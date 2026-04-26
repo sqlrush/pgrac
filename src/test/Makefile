@@ -33,26 +33,32 @@ include $(top_builddir)/src/Makefile.global
 SUBDIRS = perl regress isolation modules authentication recovery subscription
 
 # PGRAC: cluster tests included only when --enable-cluster
+# (spec-0.4 added cluster_unit + cluster_regress; spec-0.5 added cluster_tap)
 ifeq ($(enable_pgrac_cluster), yes)
-SUBDIRS += cluster_unit cluster_regress
+SUBDIRS += cluster_unit cluster_regress cluster_tap
 endif
 
-# PGRAC: convenience targets for cluster test suites (spec-0.4 §2.4)
+# PGRAC: convenience targets for cluster test suites
+# (spec-0.4 §2.4 introduced cluster-unit / cluster-regress / cluster-check;
+#  spec-0.5 §2.3 added cluster-tap and extended cluster-check to include it.)
 # Available in both enable and disable modes; disable mode no-ops cleanly.
 ifeq ($(enable_pgrac_cluster), yes)
 cluster-unit:
 	$(MAKE) -C cluster_unit check
 
+cluster-tap:
+	$(MAKE) -C cluster_tap check
+
 cluster-regress:
 	$(MAKE) -C cluster_regress check
 
-cluster-check: cluster-unit cluster-regress
+cluster-check: cluster-unit cluster-tap cluster-regress
 else
-cluster-unit cluster-regress cluster-check:
+cluster-unit cluster-tap cluster-regress cluster-check:
 	@echo "# cluster tests skipped (rebuild with --enable-cluster to run)"
 endif
 
-.PHONY: cluster-unit cluster-regress cluster-check
+.PHONY: cluster-unit cluster-tap cluster-regress cluster-check
 
 ifeq ($(with_icu),yes)
 SUBDIRS += icu
