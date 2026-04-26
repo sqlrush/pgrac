@@ -39,6 +39,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster.h"
+#include "cluster/cluster_elog.h"
 #include "utils/elog.h"
 
 
@@ -71,7 +72,8 @@
 void
 cluster_init(void)
 {
-	elog(DEBUG1, "cluster_init: stub, no-op in stage 0.2");
+	cluster_phase = "init";
+	CLUSTER_LOG(DEBUG1, "cluster_init: stub, no-op in stage 0.9");
 }
 
 /*
@@ -96,7 +98,8 @@ cluster_init(void)
 void
 cluster_shutdown(void)
 {
-	elog(DEBUG1, "cluster_shutdown: stub, no-op in stage 0.2");
+	cluster_phase = "shutdown";
+	CLUSTER_LOG(DEBUG1, "cluster_shutdown: stub, no-op in stage 0.9");
 }
 
 /*

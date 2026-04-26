@@ -26,6 +26,7 @@ include $(top_builddir)/src/Makefile.global
 
 OBJS = \
 	cluster.o \
+	cluster_elog.o \
 	cluster_version.o
 
 include $(top_srcdir)/src/backend/common.mk
