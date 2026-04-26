@@ -32,14 +32,25 @@
 #define CLUSTER_VERSION_H
 
 /*
+ * Centralized version macros (PGRAC_VERSION_STRING etc.) live in a
+ * separate header so unit tests can use them without pulling cluster
+ * implementation symbols.
+ */
+#include "cluster/cluster_version_macros.h"
+
+/*
  * pgrac_version_string -- Return the pgrac version string.
  *
  *	Returns a static null-terminated string identifying the pgrac
- *	build (e.g. "pgrac v0.1.0-stage0.4 (based on PostgreSQL 16.13)").
+ *	build (e.g. "pgrac v0.1.0-stage0.8 (based on PostgreSQL 16.13)").
  *
  *	The returned pointer must not be freed or modified by the caller.
  *	The function is implemented in cluster_version.c and uses no PG
  *	internal APIs (no elog, no palloc, no shared memory).
+ *
+ *	Equivalent to the compile-time constant PGRAC_VERSION_STRING; the
+ *	function form exists for callers that need a function pointer or
+ *	want to avoid #include "cluster/cluster_version_macros.h".
  */
 extern const char *pgrac_version_string(void);
 

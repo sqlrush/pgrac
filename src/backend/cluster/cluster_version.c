@@ -37,6 +37,11 @@
  *	Returns a static null-terminated string.  Callers must not free or
  *	modify the returned memory.
  *
+ *	The string is composed at compile time by macros in
+ *	cluster_version_macros.h (CLAUDE.md rule 19, single source of
+ *	truth).  To bump the version, edit cluster_version_macros.h --
+ *	this function's body does not need to change.
+ *
  * Inputs:
  *	(none)
  *
@@ -49,15 +54,11 @@
  * NOTES
  *	The version string format is:
  *	  pgrac v<MAJOR>.<MINOR>.<PATCH>-stage<S>.<N> (based on PostgreSQL <X.Y>)
- *	See CLAUDE.md rule 19 for version-numbering policy.
- *
- *	Update this string at the start of each new functional point in
- *	docs/development-roadmap.md.
  *
  * Author: SqlRush <sqlrush@gmail.com>
  */
 const char *
 pgrac_version_string(void)
 {
-	return "pgrac v0.1.0-stage0.4 (based on PostgreSQL 16.13)";
+	return PGRAC_VERSION_STRING;
 }
