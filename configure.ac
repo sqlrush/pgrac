@@ -207,6 +207,31 @@ PGAC_ARG_BOOL(enable, debug, no,
 AC_SUBST(enable_debug)
 
 #
+# PGRAC: --enable-cluster (build pgrac cluster subsystem)
+# ----------------------------------------------------------------------
+# PGRAC modifications by SqlRush <sqlrush@gmail.com>
+#
+# What changed:
+#   Added --enable-cluster option (default: no) to build the pgrac
+#   cluster subsystem (Cache Fusion, GES, SCN, ...).  When enabled,
+#   defines USE_PGRAC_CLUSTER macro and exports enable_cluster=yes
+#   to Makefile.global so src/backend/Makefile conditionally includes
+#   the cluster subdirectory in SUBDIRS.
+#
+# Why:
+#   pgrac is built on top of PG 16.13 with cluster code added under
+#   src/backend/cluster/.  This option lets users build a pgrac
+#   binary identical to native PG (default) or with cluster code
+#   included (--enable-cluster).  See spec-0.3 and CLAUDE.md rule 8
+#   (implementation completeness).
+# ----------------------------------------------------------------------
+PGAC_ARG_BOOL(enable, cluster, no,
+              [build pgrac cluster subsystem (Cache Fusion, GES, SCN)],
+              [AC_DEFINE([USE_PGRAC_CLUSTER], 1,
+                         [Define to 1 to build pgrac cluster subsystem. (--enable-cluster)])])
+AC_SUBST(enable_cluster)
+
+#
 # --enable-profiling enables gcc profiling
 #
 PGAC_ARG_BOOL(enable, profiling, no,

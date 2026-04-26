@@ -126,5 +126,5 @@ cluster_shutdown(void)
 const char *
 pgrac_version_string(void)
 {
-	return "pgrac v0.1.0-stage0.2 (based on PostgreSQL 16.13)";
+	return "pgrac v0.1.0-stage0.3 (based on PostgreSQL 16.13)";
 }

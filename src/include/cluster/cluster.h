@@ -25,6 +25,16 @@
 
 #include "postgres.h"
 
+/*
+ * The pgrac cluster API is only available when configured with
+ * --enable-cluster (USE_PGRAC_CLUSTER defined in pg_config.h).
+ *
+ * Calling these functions when USE_PGRAC_CLUSTER is undefined will
+ * result in a compile-time error, which is the intended behavior:
+ * cluster code paths must be guarded by `#ifdef USE_PGRAC_CLUSTER`
+ * at the call site.
+ */
+#ifdef USE_PGRAC_CLUSTER
 
 /*
  * cluster_init -- Initialize the pgrac cluster subsystem.
@@ -47,10 +57,12 @@ extern void cluster_shutdown(void);
  * pgrac_version_string -- Return the pgrac version string.
  *
  *	Returns a static null-terminated string identifying the pgrac
- *	build (e.g. "pgrac v0.1.0-stage0.2 (based on PostgreSQL 16.13)").
+ *	build (e.g. "pgrac v0.1.0-stage0.3 (based on PostgreSQL 16.13)").
  *
  *	The returned pointer must not be freed or modified by the caller.
  */
 extern const char *pgrac_version_string(void);
+
+#endif							/* USE_PGRAC_CLUSTER */
 
 #endif							/* CLUSTER_H */

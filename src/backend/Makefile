@@ -12,17 +12,19 @@
 # PGRAC MODIFICATIONS by SqlRush <sqlrush@gmail.com>
 #
 # What changed:
-#     Added "cluster" to SUBDIRS so the pgrac cluster subsystem is
-#     compiled and linked into the postgres backend binary.
+#     Added "cluster" to SUBDIRS conditionally based on --enable-cluster.
+#     When --enable-cluster is set (USE_PGRAC_CLUSTER=1), the cluster
+#     subsystem is compiled and linked into postgres.  When disabled
+#     (default), the binary is identical to native PG 16.13.
 #
 # Why:
 #     pgrac introduces a new top-level src/backend/cluster/ directory
 #     housing cluster-aware code (GRD, GCS, GES, SCN, Undo, etc.).
 #     It must be wired into PG's build system so cluster.o is linked
-#     into the postgres binary.
+#     into the postgres binary, but only when explicitly enabled.
 #
-#     See spec-0.2-cluster-skeleton.md and
-#     docs/development-roadmap.md (Stage 0 functional point 0.2).
+#     See spec-0.2 (initial subdirectory wire-up) and spec-0.3
+#     (--enable-cluster build flag).
 #
 #-------------------------------------------------------------------------
 
@@ -33,13 +35,17 @@ subdir = src/backend
 top_builddir = ../..
 include $(top_builddir)/src/Makefile.global
 
-# PGRAC: 'cluster' subdirectory added (pgrac cluster subsystem)
-SUBDIRS = access archive backup bootstrap catalog cluster parser commands \
+SUBDIRS = access archive backup bootstrap catalog parser commands \
 	executor foreign lib libpq \
 	main nodes optimizer partitioning port postmaster \
 	regex replication rewrite \
 	statistics storage tcop tsearch utils $(top_builddir)/src/timezone \
 	jit
+
+# PGRAC: include cluster subsystem only when --enable-cluster is set
+ifeq ($(enable_pgrac_cluster), yes)
+SUBDIRS += cluster
+endif
 
 include $(srcdir)/common.mk
 

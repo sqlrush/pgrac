@@ -768,6 +768,7 @@ enable_coverage
 GENHTML
 LCOV
 GCOV
+enable_cluster
 enable_debug
 enable_rpath
 default_port
@@ -836,6 +837,7 @@ enable_rpath
 enable_spinlocks
 enable_atomics
 enable_debug
+enable_cluster
 enable_profiling
 enable_coverage
 enable_dtrace
@@ -1530,6 +1532,8 @@ Optional Features:
   --disable-spinlocks     do not use spinlocks
   --disable-atomics       do not use atomic operations
   --enable-debug          build with debugging symbols (-g)
+  --enable-cluster        build pgrac cluster subsystem (Cache Fusion, GES,
+                          SCN)
   --enable-profiling      build with profiling enabled
   --enable-coverage       build with coverage testing instrumentation
   --enable-dtrace         build with DTrace support
@@ -3341,6 +3345,52 @@ if test "${enable_debug+set}" = set; then :
 
 else
   enable_debug=no
+
+fi
+
+
+
+
+#
+# PGRAC: --enable-cluster (build pgrac cluster subsystem)
+# ----------------------------------------------------------------------
+# PGRAC modifications by SqlRush <sqlrush@gmail.com>
+#
+# What changed:
+#   Added --enable-cluster option (default: no) to build the pgrac
+#   cluster subsystem (Cache Fusion, GES, SCN, ...).  When enabled,
+#   defines USE_PGRAC_CLUSTER macro and exports enable_cluster=yes
+#   to Makefile.global so src/backend/Makefile conditionally includes
+#   the cluster subdirectory in SUBDIRS.
+#
+# Why:
+#   pgrac is built on top of PG 16.13 with cluster code added under
+#   src/backend/cluster/.  This option lets users build a pgrac
+#   binary identical to native PG (default) or with cluster code
+#   included (--enable-cluster).  See spec-0.3 and CLAUDE.md rule 8
+#   (implementation completeness).
+# ----------------------------------------------------------------------
+
+
+# Check whether --enable-cluster was given.
+if test "${enable_cluster+set}" = set; then :
+  enableval=$enable_cluster;
+  case $enableval in
+    yes)
+
+$as_echo "#define USE_PGRAC_CLUSTER 1" >>confdefs.h
+
+      ;;
+    no)
+      :
+      ;;
+    *)
+      as_fn_error $? "no argument expected for --enable-cluster option" "$LINENO" 5
+      ;;
+  esac
+
+else
+  enable_cluster=no
 
 fi
 
