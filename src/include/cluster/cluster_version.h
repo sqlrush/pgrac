@@ -43,4 +43,4 @@
  */
 extern const char *pgrac_version_string(void);
 
-#endif							/* CLUSTER_VERSION_H */
+#endif /* CLUSTER_VERSION_H */

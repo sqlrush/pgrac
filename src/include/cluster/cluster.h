@@ -59,6 +59,6 @@ extern void cluster_init(void);
  */
 extern void cluster_shutdown(void);
 
-#endif							/* USE_PGRAC_CLUSTER */
+#endif /* USE_PGRAC_CLUSTER */
 
-#endif							/* CLUSTER_H */
+#endif /* CLUSTER_H */
