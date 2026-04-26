@@ -1,0 +1,56 @@
+/*-------------------------------------------------------------------------
+ *
+ * cluster.h
+ *	  Public interface for the pgrac cluster subsystem (top-level entry).
+ *
+ *	  This header declares the top-level entry points for the pgrac
+ *	  cluster subsystem.  Each subsystem (GRD, GCS, GES, SCN, ...) will
+ *	  add its own header under src/include/cluster/<subsys>/ in later
+ *	  feature points.
+ *
+ *
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2026, pgrac contributors
+ *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
+ * IDENTIFICATION
+ *	  src/include/cluster/cluster.h
+ *
+ *-------------------------------------------------------------------------
+ */
+#ifndef CLUSTER_H
+#define CLUSTER_H
+
+#include "postgres.h"
+
+
+/*
+ * cluster_init -- Initialize the pgrac cluster subsystem.
+ *
+ *	Stub function in stage 0.2.  Real implementation lands in stage 0.3+
+ *	when wired into postmaster startup.  See docs/background-process-design.md
+ *	§4 (Phase 1-4 startup sequence).
+ */
+extern void cluster_init(void);
+
+/*
+ * cluster_shutdown -- Shut down the pgrac cluster subsystem.
+ *
+ *	Stub function in stage 0.2.  Real implementation lands in stage 0.3+
+ *	when wired into postmaster shutdown.
+ */
+extern void cluster_shutdown(void);
+
+/*
+ * pgrac_version_string -- Return the pgrac version string.
+ *
+ *	Returns a static null-terminated string identifying the pgrac
+ *	build (e.g. "pgrac v0.1.0-stage0.2 (based on PostgreSQL 16.13)").
+ *
+ *	The returned pointer must not be freed or modified by the caller.
+ */
+extern const char *pgrac_version_string(void);
+
+#endif							/* CLUSTER_H */

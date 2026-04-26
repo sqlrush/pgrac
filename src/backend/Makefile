@@ -8,6 +8,23 @@
 # src/backend/Makefile
 #
 #-------------------------------------------------------------------------
+#
+# PGRAC MODIFICATIONS by SqlRush <sqlrush@gmail.com>
+#
+# What changed:
+#     Added "cluster" to SUBDIRS so the pgrac cluster subsystem is
+#     compiled and linked into the postgres backend binary.
+#
+# Why:
+#     pgrac introduces a new top-level src/backend/cluster/ directory
+#     housing cluster-aware code (GRD, GCS, GES, SCN, Undo, etc.).
+#     It must be wired into PG's build system so cluster.o is linked
+#     into the postgres binary.
+#
+#     See spec-0.2-cluster-skeleton.md and
+#     docs/development-roadmap.md (Stage 0 functional point 0.2).
+#
+#-------------------------------------------------------------------------
 
 PGFILEDESC = "PostgreSQL Server"
 PGAPPICON=win32
@@ -16,8 +33,9 @@ subdir = src/backend
 top_builddir = ../..
 include $(top_builddir)/src/Makefile.global
 
-SUBDIRS = access archive backup bootstrap catalog parser commands executor \
-	foreign lib libpq \
+# PGRAC: 'cluster' subdirectory added (pgrac cluster subsystem)
+SUBDIRS = access archive backup bootstrap catalog cluster parser commands \
+	executor foreign lib libpq \
 	main nodes optimizer partitioning port postmaster \
 	regex replication rewrite \
 	statistics storage tcop tsearch utils $(top_builddir)/src/timezone \
