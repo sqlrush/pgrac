@@ -163,13 +163,12 @@ cluster_get_wait_events(PG_FUNCTION_ARGS)
 
 #ifdef USE_PGRAC_CLUSTER
 	{
-		ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+		ReturnSetInfo *rsinfo = (ReturnSetInfo *)fcinfo->resultinfo;
 
-		for (int i = 0; i < CLUSTER_WAIT_EVENTS_COUNT; i++)
-		{
-			uint32		info = cluster_wait_event_infos[i];
-			Datum		values[2];
-			bool		nulls[2] = {false, false};
+		for (int i = 0; i < CLUSTER_WAIT_EVENTS_COUNT; i++) {
+			uint32 info = cluster_wait_event_infos[i];
+			Datum values[2];
+			bool nulls[2] = { false, false };
 			const char *type;
 			const char *name;
 
@@ -189,5 +188,5 @@ cluster_get_wait_events(PG_FUNCTION_ARGS)
 	 * Querying pg_stat_cluster_wait_events then yields an empty result
 	 * set, which is the documented behavior for that build mode.
 	 */
-	return (Datum) 0;
+	return (Datum)0;
 }
