@@ -73,6 +73,28 @@
 # class defined by the standard have a subclass value that begins
 # with 'P'. In addition, error codes defined by PostgreSQL clients
 # (such as ecpg) have a class value that begins with 'Y'.
+#
+# PGRAC MODIFICATIONS
+#   Modified by: SqlRush <sqlrush@gmail.com>
+#   Stage:        0.12
+#
+#   Added 45 cluster error codes spanning 8 PG classes (08, 40, 53,
+#   55, 57, 58, 72, XX).  All pgrac codes use the 'R' subclass
+#   character (third position of the SQLSTATE), which is reserved
+#   here as the pgrac namespace and never conflicts with the standard
+#   ('0'-'4', 'A'-'H'), with PG-defined codes ('P' subclass), or with
+#   PG client codes ('Y' class).
+#
+#   Each PG class containing pgrac codes is followed by a separate
+#   "(pgrac extension)" sub-section so that the SGML doc generator
+#   groups pgrac codes immediately after the matching PG class.
+#
+#   Stage 0.12 only registers the codes; ereport() call sites land in
+#   the spec for each owning subsystem (Stage 1+).
+#
+#   Related design:
+#     docs/error-codes-design.md v1.1 §3 / §7.3
+#     specs/spec-0.12-error-codes-framework.md
 
 Section: Class 00 - Successful Completion
 
@@ -109,6 +131,14 @@ Section: Class 08 - Connection Exception
 08004    E    ERRCODE_SQLSERVER_REJECTED_ESTABLISHMENT_OF_SQLCONNECTION      sqlserver_rejected_establishment_of_sqlconnection
 08007    E    ERRCODE_TRANSACTION_RESOLUTION_UNKNOWN                         transaction_resolution_unknown
 08P01    E    ERRCODE_PROTOCOL_VIOLATION                                     protocol_violation
+
+Section: Class 08 - Connection Exception (pgrac extension)
+
+08R01    E    ERRCODE_CLUSTER_NODE_UNREACHABLE                               cluster_node_unreachable
+08R02    E    ERRCODE_CLUSTER_NODE_EVICTED                                   cluster_node_evicted
+08R03    E    ERRCODE_CLUSTER_JOIN_FAILED                                    cluster_join_failed
+08R04    E    ERRCODE_CLUSTER_INTERCONNECT_LOST                              cluster_interconnect_lost
+08R05    E    ERRCODE_CLUSTER_PROTOCOL_VERSION_MISMATCH                      cluster_protocol_version_mismatch
 
 Section: Class 09 - Triggered Action Exception
 
@@ -326,6 +356,13 @@ Section: Class 40 - Transaction Rollback
 40003    E    ERRCODE_T_R_STATEMENT_COMPLETION_UNKNOWN                       statement_completion_unknown
 40P01    E    ERRCODE_T_R_DEADLOCK_DETECTED                                  deadlock_detected
 
+Section: Class 40 - Transaction Rollback (pgrac extension)
+
+40R01    E    ERRCODE_CLUSTER_RECONFIG_ABORT                                 cluster_reconfig_abort
+40R02    E    ERRCODE_CLUSTER_ISOLATION_FAILED                               cluster_isolation_failed
+40R03    E    ERRCODE_CLUSTER_CACHE_FUSION_RETRY                             cluster_cache_fusion_retry
+40R04    E    ERRCODE_CLUSTER_PI_INVALIDATED_RETRY                           cluster_pi_invalidated_retry
+
 Section: Class 42 - Syntax Error or Access Rule Violation
 
 42000    E    ERRCODE_SYNTAX_ERROR_OR_ACCESS_RULE_VIOLATION                  syntax_error_or_access_rule_violation
@@ -403,6 +440,16 @@ Section: Class 53 - Insufficient Resources
 53300    E    ERRCODE_TOO_MANY_CONNECTIONS                                   too_many_connections
 53400    E    ERRCODE_CONFIGURATION_LIMIT_EXCEEDED                           configuration_limit_exceeded
 
+Section: Class 53 - Insufficient Resources (pgrac extension)
+
+53R01    E    ERRCODE_CLUSTER_LMS_QUEUE_FULL                                 cluster_lms_queue_full
+53R02    E    ERRCODE_CLUSTER_GRD_FULL                                       cluster_grd_full
+53R03    E    ERRCODE_CLUSTER_UNDO_EXHAUSTED                                 cluster_undo_exhausted
+53R04    E    ERRCODE_CLUSTER_PI_CHAIN_FULL                                  cluster_pi_chain_full
+53R05    E    ERRCODE_CLUSTER_CR_CHAIN_FULL                                  cluster_cr_chain_full
+53R06    E    ERRCODE_CLUSTER_RECOVERY_WORKERS_EXHAUSTED                     cluster_recovery_workers_exhausted
+53R07    E    ERRCODE_CLUSTER_RECONFIG_QUORUM_LOST                           cluster_reconfig_quorum_lost
+
 Section: Class 54 - Program Limit Exceeded
 
 # this is for wired-in limits, not resource exhaustion problems (class borrowed from DB2)
@@ -420,6 +467,15 @@ Section: Class 55 - Object Not In Prerequisite State
 55P03    E    ERRCODE_LOCK_NOT_AVAILABLE                                     lock_not_available
 55P04    E    ERRCODE_UNSAFE_NEW_ENUM_VALUE_USAGE                            unsafe_new_enum_value_usage
 
+Section: Class 55 - Object Not In Prerequisite State (pgrac extension)
+
+55R01    E    ERRCODE_CLUSTER_PCM_STATE_INVALID                              cluster_pcm_state_invalid
+55R02    E    ERRCODE_CLUSTER_BUFFER_PIN_CONFLICT                            cluster_buffer_pin_conflict
+55R03    E    ERRCODE_CLUSTER_LOCK_STARVATION                                cluster_lock_starvation
+55R04    E    ERRCODE_CLUSTER_BUFFER_INVALIDATED                             cluster_buffer_invalidated
+55R05    E    ERRCODE_CLUSTER_MASTER_CHANGED                                 cluster_master_changed
+55R06    E    ERRCODE_CLUSTER_BLOCK_MISSING_TEMPORARY                        cluster_block_missing_temporary
+
 Section: Class 57 - Operator Intervention
 
 # (class borrowed from DB2)
@@ -431,6 +487,15 @@ Section: Class 57 - Operator Intervention
 57P04    E    ERRCODE_DATABASE_DROPPED                                       database_dropped
 57P05    E    ERRCODE_IDLE_SESSION_TIMEOUT                                   idle_session_timeout
 
+Section: Class 57 - Operator Intervention (pgrac extension)
+
+57R01    E    ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS                           cluster_reconfig_in_progress
+57R02    E    ERRCODE_CLUSTER_FENCE_TRIGGERED                                cluster_fence_triggered
+57R03    E    ERRCODE_CLUSTER_ADMIN_SHUTDOWN                                 cluster_admin_shutdown
+57R04    E    ERRCODE_CLUSTER_NODE_DRAIN                                     cluster_node_drain
+57R05    E    ERRCODE_CLUSTER_QUIESCE_ACTIVE                                 cluster_quiesce_active
+57R06    E    ERRCODE_CLUSTER_ADG_APPLY_LAG_EXCESSIVE                        cluster_adg_apply_lag_excessive
+
 Section: Class 58 - System Error (errors external to PostgreSQL itself)
 
 # (class borrowed from DB2)
@@ -439,9 +504,29 @@ Section: Class 58 - System Error (errors external to PostgreSQL itself)
 58P01    E    ERRCODE_UNDEFINED_FILE                                         undefined_file
 58P02    E    ERRCODE_DUPLICATE_FILE                                         duplicate_file
 
+Section: Class 58 - System Error (pgrac extension)
+
+58R01    E    ERRCODE_CLUSTER_SHARED_STORAGE_FAILED                          cluster_shared_storage_failed
+58R02    E    ERRCODE_CLUSTER_HEARTBEAT_LOST                                 cluster_heartbeat_lost
+58R03    E    ERRCODE_CLUSTER_INTERCONNECT_CORRUPTED                         cluster_interconnect_corrupted
+58R04    E    ERRCODE_CLUSTER_MASTER_UNAVAILABLE                             cluster_master_unavailable
+58R05    E    ERRCODE_CLUSTER_SCN_DRIFT_EXCESSIVE                            cluster_scn_drift_excessive
+58R06    E    ERRCODE_CLUSTER_SCN_UNDERFLOW                                  cluster_scn_underflow
+58R07    E    ERRCODE_CLUSTER_GRD_INCONSISTENT                               cluster_grd_inconsistent
+58R08    E    ERRCODE_CLUSTER_TOPOLOGY_INVALID                               cluster_topology_invalid
+58R09    E    ERRCODE_CLUSTER_TT_INCONSISTENT                                cluster_tt_inconsistent
+58R10    E    ERRCODE_CLUSTER_CATALOG_INCONSISTENT                           cluster_catalog_inconsistent
+58R11    E    ERRCODE_CLUSTER_SINVAL_INCONSISTENT                            cluster_sinval_inconsistent
+58R12    E    ERRCODE_CLUSTER_RECOVERY_FAILED                                cluster_recovery_failed
+
 Section: Class 72 - Snapshot Failure
 # (class borrowed from Oracle)
 72000    E    ERRCODE_SNAPSHOT_TOO_OLD                                       snapshot_too_old
+
+Section: Class 72 - Snapshot Failure (pgrac extension)
+
+72R01    E    ERRCODE_CLUSTER_SNAPSHOT_TOO_OLD                               cluster_snapshot_too_old
+72R02    E    ERRCODE_CLUSTER_SNAPSHOT_UNAVAILABLE                           cluster_snapshot_unavailable
 
 Section: Class F0 - Configuration File Error
 
@@ -495,3 +580,9 @@ Section: Class XX - Internal Error
 XX000    E    ERRCODE_INTERNAL_ERROR                                         internal_error
 XX001    E    ERRCODE_DATA_CORRUPTED                                         data_corrupted
 XX002    E    ERRCODE_INDEX_CORRUPTED                                        index_corrupted
+
+Section: Class XX - Internal Error (pgrac extension)
+
+XXR01    E    ERRCODE_CLUSTER_ASSERTION_FAILURE                              cluster_assertion_failure
+XXR02    E    ERRCODE_CLUSTER_UNEXPECTED_STATE                               cluster_unexpected_state
+XXR03    E    ERRCODE_CLUSTER_RELMAPPER_CONFLICT                             cluster_relmapper_conflict
