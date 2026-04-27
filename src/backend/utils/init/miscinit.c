@@ -75,6 +75,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_guc.h"	/* PGRAC: cluster_init_guc() */
+#include "cluster/cluster_shmem.h"	/* PGRAC: cluster_request_shmem() */
 #endif
 
 
@@ -2009,11 +2010,29 @@ process_session_preload_libraries(void)
 
 /*
  * process any shared memory requests from preloaded libraries
+ *
+ * PGRAC modifications by SqlRush:
+ *	What changed:  When USE_PGRAC_CLUSTER is defined, register all pgrac
+ *	               cluster shared-memory regions (currently the
+ *	               ClusterShmemCtl control block) before user
+ *	               shmem_request_hook fires.
+ *	Why:           PG forbids RequestAddinShmemSpace() outside this
+ *	               phase (see RequestAddinShmemSpace in ipci.c which
+ *	               checks process_shmem_requests_in_progress).  Calling
+ *	               cluster_request_shmem() here piggybacks on the same
+ *	               flag.  Reserving FIRST means user preload libraries
+ *	               see the cluster regions when they ShmemInitStruct.
+ *	               See docs/cluster-shmem-design.md §2.1 and
+ *	               specs/spec-0.14-shmem-framework.md.
  */
 void
 process_shmem_requests(void)
 {
 	process_shmem_requests_in_progress = true;
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: reserve cluster shmem space (control block + future subsystems). */
+	cluster_request_shmem();
+#endif
 	if (shmem_request_hook)
 		shmem_request_hook();
 	process_shmem_requests_in_progress = false;

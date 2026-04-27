@@ -28,6 +28,7 @@ OBJS = \
 	cluster.o \
 	cluster_elog.o \
 	cluster_guc.o \
+	cluster_shmem.o \
 	cluster_version.o
 
 include $(top_srcdir)/src/backend/common.mk

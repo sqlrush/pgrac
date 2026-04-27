@@ -26,7 +26,8 @@ include $(top_builddir)/src/Makefile.global
 
 # Test source files (each becomes a standalone executable)
 TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
-        test_cluster_wait_events test_cluster_errcodes test_cluster_guc
+        test_cluster_wait_events test_cluster_errcodes test_cluster_guc \
+        test_cluster_shmem
 
 # Path to the cluster_version object (no PG deps, safe to link standalone).
 CLUSTER_VERSION_O = $(top_builddir)/src/backend/cluster/cluster_version.o
@@ -46,9 +47,12 @@ override CPPFLAGS := -I. -I$(top_srcdir)/src/include $(CPPFLAGS)
 # ----------
 all: $(TESTS)
 
-# Most tests link only cluster_version.o.  test_cluster_guc has a
-# separate rule below because it also needs cluster_guc.o + cluster_elog.o.
-SIMPLE_TESTS = $(filter-out test_cluster_guc,$(TESTS))
+CLUSTER_SHMEM_O = $(top_builddir)/src/backend/cluster/cluster_shmem.o
+
+# Most tests link only cluster_version.o.  test_cluster_guc and
+# test_cluster_shmem have separate rules because they also need
+# cluster_guc.o + cluster_elog.o (and shmem also needs cluster_shmem.o).
+SIMPLE_TESTS = $(filter-out test_cluster_guc test_cluster_shmem,$(TESTS))
 
 $(SIMPLE_TESTS): %: %.c unit_test.h $(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) -o $@
@@ -59,6 +63,14 @@ test_cluster_guc: test_cluster_guc.c unit_test.h $(CLUSTER_VERSION_O) \
 		$(CLUSTER_GUC_O) $(CLUSTER_ELOG_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_GUC_O) $(CLUSTER_ELOG_O) -o $@
+
+# test_cluster_shmem additionally links cluster_shmem.o + cluster_guc.o +
+# cluster_elog.o (the test stubs RequestAddinShmemSpace, ShmemInitStruct,
+# GetCurrentTimestamp, and elog so no PG backend is needed).
+test_cluster_shmem: test_cluster_shmem.c unit_test.h $(CLUSTER_VERSION_O) \
+		$(CLUSTER_SHMEM_O) $(CLUSTER_GUC_O) $(CLUSTER_ELOG_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_SHMEM_O) $(CLUSTER_GUC_O) $(CLUSTER_ELOG_O) -o $@
 
 
 # ----------

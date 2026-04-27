@@ -11,6 +11,32 @@
  *	  src/backend/storage/ipc/ipci.c
  *
  *-------------------------------------------------------------------------
+ *
+ * PGRAC MODIFICATIONS
+ *	  Modified by: SqlRush <sqlrush@gmail.com>
+ *	  Stage:        0.14
+ *
+ *	  Wired cluster_init_shmem() into CreateSharedMemoryAndSemaphores()
+ *	  so that the pgrac cluster control block (and future GRD / PCM /
+ *	  GES / Undo / etc. shmem regions registered through cluster_shmem.c)
+ *	  is allocated after PG's built-in ShmemInit calls and BEFORE the
+ *	  user-facing shmem_startup_hook fires.  The placement matters:
+ *	  user preload libraries that read pgrac state need to find
+ *	  ClusterShmem already initialised when their own startup hook runs.
+ *
+ *	  The matching size-reservation call (cluster_request_shmem) lives
+ *	  in miscinit.c::process_shmem_requests under its own PGRAC
+ *	  modifications block; both calls must occur in the same postmaster
+ *	  startup pass.
+ *
+ *	  Guarded by #ifdef USE_PGRAC_CLUSTER so --disable-cluster builds
+ *	  remain byte-for-byte identical to upstream PG runtime behavior.
+ *
+ *	  Related design:
+ *	    docs/cluster-shmem-design.md v1.0 §2.1 (shmem entry-point policy)
+ *	    specs/spec-0.14-shmem-framework.md
+ *
+ *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
@@ -49,6 +75,10 @@
 #include "storage/spin.h"
 #include "utils/guc.h"
 #include "utils/snapmgr.h"
+
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_shmem.h"	/* PGRAC: cluster_init_shmem() */
+#endif
 
 /* GUCs */
 int			shared_memory_type = DEFAULT_SHARED_MEMORY_TYPE;
@@ -294,6 +324,16 @@ CreateSharedMemoryAndSemaphores(void)
 	SyncScanShmemInit();
 	AsyncShmemInit();
 	StatsShmemInit();
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: initialise the pgrac cluster shmem regions.  Runs after
+	 * PG built-in ShmemInit calls so all PG infrastructure is available,
+	 * and before shmem_startup_hook so user preload libraries see
+	 * ClusterShmem fully initialised when their hook fires.
+	 */
+	cluster_init_shmem();
+#endif
 
 #ifdef EXEC_BACKEND
 

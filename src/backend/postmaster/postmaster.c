@@ -43,18 +43,23 @@
  *
  * PGRAC MODIFICATIONS
  *	  Modified by: SqlRush <sqlrush@gmail.com>
- *	  Stage:        0.13
+ *	  Stages:       0.13, 0.14
  *
  *	  Added a comment in PostmasterMain explaining where pgrac cluster
- *	  GUCs are registered.  The actual registration call site is in
- *	  process_shared_preload_libraries() (miscinit.c) because PG forbids
- *	  defining PGC_POSTMASTER custom GUCs outside that phase.  This file
- *	  records the cross-reference so a developer reading PostmasterMain
- *	  finds the explanation in context.
+ *	  initialization happens.  Call sites live in miscinit.c because PG
+ *	  has phase-specific gates that must be respected:
+ *	    - cluster_init_guc()       in process_shared_preload_libraries()
+ *	    - cluster_request_shmem()  in process_shmem_requests()
+ *	    - cluster_init_shmem()     in CreateSharedMemoryAndSemaphores()
+ *	                                (ipci.c, see PGRAC MODIFICATIONS there)
+ *	  This file records the cross-reference so a developer reading
+ *	  PostmasterMain finds the explanation in context.
  *
  *	  Related design:
- *	    docs/cluster-guc-design.md v1.0 §2 (registration entry-point policy)
+ *	    docs/cluster-guc-design.md v1.1 §2 (GUC entry-point policy)
+ *	    docs/cluster-shmem-design.md v1.0 §2.1 (shmem entry-point policy)
  *	    specs/spec-0.13-guc-framework.md
+ *	    specs/spec-0.14-shmem-framework.md
  *
  *-------------------------------------------------------------------------
  *

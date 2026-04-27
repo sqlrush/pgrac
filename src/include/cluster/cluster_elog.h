@@ -84,12 +84,21 @@ extern const char *cluster_phase;
  *	  CLUSTER_LOG(LOG, "GRD rebuild complete in %d ms", elapsed);
  *
  *	Implementation: a function-like macro that splices a prefix into
- *	the elog format string.  The prefix is built from the current
- *	values of cluster_node_id and cluster_phase at call time.
+ *	the elog format string.  The prefix carries cluster_node_id and
+ *	cluster_phase as the FIRST two formatted arguments, followed by
+ *	whatever the caller supplied.  Using ", ## __VA_ARGS__" (a GCC /
+ *	Clang extension widely used by PG itself) elides the extra comma
+ *	when the caller passes no varargs.
+ *
+ *	bug fixed in stage 0.14: previous version placed cluster_node_id /
+ *	cluster_phase AFTER the caller's arguments, which mismatched the
+ *	prefix format specifiers whenever the caller supplied any format
+ *	arguments of their own.  The bug was harmless until cluster_shmem.c
+ *	became the first call site with format args.
  */
-#define CLUSTER_LOG(level, ...)                                                                    \
-	elog(level, "[cluster node=%d phase=%s] " __VA_ARGS__, cluster_node_id,                        \
-		 cluster_phase ? cluster_phase : "(unset)")
+#define CLUSTER_LOG(level, fmt, ...)                                                               \
+	elog(level, "[cluster node=%d phase=%s] " fmt, cluster_node_id,                                \
+		 cluster_phase ? cluster_phase : "(unset)", ##__VA_ARGS__)
 
 
 #endif /* CLUSTER_ELOG_H */
