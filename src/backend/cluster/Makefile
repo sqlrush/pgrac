@@ -30,6 +30,7 @@ OBJS = \
 	cluster_guc.o \
 	cluster_shmem.o \
 	cluster_signal.o \
-	cluster_version.o
+	cluster_version.o \
+	cluster_views.o
 
 include $(top_srcdir)/src/backend/common.mk

@@ -14,6 +14,31 @@
  * string literal (including a function body!) or a multiline comment.
  */
 
+/*
+ * PGRAC MODIFICATIONS
+ *   Modified by: SqlRush <sqlrush@gmail.com>
+ *   Stage:        0.16
+ *
+ *   Appended pgrac cluster views at the end of this file under a
+ *   clearly marked "PGRAC: cluster views" section.  Stage 0.16 ships
+ *   ONE view: pg_stat_cluster_wait_events, backed by the
+ *   cluster_get_wait_events SRF registered in pg_proc.dat (OID 8898).
+ *
+ *   The cluster views block is currently UNCONDITIONAL: when
+ *   --disable-cluster is used the cluster_get_wait_events SRF is still
+ *   present in pg_proc (we keep the catalog identical across build
+ *   modes to simplify pg_dump compatibility), but it returns an empty
+ *   set and no cluster code emits to it.  Stage 0.30 may revisit and
+ *   gate this block on a build-time guard if disable-mode parity
+ *   becomes a hard requirement; right now the simpler path is
+ *   preferred.  See docs/cluster-views-impl-design.md §5.4 for the
+ *   disable-mode tradeoff discussion.
+ *
+ *   Related design:
+ *     docs/cluster-views-impl-design.md v1.0
+ *     specs/spec-0.16-views-framework.md
+ */
+
 CREATE VIEW pg_roles AS
     SELECT
         rolname,
@@ -1338,3 +1363,19 @@ CREATE VIEW pg_stat_subscription_stats AS
         ss.stats_reset
     FROM pg_subscription as s,
          pg_stat_get_subscription_stats(s.oid) as ss;
+
+/* ----------
+ * PGRAC: cluster views (stage 0.16+)
+ *
+ * Each cluster view is a thin SQL wrapper over a SRF declared in
+ * pg_proc.dat (OID range 8000-9999) and implemented in
+ * src/backend/cluster/cluster_views.c.  Future subsystem specs add
+ * their own cluster views here following the same pattern; see
+ * docs/cluster-views-impl-design.md §5 for the registration policy.
+ * ---------- */
+
+CREATE VIEW pg_stat_cluster_wait_events AS
+    SELECT type, name FROM cluster_get_wait_events();
+
+REVOKE ALL ON pg_stat_cluster_wait_events FROM PUBLIC;
+GRANT SELECT ON pg_stat_cluster_wait_events TO PUBLIC;

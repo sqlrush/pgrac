@@ -57,6 +57,8 @@
  */
 
 /*							yyyymmddN */
-#define CATALOG_VERSION_NO	202307071
+/* PGRAC: bumped from PG 202307071 for cluster_get_wait_events SRF + */
+/* pg_stat_cluster_wait_events view (spec-0.16, stage 0.16). */
+#define CATALOG_VERSION_NO	202604270
 
 #endif

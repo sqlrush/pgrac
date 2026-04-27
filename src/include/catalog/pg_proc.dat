@@ -9,6 +9,28 @@
 # src/include/catalog/pg_proc.dat
 #
 #----------------------------------------------------------------------
+#
+# PGRAC MODIFICATIONS
+#   Modified by: SqlRush <sqlrush@gmail.com>
+#   Stage:        0.16
+#
+#   Appended pgrac cluster catalog functions at the end of this file
+#   under a clearly-marked "PGRAC: cluster catalog functions" section.
+#   pgrac reserves OIDs 8000-9999 for cluster SRFs and similar
+#   pgrac-original catalog entries; see docs/cluster-views-impl-design.md
+#   §4.3 for the live OID allocation table.
+#
+#   Stage 0.16 ships ONE SRF: cluster_get_wait_events (OID 8898), backing
+#   the pg_stat_cluster_wait_events view declared in system_views.sql.
+#   Future cluster SRFs land here together with their owning subsystem
+#   spec; CATALOG_VERSION_NO must bump for every catalog change.
+#
+#   Related design:
+#     docs/cluster-views-impl-design.md v1.0 (registration policy)
+#     docs/performance-views-design.md v1.0 §2.2 (full view roster)
+#     specs/spec-0.16-views-framework.md
+#
+#----------------------------------------------------------------------
 
 [
 
@@ -12042,5 +12064,21 @@
 { oid => '6292', descr => 'aggregate transition function',
   proname => 'any_value_transfn', prorettype => 'anyelement',
   proargtypes => 'anyelement anyelement', prosrc => 'any_value_transfn' },
+
+# ----------
+# PGRAC: cluster catalog functions (stage 0.16+)
+#
+# OID range: 8000-9999 reserved for pgrac.  See
+# docs/cluster-views-impl-design.md §4.3 for the live allocation table.
+# ----------
+
+{ oid => '8898', descr => 'list registered cluster wait events',
+  proname => 'cluster_get_wait_events', prorows => '46',
+  proretset => 't', provolatile => 's', proparallel => 'r',
+  prorettype => 'record', proargtypes => '',
+  proallargtypes => '{text,text}',
+  proargmodes => '{o,o}',
+  proargnames => '{type,name}',
+  prosrc => 'cluster_get_wait_events' },
 
 ]

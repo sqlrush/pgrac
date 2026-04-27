@@ -1827,6 +1827,9 @@ pg_stat_bgwriter| SELECT pg_stat_get_bgwriter_timed_checkpoints() AS checkpoints
     pg_stat_get_buf_fsync_backend() AS buffers_backend_fsync,
     pg_stat_get_buf_alloc() AS buffers_alloc,
     pg_stat_get_bgwriter_stat_reset_time() AS stats_reset;
+pg_stat_cluster_wait_events| SELECT type,
+    name
+   FROM cluster_get_wait_events() cluster_get_wait_events(type, name);
 pg_stat_database| SELECT oid AS datid,
     datname,
         CASE
