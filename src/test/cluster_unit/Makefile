@@ -27,7 +27,7 @@ include $(top_builddir)/src/Makefile.global
 # Test source files (each becomes a standalone executable)
 TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_wait_events test_cluster_errcodes test_cluster_guc \
-        test_cluster_shmem
+        test_cluster_shmem test_cluster_signal
 
 # Path to the cluster_version object (no PG deps, safe to link standalone).
 CLUSTER_VERSION_O = $(top_builddir)/src/backend/cluster/cluster_version.o
@@ -48,11 +48,13 @@ override CPPFLAGS := -I. -I$(top_srcdir)/src/include $(CPPFLAGS)
 all: $(TESTS)
 
 CLUSTER_SHMEM_O = $(top_builddir)/src/backend/cluster/cluster_shmem.o
+CLUSTER_SIGNAL_O = $(top_builddir)/src/backend/cluster/cluster_signal.o
 
-# Most tests link only cluster_version.o.  test_cluster_guc and
-# test_cluster_shmem have separate rules because they also need
-# cluster_guc.o + cluster_elog.o (and shmem also needs cluster_shmem.o).
-SIMPLE_TESTS = $(filter-out test_cluster_guc test_cluster_shmem,$(TESTS))
+# Most tests link only cluster_version.o.  test_cluster_guc /
+# test_cluster_shmem / test_cluster_signal have separate rules
+# because they also link additional cluster_*.o objects (the test
+# files stub the PG backend symbols those objects reference).
+SIMPLE_TESTS = $(filter-out test_cluster_guc test_cluster_shmem test_cluster_signal,$(TESTS))
 
 $(SIMPLE_TESTS): %: %.c unit_test.h $(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) -o $@
@@ -71,6 +73,13 @@ test_cluster_shmem: test_cluster_shmem.c unit_test.h $(CLUSTER_VERSION_O) \
 		$(CLUSTER_SHMEM_O) $(CLUSTER_GUC_O) $(CLUSTER_ELOG_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_SHMEM_O) $(CLUSTER_GUC_O) $(CLUSTER_ELOG_O) -o $@
+
+# test_cluster_signal links cluster_signal.o.  cluster_signal.c calls
+# SetLatch(MyLatch) which needs PG backend; the test stubs both.
+test_cluster_signal: test_cluster_signal.c unit_test.h $(CLUSTER_VERSION_O) \
+		$(CLUSTER_SIGNAL_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_SIGNAL_O) -o $@
 
 
 # ----------

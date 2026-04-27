@@ -11,6 +11,29 @@
  *	  src/backend/storage/ipc/procsignal.c
  *
  *-------------------------------------------------------------------------
+ *
+ * PGRAC MODIFICATIONS
+ *	  Modified by: SqlRush <sqlrush@gmail.com>
+ *	  Stage:        0.15
+ *
+ *	  Extended procsignal_sigusr1_handler with a dispatcher case for
+ *	  PROCSIG_CLUSTER_RECONFIG_START (the first cluster ProcSignalReason
+ *	  registered in stage 0.15).  Cluster cases sit at the end of the
+ *	  dispatcher, guarded by #ifdef USE_PGRAC_CLUSTER, so PG's existing
+ *	  thirteen reasons keep their behaviour byte-for-byte and
+ *	  --disable-cluster builds match upstream PG exactly.
+ *
+ *	  Each cluster case calls a handler in src/backend/cluster/cluster_signal.c.
+ *	  Handlers are async-signal-safe (only set a volatile sig_atomic_t flag
+ *	  and SetLatch); real processing happens later via Process<X>Interrupt
+ *	  functions in the backend main loop.  Stage 0.15 ships only handlers;
+ *	  the matching consumers land in their owning subsystem specs.
+ *
+ *	  Related design:
+ *	    docs/cluster-signal-design.md v1.0
+ *	    specs/spec-0.15-signal-framework.md
+ *
+ *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
@@ -28,6 +51,10 @@
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/proc.h"
+
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_signal.h"		/* PGRAC: cluster handlers */
+#endif
 #include "storage/shmem.h"
 #include "storage/smgr.h"
 #include "storage/sinval.h"
@@ -681,6 +708,17 @@ procsignal_sigusr1_handler(SIGNAL_ARGS)
 
 	if (CheckProcSignal(PROCSIG_RECOVERY_CONFLICT_BUFFERPIN))
 		RecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_BUFFERPIN);
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: cluster signal dispatch.  Each cluster ProcSignalReason
+	 * lands in a handler under src/backend/cluster/cluster_signal.c.
+	 * See docs/cluster-signal-design.md for the registration roster
+	 * and async-signal-safety rules each handler must obey.
+	 */
+	if (CheckProcSignal(PROCSIG_CLUSTER_RECONFIG_START))
+		cluster_handle_reconfig_start_interrupt();
+#endif
 
 	SetLatch(MyLatch);
 

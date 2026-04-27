@@ -10,6 +10,24 @@
  * src/include/storage/procsignal.h
  *
  *-------------------------------------------------------------------------
+ *
+ * PGRAC MODIFICATIONS
+ *	  Modified by: SqlRush <sqlrush@gmail.com>
+ *	  Stage:        0.15
+ *
+ *	  Extended ProcSignalReason with cluster-specific reasons (currently
+ *	  PROCSIG_CLUSTER_RECONFIG_START).  Cluster reasons are appended at
+ *	  the end of the enum, guarded by #ifdef USE_PGRAC_CLUSTER, so PG's
+ *	  original 13 numeric positions are preserved and --disable-cluster
+ *	  builds remain byte-for-byte identical to upstream PG.
+ *
+ *	  Each cluster reason is dispatched in
+ *	  src/backend/storage/ipc/procsignal.c::procsignal_sigusr1_handler
+ *	  to a handler in src/backend/cluster/cluster_signal.c.  See
+ *	  docs/cluster-signal-design.md and
+ *	  specs/spec-0.15-signal-framework.md.
+ *
+ *-------------------------------------------------------------------------
  */
 #ifndef PROCSIGNAL_H
 #define PROCSIGNAL_H
@@ -45,6 +63,18 @@ typedef enum
 	PROCSIG_RECOVERY_CONFLICT_LOGICALSLOT,
 	PROCSIG_RECOVERY_CONFLICT_BUFFERPIN,
 	PROCSIG_RECOVERY_CONFLICT_STARTUP_DEADLOCK,
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: cluster ProcSignalReasons (stage 0.15+).
+	 * Appended after PG-native values to preserve the 0..13 numeric
+	 * positions for ABI compatibility.  Handlers live in
+	 * src/backend/cluster/cluster_signal.c.  See
+	 * docs/cluster-signal-design.md §3 for the full registration
+	 * roster and reservation policy.
+	 */
+	PROCSIG_CLUSTER_RECONFIG_START,	/* LMON: cluster reconfig starting */
+#endif
 
 	NUM_PROCSIGNALS				/* Must be last! */
 } ProcSignalReason;
