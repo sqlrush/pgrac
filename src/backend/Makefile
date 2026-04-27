@@ -42,10 +42,18 @@ SUBDIRS = access archive backup bootstrap catalog parser commands \
 	statistics storage tcop tsearch utils $(top_builddir)/src/timezone \
 	jit
 
-# PGRAC: include cluster subsystem only when --enable-cluster is set
-ifeq ($(enable_pgrac_cluster), yes)
+# PGRAC: cluster subsystem
+#
+# We always build src/backend/cluster (rather than guarding on
+# enable_pgrac_cluster) so the catalog SRFs declared in pg_proc.dat --
+# notably cluster_get_wait_events, registered unconditionally in
+# stage 0.16 -- have a backing C symbol in --disable-cluster builds.
+# Each cluster_*.c source file individually wraps cluster-specific
+# behavior in #ifdef USE_PGRAC_CLUSTER so disable-cluster builds run
+# the empty paths.  Stage 0.16 onward: the cluster/ subdir produces
+# objects in both build modes; only the runtime calls into them
+# (cluster_init_guc, cluster_init_shmem, ...) are gated.
 SUBDIRS += cluster
-endif
 
 include $(srcdir)/common.mk
 

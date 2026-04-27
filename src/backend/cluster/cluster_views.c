@@ -53,9 +53,18 @@
 
 /* ============================================================
  * cluster_get_wait_events -- backing SRF for pg_stat_cluster_wait_events
+ *
+ *	The function symbol is provided unconditionally so that pg_proc.dat
+ *	can reference it from both --enable-cluster and --disable-cluster
+ *	builds (initdb loads the catalog identically in both modes).  In
+ *	--disable-cluster builds the function returns an empty result set
+ *	since no cluster wait events are registered or routed through the
+ *	pgstat dispatch table.
  * ============================================================ */
 
 PG_FUNCTION_INFO_V1(cluster_get_wait_events);
+
+#ifdef USE_PGRAC_CLUSTER
 
 /*
  * Static table of cluster wait events known to the registration table.
@@ -140,33 +149,45 @@ static const uint32 cluster_wait_event_infos[CLUSTER_WAIT_EVENTS_COUNT] = {
 StaticAssertDecl(lengthof(cluster_wait_event_infos) == CLUSTER_WAIT_EVENTS_COUNT,
 				 "cluster_wait_event_infos length must equal CLUSTER_WAIT_EVENTS_COUNT");
 
+#endif /* USE_PGRAC_CLUSTER */
+
 
 Datum
 cluster_get_wait_events(PG_FUNCTION_ARGS)
 {
-	ReturnSetInfo *rsinfo = (ReturnSetInfo *)fcinfo->resultinfo;
-
 	/*
 	 * Use PG's helper to set up a tuplestore-returning SRF.  This pattern
 	 * matches pg_stat_get_subscription_stats and similar PG core SRFs.
 	 */
 	InitMaterializedSRF(fcinfo, 0);
 
-	for (int i = 0; i < CLUSTER_WAIT_EVENTS_COUNT; i++) {
-		uint32 info = cluster_wait_event_infos[i];
-		Datum values[2];
-		bool nulls[2] = { false, false };
-		const char *type;
-		const char *name;
+#ifdef USE_PGRAC_CLUSTER
+	{
+		ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 
-		type = pgstat_get_wait_event_type(info);
-		name = pgstat_get_wait_event(info);
+		for (int i = 0; i < CLUSTER_WAIT_EVENTS_COUNT; i++)
+		{
+			uint32		info = cluster_wait_event_infos[i];
+			Datum		values[2];
+			bool		nulls[2] = {false, false};
+			const char *type;
+			const char *name;
 
-		values[0] = CStringGetTextDatum(type ? type : "(unknown)");
-		values[1] = CStringGetTextDatum(name ? name : "(unknown)");
+			type = pgstat_get_wait_event_type(info);
+			name = pgstat_get_wait_event(info);
 
-		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+			values[0] = CStringGetTextDatum(type ? type : "(unknown)");
+			values[1] = CStringGetTextDatum(name ? name : "(unknown)");
+
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+		}
 	}
+#endif
 
-	return (Datum)0;
+	/*
+	 * In --disable-cluster builds we fall through with no rows emitted.
+	 * Querying pg_stat_cluster_wait_events then yields an empty result
+	 * set, which is the documented behavior for that build mode.
+	 */
+	return (Datum) 0;
 }
