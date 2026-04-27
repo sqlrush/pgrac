@@ -17,26 +17,29 @@
 /*
  * PGRAC MODIFICATIONS
  *   Modified by: SqlRush <sqlrush@gmail.com>
- *   Stage:        0.16
+ *   Stage:        0.16, 0.17
  *
  *   Appended pgrac cluster views at the end of this file under a
- *   clearly marked "PGRAC: cluster views" section.  Stage 0.16 ships
- *   ONE view: pg_stat_cluster_wait_events, backed by the
- *   cluster_get_wait_events SRF registered in pg_proc.dat (OID 8898).
+ *   clearly marked "PGRAC: cluster views" section.  Stage 0.16 added
+ *   pg_stat_cluster_wait_events (OID 8898 SRF).  Stage 0.17 added
+ *   pg_stat_gcluster_wait_events (OID 8899 SRF) -- the first pgrac
+ *   "global" view (cross-node placeholder; emits 46 rows for the local
+ *   node only at 0.17, evolves to a multi-node RPC fan-out at Stage 6+).
  *
  *   The cluster views block is currently UNCONDITIONAL: when
- *   --disable-cluster is used the cluster_get_wait_events SRF is still
- *   present in pg_proc (we keep the catalog identical across build
- *   modes to simplify pg_dump compatibility), but it returns an empty
- *   set and no cluster code emits to it.  Stage 0.30 may revisit and
- *   gate this block on a build-time guard if disable-mode parity
- *   becomes a hard requirement; right now the simpler path is
- *   preferred.  See docs/cluster-views-impl-design.md §5.4 for the
- *   disable-mode tradeoff discussion.
+ *   --disable-cluster is used the SRFs are still present in pg_proc
+ *   (we keep the catalog identical across build modes to simplify
+ *   pg_dump compatibility), but they return empty sets and no cluster
+ *   code emits to them.  Stage 0.30 may revisit and gate this block on
+ *   a build-time guard if disable-mode parity becomes a hard
+ *   requirement; right now the simpler path is preferred.  See
+ *   docs/cluster-views-impl-design.md §5.4 for the disable-mode
+ *   tradeoff discussion.
  *
  *   Related design:
- *     docs/cluster-views-impl-design.md v1.0
+ *     docs/cluster-views-impl-design.md v1.1
  *     specs/spec-0.16-views-framework.md
+ *     specs/spec-0.17-gviews-skeleton.md
  */
 
 CREATE VIEW pg_roles AS
@@ -1379,3 +1382,17 @@ CREATE VIEW pg_stat_cluster_wait_events AS
 
 REVOKE ALL ON pg_stat_cluster_wait_events FROM PUBLIC;
 GRANT SELECT ON pg_stat_cluster_wait_events TO PUBLIC;
+
+/*
+ * pg_stat_gcluster_wait_events -- first pgrac "global" (cluster-wide)
+ * view.  At stage 0.17 the SRF emits 46 rows for the local node only
+ * (node_id = cluster.node_id GUC); the column shape (node_id, type,
+ * name) is a stable contract from 0.17 onward and stays unchanged
+ * when Stage 6+ swaps the SRF body for a real cross-node RPC fan-out.
+ * See specs/spec-0.17-gviews-skeleton.md.
+ */
+CREATE VIEW pg_stat_gcluster_wait_events AS
+    SELECT node_id, type, name FROM cluster_get_gcluster_wait_events();
+
+REVOKE ALL ON pg_stat_gcluster_wait_events FROM PUBLIC;
+GRANT SELECT ON pg_stat_gcluster_wait_events TO PUBLIC;

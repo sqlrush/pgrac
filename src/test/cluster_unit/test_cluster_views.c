@@ -109,6 +109,15 @@ pgstat_get_wait_event_type(uint32 wait_event_info pg_attribute_unused())
 	return "";
 }
 
+/*
+ * cluster_node_id is defined in cluster_guc.o in real backend builds.
+ * Stage 0.17 added cluster_get_gcluster_wait_events to cluster_views.o,
+ * which references this symbol.  The unit test binary does not link
+ * cluster_guc.o, so provide a local definition with the same default
+ * value as the GUC.  Mirrors the stub in test_cluster_gviews.c.
+ */
+int cluster_node_id = -1;
+
 
 UT_DEFINE_GLOBALS();
 

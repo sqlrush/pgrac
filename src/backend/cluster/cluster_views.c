@@ -50,6 +50,10 @@
 
 #include "cluster/cluster_views.h"
 
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"		/* cluster_node_id */
+#endif
+
 
 /* ============================================================
  * cluster_get_wait_events -- backing SRF for pg_stat_cluster_wait_events
@@ -188,5 +192,66 @@ cluster_get_wait_events(PG_FUNCTION_ARGS)
 	 * Querying pg_stat_cluster_wait_events then yields an empty result
 	 * set, which is the documented behavior for that build mode.
 	 */
+	return (Datum)0;
+}
+
+
+/* ============================================================
+ * cluster_get_gcluster_wait_events -- backing SRF for
+ *	pg_stat_gcluster_wait_events.
+ *
+ *	Stage 0.17 placeholder: emits one row per registered cluster wait
+ *	event for the local node only (node_id taken from the cluster.node_id
+ *	GUC).  The outer loop over "known nodes" is structured so that future
+ *	cross-node RPC fan-out (Stage 6+ AD-007) replaces only the loop body
+ *	-- the (node_id, type, name) column contract stays stable from 0.17
+ *	onward.  See specs/spec-0.17-gviews-skeleton.md §2.5.
+ *
+ *	In --disable-cluster builds the SRF returns an empty result set, the
+ *	same convention as cluster_get_wait_events.
+ * ============================================================ */
+
+PG_FUNCTION_INFO_V1(cluster_get_gcluster_wait_events);
+
+Datum
+cluster_get_gcluster_wait_events(PG_FUNCTION_ARGS)
+{
+	InitMaterializedSRF(fcinfo, 0);
+
+#ifdef USE_PGRAC_CLUSTER
+	{
+		ReturnSetInfo *rsinfo = (ReturnSetInfo *)fcinfo->resultinfo;
+
+		/*
+		 * Stage 0.17 placeholder for the "known nodes" set.  Stage 6+ will
+		 * replace this with a Heartbeat-driven membership query (and the
+		 * inner emit branch with an RPC fan-out for non-self nodes).
+		 */
+		const int32 known_nodes[1] = { (int32)cluster_node_id };
+		const int n_nodes = 1;
+
+		for (int n = 0; n < n_nodes; n++) {
+			int32 nid = known_nodes[n];
+
+			for (int i = 0; i < CLUSTER_WAIT_EVENTS_COUNT; i++) {
+				uint32 info = cluster_wait_event_infos[i];
+				Datum values[3];
+				bool nulls[3] = { false, false, false };
+				const char *type;
+				const char *name;
+
+				type = pgstat_get_wait_event_type(info);
+				name = pgstat_get_wait_event(info);
+
+				values[0] = Int32GetDatum(nid);
+				values[1] = CStringGetTextDatum(type ? type : "(unknown)");
+				values[2] = CStringGetTextDatum(name ? name : "(unknown)");
+
+				tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+			}
+		}
+	}
+#endif
+
 	return (Datum)0;
 }

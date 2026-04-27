@@ -27,7 +27,8 @@ include $(top_builddir)/src/Makefile.global
 # Test source files (each becomes a standalone executable)
 TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_wait_events test_cluster_errcodes test_cluster_guc \
-        test_cluster_shmem test_cluster_signal test_cluster_views
+        test_cluster_shmem test_cluster_signal test_cluster_views \
+        test_cluster_gviews
 
 # Path to the cluster_version object (no PG deps, safe to link standalone).
 CLUSTER_VERSION_O = $(top_builddir)/src/backend/cluster/cluster_version.o
@@ -55,7 +56,7 @@ CLUSTER_VIEWS_O = $(top_builddir)/src/backend/cluster/cluster_views.o
 # test_cluster_shmem / test_cluster_signal / test_cluster_views have
 # separate rules because they also link additional cluster_*.o objects
 # (the test files stub the PG backend symbols those objects reference).
-SIMPLE_TESTS = $(filter-out test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views,$(TESTS))
+SIMPLE_TESTS = $(filter-out test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews,$(TESTS))
 
 $(SIMPLE_TESTS): %: %.c unit_test.h $(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) -o $@
@@ -86,6 +87,14 @@ test_cluster_signal: test_cluster_signal.c unit_test.h $(CLUSTER_VERSION_O) \
 # fmgr / tuplestore / wait event lookup machinery; the test stubs all
 # of them since the unit test only takes the SRF address (never invokes).
 test_cluster_views: test_cluster_views.c unit_test.h $(CLUSTER_VERSION_O) \
+		$(CLUSTER_VIEWS_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_VIEWS_O) -o $@
+
+# test_cluster_gviews shares cluster_views.o with test_cluster_views.
+# It additionally provides a local cluster_node_id symbol (real backend
+# gets it from cluster_guc.o; unit test stubs it as a plain int).
+test_cluster_gviews: test_cluster_gviews.c unit_test.h $(CLUSTER_VERSION_O) \
 		$(CLUSTER_VIEWS_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_VIEWS_O) -o $@

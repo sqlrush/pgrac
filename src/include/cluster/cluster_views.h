@@ -67,4 +67,21 @@
 extern Datum cluster_get_wait_events(PG_FUNCTION_ARGS);
 
 
+/*
+ * cluster_get_gcluster_wait_events -- SRF backing pg_stat_gcluster_wait_events.
+ *
+ *	Emits one row per (node, registered cluster wait event) pair:
+ *	    node_id int  -- the node that observed the event (-1 == self,
+ *	                    unconfigured)
+ *	    type text    -- same as cluster_get_wait_events
+ *	    name text    -- same as cluster_get_wait_events
+ *
+ *	Stage 0.17 returns 46 rows for the local node only; the SRF body is
+ *	written so that swapping the inner loop with a real cross-node RPC
+ *	fan-out (Stage 6+ AD-007) leaves the column shape unchanged.  The
+ *	column contract is a stable interface from 0.17 onward.
+ */
+extern Datum cluster_get_gcluster_wait_events(PG_FUNCTION_ARGS);
+
+
 #endif /* CLUSTER_VIEWS_H */

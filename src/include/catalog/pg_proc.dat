@@ -12,7 +12,7 @@
 #
 # PGRAC MODIFICATIONS
 #   Modified by: SqlRush <sqlrush@gmail.com>
-#   Stage:        0.16
+#   Stage:        0.16, 0.17
 #
 #   Appended pgrac cluster catalog functions at the end of this file
 #   under a clearly-marked "PGRAC: cluster catalog functions" section.
@@ -20,15 +20,20 @@
 #   pgrac-original catalog entries; see docs/cluster-views-impl-design.md
 #   §4.3 for the live OID allocation table.
 #
-#   Stage 0.16 ships ONE SRF: cluster_get_wait_events (OID 8898), backing
-#   the pg_stat_cluster_wait_events view declared in system_views.sql.
-#   Future cluster SRFs land here together with their owning subsystem
-#   spec; CATALOG_VERSION_NO must bump for every catalog change.
+#   Stage 0.16 added cluster_get_wait_events (OID 8898), backing the
+#   pg_stat_cluster_wait_events view declared in system_views.sql.
+#   Stage 0.17 added cluster_get_gcluster_wait_events (OID 8899), backing
+#   the pg_stat_gcluster_wait_events view (cross-node placeholder; emits
+#   46 rows for the local node only at 0.17, evolves to a multi-node
+#   RPC fan-out at Stage 6+).  Future cluster SRFs land here together
+#   with their owning subsystem spec; CATALOG_VERSION_NO must bump for
+#   every catalog change.
 #
 #   Related design:
-#     docs/cluster-views-impl-design.md v1.0 (registration policy)
-#     docs/performance-views-design.md v1.0 §2.2 (full view roster)
+#     docs/cluster-views-impl-design.md v1.1 (registration policy + OIDs)
+#     docs/performance-views-design.md v1.1 §2.2 (full view roster)
 #     specs/spec-0.16-views-framework.md
+#     specs/spec-0.17-gviews-skeleton.md
 #
 #----------------------------------------------------------------------
 
@@ -12080,5 +12085,18 @@
   proargmodes => '{o,o}',
   proargnames => '{type,name}',
   prosrc => 'cluster_get_wait_events' },
+
+# Stage 0.17: cross-node placeholder.  Emits 46 rows for the local node
+# at 0.17 (node_id = cluster.node_id GUC); evolves into a multi-node RPC
+# fan-out at Stage 6+.  Column shape (node_id, type, name) is a stable
+# contract from 0.17 onward.  See specs/spec-0.17-gviews-skeleton.md.
+{ oid => '8899', descr => 'list registered cluster wait events across cluster nodes',
+  proname => 'cluster_get_gcluster_wait_events', prorows => '46',
+  proretset => 't', provolatile => 's', proparallel => 'r',
+  prorettype => 'record', proargtypes => '',
+  proallargtypes => '{int4,text,text}',
+  proargmodes => '{o,o,o}',
+  proargnames => '{node_id,type,name}',
+  prosrc => 'cluster_get_gcluster_wait_events' },
 
 ]
