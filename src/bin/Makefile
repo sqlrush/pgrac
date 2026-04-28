@@ -8,6 +8,16 @@
 # src/bin/Makefile
 #
 #-------------------------------------------------------------------------
+#
+# PGRAC MODIFICATIONS
+#   Modified by: SqlRush <sqlrush@gmail.com>
+#   Stage:        0.20
+#
+#   Added "pgrac" SUBDIR (alphabetical position) so the
+#   pgrac-init / pgrac-start client tools land alongside initdb /
+#   pg_ctl after make install.  See specs/spec-0.20-init-tools.md.
+#
+#-------------------------------------------------------------------------
 
 subdir = src/bin
 top_builddir = ../..
@@ -31,6 +41,7 @@ SUBDIRS = \
 	pg_verifybackup \
 	pg_waldump \
 	pgbench \
+	pgrac \
 	psql \
 	scripts
 
