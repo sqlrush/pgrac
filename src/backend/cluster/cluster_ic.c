@@ -77,8 +77,7 @@ static bool
 stub_send_bytes(int32 target_node_id, const void *buf pg_attribute_unused(),
 				size_t len pg_attribute_unused())
 {
-	if (target_node_id == cluster_node_id)
-	{
+	if (target_node_id == cluster_node_id) {
 		/*
 		 * Self-targeted send is a no-op success.  Stage 0 unit / single
 		 * -node deployments need this path so callers can exercise the
@@ -88,26 +87,22 @@ stub_send_bytes(int32 target_node_id, const void *buf pg_attribute_unused(),
 		return true;
 	}
 
-	if (cluster_node_id == -1)
-	{
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("cluster.node_id is unconfigured (-1)"),
-				 errhint("Set cluster.node_id in postgresql.conf and restart.")));
+	if (cluster_node_id == -1) {
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("cluster.node_id is unconfigured (-1)"),
+						errhint("Set cluster.node_id in postgresql.conf and restart.")));
 	}
 
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("cross-node interconnect is not available in stub tier"),
-			 errhint("Set cluster.interconnect_tier to tier1 (Stage 2+) for "
-					 "real cross-node IPC.")));
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cross-node interconnect is not available in stub tier"),
+					errhint("Set cluster.interconnect_tier to tier1 (Stage 2+) for "
+							"real cross-node IPC.")));
 
 	return false; /* unreachable */
 }
 
 static bool
-stub_recv_bytes(int32 *out_sender_node_id pg_attribute_unused(),
-				void *buf pg_attribute_unused(),
+stub_recv_bytes(int32 *out_sender_node_id pg_attribute_unused(), void *buf pg_attribute_unused(),
 				size_t bufsize pg_attribute_unused(),
 				size_t *out_received_len pg_attribute_unused())
 {
@@ -143,33 +138,29 @@ const ClusterICOps ClusterICOps_Stub = {
 void
 cluster_ic_init(void)
 {
-	switch ((ClusterICTier) cluster_interconnect_tier)
-	{
-		case CLUSTER_IC_TIER_STUB:
-			ClusterICOps_Active = &ClusterICOps_Stub;
-			break;
+	switch ((ClusterICTier)cluster_interconnect_tier) {
+	case CLUSTER_IC_TIER_STUB:
+		ClusterICOps_Active = &ClusterICOps_Stub;
+		break;
 
-		case CLUSTER_IC_TIER_1:
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("cluster.interconnect_tier=tier1 is not implemented"),
-					 errhint("tier1 (TCP) lands in Stage 2; stay on stub for now.")));
-			break;
+	case CLUSTER_IC_TIER_1:
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cluster.interconnect_tier=tier1 is not implemented"),
+						errhint("tier1 (TCP) lands in Stage 2; stay on stub for now.")));
+		break;
 
-		case CLUSTER_IC_TIER_2:
-		case CLUSTER_IC_TIER_3:
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("cluster.interconnect_tier=tier2/tier3 is not implemented"),
-					 errhint("tier2/tier3 (RDMA) land in Stage 6+; stay on stub for now.")));
-			break;
+	case CLUSTER_IC_TIER_2:
+	case CLUSTER_IC_TIER_3:
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cluster.interconnect_tier=tier2/tier3 is not implemented"),
+						errhint("tier2/tier3 (RDMA) land in Stage 6+; stay on stub for now.")));
+		break;
 
-		default:
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("invalid cluster.interconnect_tier value: %d",
-							cluster_interconnect_tier)));
-			break;
+	default:
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid cluster.interconnect_tier value: %d", cluster_interconnect_tier)));
+		break;
 	}
 
 	Assert(ClusterICOps_Active != NULL);
@@ -179,8 +170,7 @@ cluster_ic_init(void)
 void
 cluster_ic_shutdown(void)
 {
-	if (ClusterICOps_Active != NULL)
-	{
+	if (ClusterICOps_Active != NULL) {
 		ClusterICOps_Active->tier_shutdown();
 		ClusterICOps_Active = NULL;
 	}
@@ -201,12 +191,11 @@ cluster_ic_send_bytes(int32 target_node_id, const void *buf, size_t len)
 }
 
 bool
-cluster_ic_recv_bytes(int32 *out_sender_node_id,
-					  void *buf, size_t bufsize, size_t *out_received_len)
+cluster_ic_recv_bytes(int32 *out_sender_node_id, void *buf, size_t bufsize,
+					  size_t *out_received_len)
 {
 	Assert(ClusterICOps_Active != NULL);
-	return ClusterICOps_Active->recv_bytes(out_sender_node_id, buf,
-										   bufsize, out_received_len);
+	return ClusterICOps_Active->recv_bytes(out_sender_node_id, buf, bufsize, out_received_len);
 }
 
 
@@ -226,8 +215,8 @@ static uint32 ic_global_seq_no = 0;
 static pg_crc32c
 compute_msg_crc(const ClusterMsgHeader *hdr, const void *payload, uint32 payload_len)
 {
-	pg_crc32c	crc;
-	const uint8 *hdr_bytes = (const uint8 *) hdr;
+	pg_crc32c crc;
+	const uint8 *hdr_bytes = (const uint8 *)hdr;
 	const size_t crc_offset = offsetof(ClusterMsgHeader, crc32);
 
 	INIT_CRC32C(crc);
@@ -239,8 +228,7 @@ compute_msg_crc(const ClusterMsgHeader *hdr, const void *payload, uint32 payload
 }
 
 bool
-cluster_msg_send(int32 target_node_id, uint16 msg_type,
-				 const void *payload, uint32 payload_len)
+cluster_msg_send(int32 target_node_id, uint16 msg_type, const void *payload, uint32 payload_len)
 {
 	ClusterMsgHeader hdr;
 
@@ -248,7 +236,7 @@ cluster_msg_send(int32 target_node_id, uint16 msg_type,
 	hdr.magic = PGRAC_IC_MAGIC;
 	hdr.protocol_version = PGRAC_IC_PROTOCOL_VERSION_V1;
 	hdr.msg_type = msg_type;
-	hdr.sender_node_id = (int16) cluster_node_id;
+	hdr.sender_node_id = (int16)cluster_node_id;
 	hdr.seq_no = ++ic_global_seq_no;
 	hdr.payload_len = payload_len;
 	hdr.crc32 = compute_msg_crc(&hdr, payload, payload_len);
@@ -263,71 +251,56 @@ cluster_msg_send(int32 target_node_id, uint16 msg_type,
 }
 
 bool
-cluster_msg_recv(ClusterMsgHeader *out_hdr,
-				 void *payload_buf, uint32 payload_buf_size)
+cluster_msg_recv(ClusterMsgHeader *out_hdr, void *payload_buf, uint32 payload_buf_size)
 {
-	int32		sender_node_id;
-	size_t		hdr_received;
-	size_t		payload_received;
-	pg_crc32c	expected_crc;
+	int32 sender_node_id;
+	size_t hdr_received;
+	size_t payload_received;
+	pg_crc32c expected_crc;
 
-	if (!cluster_ic_recv_bytes(&sender_node_id, out_hdr,
-							   sizeof(*out_hdr), &hdr_received))
+	if (!cluster_ic_recv_bytes(&sender_node_id, out_hdr, sizeof(*out_hdr), &hdr_received))
 		return false;
 
-	if (hdr_received != sizeof(*out_hdr))
-	{
-		ereport(WARNING,
-				(errmsg("cluster_msg_recv: short header read (%zu of %zu bytes)",
-						hdr_received, sizeof(*out_hdr))));
+	if (hdr_received != sizeof(*out_hdr)) {
+		ereport(WARNING, (errmsg("cluster_msg_recv: short header read (%zu of %zu bytes)",
+								 hdr_received, sizeof(*out_hdr))));
 		return false;
 	}
 
-	if (out_hdr->magic != PGRAC_IC_MAGIC)
-	{
-		ereport(WARNING,
-				(errmsg("cluster_msg_recv: bad magic 0x%08x (expected 0x%08x)",
-						out_hdr->magic, PGRAC_IC_MAGIC)));
+	if (out_hdr->magic != PGRAC_IC_MAGIC) {
+		ereport(WARNING, (errmsg("cluster_msg_recv: bad magic 0x%08x (expected 0x%08x)",
+								 out_hdr->magic, PGRAC_IC_MAGIC)));
 		return false;
 	}
 
-	if (out_hdr->protocol_version != PGRAC_IC_PROTOCOL_VERSION_V1)
-	{
-		ereport(WARNING,
-				(errmsg("cluster_msg_recv: unsupported protocol version %u",
-						out_hdr->protocol_version)));
+	if (out_hdr->protocol_version != PGRAC_IC_PROTOCOL_VERSION_V1) {
+		ereport(WARNING, (errmsg("cluster_msg_recv: unsupported protocol version %u",
+								 out_hdr->protocol_version)));
 		return false;
 	}
 
-	if (out_hdr->payload_len > payload_buf_size)
-	{
-		ereport(WARNING,
-				(errmsg("cluster_msg_recv: payload %u exceeds buffer %u",
-						out_hdr->payload_len, payload_buf_size)));
+	if (out_hdr->payload_len > payload_buf_size) {
+		ereport(WARNING, (errmsg("cluster_msg_recv: payload %u exceeds buffer %u",
+								 out_hdr->payload_len, payload_buf_size)));
 		return false;
 	}
 
-	if (out_hdr->payload_len > 0)
-	{
-		if (!cluster_ic_recv_bytes(&sender_node_id, payload_buf,
-								   payload_buf_size, &payload_received))
+	if (out_hdr->payload_len > 0) {
+		if (!cluster_ic_recv_bytes(&sender_node_id, payload_buf, payload_buf_size,
+								   &payload_received))
 			return false;
 
-		if (payload_received != out_hdr->payload_len)
-		{
-			ereport(WARNING,
-					(errmsg("cluster_msg_recv: short payload read (%zu of %u bytes)",
-							payload_received, out_hdr->payload_len)));
+		if (payload_received != out_hdr->payload_len) {
+			ereport(WARNING, (errmsg("cluster_msg_recv: short payload read (%zu of %u bytes)",
+									 payload_received, out_hdr->payload_len)));
 			return false;
 		}
 	}
 
 	expected_crc = compute_msg_crc(out_hdr, payload_buf, out_hdr->payload_len);
-	if (!EQ_CRC32C(expected_crc, out_hdr->crc32))
-	{
-		ereport(WARNING,
-				(errmsg("cluster_msg_recv: CRC mismatch (got 0x%08x expected 0x%08x)",
-						out_hdr->crc32, expected_crc)));
+	if (!EQ_CRC32C(expected_crc, out_hdr->crc32)) {
+		ereport(WARNING, (errmsg("cluster_msg_recv: CRC mismatch (got 0x%08x expected 0x%08x)",
+								 out_hdr->crc32, expected_crc)));
 		return false;
 	}
 
@@ -335,15 +308,13 @@ cluster_msg_recv(ClusterMsgHeader *out_hdr,
 }
 
 bool
-cluster_rpc_call(int32 target_node_id, uint16 msg_type,
-				 const void *req, uint32 req_len,
-				 void *resp_buf, uint32 resp_buf_size,
-				 uint32 *out_resp_len, int timeout_ms)
+cluster_rpc_call(int32 target_node_id, uint16 msg_type, const void *req, uint32 req_len,
+				 void *resp_buf, uint32 resp_buf_size, uint32 *out_resp_len, int timeout_ms)
 {
 	ClusterMsgHeader hdr;
-	uint32		sent_seq;
-	int			elapsed_ms = 0;
-	const int	poll_step_ms = 1;
+	uint32 sent_seq;
+	int elapsed_ms = 0;
+	const int poll_step_ms = 1;
 
 	/*
 	 * Capture the seq_no we are about to send so the receive loop can
@@ -354,12 +325,9 @@ cluster_rpc_call(int32 target_node_id, uint16 msg_type,
 	if (!cluster_msg_send(target_node_id, msg_type, req, req_len))
 		return false;
 
-	while (elapsed_ms < timeout_ms)
-	{
-		if (cluster_msg_recv(&hdr, resp_buf, resp_buf_size))
-		{
-			if (hdr.seq_no == sent_seq)
-			{
+	while (elapsed_ms < timeout_ms) {
+		if (cluster_msg_recv(&hdr, resp_buf, resp_buf_size)) {
+			if (hdr.seq_no == sent_seq) {
 				if (out_resp_len != NULL)
 					*out_resp_len = hdr.payload_len;
 				return true;

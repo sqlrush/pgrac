@@ -116,17 +116,15 @@ cluster_init_guc(void)
 	 * with a precise errhint.  See cluster_ic.c::cluster_ic_init and
 	 * docs/cluster-ic-design.md §3.
 	 */
-	DefineCustomEnumVariable("cluster.interconnect_tier",
-							 gettext_noop("Cluster interconnect tier vtable selection."),
-							 gettext_noop("stub (default) keeps cross-node IPC disabled; tier1 (TCP) "
-										  "lands in Stage 2; tier2 / tier3 (RDMA) land in Stage 6+. "
-										  "See docs/cluster-ic-design.md."),
-							 &cluster_interconnect_tier,
-							 CLUSTER_IC_TIER_STUB, /* boot value */
-							 cluster_interconnect_tier_options,
-							 PGC_POSTMASTER, /* tier change requires restart */
-							 0,				 /* flags */
-							 NULL,			 /* check_hook */
-							 NULL,			 /* assign_hook */
-							 NULL);			 /* show_hook */
+	DefineCustomEnumVariable(
+		"cluster.interconnect_tier", gettext_noop("Cluster interconnect tier vtable selection."),
+		gettext_noop("stub (default) keeps cross-node IPC disabled; tier1 (TCP) "
+					 "lands in Stage 2; tier2 / tier3 (RDMA) land in Stage 6+. "
+					 "See docs/cluster-ic-design.md."),
+		&cluster_interconnect_tier, CLUSTER_IC_TIER_STUB,  /* boot value */
+		cluster_interconnect_tier_options, PGC_POSTMASTER, /* tier change requires restart */
+		0,												   /* flags */
+		NULL,											   /* check_hook */
+		NULL,											   /* assign_hook */
+		NULL);											   /* show_hook */
 }

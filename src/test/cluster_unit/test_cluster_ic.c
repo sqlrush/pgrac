@@ -181,7 +181,7 @@ UT_TEST(test_msg_header_size_24)
 UT_TEST(test_msg_header_magic_constant)
 {
 	/* "ICRG" little-endian = 0x47435249 */
-	UT_ASSERT_EQ(PGRAC_IC_MAGIC, (uint32) 0x47435249);
+	UT_ASSERT_EQ(PGRAC_IC_MAGIC, (uint32)0x47435249);
 }
 
 UT_TEST(test_msg_header_protocol_v1)
@@ -197,37 +197,37 @@ UT_TEST(test_msg_header_protocol_v1)
 
 UT_TEST(test_ic_send_bytes_linkable)
 {
-	UT_ASSERT_NOT_NULL((void *) cluster_ic_send_bytes);
+	UT_ASSERT_NOT_NULL((void *)cluster_ic_send_bytes);
 }
 
 UT_TEST(test_ic_recv_bytes_linkable)
 {
-	UT_ASSERT_NOT_NULL((void *) cluster_ic_recv_bytes);
+	UT_ASSERT_NOT_NULL((void *)cluster_ic_recv_bytes);
 }
 
 UT_TEST(test_msg_send_linkable)
 {
-	UT_ASSERT_NOT_NULL((void *) cluster_msg_send);
+	UT_ASSERT_NOT_NULL((void *)cluster_msg_send);
 }
 
 UT_TEST(test_msg_recv_linkable)
 {
-	UT_ASSERT_NOT_NULL((void *) cluster_msg_recv);
+	UT_ASSERT_NOT_NULL((void *)cluster_msg_recv);
 }
 
 UT_TEST(test_rpc_call_linkable)
 {
-	UT_ASSERT_NOT_NULL((void *) cluster_rpc_call);
+	UT_ASSERT_NOT_NULL((void *)cluster_rpc_call);
 }
 
 UT_TEST(test_ic_init_linkable)
 {
-	UT_ASSERT_NOT_NULL((void *) cluster_ic_init);
+	UT_ASSERT_NOT_NULL((void *)cluster_ic_init);
 }
 
 UT_TEST(test_ic_shutdown_linkable)
 {
-	UT_ASSERT_NOT_NULL((void *) cluster_ic_shutdown);
+	UT_ASSERT_NOT_NULL((void *)cluster_ic_shutdown);
 }
 
 
@@ -243,12 +243,12 @@ UT_TEST(test_stub_vtable_tier_name)
 
 UT_TEST(test_stub_vtable_send_nonnull)
 {
-	UT_ASSERT_NOT_NULL((void *) ClusterICOps_Stub.send_bytes);
+	UT_ASSERT_NOT_NULL((void *)ClusterICOps_Stub.send_bytes);
 }
 
 UT_TEST(test_stub_vtable_recv_nonnull)
 {
-	UT_ASSERT_NOT_NULL((void *) ClusterICOps_Stub.recv_bytes);
+	UT_ASSERT_NOT_NULL((void *)ClusterICOps_Stub.recv_bytes);
 }
 
 

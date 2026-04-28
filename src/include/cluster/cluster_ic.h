@@ -82,13 +82,13 @@ typedef enum ClusterICTier {
  * Wire protocol version.  Bumped when ClusterMsgHeader changes shape.
  * Stage 0.18 starts at 1.
  */
-#define PGRAC_IC_PROTOCOL_VERSION_V1 ((uint8) 1)
+#define PGRAC_IC_PROTOCOL_VERSION_V1 ((uint8)1)
 
 /*
  * Exact size of ClusterMsgHeader, anchored as a constant for unit
  * tests and for cross-checking against StaticAssertDecl in cluster_ic.c.
  */
-#define PGRAC_IC_HEADER_BYTES		24
+#define PGRAC_IC_HEADER_BYTES 24
 
 
 /*
@@ -100,17 +100,16 @@ typedef enum ClusterICTier {
  *	fields are zero-filled by the sender and ignored by the receiver
  *	at protocol_version 1.
  */
-typedef struct ClusterMsgHeader
-{
-	uint32		magic;			/* PGRAC_IC_MAGIC */
-	uint8		protocol_version;	/* PGRAC_IC_PROTOCOL_VERSION_V1 */
-	uint8		reserved1;
-	uint16		msg_type;		/* subsystem-defined, registered in Stage 2+ */
-	int16		sender_node_id;
-	int16		reserved2;
-	uint32		seq_no;			/* per-target monotonic; wraps */
-	uint32		payload_len;	/* bytes in payload following the header */
-	pg_crc32c	crc32;			/* CRC32C over (header excl crc) + payload */
+typedef struct ClusterMsgHeader {
+	uint32 magic;			/* PGRAC_IC_MAGIC */
+	uint8 protocol_version; /* PGRAC_IC_PROTOCOL_VERSION_V1 */
+	uint8 reserved1;
+	uint16 msg_type; /* subsystem-defined, registered in Stage 2+ */
+	int16 sender_node_id;
+	int16 reserved2;
+	uint32 seq_no;		/* per-target monotonic; wraps */
+	uint32 payload_len; /* bytes in payload following the header */
+	pg_crc32c crc32;	/* CRC32C over (header excl crc) + payload */
 } ClusterMsgHeader;
 
 
@@ -138,13 +137,12 @@ typedef struct ClusterMsgHeader
  *	Function-pointer fields must remain non-NULL for any vtable shipped;
  *	NULL is never a valid value at runtime (cluster_ic_init asserts).
  */
-typedef struct ClusterICOps
-{
-	bool		(*send_bytes) (int32 target_node_id, const void *buf, size_t len);
-	bool		(*recv_bytes) (int32 *out_sender_node_id,
-							   void *buf, size_t bufsize, size_t *out_received_len);
-	void		(*tier_init) (void);
-	void		(*tier_shutdown) (void);
+typedef struct ClusterICOps {
+	bool (*send_bytes)(int32 target_node_id, const void *buf, size_t len);
+	bool (*recv_bytes)(int32 *out_sender_node_id, void *buf, size_t bufsize,
+					   size_t *out_received_len);
+	void (*tier_init)(void);
+	void (*tier_shutdown)(void);
 	const char *tier_name;
 } ClusterICOps;
 
@@ -189,10 +187,8 @@ extern void cluster_ic_shutdown(void);
  *	use cluster_msg_send / cluster_msg_recv instead.
  * ----------
  */
-extern bool cluster_ic_send_bytes(int32 target_node_id,
-								  const void *buf, size_t len);
-extern bool cluster_ic_recv_bytes(int32 *out_sender_node_id,
-								  void *buf, size_t bufsize,
+extern bool cluster_ic_send_bytes(int32 target_node_id, const void *buf, size_t len);
+extern bool cluster_ic_recv_bytes(int32 *out_sender_node_id, void *buf, size_t bufsize,
 								  size_t *out_received_len);
 
 
@@ -214,16 +210,14 @@ extern bool cluster_ic_recv_bytes(int32 *out_sender_node_id,
  *	    listener producing replies.
  * ----------
  */
-extern bool cluster_msg_send(int32 target_node_id, uint16 msg_type,
-							 const void *payload, uint32 payload_len);
+extern bool cluster_msg_send(int32 target_node_id, uint16 msg_type, const void *payload,
+							 uint32 payload_len);
 
-extern bool cluster_msg_recv(ClusterMsgHeader *out_hdr,
-							 void *payload_buf, uint32 payload_buf_size);
+extern bool cluster_msg_recv(ClusterMsgHeader *out_hdr, void *payload_buf, uint32 payload_buf_size);
 
-extern bool cluster_rpc_call(int32 target_node_id, uint16 msg_type,
-							 const void *req, uint32 req_len,
-							 void *resp_buf, uint32 resp_buf_size,
-							 uint32 *out_resp_len, int timeout_ms);
+extern bool cluster_rpc_call(int32 target_node_id, uint16 msg_type, const void *req, uint32 req_len,
+							 void *resp_buf, uint32 resp_buf_size, uint32 *out_resp_len,
+							 int timeout_ms);
 
 #endif /* USE_PGRAC_CLUSTER */
 
