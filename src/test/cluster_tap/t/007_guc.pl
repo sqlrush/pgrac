@@ -47,17 +47,16 @@ use Test::More;
 use PgracClusterNode;
 
 
-my $node = PostgreSQL::Test::Cluster->new('main');
+my $node = PgracClusterNode->new('main');
 $node->init;
 $node->start;
 
 
 # ----------
-# Boot default is -1.
+# Boot default is -1.  Uses the spec-0.22 assert_cluster_guc helper.
 # ----------
-is($node->safe_psql('postgres', q{SHOW "cluster.node_id"}),
-   '-1',
-   'cluster.node_id default is -1 (unconfigured)');
+$node->assert_cluster_guc('cluster.node_id', '-1',
+	'cluster.node_id default is -1 (unconfigured)');
 
 
 # ----------
@@ -90,9 +89,8 @@ $node->stop;
 $node->append_conf('postgresql.conf', "cluster.node_id = 7\n");
 $node->start;
 
-is($node->safe_psql('postgres', q{SHOW "cluster.node_id"}),
-   '7',
-   'postgresql.conf override applied across restart (cluster.node_id = 7)');
+$node->assert_cluster_guc('cluster.node_id', '7',
+	'postgresql.conf override applied across restart (cluster.node_id = 7)');
 
 
 # ----------

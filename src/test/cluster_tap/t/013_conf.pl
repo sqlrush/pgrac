@@ -48,7 +48,7 @@ use Test::More;
 use PgracClusterNode;
 
 
-my $node = PostgreSQL::Test::Cluster->new('main');
+my $node = PgracClusterNode->new('main');
 $node->init;
 $node->start;
 
@@ -83,8 +83,8 @@ like($stderr, qr/cannot be changed without restarting the server/i,
 # never created one in this PGDATA.  pg_cluster_nodes must return 1
 # row for the local node (is_self = true).
 # ----------
-is($node->safe_psql('postgres', 'SELECT count(*) FROM pg_cluster_nodes'),
-	'1',
+# Uses spec-0.22 assert_pg_cluster_nodes_count helper.
+$node->assert_pg_cluster_nodes_count('1',
 	'pg_cluster_nodes returns 1 row in single-node degraded mode');
 
 is($node->safe_psql('postgres',

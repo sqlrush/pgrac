@@ -47,16 +47,15 @@ use Test::More;
 use PgracClusterNode;
 
 
-my $node = PostgreSQL::Test::Cluster->new('main');
+my $node = PgracClusterNode->new('main');
 $node->init;
 $node->start;
 
 
 # ----------
-# Default value is 'stub'.
+# Default value is 'stub'.  Uses spec-0.22 assert_cluster_guc helper.
 # ----------
-is($node->safe_psql('postgres', q{SHOW "cluster.interconnect_tier"}),
-	'stub',
+$node->assert_cluster_guc('cluster.interconnect_tier', 'stub',
 	'cluster.interconnect_tier default is stub');
 
 
@@ -123,10 +122,12 @@ my $start_failed = !$node->start(fail_ok => 1);
 ok($start_failed,
 	'server refuses to start with cluster.interconnect_tier = tier1 (Stage 2+)');
 
-my $log = PostgreSQL::Test::Utils::slurp_file($node->logfile);
-like($log, qr/tier1.*not implemented/i,
+# Use spec-0.22 wait_for_log_match (replaces slurp_file + like).  The
+# log file is already complete here -- postmaster crashed and left it
+# on disk -- so wait_for_log_match returns on the first poll iteration.
+ok(defined $node->wait_for_log_match(qr/tier1.*not implemented/i, 5),
 	'startup failure log mentions tier1 not implemented');
-like($log, qr/Stage 2/,
+ok(defined $node->wait_for_log_match(qr/Stage 2/, 5),
 	'startup failure errhint points to Stage 2');
 
 
@@ -139,8 +140,7 @@ $start_failed = !$node->start(fail_ok => 1);
 ok($start_failed,
 	'server refuses to start with cluster.interconnect_tier = tier2 (Stage 6+)');
 
-$log = PostgreSQL::Test::Utils::slurp_file($node->logfile);
-like($log, qr/Stage 6/,
+ok(defined $node->wait_for_log_match(qr/Stage 6/, 5),
 	'startup failure errhint for tier2 points to Stage 6+');
 
 
@@ -149,8 +149,7 @@ like($log, qr/Stage 6/,
 # ----------
 $node->adjust_conf('postgresql.conf', 'cluster.interconnect_tier', 'stub');
 $node->start;
-is($node->safe_psql('postgres', q{SHOW "cluster.interconnect_tier"}),
-	'stub',
+$node->assert_cluster_guc('cluster.interconnect_tier', 'stub',
 	'server recovers after reverting to stub tier');
 
 
