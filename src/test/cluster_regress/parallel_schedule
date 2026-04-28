@@ -1,0 +1,6 @@
+# pgrac cluster regression schedule (stage 0.21)
+# Stage 2+ contributors append additional "test: <name>" lines as
+# their feature spec lands.  See README.md for the contribution
+# procedure.
+
+test: cluster_smoke
