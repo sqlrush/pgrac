@@ -228,3 +228,63 @@ jobs:
             exit 1
           fi
           echo "OK: no cluster symbols in disable-mode binary"
+
+
+  # ====================================================================
+  # security-static-analysis: cppcheck + scan-build (warn-only stage 0.27.5)
+  # --------------------------------------------------------------------
+  # Spec:    pgrac/specs/spec-0.27.5-static-analysis.md
+  # Design:  pgrac/docs/ci-static-analysis.md
+  # Scope:   src/backend/cluster/ + src/include/cluster/ +
+  #          src/test/cluster_unit/ (avoid PG-upstream noise)
+  # Mode:    warn-only (continue-on-error: true) until Stage 0.30
+  #          verification spec switches to strict.
+  # ====================================================================
+  security-static-analysis:
+    name: Security (cppcheck + scan-build)
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true   # warn-only at stage 0.27.5 - 0.30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            cppcheck clang-tools python3 \
+            build-essential libreadline-dev zlib1g-dev libicu-dev \
+            liblz4-dev libzstd-dev libssl-dev libxml2-dev pkg-config
+          cppcheck --version
+          scan-build --help | head -5
+
+      - name: Configure (--enable-cluster)
+        run: |
+          ./configure \
+            --prefix=$HOME/pgrac-install \
+            --enable-cassert --enable-debug \
+            --with-openssl --with-icu --with-lz4 --with-zstd \
+            --enable-cluster
+
+      - name: Generate headers (needed by cppcheck includes)
+        run: make -C src/backend generated-headers
+
+      - name: Run cppcheck
+        run: bash scripts/ci/run-cppcheck.sh
+
+      - name: Run scan-build
+        run: bash scripts/ci/run-scan-build.sh
+
+      - name: Upload SARIF / HTML reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: static-analysis-report
+          path: |
+            cppcheck.xml
+            cppcheck-summary.txt
+            scan-build-report/
+          if-no-files-found: warn
+          retention-days: 30

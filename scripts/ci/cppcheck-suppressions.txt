@@ -1,0 +1,27 @@
+# ----------------------------------------------------------------------
+# cppcheck-suppressions.txt
+#
+# External suppression list for cppcheck, consumed by
+# scripts/ci/run-cppcheck.sh via --suppressions-list.
+#
+# Spec:   pgrac/specs/spec-0.27.5-static-analysis.md
+# Design: pgrac/docs/ci-static-analysis.md
+#
+# Format: <id>[:<file>[:<line>]]
+#   id      : cppcheck rule id (e.g. unreachableCode, nullPointer)
+#   file    : path relative to repo root, optional
+#   line    : line number, optional (use only when narrow match needed)
+#
+# RULE: every suppression entry MUST be preceded by a one-line
+# "Reason:" comment explaining why the cppcheck warning is wrong or
+# unactionable.  See spec-0.27.5 §3.4 (suppression maintenance) and
+# CLAUDE.md rule 21 (no silent design overrides).
+#
+# Stage 0.30 verification re-reviews every entry to confirm the Reason
+# is still valid.
+#
+# ----------------------------------------------------------------------
+#
+# (No entries yet.  Populated at spec-0.27.5 §8.7 after the first
+# baseline scan review.)
+#
