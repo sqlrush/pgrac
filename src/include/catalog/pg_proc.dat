@@ -12,7 +12,7 @@
 #
 # PGRAC MODIFICATIONS
 #   Modified by: SqlRush <sqlrush@gmail.com>
-#   Stage:        0.16, 0.17, 0.19
+#   Stage:        0.16, 0.17, 0.19, 0.26
 #
 #   Appended pgrac cluster catalog functions at the end of this file
 #   under a clearly-marked "PGRAC: cluster catalog functions" section.
@@ -20,17 +20,14 @@
 #   pgrac-original catalog entries; see docs/cluster-views-impl-design.md
 #   §4.3 for the live OID allocation table.
 #
-#   Stage 0.16 added cluster_get_wait_events (OID 8898), backing the
-#   pg_stat_cluster_wait_events view declared in system_views.sql.
-#   Stage 0.17 added cluster_get_gcluster_wait_events (OID 8899), backing
-#   the pg_stat_gcluster_wait_events view (cross-node placeholder; emits
-#   46 rows for the local node only at 0.17, evolves to a multi-node
-#   RPC fan-out at Stage 6+).
-#   Stage 0.19 added cluster_get_nodes (OID 8900), backing the
-#   pg_cluster_nodes view (cluster topology from pgrac.conf; SSOT for
-#   Stage 2+ Interconnect / Heartbeat / Reconfig membership lookup).
-#   Future cluster SRFs land here together with their owning subsystem
-#   spec; CATALOG_VERSION_NO must bump for every catalog change.
+#   Stage 0.16 added cluster_get_wait_events (OID 8898).
+#   Stage 0.17 added cluster_get_gcluster_wait_events (OID 8899).
+#   Stage 0.19 added cluster_get_nodes (OID 8900).
+#   Stage 0.26 added cluster_ic_mock_inject / drain_outbound /
+#   clear_all / recv_test (OIDs 8901..8904), used by the mock-tier
+#   test surface.  Future cluster SRFs land here together with their
+#   owning subsystem spec; CATALOG_VERSION_NO must bump for every
+#   catalog change.
 #
 #   Related design:
 #     docs/cluster-views-impl-design.md v1.1 (registration policy + OIDs)
@@ -12117,5 +12114,38 @@
   proargmodes => '{o,o,o,o,o,o,o}',
   proargnames => '{node_id,hostname,interconnect_addr,public_addr,role,region,is_self}',
   prosrc => 'cluster_get_nodes' },
+
+# Stage 0.26: cluster_ic mock-tier test utilities.  Per-backend
+# in-memory queues simulating cross-node IPC.  Require
+# cluster.interconnect_tier = 'mock' (raise FEATURE_NOT_SUPPORTED
+# otherwise).
+{ oid => '8901', descr => 'inject a fake inbound message into the mock interconnect queue',
+  proname => 'cluster_ic_mock_inject', provolatile => 'v', proparallel => 'u',
+  prorettype => 'void', proargtypes => 'int4 bytea',
+  proargnames => '{from_node,payload}',
+  prosrc => 'cluster_ic_mock_inject' },
+
+{ oid => '8902', descr => 'drain queued outbound mock messages for a target node',
+  proname => 'cluster_ic_mock_drain_outbound', prorows => '8',
+  proretset => 't', provolatile => 'v', proparallel => 'u',
+  prorettype => 'record', proargtypes => 'int4',
+  proallargtypes => '{int4,int4,bytea}',
+  proargmodes => '{i,o,o}',
+  proargnames => '{target_node,sender,payload}',
+  prosrc => 'cluster_ic_mock_drain_outbound' },
+
+{ oid => '8903', descr => 'reset all mock interconnect queues',
+  proname => 'cluster_ic_mock_clear_all', provolatile => 'v', proparallel => 'u',
+  prorettype => 'void', proargtypes => '',
+  prosrc => 'cluster_ic_mock_clear_all' },
+
+{ oid => '8904', descr => 'pop one inbound mock message via cluster_ic_recv_bytes',
+  proname => 'cluster_ic_mock_recv_test', prorows => '1',
+  proretset => 't', provolatile => 'v', proparallel => 'u',
+  prorettype => 'record', proargtypes => '',
+  proallargtypes => '{int4,bytea}',
+  proargmodes => '{o,o}',
+  proargnames => '{sender,payload}',
+  prosrc => 'cluster_ic_mock_recv_test' },
 
 ]

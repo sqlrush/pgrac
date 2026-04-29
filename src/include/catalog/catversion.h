@@ -64,6 +64,7 @@
 /*               pg_stat_gcluster_wait_events view (spec-0.17, stage 0.17). */
 /*  - 202604280: cluster_get_nodes SRF + pg_cluster_nodes view */
 /*               (spec-0.19, stage 0.19). */
-#define CATALOG_VERSION_NO	202604280
+/*  - 202604290: cluster_ic_mock_* test SRFs (spec-0.26, stage 0.26). */
+#define CATALOG_VERSION_NO	202604290
 
 #endif

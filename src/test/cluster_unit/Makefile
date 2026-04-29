@@ -28,7 +28,8 @@ include $(top_builddir)/src/Makefile.global
 TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_wait_events test_cluster_errcodes test_cluster_guc \
         test_cluster_shmem test_cluster_signal test_cluster_views \
-        test_cluster_gviews test_cluster_ic test_cluster_conf
+        test_cluster_gviews test_cluster_ic test_cluster_conf \
+        test_cluster_ic_mock
 
 # Path to the cluster_version object (no PG deps, safe to link standalone).
 CLUSTER_VERSION_O = $(top_builddir)/src/backend/cluster/cluster_version.o
@@ -60,7 +61,7 @@ CLUSTER_CONF_O = $(top_builddir)/src/backend/cluster/cluster_conf.o
 # separate rules because they also link additional cluster_*.o
 # objects (the test files stub the PG backend symbols those
 # objects reference).
-SIMPLE_TESTS = $(filter-out test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf,$(TESTS))
+SIMPLE_TESTS = $(filter-out test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf test_cluster_ic_mock,$(TESTS))
 
 $(SIMPLE_TESTS): %: %.c unit_test.h $(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) -o $@
@@ -122,6 +123,17 @@ test_cluster_conf: test_cluster_conf.c unit_test.h $(CLUSTER_VERSION_O) \
 		$(CLUSTER_CONF_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_CONF_O) -o $@
+
+# test_cluster_ic_mock links cluster_ic.o standalone (same as
+# test_cluster_ic but exercises the mock vtable additions and the four
+# cluster_ic_mock_* SRF entry points shipped at stage 0.26).  The unit
+# test only takes addresses and reads constants -- the SRF bodies and
+# any ereport / palloc / tuplestore paths are not invoked, so the
+# stubs in test_cluster_ic_mock.c suffice.
+test_cluster_ic_mock: test_cluster_ic_mock.c unit_test.h $(CLUSTER_VERSION_O) \
+		$(CLUSTER_IC_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_IC_O) -o $@
 
 
 # ----------

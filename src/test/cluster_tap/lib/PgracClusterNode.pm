@@ -36,6 +36,13 @@
 #    fence_node, ...) land here at the same time as their first
 #    multi-node spec; see specs/spec-0.22-tap-helpers.md §1.2.
 #
+#    Stage 0.26 added three thin helpers (mock_inject_msg,
+#    mock_drain_outbound, mock_clear_all) that call into the mock
+#    interconnect SRFs shipped in cluster_ic.c.  These let TAP tests
+#    drive the cross-node IPC simulation queue from a single PG
+#    instance with cluster.interconnect_tier = 'mock'; see
+#    specs/spec-0.26-mock-framework.md.
+#
 #-------------------------------------------------------------------------
 
 package PgracClusterNode;
@@ -222,6 +229,91 @@ sub wait_for_log_match
 		usleep(250_000);    # 250 ms
 	}
 	return undef;
+}
+
+
+#-----------------------------------------------------------------------
+# mock_inject_msg -- Inject a single inbound message via the mock IC.
+#
+#	Wraps SELECT cluster_ic_mock_inject($sender, '\x...'::bytea).
+#	The injected message is queued onto the calling backend's mock
+#	inbound queue and becomes visible to cluster_ic_recv_bytes (or
+#	cluster_ic_mock_recv_test) on the same backend.
+#
+#	Caller MUST ensure cluster.interconnect_tier = 'mock' is in effect
+#	for the session; the SRF body raises ERROR otherwise.
+#
+# Args:
+#	$sender:   sender node id (int)
+#	$payload:  payload as a hex string (e.g. 'deadbeef'); empty string
+#	           => empty bytea
+#
+# Returns:
+#	Whatever safe_psql returns (empty string on success).
+#-----------------------------------------------------------------------
+sub mock_inject_msg
+{
+	my ($self, $sender, $payload) = @_;
+	$payload //= '';
+
+	return $self->safe_psql('postgres',
+		qq{SELECT cluster_ic_mock_inject($sender, '\\x$payload'::bytea)});
+}
+
+
+#-----------------------------------------------------------------------
+# mock_drain_outbound -- Drain queued outbound messages for a target.
+#
+#	Wraps SELECT * FROM cluster_ic_mock_drain_outbound($target).
+#	Returns a list of [sender, payload_hex] arrayrefs in FIFO order;
+#	the empty list if no messages are queued for that target.  The
+#	target's outbound queue is cleared as a side effect.
+#
+#	Caller MUST ensure cluster.interconnect_tier = 'mock' is in effect
+#	for the session; the SRF body raises ERROR otherwise.
+#
+# Args:
+#	$target: target node id (int)
+#
+# Returns:
+#	List of [sender, payload_hex] arrayrefs.
+#-----------------------------------------------------------------------
+sub mock_drain_outbound
+{
+	my ($self, $target) = @_;
+
+	my $out = $self->safe_psql('postgres',
+		qq{SELECT sender, encode(payload, 'hex') }
+			. qq{FROM cluster_ic_mock_drain_outbound($target)});
+	return () if $out eq '';
+
+	my @rows;
+	for my $line (split /\n/, $out)
+	{
+		my ($sender, $hex) = split /\|/, $line, 2;
+		push @rows, [ $sender, $hex // '' ];
+	}
+	return @rows;
+}
+
+
+#-----------------------------------------------------------------------
+# mock_clear_all -- Reset every mock queue (inbound + all outbounds).
+#
+#	Wraps SELECT cluster_ic_mock_clear_all().  Useful between sub-tests
+#	to guarantee a clean queue state.
+#
+#	Caller MUST ensure cluster.interconnect_tier = 'mock' is in effect
+#	for the session; the SRF body raises ERROR otherwise.
+#
+# Returns:
+#	Whatever safe_psql returns (empty string on success).
+#-----------------------------------------------------------------------
+sub mock_clear_all
+{
+	my ($self) = @_;
+
+	return $self->safe_psql('postgres', 'SELECT cluster_ic_mock_clear_all()');
 }
 
 

@@ -66,9 +66,18 @@
  *	macro-expanded into errstart/errmsg/errfinish.  We provide minimal
  *	stubs for those so the linker is satisfied.  The tests below never
  *	invoke a path that triggers ereport.
+ *
+ *	Stage 0.26 added the mock vtable + four cluster_ic_mock_* SRFs to
+ *	cluster_ic.o; their bodies reference palloc / pfree / TopMemoryContext
+ *	/ pg_detoast_datum_packed / InitMaterializedSRF / tuplestore_putvalues.
+ *	None of those paths are exercised here, so the additional stubs are
+ *	inert.
  * ----------
  */
+#include "fmgr.h"
+#include "funcapi.h"
 #include "utils/elog.h"
+#include "utils/memutils.h"
 
 int cluster_node_id = -1;
 int cluster_interconnect_tier = 0; /* CLUSTER_IC_TIER_STUB */
@@ -173,6 +182,48 @@ pg_comp_crc32c_armv8(pg_crc32c crc, const void *data pg_attribute_unused(),
  * resolve.  Initialise to the local sse42 stub above for safety.
  */
 pg_crc32c (*pg_comp_crc32c)(pg_crc32c crc, const void *data, size_t len) = pg_comp_crc32c_sse42;
+
+/*
+ * Stage 0.26 mock-vtable / mock-SRF dependencies.  Tests below take
+ * only addresses; bodies never run, stubs satisfy the linker.
+ * MemoryContextSwitchTo is a static inline in palloc.h so no stub is
+ * needed for it.
+ */
+MemoryContext TopMemoryContext = NULL;
+MemoryContext CurrentMemoryContext = NULL;
+
+void *
+palloc(Size size pg_attribute_unused())
+{
+	return NULL;
+}
+
+void *
+palloc0(Size size pg_attribute_unused())
+{
+	return NULL;
+}
+
+void
+pfree(void *pointer pg_attribute_unused())
+{}
+
+struct varlena *
+pg_detoast_datum_packed(struct varlena *datum)
+{
+	return datum;
+}
+
+void
+InitMaterializedSRF(FunctionCallInfo fcinfo pg_attribute_unused(),
+					bits32 flags pg_attribute_unused())
+{}
+
+void
+tuplestore_putvalues(Tuplestorestate *state pg_attribute_unused(),
+					 TupleDesc tdesc pg_attribute_unused(), Datum *values pg_attribute_unused(),
+					 bool *isnull pg_attribute_unused())
+{}
 
 
 UT_DEFINE_GLOBALS();

@@ -51,6 +51,7 @@
 #ifndef CLUSTER_IC_H
 #define CLUSTER_IC_H
 
+#include "fmgr.h"
 #include "port/pg_crc32c.h"
 
 
@@ -58,14 +59,15 @@
  * ClusterICTier -- the four interconnect tiers defined in
  *	interconnect-tier-strategy.md.  The cluster.interconnect_tier GUC
  *	maps onto this enum; cluster_ic_init picks the corresponding
- *	vtable.  Stage 0.18 only supports CLUSTER_IC_TIER_STUB; tier1
- *	lands in Stage 2, tier2/tier3 in Stage 6+.
+ *	vtable.  CLUSTER_IC_TIER_STUB and CLUSTER_IC_TIER_MOCK are
+ *	supported; tier1 lands later, tier2/tier3 later still.
  */
 typedef enum ClusterICTier {
 	CLUSTER_IC_TIER_STUB = 0,
 	CLUSTER_IC_TIER_1 = 1,
 	CLUSTER_IC_TIER_2 = 2,
-	CLUSTER_IC_TIER_3 = 3
+	CLUSTER_IC_TIER_3 = 3,
+	CLUSTER_IC_TIER_MOCK = 4
 } ClusterICTier;
 
 
@@ -147,6 +149,7 @@ typedef struct ClusterICOps {
 } ClusterICOps;
 
 extern const ClusterICOps ClusterICOps_Stub;
+extern const ClusterICOps ClusterICOps_Mock;
 extern const ClusterICOps *ClusterICOps_Active;
 
 
@@ -220,5 +223,38 @@ extern bool cluster_rpc_call(int32 target_node_id, uint16 msg_type, const void *
 							 int timeout_ms);
 
 #endif /* USE_PGRAC_CLUSTER */
+
+
+/* ----------
+ * Mock-tier SRF surface.  These functions are unconditional symbols
+ * (referenced unconditionally from pg_proc.dat); the bodies are
+ * #ifdef USE_PGRAC_CLUSTER guarded and return errors / empty in
+ * disable-cluster builds.
+ *
+ *	cluster_ic_mock_inject(from int4, payload bytea) RETURNS void
+ *	    Push (from_node, payload) into this backend's mock_inbound_queue.
+ *	    Subsequent cluster_ic_recv_bytes / cluster_msg_recv calls in
+ *	    the same backend will dequeue this entry.  ERRORs unless
+ *	    cluster.interconnect_tier = 'mock'.
+ *
+ *	cluster_ic_mock_drain_outbound(target int4)
+ *	    RETURNS SETOF (sender int4, payload bytea)
+ *	    Drain all queued outbound messages whose target is `target`.
+ *	    Returns one row per message (FIFO); clears that target's
+ *	    outbound queue.  ERRORs unless tier='mock' or target out of [0, 127].
+ *
+ *	cluster_ic_mock_clear_all() RETURNS void
+ *	    Reset all mock queues (inbound + every target's outbound).
+ *
+ *	cluster_ic_mock_recv_test()
+ *	    RETURNS SETOF (sender int4, payload bytea)
+ *	    Test-only wrapper: invoke cluster_ic_recv_bytes once and emit
+ *	    a single row if a message was dequeued, zero rows otherwise.
+ *	    Lets TAP tests verify the recv path without a custom backend.
+ * ---------- */
+extern Datum cluster_ic_mock_inject(PG_FUNCTION_ARGS);
+extern Datum cluster_ic_mock_drain_outbound(PG_FUNCTION_ARGS);
+extern Datum cluster_ic_mock_clear_all(PG_FUNCTION_ARGS);
+extern Datum cluster_ic_mock_recv_test(PG_FUNCTION_ARGS);
 
 #endif /* CLUSTER_IC_H */

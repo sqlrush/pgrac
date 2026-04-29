@@ -44,7 +44,12 @@ OBJS = \
 	cluster_version.o \
 	cluster_views.o
 else
-OBJS = cluster_conf.o cluster_views.o
+# cluster_conf.o, cluster_views.o, cluster_ic.o are always linked
+# because pg_proc.dat references their SRF entry points uncondition-
+# ally.  In disable-cluster builds the SRF bodies #ifdef out and
+# raise ERRCODE_FEATURE_NOT_SUPPORTED, but the function symbols must
+# still resolve at link time.
+OBJS = cluster_conf.o cluster_ic.o cluster_views.o
 endif
 
 include $(top_srcdir)/src/backend/common.mk
