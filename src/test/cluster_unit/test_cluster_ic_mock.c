@@ -64,8 +64,8 @@
 #include "utils/elog.h"
 #include "utils/memutils.h"
 
-int			cluster_node_id = -1;
-int			cluster_interconnect_tier = 0;
+int cluster_node_id = -1;
+int cluster_interconnect_tier = 0;
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
@@ -197,22 +197,22 @@ UT_TEST(test_mock_vtable_tier_name)
 
 UT_TEST(test_mock_vtable_send_nonnull)
 {
-	UT_ASSERT_NOT_NULL((void *) ClusterICOps_Mock.send_bytes);
+	UT_ASSERT_NOT_NULL((void *)ClusterICOps_Mock.send_bytes);
 }
 
 UT_TEST(test_mock_vtable_recv_nonnull)
 {
-	UT_ASSERT_NOT_NULL((void *) ClusterICOps_Mock.recv_bytes);
+	UT_ASSERT_NOT_NULL((void *)ClusterICOps_Mock.recv_bytes);
 }
 
 UT_TEST(test_mock_vtable_init_nonnull)
 {
-	UT_ASSERT_NOT_NULL((void *) ClusterICOps_Mock.tier_init);
+	UT_ASSERT_NOT_NULL((void *)ClusterICOps_Mock.tier_init);
 }
 
 UT_TEST(test_mock_vtable_shutdown_nonnull)
 {
-	UT_ASSERT_NOT_NULL((void *) ClusterICOps_Mock.tier_shutdown);
+	UT_ASSERT_NOT_NULL((void *)ClusterICOps_Mock.tier_shutdown);
 }
 
 
@@ -226,22 +226,22 @@ UT_TEST(test_mock_vtable_shutdown_nonnull)
 
 UT_TEST(test_mock_inject_srf_linkable)
 {
-	UT_ASSERT_NOT_NULL((void *) cluster_ic_mock_inject);
+	UT_ASSERT_NOT_NULL((void *)cluster_ic_mock_inject);
 }
 
 UT_TEST(test_mock_drain_srf_linkable)
 {
-	UT_ASSERT_NOT_NULL((void *) cluster_ic_mock_drain_outbound);
+	UT_ASSERT_NOT_NULL((void *)cluster_ic_mock_drain_outbound);
 }
 
 UT_TEST(test_mock_clear_srf_linkable)
 {
-	UT_ASSERT_NOT_NULL((void *) cluster_ic_mock_clear_all);
+	UT_ASSERT_NOT_NULL((void *)cluster_ic_mock_clear_all);
 }
 
 UT_TEST(test_mock_recv_test_srf_linkable)
 {
-	UT_ASSERT_NOT_NULL((void *) cluster_ic_mock_recv_test);
+	UT_ASSERT_NOT_NULL((void *)cluster_ic_mock_recv_test);
 }
 
 
