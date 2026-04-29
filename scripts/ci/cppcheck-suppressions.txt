@@ -22,6 +22,15 @@
 #
 # ----------------------------------------------------------------------
 #
-# (No entries yet.  Populated at spec-0.27.5 §8.7 after the first
-# baseline scan review.)
+# (Findings-driven entries are populated at spec-0.27.5 §8.7 after the
+# first baseline scan review.  The single placeholder entry below is
+# required because cppcheck 2.13+ rejects a comment-only suppressions
+# list as "no id".  See FAQ in docs/ci-static-analysis.md.)
 #
+# Reason: cppcheck 2.13+ requires at least one valid id in the
+# suppressions list passed via --suppressions-list; a comment-only file
+# is rejected with "Failed to add suppression. No id."  We register
+# unmatchedSuppression as a self-suppression so removing later inline
+# /* cppcheck-suppress xxx */ comments does not cause a CI failure.
+unmatchedSuppression
+

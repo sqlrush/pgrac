@@ -272,9 +272,14 @@ jobs:
         run: make -C src/backend generated-headers
 
       - name: Run cppcheck
+        id: cppcheck
         run: bash scripts/ci/run-cppcheck.sh
 
+      # Always run scan-build even if cppcheck step had a setup error,
+      # so the artifact carries both reports for review.  The two tools
+      # are independent.
       - name: Run scan-build
+        if: always() && steps.cppcheck.conclusion != 'cancelled'
         run: bash scripts/ci/run-scan-build.sh
 
       - name: Upload SARIF / HTML reports
