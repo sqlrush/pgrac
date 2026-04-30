@@ -13,6 +13,17 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
+ * PGRAC MODIFICATIONS
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *	Stage:       0.30
+ *
+ *	Added recognition of the --pgrac-version long option (cluster
+ *	build only): prints PGRAC_VERSION_STRING and exits.  Mirrors PG's
+ *	own --version handling so DBA / ops scripts can probe the pgrac
+ *	stage tag without an SQL connection.  Roadmap §2.2 acceptance
+ *	criterion.  See specs/spec-0.30-stage0-acceptance.md §2.2.
+ *
+ *
  * IDENTIFICATION
  *	  src/backend/main/main.c
  *
@@ -21,6 +32,10 @@
 #include "postgres.h"
 
 #include <unistd.h>
+
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_version_macros.h" /* PGRAC_VERSION_STRING */
+#endif
 
 #if defined(WIN32)
 #include <crtdbg.h>
@@ -155,6 +170,24 @@ main(int argc, char *argv[])
 			fputs(PG_BACKEND_VERSIONSTR, stdout);
 			exit(0);
 		}
+
+#ifdef USE_PGRAC_CLUSTER
+		/*
+		 * PGRAC: --pgrac-version (stage 0.30).
+		 *
+		 * Print the pgrac semver+stage version string and exit.  Only
+		 * recognised in cluster builds; --disable-cluster ignores this
+		 * option and falls through to PG's normal unknown-arg path.
+		 * No short alias (-V is reserved for PG's --version).
+		 *
+		 * Spec: pgrac:specs/spec-0.30-stage0-acceptance.md §2.2.
+		 */
+		if (strcmp(argv[1], "--pgrac-version") == 0)
+		{
+			puts(PGRAC_VERSION_STRING);
+			exit(0);
+		}
+#endif
 
 		/*
 		 * In addition to the above, we allow "--describe-config" and "-C var"

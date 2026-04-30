@@ -40,6 +40,7 @@
 
 #include "cluster/cluster.h"
 #include "cluster/cluster_elog.h"
+#include "cluster/cluster_inject.h" /* CLUSTER_INJECTION_POINT (stage 0.30 sweep) */
 #include "utils/elog.h"
 
 
@@ -72,6 +73,8 @@
 void
 cluster_init(void)
 {
+	CLUSTER_INJECTION_POINT("cluster-init-top");
+
 	cluster_phase = "init";
 	CLUSTER_LOG(DEBUG1, "cluster_init: stub, no-op in stage 0.9");
 }
@@ -98,6 +101,8 @@ cluster_init(void)
 void
 cluster_shutdown(void)
 {
+	CLUSTER_INJECTION_POINT("cluster-shutdown-top");
+
 	cluster_phase = "shutdown";
 	CLUSTER_LOG(DEBUG1, "cluster_shutdown: stub, no-op in stage 0.9");
 }

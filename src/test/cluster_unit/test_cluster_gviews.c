@@ -131,6 +131,13 @@ cluster_conf_role_to_string(ClusterNodeRole role pg_attribute_unused())
 	return "unknown";
 }
 
+/* Stage 0.30 sweep: cluster_views.c gained CLUSTER_INJECTION_POINT. */
+int cluster_injection_armed_count = 0;
+
+void
+cluster_injection_run(const char *name pg_attribute_unused())
+{}
+
 
 UT_DEFINE_GLOBALS();
 

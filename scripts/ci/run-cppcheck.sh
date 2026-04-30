@@ -112,4 +112,13 @@ else
   grep -c '<error ' cppcheck.xml || true
 fi
 
-exit 0
+# Stage 0.30: strict-mode baseline diff.  Exits non-zero if any new
+# finding compared to the baseline established at spec-0.27.5 §6
+# (currently 0 findings).  The CI workflow no longer wraps this step
+# in continue-on-error, so a regression here fails the Security job.
+if [ -x scripts/ci/baseline-diff.py ]; then
+  echo "## baseline-diff (strict mode)"
+  python3 scripts/ci/baseline-diff.py \
+    --baseline scripts/ci/cppcheck-baseline.md \
+    --current cppcheck.xml
+fi

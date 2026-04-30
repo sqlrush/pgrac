@@ -1,0 +1,293 @@
+#!/bin/bash
+#-------------------------------------------------------------------------
+#
+# pgrac-acceptance -- DBA self-verification smoke check for pgrac
+#                     stage 0 deliverables on a running cluster.
+#
+# Runs ~10 read-only psql queries against an already-started pgrac
+# instance and prints a coloured PASS/FAIL table.  Intended for DBA
+# self-service confirmation that an installed pgrac binary is wired
+# up correctly: catalog views are reachable, injection-point registry
+# is populated, pgstat counters are visible, --pgrac-version flag
+# works.  Does not modify any state.
+#
+# Exit code: 0 if every check passes, 1 if any check fails.
+#
+# Author: SqlRush <sqlrush@gmail.com>
+# Portions Copyright (c) 2026, pgrac contributors
+#
+# Spec: specs/spec-0.30-stage0-acceptance.md (Deliverable 5)
+#
+# NOTES
+#    Deliberately depends only on bash + psql + awk (no perl, no jq);
+#    must run on any machine that has the pgrac client tools installed.
+#
+#    This is a smoke check, not a full regression net.  The exhaustive
+#    cross-spec acceptance test lives in
+#    src/test/cluster_tap/t/030_acceptance.pl (TAP, 59+ assertions);
+#    pgrac-acceptance trims that down to the ~10 user-visible signals
+#    a DBA can interpret without source-tree access.
+#
+#-------------------------------------------------------------------------
+set -uo pipefail
+
+PROGNAME="pgrac-acceptance"
+
+# ---- defaults ---------------------------------------------------------
+PORT=""
+DBNAME="postgres"
+HOSTOPT=""
+USEROPT=""
+NO_COLOR="${NO_COLOR:-}"
+
+# ---- helpers ----------------------------------------------------------
+
+die() {
+    echo "$PROGNAME: $*" 1>&2
+    exit 2
+}
+
+usage() {
+    cat <<EOF
+$PROGNAME runs stage-0 acceptance smoke checks on a running pgrac cluster.
+
+Usage:
+  $PROGNAME [OPTION]...
+
+Options:
+  -p, --port=PORT            postmaster port (default: from PGPORT env / 5432)
+  -d, --db=NAME              database to connect to (default: postgres)
+  -h, --host=HOST            postmaster host (default: local socket)
+  -U, --username=USER        connect as USER (default: current user)
+  -V, --version              show pgrac-acceptance version, then exit
+  -?, --help                 show this help, then exit
+
+Environment:
+  NO_COLOR=1                 disable ANSI colour output
+
+Exit code: 0 = all checks PASS, 1 = any check FAIL, 2 = setup error.
+
+Report bugs to <https://github.com/sqlrush/pgrac/issues>.
+EOF
+}
+
+# ANSI colours (suppressed when NO_COLOR is set or stdout is not a tty).
+if [ -n "$NO_COLOR" ] || [ ! -t 1 ]; then
+    C_GREEN=""
+    C_RED=""
+    C_BOLD=""
+    C_RESET=""
+else
+    C_GREEN=$'\033[32m'
+    C_RED=$'\033[31m'
+    C_BOLD=$'\033[1m'
+    C_RESET=$'\033[0m'
+fi
+
+PASS_COUNT=0
+FAIL_COUNT=0
+
+# Run a SQL query and capture stdout; suppress psql notices/banners.
+psql_query() {
+    local sql="$1"
+    psql -X -A -t -q $HOSTOPT $USEROPT \
+         ${PORT:+-p "$PORT"} -d "$DBNAME" \
+         -c "$sql" 2>/dev/null
+}
+
+# Record a check result.  $1 is "PASS" or "FAIL"; $2 is the description.
+record() {
+    local outcome="$1"
+    local desc="$2"
+    if [ "$outcome" = "PASS" ]; then
+        echo "${C_GREEN}[PASS]${C_RESET} $desc"
+        PASS_COUNT=$((PASS_COUNT + 1))
+    else
+        echo "${C_RED}[FAIL]${C_RESET} $desc"
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+    fi
+}
+
+# Check that a SQL query returns a value matching an expected pattern.
+# Args: description, sql, expected-regex
+check_sql() {
+    local desc="$1"
+    local sql="$2"
+    local expect="$3"
+    local got
+    got=$(psql_query "$sql")
+    if [[ "$got" =~ $expect ]]; then
+        record PASS "$desc (got: $got)"
+    else
+        record FAIL "$desc (expected /$expect/, got: $got)"
+    fi
+}
+
+# Check that a SQL query returns at least N rows-of-count.
+# Args: description, sql, minimum-int
+check_sql_min() {
+    local desc="$1"
+    local sql="$2"
+    local min="$3"
+    local got
+    got=$(psql_query "$sql")
+    if [[ "$got" =~ ^[0-9]+$ ]] && [ "$got" -ge "$min" ]; then
+        record PASS "$desc ($got >= $min)"
+    else
+        record FAIL "$desc (expected >= $min, got: $got)"
+    fi
+}
+
+# ---- argument parsing -------------------------------------------------
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -p)
+            shift
+            [ $# -gt 0 ] || die "option -p requires an argument"
+            PORT="$1"
+            ;;
+        -p*)
+            PORT="${1#-p}"
+            ;;
+        --port)
+            shift
+            [ $# -gt 0 ] || die "option --port requires an argument"
+            PORT="$1"
+            ;;
+        --port=*)
+            PORT="${1#*=}"
+            ;;
+        -d)
+            shift
+            [ $# -gt 0 ] || die "option -d requires an argument"
+            DBNAME="$1"
+            ;;
+        --db=*)
+            DBNAME="${1#*=}"
+            ;;
+        -h)
+            shift
+            [ $# -gt 0 ] || die "option -h requires an argument"
+            HOSTOPT="-h $1"
+            ;;
+        --host=*)
+            HOSTOPT="-h ${1#*=}"
+            ;;
+        -U)
+            shift
+            [ $# -gt 0 ] || die "option -U requires an argument"
+            USEROPT="-U $1"
+            ;;
+        --username=*)
+            USEROPT="-U ${1#*=}"
+            ;;
+        -V|--version)
+            POSTGRES_BIN=$(command -v postgres || true)
+            if [ -n "$POSTGRES_BIN" ] && [ -x "$POSTGRES_BIN" ]; then
+                "$POSTGRES_BIN" --pgrac-version 2>/dev/null \
+                    || echo "$PROGNAME (pgrac, version unavailable from postgres)"
+            else
+                echo "$PROGNAME (pgrac, postgres binary not in PATH)"
+            fi
+            exit 0
+            ;;
+        -\?|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            die "unrecognised option \"$1\" (try --help)"
+            ;;
+    esac
+    shift
+done
+
+# ---- preflight --------------------------------------------------------
+
+command -v psql >/dev/null 2>&1 || die "psql not found in PATH"
+
+POSTGRES_BIN=$(command -v postgres || true)
+[ -n "$POSTGRES_BIN" ] || die "postgres binary not in PATH"
+
+# ---- header -----------------------------------------------------------
+
+echo "=================================================="
+echo " pgrac stage 0 acceptance smoke check"
+echo "=================================================="
+
+# ---- check 1: postgres binary present and executable ------------------
+if [ -x "$POSTGRES_BIN" ]; then
+    record PASS "postgres binary present and executable ($POSTGRES_BIN)"
+else
+    record FAIL "postgres binary present and executable (not executable)"
+fi
+
+# ---- check 2: --pgrac-version flag works ------------------------------
+PGRAC_VER=$("$POSTGRES_BIN" --pgrac-version 2>/dev/null || true)
+if [[ "$PGRAC_VER" =~ ^pgrac\ v[0-9] ]]; then
+    record PASS "postgres --pgrac-version returns \"$PGRAC_VER\""
+else
+    record FAIL "postgres --pgrac-version (got: ${PGRAC_VER:-<empty>})"
+fi
+
+# Bail out early if we cannot reach a running cluster: the remaining
+# checks all require a SQL connection.  Probe with SELECT 1.
+if ! psql_query "SELECT 1" >/dev/null; then
+    echo
+    echo "${C_BOLD}${C_RED}ERROR:${C_RESET} cannot connect to postmaster (port=${PORT:-default}, db=$DBNAME)."
+    echo "Start the cluster first:  pgrac-start -D PGDATA"
+    exit 2
+fi
+
+# ---- check 3: cluster.node_id GUC accessible --------------------------
+check_sql "cluster.node_id GUC accessible" \
+    "SHOW cluster.node_id" \
+    "^-?[0-9]+$"
+
+# ---- check 4: pg_cluster_nodes view returns >= 1 row ------------------
+check_sql_min "pg_cluster_nodes returns >= 1 row" \
+    "SELECT count(*) FROM pg_cluster_nodes" \
+    1
+
+# ---- check 5: pg_stat_cluster_wait_events returns 46 rows -------------
+check_sql "pg_stat_cluster_wait_events returns 46 rows" \
+    "SELECT count(*) FROM pg_stat_cluster_wait_events" \
+    "^46$"
+
+# ---- check 6: pg_stat_cluster_nodes returns >= 1 row ------------------
+check_sql_min "pg_stat_cluster_nodes returns >= 1 row" \
+    "SELECT count(*) FROM pg_stat_cluster_nodes" \
+    1
+
+# ---- check 7: pg_stat_cluster_injections has the 14 stage-0 points ---
+check_sql "pg_stat_cluster_injections has 14 registered injection points" \
+    "SELECT count(*) FROM pg_stat_cluster_injections" \
+    "^14$"
+
+# ---- check 8: cluster.inject.armed_count counter visible -------------
+check_sql_min "pg_stat_cluster_counters has cluster.inject.armed_count" \
+    "SELECT count(*) FROM pg_stat_cluster_counters WHERE name = 'cluster.inject.armed_count'" \
+    1
+
+# ---- check 9: pg_cluster_state returns the 7 stage-0 categories ------
+check_sql "pg_cluster_state returns 7 categories" \
+    "SELECT count(DISTINCT category) FROM pg_cluster_state" \
+    "^7$"
+
+# ---- check 10: cluster_phase is 'init' (postmaster booted ok) --------
+check_sql "phase.cluster_phase = 'init'" \
+    "SELECT value FROM pg_cluster_state WHERE category = 'phase' AND key = 'cluster_phase'" \
+    "^init$"
+
+# ---- summary ----------------------------------------------------------
+
+TOTAL=$((PASS_COUNT + FAIL_COUNT))
+echo
+if [ "$FAIL_COUNT" -eq 0 ]; then
+    echo "${C_BOLD}${C_GREEN}${PASS_COUNT}/${TOTAL} checks passed.  Stage 0 acceptance: GREEN.${C_RESET}"
+    exit 0
+else
+    echo "${C_BOLD}${C_RED}${FAIL_COUNT}/${TOTAL} checks FAILED.  Stage 0 acceptance: RED.${C_RESET}"
+    exit 1
+fi

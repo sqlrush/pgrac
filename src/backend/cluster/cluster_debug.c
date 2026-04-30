@@ -61,6 +61,7 @@
 #include "utils/builtins.h"
 
 #include "cluster/cluster_debug.h"
+#include "cluster/cluster_inject.h" /* CLUSTER_INJECTION_POINT (always-linked SRF) */
 
 
 /* SRF info-V1 declaration -- always linked because pg_proc.dat
@@ -74,7 +75,6 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_elog.h" /* cluster_phase */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic.h" /* ClusterICOps_Active, ClusterICTier */
-#include "cluster/cluster_inject.h"
 #include "cluster/cluster_pgstat.h"
 #include "cluster/cluster_shmem.h"
 #include "utils/timestamp.h"
@@ -310,6 +310,8 @@ dump_phase(ReturnSetInfo *rsinfo)
 Datum
 cluster_dump_state(PG_FUNCTION_ARGS)
 {
+	CLUSTER_INJECTION_POINT("cluster-debug-dump-entry");
+
 	InitMaterializedSRF(fcinfo, 0);
 
 #ifdef USE_PGRAC_CLUSTER

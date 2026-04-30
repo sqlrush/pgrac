@@ -49,6 +49,7 @@
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
+#include "cluster/cluster_inject.h" /* CLUSTER_INJECTION_POINT (stage 0.30 sweep) */
 #include "cluster/cluster_views.h"
 
 #ifdef USE_PGRAC_CLUSTER
@@ -163,6 +164,8 @@ StaticAssertDecl(lengthof(cluster_wait_event_infos) == CLUSTER_WAIT_EVENTS_COUNT
 Datum
 cluster_get_wait_events(PG_FUNCTION_ARGS)
 {
+	CLUSTER_INJECTION_POINT("cluster-views-srf-entry");
+
 	/*
 	 * Use PG's helper to set up a tuplestore-returning SRF.  This pattern
 	 * matches pg_stat_get_subscription_stats and similar PG core SRFs.

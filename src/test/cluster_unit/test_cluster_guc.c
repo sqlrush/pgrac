@@ -123,11 +123,20 @@ DefineCustomStringVariable(
 /*
  * cluster_init_guc references cluster_injection_assign_hook (from
  * cluster_inject.o) when registering cluster.injection_points (stage 0.27).
- * This unit test does not link cluster_inject.o, so stub the symbol.
+ * Stage 0.30 added a CLUSTER_INJECTION_POINT inside cluster_init_guc,
+ * which expands (in --enable-cluster builds) to a global counter check
+ * + a possible call to cluster_injection_run.  This unit test does not
+ * link cluster_inject.o, so stub all three symbols.
  */
 void
 cluster_injection_assign_hook(const char *newval pg_attribute_unused(),
 							  void *extra pg_attribute_unused())
+{}
+
+int cluster_injection_armed_count = 0;
+
+void
+cluster_injection_run(const char *name pg_attribute_unused())
 {}
 
 

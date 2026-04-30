@@ -142,6 +142,17 @@ cluster_conf_role_to_string(ClusterNodeRole role pg_attribute_unused())
 	return "unknown";
 }
 
+/*
+ * Stage 0.30 sweep: cluster_views.c gained a CLUSTER_INJECTION_POINT
+ * call at the top of cluster_get_wait_events; stub the inject symbols
+ * so the unit test linking succeeds without pulling in cluster_inject.o.
+ */
+int cluster_injection_armed_count = 0;
+
+void
+cluster_injection_run(const char *name pg_attribute_unused())
+{}
+
 
 UT_DEFINE_GLOBALS();
 

@@ -14,7 +14,8 @@
 #        (0x50475243 / "PGRC" little-endian).
 #      - guc.cluster.node_id reflects the live GUC value.
 #      - ic.active_tier_name matches cluster.interconnect_tier.
-#      - All 6 injection points appear with .fault_type / .hits.
+#      - All 14 injection points appear with .fault_type / .hits
+#        (6 baseline + 8 stage-0.30 sweep additions).
 #      - At least one pgstat counter is present.
 #      - conf.node_count matches pg_cluster_nodes (spec-0.19 view).
 #      - phase.cluster_phase is a recognised lifecycle string.
@@ -116,21 +117,22 @@ is($node->get_cluster_state_value('ic', 'active_tier_name'),
 
 
 # ----------
-# Test 8: All 6 injection points appear with .fault_type / .hits keys.
+# Test 8: All 14 injection points appear with .fault_type / .hits keys
+# (after stage-0.30 sweep: 6 baseline + 8 new entries).
 # ----------
 is( $node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='inject' AND key LIKE '%.fault_type'}),
-	'6',
-	'all 6 injection points have a .fault_type entry under inject category');
+	'14',
+	'all 14 injection points have a .fault_type entry under inject category');
 
 is( $node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='inject' AND key LIKE '%.hits'}),
-	'6',
-	'all 6 injection points have a .hits entry under inject category');
+	'14',
+	'all 14 injection points have a .hits entry under inject category');
 
 
 # ----------

@@ -196,12 +196,16 @@ UT_DEFINE_GLOBALS();
 
 UT_TEST(test_inject_count_compile_constant)
 {
-	/* Six injection points: 2 cluster-init + 2 cluster-ic + 2 cluster-conf. */
+	/* 14 injection points after stage-0.30 sweep: 6 baseline (2 cluster-init
+	 * + 2 cluster-ic + 2 cluster-conf) + 8 sweep (cluster.c × 2 + 6 other
+	 * subsystems × 1; cluster_elog and cluster_signal excluded -- see
+	 * spec-0.30 §1.4). */
 	UT_ASSERT_EQ(cluster_injection_armed_count, 0);
 	/*
 	 * Indirect assertion via SRF-state count is harder here without
-	 * setting up a tuplestore.  The TAP test pins this to 6 against
-	 * the live view; the unit test just exercises the surface.
+	 * setting up a tuplestore.  The TAP test t/015_inject.pl pins this
+	 * to 14 against the live view; the unit test just exercises the
+	 * surface.
 	 */
 }
 

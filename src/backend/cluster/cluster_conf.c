@@ -109,6 +109,8 @@ cluster_conf_shmem_init(void)
 {
 	bool found;
 
+	CLUSTER_INJECTION_POINT("cluster-conf-shmem-init");
+
 	ClusterConfShmem
 		= (ClusterConf *)ShmemInitStruct("pgrac cluster conf", cluster_conf_shmem_size(), &found);
 

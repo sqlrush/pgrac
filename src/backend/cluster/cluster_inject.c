@@ -69,15 +69,33 @@ typedef struct ClusterInjectPoint {
 } ClusterInjectPoint;
 
 /*
- * The six stage-0 injection points.  Order in this array drives the
- * SRF row order; keep sorted by name for stable test output.  See
- * docs/error-injection-design.md §2.4 for the naming convention and
- * §5 for the Stage 1+ roadmap.
+ * The 14 stage-0 injection points.  Order in this array drives the
+ * SRF row order; entries kept sorted by name for stable test output.
+ * 6 baseline points were established in spec-0.27; 8 more added at
+ * spec-0.30 to cover every stage-0.x already-implemented subsystem
+ * that has a non-signal-handler function-level hook position (sweep
+ * recorded in roadmap §2.2 0.30 deliverable).
+ *
+ * Two subsystems deliberately excluded (spec-0.30 §1.4 exceptions):
+ *   - cluster_elog: CLUSTER_LOG is a header macro that expands inline
+ *     at each call site; cluster_elog.c has only a global variable
+ *     definition with no function-level position.
+ *   - cluster_signal: cluster_signal.c contains only the
+ *     cluster_handle_reconfig_start_interrupt signal handler;
+ *     docs/error-injection-design.md §4.2 forbids injection points
+ *     inside signal handlers (async-signal-safe constraint).
+ *
+ * See docs/error-injection-design.md §2.4 for the naming convention
+ * and §5 for the Stage 1+ roadmap.
  */
 static ClusterInjectPoint cluster_injection_points[] = {
-	{ .name = "cluster-conf-load-success" },		{ .name = "cluster-conf-parse-fail" },
-	{ .name = "cluster-ic-mock-send-pre-enqueue" }, { .name = "cluster-ic-tier-selected" },
-	{ .name = "cluster-init-post-shmem" },			{ .name = "cluster-init-pre-shmem" },
+	{ .name = "cluster-conf-load-success" },   { .name = "cluster-conf-parse-fail" },
+	{ .name = "cluster-conf-shmem-init" },	   { .name = "cluster-debug-dump-entry" },
+	{ .name = "cluster-guc-init-pre-define" }, { .name = "cluster-ic-mock-send-pre-enqueue" },
+	{ .name = "cluster-ic-tier-selected" },	   { .name = "cluster-init-post-shmem" },
+	{ .name = "cluster-init-pre-shmem" },	   { .name = "cluster-init-top" },
+	{ .name = "cluster-pgstat-mirror-sync" },  { .name = "cluster-shmem-request" },
+	{ .name = "cluster-shutdown-top" },		   { .name = "cluster-views-srf-entry" },
 };
 
 #define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_points)

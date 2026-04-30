@@ -53,12 +53,13 @@ $node->start;
 
 
 # ----------
-# Test 1: View exists and returns six rows (compile-time registry size).
+# Test 1: View exists and returns 14 rows (compile-time registry size
+# after stage-0.30 sweep; 6 baseline + 8 new entries).
 # ----------
 is( $node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-	'6',
-	'pg_stat_cluster_injections returns 6 rows (compile-time registry)');
+	'14',
+	'pg_stat_cluster_injections returns 14 rows (compile-time registry)');
 
 
 # ----------
@@ -76,14 +77,15 @@ is( $node->safe_psql(
 
 
 # ----------
-# Test 3: Names match the spec-0.27 §2.3 list.
+# Test 3: Names match the spec-0.30 §2.1 list (14 entries: 6 baseline +
+# 8 sweep additions).
 # ----------
 is( $node->safe_psql(
 		'postgres',
 		'SELECT string_agg(name, \',\' ORDER BY name) FROM pg_stat_cluster_injections'
 	),
-	'cluster-conf-load-success,cluster-conf-parse-fail,cluster-ic-mock-send-pre-enqueue,cluster-ic-tier-selected,cluster-init-post-shmem,cluster-init-pre-shmem',
-	'six injection point names match spec-0.27 §2.3');
+	'cluster-conf-load-success,cluster-conf-parse-fail,cluster-conf-shmem-init,cluster-debug-dump-entry,cluster-guc-init-pre-define,cluster-ic-mock-send-pre-enqueue,cluster-ic-tier-selected,cluster-init-post-shmem,cluster-init-pre-shmem,cluster-init-top,cluster-pgstat-mirror-sync,cluster-shmem-request,cluster-shutdown-top,cluster-views-srf-entry',
+	'14 injection point names match spec-0.30 §2.1');
 
 
 # ----------

@@ -94,6 +94,14 @@ const ClusterICOps *ClusterICOps_Active = NULL;
 /* cluster_inject (armed_count + iterator) */
 int cluster_injection_armed_count = 0;
 
+/*
+ * Stage 0.30 sweep: cluster_dump_state gained CLUSTER_INJECTION_POINT;
+ * cluster_inject.h declares cluster_injection_run extern.
+ */
+void
+cluster_injection_run(const char *name pg_attribute_unused())
+{}
+
 int
 cluster_injection_get_count(void)
 {

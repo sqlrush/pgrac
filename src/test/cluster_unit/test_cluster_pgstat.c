@@ -78,6 +78,13 @@
  */
 int cluster_injection_armed_count = 0;
 
+/*
+ * Stage 0.30 sweep: cluster_pgstat_sync_mirrors gained CLUSTER_INJECTION_POINT.
+ */
+void
+cluster_injection_run(const char *name pg_attribute_unused())
+{}
+
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 					 const char *fileName pg_attribute_unused(),

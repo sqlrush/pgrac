@@ -231,21 +231,30 @@ jobs:
 
 
   # ====================================================================
-  # security-static-analysis: cppcheck + scan-build (warn-only stage 0.27.5)
+  # security-static-analysis: cppcheck (strict) + scan-build (warn-only)
   # --------------------------------------------------------------------
-  # Spec:    pgrac/specs/spec-0.27.5-static-analysis.md
+  # Spec:    pgrac/specs/spec-0.27.5-static-analysis.md (initial接入)
+  #          pgrac/specs/spec-0.30-stage0-acceptance.md §2.3 (strict 切换)
   # Design:  pgrac/docs/ci-static-analysis.md
   # Scope:   src/backend/cluster/ + src/include/cluster/ +
   #          src/test/cluster_unit/ (avoid PG-upstream noise)
-  # Mode:    warn-only (continue-on-error: true) until Stage 0.30
-  #          verification spec switches to strict.
+  # Mode (stage 0.30+):
+  #   - cppcheck: STRICT.  scripts/ci/run-cppcheck.sh invokes
+  #     scripts/ci/baseline-diff.py at the end; any new finding vs the
+  #     stage-0 baseline (0 findings, established at spec-0.27.5 §6)
+  #     fails the step and the workflow.
+  #   - scan-build: still warn-only.  scripts/ci/run-scan-build.sh wraps
+  #     scan-build with `|| true`, exit 0 regardless of findings; HTML
+  #     report uploaded as artifact for review.  Strict切换 deferred
+  #     because scan-build HTML output is non-structured -- baseline
+  #     diff tooling complexity is higher than spec-0.30 budget.
   # ====================================================================
   security-static-analysis:
     name: Security (cppcheck + scan-build)
     needs: validate
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    continue-on-error: true   # warn-only at stage 0.27.5 - 0.30
+    # Stage 0.30: continue-on-error removed; cppcheck regression fails CI.
     steps:
       - name: Checkout
         uses: actions/checkout@v4

@@ -89,6 +89,8 @@ static const struct config_enum_entry cluster_interconnect_tier_options[]
 void
 cluster_init_guc(void)
 {
+	CLUSTER_INJECTION_POINT("cluster-guc-init-pre-define");
+
 	/*
 	 * GUC name uses the dot-prefixed "cluster.node_id" form per PG's
 	 * convention for custom (non-built-in) GUCs (valid_custom_variable_name

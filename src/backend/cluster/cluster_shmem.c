@@ -107,6 +107,8 @@ cluster_shmem_size(void)
 void
 cluster_request_shmem(void)
 {
+	CLUSTER_INJECTION_POINT("cluster-shmem-request");
+
 	cluster_ctl_shmem_request();
 	cluster_conf_shmem_request();
 	/* Future: grd_shmem_request(); pcm_shmem_request(); ... */

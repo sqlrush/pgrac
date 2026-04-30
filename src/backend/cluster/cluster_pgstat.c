@@ -217,6 +217,8 @@ cluster_pgstat_sync_mirrors(void)
 {
 	ClusterPgstatCounter *armed_count;
 
+	CLUSTER_INJECTION_POINT("cluster-pgstat-mirror-sync");
+
 	armed_count = cluster_pgstat_lookup("cluster.inject.armed_count");
 	if (armed_count != NULL)
 		cluster_pgstat_set(armed_count, (uint64)cluster_injection_armed_count);
