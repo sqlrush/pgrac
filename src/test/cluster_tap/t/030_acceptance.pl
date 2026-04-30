@@ -283,8 +283,13 @@ ok($node->get_cluster_state_value('conf', 'self_in_topology') =~ /^(t|f)$/,
 # §L  pgrac-init / pgrac-start (1 test)
 # ============================================================
 
-ok(-x '/Users/yingjiewang/linkdb-install/bin/postgres',
-	'L1 postgres binary present and executable');
+# postgres binary is on PATH thanks to the cluster_tap Makefile installcheck
+# rule (PATH="$installdir/bin:..."), so a `command -v` lookup is portable
+# across local trees and CI runners.
+my $postgres_bin = `command -v postgres`;
+chomp $postgres_bin;
+ok($postgres_bin ne '' && -x $postgres_bin,
+	"L1 postgres binary present and executable ($postgres_bin)");
 
 
 # ============================================================
@@ -381,8 +386,10 @@ ok($node->safe_psql('postgres',
 # §P  --pgrac-version flag (1 test)
 # ============================================================
 
-# Run postgres binary with --pgrac-version and capture output
-my $version_out = `/Users/yingjiewang/linkdb-install/bin/postgres --pgrac-version 2>&1`;
+# Run postgres binary with --pgrac-version and capture output.
+# Reuse $postgres_bin (resolved via PATH in §L1) so this works in both
+# local make-check and CI environments.
+my $version_out = `'$postgres_bin' --pgrac-version 2>&1`;
 chomp $version_out;
 like($version_out, qr/^pgrac v\d+\.\d+\.\d+-stage\d+\.\d+ \(based on PostgreSQL \d+\.\d+\)$/,
 	"P1 --pgrac-version output matches semver format (got: $version_out)");
