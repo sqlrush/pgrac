@@ -80,6 +80,18 @@ PG_HEADER_SUPP=(
   --suppress=preprocessorErrorDirective:src/include/storage/s_lock.h
   --suppress=nullPointerRedundantCheck:src/include/nodes/pg_list.h
   --suppress=nullPointerRedundantCheck:src/include/storage/bufpage.h
+  --suppress=constParameterPointer:src/include/lib/ilist.h
+)
+
+# Reason: PG's Assert() is non-trapping by spec to cppcheck (it has no
+# noreturn attribute on the failure path), so cppcheck treats
+# `Assert(p != NULL); p->member` as "p was checked redundantly" rather
+# than "Assert is the runtime guard".  Same pattern PG itself uses
+# throughout, e.g. mdread / mdwrite -- spec-0.27.5 baseline already
+# suppressed two PG headers for the same reason.  Adding our own files
+# keeps the policy consistent.
+SHAREDFS_SUPP=(
+  --suppress=nullPointerRedundantCheck:src/backend/cluster/storage/cluster_shared_fs_local.c
 )
 
 echo "## cppcheck $(cppcheck --version)"
@@ -91,6 +103,7 @@ cppcheck \
   --enable=warning,style,performance,portability \
   "${GLOBAL_SUPP[@]}" \
   "${PG_HEADER_SUPP[@]}" \
+  "${SHAREDFS_SUPP[@]}" \
   --inline-suppr \
   --error-exitcode=0 \
   --xml --xml-version=2 \
