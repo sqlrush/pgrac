@@ -9,6 +9,27 @@
  * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
+ * PGRAC MODIFICATIONS
+ *	  Modified by: SqlRush <sqlrush@gmail.com>
+ *	  Stage:        1.2
+ *
+ *	  Extended smgrsw[] from 1 to 2 entries (under USE_PGRAC_CLUSTER):
+ *	  index 0 stays md.c, index 1 routes to cluster_smgr (cluster-aware
+ *	  storage that bridges into the spec-1.1 cluster_shared_fs vtable).
+ *	  smgropen() now consults cluster_smgr_which_for() to pick the
+ *	  smgr_which value at relation-open time; default behaviour
+ *	  (cluster.smgr_user_relations = off, the GUC default) returns 0
+ *	  for every rlocator so the production path is byte-for-byte
+ *	  identical to upstream.
+ *
+ *	  In --disable-cluster builds neither the include nor the array
+ *	  extension fires, so smgrsw[] remains a single element and
+ *	  smgr_which is forced to 0 -- spec-0.3 binary contract.
+ *
+ *	  Related design:
+ *	    docs/cluster-smgr-design.md v1.1 (方案 C 单文件)
+ *	    specs/spec-1.2-smgr-cluster.md
+ *
  *
  * IDENTIFICATION
  *	  src/backend/storage/smgr/smgr.c
@@ -23,6 +44,9 @@
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/md.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/storage/cluster_smgr.h"		/* PGRAC: smgrsw[1] */
+#endif
 #include "storage/smgr.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
@@ -87,6 +111,34 @@ static const f_smgr smgrsw[] = {
 		.smgr_truncate = mdtruncate,
 		.smgr_immedsync = mdimmedsync,
 	}
+#ifdef USE_PGRAC_CLUSTER
+	,
+	/*
+	 * PGRAC stage 1.2: cluster-aware smgr.  Selected by smgropen()
+	 * via cluster_smgr_which_for() when both
+	 * cluster.shared_storage_backend != stub AND
+	 * cluster.smgr_user_relations = on AND backend == InvalidBackendId.
+	 * See cluster_smgr.c (方案 C 单文件实装) for callback bodies.
+	 */
+	{
+		.smgr_init = cluster_smgr_init,
+		.smgr_shutdown = cluster_smgr_shutdown,
+		.smgr_open = cluster_smgr_open,
+		.smgr_close = cluster_smgr_close,
+		.smgr_create = cluster_smgr_create,
+		.smgr_exists = cluster_smgr_exists,
+		.smgr_unlink = cluster_smgr_unlink,
+		.smgr_extend = cluster_smgr_extend,
+		.smgr_zeroextend = cluster_smgr_zeroextend,
+		.smgr_prefetch = cluster_smgr_prefetch,
+		.smgr_read = cluster_smgr_read,
+		.smgr_write = cluster_smgr_write,
+		.smgr_writeback = cluster_smgr_writeback,
+		.smgr_nblocks = cluster_smgr_nblocks,
+		.smgr_truncate = cluster_smgr_truncate,
+		.smgr_immedsync = cluster_smgr_immedsync,
+	}
+#endif
 };
 
 static const int NSmgr = lengthof(smgrsw);
@@ -180,7 +232,17 @@ smgropen(RelFileLocator rlocator, BackendId backend)
 		reln->smgr_targblock = InvalidBlockNumber;
 		for (int i = 0; i <= MAX_FORKNUM; ++i)
 			reln->smgr_cached_nblocks[i] = InvalidBlockNumber;
+#ifdef USE_PGRAC_CLUSTER
+		/*
+		 * PGRAC: pick md.c (smgr_which=0) or cluster_smgr (1) based on
+		 * GUC + InvalidBackendId.  Default returns 0 so the production
+		 * path is byte-for-byte identical to upstream (cluster.smgr_
+		 * user_relations is opt-in, off by default).
+		 */
+		reln->smgr_which = cluster_smgr_which_for(rlocator, backend);
+#else
 		reln->smgr_which = 0;	/* we only have md.c at present */
+#endif
 
 		/* implementation-specific initialization */
 		smgrsw[reln->smgr_which].smgr_open(reln);

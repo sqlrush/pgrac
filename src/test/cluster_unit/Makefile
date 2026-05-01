@@ -30,7 +30,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_shmem test_cluster_signal test_cluster_views \
         test_cluster_gviews test_cluster_ic test_cluster_conf \
         test_cluster_ic_mock test_cluster_inject test_cluster_pgstat \
-        test_cluster_debug test_cluster_shared_fs
+        test_cluster_debug test_cluster_shared_fs test_cluster_smgr
 
 # Path to the cluster_version object (no PG deps, safe to link standalone).
 CLUSTER_VERSION_O = $(top_builddir)/src/backend/cluster/cluster_version.o
@@ -61,6 +61,7 @@ CLUSTER_DEBUG_O = $(top_builddir)/src/backend/cluster/cluster_debug.o
 CLUSTER_SHARED_FS_O = $(top_builddir)/src/backend/cluster/storage/cluster_shared_fs.o
 CLUSTER_SHARED_FS_STUB_O = $(top_builddir)/src/backend/cluster/storage/cluster_shared_fs_stub.o
 CLUSTER_SHARED_FS_LOCAL_O = $(top_builddir)/src/backend/cluster/storage/cluster_shared_fs_local.o
+CLUSTER_SMGR_O = $(top_builddir)/src/backend/cluster/storage/cluster_smgr.o
 
 # Most tests link only cluster_version.o.  test_cluster_guc /
 # test_cluster_shmem / test_cluster_signal / test_cluster_views /
@@ -68,7 +69,7 @@ CLUSTER_SHARED_FS_LOCAL_O = $(top_builddir)/src/backend/cluster/storage/cluster_
 # separate rules because they also link additional cluster_*.o
 # objects (the test files stub the PG backend symbols those
 # objects reference).
-SIMPLE_TESTS = $(filter-out test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf test_cluster_ic_mock test_cluster_inject test_cluster_pgstat test_cluster_debug test_cluster_shared_fs,$(TESTS))
+SIMPLE_TESTS = $(filter-out test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf test_cluster_ic_mock test_cluster_inject test_cluster_pgstat test_cluster_debug test_cluster_shared_fs test_cluster_smgr,$(TESTS))
 
 $(SIMPLE_TESTS): %: %.c unit_test.h $(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) -o $@
@@ -191,6 +192,24 @@ test_cluster_shared_fs: test_cluster_shared_fs.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_SHARED_FS_O) \
 		$(CLUSTER_SHARED_FS_STUB_O) $(CLUSTER_SHARED_FS_LOCAL_O) -o $@
+
+# test_cluster_smgr links cluster_smgr.o + the three cluster_shared_fs
+# objects standalone.  cluster_smgr.c references HTAB / md.c / fd.c /
+# TablespaceCreateDbspace / ereport; the test stubs each one because
+# the unit test only address-takes the sixteen f_smgr callback
+# prototypes and exercises the four short-circuit branches of
+# cluster_smgr_which_for() via direct function call (no smgrsw
+# dispatch).  End-to-end runtime behaviour (PG 219 GUC=on) is
+# verified by cluster_tap t/019_smgr_cluster.pl + make check
+# --temp-config.
+test_cluster_smgr: test_cluster_smgr.c unit_test.h \
+		$(CLUSTER_VERSION_O) $(CLUSTER_SMGR_O) \
+		$(CLUSTER_SHARED_FS_O) $(CLUSTER_SHARED_FS_STUB_O) \
+		$(CLUSTER_SHARED_FS_LOCAL_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_SMGR_O) \
+		$(CLUSTER_SHARED_FS_O) $(CLUSTER_SHARED_FS_STUB_O) \
+		$(CLUSTER_SHARED_FS_LOCAL_O) -o $@
 
 
 # ----------

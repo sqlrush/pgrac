@@ -57,6 +57,7 @@ int cluster_interconnect_tier = CLUSTER_IC_TIER_STUB;
 char *cluster_config_file = NULL;	   /* boot value filled by DefineCustomStringVariable */
 char *cluster_injection_points = NULL; /* boot value filled by DefineCustomStringVariable */
 int cluster_shared_storage_backend = CLUSTER_SHARED_FS_BACKEND_STUB;
+bool cluster_smgr_user_relations = false;
 
 
 /*
@@ -209,6 +210,30 @@ cluster_init_guc(void)
 							 &cluster_shared_storage_backend, CLUSTER_SHARED_FS_BACKEND_STUB,
 							 cluster_shared_storage_backend_options,
 							 PGC_POSTMASTER, /* backend selection requires restart */
+							 0,				 /* flags */
+							 NULL,			 /* check_hook */
+							 NULL,			 /* assign_hook */
+							 NULL);			 /* show_hook */
+
+	/*
+	 * cluster.smgr_user_relations -- opt-in switch routing user-
+	 * relation block I/O through cluster_smgr (smgr_which=1) instead
+	 * of md.c (smgr_which=0).  Default off keeps the existing PG
+	 * smgr path completely unchanged; the GUC only takes effect for
+	 * permanent (non-temp) relations and only when
+	 * shared_storage_backend != stub.  Startup-time cross-check
+	 * lives in cluster_shared_fs_init (cluster_shared_fs.c).  See
+	 * spec-1.2-smgr-cluster.md §3.2 + docs/cluster-smgr-design.md §6.
+	 */
+	DefineCustomBoolVariable("cluster.smgr_user_relations",
+							 gettext_noop("Route permanent relations through cluster_smgr instead of md.c."),
+							 gettext_noop("When on (combined with shared_storage_backend != stub), "
+										  "permanent non-temp relations route through cluster_smgr "
+										  "-> cluster_shared_fs at smgropen time.  Stage 1.2 single-"
+										  "node single-file passthrough; user data stored as one "
+										  "file per (rlocator, fork) without the md.c .seg suffix."),
+							 &cluster_smgr_user_relations, false,
+							 PGC_POSTMASTER, /* smgr_which is cached per-relation; restart required */
 							 0,				 /* flags */
 							 NULL,			 /* check_hook */
 							 NULL,			 /* assign_hook */

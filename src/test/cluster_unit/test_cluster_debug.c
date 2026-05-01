@@ -162,6 +162,16 @@ cluster_shared_fs_get_backend_at(int id pg_attribute_unused())
 	return NULL;
 }
 
+/* Stage 1.2: cluster_smgr accessor + GUC referenced by dump_guc /
+ * dump_shared_fs.  cluster_smgr.o is not linked here; provide stubs. */
+extern int cluster_smgr_active_relation_count(void);
+int
+cluster_smgr_active_relation_count(void)
+{
+	return 0;
+}
+bool cluster_smgr_user_relations = false;
+
 /* StringInfo + pfree stubs for dump_shared_fs.  No-op pointers; SRF
  * body is never invoked by this unit test. */
 #include "lib/stringinfo.h"

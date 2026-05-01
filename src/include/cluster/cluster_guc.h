@@ -146,4 +146,22 @@ extern char *cluster_injection_points;
 extern int cluster_shared_storage_backend;
 
 
+/*
+ * cluster_smgr_user_relations -- opt-in switch routing user-relation
+ *	smgr operations through cluster_smgr (smgr_which=1) instead of
+ *	md.c (smgr_which=0).  Default off keeps stage 0 / 1.1 behaviour
+ *	unchanged for upgraders who haven't explicitly opted in.
+ *
+ *	Boot default: false (md.c for everything).
+ *	context:      PGC_POSTMASTER (smgr selection is per-relation
+ *	              cached at smgropen, so changes need a restart).
+ *
+ *	Startup-time cross-check: this GUC = on combined with
+ *	shared_storage_backend = stub is incoherent (cluster_smgr would
+ *	have no real backend); cluster_shared_fs_init ereports FATAL
+ *	when the combination is detected.  See spec-1.2 §3.2.
+ */
+extern bool cluster_smgr_user_relations;
+
+
 #endif /* CLUSTER_GUC_H */

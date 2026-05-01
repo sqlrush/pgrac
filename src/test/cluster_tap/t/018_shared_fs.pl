@@ -130,19 +130,20 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-	'17',
-	'L9 total injection registry size is 17 (14 + 3 stage-1.1 sweep)');
+	'20',
+	'L9 total injection registry size is 20 (14 + 3 stage-1.1 + 3 stage-1.2)');
 
 
 # ----------
-# L10: pg_cluster_state shared_fs category contents.
+# L10: pg_cluster_state shared_fs category contents.  Stage 1.2 added
+# smgr_active_relations + smgr_user_relations rows.
 # ----------
 is($node->safe_psql(
 		'postgres',
 		q{SELECT string_agg(key, ',' ORDER BY key) FROM pg_cluster_state
 		   WHERE category = 'shared_fs'}),
-	'active_backend,registered_backends',
-	'L10 pg_cluster_state.shared_fs has both expected keys');
+	'active_backend,registered_backends,smgr_active_relations,smgr_user_relations',
+	'L10 pg_cluster_state.shared_fs has all 4 expected keys (1.1 + 1.2)');
 
 is($node->safe_psql(
 		'postgres',

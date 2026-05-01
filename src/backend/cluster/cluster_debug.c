@@ -78,6 +78,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_pgstat.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/storage/cluster_shared_fs.h" /* dump_shared_fs (stage 1.1) */
+#include "cluster/storage/cluster_smgr.h"	   /* cluster_smgr_active_relation_count (stage 1.2) */
 #include "lib/stringinfo.h"
 #include "utils/timestamp.h"
 
@@ -237,6 +238,10 @@ dump_guc(ReturnSetInfo *rsinfo)
 	shared_fs_active = cluster_shared_fs_get_active_ops();
 	emit_row(rsinfo, "guc", "cluster.shared_storage_backend",
 			 shared_fs_active != NULL ? shared_fs_active->name : "(none)");
+
+	/* Stage 1.2: cluster.smgr_user_relations boolean. */
+	emit_row(rsinfo, "guc", "cluster.smgr_user_relations",
+			 fmt_bool(cluster_smgr_user_relations));
 }
 
 static void
@@ -346,6 +351,13 @@ dump_shared_fs(ReturnSetInfo *rsinfo)
 	}
 	emit_row(rsinfo, "shared_fs", "registered_backends", csv.len > 0 ? csv.data : "(empty)");
 	pfree(csv.data);
+
+	/* Stage 1.2 cluster_smgr extension: surface the routing GUC + the
+	 * count of cluster_smgr SMgrRelations live in the bypass HTAB. */
+	emit_row(rsinfo, "shared_fs", "smgr_user_relations",
+			 fmt_bool(cluster_smgr_user_relations));
+	emit_row(rsinfo, "shared_fs", "smgr_active_relations",
+			 fmt_int32(cluster_smgr_active_relation_count()));
 }
 
 #endif /* USE_PGRAC_CLUSTER */

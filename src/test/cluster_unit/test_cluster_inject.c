@@ -196,10 +196,9 @@ UT_DEFINE_GLOBALS();
 
 UT_TEST(test_inject_count_compile_constant)
 {
-	/* 14 injection points after stage-0.30 sweep: 6 baseline (2 cluster-init
-	 * + 2 cluster-ic + 2 cluster-conf) + 8 sweep (cluster.c × 2 + 6 other
-	 * subsystems × 1; cluster_elog and cluster_signal excluded -- see
-	 * spec-0.30 §1.4). */
+	/* 20 injection points: 6 baseline (spec-0.27) + 8 sweep (spec-0.30,
+	 * cluster_elog + cluster_signal excluded) + 3 cluster_shared_fs
+	 * (spec-1.1) + 3 cluster_smgr (spec-1.2). */
 	UT_ASSERT_EQ(cluster_injection_armed_count, 0);
 	/*
 	 * Indirect assertion via SRF-state count is harder here without

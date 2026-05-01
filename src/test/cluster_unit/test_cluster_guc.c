@@ -120,6 +120,19 @@ DefineCustomStringVariable(
 	/* Stub for unit-test linking; real impl lives in PG backend. */
 }
 
+void
+DefineCustomBoolVariable(
+	const char *name pg_attribute_unused(), const char *short_desc pg_attribute_unused(),
+	const char *long_desc pg_attribute_unused(), bool *valueAddr pg_attribute_unused(),
+	bool bootValue pg_attribute_unused(), GucContext context pg_attribute_unused(),
+	int flags pg_attribute_unused(), GucBoolCheckHook check_hook pg_attribute_unused(),
+	GucBoolAssignHook assign_hook pg_attribute_unused(),
+	GucShowHook show_hook pg_attribute_unused())
+{
+	/* Stub for unit-test linking; real impl lives in PG backend.
+	 * Added at stage 1.2 for cluster.smgr_user_relations. */
+}
+
 /*
  * cluster_init_guc references cluster_injection_assign_hook (from
  * cluster_inject.o) when registering cluster.injection_points (stage 0.27).

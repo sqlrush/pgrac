@@ -198,6 +198,22 @@ cluster_shared_fs_init(void)
 	/* Backend's own init runs after we record it as active. */
 	ops->init();
 
+	/*
+	 * Stage 1.2 cross-check: cluster.smgr_user_relations=on requires a
+	 * real backend.  Stub backend has every callback ereport
+	 * FEATURE_NOT_SUPPORTED, so routing user relations through
+	 * cluster_smgr -> cluster_shared_fs -> stub would FATAL on the
+	 * first I/O.  Catch the misconfiguration at postmaster init.
+	 */
+	if (cluster_smgr_user_relations &&
+		cluster_shared_storage_backend == CLUSTER_SHARED_FS_BACKEND_STUB)
+		ereport(FATAL,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cluster.smgr_user_relations=on requires shared_storage_backend != stub"),
+				 errhint("Set cluster.shared_storage_backend=local in postgresql.conf "
+						 "to enable cluster_smgr routing, or revert "
+						 "cluster.smgr_user_relations=off.")));
+
 	cluster_shared_fs_init_in_progress = false;
 
 	/*

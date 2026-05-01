@@ -69,12 +69,12 @@ typedef struct ClusterInjectPoint {
 } ClusterInjectPoint;
 
 /*
- * The 14 stage-0 injection points.  Order in this array drives the
- * SRF row order; entries kept sorted by name for stable test output.
+ * The 20 cluster injection points.  Order in this array drives the
+ * SRF row order; entries kept sorted by name within each stage block.
  * 6 baseline points were established in spec-0.27; 8 more added at
  * spec-0.30 to cover every stage-0.x already-implemented subsystem
- * that has a non-signal-handler function-level hook position (sweep
- * recorded in roadmap §2.2 0.30 deliverable).
+ * with a non-signal-handler function-level hook position; 3 added at
+ * spec-1.1 for cluster_shared_fs; 3 more at spec-1.2 for cluster_smgr.
  *
  * Two subsystems deliberately excluded (spec-0.30 §1.4 exceptions):
  *   - cluster_elog: CLUSTER_LOG is a header macro that expands inline
@@ -109,6 +109,11 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	{ .name = "cluster-shared-fs-backend-register" },
 	{ .name = "cluster-shared-fs-init-top" },
 	{ .name = "cluster-shared-fs-local-open" },
+
+	/* Stage 1.2 cluster_smgr (3 entries) */
+	{ .name = "cluster-smgr-create-top" },
+	{ .name = "cluster-smgr-open-top" },
+	{ .name = "cluster-smgr-which-decision" },
 };
 
 #define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_points)

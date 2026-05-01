@@ -67,8 +67,10 @@
 #include "utils/elog.h"
 #include "utils/memutils.h"
 
-/* GUC variable accessed by cluster_shared_fs_init. */
+/* GUC variables accessed by cluster_shared_fs_init.  Stage 1.2 added
+ * the smgr_user_relations cross-check. */
 int cluster_shared_storage_backend = 0;
+bool cluster_smgr_user_relations = false;
 
 /* Cluster injection support (CLUSTER_INJECTION_POINT() macro expansion). */
 #include "cluster/cluster_inject.h"

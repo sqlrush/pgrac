@@ -75,6 +75,10 @@
 /*  - 202605010: cluster.shared_storage_backend GUC + 5 cluster_shared_fs */
 /*               wait events (no new SRF; pg_cluster_state extended with */
 /*               a shared_fs category) (spec-1.1, stage 1.1). */
-#define CATALOG_VERSION_NO	202605010
+/*  - 202605020: cluster_smgr bridge + cluster.smgr_user_relations GUC + */
+/*               smgrsw[] extended to 2 entries + 3 cluster-smgr-* */
+/*               injection points + pg_cluster_state shared_fs / guc */
+/*               extended (spec-1.2, stage 1.2; 方案 C 单文件). */
+#define CATALOG_VERSION_NO	202605020
 
 #endif
