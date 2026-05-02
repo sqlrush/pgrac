@@ -136,16 +136,76 @@ UT_TEST(test_field_layout_below_pd_block_scn_unchanged)
 }
 
 
+/* ============================================================
+ * Stage 1.5 invariants -- ITL slot array + tuple header +1B.
+ * ============================================================ */
+
+#include "access/htup_details.h"
+
+
+UT_TEST(test_pd_has_itl_bit_value)
+{
+	/*
+	 * PD_HAS_ITL = 0x0008 carved out of pd_flags reserved space
+	 * (PG vanilla used 0x0001-0x0004).  PD_VALID_FLAG_BITS extended
+	 * to 0x000F to acknowledge the new bit.
+	 */
+	UT_ASSERT_EQ(PD_HAS_ITL, 0x0008);
+	UT_ASSERT_EQ(PD_VALID_FLAG_BITS, 0x000F);
+}
+
+
+UT_TEST(test_heap_tuple_header_size_is_24)
+{
+	/*
+	 * SizeofHeapTupleHeader = offsetof(HeapTupleHeaderData, t_bits).
+	 * pgrac inserts t_itl_slot_idx after t_hoff so this grows from
+	 * 23 (PG vanilla) to 24.  Q7 A+B audit verifies no PG path
+	 * hardcodes the old 23 value (see docs/spec-1.5-tuple-header-audit.md).
+	 */
+	UT_ASSERT_EQ((int)SizeofHeapTupleHeader, 24);
+}
+
+
+UT_TEST(test_t_itl_slot_idx_offset_is_23)
+{
+	/*
+	 * t_itl_slot_idx must sit immediately after t_hoff (offset 22 +
+	 * 1 byte = 23).  heap_form_tuple writes this byte explicitly to
+	 * CLUSTER_ITL_SLOT_UNALLOCATED (255) per spec-1.5 §8 Q3.
+	 */
+	UT_ASSERT_EQ((int)offsetof(HeapTupleHeaderData, t_itl_slot_idx), 23);
+}
+
+
+UT_TEST(test_minimal_tuple_layout_matches_heap)
+{
+	/*
+	 * MinimalTupleData MUST have t_itl_slot_idx at the same relative
+	 * offset to t_hoff as HeapTupleHeaderData, so heap_to_minimal_tuple
+	 * byte-copy preserves the placeholder value.  Both should have
+	 * t_bits at offsetof t_hoff + 1.
+	 */
+	UT_ASSERT_EQ(
+		(int)(offsetof(MinimalTupleData, t_bits) - offsetof(MinimalTupleData, t_hoff)),
+		(int)(offsetof(HeapTupleHeaderData, t_bits) - offsetof(HeapTupleHeaderData, t_hoff)));
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(10);
 	UT_RUN(test_page_header_total_size_is_32_bytes);
 	UT_RUN(test_pd_block_scn_offset_is_24);
 	UT_RUN(test_pd_block_scn_field_is_8_bytes);
 	UT_RUN(test_pg_page_layout_version_is_5);
 	UT_RUN(test_invalid_scn_zero_init_is_natural);
 	UT_RUN(test_field_layout_below_pd_block_scn_unchanged);
+	UT_RUN(test_pd_has_itl_bit_value);
+	UT_RUN(test_heap_tuple_header_size_is_24);
+	UT_RUN(test_t_itl_slot_idx_offset_is_23);
+	UT_RUN(test_minimal_tuple_layout_matches_heap);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

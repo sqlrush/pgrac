@@ -91,6 +91,14 @@
 /*               + block_format category 4 keys (spec-1.4, stage 1.4; */
 /*               binary not compatible with vanilla PG 16; pgrac 1.3 */
 /*               data must be dump+restore migrated to 1.4+). */
-#define CATALOG_VERSION_NO	202605040
+/*  - 202605050: cluster ITL slot array (stage 1.5): heap PageHeader */
+/*               +384B ITL slot array (INITRANS=8 × 48B/slot) via */
+/*               PageInitHeapPage + HeapTupleHeader +1B t_itl_slot_idx */
+/*               + cluster_itl_slot.h ClusterItlSlotData typedef stub + */
+/*               pd_flags PD_HAS_ITL bit (0x0008) + MaxHeapTupleSize */
+/*               reduced 8152 -> 7768 + pg_cluster_state.block_format */
+/*               extended 4 -> 9 keys (spec-1.5, stage 1.5; pgrac 1.4 */
+/*               data must be dump+restore migrated to 1.5+). */
+#define CATALOG_VERSION_NO	202605050
 
 #endif

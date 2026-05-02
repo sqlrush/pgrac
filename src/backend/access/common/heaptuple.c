@@ -53,11 +53,31 @@
  *	  src/backend/access/common/heaptuple.c
  *
  *-------------------------------------------------------------------------
+ *
+ * PGRAC MODIFICATIONS (10th):
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *
+ *	What changed:  When USE_PGRAC_CLUSTER is defined, heap_form_tuple
+ *	               (called by heap_modify_tuple and most tuple-creation
+ *	               paths) writes CLUSTER_ITL_SLOT_UNALLOCATED (= 255)
+ *	               to td->t_itl_slot_idx after td->t_hoff assignment.
+ *	Why:           Stage 1.5 placeholder for the new HeapTupleHeader
+ *	               t_itl_slot_idx field (PGRAC MODIFICATIONS 9th in
+ *	               htup_details.h).  palloc0 above already zeroed the
+ *	               byte, but the placeholder constant is 255 (not 0)
+ *	               so we MUST write it explicitly.  Stage 3 (AD-006
+ *	               第五轮) populates real 0..N indexes when a
+ *	               transaction touches the row.
+ *	               See specs/spec-1.5-itl-slot.md §1.4 例外说明 #3
+ *	               + §8 Q3.
  */
 
 #include "postgres.h"
 
 #include "access/heaptoast.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_itl_slot.h" /* CLUSTER_ITL_SLOT_UNALLOCATED (stage 1.5) */
+#endif
 #include "access/sysattr.h"
 #include "access/tupdesc_details.h"
 #include "common/hashfn.h"
@@ -1183,6 +1203,18 @@ heap_form_tuple(TupleDesc tupleDescriptor,
 
 	HeapTupleHeaderSetNatts(td, numberOfAttributes);
 	td->t_hoff = hoff;
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC (stage 1.5): mark this tuple as having no ITL slot assigned.
+	 *
+	 *	palloc0 above already zeroed t_itl_slot_idx, but
+	 *	CLUSTER_ITL_SLOT_UNALLOCATED == 255 (not 0), so we must write
+	 *	the placeholder explicitly.  Stage 3 (AD-006 第五轮) populates
+	 *	real 0..N slot indexes when a transaction actually touches the
+	 *	row; until then every newly-formed tuple stays "unassigned".
+	 */
+	td->t_itl_slot_idx = CLUSTER_ITL_SLOT_UNALLOCATED;
+#endif
 
 	heap_fill_tuple(tupleDescriptor,
 					values,

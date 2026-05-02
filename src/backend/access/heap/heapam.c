@@ -9828,7 +9828,12 @@ heap_xlog_insert(XLogReaderState *record)
 	{
 		buffer = XLogInitBufferForRedo(record, 0);
 		page = BufferGetPage(buffer);
+		/* PGRAC: heap WAL redo must restore ITL slot array (stage 1.5). */
+#ifdef USE_PGRAC_CLUSTER
+		PageInitHeapPage(page, BufferGetPageSize(buffer), 0);
+#else
 		PageInit(page, BufferGetPageSize(buffer), 0);
+#endif
 		action = BLK_NEEDS_REDO;
 	}
 	else
@@ -9948,7 +9953,12 @@ heap_xlog_multi_insert(XLogReaderState *record)
 	{
 		buffer = XLogInitBufferForRedo(record, 0);
 		page = BufferGetPage(buffer);
+		/* PGRAC: heap WAL redo must restore ITL slot array (stage 1.5). */
+#ifdef USE_PGRAC_CLUSTER
+		PageInitHeapPage(page, BufferGetPageSize(buffer), 0);
+#else
 		PageInit(page, BufferGetPageSize(buffer), 0);
+#endif
 		action = BLK_NEEDS_REDO;
 	}
 	else
@@ -10166,7 +10176,12 @@ heap_xlog_update(XLogReaderState *record, bool hot_update)
 	{
 		nbuffer = XLogInitBufferForRedo(record, 0);
 		page = (Page) BufferGetPage(nbuffer);
+		/* PGRAC: heap WAL redo must restore ITL slot array (stage 1.5). */
+#ifdef USE_PGRAC_CLUSTER
+		PageInitHeapPage(page, BufferGetPageSize(nbuffer), 0);
+#else
 		PageInit(page, BufferGetPageSize(nbuffer), 0);
+#endif
 		newaction = BLK_NEEDS_REDO;
 	}
 	else

@@ -437,7 +437,7 @@ ok($node->safe_psql('postgres',
 # P1: block_format category exposes 4 keys.
 is($node->safe_psql('postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='block_format'}),
-	'4', 'P1 block_format category has 4 keys (page_layout_version, page_header_size, scn_size_bytes, invalid_scn_value)');
+	'9', 'P1 block_format category has 9 keys (4 stage-1.4 + 5 stage-1.5 ITL: itl_slot_size_bytes, itl_initrans_default, itl_array_bytes, tuple_header_extra_bytes, itl_location)');
 
 # P2: page_layout_version = 5 (PG 16 vanilla 4 + pgrac 1.4 bump).
 is($node->safe_psql('postgres',

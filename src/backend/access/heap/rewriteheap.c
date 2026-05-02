@@ -701,8 +701,12 @@ raw_heap_insert(RewriteState state, HeapTuple tup)
 
 	if (!state->rs_buffer_valid)
 	{
-		/* Initialize a new empty page */
+		/* Initialize a new empty page (PGRAC: heap page needs ITL, stage 1.5). */
+#ifdef USE_PGRAC_CLUSTER
+		PageInitHeapPage(page, BLCKSZ, 0);
+#else
 		PageInit(page, BLCKSZ, 0);
+#endif
 		state->rs_buffer_valid = true;
 	}
 

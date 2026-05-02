@@ -10,6 +10,42 @@
  * src/include/access/htup_details.h
  *
  *-------------------------------------------------------------------------
+ *
+ * PGRAC MODIFICATIONS (9th):
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *
+ *	What changed:  When USE_PGRAC_CLUSTER is defined, extend
+ *	               HeapTupleHeaderData with a 1-byte t_itl_slot_idx
+ *	               field after t_hoff and before the t_bits FAM.
+ *	               SizeofHeapTupleHeader (= offsetof t_bits) auto-grows
+ *	               from 23 to 24 bytes.  Stage 1.5 ships only the field;
+ *	               heap_form_tuple / heap_modify_tuple write
+ *	               CLUSTER_ITL_SLOT_UNALLOCATED (= 255) as a placeholder
+ *	               (PGRAC MODIFICATIONS 10th in heaptuple.c).  Stage 3
+ *	               (AD-006 第五轮) populates real 0..N slot indexes when
+ *	               a transaction touches the row.
+ *	Why:           Stage 1.5 introduces ITL slot array for Oracle-style
+ *	               row-level locking + per-block transaction queue.
+ *	               Each tuple needs to record which ITL slot is "interested"
+ *	               in it; t_itl_slot_idx is that pointer (255 = unassigned).
+ *	               1B is enough because INITRANS upper bound is ~169
+ *	               slots/page (8192-byte page capacity), well under 256.
+ *	               Per spec-1.5 §8 Q3 = A.
+ *	               t_bits is FLEXIBLE_ARRAY_MEMBER, so adding a field
+ *	               before it is an ABI-safe PG modification pattern --
+ *	               PG callers use SizeofHeapTupleHeader macro which
+ *	               recomputes via offsetof.
+ *	               See specs/spec-1.5-itl-slot.md §1.4 例外说明 #5,
+ *	               docs/block-format-design.md v1.2 §4.4.
+ *
+ *	Per spec-1.5 §8 Q7 (user-revised hybrid A+B): trust PG's
+ *	SizeofHeapTupleHeader macro as the primary mechanism, BUT do a
+ *	targeted audit of 7 high-risk files (heaptoast.c / heaptuple.c /
+ *	heapam_visibility.c / pruneheap.c / vacuumlazy.c / heapam.c / hio.c)
+ *	for hardcoded `23` / `t_hoff >= 23` assumptions, and add 4 t_hoff
+ *	boundary tests in 022_itl_slot.pl L15-L18 (no null bitmap / 1 null /
+ *	64+ nulls / max heap size).  Audit deliverable:
+ *	pgrac/docs/spec-1.5-tuple-header-audit.md.
  */
 #ifndef HTUP_DETAILS_H
 #define HTUP_DETAILS_H
@@ -172,9 +208,30 @@ struct HeapTupleHeaderData
 #define FIELDNO_HEAPTUPLEHEADERDATA_HOFF 4
 	uint8		t_hoff;			/* sizeof header incl. bitmap, padding */
 
-	/* ^ - 23 bytes - ^ */
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC (stage 1.5): ITL slot index pointer.
+	 *
+	 *	255 = unallocated (Stage 1.5 placeholder; all heap_form_tuple /
+	 *	heap_modify_tuple paths write this value -- spec-1.5 §8 Q3).
+	 *	0..7 = ITL slot index (Stage 3 AD-006 第五轮 populates real
+	 *	values when a transaction touches the row).
+	 *
+	 *	1 byte is sufficient: INITRANS upper bound is ~169/page (8192-
+	 *	byte page capacity), well under the 255 slot-id space; 255 is
+	 *	reserved as the "no slot" sentinel.
+	 */
+#define FIELDNO_HEAPTUPLEHEADERDATA_ITL_SLOT_IDX 5
+	uint8		t_itl_slot_idx;	/* ITL slot index (255 = unallocated) */
+#endif
 
+	/* ^ - 23 bytes (PG vanilla) / 24 bytes (USE_PGRAC_CLUSTER) - ^ */
+
+#ifdef USE_PGRAC_CLUSTER
+#define FIELDNO_HEAPTUPLEHEADERDATA_BITS 6
+#else
 #define FIELDNO_HEAPTUPLEHEADERDATA_BITS 5
+#endif
 	bits8		t_bits[FLEXIBLE_ARRAY_MEMBER];	/* bitmap of NULLs */
 
 	/* MORE DATA FOLLOWS AT END OF STRUCT */
@@ -560,7 +617,31 @@ StaticAssertDecl(MaxOffsetNumber < SpecTokenOffsetNumber,
  * ItemIds and tuples have different alignment requirements, don't assume that
  * you can, say, fit 2 tuples of size MaxHeapTupleSize/2 on the same page.
  */
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * PGRAC (stage 1.5, PIVOT A 2026-05-02): heap pages reserve 384 bytes
+ * at the page TAIL for the ITL slot array (PG special area, set up by
+ * PageInitHeapPage).  Using vanilla MaxHeapTupleSize would cause
+ * heap_insert to accept over-sized tuples that pass the check but
+ * then PANIC inside the critical section when they don't fit on the
+ * page (PANIC: tuple is too big at heapam.c:9854).
+ *
+ * MaxHeapTupleSize for pgrac heap pages =
+ *     BLCKSZ - CLUSTER_ITL_ARRAY_SIZE - MAXALIGN(SizeOfPageHeaderData + sizeof(ItemIdData))
+ *   = 8192 - 384 - MAXALIGN(32 + 4)
+ *   = 8192 - 384 - 40
+ *   = 7768
+ *
+ * Index pages don't subtract ITL (their special area is btree opaque
+ * etc.); MaxHeapTupleSize only governs heap_insert / heap_update.
+ * btree's own checks (e.g. BTMaxItemSize) are independent.
+ */
+#define MaxHeapTupleSize  \
+	(BLCKSZ - CLUSTER_ITL_ARRAY_SIZE - \
+	 MAXALIGN(SizeOfPageHeaderData + sizeof(ItemIdData)))
+#else
 #define MaxHeapTupleSize  (BLCKSZ - MAXALIGN(SizeOfPageHeaderData + sizeof(ItemIdData)))
+#endif
 #define MinHeapTupleSize  MAXALIGN(SizeofHeapTupleHeader)
 
 /*
@@ -573,10 +654,20 @@ StaticAssertDecl(MaxOffsetNumber < SpecTokenOffsetNumber,
  * tuples) than this on a heap page.  However we constrain the number of line
  * pointers to this anyway, to avoid excessive line-pointer bloat and not
  * require increases in the size of work arrays.
+ *
+ * PGRAC (stage 1.5): heap pages reserve CLUSTER_ITL_ARRAY_SIZE bytes
+ * at the page tail (special area), so the usable space for tuples +
+ * ItemIds is reduced by that amount.
  */
+#ifdef USE_PGRAC_CLUSTER
+#define MaxHeapTuplesPerPage	\
+	((int) ((BLCKSZ - CLUSTER_ITL_ARRAY_SIZE - SizeOfPageHeaderData) / \
+			(MAXALIGN(SizeofHeapTupleHeader) + sizeof(ItemIdData))))
+#else
 #define MaxHeapTuplesPerPage	\
 	((int) ((BLCKSZ - SizeOfPageHeaderData) / \
 			(MAXALIGN(SizeofHeapTupleHeader) + sizeof(ItemIdData))))
+#endif
 
 /*
  * MaxAttrSize is a somewhat arbitrary upper limit on the declared size of
@@ -640,7 +731,18 @@ struct MinimalTupleData
 
 	uint8		t_hoff;			/* sizeof header incl. bitmap, padding */
 
-	/* ^ - 23 bytes - ^ */
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC (stage 1.5): MUST mirror HeapTupleHeaderData.t_itl_slot_idx
+	 * because PG converts between HeapTuple and MinimalTuple by copying
+	 * bytes starting at t_infomask2 (heap_to_minimal_tuple in
+	 * heaptuple.c).  In-memory MinimalTuples don't need ITL semantically,
+	 * but the layout MUST match or conversion corrupts t_bits / data.
+	 */
+	uint8		t_itl_slot_idx;	/* mirror of HeapTupleHeaderData; 255 placeholder */
+#endif
+
+	/* ^ - 23 bytes (PG vanilla) / 24 bytes (USE_PGRAC_CLUSTER) - ^ */
 
 	bits8		t_bits[FLEXIBLE_ARRAY_MEMBER];	/* bitmap of NULLs */
 

@@ -49,13 +49,14 @@ $node->start;
 
 
 # ----------
-# L1: pg_cluster_state.block_format category exists with 4 rows.
+# L1: pg_cluster_state.block_format category exists.
+# Stage 1.4 introduced 4 keys; stage 1.5 extends to 9 keys (+5 ITL).
 # ----------
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='block_format'}),
-   '4',
-   'L1 pg_cluster_state.block_format category has 4 keys');
+   '9',
+   'L1 pg_cluster_state.block_format category has 9 keys (4 stage-1.4 + 5 stage-1.5 ITL)');
 
 
 # ----------
@@ -121,14 +122,16 @@ SKIP: {
 		INSERT INTO t1 VALUES (1);
 	});
 
-	# L6: heap PageInit -- pd_lower = 36 (32 header + 4-byte ItemId);
-	# pagesize = 8192; layout version = 5.
+	# L6: heap PageInit (1.4) -> heap PageInitHeapPage (1.5 PIVOT A).
+	# Stage 1.5 reserves 384B ITL array in PG special area at page tail,
+	# so pd_lower = 32 + 4 (first ItemId) = 36 (not 420 like pre-PIVOT).
+	# pagesize = 8192; layout version = 5; pd_special = 7808.
 	is($node->safe_psql(
-			'postgres',
-			q{SELECT lower::text || ',' || pagesize::text || ',' || version::text
-			    FROM page_header(get_raw_page('t1', 0))}),
-	   '36,8192,5',
-	   'L6 heap page first INSERT: lower=36, pagesize=8192, version=5');
+			'postgres', q{
+		SELECT lower::text || ',' || pagesize::text || ',' || version::text || ',' || special::text
+		  FROM page_header(get_raw_page('t1', 0))}),
+	   '36,8192,5,7808',
+	   'L6 heap page first INSERT (PIVOT A): lower=36, pagesize=8192, version=5, special=7808 (ITL in special area)');
 
 	# L7: btree index PageInit -- root page version = 5.
 	$node->safe_psql('postgres', q{

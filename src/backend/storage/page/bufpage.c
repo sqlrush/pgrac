@@ -30,6 +30,31 @@
  *	               when spec-1.16 lands.
  *	               See specs/spec-1.4-block-format-pageheader-scn.md
  *	               §1.4 example 3 (PageInit placeholder write strategy).
+ *
+ * PGRAC MODIFICATIONS (8th):
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *
+ *	What changed:  Add PageInitHeapPage(page, pageSize, specialSize) --
+ *	               heap-specific PageInit that initializes both the
+ *	               PageHeader (delegates to PageInit) AND the 384-byte
+ *	               ITL slot array (8 slots × 48 bytes) immediately
+ *	               after the header.  Sets PD_HAS_ITL pd_flags bit.
+ *	               Stage 1.5 writes ITL_FLAG_FREE / InvalidScn /
+ *	               InvalidUba / InvalidTransactionId / InvalidXLogRecPtr
+ *	               placeholders for every slot field; Stage 3 (AD-006
+ *	               第五轮) implements actual writes / reuse / cleanout.
+ *	Why:           Stage 1.5 introduces ITL slot array for Oracle-style
+ *	               row-level locking + per-block transaction queue.
+ *	               Heap pages get the array (visible via PD_HAS_ITL bit
+ *	               + pd_lower starting at SizeOfPageHeaderWithItl=416);
+ *	               index pages stay at pd_lower=32.  PageInitHeapPage
+ *	               is the single SSOT for "heap page init"; heap am
+ *	               (heapam.c, hio.c) MUST call it instead of PageInit.
+ *	               Per spec-1.5 §8 Q4 = B and §8 Q6 = B, ITL fields are
+ *	               written explicitly (not relying on MemSet zero-fill)
+ *	               so the placeholder semantics are readable in source.
+ *	               See specs/spec-1.5-itl-slot.md §1.4 例外说明 #5,
+ *	               docs/block-format-design.md v1.2 §15 阶段 2 ✦.
  */
 #include "postgres.h"
 
@@ -40,6 +65,10 @@
 #include "storage/checksum.h"
 #include "utils/memdebug.h"
 #include "utils/memutils.h"
+
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_itl_slot.h" /* PageInitHeapPage placeholder writes (stage 1.5) */
+#endif
 
 
 /* GUC variable */
@@ -89,6 +118,112 @@ PageInit(Page page, Size pageSize, Size specialSize)
 	p->pd_block_scn = InvalidScn;
 #endif
 }
+
+
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * PageInitHeapPage
+ *		Heap-specific PageInit (stage 1.5).
+ *
+ *	Initializes the contents of a heap page: PageHeader (via PageInit
+ *	with specialSize = CLUSTER_ITL_ARRAY_SIZE = 384) plus placeholder
+ *	values for the 8 ITL slots stored in PG's special area at the END
+ *	of the page.  Sets PD_HAS_ITL flag bit so readers can distinguish
+ *	heap pages (with ITL) from index pages (PageInit, no ITL).
+ *
+ *	Page layout (8 KB):
+ *	    [0 .. 32)        PageHeaderData
+ *	    [32 .. pd_lower) line pointers (ItemIdData[]), grow upward
+ *	    [pd_lower .. pd_upper)  free space
+ *	    [pd_upper .. 7808)      tuple data, grows downward
+ *	    [7808 .. 8192)   ClusterItlSlotData[8] (PG special area)
+ *
+ *	Per spec-1.5 §1.4 example #6 (PIVOT A 2026-05-02), the ITL array
+ *	lives in PG's special area (the same mechanism btree / hash / gin
+ *	/ gist / brin / spgist use for per-page metadata), NOT directly
+ *	after PageHeader.  This avoids breaking PG's pd_linp[] array
+ *	access -- all PG page-access macros (PageGetItemId,
+ *	PageGetMaxOffsetNumber, PageGetFreeSpace, etc.) keep working.
+ *	docs/block-format-design.md v1.0 §4.1 visual layout was misleading
+ *	(it implied physical adjacency); spec-1.5 §1.4 example #6 + v1.2
+ *	docs amend reflect the special-area placement.
+ *
+ *	Stage 1.5 writes only placeholder values to ITL slot fields:
+ *	    xid                = InvalidTransactionId
+ *	    wrap               = 0
+ *	    flags              = ITL_FLAG_FREE
+ *	    lock_count         = 0
+ *	    undo_segment_head  = InvalidUba (all zero)
+ *	    commit_scn         = InvalidScn
+ *	    write_scn          = InvalidScn
+ *	    first_change_lsn   = InvalidXLogRecPtr
+ *
+ *	Stage 3 (AD-006 第五轮 ~27000 LOC) implements the actual write /
+ *	reuse / cleanout state machine; until then PageInitHeapPage is
+ *	called once per heap page allocation (heap_extend / hio.c) and
+ *	the ITL array remains in placeholder state for the page lifetime.
+ *
+ *	Per spec-1.5 §8 Q6 = B, ITL fields are written explicitly (loop
+ *	over the 8 slots) rather than relying on MemSet.  The MemSet in
+ *	PageInit already zeroes the array; the explicit assignments make
+ *	the placeholder semantics visible to readers and survive any
+ *	future change to the InvalidXxx sentinel values.
+ *
+ *	Heap am callers (heapam.c, hio.c) MUST use this; index am callers
+ *	(btree, hash, gin, gist, brin, spgist) MUST keep using PageInit.
+ */
+void
+PageInitHeapPage(Page page, Size pageSize, Size specialSize)
+{
+	PageHeader	p = (PageHeader) page;
+	ClusterItlSlotData *itl;
+	int			i;
+
+	/*
+	 * Heap am currently passes specialSize = 0 (heap doesn't use the
+	 * special area); pgrac stage 1.5 repurposes the special area for
+	 * the ITL slot array.  Future stages (e.g. when heap am wants its
+	 * own special area for other purposes) would need to fold those
+	 * bytes into a larger specialSize -- not on the roadmap.
+	 */
+	Assert(specialSize == 0);
+
+	/*
+	 * Delegate to base PageInit, but reserve CLUSTER_ITL_ARRAY_SIZE
+	 * bytes at the page tail as PG special area.  After this:
+	 *    pd_lower = SizeOfPageHeaderData (32)
+	 *    pd_upper = pageSize - CLUSTER_ITL_ARRAY_SIZE
+	 *    pd_special = pd_upper (= start of ITL array)
+	 */
+	PageInit(page, pageSize, CLUSTER_ITL_ARRAY_SIZE);
+
+	/* Mark the page so readers know special area is ITL (not btree etc.). */
+	p->pd_flags |= PD_HAS_ITL;
+
+	/*
+	 * Explicit placeholder writes for every ITL slot (per spec-1.5 §8
+	 * Q6 = B).  MemSet in PageInit already zeroed all 8 slots, but the
+	 * assignment makes the placeholder semantics visible and survives
+	 * future changes to InvalidXxx sentinel values.
+	 *
+	 * Stage 3 (AD-006 第五轮) replaces this loop body with actual ITL
+	 * write logic on heap_insert / heap_update / heap_delete paths.
+	 */
+	itl = (ClusterItlSlotData *) PageGetSpecialPointer(page);
+	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+	{
+		itl[i].xid = InvalidTransactionId;
+		itl[i].wrap = 0;
+		itl[i].flags = ITL_FLAG_FREE;
+		itl[i].lock_count = 0;
+		itl[i].undo_segment_head.raw[0] = 0;
+		itl[i].undo_segment_head.raw[1] = 0;
+		itl[i].commit_scn = InvalidScn;
+		itl[i].write_scn = InvalidScn;
+		itl[i].first_change_lsn = InvalidXLogRecPtr;
+	}
+}
+#endif /* USE_PGRAC_CLUSTER */
 
 
 /*

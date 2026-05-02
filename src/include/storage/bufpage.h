@@ -31,6 +31,48 @@
  *	               See docs/block-format-design.md v1.1 §4.2 + §15
  *	               stage 1, docs/scn-protocol-design.md v1.1 §3.2,
  *	               specs/spec-1.4-block-format-pageheader-scn.md.
+ *
+ * PGRAC MODIFICATIONS (7th):
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *
+ *	What changed:  When USE_PGRAC_CLUSTER is defined, declare:
+ *	               1. PageInitHeapPage extern -- heap-specific PageInit
+ *	                  variant that calls PG PageInit with specialSize
+ *	                  = CLUSTER_ITL_ARRAY_SIZE (384), placing 8 ITL
+ *	                  slots in PG's special area at the page tail.
+ *	               2. ClusterPageGetItlSlots inline helper that wraps
+ *	                  PageGetSpecialPointer with PD_HAS_ITL +
+ *	                  PageGetSpecialSize asserts.
+ *	               3. PageHasItl inline helper.
+ *	               4. PD_HAS_ITL flag bit (0x0008) -- set by
+ *	                  PageInitHeapPage; reader uses it to distinguish
+ *	                  heap pages (special = ITL) from index pages
+ *	                  (special = btree/hash/gin opaque).
+ *	Why:           Stage 1.5 introduces the ITL slot array for Oracle-
+ *	               style row-level locking + per-block transaction
+ *	               queue.  Heap pages get 384 B ITL in the PG special
+ *	               area at the page tail (NOT directly after the
+ *	               PageHeader -- doing so would break PG's pd_linp
+ *	               array access); index pages keep using their own
+ *	               special area for btree/hash/etc. opaque data.
+ *	               PageInitHeapPage carries the heap-specific knowledge
+ *	               (which PageInit cannot, since it's called from both
+ *	               heap am and index am).  Stage 1.5 only writes
+ *	               placeholder ITL values (ITL_FLAG_FREE / InvalidScn /
+ *	               InvalidUba); Stage 3 (AD-006 第五轮) implements
+ *	               actual writes / reuse / cleanout.
+ *
+ *	               PIVOT A (2026-05-02): user-mandated relocation of
+ *	               ITL from "after PageHeader" to "in special area".
+ *	               The original layout broke PG's pd_linp[] struct
+ *	               access (PageGetMaxOffsetNumber / PageGetItemId etc.
+ *	               assume pd_linp starts at offsetof = SizeOfPageHeader-
+ *	               Data); special area is the only ABI-safe place to
+ *	               put 384 B of per-heap-page metadata.  This is also
+ *	               how btree (BTPageOpaque) / hash / gist / brin /
+ *	               spgist / gin already use the special area.
+ *	               See specs/spec-1.5-itl-slot.md §1.4 例外说明 #6,
+ *	               docs/block-format-design.md v1.2 §4.1 layout.
  */
 #ifndef BUFPAGE_H
 #define BUFPAGE_H
@@ -42,6 +84,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_scn.h" /* SCN typedef + InvalidScn (stage 1.4) */
+#include "cluster/cluster_itl_slot.h" /* ClusterItlSlotData + CLUSTER_ITL_ARRAY_SIZE (stage 1.5) */
 #endif
 
 /*
@@ -222,7 +265,19 @@ typedef PageHeaderData *PageHeader;
 #define PD_ALL_VISIBLE		0x0004	/* all tuples on page are visible to
 									 * everyone */
 
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * PGRAC (stage 1.5): heap pages contain an ITL slot array immediately
+ * after the PageHeader.  Set by PageInitHeapPage (heap am path);
+ * cleared / never-set by PageInit (index am path).  Reader uses this
+ * bit to know whether (page + SizeOfPageHeaderData) is the start of
+ * 384 bytes of ClusterItlSlotData or the start of pd_linp.
+ */
+#define PD_HAS_ITL			0x0008
+#define PD_VALID_FLAG_BITS	0x000F	/* OR of all valid pd_flags bits */
+#else
 #define PD_VALID_FLAG_BITS	0x0007	/* OR of all valid pd_flags bits */
+#endif
 
 /*
  * Page layout version number 0 is for pre-7.3 Postgres releases.
@@ -263,6 +318,14 @@ typedef PageHeaderData *PageHeader;
 /*
  * PageIsEmpty
  *		returns true iff no itemid has been allocated on the page
+ *
+ *	NOTE (PGRAC stage 1.5): this checks pd_lower against the ITL-free
+ *	header size.  Heap pages with PD_HAS_ITL still pass this test if
+ *	pd_lower has not been advanced past SizeOfPageHeaderWithItl, but
+ *	heap am callers should use PageIsEmpty in conjunction with
+ *	PageHasItl() when they care whether the ITL array is present.
+ *	Most existing callers (vacuum, FSM) treat "empty" as "no rows yet"
+ *	and the unchanged check is correct for both heap and index pages.
  */
 static inline bool
 PageIsEmpty(Page page)
@@ -533,6 +596,81 @@ StaticAssertDecl(BLCKSZ == ((BLCKSZ / sizeof(size_t)) * sizeof(size_t)),
 				 "BLCKSZ has to be a multiple of sizeof(size_t)");
 
 extern void PageInit(Page page, Size pageSize, Size specialSize);
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * PGRAC (stage 1.5): heap-specific PageInit that allocates the 384B
+ * ITL slot array immediately after the PageHeader.  All ITL slot
+ * fields are written as placeholders (ITL_FLAG_FREE / InvalidScn /
+ * InvalidUba / InvalidTransactionId / InvalidXLogRecPtr) per
+ * spec-1.5 §3.2; Stage 3 (AD-006 第五轮) takes over real writes /
+ * reuse / cleanout.
+ *
+ * pd_lower starts at SizeOfPageHeaderWithItl (= 416); PD_HAS_ITL is
+ * set in pd_flags so readers can distinguish heap pages (with ITL)
+ * from index pages (PageInit, no ITL).
+ *
+ * Heap am paths (heapam.c, hio.c) MUST call this; index am paths
+ * (btree, hash, gin, gist, brin, spgist) MUST keep calling PageInit.
+ */
+extern void PageInitHeapPage(Page page, Size pageSize, Size specialSize);
+
+/*
+ * PageHasItl -- does this heap page carry an ITL slot array?
+ *
+ *	Read PD_HAS_ITL bit; only heap pages set it (PageInitHeapPage
+ *	above).  Use this guard before ClusterPageGetItlSlots.
+ *
+ *	Index am pages (btree, hash, gin, gist, brin, spgist) have their
+ *	own special area data (BTPageOpaque etc.) and MUST NOT have this
+ *	bit set.  PG reuses the special area for am-specific metadata; the
+ *	bit identifies which interpretation to use.
+ */
+static inline bool
+PageHasItl(Page page)
+{
+	return (((PageHeader) page)->pd_flags & PD_HAS_ITL) != 0;
+}
+
+/*
+ * ClusterPageGetItlSlots -- pointer to slot 0 of the per-page ITL array.
+ *
+ *	Returns PageGetSpecialPointer(page) cast to ClusterItlSlotData *.
+ *	Stage 1.5 stores the 8-slot array (384 B) in PG's special area at
+ *	the page tail, NOT directly after the PageHeader (PIVOT A
+ *	2026-05-02; original layout broke PG's pd_linp[] struct access).
+ *
+ *	The asserts catch two classes of misuse:
+ *	  1. PageHasItl(page) -- caller fed an index page (no ITL)
+ *	  2. PageGetSpecialSize(page) >= CLUSTER_ITL_ARRAY_SIZE -- caller
+ *	     fed a malformed heap page where the special area is smaller
+ *	     than the ITL array (corruption / bug)
+ */
+static inline ClusterItlSlotData *
+ClusterPageGetItlSlots(Page page)
+{
+	Assert(PageHasItl(page));
+	Assert(PageGetSpecialSize(page) >= CLUSTER_ITL_ARRAY_SIZE);
+	return (ClusterItlSlotData *) PageGetSpecialPointer(page);
+}
+
+/*
+ * ClusterPageGetItlSlot -- the slot_idx-th ITL slot (0-based).
+ *
+ *	Stage 1.5 returns slots in ITL_FLAG_FREE state with all SCN /
+ *	UBA / xid fields zero-init'd.  Stage 3 (AD-006 第五轮) populates
+ *	real values during heap_insert / heap_update / heap_delete.
+ *
+ *	slot_idx in 0..CLUSTER_ITL_INITRANS_DEFAULT-1; out-of-range trips
+ *	an Assert.  Heap tuple's t_itl_slot_idx == 255 means "no slot
+ *	assigned" -- callers must not pass 255 here.
+ */
+static inline ClusterItlSlotData *
+ClusterPageGetItlSlot(Page page, uint8 slot_idx)
+{
+	Assert(slot_idx < CLUSTER_ITL_INITRANS_DEFAULT);
+	return &ClusterPageGetItlSlots(page)[slot_idx];
+}
+#endif
 extern bool PageIsVerifiedExtended(Page page, BlockNumber blkno, int flags);
 extern OffsetNumber PageAddItemExtended(Page page, Item item, Size size,
 										OffsetNumber offsetNumber, int flags);

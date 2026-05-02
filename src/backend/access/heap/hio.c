@@ -361,7 +361,12 @@ RelationAddBlocks(Relation relation, BulkInsertState bistate,
 			 first_block,
 			 RelationGetRelationName(relation));
 
+	/* PGRAC: heap page needs ITL slot array (stage 1.5). */
+#ifdef USE_PGRAC_CLUSTER
+	PageInitHeapPage(page, BufferGetPageSize(buffer), 0);
+#else
 	PageInit(page, BufferGetPageSize(buffer), 0);
+#endif
 	MarkBufferDirty(buffer);
 
 	/*
@@ -696,7 +701,12 @@ loop:
 		 */
 		if (PageIsNew(page))
 		{
+			/* PGRAC: heap page needs ITL slot array (stage 1.5). */
+#ifdef USE_PGRAC_CLUSTER
+			PageInitHeapPage(page, BufferGetPageSize(buffer), 0);
+#else
 			PageInit(page, BufferGetPageSize(buffer), 0);
+#endif
 			MarkBufferDirty(buffer);
 		}
 
