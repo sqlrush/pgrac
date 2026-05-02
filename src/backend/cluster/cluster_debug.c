@@ -74,10 +74,12 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_elog.h" /* cluster_phase */
 #include "cluster/cluster_guc.h"
-#include "cluster/cluster_ic.h"		  /* ClusterICOps_Active, ClusterICTier */
-#include "cluster/cluster_scn.h"	  /* SCN typedef (stage 1.4) */
-#include "cluster/cluster_itl_slot.h" /* CLUSTER_ITL_* constants (stage 1.5) */
-#include "storage/bufpage.h"		  /* PG_PAGE_LAYOUT_VERSION, SizeOfPageHeaderData (stage 1.4) */
+#include "cluster/cluster_ic.h"			 /* ClusterICOps_Active, ClusterICTier */
+#include "cluster/cluster_scn.h"		 /* SCN typedef (stage 1.4) */
+#include "cluster/cluster_itl_slot.h"	 /* CLUSTER_ITL_* constants (stage 1.5) */
+#include "cluster/cluster_buffer_desc.h" /* BufferType / PcmState enums (stage 1.6) */
+#include "storage/bufpage.h"	   /* PG_PAGE_LAYOUT_VERSION, SizeOfPageHeaderData (stage 1.4) */
+#include "storage/buf_internals.h" /* BufferDesc layout (stage 1.6) */
 #include "cluster/cluster_pgstat.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/storage/cluster_shared_fs.h" /* dump_shared_fs (stage 1.1) */
@@ -423,6 +425,34 @@ dump_block_format(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "block_format", "itl_location", "page_special_area_tail");
 }
 
+/*
+ * dump_buffer_format -- Stage 1.6 buffer descriptor cluster fields layout.
+ *
+ *	Emits 6 rows surfacing the spec-1.6 BufferDesc layout invariants.
+ *	Reports actual sizeof / offsetof values (not compile-time guesses)
+ *	so DBAs can verify the binary's layout matches expectations.
+ *
+ *	PIVOT B (2026-05-02): on PG 16.13 sizeof(BufferTag) == 20 (not 16),
+ *	pushing PG-original fields to offset 52 and leaving only 12B of
+ *	cache line 1 for the cluster hot tail.  block_scn occupies cache
+ *	line 1 (Stage 2-3 visibility hot path); cr_chain_head moved to
+ *	cache line 2 boundary.  Spec-1.6 5 StaticAssertDecl in
+ *	buf_internals.h enforce these invariants at compile time.
+ */
+static void
+dump_buffer_format(ReturnSetInfo *rsinfo)
+{
+	emit_row(rsinfo, "buffer_format", "buffer_desc_size_bytes",
+			 fmt_int32((int32)sizeof(BufferDesc)));
+	emit_row(rsinfo, "buffer_format", "buffer_desc_pad_to_size", fmt_int32(BUFFERDESC_PAD_TO_SIZE));
+	emit_row(rsinfo, "buffer_format", "buffer_hot_field_offset",
+			 fmt_int32((int32)offsetof(BufferDesc, buffer_type)));
+	emit_row(rsinfo, "buffer_format", "buffer_cold_field_offset",
+			 fmt_int32((int32)offsetof(BufferDesc, cr_chain_head)));
+	emit_row(rsinfo, "buffer_format", "buffer_type_count", "3");
+	emit_row(rsinfo, "buffer_format", "pcm_state_count", "3");
+}
+
 #endif /* USE_PGRAC_CLUSTER */
 
 
@@ -454,6 +484,7 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		dump_conf(rsinfo);
 		dump_shared_fs(rsinfo);
 		dump_block_format(rsinfo);
+		dump_buffer_format(rsinfo);
 		dump_phase(rsinfo);
 	}
 #else

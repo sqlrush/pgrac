@@ -99,6 +99,25 @@
 /*               reduced 8152 -> 7768 + pg_cluster_state.block_format */
 /*               extended 4 -> 9 keys (spec-1.5, stage 1.5; pgrac 1.4 */
 /*               data must be dump+restore migrated to 1.5+). */
-#define CATALOG_VERSION_NO	202605050
+/*           1.6: cluster BufferDesc +12B hot tail in cache line 1 ([52, */
+/*               64): buffer_type / pcm_state / pi_flags / padding + */
+/*               block_scn) + 64B cold body in cache line 2 ([64, 128): */
+/*               cr_chain_head / cr_chain_next / cr_scn / pi_buf_id / */
+/*               pi_lsn / grd_master_node / grd_master_seq / cf_state / */
+/*               cf_owner_node / cf_request_count / pcm_lock / */
+/*               pi_created_at) + BUFFERDESC_PAD_TO_SIZE 64 -> 128 in */
+/*               USE_PGRAC_CLUSTER mode + cluster_buffer_desc.h enums + */
+/*               5 StaticAssertDecl semantic layout invariants + */
+/*               ClusterInitBufferDescFields helper called from */
+/*               InitBufferPool (PGRAC MODIFICATIONS 14th) and */
+/*               InitLocalBuffers (PGRAC MODIFICATIONS 16th) for */
+/*               defensive placeholder writes (cr_chain_head / */
+/*               cr_chain_next / pi_buf_id = INVALID_BUFFER_ID = -1) + */
+/*               pg_cluster_state.buffer_format category 6 keys + */
+/*               PIVOT B (2026-05-02): PG 16.13 实测 BufferTag = 20B */
+/*               让 cluster hot 区 16B 缩到 12B tail; cr_chain_head 移 */
+/*               cache line 2 保 block_scn 在 cache line 1. (spec-1.6, */
+/*               stage 1.6; pgrac 1.5 数据可 in-place 启动 1.6 binary). */
+#define CATALOG_VERSION_NO	202605060
 
 #endif

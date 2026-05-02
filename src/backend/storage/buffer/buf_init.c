@@ -10,6 +10,29 @@
  * IDENTIFICATION
  *	  src/backend/storage/buffer/buf_init.c
  *
+ * PGRAC MODIFICATIONS (14th, in InitBufferPool)
+ * ---------------------------------------------------------------------
+ * Modified by: SqlRush <sqlrush@gmail.com>
+ *
+ * What changed (USE_PGRAC_CLUSTER guarded):
+ *   InitBufferPool's per-buffer init loop calls
+ *   ClusterInitBufferDescFields(buf) (defined inline in
+ *   storage/buf_internals.h) to write placeholder values for the 17
+ *   cluster fields (PCM lock state / CR chain / PI / Cache Fusion /
+ *   GRD master cache).  The helper is also called from localbuf.c's
+ *   InitLocalBuffers (PGRAC MODIFICATIONS 16th) so both shared and
+ *   local buffer descriptor arrays get identical placeholder values.
+ *
+ * Why:
+ *   Stage 1.6 lays the structural foundation; runtime semantics land
+ *   later.  Explicit placeholder writes (CLAUDE.md 规则 8 实现完整性)
+ *   prevent reliance on calloc / MemSet zero-fill -- three cluster
+ *   fields (cr_chain_head / cr_chain_next / pi_buf_id) require
+ *   INVALID_BUFFER_ID = -1 not 0 (0 is a valid buffer_id and would
+ *   mislead Stage 3 CR-path reads).
+ *
+ * Spec: spec-1.6-buffer-descriptor.md §1.2 Deliverable 3.5 + §8 Q4 + Q5
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -136,6 +159,16 @@ InitBufferPool(void)
 							 LWTRANCHE_BUFFER_CONTENT);
 
 			ConditionVariableInit(BufferDescriptorGetIOCV(buf));
+
+#ifdef USE_PGRAC_CLUSTER
+			/*
+			 * PGRAC: write placeholder values for the 17 cluster fields
+			 * (PCM state / CR chain / PI / Cache Fusion / GRD master cache).
+			 * Same helper called from InitLocalBuffers in localbuf.c so
+			 * shared and local buffer arrays carry identical defaults.
+			 */
+			ClusterInitBufferDescFields(buf);
+#endif
 		}
 
 		/* Correct last entry of linked list */

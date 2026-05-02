@@ -10,6 +10,38 @@
  *
  * src/include/storage/buf_internals.h
  *
+ * PGRAC MODIFICATIONS (12th + 13th, in BufferDesc struct + BUFFERDESC_PAD_TO_SIZE)
+ * -----------------------------------------------------------------------------
+ * Modified by: SqlRush <sqlrush@gmail.com>
+ *
+ * What changed (USE_PGRAC_CLUSTER guarded):
+ *   1. BufferDesc struct: append 12B hot cluster tail in cache line 1
+ *      ([52, 64)) + 64B cold cluster fields in cache line 2 ([64, 128))
+ *      after PG-original 52B (PG 16.13: BufferTag 20B + buf_id 4B +
+ *      state 4B + wait_backend 4B + freeNext 4B + content_lock 16B).
+ *      block_scn lives in cache line 1 (Stage 2-3 visibility hot path);
+ *      cr_chain_head in cache line 2 (cold; CR construction path only).
+ *      See spec-1.6 PIVOT B (2026-05-02 user approve).
+ *   2. BUFFERDESC_PAD_TO_SIZE bumped 64 -> 128 (cluster fields require
+ *      2 cache lines per slot).
+ *   3. ClusterInitBufferDescFields: static inline helper writing the 17
+ *      placeholder values at InitBufferPool / InitLocalBuffers time.
+ *   4. 5 StaticAssertDecl layout invariants -- catch field reorder /
+ *      size drift at compile time using semantic constraints (block_scn
+ *      stays in cache line 1; cr_chain_head starts cache line 2;
+ *      cluster fields follow PG-original content_lock so bufmgr.c:3275
+ *      AssertNotCatalogBufferLock reverse-deref stays correct).
+ *
+ * Why:
+ *   pgrac needs PCM lock state machine + CR chain + PI chain + Cache
+ *   Fusion + GRD master cache fields per buffer (Stage 2-3 真值激活).
+ *   Stage 1.6 places the structural foundation; runtime semantics land
+ *   later.  Hot path performance preserved by keeping all hot fields
+ *   in cache line 1 (PG 16.13: 52B + cluster 12B tail = 64B).
+ *
+ * Spec: spec-1.6-buffer-descriptor.md (frozen 2026-05-02)
+ * Design: docs/buffer-pool-design.md v1.2 §4.3 + §12 + §15.4
+ *
  *-------------------------------------------------------------------------
  */
 #ifndef BUFMGR_INTERNALS_H
@@ -26,6 +58,13 @@
 #include "storage/smgr.h"
 #include "storage/spin.h"
 #include "utils/relcache.h"
+
+#ifdef USE_PGRAC_CLUSTER
+#include "access/xlogdefs.h"		 /* PGRAC: XLogRecPtr, InvalidXLogRecPtr */
+#include "cluster/cluster_buffer_desc.h" /* PGRAC: BufferType / PcmState / CacheFusionState / BufferFlags / INVALID_BUFFER_ID / INVALID_NODE_ID */
+#include "cluster/cluster_scn.h"	 /* PGRAC: SCN, InvalidScn */
+#include "datatype/timestamp.h"		 /* PGRAC: TimestampTz */
+#endif
 
 /*
  * Buffer state is a single 32-bit variable where following data is combined.
@@ -252,6 +291,58 @@ typedef struct BufferDesc
 	int			wait_backend_pgprocno;	/* backend of pin-count waiter */
 	int			freeNext;		/* link in freelist chain */
 	LWLock		content_lock;	/* to lock access to buffer contents */
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: cluster fields (stage 1.6, ~76B + alignment).
+	 *
+	 * On PG 16.13 the original BufferDesc fields above end at offset 52
+	 * (BufferTag 20B + buf_id 4B + state 4B + wait_backend_pgprocno 4B
+	 * + freeNext 4B + content_lock 16B = 52B).  This leaves only 12B of
+	 * cache line 1 for cluster fields ([52, 64)) -- the "12B hot
+	 * cluster tail".  Cache line 2 ([64, 128)) holds the 64B cold
+	 * cluster fields accessed only on cluster-specific paths.
+	 *
+	 * PIVOT B (2026-05-02 user approve): block_scn must stay in cache
+	 * line 1 because it's read on every visibility check (Stage 2-3
+	 * hot path).  cr_chain_head moves to cache line 2 because CR
+	 * construction is a cold path.  See spec-1.6 §1.4 example #5 and
+	 * docs/buffer-pool-design.md v1.2 §4.3.
+	 *
+	 * All values are placeholders at stage 1.6 --
+	 * ClusterInitBufferDescFields (defined below) writes them explicitly
+	 * at InitBufferPool / InitLocalBuffers time.  Stage 2-3 真值激活 spec
+	 * brings the actual PCM state machine / CR chain / PI / Cache
+	 * Fusion / GRD master cache semantics.
+	 *
+	 * Spec: spec-1.6-buffer-descriptor.md
+	 * Design: docs/buffer-pool-design.md v1.2 §4.3
+	 */
+
+	/* === Cache line 1 hot cluster tail ([52, 64), 12B usable) === */
+	uint8		buffer_type;	/* offset 52; BufferType enum; BUF_TYPE_CURRENT at stage 1.6 */
+	uint8		pcm_state;		/* offset 53; PcmState enum; PCM_STATE_N at stage 1.6 */
+	uint8		pi_flags;		/* offset 54; BufferFlags bitfield; 0 at stage 1.6 (no PI) */
+	uint8		cluster_padding_1;	/* offset 55; 1B padding for 8B alignment of block_scn; 0 at stage 1.6 */
+	SCN			block_scn;		/* offset 56; page-level SCN (spec-1.4 typedef); InvalidScn at stage 1.6 */
+	/* end of cache line 1 at offset 64 */
+
+	/* === Cache line 2 cold cluster fields ([64, 128), 64B) === */
+	int			cr_chain_head;	/* offset 64; CR chain head buf_id; INVALID_BUFFER_ID at stage 1.6 */
+	int			cr_chain_next;	/* offset 68; next CR in chain; INVALID_BUFFER_ID at stage 1.6 */
+	SCN			cr_scn;			/* offset 72; CR buffer's read SCN; InvalidScn at stage 1.6 */
+	int			pi_buf_id;		/* offset 80; PI buffer's buf_id; INVALID_BUFFER_ID at stage 1.6 */
+	/* offset 84..87: 4B implicit padding for pi_lsn 8-byte alignment */
+	XLogRecPtr	pi_lsn;			/* offset 88; PI buffer's let-go LSN; InvalidXLogRecPtr at stage 1.6 */
+	uint16		grd_master_node;	/* offset 96; GRD master node id; INVALID_NODE_ID at stage 1.6 */
+	uint16		grd_master_seq; /* offset 98; GRD master seq; 0 at stage 1.6 */
+	uint8		cf_state;		/* offset 100; CacheFusionState enum; CF_STATE_NONE at stage 1.6 */
+	uint8		cf_owner_node;	/* offset 101; CF transfer owner node; 0 at stage 1.6 */
+	uint16		cf_request_count;	/* offset 102; CF transfer request count; 0 at stage 1.6 */
+	LWLock		pcm_lock;		/* offset 104; PCM lock; LWLockInitialize'd at stage 1.6 (not held) */
+	TimestampTz pi_created_at;	/* offset 120; PI creation timestamp; 0 at stage 1.6 */
+	/* end of cache line 2 at offset 128 */
+#endif							/* USE_PGRAC_CLUSTER */
 } BufferDesc;
 
 /*
@@ -274,13 +365,123 @@ typedef struct BufferDesc
  * platform with either 32 or 128 byte line sizes, it's good to align to
  * boundaries and avoid false sharing.
  */
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * PGRAC: BufferDesc grew from PG-vanilla ~52B (padded to 64) to ~120B
+ * (padded to 128) on PG 16.13.  12B hot cluster tail shares cache line 1
+ * with PG-original 52B; 64B cold cluster fields occupy cache line 2 and
+ * are accessed only on cluster-specific paths (Stage 2-3 真值激活).
+ *
+ * Hot path cache behaviour preserved: ReadBuffer / BufferAlloc /
+ * UnpinBuffer / IncrBufferRefCount continue to read only cache line 1
+ * (offsets 0..63), exactly the same cache miss profile as PG vanilla.
+ *
+ * Spec: spec-1.6-buffer-descriptor.md  Design: docs/buffer-pool-design.md v1.2 §4.3
+ */
+#define BUFFERDESC_PAD_TO_SIZE	(SIZEOF_VOID_P == 8 ? 128 : 1)
+#else
 #define BUFFERDESC_PAD_TO_SIZE	(SIZEOF_VOID_P == 8 ? 64 : 1)
+#endif
 
 typedef union BufferDescPadded
 {
 	BufferDesc	bufferdesc;
 	char		pad[BUFFERDESC_PAD_TO_SIZE];
 } BufferDescPadded;
+
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * PGRAC: compile-time layout invariants for cluster BufferDesc fields.
+ *
+ *	These StaticAssertDecls catch any field reorder / size drift at
+ *	build time, before any runtime test runs.
+ *
+ *	PIVOT B (2026-05-02): use semantic constraints instead of magic
+ *	offset numbers.  PG 16.13 实测 sizeof(BufferTag) == 20 (not 16),
+ *	pushing PG-original fields to offset 52 (not 48).  Hard-coded
+ *	"offset 32 / 48 / 64" assertions break on any future PG version
+ *	that grows BufferTag again; semantic constraints survive.
+ *
+ *	Critical: PG bufmgr.c:AssertNotCatalogBufferLock reverse-derefs
+ *	BufferDesc from an LWLock pointer using
+ *	  bufHdr = (BufferDesc *) ((char *) lock - offsetof(BufferDesc, content_lock))
+ *	which uses the offsetof() macro and therefore adapts to whatever
+ *	the actual content_lock offset is on the current PG version
+ *	(36 on PG 16.13; 32 on earlier PG with smaller BufferTag).
+ *	The semantic invariant we lock below is "cluster fields appear
+ *	*after* content_lock"; any future reorder breaking that semantic
+ *	fails to compile.
+ *
+ *	Spec: spec-1.6-buffer-descriptor.md §1.2 Deliverable 3.6 + §8 Q2.
+ */
+StaticAssertDecl(BUFFERDESC_PAD_TO_SIZE == 128,
+				 "PGRAC: BUFFERDESC_PAD_TO_SIZE must be 128 in USE_PGRAC_CLUSTER mode");
+StaticAssertDecl(sizeof(BufferDesc) <= BUFFERDESC_PAD_TO_SIZE,
+				 "PGRAC: BufferDesc with cluster fields exceeds padded size");
+StaticAssertDecl(offsetof(BufferDesc, block_scn) + sizeof(SCN) <= 64,
+				 "PGRAC: block_scn must stay in BufferDesc cache line 1 (Stage 2-3 visibility hot path)");
+StaticAssertDecl(offsetof(BufferDesc, cr_chain_head) >= 64,
+				 "PGRAC: cr_chain_head (cold field) must start at or after cache line 2 boundary");
+StaticAssertDecl(offsetof(BufferDesc, content_lock) <
+				 offsetof(BufferDesc, buffer_type),
+				 "PGRAC: cluster fields must follow PG-original content_lock so bufmgr.c:3275 reverse-deref stays correct");
+
+/*
+ * PGRAC: ClusterInitBufferDescFields -- write placeholder values to all
+ *	17 cluster fields of a BufferDesc.
+ *
+ *	Called from both InitBufferPool() (shared buffer; PGRAC MODIFICATIONS
+ *	14th in buf_init.c) and InitLocalBuffers() (local / temp buffer per
+ *	backend; PGRAC MODIFICATIONS 16th in localbuf.c).  Any future
+ *	BufferDesc init path (e.g. Stage 2 dynamic buffer pool resizing)
+ *	MUST also call this helper to keep cluster fields in valid
+ *	placeholder state.
+ *
+ *	Stage 1.6 stub; Stage 2-3 真值激活时调用方负责状态转换 (PCM 锁 /
+ *	CR chain / PI chain / Cache Fusion / GRD).
+ *
+ *	Critical: cr_chain_head / cr_chain_next / pi_buf_id MUST be set to
+ *	INVALID_BUFFER_ID (-1) explicitly -- calloc zero-fill (used by
+ *	localbuf.c LocalBufferDescriptors = calloc(...)) leaves them as 0,
+ *	which is a *valid* buffer_id and would mislead Stage 3 CR-path
+ *	reads of local buffers.  pcm_lock also MUST be LWLockInitialize'd
+ *	explicitly -- calloc 0 is not a valid LWLock state.  This is the
+ *	entire reason this helper exists.
+ *
+ *	Spec: spec-1.6-buffer-descriptor.md §1.2 Deliverable 3.5 + §8 Q1.
+ */
+static inline void
+ClusterInitBufferDescFields(BufferDesc *buf)
+{
+	/* hot cluster fields */
+	buf->buffer_type = BUF_TYPE_CURRENT;
+	buf->pcm_state = PCM_STATE_N;
+	buf->pi_flags = 0;
+	buf->cluster_padding_1 = 0;
+	buf->cr_chain_head = INVALID_BUFFER_ID;
+	buf->block_scn = InvalidScn;
+
+	/* cold cluster fields */
+	buf->cr_scn = InvalidScn;
+	buf->cr_chain_next = INVALID_BUFFER_ID;
+	buf->pi_buf_id = INVALID_BUFFER_ID;
+	buf->pi_lsn = InvalidXLogRecPtr;
+	buf->grd_master_node = INVALID_NODE_ID;
+	buf->grd_master_seq = 0;
+	buf->cf_state = CF_STATE_NONE;
+	buf->cf_owner_node = 0;
+	buf->cf_request_count = 0;
+
+	/*
+	 * pcm_lock: stage 1.6 reuses LWTRANCHE_BUFFER_CONTENT tranche (pcm
+	 * lock is never acquired at stage 1.6; Stage 2 PCM真值激活 spec will
+	 * register a dedicated LWTRANCHE_BUFFER_PCM_LOCK and migrate).
+	 */
+	LWLockInitialize(&buf->pcm_lock, LWTRANCHE_BUFFER_CONTENT);
+
+	buf->pi_created_at = 0;
+}
+#endif							/* USE_PGRAC_CLUSTER */
 
 /*
  * The PendingWriteback & WritebackContext structure are used to keep

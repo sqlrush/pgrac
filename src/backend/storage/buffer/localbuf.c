@@ -11,6 +11,38 @@
  * IDENTIFICATION
  *	  src/backend/storage/buffer/localbuf.c
  *
+ * PGRAC MODIFICATIONS (16th, in InitLocalBuffers)
+ * ---------------------------------------------------------------------
+ * Modified by: SqlRush <sqlrush@gmail.com>
+ *
+ * What changed (USE_PGRAC_CLUSTER guarded):
+ *   InitLocalBuffers' per-buffer init loop calls
+ *   ClusterInitBufferDescFields(buf) (defined inline in
+ *   storage/buf_internals.h) so local / temp buffer descriptors get the
+ *   same 17 cluster-field placeholder values as shared buffer
+ *   descriptors initialized in buf_init.c (PGRAC MODIFICATIONS 14th).
+ *
+ * Why (Q1 §1.4 + Q7 audit, user 修订 2026-05-02):
+ *   Without this, local buffer descriptors retain the calloc zero-fill
+ *   on the line `LocalBufferDescriptors = (BufferDesc *) calloc(nbufs,
+ *   sizeof(BufferDesc))` which leaves cr_chain_head / cr_chain_next /
+ *   pi_buf_id at 0.  Zero is a *valid* buffer_id (the first buffer
+ *   slot), so future Stage 3 CR-path code that reads these fields on
+ *   local buffers would mistakenly follow the chain into buffer 0 of
+ *   the local pool, triggering invalid memory access.  pcm_lock also
+ *   needs explicit LWLockInitialize -- calloc 0 is not a valid LWLock
+ *   state.  ClusterInitBufferDescFields writes the correct
+ *   INVALID_BUFFER_ID = -1 for all three buffer-id fields and properly
+ *   initializes pcm_lock.
+ *
+ *   Cluster code paths (PCM lock state machine / CR chain / PI / Cache
+ *   Fusion / GRD master cache) MUST NOT touch local buffers at any
+ *   stage -- local buffers are backend-private and don't participate
+ *   in cluster.  The placeholder values stay valid forever on local
+ *   buffers; this helper just makes them defensive (-1 instead of 0).
+ *
+ * Spec: spec-1.6-buffer-descriptor.md §1.2 Deliverable 3.5 + §3.2 + §8 Q1
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -621,6 +653,18 @@ InitLocalBuffers(void)
 		 * errors on platforms without atomics, if somebody (re-)introduces
 		 * atomic operations for local buffers.
 		 */
+
+#ifdef USE_PGRAC_CLUSTER
+		/*
+		 * PGRAC: write placeholder values for the 17 cluster fields.
+		 * Critical for cr_chain_head / cr_chain_next / pi_buf_id which
+		 * need INVALID_BUFFER_ID (-1) -- calloc above leaves them as 0
+		 * (a *valid* buffer_id that would mislead Stage 3 CR-path code
+		 * into following the chain into buffer 0).  See spec-1.6 §3.2 +
+		 * §8 Q1 user 修订 + buf_internals.h PGRAC MODIFICATIONS 12th.
+		 */
+		ClusterInitBufferDescFields(buf);
+#endif
 	}
 
 	/* Create the lookup hash table */

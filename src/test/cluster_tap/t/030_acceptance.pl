@@ -367,8 +367,8 @@ ok($node->safe_psql('postgres',
 
 is($node->safe_psql('postgres',
 		q{SELECT string_agg(DISTINCT category, ',' ORDER BY category) FROM pg_cluster_state}),
-	'block_format,conf,guc,ic,inject,pgstat,phase,shared_fs,shmem',
-	'O2 pg_cluster_state has all 9 categories (7 stage-0 + shared_fs 1.1 + block_format 1.4)');
+	'block_format,buffer_format,conf,guc,ic,inject,pgstat,phase,shared_fs,shmem',
+	'O2 pg_cluster_state has all 10 categories (7 stage-0 + shared_fs 1.1 + block_format 1.4 + buffer_format 1.6)');
 
 is($node->safe_psql('postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE value IS NULL}),
@@ -459,6 +459,59 @@ is($node->safe_psql('postgres',
 		         (SELECT value FROM pg_cluster_state
 		           WHERE category='block_format' AND key='invalid_scn_value')}),
 	'8|0', 'P4 sizeof(SCN) = 8, InvalidScn = 0');
+
+
+# ============================================================
+# §P (cont.) buffer descriptor (stage 1.6) -- spec-1.6 acceptance (6 tests)
+# PIVOT B (2026-05-02): on PG 16.13 BufferTag = 20B (not 16), pushing
+# PG-original fields to offset 52; cluster hot tail is 12B [52, 64);
+# block_scn occupies cache line 1, cr_chain_head moved to cache line 2.
+# ============================================================
+
+# P5: buffer_format category exposes 6 keys.
+is($node->safe_psql('postgres',
+		q{SELECT count(*) FROM pg_cluster_state WHERE category='buffer_format'}),
+	'6', 'P5 buffer_format category has 6 keys (stage-1.6: buffer_desc_size_bytes, buffer_desc_pad_to_size, buffer_hot_field_offset, buffer_cold_field_offset, buffer_type_count, pcm_state_count)');
+
+# P6: BUFFERDESC_PAD_TO_SIZE = 128.
+is($node->safe_psql('postgres',
+		q{SELECT value FROM pg_cluster_state
+		   WHERE category='buffer_format' AND key='buffer_desc_pad_to_size'}),
+	'128', 'P6 BUFFERDESC_PAD_TO_SIZE = 128 (PG 64 -> pgrac 128)');
+
+# P7: sizeof(BufferDesc) <= padded size (semantic invariant).
+ok($node->safe_psql('postgres',
+		q{SELECT
+		    (SELECT value::int FROM pg_cluster_state
+		      WHERE category='buffer_format' AND key='buffer_desc_size_bytes')
+		    <=
+		    (SELECT value::int FROM pg_cluster_state
+		      WHERE category='buffer_format' AND key='buffer_desc_pad_to_size')})
+	eq 't', 'P7 sizeof(BufferDesc) <= BUFFERDESC_PAD_TO_SIZE (1st StaticAssertDecl invariant)');
+
+# P8: PIVOT B layout invariant -- buffer_hot_field_offset = 52
+# (PG 16.13: BufferTag 20 + buf_id 4 + state 4 + wait 4 + freeNext 4 + content_lock 16).
+is($node->safe_psql('postgres',
+		q{SELECT value FROM pg_cluster_state
+		   WHERE category='buffer_format' AND key='buffer_hot_field_offset'}),
+	'52', 'P8 buffer_hot_field_offset = 52 (PIVOT B 实测 PG 16.13 BufferTag = 20B)');
+
+# P9: PIVOT B layout invariant -- cluster cold body starts cache line 2.
+ok($node->safe_psql('postgres',
+		q{SELECT
+		    (SELECT value::int FROM pg_cluster_state
+		      WHERE category='buffer_format' AND key='buffer_cold_field_offset')
+		    >= 64})
+	eq 't', 'P9 cluster cold fields start at cache line 2 boundary >= 64 (PIVOT B + 4th StaticAssertDecl)');
+
+# P10: BufferType + PcmState enum count = 3 each.
+is($node->safe_psql('postgres',
+		q{SELECT (SELECT value FROM pg_cluster_state
+		           WHERE category='buffer_format' AND key='buffer_type_count')
+		     || '|' ||
+		         (SELECT value FROM pg_cluster_state
+		           WHERE category='buffer_format' AND key='pcm_state_count')}),
+	'3|3', 'P10 BufferType has 3 values (CURRENT/CR/PI), PcmState has 3 values (N/S/X)');
 
 
 $node->stop;

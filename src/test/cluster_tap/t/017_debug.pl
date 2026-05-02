@@ -63,8 +63,8 @@ is( $node->safe_psql(
 		'postgres',
 		q{SELECT string_agg(DISTINCT category, ',' ORDER BY category)
 		    FROM pg_cluster_state}),
-	'block_format,conf,guc,ic,inject,pgstat,phase,shared_fs,shmem',
-	'all 9 categories appear (block_format added at stage 1.4: 7 stage-0 + shared_fs 1.1 + block_format 1.4)');
+	'block_format,buffer_format,conf,guc,ic,inject,pgstat,phase,shared_fs,shmem',
+	'all 10 categories appear (7 stage-0 + shared_fs 1.1 + block_format 1.4 + buffer_format 1.6)');
 
 
 # ----------
