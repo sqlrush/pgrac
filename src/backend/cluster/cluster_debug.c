@@ -73,6 +73,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_elog.h" /* cluster_phase */
+#include "cluster/cluster_lmon.h" /* cluster_lmon_status (spec-1.11 Sprint B D12) */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic.h"			   /* ClusterICOps_Active, ClusterICTier */
 #include "cluster/cluster_scn.h"		   /* SCN typedef (stage 1.4) */
@@ -385,6 +386,23 @@ dump_phase(ReturnSetInfo *rsinfo)
 	cluster_phase_history_format(history_buf, sizeof(history_buf));
 	emit_row(rsinfo, "phase", "phase_history",
 			 pstrdup(history_buf[0] != '\0' ? history_buf : "(empty)"));
+}
+
+
+/*
+ * dump_lmon -- Stage 1.11 Sprint B LMON state diagnostics
+ * (spec-1.11 D12).  Six SQL keys exposed to pg_cluster_state.lmon
+ * for operators to monitor LMON liveness without log-grepping.  All
+ * reads go through cluster_lmon_status() / cluster_lmon_state shmem
+ * (HC2 SSOT, HC3 limited scope).
+ */
+static void
+dump_lmon(ReturnSetInfo *rsinfo)
+{
+	ClusterLmonStatus s = cluster_lmon_status();
+
+	emit_row(rsinfo, "lmon", "lmon_status", cluster_lmon_status_to_string(s));
+	emit_row(rsinfo, "lmon", "lmon_status_enum_value", fmt_int32((int32)s));
 }
 
 /*

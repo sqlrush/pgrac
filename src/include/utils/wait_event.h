@@ -46,15 +46,15 @@
  * Wait Classes
  * ----------
  */
-#define PG_WAIT_LWLOCK				0x01000000U
-#define PG_WAIT_LOCK				0x03000000U
-#define PG_WAIT_BUFFER_PIN			0x04000000U
-#define PG_WAIT_ACTIVITY			0x05000000U
-#define PG_WAIT_CLIENT				0x06000000U
-#define PG_WAIT_EXTENSION			0x07000000U
-#define PG_WAIT_IPC					0x08000000U
-#define PG_WAIT_TIMEOUT				0x09000000U
-#define PG_WAIT_IO					0x0A000000U
+#define PG_WAIT_LWLOCK 0x01000000U
+#define PG_WAIT_LOCK 0x03000000U
+#define PG_WAIT_BUFFER_PIN 0x04000000U
+#define PG_WAIT_ACTIVITY 0x05000000U
+#define PG_WAIT_CLIENT 0x06000000U
+#define PG_WAIT_EXTENSION 0x07000000U
+#define PG_WAIT_IPC 0x08000000U
+#define PG_WAIT_TIMEOUT 0x09000000U
+#define PG_WAIT_IO 0x0A000000U
 
 /* ----------
  * Wait Events - Activity
@@ -64,8 +64,7 @@
  * Typically, this should only be used for background processes.
  * ----------
  */
-typedef enum
-{
+typedef enum {
 	WAIT_EVENT_ARCHIVER_MAIN = PG_WAIT_ACTIVITY,
 	WAIT_EVENT_AUTOVACUUM_MAIN,
 	WAIT_EVENT_BGWRITER_HIBERNATE,
@@ -89,8 +88,7 @@ typedef enum
  * a background process, which has no client connection.
  * ----------
  */
-typedef enum
-{
+typedef enum {
 	WAIT_EVENT_CLIENT_READ = PG_WAIT_CLIENT,
 	WAIT_EVENT_CLIENT_WRITE,
 	WAIT_EVENT_GSS_OPEN_SERVER,
@@ -108,8 +106,7 @@ typedef enum
  * it is waiting for a notification from another process.
  * ----------
  */
-typedef enum
-{
+typedef enum {
 	WAIT_EVENT_APPEND_READY = PG_WAIT_IPC,
 	WAIT_EVENT_ARCHIVE_CLEANUP_COMMAND,
 	WAIT_EVENT_ARCHIVE_COMMAND,
@@ -171,8 +168,7 @@ typedef enum
  * Use this category when a process is waiting for a timeout to expire.
  * ----------
  */
-typedef enum
-{
+typedef enum {
 	WAIT_EVENT_BASE_BACKUP_THROTTLE = PG_WAIT_TIMEOUT,
 	WAIT_EVENT_CHECKPOINT_WRITE_DELAY,
 	WAIT_EVENT_PG_SLEEP,
@@ -190,8 +186,7 @@ typedef enum
  * Use this category when a process is waiting for a IO.
  * ----------
  */
-typedef enum
-{
+typedef enum {
 	WAIT_EVENT_BASEBACKUP_READ = PG_WAIT_IO,
 	WAIT_EVENT_BASEBACKUP_SYNC,
 	WAIT_EVENT_BASEBACKUP_WRITE,
@@ -284,8 +279,7 @@ typedef enum
  * sites land in the spec for each owning subsystem.
  * ----------
  */
-typedef enum
-{
+typedef enum {
 	/* Cluster: GES (5 events) -- subsystem #8 */
 	WAIT_EVENT_GES_ENQUEUE_ACQUIRE = PG_WAIT_CLUSTER_GES,
 	WAIT_EVENT_GES_ENQUEUE_CONVERT,
@@ -365,6 +359,15 @@ typedef enum
 	WAIT_EVENT_CLUSTER_STARTUP_PHASE_2,
 	WAIT_EVENT_CLUSTER_STARTUP_PHASE_3,
 	WAIT_EVENT_CLUSTER_STARTUP_PHASE_4,
+
+	/*
+	 * Cluster: BgProc (1 event so far) -- spec-1.11 Sprint B (2026-05-04).
+	 * Class scoped to cluster background-process main-loop / lifecycle /
+	 * liveness waits (LMON, future LCK / DIAG / Cluster Stats).  Real
+	 * reconfig / fence / heartbeat / interconnect / GES wait events go
+	 * to their dedicated business class, NOT BgProc.
+	 */
+	WAIT_EVENT_CLUSTER_BGPROC_LMON_MAIN_LOOP = PG_WAIT_CLUSTER_BGPROC,
 } WaitEventCluster;
 
 
@@ -404,7 +407,7 @@ pgstat_report_wait_start(uint32 wait_event_info)
 	 * Since this is a four-byte field which is always read and written as
 	 * four-bytes, updates are atomic.
 	 */
-	*(volatile uint32 *) my_wait_event_info = wait_event_info;
+	*(volatile uint32 *)my_wait_event_info = wait_event_info;
 }
 
 /* ----------
@@ -417,8 +420,8 @@ static inline void
 pgstat_report_wait_end(void)
 {
 	/* see pgstat_report_wait_start() */
-	*(volatile uint32 *) my_wait_event_info = 0;
+	*(volatile uint32 *)my_wait_event_info = 0;
 }
 
 
-#endif							/* WAIT_EVENT_H */
+#endif /* WAIT_EVENT_H */

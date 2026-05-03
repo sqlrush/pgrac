@@ -156,6 +156,13 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	{ .name = "cluster-startup-phase-4-enter" },
 	{ .name = "cluster-startup-phase-4-exit" },
 	{ .name = "cluster-startup-phase-4-fail" },
+	/* Stage 1.11 Sprint B (spec-1.11 D10) — 6 LMON lifecycle injects. */
+	{ .name = "cluster-lmon-pre-spawn" },
+	{ .name = "cluster-lmon-post-spawn" },
+	{ .name = "cluster-lmon-ready-publish" },
+	{ .name = "cluster-lmon-main-loop-iter" },
+	{ .name = "cluster-lmon-shutdown-pre" },
+	{ .name = "cluster-lmon-shutdown-post" },
 };
 
 #define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_points)

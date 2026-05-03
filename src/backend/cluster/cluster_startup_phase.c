@@ -451,34 +451,50 @@ phase_1_handler(void)
 	Assert(!IsUnderPostmaster);
 
 	/*
+	 * Stage 1.11 Sprint B HC4 闭环: cluster.enabled = false 退化为
+	 * spec-1.10 stub 行为 (no LMON spawn).  Sprint B 引入 PGC_POSTMASTER
+	 * cluster.enabled GUC; phase_1_handler 读取真实 GUC 决定是否
+	 * spawn LMON.  cluster_enabled = true (default) 保持 Sprint A
+	 * behavior; cluster_enabled = false 让 enable-cluster build 在
+	 * 运行期退化为 spec-1.10 stub (允许 PG regression / pgbench 在
+	 * cluster-built 二进制上跑而不被 cluster 控制平面打扰).
+	 *
+	 * Spec: spec-1.11-lmon-skeleton.md §1.4 4 实质 HC #2 (HC4).
+	 */
+	if (!cluster_enabled) {
+		elog(DEBUG1, "cluster phase 1: cluster.enabled=false; skipping LMON "
+					 "spawn (degraded to spec-1.10 stub behavior)");
+		return PHASE_RUN_OK;
+	}
+
+	/*
 	 * Stage 1.11 Sprint A: spawn LMON aux process and synchronously
 	 * wait for it to publish CLUSTER_LMON_READY.  Interconnect listener
 	 * and Heartbeat process remain Sprint A stubs (Stage 1.15+).
 	 *
-	 * HC4 (cluster_enabled GUC reader):
-	 *   The runtime cluster_enabled GUC is **NOT yet defined** at
-	 *   spec-1.11 Sprint A; the de-facto cluster gate is the compile-
-	 *   time #ifdef USE_PGRAC_CLUSTER (this whole file is excluded
-	 *   from non-cluster builds).  Adding cluster.enabled PGC_POSTMASTER
-	 *   GUC + the L9 'GUC=off path' acceptance test was deliberately
-	 *   deferred to Sprint B (Sprint A scope excluded GUC additions).
-	 *   When Sprint B lands the GUC, replace this comment block with
-	 *   the runtime check + PHASE_RUN_OK early return when
-	 *   cluster_enabled=false (degrades to spec-1.10 stub behavior).
-	 *
-	 * Spec: spec-1.11-lmon-skeleton.md Sprint A D6 + 4 实质 HC #2.
+	 * Spec: spec-1.11-lmon-skeleton.md Sprint A D6.
 	 */
 	lmon_pid = cluster_lmon_start();
 	if (lmon_pid == 0) {
-		ereport(LOG, (errmsg("cluster phase 1: failed to spawn LMON aux process")));
+		/*
+		 * Stage 1.11 Sprint B (spec-1.11 D9): emit dedicated SQLSTATE
+		 * 53R0A so external supervisors / TAP tests can distinguish
+		 * spawn failure from generic phase precondition failure.
+		 * The driver loop also ereports FATAL with 53R09 PHASE_PRE
+		 * CONDITION_FAILED on PHASE_RUN_FATAL return; the LOG here
+		 * captures the spawn-specific diagnostic before driver FATAL.
+		 */
+		ereport(LOG, (errcode(ERRCODE_CLUSTER_LMON_SPAWN_FAILED),
+					  errmsg("cluster phase 1: failed to spawn LMON aux process"),
+					  errhint("Check fork() / system limits (ulimit -u) "
+							  "and postmaster log for LMON child startup errors.")));
 		return PHASE_RUN_FATAL;
 	}
 
 	/*
 	 * Reserve 5 seconds of timeout headroom for the driver's elapsed
 	 * check; the readiness wait gets the remainder.  cluster.phase1_
-	 * timeout default is 60 s -> 55 s readiness budget.  Sprint B will
-	 * tighten this once cluster_lmon_main_loop_interval GUC exists.
+	 * timeout default is 60 s -> 55 s readiness budget.
 	 */
 	wait_budget_ms = (cluster_phase1_timeout - 5) * 1000;
 	if (wait_budget_ms < 1000)
@@ -486,8 +502,13 @@ phase_1_handler(void)
 
 	ready = cluster_lmon_wait_for_ready(wait_budget_ms);
 	if (!ready) {
-		ereport(LOG, (errmsg("cluster phase 1: LMON did not publish READY within %d ms",
-							 wait_budget_ms)));
+		/* Stage 1.11 Sprint B (spec-1.11 D9): SQLSTATE 53R0B. */
+		ereport(LOG,
+				(errcode(ERRCODE_CLUSTER_LMON_NOT_READY),
+				 errmsg("cluster phase 1: LMON did not publish READY within %d ms", wait_budget_ms),
+				 errhint("Increase cluster.phase1_timeout or check LMON "
+						 "log for stuck startup; LMON status sticks at "
+						 "SPAWNING when the child crashed during initialization.")));
 		return PHASE_RUN_FATAL;
 	}
 

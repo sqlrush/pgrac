@@ -76,6 +76,22 @@ int cluster_phase4_timeout = 30;
 
 
 /*
+ * cluster.lmon_main_loop_interval (Stage 1.11 Sprint B; spec-1.11 D8).
+ * LMON main-loop tick / WaitLatch timeout in milliseconds.
+ */
+int cluster_lmon_main_loop_interval = 1000;
+
+
+/*
+ * cluster.enabled (Stage 1.11 Sprint B HC4 闭环; spec-1.11 D8).
+ * Runtime cluster mode gate.  Sprint A relied on compile-time
+ * USE_PGRAC_CLUSTER; Sprint B adds runtime control so a cluster build
+ * can run as a non-cluster postgres without spawning LMON.
+ */
+bool cluster_enabled = true;
+
+
+/*
  * Mapping from the cluster.interconnect_tier GUC enum string to the
  * ClusterICTier C enum.  PG's GUC machinery copies the int into
  * cluster_interconnect_tier; cluster_ic_init then dispatches.  The
@@ -358,4 +374,40 @@ cluster_init_guc(void)
 										 "PGRAC_E_PHASE_TRANSITION_TIMEOUT)."),
 							&cluster_phase4_timeout, 30, 1, 3600, PGC_POSTMASTER, GUC_UNIT_S, NULL,
 							NULL, NULL);
+
+	/* ----------
+	 * Stage 1.11 Sprint B (2026-05-04) — LMON GUCs (spec-1.11 D8).
+	 *
+	 *	Spec: spec-1.11-lmon-skeleton.md §2.2 GUC table
+	 *	      (cluster.lmon_main_loop_interval) +
+	 *	      4 实质 HC #2 (cluster.enabled HC4 闭环).
+	 * ----------
+	 */
+	DefineCustomIntVariable(
+		"cluster.lmon_main_loop_interval",
+		gettext_noop("LMON main-loop tick interval in milliseconds."),
+		gettext_noop("How often the LMON aux process wakes from its main loop to "
+					 "advance last_liveness_tick_at + main_loop_iters and check "
+					 "for shutdown / SIGHUP.  Sprint A used a hardcoded 1000ms "
+					 "baseline; Sprint B exposes this as PGC_SIGHUP so operators "
+					 "can dial telemetry granularity at runtime.  Lower value -> "
+					 "finer last_liveness_tick_at resolution + faster shutdown "
+					 "response; higher value -> lower wakeup overhead.  Sprint A "
+					 "LMON has no real consumer work, so any value in range is "
+					 "functionally equivalent."),
+		&cluster_lmon_main_loop_interval, 1000, 100, 60000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
+		NULL);
+
+	DefineCustomBoolVariable(
+		"cluster.enabled",
+		gettext_noop("Runtime cluster mode gate (Stage 1.11 Sprint B HC4 闭环)."),
+		gettext_noop("When on (default for --enable-cluster builds), the postmaster "
+					 "phase machinery spawns LMON + future cluster background "
+					 "processes (LCK / DIAG / Cluster Stats / Heartbeat).  When "
+					 "off, the phase 1 driver degrades to spec-1.10 stub behavior "
+					 "(no LMON spawn) and a non-cluster single-instance postgres "
+					 "is the result.  Useful for running PG regression tests / "
+					 "pgbench on a cluster-built binary without the cluster "
+					 "control plane."),
+		&cluster_enabled, true, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 }

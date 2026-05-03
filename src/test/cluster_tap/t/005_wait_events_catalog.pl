@@ -74,16 +74,27 @@ cmp_ok($native_wait_type_count, '>=', 1,
 
 
 # ----------
-# No live backend may currently be in a cluster wait state -- the
-# pgstat_report_wait_start() call sites for the 46 cluster events are
-# deferred to Stage 1+ subsystem specs.  Seeing any 'Cluster: *' here
-# at stage 0.11 would indicate stray instrumentation slipped in.
+# Stage 1.11 Sprint B (2026-05-04): the 'Cluster: BgProc' wait class
+# now has a real call site -- LMON main loop sleeps in
+# WAIT_EVENT_CLUSTER_BGPROC_LMON_MAIN_LOOP via WaitLatch.  The other
+# Cluster:* classes (GES / PCM / SCN / Reconfig / Recovery / Sinval /
+# Interconnect / Undo / ADG / SharedFs / StartupPhase) remain
+# deferred to their respective Stage 1.12+ / Stage 2-6 specs.  We
+# therefore allow exactly one LMON in BgProc and zero other Cluster:*.
 # ----------
-my $live_cluster_waits = $node->safe_psql(
+my $non_bgproc_cluster_waits = $node->safe_psql(
 	'postgres',
-	q{SELECT count(*) FROM pg_stat_activity WHERE wait_event_type LIKE 'Cluster:%'});
-is($live_cluster_waits, '0',
-	'no live backend in a Cluster:* wait state (call sites deferred to Stage 1+)');
+	q{SELECT count(*) FROM pg_stat_activity
+	   WHERE wait_event_type LIKE 'Cluster:%' AND wait_event_type <> 'Cluster: BgProc'});
+is($non_bgproc_cluster_waits, '0',
+	'no live backend in a non-BgProc Cluster:* wait state (call sites deferred to Stage 1.12+)');
+
+my $bgproc_lmon_waits = $node->safe_psql(
+	'postgres',
+	q{SELECT count(*) FROM pg_stat_activity
+	   WHERE wait_event_type = 'Cluster: BgProc' AND wait_event = 'ClusterBgProcLmonMainLoop'});
+ok($bgproc_lmon_waits eq '0' || $bgproc_lmon_waits eq '1',
+	'LMON main loop wait state count is 0 (mid-tick) or 1 (sleeping in WaitLatch)');
 
 
 # ----------

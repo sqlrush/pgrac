@@ -198,8 +198,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '45',
-   'L15 total injection registry size is 28 (14 baseline + 8 sweep + 3 shared_fs + 3 smgr + 4 shmem registry + 4 PCM lock = 28; spec-1.7 baseline)');
+   '51',
+   'L15 total injection registry size is 51 (14 baseline + 8 sweep + 3 shared_fs + 3 smgr + 4 shmem registry + 4 PCM lock = 28; spec-1.7 baseline)');
 
 
 # ----------

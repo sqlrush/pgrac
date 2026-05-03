@@ -115,11 +115,13 @@ unlike($log_l4, qr/HandleChildCrash|server process .* exited|terminating any oth
 
 
 # ----------
-# L5: abnormal LMON exit (kill -9 LMON pid) triggers crash recovery.
-# Postmaster log shows HandleChildCrash + restart_after_crash cycle.
-# Sprint A skeleton: instance restart cycle is the expected behavior
-# per background-process-design.md §3.1.4 (LMON crash = cluster
-# coordination broken = instance restart).
+# L5: abnormal LMON exit (kill -9 LMON pid) routes through
+# HandleChildCrash.  PostgreSQL::Test::Cluster.pm forces
+# restart_after_crash = off in init() so this test only exercises
+# the shutdown-on-crash branch (postmaster terminates other children
+# and exits).  The full restart-after-crash recovery cycle is
+# covered by L5b below with an explicit GUC override.  Sprint A
+# baseline + spec-1.11 Sprint B codex round 3 P2.4 honest scoping.
 # ----------
 $node->start;
 my $lmon_pid = $node->safe_psql('postgres',
@@ -129,12 +131,10 @@ ok($lmon_pid && $lmon_pid =~ /^\d+$/,
 
 if ($lmon_pid && $lmon_pid =~ /^\d+$/) {
 	# SIGKILL the LMON child.  Postmaster reaper sees abnormal exit ->
-	# HandleChildCrash -> restart_after_crash decides instance recovery.
+	# HandleChildCrash -> with restart_after_crash=off (TAP harness
+	# default) postmaster terminates other children and exits.
 	kill 9, $lmon_pid;
 
-	# Give postmaster time to detect + start crash recovery.  In
-	# restart_after_crash=on (default) mode, the postmaster goes
-	# through PM_WAIT_DEAD_END -> PM_NO_CHILDREN -> restart cycle.
 	# Wait up to 10 seconds for the crash log line.
 	my $waited = 0;
 	my $log_l5 = '';
@@ -147,12 +147,73 @@ if ($lmon_pid && $lmon_pid =~ /^\d+$/) {
 
 	like($log_l5,
 		 qr/terminating any other active server processes|crash of another server process/,
-		 'L5 LMON kill -9 routes through HandleChildCrash (HC5 abnormal path)');
+		 'L5 LMON kill -9 routes through HandleChildCrash (HC5 abnormal path; '
+		 . 'restart_after_crash=off forces shutdown branch)');
 }
 
 # Best-effort cleanup; postmaster may have already exited via crash
-# recovery cycle.  fail_ok bypasses BAIL_OUT in PostgreSQL::Test::Cluster.
+# branch.  fail_ok bypasses BAIL_OUT in PostgreSQL::Test::Cluster.
 $node->stop('immediate', fail_ok => 1);
+
+
+# ----------
+# L5b (spec-1.11 Sprint B codex round 3 P1.1 + P1.2 + P2.4):
+# explicit restart_after_crash=on + LMON respawn after kill.
+#
+# Sprint A had a hidden gap: cluster_run_startup_sequence ran exactly
+# once in PostmasterMain, so after restart_after_crash recovery LMON
+# was never respawned (postmaster would continue serving SQL with no
+# LMON, breaking cluster coordination silently).  Sprint B fixes this
+# by adding LMON respawn logic in ServerLoop (mirrors WalWriter), so
+# whenever pmState=PM_RUN && LmonPID=0 && cluster_enabled, postmaster
+# starts a fresh LMON child.
+#
+# This test verifies the respawn closure end-to-end:
+#   1. start node with restart_after_crash=on
+#   2. capture initial LMON pid
+#   3. kill -9 LMON
+#   4. wait for crash recovery + new LMON spawn
+#   5. confirm new LMON pid != initial pid
+# ----------
+{
+	my $node_l5b = PgracClusterNode->new('l5b_respawn');
+	$node_l5b->init;
+	$node_l5b->append_conf('postgresql.conf',
+		"restart_after_crash = on\nlog_min_messages = debug1\n");
+	$node_l5b->start;
+
+	my $lmon_pid_initial = $node_l5b->safe_psql('postgres',
+		q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'lmon' LIMIT 1});
+	ok($lmon_pid_initial && $lmon_pid_initial =~ /^\d+$/,
+	   'L5b captured initial LMON pid (restart_after_crash=on baseline)');
+
+	if ($lmon_pid_initial && $lmon_pid_initial =~ /^\d+$/) {
+		kill 9, $lmon_pid_initial;
+
+		# Wait for restart cycle + new LMON spawn.  Up to 30 seconds.
+		my $lmon_pid_new = '';
+		my $waited = 0;
+		while ($waited < 30) {
+			sleep 1;
+			$waited++;
+			my $r = eval {
+				$node_l5b->safe_psql('postgres',
+					q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'lmon' LIMIT 1});
+			};
+			next if $@;	  # connection still recovering
+			next unless $r && $r =~ /^\d+$/;
+			next if $r eq $lmon_pid_initial;	# old LMON pid still cached
+			$lmon_pid_new = $r;
+			last;
+		}
+
+		ok($lmon_pid_new && $lmon_pid_new ne $lmon_pid_initial,
+		   "L5b LMON respawned after kill -9 (initial=$lmon_pid_initial new=$lmon_pid_new); "
+		   . "spec-1.11 Sprint B P1 fix: ServerLoop respawn logic mirrors WalWriter pattern");
+	}
+
+	$node_l5b->stop('immediate', fail_ok => 1);
+}
 
 
 done_testing();

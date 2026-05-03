@@ -61,7 +61,10 @@
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
 #include "utils/timestamp.h"
+#include "utils/wait_event.h" /* WAIT_EVENT_CLUSTER_BGPROC_LMON_MAIN_LOOP (1.11 Sprint B) */
 
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_inject.h"
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_shmem.h"
 
@@ -161,6 +164,9 @@ cluster_lmon_start(void)
 	/* HC1 defense in depth — only postmaster spawns LMON. */
 	Assert(!IsUnderPostmaster);
 
+	/* Sprint B inject: pre-spawn (testable spawn-failure injection). */
+	CLUSTER_INJECTION_POINT("cluster-lmon-pre-spawn");
+
 	/*
 	 * Q2 thin proxy: forward to the postmaster-owned wrapper that
 	 * lives in postmaster.c.  cluster_lmon.c does NOT directly call
@@ -168,6 +174,10 @@ cluster_lmon_start(void)
 	 * to fork on its own.
 	 */
 	pid = cluster_postmaster_start_lmon();
+
+	/* Sprint B inject: post-spawn (after fork; LMON main not yet active). */
+	CLUSTER_INJECTION_POINT("cluster-lmon-post-spawn");
+
 	return (int)pid;
 }
 
@@ -251,10 +261,11 @@ cluster_lmon_status(void)
  * ============================================================ */
 
 /*
- * Sprint A main loop interval — hardcoded 1 second.  Sprint B replaces
- * with the cluster.lmon_main_loop_interval PGC_SIGHUP GUC.
+ * Sprint B main loop interval is the cluster.lmon_main_loop_interval
+ * PGC_SIGHUP GUC (default 1000ms; range [100, 60000]).  We re-read
+ * the GUC every iteration so SIGHUP changes take effect on the next
+ * tick.
  */
-#define LMON_MAIN_LOOP_INTERVAL_MS 1000
 
 
 static void
@@ -356,6 +367,9 @@ LmonMain(void)
 	/* Publish SPAWNING (records pid + spawned_at). */
 	lmon_publish_status(CLUSTER_LMON_SPAWNING);
 
+	/* Sprint B inject: ready-publish (test slow startup / phase 1 wait timeout). */
+	CLUSTER_INJECTION_POINT("cluster-lmon-ready-publish");
+
 	/*
 	 * Sprint A has no startup-side initialization beyond shmem state
 	 * registration (no interconnect, no heartbeat consumer, no GRD).
@@ -364,13 +378,17 @@ LmonMain(void)
 	lmon_publish_status(CLUSTER_LMON_READY);
 
 	/*
-	 * Main loop — HC6 local liveness tick.  Sprint B will add
-	 * WaitLatch(MyLatch, ..., WAIT_EVENT_CLUSTER_BGPROC_LMON_MAIN_LOOP)
-	 * for proper sleep semantics + GUC-driven interval.  Sprint A
-	 * uses pg_usleep for simplicity since there is no incoming
-	 * signal traffic to multiplex on.
+	 * Sprint B main loop — WaitLatch with explicit timeout +
+	 * WAIT_EVENT_CLUSTER_BGPROC_LMON_MAIN_LOOP wait event so
+	 * pg_stat_activity surfaces idle LMON cleanly.  GUC-driven
+	 * interval (re-read each iteration so SIGHUP propagates on the
+	 * next tick).
+	 *
+	 * HC6: tick is LOCAL liveness only — no inter-node heartbeat.
 	 */
 	for (;;) {
+		int rc;
+
 		CHECK_FOR_INTERRUPTS();
 
 		if (ConfigReloadPending) {
@@ -383,8 +401,17 @@ LmonMain(void)
 
 		lmon_advance_liveness_tick();
 
-		pg_usleep(LMON_MAIN_LOOP_INTERVAL_MS * 1000L);
+		/* Sprint B inject: main-loop-iter (test mid-loop fault). */
+		CLUSTER_INJECTION_POINT("cluster-lmon-main-loop-iter");
+
+		rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+					   cluster_lmon_main_loop_interval, WAIT_EVENT_CLUSTER_BGPROC_LMON_MAIN_LOOP);
+		if (rc & WL_LATCH_SET)
+			ResetLatch(MyLatch);
 	}
+
+	/* Sprint B inject: shutdown-pre (test cleanup-time fault). */
+	CLUSTER_INJECTION_POINT("cluster-lmon-shutdown-pre");
 
 	/* Graceful shutdown path — HC5 normal exit. */
 	lmon_publish_status(CLUSTER_LMON_SHUTTING_DOWN);
@@ -392,6 +419,9 @@ LmonMain(void)
 	/* No cleanup work in Sprint A skeleton (no interconnect / GRD / etc). */
 
 	lmon_publish_status(CLUSTER_LMON_EXITED);
+
+	/* Sprint B inject: shutdown-post (test final exit-code path). */
+	CLUSTER_INJECTION_POINT("cluster-lmon-shutdown-post");
 
 	/*
 	 * proc_exit(0) -> reaper sees WIFEXITED + WEXITSTATUS=0 ->

@@ -230,6 +230,8 @@ int cluster_phase1_timeout = 60;
 int cluster_phase2_timeout = 30;
 int cluster_phase3_timeout = 600;
 int cluster_phase4_timeout = 30;
+/* Spec-1.11 Sprint B: cluster_startup_phase.c references cluster_enabled */
+bool cluster_enabled = true;
 
 #include "cluster/cluster_shmem.h"
 void

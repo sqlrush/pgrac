@@ -451,6 +451,8 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 53R07    E    ERRCODE_CLUSTER_RECONFIG_QUORUM_LOST                           cluster_reconfig_quorum_lost
 53R08    E    ERRCODE_CLUSTER_PHASE_TRANSITION_TIMEOUT                       cluster_phase_transition_timeout
 53R09    E    ERRCODE_CLUSTER_PHASE_PRECONDITION_FAILED                      cluster_phase_precondition_failed
+53R0A    E    ERRCODE_CLUSTER_LMON_SPAWN_FAILED                              cluster_lmon_spawn_failed
+53R0B    E    ERRCODE_CLUSTER_LMON_NOT_READY                                 cluster_lmon_not_ready
 
 Section: Class 54 - Program Limit Exceeded
 

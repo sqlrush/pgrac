@@ -206,4 +206,44 @@ extern int cluster_phase3_timeout;
 extern int cluster_phase4_timeout;
 
 
+/*
+ * cluster.lmon_main_loop_interval: LMON main-loop tick / WaitLatch
+ * timeout in milliseconds (Stage 1.11 Sprint B; spec-1.11 D8).
+ *
+ *	Sprint A used a hardcoded LMON_MAIN_LOOP_INTERVAL_MS = 1000.  Sprint
+ *	B exposes the tick interval as PGC_SIGHUP so operators can dial
+ *	telemetry granularity at runtime: lower value -> finer
+ *	last_liveness_tick_at resolution + faster shutdown response;
+ *	higher value -> lower wakeup overhead (Sprint A LMON does no real
+ *	work, so even 60s is fine).
+ *
+ *	context:      PGC_SIGHUP
+ *	default:      1000 (1 second; matches Sprint A hardcoded baseline)
+ *	range:        [100, 60000] (millisecond)
+ */
+extern int cluster_lmon_main_loop_interval;
+
+
+/*
+ * cluster.enabled: runtime cluster mode gate (Stage 1.11 Sprint B; HC4
+ * 闭环).
+ *
+ *	Sprint A used compile-time #ifdef USE_PGRAC_CLUSTER as the de-facto
+ *	cluster gate (HC4 GUC + L9 deferred to Sprint B per spec-1.11 §1.4
+ *	Q-amend #4).  Sprint B introduces the runtime PGC_POSTMASTER GUC
+ *	so an enable-cluster build can still be run as a single-instance
+ *	non-cluster postgres without spawning LMON or other Stage 1.11+
+ *	cluster background processes.
+ *
+ *	Phase 1 driver reads this GUC and falls back to the spec-1.10 stub
+ *	(no LMON spawn) when cluster.enabled = false (HC4).
+ *
+ *	context:      PGC_POSTMASTER (read once at postmaster startup;
+ *	              children inherit via fork)
+ *	default:      true (cluster mode is the default for --enable-cluster
+ *	              builds; non-cluster builds never compile this GUC)
+ */
+extern bool cluster_enabled;
+
+
 #endif /* CLUSTER_GUC_H */

@@ -172,6 +172,19 @@ cluster_postmaster_start_lmon(void)
 	return 0;
 }
 
+/* Spec-1.11 Sprint B: cluster_lmon.c references
+ * cluster_lmon_main_loop_interval GUC + WaitLatch / ResetLatch /
+ * MyLatch + cluster_inject framework.  Stubs cover them all --
+ * runtime LmonMain is not exercised. */
+int cluster_lmon_main_loop_interval = 1000;
+
+#include "cluster/cluster_inject.h"
+int cluster_injection_armed_count = 0;
+char *cluster_injection_points = NULL;
+void
+cluster_injection_run(const char *name pg_attribute_unused())
+{}
+
 /* libpq + procsignal stubs (pulled in transitively via cluster_lmon.c
  * includes; LmonMain runtime is not invoked). */
 struct sigaction;
@@ -215,6 +228,19 @@ ProcessInterrupts(void)
 
 void
 pg_usleep(long microsec pg_attribute_unused())
+{}
+
+/* Sprint B: Latch / WaitLatch / ResetLatch stubs (LmonMain runtime
+ * is not invoked at unit-test level). */
+struct Latch *MyLatch = NULL;
+int
+WaitLatch(struct Latch *latch pg_attribute_unused(), int wakeEvents pg_attribute_unused(),
+		  long timeout pg_attribute_unused(), uint32 wait_event_info pg_attribute_unused())
+{
+	return 0;
+}
+void
+ResetLatch(struct Latch *latch pg_attribute_unused())
 {}
 
 /* cluster_lmon.c references MyBackendType (set by LmonMain). */
