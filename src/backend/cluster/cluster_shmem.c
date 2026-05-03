@@ -60,6 +60,7 @@
 #include "cluster/cluster_inject.h"	  /* CLUSTER_INJECTION_POINT */
 #include "cluster/cluster_pcm_lock.h" /* cluster_pcm_lock_module_init (stage 1.7) */
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_startup_phase.h" /* cluster_phase_shmem_register (1.10.1) */
 #include "cluster/cluster_version_macros.h"
 
 
@@ -320,6 +321,17 @@ cluster_init_shmem_module(void)
 	 */
 	if (cluster_shmem_lookup_region("pgrac cluster pcm grd") == NULL)
 		cluster_pcm_lock_module_init();
+
+	/*
+	 * Stage 1.10.1 (F1 hardening): register cluster_startup_phase shmem
+	 * region.  Phase state was a process-local static; EXEC_BACKEND
+	 * children re-exec'd and saw stale PRE_INIT.  Migrating to shmem
+	 * gives every backend a coherent view.
+	 *
+	 * Spec: spec-1.10.1-postmaster-phase-hardening.md D1 F1.
+	 */
+	if (cluster_shmem_lookup_region("pgrac cluster startup phase") == NULL)
+		cluster_phase_shmem_register();
 }
 
 

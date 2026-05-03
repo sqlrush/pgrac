@@ -161,13 +161,13 @@ SKIP: {
 
 
 # ----------
-# L10: Stage 1.3 baseline -- pg_cluster_shmem still 2 rows.
+# L10: Stage 1.10.1 baseline -- pg_cluster_shmem 4 rows.
 # ----------
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_shmem}),
-   '3',
-   'L10 pg_cluster_shmem 3 rows (block format change is not a shmem region; 1.7 adds cluster_pcm_grd)');
+   '4',
+   'L10 pg_cluster_shmem 4 rows (block format change is not a shmem region; 1.7 adds cluster_pcm_grd; 1.10.1 adds cluster_startup_phase)');
 
 
 # ----------

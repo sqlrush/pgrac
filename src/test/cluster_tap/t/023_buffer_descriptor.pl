@@ -129,14 +129,14 @@ is($node->safe_psql(
 
 
 # ----------
-# L10: 1.3 baseline -- pg_cluster_shmem 3 rows (1.6 adds no shmem regions;
-# 1.7 adds cluster_pcm_grd region).
+# L10: 1.10.1 baseline -- pg_cluster_shmem 4 rows (1.7 adds cluster_pcm_grd;
+# 1.10.1 adds cluster_startup_phase region).
 # ----------
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_cluster_shmem'),
-   '3',
-   'L10 1.3 baseline: pg_cluster_shmem 3 rows (cluster_ctl + cluster_conf + cluster_pcm_grd from 1.7)');
+   '4',
+   'L10 1.10.1 baseline: pg_cluster_shmem 4 rows (cluster_ctl + cluster_conf + cluster_pcm_grd + cluster_startup_phase)');
 
 
 # ----------

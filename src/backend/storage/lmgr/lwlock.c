@@ -193,6 +193,8 @@ static const char *const BuiltinTrancheNames[] = {
 #ifdef USE_PGRAC_CLUSTER
 	/* PGRAC LWTRANCHE_BUFFER_PCM_LOCK: */
 	"BufferPcmLock",
+	/* PGRAC LWTRANCHE_CLUSTER_STARTUP_PHASE: */
+	"ClusterStartupPhase",
 #endif
 };
 

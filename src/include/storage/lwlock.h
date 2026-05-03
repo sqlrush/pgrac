@@ -220,6 +220,17 @@ typedef enum BuiltinTrancheIds
 	 * Spec: spec-stage1-codex-fixes.md §1.2 Deliverable 5 + spec-1.6 §11
 	 */
 	LWTRANCHE_BUFFER_PCM_LOCK,
+	/*
+	 * PGRAC (stage 1.10.1 hardening): dedicated tranche for the
+	 * ClusterPhaseSharedState lwlock that guards postmaster startup
+	 * phase state in shmem (current_phase / phase_start_times[] /
+	 * phase_history[] ring).  Migrated from process-local static
+	 * globals to fix EXEC_BACKEND/Windows children seeing pre_init
+	 * stale state after re-exec.
+	 *
+	 * Spec: spec-1.10.1-postmaster-phase-hardening.md F1
+	 */
+	LWTRANCHE_CLUSTER_STARTUP_PHASE,
 #endif
 	LWTRANCHE_FIRST_USER_DEFINED
 }			BuiltinTrancheIds;

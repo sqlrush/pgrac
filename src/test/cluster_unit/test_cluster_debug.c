@@ -391,6 +391,51 @@ timestamptz_out(PG_FUNCTION_ARGS)
 }
 
 
+/*
+ * Spec-1.10.1 D1 F1 stubs: cluster_startup_phase.o now references
+ * the LWLock + ShmemInitStruct API (phase state migrated to shmem)
+ * plus the cluster.phase{1..4}_timeout GUC variables (D2 F2 driver
+ * elapsed check) plus cluster_shmem_register_region (region registry).
+ * The unit test never invokes the runtime paths -- these are
+ * address-only / NULL stubs so cluster_debug.o links standalone.
+ */
+#include "storage/lwlock.h"
+#include "storage/shmem.h"
+
+void
+LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute_unused())
+{}
+
+bool
+LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
+{
+	return true;
+}
+
+void
+LWLockRelease(LWLock *lock pg_attribute_unused())
+{}
+
+void *
+ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_unused(),
+				bool *foundPtr)
+{
+	if (foundPtr != NULL)
+		*foundPtr = false;
+	return NULL;
+}
+
+int cluster_phase1_timeout = 60;
+int cluster_phase2_timeout = 30;
+int cluster_phase3_timeout = 600;
+int cluster_phase4_timeout = 30;
+
+#include "cluster/cluster_shmem.h"
+void
+cluster_shmem_register_region(const ClusterShmemRegion *region pg_attribute_unused())
+{}
+
+
 UT_DEFINE_GLOBALS();
 
 

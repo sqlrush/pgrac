@@ -184,6 +184,51 @@ pg_snprintf(char *str, size_t count, const char *fmt, ...)
 }
 
 
+/*
+ * Spec-1.10.1 D1 F1 stubs: cluster_startup_phase.o now references
+ * LWLock + ShmemInitStruct (phase state migrated to shmem) +
+ * cluster.phase{1..4}_timeout GUC variables (D2 F2 driver elapsed
+ * check) + cluster_shmem_register_region (registry).  The runtime
+ * tests below only exercise pure-function APIs; the stubs are
+ * address-only / no-op.
+ */
+#include "storage/lwlock.h"
+#include "storage/shmem.h"
+
+void
+LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute_unused())
+{}
+
+bool
+LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
+{
+	return true;
+}
+
+void
+LWLockRelease(LWLock *lock pg_attribute_unused())
+{}
+
+void *
+ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_unused(),
+				bool *foundPtr)
+{
+	if (foundPtr != NULL)
+		*foundPtr = false;
+	return NULL;
+}
+
+int cluster_phase1_timeout = 60;
+int cluster_phase2_timeout = 30;
+int cluster_phase3_timeout = 600;
+int cluster_phase4_timeout = 30;
+
+#include "cluster/cluster_shmem.h"
+void
+cluster_shmem_register_region(const ClusterShmemRegion *region pg_attribute_unused())
+{}
+
+
 UT_DEFINE_GLOBALS();
 
 
@@ -285,19 +330,55 @@ UT_TEST(test_public_symbols_linkable)
 
 
 /* ============================================================
+ * Spec-1.10.1 D1 F1 / D4 F4 anchors
+ * ============================================================ */
+
+UT_TEST(test_phase_shmem_state_size_under_4kb)
+{
+	/*
+	 * Spec-1.10.1 D1 F1: ClusterPhaseSharedState lives in shmem now.
+	 * The struct is small by design (LWLock + 1 enum + 8 timestamps +
+	 * 8-entry ring + 2 ints).  Bound it well below 4 KiB so a future
+	 * field accidentally bloating the layout is caught early; on
+	 * macOS arm64 the current size is ~256 bytes.
+	 */
+	UT_ASSERT(sizeof(ClusterPhaseSharedState) < 4096);
+}
+
+
+UT_TEST(test_phase_shmem_register_init_linkable)
+{
+	/*
+	 * Spec-1.10.1 D1 F1: cluster_phase_shmem_register +
+	 * cluster_phase_shmem_init are part of the public surface and must
+	 * resolve at link time.  cluster_finalize_startup_running (D4 F4)
+	 * is the new public entry that PostmasterMain calls before
+	 * ServerLoop.  All three are address-only here -- the runtime
+	 * paths require real shmem and PG init that the unit harness lacks.
+	 */
+	UT_ASSERT_NOT_NULL((void *)cluster_phase_shmem_register);
+	UT_ASSERT_NOT_NULL((void *)cluster_phase_shmem_init);
+	UT_ASSERT_NOT_NULL((void *)cluster_phase_shmem_size);
+	UT_ASSERT_NOT_NULL((void *)cluster_finalize_startup_running);
+}
+
+
+/* ============================================================
  * Test runner
  * ============================================================ */
 
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(8);
 	UT_RUN(test_phase_enum_values_frozen);
 	UT_RUN(test_phase_last_is_shutdown);
 	UT_RUN(test_phase_history_ring_size_is_eight);
 	UT_RUN(test_phase_string_lookup_returns_non_null_for_each_value);
 	UT_RUN(test_phase_string_lookup_invalid_returns_unknown);
 	UT_RUN(test_public_symbols_linkable);
+	UT_RUN(test_phase_shmem_state_size_under_4kb);
+	UT_RUN(test_phase_shmem_register_init_linkable);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -319,6 +319,16 @@ cluster_pcm_lock_module_init(void)
 {}
 
 
+/*
+ * Spec-1.10.1 D1 F1 stub: cluster_init_shmem_module also calls
+ * cluster_phase_shmem_register (cluster_startup_phase.c).  Provide a
+ * no-op stub since this test does not exercise the full module init.
+ */
+void
+cluster_phase_shmem_register(void)
+{}
+
+
 UT_DEFINE_GLOBALS();
 
 

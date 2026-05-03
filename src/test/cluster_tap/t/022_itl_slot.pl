@@ -205,8 +205,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_cluster_shmem'),
-   '3',
-   'L12c pg_cluster_shmem 3 rows (1.5 adds no shmem regions; 1.7 adds cluster_pcm_grd)');
+   '4',
+   'L12c pg_cluster_shmem 4 rows (1.5 adds no shmem regions; 1.7 adds cluster_pcm_grd; 1.10.1 adds cluster_startup_phase)');
 
 
 # ----------

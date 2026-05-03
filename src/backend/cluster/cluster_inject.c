@@ -457,6 +457,10 @@ cluster_injection_assign_hook(const char *newval, void *extra)
 		size_t len;
 		char buf[128];
 		ClusterInjectPoint *p;
+		ClusterInjectFaultType arm_type = CLUSTER_FAULT_WARNING;
+		int64 arm_param = 0;
+		char *colon;
+		ClusterInjectFaultType last_type;
 
 		while (*cursor == ' ' || *cursor == ',' || *cursor == '\t')
 			cursor++;
@@ -474,6 +478,33 @@ cluster_injection_assign_hook(const char *newval, void *extra)
 		memcpy(buf, start, len);
 		buf[len] = '\0';
 
+		/*
+		 * Spec-1.10.1 D7 extension: optional ':type[:param]' suffix lets
+		 * tests arm a specific fault type from postmaster GUC time
+		 * (before any SQL connection exists).  Backward compatible:
+		 * bare 'name' still arms to WARNING/0.
+		 *
+		 *	cluster.injection_points = 'cluster-startup-phase-1-enter:sleep:2'
+		 */
+		colon = strchr(buf, ':');
+		if (colon != NULL) {
+			char *type_str = colon + 1;
+			char *param_colon = strchr(type_str, ':');
+
+			*colon = '\0';
+			if (param_colon != NULL) {
+				*param_colon = '\0';
+				arm_param = strtoll(param_colon + 1, NULL, 10);
+			}
+			arm_type = parse_fault_type(type_str);
+			if (arm_type == CLUSTER_FAULT_NONE) {
+				ereport(WARNING,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("unknown cluster injection fault type: \"%s\"", type_str)));
+				continue;
+			}
+		}
+
 		p = cluster_injection_lookup(buf);
 		if (p == NULL) {
 			ereport(WARNING,
@@ -482,11 +513,20 @@ cluster_injection_assign_hook(const char *newval, void *extra)
 							buf)));
 			continue;
 		}
-		cluster_injection_arm_internal(p, CLUSTER_FAULT_WARNING, 0);
+		cluster_injection_arm_internal(p, arm_type, arm_param);
 		seen[p - cluster_injection_points] = true;
+		(void)last_type; /* silence unused under -Wunused-variable on some builds */
 	}
 
-	/* Disarm points that were not in the new list (only WARNING ones). */
+	/*
+	 * Disarm points that were not in the new list, but only the
+	 * WARNING-armed kind.  SQL-armed faults (cluster_inject_fault
+	 * with ERROR / SLEEP / CRASH / SKIP) are independent and survive
+	 * GUC reloads.  Spec-1.10.1 D7 colon-syntax extensions go through
+	 * the same path: a postmaster-time SLEEP arm survives subsequent
+	 * cluster.injection_points reloads -- callers must explicitly
+	 * disarm via cluster_inject_fault('name', 'none', 0) if needed.
+	 */
 	for (int i = 0; i < CLUSTER_INJECTION_COUNT; i++) {
 		if (seen[i])
 			continue;

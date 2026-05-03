@@ -70,6 +70,7 @@
 #define CLUSTER_STARTUP_PHASE_H
 
 #include "datatype/timestamp.h"
+#include "storage/lwlock.h"
 
 
 /*
@@ -199,6 +200,73 @@ extern void cluster_run_shutdown_sequence(void);
  */
 extern int64 cluster_phase_elapsed_seconds(void);
 extern void cluster_phase_history_format(char *buf, size_t size);
+
+
+/* ============================================================
+ * Phase shmem state (spec-1.10.1 F1 hardening)
+ *
+ *	Phase state was originally process-local static globals in
+ *	cluster_startup_phase.c.  EXEC_BACKEND/Windows children re-exec
+ *	the binary, re-running static initializers, so they observed
+ *	cluster_startup_phase_current = CLUSTER_PHASE_PRE_INIT regardless
+ *	of postmaster's actual state.  Migrating to shmem fixes this.
+ *
+ *	Single writer: postmaster (cluster_advance_phase, HC1).
+ *	Many readers: any backend or aux process (cluster_current_phase,
+ *	cluster_phase_started_at, cluster_phase_elapsed_seconds,
+ *	cluster_phase_history_format).
+ *
+ *	LWLock LWTRANCHE_CLUSTER_STARTUP_PHASE guards the struct.
+ *	cluster_advance_phase takes LW_EXCLUSIVE; readers take LW_SHARED.
+ * ============================================================ */
+
+typedef struct PhaseHistoryEntry {
+	ClusterStartupPhase phase;
+	TimestampTz entered_at;
+} PhaseHistoryEntry;
+
+typedef struct ClusterPhaseSharedState {
+	LWLock lwlock; /* LWTRANCHE_CLUSTER_STARTUP_PHASE */
+	ClusterStartupPhase current_phase;
+	TimestampTz phase_start_times[CLUSTER_PHASE_LAST + 1];
+	PhaseHistoryEntry phase_history[CLUSTER_PHASE_HISTORY_RING_SIZE];
+	int phase_history_count; /* total entries ever written (lifetime) */
+	int phase_history_head;	 /* next slot to write (0..RING_SIZE-1) */
+} ClusterPhaseSharedState;
+
+
+/* ----------
+ * Phase shmem region helpers (spec-1.10.1 D1 F1).
+ *
+ *	cluster_phase_shmem_size()    -- bytes requested via RequestAddinShmemSpace
+ *	cluster_phase_shmem_init()    -- ShmemInitStruct + LWLock init
+ *	cluster_phase_shmem_register()-- spec-1.3 shmem registry register
+ *
+ *	Called from cluster_init_shmem_module() (cluster_shmem.c) during
+ *	postmaster startup, idempotent on EXEC_BACKEND children rebind.
+ * ----------
+ */
+extern Size cluster_phase_shmem_size(void);
+extern void cluster_phase_shmem_init(void);
+extern void cluster_phase_shmem_register(void);
+
+
+/* ----------
+ * Postmaster startup finalize (spec-1.10.1 D4 F4).
+ *
+ *	cluster_finalize_startup_running() -- advance phase from
+ *	    CLUSTER_PHASE_4_NORMAL to CLUSTER_PHASE_RUNNING.  Called from
+ *	    PostmasterMain function body just before ServerLoop() entry,
+ *	    AFTER PG-native subprocesses (walwriter / bgwriter /
+ *	    checkpointer / autovacuum) have spawned and the listen socket
+ *	    is up.  This separates "pgrac skeleton finished" from
+ *	    "PostgreSQL ready to accept connections": cluster_run_startup_
+ *	    sequence advances to phase 4 only; finalize advances to RUNNING.
+ *
+ *	    HC1 postmaster-only: Assert(!IsUnderPostmaster).
+ * ----------
+ */
+extern void cluster_finalize_startup_running(void);
 
 
 #endif /* CLUSTER_STARTUP_PHASE_H */

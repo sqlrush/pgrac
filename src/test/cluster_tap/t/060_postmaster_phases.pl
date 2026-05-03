@@ -258,4 +258,74 @@ like($log_l12, qr/cluster\.smgr_user_relations is experimental/,
 $node->stop;
 
 
+# ----------
+# L13 (spec-1.10.1 D1 F1): backend reads phase=running from shmem,
+# not from a process-local static.  On POSIX fork() platforms this
+# also held with the static-globals layout (child inherited the
+# postmaster's snapshot); on EXEC_BACKEND/Windows the static-globals
+# layout failed because re-exec'd children re-ran static initializers
+# and saw PRE_INIT.  L13 anchors the shmem-backed read path: any
+# backend SQL session must see phase=running after startup completes.
+# ----------
+$node->start;
+my $phase_l13 = $node->safe_psql('postgres',
+	"SELECT value FROM pg_cluster_state WHERE category = 'phase' AND key = 'cluster_phase'");
+is($phase_l13, 'running',
+   'L13 backend SELECTs phase=running from shmem (spec-1.10.1 F1)');
+
+my $phase_enum_l13 = $node->safe_psql('postgres',
+	"SELECT value FROM pg_cluster_state WHERE category = 'phase' AND key = 'phase_enum_value'");
+is($phase_enum_l13, '6',
+   'L13 phase_enum_value = 6 (RUNNING) via shmem');
+
+$node->stop;
+
+
+# ----------
+# L14 (spec-1.10.1 D2 F2 / Q2=D): driver synchronous elapsed check
+# enforces cluster.phaseN_timeout.  Inject sleep(2s) on phase 1
+# enter; with cluster.phase1_timeout=1, the handler returns after
+# the inject sleep completes, the driver computes elapsed > timeout,
+# and ereports FATAL with 53R08 (CLUSTER_PHASE_TRANSITION_TIMEOUT).
+# Postmaster startup fails; logfile contains the timeout message.
+# ----------
+{
+    my $node_l14 = PostgreSQL::Test::Cluster->new('l14_timeout');
+    $node_l14->init;
+    $node_l14->append_conf('postgresql.conf', q{
+cluster.phase1_timeout = 1
+cluster.injection_points = 'cluster-startup-phase-1-enter:sleep:2000000'
+});
+    # PostgreSQL::Test::Cluster::start uses BAIL_OUT on failure unless
+    # fail_ok is passed; eval cannot catch BAIL_OUT, so we must opt into
+    # the fail-ok path explicitly.  start() returns 1 on success and 0 on
+    # failure when fail_ok is set.
+    my $start_ok = $node_l14->start(fail_ok => 1);
+    ok(!$start_ok, 'L14 postmaster startup fails when phase 1 elapsed > timeout');
+
+    my $log_l14 = slurp_file($node_l14->logfile);
+    like($log_l14,
+         qr/cluster startup phase phase1_cluster exceeded timeout/,
+         'L14 logfile contains phase 1 timeout FATAL message (53R08)');
+    eval { $node_l14->stop('immediate'); };
+}
+
+
+# ----------
+# L15 (spec-1.10.1 D4 F4): advance(RUNNING) is delayed to PostmasterMain
+# just before ServerLoop entry.  Before the spec-1.10.1 fix, advance to
+# RUNNING happened inside cluster_run_startup_sequence() right after
+# CreateSharedMemoryAndSemaphores, before set_max_safe_fds / listen
+# socket / startup process / bgwriter etc.  After the fix, the first
+# SELECT after $node->start always observes phase=running because that
+# transition is the immediate predecessor of ServerLoop().
+# ----------
+$node->start;
+my $phase_l15 = $node->safe_psql('postgres',
+	"SELECT value FROM pg_cluster_state WHERE category = 'phase' AND key = 'cluster_phase'");
+is($phase_l15, 'running',
+   'L15 first SELECT after start sees phase=running (advance delayed to ServerLoop entry)');
+$node->stop;
+
+
 done_testing();

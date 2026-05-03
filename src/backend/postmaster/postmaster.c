@@ -1543,6 +1543,23 @@ PostmasterMain(int argc, char *argv[])
 	/* Some workers may be scheduled to start now */
 	maybe_start_bgworkers();
 
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: spec-1.10.1 (2026-05-04) D4 F4 — advance phase machinery
+	 * to RUNNING just before entering ServerLoop().  spec-1.10 originally
+	 * advanced to RUNNING inside cluster_run_startup_sequence() right
+	 * after CreateSharedMemoryAndSemaphores(), but at that point PG had
+	 * not yet set_max_safe_fds, opened listen sockets, started startup
+	 * process / bgwriter / checkpointer, etc.  Pushing the transition
+	 * here makes phase=running accurately reflect "PostgreSQL ready to
+	 * accept connections" rather than just "pgrac skeleton finished".
+	 *
+	 * HC1 PostmasterMain-only.  cluster_finalize_startup_running()
+	 * Asserts !IsUnderPostmaster as defense in depth.
+	 */
+	cluster_finalize_startup_running();
+#endif
+
 	status = ServerLoop();
 
 	/*
@@ -3987,6 +4004,25 @@ PostmasterStateMachine(void)
 		}
 		else
 		{
+#ifdef USE_PGRAC_CLUSTER
+			/*
+			 * PGRAC: spec-1.10.1 (2026-05-04) D5 F5 — drive cluster
+			 * shutdown phase machinery after PG children have all
+			 * exited and before postmaster itself proc_exit's.  Stage
+			 * 1.10.1 stub: directly advance to CLUSTER_PHASE_SHUTDOWN
+			 * (no reverse per-phase tear-down yet because no real
+			 * cluster background processes exist; 1.11+ will spawn
+			 * LMON / LCK / DIAG / Cluster Stats and amend this entry
+			 * to reverse-walk phase 4 -> 3 -> 2 -> 1 -> SHUTDOWN).
+			 *
+			 * cluster_run_shutdown_sequence() is idempotent (returns
+			 * immediately if already at SHUTDOWN) so multiple invocations
+			 * during smart -> fast -> immediate shutdown upgrades stay
+			 * safe.  HC1 PostmasterMain-only Assert applies.
+			 */
+			cluster_run_shutdown_sequence();
+#endif
+
 			/*
 			 * Normal exit from the postmaster is here.  We don't need to log
 			 * anything here, since the UnlinkLockFiles proc_exit callback
