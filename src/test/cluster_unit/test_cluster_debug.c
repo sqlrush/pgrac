@@ -277,6 +277,14 @@ TimestampDifference(TimestampTz start_time pg_attribute_unused(),
 	*microsecs = 0;
 }
 
+bool
+TimestampDifferenceExceeds(TimestampTz start_time pg_attribute_unused(),
+						   TimestampTz stop_time pg_attribute_unused(),
+						   int msec pg_attribute_unused())
+{
+	return false;
+}
+
 const char *
 timestamptz_to_str(TimestampTz dt pg_attribute_unused())
 {

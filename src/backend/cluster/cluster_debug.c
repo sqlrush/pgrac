@@ -356,10 +356,16 @@ dump_phase(ReturnSetInfo *rsinfo)
 	char history_buf[1024];
 
 	/*
-	 * cluster_phase legacy mirror -- HC2 derived mirror, single-writer
-	 * is cluster_advance_phase() (cluster_startup_phase.c).
+	 * Spec-1.10.2 F7 (2026-05-04 codex review fix): the SQL-visible
+	 * "cluster_phase" key MUST derive from shmem-backed
+	 * cluster_current_phase() instead of the legacy const char *
+	 * cluster_phase global.  The legacy mirror is fork-coherent (child
+	 * inherits postmaster's last write) but EXEC_BACKEND children
+	 * re-exec and re-run the static initializer -> the mirror reverts
+	 * to "pre_init" while shmem still holds the live phase.  Reading
+	 * via cluster_startup_phase_to_string(current) closes that gap.
 	 */
-	emit_row(rsinfo, "phase", "cluster_phase", str_or_default(cluster_phase, "(unset)"));
+	emit_row(rsinfo, "phase", "cluster_phase", cluster_startup_phase_to_string(current));
 
 	/*
 	 * Spec-1.10 (2026-05-03) phase 4 new keys (HC5 fixed-size ring on

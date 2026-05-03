@@ -598,6 +598,7 @@ cluster_run_startup_sequence(void)
 		PhaseRunResult result;
 		ClusterPhaseHandler handler;
 		TimestampTz started;
+		TimestampTz now;
 		long elapsed_secs;
 		int microsecs;
 		int timeout_secs;
@@ -635,20 +636,33 @@ cluster_run_startup_sequence(void)
 
 		result = handler();
 
-		TimestampDifference(started, GetCurrentTimestamp(), &elapsed_secs, &microsecs);
+		/*
+		 * Spec-1.10.2 F8 (2026-05-04 codex review fix): use
+		 * TimestampDifferenceExceeds for millisecond-precision boundary
+		 * checking.  The prior comparison `elapsed_secs > timeout_secs`
+		 * floored sub-second elapsed and yielded false negatives when
+		 * elapsed was 1.0s..1.999s with timeout_secs == 1 (boundary
+		 * leak).  TimestampDifferenceExceeds(start, stop, ms) returns
+		 * true iff (stop - start) exceeds ms, with full us precision.
+		 *
+		 * Capture `now` once so the FATAL errmsg reports the same
+		 * sample the deadline was checked against.
+		 */
+		now = GetCurrentTimestamp();
 		timeout_secs = cluster_phase_timeout_for(phase);
 
-		if (timeout_secs > 0 && elapsed_secs > (long)timeout_secs) {
+		if (timeout_secs > 0 && TimestampDifferenceExceeds(started, now, timeout_secs * 1000)) {
+			TimestampDifference(started, now, &elapsed_secs, &microsecs);
 			cluster_phase_fail_inject(phase);
-			ereport(FATAL,
-					(errcode(ERRCODE_CLUSTER_PHASE_TRANSITION_TIMEOUT),
-					 errmsg("cluster startup phase %s exceeded timeout (%ld s > %d s)",
-							cluster_startup_phase_to_string(phase), elapsed_secs, timeout_secs),
-					 errhint("Increase cluster.phase%d_timeout GUC or "
-							 "fix handler hang (handler must self-bound "
-							 "blocking waits via WaitLatch+timeout per the "
-							 "phase handler contract).",
-							 (int)phase - 1)));
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_PHASE_TRANSITION_TIMEOUT),
+							errmsg("cluster startup phase %s exceeded timeout (%ld.%03d s > %d s)",
+								   cluster_startup_phase_to_string(phase), elapsed_secs,
+								   microsecs / 1000, timeout_secs),
+							errhint("Increase cluster.phase%d_timeout GUC or "
+									"fix handler hang (handler must self-bound "
+									"blocking waits via WaitLatch+timeout per the "
+									"phase handler contract).",
+									(int)phase - 1)));
 		}
 
 		/*
