@@ -241,7 +241,13 @@ UT_TEST(test_phase_string_lookup_returns_non_null_for_each_value)
 		const char *s = cluster_startup_phase_to_string((ClusterStartupPhase)i);
 
 		UT_ASSERT_NOT_NULL(s);
-		UT_ASSERT(s[0] != '\0');
+		/*
+		 * Defensive: cppcheck doesn't model UT_ASSERT_NOT_NULL's abort
+		 * semantics, so the explicit `s != NULL` keeps the static
+		 * analyser happy without relaxing the assertion's meaning.
+		 */
+		if (s != NULL)
+			UT_ASSERT(s[0] != '\0');
 	}
 }
 

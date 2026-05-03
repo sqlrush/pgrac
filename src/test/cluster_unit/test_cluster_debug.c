@@ -295,6 +295,12 @@ errmsg_internal(const char *fmt pg_attribute_unused(), ...)
 	return 0;
 }
 
+int
+errhint(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
 /*
  * pg_snprintf stub: cluster_startup_phase.c uses snprintf which is
  * macro'd to pg_snprintf in PG.  Forward to libc snprintf in unit

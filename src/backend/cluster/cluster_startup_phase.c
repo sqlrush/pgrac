@@ -175,7 +175,7 @@ cluster_phase_history_format(char *buf, size_t size)
 
 	for (i = 0; i < emit_count; i++) {
 		int idx = (start + i) % CLUSTER_PHASE_HISTORY_RING_SIZE;
-		PhaseHistoryEntry *entry = &cluster_phase_history[idx];
+		const PhaseHistoryEntry *entry = &cluster_phase_history[idx];
 		const char *phase_str = cluster_startup_phase_to_string(entry->phase);
 		const char *ts_str = timestamptz_to_str(entry->entered_at);
 		int n;
@@ -418,7 +418,16 @@ cluster_run_startup_sequence(void)
 		cluster_advance_phase(phase);
 
 		handler = phase_handlers[(int)phase];
-		Assert(handler != NULL); /* every iterated phase has a handler */
+		/*
+		 * Every iterated phase (1..4) has a handler defined in
+		 * phase_handlers[].  If a future amend leaves a slot NULL we
+		 * fail loudly rather than dereference it (cppcheck flagged
+		 * the prior Assert-only form as a potential null deref).
+		 */
+		if (handler == NULL)
+			ereport(FATAL, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("cluster startup phase %s has no handler in dispatch table",
+								   cluster_startup_phase_to_string(phase))));
 		result = handler();
 
 		if (result == PHASE_RUN_FATAL) {
