@@ -50,17 +50,18 @@ $node->start;
 # ----------
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'51',
+	'56',
 	'pg_stat_cluster_wait_events returns 51 rows (matches spec-0.11 registration)');
 
 
 # ----------
-# Distinct type count: 11 (10 from spec-0.11 + SharedFs from spec-1.1).
+# Distinct type count: 12 (10 from spec-0.11 + SharedFs from spec-1.1
+# + StartupPhase from spec-1.10).
 # ----------
 is($node->safe_psql('postgres',
 		'SELECT count(DISTINCT type) FROM pg_stat_cluster_wait_events'),
-	'11',
-	'11 distinct Cluster: * types');
+	'12',
+	'12 distinct Cluster: * types');
 
 
 # ----------

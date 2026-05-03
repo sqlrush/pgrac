@@ -181,4 +181,29 @@ extern bool cluster_smgr_user_relations;
 extern int cluster_shmem_max_regions;
 
 
+/* ----------
+ * cluster.phase{1..4}_timeout (Stage 1.10, spec-1.10 §2.2)
+ *
+ *	Per-phase wall-clock deadlines (seconds) for postmaster startup
+ *	phase machinery.  Exceeding the deadline triggers ereport(FATAL,
+ *	errcode PGRAC_E_PHASE_TRANSITION_TIMEOUT) so postmaster startup
+ *	fails cleanly (HC4 user 修订 4).  Default values match
+ *	background-process-design.md §4.3 (60 / 30 / 600 / 30 seconds).
+ *
+ *	Stage 1.10 stub handlers do not naturally trigger timeouts; the
+ *	cluster-startup-phase-N-enter inject point + sleep fault
+ *	simulates a stuck phase for regression coverage (060 L9b).
+ *	Real timeout enforcement activates in 1.11+ when phase handlers
+ *	have actual work that can hang.
+ *
+ *	context:      PGC_POSTMASTER (read once when postmaster init runs
+ *	              the phase driver; child backends inherit via fork).
+ * ----------
+ */
+extern int cluster_phase1_timeout;
+extern int cluster_phase2_timeout;
+extern int cluster_phase3_timeout;
+extern int cluster_phase4_timeout;
+
+
 #endif /* CLUSTER_GUC_H */

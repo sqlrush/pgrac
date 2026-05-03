@@ -117,23 +117,24 @@ is($node->get_cluster_state_value('ic', 'active_tier_name'),
 
 
 # ----------
-# Test 8: All 28 injection points appear with .fault_type / .hits keys
-# (after stage-1.7 PCM lock framework: 6 baseline + 8 sweep + 3 shared_fs
-# + 3 cluster_smgr + 4 shmem registry + 4 PCM lock = 28).
+# Test 8: All 45 injection points appear with .fault_type / .hits keys
+# (after stage-1.10 startup phase machinery: 6 baseline + 8 sweep + 3
+# shared_fs + 3 cluster_smgr + 4 shmem registry + 4 PCM lock + 17
+# startup phase = 45).
 # ----------
 is( $node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='inject' AND key LIKE '%.fault_type'}),
-	'28',
-	'all 28 injection points have a .fault_type entry under inject category');
+	'45',
+	'all 45 injection points have a .fault_type entry under inject category');
 
 is( $node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='inject' AND key LIKE '%.hits'}),
-	'28',
-	'all 28 injection points have a .hits entry under inject category');
+	'45',
+	'all 45 injection points have a .hits entry under inject category');
 
 
 # ----------
@@ -159,8 +160,8 @@ like($phase, qr/^(init|running|shutdown|\(unset\))$/,
 # ----------
 is( $node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'51',
-	'pg_stat_cluster_wait_events still 51 rows after 0.29');
+	'56',
+	'pg_stat_cluster_wait_events 56 rows (51 from stage 0/1.1 + 5 from stage 1.10 startup phase)');
 
 $node->stop;
 

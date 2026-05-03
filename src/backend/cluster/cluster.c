@@ -76,7 +76,23 @@ cluster_init(void)
 {
 	CLUSTER_INJECTION_POINT("cluster-init-top");
 
-	cluster_phase = "init";
+	/*
+	 * PGRAC: spec-1.10 (2026-05-03) — cluster_init is the logical
+	 * Phase 0 (pre-shmem-ready) entry helper.  It does NOT mutate
+	 * cluster_phase directly (HC2 SSOT: only cluster_advance_phase()
+	 * in cluster_startup_phase.c is permitted to update the legacy
+	 * mirror).  Phase 0 transition itself happens later in
+	 * PostmasterMain when cluster_run_startup_sequence() advances
+	 * from PRE_INIT into CLUSTER_PHASE_0_BASE; cluster_phase mirror
+	 * flips to "phase0_base" then.
+	 *
+	 * Note: cluster_init() is invoked by process_shared_preload_libraries
+	 * (miscinit.c), which runs both in PostmasterMain AND in
+	 * SubPostmasterMain (EXEC_BACKEND children).  For HC1
+	 * compliance, cluster_init must NOT call cluster_advance_phase()
+	 * (which is postmaster-only); the actual phase advance is
+	 * orchestrated in PostmasterMain only.
+	 */
 	CLUSTER_LOG(DEBUG1, "cluster_init: registering cluster shmem regions");
 
 	/*
@@ -112,7 +128,16 @@ cluster_shutdown(void)
 {
 	CLUSTER_INJECTION_POINT("cluster-shutdown-top");
 
-	cluster_phase = "shutdown";
+	/*
+	 * PGRAC: spec-1.10 (2026-05-03) — direct cluster_phase assignment
+	 * removed (HC2 SSOT: only cluster_advance_phase() updates the
+	 * legacy mirror).  Real shutdown phase transition happens via
+	 * cluster_run_shutdown_sequence() (cluster_startup_phase.c) when
+	 * postmaster shutdown is wired up by 1.10 D4 PostmasterMain
+	 * PGRAC MODIFICATIONS.  This function remains a stub callable
+	 * by tests; the phase transition itself goes through the
+	 * authoritative path.
+	 */
 	CLUSTER_LOG(DEBUG1, "cluster_shutdown: stub, no-op in stage 0.9");
 }
 

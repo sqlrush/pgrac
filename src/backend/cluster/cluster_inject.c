@@ -128,6 +128,34 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	{ .name = "cluster-pcm-convert-pre" },
 	{ .name = "cluster-pcm-downgrade-pre" },
 	{ .name = "cluster-pcm-release-pre" },
+
+	/*
+	 * Stage 1.10 cluster startup phase machinery (17 entries; spec-1.10
+	 * §2.5).  Per phase 0/1/2/3/4 three points: -enter / -exit / -fail
+	 * (15 phase-specific) plus driver-top entries cluster-run-startup-
+	 * top + cluster-run-shutdown-top (2 driver-level).  Symmetric layout
+	 * lets 1.11-1.14 real handlers + Stage 4 recovery + Stage 6 reconfig
+	 * arm faults at any granularity without re-amending the injection
+	 * registry.  HC4: -enter + sleep fault simulates a stuck phase to
+	 * verify cluster.phase{N}_timeout enforcement.
+	 */
+	{ .name = "cluster-run-shutdown-top" },
+	{ .name = "cluster-run-startup-top" },
+	{ .name = "cluster-startup-phase-0-enter" },
+	{ .name = "cluster-startup-phase-0-exit" },
+	{ .name = "cluster-startup-phase-0-fail" },
+	{ .name = "cluster-startup-phase-1-enter" },
+	{ .name = "cluster-startup-phase-1-exit" },
+	{ .name = "cluster-startup-phase-1-fail" },
+	{ .name = "cluster-startup-phase-2-enter" },
+	{ .name = "cluster-startup-phase-2-exit" },
+	{ .name = "cluster-startup-phase-2-fail" },
+	{ .name = "cluster-startup-phase-3-enter" },
+	{ .name = "cluster-startup-phase-3-exit" },
+	{ .name = "cluster-startup-phase-3-fail" },
+	{ .name = "cluster-startup-phase-4-enter" },
+	{ .name = "cluster-startup-phase-4-exit" },
+	{ .name = "cluster-startup-phase-4-fail" },
 };
 
 #define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_points)

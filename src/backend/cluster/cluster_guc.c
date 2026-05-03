@@ -61,6 +61,19 @@ int cluster_shared_storage_backend = CLUSTER_SHARED_FS_BACKEND_STUB;
 bool cluster_smgr_user_relations = false;
 int cluster_shmem_max_regions = 64;
 
+/*
+ * Spec-1.10 (2026-05-03) phase transition timeouts (HC4 user 修订 4).
+ * Per-phase deadlines in seconds; defaults match background-process-
+ * design.md §4.3.  Stage 1.10 stub handlers don't naturally trigger
+ * timeouts (they return immediately); the cluster-startup-phase-N-enter
+ * inject point + sleep fault simulates a stuck phase for regression
+ * coverage.  Stage 1.11+ real handlers consult these GUCs.
+ */
+int cluster_phase1_timeout = 60;
+int cluster_phase2_timeout = 30;
+int cluster_phase3_timeout = 600;
+int cluster_phase4_timeout = 30;
+
 
 /*
  * Mapping from the cluster.interconnect_tier GUC enum string to the
@@ -297,4 +310,52 @@ cluster_init_guc(void)
 							NULL,			/* check_hook */
 							NULL,			/* assign_hook */
 							NULL);			/* show_hook */
+
+	/* ----------
+	 * Stage 1.10 (2026-05-03) — postmaster startup phase transition
+	 * timeouts (HC4 user 修订 4).  Per background-process-design.md
+	 * §4.3.  Stage 1.10 stub handlers don't naturally trigger
+	 * timeouts; cluster-startup-phase-N-enter inject point + sleep
+	 * fault simulates a stuck phase for regression coverage.  Real
+	 * timeout enforcement activates in 1.11+ when phase handlers
+	 * have actual work that can hang.
+	 *
+	 *	Spec: spec-1.10-postmaster-startup-phase-skeleton.md §2.2 GUC table.
+	 * ----------
+	 */
+	DefineCustomIntVariable("cluster.phase1_timeout",
+							gettext_noop("Phase 1 (cluster basics) transition timeout in seconds."),
+							gettext_noop("Maximum wall-clock time for Phase 1 handler "
+										 "(interconnect listener / heartbeat / LMON join).  "
+										 "Exceeding this triggers ereport(FATAL, errcode "
+										 "PGRAC_E_PHASE_TRANSITION_TIMEOUT) so postmaster "
+										 "startup fails cleanly.  Default matches background-"
+										 "process-design.md §4.3."),
+							&cluster_phase1_timeout, 60, 1, 3600, PGC_POSTMASTER, GUC_UNIT_S, NULL,
+							NULL, NULL);
+
+	DefineCustomIntVariable("cluster.phase2_timeout",
+							gettext_noop("Phase 2 (lock services) transition timeout in seconds."),
+							gettext_noop("Maximum wall-clock time for Phase 2 handler "
+										 "(LMS / LMD / LCK spawn).  Exceeding this triggers "
+										 "ereport(FATAL, PGRAC_E_PHASE_TRANSITION_TIMEOUT)."),
+							&cluster_phase2_timeout, 30, 1, 3600, PGC_POSTMASTER, GUC_UNIT_S, NULL,
+							NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.phase3_timeout", gettext_noop("Phase 3 (recovery) transition timeout in seconds."),
+		gettext_noop("Maximum wall-clock time for Phase 3 handler "
+					 "(crash recovery / Recovery Coordinator / merged "
+					 "recovery).  Exceeding this triggers ereport(FATAL, "
+					 "PGRAC_E_PHASE_TRANSITION_TIMEOUT)."),
+		&cluster_phase3_timeout, 600, 60, 3600, PGC_POSTMASTER, GUC_UNIT_S, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("cluster.phase4_timeout",
+							gettext_noop("Phase 4 (normal startup) transition timeout in seconds."),
+							gettext_noop("Maximum wall-clock time for Phase 4 handler "
+										 "(walwriter / bgwriter / DIAG / Cluster Stats "
+										 "spawn).  Exceeding this triggers ereport(FATAL, "
+										 "PGRAC_E_PHASE_TRANSITION_TIMEOUT)."),
+							&cluster_phase4_timeout, 30, 1, 3600, PGC_POSTMASTER, GUC_UNIT_S, NULL,
+							NULL, NULL);
 }

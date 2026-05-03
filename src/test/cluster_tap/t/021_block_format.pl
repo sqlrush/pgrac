@@ -177,7 +177,7 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '28',
+   '45',
    'L11 pg_stat_cluster_injections is 28 (1.4 adds no new injection points; 4 PCM added by 1.7)');
 
 
@@ -188,7 +188,7 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-   '51',
+   '56',
    'L12 pg_stat_cluster_wait_events still 51 rows after 1.4');
 
 

@@ -212,13 +212,14 @@ UT_TEST(test_cluster_init_guc_symbol_is_linkable)
 UT_TEST(test_cluster_phase_remains_plain_global)
 {
 	/*
-	 * cluster_phase is a lifecycle-state pointer set by cluster code
-	 * (cluster_init / cluster_shutdown), not a user-facing GUC.  At
-	 * link time it must still resolve (cluster_elog.o still owns it);
-	 * the boot value is the literal "init" set in cluster_elog.c.
+	 * cluster_phase is a lifecycle-state pointer, not a user-facing
+	 * GUC.  Spec-1.10 (HC2) made it a read-only derived mirror of the
+	 * ClusterStartupPhase enum, written ONLY by cluster_advance_phase()
+	 * in cluster_startup_phase.c.  The boot value is the literal
+	 * "pre_init" set in cluster_elog.c (matches CLUSTER_PHASE_PRE_INIT).
 	 */
 	UT_ASSERT_NOT_NULL(cluster_phase);
-	UT_ASSERT_STR_EQ(cluster_phase, "init");
+	UT_ASSERT_STR_EQ(cluster_phase, "pre_init");
 }
 
 

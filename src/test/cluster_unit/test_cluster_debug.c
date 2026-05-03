@@ -252,6 +252,67 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 	abort();
 }
 
+/*
+ * Spec-1.10 stubs needed because cluster_debug.o now pulls in
+ * cluster_startup_phase.o (D6 dump_phase emits 4 new keys backed by
+ * cluster_phase_started_at / cluster_phase_elapsed_seconds /
+ * cluster_phase_history_format), which transitively references
+ * GetCurrentTimestamp + TimestampDifference + timestamptz_to_str +
+ * IsUnderPostmaster.  The unit test never invokes the dump path so
+ * these are address-only -- harmless to stub to no-ops.
+ */
+bool IsUnderPostmaster = false;
+
+TimestampTz
+GetCurrentTimestamp(void)
+{
+	return 0;
+}
+
+void
+TimestampDifference(TimestampTz start_time pg_attribute_unused(),
+					TimestampTz stop_time pg_attribute_unused(), long *secs, int *microsecs)
+{
+	*secs = 0;
+	*microsecs = 0;
+}
+
+const char *
+timestamptz_to_str(TimestampTz dt pg_attribute_unused())
+{
+	return "(stub)";
+}
+
+int
+errdetail(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+int
+errmsg_internal(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+/*
+ * pg_snprintf stub: cluster_startup_phase.c uses snprintf which is
+ * macro'd to pg_snprintf in PG.  Forward to libc snprintf in unit
+ * test.  Variadic forwarding via vsnprintf.
+ */
+#include <stdarg.h>
+int
+pg_snprintf(char *str, size_t count, const char *fmt, ...)
+{
+	int n;
+	va_list ap;
+
+	va_start(ap, fmt);
+	n = vsnprintf(str, count, fmt, ap);
+	va_end(ap);
+	return n;
+}
+
 bool
 errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
 {

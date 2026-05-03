@@ -66,6 +66,7 @@ static const char *pgstat_get_wait_cluster_interconnect(WaitEventCluster w);
 static const char *pgstat_get_wait_cluster_undo(WaitEventCluster w);
 static const char *pgstat_get_wait_cluster_adg(WaitEventCluster w);
 static const char *pgstat_get_wait_cluster_sharedfs(WaitEventCluster w);
+static const char *pgstat_get_wait_cluster_startup_phase(WaitEventCluster w);
 
 
 static uint32 local_my_wait_event_info;
@@ -178,6 +179,9 @@ pgstat_get_wait_event_type(uint32 wait_event_info)
 			break;
 		case PG_WAIT_CLUSTER_SHAREDFS:
 			event_type = "Cluster: SharedFs";
+			break;
+		case PG_WAIT_CLUSTER_STARTUP_PHASE:
+			event_type = "Cluster: StartupPhase";
 			break;
 		default:
 			event_type = "???";
@@ -299,6 +303,10 @@ pgstat_get_wait_event(uint32 wait_event_info)
 			break;
 		case PG_WAIT_CLUSTER_SHAREDFS:
 			event_name = pgstat_get_wait_cluster_sharedfs(
+				(WaitEventCluster) wait_event_info);
+			break;
+		case PG_WAIT_CLUSTER_STARTUP_PHASE:
+			event_name = pgstat_get_wait_cluster_startup_phase(
 				(WaitEventCluster) wait_event_info);
 			break;
 		default:
@@ -1191,6 +1199,36 @@ pgstat_get_wait_cluster_sharedfs(WaitEventCluster w)
 			break;
 		case WAIT_EVENT_CLUSTER_SHARED_FS_FSYNC:
 			event_name = "ClusterSharedFsFsync";
+			break;
+		default:
+			break;
+	}
+
+	return event_name;
+}
+
+/* PGRAC: spec-1.10 (2026-05-03) cluster startup phase wait events. */
+static const char *
+pgstat_get_wait_cluster_startup_phase(WaitEventCluster w)
+{
+	const char *event_name = "unknown wait event";
+
+	switch (w)
+	{
+		case WAIT_EVENT_CLUSTER_STARTUP_PHASE_0:
+			event_name = "ClusterStartupPhase0Wait";
+			break;
+		case WAIT_EVENT_CLUSTER_STARTUP_PHASE_1:
+			event_name = "ClusterStartupPhase1Wait";
+			break;
+		case WAIT_EVENT_CLUSTER_STARTUP_PHASE_2:
+			event_name = "ClusterStartupPhase2Wait";
+			break;
+		case WAIT_EVENT_CLUSTER_STARTUP_PHASE_3:
+			event_name = "ClusterStartupPhase3Wait";
+			break;
+		case WAIT_EVENT_CLUSTER_STARTUP_PHASE_4:
+			event_name = "ClusterStartupPhase4Wait";
 			break;
 		default:
 			break;

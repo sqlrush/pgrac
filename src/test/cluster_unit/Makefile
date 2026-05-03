@@ -32,7 +32,8 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_ic_mock test_cluster_inject test_cluster_pgstat \
         test_cluster_debug test_cluster_shared_fs test_cluster_smgr \
         test_cluster_scn test_cluster_block_format test_cluster_itl_slot \
-        test_cluster_buffer_desc test_cluster_pcm_lock
+        test_cluster_buffer_desc test_cluster_pcm_lock \
+        test_cluster_startup_phase
 
 # Path to the cluster_version object (no PG deps, safe to link standalone).
 CLUSTER_VERSION_O = $(top_builddir)/src/backend/cluster/cluster_version.o
@@ -64,6 +65,7 @@ CLUSTER_SHARED_FS_O = $(top_builddir)/src/backend/cluster/storage/cluster_shared
 CLUSTER_SHARED_FS_STUB_O = $(top_builddir)/src/backend/cluster/storage/cluster_shared_fs_stub.o
 CLUSTER_SHARED_FS_LOCAL_O = $(top_builddir)/src/backend/cluster/storage/cluster_shared_fs_local.o
 CLUSTER_SMGR_O = $(top_builddir)/src/backend/cluster/storage/cluster_smgr.o
+CLUSTER_STARTUP_PHASE_O = $(top_builddir)/src/backend/cluster/cluster_startup_phase.o
 
 # Most tests link only cluster_version.o.  test_cluster_guc /
 # test_cluster_shmem / test_cluster_signal / test_cluster_views /
@@ -71,7 +73,7 @@ CLUSTER_SMGR_O = $(top_builddir)/src/backend/cluster/storage/cluster_smgr.o
 # separate rules because they also link additional cluster_*.o
 # objects (the test files stub the PG backend symbols those
 # objects reference).
-SIMPLE_TESTS = $(filter-out test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf test_cluster_ic_mock test_cluster_inject test_cluster_pgstat test_cluster_debug test_cluster_shared_fs test_cluster_smgr,$(TESTS))
+SIMPLE_TESTS = $(filter-out test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf test_cluster_ic_mock test_cluster_inject test_cluster_pgstat test_cluster_debug test_cluster_shared_fs test_cluster_smgr test_cluster_startup_phase,$(TESTS))
 
 $(SIMPLE_TESTS): %: %.c unit_test.h $(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) -o $@
@@ -176,9 +178,9 @@ test_cluster_pgstat: test_cluster_pgstat.c unit_test.h $(CLUSTER_VERSION_O) \
 # (out-of-range index returns false; NULL out-pointers do not crash).
 # End-to-end behaviour is covered by cluster_tap t/017_debug.pl.
 test_cluster_debug: test_cluster_debug.c unit_test.h $(CLUSTER_VERSION_O) \
-		$(CLUSTER_DEBUG_O)
+		$(CLUSTER_DEBUG_O) $(CLUSTER_STARTUP_PHASE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_VERSION_O) $(CLUSTER_DEBUG_O) -o $@
+		$(CLUSTER_VERSION_O) $(CLUSTER_DEBUG_O) $(CLUSTER_STARTUP_PHASE_O) -o $@
 
 # test_cluster_shared_fs links the three storage/ objects standalone:
 # cluster_shared_fs.o (registry + dispatch), cluster_shared_fs_stub.o
@@ -212,6 +214,19 @@ test_cluster_smgr: test_cluster_smgr.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_SMGR_O) \
 		$(CLUSTER_SHARED_FS_O) $(CLUSTER_SHARED_FS_STUB_O) \
 		$(CLUSTER_SHARED_FS_LOCAL_O) -o $@
+
+# test_cluster_startup_phase links cluster_startup_phase.o standalone.
+# cluster_startup_phase.c references ereport / GetCurrentTimestamp /
+# timestamptz_to_str / cluster_phase legacy mirror / IsUnderPostmaster
+# / cluster_inject.  The test stubs every one because the unit test
+# only takes function addresses + exercises pure-function string
+# lookups; behavior tests (transition rejection, Postmaster-once
+# Assert) live in TAP t/060_postmaster_phases.pl where postmaster
+# orchestration is real.
+test_cluster_startup_phase: test_cluster_startup_phase.c unit_test.h \
+		$(CLUSTER_VERSION_O) $(CLUSTER_STARTUP_PHASE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_STARTUP_PHASE_O) -o $@
 
 
 # ----------

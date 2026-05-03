@@ -146,7 +146,7 @@ ok($phase_val =~ /^(init|running|shutdown|reconfig)$/,
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'51', 'E1 pg_stat_cluster_wait_events returns 51 rows');
+	'56', 'E1 pg_stat_cluster_wait_events returns 56 rows (51 from stage 0/1.1 + 5 from stage 1.10 startup phase)');
 
 ok($node->safe_psql('postgres',
 		q{SELECT count(*) > 0 FROM pg_stat_cluster_wait_events WHERE type='Cluster: GES'})
@@ -158,7 +158,7 @@ ok($node->safe_psql('postgres',
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_gcluster_wait_events'),
-	'51', 'E4 pg_stat_gcluster_wait_events returns 51 rows (single-node)');
+	'56', 'E4 pg_stat_gcluster_wait_events returns 56 rows (single-node, 51 + 5 stage-1.10 startup phase)');
 
 
 # ============================================================
@@ -219,7 +219,7 @@ ok($node->safe_psql('postgres',
 
 is($node->safe_psql('postgres',
 		q{SELECT count(DISTINCT type) FROM pg_stat_cluster_wait_events}),
-	'11', 'I1 wait_events has exactly 11 distinct types (10 from stage 0 + SharedFs from stage 1.1)');
+	'12', 'I1 wait_events has exactly 12 distinct types (10 from stage 0 + SharedFs from stage 1.1 + StartupPhase from stage 1.10)');
 
 ok($node->safe_psql('postgres',
 		q{SELECT count(*) > 0 FROM pg_stat_gcluster_wait_events WHERE node_id IS NOT NULL})
@@ -302,7 +302,7 @@ ok(defined $postgres_bin && -x $postgres_bin,
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-	'28', 'M1 28 injection points (6 baseline + 8 stage-0.30 sweep + 3 stage-1.1 shared_fs + 3 stage-1.2 smgr + 4 stage-1.3 shmem registry + 4 stage-1.7 pcm lock)');
+	'45', 'M1 45 injection points (6 baseline + 8 stage-0.30 sweep + 3 stage-1.1 shared_fs + 3 stage-1.2 smgr + 4 stage-1.3 shmem registry + 4 stage-1.7 pcm lock + 17 stage-1.10 startup phase machinery)');
 
 is($node->safe_psql('postgres',
 		q{SELECT string_agg(name, ',' ORDER BY name) FROM pg_stat_cluster_injections WHERE name LIKE 'cluster-init-%'}),
@@ -332,8 +332,8 @@ ok( $node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT key) FROM pg_cluster_state
 		   WHERE category='inject' AND (key LIKE '%.fault_type' OR key LIKE '%.hits')}
-	) eq '56',
-	'M5 inject category has 28×2 = 56 sub-keys (.fault_type + .hits) after 1.7');
+	) eq '90',
+	'M5 inject category has 45×2 = 90 sub-keys (.fault_type + .hits) after 1.10');
 
 is($node->get_cluster_state_value('inject', 'armed_count'),
 	'0', 'M6 inject.armed_count starts at 0 in fresh backend');
@@ -548,6 +548,41 @@ ok( $r1_active > 0,
 );
 
 $node->safe_psql('postgres', 'DROP TABLE r1_smoke');
+
+
+# ============================================================
+# §S  postmaster startup phase machinery (stage 1.10) -- spec-1.10
+#     acceptance (3 tests)
+# ============================================================
+
+# S1: phase enum 8 values + 5 keys exposed via pg_cluster_state.phase.
+# Comprehensive matrix (L1-L12) lives in t/060_postmaster_phases.pl;
+# 030 captures the milestone-level invariant that phase machinery
+# completes startup and exposes the 5 spec-1.10 keys.
+is($node->safe_psql(
+		'postgres',
+		"SELECT count(*) FROM pg_cluster_state WHERE category = 'phase'"),
+   '5',
+   'S1 stage-1.10 milestone: pg_cluster_state.phase has 5 keys (cluster_phase + phase_enum_value + phase_started_at + phase_elapsed_seconds + phase_history)');
+
+# S2: cluster_current_phase() = CLUSTER_PHASE_RUNNING (=6) after
+# postmaster completes Phase 0 -> RUNNING sequence.
+is($node->safe_psql(
+		'postgres',
+		"SELECT value FROM pg_cluster_state WHERE category = 'phase' AND key = 'phase_enum_value'"),
+   '6',
+   'S2 stage-1.10 milestone: phase_enum_value = 6 (CLUSTER_PHASE_RUNNING) after normal startup completes');
+
+# S3: phase_history ring contains entries from the startup sequence
+# (HC5 fixed-size ring at 8 entries; user 修订 5).  We don't pin the
+# exact format but verify the ring is non-empty and contains the
+# canonical "running" final state.
+my $history = $node->safe_psql(
+	'postgres',
+	"SELECT value FROM pg_cluster_state WHERE category = 'phase' AND key = 'phase_history'"
+);
+like($history, qr/running@/,
+   'S3 stage-1.10 milestone: phase_history ring records the running entry (HC5 fixed-size ring active)');
 
 
 $node->stop;

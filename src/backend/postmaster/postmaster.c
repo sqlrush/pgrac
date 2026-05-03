@@ -43,7 +43,7 @@
  *
  * PGRAC MODIFICATIONS
  *	  Modified by: SqlRush <sqlrush@gmail.com>
- *	  Stages:       0.13, 0.14
+ *	  Stages:       0.13, 0.14, 1.10
  *
  *	  Added a comment in PostmasterMain explaining where pgrac cluster
  *	  initialization happens.  Call sites live in miscinit.c because PG
@@ -55,11 +55,25 @@
  *	  This file records the cross-reference so a developer reading
  *	  PostmasterMain finds the explanation in context.
  *
+ *	  Stage 1.10 (2026-05-03) — postmaster startup phase machinery:
+ *	    cluster_run_startup_sequence() is invoked from PostmasterMain
+ *	    function body AFTER CreateSharedMemoryAndSemaphores() returns.
+ *	    HC1 hard constraint (spec-1.10 §1.5): the call must NOT be
+ *	    placed inside CreateSharedMemoryAndSemaphores() because that
+ *	    function is also invoked by SubPostmasterMain on EXEC_BACKEND
+ *	    children -- running phase machinery there would violate
+ *	    Postmaster-once semantics (CLAUDE.md rule 16 §Postmaster-once,
+ *	    2026-05-03).  The call site here is in PostmasterMain only;
+ *	    cluster_run_startup_sequence() also Asserts !IsUnderPostmaster
+ *	    as a defense in depth.
+ *
  *	  Related design:
  *	    docs/cluster-guc-design.md v1.1 §2 (GUC entry-point policy)
  *	    docs/cluster-shmem-design.md v1.0 §2.1 (shmem entry-point policy)
+ *	    docs/postmaster-startup-phase-design.md v1.0 (1.10 phase machinery)
  *	    specs/spec-0.13-guc-framework.md
  *	    specs/spec-0.14-shmem-framework.md
+ *	    specs/spec-1.10-postmaster-startup-phase-skeleton.md
  *
  *-------------------------------------------------------------------------
  *
@@ -154,6 +168,16 @@
 #include "utils/timeout.h"
 #include "utils/timestamp.h"
 #include "utils/varlena.h"
+
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * PGRAC: spec-1.10 (2026-05-03) cluster startup phase machinery.
+ * cluster_run_startup_sequence() is called from PostmasterMain after
+ * CreateSharedMemoryAndSemaphores() returns; see PGRAC MODIFICATIONS
+ * banner above for the HC1 rationale.
+ */
+#include "cluster/cluster_startup_phase.h"
+#endif
 
 #ifdef EXEC_BACKEND
 #include "storage/spin.h"
@@ -1103,6 +1127,27 @@ PostmasterMain(int argc, char *argv[])
 	 * clean up dead IPC objects if the postmaster crashes and is restarted.
 	 */
 	CreateSharedMemoryAndSemaphores();
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: spec-1.10 (2026-05-03) — drive postmaster startup phase
+	 * machinery (Phase 0 -> 1 -> 2 -> 3 -> 4 -> RUNNING).
+	 *
+	 * HC1 (spec-1.10 §1.5 + CLAUDE.md rule 16 §Postmaster-once): this
+	 * call MUST live in PostmasterMain only, NOT inside
+	 * CreateSharedMemoryAndSemaphores() or any function that
+	 * SubPostmasterMain also invokes on EXEC_BACKEND children.
+	 * cluster_run_startup_sequence() Asserts !IsUnderPostmaster as
+	 * defense in depth.
+	 *
+	 * Stage 1.10 skeleton: Phase 1-3 handlers are no-op stubs;
+	 * Phase 4 delegates to PG's existing walwriter / bgwriter /
+	 * checkpointer / autovacuum spawn paths further below in this
+	 * function.  Stage 1.11-1.14 / Stage 2-4 replace handler bodies
+	 * without changing the driver loop or this call site.
+	 */
+	cluster_run_startup_sequence();
+#endif
 
 	/*
 	 * Estimate number of openable files.  This must happen after setting up

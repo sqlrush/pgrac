@@ -46,13 +46,25 @@
 /*
  * Lifecycle phase tag.
  *
- * Conventional values:
- *   "init"     - initialisation in progress (default at process start)
- *   "running"  - normal steady-state
- *   "shutdown" - shutdown in progress
- *   "reconfig" - cluster reconfiguration in progress
+ *	HC2 (spec-1.10 §1.5): this is a read-only DERIVED MIRROR of the
+ *	authoritative ClusterStartupPhase enum maintained in
+ *	cluster_startup_phase.c.  The ONLY writer is cluster_advance_phase()
+ *	(spec-1.10 D2).  External callers MUST NOT assign cluster_phase
+ *	directly -- it would diverge from the enum SSOT.
  *
- * Callers update this directly; CLUSTER_LOG dereferences it on every
- * log line.  NULL is tolerated by the macro and rendered as "(unset)".
+ *	Initial value "pre_init" matches CLUSTER_PHASE_PRE_INIT (the enum
+ *	default at process start, before cluster_run_startup_sequence()
+ *	advances into CLUSTER_PHASE_0_BASE in PostmasterMain).
+ *
+ *	CLUSTER_LOG dereferences this string on every log line; the
+ *	cluster_advance_phase() updater simply swaps the pointer to point
+ *	at one of the static const strings owned by cluster_startup_phase.c.
+ *	No locking is required: postmaster startup is single-threaded, and
+ *	child backends inherit the snapshot at fork() time without
+ *	mutating it.
+ *
+ *	NULL is tolerated by the macro and rendered as "(unset)" for
+ *	backward compatibility, even though we now always keep a non-NULL
+ *	value.
  */
-const char *cluster_phase = "init";
+const char *cluster_phase = "pre_init";

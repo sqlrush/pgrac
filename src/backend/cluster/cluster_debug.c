@@ -74,11 +74,12 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_elog.h" /* cluster_phase */
 #include "cluster/cluster_guc.h"
-#include "cluster/cluster_ic.h"			 /* ClusterICOps_Active, ClusterICTier */
-#include "cluster/cluster_scn.h"		 /* SCN typedef (stage 1.4) */
-#include "cluster/cluster_itl_slot.h"	 /* CLUSTER_ITL_* constants (stage 1.5) */
-#include "cluster/cluster_buffer_desc.h" /* BufferType / PcmState enums (stage 1.6) */
-#include "cluster/cluster_pcm_lock.h"	 /* PCM stub API + grd helpers (stage 1.7) */
+#include "cluster/cluster_ic.h"			   /* ClusterICOps_Active, ClusterICTier */
+#include "cluster/cluster_scn.h"		   /* SCN typedef (stage 1.4) */
+#include "cluster/cluster_itl_slot.h"	   /* CLUSTER_ITL_* constants (stage 1.5) */
+#include "cluster/cluster_buffer_desc.h"   /* BufferType / PcmState enums (stage 1.6) */
+#include "cluster/cluster_pcm_lock.h"	   /* PCM stub API + grd helpers (stage 1.7) */
+#include "cluster/cluster_startup_phase.h" /* phase enum + accessors (stage 1.10) */
 #include "storage/bufpage.h"	   /* PG_PAGE_LAYOUT_VERSION, SizeOfPageHeaderData (stage 1.4) */
 #include "storage/buf_internals.h" /* BufferDesc layout (stage 1.6) */
 #include "cluster/cluster_pgstat.h"
@@ -350,7 +351,34 @@ dump_conf(ReturnSetInfo *rsinfo)
 static void
 dump_phase(ReturnSetInfo *rsinfo)
 {
+	ClusterStartupPhase current = cluster_current_phase();
+	TimestampTz started = cluster_phase_started_at(current);
+	char history_buf[1024];
+
+	/*
+	 * cluster_phase legacy mirror -- HC2 derived mirror, single-writer
+	 * is cluster_advance_phase() (cluster_startup_phase.c).
+	 */
 	emit_row(rsinfo, "phase", "cluster_phase", str_or_default(cluster_phase, "(unset)"));
+
+	/*
+	 * Spec-1.10 (2026-05-03) phase 4 new keys (HC5 fixed-size ring on
+	 * phase_history; user 修订 5).
+	 */
+	emit_row(rsinfo, "phase", "phase_enum_value", fmt_int32((int32)current));
+
+	if (started == 0) {
+		emit_row(rsinfo, "phase", "phase_started_at", "(unset)");
+		emit_row(rsinfo, "phase", "phase_elapsed_seconds", fmt_int64(0));
+	} else {
+		emit_row(rsinfo, "phase", "phase_started_at", pstrdup(timestamptz_to_str(started)));
+		emit_row(rsinfo, "phase", "phase_elapsed_seconds",
+				 fmt_int64(cluster_phase_elapsed_seconds()));
+	}
+
+	cluster_phase_history_format(history_buf, sizeof(history_buf));
+	emit_row(rsinfo, "phase", "phase_history",
+			 pstrdup(history_buf[0] != '\0' ? history_buf : "(empty)"));
 }
 
 /*
