@@ -1,0 +1,6 @@
+# Generated test binaries (PGRAC stage 1.11 Sprint B follow-up cleanup)
+test_cluster_*
+!test_cluster_*.c
+!test_cluster_*.h
+!*.dSYM
+*.dSYM/

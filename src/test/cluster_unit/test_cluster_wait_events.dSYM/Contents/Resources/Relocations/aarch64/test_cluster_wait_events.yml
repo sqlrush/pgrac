@@ -1,5 +1,0 @@
----
-triple:          'arm64-apple-darwin'
-binary-path:     test_cluster_wait_events
-relocations:     []
-...
