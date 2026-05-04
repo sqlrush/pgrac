@@ -256,6 +256,84 @@ cluster_lmon_status(void)
 }
 
 
+/*
+ * Spec-1.11.1 F11 (codex round 4 P2 fix): LW_SHARED accessors for the
+ * 5 lmon_* fields that Sprint B D12 left out of the view.  Each
+ * acquires the per-region lwlock briefly and copies one scalar out;
+ * call from any backend context.
+ */
+
+pid_t
+cluster_lmon_pid(void)
+{
+	pid_t result;
+
+	if (cluster_lmon_state == NULL)
+		return 0;
+
+	LWLockAcquire(&cluster_lmon_state->lwlock, LW_SHARED);
+	result = cluster_lmon_state->pid;
+	LWLockRelease(&cluster_lmon_state->lwlock);
+	return result;
+}
+
+TimestampTz
+cluster_lmon_spawned_at(void)
+{
+	TimestampTz result;
+
+	if (cluster_lmon_state == NULL)
+		return 0;
+
+	LWLockAcquire(&cluster_lmon_state->lwlock, LW_SHARED);
+	result = cluster_lmon_state->spawned_at;
+	LWLockRelease(&cluster_lmon_state->lwlock);
+	return result;
+}
+
+TimestampTz
+cluster_lmon_ready_at(void)
+{
+	TimestampTz result;
+
+	if (cluster_lmon_state == NULL)
+		return 0;
+
+	LWLockAcquire(&cluster_lmon_state->lwlock, LW_SHARED);
+	result = cluster_lmon_state->ready_at;
+	LWLockRelease(&cluster_lmon_state->lwlock);
+	return result;
+}
+
+TimestampTz
+cluster_lmon_last_liveness_tick_at(void)
+{
+	TimestampTz result;
+
+	if (cluster_lmon_state == NULL)
+		return 0;
+
+	LWLockAcquire(&cluster_lmon_state->lwlock, LW_SHARED);
+	result = cluster_lmon_state->last_liveness_tick_at;
+	LWLockRelease(&cluster_lmon_state->lwlock);
+	return result;
+}
+
+int64
+cluster_lmon_main_loop_iters(void)
+{
+	int64 result;
+
+	if (cluster_lmon_state == NULL)
+		return 0;
+
+	LWLockAcquire(&cluster_lmon_state->lwlock, LW_SHARED);
+	result = cluster_lmon_state->main_loop_iters;
+	LWLockRelease(&cluster_lmon_state->lwlock);
+	return result;
+}
+
+
 /* ============================================================
  * LMON main entry (AuxiliaryProcessMain dispatch target).
  * ============================================================ */

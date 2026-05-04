@@ -166,6 +166,15 @@ static const uint32 cluster_wait_event_infos[CLUSTER_WAIT_EVENTS_COUNT] = {
 	WAIT_EVENT_CLUSTER_STARTUP_PHASE_2,
 	WAIT_EVENT_CLUSTER_STARTUP_PHASE_3,
 	WAIT_EVENT_CLUSTER_STARTUP_PHASE_4,
+
+	/*
+	 * Cluster: BgProc (1) -- spec-1.11 Sprint B (2026-05-04) wait
+	 * class for cluster background-process main-loop / lifecycle /
+	 * liveness waits.  Spec-1.11.1 F12: missed in original Sprint B
+	 * D11 ship; SRF row added retrospectively so LMON main loop is
+	 * SQL-visible alongside the C-level enum + name lookup.
+	 */
+	WAIT_EVENT_CLUSTER_BGPROC_LMON_MAIN_LOOP,
 };
 
 /* Compile-time assertion: array length must match the documented count. */

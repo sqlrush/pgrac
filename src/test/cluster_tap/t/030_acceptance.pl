@@ -146,7 +146,7 @@ ok($phase_val =~ /^(init|running|shutdown|reconfig)$/,
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'56', 'E1 pg_stat_cluster_wait_events returns 56 rows (51 from stage 0/1.1 + 5 from stage 1.10 startup phase)');
+	'57', 'E1 pg_stat_cluster_wait_events returns 56 rows (51 from stage 0/1.1 + 5 from stage 1.10 startup phase)');
 
 ok($node->safe_psql('postgres',
 		q{SELECT count(*) > 0 FROM pg_stat_cluster_wait_events WHERE type='Cluster: GES'})
@@ -158,7 +158,7 @@ ok($node->safe_psql('postgres',
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_gcluster_wait_events'),
-	'56', 'E4 pg_stat_gcluster_wait_events returns 56 rows (single-node, 51 + 5 stage-1.10 startup phase)');
+	'57', 'E4 pg_stat_gcluster_wait_events returns 56 rows (single-node, 51 + 5 stage-1.10 startup phase)');
 
 
 # ============================================================
@@ -219,7 +219,7 @@ ok($node->safe_psql('postgres',
 
 is($node->safe_psql('postgres',
 		q{SELECT count(DISTINCT type) FROM pg_stat_cluster_wait_events}),
-	'12', 'I1 wait_events has exactly 12 distinct types (10 from stage 0 + SharedFs from stage 1.1 + StartupPhase from stage 1.10)');
+	'13', 'I1 wait_events has exactly 13 distinct types (10 from stage 0 + SharedFs from stage 1.1 + StartupPhase from stage 1.10 + BgProc from stage 1.11 Sprint B / 1.11.1 F12)');
 
 ok($node->safe_psql('postgres',
 		q{SELECT count(*) > 0 FROM pg_stat_gcluster_wait_events WHERE node_id IS NOT NULL})

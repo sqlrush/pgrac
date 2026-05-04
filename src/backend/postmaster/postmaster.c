@@ -2999,6 +2999,18 @@ process_pm_child_exit(void)
 			pmState = PM_RUN;
 			connsAllowed = true;
 
+#ifdef USE_PGRAC_CLUSTER
+			/*
+			 * PGRAC: spec-1.11.1 F9 — advance cluster phase to RUNNING
+			 * now that pmState reflects PG-ready.  Idempotent guard
+			 * inside the helper makes this safe to call from both the
+			 * normal startup path (PostmasterMain explicitly invokes
+			 * it before ServerLoop) and the crash reinit path (here,
+			 * after the second startup process completes recovery).
+			 */
+			cluster_finalize_startup_running();
+#endif
+
 			/*
 			 * Crank up the background tasks, if we didn't do that already
 			 * when we entered consistent recovery state.  It doesn't matter
@@ -3876,6 +3888,32 @@ PostmasterStateMachine(void)
 
 		/* re-create shared memory and semaphores */
 		CreateSharedMemoryAndSemaphores();
+
+#ifdef USE_PGRAC_CLUSTER
+		/*
+		 * PGRAC: spec-1.11.1 F9 (2026-05-04 codex round 4 review fix).
+		 *
+		 *	Crash reinit must rerun cluster phase machinery: shmem_exit
+		 *	+ CreateSharedMemoryAndSemaphores reset cluster_phase_state
+		 *	to PRE_INIT, but spec-1.10 cluster_run_startup_sequence ran
+		 *	exactly once in PostmasterMain.  Without this call, after
+		 *	crash recovery pg_cluster_state.phase.cluster_phase reads
+		 *	"pre_init" while pmState reaches PM_RUN and LMON is alive
+		 *	(via the spec-1.11 Sprint B ServerLoop respawn) -- service
+		 *	state and phase view diverge (user-visible inconsistency).
+		 *
+		 *	Calling cluster_run_startup_sequence here advances Phase 0
+		 *	-> 4 freshly; phase_1_handler also re-spawns LMON, so the
+		 *	ServerLoop respawn path is bypassed for crash recovery
+		 *	(it remains the safety net for external SIGTERM-only-LMON).
+		 *	The matching cluster_finalize_startup_running call is in
+		 *	the reaper path where pmState transitions to PM_RUN, and
+		 *	is idempotent if PostmasterMain already ran it (initial
+		 *	startup sees it twice; crash recovery sees it once at the
+		 *	transition).
+		 */
+		cluster_run_startup_sequence();
+#endif
 
 		StartupPID = StartupDataBase();
 		Assert(StartupPID != 0);

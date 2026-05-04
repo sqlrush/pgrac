@@ -174,9 +174,19 @@ extern bool cluster_lmon_wait_for_ready(int timeout_ms);
 extern void cluster_lmon_request_shutdown(void);
 
 /*
- * Read-only accessor for SQL view + diagnostics.  LW_SHARED.
+ * Read-only accessors for SQL view + diagnostics.  LW_SHARED.
+ *
+ *	Spec-1.11.1 F11: Sprint B D12 only emitted lmon_status +
+ *	lmon_status_enum_value, leaving cluster.lmon_main_loop_interval
+ *	GUC unverifiable from SQL (no main_loop_iters surface).  F11
+ *	completes the 6-key view with the missing 5 accessors below.
  */
 extern ClusterLmonStatus cluster_lmon_status(void);
+extern pid_t cluster_lmon_pid(void);
+extern TimestampTz cluster_lmon_spawned_at(void);
+extern TimestampTz cluster_lmon_ready_at(void);
+extern TimestampTz cluster_lmon_last_liveness_tick_at(void);
+extern int64 cluster_lmon_main_loop_iters(void);
 
 /*
  * Status enum -> canonical lowercase string ("not_started", "spawning",

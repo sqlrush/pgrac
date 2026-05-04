@@ -400,9 +400,37 @@ static void
 dump_lmon(ReturnSetInfo *rsinfo)
 {
 	ClusterLmonStatus s = cluster_lmon_status();
+	pid_t pid;
+	TimestampTz spawned_at, ready_at, last_tick;
+	int64 iters;
 
 	emit_row(rsinfo, "lmon", "lmon_status", cluster_lmon_status_to_string(s));
 	emit_row(rsinfo, "lmon", "lmon_status_enum_value", fmt_int32((int32)s));
+
+	/*
+	 * Spec-1.11.1 F11 (codex round 4 P2 fix): emit the 5 keys Sprint B
+	 * D12 left out so cluster.lmon_main_loop_interval GUC + LMON
+	 * liveness are SQL-verifiable.  pid==0 / timestamps==0 surface as
+	 * "(unset)" to match other lifecycle keys; main_loop_iters is
+	 * always int8.
+	 */
+	pid = cluster_lmon_pid();
+	emit_row(rsinfo, "lmon", "lmon_pid", pid == 0 ? "(unset)" : fmt_int64((int64)pid));
+
+	spawned_at = cluster_lmon_spawned_at();
+	emit_row(rsinfo, "lmon", "lmon_spawned_at",
+			 spawned_at == 0 ? "(unset)" : pstrdup(timestamptz_to_str(spawned_at)));
+
+	ready_at = cluster_lmon_ready_at();
+	emit_row(rsinfo, "lmon", "lmon_ready_at",
+			 ready_at == 0 ? "(unset)" : pstrdup(timestamptz_to_str(ready_at)));
+
+	last_tick = cluster_lmon_last_liveness_tick_at();
+	emit_row(rsinfo, "lmon", "lmon_last_liveness_tick_at",
+			 last_tick == 0 ? "(unset)" : pstrdup(timestamptz_to_str(last_tick)));
+
+	iters = cluster_lmon_main_loop_iters();
+	emit_row(rsinfo, "lmon", "lmon_main_loop_iters", fmt_int64(iters));
 }
 
 /*

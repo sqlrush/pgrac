@@ -169,18 +169,20 @@ cluster_shmem_iter_regions(int *idx pg_attribute_unused(),
 UT_DEFINE_GLOBALS();
 
 
-UT_TEST(test_cluster_wait_events_count_is_56)
+UT_TEST(test_cluster_wait_events_count_is_57)
 {
 	/*
-	 * Anchored against the cumulative registration roster: 46 events
-	 * from spec-0.11 plus 5 added by spec-1.1 for cluster_shared_fs
-	 * plus 5 added by spec-1.10 for the postmaster startup phase
-	 * machinery.  If a future subsystem spec adds new cluster wait
-	 * events, both the enum in wait_event.h and CLUSTER_WAIT_EVENTS_
-	 * COUNT must move together, and this test number must be bumped
-	 * in lockstep.
+	 * Cumulative registration roster: 46 events from spec-0.11 + 5
+	 * added by spec-1.1 (cluster_shared_fs) + 5 added by spec-1.10
+	 * (startup phase machinery) + 1 added by spec-1.11.1 F12
+	 * (ClusterBgProcLmonMainLoop -- spec-1.11 Sprint B D11 added it
+	 * to the C-level enum + name lookup but missed the SRF registry;
+	 * F12 closes the gap).  If a future subsystem spec adds new
+	 * cluster wait events, both the enum in wait_event.h and
+	 * CLUSTER_WAIT_EVENTS_COUNT must move together, and this test
+	 * number must be bumped in lockstep.
 	 */
-	UT_ASSERT_EQ(CLUSTER_WAIT_EVENTS_COUNT, 56);
+	UT_ASSERT_EQ(CLUSTER_WAIT_EVENTS_COUNT, 57);
 }
 
 
@@ -217,7 +219,7 @@ int
 main(void)
 {
 	UT_PLAN(4);
-	UT_RUN(test_cluster_wait_events_count_is_56);
+	UT_RUN(test_cluster_wait_events_count_is_57);
 	UT_RUN(test_srf_symbol_linkable);
 	UT_RUN(test_first_event_is_ges_enqueue_acquire);
 	UT_RUN(test_last_event_is_adg_scn_sync_wait);

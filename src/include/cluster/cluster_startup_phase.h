@@ -114,6 +114,35 @@ typedef enum PhaseRunResult {
 
 
 /*
+ * PhaseRunFailContext (spec-1.11.1 F13 / codex round 4 P2/P3 fix):
+ *
+ *	Phase handlers used to ereport(LOG, errcode=...) their handler-
+ *	specific SQLSTATE then return PHASE_RUN_FATAL; the driver's
+ *	ereport(FATAL) then used a generic 53R09 PHASE_PRECONDITION_FAILED
+ *	-- so the user-visible FATAL exit code disagreed with the LOG
+ *	diagnostic code.  External supervisors / TAP tests parsing exit
+ *	status saw the wrong errcode.
+ *
+ *	Sprint B handlers now write into this output struct on
+ *	PHASE_RUN_FATAL: errcode (handler-specific SQLSTATE) and an
+ *	optional override errmsg.  The driver loop uses fail_ctx->errcode
+ *	(when non-zero) instead of the generic 53R09, so LMON spawn
+ *	failure -> FATAL with 53R0A (not 53R09); LMON ready timeout ->
+ *	FATAL with 53R0B; etc.  spec-1.12 LCK 53R0C / 53R0D inherit the
+ *	same path.
+ *
+ *	Handlers leave errcode = 0 if they want the driver default.
+ *	errmsg = NULL means "use the driver's default phase-failure
+ *	message"; otherwise the override is passed through (caller owns).
+ */
+typedef struct PhaseRunFailContext {
+	int errcode;		 /* handler-specific SQLSTATE; 0 = driver default 53R09 */
+	const char *errmsg;	 /* optional override; NULL = driver default */
+	const char *errhint; /* optional override; NULL = driver default */
+} PhaseRunFailContext;
+
+
+/*
  * Phase history ring size (HC5 fixed-size; user 修订 5).
  *
  *	Bounded to avoid Stage 6 reconfig phase reentry causing unbounded

@@ -442,73 +442,48 @@ cluster_advance_phase(ClusterStartupPhase target)
  * ============================================================ */
 
 static PhaseRunResult
-phase_1_handler(void)
+phase_1_handler(PhaseRunFailContext *fail_ctx)
 {
 	int lmon_pid;
 	bool ready;
 	int wait_budget_ms;
 
 	Assert(!IsUnderPostmaster);
+	Assert(fail_ctx != NULL);
 
-	/*
-	 * Stage 1.11 Sprint B HC4 闭环: cluster.enabled = false 退化为
-	 * spec-1.10 stub 行为 (no LMON spawn).  Sprint B 引入 PGC_POSTMASTER
-	 * cluster.enabled GUC; phase_1_handler 读取真实 GUC 决定是否
-	 * spawn LMON.  cluster_enabled = true (default) 保持 Sprint A
-	 * behavior; cluster_enabled = false 让 enable-cluster build 在
-	 * 运行期退化为 spec-1.10 stub (允许 PG regression / pgbench 在
-	 * cluster-built 二进制上跑而不被 cluster 控制平面打扰).
-	 *
-	 * Spec: spec-1.11-lmon-skeleton.md §1.4 4 实质 HC #2 (HC4).
-	 */
 	if (!cluster_enabled) {
 		elog(DEBUG1, "cluster phase 1: cluster.enabled=false; skipping LMON "
 					 "spawn (degraded to spec-1.10 stub behavior)");
 		return PHASE_RUN_OK;
 	}
 
-	/*
-	 * Stage 1.11 Sprint A: spawn LMON aux process and synchronously
-	 * wait for it to publish CLUSTER_LMON_READY.  Interconnect listener
-	 * and Heartbeat process remain Sprint A stubs (Stage 1.15+).
-	 *
-	 * Spec: spec-1.11-lmon-skeleton.md Sprint A D6.
-	 */
 	lmon_pid = cluster_lmon_start();
 	if (lmon_pid == 0) {
 		/*
-		 * Stage 1.11 Sprint B (spec-1.11 D9): emit dedicated SQLSTATE
-		 * 53R0A so external supervisors / TAP tests can distinguish
-		 * spawn failure from generic phase precondition failure.
-		 * The driver loop also ereports FATAL with 53R09 PHASE_PRE
-		 * CONDITION_FAILED on PHASE_RUN_FATAL return; the LOG here
-		 * captures the spawn-specific diagnostic before driver FATAL.
+		 * Spec-1.11.1 F13 (codex round 4 P2/P3 fix): write the LMON-
+		 * specific SQLSTATE into fail_ctx so the driver's FATAL exit
+		 * carries 53R0A (was generic 53R09 before F13).  Sprint B's
+		 * LOG-only ereport is removed -- single FATAL path is cleaner
+		 * for external supervisors / TAP tests.
 		 */
-		ereport(LOG, (errcode(ERRCODE_CLUSTER_LMON_SPAWN_FAILED),
-					  errmsg("cluster phase 1: failed to spawn LMON aux process"),
-					  errhint("Check fork() / system limits (ulimit -u) "
-							  "and postmaster log for LMON child startup errors.")));
+		fail_ctx->errcode = ERRCODE_CLUSTER_LMON_SPAWN_FAILED;
+		fail_ctx->errmsg = "cluster phase 1: failed to spawn LMON aux process";
+		fail_ctx->errhint = "Check fork() / system limits (ulimit -u) and "
+							"postmaster log for LMON child startup errors.";
 		return PHASE_RUN_FATAL;
 	}
 
-	/*
-	 * Reserve 5 seconds of timeout headroom for the driver's elapsed
-	 * check; the readiness wait gets the remainder.  cluster.phase1_
-	 * timeout default is 60 s -> 55 s readiness budget.
-	 */
 	wait_budget_ms = (cluster_phase1_timeout - 5) * 1000;
 	if (wait_budget_ms < 1000)
-		wait_budget_ms = 1000; /* clamp tiny custom timeouts to 1 s minimum */
+		wait_budget_ms = 1000;
 
 	ready = cluster_lmon_wait_for_ready(wait_budget_ms);
 	if (!ready) {
-		/* Stage 1.11 Sprint B (spec-1.11 D9): SQLSTATE 53R0B. */
-		ereport(LOG,
-				(errcode(ERRCODE_CLUSTER_LMON_NOT_READY),
-				 errmsg("cluster phase 1: LMON did not publish READY within %d ms", wait_budget_ms),
-				 errhint("Increase cluster.phase1_timeout or check LMON "
-						 "log for stuck startup; LMON status sticks at "
-						 "SPAWNING when the child crashed during initialization.")));
+		fail_ctx->errcode = ERRCODE_CLUSTER_LMON_NOT_READY;
+		fail_ctx->errmsg = "cluster phase 1: LMON did not publish READY in time";
+		fail_ctx->errhint = "Increase cluster.phase1_timeout or check LMON log "
+							"for stuck startup; LMON status sticks at SPAWNING "
+							"when the child crashed during initialization.";
 		return PHASE_RUN_FATAL;
 	}
 
@@ -521,7 +496,7 @@ phase_1_handler(void)
 
 
 static PhaseRunResult
-phase_2_handler(void)
+phase_2_handler(PhaseRunFailContext *fail_ctx pg_attribute_unused())
 {
 	Assert(!IsUnderPostmaster);
 	elog(DEBUG1, "Phase 2 stub: skipping LMS / LMD / LCK "
@@ -531,7 +506,7 @@ phase_2_handler(void)
 
 
 static PhaseRunResult
-phase_3_handler(void)
+phase_3_handler(PhaseRunFailContext *fail_ctx pg_attribute_unused())
 {
 	Assert(!IsUnderPostmaster);
 	elog(DEBUG1, "Phase 3 stub: PG-native startup process unchanged; "
@@ -541,7 +516,7 @@ phase_3_handler(void)
 
 
 static PhaseRunResult
-phase_4_handler(void)
+phase_4_handler(PhaseRunFailContext *fail_ctx pg_attribute_unused())
 {
 	Assert(!IsUnderPostmaster);
 	elog(DEBUG1, "Phase 4 stub: PG-native walwriter / bgwriter / checkpointer / "
@@ -561,7 +536,7 @@ phase_4_handler(void)
  * SHUTDOWN have NULL because they don't run a phase handler -- their
  * transitions are driven directly by cluster_advance_phase().
  */
-typedef PhaseRunResult (*ClusterPhaseHandler)(void);
+typedef PhaseRunResult (*ClusterPhaseHandler)(PhaseRunFailContext *fail_ctx);
 
 static const ClusterPhaseHandler phase_handlers[CLUSTER_PHASE_LAST + 1]
 	= { [CLUSTER_PHASE_PRE_INIT] = NULL,
@@ -689,6 +664,8 @@ cluster_run_startup_sequence(void)
 		 *	hangs without using WaitLatch+timeout will hang the entire
 		 *	postmaster, defeating this enforcement.
 		 */
+		PhaseRunFailContext fail_ctx = { 0 };
+
 		started = GetCurrentTimestamp();
 		cluster_advance_phase(phase);
 
@@ -704,7 +681,14 @@ cluster_run_startup_sequence(void)
 							errmsg("cluster startup phase %s has no handler in dispatch table",
 								   cluster_startup_phase_to_string(phase))));
 
-		result = handler();
+		/*
+		 * Spec-1.11.1 F13 (codex round 4 P2/P3 fix): handler writes
+		 * PHASE_RUN_FATAL diagnostic into fail_ctx (errcode/errmsg/
+		 * errhint).  Driver loop's FATAL path uses fail_ctx values
+		 * when non-zero/non-NULL, otherwise falls back to generic
+		 * 53R09 PHASE_PRECONDITION_FAILED + standard message.
+		 */
+		result = handler(&fail_ctx);
 
 		/*
 		 * Spec-1.10.2 F8 (2026-05-04 codex review fix): use
@@ -747,12 +731,23 @@ cluster_run_startup_sequence(void)
 
 		case PHASE_RUN_FATAL:
 			cluster_phase_fail_inject(phase);
-			ereport(FATAL, (errcode(ERRCODE_CLUSTER_PHASE_PRECONDITION_FAILED),
-							errmsg("cluster startup phase %s failed",
-								   cluster_startup_phase_to_string(phase)),
-							errhint("See postmaster log for handler-specific "
-									"diagnostics; spec-1.10 / spec-1.11+ "
-									"document the phase handler contract.")));
+			/*
+			 * Spec-1.11.1 F13: use handler-supplied SQLSTATE / errmsg
+			 * / errhint when present (e.g. 53R0A LMON_SPAWN_FAILED for
+			 * phase_1_handler), else fall back to generic 53R09
+			 * PHASE_PRECONDITION_FAILED.
+			 */
+			ereport(FATAL,
+					(errcode(fail_ctx.errcode != 0 ? fail_ctx.errcode
+												   : ERRCODE_CLUSTER_PHASE_PRECONDITION_FAILED),
+					 errmsg("cluster startup phase %s failed: %s",
+							cluster_startup_phase_to_string(phase),
+							fail_ctx.errmsg != NULL ? fail_ctx.errmsg
+													: "see postmaster log for diagnostics"),
+					 errhint("%s",
+							 fail_ctx.errhint != NULL
+								 ? fail_ctx.errhint
+								 : "spec-1.10 / spec-1.11+ document the phase handler contract.")));
 			break;
 
 		case PHASE_RUN_RETRY:
@@ -795,8 +790,17 @@ cluster_finalize_startup_running(void)
 	 * responsibility of PostmasterMain (just before ServerLoop()) so
 	 * that "phase=running" reflects PG-ready, not just pgrac-skeleton-
 	 * finished.  HC1 postmaster-only.
+	 *
+	 * Spec-1.11.1 F9: idempotent guard.  Crash reinit also calls this
+	 * to advance phase 4 -> RUNNING after the reinit cycle completes;
+	 * normal startup calls it once from PostmasterMain.  An already-
+	 * RUNNING state is a benign no-op rather than a strict +1
+	 * cluster_advance_phase failure.
 	 */
 	Assert(!IsUnderPostmaster);
+
+	if (cluster_current_phase() == CLUSTER_PHASE_RUNNING)
+		return;
 
 	cluster_advance_phase(CLUSTER_PHASE_RUNNING);
 }
