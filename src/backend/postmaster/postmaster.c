@@ -1475,22 +1475,20 @@ PostmasterMain(int argc, char *argv[])
 	/* Some workers may be scheduled to start now */
 	maybe_start_bgworkers();
 
-#ifdef USE_PGRAC_CLUSTER
 	/*
-	 * PGRAC: spec-1.10.1 (2026-05-04) D4 F4 — advance phase machinery
-	 * to RUNNING just before entering ServerLoop().  spec-1.10 originally
-	 * advanced to RUNNING inside cluster_run_startup_sequence() right
-	 * after CreateSharedMemoryAndSemaphores(), but at that point PG had
-	 * not yet set_max_safe_fds, opened listen sockets, started startup
-	 * process / bgwriter / checkpointer, etc.  Pushing the transition
-	 * here makes phase=running accurately reflect "PostgreSQL ready to
-	 * accept connections" rather than just "pgrac skeleton finished".
-	 *
-	 * HC1 PostmasterMain-only.  cluster_finalize_startup_running()
-	 * Asserts !IsUnderPostmaster as defense in depth.
+	 * PGRAC: spec-1.11 v1.0.2 / spec-1.12 v1.0.1 F15 — earlier hardening
+	 * (1.10.1 F4) advanced cluster phase to RUNNING here, before
+	 * ServerLoop, while pmState == PM_STARTUP and the startup process is
+	 * still doing recovery.  That made phase=running misreport readiness
+	 * by exactly the duration of WAL replay.  1.11.1 F9 added a second
+	 * call site in the reaper after the startup process completes
+	 * (PostmasterStateMachine PM_STARTUP -> PM_RUN transition), but the
+	 * idempotent guard inside cluster_finalize_startup_running() makes
+	 * the reaper call a no-op because the early call has already won.
+	 * Round 5 hardening removes the early call entirely; the reaper path
+	 * (postmaster.c reaper PM_STARTUP -> PM_RUN, ~line 3026) is now the
+	 * sole correct location.
 	 */
-	cluster_finalize_startup_running();
-#endif
 
 	status = ServerLoop();
 

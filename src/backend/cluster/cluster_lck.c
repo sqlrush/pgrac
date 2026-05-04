@@ -355,10 +355,24 @@ lck_publish_status(ClusterLckStatus status)
 
 	LWLockAcquire(&cluster_lck_state->lwlock, LW_EXCLUSIVE);
 	cluster_lck_state->status = status;
-	if (status == CLUSTER_LCK_SPAWNING && cluster_lck_state->spawned_at == 0) {
+	/*
+	 * PGRAC: spec-1.12 v1.0.1 F16 — SPAWNING means a new LCK incarnation
+	 * is starting.  Earlier code only wrote pid/spawned_at when
+	 * spawned_at == 0, which leaves stale values from the previous
+	 * incarnation after a normal-exit ServerLoop respawn (shmem is not
+	 * recreated on normal exit, only on postmaster crash recovery).
+	 * Refresh every field that scopes to a single incarnation
+	 * unconditionally so SQL views (pg_cluster_state.lck.lck_pid /
+	 * spawned_at / ready_at / last_liveness_tick_at / main_loop_iters)
+	 * always reflect the live LCK.
+	 */
+	if (status == CLUSTER_LCK_SPAWNING) {
 		cluster_lck_state->pid = MyProcPid;
 		cluster_lck_state->spawned_at = now;
-	} else if (status == CLUSTER_LCK_READY && cluster_lck_state->ready_at == 0) {
+		cluster_lck_state->ready_at = 0;
+		cluster_lck_state->last_liveness_tick_at = 0;
+		cluster_lck_state->main_loop_iters = 0;
+	} else if (status == CLUSTER_LCK_READY) {
 		cluster_lck_state->ready_at = now;
 	}
 	LWLockRelease(&cluster_lck_state->lwlock);

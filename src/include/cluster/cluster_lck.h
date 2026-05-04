@@ -1,24 +1,30 @@
 /*-------------------------------------------------------------------------
  *
  * cluster_lck.h
- *	  pgrac LCK (Lock Process) cluster background process — Stage 1.12
- *	  Sprint A skeleton.
+ *	  pgrac LCK (Lock Process) cluster background process — Stage 1.12.
  *
- *	  Stage 1.12 introduces the first real cluster background process
- *	  spawned by postmaster.  Sprint A scope is the lifecycle skeleton:
- *	  AuxProcType integration / shmem state struct / readiness sync
- *	  protocol / shutdown protocol / crash semantics.  The LCK main
- *	  loop only does a local liveness tick (last_liveness_tick_at
- *	  advance + iter++) — it does NOT consume heartbeat messages, do
- *	  reconfig coordination, fence decisions, GRD maintenance, or
- *	  Recovery Coordinator triggering.  Those land in Stage 2-6.
+ *	  Stage 1.12 ships the second cluster background process spawned by
+ *	  postmaster (LMON in 1.11 was first).  Sprint A and Sprint B were
+ *	  shipped together: lifecycle skeleton + GUC + SQLSTATE + inject
+ *	  points + wait event + dump_lck view, all in tag v0.2.0-stage1.12.
+ *	  spec-1.12 v1.0.1 (round 5 hardening) further refreshes shmem on
+ *	  every SPAWNING incarnation so SQL views never report stale PID /
+ *	  timestamps after a ServerLoop respawn.
  *
- *	  Sprint A boundary (NOT in this file):
- *	    - cluster.lck_main_loop_interval GUC          (Sprint B)
- *	    - 53R0C LCK_SPAWN_FAILED / 53R0D LCK_NOT_READY (Sprint B)
- *	    - 6 inject points cluster-lck-*               (Sprint B)
- *	    - WAIT_EVENT_CLUSTER_BGPROC_LCK_MAIN_LOOP wait event (Sprint B)
- *	    - pg_cluster_state.lck view 6 keys            (Sprint B)
+ *	  The LCK main loop only does a local liveness tick
+ *	  (last_liveness_tick_at advance + iter++) — it does NOT acquire,
+ *	  convert, or release any dictionary / catalog / cache invalidation
+ *	  lock; those protocols land in Stage 2+ GES feature.
+ *
+ *	  Implemented surface (1.12 + 1.12.1):
+ *	    - cluster.lck_main_loop_interval GUC (PGC_SIGHUP, default 1000ms)
+ *	    - SQLSTATE 53R0C LCK_SPAWN_FAILED / 53R0D LCK_NOT_READY
+ *	    - 6 inject points cluster-lck-{pre-spawn,post-spawn,
+ *	      ready-publish,main-loop-iter,shutdown-pre,shutdown-post}
+ *	    - WAIT_EVENT_CLUSTER_BGPROC_LCK_MAIN_LOOP wait event
+ *	    - pg_cluster_state.lck view 6 keys (status / status_enum_value /
+ *	      pid / spawned_at / ready_at / last_liveness_tick_at /
+ *	      main_loop_iters)
  *
  *	  HC1 (spec-1.11 §1.4): LCK spawn entry point Asserts
  *	      !IsUnderPostmaster (postmaster-only).  LckMain itself

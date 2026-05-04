@@ -182,14 +182,14 @@ is($node->safe_psql(
 
 
 # ----------
-# L12: pg_stat_cluster_wait_events still 51 rows (block format
+# L12: pg_stat_cluster_wait_events still 58 rows (block format
 # is structure-only; no new wait events at stage 1.4).
 # ----------
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
    '58',
-   'L12 pg_stat_cluster_wait_events still 51 rows after 1.4');
+   'L12 pg_stat_cluster_wait_events still 58 rows after 1.4');
 
 
 $node->stop;

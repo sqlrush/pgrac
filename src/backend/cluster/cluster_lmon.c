@@ -355,10 +355,24 @@ lmon_publish_status(ClusterLmonStatus status)
 
 	LWLockAcquire(&cluster_lmon_state->lwlock, LW_EXCLUSIVE);
 	cluster_lmon_state->status = status;
-	if (status == CLUSTER_LMON_SPAWNING && cluster_lmon_state->spawned_at == 0) {
+	/*
+	 * PGRAC: spec-1.11 v1.0.2 F16 — SPAWNING means a new LMON incarnation
+	 * is starting.  Earlier code only wrote pid/spawned_at when
+	 * spawned_at == 0, which leaves stale values from the previous
+	 * incarnation after a normal-exit ServerLoop respawn (shmem is not
+	 * recreated on normal exit, only on postmaster crash recovery).
+	 * Refresh every field that scopes to a single incarnation
+	 * unconditionally so SQL views (pg_cluster_state.lmon.lmon_pid /
+	 * spawned_at / ready_at / last_liveness_tick_at / main_loop_iters)
+	 * always reflect the live LMON.
+	 */
+	if (status == CLUSTER_LMON_SPAWNING) {
 		cluster_lmon_state->pid = MyProcPid;
 		cluster_lmon_state->spawned_at = now;
-	} else if (status == CLUSTER_LMON_READY && cluster_lmon_state->ready_at == 0) {
+		cluster_lmon_state->ready_at = 0;
+		cluster_lmon_state->last_liveness_tick_at = 0;
+		cluster_lmon_state->main_loop_iters = 0;
+	} else if (status == CLUSTER_LMON_READY) {
 		cluster_lmon_state->ready_at = now;
 	}
 	LWLockRelease(&cluster_lmon_state->lwlock);
