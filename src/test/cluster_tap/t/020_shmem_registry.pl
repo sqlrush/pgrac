@@ -78,13 +78,13 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_shmem}),
-   '5',
+   '6',
    'L2 pg_cluster_shmem returns 5 baseline rows (cluster_ctl + cluster_conf + cluster_pcm_grd + cluster startup phase + cluster lmon)');
 
 is($node->safe_psql(
 		'postgres',
 		q{SELECT string_agg(name, ',' ORDER BY name) FROM pg_cluster_shmem}),
-   'pgrac cluster conf,pgrac cluster control,pgrac cluster lmon,pgrac cluster pcm grd,pgrac cluster startup phase',
+   'pgrac cluster conf,pgrac cluster control,pgrac cluster lck,pgrac cluster lmon,pgrac cluster pcm grd,pgrac cluster startup phase',
    'L3 pg_cluster_shmem rows are exactly the 5 foundational regions (cluster_ctl + cluster_conf + cluster_pcm_grd + cluster startup phase since 1.10.1 + cluster lmon since 1.11 Sprint A)');
 
 
@@ -133,7 +133,7 @@ is($node->safe_psql(
 		'postgres',
 		q{SELECT value FROM pg_cluster_state
 		   WHERE category = 'shmem' AND key = 'region_count'}),
-   '5',
+   '6',
    'L8 pg_cluster_state.shmem.region_count = 5 (cluster_ctl + cluster_conf + cluster_pcm_grd + cluster startup phase from spec-1.10.1)');
 
 is($node->safe_psql(
@@ -153,14 +153,14 @@ is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='shmem' AND key LIKE 'region.%.bytes'}),
-   '5',
+   '6',
    'L10 pg_cluster_state.shmem has 5 region.<name>.bytes keys (one per region)');
 
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='shmem' AND key LIKE 'region.%.owner'}),
-   '5',
+   '6',
    'L11 pg_cluster_state.shmem has 5 region.<name>.owner keys (one per region)');
 
 
@@ -198,7 +198,7 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '51',
+   '57',
    'L15 total injection registry size is 51 (14 baseline + 8 sweep + 3 shared_fs + 3 smgr + 4 shmem registry + 4 PCM lock = 28; spec-1.7 baseline)');
 
 
@@ -229,7 +229,7 @@ like($stderr,
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-   '57',
+   '58',
    'L17 pg_stat_cluster_wait_events still 51 rows after 1.3');
 
 
@@ -243,7 +243,7 @@ $node->start;
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_shmem}),
-   '5',
+   '6',
    'L18 cluster.shmem_max_regions = 8 still admits the 5 baseline regions');
 
 is($node->safe_psql(

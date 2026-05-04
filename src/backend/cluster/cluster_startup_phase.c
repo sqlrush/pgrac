@@ -57,6 +57,7 @@
 #include "cluster/cluster_elog.h"	/* cluster_phase legacy mirror (HC2) */
 #include "cluster/cluster_guc.h"	/* cluster_phase{1..4}_timeout (D2 F2) */
 #include "cluster/cluster_inject.h" /* CLUSTER_INJECTION_POINT */
+#include "cluster/cluster_lck.h"	/* cluster_lck_start / wait_for_ready (1.12 Sprint A) */
 #include "cluster/cluster_lmon.h"	/* cluster_lmon_start / wait_for_ready (1.11 Sprint A) */
 #include "cluster/cluster_shmem.h"	/* cluster_shmem_register_region */
 #include "cluster/cluster_startup_phase.h"
@@ -496,11 +497,57 @@ phase_1_handler(PhaseRunFailContext *fail_ctx)
 
 
 static PhaseRunResult
-phase_2_handler(PhaseRunFailContext *fail_ctx pg_attribute_unused())
+phase_2_handler(PhaseRunFailContext *fail_ctx)
 {
+	int lck_pid;
+	bool ready;
+	int wait_budget_ms;
+
 	Assert(!IsUnderPostmaster);
-	elog(DEBUG1, "Phase 2 stub: skipping LMS / LMD / LCK "
-				 "(spec-1.12 LCK + Stage 2 GES replace this handler)");
+	Assert(fail_ctx != NULL);
+
+	/* Spec-1.12 HC4: cluster.enabled=false 退化 stub (与 phase_1 对称). */
+	if (!cluster_enabled) {
+		elog(DEBUG1, "cluster phase 2: cluster.enabled=false; skipping LCK "
+					 "spawn (degraded to spec-1.10 stub behavior)");
+		return PHASE_RUN_OK;
+	}
+
+	/*
+	 * Stage 1.12 Sprint A: spawn LCK aux process and synchronously
+	 * wait for it to publish CLUSTER_LCK_READY.  LMS / LMD remain
+	 * stubs (Stage 2+ GES feature).
+	 *
+	 * Spec: spec-1.12-lck-skeleton.md Sprint A D6 +
+	 *       spec-1.11.1 F13 PhaseRunFailContext API.
+	 */
+	lck_pid = cluster_lck_start();
+	if (lck_pid == 0) {
+		fail_ctx->errcode = ERRCODE_CLUSTER_LCK_SPAWN_FAILED;
+		fail_ctx->errmsg = "cluster phase 2: failed to spawn LCK aux process";
+		fail_ctx->errhint = "Check fork() / system limits (ulimit -u) and "
+							"postmaster log for LCK child startup errors.";
+		return PHASE_RUN_FATAL;
+	}
+
+	wait_budget_ms = (cluster_phase2_timeout - 5) * 1000;
+	if (wait_budget_ms < 1000)
+		wait_budget_ms = 1000;
+
+	ready = cluster_lck_wait_for_ready(wait_budget_ms);
+	if (!ready) {
+		fail_ctx->errcode = ERRCODE_CLUSTER_LCK_NOT_READY;
+		fail_ctx->errmsg = "cluster phase 2: LCK did not publish READY in time";
+		fail_ctx->errhint = "Increase cluster.phase2_timeout or check LCK log "
+							"for stuck startup; LCK status sticks at SPAWNING "
+							"when the child crashed during initialization.";
+		return PHASE_RUN_FATAL;
+	}
+
+	elog(DEBUG1,
+		 "cluster phase 2: LCK ready (pid %d); LMS / LMD remain stubs "
+		 "(Stage 2+ GES feature)",
+		 lck_pid);
 	return PHASE_RUN_OK;
 }
 

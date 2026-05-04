@@ -453,6 +453,8 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 53R09    E    ERRCODE_CLUSTER_PHASE_PRECONDITION_FAILED                      cluster_phase_precondition_failed
 53R0A    E    ERRCODE_CLUSTER_LMON_SPAWN_FAILED                              cluster_lmon_spawn_failed
 53R0B    E    ERRCODE_CLUSTER_LMON_NOT_READY                                 cluster_lmon_not_ready
+53R0C    E    ERRCODE_CLUSTER_LCK_SPAWN_FAILED                               cluster_lck_spawn_failed
+53R0D    E    ERRCODE_CLUSTER_LCK_NOT_READY                                  cluster_lck_not_ready
 
 Section: Class 54 - Program Limit Exceeded
 

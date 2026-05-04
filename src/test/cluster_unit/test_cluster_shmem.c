@@ -334,6 +334,11 @@ void
 cluster_lmon_shmem_register(void)
 {}
 
+/* Spec-1.12 Sprint A stub: same for LCK. */
+void
+cluster_lck_shmem_register(void)
+{}
+
 
 UT_DEFINE_GLOBALS();
 

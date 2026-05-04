@@ -73,6 +73,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_elog.h" /* cluster_phase */
+#include "cluster/cluster_lck.h"  /* cluster_lck_status (spec-1.12 D12) */
 #include "cluster/cluster_lmon.h" /* cluster_lmon_status (spec-1.11 Sprint B D12) */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic.h"			   /* ClusterICOps_Active, ClusterICTier */
@@ -434,6 +435,42 @@ dump_lmon(ReturnSetInfo *rsinfo)
 }
 
 /*
+ * dump_lck -- Stage 1.12 LCK state diagnostics (mirrors dump_lmon
+ * spec-1.11.1 F11 6 keys complete model).  Sprint A starts with full
+ * 6 keys, not the Sprint B starter trap that bit spec-1.11 D12.
+ */
+static void
+dump_lck(ReturnSetInfo *rsinfo)
+{
+	ClusterLckStatus s = cluster_lck_status();
+	pid_t pid;
+	TimestampTz spawned_at, ready_at, last_tick;
+	int64 iters;
+
+	emit_row(rsinfo, "lck", "lck_status", cluster_lck_status_to_string(s));
+	emit_row(rsinfo, "lck", "lck_status_enum_value", fmt_int32((int32)s));
+
+	pid = cluster_lck_pid();
+	emit_row(rsinfo, "lck", "lck_pid", pid == 0 ? "(unset)" : fmt_int64((int64)pid));
+
+	spawned_at = cluster_lck_spawned_at();
+	emit_row(rsinfo, "lck", "lck_spawned_at",
+			 spawned_at == 0 ? "(unset)" : pstrdup(timestamptz_to_str(spawned_at)));
+
+	ready_at = cluster_lck_ready_at();
+	emit_row(rsinfo, "lck", "lck_ready_at",
+			 ready_at == 0 ? "(unset)" : pstrdup(timestamptz_to_str(ready_at)));
+
+	last_tick = cluster_lck_last_liveness_tick_at();
+	emit_row(rsinfo, "lck", "lck_last_liveness_tick_at",
+			 last_tick == 0 ? "(unset)" : pstrdup(timestamptz_to_str(last_tick)));
+
+	iters = cluster_lck_main_loop_iters();
+	emit_row(rsinfo, "lck", "lck_main_loop_iters", fmt_int64(iters));
+}
+
+
+/*
  * dump_shared_fs -- Stage 1.1 cluster_shared_fs runtime state.
  *
  *	Emits two rows: the active backend's name (or "(none)" if init has
@@ -600,6 +637,8 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		dump_buffer_format(rsinfo);
 		dump_pcm(rsinfo);
 		dump_phase(rsinfo);
+		dump_lmon(rsinfo);
+		dump_lck(rsinfo);
 	}
 #else
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

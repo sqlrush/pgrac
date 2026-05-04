@@ -33,7 +33,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_debug test_cluster_shared_fs test_cluster_smgr \
         test_cluster_scn test_cluster_block_format test_cluster_itl_slot \
         test_cluster_buffer_desc test_cluster_pcm_lock \
-        test_cluster_startup_phase test_cluster_lmon
+        test_cluster_startup_phase test_cluster_lmon test_cluster_lck
 
 # Path to the cluster_version object (no PG deps, safe to link standalone).
 CLUSTER_VERSION_O = $(top_builddir)/src/backend/cluster/cluster_version.o
@@ -67,6 +67,7 @@ CLUSTER_SHARED_FS_LOCAL_O = $(top_builddir)/src/backend/cluster/storage/cluster_
 CLUSTER_SMGR_O = $(top_builddir)/src/backend/cluster/storage/cluster_smgr.o
 CLUSTER_STARTUP_PHASE_O = $(top_builddir)/src/backend/cluster/cluster_startup_phase.o
 CLUSTER_LMON_O = $(top_builddir)/src/backend/cluster/cluster_lmon.o
+CLUSTER_LCK_O = $(top_builddir)/src/backend/cluster/cluster_lck.o
 
 # Most tests link only cluster_version.o.  test_cluster_guc /
 # test_cluster_shmem / test_cluster_signal / test_cluster_views /
@@ -74,7 +75,7 @@ CLUSTER_LMON_O = $(top_builddir)/src/backend/cluster/cluster_lmon.o
 # separate rules because they also link additional cluster_*.o
 # objects (the test files stub the PG backend symbols those
 # objects reference).
-SIMPLE_TESTS = $(filter-out test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf test_cluster_ic_mock test_cluster_inject test_cluster_pgstat test_cluster_debug test_cluster_shared_fs test_cluster_smgr test_cluster_startup_phase test_cluster_lmon,$(TESTS))
+SIMPLE_TESTS = $(filter-out test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf test_cluster_ic_mock test_cluster_inject test_cluster_pgstat test_cluster_debug test_cluster_shared_fs test_cluster_smgr test_cluster_startup_phase test_cluster_lmon test_cluster_lck,$(TESTS))
 
 $(SIMPLE_TESTS): %: %.c unit_test.h $(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) -o $@
@@ -239,6 +240,18 @@ test_cluster_lmon: test_cluster_lmon.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_LMON_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_LMON_O) -o $@
+
+# test_cluster_lck links cluster_lck.o standalone (spec-1.12 Sprint A).
+# Mirrors test_cluster_lmon pattern: cluster_lck.c references shmem /
+# lwlock / pqsignal / latch / proc / procsignal / interrupt / timestamp
+# / memutils / ps_status helpers; stubs in test_cluster_lck.c cover
+# every external; behavior tests (LCK spawn, phase 2 ready, kill -9
+# crash recovery) live in TAP t/062_lck_skeleton.pl where postmaster
+# orchestration is real.
+test_cluster_lck: test_cluster_lck.c unit_test.h \
+		$(CLUSTER_VERSION_O) $(CLUSTER_LCK_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_LCK_O) -o $@
 
 
 # ----------

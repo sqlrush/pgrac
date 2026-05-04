@@ -225,6 +225,13 @@ extern int cluster_lmon_main_loop_interval;
 
 
 /*
+ * cluster.lck_main_loop_interval (spec-1.12 Sprint B D8): same pattern
+ * as cluster.lmon_main_loop_interval; controls LCK aux process tick.
+ */
+extern int cluster_lck_main_loop_interval;
+
+
+/*
  * cluster.enabled: runtime cluster mode gate (Stage 1.11 Sprint B; HC4
  * 闭环).
  *

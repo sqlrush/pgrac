@@ -163,6 +163,13 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	{ .name = "cluster-lmon-main-loop-iter" },
 	{ .name = "cluster-lmon-shutdown-pre" },
 	{ .name = "cluster-lmon-shutdown-post" },
+	/* Stage 1.12 Sprint B (spec-1.12 D10) — 6 LCK lifecycle injects. */
+	{ .name = "cluster-lck-pre-spawn" },
+	{ .name = "cluster-lck-post-spawn" },
+	{ .name = "cluster-lck-ready-publish" },
+	{ .name = "cluster-lck-main-loop-iter" },
+	{ .name = "cluster-lck-shutdown-pre" },
+	{ .name = "cluster-lck-shutdown-post" },
 };
 
 #define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_points)

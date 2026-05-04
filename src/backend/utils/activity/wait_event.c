@@ -1218,6 +1218,9 @@ pgstat_get_wait_cluster_bgproc(WaitEventCluster w)
 	case WAIT_EVENT_CLUSTER_BGPROC_LMON_MAIN_LOOP:
 		event_name = "ClusterBgProcLmonMainLoop";
 		break;
+	case WAIT_EVENT_CLUSTER_BGPROC_LCK_MAIN_LOOP:
+		event_name = "ClusterBgProcLckMainLoop";
+		break;
 	default:
 		break;
 	}

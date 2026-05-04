@@ -505,6 +505,14 @@ typedef enum
 	 * consumption land in Stage 2-6.  See cluster_lmon.h.
 	 */
 	LmonProcess,
+	/*
+	 * PGRAC (stage 1.12 Sprint A): LCK aux process — second cluster
+	 * background process; instance-level lock placeholder.  Appended
+	 * after LmonProcess to preserve numeric values.  Lifecycle
+	 * skeleton only; real dictionary/catalog lock protocol lands in
+	 * Stage 2+ GES feature.  See cluster_lck.h.
+	 */
+	LckProcess,
 #endif
 
 	NUM_AUXPROCTYPES			/* Must be last! */
@@ -520,6 +528,7 @@ extern PGDLLIMPORT AuxProcType MyAuxProcType;
 #define AmWalReceiverProcess()		(MyAuxProcType == WalReceiverProcess)
 #ifdef USE_PGRAC_CLUSTER
 #define AmLmonProcess()				(MyAuxProcType == LmonProcess)
+#define AmLckProcess()				(MyAuxProcType == LckProcess)
 #endif
 
 

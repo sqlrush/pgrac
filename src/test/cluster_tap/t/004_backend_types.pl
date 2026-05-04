@@ -85,29 +85,38 @@ is($unknown_count, '0',
 # accidentally wiring up a process before the supporting infrastructure
 # (GUC, ProcessAux, signal handling) lands in stage 0.13+.
 # Spec-1.11 Sprint A: LMON aux process is the first pgrac background
-# process actually spawned by postmaster.  Other types (lck / diag /
-# cluster stats / heartbeat / interconnect listener / etc) remain
-# deferred to Stage 1.12-1.14 + Stage 2-6.  Excluded 'lmon' from the
+# process actually spawned by postmaster.  Spec-1.12 Sprint A: LCK
+# aux process is the second.  Other types (diag / cluster stats /
+# heartbeat / interconnect listener / etc) remain deferred to Stage
+# 1.13-1.14 + Stage 2-6.  Excluded 'lmon' and 'lck' from the
 # "no pgrac process visible" assertion accordingly.
 my $pgrac_visible = $node->safe_psql(
 	'postgres',
 	q{SELECT count(*) FROM pg_stat_activity
 	   WHERE backend_type IN (
 	       'cluster stats', 'diag', 'heartbeat', 'interconnect listener',
-	       'lck', 'lmd', 'lms worker',
+	       'lmd', 'lms worker',
 	       'managed recovery process', 'recovery coordinator',
 	       'recovery worker', 'sinval broadcaster',
 	       'tt gc', 'undo cleaner')});
 is($pgrac_visible, '0',
-	'no pgrac process descriptor visible at stage 0.10 except LMON spawned at 1.11 Sprint A (others deferred to 1.12-1.14 + Stage 2-6)');
+	'no pgrac process descriptor visible at stage 0.10 except LMON (1.11) + LCK (1.12) Sprint A (others deferred to 1.13-1.14 + Stage 2-6)');
 
-# LMON is now spawned by postmaster (spec-1.11 Sprint A).  Verify it
+# LMON is spawned by postmaster (spec-1.11 Sprint A).  Verify it
 # appears in pg_stat_activity exactly once.
 my $lmon_visible = $node->safe_psql(
 	'postgres',
 	q{SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'lmon'});
 is($lmon_visible, '1',
 	'LMON aux process visible in pg_stat_activity (spec-1.11 Sprint A)');
+
+# LCK is spawned by postmaster (spec-1.12 Sprint A).  Verify it
+# appears in pg_stat_activity exactly once.
+my $lck_visible = $node->safe_psql(
+	'postgres',
+	q{SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'lck'});
+is($lck_visible, '1',
+	'LCK aux process visible in pg_stat_activity (spec-1.12 Sprint A)');
 
 
 $node->stop;

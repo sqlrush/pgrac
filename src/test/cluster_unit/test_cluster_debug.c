@@ -463,6 +463,31 @@ cluster_lmon_wait_for_ready(int timeout_ms pg_attribute_unused())
 	return false;
 }
 
+/*
+ * Spec-1.11.1 F11 stubs: dump_lmon now reads 5 new accessors; test
+ * harness never invokes runtime path so address-only no-op stubs.
+ */
+pid_t cluster_lmon_pid(void) { return 0; }
+TimestampTz cluster_lmon_spawned_at(void) { return 0; }
+TimestampTz cluster_lmon_ready_at(void) { return 0; }
+TimestampTz cluster_lmon_last_liveness_tick_at(void) { return 0; }
+int64 cluster_lmon_main_loop_iters(void) { return 0; }
+int cluster_lmon_status(void) { return 0; }
+const char *cluster_lmon_status_to_string(int s pg_attribute_unused()) { return "(stub)"; }
+
+/* Spec-1.12 D6+D12 stubs: cluster_startup_phase.o now references
+ * cluster_lck_start + cluster_lck_wait_for_ready; cluster_debug.o
+ * dump_lck now references 6 lck_* accessors. */
+int cluster_lck_start(void) { return 0; }
+bool cluster_lck_wait_for_ready(int timeout_ms pg_attribute_unused()) { return false; }
+int cluster_lck_status(void) { return 0; }
+const char *cluster_lck_status_to_string(int s pg_attribute_unused()) { return "(stub)"; }
+pid_t cluster_lck_pid(void) { return 0; }
+TimestampTz cluster_lck_spawned_at(void) { return 0; }
+TimestampTz cluster_lck_ready_at(void) { return 0; }
+TimestampTz cluster_lck_last_liveness_tick_at(void) { return 0; }
+int64 cluster_lck_main_loop_iters(void) { return 0; }
+
 
 UT_DEFINE_GLOBALS();
 

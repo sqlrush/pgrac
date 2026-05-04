@@ -251,6 +251,10 @@ cluster_lmon_wait_for_ready(int timeout_ms pg_attribute_unused())
 	return false;
 }
 
+/* Spec-1.12 stubs. */
+int cluster_lck_start(void) { return 0; }
+bool cluster_lck_wait_for_ready(int timeout_ms pg_attribute_unused()) { return false; }
+
 
 UT_DEFINE_GLOBALS();
 

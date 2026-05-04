@@ -81,6 +81,9 @@ int cluster_phase4_timeout = 30;
  */
 int cluster_lmon_main_loop_interval = 1000;
 
+/* spec-1.12 Sprint B D8: cluster.lck_main_loop_interval (mirror). */
+int cluster_lck_main_loop_interval = 1000;
+
 
 /*
  * cluster.enabled (Stage 1.11 Sprint B HC4 闭环; spec-1.11 D8).
@@ -396,6 +399,16 @@ cluster_init_guc(void)
 					 "LMON has no real consumer work, so any value in range is "
 					 "functionally equivalent."),
 		&cluster_lmon_main_loop_interval, 1000, 100, 60000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
+		NULL);
+
+	DefineCustomIntVariable(
+		"cluster.lck_main_loop_interval",
+		gettext_noop("LCK main-loop tick interval in milliseconds."),
+		gettext_noop("Same semantics as cluster.lmon_main_loop_interval; controls "
+					 "the LCK aux process main-loop WaitLatch timeout (spec-1.12 "
+					 "Sprint B D8).  Sprint A LCK has no real consumer work, so "
+					 "any value in range is functionally equivalent."),
+		&cluster_lck_main_loop_interval, 1000, 100, 60000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
 		NULL);
 
 	DefineCustomBoolVariable(

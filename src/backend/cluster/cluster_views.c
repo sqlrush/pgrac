@@ -175,6 +175,8 @@ static const uint32 cluster_wait_event_infos[CLUSTER_WAIT_EVENTS_COUNT] = {
 	 * SQL-visible alongside the C-level enum + name lookup.
 	 */
 	WAIT_EVENT_CLUSTER_BGPROC_LMON_MAIN_LOOP,
+	/* spec-1.12 D11: 4-process symmetric grep (enum/lookup/count/registry). */
+	WAIT_EVENT_CLUSTER_BGPROC_LCK_MAIN_LOOP,
 };
 
 /* Compile-time assertion: array length must match the documented count. */

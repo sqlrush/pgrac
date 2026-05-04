@@ -34,6 +34,7 @@
 #include "utils/rel.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_lck.h"	/* LckMain (stage 1.12 Sprint A) */
 #include "cluster/cluster_lmon.h"	/* LmonMain (stage 1.11 Sprint A) */
 #endif
 
@@ -88,6 +89,10 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 		/* PGRAC (stage 1.11 Sprint A): LMON aux process. */
 		case LmonProcess:
 			MyBackendType = B_LMON;
+			break;
+		/* PGRAC (stage 1.12 Sprint A): LCK aux process. */
+		case LckProcess:
+			MyBackendType = B_LCK;
 			break;
 #endif
 		default:
@@ -182,6 +187,10 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 		 */
 		case LmonProcess:
 			LmonMain();
+			proc_exit(1);
+		/* PGRAC (stage 1.12 Sprint A): LCK aux process dispatch. */
+		case LckProcess:
+			LckMain();
 			proc_exit(1);
 #endif
 

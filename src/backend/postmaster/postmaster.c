@@ -309,6 +309,9 @@ static pid_t StartupPID = 0, BgWriterPID = 0, CheckpointerPID = 0, WalWriterPID 
  * Spec: spec-1.11-lmon-skeleton.md Sprint A D5 + 4 实质 HC #1 (HC3 限定版)
  */
 static pid_t LmonPID = 0;
+
+/* PGRAC (stage 1.12 Sprint A): LCK aux process pid; same pattern. */
+static pid_t LckPID = 0;
 #endif
 
 /* Startup process's status */
@@ -613,6 +616,7 @@ static void ShmemBackendArrayRemove(Backend *bn);
 #define StartWalReceiver() StartChildProcess(WalReceiverProcess)
 #ifdef USE_PGRAC_CLUSTER
 #define StartLmon() StartChildProcess(LmonProcess)
+#define StartLck() StartChildProcess(LckProcess)
 #endif
 
 /* Macros to check exit status of a child process */
@@ -1837,6 +1841,15 @@ ServerLoop(void)
 		 */
 		if (cluster_enabled && LmonPID == 0 && pmState == PM_RUN)
 			LmonPID = StartLmon();
+
+		/*
+		 * PGRAC: spec-1.12 Sprint A — same ServerLoop respawn for LCK
+		 * (codex round 3 P1.1+P1.2 preempted in 1.12).  Closes
+		 * restart_after_crash recovery + LCK external-SIGTERM paths
+		 * uniformly.
+		 */
+		if (cluster_enabled && LckPID == 0 && pmState == PM_RUN)
+			LckPID = StartLck();
 #endif
 
 		/*
@@ -2692,6 +2705,8 @@ process_pm_reload_request(void)
 #ifdef USE_PGRAC_CLUSTER
 		if (LmonPID != 0)
 			signal_child(LmonPID, SIGHUP);
+		if (LckPID != 0)
+			signal_child(LckPID, SIGHUP);
 #endif
 		if (AutoVacPID != 0)
 			signal_child(AutoVacPID, SIGHUP);
@@ -3134,6 +3149,22 @@ process_pm_child_exit(void)
 				HandleChildCrash(pid, exitstatus, _("LMON process"));
 			continue;
 		}
+
+		/*
+		 * PGRAC (stage 1.12 Sprint A): LCK aux process exit (mirror
+		 * of LMON above).  HC5 normal vs abnormal split: EXIT_STATUS_0
+		 * is graceful and ignored (ServerLoop respawn handles "no
+		 * LCK while pmState==PM_RUN" silently); anything else routes
+		 * to HandleChildCrash -> restart_after_crash cycle.
+		 *
+		 * Spec: spec-1.12-lck-skeleton.md Sprint A D5 + HC5.
+		 */
+		if (pid == LckPID) {
+			LckPID = 0;
+			if (!EXIT_STATUS_0(exitstatus))
+				HandleChildCrash(pid, exitstatus, _("LCK process"));
+			continue;
+		}
 #endif
 
 		/*
@@ -3516,6 +3547,12 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 		LmonPID = 0;
 	else if (LmonPID != 0 && take_action)
 		sigquit_child(LmonPID);
+
+	/* PGRAC (stage 1.12 Sprint A): same pattern for LCK. */
+	if (pid == LckPID)
+		LckPID = 0;
+	else if (LckPID != 0 && take_action)
+		sigquit_child(LckPID);
 #endif
 
 	/* Take care of the walreceiver too */
@@ -3669,6 +3706,9 @@ PostmasterStateMachine(void)
 		 */
 		if (LmonPID != 0)
 			signal_child(LmonPID, SIGTERM);
+		/* PGRAC (stage 1.12 Sprint A): same SIGTERM for LCK. */
+		if (LckPID != 0)
+			signal_child(LckPID, SIGTERM);
 #endif
 		/* If we're in recovery, also stop startup and walreceiver procs */
 		if (StartupPID != 0)
@@ -3712,6 +3752,9 @@ PostmasterStateMachine(void)
 			 * relies on this.
 			 */
 			LmonPID == 0 &&
+			/* PGRAC: spec-1.12 Sprint A — same wait for LCK (codex
+			 * round 3 P2.3 preempted in 1.12). */
+			LckPID == 0 &&
 #endif
 			AutoVacPID == 0) {
 			if (Shutdown >= ImmediateShutdown || FatalError) {
@@ -4049,6 +4092,8 @@ TerminateChildren(int signal)
 #ifdef USE_PGRAC_CLUSTER
 	if (LmonPID != 0)
 		signal_child(LmonPID, signal);
+	if (LckPID != 0)
+		signal_child(LckPID, signal);
 #endif
 }
 
@@ -5386,6 +5431,25 @@ cluster_postmaster_start_lmon(void)
 
 	LmonPID = StartLmon();
 	return LmonPID;
+}
+
+/*
+ * cluster_postmaster_start_lck -- spawn the LCK aux process.
+ *
+ *	PGRAC (stage 1.12 Sprint A): postmaster-owned narrow wrapper for
+ *	the cluster module to request LCK spawn (Q2).  Mirrors
+ *	cluster_postmaster_start_lmon -- StartChildProcess is file-static,
+ *	so cluster_lck.c::cluster_lck_start() forwards here.
+ *
+ *	Spec: spec-1.12-lck-skeleton.md Sprint A D5.
+ */
+pid_t
+cluster_postmaster_start_lck(void)
+{
+	Assert(!IsUnderPostmaster);
+
+	LckPID = StartLck();
+	return LckPID;
 }
 #endif
 

@@ -130,7 +130,7 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-	'51',
+	'57',
 	'L9 total injection registry size is 51 (14 + 3 stage-1.1 + 3 stage-1.2 + 4 stage-1.3 + 4 stage-1.7)');
 
 
@@ -167,7 +167,7 @@ $node->stop;
 $node->append_conf('postgresql.conf', "cluster.shared_storage_backend = block_device\n");
 
 my $pg_ctl = $ENV{PG_CTL} || 'pg_ctl';
-my $exit_code = system($pg_ctl, '-w', '-t', '5', '-D', $node->data_dir,
+my $exit_code = system($pg_ctl, '-w', '-t', '6', '-D', $node->data_dir,
 					   '-l', $node->logfile, 'start');
 isnt($exit_code, 0,
 	 'L12 postmaster refuses to start when cluster.shared_storage_backend names an unregistered backend');

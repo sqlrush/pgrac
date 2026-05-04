@@ -197,6 +197,8 @@ static const char *const BuiltinTrancheNames[] = {
 	"ClusterStartupPhase",
 	/* PGRAC LWTRANCHE_CLUSTER_LMON: */
 	"ClusterLmon",
+	/* PGRAC LWTRANCHE_CLUSTER_LCK: */
+	"ClusterLck",
 #endif
 };
 

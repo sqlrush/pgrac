@@ -128,8 +128,8 @@ is($node->safe_psql('postgres', 'SHOW cluster.phase4_timeout'),
 # interconnect listener / heartbeat consumer remain stubs (Stage 1.15+)".
 like($log_l1, qr/cluster phase 1: LMON ready/,
 	 'L4 Phase 1 LMON ready DEBUG1 message logged (spec-1.11 Sprint A real spawn)');
-like($log_l1, qr/Phase 2 stub: skipping LMS/,
-	 'L4 Phase 2 stub DEBUG1 message logged');
+like($log_l1, qr/cluster phase 2: LCK ready/,
+	 'L4 Phase 2 LCK ready DEBUG1 message logged (spec-1.12 Sprint A real spawn)');
 like($log_l1, qr/Phase 3 stub:/,
 	 'L4 Phase 3 stub DEBUG1 message logged');
 like($log_l1, qr/Phase 4 stub:/,
