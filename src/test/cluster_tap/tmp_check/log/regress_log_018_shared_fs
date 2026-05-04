@@ -1,0 +1,88 @@
+# Checking port 11991
+# Found port 11991
+Name: main
+Version: 16.13
+Data directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_018_shared_fs_main_data/pgdata
+Backup directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_018_shared_fs_main_data/backup
+Archive directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_018_shared_fs_main_data/archives
+Connection string: port=11991 host=/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/Sc6OuEb1bN
+Log file: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/018_shared_fs_main.log
+# Running: initdb -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_018_shared_fs_main_data/pgdata -A trust -N
+The files belonging to this database system will be owned by user "yingjiewang".
+This user must also own the server process.
+
+The database cluster will be initialized with this locale configuration:
+  provider:    libc
+  LC_COLLATE:  zh_CN.UTF-8
+  LC_CTYPE:    zh_CN.UTF-8
+  LC_MESSAGES: C
+  LC_MONETARY: zh_CN.UTF-8
+  LC_NUMERIC:  zh_CN.UTF-8
+  LC_TIME:     zh_CN.UTF-8
+The default database encoding has accordingly been set to "UTF8".
+initdb: could not find suitable text search configuration for locale "zh_CN.UTF-8"
+The default text search configuration will be set to "simple".
+
+Data page checksums are disabled.
+
+creating directory /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_018_shared_fs_main_data/pgdata ... ok
+creating subdirectories ... ok
+selecting dynamic shared memory implementation ... posix
+selecting default max_connections ... 100
+selecting default shared_buffers ... 128MB
+selecting default time zone ... Asia/Shanghai
+creating configuration files ... ok
+running bootstrap script ... 2026-05-04 13:37:13.055 CST [19147] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:13.055 CST [19147] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:13.055 CST [19147] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+performing post-bootstrap initialization ... 2026-05-04 13:37:13.181 CST [19149] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:13.181 CST [19149] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:13.181 CST [19149] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+
+Sync to disk skipped.
+The data directory might become corrupt if the operating system crashes.
+
+Success. You can now start the database server using:
+
+    pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_018_shared_fs_main_data/pgdata -l logfile start
+
+# Running: /Users/yingjiewang/linkdb/src/test/cluster_tap/../../../src/test/regress/pg_regress --config-auth /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_018_shared_fs_main_data/pgdata
+### Starting node "main"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_018_shared_fs_main_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/018_shared_fs_main.log -o --cluster-name=main start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "main" is 19155
+[13:37:13.953](0.974s) ok 1 - L1 cluster.shared_storage_backend default is stub
+[13:37:13.965](0.012s) ok 2 - L2 cluster.shared_storage_backend is enum (postmaster context)
+[13:37:13.976](0.011s) ok 3 - L3 cluster.shared_storage_backend enumvals expose all six backends
+[13:37:13.985](0.009s) ok 4 - L4 SET cluster.shared_storage_backend at runtime is rejected (PGC_POSTMASTER)
+### Stopping node "main" using mode fast
+# Running: pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_018_shared_fs_main_data/pgdata -m fast stop
+waiting for server to shut down.... done
+server stopped
+# No postmaster PID for node "main"
+### Starting node "main"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_018_shared_fs_main_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/018_shared_fs_main.log -o --cluster-name=main start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "main" is 19177
+[13:37:14.556](0.571s) ok 5 - L5 cluster.shared_storage_backend = local applied across restart
+[13:37:14.566](0.011s) ok 6 - L6 pg_cluster_state.shared_fs.active_backend reflects override = local
+[13:37:14.576](0.010s) ok 7 - L7 5 cluster_shared_fs wait events registered under type "Cluster: SharedFs"
+[13:37:14.587](0.011s) ok 8 - L8 3 cluster_shared_fs injection points registered
+[13:37:14.596](0.010s) ok 9 - L9 total injection registry size is 51 (14 + 3 stage-1.1 + 3 stage-1.2 + 4 stage-1.3 + 4 stage-1.7)
+[13:37:14.607](0.010s) ok 10 - L10 pg_cluster_state.shared_fs has all 4 expected keys (1.1 + 1.2)
+[13:37:14.615](0.009s) ok 11 - L11 registered_backends lists both built-in backends
+### Stopping node "main" using mode fast
+# Running: pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_018_shared_fs_main_data/pgdata -m fast stop
+waiting for server to shut down.... done
+server stopped
+# No postmaster PID for node "main"
+waiting for server to start.... stopped waiting
+pg_ctl: could not start server
+Examine the log output.
+[13:37:14.841](0.225s) ok 12 - L12 postmaster refuses to start when cluster.shared_storage_backend names an unregistered backend
+[13:37:14.841](0.000s) ok 13 - L13 startup log contains FEATURE_NOT_SUPPORTED message naming the backend id
+[13:37:14.841](0.000s) 1..13

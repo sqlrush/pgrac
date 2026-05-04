@@ -1,0 +1,80 @@
+# Checking port 13296
+# Found port 13296
+Name: main
+Version: 16.13
+Data directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_010_views_main_data/pgdata
+Backup directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_010_views_main_data/backup
+Archive directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_010_views_main_data/archives
+Connection string: port=13296 host=/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/RXYFI6qQsV
+Log file: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/010_views_main.log
+# Running: initdb -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_010_views_main_data/pgdata -A trust -N
+The files belonging to this database system will be owned by user "yingjiewang".
+This user must also own the server process.
+
+The database cluster will be initialized with this locale configuration:
+  provider:    libc
+  LC_COLLATE:  zh_CN.UTF-8
+  LC_CTYPE:    zh_CN.UTF-8
+  LC_MESSAGES: C
+  LC_MONETARY: zh_CN.UTF-8
+  LC_NUMERIC:  zh_CN.UTF-8
+  LC_TIME:     zh_CN.UTF-8
+The default database encoding has accordingly been set to "UTF8".
+initdb: could not find suitable text search configuration for locale "zh_CN.UTF-8"
+The default text search configuration will be set to "simple".
+
+Data page checksums are disabled.
+
+creating directory /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_010_views_main_data/pgdata ... ok
+creating subdirectories ... ok
+selecting dynamic shared memory implementation ... posix
+selecting default max_connections ... 100
+selecting default shared_buffers ... 128MB
+selecting default time zone ... Asia/Shanghai
+creating configuration files ... ok
+running bootstrap script ... 2026-05-04 13:36:58.305 CST [18623] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:36:58.305 CST [18623] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:36:58.305 CST [18623] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+performing post-bootstrap initialization ... 2026-05-04 13:36:58.427 CST [18625] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:36:58.427 CST [18625] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:36:58.427 CST [18625] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+
+Sync to disk skipped.
+The data directory might become corrupt if the operating system crashes.
+
+Success. You can now start the database server using:
+
+    pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_010_views_main_data/pgdata -l logfile start
+
+# Running: /Users/yingjiewang/linkdb/src/test/cluster_tap/../../../src/test/regress/pg_regress --config-auth /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_010_views_main_data/pgdata
+### Starting node "main"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_010_views_main_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/010_views_main.log -o --cluster-name=main start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "main" is 18630
+[13:36:59.237](1.004s) ok 1 - pg_stat_cluster_wait_events returns 58 rows (matches spec-0.11 registration)
+[13:36:59.249](0.012s) ok 2 - 13 distinct Cluster: * types (added BgProc in spec-1.11 Sprint B)
+[13:36:59.259](0.010s) ok 3 - Cluster: ADG has 4 events
+[13:36:59.269](0.009s) ok 4 - Cluster: BufferShip has 5 events
+[13:36:59.278](0.009s) ok 5 - Cluster: GES has 5 events
+[13:36:59.288](0.010s) ok 6 - Cluster: Interconnect has 5 events
+[13:36:59.298](0.010s) ok 7 - Cluster: PCM has 6 events
+[13:36:59.307](0.009s) ok 8 - Cluster: Reconfig has 5 events
+[13:36:59.315](0.009s) ok 9 - Cluster: Recovery has 5 events
+[13:36:59.324](0.009s) ok 10 - Cluster: SCN has 4 events
+[13:36:59.334](0.010s) ok 11 - Cluster: Sinval has 3 events
+[13:36:59.343](0.009s) ok 12 - Cluster: Undo has 4 events
+[13:36:59.353](0.009s) ok 13 - spot-check: 'GesEnqueueAcquire' present exactly once
+[13:36:59.361](0.009s) ok 14 - spot-check: 'PcmBlockReadNS' present exactly once
+[13:36:59.370](0.009s) ok 15 - spot-check: 'SinvalInjectLocalQueue' present exactly once
+[13:36:59.379](0.009s) ok 16 - spot-check: 'InterconnectRdmaSend' present exactly once
+[13:36:59.388](0.010s) ok 17 - spot-check: 'AdgScnSyncWait' present exactly once
+[13:36:59.399](0.011s) ok 18 - pg_stat_activity still works after cluster view extension
+### Stopping node "main" using mode fast
+# Running: pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_010_views_main_data/pgdata -m fast stop
+waiting for server to shut down.... done
+server stopped
+# No postmaster PID for node "main"
+[13:36:59.514](0.114s) 1..18

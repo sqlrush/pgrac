@@ -1,0 +1,101 @@
+# Checking port 24866
+# Found port 24866
+Name: main
+Version: 16.13
+Data directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_022_itl_slot_main_data/pgdata
+Backup directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_022_itl_slot_main_data/backup
+Archive directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_022_itl_slot_main_data/archives
+Connection string: port=24866 host=/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/TwExacPd8Q
+Log file: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/022_itl_slot_main.log
+# Running: initdb -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_022_itl_slot_main_data/pgdata -A trust -N
+The files belonging to this database system will be owned by user "yingjiewang".
+This user must also own the server process.
+
+The database cluster will be initialized with this locale configuration:
+  provider:    libc
+  LC_COLLATE:  zh_CN.UTF-8
+  LC_CTYPE:    zh_CN.UTF-8
+  LC_MESSAGES: C
+  LC_MONETARY: zh_CN.UTF-8
+  LC_NUMERIC:  zh_CN.UTF-8
+  LC_TIME:     zh_CN.UTF-8
+The default database encoding has accordingly been set to "UTF8".
+initdb: could not find suitable text search configuration for locale "zh_CN.UTF-8"
+The default text search configuration will be set to "simple".
+
+Data page checksums are disabled.
+
+creating directory /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_022_itl_slot_main_data/pgdata ... ok
+creating subdirectories ... ok
+selecting dynamic shared memory implementation ... posix
+selecting default max_connections ... 100
+selecting default shared_buffers ... 128MB
+selecting default time zone ... Asia/Shanghai
+creating configuration files ... ok
+running bootstrap script ... 2026-05-04 13:37:27.112 CST [19493] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:27.112 CST [19493] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:27.112 CST [19493] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+performing post-bootstrap initialization ... 2026-05-04 13:37:27.238 CST [19495] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:27.238 CST [19495] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:27.238 CST [19495] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+
+Sync to disk skipped.
+The data directory might become corrupt if the operating system crashes.
+
+Success. You can now start the database server using:
+
+    pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_022_itl_slot_main_data/pgdata -l logfile start
+
+# Running: /Users/yingjiewang/linkdb/src/test/cluster_tap/../../../src/test/regress/pg_regress --config-auth /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_022_itl_slot_main_data/pgdata
+### Starting node "main"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_022_itl_slot_main_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/022_itl_slot_main.log -o --cluster-name=main start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "main" is 19500
+[13:37:28.030](0.992s) ok 1 - L1 pg_cluster_state.block_format category has 9 keys (4 stage-1.4 + 5 stage-1.5)
+[13:37:28.042](0.013s) ok 2 - L2 itl_slot_size_bytes = 48
+[13:37:28.053](0.011s) ok 3 - L3 itl_initrans_default = 8
+[13:37:28.069](0.016s) ok 4 - L4 itl_array_bytes = 384 (= 48 × 8 INITRANS)
+[13:37:28.078](0.010s) ok 5 - L5 tuple_header_extra_bytes = 1 (t_itl_slot_idx)
+[13:37:28.089](0.010s) ok 6 - L6 itl_location = page_special_area_tail (PIVOT A 2026-05-02: ITL in PG special area, not after PageHeader)
+[13:37:28.124](0.035s) ok 7 - L7 PIVOT A heap page: lower=36, special=7808, version=5 (ITL in special area, not after header)
+[13:37:28.134](0.009s) ok 8 - L8 PIVOT A ITL slot array (offset 7808-8191 in special area) is 384 zero bytes
+[13:37:28.143](0.009s) ok 9 - L9 pd_flags PD_HAS_ITL bit (0x0008) set on heap page
+[13:37:28.151](0.009s) ok 10 - L10 HeapTupleHeader t_hoff = 24 (was 23 in vanilla PG)
+[13:37:28.162](0.011s) ok 11 - L11 t_itl_slot_idx raw byte (offset 23 in header) = 0xFF (255 unallocated)
+[13:37:28.172](0.010s) ok 12 - L12a pg_stat_cluster_injections is 51 (1.5 adds no inject points; 4 PCM added by 1.7)
+[13:37:28.182](0.010s) ok 13 - L12b pg_stat_cluster_wait_events still 51 (1.5 adds no wait events)
+[13:37:28.191](0.009s) ok 14 - L12c pg_cluster_shmem 6 rows (1.5 adds no shmem regions; 1.7 adds cluster_pcm_grd; 1.10.1 adds cluster_startup_phase; 1.11 adds cluster_lmon; 1.12 adds cluster_lck)
+[13:37:28.200](0.009s) ok 15 - L13 block_format category integrates with cluster_smoke
+[13:37:28.220](0.020s) ok 16 - L14 8000-byte plain row rejected with "row is too big" (max < 8000 in pgrac 1.5)
+[13:37:28.239](0.020s) ok 17 - L15 tuple with no null bitmap: t_hoff = 24 = SizeofHeapTupleHeader
+[13:37:28.259](0.019s) ok 18 - L16 tuple with 1 null bitmap byte: t_hoff = 32 = MAXALIGN(24+1)
+[13:37:28.289](0.030s) ok 19 - L17 tuple with 64-col null bitmap (8 bytes): t_hoff = 32 = MAXALIGN(24+8)
+[13:37:28.308](0.020s) ok 20 - L18 100-byte plain row succeeds (sanity: small rows fit)
+[13:37:28.329](0.021s) ok 21 - L19 PIVOT A heap page after first INSERT: pd_lower = 36 (NOT 420)
+[13:37:28.340](0.011s) ok 22 - L20 PIVOT A heap page PageGetSpecialSize = 384 (CLUSTER_ITL_ARRAY_SIZE)
+[13:37:28.350](0.011s) ok 23 - L21 PIVOT A heap page max offset = 1 (ItemIds + ITL no longer collide)
+[13:37:28.361](0.010s) ok 24 - L22 PIVOT A heap page PD_HAS_ITL bit (0x0008) set
+[13:37:28.371](0.010s) ok 25 - L23 PIVOT A btree index page PD_HAS_ITL bit NOT set (index special = btree opaque, not ITL)
+[13:37:28.382](0.011s) ok 26 - L24 PIVOT A heap special = ITL all zero; btree special = opaque non-zero (separate semantics)
+### Stopping node "main" using mode immediate
+# Running: pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_022_itl_slot_main_data/pgdata -m immediate stop
+waiting for server to shut down.... done
+server stopped
+# No postmaster PID for node "main"
+### Starting node "main"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_022_itl_slot_main_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/022_itl_slot_main.log -o --cluster-name=main start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "main" is 19585
+[13:37:28.988](0.606s) ok 27 - L25 WAL replay reconstruction: 5 rows present after immediate stop + restart (replay path exercised + ClusterHeapTupleHeaderInitItlSlot in heap_xlog_insert preserved t_itl_slot_idx = 255)
+[13:37:29.011](0.023s) ok 28 - L26 MinimalTuple round-trip (sort -> tuplestore -> heap insert) preserves t_itl_slot_idx = 255 via ClusterMinimalTupleInitItlSlot
+[13:37:29.032](0.020s) ok 29 - L27 expand_tuple round-trip (ALTER TABLE ADD COLUMN DEFAULT) preserves t_itl_slot_idx = 255 via ClusterHeapTupleHeaderInitItlSlot
+### Stopping node "main" using mode fast
+# Running: pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_022_itl_slot_main_data/pgdata -m fast stop
+waiting for server to shut down.... done
+server stopped
+# No postmaster PID for node "main"
+[13:37:29.146](0.115s) 1..29

@@ -1,0 +1,47 @@
+2026-05-04 13:37:06.553 CST [18910] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:06.553 CST [18910] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:06.553 CST [18910] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+2026-05-04 13:37:06.553 CST [18910] LOG:  cluster startup: pre_init -> phase0_base
+2026-05-04 13:37:06.553 CST [18910] LOG:  cluster startup: phase0_base -> phase1_cluster
+2026-05-04 13:37:06.661 CST [18910] LOG:  cluster startup: phase1_cluster -> phase2_lock
+2026-05-04 13:37:06.770 CST [18910] LOG:  cluster startup: phase2_lock -> phase3_recovery
+2026-05-04 13:37:06.771 CST [18910] LOG:  starting PostgreSQL 16.13 on aarch64-apple-darwin25.2.0, compiled by Apple clang version 21.0.0 (clang-2100.0.123.102), 64-bit
+2026-05-04 13:37:06.771 CST [18910] LOG:  listening on Unix socket "/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/fR97C4Wp7v/.s.PGSQL.20887"
+2026-05-04 13:37:06.777 CST [18915] LOG:  database system was shut down at 2026-05-04 13:37:06 CST
+2026-05-04 13:37:06.779 CST [18910] LOG:  cluster startup: phase3_recovery -> phase4_normal
+2026-05-04 13:37:06.889 CST [18910] LOG:  cluster startup: phase4_normal -> running
+2026-05-04 13:37:06.891 CST [18910] LOG:  database system is ready to accept connections
+2026-05-04 13:37:06.992 CST [18921] 014_ic_mock.pl LOG:  statement: SHOW "cluster.interconnect_tier"
+2026-05-04 13:37:07.005 CST [18923] 014_ic_mock.pl LOG:  statement: SELECT count(*)
+			    FROM pg_proc
+			   WHERE proname LIKE 'cluster_ic_mock_%'
+2026-05-04 13:37:07.017 CST [18925] 014_ic_mock.pl LOG:  statement: SELECT cluster_ic_mock_clear_all();
+2026-05-04 13:37:07.018 CST [18925] 014_ic_mock.pl LOG:  statement: SELECT cluster_ic_mock_inject(5, '\xDE'::bytea);
+2026-05-04 13:37:07.018 CST [18925] 014_ic_mock.pl LOG:  statement: SELECT sender, encode(payload, 'hex') FROM cluster_ic_mock_recv_test();
+2026-05-04 13:37:07.028 CST [18927] 014_ic_mock.pl LOG:  statement: SELECT cluster_ic_mock_clear_all();
+2026-05-04 13:37:07.028 CST [18927] 014_ic_mock.pl LOG:  statement: SELECT cluster_ic_mock_inject(1, '\x41'::bytea);
+2026-05-04 13:37:07.028 CST [18927] 014_ic_mock.pl LOG:  statement: SELECT cluster_ic_mock_inject(2, '\x42'::bytea);
+2026-05-04 13:37:07.029 CST [18927] 014_ic_mock.pl LOG:  statement: SELECT cluster_ic_mock_inject(3, '\x43'::bytea);
+2026-05-04 13:37:07.029 CST [18927] 014_ic_mock.pl LOG:  statement: SELECT sender, encode(payload, 'hex') FROM cluster_ic_mock_recv_test();
+2026-05-04 13:37:07.029 CST [18927] 014_ic_mock.pl LOG:  statement: SELECT sender, encode(payload, 'hex') FROM cluster_ic_mock_recv_test();
+2026-05-04 13:37:07.029 CST [18927] 014_ic_mock.pl LOG:  statement: SELECT sender, encode(payload, 'hex') FROM cluster_ic_mock_recv_test();
+2026-05-04 13:37:07.038 CST [18929] 014_ic_mock.pl LOG:  statement: SELECT cluster_ic_mock_clear_all();
+2026-05-04 13:37:07.038 CST [18929] 014_ic_mock.pl LOG:  statement: SELECT count(*) FROM cluster_ic_mock_recv_test();
+2026-05-04 13:37:07.048 CST [18931] 014_ic_mock.pl LOG:  statement: SELECT cluster_ic_mock_clear_all()
+2026-05-04 13:37:07.057 CST [18933] 014_ic_mock.pl LOG:  statement: SELECT count(*) FROM cluster_ic_mock_drain_outbound(7)
+2026-05-04 13:37:07.066 CST [18936] 014_ic_mock.pl LOG:  statement: SELECT * FROM cluster_ic_mock_drain_outbound(200)
+2026-05-04 13:37:07.067 CST [18936] 014_ic_mock.pl ERROR:  target_node_id 200 out of range [0, 128)
+2026-05-04 13:37:07.067 CST [18936] 014_ic_mock.pl STATEMENT:  SELECT * FROM cluster_ic_mock_drain_outbound(200)
+2026-05-04 13:37:07.076 CST [18938] 014_ic_mock.pl LOG:  statement: SELECT cluster_ic_mock_inject(1, '\x41'::bytea);
+2026-05-04 13:37:07.076 CST [18938] 014_ic_mock.pl LOG:  statement: SELECT cluster_ic_mock_inject(2, '\x42'::bytea);
+2026-05-04 13:37:07.076 CST [18938] 014_ic_mock.pl LOG:  statement: SELECT cluster_ic_mock_clear_all();
+2026-05-04 13:37:07.077 CST [18938] 014_ic_mock.pl LOG:  statement: SELECT count(*) FROM cluster_ic_mock_recv_test();
+2026-05-04 13:37:08.168 CST [18969] 014_ic_mock.pl LOG:  statement: SELECT count(*) FROM pg_stat_cluster_wait_events
+2026-05-04 13:37:08.174 CST [18910] LOG:  received fast shutdown request
+2026-05-04 13:37:08.174 CST [18910] LOG:  aborting any active transactions
+2026-05-04 13:37:08.175 CST [18910] LOG:  background worker "logical replication launcher" (PID 18919) exited with exit code 1
+2026-05-04 13:37:08.175 CST [18913] LOG:  shutting down
+2026-05-04 13:37:08.175 CST [18913] LOG:  checkpoint starting: shutdown immediate
+2026-05-04 13:37:08.176 CST [18913] LOG:  checkpoint complete: wrote 3 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.001 s, sync=0.000 s, total=0.002 s; sync files=0, longest=0.000 s, average=0.000 s; distance=0 kB, estimate=0 kB; lsn=0/1532090, redo lsn=0/1532090
+2026-05-04 13:37:08.177 CST [18910] LOG:  cluster startup: running -> shutdown
+2026-05-04 13:37:08.178 CST [18910] LOG:  database system is shut down

@@ -1,0 +1,76 @@
+2026-05-04 13:36:53.323 CST [18475] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:36:53.323 CST [18475] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:36:53.323 CST [18475] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+2026-05-04 13:36:53.323 CST [18475] LOG:  cluster startup: pre_init -> phase0_base
+2026-05-04 13:36:53.323 CST [18475] LOG:  cluster startup: phase0_base -> phase1_cluster
+2026-05-04 13:36:53.429 CST [18475] LOG:  cluster startup: phase1_cluster -> phase2_lock
+2026-05-04 13:36:53.538 CST [18475] LOG:  cluster startup: phase2_lock -> phase3_recovery
+2026-05-04 13:36:53.538 CST [18475] LOG:  starting PostgreSQL 16.13 on aarch64-apple-darwin25.2.0, compiled by Apple clang version 21.0.0 (clang-2100.0.123.102), 64-bit
+2026-05-04 13:36:53.539 CST [18475] LOG:  listening on Unix socket "/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/zUScschdHp/.s.PGSQL.20591"
+2026-05-04 13:36:53.544 CST [18480] LOG:  database system was shut down at 2026-05-04 13:36:53 CST
+2026-05-04 13:36:53.546 CST [18475] LOG:  cluster startup: phase3_recovery -> phase4_normal
+2026-05-04 13:36:53.657 CST [18475] LOG:  cluster startup: phase4_normal -> running
+2026-05-04 13:36:53.659 CST [18475] LOG:  database system is ready to accept connections
+2026-05-04 13:36:53.757 CST [18486] 007_guc.pl LOG:  statement: SHOW "cluster.node_id"
+2026-05-04 13:36:53.769 CST [18488] 007_guc.pl LOG:  statement: SELECT setting, vartype, min_val, max_val, context
+		    FROM pg_settings
+		   WHERE name = 'cluster.node_id'
+2026-05-04 13:36:53.780 CST [18490] 007_guc.pl LOG:  statement: SET "cluster.node_id" = 5
+2026-05-04 13:36:53.780 CST [18490] 007_guc.pl ERROR:  parameter "cluster.node_id" cannot be changed without restarting the server
+2026-05-04 13:36:53.780 CST [18490] 007_guc.pl STATEMENT:  SET "cluster.node_id" = 5
+2026-05-04 13:36:53.785 CST [18475] LOG:  received fast shutdown request
+2026-05-04 13:36:53.785 CST [18475] LOG:  aborting any active transactions
+2026-05-04 13:36:53.786 CST [18475] LOG:  background worker "logical replication launcher" (PID 18484) exited with exit code 1
+2026-05-04 13:36:53.786 CST [18478] LOG:  shutting down
+2026-05-04 13:36:53.786 CST [18478] LOG:  checkpoint starting: shutdown immediate
+2026-05-04 13:36:53.787 CST [18478] LOG:  checkpoint complete: wrote 3 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.001 s, sync=0.001 s, total=0.002 s; sync files=0, longest=0.000 s, average=0.000 s; distance=0 kB, estimate=0 kB; lsn=0/1532090, redo lsn=0/1532090
+2026-05-04 13:36:53.788 CST [18475] LOG:  cluster startup: running -> shutdown
+2026-05-04 13:36:53.789 CST [18475] LOG:  database system is shut down
+2026-05-04 13:36:53.925 CST [18494] LOG:  [cluster node=7 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:36:53.925 CST [18494] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=7)
+2026-05-04 13:36:53.925 CST [18494] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+2026-05-04 13:36:53.925 CST [18494] LOG:  cluster startup: pre_init -> phase0_base
+2026-05-04 13:36:53.925 CST [18494] LOG:  cluster startup: phase0_base -> phase1_cluster
+2026-05-04 13:36:54.031 CST [18494] LOG:  cluster startup: phase1_cluster -> phase2_lock
+2026-05-04 13:36:54.141 CST [18494] LOG:  cluster startup: phase2_lock -> phase3_recovery
+2026-05-04 13:36:54.141 CST [18494] LOG:  starting PostgreSQL 16.13 on aarch64-apple-darwin25.2.0, compiled by Apple clang version 21.0.0 (clang-2100.0.123.102), 64-bit
+2026-05-04 13:36:54.142 CST [18494] LOG:  listening on Unix socket "/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/zUScschdHp/.s.PGSQL.20591"
+2026-05-04 13:36:54.148 CST [18499] LOG:  database system was shut down at 2026-05-04 13:36:53 CST
+2026-05-04 13:36:54.150 CST [18494] LOG:  cluster startup: phase3_recovery -> phase4_normal
+2026-05-04 13:36:54.253 CST [18494] LOG:  cluster startup: phase4_normal -> running
+2026-05-04 13:36:54.255 CST [18494] LOG:  database system is ready to accept connections
+2026-05-04 13:36:54.358 CST [18505] 007_guc.pl LOG:  statement: SHOW "cluster.node_id"
+2026-05-04 13:36:54.370 CST [18507] 007_guc.pl LOG:  statement: SELECT source FROM pg_settings WHERE name = 'cluster.node_id'
+2026-05-04 13:36:54.382 CST [18509] 007_guc.pl LOG:  statement: SHOW "cluster.interconnect_tier"
+2026-05-04 13:36:54.392 CST [18511] 007_guc.pl LOG:  statement: SELECT vartype, context FROM pg_settings WHERE name = 'cluster.interconnect_tier'
+2026-05-04 13:36:54.402 CST [18513] 007_guc.pl LOG:  statement: SELECT array_to_string(enumvals, ',')
+		    FROM pg_settings WHERE name = 'cluster.interconnect_tier'
+2026-05-04 13:36:54.412 CST [18515] 007_guc.pl LOG:  statement: SHOW "cluster.config_file"
+2026-05-04 13:36:54.421 CST [18517] 007_guc.pl LOG:  statement: SHOW "cluster.injection_points"
+2026-05-04 13:36:54.430 CST [18519] 007_guc.pl LOG:  statement: SET "cluster.injection_points" = 'cluster-init-pre-shmem'
+2026-05-04 13:36:54.434 CST [18494] LOG:  received fast shutdown request
+2026-05-04 13:36:54.434 CST [18494] LOG:  aborting any active transactions
+2026-05-04 13:36:54.435 CST [18494] LOG:  background worker "logical replication launcher" (PID 18503) exited with exit code 1
+2026-05-04 13:36:54.435 CST [18497] LOG:  shutting down
+2026-05-04 13:36:54.436 CST [18497] LOG:  checkpoint starting: shutdown immediate
+2026-05-04 13:36:54.436 CST [18497] LOG:  checkpoint complete: wrote 3 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.001 s, sync=0.001 s, total=0.001 s; sync files=0, longest=0.000 s, average=0.000 s; distance=0 kB, estimate=0 kB; lsn=0/1532108, redo lsn=0/1532108
+2026-05-04 13:36:54.437 CST [18494] LOG:  cluster startup: running -> shutdown
+2026-05-04 13:36:54.438 CST [18494] LOG:  database system is shut down
+2026-05-04 13:36:54.572 CST [18523] WARNING:  999 is outside the valid range for parameter "cluster.node_id" (-1 .. 127)
+2026-05-04 13:36:54.573 CST [18523] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:36:54.573 CST [18523] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:36:54.573 CST [18523] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+2026-05-04 13:36:54.574 CST [18523] LOG:  cluster startup: pre_init -> phase0_base
+2026-05-04 13:36:54.574 CST [18523] LOG:  cluster startup: phase0_base -> phase1_cluster
+2026-05-04 13:36:54.678 CST [18523] LOG:  cluster startup: phase1_cluster -> phase2_lock
+2026-05-04 13:36:54.781 CST [18523] LOG:  cluster startup: phase2_lock -> phase3_recovery
+2026-05-04 13:36:54.781 CST [18523] LOG:  starting PostgreSQL 16.13 on aarch64-apple-darwin25.2.0, compiled by Apple clang version 21.0.0 (clang-2100.0.123.102), 64-bit
+2026-05-04 13:36:54.781 CST [18523] LOG:  listening on Unix socket "/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/zUScschdHp/.s.PGSQL.20591"
+2026-05-04 13:36:54.787 CST [18528] LOG:  database system was shut down at 2026-05-04 13:36:54 CST
+2026-05-04 13:36:54.790 CST [18523] LOG:  cluster startup: phase3_recovery -> phase4_normal
+2026-05-04 13:36:54.896 CST [18523] LOG:  cluster startup: phase4_normal -> running
+2026-05-04 13:36:54.898 CST [18523] LOG:  database system is ready to accept connections
+2026-05-04 13:36:54.990 CST [18534] 007_guc.pl LOG:  statement: SHOW "cluster.node_id"
+2026-05-04 13:36:54.995 CST [18523] LOG:  received immediate shutdown request
+2026-05-04 13:36:54.996 CST [18523] LOG:  cluster startup: running -> shutdown
+2026-05-04 13:36:54.996 CST [18523] LOG:  database system is shut down

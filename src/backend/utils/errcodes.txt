@@ -455,6 +455,8 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 53R0B    E    ERRCODE_CLUSTER_LMON_NOT_READY                                 cluster_lmon_not_ready
 53R0C    E    ERRCODE_CLUSTER_LCK_SPAWN_FAILED                               cluster_lck_spawn_failed
 53R0D    E    ERRCODE_CLUSTER_LCK_NOT_READY                                  cluster_lck_not_ready
+53R0E    E    ERRCODE_CLUSTER_DIAG_SPAWN_FAILED                              cluster_diag_spawn_failed
+53R0F    E    ERRCODE_CLUSTER_DIAG_NOT_READY                                 cluster_diag_not_ready
 
 Section: Class 54 - Program Limit Exceeded
 

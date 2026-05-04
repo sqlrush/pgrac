@@ -52,7 +52,7 @@
 #include "pgtime.h"				/* for pg_time_t */
 
 
-#define InvalidPid				(-1)
+#define InvalidPid (-1)
 
 
 /*****************************************************************************
@@ -132,50 +132,47 @@ extern void ProcessInterrupts(void);
 
 /* Test whether an interrupt is pending */
 #ifndef WIN32
-#define INTERRUPTS_PENDING_CONDITION() \
-	(unlikely(InterruptPending))
+#define INTERRUPTS_PENDING_CONDITION() (unlikely(InterruptPending))
 #else
-#define INTERRUPTS_PENDING_CONDITION() \
-	(unlikely(UNBLOCKED_SIGNAL_QUEUE()) ? \
-	 pgwin32_dispatch_queued_signals() : (void) 0, \
+#define INTERRUPTS_PENDING_CONDITION()                                                             \
+	(unlikely(UNBLOCKED_SIGNAL_QUEUE()) ? pgwin32_dispatch_queued_signals() : (void)0,             \
 	 unlikely(InterruptPending))
 #endif
 
 /* Service interrupt, if one is pending and it's safe to service it now */
-#define CHECK_FOR_INTERRUPTS() \
-do { \
-	if (INTERRUPTS_PENDING_CONDITION()) \
-		ProcessInterrupts(); \
-} while(0)
+#define CHECK_FOR_INTERRUPTS()                                                                     \
+	do {                                                                                           \
+		if (INTERRUPTS_PENDING_CONDITION())                                                        \
+			ProcessInterrupts();                                                                   \
+	} while (0)
 
 /* Is ProcessInterrupts() guaranteed to clear InterruptPending? */
-#define INTERRUPTS_CAN_BE_PROCESSED() \
-	(InterruptHoldoffCount == 0 && CritSectionCount == 0 && \
-	 QueryCancelHoldoffCount == 0)
+#define INTERRUPTS_CAN_BE_PROCESSED()                                                              \
+	(InterruptHoldoffCount == 0 && CritSectionCount == 0 && QueryCancelHoldoffCount == 0)
 
-#define HOLD_INTERRUPTS()  (InterruptHoldoffCount++)
+#define HOLD_INTERRUPTS() (InterruptHoldoffCount++)
 
-#define RESUME_INTERRUPTS() \
-do { \
-	Assert(InterruptHoldoffCount > 0); \
-	InterruptHoldoffCount--; \
-} while(0)
+#define RESUME_INTERRUPTS()                                                                        \
+	do {                                                                                           \
+		Assert(InterruptHoldoffCount > 0);                                                         \
+		InterruptHoldoffCount--;                                                                   \
+	} while (0)
 
-#define HOLD_CANCEL_INTERRUPTS()  (QueryCancelHoldoffCount++)
+#define HOLD_CANCEL_INTERRUPTS() (QueryCancelHoldoffCount++)
 
-#define RESUME_CANCEL_INTERRUPTS() \
-do { \
-	Assert(QueryCancelHoldoffCount > 0); \
-	QueryCancelHoldoffCount--; \
-} while(0)
+#define RESUME_CANCEL_INTERRUPTS()                                                                 \
+	do {                                                                                           \
+		Assert(QueryCancelHoldoffCount > 0);                                                       \
+		QueryCancelHoldoffCount--;                                                                 \
+	} while (0)
 
-#define START_CRIT_SECTION()  (CritSectionCount++)
+#define START_CRIT_SECTION() (CritSectionCount++)
 
-#define END_CRIT_SECTION() \
-do { \
-	Assert(CritSectionCount > 0); \
-	CritSectionCount--; \
-} while(0)
+#define END_CRIT_SECTION()                                                                         \
+	do {                                                                                           \
+		Assert(CritSectionCount > 0);                                                              \
+		CritSectionCount--;                                                                        \
+	} while (0)
 
 
 /*****************************************************************************
@@ -250,16 +247,16 @@ extern PGDLLIMPORT Oid MyDatabaseTableSpace;
  */
 
 /* valid DateStyle values */
-#define USE_POSTGRES_DATES		0
-#define USE_ISO_DATES			1
-#define USE_SQL_DATES			2
-#define USE_GERMAN_DATES		3
-#define USE_XSD_DATES			4
+#define USE_POSTGRES_DATES 0
+#define USE_ISO_DATES 1
+#define USE_SQL_DATES 2
+#define USE_GERMAN_DATES 3
+#define USE_XSD_DATES 4
 
 /* valid DateOrder values */
-#define DATEORDER_YMD			0
-#define DATEORDER_DMY			1
-#define DATEORDER_MDY			2
+#define DATEORDER_YMD 0
+#define DATEORDER_DMY 1
+#define DATEORDER_MDY 2
 
 extern PGDLLIMPORT int DateStyle;
 extern PGDLLIMPORT int DateOrder;
@@ -271,14 +268,14 @@ extern PGDLLIMPORT int DateOrder;
  *	 INTSTYLE_SQL_STANDARD		   SQL standard interval literals
  *	 INTSTYLE_ISO_8601			   ISO-8601-basic formatted intervals
  */
-#define INTSTYLE_POSTGRES			0
-#define INTSTYLE_POSTGRES_VERBOSE	1
-#define INTSTYLE_SQL_STANDARD		2
-#define INTSTYLE_ISO_8601			3
+#define INTSTYLE_POSTGRES 0
+#define INTSTYLE_POSTGRES_VERBOSE 1
+#define INTSTYLE_SQL_STANDARD 2
+#define INTSTYLE_ISO_8601 3
 
 extern PGDLLIMPORT int IntervalStyle;
 
-#define MAXTZLEN		10		/* max TZ name len, not counting tr. null */
+#define MAXTZLEN 10 /* max TZ name len, not counting tr. null */
 
 extern PGDLLIMPORT bool enableFsync;
 extern PGDLLIMPORT bool allowSystemTableMods;
@@ -326,7 +323,7 @@ extern void PreventCommandDuringRecovery(const char *cmdname);
 
 /* in utils/misc/guc_tables.c */
 extern PGDLLIMPORT int trace_recovery_messages;
-extern int	trace_recovery(int trace_level);
+extern int trace_recovery(int trace_level);
 
 /*****************************************************************************
  *	  pdir.h --																 *
@@ -334,9 +331,9 @@ extern int	trace_recovery(int trace_level);
  *****************************************************************************/
 
 /* flags to be OR'd to form sec_context */
-#define SECURITY_LOCAL_USERID_CHANGE	0x0001
-#define SECURITY_RESTRICTED_OPERATION	0x0002
-#define SECURITY_NOFORCE_RLS			0x0004
+#define SECURITY_LOCAL_USERID_CHANGE 0x0001
+#define SECURITY_RESTRICTED_OPERATION 0x0002
+#define SECURITY_NOFORCE_RLS 0x0004
 
 extern PGDLLIMPORT char *DatabasePath;
 
@@ -347,8 +344,7 @@ extern void InitProcessLocalLatch(void);
 extern void SwitchToSharedLatch(void);
 extern void SwitchBackToLocalLatch(void);
 
-typedef enum BackendType
-{
+typedef enum BackendType {
 	B_INVALID = 0,
 	B_ARCHIVER,
 	B_AUTOVAC_LAUNCHER,
@@ -391,7 +387,7 @@ typedef enum BackendType
 
 extern PGDLLIMPORT BackendType MyBackendType;
 
-#define AmRegularBackendProcess()	(MyBackendType == B_BACKEND)
+#define AmRegularBackendProcess() (MyBackendType == B_BACKEND)
 
 extern const char *GetBackendTypeDesc(BackendType backendType);
 
@@ -401,11 +397,11 @@ extern void SetDataDir(const char *dir);
 extern void ChangeToDataDir(void);
 
 extern char *GetUserNameFromId(Oid roleid, bool noerr);
-extern Oid	GetUserId(void);
-extern Oid	GetOuterUserId(void);
-extern Oid	GetSessionUserId(void);
+extern Oid GetUserId(void);
+extern Oid GetOuterUserId(void);
+extern Oid GetSessionUserId(void);
 extern bool GetSessionUserIsSuperuser(void);
-extern Oid	GetAuthenticatedUserId(void);
+extern Oid GetAuthenticatedUserId(void);
 extern bool GetAuthenticatedUserIsSuperuser(void);
 extern void SetAuthenticatedUserId(Oid userid, bool is_superuser);
 extern void GetUserIdAndSecContext(Oid *userid, int *sec_context);
@@ -418,15 +414,14 @@ extern void SetUserIdAndContext(Oid userid, bool sec_def_context);
 extern void InitializeSessionUserId(const char *rolename, Oid roleid);
 extern void InitializeSessionUserIdStandalone(void);
 extern void SetSessionAuthorization(Oid userid, bool is_superuser);
-extern Oid	GetCurrentRoleId(void);
+extern Oid GetCurrentRoleId(void);
 extern void SetCurrentRoleId(Oid roleid, bool is_superuser);
-extern void InitializeSystemUser(const char *authn_id,
-								 const char *auth_method);
+extern void InitializeSystemUser(const char *authn_id, const char *auth_method);
 extern const char *GetSystemUser(void);
 
 /* in utils/misc/superuser.c */
-extern bool superuser(void);	/* current user is superuser */
-extern bool superuser_arg(Oid roleid);	/* given user is superuser */
+extern bool superuser(void);		   /* current user is superuser */
+extern bool superuser_arg(Oid roleid); /* given user is superuser */
 
 
 /*****************************************************************************
@@ -453,28 +448,26 @@ extern bool superuser_arg(Oid roleid);	/* given user is superuser */
  * executed normally.
  */
 
-typedef enum ProcessingMode
-{
-	BootstrapProcessing,		/* bootstrap creation of template database */
-	InitProcessing,				/* initializing system */
-	NormalProcessing			/* normal processing */
+typedef enum ProcessingMode {
+	BootstrapProcessing, /* bootstrap creation of template database */
+	InitProcessing,		 /* initializing system */
+	NormalProcessing	 /* normal processing */
 } ProcessingMode;
 
 extern PGDLLIMPORT ProcessingMode Mode;
 
 #define IsBootstrapProcessingMode() (Mode == BootstrapProcessing)
-#define IsInitProcessingMode()		(Mode == InitProcessing)
-#define IsNormalProcessingMode()	(Mode == NormalProcessing)
+#define IsInitProcessingMode() (Mode == InitProcessing)
+#define IsNormalProcessingMode() (Mode == NormalProcessing)
 
 #define GetProcessingMode() Mode
 
-#define SetProcessingMode(mode) \
-	do { \
-		Assert((mode) == BootstrapProcessing || \
-				  (mode) == InitProcessing || \
-				  (mode) == NormalProcessing); \
-		Mode = (mode); \
-	} while(0)
+#define SetProcessingMode(mode)                                                                    \
+	do {                                                                                           \
+		Assert((mode) == BootstrapProcessing || (mode) == InitProcessing                           \
+			   || (mode) == NormalProcessing);                                                     \
+		Mode = (mode);                                                                             \
+	} while (0)
 
 
 /*
@@ -485,8 +478,7 @@ extern PGDLLIMPORT ProcessingMode Mode;
  * Make sure to list in the glossary any items you add here.
  */
 
-typedef enum
-{
+typedef enum {
 	NotAnAuxProcess = -1,
 	StartupProcess = 0,
 	BgWriterProcess,
@@ -513,22 +505,32 @@ typedef enum
 	 * Stage 2+ GES feature.  See cluster_lck.h.
 	 */
 	LckProcess,
+	/*
+	 * DIAG (Diagnostic Process) is stage 1.13 Sprint A's third real
+	 * cluster background process; cross-node diagnostic placeholder.
+	 * Appended after LckProcess to preserve numeric values.  Lifecycle
+	 * skeleton only; real diagnostic snapshot / hang dump / cross-node
+	 * DIAG request protocol lands in Stage 2+ when interconnect is
+	 * fully wired.  See cluster_diag.h.
+	 */
+	DiagProcess,
 #endif
 
-	NUM_AUXPROCTYPES			/* Must be last! */
+	NUM_AUXPROCTYPES /* Must be last! */
 } AuxProcType;
 
 extern PGDLLIMPORT AuxProcType MyAuxProcType;
 
-#define AmStartupProcess()			(MyAuxProcType == StartupProcess)
+#define AmStartupProcess() (MyAuxProcType == StartupProcess)
 #define AmBackgroundWriterProcess() (MyAuxProcType == BgWriterProcess)
-#define AmArchiverProcess()			(MyAuxProcType == ArchiverProcess)
-#define AmCheckpointerProcess()		(MyAuxProcType == CheckpointerProcess)
-#define AmWalWriterProcess()		(MyAuxProcType == WalWriterProcess)
-#define AmWalReceiverProcess()		(MyAuxProcType == WalReceiverProcess)
+#define AmArchiverProcess() (MyAuxProcType == ArchiverProcess)
+#define AmCheckpointerProcess() (MyAuxProcType == CheckpointerProcess)
+#define AmWalWriterProcess() (MyAuxProcType == WalWriterProcess)
+#define AmWalReceiverProcess() (MyAuxProcType == WalReceiverProcess)
 #ifdef USE_PGRAC_CLUSTER
-#define AmLmonProcess()				(MyAuxProcType == LmonProcess)
-#define AmLckProcess()				(MyAuxProcType == LckProcess)
+#define AmLmonProcess() (MyAuxProcType == LmonProcess)
+#define AmLckProcess() (MyAuxProcType == LckProcess)
+#define AmDiagProcess() (MyAuxProcType == DiagProcess)
 #endif
 
 
@@ -540,10 +542,8 @@ extern PGDLLIMPORT AuxProcType MyAuxProcType;
 /* in utils/init/postinit.c */
 extern void pg_split_opts(char **argv, int *argcp, const char *optstr);
 extern void InitializeMaxBackends(void);
-extern void InitPostgres(const char *in_dbname, Oid dboid,
-						 const char *username, Oid useroid,
-						 bool load_session_libraries,
-						 bool override_allow_connections,
+extern void InitPostgres(const char *in_dbname, Oid dboid, const char *username, Oid useroid,
+						 bool load_session_libraries, bool override_allow_connections,
 						 char *out_dbname);
 extern void BaseInit(void);
 
@@ -557,8 +557,7 @@ extern PGDLLIMPORT char *shared_preload_libraries_string;
 extern PGDLLIMPORT char *local_preload_libraries_string;
 
 extern void CreateDataDirLockFile(bool amPostmaster);
-extern void CreateSocketLockFile(const char *socketfile, bool amPostmaster,
-								 const char *socketDir);
+extern void CreateSocketLockFile(const char *socketfile, bool amPostmaster, const char *socketDir);
 extern void TouchSocketLockFiles(void);
 extern void AddToDataDirLockFile(int target_line, const char *str);
 extern bool RecheckDataDirLockFile(void);
@@ -569,7 +568,7 @@ extern void process_shmem_requests(void);
 extern void pg_bindtextdomain(const char *domain);
 extern bool has_rolreplication(Oid roleid);
 
-typedef void (*shmem_request_hook_type) (void);
+typedef void (*shmem_request_hook_type)(void);
 extern PGDLLIMPORT shmem_request_hook_type shmem_request_hook;
 
 extern Size EstimateClientConnectionInfoSpace(void);
@@ -579,4 +578,4 @@ extern void RestoreClientConnectionInfo(char *conninfo);
 /* in executor/nodeHash.c */
 extern size_t get_hash_memory_limit(void);
 
-#endif							/* MISCADMIN_H */
+#endif /* MISCADMIN_H */

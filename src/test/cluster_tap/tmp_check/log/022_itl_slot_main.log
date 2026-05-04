@@ -1,0 +1,139 @@
+2026-05-04 13:37:27.589 CST [19500] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:27.589 CST [19500] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:27.589 CST [19500] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+2026-05-04 13:37:27.590 CST [19500] LOG:  cluster startup: pre_init -> phase0_base
+2026-05-04 13:37:27.590 CST [19500] LOG:  cluster startup: phase0_base -> phase1_cluster
+2026-05-04 13:37:27.692 CST [19500] LOG:  cluster startup: phase1_cluster -> phase2_lock
+2026-05-04 13:37:27.792 CST [19500] LOG:  cluster startup: phase2_lock -> phase3_recovery
+2026-05-04 13:37:27.792 CST [19500] LOG:  starting PostgreSQL 16.13 on aarch64-apple-darwin25.2.0, compiled by Apple clang version 21.0.0 (clang-2100.0.123.102), 64-bit
+2026-05-04 13:37:27.793 CST [19500] LOG:  listening on Unix socket "/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/TwExacPd8Q/.s.PGSQL.24866"
+2026-05-04 13:37:27.798 CST [19505] LOG:  database system was shut down at 2026-05-04 13:37:27 CST
+2026-05-04 13:37:27.800 CST [19500] LOG:  cluster startup: phase3_recovery -> phase4_normal
+2026-05-04 13:37:27.910 CST [19500] LOG:  cluster startup: phase4_normal -> running
+2026-05-04 13:37:27.912 CST [19500] LOG:  database system is ready to accept connections
+2026-05-04 13:37:28.027 CST [19511] 022_itl_slot.pl LOG:  statement: SELECT count(*) FROM pg_cluster_state WHERE category='block_format'
+2026-05-04 13:37:28.041 CST [19513] 022_itl_slot.pl LOG:  statement: SELECT value FROM pg_cluster_state
+			   WHERE category='block_format' AND key='itl_slot_size_bytes'
+2026-05-04 13:37:28.052 CST [19515] 022_itl_slot.pl LOG:  statement: SELECT value FROM pg_cluster_state
+			   WHERE category='block_format' AND key='itl_initrans_default'
+2026-05-04 13:37:28.068 CST [19517] 022_itl_slot.pl LOG:  statement: SELECT value FROM pg_cluster_state
+			   WHERE category='block_format' AND key='itl_array_bytes'
+2026-05-04 13:37:28.077 CST [19519] 022_itl_slot.pl LOG:  statement: SELECT value FROM pg_cluster_state
+			   WHERE category='block_format' AND key='tuple_header_extra_bytes'
+2026-05-04 13:37:28.088 CST [19521] 022_itl_slot.pl LOG:  statement: SELECT value FROM pg_cluster_state
+			   WHERE category='block_format' AND key='itl_location'
+2026-05-04 13:37:28.098 CST [19523] 022_itl_slot.pl LOG:  statement: SELECT count(*) FROM pg_available_extensions WHERE name='pageinspect'
+2026-05-04 13:37:28.108 CST [19525] 022_itl_slot.pl LOG:  statement: CREATE EXTENSION IF NOT EXISTS pageinspect;
+2026-05-04 13:37:28.112 CST [19525] 022_itl_slot.pl LOG:  statement: CREATE TABLE t1 (a int);
+2026-05-04 13:37:28.113 CST [19525] 022_itl_slot.pl LOG:  statement: INSERT INTO t1 VALUES (1);
+2026-05-04 13:37:28.123 CST [19527] 022_itl_slot.pl LOG:  statement: SELECT lower::text || ',' || special::text || ',' || version::text
+			  FROM page_header(get_raw_page('t1', 0))
+2026-05-04 13:37:28.132 CST [19529] 022_itl_slot.pl LOG:  statement: SELECT encode(substring(get_raw_page('t1', 0), 7809, 384), 'hex') =
+			       repeat('00', 384)
+2026-05-04 13:37:28.141 CST [19531] 022_itl_slot.pl LOG:  statement: SELECT encode(substring(get_raw_page('t1', 0), 11, 2), 'hex')
+2026-05-04 13:37:28.150 CST [19533] 022_itl_slot.pl LOG:  statement: SELECT DISTINCT t_hoff FROM heap_page_items(get_raw_page('t1', 0))
+				   WHERE t_hoff IS NOT NULL
+2026-05-04 13:37:28.160 CST [19535] 022_itl_slot.pl LOG:  statement: WITH lp AS (
+			  SELECT lp_off
+			    FROM heap_page_items(get_raw_page('t1', 0))
+			   WHERE t_data IS NOT NULL
+			   LIMIT 1
+			)
+			SELECT encode(
+			         substring(get_raw_page('t1', 0),
+			                   (SELECT lp_off FROM lp) + 24,
+			                   1),
+			         'hex')
+		
+2026-05-04 13:37:28.171 CST [19537] 022_itl_slot.pl LOG:  statement: SELECT count(*) FROM pg_stat_cluster_injections
+2026-05-04 13:37:28.181 CST [19539] 022_itl_slot.pl LOG:  statement: SELECT count(*) FROM pg_stat_cluster_wait_events
+2026-05-04 13:37:28.190 CST [19541] 022_itl_slot.pl LOG:  statement: SELECT count(*) FROM pg_cluster_shmem
+2026-05-04 13:37:28.199 CST [19543] 022_itl_slot.pl LOG:  statement: SELECT count(*) FROM pg_cluster_state WHERE category='block_format'
+2026-05-04 13:37:28.208 CST [19545] 022_itl_slot.pl LOG:  statement: CREATE TABLE row_size_test (a text);
+2026-05-04 13:37:28.210 CST [19545] 022_itl_slot.pl LOG:  statement: ALTER TABLE row_size_test ALTER COLUMN a SET STORAGE plain;
+2026-05-04 13:37:28.219 CST [19547] 022_itl_slot.pl LOG:  statement: INSERT INTO row_size_test VALUES (repeat('x', 8000));
+2026-05-04 13:37:28.219 CST [19547] 022_itl_slot.pl ERROR:  row is too big: size 8032, maximum size 7768
+2026-05-04 13:37:28.219 CST [19547] 022_itl_slot.pl STATEMENT:  INSERT INTO row_size_test VALUES (repeat('x', 8000));
+2026-05-04 13:37:28.227 CST [19549] 022_itl_slot.pl LOG:  statement: CREATE TABLE no_null_test (a int NOT NULL, b int NOT NULL);
+2026-05-04 13:37:28.228 CST [19549] 022_itl_slot.pl LOG:  statement: INSERT INTO no_null_test VALUES (1, 2);
+2026-05-04 13:37:28.237 CST [19551] 022_itl_slot.pl LOG:  statement: SELECT DISTINCT t_hoff FROM heap_page_items(get_raw_page('no_null_test', 0))
+				   WHERE t_hoff IS NOT NULL
+2026-05-04 13:37:28.248 CST [19553] 022_itl_slot.pl LOG:  statement: CREATE TABLE one_null_test (a int, b int);
+2026-05-04 13:37:28.249 CST [19553] 022_itl_slot.pl LOG:  statement: INSERT INTO one_null_test VALUES (1, NULL);
+2026-05-04 13:37:28.257 CST [19555] 022_itl_slot.pl LOG:  statement: SELECT DISTINCT t_hoff FROM heap_page_items(get_raw_page('one_null_test', 0))
+				   WHERE t_hoff IS NOT NULL
+2026-05-04 13:37:28.267 CST [19557] 022_itl_slot.pl LOG:  statement: CREATE TABLE wide_null_test (c1 int, c2 int, c3 int, c4 int, c5 int, c6 int, c7 int, c8 int, c9 int, c10 int, c11 int, c12 int, c13 int, c14 int, c15 int, c16 int, c17 int, c18 int, c19 int, c20 int, c21 int, c22 int, c23 int, c24 int, c25 int, c26 int, c27 int, c28 int, c29 int, c30 int, c31 int, c32 int, c33 int, c34 int, c35 int, c36 int, c37 int, c38 int, c39 int, c40 int, c41 int, c42 int, c43 int, c44 int, c45 int, c46 int, c47 int, c48 int, c49 int, c50 int, c51 int, c52 int, c53 int, c54 int, c55 int, c56 int, c57 int, c58 int, c59 int, c60 int, c61 int, c62 int, c63 int, c64 int);
+2026-05-04 13:37:28.277 CST [19559] 022_itl_slot.pl LOG:  statement: INSERT INTO wide_null_test VALUES (NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+2026-05-04 13:37:28.287 CST [19561] 022_itl_slot.pl LOG:  statement: SELECT DISTINCT t_hoff FROM heap_page_items(get_raw_page('wide_null_test', 0))
+				   WHERE t_hoff IS NOT NULL
+2026-05-04 13:37:28.298 CST [19563] 022_itl_slot.pl LOG:  statement: CREATE TABLE small_size_test (a text);
+2026-05-04 13:37:28.299 CST [19563] 022_itl_slot.pl LOG:  statement: ALTER TABLE small_size_test ALTER COLUMN a SET STORAGE plain;
+2026-05-04 13:37:28.307 CST [19565] 022_itl_slot.pl LOG:  statement: INSERT INTO small_size_test VALUES (repeat('y', 100));
+2026-05-04 13:37:28.317 CST [19567] 022_itl_slot.pl LOG:  statement: CREATE TABLE pivot_a_heap (a int);
+2026-05-04 13:37:28.318 CST [19567] 022_itl_slot.pl LOG:  statement: CREATE INDEX pivot_a_idx ON pivot_a_heap (a);
+2026-05-04 13:37:28.318 CST [19567] 022_itl_slot.pl LOG:  statement: INSERT INTO pivot_a_heap VALUES (1);
+2026-05-04 13:37:28.327 CST [19569] 022_itl_slot.pl LOG:  statement: SELECT lower FROM page_header(get_raw_page('pivot_a_heap', 0))
+2026-05-04 13:37:28.338 CST [19571] 022_itl_slot.pl LOG:  statement: SELECT (pagesize - special)
+			  FROM page_header(get_raw_page('pivot_a_heap', 0))
+		
+2026-05-04 13:37:28.349 CST [19573] 022_itl_slot.pl LOG:  statement: SELECT count(*) FROM heap_page_items(get_raw_page('pivot_a_heap', 0))
+			 WHERE t_data IS NOT NULL
+		
+2026-05-04 13:37:28.359 CST [19575] 022_itl_slot.pl LOG:  statement: SELECT (flags & 8) = 8
+			  FROM page_header(get_raw_page('pivot_a_heap', 0))
+		
+2026-05-04 13:37:28.369 CST [19577] 022_itl_slot.pl LOG:  statement: SELECT (flags & 8) = 0
+			  FROM page_header(get_raw_page('pivot_a_idx', 0))
+		
+2026-05-04 13:37:28.380 CST [19579] 022_itl_slot.pl LOG:  statement: SELECT
+			  (encode(substring(get_raw_page('pivot_a_heap', 0), 7809, 384), 'hex')
+			     = repeat('00', 384))
+			  AND
+			  (encode(substring(get_raw_page('pivot_a_idx', 0),
+			                    (SELECT special + 1
+			                       FROM page_header(get_raw_page('pivot_a_idx', 0))),
+			                    16), 'hex')
+			     <> repeat('00', 16))
+		
+2026-05-04 13:37:28.391 CST [19581] 022_itl_slot.pl LOG:  statement: CREATE TABLE wal_replay_itl (id int PRIMARY KEY, val text);
+2026-05-04 13:37:28.393 CST [19581] 022_itl_slot.pl LOG:  statement: INSERT INTO wal_replay_itl SELECT g, 'r' || g FROM generate_series(1, 5) g;
+2026-05-04 13:37:28.398 CST [19500] LOG:  received immediate shutdown request
+2026-05-04 13:37:28.398 CST [19500] LOG:  cluster startup: running -> shutdown
+2026-05-04 13:37:28.399 CST [19500] LOG:  database system is shut down
+2026-05-04 13:37:28.537 CST [19585] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:28.537 CST [19585] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:28.537 CST [19585] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+2026-05-04 13:37:28.537 CST [19585] LOG:  cluster startup: pre_init -> phase0_base
+2026-05-04 13:37:28.537 CST [19585] LOG:  cluster startup: phase0_base -> phase1_cluster
+2026-05-04 13:37:28.640 CST [19585] LOG:  cluster startup: phase1_cluster -> phase2_lock
+2026-05-04 13:37:28.744 CST [19585] LOG:  cluster startup: phase2_lock -> phase3_recovery
+2026-05-04 13:37:28.744 CST [19585] LOG:  starting PostgreSQL 16.13 on aarch64-apple-darwin25.2.0, compiled by Apple clang version 21.0.0 (clang-2100.0.123.102), 64-bit
+2026-05-04 13:37:28.744 CST [19585] LOG:  listening on Unix socket "/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/TwExacPd8Q/.s.PGSQL.24866"
+2026-05-04 13:37:28.749 CST [19590] LOG:  database system was interrupted; last known up at 2026-05-04 13:37:27 CST
+2026-05-04 13:37:28.749 CST [19590] LOG:  database system was not properly shut down; automatic recovery in progress
+2026-05-04 13:37:28.750 CST [19590] LOG:  redo starts at 0/1532058
+2026-05-04 13:37:28.754 CST [19590] LOG:  invalid record length at 0/15D60C8: expected at least 24, got 0
+2026-05-04 13:37:28.754 CST [19590] LOG:  redo done at 0/15D60A0 system usage: CPU: user: 0.00 s, system: 0.00 s, elapsed: 0.00 s
+2026-05-04 13:37:28.755 CST [19588] LOG:  checkpoint starting: end-of-recovery immediate wait
+2026-05-04 13:37:28.759 CST [19588] LOG:  checkpoint complete: wrote 123 buffers (0.8%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.003 s, sync=0.001 s, total=0.004 s; sync files=0, longest=0.000 s, average=0.000 s; distance=656 kB, estimate=656 kB; lsn=0/15D60C8, redo lsn=0/15D60C8
+2026-05-04 13:37:28.760 CST [19585] LOG:  cluster startup: phase3_recovery -> phase4_normal
+2026-05-04 13:37:28.865 CST [19585] LOG:  cluster startup: phase4_normal -> running
+2026-05-04 13:37:28.866 CST [19585] LOG:  database system is ready to accept connections
+2026-05-04 13:37:28.986 CST [19597] 022_itl_slot.pl LOG:  statement: SELECT count(*) FROM wal_replay_itl
+2026-05-04 13:37:28.998 CST [19599] 022_itl_slot.pl LOG:  statement: CREATE TABLE minimal_round_trip_src (id int, val text);
+2026-05-04 13:37:29.000 CST [19599] 022_itl_slot.pl LOG:  statement: CREATE TABLE minimal_round_trip_dst (id int, val text);
+2026-05-04 13:37:29.001 CST [19599] 022_itl_slot.pl LOG:  statement: INSERT INTO minimal_round_trip_src SELECT g, 'm' || g FROM generate_series(1, 10) g;
+2026-05-04 13:37:29.001 CST [19599] 022_itl_slot.pl LOG:  statement: INSERT INTO minimal_round_trip_dst SELECT id, val FROM minimal_round_trip_src ORDER BY id DESC;
+2026-05-04 13:37:29.010 CST [19601] 022_itl_slot.pl LOG:  statement: SELECT count(*) FROM minimal_round_trip_dst
+2026-05-04 13:37:29.019 CST [19603] 022_itl_slot.pl LOG:  statement: CREATE TABLE expand_tuple_test (id int, val text);
+2026-05-04 13:37:29.021 CST [19603] 022_itl_slot.pl LOG:  statement: INSERT INTO expand_tuple_test SELECT g, 'e' || g FROM generate_series(1, 5) g;
+2026-05-04 13:37:29.021 CST [19603] 022_itl_slot.pl LOG:  statement: ALTER TABLE expand_tuple_test ADD COLUMN extra int DEFAULT 42;
+2026-05-04 13:37:29.030 CST [19605] 022_itl_slot.pl LOG:  statement: SELECT count(*) FROM expand_tuple_test WHERE extra = 42
+2026-05-04 13:37:29.035 CST [19585] LOG:  received fast shutdown request
+2026-05-04 13:37:29.035 CST [19585] LOG:  aborting any active transactions
+2026-05-04 13:37:29.036 CST [19585] LOG:  background worker "logical replication launcher" (PID 19594) exited with exit code 1
+2026-05-04 13:37:29.036 CST [19588] LOG:  shutting down
+2026-05-04 13:37:29.037 CST [19588] LOG:  checkpoint starting: shutdown immediate
+2026-05-04 13:37:29.038 CST [19588] LOG:  checkpoint complete: wrote 56 buffers (0.3%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.001 s, sync=0.001 s, total=0.002 s; sync files=0, longest=0.000 s, average=0.000 s; distance=172 kB, estimate=607 kB; lsn=0/1601408, redo lsn=0/1601408
+2026-05-04 13:37:29.039 CST [19585] LOG:  cluster startup: running -> shutdown
+2026-05-04 13:37:29.039 CST [19585] LOG:  database system is shut down

@@ -368,7 +368,8 @@ typedef enum {
 	 * to their dedicated business class, NOT BgProc.
 	 */
 	WAIT_EVENT_CLUSTER_BGPROC_LMON_MAIN_LOOP = PG_WAIT_CLUSTER_BGPROC,
-	WAIT_EVENT_CLUSTER_BGPROC_LCK_MAIN_LOOP, /* spec-1.12 Sprint B D11 */
+	WAIT_EVENT_CLUSTER_BGPROC_LCK_MAIN_LOOP,  /* spec-1.12 Sprint B D11 */
+	WAIT_EVENT_CLUSTER_BGPROC_DIAG_MAIN_LOOP, /* spec-1.13 D11 */
 } WaitEventCluster;
 
 

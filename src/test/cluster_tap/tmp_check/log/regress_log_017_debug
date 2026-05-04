@@ -1,0 +1,75 @@
+# Checking port 11513
+# Found port 11513
+Name: main
+Version: 16.13
+Data directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_017_debug_main_data/pgdata
+Backup directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_017_debug_main_data/backup
+Archive directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_017_debug_main_data/archives
+Connection string: port=11513 host=/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/Rs6O13TRGp
+Log file: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/017_debug_main.log
+# Running: initdb -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_017_debug_main_data/pgdata -A trust -N
+The files belonging to this database system will be owned by user "yingjiewang".
+This user must also own the server process.
+
+The database cluster will be initialized with this locale configuration:
+  provider:    libc
+  LC_COLLATE:  zh_CN.UTF-8
+  LC_CTYPE:    zh_CN.UTF-8
+  LC_MESSAGES: C
+  LC_MONETARY: zh_CN.UTF-8
+  LC_NUMERIC:  zh_CN.UTF-8
+  LC_TIME:     zh_CN.UTF-8
+The default database encoding has accordingly been set to "UTF8".
+initdb: could not find suitable text search configuration for locale "zh_CN.UTF-8"
+The default text search configuration will be set to "simple".
+
+Data page checksums are disabled.
+
+creating directory /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_017_debug_main_data/pgdata ... ok
+creating subdirectories ... ok
+selecting dynamic shared memory implementation ... posix
+selecting default max_connections ... 100
+selecting default shared_buffers ... 128MB
+selecting default time zone ... Asia/Shanghai
+creating configuration files ... ok
+running bootstrap script ... 2026-05-04 13:37:11.705 CST [19087] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:11.705 CST [19087] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:11.705 CST [19087] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+performing post-bootstrap initialization ... 2026-05-04 13:37:11.827 CST [19089] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:11.827 CST [19089] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:11.827 CST [19089] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+
+Sync to disk skipped.
+The data directory might become corrupt if the operating system crashes.
+
+Success. You can now start the database server using:
+
+    pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_017_debug_main_data/pgdata -l logfile start
+
+# Running: /Users/yingjiewang/linkdb/src/test/cluster_tap/../../../src/test/regress/pg_regress --config-auth /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_017_debug_main_data/pgdata
+### Starting node "main"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_017_debug_main_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/017_debug_main.log -o --cluster-name=main start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "main" is 19095
+[13:37:12.610](0.975s) ok 1 - pg_cluster_state returns 209 rows (>= 20 expected at stage 0)
+[13:37:12.622](0.012s) ok 2 - all 14 categories appear (7 stage-0 + shared_fs 1.1 + block_format 1.4 + buffer_format 1.6 + pcm 1.7 + lmon 1.11 + lck 1.12 + diag 1.13)
+[13:37:12.633](0.011s) ok 3 - pg_cluster_state columns are (text, text, text)
+[13:37:12.643](0.010s) ok 4 - pg_cluster_state has no NULL values (NOT NULL contract)
+[13:37:12.652](0.009s) ok 5 - shmem.magic equals 0x50475243 ("PGRC" little-endian)
+[13:37:12.669](0.017s) ok 6 - guc.cluster.node_id matches SHOW cluster.node_id
+[13:37:12.688](0.019s) ok 7 - ic.active_tier_name matches SHOW cluster.interconnect_tier
+[13:37:12.698](0.010s) ok 8 - all 57 injection points have a .fault_type entry under inject category
+[13:37:12.707](0.009s) ok 9 - all 57 injection points have a .hits entry under inject category
+[13:37:12.716](0.009s) ok 10 - pgstat category has 1 counter(s) (>= 1 expected)
+[13:37:12.735](0.019s) ok 11 - conf.node_count matches pg_cluster_nodes row count
+[13:37:12.744](0.009s) ok 12 - phase.cluster_phase is a recognised string (got: running)
+[13:37:12.754](0.010s) ok 13 - pg_stat_cluster_wait_events 58 rows (51 from stage 0/1.1 + 5 from stage 1.10 startup phase)
+### Stopping node "main" using mode fast
+# Running: pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_017_debug_main_data/pgdata -m fast stop
+waiting for server to shut down.... done
+server stopped
+# No postmaster PID for node "main"
+[13:37:12.858](0.105s) 1..13

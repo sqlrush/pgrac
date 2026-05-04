@@ -1,0 +1,80 @@
+2026-05-04 13:37:31.855 CST [19711] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:31.855 CST [19711] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:31.855 CST [19711] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+2026-05-04 13:37:31.855 CST [19711] LOG:  cluster startup: pre_init -> phase0_base
+2026-05-04 13:37:31.855 CST [19711] LOG:  cluster startup: phase0_base -> phase1_cluster
+2026-05-04 13:37:31.957 CST [19711] LOG:  cluster startup: phase1_cluster -> phase2_lock
+2026-05-04 13:37:32.062 CST [19711] LOG:  cluster startup: phase2_lock -> phase3_recovery
+2026-05-04 13:37:32.062 CST [19711] LOG:  starting PostgreSQL 16.13 on aarch64-apple-darwin25.2.0, compiled by Apple clang version 21.0.0 (clang-2100.0.123.102), 64-bit
+2026-05-04 13:37:32.062 CST [19711] LOG:  listening on Unix socket "/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/6qq4Ruhbd1/.s.PGSQL.27779"
+2026-05-04 13:37:32.066 CST [19716] LOG:  database system was shut down at 2026-05-04 13:37:31 CST
+2026-05-04 13:37:32.068 CST [19711] LOG:  cluster startup: phase3_recovery -> phase4_normal
+2026-05-04 13:37:32.178 CST [19711] LOG:  cluster startup: phase4_normal -> running
+2026-05-04 13:37:32.179 CST [19711] LOG:  database system is ready to accept connections
+2026-05-04 13:37:32.285 CST [19722] 024_pcm_lock.pl LOG:  statement: SELECT count(*) FROM pg_cluster_state WHERE category='pcm'
+2026-05-04 13:37:32.300 CST [19724] 024_pcm_lock.pl LOG:  statement: SELECT value FROM pg_cluster_state
+			   WHERE category='pcm' AND key='pcm_grd_max_entries'
+2026-05-04 13:37:32.312 CST [19726] 024_pcm_lock.pl LOG:  statement: SELECT value FROM pg_cluster_state
+			   WHERE category='pcm' AND key='pcm_grd_allocated_bytes'
+2026-05-04 13:37:32.322 CST [19728] 024_pcm_lock.pl LOG:  statement: SELECT value FROM pg_cluster_state
+			   WHERE category='pcm' AND key='pcm_grd_active_entries'
+2026-05-04 13:37:32.333 CST [19730] 024_pcm_lock.pl LOG:  statement: SELECT (SELECT value FROM pg_cluster_state
+			           WHERE category='pcm' AND key='pcm_lock_mode_count')
+			    || '|' ||
+			         (SELECT value FROM pg_cluster_state
+			           WHERE category='pcm' AND key='pcm_transition_count')
+			    || '|' ||
+			         (SELECT value FROM pg_cluster_state
+			           WHERE category='pcm' AND key='pcm_api_state')
+2026-05-04 13:37:32.370 CST [19735] 024_pcm_lock.pl LOG:  statement: SELECT count(*) FROM pg_stat_cluster_injections
+2026-05-04 13:37:32.379 CST [19737] 024_pcm_lock.pl LOG:  statement: SELECT count(*) FROM pg_stat_cluster_injections
+			   WHERE name IN ('cluster-pcm-acquire-entry',
+			                  'cluster-pcm-convert-pre',
+			                  'cluster-pcm-downgrade-pre',
+			                  'cluster-pcm-release-pre')
+2026-05-04 13:37:32.390 CST [19739] 024_pcm_lock.pl LOG:  statement: SELECT count(*) FROM pg_cluster_state WHERE category='buffer_format'
+2026-05-04 13:37:32.400 CST [19741] 024_pcm_lock.pl LOG:  statement: SELECT count(DISTINCT category) FROM pg_cluster_state
+2026-05-04 13:37:32.409 CST [19743] 024_pcm_lock.pl LOG:  statement: SELECT count(*) FROM pg_cluster_state WHERE category='block_format'
+2026-05-04 13:37:32.419 CST [19745] 024_pcm_lock.pl LOG:  statement: SELECT count(DISTINCT category) FROM pg_cluster_state
+2026-05-04 13:37:32.428 CST [19747] 024_pcm_lock.pl LOG:  statement: SHOW cluster.pcm_grd_max_entries
+2026-05-04 13:37:32.437 CST [19749] 024_pcm_lock.pl LOG:  statement: SET cluster.pcm_grd_max_entries = 1024;
+2026-05-04 13:37:32.437 CST [19749] 024_pcm_lock.pl ERROR:  parameter "cluster.pcm_grd_max_entries" cannot be changed without restarting the server
+2026-05-04 13:37:32.437 CST [19749] 024_pcm_lock.pl STATEMENT:  SET cluster.pcm_grd_max_entries = 1024;
+2026-05-04 13:37:32.441 CST [19711] LOG:  received fast shutdown request
+2026-05-04 13:37:32.441 CST [19711] LOG:  aborting any active transactions
+2026-05-04 13:37:32.442 CST [19711] LOG:  background worker "logical replication launcher" (PID 19720) exited with exit code 1
+2026-05-04 13:37:32.442 CST [19714] LOG:  shutting down
+2026-05-04 13:37:32.442 CST [19714] LOG:  checkpoint starting: shutdown immediate
+2026-05-04 13:37:32.443 CST [19714] LOG:  checkpoint complete: wrote 3 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.001 s, sync=0.001 s, total=0.002 s; sync files=0, longest=0.000 s, average=0.000 s; distance=0 kB, estimate=0 kB; lsn=0/1532090, redo lsn=0/1532090
+2026-05-04 13:37:32.444 CST [19711] LOG:  cluster startup: running -> shutdown
+2026-05-04 13:37:32.444 CST [19711] LOG:  database system is shut down
+2026-05-04 13:37:32.578 CST [19753] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:32.578 CST [19753] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:32.578 CST [19753] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+2026-05-04 13:37:32.579 CST [19753] LOG:  cluster startup: pre_init -> phase0_base
+2026-05-04 13:37:32.579 CST [19753] LOG:  cluster startup: phase0_base -> phase1_cluster
+2026-05-04 13:37:32.680 CST [19753] LOG:  cluster startup: phase1_cluster -> phase2_lock
+2026-05-04 13:37:32.790 CST [19753] LOG:  cluster startup: phase2_lock -> phase3_recovery
+2026-05-04 13:37:32.790 CST [19753] LOG:  starting PostgreSQL 16.13 on aarch64-apple-darwin25.2.0, compiled by Apple clang version 21.0.0 (clang-2100.0.123.102), 64-bit
+2026-05-04 13:37:32.791 CST [19753] LOG:  listening on Unix socket "/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/6qq4Ruhbd1/.s.PGSQL.27779"
+2026-05-04 13:37:32.797 CST [19758] LOG:  database system was shut down at 2026-05-04 13:37:32 CST
+2026-05-04 13:37:32.799 CST [19753] LOG:  cluster startup: phase3_recovery -> phase4_normal
+2026-05-04 13:37:32.907 CST [19753] LOG:  cluster startup: phase4_normal -> running
+2026-05-04 13:37:32.908 CST [19753] LOG:  database system is ready to accept connections
+2026-05-04 13:37:32.995 CST [19764] 024_pcm_lock.pl LOG:  statement: SHOW cluster.pcm_grd_max_entries
+2026-05-04 13:37:33.006 CST [19766] 024_pcm_lock.pl LOG:  statement: SELECT size_bytes > 0 FROM pg_cluster_shmem
+			   WHERE name = 'pgrac cluster pcm grd'
+2026-05-04 13:37:33.016 CST [19768] 024_pcm_lock.pl LOG:  statement: SELECT value::int > 0 FROM pg_cluster_state
+			   WHERE category = 'pcm' AND key = 'pcm_grd_allocated_bytes'
+2026-05-04 13:37:33.026 CST [19770] 024_pcm_lock.pl LOG:  statement: SELECT value FROM pg_cluster_state
+			   WHERE category = 'pcm' AND key = 'pcm_grd_active_entries'
+2026-05-04 13:37:33.035 CST [19772] 024_pcm_lock.pl LOG:  statement: SELECT value FROM pg_cluster_state
+			   WHERE category = 'pcm' AND key = 'pcm_api_state'
+2026-05-04 13:37:33.041 CST [19753] LOG:  received fast shutdown request
+2026-05-04 13:37:33.041 CST [19753] LOG:  aborting any active transactions
+2026-05-04 13:37:33.041 CST [19753] LOG:  background worker "logical replication launcher" (PID 19762) exited with exit code 1
+2026-05-04 13:37:33.042 CST [19756] LOG:  shutting down
+2026-05-04 13:37:33.042 CST [19756] LOG:  checkpoint starting: shutdown immediate
+2026-05-04 13:37:33.043 CST [19756] LOG:  checkpoint complete: wrote 3 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.001 s, sync=0.001 s, total=0.002 s; sync files=0, longest=0.000 s, average=0.000 s; distance=0 kB, estimate=0 kB; lsn=0/1532108, redo lsn=0/1532108
+2026-05-04 13:37:33.043 CST [19753] LOG:  cluster startup: running -> shutdown
+2026-05-04 13:37:33.044 CST [19753] LOG:  database system is shut down

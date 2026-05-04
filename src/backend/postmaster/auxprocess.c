@@ -34,8 +34,9 @@
 #include "utils/rel.h"
 
 #ifdef USE_PGRAC_CLUSTER
-#include "cluster/cluster_lck.h"	/* LckMain (stage 1.12 Sprint A) */
-#include "cluster/cluster_lmon.h"	/* LmonMain (stage 1.11 Sprint A) */
+#include "cluster/cluster_diag.h" /* DiagMain (stage 1.13 Sprint A) */
+#include "cluster/cluster_lck.h"  /* LckMain (stage 1.12 Sprint A) */
+#include "cluster/cluster_lmon.h" /* LmonMain (stage 1.11 Sprint A) */
 #endif
 
 
@@ -47,7 +48,7 @@ static void ShutdownAuxiliaryProcess(int code, Datum arg);
  * ----------------
  */
 
-AuxProcType MyAuxProcType = NotAnAuxProcess;	/* declared in miscadmin.h */
+AuxProcType MyAuxProcType = NotAnAuxProcess; /* declared in miscadmin.h */
 
 
 /*
@@ -65,39 +66,42 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 
 	MyAuxProcType = auxtype;
 
-	switch (MyAuxProcType)
-	{
-		case StartupProcess:
-			MyBackendType = B_STARTUP;
-			break;
-		case ArchiverProcess:
-			MyBackendType = B_ARCHIVER;
-			break;
-		case BgWriterProcess:
-			MyBackendType = B_BG_WRITER;
-			break;
-		case CheckpointerProcess:
-			MyBackendType = B_CHECKPOINTER;
-			break;
-		case WalWriterProcess:
-			MyBackendType = B_WAL_WRITER;
-			break;
-		case WalReceiverProcess:
-			MyBackendType = B_WAL_RECEIVER;
-			break;
+	switch (MyAuxProcType) {
+	case StartupProcess:
+		MyBackendType = B_STARTUP;
+		break;
+	case ArchiverProcess:
+		MyBackendType = B_ARCHIVER;
+		break;
+	case BgWriterProcess:
+		MyBackendType = B_BG_WRITER;
+		break;
+	case CheckpointerProcess:
+		MyBackendType = B_CHECKPOINTER;
+		break;
+	case WalWriterProcess:
+		MyBackendType = B_WAL_WRITER;
+		break;
+	case WalReceiverProcess:
+		MyBackendType = B_WAL_RECEIVER;
+		break;
 #ifdef USE_PGRAC_CLUSTER
-		/* PGRAC (stage 1.11 Sprint A): LMON aux process. */
-		case LmonProcess:
-			MyBackendType = B_LMON;
-			break;
-		/* PGRAC (stage 1.12 Sprint A): LCK aux process. */
-		case LckProcess:
-			MyBackendType = B_LCK;
-			break;
+	/* PGRAC (stage 1.11 Sprint A): LMON aux process. */
+	case LmonProcess:
+		MyBackendType = B_LMON;
+		break;
+	/* PGRAC (stage 1.12 Sprint A): LCK aux process. */
+	case LckProcess:
+		MyBackendType = B_LCK;
+		break;
+	/* PGRAC (stage 1.13 Sprint A): DIAG aux process. */
+	case DiagProcess:
+		MyBackendType = B_DIAG;
+		break;
 #endif
-		default:
-			elog(PANIC, "unrecognized process type: %d", (int) MyAuxProcType);
-			MyBackendType = B_INVALID;
+	default:
+		elog(PANIC, "unrecognized process type: %d", (int)MyAuxProcType);
+		MyBackendType = B_INVALID;
 	}
 
 	init_ps_display(NULL);
@@ -150,34 +154,33 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 
 	SetProcessingMode(NormalProcessing);
 
-	switch (MyAuxProcType)
-	{
-		case StartupProcess:
-			StartupProcessMain();
-			proc_exit(1);
+	switch (MyAuxProcType) {
+	case StartupProcess:
+		StartupProcessMain();
+		proc_exit(1);
 
-		case ArchiverProcess:
-			PgArchiverMain();
-			proc_exit(1);
+	case ArchiverProcess:
+		PgArchiverMain();
+		proc_exit(1);
 
-		case BgWriterProcess:
-			BackgroundWriterMain();
-			proc_exit(1);
+	case BgWriterProcess:
+		BackgroundWriterMain();
+		proc_exit(1);
 
-		case CheckpointerProcess:
-			CheckpointerMain();
-			proc_exit(1);
+	case CheckpointerProcess:
+		CheckpointerMain();
+		proc_exit(1);
 
-		case WalWriterProcess:
-			WalWriterMain();
-			proc_exit(1);
+	case WalWriterProcess:
+		WalWriterMain();
+		proc_exit(1);
 
-		case WalReceiverProcess:
-			WalReceiverMain();
-			proc_exit(1);
+	case WalReceiverProcess:
+		WalReceiverMain();
+		proc_exit(1);
 
 #ifdef USE_PGRAC_CLUSTER
-		/*
+	/*
 		 * PGRAC (stage 1.11 Sprint A): LMON aux process dispatch.
 		 * LmonMain is pg_attribute_noreturn() (proc_exit on shutdown);
 		 * the proc_exit(1) below is a defensive bailout in case the
@@ -185,18 +188,22 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 		 *
 		 * Spec: spec-1.11-lmon-skeleton.md Sprint A D3
 		 */
-		case LmonProcess:
-			LmonMain();
-			proc_exit(1);
-		/* PGRAC (stage 1.12 Sprint A): LCK aux process dispatch. */
-		case LckProcess:
-			LckMain();
-			proc_exit(1);
+	case LmonProcess:
+		LmonMain();
+		proc_exit(1);
+	/* PGRAC (stage 1.12 Sprint A): LCK aux process dispatch. */
+	case LckProcess:
+		LckMain();
+		proc_exit(1);
+	/* PGRAC (stage 1.13 Sprint A): DIAG aux process dispatch. */
+	case DiagProcess:
+		DiagMain();
+		proc_exit(1);
 #endif
 
-		default:
-			elog(PANIC, "unrecognized process type: %d", (int) MyAuxProcType);
-			proc_exit(1);
+	default:
+		elog(PANIC, "unrecognized process type: %d", (int)MyAuxProcType);
+		proc_exit(1);
 	}
 }
 

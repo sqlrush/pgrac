@@ -33,7 +33,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_debug test_cluster_shared_fs test_cluster_smgr \
         test_cluster_scn test_cluster_block_format test_cluster_itl_slot \
         test_cluster_buffer_desc test_cluster_pcm_lock \
-        test_cluster_startup_phase test_cluster_lmon test_cluster_lck
+        test_cluster_startup_phase test_cluster_lmon test_cluster_lck test_cluster_diag
 
 # Path to the cluster_version object (no PG deps, safe to link standalone).
 CLUSTER_VERSION_O = $(top_builddir)/src/backend/cluster/cluster_version.o
@@ -68,6 +68,7 @@ CLUSTER_SMGR_O = $(top_builddir)/src/backend/cluster/storage/cluster_smgr.o
 CLUSTER_STARTUP_PHASE_O = $(top_builddir)/src/backend/cluster/cluster_startup_phase.o
 CLUSTER_LMON_O = $(top_builddir)/src/backend/cluster/cluster_lmon.o
 CLUSTER_LCK_O = $(top_builddir)/src/backend/cluster/cluster_lck.o
+CLUSTER_DIAG_O = $(top_builddir)/src/backend/cluster/cluster_diag.o
 
 # Most tests link only cluster_version.o.  test_cluster_guc /
 # test_cluster_shmem / test_cluster_signal / test_cluster_views /
@@ -75,7 +76,7 @@ CLUSTER_LCK_O = $(top_builddir)/src/backend/cluster/cluster_lck.o
 # separate rules because they also link additional cluster_*.o
 # objects (the test files stub the PG backend symbols those
 # objects reference).
-SIMPLE_TESTS = $(filter-out test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf test_cluster_ic_mock test_cluster_inject test_cluster_pgstat test_cluster_debug test_cluster_shared_fs test_cluster_smgr test_cluster_startup_phase test_cluster_lmon test_cluster_lck,$(TESTS))
+SIMPLE_TESTS = $(filter-out test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf test_cluster_ic_mock test_cluster_inject test_cluster_pgstat test_cluster_debug test_cluster_shared_fs test_cluster_smgr test_cluster_startup_phase test_cluster_lmon test_cluster_lck test_cluster_diag,$(TESTS))
 
 $(SIMPLE_TESTS): %: %.c unit_test.h $(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) -o $@
@@ -284,3 +285,9 @@ install installdirs uninstall installcheck:
 
 .PHONY: all check clean distclean maintainer-clean install installdirs \
         uninstall installcheck
+
+# test_cluster_diag links cluster_diag.o standalone (spec-1.13 Sprint A).
+test_cluster_diag: test_cluster_diag.c unit_test.h \
+		$(CLUSTER_VERSION_O) $(CLUSTER_DIAG_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_DIAG_O) -o $@

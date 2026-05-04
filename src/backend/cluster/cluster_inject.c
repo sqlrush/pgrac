@@ -170,6 +170,13 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	{ .name = "cluster-lck-main-loop-iter" },
 	{ .name = "cluster-lck-shutdown-pre" },
 	{ .name = "cluster-lck-shutdown-post" },
+	/* Stage 1.13 (spec-1.13 D10) — 6 DIAG lifecycle injects. */
+	{ .name = "cluster-diag-pre-spawn" },
+	{ .name = "cluster-diag-post-spawn" },
+	{ .name = "cluster-diag-ready-publish" },
+	{ .name = "cluster-diag-main-loop-iter" },
+	{ .name = "cluster-diag-shutdown-pre" },
+	{ .name = "cluster-diag-shutdown-post" },
 };
 
 #define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_points)

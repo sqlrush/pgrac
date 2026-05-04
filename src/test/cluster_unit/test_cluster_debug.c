@@ -552,6 +552,55 @@ cluster_lck_main_loop_iters(void)
 	return 0;
 }
 
+/* Spec-1.13 D6+D12 stubs: cluster_startup_phase.o references
+ * cluster_diag_start + cluster_diag_wait_for_ready; cluster_debug.o
+ * dump_diag references 7 diag_* accessors. */
+int
+cluster_diag_start(void)
+{
+	return 0;
+}
+bool
+cluster_diag_wait_for_ready(int timeout_ms pg_attribute_unused())
+{
+	return false;
+}
+int
+cluster_diag_status(void)
+{
+	return 0;
+}
+const char *
+cluster_diag_status_to_string(int s pg_attribute_unused())
+{
+	return "(stub)";
+}
+pid_t
+cluster_diag_pid(void)
+{
+	return 0;
+}
+TimestampTz
+cluster_diag_spawned_at(void)
+{
+	return 0;
+}
+TimestampTz
+cluster_diag_ready_at(void)
+{
+	return 0;
+}
+TimestampTz
+cluster_diag_last_liveness_tick_at(void)
+{
+	return 0;
+}
+int64
+cluster_diag_main_loop_iters(void)
+{
+	return 0;
+}
+
 
 UT_DEFINE_GLOBALS();
 

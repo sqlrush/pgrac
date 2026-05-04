@@ -132,8 +132,8 @@ like($log_l1, qr/cluster phase 2: LCK ready/,
 	 'L4 Phase 2 LCK ready DEBUG1 message logged (spec-1.12 Sprint A real spawn)');
 like($log_l1, qr/Phase 3 stub:/,
 	 'L4 Phase 3 stub DEBUG1 message logged');
-like($log_l1, qr/Phase 4 stub:/,
-	 'L4 Phase 4 stub DEBUG1 message logged');
+like($log_l1, qr/cluster phase 4: DIAG ready/,
+	 'L4 Phase 4 DIAG ready DEBUG1 message logged (spec-1.13 Sprint A real spawn; phase4 driver runs post-PM_RUN per Q2 A\')');
 
 
 # ----------

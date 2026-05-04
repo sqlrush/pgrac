@@ -1,0 +1,3 @@
+# Checking port 11472
+# Found port 11472
+[09:05:12.625](0.007s) Bail out!  could not create data directory "tmp_check/t_007_guc_main_data": File exists

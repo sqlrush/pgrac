@@ -1,0 +1,130 @@
+2026-05-04 13:37:36.376 CST [19982] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:36.376 CST [19982] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:36.376 CST [19982] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+2026-05-04 13:37:36.377 CST [19982] LOG:  cluster startup: pre_init -> phase0_base
+2026-05-04 13:37:36.377 CST [19982] LOG:  cluster startup: phase0_base -> phase1_cluster
+2026-05-04 13:37:36.486 CST [19982] LOG:  cluster startup: phase1_cluster -> phase2_lock
+2026-05-04 13:37:36.589 CST [19982] LOG:  cluster startup: phase2_lock -> phase3_recovery
+2026-05-04 13:37:36.589 CST [19982] LOG:  starting PostgreSQL 16.13 on aarch64-apple-darwin25.2.0, compiled by Apple clang version 21.0.0 (clang-2100.0.123.102), 64-bit
+2026-05-04 13:37:36.590 CST [19982] LOG:  listening on Unix socket "/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/KOhrOtsFnG/.s.PGSQL.28148"
+2026-05-04 13:37:36.597 CST [19987] LOG:  database system was shut down at 2026-05-04 13:37:36 CST
+2026-05-04 13:37:36.599 CST [19982] LOG:  cluster startup: phase3_recovery -> phase4_normal
+2026-05-04 13:37:36.709 CST [19982] LOG:  cluster startup: phase4_normal -> running
+2026-05-04 13:37:36.711 CST [19982] LOG:  database system is ready to accept connections
+2026-05-04 13:37:36.806 CST [19993] 050_shared_storage_initdb.pl LOG:  statement: SHOW "cluster.smgr_user_relations"
+2026-05-04 13:37:36.818 CST [19995] 050_shared_storage_initdb.pl LOG:  statement: SHOW "cluster.shared_storage_backend"
+2026-05-04 13:37:36.824 CST [19982] LOG:  received fast shutdown request
+2026-05-04 13:37:36.824 CST [19982] LOG:  aborting any active transactions
+2026-05-04 13:37:36.824 CST [19982] LOG:  background worker "logical replication launcher" (PID 19991) exited with exit code 1
+2026-05-04 13:37:36.825 CST [19985] LOG:  shutting down
+2026-05-04 13:37:36.825 CST [19985] LOG:  checkpoint starting: shutdown immediate
+2026-05-04 13:37:36.826 CST [19985] LOG:  checkpoint complete: wrote 3 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.001 s, sync=0.001 s, total=0.002 s; sync files=0, longest=0.000 s, average=0.000 s; distance=0 kB, estimate=0 kB; lsn=0/1532090, redo lsn=0/1532090
+2026-05-04 13:37:36.827 CST [19982] LOG:  cluster startup: running -> shutdown
+2026-05-04 13:37:36.827 CST [19982] LOG:  database system is shut down
+2026-05-04 13:37:36.960 CST [19999] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:36.960 CST [19999] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:36.960 CST [19999] LOG:  cluster_shared_fs: active backend is "local" (id 1)
+2026-05-04 13:37:36.960 CST [19999] WARNING:  cluster.smgr_user_relations is experimental in Stage 1.X
+2026-05-04 13:37:36.960 CST [19999] DETAIL:  cluster_smgr is single-file passthrough; full md.c-equivalent fsync registration / unlink lifecycle is not yet implemented.
+2026-05-04 13:37:36.960 CST [19999] HINT:  Crash recovery durability is not guaranteed.  Stage 2 共享存储 spec implements full fsync semantics with shared-storage backend protocol.  See docs/cluster-smgr-design.md and spec-1.7.2-cluster-smgr-warning-create-lifecycle.md for current limitations.
+2026-05-04 13:37:36.960 CST [19999] LOG:  cluster startup: pre_init -> phase0_base
+2026-05-04 13:37:36.961 CST [19999] LOG:  cluster startup: phase0_base -> phase1_cluster
+2026-05-04 13:37:37.071 CST [19999] LOG:  cluster startup: phase1_cluster -> phase2_lock
+2026-05-04 13:37:37.172 CST [19999] LOG:  cluster startup: phase2_lock -> phase3_recovery
+2026-05-04 13:37:37.172 CST [19999] LOG:  starting PostgreSQL 16.13 on aarch64-apple-darwin25.2.0, compiled by Apple clang version 21.0.0 (clang-2100.0.123.102), 64-bit
+2026-05-04 13:37:37.173 CST [19999] LOG:  listening on Unix socket "/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/KOhrOtsFnG/.s.PGSQL.28148"
+2026-05-04 13:37:37.177 CST [20004] LOG:  database system was shut down at 2026-05-04 13:37:36 CST
+2026-05-04 13:37:37.179 CST [19999] LOG:  cluster startup: phase3_recovery -> phase4_normal
+2026-05-04 13:37:37.285 CST [19999] LOG:  cluster startup: phase4_normal -> running
+2026-05-04 13:37:37.287 CST [19999] LOG:  database system is ready to accept connections
+2026-05-04 13:37:37.387 CST [20010] 050_shared_storage_initdb.pl LOG:  statement: SHOW "cluster.smgr_user_relations"
+2026-05-04 13:37:37.399 CST [20012] 050_shared_storage_initdb.pl LOG:  statement: SHOW "cluster.shared_storage_backend"
+2026-05-04 13:37:37.409 CST [20014] 050_shared_storage_initdb.pl LOG:  statement: SELECT 1
+2026-05-04 13:37:37.418 CST [20016] 050_shared_storage_initdb.pl LOG:  statement: SELECT version()
+2026-05-04 13:37:37.428 CST [20018] 050_shared_storage_initdb.pl LOG:  statement: SELECT length('cluster_smgr')
+2026-05-04 13:37:37.438 CST [20020] 050_shared_storage_initdb.pl LOG:  statement: CREATE TABLE t1 (id int, payload text)
+2026-05-04 13:37:37.449 CST [20022] 050_shared_storage_initdb.pl LOG:  statement: INSERT INTO t1 SELECT g, 'r-' || g FROM generate_series(1, 1000) g
+2026-05-04 13:37:37.459 CST [20024] 050_shared_storage_initdb.pl LOG:  statement: SELECT count(*) FROM t1
+2026-05-04 13:37:37.468 CST [20026] 050_shared_storage_initdb.pl LOG:  statement: SELECT value FROM pg_cluster_state WHERE category = 'shared_fs' AND key = 'smgr_user_relations'
+2026-05-04 13:37:37.478 CST [20028] 050_shared_storage_initdb.pl LOG:  statement: SELECT value::int FROM pg_cluster_state WHERE category = 'shared_fs' AND key = 'smgr_active_relations'
+2026-05-04 13:37:37.488 CST [20030] 050_shared_storage_initdb.pl LOG:  statement: SELECT count(*) FROM t1
+2026-05-04 13:37:37.497 CST [20032] 050_shared_storage_initdb.pl LOG:  statement: SELECT value::int FROM pg_cluster_state WHERE category = 'shared_fs' AND key = 'smgr_active_relations'
+2026-05-04 13:37:37.507 CST [20034] 050_shared_storage_initdb.pl LOG:  statement: VACUUM ANALYZE t1
+2026-05-04 13:37:37.519 CST [20036] 050_shared_storage_initdb.pl LOG:  statement: TRUNCATE t1
+2026-05-04 13:37:37.528 CST [20038] 050_shared_storage_initdb.pl LOG:  statement: SELECT count(*) FROM t1
+2026-05-04 13:37:37.538 CST [20040] 050_shared_storage_initdb.pl LOG:  statement: DROP TABLE t1
+2026-05-04 13:37:37.548 CST [20042] 050_shared_storage_initdb.pl LOG:  statement: CREATE TABLE persistent (id int, val text);
+2026-05-04 13:37:37.550 CST [20042] 050_shared_storage_initdb.pl LOG:  statement: INSERT INTO persistent VALUES (1, 'one'), (2, 'two'), (3, 'three')
+2026-05-04 13:37:37.554 CST [19999] LOG:  received fast shutdown request
+2026-05-04 13:37:37.554 CST [19999] LOG:  aborting any active transactions
+2026-05-04 13:37:37.555 CST [19999] LOG:  background worker "logical replication launcher" (PID 20008) exited with exit code 1
+2026-05-04 13:37:37.555 CST [20002] LOG:  shutting down
+2026-05-04 13:37:37.555 CST [20002] LOG:  checkpoint starting: shutdown immediate
+2026-05-04 13:37:37.557 CST [20002] LOG:  checkpoint complete: wrote 44 buffers (0.3%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.002 s, sync=0.001 s, total=0.003 s; sync files=0, longest=0.000 s, average=0.000 s; distance=258 kB, estimate=258 kB; lsn=0/1572978, redo lsn=0/1572978
+2026-05-04 13:37:37.558 CST [19999] LOG:  cluster startup: running -> shutdown
+2026-05-04 13:37:37.559 CST [19999] LOG:  database system is shut down
+2026-05-04 13:37:37.679 CST [20044] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:37.679 CST [20044] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:37.679 CST [20044] LOG:  cluster_shared_fs: active backend is "local" (id 1)
+2026-05-04 13:37:37.679 CST [20044] WARNING:  cluster.smgr_user_relations is experimental in Stage 1.X
+2026-05-04 13:37:37.679 CST [20044] DETAIL:  cluster_smgr is single-file passthrough; full md.c-equivalent fsync registration / unlink lifecycle is not yet implemented.
+2026-05-04 13:37:37.679 CST [20044] HINT:  Crash recovery durability is not guaranteed.  Stage 2 共享存储 spec implements full fsync semantics with shared-storage backend protocol.  See docs/cluster-smgr-design.md and spec-1.7.2-cluster-smgr-warning-create-lifecycle.md for current limitations.
+2026-05-04 13:37:37.680 CST [20044] LOG:  cluster startup: pre_init -> phase0_base
+2026-05-04 13:37:37.680 CST [20044] LOG:  cluster startup: phase0_base -> phase1_cluster
+2026-05-04 13:37:37.783 CST [20044] LOG:  cluster startup: phase1_cluster -> phase2_lock
+2026-05-04 13:37:37.887 CST [20044] LOG:  cluster startup: phase2_lock -> phase3_recovery
+2026-05-04 13:37:37.887 CST [20044] LOG:  starting PostgreSQL 16.13 on aarch64-apple-darwin25.2.0, compiled by Apple clang version 21.0.0 (clang-2100.0.123.102), 64-bit
+2026-05-04 13:37:37.888 CST [20044] LOG:  listening on Unix socket "/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/KOhrOtsFnG/.s.PGSQL.28148"
+2026-05-04 13:37:37.894 CST [20049] LOG:  database system was shut down at 2026-05-04 13:37:37 CST
+2026-05-04 13:37:37.896 CST [20044] LOG:  cluster startup: phase3_recovery -> phase4_normal
+2026-05-04 13:37:38.001 CST [20044] LOG:  cluster startup: phase4_normal -> running
+2026-05-04 13:37:38.002 CST [20044] LOG:  database system is ready to accept connections
+2026-05-04 13:37:38.096 CST [20055] 050_shared_storage_initdb.pl LOG:  statement: SELECT count(*) FROM persistent
+2026-05-04 13:37:38.106 CST [20057] 050_shared_storage_initdb.pl LOG:  statement: SELECT val FROM persistent WHERE id = 2
+2026-05-04 13:37:38.117 CST [20059] 050_shared_storage_initdb.pl LOG:  statement: CREATE TABLE redo_idempotent_target (id int, payload text);
+2026-05-04 13:37:38.119 CST [20059] 050_shared_storage_initdb.pl LOG:  statement: INSERT INTO redo_idempotent_target SELECT g, 'rr-' || g FROM generate_series(1, 50) g;
+2026-05-04 13:37:38.120 CST [20059] 050_shared_storage_initdb.pl LOG:  statement: CHECKPOINT;
+2026-05-04 13:37:38.120 CST [20047] LOG:  checkpoint starting: immediate force wait
+2026-05-04 13:37:38.122 CST [20047] LOG:  checkpoint complete: wrote 28 buffers (0.2%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.002 s, sync=0.000 s, total=0.002 s; sync files=0, longest=0.000 s, average=0.000 s; distance=119 kB, estimate=119 kB; lsn=0/15905B0, redo lsn=0/15905B0
+2026-05-04 13:37:38.122 CST [20059] 050_shared_storage_initdb.pl LOG:  statement: INSERT INTO redo_idempotent_target SELECT g, 'rr-' || g FROM generate_series(51, 100) g;
+2026-05-04 13:37:38.126 CST [20044] LOG:  received immediate shutdown request
+2026-05-04 13:37:38.127 CST [20044] LOG:  cluster startup: running -> shutdown
+2026-05-04 13:37:38.127 CST [20044] LOG:  database system is shut down
+2026-05-04 13:37:38.267 CST [20063] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:38.267 CST [20063] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:38.267 CST [20063] LOG:  cluster_shared_fs: active backend is "local" (id 1)
+2026-05-04 13:37:38.267 CST [20063] WARNING:  cluster.smgr_user_relations is experimental in Stage 1.X
+2026-05-04 13:37:38.267 CST [20063] DETAIL:  cluster_smgr is single-file passthrough; full md.c-equivalent fsync registration / unlink lifecycle is not yet implemented.
+2026-05-04 13:37:38.267 CST [20063] HINT:  Crash recovery durability is not guaranteed.  Stage 2 共享存储 spec implements full fsync semantics with shared-storage backend protocol.  See docs/cluster-smgr-design.md and spec-1.7.2-cluster-smgr-warning-create-lifecycle.md for current limitations.
+2026-05-04 13:37:38.268 CST [20063] LOG:  cluster startup: pre_init -> phase0_base
+2026-05-04 13:37:38.268 CST [20063] LOG:  cluster startup: phase0_base -> phase1_cluster
+2026-05-04 13:37:38.374 CST [20063] LOG:  cluster startup: phase1_cluster -> phase2_lock
+2026-05-04 13:37:38.485 CST [20063] LOG:  cluster startup: phase2_lock -> phase3_recovery
+2026-05-04 13:37:38.485 CST [20063] LOG:  starting PostgreSQL 16.13 on aarch64-apple-darwin25.2.0, compiled by Apple clang version 21.0.0 (clang-2100.0.123.102), 64-bit
+2026-05-04 13:37:38.485 CST [20063] LOG:  listening on Unix socket "/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/KOhrOtsFnG/.s.PGSQL.28148"
+2026-05-04 13:37:38.489 CST [20068] LOG:  database system was interrupted; last known up at 2026-05-04 13:37:38 CST
+2026-05-04 13:37:38.489 CST [20068] LOG:  database system was not properly shut down; automatic recovery in progress
+2026-05-04 13:37:38.490 CST [20068] LOG:  redo starts at 0/1590628
+2026-05-04 13:37:38.490 CST [20068] LOG:  invalid record length at 0/1591D38: expected at least 24, got 0
+2026-05-04 13:37:38.490 CST [20068] LOG:  redo done at 0/1591D10 system usage: CPU: user: 0.00 s, system: 0.00 s, elapsed: 0.00 s
+2026-05-04 13:37:38.492 CST [20066] LOG:  checkpoint starting: end-of-recovery immediate wait
+2026-05-04 13:37:38.493 CST [20066] LOG:  checkpoint complete: wrote 4 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.001 s, sync=0.001 s, total=0.002 s; sync files=0, longest=0.000 s, average=0.000 s; distance=5 kB, estimate=5 kB; lsn=0/1591D38, redo lsn=0/1591D38
+2026-05-04 13:37:38.494 CST [20063] LOG:  cluster startup: phase3_recovery -> phase4_normal
+2026-05-04 13:37:38.603 CST [20063] LOG:  cluster startup: phase4_normal -> running
+2026-05-04 13:37:38.605 CST [20063] LOG:  database system is ready to accept connections
+2026-05-04 13:37:38.707 CST [20074] 050_shared_storage_initdb.pl LOG:  statement: SELECT count(*) FROM redo_idempotent_target
+2026-05-04 13:37:38.719 CST [20076] 050_shared_storage_initdb.pl LOG:  statement: DROP TABLE redo_idempotent_target
+2026-05-04 13:37:38.725 CST [20063] LOG:  received fast shutdown request
+2026-05-04 13:37:38.725 CST [20063] LOG:  aborting any active transactions
+2026-05-04 13:37:38.726 CST [20063] LOG:  background worker "logical replication launcher" (PID 20072) exited with exit code 1
+2026-05-04 13:37:38.727 CST [20066] LOG:  shutting down
+2026-05-04 13:37:38.727 CST [20066] LOG:  checkpoint starting: shutdown immediate
+2026-05-04 13:37:38.728 CST [20066] LOG:  checkpoint complete: wrote 6 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.001 s, sync=0.001 s, total=0.001 s; sync files=0, longest=0.000 s, average=0.000 s; distance=28 kB, estimate=28 kB; lsn=0/1598DC0, redo lsn=0/1598DC0
+2026-05-04 13:37:38.728 CST [20063] LOG:  cluster startup: running -> shutdown
+2026-05-04 13:37:38.729 CST [20063] LOG:  database system is shut down
+2026-05-04 13:37:38.910 CST [20080] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:38.910 CST [20080] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:38.910 CST [20080] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+2026-05-04 13:37:38.910 CST [20080] FATAL:  cluster.smgr_user_relations=on requires shared_storage_backend != stub
+2026-05-04 13:37:38.910 CST [20080] HINT:  Set cluster.shared_storage_backend=local in postgresql.conf to enable cluster_smgr routing, or revert cluster.smgr_user_relations=off.
+2026-05-04 13:37:38.910 CST [20080] LOG:  database system is shut down

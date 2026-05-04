@@ -1,0 +1,99 @@
+# Checking port 27779
+# Found port 27779
+Name: main
+Version: 16.13
+Data directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_024_pcm_lock_main_data/pgdata
+Backup directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_024_pcm_lock_main_data/backup
+Archive directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_024_pcm_lock_main_data/archives
+Connection string: port=27779 host=/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/6qq4Ruhbd1
+Log file: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/024_pcm_lock_main.log
+# Running: initdb -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_024_pcm_lock_main_data/pgdata -A trust -N
+The files belonging to this database system will be owned by user "yingjiewang".
+This user must also own the server process.
+
+The database cluster will be initialized with this locale configuration:
+  provider:    libc
+  LC_COLLATE:  zh_CN.UTF-8
+  LC_CTYPE:    zh_CN.UTF-8
+  LC_MESSAGES: C
+  LC_MONETARY: zh_CN.UTF-8
+  LC_NUMERIC:  zh_CN.UTF-8
+  LC_TIME:     zh_CN.UTF-8
+The default database encoding has accordingly been set to "UTF8".
+initdb: could not find suitable text search configuration for locale "zh_CN.UTF-8"
+The default text search configuration will be set to "simple".
+
+Data page checksums are disabled.
+
+creating directory /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_024_pcm_lock_main_data/pgdata ... ok
+creating subdirectories ... ok
+selecting dynamic shared memory implementation ... posix
+selecting default max_connections ... 100
+selecting default shared_buffers ... 128MB
+selecting default time zone ... Asia/Shanghai
+creating configuration files ... ok
+running bootstrap script ... 2026-05-04 13:37:31.379 CST [19704] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:31.379 CST [19704] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:31.379 CST [19704] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+performing post-bootstrap initialization ... 2026-05-04 13:37:31.501 CST [19706] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:31.501 CST [19706] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:31.501 CST [19706] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+
+Sync to disk skipped.
+The data directory might become corrupt if the operating system crashes.
+
+Success. You can now start the database server using:
+
+    pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_024_pcm_lock_main_data/pgdata -l logfile start
+
+# Running: /Users/yingjiewang/linkdb/src/test/cluster_tap/../../../src/test/regress/pg_regress --config-auth /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_024_pcm_lock_main_data/pgdata
+### Starting node "main"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_024_pcm_lock_main_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/024_pcm_lock_main.log -o --cluster-name=main start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "main" is 19711
+[13:37:32.288](0.980s) ok 1 - L1 pg_cluster_state.pcm category has 6 keys (Q4 修订: max_entries / allocated_bytes / active_entries / mode_count / transition_count / api_state)
+[13:37:32.302](0.014s) ok 2 - L2 pcm_grd_max_entries = 0 (Q4 default GUC; no GRD shmem allocated)
+[13:37:32.313](0.011s) ok 3 - L3a pcm_grd_allocated_bytes = 0 (Q4 修订加; default GUC=0 -> 0 bytes shmem)
+[13:37:32.324](0.010s) ok 4 - L3b pcm_grd_active_entries = 0 (stub never writes to GRD)
+[13:37:32.334](0.010s) ok 5 - L4 pcm_lock_mode_count=3, pcm_transition_count=9, pcm_api_state=stub (Q4 修订关键诊断字段)
+[13:37:32.339](0.005s) ok 6 - L5a postgres binary at /Users/yingjiewang/linkdb-install/bin/postgres is executable
+[13:37:32.359](0.021s) ok 7 - L5b nm postgres contains symbol cluster_pcm_lock_acquire (Q8 C internal API; spec-1.7 §1.4 \#7)
+[13:37:32.360](0.000s) ok 8 - L5b nm postgres contains symbol cluster_pcm_lock_release (Q8 C internal API; spec-1.7 §1.4 \#7)
+[13:37:32.360](0.000s) ok 9 - L5b nm postgres contains symbol cluster_pcm_lock_upgrade (Q8 C internal API; spec-1.7 §1.4 \#7)
+[13:37:32.361](0.000s) ok 10 - L5b nm postgres contains symbol cluster_pcm_lock_downgrade (Q8 C internal API; spec-1.7 §1.4 \#7)
+[13:37:32.361](0.000s) ok 11 - L5b nm postgres contains symbol cluster_pcm_lock_query (Q8 C internal API; spec-1.7 §1.4 \#7)
+[13:37:32.361](0.000s) ok 12 - L5b nm postgres contains symbol cluster_pcm_grd_count (Q8 C internal API; spec-1.7 §1.4 \#7)
+[13:37:32.361](0.000s) ok 13 - L5b nm postgres contains symbol cluster_pcm_grd_shmem_size (Q8 C internal API; spec-1.7 §1.4 \#7)
+[13:37:32.362](0.000s) ok 14 - L5b nm postgres contains symbol cluster_pcm_grd_init (Q8 C internal API; spec-1.7 §1.4 \#7)
+[13:37:32.371](0.010s) ok 15 - L6a pg_stat_cluster_injections has 28 entries (24 pre-1.7 + 4 PCM)
+[13:37:32.380](0.009s) ok 16 - L6b 4 PCM inject points present (Q6 user 修订: release-pre not release-post)
+[13:37:32.391](0.011s) ok 17 - L7a buffer_format category still 6 keys (1.6 baseline)
+[13:37:32.401](0.010s) ok 18 - L7b pg_cluster_state has 13 distinct categories (11 from spec-1.7 + lmon from 1.11 + lck from 1.12)
+[13:37:32.410](0.009s) ok 19 - L8 block_format category still 9 keys (1.4 + 1.5 baseline)
+[13:37:32.420](0.010s) ok 20 - L9 cluster_smoke surface integrates pcm + lmon + lck categories (13 categories)
+[13:37:32.429](0.009s) ok 21 - L10a cluster.pcm_grd_max_entries default 0 (Q4 user 修订)
+[13:37:32.437](0.009s) ok 22 - L10b cluster.pcm_grd_max_entries is PGC_POSTMASTER (SET fails at session level)
+### Stopping node "main" using mode fast
+# Running: pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_024_pcm_lock_main_data/pgdata -m fast stop
+waiting for server to shut down.... done
+server stopped
+# No postmaster PID for node "main"
+### Starting node "main"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_024_pcm_lock_main_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/024_pcm_lock_main.log -o --cluster-name=main start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "main" is 19753
+[13:37:32.996](0.559s) ok 23 - L11a postmaster started cleanly with cluster.pcm_grd_max_entries=16
+[13:37:33.007](0.011s) ok 24 - L11b pg_cluster_shmem.pgrac cluster pcm grd has size_bytes > 0
+[13:37:33.017](0.010s) ok 25 - L11c pcm_grd_allocated_bytes > 0 (16 entries × sizeof(GrdEntry))
+[13:37:33.027](0.010s) ok 26 - L11d pcm_grd_active_entries still 0 (stub never populates entries)
+[13:37:33.037](0.010s) ok 27 - L11e pcm_api_state still "stub" (allocation does not activate state machine)
+### Stopping node "main" using mode fast
+# Running: pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_024_pcm_lock_main_data/pgdata -m fast stop
+waiting for server to shut down.... done
+server stopped
+# No postmaster PID for node "main"
+[13:37:33.146](0.109s) 1..27

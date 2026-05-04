@@ -1,0 +1,118 @@
+# Checking port 28148
+# Found port 28148
+Name: main
+Version: 16.13
+Data directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_050_shared_storage_initdb_main_data/pgdata
+Backup directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_050_shared_storage_initdb_main_data/backup
+Archive directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_050_shared_storage_initdb_main_data/archives
+Connection string: port=28148 host=/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/KOhrOtsFnG
+Log file: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/050_shared_storage_initdb_main.log
+# Running: initdb -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_050_shared_storage_initdb_main_data/pgdata -A trust -N
+The files belonging to this database system will be owned by user "yingjiewang".
+This user must also own the server process.
+
+The database cluster will be initialized with this locale configuration:
+  provider:    libc
+  LC_COLLATE:  zh_CN.UTF-8
+  LC_CTYPE:    zh_CN.UTF-8
+  LC_MESSAGES: C
+  LC_MONETARY: zh_CN.UTF-8
+  LC_NUMERIC:  zh_CN.UTF-8
+  LC_TIME:     zh_CN.UTF-8
+The default database encoding has accordingly been set to "UTF8".
+initdb: could not find suitable text search configuration for locale "zh_CN.UTF-8"
+The default text search configuration will be set to "simple".
+
+Data page checksums are disabled.
+
+creating directory /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_050_shared_storage_initdb_main_data/pgdata ... ok
+creating subdirectories ... ok
+selecting dynamic shared memory implementation ... posix
+selecting default max_connections ... 100
+selecting default shared_buffers ... 128MB
+selecting default time zone ... Asia/Shanghai
+creating configuration files ... ok
+running bootstrap script ... 2026-05-04 13:37:35.898 CST [19974] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:35.898 CST [19974] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:35.898 CST [19974] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+performing post-bootstrap initialization ... 2026-05-04 13:37:36.022 CST [19976] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:36.022 CST [19976] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:36.022 CST [19976] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+
+Sync to disk skipped.
+The data directory might become corrupt if the operating system crashes.
+
+Success. You can now start the database server using:
+
+    pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_050_shared_storage_initdb_main_data/pgdata -l logfile start
+
+# Running: /Users/yingjiewang/linkdb/src/test/cluster_tap/../../../src/test/regress/pg_regress --config-auth /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_050_shared_storage_initdb_main_data/pgdata
+### Starting node "main"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_050_shared_storage_initdb_main_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/050_shared_storage_initdb_main.log -o --cluster-name=main start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "main" is 19982
+[13:37:36.807](0.980s) ok 1 - L1 cluster.smgr_user_relations defaults to off after initdb
+[13:37:36.819](0.012s) ok 2 - L1 cluster.shared_storage_backend defaults to stub after initdb
+[13:37:36.820](0.000s) ok 3 - L1 default-GUC startup logfile does NOT contain EXPERIMENTAL WARNING
+### Stopping node "main" using mode fast
+# Running: pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_050_shared_storage_initdb_main_data/pgdata -m fast stop
+waiting for server to shut down.... done
+server stopped
+# No postmaster PID for node "main"
+[13:37:36.931](0.112s) ok 4 - L2 postgresql.conf still present after edit
+### Starting node "main"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_050_shared_storage_initdb_main_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/050_shared_storage_initdb_main.log -o --cluster-name=main start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "main" is 19999
+[13:37:37.388](0.457s) ok 5 - L3 cluster.smgr_user_relations applies after restart
+[13:37:37.400](0.012s) ok 6 - L3 cluster.shared_storage_backend = local applies after restart
+[13:37:37.400](0.000s) ok 7 - L3 postmaster startup logfile contains EXPERIMENTAL WARNING (DoD \#19; spec-1.7.2 F2 regression防御)
+[13:37:37.410](0.010s) ok 8 - L4 SELECT 1 returns 1 under GUC=on
+[13:37:37.419](0.009s) ok 9 - L4 SELECT version() returns PG-style string
+[13:37:37.429](0.010s) ok 10 - L4 built-in functions still work
+[13:37:37.460](0.031s) ok 11 - L5 INSERT 1000 rows visible via SELECT
+[13:37:37.470](0.010s) ok 12 - L5 pg_cluster_state.shared_fs.smgr_user_relations = t (Q4 path proof a)
+[13:37:37.479](0.010s) ok 13 - L5 smgr_active_relations > 0 after INSERT (got 34; Q4 path proof b)
+[13:37:37.489](0.010s) ok 14 - L6 SELECT count returns expected total
+[13:37:37.498](0.009s) ok 15 - L6 smgr_active_relations > 0 in read backend (got 34; read path also engaged)
+[13:37:37.511](0.012s) ok 16 - L7 VACUUM ANALYZE succeeds on cluster_smgr-routed relation
+[13:37:37.529](0.019s) ok 17 - L7 TRUNCATE empties the relation
+[13:37:37.540](0.011s) ok 18 - L7 DROP TABLE succeeds on cluster_smgr-routed relation
+### Restarting node "main"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_050_shared_storage_initdb_main_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/050_shared_storage_initdb_main.log restart
+waiting for server to shut down.... done
+server stopped
+waiting for server to start.... done
+server started
+# Postmaster PID for node "main" is 20044
+[13:37:38.097](0.557s) ok 19 - L8 cluster_smgr-stored data survives restart (spec-1.7.2 F1 isRedo idempotent path)
+[13:37:38.108](0.010s) ok 20 - L8 row payload survives restart correctly
+[13:37:38.108](0.000s) ok 21 - L8 EXPERIMENTAL WARNING re-emitted after restart (saw 2 occurrences across L3 + L8 starts; DoD \#19 spec-1.7.2 F2 regression防御)
+### Stopping node "main" using mode immediate
+# Running: pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_050_shared_storage_initdb_main_data/pgdata -m immediate stop
+waiting for server to shut down.... done
+server stopped
+# No postmaster PID for node "main"
+### Starting node "main"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_050_shared_storage_initdb_main_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/050_shared_storage_initdb_main.log -o --cluster-name=main start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "main" is 20063
+[13:37:38.709](0.601s) ok 22 - L8b redo replay over existing relfilenode file succeeds (isRedo=true idempotent path; spec-1.7.2 F1 EEXIST fallback verified)
+### Stopping node "main" using mode fast
+# Running: pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_050_shared_storage_initdb_main_data/pgdata -m fast stop
+waiting for server to shut down.... done
+server stopped
+# No postmaster PID for node "main"
+[13:37:38.837](0.128s) ok 23 - L9 clean shutdown produced no PANIC
+[13:37:38.837](0.000s) ok 24 - L9 logfile records the orderly shutdown message
+waiting for server to start.... stopped waiting
+pg_ctl: could not start server
+Examine the log output.
+[13:37:38.999](0.162s) ok 25 - L10 postmaster refuses to start when smgr_user_relations=on + shared_storage_backend=stub
+[13:37:38.999](0.000s) ok 26 - L10 startup logfile contains the cross-check FATAL message
+[13:37:38.999](0.000s) 1..26

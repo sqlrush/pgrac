@@ -55,6 +55,7 @@
 #include "utils/timestamp.h"
 
 #include "cluster/cluster_elog.h"	/* cluster_phase legacy mirror (HC2) */
+#include "cluster/cluster_diag.h"	/* cluster_diag_start / wait_for_ready (1.13 Sprint A) */
 #include "cluster/cluster_guc.h"	/* cluster_phase{1..4}_timeout (D2 F2) */
 #include "cluster/cluster_inject.h" /* CLUSTER_INJECTION_POINT */
 #include "cluster/cluster_lck.h"	/* cluster_lck_start / wait_for_ready (1.12 Sprint A) */
@@ -442,6 +443,9 @@ cluster_advance_phase(ClusterStartupPhase target)
  *	1.11-1.14 / Stage 2-4 replacement.
  * ============================================================ */
 
+/* Forward decl: phase_4_handler reads phase4_timeout via this helper. */
+static int cluster_phase_timeout_for(ClusterStartupPhase phase);
+
 static PhaseRunResult
 phase_1_handler(PhaseRunFailContext *fail_ctx)
 {
@@ -563,12 +567,62 @@ phase_3_handler(PhaseRunFailContext *fail_ctx pg_attribute_unused())
 
 
 static PhaseRunResult
-phase_4_handler(PhaseRunFailContext *fail_ctx pg_attribute_unused())
+phase_4_handler(PhaseRunFailContext *fail_ctx)
 {
+	int diag_pid;
+	int phase4_timeout_ms;
+
 	Assert(!IsUnderPostmaster);
-	elog(DEBUG1, "Phase 4 stub: PG-native walwriter / bgwriter / checkpointer / "
-				 "autovacuum spawn unchanged; DIAG (1.13) / Cluster Stats (1.14) "
-				 "deferred to those specs");
+
+	/*
+	 * HC4 (spec-1.13 §1.4 #4): if cluster.enabled = false, phase 4
+	 * degrades to spec-1.10 stub behavior — no DIAG spawn, no FATAL.
+	 * Tested by 063 L10.
+	 */
+	if (!cluster_enabled) {
+		elog(DEBUG1, "cluster phase 4: cluster.enabled=false; skipping DIAG spawn "
+					 "(degraded to spec-1.10 stub behavior).  PG-native "
+					 "walwriter / bgwriter / checkpointer / autovacuum spawn "
+					 "unchanged.");
+		return PHASE_RUN_OK;
+	}
+
+	/* spec-1.13 D6: real DIAG spawn via Q2 narrow wrapper. */
+	diag_pid = cluster_diag_start();
+	if (diag_pid <= 0) {
+		fail_ctx->errcode = ERRCODE_CLUSTER_DIAG_SPAWN_FAILED;
+		fail_ctx->errmsg = "cluster phase 4: failed to spawn DIAG aux process";
+		fail_ctx->errhint = "Check postmaster log for fork() error.  Confirm OS process "
+							"limits (ulimit -u) leave room for the DIAG aux process; if "
+							"the limit is exhausted, raise it via ulimit or systemd "
+							"LimitNPROC and restart postmaster.";
+		return PHASE_RUN_FATAL;
+	}
+
+	/*
+	 * spec-1.13 D6: bounded readiness wait via shmem polling.  Use the
+	 * phase 4 timeout minus a 5-second driver elapsed buffer so that
+	 * driver TimestampDifferenceExceeds() can still trip and raise
+	 * 53R09 PHASE_TRANSITION_TIMEOUT cleanly even if the DIAG handle
+	 * goes pathological.  5s is the same buffer LCK/LMON use.
+	 */
+	phase4_timeout_ms = cluster_phase_timeout_for(CLUSTER_PHASE_4_NORMAL) * 1000;
+	if (phase4_timeout_ms > 5000)
+		phase4_timeout_ms -= 5000;
+	if (!cluster_diag_wait_for_ready(phase4_timeout_ms)) {
+		fail_ctx->errcode = ERRCODE_CLUSTER_DIAG_NOT_READY;
+		fail_ctx->errmsg = "cluster phase 4: DIAG did not publish READY in time";
+		fail_ctx->errhint = "Check postmaster log for DIAG-side errors.  If DIAG is "
+							"slow on this hardware, raise cluster.phase4_timeout (PGC_SIGHUP).";
+		return PHASE_RUN_FATAL;
+	}
+
+	elog(DEBUG1,
+		 "cluster phase 4: DIAG ready (pid %d); Cluster Stats remain stub "
+		 "(Stage 1.14).  PG-native walwriter / bgwriter / checkpointer / "
+		 "autovacuum spawn unchanged.",
+		 diag_pid);
+
 	return PHASE_RUN_OK;
 }
 
@@ -686,7 +740,18 @@ cluster_run_startup_sequence(void)
 	 */
 	cluster_advance_phase(CLUSTER_PHASE_0_BASE);
 
-	for (phase = CLUSTER_PHASE_1_CLUSTER; phase <= CLUSTER_PHASE_4_NORMAL; phase++) {
+	/*
+	 * Spec-1.13 v0.2 Q2 A': cluster_run_startup_sequence() walks
+	 * phase 1 -> 3 ONLY.  Phase 4 (the post-recovery / post-PM_RUN
+	 * normal-running phase that DIAG and Cluster Stats spawn into)
+	 * is driven by cluster_run_phase4_sequence() below, which the
+	 * postmaster reaper invokes after the startup process has finished
+	 * recovery and pmState transitions to PM_RUN.  Splitting the
+	 * driver moves DIAG spawn from "pre-recovery" (the original 1.10
+	 * skeleton timing) to "post-recovery / DB OPEN" (correct Oracle
+	 * DIAG semantics).
+	 */
+	for (phase = CLUSTER_PHASE_1_CLUSTER; phase <= CLUSTER_PHASE_3_RECOVERY; phase++) {
 		PhaseRunResult result;
 		ClusterPhaseHandler handler;
 		TimestampTz started;
@@ -825,7 +890,107 @@ cluster_run_startup_sequence(void)
 		}
 	}
 
-	/* Driver leaves phase machinery at CLUSTER_PHASE_4_NORMAL. */
+	/* Driver leaves phase machinery at CLUSTER_PHASE_3_RECOVERY.
+	 * cluster_run_phase4_sequence() advances to CLUSTER_PHASE_4_NORMAL
+	 * later from the reaper PM_RUN transition path. */
+}
+
+
+/*
+ * cluster_run_phase4_sequence -- spec-1.13 v0.2 Q2 A' driver for the
+ * post-recovery / post-PM_RUN phase 4 transition.
+ *
+ *	Walks just CLUSTER_PHASE_4_NORMAL by invoking phase_4_handler.
+ *	Same per-phase timeout / FATAL / SQLSTATE machinery as
+ *	cluster_run_startup_sequence().  Caller (postmaster reaper at
+ *	PM_STARTUP -> PM_RUN transition) invokes this AFTER the startup
+ *	process has succeeded.  cluster_finalize_startup_running() runs
+ *	immediately after to advance phase machinery to RUNNING.
+ *
+ *	Why split: spec-1.10 originally walked phase 1->4 inside
+ *	cluster_run_startup_sequence() in PostmasterMain, before
+ *	StartupDataBase().  That made phase 4 fire pre-recovery, which
+ *	would mis-position DIAG (1.13) and Cluster Stats (1.14) into the
+ *	WAL replay window.  Round 5 (user codex review) caught this; the
+ *	fix is the driver split: phase 1-3 stay in startup_sequence;
+ *	phase 4 lives here.
+ */
+void
+cluster_run_phase4_sequence(void)
+{
+	PhaseRunResult result;
+	ClusterPhaseHandler handler;
+	TimestampTz started;
+	TimestampTz now;
+	long elapsed_secs;
+	int microsecs;
+	int timeout_secs;
+	const ClusterStartupPhase phase = CLUSTER_PHASE_4_NORMAL;
+	PhaseRunFailContext fail_ctx = { 0 };
+
+	Assert(!IsUnderPostmaster);
+
+	CLUSTER_INJECTION_POINT("cluster-run-phase4-top");
+
+	started = GetCurrentTimestamp();
+	cluster_advance_phase(phase);
+
+	handler = phase_handlers[(int)phase];
+	if (handler == NULL)
+		ereport(FATAL, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("cluster startup phase %s has no handler in dispatch table",
+							   cluster_startup_phase_to_string(phase))));
+
+	result = handler(&fail_ctx);
+
+	now = GetCurrentTimestamp();
+	timeout_secs = cluster_phase_timeout_for(phase);
+
+	if (timeout_secs > 0 && TimestampDifferenceExceeds(started, now, timeout_secs * 1000)) {
+		TimestampDifference(started, now, &elapsed_secs, &microsecs);
+		cluster_phase_fail_inject(phase);
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_PHASE_TRANSITION_TIMEOUT),
+						errmsg("cluster startup phase %s exceeded timeout (%ld.%03d s > %d s)",
+							   cluster_startup_phase_to_string(phase), elapsed_secs,
+							   microsecs / 1000, timeout_secs),
+						errhint("Increase cluster.phase%d_timeout GUC or "
+								"fix handler hang.",
+								(int)phase - 1)));
+	}
+
+	switch (result) {
+	case PHASE_RUN_OK:
+		break;
+
+	case PHASE_RUN_FATAL:
+		cluster_phase_fail_inject(phase);
+		ereport(FATAL, (errcode(fail_ctx.errcode != 0 ? fail_ctx.errcode
+													  : ERRCODE_CLUSTER_PHASE_PRECONDITION_FAILED),
+						errmsg("cluster startup phase %s failed: %s",
+							   cluster_startup_phase_to_string(phase),
+							   fail_ctx.errmsg != NULL ? fail_ctx.errmsg
+													   : "see postmaster log for diagnostics"),
+						errhint("%s", fail_ctx.errhint != NULL
+										  ? fail_ctx.errhint
+										  : "spec-1.13 documents the phase 4 handler contract.")));
+		break;
+
+	case PHASE_RUN_RETRY:
+		cluster_phase_fail_inject(phase);
+		ereport(FATAL, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("cluster startup phase %s returned PHASE_RUN_RETRY "
+							   "but driver does not implement retry yet",
+							   cluster_startup_phase_to_string(phase))));
+		break;
+
+	default:
+		cluster_phase_fail_inject(phase);
+		ereport(FATAL, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("cluster startup phase %s handler returned unknown "
+							   "PhaseRunResult %d",
+							   cluster_startup_phase_to_string(phase), (int)result)));
+		break;
+	}
 }
 
 

@@ -1,0 +1,436 @@
+# Checking port 16531
+# Found port 16531
+Name: main
+Version: 16.13
+Data directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_main_data/pgdata
+Backup directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_main_data/backup
+Archive directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_main_data/archives
+Connection string: port=16531 host=/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/17_rB9wsB7
+Log file: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/063_diag_skeleton_main.log
+# Running: initdb -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_main_data/pgdata -A trust -N
+The files belonging to this database system will be owned by user "yingjiewang".
+This user must also own the server process.
+
+The database cluster will be initialized with this locale configuration:
+  provider:    libc
+  LC_COLLATE:  zh_CN.UTF-8
+  LC_CTYPE:    zh_CN.UTF-8
+  LC_MESSAGES: C
+  LC_MONETARY: zh_CN.UTF-8
+  LC_NUMERIC:  zh_CN.UTF-8
+  LC_TIME:     zh_CN.UTF-8
+The default database encoding has accordingly been set to "UTF8".
+initdb: could not find suitable text search configuration for locale "zh_CN.UTF-8"
+The default text search configuration will be set to "simple".
+
+Data page checksums are disabled.
+
+creating directory /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_main_data/pgdata ... ok
+creating subdirectories ... ok
+selecting dynamic shared memory implementation ... posix
+selecting default max_connections ... 100
+selecting default shared_buffers ... 128MB
+selecting default time zone ... Asia/Shanghai
+creating configuration files ... ok
+running bootstrap script ... 2026-05-04 13:38:11.655 CST [20633] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:38:11.655 CST [20633] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:38:11.655 CST [20633] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+performing post-bootstrap initialization ... 2026-05-04 13:38:11.779 CST [20636] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:38:11.779 CST [20636] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:38:11.779 CST [20636] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+
+Sync to disk skipped.
+The data directory might become corrupt if the operating system crashes.
+
+Success. You can now start the database server using:
+
+    pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_main_data/pgdata -l logfile start
+
+# Running: /Users/yingjiewang/linkdb/src/test/cluster_tap/../../../src/test/regress/pg_regress --config-auth /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_main_data/pgdata
+### Starting node "main"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_main_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/063_diag_skeleton_main.log -o --cluster-name=main start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "main" is 20642
+[13:38:12.576](0.994s) ok 1 - L1 DIAG aux process visible in pg_stat_activity (spec-1.13 Sprint A)
+[13:38:12.576](0.001s) ok 2 - L2 postmaster log contains DIAG ready message
+[13:38:12.576](0.000s) ok 3 - L2 postmaster log contains phase2->phase3 transition
+[13:38:12.576](0.000s) ok 4 - L2 phase 2 driver waited for DIAG ready before advancing to phase 3
+[13:38:12.589](0.013s) ok 5 - L3 cluster module live; phase=running confirms DIAG spawn path completed (HC4 cluster_enabled GUC=on default)
+### Stopping node "main" using mode fast
+# Running: pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_main_data/pgdata -m fast stop
+waiting for server to shut down.... done
+server stopped
+# No postmaster PID for node "main"
+[13:38:12.705](0.116s) ok 6 - L4 clean shutdown completes (pg_ctl stop -m fast)
+[13:38:12.705](0.000s) ok 7 - L4 DIAG normal exit does NOT trigger crash recovery (HC5 normal path)
+### Starting node "main"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_main_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/063_diag_skeleton_main.log -o --cluster-name=main start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "main" is 20659
+[13:38:13.166](0.461s) ok 8 - L5 captured DIAG pid for kill test
+[13:38:14.176](1.011s) ok 9 - L5 DIAG kill -9 routes through HandleChildCrash (HC5 abnormal path; restart_after_crash=off forces shutdown branch)
+### Stopping node "main" using mode immediate
+# Running: pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_main_data/pgdata -m immediate stop
+pg_ctl: PID file "/Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_main_data/pgdata/postmaster.pid" does not exist
+Is server running?
+# pg_ctl stop failed: 256
+# No postmaster PID for node "main"
+# Checking port 16532
+# Found port 16532
+Name: l5b_diag_respawn
+Version: 16.13
+Data directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l5b_diag_respawn_data/pgdata
+Backup directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l5b_diag_respawn_data/backup
+Archive directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l5b_diag_respawn_data/archives
+Connection string: port=16532 host=/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/17_rB9wsB7
+Log file: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/063_diag_skeleton_l5b_diag_respawn.log
+# Running: initdb -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l5b_diag_respawn_data/pgdata -A trust -N
+The files belonging to this database system will be owned by user "yingjiewang".
+This user must also own the server process.
+
+The database cluster will be initialized with this locale configuration:
+  provider:    libc
+  LC_COLLATE:  zh_CN.UTF-8
+  LC_CTYPE:    zh_CN.UTF-8
+  LC_MESSAGES: C
+  LC_MONETARY: zh_CN.UTF-8
+  LC_NUMERIC:  zh_CN.UTF-8
+  LC_TIME:     zh_CN.UTF-8
+The default database encoding has accordingly been set to "UTF8".
+initdb: could not find suitable text search configuration for locale "zh_CN.UTF-8"
+The default text search configuration will be set to "simple".
+
+Data page checksums are disabled.
+
+creating directory /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l5b_diag_respawn_data/pgdata ... ok
+creating subdirectories ... ok
+selecting dynamic shared memory implementation ... posix
+selecting default max_connections ... 100
+selecting default shared_buffers ... 128MB
+selecting default time zone ... Asia/Shanghai
+creating configuration files ... ok
+running bootstrap script ... 2026-05-04 13:38:14.249 CST [20680] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:38:14.249 CST [20680] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:38:14.249 CST [20680] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+performing post-bootstrap initialization ... 2026-05-04 13:38:14.372 CST [20682] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:38:14.372 CST [20682] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:38:14.372 CST [20682] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+
+Sync to disk skipped.
+The data directory might become corrupt if the operating system crashes.
+
+Success. You can now start the database server using:
+
+    pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l5b_diag_respawn_data/pgdata -l logfile start
+
+# Running: /Users/yingjiewang/linkdb/src/test/cluster_tap/../../../src/test/regress/pg_regress --config-auth /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l5b_diag_respawn_data/pgdata
+### Starting node "l5b_diag_respawn"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l5b_diag_respawn_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/063_diag_skeleton_l5b_diag_respawn.log -o --cluster-name=l5b_diag_respawn start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "l5b_diag_respawn" is 20687
+[13:38:15.137](0.961s) ok 10 - L5b captured initial DIAG pid (restart_after_crash=on baseline)
+[13:38:16.161](1.024s) ok 11 - L5b DIAG respawned after kill -9 (initial=20693 new=20704); spec-1.13 Sprint A P1 preemption: ServerLoop respawn logic mirrors LMON + WalWriter pattern
+### Stopping node "l5b_diag_respawn" using mode immediate
+# Running: pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l5b_diag_respawn_data/pgdata -m immediate stop
+waiting for server to shut down.... done
+server stopped
+# No postmaster PID for node "l5b_diag_respawn"
+# Checking port 16533
+# Found port 16533
+Name: l6_diag_post_crash_phase
+Version: 16.13
+Data directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l6_diag_post_crash_phase_data/pgdata
+Backup directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l6_diag_post_crash_phase_data/backup
+Archive directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l6_diag_post_crash_phase_data/archives
+Connection string: port=16533 host=/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/17_rB9wsB7
+Log file: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/063_diag_skeleton_l6_diag_post_crash_phase.log
+# Running: initdb -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l6_diag_post_crash_phase_data/pgdata -A trust -N
+The files belonging to this database system will be owned by user "yingjiewang".
+This user must also own the server process.
+
+The database cluster will be initialized with this locale configuration:
+  provider:    libc
+  LC_COLLATE:  zh_CN.UTF-8
+  LC_CTYPE:    zh_CN.UTF-8
+  LC_MESSAGES: C
+  LC_MONETARY: zh_CN.UTF-8
+  LC_NUMERIC:  zh_CN.UTF-8
+  LC_TIME:     zh_CN.UTF-8
+The default database encoding has accordingly been set to "UTF8".
+initdb: could not find suitable text search configuration for locale "zh_CN.UTF-8"
+The default text search configuration will be set to "simple".
+
+Data page checksums are disabled.
+
+creating directory /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l6_diag_post_crash_phase_data/pgdata ... ok
+creating subdirectories ... ok
+selecting dynamic shared memory implementation ... posix
+selecting default max_connections ... 100
+selecting default shared_buffers ... 128MB
+selecting default time zone ... Asia/Shanghai
+creating configuration files ... ok
+running bootstrap script ... 2026-05-04 13:38:16.347 CST [20718] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:38:16.347 CST [20718] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:38:16.347 CST [20718] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+performing post-bootstrap initialization ... 2026-05-04 13:38:16.472 CST [20720] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:38:16.472 CST [20720] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:38:16.472 CST [20720] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+
+Sync to disk skipped.
+The data directory might become corrupt if the operating system crashes.
+
+Success. You can now start the database server using:
+
+    pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l6_diag_post_crash_phase_data/pgdata -l logfile start
+
+# Running: /Users/yingjiewang/linkdb/src/test/cluster_tap/../../../src/test/regress/pg_regress --config-auth /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l6_diag_post_crash_phase_data/pgdata
+### Starting node "l6_diag_post_crash_phase"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l6_diag_post_crash_phase_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/063_diag_skeleton_l6_diag_post_crash_phase.log -o --cluster-name=l6_diag_post_crash_phase start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "l6_diag_post_crash_phase" is 20725
+[13:38:18.271](2.110s) ok 12 - L6 cluster_phase returns to running after restart_after_crash recovery (F15+F16 verifier)
+### Stopping node "l6_diag_post_crash_phase" using mode immediate
+# Running: pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l6_diag_post_crash_phase_data/pgdata -m immediate stop
+waiting for server to shut down.... done
+server stopped
+# No postmaster PID for node "l6_diag_post_crash_phase"
+# Checking port 16534
+# Found port 16534
+Name: lx_diag_state
+Version: 16.13
+Data directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_lx_diag_state_data/pgdata
+Backup directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_lx_diag_state_data/backup
+Archive directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_lx_diag_state_data/archives
+Connection string: port=16534 host=/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/17_rB9wsB7
+Log file: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/063_diag_skeleton_lx_diag_state.log
+# Running: initdb -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_lx_diag_state_data/pgdata -A trust -N
+The files belonging to this database system will be owned by user "yingjiewang".
+This user must also own the server process.
+
+The database cluster will be initialized with this locale configuration:
+  provider:    libc
+  LC_COLLATE:  zh_CN.UTF-8
+  LC_CTYPE:    zh_CN.UTF-8
+  LC_MESSAGES: C
+  LC_MONETARY: zh_CN.UTF-8
+  LC_NUMERIC:  zh_CN.UTF-8
+  LC_TIME:     zh_CN.UTF-8
+The default database encoding has accordingly been set to "UTF8".
+initdb: could not find suitable text search configuration for locale "zh_CN.UTF-8"
+The default text search configuration will be set to "simple".
+
+Data page checksums are disabled.
+
+creating directory /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_lx_diag_state_data/pgdata ... ok
+creating subdirectories ... ok
+selecting dynamic shared memory implementation ... posix
+selecting default max_connections ... 100
+selecting default shared_buffers ... 128MB
+selecting default time zone ... Asia/Shanghai
+creating configuration files ... ok
+running bootstrap script ... 2026-05-04 13:38:18.456 CST [20756] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:38:18.456 CST [20756] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:38:18.456 CST [20756] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+performing post-bootstrap initialization ... 2026-05-04 13:38:18.583 CST [20758] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:38:18.583 CST [20758] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:38:18.583 CST [20758] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+
+Sync to disk skipped.
+The data directory might become corrupt if the operating system crashes.
+
+Success. You can now start the database server using:
+
+    pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_lx_diag_state_data/pgdata -l logfile start
+
+# Running: /Users/yingjiewang/linkdb/src/test/cluster_tap/../../../src/test/regress/pg_regress --config-auth /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_lx_diag_state_data/pgdata
+### Starting node "lx_diag_state"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_lx_diag_state_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/063_diag_skeleton_lx_diag_state.log -o --cluster-name=lx_diag_state start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "lx_diag_state" is 20763
+[13:38:19.388](1.117s) ok 13 - L7 pg_cluster_state.diag.diag_pid matches live pg_stat_activity (20769 == 20769)
+[13:38:19.399](0.011s) ok 14 - L7 pg_cluster_state.diag exposes diag_status
+[13:38:19.399](0.000s) ok 15 - L7 pg_cluster_state.diag exposes diag_pid
+[13:38:19.399](0.000s) ok 16 - L7 pg_cluster_state.diag exposes diag_spawned_at
+[13:38:19.399](0.000s) ok 17 - L7 pg_cluster_state.diag exposes diag_ready_at
+[13:38:19.399](0.000s) ok 18 - L7 pg_cluster_state.diag exposes diag_last_liveness_tick_at
+[13:38:19.400](0.000s) ok 19 - L7 pg_cluster_state.diag exposes diag_main_loop_iters
+[13:38:22.437](3.038s) ok 20 - L8 diag_main_loop_iters grew over 3s (2 -> 5) — main loop is ticking
+### Stopping node "lx_diag_state" using mode fast
+# Running: pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_lx_diag_state_data/pgdata -m fast stop
+waiting for server to shut down.... done
+server stopped
+# No postmaster PID for node "lx_diag_state"
+# Checking port 16535
+# Found port 16535
+Name: l9_diag_spawn_fail
+Version: 16.13
+Data directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l9_diag_spawn_fail_data/pgdata
+Backup directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l9_diag_spawn_fail_data/backup
+Archive directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l9_diag_spawn_fail_data/archives
+Connection string: port=16535 host=/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/17_rB9wsB7
+Log file: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/063_diag_skeleton_l9_diag_spawn_fail.log
+# Running: initdb -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l9_diag_spawn_fail_data/pgdata -A trust -N
+The files belonging to this database system will be owned by user "yingjiewang".
+This user must also own the server process.
+
+The database cluster will be initialized with this locale configuration:
+  provider:    libc
+  LC_COLLATE:  zh_CN.UTF-8
+  LC_CTYPE:    zh_CN.UTF-8
+  LC_MESSAGES: C
+  LC_MONETARY: zh_CN.UTF-8
+  LC_NUMERIC:  zh_CN.UTF-8
+  LC_TIME:     zh_CN.UTF-8
+The default database encoding has accordingly been set to "UTF8".
+initdb: could not find suitable text search configuration for locale "zh_CN.UTF-8"
+The default text search configuration will be set to "simple".
+
+Data page checksums are disabled.
+
+creating directory /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l9_diag_spawn_fail_data/pgdata ... ok
+creating subdirectories ... ok
+selecting dynamic shared memory implementation ... posix
+selecting default max_connections ... 100
+selecting default shared_buffers ... 128MB
+selecting default time zone ... Asia/Shanghai
+creating configuration files ... ok
+running bootstrap script ... 2026-05-04 13:38:22.622 CST [20791] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:38:22.622 CST [20791] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:38:22.622 CST [20791] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+performing post-bootstrap initialization ... 2026-05-04 13:38:22.745 CST [20793] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:38:22.745 CST [20793] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:38:22.745 CST [20793] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+
+Sync to disk skipped.
+The data directory might become corrupt if the operating system crashes.
+
+Success. You can now start the database server using:
+
+    pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l9_diag_spawn_fail_data/pgdata -l logfile start
+
+# Running: /Users/yingjiewang/linkdb/src/test/cluster_tap/../../../src/test/regress/pg_regress --config-auth /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l9_diag_spawn_fail_data/pgdata
+### Starting node "l9_diag_spawn_fail"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l9_diag_spawn_fail_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/063_diag_skeleton_l9_diag_spawn_fail.log -o --cluster-name=l9_diag_spawn_fail start
+waiting for server to start.... stopped waiting
+pg_ctl: could not start server
+Examine the log output.
+# pg_ctl start failed; logfile:
+2026-05-04 13:38:23.090 CST [20798] DEBUG:  registering background worker "logical replication launcher"
+2026-05-04 13:38:23.090 CST [20798] DEBUG:  [cluster node=-1 phase=pre_init] cluster_init: registering cluster shmem regions
+2026-05-04 13:38:23.091 CST [20798] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:38:23.091 CST [20798] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:38:23.091 CST [20798] DEBUG:  cluster_shared_fs: registered backend "stub" at id 0
+2026-05-04 13:38:23.091 CST [20798] DEBUG:  cluster_shared_fs: registered backend "local" at id 1
+2026-05-04 13:38:23.091 CST [20798] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+2026-05-04 13:38:23.091 CST [20798] LOG:  cluster startup: pre_init -> phase0_base
+2026-05-04 13:38:23.091 CST [20798] LOG:  cluster startup: phase0_base -> phase1_cluster
+2026-05-04 13:38:23.092 CST [20799] DEBUG:  cluster_smgr: bypass HTAB initialised (initial size 1024 entries)
+2026-05-04 13:38:23.202 CST [20798] DEBUG:  cluster phase 1: LMON ready (pid 20799); interconnect listener / heartbeat consumer remain stubs (Stage 1.15+)
+2026-05-04 13:38:23.202 CST [20798] LOG:  cluster startup: phase1_cluster -> phase2_lock
+2026-05-04 13:38:23.203 CST [20800] DEBUG:  cluster_smgr: bypass HTAB initialised (initial size 1024 entries)
+2026-05-04 13:38:23.309 CST [20798] DEBUG:  cluster phase 2: LCK ready (pid 20800); LMS / LMD remain stubs (Stage 2+ GES feature)
+2026-05-04 13:38:23.309 CST [20798] LOG:  cluster startup: phase2_lock -> phase3_recovery
+2026-05-04 13:38:23.309 CST [20798] DEBUG:  Phase 3 stub: PG-native startup process unchanged; Recovery Coordinator / merged recovery deferred to Stage 4 spec
+2026-05-04 13:38:23.309 CST [20798] LOG:  starting PostgreSQL 16.13 on aarch64-apple-darwin25.2.0, compiled by Apple clang version 21.0.0 (clang-2100.0.123.102), 64-bit
+2026-05-04 13:38:23.309 CST [20798] LOG:  listening on Unix socket "/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/17_rB9wsB7/.s.PGSQL.16535"
+2026-05-04 13:38:23.313 CST [20801] DEBUG:  cluster_smgr: bypass HTAB initialised (initial size 1024 entries)
+2026-05-04 13:38:23.313 CST [20802] DEBUG:  cluster_smgr: bypass HTAB initialised (initial size 1024 entries)
+2026-05-04 13:38:23.313 CST [20803] DEBUG:  cluster_smgr: bypass HTAB initialised (initial size 1024 entries)
+2026-05-04 13:38:23.313 CST [20803] LOG:  database system was shut down at 2026-05-04 13:38:23 CST
+2026-05-04 13:38:23.313 CST [20803] DEBUG:  checkpoint record is at 0/1531FC8
+2026-05-04 13:38:23.313 CST [20803] DEBUG:  redo record is at 0/1531FC8; shutdown true
+2026-05-04 13:38:23.313 CST [20803] DEBUG:  next transaction ID: 746; next OID: 14079
+2026-05-04 13:38:23.313 CST [20803] DEBUG:  next MultiXactId: 1; next MultiXactOffset: 0
+2026-05-04 13:38:23.313 CST [20803] DEBUG:  oldest unfrozen transaction ID: 738, in database 1
+2026-05-04 13:38:23.313 CST [20803] DEBUG:  oldest MultiXactId: 1, in database 1
+2026-05-04 13:38:23.313 CST [20803] DEBUG:  commit timestamp Xid oldest/newest: 0/0
+2026-05-04 13:38:23.313 CST [20803] DEBUG:  transaction ID wrap limit is 2147484385, limited by database with OID 1
+2026-05-04 13:38:23.313 CST [20803] DEBUG:  MultiXactId wrap limit is 2147483648, limited by database with OID 1
+2026-05-04 13:38:23.314 CST [20803] DEBUG:  starting up replication slots
+2026-05-04 13:38:23.314 CST [20803] DEBUG:  xmin required by slots: data 0, catalog 0
+2026-05-04 13:38:23.314 CST [20803] DEBUG:  MultiXactId wrap limit is 2147483648, limited by database with OID 1
+2026-05-04 13:38:23.314 CST [20803] DEBUG:  MultiXact member stop limit is now 4294914944 based on MultiXact 1
+2026-05-04 13:38:23.315 CST [20798] LOG:  cluster startup: phase3_recovery -> phase4_normal
+2026-05-04 13:38:23.315 CST [20798] FATAL:  cluster injection point "cluster-diag-pre-spawn" armed with ERROR
+2026-05-04 13:38:23.315 CST [20798] LOG:  database system is shut down
+# No postmaster PID for node "l9_diag_spawn_fail"
+[13:38:23.401](0.964s) ok 21 - L9 phase 2 FATAL out path works when DIAG spawn is interrupted by injection (F13 fail_ctx plumbing reachable)
+# Checking port 16536
+# Found port 16536
+Name: l10_diag_disabled
+Version: 16.13
+Data directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l10_diag_disabled_data/pgdata
+Backup directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l10_diag_disabled_data/backup
+Archive directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l10_diag_disabled_data/archives
+Connection string: port=16536 host=/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/17_rB9wsB7
+Log file: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/063_diag_skeleton_l10_diag_disabled.log
+# Running: initdb -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l10_diag_disabled_data/pgdata -A trust -N
+The files belonging to this database system will be owned by user "yingjiewang".
+This user must also own the server process.
+
+The database cluster will be initialized with this locale configuration:
+  provider:    libc
+  LC_COLLATE:  zh_CN.UTF-8
+  LC_CTYPE:    zh_CN.UTF-8
+  LC_MESSAGES: C
+  LC_MONETARY: zh_CN.UTF-8
+  LC_NUMERIC:  zh_CN.UTF-8
+  LC_TIME:     zh_CN.UTF-8
+The default database encoding has accordingly been set to "UTF8".
+initdb: could not find suitable text search configuration for locale "zh_CN.UTF-8"
+The default text search configuration will be set to "simple".
+
+Data page checksums are disabled.
+
+creating directory /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l10_diag_disabled_data/pgdata ... ok
+creating subdirectories ... ok
+selecting dynamic shared memory implementation ... posix
+selecting default max_connections ... 100
+selecting default shared_buffers ... 128MB
+selecting default time zone ... Asia/Shanghai
+creating configuration files ... ok
+running bootstrap script ... 2026-05-04 13:38:23.477 CST [20811] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:38:23.477 CST [20811] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:38:23.477 CST [20811] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+performing post-bootstrap initialization ... 2026-05-04 13:38:23.599 CST [20813] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:38:23.599 CST [20813] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:38:23.599 CST [20813] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+
+Sync to disk skipped.
+The data directory might become corrupt if the operating system crashes.
+
+Success. You can now start the database server using:
+
+    pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l10_diag_disabled_data/pgdata -l logfile start
+
+# Running: /Users/yingjiewang/linkdb/src/test/cluster_tap/../../../src/test/regress/pg_regress --config-auth /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l10_diag_disabled_data/pgdata
+### Starting node "l10_diag_disabled"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l10_diag_disabled_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/063_diag_skeleton_l10_diag_disabled.log -o --cluster-name=l10_diag_disabled start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "l10_diag_disabled" is 20818
+[13:38:24.068](0.667s) ok 22 - L10 cluster.enabled=off → DIAG does NOT spawn (HC4 degraded stub path)
+[13:38:24.079](0.011s) ok 23 - L10 phase machinery still advances to running with cluster.enabled=off
+### Stopping node "l10_diag_disabled" using mode fast
+# Running: pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_063_diag_skeleton_l10_diag_disabled_data/pgdata -m fast stop
+waiting for server to shut down.... done
+server stopped
+# No postmaster PID for node "l10_diag_disabled"
+[13:38:24.189](0.110s) 1..23

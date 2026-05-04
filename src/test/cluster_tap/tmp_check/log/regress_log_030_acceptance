@@ -1,0 +1,143 @@
+# Checking port 23458
+# Found port 23458
+Name: main
+Version: 16.13
+Data directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_030_acceptance_main_data/pgdata
+Backup directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_030_acceptance_main_data/backup
+Archive directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_030_acceptance_main_data/archives
+Connection string: port=23458 host=/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/gvGmpN9Jk3
+Log file: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/030_acceptance_main.log
+# Running: initdb -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_030_acceptance_main_data/pgdata -A trust -N
+The files belonging to this database system will be owned by user "yingjiewang".
+This user must also own the server process.
+
+The database cluster will be initialized with this locale configuration:
+  provider:    libc
+  LC_COLLATE:  zh_CN.UTF-8
+  LC_CTYPE:    zh_CN.UTF-8
+  LC_MESSAGES: C
+  LC_MONETARY: zh_CN.UTF-8
+  LC_NUMERIC:  zh_CN.UTF-8
+  LC_TIME:     zh_CN.UTF-8
+The default database encoding has accordingly been set to "UTF8".
+initdb: could not find suitable text search configuration for locale "zh_CN.UTF-8"
+The default text search configuration will be set to "simple".
+
+Data page checksums are disabled.
+
+creating directory /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_030_acceptance_main_data/pgdata ... ok
+creating subdirectories ... ok
+selecting dynamic shared memory implementation ... posix
+selecting default max_connections ... 100
+selecting default shared_buffers ... 128MB
+selecting default time zone ... Asia/Shanghai
+creating configuration files ... ok
+running bootstrap script ... 2026-05-04 13:37:33.353 CST [19782] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:33.353 CST [19782] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:33.353 CST [19782] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+performing post-bootstrap initialization ... 2026-05-04 13:37:33.477 CST [19784] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:33.477 CST [19784] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:33.477 CST [19784] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+
+Sync to disk skipped.
+The data directory might become corrupt if the operating system crashes.
+
+Success. You can now start the database server using:
+
+    pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_030_acceptance_main_data/pgdata -l logfile start
+
+# Running: /Users/yingjiewang/linkdb/src/test/cluster_tap/../../../src/test/regress/pg_regress --config-auth /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_030_acceptance_main_data/pgdata
+### Starting node "main"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_030_acceptance_main_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/030_acceptance_main.log -o --cluster-name=main start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "main" is 19789
+[13:37:34.247](0.967s) ok 1 - A1 PG basic SELECT works
+[13:37:34.259](0.013s) ok 2 - A2 server_version_num matches PG 16.x
+[13:37:34.281](0.022s) ok 3 - A3 pg_class catalog accessible
+[13:37:34.291](0.010s) ok 4 - A4 pg_postmaster_start_time() is in the past
+[13:37:34.301](0.010s) ok 5 - A5 pg_database has at least 1 entry
+[13:37:34.312](0.011s) ok 6 - B1 cluster_* SRFs registered in pg_proc
+[13:37:34.322](0.010s) ok 7 - B2 pgrac views materialised in pg_views
+[13:37:34.331](0.009s) ok 8 - B3 enough cluster_* SRFs (>= 9 SRF entry points; stage 0.30 has 12)
+[13:37:34.340](0.009s) ok 9 - C1 cluster.node_id GUC accessible (default -1)
+[13:37:34.350](0.010s) ok 10 - C2 cluster.interconnect_tier defaults to stub
+[13:37:34.360](0.010s) ok 11 - C3 PG version string non-empty
+[13:37:34.369](0.010s) ok 12 - C4 pg_cluster_nodes returns 1 row (single-node fallback)
+[13:37:34.378](0.009s) ok 13 - D1 phase category present in pg_cluster_state
+[13:37:34.387](0.009s) ok 14 - D2 cluster_phase is a recognised lifecycle string (got: running)
+[13:37:34.397](0.010s) ok 15 - E1 pg_stat_cluster_wait_events returns 59 rows (with DIAG BgProc 1.13)
+[13:37:34.406](0.009s) ok 16 - E2 Cluster: GES wait events exist
+[13:37:34.416](0.010s) ok 17 - E3 Cluster: PCM wait events exist
+[13:37:34.425](0.009s) ok 18 - E4 pg_stat_gcluster_wait_events returns 59 rows (single-node)
+[13:37:34.436](0.010s) ok 19 - F1 pg_class accessible (sanity)
+[13:37:34.445](0.010s) ok 20 - F2 cluster injection unknown-name path raises WARNING
+[13:37:34.454](0.009s) ok 21 - G1 dump shows cluster.node_id GUC
+[13:37:34.464](0.010s) ok 22 - G2 dump shows cluster.interconnect_tier GUC
+[13:37:34.474](0.010s) ok 23 - G3 dump shows cluster.config_file GUC
+[13:37:34.483](0.010s) ok 24 - G4 dump shows cluster.injection_points GUC
+[13:37:34.492](0.009s) ok 25 - G5 dump shows cluster.shared_storage_backend GUC (default stub, stage 1.1)
+[13:37:34.501](0.009s) ok 26 - H1 ClusterShmem magic = 0x50475243 ("PGRC" LE)
+[13:37:34.511](0.010s) ok 27 - H2 ClusterShmem version_packed is 8-hex format
+[13:37:34.521](0.010s) ok 28 - H3 ClusterShmem created_at is sane timestamp
+[13:37:34.531](0.010s) ok 29 - I1 wait_events has exactly 13 distinct types (10 from stage 0 + SharedFs from stage 1.1 + StartupPhase from stage 1.10 + BgProc from stage 1.11 Sprint B / 1.11.1 F12)
+[13:37:34.539](0.009s) ok 30 - I2 gview returns rows with node_id populated
+[13:37:34.549](0.009s) ok 31 - I3 wait_events column names: type,name
+[13:37:34.558](0.009s) ok 32 - I4 pg_stat_cluster_wait_events present in pg_views
+[13:37:34.569](0.011s) ok 33 - J1 default IC tier is stub
+[13:37:34.578](0.009s) ok 34 - J2 4 mock SRFs registered
+[13:37:34.587](0.009s) ok 35 - J3 mock_inject rejected when tier != mock
+[13:37:34.596](0.009s) ok 36 - J4 high-level cluster_msg_* are C-only (not in pg_proc)
+[13:37:34.605](0.009s) ok 37 - K1 pg_cluster_nodes has 7 columns (spec-0.19 contract)
+[13:37:34.613](0.009s) ok 38 - K2 single-node fallback role is primary
+[13:37:34.624](0.011s) ok 39 - K3 dump shows conf.node_count = 1
+[13:37:34.633](0.009s) ok 40 - K4 conf.self_in_topology is bool-formatted
+[13:37:34.669](0.036s) ok 41 - L1 postgres binary present and executable (/Users/yingjiewang/linkdb-install/bin/postgres)
+[13:37:34.679](0.010s) ok 42 - M1 63 injection points (1.13 adds 6 cluster-diag-*)
+[13:37:34.689](0.010s) ok 43 - M2 cluster-init injection points present
+[13:37:34.699](0.010s) ok 44 - M3 SRF arm path works (warning fault_type observed)
+[13:37:34.709](0.010s) ok 45 - M4 5 fault types accepted by SRF
+[13:37:34.719](0.010s) ok 46 - M5 inject category has 63×2 = 126 sub-keys (.fault_type + .hits) after 1.13
+[13:37:34.727](0.009s) ok 47 - M6 inject.armed_count starts at 0 in fresh backend
+[13:37:34.737](0.010s) ok 48 - N1 pg_stat_cluster_nodes returns 1 row
+[13:37:34.747](0.010s) ok 49 - N2 node state is online
+[13:37:34.756](0.010s) ok 50 - N3 pg_stat_cluster_counters has at least 1 entry
+[13:37:34.767](0.010s) ok 51 - N4 cluster.inject.armed_count counter accessible
+[13:37:34.776](0.009s) ok 52 - O1 pg_cluster_state returns >= 30 rows (20 inject + others)
+[13:37:34.786](0.010s) ok 53 - O2 pg_cluster_state has all 14 categories (7 stage-0 + shared_fs 1.1 + block_format 1.4 + buffer_format 1.6 + pcm 1.7 + lmon 1.11 + lck 1.12 + diag 1.13)
+[13:37:34.796](0.010s) ok 54 - O3 no NULL values in pg_cluster_state (NOT NULL contract)
+[13:37:34.806](0.010s) ok 55 - O4 pg_cluster_state columns are (text, text, text)
+[13:37:34.816](0.010s) ok 56 - O5 shmem.magic dump entry present
+[13:37:34.823](0.008s) ok 57 - P1 --pgrac-version output matches semver format (got: pgrac v0.2.0-stage1.7 (based on PostgreSQL 16.13))
+[13:37:34.833](0.009s) ok 58 - Q1 pgrac_version SQL view matches --pgrac-version CLI output
+[13:37:34.842](0.009s) ok 59 - Q2 inject + pgstat + dump frameworks consistent (cross-spec integration)
+[13:37:34.852](0.010s) ok 60 - Q3 pg_proc OID 8898-8910 range has >= 9 cluster SRFs (stage 0 catalog complete)
+[13:37:34.861](0.010s) ok 61 - P1 block_format category has 9 keys (4 stage-1.4 + 5 stage-1.5 ITL: itl_slot_size_bytes, itl_initrans_default, itl_array_bytes, tuple_header_extra_bytes, itl_location)
+[13:37:34.871](0.010s) ok 62 - P2 page_layout_version = 5
+[13:37:34.881](0.010s) ok 63 - P3 page_header_size = 32 (24 PG vanilla + 8B pd_block_scn)
+[13:37:34.890](0.009s) ok 64 - P4 sizeof(SCN) = 8, InvalidScn = 0
+[13:37:34.899](0.009s) ok 65 - P5 buffer_format category has 6 keys (stage-1.6: buffer_desc_size_bytes, buffer_desc_pad_to_size, buffer_hot_field_offset, buffer_cold_field_offset, buffer_type_count, pcm_state_count)
+[13:37:34.909](0.010s) ok 66 - P6 BUFFERDESC_PAD_TO_SIZE = 128 (PG 64 -> pgrac 128)
+[13:37:34.919](0.009s) ok 67 - P7 sizeof(BufferDesc) <= BUFFERDESC_PAD_TO_SIZE (1st StaticAssertDecl invariant)
+[13:37:34.928](0.010s) ok 68 - P8 buffer_hot_field_offset = 52 (PIVOT B 实测 PG 16.13 BufferTag = 20B)
+[13:37:34.938](0.010s) ok 69 - P9 cluster cold fields start at cache line 2 boundary >= 64 (PIVOT B + 4th StaticAssertDecl)
+[13:37:34.947](0.009s) ok 70 - P10 BufferType has 3 values (CURRENT/CR/PI), PcmState has 3 values (N/S/X)
+### Restarting node "main"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_030_acceptance_main_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/030_acceptance_main.log restart
+waiting for server to shut down.... done
+server stopped
+waiting for server to start.... done
+server started
+# Postmaster PID for node "main" is 19943
+[13:37:35.538](0.591s) ok 71 - R1 stage-1.8 milestone: cluster_smgr engaged when GUC=on (smgr_active_relations=34; spec-1.8 end-to-end verified at 030 acceptance level)
+[13:37:35.560](0.022s) ok 72 - S1 stage-1.10 milestone: pg_cluster_state.phase has 5 keys (cluster_phase + phase_enum_value + phase_started_at + phase_elapsed_seconds + phase_history)
+[13:37:35.570](0.010s) ok 73 - S2 stage-1.10 milestone: phase_enum_value = 6 (CLUSTER_PHASE_RUNNING) after normal startup completes
+[13:37:35.580](0.010s) ok 74 - S3 stage-1.10 milestone: phase_history ring records the running entry (HC5 fixed-size ring active)
+### Stopping node "main" using mode fast
+# Running: pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_030_acceptance_main_data/pgdata -m fast stop
+waiting for server to shut down.... done
+server stopped
+# No postmaster PID for node "main"
+[13:37:35.695](0.114s) 1..74

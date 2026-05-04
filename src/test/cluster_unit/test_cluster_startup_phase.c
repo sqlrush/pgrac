@@ -263,6 +263,18 @@ cluster_lck_wait_for_ready(int timeout_ms pg_attribute_unused())
 	return false;
 }
 
+/* Spec-1.13 stubs. */
+int
+cluster_diag_start(void)
+{
+	return 0;
+}
+bool
+cluster_diag_wait_for_ready(int timeout_ms pg_attribute_unused())
+{
+	return false;
+}
+
 
 UT_DEFINE_GLOBALS();
 

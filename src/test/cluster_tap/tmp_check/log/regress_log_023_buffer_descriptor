@@ -1,0 +1,95 @@
+# Checking port 11704
+# Found port 11704
+Name: main
+Version: 16.13
+Data directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_023_buffer_descriptor_main_data/pgdata
+Backup directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_023_buffer_descriptor_main_data/backup
+Archive directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_023_buffer_descriptor_main_data/archives
+Connection string: port=11704 host=/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/p1FdIDigmw
+Log file: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/023_buffer_descriptor_main.log
+# Running: initdb -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_023_buffer_descriptor_main_data/pgdata -A trust -N
+The files belonging to this database system will be owned by user "yingjiewang".
+This user must also own the server process.
+
+The database cluster will be initialized with this locale configuration:
+  provider:    libc
+  LC_COLLATE:  zh_CN.UTF-8
+  LC_CTYPE:    zh_CN.UTF-8
+  LC_MESSAGES: C
+  LC_MONETARY: zh_CN.UTF-8
+  LC_NUMERIC:  zh_CN.UTF-8
+  LC_TIME:     zh_CN.UTF-8
+The default database encoding has accordingly been set to "UTF8".
+initdb: could not find suitable text search configuration for locale "zh_CN.UTF-8"
+The default text search configuration will be set to "simple".
+
+Data page checksums are disabled.
+
+creating directory /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_023_buffer_descriptor_main_data/pgdata ... ok
+creating subdirectories ... ok
+selecting dynamic shared memory implementation ... posix
+selecting default max_connections ... 100
+selecting default shared_buffers ... 128MB
+selecting default time zone ... Asia/Shanghai
+creating configuration files ... ok
+running bootstrap script ... 2026-05-04 13:37:29.339 CST [19615] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:29.339 CST [19615] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:29.339 CST [19615] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+performing post-bootstrap initialization ... 2026-05-04 13:37:29.466 CST [19617] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:29.466 CST [19617] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:29.466 CST [19617] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+
+Sync to disk skipped.
+The data directory might become corrupt if the operating system crashes.
+
+Success. You can now start the database server using:
+
+    pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_023_buffer_descriptor_main_data/pgdata -l logfile start
+
+# Running: /Users/yingjiewang/linkdb/src/test/cluster_tap/../../../src/test/regress/pg_regress --config-auth /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_023_buffer_descriptor_main_data/pgdata
+### Starting node "main"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_023_buffer_descriptor_main_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/023_buffer_descriptor_main.log -o --cluster-name=main start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "main" is 19622
+[13:37:30.245](0.979s) ok 1 - L1 pg_cluster_state.buffer_format category has 6 keys
+[13:37:30.259](0.014s) ok 2 - L2 buffer_desc_size_bytes = 128 (PG-original 52B + 12B hot tail + 64B cold body)
+[13:37:30.271](0.012s) ok 3 - L3 buffer_desc_pad_to_size = 128 (BUFFERDESC_PAD_TO_SIZE 64 -> 128)
+[13:37:30.282](0.011s) ok 4 - L4 buffer_hot_field_offset = 52 (PG 16.13: BufferTag 20B + buf_id 4B + state 4B + wait 4B + freeNext 4B + content_lock 16B = 52B)
+[13:37:30.292](0.010s) ok 5 - L5 buffer_cold_field_offset = 64 (PIVOT B: cr_chain_head moved to cache line 2 boundary)
+[13:37:30.303](0.010s) ok 6 - L6 buffer_type_count = 3 (CURRENT / CR / PI)
+[13:37:30.313](0.010s) ok 7 - L7 pcm_state_count = 3 (N / S / X)
+[13:37:30.323](0.010s) ok 8 - L8 1.5 baseline: block_format category still has 9 keys (1.6 adds none here)
+[13:37:30.333](0.010s) ok 9 - L9 1.4 baseline: pg_stat_cluster_wait_events still 51 (1.6 adds no wait events)
+[13:37:30.343](0.010s) ok 10 - L10 1.12 baseline: pg_cluster_shmem 6 rows (cluster_ctl + cluster_conf + cluster_pcm_grd + cluster_startup_phase + cluster_lmon + cluster_lck)
+[13:37:30.352](0.010s) ok 11 - L11 1.2 baseline: pg_stat_cluster_injections is 51 (1.6 adds no inject points; 4 PCM added by 1.7)
+[13:37:30.364](0.011s) ok 12 - L12 pg_cluster_state has 13 distinct categories (11 from spec-1.7 + lmon from spec-1.11 + lck from spec-1.12)
+[13:37:30.387](0.023s) ok 13 - L13 simple INSERT/SELECT round-trip (100 rows) works -- BufferDesc layout does not break PG basic functionality
+[13:37:30.409](0.023s) ok 14 - L14 INSERT 500 + UPDATE 250 + DELETE 100 round-trip (400 rows) works
+[13:37:30.447](0.038s) ok 15 - L15 parallel scan deterministic count (no concurrency-triggered corruption)
+[13:37:30.457](0.009s) ok 16 - L16 cluster_smoke surface integrates buffer_format + pcm + lmon + lck (13 categories)
+[13:37:30.485](0.028s) ok 17 - L17 layout self-consistent: hot=52 < cold=64 <= pad=128
+[13:37:30.485](0.000s) ok 18 - L17b hot tail size = cold - hot = 12B (PIVOT B 实测)
+### Stopping node "main" using mode fast
+# Running: pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_023_buffer_descriptor_main_data/pgdata -m fast stop
+waiting for server to shut down.... done
+server stopped
+# No postmaster PID for node "main"
+### Starting node "main"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_023_buffer_descriptor_main_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/023_buffer_descriptor_main.log -o --cluster-name=main start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "main" is 19681
+[13:37:31.055](0.570s) ok 19 - L18 server restarts cleanly with cluster BufferDesc layout (data persists)
+[13:37:31.055](0.000s) ok 20 - L19a cr_chain_head >= 64 (Stage 2-3 cold path; semantic StaticAssert)
+[13:37:31.055](0.000s) ok 21 - L19b cold offset is cache-line aligned (boundary at multiple of 64)
+[13:37:31.055](0.000s) ok 22 - L19c hot field offset >= 48 (cluster fields follow PG-original content_lock)
+[13:37:31.071](0.015s) ok 23 - L20 TEMP TABLE INSERT/UPDATE/DELETE round-trip works (LocalBufferAlloc + ClusterInitBufferDescFields not breaking PG)
+[13:37:31.071](0.000s) 1..23
+### Stopping node "main" using mode immediate
+# Running: pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_023_buffer_descriptor_main_data/pgdata -m immediate stop
+waiting for server to shut down.... done
+server stopped
+# No postmaster PID for node "main"

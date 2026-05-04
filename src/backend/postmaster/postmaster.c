@@ -312,6 +312,9 @@ static pid_t LmonPID = 0;
 
 /* PGRAC (stage 1.12 Sprint A): LCK aux process pid; same pattern. */
 static pid_t LckPID = 0;
+
+/* PGRAC (stage 1.13 Sprint A): DIAG aux process pid; same pattern. */
+static pid_t DiagPID = 0;
 #endif
 
 /* Startup process's status */
@@ -617,6 +620,7 @@ static void ShmemBackendArrayRemove(Backend *bn);
 #ifdef USE_PGRAC_CLUSTER
 #define StartLmon() StartChildProcess(LmonProcess)
 #define StartLck() StartChildProcess(LckProcess)
+#define StartDiag() StartChildProcess(DiagProcess)
 #endif
 
 /* Macros to check exit status of a child process */
@@ -1848,6 +1852,16 @@ ServerLoop(void)
 		 */
 		if (cluster_enabled && LckPID == 0 && pmState == PM_RUN)
 			LckPID = StartLck();
+
+		/*
+		 * PGRAC: spec-1.13 Sprint A — same ServerLoop respawn for DIAG
+		 * (codex round 3 P1.1+P1.2 preempted, third instance).  DIAG
+		 * is the first cluster aux process spawned post PM_RUN by the
+		 * Q2 A' cluster_run_phase4_sequence() driver, but the respawn
+		 * path is symmetric to LMON / LCK once PM_RUN is reached.
+		 */
+		if (cluster_enabled && DiagPID == 0 && pmState == PM_RUN)
+			DiagPID = StartDiag();
 #endif
 
 		/*
@@ -2705,6 +2719,8 @@ process_pm_reload_request(void)
 			signal_child(LmonPID, SIGHUP);
 		if (LckPID != 0)
 			signal_child(LckPID, SIGHUP);
+		if (DiagPID != 0)
+			signal_child(DiagPID, SIGHUP);
 #endif
 		if (AutoVacPID != 0)
 			signal_child(AutoVacPID, SIGHUP);
@@ -3014,13 +3030,23 @@ process_pm_child_exit(void)
 
 #ifdef USE_PGRAC_CLUSTER
 			/*
-			 * PGRAC: spec-1.11.1 F9 — advance cluster phase to RUNNING
-			 * now that pmState reflects PG-ready.  Idempotent guard
-			 * inside the helper makes this safe to call from both the
-			 * normal startup path (PostmasterMain explicitly invokes
-			 * it before ServerLoop) and the crash reinit path (here,
-			 * after the second startup process completes recovery).
+			 * PGRAC: spec-1.13 v0.2 Q2 A' — drive cluster phase 4
+			 * (post-recovery / post-PM_RUN) HERE, after the startup
+			 * process has finished recovery and pmState reflects
+			 * PG-ready.  This makes phase 4 a true normal-running
+			 * phase: DIAG (1.13) spawns AFTER PG is OPEN, not before
+			 * recovery as the original spec-1.10 phase 4 location
+			 * implied.  cluster_run_startup_sequence() (called earlier
+			 * from PostmasterMain) only runs phase 0-3 now; phase 4
+			 * lives in cluster_run_phase4_sequence().
+			 *
+			 * After phase4_sequence returns, advance cluster phase
+			 * meta state to RUNNING (spec-1.11.1 F9 / spec-1.12.1 F15
+			 * pathing).  Idempotent guard makes finalize safe to call
+			 * here even if called by an earlier sibling path; round 5
+			 * F15 already removed the pre-ServerLoop early call site.
 			 */
+			cluster_run_phase4_sequence();
 			cluster_finalize_startup_running();
 #endif
 
@@ -3161,6 +3187,18 @@ process_pm_child_exit(void)
 			LckPID = 0;
 			if (!EXIT_STATUS_0(exitstatus))
 				HandleChildCrash(pid, exitstatus, _("LCK process"));
+			continue;
+		}
+		/*
+		 * PGRAC: stage 1.13 Sprint A — DIAG aux process exit handling
+		 * mirrors LCK / LMON.  Same HC5 normal/abnormal split.
+		 *
+		 * Spec: spec-1.13-diag-skeleton.md Sprint A D5 + HC5.
+		 */
+		if (pid == DiagPID) {
+			DiagPID = 0;
+			if (!EXIT_STATUS_0(exitstatus))
+				HandleChildCrash(pid, exitstatus, _("DIAG process"));
 			continue;
 		}
 #endif
@@ -3551,6 +3589,12 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 		LckPID = 0;
 	else if (LckPID != 0 && take_action)
 		sigquit_child(LckPID);
+
+	/* PGRAC (stage 1.13 Sprint A): same pattern for DIAG. */
+	if (pid == DiagPID)
+		DiagPID = 0;
+	else if (DiagPID != 0 && take_action)
+		sigquit_child(DiagPID);
 #endif
 
 	/* Take care of the walreceiver too */
@@ -3707,6 +3751,9 @@ PostmasterStateMachine(void)
 		/* PGRAC (stage 1.12 Sprint A): same SIGTERM for LCK. */
 		if (LckPID != 0)
 			signal_child(LckPID, SIGTERM);
+		/* PGRAC (stage 1.13 Sprint A): same SIGTERM for DIAG. */
+		if (DiagPID != 0)
+			signal_child(DiagPID, SIGTERM);
 #endif
 		/* If we're in recovery, also stop startup and walreceiver procs */
 		if (StartupPID != 0)
@@ -3753,6 +3800,8 @@ PostmasterStateMachine(void)
 			/* PGRAC: spec-1.12 Sprint A — same wait for LCK (codex
 			 * round 3 P2.3 preempted in 1.12). */
 			LckPID == 0 &&
+			/* PGRAC: spec-1.13 Sprint A — same wait for DIAG. */
+			DiagPID == 0 &&
 #endif
 			AutoVacPID == 0) {
 			if (Shutdown >= ImmediateShutdown || FatalError) {
@@ -4092,6 +4141,8 @@ TerminateChildren(int signal)
 		signal_child(LmonPID, signal);
 	if (LckPID != 0)
 		signal_child(LckPID, signal);
+	if (DiagPID != 0)
+		signal_child(DiagPID, signal);
 #endif
 }
 
@@ -5448,6 +5499,29 @@ cluster_postmaster_start_lck(void)
 
 	LckPID = StartLck();
 	return LckPID;
+}
+
+/*
+ * cluster_postmaster_start_diag -- spawn the DIAG aux process.
+ *
+ *	PGRAC (stage 1.13 Sprint A): postmaster-owned narrow wrapper for
+ *	the cluster module to request DIAG spawn (Q2).  Mirrors
+ *	cluster_postmaster_start_lck -- StartChildProcess is file-static,
+ *	so cluster_diag.c::cluster_diag_start() forwards here.
+ *
+ *	Note: DIAG spawn is driven from cluster_run_phase4_sequence() in
+ *	the reaper PM_RUN transition path (Q2 A'); not from
+ *	cluster_run_startup_sequence() pre-recovery.
+ *
+ *	Spec: spec-1.13-diag-skeleton.md Sprint A D5.
+ */
+pid_t
+cluster_postmaster_start_diag(void)
+{
+	Assert(!IsUnderPostmaster);
+
+	DiagPID = StartDiag();
+	return DiagPID;
 }
 #endif
 

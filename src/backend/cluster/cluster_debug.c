@@ -73,6 +73,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_elog.h" /* cluster_phase */
+#include "cluster/cluster_diag.h" /* cluster_diag_status (spec-1.13 D12) */
 #include "cluster/cluster_lck.h"  /* cluster_lck_status (spec-1.12 D12) */
 #include "cluster/cluster_lmon.h" /* cluster_lmon_status (spec-1.11 Sprint B D12) */
 #include "cluster/cluster_guc.h"
@@ -471,6 +472,41 @@ dump_lck(ReturnSetInfo *rsinfo)
 
 
 /*
+ * dump_diag -- Stage 1.13 DIAG state diagnostics (mirrors dump_lck /
+ * dump_lmon F11 7-key complete model: 2 status + 5 lifecycle).
+ */
+static void
+dump_diag(ReturnSetInfo *rsinfo)
+{
+	ClusterDiagStatus s = cluster_diag_status();
+	pid_t pid;
+	TimestampTz spawned_at, ready_at, last_tick;
+	int64 iters;
+
+	emit_row(rsinfo, "diag", "diag_status", cluster_diag_status_to_string(s));
+	emit_row(rsinfo, "diag", "diag_status_enum_value", fmt_int32((int32)s));
+
+	pid = cluster_diag_pid();
+	emit_row(rsinfo, "diag", "diag_pid", pid == 0 ? "(unset)" : fmt_int64((int64)pid));
+
+	spawned_at = cluster_diag_spawned_at();
+	emit_row(rsinfo, "diag", "diag_spawned_at",
+			 spawned_at == 0 ? "(unset)" : pstrdup(timestamptz_to_str(spawned_at)));
+
+	ready_at = cluster_diag_ready_at();
+	emit_row(rsinfo, "diag", "diag_ready_at",
+			 ready_at == 0 ? "(unset)" : pstrdup(timestamptz_to_str(ready_at)));
+
+	last_tick = cluster_diag_last_liveness_tick_at();
+	emit_row(rsinfo, "diag", "diag_last_liveness_tick_at",
+			 last_tick == 0 ? "(unset)" : pstrdup(timestamptz_to_str(last_tick)));
+
+	iters = cluster_diag_main_loop_iters();
+	emit_row(rsinfo, "diag", "diag_main_loop_iters", fmt_int64(iters));
+}
+
+
+/*
  * dump_shared_fs -- Stage 1.1 cluster_shared_fs runtime state.
  *
  *	Emits two rows: the active backend's name (or "(none)" if init has
@@ -639,6 +675,7 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		dump_phase(rsinfo);
 		dump_lmon(rsinfo);
 		dump_lck(rsinfo);
+		dump_diag(rsinfo);
 	}
 #else
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

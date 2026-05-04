@@ -1,0 +1,8 @@
+2026-05-04 13:37:43.676 CST [20224] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:43.676 CST [20224] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:43.676 CST [20224] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+2026-05-04 13:37:43.677 CST [20224] LOG:  cluster startup: pre_init -> phase0_base
+2026-05-04 13:37:43.677 CST [20224] LOG:  cluster startup: phase0_base -> phase1_cluster
+2026-05-04 13:37:45.787 CST [20224] FATAL:  cluster startup phase phase1_cluster exceeded timeout (2.110 s > 1 s)
+2026-05-04 13:37:45.787 CST [20224] HINT:  Increase cluster.phase1_timeout GUC or fix handler hang (handler must self-bound blocking waits via WaitLatch+timeout per the phase handler contract).
+2026-05-04 13:37:45.787 CST [20224] LOG:  database system is shut down

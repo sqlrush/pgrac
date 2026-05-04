@@ -1,0 +1,220 @@
+# Checking port 25194
+# Found port 25194
+Name: main
+Version: 16.13
+Data directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_060_postmaster_phases_main_data/pgdata
+Backup directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_060_postmaster_phases_main_data/backup
+Archive directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_060_postmaster_phases_main_data/archives
+Connection string: port=25194 host=/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/v9WHetLoH2
+Log file: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/060_postmaster_phases_main.log
+# Running: initdb -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_060_postmaster_phases_main_data/pgdata -A trust -N
+The files belonging to this database system will be owned by user "yingjiewang".
+This user must also own the server process.
+
+The database cluster will be initialized with this locale configuration:
+  provider:    libc
+  LC_COLLATE:  zh_CN.UTF-8
+  LC_CTYPE:    zh_CN.UTF-8
+  LC_MESSAGES: C
+  LC_MONETARY: zh_CN.UTF-8
+  LC_NUMERIC:  zh_CN.UTF-8
+  LC_TIME:     zh_CN.UTF-8
+The default database encoding has accordingly been set to "UTF8".
+initdb: could not find suitable text search configuration for locale "zh_CN.UTF-8"
+The default text search configuration will be set to "simple".
+
+Data page checksums are disabled.
+
+creating directory /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_060_postmaster_phases_main_data/pgdata ... ok
+creating subdirectories ... ok
+selecting dynamic shared memory implementation ... posix
+selecting default max_connections ... 100
+selecting default shared_buffers ... 128MB
+selecting default time zone ... Asia/Shanghai
+creating configuration files ... ok
+running bootstrap script ... 2026-05-04 13:37:39.200 CST [20089] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:39.200 CST [20089] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:39.200 CST [20089] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+performing post-bootstrap initialization ... 2026-05-04 13:37:39.321 CST [20091] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:39.321 CST [20091] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:39.321 CST [20091] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+
+Sync to disk skipped.
+The data directory might become corrupt if the operating system crashes.
+
+Success. You can now start the database server using:
+
+    pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_060_postmaster_phases_main_data/pgdata -l logfile start
+
+# Running: /Users/yingjiewang/linkdb/src/test/cluster_tap/../../../src/test/regress/pg_regress --config-auth /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_060_postmaster_phases_main_data/pgdata
+### Starting node "main"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_060_postmaster_phases_main_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/060_postmaster_phases_main.log -o --cluster-name=main start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "main" is 20098
+[13:37:40.079](0.950s) ok 1 - L1 saw at least 6 phase transitions in startup log (got 6 transitions)
+[13:37:40.079](0.001s) ok 2 - L1 PRE_INIT -> phase0_base transition logged
+[13:37:40.079](0.000s) ok 3 - L1 phase0_base -> phase1_cluster transition logged
+[13:37:40.079](0.000s) ok 4 - L1 phase1_cluster -> phase2_lock transition logged
+[13:37:40.079](0.000s) ok 5 - L1 phase2_lock -> phase3_recovery transition logged
+[13:37:40.079](0.000s) ok 6 - L1 phase3_recovery -> phase4_normal transition logged
+[13:37:40.080](0.000s) ok 7 - L1 phase4_normal -> running transition logged
+[13:37:40.095](0.015s) ok 8 - L2 pg_cluster_state.phase has 5 keys
+[13:37:40.107](0.012s) ok 9 - L2 pg_cluster_state.phase keys are exactly the 5 spec-1.10 names
+[13:37:40.117](0.010s) ok 10 - L3 cluster.phase1_timeout default 60s
+[13:37:40.126](0.010s) ok 11 - L3 cluster.phase2_timeout default 30s
+[13:37:40.136](0.010s) ok 12 - L3 cluster.phase3_timeout default 600s
+[13:37:40.145](0.009s) ok 13 - L3 cluster.phase4_timeout default 30s
+[13:37:40.145](0.000s) ok 14 - L4 Phase 1 LMON ready DEBUG1 message logged (spec-1.11 Sprint A real spawn)
+[13:37:40.145](0.000s) ok 15 - L4 Phase 2 LCK ready DEBUG1 message logged (spec-1.12 Sprint A real spawn)
+[13:37:40.145](0.000s) ok 16 - L4 Phase 3 stub DEBUG1 message logged
+[13:37:40.146](0.000s) ok 17 - L4 Phase 4 DIAG ready DEBUG1 message logged (spec-1.13 Sprint A real spawn; phase4 driver runs post-PM_RUN per Q2 A')
+[13:37:40.155](0.010s) ok 18 - L5 17 spec-1.10 inject points registered (5 phase x 3 each + 2 driver)
+[13:37:40.164](0.009s) ok 19 - L6 5 ClusterStartupPhase wait events registered
+### Stopping node "main" using mode fast
+# Running: pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_060_postmaster_phases_main_data/pgdata -m fast stop
+waiting for server to shut down.... done
+server stopped
+# No postmaster PID for node "main"
+[13:37:40.277](0.112s) ok 20 - L7 clean shutdown produced no PANIC
+[13:37:40.277](0.000s) ok 21 - L7 logfile records the orderly shutdown message
+### Starting node "main"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_060_postmaster_phases_main_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/060_postmaster_phases_main.log -o --cluster-name=main start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "main" is 20127
+### Restarting node "main"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_060_postmaster_phases_main_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/060_postmaster_phases_main.log restart
+waiting for server to shut down.... done
+server stopped
+waiting for server to start.... done
+server started
+# Postmaster PID for node "main" is 20138
+[13:37:41.233](0.956s) ok 22 - L8 phase machinery re-runs on restart (saw 3 'running' entries across all starts)
+### Stopping node "main" using mode fast
+# Running: pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_060_postmaster_phases_main_data/pgdata -m fast stop
+waiting for server to shut down.... done
+server stopped
+# No postmaster PID for node "main"
+### Starting node "main"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_060_postmaster_phases_main_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/060_postmaster_phases_main.log -o --cluster-name=main start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "main" is 20151
+[13:37:41.803](0.571s) ok 23 - L9 cluster.phase1_timeout = 1s applies
+[13:37:41.814](0.011s) ok 24 - L9 server still responsive (stub does not block)
+[13:37:41.825](0.011s) ok 25 - L10 cluster_phase legacy mirror reads "running" after startup
+[13:37:41.835](0.010s) ok 26 - L10 phase_enum_value = 6 (CLUSTER_PHASE_RUNNING) after startup
+[13:37:41.846](0.011s) ok 27 - L11 pg_stat_activity SELECT works after phase machinery startup
+### Stopping node "main" using mode fast
+# Running: pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_060_postmaster_phases_main_data/pgdata -m fast stop
+waiting for server to shut down.... done
+server stopped
+# No postmaster PID for node "main"
+### Starting node "main"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_060_postmaster_phases_main_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/060_postmaster_phases_main.log -o --cluster-name=main start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "main" is 20175
+[13:37:42.430](0.584s) ok 28 - L12 spec-1.8 cluster_smgr opt-in + spec-1.10 phase machinery coexist
+[13:37:42.430](0.000s) ok 29 - L12 phase machinery still drives Phase 0 -> RUNNING under cluster_smgr opt-in
+[13:37:42.430](0.000s) ok 30 - L12 spec-1.7.2 EXPERIMENTAL WARNING still fires alongside phase machinery
+### Stopping node "main" using mode fast
+# Running: pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_060_postmaster_phases_main_data/pgdata -m fast stop
+waiting for server to shut down.... done
+server stopped
+# No postmaster PID for node "main"
+### Starting node "main"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_060_postmaster_phases_main_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/060_postmaster_phases_main.log -o --cluster-name=main start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "main" is 20193
+[13:37:43.010](0.580s) ok 31 - L13 backend SELECTs phase=running from shmem (spec-1.10.1 F1)
+[13:37:43.021](0.012s) ok 32 - L13 phase_enum_value = 6 (RUNNING) via shmem
+### Stopping node "main" using mode fast
+# Running: pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_060_postmaster_phases_main_data/pgdata -m fast stop
+waiting for server to shut down.... done
+server stopped
+# No postmaster PID for node "main"
+# Checking port 25195
+# Found port 25195
+Name: l14_timeout
+Version: 16.13
+Data directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_060_postmaster_phases_l14_timeout_data/pgdata
+Backup directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_060_postmaster_phases_l14_timeout_data/backup
+Archive directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_060_postmaster_phases_l14_timeout_data/archives
+Connection string: port=25195 host=/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/v9WHetLoH2
+Log file: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/060_postmaster_phases_l14_timeout.log
+# Running: initdb -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_060_postmaster_phases_l14_timeout_data/pgdata -A trust -N
+The files belonging to this database system will be owned by user "yingjiewang".
+This user must also own the server process.
+
+The database cluster will be initialized with this locale configuration:
+  provider:    libc
+  LC_COLLATE:  zh_CN.UTF-8
+  LC_CTYPE:    zh_CN.UTF-8
+  LC_MESSAGES: C
+  LC_MONETARY: zh_CN.UTF-8
+  LC_NUMERIC:  zh_CN.UTF-8
+  LC_TIME:     zh_CN.UTF-8
+The default database encoding has accordingly been set to "UTF8".
+initdb: could not find suitable text search configuration for locale "zh_CN.UTF-8"
+The default text search configuration will be set to "simple".
+
+Data page checksums are disabled.
+
+creating directory /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_060_postmaster_phases_l14_timeout_data/pgdata ... ok
+creating subdirectories ... ok
+selecting dynamic shared memory implementation ... posix
+selecting default max_connections ... 100
+selecting default shared_buffers ... 128MB
+selecting default time zone ... Asia/Shanghai
+creating configuration files ... ok
+running bootstrap script ... 2026-05-04 13:37:43.200 CST [20217] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:43.200 CST [20217] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:43.200 CST [20217] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+performing post-bootstrap initialization ... 2026-05-04 13:37:43.324 CST [20219] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:43.324 CST [20219] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:43.324 CST [20219] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+
+Sync to disk skipped.
+The data directory might become corrupt if the operating system crashes.
+
+Success. You can now start the database server using:
+
+    pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_060_postmaster_phases_l14_timeout_data/pgdata -l logfile start
+
+# Running: /Users/yingjiewang/linkdb/src/test/cluster_tap/../../../src/test/regress/pg_regress --config-auth /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_060_postmaster_phases_l14_timeout_data/pgdata
+### Starting node "l14_timeout"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_060_postmaster_phases_l14_timeout_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/060_postmaster_phases_l14_timeout.log -o --cluster-name=l14_timeout start
+waiting for server to start...... stopped waiting
+pg_ctl: could not start server
+Examine the log output.
+# pg_ctl start failed; logfile:
+2026-05-04 13:37:43.676 CST [20224] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:43.676 CST [20224] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:43.676 CST [20224] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+2026-05-04 13:37:43.677 CST [20224] LOG:  cluster startup: pre_init -> phase0_base
+2026-05-04 13:37:43.677 CST [20224] LOG:  cluster startup: phase0_base -> phase1_cluster
+2026-05-04 13:37:45.787 CST [20224] FATAL:  cluster startup phase phase1_cluster exceeded timeout (2.110 s > 1 s)
+2026-05-04 13:37:45.787 CST [20224] HINT:  Increase cluster.phase1_timeout GUC or fix handler hang (handler must self-bound blocking waits via WaitLatch+timeout per the phase handler contract).
+2026-05-04 13:37:45.787 CST [20224] LOG:  database system is shut down
+# No postmaster PID for node "l14_timeout"
+[13:37:45.860](2.839s) ok 33 - L14 postmaster startup fails when phase 1 elapsed > timeout
+[13:37:45.860](0.000s) ok 34 - L14 logfile contains phase 1 timeout FATAL message (53R08)
+### Starting node "main"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_060_postmaster_phases_main_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/060_postmaster_phases_main.log -o --cluster-name=main start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "main" is 20232
+[13:37:46.327](0.467s) ok 35 - L15 first SELECT after start sees phase=running (advance delayed to ServerLoop entry)
+### Stopping node "main" using mode fast
+# Running: pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_060_postmaster_phases_main_data/pgdata -m fast stop
+waiting for server to shut down.... done
+server stopped
+# No postmaster PID for node "main"
+[13:37:46.441](0.113s) 1..35

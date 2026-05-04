@@ -211,6 +211,7 @@ extern TimestampTz cluster_phase_started_at(ClusterStartupPhase phase);
  */
 extern void cluster_advance_phase(ClusterStartupPhase target);
 extern void cluster_run_startup_sequence(void);
+extern void cluster_run_phase4_sequence(void);
 extern void cluster_run_shutdown_sequence(void);
 
 

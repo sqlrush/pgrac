@@ -1,0 +1,14 @@
+2026-05-04 13:38:10.182 CST [20597] DEBUG:  registering background worker "logical replication launcher"
+2026-05-04 13:38:10.182 CST [20597] DEBUG:  [cluster node=-1 phase=pre_init] cluster_init: registering cluster shmem regions
+2026-05-04 13:38:10.184 CST [20597] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:38:10.184 CST [20597] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:38:10.184 CST [20597] DEBUG:  cluster_shared_fs: registered backend "stub" at id 0
+2026-05-04 13:38:10.184 CST [20597] DEBUG:  cluster_shared_fs: registered backend "local" at id 1
+2026-05-04 13:38:10.184 CST [20597] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+2026-05-04 13:38:10.184 CST [20597] LOG:  cluster startup: pre_init -> phase0_base
+2026-05-04 13:38:10.184 CST [20597] LOG:  cluster startup: phase0_base -> phase1_cluster
+2026-05-04 13:38:10.185 CST [20598] DEBUG:  cluster_smgr: bypass HTAB initialised (initial size 1024 entries)
+2026-05-04 13:38:10.295 CST [20597] DEBUG:  cluster phase 1: LMON ready (pid 20598); interconnect listener / heartbeat consumer remain stubs (Stage 1.15+)
+2026-05-04 13:38:10.295 CST [20597] LOG:  cluster startup: phase1_cluster -> phase2_lock
+2026-05-04 13:38:10.295 CST [20597] FATAL:  cluster injection point "cluster-lck-pre-spawn" armed with ERROR
+2026-05-04 13:38:10.295 CST [20597] LOG:  database system is shut down

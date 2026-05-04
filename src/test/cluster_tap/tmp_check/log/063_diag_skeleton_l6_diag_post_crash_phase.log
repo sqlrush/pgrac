@@ -1,0 +1,108 @@
+2026-05-04 13:38:16.824 CST [20725] DEBUG:  registering background worker "logical replication launcher"
+2026-05-04 13:38:16.824 CST [20725] DEBUG:  [cluster node=-1 phase=pre_init] cluster_init: registering cluster shmem regions
+2026-05-04 13:38:16.826 CST [20725] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:38:16.826 CST [20725] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:38:16.826 CST [20725] DEBUG:  cluster_shared_fs: registered backend "stub" at id 0
+2026-05-04 13:38:16.826 CST [20725] DEBUG:  cluster_shared_fs: registered backend "local" at id 1
+2026-05-04 13:38:16.826 CST [20725] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+2026-05-04 13:38:16.826 CST [20725] LOG:  cluster startup: pre_init -> phase0_base
+2026-05-04 13:38:16.826 CST [20725] LOG:  cluster startup: phase0_base -> phase1_cluster
+2026-05-04 13:38:16.827 CST [20726] DEBUG:  cluster_smgr: bypass HTAB initialised (initial size 1024 entries)
+2026-05-04 13:38:16.928 CST [20725] DEBUG:  cluster phase 1: LMON ready (pid 20726); interconnect listener / heartbeat consumer remain stubs (Stage 1.15+)
+2026-05-04 13:38:16.928 CST [20725] LOG:  cluster startup: phase1_cluster -> phase2_lock
+2026-05-04 13:38:16.929 CST [20727] DEBUG:  cluster_smgr: bypass HTAB initialised (initial size 1024 entries)
+2026-05-04 13:38:17.032 CST [20725] DEBUG:  cluster phase 2: LCK ready (pid 20727); LMS / LMD remain stubs (Stage 2+ GES feature)
+2026-05-04 13:38:17.032 CST [20725] LOG:  cluster startup: phase2_lock -> phase3_recovery
+2026-05-04 13:38:17.032 CST [20725] DEBUG:  Phase 3 stub: PG-native startup process unchanged; Recovery Coordinator / merged recovery deferred to Stage 4 spec
+2026-05-04 13:38:17.032 CST [20725] LOG:  starting PostgreSQL 16.13 on aarch64-apple-darwin25.2.0, compiled by Apple clang version 21.0.0 (clang-2100.0.123.102), 64-bit
+2026-05-04 13:38:17.032 CST [20725] LOG:  listening on Unix socket "/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/17_rB9wsB7/.s.PGSQL.16533"
+2026-05-04 13:38:17.036 CST [20728] DEBUG:  cluster_smgr: bypass HTAB initialised (initial size 1024 entries)
+2026-05-04 13:38:17.036 CST [20729] DEBUG:  cluster_smgr: bypass HTAB initialised (initial size 1024 entries)
+2026-05-04 13:38:17.037 CST [20730] DEBUG:  cluster_smgr: bypass HTAB initialised (initial size 1024 entries)
+2026-05-04 13:38:17.037 CST [20730] LOG:  database system was shut down at 2026-05-04 13:38:16 CST
+2026-05-04 13:38:17.037 CST [20730] DEBUG:  checkpoint record is at 0/1531FC8
+2026-05-04 13:38:17.037 CST [20730] DEBUG:  redo record is at 0/1531FC8; shutdown true
+2026-05-04 13:38:17.037 CST [20730] DEBUG:  next transaction ID: 746; next OID: 14079
+2026-05-04 13:38:17.037 CST [20730] DEBUG:  next MultiXactId: 1; next MultiXactOffset: 0
+2026-05-04 13:38:17.037 CST [20730] DEBUG:  oldest unfrozen transaction ID: 738, in database 1
+2026-05-04 13:38:17.037 CST [20730] DEBUG:  oldest MultiXactId: 1, in database 1
+2026-05-04 13:38:17.037 CST [20730] DEBUG:  commit timestamp Xid oldest/newest: 0/0
+2026-05-04 13:38:17.037 CST [20730] DEBUG:  transaction ID wrap limit is 2147484385, limited by database with OID 1
+2026-05-04 13:38:17.037 CST [20730] DEBUG:  MultiXactId wrap limit is 2147483648, limited by database with OID 1
+2026-05-04 13:38:17.037 CST [20730] DEBUG:  starting up replication slots
+2026-05-04 13:38:17.037 CST [20730] DEBUG:  xmin required by slots: data 0, catalog 0
+2026-05-04 13:38:17.038 CST [20730] DEBUG:  MultiXactId wrap limit is 2147483648, limited by database with OID 1
+2026-05-04 13:38:17.038 CST [20730] DEBUG:  MultiXact member stop limit is now 4294914944 based on MultiXact 1
+2026-05-04 13:38:17.039 CST [20725] LOG:  cluster startup: phase3_recovery -> phase4_normal
+2026-05-04 13:38:17.040 CST [20731] DEBUG:  cluster_smgr: bypass HTAB initialised (initial size 1024 entries)
+2026-05-04 13:38:17.149 CST [20725] DEBUG:  cluster phase 4: DIAG ready (pid 20731); Cluster Stats remain stub (Stage 1.14).  PG-native walwriter / bgwriter / checkpointer / autovacuum spawn unchanged.
+2026-05-04 13:38:17.149 CST [20725] LOG:  cluster startup: phase4_normal -> running
+2026-05-04 13:38:17.150 CST [20725] DEBUG:  starting background worker process "logical replication launcher"
+2026-05-04 13:38:17.150 CST [20725] LOG:  database system is ready to accept connections
+2026-05-04 13:38:17.150 CST [20732] DEBUG:  cluster_smgr: bypass HTAB initialised (initial size 1024 entries)
+2026-05-04 13:38:17.150 CST [20733] DEBUG:  autovacuum launcher started
+2026-05-04 13:38:17.150 CST [20733] DEBUG:  cluster_smgr: bypass HTAB initialised (initial size 1024 entries)
+2026-05-04 13:38:17.150 CST [20734] DEBUG:  cluster_smgr: bypass HTAB initialised (initial size 1024 entries)
+2026-05-04 13:38:17.150 CST [20734] DEBUG:  logical replication launcher started
+2026-05-04 13:38:17.238 CST [20736] [unknown] DEBUG:  cluster_smgr: bypass HTAB initialised (initial size 1024 entries)
+2026-05-04 13:38:17.241 CST [20736] 063_diag_skeleton.pl LOG:  statement: SELECT pid FROM pg_stat_activity WHERE backend_type = 'diag' LIMIT 1
+2026-05-04 13:38:17.244 CST [20725] LOG:  DIAG process (PID 20731) was terminated by signal 9: Killed: 9
+2026-05-04 13:38:17.244 CST [20725] LOG:  terminating any other active server processes
+2026-05-04 13:38:17.245 CST [20725] LOG:  all server processes terminated; reinitializing
+2026-05-04 13:38:17.247 CST [20725] LOG:  [cluster node=-1 phase=running] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:38:17.247 CST [20725] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:38:17.247 CST [20725] WARNING:  cluster_shared_fs backend id 0 ("stub") already registered as "stub"; ignoring duplicate
+2026-05-04 13:38:17.247 CST [20725] WARNING:  cluster_shared_fs backend id 1 ("local") already registered as "local"; ignoring duplicate
+2026-05-04 13:38:17.247 CST [20725] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+2026-05-04 13:38:17.247 CST [20725] LOG:  cluster startup: pre_init -> phase0_base
+2026-05-04 13:38:17.247 CST [20725] LOG:  cluster startup: phase0_base -> phase1_cluster
+2026-05-04 13:38:17.248 CST [20737] DEBUG:  cluster_smgr: bypass HTAB initialised (initial size 1024 entries)
+2026-05-04 13:38:17.351 CST [20725] DEBUG:  cluster phase 1: LMON ready (pid 20737); interconnect listener / heartbeat consumer remain stubs (Stage 1.15+)
+2026-05-04 13:38:17.351 CST [20725] LOG:  cluster startup: phase1_cluster -> phase2_lock
+2026-05-04 13:38:17.352 CST [20738] DEBUG:  cluster_smgr: bypass HTAB initialised (initial size 1024 entries)
+2026-05-04 13:38:17.461 CST [20725] DEBUG:  cluster phase 2: LCK ready (pid 20738); LMS / LMD remain stubs (Stage 2+ GES feature)
+2026-05-04 13:38:17.461 CST [20725] LOG:  cluster startup: phase2_lock -> phase3_recovery
+2026-05-04 13:38:17.461 CST [20725] DEBUG:  Phase 3 stub: PG-native startup process unchanged; Recovery Coordinator / merged recovery deferred to Stage 4 spec
+2026-05-04 13:38:17.463 CST [20739] DEBUG:  cluster_smgr: bypass HTAB initialised (initial size 1024 entries)
+2026-05-04 13:38:17.463 CST [20739] LOG:  database system was interrupted; last known up at 2026-05-04 13:38:17 CST
+2026-05-04 13:38:17.463 CST [20739] DEBUG:  checkpoint record is at 0/1531FC8
+2026-05-04 13:38:17.463 CST [20739] DEBUG:  redo record is at 0/1531FC8; shutdown true
+2026-05-04 13:38:17.463 CST [20739] DEBUG:  next transaction ID: 746; next OID: 14079
+2026-05-04 13:38:17.463 CST [20740] DEBUG:  cluster_smgr: bypass HTAB initialised (initial size 1024 entries)
+2026-05-04 13:38:17.463 CST [20739] DEBUG:  next MultiXactId: 1; next MultiXactOffset: 0
+2026-05-04 13:38:17.463 CST [20739] DEBUG:  oldest unfrozen transaction ID: 738, in database 1
+2026-05-04 13:38:17.463 CST [20739] DEBUG:  oldest MultiXactId: 1, in database 1
+2026-05-04 13:38:17.463 CST [20739] DEBUG:  commit timestamp Xid oldest/newest: 0/0
+2026-05-04 13:38:17.463 CST [20739] LOG:  database system was not properly shut down; automatic recovery in progress
+2026-05-04 13:38:17.463 CST [20739] DEBUG:  transaction ID wrap limit is 2147484385, limited by database with OID 1
+2026-05-04 13:38:17.463 CST [20739] DEBUG:  MultiXactId wrap limit is 2147483648, limited by database with OID 1
+2026-05-04 13:38:17.464 CST [20741] DEBUG:  cluster_smgr: bypass HTAB initialised (initial size 1024 entries)
+2026-05-04 13:38:17.464 CST [20739] DEBUG:  starting up replication slots
+2026-05-04 13:38:17.464 CST [20739] DEBUG:  xmin required by slots: data 0, catalog 0
+2026-05-04 13:38:17.464 CST [20739] DEBUG:  resetting unlogged relations: cleanup 1 init 0
+2026-05-04 13:38:17.465 CST [20739] LOG:  redo starts at 0/1532058
+2026-05-04 13:38:17.465 CST [20739] LOG:  invalid record length at 0/1532090: expected at least 24, got 0
+2026-05-04 13:38:17.465 CST [20739] LOG:  redo done at 0/1532058 system usage: CPU: user: 0.00 s, system: 0.00 s, elapsed: 0.00 s
+2026-05-04 13:38:17.465 CST [20739] DEBUG:  resetting unlogged relations: cleanup 0 init 1
+2026-05-04 13:38:17.466 CST [20739] DEBUG:  MultiXactId wrap limit is 2147483648, limited by database with OID 1
+2026-05-04 13:38:17.466 CST [20739] DEBUG:  MultiXact member stop limit is now 4294914944 based on MultiXact 1
+2026-05-04 13:38:17.466 CST [20740] LOG:  checkpoint starting: end-of-recovery immediate wait
+2026-05-04 13:38:17.466 CST [20740] DEBUG:  performing replication slot checkpoint
+2026-05-04 13:38:17.468 CST [20740] LOG:  checkpoint complete: wrote 3 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.001 s, sync=0.001 s, total=0.002 s; sync files=0, longest=0.000 s, average=0.000 s; distance=0 kB, estimate=0 kB; lsn=0/1532090, redo lsn=0/1532090
+2026-05-04 13:38:17.469 CST [20725] LOG:  cluster startup: phase3_recovery -> phase4_normal
+2026-05-04 13:38:17.470 CST [20742] DEBUG:  cluster_smgr: bypass HTAB initialised (initial size 1024 entries)
+2026-05-04 13:38:17.579 CST [20725] DEBUG:  cluster phase 4: DIAG ready (pid 20742); Cluster Stats remain stub (Stage 1.14).  PG-native walwriter / bgwriter / checkpointer / autovacuum spawn unchanged.
+2026-05-04 13:38:17.579 CST [20725] LOG:  cluster startup: phase4_normal -> running
+2026-05-04 13:38:17.581 CST [20725] DEBUG:  starting background worker process "logical replication launcher"
+2026-05-04 13:38:17.581 CST [20744] DEBUG:  autovacuum launcher started
+2026-05-04 13:38:17.581 CST [20743] DEBUG:  cluster_smgr: bypass HTAB initialised (initial size 1024 entries)
+2026-05-04 13:38:17.581 CST [20744] DEBUG:  cluster_smgr: bypass HTAB initialised (initial size 1024 entries)
+2026-05-04 13:38:17.581 CST [20725] LOG:  database system is ready to accept connections
+2026-05-04 13:38:17.582 CST [20745] DEBUG:  cluster_smgr: bypass HTAB initialised (initial size 1024 entries)
+2026-05-04 13:38:17.582 CST [20745] DEBUG:  logical replication launcher started
+2026-05-04 13:38:18.265 CST [20747] [unknown] DEBUG:  cluster_smgr: bypass HTAB initialised (initial size 1024 entries)
+2026-05-04 13:38:18.269 CST [20747] 063_diag_skeleton.pl LOG:  statement: SELECT value FROM pg_cluster_state
+						   WHERE category='phase' AND key='cluster_phase'
+2026-05-04 13:38:18.275 CST [20725] LOG:  received immediate shutdown request
+2026-05-04 13:38:18.275 CST [20725] LOG:  cluster startup: running -> shutdown
+2026-05-04 13:38:18.276 CST [20725] LOG:  database system is shut down

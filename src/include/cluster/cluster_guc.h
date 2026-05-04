@@ -232,6 +232,13 @@ extern int cluster_lck_main_loop_interval;
 
 
 /*
+ * cluster.diag_main_loop_interval (spec-1.13 D8): same pattern as
+ * cluster.lmon_main_loop_interval; controls DIAG aux process tick.
+ */
+extern int cluster_diag_main_loop_interval;
+
+
+/*
  * cluster.enabled: runtime cluster mode gate (Stage 1.11 Sprint B; HC4
  * 闭环).
  *

@@ -1,0 +1,27 @@
+2026-05-04 13:36:57.550 CST [18593] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:36:57.550 CST [18593] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:36:57.550 CST [18593] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+2026-05-04 13:36:57.551 CST [18593] LOG:  cluster startup: pre_init -> phase0_base
+2026-05-04 13:36:57.551 CST [18593] LOG:  cluster startup: phase0_base -> phase1_cluster
+2026-05-04 13:36:57.659 CST [18593] LOG:  cluster startup: phase1_cluster -> phase2_lock
+2026-05-04 13:36:57.768 CST [18593] LOG:  cluster startup: phase2_lock -> phase3_recovery
+2026-05-04 13:36:57.768 CST [18593] LOG:  starting PostgreSQL 16.13 on aarch64-apple-darwin25.2.0, compiled by Apple clang version 21.0.0 (clang-2100.0.123.102), 64-bit
+2026-05-04 13:36:57.768 CST [18593] LOG:  listening on Unix socket "/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/XLQkwKKFIJ/.s.PGSQL.22921"
+2026-05-04 13:36:57.776 CST [18598] LOG:  database system was shut down at 2026-05-04 13:36:57 CST
+2026-05-04 13:36:57.778 CST [18593] LOG:  cluster startup: phase3_recovery -> phase4_normal
+2026-05-04 13:36:57.886 CST [18593] LOG:  cluster startup: phase4_normal -> running
+2026-05-04 13:36:57.888 CST [18593] LOG:  database system is ready to accept connections
+2026-05-04 13:36:57.966 CST [18604] 009_signal.pl LOG:  statement: SELECT 1
+2026-05-04 13:36:57.977 CST [18606] 009_signal.pl LOG:  statement: SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend'
+2026-05-04 13:36:57.989 CST [18608] 009_signal.pl LOG:  statement: LISTEN spec_0_15_channel
+2026-05-04 13:36:57.998 CST [18610] 009_signal.pl LOG:  statement: SELECT pg_notify('spec_0_15_channel', 'hello');
+2026-05-04 13:36:57.998 CST [18610] 009_signal.pl LOG:  statement: SELECT 'ok'
+2026-05-04 13:36:58.008 CST [18612] 009_signal.pl LOG:  statement: SHOW "cluster.node_id"
+2026-05-04 13:36:58.012 CST [18593] LOG:  received fast shutdown request
+2026-05-04 13:36:58.012 CST [18593] LOG:  aborting any active transactions
+2026-05-04 13:36:58.013 CST [18593] LOG:  background worker "logical replication launcher" (PID 18602) exited with exit code 1
+2026-05-04 13:36:58.013 CST [18596] LOG:  shutting down
+2026-05-04 13:36:58.013 CST [18596] LOG:  checkpoint starting: shutdown immediate
+2026-05-04 13:36:58.014 CST [18596] LOG:  checkpoint complete: wrote 3 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.001 s, sync=0.001 s, total=0.002 s; sync files=0, longest=0.000 s, average=0.000 s; distance=0 kB, estimate=0 kB; lsn=0/15320B8, redo lsn=0/15320B8
+2026-05-04 13:36:58.015 CST [18593] LOG:  cluster startup: running -> shutdown
+2026-05-04 13:36:58.015 CST [18593] LOG:  database system is shut down

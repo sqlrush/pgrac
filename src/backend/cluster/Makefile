@@ -41,6 +41,7 @@ OBJS = \
 	cluster.o \
 	cluster_conf.o \
 	cluster_debug.o \
+	cluster_diag.o \
 	cluster_elog.o \
 	cluster_guc.o \
 	cluster_ic.o \

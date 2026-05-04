@@ -1,0 +1,95 @@
+# Checking port 20591
+# Found port 20591
+Name: main
+Version: 16.13
+Data directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_007_guc_main_data/pgdata
+Backup directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_007_guc_main_data/backup
+Archive directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_007_guc_main_data/archives
+Connection string: port=20591 host=/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/zUScschdHp
+Log file: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/007_guc_main.log
+# Running: initdb -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_007_guc_main_data/pgdata -A trust -N
+The files belonging to this database system will be owned by user "yingjiewang".
+This user must also own the server process.
+
+The database cluster will be initialized with this locale configuration:
+  provider:    libc
+  LC_COLLATE:  zh_CN.UTF-8
+  LC_CTYPE:    zh_CN.UTF-8
+  LC_MESSAGES: C
+  LC_MONETARY: zh_CN.UTF-8
+  LC_NUMERIC:  zh_CN.UTF-8
+  LC_TIME:     zh_CN.UTF-8
+The default database encoding has accordingly been set to "UTF8".
+initdb: could not find suitable text search configuration for locale "zh_CN.UTF-8"
+The default text search configuration will be set to "simple".
+
+Data page checksums are disabled.
+
+creating directory /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_007_guc_main_data/pgdata ... ok
+creating subdirectories ... ok
+selecting dynamic shared memory implementation ... posix
+selecting default max_connections ... 100
+selecting default shared_buffers ... 128MB
+selecting default time zone ... Asia/Shanghai
+creating configuration files ... ok
+running bootstrap script ... 2026-05-04 13:36:52.846 CST [18468] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:36:52.846 CST [18468] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:36:52.846 CST [18468] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+performing post-bootstrap initialization ... 2026-05-04 13:36:52.973 CST [18470] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:36:52.973 CST [18470] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:36:52.973 CST [18470] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+
+Sync to disk skipped.
+The data directory might become corrupt if the operating system crashes.
+
+Success. You can now start the database server using:
+
+    pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_007_guc_main_data/pgdata -l logfile start
+
+# Running: /Users/yingjiewang/linkdb/src/test/cluster_tap/../../../src/test/regress/pg_regress --config-auth /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_007_guc_main_data/pgdata
+### Starting node "main"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_007_guc_main_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/007_guc_main.log -o --cluster-name=main start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "main" is 18475
+[13:36:53.759](0.983s) ok 1 - cluster.node_id default is -1 (unconfigured)
+[13:36:53.771](0.013s) ok 2 - pg_settings rows match: setting=-1, vartype=integer, min=-1, max=127, context=postmaster
+[13:36:53.781](0.010s) ok 3 - SET cluster.node_id at runtime is rejected (PGC_POSTMASTER)
+### Stopping node "main" using mode fast
+# Running: pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_007_guc_main_data/pgdata -m fast stop
+waiting for server to shut down.... done
+server stopped
+# No postmaster PID for node "main"
+### Starting node "main"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_007_guc_main_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/007_guc_main.log -o --cluster-name=main start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "main" is 18494
+[13:36:54.360](0.578s) ok 4 - postgresql.conf override applied across restart (cluster.node_id = 7)
+[13:36:54.373](0.013s) ok 5 - pg_settings.source becomes "configuration file" after postgresql.conf override
+[13:36:54.383](0.010s) ok 6 - cluster.interconnect_tier default is stub
+[13:36:54.393](0.010s) ok 7 - cluster.interconnect_tier is an enum (postmaster context)
+[13:36:54.403](0.010s) ok 8 - cluster.interconnect_tier enumvals expose all five tiers
+[13:36:54.413](0.010s) ok 9 - cluster.config_file default is "pgrac.conf"
+[13:36:54.422](0.009s) ok 10 - cluster.injection_points default is empty
+[13:36:54.431](0.009s) ok 11 - SET cluster.injection_points at runtime is accepted (PGC_SUSET)
+### Stopping node "main" using mode fast
+# Running: pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_007_guc_main_data/pgdata -m fast stop
+waiting for server to shut down.... done
+server stopped
+# No postmaster PID for node "main"
+### Starting node "main"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_007_guc_main_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/007_guc_main.log -o --cluster-name=main start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "main" is 18523
+[13:36:54.991](0.560s) ok 12 - out-of-range cluster.node_id (999) falls back to the boot default (-1)
+[13:36:54.991](0.000s) ok 13 - startup log contains GUC out-of-range WARNING for cluster.node_id
+[13:36:54.991](0.000s) 1..13
+### Stopping node "main" using mode immediate
+# Running: pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_007_guc_main_data/pgdata -m immediate stop
+waiting for server to shut down.... done
+server stopped
+# No postmaster PID for node "main"

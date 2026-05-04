@@ -59,7 +59,7 @@ $node->start;
 # ----------
 is( $node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-	'57',
+	'63',
 	'pg_stat_cluster_injections returns 28 rows (compile-time registry)');
 
 
@@ -88,7 +88,7 @@ is( $node->safe_psql(
 		'postgres',
 		'SELECT string_agg(name, \',\' ORDER BY name) FROM pg_stat_cluster_injections'
 	),
-	'cluster-conf-load-success,cluster-conf-parse-fail,cluster-conf-shmem-init,cluster-debug-dump-entry,cluster-guc-init-pre-define,cluster-ic-mock-send-pre-enqueue,cluster-ic-tier-selected,cluster-init-post-shmem,cluster-init-pre-shmem,cluster-init-top,cluster-lck-main-loop-iter,cluster-lck-post-spawn,cluster-lck-pre-spawn,cluster-lck-ready-publish,cluster-lck-shutdown-post,cluster-lck-shutdown-pre,cluster-lmon-main-loop-iter,cluster-lmon-post-spawn,cluster-lmon-pre-spawn,cluster-lmon-ready-publish,cluster-lmon-shutdown-post,cluster-lmon-shutdown-pre,cluster-pcm-acquire-entry,cluster-pcm-convert-pre,cluster-pcm-downgrade-pre,cluster-pcm-release-pre,cluster-pgstat-mirror-sync,cluster-run-shutdown-top,cluster-run-startup-top,cluster-shared-fs-backend-register,cluster-shared-fs-init-top,cluster-shared-fs-local-open,cluster-shmem-region-init-post,cluster-shmem-region-init-pre,cluster-shmem-register-region,cluster-shmem-request,cluster-shmem-views-srf-entry,cluster-shutdown-top,cluster-smgr-create-top,cluster-smgr-open-top,cluster-smgr-which-decision,cluster-startup-phase-0-enter,cluster-startup-phase-0-exit,cluster-startup-phase-0-fail,cluster-startup-phase-1-enter,cluster-startup-phase-1-exit,cluster-startup-phase-1-fail,cluster-startup-phase-2-enter,cluster-startup-phase-2-exit,cluster-startup-phase-2-fail,cluster-startup-phase-3-enter,cluster-startup-phase-3-exit,cluster-startup-phase-3-fail,cluster-startup-phase-4-enter,cluster-startup-phase-4-exit,cluster-startup-phase-4-fail,cluster-views-srf-entry',
+	'cluster-conf-load-success,cluster-conf-parse-fail,cluster-conf-shmem-init,cluster-debug-dump-entry,cluster-diag-main-loop-iter,cluster-diag-post-spawn,cluster-diag-pre-spawn,cluster-diag-ready-publish,cluster-diag-shutdown-post,cluster-diag-shutdown-pre,cluster-guc-init-pre-define,cluster-ic-mock-send-pre-enqueue,cluster-ic-tier-selected,cluster-init-post-shmem,cluster-init-pre-shmem,cluster-init-top,cluster-lck-main-loop-iter,cluster-lck-post-spawn,cluster-lck-pre-spawn,cluster-lck-ready-publish,cluster-lck-shutdown-post,cluster-lck-shutdown-pre,cluster-lmon-main-loop-iter,cluster-lmon-post-spawn,cluster-lmon-pre-spawn,cluster-lmon-ready-publish,cluster-lmon-shutdown-post,cluster-lmon-shutdown-pre,cluster-pcm-acquire-entry,cluster-pcm-convert-pre,cluster-pcm-downgrade-pre,cluster-pcm-release-pre,cluster-pgstat-mirror-sync,cluster-run-shutdown-top,cluster-run-startup-top,cluster-shared-fs-backend-register,cluster-shared-fs-init-top,cluster-shared-fs-local-open,cluster-shmem-region-init-post,cluster-shmem-region-init-pre,cluster-shmem-register-region,cluster-shmem-request,cluster-shmem-views-srf-entry,cluster-shutdown-top,cluster-smgr-create-top,cluster-smgr-open-top,cluster-smgr-which-decision,cluster-startup-phase-0-enter,cluster-startup-phase-0-exit,cluster-startup-phase-0-fail,cluster-startup-phase-1-enter,cluster-startup-phase-1-exit,cluster-startup-phase-1-fail,cluster-startup-phase-2-enter,cluster-startup-phase-2-exit,cluster-startup-phase-2-fail,cluster-startup-phase-3-enter,cluster-startup-phase-3-exit,cluster-startup-phase-3-fail,cluster-startup-phase-4-enter,cluster-startup-phase-4-exit,cluster-startup-phase-4-fail,cluster-views-srf-entry',
 	'57 injection point names match spec-0.30 + spec-1.1 + spec-1.2 + spec-1.3 + spec-1.7 + spec-1.10 + spec-1.11 Sprint B + spec-1.12 Sprint B');
 
 
@@ -191,7 +191,7 @@ ok($hits >= 1,
 # ----------
 is( $node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'58',
+	'59',
 	'pg_stat_cluster_wait_events still 58 rows after 0.27');
 
 $node->stop;

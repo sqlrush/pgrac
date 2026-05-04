@@ -113,12 +113,12 @@ is($cols,
 # ----------
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'58',
+	'59',
 	'pg_stat_cluster_wait_events still returns 58 rows after conf framework added');
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_gcluster_wait_events'),
-	'58',
+	'59',
 	'pg_stat_gcluster_wait_events still returns 58 rows after conf framework added');
 
 is($node->safe_psql('postgres', q{SHOW "cluster.interconnect_tier"}),

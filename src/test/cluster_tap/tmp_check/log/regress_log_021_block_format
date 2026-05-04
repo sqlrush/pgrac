@@ -1,0 +1,74 @@
+# Checking port 20356
+# Found port 20356
+Name: main
+Version: 16.13
+Data directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_021_block_format_main_data/pgdata
+Backup directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_021_block_format_main_data/backup
+Archive directory: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_021_block_format_main_data/archives
+Connection string: port=20356 host=/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/pt1cGY_rgw
+Log file: /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/021_block_format_main.log
+# Running: initdb -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_021_block_format_main_data/pgdata -A trust -N
+The files belonging to this database system will be owned by user "yingjiewang".
+This user must also own the server process.
+
+The database cluster will be initialized with this locale configuration:
+  provider:    libc
+  LC_COLLATE:  zh_CN.UTF-8
+  LC_CTYPE:    zh_CN.UTF-8
+  LC_MESSAGES: C
+  LC_MONETARY: zh_CN.UTF-8
+  LC_NUMERIC:  zh_CN.UTF-8
+  LC_TIME:     zh_CN.UTF-8
+The default database encoding has accordingly been set to "UTF8".
+initdb: could not find suitable text search configuration for locale "zh_CN.UTF-8"
+The default text search configuration will be set to "simple".
+
+Data page checksums are disabled.
+
+creating directory /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_021_block_format_main_data/pgdata ... ok
+creating subdirectories ... ok
+selecting dynamic shared memory implementation ... posix
+selecting default max_connections ... 100
+selecting default shared_buffers ... 128MB
+selecting default time zone ... Asia/Shanghai
+creating configuration files ... ok
+running bootstrap script ... 2026-05-04 13:37:25.746 CST [19437] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:25.746 CST [19437] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:25.746 CST [19437] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+performing post-bootstrap initialization ... 2026-05-04 13:37:25.869 CST [19439] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:37:25.869 CST [19439] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:37:25.869 CST [19439] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+ok
+
+Sync to disk skipped.
+The data directory might become corrupt if the operating system crashes.
+
+Success. You can now start the database server using:
+
+    pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_021_block_format_main_data/pgdata -l logfile start
+
+# Running: /Users/yingjiewang/linkdb/src/test/cluster_tap/../../../src/test/regress/pg_regress --config-auth /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_021_block_format_main_data/pgdata
+### Starting node "main"
+# Running: pg_ctl -w -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_021_block_format_main_data/pgdata -l /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/log/021_block_format_main.log -o --cluster-name=main start
+waiting for server to start.... done
+server started
+# Postmaster PID for node "main" is 19444
+[13:37:26.651](0.978s) ok 1 - L1 pg_cluster_state.block_format category has 9 keys (4 stage-1.4 + 5 stage-1.5 ITL)
+[13:37:26.667](0.016s) ok 2 - L2 page_layout_version = 5 (PG vanilla 4 + pgrac 1.4 bump)
+[13:37:26.678](0.011s) ok 3 - L3 page_header_size = 32 (PG vanilla 24 + 8B pd_block_scn)
+[13:37:26.688](0.010s) ok 4 - L4 scn_size_bytes = 8 (uint64 typedef alias)
+[13:37:26.697](0.009s) ok 5 - L5 invalid_scn_value = "0" (locked by spec-1.4 §8 Q2 = A)
+[13:37:26.736](0.039s) ok 6 - L6 heap page first INSERT (PIVOT A): lower=36, pagesize=8192, version=5, special=7808 (ITL in special area)
+[13:37:26.756](0.020s) ok 7 - L7 btree index page version = 5 (PageInit goes through new path)
+[13:37:26.766](0.010s) ok 8 - L8 pd_block_scn raw bytes are 8 zeros (InvalidScn placeholder)
+[13:37:26.776](0.010s) ok 9 - L9 pd_pagesize_version raw bytes = 0520 LE = 0x2005 (BLCKSZ 8192 | layout 5)
+[13:37:26.785](0.009s) ok 10 - L10 pg_cluster_shmem 6 rows (block format change is not a shmem region; 1.7 adds cluster_pcm_grd; 1.10.1 adds cluster_startup_phase; 1.11 adds cluster_lmon; 1.12 adds cluster_lck)
+[13:37:26.795](0.010s) ok 11 - L11 pg_stat_cluster_injections is 51 (1.4 adds no new injection points; 4 PCM added by 1.7)
+[13:37:26.805](0.009s) ok 12 - L12 pg_stat_cluster_wait_events still 58 rows after 1.4
+### Stopping node "main" using mode fast
+# Running: pg_ctl -D /Users/yingjiewang/linkdb/src/test/cluster_tap/tmp_check/t_021_block_format_main_data/pgdata -m fast stop
+waiting for server to shut down.... done
+server stopped
+# No postmaster PID for node "main"
+[13:37:26.915](0.111s) 1..12

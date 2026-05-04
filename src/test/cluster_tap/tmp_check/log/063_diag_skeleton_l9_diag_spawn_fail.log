@@ -1,0 +1,38 @@
+2026-05-04 13:38:23.090 CST [20798] DEBUG:  registering background worker "logical replication launcher"
+2026-05-04 13:38:23.090 CST [20798] DEBUG:  [cluster node=-1 phase=pre_init] cluster_init: registering cluster shmem regions
+2026-05-04 13:38:23.091 CST [20798] LOG:  [cluster node=-1 phase=pre_init] cluster shmem control block allocated (24 bytes, magic=0x50475243, version=0x00020007)
+2026-05-04 13:38:23.091 CST [20798] LOG:  cluster_conf: "pgrac.conf" not found, falling back to single-node mode (node_id=-1)
+2026-05-04 13:38:23.091 CST [20798] DEBUG:  cluster_shared_fs: registered backend "stub" at id 0
+2026-05-04 13:38:23.091 CST [20798] DEBUG:  cluster_shared_fs: registered backend "local" at id 1
+2026-05-04 13:38:23.091 CST [20798] LOG:  cluster_shared_fs: active backend is "stub" (id 0)
+2026-05-04 13:38:23.091 CST [20798] LOG:  cluster startup: pre_init -> phase0_base
+2026-05-04 13:38:23.091 CST [20798] LOG:  cluster startup: phase0_base -> phase1_cluster
+2026-05-04 13:38:23.092 CST [20799] DEBUG:  cluster_smgr: bypass HTAB initialised (initial size 1024 entries)
+2026-05-04 13:38:23.202 CST [20798] DEBUG:  cluster phase 1: LMON ready (pid 20799); interconnect listener / heartbeat consumer remain stubs (Stage 1.15+)
+2026-05-04 13:38:23.202 CST [20798] LOG:  cluster startup: phase1_cluster -> phase2_lock
+2026-05-04 13:38:23.203 CST [20800] DEBUG:  cluster_smgr: bypass HTAB initialised (initial size 1024 entries)
+2026-05-04 13:38:23.309 CST [20798] DEBUG:  cluster phase 2: LCK ready (pid 20800); LMS / LMD remain stubs (Stage 2+ GES feature)
+2026-05-04 13:38:23.309 CST [20798] LOG:  cluster startup: phase2_lock -> phase3_recovery
+2026-05-04 13:38:23.309 CST [20798] DEBUG:  Phase 3 stub: PG-native startup process unchanged; Recovery Coordinator / merged recovery deferred to Stage 4 spec
+2026-05-04 13:38:23.309 CST [20798] LOG:  starting PostgreSQL 16.13 on aarch64-apple-darwin25.2.0, compiled by Apple clang version 21.0.0 (clang-2100.0.123.102), 64-bit
+2026-05-04 13:38:23.309 CST [20798] LOG:  listening on Unix socket "/var/folders/40/0xjs_z9s47vfb793hcjkbshw0000gn/T/17_rB9wsB7/.s.PGSQL.16535"
+2026-05-04 13:38:23.313 CST [20801] DEBUG:  cluster_smgr: bypass HTAB initialised (initial size 1024 entries)
+2026-05-04 13:38:23.313 CST [20802] DEBUG:  cluster_smgr: bypass HTAB initialised (initial size 1024 entries)
+2026-05-04 13:38:23.313 CST [20803] DEBUG:  cluster_smgr: bypass HTAB initialised (initial size 1024 entries)
+2026-05-04 13:38:23.313 CST [20803] LOG:  database system was shut down at 2026-05-04 13:38:23 CST
+2026-05-04 13:38:23.313 CST [20803] DEBUG:  checkpoint record is at 0/1531FC8
+2026-05-04 13:38:23.313 CST [20803] DEBUG:  redo record is at 0/1531FC8; shutdown true
+2026-05-04 13:38:23.313 CST [20803] DEBUG:  next transaction ID: 746; next OID: 14079
+2026-05-04 13:38:23.313 CST [20803] DEBUG:  next MultiXactId: 1; next MultiXactOffset: 0
+2026-05-04 13:38:23.313 CST [20803] DEBUG:  oldest unfrozen transaction ID: 738, in database 1
+2026-05-04 13:38:23.313 CST [20803] DEBUG:  oldest MultiXactId: 1, in database 1
+2026-05-04 13:38:23.313 CST [20803] DEBUG:  commit timestamp Xid oldest/newest: 0/0
+2026-05-04 13:38:23.313 CST [20803] DEBUG:  transaction ID wrap limit is 2147484385, limited by database with OID 1
+2026-05-04 13:38:23.313 CST [20803] DEBUG:  MultiXactId wrap limit is 2147483648, limited by database with OID 1
+2026-05-04 13:38:23.314 CST [20803] DEBUG:  starting up replication slots
+2026-05-04 13:38:23.314 CST [20803] DEBUG:  xmin required by slots: data 0, catalog 0
+2026-05-04 13:38:23.314 CST [20803] DEBUG:  MultiXactId wrap limit is 2147483648, limited by database with OID 1
+2026-05-04 13:38:23.314 CST [20803] DEBUG:  MultiXact member stop limit is now 4294914944 based on MultiXact 1
+2026-05-04 13:38:23.315 CST [20798] LOG:  cluster startup: phase3_recovery -> phase4_normal
+2026-05-04 13:38:23.315 CST [20798] FATAL:  cluster injection point "cluster-diag-pre-spawn" armed with ERROR
+2026-05-04 13:38:23.315 CST [20798] LOG:  database system is shut down
