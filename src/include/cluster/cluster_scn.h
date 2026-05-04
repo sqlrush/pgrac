@@ -109,11 +109,15 @@ typedef uint64 SCN;
  *	produces real SCN values.  observe(remote_scn) updates a
  *	max_observed_remote statistic but does NOT bump local_scn (that
  *	lands at spec-1.16 Lamport observe).
+ *
+ *	Frontend visibility: bufpage.h pulls cluster_scn.h into frontend
+ *	tools (pg_checksums / pg_resetwal / ...) via the PageHeaderData
+ *	layout.  The encoding constants + inline helpers below are pure
+ *	bit math (no LWLock / TimestampTz / palloc) and remain available
+ *	to frontend code.  Backend-only APIs (LWLock-protected advance /
+ *	observe / TimestampTz accessors / Size shmem hooks) are gated
+ *	behind #ifndef FRONTEND below.
  */
-
-#include "datatype/timestamp.h"
-#include "storage/lwlock.h"
-#include "access/xlogdefs.h" /* XLogRecPtr */
 
 
 /*
@@ -180,6 +184,12 @@ scn_local(SCN scn)
 }
 
 
+#ifndef FRONTEND
+
+#include "datatype/timestamp.h" /* TimestampTz (backend only) */
+#include "access/xlogdefs.h"	/* XLogRecPtr */
+
+
 /*
  * Comparison contract (spec-1.15 §3.2.1; Q2 + L4):
  *
@@ -218,6 +228,8 @@ extern TimestampTz cluster_scn_last_advance_at(void);
 extern Size cluster_scn_shmem_size(void);
 extern void cluster_scn_shmem_init(void);
 extern void cluster_scn_shmem_register(void);
+
+#endif /* !FRONTEND */
 
 
 #endif /* CLUSTER_SCN_H */

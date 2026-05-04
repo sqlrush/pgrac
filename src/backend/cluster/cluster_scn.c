@@ -190,12 +190,12 @@ scn_check_wraparound_watermark(uint64 current)
 				 "This is a theoretical sentinel; reaching it indicates a runaway advance loop or "
 				 "external manipulation.  spec-1.16 introduces real wraparound protection.")));
 	} else if (current >= SCN_WRAP_WARNING_THRESHOLD) {
-		TimestampTz now = GetCurrentTimestamp();
+		TimestampTz now_ts = GetCurrentTimestamp();
 
 		/* Throttle: at most 1 WARNING per minute. */
 		if (last_warn_emitted_at == 0
-			|| TimestampDifferenceExceeds(last_warn_emitted_at, now, 60 * 1000)) {
-			last_warn_emitted_at = now;
+			|| TimestampDifferenceExceeds(last_warn_emitted_at, now_ts, 60 * 1000)) {
+			last_warn_emitted_at = now_ts;
 			ereport(WARNING,
 					(errcode(ERRCODE_WARNING),
 					 errmsg("cluster_scn: local_scn (%lu) crossed WARNING threshold (2^50 ≈ 3568 "

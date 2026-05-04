@@ -45,6 +45,8 @@
 #include <string.h>
 
 #include "cluster/cluster_scn.h"
+#include "port/atomics.h"
+#include "storage/lwlock.h"
 
 /* Drop PG's port.h printf -> pg_printf override; unit_test.h uses
  * stdlib printf and we don't link libpgport in this test binary. */
