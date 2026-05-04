@@ -50,6 +50,7 @@ OBJS = \
 	cluster_lmon.o \
 	cluster_pcm_lock.o \
 	cluster_pgstat.o \
+	cluster_scn.o \
 	cluster_shmem.o \
 	cluster_signal.o \
 	cluster_startup_phase.o \
@@ -62,16 +63,16 @@ OBJS = \
 	storage/cluster_smgr.o
 else
 # cluster_conf.o, cluster_debug.o, cluster_views.o, cluster_ic.o,
-# cluster_inject.o, cluster_pgstat.o are always linked because
-# pg_proc.dat references their SRF entry points unconditionally.
-# In disable-cluster builds the SRF bodies #ifdef out and raise
-# ERRCODE_FEATURE_NOT_SUPPORTED, but the function symbols must still
-# resolve at link time.  storage/ subdirectory is omitted entirely in
-# disable mode because nothing in pg_proc.dat references it (spec-1.1
-# does not introduce a SRF; pg_cluster_state extension lives in
-# cluster_debug.c which is always linked).
+# cluster_inject.o, cluster_pgstat.o, cluster_scn.o are always linked
+# because pg_proc.dat references their SRF entry points
+# unconditionally.  In disable-cluster builds the SRF bodies #ifdef out
+# and raise ERRCODE_FEATURE_NOT_SUPPORTED, but the function symbols
+# must still resolve at link time.  storage/ subdirectory is omitted
+# entirely in disable mode because nothing in pg_proc.dat references
+# it (spec-1.1 does not introduce a SRF; pg_cluster_state extension
+# lives in cluster_debug.c which is always linked).
 OBJS = cluster_conf.o cluster_debug.o cluster_ic.o cluster_inject.o \
-	cluster_pgstat.o cluster_views.o
+	cluster_pgstat.o cluster_scn.o cluster_views.o
 endif
 
 include $(top_srcdir)/src/backend/common.mk

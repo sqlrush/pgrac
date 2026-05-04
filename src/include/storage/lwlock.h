@@ -252,6 +252,8 @@ typedef enum BuiltinTrancheIds {
 	 * Spec: spec-1.14-cluster-stats-skeleton.md Sprint A D1+D2
 	 */
 	LWTRANCHE_CLUSTER_STATS,
+	/* PGRAC (stage 1.15): SCN encoding layer; cluster_scn_state lwlock. */
+	LWTRANCHE_CLUSTER_SCN,
 #endif
 	LWTRANCHE_FIRST_USER_DEFINED
 } BuiltinTrancheIds;

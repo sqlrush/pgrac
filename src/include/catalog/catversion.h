@@ -117,6 +117,8 @@
 /*  "64B BufferDesc segment" terminology + pgrac-acceptance numbers */
 /*  upgrade.  All hardening fixes are runtime/inline level; no on-disk */
 /*  format change.  catversion stays at 202605050. */
-#define CATALOG_VERSION_NO	202605050
+/* Stage 1.15: bump for cluster_scn_advance / current / observe SQL */
+/*  UDFs (3 new pg_proc entries OID 8911-8913); spec-1.15 Q7+Q10+L1. */
+#define CATALOG_VERSION_NO	202605151
 
 #endif

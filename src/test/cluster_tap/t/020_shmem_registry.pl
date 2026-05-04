@@ -78,14 +78,14 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_shmem}),
-   '8',
-   'L2 pg_cluster_shmem returns 5 baseline rows (cluster_ctl + cluster_conf + cluster_pcm_grd + cluster startup phase + cluster lmon)');
+   '9',
+   'L2 pg_cluster_shmem returns 9 rows (8 baseline + cluster scn at 1.15)');
 
 is($node->safe_psql(
 		'postgres',
 		q{SELECT string_agg(name, ',' ORDER BY name) FROM pg_cluster_shmem}),
-   'pgrac cluster conf,pgrac cluster control,pgrac cluster diag,pgrac cluster lck,pgrac cluster lmon,pgrac cluster pcm grd,pgrac cluster startup phase,pgrac cluster stats',
-   'L3 pg_cluster_shmem rows are exactly the 5 foundational regions (cluster_ctl + cluster_conf + cluster_pcm_grd + cluster startup phase since 1.10.1 + cluster lmon since 1.11 Sprint A)');
+   'pgrac cluster conf,pgrac cluster control,pgrac cluster diag,pgrac cluster lck,pgrac cluster lmon,pgrac cluster pcm grd,pgrac cluster scn,pgrac cluster startup phase,pgrac cluster stats',
+   'L3 pg_cluster_shmem rows are exactly the 9 foundational regions (8 prior + cluster_scn since 1.15)');
 
 
 # ----------
@@ -133,8 +133,8 @@ is($node->safe_psql(
 		'postgres',
 		q{SELECT value FROM pg_cluster_state
 		   WHERE category = 'shmem' AND key = 'region_count'}),
-   '8',
-   'L8 pg_cluster_state.shmem.region_count = 5 (cluster_ctl + cluster_conf + cluster_pcm_grd + cluster startup phase from spec-1.10.1)');
+   '9',
+   'L8 pg_cluster_state.shmem.region_count = 9 (8 baseline + cluster_scn at 1.15)');
 
 is($node->safe_psql(
 		'postgres', q{
@@ -153,15 +153,15 @@ is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='shmem' AND key LIKE 'region.%.bytes'}),
-   '8',
-   'L10 pg_cluster_state.shmem has 5 region.<name>.bytes keys (one per region)');
+   '9',
+   'L10 pg_cluster_state.shmem has 9 region.<name>.bytes keys (one per region)');
 
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='shmem' AND key LIKE 'region.%.owner'}),
-   '8',
-   'L11 pg_cluster_state.shmem has 5 region.<name>.owner keys (one per region)');
+   '9',
+   'L11 pg_cluster_state.shmem has 9 region.<name>.owner keys (one per region)');
 
 
 # ----------
@@ -174,8 +174,8 @@ is($node->safe_psql(
 	  FROM pg_settings
 	 WHERE name = 'cluster.shmem_max_regions'
 }),
-   'integer|postmaster|64|8|256',
-   'L12 cluster.shmem_max_regions: int / postmaster / default 64 / [8,256]');
+   'integer|postmaster|64|16|256',
+   'L12 cluster.shmem_max_regions: int / postmaster / default 64 / [16,256]');
 
 is($node->safe_psql(
 		'postgres',
@@ -198,8 +198,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '69',
-   'L15 total injection registry size is 51 (14 baseline + 8 sweep + 3 shared_fs + 3 smgr + 4 shmem registry + 4 PCM lock = 28; spec-1.7 baseline)');
+   '73',
+   'L15 total injection registry size is 73 (69 baseline + 4 SCN encoding-layer at 1.15)');
 
 
 # ----------
@@ -234,24 +234,24 @@ is($node->safe_psql(
 
 
 # ----------
-# L18: GUC max_regions=8 (boundary minimum) still admits 5 baseline regions.
+# L18: GUC max_regions=16 (boundary minimum) still admits 9 baseline regions.
 # ----------
 $node->stop;
-$node->append_conf('postgresql.conf', "cluster.shmem_max_regions = 8\n");
+$node->append_conf('postgresql.conf', "cluster.shmem_max_regions = 16\n");
 $node->start;
 
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_shmem}),
-   '8',
-   'L18 cluster.shmem_max_regions = 8 still admits the 5 baseline regions');
+   '9',
+   'L18 cluster.shmem_max_regions = 16 still admits the 9 baseline regions');
 
 is($node->safe_psql(
 		'postgres',
 		q{SELECT value FROM pg_cluster_state
 		   WHERE category = 'guc' AND key = 'cluster.shmem_max_regions'}),
-   '8',
-   'L19 pg_cluster_state.guc.cluster.shmem_max_regions reflects override = 8');
+   '16',
+   'L19 pg_cluster_state.guc.cluster.shmem_max_regions reflects override = 16');
 
 $node->stop;
 

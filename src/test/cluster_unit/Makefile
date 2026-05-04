@@ -70,6 +70,7 @@ CLUSTER_LMON_O = $(top_builddir)/src/backend/cluster/cluster_lmon.o
 CLUSTER_LCK_O = $(top_builddir)/src/backend/cluster/cluster_lck.o
 CLUSTER_DIAG_O = $(top_builddir)/src/backend/cluster/cluster_diag.o
 CLUSTER_STATS_O = $(top_builddir)/src/backend/cluster/cluster_stats.o
+CLUSTER_SCN_O = $(top_builddir)/src/backend/cluster/cluster_scn.o
 
 # Most tests link only cluster_version.o.  test_cluster_guc /
 # test_cluster_shmem / test_cluster_signal / test_cluster_views /
@@ -77,7 +78,7 @@ CLUSTER_STATS_O = $(top_builddir)/src/backend/cluster/cluster_stats.o
 # separate rules because they also link additional cluster_*.o
 # objects (the test files stub the PG backend symbols those
 # objects reference).
-SIMPLE_TESTS = $(filter-out test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf test_cluster_ic_mock test_cluster_inject test_cluster_pgstat test_cluster_debug test_cluster_shared_fs test_cluster_smgr test_cluster_startup_phase test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats,$(TESTS))
+SIMPLE_TESTS = $(filter-out test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf test_cluster_ic_mock test_cluster_inject test_cluster_pgstat test_cluster_debug test_cluster_shared_fs test_cluster_smgr test_cluster_startup_phase test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_scn,$(TESTS))
 
 $(SIMPLE_TESTS): %: %.c unit_test.h $(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) -o $@
@@ -298,3 +299,15 @@ test_cluster_stats: test_cluster_stats.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_STATS_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_STATS_O) -o $@
+
+# test_cluster_scn links cluster_scn.o standalone (spec-1.15 Sprint A).
+# cluster_scn.c references shmem / lwlock / fmgr / superuser / ereport
+# / GetCurrentTimestamp / cluster_injection_should_skip; all stubbed in
+# test_cluster_scn.c since the unit test only exercises pure-function
+# cmp helpers (scn_time_cmp / scn_total_cmp / scn_recovery_cmp) and
+# the inline encoding macros.  Runtime advance/observe paths (LWLock-
+# protected SCN counter) are TAP-tested in t/065_scn_encoding.pl.
+test_cluster_scn: test_cluster_scn.c unit_test.h \
+		$(CLUSTER_VERSION_O) $(CLUSTER_SCN_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_SCN_O) -o $@

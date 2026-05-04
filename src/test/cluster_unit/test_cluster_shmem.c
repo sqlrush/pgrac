@@ -349,6 +349,11 @@ void
 cluster_stats_shmem_register(void)
 {}
 
+/* Spec-1.15 Sprint A stub: same for SCN. */
+void
+cluster_scn_shmem_register(void)
+{}
+
 
 UT_DEFINE_GLOBALS();
 

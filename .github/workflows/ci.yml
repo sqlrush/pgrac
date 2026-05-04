@@ -79,6 +79,9 @@ jobs:
       - name: Check clang-tidy (cluster sources, warn-only stage 0.7)
         run: ./scripts/ci/check-tidy.sh
 
+      - name: Check SCN cmp gate (spec-1.15 Q8+L4; ban raw SCN comparisons)
+        run: ./scripts/ci/check-scn-cmp-gate.sh
+
       - name: Lint commit message (strict, stage 0.7 tightened from spec-0.6 Q5)
         if: github.event_name == 'pull_request'
         run: |

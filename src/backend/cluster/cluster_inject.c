@@ -184,6 +184,11 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	{ .name = "cluster-stats-main-loop-iter" },
 	{ .name = "cluster-stats-shutdown-pre" },
 	{ .name = "cluster-stats-shutdown-post" },
+	/* Stage 1.15 (spec-1.15 D11 inject) — 4 SCN encoding-layer injects. */
+	{ .name = "cluster-scn-advance-pre" },
+	{ .name = "cluster-scn-advance-post" },
+	{ .name = "cluster-scn-observe-entry" },
+	{ .name = "cluster-scn-wraparound-warning" },
 };
 
 #define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_points)

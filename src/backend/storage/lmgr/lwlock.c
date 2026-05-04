@@ -202,6 +202,8 @@ static const char *const BuiltinTrancheNames[] = {
 	"ClusterDiag",
 	/* PGRAC LWTRANCHE_CLUSTER_STATS: */
 	"ClusterStats",
+	/* PGRAC LWTRANCHE_CLUSTER_SCN: */
+	"ClusterScn",
 #endif
 };
 

@@ -282,13 +282,16 @@ cluster_init_guc(void)
 
 	/*
 	 * cluster.shmem_max_regions (spec-1.3): capacity of the cluster shmem
-	 * region registry.  Default 64 covers the stage 1.3 baseline (2
-	 * regions: cluster_ctl + cluster_conf) plus the 12 reserved regions
-	 * planned in cluster-shmem-design.md §3.2 with a wide safety margin.
-	 * Range [8, 256] -- 8 is the minimum to fit baseline + small dev
-	 * subset; 256 is the upper engineering bound (raise via source-code
-	 * change if more are needed).  PGC_POSTMASTER because the registry
-	 * array is palloc'd once at postmaster init from this value.
+	 * region registry.  Default 64 covers the stage 1.3 baseline plus the
+	 * reserved regions planned in cluster-shmem-design.md §3.2 with a wide
+	 * safety margin.  Range [16, 256] -- 16 is the minimum to fit the
+	 * stage 1.15 baseline (9 registered regions: cluster_ctl + conf +
+	 * pcm_grd + startup_phase + lmon + lck + diag + cluster_stats + scn)
+	 * with a small dev margin; 256 is the upper engineering bound (raise
+	 * via source-code change if more are needed).  PGC_POSTMASTER because
+	 * the registry array is palloc'd once at postmaster init from this
+	 * value.  Min raised 8 -> 16 in spec-1.15 to accommodate the cluster_
+	 * scn region without regressing the L18 boundary test.
 	 */
 	DefineCustomIntVariable("cluster.shmem_max_regions",
 							gettext_noop("Capacity of the pgrac cluster shmem region registry."),
@@ -298,7 +301,7 @@ cluster_init_guc(void)
 										 "registers one region.  Raise if FATAL on startup with "
 										 "errcode 53400 \"cluster shmem registry capacity "
 										 "exceeded\"."),
-							&cluster_shmem_max_regions, 64, 8, 256,
+							&cluster_shmem_max_regions, 64, 16, 256,
 							PGC_POSTMASTER, /* registry array is palloc'd once at init */
 							0,				/* flags */
 							NULL,			/* check_hook */

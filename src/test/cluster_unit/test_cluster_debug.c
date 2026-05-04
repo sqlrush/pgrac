@@ -73,6 +73,7 @@
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_pgstat.h"
+#include "cluster/cluster_scn.h"
 #include "cluster/cluster_shmem.h"
 #include "fmgr.h"
 #include "funcapi.h"
@@ -646,6 +647,39 @@ cluster_stats_last_liveness_tick_at(void)
 }
 int64
 cluster_stats_main_loop_iters(void)
+{
+	return 0;
+}
+
+/* Spec-1.15 SCN encoding-layer stubs (cluster_debug.c references the
+ * 7-key dump set; address-only in unit tests). */
+SCN
+cluster_scn_current(void)
+{
+	return 0;
+}
+NodeId
+cluster_scn_node_id(void)
+{
+	return 0;
+}
+uint64
+cluster_scn_advance_count(void)
+{
+	return 0;
+}
+uint64
+cluster_scn_max_observed_remote(void)
+{
+	return 0;
+}
+TimestampTz
+cluster_scn_initialized_at(void)
+{
+	return 0;
+}
+TimestampTz
+cluster_scn_last_advance_at(void)
 {
 	return 0;
 }

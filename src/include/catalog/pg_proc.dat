@@ -12229,4 +12229,22 @@
   proargnames => '{name,size_bytes,lwlock_count,owner_subsys}',
   prosrc => 'cluster_shmem_dump_regions' },
 
+# Stage 1.15: SCN encoding-layer scalar UDFs (spec-1.15 D11; Q7).
+# Mutating APIs are superuser-only; current is read-only public.
+# C wrappers in cluster_scn.c use _sql suffix to avoid C symbol
+# collision with the C-level cluster_scn_advance / current / observe.
+{ oid => '8911', descr => 'advance cluster SCN by 1 (superuser-only debug API)',
+  proname => 'cluster_scn_advance', provolatile => 'v', proparallel => 'u',
+  prorettype => 'int8', proargtypes => '',
+  prosrc => 'cluster_scn_advance_sql' },
+{ oid => '8912', descr => 'read current cluster SCN (encoded uint64)',
+  proname => 'cluster_scn_current', provolatile => 's', proparallel => 's',
+  prorettype => 'int8', proargtypes => '',
+  prosrc => 'cluster_scn_current_sql' },
+{ oid => '8913', descr => 'observe a remote SCN (single-node 1.15: stat-only; superuser)',
+  proname => 'cluster_scn_observe', provolatile => 'v', proparallel => 'u',
+  prorettype => 'void', proargtypes => 'int8',
+  proargnames => '{remote_scn}',
+  prosrc => 'cluster_scn_observe_sql' },
+
 ]

@@ -75,6 +75,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_elog.h"  /* cluster_phase */
 #include "cluster/cluster_diag.h"  /* cluster_diag_status (spec-1.13 D12) */
 #include "cluster/cluster_lck.h"   /* cluster_lck_status (spec-1.12 D12) */
+#include "cluster/cluster_scn.h"   /* cluster_scn_current (spec-1.15 D6) */
 #include "cluster/cluster_stats.h" /* cluster_stats_status (spec-1.14 D12) */
 #include "cluster/cluster_lmon.h"  /* cluster_lmon_status (spec-1.11 Sprint B D12) */
 #include "cluster/cluster_guc.h"
@@ -544,6 +545,51 @@ dump_cluster_stats(ReturnSetInfo *rsinfo)
 
 
 /*
+ * dump_scn -- Stage 1.15 SCN encoding-layer state diagnostics.
+ *
+ *	7 keys: scn_node_id / scn_current_local / scn_current_encoded /
+ *	scn_max_observed_remote / scn_total_advance_count /
+ *	scn_initialized_at / scn_last_advance_at.
+ *
+ *	Spec-1.15 Q6: 7 keys 起步即完整, mirrors lmon/lck/diag/stats dump
+ *	7-key model.  scn_current_encoded uses hex format for clarity
+ *	(8-bit node_id high byte + 56-bit local_scn) per docs/scn-protocol-
+ *	design.md §3.1.
+ */
+static void
+dump_scn(ReturnSetInfo *rsinfo)
+{
+	NodeId node_id;
+	SCN current;
+	uint64 current_local;
+	uint64 max_remote;
+	uint64 advance_count;
+	TimestampTz init_at;
+	TimestampTz last_at;
+
+	node_id = cluster_scn_node_id();
+	current = cluster_scn_current();
+	current_local = scn_local(current);
+	max_remote = cluster_scn_max_observed_remote();
+	advance_count = cluster_scn_advance_count();
+	init_at = cluster_scn_initialized_at();
+	last_at = cluster_scn_last_advance_at();
+
+	emit_row(rsinfo, "scn", "scn_node_id", fmt_int32((int32)node_id));
+	emit_row(rsinfo, "scn", "scn_current_local", fmt_int64((int64)current_local));
+	emit_row(rsinfo, "scn", "scn_current_encoded", fmt_uint32_hex((uint32)(current >> 32)));
+	/* high 32-bit hex for cross-instance debugging convenience; full
+	 * 64-bit value is observable via scn_current_local + scn_node_id. */
+	emit_row(rsinfo, "scn", "scn_max_observed_remote", fmt_int64((int64)max_remote));
+	emit_row(rsinfo, "scn", "scn_total_advance_count", fmt_int64((int64)advance_count));
+	emit_row(rsinfo, "scn", "scn_initialized_at",
+			 init_at == 0 ? "(unset)" : pstrdup(timestamptz_to_str(init_at)));
+	emit_row(rsinfo, "scn", "scn_last_advance_at",
+			 last_at == 0 ? "(unset)" : pstrdup(timestamptz_to_str(last_at)));
+}
+
+
+/*
  * dump_shared_fs -- Stage 1.1 cluster_shared_fs runtime state.
  *
  *	Emits two rows: the active backend's name (or "(none)" if init has
@@ -714,6 +760,7 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		dump_lck(rsinfo);
 		dump_diag(rsinfo);
 		dump_cluster_stats(rsinfo);
+		dump_scn(rsinfo);
 	}
 #else
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
