@@ -44,6 +44,12 @@
  *	  This is a pgrac-original file (no derivation from PostgreSQL).
  *	  Spec: spec-1.20-tt-slot-data-structure.md
  *
+ *	  Forward-link (spec-1.21): UndoSegmentHeaderData
+ *	  (cluster_undo_segment.h) embeds an array of TT_SLOTS_PER_SEGMENT
+ *	  TTSlot entries at byte offset 112 (C natural alignment shifts the
+ *	  v0.2 body table value 108 by +4).  spec-1.22 will populate TTSlot
+ *	  fields when binding transactions to segments.
+ *
  *	  Frontend-safe: this header has no backend-only includes.  Future
  *	  pg_waldump / pg_resetwal extensions can read TTSlot bytes without
  *	  pulling in cluster runtime headers.

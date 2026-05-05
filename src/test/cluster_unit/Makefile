@@ -34,7 +34,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_scn test_cluster_block_format test_cluster_itl_slot \
         test_cluster_buffer_desc test_cluster_pcm_lock \
         test_cluster_startup_phase test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats \
-        test_cluster_xlog test_cluster_tt_slot
+        test_cluster_xlog test_cluster_tt_slot test_cluster_undo_segment
 
 # Path to the cluster_version object (no PG deps, safe to link standalone).
 CLUSTER_VERSION_O = $(top_builddir)/src/backend/cluster/cluster_version.o

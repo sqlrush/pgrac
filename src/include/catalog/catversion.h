@@ -139,10 +139,15 @@
 /*  spec-1.19-wal-page-header-thread-id.md APPROVED v0.2. */
 /* Stage 1.20: TTSlot type definition only (cluster_tt_slot.h NEW; 32 */
 /*  byte struct + sentinel constants + StaticAssertDecl + inline */
-/*  helpers).  No on-disk artefact in Stage 1.20: undo segment header */
-/*  is created by spec-1.21; dedicated undo tablespace is created by */
-/*  spec-1.22.  Therefore: NO catversion bump.  Spec: */
-/*  spec-1.20-tt-slot-data-structure.md APPROVED v0.2. */
+/*  helpers).  No on-disk artefact in Stage 1.20.  Therefore: NO */
+/*  catversion bump.  Spec: spec-1.20-tt-slot-data-structure.md v0.2. */
+/* Stage 1.21: UndoSegmentHeaderData type definition only */
+/*  (cluster_undo_segment.h NEW; 8192 byte struct + segment_state */
+/*  enum + sentinels + StaticAssertDecl + inline helpers).  No on- */
+/*  disk artefact in Stage 1.21: undo tablespace and segment files */
+/*  are created by spec-1.22 (atomic with PageInitUndoSegmentHeader */
+/*  caller and PD_UNDO_SEG_HEADER bufpage.h definition).  Therefore: */
+/*  NO catversion bump.  Spec: spec-1.21-undo-segment-header.md v0.2. */
 #define CATALOG_VERSION_NO	202605181
 
 #endif
