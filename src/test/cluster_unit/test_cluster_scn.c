@@ -44,6 +44,7 @@
 #include <signal.h>
 #include <string.h>
 
+#include "access/xact.h"		/* PGRAC: spec-1.18 xl_xact_scn struct */
 #include "cluster/cluster_scn.h"
 #include "port/atomics.h"
 #include "storage/lwlock.h"
@@ -544,11 +545,29 @@ UT_TEST(test_spec117_boc_max_batch_size_linkable)
 	UT_ASSERT_NOT_NULL((void *)cluster_scn_boc_max_batch_size);
 }
 
+/*
+ * spec-1.18 symbol-linkable smoke tests.
+ *
+ *	Real semantics (commit_scn round-tripping through xl_xact_scn,
+ *	xact_redo_commit observe wiring, replay 3-layer gate) are exercised
+ *	by 068_wal_xl_scn.pl TAP test which spins a real PG instance.  Unit
+ *	tests just verify the linker resolves the new spec-1.18 symbols.
+ */
+UT_TEST(test_spec118_recovery_replay_observe_linkable)
+{
+	UT_ASSERT_NOT_NULL((void *)cluster_scn_recovery_replay_observe);
+}
+
+UT_TEST(test_spec118_xl_xact_scn_size_is_8_bytes)
+{
+	UT_ASSERT_EQ(sizeof(xl_xact_scn), (size_t) 8);
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(28);
 
 	/* Stage 1.4 stub (5) */
 	UT_RUN(test_scn_typedef_size_is_8_bytes);
@@ -583,6 +602,10 @@ main(void)
 	UT_RUN(test_spec117_boc_sweep_count_linkable);
 	UT_RUN(test_spec117_boc_pending_at_last_sweep_linkable);
 	UT_RUN(test_spec117_boc_max_batch_size_linkable);
+
+	/* Spec-1.18 WAL xl_scn + replay observe wrapper (2) */
+	UT_RUN(test_spec118_recovery_replay_observe_linkable);
+	UT_RUN(test_spec118_xl_xact_scn_size_is_8_bytes);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

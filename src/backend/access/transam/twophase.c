@@ -69,17 +69,29 @@
  *
  *-------------------------------------------------------------------------
  *
- * PGRAC MODIFICATIONS (spec-1.16 v0.2)
+ * PGRAC MODIFICATIONS (spec-1.16 v0.2 + spec-1.18 v0.2)
  *
  *	Modified by: SqlRush <sqlrush@gmail.com>
- *	Spec: spec-1.16-local-scn-maintenance.md
+ *	Spec: spec-1.16-local-scn-maintenance.md (commit/abort SCN advance)
+ *	Spec: spec-1.18-wal-record-xl-scn.md (forward SCN to Record*Prepared)
  *
- *	What changed:
- *	  - FinishPreparedTransaction() (twophase.c:~1554): hooks
- *	    cluster_scn_advance_for_commit / _for_abort BEFORE
- *	    RecordTransactionCommitPrepared / RecordTransactionAbortPrepared
- *	    based on isCommit.  PrepareTransaction (PREPARE TRANSACTION at
- *	    twophase.c:~1196) is deliberately NOT hooked.
+ *	What changed (spec-1.16 v0.2):
+ *	  - FinishPreparedTransaction(): hooks cluster_scn_advance_for_commit
+ *	    / _for_abort BEFORE RecordTransactionCommitPrepared /
+ *	    RecordTransactionAbortPrepared based on isCommit.
+ *	    PrepareTransaction (PREPARE TRANSACTION) is deliberately NOT
+ *	    hooked.
+ *
+ *	What changed (spec-1.18 v0.2):
+ *	  - FinishPreparedTransaction(): captures the returned SCN into
+ *	    final_scn and forwards it to RecordTransaction{Commit,Abort}
+ *	    Prepared so the prepared-commit/abort WAL record carries
+ *	    xl_xact_scn (Q5 ★ -- COMMIT PREPARED + ROLLBACK PREPARED both
+ *	    carry SCN; PREPARE itself does not).
+ *	  - RecordTransactionCommitPrepared() / RecordTransactionAbort
+ *	    Prepared(): new trailing SCN parameter; forwarded to
+ *	    XactLog{Commit,Abort}Record with the same byte-identical-WAL
+ *	    guarantee when --disable-cluster (InvalidScn suppresses section).
  *
  *	Why:
  *	  Spec-1.16 v0.2 Q5 REVISED -- PG's durable commit point for 2PC is
@@ -87,7 +99,8 @@
  *	  transaction recoverable as either COMMIT PREPARED or ROLLBACK
  *	  PREPARED, so committing SCN at PREPARE time would couple SCN to a
  *	  non-final state.  Hooks here fire BEFORE the Record*Prepared call
- *	  so ereport(ERROR) is safe (no critical section yet).
+ *	  so ereport(ERROR) is safe (no critical section yet).  Spec-1.18
+ *	  graduates that bump into durable WAL evidence.
  */
 #include "postgres.h"
 
@@ -236,7 +249,8 @@ static void RecordTransactionCommitPrepared(TransactionId xid,
 											int ninvalmsgs,
 											SharedInvalidationMessage *invalmsgs,
 											bool initfileinval,
-											const char *gid);
+											const char *gid,
+											SCN commit_scn);	/* PGRAC: 1.18 */
 static void RecordTransactionAbortPrepared(TransactionId xid,
 										   int nchildren,
 										   TransactionId *children,
@@ -244,7 +258,8 @@ static void RecordTransactionAbortPrepared(TransactionId xid,
 										   RelFileLocator *rels,
 										   int nstats,
 										   xl_xact_stats_item *stats,
-										   const char *gid);
+										   const char *gid,
+										   SCN abort_scn);	/* PGRAC: 1.18 */
 static void ProcessRecords(char *bufptr, TransactionId xid,
 						   const TwoPhaseCallback callbacks[]);
 static void RemoveGXact(GlobalTransaction gxact);
@@ -1521,6 +1536,7 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 	xl_xact_stats_item *commitstats;
 	xl_xact_stats_item *abortstats;
 	SharedInvalidationMessage *invalmsgs;
+	SCN			final_scn = InvalidScn;	/* PGRAC: spec-1.18 */
 
 	/*
 	 * Validate the GID, and lock the GXACT to ensure that two backends do not
@@ -1567,12 +1583,16 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 	/* Prevent cancel/die interrupt while cleaning up */
 	HOLD_INTERRUPTS();
 
-#ifdef USE_PGRAC_CLUSTER
 	/*
 	 * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
 	 * What changed: 2PC durable-decision SCN advance hooked at COMMIT
 	 * PREPARED / ROLLBACK PREPARED entry; PrepareTransaction (PREPARE
-	 * TRANSACTION) is deliberately NOT hooked.
+	 * TRANSACTION) is deliberately NOT hooked.  spec-1.18 forwards the
+	 * captured SCN (final_scn declared at FinishPreparedTransaction
+	 * variable block top) to RecordTransactionCommitPrepared /
+	 * RecordTransactionAbortPrepared so the prepared-commit/abort WAL
+	 * record carries xl_xact_scn (Q5 ★ -- COMMIT PREPARED + ROLLBACK
+	 * PREPARED both carry SCN; PREPARE itself does not).
 	 * Why: spec-1.16 v0.2 Q5 REVISED -- PG durable commit point is
 	 * RecordTransactionCommitPrepared, not PREPARE.  PREPARE can still
 	 * become ROLLBACK PREPARED, so committing SCN at PREPARE time would
@@ -1580,10 +1600,11 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 	 * so ereport(ERROR) is safe (no critical section yet; HOLD_INTERRUPTS
 	 * does not forbid ERROR).
 	 */
+#ifdef USE_PGRAC_CLUSTER
 	if (isCommit)
-		(void) cluster_scn_advance_for_commit();
+		final_scn = cluster_scn_advance_for_commit();
 	else
-		(void) cluster_scn_advance_for_abort();
+		final_scn = cluster_scn_advance_for_abort();
 #endif
 
 	/*
@@ -1601,14 +1622,16 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 										hdr->ncommitstats,
 										commitstats,
 										hdr->ninvalmsgs, invalmsgs,
-										hdr->initfileinval, gid);
+										hdr->initfileinval, gid,
+										final_scn); /* PGRAC: spec-1.18 */
 	else
 		RecordTransactionAbortPrepared(xid,
 									   hdr->nsubxacts, children,
 									   hdr->nabortrels, abortrels,
 									   hdr->nabortstats,
 									   abortstats,
-									   gid);
+									   gid,
+									   final_scn); /* PGRAC: spec-1.18 */
 
 	ProcArrayRemove(proc, latestXid);
 
@@ -2340,7 +2363,8 @@ RecordTransactionCommitPrepared(TransactionId xid,
 								int ninvalmsgs,
 								SharedInvalidationMessage *invalmsgs,
 								bool initfileinval,
-								const char *gid)
+								const char *gid,
+								SCN commit_scn)		/* PGRAC: spec-1.18 */
 {
 	XLogRecPtr	recptr;
 	TimestampTz committs = GetCurrentTimestamp();
@@ -2363,6 +2387,10 @@ RecordTransactionCommitPrepared(TransactionId xid,
 	 * Emit the XLOG commit record. Note that we mark 2PC commits as
 	 * potentially having AccessExclusiveLocks since we don't know whether or
 	 * not they do.
+	 *
+	 * PGRAC (spec-1.18): commit_scn captured by caller before
+	 * START_CRIT_SECTION (FinishPreparedTransaction); InvalidScn from
+	 * --disable-cluster builds suppresses xl_xact_scn (Q10 ★ guarantee).
 	 */
 	recptr = XactLogCommitRecord(committs,
 								 nchildren, children, nrels, rels,
@@ -2370,7 +2398,8 @@ RecordTransactionCommitPrepared(TransactionId xid,
 								 ninvalmsgs, invalmsgs,
 								 initfileinval,
 								 MyXactFlags | XACT_FLAGS_ACQUIREDACCESSEXCLUSIVELOCK,
-								 xid, gid);
+								 xid, gid,
+								 commit_scn);	/* PGRAC: spec-1.18 */
 
 
 	if (replorigin)
@@ -2435,7 +2464,8 @@ RecordTransactionAbortPrepared(TransactionId xid,
 							   RelFileLocator *rels,
 							   int nstats,
 							   xl_xact_stats_item *stats,
-							   const char *gid)
+							   const char *gid,
+							   SCN abort_scn)		/* PGRAC: spec-1.18 */
 {
 	XLogRecPtr	recptr;
 	bool		replorigin;
@@ -2461,13 +2491,18 @@ RecordTransactionAbortPrepared(TransactionId xid,
 	 * Emit the XLOG commit record. Note that we mark 2PC aborts as
 	 * potentially having AccessExclusiveLocks since we don't know whether or
 	 * not they do.
+	 *
+	 * PGRAC (spec-1.18): abort_scn captured by caller before
+	 * START_CRIT_SECTION (FinishPreparedTransaction); HC1 -- abort path
+	 * symmetric with commit path above.
 	 */
 	recptr = XactLogAbortRecord(GetCurrentTimestamp(),
 								nchildren, children,
 								nrels, rels,
 								nstats, stats,
 								MyXactFlags | XACT_FLAGS_ACQUIREDACCESSEXCLUSIVELOCK,
-								xid, gid);
+								xid, gid,
+								abort_scn);		/* PGRAC: spec-1.18 */
 
 	if (replorigin)
 		/* Move LSNs forward for this replication origin */

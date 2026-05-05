@@ -14,27 +14,49 @@
  *
  *-------------------------------------------------------------------------
  *
- * PGRAC MODIFICATIONS (spec-1.16 v0.2)
+ * PGRAC MODIFICATIONS (spec-1.16 v0.2 + spec-1.18 v0.2)
  *
  *	Modified by: SqlRush <sqlrush@gmail.com>
- *	Spec: spec-1.16-local-scn-maintenance.md
+ *	Spec: spec-1.16-local-scn-maintenance.md (commit/abort SCN advance)
+ *	Spec: spec-1.18-wal-record-xl-scn.md (WAL emit + replay observe)
  *
- *	What changed:
+ *	What changed (spec-1.16 v0.2):
  *	  - RecordTransactionCommit(): in markXidCommitted else branch,
  *	    cluster_scn_advance_for_commit() called BEFORE START_CRIT_SECTION
- *	    so ereport(ERROR) is safe.  Spec-1.16 only-bump; spec-1.18 will
- *	    pass commit_scn into XactLogCommitRecord for xl_scn field.
+ *	    so ereport(ERROR) is safe.  Returns commit_scn captured into a
+ *	    local for spec-1.18 wiring (no longer (void)-cast).
  *	  - RecordTransactionAbort(): explicit if (!isSubXact) gate;
  *	    cluster_scn_advance_for_abort() called BEFORE START_CRIT_SECTION.
- *	    Subxact aborts (called via xact.c:5173) deliberately skipped --
- *	    only top-level abort decisions advance SCN per Q4.
+ *	    Subxact aborts (called via xact.c CommitSubTransaction error
+ *	    path) deliberately skipped -- only top-level abort decisions
+ *	    advance SCN per Q4.
+ *
+ *	What changed (spec-1.18 v0.2):
+ *	  - XactLogCommitRecord(): new trailing SCN parameter; emits 8-byte
+ *	    xl_xact_scn sub-record gated on XACT_XINFO_HAS_SCN bit when
+ *	    SCN_VALID(commit_scn).  Stored unaligned (matches xl_xact_origin
+ *	    convention).  HC1 -- abort path is symmetric.
+ *	  - XactLogAbortRecord(): new trailing SCN parameter; same emit
+ *	    pattern as commit (HC1 enumeration).
+ *	  - RecordTransactionCommit() / RecordTransactionAbort() callers
+ *	    capture the returned SCN and forward it to XactLog{Commit,Abort}
+ *	    Record.  --disable-cluster builds pass InvalidScn, which
+ *	    suppresses xl_xact_scn (zero overhead, byte-identical WAL).
+ *	  - xact_redo_commit() / xact_redo_abort(): call
+ *	    cluster_scn_recovery_replay_observe(parsed->scn) at function
+ *	    entry to catch cluster_scn_state up to the durable SCN.  HC4 --
+ *	    wrapper applies 3-layer gate (cluster_enabled + shmem-not-null +
+ *	    SCN_VALID) so plain cluster_scn_observe()'s
+ *	    Assert(state != NULL) cannot trip during early replay.
  *
  *	Why:
- *	  Spec-1.16 hooks PG commit/abort into the cluster SCN protocol.
+ *	  Spec-1.16 hooks PG commit/abort into the cluster SCN protocol;
+ *	  spec-1.18 graduates those bumps into durable WAL evidence so crash
+ *	  recovery + standby walreceivers can rebuild cluster_scn_state.
  *	  Hooks are #ifdef USE_PGRAC_CLUSTER gated so --disable-cluster
- *	  builds remain symbol-equivalent to vanilla PG 16.  Q&A v0.2
- *	  records the line-number-anchored hook positions (Q1+Q2 REVISED
- *	  after PG 16 source review).
+ *	  builds remain symbol-equivalent to vanilla PG 16; the WAL ABI
+ *	  change is gated on SCN_VALID(scn) at emit time so byte-identical
+ *	  WAL is produced when the cluster subsystem is off.
  */
 
 #include "postgres.h"
@@ -95,7 +117,8 @@
 #include "utils/timestamp.h"
 
 #ifdef USE_PGRAC_CLUSTER
-/* PGRAC: spec-1.16 commit/abort SCN hooks. */
+/* PGRAC: spec-1.16 commit/abort SCN hooks; spec-1.18 WAL emit + replay. */
+#include "cluster/cluster_inject.h"
 #include "cluster/cluster_scn.h"
 #endif
 
@@ -1402,6 +1425,7 @@ RecordTransactionCommit(void)
 	else
 	{
 		bool		replorigin;
+		SCN			commit_scn = InvalidScn;	/* PGRAC: spec-1.18 */
 
 		/*
 		 * Are we using the replication origins feature?  Or, in other words,
@@ -1429,17 +1453,24 @@ RecordTransactionCommit(void)
 		 */
 		Assert((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0);
 
-#ifdef USE_PGRAC_CLUSTER
 		/*
 		 * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
-		 * What changed: capture commit SCN BEFORE START_CRIT_SECTION.
-		 * Why: spec-1.16 v0.2 Q1 -- hook must run before critical
-		 * section so ereport(ERROR) is safe (PG critical section forbids
-		 * ERROR; only PANIC).  spec-1.18 will pass commit_scn into
-		 * XactLogCommitRecord below for the xl_scn field; spec-1.16 just
-		 * bumps cluster SCN counters without WAL wiring.
+		 * What changed: spec-1.18 -- capture commit SCN BEFORE
+		 * START_CRIT_SECTION and feed it through to XactLogCommitRecord
+		 * so the WAL record carries xl_scn.  Variable declared at the
+		 * top of the enclosing else block to satisfy PG's strict
+		 * declaration-at-top-of-block convention.
+		 * Why: spec-1.16 v0.2 Q1 already hooks the advance call here so
+		 * ereport(ERROR) is safe (PG critical section forbids ERROR;
+		 * only PANIC).  spec-1.18 graduates the captured SCN from
+		 * "counter bump only" to durable WAL evidence so crash recovery
+		 * + standby walreceivers can rebuild cluster_scn_state.  When
+		 * --disable-cluster is built, commit_scn stays InvalidScn and
+		 * XactLogCommitRecord suppresses the xl_xact_scn section so the
+		 * WAL bytestream is byte-identical to vanilla PG.
 		 */
-		(void) cluster_scn_advance_for_commit();
+#ifdef USE_PGRAC_CLUSTER
+		commit_scn = cluster_scn_advance_for_commit();
 #endif
 
 		START_CRIT_SECTION();
@@ -1454,7 +1485,8 @@ RecordTransactionCommit(void)
 							nmsgs, invalMessages,
 							RelcacheInitFileInval,
 							MyXactFlags,
-							InvalidTransactionId, NULL /* plain commit */ );
+							InvalidTransactionId, NULL /* plain commit */ ,
+							commit_scn);	/* PGRAC: spec-1.18 */
 
 		if (replorigin)
 			/* Move LSNs forward for this replication origin */
@@ -1762,6 +1794,7 @@ RecordTransactionAbort(bool isSubXact)
 	TransactionId *children;
 	TimestampTz xact_time;
 	bool		replorigin;
+	SCN			abort_scn = InvalidScn;	/* PGRAC: spec-1.18 */
 
 	/*
 	 * If we haven't been assigned an XID, nobody will care whether we aborted
@@ -1804,16 +1837,22 @@ RecordTransactionAbort(bool isSubXact)
 	nchildren = xactGetCommittedChildren(&children);
 	ndroppedstats = pgstat_get_transactional_drops(false, &droppedstats);
 
-#ifdef USE_PGRAC_CLUSTER
 	/*
 	 * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
-	 * What changed: top-level abort SCN advance BEFORE START_CRIT_SECTION.
-	 * Why: spec-1.16 v0.2 Q2 -- explicit if (!isSubXact) gate (subxact
-	 * aborts called from xact.c CommitSubTransaction error path do not
-	 * advance SCN per Q4); ereport(ERROR) safe before critical section.
+	 * What changed: spec-1.18 -- top-level abort SCN advance BEFORE
+	 * START_CRIT_SECTION; capture the SCN and feed it through to
+	 * XactLogAbortRecord so the abort WAL record carries xl_scn.  abort_scn
+	 * declared at the top of RecordTransactionAbort so PG's strict
+	 * declaration-at-top-of-block convention is satisfied.
+	 * Why: spec-1.16 v0.2 Q2 already explicit if (!isSubXact) gate
+	 * (subxact aborts from CommitSubTransaction error path do not advance
+	 * SCN per Q4); ereport(ERROR) safe before critical section.  spec-1.18
+	 * HC1 demands abort path be enumerated symmetrically with commit
+	 * (ParseAbortRecord is an independent parser at xactdesc.c:142).
 	 */
+#ifdef USE_PGRAC_CLUSTER
 	if (!isSubXact)
-		(void) cluster_scn_advance_for_abort();
+		abort_scn = cluster_scn_advance_for_abort();
 #endif
 
 	/* XXX do we really need a critical section here? */
@@ -1832,7 +1871,8 @@ RecordTransactionAbort(bool isSubXact)
 					   nrels, rels,
 					   ndroppedstats, droppedstats,
 					   MyXactFlags, InvalidTransactionId,
-					   NULL);
+					   NULL,
+					   abort_scn);	/* PGRAC: spec-1.18 */
 
 	if (replorigin)
 		/* Move LSNs forward for this replication origin */
@@ -5704,7 +5744,8 @@ XactLogCommitRecord(TimestampTz commit_time,
 					int nmsgs, SharedInvalidationMessage *msgs,
 					bool relcacheInval,
 					int xactflags, TransactionId twophase_xid,
-					const char *twophase_gid)
+					const char *twophase_gid,
+					SCN commit_scn)		/* PGRAC: spec-1.18 */
 {
 	xl_xact_commit xlrec;
 	xl_xact_xinfo xl_xinfo;
@@ -5715,6 +5756,7 @@ XactLogCommitRecord(TimestampTz commit_time,
 	xl_xact_invals xl_invals;
 	xl_xact_twophase xl_twophase;
 	xl_xact_origin xl_origin;
+	xl_xact_scn xl_scn;			/* PGRAC: spec-1.18 */
 	uint8		info;
 
 	Assert(CritSectionCount > 0);
@@ -5800,6 +5842,22 @@ XactLogCommitRecord(TimestampTz commit_time,
 		xl_origin.origin_timestamp = replorigin_session_origin_timestamp;
 	}
 
+	/*
+	 * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+	 * What changed: spec-1.18 -- attach 8-byte xl_xact_scn sub-record
+	 * iff caller captured a real SCN.  InvalidScn (callers from --
+	 * disable-cluster builds, read-only commits, subxact commits) leaves
+	 * the bit clear so the WAL bytestream stays byte-identical to vanilla
+	 * PG (Q10 ★ guarantee).
+	 * Why: spec-1.18 §2.1 commit/abort emit; HC1 demands symmetric
+	 * encoding with the abort path below.
+	 */
+	if (SCN_VALID(commit_scn))
+	{
+		xl_xinfo.xinfo |= XACT_XINFO_HAS_SCN;
+		xl_scn.scn = commit_scn;
+	}
+
 	if (xl_xinfo.xinfo != 0)
 		info |= XLOG_XACT_HAS_INFO;
 
@@ -5856,8 +5914,26 @@ XactLogCommitRecord(TimestampTz commit_time,
 	if (xl_xinfo.xinfo & XACT_XINFO_HAS_ORIGIN)
 		XLogRegisterData((char *) (&xl_origin), sizeof(xl_xact_origin));
 
+	/*
+	 * PGRAC (spec-1.18): xl_xact_scn is registered last so it always sits
+	 * at a known offset relative to the optional sections above.  Stored
+	 * unaligned (mirrors xl_xact_origin convention).
+	 */
+	if (xl_xinfo.xinfo & XACT_XINFO_HAS_SCN)
+		XLogRegisterData((char *) (&xl_scn), sizeof(xl_xact_scn));
+
 	/* we allow filtering by xacts */
 	XLogSetRecordFlags(XLOG_INCLUDE_ORIGIN);
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC (spec-1.18 D9 / HC5): inject point fires inside the critical
+	 * section.  Use only PANIC-equivalent faults here (:sleep / :skip /
+	 * :crash); :error becomes PANIC at runtime by PG's critical-section
+	 * contract.
+	 */
+	CLUSTER_INJECTION_POINT("cluster-scn-wal-write-pre");
+#endif
 
 	return XLogInsert(RM_XACT_ID, info);
 }
@@ -5874,7 +5950,8 @@ XactLogAbortRecord(TimestampTz abort_time,
 				   int nrels, RelFileLocator *rels,
 				   int ndroppedstats, xl_xact_stats_item *droppedstats,
 				   int xactflags, TransactionId twophase_xid,
-				   const char *twophase_gid)
+				   const char *twophase_gid,
+				   SCN abort_scn)		/* PGRAC: spec-1.18 */
 {
 	xl_xact_abort xlrec;
 	xl_xact_xinfo xl_xinfo;
@@ -5884,6 +5961,7 @@ XactLogAbortRecord(TimestampTz abort_time,
 	xl_xact_twophase xl_twophase;
 	xl_xact_dbinfo xl_dbinfo;
 	xl_xact_origin xl_origin;
+	xl_xact_scn xl_scn;			/* PGRAC: spec-1.18 */
 
 	uint8		info;
 
@@ -5953,6 +6031,21 @@ XactLogAbortRecord(TimestampTz abort_time,
 		xl_origin.origin_timestamp = replorigin_session_origin_timestamp;
 	}
 
+	/*
+	 * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+	 * What changed: spec-1.18 -- attach 8-byte xl_xact_scn iff caller
+	 * captured a real abort_scn.  HC1 makes the abort path symmetric
+	 * with XactLogCommitRecord above (ParseAbortRecord at xactdesc.c:142
+	 * is an independent parser; encoding must match).
+	 * Why: spec-1.18 §2.1 emits commit AND abort records with SCN so
+	 * recovery can rebuild cluster_scn_state regardless of outcome.
+	 */
+	if (SCN_VALID(abort_scn))
+	{
+		xl_xinfo.xinfo |= XACT_XINFO_HAS_SCN;
+		xl_scn.scn = abort_scn;
+	}
+
 	if (xl_xinfo.xinfo != 0)
 		info |= XLOG_XACT_HAS_INFO;
 
@@ -6002,8 +6095,23 @@ XactLogAbortRecord(TimestampTz abort_time,
 	if (xl_xinfo.xinfo & XACT_XINFO_HAS_ORIGIN)
 		XLogRegisterData((char *) (&xl_origin), sizeof(xl_xact_origin));
 
+	/*
+	 * PGRAC (spec-1.18): xl_xact_scn registered last (mirrors commit
+	 * path; stored unaligned).
+	 */
+	if (xl_xinfo.xinfo & XACT_XINFO_HAS_SCN)
+		XLogRegisterData((char *) (&xl_scn), sizeof(xl_xact_scn));
+
 	/* Include the replication origin */
 	XLogSetRecordFlags(XLOG_INCLUDE_ORIGIN);
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC (spec-1.18 D9 / HC5): same critical-section contract as
+	 * XactLogCommitRecord; :error -> PANIC at runtime.
+	 */
+	CLUSTER_INJECTION_POINT("cluster-scn-wal-write-pre");
+#endif
 
 	return XLogInsert(RM_XACT_ID, info);
 }
@@ -6022,6 +6130,22 @@ xact_redo_commit(xl_xact_parsed_commit *parsed,
 	TimestampTz commit_time;
 
 	Assert(TransactionIdIsValid(xid));
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+	 * What changed: spec-1.18 -- replay-side observe.  When the WAL
+	 * record carries XACT_XINFO_HAS_SCN, hand parsed->scn to the recovery
+	 * observe wrapper so cluster_scn_state catches up to the SCN that
+	 * was durable at primary-commit time.
+	 * Why: HC4 -- the wrapper applies a 3-layer gate (cluster_enabled +
+	 * shmem-not-null + SCN_VALID) so this hook is safe even when the
+	 * cluster subsystem is disabled or shmem hasn't been wired up yet
+	 * (early replay).  Plain cluster_scn_observe() asserts
+	 * shmem != NULL and does not check cluster_enabled (cluster_scn.c:339).
+	 */
+	cluster_scn_recovery_replay_observe(parsed->scn);
+#endif
 
 	max_xid = TransactionIdLatest(xid, parsed->nsubxacts, parsed->subxacts);
 
@@ -6173,6 +6297,18 @@ xact_redo_abort(xl_xact_parsed_abort *parsed, TransactionId xid,
 	TransactionId max_xid;
 
 	Assert(TransactionIdIsValid(xid));
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+	 * What changed: spec-1.18 -- replay-side observe (HC1 abort path
+	 * mirrors xact_redo_commit).  Wrapper 3-layer gate per HC4.
+	 * Why: rebuild cluster_scn_state from durable abort WAL evidence so
+	 * a crashed primary -- or a fresh standby walreceiver catching up --
+	 * doesn't lose SCN advances that the failed transaction recorded.
+	 */
+	cluster_scn_recovery_replay_observe(parsed->scn);
+#endif
 
 	/* Make sure nextXid is beyond any XID mentioned in the record. */
 	max_xid = TransactionIdLatest(xid,

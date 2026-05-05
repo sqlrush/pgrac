@@ -11,11 +11,43 @@
  *	  src/backend/access/rmgrdesc/xactdesc.c
  *
  *-------------------------------------------------------------------------
+ *
+ * PGRAC MODIFICATIONS (spec-1.18 v0.2)
+ *
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *	Spec: spec-1.18-wal-record-xl-scn.md
+ *
+ *	What changed:
+ *	  - ParseCommitRecord(): after the existing xl_xact_origin section,
+ *	    parse the optional XACT_XINFO_HAS_SCN section using memcpy onto
+ *	    a stack-local xl_xact_scn (HC2 -- "no alignment is guaranteed
+ *	    after this point", origin already documented this convention).
+ *	  - ParseAbortRecord(): independent parser, mirrors commit (HC1 --
+ *	    abort path is its own function with its own xinfo flags; do NOT
+ *	    refactor to share with commit).
+ *	  - xact_desc_commit() / xact_desc_abort(): print SCN value when
+ *	    XACT_XINFO_HAS_SCN is set so pg_waldump output is meaningful.
+ *
+ *	Why:
+ *	  Spec-1.18 §2.1 -- commit/abort WAL records carry the cluster SCN
+ *	  in an 8-byte sub-record gated on XACT_XINFO_HAS_SCN.  HC2 -- ARM
+ *	  / SPARC / 32-bit platforms SIGBUS on unaligned 8-byte loads, so
+ *	  readers MUST memcpy through a stack-aligned buffer (mirrors how
+ *	  ParseCommitRecord already handles xl_xact_origin).  HC1 -- the two
+ *	  parsers must be modified symmetrically; abort even lacks
+ *	  XACT_XINFO_HAS_INVALS (commit-only), demonstrating the parsers'
+ *	  schemas diverge.
+ *
+ *	  pg_waldump (frontend) shares this file with the backend (per the
+ *	  comment at the top of the parsing routines below), so the
+ *	  SCN_VALID test is wrapped to keep the frontend buildable when
+ *	  cluster_scn.h's #ifndef FRONTEND blocks the backend-only API.
  */
 #include "postgres.h"
 
 #include "access/transam.h"
 #include "access/xact.h"
+#include "cluster/cluster_scn.h"	/* PGRAC: SCN typedef + InvalidScn */
 #include "replication/origin.h"
 #include "storage/sinval.h"
 #include "storage/standbydefs.h"
@@ -135,6 +167,22 @@ ParseCommitRecord(uint8 info, xl_xact_commit *xlrec, xl_xact_parsed_commit *pars
 
 		data += sizeof(xl_xact_origin);
 	}
+
+	/*
+	 * PGRAC (spec-1.18 / HC2): xl_xact_scn follows xl_xact_origin in the
+	 * unaligned tail.  memcpy onto stack so ARM / SPARC / 32-bit hosts
+	 * don't SIGBUS on an unaligned 8-byte load.
+	 */
+	parsed->scn = InvalidScn;
+	if (parsed->xinfo & XACT_XINFO_HAS_SCN)
+	{
+		xl_xact_scn xl_scn;
+
+		memcpy(&xl_scn, data, sizeof(xl_scn));
+		parsed->scn = xl_scn.scn;
+
+		data += sizeof(xl_xact_scn);
+	}
 }
 
 void
@@ -229,6 +277,21 @@ ParseAbortRecord(uint8 info, xl_xact_abort *xlrec, xl_xact_parsed_abort *parsed)
 		parsed->origin_timestamp = xl_origin.origin_timestamp;
 
 		data += sizeof(xl_xact_origin);
+	}
+
+	/*
+	 * PGRAC (spec-1.18 / HC1 abort symmetric with commit, HC2 unaligned):
+	 * xl_xact_scn follows the unaligned xl_xact_origin section.
+	 */
+	parsed->scn = InvalidScn;
+	if (parsed->xinfo & XACT_XINFO_HAS_SCN)
+	{
+		xl_xact_scn xl_scn;
+
+		memcpy(&xl_scn, data, sizeof(xl_scn));
+		parsed->scn = xl_scn.scn;
+
+		data += sizeof(xl_xact_scn);
 	}
 }
 
@@ -363,6 +426,14 @@ xact_desc_commit(StringInfo buf, uint8 info, xl_xact_commit *xlrec, RepOriginId 
 						 LSN_FORMAT_ARGS(parsed.origin_lsn),
 						 timestamptz_to_str(parsed.origin_timestamp));
 	}
+
+	/*
+	 * PGRAC (spec-1.18): show cluster SCN when present so pg_waldump
+	 * output is meaningful for crash-recovery / standby-apply debugging.
+	 */
+	if (parsed.xinfo & XACT_XINFO_HAS_SCN)
+		appendStringInfo(buf, "; scn: " SCN_FORMAT,
+						 SCN_FORMAT_ARG(parsed.scn));
 }
 
 static void
@@ -388,6 +459,11 @@ xact_desc_abort(StringInfo buf, uint8 info, xl_xact_abort *xlrec, RepOriginId or
 						 LSN_FORMAT_ARGS(parsed.origin_lsn),
 						 timestamptz_to_str(parsed.origin_timestamp));
 	}
+
+	/* PGRAC (spec-1.18): cluster SCN -- HC1 abort symmetric with commit. */
+	if (parsed.xinfo & XACT_XINFO_HAS_SCN)
+		appendStringInfo(buf, "; scn: " SCN_FORMAT,
+						 SCN_FORMAT_ARG(parsed.scn));
 
 	xact_desc_stats(buf, "", parsed.nstats, parsed.stats);
 }

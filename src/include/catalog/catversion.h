@@ -122,6 +122,12 @@
 /* Stage 1.15.1 (round 8 P3): cluster_scn_current pg_proc.dat */
 /*  provolatile s -> v + proparallel s -> r (it reads dynamically- */
 /*  mutating shmem state).  Catalog row attribute change => bump. */
-#define CATALOG_VERSION_NO	202605152
+/* Stage 1.18: commit/abort WAL records carry an optional 8-byte */
+/*  xl_xact_scn sub-record (spec-1.18, XACT_XINFO_HAS_SCN bit 9). */
+/*  WAL record format is on-disk format -> bump.  Old data dirs cannot */
+/*  cross-replay 1.17->1.18 because parsers diverge; CATALOG_VERSION_NO */
+/*  mismatch is the gate that makes pg_control reject mixed binaries. */
+/*  Spec: spec-1.18-wal-record-xl-scn.md Q2 ★. */
+#define CATALOG_VERSION_NO	202605181
 
 #endif

@@ -198,6 +198,22 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	/* Stage 1.17 (spec-1.17 D5) — 2 walwriter BOC sweep injects. */
 	{ .name = "cluster-scn-boc-sweep-pre" },
 	{ .name = "cluster-scn-boc-sweep-post" },
+	/*
+	 * Stage 1.18 (spec-1.18 D9) — 2 commit/abort WAL emit + replay observe.
+	 *
+	 *   cluster-scn-wal-write-pre: fires inside XactLogCommitRecord /
+	 *	   XactLogAbortRecord while CritSectionCount > 0.  HC5 -- ereport(
+	 *	   ERROR) here is converted to PANIC by PG's critical-section
+	 *	   contract; tests that arm :error must expect PANIC + recovery
+	 *	   path, NOT ERROR + retry.  Use :sleep / :skip / :crash for
+	 *	   non-PANIC fault injection here.
+	 *   cluster-scn-replay-observe-pre: fires inside
+	 *	   cluster_scn_recovery_replay_observe (xact_redo_commit /
+	 *	   xact_redo_abort entry).  Recovery hasn't entered a critical
+	 *	   section yet at this point, so :error is ERROR-safe.
+	 */
+	{ .name = "cluster-scn-wal-write-pre" },
+	{ .name = "cluster-scn-replay-observe-pre" },
 };
 
 #define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_points)

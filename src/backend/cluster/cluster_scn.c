@@ -497,6 +497,43 @@ cluster_scn_advance_for_abort(void)
 }
 
 /*
+ * cluster_scn_recovery_replay_observe -- spec-1.18 WAL-replay observe
+ *	wrapper.  Called from xact_redo_commit / xact_redo_abort with the
+ *	SCN parsed from the optional XACT_XINFO_HAS_SCN section of a
+ *	commit/abort WAL record (parsed->scn).
+ *
+ *	HC4 three-layer gate: the plain cluster_scn_observe() entry asserts
+ *	cluster_scn_state != NULL and does not check cluster_enabled, so it
+ *	is unsafe to call directly from recovery code (early replay can
+ *	land here before cluster_shmem_init runs; --disable-cluster builds
+ *	must not advance SCN at all).  This wrapper applies the three
+ *	checks and forwards real values to the existing CAS-Lamport
+ *	machinery.
+ *
+ *	HC5 note: this code path is ERROR-safe (recovery has not entered a
+ *	critical section yet at xact_redo_commit / xact_redo_abort entry).
+ *	The cluster-scn-replay-observe-pre inject point is registered so
+ *	tests can fault-inject ERROR here without triggering PANIC.
+ */
+void
+cluster_scn_recovery_replay_observe(SCN scn)
+{
+	/* Layer 1: runtime feature toggle (vanilla PG behaviour when off). */
+	if (!cluster_enabled)
+		return;
+	/* Layer 2: shmem may not yet be initialised in early replay. */
+	if (cluster_scn_state == NULL)
+		return;
+	/* Layer 3: record predates spec-1.18 / cluster.enabled was off at emit. */
+	if (!SCN_VALID(scn))
+		return;
+
+	CLUSTER_INJECTION_POINT("cluster-scn-replay-observe-pre");
+
+	cluster_scn_observe(scn);
+}
+
+/*
  * cluster_scn_current -- read current encoded SCN without advancing.
  *
  *	Returns InvalidScn (= 0) in two cases:

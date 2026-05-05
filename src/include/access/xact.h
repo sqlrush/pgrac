@@ -11,11 +11,51 @@
  *
  *-------------------------------------------------------------------------
  */
+/*-------------------------------------------------------------------------
+ * PGRAC MODIFICATIONS (spec-1.18)
+ *
+ * Modified by: SqlRush <sqlrush@gmail.com>
+ *
+ * What changed:
+ *	1. Pull in "cluster/cluster_scn.h" so the SCN typedef is reachable
+ *	   from xact.h consumers (backend + frontend pg_waldump).  The
+ *	   header guards backend-only declarations behind #ifndef FRONTEND,
+ *	   so this include is safe from both build worlds.
+ *	2. Reserve bit 9 of xinfo as XACT_XINFO_HAS_SCN; signals an 8-byte
+ *	   xl_xact_scn section follows the xinfo when the cluster SCN
+ *	   subsystem captured a commit/abort SCN at WAL emit time.
+ *	3. Add xl_xact_scn struct (8 bytes; one SCN field) describing the
+ *	   optional WAL section.  Follows the existing xl_xact_origin
+ *	   "stored unaligned!" convention; readers MUST memcpy.
+ *	4. Add `SCN scn` field to xl_xact_parsed_commit + xl_xact_parsed_abort
+ *	   so xact_redo_commit / xact_redo_abort can hand the value to the
+ *	   recovery-side observe wrapper without re-parsing the byte stream.
+ *	5. Extend XactLogCommitRecord / XactLogAbortRecord prototypes with
+ *	   a trailing `SCN commit_scn` / `SCN abort_scn` parameter.  Callers
+ *	   pass InvalidScn when no SCN was captured (cluster.enabled=off,
+ *	   read-only commit, subxact commit) and the parameter is suppressed
+ *	   from WAL when InvalidScn (no XACT_XINFO_HAS_SCN bit set, zero
+ *	   bytes added to the record).
+ *
+ * Why:
+ *	spec-1.18-wal-record-xl-scn.md §2 requires commit/abort WAL records
+ *	to carry the cluster SCN so crash recovery + standby walreceivers
+ *	can rebuild cluster_scn_state from WAL.  HC1 (commit AND abort 双路径
+ *	对称) drives the symmetric prototype change.  HC3 documents that the
+ *	overhead is +8B per commit/abort (when present) plus +4B for the
+ *	xinfo header on the first record that uses xinfo.
+ *
+ *	Spec: spec-1.18-wal-record-xl-scn.md
+ *	Design: docs/scn-protocol-design.md §3.2 + §3.4
+ *	AD-008 (SCN protocol; Lamport-style distributed counters)
+ *-------------------------------------------------------------------------
+ */
 #ifndef XACT_H
 #define XACT_H
 
 #include "access/transam.h"
 #include "access/xlogreader.h"
+#include "cluster/cluster_scn.h"	/* PGRAC: SCN typedef for xl_xact_scn */
 #include "datatype/timestamp.h"
 #include "lib/stringinfo.h"
 #include "nodes/pg_list.h"
@@ -194,6 +234,8 @@ typedef struct SavedTransactionCharacteristics
 #define XACT_XINFO_HAS_AE_LOCKS			(1U << 6)
 #define XACT_XINFO_HAS_GID				(1U << 7)
 #define XACT_XINFO_HAS_DROPPED_STATS	(1U << 8)
+/* PGRAC (spec-1.18): bit 9 -- cluster SCN section (xl_xact_scn, 8 bytes). */
+#define XACT_XINFO_HAS_SCN				(1U << 9)
 
 /*
  * Also stored in xinfo, these indicating a variety of additional actions that
@@ -311,6 +353,17 @@ typedef struct xl_xact_origin
 	TimestampTz origin_timestamp;
 } xl_xact_origin;
 
+/*
+ * PGRAC (spec-1.18): cluster SCN sub-record.  Present iff XACT_XINFO_HAS_SCN
+ * bit is set in xinfo.  Stored unaligned! -- placed after xl_xact_origin
+ * which itself documents the unaligned property; readers MUST use memcpy
+ * (see xactdesc.c ParseCommitRecord / ParseAbortRecord).
+ */
+typedef struct xl_xact_scn
+{
+	SCN			scn;			/* commit/abort SCN captured at WAL emit */
+} xl_xact_scn;
+
 typedef struct xl_xact_commit
 {
 	TimestampTz xact_time;		/* time of commit */
@@ -324,6 +377,7 @@ typedef struct xl_xact_commit
 	/* xl_xact_twophase follows if XINFO_HAS_TWOPHASE */
 	/* twophase_gid follows if XINFO_HAS_GID. As a null-terminated string. */
 	/* xl_xact_origin follows if XINFO_HAS_ORIGIN, stored unaligned! */
+	/* PGRAC: xl_xact_scn follows if XINFO_HAS_SCN, stored unaligned! */
 } xl_xact_commit;
 #define MinSizeOfXactCommit (offsetof(xl_xact_commit, xact_time) + sizeof(TimestampTz))
 
@@ -340,6 +394,7 @@ typedef struct xl_xact_abort
 	/* xl_xact_twophase follows if XINFO_HAS_TWOPHASE */
 	/* twophase_gid follows if XINFO_HAS_GID. As a null-terminated string. */
 	/* xl_xact_origin follows if XINFO_HAS_ORIGIN, stored unaligned! */
+	/* PGRAC: xl_xact_scn follows if XINFO_HAS_SCN, stored unaligned! */
 } xl_xact_abort;
 #define MinSizeOfXactAbort sizeof(xl_xact_abort)
 
@@ -397,6 +452,8 @@ typedef struct xl_xact_parsed_commit
 
 	XLogRecPtr	origin_lsn;
 	TimestampTz origin_timestamp;
+
+	SCN			scn;			/* PGRAC (spec-1.18): InvalidScn if !HAS_SCN */
 } xl_xact_parsed_commit;
 
 typedef xl_xact_parsed_commit xl_xact_parsed_prepare;
@@ -423,6 +480,8 @@ typedef struct xl_xact_parsed_abort
 
 	XLogRecPtr	origin_lsn;
 	TimestampTz origin_timestamp;
+
+	SCN			scn;			/* PGRAC (spec-1.18): InvalidScn if !HAS_SCN */
 } xl_xact_parsed_abort;
 
 
@@ -503,7 +562,8 @@ extern XLogRecPtr XactLogCommitRecord(TimestampTz commit_time,
 									  bool relcacheInval,
 									  int xactflags,
 									  TransactionId twophase_xid,
-									  const char *twophase_gid);
+									  const char *twophase_gid,
+									  SCN commit_scn);	/* PGRAC: spec-1.18 */
 
 extern XLogRecPtr XactLogAbortRecord(TimestampTz abort_time,
 									 int nsubxacts, TransactionId *subxacts,
@@ -511,7 +571,8 @@ extern XLogRecPtr XactLogAbortRecord(TimestampTz abort_time,
 									 int ndroppedstats,
 									 xl_xact_stats_item *droppedstats,
 									 int xactflags, TransactionId twophase_xid,
-									 const char *twophase_gid);
+									 const char *twophase_gid,
+									 SCN abort_scn);	/* PGRAC: spec-1.18 */
 extern void xact_redo(XLogReaderState *record);
 
 /* xactdesc.c */

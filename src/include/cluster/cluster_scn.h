@@ -292,6 +292,35 @@ extern uint64 cluster_scn_boc_max_batch_size(void);
 
 
 /*
+ * spec-1.18: WAL-replay-side observe wrapper.
+ *
+ *	cluster_scn_recovery_replay_observe -- safely catch cluster_scn_state
+ *	up to a SCN parsed from a commit/abort WAL record (ParseCommitRecord
+ *	/ ParseAbortRecord populate parsed->scn from the optional
+ *	XACT_XINFO_HAS_SCN section; xact_redo_commit / xact_redo_abort
+ *	forward it here).
+ *
+ *	Three-layer gate (spec-1.18 v0.2 HC4):
+ *	  1. cluster_enabled is false  -> no-op (vanilla PG behaviour).
+ *	  2. cluster_scn_state == NULL -> no-op (early replay before
+ *	     cluster_shmem is initialised; plain cluster_scn_observe()
+ *	     asserts state != NULL, which would crash recovery).
+ *	  3. !SCN_VALID(scn)           -> no-op (record carried InvalidScn
+ *	     / record predates spec-1.18 / cluster.enabled was off at emit).
+ *	Otherwise calls cluster_scn_observe(scn) which CAS-Lamport bumps
+ *	current_local_scn / max_observed_remote_scn under the existing
+ *	wraparound + statistics contract.
+ *
+ *	HC5 note: this wrapper itself never ereport(ERROR) -- recovery code
+ *	cannot tolerate ERROR (PANIC-only).  The cluster-scn-replay-observe-
+ *	pre inject point added in spec-1.18 fires *here* (ERROR-safe inject
+ *	context), distinct from cluster-scn-wal-write-pre which fires inside
+ *	XactLogCommitRecord's critical section (PANIC-only).
+ */
+extern void cluster_scn_recovery_replay_observe(SCN scn);
+
+
+/*
  * Shmem hookup.
  */
 extern Size cluster_scn_shmem_size(void);
