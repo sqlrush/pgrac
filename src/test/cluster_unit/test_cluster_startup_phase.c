@@ -232,6 +232,10 @@ int cluster_phase3_timeout = 600;
 int cluster_phase4_timeout = 30;
 /* Spec-1.11 Sprint B: cluster_startup_phase.c references cluster_enabled */
 bool cluster_enabled = true;
+/* Spec-1.16 D13: cluster_finalize_startup_running references cluster_node_id
+ * for SCN_NODE_ID_VALID validation.  Pin to 0 (valid) so unit test does
+ * not trip the FATAL ereport path; behavioral test lives in TAP 060 L19. */
+int cluster_node_id = 0;
 
 #include "cluster/cluster_shmem.h"
 void

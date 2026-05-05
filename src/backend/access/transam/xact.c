@@ -13,6 +13,28 @@
  *	  src/backend/access/transam/xact.c
  *
  *-------------------------------------------------------------------------
+ *
+ * PGRAC MODIFICATIONS (spec-1.16 v0.2)
+ *
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *	Spec: spec-1.16-local-scn-maintenance.md
+ *
+ *	What changed:
+ *	  - RecordTransactionCommit(): in markXidCommitted else branch,
+ *	    cluster_scn_advance_for_commit() called BEFORE START_CRIT_SECTION
+ *	    so ereport(ERROR) is safe.  Spec-1.16 only-bump; spec-1.18 will
+ *	    pass commit_scn into XactLogCommitRecord for xl_scn field.
+ *	  - RecordTransactionAbort(): explicit if (!isSubXact) gate;
+ *	    cluster_scn_advance_for_abort() called BEFORE START_CRIT_SECTION.
+ *	    Subxact aborts (called via xact.c:5173) deliberately skipped --
+ *	    only top-level abort decisions advance SCN per Q4.
+ *
+ *	Why:
+ *	  Spec-1.16 hooks PG commit/abort into the cluster SCN protocol.
+ *	  Hooks are #ifdef USE_PGRAC_CLUSTER gated so --disable-cluster
+ *	  builds remain symbol-equivalent to vanilla PG 16.  Q&A v0.2
+ *	  records the line-number-anchored hook positions (Q1+Q2 REVISED
+ *	  after PG 16 source review).
  */
 
 #include "postgres.h"
@@ -71,6 +93,11 @@
 #include "utils/snapmgr.h"
 #include "utils/timeout.h"
 #include "utils/timestamp.h"
+
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: spec-1.16 commit/abort SCN hooks. */
+#include "cluster/cluster_scn.h"
+#endif
 
 /*
  *	User-tweakable parameters
@@ -1401,6 +1428,20 @@ RecordTransactionCommit(void)
 		 * are delaying the checkpoint a bit fuzzy, but it doesn't matter.
 		 */
 		Assert((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0);
+
+#ifdef USE_PGRAC_CLUSTER
+		/*
+		 * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+		 * What changed: capture commit SCN BEFORE START_CRIT_SECTION.
+		 * Why: spec-1.16 v0.2 Q1 -- hook must run before critical
+		 * section so ereport(ERROR) is safe (PG critical section forbids
+		 * ERROR; only PANIC).  spec-1.18 will pass commit_scn into
+		 * XactLogCommitRecord below for the xl_scn field; spec-1.16 just
+		 * bumps cluster SCN counters without WAL wiring.
+		 */
+		(void) cluster_scn_advance_for_commit();
+#endif
+
 		START_CRIT_SECTION();
 		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
 
@@ -1762,6 +1803,18 @@ RecordTransactionAbort(bool isSubXact)
 	nrels = smgrGetPendingDeletes(false, &rels);
 	nchildren = xactGetCommittedChildren(&children);
 	ndroppedstats = pgstat_get_transactional_drops(false, &droppedstats);
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+	 * What changed: top-level abort SCN advance BEFORE START_CRIT_SECTION.
+	 * Why: spec-1.16 v0.2 Q2 -- explicit if (!isSubXact) gate (subxact
+	 * aborts called from xact.c CommitSubTransaction error path do not
+	 * advance SCN per Q4); ereport(ERROR) safe before critical section.
+	 */
+	if (!isSubXact)
+		(void) cluster_scn_advance_for_abort();
+#endif
 
 	/* XXX do we really need a critical section here? */
 	START_CRIT_SECTION();

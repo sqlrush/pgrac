@@ -684,6 +684,24 @@ cluster_scn_last_advance_at(void)
 	return 0;
 }
 
+/* spec-1.16 stat accessor stubs (cluster_debug references the 3 new
+ * counter accessors for dump_scn 7 -> 10 keys). */
+uint64
+cluster_scn_commit_advance_count(void)
+{
+	return 0;
+}
+uint64
+cluster_scn_abort_advance_count(void)
+{
+	return 0;
+}
+uint64
+cluster_scn_observe_bump_count(void)
+{
+	return 0;
+}
+
 
 UT_DEFINE_GLOBALS();
 

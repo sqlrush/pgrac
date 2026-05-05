@@ -302,7 +302,7 @@ ok(defined $postgres_bin && -x $postgres_bin,
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-	'73', 'M1 73 injection points (1.15 adds 4 cluster-scn-*)');
+	'78', 'M1 78 injection points (1.16 adds 5 cluster-scn-{commit/abort/observe-bump}-*)');
 
 is($node->safe_psql('postgres',
 		q{SELECT string_agg(name, ',' ORDER BY name) FROM pg_stat_cluster_injections WHERE name LIKE 'cluster-init-%'}),
@@ -332,8 +332,8 @@ ok( $node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT key) FROM pg_cluster_state
 		   WHERE category='inject' AND (key LIKE '%.fault_type' OR key LIKE '%.hits')}
-	) eq '146',
-	'M5 inject category has 73×2 = 146 sub-keys (.fault_type + .hits) after 1.15');
+	) eq '156',
+	'M5 inject category has 78×2 = 156 sub-keys (.fault_type + .hits) after 1.16');
 
 is($node->get_cluster_state_value('inject', 'armed_count'),
 	'0', 'M6 inject.armed_count starts at 0 in fresh backend');

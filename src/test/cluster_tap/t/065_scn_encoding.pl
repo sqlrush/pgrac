@@ -99,20 +99,30 @@ ok($after > $before,
 
 
 # ----------
-# L3: cluster_scn_observe is stat-only; local_scn does NOT bump.
-# Use a synthetic remote SCN with node_id=42 + local_scn = current_local + 1000.
+# L3 (spec-1.16 v0.2 Q3 upgrade): cluster_scn_observe NOW does Lamport
+# bump (max(current, remote+1)).  Spec-1.15 stat-only contract has been
+# replaced by spec-1.16 real Lamport observe.  remote with high local
+# bumps current_local.
 # ----------
-my $local_before_observe = $node->safe_psql('postgres',
-	'SELECT cluster_scn_current()');
-# Remote with node_id=42 high byte, local = 999999.
+my $local_before_observe = $node->safe_psql('postgres', q{
+	SELECT value::bigint FROM pg_cluster_state
+	 WHERE category='scn' AND key='scn_current_local'
+});
+# Remote with node_id=42 high byte, local = current_local + 999999 (much higher).
+# Use addition rather than `|`: the high 8 bits (42 * 2^56) and the low
+# 56 bits ($remote_high < 2^56) never overlap, so addition gives the
+# same encoded SCN as bitwise OR while avoiding PG's bigint|int4
+# operator-resolution quirks.
+my $remote_high = $local_before_observe + 999999;
 my $remote = $node->safe_psql('postgres',
-	'SELECT ((42::bigint << 56) | 999999)::bigint');
-$node->safe_psql('postgres',
-	"SELECT cluster_scn_observe($remote)");
-my $local_after_observe = $node->safe_psql('postgres',
-	'SELECT cluster_scn_current()');
-is($local_after_observe, $local_before_observe,
-   'L3 cluster_scn_observe is stat-only; current SCN does not bump (Q4+L5 contract)');
+	"SELECT 42::bigint * 72057594037927936 + $remote_high");
+$node->safe_psql('postgres', "SELECT cluster_scn_observe($remote)");
+my $local_after_observe = $node->safe_psql('postgres', q{
+	SELECT value::bigint FROM pg_cluster_state
+	 WHERE category='scn' AND key='scn_current_local'
+});
+ok($local_after_observe >= $remote_high + 1,
+   "L3 cluster_scn_observe Lamport-bumps current_local to >= remote+1 ($remote_high+1; got $local_after_observe; spec-1.16 v0.2 Q3)");
 
 
 # ----------

@@ -68,6 +68,26 @@
  *		  gxact->inredo entries that have not made it to disk.
  *
  *-------------------------------------------------------------------------
+ *
+ * PGRAC MODIFICATIONS (spec-1.16 v0.2)
+ *
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *	Spec: spec-1.16-local-scn-maintenance.md
+ *
+ *	What changed:
+ *	  - FinishPreparedTransaction() (twophase.c:~1554): hooks
+ *	    cluster_scn_advance_for_commit / _for_abort BEFORE
+ *	    RecordTransactionCommitPrepared / RecordTransactionAbortPrepared
+ *	    based on isCommit.  PrepareTransaction (PREPARE TRANSACTION at
+ *	    twophase.c:~1196) is deliberately NOT hooked.
+ *
+ *	Why:
+ *	  Spec-1.16 v0.2 Q5 REVISED -- PG's durable commit point for 2PC is
+ *	  RecordTransactionCommitPrepared, not PREPARE.  PREPARE leaves the
+ *	  transaction recoverable as either COMMIT PREPARED or ROLLBACK
+ *	  PREPARED, so committing SCN at PREPARE time would couple SCN to a
+ *	  non-final state.  Hooks here fire BEFORE the Record*Prepared call
+ *	  so ereport(ERROR) is safe (no critical section yet).
  */
 #include "postgres.h"
 
@@ -108,6 +128,11 @@
 #include "utils/builtins.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
+
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: spec-1.16 commit/abort SCN hooks for 2PC durable decisions. */
+#include "cluster/cluster_scn.h"
+#endif
 
 /*
  * Directory where Two-phase commit files reside within PGDATA
@@ -1541,6 +1566,25 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 
 	/* Prevent cancel/die interrupt while cleaning up */
 	HOLD_INTERRUPTS();
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+	 * What changed: 2PC durable-decision SCN advance hooked at COMMIT
+	 * PREPARED / ROLLBACK PREPARED entry; PrepareTransaction (PREPARE
+	 * TRANSACTION) is deliberately NOT hooked.
+	 * Why: spec-1.16 v0.2 Q5 REVISED -- PG durable commit point is
+	 * RecordTransactionCommitPrepared, not PREPARE.  PREPARE can still
+	 * become ROLLBACK PREPARED, so committing SCN at PREPARE time would
+	 * couple SCN to a non-final state.  Hooks fire BEFORE Record*Prepared
+	 * so ereport(ERROR) is safe (no critical section yet; HOLD_INTERRUPTS
+	 * does not forbid ERROR).
+	 */
+	if (isCommit)
+		(void) cluster_scn_advance_for_commit();
+	else
+		(void) cluster_scn_advance_for_abort();
+#endif
 
 	/*
 	 * The order of operations here is critical: make the XLOG entry for

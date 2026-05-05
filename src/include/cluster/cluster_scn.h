@@ -214,7 +214,7 @@ extern int scn_recovery_cmp(SCN a, XLogRecPtr a_lsn, NodeId a_node, SCN b, XLogR
 
 
 /*
- * Public advance / observe API (single-node Stage 1.15 only).
+ * Public advance / observe API (single-node; spec-1.15 + spec-1.16).
  */
 extern SCN cluster_scn_advance(void);
 extern void cluster_scn_observe(SCN remote_scn);
@@ -224,6 +224,47 @@ extern uint64 cluster_scn_max_observed_remote(void);
 extern NodeId cluster_scn_node_id(void);
 extern TimestampTz cluster_scn_initialized_at(void);
 extern TimestampTz cluster_scn_last_advance_at(void);
+
+/*
+ * spec-1.16: commit / abort hooks (xact.c + twophase.c).
+ *
+ *	cluster_scn_advance_for_commit -- wraps cluster_scn_advance() with
+ *	commit-specific instrumentation (bumps commit_advance_count + fires
+ *	cluster-scn-commit-pre/post-advance inject points).  Returns the
+ *	committed SCN for callers; spec-1.16 only-bump (no WAL wiring),
+ *	spec-1.18 will pass commit_scn into XactLogCommitRecord for the
+ *	xl_scn field.
+ *
+ *	Caller contract (per spec-1.16 v0.2 Q1):
+ *	  - xact.c RecordTransactionCommit: in markXidCommitted else branch,
+ *	    BEFORE START_CRIT_SECTION (xact.c:1404).  ereport(ERROR) safe.
+ *	  - twophase.c FinishPreparedTransaction(isCommit=true): before
+ *	    RecordTransactionCommitPrepared (twophase.c:1554).
+ *	  - DO NOT call from PrepareTransaction (PREPARE is not durable
+ *	    commit point per spec-1.16 v0.2 Q5).
+ *	  - DO NOT call for read-only transactions (markXidCommitted == false
+ *	    per spec-1.16 v0.2 Q7).
+ *	  - DO NOT call for subtransaction commit.
+ *
+ *	cluster_scn_advance_for_abort -- mirrors commit hook for abort path
+ *	(bumps abort_advance_count + fires cluster-scn-abort-pre/post-advance
+ *	inject points).
+ *
+ *	Caller contract (per spec-1.16 v0.2 Q2):
+ *	  - xact.c RecordTransactionAbort: in if (!isSubXact) branch BEFORE
+ *	    START_CRIT_SECTION (xact.c:1767).  isSubXact gate is explicit
+ *	    (xact.c:5173 calls RecordTransactionAbort(true) for subxacts).
+ *	  - twophase.c FinishPreparedTransaction(isCommit=false): before
+ *	    RecordTransactionAbortPrepared (twophase.c:1554; ROLLBACK PREPARED
+ *	    per spec-1.16 v0.2 Q8).
+ */
+extern SCN cluster_scn_advance_for_commit(void);
+extern SCN cluster_scn_advance_for_abort(void);
+
+/* spec-1.16 stat accessors (LW_SHARED). */
+extern uint64 cluster_scn_commit_advance_count(void);
+extern uint64 cluster_scn_abort_advance_count(void);
+extern uint64 cluster_scn_observe_bump_count(void);
 
 
 /*

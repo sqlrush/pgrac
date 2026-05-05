@@ -189,6 +189,12 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	{ .name = "cluster-scn-advance-post" },
 	{ .name = "cluster-scn-observe-entry" },
 	{ .name = "cluster-scn-wraparound-warning" },
+	/* Stage 1.16 (spec-1.16 D5) — 5 commit/abort/observe-bump injects. */
+	{ .name = "cluster-scn-commit-pre-advance" },
+	{ .name = "cluster-scn-commit-post-advance" },
+	{ .name = "cluster-scn-abort-pre-advance" },
+	{ .name = "cluster-scn-abort-post-advance" },
+	{ .name = "cluster-scn-observe-bump-pre" },
 };
 
 #define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_points)

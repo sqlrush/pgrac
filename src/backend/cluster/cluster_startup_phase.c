@@ -61,6 +61,7 @@
 #include "cluster/cluster_inject.h" /* CLUSTER_INJECTION_POINT */
 #include "cluster/cluster_lck.h"	/* cluster_lck_start / wait_for_ready (1.12 Sprint A) */
 #include "cluster/cluster_lmon.h"	/* cluster_lmon_start / wait_for_ready (1.11 Sprint A) */
+#include "cluster/cluster_scn.h"	/* SCN_NODE_ID_VALID (spec-1.16 D13) */
 #include "cluster/cluster_shmem.h"	/* cluster_shmem_register_region */
 #include "cluster/cluster_startup_phase.h"
 
@@ -1083,6 +1084,28 @@ cluster_finalize_startup_running(void)
 
 	if (cluster_current_phase() == CLUSTER_PHASE_RUNNING)
 		return;
+
+	/*
+	 * Spec-1.16 v0.2 Q9 / D13: surface cluster.node_id BEFORE entering
+	 * RUNNING so admins notice misconfiguration at startup rather than
+	 * mid-transaction.  Stage 1.16 single-node fallback (-1) is still
+	 * functional (commit/abort hooks skip the SCN advance silently --
+	 * see cluster_scn_skip_hook_in_pre_running), so we emit WARNING
+	 * here rather than FATAL.  Stage 2+ multi-node spec will tighten
+	 * this to FATAL once cross-instance protocols make node_id
+	 * mandatory.
+	 *
+	 * cluster_enabled=off path skips entirely (no warning).
+	 */
+	if (cluster_enabled && !SCN_NODE_ID_VALID(cluster_node_id))
+		ereport(WARNING,
+				(errcode(ERRCODE_WARNING),
+				 errmsg("cluster.node_id (%d) is outside the valid range 0..%d; cluster SCN "
+						"advance will silently skip",
+						cluster_node_id, SCN_MAX_VALID_NODE_ID),
+				 errhint("Set cluster.node_id in postgresql.conf to an integer 0..127 to enable "
+						 "SCN advance, or set cluster_enabled=off for vanilla PG behaviour.  Stage "
+						 "2+ multi-node will require a valid node_id.")));
 
 	cluster_advance_phase(CLUSTER_PHASE_RUNNING);
 }

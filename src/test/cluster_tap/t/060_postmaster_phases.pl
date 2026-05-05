@@ -408,4 +408,28 @@ like($log_l17,
 }
 
 
+# ----------
+# L19 (spec-1.16 D13): cluster_finalize_startup_running emits WARNING
+# when cluster_enabled=on but cluster.node_id is unset (-1).  WARNING
+# (not FATAL) keeps single-node fallback functional for vanilla PG
+# regression tests; the SCN hooks silently skip via
+# cluster_scn_skip_hook_in_pre_running.  Stage 2+ multi-node will
+# tighten this to FATAL.
+# ----------
+{
+	my $node_l19 = PgracClusterNode->new('node_l19');
+	$node_l19->init;
+	# Default cluster.node_id = -1 (unset / single-node fallback).
+	# cluster_enabled defaults to on; do NOT override.
+	$node_l19->start;
+
+	my $log_l19 = slurp_file($node_l19->logfile);
+	like($log_l19, qr/cluster\.node_id.*outside the valid range/,
+	   'L19 WARNING surfaces unset cluster.node_id at startup (spec-1.16 D13)');
+	like($log_l19, qr/cluster\.node_id in postgresql\.conf|integer 0\.\.127/,
+	   'L19 errhint mentions postgresql.conf and 0..127 range');
+	$node_l19->stop;
+}
+
+
 done_testing();

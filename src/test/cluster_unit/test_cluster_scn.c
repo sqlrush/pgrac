@@ -473,10 +473,47 @@ UT_TEST(test_scn_node_id_extracts_unsigned_byte)
 }
 
 
+/* ============================================================
+ * Spec-1.16 commit/abort hook + observe Lamport bump symbol tests
+ * ============================================================
+ *
+ *	cluster_unit binary stubs ShmemInitStruct so cluster_scn_state stays
+ *	NULL.  Behavior tests (advance / observe Lamport bump / commit/abort
+ *	counter increment) live in TAP t/066_scn_commit_advance.pl + 065
+ *	upgrade where a real PG instance backs the shmem region.  The unit
+ *	tests below only verify symbol linkability.
+ */
+
+UT_TEST(test_spec116_advance_for_commit_linkable)
+{
+	UT_ASSERT_NOT_NULL((void *)cluster_scn_advance_for_commit);
+}
+
+UT_TEST(test_spec116_advance_for_abort_linkable)
+{
+	UT_ASSERT_NOT_NULL((void *)cluster_scn_advance_for_abort);
+}
+
+UT_TEST(test_spec116_commit_advance_count_linkable)
+{
+	UT_ASSERT_NOT_NULL((void *)cluster_scn_commit_advance_count);
+}
+
+UT_TEST(test_spec116_abort_advance_count_linkable)
+{
+	UT_ASSERT_NOT_NULL((void *)cluster_scn_abort_advance_count);
+}
+
+UT_TEST(test_spec116_observe_bump_count_linkable)
+{
+	UT_ASSERT_NOT_NULL((void *)cluster_scn_observe_bump_count);
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(22);
 
 	/* Stage 1.4 stub (5) */
 	UT_RUN(test_scn_typedef_size_is_8_bytes);
@@ -498,6 +535,13 @@ main(void)
 	UT_RUN(test_scn_total_cmp_invariant_no_raw_uint64_wins);
 	UT_RUN(test_scn_invalid_remains_zero_under_encoding);
 	UT_RUN(test_scn_node_id_extracts_unsigned_byte);
+
+	/* Spec-1.16 commit/abort + observe Lamport hook symbols (5) */
+	UT_RUN(test_spec116_advance_for_commit_linkable);
+	UT_RUN(test_spec116_advance_for_abort_linkable);
+	UT_RUN(test_spec116_commit_advance_count_linkable);
+	UT_RUN(test_spec116_abort_advance_count_linkable);
+	UT_RUN(test_spec116_observe_bump_count_linkable);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

@@ -599,6 +599,13 @@ dump_scn(ReturnSetInfo *rsinfo)
 			 init_at == 0 ? "(unset)" : pstrdup(timestamptz_to_str(init_at)));
 	emit_row(rsinfo, "scn", "scn_last_advance_at",
 			 last_at == 0 ? "(unset)" : pstrdup(timestamptz_to_str(last_at)));
+	/* spec-1.16 D6: per-decision counters (Q6 dump_scn 7 -> 10 keys) */
+	emit_row(rsinfo, "scn", "scn_commit_advance_count",
+			 fmt_int64((int64)cluster_scn_commit_advance_count()));
+	emit_row(rsinfo, "scn", "scn_abort_advance_count",
+			 fmt_int64((int64)cluster_scn_abort_advance_count()));
+	emit_row(rsinfo, "scn", "scn_observe_bump_count",
+			 fmt_int64((int64)cluster_scn_observe_bump_count()));
 }
 
 

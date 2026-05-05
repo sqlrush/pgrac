@@ -77,6 +77,10 @@ typedef struct ClusterScnSharedState {
 	pg_atomic_uint64 total_advance_count; /* monotone counter */
 	TimestampTz initialized_at;
 	TimestampTz last_advance_at;
+	/* spec-1.16 additions: per-decision counters */
+	pg_atomic_uint64 commit_advance_count; /* incremented by _for_commit */
+	pg_atomic_uint64 abort_advance_count;  /* incremented by _for_abort  */
+	pg_atomic_uint64 observe_bump_count;   /* incremented by observe bump */
 } ClusterScnSharedState;
 
 
@@ -281,21 +285,34 @@ cluster_scn_advance(void)
 }
 
 /*
- * cluster_scn_observe -- update max_observed_remote statistic.
+ * cluster_scn_observe -- Lamport-bump local SCN from a remote SCN.
  *
- *	Spec-1.15 Q4 + L5: single-node observe is a no-op for current_
- *	local_scn (no Lamport bump).  Only updates max_observed_remote_scn
- *	statistic for monitoring.  spec-1.16 implements true Lamport bump
- *	(current_local = max(current_local, scn_local(remote) + 1)).
+ *	Spec-1.16 Q3 (real Lamport bump; upgraded from spec-1.15 stat-only):
  *
- *	Silently ignore InvalidScn input to ease forward-compat with
- *	multi-node code paths that may pass remote SCN before any cross-
- *	node traffic exists.
+ *	   if (remote_local > current_local_scn) {
+ *	     current_local_scn = remote_local + 1;  -- Lamport bump
+ *	     observe_bump_count++;
+ *	     last_advance_at = now;
+ *	   }
+ *	   if (remote_local > max_observed_remote_scn)
+ *	     max_observed_remote_scn = remote_local;  -- stat
+ *
+ *	Whole compound (max bump + counter inc + stat update + timestamp)
+ *	runs under a single LW_EXCLUSIVE per spec-1.16 v0.2 Q3 -- atomic CAS
+ *	+ atomic counter would create observation windows where
+ *	observe_bump_count and current_local_scn disagree.  observe()
+ *	frequency in single-node Stage 1.16 is rare (SQL UDF only); LWLock
+ *	contention is not a concern.
+ *
+ *	Silently ignore InvalidScn input to ease forward-compat with multi-
+ *	node code paths that may pass remote SCN before any cross-node
+ *	traffic exists.
  */
 void
 cluster_scn_observe(SCN remote_scn)
 {
 	uint64 remote_local;
+	bool bumped = false;
 
 	Assert(cluster_scn_state != NULL);
 
@@ -304,19 +321,89 @@ cluster_scn_observe(SCN remote_scn)
 	if (!SCN_VALID(remote_scn))
 		return;
 
+	CLUSTER_INJECTION_POINT("cluster-scn-observe-bump-pre");
+
 	remote_local = scn_local(remote_scn);
 
 	LWLockAcquire(&cluster_scn_state->lwlock, LW_EXCLUSIVE);
 
+	/* Lamport bump: current = max(current, remote + 1). */
+	if (remote_local > cluster_scn_state->current_local_scn) {
+		cluster_scn_state->current_local_scn = remote_local + 1;
+		cluster_scn_state->last_advance_at = GetCurrentTimestamp();
+		bumped = true;
+	}
+
+	/* Stat: track the highest remote SCN we've ever seen. */
 	if (remote_local > cluster_scn_state->max_observed_remote_scn)
 		cluster_scn_state->max_observed_remote_scn = remote_local;
 
-	/*
-	 * Spec-1.15 L5: explicitly DO NOT bump current_local_scn here.
-	 * Lamport observe is spec-1.16 territory.  Statistic-only.
-	 */
-
 	LWLockRelease(&cluster_scn_state->lwlock);
+
+	if (bumped)
+		pg_atomic_fetch_add_u64(&cluster_scn_state->observe_bump_count, 1);
+}
+
+/*
+ * cluster_scn_advance_for_commit / _for_abort -- spec-1.16 commit/abort
+ * hooks.  Wrap cluster_scn_advance() with per-decision counters and
+ * inject points.  Caller contract documented in cluster_scn.h.
+ *
+ * Bootstrap / pre-RUNNING tolerance: initdb's bootstrap mode runs
+ * RecordTransactionCommit before cluster.node_id is set (postgresql.conf
+ * is not parsed in single-user bootstrap), so cluster_scn_advance would
+ * ereport(ERROR) and PANIC the bootstrap.  spec-1.16 v0.2 Q9 + D13:
+ * cluster_finalize_startup_running() FATALs if cluster_enabled=on and
+ * node_id is invalid before postmaster reaches RUNNING.  Therefore we
+ * can safely silently skip the hooks when cluster_scn_state is NULL
+ * (early bootstrap before shmem init) or node_id is invalid (bootstrap
+ * + initdb post-bootstrap SQL).  Once postmaster reaches RUNNING, D13
+ * has confirmed node_id is valid; commits there always advance SCN.
+ */
+static inline bool
+cluster_scn_skip_hook_in_pre_running(void)
+{
+	if (cluster_scn_state == NULL)
+		return true; /* shmem not yet initialised */
+	if (!SCN_NODE_ID_VALID(cluster_scn_state->node_id))
+		return true; /* bootstrap / single-node fallback */
+	return false;
+}
+
+SCN
+cluster_scn_advance_for_commit(void)
+{
+	SCN scn;
+
+	if (cluster_scn_skip_hook_in_pre_running())
+		return InvalidScn;
+
+	CLUSTER_INJECTION_POINT("cluster-scn-commit-pre-advance");
+
+	scn = cluster_scn_advance();
+	pg_atomic_fetch_add_u64(&cluster_scn_state->commit_advance_count, 1);
+
+	CLUSTER_INJECTION_POINT("cluster-scn-commit-post-advance");
+
+	return scn;
+}
+
+SCN
+cluster_scn_advance_for_abort(void)
+{
+	SCN scn;
+
+	if (cluster_scn_skip_hook_in_pre_running())
+		return InvalidScn;
+
+	CLUSTER_INJECTION_POINT("cluster-scn-abort-pre-advance");
+
+	scn = cluster_scn_advance();
+	pg_atomic_fetch_add_u64(&cluster_scn_state->abort_advance_count, 1);
+
+	CLUSTER_INJECTION_POINT("cluster-scn-abort-post-advance");
+
+	return scn;
 }
 
 /*
@@ -408,6 +495,28 @@ cluster_scn_last_advance_at(void)
 	return v;
 }
 
+/* spec-1.16 stat accessors. */
+uint64
+cluster_scn_commit_advance_count(void)
+{
+	Assert(cluster_scn_state != NULL);
+	return pg_atomic_read_u64(&cluster_scn_state->commit_advance_count);
+}
+
+uint64
+cluster_scn_abort_advance_count(void)
+{
+	Assert(cluster_scn_state != NULL);
+	return pg_atomic_read_u64(&cluster_scn_state->abort_advance_count);
+}
+
+uint64
+cluster_scn_observe_bump_count(void)
+{
+	Assert(cluster_scn_state != NULL);
+	return pg_atomic_read_u64(&cluster_scn_state->observe_bump_count);
+}
+
 
 /*
  * ============================================================
@@ -435,6 +544,10 @@ cluster_scn_shmem_init(void)
 		pg_atomic_init_u64(&cluster_scn_state->total_advance_count, 0);
 		cluster_scn_state->initialized_at = GetCurrentTimestamp();
 		cluster_scn_state->last_advance_at = 0;
+		/* spec-1.16 counters */
+		pg_atomic_init_u64(&cluster_scn_state->commit_advance_count, 0);
+		pg_atomic_init_u64(&cluster_scn_state->abort_advance_count, 0);
+		pg_atomic_init_u64(&cluster_scn_state->observe_bump_count, 0);
 	}
 }
 
