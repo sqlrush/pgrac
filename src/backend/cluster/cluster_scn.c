@@ -312,7 +312,6 @@ void
 cluster_scn_observe(SCN remote_scn)
 {
 	uint64 remote_local;
-	uint64 target_local;
 	bool bumped = false;
 
 	Assert(cluster_scn_state != NULL);
@@ -375,7 +374,7 @@ cluster_scn_observe(SCN remote_scn)
 	 * therefore reflects ALL advances (commit + abort + observe bump).
 	 */
 	if (remote_local >= cluster_scn_state->current_local_scn) {
-		target_local = remote_local + 1;
+		uint64 target_local = remote_local + 1;
 
 		/* Wraparound watermark check inside the same LWLock (round 9 P1
 		 * finding 3): bump may push past 2^50 WARNING / 2^55 PANIC
