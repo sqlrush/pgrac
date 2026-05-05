@@ -128,6 +128,15 @@
 /*  cross-replay 1.17->1.18 because parsers diverge; CATALOG_VERSION_NO */
 /*  mismatch is the gate that makes pg_control reject mixed binaries. */
 /*  Spec: spec-1.18-wal-record-xl-scn.md Q2 ★. */
+/* Stage 1.19: WAL Page Header xlp_thread_id + xlp_cluster_flags */
+/*  placeholder fields reuse the existing MAXALIGN tail padding so */
+/*  sizeof(XLogPageHeaderData) stays 24 bytes (StaticAssertDecl in */
+/*  xlog_internal.h).  vanilla PG MemSet's the entire 8 KB page before */
+/*  writing fields (xlog.c:1878 + xlog.c:4685 + pg_resetwal.c:1059) so */
+/*  pre-1.19 datadirs land both fields as 0 (= XLP_THREAD_ID_LEGACY + */
+/*  XLP_CLUSTER_FLAGS_RESERVED) automatically.  No on-disk format */
+/*  change -> NO catversion bump (Q1=A approve).  Spec: */
+/*  spec-1.19-wal-page-header-thread-id.md APPROVED v0.2. */
 #define CATALOG_VERSION_NO	202605181
 
 #endif

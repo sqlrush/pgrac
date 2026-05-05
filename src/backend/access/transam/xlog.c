@@ -34,6 +34,37 @@
  * src/backend/access/transam/xlog.c
  *
  *-------------------------------------------------------------------------
+ *
+ * PGRAC MODIFICATIONS (spec-1.19 v0.2)
+ *
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *	Spec: spec-1.19-wal-page-header-thread-id.md
+ *
+ *	What changed:
+ *	  - AdvanceXLInsertBuffer() (xlog.c:~1883): after the existing
+ *	    MemSet of the new 8 KB page and the writes of xlp_magic /
+ *	    xlp_info / xlp_tli / xlp_pageaddr, write the cluster placeholder
+ *	    fields xlp_thread_id = XLP_THREAD_ID_LEGACY (0) and
+ *	    xlp_cluster_flags = XLP_CLUSTER_FLAGS_RESERVED (0).  The
+ *	    placeholder write is unconditional (no cluster.enabled gate);
+ *	    the value zero is byte-identical to vanilla PG's MemSet'd
+ *	    padding so cluster.enabled=off builds still produce vanilla
+ *	    WAL byte streams.  Fires the cluster-wal-page-init-thread-id
+ *	    injection point after the writes (HC5 v0.2: this site is reached
+ *	    from XLogInsertRecord:1617 inside START_CRIT_SECTION and from
+ *	    XLogWrite:2829 outside critical section, so :error fault has
+ *	    mixed PANIC-capable / ERROR-safe semantics depending on caller).
+ *	  - BootStrapXLOG() (xlog.c:~4722): mirrors the AdvanceXLInsertBuffer
+ *	    placeholder write for the initial WAL page created during
+ *	    initdb.  Single-shot, no critical section, no inject hook.
+ *
+ *	Why:
+ *	  spec-1.19 establishes the structural placeholder for AD-009
+ *	  per-instance redo thread routing.  Stage 1 always writes LEGACY
+ *	  (0); Stage 2+ feature-034 activates real per-instance thread IDs
+ *	  starting at 1 (mapping `thread_id = cluster_node_id + 1`, so 0
+ *	  remains permanently legacy).  Q1=A approve: reuse MAXALIGN
+ *	  padding, no on-disk growth, no catversion bump.
  */
 
 #include "postgres.h"
@@ -108,6 +139,11 @@
 #include "utils/timeout.h"
 #include "utils/timestamp.h"
 #include "utils/varlena.h"
+
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: spec-1.19 cluster-wal-page-init-thread-id injection point. */
+#include "cluster/cluster_inject.h"
+#endif
 
 extern uint32 bootstrap_data_checksum_version;
 
@@ -1887,6 +1923,34 @@ AdvanceXLInsertBuffer(XLogRecPtr upto, TimeLineID tli, bool opportunistic)
 		NewPage->xlp_pageaddr = NewPageBeginPtr;
 
 		/* NewPage->xlp_rem_len = 0; */	/* done by memset */
+
+		/*
+		 * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+		 * What changed: spec-1.19 -- write Stage 1 placeholder cluster
+		 * fields (xlp_thread_id = LEGACY (0); xlp_cluster_flags =
+		 * RESERVED (0)).  Both writes are unconditional and produce a
+		 * byte-identical WAL stream to vanilla PG (the MemSet above
+		 * already zeroed the bytes).
+		 * Why: the explicit zero writes document intent to future
+		 * readers and survive any future move of the MemSet pattern.
+		 * Stage 2+ feature-034 will write `cluster_node_id + 1` here so
+		 * zero remains permanently legacy (Q2 v0.2 sentinel rule).
+		 *
+		 * HC5 (mixed-context inject): cluster-wal-page-init-thread-id
+		 * fires below.  AdvanceXLInsertBuffer is called from
+		 * XLogInsertRecord (xlog.c:~1617, INSIDE START_CRIT_SECTION at
+		 * xlog.c:~796) and from XLogWrite opportunistic
+		 * (xlog.c:~2829, AFTER END_CRIT_SECTION).  :error fault becomes
+		 * PANIC in the first caller path and ERROR-safe in the second.
+		 * Default fault types for this point are :skip / :warning
+		 * (PANIC-safe in either context).
+		 */
+		NewPage->xlp_thread_id = XLP_THREAD_ID_LEGACY;
+		NewPage->xlp_cluster_flags = XLP_CLUSTER_FLAGS_RESERVED;
+
+#ifdef USE_PGRAC_CLUSTER
+		CLUSTER_INJECTION_POINT("cluster-wal-page-init-thread-id");
+#endif
 
 		/*
 		 * If online backup is not in progress, mark the header to indicate
@@ -4723,6 +4787,14 @@ BootStrapXLOG(void)
 	page->xlp_info = XLP_LONG_HEADER;
 	page->xlp_tli = BootstrapTimeLineID;
 	page->xlp_pageaddr = wal_segment_size;
+	/*
+	 * PGRAC (spec-1.19): Stage 1 placeholder cluster fields.  initdb
+	 * runs this once; no critical section, no inject hook (Stage 1 only
+	 * AdvanceXLInsertBuffer's site fires the cluster-wal-page-init-
+	 * thread-id injection).  Mirrors AdvanceXLInsertBuffer write.
+	 */
+	page->xlp_thread_id = XLP_THREAD_ID_LEGACY;
+	page->xlp_cluster_flags = XLP_CLUSTER_FLAGS_RESERVED;
 	longpage = (XLogLongPageHeader) page;
 	longpage->xlp_sysid = sysidentifier;
 	longpage->xlp_seg_size = wal_segment_size;

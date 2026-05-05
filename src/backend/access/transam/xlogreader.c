@@ -14,6 +14,35 @@
  *		This file is compiled as both front-end and backend code, so it
  *		may not use ereport, server-defined static variables, etc.
  *-------------------------------------------------------------------------
+ *
+ * PGRAC MODIFICATIONS (spec-1.19 v0.2)
+ *
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *	Spec: spec-1.19-wal-page-header-thread-id.md
+ *
+ *	What changed:
+ *	  - XLogReaderValidatePageHeader() (~line 1262, after the existing
+ *	    magic and info bits checks): NEW validator hook that enforces
+ *	    the Stage 1 invariant `xlp_thread_id == XLP_THREAD_ID_LEGACY &&
+ *	    xlp_cluster_flags == XLP_CLUSTER_FLAGS_RESERVED`.  Catches mixed
+ *	    binaries (Stage 2+ binary writing into a datadir read by a Stage
+ *	    1 binary) and corruption that flips padding bits.  Uses the
+ *	    existing report_invalid_record() helper so the same code path
+ *	    runs in both backend (server log) and frontend (pg_waldump
+ *	    stderr) contexts.
+ *	  - XLogReaderGetThreadId() — new accessor helper that returns
+ *	    state->latestPageHeader.xlp_thread_id.  Stage 1 always returns
+ *	    XLP_THREAD_ID_LEGACY (0); spec-1.21+ feature-037 merged-apply
+ *	    consumes this for routing.
+ *
+ *	Why:
+ *	  user 反审 #2 (Q3 v0.2 修订 → B): PG's existing
+ *	  XLogReaderValidatePageHeader checks only magic / info / long
+ *	  header / pageaddr / tli — it does NOT inspect the new cluster
+ *	  fields.  spec-1.19 placeholder MUST add an explicit hook on every
+ *	  reader path; we cannot rely on PG validation auto-covering the
+ *	  new fields.
+ *	  Spec: spec-1.19-wal-page-header-thread-id.md APPROVED v0.2 D3
  */
 #include "postgres.h"
 
@@ -1275,6 +1304,33 @@ XLogReaderValidatePageHeader(XLogReaderState *state, XLogRecPtr recptr,
 		return false;
 	}
 
+	/*
+	 * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+	 * What changed: spec-1.19 -- enforce Stage 1 invariant on the
+	 * xlp_thread_id + xlp_cluster_flags placeholder fields.
+	 * Why: PG's preceding magic and info bits checks do NOT cover the
+	 * new cluster fields (user 反审 #2 / Q3 v0.2 → B).  Catches mixed
+	 * binaries and padding corruption.  Stage 2+ feature-034 will
+	 * replace this check with a real range test
+	 * (XLP_THREAD_ID_FIRST_REAL .. XLP_THREAD_ID_MAX_REAL).
+	 */
+	if (hdr->xlp_thread_id != XLP_THREAD_ID_LEGACY ||
+		hdr->xlp_cluster_flags != XLP_CLUSTER_FLAGS_RESERVED)
+	{
+		char		fname[MAXFNAMELEN];
+
+		XLogFileName(fname, state->seg.ws_tli, segno, state->segcxt.ws_segsize);
+
+		report_invalid_record(state,
+							  "invalid Stage 1 cluster fields in WAL page (thread_id=%u cluster_flags=%u; expected 0/0) in WAL segment %s, LSN %X/%X, offset %u",
+							  hdr->xlp_thread_id,
+							  hdr->xlp_cluster_flags,
+							  fname,
+							  LSN_FORMAT_ARGS(recptr),
+							  offset);
+		return false;
+	}
+
 	if (hdr->xlp_info & XLP_LONG_HEADER)
 	{
 		XLogLongPageHeader longhdr = (XLogLongPageHeader) hdr;
@@ -2206,3 +2262,23 @@ XLogRecGetFullXid(XLogReaderState *record)
 }
 
 #endif
+
+/*
+ * PGRAC (spec-1.19): cluster thread_id accessor.
+ *
+ *   Returns the xlp_thread_id of the page currently buffered in
+ *   state->readBuf.  Stage 1 always returns XLP_THREAD_ID_LEGACY (0);
+ *   spec-1.21+ feature-037 merged-apply consumes this for per-instance
+ *   routing.  Caller MUST have validated readBuf via
+ *   XLogReaderValidatePageHeader (which also enforces the Stage 1
+ *   invariant thread_id == LEGACY).
+ *
+ *   Compiled in both backend and frontend; no ereport.
+ */
+uint16
+XLogReaderGetThreadId(XLogReaderState *state)
+{
+	XLogPageHeader hdr = (XLogPageHeader) state->readBuf;
+
+	return hdr->xlp_thread_id;
+}

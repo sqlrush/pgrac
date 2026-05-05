@@ -26,6 +26,30 @@
  * src/bin/pg_resetwal/pg_resetwal.c
  *
  *-------------------------------------------------------------------------
+ *
+ * PGRAC MODIFICATIONS (spec-1.19 v0.2)
+ *
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *	Spec: spec-1.19-wal-page-header-thread-id.md
+ *
+ *	What changed:
+ *	  - WriteEmptyXLOG() (~line 1063): NO code change.  Comment-only
+ *	    addition documents that xlp_thread_id and xlp_cluster_flags
+ *	    intentionally rely on the memset(buffer.data, 0, XLOG_BLCKSZ)
+ *	    above (line 1059) to land as XLP_THREAD_ID_LEGACY +
+ *	    XLP_CLUSTER_FLAGS_RESERVED.  This mirrors how the existing
+ *	    xlp_info=0 / xlp_rem_len=0 fields work — pg_resetwal does not
+ *	    explicitly write zero-valued fields, instead relying on the
+ *	    upfront memset.
+ *
+ *	Why:
+ *	  HC1 inheritance (user 反审 #4): page header creation paths must
+ *	  be enumerated symmetrically across backend and frontend.  Stage 1
+ *	  zero placeholder is byte-identical to vanilla PG behaviour because
+ *	  the memset already zeroes the cluster fields.  Stage 2+
+ *	  feature-034 introducing non-zero defaults must amend this site to
+ *	  write XLP_THREAD_ID_FIRST_REAL + (cluster_node_id + 1) explicitly.
+ *	  Spec: spec-1.19-wal-page-header-thread-id.md APPROVED v0.2 D2-bis.
  */
 
 /*
@@ -1064,6 +1088,16 @@ WriteEmptyXLOG(void)
 	page->xlp_info = XLP_LONG_HEADER;
 	page->xlp_tli = ControlFile.checkPointCopy.ThisTimeLineID;
 	page->xlp_pageaddr = ControlFile.checkPointCopy.redo - SizeOfXLogLongPHD;
+	/*
+	 * PGRAC (spec-1.19): xlp_thread_id and xlp_cluster_flags are
+	 * intentionally NOT written here -- both rely on the
+	 * memset(buffer.data, 0, XLOG_BLCKSZ) above to land as
+	 * XLP_THREAD_ID_LEGACY (0) + XLP_CLUSTER_FLAGS_RESERVED (0).
+	 * Same convention as xlp_info=0 / xlp_rem_len=0 (relying on
+	 * the memset).  Stage 2+ feature-034 introducing non-zero defaults
+	 * must amend this site to write XLP_THREAD_ID_FIRST_REAL +
+	 * (cluster_node_id + 1) explicitly.
+	 */
 	longpage = (XLogLongPageHeader) page;
 	longpage->xlp_sysid = ControlFile.system_identifier;
 	longpage->xlp_seg_size = WalSegSz;

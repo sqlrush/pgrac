@@ -214,6 +214,37 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 */
 	{ .name = "cluster-scn-wal-write-pre" },
 	{ .name = "cluster-scn-replay-observe-pre" },
+	/*
+	 * Stage 1.19 (spec-1.19 D7) — 1 WAL page-header init point.
+	 *
+	 *   cluster-wal-page-init-thread-id: fires inside
+	 *	   AdvanceXLInsertBuffer (xlog.c:~1925) after the cluster
+	 *	   placeholder writes (xlp_thread_id = LEGACY,
+	 *	   xlp_cluster_flags = RESERVED) and before the rest of the
+	 *	   page header (XLP_BKP_REMOVABLE / XLP_LONG_HEADER setup).
+	 *
+	 *	   HC5 v0.2 (mixed PANIC-capable / ERROR-safe context;
+	 *	   user 反审 #3 落地):
+	 *	     1. Caller path xlog.c:1617 = XLogInsertRecord:796
+	 *		    START_CRIT_SECTION → :error becomes PANIC + crash
+	 *		    recovery (PG critical-section forbids ereport ERROR).
+	 *	     2. Caller path xlog.c:2829 = XLogWrite opportunistic
+	 *		    AFTER xlog.c:2820 END_CRIT_SECTION → :error is
+	 *		    ERROR-safe (rolls back transaction normally).
+	 *
+	 *	   Tests that arm :error MUST expect EITHER PANIC + crash
+	 *	   recovery OR plain ERROR depending on which caller path
+	 *	   triggers first under load.  Default fault types are
+	 *	   :skip / :warning / :crash (PANIC-safe in either context).
+	 *	   See spec-1.19 §3.3 + §4.2 069 TAP L5-L7.
+	 *
+	 *	   Unlike spec-1.18 cluster-scn-wal-write-pre (always inside
+	 *	   XactLogCommitRecord critical section, single PANIC-only
+	 *	   context) and unlike cluster-scn-replay-observe-pre (always
+	 *	   outside critical section, single ERROR-safe context), this
+	 *	   point is genuinely mixed.
+	 */
+	{ .name = "cluster-wal-page-init-thread-id" },
 };
 
 #define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_points)

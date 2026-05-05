@@ -117,22 +117,22 @@ is($node->get_cluster_state_value('ic', 'active_tier_name'),
 
 
 # ----------
-# Test 8: All 82 injection points appear with .fault_type / .hits keys
-# (76 baseline + 4 SCN 1.15 + 2 BOC 1.17 + 2 spec-1.18 WAL emit/replay).
+# Test 8: All 83 injection points appear with .fault_type / .hits keys
+# (76 baseline + 4 SCN 1.15 + 2 BOC 1.17 + 2 spec-1.18 + 1 spec-1.19).
 # ----------
 is( $node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='inject' AND key LIKE '%.fault_type'}),
-	'82',
-	'all 82 injection points have a .fault_type entry under inject category (spec-1.18 +2)');
+	'83',
+	'all 83 injection points have a .fault_type entry under inject category (spec-1.19 +1 page-init-thread-id)');
 
 is( $node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='inject' AND key LIKE '%.hits'}),
-	'82',
-	'all 82 injection points have a .hits entry under inject category (spec-1.18 +2)');
+	'83',
+	'all 83 injection points have a .hits entry under inject category (spec-1.19 +1 page-init-thread-id)');
 
 
 # ----------

@@ -7,6 +7,25 @@
  * IDENTIFICATION
  *		  src/bin/pg_waldump/pg_waldump.c
  *-------------------------------------------------------------------------
+ *
+ * PGRAC MODIFICATIONS (spec-1.19 v0.2)
+ *
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *	Spec: spec-1.19-wal-page-header-thread-id.md
+ *
+ *	What changed:
+ *	  - XLogDumpDisplayRecord(): emit `, thread: NNN` field after the
+ *	    PG-standard `lsn: ... prev ...` block, sourcing the value from
+ *	    XLogReaderGetThreadId(record).  Stage 1 always shows
+ *	    `thread: 0`; spec-1.21+ feature-037 will show real per-instance
+ *	    thread IDs.
+ *
+ *	Why:
+ *	  D4 surfaces the cluster placeholder field to operators reading
+ *	  WAL via pg_waldump.  Frontend-safe (no cluster_inject /
+ *	  cluster_scn dependencies; just reads xlog_internal.h's
+ *	  unconditional struct field).
+ *	  Spec: spec-1.19-wal-page-header-thread-id.md APPROVED v0.2 D4
  */
 
 #define FRONTEND 1
@@ -551,12 +570,18 @@ XLogDumpDisplayRecord(XLogDumpConfig *config, XLogReaderState *record)
 
 	XLogRecGetLen(record, &rec_len, &fpi_len);
 
-	printf("rmgr: %-11s len (rec/tot): %6u/%6u, tx: %10u, lsn: %X/%08X, prev %X/%08X, ",
+	/*
+	 * PGRAC (spec-1.19): emit cluster thread_id alongside the standard
+	 * record header.  Stage 1 always prints `thread: 0`; spec-1.21+
+	 * feature-037 will show real per-instance thread IDs.
+	 */
+	printf("rmgr: %-11s len (rec/tot): %6u/%6u, tx: %10u, lsn: %X/%08X, prev %X/%08X, thread: %u, ",
 		   desc->rm_name,
 		   rec_len, XLogRecGetTotalLen(record),
 		   XLogRecGetXid(record),
 		   LSN_FORMAT_ARGS(record->ReadRecPtr),
-		   LSN_FORMAT_ARGS(xl_prev));
+		   LSN_FORMAT_ARGS(xl_prev),
+		   XLogReaderGetThreadId(record));
 
 	id = desc->rm_identify(info);
 	if (id == NULL)

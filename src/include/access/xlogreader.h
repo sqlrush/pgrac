@@ -376,6 +376,14 @@ extern bool XLogReaderValidatePageHeader(XLogReaderState *state,
 extern void XLogReaderResetError(XLogReaderState *state);
 
 /*
+ * PGRAC (spec-1.19): accessor returning the cluster thread_id of the page
+ * currently buffered in state->readBuf.  Stage 1 always returns
+ * XLP_THREAD_ID_LEGACY (0); spec-1.21+ feature-037 merged-apply consumes
+ * this for routing.  Caller MUST have a validated page in readBuf.
+ */
+extern uint16 XLogReaderGetThreadId(XLogReaderState *state);
+
+/*
  * Error information from WALRead that both backend and frontend caller can
  * process.  Currently only errors from pg_pread can be reported.
  */

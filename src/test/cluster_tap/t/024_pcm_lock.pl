@@ -162,7 +162,7 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '82',
+   '83',
    'L6a pg_stat_cluster_injections has 28 entries (24 pre-1.7 + 4 PCM)');
 
 is($node->safe_psql(

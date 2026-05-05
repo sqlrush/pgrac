@@ -16,6 +16,39 @@
  *
  * src/include/access/xlog_internal.h
  */
+/*-------------------------------------------------------------------------
+ * PGRAC MODIFICATIONS (spec-1.19)
+ *
+ * Modified by: SqlRush <sqlrush@gmail.com>
+ *
+ * What changed:
+ *	1. Extend XLogPageHeaderData with xlp_thread_id (uint16) and
+ *	   xlp_cluster_flags (uint16) at offsets 20 and 22.  These two
+ *	   2-byte fields occupy the previous MAXALIGN trailing padding so
+ *	   sizeof(XLogPageHeaderData) stays exactly 24 bytes — verified by
+ *	   StaticAssertDecl below.  vanilla PG MemSet's the entire 8 KB
+ *	   page (xlog.c:1878 AdvanceXLInsertBuffer + xlog.c:4685
+ *	   BootStrapXLOG + pg_resetwal.c:1059) before writing the named
+ *	   header fields, so the on-disk byte stream is byte-identical to
+ *	   vanilla PG when both new fields land as zero.
+ *	2. Define XLP_THREAD_ID_LEGACY (= 0) as the permanent sentinel for
+ *	   "legacy / single-thread / default" pages.  Stage 1 always
+ *	   writes LEGACY; Stage 2+ feature-034 will assign real per-instance
+ *	   thread IDs starting at 1, mapping `thread_id = node_id + 1` so
+ *	   zero remains permanently reserved.
+ *
+ * Why:
+ *	spec-1.19-wal-page-header-thread-id.md establishes the structural
+ *	placeholder for AD-009 per-instance redo thread routing.  Q1=A
+ *	approve: reuse MAXALIGN padding (no on-disk growth, no catversion
+ *	bump).  Q2 sentinel rule: zero is permanently legacy; future Stage
+ *	2+ code MUST NOT assign zero to any real instance.
+ *
+ *	Spec: spec-1.19-wal-page-header-thread-id.md APPROVED 2026-05-05 v0.2
+ *	Design: docs/wal-record-format-design.md §5.1
+ *	AD-009 (Per-instance redo thread + 共享存储 + merged recovery)
+ *-------------------------------------------------------------------------
+ */
 #ifndef XLOG_INTERNAL_H
 #define XLOG_INTERNAL_H
 
@@ -47,7 +80,54 @@ typedef struct XLogPageHeaderData
 	 * header.  Note that the continuation data isn't necessarily aligned.
 	 */
 	uint32		xlp_rem_len;	/* total len of remaining data for record */
+
+	/*
+	 * PGRAC (spec-1.19): cluster fields occupying the previous MAXALIGN
+	 * trailing padding (offsets 20-23).  sizeof(XLogPageHeaderData) is
+	 * still 24 bytes — see StaticAssertDecl below.  Both fields are
+	 * permanently zero in Stage 1 (XLP_THREAD_ID_LEGACY +
+	 * XLP_CLUSTER_FLAGS_RESERVED); Stage 2+ feature-034 activates real
+	 * per-instance thread IDs starting at 1.
+	 */
+	uint16		xlp_thread_id;	/* AD-009 thread/instance; 0 = legacy sentinel */
+	uint16		xlp_cluster_flags;	/* cluster flag bits; reserved = 0 */
 } XLogPageHeaderData;
+
+/*
+ * PGRAC (spec-1.19 Q1=A invariant): page header on-disk layout is
+ * preserved.  The placeholder fields reuse the previous MAXALIGN tail
+ * padding; growth would force a catversion bump in a separate spec.
+ */
+StaticAssertDecl(sizeof(XLogPageHeaderData) == 24,
+				 "spec-1.19 Q1=A invariant: XLogPageHeaderData on-disk size "
+				 "MUST stay 24 bytes (padding reuse)");
+StaticAssertDecl(offsetof(XLogPageHeaderData, xlp_thread_id) == 20,
+				 "spec-1.19 Q1=A invariant: xlp_thread_id occupies the "
+				 "MAXALIGN tail padding starting at byte 20");
+StaticAssertDecl(offsetof(XLogPageHeaderData, xlp_cluster_flags) == 22,
+				 "spec-1.19 Q1=A invariant: xlp_cluster_flags follows "
+				 "thread_id at byte 22");
+
+/*
+ * PGRAC (spec-1.19 Q2 v0.2 sentinel rule): xlp_thread_id semantics.
+ *
+ *   XLP_THREAD_ID_LEGACY (= 0) is permanently reserved for "legacy /
+ *   single-thread / default" pages.  All Stage 1 pages, all PG 16 pages
+ *   pre-spec-1.19 (the MAXALIGN padding bytes were always zero, see
+ *   xlog.c:1878 MemSet), and all --disable-cluster builds emit LEGACY.
+ *
+ *   Stage 2+ feature-034 activates real per-instance thread IDs in the
+ *   range [XLP_THREAD_ID_FIRST_REAL, XLP_THREAD_ID_MAX_REAL] mapping
+ *   thread_id = cluster_node_id + 1, so zero remains forever a
+ *   sentinel.  Future code MUST NOT reassign zero to any real instance.
+ */
+#define XLP_THREAD_ID_LEGACY		((uint16) 0)
+#define XLP_THREAD_ID_FIRST_REAL	((uint16) 1)
+#define XLP_THREAD_ID_MAX_REAL		((uint16) 0xFFFE)
+#define XLP_THREAD_ID_INVALID		((uint16) 0xFFFF)
+
+/* Stage 1 cluster_flags is fully reserved (= 0); Stage 2+ may carve bits. */
+#define XLP_CLUSTER_FLAGS_RESERVED	((uint16) 0)
 
 #define SizeOfXLogShortPHD	MAXALIGN(sizeof(XLogPageHeaderData))
 
