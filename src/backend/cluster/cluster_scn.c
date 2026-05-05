@@ -627,7 +627,8 @@ cluster_scn_emit_broadcast_pulse(void)
 void
 cluster_scn_boc_tick(void)
 {
-	TimestampTz now;
+	/* L9 lesson: avoid `now` (shadows time.h::now()).  Use now_ts. */
+	TimestampTz now_ts;
 	uint64 cur_local;
 	uint64 prev_local;
 	uint64 batch;
@@ -639,7 +640,7 @@ cluster_scn_boc_tick(void)
 	if (cluster_scn_state == NULL)
 		return;
 
-	now = GetCurrentTimestamp();
+	now_ts = GetCurrentTimestamp();
 
 	/* Throttle: skip if elapsed < cluster.boc_sweep_interval_ms.
 	 * cluster_boc_sweep_interval_ms is millisecond-typed; convert
@@ -648,14 +649,16 @@ cluster_scn_boc_tick(void)
 		TimestampTz last;
 		long secs;
 		int usecs;
-		long delta_ms;
 
 		LWLockAcquire(&cluster_scn_state->lwlock, LW_SHARED);
 		last = cluster_scn_state->boc_last_sweep_at;
 		LWLockRelease(&cluster_scn_state->lwlock);
 
 		if (last != 0) {
-			TimestampDifference(last, now, &secs, &usecs);
+			/* delta_ms scope reduced into this branch (L23 lesson form). */
+			long delta_ms;
+
+			TimestampDifference(last, now_ts, &secs, &usecs);
 			delta_ms = secs * 1000 + usecs / 1000;
 			if (delta_ms < cluster_boc_sweep_interval_ms)
 				return;
@@ -670,8 +673,8 @@ cluster_scn_boc_tick(void)
 	cur_local = pg_atomic_read_u64(&cluster_scn_state->current_local_scn);
 	prev_local = pg_atomic_read_u64(&cluster_scn_state->boc_last_sweep_local_scn);
 	pg_atomic_write_u64(&cluster_scn_state->boc_last_sweep_local_scn, cur_local);
-	cluster_scn_state->boc_last_sweep_at = now;
-	cluster_scn_state->last_advance_at = now;
+	cluster_scn_state->boc_last_sweep_at = now_ts;
+	cluster_scn_state->last_advance_at = now_ts;
 	pg_atomic_fetch_add_u64(&cluster_scn_state->boc_sweep_count, 1);
 	scn_check_wraparound_watermark(cur_local);
 	LWLockRelease(&cluster_scn_state->lwlock);
