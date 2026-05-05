@@ -86,6 +86,17 @@ typedef struct ClusterScnSharedState {
 	TimestampTz boc_last_sweep_at;			   /* set under LWLock at sweep entry */
 	pg_atomic_uint64 boc_last_sweep_local_scn; /* local_scn at last sweep entry */
 	pg_atomic_uint64 boc_max_batch_size;	   /* atomic-max via CAS */
+	/*
+	 * Hardening v1.0.1 (round 10 P2): boc_last_batch_size stores the
+	 * delta computed at the LAST sweep (cur_local at sweep entry minus
+	 * prev_local recorded by the previous sweep).  Distinct from the
+	 * "pending since last sweep" lock-free helper which always returns
+	 * the live delta from now.  The exposed pg_cluster_state key
+	 * `scn_boc_pending_at_last_sweep` reads this field so the name
+	 * matches semantics: "what was pending at the moment the last
+	 * sweep ran" (a snapshot, not a live value).
+	 */
+	pg_atomic_uint64 boc_last_batch_size; /* set under LWLock at sweep */
 } ClusterScnSharedState;
 
 
@@ -183,7 +194,20 @@ scn_recovery_cmp(SCN a, XLogRecPtr a_lsn, NodeId a_node, SCN b, XLogRecPtr b_lsn
  * Wraparound watermark check (spec-1.15 D7; Q9 + L6)
  * ============================================================
  *
- *	Caller holds cluster_scn_state->lwlock LW_EXCLUSIVE.
+ *	Hardening v1.0.1 (round 10 P3): the WARNING throttle uses a
+ *	module-static `last_warn_emitted_at` (TimestampTz).  This function
+ *	must be safe to call without holding cluster_scn_state->lwlock --
+ *	spec-1.17 observe() invokes it from inside the lock-free CAS retry
+ *	loop, while boc_tick() invokes it under LW_EXCLUSIVE for snapshot
+ *	coherence with boc_last_sweep_at.  Both call paths are correct in
+ *	v1.0.0: the static variable is single-writer-via-throttle (a brief
+ *	race produces at most a duplicate WARNING within the 1/min window,
+ *	never a missed PANIC).  PANIC ereport is unconditional and not
+ *	state-dependent.
+ *
+ *	If a future change adds shared state with stronger consistency
+ *	requirements, split this function into a lock-free threshold gate
+ *	+ a separately-locked WARNING throttle.
  */
 static void
 scn_check_wraparound_watermark(uint64 current)
@@ -672,15 +696,24 @@ cluster_scn_boc_tick(void)
 	LWLockAcquire(&cluster_scn_state->lwlock, LW_EXCLUSIVE);
 	cur_local = pg_atomic_read_u64(&cluster_scn_state->current_local_scn);
 	prev_local = pg_atomic_read_u64(&cluster_scn_state->boc_last_sweep_local_scn);
+	batch = (cur_local >= prev_local) ? (cur_local - prev_local) : 0;
 	pg_atomic_write_u64(&cluster_scn_state->boc_last_sweep_local_scn, cur_local);
+	pg_atomic_write_u64(&cluster_scn_state->boc_last_batch_size, batch);
 	cluster_scn_state->boc_last_sweep_at = now_ts;
-	cluster_scn_state->last_advance_at = now_ts;
+	/*
+	 * Hardening v1.0.1 (round 10 P2): only refresh last_advance_at
+	 * when current_local_scn actually advanced since the last sweep.
+	 * Pre fix: every sweep refreshed last_advance_at, making it
+	 * indistinguishable from boc_last_sweep_at and misleading
+	 * operators about whether transactions actually progressed.
+	 */
+	if (cur_local != prev_local)
+		cluster_scn_state->last_advance_at = now_ts;
 	pg_atomic_fetch_add_u64(&cluster_scn_state->boc_sweep_count, 1);
 	scn_check_wraparound_watermark(cur_local);
 	LWLockRelease(&cluster_scn_state->lwlock);
 
 	/* atomic-max via CAS for boc_max_batch_size */
-	batch = (cur_local >= prev_local) ? (cur_local - prev_local) : 0;
 	for (;;) {
 		cur_max = pg_atomic_read_u64(&cluster_scn_state->boc_max_batch_size);
 		if (batch <= cur_max)
@@ -737,19 +770,17 @@ cluster_scn_boc_last_sweep_at(void)
 uint64
 cluster_scn_boc_pending_at_last_sweep(void)
 {
-	/* Last-sweep pending = (current_local at sweep entry - prev_local).
-	 * We don't store this directly; recompute as
-	 * (boc_last_sweep_local_scn - some-prev) — but we only kept the
-	 * monotonic boc_last_sweep_local_scn.  Best lock-free approximation:
-	 * the most recent batch is computed inside boc_tick and stashed in
-	 * boc_max_batch_size (running max).  Expose pending as the running
-	 * delta between current and last-sweep marker. */
-	uint64 cur, prev;
-
+	/*
+	 * Hardening v1.0.1 (round 10 P2): this accessor backs the SQL
+	 * key `scn_boc_pending_at_last_sweep`, which the name promises to
+	 * be "what was pending at the moment the last sweep ran" -- a
+	 * snapshot.  Pre fix: returned the live delta (cur - boc_last_
+	 * sweep_local_scn) which is the delta SINCE the last sweep, not
+	 * AT it.  Now reads the dedicated boc_last_batch_size field
+	 * written under LWLock at sweep entry.
+	 */
 	Assert(cluster_scn_state != NULL);
-	cur = pg_atomic_read_u64(&cluster_scn_state->current_local_scn);
-	prev = pg_atomic_read_u64(&cluster_scn_state->boc_last_sweep_local_scn);
-	return (cur >= prev) ? (cur - prev) : 0;
+	return pg_atomic_read_u64(&cluster_scn_state->boc_last_batch_size);
 }
 
 uint64
@@ -796,6 +827,7 @@ cluster_scn_shmem_init(void)
 		cluster_scn_state->boc_last_sweep_at = 0;
 		pg_atomic_init_u64(&cluster_scn_state->boc_last_sweep_local_scn, 0);
 		pg_atomic_init_u64(&cluster_scn_state->boc_max_batch_size, 0);
+		pg_atomic_init_u64(&cluster_scn_state->boc_last_batch_size, 0);
 	}
 }
 

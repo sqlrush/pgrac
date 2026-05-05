@@ -297,16 +297,27 @@ WalWriterMain(void)
 		 * silently no-ops (spec-1.16.1 L20 lesson inheritance).
 		 * Why: spec-1.17 v0.2 Q4 anchor; ereport-safe (no critical
 		 * section); see cluster_scn.c::cluster_scn_boc_tick().
+		 *
+		 * Hardening v1.0.1 (round 10 P1): the cur_timeout cap and
+		 * hibernate inhibition are now gated behind cluster_enabled
+		 * (was: always-on with internal no-op).  Reason: when
+		 * cluster.enabled=off, capping cur_timeout to
+		 * cluster_boc_sweep_interval_ms (default 1ms) caused walwriter
+		 * to wake 200x more often than vanilla PG (wal_writer_delay
+		 * default 200ms).  That broke the "cluster.enabled=off
+		 * degrades to vanilla PG" runtime contract: idle CPU/wake-rate
+		 * regression even though boc_tick itself was a no-op.
 		 */
 		cluster_scn_boc_tick();
 
 		/*
-		 * PGRAC: hibernate inhibition (spec-1.17 v0.2 Q4).  If SCN
-		 * advanced since the last sweep, reset hibernation counter so
-		 * the next iteration runs the BOC sweep promptly rather than
-		 * sleeping for a hibernate-multiplied interval.
+		 * PGRAC: hibernate inhibition (spec-1.17 v0.2 Q4).  Gated on
+		 * cluster_enabled (round 10 P1) -- when cluster.enabled=off,
+		 * BOC sweep doesn't run and "pending since last sweep" is
+		 * meaningless; walwriter should hibernate per vanilla PG.
 		 */
-		if (cluster_scn_boc_pending_since_last_sweep() > 0)
+		if (cluster_enabled
+			&& cluster_scn_boc_pending_since_last_sweep() > 0)
 			left_till_hibernate = LOOPS_UNTIL_HIBERNATE;
 #endif
 
@@ -325,15 +336,17 @@ WalWriterMain(void)
 
 #ifdef USE_PGRAC_CLUSTER
 		/*
-		 * PGRAC: cur_timeout cap (spec-1.17 v0.2 Q4).  walwriter must
-		 * wake at least every cluster.boc_sweep_interval_ms so BOC tick
-		 * meets staleness target.  Without this cap, WalWriterDelay
-		 * (default 200ms) dominates and 1ms-class sweep target is
-		 * unreachable.  cluster_enabled=off case: tick is a no-op so
-		 * cap-to-1ms is harmless extra wake; choose to keep gate
-		 * lightweight (no per-tick branch).
+		 * PGRAC: cur_timeout cap (spec-1.17 v0.2 Q4) -- gated on
+		 * cluster_enabled (round 10 P1).  walwriter must wake at least
+		 * every cluster.boc_sweep_interval_ms so BOC tick meets
+		 * staleness target.  When cluster.enabled=off, the cap is
+		 * suppressed so walwriter falls back to vanilla PG
+		 * WalWriterDelay sleep behaviour (preserves the "vanilla PG
+		 * runtime contract" promised by cluster_finalize_startup_
+		 * running()'s docstring).
 		 */
-		cur_timeout = Min(cur_timeout, cluster_boc_sweep_interval_ms);
+		if (cluster_enabled)
+			cur_timeout = Min(cur_timeout, cluster_boc_sweep_interval_ms);
 #endif
 
 		(void) WaitLatch(MyLatch,

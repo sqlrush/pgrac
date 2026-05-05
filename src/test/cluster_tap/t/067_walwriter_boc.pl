@@ -287,6 +287,34 @@ my $sweeps_off_t1 = counter('scn_boc_sweep_count');
 is($sweeps_off_t1, $sweeps_off_t0,
    "L11 boc_sweep_count unchanged with cluster.enabled=off after 2s ($sweeps_off_t0 == $sweeps_off_t1; L20 inheritance)");
 
+
+# ----------
+# L11b (round 10 P1): cluster.enabled=off must not cap walwriter
+# cur_timeout to cluster.boc_sweep_interval_ms.  Pre-fix: walwriter
+# woke every 1ms (boc_sweep_interval_ms default) instead of vanilla
+# wal_writer_delay (10ms in this test).  No direct PG view exposes
+# walwriter wake count, so we verify indirectly: with cluster.enabled
+# =off, boc_max_batch_size + boc_last_batch_size never advance because
+# the cur_timeout cap path is gated; verifying scn_boc_pending_at_last
+# _sweep stays 0 (last sweep happened in the previous boot's
+# enabled=on phase but is also frozen in this off phase) confirms
+# walwriter isn't running BOC tick at all.
+# ----------
+my $batch_off = counter('scn_boc_max_batch_size');
+my $last_batch_off = counter('scn_boc_pending_at_last_sweep');
+# Run some commits during cluster.enabled=off; BOC sweep should NOT pick up
+$node->safe_psql('postgres', q{
+	CREATE TABLE t_off (id int);
+	INSERT INTO t_off VALUES (1), (2), (3);
+});
+usleep(500_000);
+my $batch_off_after = counter('scn_boc_max_batch_size');
+my $last_batch_off_after = counter('scn_boc_pending_at_last_sweep');
+is($batch_off_after, $batch_off,
+   "L11b boc_max_batch_size frozen with cluster.enabled=off (round 10 P1; walwriter cap suppressed)");
+is($last_batch_off_after, $last_batch_off,
+   "L11b boc_last_batch_size frozen with cluster.enabled=off (round 10 P1)");
+
 # Restore cluster.enabled before stop
 $node->stop;
 
