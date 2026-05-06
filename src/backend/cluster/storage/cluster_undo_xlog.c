@@ -60,16 +60,23 @@
  *   only instance_0 from initdb; redo path may need other instance
  *   subdirs on standbys / cross-instance crash recovery).
  *
+ *   Hardening v1.0.4 P1-1: directory naming uses cluster_node_id
+ *   (= owner_instance - 1) so that single-node default
+ *   (cluster_node_id = 0, owner_instance = 1) lands at instance_0/
+ *   matching the initdb seed.  See cluster_undo_alloc.c
+ *   cluster_undo_path_resolve docstring for full rationale.
+ *
  *   Returns 0 on success, -1 on path-too-long.  Caller supplies
  *   buf with capacity >= MAXPGPATH.
  */
 static int
-build_undo_segment_path(uint8 instance, uint32 segment_id, char *buf, size_t buf_size)
+build_undo_segment_path(uint8 owner_instance, uint32 segment_id, char *buf, size_t buf_size)
 {
 	int ret;
 
-	ret = snprintf(buf, buf_size, "%s/pg_undo/instance_%u/seg_%u.dat", DataDir, (unsigned)instance,
-				   (unsigned)segment_id);
+	Assert(owner_instance >= 1 && owner_instance <= UNDO_OWNER_INSTANCE_MAX);
+	ret = snprintf(buf, buf_size, "%s/pg_undo/instance_%u/seg_%u.dat", DataDir,
+				   (unsigned)(owner_instance - 1), (unsigned)segment_id);
 	if (ret < 0 || (size_t)ret >= buf_size)
 		return -1;
 	return 0;
@@ -88,15 +95,19 @@ build_undo_segment_path(uint8 instance, uint32 segment_id, char *buf, size_t buf
  *   established by initdb (D4) and assumed to exist.
  */
 static void
-ensure_undo_instance_subdir(uint8 instance)
+ensure_undo_instance_subdir(uint8 owner_instance)
 {
 	char path[MAXPGPATH];
 	int ret;
 
-	ret = snprintf(path, sizeof(path), "%s/pg_undo/instance_%u", DataDir, (unsigned)instance);
+	Assert(owner_instance >= 1 && owner_instance <= UNDO_OWNER_INSTANCE_MAX);
+
+	/* directory uses cluster_node_id (= owner_instance - 1) per Hardening v1.0.4 P1-1 */
+	ret = snprintf(path, sizeof(path), "%s/pg_undo/instance_%u", DataDir,
+				   (unsigned)(owner_instance - 1));
 	if (ret < 0 || (size_t)ret >= sizeof(path))
-		ereport(PANIC,
-				(errmsg("undo instance subdir path too long: instance=%u", (unsigned)instance)));
+		ereport(PANIC, (errmsg("undo instance subdir path too long: owner_instance=%u",
+							   (unsigned)owner_instance)));
 
 	if (mkdir(path, S_IRWXU) != 0 && errno != EEXIST)
 		ereport(PANIC, (errcode_for_file_access(),
@@ -245,8 +256,9 @@ cluster_undo_redo_segment_init(XLogReaderState *record)
 		char dir[MAXPGPATH];
 		int dret;
 
+		/* directory uses cluster_node_id (= owner_instance - 1) per Hardening v1.0.4 P1-1 */
 		dret = snprintf(dir, sizeof(dir), "%s/pg_undo/instance_%u", DataDir,
-						(unsigned)hdr->instance);
+						(unsigned)(hdr->instance - 1));
 		if (dret >= 0 && (size_t)dret < sizeof(dir))
 			fsync_fname(dir, true);
 	}

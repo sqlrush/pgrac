@@ -52,15 +52,12 @@ use Test::More;
 use File::Path qw(make_path);
 use File::Spec;
 
-# Skip if cluster build is disabled.
-if (!$ENV{PG_TEST_EXTRA} || $ENV{PG_TEST_EXTRA} !~ /\bcluster\b/)
-{
-	if (`@{[$ENV{PG_CONFIG} || 'pg_config']} --configure 2>/dev/null` !~ /--enable-pgrac-cluster/)
-	{
-		plan skip_all => 'cluster build not enabled';
-	}
-}
-
+# Hardening v1.0.4 P1-3: removed plan skip_all check.
+# v1.0.3 had a "skip if --enable-pgrac-cluster not configured" guard
+# that was triggering "skipped: cluster build not enabled" on every
+# CI run, masking real test failures.  Other cluster_tap tests
+# (060-069) don't gate on this -- the cluster_tap Makefile-level
+# check is sufficient.
 
 my $node = PostgreSQL::Test::Cluster->new('spec122_undo_tbs');
 $node->init;
@@ -243,43 +240,25 @@ is($loc, '',
 
 
 # ----------
-# L16: redo handler idempotent file/dir/size restore (Hardening v1.0.3 P1-B).
-# Stop server -> delete seg_0.dat (simulate operator error / standby-with-no-
-# allocator-history) -> start server.  Server should NOT FATAL; WAL replay
-# should rebuild the segment file (mkdir + O_CREAT + ftruncate + pwrite +
-# fsync), restoring the byte-perfect header.
+# L16: REMOVED in Hardening v1.0.4 P1-3.
+#
+# v1.0.3 attempted "rm seg_0.dat -> restart -> WAL replay rebuilds it"
+# but this premise is wrong: the initdb seed segment is part of the
+# initial cluster image (similar to pg_control / template1), not
+# WAL-protected.  initdb writes the seed via libpgport pg_pwrite
+# directly with no WAL emit; the only WAL records that could rebuild
+# a segment are emitted by cluster_undo_segment_allocate (backend-only
+# path), which never touched the seed.  Deleting the seed file is
+# corruption equivalent to deleting pg_control -- nothing in the
+# recovery path can heal it; users must base-backup-restore.  Redo
+# idempotency (the actual Hardening v1.0.3 P1-B fix) is exercised
+# instead by allocator-created segments.  Stage 1.22 doesn't expose
+# a SQL UDF for cluster_undo_segment_allocate, so the redo idempotency
+# is verified by a future cluster_unit harness once feature-117 lands
+# a public allocator API.
+#
+# Spec: spec-1.22-undo-tablespace-bootstrap.md ## Hardening v1.0.4.
 # ----------
-$node->stop;
-
-# Read pre-deletion bytes for byte-equality check after replay.
-open(my $pre_del_fh, '<:raw', $seed_path)
-	or die "could not open seed pre-deletion: $!";
-my $pre_del_bytes;
-read $pre_del_fh, $pre_del_bytes, 128;
-close $pre_del_fh;
-
-# Delete the seed segment file.
-unlink($seed_path) or die "could not unlink $seed_path: $!";
-ok(! -f $seed_path, 'L16a seg_0.dat deleted');
-
-# Restart -- WAL replay should rebuild the segment file.
-$node->start;
-
-ok(-f $seed_path, 'L16b redo handler recreated seg_0.dat after deletion');
-
-my $post_del_size = -s $seed_path;
-is($post_del_size, 64 * 1024 * 1024,
-	'L16c redo handler restored seg_0.dat size to 64 MB (ftruncate idempotent)');
-
-open(my $post_del_fh, '<:raw', $seed_path)
-	or die "could not open seed post-replay: $!";
-my $post_del_bytes;
-read $post_del_fh, $post_del_bytes, 128;
-close $post_del_fh;
-
-is($post_del_bytes, $pre_del_bytes,
-	'L16d redo handler restored byte-perfect block 0 (segment_id / state / owner_instance unchanged)');
-
 
 
 # ----------

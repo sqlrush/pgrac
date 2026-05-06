@@ -55,7 +55,7 @@
 /*
  * On-disk WAL payload layout for XLOG_UNDO_SEGMENT_INIT.
  *
- *   payload = 6-byte fixed header + BLCKSZ-byte page image.
+ *   payload = 12-byte fixed header + BLCKSZ-byte page image.
  *   Stored sequentially in a single XLogRegisterData block.
  *
  *   v0.2 P1-A: payload uses a custom path-based identification
@@ -63,14 +63,36 @@
  *   because pg_undo/ files live outside PG's relfilenode namespace.
  *   redo handler resolves the path via cluster_undo_path_resolve()
  *   and pwrites directly.
+ *
+ *   Hardening v1.0.4 P2-1: header is 12 bytes (not the "6-byte"
+ *   v1.0.3 doc claimed); _pad[1] + _pad2[2] add up to 5 padding bytes
+ *   that round segment_id to its uint32 8-byte alignment slot
+ *   (1 + 1 + 4 + 4 = 10 bytes data; layout pads to offset 8 for
+ *   segment_id, total struct size 12).  StaticAssertDecl below locks
+ *   the on-disk WAL ABI; future maintainers see the assert fire if
+ *   a field add / reorder breaks cross-version replay.
  */
 typedef struct xl_cluster_undo_segment_init {
-	uint8 instance;	   /* owner instance (1..128); spec-1.21 Q5 */
-	uint8 _pad[1];	   /* alignment pad */
-	uint16 _pad2[2];   /* alignment pad to 8 bytes */
+	uint8 instance;	   /* offset 0; 1 byte; owner instance (1..128); spec-1.21 Q5 */
+	uint8 _pad[1];	   /* offset 1; 1 byte; alignment pad */
+	uint16 _pad2[2];   /* offset 2; 4 bytes; pad up to uint32 alignment */
 	uint32 segment_id; /* offset 8; 4 bytes */
 					   /* Followed by char page_image[BLCKSZ] (segment header block 0). */
 } xl_cluster_undo_segment_init;
+
+/*
+ * WAL ABI invariants (Hardening v1.0.4 P2-1; lessons SSOT L45 ext).
+ *
+ *   StaticAssertDecl locks struct size + segment_id offset so cross-
+ *   version replay (mixed 1.22 / 1.23+ binaries) catches incompatible
+ *   field add / reorder at compile time.
+ */
+StaticAssertDecl(sizeof(xl_cluster_undo_segment_init) == 12,
+				 "xl_cluster_undo_segment_init must be exactly 12 bytes "
+				 "(WAL ABI lock; Hardening v1.0.4 P2-1)");
+StaticAssertDecl(offsetof(xl_cluster_undo_segment_init, segment_id) == 8,
+				 "xl_cluster_undo_segment_init.segment_id must be at offset 8 "
+				 "(uint32 8-byte alignment slot; Hardening v1.0.4 P2-1)");
 
 
 /*

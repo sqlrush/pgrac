@@ -51,17 +51,33 @@
  * cluster_undo_path_resolve
  *
  *   Pure path builder (no I/O, no errors apart from buffer overflow).
+ *
+ *   Hardening v1.0.4 P1-1 (directory naming separation):
+ *     - The owner_instance VALUE in headers / WAL payloads is
+ *       (cluster_node_id + 1), so 0 stays the "unallocated" sentinel.
+ *     - The DIRECTORY NAME on disk uses cluster_node_id directly
+ *       (= owner_instance - 1) so that single-node default
+ *       (cluster_node_id = 0) lays out at pg_undo/instance_0/...
+ *       matching the initdb seed segment (also at instance_0/).
+ *       Otherwise allocator segments would land at instance_1/ and
+ *       split from the seed, breaking the per-instance subdir
+ *       invariant.
+ *
+ *   Caller MUST pass owner_instance in [1, UNDO_OWNER_INSTANCE_MAX];
+ *   the assert catches sentinel-0 misuse.
  */
 int
-cluster_undo_path_resolve(uint8 instance, uint32 segment_id, char *buf, size_t buf_size)
+cluster_undo_path_resolve(uint8 owner_instance, uint32 segment_id, char *buf, size_t buf_size)
 {
 	int ret;
 
 	if (buf == NULL || buf_size == 0)
 		return -1;
+	Assert(owner_instance >= 1 && owner_instance <= UNDO_OWNER_INSTANCE_MAX);
 
-	ret = snprintf(buf, buf_size, "%s/pg_undo/instance_%u/seg_%u.dat", DataDir, (unsigned)instance,
-				   (unsigned)segment_id);
+	/* directory uses cluster_node_id (= owner_instance - 1) */
+	ret = snprintf(buf, buf_size, "%s/pg_undo/instance_%u/seg_%u.dat", DataDir,
+				   (unsigned)(owner_instance - 1), (unsigned)segment_id);
 	if (ret < 0 || (size_t)ret >= buf_size)
 		return -1;
 	return 0;
@@ -111,16 +127,21 @@ open_or_create_segment(const char *path, bool *out_created)
  * rejects it, but if a future caller does, mkdir() handles it.
  */
 static void
-ensure_instance_subdir(uint8 instance)
+ensure_instance_subdir(uint8 owner_instance)
 {
 	char path[MAXPGPATH];
 	int ret;
 
-	ret = snprintf(path, sizeof(path), "%s/pg_undo/instance_%u", DataDir, (unsigned)instance);
+	Assert(owner_instance >= 1 && owner_instance <= UNDO_OWNER_INSTANCE_MAX);
+
+	/* directory uses cluster_node_id (= owner_instance - 1); see
+	 * cluster_undo_path_resolve docstring. */
+	ret = snprintf(path, sizeof(path), "%s/pg_undo/instance_%u", DataDir,
+				   (unsigned)(owner_instance - 1));
 	if (ret < 0 || (size_t)ret >= sizeof(path))
-		ereport(ERROR,
-				(errcode(ERRCODE_NAME_TOO_LONG),
-				 errmsg("undo instance subdir path too long: instance=%u", (unsigned)instance)));
+		ereport(ERROR, (errcode(ERRCODE_NAME_TOO_LONG),
+						errmsg("undo instance subdir path too long: owner_instance=%u",
+							   (unsigned)owner_instance)));
 
 	if (mkdir(path, S_IRWXU) < 0 && errno != EEXIST)
 		ereport(ERROR, (errcode_for_file_access(),
@@ -171,24 +192,30 @@ cluster_undo_segment_allocate(uint32 segment_id, uint8 owner_instance)
 	ensure_instance_subdir(owner_instance);
 
 	fd = open_or_create_segment(path, &created);
+	(void)created; /* tracked for logging/observability; ftruncate is unconditional */
 
 	cluster_undo_segment_make_header_bytes(segment_id, owner_instance, page.data);
 
 	/*
-	 * Extend file to UNDO_SEGMENT_SIZE_BYTES on first creation.  ftruncate
-	 * gives a sparse file (tail bytes read as zero); the allocator path
-	 * writes actual undo records lazily later.
+	 * Hardening v1.0.4 P1-2: unconditional ftruncate.
+	 *
+	 * v1.0.3 only ftruncate'd when created=true, but a crash between
+	 * O_CREAT and ftruncate leaves a partial / zero-size orphan file.
+	 * The next allocate call sees the existing file, so created=false,
+	 * and the file would never reach UNDO_SEGMENT_SIZE_BYTES -- segment
+	 * tail accesses would EOF.  ftruncate is idempotent (shrink-to-same
+	 * and extend-to-target are both no-ops when size already matches),
+	 * so unconditional is safe and self-healing.  Mirrors the redo
+	 * handler's 6-step idempotent pattern (cluster_undo_xlog.c).
 	 */
-	if (created) {
-		if (ftruncate(fd, (off_t)UNDO_SEGMENT_SIZE_BYTES) != 0) {
-			int save_errno = errno;
+	if (ftruncate(fd, (off_t)UNDO_SEGMENT_SIZE_BYTES) != 0) {
+		int save_errno = errno;
 
-			close(fd);
-			errno = save_errno;
-			ereport(ERROR, (errcode_for_file_access(),
-							errmsg("could not extend undo segment file \"%s\" to %d bytes: %m",
-								   path, UNDO_SEGMENT_SIZE_BYTES)));
-		}
+		close(fd);
+		errno = save_errno;
+		ereport(ERROR, (errcode_for_file_access(),
+						errmsg("could not extend undo segment file \"%s\" to %d bytes: %m", path,
+							   UNDO_SEGMENT_SIZE_BYTES)));
 	}
 
 	written = pg_pwrite(fd, page.data, BLCKSZ, 0);
@@ -215,6 +242,21 @@ cluster_undo_segment_allocate(uint32 segment_id, uint8 owner_instance)
 	if (close(fd) != 0)
 		ereport(ERROR, (errcode_for_file_access(),
 						errmsg("could not close undo segment file \"%s\": %m", path)));
+
+	/*
+	 * Hardening v1.0.4 P1-2: fsync parent directory after file creation /
+	 * truncate.  Required for the create case so the dirent is durable;
+	 * harmless for the already-exists case.  Mirrors redo handler.
+	 */
+	{
+		char dir[MAXPGPATH];
+		int dret;
+
+		dret = snprintf(dir, sizeof(dir), "%s/pg_undo/instance_%u", DataDir,
+						(unsigned)(owner_instance - 1));
+		if (dret >= 0 && (size_t)dret < sizeof(dir))
+			fsync_fname(dir, true);
+	}
 
 	/*
 	 * Emit WAL record so crash recovery can recreate the header (the
