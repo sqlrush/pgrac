@@ -12,12 +12,21 @@ unchanged.
 
 ## Status
 
-**Stage 0 in progress.**  Cluster subsystem scaffolding is in place:
-GUCs / shmem / IPC abstraction / topology / system views / wait
-events / pgrac-init bootstrap tools.  Cross-node functionality
-(GES / PCM / Cache Fusion / Reconfiguration / Recovery) is
-scaffolded but not yet active; operations that would require it
-return `ERRCODE_FEATURE_NOT_SUPPORTED`.
+**Stage 1 in progress.**  Stage 0 (cluster subsystem scaffolding -- GUCs /
+shmem / IPC abstraction / topology / system views / wait events /
+pgrac-init bootstrap tools) is complete.  Stage 1 has shipped block
+format extensions (PageHeader pd_block_scn / ITL slot array / BufferDesc
+cluster fields), commit local_scn maintenance, walwriter BOC, WAL
+record xl_scn, WAL Page Header xlp_thread_id, and the dedicated undo
+tablespace (`pg_undo` OID 9100) atomic batch.  Cross-node functionality
+(GES / PCM / Cache Fusion / Reconfiguration / Recovery) is scaffolded
+but not yet active; operations that would require it return
+`ERRCODE_FEATURE_NOT_SUPPORTED`.
+
+Stage 1 OLTP performance regression vs vanilla PG 16.13 is verified by
+`scripts/perf/run-stage1-oltp-baseline.sh` (manual; ~4.5 hour `--full`
+run; pgbench TPC-B 27 combos across 3 scales × 3 modes × 3 client
+levels).  See pgrac private docs for measured baselines.
 
 ## Documentation
 
