@@ -75,7 +75,8 @@ UT_TEST(test_macro_version_major)
 
 UT_TEST(test_macro_version_minor)
 {
-	UT_ASSERT_EQ(PGRAC_VERSION_MINOR, 2);
+	/* Spec-2.1 D8: bump 2 -> 8 (Q-I versioning ladder Stage 2 entry). */
+	UT_ASSERT_EQ(PGRAC_VERSION_MINOR, 8);
 }
 
 UT_TEST(test_macro_pg_base_version)

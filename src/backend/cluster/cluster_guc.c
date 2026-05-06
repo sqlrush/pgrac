@@ -122,6 +122,22 @@ bool cluster_enabled = true;
 
 
 /*
+ * cluster.allow_single_node (spec-2.1 D1; Stage 2.1 backward-compat
+ * mode gate).
+ *
+ *	Stage 2.1 default = true permits Stage 1.X single-node fallback
+ *	when pgrac.conf is absent or cluster.node_id is unset (-1).  Set
+ *	to false to enforce strict multi-node validation.
+ *
+ *	BOUNDARY INVARIANT (spec-2.1 §3.5):  allow_single_node = on ONLY
+ *	permits fallback when multi-node configuration is absent.  It does
+ *	NOT downgrade malformed or explicit multi-node configuration
+ *	errors -- those still FATAL regardless of allow_single_node value.
+ */
+bool cluster_allow_single_node = true;
+
+
+/*
  * Mapping from the cluster.interconnect_tier GUC enum string to the
  * ClusterICTier C enum.  PG's GUC machinery copies the int into
  * cluster_interconnect_tier; cluster_ic_init then dispatches.  The
@@ -511,4 +527,25 @@ cluster_init_guc(void)
 					 "pgbench on a cluster-built binary without the cluster "
 					 "control plane."),
 		&cluster_enabled, true, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	/*
+	 * cluster.allow_single_node (spec-2.1 D1; Stage 2.1 backward-compat
+	 * mode gate).  Boot value matches storage initialiser (true) so reads
+	 * before this registration runs see the safe default.  Boundary
+	 * invariant (spec-2.1 §3.5): allow_single_node = on permits fallback
+	 * ONLY when multi-node configuration is absent; malformed conf still
+	 * FATAL.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.allow_single_node",
+		gettext_noop("Allow pgrac to start in single-node mode "
+					 "(no pgrac.conf or invalid cluster.node_id)."),
+		gettext_noop("When on (Stage 2.1 default for backward compatibility), "
+					 "pgrac.conf missing or cluster.node_id invalid emits WARNING "
+					 "and falls back to single-node operation.  When off (Stage 2 "
+					 "strict mode), such conditions emit FATAL during postmaster "
+					 "startup.  This flag does NOT downgrade malformed or explicit "
+					 "multi-node configuration errors -- those still FATAL "
+					 "regardless of this value (spec-2.1 §3.5 boundary invariant)."),
+		&cluster_allow_single_node, true, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 }

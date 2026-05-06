@@ -543,8 +543,31 @@ cluster_conf_load(void)
 
 	if (stat(path, &st) != 0) {
 		if (errno == ENOENT) {
-			load_single_node_fallback(path);
-			return;
+			/*
+			 * Spec-2.1 D3 (2026-05-06): pgrac.conf-absent path gated on
+			 * cluster.allow_single_node.  When on (Stage 2.1 default,
+			 * backward-compat), fall back to single-node mode.  When off
+			 * (Stage 2 strict), FATAL per spec-2.0 §3 Invariant 3
+			 * "uncertainty fail-closed".
+			 *
+			 * BOUNDARY INVARIANT (spec-2.1 §3.5): allow_single_node is
+			 * checked ONLY in this ENOENT path.  All other error branches
+			 * (parser failures / collision / out-of-range / invalid addr /
+			 * assert_self_in_topology) ereport(FATAL) unconditionally --
+			 * see post_validate() etc below.  Do NOT extend allow_single_node
+			 * to swallow malformed conf errors; that is an explicit anti-
+			 * pattern (see spec-2.1 §3.5 reverse code example).
+			 */
+			if (cluster_allow_single_node) {
+				load_single_node_fallback(path);
+				return;
+			}
+			ereport(FATAL,
+					(errcode(ERRCODE_CONFIG_FILE_ERROR),
+					 errmsg("pgrac.conf is required when cluster.allow_single_node is off"),
+					 errhint("Create pgrac.conf with node entries, or set "
+							 "cluster.allow_single_node = on for single-node "
+							 "compatibility mode.")));
 		}
 		ereport(FATAL, (errcode_for_file_access(),
 						errmsg("cluster_conf: could not stat \"%s\": %m", path)));

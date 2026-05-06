@@ -1088,24 +1088,47 @@ cluster_finalize_startup_running(void)
 	/*
 	 * Spec-1.16 v0.2 Q9 / D13: surface cluster.node_id BEFORE entering
 	 * RUNNING so admins notice misconfiguration at startup rather than
-	 * mid-transaction.  Stage 1.16 single-node fallback (-1) is still
-	 * functional (commit/abort hooks skip the SCN advance silently --
-	 * see cluster_scn_skip_hook_in_pre_running), so we emit WARNING
-	 * here rather than FATAL.  Stage 2+ multi-node spec will tighten
-	 * this to FATAL once cross-instance protocols make node_id
-	 * mandatory.
+	 * mid-transaction (per L18 startup-time validation).
 	 *
-	 * cluster_enabled=off path skips entirely (no warning).
+	 * Spec-2.1 D2 (Stage 2.1 tightening, 2026-05-06): WARNING/FATAL dual
+	 * path gated on cluster.allow_single_node:
+	 *   - allow_single_node = on  (Stage 2.1 default; backward-compat):
+	 *       WARNING + single-node fallback (Stage 1.16 behavior preserved
+	 *       so frozen Stage 1 specs keep working unchanged).
+	 *   - allow_single_node = off (Stage 2 strict mode):
+	 *       FATAL -- per spec-2.0 §3 Invariant 3 "uncertainty fail-closed".
+	 *
+	 * cluster_enabled = off path skips entirely (no warning, no FATAL --
+	 * vanilla PG behaviour).
 	 */
 	if (cluster_enabled && !SCN_NODE_ID_VALID(cluster_node_id))
-		ereport(WARNING,
-				(errcode(ERRCODE_WARNING),
-				 errmsg("cluster.node_id (%d) is outside the valid range 0..%d; cluster SCN "
-						"advance will silently skip",
-						cluster_node_id, SCN_MAX_VALID_NODE_ID),
-				 errhint("Set cluster.node_id in postgresql.conf to an integer 0..127 to enable "
-						 "SCN advance, or set cluster_enabled=off for vanilla PG behaviour.  Stage "
-						 "2+ multi-node will require a valid node_id.")));
+	{
+		if (cluster_allow_single_node)
+		{
+			/* Stage 2.1 backward-compat path: WARNING + single-node fallback */
+			ereport(WARNING,
+					(errcode(ERRCODE_WARNING),
+					 errmsg("cluster.node_id (%d) is outside the valid range 0..%d; "
+							"cluster SCN advance will silently skip",
+							cluster_node_id, SCN_MAX_VALID_NODE_ID),
+					 errhint("Set cluster.node_id in postgresql.conf to an integer 0..127 "
+							 "to enable SCN advance, or set cluster.enabled = off for "
+							 "vanilla PG behaviour.  Currently running in single-node "
+							 "compatibility mode (cluster.allow_single_node = on).  Set "
+							 "cluster.allow_single_node = off to enforce strict mode.")));
+		}
+		else
+		{
+			/* Stage 2 strict path: FATAL */
+			ereport(FATAL,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("cluster.node_id (%d) is outside the valid range 0..%d",
+							cluster_node_id, SCN_MAX_VALID_NODE_ID),
+					 errhint("Set cluster.node_id in postgresql.conf to an integer 0..127, "
+							 "or set cluster.allow_single_node = on for single-node "
+							 "compatibility mode.")));
+		}
+	}
 
 	cluster_advance_phase(CLUSTER_PHASE_RUNNING);
 }

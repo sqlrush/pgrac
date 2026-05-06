@@ -236,6 +236,11 @@ bool cluster_enabled = true;
  * for SCN_NODE_ID_VALID validation.  Pin to 0 (valid) so unit test does
  * not trip the FATAL ereport path; behavioral test lives in TAP 060 L19. */
 int cluster_node_id = 0;
+/* Spec-2.1 D1: cluster_finalize_startup_running references allow_single_node;
+ * stub matches storage default (true) so WARNING/FATAL dual path stays
+ * on WARNING side -- unit test pins node_id = 0 (valid) anyway so this
+ * stub value is moot.  Behavioral validation in TAP 072. */
+bool cluster_allow_single_node = true;
 
 #include "cluster/cluster_shmem.h"
 void

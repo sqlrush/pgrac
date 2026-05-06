@@ -33,6 +33,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_scn.h" /* spec-2.1 D5: SCN_NODE_ID_VALID range tests */
 
 /*
  * postgres.h transitively pulls in port.h which redirects printf etc.
@@ -65,6 +66,7 @@
 
 int cluster_node_id = -1;
 char *cluster_config_file = (char *)"pgrac.conf";
+bool cluster_allow_single_node = true; /* spec-2.1 D1; storage stub matches default */
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
@@ -301,10 +303,51 @@ UT_TEST(test_get_nodes_srf_linkable)
 }
 
 
+/* ============================================================
+ * spec-2.1 D5: cluster.allow_single_node + SCN_NODE_ID_VALID range
+ * ============================================================ */
+
+UT_TEST(test_allow_single_node_default)
+{
+	/*
+	 * Default storage value is true (spec-2.1 D1; Stage 2.1 backward-
+	 * compat).  GUC registration in cluster_guc.c boot value matches.
+	 */
+	UT_ASSERT(cluster_allow_single_node);
+}
+
+UT_TEST(test_allow_single_node_size)
+{
+	UT_ASSERT_EQ(sizeof(cluster_allow_single_node), sizeof(bool));
+}
+
+UT_TEST(test_scn_node_id_valid_unset)
+{
+	/* -1 sentinel (unset) is invalid (spec-1.15 / spec-1.16 contract). */
+	UT_ASSERT(!SCN_NODE_ID_VALID(-1));
+}
+
+UT_TEST(test_scn_node_id_valid_range)
+{
+	/* 0..127 valid (AD-012 example 10 + spec-1.15 §2.5). */
+	UT_ASSERT(SCN_NODE_ID_VALID(0));
+	UT_ASSERT(SCN_NODE_ID_VALID(63));
+	UT_ASSERT(SCN_NODE_ID_VALID(SCN_MAX_VALID_NODE_ID));
+}
+
+UT_TEST(test_scn_node_id_valid_overflow)
+{
+	/* 128+ reserved (Stage 2+ extension space; spec-1.15 §2.5). */
+	UT_ASSERT(!SCN_NODE_ID_VALID(128));
+	UT_ASSERT(!SCN_NODE_ID_VALID(255));
+	UT_ASSERT(!SCN_NODE_ID_VALID(1000));
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(18);
 	UT_RUN(test_max_nodes_constant);
 	UT_RUN(test_conf_magic_constant);
 	UT_RUN(test_node_role_int32_sized);
@@ -318,6 +361,11 @@ main(void)
 	UT_RUN(test_lookup_linkable);
 	UT_RUN(test_node_count_linkable);
 	UT_RUN(test_get_nodes_srf_linkable);
+	UT_RUN(test_allow_single_node_default);
+	UT_RUN(test_allow_single_node_size);
+	UT_RUN(test_scn_node_id_valid_unset);
+	UT_RUN(test_scn_node_id_valid_range);
+	UT_RUN(test_scn_node_id_valid_overflow);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

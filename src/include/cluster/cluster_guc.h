@@ -289,4 +289,33 @@ extern bool cluster_enabled;
 extern int cluster_undo_segments_per_instance;
 
 
+/*
+ * cluster.allow_single_node (spec-2.1 D1; Stage 2.1 backward-compat
+ * mode gate).
+ *
+ *	Stage 2.1 introduces strict multi-node validation: pgrac.conf is
+ *	required and cluster.node_id must be in valid range 0..127.  The
+ *	allow_single_node = on default permits Stage 1.X single-node
+ *	fallback (no pgrac.conf, cluster.node_id = -1) so that frozen
+ *	Stage 1 specs (1.0-1.23) keep working unchanged.  Set to off to
+ *	enforce strict mode (production deployments).
+ *
+ *	BOUNDARY INVARIANT (spec-2.1 §3.5; Q1 user 反审 caveat):
+ *	allow_single_node = on ONLY permits fallback when multi-node
+ *	configuration is ABSENT.  It does NOT downgrade malformed or
+ *	explicit multi-node configuration errors:
+ *	- pgrac.conf 不存在 + allow=on -> single-node fallback + LOG
+ *	- pgrac.conf malformed (collision / out-of-range / etc) -> FATAL
+ *	  regardless of allow_single_node value
+ *	- pgrac.conf 存在 + cluster.node_id 不在 conf -> FATAL same
+ *	allow=on is a Stage 2 development / backward-compat mode, NOT a
+ *	production strict mode.
+ *
+ *	context: PGC_POSTMASTER (boot-time only)
+ *	default: true (Stage 2.1 backward compat; spec-2.31 acceptance
+ *	         may flip to false for strict mode)
+ */
+extern bool cluster_allow_single_node;
+
+
 #endif /* CLUSTER_GUC_H */

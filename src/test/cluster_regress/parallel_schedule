@@ -5,3 +5,4 @@
 
 test: cluster_smoke
 test: undo_tablespace
+test: conf_multi_node_activation

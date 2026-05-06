@@ -42,12 +42,22 @@
 /* ============================================================
  * Version components (single source of truth)
  * ============================================================ */
+/*
+ * spec-2.1 D8 (2026-05-06): Stage 2 entry; bump
+ * MINOR 2 -> 8 (Q-I versioning ladder: v0.8.X-stage2.N for Stage 2
+ * sub-specs), PATCH 0 -> 1 (first sub-spec), STAGE_NUM 1 -> 2,
+ * STAGE_STEP 7 -> 1.  See spec-2.0 §12 Q-I REVISED + spec-2.1 D8.
+ *
+ * Note: macros lagged behind git tags during Stage 1.8-1.23 (real
+ * tags went up to v0.7.0-stage1.22 / v0.8.0-stage1.23 while macros
+ * stayed at v0.2.0-stage1.7).  Stage 2.1 resyncs.
+ */
 #define PGRAC_VERSION_MAJOR 0
-#define PGRAC_VERSION_MINOR 2
-#define PGRAC_VERSION_PATCH 0
+#define PGRAC_VERSION_MINOR 8
+#define PGRAC_VERSION_PATCH 1
 
-#define PGRAC_STAGE_NUM 1
-#define PGRAC_STAGE_STEP 7
+#define PGRAC_STAGE_NUM 2
+#define PGRAC_STAGE_STEP 1
 
 /* PostgreSQL version this fork is based on. */
 #define PGRAC_PG_BASE_VERSION "16.13"
