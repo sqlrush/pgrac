@@ -179,6 +179,28 @@ jobs:
         run: make -C src/test cluster-check
 
       # ----------------------------------------------------------------
+      # spec-1.23 D6: Stage 1 perf baseline check (warn-only artifact).
+      #
+      # Per spec-1.23 Q8 B-WARN, this is *not* a PR-level blocking gate;
+      # GitHub Actions shared runners exhibit 10-20% variance unsuitable
+      # for blocking thresholds.  Output is captured as artifact for
+      # manual review.  Future Stage 6 spec upgrades to blocking gate
+      # once self-hosted runner / same-run ratio comparison is in place.
+      # ----------------------------------------------------------------
+      - name: Stage 1 perf baseline check (warn-only)
+        run: bash scripts/ci/run-perf-baseline-check.sh
+        continue-on-error: true
+
+      - name: Upload perf baseline artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-baseline-${{ matrix.os }}
+          path: perf-baseline-artifact/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # ----------------------------------------------------------------
       # On failure, surface key log files via artifacts
       # ----------------------------------------------------------------
       - name: Upload regression diffs on failure
