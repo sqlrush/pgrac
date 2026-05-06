@@ -20,9 +20,13 @@
  *	               UNDOTABLESPACE_OID (9100) the same way they already
  *	               special-case DEFAULTTABLESPACE_OID (1663) and
  *	               GLOBALTABLESPACE_OID (1664):
- *	                 - pg_tablespace_location returns "pg_undo" instead
- *	                   of trying to readlink() a non-existent
+ *	                 - pg_tablespace_location returns "" (empty string)
+ *	                   instead of trying to readlink() a non-existent
  *	                   pg_tblspc/9100 symlink (which would ERROR).
+ *	                   Hardening v1.0.3 (P2-B): aligns with PG convention
+ *	                   for system-internal tablespaces (default/global
+ *	                   also return "").  Earlier v1.0.2 returned literal
+ *	                   "pg_undo" which violated PG convention.
  *	                 - pg_tablespace_databases returns an empty
  *	                   tuplestore (pg_undo has no database catalog
  *	                   subdirs; it stores undo segment files under
@@ -360,16 +364,22 @@ pg_tablespace_location(PG_FUNCTION_ARGS)
 
 #ifdef USE_PGRAC_CLUSTER
 	/*
-	 * PGRAC stage 1.22 (D14b): pg_undo lives at $PGDATA/pg_undo (no
-	 * pg_tblspc/<oid> symlink); return the path explicitly instead of
-	 * trying to readlink() a non-existent symlink.  Empty string would
-	 * mirror DEFAULTTABLESPACE_OID/GLOBALTABLESPACE_OID semantics, but
-	 * since pg_undo's location is not the database default we surface
-	 * the actual relative path so introspection / debug tooling sees
-	 * the truth.  See specs/spec-1.22-undo-tablespace-bootstrap.md §3.7.
+	 * PGRAC stage 1.22 Hardening v1.0.3 (P2-B): pg_undo lives at
+	 * $PGDATA/pg_undo (no pg_tblspc/<oid> symlink).  Return empty
+	 * string mirroring DEFAULTTABLESPACE_OID / GLOBALTABLESPACE_OID
+	 * semantics: PG convention says "predates the symlink mechanism /
+	 * system-internal tablespace" returns empty string.  pg_undo
+	 * follows the same model.  Tools that want the actual on-disk
+	 * path can join $PGDATA + 'pg_undo' themselves (or call
+	 * pg_tablespace_size which knows the layout).
+	 *
+	 * v1.0.2 returned the literal "pg_undo" string; v1.0.3 corrects
+	 * to "" for PG convention compatibility.  See
+	 * specs/spec-1.22-undo-tablespace-bootstrap.md §3.7 + ## Hardening
+	 * v1.0.3.
 	 */
 	if (tablespaceOid == UNDOTABLESPACE_OID)
-		PG_RETURN_TEXT_P(cstring_to_text("pg_undo"));
+		PG_RETURN_TEXT_P(cstring_to_text(""));
 #endif
 
 	/*

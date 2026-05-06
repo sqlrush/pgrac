@@ -36,12 +36,14 @@
 #include "postgres.h"
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "access/xlogreader.h"
 #include "access/xlogutils.h"
+#include "cluster/cluster_undo_segment.h" /* UNDO_SEGMENT_SIZE_BYTES */
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "miscadmin.h"
 #include "storage/bufpage.h"
@@ -54,7 +56,9 @@
  *   Both encoder (cluster_undo_emit_segment_init) and decoder
  *   (cluster_undo_redo) use this layout.  pg_undo subdir is
  *   established by initdb (D4).  instance_<N> subdir is created
- *   on demand (Stage 1.22 ships only instance_0 from initdb).
+ *   on demand by cluster_undo_redo_segment_init (Stage 1.22 ships
+ *   only instance_0 from initdb; redo path may need other instance
+ *   subdirs on standbys / cross-instance crash recovery).
  *
  *   Returns 0 on success, -1 on path-too-long.  Caller supplies
  *   buf with capacity >= MAXPGPATH.
@@ -69,6 +73,34 @@ build_undo_segment_path(uint8 instance, uint32 segment_id, char *buf, size_t buf
 	if (ret < 0 || (size_t)ret >= buf_size)
 		return -1;
 	return 0;
+}
+
+
+/*
+ * Ensure $PGDATA/pg_undo/instance_<N>/ exists (creates if missing).
+ *
+ *   Idempotent: EEXIST is not an error.  PANIC on any other failure
+ *   (recovery contract -- a half-replayed undo segment is corruption).
+ *
+ *   Stage 1.22 redo path is the primary user: standbys + cross-instance
+ *   crash recovery may see XLOG_UNDO_SEGMENT_INIT records for instance
+ *   subdirs that initdb never created locally.  pg_undo/ itself is
+ *   established by initdb (D4) and assumed to exist.
+ */
+static void
+ensure_undo_instance_subdir(uint8 instance)
+{
+	char path[MAXPGPATH];
+	int ret;
+
+	ret = snprintf(path, sizeof(path), "%s/pg_undo/instance_%u", DataDir, (unsigned)instance);
+	if (ret < 0 || (size_t)ret >= sizeof(path))
+		ereport(PANIC,
+				(errmsg("undo instance subdir path too long: instance=%u", (unsigned)instance)));
+
+	if (mkdir(path, S_IRWXU) != 0 && errno != EEXIST)
+		ereport(PANIC, (errcode_for_file_access(),
+						errmsg("could not create undo instance subdir \"%s\": %m", path)));
 }
 
 
@@ -107,12 +139,26 @@ cluster_undo_emit_segment_init(uint8 instance, uint32 segment_id, const char *pa
 /*
  * Replay XLOG_UNDO_SEGMENT_INIT.
  *
- *   Direct pwrite to $PGDATA/pg_undo/instance_<N>/seg_<id>.dat block 0.
- *   Bypasses PG buffer manager + smgr.  Idempotent: if the segment file
- *   already exists, overwrites block 0 with the WAL-shipped image.
+ *   Spec-1.22 Hardening v1.0.3: full idempotent create + size + restore
+ *   semantics for crash / standby replay.  Because pg_undo/ files live
+ *   outside PG's RelFileLocator namespace, neither SMGR nor XLOG_FPI
+ *   manage file lifecycle for us; the redo handler must own:
+ *     1. mkdir parent directory (instance_<N>/) if missing
+ *     2. open(O_CREAT | O_RDWR) (creates file if missing)
+ *     3. ftruncate to UNDO_SEGMENT_SIZE_BYTES (extends sparse if missing)
+ *     4. pwrite block 0 with the WAL-shipped page image
+ *     5. fsync file
+ *     6. fsync parent directory (durable dirent for create case)
  *
- *   Errors during recovery promote to PANIC per the standard recovery
- *   contract (a half-replayed undo segment is corruption).
+ *   Idempotent across replay scenarios:
+ *     - Segment + dir + size all present (allocator path normal): every
+ *       step is a no-op except pwrite (overwrites block 0 with same bytes)
+ *     - Standby never saw the allocator: full create + extend + write
+ *     - Operator deleted seg_<id>.dat between checkpoints: rebuild
+ *     - Crash mid-allocator (between create and extend): ftruncate
+ *       extends to full size; pwrite restores block 0
+ *
+ *   Errors promote to PANIC per the standard recovery contract.
  */
 static void
 cluster_undo_redo_segment_init(XLogReaderState *record)
@@ -136,18 +182,33 @@ cluster_undo_redo_segment_init(XLogReaderState *record)
 		ereport(PANIC, (errmsg("undo segment path too long: instance=%u seg=%u", hdr->instance,
 							   hdr->segment_id)));
 
-	/*
-	 * Open the segment file.  Stage 1.22 only redos block 0 init for an
-	 * existing segment; segment file creation is the allocator's job.
-	 * If the segment file is missing during recovery, the allocator's
-	 * own WAL records (or initdb-time seed) should have appeared earlier
-	 * in the WAL stream -- if they didn't, this is corruption.
-	 */
-	fd = BasicOpenFile(path, O_RDWR | PG_BINARY);
+	/* Step 1: ensure parent instance subdir exists (idempotent on EEXIST). */
+	ensure_undo_instance_subdir(hdr->instance);
+
+	/* Step 2: open the segment file, creating if missing. */
+	fd = BasicOpenFile(path, O_CREAT | O_RDWR | PG_BINARY);
 	if (fd < 0)
 		ereport(PANIC, (errcode_for_file_access(),
-						errmsg("could not open undo segment file \"%s\": %m", path)));
+						errmsg("could not open or create undo segment file \"%s\": %m", path)));
 
+	/*
+	 * Step 3: ensure file is exactly UNDO_SEGMENT_SIZE_BYTES (64 MB).
+	 * ftruncate is idempotent: shrink-to-same-size and extend-to-target
+	 * are both no-ops when the file already has the target size.  Tail
+	 * bytes are sparse zeros until the allocator path writes real undo
+	 * records (deferred to feature-117).
+	 */
+	if (ftruncate(fd, (off_t)UNDO_SEGMENT_SIZE_BYTES) != 0) {
+		int save_errno = errno;
+
+		close(fd);
+		errno = save_errno;
+		ereport(PANIC, (errcode_for_file_access(),
+						errmsg("could not extend undo segment file \"%s\" to %d bytes: %m", path,
+							   UNDO_SEGMENT_SIZE_BYTES)));
+	}
+
+	/* Step 4: pwrite block 0 with the WAL-shipped page image. */
 	written = pg_pwrite(fd, page_image, BLCKSZ, 0);
 	if (written != BLCKSZ) {
 		int save_errno = errno;
@@ -160,6 +221,7 @@ cluster_undo_redo_segment_init(XLogReaderState *record)
 							   path, written, BLCKSZ)));
 	}
 
+	/* Step 5: fsync the file (durable block 0 + tail allocation). */
 	if (pg_fsync(fd) != 0) {
 		int save_errno = errno;
 
@@ -172,6 +234,22 @@ cluster_undo_redo_segment_init(XLogReaderState *record)
 	if (close(fd) != 0)
 		ereport(PANIC, (errcode_for_file_access(),
 						errmsg("could not close undo segment file \"%s\": %m", path)));
+
+	/*
+	 * Step 6: fsync the parent directory (instance_<N>/).  Required for
+	 * the create case (Step 2 with O_CREAT) so the dirent is durable;
+	 * harmless for the already-exists case.  fsync_parent_path is
+	 * idempotent and tolerates missing intermediate directories.
+	 */
+	{
+		char dir[MAXPGPATH];
+		int dret;
+
+		dret = snprintf(dir, sizeof(dir), "%s/pg_undo/instance_%u", DataDir,
+						(unsigned)hdr->instance);
+		if (dret >= 0 && (size_t)dret < sizeof(dir))
+			fsync_fname(dir, true);
+	}
 }
 
 
@@ -200,5 +278,5 @@ cluster_undo_redo(XLogReaderState *record)
  * NOTE: cluster_undo_desc + cluster_undo_identify live in
  * src/backend/access/rmgrdesc/clusterundodesc.c so they are picked up
  * by both the backend xlog.o linker and the frontend pg_waldump build
- * (which globs src/backend/access/rmgrdesc/*desc.c into its OBJS).
+ * (which globs src/backend/access/rmgrdesc/ "*desc.c" into its OBJS).
  */

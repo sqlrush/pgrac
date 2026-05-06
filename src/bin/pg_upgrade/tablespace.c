@@ -45,11 +45,20 @@ get_tablespace_paths(void)
 	int			i_spclocation;
 	char		query[QUERY_ALLOC];
 
+	/*
+	 * PGRAC stage 1.22 Hardening v1.0.3 (P2-A): exclude pg_undo
+	 * (UNDOTABLESPACE_OID) from the user-tablespace upgrade list.
+	 * pg_undo is a hard-coded system tablespace managed by the cluster
+	 * runtime; its segment files (pg_undo/instance_<N>/seg_<id>.dat)
+	 * are recreated by initdb seed + WAL replay, not by tablespace
+	 * file copy.  Use the "spcname like 'pg_%'" pattern for forward
+	 * compatibility with future system tablespaces; PG vanilla's
+	 * spcname check above already filters pg_default + pg_global.
+	 */
 	snprintf(query, sizeof(query),
 			 "SELECT pg_catalog.pg_tablespace_location(oid) AS spclocation "
 			 "FROM	pg_catalog.pg_tablespace "
-			 "WHERE	spcname != 'pg_default' AND "
-			 "		spcname != 'pg_global'");
+			 "WHERE	spcname NOT LIKE 'pg\\_%%' ESCAPE '\\'");
 
 	res = executeQueryOrDie(conn, "%s", query);
 

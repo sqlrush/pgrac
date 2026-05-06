@@ -185,9 +185,7 @@ $node->start;
 # ----------
 my $db_output = $node->safe_psql('postgres', '\db');
 like($db_output, qr/pg_undo/,
-	'L11 psql \\db output includes pg_undo entry');
-like($db_output, qr/pg_undo\s+\|\s+\S+\s+\|\s*pg_undo/,
-	'L11 psql \\db pg_undo location column shows pg_undo path');
+	'L11 psql \\db output includes pg_undo entry (location column empty, mirroring pg_default/pg_global PG convention)');
 
 
 # ----------
@@ -240,8 +238,84 @@ like($stderr, qr/(?:cannot be altered|FEATURE_NOT_SUPPORTED|0A000)/,
 # ----------
 my $loc = $node->safe_psql('postgres',
 	'SELECT pg_tablespace_location(9100);');
-is($loc, 'pg_undo',
-	'L15 pg_tablespace_location(UNDOTABLESPACE_OID) returns pg_undo (D14b special case)');
+is($loc, '',
+	'L15 pg_tablespace_location(UNDOTABLESPACE_OID) returns "" (Hardening v1.0.3 P2-B: PG convention for system-internal tablespaces)');
+
+
+# ----------
+# L16: redo handler idempotent file/dir/size restore (Hardening v1.0.3 P1-B).
+# Stop server -> delete seg_0.dat (simulate operator error / standby-with-no-
+# allocator-history) -> start server.  Server should NOT FATAL; WAL replay
+# should rebuild the segment file (mkdir + O_CREAT + ftruncate + pwrite +
+# fsync), restoring the byte-perfect header.
+# ----------
+$node->stop;
+
+# Read pre-deletion bytes for byte-equality check after replay.
+open(my $pre_del_fh, '<:raw', $seed_path)
+	or die "could not open seed pre-deletion: $!";
+my $pre_del_bytes;
+read $pre_del_fh, $pre_del_bytes, 128;
+close $pre_del_fh;
+
+# Delete the seed segment file.
+unlink($seed_path) or die "could not unlink $seed_path: $!";
+ok(! -f $seed_path, 'L16a seg_0.dat deleted');
+
+# Restart -- WAL replay should rebuild the segment file.
+$node->start;
+
+ok(-f $seed_path, 'L16b redo handler recreated seg_0.dat after deletion');
+
+my $post_del_size = -s $seed_path;
+is($post_del_size, 64 * 1024 * 1024,
+	'L16c redo handler restored seg_0.dat size to 64 MB (ftruncate idempotent)');
+
+open(my $post_del_fh, '<:raw', $seed_path)
+	or die "could not open seed post-replay: $!";
+my $post_del_bytes;
+read $post_del_fh, $post_del_bytes, 128;
+close $post_del_fh;
+
+is($post_del_bytes, $pre_del_bytes,
+	'L16d redo handler restored byte-perfect block 0 (segment_id / state / owner_instance unchanged)');
+
+
+
+# ----------
+# L17: DROP TABLESPACE pg_undo rejected (Hardening v1.0.3 P2-A).
+# Mirrors L14 (ALTER REJECT) but for DROP path.
+# ----------
+my ($drop_ret, $drop_stdout, $drop_stderr) = $node->psql(
+	'postgres', 'DROP TABLESPACE pg_undo;');
+isnt($drop_ret, 0, 'L17a DROP TABLESPACE pg_undo returns non-zero');
+like($drop_stderr, qr/(?:cannot be dropped|FEATURE_NOT_SUPPORTED|0A000)/,
+	'L17b DROP TABLESPACE pg_undo rejected with cluster runtime errmsg/code');
+
+
+# ----------
+# L18: ALTER TABLESPACE pg_undo OWNER TO ... rejected (Hardening v1.0.3 P2-A).
+# Goes through alter.c ExecAlterOwnerStmt generic path -- separate from
+# AlterTableSpaceOptions / RenameTableSpace covered by L14.
+# ----------
+my ($own_ret, $own_stdout, $own_stderr) = $node->psql(
+	'postgres', 'ALTER TABLESPACE pg_undo OWNER TO postgres;');
+isnt($own_ret, 0, 'L18a ALTER TABLESPACE pg_undo OWNER TO returns non-zero');
+like($own_stderr, qr/(?:cannot be altered|FEATURE_NOT_SUPPORTED|0A000)/,
+	'L18b ALTER TABLESPACE pg_undo OWNER TO rejected via alter.c path');
+
+
+# ----------
+# L19: pg_tablespace_size('pg_undo') walks pg_undo/ directly (Hardening
+# v1.0.3 P2-A; dbsize.c special case so the call doesn't ENOENT on
+# pg_tblspc/9100/PG_*).  Result is non-NULL and >= 64 MB (one seed segment).
+# ----------
+my $tbs_size = $node->safe_psql('postgres',
+	"SELECT pg_tablespace_size('pg_undo');");
+ok(defined $tbs_size && $tbs_size ne '',
+	'L19a pg_tablespace_size(pg_undo) returns a value (no ENOENT)');
+ok($tbs_size >= 64 * 1024 * 1024,
+	'L19b pg_tablespace_size(pg_undo) >= 64 MB (seed segment counted)');
 
 
 $node->stop;

@@ -463,6 +463,21 @@ DropTableSpace(DropTableSpaceStmt *stmt)
 	spcform = (Form_pg_tablespace) GETSTRUCT(tuple);
 	tablespaceoid = spcform->oid;
 
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC stage 1.22 Hardening v1.0.3 (P2-A): pg_undo is a hard-coded
+	 * system tablespace managed by the cluster runtime; reject DROP
+	 * before owner / pinned-object checks (defense in depth -- don't
+	 * rely on initdb adding a pin entry, which Stage 1.22 doesn't).
+	 */
+	if (tablespaceoid == UNDOTABLESPACE_OID)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("pg_undo cannot be dropped"),
+				 errhint("pg_undo is a hard-coded system tablespace managed by "
+						 "the cluster runtime.")));
+#endif
+
 	/* Must be tablespace owner */
 	if (!object_ownercheck(TableSpaceRelationId, tablespaceoid, GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TABLESPACE,

@@ -31,14 +31,16 @@ SELECT count(*) FROM pg_tablespace;
 (1 row)
 
 -- ----------
--- 3. pg_tablespace_location(9100) returns 'pg_undo' relative path.
---    D14b special case -- without it the call would readlink()
---    pg_tblspc/9100 which doesn't exist and raise an error.
+-- 3. pg_tablespace_location(9100) returns '' (empty string).
+--    D14b + Hardening v1.0.3 P2-B special case: pg_undo follows the
+--    pg_default/pg_global PG convention for system-internal tablespaces
+--    (return empty string, not the literal path).  Without this special
+--    case the call would readlink(pg_tblspc/9100) which doesn't exist.
 -- ----------
 SELECT pg_tablespace_location(9100);
  pg_tablespace_location 
 ------------------------
- pg_undo
+ 
 (1 row)
 
 -- ----------

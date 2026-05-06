@@ -23,6 +23,9 @@
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_collation.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "catalog/pg_tablespace.h"   /* UNDOTABLESPACE_OID for pg_undo reject */
+#endif
 #include "catalog/pg_conversion.h"
 #include "catalog/pg_database_d.h"
 #include "catalog/pg_event_trigger.h"
@@ -935,6 +938,23 @@ ExecAlterOwnerStmt(AlterOwnerStmt *stmt)
 				 */
 				if (classId == LargeObjectRelationId)
 					classId = LargeObjectMetadataRelationId;
+
+#ifdef USE_PGRAC_CLUSTER
+				/*
+				 * PGRAC stage 1.22 Hardening v1.0.3 (P2-A): pg_undo is a
+				 * hard-coded system tablespace; reject ALTER OWNER before
+				 * dispatching to AlterObjectOwner_internal.  Mirrors the
+				 * AlterTableSpaceOptions / RenameTableSpace / DropTableSpace
+				 * rejects in commands/tablespace.c.
+				 */
+				if (stmt->objectType == OBJECT_TABLESPACE &&
+					address.objectId == UNDOTABLESPACE_OID)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("pg_undo cannot be altered"),
+							 errhint("pg_undo is a hard-coded system tablespace; "
+									 "owner changes are not supported.")));
+#endif
 
 				catalog = table_open(classId, RowExclusiveLock);
 

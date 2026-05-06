@@ -227,6 +227,17 @@ calculate_tablespace_size(Oid tblspcOid)
 		snprintf(tblspcPath, MAXPGPATH, "base");
 	else if (tblspcOid == GLOBALTABLESPACE_OID)
 		snprintf(tblspcPath, MAXPGPATH, "global");
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC stage 1.22 Hardening v1.0.3 (P2-A): pg_undo lives at
+	 * $PGDATA/pg_undo (no pg_tblspc/<oid> symlink and no
+	 * PG_<MAJOR>_<CATVER>/ subdir layer; per-instance subdirs hold
+	 * undo segment files directly).  Direct path so the size
+	 * calculation walks the actual undo segment files.
+	 */
+	else if (tblspcOid == UNDOTABLESPACE_OID)
+		snprintf(tblspcPath, MAXPGPATH, "pg_undo");
+#endif
 	else
 		snprintf(tblspcPath, MAXPGPATH, "pg_tblspc/%u/%s", tblspcOid,
 				 TABLESPACE_VERSION_DIRECTORY);
