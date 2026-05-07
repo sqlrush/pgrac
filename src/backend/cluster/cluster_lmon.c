@@ -529,39 +529,72 @@ LmonMain(void)
 		&& (ClusterICTier) cluster_interconnect_tier == CLUSTER_IC_TIER_1)
 	{
 		/*
-		 * spec-2.2 §2.1 Tier1 main loop.  Heartbeat cadence driven by
-		 * cluster.interconnect_heartbeat_interval_ms (D7 GUC; default
-		 * 1000, range 100..60000) -- read once at loop entry per
-		 * PGC_POSTMASTER semantics (no SIGHUP refresh).
+		 * spec-2.2 Step 11 D5 -- LMON Tier1 peer drive.
+		 *
+		 * Per-peer LMON-local state machine drives N×(N-1)/2 mesh
+		 * connections to CONNECTED.  Mesh role per §3.5: lower
+		 * node_id is the active connector, higher is passive
+		 * accepter.  Per-peer substates:
+		 *
+		 *   DOWN          : no fd; eligible for active reconnect
+		 *                   on next attempt-tick (active role only)
+		 *   CONNECT_PEND  : nonblocking connect() in flight; waiting
+		 *                   for WL_SOCKET_WRITEABLE
+		 *   HELLO_WAIT    : HELLO sent (active) or peer HELLO not yet
+		 *                   verified (passive); waiting for
+		 *                   WL_SOCKET_READABLE to recv + verify
+		 *   CONNECTED     : HELLO verified; full duplex; heartbeat
+		 *                   send on tick + heartbeat drain on read
+		 *
+		 * Anonymous accept slots: when listener accepts, peer's
+		 * node_id isn't known until we recv + verify HELLO, so the
+		 * fd lands in lmon_pending_fds[] until HELLO binds it to
+		 * tier1_peer_fds[learned_peer_id] and lmon_peer_track[].
 		 */
+#define LMON_SUB_DOWN          0
+#define LMON_SUB_CONNECT_PEND  1
+#define LMON_SUB_HELLO_WAIT    2
+#define LMON_SUB_CONNECTED     3
+
+		typedef struct LmonPeerTrack
+		{
+			int          fd;
+			int8         substate;
+			bool         is_active;
+			TimestampTz  next_attempt_at;
+		} LmonPeerTrack;
+
 		const long  HEARTBEAT_INTERVAL_MS = cluster_interconnect_heartbeat_interval_ms;
+		LmonPeerTrack lmon_peer_track[CLUSTER_MAX_NODES];
+		int           lmon_pending_fds[CLUSTER_MAX_NODES];
 		WaitEventSet *wes = NULL;
+		bool          wes_dirty = true;
 		int           listener_fd = cluster_ic_tier1_get_listener_fd();
 		TimestampTz   next_heartbeat_at;
+		int32         self_id = cluster_node_id;
+		int32         pi;
 
-		/*
-		 * Build the WaitEventSet.  Capacity: latch + listener +
-		 * CLUSTER_MAX_NODES per-peer fds (Step 7 only adds latch +
-		 * listener; per-peer fd registration in subsequent steps).
-		 */
-		wes = CreateWaitEventSet(CurrentMemoryContext, 2 + CLUSTER_MAX_NODES);
-		AddWaitEventToSet(wes, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch, NULL);
-		if (listener_fd >= 0)
-			AddWaitEventToSet(wes, WL_SOCKET_READABLE, listener_fd, NULL,
-							  /* user_data tag = -1 means "listener" */
-							  (void *) (uintptr_t) -1);
-		/*
-		 * spec-2.2 D8 / 约束 1 -- the WaitEventSetWait below uses
-		 * WAIT_EVENT_CLUSTER_IC_HEARTBEAT_WAIT (timer-based wait until
-		 * next heartbeat tick) for the IDLE-with-timeout path.  Per
-		 * 约束 2 strict semantics, HEARTBEAT_WAIT is the timer wait
-		 * NOT a socket recv; recv waits use TCP_RECV.
-		 */
+		/* Init per-peer track from pgrac.conf membership + mesh role. */
+		for (pi = 0; pi < CLUSTER_MAX_NODES; pi++)
+		{
+			lmon_peer_track[pi].fd = -1;
+			lmon_peer_track[pi].substate = LMON_SUB_DOWN;
+			lmon_peer_track[pi].is_active = false;
+			lmon_peer_track[pi].next_attempt_at = 0;
+			lmon_pending_fds[pi] = -1;
+
+			if (pi == self_id)
+				continue;
+			if (cluster_conf_lookup_node(pi) == NULL)
+				continue;     /* peer not declared in pgrac.conf */
+			lmon_peer_track[pi].is_active =
+				(cluster_ic_mesh_role_for_pair(self_id, pi) == CLUSTER_IC_MESH_ACTIVE);
+		}
 
 		next_heartbeat_at = GetCurrentTimestamp() + HEARTBEAT_INTERVAL_MS * INT64CONST(1000);
 
 		for (;;) {
-			WaitEvent ev[8];
+			WaitEvent ev[2 * CLUSTER_MAX_NODES + 4];
 			int       n_events;
 			long      wait_ms;
 			TimestampTz now;
@@ -582,13 +615,107 @@ LmonMain(void)
 			CLUSTER_INJECTION_POINT("cluster-lmon-main-loop-iter");
 
 			now = GetCurrentTimestamp();
+
+			/*
+			 * Active-role reconnect: for each DOWN peer where we are
+			 * the active connector and back-off has elapsed, kick
+			 * off a nonblocking connect.
+			 */
+			for (pi = 0; pi < CLUSTER_MAX_NODES; pi++)
+			{
+				int new_fd = -1;
+
+				if (pi == self_id) continue;
+				if (!lmon_peer_track[pi].is_active) continue;
+				if (lmon_peer_track[pi].substate != LMON_SUB_DOWN) continue;
+				if (lmon_peer_track[pi].next_attempt_at > now) continue;
+
+				lmon_peer_track[pi].next_attempt_at =
+					now + HEARTBEAT_INTERVAL_MS * INT64CONST(1000);
+
+				if (cluster_ic_tier1_connect_one(pi, &new_fd) && new_fd >= 0)
+				{
+					lmon_peer_track[pi].fd = new_fd;
+					lmon_peer_track[pi].substate = LMON_SUB_CONNECT_PEND;
+					wes_dirty = true;
+				}
+			}
+
+			/* Heartbeat send tick. */
+			if (now >= next_heartbeat_at)
+			{
+				for (pi = 0; pi < CLUSTER_MAX_NODES; pi++)
+				{
+					if (lmon_peer_track[pi].substate != LMON_SUB_CONNECTED)
+						continue;
+					if (!cluster_ic_tier1_send_heartbeat(pi))
+					{
+						cluster_ic_tier1_close_peer(pi, "heartbeat send failed");
+						lmon_peer_track[pi].fd = -1;
+						lmon_peer_track[pi].substate = LMON_SUB_DOWN;
+						wes_dirty = true;
+					}
+				}
+				next_heartbeat_at = now + HEARTBEAT_INTERVAL_MS * INT64CONST(1000);
+			}
+
+			/* (Re)build WaitEventSet whenever per-peer fd set changes. */
+			if (wes_dirty)
+			{
+				if (wes != NULL)
+				{
+					FreeWaitEventSet(wes);
+					wes = NULL;
+				}
+				wes = CreateWaitEventSet(CurrentMemoryContext,
+										 2 + 2 * CLUSTER_MAX_NODES);
+				AddWaitEventToSet(wes, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch, NULL);
+				if (listener_fd >= 0)
+					AddWaitEventToSet(wes, WL_SOCKET_READABLE, listener_fd, NULL,
+									  (void *) (intptr_t) -1);
+
+				/* Per-peer (post-HELLO-bound) fds. */
+				for (pi = 0; pi < CLUSTER_MAX_NODES; pi++)
+				{
+					int events;
+
+					if (lmon_peer_track[pi].fd < 0) continue;
+
+					switch (lmon_peer_track[pi].substate)
+					{
+						case LMON_SUB_CONNECT_PEND:
+							events = WL_SOCKET_WRITEABLE;
+							break;
+						case LMON_SUB_HELLO_WAIT:
+						case LMON_SUB_CONNECTED:
+							events = WL_SOCKET_READABLE;
+							break;
+						default:
+							continue;
+					}
+
+					AddWaitEventToSet(wes, events,
+									  lmon_peer_track[pi].fd, NULL,
+									  (void *) (intptr_t) pi);
+				}
+
+				/* Anonymous pending accept fds (peer_id learnt via HELLO). */
+				for (pi = 0; pi < CLUSTER_MAX_NODES; pi++)
+				{
+					if (lmon_pending_fds[pi] < 0) continue;
+					AddWaitEventToSet(wes, WL_SOCKET_READABLE,
+									  lmon_pending_fds[pi], NULL,
+									  (void *) (intptr_t) (CLUSTER_MAX_NODES + pi));
+				}
+				wes_dirty = false;
+			}
+
+			now = GetCurrentTimestamp();
 			wait_ms = (next_heartbeat_at > now)
-				? (long) ((next_heartbeat_at - now) / 1000)    /* us -> ms */
+				? (long) ((next_heartbeat_at - now) / 1000)
 				: 0;
-			if (wait_ms < 0)
-				wait_ms = 0;
-			if (wait_ms > HEARTBEAT_INTERVAL_MS)
-				wait_ms = HEARTBEAT_INTERVAL_MS;
+			if (wait_ms < 0) wait_ms = 0;
+			if (wait_ms > HEARTBEAT_INTERVAL_MS) wait_ms = HEARTBEAT_INTERVAL_MS;
 
 			n_events = WaitEventSetWait(wes, wait_ms, ev,
 										lengthof(ev),
@@ -596,55 +723,136 @@ LmonMain(void)
 
 			for (i = 0; i < n_events; i++)
 			{
+				intptr_t tag = (intptr_t) ev[i].user_data;
+
 				if (ev[i].events & WL_LATCH_SET)
 				{
 					ResetLatch(MyLatch);
+					continue;
 				}
-				else if (ev[i].events & WL_SOCKET_READABLE)
-				{
-					/*
-					 * Tag -1 in user_data => listener readable.  Step 7
-					 * accepts the new fd and immediately closes it (no
-					 * per-peer fd registration yet -- Steps 11+ wire
-					 * the full HELLO handshake when 076 ClusterPair TAP
-					 * exercises 2-node interaction).  For Step 7 the
-					 * accept call itself proves the listener works +
-					 * doesn't FATAL; full peer state machine drive is
-					 * the next milestone.
-					 */
-					if ((intptr_t) ev[i].user_data == -1)
-					{
-						int peer_fd = -1;
-						int32 peer_id = -1;
 
-						if (cluster_ic_tier1_accept_one(&peer_fd, &peer_id))
+				if (tag == -1)
+				{
+					/* Listener: drain all pending accepts. */
+					for (;;)
+					{
+						int   new_fd = -1;
+						int32 dummy_peer_id = -1;
+						int   slot;
+
+						if (!cluster_ic_tier1_accept_one(&new_fd, &dummy_peer_id))
+							break;
+						if (new_fd < 0) break;
+
+						for (slot = 0; slot < CLUSTER_MAX_NODES; slot++)
+							if (lmon_pending_fds[slot] < 0) break;
+						if (slot >= CLUSTER_MAX_NODES)
 						{
-							/*
-							 * Step 7 placeholder: close immediately.
-							 * Step 11 will recv + verify HELLO and
-							 * keep the fd in the WaitEventSet.
-							 */
-							if (peer_fd >= 0)
-								(void) close(peer_fd);
+							/* No room -- reject by closing. */
+							(void) close(new_fd);
+							continue;
+						}
+						lmon_pending_fds[slot] = new_fd;
+						wes_dirty = true;
+					}
+				}
+				else if (tag >= 0 && tag < CLUSTER_MAX_NODES)
+				{
+					int32 peer = (int32) tag;
+					int   peer_fd = lmon_peer_track[peer].fd;
+
+					if (peer_fd < 0) continue;       /* lost between events */
+
+					if (lmon_peer_track[peer].substate == LMON_SUB_CONNECT_PEND
+						&& (ev[i].events & WL_SOCKET_WRITEABLE))
+					{
+						/*
+						 * spec-2.2 §2.4 protocol is asymmetric -- active
+						 * side sends HELLO and immediately considers the
+						 * connection live; passive verifies HELLO and
+						 * either CONNECTEDs or rejects (closing socket;
+						 * active sees the rejection on next heartbeat
+						 * send/recv).  There is no HELLO_ACK round trip,
+						 * so active transitions CONNECT_PEND -> CONNECTED
+						 * directly (HELLO_WAIT is passive-only).
+						 * finish_connect handles the shmem peer-state
+						 * write to CONNECTED on success.
+						 */
+						if (cluster_ic_tier1_finish_connect(peer, peer_fd))
+						{
+							lmon_peer_track[peer].substate = LMON_SUB_CONNECTED;
+							wes_dirty = true;
+						}
+						else
+						{
+							lmon_peer_track[peer].fd = -1;
+							lmon_peer_track[peer].substate = LMON_SUB_DOWN;
+							wes_dirty = true;
+						}
+					}
+					else if (lmon_peer_track[peer].substate == LMON_SUB_CONNECTED
+							 && (ev[i].events & WL_SOCKET_READABLE))
+					{
+						if (!cluster_ic_tier1_recv_heartbeat_drain(peer, peer_fd))
+						{
+							cluster_ic_tier1_close_peer(peer, "heartbeat recv failed");
+							lmon_peer_track[peer].fd = -1;
+							lmon_peer_track[peer].substate = LMON_SUB_DOWN;
+							wes_dirty = true;
 						}
 					}
 				}
-			}
+				else if (tag >= CLUSTER_MAX_NODES && tag < 2 * CLUSTER_MAX_NODES)
+				{
+					int  slot   = (int) (tag - CLUSTER_MAX_NODES);
+					int  pend_fd = lmon_pending_fds[slot];
+					int32 j;
 
-			now = GetCurrentTimestamp();
-			if (now >= next_heartbeat_at)
-			{
-				/*
-				 * Step 7 heartbeat tick: bookkeeping only.  Step 11
-				 * will iterate connected peers and call
-				 * cluster_ic_tier1_send_heartbeat to actually emit
-				 * heartbeats once 2-node TAP can exercise it.
-				 */
-				next_heartbeat_at = now + HEARTBEAT_INTERVAL_MS * INT64CONST(1000);
+					if (pend_fd < 0) continue;
+
+					if (cluster_ic_tier1_recv_and_verify_hello(-1, pend_fd))
+					{
+						/*
+						 * recv_and_verify_hello set tier1_peer_fds[learned]
+						 * and shmem state to CONNECTED.  Find which peer
+						 * id got bound and migrate the fd into peer_track.
+						 */
+						for (j = 0; j < CLUSTER_MAX_NODES; j++)
+						{
+							if (cluster_ic_tier1_get_peer_fd(j) == pend_fd)
+							{
+								lmon_peer_track[j].fd = pend_fd;
+								lmon_peer_track[j].substate = LMON_SUB_CONNECTED;
+								break;
+							}
+						}
+						lmon_pending_fds[slot] = -1;
+						wes_dirty = true;
+					}
+					else
+					{
+						/* HELLO failed -- drop anonymous fd silently. */
+						(void) close(pend_fd);
+						lmon_pending_fds[slot] = -1;
+						wes_dirty = true;
+					}
+				}
 			}
 		}
 
-		FreeWaitEventSet(wes);
+		/* Shutdown: close every fd we own + free WES. */
+		for (pi = 0; pi < CLUSTER_MAX_NODES; pi++)
+		{
+			if (lmon_peer_track[pi].fd >= 0)
+				cluster_ic_tier1_close_peer(pi, "lmon shutdown");
+			if (lmon_pending_fds[pi] >= 0)
+			{
+				(void) close(lmon_pending_fds[pi]);
+				lmon_pending_fds[pi] = -1;
+			}
+		}
+		if (wes != NULL)
+			FreeWaitEventSet(wes);
 	}
 	else
 	{

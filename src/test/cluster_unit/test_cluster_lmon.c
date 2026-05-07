@@ -215,6 +215,52 @@ cluster_ic_tier1_get_listener_fd(void)
 {
 	return -1;
 }
+int
+cluster_ic_tier1_get_peer_fd(int32 peer_id pg_attribute_unused())
+{
+	return -1;
+}
+bool
+cluster_ic_tier1_connect_one(int32 peer_id pg_attribute_unused(),
+							 int *out_peer_fd pg_attribute_unused())
+{
+	return false;
+}
+bool
+cluster_ic_tier1_finish_connect(int32 peer_id pg_attribute_unused(),
+								int peer_fd pg_attribute_unused())
+{
+	return false;
+}
+bool
+cluster_ic_tier1_recv_and_verify_hello(int32 peer_id pg_attribute_unused(),
+									   int peer_fd pg_attribute_unused())
+{
+	return false;
+}
+bool
+cluster_ic_tier1_send_heartbeat(int32 peer_id pg_attribute_unused())
+{
+	return false;
+}
+bool
+cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id pg_attribute_unused(),
+									  int peer_fd pg_attribute_unused())
+{
+	return false;
+}
+void
+cluster_ic_tier1_close_peer(int32 peer_id pg_attribute_unused(),
+							const char *reason pg_attribute_unused())
+{}
+
+/* spec-2.2 D5 LMON drive references cluster_conf_lookup_node + cluster_node_id. */
+const struct ClusterNodeInfo *
+cluster_conf_lookup_node(int32 node_id pg_attribute_unused())
+{
+	return NULL;
+}
+int cluster_node_id = -1;
 
 /* WaitEventSet API stubs (storage/latch.h).  Never invoked at unit-test
  * runtime because the test doesn't call LmonMain. */

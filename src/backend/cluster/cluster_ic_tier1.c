@@ -801,7 +801,20 @@ cluster_ic_tier1_finish_connect(int32 peer_id, int peer_fd)
 		return false;
 	}
 
-	/* Stay in CONNECTING; peer's HELLO_ACK arrives via recv path. */
+	/*
+	 * spec-2.2 §2.4 -- protocol is asymmetric: active sender considers
+	 * itself CONNECTED after a successful HELLO send.  Passive verifier
+	 * reads the HELLO and either CONNECTEDs or rejects + closes (active
+	 * detects rejection on next heartbeat send/recv).  No HELLO_ACK.
+	 */
+	if (Tier1Shmem != NULL)
+	{
+		Tier1Shmem->peers[peer_id].state = (int32) CLUSTER_IC_PEER_CONNECTED;
+		Tier1Shmem->peers[peer_id].last_connect_at = GetCurrentTimestamp();
+	}
+	ereport(LOG,
+			(errmsg("cluster_ic tier1 peer %d HELLO sent, state CONNECTED (active)",
+					peer_id)));
 	return true;
 }
 
