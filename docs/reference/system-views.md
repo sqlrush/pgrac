@@ -112,12 +112,70 @@ SELECT count(*) FROM (
 -- 0
 ```
 
+## pg_cluster_ic_peers
+
+Per-peer state of the Tier 1 (TCP) interconnect.  Returns one row for
+every peer declared in `pgrac.conf`, regardless of whether the peer is
+currently reachable.  Always returns zero rows when
+`cluster.interconnect_tier` is not `tier1`.
+
+### Columns
+
+| Column | Type | Notes |
+|---|---|---|
+| `node_id` | `int4` | Peer's `cluster.node_id`. |
+| `state` | `text` | One of `down`, `connecting`, `connected`, `rejected`. |
+| `interconnect_addr` | `text` | `host:port` learned from `pgrac.conf`. |
+| `last_connect_at` | `timestamptz` | Most recent transition into `connected`.  `NULL` if never connected. |
+| `last_send_at` | `timestamptz` | Most recent successful socket send (any frame). |
+| `last_recv_at` | `timestamptz` | Most recent successful socket recv (any frame). |
+| `last_heartbeat_sent_at` | `timestamptz` | Most recent heartbeat emitted to this peer. |
+| `last_heartbeat_recv_at` | `timestamptz` | Most recent heartbeat received from this peer. |
+| `heartbeat_send_count` | `int8` | Cumulative heartbeats sent. |
+| `heartbeat_recv_count` | `int8` | Cumulative heartbeats received. |
+| `msg_send_count` | `int8` | Reserved for future use. |
+| `msg_recv_count` | `int8` | Reserved for future use. |
+| `bytes_send` | `int8` | Cumulative bytes written to the peer socket. |
+| `bytes_recv` | `int8` | Cumulative bytes read from the peer socket. |
+| `reconnect_count` | `int4` | Times this peer has been re-established after a drop. |
+| `connect_error_count` | `int4` | `connect(2)` failures. |
+| `last_errno` | `int4` | Last `errno` recorded; `0` if no error or never failed. |
+| `last_error_code` | `text` | Last SQLSTATE-style code recorded (e.g. `08001`, `08006`, `08P01`).  Empty when no error. |
+| `last_error` | `text` | Free-form description of the last error. |
+
+### Example queries
+
+```sql
+-- Are all declared peers connected?
+SELECT node_id, state, interconnect_addr,
+       heartbeat_recv_count, last_heartbeat_recv_at
+  FROM pg_cluster_ic_peers
+ ORDER BY node_id;
+```
+
+```sql
+-- Peers that have ever flapped.
+SELECT node_id, state, reconnect_count, connect_error_count,
+       last_error_code, last_error
+  FROM pg_cluster_ic_peers
+ WHERE reconnect_count > 0 OR connect_error_count > 0;
+```
+
+### Sample output (2-node cluster, both connected)
+
+```text
+ node_id |  state    | interconnect_addr | heartbeat_send_count | heartbeat_recv_count
+---------+-----------+-------------------+----------------------+----------------------
+       0 | connected | 10.0.0.1:6432     |                  342 |                  341
+       1 | connected | 10.0.0.2:6432     |                  342 |                  342
+```
+
 ## --disable-cluster builds
 
 In binaries built with `--disable-cluster`:
 
-- All three views still exist in the catalog.
-- All three return zero rows.
+- All four views still exist in the catalog.
+- All four return zero rows.
 - The underlying `cluster_get_*` SRFs are present as no-op symbols.
 
 This means SQL written against these views works on both build

@@ -82,13 +82,13 @@ e.g. on a standalone development machine.
 
 ## Interconnect tiers
 
-The `cluster_ic` module defines four tier slots; only the first
-is populated in the current release.
+The `cluster_ic` module defines four tier slots.  The first two are
+populated in the current release.
 
 | Tier | Status |
 |---|---|
 | `stub` | **Active** — same-node ops are no-ops, cross-node ops raise `ERRCODE_FEATURE_NOT_SUPPORTED` |
-| `tier1` | Not supported |
+| `tier1` | **Active** — TCP transport carrying the LMON aux-process heartbeat between every pair of nodes declared in `pgrac.conf`.  Per-peer state is exposed via [`pg_cluster_ic_peers`](../reference/system-views.md#pg_cluster_ic_peers). |
 | `tier2` | Not supported |
 | `tier3` | Not supported |
 

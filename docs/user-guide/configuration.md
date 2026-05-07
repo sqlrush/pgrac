@@ -54,9 +54,9 @@ Selects the cluster interconnect transport.
 | Value | Behavior |
 |---|---|
 | `stub` (default) | Same-node operation is a no-op success.  Cross-node send raises `ERRCODE_FEATURE_NOT_SUPPORTED`.  No real wire traffic.  Suitable for single-node deployments and CI. |
-| `tier1` | Currently not supported.  Setting this causes the postmaster to refuse to start with `ERRCODE_FEATURE_NOT_SUPPORTED`. |
-| `tier2` | Same as `tier1`: not supported. |
-| `tier3` | Same as `tier1`: not supported. |
+| `tier1` | TCP transport for the LMON heartbeat path between cluster nodes.  Requires every peer (including self) to be listed in `pgrac.conf` with an `interconnect_addr`.  See `pg_cluster_ic_peers` for runtime peer state. |
+| `tier2` | Currently not supported.  Setting this causes the postmaster to refuse to start with `ERRCODE_FEATURE_NOT_SUPPORTED`. |
+| `tier3` | Same as `tier2`: not supported. |
 
 ```text
 # postgresql.conf
@@ -73,6 +73,39 @@ SELECT name, vartype, context, setting
 -- ------------------------+---------+------------+---------
 --  cluster.interconnect_tier | enum    | postmaster | stub
 ```
+
+### `cluster.interconnect_heartbeat_interval_ms`
+
+| | |
+|---|---|
+| Type | integer (milliseconds) |
+| Default | `1000` (1 s) |
+| Range | `100` – `60000` |
+| Context | postmaster |
+
+How often the LMON aux process emits a heartbeat to each connected peer in `tier1` mode, and (because the LMON main loop uses one timer for both jobs) how often it retries a connection to a peer that is currently down.  Has no effect when `cluster.interconnect_tier = stub`.
+
+### `cluster.interconnect_connect_timeout_ms`
+
+| | |
+|---|---|
+| Type | integer (milliseconds) |
+| Default | `5000` (5 s) |
+| Range | `1000` – `60000` |
+| Context | postmaster |
+
+Reserved for future timeout enforcement on outbound `tier1` TCP `connect(2)` calls.  Currently informational; LMON re-attempts on each heartbeat tick.
+
+### `cluster.interconnect_recv_timeout_ms`
+
+| | |
+|---|---|
+| Type | integer (milliseconds) |
+| Default | `30000` (30 s) |
+| Range | `1000` – `600000` |
+| Context | postmaster |
+
+Reserved for future timeout enforcement on `tier1` peer `recv(2)`.  Currently informational; the connection is held open until the peer closes or the postmaster shuts down.
 
 ### `cluster.config_file`
 

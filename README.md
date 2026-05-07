@@ -12,15 +12,20 @@ unchanged.
 
 ## Status
 
-**Stage 1 in progress.**  Stage 0 (cluster subsystem scaffolding -- GUCs /
-shmem / IPC abstraction / topology / system views / wait events /
+**Stage 2 Phase 2.A in progress.**  Stage 0 (cluster subsystem scaffolding --
+GUCs / shmem / IPC abstraction / topology / system views / wait events /
 pgrac-init bootstrap tools) is complete.  Stage 1 has shipped block
 format extensions (PageHeader pd_block_scn / ITL slot array / BufferDesc
 cluster fields), commit local_scn maintenance, walwriter BOC, WAL
 record xl_scn, WAL Page Header xlp_thread_id, and the dedicated undo
-tablespace (`pg_undo` OID 9100) atomic batch.  Cross-node functionality
-(GES / PCM / Cache Fusion / Reconfiguration / Recovery) is scaffolded
-but not yet active; operations that would require it return
+tablespace (`pg_undo` OID 9100) atomic batch.  Stage 2 has shipped
+multi-node `pgrac.conf` activation and the Tier 1 (TCP) inter-node
+interconnect carrying the LMON heartbeat: every pair of declared peers
+establishes a full-duplex socket, exchanges a HELLO handshake, and
+trades 1 Hz heartbeats; runtime per-peer state is exposed via
+`pg_cluster_ic_peers`.  Higher-level cross-node functionality (GES /
+PCM / Cache Fusion / Reconfiguration / Recovery) is scaffolded but not
+yet active; operations that would require it return
 `ERRCODE_FEATURE_NOT_SUPPORTED`.
 
 Stage 1 OLTP performance regression vs vanilla PG 16.13 is verified by

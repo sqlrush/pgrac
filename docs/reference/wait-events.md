@@ -96,7 +96,7 @@ Cross-node shared invalidation broadcast.
 | `SinvalBroadcastReceive` | Waiting for incoming sinval broadcast |
 | `SinvalInjectLocalQueue` | Waiting to inject received sinval into local queue |
 
-## Cluster: Interconnect (5 events)
+## Cluster: Interconnect (11 events)
 
 Network transport layer.
 
@@ -107,6 +107,12 @@ Network transport layer.
 | `InterconnectTcpFallback` | Waiting on the TCP fallback transport |
 | `InterconnectTierSwitch` | Waiting for transport tier switch (e.g. RDMA → TCP fallback) |
 | `InterconnectConnectRetry` | Waiting for an interconnect reconnection attempt |
+| `ClusterICTcpAccept` | LMON waiting on the Tier 1 listener for an incoming peer connection |
+| `ClusterICTcpConnect` | LMON waiting for an outbound nonblocking `connect(2)` to a peer to complete |
+| `ClusterICTcpRecv` | LMON waiting to read bytes from a peer socket |
+| `ClusterICTcpSend` | LMON waiting to write bytes to a peer socket |
+| `ClusterICHeartbeatWait` | LMON main loop is idle, waiting for the next heartbeat tick |
+| `ClusterICReconnect` | LMON waiting before re-attempting a connection to a peer that is currently `down` |
 
 ## Cluster: Undo (4 events)
 
