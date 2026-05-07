@@ -6,3 +6,4 @@
 test: cluster_smoke
 test: undo_tablespace
 test: conf_multi_node_activation
+test: ic_tcp_smoke

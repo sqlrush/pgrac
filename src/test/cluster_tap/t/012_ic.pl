@@ -112,23 +112,22 @@ is($node->safe_psql('postgres',
 
 
 # ----------
-# Setting tier1 in postgresql.conf prevents server startup.
+# spec-2.2: tier1 is now implemented but requires pgrac.conf to declare
+# self interconnect_addr.  Setting tier=tier1 without pgrac.conf fails at
+# listener_bind (cluster_ic_tier1.c) -- different error message than
+# pre-spec-2.2 ("tier1 not implemented" -> "cannot parse interconnect_addr").
+# (cluster.enabled defaults to ON; cluster_ic_init runs unconditionally.)
 # ----------
 $node->stop;
 $node->append_conf('postgresql.conf', "cluster.interconnect_tier = tier1\n");
 
-# Startup must fail; capture log to verify the errhint is emitted.
+# Startup must fail; capture log to verify the new errmsg is emitted.
 my $start_failed = !$node->start(fail_ok => 1);
 ok($start_failed,
-	'server refuses to start with cluster.interconnect_tier = tier1 (Stage 2+)');
+	'server refuses to start with tier=tier1 + missing pgrac.conf (spec-2.2)');
 
-# Use spec-0.22 wait_for_log_match (replaces slurp_file + like).  The
-# log file is already complete here -- postmaster crashed and left it
-# on disk -- so wait_for_log_match returns on the first poll iteration.
-ok(defined $node->wait_for_log_match(qr/tier1.*not implemented/i, 5),
-	'startup failure log mentions tier1 not implemented');
-ok(defined $node->wait_for_log_match(qr/Stage 2/, 5),
-	'startup failure errhint points to Stage 2');
+ok(defined $node->wait_for_log_match(qr/tier1.*interconnect_addr|interconnect_addr.*""/i, 5),
+	'startup failure log mentions tier1 listener_bind / interconnect_addr');
 
 
 # ----------

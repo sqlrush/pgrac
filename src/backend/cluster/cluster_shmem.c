@@ -57,6 +57,7 @@
 #include "cluster/cluster_elog.h"	  /* CLUSTER_LOG */
 #include "cluster/cluster_guc.h"	  /* cluster_node_id / cluster_shmem_max_regions */
 #include "cluster/cluster_ic.h"		  /* cluster_ic_init / shutdown (stage 0.18) */
+#include "cluster/cluster_ic_tier1.h" /* cluster_ic_tier1_shmem_register (spec-2.2 D3) */
 #include "cluster/cluster_diag.h"	  /* cluster_diag_shmem_register (1.13 Sprint A) */
 #include "cluster/cluster_inject.h"	  /* CLUSTER_INJECTION_POINT */
 #include "cluster/cluster_lck.h"	  /* cluster_lck_shmem_register (1.12 Sprint A) */
@@ -361,6 +362,10 @@ cluster_init_shmem_module(void)
 	/* spec-1.14 Sprint A D7: register cluster_stats shmem region. */
 	if (cluster_shmem_lookup_region("pgrac cluster stats") == NULL)
 		cluster_stats_shmem_register();
+
+	/* spec-2.2 D3 (2026-05-07): register cluster_ic_tier1 shmem region. */
+	if (cluster_shmem_lookup_region("pgrac cluster_ic_tier1") == NULL)
+		cluster_ic_tier1_shmem_register();
 
 	/* spec-1.15 D3: register cluster_scn shmem region (encoding layer). */
 	if (cluster_shmem_lookup_region("pgrac cluster scn") == NULL)

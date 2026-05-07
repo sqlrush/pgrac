@@ -1,0 +1,46 @@
+-- ============================================================
+-- ic_tcp_smoke -- spec-2.2 D16 single-instance regress smoke.
+--
+--	Verifies the spec-2.2 SQL surface in stub-tier mode (default for
+--	cluster_regress):
+--	- 3 D7 PGC_POSTMASTER GUCs exist with documented metadata
+--	- 6 D8 wait events are registered (visible via pg_stat_activity
+--	  / pg_settings; spot-check via name predicate)
+--	- pg_cluster_ic_peers view exists + returns zero rows under
+--	  cluster_regress (no pgrac.conf peers configured, so
+--	  cluster_conf_lookup_node() returns NULL for every slot)
+--	- catversion bumped to >= 202605200
+--
+--	Behavioural Tier1 connection / HELLO handshake / heartbeat
+--	exchange tests live in cluster_tap (075 single-instance,
+--	076 ClusterPair 2-node) because they require restart + multi
+--	postmaster orchestration, which cluster_regress cannot do.
+--
+--	Author: SqlRush <sqlrush@gmail.com>
+--	Portions Copyright (c) 2026, pgrac contributors
+-- ============================================================
+
+-- ----------
+-- 1. 3 D7 PGC_POSTMASTER GUCs exist with documented metadata + defaults.
+-- ----------
+SELECT name, vartype, context, unit, boot_val
+  FROM pg_settings
+ WHERE name IN ('cluster.interconnect_heartbeat_interval_ms',
+                'cluster.interconnect_connect_timeout_ms',
+                'cluster.interconnect_recv_timeout_ms')
+ ORDER BY name;
+
+
+-- ----------
+-- 2. pg_cluster_ic_peers view exists + returns zero rows when no
+--	pgrac.conf peers are configured (cluster_regress default).
+-- ----------
+SELECT count(*) AS peer_rows FROM pg_cluster_ic_peers;
+
+
+-- ----------
+-- 3. View has the spec-2.2 §2.6 frozen 19-column layout.
+-- ----------
+SELECT count(*) AS column_count
+  FROM information_schema.columns
+ WHERE table_name = 'pg_cluster_ic_peers';

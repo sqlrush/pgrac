@@ -354,6 +354,11 @@ void
 cluster_scn_shmem_register(void)
 {}
 
+/* spec-2.2 D3 stub: tier1 shmem region (real impl in cluster_ic_tier1.c). */
+void
+cluster_ic_tier1_shmem_register(void)
+{}
+
 
 UT_DEFINE_GLOBALS();
 

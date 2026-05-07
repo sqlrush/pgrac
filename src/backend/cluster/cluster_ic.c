@@ -93,12 +93,14 @@ StaticAssertDecl(sizeof(ClusterMsgHeader) == PGRAC_IC_HEADER_BYTES,
 
 
 /*
- * Active vtable.  Initialised to point at ClusterICOps_Stub by
- * cluster_ic_init (see below) so that the dereference path is always
- * valid; postmaster startup ordering guarantees cluster_ic_init runs
- * before any backend forks.
+ * Active vtable.  Statically initialised to ClusterICOps_Stub so that
+ * the dereference path (and pg_cluster_state 'ic' category) is always
+ * valid -- including the cluster.enabled=off path where v1.0.2 D-I1
+ * makes cluster_ic_init early-return without rebinding Active.
+ * cluster_ic_init may rebind to Mock or Tier1 based on
+ * cluster.interconnect_tier when cluster_enabled = on.
  */
-const ClusterICOps *ClusterICOps_Active = NULL;
+const ClusterICOps *ClusterICOps_Active = &ClusterICOps_Stub;
 
 
 /* ============================================================
