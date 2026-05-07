@@ -169,6 +169,42 @@ extern bool cluster_ic_tier1_recv_and_verify_hello(int32 peer_id, int peer_fd);
 extern bool cluster_ic_tier1_send_heartbeat(int32 peer_id);
 
 /*
+ * Hardening v1.0.1 F1: continue an in-progress HELLO send (active side).
+ * Called by LMON from finish_connect AND on each WL_SOCKET_WRITEABLE
+ * wakeup until HELLO is fully sent.  Returns true on success / partial;
+ * false on hard error.  When the full 64 bytes have been sent, the
+ * peer's shmem state flips to CONNECTED.
+ *
+ * Use cluster_ic_tier1_hello_send_remaining() to learn whether more
+ * sends are needed (returns 0 = complete, > 0 = remaining bytes).
+ */
+extern bool cluster_ic_tier1_continue_hello_send(int32 peer_id, int peer_fd);
+extern int  cluster_ic_tier1_hello_send_remaining(int32 peer_id);
+
+/*
+ * Hardening v1.0.1 F1: passive-side HELLO recv with partial-recv
+ * accumulation.  Called by LMON on WL_SOCKET_READABLE for
+ * accept-side anonymous fds before peer_id is known.
+ *
+ *   anon_slot         : 0..CLUSTER_MAX_NODES-1, identifies the
+ *                       per-call accumulation buffer (LMON owns
+ *                       the slot until HELLO complete or fd closed).
+ *   peer_fd           : the fd to recv from
+ *   out_learned_peer_id : on success of full HELLO, set to verified
+ *                       source_node_id (caller binds peer fd).  If
+ *                       still accumulating, set to -1.
+ *
+ * Returns true while recv is making progress (partial or complete);
+ * false on hard error / EOF / verification failure -- caller closes fd.
+ *
+ * Caller must reset accumulation state when fd is bound or closed
+ * via cluster_ic_tier1_anon_hello_reset(anon_slot).
+ */
+extern bool cluster_ic_tier1_continue_hello_recv(int anon_slot, int peer_fd,
+												 int32 *out_learned_peer_id);
+extern void cluster_ic_tier1_anon_hello_reset(int anon_slot);
+
+/*
  * Drain pending heartbeat frames from peer_fd.  Reads until EAGAIN,
  * accumulating bytes into a per-peer recv buffer; for each fully
  * received 24-byte ClusterMsgHeader (msg_type=HEARTBEAT, payload_len=0,

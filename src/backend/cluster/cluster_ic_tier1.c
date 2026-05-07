@@ -139,6 +139,40 @@ static bool tier1_peer_fds_initialised = false;
 static uint8 tier1_recv_buf[CLUSTER_MAX_NODES][PGRAC_IC_HEADER_BYTES];
 static int   tier1_recv_buf_len[CLUSTER_MAX_NODES];
 
+/*
+ * Hardening v1.0.1 F1: per-peer HELLO send + recv buffers + state for
+ * partial-IO across WL_SOCKET_WRITEABLE / READABLE wakeups.  64-byte
+ * HELLO can fragment on real LANs (and almost-always-doesn't on
+ * loopback, hiding the bug).  state machine:
+ *   active : finish_connect() seeds tier1_hello_send_buf[],
+ *            tier1_hello_send_remaining = 64; LMON re-enters
+ *            cluster_ic_tier1_continue_hello_send() on WRITEABLE
+ *            until remaining == 0; then peer state -> CONNECTED.
+ *   passive: cluster_ic_tier1_recv_and_verify_hello() accumulates
+ *            into tier1_hello_recv_buf[] until len == 64; then
+ *            parses + verifies + state -> CONNECTED.
+ *
+ * Heartbeat send partial-write: tier1_outbound_remaining[] stores
+ * leftover bytes when send() returns short; LMON drains on WRITEABLE
+ * before scheduling next heartbeat.  For HEARTBEAT (24B header,
+ * 0B payload) the buffer reuses tier1_outbound_buf[] (24 bytes per
+ * peer); spec-2.4 framing will generalize for larger payloads.
+ */
+static uint8 tier1_hello_send_buf[CLUSTER_MAX_NODES][PGRAC_IC_HELLO_BYTES];
+static int   tier1_hello_send_remaining[CLUSTER_MAX_NODES];
+
+/*
+ * Anon-slot keyed buffer (passive-side HELLO recv before peer_id known).
+ * LMON owns the slot 0..N-1 mapping to lmon_pending_fds[].  After HELLO
+ * verifies and fd is bound to peer, LMON calls anon_hello_reset to free
+ * the slot for next accept.
+ */
+static uint8 tier1_anon_hello_buf[CLUSTER_MAX_NODES][PGRAC_IC_HELLO_BYTES];
+static int   tier1_anon_hello_len[CLUSTER_MAX_NODES];
+
+static uint8 tier1_outbound_buf[CLUSTER_MAX_NODES][PGRAC_IC_HEADER_BYTES];
+static int   tier1_outbound_remaining[CLUSTER_MAX_NODES];
+
 
 /* ============================================================
  * Static helpers.
@@ -354,10 +388,47 @@ tier1_send_bytes(int32 target_node_id, const void *buf, size_t len)
 		return false;       /* not connected */
 
 	/*
-	 * Nonblocking write.  In Step 6 we treat short writes as failure;
-	 * Step 7 LMON main loop will retry on WL_SOCKET_WRITEABLE.  Step 6
-	 * standalone send_bytes is reachable only from cluster_unit smoke
-	 * (where peer_fds[] are still -1) and never executes the write.
+	 * Hardening v1.0.1 F1: per-peer outbound buffer for partial writes.
+	 * If a previous send for this peer left bytes pending, drain them
+	 * first; only attempt the new caller-supplied buf when the buffer
+	 * is empty (otherwise we'd corrupt the byte stream by interleaving
+	 * frames).  Cluster-IC frames are message-aligned so partial-write
+	 * recovery must NOT interleave two payloads on the same socket.
+	 */
+	if (tier1_outbound_remaining[target_node_id] > 0)
+	{
+		int rem = tier1_outbound_remaining[target_node_id];
+		int off = (int) sizeof(tier1_outbound_buf[0]) - rem;
+		ssize_t drained = send(fd, &tier1_outbound_buf[target_node_id][off],
+							   (size_t) rem, 0);
+		if (drained < 0)
+		{
+			int saved = errno;
+
+			if (saved == EAGAIN || saved == EWOULDBLOCK)
+				return false;       /* still backpressured; caller skips */
+			peer_record_error(target_node_id, saved, "08006",
+							  "send (drain): %s", strerror(saved));
+			cluster_ic_tier1_close_peer(target_node_id, "send error");
+			return false;
+		}
+		tier1_outbound_remaining[target_node_id] -= (int) drained;
+		if (tier1_outbound_remaining[target_node_id] > 0)
+			return false;           /* still pending, defer new payload */
+
+		if (Tier1Shmem != NULL)
+		{
+			pg_atomic_add_fetch_u64(&Tier1Shmem->peers[target_node_id].bytes_send,
+									(uint64) drained);
+			Tier1Shmem->peers[target_node_id].last_send_at = GetCurrentTimestamp();
+		}
+	}
+
+	/*
+	 * Nonblocking write.  Short write is now buffered (F1) instead of
+	 * closing the peer: drain the remainder on next WL_SOCKET_WRITEABLE
+	 * via the path above.  HEARTBEAT (24B header) fits in the buffer;
+	 * spec-2.4 framing will generalize for larger payloads.
 	 */
 	sent = send(fd, buf, len, 0);
 	if (sent < 0)
@@ -376,7 +447,41 @@ tier1_send_bytes(int32 target_node_id, const void *buf, size_t len)
 
 	if ((size_t) sent != len)
 	{
-		/* Partial write -- caller (LMON) is responsible for retry. */
+		/*
+		 * Hardening v1.0.1 F1: partial write -- buffer the unsent tail
+		 * in tier1_outbound_buf so we can complete it on next WRITEABLE.
+		 * Frame is message-aligned; we MUST complete it before the next
+		 * heartbeat to avoid interleaving payloads on the wire.
+		 */
+		size_t tail_len = len - (size_t) sent;
+
+		if (tail_len > sizeof(tier1_outbound_buf[0]))
+		{
+			/* Larger than the buffer (24B) -- spec-2.2 only sends
+			 * 24B HEARTBEAT, so this is a programming error. */
+			peer_record_error(target_node_id, 0, "08006",
+							  "partial send tail %zu > buffer %zu",
+							  tail_len, sizeof(tier1_outbound_buf[0]));
+			cluster_ic_tier1_close_peer(target_node_id, "send tail too large");
+			return false;
+		}
+		memcpy(tier1_outbound_buf[target_node_id],
+			   (const char *) buf + sent, tail_len);
+		tier1_outbound_remaining[target_node_id] = (int) tail_len;
+
+		if (Tier1Shmem != NULL && sent > 0)
+		{
+			pg_atomic_add_fetch_u64(&Tier1Shmem->peers[target_node_id].bytes_send,
+									(uint64) sent);
+			Tier1Shmem->peers[target_node_id].last_send_at = GetCurrentTimestamp();
+		}
+		/*
+		 * Return false so caller knows the send is not yet complete;
+		 * buffered tail will drain on next call via the top-of-function
+		 * drain path.  Heartbeat counter is NOT bumped here -- the
+		 * caller (cluster_ic_tier1_send_heartbeat) bumps only on full
+		 * completion.
+		 */
 		return false;
 	}
 
@@ -809,8 +914,6 @@ cluster_ic_tier1_finish_connect(int32 peer_id, int peer_fd)
 {
 	int       so_error = 0;
 	socklen_t so_error_len = sizeof(so_error);
-	uint8     hello_buf[PGRAC_IC_HELLO_BYTES];
-	ssize_t   sent;
 	const char *self_cluster_name;
 
 	if (getsockopt(peer_fd, SOL_SOCKET, SO_ERROR, &so_error, &so_error_len) < 0
@@ -824,34 +927,78 @@ cluster_ic_tier1_finish_connect(int32 peer_id, int peer_fd)
 		return false;
 	}
 
-	/* Send HELLO (active edge speaks first per spec-2.2 §2.4). */
+	/*
+	 * Hardening v1.0.1 F1: seed HELLO send buffer + delegate to
+	 * continue_hello_send for the actual byte-pushing.  This lets
+	 * partial sends (TCP fragmentation on real LANs) recover via
+	 * subsequent WL_SOCKET_WRITEABLE wakeups without losing the
+	 * already-sent prefix.
+	 */
 	self_cluster_name = (ClusterConfShmem != NULL)
 		? ClusterConfShmem->cluster_name
 		: "";
-	cluster_ic_build_hello(hello_buf,
+	cluster_ic_build_hello(tier1_hello_send_buf[peer_id],
 						   PGRAC_IC_HELLO_VERSION_V1,
 						   PGRAC_IC_ENVELOPE_VERSION_V1,
 						   cluster_node_id,
 						   self_cluster_name);
+	tier1_hello_send_remaining[peer_id] = PGRAC_IC_HELLO_BYTES;
 
-	sent = send(peer_fd, hello_buf, PGRAC_IC_HELLO_BYTES, 0);
-	if (sent != PGRAC_IC_HELLO_BYTES)
+	return cluster_ic_tier1_continue_hello_send(peer_id, peer_fd);
+}
+
+/*
+ * Hardening v1.0.1 F1: continue an in-progress HELLO send.  Caller
+ * (LMON) invokes this from finish_connect AND on each WL_SOCKET_WRITEABLE
+ * wakeup until tier1_hello_send_remaining[peer_id] reaches 0; at that
+ * point the active side flips peer state to CONNECTED.
+ *
+ * Return semantics:
+ *   true  + remaining > 0 = partial send; LMON keeps WL_SOCKET_WRITEABLE
+ *   true  + remaining = 0 = HELLO complete; LMON should switch to READABLE
+ *   false                  = hard error; LMON should close + DOWN
+ */
+bool
+cluster_ic_tier1_continue_hello_send(int32 peer_id, int peer_fd)
+{
+	int     rem;
+	int     off;
+	ssize_t sent;
+
+	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES) return false;
+	if (peer_fd < 0) return false;
+
+	rem = tier1_hello_send_remaining[peer_id];
+	if (rem <= 0)
+		return true;     /* nothing to do (already complete) */
+
+	off = PGRAC_IC_HELLO_BYTES - rem;
+	sent = send(peer_fd, &tier1_hello_send_buf[peer_id][off],
+				(size_t) rem, 0);
+
+	if (sent < 0)
 	{
-		int saved = (sent < 0) ? errno : 0;
+		int saved = errno;
+
+		if (saved == EAGAIN || saved == EWOULDBLOCK)
+			return true;       /* will retry on next WRITEABLE */
 
 		peer_record_error(peer_id, saved, "08006",
-						  "HELLO send short or failed (%zd of %d): %s",
-						  sent, PGRAC_IC_HELLO_BYTES,
-						  saved ? strerror(saved) : "short write");
-		cluster_ic_tier1_close_peer(peer_id, "HELLO send failed");
+						  "HELLO send: %s", strerror(saved));
+		cluster_ic_tier1_close_peer(peer_id, "HELLO send error");
 		return false;
 	}
 
+	tier1_hello_send_remaining[peer_id] -= (int) sent;
+
+	if (tier1_hello_send_remaining[peer_id] > 0)
+		return true;           /* partial; LMON re-enters on next WRITEABLE */
+
 	/*
-	 * spec-2.2 §2.4 -- protocol is asymmetric: active sender considers
-	 * itself CONNECTED after a successful HELLO send.  Passive verifier
-	 * reads the HELLO and either CONNECTEDs or rejects + closes (active
-	 * detects rejection on next heartbeat send/recv).  No HELLO_ACK.
+	 * spec-2.2 §2.4 -- HELLO fully sent; active considers itself
+	 * CONNECTED.  Passive verifier reads the HELLO and either
+	 * CONNECTEDs or rejects + closes (active detects rejection on
+	 * next heartbeat send/recv).  No HELLO_ACK.
 	 */
 	if (Tier1Shmem != NULL)
 	{
@@ -981,6 +1128,132 @@ cluster_ic_tier1_send_heartbeat(int32 peer_id)
 	pg_atomic_add_fetch_u64(&Tier1Shmem->peers[peer_id].heartbeat_send_count, 1);
 	Tier1Shmem->peers[peer_id].last_heartbeat_sent_at = GetCurrentTimestamp();
 	return true;
+}
+
+/*
+ * Hardening v1.0.1 F1: anon-slot HELLO recv accumulator (passive side).
+ * See cluster_ic_tier1.h for full contract.  Replaces the single-shot
+ * recv_and_verify_hello path that assumed 64-byte HELLO arrived in
+ * one segment (broken on real-network TCP fragmentation).
+ */
+bool
+cluster_ic_tier1_continue_hello_recv(int anon_slot, int peer_fd,
+									 int32 *out_learned_peer_id)
+{
+	int                    len;
+	int                    need;
+	ssize_t                got;
+	ClusterICHelloMsg      msg;
+	const char            *self_cluster_name;
+	const ClusterNodeInfo *peer_info;
+	int32                  learned;
+
+	if (out_learned_peer_id != NULL)
+		*out_learned_peer_id = -1;
+	if (anon_slot < 0 || anon_slot >= CLUSTER_MAX_NODES) return false;
+	if (peer_fd < 0) return false;
+
+	len  = tier1_anon_hello_len[anon_slot];
+	need = PGRAC_IC_HELLO_BYTES - len;
+
+	if (need > 0)
+	{
+		got = recv(peer_fd, &tier1_anon_hello_buf[anon_slot][len],
+				   (size_t) need, 0);
+		if (got < 0)
+		{
+			int saved = errno;
+
+			if (saved == EAGAIN || saved == EWOULDBLOCK)
+				return true;       /* wait next WL_SOCKET_READABLE */
+			ereport(LOG,
+					(errmsg("cluster_ic tier1 HELLO recv error on anon slot %d: %s",
+							anon_slot, strerror(saved))));
+			return false;
+		}
+		if (got == 0)
+		{
+			ereport(LOG,
+					(errmsg("cluster_ic tier1 HELLO recv: peer EOF on anon slot %d",
+							anon_slot)));
+			return false;
+		}
+		tier1_anon_hello_len[anon_slot] += (int) got;
+
+		if (tier1_anon_hello_len[anon_slot] < PGRAC_IC_HELLO_BYTES)
+			return true;           /* partial; wait next READABLE */
+	}
+
+	/* Full HELLO assembled; parse + verify. */
+	if (!cluster_ic_parse_hello(tier1_anon_hello_buf[anon_slot], &msg))
+	{
+		ereport(LOG, (errmsg("cluster_ic tier1 HELLO bad magic on anon slot %d",
+							 anon_slot)));
+		return false;
+	}
+
+	if (msg.hello_version != PGRAC_IC_HELLO_VERSION_V1
+		|| msg.envelope_version != PGRAC_IC_ENVELOPE_VERSION_V1)
+	{
+		ereport(LOG,
+				(errmsg("cluster_ic tier1 HELLO version mismatch (hello=%u env=%u)",
+						msg.hello_version, msg.envelope_version)));
+		return false;
+	}
+
+	self_cluster_name = (ClusterConfShmem != NULL)
+		? ClusterConfShmem->cluster_name
+		: "";
+	if (ClusterConfShmem != NULL
+		&& strcmp(msg.cluster_name, self_cluster_name) != 0)
+	{
+		ereport(LOG,
+				(errmsg("cluster_ic tier1 HELLO cluster_name mismatch (peer=\"%s\" mine=\"%s\")",
+						msg.cluster_name, self_cluster_name)));
+		return false;
+	}
+
+	peer_info = cluster_conf_lookup_node(msg.source_node_id);
+	if (peer_info == NULL)
+	{
+		ereport(LOG,
+				(errmsg("cluster_ic tier1 HELLO unknown source_node_id %d",
+						msg.source_node_id)));
+		return false;
+	}
+
+	/* Bind learned peer_id; record state CONNECTED. */
+	learned = msg.source_node_id;
+	tier1_peer_fds[learned] = peer_fd;
+	if (Tier1Shmem != NULL)
+	{
+		peer_record_error(learned, 0, "", "");      /* clear any prior */
+		Tier1Shmem->peers[learned].state = (int32) CLUSTER_IC_PEER_CONNECTED;
+		Tier1Shmem->peers[learned].last_connect_at = GetCurrentTimestamp();
+		(void) peer_addr(learned);
+	}
+
+	if (out_learned_peer_id != NULL)
+		*out_learned_peer_id = learned;
+
+	ereport(LOG,
+			(errmsg("cluster_ic tier1 anon slot %d HELLO verified -> peer %d state CONNECTED",
+					anon_slot, learned)));
+	return true;
+}
+
+void
+cluster_ic_tier1_anon_hello_reset(int anon_slot)
+{
+	if (anon_slot < 0 || anon_slot >= CLUSTER_MAX_NODES) return;
+	tier1_anon_hello_len[anon_slot] = 0;
+}
+
+int
+cluster_ic_tier1_hello_send_remaining(int32 peer_id)
+{
+	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES) return 0;
+	return tier1_hello_send_remaining[peer_id];
 }
 
 /*

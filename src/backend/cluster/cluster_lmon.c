@@ -551,10 +551,11 @@ LmonMain(void)
 		 * fd lands in lmon_pending_fds[] until HELLO binds it to
 		 * tier1_peer_fds[learned_peer_id] and lmon_peer_track[].
 		 */
-#define LMON_SUB_DOWN          0
-#define LMON_SUB_CONNECT_PEND  1
-#define LMON_SUB_HELLO_WAIT    2
-#define LMON_SUB_CONNECTED     3
+#define LMON_SUB_DOWN           0
+#define LMON_SUB_CONNECT_PEND   1
+#define LMON_SUB_HELLO_SENDING  2     /* Hardening v1.0.1 F1: active partial-send tail */
+#define LMON_SUB_HELLO_WAIT     3     /* (legacy; passive uses anon path now) */
+#define LMON_SUB_CONNECTED      4
 
 		typedef struct LmonPeerTrack
 		{
@@ -684,6 +685,7 @@ LmonMain(void)
 					switch (lmon_peer_track[pi].substate)
 					{
 						case LMON_SUB_CONNECT_PEND:
+						case LMON_SUB_HELLO_SENDING:    /* F1: WRITEABLE for partial-HELLO drain */
 							events = WL_SOCKET_WRITEABLE;
 							break;
 						case LMON_SUB_HELLO_WAIT:
@@ -767,21 +769,42 @@ LmonMain(void)
 						&& (ev[i].events & WL_SOCKET_WRITEABLE))
 					{
 						/*
-						 * spec-2.2 §2.4 protocol is asymmetric -- active
-						 * side sends HELLO and immediately considers the
-						 * connection live; passive verifies HELLO and
-						 * either CONNECTEDs or rejects (closing socket;
-						 * active sees the rejection on next heartbeat
-						 * send/recv).  There is no HELLO_ACK round trip,
-						 * so active transitions CONNECT_PEND -> CONNECTED
-						 * directly (HELLO_WAIT is passive-only).
-						 * finish_connect handles the shmem peer-state
-						 * write to CONNECTED on success.
+						 * spec-2.2 §2.4 + Hardening v1.0.1 F1: active side
+						 * sends HELLO via per-peer buffer.  finish_connect
+						 * does SO_ERROR check + seeds buffer + first send.
+						 * If HELLO fully fits in one send, hello_send_remaining
+						 * goes to 0 and peer state flips to CONNECTED inside
+						 * continue_hello_send (called by finish_connect).
+						 * If partial, transition to HELLO_SENDING and re-enter
+						 * on next WRITEABLE.
 						 */
 						if (cluster_ic_tier1_finish_connect(peer, peer_fd))
 						{
-							lmon_peer_track[peer].substate = LMON_SUB_CONNECTED;
+							if (cluster_ic_tier1_hello_send_remaining(peer) == 0)
+								lmon_peer_track[peer].substate = LMON_SUB_CONNECTED;
+							else
+								lmon_peer_track[peer].substate = LMON_SUB_HELLO_SENDING;
 							wes_dirty = true;
+						}
+						else
+						{
+							lmon_peer_track[peer].fd = -1;
+							lmon_peer_track[peer].substate = LMON_SUB_DOWN;
+							wes_dirty = true;
+						}
+					}
+					else if (lmon_peer_track[peer].substate == LMON_SUB_HELLO_SENDING
+							 && (ev[i].events & WL_SOCKET_WRITEABLE))
+					{
+						/* Hardening v1.0.1 F1: continue partial HELLO send. */
+						if (cluster_ic_tier1_continue_hello_send(peer, peer_fd))
+						{
+							if (cluster_ic_tier1_hello_send_remaining(peer) == 0)
+							{
+								lmon_peer_track[peer].substate = LMON_SUB_CONNECTED;
+								wes_dirty = true;
+							}
+							/* else: still partial, keep WRITEABLE */
 						}
 						else
 						{
@@ -804,36 +827,39 @@ LmonMain(void)
 				}
 				else if (tag >= CLUSTER_MAX_NODES && tag < 2 * CLUSTER_MAX_NODES)
 				{
-					int  slot   = (int) (tag - CLUSTER_MAX_NODES);
-					int  pend_fd = lmon_pending_fds[slot];
-					int32 j;
+					int   slot    = (int) (tag - CLUSTER_MAX_NODES);
+					int   pend_fd = lmon_pending_fds[slot];
+					int32 learned = -1;
 
 					if (pend_fd < 0) continue;
 
-					if (cluster_ic_tier1_recv_and_verify_hello(-1, pend_fd))
+					/*
+					 * Hardening v1.0.1 F1: continue_hello_recv accumulates
+					 * partial HELLO bytes into per-anon-slot buffer; returns
+					 * true with learned == -1 while still partial, true with
+					 * learned >= 0 when HELLO fully verified.
+					 */
+					if (cluster_ic_tier1_continue_hello_recv(slot, pend_fd, &learned))
 					{
-						/*
-						 * recv_and_verify_hello set tier1_peer_fds[learned]
-						 * and shmem state to CONNECTED.  Find which peer
-						 * id got bound and migrate the fd into peer_track.
-						 */
-						for (j = 0; j < CLUSTER_MAX_NODES; j++)
+						if (learned >= 0)
 						{
-							if (cluster_ic_tier1_get_peer_fd(j) == pend_fd)
-							{
-								lmon_peer_track[j].fd = pend_fd;
-								lmon_peer_track[j].substate = LMON_SUB_CONNECTED;
-								break;
-							}
+							/* HELLO complete + verified.  Migrate fd into
+							 * peer_track + free anon slot. */
+							lmon_peer_track[learned].fd = pend_fd;
+							lmon_peer_track[learned].substate = LMON_SUB_CONNECTED;
+							lmon_pending_fds[slot] = -1;
+							cluster_ic_tier1_anon_hello_reset(slot);
+							wes_dirty = true;
 						}
-						lmon_pending_fds[slot] = -1;
-						wes_dirty = true;
+						/* else: still accumulating; keep fd registered as READABLE */
 					}
 					else
 					{
-						/* HELLO failed -- drop anonymous fd silently. */
+						/* HELLO failed (parse / verify / EOF / error).
+						 * Drop anonymous fd; reset slot accumulator. */
 						(void) close(pend_fd);
 						lmon_pending_fds[slot] = -1;
+						cluster_ic_tier1_anon_hello_reset(slot);
 						wes_dirty = true;
 					}
 				}
