@@ -67,12 +67,18 @@
 int cluster_node_id = -1;
 char *cluster_config_file = (char *)"pgrac.conf";
 bool cluster_allow_single_node = true; /* spec-2.1 D1; storage stub matches default */
-bool cluster_enabled = true; /* spec-2.1 Hardening v1.0.1 D-H7 -- F2 fix in
-                              * cluster_conf.c::cluster_conf_load adds an extern
-                              * reference to cluster_enabled (defensive guard).
-                              * Stub matches GUC default; tests do not exercise
-                              * the !cluster_enabled early-return path
-                              * (verified at TAP layer L11). */
+
+/*
+ * spec-2.1 Hardening v1.0.1 D-H7 -- F2 fix in cluster_conf.c::
+ * cluster_conf_load adds an extern reference to cluster_enabled
+ * (defensive guard).  Stub matches GUC default; tests do not
+ * exercise the !cluster_enabled early-return path (verified at
+ * TAP layer L11).  v1.0.2 D-I5 (codex review P2 post-Sprint B):
+ * moved the multi-line note above the declaration so the
+ * continuation lines use tabs (was inline with space-indented
+ * continuation, breaking git diff --check / PG style).
+ */
+bool cluster_enabled = true;
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),

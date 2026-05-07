@@ -160,6 +160,23 @@ const ClusterICOps ClusterICOps_Stub = {
 void
 cluster_ic_init(void)
 {
+	/*
+	 * spec-2.1 Hardening v1.0.2 D-I1 defensive guard (extends F2; codex
+	 * review P1 post-Sprint B): even if a future caller forgets the
+	 * cluster_enabled gate at the cluster_init_shmem call site,
+	 * cluster_ic_init itself must be a no-op when cluster.enabled=off.
+	 * Per L15 (spec-1.16 v0.2): early-return alone is not enough --
+	 * caller must also gate.  Both layers must hold (caller in
+	 * cluster_shmem.c::cluster_init_shmem + this defensive guard) to
+	 * prevent the same family bug as F2 (which was a v1.0.1 fix for
+	 * cluster_conf_load).  Without this guard, cluster.enabled=off +
+	 * cluster.interconnect_tier=tier1 would FATAL via the tier1 case
+	 * below (tier1 raises ERRCODE_FEATURE_NOT_SUPPORTED until Stage 2
+	 * lands), violating the vanilla PG path promise.
+	 */
+	if (!cluster_enabled)
+		return;
+
 	switch ((ClusterICTier)cluster_interconnect_tier) {
 	case CLUSTER_IC_TIER_STUB:
 		ClusterICOps_Active = &ClusterICOps_Stub;

@@ -235,6 +235,56 @@ like($l_stderr, qr/exceeds 1-hour cap/i,
 	'sleep param above 1-hour cap rejected by SQL SRF (P2-2 enforce)');
 
 
+# ----------
+# Test 14 (Hardening v1.0.2 D-I4 / codex review P2 post-Sprint B): the
+# GUC parser path (cluster.injection_points='name:sleep:param') must
+# enforce the same sleep param validation as the SQL SRF.  Pre-v1.0.2
+# the GUC parser only checked for unknown fault types and let any
+# numeric param pass straight to pg_usleep (uint64 wrap-around for
+# negative values; multi-second blocking for huge values).
+# ----------
+$node->stop;
+unlink $node->logfile;
+$node->adjust_conf('postgresql.conf', 'cluster.injection_points',
+	"'cluster-init-pre-shmem:sleep:-1'");
+$node->start;
+my $g_log_neg = PostgreSQL::Test::Utils::slurp_file($node->logfile);
+like($g_log_neg, qr/sleep param must be >= 0/i,
+	'GUC parser rejects negative sleep param (D-I4 / shared validate_fault_param)');
+
+
+# ----------
+# Test 15: GUC parser rejects sleep param > 1 hour cap.
+# ----------
+$node->stop;
+unlink $node->logfile;
+$node->adjust_conf('postgresql.conf', 'cluster.injection_points',
+	"'cluster-init-pre-shmem:sleep:3600000001'");
+$node->start;
+my $g_log_large = PostgreSQL::Test::Utils::slurp_file($node->logfile);
+like($g_log_large, qr/exceeds 1-hour cap/i,
+	'GUC parser rejects sleep param above 1-hour cap (D-I4)');
+
+
+# ----------
+# Test 16: GUC parser still rejects unknown fault type (regression
+# guard -- pre-v1.0.2 this WARNING already existed but moved into
+# shared validate_fault_param helper).
+# ----------
+$node->stop;
+unlink $node->logfile;
+$node->adjust_conf('postgresql.conf', 'cluster.injection_points',
+	"'cluster-init-pre-shmem:definitely-not-a-real-type'");
+$node->start;
+my $g_log_unk = PostgreSQL::Test::Utils::slurp_file($node->logfile);
+like($g_log_unk, qr/unknown cluster injection fault type/i,
+	'GUC parser rejects unknown fault type (D-I4 regression guard)');
+
+
+# Restore the GUC for downstream consumers / clean shutdown.
+$node->stop;
+$node->adjust_conf('postgresql.conf', 'cluster.injection_points', "''");
+$node->start;
 $node->stop;
 
 done_testing();

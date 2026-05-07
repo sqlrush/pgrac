@@ -472,8 +472,25 @@ cluster_init_shmem(void)
 	 * cluster_init_shmem -- because (a) GUCs are already loaded and
 	 * (b) Stage 2+ will need shmem to be ready when the tier_init
 	 * hook fires.
+	 *
+	 * spec-2.1 Hardening v1.0.2 D-I1 (extends F2; codex review P1
+	 * post-Sprint B): gate cluster_ic_init on cluster_enabled (caller
+	 * primary, per L15 pattern -- same as cluster_conf_load above).
+	 * Without this gate, cluster.enabled=off + cluster.interconnect_tier=
+	 * tier1 would FATAL inside cluster_ic_init (tier1 raises
+	 * ERRCODE_FEATURE_NOT_SUPPORTED until Stage 2 implementation lands),
+	 * violating the postgresql.conf.sample promise that cluster.enabled=
+	 * off means "vanilla PG behaviour: no cluster shmem, no SCN advance,
+	 * no IC tier_init".  v1.0.1 only gated cluster_conf_load -- v1.0.2
+	 * extends the same caller gate to cluster_ic_init.  cluster_ic_init
+	 * itself also has a defensive early-return on !cluster_enabled
+	 * (belt-and-suspenders; same family as cluster_conf_load defensive
+	 * guard).  Cross-ref lessons L11/L15/L36/L48 (cluster_enabled gate
+	 * forgot family) -- this is the second neighbor of F2 caught by
+	 * post-ship review (codex follow-up scan 2026-05-07 P1).
 	 */
-	cluster_ic_init();
+	if (cluster_enabled)
+		cluster_ic_init();
 
 	CLUSTER_INJECTION_POINT("cluster-init-post-shmem");
 }

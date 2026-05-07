@@ -51,7 +51,7 @@ die() {
 
 usage() {
     cat <<EOF
-$PROGNAME runs stage-0 acceptance smoke checks on a running pgrac cluster.
+$PROGNAME runs Stage 1+/2.1 acceptance smoke checks on a running pgrac cluster.
 
 Usage:
   $PROGNAME [OPTION]...
@@ -296,9 +296,9 @@ check_sql "phase.cluster_phase = 'init'" \
 TOTAL=$((PASS_COUNT + FAIL_COUNT))
 echo
 if [ "$FAIL_COUNT" -eq 0 ]; then
-    echo "${C_BOLD}${C_GREEN}${PASS_COUNT}/${TOTAL} checks passed.  Stage 0 acceptance: GREEN.${C_RESET}"
+    echo "${C_BOLD}${C_GREEN}${PASS_COUNT}/${TOTAL} checks passed.  Stage 1+/2.1 acceptance: GREEN.${C_RESET}"
     exit 0
 else
-    echo "${C_BOLD}${C_RED}${FAIL_COUNT}/${TOTAL} checks FAILED.  Stage 0 acceptance: RED.${C_RESET}"
+    echo "${C_BOLD}${C_RED}${FAIL_COUNT}/${TOTAL} checks FAILED.  Stage 1+/2.1 acceptance: RED.${C_RESET}"
     exit 1
 fi

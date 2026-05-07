@@ -71,10 +71,9 @@ Modes:
   --quick (default)  9 combos: scale 50 × 3 modes × 3 clients (~1.5 hour)
   --full             27 combos: [10,50,100] × 3 modes × 3 clients (~4.5 hour)
 
-Required env:
+Required env (no defaults; both must be set explicitly):
   VANILLA_BINDIR    absolute path to vanilla PG 16.13 install bin/ dir
-  PGRAC_BINDIR      absolute path to pgrac --enable-cluster install bin/
-                    dir (default: /Users/yingjiewang/linkdb-install/bin)
+  PGRAC_BINDIR      absolute path to pgrac --enable-cluster install bin/ dir
 
 Optional env:
   DURATION          per-combo wallclock seconds (default: 600)
@@ -101,6 +100,17 @@ esac
 
 if [[ -z "$VANILLA_BINDIR" ]]; then
     echo "$PROGNAME: VANILLA_BINDIR env var required" >&2
+    usage
+    exit 2
+fi
+
+# Hardening v1.0.2 D-I7 (codex review P3 post-Sprint B): symmetric
+# enforcement.  Pre-v1.0.2 only VANILLA_BINDIR was checked; PGRAC_BINDIR
+# fell through to a stale personal-path default (/Users/yingjiewang/...)
+# which broke on every fresh install.  v1.0.1 cleared the default but
+# left the asymmetric check.
+if [[ -z "$PGRAC_BINDIR" ]]; then
+    echo "$PROGNAME: PGRAC_BINDIR env var required" >&2
     usage
     exit 2
 fi

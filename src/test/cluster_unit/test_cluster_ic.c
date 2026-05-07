@@ -82,6 +82,15 @@
 int cluster_node_id = -1;
 int cluster_interconnect_tier = 0; /* CLUSTER_IC_TIER_STUB */
 
+/*
+ * spec-2.1 Hardening v1.0.2 D-I1 -- F2 extension fix in cluster_ic.c::
+ * cluster_ic_init adds an extern reference to cluster_enabled
+ * (defensive guard mirroring the cluster_conf_load v1.0.1 pattern).
+ * Stub matches GUC default; tests do not exercise the
+ * !cluster_enabled early-return path (verified at TAP layer L12).
+ */
+bool cluster_enabled = true;
+
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 					 const char *fileName pg_attribute_unused(),

@@ -307,4 +307,47 @@ unlike($log, qr/declares zero \[node\.N\]/,
 $node->stop;
 
 
+# ============================================================
+# L12 ★ Hardening v1.0.2 D-I2 (extends F2; codex review P1
+#      post-Sprint B): cluster.enabled=off + cluster.interconnect_tier=
+#      tier1 -> startup OK (vanilla PG path).  Verifies the F2
+#      extension that gates cluster_ic_init on cluster_enabled (caller
+#      in cluster_init_shmem + defensive guard inside cluster_ic_init).
+#      Pre-Hardening v1.0.2 this combination FATAL'd because
+#      cluster_ic_init ran unconditionally and tier1 raises
+#      ERRCODE_FEATURE_NOT_SUPPORTED until Stage 2 lands.  L11 only
+#      covered the cluster_conf_load path (the v1.0.1 fix); L12 covers
+#      the cluster_ic_init path (the v1.0.2 fix).  Without both gates,
+#      the postgresql.conf.sample promise "off = vanilla PG / no IC
+#      tier_init" is a lie.
+# ============================================================
+$node->stop;
+unlink $conf_path;    # B1-style: pgrac.conf absent
+# cluster.enabled = off (already set above by L11 append_to_file --
+# verify it is still there; if not, append again)
+my $pg_conf_now = PostgreSQL::Test::Utils::slurp_file(
+	$node->data_dir . '/postgresql.conf');
+if ($pg_conf_now !~ /^cluster\.enabled\s*=\s*off/m)
+{
+	PostgreSQL::Test::Utils::append_to_file(
+		$node->data_dir . '/postgresql.conf',
+		"cluster.enabled = off\n");
+}
+# cluster.interconnect_tier = tier1 -- normally raises FEATURE_NOT_SUPPORTED
+# inside cluster_ic_init, but cluster.enabled=off must bypass that.
+PostgreSQL::Test::Utils::append_to_file(
+	$node->data_dir . '/postgresql.conf',
+	"cluster.interconnect_tier = tier1\n");
+unlink $node->logfile;
+$node->start;    # MUST succeed (vanilla PG path; IC tier_init bypassed)
+
+$log = PostgreSQL::Test::Utils::slurp_file($node->logfile);
+unlike($log, qr/cluster\.interconnect_tier=tier1 is not implemented/,
+	'L12 cluster.enabled=off bypass -- no tier1 FEATURE_NOT_SUPPORTED FATAL');
+unlike($log, qr/tier1 \(TCP\) lands in Stage 2/,
+	'L12 cluster.enabled=off bypass -- no tier1 errhint reached');
+
+$node->stop;
+
+
 done_testing();

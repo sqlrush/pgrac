@@ -48,7 +48,7 @@ pgrac-init  -D "$PGDATA" --node-id 1 -o "-A trust"
 pgrac-start -D "$PGDATA" -o "-p 65432" -l "$PGDATA/postmaster.log"
 
 pgrac-acceptance --port 65432
-# → 10/10 checks passed.  Stage 0 acceptance: GREEN.
+# → 10/10 checks passed.  Stage 1+/2.1 acceptance: GREEN.
 
 pg_ctl -D "$PGDATA" stop -m fast
 rm -rf "$PGDATA"

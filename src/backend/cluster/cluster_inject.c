@@ -326,6 +326,56 @@ parse_fault_type(const char *s)
 }
 
 
+/*
+ * spec-2.1 Hardening v1.0.2 D-I3 (codex review P2 post-Sprint B):
+ * shared validator for fault type + param.  Both arm entry points
+ * (SQL SRF cluster_inject_fault and GUC parser at line ~588) must
+ * call this to enforce identical strict semantics.  v1.0.1 only
+ * enforced strict validation in the SQL SRF; the GUC colon-form
+ * (cluster.injection_points='name:sleep:-1') bypassed it and went
+ * straight to pg_usleep with a wrap-around uint64.  Extracting a
+ * single validator + calling from both sites prevents the same
+ * bug from resurfacing as new arm entry points are added (Stage
+ * 2.X is expected to introduce more inject scaffolding).
+ *
+ * Returns FAULT_VALIDATE_OK and writes resolved type to *out_type
+ * on success.  On failure, writes the resolved (probably NONE)
+ * type and returns a tag indicating which validation failed; the
+ * caller is responsible for choosing ereport severity (SQL SRF
+ * uses ERROR; GUC parser uses WARNING + skip per existing
+ * pattern).
+ */
+typedef enum {
+	FAULT_VALIDATE_OK,
+	FAULT_VALIDATE_UNKNOWN_TYPE,
+	FAULT_VALIDATE_NEGATIVE_SLEEP,
+	FAULT_VALIDATE_SLEEP_TOO_LARGE
+} ClusterInjectValidateResult;
+
+#define CLUSTER_INJECT_SLEEP_CAP_US (INT64CONST(3600) * 1000 * 1000)
+
+static ClusterInjectValidateResult
+validate_fault_param(const char *type_str, int64 param,
+					 ClusterInjectFaultType *out_type)
+{
+	*out_type = parse_fault_type(type_str);
+
+	if (*out_type == CLUSTER_FAULT_NONE
+		&& (type_str == NULL || pg_strcasecmp(type_str, "none") != 0))
+		return FAULT_VALIDATE_UNKNOWN_TYPE;
+
+	if (*out_type == CLUSTER_FAULT_SLEEP)
+	{
+		if (param < 0)
+			return FAULT_VALIDATE_NEGATIVE_SLEEP;
+		if (param > CLUSTER_INJECT_SLEEP_CAP_US)
+			return FAULT_VALIDATE_SLEEP_TOO_LARGE;
+	}
+
+	return FAULT_VALIDATE_OK;
+}
+
+
 static const char *
 fault_type_name(ClusterInjectFaultType t)
 {
@@ -579,18 +629,49 @@ cluster_injection_assign_hook(const char *newval, void *extra)
 		if (colon != NULL) {
 			char *type_str = colon + 1;
 			char *param_colon = strchr(type_str, ':');
+			ClusterInjectValidateResult vr;
 
 			*colon = '\0';
 			if (param_colon != NULL) {
 				*param_colon = '\0';
 				arm_param = strtoll(param_colon + 1, NULL, 10);
 			}
-			arm_type = parse_fault_type(type_str);
-			if (arm_type == CLUSTER_FAULT_NONE) {
-				ereport(WARNING,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("unknown cluster injection fault type: \"%s\"", type_str)));
-				continue;
+
+			/*
+			 * Hardening v1.0.2 D-I3 (codex review P2 post-Sprint B):
+			 * use the same validate_fault_param helper as the SQL SRF.
+			 * Pre-v1.0.2 this path only checked unknown type and let
+			 * negative / huge sleep params pass through to pg_usleep
+			 * (uint64 wrap-around).  Per the GUC parser pattern keep
+			 * WARNING + skip semantics (existing behaviour for unknown
+			 * type) so a single malformed entry does not FATAL the
+			 * postmaster startup.
+			 */
+			vr = validate_fault_param(type_str, arm_param, &arm_type);
+			switch (vr)
+			{
+				case FAULT_VALIDATE_OK:
+					break;
+				case FAULT_VALIDATE_UNKNOWN_TYPE:
+					ereport(WARNING,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("unknown cluster injection fault type: \"%s\"",
+									type_str)));
+					continue;
+				case FAULT_VALIDATE_NEGATIVE_SLEEP:
+					ereport(WARNING,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("cluster injection sleep param must be >= 0 "
+									"microseconds (got %lld)",
+									(long long) arm_param)));
+					continue;
+				case FAULT_VALIDATE_SLEEP_TOO_LARGE:
+					ereport(WARNING,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("cluster injection sleep param exceeds 1-hour "
+									"cap of 3600000000 us (got %lld)",
+									(long long) arm_param)));
+					continue;
 			}
 		}
 
@@ -681,41 +762,45 @@ cluster_inject_fault(PG_FUNCTION_ARGS)
 	}
 
 	/*
-	 * Hardening v1.0.1 / codex review P2-2: validate fault type strictly.
-	 * parse_fault_type returns CLUSTER_FAULT_NONE for both the explicit
-	 * string "none" AND any unknown input -- pre-Hardening this silently
-	 * mapped typos / invalid types to a no-op arm and returned true,
-	 * masking misconfigured tests.  Treat any non-"none" string that
-	 * resolves to NONE as an ERROR.
+	 * Hardening v1.0.1 / codex review P2-2: validate fault type strictly
+	 * (unknown -> ERROR) + sleep param range (0..1h us).
+	 *
+	 * v1.0.2 D-I3 refactor: shared validate_fault_param helper; same
+	 * checks now also run in the GUC parser path (line ~588 below).
+	 * Pre-v1.0.2 the SQL SRF was strict but the GUC colon-form
+	 * (cluster.injection_points='name:sleep:-1') bypassed validation.
 	 */
-	new_type = parse_fault_type(type_str);
-	if (new_type == CLUSTER_FAULT_NONE && pg_strcasecmp(type_str, "none") != 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("unknown cluster injection fault type: \"%s\"", type_str),
-				 errhint("Valid fault types: none, error, warning, sleep, "
-						 "crash, skip.")));
-
-	/*
-	 * Hardening v1.0.1 / codex review P2-2: validate sleep param range.
-	 * pg_usleep takes long; reject negative values and cap at 1 hour
-	 * (3600 * 1e6 us).  Negative reaches pg_usleep as a giant unsigned
-	 * (param is stored as uint64); excessive sleeps would silently
-	 * stall test backends.
-	 */
-	if (new_type == CLUSTER_FAULT_SLEEP)
 	{
-		if (param < 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("cluster injection sleep param must be >= 0 "
-							"microseconds (got %lld)", (long long) param)));
-		if (param > INT64CONST(3600) * 1000 * 1000)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("cluster injection sleep param exceeds 1-hour "
-							"cap of 3600000000 us (got %lld)",
-							(long long) param)));
+		ClusterInjectValidateResult vr =
+			validate_fault_param(type_str, param, &new_type);
+
+		switch (vr)
+		{
+			case FAULT_VALIDATE_OK:
+				break;
+			case FAULT_VALIDATE_UNKNOWN_TYPE:
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("unknown cluster injection fault type: \"%s\"",
+								type_str),
+						 errhint("Valid fault types: none, error, warning, "
+								 "sleep, crash, skip.")));
+				break;
+			case FAULT_VALIDATE_NEGATIVE_SLEEP:
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("cluster injection sleep param must be >= 0 "
+								"microseconds (got %lld)",
+								(long long) param)));
+				break;
+			case FAULT_VALIDATE_SLEEP_TOO_LARGE:
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("cluster injection sleep param exceeds 1-hour "
+								"cap of 3600000000 us (got %lld)",
+								(long long) param)));
+				break;
+		}
 	}
 
 	cluster_injection_arm_internal(p, new_type, param);
