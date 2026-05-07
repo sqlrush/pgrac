@@ -124,12 +124,27 @@ stub_send_bytes(int32 target_node_id, const void *buf pg_attribute_unused(),
 }
 
 static bool
+stub_peek_sender(int32 *out_sender_node_id pg_attribute_unused())
+{
+	/* Stub mode never has data ready. */
+	return false;
+}
+
+static bool
 stub_recv_bytes(int32 *out_sender_node_id pg_attribute_unused(), void *buf pg_attribute_unused(),
 				size_t bufsize pg_attribute_unused(),
 				size_t *out_received_len pg_attribute_unused())
 {
-	/* No listener exists in stub mode; nothing is ever received. */
-	return false;
+	/*
+	 * No listener exists in stub mode; nothing is ever received.
+	 * Per spec-2.2 D2 strict bool semantics: return true with received=0
+	 * (NOT false; false is reserved for hard error).
+	 */
+	if (out_received_len != NULL)
+		*out_received_len = 0;
+	if (out_sender_node_id != NULL)
+		*out_sender_node_id = -1;
+	return true;
 }
 
 static void
@@ -147,6 +162,7 @@ stub_tier_shutdown(void)
 const ClusterICOps ClusterICOps_Stub = {
 	.send_bytes = stub_send_bytes,
 	.recv_bytes = stub_recv_bytes,
+	.peek_sender = stub_peek_sender,
 	.tier_init = stub_tier_init,
 	.tier_shutdown = stub_tier_shutdown,
 	.tier_name = "stub",
@@ -316,10 +332,38 @@ cluster_ic_recv_exact(int32 *out_sender_node_id, void *buf, size_t bufsize,
 
 	while (total < bufsize)
 	{
+		int32  next_sender = -1;
 		size_t got = 0;
 		int32  this_sender = -1;
 		bool   ok;
 
+		/*
+		 * spec-2.2 D2 (post-codex review) -- peek BEFORE consume.
+		 *
+		 * Pre-codex-review (Sprint A Step 1-5 commit f4797e6001),
+		 * recv_exact called recv_bytes first, then checked
+		 * this_sender against accumulated sender; on mismatch it
+		 * returned false WITH THE NEXT-SENDER'S BYTES ALREADY
+		 * CONSUMED into the caller's buffer.  That polluted the
+		 * buffer + advanced mock queue state, making the failure
+		 * non-recoverable.
+		 *
+		 * Post-codex-review: peek the next-ready chunk's sender
+		 * first (pure, no state mutation).  If we already have
+		 * partial data (total > 0) and the next chunk's sender
+		 * differs, stop the loop with partial OK -- caller decides
+		 * whether partial is acceptable or to error out (header /
+		 * envelope readers will treat partial as "short message",
+		 * drop the connection in tier1).  No bytes from the wrong
+		 * sender are ever consumed.
+		 */
+		if (!ClusterICOps_Active->peek_sender(&next_sender))
+			break; /* no chunk ready; partial OK */
+
+		if (total > 0 && next_sender != sender)
+			break; /* sender flip detected BEFORE consume; stop with partial */
+
+		/* Safe to consume now: next chunk is from same peer (or first). */
 		ok = ClusterICOps_Active->recv_bytes(&this_sender,
 											 cursor + total,
 											 bufsize - total,
@@ -327,31 +371,20 @@ cluster_ic_recv_exact(int32 *out_sender_node_id, void *buf, size_t bufsize,
 		if (!ok)
 		{
 			/*
-			 * Vtable signals "no data right now" (mock empty queue;
-			 * tier1 EAGAIN; etc).  Treat as clean partial -- return
-			 * what we have so far.  Caller distinguishes "got full N"
-			 * vs "got partial" via *out_received_len comparison;
-			 * partial is NOT an error here, just back-pressure for the
-			 * caller's wait loop (LmonMain WaitEventSet for tier1).
-			 */
-			break;
-		}
-		if (got == 0)
-			break; /* defensive: vtable signals no data via this path too */
-
-		if (total == 0)
-			sender = this_sender;
-		else if (this_sender != sender)
-		{
-			/*
-			 * Sender flip mid-read: queue boundary at a different peer.
-			 * For a wire-format unit (header / envelope) this is a
-			 * protocol violation.  Signal failure; caller must decide
-			 * how to recover (typically: drop connection in tier1; in
-			 * mock-tests this means the test setup is wrong).
+			 * Hard error from vtable (tier1 ECONNRESET / EPIPE; mock
+			 * never reaches here per strict bool semantics).  Propagate
+			 * failure; caller (cluster_msg_recv etc) drops connection.
 			 */
 			return false;
 		}
+
+		if (got == 0)
+			break; /* race: peek said data but vtable now reports none */
+
+		Assert(this_sender == next_sender); /* peek invariant */
+
+		if (total == 0)
+			sender = this_sender;
 
 		total += got;
 	}
@@ -377,6 +410,132 @@ cluster_ic_recv_exact(int32 *out_sender_node_id, void *buf, size_t bufsize,
  * ============================================================ */
 
 static uint32 ic_global_seq_no = 0;
+
+
+/* ============================================================
+ * spec-2.2 D2 (post-codex review) -- HELLO wire encode/decode.
+ *
+ * StaticAssertDecl locks the in-memory struct size; the build/parse
+ * helpers lock the WIRE byte layout independently.  The two checks
+ * together prevent (a) compiler-padded struct ABI drift and (b)
+ * silent endian / alignment surprises on the wire.
+ *
+ * Wire layout (little-endian, all multi-byte integers):
+ *
+ *   offset  bytes  field
+ *   ------  -----  ---------------------------------------------
+ *      0      4    magic (PGRAC_IC_HELLO_MAGIC = 0x4F4C4C48)
+ *      4      2    hello_version (PGRAC_IC_HELLO_VERSION_V1 = 1)
+ *      6      2    envelope_version (PGRAC_IC_ENVELOPE_VERSION_V1 = 1)
+ *      8      4    source_node_id (signed int32)
+ *     12     24    cluster_name (NUL-terminated; truncated to 23 + NUL)
+ *     36     28    _pad (always zero on send;ignored on receive)
+ *   ------  -----
+ *   total   64
+ *
+ * Locked at test_cluster_ic.c::test_hello_wire_roundtrip via a
+ * fixed reference byte vector.  Any future bump goes via a new
+ * struct + dispatch on hello_version (NEVER resize V1 in-place).
+ * ============================================================ */
+
+StaticAssertDecl(sizeof(ClusterICHelloMsg) == PGRAC_IC_HELLO_BYTES,
+				 "ClusterICHelloMsg ABI size lock (spec-2.2 §2.4)");
+
+static inline void
+ic_le_write_uint16(uint8 *buf, uint16 v)
+{
+	buf[0] = (uint8) (v & 0xFF);
+	buf[1] = (uint8) ((v >> 8) & 0xFF);
+}
+
+static inline void
+ic_le_write_uint32(uint8 *buf, uint32 v)
+{
+	buf[0] = (uint8) (v & 0xFF);
+	buf[1] = (uint8) ((v >> 8) & 0xFF);
+	buf[2] = (uint8) ((v >> 16) & 0xFF);
+	buf[3] = (uint8) ((v >> 24) & 0xFF);
+}
+
+static inline uint16
+ic_le_read_uint16(const uint8 *buf)
+{
+	return ((uint16) buf[0])
+		 | ((uint16) buf[1] << 8);
+}
+
+static inline uint32
+ic_le_read_uint32(const uint8 *buf)
+{
+	return ((uint32) buf[0])
+		 | ((uint32) buf[1] << 8)
+		 | ((uint32) buf[2] << 16)
+		 | ((uint32) buf[3] << 24);
+}
+
+void
+cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES],
+					   uint16 hello_version,
+					   uint16 envelope_version,
+					   int32  source_node_id,
+					   const char *cluster_name)
+{
+	size_t name_len;
+
+	Assert(out_buf != NULL);
+	Assert(cluster_name != NULL);
+
+	/*
+	 * Zero the entire buffer first so the _pad region is deterministic
+	 * (no uninitialized stack bytes leak onto the wire) and any future
+	 * field added before _pad starts from a clean slate.
+	 */
+	memset(out_buf, 0, PGRAC_IC_HELLO_BYTES);
+
+	ic_le_write_uint32(out_buf + 0,  PGRAC_IC_HELLO_MAGIC);
+	ic_le_write_uint16(out_buf + 4,  hello_version);
+	ic_le_write_uint16(out_buf + 6,  envelope_version);
+	ic_le_write_uint32(out_buf + 8,  (uint32) source_node_id);
+
+	/* cluster_name: copy up to PGRAC_IC_CLUSTER_NAME_MAX-1 chars + NUL. */
+	name_len = strlen(cluster_name);
+	if (name_len > PGRAC_IC_CLUSTER_NAME_MAX - 1)
+		name_len = PGRAC_IC_CLUSTER_NAME_MAX - 1;
+	if (name_len > 0)
+		memcpy(out_buf + 12, cluster_name, name_len);
+	/* out_buf[12 + name_len] .. out_buf[35] already zero from memset. */
+}
+
+bool
+cluster_ic_parse_hello(const uint8 in_buf[PGRAC_IC_HELLO_BYTES],
+					   ClusterICHelloMsg *out_msg)
+{
+	uint32 magic;
+
+	Assert(in_buf != NULL);
+	Assert(out_msg != NULL);
+
+	magic = ic_le_read_uint32(in_buf + 0);
+	if (magic != PGRAC_IC_HELLO_MAGIC)
+		return false;
+
+	out_msg->magic            = magic;
+	out_msg->hello_version    = ic_le_read_uint16(in_buf + 4);
+	out_msg->envelope_version = ic_le_read_uint16(in_buf + 6);
+	out_msg->source_node_id   = (int32) ic_le_read_uint32(in_buf + 8);
+
+	/*
+	 * Copy cluster_name region; ensure terminator inside the field
+	 * even if the wire bytes are not NUL-terminated (defensive).
+	 */
+	memcpy(out_msg->cluster_name, in_buf + 12, PGRAC_IC_CLUSTER_NAME_MAX);
+	out_msg->cluster_name[PGRAC_IC_CLUSTER_NAME_MAX - 1] = '\0';
+
+	/* Pad: caller does not need it; zero out for cleanliness. */
+	memset(out_msg->_pad, 0, sizeof(out_msg->_pad));
+
+	return true;
+}
 
 static pg_crc32c
 compute_msg_crc(const ClusterMsgHeader *hdr, const void *payload, uint32 payload_len)
@@ -424,7 +583,18 @@ cluster_msg_recv(ClusterMsgHeader *out_hdr, void *payload_buf, uint32 payload_bu
 	size_t payload_received;
 	pg_crc32c expected_crc;
 
-	if (!cluster_ic_recv_bytes(&sender_node_id, out_hdr, sizeof(*out_hdr), &hdr_received))
+	/*
+	 * spec-2.2 D2 / Q11=A / P2-1 fix (post-codex-review close):
+	 *
+	 * Use cluster_ic_recv_exact for the 24-byte fixed-size header.
+	 * Pre-fix this called cluster_ic_recv_bytes single-call which
+	 * returned partial reads as "short header" errors -- a normal TCP
+	 * short read (kernel buffering) would be misinterpreted as wire
+	 * corruption, dropping otherwise-valid messages.  recv_exact
+	 * loops until the full 24 bytes arrive from a single peer
+	 * (or sender flip / hard error / EOF).
+	 */
+	if (!cluster_ic_recv_exact(&sender_node_id, out_hdr, sizeof(*out_hdr), &hdr_received))
 		return false;
 
 	if (hdr_received != sizeof(*out_hdr)) {
@@ -452,8 +622,22 @@ cluster_msg_recv(ClusterMsgHeader *out_hdr, void *payload_buf, uint32 payload_bu
 	}
 
 	if (out_hdr->payload_len > 0) {
-		if (!cluster_ic_recv_bytes(&sender_node_id, payload_buf, payload_buf_size,
-								   &payload_received))
+		/*
+		 * spec-2.2 D2 / Q11=A / P2-1 fix (post-codex-review close):
+		 *
+		 * Use cluster_ic_recv_exact AND request out_hdr->payload_len
+		 * bytes (NOT payload_buf_size).  Pre-fix this requested the
+		 * caller's full buffer size, which would over-read into the
+		 * NEXT frame on the wire and desync the stream irrecoverably.
+		 * The header's payload_len is the authoritative byte count
+		 * for THIS message; over-reading is a wire-protocol bug that
+		 * would surface only when tier1 (TCP) ships in spec-2.2 D3.
+		 *
+		 * We've already validated payload_len <= payload_buf_size
+		 * just above, so passing payload_len to recv_exact is safe.
+		 */
+		if (!cluster_ic_recv_exact(&sender_node_id, payload_buf,
+								   out_hdr->payload_len, &payload_received))
 			return false;
 
 		if (payload_received != out_hdr->payload_len) {
@@ -663,6 +847,30 @@ mock_send_bytes(int32 target_node_id, const void *buf, size_t len)
 }
 
 static bool
+mock_peek_sender(int32 *out_sender_node_id)
+{
+	MockQueueEntry *e;
+
+	mock_state_init();
+
+	/*
+	 * spec-2.2 D2 -- pure peek (no state mutation).  Used by
+	 * cluster_ic_recv_exact to detect sender flip BEFORE consuming
+	 * bytes from a different peer (which would pollute the caller's
+	 * buffer).  Returns true with *out_sender set if queue head has
+	 * an unconsumed chunk; false if queue empty.
+	 */
+	e = mock_inbound_queue ? mock_inbound_queue->head : NULL;
+	if (e == NULL)
+		return false;
+
+	Assert(e->len > e->consumed);
+	if (out_sender_node_id != NULL)
+		*out_sender_node_id = e->sender_node_id;
+	return true;
+}
+
+static bool
 mock_recv_bytes(int32 *out_sender_node_id, void *buf, size_t bufsize, size_t *out_received_len)
 {
 	MockQueueEntry *e;
@@ -690,15 +898,21 @@ mock_recv_bytes(int32 *out_sender_node_id, void *buf, size_t bufsize, size_t *ou
 	if (e == NULL)
 	{
 		/*
-		 * Empty queue -- preserve PG-convention "false = no data
-		 * available" (matches pre-spec-2.2 mock_recv_bytes contract).
-		 * cluster_ic_recv_exact treats false from vtable as "stop
-		 * loop with whatever we accumulated so far" rather than hard
-		 * error; the existing cluster_ic_mock_recv_test SRF gates row
-		 * emission on this bool return so empty queue => zero rows
-		 * (014_ic_mock.pl tests 5 + 8 lock this).
+		 * spec-2.2 D2 STRICT bool semantics (post-codex review): empty
+		 * queue is "no data ready" -- return true with received=0,
+		 * NOT false.  False is reserved for hard error (which mock
+		 * never has).  Tier1 will use false ONLY for ECONNRESET /
+		 * EPIPE / unrecoverable socket state.
+		 *
+		 * SRF cluster_ic_mock_recv_test now gates row emission on
+		 * received > 0 (instead of bool), so 014_ic_mock.pl tests
+		 * 5 + 8 still emit zero rows for empty queue.
 		 */
-		return false;
+		if (out_received_len != NULL)
+			*out_received_len = 0;
+		if (out_sender_node_id != NULL)
+			*out_sender_node_id = -1;
+		return true;
 	}
 
 	remaining = e->len - e->consumed;
@@ -746,6 +960,7 @@ mock_tier_shutdown(void)
 const ClusterICOps ClusterICOps_Mock = {
 	.send_bytes = mock_send_bytes,
 	.recv_bytes = mock_recv_bytes,
+	.peek_sender = mock_peek_sender,
 	.tier_init = mock_tier_init,
 	.tier_shutdown = mock_tier_shutdown,
 	.tier_name = "mock",
@@ -820,9 +1035,18 @@ tier1_stub_tier_shutdown(void)
 	/* No-op: stub allocated nothing. */
 }
 
+static bool
+tier1_stub_peek_sender(int32 *out_sender_node_id pg_attribute_unused())
+{
+	/* Stub never has data ready; D3 will implement real peek over
+	 * per-peer fd readability. */
+	return false;
+}
+
 const ClusterICOps ClusterICOps_Tier1 = {
 	.send_bytes = tier1_stub_send_bytes,
 	.recv_bytes = tier1_stub_recv_bytes,
+	.peek_sender = tier1_stub_peek_sender,
 	.tier_init = tier1_stub_tier_init,
 	.tier_shutdown = tier1_stub_tier_shutdown,
 	.tier_name = "tier1-stub-pending-D3",
@@ -950,7 +1174,16 @@ cluster_ic_mock_recv_test(PG_FUNCTION_ARGS)
 	InitMaterializedSRF(fcinfo, 0);
 	rsinfo = (ReturnSetInfo *)fcinfo->resultinfo;
 
-	if (cluster_ic_recv_bytes(&sender, buf, sizeof(buf), &received)) {
+	/*
+	 * spec-2.2 D2 STRICT bool semantics (post-codex-review):
+	 * cluster_ic_recv_bytes now returns true with received=0 for
+	 * empty queue (false reserved for hard error).  Gate row
+	 * emission on received > 0 so empty queue still emits zero rows
+	 * (014_ic_mock.pl tests 5 + 8 lock this behaviour).
+	 */
+	if (cluster_ic_recv_bytes(&sender, buf, sizeof(buf), &received)
+		&& received > 0)
+	{
 		Datum values[2];
 		bool nulls[2] = { false, false };
 		bytea *payload_bytea;
@@ -959,8 +1192,7 @@ cluster_ic_mock_recv_test(PG_FUNCTION_ARGS)
 
 		payload_bytea = (bytea *)palloc(VARHDRSZ + received);
 		SET_VARSIZE(payload_bytea, VARHDRSZ + received);
-		if (received > 0)
-			memcpy(VARDATA(payload_bytea), buf, received);
+		memcpy(VARDATA(payload_bytea), buf, received);
 		values[1] = PointerGetDatum(payload_bytea);
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);

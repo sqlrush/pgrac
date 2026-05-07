@@ -419,16 +419,144 @@ UT_TEST(test_tier1_vtable_extern_linkable)
 	 */
 	UT_ASSERT_NOT_NULL((void *)ClusterICOps_Tier1.send_bytes);
 	UT_ASSERT_NOT_NULL((void *)ClusterICOps_Tier1.recv_bytes);
+	UT_ASSERT_NOT_NULL((void *)ClusterICOps_Tier1.peek_sender);
 	UT_ASSERT_NOT_NULL((void *)ClusterICOps_Tier1.tier_init);
 	UT_ASSERT_NOT_NULL((void *)ClusterICOps_Tier1.tier_shutdown);
 	UT_ASSERT_NOT_NULL((void *)ClusterICOps_Tier1.tier_name);
 }
 
 
+/*
+ * spec-2.2 D2 (post-codex review) -- HELLO wire roundtrip + reference
+ * byte-vector lock.  Verifies that build_hello produces a deterministic
+ * byte sequence (no struct-padding leakage, explicit little-endian)
+ * and parse_hello round-trips the values cleanly.  Locks the WIRE
+ * layout independently of the in-memory ClusterICHelloMsg struct ABI.
+ */
+
+UT_TEST(test_hello_wire_roundtrip)
+{
+	uint8 wire[PGRAC_IC_HELLO_BYTES];
+	ClusterICHelloMsg parsed;
+	bool ok;
+
+	cluster_ic_build_hello(wire,
+						   PGRAC_IC_HELLO_VERSION_V1,
+						   PGRAC_IC_ENVELOPE_VERSION_V1,
+						   42,
+						   "pgrac-test");
+
+	ok = cluster_ic_parse_hello(wire, &parsed);
+	UT_ASSERT(ok);
+	UT_ASSERT_EQ(parsed.magic, PGRAC_IC_HELLO_MAGIC);
+	UT_ASSERT_EQ(parsed.hello_version, PGRAC_IC_HELLO_VERSION_V1);
+	UT_ASSERT_EQ(parsed.envelope_version, PGRAC_IC_ENVELOPE_VERSION_V1);
+	UT_ASSERT_EQ(parsed.source_node_id, 42);
+	UT_ASSERT_EQ(strcmp(parsed.cluster_name, "pgrac-test"), 0);
+}
+
+UT_TEST(test_hello_wire_reference_bytes)
+{
+	uint8 wire[PGRAC_IC_HELLO_BYTES];
+	int   i;
+
+	/*
+	 * Reference byte vector for HELLO V1 with:
+	 *   hello_version    = 1
+	 *   envelope_version = 1
+	 *   source_node_id   = 0x01020304
+	 *   cluster_name     = "AB"
+	 *
+	 * Bytes 0-3:    48 4C 4C 4F            magic "HLLO" little-endian
+	 * Bytes 4-5:    01 00                  hello_version = 1 (LE)
+	 * Bytes 6-7:    01 00                  envelope_version = 1 (LE)
+	 * Bytes 8-11:   04 03 02 01            source_node_id = 0x01020304 (LE)
+	 * Bytes 12-13:  41 42                  "AB"
+	 * Bytes 14-35:  00..00                 cluster_name NUL pad
+	 * Bytes 36-63:  00..00                 _pad (must be zero)
+	 *
+	 * Locking these exact bytes guards against compiler-pad drift,
+	 * unintended endian flips, and uninitialized memory leakage.
+	 */
+	cluster_ic_build_hello(wire,
+						   PGRAC_IC_HELLO_VERSION_V1,
+						   PGRAC_IC_ENVELOPE_VERSION_V1,
+						   0x01020304,
+						   "AB");
+
+	/* magic */
+	UT_ASSERT_EQ(wire[0], 0x48);
+	UT_ASSERT_EQ(wire[1], 0x4C);
+	UT_ASSERT_EQ(wire[2], 0x4C);
+	UT_ASSERT_EQ(wire[3], 0x4F);
+	/* hello_version = 1 LE */
+	UT_ASSERT_EQ(wire[4], 0x01);
+	UT_ASSERT_EQ(wire[5], 0x00);
+	/* envelope_version = 1 LE */
+	UT_ASSERT_EQ(wire[6], 0x01);
+	UT_ASSERT_EQ(wire[7], 0x00);
+	/* source_node_id = 0x01020304 LE */
+	UT_ASSERT_EQ(wire[8],  0x04);
+	UT_ASSERT_EQ(wire[9],  0x03);
+	UT_ASSERT_EQ(wire[10], 0x02);
+	UT_ASSERT_EQ(wire[11], 0x01);
+	/* cluster_name "AB" + NUL pad */
+	UT_ASSERT_EQ(wire[12], 'A');
+	UT_ASSERT_EQ(wire[13], 'B');
+	for (i = 14; i < 36; i++)
+		UT_ASSERT_EQ(wire[i], 0);
+	/* _pad must be all zero */
+	for (i = 36; i < PGRAC_IC_HELLO_BYTES; i++)
+		UT_ASSERT_EQ(wire[i], 0);
+}
+
+UT_TEST(test_hello_parse_rejects_bad_magic)
+{
+	uint8 wire[PGRAC_IC_HELLO_BYTES];
+	ClusterICHelloMsg parsed;
+
+	cluster_ic_build_hello(wire,
+						   PGRAC_IC_HELLO_VERSION_V1,
+						   PGRAC_IC_ENVELOPE_VERSION_V1,
+						   1,
+						   "x");
+	/* Corrupt magic */
+	wire[0] = 0xDE;
+	wire[1] = 0xAD;
+	wire[2] = 0xBE;
+	wire[3] = 0xEF;
+
+	UT_ASSERT(!cluster_ic_parse_hello(wire, &parsed));
+}
+
+UT_TEST(test_hello_build_truncates_long_name)
+{
+	uint8 wire[PGRAC_IC_HELLO_BYTES];
+	ClusterICHelloMsg parsed;
+	const char *long_name =
+		"this-cluster-name-is-way-longer-than-the-fixed-cap-on-purpose";
+
+	cluster_ic_build_hello(wire,
+						   PGRAC_IC_HELLO_VERSION_V1,
+						   PGRAC_IC_ENVELOPE_VERSION_V1,
+						   7,
+						   long_name);
+
+	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
+	/*
+	 * cluster_name is 24 bytes, last byte forced NUL by parser; so
+	 * parsed.cluster_name should be the first 23 chars of long_name
+	 * + NUL.
+	 */
+	UT_ASSERT_EQ(strncmp(parsed.cluster_name, long_name, 23), 0);
+	UT_ASSERT_EQ(parsed.cluster_name[23], '\0');
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(20);
+	UT_PLAN(24);
 	UT_RUN(test_msg_header_size_24);
 	UT_RUN(test_msg_header_magic_constant);
 	UT_RUN(test_msg_header_protocol_v1);
@@ -450,6 +578,11 @@ main(void)
 	UT_RUN(test_mesh_role_low_id_active);
 	UT_RUN(test_mesh_role_high_id_passive);
 	UT_RUN(test_tier1_vtable_extern_linkable);
+	/* HELLO wire encode/decode + reference bytes (post-codex review) */
+	UT_RUN(test_hello_wire_roundtrip);
+	UT_RUN(test_hello_wire_reference_bytes);
+	UT_RUN(test_hello_parse_rejects_bad_magic);
+	UT_RUN(test_hello_build_truncates_long_name);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

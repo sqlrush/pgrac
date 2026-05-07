@@ -139,10 +139,45 @@ typedef struct ClusterMsgHeader {
  *	Function-pointer fields must remain non-NULL for any vtable shipped;
  *	NULL is never a valid value at runtime (cluster_ic_init asserts).
  */
+/*
+ * spec-2.2 D2 -- vtable contract (revised post-Sprint A Step 1-5
+ * codex review):
+ *
+ *   send_bytes:
+ *     Returns true on hand-off success, false on hard error.
+ *
+ *   recv_bytes (STRICT semantics, post-codex-review):
+ *     - Returns true with *out_received > 0 on success (got data).
+ *     - Returns true with *out_received == 0 on "no data ready"
+ *       (mock: empty inbound queue; tier1: kernel EAGAIN/EWOULDBLOCK
+ *       race after WaitEventSet).  This is NOT an error -- the
+ *       caller's wait loop should re-poll later.
+ *     - Returns false on HARD ERROR ONLY (mock: never; tier1:
+ *       ECONNRESET / EPIPE / unrecoverable socket state).
+ *     - Pre-codex-review (Sprint A Step 1-5 commit f4797e6001), mock
+ *       returned false for empty queue, conflating "no data" with
+ *       "hard error" -- this would silently swallow tier1 ECONNRESET
+ *       once D3 lands.  Strict bool semantics fix that.
+ *
+ *   peek_sender (NEW per codex review):
+ *     - Returns true and sets *out_sender if a chunk is currently
+ *       available to recv (mock: queue head non-NULL; tier1: a
+ *       per-peer fd is readable AND has unconsumed bytes).
+ *     - Returns false if no chunk available right now.
+ *     - Pure peek -- MUST NOT mutate any state (no consumed +=,
+ *       no queue pop, no socket read).  Used by cluster_ic_recv_exact
+ *       to detect sender flip BEFORE consuming bytes from a different
+ *       peer (which would pollute the caller's buffer).
+ *
+ *   tier_init / tier_shutdown:
+ *     Called by cluster_ic_init / cluster_ic_shutdown after vtable
+ *     bound to ClusterICOps_Active.
+ */
 typedef struct ClusterICOps {
 	bool (*send_bytes)(int32 target_node_id, const void *buf, size_t len);
 	bool (*recv_bytes)(int32 *out_sender_node_id, void *buf, size_t bufsize,
 					   size_t *out_received_len);
+	bool (*peek_sender)(int32 *out_sender_node_id);
 	void (*tier_init)(void);
 	void (*tier_shutdown)(void);
 	const char *tier_name;
@@ -197,6 +232,36 @@ typedef struct ClusterICHelloMsg {
 	char   cluster_name[PGRAC_IC_CLUSTER_NAME_MAX]; /* NUL-terminated; truncated */
 	uint8  _pad[28];                             /* pad to 64B fixed ABI */
 } ClusterICHelloMsg;
+
+
+/*
+ * spec-2.2 D2 (post-codex review) -- HELLO wire encode/decode helpers.
+ *
+ * DO NOT send/recv ClusterICHelloMsg directly across the TCP socket.
+ * Compiler struct padding, alignment, and byte order may differ
+ * between sender and receiver -- and uninitialized stack pad bytes
+ * can leak sensitive memory contents onto the wire.  Always go
+ * through cluster_ic_build_hello / cluster_ic_parse_hello which:
+ *
+ *   - memset the 64-byte buffer to zero (no leaked pad bytes)
+ *   - write each field at its frozen wire offset
+ *   - serialize multi-byte integers in little-endian (consistent
+ *     with the rest of pgrac wire format; see ClusterMsgHeader,
+ *     spec-2.0 §4 envelope)
+ *   - truncate cluster_name to PGRAC_IC_CLUSTER_NAME_MAX-1 + NUL
+ *
+ * The wire layout is locked at unit-test level via a fixed byte-vector
+ * roundtrip (test_hello_wire_roundtrip).  Any future bump to HELLO
+ * MUST go via PGRAC_IC_HELLO_VERSION_V2 (new struct + dispatch on
+ * hello_version field), never resize V1 in-place.
+ */
+extern void cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES],
+								   uint16 hello_version,
+								   uint16 envelope_version,
+								   int32  source_node_id,
+								   const char *cluster_name);
+extern bool cluster_ic_parse_hello(const uint8 in_buf[PGRAC_IC_HELLO_BYTES],
+								   ClusterICHelloMsg *out_msg);
 
 
 /*
