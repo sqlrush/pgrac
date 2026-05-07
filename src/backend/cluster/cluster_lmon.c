@@ -490,10 +490,8 @@ LmonMain(void)
 	 * connect before publishing READY (that would deadlock when this
 	 * node starts before its peers).
 	 */
-	if (cluster_enabled
-		&& (ClusterICTier) cluster_interconnect_tier == CLUSTER_IC_TIER_1)
-	{
-		(void) cluster_ic_tier1_listener_bind();    /* FATAL on failure */
+	if (cluster_enabled && (ClusterICTier)cluster_interconnect_tier == CLUSTER_IC_TIER_1) {
+		(void)cluster_ic_tier1_listener_bind(); /* FATAL on failure */
 	}
 
 	/*
@@ -525,9 +523,7 @@ LmonMain(void)
 	 *      semantic in stub/mock mode.  In tier1 mode heartbeat is
 	 *      transport liveness only, NOT membership (per §3.6 boundary).
 	 */
-	if (cluster_enabled
-		&& (ClusterICTier) cluster_interconnect_tier == CLUSTER_IC_TIER_1)
-	{
+	if (cluster_enabled && (ClusterICTier)cluster_interconnect_tier == CLUSTER_IC_TIER_1) {
 		/*
 		 * spec-2.2 Step 11 D5 -- LMON Tier1 peer drive.
 		 *
@@ -551,34 +547,32 @@ LmonMain(void)
 		 * fd lands in lmon_pending_fds[] until HELLO binds it to
 		 * tier1_peer_fds[learned_peer_id] and lmon_peer_track[].
 		 */
-#define LMON_SUB_DOWN           0
-#define LMON_SUB_CONNECT_PEND   1
-#define LMON_SUB_HELLO_SENDING  2     /* Hardening v1.0.1 F1: active partial-send tail */
-#define LMON_SUB_HELLO_WAIT     3     /* (legacy; passive uses anon path now) */
-#define LMON_SUB_CONNECTED      4
+#define LMON_SUB_DOWN 0
+#define LMON_SUB_CONNECT_PEND 1
+#define LMON_SUB_HELLO_SENDING 2 /* Hardening v1.0.1 F1: active partial-send tail */
+#define LMON_SUB_HELLO_WAIT 3	 /* (legacy; passive uses anon path now) */
+#define LMON_SUB_CONNECTED 4
 
-		typedef struct LmonPeerTrack
-		{
-			int          fd;
-			int8         substate;
-			bool         is_active;
-			TimestampTz  next_attempt_at;
-			TimestampTz  connect_started_at;     /* F2: connect_timeout deadline base */
+		typedef struct LmonPeerTrack {
+			int fd;
+			int8 substate;
+			bool is_active;
+			TimestampTz next_attempt_at;
+			TimestampTz connect_started_at; /* F2: connect_timeout deadline base */
 		} LmonPeerTrack;
 
-		const long  HEARTBEAT_INTERVAL_MS = cluster_interconnect_heartbeat_interval_ms;
+		const long HEARTBEAT_INTERVAL_MS = cluster_interconnect_heartbeat_interval_ms;
 		LmonPeerTrack lmon_peer_track[CLUSTER_MAX_NODES];
-		int           lmon_pending_fds[CLUSTER_MAX_NODES];
+		int lmon_pending_fds[CLUSTER_MAX_NODES];
 		WaitEventSet *wes = NULL;
-		bool          wes_dirty = true;
-		int           listener_fd = cluster_ic_tier1_get_listener_fd();
-		TimestampTz   next_heartbeat_at;
-		int32         self_id = cluster_node_id;
-		int32         pi;
+		bool wes_dirty = true;
+		int listener_fd = cluster_ic_tier1_get_listener_fd();
+		TimestampTz next_heartbeat_at;
+		int32 self_id = cluster_node_id;
+		int32 pi;
 
 		/* Init per-peer track from pgrac.conf membership + mesh role. */
-		for (pi = 0; pi < CLUSTER_MAX_NODES; pi++)
-		{
+		for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
 			lmon_peer_track[pi].fd = -1;
 			lmon_peer_track[pi].substate = LMON_SUB_DOWN;
 			lmon_peer_track[pi].is_active = false;
@@ -589,19 +583,19 @@ LmonMain(void)
 			if (pi == self_id)
 				continue;
 			if (cluster_conf_lookup_node(pi) == NULL)
-				continue;     /* peer not declared in pgrac.conf */
-			lmon_peer_track[pi].is_active =
-				(cluster_ic_mesh_role_for_pair(self_id, pi) == CLUSTER_IC_MESH_ACTIVE);
+				continue; /* peer not declared in pgrac.conf */
+			lmon_peer_track[pi].is_active
+				= (cluster_ic_mesh_role_for_pair(self_id, pi) == CLUSTER_IC_MESH_ACTIVE);
 		}
 
 		next_heartbeat_at = GetCurrentTimestamp() + HEARTBEAT_INTERVAL_MS * INT64CONST(1000);
 
 		for (;;) {
 			WaitEvent ev[2 * CLUSTER_MAX_NODES + 4];
-			int       n_events;
-			long      wait_ms;
+			int n_events;
+			long wait_ms;
 			TimestampTz now;
-			int32     i;
+			int32 i;
 
 			CHECK_FOR_INTERRUPTS();
 
@@ -624,23 +618,25 @@ LmonMain(void)
 			 * the active connector and back-off has elapsed, kick
 			 * off a nonblocking connect.
 			 */
-			for (pi = 0; pi < CLUSTER_MAX_NODES; pi++)
-			{
+			for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
 				int new_fd = -1;
 
-				if (pi == self_id) continue;
-				if (!lmon_peer_track[pi].is_active) continue;
-				if (lmon_peer_track[pi].substate != LMON_SUB_DOWN) continue;
-				if (lmon_peer_track[pi].next_attempt_at > now) continue;
+				if (pi == self_id)
+					continue;
+				if (!lmon_peer_track[pi].is_active)
+					continue;
+				if (lmon_peer_track[pi].substate != LMON_SUB_DOWN)
+					continue;
+				if (lmon_peer_track[pi].next_attempt_at > now)
+					continue;
 
-				lmon_peer_track[pi].next_attempt_at =
-					now + HEARTBEAT_INTERVAL_MS * INT64CONST(1000);
+				lmon_peer_track[pi].next_attempt_at
+					= now + HEARTBEAT_INTERVAL_MS * INT64CONST(1000);
 
-				if (cluster_ic_tier1_connect_one(pi, &new_fd) && new_fd >= 0)
-				{
+				if (cluster_ic_tier1_connect_one(pi, &new_fd) && new_fd >= 0) {
 					lmon_peer_track[pi].fd = new_fd;
 					lmon_peer_track[pi].substate = LMON_SUB_CONNECT_PEND;
-					lmon_peer_track[pi].connect_started_at = now;   /* F2 timeout base */
+					lmon_peer_track[pi].connect_started_at = now; /* F2 timeout base */
 					wes_dirty = true;
 				}
 			}
@@ -660,21 +656,19 @@ LmonMain(void)
 			 * trigger fence / membership change (that is spec-2.29).
 			 */
 			{
-				int64 connect_to_us =
-					(int64) cluster_interconnect_connect_timeout_ms * INT64CONST(1000);
-				int64 liveness_to_us =
-					3L * (int64) HEARTBEAT_INTERVAL_MS * INT64CONST(1000);
+				int64 connect_to_us
+					= (int64)cluster_interconnect_connect_timeout_ms * INT64CONST(1000);
+				int64 liveness_to_us = 3L * (int64)HEARTBEAT_INTERVAL_MS * INT64CONST(1000);
 
-				for (pi = 0; pi < CLUSTER_MAX_NODES; pi++)
-				{
-					if (lmon_peer_track[pi].fd < 0) continue;
+				for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
+					if (lmon_peer_track[pi].fd < 0)
+						continue;
 
 					if ((lmon_peer_track[pi].substate == LMON_SUB_CONNECT_PEND
 						 || lmon_peer_track[pi].substate == LMON_SUB_HELLO_SENDING
 						 || lmon_peer_track[pi].substate == LMON_SUB_HELLO_WAIT)
 						&& lmon_peer_track[pi].connect_started_at > 0
-						&& now > lmon_peer_track[pi].connect_started_at + connect_to_us)
-					{
+						&& now > lmon_peer_track[pi].connect_started_at + connect_to_us) {
 						cluster_ic_tier1_close_peer(pi, "connect timeout");
 						lmon_peer_track[pi].fd = -1;
 						lmon_peer_track[pi].substate = LMON_SUB_DOWN;
@@ -683,20 +677,19 @@ LmonMain(void)
 						continue;
 					}
 
-					if (lmon_peer_track[pi].substate == LMON_SUB_CONNECTED)
-					{
+					if (lmon_peer_track[pi].substate == LMON_SUB_CONNECTED) {
 						const ClusterICPeerStateShmem *p = cluster_ic_tier1_peer_get(pi);
 						TimestampTz last;
 
-						if (p == NULL) continue;
+						if (p == NULL)
+							continue;
 						last = p->last_heartbeat_recv_at;
 
 						/* Skip if no heartbeat ever received yet (just CONNECTED;
 						 * give peer 1 full liveness window before judging). */
 						if (last == 0)
 							continue;
-						if (now > last + liveness_to_us)
-						{
+						if (now > last + liveness_to_us) {
 							cluster_ic_tier1_close_peer(pi, "heartbeat liveness timeout");
 							lmon_peer_track[pi].fd = -1;
 							lmon_peer_track[pi].substate = LMON_SUB_DOWN;
@@ -708,14 +701,11 @@ LmonMain(void)
 			}
 
 			/* Heartbeat send tick. */
-			if (now >= next_heartbeat_at)
-			{
-				for (pi = 0; pi < CLUSTER_MAX_NODES; pi++)
-				{
+			if (now >= next_heartbeat_at) {
+				for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
 					if (lmon_peer_track[pi].substate != LMON_SUB_CONNECTED)
 						continue;
-					if (!cluster_ic_tier1_send_heartbeat(pi))
-					{
+					if (!cluster_ic_tier1_send_heartbeat(pi)) {
 						cluster_ic_tier1_close_peer(pi, "heartbeat send failed");
 						lmon_peer_track[pi].fd = -1;
 						lmon_peer_track[pi].substate = LMON_SUB_DOWN;
@@ -726,113 +716,101 @@ LmonMain(void)
 			}
 
 			/* (Re)build WaitEventSet whenever per-peer fd set changes. */
-			if (wes_dirty)
-			{
-				if (wes != NULL)
-				{
+			if (wes_dirty) {
+				if (wes != NULL) {
 					FreeWaitEventSet(wes);
 					wes = NULL;
 				}
-				wes = CreateWaitEventSet(CurrentMemoryContext,
-										 2 + 2 * CLUSTER_MAX_NODES);
+				wes = CreateWaitEventSet(CurrentMemoryContext, 2 + 2 * CLUSTER_MAX_NODES);
 				AddWaitEventToSet(wes, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch, NULL);
 				if (listener_fd >= 0)
 					AddWaitEventToSet(wes, WL_SOCKET_READABLE, listener_fd, NULL,
-									  (void *) (intptr_t) -1);
+									  (void *)(intptr_t)-1);
 
 				/* Per-peer (post-HELLO-bound) fds. */
-				for (pi = 0; pi < CLUSTER_MAX_NODES; pi++)
-				{
+				for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
 					int events;
 
-					if (lmon_peer_track[pi].fd < 0) continue;
+					if (lmon_peer_track[pi].fd < 0)
+						continue;
 
-					switch (lmon_peer_track[pi].substate)
-					{
-						case LMON_SUB_CONNECT_PEND:
-						case LMON_SUB_HELLO_SENDING:    /* F1: WRITEABLE for partial-HELLO drain */
-							events = WL_SOCKET_WRITEABLE;
-							break;
-						case LMON_SUB_HELLO_WAIT:
-						case LMON_SUB_CONNECTED:
-							events = WL_SOCKET_READABLE;
-							break;
-						default:
-							continue;
+					switch (lmon_peer_track[pi].substate) {
+					case LMON_SUB_CONNECT_PEND:
+					case LMON_SUB_HELLO_SENDING: /* F1: WRITEABLE for partial-HELLO drain */
+						events = WL_SOCKET_WRITEABLE;
+						break;
+					case LMON_SUB_HELLO_WAIT:
+					case LMON_SUB_CONNECTED:
+						events = WL_SOCKET_READABLE;
+						break;
+					default:
+						continue;
 					}
 
-					AddWaitEventToSet(wes, events,
-									  lmon_peer_track[pi].fd, NULL,
-									  (void *) (intptr_t) pi);
+					AddWaitEventToSet(wes, events, lmon_peer_track[pi].fd, NULL,
+									  (void *)(intptr_t)pi);
 				}
 
 				/* Anonymous pending accept fds (peer_id learnt via HELLO). */
-				for (pi = 0; pi < CLUSTER_MAX_NODES; pi++)
-				{
-					if (lmon_pending_fds[pi] < 0) continue;
-					AddWaitEventToSet(wes, WL_SOCKET_READABLE,
-									  lmon_pending_fds[pi], NULL,
-									  (void *) (intptr_t) (CLUSTER_MAX_NODES + pi));
+				for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
+					if (lmon_pending_fds[pi] < 0)
+						continue;
+					AddWaitEventToSet(wes, WL_SOCKET_READABLE, lmon_pending_fds[pi], NULL,
+									  (void *)(intptr_t)(CLUSTER_MAX_NODES + pi));
 				}
 				wes_dirty = false;
 			}
 
 			now = GetCurrentTimestamp();
-			wait_ms = (next_heartbeat_at > now)
-				? (long) ((next_heartbeat_at - now) / 1000)
-				: 0;
-			if (wait_ms < 0) wait_ms = 0;
-			if (wait_ms > HEARTBEAT_INTERVAL_MS) wait_ms = HEARTBEAT_INTERVAL_MS;
+			wait_ms = (next_heartbeat_at > now) ? (long)((next_heartbeat_at - now) / 1000) : 0;
+			if (wait_ms < 0)
+				wait_ms = 0;
+			if (wait_ms > HEARTBEAT_INTERVAL_MS)
+				wait_ms = HEARTBEAT_INTERVAL_MS;
 
-			n_events = WaitEventSetWait(wes, wait_ms, ev,
-										lengthof(ev),
+			n_events = WaitEventSetWait(wes, wait_ms, ev, lengthof(ev),
 										WAIT_EVENT_CLUSTER_IC_HEARTBEAT_WAIT);
 
-			for (i = 0; i < n_events; i++)
-			{
-				intptr_t tag = (intptr_t) ev[i].user_data;
+			for (i = 0; i < n_events; i++) {
+				intptr_t tag = (intptr_t)ev[i].user_data;
 
-				if (ev[i].events & WL_LATCH_SET)
-				{
+				if (ev[i].events & WL_LATCH_SET) {
 					ResetLatch(MyLatch);
 					continue;
 				}
 
-				if (tag == -1)
-				{
+				if (tag == -1) {
 					/* Listener: drain all pending accepts. */
-					for (;;)
-					{
-						int   new_fd = -1;
+					for (;;) {
+						int new_fd = -1;
 						int32 dummy_peer_id = -1;
-						int   slot;
+						int slot;
 
 						if (!cluster_ic_tier1_accept_one(&new_fd, &dummy_peer_id))
 							break;
-						if (new_fd < 0) break;
+						if (new_fd < 0)
+							break;
 
 						for (slot = 0; slot < CLUSTER_MAX_NODES; slot++)
-							if (lmon_pending_fds[slot] < 0) break;
-						if (slot >= CLUSTER_MAX_NODES)
-						{
+							if (lmon_pending_fds[slot] < 0)
+								break;
+						if (slot >= CLUSTER_MAX_NODES) {
 							/* No room -- reject by closing. */
-							(void) close(new_fd);
+							(void)close(new_fd);
 							continue;
 						}
 						lmon_pending_fds[slot] = new_fd;
 						wes_dirty = true;
 					}
-				}
-				else if (tag >= 0 && tag < CLUSTER_MAX_NODES)
-				{
-					int32 peer = (int32) tag;
-					int   peer_fd = lmon_peer_track[peer].fd;
+				} else if (tag >= 0 && tag < CLUSTER_MAX_NODES) {
+					int32 peer = (int32)tag;
+					int peer_fd = lmon_peer_track[peer].fd;
 
-					if (peer_fd < 0) continue;       /* lost between events */
+					if (peer_fd < 0)
+						continue; /* lost between events */
 
 					if (lmon_peer_track[peer].substate == LMON_SUB_CONNECT_PEND
-						&& (ev[i].events & WL_SOCKET_WRITEABLE))
-					{
+						&& (ev[i].events & WL_SOCKET_WRITEABLE)) {
 						/*
 						 * spec-2.2 §2.4 + Hardening v1.0.1 F1: active side
 						 * sends HELLO via per-peer buffer.  finish_connect
@@ -843,60 +821,47 @@ LmonMain(void)
 						 * If partial, transition to HELLO_SENDING and re-enter
 						 * on next WRITEABLE.
 						 */
-						if (cluster_ic_tier1_finish_connect(peer, peer_fd))
-						{
+						if (cluster_ic_tier1_finish_connect(peer, peer_fd)) {
 							if (cluster_ic_tier1_hello_send_remaining(peer) == 0)
 								lmon_peer_track[peer].substate = LMON_SUB_CONNECTED;
 							else
 								lmon_peer_track[peer].substate = LMON_SUB_HELLO_SENDING;
 							wes_dirty = true;
-						}
-						else
-						{
+						} else {
 							lmon_peer_track[peer].fd = -1;
 							lmon_peer_track[peer].substate = LMON_SUB_DOWN;
 							wes_dirty = true;
 						}
-					}
-					else if (lmon_peer_track[peer].substate == LMON_SUB_HELLO_SENDING
-							 && (ev[i].events & WL_SOCKET_WRITEABLE))
-					{
+					} else if (lmon_peer_track[peer].substate == LMON_SUB_HELLO_SENDING
+							   && (ev[i].events & WL_SOCKET_WRITEABLE)) {
 						/* Hardening v1.0.1 F1: continue partial HELLO send. */
-						if (cluster_ic_tier1_continue_hello_send(peer, peer_fd))
-						{
-							if (cluster_ic_tier1_hello_send_remaining(peer) == 0)
-							{
+						if (cluster_ic_tier1_continue_hello_send(peer, peer_fd)) {
+							if (cluster_ic_tier1_hello_send_remaining(peer) == 0) {
 								lmon_peer_track[peer].substate = LMON_SUB_CONNECTED;
 								wes_dirty = true;
 							}
 							/* else: still partial, keep WRITEABLE */
-						}
-						else
-						{
+						} else {
 							lmon_peer_track[peer].fd = -1;
 							lmon_peer_track[peer].substate = LMON_SUB_DOWN;
 							wes_dirty = true;
 						}
-					}
-					else if (lmon_peer_track[peer].substate == LMON_SUB_CONNECTED
-							 && (ev[i].events & WL_SOCKET_READABLE))
-					{
-						if (!cluster_ic_tier1_recv_heartbeat_drain(peer, peer_fd))
-						{
+					} else if (lmon_peer_track[peer].substate == LMON_SUB_CONNECTED
+							   && (ev[i].events & WL_SOCKET_READABLE)) {
+						if (!cluster_ic_tier1_recv_heartbeat_drain(peer, peer_fd)) {
 							cluster_ic_tier1_close_peer(peer, "heartbeat recv failed");
 							lmon_peer_track[peer].fd = -1;
 							lmon_peer_track[peer].substate = LMON_SUB_DOWN;
 							wes_dirty = true;
 						}
 					}
-				}
-				else if (tag >= CLUSTER_MAX_NODES && tag < 2 * CLUSTER_MAX_NODES)
-				{
-					int   slot    = (int) (tag - CLUSTER_MAX_NODES);
-					int   pend_fd = lmon_pending_fds[slot];
+				} else if (tag >= CLUSTER_MAX_NODES && tag < 2 * CLUSTER_MAX_NODES) {
+					int slot = (int)(tag - CLUSTER_MAX_NODES);
+					int pend_fd = lmon_pending_fds[slot];
 					int32 learned = -1;
 
-					if (pend_fd < 0) continue;
+					if (pend_fd < 0)
+						continue;
 
 					/*
 					 * Hardening v1.0.1 F1: continue_hello_recv accumulates
@@ -904,10 +869,8 @@ LmonMain(void)
 					 * true with learned == -1 while still partial, true with
 					 * learned >= 0 when HELLO fully verified.
 					 */
-					if (cluster_ic_tier1_continue_hello_recv(slot, pend_fd, &learned))
-					{
-						if (learned >= 0)
-						{
+					if (cluster_ic_tier1_continue_hello_recv(slot, pend_fd, &learned)) {
+						if (learned >= 0) {
 							/* HELLO complete + verified.  Migrate fd into
 							 * peer_track + free anon slot. */
 							lmon_peer_track[learned].fd = pend_fd;
@@ -917,12 +880,10 @@ LmonMain(void)
 							wes_dirty = true;
 						}
 						/* else: still accumulating; keep fd registered as READABLE */
-					}
-					else
-					{
+					} else {
 						/* HELLO failed (parse / verify / EOF / error).
 						 * Drop anonymous fd; reset slot accumulator. */
-						(void) close(pend_fd);
+						(void)close(pend_fd);
 						lmon_pending_fds[slot] = -1;
 						cluster_ic_tier1_anon_hello_reset(slot);
 						wes_dirty = true;
@@ -932,21 +893,17 @@ LmonMain(void)
 		}
 
 		/* Shutdown: close every fd we own + free WES. */
-		for (pi = 0; pi < CLUSTER_MAX_NODES; pi++)
-		{
+		for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
 			if (lmon_peer_track[pi].fd >= 0)
 				cluster_ic_tier1_close_peer(pi, "lmon shutdown");
-			if (lmon_pending_fds[pi] >= 0)
-			{
-				(void) close(lmon_pending_fds[pi]);
+			if (lmon_pending_fds[pi] >= 0) {
+				(void)close(lmon_pending_fds[pi]);
 				lmon_pending_fds[pi] = -1;
 			}
 		}
 		if (wes != NULL)
 			FreeWaitEventSet(wes);
-	}
-	else
-	{
+	} else {
 		/* Stub / mock / disabled mode -- preserve spec-1.11 simple loop. */
 		for (;;) {
 			int rc;

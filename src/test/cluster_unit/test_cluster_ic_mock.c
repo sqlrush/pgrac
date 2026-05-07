@@ -83,16 +83,29 @@ BackendType MyBackendType = B_INVALID;
 
 /* spec-2.2 D3 -- test-local ClusterICOps_Tier1 stub (same rationale as
  * test_cluster_ic.c). */
-static bool tier1_test_stub_send(int32 t pg_attribute_unused(),
-								 const void *b pg_attribute_unused(),
-								 size_t l pg_attribute_unused()) { return false; }
-static bool tier1_test_stub_recv(int32 *s pg_attribute_unused(),
-								 void *b pg_attribute_unused(),
-								 size_t bs pg_attribute_unused(),
-								 size_t *r pg_attribute_unused()) { return false; }
-static bool tier1_test_stub_peek(int32 *s pg_attribute_unused()) { return false; }
-static void tier1_test_stub_init(void) { }
-static void tier1_test_stub_shutdown(void) { }
+static bool
+tier1_test_stub_send(int32 t pg_attribute_unused(), const void *b pg_attribute_unused(),
+					 size_t l pg_attribute_unused())
+{
+	return false;
+}
+static bool
+tier1_test_stub_recv(int32 *s pg_attribute_unused(), void *b pg_attribute_unused(),
+					 size_t bs pg_attribute_unused(), size_t *r pg_attribute_unused())
+{
+	return false;
+}
+static bool
+tier1_test_stub_peek(int32 *s pg_attribute_unused())
+{
+	return false;
+}
+static void
+tier1_test_stub_init(void)
+{}
+static void
+tier1_test_stub_shutdown(void)
+{}
 
 const ClusterICOps ClusterICOps_Tier1 = {
 	.send_bytes = tier1_test_stub_send,

@@ -92,8 +92,8 @@ int cluster_cluster_stats_main_loop_interval = 1000;
 
 /* spec-2.2 D7 -- Tier 1 TCP transport tuning (PGC_POSTMASTER per §3.3). */
 int cluster_interconnect_heartbeat_interval_ms = 1000;
-int cluster_interconnect_connect_timeout_ms    = 5000;
-int cluster_interconnect_recv_timeout_ms       = 30000;
+int cluster_interconnect_connect_timeout_ms = 5000;
+int cluster_interconnect_recv_timeout_ms = 30000;
 
 /*
  * cluster.undo_segments_per_instance (spec-1.22 D7).  Number of undo
@@ -480,19 +480,19 @@ cluster_init_guc(void)
 	 * leave in-flight connect / recv state in inconsistent timeout
 	 * windows).
 	 */
-	DefineCustomIntVariable("cluster.interconnect_heartbeat_interval_ms",
-							gettext_noop("Tier1 IC heartbeat tick interval in milliseconds."),
-							gettext_noop("LMON sends a HEARTBEAT msg to every CONNECTED peer at "
-										 "this cadence (spec-2.2 §2.1).  Lower value -> earlier "
-										 "transport-down detection at cost of higher idle wakeup; "
-										 "higher value -> lower CPU overhead but slower peer state "
-										 "transition.  Per spec-2.2 §3.6 boundary invariant, "
-										 "missed heartbeats only mark peer_state DOWN (transport-"
-										 "level liveness); they do NOT trigger fence / quorum / "
-										 "membership change (those land in spec-2.5+ / 2.6+ / 2.28+)."),
-							&cluster_interconnect_heartbeat_interval_ms,
-							1000, 100, 60000, PGC_POSTMASTER, GUC_UNIT_MS,
-							NULL, NULL, NULL);
+	DefineCustomIntVariable(
+		"cluster.interconnect_heartbeat_interval_ms",
+		gettext_noop("Tier1 IC heartbeat tick interval in milliseconds."),
+		gettext_noop("LMON sends a HEARTBEAT msg to every CONNECTED peer at "
+					 "this cadence (spec-2.2 §2.1).  Lower value -> earlier "
+					 "transport-down detection at cost of higher idle wakeup; "
+					 "higher value -> lower CPU overhead but slower peer state "
+					 "transition.  Per spec-2.2 §3.6 boundary invariant, "
+					 "missed heartbeats only mark peer_state DOWN (transport-"
+					 "level liveness); they do NOT trigger fence / quorum / "
+					 "membership change (those land in spec-2.5+ / 2.6+ / 2.28+)."),
+		&cluster_interconnect_heartbeat_interval_ms, 1000, 100, 60000, PGC_POSTMASTER, GUC_UNIT_MS,
+		NULL, NULL, NULL);
 
 	DefineCustomIntVariable("cluster.interconnect_connect_timeout_ms",
 							gettext_noop("Tier1 IC active-connect SO_ERROR poll timeout in ms."),
@@ -502,9 +502,8 @@ cluster_init_guc(void)
 										 "Per spec-2.2 §3.3 PGC_POSTMASTER -- runtime change "
 										 "would leave half-finished connects in inconsistent "
 										 "timeout windows."),
-							&cluster_interconnect_connect_timeout_ms,
-							5000, 1000, 60000, PGC_POSTMASTER, GUC_UNIT_MS,
-							NULL, NULL, NULL);
+							&cluster_interconnect_connect_timeout_ms, 5000, 1000, 60000,
+							PGC_POSTMASTER, GUC_UNIT_MS, NULL, NULL, NULL);
 
 	DefineCustomIntVariable("cluster.interconnect_recv_timeout_ms",
 							gettext_noop("Tier1 IC per-peer recv read deadline in milliseconds."),
@@ -513,9 +512,8 @@ cluster_init_guc(void)
 										 "data triggers peer_state -> DOWN per spec-2.2 §3.10 "
 										 "(connection-level rejection; never FATAL).  Per spec-2.2 "
 										 "§3.3 PGC_POSTMASTER."),
-							&cluster_interconnect_recv_timeout_ms,
-							30000, 1000, 600000, PGC_POSTMASTER, GUC_UNIT_MS,
-							NULL, NULL, NULL);
+							&cluster_interconnect_recv_timeout_ms, 30000, 1000, 600000,
+							PGC_POSTMASTER, GUC_UNIT_MS, NULL, NULL, NULL);
 
 	DefineCustomIntVariable("cluster.cluster_stats_main_loop_interval",
 							gettext_noop("Cluster Stats main-loop tick interval in milliseconds."),

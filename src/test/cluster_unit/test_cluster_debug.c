@@ -96,10 +96,22 @@ const ClusterICOps *ClusterICOps_Active = NULL;
  * (cluster_debug.c references these via dump_ic).  Stubs return zeros
  * since this unit test never binds a real listener. */
 #include "cluster/cluster_ic_tier1.h"
-const ClusterICOps ClusterICOps_Tier1 = {0};
-pid_t cluster_ic_tier1_get_listener_pid(void) { return 0; }
-uint64 cluster_ic_tier1_get_listener_incarnation(void) { return 0; }
-int cluster_ic_tier1_get_listener_port(void) { return -1; }
+const ClusterICOps ClusterICOps_Tier1 = { 0 };
+pid_t
+cluster_ic_tier1_get_listener_pid(void)
+{
+	return 0;
+}
+uint64
+cluster_ic_tier1_get_listener_incarnation(void)
+{
+	return 0;
+}
+int
+cluster_ic_tier1_get_listener_port(void)
+{
+	return -1;
+}
 
 /* cluster_inject (armed_count + iterator) */
 int cluster_injection_armed_count = 0;

@@ -355,8 +355,7 @@ typedef enum {
 #define CLUSTER_INJECT_SLEEP_CAP_US (INT64CONST(3600) * 1000 * 1000)
 
 static ClusterInjectValidateResult
-validate_fault_param(const char *type_str, int64 param,
-					 ClusterInjectFaultType *out_type)
+validate_fault_param(const char *type_str, int64 param, ClusterInjectFaultType *out_type)
 {
 	*out_type = parse_fault_type(type_str);
 
@@ -364,8 +363,7 @@ validate_fault_param(const char *type_str, int64 param,
 		&& (type_str == NULL || pg_strcasecmp(type_str, "none") != 0))
 		return FAULT_VALIDATE_UNKNOWN_TYPE;
 
-	if (*out_type == CLUSTER_FAULT_SLEEP)
-	{
+	if (*out_type == CLUSTER_FAULT_SLEEP) {
 		if (param < 0)
 			return FAULT_VALIDATE_NEGATIVE_SLEEP;
 		if (param > CLUSTER_INJECT_SLEEP_CAP_US)
@@ -648,30 +646,26 @@ cluster_injection_assign_hook(const char *newval, void *extra)
 			 * postmaster startup.
 			 */
 			vr = validate_fault_param(type_str, arm_param, &arm_type);
-			switch (vr)
-			{
-				case FAULT_VALIDATE_OK:
-					break;
-				case FAULT_VALIDATE_UNKNOWN_TYPE:
-					ereport(WARNING,
-							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							 errmsg("unknown cluster injection fault type: \"%s\"",
-									type_str)));
-					continue;
-				case FAULT_VALIDATE_NEGATIVE_SLEEP:
-					ereport(WARNING,
-							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							 errmsg("cluster injection sleep param must be >= 0 "
-									"microseconds (got %lld)",
-									(long long) arm_param)));
-					continue;
-				case FAULT_VALIDATE_SLEEP_TOO_LARGE:
-					ereport(WARNING,
-							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							 errmsg("cluster injection sleep param exceeds 1-hour "
-									"cap of 3600000000 us (got %lld)",
-									(long long) arm_param)));
-					continue;
+			switch (vr) {
+			case FAULT_VALIDATE_OK:
+				break;
+			case FAULT_VALIDATE_UNKNOWN_TYPE:
+				ereport(WARNING,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("unknown cluster injection fault type: \"%s\"", type_str)));
+				continue;
+			case FAULT_VALIDATE_NEGATIVE_SLEEP:
+				ereport(WARNING, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+								  errmsg("cluster injection sleep param must be >= 0 "
+										 "microseconds (got %lld)",
+										 (long long)arm_param)));
+				continue;
+			case FAULT_VALIDATE_SLEEP_TOO_LARGE:
+				ereport(WARNING, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+								  errmsg("cluster injection sleep param exceeds 1-hour "
+										 "cap of 3600000000 us (got %lld)",
+										 (long long)arm_param)));
+				continue;
 			}
 		}
 
@@ -771,35 +765,29 @@ cluster_inject_fault(PG_FUNCTION_ARGS)
 	 * (cluster.injection_points='name:sleep:-1') bypassed validation.
 	 */
 	{
-		ClusterInjectValidateResult vr =
-			validate_fault_param(type_str, param, &new_type);
+		ClusterInjectValidateResult vr = validate_fault_param(type_str, param, &new_type);
 
-		switch (vr)
-		{
-			case FAULT_VALIDATE_OK:
-				break;
-			case FAULT_VALIDATE_UNKNOWN_TYPE:
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("unknown cluster injection fault type: \"%s\"",
-								type_str),
-						 errhint("Valid fault types: none, error, warning, "
-								 "sleep, crash, skip.")));
-				break;
-			case FAULT_VALIDATE_NEGATIVE_SLEEP:
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("cluster injection sleep param must be >= 0 "
-								"microseconds (got %lld)",
-								(long long) param)));
-				break;
-			case FAULT_VALIDATE_SLEEP_TOO_LARGE:
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("cluster injection sleep param exceeds 1-hour "
-								"cap of 3600000000 us (got %lld)",
-								(long long) param)));
-				break;
+		switch (vr) {
+		case FAULT_VALIDATE_OK:
+			break;
+		case FAULT_VALIDATE_UNKNOWN_TYPE:
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("unknown cluster injection fault type: \"%s\"", type_str),
+							errhint("Valid fault types: none, error, warning, "
+									"sleep, crash, skip.")));
+			break;
+		case FAULT_VALIDATE_NEGATIVE_SLEEP:
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("cluster injection sleep param must be >= 0 "
+								   "microseconds (got %lld)",
+								   (long long)param)));
+			break;
+		case FAULT_VALIDATE_SLEEP_TOO_LARGE:
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("cluster injection sleep param exceeds 1-hour "
+								   "cap of 3600000000 us (got %lld)",
+								   (long long)param)));
+			break;
 		}
 	}
 

@@ -285,16 +285,14 @@ cluster_ic_send_bytes(int32 target_node_id, const void *buf, size_t len)
 	 * message (header bytes + payload bytes); either one's `buf` may
 	 * arrive here.  Belt-and-suspenders: both layers enforce.
 	 */
-	if (ClusterICOps_Active == &ClusterICOps_Tier1
-		&& MyBackendType != B_LMON)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cluster_ic_send_bytes via tier1 is restricted to "
-						"LMON aux process in spec-2.2"),
-				 errhint("General-purpose backend IC routing lands in "
-						 "spec-2.3+ (envelope ABI ratify) and spec-2.4+ "
-						 "(framing + epoch enforce).  For non-LMON IC "
-						 "tests use cluster.interconnect_tier=mock.")));
+	if (ClusterICOps_Active == &ClusterICOps_Tier1 && MyBackendType != B_LMON)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cluster_ic_send_bytes via tier1 is restricted to "
+							   "LMON aux process in spec-2.2"),
+						errhint("General-purpose backend IC routing lands in "
+								"spec-2.3+ (envelope ABI ratify) and spec-2.4+ "
+								"(framing + epoch enforce).  For non-LMON IC "
+								"tests use cluster.interconnect_tier=mock.")));
 
 	return ClusterICOps_Active->send_bytes(target_node_id, buf, len);
 }
@@ -317,8 +315,7 @@ cluster_ic_recv_bytes(int32 *out_sender_node_id, void *buf, size_t bufsize,
 	 * tier1 backend honours kernel recv(2) short-read behaviour.
 	 */
 	Assert(ClusterICOps_Active != NULL);
-	return ClusterICOps_Active->recv_bytes(out_sender_node_id, buf, bufsize,
-										   out_received_len);
+	return ClusterICOps_Active->recv_bytes(out_sender_node_id, buf, bufsize, out_received_len);
 }
 
 
@@ -360,8 +357,8 @@ cluster_ic_recv_exact(int32 *out_sender_node_id, void *buf, size_t bufsize,
 					  size_t *out_received_len)
 {
 	size_t total = 0;
-	char  *cursor = (char *) buf;
-	int32  sender = -1;
+	char *cursor = (char *)buf;
+	int32 sender = -1;
 
 	Assert(ClusterICOps_Active != NULL);
 
@@ -370,12 +367,11 @@ cluster_ic_recv_exact(int32 *out_sender_node_id, void *buf, size_t bufsize,
 	if (out_sender_node_id != NULL)
 		*out_sender_node_id = -1;
 
-	while (total < bufsize)
-	{
-		int32  next_sender = -1;
+	while (total < bufsize) {
+		int32 next_sender = -1;
 		size_t got = 0;
-		int32  this_sender = -1;
-		bool   ok;
+		int32 this_sender = -1;
+		bool ok;
 
 		/*
 		 * spec-2.2 D2 (post-codex review) -- peek BEFORE consume.
@@ -404,12 +400,8 @@ cluster_ic_recv_exact(int32 *out_sender_node_id, void *buf, size_t bufsize,
 			break; /* sender flip detected BEFORE consume; stop with partial */
 
 		/* Safe to consume now: next chunk is from same peer (or first). */
-		ok = ClusterICOps_Active->recv_bytes(&this_sender,
-											 cursor + total,
-											 bufsize - total,
-											 &got);
-		if (!ok)
-		{
+		ok = ClusterICOps_Active->recv_bytes(&this_sender, cursor + total, bufsize - total, &got);
+		if (!ok) {
 			/*
 			 * Hard error from vtable (tier1 ECONNRESET / EPIPE; mock
 			 * never reaches here per strict bool semantics).  Propagate
@@ -484,41 +476,35 @@ StaticAssertDecl(sizeof(ClusterICHelloMsg) == PGRAC_IC_HELLO_BYTES,
 static inline void
 ic_le_write_uint16(uint8 *buf, uint16 v)
 {
-	buf[0] = (uint8) (v & 0xFF);
-	buf[1] = (uint8) ((v >> 8) & 0xFF);
+	buf[0] = (uint8)(v & 0xFF);
+	buf[1] = (uint8)((v >> 8) & 0xFF);
 }
 
 static inline void
 ic_le_write_uint32(uint8 *buf, uint32 v)
 {
-	buf[0] = (uint8) (v & 0xFF);
-	buf[1] = (uint8) ((v >> 8) & 0xFF);
-	buf[2] = (uint8) ((v >> 16) & 0xFF);
-	buf[3] = (uint8) ((v >> 24) & 0xFF);
+	buf[0] = (uint8)(v & 0xFF);
+	buf[1] = (uint8)((v >> 8) & 0xFF);
+	buf[2] = (uint8)((v >> 16) & 0xFF);
+	buf[3] = (uint8)((v >> 24) & 0xFF);
 }
 
 static inline uint16
 ic_le_read_uint16(const uint8 *buf)
 {
-	return ((uint16) buf[0])
-		 | ((uint16) buf[1] << 8);
+	return ((uint16)buf[0]) | ((uint16)buf[1] << 8);
 }
 
 static inline uint32
 ic_le_read_uint32(const uint8 *buf)
 {
-	return ((uint32) buf[0])
-		 | ((uint32) buf[1] << 8)
-		 | ((uint32) buf[2] << 16)
-		 | ((uint32) buf[3] << 24);
+	return ((uint32)buf[0]) | ((uint32)buf[1] << 8) | ((uint32)buf[2] << 16)
+		   | ((uint32)buf[3] << 24);
 }
 
 void
-cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES],
-					   uint16 hello_version,
-					   uint16 envelope_version,
-					   int32  source_node_id,
-					   const char *cluster_name)
+cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint16 hello_version,
+					   uint16 envelope_version, int32 source_node_id, const char *cluster_name)
 {
 	size_t name_len;
 
@@ -532,10 +518,10 @@ cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES],
 	 */
 	memset(out_buf, 0, PGRAC_IC_HELLO_BYTES);
 
-	ic_le_write_uint32(out_buf + 0,  PGRAC_IC_HELLO_MAGIC);
-	ic_le_write_uint16(out_buf + 4,  hello_version);
-	ic_le_write_uint16(out_buf + 6,  envelope_version);
-	ic_le_write_uint32(out_buf + 8,  (uint32) source_node_id);
+	ic_le_write_uint32(out_buf + 0, PGRAC_IC_HELLO_MAGIC);
+	ic_le_write_uint16(out_buf + 4, hello_version);
+	ic_le_write_uint16(out_buf + 6, envelope_version);
+	ic_le_write_uint32(out_buf + 8, (uint32)source_node_id);
 
 	/* cluster_name: copy up to PGRAC_IC_CLUSTER_NAME_MAX-1 chars + NUL. */
 	name_len = strlen(cluster_name);
@@ -547,8 +533,7 @@ cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES],
 }
 
 bool
-cluster_ic_parse_hello(const uint8 in_buf[PGRAC_IC_HELLO_BYTES],
-					   ClusterICHelloMsg *out_msg)
+cluster_ic_parse_hello(const uint8 in_buf[PGRAC_IC_HELLO_BYTES], ClusterICHelloMsg *out_msg)
 {
 	uint32 magic;
 
@@ -559,10 +544,10 @@ cluster_ic_parse_hello(const uint8 in_buf[PGRAC_IC_HELLO_BYTES],
 	if (magic != PGRAC_IC_HELLO_MAGIC)
 		return false;
 
-	out_msg->magic            = magic;
-	out_msg->hello_version    = ic_le_read_uint16(in_buf + 4);
+	out_msg->magic = magic;
+	out_msg->hello_version = ic_le_read_uint16(in_buf + 4);
 	out_msg->envelope_version = ic_le_read_uint16(in_buf + 6);
-	out_msg->source_node_id   = (int32) ic_le_read_uint32(in_buf + 8);
+	out_msg->source_node_id = (int32)ic_le_read_uint32(in_buf + 8);
 
 	/*
 	 * Copy cluster_name region; ensure terminator inside the field
@@ -609,15 +594,13 @@ cluster_msg_send(int32 target_node_id, uint16 msg_type, const void *payload, uin
 	 * stub / mock / disabled modes pass through unchanged so existing
 	 * tests / debug paths still work.
 	 */
-	if (ClusterICOps_Active == &ClusterICOps_Tier1
-		&& msg_type != PGRAC_IC_MSG_HEARTBEAT)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cluster_msg_send via tier1 only supports "
-						"HEARTBEAT msg_type in spec-2.2 (got msg_type=%u)",
-						msg_type),
-				 errhint("Other msg_types land in spec-2.4 (framing + epoch "
-						 "enforce) and follow-up specs (general IC router).")));
+	if (ClusterICOps_Active == &ClusterICOps_Tier1 && msg_type != PGRAC_IC_MSG_HEARTBEAT)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cluster_msg_send via tier1 only supports "
+							   "HEARTBEAT msg_type in spec-2.2 (got msg_type=%u)",
+							   msg_type),
+						errhint("Other msg_types land in spec-2.4 (framing + epoch "
+								"enforce) and follow-up specs (general IC router).")));
 
 	memset(&hdr, 0, sizeof(hdr));
 	hdr.magic = PGRAC_IC_MAGIC;
@@ -698,8 +681,8 @@ cluster_msg_recv(ClusterMsgHeader *out_hdr, void *payload_buf, uint32 payload_bu
 		 * We've already validated payload_len <= payload_buf_size
 		 * just above, so passing payload_len to recv_exact is safe.
 		 */
-		if (!cluster_ic_recv_exact(&sender_node_id, payload_buf,
-								   out_hdr->payload_len, &payload_received))
+		if (!cluster_ic_recv_exact(&sender_node_id, payload_buf, out_hdr->payload_len,
+								   &payload_received))
 			return false;
 
 		if (payload_received != out_hdr->payload_len) {
@@ -957,8 +940,7 @@ mock_recv_bytes(int32 *out_sender_node_id, void *buf, size_t bufsize, size_t *ou
 	 */
 	e = mock_inbound_queue ? mock_inbound_queue->head : NULL;
 
-	if (e == NULL)
-	{
+	if (e == NULL) {
 		/*
 		 * spec-2.2 D2 STRICT bool semantics (post-codex review): empty
 		 * queue is "no data ready" -- return true with received=0,
@@ -990,8 +972,7 @@ mock_recv_bytes(int32 *out_sender_node_id, void *buf, size_t bufsize, size_t *ou
 	if (out_sender_node_id != NULL)
 		*out_sender_node_id = e->sender_node_id;
 
-	if (e->consumed == e->len)
-	{
+	if (e->consumed == e->len) {
 		/* Fully drained -- detach from queue and free. */
 		MockQueueEntry *popped = mock_queue_pop(mock_inbound_queue);
 		Assert(popped == e);
@@ -1165,9 +1146,7 @@ cluster_ic_mock_recv_test(PG_FUNCTION_ARGS)
 	 * emission on received > 0 so empty queue still emits zero rows
 	 * (014_ic_mock.pl tests 5 + 8 lock this behaviour).
 	 */
-	if (cluster_ic_recv_bytes(&sender, buf, sizeof(buf), &received)
-		&& received > 0)
-	{
+	if (cluster_ic_recv_bytes(&sender, buf, sizeof(buf), &received) && received > 0) {
 		Datum values[2];
 		bool nulls[2] = { false, false };
 		bytea *payload_bytea;
@@ -1203,9 +1182,8 @@ cluster_ic_mock_recv_test(PG_FUNCTION_ARGS)
 Datum
 cluster_get_ic_peers(PG_FUNCTION_ARGS pg_attribute_unused())
 {
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("cluster_get_ic_peers requires --enable-cluster")));
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cluster_get_ic_peers requires --enable-cluster")));
 	PG_RETURN_NULL();
 }
 #endif

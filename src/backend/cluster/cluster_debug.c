@@ -311,14 +311,13 @@ dump_ic(ReturnSetInfo *rsinfo)
 	 * t/077 TAP and runtime diagnostics; the fd itself is process-
 	 * local and never exposed.
 	 */
-	if (ClusterICOps_Active == &ClusterICOps_Tier1)
-	{
+	if (ClusterICOps_Active == &ClusterICOps_Tier1) {
 		emit_row(rsinfo, "ic", "tier1_listener_pid",
-				 fmt_int32((int32) cluster_ic_tier1_get_listener_pid()));
+				 fmt_int32((int32)cluster_ic_tier1_get_listener_pid()));
 		emit_row(rsinfo, "ic", "tier1_listener_incarnation",
 				 psprintf(UINT64_FORMAT, cluster_ic_tier1_get_listener_incarnation()));
 		emit_row(rsinfo, "ic", "tier1_listener_port",
-				 fmt_int32((int32) cluster_ic_tier1_get_listener_port()));
+				 fmt_int32((int32)cluster_ic_tier1_get_listener_port()));
 	}
 }
 

@@ -111,16 +111,29 @@ BackendType MyBackendType = B_INVALID;
  * (test_tier1_vtable_extern_linkable).  Real behaviour is verified at
  * TAP layer (075 single-instance + 076 2-node A-lite, in Steps 10-11).
  */
-static bool tier1_test_stub_send(int32 t pg_attribute_unused(),
-								 const void *b pg_attribute_unused(),
-								 size_t l pg_attribute_unused()) { return false; }
-static bool tier1_test_stub_recv(int32 *s pg_attribute_unused(),
-								 void *b pg_attribute_unused(),
-								 size_t bs pg_attribute_unused(),
-								 size_t *r pg_attribute_unused()) { return false; }
-static bool tier1_test_stub_peek(int32 *s pg_attribute_unused()) { return false; }
-static void tier1_test_stub_init(void) { }
-static void tier1_test_stub_shutdown(void) { }
+static bool
+tier1_test_stub_send(int32 t pg_attribute_unused(), const void *b pg_attribute_unused(),
+					 size_t l pg_attribute_unused())
+{
+	return false;
+}
+static bool
+tier1_test_stub_recv(int32 *s pg_attribute_unused(), void *b pg_attribute_unused(),
+					 size_t bs pg_attribute_unused(), size_t *r pg_attribute_unused())
+{
+	return false;
+}
+static bool
+tier1_test_stub_peek(int32 *s pg_attribute_unused())
+{
+	return false;
+}
+static void
+tier1_test_stub_init(void)
+{}
+static void
+tier1_test_stub_shutdown(void)
+{}
 
 const ClusterICOps ClusterICOps_Tier1 = {
 	.send_bytes = tier1_test_stub_send,
@@ -427,10 +440,10 @@ UT_TEST(test_peer_state_enum_size)
 	 * implementation-defined; lock to int via sizeof check.
 	 */
 	UT_ASSERT_EQ(sizeof(ClusterICPeerState), sizeof(int));
-	UT_ASSERT_EQ((int)CLUSTER_IC_PEER_DOWN,       0);
+	UT_ASSERT_EQ((int)CLUSTER_IC_PEER_DOWN, 0);
 	UT_ASSERT_EQ((int)CLUSTER_IC_PEER_CONNECTING, 1);
-	UT_ASSERT_EQ((int)CLUSTER_IC_PEER_CONNECTED,  2);
-	UT_ASSERT_EQ((int)CLUSTER_IC_PEER_REJECTED,   3);
+	UT_ASSERT_EQ((int)CLUSTER_IC_PEER_CONNECTED, 2);
+	UT_ASSERT_EQ((int)CLUSTER_IC_PEER_REJECTED, 3);
 }
 
 UT_TEST(test_mesh_role_low_id_active)
@@ -480,10 +493,7 @@ UT_TEST(test_hello_wire_roundtrip)
 	ClusterICHelloMsg parsed;
 	bool ok;
 
-	cluster_ic_build_hello(wire,
-						   PGRAC_IC_HELLO_VERSION_V1,
-						   PGRAC_IC_ENVELOPE_VERSION_V1,
-						   42,
+	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 42,
 						   "pgrac-test");
 
 	ok = cluster_ic_parse_hello(wire, &parsed);
@@ -498,7 +508,7 @@ UT_TEST(test_hello_wire_roundtrip)
 UT_TEST(test_hello_wire_reference_bytes)
 {
 	uint8 wire[PGRAC_IC_HELLO_BYTES];
-	int   i;
+	int i;
 
 	/*
 	 * Reference byte vector for HELLO V1 with:
@@ -518,11 +528,8 @@ UT_TEST(test_hello_wire_reference_bytes)
 	 * Locking these exact bytes guards against compiler-pad drift,
 	 * unintended endian flips, and uninitialized memory leakage.
 	 */
-	cluster_ic_build_hello(wire,
-						   PGRAC_IC_HELLO_VERSION_V1,
-						   PGRAC_IC_ENVELOPE_VERSION_V1,
-						   0x01020304,
-						   "AB");
+	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1,
+						   0x01020304, "AB");
 
 	/* magic */
 	UT_ASSERT_EQ(wire[0], 0x48);
@@ -536,8 +543,8 @@ UT_TEST(test_hello_wire_reference_bytes)
 	UT_ASSERT_EQ(wire[6], 0x01);
 	UT_ASSERT_EQ(wire[7], 0x00);
 	/* source_node_id = 0x01020304 LE */
-	UT_ASSERT_EQ(wire[8],  0x04);
-	UT_ASSERT_EQ(wire[9],  0x03);
+	UT_ASSERT_EQ(wire[8], 0x04);
+	UT_ASSERT_EQ(wire[9], 0x03);
 	UT_ASSERT_EQ(wire[10], 0x02);
 	UT_ASSERT_EQ(wire[11], 0x01);
 	/* cluster_name "AB" + NUL pad */
@@ -555,11 +562,7 @@ UT_TEST(test_hello_parse_rejects_bad_magic)
 	uint8 wire[PGRAC_IC_HELLO_BYTES];
 	ClusterICHelloMsg parsed;
 
-	cluster_ic_build_hello(wire,
-						   PGRAC_IC_HELLO_VERSION_V1,
-						   PGRAC_IC_ENVELOPE_VERSION_V1,
-						   1,
-						   "x");
+	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 1, "x");
 	/* Corrupt magic */
 	wire[0] = 0xDE;
 	wire[1] = 0xAD;
@@ -573,13 +576,9 @@ UT_TEST(test_hello_build_truncates_long_name)
 {
 	uint8 wire[PGRAC_IC_HELLO_BYTES];
 	ClusterICHelloMsg parsed;
-	const char *long_name =
-		"this-cluster-name-is-way-longer-than-the-fixed-cap-on-purpose";
+	const char *long_name = "this-cluster-name-is-way-longer-than-the-fixed-cap-on-purpose";
 
-	cluster_ic_build_hello(wire,
-						   PGRAC_IC_HELLO_VERSION_V1,
-						   PGRAC_IC_ENVELOPE_VERSION_V1,
-						   7,
+	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 7,
 						   long_name);
 
 	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));

@@ -55,17 +55,16 @@
  * (256 bytes per peer, cache-line aligned to keep cross-CPU
  * peer-state writes from sharing cache lines).
  */
-#include "datatype/timestamp.h"      /* TimestampTz */
-#include "port/atomics.h"            /* pg_atomic_uint64 */
+#include "datatype/timestamp.h" /* TimestampTz */
+#include "port/atomics.h"		/* pg_atomic_uint64 */
 
 #define CLUSTER_IC_TIER1_LAST_ERROR_LEN 128
-#define CLUSTER_IC_TIER1_ADDR_LEN       64
+#define CLUSTER_IC_TIER1_ADDR_LEN 64
 
-typedef struct ClusterICPeerStateShmem
-{
-	int32       node_id;                                   /* peer's node_id */
-	int32       state;                                     /* ClusterICPeerState */
-	char        interconnect_addr[CLUSTER_IC_TIER1_ADDR_LEN];
+typedef struct ClusterICPeerStateShmem {
+	int32 node_id; /* peer's node_id */
+	int32 state;   /* ClusterICPeerState */
+	char interconnect_addr[CLUSTER_IC_TIER1_ADDR_LEN];
 	TimestampTz last_connect_at;
 	TimestampTz last_send_at;
 	TimestampTz last_recv_at;
@@ -77,12 +76,12 @@ typedef struct ClusterICPeerStateShmem
 	pg_atomic_uint64 msg_recv_count;
 	pg_atomic_uint64 bytes_send;
 	pg_atomic_uint64 bytes_recv;
-	uint32      reconnect_count;
-	uint32      connect_error_count;
-	int32       last_errno;
-	char        last_error_code[8];                        /* SQLSTATE + NUL */
-	char        last_error[CLUSTER_IC_TIER1_LAST_ERROR_LEN];
-	uint8       _pad[40];                                  /* pad to 256B */
+	uint32 reconnect_count;
+	uint32 connect_error_count;
+	int32 last_errno;
+	char last_error_code[8]; /* SQLSTATE + NUL */
+	char last_error[CLUSTER_IC_TIER1_LAST_ERROR_LEN];
+	uint8 _pad[40]; /* pad to 256B */
 } ClusterICPeerStateShmem;
 
 /*
@@ -179,7 +178,7 @@ extern bool cluster_ic_tier1_send_heartbeat(int32 peer_id);
  * sends are needed (returns 0 = complete, > 0 = remaining bytes).
  */
 extern bool cluster_ic_tier1_continue_hello_send(int32 peer_id, int peer_fd);
-extern int  cluster_ic_tier1_hello_send_remaining(int32 peer_id);
+extern int cluster_ic_tier1_hello_send_remaining(int32 peer_id);
 
 /*
  * Hardening v1.0.1 F1: passive-side HELLO recv with partial-recv

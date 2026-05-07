@@ -103,7 +103,7 @@ typedef enum ClusterICTier {
  * msg_type sent through cluster_msg_send in tier1 mode is rejected
  * with ERR_FEATURE_NOT_SUPPORTED.
  */
-#define PGRAC_IC_MSG_HEARTBEAT  ((uint16)1)
+#define PGRAC_IC_MSG_HEARTBEAT ((uint16)1)
 
 /*
  * Exact size of ClusterMsgHeader, anchored as a constant for unit
@@ -246,19 +246,19 @@ extern const ClusterICOps *ClusterICOps_Active;
  * Failure to verify any field => connection-level rejection per §3.10
  * (close socket + peer_state = rejected; NEVER FATAL the postmaster).
  */
-#define PGRAC_IC_HELLO_MAGIC       ((uint32)0x4F4C4C48)  /* "HLLO" LE */
-#define PGRAC_IC_HELLO_VERSION_V1  ((uint16)1)
-#define PGRAC_IC_ENVELOPE_VERSION_V1 ((uint16)1)         /* spec-2.0 §4 frozen */
-#define PGRAC_IC_HELLO_BYTES       64
-#define PGRAC_IC_CLUSTER_NAME_MAX  24
+#define PGRAC_IC_HELLO_MAGIC ((uint32)0x4F4C4C48) /* "HLLO" LE */
+#define PGRAC_IC_HELLO_VERSION_V1 ((uint16)1)
+#define PGRAC_IC_ENVELOPE_VERSION_V1 ((uint16)1) /* spec-2.0 §4 frozen */
+#define PGRAC_IC_HELLO_BYTES 64
+#define PGRAC_IC_CLUSTER_NAME_MAX 24
 
 typedef struct ClusterICHelloMsg {
-	uint32 magic;                                /* PGRAC_IC_HELLO_MAGIC */
-	uint16 hello_version;                        /* PGRAC_IC_HELLO_VERSION_V1 */
-	uint16 envelope_version;                     /* PGRAC_IC_ENVELOPE_VERSION_V1 */
-	int32  source_node_id;                       /* sender's cluster.node_id */
-	char   cluster_name[PGRAC_IC_CLUSTER_NAME_MAX]; /* NUL-terminated; truncated */
-	uint8  _pad[28];                             /* pad to 64B fixed ABI */
+	uint32 magic;								  /* PGRAC_IC_HELLO_MAGIC */
+	uint16 hello_version;						  /* PGRAC_IC_HELLO_VERSION_V1 */
+	uint16 envelope_version;					  /* PGRAC_IC_ENVELOPE_VERSION_V1 */
+	int32 source_node_id;						  /* sender's cluster.node_id */
+	char cluster_name[PGRAC_IC_CLUSTER_NAME_MAX]; /* NUL-terminated; truncated */
+	uint8 _pad[28];								  /* pad to 64B fixed ABI */
 } ClusterICHelloMsg;
 
 
@@ -283,10 +283,8 @@ typedef struct ClusterICHelloMsg {
  * MUST go via PGRAC_IC_HELLO_VERSION_V2 (new struct + dispatch on
  * hello_version field), never resize V1 in-place.
  */
-extern void cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES],
-								   uint16 hello_version,
-								   uint16 envelope_version,
-								   int32  source_node_id,
+extern void cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint16 hello_version,
+								   uint16 envelope_version, int32 source_node_id,
 								   const char *cluster_name);
 extern bool cluster_ic_parse_hello(const uint8 in_buf[PGRAC_IC_HELLO_BYTES],
 								   ClusterICHelloMsg *out_msg);
@@ -314,10 +312,10 @@ extern bool cluster_ic_parse_hello(const uint8 in_buf[PGRAC_IC_HELLO_BYTES],
  * fence state (those land in spec-2.5 / 2.6 / 2.28).
  */
 typedef enum ClusterICPeerState {
-	CLUSTER_IC_PEER_DOWN       = 0,
+	CLUSTER_IC_PEER_DOWN = 0,
 	CLUSTER_IC_PEER_CONNECTING = 1,
-	CLUSTER_IC_PEER_CONNECTED  = 2,
-	CLUSTER_IC_PEER_REJECTED   = 3
+	CLUSTER_IC_PEER_CONNECTED = 2,
+	CLUSTER_IC_PEER_REJECTED = 3
 } ClusterICPeerState;
 
 
@@ -335,7 +333,7 @@ typedef enum ClusterICPeerState {
  * (test_cluster_ic.c) link without pulling in the full Tier1 vtable.
  */
 typedef enum ClusterICMeshRole {
-	CLUSTER_IC_MESH_ACTIVE  = 0,
+	CLUSTER_IC_MESH_ACTIVE = 0,
 	CLUSTER_IC_MESH_PASSIVE = 1
 } ClusterICMeshRole;
 
@@ -344,8 +342,7 @@ cluster_ic_mesh_role_for_pair(int32 self_node_id, int32 peer_node_id)
 {
 	/* self == peer is a programming error (mesh has no self loop). */
 	Assert(self_node_id != peer_node_id);
-	return (self_node_id < peer_node_id) ? CLUSTER_IC_MESH_ACTIVE
-										 : CLUSTER_IC_MESH_PASSIVE;
+	return (self_node_id < peer_node_id) ? CLUSTER_IC_MESH_ACTIVE : CLUSTER_IC_MESH_PASSIVE;
 }
 
 
@@ -395,8 +392,8 @@ extern bool cluster_ic_send_bytes(int32 target_node_id, const void *buf, size_t 
  * length-prefixed wire-format reads (header / envelope / HELLO).
  * See body comment in cluster_ic.c for full semantics.
  */
-extern bool cluster_ic_recv_exact(int32 *out_sender_node_id, void *buf,
-								  size_t bufsize, size_t *out_received_len);
+extern bool cluster_ic_recv_exact(int32 *out_sender_node_id, void *buf, size_t bufsize,
+								  size_t *out_received_len);
 
 extern bool cluster_ic_recv_bytes(int32 *out_sender_node_id, void *buf, size_t bufsize,
 								  size_t *out_received_len);

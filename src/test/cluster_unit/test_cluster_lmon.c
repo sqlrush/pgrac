@@ -190,12 +190,12 @@ char *cluster_injection_points = NULL;
  * at TAP layer (075/076 in spec-2.2 Steps 10-11).
  */
 bool cluster_enabled = false;
-int  cluster_interconnect_tier = 0;        /* CLUSTER_IC_TIER_STUB */
+int cluster_interconnect_tier = 0; /* CLUSTER_IC_TIER_STUB */
 
 /* spec-2.2 D7 GUCs (cluster_lmon.c references heartbeat_interval_ms). */
 int cluster_interconnect_heartbeat_interval_ms = 1000;
-int cluster_interconnect_connect_timeout_ms    = 5000;
-int cluster_interconnect_recv_timeout_ms       = 30000;
+int cluster_interconnect_connect_timeout_ms = 5000;
+int cluster_interconnect_recv_timeout_ms = 30000;
 
 #include "cluster/cluster_ic_tier1.h"
 
@@ -268,10 +268,10 @@ cluster_ic_tier1_hello_send_remaining(int32 peer_id pg_attribute_unused())
 }
 bool
 cluster_ic_tier1_continue_hello_recv(int anon_slot pg_attribute_unused(),
-									 int peer_fd pg_attribute_unused(),
-									 int32 *out_learned_peer_id)
+									 int peer_fd pg_attribute_unused(), int32 *out_learned_peer_id)
 {
-	if (out_learned_peer_id != NULL) *out_learned_peer_id = -1;
+	if (out_learned_peer_id != NULL)
+		*out_learned_peer_id = -1;
 	return false;
 }
 void
@@ -302,33 +302,27 @@ typedef struct WaitEvent WaitEvent;
  * declared in utils/memutils.h indirectly via cluster_lmon.c includes. */
 MemoryContext CurrentMemoryContext = NULL;
 WaitEventSet *
-CreateWaitEventSet(MemoryContext cxt pg_attribute_unused(),
-				   int nevents pg_attribute_unused())
+CreateWaitEventSet(MemoryContext cxt pg_attribute_unused(), int nevents pg_attribute_unused())
 {
 	return NULL;
 }
 int
-AddWaitEventToSet(WaitEventSet *set pg_attribute_unused(),
-				  uint32 events pg_attribute_unused(),
-				  int fd pg_attribute_unused(),
-				  void *latch pg_attribute_unused(),
+AddWaitEventToSet(WaitEventSet *set pg_attribute_unused(), uint32 events pg_attribute_unused(),
+				  int fd pg_attribute_unused(), void *latch pg_attribute_unused(),
 				  void *user_data pg_attribute_unused())
 {
 	return -1;
 }
 int
-WaitEventSetWait(WaitEventSet *set pg_attribute_unused(),
-				 long timeout pg_attribute_unused(),
+WaitEventSetWait(WaitEventSet *set pg_attribute_unused(), long timeout pg_attribute_unused(),
 				 WaitEvent *occurred_events pg_attribute_unused(),
-				 int nevents pg_attribute_unused(),
-				 uint32 wait_event_info pg_attribute_unused())
+				 int nevents pg_attribute_unused(), uint32 wait_event_info pg_attribute_unused())
 {
 	return 0;
 }
 void
 FreeWaitEventSet(WaitEventSet *set pg_attribute_unused())
-{
-}
+{}
 void
 cluster_injection_run(const char *name pg_attribute_unused())
 {}

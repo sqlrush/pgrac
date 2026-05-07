@@ -494,13 +494,11 @@ post_validate(const char *path)
 			load_single_node_fallback(path);
 			return;
 		}
-		ereport(FATAL,
-				(errcode(ERRCODE_CONFIG_FILE_ERROR),
-				 errmsg("cluster_conf: \"%s\" declares zero [node.N] sections",
-						path),
-				 errhint("Add at least one [node.N] section to pgrac.conf, "
-						 "or set cluster.allow_single_node = on for "
-						 "single-node compatibility mode.")));
+		ereport(FATAL, (errcode(ERRCODE_CONFIG_FILE_ERROR),
+						errmsg("cluster_conf: \"%s\" declares zero [node.N] sections", path),
+						errhint("Add at least one [node.N] section to pgrac.conf, "
+								"or set cluster.allow_single_node = on for "
+								"single-node compatibility mode.")));
 	}
 
 	for (i = 0; i < ClusterConfShmem->node_count; i++) {
@@ -591,12 +589,11 @@ cluster_conf_load(void)
 				load_single_node_fallback(path);
 				return;
 			}
-			ereport(FATAL,
-					(errcode(ERRCODE_CONFIG_FILE_ERROR),
-					 errmsg("pgrac.conf is required when cluster.allow_single_node is off"),
-					 errhint("Create pgrac.conf with node entries, or set "
-							 "cluster.allow_single_node = on for single-node "
-							 "compatibility mode.")));
+			ereport(FATAL, (errcode(ERRCODE_CONFIG_FILE_ERROR),
+							errmsg("pgrac.conf is required when cluster.allow_single_node is off"),
+							errhint("Create pgrac.conf with node entries, or set "
+									"cluster.allow_single_node = on for single-node "
+									"compatibility mode.")));
 		}
 		ereport(FATAL, (errcode_for_file_access(),
 						errmsg("cluster_conf: could not stat \"%s\": %m", path)));

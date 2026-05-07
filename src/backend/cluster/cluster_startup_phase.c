@@ -1101,32 +1101,26 @@ cluster_finalize_startup_running(void)
 	 * cluster_enabled = off path skips entirely (no warning, no FATAL --
 	 * vanilla PG behaviour).
 	 */
-	if (cluster_enabled && !SCN_NODE_ID_VALID(cluster_node_id))
-	{
-		if (cluster_allow_single_node)
-		{
+	if (cluster_enabled && !SCN_NODE_ID_VALID(cluster_node_id)) {
+		if (cluster_allow_single_node) {
 			/* Stage 2.1 backward-compat path: WARNING + single-node fallback */
-			ereport(WARNING,
-					(errcode(ERRCODE_WARNING),
-					 errmsg("cluster.node_id (%d) is outside the valid range 0..%d; "
-							"cluster SCN advance will silently skip",
-							cluster_node_id, SCN_MAX_VALID_NODE_ID),
-					 errhint("Set cluster.node_id in postgresql.conf to an integer 0..127 "
-							 "to enable SCN advance, or set cluster.enabled = off for "
-							 "vanilla PG behaviour.  Currently running in single-node "
-							 "compatibility mode (cluster.allow_single_node = on).  Set "
-							 "cluster.allow_single_node = off to enforce strict mode.")));
-		}
-		else
-		{
+			ereport(WARNING, (errcode(ERRCODE_WARNING),
+							  errmsg("cluster.node_id (%d) is outside the valid range 0..%d; "
+									 "cluster SCN advance will silently skip",
+									 cluster_node_id, SCN_MAX_VALID_NODE_ID),
+							  errhint("Set cluster.node_id in postgresql.conf to an integer 0..127 "
+									  "to enable SCN advance, or set cluster.enabled = off for "
+									  "vanilla PG behaviour.  Currently running in single-node "
+									  "compatibility mode (cluster.allow_single_node = on).  Set "
+									  "cluster.allow_single_node = off to enforce strict mode.")));
+		} else {
 			/* Stage 2 strict path: FATAL */
-			ereport(FATAL,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("cluster.node_id (%d) is outside the valid range 0..%d",
-							cluster_node_id, SCN_MAX_VALID_NODE_ID),
-					 errhint("Set cluster.node_id in postgresql.conf to an integer 0..127, "
-							 "or set cluster.allow_single_node = on for single-node "
-							 "compatibility mode.")));
+			ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("cluster.node_id (%d) is outside the valid range 0..%d",
+								   cluster_node_id, SCN_MAX_VALID_NODE_ID),
+							errhint("Set cluster.node_id in postgresql.conf to an integer 0..127, "
+									"or set cluster.allow_single_node = on for single-node "
+									"compatibility mode.")));
 		}
 	}
 
