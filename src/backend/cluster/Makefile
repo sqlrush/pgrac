@@ -46,6 +46,7 @@ OBJS = \
 	cluster_guc.o \
 	cluster_ic.o \
 	cluster_ic_envelope.o \
+	cluster_ic_router.o \
 	cluster_ic_tier1.o \
 	cluster_inject.o \
 	cluster_lck.o \

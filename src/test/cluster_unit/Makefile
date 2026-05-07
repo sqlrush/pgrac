@@ -29,6 +29,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_wait_events test_cluster_errcodes test_cluster_guc \
         test_cluster_shmem test_cluster_signal test_cluster_views \
         test_cluster_gviews test_cluster_ic test_cluster_ic_envelope \
+        test_cluster_ic_router \
         test_cluster_conf \
         test_cluster_ic_mock test_cluster_inject test_cluster_pgstat \
         test_cluster_debug test_cluster_shared_fs test_cluster_smgr \
@@ -60,6 +61,7 @@ CLUSTER_SIGNAL_O = $(top_builddir)/src/backend/cluster/cluster_signal.o
 CLUSTER_VIEWS_O = $(top_builddir)/src/backend/cluster/cluster_views.o
 CLUSTER_IC_O = $(top_builddir)/src/backend/cluster/cluster_ic.o
 CLUSTER_IC_ENVELOPE_O = $(top_builddir)/src/backend/cluster/cluster_ic_envelope.o
+CLUSTER_IC_ROUTER_O = $(top_builddir)/src/backend/cluster/cluster_ic_router.o
 CLUSTER_CONF_O = $(top_builddir)/src/backend/cluster/cluster_conf.o
 CLUSTER_INJECT_O = $(top_builddir)/src/backend/cluster/cluster_inject.o
 CLUSTER_PGSTAT_O = $(top_builddir)/src/backend/cluster/cluster_pgstat.o
@@ -142,6 +144,19 @@ test_cluster_ic_envelope: test_cluster_ic_envelope.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_IC_ENVELOPE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_IC_ENVELOPE_O) \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-2.3 D4: test_cluster_ic_router links cluster_ic_router.o +
+# cluster_ic_envelope.o (envelope_build called inside send_envelope) +
+# libpgport_srv.a for CRC32C.  Stubs ereport family + cluster_ic_send_bytes
+# + MyBackendType + MemoryContext + cluster_node_id locally.  Tests
+# register_msg_type / get_msg_type_info / count_registered;send + dispatch
+# behavior probed only at the validation layer (no actual wire send because
+# the vtable stub is short-circuited via dest=self).
+test_cluster_ic_router: test_cluster_ic_router.c unit_test.h \
+		$(CLUSTER_VERSION_O) $(CLUSTER_IC_ROUTER_O) $(CLUSTER_IC_ENVELOPE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_IC_ROUTER_O) $(CLUSTER_IC_ENVELOPE_O) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 # test_cluster_conf links cluster_conf.o standalone.  cluster_conf.c

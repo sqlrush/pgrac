@@ -102,8 +102,14 @@ typedef enum ClusterICTier {
  * INVAL / etc) and lift the scope guard.  Until then, any non-HEARTBEAT
  * msg_type sent through cluster_msg_send in tier1 mode is rejected
  * with ERR_FEATURE_NOT_SUPPORTED.
+ *
+ * spec-2.3 D3: PGRAC_IC_MSG_HEARTBEAT is now defined as an enum value
+ * in cluster_ic_envelope.h (ClusterICMsgType).  cluster_ic.c picks up
+ * the enum value via the include below; the spec-2.2 #define is
+ * superseded.  Step 5 will delete cluster_msg_send entirely + the
+ * scope guard at line 597 along with it.
  */
-#define PGRAC_IC_MSG_HEARTBEAT ((uint16)1)
+#include "cluster/cluster_ic_envelope.h"
 
 /*
  * Exact size of ClusterMsgHeader, anchored as a constant for unit
