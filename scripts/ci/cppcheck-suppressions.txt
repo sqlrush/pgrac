@@ -57,6 +57,16 @@ integerOverflowCond:src/include/port/atomics/generic.h
 # cluster_shared_fs_local.c suppression added in stage 1.1.
 nullPointerRedundantCheck:src/backend/cluster/cluster_shmem.c
 
+# Reason: spec-2.3 D1 cluster_ic_envelope.h uses pg_attribute_packed() macro
+# from c.h to honor spec-2.0 §4 frozen offsets (uint64 epoch at offset 12 /
+# scn at offset 20 are non-8-aligned naturally; without __attribute__((packed))
+# the struct grows to 40 bytes).  cppcheck 2.13 cannot expand the PG macro
+# and parses the trailing identifier `ClusterICEnvelope` as a syntax error.
+# The compile-time ABI lock is the 4 StaticAssertDecl in cluster_ic_envelope.c
+# (sizeof + 3 offsetof); cppcheck's syntax confusion is purely a macro-
+# expansion gap, not a code defect.
+syntaxError:src/include/cluster/cluster_ic_envelope.h
+
 # === Inline suppressions ===
 # All inline /* cppcheck-suppress xxx */ comments must include a
 # "Reason:" line on the next line.  Currently:

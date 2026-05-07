@@ -115,6 +115,16 @@ SHAREDFS_SUPP=(
   # Assert(region != NULL); region->name pattern that triggers the
   # PG-Assert false positive (PG's Assert is non-trapping to cppcheck).
   --suppress=nullPointerRedundantCheck:src/backend/cluster/cluster_shmem.c
+  # Reason: spec-2.3 D1 cluster_ic_envelope.h uses pg_attribute_packed()
+  # macro from c.h to honor spec-2.0 §4 frozen offsets (uint64 epoch at
+  # offset 12 / scn at offset 20 are non-8-aligned naturally; without
+  # __attribute__((packed)) the struct grows to 40 bytes).  cppcheck 2.13
+  # cannot expand this PG macro and parses the trailing identifier
+  # `ClusterICEnvelope` after `pg_attribute_packed()` as a syntax error.
+  # The compile-time guarantee is the 4 StaticAssertDecl in
+  # cluster_ic_envelope.c (sizeof + 3 offsetof); cppcheck's syntax
+  # confusion is purely a macro-expansion gap, not a code defect.
+  --suppress=syntaxError:src/include/cluster/cluster_ic_envelope.h
 )
 
 echo "## cppcheck $(cppcheck --version)"
