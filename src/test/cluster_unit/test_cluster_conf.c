@@ -67,6 +67,12 @@
 int cluster_node_id = -1;
 char *cluster_config_file = (char *)"pgrac.conf";
 bool cluster_allow_single_node = true; /* spec-2.1 D1; storage stub matches default */
+bool cluster_enabled = true; /* spec-2.1 Hardening v1.0.1 D-H7 -- F2 fix in
+                              * cluster_conf.c::cluster_conf_load adds an extern
+                              * reference to cluster_enabled (defensive guard).
+                              * Stub matches GUC default; tests do not exercise
+                              * the !cluster_enabled early-return path
+                              * (verified at TAP layer L11). */
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
@@ -344,10 +350,32 @@ UT_TEST(test_scn_node_id_valid_overflow)
 }
 
 
+/* ============================================================
+ * spec-2.1 Hardening v1.0.1 D-H7: cluster_enabled extern linkable
+ *
+ * F2 fix in cluster_shmem.c (caller gate) and cluster_conf.c
+ * (callee defensive guard) both reference cluster_enabled.  This
+ * test verifies the extern symbol resolves at link time so future
+ * regressions are caught at unit-test build, not at TAP runtime.
+ * Cross-ref: lessons L48 meta (lesson SSOT enforce 不能假设单点
+ * -- need compile-time + CI gate, not just docstring).
+ * ============================================================ */
+
+UT_TEST(test_cluster_enabled_linkable)
+{
+	/*
+	 * Stub above sets cluster_enabled = true.  We are only checking
+	 * that the symbol resolves; runtime behaviour of the F2 guard is
+	 * verified at TAP layer (072 L11).
+	 */
+	UT_ASSERT(cluster_enabled);
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(19);
 	UT_RUN(test_max_nodes_constant);
 	UT_RUN(test_conf_magic_constant);
 	UT_RUN(test_node_role_int32_sized);
@@ -366,6 +394,7 @@ main(void)
 	UT_RUN(test_scn_node_id_valid_unset);
 	UT_RUN(test_scn_node_id_valid_range);
 	UT_RUN(test_scn_node_id_valid_overflow);
+	UT_RUN(test_cluster_enabled_linkable);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -482,9 +482,25 @@ post_validate(const char *path)
 	bool self_seen = false;
 
 	if (ClusterConfShmem->node_count == 0) {
-		/* No [node.N] declared: behave as single-node fallback. */
-		load_single_node_fallback(path);
-		return;
+		/*
+		 * spec-2.1 Hardening v1.0.1 F1: gate zero-[node.N] fallback on
+		 * cluster_allow_single_node.  Pre-Hardening this branch was
+		 * unconditional and bypassed allow=off strict mode (boundary B5
+		 * gap, see spec-2.1 §3.5 v1.0.1 amendment).  Other malformed
+		 * conf paths (parse error / collision / out-of-range) are not
+		 * affected -- they FATAL unconditionally per spec-0.19 ship.
+		 */
+		if (cluster_allow_single_node) {
+			load_single_node_fallback(path);
+			return;
+		}
+		ereport(FATAL,
+				(errcode(ERRCODE_CONFIG_FILE_ERROR),
+				 errmsg("cluster_conf: \"%s\" declares zero [node.N] sections",
+						path),
+				 errhint("Add at least one [node.N] section to pgrac.conf, "
+						 "or set cluster.allow_single_node = on for "
+						 "single-node compatibility mode.")));
 	}
 
 	for (i = 0; i < ClusterConfShmem->node_count; i++) {
@@ -533,6 +549,19 @@ cluster_conf_load(void)
 	enum { SEC_NONE, SEC_CLUSTER, SEC_NODE } cur_section = SEC_NONE;
 	int32 cur_node_id = -1;
 	ClusterNodeInfo *cur_node = NULL;
+
+	/*
+	 * spec-2.1 Hardening v1.0.1 F2 defensive guard: even if a future
+	 * caller forgets the cluster_enabled gate, cluster_conf_load itself
+	 * must be a no-op when cluster.enabled = off.  Per L15 (spec-1.16
+	 * v0.2): early-return alone is not enough -- caller must also gate.
+	 * Both layers must hold (caller in cluster_shmem.c::cluster_init_shmem
+	 * + this defensive guard) to prevent L11/L15/L36 family bugs from
+	 * resurfacing in Stage 2.X.  Cross-ref L48 meta (lesson enforce
+	 * can't assume single point).
+	 */
+	if (!cluster_enabled)
+		return;
 
 	CLUSTER_INJECTION_POINT("cluster-conf-parse-fail");
 

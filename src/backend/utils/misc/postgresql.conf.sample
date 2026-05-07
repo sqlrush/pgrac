@@ -819,6 +819,38 @@
 
 
 #------------------------------------------------------------------------------
+# PGRAC CLUSTER (pgrac multi-node fork; spec-2.1+)
+#------------------------------------------------------------------------------
+
+# These options are pgrac extensions to PostgreSQL 16.13.  All listed
+# here are PGC_POSTMASTER unless noted.  See pgrac/specs/spec-2.1-*
+# and pgrac/docs/cluster-conf-design.md for full design rationale.
+#
+# Note: these comment-out lines are deliberately present (per spec-2.1
+# Hardening v1.0.1 D-H6 / lessons L59) so that PostgreSQL::Test::Cluster
+# adjust_conf() always finds an anchor when test setup mutates these
+# settings.  Do not remove without coordinating with cluster_tap suites.
+
+#cluster.enabled = on			# master toggle: on = pgrac cluster
+					# runtime active; off = vanilla PG
+					# behaviour (no cluster shmem, no SCN
+					# advance, no IC tier_init).
+					# (change requires restart)
+#cluster.node_id = -1			# this node's id within the cluster
+					# (0..127); -1 = single-node default
+					# (must match a [node.N] section in
+					# pgrac.conf when allow_single_node=off).
+					# (change requires restart)
+#cluster.allow_single_node = on		# Stage 2.1 backward-compat:
+					# on  = pgrac.conf absent OR zero
+					#       [node.N] sections falls back
+					#       to single-node mode;
+					# off = strict; pgrac.conf required
+					#       with >= 1 [node.N] section.
+					# (change requires restart)
+
+
+#------------------------------------------------------------------------------
 # CUSTOMIZED OPTIONS
 #------------------------------------------------------------------------------
 

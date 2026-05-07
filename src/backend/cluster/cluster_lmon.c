@@ -7,22 +7,15 @@
  *	  See cluster_lmon.h for the architectural overview, HC1-HC6 hard
  *	  constraints, and Q1-Q3 implementation details.
  *
- *	  Sprint A scope summary (this file):
- *	    - shmem state (ClusterLmonSharedState + LWTRANCHE_CLUSTER_LMON)
- *	    - bounded-polling readiness sync (cluster_lmon_wait_for_ready)
- *	    - LmonMain main loop = local liveness tick (HC6)
- *	    - shutdown protocol (cluster_lmon_request_shutdown +
- *	      shutdown_requested poll in main loop)
- *	    - cluster_lmon_start as thin proxy to
- *	      cluster_postmaster_start_lmon (lives in postmaster.c, Q2)
- *
- *	  NOT in Sprint A (deferred to Sprint B):
- *	    - cluster.lmon_main_loop_interval GUC (Sprint A uses 1000ms hardcoded)
- *	    - 53R0A LMON_SPAWN_FAILED / 53R0B LMON_NOT_READY SQLSTATE
- *	      (Sprint A uses ERRCODE_INTERNAL_ERROR + diagnostic errmsg)
- *	    - 6 cluster-lmon-* inject points
- *	    - WAIT_EVENT_CLUSTER_BGPROC_LMON_MAIN_LOOP wait event
- *	    - dump_lmon view 6 keys
+ *	  Ship status (Hardening v1.0.1 codex review P2-4 cleanup;
+ *	  obsolete Sprint A/B planning blocks removed 2026-05-07):
+ *	    - Sprint A skeleton (shmem state + bounded-polling readiness +
+ *	      main loop liveness tick + shutdown protocol + start proxy
+ *	      to postmaster.c) shipped per spec-1.11 v0.2.
+ *	    - Sprint B surfaces (interval GUC + dedicated SQLSTATE + inject
+ *	      points + wait event + dump view) progressively shipped
+ *	      through subsequent spec-1.X main commits and the cluster_*
+ *	      framework families (inject / wait_events / gviews).
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group

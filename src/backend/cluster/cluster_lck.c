@@ -7,22 +7,15 @@
  *	  See cluster_lck.h for the architectural overview, HC1-HC6 hard
  *	  constraints, and Q1-Q3 implementation details.
  *
- *	  Sprint A scope summary (this file):
- *	    - shmem state (ClusterLckSharedState + LWTRANCHE_CLUSTER_LCK)
- *	    - bounded-polling readiness sync (cluster_lck_wait_for_ready)
- *	    - LckMain main loop = local liveness tick (HC6)
- *	    - shutdown protocol (cluster_lck_request_shutdown +
- *	      shutdown_requested poll in main loop)
- *	    - cluster_lck_start as thin proxy to
- *	      cluster_postmaster_start_lck (lives in postmaster.c, Q2)
- *
- *	  NOT in Sprint A (deferred to Sprint B):
- *	    - cluster.lck_main_loop_interval GUC (Sprint A uses 1000ms hardcoded)
- *	    - 53R0A LCK_SPAWN_FAILED / 53R0B LCK_NOT_READY SQLSTATE
- *	      (Sprint A uses ERRCODE_INTERNAL_ERROR + diagnostic errmsg)
- *	    - 6 cluster-lck-* inject points
- *	    - WAIT_EVENT_CLUSTER_BGPROC_LCK_MAIN_LOOP wait event
- *	    - dump_lck view 6 keys
+ *	  Ship status (Hardening v1.0.1 codex review P2-4 cleanup;
+ *	  obsolete Sprint A/B planning blocks removed 2026-05-07):
+ *	    - Sprint A skeleton (shmem state + bounded-polling readiness +
+ *	      main loop liveness tick + shutdown protocol + start proxy
+ *	      to postmaster.c) shipped per spec-1.12 v0.2.
+ *	    - Sprint B surfaces (interval GUC + dedicated SQLSTATE + inject
+ *	      points + wait event + dump view) progressively shipped
+ *	      through subsequent spec-1.X main commits and the cluster_*
+ *	      framework families (inject / wait_events / gviews).
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group

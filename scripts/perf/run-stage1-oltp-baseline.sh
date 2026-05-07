@@ -60,7 +60,7 @@ PORT_PGRAC="${PORT_PGRAC:-55433}"
 SHARED_BUFFERS="${SHARED_BUFFERS:-4GB}"
 
 VANILLA_BINDIR="${VANILLA_BINDIR:-}"
-PGRAC_BINDIR="${PGRAC_BINDIR:-/Users/yingjiewang/linkdb-install/bin}"
+PGRAC_BINDIR="${PGRAC_BINDIR:-}"
 
 
 usage() {
@@ -377,4 +377,4 @@ echo "  summary:    $SUMMARY_CSV"
 echo "  regression: $REGRESSION_TXT"
 echo
 echo "Per spec-1.23 Q3 REVISED: > 5% deltas require RCA + disposition"
-echo "recorded in pgrac:docs/perf-baseline.md §3.5 before shipping."
+echo "recorded in pgrac:docs/perf-baseline.md §9.5 before shipping."

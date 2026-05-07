@@ -92,8 +92,10 @@
  *	                  so backend and initdb produce byte-identical pages).
  *	               4. PageIsUndoSegmentHeader inline helper.
  *	Why:           Stage 1.22 ships the dedicated undo tablespace
- *	               (pg_undo OID 1665) + atomic batch on-disk format
- *	               change.  block 0 of every seg_<id>.dat is laid out
+ *	               (pg_undo OID 9100; UNDOTABLESPACE_OID per
+ *	               Hardening v1.0.2 OID conflict resolution) + atomic
+ *	               batch on-disk format change.  block 0 of every
+ *	               seg_<id>.dat is laid out
  *	               as UndoSegmentHeaderData (cluster_undo_segment.h);
  *	               PD_UNDO_SEG_HEADER lets tooling and visibility paths
  *	               distinguish three page kinds (vanilla index / ITL

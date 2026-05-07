@@ -2,7 +2,9 @@
 #-------------------------------------------------------------------------
 #
 # pgrac-acceptance -- DBA self-verification smoke check for pgrac
-#                     stage 0 deliverables on a running cluster.
+#                     Stage 1+/2.1 deliverables on a running cluster.
+#                     Sync'd to 030_acceptance.pl thresholds (Hardening
+#                     v1.0.1 D-H8 / codex review P1-2).
 #
 # Runs ~10 read-only psql queries against an already-started pgrac
 # instance and prints a coloured PASS/FAIL table.  Intended for DBA
@@ -213,7 +215,7 @@ POSTGRES_BIN=$(command -v postgres || true)
 # ---- header -----------------------------------------------------------
 
 echo "=================================================="
-echo " pgrac stage 0 acceptance smoke check"
+echo " pgrac Stage 1+/2.1 acceptance smoke check"
 echo "=================================================="
 
 # ---- check 1: postgres binary present and executable ------------------
@@ -250,38 +252,39 @@ check_sql_min "pg_cluster_nodes returns >= 1 row" \
     "SELECT count(*) FROM pg_cluster_nodes" \
     1
 
-# ---- check 5: pg_stat_cluster_wait_events returns 51 rows -------------
-# stage 0 base 46 + spec-1.1 cluster_shared_fs 5 = 51 (no further events
-# added in stage 1.2-1.6).  spec-stage1-codex-fixes Deliverable 9.
-check_sql "pg_stat_cluster_wait_events returns 51 rows" \
+# ---- check 5: pg_stat_cluster_wait_events returns 60 rows -------------
+# Stage 1+/2.1 current count.  030_acceptance.pl is the SSOT for this
+# threshold; keep this script in sync (Hardening v1.0.1 D-H8 / codex
+# review P1-2 -- sync from Stage 0 = 51 to current).
+check_sql "pg_stat_cluster_wait_events returns 60 rows" \
     "SELECT count(*) FROM pg_stat_cluster_wait_events" \
-    "^51$"
+    "^60$"
 
 # ---- check 6: pg_stat_cluster_nodes returns >= 1 row ------------------
 check_sql_min "pg_stat_cluster_nodes returns >= 1 row" \
     "SELECT count(*) FROM pg_stat_cluster_nodes" \
     1
 
-# ---- check 7: pg_stat_cluster_injections has 28 registered points ----
-# stage 0 base 14 + spec-0.27 +6 + spec-1.2 +3 + spec-1.3 +4 + spec-1.7 +4
-# = 28.  030_acceptance.pl §M1 / 017_debug.pl §8 lock this same value;
-# spec-1.7 §11.3 inject baseline checklist keeps them in sync.
-check_sql "pg_stat_cluster_injections has 28 registered injection points" \
+# ---- check 7: pg_stat_cluster_injections has 83 registered points ----
+# Stage 1+/2.1 current count.  030_acceptance.pl is the SSOT for this
+# threshold; keep this script in sync (Hardening v1.0.1 D-H8 / codex
+# review P1-2 -- sync from Stage 0 = 28 to current).
+check_sql "pg_stat_cluster_injections has 83 registered injection points" \
     "SELECT count(*) FROM pg_stat_cluster_injections" \
-    "^28$"
+    "^83$"
 
 # ---- check 8: cluster.inject.armed_count counter visible -------------
 check_sql_min "pg_stat_cluster_counters has cluster.inject.armed_count" \
     "SELECT count(*) FROM pg_stat_cluster_counters WHERE name = 'cluster.inject.armed_count'" \
     1
 
-# ---- check 9: pg_cluster_state returns 11 categories -----------------
-# stage 0 base 7 + shared_fs (1.1) + block_format (1.4) + buffer_format
-# (1.6) + pcm (1.7) = 11.  030_acceptance.pl §O2 locks the exact
-# category set; spec-1.7 §11.4 keeps numeric count in sync.
-check_sql "pg_cluster_state returns 11 categories" \
+# ---- check 9: pg_cluster_state returns 16 categories -----------------
+# Stage 1+/2.1 current count.  030_acceptance.pl §O2 is the SSOT for
+# the exact category set; keep this script in sync (Hardening v1.0.1
+# D-H8 / codex review P1-2 -- sync from Stage 0 = 11 to current).
+check_sql "pg_cluster_state returns 16 categories" \
     "SELECT count(DISTINCT category) FROM pg_cluster_state" \
-    "^11$"
+    "^16$"
 
 # ---- check 10: cluster_phase is 'init' (postmaster booted ok) --------
 check_sql "phase.cluster_phase = 'init'" \

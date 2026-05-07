@@ -223,8 +223,11 @@ $node->stop('immediate', fail_ok => 1);
 #
 #   L6  post-crash phase recovers to running (cluster_phase = 'running'
 #       after restart_after_crash recovery completes)
-#   L7  pg_cluster_state.diag 6 keys are kept in sync with the live
-#       Cluster Stats pid in pg_stat_activity (no stale incarnation data)
+#   L7  pg_cluster_state.cluster_stats 7 keys are kept in sync with
+#       the live Cluster Stats pid in pg_stat_activity (no stale
+#       incarnation data); Hardening v1.0.1 codex review P2-4 fix
+#       (was wrongly labelled 'diag 6 keys' carried over from copy of
+#       063_diag_skeleton.pl).
 #   L8  cluster_stats_main_loop_iters grows over time (proof the live Cluster Stats main
 #       loop is actually ticking, not just present in pg_stat_activity)
 #   L9  53R10 STATS_SPAWN_FAILED FATAL is reachable end-to-end via the
@@ -281,7 +284,9 @@ $node_lx->start;
 
 
 # ----------
-# L7: pg_cluster_state.diag 6 keys agree with live pg_stat_activity.
+# L7: pg_cluster_state.cluster_stats 7 keys agree with live
+#     pg_stat_activity (Hardening v1.0.1 codex review P2-4: corrected
+#     label from 'diag 6 keys' carried over from 063_diag_skeleton.pl).
 # ----------
 my $live_pid = $node_lx->safe_psql('postgres',
 	q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'cluster stats' LIMIT 1});

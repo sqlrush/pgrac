@@ -14,9 +14,10 @@
  *	      request_shutdown / status / shmem_register/init / ClusterStatsMain
  *	      resolve at link time.
  *
- *	  Behavior tests (postmaster spawns DIAG, phase 1 sync wait ready,
- *	  clean shutdown, kill -9 crash recovery) live in TAP
- *	  t/062_lck_skeleton.pl.
+ *	  Behavior tests (postmaster spawns Cluster Stats, phase 1 sync
+ *	  wait ready, clean shutdown, kill -9 crash recovery) live in TAP
+ *	  t/064_cluster_stats_skeleton.pl (Hardening v1.0.1 codex review
+ *	  P2-4 fix: was wrongly pointing at 062_lck_skeleton.pl).
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
@@ -30,7 +31,9 @@
  *
  * NOTES
  *	  This is a pgrac-original file.
- *	  Spec: spec-1.14-lck-skeleton.md (Sprint A scope (mirrors spec-1.13 DIAG); mirrors spec-1.11 LMON).
+ *	  Spec: spec-1.14-cluster-stats-skeleton.md (Hardening v1.0.1
+ *	        codex review P2-4 fix: was wrongly named
+ *	        spec-1.14-lck-skeleton.md).
  *
  *-------------------------------------------------------------------------
  */

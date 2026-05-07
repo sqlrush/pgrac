@@ -7,26 +7,35 @@
 #    layout, that the catalog row + user-visible tablespace helpers
 #    work end-to-end, and that ALTER TABLESPACE pg_undo is rejected.
 #
-#    Test matrix (L1-L15; L1-L10 are core behaviour; L11-L15 are the
-#    user-visible tablespace surface tests added in v0.2 P1-C 联动):
+#    Test matrix (current L1-L19 after Hardening rounds v1.0.3-v1.0.5;
+#    L13 and L16 dropped, L17-L19 added per Hardening notes inline):
 #
-#      L1   initdb creates pg_undo/ directory + pg_undo/instance_0/ subdir
+#      L1   initdb creates pg_undo/ + pg_undo/instance_0/ subdirs
 #      L2   pg_undo/instance_0/seg_0.dat exists with size 64 MB
 #      L3   pg_tablespace catalog has UNDOTABLESPACE_OID = 9100 row
-#      L4   block 0 of seg_0.dat has PD_UNDO_SEG_HEADER bit (pd_flags
-#           bit 4 == 1)
-#      L5   block 0 segment_id field == 0 (offset 32, uint32 LE)
-#      L6   second-instance allocation rejected with FEATURE_NOT_SUPPORTED
-#           (Stage 1.22 single-node restriction; spec §3.3)
-#      L7   path resolve correctness across instance / segment_id values
+#      L4   block 0 of seg_0.dat has PD_UNDO_SEG_HEADER bit set
+#      L5   block 0 segment_id field == 0 (offset per current layout
+#           in cluster_undo_segment.h)
+#      L6   cross-instance allocation -- deferred to feature-117 (no
+#           SQL UDF in Stage 1.22; C-level Assert in cluster_undo_alloc.c
+#           is the active enforcement; see inline note)
+#      L7   path resolve correctness via filesystem layout
 #      L8   cluster.undo_segments_per_instance = 16 GUC default
 #      L9   crash recovery preserves segment header (kill -9 + restart)
-#      L10  pg_resetwal does not delete pg_undo tree (data integrity)
+#      L10  pg_resetwal does not delete pg_undo tree
 #      L11  psql \db output includes pg_undo, location column non-empty
-#      L12  pg_dumpall does not emit CREATE TABLESPACE pg_undo SQL
-#      L13  pg_basebackup includes pg_undo/ directory in tar layout
-#      L14  ALTER TABLESPACE pg_undo OWNER TO foo rejected
-#      L15  SELECT pg_tablespace_location(9100) returns 'pg_undo'
+#      L12  pg_dumpall does NOT emit CREATE TABLESPACE pg_undo SQL
+#      L13  REMOVED in Hardening v1.0.5 (pg_basebackup setup > spec scope)
+#      L14  ALTER TABLESPACE pg_undo TABLESPACE_OPTIONS rejected
+#      L15  pg_tablespace_location(9100) returns '' (PG convention for
+#           system-internal tablespaces; Hardening v1.0.3 P2-B)
+#      L16  REMOVED in Hardening v1.0.4 P1-3
+#      L17  DROP TABLESPACE pg_undo rejected (Hardening v1.0.3 P2-A)
+#      L18  ALTER TABLESPACE pg_undo OWNER TO ... rejected (v1.0.3 P2-A)
+#      L19  pg_tablespace_size('pg_undo') walks pg_undo/ directly
+#           (Hardening v1.0.3 P2-B)
+#
+#    Header rewritten 2026-05-07 per Hardening v1.0.1 codex review P2-3.
 #
 #
 # Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
@@ -112,13 +121,19 @@ is($segment_id, 0, 'L5 block 0 segment_id == 0 (seed segment)');
 
 
 # ----------
-# L6: cross-instance allocation rejected.  Stage 1.22 doesn't expose a
-# SQL UDF for cluster_undo_segment_allocate (deferred to feature-117);
-# verify the path-resolve behavior via DataDir directly.  This is a
-# smoke check that the rejection logic compiles + links; the behavior
-# is enforced at C level in cluster_undo_alloc.c.
+# L6: cross-instance allocation rejection -- DEFERRED to feature-117.
+# Stage 1.22 does not expose a SQL UDF for cluster_undo_segment_allocate;
+# the rejection logic exists at C level (Assert in cluster_undo_alloc.c)
+# but cannot be exercised from a TAP test without the SQL surface.
+#
+# Hardening v1.0.1 / codex review P2-3: removed the stand-in
+# `ok(1, ...)` fake assertion that previously inflated the test count
+# without actually verifying behaviour.  The C-level enforcement is
+# covered by cluster_unit; the SQL/TAP coverage will land with the
+# UDF in feature-117.
 # ----------
-ok(1, 'L6 cross-instance allocation rejected (verified via cluster_unit + C-level Assert)');
+note('L6 cross-instance allocation rejection -- deferred to feature-117 '
+	. '(C-level Assert covered by cluster_unit; no SQL UDF in Stage 1.22)');
 
 
 # ----------

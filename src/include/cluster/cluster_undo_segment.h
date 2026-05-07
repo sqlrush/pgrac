@@ -71,7 +71,8 @@
  *	  tx activity yet", NOT "active" -- zero-init undo segment headers
  *	  (memset) and freshly allocated arrays land at status==0.
  *
- *	  owner_instance (offset 33, 1 byte) holds (cluster_node_id + 1)
+ *	  owner_instance (offset 41, 1 byte; per current C struct layout
+ *	  with 8-byte SCN alignment shift) holds (cluster_node_id + 1)
  *	  in [1, 128] when the segment is bound to an instance.  Value 0 is
  *	  the "unallocated" sentinel.  Mapping is implemented in spec-1.22
  *	  with explicit range validation; see Spec spec-1.21 §3.4.

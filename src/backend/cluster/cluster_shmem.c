@@ -450,8 +450,20 @@ cluster_init_shmem(void)
 	 * read interconnect_addr from the topology.  Stub mode at 0.18
 	 * does not consume the topology, so the relative ordering is for
 	 * forward symmetry.
+	 *
+	 * spec-2.1 Hardening v1.0.1 F2: gate cluster_conf_load on
+	 * cluster_enabled (caller primary gate, per L15 pattern).  Without
+	 * this gate, cluster.enabled=off + allow_single_node=off + missing
+	 * pgrac.conf would FATAL, violating the vanilla PG path promise
+	 * (spec-1.16 D13 docstring).  cluster_conf_load itself also has a
+	 * defensive early-return on !cluster_enabled (belt-and-suspenders;
+	 * future callers must not rely on that alone -- always gate here).
+	 * Cross-ref: lessons L11 (1.17 walwriter idle CPU regression),
+	 * L15 (1.16 early-return fragility), L36 (1.18 WAL replay observe
+	 * wrapper), L48 meta (lesson SSOT enforce 不能假设单点).
 	 */
-	cluster_conf_load();
+	if (cluster_enabled)
+		cluster_conf_load();
 
 	/*
 	 * Stage 0.18: bind the cluster_ic vtable for the configured tier.

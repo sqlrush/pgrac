@@ -194,6 +194,47 @@ is( $node->safe_psql('postgres',
 	'60',
 	'pg_stat_cluster_wait_events still 58 rows after 0.27');
 
+# ----------
+# Test 11 (Hardening v1.0.1 / codex review P2-2): SQL SRF rejects
+# unknown fault types.  Pre-Hardening these silently mapped to
+# CLUSTER_FAULT_NONE and returned true, masking misconfigured tests.
+# ----------
+my ($u_stdout, $u_stderr);
+$node->psql(
+	'postgres',
+	q{SELECT cluster_inject_fault('cluster-init-pre-shmem', 'definitely-not-a-real-type', 0)},
+	stdout => \$u_stdout,
+	stderr => \$u_stderr);
+like($u_stderr, qr/unknown cluster injection fault type/i,
+	'unknown fault type rejected by SQL SRF (P2-2 enforce)');
+
+
+# ----------
+# Test 12: SQL SRF rejects negative sleep param.
+# ----------
+my ($n_stdout, $n_stderr);
+$node->psql(
+	'postgres',
+	q{SELECT cluster_inject_fault('cluster-init-pre-shmem', 'sleep', -1)},
+	stdout => \$n_stdout,
+	stderr => \$n_stderr);
+like($n_stderr, qr/sleep param must be >= 0/i,
+	'negative sleep param rejected by SQL SRF (P2-2 enforce)');
+
+
+# ----------
+# Test 13: SQL SRF rejects sleep param > 1 hour cap.
+# ----------
+my ($l_stdout, $l_stderr);
+$node->psql(
+	'postgres',
+	q{SELECT cluster_inject_fault('cluster-init-pre-shmem', 'sleep', 3600000001)},
+	stdout => \$l_stdout,
+	stderr => \$l_stderr);
+like($l_stderr, qr/exceeds 1-hour cap/i,
+	'sleep param above 1-hour cap rejected by SQL SRF (P2-2 enforce)');
+
+
 $node->stop;
 
 done_testing();

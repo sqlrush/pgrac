@@ -109,6 +109,17 @@ like($log, qr/single-node compatibility mode/,
 # L4: conf present + node_id valid -> no WARNING
 #     Restore allow=on, write a valid pgrac.conf, set cluster.node_id=0,
 #     restart, verify clean startup with no node_id WARNING.
+#
+#     Hardening v1.0.1 D-H3 / lessons L59 fix:
+#     PostgreSQL::Test::Cluster::adjust_conf only modifies existing
+#     lines; it does NOT add a missing setting (Cluster.pm:641-669).
+#     cluster.node_id was never written to postgresql.conf before this
+#     point, so the original adjust_conf() call here was a no-op and
+#     the postmaster started with the GUC's boot default (-1) instead
+#     of the intended 0, triggering an unexpected WARNING that broke
+#     the L4 'unlike' assertion (subtest #9 of 20).
+#     Fix: use append_to_file for the FIRST write of the GUC.  L5
+#     below still uses adjust_conf because by then the line exists.
 # ============================================================
 $node->adjust_conf('postgresql.conf', 'cluster.allow_single_node', 'on');
 PostgreSQL::Test::Utils::append_to_file($conf_path, <<'EOC');
@@ -118,7 +129,9 @@ name = pgrac-l4
 [node.0]
 interconnect_addr = 10.0.0.0:6432
 EOC
-$node->adjust_conf('postgresql.conf', 'cluster.node_id', '0');
+PostgreSQL::Test::Utils::append_to_file(
+	$node->data_dir . '/postgresql.conf',
+	"cluster.node_id = 0\n");
 unlink $node->logfile;
 $node->start;
 $log = PostgreSQL::Test::Utils::slurp_file($node->logfile);
@@ -234,6 +247,64 @@ ok($start_failed,
 $log = PostgreSQL::Test::Utils::slurp_file($node->logfile);
 like($log, qr/duplicate \[node\.0\] section/,
 	'L9 startup FATAL log mentions duplicate section (boundary invariant enforced)');
+
+
+# ============================================================
+# L10 ★ Hardening v1.0.1 D-H4: zero-[node.N] conf + allow=off -> FATAL
+#      Closes B5 boundary gap (spec-2.1 §3.5 v1.0.1 amendment).
+#      Pre-Hardening: post_validate's node_count==0 branch
+#      unconditionally fell back to single-node, bypassing
+#      cluster.allow_single_node = off strict mode.  After F1 fix
+#      the same input must FATAL when allow=off.
+# ============================================================
+$node->stop;
+unlink $conf_path;
+PostgreSQL::Test::Utils::append_to_file($conf_path, <<'EOC');
+[cluster]
+name = pgrac-l10
+EOC
+# Note: deliberately NO [node.N] sections.  This is the B5 input.
+$node->adjust_conf('postgresql.conf', 'cluster.allow_single_node', 'off');
+unlink $node->logfile;
+$start_failed = !$node->start(fail_ok => 1);
+ok($start_failed,
+	'L10 ★ zero-[node.N] conf + allow=off -> postmaster refuses to start '
+	. '(B5 boundary: zero-node conf must not silently bypass strict mode)');
+
+$log = PostgreSQL::Test::Utils::slurp_file($node->logfile);
+like($log, qr/declares zero \[node\.N\] sections/,
+	'L10 startup FATAL log mentions zero [node.N] (F1 errmsg verified)');
+
+
+# ============================================================
+# L11 ★ Hardening v1.0.1 D-H5: cluster.enabled=off + allow=off + missing
+#      pgrac.conf -> startup OK (vanilla PG path).  Verifies F2 fix --
+#      cluster_conf_load is gated on cluster_enabled at the caller
+#      (cluster_init_shmem) AND defended at the callee (cluster_conf_load
+#      top early-return).  Pre-Hardening this combination FATAL'd
+#      because cluster_conf_load ran unconditionally and ENOENT +
+#      allow=off triggers FATAL per spec-2.1 D3.  Cross-ref lessons
+#      L11 / L15 / L36 (cluster_enabled gate forgot family).
+# ============================================================
+$node->stop;
+unlink $conf_path;    # B1-style: pgrac.conf absent
+$node->adjust_conf('postgresql.conf', 'cluster.allow_single_node', 'off');
+# cluster.enabled = off must be set; this is the F2 vanilla-path gate.
+PostgreSQL::Test::Utils::append_to_file(
+	$node->data_dir . '/postgresql.conf',
+	"cluster.enabled = off\n");
+unlink $node->logfile;
+$node->start;    # MUST succeed (vanilla PG path; no FATAL)
+
+$log = PostgreSQL::Test::Utils::slurp_file($node->logfile);
+unlike($log, qr/pgrac\.conf is required/,
+	'L11 cluster.enabled=off bypass -- no pgrac.conf-required FATAL');
+unlike($log, qr/declares zero \[node\.N\]/,
+	'L11 cluster.enabled=off bypass -- no zero-node FATAL');
+
+# Restore for any future tests (none currently follow L11, but keep
+# the postgresql.conf in a sane state).
+$node->stop;
 
 
 done_testing();

@@ -680,7 +680,44 @@ cluster_inject_fault(PG_FUNCTION_ARGS)
 		PG_RETURN_BOOL(false);
 	}
 
+	/*
+	 * Hardening v1.0.1 / codex review P2-2: validate fault type strictly.
+	 * parse_fault_type returns CLUSTER_FAULT_NONE for both the explicit
+	 * string "none" AND any unknown input -- pre-Hardening this silently
+	 * mapped typos / invalid types to a no-op arm and returned true,
+	 * masking misconfigured tests.  Treat any non-"none" string that
+	 * resolves to NONE as an ERROR.
+	 */
 	new_type = parse_fault_type(type_str);
+	if (new_type == CLUSTER_FAULT_NONE && pg_strcasecmp(type_str, "none") != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("unknown cluster injection fault type: \"%s\"", type_str),
+				 errhint("Valid fault types: none, error, warning, sleep, "
+						 "crash, skip.")));
+
+	/*
+	 * Hardening v1.0.1 / codex review P2-2: validate sleep param range.
+	 * pg_usleep takes long; reject negative values and cap at 1 hour
+	 * (3600 * 1e6 us).  Negative reaches pg_usleep as a giant unsigned
+	 * (param is stored as uint64); excessive sleeps would silently
+	 * stall test backends.
+	 */
+	if (new_type == CLUSTER_FAULT_SLEEP)
+	{
+		if (param < 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("cluster injection sleep param must be >= 0 "
+							"microseconds (got %lld)", (long long) param)));
+		if (param > INT64CONST(3600) * 1000 * 1000)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("cluster injection sleep param exceeds 1-hour "
+							"cap of 3600000000 us (got %lld)",
+							(long long) param)));
+	}
+
 	cluster_injection_arm_internal(p, new_type, param);
 
 	PG_RETURN_BOOL(true);

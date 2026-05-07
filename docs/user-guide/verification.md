@@ -110,10 +110,13 @@ SELECT * FROM cluster_get_pgstat_counters();
 SELECT * FROM cluster_dump_state();
 
 -- Mock-tier interconnect helpers (only useful when
--- cluster.interconnect_tier = 'mock'):
+-- cluster.interconnect_tier = 'mock').  Function names updated per
+-- Hardening v1.0.1 codex review P2-5; pre-Hardening doc referenced
+-- the older drain/clear shorthand which no longer matches the
+-- current SQL surface.
 SELECT * FROM cluster_ic_mock_inject(1, '\x01\x02');
-SELECT * FROM cluster_ic_mock_drain();
-SELECT * FROM cluster_ic_mock_clear();
+SELECT * FROM cluster_ic_mock_drain_outbound();
+SELECT * FROM cluster_ic_mock_clear_all();
 SELECT * FROM cluster_ic_mock_recv_test();
 ```
 
@@ -133,10 +136,14 @@ SELECT name, fault_type, hits
  WHERE name = 'cluster-init-pre-shmem';
 ```
 
-The current build registers 14 injection points covering every
-cluster init / shutdown / shmem / GUC / conf / pgstat / views / debug
-entry.  Dump the full list with `SELECT name FROM
-pg_stat_cluster_injections ORDER BY name;`.
+The current build registers 83 injection points covering every
+cluster init / shutdown / shmem / GUC / conf / pgstat / views / debug /
+SCN / undo / WAL / IC / phase / lmon / lck / diag / stats /
+acceptance / pgrac.conf-multi-node-activation entry.  Dump the full
+list with `SELECT name FROM pg_stat_cluster_injections ORDER BY name;`.
+The exact count is locked by `030_acceptance.pl` and the installed
+`pgrac-acceptance` smoke check (Hardening v1.0.1 D-H8 / codex review
+P2-5; sync'd from Stage 0 = 14 to current).
 
 ### 3.5 SQLSTATE error codes
 
@@ -227,12 +234,45 @@ Cleanup: `rm -rf /tmp/linkdb-disable /tmp/pgrac-disable`.
 
 ## 6. Performance baseline (manual / local)
 
+There are now two performance baseline runners; pick the one that
+matches what you want to measure.
+
+### 6.1 Stage 1 OLTP TPC-B baseline (`run-stage1-oltp-baseline.sh`)
+
+This is the spec-1.23 frozen runner.  Compares vanilla PG 16.13
+against pgrac (cluster-on + cluster-off) across a 27-combo matrix
+(scale 10/50/100 × clients 1/8/16) using the standard pgbench TPC-B
+workload.  Used to gate Stage 1 → Stage 2 entry.
+
 ```bash
-# From the source tree.  Builds and runs pgbench against both an
-# --enable-cluster install ($HOME/linkdb-install by default) and a
-# --disable-cluster install ($HOME/linkdb-disable-install), then
-# prints a summary line per mode.  Default 30-second runs with
-# scale=10, 4 clients, 2 jobs.
+# Required env vars (no defaults; codex review P1-3 fix removed the
+# personal-path default that previously broke on fresh installs):
+export VANILLA_BINDIR=/path/to/vanilla-pg-16.13/bin
+export PGRAC_BINDIR=/tmp/pgrac-no-cassert-install/bin   # or your install
+
+# Full baseline (27 combos × 720s ≈ 5.4 hour 挂机):
+bash scripts/perf/run-stage1-oltp-baseline.sh --full
+
+# Quick sanity (9 combos × 720s ≈ 1.8 hour):
+bash scripts/perf/run-stage1-oltp-baseline.sh --quick
+```
+
+Outputs land under `scripts/perf/results/stage1-oltp-<TS>/`
+(`summary.csv` raw TPS / `regression.txt` analysis with `>5% RCA`
+markers / `provenance.txt` host + bin versions / 27 `*.log` per-combo
+pgbench output).  The 2026-05-06 reference run + Disposition decision
+is preserved at `pgrac/docs/perf-baseline.md §9.4/§9.5`.
+
+### 6.2 Quick smoke baseline (`run-baseline.sh`)
+
+Original Stage 0 quick smoke runner.  Builds and runs pgbench
+against both an --enable-cluster install ($HOME/linkdb-install by
+default) and a --disable-cluster install ($HOME/linkdb-disable-install),
+then prints a summary line per mode.  Default 30-second runs with
+scale=10, 4 clients, 2 jobs.  Useful for fast sanity checks but does
+NOT gate Stage 1 acceptance (use 6.1 for that).
+
+```bash
 scripts/perf/run-baseline.sh
 
 # Just one mode, smaller workload (handy for smoke tests):

@@ -71,7 +71,9 @@
  *	               src/common/cluster_undo_segment_init.c) so backend
  *	               and initdb (frontend) produce byte-identical pages.
  *	Why:           Stage 1.22 ships dedicated undo tablespace (pg_undo
- *	               OID 1665) + atomic batch on-disk format change.
+ *	               OID 9100; UNDOTABLESPACE_OID per Hardening v1.0.2
+ *	               OID conflict resolution) + atomic batch on-disk
+ *	               format change.
  *	               PageInitUndoSegmentHeader is the SSOT entry point
  *	               for segment-block-0 initialization on the backend
  *	               buffer-manager path (cluster_undo_alloc.c calls it
