@@ -91,6 +91,12 @@ int cluster_interconnect_tier = 0; /* CLUSTER_IC_TIER_STUB */
  */
 bool cluster_enabled = true;
 
+/* spec-2.2 §3.9 D2 -- cluster_ic.c references MyBackendType for
+ * the tier1 caller scope guard.  Stub here; unit test never invokes
+ * the runtime path that reads it. */
+#include "miscadmin.h"
+BackendType MyBackendType = B_INVALID;
+
 /*
  * spec-2.2 D3 (post-codex review) -- test-local ClusterICOps_Tier1 stub.
  *

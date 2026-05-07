@@ -266,6 +266,34 @@ bool
 cluster_ic_send_bytes(int32 target_node_id, const void *buf, size_t len)
 {
 	Assert(ClusterICOps_Active != NULL);
+
+	/*
+	 * spec-2.2 §3.9 hard scope guard (post-codex review L60 audit) --
+	 * caller-level enforcement.
+	 *
+	 * In tier1 mode this byte-level send entry point is reserved for
+	 * the LMON aux process (heartbeat path).  Any backend / autovacuum
+	 * / etc calling cluster_ic_send_bytes directly is rejected with
+	 * ERR_FEATURE_NOT_SUPPORTED.  General-purpose backend IC routing
+	 * lands in spec-2.3+ / spec-2.4+ (see cluster_ic.h
+	 * PGRAC_IC_MSG_HEARTBEAT comment).  msg_type-level enforcement is
+	 * at cluster_msg_send (the higher-level entry that has msg_type
+	 * as a parameter) -- this byte-level guard cannot reliably parse
+	 * msg_type from buf because cluster_msg_send issues TWO sends per
+	 * message (header bytes + payload bytes); either one's `buf` may
+	 * arrive here.  Belt-and-suspenders: both layers enforce.
+	 */
+	if (ClusterICOps_Active == &ClusterICOps_Tier1
+		&& MyBackendType != B_LMON)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cluster_ic_send_bytes via tier1 is restricted to "
+						"LMON aux process in spec-2.2"),
+				 errhint("General-purpose backend IC routing lands in "
+						 "spec-2.3+ (envelope ABI ratify) and spec-2.4+ "
+						 "(framing + epoch enforce).  For non-LMON IC "
+						 "tests use cluster.interconnect_tier=mock.")));
+
 	return ClusterICOps_Active->send_bytes(target_node_id, buf, len);
 }
 
@@ -566,6 +594,28 @@ bool
 cluster_msg_send(int32 target_node_id, uint16 msg_type, const void *payload, uint32 payload_len)
 {
 	ClusterMsgHeader hdr;
+
+	/*
+	 * spec-2.2 §3.9 hard scope guard -- msg_type-level enforcement.
+	 *
+	 * In tier1 mode only HEARTBEAT msg_type is accepted; everything
+	 * else returns ERR_FEATURE_NOT_SUPPORTED until spec-2.4 lifts the
+	 * guard.  Pair with the caller-level check in cluster_ic_send_bytes
+	 * (belt-and-suspenders); together these enforce the §3.9
+	 * invariant "tier1 carries ONLY LMON heartbeat traffic".
+	 *
+	 * stub / mock / disabled modes pass through unchanged so existing
+	 * tests / debug paths still work.
+	 */
+	if (ClusterICOps_Active == &ClusterICOps_Tier1
+		&& msg_type != PGRAC_IC_MSG_HEARTBEAT)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cluster_msg_send via tier1 only supports "
+						"HEARTBEAT msg_type in spec-2.2 (got msg_type=%u)",
+						msg_type),
+				 errhint("Other msg_types land in spec-2.4 (framing + epoch "
+						 "enforce) and follow-up specs (general IC router).")));
 
 	memset(&hdr, 0, sizeof(hdr));
 	hdr.magic = PGRAC_IC_MAGIC;

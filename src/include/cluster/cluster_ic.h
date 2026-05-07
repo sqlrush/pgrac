@@ -86,6 +86,25 @@ typedef enum ClusterICTier {
  */
 #define PGRAC_IC_PROTOCOL_VERSION_V1 ((uint8)1)
 
+
+/*
+ * spec-2.2 §3.9 -- Tier1 scope guard message types.
+ *
+ * Tier1 transport in spec-2.2 carries ONLY LMON heartbeat traffic.
+ * General-purpose backend cluster_msg_send is REJECTED in tier1 mode
+ * (caller / msg_type check).  General message routing for cross-node
+ * RPC / GES / Cache Fusion / sinval lands later:
+ *   spec-2.3 envelope ABI ratify + transport-agnostic API
+ *   spec-2.4 framing + epoch enforce
+ *   spec-2.X general IC router (TBD)
+ *
+ * Future spec-2.4+ will add more msg_type values (REQUEST / RESPONSE /
+ * INVAL / etc) and lift the scope guard.  Until then, any non-HEARTBEAT
+ * msg_type sent through cluster_msg_send in tier1 mode is rejected
+ * with ERR_FEATURE_NOT_SUPPORTED.
+ */
+#define PGRAC_IC_MSG_HEARTBEAT  ((uint16)1)
+
 /*
  * Exact size of ClusterMsgHeader, anchored as a constant for unit
  * tests and for cross-checking against StaticAssertDecl in cluster_ic.c.
