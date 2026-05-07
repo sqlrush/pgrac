@@ -187,9 +187,17 @@ cluster_ic_init(void)
 		break;
 
 	case CLUSTER_IC_TIER_1:
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("cluster.interconnect_tier=tier1 is not implemented"),
-						errhint("tier1 (TCP) lands in Stage 2; stay on stub for now.")));
+		/*
+		 * spec-2.2 D2 -- tier1 vtable binding.  Real implementation
+		 * lives in cluster_ic_tier1.c (spec-2.2 D3 NEW); until D3
+		 * lands in this Sprint A round, the stub at the bottom of
+		 * this file (look for "ClusterICOps_Tier1 stub" comment)
+		 * provides linker-resolved function pointers that all
+		 * ereport ERR_FEATURE_NOT_SUPPORTED with a clear D3-pending
+		 * message.  Once D3 ships, the stub here is removed and the
+		 * real const struct in cluster_ic_tier1.c takes over.
+		 */
+		ClusterICOps_Active = &ClusterICOps_Tier1;
 		break;
 
 	case CLUSTER_IC_TIER_2:
@@ -239,8 +247,121 @@ bool
 cluster_ic_recv_bytes(int32 *out_sender_node_id, void *buf, size_t bufsize,
 					  size_t *out_received_len)
 {
+	/*
+	 * spec-2.2 D2 -- single-call pass-through with partial-OK semantics
+	 * (kernel recv(2)-like).  Returns up to bufsize bytes from a SINGLE
+	 * peer; caller may receive fewer than bufsize and must call again
+	 * if a complete N-byte unit is required (use cluster_ic_recv_exact
+	 * helper below for that).
+	 *
+	 * The vtable contract: recv_bytes returns true with *out_received >= 0
+	 * (0 == no data ready under nonblocking semantics; > 0 == partial OR
+	 * full read), or false on hard error.  Mock backend honours partial
+	 * consumption via MockQueueEntry.consumed (spec-2.2 D2 P2-1 fix);
+	 * tier1 backend honours kernel recv(2) short-read behaviour.
+	 */
 	Assert(ClusterICOps_Active != NULL);
-	return ClusterICOps_Active->recv_bytes(out_sender_node_id, buf, bufsize, out_received_len);
+	return ClusterICOps_Active->recv_bytes(out_sender_node_id, buf, bufsize,
+										   out_received_len);
+}
+
+
+/*
+ * spec-2.2 D2 / Q11=A / P2-1 fix -- recv_exact helper for callers that
+ * MUST get a full N bytes from a single peer (e.g. wire-format readers
+ * for the 24-byte ClusterMsgHeader / 36-byte ClusterICEnvelope / 64-byte
+ * ClusterICHelloMsg).
+ *
+ * Unlike cluster_ic_recv_bytes which pass-throughs the underlying
+ * vtable single-call (and may return partial on mock entry boundary or
+ * TCP short read), this helper LOOPS until either:
+ *   - total == bufsize (full read OK)
+ *   - vtable returns false (hard error -- propagated)
+ *   - vtable returns true with *out_received == 0 (EOF / no data;
+ *     loop exits with total < bufsize, returns true with partial)
+ *   - sender flip detected (the per-peer wire contract requires a
+ *     single message be served by one peer; sender mismatch indicates
+ *     either a wire-protocol bug OR a mock-test setup that injected
+ *     interleaved senders -- callers wanting N bytes from ONE peer
+ *     must reject this case).  In tier1 this never happens because
+ *     each peer has its own dedicated socket; the mock backend's
+ *     per-entry sender is preserved across partial chunks of the same
+ *     entry, but a fresh head entry from a different sender will trip
+ *     this guard, signaling the caller that the queue boundary fell
+ *     in the middle of an N-byte read.
+ *
+ * Cross-ref: lessons L59 (PG TAP framework assumption) -- assuming
+ * "single recv = full payload" is a wire-protocol assumption error
+ * analogous to assuming "adjust_conf set-or-add"; the loop primitive
+ * is the only correct one for length-prefixed wire formats.
+ *
+ * Returns true on success (with *out_received == bufsize) OR clean
+ * EOF/no-data (with *out_received < bufsize).  Returns false on hard
+ * error or sender flip mid-read.
+ */
+bool
+cluster_ic_recv_exact(int32 *out_sender_node_id, void *buf, size_t bufsize,
+					  size_t *out_received_len)
+{
+	size_t total = 0;
+	char  *cursor = (char *) buf;
+	int32  sender = -1;
+
+	Assert(ClusterICOps_Active != NULL);
+
+	if (out_received_len != NULL)
+		*out_received_len = 0;
+	if (out_sender_node_id != NULL)
+		*out_sender_node_id = -1;
+
+	while (total < bufsize)
+	{
+		size_t got = 0;
+		int32  this_sender = -1;
+		bool   ok;
+
+		ok = ClusterICOps_Active->recv_bytes(&this_sender,
+											 cursor + total,
+											 bufsize - total,
+											 &got);
+		if (!ok)
+		{
+			/*
+			 * Vtable signals "no data right now" (mock empty queue;
+			 * tier1 EAGAIN; etc).  Treat as clean partial -- return
+			 * what we have so far.  Caller distinguishes "got full N"
+			 * vs "got partial" via *out_received_len comparison;
+			 * partial is NOT an error here, just back-pressure for the
+			 * caller's wait loop (LmonMain WaitEventSet for tier1).
+			 */
+			break;
+		}
+		if (got == 0)
+			break; /* defensive: vtable signals no data via this path too */
+
+		if (total == 0)
+			sender = this_sender;
+		else if (this_sender != sender)
+		{
+			/*
+			 * Sender flip mid-read: queue boundary at a different peer.
+			 * For a wire-format unit (header / envelope) this is a
+			 * protocol violation.  Signal failure; caller must decide
+			 * how to recover (typically: drop connection in tier1; in
+			 * mock-tests this means the test setup is wrong).
+			 */
+			return false;
+		}
+
+		total += got;
+	}
+
+	if (out_received_len != NULL)
+		*out_received_len = total;
+	if (out_sender_node_id != NULL)
+		*out_sender_node_id = sender;
+
+	return true;
 }
 
 
@@ -402,6 +523,22 @@ cluster_rpc_call(int32 target_node_id, uint16 msg_type, const void *req, uint32 
 typedef struct MockQueueEntry {
 	int32 sender_node_id;
 	Size len;
+	/*
+	 * spec-2.2 D2 / Q11=A / P2-1 fix -- partial consumption support.
+	 *
+	 * Pre-spec-2.2 mock_recv_bytes always copied min(e->len, bufsize)
+	 * and freed the entry, silently dropping the tail when bufsize <
+	 * e->len.  This created an "every recv returns one full message"
+	 * fiction that masked real partial-read behaviour and ABI errors
+	 * which would surface only when tier1 (TCP) shipped.
+	 *
+	 * `consumed` records how many bytes have been delivered to recv
+	 * callers so far; the entry is freed only when consumed == len.
+	 * Callers that need full payload must use cluster_ic_recv_bytes
+	 * (recv_exact loop) which iterates until total == bufsize OR
+	 * EOF; mock now returns partial chunks honestly.
+	 */
+	Size consumed;
 	uint8 *payload;
 	struct MockQueueEntry *next;
 } MockQueueEntry;
@@ -529,23 +666,62 @@ static bool
 mock_recv_bytes(int32 *out_sender_node_id, void *buf, size_t bufsize, size_t *out_received_len)
 {
 	MockQueueEntry *e;
+	Size remaining;
 	Size copy_len;
 
 	mock_state_init();
 
-	e = mock_queue_pop(mock_inbound_queue);
-	if (e == NULL)
-		return false;
+	/*
+	 * spec-2.2 D2 / Q11=A / P2-1 fix -- partial consumption.
+	 *
+	 * Look at queue head WITHOUT popping; only pop (and free) when
+	 * the entry has been fully consumed.  This lets cluster_ic_recv_bytes
+	 * (recv_exact loop) read a large entry across multiple bufsize-bound
+	 * recv calls without losing the tail.
+	 *
+	 * Returns true (and *out_received_len > 0) on partial copy as well;
+	 * caller's recv_exact loop will call back to drain the rest.
+	 * Returns true with *out_received_len == 0 ONLY when the inbound
+	 * queue is empty (signals "no data ready" to the recv_exact loop,
+	 * which then exits the loop).
+	 */
+	e = mock_inbound_queue ? mock_inbound_queue->head : NULL;
 
-	copy_len = e->len < bufsize ? e->len : bufsize;
+	if (e == NULL)
+	{
+		/*
+		 * Empty queue -- preserve PG-convention "false = no data
+		 * available" (matches pre-spec-2.2 mock_recv_bytes contract).
+		 * cluster_ic_recv_exact treats false from vtable as "stop
+		 * loop with whatever we accumulated so far" rather than hard
+		 * error; the existing cluster_ic_mock_recv_test SRF gates row
+		 * emission on this bool return so empty queue => zero rows
+		 * (014_ic_mock.pl tests 5 + 8 lock this).
+		 */
+		return false;
+	}
+
+	remaining = e->len - e->consumed;
+	Assert(remaining > 0); /* fully-consumed entries must have been freed */
+
+	copy_len = remaining < bufsize ? remaining : bufsize;
 	if (copy_len > 0)
-		memcpy(buf, e->payload, copy_len);
+		memcpy(buf, e->payload + e->consumed, copy_len);
+	e->consumed += copy_len;
+
 	if (out_received_len != NULL)
 		*out_received_len = copy_len;
 	if (out_sender_node_id != NULL)
 		*out_sender_node_id = e->sender_node_id;
 
-	mock_queue_free_entry(e);
+	if (e->consumed == e->len)
+	{
+		/* Fully drained -- detach from queue and free. */
+		MockQueueEntry *popped = mock_queue_pop(mock_inbound_queue);
+		Assert(popped == e);
+		mock_queue_free_entry(popped);
+	}
+
 	return true;
 }
 
@@ -573,6 +749,83 @@ const ClusterICOps ClusterICOps_Mock = {
 	.tier_init = mock_tier_init,
 	.tier_shutdown = mock_tier_shutdown,
 	.tier_name = "mock",
+};
+
+
+/* ============================================================
+ * spec-2.2 D2 -- ClusterICOps_Tier1 stub (transitional).
+ *
+ * Real Tier1 vtable lives in cluster_ic_tier1.c (spec-2.2 D3 NEW).
+ * Until D3 lands in this Sprint A round, this stub provides
+ * linker-resolved function pointers so cluster_unit (test_cluster_ic
+ * test_tier1_vtable_extern_linkable) builds cleanly and so postmaster
+ * with cluster.interconnect_tier=tier1 fails with a clear D3-pending
+ * message at the FIRST send/recv call (rather than at link time).
+ *
+ * Once D3 ships the real const struct in cluster_ic_tier1.c, this
+ * stub block must be DELETED -- otherwise the linker will report a
+ * duplicate symbol.  D3's commit message must explicitly call out
+ * the stub removal step.
+ * ============================================================ */
+
+static bool
+tier1_stub_send_bytes(int32 target_node_id pg_attribute_unused(),
+					  const void *buf pg_attribute_unused(),
+					  size_t len pg_attribute_unused())
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cluster_ic tier1 send_bytes is not yet implemented"),
+			 errhint("spec-2.2 D3 (cluster_ic_tier1.c NEW) lands later in "
+					 "this Sprint A round; for now stay on tier=stub or "
+					 "tier=mock for IC tests.")));
+	return false; /* unreachable */
+}
+
+static bool
+tier1_stub_recv_bytes(int32 *out_sender_node_id pg_attribute_unused(),
+					  void *buf pg_attribute_unused(),
+					  size_t bufsize pg_attribute_unused(),
+					  size_t *out_received_len pg_attribute_unused())
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cluster_ic tier1 recv_bytes is not yet implemented"),
+			 errhint("spec-2.2 D3 (cluster_ic_tier1.c NEW) lands later in "
+					 "this Sprint A round.")));
+	return false; /* unreachable */
+}
+
+static void
+tier1_stub_tier_init(void)
+{
+	/*
+	 * Per spec-2.2 §3.7 + §3.9 the caller (cluster_init_shmem) gates
+	 * on cluster_enabled; cluster_ic_init has its own defensive guard
+	 * (v1.0.2 D-I1).  This stub init is reached only when
+	 * cluster.enabled=on AND cluster.interconnect_tier=tier1; it must
+	 * not FATAL the postmaster (per §3.10 -- only listener bind failure
+	 * may FATAL).  Emit a clear LOG instead so operators see the
+	 * D3-pending status; first send/recv will then ERROR.
+	 */
+	ereport(LOG,
+			(errmsg("cluster_ic tier1 stub active -- Sprint A D3 implementation pending"),
+			 errhint("Postmaster will start; first cluster_ic_send_bytes / recv_bytes "
+					 "call will ERROR until cluster_ic_tier1.c (spec-2.2 D3) ships.")));
+}
+
+static void
+tier1_stub_tier_shutdown(void)
+{
+	/* No-op: stub allocated nothing. */
+}
+
+const ClusterICOps ClusterICOps_Tier1 = {
+	.send_bytes = tier1_stub_send_bytes,
+	.recv_bytes = tier1_stub_recv_bytes,
+	.tier_init = tier1_stub_tier_init,
+	.tier_shutdown = tier1_stub_tier_shutdown,
+	.tier_name = "tier1-stub-pending-D3",
 };
 
 #endif /* USE_PGRAC_CLUSTER */

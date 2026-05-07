@@ -333,10 +333,102 @@ UT_TEST(test_stub_vtable_recv_nonnull)
 }
 
 
+/* ============================================================
+ * spec-2.2 D11 -- Tier1 / HELLO / peer state / mesh role tests.
+ *
+ * These tests lock interface ABI and pure-helper semantics that
+ * spec-2.2 §2.4 / §2.2 / §3.5 frozen.  Behaviour-level tests for
+ * tier1 socket I/O live in cluster_tap (075 single-instance + 076
+ * 2-node A-lite); cluster_unit only locks the link-time ABI surface.
+ *
+ * Cross-ref: lessons L45 (on-disk struct byte layout per-field C
+ * alignment) -- HELLO is wire-format, treat same as on-disk.
+ * ============================================================ */
+
+UT_TEST(test_hello_struct_size_64)
+{
+	/*
+	 * spec-2.2 §2.4 frozen ABI: HELLO must be exactly 64 bytes.  Any
+	 * change here breaks cross-version peer handshake; future bumps
+	 * MUST go via PGRAC_IC_HELLO_VERSION_V2 (new struct, dispatch on
+	 * hello_version field), never resize V1.
+	 */
+	UT_ASSERT_EQ(sizeof(ClusterICHelloMsg), 64);
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_BYTES, 64);
+}
+
+UT_TEST(test_hello_field_offsets)
+{
+	/*
+	 * Per-field offset locks (per L45 byte-layout discipline).  Any
+	 * compiler that adds padding here breaks the wire ABI.
+	 */
+	UT_ASSERT_EQ(offsetof(ClusterICHelloMsg, magic), 0);
+	UT_ASSERT_EQ(offsetof(ClusterICHelloMsg, hello_version), 4);
+	UT_ASSERT_EQ(offsetof(ClusterICHelloMsg, envelope_version), 6);
+	UT_ASSERT_EQ(offsetof(ClusterICHelloMsg, source_node_id), 8);
+	UT_ASSERT_EQ(offsetof(ClusterICHelloMsg, cluster_name), 12);
+	UT_ASSERT_EQ(offsetof(ClusterICHelloMsg, _pad), 36);
+}
+
+UT_TEST(test_hello_magic_constant)
+{
+	/* "HLLO" little-endian = 0x4F4C4C48. */
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_MAGIC, (uint32)0x4F4C4C48);
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_VERSION_V1, (uint16)1);
+	UT_ASSERT_EQ(PGRAC_IC_ENVELOPE_VERSION_V1, (uint16)1);
+}
+
+UT_TEST(test_peer_state_enum_size)
+{
+	/*
+	 * Stored as int32 in shmem (per spec-2.2 §2.6
+	 * ClusterICPeerStateShmem.state).  Standard C makes enum width
+	 * implementation-defined; lock to int via sizeof check.
+	 */
+	UT_ASSERT_EQ(sizeof(ClusterICPeerState), sizeof(int));
+	UT_ASSERT_EQ((int)CLUSTER_IC_PEER_DOWN,       0);
+	UT_ASSERT_EQ((int)CLUSTER_IC_PEER_CONNECTING, 1);
+	UT_ASSERT_EQ((int)CLUSTER_IC_PEER_CONNECTED,  2);
+	UT_ASSERT_EQ((int)CLUSTER_IC_PEER_REJECTED,   3);
+}
+
+UT_TEST(test_mesh_role_low_id_active)
+{
+	/* spec-2.2 §2.2 + §3.5: lower node_id = ACTIVE (initiates connect). */
+	UT_ASSERT_EQ(cluster_ic_mesh_role_for_pair(0, 1), CLUSTER_IC_MESH_ACTIVE);
+	UT_ASSERT_EQ(cluster_ic_mesh_role_for_pair(0, 127), CLUSTER_IC_MESH_ACTIVE);
+	UT_ASSERT_EQ(cluster_ic_mesh_role_for_pair(5, 6), CLUSTER_IC_MESH_ACTIVE);
+}
+
+UT_TEST(test_mesh_role_high_id_passive)
+{
+	/* Higher node_id = PASSIVE (accepts on listener). */
+	UT_ASSERT_EQ(cluster_ic_mesh_role_for_pair(1, 0), CLUSTER_IC_MESH_PASSIVE);
+	UT_ASSERT_EQ(cluster_ic_mesh_role_for_pair(127, 0), CLUSTER_IC_MESH_PASSIVE);
+	UT_ASSERT_EQ(cluster_ic_mesh_role_for_pair(6, 5), CLUSTER_IC_MESH_PASSIVE);
+}
+
+UT_TEST(test_tier1_vtable_extern_linkable)
+{
+	/*
+	 * Tier1 vtable is implemented in cluster_ic_tier1.c (spec-2.2 D3
+	 * NEW).  This test only verifies the extern symbol resolves at
+	 * link time so test_cluster_ic builds cleanly once D3 lands.
+	 * Behaviour-level coverage is at TAP layer (075/076).
+	 */
+	UT_ASSERT_NOT_NULL((void *)ClusterICOps_Tier1.send_bytes);
+	UT_ASSERT_NOT_NULL((void *)ClusterICOps_Tier1.recv_bytes);
+	UT_ASSERT_NOT_NULL((void *)ClusterICOps_Tier1.tier_init);
+	UT_ASSERT_NOT_NULL((void *)ClusterICOps_Tier1.tier_shutdown);
+	UT_ASSERT_NOT_NULL((void *)ClusterICOps_Tier1.tier_name);
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(20);
 	UT_RUN(test_msg_header_size_24);
 	UT_RUN(test_msg_header_magic_constant);
 	UT_RUN(test_msg_header_protocol_v1);
@@ -350,6 +442,14 @@ main(void)
 	UT_RUN(test_stub_vtable_tier_name);
 	UT_RUN(test_stub_vtable_send_nonnull);
 	UT_RUN(test_stub_vtable_recv_nonnull);
+	/* spec-2.2 D11 -- new tests */
+	UT_RUN(test_hello_struct_size_64);
+	UT_RUN(test_hello_field_offsets);
+	UT_RUN(test_hello_magic_constant);
+	UT_RUN(test_peer_state_enum_size);
+	UT_RUN(test_mesh_role_low_id_active);
+	UT_RUN(test_mesh_role_high_id_passive);
+	UT_RUN(test_tier1_vtable_extern_linkable);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

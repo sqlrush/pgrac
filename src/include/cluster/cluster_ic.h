@@ -150,7 +150,110 @@ typedef struct ClusterICOps {
 
 extern const ClusterICOps ClusterICOps_Stub;
 extern const ClusterICOps ClusterICOps_Mock;
+
+/*
+ * spec-2.2 D1 -- Tier1 (TCP) vtable extern.  Implementation in
+ * cluster_ic_tier1.c (NEW; spec-2.2 D3).  ClusterICOps_Active is
+ * bound to this when cluster.interconnect_tier = tier1 AND
+ * cluster_enabled = true (per v1.0.2 D-I1 double gate;
+ * spec-2.2 §3.7).
+ */
+extern const ClusterICOps ClusterICOps_Tier1;
+
 extern const ClusterICOps *ClusterICOps_Active;
+
+
+/*
+ * spec-2.2 D1 -- HELLO handshake message exchanged on every newly
+ * established TCP connection (active connect side sends first; passive
+ * accept side verifies + responds with HELLO_ACK using the same
+ * struct shape).  Fixed 64-byte ABI for cross-version safety
+ * (StaticAssertDecl in cluster_ic_tier1.c).
+ *
+ * Per spec-2.2 §2.4, HELLO carries:
+ *   magic + hello_version (allows future bump without breaking pre-v1
+ *   peers; current peers must reject mismatches per §3.10),
+ *   envelope_version (separate from hello_version because envelope is
+ *   spec-2.0 §4 frozen v1; HELLO can evolve independently),
+ *   source_node_id (sender's cluster.node_id; verified against
+ *   pgrac.conf [node.N] declaration),
+ *   cluster_name (verified against ClusterConfShmem->cluster_name; the
+ *   primary defense against accidentally connecting to wrong cluster).
+ *
+ * Failure to verify any field => connection-level rejection per §3.10
+ * (close socket + peer_state = rejected; NEVER FATAL the postmaster).
+ */
+#define PGRAC_IC_HELLO_MAGIC       ((uint32)0x4F4C4C48)  /* "HLLO" LE */
+#define PGRAC_IC_HELLO_VERSION_V1  ((uint16)1)
+#define PGRAC_IC_ENVELOPE_VERSION_V1 ((uint16)1)         /* spec-2.0 §4 frozen */
+#define PGRAC_IC_HELLO_BYTES       64
+#define PGRAC_IC_CLUSTER_NAME_MAX  24
+
+typedef struct ClusterICHelloMsg {
+	uint32 magic;                                /* PGRAC_IC_HELLO_MAGIC */
+	uint16 hello_version;                        /* PGRAC_IC_HELLO_VERSION_V1 */
+	uint16 envelope_version;                     /* PGRAC_IC_ENVELOPE_VERSION_V1 */
+	int32  source_node_id;                       /* sender's cluster.node_id */
+	char   cluster_name[PGRAC_IC_CLUSTER_NAME_MAX]; /* NUL-terminated; truncated */
+	uint8  _pad[28];                             /* pad to 64B fixed ABI */
+} ClusterICHelloMsg;
+
+
+/*
+ * spec-2.2 D1 -- per-peer state machine state.  Ordering is
+ * intentional: numerically ascending = increasing "operational"
+ * level.  State transitions are detailed in spec-2.2 §3.4 (readiness)
+ * and §3.10 (HELLO failure).
+ *
+ *   DOWN       -- never connected yet, OR last connect/recv failed,
+ *                 OR heartbeat 3x interval missed; reconnect scheduled
+ *                 with exponential backoff (1s/2s/4s/8s/max 30s).
+ *   CONNECTING -- TCP connect(2) issued (active edge) OR accept(2)
+ *                 returned a fresh fd (passive edge); HELLO not yet
+ *                 verified.
+ *   CONNECTED  -- HELLO verified both ways; heartbeat exchange active.
+ *   REJECTED   -- HELLO verification failed (wrong magic / version /
+ *                 cluster_name / node_id); peer permanently rejected
+ *                 until next reconnect attempt re-tries HELLO.
+ *
+ * Per spec-2.2 §3.6 boundary invariant, these are TRANSPORT-LEVEL
+ * states ONLY.  They do NOT map to cluster membership / quorum /
+ * fence state (those land in spec-2.5 / 2.6 / 2.28).
+ */
+typedef enum ClusterICPeerState {
+	CLUSTER_IC_PEER_DOWN       = 0,
+	CLUSTER_IC_PEER_CONNECTING = 1,
+	CLUSTER_IC_PEER_CONNECTED  = 2,
+	CLUSTER_IC_PEER_REJECTED   = 3
+} ClusterICPeerState;
+
+
+/*
+ * spec-2.2 D1 -- mesh role decision for the N×(N-1)/2 mesh.
+ *
+ * Per §2.2 + §3.5 invariant: in any unordered pair {self, peer}, the
+ * lower node_id takes the ACTIVE role (initiates connect(2)) and the
+ * higher node_id takes the PASSIVE role (accepts on listener).  Race
+ * resolution (both sides momentarily ACTIVE due to concurrent connect
+ * attempts) closes the connection on the side where mesh_role_for_pair
+ * returned PASSIVE for the dup.
+ *
+ * Pure stateless function -- declared as static inline so unit tests
+ * (test_cluster_ic.c) link without pulling in the full Tier1 vtable.
+ */
+typedef enum ClusterICMeshRole {
+	CLUSTER_IC_MESH_ACTIVE  = 0,
+	CLUSTER_IC_MESH_PASSIVE = 1
+} ClusterICMeshRole;
+
+static inline ClusterICMeshRole
+cluster_ic_mesh_role_for_pair(int32 self_node_id, int32 peer_node_id)
+{
+	/* self == peer is a programming error (mesh has no self loop). */
+	Assert(self_node_id != peer_node_id);
+	return (self_node_id < peer_node_id) ? CLUSTER_IC_MESH_ACTIVE
+										 : CLUSTER_IC_MESH_PASSIVE;
+}
 
 
 /*
@@ -191,6 +294,17 @@ extern void cluster_ic_shutdown(void);
  * ----------
  */
 extern bool cluster_ic_send_bytes(int32 target_node_id, const void *buf, size_t len);
+
+/*
+ * spec-2.2 D2 / Q11=A / P2-1 -- recv_exact helper.  Loops over
+ * cluster_ic_recv_bytes until exactly bufsize bytes are received from
+ * a single peer (or EOF / hard error / sender flip).  Use this for
+ * length-prefixed wire-format reads (header / envelope / HELLO).
+ * See body comment in cluster_ic.c for full semantics.
+ */
+extern bool cluster_ic_recv_exact(int32 *out_sender_node_id, void *buf,
+								  size_t bufsize, size_t *out_received_len);
+
 extern bool cluster_ic_recv_bytes(int32 *out_sender_node_id, void *buf, size_t bufsize,
 								  size_t *out_received_len);
 
