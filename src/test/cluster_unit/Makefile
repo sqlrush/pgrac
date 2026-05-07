@@ -28,7 +28,8 @@ include $(top_builddir)/src/Makefile.global
 TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_wait_events test_cluster_errcodes test_cluster_guc \
         test_cluster_shmem test_cluster_signal test_cluster_views \
-        test_cluster_gviews test_cluster_ic test_cluster_conf \
+        test_cluster_gviews test_cluster_ic test_cluster_ic_envelope \
+        test_cluster_conf \
         test_cluster_ic_mock test_cluster_inject test_cluster_pgstat \
         test_cluster_debug test_cluster_shared_fs test_cluster_smgr \
         test_cluster_scn test_cluster_block_format test_cluster_itl_slot \
@@ -58,6 +59,7 @@ CLUSTER_SHMEM_O = $(top_builddir)/src/backend/cluster/cluster_shmem.o
 CLUSTER_SIGNAL_O = $(top_builddir)/src/backend/cluster/cluster_signal.o
 CLUSTER_VIEWS_O = $(top_builddir)/src/backend/cluster/cluster_views.o
 CLUSTER_IC_O = $(top_builddir)/src/backend/cluster/cluster_ic.o
+CLUSTER_IC_ENVELOPE_O = $(top_builddir)/src/backend/cluster/cluster_ic_envelope.o
 CLUSTER_CONF_O = $(top_builddir)/src/backend/cluster/cluster_conf.o
 CLUSTER_INJECT_O = $(top_builddir)/src/backend/cluster/cluster_inject.o
 CLUSTER_PGSTAT_O = $(top_builddir)/src/backend/cluster/cluster_pgstat.o
@@ -131,6 +133,16 @@ test_cluster_ic: test_cluster_ic.c unit_test.h $(CLUSTER_VERSION_O) \
 		$(CLUSTER_IC_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_IC_O) -o $@
+
+# spec-2.3 D8: test_cluster_ic_envelope links cluster_ic_envelope.o
+# standalone + the libpgport_srv archive (for the real pg_crc32c
+# dispatch that cluster_ic_envelope.c uses).  ExceptionalCondition
+# is stubbed in the test source (Assert-on-fail abort).
+test_cluster_ic_envelope: test_cluster_ic_envelope.c unit_test.h \
+		$(CLUSTER_VERSION_O) $(CLUSTER_IC_ENVELOPE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_IC_ENVELOPE_O) \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 # test_cluster_conf links cluster_conf.o standalone.  cluster_conf.c
 # references ereport / ShmemInitStruct / AllocateFile / FreeFile /
