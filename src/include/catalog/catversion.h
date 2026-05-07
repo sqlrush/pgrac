@@ -176,6 +176,14 @@
 /*  pg_control catversion check) and vice versa; users must dump+ */
 /*  restore (pg_upgrade 1.21->1.22 lands in feature-117). */
 /*  Spec: spec-1.22-undo-tablespace-bootstrap.md APPROVED v0.2. */
-#define CATALOG_VERSION_NO	202605190
+/*
+ * spec-2.2 D10 (2026-05-07) -- bump 202605190 -> 202605200 for the
+ * pg_cluster_ic_peers SRF + view (D9) addition to pg_proc.dat +
+ * system_views.sql.  Per L46 (atomic batch + catversion bump):
+ * downstream TAP / regress hardcoded catversion regex MUST be
+ * lower-bound (>= 202605200) not equal-bound; see grep audit in
+ * spec-2.2 §6 DoD.
+ */
+#define CATALOG_VERSION_NO	202605200
 
 #endif

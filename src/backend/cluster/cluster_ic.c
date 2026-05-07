@@ -65,6 +65,16 @@ PG_FUNCTION_INFO_V1(cluster_ic_mock_drain_outbound);
 PG_FUNCTION_INFO_V1(cluster_ic_mock_clear_all);
 PG_FUNCTION_INFO_V1(cluster_ic_mock_recv_test);
 
+/*
+ * spec-2.2 D9 -- cluster_get_ic_peers SRF.  Body lives in
+ * cluster_ic_tier1.c (which is only compiled in --enable-cluster).
+ * The macro must be emitted here (always-linked file) so pg_proc.dat
+ * resolves the function symbol in both build modes.  The disable-mode
+ * stub body is at the bottom of this file (under #ifndef
+ * USE_PGRAC_CLUSTER); enable-mode body is in cluster_ic_tier1.c.
+ */
+PG_FUNCTION_INFO_V1(cluster_get_ic_peers);
+
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -1127,3 +1137,23 @@ cluster_ic_mock_recv_test(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 #endif
 }
+
+
+/*
+ * spec-2.2 D9 -- cluster_get_ic_peers SRF.
+ *
+ * Enable-cluster body lives in cluster_ic_tier1.c (which is only
+ * compiled in --enable-cluster).  This file (always-linked) provides
+ * the disable-cluster stub so pg_proc.dat reference resolves at link
+ * time.
+ */
+#ifndef USE_PGRAC_CLUSTER
+Datum
+cluster_get_ic_peers(PG_FUNCTION_ARGS pg_attribute_unused())
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cluster_get_ic_peers requires --enable-cluster")));
+	PG_RETURN_NULL();
+}
+#endif

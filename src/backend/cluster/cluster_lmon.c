@@ -529,13 +529,12 @@ LmonMain(void)
 		&& (ClusterICTier) cluster_interconnect_tier == CLUSTER_IC_TIER_1)
 	{
 		/*
-		 * spec-2.2 §2.1 Tier1 main loop.
-		 *
-		 * Heartbeat interval -- hard-coded to 1000ms in Step 7.
-		 * Step 8 D7 wires the cluster.interconnect_heartbeat_interval_ms
-		 * PGC_POSTMASTER GUC; spec-2.2 §3.3 default value is 1000.
+		 * spec-2.2 §2.1 Tier1 main loop.  Heartbeat cadence driven by
+		 * cluster.interconnect_heartbeat_interval_ms (D7 GUC; default
+		 * 1000, range 100..60000) -- read once at loop entry per
+		 * PGC_POSTMASTER semantics (no SIGHUP refresh).
 		 */
-		const long  HEARTBEAT_INTERVAL_MS = 1000;
+		const long  HEARTBEAT_INTERVAL_MS = cluster_interconnect_heartbeat_interval_ms;
 		WaitEventSet *wes = NULL;
 		int           listener_fd = cluster_ic_tier1_get_listener_fd();
 		TimestampTz   next_heartbeat_at;
@@ -549,7 +548,15 @@ LmonMain(void)
 		AddWaitEventToSet(wes, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch, NULL);
 		if (listener_fd >= 0)
 			AddWaitEventToSet(wes, WL_SOCKET_READABLE, listener_fd, NULL,
-							  /* user_data tag for dispatch */ (void *) (uintptr_t) -1);
+							  /* user_data tag = -1 means "listener" */
+							  (void *) (uintptr_t) -1);
+		/*
+		 * spec-2.2 D8 / 约束 1 -- the WaitEventSetWait below uses
+		 * WAIT_EVENT_CLUSTER_IC_HEARTBEAT_WAIT (timer-based wait until
+		 * next heartbeat tick) for the IDLE-with-timeout path.  Per
+		 * 约束 2 strict semantics, HEARTBEAT_WAIT is the timer wait
+		 * NOT a socket recv; recv waits use TCP_RECV.
+		 */
 
 		next_heartbeat_at = GetCurrentTimestamp() + HEARTBEAT_INTERVAL_MS * INT64CONST(1000);
 
@@ -585,7 +592,7 @@ LmonMain(void)
 
 			n_events = WaitEventSetWait(wes, wait_ms, ev,
 										lengthof(ev),
-										WAIT_EVENT_CLUSTER_BGPROC_LMON_MAIN_LOOP);
+										WAIT_EVENT_CLUSTER_IC_HEARTBEAT_WAIT);
 
 			for (i = 0; i < n_events; i++)
 			{

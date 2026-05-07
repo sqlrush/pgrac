@@ -90,6 +90,11 @@ int cluster_diag_main_loop_interval = 1000;
 /* spec-1.14 D8: cluster.cluster_stats_main_loop_interval (mirror). */
 int cluster_cluster_stats_main_loop_interval = 1000;
 
+/* spec-2.2 D7 -- Tier 1 TCP transport tuning (PGC_POSTMASTER per §3.3). */
+int cluster_interconnect_heartbeat_interval_ms = 1000;
+int cluster_interconnect_connect_timeout_ms    = 5000;
+int cluster_interconnect_recv_timeout_ms       = 30000;
+
 /*
  * cluster.undo_segments_per_instance (spec-1.22 D7).  Number of undo
  * segment files reserved per cluster instance.  Stage 1.22 declares
@@ -468,6 +473,49 @@ cluster_init_guc(void)
 					 "value in range is functionally equivalent at this stage."),
 		&cluster_diag_main_loop_interval, 1000, 100, 60000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
 		NULL);
+
+	/*
+	 * spec-2.2 D7 (2026-05-07) -- Tier 1 TCP transport tuning GUCs.
+	 * All PGC_POSTMASTER per spec-2.2 §3.3 (runtime change would
+	 * leave in-flight connect / recv state in inconsistent timeout
+	 * windows).
+	 */
+	DefineCustomIntVariable("cluster.interconnect_heartbeat_interval_ms",
+							gettext_noop("Tier1 IC heartbeat tick interval in milliseconds."),
+							gettext_noop("LMON sends a HEARTBEAT msg to every CONNECTED peer at "
+										 "this cadence (spec-2.2 §2.1).  Lower value -> earlier "
+										 "transport-down detection at cost of higher idle wakeup; "
+										 "higher value -> lower CPU overhead but slower peer state "
+										 "transition.  Per spec-2.2 §3.6 boundary invariant, "
+										 "missed heartbeats only mark peer_state DOWN (transport-"
+										 "level liveness); they do NOT trigger fence / quorum / "
+										 "membership change (those land in spec-2.5+ / 2.6+ / 2.28+)."),
+							&cluster_interconnect_heartbeat_interval_ms,
+							1000, 100, 60000, PGC_POSTMASTER, GUC_UNIT_MS,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("cluster.interconnect_connect_timeout_ms",
+							gettext_noop("Tier1 IC active-connect SO_ERROR poll timeout in ms."),
+							gettext_noop("Per-peer nonblocking connect(2) waits up to this many "
+										 "ms for SO_ERROR to settle before scheduling a reconnect "
+										 "(spec-2.2 §2.1 + §3.10 connection-level rejection).  "
+										 "Per spec-2.2 §3.3 PGC_POSTMASTER -- runtime change "
+										 "would leave half-finished connects in inconsistent "
+										 "timeout windows."),
+							&cluster_interconnect_connect_timeout_ms,
+							5000, 1000, 60000, PGC_POSTMASTER, GUC_UNIT_MS,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("cluster.interconnect_recv_timeout_ms",
+							gettext_noop("Tier1 IC per-peer recv read deadline in milliseconds."),
+							gettext_noop("Per-peer recv(2) read deadline (HELLO handshake + "
+										 "subsequent message reads).  Exceeding this without "
+										 "data triggers peer_state -> DOWN per spec-2.2 §3.10 "
+										 "(connection-level rejection; never FATAL).  Per spec-2.2 "
+										 "§3.3 PGC_POSTMASTER."),
+							&cluster_interconnect_recv_timeout_ms,
+							30000, 1000, 600000, PGC_POSTMASTER, GUC_UNIT_MS,
+							NULL, NULL, NULL);
 
 	DefineCustomIntVariable("cluster.cluster_stats_main_loop_interval",
 							gettext_noop("Cluster Stats main-loop tick interval in milliseconds."),

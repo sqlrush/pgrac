@@ -12241,6 +12241,22 @@
   proname => 'cluster_scn_current', provolatile => 'v', proparallel => 'r',
   prorettype => 'int8', proargtypes => '',
   prosrc => 'cluster_scn_current_sql' },
+# spec-2.2 D9 (2026-05-07) -- pg_cluster_ic_peers SRF (oid 8914).
+# Returns one row per peer declared in pgrac.conf with current Tier1
+# transport state + telemetry (spec-2.2 §2.6 frozen 19-column layout).
+# Per spec-2.2 §3.6 boundary invariant the state column reports
+# TRANSPORT-LEVEL liveness only (connecting / connected / down /
+# rejected); does NOT map to membership / quorum / fence (those land
+# in spec-2.5+ / 2.6+ / 2.28+).
+{ oid => '8914', descr => 'list cluster IC peer connection state + telemetry (spec-2.2)',
+  proname => 'cluster_get_ic_peers', prorows => '8',
+  proretset => 't', provolatile => 'v', proparallel => 'r',
+  prorettype => 'record', proargtypes => '',
+  proallargtypes => '{int4,text,text,timestamptz,timestamptz,timestamptz,timestamptz,timestamptz,int8,int8,int8,int8,int8,int8,int4,int4,int4,text,text}',
+  proargmodes => '{o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o}',
+  proargnames => '{node_id,state,interconnect_addr,last_connect_at,last_send_at,last_recv_at,last_heartbeat_sent_at,last_heartbeat_recv_at,heartbeat_send_count,heartbeat_recv_count,msg_send_count,msg_recv_count,bytes_send,bytes_recv,reconnect_count,connect_error_count,last_errno,last_error_code,last_error}',
+  prosrc => 'cluster_get_ic_peers' },
+
 { oid => '8913', descr => 'observe a remote SCN (single-node 1.15: stat-only; superuser)',
   proname => 'cluster_scn_observe', provolatile => 'v', proparallel => 'u',
   prorettype => 'void', proargtypes => 'int8',

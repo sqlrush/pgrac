@@ -327,12 +327,39 @@ typedef enum {
 	WAIT_EVENT_SINVAL_BROADCAST_RECEIVE,
 	WAIT_EVENT_SINVAL_INJECT_LOCAL_QUEUE,
 
-	/* Cluster: Interconnect (5 events) -- AD-007 */
+	/* Cluster: Interconnect (5 events + 6 spec-2.2 D8) -- AD-007 */
 	WAIT_EVENT_INTERCONNECT_RDMA_SEND = PG_WAIT_CLUSTER_INTERCONNECT,
 	WAIT_EVENT_INTERCONNECT_RDMA_RECV,
 	WAIT_EVENT_INTERCONNECT_TCP_FALLBACK,
 	WAIT_EVENT_INTERCONNECT_TIER_SWITCH,
 	WAIT_EVENT_INTERCONNECT_CONNECT_RETRY,
+	/*
+	 * spec-2.2 D8 (2026-05-07) -- Tier 1 TCP transport wait events.
+	 * Per 约束 2 strict semantics:
+	 *   ClusterICTcpAccept    : listener fd waiting for incoming connection
+	 *   ClusterICTcpConnect   : active edge nonblocking connect waiting for
+	 *                           SO_ERROR check via WL_SOCKET_WRITEABLE
+	 *   ClusterICTcpRecv      : per-peer socket waiting readable -- the
+	 *                           ONLY socket-recv wait event (HeartbeatWait
+	 *                           is timer-based, NOT recv)
+	 *   ClusterICTcpSend      : per-peer socket waiting writeable on
+	 *                           short / nonblocking write
+	 *   ClusterICHeartbeatWait: timer-based wait until next heartbeat tick
+	 *                           (NOT a socket recv -- distinct from TcpRecv)
+	 *   ClusterICReconnect    : reconnect backoff sleep after
+	 *                           connect failure / connection lost
+	 *                           (NOT a connect-in-progress wait)
+	 *
+	 * WAIT_EVENT_CLUSTER_BGPROC_LMON_MAIN_LOOP (spec-1.11) is RESERVED
+	 * for the LMON IDLE tick path -- per 约束 1 it MUST NOT be reused
+	 * for any of the 6 IC socket waits.
+	 */
+	WAIT_EVENT_CLUSTER_IC_TCP_ACCEPT,
+	WAIT_EVENT_CLUSTER_IC_TCP_CONNECT,
+	WAIT_EVENT_CLUSTER_IC_TCP_RECV,
+	WAIT_EVENT_CLUSTER_IC_TCP_SEND,
+	WAIT_EVENT_CLUSTER_IC_HEARTBEAT_WAIT,
+	WAIT_EVENT_CLUSTER_IC_RECONNECT,
 
 	/* Cluster: Undo (4 events) -- AD-010 */
 	WAIT_EVENT_UNDO_REMOTE_READ = PG_WAIT_CLUSTER_UNDO,

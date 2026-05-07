@@ -1461,6 +1461,39 @@ CREATE VIEW pg_stat_cluster_counters AS
 REVOKE ALL ON pg_stat_cluster_counters FROM PUBLIC;
 GRANT SELECT ON pg_stat_cluster_counters TO PUBLIC;
 
+-- PGRAC: pg_cluster_ic_peers (spec-2.2 D9; 2026-05-07).
+--   Lists every peer declared in pgrac.conf with current Tier1 (TCP)
+--   transport state + telemetry.  Per spec-2.2 §3.6 boundary
+--   invariant the `state` column is TRANSPORT-LEVEL only
+--   (connecting / connected / down / rejected); it does NOT map to
+--   cluster membership / quorum / fence (those live in spec-2.5+
+--   CSSD heartbeat + spec-2.6+ quorum disk + spec-2.28+ fence-lite).
+--   Backed by cluster_get_ic_peers (OID 8914).
+CREATE VIEW pg_cluster_ic_peers AS
+    SELECT node_id,
+           state,
+           interconnect_addr,
+           last_connect_at,
+           last_send_at,
+           last_recv_at,
+           last_heartbeat_sent_at,
+           last_heartbeat_recv_at,
+           heartbeat_send_count,
+           heartbeat_recv_count,
+           msg_send_count,
+           msg_recv_count,
+           bytes_send,
+           bytes_recv,
+           reconnect_count,
+           connect_error_count,
+           last_errno,
+           last_error_code,
+           last_error
+      FROM cluster_get_ic_peers();
+
+REVOKE ALL ON pg_cluster_ic_peers FROM PUBLIC;
+GRANT SELECT ON pg_cluster_ic_peers TO PUBLIC;
+
 -- PGRAC: pg_cluster_state (stage 0.29).
 --   One-stop diagnostic snapshot covering every cluster subsystem's
 --   runtime state expressed as (category, key, value) triples:

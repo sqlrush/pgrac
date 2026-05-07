@@ -58,9 +58,12 @@
 #include <unistd.h>
 #include <errno.h>
 
+#include "fmgr.h"
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
+#include "utils/builtins.h"
 #include "utils/elog.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
@@ -71,6 +74,13 @@
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_shmem.h"
+
+/*
+ * PG_FUNCTION_INFO_V1(cluster_get_ic_peers) lives in cluster_ic.c
+ * (always-linked file); cluster_ic_tier1.c provides the
+ * USE_PGRAC_CLUSTER body, cluster_ic.c provides the disable-cluster
+ * stub.
+ */
 
 
 #ifdef USE_PGRAC_CLUSTER
@@ -953,6 +963,91 @@ cluster_ic_tier1_get_peer_fd(int32 peer_id)
 	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
 		return -1;
 	return tier1_peer_fds[peer_id];
+}
+
+
+/* ============================================================
+ * spec-2.2 D9 -- pg_cluster_ic_peers SRF body.
+ *
+ * Returns one row per peer declared in pgrac.conf (skips slots with
+ * node_id == -1 = unconfigured).  19 columns per spec-2.2 §2.6
+ * frozen layout.  Per spec-2.2 §3.6 the `state` column reports
+ * TRANSPORT-LEVEL liveness only.
+ * ============================================================ */
+
+static const char *
+peer_state_to_string(int32 s)
+{
+	switch ((ClusterICPeerState) s)
+	{
+		case CLUSTER_IC_PEER_DOWN:       return "down";
+		case CLUSTER_IC_PEER_CONNECTING: return "connecting";
+		case CLUSTER_IC_PEER_CONNECTED:  return "connected";
+		case CLUSTER_IC_PEER_REJECTED:   return "rejected";
+	}
+	return "unknown";
+}
+
+Datum
+cluster_get_ic_peers(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo;
+	int            i;
+
+	InitMaterializedSRF(fcinfo, 0);
+	rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	if (Tier1Shmem == NULL)
+		PG_RETURN_VOID();
+
+	for (i = 0; i < CLUSTER_MAX_NODES; i++)
+	{
+		ClusterICPeerStateShmem *p = &Tier1Shmem->peers[i];
+		Datum   values[19];
+		bool    nulls[19];
+		int     col = 0;
+
+		if (cluster_conf_lookup_node(i) == NULL)
+			continue;       /* peer not declared in pgrac.conf */
+
+		memset(nulls, false, sizeof(nulls));
+
+		values[col++] = Int32GetDatum(i);
+		values[col++] = CStringGetTextDatum(peer_state_to_string(p->state));
+		values[col++] = CStringGetTextDatum(p->interconnect_addr[0]
+											? p->interconnect_addr : "");
+#define ADD_TS(field) \
+	do { \
+		if (p->field == 0) \
+			nulls[col] = true; \
+		else \
+			values[col] = TimestampTzGetDatum(p->field); \
+		col++; \
+	} while (0)
+		ADD_TS(last_connect_at);
+		ADD_TS(last_send_at);
+		ADD_TS(last_recv_at);
+		ADD_TS(last_heartbeat_sent_at);
+		ADD_TS(last_heartbeat_recv_at);
+#undef ADD_TS
+		values[col++] = Int64GetDatum((int64) pg_atomic_read_u64(&p->heartbeat_send_count));
+		values[col++] = Int64GetDatum((int64) pg_atomic_read_u64(&p->heartbeat_recv_count));
+		values[col++] = Int64GetDatum((int64) pg_atomic_read_u64(&p->msg_send_count));
+		values[col++] = Int64GetDatum((int64) pg_atomic_read_u64(&p->msg_recv_count));
+		values[col++] = Int64GetDatum((int64) pg_atomic_read_u64(&p->bytes_send));
+		values[col++] = Int64GetDatum((int64) pg_atomic_read_u64(&p->bytes_recv));
+		values[col++] = Int32GetDatum((int32) p->reconnect_count);
+		values[col++] = Int32GetDatum((int32) p->connect_error_count);
+		values[col++] = Int32GetDatum(p->last_errno);
+		values[col++] = CStringGetTextDatum(p->last_error_code[0]
+											? p->last_error_code : "");
+		values[col++] = CStringGetTextDatum(p->last_error[0] ? p->last_error : "");
+
+		Assert(col == 19);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+
+	return (Datum) 0;
 }
 
 #endif /* USE_PGRAC_CLUSTER */

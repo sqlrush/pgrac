@@ -1094,6 +1094,25 @@ pgstat_get_wait_cluster_interconnect(WaitEventCluster w)
 	case WAIT_EVENT_INTERCONNECT_CONNECT_RETRY:
 		event_name = "InterconnectConnectRetry";
 		break;
+	/* spec-2.2 D8 -- 6 Tier 1 TCP transport wait events (per 约束 2). */
+	case WAIT_EVENT_CLUSTER_IC_TCP_ACCEPT:
+		event_name = "ClusterICTcpAccept";
+		break;
+	case WAIT_EVENT_CLUSTER_IC_TCP_CONNECT:
+		event_name = "ClusterICTcpConnect";
+		break;
+	case WAIT_EVENT_CLUSTER_IC_TCP_RECV:
+		event_name = "ClusterICTcpRecv";
+		break;
+	case WAIT_EVENT_CLUSTER_IC_TCP_SEND:
+		event_name = "ClusterICTcpSend";
+		break;
+	case WAIT_EVENT_CLUSTER_IC_HEARTBEAT_WAIT:
+		event_name = "ClusterICHeartbeatWait";
+		break;
+	case WAIT_EVENT_CLUSTER_IC_RECONNECT:
+		event_name = "ClusterICReconnect";
+		break;
 	default:
 		break;
 	}
