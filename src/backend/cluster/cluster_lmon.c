@@ -872,10 +872,19 @@ LmonMain(void)
 									 (uint32)cs, &slots[cs].payload, sizeof(slots[cs].payload)))
 							fanout_rc = CLUSTER_IC_FANOUT_HARD_ERROR;
 						else {
-							send_rc = cluster_ic_send_bytes(cs, &env, sizeof(env));
-							if (send_rc == CLUSTER_IC_SEND_DONE)
-								send_rc = cluster_ic_send_bytes(cs, &slots[cs].payload,
-																sizeof(slots[cs].payload));
+							/* spec-2.5 hardening v1.0.1 F2 (L79 envelope-payload-
+							 * 单 buffer 拼接发送): envelope + payload MUST be a
+							 * single contiguous send_bytes call so partial-IO
+							 * buffer atomically accumulates the entire frame.
+							 * Splitting was the root-cause of frame stream
+							 * corruption when EAGAIN fell between env (DONE)
+							 * and payload (WOULD_BLOCK). */
+							char combined[sizeof(env) + sizeof(slots[cs].payload)];
+
+							memcpy(combined, &env, sizeof(env));
+							memcpy(combined + sizeof(env), &slots[cs].payload,
+								   sizeof(slots[cs].payload));
+							send_rc = cluster_ic_send_bytes(cs, combined, sizeof(combined));
 							switch (send_rc) {
 							case CLUSTER_IC_SEND_DONE:
 								fanout_rc = CLUSTER_IC_FANOUT_DONE;

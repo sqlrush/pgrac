@@ -143,6 +143,21 @@ void
 FlushErrorState(void)
 {}
 
+/* spec-2.5 hardening v1.0.1 F2: send_envelope now palloc's combined
+ * buffer for payload_len > 1024;router unit tests use stack_buf path
+ * (small / zero payload) so palloc/pfree should be unreachable, but the
+ * link must resolve. */
+void *
+palloc(Size size pg_attribute_unused())
+{
+	abort();
+}
+void
+pfree(void *p pg_attribute_unused())
+{
+	abort();
+}
+
 /* MemoryContext stubs (PG_TRY/CATCH path in dispatch_envelope).
  * MemoryContextSwitchTo is a PG static inline using CurrentMemoryContext --
  * leave it; just stub the real-function MemoryContextReset. */

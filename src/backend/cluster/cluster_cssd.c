@@ -663,9 +663,18 @@ cssd_deadband_scan_tick(void)
 
 		last_recv_us = pg_atomic_read_u64(&CssdShmem->peers[peer].last_heartbeat_recv_at_us);
 
-		/* If never received any heartbeat, skip (no baseline to compare). */
+		/* spec-2.5 hardening v1.0.1 F1 (L78 default-state-vs-deadband-
+		 * baseline):  never-received-heartbeat peer must NOT stay ALIVE
+		 * forever.  Pre-fix `if (last_recv_us == 0) continue;` broke the
+		 * dead-detection contract for declared-but-never-connected peers
+		 * (shmem default state ALIVE persists indefinitely).
+		 *
+		 * Use grace_until_us as virtual baseline when no heartbeat has
+		 * been received yet:  after the grace window expires, elapsed
+		 * accumulates from grace boundary → SUSPECTED → DEAD eventually
+		 * fire as expected. */
 		if (last_recv_us == 0)
-			continue;
+			last_recv_us = grace_until;
 
 		if (now_us <= last_recv_us)
 			continue; /* clock skew defense */

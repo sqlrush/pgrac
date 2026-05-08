@@ -225,22 +225,41 @@ cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload
 						errmsg("cluster_ic_envelope_build failed for msg_type %u", msg_type)));
 
 	/*
-	 * Two sends per frame: header + (optional) payload.  Per spec-2.0
-	 * §4 wire format -- reader recvs envelope first, then payload of
-	 * env->payload_length bytes.  Hardening v1.0.1 F1 partial-IO
-	 * buffering at tier1_send_bytes preserves frame integrity.
-	 *
-	 * spec-2.3 hardening v1.0.1 F1 (L68): three-state propagation.
-	 * Header-send WOULD_BLOCK / HARD_ERROR returns immediately;
-	 * payload (if any) is only attempted on header DONE.
+	 * spec-2.5 hardening v1.0.1 F2 (L79 envelope-payload-单 buffer 拼接发送):
+	 * envelope + payload MUST be sent in a single contiguous send_bytes
+	 * call so partial-IO buffer (spec-2.3 v1.0.1 F1 L65) atomically
+	 * accumulates the entire frame.  Splitting (send env -> if DONE send
+	 * payload) was the root cause of frame stream corruption when the
+	 * EAGAIN boundary fell between env and payload: receiver would get a
+	 * complete envelope claiming payload_length=N bytes, then on the
+	 * next tick a NEW envelope would arrive and be (mis)read as the
+	 * "missing payload" -- corrupting the recv state machine.
 	 */
-	rc = cluster_ic_send_bytes(dest_node_id, &env, sizeof(env));
-	if (rc != CLUSTER_IC_SEND_DONE)
-		return rc;
-	if (payload_len > 0)
-		return cluster_ic_send_bytes(dest_node_id, payload, payload_len);
+	if (payload_len == 0)
+		return cluster_ic_send_bytes(dest_node_id, &env, sizeof(env));
 
-	return CLUSTER_IC_SEND_DONE;
+	{
+		size_t total = sizeof(env) + payload_len;
+		char *combined;
+
+		/* For typical small heartbeat / control frames (env + payload ≤
+		 * 1 KB), use a stack buffer; spillover hits palloc. */
+		char stack_buf[1024];
+
+		if (total <= sizeof(stack_buf))
+			combined = stack_buf;
+		else
+			combined = palloc(total);
+
+		memcpy(combined, &env, sizeof(env));
+		memcpy(combined + sizeof(env), payload, payload_len);
+		rc = cluster_ic_send_bytes(dest_node_id, combined, total);
+
+		if (combined != stack_buf)
+			pfree(combined);
+
+		return rc;
+	}
 }
 
 
@@ -406,6 +425,20 @@ cluster_ic_send_envelope_fanout(uint8 msg_type, const void *payload, uint32 payl
 	const ClusterICMsgTypeInfo *info;
 	int peer;
 
+	/* spec-2.5 hardening v1.0.1 F4 (L81 doc-must-runtime-enforce):
+	 * fanout API contract is LMON-only callable.  Without this guard,
+	 * future msg_type registrations with non-LMON producer would let
+	 * the fanout call run in a process context that doesn't own the
+	 * tier1 TCP fds (which are LMON process-local per L61) — every
+	 * peer would silently return PEER_DOWN. */
+	if (MyBackendType != B_LMON)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cluster_ic_send_envelope_fanout: callable only from LMON process "
+							   "context (got BackendType %d)",
+							   (int)MyBackendType),
+						errhint("Non-LMON callers must hand off via shmem outbound queue "
+								"(spec-2.5 D2 ClusterCssdOutboundSlot pattern).")));
+
 	/* (1) msg_type range. */
 	if (msg_type == 0 || (int)msg_type >= CLUSTER_IC_MSG_TYPE_MAX)
 		ereport(ERROR,
@@ -478,9 +511,27 @@ cluster_ic_send_envelope_fanout(uint8 msg_type, const void *payload, uint32 payl
 			continue;
 		}
 
-		rc = cluster_ic_send_bytes(peer, &env, sizeof(env));
-		if (rc == CLUSTER_IC_SEND_DONE && payload_len > 0)
-			rc = cluster_ic_send_bytes(peer, payload, payload_len);
+		/* spec-2.5 hardening v1.0.1 F2 (L79 envelope-payload-单 buffer
+		 * 拼接发送): single contiguous send. */
+		if (payload_len == 0) {
+			rc = cluster_ic_send_bytes(peer, &env, sizeof(env));
+		} else {
+			size_t total = sizeof(env) + payload_len;
+			char stack_buf[1024];
+			char *combined;
+
+			if (total <= sizeof(stack_buf))
+				combined = stack_buf;
+			else
+				combined = palloc(total);
+
+			memcpy(combined, &env, sizeof(env));
+			memcpy(combined + sizeof(env), payload, payload_len);
+			rc = cluster_ic_send_bytes(peer, combined, total);
+
+			if (combined != stack_buf)
+				pfree(combined);
+		}
 
 		switch (rc) {
 		case CLUSTER_IC_SEND_DONE:

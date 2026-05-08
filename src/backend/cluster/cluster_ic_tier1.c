@@ -205,6 +205,12 @@ static int tier1_outbound_remaining[CLUSTER_MAX_NODES];
  */
 static int tier1_recv_phase[CLUSTER_MAX_NODES];
 static uint8 *tier1_recv_payload_buf_dyn[CLUSTER_MAX_NODES];
+/* spec-2.5 hardening v1.0.1 F3 (L80 dynamic-buffer-must-track-capacity):
+ * track per-peer allocated capacity so a frame whose payload exceeds the
+ * existing buffer triggers grow/realloc rather than overrun.  Without
+ * this the lazy-palloc-on-NULL path locks the buffer to the FIRST frame's
+ * payload size;subsequent larger frames overwrite past the allocation. */
+static int tier1_recv_payload_buf_dyn_capacity[CLUSTER_MAX_NODES];
 static int tier1_recv_payload_total[CLUSTER_MAX_NODES];
 static int tier1_recv_payload_filled[CLUSTER_MAX_NODES];
 
@@ -1520,11 +1526,21 @@ cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd)
 					goto verify_and_dispatch;
 				}
 
-				/* Enter phase 1: lazy palloc payload buf in TopMemoryContext. */
-				if (tier1_recv_payload_buf_dyn[peer_id] == NULL) {
+				/* Enter phase 1: lazy palloc payload buf in TopMemoryContext.
+				 *
+				 * spec-2.5 hardening v1.0.1 F3 (L80 dynamic-buffer-must-track-
+				 * capacity): grow the per-peer buffer if plen exceeds current
+				 * capacity.  Pre-fix code only palloc'd when buf == NULL,
+				 * locking capacity to the FIRST frame's payload size and
+				 * causing memcpy overrun on subsequent larger frames. */
+				if (tier1_recv_payload_buf_dyn[peer_id] == NULL
+					|| (int)plen > tier1_recv_payload_buf_dyn_capacity[peer_id]) {
 					MemoryContext oldctx = MemoryContextSwitchTo(TopMemoryContext);
 
+					if (tier1_recv_payload_buf_dyn[peer_id] != NULL)
+						pfree(tier1_recv_payload_buf_dyn[peer_id]);
 					tier1_recv_payload_buf_dyn[peer_id] = palloc((Size)plen);
+					tier1_recv_payload_buf_dyn_capacity[peer_id] = (int)plen;
 					MemoryContextSwitchTo(oldctx);
 				}
 				tier1_recv_payload_total[peer_id] = (int)plen;
@@ -1702,6 +1718,7 @@ cluster_ic_tier1_close_peer(int32 peer_id, const char *reason)
 		pfree(tier1_recv_payload_buf_dyn[peer_id]);
 		tier1_recv_payload_buf_dyn[peer_id] = NULL;
 	}
+	tier1_recv_payload_buf_dyn_capacity[peer_id] = 0; /* spec-2.5 v1.0.1 F3 */
 
 	/* spec-2.4 hardening v1.0.1 F2: dynamic outbound buf. */
 	if (tier1_outbound_buf_dyn[peer_id] != NULL) {

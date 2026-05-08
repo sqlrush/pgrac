@@ -135,6 +135,40 @@ cluster_ic_send_envelope_chunked(uint8 inner_msg_type, int32 dest_node_id, const
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("cluster_ic_send_envelope_chunked: payload is NULL but len = %zu", len)));
 
+	/*
+	 * spec-2.5 hardening v1.0.1 F5 (L82 wrapper-must-validate-inner-msg-
+	 * type):  chunked send wrapper MUST run inner_msg_type through the
+	 * router's full 5-step ABI gate (registered + producer mask + dest=
+	 * BROADCAST → broadcast_ok + payload_len ≤ MAX).  Pre-fix code only
+	 * rejected inner=0/inner=255 — a hostile or buggy caller could ship
+	 * any unregistered / wrong-producer-context / non-broadcast-allowed
+	 * inner msg via chunked path, bypassing send_envelope's normal gate.
+	 */
+	{
+		const ClusterICMsgTypeInfo *inner_info = cluster_ic_get_msg_type_info(inner_msg_type);
+
+		if (inner_info == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cluster_ic_send_envelope_chunked: inner_msg_type %u not registered",
+							inner_msg_type),
+					 errhint("Register the inner msg_type in postmaster phase 1 before "
+							 "shipping chunked payloads.")));
+
+		if ((inner_info->allowed_producer_mask & (1u << MyBackendType)) == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cluster_ic_send_envelope_chunked: inner_msg_type %u (\"%s\") not "
+							"allowed from BackendType %d",
+							inner_msg_type, inner_info->name, (int)MyBackendType)));
+
+		if ((uint32)dest_node_id == PGRAC_IC_BROADCAST && !inner_info->broadcast_ok)
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("cluster_ic_send_envelope_chunked: inner_msg_type %u (\"%s\") "
+								   "does not allow BROADCAST destination",
+								   inner_msg_type, inner_info->name)));
+	}
+
 	max_bytes = (uint32)cluster_interconnect_payload_max_bytes;
 	if (len > (size_t)max_bytes)
 		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
