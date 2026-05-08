@@ -205,8 +205,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_cluster_shmem'),
-   '10',
-   'L12c pg_cluster_shmem 10 rows (1.5 adds no shmem regions; 1.12 baseline 6 + 1.13 diag + 1.14 stats + 1.15 scn + 2.2 cluster_ic_tier1)');
+   '11',
+   'L12c pg_cluster_shmem 11 rows (1.5 adds no shmem regions; 1.12 baseline 6 + 1.13 diag + 1.14 stats + 1.15 scn + 2.2 cluster_ic_tier1 + 2.4 cluster_epoch)');
 
 
 # ----------
@@ -451,7 +451,7 @@ $node->safe_psql('postgres', q{
 	INSERT INTO minimal_round_trip_dst SELECT id, val FROM minimal_round_trip_src ORDER BY id DESC;
 });
 is($node->safe_psql('postgres', 'SELECT count(*) FROM minimal_round_trip_dst'),
-   '10',
+   '11',
    'L26 MinimalTuple round-trip (sort -> tuplestore -> heap insert) preserves t_itl_slot_idx = 255 via ClusterMinimalTupleInitItlSlot');
 
 
