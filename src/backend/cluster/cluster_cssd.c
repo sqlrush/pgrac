@@ -64,15 +64,27 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "libpq/pqsignal.h"
 #include "miscadmin.h"
+#include "postmaster/interrupt.h"
 #include "storage/ipc.h"
+#include "storage/latch.h"
 #include "storage/lwlock.h"
+#include "storage/proc.h"
+#include "storage/procsignal.h"
 #include "storage/shmem.h"
+#include "tcop/tcopprot.h"
 #include "utils/elog.h"
+#include "utils/memutils.h"
+#include "utils/ps_status.h"
 #include "utils/timestamp.h"
+#include "utils/wait_event.h"
 
 #include "cluster/cluster_cssd.h"
-#include "cluster/cluster_guc.h" /* cluster_node_id */
+#include "cluster/cluster_guc.h"   /* cluster_node_id */
+#include "cluster/cluster_shmem.h" /* cluster_shmem_register_region */
+
+extern pid_t cluster_postmaster_start_cssd(void);
 
 
 /* ============================================================
@@ -179,14 +191,19 @@ cluster_cssd_shmem_init(void)
 	}
 }
 
+static const ClusterShmemRegion cluster_cssd_region = {
+	.name = "pgrac cluster cssd",
+	.size_fn = cluster_cssd_shmem_size,
+	.init_fn = cluster_cssd_shmem_init,
+	.lwlock_count = 1,
+	.owner_subsys = "cluster_cssd",
+	.reserved_flags = 0,
+};
+
 void
 cluster_cssd_shmem_register(void)
 {
-	/* NB: real cluster_shmem.c registration happens in Step 5 D6.  This
-	 * thin wrapper keeps the API surface stable so Step 4 spawn path
-	 * can reference the symbol.  In Step 5 the body becomes a call to
-	 * the cluster_shmem region registry (mirroring spec-1.14 D6
-	 * pattern). */
+	cluster_shmem_register_region(&cluster_cssd_region);
 }
 
 
@@ -436,59 +453,210 @@ cluster_cssd_dispatch_heartbeat(const ClusterICEnvelope *env, const void *payloa
 
 
 /* ============================================================
- * CssdMain skeleton.
+ * Status publish + tick advance helpers (Step 4).
  *
- *   Step 2 minimal:  enter shutdown loop; publish READY status; tick
- *   at fixed 1000 ms interval (real GUC + wait event in Step 5 D8/D9).
- *   Heartbeat publish to outbound queue + deadband scan are stubbed
- *   (Step 5 fills body).  This skeleton lets Step 4 postmaster wiring
- *   integrate cleanly without rewriting CssdMain.
+ *   Mirror spec-1.14 Cluster Stats pattern (stats_publish_status +
+ *   stats_advance_liveness_tick).  Single writer = CSSD process
+ *   itself (LW_EXCLUSIVE).
+ * ============================================================ */
+
+static void
+cssd_publish_status(ClusterCssdStatus new_status)
+{
+	TimestampTz now = GetCurrentTimestamp();
+
+	if (CssdShmem == NULL)
+		return;
+
+	LWLockAcquire(&CssdShmem->lwlock, LW_EXCLUSIVE);
+	CssdShmem->status = new_status;
+
+	switch (new_status) {
+	case CLUSTER_CSSD_STARTING:
+		/* F16: SPAWNING unconditionally refreshes pid + spawned_at on
+			 * every spawn (so SQL views never report stale PID after
+			 * ServerLoop respawn). */
+		CssdShmem->pid = MyProcPid;
+		CssdShmem->spawned_at = now;
+		break;
+	case CLUSTER_CSSD_READY:
+		CssdShmem->ready_at = now;
+		break;
+	case CLUSTER_CSSD_SHUTTING_DOWN:
+	case CLUSTER_CSSD_DOWN:
+	case CLUSTER_CSSD_FAILED:
+		break;
+	}
+	LWLockRelease(&CssdShmem->lwlock);
+}
+
+static bool
+cssd_shutdown_requested(void)
+{
+	bool v;
+
+	if (CssdShmem == NULL)
+		return false;
+	LWLockAcquire(&CssdShmem->lwlock, LW_SHARED);
+	v = CssdShmem->shutdown_requested;
+	LWLockRelease(&CssdShmem->lwlock);
+	return v;
+}
+
+static void
+cssd_advance_liveness_tick(void)
+{
+	TimestampTz now = GetCurrentTimestamp();
+
+	if (CssdShmem == NULL)
+		return;
+	LWLockAcquire(&CssdShmem->lwlock, LW_EXCLUSIVE);
+	CssdShmem->last_liveness_tick_at = now;
+	CssdShmem->main_loop_iters++;
+	LWLockRelease(&CssdShmem->lwlock);
+}
+
+
+/* ============================================================
+ * CssdMain.
+ *
+ *   Step 4 — real lifecycle.  Heartbeat-tick body (write to outbound
+ *   queue + deadband scan) lands in Step 5 once GUC + wait event +
+ *   inject points are registered.  Step 4 minimal: proper spawn /
+ *   READY publish / WaitLatch loop / shutdown protocol so postmaster
+ *   reaper sees clean exit codes.
  *
  *   Asserts IsUnderPostmaster (HC1 reverse defense).
  * ============================================================ */
+
+#define CSSD_MAIN_LOOP_INTERVAL_MS 1000 /* Step 5 D9 wires GUC */
 
 void
 CssdMain(void)
 {
 	Assert(IsUnderPostmaster);
 
-	/* Step 4 wires postmaster spawn → CssdMain;Step 5 GUC + wait event +
-	 * inject point machinery turns this into the real heartbeat tick.
-	 *
-	 * For Step 2, this entry compiles + links so the postmaster spawn
-	 * patch (Step 4) can target it.  Calling it directly without the
-	 * spawn path will hit Assert(IsUnderPostmaster) FATAL in postmaster
-	 * context. */
+	MyBackendType = B_CSSD;
+	init_ps_display(NULL);
+
+	pqsignal(SIGHUP, SignalHandlerForConfigReload);
+	pqsignal(SIGINT, SignalHandlerForShutdownRequest);
+	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
+	/* SIGQUIT installed by InitPostmasterChild. */
+	pqsignal(SIGALRM, SIG_IGN);
+	pqsignal(SIGPIPE, SIG_IGN);
+	pqsignal(SIGUSR1, procsignal_sigusr1_handler);
+	pqsignal(SIGUSR2, SIG_IGN);
+	pqsignal(SIGCHLD, SIG_DFL);
+
+	sigprocmask(SIG_SETMASK, &UnBlockSig, NULL);
+
+	if (CssdShmem == NULL)
+		ereport(FATAL,
+				(errcode(ERRCODE_INTERNAL_ERROR), errmsg("cluster_cssd shmem region not attached"),
+				 errhint("cluster_cssd_shmem_init() must run during "
+						 "CreateSharedMemoryAndSemaphores().")));
+
+	cssd_publish_status(CLUSTER_CSSD_STARTING);
+
+	/* Step 4 minimum: no Sprint-A startup work beyond shmem registration.
+	 * Move directly to READY.  Step 5 will hook inject point + Q6
+	 * first-tick grace period gate here. */
+	cssd_publish_status(CLUSTER_CSSD_READY);
+
+	/* spec-2.5 Q6 first-tick grace period (Step 5 connects to GUC; Step
+	 * 4 hardcodes default 3 × 1000 ms). */
+	{
+		uint64 ready_us = (uint64)GetCurrentTimestamp();
+		uint64 grace = 3 * (uint64)CSSD_MAIN_LOOP_INTERVAL_MS * 1000ULL;
+
+		LWLockAcquire(&CssdShmem->lwlock, LW_EXCLUSIVE);
+		CssdShmem->first_tick_grace_until_us = ready_us + grace;
+		LWLockRelease(&CssdShmem->lwlock);
+	}
+
+	for (;;) {
+		int rc;
+
+		CHECK_FOR_INTERRUPTS();
+
+		if (ConfigReloadPending) {
+			ConfigReloadPending = false;
+			ProcessConfigFile(PGC_SIGHUP);
+		}
+
+		if (ShutdownRequestPending || cssd_shutdown_requested())
+			break;
+
+		cssd_advance_liveness_tick();
+
+		/* Step 5 D11 wires inject point + heartbeat broadcast tick +
+		 * deadband-scan + state machine here. */
+
+		rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+					   CSSD_MAIN_LOOP_INTERVAL_MS, WAIT_EVENT_PG_SLEEP);
+		if (rc & WL_LATCH_SET)
+			ResetLatch(MyLatch);
+	}
+
+	cssd_publish_status(CLUSTER_CSSD_SHUTTING_DOWN);
+	cssd_publish_status(CLUSTER_CSSD_DOWN);
+
+	/* proc_exit(0) -> reaper sees WIFEXITED + WEXITSTATUS=0 ->
+	 * normal-exit path -> NO crash recovery (HC5).  Abnormal exit hits
+	 * HandleChildCrash -> restart_after_crash decides cycle. */
 	proc_exit(0);
 }
 
 
 /* ============================================================
- * Lifecycle (Step 4 D4 thin proxies).
- *
- *   Real implementation in Step 4: cluster_postmaster_start_cssd in
- *   postmaster.c (file-static StartChildProcess access);here we only
- *   declare the API surface.  Step 2 stubs that fail-safe so unit
- *   tests don't trigger spawn paths inadvertently.
+ * Lifecycle (Q2 thin proxies — postmaster-owned wrappers in
+ * postmaster.c).
  * ============================================================ */
 
 int
 cluster_cssd_start(void)
 {
-	/* Real impl in Step 4: forwards to cluster_postmaster_start_cssd(). */
-	return 0;
+	pid_t pid;
+
+	Assert(!IsUnderPostmaster);
+
+	pid = cluster_postmaster_start_cssd();
+	return (int)pid;
 }
 
 bool
-cluster_cssd_wait_for_ready(int timeout_ms pg_attribute_unused())
+cluster_cssd_wait_for_ready(int timeout_ms)
 {
-	/* Real impl in Step 4: bounded poll on CssdShmem->status. */
+	const int sleep_ms = 100;
+	int waited = 0;
+
+	Assert(!IsUnderPostmaster);
+
+	if (CssdShmem == NULL)
+		return false;
+
+	while (waited < timeout_ms) {
+		ClusterCssdStatus s;
+
+		LWLockAcquire(&CssdShmem->lwlock, LW_SHARED);
+		s = CssdShmem->status;
+		LWLockRelease(&CssdShmem->lwlock);
+
+		if (s >= CLUSTER_CSSD_READY)
+			return s == CLUSTER_CSSD_READY;
+
+		pg_usleep(sleep_ms * 1000L);
+		waited += sleep_ms;
+	}
 	return false;
 }
 
 void
 cluster_cssd_request_shutdown(void)
 {
+	Assert(!IsUnderPostmaster);
+
 	if (CssdShmem == NULL)
 		return;
 	LWLockAcquire(&CssdShmem->lwlock, LW_EXCLUSIVE);

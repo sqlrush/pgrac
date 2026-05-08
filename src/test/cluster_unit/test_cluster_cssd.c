@@ -179,6 +179,67 @@ proc_exit(int code pg_attribute_unused())
 	abort();
 }
 
+/* CssdMain runtime stubs (Step 4 wires postmaster spawn;tests don't
+ * invoke the full main loop). */
+#include "miscadmin.h"
+volatile sig_atomic_t InterruptPending = false;
+BackendType MyBackendType = B_INVALID;
+struct Latch *MyLatch = NULL;
+sigset_t UnBlockSig;
+
+void
+ProcessConfigFile(int context pg_attribute_unused())
+{}
+void
+ProcessInterrupts(void)
+{}
+void
+ResetLatch(struct Latch *latch pg_attribute_unused())
+{}
+int
+WaitLatch(struct Latch *latch pg_attribute_unused(), int wakeEvents pg_attribute_unused(),
+		  long timeout pg_attribute_unused(), uint32 wait_event_info pg_attribute_unused())
+{
+	return 0;
+}
+void
+SignalHandlerForConfigReload(int sig pg_attribute_unused())
+{}
+void
+SignalHandlerForShutdownRequest(int sig pg_attribute_unused())
+{}
+void
+init_ps_display(const char *fixed_part pg_attribute_unused())
+{}
+void
+pg_usleep(long microsec pg_attribute_unused())
+{}
+
+typedef void (*pqsigfunc)(int);
+pqsigfunc
+pqsignal(int signum pg_attribute_unused(), pqsigfunc handler pg_attribute_unused())
+{
+	return handler;
+}
+void
+procsignal_sigusr1_handler(int sig pg_attribute_unused())
+{}
+
+/* Step 4 cluster_postmaster_start_cssd lives in postmaster.c;tests don't
+ * spawn so stub returns 0 (failure) — consistent with cluster_cssd_start
+ * Assert(!IsUnderPostmaster) but tests never invoke start. */
+pid_t
+cluster_postmaster_start_cssd(void)
+{
+	return 0;
+}
+
+/* Step 4 cluster_shmem_register_region;tests don't register so stub. */
+#include "cluster/cluster_shmem.h"
+void
+cluster_shmem_register_region(const ClusterShmemRegion *region pg_attribute_unused())
+{}
+
 
 /* ============================================================
  * Tests.

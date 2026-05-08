@@ -318,6 +318,9 @@ static pid_t DiagPID = 0;
 
 /* PGRAC (stage 1.14 Sprint A): Cluster Stats aux process pid; same pattern. */
 static pid_t ClusterStatsPID = 0;
+
+/* PGRAC (stage 2.5 Sprint A): CSSD aux process pid; same pattern. */
+static pid_t CssdPID = 0;
 #endif
 
 /* Startup process's status */
@@ -625,6 +628,7 @@ static void ShmemBackendArrayRemove(Backend *bn);
 #define StartLck() StartChildProcess(LckProcess)
 #define StartDiag() StartChildProcess(DiagProcess)
 #define StartClusterStats() StartChildProcess(ClusterStatsProcess)
+#define StartCssd() StartChildProcess(CssdProcess)
 #endif
 
 /* Macros to check exit status of a child process */
@@ -1876,6 +1880,15 @@ ServerLoop(void)
 		 */
 		if (cluster_enabled && ClusterStatsPID == 0 && pmState == PM_RUN)
 			ClusterStatsPID = StartClusterStats();
+
+		/*
+		 * PGRAC: spec-2.5 Sprint A — same ServerLoop respawn for CSSD
+		 * (5th cluster aux process).  Spawned post PM_RUN by phase4
+		 * driver third upgrade;respawn here closes restart_after_crash
+		 * recovery + external-SIGTERM paths.
+		 */
+		if (cluster_enabled && CssdPID == 0 && pmState == PM_RUN)
+			CssdPID = StartCssd();
 #endif
 
 		/*
@@ -2737,6 +2750,8 @@ process_pm_reload_request(void)
 			signal_child(DiagPID, SIGHUP);
 		if (ClusterStatsPID != 0)
 			signal_child(ClusterStatsPID, SIGHUP);
+		if (CssdPID != 0)
+			signal_child(CssdPID, SIGHUP);
 #endif
 		if (AutoVacPID != 0)
 			signal_child(AutoVacPID, SIGHUP);
@@ -3230,6 +3245,19 @@ process_pm_child_exit(void)
 				HandleChildCrash(pid, exitstatus, _("cluster stats process"));
 			continue;
 		}
+		/*
+		 * PGRAC: stage 2.5 Sprint A — CSSD aux process exit handling
+		 * mirrors Cluster Stats / DIAG / LCK / LMON.  Same HC5 normal/
+		 * abnormal split.
+		 *
+		 * Spec: spec-2.5-cssd-heartbeat-skeleton.md Sprint A D4 + HC5.
+		 */
+		if (pid == CssdPID) {
+			CssdPID = 0;
+			if (!EXIT_STATUS_0(exitstatus))
+				HandleChildCrash(pid, exitstatus, _("CSSD process"));
+			continue;
+		}
 #endif
 
 		/*
@@ -3630,6 +3658,12 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 		ClusterStatsPID = 0;
 	else if (ClusterStatsPID != 0 && take_action)
 		sigquit_child(ClusterStatsPID);
+
+	/* PGRAC (stage 2.5 Sprint A): same pattern for CSSD. */
+	if (pid == CssdPID)
+		CssdPID = 0;
+	else if (CssdPID != 0 && take_action)
+		sigquit_child(CssdPID);
 #endif
 
 	/* Take care of the walreceiver too */
@@ -3787,13 +3821,18 @@ PostmasterStateMachine(void)
 		 * cluster_run_shutdown_sequence (which fires AFTER children
 		 * already exited) has no effect.  Q10 user-finding 2026-05-04.
 		 */
-		/* spec-1.14 Q10 LIFO: Cluster Stats first (last-spawned). */
+		/* spec-2.5 Q10 LIFO: CSSD first (last-spawned in phase 4
+		 * driver third upgrade — DIAG + Stats + CSSD serial wait,
+		 * CSSD added last). */
+		if (CssdPID != 0)
+			signal_child(CssdPID, SIGTERM);
+		/* spec-1.14 Q10 LIFO: Cluster Stats next. */
 		if (ClusterStatsPID != 0)
 			signal_child(ClusterStatsPID, SIGTERM);
-		/* spec-1.13 Q10 LIFO: DIAG second. */
+		/* spec-1.13 Q10 LIFO: DIAG next. */
 		if (DiagPID != 0)
 			signal_child(DiagPID, SIGTERM);
-		/* spec-1.12 Q10 LIFO: LCK third. */
+		/* spec-1.12 Q10 LIFO: LCK next. */
 		if (LckPID != 0)
 			signal_child(LckPID, SIGTERM);
 		/* spec-1.11 Q10 LIFO: LMON last (first-spawned).  LMON main
@@ -3852,6 +3891,8 @@ PostmasterStateMachine(void)
 			DiagPID == 0 &&
 			/* PGRAC: spec-1.14 Sprint A — same wait for Cluster Stats. */
 			ClusterStatsPID == 0 &&
+			/* PGRAC: spec-2.5 Sprint A — same wait for CSSD. */
+			CssdPID == 0 &&
 #endif
 			AutoVacPID == 0) {
 			if (Shutdown >= ImmediateShutdown || FatalError) {
@@ -4195,6 +4236,8 @@ TerminateChildren(int signal)
 		signal_child(DiagPID, signal);
 	if (ClusterStatsPID != 0)
 		signal_child(ClusterStatsPID, signal);
+	if (CssdPID != 0)
+		signal_child(CssdPID, signal);
 #endif
 }
 
@@ -5598,6 +5641,30 @@ cluster_postmaster_start_stats(void)
 
 	ClusterStatsPID = StartClusterStats();
 	return ClusterStatsPID;
+}
+
+/*
+ * cluster_postmaster_start_cssd -- spawn the CSSD aux process.
+ *
+ *	PGRAC (stage 2.5 Sprint A): postmaster-owned narrow wrapper for
+ *	the cluster module to request CSSD spawn (Q2).  Mirrors
+ *	cluster_postmaster_start_stats -- StartChildProcess is file-static,
+ *	so cluster_cssd.c::cluster_cssd_start() forwards here.
+ *
+ *	Note: CSSD spawn is driven from cluster_run_phase4_sequence() in
+ *	the reaper PM_RUN transition path, AFTER Cluster Stats ready
+ *	(spec-2.5 Q6 / D5 phase 4 driver third upgrade — DIAG + Stats +
+ *	CSSD serial wait sharing phase4_remaining_budget_ms).
+ *
+ *	Spec: spec-2.5-cssd-heartbeat-skeleton.md Sprint A D4.
+ */
+pid_t
+cluster_postmaster_start_cssd(void)
+{
+	Assert(!IsUnderPostmaster);
+
+	CssdPID = StartCssd();
+	return CssdPID;
 }
 #endif
 

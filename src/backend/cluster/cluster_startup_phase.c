@@ -55,6 +55,7 @@
 #include "utils/timestamp.h"
 
 #include "cluster/cluster_elog.h"	/* cluster_phase legacy mirror (HC2) */
+#include "cluster/cluster_cssd.h"	/* cluster_cssd_start / wait_for_ready (2.5 Sprint A) */
 #include "cluster/cluster_diag.h"	/* cluster_diag_start / wait_for_ready (1.13 Sprint A) */
 #include "cluster/cluster_guc.h"	/* cluster_phase{1..4}_timeout (D2 F2) */
 #include "cluster/cluster_stats.h"	/* cluster_stats_start / wait_for_ready (1.14 Sprint A) */
@@ -601,8 +602,10 @@ phase_4_handler(PhaseRunFailContext *fail_ctx)
 {
 	int diag_pid;
 	int stats_pid;
+	int cssd_pid;
 	int diag_remaining_ms;
 	int stats_remaining_ms;
+	int cssd_remaining_ms;
 	TimestampTz phase4_start;
 	TimestampTz phase4_deadline;
 
@@ -616,9 +619,9 @@ phase_4_handler(PhaseRunFailContext *fail_ctx)
 	 */
 	if (!cluster_enabled) {
 		elog(DEBUG1, "cluster phase 4: cluster.enabled=false; skipping DIAG + "
-					 "Cluster Stats spawn (degraded to spec-1.10 stub behavior).  "
-					 "PG-native walwriter / bgwriter / checkpointer / autovacuum "
-					 "spawn unchanged.");
+					 "Cluster Stats + CSSD spawn (degraded to spec-1.10 stub "
+					 "behavior).  PG-native walwriter / bgwriter / checkpointer / "
+					 "autovacuum spawn unchanged.");
 		return PHASE_RUN_OK;
 	}
 
@@ -687,12 +690,39 @@ phase_4_handler(PhaseRunFailContext *fail_ctx)
 		return PHASE_RUN_FATAL;
 	}
 
+	/* ----------
+	 * spec-2.5 D5: CSSD spawn + sync wait ready (third phase 4 child).
+	 * Same Q3 single deadline pattern shared with DIAG + Stats.
+	 * Step 5 D10 lands proper SQLSTATEs (53R30 / 53R31);Step 4 reuses
+	 * Cluster Stats SQLSTATE codes as placeholders to keep the
+	 * compile-time link clean.
+	 * ----------
+	 */
+	cssd_pid = cluster_cssd_start();
+	if (cssd_pid <= 0) {
+		fail_ctx->errcode = ERRCODE_CLUSTER_STATS_SPAWN_FAILED; /* Step 5 D10: 53R30 */
+		fail_ctx->errmsg = "cluster phase 4: failed to spawn CSSD aux process";
+		fail_ctx->errhint = "Check postmaster log for fork() error.  Confirm OS "
+							"process limits leave room for the CSSD aux process.";
+		return PHASE_RUN_FATAL;
+	}
+
+	cssd_remaining_ms = phase4_remaining_budget_ms(phase4_deadline, 5000);
+	if (!cluster_cssd_wait_for_ready(cssd_remaining_ms)) {
+		fail_ctx->errcode = ERRCODE_CLUSTER_STATS_NOT_READY; /* Step 5 D10: 53R31 */
+		fail_ctx->errmsg = "cluster phase 4: CSSD did not publish READY in time";
+		fail_ctx->errhint = "Check postmaster log for CSSD-side errors.  If CSSD is "
+							"slow on this hardware, raise cluster.phase4_timeout "
+							"(PGC_SIGHUP).";
+		return PHASE_RUN_FATAL;
+	}
+
 	elog(DEBUG1,
-		 "cluster phase 4: DIAG ready (pid %d) + Cluster Stats ready (pid %d).  "
-		 "PG-native walwriter / bgwriter / checkpointer / autovacuum spawn "
-		 "unchanged.  Sinval Broadcaster / Recovery Coordinator deferred to "
-		 "Stage 2+.",
-		 diag_pid, stats_pid);
+		 "cluster phase 4: DIAG ready (pid %d) + Cluster Stats ready (pid %d) + "
+		 "CSSD ready (pid %d).  PG-native walwriter / bgwriter / checkpointer / "
+		 "autovacuum spawn unchanged.  Sinval Broadcaster / Recovery Coordinator "
+		 "deferred to Stage 2+.",
+		 diag_pid, stats_pid, cssd_pid);
 
 	return PHASE_RUN_OK;
 }

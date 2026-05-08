@@ -367,6 +367,7 @@ typedef enum BackendType {
 	 * land in stage 0.13+.
 	 */
 	B_CLUSTER_STATS,
+	B_CSSD,
 	B_DIAG,
 	B_HEARTBEAT,
 	B_INTERCONNECT,
@@ -524,6 +525,17 @@ typedef enum {
 	 * cluster_stats.h.
 	 */
 	ClusterStatsProcess,
+	/*
+	 * CSSD (Cluster Synchronization Service Daemon) is the 5th cluster
+	 * background process — spec-2.5 Sprint A.  Appended after
+	 * ClusterStatsProcess to preserve numeric values.  Application-level
+	 * peer dead detection via heartbeat broadcast (paired with spec-2.4
+	 * D8 socket-level TCP KeepAlive for two-layer dead detection).
+	 * Lifecycle skeleton + heartbeat broadcast + per-peer state machine;
+	 * does NOT trigger reconfig (spec-2.29 separate sub-spec).  See
+	 * cluster_cssd.h.
+	 */
+	CssdProcess,
 #endif
 
 	NUM_AUXPROCTYPES /* Must be last! */
@@ -542,6 +554,7 @@ extern PGDLLIMPORT AuxProcType MyAuxProcType;
 #define AmLckProcess() (MyAuxProcType == LckProcess)
 #define AmDiagProcess() (MyAuxProcType == DiagProcess)
 #define AmClusterStatsProcess() (MyAuxProcType == ClusterStatsProcess)
+#define AmCssdProcess() (MyAuxProcType == CssdProcess)
 #endif
 
 

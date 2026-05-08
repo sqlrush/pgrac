@@ -37,6 +37,7 @@
 #include "cluster/cluster_diag.h"  /* DiagMain (stage 1.13 Sprint A) */
 #include "cluster/cluster_lck.h"   /* LckMain (stage 1.12 Sprint A) */
 #include "cluster/cluster_lmon.h"  /* LmonMain (stage 1.11 Sprint A) */
+#include "cluster/cluster_cssd.h"  /* CssdMain (stage 2.5 Sprint A) */
 #include "cluster/cluster_stats.h" /* ClusterStatsMain (stage 1.14 Sprint A) */
 #endif
 
@@ -102,6 +103,10 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 	/* PGRAC (stage 1.14 Sprint A): Cluster Stats aux process. */
 	case ClusterStatsProcess:
 		MyBackendType = B_CLUSTER_STATS;
+		break;
+	/* PGRAC (stage 2.5 Sprint A): CSSD aux process. */
+	case CssdProcess:
+		MyBackendType = B_CSSD;
 		break;
 #endif
 	default:
@@ -207,6 +212,10 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 	/* PGRAC (stage 1.14 Sprint A): Cluster Stats aux process dispatch. */
 	case ClusterStatsProcess:
 		ClusterStatsMain();
+		proc_exit(1);
+	/* PGRAC (stage 2.5 Sprint A): CSSD aux process dispatch. */
+	case CssdProcess:
+		CssdMain();
 		proc_exit(1);
 #endif
 

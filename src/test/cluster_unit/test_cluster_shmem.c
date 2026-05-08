@@ -349,6 +349,11 @@ void
 cluster_stats_shmem_register(void)
 {}
 
+/* Spec-2.5 Sprint A stub: same for CSSD. */
+void
+cluster_cssd_shmem_register(void)
+{}
+
 /* Spec-1.15 Sprint A stub: same for SCN. */
 void
 cluster_scn_shmem_register(void)

@@ -9,10 +9,10 @@
  *	  the extension:
  *
  *	  - PG ABI preserved: the original 14 PG values (B_INVALID..B_WAL_WRITER)
- *	    keep their numeric positions; the 14 pgrac values are appended
- *	    after B_WAL_WRITER.
- *	  - BACKEND_NUM_TYPES == 28 (14 PG + 14 pgrac).
- *	  - The 14 new values are pairwise distinct and dense (no holes).
+ *	    keep their numeric positions; the 15 pgrac values are appended
+ *	    after B_WAL_WRITER (CSSD added in spec-2.5 Sprint A).
+ *	  - BACKEND_NUM_TYPES == 29 (14 PG + 15 pgrac).
+ *	  - The 15 new values are pairwise distinct and dense (no holes).
  *	  - B_UNDO_CLEANER == BACKEND_NUM_TYPES - 1 (last value).
  *
  *	  Why compile-time only:
@@ -87,16 +87,18 @@ UT_DEFINE_GLOBALS();
  * ----------
  */
 
-UT_TEST(test_backend_num_types_is_28)
+UT_TEST(test_backend_num_types_is_29)
 {
-	/* 14 PG-native (B_INVALID..B_WAL_WRITER) + 14 pgrac = 28 */
-	UT_ASSERT_EQ(BACKEND_NUM_TYPES, 28);
+	/* 14 PG-native (B_INVALID..B_WAL_WRITER) + 15 pgrac = 29
+	 * (spec-2.5 Sprint A added B_CSSD) */
+	UT_ASSERT_EQ(BACKEND_NUM_TYPES, 29);
 }
 
 UT_TEST(test_pgrac_values_appended_after_wal_writer)
 {
 	/* Append-only ABI policy: every pgrac value sits above B_WAL_WRITER. */
 	UT_ASSERT(B_CLUSTER_STATS > B_WAL_WRITER);
+	UT_ASSERT(B_CSSD > B_WAL_WRITER);
 	UT_ASSERT(B_DIAG > B_WAL_WRITER);
 	UT_ASSERT(B_HEARTBEAT > B_WAL_WRITER);
 	UT_ASSERT(B_INTERCONNECT > B_WAL_WRITER);
@@ -126,11 +128,12 @@ UT_TEST(test_pg_native_values_unchanged)
 UT_TEST(test_pgrac_values_are_dense_and_distinct)
 {
 	/*
-	 * 14 pgrac values must occupy positions 14..27 with no holes
+	 * 15 pgrac values must occupy positions 14..28 with no holes
 	 * and no duplicates.  Asserting strict ordering proves both
 	 * (alphabetic order matches enum order in §2.2 of spec-0.10).
 	 */
-	UT_ASSERT(B_CLUSTER_STATS < B_DIAG);
+	UT_ASSERT(B_CLUSTER_STATS < B_CSSD);
+	UT_ASSERT(B_CSSD < B_DIAG);
 	UT_ASSERT(B_DIAG < B_HEARTBEAT);
 	UT_ASSERT(B_HEARTBEAT < B_INTERCONNECT);
 	UT_ASSERT(B_INTERCONNECT < B_LCK);
@@ -159,7 +162,7 @@ int
 main(void)
 {
 	UT_PLAN(5);
-	UT_RUN(test_backend_num_types_is_28);
+	UT_RUN(test_backend_num_types_is_29);
 	UT_RUN(test_pgrac_values_appended_after_wal_writer);
 	UT_RUN(test_pg_native_values_unchanged);
 	UT_RUN(test_pgrac_values_are_dense_and_distinct);

@@ -296,6 +296,18 @@ cluster_stats_wait_for_ready(int timeout_ms pg_attribute_unused())
 	return false;
 }
 
+/* Spec-2.5 stubs. */
+int
+cluster_cssd_start(void)
+{
+	return 0;
+}
+bool
+cluster_cssd_wait_for_ready(int timeout_ms pg_attribute_unused())
+{
+	return false;
+}
+
 
 UT_DEFINE_GLOBALS();
 
