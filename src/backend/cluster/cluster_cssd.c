@@ -81,10 +81,11 @@
 #include "utils/wait_event.h"
 
 #include "cluster/cluster_cssd.h"
-#include "cluster/cluster_conf.h"	/* cluster_conf_lookup_node (SRF row filter) */
-#include "cluster/cluster_guc.h"	/* cluster_node_id + cssd_* GUCs */
-#include "cluster/cluster_inject.h" /* CLUSTER_INJECTION_POINT (spec-2.5 D11) */
-#include "cluster/cluster_shmem.h"	/* cluster_shmem_register_region */
+#include "cluster/cluster_conf.h"	   /* cluster_conf_lookup_node (SRF row filter) */
+#include "cluster/cluster_guc.h"	   /* cluster_node_id + cssd_* GUCs */
+#include "cluster/cluster_ic_router.h" /* ClusterICFanoutResult (heartbeat tick read result) */
+#include "cluster/cluster_inject.h"	   /* CLUSTER_INJECTION_POINT (spec-2.5 D11) */
+#include "cluster/cluster_shmem.h"	   /* cluster_shmem_register_region */
 #include "fmgr.h"
 #include "funcapi.h"
 #include "utils/builtins.h" /* CStringGetTextDatum */
@@ -523,6 +524,198 @@ cssd_advance_liveness_tick(void)
 
 
 /* ============================================================
+ * Heartbeat broadcast tick (spec-2.5 §3.2).
+ *
+ *   Per CSSD MainLoop tick:
+ *     1. Read previous tick's LMON drain result for each peer slot;
+ *        update send counter / last_send_at on DONE;LOG advisory on
+ *        PEER_DOWN (spec §3.2.2 first-tick nonfatal).
+ *     2. CAS pending 0→1 to write new request, copy payload, CAS to 2
+ *        publish to LMON drain.
+ *
+ *   No LWLock — single producer (CSSD process) + single consumer
+ *   (LMON tick) per peer slot.
+ * ============================================================ */
+
+static uint32 cssd_request_seq = 0;
+static uint32 cssd_seq = 0;
+
+static void
+cssd_heartbeat_broadcast_tick(void)
+{
+	ClusterCssdHeartbeatPayload hb;
+	ClusterCssdOutboundSlot *slots;
+	int peer;
+
+	if (CssdShmem == NULL)
+		return;
+
+	slots = cluster_cssd_outbound_slots();
+	if (slots == NULL)
+		return;
+
+	hb.cssd_seq = ++cssd_seq;
+	hb.sender_local_clock = (uint64)GetCurrentTimestamp();
+
+	for (peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
+		uint32 prev_pending;
+		uint32 expected;
+
+		if (peer == cluster_node_id)
+			continue;
+		if (cluster_conf_lookup_node(peer) == NULL)
+			continue;
+
+		/* Step 1: read previous result + update counters / last_send_at. */
+		prev_pending = pg_atomic_read_u32(&slots[peer].pending);
+		if (prev_pending == 0) {
+			ClusterICFanoutResult prev_result
+				= (ClusterICFanoutResult)pg_atomic_read_u32(&slots[peer].result_state);
+			uint64 prev_result_at_us = slots[peer].result_at_us;
+
+			switch (prev_result) {
+			case CLUSTER_IC_FANOUT_DONE:
+				if (prev_result_at_us > 0) {
+					pg_atomic_write_u64(&CssdShmem->peers[peer].last_heartbeat_send_at_us,
+										prev_result_at_us);
+					pg_atomic_add_fetch_u64(&CssdShmem->peers[peer].heartbeat_send_count, 1);
+					pg_atomic_add_fetch_u64(&CssdShmem->total_heartbeat_send_count, 1);
+				}
+				break;
+			case CLUSTER_IC_FANOUT_WOULD_BLOCK:
+			case CLUSTER_IC_FANOUT_HARD_ERROR:
+			case CLUSTER_IC_FANOUT_PEER_DOWN:
+				/* nonfatal;next tick will retry. */
+				break;
+			}
+		} else {
+			/* LMON not yet drained previous tick;skip this peer to
+			 * give backpressure (CSSD self-throttle prevents outbound
+			 * queue starvation per spec-2.5 R11). */
+			continue;
+		}
+
+		/* Step 2: write new request via CAS 0→1→memcpy→2. */
+		expected = 0;
+		if (!pg_atomic_compare_exchange_u32(&slots[peer].pending, &expected, 1))
+			continue; /* race with LMON or self;skip this peer */
+
+		slots[peer].request_seq = ++cssd_request_seq;
+		memcpy(&slots[peer].payload, &hb, sizeof(hb));
+		pg_atomic_write_u32(&slots[peer].pending, 2); /* publish to LMON */
+	}
+}
+
+
+/* ============================================================
+ * Deadband scan (spec-2.5 §3.4).
+ *
+ *   Per CSSD MainLoop tick (after heartbeat broadcast):
+ *     For each declared peer (skip self):
+ *       Skip if now < first_tick_grace_until_us (spec §3.2.1 grace).
+ *       Compute elapsed_ms = (now - last_recv_at) / 1000.
+ *       suspected_threshold = max(2, factor-1) × heartbeat_interval.
+ *       dead_threshold      = factor × heartbeat_interval.
+ *       Transition state per elapsed_ms;ereport LOG / WARNING + bump
+ *       counter on transition;hysteresis ALIVE recovery on recv.
+ * ============================================================ */
+
+static void
+cssd_deadband_scan_tick(void)
+{
+	uint64 now_us;
+	uint64 grace_until;
+	int factor;
+	int interval_ms;
+	int suspected_factor;
+	int suspected_threshold_ms;
+	int dead_threshold_ms;
+	int peer;
+
+	if (CssdShmem == NULL)
+		return;
+
+	now_us = (uint64)GetCurrentTimestamp();
+	LWLockAcquire(&CssdShmem->lwlock, LW_SHARED);
+	grace_until = CssdShmem->first_tick_grace_until_us;
+	LWLockRelease(&CssdShmem->lwlock);
+
+	/* Grace period: skip transitions until grace_until_us elapsed. */
+	if (now_us < grace_until)
+		return;
+
+	factor = cluster_cssd_dead_deadband_factor;
+	interval_ms = cluster_cssd_heartbeat_interval_ms;
+	suspected_factor = (factor - 1 < 2) ? 2 : factor - 1;
+	suspected_threshold_ms = suspected_factor * interval_ms;
+	dead_threshold_ms = factor * interval_ms;
+
+	for (peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
+		uint64 last_recv_us;
+		uint64 elapsed_us;
+		int elapsed_ms;
+		ClusterCssdPeerState old_state, new_state;
+
+		if (peer == cluster_node_id)
+			continue;
+		if (cluster_conf_lookup_node(peer) == NULL)
+			continue;
+
+		last_recv_us = pg_atomic_read_u64(&CssdShmem->peers[peer].last_heartbeat_recv_at_us);
+
+		/* If never received any heartbeat, skip (no baseline to compare). */
+		if (last_recv_us == 0)
+			continue;
+
+		if (now_us <= last_recv_us)
+			continue; /* clock skew defense */
+		elapsed_us = now_us - last_recv_us;
+		elapsed_ms = (int)(elapsed_us / 1000);
+
+		old_state = (ClusterCssdPeerState)pg_atomic_read_u32(&CssdShmem->peers[peer].state);
+		if (elapsed_ms > dead_threshold_ms)
+			new_state = CLUSTER_CSSD_PEER_DEAD;
+		else if (elapsed_ms > suspected_threshold_ms)
+			new_state = CLUSTER_CSSD_PEER_SUSPECTED;
+		else
+			new_state = CLUSTER_CSSD_PEER_ALIVE;
+
+		if (old_state != new_state) {
+			pg_atomic_write_u32(&CssdShmem->peers[peer].state, (uint32)new_state);
+
+			switch (new_state) {
+			case CLUSTER_CSSD_PEER_SUSPECTED:
+				pg_atomic_write_u64(&CssdShmem->peers[peer].suspected_since_us, now_us);
+				pg_atomic_add_fetch_u64(&CssdShmem->peers[peer].suspected_transitions, 1);
+				ereport(LOG, (errcode(ERRCODE_CLUSTER_CSSD_PEER_SUSPECTED),
+							  errmsg("cssd: peer %d transitioned ALIVE → SUSPECTED "
+									 "(elapsed %d ms > %d ms)",
+									 peer, elapsed_ms, suspected_threshold_ms)));
+				break;
+			case CLUSTER_CSSD_PEER_DEAD:
+				pg_atomic_write_u64(&CssdShmem->peers[peer].dead_since_us, now_us);
+				pg_atomic_add_fetch_u64(&CssdShmem->peers[peer].dead_transitions, 1);
+				ereport(WARNING, (errcode(ERRCODE_CLUSTER_CSSD_PEER_DEAD),
+								  errmsg("cssd: peer %d transitioned %s → DEAD "
+										 "(elapsed %d ms > %d ms);NO reconfig in spec-2.5",
+										 peer, cluster_cssd_peer_state_to_string(old_state),
+										 elapsed_ms, dead_threshold_ms)));
+				break;
+			case CLUSTER_CSSD_PEER_ALIVE:
+				/* Hysteresis recovery (peer was SUSPECTED/DEAD;recv brought
+					 * elapsed below threshold).  Clear since-timestamps. */
+				pg_atomic_write_u64(&CssdShmem->peers[peer].suspected_since_us, 0);
+				pg_atomic_write_u64(&CssdShmem->peers[peer].dead_since_us, 0);
+				ereport(LOG, (errmsg("cssd: peer %d recovered %s → ALIVE (heartbeat received)",
+									 peer, cluster_cssd_peer_state_to_string(old_state))));
+				break;
+			}
+		}
+	}
+}
+
+
+/* ============================================================
  * CssdMain.
  *
  *   Step 4 — real lifecycle.  Heartbeat-tick body (write to outbound
@@ -600,8 +793,12 @@ CssdMain(void)
 
 		CLUSTER_INJECTION_POINT("cluster-cssd-main-loop-pre-tick");
 
-		/* Step 6 D11 wires heartbeat broadcast tick (write outbound queue
-		 * + deadband-scan + state machine) here. */
+		/* spec-2.5 §3.2: heartbeat broadcast body — write to outbound
+		 * queue;LMON tick will drain. */
+		cssd_heartbeat_broadcast_tick();
+
+		/* spec-2.5 §3.4: deadband-scan body — transition peer state. */
+		cssd_deadband_scan_tick();
 
 		rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 					   cluster_cssd_main_loop_interval_ms,

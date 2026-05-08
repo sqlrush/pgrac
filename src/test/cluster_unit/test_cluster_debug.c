@@ -686,6 +686,45 @@ cluster_stats_main_loop_iters(void)
 	return 0;
 }
 
+/* Spec-2.5 D12 stubs: cluster_debug.c calls cluster_cssd_* accessors
+ * via dump_cluster_cssd();test stubs return 0 / sentinel. */
+#include "cluster/cluster_cssd.h"
+ClusterCssdStatus
+cluster_cssd_get_status(void)
+{
+	return CLUSTER_CSSD_STARTING;
+}
+const char *
+cluster_cssd_status_to_string(ClusterCssdStatus s pg_attribute_unused())
+{
+	return "(stub)";
+}
+pid_t
+cluster_cssd_get_pid(void)
+{
+	return 0;
+}
+TimestampTz
+cluster_cssd_get_spawned_at(void)
+{
+	return 0;
+}
+TimestampTz
+cluster_cssd_get_ready_at(void)
+{
+	return 0;
+}
+TimestampTz
+cluster_cssd_get_last_liveness_tick_at(void)
+{
+	return 0;
+}
+uint64
+cluster_cssd_get_main_loop_iters(void)
+{
+	return 0;
+}
+
 /* Spec-1.15 SCN encoding-layer stubs (cluster_debug.c references the
  * 7-key dump set; address-only in unit tests). */
 SCN
