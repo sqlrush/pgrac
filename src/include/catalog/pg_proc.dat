@@ -12276,4 +12276,19 @@
   proargnames => '{remote_scn}',
   prosrc => 'cluster_scn_observe_sql' },
 
+# spec-2.5 D15 (2026-05-08) -- pg_cluster_cssd_peers SRF (oid 8916).
+# Returns one row per peer declared in pgrac.conf with current CSSD
+# membership / dead-detection state.  Per spec-2.5 §3.5 boundary
+# invariant the state column is application-level (alive / suspected
+# / dead);DEAD does NOT trigger reconfig in spec-2.5 (spec-2.29
+# separate sub-spec).  9 cols per Q7 ★ B independent view design.
+{ oid => '8916', descr => 'list CSSD peer state + heartbeat counters (spec-2.5)',
+  proname => 'cluster_get_cssd_peers', prorows => '8',
+  proretset => 't', provolatile => 'v', proparallel => 'r',
+  prorettype => 'record', proargtypes => '',
+  proallargtypes => '{int4,text,timestamptz,timestamptz,int8,int8,timestamptz,timestamptz,int8}',
+  proargmodes => '{o,o,o,o,o,o,o,o,o}',
+  proargnames => '{node_id,state,last_heartbeat_send_at,last_heartbeat_recv_at,heartbeat_send_count,heartbeat_recv_count,suspected_since,dead_since,suspected_transitions}',
+  prosrc => 'cluster_get_cssd_peers' },
+
 ]

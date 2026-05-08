@@ -206,6 +206,6 @@
  * (>= 202605220) not equal-bound;see grep audit in spec-2.4 §7
  * DoD.
  */
-#define CATALOG_VERSION_NO 202605220
+#define CATALOG_VERSION_NO 202605230
 
 #endif

@@ -1498,6 +1498,30 @@ CREATE VIEW pg_cluster_ic_peers AS
 REVOKE ALL ON pg_cluster_ic_peers FROM PUBLIC;
 GRANT SELECT ON pg_cluster_ic_peers TO PUBLIC;
 
+-- PGRAC: pg_cluster_cssd_peers (spec-2.5 D15; 2026-05-08).
+--   Lists every peer declared in pgrac.conf with current CSSD
+--   (Cluster Synchronization Service Daemon) membership state +
+--   heartbeat counters.  Per spec-2.5 §3.5 boundary invariant the
+--   state column is APPLICATION-LEVEL (alive / suspected / dead);
+--   DEAD does NOT trigger reconfig (spec-2.29 separate sub-spec).
+--   Two-layer dead detection paired with pg_cluster_ic_peers
+--   socket-level state.  Backed by cluster_get_cssd_peers (OID
+--   8916).  9 cols per Q7 ★ B independent view design.
+CREATE VIEW pg_cluster_cssd_peers AS
+    SELECT node_id,
+           state,
+           last_heartbeat_send_at,
+           last_heartbeat_recv_at,
+           heartbeat_send_count,
+           heartbeat_recv_count,
+           suspected_since,
+           dead_since,
+           suspected_transitions
+      FROM cluster_get_cssd_peers();
+
+REVOKE ALL ON pg_cluster_cssd_peers FROM PUBLIC;
+GRANT SELECT ON pg_cluster_cssd_peers TO PUBLIC;
+
 -- PGRAC: pg_cluster_ic_msg_types (spec-2.3 D8; 2026-05-08).
 --   Lists every IC message type registered in the process-local
 --   dispatch_table[] under cluster_ic_router.c.  Diagnostic /

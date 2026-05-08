@@ -8,3 +8,4 @@ test: undo_tablespace
 test: conf_multi_node_activation
 test: ic_tcp_smoke
 test: ic_envelope_smoke
+test: cssd_smoke

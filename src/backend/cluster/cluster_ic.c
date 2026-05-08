@@ -83,6 +83,13 @@ PG_FUNCTION_INFO_V1(cluster_get_ic_peers);
  */
 PG_FUNCTION_INFO_V1(cluster_get_ic_msg_types);
 
+/*
+ * spec-2.5 D15 -- cluster_get_cssd_peers SRF.  Body lives in
+ * cluster_cssd.c (only compiled in --enable-cluster).  This file
+ * (always-linked) declares the V1 wrapper for both build modes.
+ */
+PG_FUNCTION_INFO_V1(cluster_get_cssd_peers);
+
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -1195,6 +1202,17 @@ cluster_get_ic_msg_types(PG_FUNCTION_ARGS pg_attribute_unused())
 {
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("cluster_get_ic_msg_types requires --enable-cluster")));
+	PG_RETURN_NULL();
+}
+
+/*
+ * spec-2.5 D15 -- cluster_get_cssd_peers disable-cluster stub.
+ */
+Datum
+cluster_get_cssd_peers(PG_FUNCTION_ARGS pg_attribute_unused())
+{
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cluster_get_cssd_peers requires --enable-cluster")));
 	PG_RETURN_NULL();
 }
 #endif

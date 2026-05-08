@@ -81,9 +81,13 @@
 #include "utils/wait_event.h"
 
 #include "cluster/cluster_cssd.h"
+#include "cluster/cluster_conf.h"	/* cluster_conf_lookup_node (SRF row filter) */
 #include "cluster/cluster_guc.h"	/* cluster_node_id + cssd_* GUCs */
 #include "cluster/cluster_inject.h" /* CLUSTER_INJECTION_POINT (spec-2.5 D11) */
 #include "cluster/cluster_shmem.h"	/* cluster_shmem_register_region */
+#include "fmgr.h"
+#include "funcapi.h"
+#include "utils/builtins.h" /* CStringGetTextDatum */
 
 extern pid_t cluster_postmaster_start_cssd(void);
 
@@ -678,6 +682,77 @@ cluster_cssd_request_shutdown(void)
 	LWLockAcquire(&CssdShmem->lwlock, LW_EXCLUSIVE);
 	CssdShmem->shutdown_requested = true;
 	LWLockRelease(&CssdShmem->lwlock);
+}
+
+
+/* ============================================================
+ * cluster_get_cssd_peers SRF (spec-2.5 D15;oid 8916).
+ *
+ *	Returns one row per peer declared in pgrac.conf with current
+ *	CSSD application-level state + heartbeat counters.  9 cols
+ *	per Q7 ★ B independent view design.
+ * ============================================================ */
+
+/* PG_FUNCTION_INFO_V1(cluster_get_cssd_peers) lives in cluster_ic.c
+ * to support disable-cluster build (same dual-link pattern as
+ * cluster_get_ic_peers / cluster_get_ic_msg_types). */
+
+Datum
+cluster_get_cssd_peers(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo;
+	int i;
+
+	InitMaterializedSRF(fcinfo, 0);
+	rsinfo = (ReturnSetInfo *)fcinfo->resultinfo;
+
+	if (CssdShmem == NULL)
+		PG_RETURN_VOID();
+
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		ClusterCssdPeerStateShmem *p = &CssdShmem->peers[i];
+		Datum values[9];
+		bool nulls[9];
+		int col = 0;
+		uint64 ts;
+
+		if (cluster_conf_lookup_node(i) == NULL)
+			continue; /* peer not declared in pgrac.conf */
+
+		memset(nulls, false, sizeof(nulls));
+
+		values[col++] = Int32GetDatum(i);
+		values[col++] = CStringGetTextDatum(
+			cluster_cssd_peer_state_to_string((ClusterCssdPeerState)pg_atomic_read_u32(&p->state)));
+
+#define ADD_TS_ATOMIC(atom_field)                                                                  \
+	do {                                                                                           \
+		ts = pg_atomic_read_u64(&p->atom_field);                                                   \
+		if (ts == 0)                                                                               \
+			nulls[col] = true;                                                                     \
+		else                                                                                       \
+			values[col] = TimestampTzGetDatum((TimestampTz)ts);                                    \
+		col++;                                                                                     \
+	} while (0)
+
+		ADD_TS_ATOMIC(last_heartbeat_send_at_us);
+		ADD_TS_ATOMIC(last_heartbeat_recv_at_us);
+
+		values[col++] = Int64GetDatum((int64)pg_atomic_read_u64(&p->heartbeat_send_count));
+		values[col++] = Int64GetDatum((int64)pg_atomic_read_u64(&p->heartbeat_recv_count));
+
+		ADD_TS_ATOMIC(suspected_since_us);
+		ADD_TS_ATOMIC(dead_since_us);
+
+#undef ADD_TS_ATOMIC
+
+		values[col++] = Int64GetDatum((int64)pg_atomic_read_u64(&p->suspected_transitions));
+
+		Assert(col == 9);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+
+	return (Datum)0;
 }
 
 

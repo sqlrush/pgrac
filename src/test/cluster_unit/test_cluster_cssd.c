@@ -240,6 +240,33 @@ void
 cluster_shmem_register_region(const ClusterShmemRegion *region pg_attribute_unused())
 {}
 
+/* spec-2.5 D15 SRF stubs: cluster_unit doesn't exercise the SRF body
+ * (TAP / cluster_regress covers that);link must resolve. */
+#include "access/tupdesc.h"
+#include "cluster/cluster_conf.h"
+#include "fmgr.h"
+#include "funcapi.h"
+#include "utils/tuplestore.h"
+const ClusterNodeInfo *
+cluster_conf_lookup_node(int32 node_id pg_attribute_unused())
+{
+	return NULL;
+}
+void
+InitMaterializedSRF(FunctionCallInfo fcinfo pg_attribute_unused(),
+					bits32 flags pg_attribute_unused())
+{}
+text *
+cstring_to_text(const char *s pg_attribute_unused())
+{
+	return NULL;
+}
+void
+tuplestore_putvalues(Tuplestorestate *state pg_attribute_unused(),
+					 TupleDesc tdesc pg_attribute_unused(), Datum *values pg_attribute_unused(),
+					 bool *isnull pg_attribute_unused())
+{}
+
 /* spec-2.5 D9 GUC + D11 inject framework stubs.  Tests don't exercise
  * CssdMain runtime so default values + no-op inject are sufficient. */
 int cluster_cssd_main_loop_interval_ms = 1000;
