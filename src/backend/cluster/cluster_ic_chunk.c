@@ -340,11 +340,14 @@ cluster_ic_chunk_scan_reassembly_timeouts(void)
 							peer, elapsed_ms, cluster_interconnect_chunk_reassembly_timeout_ms)));
 			cluster_ic_chunk_reset_peer((int32)peer);
 			/*
-			 * spec-2.4 D8 (already shipped in Step 4):
-			 * cluster_ic_tier1_close_peer's hook calls chunk_reset_peer;
-			 * here we close the peer to force reconnection on timeout.
+			 * spec-2.4 hardening v1.0.1 F3 (L74 cross-aux-process-close-must-
+			 * be-LMON-mediated):use request_close_peer instead of direct
+			 * close_peer.  LMON main tick is the sole owner of fd lifecycle
+			 * + lmon_peer_track sync;non-LMON contexts (here:LMON tick
+			 * scan, but also future CSSD timeout / GES failure path) only
+			 * publish a close request.  Drained by LMON at next tick start.
 			 */
-			cluster_ic_tier1_close_peer((int32)peer, "chunk reassembly timeout");
+			cluster_ic_tier1_request_close_peer((int32)peer, "chunk reassembly timeout");
 		}
 	}
 }

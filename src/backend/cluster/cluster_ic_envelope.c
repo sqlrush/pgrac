@@ -147,79 +147,56 @@ cluster_ic_envelope_build(ClusterICEnvelope *out_env, uint8 msg_type, uint32 sou
 	return true;
 }
 
-bool
+ClusterICEnvelopeVerifyResult
 cluster_ic_envelope_verify(const ClusterICEnvelope *env, const void *payload, uint32 payload_len,
 						   uint32 self_node_id, int32 peer_id)
 {
 	if (env == NULL)
-		return false;
+		return CLUSTER_IC_ENVELOPE_PEER_FAILURE;
 
 	/* Step 1: magic */
 	if (env->magic != PGRAC_IC_ENVELOPE_MAGIC)
-		return false;
+		return CLUSTER_IC_ENVELOPE_PEER_FAILURE;
 
 	/* Step 2: version (anti-mixed-wire defense layer 1, spec-2.3 §3.7) */
 	if (env->version != PGRAC_IC_ENVELOPE_VERSION_V1)
-		return false;
+		return CLUSTER_IC_ENVELOPE_PEER_FAILURE;
 
 	/*
-	 * Step 3: source_node_id sanity.
-	 *
-	 * Reject the broadcast sentinel (broadcast can only appear in
-	 * dest_node_id).  spec-2.3 hardening v1.0.1 F2 (L69
-	 * inbound-identity-binding) adds two further checks: when the
-	 * caller knows the peer fd's HELLO-bound identity (peer_id >= 0),
-	 * env->source_node_id must == peer_id (otherwise the peer is
-	 * faking sender identity);and source_node_id must be a declared
-	 * cluster member (cluster_conf_lookup_node).  Pre-handshake
-	 * contexts pass peer_id = -1 to skip the identity binding while
-	 * still range-scanning ClusterConf.
+	 * Step 3: source_node_id sanity.  spec-2.3 v1.0.1 F2 (L69) +
+	 * peer_id binding + ClusterConf scan.
 	 */
 	if (env->source_node_id == PGRAC_IC_BROADCAST)
-		return false;
+		return CLUSTER_IC_ENVELOPE_PEER_FAILURE;
 	if (peer_id >= 0 && (int32)env->source_node_id != peer_id)
-		return false;
+		return CLUSTER_IC_ENVELOPE_PEER_FAILURE;
 	if (cluster_conf_lookup_node((int32)env->source_node_id) == NULL)
-		return false;
+		return CLUSTER_IC_ENVELOPE_PEER_FAILURE;
 
 	/* Step 4: dest = self OR broadcast */
 	if (env->dest_node_id != self_node_id && env->dest_node_id != PGRAC_IC_BROADCAST)
-		return false;
+		return CLUSTER_IC_ENVELOPE_PEER_FAILURE;
 
-	/*
-	 * Step 5: payload_length sanity (per §3.5b inbound rule) +
-	 * spec-2.3 hardening v1.0.1 F3 (L70 contract-API-NULL-payload):
-	 * envelope claim must match caller-supplied buffer length, and
-	 * non-zero claim with NULL buffer is illegal.
-	 */
+	/* Step 5: payload_length + buf-NULL contract (spec-2.3 v1.0.1 F3 L70). */
 	if (env->payload_length > PGRAC_IC_PAYLOAD_MAX)
-		return false;
+		return CLUSTER_IC_ENVELOPE_PEER_FAILURE;
 	if (env->payload_length != payload_len)
-		return false;
+		return CLUSTER_IC_ENVELOPE_PEER_FAILURE;
 	if (env->payload_length > 0 && payload == NULL)
-		return false;
+		return CLUSTER_IC_ENVELOPE_PEER_FAILURE;
 
-	/*
-	 * Step 6: CRC.  compute_crc only walks env[0..32] + payload, so
-	 * we don't need to zero env->payload_crc32c first.
-	 */
+	/* Step 6: CRC. */
 	if (env->payload_crc32c != cluster_ic_envelope_compute_crc(env, payload))
-		return false;
+		return CLUSTER_IC_ENVELOPE_PEER_FAILURE;
 
 	/*
-	 * Step 7: spec-2.4 D4 -- epoch enforce (Invariant 2 per spec-2.0
-	 * §3.2).  Reject envelopes carrying a stale epoch (typically
-	 * reconfig in-flight pre-thaw frames in spec-2.29 era).
-	 *
-	 * spec-2.4 期 current_epoch always = CLUSTER_EPOCH_INITIAL = 0;
-	 * sender side also reads the same shmem accessor so production
-	 * traffic always passes this check.  fault-inject (cluster_tap
-	 * 082) and post-spec-2.29 reconfig flow are the only paths that
-	 * exercise the reject branch.
-	 *
-	 * Counter bump + LOG describe verify's own decision (this is
-	 * still validation, not state propagation -- safe inside the
-	 * pure verify path per Q2 contract;NO SCN advance here).
+	 * Step 7: spec-2.4 D4 epoch enforce.  Stale epoch = DROP_NO_CLOSE
+	 * (spec-2.4 hardening v1.0.1 F4 / L75 verify-tri-state-return).
+	 * Per spec-2.0 §3.2 Invariant 2 + envelope.c original intent
+	 * "peer NOT closed":pre-reconfig in-flight + replay frames are
+	 * benign for the peer's transport health -- LMON should NOT
+	 * close the peer on stale epoch.  Caller switches on enum to
+	 * distinguish from PEER_FAILURE.
 	 */
 	{
 		uint64 my_epoch = cluster_epoch_get_current();
@@ -234,11 +211,11 @@ cluster_ic_envelope_verify(const ClusterICEnvelope *env, const void *payload, ui
 								 env->source_node_id, env_epoch, my_epoch),
 						  errdetail("spec-2.4 Invariant 2 enforce -- pre-reconfig "
 									"or replay frame;peer NOT closed.")));
-			return false; /* drop -- caller does NOT close peer */
+			return CLUSTER_IC_ENVELOPE_DROP_NO_CLOSE;
 		}
 	}
 
-	return true;
+	return CLUSTER_IC_ENVELOPE_OK;
 }
 
 /*
@@ -294,14 +271,17 @@ cluster_ic_envelope_observe_scn(const ClusterICEnvelope *env, int32 source_node_
  * this wrapper.  Lower-level callers (mock / dry-run / unit-test)
  * call verify() alone to avoid SCN pollution.
  */
-bool
+ClusterICEnvelopeVerifyResult
 cluster_ic_envelope_accept_and_observe(const ClusterICEnvelope *env, const void *payload,
 									   uint32 payload_len, uint32 self_node_id, int32 peer_id)
 {
-	if (!cluster_ic_envelope_verify(env, payload, payload_len, self_node_id, peer_id))
-		return false; /* verify reject -- observe NOT called */
+	ClusterICEnvelopeVerifyResult rc;
+
+	rc = cluster_ic_envelope_verify(env, payload, payload_len, self_node_id, peer_id);
+	if (rc != CLUSTER_IC_ENVELOPE_OK)
+		return rc; /* DROP_NO_CLOSE or PEER_FAILURE -- observe NOT called */
 	cluster_ic_envelope_observe_scn(env, (int32)env->source_node_id);
-	return true;
+	return CLUSTER_IC_ENVELOPE_OK;
 }
 
 #endif /* USE_PGRAC_CLUSTER */

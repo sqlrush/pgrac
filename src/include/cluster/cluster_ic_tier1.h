@@ -86,7 +86,15 @@ typedef struct ClusterICPeerStateShmem {
 	pg_atomic_uint64 lamport_observe_advance_count;	 /* envelope_observe_scn advance */
 	pg_atomic_uint64 chunk_reassembly_timeout_count; /* spec-2.4 D6 timeout cleanup */
 	pg_atomic_uint32 chunk_reassembly_active;		 /* in-flight reassembly seq_next */
-	uint8 _pad[4];									 /* pad to 256B (was 40 - 32 - 4 = 4) */
+	/*
+	 * spec-2.4 hardening v1.0.1 F3 (L74 cross-aux-process-close-must-be-LMON-mediated):
+	 * close_requested = 1 when non-LMON aux context wants to close the peer.
+	 * LMON main tick reads, performs actual close + lmon_peer_track sync,
+	 * then clears.  This makes LMON the sole owner of fd/state machine
+	 * lifecycle even when CSSD / chunk-timeout / future GES wants to
+	 * close.
+	 */
+	pg_atomic_uint32 close_requested; /* 0 = idle, 1 = pending close */
 } ClusterICPeerStateShmem;
 
 /*
@@ -197,6 +205,24 @@ extern void cluster_ic_tier1_bump_stale_epoch_drop(int32 peer_id);
 extern void cluster_ic_tier1_bump_lamport_advance(int32 peer_id);
 extern void cluster_ic_tier1_bump_chunk_reassembly_timeout(int32 peer_id);
 extern void cluster_ic_tier1_set_chunk_reassembly_active(int32 peer_id, uint32 active);
+
+/*
+ * spec-2.4 hardening v1.0.1 F3 (L74): non-LMON callers (chunk timeout,
+ * future CSSD / GES) that want to close a peer go through this API.
+ * Sets close_requested in shmem;LMON main tick observes, performs the
+ * actual close + lmon_peer_track sync, then clears.  reason is logged
+ * immediately by the requester (not stored in shmem).
+ *
+ * Idempotent;repeated requests collapse into one close.
+ */
+extern void cluster_ic_tier1_request_close_peer(int32 peer_id, const char *reason);
+
+/*
+ * spec-2.4 hardening v1.0.1 F3: LMON main tick scans peers for
+ * close_requested = 1, performs actual close + clears flag.  Returns
+ * true if any close was performed (LMON should set wes_dirty).
+ */
+extern bool cluster_ic_tier1_lmon_drain_close_requests(void);
 
 /*
  * Hardening v1.0.1 F1: continue an in-progress HELLO send (active side).

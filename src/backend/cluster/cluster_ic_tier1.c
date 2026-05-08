@@ -417,6 +417,8 @@ tier1_shmem_init(void)
 			pg_atomic_init_u64(&Tier1Shmem->peers[i].lamport_observe_advance_count, 0);
 			pg_atomic_init_u64(&Tier1Shmem->peers[i].chunk_reassembly_timeout_count, 0);
 			pg_atomic_init_u32(&Tier1Shmem->peers[i].chunk_reassembly_active, 0);
+			/* spec-2.4 v1.0.1 F3: LMON-mediated close request flag. */
+			pg_atomic_init_u32(&Tier1Shmem->peers[i].close_requested, 0);
 		}
 	}
 
@@ -624,6 +626,72 @@ cluster_ic_tier1_set_chunk_reassembly_active(int32 peer_id, uint32 active)
 	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES || Tier1Shmem == NULL)
 		return;
 	pg_atomic_write_u32(&Tier1Shmem->peers[peer_id].chunk_reassembly_active, active);
+}
+
+/*
+ * spec-2.4 hardening v1.0.1 F3 (L74 cross-aux-process-close-must-be-LMON-mediated):
+ * non-LMON callers (chunk timeout, future CSSD / GES backend) request a peer
+ * close.  LMON main tick drains the request via cluster_ic_tier1_lmon_drain_close_requests.
+ *
+ * Reason is logged immediately by the requester (not stored in shmem) so we
+ * don't need a per-peer reason buffer.  Idempotent;repeated requests collapse
+ * into one close at LMON tick time.
+ */
+void
+cluster_ic_tier1_request_close_peer(int32 peer_id, const char *reason)
+{
+	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES || Tier1Shmem == NULL)
+		return;
+	ereport(LOG, (errmsg("cluster_ic tier1 close requested for peer %d: %s", peer_id,
+						 reason ? reason : "(no reason)")));
+	pg_atomic_write_u32(&Tier1Shmem->peers[peer_id].close_requested, 1);
+}
+
+/*
+ * spec-2.4 hardening v1.0.1 F3: LMON main tick scans peers for
+ * close_requested = 1, performs the actual close.  Caller (LMON) is
+ * expected to update lmon_peer_track[peer].fd / substate + wes_dirty
+ * for each closed peer based on this function's return value.
+ *
+ * Returns true if any close was performed.
+ *
+ * NOTE:caller MUST be LMON main tick context;this function does NOT
+ * itself update lmon_peer_track (that's caller-specific knowledge).
+ * LMON callers should:
+ *
+ *   if (cluster_ic_tier1_lmon_drain_close_requests()) {
+ *       for (peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
+ *           if (lmon_peer_track[peer].fd != tier1_peer_fds[peer]) {
+ *               lmon_peer_track[peer].fd = -1;
+ *               lmon_peer_track[peer].substate = LMON_SUB_DOWN;
+ *           }
+ *       }
+ *       wes_dirty = true;
+ *   }
+ *
+ * Or alternatively:LMON main loop can re-read tier1_peer_fds[peer]
+ * after each tick and detect fd transitions to -1 to know which
+ * peers were closed.
+ */
+bool
+cluster_ic_tier1_lmon_drain_close_requests(void)
+{
+	int peer;
+	bool any_closed = false;
+
+	if (Tier1Shmem == NULL)
+		return false;
+
+	for (peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
+		uint32 req = pg_atomic_read_u32(&Tier1Shmem->peers[peer].close_requested);
+
+		if (req != 0) {
+			pg_atomic_write_u32(&Tier1Shmem->peers[peer].close_requested, 0);
+			cluster_ic_tier1_close_peer(peer, "LMON-mediated close (deferred)");
+			any_closed = true;
+		}
+	}
+	return any_closed;
 }
 
 static bool
@@ -1518,22 +1586,40 @@ cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd)
 		}
 
 		/*
-			 * spec-2.4 hardening v1.0.1 F1 + F4: accept_and_observe
-			 * passes payload + payload_len (was NULL,0).  F4 will
-			 * upgrade verify return to 三态 enum;step 1 keeps bool.
-			 */
-		if (!cluster_ic_envelope_accept_and_observe(&env, payload, payload_len,
-													(uint32)cluster_node_id, peer_id)) {
-			peer_record_error(peer_id, 0, "08P01",
-							  "envelope verify failed (magic=0x%x version=%u msg_type=%u "
-							  "src=%u dst=%u plen=%u crc=0x%x peer_id=%d)",
-							  env.magic, env.version, env.msg_type, env.source_node_id,
-							  env.dest_node_id, env.payload_length, env.payload_crc32c, peer_id);
-			tier1_recv_buf_len[peer_id] = 0;
-			tier1_recv_phase[peer_id] = 0;
-			tier1_recv_payload_filled[peer_id] = 0;
-			tier1_recv_payload_total[peer_id] = 0;
-			return false;
+		 * spec-2.4 hardening v1.0.1 F4 (L75 verify-tri-state-return):
+		 * accept_and_observe returns enum.  Switch on result:
+		 *   OK              -> dispatch
+		 *   DROP_NO_CLOSE   -> drop frame (LOG already emitted by verify
+		 *                      step 7 for stale epoch);reset state, KEEP
+		 *                      peer connected
+		 *   PEER_FAILURE    -> close peer (peer-level failure)
+		 */
+		{
+			ClusterICEnvelopeVerifyResult vrc = cluster_ic_envelope_accept_and_observe(
+				&env, payload, payload_len, (uint32)cluster_node_id, peer_id);
+
+			if (vrc == CLUSTER_IC_ENVELOPE_DROP_NO_CLOSE) {
+				/* Drop frame, keep peer.  Reset state for next frame. */
+				tier1_recv_buf_len[peer_id] = 0;
+				tier1_recv_phase[peer_id] = 0;
+				tier1_recv_payload_filled[peer_id] = 0;
+				tier1_recv_payload_total[peer_id] = 0;
+				continue; /* loop back to read next frame */
+			}
+			if (vrc == CLUSTER_IC_ENVELOPE_PEER_FAILURE) {
+				peer_record_error(peer_id, 0, "08P01",
+								  "envelope verify hard failure (magic=0x%x version=%u "
+								  "msg_type=%u src=%u dst=%u plen=%u crc=0x%x peer_id=%d)",
+								  env.magic, env.version, env.msg_type, env.source_node_id,
+								  env.dest_node_id, env.payload_length, env.payload_crc32c,
+								  peer_id);
+				tier1_recv_buf_len[peer_id] = 0;
+				tier1_recv_phase[peer_id] = 0;
+				tier1_recv_payload_filled[peer_id] = 0;
+				tier1_recv_payload_total[peer_id] = 0;
+				return false;
+			}
+			/* OK -> fall through to dispatch */
 		}
 
 		/* HEARTBEAT-specific bookkeeping. */

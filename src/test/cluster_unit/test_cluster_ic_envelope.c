@@ -240,7 +240,7 @@ UT_TEST(test_u2_build_verify_roundtrip_heartbeat)
 {
 	ClusterICEnvelope env;
 	bool built;
-	bool verified;
+	ClusterICEnvelopeVerifyResult verified;
 
 	/* HEARTBEAT shape: msg_type=1, no payload */
 	built = cluster_ic_envelope_build(&env, PGRAC_IC_MSG_HEARTBEAT, TEST_PEER_NODE_ID, /* source */
@@ -257,7 +257,7 @@ UT_TEST(test_u2_build_verify_roundtrip_heartbeat)
 	UT_ASSERT_NE((int)env.payload_crc32c, 0);
 
 	verified = cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, -1);
-	UT_ASSERT(verified);
+	UT_ASSERT(verified == CLUSTER_IC_ENVELOPE_OK);
 }
 
 UT_TEST(test_u2_build_verify_roundtrip_with_payload)
@@ -266,7 +266,7 @@ UT_TEST(test_u2_build_verify_roundtrip_with_payload)
 	const char payload[] = "hello pgrac envelope";
 	uint32 paylen = sizeof(payload) - 1; /* exclude NUL */
 	bool built;
-	bool verified;
+	ClusterICEnvelopeVerifyResult verified;
 
 	built = cluster_ic_envelope_build(&env, PGRAC_IC_MSG_SCN_BROADCAST, TEST_PEER_NODE_ID,
 									  TEST_SELF_NODE_ID, payload, paylen);
@@ -275,7 +275,7 @@ UT_TEST(test_u2_build_verify_roundtrip_with_payload)
 	UT_ASSERT_NE((int)env.payload_crc32c, 0);
 
 	verified = cluster_ic_envelope_verify(&env, payload, paylen, TEST_SELF_NODE_ID, -1);
-	UT_ASSERT(verified);
+	UT_ASSERT(verified == CLUSTER_IC_ENVELOPE_OK);
 }
 
 UT_TEST(test_u2b_crc_byte_vector_reference)
@@ -339,7 +339,8 @@ UT_TEST(test_u3a_verify_rejects_bad_magic)
 	ClusterICEnvelope env;
 	build_valid_heartbeat(&env);
 	env.magic = 0xDEAD;
-	UT_ASSERT(!cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, -1));
+	UT_ASSERT(cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, -1)
+			  != CLUSTER_IC_ENVELOPE_OK);
 }
 
 UT_TEST(test_u3b_verify_rejects_bad_version)
@@ -347,7 +348,8 @@ UT_TEST(test_u3b_verify_rejects_bad_version)
 	ClusterICEnvelope env;
 	build_valid_heartbeat(&env);
 	env.version = 99;
-	UT_ASSERT(!cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, -1));
+	UT_ASSERT(cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, -1)
+			  != CLUSTER_IC_ENVELOPE_OK);
 }
 
 UT_TEST(test_u3c_verify_rejects_source_broadcast)
@@ -359,7 +361,8 @@ UT_TEST(test_u3c_verify_rejects_source_broadcast)
 	 * rejection cause.  Confirm we reject BEFORE CRC by checking
 	 * that source-mutation alone is enough -- but verify is a
 	 * single-call so we just check returns false. */
-	UT_ASSERT(!cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, -1));
+	UT_ASSERT(cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, -1)
+			  != CLUSTER_IC_ENVELOPE_OK);
 }
 
 UT_TEST(test_u3d_verify_rejects_dest_mismatch)
@@ -369,7 +372,8 @@ UT_TEST(test_u3d_verify_rejects_dest_mismatch)
 										99, /* dest != TEST_SELF_NODE_ID */
 										NULL, 0);
 	UT_ASSERT(ok);
-	UT_ASSERT(!cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, -1));
+	UT_ASSERT(cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, -1)
+			  != CLUSTER_IC_ENVELOPE_OK);
 }
 
 UT_TEST(test_u3d_verify_accepts_dest_broadcast)
@@ -378,7 +382,8 @@ UT_TEST(test_u3d_verify_accepts_dest_broadcast)
 	bool ok = cluster_ic_envelope_build(&env, PGRAC_IC_MSG_SINVAL, TEST_PEER_NODE_ID,
 										PGRAC_IC_BROADCAST, NULL, 0);
 	UT_ASSERT(ok);
-	UT_ASSERT(cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, -1));
+	UT_ASSERT(cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, -1)
+			  == CLUSTER_IC_ENVELOPE_OK);
 }
 
 UT_TEST(test_u3e_verify_rejects_oversize_payload_length)
@@ -389,7 +394,8 @@ UT_TEST(test_u3e_verify_rejects_oversize_payload_length)
 	 * (so CRC is stale; that doesn't matter -- we want the size
 	 * check itself to fire first per §3.5b inbound rule). */
 	env.payload_length = PGRAC_IC_PAYLOAD_MAX + 1;
-	UT_ASSERT(!cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, -1));
+	UT_ASSERT(cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, -1)
+			  != CLUSTER_IC_ENVELOPE_OK);
 }
 
 UT_TEST(test_u3f_verify_rejects_crc_mismatch)
@@ -401,14 +407,14 @@ UT_TEST(test_u3f_verify_rejects_crc_mismatch)
 	ok = cluster_ic_envelope_build(&env, PGRAC_IC_MSG_HEARTBEAT, TEST_PEER_NODE_ID,
 								   TEST_SELF_NODE_ID, payload, sizeof(payload) - 1);
 	UT_ASSERT(ok);
-	UT_ASSERT(
-		cluster_ic_envelope_verify(&env, payload, sizeof(payload) - 1, TEST_SELF_NODE_ID, -1));
+	UT_ASSERT(cluster_ic_envelope_verify(&env, payload, sizeof(payload) - 1, TEST_SELF_NODE_ID, -1)
+			  == CLUSTER_IC_ENVELOPE_OK);
 
 	/* Mutate one byte of the (would-be) wire CRC -- the recomputed
 	 * CRC over (env-excl-crc + payload) won't match. */
 	env.payload_crc32c ^= 0x01;
-	UT_ASSERT(
-		!cluster_ic_envelope_verify(&env, payload, sizeof(payload) - 1, TEST_SELF_NODE_ID, -1));
+	UT_ASSERT(cluster_ic_envelope_verify(&env, payload, sizeof(payload) - 1, TEST_SELF_NODE_ID, -1)
+			  != CLUSTER_IC_ENVELOPE_OK);
 }
 
 
@@ -496,7 +502,8 @@ UT_TEST(test_u9_unaligned_member_access)
 	UT_ASSERT_EQ((int)env->magic, 0x4943);
 	UT_ASSERT(env->epoch == 0);
 	UT_ASSERT(env->scn == 0);
-	UT_ASSERT(cluster_ic_envelope_verify(env, NULL, 0, TEST_SELF_NODE_ID, -1));
+	UT_ASSERT(cluster_ic_envelope_verify(env, NULL, 0, TEST_SELF_NODE_ID, -1)
+			  == CLUSTER_IC_ENVELOPE_OK);
 }
 
 UT_TEST(test_u9_memcpy_wire_roundtrip)
@@ -524,7 +531,8 @@ UT_TEST(test_u9_memcpy_wire_roundtrip)
 
 	UT_ASSERT_EQ((int)dst.magic, 0x4943);
 	UT_ASSERT_EQ((int)dst.payload_length, 0);
-	UT_ASSERT(cluster_ic_envelope_verify(&dst, NULL, 0, TEST_SELF_NODE_ID, -1));
+	UT_ASSERT(cluster_ic_envelope_verify(&dst, NULL, 0, TEST_SELF_NODE_ID, -1)
+			  == CLUSTER_IC_ENVELOPE_OK);
 
 	/* Last 8 bytes of `wire` must be untouched zeros -- proves
 	 * sizeof envelope is exactly 36, not 40. */
@@ -551,10 +559,12 @@ UT_TEST(test_u20_verify_rejects_source_neq_peer_id)
 
 	/* peer_id = 4 (HELLO-bound to a different identity than source=3).
 	 * F2 must reject -- peer is faking source_node_id. */
-	UT_ASSERT(!cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, 4));
+	UT_ASSERT(cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, 4)
+			  != CLUSTER_IC_ENVELOPE_OK);
 
 	/* peer_id = 3 matches source -- accept. */
-	UT_ASSERT(cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, TEST_PEER_NODE_ID));
+	UT_ASSERT(cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, TEST_PEER_NODE_ID)
+			  == CLUSTER_IC_ENVELOPE_OK);
 }
 
 UT_TEST(test_u20_verify_rejects_undeclared_source)
@@ -570,7 +580,8 @@ UT_TEST(test_u20_verify_rejects_undeclared_source)
 	UT_ASSERT(ok); /* build itself doesn't enforce membership */
 
 	/* peer_id = -1 skips identity binding;range scan still applies. */
-	UT_ASSERT(!cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, -1));
+	UT_ASSERT(cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, -1)
+			  != CLUSTER_IC_ENVELOPE_OK);
 }
 
 UT_TEST(test_u20_verify_skip_binding_when_peer_id_negative)
@@ -584,7 +595,8 @@ UT_TEST(test_u20_verify_skip_binding_when_peer_id_negative)
 	/* peer_id = -1 means caller has no fd-bound identity (pre-handshake
 	 * / unit-test).  binding skipped;ClusterConf scan succeeds because
 	 * source = 3 is in range. */
-	UT_ASSERT(cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, -1));
+	UT_ASSERT(cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, -1)
+			  == CLUSTER_IC_ENVELOPE_OK);
 }
 
 
@@ -615,7 +627,8 @@ UT_TEST(test_u21_verify_rejects_payload_null_with_length)
 	UT_ASSERT(ok);
 
 	/* envelope claims payload but caller passes NULL buffer = reject. */
-	UT_ASSERT(!cluster_ic_envelope_verify(&env, NULL, paylen, TEST_SELF_NODE_ID, -1));
+	UT_ASSERT(cluster_ic_envelope_verify(&env, NULL, paylen, TEST_SELF_NODE_ID, -1)
+			  != CLUSTER_IC_ENVELOPE_OK);
 }
 
 UT_TEST(test_u21_verify_rejects_payload_len_mismatch)
@@ -628,11 +641,14 @@ UT_TEST(test_u21_verify_rejects_payload_len_mismatch)
 	UT_ASSERT(ok);
 
 	/* Caller-supplied length differs from envelope claim = reject. */
-	UT_ASSERT(!cluster_ic_envelope_verify(&env, payload, paylen + 5, TEST_SELF_NODE_ID, -1));
-	UT_ASSERT(!cluster_ic_envelope_verify(&env, payload, paylen - 1, TEST_SELF_NODE_ID, -1));
+	UT_ASSERT(cluster_ic_envelope_verify(&env, payload, paylen + 5, TEST_SELF_NODE_ID, -1)
+			  != CLUSTER_IC_ENVELOPE_OK);
+	UT_ASSERT(cluster_ic_envelope_verify(&env, payload, paylen - 1, TEST_SELF_NODE_ID, -1)
+			  != CLUSTER_IC_ENVELOPE_OK);
 
 	/* Matching length = accept. */
-	UT_ASSERT(cluster_ic_envelope_verify(&env, payload, paylen, TEST_SELF_NODE_ID, -1));
+	UT_ASSERT(cluster_ic_envelope_verify(&env, payload, paylen, TEST_SELF_NODE_ID, -1)
+			  == CLUSTER_IC_ENVELOPE_OK);
 }
 
 
@@ -654,12 +670,14 @@ UT_TEST(test_u10_verify_rejects_stale_epoch)
 
 	/* Same current_epoch -> verify accepts. */
 	test_bump_stale_epoch_count = 0;
-	UT_ASSERT(cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, -1));
+	UT_ASSERT(cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, -1)
+			  == CLUSTER_IC_ENVELOPE_OK);
 	UT_ASSERT_EQ(test_bump_stale_epoch_count, 0);
 
 	/* Mutate test current_epoch to 6 -> stale frame -> reject + counter bump. */
 	test_current_epoch = 6;
-	UT_ASSERT(!cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, -1));
+	UT_ASSERT(cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, -1)
+			  != CLUSTER_IC_ENVELOPE_OK);
 	UT_ASSERT_EQ(test_bump_stale_epoch_count, 1);
 
 	test_current_epoch = 0;
@@ -682,7 +700,8 @@ UT_TEST(test_u11_verify_does_not_observe_scn)
 
 	test_observe_call_count = 0;
 	test_bump_lamport_advance_count = 0;
-	UT_ASSERT(cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, -1));
+	UT_ASSERT(cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, -1)
+			  == CLUSTER_IC_ENVELOPE_OK);
 	UT_ASSERT_EQ(test_observe_call_count, 0);
 	UT_ASSERT_EQ(test_bump_lamport_advance_count, 0);
 
@@ -734,15 +753,18 @@ UT_TEST(test_u13_accept_and_observe_wraps_correctly)
 
 	/* accept_and_observe: verify pass -> observe runs */
 	test_observe_call_count = 0;
-	UT_ASSERT(cluster_ic_envelope_accept_and_observe(&env, NULL, 0, TEST_SELF_NODE_ID,
-													 TEST_PEER_NODE_ID));
+	UT_ASSERT(
+		cluster_ic_envelope_accept_and_observe(&env, NULL, 0, TEST_SELF_NODE_ID, TEST_PEER_NODE_ID)
+		== CLUSTER_IC_ENVELOPE_OK);
 	UT_ASSERT_EQ(test_observe_call_count, 1);
 
-	/* accept_and_observe: verify reject (stale epoch) -> observe NOT called */
+	/* accept_and_observe: verify reject (stale epoch) -> observe NOT called.
+	 * Stale epoch returns DROP_NO_CLOSE per spec-2.4 v1.0.1 F4. */
 	test_current_epoch = 99;
 	test_observe_call_count = 0;
-	UT_ASSERT(!cluster_ic_envelope_accept_and_observe(&env, NULL, 0, TEST_SELF_NODE_ID,
-													  TEST_PEER_NODE_ID));
+	UT_ASSERT(
+		cluster_ic_envelope_accept_and_observe(&env, NULL, 0, TEST_SELF_NODE_ID, TEST_PEER_NODE_ID)
+		== CLUSTER_IC_ENVELOPE_DROP_NO_CLOSE);
 	UT_ASSERT_EQ(test_observe_call_count, 0);
 
 	test_current_epoch = 0;

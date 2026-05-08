@@ -270,8 +270,29 @@ extern bool cluster_ic_envelope_build(ClusterICEnvelope *out_env, uint8 msg_type
  *   peer-level failure (close peer + LOG/WARNING + metric);
  *   NEVER ereport ERROR LMON.
  */
-extern bool cluster_ic_envelope_verify(const ClusterICEnvelope *env, const void *payload,
-									   uint32 payload_len, uint32 self_node_id, int32 peer_id);
+/*
+ * spec-2.4 hardening v1.0.1 F4 (L75 verify-tri-state-return):
+ * verify reject has two distinct semantics that need different
+ * caller actions:
+ *   - DROP_NO_CLOSE: stale epoch (peer is alive, just sending pre-
+ *     reconfig in-flight frames or replay).  LOG + counter + drop
+ *     frame; KEEP peer connected.
+ *   - PEER_FAILURE:  bad magic/version/source/dest/CRC/payload contract.
+ *     Peer is hostile or wire-corrupt.  Caller MUST close peer.
+ * Single bool return mixed these together → tier1 caller treated
+ * stale epoch as peer failure → close peer (semantic mismatch with
+ * envelope.c's "peer NOT closed" intent).  Three-state fixes.
+ */
+typedef enum ClusterICEnvelopeVerifyResult {
+	CLUSTER_IC_ENVELOPE_OK = 0,		   /* dispatch */
+	CLUSTER_IC_ENVELOPE_DROP_NO_CLOSE, /* stale epoch only;peer NOT closed */
+	CLUSTER_IC_ENVELOPE_PEER_FAILURE,  /* hard verify fail;close peer */
+} ClusterICEnvelopeVerifyResult;
+
+extern ClusterICEnvelopeVerifyResult cluster_ic_envelope_verify(const ClusterICEnvelope *env,
+																const void *payload,
+																uint32 payload_len,
+																uint32 self_node_id, int32 peer_id);
 
 /*
  * spec-2.4 §2.7 Q2 修订 -- stateful Lamport SCN observe API.
@@ -293,9 +314,16 @@ extern bool cluster_ic_envelope_verify(const ClusterICEnvelope *env, const void 
  *     / unit-test paths call bare verify() to avoid SCN pollution.
  */
 extern bool cluster_ic_envelope_observe_scn(const ClusterICEnvelope *env, int32 source_node_id);
-extern bool cluster_ic_envelope_accept_and_observe(const ClusterICEnvelope *env,
-												   const void *payload, uint32 payload_len,
-												   uint32 self_node_id, int32 peer_id);
+
+/*
+ * spec-2.4 hardening v1.0.1 F4: tri-state return.  Caller switches:
+ *   OK              -> dispatch
+ *   DROP_NO_CLOSE   -> drop frame, keep peer connected
+ *   PEER_FAILURE    -> close peer
+ */
+extern ClusterICEnvelopeVerifyResult
+cluster_ic_envelope_accept_and_observe(const ClusterICEnvelope *env, const void *payload,
+									   uint32 payload_len, uint32 self_node_id, int32 peer_id);
 
 /*
  * cluster_ic_envelope_compute_crc -- compute CRC32C over envelope-

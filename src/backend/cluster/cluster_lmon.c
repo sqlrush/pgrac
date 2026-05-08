@@ -800,6 +800,26 @@ LmonMain(void)
 			 */
 			cluster_ic_chunk_scan_reassembly_timeouts();
 
+			/*
+			 * spec-2.4 hardening v1.0.1 F3 (L74 cross-aux-process-close-must-
+			 * be-LMON-mediated):drain pending close requests from non-LMON
+			 * contexts (chunk timeout above + future CSSD timeout / GES
+			 * failure).  After drain, sync lmon_peer_track for any peer whose
+			 * fd was just closed -- detected by tier1_peer_fds[peer] being -1
+			 * while lmon_peer_track[peer].fd was still set.
+			 */
+			if (cluster_ic_tier1_lmon_drain_close_requests()) {
+				int dpi;
+
+				for (dpi = 0; dpi < CLUSTER_MAX_NODES; dpi++) {
+					if (lmon_peer_track[dpi].fd >= 0 && cluster_ic_tier1_get_peer_fd(dpi) < 0) {
+						lmon_peer_track[dpi].fd = -1;
+						lmon_peer_track[dpi].substate = LMON_SUB_DOWN;
+						wes_dirty = true;
+					}
+				}
+			}
+
 			/* (Re)build WaitEventSet whenever per-peer fd set changes. */
 			if (wes_dirty) {
 				if (wes != NULL) {
