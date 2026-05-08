@@ -274,6 +274,30 @@ extern bool cluster_ic_envelope_verify(const ClusterICEnvelope *env, const void 
 									   uint32 payload_len, uint32 self_node_id, int32 peer_id);
 
 /*
+ * spec-2.4 §2.7 Q2 修订 -- stateful Lamport SCN observe API.
+ *
+ *   cluster_ic_envelope_observe_scn -- advance local SCN per L21
+ *     `>=` boundary using env->scn.  CONTRACT: caller MUST call
+ *     verify() and receive true return BEFORE calling this.
+ *     Calling on a not-yet-verified envelope is a contract violation
+ *     (forged / spoofed / stale frames could spoof SCN advance).
+ *
+ *     Returns true iff local SCN actually advanced;false on no-op
+ *     (env.scn == 0 or <= current_scn).  Bumps per-peer
+ *     lamport_observe_advance_count metric on advance.
+ *
+ *   cluster_ic_envelope_accept_and_observe -- LMON-facing wrapper.
+ *     Calls verify() then (if pass) observe_scn().  Returns true
+ *     iff verify passed.  Production callers (tier1 recv heartbeat
+ *     drain + spec-2.4 chunked dispatch) use this;mock / dry-run
+ *     / unit-test paths call bare verify() to avoid SCN pollution.
+ */
+extern bool cluster_ic_envelope_observe_scn(const ClusterICEnvelope *env, int32 source_node_id);
+extern bool cluster_ic_envelope_accept_and_observe(const ClusterICEnvelope *env,
+												   const void *payload, uint32 payload_len,
+												   uint32 self_node_id, int32 peer_id);
+
+/*
  * cluster_ic_envelope_compute_crc -- compute CRC32C over envelope-
  *   excluding-crc + payload.  Coverage is exactly env[0..32] (the
  *   bytes preceding payload_crc32c at offset 32) followed by

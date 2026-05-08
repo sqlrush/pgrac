@@ -46,6 +46,7 @@
 
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_ic_envelope.h"
+#include "cluster/cluster_scn.h" /* SCN typedef + stubbed observe/current */
 
 /*
  * postgres.h transitively pulls in port.h which redirects printf etc.
@@ -101,6 +102,78 @@ cluster_conf_lookup_node(int32 node_id)
 	if (node_id < 0 || node_id >= CLUSTER_MAX_NODES)
 		return NULL;
 	return &test_dummy_node_info;
+}
+
+/*
+ * spec-2.4 D4 + D10 stubs.  envelope_verify / build / observe_scn
+ * call into cluster_epoch / cluster_scn / cluster_ic_tier1.
+ * Provide controllable test stubs so U10-U13 can exercise the
+ * step-7 epoch enforce + observe paths in isolation.
+ */
+static uint64 test_current_epoch = 0;
+uint64
+cluster_epoch_get_current(void)
+{
+	return test_current_epoch;
+}
+
+static SCN test_current_scn = 0;
+static int test_observe_call_count = 0;
+SCN
+cluster_scn_current(void)
+{
+	return test_current_scn;
+}
+void
+cluster_scn_observe(SCN remote)
+{
+	test_observe_call_count++;
+	if (remote > test_current_scn)
+		test_current_scn = remote;
+}
+
+static int test_bump_stale_epoch_count = 0;
+static int test_bump_lamport_advance_count = 0;
+void
+cluster_ic_tier1_bump_stale_epoch_drop(int32 peer_id pg_attribute_unused())
+{
+	test_bump_stale_epoch_count++;
+}
+void
+cluster_ic_tier1_bump_lamport_advance(int32 peer_id pg_attribute_unused())
+{
+	test_bump_lamport_advance_count++;
+}
+
+/*
+ * ereport family stubs.  envelope_verify step-7 epoch enforce uses
+ * ereport(LOG, ...) on reject -- we want it to NOT abort but also
+ * not require a real backend.  Minimal stub:errstart returns true
+ * (so errmsg etc. run);errfinish is a no-op.
+ */
+bool
+errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+{
+	return true;
+}
+void
+errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
+		  const char *funcname pg_attribute_unused())
+{}
+int
+errcode(int sqlerrcode pg_attribute_unused())
+{
+	return 0;
+}
+int
+errmsg(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+int
+errdetail(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
 }
 
 
@@ -340,36 +413,31 @@ UT_TEST(test_u3f_verify_rejects_crc_mismatch)
 
 
 /* ============================================================
- * U4: epoch / SCN field write+read but verify pass (spec-2.3
- *     §3.2 + Q12 field-but-no-enforce).
+ * U4: epoch field at build (spec-2.4 D4: build now stamps current
+ *     epoch and SCN -- the spec-2.3 field-but-no-enforce contract
+ *     is replaced by the spec-2.4 enforce contract;see U10/U11
+ *     below for reject path).
  * ============================================================ */
 
-UT_TEST(test_u4_epoch_scn_field_but_no_enforce)
+UT_TEST(test_u4_build_stamps_current_epoch_and_scn)
 {
 	ClusterICEnvelope env;
-	bool ok = cluster_ic_envelope_build(&env, PGRAC_IC_MSG_HEARTBEAT, TEST_PEER_NODE_ID,
-										TEST_SELF_NODE_ID, NULL, 0);
+	bool ok;
+
+	/* test stub current_epoch + current_scn -- build path stamps
+	 * these into the envelope (spec-2.4 was 0/0 in spec-2.3). */
+	test_current_epoch = 7;
+	test_current_scn = (SCN)0x1122334455667788ULL;
+	ok = cluster_ic_envelope_build(&env, PGRAC_IC_MSG_HEARTBEAT, TEST_PEER_NODE_ID,
+								   TEST_SELF_NODE_ID, NULL, 0);
 	UT_ASSERT(ok);
 
-	/* spec-2.3 Q12: build writes 0 for both. */
-	UT_ASSERT_EQ((int)env.epoch, 0);
-	UT_ASSERT_EQ((int)env.scn, 0);
+	UT_ASSERT(env.epoch == 7);
+	UT_ASSERT(env.scn == 0x1122334455667788ULL);
 
-	/*
-	 * Mutate epoch + SCN to non-zero values + recompute CRC; verify
-	 * MUST still pass.  This locks the "field-but-no-enforce" contract
-	 * for spec-2.3.  When spec-2.4 / 2.10 flip enforce flags, this
-	 * test will need updating to assert reject on mismatch -- which
-	 * is exactly the spec drift signal we want.
-	 */
-	env.epoch = 0x123456789ABCDEFULL;
-	env.scn = 0xFEDCBA9876543210ULL;
-	env.payload_crc32c = cluster_ic_envelope_compute_crc(&env, NULL);
-	UT_ASSERT(cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, -1));
-
-	/* Read-back reflects mutated values. */
-	UT_ASSERT(env.epoch == 0x123456789ABCDEFULL);
-	UT_ASSERT(env.scn == 0xFEDCBA9876543210ULL);
+	/* Reset stubs back so subsequent tests start clean. */
+	test_current_epoch = 0;
+	test_current_scn = 0;
 }
 
 
@@ -568,10 +636,124 @@ UT_TEST(test_u21_verify_rejects_payload_len_mismatch)
 }
 
 
+/* ============================================================
+ * U10-U13 spec-2.4 D4 + §2.7 Q2 修订:
+ *   epoch enforce step 7 + Lamport observe split API.
+ * ============================================================ */
+
+UT_TEST(test_u10_verify_rejects_stale_epoch)
+{
+	ClusterICEnvelope env;
+	bool ok;
+
+	test_current_epoch = 5;
+	ok = cluster_ic_envelope_build(&env, PGRAC_IC_MSG_HEARTBEAT, TEST_PEER_NODE_ID,
+								   TEST_SELF_NODE_ID, NULL, 0);
+	UT_ASSERT(ok);
+	UT_ASSERT_EQ((int)env.epoch, 5);
+
+	/* Same current_epoch -> verify accepts. */
+	test_bump_stale_epoch_count = 0;
+	UT_ASSERT(cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, -1));
+	UT_ASSERT_EQ(test_bump_stale_epoch_count, 0);
+
+	/* Mutate test current_epoch to 6 -> stale frame -> reject + counter bump. */
+	test_current_epoch = 6;
+	UT_ASSERT(!cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, -1));
+	UT_ASSERT_EQ(test_bump_stale_epoch_count, 1);
+
+	test_current_epoch = 0;
+}
+
+UT_TEST(test_u11_verify_does_not_observe_scn)
+{
+	ClusterICEnvelope env;
+	bool ok;
+
+	/* verify is a PURE PREDICATE per §2.7 -- it MUST NOT call
+	 * cluster_scn_observe even on accept.  This test proves the
+	 * spec-2.3 -> spec-2.4 migration kept observe out of verify
+	 * (Q2 stateful split contract). */
+	test_current_epoch = 0;
+	test_current_scn = 100;
+	ok = cluster_ic_envelope_build(&env, PGRAC_IC_MSG_HEARTBEAT, TEST_PEER_NODE_ID,
+								   TEST_SELF_NODE_ID, NULL, 0);
+	UT_ASSERT(ok);
+
+	test_observe_call_count = 0;
+	test_bump_lamport_advance_count = 0;
+	UT_ASSERT(cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, -1));
+	UT_ASSERT_EQ(test_observe_call_count, 0);
+	UT_ASSERT_EQ(test_bump_lamport_advance_count, 0);
+
+	test_current_scn = 0;
+}
+
+UT_TEST(test_u12_observe_scn_advances_then_bumps)
+{
+	ClusterICEnvelope env;
+	bool ok;
+	bool advanced;
+
+	test_current_scn = 50;
+	ok = cluster_ic_envelope_build(&env, PGRAC_IC_MSG_HEARTBEAT, TEST_PEER_NODE_ID,
+								   TEST_SELF_NODE_ID, NULL, 0);
+	UT_ASSERT(ok);
+	UT_ASSERT((SCN)env.scn == 50);
+
+	/* Local SCN at 50 already, env.scn=50 -> no advance. */
+	test_observe_call_count = 0;
+	test_bump_lamport_advance_count = 0;
+	advanced = cluster_ic_envelope_observe_scn(&env, TEST_PEER_NODE_ID);
+	UT_ASSERT(!advanced);
+	UT_ASSERT_EQ(test_observe_call_count, 1);
+	UT_ASSERT_EQ(test_bump_lamport_advance_count, 0);
+
+	/* Build a fresh envelope with env.scn=200 while local is 50. */
+	test_current_scn = 50;
+	env.scn = 200;
+	env.payload_crc32c = cluster_ic_envelope_compute_crc(&env, NULL);
+	advanced = cluster_ic_envelope_observe_scn(&env, TEST_PEER_NODE_ID);
+	UT_ASSERT(advanced);
+	UT_ASSERT_EQ(test_bump_lamport_advance_count, 1);
+
+	test_current_scn = 0;
+}
+
+UT_TEST(test_u13_accept_and_observe_wraps_correctly)
+{
+	ClusterICEnvelope env;
+	bool ok;
+
+	test_current_epoch = 3;
+	test_current_scn = 100;
+	ok = cluster_ic_envelope_build(&env, PGRAC_IC_MSG_HEARTBEAT, TEST_PEER_NODE_ID,
+								   TEST_SELF_NODE_ID, NULL, 0);
+	UT_ASSERT(ok);
+	UT_ASSERT_EQ((int)env.epoch, 3);
+
+	/* accept_and_observe: verify pass -> observe runs */
+	test_observe_call_count = 0;
+	UT_ASSERT(cluster_ic_envelope_accept_and_observe(&env, NULL, 0, TEST_SELF_NODE_ID,
+													 TEST_PEER_NODE_ID));
+	UT_ASSERT_EQ(test_observe_call_count, 1);
+
+	/* accept_and_observe: verify reject (stale epoch) -> observe NOT called */
+	test_current_epoch = 99;
+	test_observe_call_count = 0;
+	UT_ASSERT(!cluster_ic_envelope_accept_and_observe(&env, NULL, 0, TEST_SELF_NODE_ID,
+													  TEST_PEER_NODE_ID));
+	UT_ASSERT_EQ(test_observe_call_count, 0);
+
+	test_current_epoch = 0;
+	test_current_scn = 0;
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(28);
+	UT_PLAN(32);
 
 	/* U1 ABI lock (8 sub-tests) */
 	UT_RUN(test_u1_abi_sizeof_36);
@@ -598,7 +780,7 @@ main(void)
 	UT_RUN(test_u3f_verify_rejects_crc_mismatch);
 
 	/* U4 epoch/SCN field-but-no-enforce */
-	UT_RUN(test_u4_epoch_scn_field_but_no_enforce);
+	UT_RUN(test_u4_build_stamps_current_epoch_and_scn);
 
 	/* U5 CRC coverage on empty payload */
 	UT_RUN(test_u5_crc_nonzero_for_empty_payload);
@@ -614,6 +796,12 @@ main(void)
 	UT_RUN(test_u21_build_rejects_payload_null_with_length);
 	UT_RUN(test_u21_verify_rejects_payload_null_with_length);
 	UT_RUN(test_u21_verify_rejects_payload_len_mismatch);
+
+	/* U10-U13 spec-2.4 D4 + Q2 修订 epoch enforce + observe split */
+	UT_RUN(test_u10_verify_rejects_stale_epoch);
+	UT_RUN(test_u11_verify_does_not_observe_scn);
+	UT_RUN(test_u12_observe_scn_advances_then_bumps);
+	UT_RUN(test_u13_accept_and_observe_wraps_correctly);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

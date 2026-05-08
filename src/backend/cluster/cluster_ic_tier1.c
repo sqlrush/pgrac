@@ -338,6 +338,11 @@ tier1_shmem_init(void)
 			pg_atomic_init_u64(&Tier1Shmem->peers[i].msg_recv_count, 0);
 			pg_atomic_init_u64(&Tier1Shmem->peers[i].bytes_send, 0);
 			pg_atomic_init_u64(&Tier1Shmem->peers[i].bytes_recv, 0);
+			/* spec-2.4 D10 NEW counters */
+			pg_atomic_init_u64(&Tier1Shmem->peers[i].stale_epoch_drop_count, 0);
+			pg_atomic_init_u64(&Tier1Shmem->peers[i].lamport_observe_advance_count, 0);
+			pg_atomic_init_u64(&Tier1Shmem->peers[i].chunk_reassembly_timeout_count, 0);
+			pg_atomic_init_u32(&Tier1Shmem->peers[i].chunk_reassembly_active, 0);
 		}
 	}
 
@@ -493,6 +498,43 @@ cluster_ic_tier1_pending_outbound(int32 peer_id)
 	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
 		return false;
 	return tier1_outbound_remaining[peer_id] > 0;
+}
+
+/* ============================================================
+ * spec-2.4 D10 per-peer counter bumpers.
+ * Range-checked;noop on out-of-range or shmem-not-initialized.
+ * ============================================================ */
+
+void
+cluster_ic_tier1_bump_stale_epoch_drop(int32 peer_id)
+{
+	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES || Tier1Shmem == NULL)
+		return;
+	pg_atomic_add_fetch_u64(&Tier1Shmem->peers[peer_id].stale_epoch_drop_count, 1);
+}
+
+void
+cluster_ic_tier1_bump_lamport_advance(int32 peer_id)
+{
+	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES || Tier1Shmem == NULL)
+		return;
+	pg_atomic_add_fetch_u64(&Tier1Shmem->peers[peer_id].lamport_observe_advance_count, 1);
+}
+
+void
+cluster_ic_tier1_bump_chunk_reassembly_timeout(int32 peer_id)
+{
+	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES || Tier1Shmem == NULL)
+		return;
+	pg_atomic_add_fetch_u64(&Tier1Shmem->peers[peer_id].chunk_reassembly_timeout_count, 1);
+}
+
+void
+cluster_ic_tier1_set_chunk_reassembly_active(int32 peer_id, uint32 active)
+{
+	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES || Tier1Shmem == NULL)
+		return;
+	pg_atomic_write_u32(&Tier1Shmem->peers[peer_id].chunk_reassembly_active, active);
 }
 
 static bool
@@ -1295,7 +1337,15 @@ cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd)
 			 *     framing will read payload bytes BEFORE verify and pass
 			 *     the actual length here.
 			 */
-			if (!cluster_ic_envelope_verify(&env, NULL, 0, (uint32)cluster_node_id, peer_id)) {
+			/*
+			 * spec-2.4 D4 + Q2 修订: accept_and_observe wrapper
+			 * does verify -> (on pass) observe_scn -- forged / stale
+			 * frames cannot spoof local SCN advance.  spec-2.3 used
+			 * bare verify();spec-2.4 swaps to wrapper for production
+			 * recv path.
+			 */
+			if (!cluster_ic_envelope_accept_and_observe(&env, NULL, 0, (uint32)cluster_node_id,
+														peer_id)) {
 				peer_record_error(peer_id, 0, "08P01",
 								  "envelope verify failed (magic=0x%x version=%u msg_type=%u "
 								  "src=%u dst=%u plen=%u crc=0x%x peer_id=%d)",

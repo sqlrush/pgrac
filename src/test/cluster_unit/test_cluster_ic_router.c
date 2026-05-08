@@ -211,6 +211,33 @@ cluster_conf_lookup_node(int32 node_id)
 	return &test_dummy_node_info;
 }
 
+/*
+ * spec-2.4 D4 + D10 stubs.  Router tests link envelope.o which
+ * references cluster_epoch_get_current / cluster_scn_* / tier1
+ * counter bumpers.  Router tests do NOT invoke envelope_verify
+ * directly, but link must resolve.
+ */
+#include "cluster/cluster_scn.h"
+uint64
+cluster_epoch_get_current(void)
+{
+	return 0;
+}
+SCN
+cluster_scn_current(void)
+{
+	return 0;
+}
+void
+cluster_scn_observe(SCN remote pg_attribute_unused())
+{}
+void
+cluster_ic_tier1_bump_stale_epoch_drop(int32 peer_id pg_attribute_unused())
+{}
+void
+cluster_ic_tier1_bump_lamport_advance(int32 peer_id pg_attribute_unused())
+{}
+
 /* MyBackendType -- writable from tests to flip producer scope */
 extern BackendType MyBackendType;
 BackendType MyBackendType = B_INVALID;

@@ -81,7 +81,12 @@ typedef struct ClusterICPeerStateShmem {
 	int32 last_errno;
 	char last_error_code[8]; /* SQLSTATE + NUL */
 	char last_error[CLUSTER_IC_TIER1_LAST_ERROR_LEN];
-	uint8 _pad[40]; /* pad to 256B */
+	/* spec-2.4 D10: 4 NEW per-peer atomic counters */
+	pg_atomic_uint64 stale_epoch_drop_count;		 /* envelope verify step 7 reject */
+	pg_atomic_uint64 lamport_observe_advance_count;	 /* envelope_observe_scn advance */
+	pg_atomic_uint64 chunk_reassembly_timeout_count; /* spec-2.4 D6 timeout cleanup */
+	pg_atomic_uint32 chunk_reassembly_active;		 /* in-flight reassembly seq_next */
+	uint8 _pad[4];									 /* pad to 256B (was 40 - 32 - 4 = 4) */
 } ClusterICPeerStateShmem;
 
 /*
@@ -179,6 +184,19 @@ extern ClusterICSendResult cluster_ic_tier1_send_heartbeat(int32 peer_id);
  * to register WRITEABLE interest in its WaitEventSet.
  */
 extern bool cluster_ic_tier1_pending_outbound(int32 peer_id);
+
+/*
+ * spec-2.4 D10 per-peer counter bumpers.  Used by envelope_verify
+ * (stale_epoch_drop), envelope_observe_scn (lamport_advance), and
+ * cluster_ic_chunk reassembly state machine (timeout / active).
+ *
+ * Range-checked internally;peer_id out of [0, CLUSTER_MAX_NODES) is
+ * a no-op (defensive when called pre-handshake or in unit-test).
+ */
+extern void cluster_ic_tier1_bump_stale_epoch_drop(int32 peer_id);
+extern void cluster_ic_tier1_bump_lamport_advance(int32 peer_id);
+extern void cluster_ic_tier1_bump_chunk_reassembly_timeout(int32 peer_id);
+extern void cluster_ic_tier1_set_chunk_reassembly_active(int32 peer_id, uint32 active);
 
 /*
  * Hardening v1.0.1 F1: continue an in-progress HELLO send (active side).

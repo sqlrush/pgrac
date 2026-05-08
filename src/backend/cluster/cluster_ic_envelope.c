@@ -45,8 +45,11 @@
 
 #include "port/pg_crc32c.h"
 
-#include "cluster/cluster_conf.h" /* cluster_conf_lookup_node (F2 L69) */
+#include "cluster/cluster_conf.h"  /* cluster_conf_lookup_node (F2 L69) */
+#include "cluster/cluster_epoch.h" /* cluster_epoch_get_current (spec-2.4 D1) */
 #include "cluster/cluster_ic_envelope.h"
+#include "cluster/cluster_ic_tier1.h" /* peer_stats counters (spec-2.4 D10) */
+#include "cluster/cluster_scn.h"	  /* cluster_scn_observe / current (spec-2.4 D4) */
 
 
 /* ============================================================
@@ -120,8 +123,15 @@ cluster_ic_envelope_build(ClusterICEnvelope *out_env, uint8 msg_type, uint32 sou
 	out_env->msg_type = msg_type;
 	out_env->source_node_id = source_node_id;
 	out_env->dest_node_id = dest_node_id;
-	out_env->epoch = 0; /* spec-2.3 Q12; spec-2.4 翻 enforce */
-	out_env->scn = 0;	/* spec-2.3 Q12; spec-2.10 接 piggyback */
+	/*
+	 * spec-2.4 D4: build now stamps current local epoch + SCN snapshot
+	 * (was 0 / 0 in spec-2.3 Q12).  spec-2.4 期 epoch always 0 (spec-
+	 * 2.29 reconfig is the first bump);scn is whatever cluster_scn
+	 * currently shows -- spec-2.10 walwriter真激活 makes this advance
+	 * meaningfully.
+	 */
+	out_env->epoch = cluster_epoch_get_current();
+	out_env->scn = (uint64)cluster_scn_current();
 	out_env->payload_length = payload_length;
 	out_env->payload_crc32c = 0; /* placeholder; computed below */
 
@@ -197,10 +207,100 @@ cluster_ic_envelope_verify(const ClusterICEnvelope *env, const void *payload, ui
 		return false;
 
 	/*
-	 * epoch / scn fields read but NOT enforced in spec-2.3 (spec-2.4 /
-	 * 2.10 flip enforce flags).  Caller may peek via env->epoch /
-	 * env->scn for diagnostic but cannot reject on mismatch yet.
+	 * Step 7: spec-2.4 D4 -- epoch enforce (Invariant 2 per spec-2.0
+	 * §3.2).  Reject envelopes carrying a stale epoch (typically
+	 * reconfig in-flight pre-thaw frames in spec-2.29 era).
+	 *
+	 * spec-2.4 期 current_epoch always = CLUSTER_EPOCH_INITIAL = 0;
+	 * sender side also reads the same shmem accessor so production
+	 * traffic always passes this check.  fault-inject (cluster_tap
+	 * 082) and post-spec-2.29 reconfig flow are the only paths that
+	 * exercise the reject branch.
+	 *
+	 * Counter bump + LOG describe verify's own decision (this is
+	 * still validation, not state propagation -- safe inside the
+	 * pure verify path per Q2 contract;NO SCN advance here).
 	 */
+	{
+		uint64 my_epoch = cluster_epoch_get_current();
+		uint64 env_epoch;
+
+		memcpy(&env_epoch, &env->epoch, sizeof(uint64)); /* L34 unaligned */
+		if (env_epoch != my_epoch) {
+			cluster_ic_tier1_bump_stale_epoch_drop((int32)env->source_node_id);
+			ereport(LOG, (errcode(ERRCODE_INTERNAL_ERROR),
+						  errmsg("cluster_ic dropped envelope from node %u: "
+								 "stale epoch " UINT64_FORMAT " != current " UINT64_FORMAT,
+								 env->source_node_id, env_epoch, my_epoch),
+						  errdetail("spec-2.4 Invariant 2 enforce -- pre-reconfig "
+									"or replay frame;peer NOT closed.")));
+			return false; /* drop -- caller does NOT close peer */
+		}
+	}
+
+	return true;
+}
+
+/*
+ * spec-2.4 §2.7 Q2 修订: Lamport SCN piggyback observe.
+ *
+ * STATEFUL effect.  Caller MUST have called cluster_ic_envelope_verify
+ * AND received true return BEFORE calling this function.  Calling
+ * observe on a not-yet-verified envelope is a contract violation:
+ * forged / spoofed / stale-epoch frames must NEVER reach observe
+ * (otherwise hostile peer can spoof local SCN advance via a frame
+ * with future env.scn but bad CRC).
+ *
+ * Effects:
+ *   - cluster_scn_observe(env->scn) -- Lamport `>=` advance per L21
+ *   - peer_stats[source_node_id].lamport_observe_advance_count++ if
+ *     SCN actually advanced
+ *
+ * Returns true iff local SCN advanced, false on no-op (env_scn == 0
+ * or <= current).
+ */
+bool
+cluster_ic_envelope_observe_scn(const ClusterICEnvelope *env, int32 source_node_id)
+{
+	uint64 env_scn;
+	SCN before, after;
+
+	if (env == NULL)
+		return false;
+
+	memcpy(&env_scn, &env->scn, sizeof(uint64)); /* L34 */
+	if (env_scn == 0)
+		return false;
+
+	before = cluster_scn_current();
+	cluster_scn_observe((SCN)env_scn);
+	after = cluster_scn_current();
+
+	if (after > before) {
+		cluster_ic_tier1_bump_lamport_advance(source_node_id);
+		return true;
+	}
+	return false;
+}
+
+/*
+ * spec-2.4 §2.7 Q2 修订: LMON-facing wrapper.
+ *
+ * Calls verify() then observe_scn() in the correct order.  Returns
+ * true iff verify pass (and observe_scn was invoked).  Verify reject
+ * means observe_scn is NOT called -- contract preserved.
+ *
+ * Tier1 recv heartbeat drain + future spec-2.4 chunked dispatch use
+ * this wrapper.  Lower-level callers (mock / dry-run / unit-test)
+ * call verify() alone to avoid SCN pollution.
+ */
+bool
+cluster_ic_envelope_accept_and_observe(const ClusterICEnvelope *env, const void *payload,
+									   uint32 payload_len, uint32 self_node_id, int32 peer_id)
+{
+	if (!cluster_ic_envelope_verify(env, payload, payload_len, self_node_id, peer_id))
+		return false; /* verify reject -- observe NOT called */
+	cluster_ic_envelope_observe_scn(env, (int32)env->source_node_id);
 	return true;
 }
 
