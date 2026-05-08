@@ -247,6 +247,82 @@ extern const ClusterICMsgTypeInfo *cluster_ic_get_msg_type_info(uint8 msg_type);
  */
 extern int cluster_ic_router_count_registered(void);
 
+
+/* ============================================================
+ * Fanout API (spec-2.5 D2.5; v0.2 Q3 修订采纳).
+ *
+ *   spec-2.4 ship 时 cluster_ic_send_envelope(dest=PGRAC_IC_BROADCAST=
+ *   0xFFFFFFFF) 一路传到 tier1_send_bytes(target_node_id) → tier1 把
+ *   广播 sentinel 当 invalid target 拒掉;**broadcast 真路径未实装**。
+ *   spec-2.5 引入 explicit fanout 层填补此 gap;本 spec 是首个 caller,
+ *   后续 spec-2.6 quorum / 2.18 sinval / 2.X SCN broadcast 全复用此 API。
+ *
+ *   架构 invariant (spec-2.5 v0.2 §1.4 例外 #1 + L61 process-resource-
+ *   vs-shmem):fanout API 只能从 **LMON process context** 调用 — 因为
+ *   tier1 TCP fd 是 LMON process-local kernel resource;非-LMON context
+ *   通过 spec-2.5 D2 CSSD outbound queue + LMON tick drain 模式间接调用
+ *   (CSSD 写 shmem outbound slot;LMON tick read + 调 single-peer send,
+ *   不经过 fanout API 因为已在 per-peer 迭代里)。
+ * ============================================================ */
+
+/*
+ * ClusterICFanoutResult -- per-peer result enum 4 态 (扩 spec-2.3
+ *   v1.0.1 L68 三态加 PEER_DOWN).
+ *
+ *   PEER_DOWN distinguishes "peer fd 不存在 / 未 connect / phase 4
+ *   first-tick" 类 nonfatal "未连上" 情况 vs "曾经 up 现在 down" 类
+ *   HARD_ERROR (tier1 已 close peer)。caller 必须区分以决定:
+ *
+ *     - DONE:        accepted; update last_send_at + counter
+ *     - WOULD_BLOCK: nonfatal backpressure; retry next tick;
+ *                    last_send_at 不更新 (per spec-2.3 v1.0.1 L68)
+ *     - HARD_ERROR:  peer fd 已 close (LMON 自管 reconnect);
+ *                    last_send_at 不更新; caller 不 close peer
+ *                    (close 是 LMON-only 操作; per spec-2.4 v1.0.1 L74)
+ *     - PEER_DOWN:   peer 还没 connect 上 / phase 4 first-tick;
+ *                    last_send_at 不更新; LOG advisory; 等下次 tick
+ *                    重试。绝不 ereport ERROR/FATAL/PANIC。
+ */
+typedef enum ClusterICFanoutResult {
+	CLUSTER_IC_FANOUT_DONE = 0,
+	CLUSTER_IC_FANOUT_WOULD_BLOCK,
+	CLUSTER_IC_FANOUT_HARD_ERROR,
+	CLUSTER_IC_FANOUT_PEER_DOWN
+} ClusterICFanoutResult;
+
+/*
+ * cluster_ic_send_envelope_fanout -- explicit broadcast fanout.
+ *
+ *   For each peer in [0, CLUSTER_MAX_NODES):
+ *     - peer == cluster_node_id (self):                 PEER_DOWN
+ *     - cluster_conf_lookup_node(peer) == NULL:         PEER_DOWN
+ *     - cluster_ic_tier1_get_peer_fd(peer) < 0:         PEER_DOWN
+ *     - else: build envelope (dest=peer) + cluster_ic_send_bytes;
+ *             map ClusterICSendResult → ClusterICFanoutResult
+ *
+ *   Pre-loop validation (caller-visible ereport ERROR):
+ *     - msg_type ∈ [1, CLUSTER_IC_MSG_TYPE_MAX): registered + has
+ *       handler != NULL (or send-only;name != NULL)
+ *     - info->broadcast_ok == true (broadcast_ok=false 调 fanout API
+ *       是 spec drift → ereport ERROR + errhint)
+ *     - MyBackendType ∈ allowed_producer_mask (per-peer send 路径 also
+ *       enforces; fanout 提前 fail-fast)
+ *     - payload_len ≤ PGRAC_IC_PAYLOAD_MAX (16 MB)
+ *
+ *   per_peer[] is OUT-only (caller-allocated; fanout writes all
+ *   CLUSTER_MAX_NODES slots before returning).
+ *
+ *   spec authority:
+ *     - pgrac:specs/spec-2.5-...md §1.4 例外 #2 + §2.2 + §2.2.1
+ *     - L61 process-resource-vs-shmem (LMON-only context)
+ *     - L68 backpressure-≠-peer-death (WOULD_BLOCK / HARD_ERROR 区分)
+ *     - L71 metadata-symmetric-enforce (broadcast_ok send-side 对称)
+ *     - L74 cross-aux-process-close-must-be-LMON-mediated (caller 不
+ *       close peer)
+ */
+extern void cluster_ic_send_envelope_fanout(uint8 msg_type, const void *payload, uint32 payload_len,
+											ClusterICFanoutResult per_peer[]);
+
 #endif /* USE_PGRAC_CLUSTER */
 
 #endif /* CLUSTER_IC_ROUTER_H */

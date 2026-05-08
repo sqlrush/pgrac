@@ -52,11 +52,13 @@
 #include "utils/elog.h"
 #include "utils/memutils.h"
 
+#include "cluster/cluster_conf.h"	  /* cluster_conf_lookup_node (spec-2.5 D2.5 fanout) */
 #include "cluster/cluster_guc.h"	  /* cluster_node_id */
 #include "cluster/cluster_ic.h"		  /* cluster_ic_send_bytes (vtable) */
 #include "cluster/cluster_ic_chunk.h" /* PGRAC_IC_CHUNK_MSG_TYPE + chunk_dispatch_frame (v1.0.1 F1) */
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
+#include "cluster/cluster_ic_tier1.h" /* cluster_ic_tier1_get_peer_fd (spec-2.5 D2.5 fanout) */
 
 
 /* ============================================================
@@ -368,6 +370,130 @@ cluster_ic_router_count_registered(void)
 			count++;
 	}
 	return count;
+}
+
+
+/* ============================================================
+ * Fanout API (spec-2.5 D2.5; v0.2 Q3 修订采纳).
+ *
+ *   See cluster_ic_router.h for full caller contract + lessons SSOT
+ *   inheritance (L61 / L68 / L71 / L74).
+ *
+ *   Implementation:
+ *     1. Pre-loop validation (ereport ERROR on spec violation):
+ *        msg_type range / registered / broadcast_ok=true /
+ *        MyBackendType ∈ allowed_producer_mask / payload_len ≤
+ *        PGRAC_IC_PAYLOAD_MAX
+ *
+ *     2. Per-peer loop:
+ *        - peer == cluster_node_id:                PEER_DOWN (skip self)
+ *        - cluster_conf_lookup_node(peer) == NULL: PEER_DOWN (un-declared)
+ *        - cluster_ic_tier1_get_peer_fd(peer) < 0: PEER_DOWN (not connected)
+ *        - else: build envelope (dest=peer) + cluster_ic_send_bytes;
+ *                map ClusterICSendResult → ClusterICFanoutResult
+ *
+ *   NB: per-peer send path here bypasses cluster_ic_send_envelope's
+ *   own dest=BROADCAST + producer_mask + registered checks (already
+ *   pre-validated once).  This is intentional: avoid N × constant-cost
+ *   re-validation;the per-peer dest is concrete (not BROADCAST sentinel)
+ *   so symmetric checks don't apply per peer.
+ * ============================================================ */
+
+void
+cluster_ic_send_envelope_fanout(uint8 msg_type, const void *payload, uint32 payload_len,
+								ClusterICFanoutResult per_peer[])
+{
+	const ClusterICMsgTypeInfo *info;
+	int peer;
+
+	/* (1) msg_type range. */
+	if (msg_type == 0 || (int)msg_type >= CLUSTER_IC_MSG_TYPE_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("cluster_ic_send_envelope_fanout: msg_type %u out of range", msg_type)));
+
+	info = &dispatch_table[msg_type];
+
+	/* (2) registered. */
+	if (!slot_registered(info))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cluster_ic_send_envelope_fanout: msg_type %u not registered", msg_type),
+				 errhint("Each subsystem must call cluster_ic_register_msg_type "
+						 "in postmaster phase 1 (cluster_init_shmem).")));
+
+	/* (3) broadcast_ok send-side enforce (spec-2.5 R13;L71 metadata-symmetric).
+	 *     fanout API is a broadcast-flavored entry point;callers must register
+	 *     broadcast_ok=true so inbound dispatch (cluster_ic_dispatch_envelope)
+	 *     mirrors the contract for peer-originated frames. */
+	if (!info->broadcast_ok)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cluster_ic_send_envelope_fanout: msg_type %u (\"%s\") "
+							   "registered with broadcast_ok=false",
+							   msg_type, info->name),
+						errhint("Fanout is a broadcast-flavored API;register the msg_type "
+								"with broadcast_ok=true or use cluster_ic_send_envelope "
+								"for unicast.")));
+
+	/* (4) producer_mask. */
+	if ((info->allowed_producer_mask & (1u << MyBackendType)) == 0)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cluster_ic_send_envelope_fanout: msg_type %u (\"%s\") not "
+							   "allowed from BackendType %d",
+							   msg_type, info->name, (int)MyBackendType),
+						errhint("msg_type %u allowed_producer_mask = 0x%x.", msg_type,
+								info->allowed_producer_mask)));
+
+	/* (5) payload size ceiling. */
+	if (payload_len > PGRAC_IC_PAYLOAD_MAX)
+		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						errmsg("cluster_ic_send_envelope_fanout: payload %u exceeds 16 MB limit",
+							   payload_len)));
+
+	/* (6) Per-peer loop.  Initialize all slots PEER_DOWN; overwrite as we go. */
+	for (peer = 0; peer < CLUSTER_MAX_NODES; peer++)
+		per_peer[peer] = CLUSTER_IC_FANOUT_PEER_DOWN;
+
+	for (peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
+		ClusterICEnvelope env;
+		ClusterICSendResult rc;
+
+		/* Skip self -- broadcast semantics exclude sender. */
+		if (peer == cluster_node_id)
+			continue;
+
+		/* Skip un-declared peers (cluster_conf doesn't know about them). */
+		if (cluster_conf_lookup_node(peer) == NULL)
+			continue;
+
+		/* Skip peers not yet connected (phase 4 first-tick / restart);
+		 * spec-2.5 §1.4 例外 #4 PEER_DOWN nonfatal contract. */
+		if (cluster_ic_tier1_get_peer_fd(peer) < 0)
+			continue;
+
+		/* Build envelope + send.  spec-2.4 v1.0.1 / spec-2.3 ratify ABI. */
+		if (!cluster_ic_envelope_build(&env, msg_type, (uint32)cluster_node_id, (uint32)peer,
+									   payload, payload_len)) {
+			per_peer[peer] = CLUSTER_IC_FANOUT_HARD_ERROR;
+			continue;
+		}
+
+		rc = cluster_ic_send_bytes(peer, &env, sizeof(env));
+		if (rc == CLUSTER_IC_SEND_DONE && payload_len > 0)
+			rc = cluster_ic_send_bytes(peer, payload, payload_len);
+
+		switch (rc) {
+		case CLUSTER_IC_SEND_DONE:
+			per_peer[peer] = CLUSTER_IC_FANOUT_DONE;
+			break;
+		case CLUSTER_IC_SEND_WOULD_BLOCK:
+			per_peer[peer] = CLUSTER_IC_FANOUT_WOULD_BLOCK;
+			break;
+		case CLUSTER_IC_SEND_HARD_ERROR:
+			per_peer[peer] = CLUSTER_IC_FANOUT_HARD_ERROR;
+			break;
+		}
+	}
 }
 
 
