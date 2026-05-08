@@ -252,7 +252,7 @@ $node->append_conf('postgresql.conf', "cluster.pcm_grd_max_entries = 16\n");
 $node->start;
 
 is($node->safe_psql('postgres', 'SHOW cluster.pcm_grd_max_entries'),
-   '17',
+   '16',
    'L11a postmaster started cleanly with cluster.pcm_grd_max_entries=16');
 
 ok($node->safe_psql(

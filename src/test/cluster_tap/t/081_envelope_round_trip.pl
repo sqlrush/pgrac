@@ -105,8 +105,12 @@ my $ENVELOPE_BYTES = 36;
 			"SELECT bytes_send FROM pg_cluster_ic_peers WHERE node_id = $to");
 		cmp_ok($bytes_send, '>=', $ENVELOPE_BYTES,
 			"L3 $label bytes_send >= 36 (>= 1 envelope sent)");
-		is( $bytes_send % $ENVELOPE_BYTES, 0,
-			"L3 $label bytes_send divisible by 36 (envelope frame size; got=$bytes_send)");
+		# spec-2.5 hardening v1.0.1 F2: spec-2.5 added CSSD background
+		# heartbeat (msg_type=11) which sends env+payload combined (48B);
+		# wire is now MIXED with LMON HEARTBEAT (36B no payload).  The
+		# strict % 36 invariant pre-spec-2.5 is no longer applicable.
+		# 081 is an envelope smoke test — assert envelope traffic flows;
+		# CSSD-specific assertions live in 085.
 
 		# bytes_recv: tier1 recv loop adds `got` per recv() call,
 		# which may be partial under TCP fragmentation, so we only
