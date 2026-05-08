@@ -63,8 +63,8 @@ is( $node->safe_psql(
 		'postgres',
 		q{SELECT string_agg(DISTINCT category, ',' ORDER BY category)
 		    FROM pg_cluster_state}),
-	'block_format,buffer_format,cluster_stats,conf,diag,guc,ic,inject,lck,lmon,pcm,pgstat,phase,scn,shared_fs,shmem',
-	'all 16 categories appear (7 stage-0 + shared_fs 1.1 + block_format 1.4 + buffer_format 1.6 + pcm 1.7 + lmon 1.11 + lck 1.12 + diag 1.13 + cluster_stats 1.14 + scn 1.15)');
+	'block_format,buffer_format,cluster_cssd,cluster_stats,conf,diag,guc,ic,inject,lck,lmon,pcm,pgstat,phase,scn,shared_fs,shmem',
+	'all 17 categories appear (16 prior + cluster_cssd 2.5)');
 
 
 # ----------
@@ -124,14 +124,14 @@ is( $node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='inject' AND key LIKE '%.fault_type'}),
-	'83',
-	'all 83 injection points have a .fault_type entry under inject category (spec-1.19 +1 page-init-thread-id)');
+	'89',
+	'all 89 injection points have a .fault_type entry under inject category (83 prior + 6 spec-2.5 D11 cssd)');
 
 is( $node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='inject' AND key LIKE '%.hits'}),
-	'83',
+	'89',
 	'all 83 injection points have a .hits entry under inject category (spec-1.19 +1 page-init-thread-id)');
 
 
@@ -158,7 +158,7 @@ like($phase, qr/^(init|running|shutdown|\(unset\))$/,
 # ----------
 is( $node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'60',
+	'61',
 	'pg_stat_cluster_wait_events 58 rows (51 from stage 0/1.1 + 5 from stage 1.10 startup phase)');
 
 $node->stop;

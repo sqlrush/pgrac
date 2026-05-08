@@ -844,6 +844,13 @@ cluster_cssd_start(void)
 
 	CLUSTER_INJECTION_POINT("cluster-cssd-pre-spawn");
 
+	/* spec-2.5 hardening v1.0.1 (065 L9):  'skip' fault simulates spawn
+	 * failure (returns 0 without ereport) so 53R30 CSSD_SPAWN_FAILED
+	 * plumbing can be verified end-to-end via inject point.  Mirror of
+	 * spec-1.14 cluster_stats_start pattern (spec-1.14.1 F20). */
+	if (cluster_injection_should_skip("cluster-cssd-pre-spawn"))
+		return 0;
+
 	pid = cluster_postmaster_start_cssd();
 
 	CLUSTER_INJECTION_POINT("cluster-cssd-post-spawn");

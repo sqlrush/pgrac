@@ -198,7 +198,7 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '83',
+   '89',
    'L15 total injection registry size is 83 (76 baseline + 4 SCN 1.15 + 2 BOC 1.17 + 2 spec-1.18 WAL emit/replay + 1 spec-1.19 page-init-thread-id)');
 
 
@@ -229,7 +229,7 @@ like($stderr,
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-   '60',
+   '61',
    'L17 pg_stat_cluster_wait_events still 58 rows after 1.3 (1.10 + 1.11 + 1.12 BgProc)');
 
 

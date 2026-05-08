@@ -154,8 +154,8 @@ is( $node->safe_psql(
 # ----------
 is( $node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'60',
-	'pg_stat_cluster_wait_events still 58 rows after 0.28');
+	'61',
+	'pg_stat_cluster_wait_events 61 rows after 0.28 (60 prior + cluster_cssd spec-2.5)');
 
 $node->stop;
 

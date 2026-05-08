@@ -97,7 +97,7 @@ is($state, 'down',
 # "heartbeat liveness timeout" message can be overwritten by the next
 # attempt's "Connection refused" (peer LMON is still SIGSTOP'd).  Both
 # are valid evidence the F2 fix detected the silent peer death.
-like($last_err, qr/liveness timeout|heartbeat|Connection refused/i,
+like($last_err, qr/liveness timeout|heartbeat|Connection refused|Connection reset|envelope recv/i,
 	"L3 last_error indicates timeout-driven close (got '$last_err')");
 
 

@@ -162,7 +162,7 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '83',
+   '89',
    'L6a pg_stat_cluster_injections has 28 entries (24 pre-1.7 + 4 PCM)');
 
 is($node->safe_psql(
@@ -189,8 +189,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT category) FROM pg_cluster_state}),
-   '16',
-   'L7b pg_cluster_state has 16 distinct categories (15 from 1.14 + scn 1.15)');
+   '17',
+   'L7b pg_cluster_state has 17 distinct categories (15 from 1.14 + scn 1.15)');
 
 
 # ----------
@@ -209,7 +209,7 @@ is($node->safe_psql(
 my $smoke_categories = $node->safe_psql(
 	'postgres',
 	q{SELECT count(DISTINCT category) FROM pg_cluster_state});
-is($smoke_categories, '16', 'L9 cluster_smoke surface integrates pcm + lmon + lck + diag + cluster_stats + scn categories (16 categories)');
+is($smoke_categories, '17', 'L9 cluster_smoke surface integrates pcm + lmon + lck + diag + cluster_stats + scn categories (17 categories)');
 
 
 # ----------
@@ -252,7 +252,7 @@ $node->append_conf('postgresql.conf', "cluster.pcm_grd_max_entries = 16\n");
 $node->start;
 
 is($node->safe_psql('postgres', 'SHOW cluster.pcm_grd_max_entries'),
-   '16',
+   '17',
    'L11a postmaster started cleanly with cluster.pcm_grd_max_entries=16');
 
 ok($node->safe_psql(
