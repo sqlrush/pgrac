@@ -194,6 +194,18 @@
  * remain lower-bound (>= 202605210) not equal-bound; see grep
  * audit in spec-2.3 §7 DoD.
  */
-#define CATALOG_VERSION_NO	202605210
+/*
+ * spec-2.4 D7 (2026-05-08) -- bump 202605210 -> 202605220 for
+ * pg_cluster_ic_peers SRF/view extension to 23 columns
+ * (+ stale_epoch_drop_count + chunk_reassembly_active +
+ * chunk_reassembly_timeout_count + lamport_observe_advance_count) +
+ * 5 NEW PGC_POSTMASTER GUCs (interconnect_payload_max_bytes +
+ * chunk_reassembly_timeout_ms + tcp_keepidle_sec / keepintvl_sec /
+ * keepcnt) + 2 NEW SQLSTATE (53R20 + 53R21).  Per L46:downstream
+ * TAP / regress hardcoded catversion regex MUST remain lower-bound
+ * (>= 202605220) not equal-bound;see grep audit in spec-2.4 §7
+ * DoD.
+ */
+#define CATALOG_VERSION_NO 202605220
 
 #endif

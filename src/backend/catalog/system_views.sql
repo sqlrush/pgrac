@@ -1488,7 +1488,11 @@ CREATE VIEW pg_cluster_ic_peers AS
            connect_error_count,
            last_errno,
            last_error_code,
-           last_error
+           last_error,
+           stale_epoch_drop_count,
+           chunk_reassembly_active,
+           chunk_reassembly_timeout_count,
+           lamport_observe_advance_count
       FROM cluster_get_ic_peers();
 
 REVOKE ALL ON pg_cluster_ic_peers FROM PUBLIC;

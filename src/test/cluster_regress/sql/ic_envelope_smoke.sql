@@ -57,3 +57,27 @@ SELECT count(*) AS column_count
 SELECT msg_type, name, handler_present, broadcast_ok
   FROM pg_cluster_ic_msg_types
  WHERE msg_type = 1;
+
+
+-- ----------
+-- 5. spec-2.4 D9 NEW 5 PGC_POSTMASTER GUCs (chunked + KeepAlive).
+-- ----------
+SELECT name, vartype, context
+  FROM pg_settings
+ WHERE name IN ('cluster.interconnect_payload_max_bytes',
+                'cluster.interconnect_chunk_reassembly_timeout_ms',
+                'cluster.interconnect_tcp_keepidle_sec',
+                'cluster.interconnect_tcp_keepintvl_sec',
+                'cluster.interconnect_tcp_keepcnt')
+ ORDER BY name;
+
+
+-- ----------
+-- 6. spec-2.4 D11 pg_cluster_ic_peers view extended to 23 columns
+--	(was 19 in spec-2.2 D9).  4 NEW columns: stale_epoch_drop_count /
+--	chunk_reassembly_active / chunk_reassembly_timeout_count /
+--	lamport_observe_advance_count.
+-- ----------
+SELECT count(*) AS column_count
+  FROM information_schema.columns
+ WHERE table_name = 'pg_cluster_ic_peers';

@@ -12248,13 +12248,13 @@
 # TRANSPORT-LEVEL liveness only (connecting / connected / down /
 # rejected); does NOT map to membership / quorum / fence (those land
 # in spec-2.5+ / 2.6+ / 2.28+).
-{ oid => '8914', descr => 'list cluster IC peer connection state + telemetry (spec-2.2)',
+{ oid => '8914', descr => 'list cluster IC peer connection state + telemetry (spec-2.2 + spec-2.4)',
   proname => 'cluster_get_ic_peers', prorows => '8',
   proretset => 't', provolatile => 'v', proparallel => 'r',
   prorettype => 'record', proargtypes => '',
-  proallargtypes => '{int4,text,text,timestamptz,timestamptz,timestamptz,timestamptz,timestamptz,int8,int8,int8,int8,int8,int8,int4,int4,int4,text,text}',
-  proargmodes => '{o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o}',
-  proargnames => '{node_id,state,interconnect_addr,last_connect_at,last_send_at,last_recv_at,last_heartbeat_sent_at,last_heartbeat_recv_at,heartbeat_send_count,heartbeat_recv_count,msg_send_count,msg_recv_count,bytes_send,bytes_recv,reconnect_count,connect_error_count,last_errno,last_error_code,last_error}',
+  proallargtypes => '{int4,text,text,timestamptz,timestamptz,timestamptz,timestamptz,timestamptz,int8,int8,int8,int8,int8,int8,int4,int4,int4,text,text,int8,int4,int8,int8}',
+  proargmodes => '{o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o}',
+  proargnames => '{node_id,state,interconnect_addr,last_connect_at,last_send_at,last_recv_at,last_heartbeat_sent_at,last_heartbeat_recv_at,heartbeat_send_count,heartbeat_recv_count,msg_send_count,msg_recv_count,bytes_send,bytes_recv,reconnect_count,connect_error_count,last_errno,last_error_code,last_error,stale_epoch_drop_count,chunk_reassembly_active,chunk_reassembly_timeout_count,lamport_observe_advance_count}',
   prosrc => 'cluster_get_ic_peers' },
 
 # spec-2.3 D8 cluster_get_ic_msg_types -- list registered IC message

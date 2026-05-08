@@ -228,7 +228,7 @@ cluster_ic_envelope_verify(const ClusterICEnvelope *env, const void *payload, ui
 		memcpy(&env_epoch, &env->epoch, sizeof(uint64)); /* L34 unaligned */
 		if (env_epoch != my_epoch) {
 			cluster_ic_tier1_bump_stale_epoch_drop((int32)env->source_node_id);
-			ereport(LOG, (errcode(ERRCODE_INTERNAL_ERROR),
+			ereport(LOG, (errcode(ERRCODE_CLUSTER_IC_STALE_EPOCH_DROP),
 						  errmsg("cluster_ic dropped envelope from node %u: "
 								 "stale epoch " UINT64_FORMAT " != current " UINT64_FORMAT,
 								 env->source_node_id, env_epoch, my_epoch),

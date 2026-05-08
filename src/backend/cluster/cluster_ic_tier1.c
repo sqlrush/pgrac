@@ -1574,8 +1574,8 @@ cluster_get_ic_peers(PG_FUNCTION_ARGS)
 
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 		ClusterICPeerStateShmem *p = &Tier1Shmem->peers[i];
-		Datum values[19];
-		bool nulls[19];
+		Datum values[23];
+		bool nulls[23];
 		int col = 0;
 
 		if (cluster_conf_lookup_node(i) == NULL)
@@ -1611,8 +1611,14 @@ cluster_get_ic_peers(PG_FUNCTION_ARGS)
 		values[col++] = Int32GetDatum(p->last_errno);
 		values[col++] = CStringGetTextDatum(p->last_error_code[0] ? p->last_error_code : "");
 		values[col++] = CStringGetTextDatum(p->last_error[0] ? p->last_error : "");
+		/* spec-2.4 D11: 4 NEW columns (19 -> 23). */
+		values[col++] = Int64GetDatum((int64)pg_atomic_read_u64(&p->stale_epoch_drop_count));
+		values[col++] = Int32GetDatum((int32)pg_atomic_read_u32(&p->chunk_reassembly_active));
+		values[col++]
+			= Int64GetDatum((int64)pg_atomic_read_u64(&p->chunk_reassembly_timeout_count));
+		values[col++] = Int64GetDatum((int64)pg_atomic_read_u64(&p->lamport_observe_advance_count));
 
-		Assert(col == 19);
+		Assert(col == 23);
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
 

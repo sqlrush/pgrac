@@ -334,13 +334,17 @@ cluster_ic_chunk_scan_reassembly_timeouts(void)
 		if (elapsed_ms > cluster_interconnect_chunk_reassembly_timeout_ms) {
 			cluster_ic_tier1_bump_chunk_reassembly_timeout((int32)peer);
 			ereport(WARNING,
-					(errcode(ERRCODE_INTERNAL_ERROR),
+					(errcode(ERRCODE_CLUSTER_IC_CHUNK_REASSEMBLY_TIMEOUT),
 					 errmsg("cluster_ic chunk reassembly timeout for peer %d "
 							"(elapsed %ld ms > %d ms threshold)",
 							peer, elapsed_ms, cluster_interconnect_chunk_reassembly_timeout_ms)));
 			cluster_ic_chunk_reset_peer((int32)peer);
-			/* spec-2.4 D8 close-peer hook lands here in Step 4 wiring;
-			 * this Step 3 commit only handles the reassembly cleanup. */
+			/*
+			 * spec-2.4 D8 (already shipped in Step 4):
+			 * cluster_ic_tier1_close_peer's hook calls chunk_reset_peer;
+			 * here we close the peer to force reconnection on timeout.
+			 */
+			cluster_ic_tier1_close_peer((int32)peer, "chunk reassembly timeout");
 		}
 	}
 }

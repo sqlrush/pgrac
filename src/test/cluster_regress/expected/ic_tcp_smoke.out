@@ -53,6 +53,6 @@ SELECT count(*) AS column_count
  WHERE table_name = 'pg_cluster_ic_peers';
  column_count 
 --------------
-           19
+           23
 (1 row)
 
