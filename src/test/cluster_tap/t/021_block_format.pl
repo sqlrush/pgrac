@@ -166,8 +166,8 @@ SKIP: {
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_shmem}),
-   '11',
-   'L10 pg_cluster_shmem 11 rows (block format change is not a shmem region; ..1.12 baseline 6 + 1.13 cluster_diag + 1.14 cluster_stats + 1.15 cluster_scn + 2.2 cluster_ic_tier1 + 2.4 cluster_epoch)');
+   '12',
+   'L10 pg_cluster_shmem 12 rows (block format change is not a shmem region; ..1.12 baseline 6 + 1.13 diag + 1.14 stats + 1.15 scn + 2.2 cluster_ic_tier1 + 2.4 cluster_epoch + 2.5 cluster_cssd)');
 
 
 # ----------
