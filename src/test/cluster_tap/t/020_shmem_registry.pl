@@ -133,8 +133,8 @@ is($node->safe_psql(
 		'postgres',
 		q{SELECT value FROM pg_cluster_state
 		   WHERE category = 'shmem' AND key = 'region_count'}),
-   '11',
-   'L8 pg_cluster_state.shmem.region_count = 11 (9 prior + cluster_ic_tier1 at spec-2.2 + cluster_epoch at spec-2.4)');
+   '12',
+   'L8 pg_cluster_state.shmem.region_count = 12 (11 prior + cluster_cssd at spec-2.5)');
 
 is($node->safe_psql(
 		'postgres', q{
