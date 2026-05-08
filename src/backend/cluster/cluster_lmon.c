@@ -59,6 +59,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_envelope.h"
+#include "cluster/cluster_ic_chunk.h" /* cluster_ic_chunk_scan_reassembly_timeouts (2.4) */
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_ic_tier1.h"
 #include "utils/timestamp.h"
@@ -791,6 +792,13 @@ LmonMain(void)
 				}
 				next_heartbeat_at = now + HEARTBEAT_INTERVAL_MS * INT64CONST(1000);
 			}
+
+			/*
+			 * spec-2.4 D6 -- chunk reassembly timeout scan.  Cheap per-tick
+			 * walk over CLUSTER_MAX_NODES (16) peers;noop unless any peer
+			 * has an in-flight reassembly state older than the GUC threshold.
+			 */
+			cluster_ic_chunk_scan_reassembly_timeouts();
 
 			/* (Re)build WaitEventSet whenever per-peer fd set changes. */
 			if (wes_dirty) {

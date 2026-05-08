@@ -248,6 +248,9 @@ cluster_ic_tier1_pending_outbound(int32 peer_id pg_attribute_unused())
 {
 	return false;
 }
+void
+cluster_ic_chunk_scan_reassembly_timeouts(void)
+{}
 bool
 cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id pg_attribute_unused(),
 									  int peer_fd pg_attribute_unused())

@@ -55,6 +55,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <fcntl.h>
+#include <netinet/tcp.h> /* TCP_KEEPIDLE / TCP_KEEPALIVE / KEEPINTVL / KEEPCNT */
 #include <unistd.h>
 #include <errno.h>
 
@@ -73,6 +74,7 @@
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_elog.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_ic_chunk.h" /* cluster_ic_chunk_reset_peer (spec-2.4) */
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
@@ -209,6 +211,56 @@ set_socket_nonblocking(int fd)
 	if (flags == -1)
 		return -1;
 	return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+/*
+ * spec-2.4 D8 -- apply TCP KeepAlive setsockopt 4 options on a fresh
+ * peer fd.  Best-effort:warn on failure but DO NOT close the
+ * connection (KeepAlive is a kernel-level fallback to spec-2.2 v1.0.1
+ * F2 application-level 3x heartbeat liveness scan;app dead detection
+ * is the primary defense).
+ *
+ * Linux: TCP_KEEPIDLE / macOS: TCP_KEEPALIVE alias (same semantics).
+ */
+static void
+apply_tcp_keepalive(int fd, const char *peer_label)
+{
+	int yes = 1;
+	int idle = cluster_interconnect_tcp_keepidle_sec;
+	int intvl = cluster_interconnect_tcp_keepintvl_sec;
+	int cnt = cluster_interconnect_tcp_keepcnt;
+
+	if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes)) < 0)
+		ereport(WARNING,
+				(errcode_for_socket_access(),
+				 errmsg("cluster_ic tier1 SO_KEEPALIVE setsockopt failed for %s: %m", peer_label)));
+
+#if defined(TCP_KEEPIDLE)
+	if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle)) < 0)
+		ereport(WARNING,
+				(errcode_for_socket_access(),
+				 errmsg("cluster_ic tier1 TCP_KEEPIDLE setsockopt failed for %s: %m", peer_label)));
+#elif defined(TCP_KEEPALIVE)
+	/* macOS alias for TCP_KEEPIDLE. */
+	if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &idle, sizeof(idle)) < 0)
+		ereport(WARNING, (errcode_for_socket_access(),
+						  errmsg("cluster_ic tier1 TCP_KEEPALIVE setsockopt failed for %s: %m",
+								 peer_label)));
+#endif
+
+#ifdef TCP_KEEPINTVL
+	if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl)) < 0)
+		ereport(WARNING, (errcode_for_socket_access(),
+						  errmsg("cluster_ic tier1 TCP_KEEPINTVL setsockopt failed for %s: %m",
+								 peer_label)));
+#endif
+
+#ifdef TCP_KEEPCNT
+	if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt)) < 0)
+		ereport(WARNING,
+				(errcode_for_socket_access(),
+				 errmsg("cluster_ic tier1 TCP_KEEPCNT setsockopt failed for %s: %m", peer_label)));
+#endif
 }
 
 /*
@@ -835,6 +887,9 @@ cluster_ic_tier1_accept_one(int *out_peer_fd, int32 *out_peer_id)
 		return false;
 	}
 
+	/* spec-2.4 D8 TCP KeepAlive (per-peer kernel-level half-open detection). */
+	apply_tcp_keepalive(cfd, "passive accept fd");
+
 	/*
 	 * Peer identity is unknown until we recv + verify HELLO.  Step 7
 	 * LMON main loop will register this fd in WaitEventSet and call
@@ -892,6 +947,14 @@ cluster_ic_tier1_connect_one(int32 peer_id, int *out_peer_fd)
 		(void)close(fd);
 		peer_record_error(peer_id, saved, "08001", "fcntl O_NONBLOCK: %s", strerror(saved));
 		return false;
+	}
+
+	/* spec-2.4 D8 TCP KeepAlive on active connect fd. */
+	{
+		char label[32];
+
+		snprintf(label, sizeof(label), "active connect peer %d", peer_id);
+		apply_tcp_keepalive(fd, label);
 	}
 
 	memset(&sa, 0, sizeof(sa));
@@ -1401,6 +1464,15 @@ cluster_ic_tier1_close_peer(int32 peer_id, const char *reason)
 			Tier1Shmem->peers[peer_id].state = (int32)CLUSTER_IC_PEER_DOWN;
 		Tier1Shmem->peers[peer_id].reconnect_count++;
 	}
+
+	/*
+	 * spec-2.4 D6 -- chunk reassembly state cleanup on peer close.
+	 * Idempotent (no-op when peer has no in-flight chunked recv).
+	 * Single chunk_reset_peer call atomically frees the per-peer
+	 * AllocSetContext + buf + state (per Q4 修订:cleanup correctness
+	 * is a property of the design, not of distributed pfree discipline).
+	 */
+	cluster_ic_chunk_reset_peer(peer_id);
 
 	if (reason != NULL)
 		ereport(LOG, (errmsg("cluster_ic tier1 peer %d closed: %s", peer_id, reason)));
