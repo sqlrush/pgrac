@@ -95,6 +95,13 @@ int cluster_interconnect_heartbeat_interval_ms = 1000;
 int cluster_interconnect_connect_timeout_ms = 5000;
 int cluster_interconnect_recv_timeout_ms = 30000;
 
+/* spec-2.4 D9 -- chunked framing + TCP KeepAlive tuning (PGC_POSTMASTER). */
+int cluster_interconnect_payload_max_bytes = 64 * 1024 * 1024; /* 64 MB */
+int cluster_interconnect_chunk_reassembly_timeout_ms = 10000;  /* 10s */
+int cluster_interconnect_tcp_keepidle_sec = 60;
+int cluster_interconnect_tcp_keepintvl_sec = 10;
+int cluster_interconnect_tcp_keepcnt = 6;
+
 /*
  * cluster.undo_segments_per_instance (spec-1.22 D7).  Number of undo
  * segment files reserved per cluster instance.  Stage 1.22 declares
@@ -514,6 +521,55 @@ cluster_init_guc(void)
 										 "§3.3 PGC_POSTMASTER."),
 							&cluster_interconnect_recv_timeout_ms, 30000, 1000, 600000,
 							PGC_POSTMASTER, GUC_UNIT_MS, NULL, NULL, NULL);
+
+	/* spec-2.4 D9 -- chunked framing + TCP KeepAlive 5 GUC. */
+	DefineCustomIntVariable("cluster.interconnect_payload_max_bytes",
+							gettext_noop("Maximum cluster_ic_send_envelope_chunked payload bytes."),
+							gettext_noop("Hard upper bound on cluster_ic_send_envelope_chunked "
+										 "len argument.  Caller passing larger ereport(ERROR) "
+										 "ERRCODE_PROGRAM_LIMIT_EXCEEDED at entry.  Range "
+										 "16 MB ~ 256 MB;default 64 MB conservative.  per "
+										 "spec-2.4 Q3 (GUC enforce, not silent truncate)."),
+							&cluster_interconnect_payload_max_bytes, 64 * 1024 * 1024,
+							16 * 1024 * 1024, 256 * 1024 * 1024, PGC_POSTMASTER, GUC_UNIT_BYTE,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.interconnect_chunk_reassembly_timeout_ms",
+		gettext_noop("Chunked reassembly partial-frame timeout in milliseconds."),
+		gettext_noop("LMON main tick scans per-peer reassembly state;peer "
+					 "with started_at older than this threshold gets close+ "
+					 "LOG `53R21`+counter bump.  Scan period == LMON main "
+					 "loop interval.  per spec-2.4 §3.4."),
+		&cluster_interconnect_chunk_reassembly_timeout_ms, 10000, 1000, 60000, PGC_POSTMASTER,
+		GUC_UNIT_MS, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("cluster.interconnect_tcp_keepidle_sec",
+							gettext_noop("Tier1 TCP_KEEPIDLE socket option in seconds."),
+							gettext_noop("setsockopt(TCP_KEEPIDLE) per-peer applied at "
+										 "accept_one / finish_connect.  Linux uses TCP_KEEPIDLE; "
+										 "macOS uses TCP_KEEPALIVE alias.  Default 60s.  "
+										 "Layered with spec-2.2 v1.0.1 F2 application-level "
+										 "3x heartbeat liveness scan -- TCP keepalive is "
+										 "kernel-level fallback for app-dead-but-socket-live."),
+							&cluster_interconnect_tcp_keepidle_sec, 60, 30, 600, PGC_POSTMASTER,
+							GUC_UNIT_S, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("cluster.interconnect_tcp_keepintvl_sec",
+							gettext_noop("Tier1 TCP_KEEPINTVL socket option in seconds."),
+							gettext_noop("setsockopt(TCP_KEEPINTVL) per-peer applied at "
+										 "accept_one / finish_connect.  Default 10s."),
+							&cluster_interconnect_tcp_keepintvl_sec, 10, 10, 60, PGC_POSTMASTER,
+							GUC_UNIT_S, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("cluster.interconnect_tcp_keepcnt",
+							gettext_noop("Tier1 TCP_KEEPCNT socket option (probe count)."),
+							gettext_noop("setsockopt(TCP_KEEPCNT) per-peer applied at "
+										 "accept_one / finish_connect.  Default 6 -- combined "
+										 "with keepidle=60s + keepintvl=10s yields 60 + 6*10 "
+										 "= 120s worst-case kernel-level half-open detection."),
+							&cluster_interconnect_tcp_keepcnt, 6, 3, 20, PGC_POSTMASTER, 0, NULL,
+							NULL, NULL);
 
 	DefineCustomIntVariable("cluster.cluster_stats_main_loop_interval",
 							gettext_noop("Cluster Stats main-loop tick interval in milliseconds."),

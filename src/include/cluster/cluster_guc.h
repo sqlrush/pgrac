@@ -253,6 +253,13 @@ extern int cluster_interconnect_heartbeat_interval_ms;
 extern int cluster_interconnect_connect_timeout_ms;
 extern int cluster_interconnect_recv_timeout_ms;
 
+/* spec-2.4 D9: chunked framing + TCP KeepAlive 5 GUC. */
+extern int cluster_interconnect_payload_max_bytes;
+extern int cluster_interconnect_chunk_reassembly_timeout_ms;
+extern int cluster_interconnect_tcp_keepidle_sec;
+extern int cluster_interconnect_tcp_keepintvl_sec;
+extern int cluster_interconnect_tcp_keepcnt;
+
 /*
  * cluster.boc_sweep_interval_ms (spec-1.17 D4): walwriter BOC sweep
  * staleness target in ms.  Range [1, 1000]; default 1.  walwriter wake

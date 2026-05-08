@@ -46,6 +46,7 @@ OBJS = \
 	cluster_epoch.o \
 	cluster_guc.o \
 	cluster_ic.o \
+	cluster_ic_chunk.o \
 	cluster_ic_envelope.o \
 	cluster_ic_msg_types_srf.o \
 	cluster_ic_router.o \
