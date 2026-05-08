@@ -142,6 +142,10 @@ currently reachable.  Always returns zero rows when
 | `last_errno` | `int4` | Last `errno` recorded; `0` if no error or never failed. |
 | `last_error_code` | `text` | Last SQLSTATE-style code recorded (e.g. `08001`, `08006`, `08P01`).  Empty when no error. |
 | `last_error` | `text` | Free-form description of the last error. |
+| `stale_epoch_drop_count` | `int8` | Cumulative envelopes dropped because the carried membership epoch did not match the local current epoch.  Always zero outside of reconfig windows. |
+| `chunk_reassembly_active` | `int4` | Number of large-payload chunks the cluster is currently waiting on from this peer.  Zero when no chunked send is in flight. |
+| `chunk_reassembly_timeout_count` | `int8` | Cumulative chunked-payload reassemblies that exceeded the configured timeout and were aborted (peer reconnected). |
+| `lamport_observe_advance_count` | `int8` | Cumulative envelopes whose carried SCN advanced the local SCN clock (Lamport piggyback).  Zero before high-frequency SCN traffic begins. |
 
 ### Example queries
 

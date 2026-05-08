@@ -122,6 +122,53 @@ next free `msg_type`, register it during postmaster startup with
 its allowed producer set + handler, and define the payload layout.
 The wire envelope itself stays unchanged.
 
+## Membership epoch and SCN piggyback
+
+Every envelope carries two cross-cutting fields beyond its message
+identification:
+
+- **Membership epoch** is a node-local monotonic counter incremented
+  whenever the cluster's membership changes (a peer joins or leaves).
+  The receiver rejects any envelope whose carried epoch does not
+  match the local current epoch — pre-reconfig in-flight frames are
+  dropped on the recv path with a logged message and a per-peer
+  `stale_epoch_drop_count` increment.  No frame is acted upon during
+  a membership transition, so post-reconfig state is never
+  contaminated by stale traffic.
+- **SCN piggyback** (Lamport-style) lets every received envelope
+  advance the local SCN clock if the carried SCN is greater than the
+  current local value.  Verification happens *before* the advance, so
+  forged or stale-epoch frames cannot push the SCN forward.
+
+## Large payloads and framing
+
+The 36-byte envelope caps a single message frame at 16 MB of payload.
+When a sender needs to deliver a larger payload it uses the chunked
+framing layer, which splits the buffer into N consecutive frames
+each carrying a 16-byte chunk header that records `chunk_seq`,
+`chunk_total`, the original `total_payload_len`, and the wrapped
+inner `msg_type`.  The receiver assembles the chunks into a per-peer
+dedicated memory context; on completion the inner message is
+dispatched as if it had arrived in a single frame.  If a peer falls
+silent partway through a reassembly, the receiver times out (10 s
+by default), logs the event, and drops the connection rather than
+holding the half-built buffer.  The default upper bound on a chunked
+payload is 64 MB, configurable up to a 256 MB hard cap via
+`cluster.interconnect_payload_max_bytes`.
+
+## Liveness — application heartbeat plus TCP keepalive
+
+Liveness is enforced on two layers.  The primary path is an
+application-level heartbeat that LMON sends at a configurable
+interval (default 1 s).  Three missed acks mark the peer down and
+trigger reconnection — typically within ~3 s of a real failure.
+Beneath that the kernel applies TCP keepalive probes, configured
+via `cluster.interconnect_tcp_keepidle_sec` /
+`_tcp_keepintvl_sec` / `_tcp_keepcnt`.  This is a fallback for the
+rare case where the application path stalls but the socket stays
+open; with the defaults the kernel needs at most 120 s to declare
+the connection dead.
+
 ## Topology
 
 The cluster topology — list of nodes plus their addresses — is

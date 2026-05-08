@@ -107,6 +107,61 @@ Reserved for future timeout enforcement on outbound `tier1` TCP `connect(2)` cal
 
 Reserved for future timeout enforcement on `tier1` peer `recv(2)`.  Currently informational; the connection is held open until the peer closes or the postmaster shuts down.
 
+### `cluster.interconnect_payload_max_bytes`
+
+| | |
+|---|---|
+| Type | integer (bytes) |
+| Default | `67108864` (64 MB) |
+| Range | `16777216` (16 MB) – `268435456` (256 MB) |
+| Context | postmaster |
+
+Upper bound on the payload size accepted by the chunked-send API.  A caller asking to send a larger payload is rejected outright with `ERRCODE_PROGRAM_LIMIT_EXCEEDED` rather than silently truncating.  Increase this when the workload expects larger cross-node messages; the hard cap is 256 MB.
+
+### `cluster.interconnect_chunk_reassembly_timeout_ms`
+
+| | |
+|---|---|
+| Type | integer (milliseconds) |
+| Default | `10000` (10 s) |
+| Range | `1000` – `60000` |
+| Context | postmaster |
+
+How long the receiver waits for the remaining chunks of a chunked payload before declaring the reassembly stuck and dropping the peer.  The peer is then reconnected on the next tick.
+
+### `cluster.interconnect_tcp_keepidle_sec`
+
+| | |
+|---|---|
+| Type | integer (seconds) |
+| Default | `60` |
+| Range | `30` – `600` |
+| Context | postmaster |
+
+Idle seconds before the kernel begins probing a quiet TCP connection (`TCP_KEEPIDLE` on Linux, `TCP_KEEPALIVE` on macOS).  The application-level heartbeat (~3 s deadline) is the primary liveness path; this kernel-level keepalive is a fallback for the rare case where the application stalls but the socket remains open.
+
+### `cluster.interconnect_tcp_keepintvl_sec`
+
+| | |
+|---|---|
+| Type | integer (seconds) |
+| Default | `10` |
+| Range | `10` – `60` |
+| Context | postmaster |
+
+Interval between successive kernel keepalive probes once probing has begun (`TCP_KEEPINTVL`).
+
+### `cluster.interconnect_tcp_keepcnt`
+
+| | |
+|---|---|
+| Type | integer |
+| Default | `6` |
+| Range | `3` – `20` |
+| Context | postmaster |
+
+Number of unacked keepalive probes before the kernel declares the connection dead (`TCP_KEEPCNT`).  With the defaults the kernel-level worst-case half-open detection is `60 + 6 × 10 = 120 s`, well within the application-level path.
+
 ### `cluster.config_file`
 
 | | |
