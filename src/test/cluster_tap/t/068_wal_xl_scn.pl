@@ -72,15 +72,47 @@ sub primary_counter
 
 # Helper: invoke pg_waldump on the primary's WAL slice covering [start, end].
 # Returns combined stdout + stderr.
+#
+# spec-1.18 hardening (2026-05-08, post-spec-2.5 Step 2 CI flake repro):
+# pg_waldump can race the WAL boundary on Ubuntu CI runners.  pg_current_wal_lsn()
+# returns the next-write LSN, but the just-written record may not yet be
+# durably visible to a fresh pg_waldump invocation -- especially for ABORT
+# (L2) which lacks the strong-sync semantics of user-visible COMMIT success.
+# Symptoms: "pg_waldump: error: could not find a valid record after <lsn>"
+# OR an empty output not matching the expected regex.
+#
+# Retry up to 5 times with 200ms backoff;each iteration also re-reads the
+# end LSN since the WAL writer may have advanced past the original boundary.
+# Total max wait ~1s — well within TAP timeout, imperceptible on the happy
+# path (first try succeeds in ~all healthy local + macos runs).
 sub waldump_range
 {
 	my ($start_lsn, $end_lsn) = @_;
 	my $bin_dir = $primary->config_data('--bindir');
 	my $pg_waldump = "$bin_dir/pg_waldump";
 	my $wal_dir = $primary->data_dir . '/pg_wal';
-	# pg_waldump prints to stderr on EOF / partial reads at the end; merge
-	# 2>&1 so noise doesn't fail the regex check.
-	return `"$pg_waldump" --path="$wal_dir" --start=$start_lsn --end=$end_lsn --rmgr=Transaction 2>&1`;
+
+	my $output = '';
+	for my $attempt (1 .. 5) {
+		$output = `"$pg_waldump" --path="$wal_dir" --start=$start_lsn --end=$end_lsn --rmgr=Transaction 2>&1`;
+
+		# Healthy completion: at least one Transaction record matched.
+		# Caller's like()/unlike() does the precise content match;here we
+		# just gate "did pg_waldump produce *anything* readable" so the
+		# boundary-flake retry loop terminates cleanly.
+		last if ($output =~ /Transaction/ || $output =~ /COMMIT|ABORT|PREPARE/);
+
+		# Retry signal: pg_waldump hit the WAL boundary before record was
+		# durable;sleep + advance end LSN to current.
+		if ($output =~ /could not find a valid record/ || $output eq '') {
+			select(undef, undef, undef, 0.2);  # 200 ms
+			$end_lsn = $primary->safe_psql('postgres', 'SELECT pg_current_wal_lsn()');
+			next;
+		}
+
+		last;  # other errors -- return as-is for caller diagnostics
+	}
+	return $output;
 }
 
 $primary->safe_psql('postgres',

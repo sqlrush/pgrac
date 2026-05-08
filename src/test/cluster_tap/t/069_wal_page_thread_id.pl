@@ -56,17 +56,41 @@ $node->start;
 
 
 # Helper: pg_waldump WAL slice on a specific node covering [start, end].
-# Hardening v1.0.1 P3-3 (codex review 2026-05-05): now takes the target
+# Hardening v1.0.1 P3-3 (codex review 2026-05-05): takes the target
 # node as its first argument so L3's $node2 (a fresh bootstrap instance)
 # is actually inspected — the v1.0 helper hard-coded $node and
 # silently dumped the wrong instance.
+#
+# spec-1.18 hardening (2026-05-08, post-spec-2.5 Step 2 CI flake repro;
+# mirror of 068's same fix):  pg_waldump can race the WAL boundary on
+# Ubuntu CI runners.  pg_current_wal_lsn() returns the next-write LSN,
+# but the just-written record may not yet be readable.  Retry up to 5
+# times with 200 ms backoff;each iteration re-reads end LSN.
 sub waldump_range
 {
 	my ($target, $start_lsn, $end_lsn) = @_;
 	my $bin_dir = $target->config_data('--bindir');
 	my $pg_waldump = "$bin_dir/pg_waldump";
 	my $wal_dir = $target->data_dir . '/pg_wal';
-	return `"$pg_waldump" --path="$wal_dir" --start=$start_lsn --end=$end_lsn 2>&1`;
+
+	my $output = '';
+	for my $attempt (1 .. 5) {
+		$output = `"$pg_waldump" --path="$wal_dir" --start=$start_lsn --end=$end_lsn 2>&1`;
+
+		# Healthy completion: any record matched (069 looks at thread_id /
+		# page header fields across rmgrs, not just Transaction).
+		last if ($output =~ /thread:\s*\d+/ || $output =~ /rmgr:|len/);
+
+		# Retry signal: WAL boundary not yet readable.
+		if ($output =~ /could not find a valid record/ || $output eq '') {
+			select(undef, undef, undef, 0.2);  # 200 ms
+			$end_lsn = $target->safe_psql('postgres', 'SELECT pg_current_wal_lsn()');
+			next;
+		}
+
+		last;  # other errors -- return as-is for caller diagnostics
+	}
+	return $output;
 }
 
 
