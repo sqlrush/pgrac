@@ -56,6 +56,7 @@
 #include "utils/timestamp.h"
 
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_cssd.h" /* cluster_cssd_outbound_slots (spec-2.5 D2.6) */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_envelope.h"
@@ -799,6 +800,78 @@ LmonMain(void)
 			 * has an in-flight reassembly state older than the GUC threshold.
 			 */
 			cluster_ic_chunk_scan_reassembly_timeouts();
+
+			/*
+			 * spec-2.5 D2.6 -- drain CSSD outbound queue.  CSSD aux process
+			 * cannot hold tier1 TCP fd directly (L61 process-resource-vs-shmem),
+			 * so it writes heartbeat requests into ClusterCssdOutboundSlot[]
+			 * shmem;LMON tick reads pending=2 slots, performs single-peer
+			 * tier1 send, writes per-peer result (DONE / WOULD_BLOCK /
+			 * HARD_ERROR / PEER_DOWN) back to slot, clears pending → 0.
+			 *
+			 * Slot lifecycle (CAS-based, single-producer CSSD + single-
+			 * consumer LMON, no LWLock):
+			 *   0 (idle) → 1 (CSSD writing) → 2 (ready) → 3 (LMON draining)
+			 *   → 0 (idle, result published)
+			 *
+			 * Mode-shift contract: even when CSSD shmem not yet initialized
+			 * (Step 4 wires postmaster spawn) cluster_cssd_outbound_slots()
+			 * returns NULL → drain noop.
+			 */
+			{
+				ClusterCssdOutboundSlot *slots = cluster_cssd_outbound_slots();
+
+				if (slots != NULL) {
+					int cs;
+
+					for (cs = 0; cs < CLUSTER_MAX_NODES; cs++) {
+						ClusterICEnvelope env;
+						ClusterICSendResult send_rc;
+						ClusterICFanoutResult fanout_rc;
+						uint32 expected = 2;
+
+						if (!pg_atomic_compare_exchange_u32(&slots[cs].pending, &expected, 3))
+							continue; /* not ready (0/1) or another race */
+
+						/* slot now in pending=3 (LMON-draining);safe to
+						 * read payload + request_seq + dispatch single-
+						 * peer send.  Result written back atomic before
+						 * publishing pending=0. */
+						if (cs == cluster_node_id || cluster_conf_lookup_node(cs) == NULL
+							|| cluster_ic_tier1_get_peer_fd(cs) < 0)
+							fanout_rc = CLUSTER_IC_FANOUT_PEER_DOWN;
+						else if (!cluster_ic_envelope_build(
+									 &env, PGRAC_IC_MSG_CSSD_HEARTBEAT, (uint32)cluster_node_id,
+									 (uint32)cs, &slots[cs].payload, sizeof(slots[cs].payload)))
+							fanout_rc = CLUSTER_IC_FANOUT_HARD_ERROR;
+						else {
+							send_rc = cluster_ic_send_bytes(cs, &env, sizeof(env));
+							if (send_rc == CLUSTER_IC_SEND_DONE)
+								send_rc = cluster_ic_send_bytes(cs, &slots[cs].payload,
+																sizeof(slots[cs].payload));
+							switch (send_rc) {
+							case CLUSTER_IC_SEND_DONE:
+								fanout_rc = CLUSTER_IC_FANOUT_DONE;
+								break;
+							case CLUSTER_IC_SEND_WOULD_BLOCK:
+								fanout_rc = CLUSTER_IC_FANOUT_WOULD_BLOCK;
+								break;
+							case CLUSTER_IC_SEND_HARD_ERROR:
+								fanout_rc = CLUSTER_IC_FANOUT_HARD_ERROR;
+								break;
+							default:
+								fanout_rc = CLUSTER_IC_FANOUT_HARD_ERROR;
+								break;
+							}
+						}
+
+						pg_atomic_write_u32(&slots[cs].result_state, (uint32)fanout_rc);
+						slots[cs].result_seq = slots[cs].request_seq;
+						slots[cs].result_at_us = (uint64)GetCurrentTimestamp();
+						pg_atomic_write_u32(&slots[cs].pending, 0); /* publish + idle */
+					}
+				}
+			}
 
 			/*
 			 * spec-2.4 hardening v1.0.1 F3 (L74 cross-aux-process-close-must-

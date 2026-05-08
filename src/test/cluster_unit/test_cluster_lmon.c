@@ -256,6 +256,37 @@ cluster_ic_tier1_lmon_drain_close_requests(void)
 {
 	return false;
 }
+
+/* spec-2.5 D2.6 stub: LMON tick drain CSSD outbound queue.  Tests don't
+ * exercise CSSD shmem;return NULL → drain noop branch in LmonMain. */
+#include "cluster/cluster_cssd.h"
+ClusterCssdOutboundSlot *
+cluster_cssd_outbound_slots(void)
+{
+	return NULL;
+}
+
+/* spec-2.5 D2.6 stubs: cluster_ic_envelope_build + cluster_ic_send_bytes
+ * referenced by LmonMain CSSD drain branch.  drain noop above means body
+ * is unreachable in tests, but link must resolve. */
+#include "cluster/cluster_ic_envelope.h"
+#include "cluster/cluster_ic.h"
+bool
+cluster_ic_envelope_build(ClusterICEnvelope *env pg_attribute_unused(),
+						  uint8 msg_type pg_attribute_unused(),
+						  uint32 source_node_id pg_attribute_unused(),
+						  uint32 dest_node_id pg_attribute_unused(),
+						  const void *payload pg_attribute_unused(),
+						  uint32 payload_length pg_attribute_unused())
+{
+	return true;
+}
+ClusterICSendResult
+cluster_ic_send_bytes(int32 target_node_id pg_attribute_unused(),
+					  const void *buf pg_attribute_unused(), size_t len pg_attribute_unused())
+{
+	return CLUSTER_IC_SEND_DONE;
+}
 bool
 cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id pg_attribute_unused(),
 									  int peer_fd pg_attribute_unused())
