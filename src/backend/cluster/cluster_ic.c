@@ -75,6 +75,14 @@ PG_FUNCTION_INFO_V1(cluster_ic_mock_recv_test);
  */
 PG_FUNCTION_INFO_V1(cluster_get_ic_peers);
 
+/*
+ * spec-2.3 D8 -- cluster_get_ic_msg_types SRF.  Body lives in
+ * cluster_ic_router.c (compiled only under USE_PGRAC_CLUSTER).
+ * Same dual-link pattern as cluster_get_ic_peers above; the
+ * disable-mode stub body is at the bottom of this file.
+ */
+PG_FUNCTION_INFO_V1(cluster_get_ic_msg_types);
+
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -1172,6 +1180,17 @@ cluster_get_ic_peers(PG_FUNCTION_ARGS pg_attribute_unused())
 {
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("cluster_get_ic_peers requires --enable-cluster")));
+	PG_RETURN_NULL();
+}
+
+/*
+ * spec-2.3 D8 -- cluster_get_ic_msg_types disable-cluster stub.
+ */
+Datum
+cluster_get_ic_msg_types(PG_FUNCTION_ARGS pg_attribute_unused())
+{
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cluster_get_ic_msg_types requires --enable-cluster")));
 	PG_RETURN_NULL();
 }
 #endif

@@ -183,7 +183,17 @@
  * downstream TAP / regress hardcoded catversion regex MUST be
  * lower-bound (>= 202605200) not equal-bound; see grep audit in
  * spec-2.2 §6 DoD.
+ *
+ * spec-2.3 D7 (2026-05-08) -- bump 202605200 -> 202605210 for the
+ * pg_cluster_ic_msg_types SRF + view (D8) addition to pg_proc.dat +
+ * system_views.sql, plus the wire-protocol pivot from spec-2.2
+ * 24-byte ClusterMsgHeader to spec-2.3 36-byte ClusterICEnvelope
+ * (incompatible WAL/IC bytes -> datadir from a 202605200 binary
+ * cannot be opened by a 202605210 binary and vice versa).  Per
+ * L46: downstream TAP / regress hardcoded catversion regex MUST
+ * remain lower-bound (>= 202605210) not equal-bound; see grep
+ * audit in spec-2.3 §7 DoD.
  */
-#define CATALOG_VERSION_NO	202605200
+#define CATALOG_VERSION_NO	202605210
 
 #endif

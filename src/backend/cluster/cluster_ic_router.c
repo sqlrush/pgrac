@@ -100,7 +100,7 @@ cluster_ic_register_msg_type(const ClusterICMsgTypeInfo *info)
 		ereport(FATAL, (errcode(ERRCODE_INTERNAL_ERROR),
 						errmsg("cluster_ic_register_msg_type called with NULL info")));
 
-	if (info->msg_type == 0 || info->msg_type >= CLUSTER_IC_MSG_TYPE_MAX)
+	if (info->msg_type == 0 || (int)info->msg_type >= CLUSTER_IC_MSG_TYPE_MAX)
 		ereport(FATAL, (errcode(ERRCODE_INTERNAL_ERROR),
 						errmsg("cluster_ic_register_msg_type: msg_type %u out of range "
 							   "[1, %d)",
@@ -151,7 +151,7 @@ cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload
 	const ClusterICMsgTypeInfo *info;
 	ClusterICEnvelope env;
 
-	if (msg_type == 0 || msg_type >= CLUSTER_IC_MSG_TYPE_MAX)
+	if (msg_type == 0 || (int)msg_type >= CLUSTER_IC_MSG_TYPE_MAX)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("cluster_ic_send_envelope: msg_type %u out of range", msg_type)));
 
@@ -227,7 +227,7 @@ cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload)
 	if (env == NULL)
 		return false;
 
-	if (env->msg_type == 0 || env->msg_type >= CLUSTER_IC_MSG_TYPE_MAX)
+	if (env->msg_type == 0 || (int)env->msg_type >= CLUSTER_IC_MSG_TYPE_MAX)
 		return false; /* peer sent malformed msg_type; caller close peer */
 
 	info = &dispatch_table[env->msg_type];
@@ -277,7 +277,7 @@ cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload)
 const ClusterICMsgTypeInfo *
 cluster_ic_get_msg_type_info(uint8 msg_type)
 {
-	if (msg_type == 0 || msg_type >= CLUSTER_IC_MSG_TYPE_MAX)
+	if (msg_type == 0 || (int)msg_type >= CLUSTER_IC_MSG_TYPE_MAX)
 		return NULL;
 	if (!slot_registered(&dispatch_table[msg_type]))
 		return NULL;
@@ -297,5 +297,6 @@ cluster_ic_router_count_registered(void)
 	}
 	return count;
 }
+
 
 #endif /* USE_PGRAC_CLUSTER */

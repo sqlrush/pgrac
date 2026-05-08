@@ -1494,6 +1494,25 @@ CREATE VIEW pg_cluster_ic_peers AS
 REVOKE ALL ON pg_cluster_ic_peers FROM PUBLIC;
 GRANT SELECT ON pg_cluster_ic_peers TO PUBLIC;
 
+-- PGRAC: pg_cluster_ic_msg_types (spec-2.3 D8; 2026-05-08).
+--   Lists every IC message type registered in the process-local
+--   dispatch_table[] under cluster_ic_router.c.  Diagnostic /
+--   observability only; no state mutation.  Backed by
+--   cluster_get_ic_msg_types (OID 8915).  Producer mask is the
+--   bitwise OR of CLUSTER_IC_PRODUCER_<role> values; see
+--   cluster_ic_router.h.  handler_present is FALSE for send-only
+--   msg_types and TRUE for those LMON dispatches inbound.
+CREATE VIEW pg_cluster_ic_msg_types AS
+    SELECT msg_type,
+           name,
+           allowed_producer_mask,
+           broadcast_ok,
+           handler_present
+      FROM cluster_get_ic_msg_types();
+
+REVOKE ALL ON pg_cluster_ic_msg_types FROM PUBLIC;
+GRANT SELECT ON pg_cluster_ic_msg_types TO PUBLIC;
+
 -- PGRAC: pg_cluster_state (stage 0.29).
 --   One-stop diagnostic snapshot covering every cluster subsystem's
 --   runtime state expressed as (category, key, value) triples:

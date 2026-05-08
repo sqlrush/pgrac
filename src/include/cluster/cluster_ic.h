@@ -199,7 +199,12 @@ extern const ClusterICOps *ClusterICOps_Active;
  */
 #define PGRAC_IC_HELLO_MAGIC ((uint32)0x4F4C4C48) /* "HLLO" LE */
 #define PGRAC_IC_HELLO_VERSION_V1 ((uint16)1)
-#define PGRAC_IC_ENVELOPE_VERSION_V1 ((uint16)1) /* spec-2.0 §4 frozen */
+/*
+ * spec-2.3 D3: PGRAC_IC_ENVELOPE_VERSION_V1 is now defined in
+ * cluster_ic_envelope.h as ((uint8)1) — the authoritative
+ * envelope wire constant.  HELLO carries it in a 2-byte slot
+ * (frozen ABI) via implicit promotion to uint16 at use site.
+ */
 #define PGRAC_IC_HELLO_BYTES 64
 #define PGRAC_IC_CLUSTER_NAME_MAX 24
 
