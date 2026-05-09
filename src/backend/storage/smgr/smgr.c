@@ -11,24 +11,41 @@
  *
  * PGRAC MODIFICATIONS
  *	  Modified by: SqlRush <sqlrush@gmail.com>
- *	  Stage:        1.2
+ *	  Stage:        1.2 + 2.7
  *
- *	  Extended smgrsw[] from 1 to 2 entries (under USE_PGRAC_CLUSTER):
- *	  index 0 stays md.c, index 1 routes to cluster_smgr (cluster-aware
- *	  storage that bridges into the spec-1.1 cluster_shared_fs vtable).
- *	  smgropen() now consults cluster_smgr_which_for() to pick the
- *	  smgr_which value at relation-open time; default behaviour
- *	  (cluster.smgr_user_relations = off, the GUC default) returns 0
- *	  for every rlocator so the production path is byte-for-byte
- *	  identical to upstream.
+ *	  Stage 1.2 (initial):
+ *	    Extended smgrsw[] from 1 to 2 entries (under USE_PGRAC_CLUSTER):
+ *	    index 0 stays md.c, index 1 routes to cluster_smgr (cluster-aware
+ *	    storage that bridges into the spec-1.1 cluster_shared_fs vtable).
+ *	    smgropen() now consults cluster_smgr_which_for() to pick the
+ *	    smgr_which value at relation-open time; default behaviour
+ *	    (cluster.smgr_user_relations = off, the GUC default) returns 0
+ *	    for every rlocator so the production path is byte-for-byte
+ *	    identical to upstream.
  *
- *	  In --disable-cluster builds neither the include nor the array
- *	  extension fires, so smgrsw[] remains a single element and
- *	  smgr_which is forced to 0 -- spec-0.3 binary contract.
+ *	    In --disable-cluster builds neither the include nor the array
+ *	    extension fires, so smgrsw[] remains a single element and
+ *	    smgr_which is forced to 0 -- spec-0.3 binary contract.
+ *
+ *	  Stage 2.7 (spec-2.7 v0.2 frozen 2026-05-09):
+ *	    Added three cluster invalidation hook call sites alongside the
+ *	    existing process-local invalidation paths:
+ *	      smgrextend / smgrzeroextend -> cluster_smgr_invalidate_relation
+ *	      smgrtruncate2               -> cluster_smgr_invalidate_relation
+ *	      smgrdounlinkall             -> cluster_smgr_invalidate_unlink_pending
+ *	    Hook bodies are pure cross-instance broadcast STUBs at this
+ *	    stage (counter atomic add only;no DEBUG2 hot path log per
+ *	    Q3 v0.2). spec-2.27 SI Broadcaster will activate the wire
+ *	    send + ack path without further changes to this PG-original
+ *	    file. All hook calls are gated `if (cluster_enabled)` and
+ *	    wrapped in `#ifdef USE_PGRAC_CLUSTER`, so disable-cluster
+ *	    and cluster.enabled=off paths stay byte-identical to
+ *	    upstream PG.
  *
  *	  Related design:
  *	    docs/cluster-smgr-design.md v1.1 (方案 C 单文件)
  *	    specs/spec-1.2-smgr-cluster.md
+ *	    specs/spec-2.7-smgr-cluster-2node-concurrent-open.md
  *
  *
  * IDENTIFICATION
@@ -45,7 +62,8 @@
 #include "storage/ipc.h"
 #include "storage/md.h"
 #ifdef USE_PGRAC_CLUSTER
-#include "cluster/storage/cluster_smgr.h"		/* PGRAC: smgrsw[1] */
+#include "cluster/cluster_guc.h"		/* PGRAC: cluster_enabled */
+#include "cluster/storage/cluster_smgr.h"		/* PGRAC: smgrsw[1] + spec-2.7 hooks */
 #endif
 #include "storage/smgr.h"
 #include "utils/hsearch.h"
@@ -543,6 +561,19 @@ smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo)
 			smgrsw[which].smgr_unlink(rlocators[i], forknum, isRedo);
 	}
 
+	/* PGRAC: spec-2.7 cross-instance unlink-pending hook.  Fires once
+	 * per relation after the physical unlink so cluster_smgr can drop
+	 * its local fd / HTAB entry (Q1 v0.2 local real action) and
+	 * spec-2.27 SI Broadcaster can later signal peer instances via
+	 * SINVAL_SMGR_UNLINK_PENDING. */
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_enabled)
+	{
+		for (i = 0; i < nrels; i++)
+			cluster_smgr_invalidate_unlink_pending(rlocators[i].locator);
+	}
+#endif
+
 	pfree(rlocators);
 }
 
@@ -572,6 +603,13 @@ smgrextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		reln->smgr_cached_nblocks[forknum] = blocknum + 1;
 	else
 		reln->smgr_cached_nblocks[forknum] = InvalidBlockNumber;
+
+	/* PGRAC: spec-2.7 cross-instance invalidation hook (per-operation
+	 * granularity per Q3 v0.2 — counter atomic-add only, no DEBUG2). */
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_enabled)
+		cluster_smgr_invalidate_relation(reln->smgr_rlocator.locator, forknum);
+#endif
 }
 
 /*
@@ -597,6 +635,15 @@ smgrzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		reln->smgr_cached_nblocks[forknum] = blocknum + nblocks;
 	else
 		reln->smgr_cached_nblocks[forknum] = InvalidBlockNumber;
+
+	/* PGRAC: spec-2.7 cross-instance invalidation hook (per-operation
+	 * granularity per Q3 v0.2 — fires once per smgrzeroextend regardless
+	 * of nblocks, not per-block — coalescing is spec-2.27 SI
+	 * Broadcaster's responsibility). */
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_enabled)
+		cluster_smgr_invalidate_relation(reln->smgr_rlocator.locator, forknum);
+#endif
 }
 
 /*
@@ -790,6 +837,22 @@ smgrtruncate2(SMgrRelation reln, ForkNumber *forknum, int nforks,
 		reln->smgr_cached_nblocks[forknum[i]] =
 			nblocks[i] > old_nblocks[i] ? old_nblocks[i] : nblocks[i];
 	}
+
+	/* PGRAC: spec-2.7 cross-instance invalidation hook (per-operation
+	 * per Q3 v0.2 — one fire per truncated fork inside the loop body
+	 * is overkill since this is the loop-end barrier; one fire per
+	 * smgrtruncate2 call covering all nforks is sufficient because
+	 * spec-2.27 SI Broadcaster will receive the rlocator and re-derive
+	 * the affected forks via its own catalog probe). Loop over nforks
+	 * to give the per-fork rlocator+fork pair to the stub counter so
+	 * future SI Broadcaster activations see deterministic input. */
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_enabled)
+	{
+		for (i = 0; i < nforks; i++)
+			cluster_smgr_invalidate_relation(reln->smgr_rlocator.locator, forknum[i]);
+	}
+#endif
 }
 
 /*

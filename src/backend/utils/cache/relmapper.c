@@ -37,6 +37,33 @@
  *
  *-------------------------------------------------------------------------
  */
+
+/*
+ * ============================================================
+ * PGRAC MODIFICATIONS
+ *
+ * Modified by: SqlRush <sqlrush@gmail.com>
+ *
+ * What changed:
+ *   - Added a single hook call inside RelationMapInvalidate() to
+ *     mirror sinval-driven relation-map invalidations across cluster
+ *     instances.  The hook body itself is a stub at Stage 2.7 (only
+ *     bumps the cross-instance broadcast STUB counter); spec-2.27
+ *     SI Broadcaster will turn it into a real wire send.
+ *
+ * Why:
+ *   - PG sinval is process-local on its own.  When two cluster
+ *     instances each have a backend with shared / per-database map
+ *     files cached, the local RelationMapInvalidate path only
+ *     reloads the calling backend's copy.  spec-2.7 §2.4 wires the
+ *     boundary now so that spec-2.27 can flip the stub to real
+ *     without touching this PG-original file again (per AD-001
+ *     Option C "wire boundaries early, activate late" pattern).
+ *
+ * Spec: spec-2.7-smgr-cluster-2node-concurrent-open.md (v0.2 frozen
+ *       2026-05-09; Q2 v0.2 confirms `bool shared` signature reuse).
+ * ============================================================
+ */
 #include "postgres.h"
 
 #include <fcntl.h>
@@ -55,6 +82,11 @@
 #include "storage/lwlock.h"
 #include "utils/inval.h"
 #include "utils/relmapper.h"
+
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"		/* cluster_enabled */
+#include "cluster/storage/cluster_smgr.h" /* cluster_smgr_invalidate_relmap */
+#endif
 
 
 /*
@@ -478,6 +510,20 @@ RelationMapInvalidate(bool shared)
 		if (local_map.magic == RELMAPPER_FILEMAGIC)
 			load_relmap_file(false, false);
 	}
+
+	/* PGRAC MODIFICATIONS by SqlRush:
+	 * What changed: notify cluster_smgr layer so it can broadcast
+	 *   the relation-map invalidation to peer instances.  Stage 2.7
+	 *   stub -- bumps a counter only;spec-2.27 will activate the
+	 *   real SI Broadcaster wire send.
+	 * Why: PG sinval is process-local;cluster peers' cached maps
+	 *   would otherwise stay stale after a shared-catalog map
+	 *   rewrite (VACUUM FULL on pg_database etc.).  See spec-2.7
+	 *   §2.4 + Q2 v0.2 (signature reuse: `bool shared`). */
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_enabled)
+		cluster_smgr_invalidate_relmap(shared);
+#endif
 }
 
 /*
