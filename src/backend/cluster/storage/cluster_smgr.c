@@ -104,6 +104,22 @@ static HTAB *cluster_smgr_relations = NULL;
 #define CLUSTER_SMGR_INITIAL_HTAB_SIZE 1024
 
 
+/*
+ * spec-2.7 D6 (v0.2 frozen 2026-05-09):  cross-instance broadcast
+ * STUB call counter.  Incremented at the end of every
+ * cluster_smgr_invalidate_* hook body.  Counts the cross-instance
+ * portion only (the local handle/HTAB cleanup inside
+ * invalidate_unlink_pending is NOT counted here -- it's already
+ * covered by PG SMgrRelation lifecycle observability per Q5 v0.2).
+ *
+ * spec-2.27 will rename this to
+ * cluster_smgr_remote_invalidation_count (drop `_stub_`) and add
+ * per-type sub-counters once the SI Broadcaster wire protocol lands.
+ */
+pg_atomic_uint64 cluster_smgr_remote_invalidation_stub_call_count;
+static bool cluster_smgr_remote_invalidation_counter_initialised = false;
+
+
 /* ============================================================
  * State helpers
  * ============================================================ */
@@ -198,6 +214,17 @@ cluster_smgr_init(void)
 	 */
 	if (cluster_smgr_relations != NULL)
 		return;
+
+	/*
+	 * spec-2.7 D6: initialise the cross-instance broadcast STUB call
+	 * counter.  Idempotent guard mirrors the HTAB lazy-init pattern
+	 * above so multiple cluster_smgr_init calls in the same backend
+	 * stay safe.
+	 */
+	if (!cluster_smgr_remote_invalidation_counter_initialised) {
+		pg_atomic_init_u64(&cluster_smgr_remote_invalidation_stub_call_count, 0);
+		cluster_smgr_remote_invalidation_counter_initialised = true;
+	}
 
 	memset(&info, 0, sizeof(info));
 	info.keysize = sizeof(RelFileLocatorBackend);
@@ -596,5 +623,141 @@ cluster_smgr_active_relation_count(void)
 
 	return (int)hash_get_num_entries(cluster_smgr_relations);
 }
+
+
+/* ============================================================
+ * spec-2.7 invalidation hooks (v0.2 frozen 2026-05-09)
+ *
+ *	Three entry points for cluster-aware cache invalidation that
+ *	spec-2.27 will activate with cross-instance SI Broadcaster wire
+ *	send + ack.  The current bodies are stubs except for one local
+ *	real action inside invalidate_unlink_pending.
+ *
+ *	See cluster_smgr.h hook block for the full per-hook contract and
+ *	specs/spec-2.7-smgr-cluster-2node-concurrent-open.md §3.2 for
+ *	the v0.2 stub behaviour契约.
+ * ============================================================ */
+
+/*
+ * Helper: close any open ClusterSharedFsHandle for `rlocator` and
+ * remove the bypass HTAB entry.  Used only by
+ * cluster_smgr_invalidate_unlink_pending to prevent a stale fd /
+ * stale HTAB entry from outliving an unlink.
+ *
+ * Permanent relations live under InvalidBackendId in the HTAB key
+ * (RelFileLocatorBackend); temp relations are routed to md.c by
+ * cluster_smgr_which_for and never reach this path.  We therefore
+ * look up with backend == InvalidBackendId.
+ */
+static void
+cluster_smgr_close_handle_for_rlocator(RelFileLocator rlocator)
+{
+	RelFileLocatorBackend key;
+	ClusterSmgrRelationState *state;
+
+	if (cluster_smgr_relations == NULL)
+		return;
+
+	key.locator = rlocator;
+	key.backend = InvalidBackendId;
+
+	state = (ClusterSmgrRelationState *)hash_search(cluster_smgr_relations, &key, HASH_FIND,
+													NULL);
+	if (state == NULL)
+		return;
+
+	cluster_smgr_state_drop_handles(state);
+	hash_search(cluster_smgr_relations, &key, HASH_REMOVE, NULL);
+
+	elog(DEBUG3, "cluster_smgr: invalidate_unlink_pending closed handle for rlocator %u/%u/%u",
+		 rlocator.spcOid, rlocator.dbOid, rlocator.relNumber);
+}
+
+
+void
+cluster_smgr_invalidate_relation(RelFileLocator rlocator, ForkNumber forknum)
+{
+	/*
+	 * spec-2.7 Q1 v0.2:  pure cross-instance broadcast STUB.  No
+	 * local action -- PG smgr.c invalidates its own
+	 * smgr_cached_nblocks via existing extend / truncate internals;
+	 * cluster_smgr layer carries no relation-keyed cache to flush.
+	 *
+	 * spec-2.27 will replace this body with an SI Broadcaster send
+	 * for sinval message type SINVAL_SMGR_INVALIDATE_RELATION.
+	 *
+	 * Q3 v0.2:  no hot-path DEBUG2 ereport (errstart_cold short-
+	 * circuit costs ~100ns; per-block smgrextend in 1024-block
+	 * batches would amount to ~100us of pure noise).  Counter atomic
+	 * add only.
+	 */
+	(void)rlocator;
+	(void)forknum;
+
+	if (!cluster_smgr_remote_invalidation_counter_initialised) {
+		pg_atomic_init_u64(&cluster_smgr_remote_invalidation_stub_call_count, 0);
+		cluster_smgr_remote_invalidation_counter_initialised = true;
+	}
+	pg_atomic_fetch_add_u64(&cluster_smgr_remote_invalidation_stub_call_count, 1);
+}
+
+
+void
+cluster_smgr_invalidate_relmap(bool shared)
+{
+	/*
+	 * spec-2.7 Q1 v0.2 + Q2 v0.2:  pure cross-instance broadcast
+	 * STUB.  PG relmapper.c reloads its local map cache via
+	 * load_relmap_file().  `shared` matches PG's
+	 * RelationMapInvalidate(bool shared) signature:
+	 *   shared = true  -> shared catalogs (pg_database, pg_authid, ...)
+	 *   shared = false -> current MyDatabaseId per-database catalogs
+	 * spec-2.27 SI Broadcaster will read `shared` to dispatch the
+	 * correct sinval message type.
+	 */
+	(void)shared;
+
+	if (!cluster_smgr_remote_invalidation_counter_initialised) {
+		pg_atomic_init_u64(&cluster_smgr_remote_invalidation_stub_call_count, 0);
+		cluster_smgr_remote_invalidation_counter_initialised = true;
+	}
+	pg_atomic_fetch_add_u64(&cluster_smgr_remote_invalidation_stub_call_count, 1);
+}
+
+
+void
+cluster_smgr_invalidate_unlink_pending(RelFileLocator rlocator)
+{
+	/*
+	 * spec-2.7 Q1 v0.2:  cross-instance broadcast STUB +
+	 * LOCAL REAL action.
+	 *
+	 * Local real:  close any open ClusterSharedFsHandle for
+	 * `rlocator` and remove the bypass HTAB entry.  Without this,
+	 * an unlink-then-recreate of the same rlocator could reach the
+	 * now-gone underlying file via a stale fd in this process's
+	 * HTAB cache.
+	 *
+	 * Cross-instance STUB:  spec-2.27 SI Broadcaster will add
+	 * SINVAL_SMGR_UNLINK_PENDING wire send + peer-ack barrier here.
+	 */
+	cluster_smgr_close_handle_for_rlocator(rlocator);
+
+	if (!cluster_smgr_remote_invalidation_counter_initialised) {
+		pg_atomic_init_u64(&cluster_smgr_remote_invalidation_stub_call_count, 0);
+		cluster_smgr_remote_invalidation_counter_initialised = true;
+	}
+	pg_atomic_fetch_add_u64(&cluster_smgr_remote_invalidation_stub_call_count, 1);
+}
+
+
+uint64
+cluster_smgr_get_remote_invalidation_stub_call_count(void)
+{
+	if (!cluster_smgr_remote_invalidation_counter_initialised)
+		return 0;
+	return pg_atomic_read_u64(&cluster_smgr_remote_invalidation_stub_call_count);
+}
+
 
 #endif /* USE_PGRAC_CLUSTER */

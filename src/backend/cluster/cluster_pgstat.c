@@ -54,6 +54,7 @@ PG_FUNCTION_INFO_V1(cluster_get_pgstat_counters);
 #ifdef USE_PGRAC_CLUSTER
 
 #include "cluster/cluster_inject.h" /* cluster_injection_armed_count */
+#include "cluster/storage/cluster_smgr.h" /* spec-2.7 remote invalidation stub counter */
 
 
 /* ============================================================
@@ -68,6 +69,14 @@ PG_FUNCTION_INFO_V1(cluster_get_pgstat_counters);
  */
 static ClusterPgstatCounter cluster_pgstat_counters[] = {
 	{ .name = "cluster.inject.armed_count" },
+	/*
+	 * spec-2.7 D6 (v0.2 frozen 2026-05-09):  mirror of the
+	 * cross-instance broadcast STUB call counter owned by
+	 * cluster_smgr.c.  Synchronised at SRF entry via
+	 * cluster_pgstat_sync_mirrors so SQL queries against
+	 * pg_stat_cluster_counters always reflect the live atomic.
+	 */
+	{ .name = "cluster.smgr.remote_invalidation_stub_call_count" },
 };
 
 #define CLUSTER_PGSTAT_COUNT lengthof(cluster_pgstat_counters)
@@ -222,6 +231,15 @@ cluster_pgstat_sync_mirrors(void)
 	armed_count = cluster_pgstat_lookup("cluster.inject.armed_count");
 	if (armed_count != NULL)
 		cluster_pgstat_set(armed_count, (uint64)cluster_injection_armed_count);
+
+	{
+		ClusterPgstatCounter *remote_inval;
+
+		remote_inval = cluster_pgstat_lookup("cluster.smgr.remote_invalidation_stub_call_count");
+		if (remote_inval != NULL)
+			cluster_pgstat_set(remote_inval,
+							   cluster_smgr_get_remote_invalidation_stub_call_count());
+	}
 }
 
 #endif /* USE_PGRAC_CLUSTER */

@@ -73,6 +73,7 @@
 #ifndef CLUSTER_SMGR_H
 #define CLUSTER_SMGR_H
 
+#include "port/atomics.h"
 #include "storage/block.h"
 #include "storage/relfilelocator.h"
 #include "storage/smgr.h"
@@ -158,6 +159,58 @@ extern void cluster_smgr_immedsync(SMgrRelation reln, ForkNumber forknum);
  * ----------
  */
 extern int cluster_smgr_active_relation_count(void);
+
+
+/* ----------
+ * spec-2.7 invalidation hooks (v0.2 frozen 2026-05-09).
+ *
+ *	Three entry points for cluster-aware cache invalidation that
+ *	spec-2.27 will wire into the SI Broadcaster aux process (see
+ *	specs/spec-2.7-smgr-cluster-2node-concurrent-open.md §8 Q1 v0.2
+ *	for the full design rationale).
+ *
+ *	Per Q1 v0.2:
+ *	  - cluster_smgr_invalidate_relation:  pure cross-instance
+ *	    broadcast STUB.  No local action -- PG smgr.c invalidates
+ *	    its own smgr_cached_nblocks via existing extend / truncate
+ *	    internals.  cluster_smgr layer carries no relation-keyed
+ *	    nblocks cache (see ClusterSmgrRelationState comment in
+ *	    cluster_smgr.c).
+ *	  - cluster_smgr_invalidate_relmap(bool shared):  pure cross-
+ *	    instance STUB.  Signature matches PG's RelationMapInvalidate
+ *	    (shared=true means the shared-catalog map; shared=false means
+ *	    the current MyDatabaseId per-database map).  PG relmapper.c
+ *	    reloads its local cache via load_relmap_file().
+ *	  - cluster_smgr_invalidate_unlink_pending:  cross-instance STUB
+ *	    PLUS a LOCAL REAL action -- close any open
+ *	    ClusterSharedFsHandle for `rlocator` and remove the bypass
+ *	    HTAB entry.  Without this, an unlink-then-recreate of the
+ *	    same rlocator could reach the now-gone underlying file via
+ *	    a stale fd.
+ *
+ *	Per Q3 v0.2:  hook bodies do not emit hot-path DEBUG2 ereport
+ *	(errstart_cold short-circuit still costs ~100ns; per-block
+ *	smgrextend in 1024-block batches would amount to ~100us of pure
+ *	noise).  Coalescing across (rel, fork) is spec-2.27 SI Broadcaster
+ *	queue's job, not the hook layer's.
+ *
+ *	Per Q5 v0.2:  the single counter
+ *	`cluster_smgr_remote_invalidation_stub_call_count` records the
+ *	cross-instance broadcast STUB portion only (atomic-add at the end
+ *	of every hook body).  It does NOT count the local handle/HTAB
+ *	cleanup inside invalidate_unlink_pending; that local action is
+ *	already covered by PG SMgrRelation lifecycle observability.
+ *	spec-2.27 will rename this to
+ *	`cluster_smgr_remote_invalidation_count` (drop `_stub_`) and add
+ *	per-type sub-counters + per-rlocator histograms.
+ * ----------
+ */
+extern void cluster_smgr_invalidate_relation(RelFileLocator rlocator, ForkNumber forknum);
+extern void cluster_smgr_invalidate_relmap(bool shared);
+extern void cluster_smgr_invalidate_unlink_pending(RelFileLocator rlocator);
+
+extern pg_atomic_uint64 cluster_smgr_remote_invalidation_stub_call_count;
+extern uint64 cluster_smgr_get_remote_invalidation_stub_call_count(void);
 
 
 #endif /* CLUSTER_SMGR_H */

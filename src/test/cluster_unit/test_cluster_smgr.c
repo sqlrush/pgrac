@@ -391,13 +391,112 @@ UT_TEST(test_smgrsw_callback_signature_compiles)
 
 
 /* ============================================================
+ * spec-2.7 invalidation hook unit tests (v0.2 frozen 2026-05-09).
+ *
+ *	The HTAB stubs above make hash_search / hash_create no-ops, so
+ *	cluster_smgr_relations stays NULL throughout this test.  That
+ *	suits Q1 v0.2's contract:
+ *	  - invalidate_relation / invalidate_relmap have NO local action,
+ *	    they just bump the cross-instance STUB counter.
+ *	  - invalidate_unlink_pending's local real action goes through
+ *	    cluster_smgr_close_handle_for_rlocator, which short-circuits
+ *	    when cluster_smgr_relations == NULL -- exactly what we want
+ *	    here so the test exercises only the counter portion safely.
+ *
+ *	The runtime "real HTAB entry actually removed" verification lives
+ *	in t/090_smgr_cluster_2node_concurrent_open.pl L4 + L5; here we
+ *	verify only the counter contract and the function-symbol surface.
+ * ============================================================ */
+
+UT_TEST(test_invalidate_relation_is_pure_stub)
+{
+	RelFileLocator rl = { .spcOid = 1664, .dbOid = 5, .relNumber = 16385 };
+	uint64 before;
+	uint64 after;
+
+	before = cluster_smgr_get_remote_invalidation_stub_call_count();
+	cluster_smgr_invalidate_relation(rl, MAIN_FORKNUM);
+	after = cluster_smgr_get_remote_invalidation_stub_call_count();
+
+	/* Counter advanced by exactly one;cluster_smgr_active_relation_count
+	 * unchanged because invalidate_relation has no local HTAB action. */
+	UT_ASSERT_EQ(after - before, 1);
+	UT_ASSERT_EQ(cluster_smgr_active_relation_count(), 0);
+}
+
+
+UT_TEST(test_invalidate_relmap_takes_bool_shared)
+{
+	uint64 before;
+	uint64 after;
+
+	before = cluster_smgr_get_remote_invalidation_stub_call_count();
+	cluster_smgr_invalidate_relmap(true);  /* shared catalog map */
+	cluster_smgr_invalidate_relmap(false); /* per-database map */
+	after = cluster_smgr_get_remote_invalidation_stub_call_count();
+
+	/* Both shared=true and shared=false bump the same counter.
+	 * Q2 v0.2 sig check: the call must compile against `bool shared`. */
+	UT_ASSERT_EQ(after - before, 2);
+}
+
+
+UT_TEST(test_invalidate_unlink_pending_includes_local_close)
+{
+	RelFileLocator rl = { .spcOid = 1664, .dbOid = 5, .relNumber = 16386 };
+	uint64 before;
+	uint64 after;
+
+	before = cluster_smgr_get_remote_invalidation_stub_call_count();
+	cluster_smgr_invalidate_unlink_pending(rl);
+	after = cluster_smgr_get_remote_invalidation_stub_call_count();
+
+	/*
+	 * Counter advanced by one (cross-instance STUB portion).
+	 * Local close path is no-op here because cluster_smgr_relations
+	 * stays NULL with the test HTAB stubs;the body must short-
+	 * circuit gracefully on NULL HTAB instead of segfaulting.
+	 */
+	UT_ASSERT_EQ(after - before, 1);
+	UT_ASSERT_EQ(cluster_smgr_active_relation_count(), 0);
+}
+
+
+UT_TEST(test_remote_invalidation_counter_is_atomic_and_monotonic)
+{
+	RelFileLocator rl = { .spcOid = 1664, .dbOid = 5, .relNumber = 16387 };
+	uint64 baseline;
+	uint64 final;
+
+	baseline = cluster_smgr_get_remote_invalidation_stub_call_count();
+
+	/* Three different hook entry points, three different argument
+	 * shapes -- all funnel into the same atomic counter. */
+	cluster_smgr_invalidate_relation(rl, MAIN_FORKNUM);
+	cluster_smgr_invalidate_relmap(true);
+	cluster_smgr_invalidate_unlink_pending(rl);
+
+	final = cluster_smgr_get_remote_invalidation_stub_call_count();
+
+	UT_ASSERT_EQ(final - baseline, 3);
+
+	/*
+	 * Counter symbol must be link-resolvable in --enable-cluster builds.
+	 * Address-take exercises the public extern -- spec-2.27 amend
+	 * will rename this symbol in lockstep with the counter rename.
+	 */
+	UT_ASSERT_NOT_NULL((void *)&cluster_smgr_remote_invalidation_stub_call_count);
+}
+
+
+/* ============================================================
  * Test runner
  * ============================================================ */
 
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(11);
 	UT_RUN(test_smgr_callbacks_linkable);
 	UT_RUN(test_which_for_temp_relation_returns_md);
 	UT_RUN(test_which_for_stub_backend_returns_md);
@@ -405,6 +504,10 @@ main(void)
 	UT_RUN(test_which_for_full_opt_in_returns_cluster);
 	UT_RUN(test_active_relation_count_pre_init);
 	UT_RUN(test_smgrsw_callback_signature_compiles);
+	UT_RUN(test_invalidate_relation_is_pure_stub);
+	UT_RUN(test_invalidate_relmap_takes_bool_shared);
+	UT_RUN(test_invalidate_unlink_pending_includes_local_close);
+	UT_RUN(test_remote_invalidation_counter_is_atomic_and_monotonic);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

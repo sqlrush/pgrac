@@ -85,6 +85,18 @@ void
 cluster_injection_run(const char *name pg_attribute_unused())
 {}
 
+/*
+ * spec-2.7 D6: cluster_pgstat.c also mirrors the cross-instance
+ * broadcast STUB call counter from cluster_smgr.c.  We are not
+ * linking cluster_smgr.o here; provide a stub returning 0 so the
+ * mirror-sync path compiles and reads a deterministic value.
+ */
+uint64
+cluster_smgr_get_remote_invalidation_stub_call_count(void)
+{
+	return 0;
+}
+
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 					 const char *fileName pg_attribute_unused(),
