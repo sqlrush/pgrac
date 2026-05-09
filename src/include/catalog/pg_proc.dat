@@ -12291,4 +12291,30 @@
   proargnames => '{node_id,state,last_heartbeat_send_at,last_heartbeat_recv_at,heartbeat_send_count,heartbeat_recv_count,suspected_since,dead_since,suspected_transitions}',
   prosrc => 'cluster_get_cssd_peers' },
 
+# spec-2.6 D15 (2026-05-09) -- pg_cluster_quorum_state SRF (oid 8917).
+# Returns one row reflecting current qvotec quorum state (in_quorum
+# computed via Q4 v0.2 lease check; counters from ClusterQvotecShmem).
+# 7 cols.
+{ oid => '8917', descr => 'show current cluster quorum state (spec-2.6)',
+  proname => 'cluster_get_quorum_state', prorows => '1',
+  proretset => 't', provolatile => 'v', proparallel => 'r',
+  prorettype => 'record', proargtypes => '',
+  proallargtypes => '{bool,int4,int4,int4,int8,timestamptz,text}',
+  proargmodes => '{o,o,o,o,o,o,o}',
+  proargnames => '{in_quorum,quorum_size,disks_ok,disks_total,current_epoch_at_boot,last_quorum_loss_at,collision_state}',
+  prosrc => 'cluster_get_quorum_state' },
+
+# spec-2.6 D15 (2026-05-09) -- pg_cluster_voting_disks SRF (oid 8918).
+# Returns one row per voting disk path declared in cluster.voting_disks
+# CSV.  Per-disk state + counters are placeholders (Step 4 skeleton);
+# real wiring lands in D8 follow-up hardening round.  7 cols.
+{ oid => '8918', descr => 'list voting disks declared in cluster.voting_disks (spec-2.6)',
+  proname => 'cluster_get_voting_disks', prorows => '3',
+  proretset => 't', provolatile => 'v', proparallel => 'r',
+  prorettype => 'record', proargtypes => '',
+  proallargtypes => '{text,text,timestamptz,timestamptz,int8,int8,int8}',
+  proargmodes => '{o,o,o,o,o,o,o}',
+  proargnames => '{path,state,last_read_at,last_write_at,read_count,write_count,io_error_count}',
+  prosrc => 'cluster_get_voting_disks' },
+
 ]

@@ -90,6 +90,14 @@ PG_FUNCTION_INFO_V1(cluster_get_ic_msg_types);
  */
 PG_FUNCTION_INFO_V1(cluster_get_cssd_peers);
 
+/*
+ * spec-2.6 D15 -- cluster_get_quorum_state + cluster_get_voting_disks
+ * SRFs.  Bodies live in cluster_qvotec.c (only compiled in --enable-
+ * cluster).  Same dual-link pattern as cssd_peers above.
+ */
+PG_FUNCTION_INFO_V1(cluster_get_quorum_state);
+PG_FUNCTION_INFO_V1(cluster_get_voting_disks);
+
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -1213,6 +1221,26 @@ cluster_get_cssd_peers(PG_FUNCTION_ARGS pg_attribute_unused())
 {
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("cluster_get_cssd_peers requires --enable-cluster")));
+	PG_RETURN_NULL();
+}
+
+/*
+ * spec-2.6 D15 -- cluster_get_quorum_state / cluster_get_voting_disks
+ * disable-cluster stubs.
+ */
+Datum
+cluster_get_quorum_state(PG_FUNCTION_ARGS pg_attribute_unused())
+{
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cluster_get_quorum_state requires --enable-cluster")));
+	PG_RETURN_NULL();
+}
+
+Datum
+cluster_get_voting_disks(PG_FUNCTION_ARGS pg_attribute_unused())
+{
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cluster_get_voting_disks requires --enable-cluster")));
 	PG_RETURN_NULL();
 }
 #endif

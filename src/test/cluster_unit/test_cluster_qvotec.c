@@ -239,6 +239,37 @@ cluster_postmaster_start_qvotec(void)
 
 bool cluster_enabled = true;
 
+/* spec-2.6 D15 stubs: PG SRF machinery referenced from cluster_qvotec.o
+ * SRF bodies (cluster_get_quorum_state / cluster_get_voting_disks).
+ * The unit test never invokes the SRFs — symbols only need to resolve. */
+#include "funcapi.h"
+#include "utils/builtins.h"
+
+char *cluster_voting_disks = NULL;
+
+void
+InitMaterializedSRF(FunctionCallInfo fcinfo pg_attribute_unused(),
+					bits32 flags pg_attribute_unused())
+{}
+struct varlena *
+cstring_to_text(const char *s pg_attribute_unused())
+{
+	return NULL;
+}
+void *
+palloc(Size size pg_attribute_unused())
+{
+	return NULL;
+}
+void
+pfree(void *p pg_attribute_unused())
+{}
+void
+tuplestore_putvalues(Tuplestorestate *state pg_attribute_unused(),
+					 TupleDesc tdesc pg_attribute_unused(), Datum *values pg_attribute_unused(),
+					 bool *isnull pg_attribute_unused())
+{}
+
 
 UT_DEFINE_GLOBALS();
 

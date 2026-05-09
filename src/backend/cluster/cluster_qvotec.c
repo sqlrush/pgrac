@@ -548,6 +548,148 @@ cluster_qvotec_start(void)
 }
 
 
+/* ============================================================
+ * D15 SRFs — pg_cluster_quorum_state + pg_cluster_voting_disks.
+ *
+ *	PG_FUNCTION_INFO_V1 macros + disable-cluster stubs live in
+ *	cluster_ic.c (always-linked file).  Bodies here only compiled
+ *	in --enable-cluster builds.
+ *
+ *	cluster_get_quorum_state — single row, 7 cols:
+ *	  in_quorum bool / quorum_size int / disks_ok int / disks_total
+ *	  int / current_epoch_at_boot int8 / last_quorum_loss_at
+ *	  timestamptz / collision_state text
+ *
+ *	cluster_get_voting_disks — per-disk row, 7 cols:
+ *	  path text / state text / last_read_at timestamptz /
+ *	  last_write_at timestamptz / read_count int8 / write_count int8
+ *	  / io_error_count int8
+ *
+ *	Step 4 scope: SRF skeleton against current shmem.  Per-disk
+ *	timestamps + per-disk counters are NULL/0 placeholders until D8
+ *	phase 4 driver wires real qvotec poll cycle (deferred per Step 3
+ *	hardening).  Aggregate disks_ok / disks_total / global I/O error
+ *	count are surfaced where wired.
+ * ============================================================ */
+
+#include "cluster/cluster_pgstat.h" /* cluster.qvotec.* counters */
+#include "cluster/cluster_qvotec.h" /* public accessors */
+#include "funcapi.h"
+#include "utils/builtins.h" /* CStringGetTextDatum */
+
+Datum
+cluster_get_quorum_state(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo;
+	Datum values[7];
+	bool nulls[7];
+	int col = 0;
+	uint64 ts;
+
+	InitMaterializedSRF(fcinfo, 0);
+	rsinfo = (ReturnSetInfo *)fcinfo->resultinfo;
+
+	if (QvotecShmem == NULL) {
+		/* qvotec shmem not initialised (cluster.enabled=off / boot
+		 * race) — emit one row with all-NULL state per Q5 v0.2
+		 * "fail-closed default" reasoning. */
+		Datum n_values[7] = { 0 };
+		bool n_nulls[7] = { false, true, true, true, true, true, true };
+
+		n_values[0] = BoolGetDatum(false); /* in_quorum = false */
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, n_values, n_nulls);
+		return (Datum)0;
+	}
+
+	memset(nulls, false, sizeof(nulls));
+
+	values[col++] = BoolGetDatum(cluster_qvotec_in_quorum());
+	values[col++]
+		= Int32GetDatum((int32)pg_atomic_read_u32(&QvotecShmem->disks_total_count) / 2 + 1);
+	values[col++] = Int32GetDatum((int32)pg_atomic_read_u32(&QvotecShmem->disks_ok_count));
+	values[col++] = Int32GetDatum((int32)pg_atomic_read_u32(&QvotecShmem->disks_total_count));
+	values[col++] = Int64GetDatum((int64)pg_atomic_read_u64(&QvotecShmem->current_epoch_at_boot));
+
+	ts = pg_atomic_read_u64(&QvotecShmem->last_quorum_loss_ts_us);
+	if (ts == 0)
+		nulls[col] = true;
+	else
+		values[col] = TimestampTzGetDatum((TimestampTz)ts);
+	col++;
+
+	values[col++] = CStringGetTextDatum(cluster_qvotec_get_collision_state_name());
+
+	Assert(col == 7);
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+
+	return (Datum)0;
+}
+
+
+Datum
+cluster_get_voting_disks(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo;
+	const char *csv;
+	const char *p;
+
+	InitMaterializedSRF(fcinfo, 0);
+	rsinfo = (ReturnSetInfo *)fcinfo->resultinfo;
+
+	csv = cluster_voting_disks;
+	if (csv == NULL || csv[0] == '\0')
+		return (Datum)0; /* empty config → 0 rows */
+
+	p = csv;
+	while (*p) {
+		const char *start = p;
+		const char *end;
+		char *path_buf;
+		size_t len;
+		Datum values[7];
+		bool nulls[7] = { false, false, true, true, false, false, false };
+
+		while (*p && *p != ',')
+			p++;
+		end = p;
+
+		/* trim leading whitespace */
+		while (start < end && (*start == ' ' || *start == '\t'))
+			start++;
+		/* trim trailing whitespace */
+		while (end > start && (end[-1] == ' ' || end[-1] == '\t'))
+			end--;
+
+		len = end - start;
+		if (len == 0) {
+			if (*p == ',')
+				p++;
+			continue;
+		}
+
+		path_buf = palloc(len + 1);
+		memcpy(path_buf, start, len);
+		path_buf[len] = '\0';
+
+		values[0] = CStringGetTextDatum(path_buf);
+		values[1] = CStringGetTextDatum("unknown"); /* per-disk state
+													 * NULL until D8 */
+		/* values[2..3] last_read_at / last_write_at: NULL */
+		values[4] = Int64GetDatum(0); /* read_count: NULL until D8 */
+		values[5] = Int64GetDatum(0); /* write_count: NULL until D8 */
+		values[6] = Int64GetDatum(0); /* io_error_count: NULL until D8 */
+
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+		pfree(path_buf);
+
+		if (*p == ',')
+			p++;
+	}
+
+	return (Datum)0;
+}
+
+
 #else /* !USE_PGRAC_CLUSTER */
 
 /*

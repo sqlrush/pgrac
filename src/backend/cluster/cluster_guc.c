@@ -97,6 +97,12 @@ int cluster_cssd_heartbeat_interval_ms = 1000;
 /* spec-2.5 D9: CSSD dead deadband factor (multiplier of heartbeat interval). */
 int cluster_cssd_dead_deadband_factor = 3;
 
+/* spec-2.6 Sprint A Step 4 D12: 4 voting disk / quorum-lite GUCs. */
+char *cluster_voting_disks = NULL; /* CSV path list, default empty */
+int cluster_quorum_poll_interval_ms = 2000;
+int cluster_voting_disk_io_timeout_ms = 5000;
+int cluster_voting_disk_size_bytes = 65536;
+
 /* spec-2.2 D7 -- Tier 1 TCP transport tuning (PGC_POSTMASTER per §3.3). */
 int cluster_interconnect_heartbeat_interval_ms = 1000;
 int cluster_interconnect_connect_timeout_ms = 5000;
@@ -630,6 +636,67 @@ cluster_init_guc(void)
 					 "industry baseline).  Range [2, 10];admin can widen for "
 					 "long PG GC pause tolerance, narrow for tighter SLA."),
 		&cluster_cssd_dead_deadband_factor, 3, 2, 10, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	/*
+	 * spec-2.6 Sprint A Step 4 D12: 4 voting disk / quorum-lite GUCs.
+	 *
+	 * cluster.voting_disks (string CSV) — default empty.  Per Q7 v0.2,
+	 * empty + multi-node + cluster.allow_single_node=off = postmaster
+	 * startup FATAL (avoid silent fail-open).  Set via postgresql.conf
+	 * to a comma-separated list of voting disk file paths
+	 * (e.g. "/voting/disk1,/voting/disk2,/voting/disk3").
+	 */
+	DefineCustomStringVariable(
+		"cluster.voting_disks", gettext_noop("Comma-separated list of voting disk file paths."),
+		gettext_noop("Quorum-lite voting disk paths (spec-2.6 Q1/Q7 v0.2).  "
+					 "Empty (default) = qvotec disabled.  Multi-node + empty "
+					 "+ cluster.allow_single_node=off triggers postmaster "
+					 "startup FATAL.  Recommended: 3 disks across distinct "
+					 "failure domains; 1 / 5 / 7 also valid.  Each disk file "
+					 "size = cluster.voting_disk_size_bytes."),
+		&cluster_voting_disks, NULL, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	/*
+	 * cluster.quorum_poll_interval_ms (spec-2.6 D12).  qvotec MainLoop
+	 * tick interval.  Default 2000ms = 0.5Hz; range [500, 30000] ms.
+	 * Lease (Q4 v0.2) = poll_ts + 2 × this — backend in_quorum check
+	 * fails if now ≥ lease (defends qvotec hung silent stale-OK).
+	 */
+	DefineCustomIntVariable("cluster.quorum_poll_interval_ms",
+							gettext_noop("Quorum voting disk poll period in milliseconds."),
+							gettext_noop("qvotec MainLoop tick (spec-2.6 D12).  Default 2000ms.  "
+										 "Lease window = 2 × this — backend in_quorum check "
+										 "fails after lease expiry to defend against qvotec "
+										 "hung (Q4 v0.2 lease-based).  Range [500, 30000] ms."),
+							&cluster_quorum_poll_interval_ms, 2000, 500, 30000, PGC_POSTMASTER,
+							GUC_UNIT_MS, NULL, NULL, NULL);
+
+	/*
+	 * cluster.voting_disk_io_timeout_ms (spec-2.6 D12).  Per-I/O
+	 * read/write/fsync deadline.  Default 5000ms; range [500, 60000].
+	 */
+	DefineCustomIntVariable("cluster.voting_disk_io_timeout_ms",
+							gettext_noop("Voting disk single I/O timeout in milliseconds."),
+							gettext_noop("Per slot R/W/fsync deadline (spec-2.6 D12).  EIO "
+										 "after this → disks_ok_count-- counter increments.  "
+										 "Default 5000ms.  Range [500, 60000] ms."),
+							&cluster_voting_disk_io_timeout_ms, 5000, 500, 60000, PGC_POSTMASTER,
+							GUC_UNIT_MS, NULL, NULL, NULL);
+
+	/*
+	 * cluster.voting_disk_size_bytes (spec-2.6 D12).  Voting disk file
+	 * size — pre-allocated by qvotec on first boot.  Each instance owns
+	 * one 512-byte slot at offset (node_id × sizeof(ClusterVotingSlot)).
+	 * Default 65536 bytes = 128 instances × 512.  Range [4096, 1048576].
+	 */
+	DefineCustomIntVariable("cluster.voting_disk_size_bytes",
+							gettext_noop("Voting disk file size in bytes."),
+							gettext_noop("Pre-allocated voting disk size (spec-2.6 D12).  Each "
+										 "instance owns one 512-byte slot at offset (node_id "
+										 "× 512).  Default 65536 = 128 instance slots.  Range "
+										 "[4096, 1048576] bytes; must be a multiple of 512."),
+							&cluster_voting_disk_size_bytes, 65536, 4096, 1048576, PGC_POSTMASTER,
+							GUC_UNIT_BYTE, NULL, NULL, NULL);
 
 	/*
 	 * cluster.boc_sweep_interval_ms (spec-1.17 D4 v0.2).

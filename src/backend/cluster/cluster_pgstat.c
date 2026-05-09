@@ -77,6 +77,17 @@ static ClusterPgstatCounter cluster_pgstat_counters[] = {
 	 * pg_stat_cluster_counters always reflect the live atomic.
 	 */
 	{ .name = "cluster.smgr.remote_invalidation_stub_call_count" },
+	/*
+	 * spec-2.6 Sprint A Step 4 D10:  4 qvotec / quorum-lite counters.
+	 * Incremented by cluster_qvotec.c (poll cycle / quorum loss event /
+	 * collision detect event) and cluster_voting_disk_io.c (disk I/O
+	 * failure).  Read-only via pg_stat_cluster_counters; no mirror sync
+	 * since these are written directly to the registry atomic.
+	 */
+	{ .name = "cluster.qvotec.poll_cycle_count" },
+	{ .name = "cluster.qvotec.quorum_loss_event_count" },
+	{ .name = "cluster.qvotec.collision_detect_event_count" },
+	{ .name = "cluster.qvotec.disk_io_failure_count" },
 };
 
 #define CLUSTER_PGSTAT_COUNT lengthof(cluster_pgstat_counters)

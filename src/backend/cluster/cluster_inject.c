@@ -191,6 +191,12 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	{ .name = "cluster-cssd-main-loop-pre-tick" },
 	{ .name = "cluster-cssd-shutdown-pre" },
 	{ .name = "cluster-cssd-shutdown-post" },
+	/* spec-2.6 Sprint A Step 4 D14 — 5 qvotec / quorum-lite injects. */
+	{ .name = "cluster-qvotec-poll-pre" },
+	{ .name = "cluster-qvotec-poll-post" },
+	{ .name = "cluster-voting-disk-write-fail" },
+	{ .name = "cluster-quorum-loss-broadcast" },
+	{ .name = "cluster-collision-detect" },
 	/* Stage 1.15 (spec-1.15 D11 inject) — 4 SCN encoding-layer injects. */
 	{ .name = "cluster-scn-advance-pre" },
 	{ .name = "cluster-scn-advance-post" },

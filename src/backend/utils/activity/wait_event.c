@@ -1249,6 +1249,15 @@ pgstat_get_wait_cluster_bgproc(WaitEventCluster w)
 	case WAIT_EVENT_CLUSTER_BGPROC_CSSD_MAIN_LOOP:
 		event_name = "ClusterBgProcCssdMainLoop";
 		break;
+	case WAIT_EVENT_CLUSTER_BGPROC_QVOTEC_MAIN_LOOP:
+		event_name = "ClusterBgProcQvotecMainLoop";
+		break;
+	case WAIT_EVENT_CLUSTER_VOTING_DISK_READ:
+		event_name = "ClusterVotingDiskRead";
+		break;
+	case WAIT_EVENT_CLUSTER_VOTING_DISK_WRITE:
+		event_name = "ClusterVotingDiskWrite";
+		break;
 	default:
 		break;
 	}

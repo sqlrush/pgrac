@@ -1522,6 +1522,42 @@ CREATE VIEW pg_cluster_cssd_peers AS
 REVOKE ALL ON pg_cluster_cssd_peers FROM PUBLIC;
 GRANT SELECT ON pg_cluster_cssd_peers TO PUBLIC;
 
+-- PGRAC: pg_cluster_quorum_state (spec-2.6 D15; 2026-05-09).
+--   Single-row view exposing the current cluster quorum state.
+--   in_quorum reflects Q4 v0.2 lease semantics (false if frozen,
+--   quorum_state != OK, OR lease expired).  Backed by
+--   cluster_get_quorum_state (OID 8917).
+CREATE VIEW pg_cluster_quorum_state AS
+    SELECT in_quorum,
+           quorum_size,
+           disks_ok,
+           disks_total,
+           current_epoch_at_boot,
+           last_quorum_loss_at,
+           collision_state
+      FROM cluster_get_quorum_state();
+
+REVOKE ALL ON pg_cluster_quorum_state FROM PUBLIC;
+GRANT SELECT ON pg_cluster_quorum_state TO PUBLIC;
+
+-- PGRAC: pg_cluster_voting_disks (spec-2.6 D15; 2026-05-09).
+--   One row per voting disk path declared in cluster.voting_disks
+--   CSV.  Per-disk state + counters are Step 4 skeleton placeholders
+--   (state="unknown", counts=0); real wiring lands in D8 follow-up
+--   hardening round.  Backed by cluster_get_voting_disks (OID 8918).
+CREATE VIEW pg_cluster_voting_disks AS
+    SELECT path,
+           state,
+           last_read_at,
+           last_write_at,
+           read_count,
+           write_count,
+           io_error_count
+      FROM cluster_get_voting_disks();
+
+REVOKE ALL ON pg_cluster_voting_disks FROM PUBLIC;
+GRANT SELECT ON pg_cluster_voting_disks TO PUBLIC;
+
 -- PGRAC: pg_cluster_ic_msg_types (spec-2.3 D8; 2026-05-08).
 --   Lists every IC message type registered in the process-local
 --   dispatch_table[] under cluster_ic_router.c.  Diagnostic /

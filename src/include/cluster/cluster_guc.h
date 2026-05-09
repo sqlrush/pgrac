@@ -258,6 +258,23 @@ extern int cluster_cssd_heartbeat_interval_ms;
 extern int cluster_cssd_dead_deadband_factor;
 
 /*
+ * spec-2.6 Sprint A Step 4 D12: voting disk + quorum-lite.
+ *
+ *   cluster.voting_disks               -- CSV path list (default empty)
+ *   cluster.quorum_poll_interval_ms    -- 500..30000, default 2000
+ *   cluster.voting_disk_io_timeout_ms  -- 500..60000, default 5000
+ *   cluster.voting_disk_size_bytes     -- 4096..1048576, default 65536
+ *
+ * All PGC_POSTMASTER.  Per Q4 v0.2 lease semantics, backend
+ * in_quorum() check uses 2 × quorum_poll_interval_ms as the lease
+ * window (defends qvotec hung silent stale-OK).
+ */
+extern char *cluster_voting_disks;
+extern int cluster_quorum_poll_interval_ms;
+extern int cluster_voting_disk_io_timeout_ms;
+extern int cluster_voting_disk_size_bytes;
+
+/*
  * spec-2.2 D7 -- Tier 1 TCP transport tuning (PGC_POSTMASTER).
  * Defaults / ranges per spec-2.2 §3.3 + §2.1.
  */

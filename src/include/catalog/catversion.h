@@ -206,6 +206,18 @@
  * (>= 202605220) not equal-bound;see grep audit in spec-2.4 §7
  * DoD.
  */
-#define CATALOG_VERSION_NO 202605230
+/*
+ * spec-2.6 D16 (2026-05-09) -- bump 202605230 -> 202605240 for Step 4
+ * D15 NEW 2 SRFs (cluster_get_quorum_state OID 8917 +
+ * cluster_get_voting_disks OID 8918) + 2 views (pg_cluster_quorum_state
+ * + pg_cluster_voting_disks) + 4 NEW PGC_POSTMASTER GUCs
+ * (cluster.voting_disks + quorum_poll_interval_ms +
+ * voting_disk_io_timeout_ms + voting_disk_size_bytes) + 4 NEW SQLSTATE
+ * (53R40 ERRCODE_CLUSTER_QUORUM_LOST + 53R41 + 53R42 + 53R43) + 3 NEW
+ * wait events (BgProcQvotecMainLoop + VotingDiskRead/Write) + 5 NEW
+ * inject points + 4 NEW pgstat counters.  Per L46 lower-bound regex
+ * convention.
+ */
+#define CATALOG_VERSION_NO 202605240
 
 #endif
