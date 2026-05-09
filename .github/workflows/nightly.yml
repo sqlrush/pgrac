@@ -1,0 +1,117 @@
+# ----------------------------------------------------------------------
+# .github/workflows/nightly.yml
+#    linkdb full coverage CI (Tier 2 of 3-tier CI model).
+#
+#    Runs the heavy parts that fast.yml intentionally skips:
+#      - macOS Build+Test full cluster_tap (49 files)
+#      - Linux Build+Test full cluster_tap + PG 219 three-mode
+#      - Cross-platform parity coverage
+#
+#    Per CLAUDE.md rule 20.A revised, ship-time tag verification
+#    requires both fast.yml green (push gate) AND nightly.yml green
+#    (this workflow) on the same commit (or its main-branch ancestor).
+#
+# Author: SqlRush <sqlrush@gmail.com>
+#
+# Portions Copyright (c) 2026, pgrac contributors
+#
+# Triggers:
+#   - schedule cron 08:00 UTC daily (off-peak for both US/EU/AP)
+#   - workflow_dispatch (manual trigger by maintainer)
+#   - push to tags v* (mandatory ship-time verification)
+#
+# Total wallclock target: ≤ 25 min (matrix Linux + macOS in parallel)
+# ----------------------------------------------------------------------
+
+name: linkdb nightly full CI
+
+on:
+  schedule:
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+
+  # ====================================================================
+  # Tier 2.1 — Full Build+Test matrix (Linux + macOS)
+  # --------------------------------------------------------------------
+  # All 49 cluster_tap files + PG 219 + cluster_unit + cluster_regress.
+  # Mirrors what the legacy ci.yml ran on every push.
+  # ====================================================================
+  build-test-full:
+    name: Full Build+Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            libreadline-dev zlib1g-dev libicu-dev \
+            liblz4-dev libzstd-dev libssl-dev libxml2-dev \
+            libipc-run-perl pkg-config
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install readline icu4c lz4 zstd openssl@3 libxml2 cpanminus pkg-config || true
+          cpanm --local-lib=$HOME/perl5 --notest IPC::Run IO::Tty
+          {
+            echo "PERL5LIB=$HOME/perl5/lib/perl5"
+            echo "PKG_CONFIG_PATH=$(brew --prefix icu4c)/lib/pkgconfig:$(brew --prefix openssl@3)/lib/pkgconfig:$(brew --prefix lz4)/lib/pkgconfig:$(brew --prefix zstd)/lib/pkgconfig"
+            echo "LDFLAGS=-L$(brew --prefix readline)/lib -L$(brew --prefix zstd)/lib -L$(brew --prefix lz4)/lib -L$(brew --prefix openssl@3)/lib -L$(brew --prefix icu4c)/lib"
+            echo "CPPFLAGS=-I$(brew --prefix readline)/include -I$(brew --prefix zstd)/include -I$(brew --prefix lz4)/include -I$(brew --prefix openssl@3)/include -I$(brew --prefix icu4c)/include"
+          } >> $GITHUB_ENV
+
+      - name: Configure (--enable-cluster)
+        run: |
+          ./configure \
+            --prefix=$HOME/pgrac-install \
+            --enable-cassert --enable-debug \
+            --with-openssl --with-icu --with-lz4 --with-zstd \
+            --enable-cluster --enable-tap-tests
+
+      - name: Build
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            make -j$(getconf _NPROCESSORS_ONLN)
+          else
+            make -j$(sysctl -n hw.ncpu)
+          fi
+
+      - name: Install
+        run: make install
+
+      - name: Run PG regression tests (219 tests)
+        run: make check
+
+      - name: Run cluster-check (unit + tap full + regress)
+        run: make -C src/test cluster-check
+
+      - name: Upload regression diffs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-regression-diffs-${{ matrix.os }}
+          path: |
+            src/test/regress/regression.diffs
+            src/test/regress/regression.out
+            src/test/regress/log/
+            src/test/cluster_tap/tmp_check/log/
+          if-no-files-found: ignore
+          retention-days: 14

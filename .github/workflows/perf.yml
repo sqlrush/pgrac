@@ -1,0 +1,100 @@
+# ----------------------------------------------------------------------
+# .github/workflows/perf.yml
+#    linkdb performance baseline CI (Tier 3 of 3-tier CI model).
+#
+#    pgbench Stage 1 perf baseline check, completely decoupled from the
+#    push / tag / nightly path.  Per spec-1.23 Q8 B-WARN this is *not*
+#    a blocking gate (GitHub Actions shared runners exhibit 10-20%
+#    variance unsuitable for blocking thresholds);output is artifact
+#    for manual review.
+#
+#    Pre-3-tier this ran on every push as part of ci.yml.  The 60s
+#    pgbench × 2 platforms cost ~2 min wallclock for warn-only signal
+#    that nobody read on routine PRs, so it moved here.
+#
+# Author: SqlRush <sqlrush@gmail.com>
+#
+# Portions Copyright (c) 2026, pgrac contributors
+#
+# Triggers:
+#   - workflow_dispatch (manual)
+#   - schedule cron Monday 06:00 UTC weekly
+#
+# Future Stage 6 spec upgrades to blocking gate once self-hosted runner
+# / same-run ratio comparison is in place.
+# ----------------------------------------------------------------------
+
+name: linkdb perf baseline
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  perf-baseline:
+    name: Stage 1 perf baseline (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            libreadline-dev zlib1g-dev libicu-dev \
+            liblz4-dev libzstd-dev libssl-dev libxml2-dev \
+            pkg-config
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install readline icu4c lz4 zstd openssl@3 libxml2 pkg-config || true
+          {
+            echo "PKG_CONFIG_PATH=$(brew --prefix icu4c)/lib/pkgconfig:$(brew --prefix openssl@3)/lib/pkgconfig:$(brew --prefix lz4)/lib/pkgconfig:$(brew --prefix zstd)/lib/pkgconfig"
+            echo "LDFLAGS=-L$(brew --prefix readline)/lib -L$(brew --prefix zstd)/lib -L$(brew --prefix lz4)/lib -L$(brew --prefix openssl@3)/lib -L$(brew --prefix icu4c)/lib"
+            echo "CPPFLAGS=-I$(brew --prefix readline)/include -I$(brew --prefix zstd)/include -I$(brew --prefix lz4)/include -I$(brew --prefix openssl@3)/include -I$(brew --prefix icu4c)/include"
+          } >> $GITHUB_ENV
+
+      - name: Configure (--enable-cluster)
+        run: |
+          ./configure \
+            --prefix=$HOME/pgrac-install \
+            --enable-cassert --enable-debug \
+            --with-openssl --with-icu --with-lz4 --with-zstd \
+            --enable-cluster
+
+      - name: Build + Install
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            make -j$(getconf _NPROCESSORS_ONLN)
+          else
+            make -j$(sysctl -n hw.ncpu)
+          fi
+          make install
+
+      - name: Stage 1 perf baseline check (warn-only)
+        run: bash scripts/ci/run-perf-baseline-check.sh
+        continue-on-error: true
+
+      - name: Upload perf baseline artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-baseline-${{ matrix.os }}-${{ github.run_id }}
+          path: perf-baseline-artifact/
+          if-no-files-found: ignore
+          retention-days: 60

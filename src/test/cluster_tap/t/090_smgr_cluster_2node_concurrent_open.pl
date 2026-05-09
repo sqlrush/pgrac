@@ -134,14 +134,18 @@ sub active_relation_count
 	cmp_ok(remote_invalidation_count($pair->node1), '>', 0,
 		'L5 node1 cluster.smgr.remote_invalidation_stub_call_count > 0');
 
-	# L6 -- sequential 100k INSERT exercises smgrextend hook 100k times
-	# (assuming 1 row per page;in practice many fewer extends because
-	# rows pack onto pages, but counter must still grow).
+	# L6 -- sequential 10k INSERT exercises smgrextend hook;rows pack
+	# onto pages so the counter advance per extend is much less than the
+	# row count.  10k rows is enough to trigger several extends + an
+	# observable counter delta without the 100k-row wallclock cost on
+	# CI runners (CI 3-tier pre-Hardening v1.0.1 reverted from 100k for
+	# fast-gate friendliness — the counter delta assertion does not
+	# require the larger row count).
 	my $count_before = remote_invalidation_count($pair->node0);
 	$pair->node0->safe_psql('postgres', 'CREATE TABLE big (a int)');
-	$pair->node0->safe_psql('postgres', 'INSERT INTO big SELECT generate_series(1, 100000)');
-	is($pair->node0->safe_psql('postgres', 'SELECT count(*) FROM big'), '100000',
-		'L6 node0 100k INSERT count(*) == 100000');
+	$pair->node0->safe_psql('postgres', 'INSERT INTO big SELECT generate_series(1, 10000)');
+	is($pair->node0->safe_psql('postgres', 'SELECT count(*) FROM big'), '10000',
+		'L6 node0 10k INSERT count(*) == 10000');
 	cmp_ok(remote_invalidation_count($pair->node0), '>', $count_before,
 		'L6 node0 counter advanced after bulk INSERT');
 

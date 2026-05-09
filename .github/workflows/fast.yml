@@ -1,0 +1,315 @@
+# ----------------------------------------------------------------------
+# .github/workflows/fast.yml
+#    linkdb fast-gate CI (Tier 1 of 3-tier CI model).
+#
+#    Implements CLAUDE.md rule 20.A revised — every push / PR runs the
+#    fast gate (target 5-8 min wallclock).  Heavier full coverage runs
+#    in nightly.yml + perf.yml.
+#
+# Author: SqlRush <sqlrush@gmail.com>
+#
+# Portions Copyright (c) 2026, pgrac contributors
+#
+# Triggers:
+#   - push to main
+#   - pull_request to main
+#
+# Jobs (target ≤ 8 min combined wallclock):
+#   1. validate            (~1-2 min): lint / format / tidy / scn cmp /
+#                                       comment headers / commit msg
+#   2. linux-enable        (~5-7 min): build + install + cluster_unit +
+#                                       cluster_regress + smoke TAP
+#                                       subset (010 / 030 / 050)
+#   3. linux-disable       (~3-4 min): build + PG 219 + binary symbol
+#                                       audit (--disable-cluster contract)
+#   4. macos-build-only    (~3-4 min): build only — cross-platform
+#                                       compile guard;full macOS TAP
+#                                       runs in nightly.yml
+#   5. security            (~2-3 min): cppcheck strict + scan-build warn
+#                                       (cluster sources only)
+#
+# Tag (v*) push intentionally re-runs the same fast gate.  Per CLAUDE.md
+# rule 20.A revised, ship-time verification additionally requires the
+# most recent nightly.yml run on the same commit (or its ancestor) to
+# have completed green;tag push without nightly green coverage is a
+# rule violation.
+# ----------------------------------------------------------------------
+
+name: linkdb fast-gate CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ====================================================================
+  # Tier 1.1 — Validate
+  # --------------------------------------------------------------------
+  # Same scope as the legacy ci.yml validate job;quick lint that
+  # catches obvious problems before spinning up build/test matrix.
+  # ====================================================================
+  validate:
+    name: Validate (comment headers + format + tidy + commit msg)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install lint tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            clang-format clang-tidy
+
+      - name: Check no test artifacts tracked (spec-1.14.1 F19)
+        run: |
+          tracked=$(git ls-files | grep -E '/(tmp_check|log)/|regression\.(diffs|out)$' || true)
+          if [ -n "$tracked" ]; then
+            echo "::error::test ephemeral artifacts tracked in git tree:"
+            echo "$tracked"
+            exit 1
+          fi
+          echo "OK: no tmp_check / log / regression.diffs in tracked tree"
+
+      - name: Check comment headers (CLAUDE.md rule 11)
+        run: ./scripts/ci/check-comment-headers.sh
+
+      - name: Check clang-format (cluster sources)
+        run: ./scripts/ci/check-format.sh
+
+      - name: Check clang-tidy (cluster sources, warn-only stage 0.7)
+        run: ./scripts/ci/check-tidy.sh
+
+      - name: Check SCN cmp gate (spec-1.15 Q8+L4)
+        run: ./scripts/ci/check-scn-cmp-gate.sh
+
+      - name: Lint commit message
+        if: github.event_name == 'pull_request'
+        run: |
+          msg=$(git log -1 --pretty=%s)
+          if ! [[ "$msg" =~ ^(feat|fix|docs|refactor|test|chore|perf|ci|spec|style)(\([^\)]+\))?:\ .+ ]]; then
+            echo "::error::commit subject does not match conventional pattern: '$msg'"
+            exit 1
+          fi
+
+
+  # ====================================================================
+  # Tier 1.2 — Linux enable-cluster fast gate
+  # --------------------------------------------------------------------
+  # Build + install + cluster_unit + cluster_regress + a smoke TAP
+  # subset (3 files).  Full 49-file cluster_tap suite + PG 219 three-
+  # mode coverage moves to nightly.yml.
+  # ====================================================================
+  linux-enable:
+    name: Linux enable-cluster (unit + regress + smoke TAP)
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            libreadline-dev zlib1g-dev libicu-dev \
+            liblz4-dev libzstd-dev libssl-dev libxml2-dev \
+            libipc-run-perl pkg-config
+
+      - name: Configure (--enable-cluster)
+        run: |
+          ./configure \
+            --prefix=$HOME/pgrac-install \
+            --enable-cassert --enable-debug \
+            --with-openssl --with-icu --with-lz4 --with-zstd \
+            --enable-cluster --enable-tap-tests
+
+      - name: Build
+        run: make -j$(getconf _NPROCESSORS_ONLN)
+
+      - name: Install
+        run: make install
+
+      - name: Run cluster_unit (35 binaries, link-level only)
+        run: make -C src/test/cluster_unit check
+
+      - name: Run cluster_regress (7 SQL smoke tests)
+        run: make -C src/test/cluster_regress check
+
+      - name: Run smoke TAP subset (010 + 030 + 050)
+        run: |
+          # Tier 1 fast gate: 3 TAP files covering basic catalog views,
+          # acceptance lifecycle, and smgr opt-in workflow.  Full 49-file
+          # cluster_tap suite + 2-node ClusterPair + heartbeat round-trip
+          # tests run in nightly.yml.
+          make -C src/test/cluster_tap check \
+            PROVE_TESTS="t/010_views.pl t/030_acceptance.pl t/050_shared_storage_initdb.pl"
+
+      - name: Upload regression diffs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-enable-fast-gate-failure
+          path: |
+            src/test/regress/regression.diffs
+            src/test/regress/regression.out
+            src/test/regress/log/
+            src/test/cluster_tap/tmp_check/log/
+          if-no-files-found: ignore
+          retention-days: 7
+
+
+  # ====================================================================
+  # Tier 1.3 — Linux disable-cluster contract gate
+  # --------------------------------------------------------------------
+  # spec-0.3 binary contract: --disable-cluster build must remain
+  # symbol-equivalent to upstream PG 16.13.  PG 219 must remain green.
+  # ====================================================================
+  linux-disable:
+    name: Linux --disable-cluster regression
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libreadline-dev zlib1g-dev libicu-dev \
+            liblz4-dev libzstd-dev libssl-dev libxml2-dev pkg-config
+
+      - name: Configure (--disable-cluster)
+        run: |
+          ./configure \
+            --prefix=$HOME/pgrac-install \
+            --enable-cassert --enable-debug \
+            --with-openssl --with-icu --with-lz4 --with-zstd \
+            --disable-cluster
+
+      - name: Build + Install
+        run: |
+          make -j$(getconf _NPROCESSORS_ONLN)
+          make install
+
+      - name: Run PG regression tests (must remain 219/219)
+        run: make check
+
+      - name: Verify postgres binary has NO cluster symbols
+        run: |
+          if nm $HOME/pgrac-install/bin/postgres | grep -E '\bcluster_init\b|\bcluster_shutdown\b|\bpgrac_version_string\b'; then
+            echo "::error::Disable-mode binary unexpectedly contains cluster symbols"
+            exit 1
+          fi
+          echo "OK: no cluster symbols in disable-mode binary"
+
+
+  # ====================================================================
+  # Tier 1.4 — macOS build-only cross-platform compile guard
+  # --------------------------------------------------------------------
+  # Catches macOS-specific compile failures (e.g. clang vs gcc warnings,
+  # darwin-only header issues) without paying the cost of full TAP suite.
+  # Full macOS Build+Test runs in nightly.yml.
+  # ====================================================================
+  macos-build-only:
+    name: macOS build-only (compile guard)
+    needs: validate
+    runs-on: macos-latest
+    timeout-minutes: 12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install macOS dependencies
+        run: |
+          brew install readline icu4c lz4 zstd openssl@3 libxml2 pkg-config || true
+          {
+            echo "PKG_CONFIG_PATH=$(brew --prefix icu4c)/lib/pkgconfig:$(brew --prefix openssl@3)/lib/pkgconfig:$(brew --prefix lz4)/lib/pkgconfig:$(brew --prefix zstd)/lib/pkgconfig"
+            echo "LDFLAGS=-L$(brew --prefix readline)/lib -L$(brew --prefix zstd)/lib -L$(brew --prefix lz4)/lib -L$(brew --prefix openssl@3)/lib -L$(brew --prefix icu4c)/lib"
+            echo "CPPFLAGS=-I$(brew --prefix readline)/include -I$(brew --prefix zstd)/include -I$(brew --prefix lz4)/include -I$(brew --prefix openssl@3)/include -I$(brew --prefix icu4c)/include"
+          } >> $GITHUB_ENV
+
+      - name: Configure (--enable-cluster)
+        run: |
+          ./configure \
+            --prefix=$HOME/pgrac-install \
+            --enable-cassert --enable-debug \
+            --with-openssl --with-icu --with-lz4 --with-zstd \
+            --enable-cluster
+
+      - name: Build
+        run: make -j$(sysctl -n hw.ncpu)
+
+      - name: Install + cluster_unit (link-level smoke)
+        run: |
+          make install
+          make -C src/test/cluster_unit check
+
+
+  # ====================================================================
+  # Tier 1.5 — Security static analysis (cppcheck strict + scan-build)
+  # --------------------------------------------------------------------
+  # Cluster sources only;cppcheck baseline-diff catches new findings.
+  # ====================================================================
+  security:
+    name: Security (cppcheck + scan-build)
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            cppcheck clang-tools python3 \
+            build-essential libreadline-dev zlib1g-dev libicu-dev \
+            liblz4-dev libzstd-dev libssl-dev libxml2-dev pkg-config
+
+      - name: Configure (--enable-cluster)
+        run: |
+          ./configure \
+            --prefix=$HOME/pgrac-install \
+            --enable-cassert --enable-debug \
+            --with-openssl --with-icu --with-lz4 --with-zstd \
+            --enable-cluster
+
+      - name: Generate headers
+        run: make -C src/backend generated-headers
+
+      - name: Run cppcheck
+        id: cppcheck
+        run: bash scripts/ci/run-cppcheck.sh
+
+      - name: Run scan-build
+        if: always() && steps.cppcheck.conclusion != 'cancelled'
+        run: bash scripts/ci/run-scan-build.sh
+
+      - name: Upload SARIF / HTML reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: static-analysis-report
+          path: |
+            cppcheck.xml
+            cppcheck-summary.txt
+            scan-build-report/
+          if-no-files-found: warn
+          retention-days: 30
