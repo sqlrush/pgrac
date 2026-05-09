@@ -93,6 +93,13 @@ typedef struct ClusterQuorumDecision {
  *	  self_node_id                 — caller's node_id (for collision
  *	    detection)
  *	  self_incarnation             — caller's boot incarnation
+ *	  now_us                       — wall-clock at decision time
+ *	    (caller passes GetCurrentTimestamp() result)
+ *	  heartbeat_timeout_us         — slot is "fresh" iff
+ *	    now_us - slot.heartbeat_ts_us <= this.  Stale slots (e.g. a
+ *	    crashed instance left ALIVE with stale heartbeat_ts_us) are
+ *	    EXCLUDED from alive_bitmap and from collision detection.  Pass
+ *	    0 to opt out of freshness gating (epoch recovery / fsck tools).
  *
  *	Output:
  *	  *out  populated;return code = quorum_state shortcut for callers
@@ -105,18 +112,22 @@ typedef struct ClusterQuorumDecision {
  *	      OK         if disks_ok_count >= (N_disks/2) + 1
  *	      LOST       if disks_ok_count == 0
  *	      UNCERTAIN  otherwise (>0 but < majority)
- *	  - epoch_max = max(slot.current_epoch) across all OK-disk
- *	    slots that have generation > 0 (skip never-written)
- *	  - alive_bitmap: bit set for every node_id where ANY OK disk
- *	    has a slot with generation > 0 + flags.alive set
- *	  - collision_state per Q6 v0.2 — scan all OK-disk slots for
- *	    slot.node_id == self_node_id with different incarnation
+ *	  - epoch_max = max(slot.current_epoch) across ALL OK-disk slots
+ *	    with generation > 0 (epoch recovery reads STALE slots too;
+ *	    a crashed instance's epoch is still valid input to
+ *	    "boot epoch = max + 1" per spec-2.0 §3 R10)
+ *	  - alive_bitmap: bit set for every node_id where ANY OK disk has
+ *	    a FRESH (heartbeat_ts_us within timeout window) slot with
+ *	    generation > 0 + flags.alive set.  Stale slots NOT counted —
+ *	    a crashed peer's leftover ALIVE slot does not pollute the view.
+ *	  - collision_state per Q6 v0.2 — scan FRESH OK-disk slots only
+ *	    for slot.node_id == self_node_id with different incarnation;
+ *	    stale collisions ignored (the other side has died).
  */
-extern ClusterQvotecQuorumState decide_quorum_view(const ClusterVotingSlot *slots,
-												   const ClusterVotingDiskIoState *io_states,
-												   uint32 n_disks, uint32 n_max_nodes,
-												   uint32 self_node_id, uint64 self_incarnation,
-												   ClusterQuorumDecision *out);
+extern ClusterQvotecQuorumState
+decide_quorum_view(const ClusterVotingSlot *slots, const ClusterVotingDiskIoState *io_states,
+				   uint32 n_disks, uint32 n_max_nodes, uint32 self_node_id, uint64 self_incarnation,
+				   uint64 now_us, uint64 heartbeat_timeout_us, ClusterQuorumDecision *out);
 
 #endif /* USE_PGRAC_CLUSTER */
 

@@ -136,7 +136,8 @@ cluster_voting_disk_compute_crc32c(const ClusterVotingSlot *slot)
  * ============================================================ */
 
 ClusterVotingDiskIoState
-cluster_voting_disk_read_slot(int fd, uint32 node_id, ClusterVotingSlot *out)
+cluster_voting_disk_read_slot(int fd, int expected_disk_index, uint32 node_id,
+							  ClusterVotingSlot *out)
 {
 	/* 512-byte aligned buffer for O_DIRECT compatibility. */
 	union {
@@ -185,6 +186,19 @@ cluster_voting_disk_read_slot(int fd, uint32 node_id, ClusterVotingSlot *out)
 	 * corruption / misconfiguration);refuse to trust this slot.
 	 */
 	if (aligned.slot.node_id != node_id)
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+
+	/*
+	 * Q3 v0.2 misroute defense:  slot.disk_index MUST equal the caller's
+	 * expected_disk_index.  Mismatch means the fd is reading from a
+	 * voting disk file that does NOT correspond to its CSV slot — likely
+	 * SAN/NFS multipath misroute, wrong mount point, swapped symlink, or
+	 * incorrect cluster.voting_disks ordering.  Treat as FAILED; the
+	 * caller increments io_error_count and the disk drops out of the
+	 * healthy-disk count for this poll cycle.  expected_disk_index < 0
+	 * skips the check (format / repair / fsck tools).
+	 */
+	if (expected_disk_index >= 0 && aligned.slot.disk_index != (uint32)expected_disk_index)
 		return CLUSTER_VOTING_DISK_IO_FAILED;
 
 	*out = aligned.slot;

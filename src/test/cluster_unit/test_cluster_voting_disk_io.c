@@ -95,7 +95,7 @@ UT_TEST(test_io_1_round_trip)
 	rc = cluster_voting_disk_write_slot(fd, &in);
 	UT_ASSERT_EQ(rc, CLUSTER_VOTING_DISK_IO_OK);
 
-	rc = cluster_voting_disk_read_slot(fd, 2, &out);
+	rc = cluster_voting_disk_read_slot(fd, /*expected_disk_index*/ 0, 2, &out);
 	UT_ASSERT_EQ(rc, CLUSTER_VOTING_DISK_IO_OK);
 
 	/* Field-by-field parity. */
@@ -143,7 +143,7 @@ UT_TEST(test_io_2_crc_mismatch_returns_torn)
 	(void)pwrite(fd, &garbage, 1, /* offset */ 1 * 512 + 100);
 	(void)fsync(fd);
 
-	rc = cluster_voting_disk_read_slot(fd, 1, &slot);
+	rc = cluster_voting_disk_read_slot(fd, /*expected_disk_index*/ 0, 1, &slot);
 	UT_ASSERT_EQ(rc, CLUSTER_VOTING_DISK_IO_TORN);
 
 	cluster_voting_disk_close(fd);
@@ -179,7 +179,7 @@ UT_TEST(test_io_3_magic_mismatch_failed)
 	rc = cluster_voting_disk_write_slot(fd, &slot);
 	UT_ASSERT_EQ(rc, CLUSTER_VOTING_DISK_IO_OK);
 
-	rc = cluster_voting_disk_read_slot(fd, 1, &slot);
+	rc = cluster_voting_disk_read_slot(fd, /*expected_disk_index*/ 0, 1, &slot);
 	UT_ASSERT_EQ(rc, CLUSTER_VOTING_DISK_IO_FAILED);
 
 	cluster_voting_disk_close(fd);
@@ -204,7 +204,7 @@ UT_TEST(test_io_4_node_id_mismatch_failed)
 	 * read slot 2's offset and the slot's stored node_id will be 2 from
 	 * format(), so the read for node_id=2 should match.  Verify the
 	 * defence: read slot 1 but expect node_id=99 → failure path. */
-	rc = cluster_voting_disk_read_slot(fd, /*requested*/ 99, &slot);
+	rc = cluster_voting_disk_read_slot(fd, /*expected_disk_index*/ 0, /*requested*/ 99, &slot);
 	/* Slot at offset 99*512 is beyond the formatted file (only formatted
 	 * 0..3) — short read → FAILED. */
 	UT_ASSERT_EQ(rc, CLUSTER_VOTING_DISK_IO_FAILED);
@@ -226,8 +226,57 @@ UT_TEST(test_io_5_short_read_returns_failed)
 	UT_ASSERT(fd >= 0);
 	/* Don't format — file is empty. */
 
-	rc = cluster_voting_disk_read_slot(fd, 0, &slot);
+	rc = cluster_voting_disk_read_slot(fd, /*expected_disk_index*/ 0, 0, &slot);
 	UT_ASSERT_EQ(rc, CLUSTER_VOTING_DISK_IO_FAILED);
+
+	cluster_voting_disk_close(fd);
+	(void)unlink(path);
+	free(path);
+}
+
+
+UT_TEST(test_io_7_disk_index_misroute_failed)
+{
+	char *path = make_temp_path("misroute");
+	int fd;
+	ClusterVotingSlot slot;
+	ClusterVotingDiskIoState rc;
+
+	fd = cluster_voting_disk_open(path, /*create*/ true);
+	UT_ASSERT(fd >= 0);
+
+	/*
+	 * Q3 v0.2 misroute defense — write slot tagged with disk_index=2
+	 * (i.e., this fd is supposed to be the 3rd voting disk in the CSV
+	 * list).  Then read with expected_disk_index=0 (misroute scenario:
+	 * caller thinks this fd is disk 0 but the slot says disk 2).  Read
+	 * MUST refuse the slot with FAILED.
+	 */
+	rc = cluster_voting_disk_format(fd, /*max_nodes*/ 4, /*disk_index*/ 2);
+	UT_ASSERT_EQ(rc, CLUSTER_VOTING_DISK_IO_OK);
+
+	memset(&slot, 0, sizeof(slot));
+	slot.magic = CLUSTER_VOTING_SLOT_MAGIC;
+	slot.version = CLUSTER_VOTING_SLOT_VERSION;
+	slot.node_id = 1;
+	slot.disk_index = 2; /* this disk is index 2 */
+	slot.generation = 1;
+	slot.flags = CLUSTER_VOTING_SLOT_FLAG_ALIVE;
+	rc = cluster_voting_disk_write_slot(fd, &slot);
+	UT_ASSERT_EQ(rc, CLUSTER_VOTING_DISK_IO_OK);
+
+	/* Caller expects this fd to be disk index 0 → misroute → FAILED. */
+	rc = cluster_voting_disk_read_slot(fd, /*expected_disk_index*/ 0, 1, &slot);
+	UT_ASSERT_EQ(rc, CLUSTER_VOTING_DISK_IO_FAILED);
+
+	/* Caller correctly identifies this fd as disk index 2 → OK. */
+	rc = cluster_voting_disk_read_slot(fd, /*expected_disk_index*/ 2, 1, &slot);
+	UT_ASSERT_EQ(rc, CLUSTER_VOTING_DISK_IO_OK);
+	UT_ASSERT_EQ(slot.disk_index, 2);
+
+	/* Opt-out path (-1) for format / fsck tools — no misroute check. */
+	rc = cluster_voting_disk_read_slot(fd, /*expected_disk_index*/ -1, 1, &slot);
+	UT_ASSERT_EQ(rc, CLUSTER_VOTING_DISK_IO_OK);
 
 	cluster_voting_disk_close(fd);
 	(void)unlink(path);
@@ -241,7 +290,7 @@ UT_TEST(test_io_6_fd_negative_not_tried)
 	ClusterVotingDiskIoState rc;
 
 	memset(&slot, 0, sizeof(slot));
-	rc = cluster_voting_disk_read_slot(/*fd*/ -1, 0, &slot);
+	rc = cluster_voting_disk_read_slot(/*fd*/ -1, /*expected_disk_index*/ 0, 0, &slot);
 	UT_ASSERT_EQ(rc, CLUSTER_VOTING_DISK_IO_NOT_TRIED);
 
 	rc = cluster_voting_disk_write_slot(/*fd*/ -1, &slot);
@@ -255,12 +304,13 @@ UT_TEST(test_io_6_fd_negative_not_tried)
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(7);
 	UT_RUN(test_io_1_round_trip);
 	UT_RUN(test_io_2_crc_mismatch_returns_torn);
 	UT_RUN(test_io_3_magic_mismatch_failed);
 	UT_RUN(test_io_4_node_id_mismatch_failed);
 	UT_RUN(test_io_5_short_read_returns_failed);
+	UT_RUN(test_io_7_disk_index_misroute_failed);
 	UT_RUN(test_io_6_fd_negative_not_tried);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

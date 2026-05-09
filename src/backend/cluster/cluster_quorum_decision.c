@@ -44,7 +44,7 @@ alive_bitmap_set(uint8 *bitmap, uint32 node_id)
 ClusterQvotecQuorumState
 decide_quorum_view(const ClusterVotingSlot *slots, const ClusterVotingDiskIoState *io_states,
 				   uint32 n_disks, uint32 n_max_nodes, uint32 self_node_id, uint64 self_incarnation,
-				   ClusterQuorumDecision *out)
+				   uint64 now_us, uint64 heartbeat_timeout_us, ClusterQuorumDecision *out)
 {
 	uint32 disk_idx;
 	uint32 node_idx;
@@ -87,6 +87,7 @@ decide_quorum_view(const ClusterVotingSlot *slots, const ClusterVotingDiskIoStat
 
 		for (node_idx = 0; node_idx < n_max_nodes; node_idx++) {
 			const ClusterVotingSlot *s = &slots[disk_idx * n_max_nodes + node_idx];
+			bool is_fresh;
 
 			/*
 			 * generation == 0 means "never written" (a freshly
@@ -97,11 +98,38 @@ decide_quorum_view(const ClusterVotingSlot *slots, const ClusterVotingDiskIoStat
 				continue;
 
 			/*
-			 * Track epoch_max across all alive slots — used by
-			 * boot-time epoch recovery (spec-2.0 §3 R10).
+			 * Track epoch_max across ALL written slots — fresh OR stale.
+			 * Boot-time epoch recovery (spec-2.0 §3 R10) computes
+			 * "boot epoch = max(observed) + 1"; a crashed peer's stale
+			 * slot still contributes its (last-known-valid) epoch.
 			 */
 			if (s->current_epoch > out->epoch_max)
 				out->epoch_max = s->current_epoch;
+
+			/*
+			 * P2.1 freshness gate (Hardening v0.3):
+			 * Only slots whose heartbeat is within the timeout window
+			 * are considered for alive_bitmap + collision detection.
+			 * A crashed peer leaves ALIVE flag + stale heartbeat_ts_us
+			 * behind;without this gate that slot would continue to
+			 * vote alive forever and pollute collision judgement.
+			 *
+			 * heartbeat_timeout_us == 0 disables the gate (epoch
+			 * recovery / fsck path).
+			 */
+			if (heartbeat_timeout_us == 0)
+				is_fresh = true;
+			else if (s->heartbeat_ts_us == 0)
+				is_fresh = false; /* never set — treat as stale */
+			else if (now_us > s->heartbeat_ts_us
+					 && (now_us - s->heartbeat_ts_us) > heartbeat_timeout_us)
+				is_fresh = false; /* aged out */
+			else
+				is_fresh = true; /* covers now_us <= heartbeat_ts_us
+								  * (small clock drift) and within window */
+
+			if (!is_fresh)
+				continue;
 
 			if (s->flags & CLUSTER_VOTING_SLOT_FLAG_ALIVE) {
 				if (s->node_id < (uint32)(sizeof(out->alive_bitmap) * 8u))
@@ -114,6 +142,7 @@ decide_quorum_view(const ClusterVotingSlot *slots, const ClusterVotingDiskIoStat
 			 * was written by the OTHER instance using the same
 			 * node_id (since we have not yet written ours this
 			 * cycle, OR even if we have, our own incarnation matches).
+			 * Stale collision ignored above (the other side has died).
 			 */
 			if (s->node_id == self_node_id && s->incarnation != self_incarnation) {
 				if (self_incarnation > s->incarnation) {

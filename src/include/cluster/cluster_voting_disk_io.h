@@ -87,15 +87,26 @@ extern void cluster_voting_disk_close(int fd);
 
 /*
  * cluster_voting_disk_read_slot — read slot for `node_id` from `fd`,
- * verify CRC + magic + version + node_id round-trip, populate `*out`.
+ * verify CRC + magic + version + node_id round-trip + disk_index
+ * round-trip, populate `*out`.
+ *
+ *	`expected_disk_index` is the caller's record of which voting disk
+ *	this fd should be (its 0-based index in cluster.voting_disks CSV).
+ *	If slot.disk_index != expected_disk_index → SAN/NFS misroute / wrong
+ *	mount / wrong file: refuse to trust the slot and return FAILED.  Per
+ *	Q3 v0.2 design this is the only line of defense for misrouted I/O
+ *	in shared-storage failure modes.  Pass -1 to opt out of the check
+ *	(format / repair tools that read slots without knowing which disk).
  *
  *	Returns:
  *	  CLUSTER_VOTING_DISK_IO_OK         success
  *	  CLUSTER_VOTING_DISK_IO_TORN       CRC mismatch (likely torn write)
- *	  CLUSTER_VOTING_DISK_IO_FAILED     I/O error / EOF / sanity fail
+ *	  CLUSTER_VOTING_DISK_IO_FAILED     I/O error / EOF / sanity fail /
+ *	                                    disk_index mismatch (misroute)
  *	  CLUSTER_VOTING_DISK_IO_NOT_TRIED  caller set fd<0 (programming error)
  */
-extern ClusterVotingDiskIoState cluster_voting_disk_read_slot(int fd, uint32 node_id,
+extern ClusterVotingDiskIoState cluster_voting_disk_read_slot(int fd, int expected_disk_index,
+															  uint32 node_id,
 															  ClusterVotingSlot *out);
 
 
