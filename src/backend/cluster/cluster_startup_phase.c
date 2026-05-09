@@ -1182,6 +1182,54 @@ cluster_finalize_startup_running(void)
 		}
 	}
 
+	/*
+	 * spec-2.6 Q7 v0.2 validator: multi-node + cluster.voting_disks empty +
+	 * cluster.allow_single_node=off ⇒ refuse to advance to RUNNING.
+	 *
+	 * Without voting disks, qvotec has no quorum protocol to run; backends
+	 * would be forced fail-open since the xact.c gate (P1.2) keys on
+	 * cluster_voting_disks being non-empty.  In a multi-node cluster
+	 * topology that combination is silent fail-open — exactly the
+	 * production misconfiguration spec-2.6 was added to prevent.
+	 *
+	 * cluster.allow_single_node=on still allows the dev / single-node
+	 * compat path (qvotec stays alive, no I/O, backends don't enforce).
+	 *
+	 * pgrac.conf parse already ran during phase 1 (cluster_conf_load);
+	 * by the time we reach this RUNNING transition the topology is
+	 * authoritative — single-node fallback when pgrac.conf is missing
+	 * + allow_single_node=on returns node_count = 1, which we exempt.
+	 */
+	if (cluster_enabled && cluster_conf_node_count() > 1 && !cluster_allow_single_node) {
+		const char *vd = cluster_voting_disks;
+		bool empty = true;
+
+		if (vd != NULL) {
+			while (*vd) {
+				if (*vd != ' ' && *vd != '\t' && *vd != ',') {
+					empty = false;
+					break;
+				}
+				vd++;
+			}
+		}
+
+		if (empty)
+			ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("multi-node cluster requires cluster.voting_disks to be "
+								   "configured when cluster.allow_single_node=off"),
+							errdetail("pgrac.conf declares %d nodes but cluster.voting_disks is "
+									  "empty.  Without voting disks the cluster has no quorum "
+									  "protocol and backends would silently fail-open under "
+									  "partition.",
+									  cluster_conf_node_count()),
+							errhint("Set cluster.voting_disks in postgresql.conf to a comma-"
+									"separated list of pre-formatted voting-disk file paths "
+									"(odd majority recommended: 1 / 3 / 5 / 7 disks across "
+									"distinct failure domains), or set cluster.allow_single_"
+									"node = on for single-node development mode.")));
+	}
+
 	cluster_advance_phase(CLUSTER_PHASE_RUNNING);
 }
 

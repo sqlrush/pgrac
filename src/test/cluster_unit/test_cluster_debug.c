@@ -463,6 +463,8 @@ int cluster_phase4_timeout = 30;
 bool cluster_enabled = true;
 /* Spec-2.1 D1: cluster_startup_phase.c + cluster_conf.c reference allow_single_node */
 bool cluster_allow_single_node = true;
+/* spec-2.6 Q7 validator: cluster_startup_phase.c reads cluster_voting_disks */
+char *cluster_voting_disks = NULL;
 
 #include "cluster/cluster_shmem.h"
 void

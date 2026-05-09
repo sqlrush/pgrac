@@ -241,6 +241,14 @@ int cluster_node_id = 0;
  * on WARNING side -- unit test pins node_id = 0 (valid) anyway so this
  * stub value is moot.  Behavioral validation in TAP 072. */
 bool cluster_allow_single_node = true;
+/* spec-2.6 Q7 validator: cluster_startup_phase.c reads cluster_voting_disks */
+char *cluster_voting_disks = NULL;
+/* spec-2.6 Q7 validator: cluster_startup_phase.c reads cluster_conf_node_count */
+int
+cluster_conf_node_count(void)
+{
+	return 0; /* unit harness has no pgrac.conf — single-node default */
+}
 
 #include "cluster/cluster_shmem.h"
 void
