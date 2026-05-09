@@ -80,7 +80,6 @@ CLUSTER_CSSD_O = $(top_builddir)/src/backend/cluster/cluster_cssd.o
 CLUSTER_QVOTEC_O = $(top_builddir)/src/backend/cluster/cluster_qvotec.o
 CLUSTER_VOTING_DISK_IO_O = $(top_builddir)/src/backend/cluster/cluster_voting_disk_io.o
 CLUSTER_QUORUM_DECISION_O = $(top_builddir)/src/backend/cluster/cluster_quorum_decision.o
-PG_CRC32C_O = $(top_builddir)/src/port/pg_crc32c_armv8_srv.o
 CLUSTER_SCN_O = $(top_builddir)/src/backend/cluster/cluster_scn.o
 
 # Most tests link only cluster_version.o.  test_cluster_guc /
@@ -372,12 +371,16 @@ test_cluster_qvotec: test_cluster_qvotec.c unit_test.h \
 
 # spec-2.6 Sprint A Step 2 D3: cluster_voting_disk_io.o standalone test.
 # Real syscalls (open / pread / pwrite / fdatasync) on a temp file —
-# no PG runtime needed.  pg_crc32c.o linked for INIT/COMP/FIN_CRC32C
-# macros.
+# no PG runtime needed.  CRC32C symbols (pg_comp_crc32c hardware
+# pointer + slow / sb8 / armv8 / sse42 backends) come from
+# libpgport_srv.a which selects the correct backend per platform
+# at configure time (was: hardcoded pg_crc32c_armv8_srv.o which
+# only exists on aarch64 — fast-gate Linux x86 broke).
 test_cluster_voting_disk_io: test_cluster_voting_disk_io.c unit_test.h \
-		$(CLUSTER_VERSION_O) $(CLUSTER_VOTING_DISK_IO_O) $(PG_CRC32C_O)
+		$(CLUSTER_VERSION_O) $(CLUSTER_VOTING_DISK_IO_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_VERSION_O) $(CLUSTER_VOTING_DISK_IO_O) $(PG_CRC32C_O) -o $@
+		$(CLUSTER_VERSION_O) $(CLUSTER_VOTING_DISK_IO_O) \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 # spec-2.6 Sprint A Step 2 D4: cluster_quorum_decision.o standalone test.
 # Pure logic — no shmem, no I/O, no logging.  Synthetic slot matrix
