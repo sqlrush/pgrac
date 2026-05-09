@@ -109,6 +109,11 @@ errcode(int s pg_attribute_unused())
 	return 0;
 }
 int
+errcode_for_file_access(void)
+{
+	return 0;
+}
+int
 errmsg(const char *f pg_attribute_unused(), ...)
 {
 	return 0;
@@ -230,6 +235,71 @@ procsignal_sigusr1_handler(int sig pg_attribute_unused())
 void
 ProcessConfigFile(int context pg_attribute_unused())
 {}
+
+/* P1.3 step 1-4 stubs — voting disk fd helpers + on_shmem_exit + slot
+ * I/O + quorum decision + pgstat counters + memory context.  None of
+ * these are exercised by the unit harness; we only need symbols to
+ * resolve at link time. */
+#include "storage/ipc.h"
+#include "utils/memutils.h"
+#include "utils/palloc.h"
+#include "cluster/cluster_voting_disk_io.h"
+#include "cluster/cluster_quorum_decision.h"
+#include "cluster/cluster_pgstat.h"
+
+int
+cluster_voting_disk_open(const char *path pg_attribute_unused(),
+						 bool create_if_missing pg_attribute_unused())
+{
+	return -1;
+}
+void
+cluster_voting_disk_close(int fd pg_attribute_unused())
+{}
+ClusterVotingDiskIoState
+cluster_voting_disk_read_slot(int fd pg_attribute_unused(),
+							  int expected_disk_index pg_attribute_unused(),
+							  uint32 node_id pg_attribute_unused(),
+							  ClusterVotingSlot *out pg_attribute_unused())
+{
+	return CLUSTER_VOTING_DISK_IO_NOT_TRIED;
+}
+ClusterVotingDiskIoState
+cluster_voting_disk_write_slot(int fd pg_attribute_unused(),
+							   ClusterVotingSlot *slot pg_attribute_unused())
+{
+	return CLUSTER_VOTING_DISK_IO_NOT_TRIED;
+}
+ClusterQvotecQuorumState
+decide_quorum_view(const ClusterVotingSlot *slots pg_attribute_unused(),
+				   const ClusterVotingDiskIoState *io_states pg_attribute_unused(),
+				   uint32 n_disks pg_attribute_unused(), uint32 n_max_nodes pg_attribute_unused(),
+				   uint32 self_node_id pg_attribute_unused(),
+				   uint64 self_incarnation pg_attribute_unused(),
+				   uint64 now_us pg_attribute_unused(),
+				   uint64 heartbeat_timeout_us pg_attribute_unused(),
+				   ClusterQuorumDecision *out pg_attribute_unused())
+{
+	return CLUSTER_QVOTEC_QUORUM_LOST;
+}
+ClusterPgstatCounter *
+cluster_pgstat_lookup(const char *name pg_attribute_unused())
+{
+	return NULL;
+}
+void
+cluster_pgstat_inc(ClusterPgstatCounter *c pg_attribute_unused())
+{}
+void
+on_shmem_exit(pg_on_exit_callback function pg_attribute_unused(), Datum arg pg_attribute_unused())
+{}
+MemoryContext TopMemoryContext = NULL;
+void *
+MemoryContextAllocZero(MemoryContext context pg_attribute_unused(), Size size)
+{
+	return calloc(1, size);
+}
+int cluster_quorum_poll_interval_ms = 2000;
 
 /* spec-2.6 Sprint A Step 3 D7 stub: postmaster spawn wrapper.
  * Real impl in postmaster.c (file-static StartChildProcess);unit

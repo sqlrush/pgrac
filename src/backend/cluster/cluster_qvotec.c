@@ -68,6 +68,9 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include <errno.h>
+#include <string.h>
+
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -81,9 +84,11 @@
 #include "utils/ps_status.h"
 #include "utils/timestamp.h"
 
-#include "cluster/cluster_elog.h"  /* CLUSTER_LOG (best-effort logging) */
-#include "cluster/cluster_guc.h"   /* cluster_enabled */
-#include "cluster/cluster_shmem.h" /* cluster_shmem_register_region */
+#include "cluster/cluster_elog.h"	/* CLUSTER_LOG (best-effort logging) */
+#include "cluster/cluster_guc.h"	/* cluster_enabled */
+#include "cluster/cluster_pgstat.h" /* cluster.qvotec.* counters */
+#include "cluster/cluster_shmem.h"	/* cluster_shmem_register_region */
+#include "utils/memutils.h"			/* TopMemoryContext */
 
 
 /* ============================================================
@@ -152,6 +157,61 @@ static int QvotecPid = 0;
  * lease-expired as fail-closed).
  */
 static volatile sig_atomic_t cluster_writes_frozen = 0;
+
+
+/* ============================================================
+ * Voting disk fd table (P1.3 step 1).
+ *
+ *	Per cycle qvotec needs to read all configured voting disks +
+ *	write its own slot.  Open the fds once at READY publish, close
+ *	at shutdown.  Empty cluster.voting_disks ⇒ qvotec stays alive
+ *	but does no I/O (single-node compat — backend fail-closed gate
+ *	is also skipped per P1.2 xact.c logic).
+ *
+ *	CLUSTER_MAX_VOTING_DISKS — practical odd-majority bounds: 1, 3,
+ *	5, 7 cover all realistic deployments per Q10 v0.2.  Cap at 9 so
+ *	a misconfigured 11+ disk list errors at qvotec startup rather
+ *	than runs at degraded performance.
+ * ============================================================ */
+#define CLUSTER_MAX_VOTING_DISKS 9
+
+static int qvotec_fds[CLUSTER_MAX_VOTING_DISKS];
+static int qvotec_n_disks = 0;
+
+/*
+ * qvotec_self_incarnation — set once at qvotec startup
+ * (GetCurrentTimestamp at process start) so different qvotec runs are
+ * distinguishable on disk.  Used for Q6 v0.2 collision detection.
+ *
+ * qvotec_slot_generation — monotonic per-write counter (Q2 v0.2 torn-
+ * write detection).  Caller bumps this before every write_slot.
+ *
+ * qvotec_slot_matrix — palloc'd at startup in TopMemoryContext, sized
+ * CLUSTER_MAX_VOTING_DISKS × CLUSTER_MAX_NODES, reused every poll
+ * cycle.  Large (~580KB) so heap-allocated rather than stack.
+ */
+static uint64 qvotec_self_incarnation = 0;
+static uint64 qvotec_slot_generation = 0;
+static ClusterVotingSlot *qvotec_slot_matrix = NULL;
+
+/*
+ * D10 pgstat counter handles, looked up once at startup.  The poll
+ * cycle bumps the global cluster.qvotec.* counters surfaced through
+ * pg_stat_cluster_counters.
+ */
+static ClusterPgstatCounter *qvotec_counter_poll_cycle = NULL;
+static ClusterPgstatCounter *qvotec_counter_quorum_loss = NULL;
+static ClusterPgstatCounter *qvotec_counter_collision = NULL;
+static ClusterPgstatCounter *qvotec_counter_disk_io_fail = NULL;
+
+static void
+qvotec_pgstat_lookup_all(void)
+{
+	qvotec_counter_poll_cycle = cluster_pgstat_lookup("cluster.qvotec.poll_cycle_count");
+	qvotec_counter_quorum_loss = cluster_pgstat_lookup("cluster.qvotec.quorum_loss_event_count");
+	qvotec_counter_collision = cluster_pgstat_lookup("cluster.qvotec.collision_detect_event_count");
+	qvotec_counter_disk_io_fail = cluster_pgstat_lookup("cluster.qvotec.disk_io_failure_count");
+}
 
 
 /* ============================================================
@@ -399,6 +459,245 @@ cluster_writes_currently_frozen(void)
 
 
 /* ============================================================
+ * Voting disk fd lifecycle helpers (P1.3 step 1).
+ *
+ *	qvotec_open_disks parses cluster.voting_disks CSV and opens each
+ *	configured path R/W.  qvotec_close_disks closes every open fd.
+ *
+ *	Failure policy:
+ *	  - empty CSV: qvotec_n_disks = 0;ClusterQvotecMain proceeds to
+ *	    READY but skips real poll (single-node compat per Q7 v0.2).
+ *	    Backend fail-closed is also disabled in xact.c when
+ *	    cluster_voting_disks empty (P1.2).
+ *	  - any path > CLUSTER_MAX_VOTING_DISKS or open(2) failure:
+ *	    qvotec_close_disks then ereport(FATAL).  Phase 4 driver gets
+ *	    QVOTEC_NOT_READY and refuses to advance to running.
+ * ============================================================ */
+#include "cluster/cluster_voting_disk_io.h" /* fd open/close + format */
+
+static void
+qvotec_close_disks(void)
+{
+	int i;
+
+	for (i = 0; i < qvotec_n_disks; i++) {
+		cluster_voting_disk_close(qvotec_fds[i]);
+		qvotec_fds[i] = -1;
+	}
+	qvotec_n_disks = 0;
+}
+
+/* on_shmem_exit signature wrapper (code + arg unused). */
+static void
+qvotec_close_disks_atexit(int code pg_attribute_unused(), Datum arg pg_attribute_unused())
+{
+	qvotec_close_disks();
+}
+
+
+/* ============================================================
+ * qvotec_poll_once — single poll cycle (P1.3 step 2).
+ *
+ *	One pass:
+ *	  1. Build self slot (node_id, incarnation, heartbeat, epoch, alive)
+ *	  2. For each open disk: bump generation, write self slot
+ *	  3. For each (disk × node): read slot into qvotec_slot_matrix
+ *	  4. Call decide_quorum_view → ClusterQuorumDecision
+ *	  5. Publish ClusterQvotecShmem (quorum_state / disks_ok /
+ *	     collision_state / last_quorum_loss_ts_us / lease)
+ *
+ *	No-op if qvotec_n_disks == 0 (single-node compat — backend fail-
+ *	closed gate already disabled in xact.c when voting_disks empty).
+ *	Caller (main loop) bumps poll_cycle_count regardless of the no-op
+ *	path so observability works even in single-node mode.
+ * ============================================================ */
+#include "cluster/cluster_quorum_decision.h"
+
+static void
+qvotec_poll_once(void)
+{
+	ClusterVotingSlot self_slot;
+	ClusterVotingDiskIoState io_states[CLUSTER_MAX_VOTING_DISKS];
+	ClusterQuorumDecision decision;
+	uint64 now_us;
+	uint64 next_lease_expire;
+	uint64 heartbeat_timeout_us;
+	int i;
+
+	now_us = (uint64)GetCurrentTimestamp();
+	next_lease_expire = now_us + (uint64)cluster_quorum_poll_interval_ms * 2 * 1000ULL;
+	heartbeat_timeout_us = (uint64)cluster_quorum_poll_interval_ms * 2 * 1000ULL;
+
+	/* Always update the lease + last_poll_ts so the backend helper
+	 * sees recent liveness even on the single-node short-circuit. */
+	pg_atomic_write_u64(&QvotecShmem->last_poll_ts_us, now_us);
+	pg_atomic_write_u64(&QvotecShmem->lease_expire_at_us, next_lease_expire);
+
+	if (qvotec_n_disks == 0) {
+		/* Single-node compat: no disks, no quorum to decide.  Hold
+		 * quorum_state at INITIALIZING so any explicit consumer that
+		 * does check it stays fail-closed (per Q4 v0.2 default). */
+		return;
+	}
+
+	if (cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES) {
+		/* Defensive: invalid node_id ⇒ cannot author a self slot.
+		 * Leave shmem at last-known state and skip the cycle.  Q7
+		 * startup validator (next commit) will reject this config
+		 * before we get here in production paths. */
+		return;
+	}
+
+	/* ---- 1. build self slot ---- */
+	memset(&self_slot, 0, sizeof(self_slot));
+	self_slot.magic = CLUSTER_VOTING_SLOT_MAGIC;
+	self_slot.version = CLUSTER_VOTING_SLOT_VERSION;
+	self_slot.node_id = (uint32)cluster_node_id;
+	self_slot.incarnation = qvotec_self_incarnation;
+	self_slot.heartbeat_ts_us = now_us;
+	self_slot.current_epoch = pg_atomic_read_u64(&QvotecShmem->current_epoch_at_boot);
+	self_slot.flags = CLUSTER_VOTING_SLOT_FLAG_ALIVE;
+
+	/* ---- 2. write self slot to every disk ---- */
+	for (i = 0; i < qvotec_n_disks; i++) {
+		ClusterVotingDiskIoState wrc;
+
+		qvotec_slot_generation++;
+		self_slot.generation = qvotec_slot_generation;
+		self_slot.disk_index = (uint32)i;
+
+		wrc = cluster_voting_disk_write_slot(qvotec_fds[i], &self_slot);
+		if (wrc != CLUSTER_VOTING_DISK_IO_OK)
+			cluster_pgstat_inc(qvotec_counter_disk_io_fail);
+	}
+
+	/* ---- 3. read full slot matrix ---- */
+	memset(qvotec_slot_matrix, 0,
+		   sizeof(ClusterVotingSlot) * CLUSTER_MAX_VOTING_DISKS * CLUSTER_MAX_NODES);
+	for (i = 0; i < qvotec_n_disks; i++) {
+		uint32 node;
+
+		io_states[i] = CLUSTER_VOTING_DISK_IO_OK;
+		for (node = 0; node < CLUSTER_MAX_NODES; node++) {
+			ClusterVotingSlot *cell = &qvotec_slot_matrix[i * CLUSTER_MAX_NODES + node];
+			ClusterVotingDiskIoState rrc;
+
+			rrc = cluster_voting_disk_read_slot(qvotec_fds[i], i, node, cell);
+			if (rrc != CLUSTER_VOTING_DISK_IO_OK) {
+				/* The slot row is bad but the disk may still be OK
+				 * for other nodes (TORN on a single peer's slot is
+				 * not a whole-disk failure).  Treat per-slot misses
+				 * as "no data" — leave the row zeroed (generation==0
+				 * so decide_quorum_view will skip it).  Promote the
+				 * disk's overall io_state only on FAILED at offset 0
+				 * (header read failure ⇒ whole disk unreachable). */
+				if (node == 0 && rrc == CLUSTER_VOTING_DISK_IO_FAILED)
+					io_states[i] = CLUSTER_VOTING_DISK_IO_FAILED;
+				memset(cell, 0, sizeof(*cell));
+			}
+		}
+	}
+
+	/* ---- 4. decide ---- */
+	(void)decide_quorum_view(qvotec_slot_matrix, io_states, (uint32)qvotec_n_disks,
+							 CLUSTER_MAX_NODES, (uint32)cluster_node_id, qvotec_self_incarnation,
+							 now_us, heartbeat_timeout_us, &decision);
+
+	/* ---- 5. publish shmem ---- */
+	{
+		uint32 prev_state = pg_atomic_read_u32(&QvotecShmem->quorum_state);
+
+		pg_atomic_write_u32(&QvotecShmem->quorum_state, (uint32)decision.quorum_state);
+		pg_atomic_write_u32(&QvotecShmem->disks_ok_count, decision.disks_ok_count);
+		pg_atomic_write_u32(&QvotecShmem->disks_total_count, decision.disks_total_count);
+		pg_atomic_write_u32(&QvotecShmem->collision_state, (uint32)decision.collision_state);
+
+		if (prev_state == CLUSTER_QVOTEC_QUORUM_OK
+			&& decision.quorum_state != CLUSTER_QVOTEC_QUORUM_OK) {
+			pg_atomic_write_u64(&QvotecShmem->last_quorum_loss_ts_us, now_us);
+			cluster_pgstat_inc(qvotec_counter_quorum_loss);
+		}
+
+		if (decision.collision_state == CLUSTER_COLLISION_FATAL_NEWER_SELF)
+			cluster_pgstat_inc(qvotec_counter_collision);
+	}
+}
+
+static void
+qvotec_open_disks(void)
+{
+	const char *csv = cluster_voting_disks;
+	const char *p;
+	int i;
+
+	qvotec_n_disks = 0;
+	for (i = 0; i < CLUSTER_MAX_VOTING_DISKS; i++)
+		qvotec_fds[i] = -1;
+
+	if (csv == NULL || csv[0] == '\0')
+		return; /* single-node compat — qvotec stays alive but no I/O */
+
+	p = csv;
+	while (*p) {
+		const char *start = p;
+		const char *end;
+		char path[MAXPGPATH];
+		size_t len;
+		int fd;
+
+		while (*p && *p != ',')
+			p++;
+		end = p;
+
+		while (start < end && (*start == ' ' || *start == '\t'))
+			start++;
+		while (end > start && (end[-1] == ' ' || end[-1] == '\t'))
+			end--;
+
+		len = (size_t)(end - start);
+		if (len == 0) {
+			if (*p == ',')
+				p++;
+			continue;
+		}
+		if (len >= MAXPGPATH) {
+			qvotec_close_disks();
+			ereport(FATAL,
+					(errcode(ERRCODE_CONFIG_FILE_ERROR),
+					 errmsg("cluster.voting_disks path too long (>%d bytes)", MAXPGPATH - 1)));
+		}
+		if (qvotec_n_disks >= CLUSTER_MAX_VOTING_DISKS) {
+			qvotec_close_disks();
+			ereport(FATAL, (errcode(ERRCODE_CONFIG_FILE_ERROR),
+							errmsg("cluster.voting_disks declares more than %d entries",
+								   CLUSTER_MAX_VOTING_DISKS),
+							errhint("Reduce cluster.voting_disks to an odd-majority list "
+									"(1 / 3 / 5 / 7 disks recommended).")));
+		}
+
+		memcpy(path, start, len);
+		path[len] = '\0';
+
+		fd = cluster_voting_disk_open(path, /*create_if_missing*/ false);
+		if (fd < 0) {
+			int saved_errno = errno;
+			qvotec_close_disks();
+			errno = saved_errno;
+			ereport(FATAL, (errcode_for_file_access(),
+							errmsg("cluster.voting_disks: cannot open \"%s\": %m", path),
+							errhint("Voting disk files must exist (run pgrac-init or pre-format) "
+									"and be readable/writable by the postgres user.")));
+		}
+
+		qvotec_fds[qvotec_n_disks++] = fd;
+
+		if (*p == ',')
+			p++;
+	}
+}
+
+
+/* ============================================================
  * ClusterQvotecMain — aux process entry.
  *
  *	Step 1 skeleton: WaitLatch loop, lifecycle CAS transitions,
@@ -444,11 +743,34 @@ ClusterQvotecMain(void)
 						errhint("cluster_qvotec_shmem_init() must run during "
 								"CreateSharedMemoryAndSemaphores().")));
 
+	/*
+	 * P1.3 step 1 — open all configured voting disks before publishing
+	 * READY so phase 4 driver only sees us ready when fds are valid.
+	 * Empty CSV is OK (single-node compat); any other open(2) failure
+	 * ereports FATAL inside qvotec_open_disks.  fds are closed
+	 * explicitly when the main loop exits + via on_shmem_exit hook
+	 * registered below for the crash / proc_exit path.
+	 */
+	qvotec_open_disks();
+	pg_atomic_write_u32(&QvotecShmem->disks_total_count, (uint32)qvotec_n_disks);
+	on_shmem_exit(qvotec_close_disks_atexit, (Datum)0);
+
+	/*
+	 * P1.3 step 2 — boot incarnation + slot matrix + counter handles.
+	 * Incarnation = process start timestamp gives us a unique value
+	 * per qvotec run for Q6 collision detection.  Matrix lives in
+	 * TopMemoryContext so it survives the per-cycle ResourceOwner
+	 * resets and is freed automatically at proc_exit.
+	 */
+	qvotec_self_incarnation = (uint64)GetCurrentTimestamp();
+	qvotec_slot_generation = 0;
+	qvotec_slot_matrix = (ClusterVotingSlot *)MemoryContextAllocZero(
+		TopMemoryContext, sizeof(ClusterVotingSlot) * CLUSTER_MAX_VOTING_DISKS * CLUSTER_MAX_NODES);
+	qvotec_pgstat_lookup_all();
+
 	pg_atomic_write_u32(&QvotecShmem->state, CLUSTER_QVOTEC_READY);
 
 	for (;;) {
-		uint64 now_us;
-		uint64 next_lease_expire;
 		int rc;
 
 		CHECK_FOR_INTERRUPTS();
@@ -471,33 +793,22 @@ ClusterQvotecMain(void)
 			|| pg_atomic_read_u32(&QvotecShmem->state) == CLUSTER_QVOTEC_SHUTTING_DOWN)
 			break;
 
-		/*
-		 * Step 1 stub poll cycle — actual disk I/O + quorum decision
-		 * delegated to Step 2 D3+D4 modules.  Until those land, the
-		 * stub:
-		 *   1. bumps poll_cycle_count (observability counter)
-		 *   2. writes last_poll_ts_us = now
-		 *   3. writes lease_expire_at_us = now + 2 × poll_interval
-		 *      (lease semantics live even before real poll;backends
-		 *      see quorum_state = INITIALIZING and stay fail-closed)
-		 *   4. quorum_state stays INITIALIZING (Step 2 sets OK only
-		 *      after a real successful poll cycle)
-		 */
-		(void)pg_atomic_fetch_add_u32(&QvotecShmem->poll_cycle_count, 1);
+		/* P1.3 step 2/3 — real poll cycle: write self slot, read
+		 * matrix, decide quorum, publish shmem.  Counter bumps live
+		 * inside qvotec_poll_once. */
+		qvotec_poll_once();
+		cluster_pgstat_inc(qvotec_counter_poll_cycle);
 
-		now_us = (uint64)GetCurrentTimestamp();
-		next_lease_expire = now_us + (uint64)(timeout_ms * 2 * 1000);
-
-		pg_atomic_write_u64(&QvotecShmem->last_poll_ts_us, now_us);
-		pg_atomic_write_u64(&QvotecShmem->lease_expire_at_us, next_lease_expire);
+		timeout_ms = cluster_quorum_poll_interval_ms;
 
 		rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, timeout_ms,
-					   /* wait_event_info wired Step 4 D11 */ 0);
+					   WAIT_EVENT_CLUSTER_BGPROC_QVOTEC_MAIN_LOOP);
 
 		if (rc & WL_LATCH_SET)
 			ResetLatch(MyLatch);
 	}
 
+	qvotec_close_disks();
 	pg_atomic_write_u32(&QvotecShmem->state, CLUSTER_QVOTEC_DOWN);
 
 	proc_exit(0);
