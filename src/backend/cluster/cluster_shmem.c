@@ -67,6 +67,7 @@
 #include "cluster/cluster_stats.h"	  /* cluster_stats_shmem_register (1.14 Sprint A) */
 #include "cluster/cluster_lmon.h"	  /* cluster_lmon_shmem_register (1.11 Sprint A) */
 #include "cluster/cluster_pcm_lock.h" /* cluster_pcm_lock_module_init (stage 1.7) */
+#include "cluster/storage/cluster_smgr.h" /* cluster_smgr_shmem_register (spec-2.7 hardening F1) */
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_startup_phase.h" /* cluster_phase_shmem_register (1.10.1) */
 #include "cluster/cluster_version_macros.h"
@@ -384,6 +385,17 @@ cluster_init_shmem_module(void)
 	 */
 	if (cluster_shmem_lookup_region("pgrac cluster epoch") == NULL)
 		cluster_epoch_shmem_register();
+
+	/*
+	 * spec-2.7 hardening F1 (2026-05-09): register cluster_smgr shmem
+	 * region (one pg_atomic_uint64 for the cross-instance broadcast
+	 * STUB call counter).  Promoted from per-process pg_atomic on
+	 * pre-ship review — process-local counter contradicted both the
+	 * manual claim of cluster-wide accumulation and the
+	 * pg_stat_cluster_counters cluster-wide口径.
+	 */
+	if (cluster_shmem_lookup_region("pgrac cluster smgr") == NULL)
+		cluster_smgr_shmem_register();
 }
 
 

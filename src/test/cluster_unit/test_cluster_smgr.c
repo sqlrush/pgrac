@@ -216,6 +216,38 @@ before_shmem_exit(pg_on_exit_callback function pg_attribute_unused(),
 				  Datum arg pg_attribute_unused())
 {}
 
+/*
+ * spec-2.7 hardening F1 (2026-05-09):  cluster_smgr now allocates
+ * its cross-instance broadcast STUB counter in shmem via
+ * ShmemInitStruct + cluster_shmem_register_region.  The unit test
+ * doesn't drive PG's real shmem initialiser, so we provide a
+ * minimal heap-backed ShmemInitStruct stub that returns a unique
+ * static buffer per requested name -- enough for cluster_smgr_
+ * shmem_init to populate the atomic counter on first call so
+ * T-inv-1..T-inv-4 see live increments.
+ *
+ * cluster_shmem_register_region is also stubbed (no-op): the unit
+ * test calls cluster_smgr_shmem_init directly at main() entry to
+ * bypass the registry/lifecycle layer entirely.
+ */
+#define CLUSTER_SMGR_UT_SHMEM_BUFSZ 1024
+static char cluster_smgr_ut_shmem_buffer[CLUSTER_SMGR_UT_SHMEM_BUFSZ];
+void *
+ShmemInitStruct(const char *n pg_attribute_unused(), Size s pg_attribute_unused(),
+				bool *foundPtr)
+{
+	if (foundPtr != NULL)
+		*foundPtr = false;
+	if (s > CLUSTER_SMGR_UT_SHMEM_BUFSZ)
+		abort();
+	memset(cluster_smgr_ut_shmem_buffer, 0, s);
+	return cluster_smgr_ut_shmem_buffer;
+}
+#include "cluster/cluster_shmem.h"
+void
+cluster_shmem_register_region(const ClusterShmemRegion *r pg_attribute_unused())
+{}
+
 /* HTAB stubs. */
 HTAB *
 hash_create(const char *t pg_attribute_unused(), long n pg_attribute_unused(),
@@ -481,11 +513,15 @@ UT_TEST(test_remote_invalidation_counter_is_atomic_and_monotonic)
 	UT_ASSERT_EQ(final - baseline, 3);
 
 	/*
-	 * Counter symbol must be link-resolvable in --enable-cluster builds.
-	 * Address-take exercises the public extern -- spec-2.27 amend
-	 * will rename this symbol in lockstep with the counter rename.
+	 * Hardening F1 (2026-05-09):  the counter is now shmem-backed
+	 * (ClusterSmgrShmem private to cluster_smgr.c), so the public
+	 * symbol surface is the accessor function rather than an extern
+	 * atomic.  Address-take the function to verify link resolution;
+	 * spec-2.27 amend will rename it in lockstep with the counter
+	 * rename.
 	 */
-	UT_ASSERT_NOT_NULL((void *)&cluster_smgr_remote_invalidation_stub_call_count);
+	uint64 (*p_get)(void) = cluster_smgr_get_remote_invalidation_stub_call_count;
+	UT_ASSERT_NOT_NULL((void *)p_get);
 }
 
 
@@ -496,6 +532,12 @@ UT_TEST(test_remote_invalidation_counter_is_atomic_and_monotonic)
 int
 main(void)
 {
+	/*
+	 * spec-2.7 hardening F1: bring the shmem-backed counter online
+	 * before any hook tests run.  Idempotent;safe to call twice.
+	 */
+	cluster_smgr_shmem_init();
+
 	UT_PLAN(11);
 	UT_RUN(test_smgr_callbacks_linkable);
 	UT_RUN(test_which_for_temp_relation_returns_md);

@@ -84,7 +84,7 @@
 #include "utils/relmapper.h"
 
 #ifdef USE_PGRAC_CLUSTER
-#include "cluster/cluster_guc.h"		/* cluster_enabled */
+#include "cluster/cluster_guc.h"		  /* cluster_enabled + cluster_smgr_user_relations */
 #include "cluster/storage/cluster_smgr.h" /* cluster_smgr_invalidate_relmap */
 #endif
 
@@ -511,19 +511,20 @@ RelationMapInvalidate(bool shared)
 			load_relmap_file(false, false);
 	}
 
-	/* PGRAC MODIFICATIONS by SqlRush:
-	 * What changed: notify cluster_smgr layer so it can broadcast
-	 *   the relation-map invalidation to peer instances.  Stage 2.7
-	 *   stub -- bumps a counter only;spec-2.27 will activate the
-	 *   real SI Broadcaster wire send.
-	 * Why: PG sinval is process-local;cluster peers' cached maps
-	 *   would otherwise stay stale after a shared-catalog map
-	 *   rewrite (VACUUM FULL on pg_database etc.).  See spec-2.7
-	 *   §2.4 + Q2 v0.2 (signature reuse: `bool shared`). */
-#ifdef USE_PGRAC_CLUSTER
-	if (cluster_enabled)
-		cluster_smgr_invalidate_relmap(shared);
-#endif
+	/*
+	 * PGRAC MODIFICATIONS by SqlRush:
+	 * Hardening F3 (2026-05-09):  the cluster_smgr_invalidate_relmap
+	 * hook used to fire here, but RelationMapInvalidate is the sinval
+	 * RECEIVE side -- every backend that gets a relmap inval ran this
+	 * callback to reload its own map.  Hooking the broadcast here
+	 * meant every peer that received an inval would re-broadcast,
+	 * which once spec-2.27 SI Broadcaster goes live would form a
+	 * cross-instance loop with no origin suppression.
+	 *
+	 * The hook moved to the SOURCE side -- write_relmap_file()
+	 * alongside the CacheInvalidateRelmap() call -- where it fires
+	 * exactly once per relmap update with no origin amplification.
+	 */
 }
 
 /*
@@ -1045,7 +1046,26 @@ write_relmap_file(RelMapFile *newmap, bool write_wal, bool send_sinval,
 	 * as soon as others began to use the now-committed data.
 	 */
 	if (send_sinval)
+	{
 		CacheInvalidateRelmap(dbid);
+
+		/* PGRAC MODIFICATIONS by SqlRush (hardening F3 2026-05-09):
+		 * cluster_smgr_invalidate_relmap fires HERE -- the source
+		 * side of the relmap inval -- not in RelationMapInvalidate
+		 * (the receive side).  Sourcing here gives spec-2.27 SI
+		 * Broadcaster a single per-update broadcast point with no
+		 * origin amplification when peer instances receive +
+		 * RelationMapInvalidate-callback the inval locally.
+		 *
+		 * Q4 v0.2 also requires `cluster.smgr_user_relations` gate
+		 * because relmap has no smgr_which routing -- when the GUC
+		 * is off the default md.c path covers all permanent rels and
+		 * cross-instance map sync isn't part of the contract. */
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_enabled && cluster_smgr_user_relations)
+			cluster_smgr_invalidate_relmap(dbid == InvalidOid);
+#endif
+	}
 
 	/*
 	 * Make sure that the files listed in the map are not deleted if the outer

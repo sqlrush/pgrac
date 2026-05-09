@@ -209,8 +209,26 @@ extern void cluster_smgr_invalidate_relation(RelFileLocator rlocator, ForkNumber
 extern void cluster_smgr_invalidate_relmap(bool shared);
 extern void cluster_smgr_invalidate_unlink_pending(RelFileLocator rlocator);
 
-extern pg_atomic_uint64 cluster_smgr_remote_invalidation_stub_call_count;
+/*
+ * The cross-instance broadcast STUB call counter is allocated in
+ * shmem (registered via cluster_smgr_shmem_register) so that all
+ * backends in this postmaster see one shared accumulator.  Hot-path
+ * accessor below reads from the shmem atomic;disable-cluster builds
+ * compile out the symbol entirely.
+ */
+extern Size cluster_smgr_shmem_size(void);
+extern void cluster_smgr_shmem_init(void);
+extern void cluster_smgr_shmem_register(void);
 extern uint64 cluster_smgr_get_remote_invalidation_stub_call_count(void);
+
+/*
+ * Public smgrsw[] dispatch index reserved for cluster_smgr.  Used by
+ * PG-original hook call sites (smgr.c spec-2.7 hooks) to gate
+ * cluster invalidation broadcasts to relations actually routed
+ * through cluster_smgr;non-cluster_smgr (smgr_which == 0 -> md.c)
+ * relations skip the hooks entirely.
+ */
+#define CLUSTER_SMGR_SMGRSW_INDEX 1
 
 
 #endif /* CLUSTER_SMGR_H */

@@ -553,6 +553,26 @@ smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo)
 	 * xact.
 	 */
 
+	/* PGRAC: spec-2.7 cross-instance unlink-pending hook (hardening F2
+	 * 2026-05-09 — moved from post-unlink to pre-unlink, alongside
+	 * CacheInvalidateSmgr above).  PG sinval is sent BEFORE the
+	 * physical unlink so peers transitioning to invalidated state
+	 * during the broadcast→unlink window stay safe;the reverse opens
+	 * a stale-state read window once spec-2.27 flips this stub to a
+	 * real wire send.  Per-rel smgr_which filter (hardening F4) skips
+	 * md.c relations entirely so the hook only fires for relations
+	 * actually routed through cluster_smgr. */
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_enabled)
+	{
+		for (i = 0; i < nrels; i++)
+		{
+			if (rels[i]->smgr_which == CLUSTER_SMGR_SMGRSW_INDEX)
+				cluster_smgr_invalidate_unlink_pending(rlocators[i].locator);
+		}
+	}
+#endif
+
 	for (i = 0; i < nrels; i++)
 	{
 		int			which = rels[i]->smgr_which;
@@ -560,19 +580,6 @@ smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo)
 		for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
 			smgrsw[which].smgr_unlink(rlocators[i], forknum, isRedo);
 	}
-
-	/* PGRAC: spec-2.7 cross-instance unlink-pending hook.  Fires once
-	 * per relation after the physical unlink so cluster_smgr can drop
-	 * its local fd / HTAB entry (Q1 v0.2 local real action) and
-	 * spec-2.27 SI Broadcaster can later signal peer instances via
-	 * SINVAL_SMGR_UNLINK_PENDING. */
-#ifdef USE_PGRAC_CLUSTER
-	if (cluster_enabled)
-	{
-		for (i = 0; i < nrels; i++)
-			cluster_smgr_invalidate_unlink_pending(rlocators[i].locator);
-	}
-#endif
 
 	pfree(rlocators);
 }
@@ -605,9 +612,11 @@ smgrextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		reln->smgr_cached_nblocks[forknum] = InvalidBlockNumber;
 
 	/* PGRAC: spec-2.7 cross-instance invalidation hook (per-operation
-	 * granularity per Q3 v0.2 — counter atomic-add only, no DEBUG2). */
+	 * granularity per Q3 v0.2 — counter atomic-add only, no DEBUG2).
+	 * Hardening F4 (2026-05-09):  smgr_which gate skips md.c relations
+	 * so only cluster_smgr-routed extends fire the broadcast hook. */
 #ifdef USE_PGRAC_CLUSTER
-	if (cluster_enabled)
+	if (cluster_enabled && reln->smgr_which == CLUSTER_SMGR_SMGRSW_INDEX)
 		cluster_smgr_invalidate_relation(reln->smgr_rlocator.locator, forknum);
 #endif
 }
@@ -639,9 +648,10 @@ smgrzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	/* PGRAC: spec-2.7 cross-instance invalidation hook (per-operation
 	 * granularity per Q3 v0.2 — fires once per smgrzeroextend regardless
 	 * of nblocks, not per-block — coalescing is spec-2.27 SI
-	 * Broadcaster's responsibility). */
+	 * Broadcaster's responsibility).  Hardening F4 (2026-05-09):
+	 * smgr_which gate skips md.c relations. */
 #ifdef USE_PGRAC_CLUSTER
-	if (cluster_enabled)
+	if (cluster_enabled && reln->smgr_which == CLUSTER_SMGR_SMGRSW_INDEX)
 		cluster_smgr_invalidate_relation(reln->smgr_rlocator.locator, forknum);
 #endif
 }
@@ -810,6 +820,22 @@ smgrtruncate2(SMgrRelation reln, ForkNumber *forknum, int nforks,
 	 */
 	CacheInvalidateSmgr(reln->smgr_rlocator);
 
+	/* PGRAC: spec-2.7 cross-instance invalidation hook (hardening F2
+	 * 2026-05-09 — moved from post-truncate-loop to here, alongside
+	 * CacheInvalidateSmgr, so spec-2.27 SI Broadcaster sees pre-modify
+	 * timing identical to PG sinval — peers transitioning to
+	 * invalidated state during the broadcast→truncate window stay
+	 * safe).  Hardening F4: smgr_which gate skips md.c relations.
+	 * Loop fires once per truncated fork so the stub counter sees
+	 * deterministic input matching what spec-2.27 will wire-send. */
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_enabled && reln->smgr_which == CLUSTER_SMGR_SMGRSW_INDEX)
+	{
+		for (i = 0; i < nforks; i++)
+			cluster_smgr_invalidate_relation(reln->smgr_rlocator.locator, forknum[i]);
+	}
+#endif
+
 	/* Do the truncation */
 	for (i = 0; i < nforks; i++)
 	{
@@ -837,22 +863,6 @@ smgrtruncate2(SMgrRelation reln, ForkNumber *forknum, int nforks,
 		reln->smgr_cached_nblocks[forknum[i]] =
 			nblocks[i] > old_nblocks[i] ? old_nblocks[i] : nblocks[i];
 	}
-
-	/* PGRAC: spec-2.7 cross-instance invalidation hook (per-operation
-	 * per Q3 v0.2 — one fire per truncated fork inside the loop body
-	 * is overkill since this is the loop-end barrier; one fire per
-	 * smgrtruncate2 call covering all nforks is sufficient because
-	 * spec-2.27 SI Broadcaster will receive the rlocator and re-derive
-	 * the affected forks via its own catalog probe). Loop over nforks
-	 * to give the per-fork rlocator+fork pair to the stub counter so
-	 * future SI Broadcaster activations see deterministic input. */
-#ifdef USE_PGRAC_CLUSTER
-	if (cluster_enabled)
-	{
-		for (i = 0; i < nforks; i++)
-			cluster_smgr_invalidate_relation(reln->smgr_rlocator.locator, forknum[i]);
-	}
-#endif
 }
 
 /*

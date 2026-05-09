@@ -57,10 +57,12 @@
 #include "commands/tablespace.h"
 #include "common/relpath.h"
 #include "storage/md.h"
+#include "storage/shmem.h"
 #include "utils/hsearch.h"
 
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
+#include "cluster/cluster_shmem.h"
 #include "cluster/storage/cluster_shared_fs.h"
 #include "cluster/storage/cluster_smgr.h"
 
@@ -105,19 +107,34 @@ static HTAB *cluster_smgr_relations = NULL;
 
 
 /*
- * spec-2.7 D6 (v0.2 frozen 2026-05-09):  cross-instance broadcast
- * STUB call counter.  Incremented at the end of every
- * cluster_smgr_invalidate_* hook body.  Counts the cross-instance
- * portion only (the local handle/HTAB cleanup inside
- * invalidate_unlink_pending is NOT counted here -- it's already
- * covered by PG SMgrRelation lifecycle observability per Q5 v0.2).
+ * spec-2.7 D6 (v0.2 frozen 2026-05-09;hardening F1 2026-05-09):
  *
- * spec-2.27 will rename this to
- * cluster_smgr_remote_invalidation_count (drop `_stub_`) and add
- * per-type sub-counters once the SI Broadcaster wire protocol lands.
+ *	Cross-instance broadcast STUB call counter, allocated in shmem
+ *	so all backends in this postmaster share one accumulator.  Hot
+ *	path adds bypass any LWLock (atomic fetch-add only).  Counts
+ *	the cross-instance portion only — the local handle/HTAB
+ *	cleanup inside invalidate_unlink_pending is NOT counted here
+ *	(already covered by PG SMgrRelation lifecycle observability per
+ *	Q5 v0.2).
+ *
+ *	Pre-hardening this counter was a process-local pg_atomic_uint64;
+ *	user review 2026-05-09 caught that the per-backend semantics
+ *	contradicted both the manual ("counter advances on every
+ *	relation extend...") and the spec-1.X cluster_pgstat口径.
+ *	Promoted to shmem so SQL queries against pg_stat_cluster_counters
+ *	see the live cluster-wide value regardless of which backend
+ *	answers the query.
+ *
+ *	spec-2.27 will rename this to
+ *	cluster_smgr_remote_invalidation_count (drop `_stub_`) and add
+ *	per-type sub-counters + per-rlocator histograms once the SI
+ *	Broadcaster wire protocol lands.
  */
-pg_atomic_uint64 cluster_smgr_remote_invalidation_stub_call_count;
-static bool cluster_smgr_remote_invalidation_counter_initialised = false;
+typedef struct ClusterSmgrShmem {
+	pg_atomic_uint64 remote_invalidation_stub_call_count;
+} ClusterSmgrShmem;
+
+static ClusterSmgrShmem *cluster_smgr_state = NULL;
 
 
 /* ============================================================
@@ -214,17 +231,6 @@ cluster_smgr_init(void)
 	 */
 	if (cluster_smgr_relations != NULL)
 		return;
-
-	/*
-	 * spec-2.7 D6: initialise the cross-instance broadcast STUB call
-	 * counter.  Idempotent guard mirrors the HTAB lazy-init pattern
-	 * above so multiple cluster_smgr_init calls in the same backend
-	 * stay safe.
-	 */
-	if (!cluster_smgr_remote_invalidation_counter_initialised) {
-		pg_atomic_init_u64(&cluster_smgr_remote_invalidation_stub_call_count, 0);
-		cluster_smgr_remote_invalidation_counter_initialised = true;
-	}
 
 	memset(&info, 0, sizeof(info));
 	info.keysize = sizeof(RelFileLocatorBackend);
@@ -673,6 +679,22 @@ cluster_smgr_close_handle_for_rlocator(RelFileLocator rlocator)
 }
 
 
+/*
+ * Helper: bump the shmem cross-instance STUB counter.  Defensive
+ * NULL-guard against cluster_smgr_state == NULL so that unit-test
+ * harnesses (which don't run cluster_shmem_init) plus any pre-shmem
+ * call site stay safe.  Real backend lifecycle attaches the shared
+ * struct via cluster_smgr_shmem_init before any SQL runs.
+ */
+static inline void
+cluster_smgr_remote_invalidation_inc(void)
+{
+	if (cluster_smgr_state == NULL)
+		return;
+	pg_atomic_fetch_add_u64(&cluster_smgr_state->remote_invalidation_stub_call_count, 1);
+}
+
+
 void
 cluster_smgr_invalidate_relation(RelFileLocator rlocator, ForkNumber forknum)
 {
@@ -693,11 +715,7 @@ cluster_smgr_invalidate_relation(RelFileLocator rlocator, ForkNumber forknum)
 	(void)rlocator;
 	(void)forknum;
 
-	if (!cluster_smgr_remote_invalidation_counter_initialised) {
-		pg_atomic_init_u64(&cluster_smgr_remote_invalidation_stub_call_count, 0);
-		cluster_smgr_remote_invalidation_counter_initialised = true;
-	}
-	pg_atomic_fetch_add_u64(&cluster_smgr_remote_invalidation_stub_call_count, 1);
+	cluster_smgr_remote_invalidation_inc();
 }
 
 
@@ -716,11 +734,7 @@ cluster_smgr_invalidate_relmap(bool shared)
 	 */
 	(void)shared;
 
-	if (!cluster_smgr_remote_invalidation_counter_initialised) {
-		pg_atomic_init_u64(&cluster_smgr_remote_invalidation_stub_call_count, 0);
-		cluster_smgr_remote_invalidation_counter_initialised = true;
-	}
-	pg_atomic_fetch_add_u64(&cluster_smgr_remote_invalidation_stub_call_count, 1);
+	cluster_smgr_remote_invalidation_inc();
 }
 
 
@@ -728,34 +742,82 @@ void
 cluster_smgr_invalidate_unlink_pending(RelFileLocator rlocator)
 {
 	/*
-	 * spec-2.7 Q1 v0.2:  cross-instance broadcast STUB +
-	 * LOCAL REAL action.
+	 * spec-2.7 Q1 v0.2 + hardening F2 (2026-05-09):
 	 *
-	 * Local real:  close any open ClusterSharedFsHandle for
-	 * `rlocator` and remove the bypass HTAB entry.  Without this,
-	 * an unlink-then-recreate of the same rlocator could reach the
-	 * now-gone underlying file via a stale fd in this process's
-	 * HTAB cache.
+	 *	Cross-instance broadcast STUB + LOCAL REAL action.  The
+	 *	caller (smgrdounlinkall in PG smgr.c) now invokes this hook
+	 *	BEFORE the physical unlink loop, alongside CacheInvalidateSmgr,
+	 *	so that spec-2.27 SI Broadcaster can broadcast the inval
+	 *	pre-modify (matches PG's sinval timing — peers transitioning
+	 *	to invalidated state during the broadcast→unlink gap is safe;
+	 *	the reverse opens a window where peers read stale state).
 	 *
-	 * Cross-instance STUB:  spec-2.27 SI Broadcaster will add
-	 * SINVAL_SMGR_UNLINK_PENDING wire send + peer-ack barrier here.
+	 *	Local real (handle/HTAB cleanup):  close any open
+	 *	ClusterSharedFsHandle for `rlocator` and remove the bypass
+	 *	HTAB entry.  PG's smgrdounlinkall already called
+	 *	smgrsw[].smgr_close on each fork before this hook fires, so
+	 *	the per-fork handles are typically NULL by now;the HTAB
+	 *	entry itself is still around because smgr_close only removes
+	 *	on InvalidForkNumber.  Removing it here prevents stale fds
+	 *	on a future smgropen of the same rlocator (e.g. CREATE TABLE
+	 *	reusing the relfilenumber after a recent DROP).
+	 *
+	 *	Cross-instance STUB:  spec-2.27 SI Broadcaster will replace
+	 *	the counter add with SINVAL_SMGR_UNLINK_PENDING wire send +
+	 *	peer-ack barrier here.
 	 */
 	cluster_smgr_close_handle_for_rlocator(rlocator);
-
-	if (!cluster_smgr_remote_invalidation_counter_initialised) {
-		pg_atomic_init_u64(&cluster_smgr_remote_invalidation_stub_call_count, 0);
-		cluster_smgr_remote_invalidation_counter_initialised = true;
-	}
-	pg_atomic_fetch_add_u64(&cluster_smgr_remote_invalidation_stub_call_count, 1);
+	cluster_smgr_remote_invalidation_inc();
 }
 
 
 uint64
 cluster_smgr_get_remote_invalidation_stub_call_count(void)
 {
-	if (!cluster_smgr_remote_invalidation_counter_initialised)
+	if (cluster_smgr_state == NULL)
 		return 0;
-	return pg_atomic_read_u64(&cluster_smgr_remote_invalidation_stub_call_count);
+	return pg_atomic_read_u64(&cluster_smgr_state->remote_invalidation_stub_call_count);
+}
+
+
+/* ============================================================
+ * spec-2.7 D6 hardening F1 (2026-05-09):  shmem region for the
+ * cross-instance broadcast STUB call counter.  Follows the
+ * cluster_epoch / cluster_diag pattern (size_fn + init_fn +
+ * register_fn invoked from cluster_shmem.c).
+ * ============================================================ */
+
+Size
+cluster_smgr_shmem_size(void)
+{
+	return sizeof(ClusterSmgrShmem);
+}
+
+void
+cluster_smgr_shmem_init(void)
+{
+	bool found;
+
+	cluster_smgr_state
+		= (ClusterSmgrShmem *)ShmemInitStruct("pgrac cluster smgr",
+											  cluster_smgr_shmem_size(), &found);
+	if (!found)
+		pg_atomic_init_u64(&cluster_smgr_state->remote_invalidation_stub_call_count, 0);
+}
+
+static const ClusterShmemRegion cluster_smgr_region = {
+	.name = "pgrac cluster smgr",
+	.size_fn = cluster_smgr_shmem_size,
+	.init_fn = cluster_smgr_shmem_init,
+	.lwlock_count = 0,
+	.owner_subsys = "cluster_smgr",
+	.reserved_flags = 0,
+};
+
+void
+cluster_smgr_shmem_register(void)
+{
+	cluster_shmem_register_region(&cluster_smgr_region);
 }
 
 

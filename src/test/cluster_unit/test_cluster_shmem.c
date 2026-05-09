@@ -369,6 +369,11 @@ void
 cluster_epoch_shmem_register(void)
 {}
 
+/* spec-2.7 hardening F1 stub: cluster_smgr shmem region. */
+void
+cluster_smgr_shmem_register(void)
+{}
+
 
 UT_DEFINE_GLOBALS();
 
