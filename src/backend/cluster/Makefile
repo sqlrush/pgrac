@@ -57,8 +57,10 @@ OBJS = \
 	cluster_lmon.o \
 	cluster_pcm_lock.o \
 	cluster_pgstat.o \
+	cluster_quorum_decision.o \
 	cluster_qvotec.o \
 	cluster_scn.o \
+	cluster_voting_disk_io.o \
 	cluster_shmem.o \
 	cluster_signal.o \
 	cluster_startup_phase.o \
