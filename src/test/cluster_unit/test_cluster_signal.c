@@ -41,6 +41,7 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_qvotec.h"
 #include "storage/procsignal.h"
 #include "cluster/cluster_signal.h"
 
@@ -90,15 +91,18 @@ SetLatch(Latch *latch pg_attribute_unused())
  * cluster_qvotec.c) and ClusterFenceFreezePending (spec-2.28
  * cluster_fence.c) from its dual-set freeze handler + thaw handler.
  * Provide standalone stubs so test_cluster_signal still links.  The
- * dual-set + asymmetric-thaw semantic is verified end-to-end by
- * test_cluster_fence (T-fence-2/3/5) — this test only validates the
- * RECONFIG_START handler dispatch.
+ * ProcessInterrupts arm is verified here;the remaining asymmetric-thaw
+ * semantic is verified end-to-end by test_cluster_fence.
  */
 #include <signal.h>
 volatile sig_atomic_t ClusterFenceFreezePending = 0;
+volatile sig_atomic_t InterruptPending = 0;
+static int ut_freeze_writes_set_count = 0;
 void
 cluster_freeze_writes_set(void)
-{}
+{
+	ut_freeze_writes_set_count++;
+}
 void
 cluster_thaw_writes_set(void)
 {}
@@ -169,17 +173,35 @@ UT_TEST(test_handler_sets_pending_flag)
 	cluster_reconfig_start_pending = 0;
 }
 
+UT_TEST(test_freeze_handler_arms_process_interrupts)
+{
+	ClusterFenceFreezePending = 0;
+	InterruptPending = 0;
+	ut_freeze_writes_set_count = 0;
+
+	cluster_handle_freeze_writes_interrupt();
+
+	UT_ASSERT_EQ(ut_freeze_writes_set_count, 1);
+	UT_ASSERT_EQ((int)ClusterFenceFreezePending, 1);
+	UT_ASSERT_EQ((int)InterruptPending, 1);
+
+	/* Restore for any subsequent tests; harmless either way. */
+	ClusterFenceFreezePending = 0;
+	InterruptPending = 0;
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(7);
 	UT_RUN(test_cluster_reconfig_start_after_recovery_conflict_bufferpin);
 	UT_RUN(test_pg_native_reasons_unchanged);
 	UT_RUN(test_num_procsignals_is_17);
 	UT_RUN(test_cluster_reconfig_start_pending_default_false);
 	UT_RUN(test_handler_symbol_linkable);
 	UT_RUN(test_handler_sets_pending_flag);
+	UT_RUN(test_freeze_handler_arms_process_interrupts);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

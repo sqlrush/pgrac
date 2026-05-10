@@ -117,10 +117,12 @@ behaviour is governed by four PGC_POSTMASTER GUCs:
 `cluster.freeze_writes_enabled` / `cluster.fence_audit_log` (see
 [configuration.md](../user-guide/configuration.md) for full reference).
 
-> **Status.** The fence-lite path ships with the catalog surface +
-> end-to-end TAP coverage in this release.  External fence command
-> integration (IPMI / STONITH / cloud API) is not in scope and will
-> land in a future watchdog spec.
+> **Status.** The fence-lite path ships with the catalog surface,
+> unit coverage for the signal/self-fence contracts, and 2-node
+> steady-state TAP coverage.  End-to-end freeze/thaw broadcast TAP
+> is deferred until the voting-disk I/O failure injection harness
+> exists.  External fence command integration (IPMI / STONITH /
+> cloud API) is not in scope and will land in a future watchdog spec.
 
 ## Postmaster startup flow
 

@@ -14,6 +14,8 @@
  *	  Signal handlers run in signal context and must be async-signal-safe.
  *	  In practice this restricts each handler to:
  *	    - writing a volatile sig_atomic_t flag
+ *	    - setting InterruptPending when the flag is consumed by
+ *	      ProcessInterrupts()
  *	    - calling SetLatch(MyLatch) to wake the main loop
  *	  Anything else (palloc, elog, LWLockAcquire, ...) is forbidden.
  *
@@ -96,6 +98,9 @@ cluster_handle_reconfig_start_interrupt(void)
  *	  - ClusterFenceFreezePending = 1: cluster_fence_check_interrupts
  *	    (postgres.c hook D4) ereport(ERROR, 53R50) on next
  *	    ProcessInterrupts to abort in-flight long-running query.
+ *	  - InterruptPending = true: make CHECK_FOR_INTERRUPTS enter
+ *	    ProcessInterrupts for this signal instead of waiting for an
+ *	    unrelated interrupt.
  *	  - SetLatch(MyLatch): wake main loop so the abort path runs
  *	    promptly.
  *
@@ -110,6 +115,7 @@ cluster_handle_freeze_writes_interrupt(void)
 
 	/* spec-2.28 path:  in-flight ProcessInterrupts abort. */
 	ClusterFenceFreezePending = 1;
+	InterruptPending = true;
 
 	SetLatch(MyLatch);
 }

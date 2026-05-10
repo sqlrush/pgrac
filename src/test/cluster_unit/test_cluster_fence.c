@@ -73,6 +73,14 @@ UT_DEFINE_GLOBALS();
 
 bool IsUnderPostmaster = false;
 int MyProcPid = 0;
+static int ut_kill_call_count = 0;
+
+int
+kill(pid_t pid pg_attribute_unused(), int sig pg_attribute_unused())
+{
+	ut_kill_call_count++;
+	return 0;
+}
 
 /* spec-2.28 §2.3 — 4 fence GUCs with their declared defaults. */
 bool cluster_self_fence_enabled = true;
@@ -177,10 +185,11 @@ ShmemInitStruct(const char *name pg_attribute_unused(), Size size, bool *foundPt
 }
 
 #include "datatype/timestamp.h"
+static TimestampTz ut_now_us = 1700000000000000LL;
 TimestampTz
 GetCurrentTimestamp(void)
 {
-	return 1700000000000000LL;
+	return ut_now_us;
 }
 
 #include "storage/lwlock.h"
@@ -264,6 +273,20 @@ tuplestore_putvalues(Tuplestorestate *state pg_attribute_unused(),
 					 TupleDesc tdesc pg_attribute_unused(), Datum *values pg_attribute_unused(),
 					 bool *isnull pg_attribute_unused())
 {}
+
+static void
+ut_reset_fence_shmem(void)
+{
+	memset(shmem_storage, 0, sizeof(shmem_storage));
+	shmem_init_done = false;
+	cluster_fence_shmem_init();
+
+	ClusterFenceFreezePending = 0;
+	ut_now_us = 1700000000000000LL;
+	ut_kill_call_count = 0;
+	IsUnderPostmaster = false;
+	MyProcPid = 12345;
+}
 
 
 /* ============================================================
@@ -488,7 +511,7 @@ UT_TEST(test_t_fence_6_thaw_clears_self_fence_pending)
 	cluster_enabled = true;
 	cluster_self_fence_enabled = true;
 	cluster_freeze_writes_enabled = true;
-	cluster_fence_shmem_init();
+	ut_reset_fence_shmem();
 
 	/* Set a pending self-fence then thaw — verify both freeze flag and
 	 * self-fence-pending are handled per §3.7 C2 contract. */
@@ -519,6 +542,34 @@ UT_TEST(test_t_fence_6_thaw_clears_self_fence_pending)
 	ClusterFenceFreezePending = 0;
 }
 
+/* ============================================================
+ * T-fence-7:  thaw clears self_fence_pending even when
+ * cluster.freeze_writes_enabled=false.  That GUC disables only the
+ * in-flight backend abort path;it must not make a recovered quorum
+ * self-fence anyway after grace_ms elapses.
+ * ============================================================ */
+UT_TEST(test_t_fence_7_thaw_clears_self_fence_when_freeze_disabled)
+{
+	cluster_enabled = true;
+	cluster_self_fence_enabled = true;
+	cluster_freeze_writes_enabled = false;
+	cluster_self_fence_grace_ms = 1000;
+	ut_reset_fence_shmem();
+
+	cluster_fence_self_request("test_lost", 0);
+	cluster_fence_broadcast_thaw("test_recovered", 0);
+
+	ut_now_us += 2000000LL; /* exceed 1s grace */
+	cluster_fence_postmaster_check();
+
+	UT_ASSERT_EQ(ut_kill_call_count, 0);
+	UT_ASSERT_EQ((int)ClusterFenceFreezePending, 0);
+
+	/* Restore for other tests. */
+	cluster_freeze_writes_enabled = true;
+	cluster_self_fence_grace_ms = 30000;
+}
+
 
 /* ============================================================
  * Test driver.
@@ -526,7 +577,7 @@ UT_TEST(test_t_fence_6_thaw_clears_self_fence_pending)
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(10);
 	UT_RUN(test_t_fence_1a_guc_defaults);
 	UT_RUN(test_t_fence_1b_shmem_init);
 	UT_RUN(test_t_fence_1c_freeze_flag_default);
@@ -536,5 +587,6 @@ main(void)
 	UT_RUN(test_t_fence_5_disabled_freeze_writes_absorbs_and_clears);
 	UT_RUN(test_t_fence_4_self_request_idempotent_keeps_earliest);
 	UT_RUN(test_t_fence_6_thaw_clears_self_fence_pending);
+	UT_RUN(test_t_fence_7_thaw_clears_self_fence_when_freeze_disabled);
 	UT_DONE();
 }

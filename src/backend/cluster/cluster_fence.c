@@ -308,8 +308,6 @@ cluster_fence_broadcast_thaw(const char *reason, uint64 scn)
 
 	if (!cluster_enabled)
 		return;
-	if (!cluster_freeze_writes_enabled)
-		return;
 	if (ClusterFenceShmem == NULL)
 		return;
 
@@ -333,6 +331,11 @@ cluster_fence_broadcast_thaw(const char *reason, uint64 scn)
 	/*
 	 * Broadcast THAW signal — informational on backend side per
 	 * Invariant I2.  Same ProcArray loop pattern as freeze.
+	 *
+	 * Deliberately do not gate the self-fence cancellation above on
+	 * cluster.freeze_writes_enabled.  That GUC disables the in-flight
+	 * abort path only; a recovered quorum must still clear a pending
+	 * postmaster self-fence request.
 	 */
 	{
 		int beid;
