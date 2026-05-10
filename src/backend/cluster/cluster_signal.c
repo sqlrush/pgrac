@@ -48,6 +48,8 @@
 #include "miscadmin.h" /* MyLatch */
 #include "storage/latch.h"
 
+#include "cluster/cluster_fence.h"	/* ClusterFenceFreezePending (spec-2.28) */
+#include "cluster/cluster_qvotec.h" /* cluster_freeze_writes_set / _thaw_writes_set (spec-2.6) */
 #include "cluster/cluster_signal.h"
 
 
@@ -79,5 +81,64 @@ void
 cluster_handle_reconfig_start_interrupt(void)
 {
 	cluster_reconfig_start_pending = true;
+	SetLatch(MyLatch);
+}
+
+
+/*
+ * cluster_handle_freeze_writes_interrupt -- handler for
+ *	PROCSIG_CLUSTER_FREEZE_WRITES (spec-2.28 Sprint A Step 2 D3).
+ *
+ *	Per spec-2.28 §3.7 C1 dual-set + C3 sig_atomic_t only:
+ *	  - cluster_freeze_writes_set(): writes spec-2.6 cluster_writes_
+ *	    frozen sig_atomic_t = 1;commit gate (cluster_qvotec_in_quorum
+ *	    + xact.c v0.14.1+) fail-closes immediately.
+ *	  - ClusterFenceFreezePending = 1: cluster_fence_check_interrupts
+ *	    (postgres.c hook D4) ereport(ERROR, 53R50) on next
+ *	    ProcessInterrupts to abort in-flight long-running query.
+ *	  - SetLatch(MyLatch): wake main loop so the abort path runs
+ *	    promptly.
+ *
+ *	Both flag writes are sig_atomic_t per POSIX async-signal-safe
+ *	guarantee.  No pg_atomic, no LWLock, no elog, no palloc.
+ */
+void
+cluster_handle_freeze_writes_interrupt(void)
+{
+	/* spec-2.6 path:  commit gate immediate fail-close. */
+	cluster_freeze_writes_set();
+
+	/* spec-2.28 path:  in-flight ProcessInterrupts abort. */
+	ClusterFenceFreezePending = 1;
+
+	SetLatch(MyLatch);
+}
+
+
+/*
+ * cluster_handle_thaw_writes_interrupt -- handler for
+ *	PROCSIG_CLUSTER_THAW_WRITES (spec-2.28 Sprint A Step 2 D3).
+ *
+ *	Per spec-2.28 §3.7 C2 asymmetric + Invariant I2:
+ *	  - cluster_thaw_writes_set(): writes spec-2.6 cluster_writes_
+ *	    frozen sig_atomic_t = 0;commit gate naturally unfreezes.
+ *	  - DOES NOT clear ClusterFenceFreezePending: an in-flight tx
+ *	    that already received the freeze signal must still abort
+ *	    even if quorum recovers between the freeze and the next
+ *	    ProcessInterrupts.  Conservative direction:  work loss
+ *	    (unnecessary abort) vs incorrect commit (silent quorum
+ *	    violation race).
+ *	  - SetLatch(MyLatch): wake main loop for latch-driven consumers.
+ *
+ *	No-op if cluster_writes_frozen was already 0; idempotent.
+ */
+void
+cluster_handle_thaw_writes_interrupt(void)
+{
+	/* spec-2.6 path:  unfreeze commit gate. */
+	cluster_thaw_writes_set();
+
+	/* Per Invariant I2:  DO NOT clear ClusterFenceFreezePending. */
+
 	SetLatch(MyLatch);
 }

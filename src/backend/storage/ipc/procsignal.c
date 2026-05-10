@@ -53,8 +53,7 @@
 #include "storage/proc.h"
 
 #ifdef USE_PGRAC_CLUSTER
-#include "cluster/cluster_qvotec.h"	  /* PGRAC: spec-2.6 freeze/thaw flag setters */
-#include "cluster/cluster_signal.h"	  /* PGRAC: cluster handlers */
+#include "cluster/cluster_signal.h" /* PGRAC: cluster handlers (spec-2.28 D3 dispatches via wrappers) */
 #endif
 #include "storage/shmem.h"
 #include "storage/smgr.h"
@@ -89,8 +88,7 @@
  * (or greater) appears in the pss_barrierGeneration flag of every process,
  * we know that the message has been received everywhere.
  */
-typedef struct
-{
+typedef struct {
 	volatile pid_t pss_pid;
 	volatile sig_atomic_t pss_signalFlags[NUM_PROCSIGNALS];
 	pg_atomic_uint64 pss_barrierGeneration;
@@ -104,8 +102,7 @@ typedef struct
  *
  * psh_barrierGeneration is the highest barrier generation in existence.
  */
-typedef struct
-{
+typedef struct {
 	pg_atomic_uint64 psh_barrierGeneration;
 	ProcSignalSlot psh_slot[FLEXIBLE_ARRAY_MEMBER];
 } ProcSignalHeader;
@@ -115,15 +112,13 @@ typedef struct
  * possible auxiliary process type.  (This scheme assumes there is not
  * more than one of any auxiliary process type at a time.)
  */
-#define NumProcSignalSlots	(MaxBackends + NUM_AUXPROCTYPES)
+#define NumProcSignalSlots (MaxBackends + NUM_AUXPROCTYPES)
 
 /* Check whether the relevant type bit is set in the flags. */
-#define BARRIER_SHOULD_CHECK(flags, type) \
-	(((flags) & (((uint32) 1) << (uint32) (type))) != 0)
+#define BARRIER_SHOULD_CHECK(flags, type) (((flags) & (((uint32)1) << (uint32)(type))) != 0)
 
 /* Clear the relevant type bit from the flags. */
-#define BARRIER_CLEAR_BIT(flags, type) \
-	((flags) &= ~(((uint32) 1) << (uint32) (type)))
+#define BARRIER_CLEAR_BIT(flags, type) ((flags) &= ~(((uint32)1) << (uint32)(type)))
 
 static ProcSignalHeader *ProcSignal = NULL;
 static ProcSignalSlot *MyProcSignalSlot = NULL;
@@ -139,7 +134,7 @@ static void ResetProcSignalBarrierBits(uint32 flags);
 Size
 ProcSignalShmemSize(void)
 {
-	Size		size;
+	Size size;
 
 	size = mul_size(NumProcSignalSlots, sizeof(ProcSignalSlot));
 	size = add_size(size, offsetof(ProcSignalHeader, psh_slot));
@@ -153,21 +148,18 @@ ProcSignalShmemSize(void)
 void
 ProcSignalShmemInit(void)
 {
-	Size		size = ProcSignalShmemSize();
-	bool		found;
+	Size size = ProcSignalShmemSize();
+	bool found;
 
-	ProcSignal = (ProcSignalHeader *)
-		ShmemInitStruct("ProcSignal", size, &found);
+	ProcSignal = (ProcSignalHeader *)ShmemInitStruct("ProcSignal", size, &found);
 
 	/* If we're first, initialize. */
-	if (!found)
-	{
-		int			i;
+	if (!found) {
+		int i;
 
 		pg_atomic_init_u64(&ProcSignal->psh_barrierGeneration, 0);
 
-		for (i = 0; i < NumProcSignalSlots; ++i)
-		{
+		for (i = 0; i < NumProcSignalSlots; ++i) {
 			ProcSignalSlot *slot = &ProcSignal->psh_slot[i];
 
 			slot->pss_pid = 0;
@@ -190,7 +182,7 @@ void
 ProcSignalInit(int pss_idx)
 {
 	ProcSignalSlot *slot;
-	uint64		barrier_generation;
+	uint64 barrier_generation;
 
 	Assert(pss_idx >= 1 && pss_idx <= NumProcSignalSlots);
 
@@ -198,8 +190,8 @@ ProcSignalInit(int pss_idx)
 
 	/* sanity check */
 	if (slot->pss_pid != 0)
-		elog(LOG, "process %d taking over ProcSignal slot %d, but it's not empty",
-			 MyProcPid, pss_idx);
+		elog(LOG, "process %d taking over ProcSignal slot %d, but it's not empty", MyProcPid,
+			 pss_idx);
 
 	/* Clear out any leftover signal reasons */
 	MemSet(slot->pss_signalFlags, 0, NUM_PROCSIGNALS * sizeof(sig_atomic_t));
@@ -216,8 +208,7 @@ ProcSignalInit(int pss_idx)
 	 * sure that any later reads of memory happen strictly after this.
 	 */
 	pg_atomic_write_u32(&slot->pss_barrierCheckMask, 0);
-	barrier_generation =
-		pg_atomic_read_u64(&ProcSignal->psh_barrierGeneration);
+	barrier_generation = pg_atomic_read_u64(&ProcSignal->psh_barrierGeneration);
 	pg_atomic_write_u64(&slot->pss_barrierGeneration, barrier_generation);
 	pg_memory_barrier();
 
@@ -240,7 +231,7 @@ ProcSignalInit(int pss_idx)
 static void
 CleanupProcSignalState(int status, Datum arg)
 {
-	int			pss_idx = DatumGetInt32(arg);
+	int pss_idx = DatumGetInt32(arg);
 	ProcSignalSlot *slot;
 
 	slot = &ProcSignal->psh_slot[pss_idx - 1];
@@ -254,15 +245,14 @@ CleanupProcSignalState(int status, Datum arg)
 	MyProcSignalSlot = NULL;
 
 	/* sanity check */
-	if (slot->pss_pid != MyProcPid)
-	{
+	if (slot->pss_pid != MyProcPid) {
 		/*
 		 * don't ERROR here. We're exiting anyway, and don't want to get into
 		 * infinite loop trying to exit
 		 */
-		elog(LOG, "process %d releasing ProcSignal slot %d, but it contains %d",
-			 MyProcPid, pss_idx, (int) slot->pss_pid);
-		return;					/* XXX better to zero the slot anyway? */
+		elog(LOG, "process %d releasing ProcSignal slot %d, but it contains %d", MyProcPid, pss_idx,
+			 (int)slot->pss_pid);
+		return; /* XXX better to zero the slot anyway? */
 	}
 
 	/*
@@ -291,8 +281,7 @@ SendProcSignal(pid_t pid, ProcSignalReason reason, BackendId backendId)
 {
 	volatile ProcSignalSlot *slot;
 
-	if (backendId != InvalidBackendId)
-	{
+	if (backendId != InvalidBackendId) {
 		slot = &ProcSignal->psh_slot[backendId - 1];
 
 		/*
@@ -303,30 +292,25 @@ SendProcSignal(pid_t pid, ProcSignalReason reason, BackendId backendId)
 		 * that we set a flag for a wrong process. That's OK, all the signals
 		 * are such that no harm is done if they're mistakenly fired.
 		 */
-		if (slot->pss_pid == pid)
-		{
+		if (slot->pss_pid == pid) {
 			/* Atomically set the proper flag */
 			slot->pss_signalFlags[reason] = true;
 			/* Send signal */
 			return kill(pid, SIGUSR1);
 		}
-	}
-	else
-	{
+	} else {
 		/*
 		 * BackendId not provided, so search the array using pid.  We search
 		 * the array back to front so as to reduce search overhead.  Passing
 		 * InvalidBackendId means that the target is most likely an auxiliary
 		 * process, which will have a slot near the end of the array.
 		 */
-		int			i;
+		int i;
 
-		for (i = NumProcSignalSlots - 1; i >= 0; i--)
-		{
+		for (i = NumProcSignalSlots - 1; i >= 0; i--) {
 			slot = &ProcSignal->psh_slot[i];
 
-			if (slot->pss_pid == pid)
-			{
+			if (slot->pss_pid == pid) {
 				/* the above note about race conditions applies here too */
 
 				/* Atomically set the proper flag */
@@ -360,8 +344,8 @@ SendProcSignal(pid_t pid, ProcSignalReason reason, BackendId backendId)
 uint64
 EmitProcSignalBarrier(ProcSignalBarrierType type)
 {
-	uint32		flagbit = 1 << (uint32) type;
-	uint64		generation;
+	uint32 flagbit = 1 << (uint32)type;
+	uint64 generation;
 
 	/*
 	 * Set all the flags.
@@ -371,8 +355,7 @@ EmitProcSignalBarrier(ProcSignalBarrierType type)
 	 * anything that we do afterwards. (This is also true of the later call to
 	 * pg_atomic_add_fetch_u64.)
 	 */
-	for (int i = 0; i < NumProcSignalSlots; i++)
-	{
+	for (int i = 0; i < NumProcSignalSlots; i++) {
 		volatile ProcSignalSlot *slot = &ProcSignal->psh_slot[i];
 
 		pg_atomic_fetch_or_u32(&slot->pss_barrierCheckMask, flagbit);
@@ -381,8 +364,7 @@ EmitProcSignalBarrier(ProcSignalBarrierType type)
 	/*
 	 * Increment the generation counter.
 	 */
-	generation =
-		pg_atomic_add_fetch_u64(&ProcSignal->psh_barrierGeneration, 1);
+	generation = pg_atomic_add_fetch_u64(&ProcSignal->psh_barrierGeneration, 1);
 
 	/*
 	 * Signal all the processes, so that they update their advertised barrier
@@ -397,13 +379,11 @@ EmitProcSignalBarrier(ProcSignalBarrierType type)
 	 * backends that need to update state - but they won't actually need to
 	 * change any state.
 	 */
-	for (int i = NumProcSignalSlots - 1; i >= 0; i--)
-	{
+	for (int i = NumProcSignalSlots - 1; i >= 0; i--) {
 		volatile ProcSignalSlot *slot = &ProcSignal->psh_slot[i];
-		pid_t		pid = slot->pss_pid;
+		pid_t pid = slot->pss_pid;
 
-		if (pid != 0)
-		{
+		if (pid != 0) {
 			/* see SendProcSignal for details */
 			slot->pss_signalFlags[PROCSIG_BARRIER] = true;
 			kill(pid, SIGUSR1);
@@ -422,15 +402,12 @@ WaitForProcSignalBarrier(uint64 generation)
 {
 	Assert(generation <= pg_atomic_read_u64(&ProcSignal->psh_barrierGeneration));
 
-	elog(DEBUG1,
-		 "waiting for all backends to process ProcSignalBarrier generation "
-		 UINT64_FORMAT,
+	elog(DEBUG1, "waiting for all backends to process ProcSignalBarrier generation " UINT64_FORMAT,
 		 generation);
 
-	for (int i = NumProcSignalSlots - 1; i >= 0; i--)
-	{
+	for (int i = NumProcSignalSlots - 1; i >= 0; i--) {
 		ProcSignalSlot *slot = &ProcSignal->psh_slot[i];
-		uint64		oldval;
+		uint64 oldval;
 
 		/*
 		 * It's important that we check only pss_barrierGeneration here and
@@ -439,22 +416,19 @@ WaitForProcSignalBarrier(uint64 generation)
 		 * is updated only afterward.
 		 */
 		oldval = pg_atomic_read_u64(&slot->pss_barrierGeneration);
-		while (oldval < generation)
-		{
-			if (ConditionVariableTimedSleep(&slot->pss_barrierCV,
-											5000,
+		while (oldval < generation) {
+			if (ConditionVariableTimedSleep(&slot->pss_barrierCV, 5000,
 											WAIT_EVENT_PROC_SIGNAL_BARRIER))
 				ereport(LOG,
 						(errmsg("still waiting for backend with PID %d to accept ProcSignalBarrier",
-								(int) slot->pss_pid)));
+								(int)slot->pss_pid)));
 			oldval = pg_atomic_read_u64(&slot->pss_barrierGeneration);
 		}
 		ConditionVariableCancelSleep();
 	}
 
 	elog(DEBUG1,
-		 "finished waiting for all backends to process ProcSignalBarrier generation "
-		 UINT64_FORMAT,
+		 "finished waiting for all backends to process ProcSignalBarrier generation " UINT64_FORMAT,
 		 generation);
 
 	/*
@@ -495,8 +469,8 @@ HandleProcSignalBarrierInterrupt(void)
 void
 ProcessProcSignalBarrier(void)
 {
-	uint64		local_gen;
-	uint64		shared_gen;
+	uint64 local_gen;
+	uint64 shared_gen;
 	volatile uint32 flags;
 
 	Assert(MyProcSignalSlot);
@@ -544,9 +518,8 @@ ProcessProcSignalBarrier(void)
 	 * Otherwise, establish a PG_TRY block, so that we don't lose track of
 	 * which types of barrier processing are needed if an ERROR occurs.
 	 */
-	if (flags != 0)
-	{
-		bool		success = true;
+	if (flags != 0) {
+		bool success = true;
 
 		PG_TRY();
 		{
@@ -562,17 +535,15 @@ ProcessProcSignalBarrier(void)
 			 * unconditionally, but it's more efficient to call only the ones
 			 * that might need us to do something based on the flags.
 			 */
-			while (flags != 0)
-			{
+			while (flags != 0) {
 				ProcSignalBarrierType type;
-				bool		processed = true;
+				bool processed = true;
 
-				type = (ProcSignalBarrierType) pg_rightmost_one_pos32(flags);
-				switch (type)
-				{
-					case PROCSIGNAL_BARRIER_SMGRRELEASE:
-						processed = ProcessBarrierSmgrRelease();
-						break;
+				type = (ProcSignalBarrierType)pg_rightmost_one_pos32(flags);
+				switch (type) {
+				case PROCSIGNAL_BARRIER_SMGRRELEASE:
+					processed = ProcessBarrierSmgrRelease();
+					break;
 				}
 
 				/*
@@ -586,9 +557,8 @@ ProcessProcSignalBarrier(void)
 				 * so we try again later, and set a flag so that we don't bump
 				 * our generation.
 				 */
-				if (!processed)
-				{
-					ResetProcSignalBarrierBits(((uint32) 1) << type);
+				if (!processed) {
+					ResetProcSignalBarrierBits(((uint32)1) << type);
 					success = false;
 				}
 			}
@@ -647,11 +617,9 @@ CheckProcSignal(ProcSignalReason reason)
 {
 	volatile ProcSignalSlot *slot = MyProcSignalSlot;
 
-	if (slot != NULL)
-	{
+	if (slot != NULL) {
 		/* Careful here --- don't clear flag if we haven't seen it set */
-		if (slot->pss_signalFlags[reason])
-		{
+		if (slot->pss_signalFlags[reason]) {
 			slot->pss_signalFlags[reason] = false;
 			return true;
 		}
@@ -666,7 +634,7 @@ CheckProcSignal(ProcSignalReason reason)
 void
 procsignal_sigusr1_handler(SIGNAL_ARGS)
 {
-	int			save_errno = errno;
+	int save_errno = errno;
 
 	if (CheckProcSignal(PROCSIG_CATCHUP_INTERRUPT))
 		HandleCatchupInterrupt();
@@ -713,23 +681,26 @@ procsignal_sigusr1_handler(SIGNAL_ARGS)
 #ifdef USE_PGRAC_CLUSTER
 	/*
 	 * PGRAC: cluster signal dispatch.  Each cluster ProcSignalReason
-	 * lands in a handler — stage-0.15+ reasons in cluster_signal.c,
-	 * stage-2.6 fail-closed reasons inline (cluster_qvotec.c
-	 * sig_atomic_t flag setters).
+	 * lands in a handler in cluster_signal.c — async-signal-safe
+	 * (sig_atomic_t writes + SetLatch only, per CLAUDE.md rule 16).
 	 *
-	 * spec-2.6 D5 (Sprint A Step 3): the freeze/thaw handlers MUST
-	 * stay async-signal-safe — they only mutate a sig_atomic_t flag
-	 * via cluster_freeze_writes_set / cluster_thaw_writes_set;the
-	 * actual ereport(ERROR) happens later at write-intent or commit
-	 * boundary in tcop/postgres.c (Step 3 D6 — read the flag from
-	 * cluster_writes_currently_frozen + cluster_qvotec_in_quorum).
+	 * spec-2.28 Sprint A Step 2 D3 amend:  the freeze/thaw paths now
+	 * dispatch to cluster_handle_freeze_writes_interrupt /
+	 * cluster_handle_thaw_writes_interrupt instead of directly to the
+	 * spec-2.6 sig_atomic_t setters.  The new handlers implement
+	 * spec-2.28 §3.7 §C1+C2 dual-set / asymmetric:  freeze keeps the
+	 * spec-2.6 commit gate immediate fail-close (cluster_freeze_writes_
+	 * set) AND adds in-flight ProcessInterrupts abort (ClusterFence
+	 * FreezePending = 1);thaw clears the spec-2.6 flag but does NOT
+	 * clear ClusterFenceFreezePending (Invariant I2 conservative
+	 * direction).
 	 */
 	if (CheckProcSignal(PROCSIG_CLUSTER_RECONFIG_START))
 		cluster_handle_reconfig_start_interrupt();
 	if (CheckProcSignal(PROCSIG_CLUSTER_FREEZE_WRITES))
-		cluster_freeze_writes_set();
+		cluster_handle_freeze_writes_interrupt();
 	if (CheckProcSignal(PROCSIG_CLUSTER_THAW_WRITES))
-		cluster_thaw_writes_set();
+		cluster_handle_thaw_writes_interrupt();
 #endif
 
 	SetLatch(MyLatch);

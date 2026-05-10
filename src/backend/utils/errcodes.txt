@@ -479,6 +479,16 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 53R44    E    ERRCODE_CLUSTER_QVOTEC_SPAWN_FAILED                            cluster_qvotec_spawn_failed
 53R45    E    ERRCODE_CLUSTER_QVOTEC_NOT_READY                               cluster_qvotec_not_ready
 
+# spec-2.28 Sprint A Step 2 D4 (D8 partial) — fence-lite in-flight tx
+# abort path.  53R50 ≠ 53R40 by design (Q4 user approve):  53R40 is
+# CommitTransaction commit-gate path (spec-2.6 v0.14.1+); 53R50 is
+# ProcessInterrupts in-flight ProcSignal abort path (spec-2.28 §3.7
+# C4 read-clear-then-decide).  Distinct error codes let log analysis +
+# client retry logic distinguish "tx start blocked at commit" vs "tx
+# aborted mid-flight by fence broadcast".  53R51-59 reserved for
+# future fence (spec-2.29 reconfig / spec-2.30 external fence).
+53R50    E    ERRCODE_CLUSTER_QUORUM_LOST_BACKEND                            cluster_quorum_lost_backend
+
 Section: Class 54 - Program Limit Exceeded
 
 # this is for wired-in limits, not resource exhaustion problems (class borrowed from DB2)

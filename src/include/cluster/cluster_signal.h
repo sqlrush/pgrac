@@ -76,4 +76,51 @@ extern volatile sig_atomic_t cluster_reconfig_start_pending;
 extern void cluster_handle_reconfig_start_interrupt(void);
 
 
+/*
+ * cluster_handle_freeze_writes_interrupt -- async-signal-safe handler
+ *	called by procsignal_sigusr1_handler when a backend receives
+ *	PROCSIG_CLUSTER_FREEZE_WRITES (spec-2.28 Sprint A Step 2 D3).
+ *
+ *	Per spec-2.28 §3.7 Step 2 implementation contract:
+ *
+ *	  C1 dual-set:  this handler must BOTH (a) keep the existing
+ *	     cluster_freeze_writes_set() side effect — sets the spec-2.6
+ *	     cluster_writes_frozen sig_atomic_t so the commit gate
+ *	     (cluster_qvotec_in_quorum + xact.c v0.14.1+) fail-closes
+ *	     immediately at next CommitTransaction; AND (b) set
+ *	     ClusterFenceFreezePending = 1 so cluster_fence_check_
+ *	     interrupts (postgres.c hook D4) can ereport(ERROR,
+ *	     ERRCODE_CLUSTER_QUORUM_LOST_BACKEND) on next ProcessInterrupts
+ *	     to abort an in-flight long-running query.  Both paths are
+ *	     independent defenses against quorum loss; replacing either
+ *	     would break a contract.
+ *
+ *	  C3 sig_atomic_t only:  no pg_atomic_write_u32, no LWLock, no
+ *	     elog, no palloc.  Both writes are sig_atomic_t per POSIX
+ *	     async-signal-safe guarantee.
+ */
+extern void cluster_handle_freeze_writes_interrupt(void);
+
+
+/*
+ * cluster_handle_thaw_writes_interrupt -- async-signal-safe handler
+ *	called by procsignal_sigusr1_handler when a backend receives
+ *	PROCSIG_CLUSTER_THAW_WRITES (spec-2.28 Sprint A Step 2 D3).
+ *
+ *	Per spec-2.28 §3.7 Step 2 implementation contract:
+ *
+ *	  C2 asymmetric (NOT a mirror of freeze):  this handler calls
+ *	     cluster_thaw_writes_set() — clears spec-2.6 cluster_writes_
+ *	     frozen so commit gate naturally unfreezes — but does NOT
+ *	     clear ClusterFenceFreezePending.  Per Invariant I2, an
+ *	     in-flight tx that already received the freeze signal must
+ *	     still abort even if quorum recovers between the freeze and
+ *	     ProcessInterrupts (conservative direction:  work loss vs
+ *	     incorrect commit).
+ *
+ *	  C3 sig_atomic_t only:  same constraint as freeze handler.
+ */
+extern void cluster_handle_thaw_writes_interrupt(void);
+
+
 #endif /* CLUSTER_SIGNAL_H */

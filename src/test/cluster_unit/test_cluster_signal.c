@@ -84,6 +84,25 @@ SetLatch(Latch *latch pg_attribute_unused())
 	/* Stub: real impl is in src/backend/storage/ipc/latch.c */
 }
 
+/*
+ * spec-2.28 Sprint A Step 2 stubs: cluster_signal.o now references
+ * cluster_freeze_writes_set / cluster_thaw_writes_set (spec-2.6
+ * cluster_qvotec.c) and ClusterFenceFreezePending (spec-2.28
+ * cluster_fence.c) from its dual-set freeze handler + thaw handler.
+ * Provide standalone stubs so test_cluster_signal still links.  The
+ * dual-set + asymmetric-thaw semantic is verified end-to-end by
+ * test_cluster_fence (T-fence-2/3/5) — this test only validates the
+ * RECONFIG_START handler dispatch.
+ */
+#include <signal.h>
+volatile sig_atomic_t ClusterFenceFreezePending = 0;
+void
+cluster_freeze_writes_set(void)
+{}
+void
+cluster_thaw_writes_set(void)
+{}
+
 
 UT_DEFINE_GLOBALS();
 

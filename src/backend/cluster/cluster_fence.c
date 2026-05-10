@@ -70,6 +70,7 @@
 
 #include <string.h>
 
+#include "access/xact.h" /* IsTransactionState (spec-2.28 Step 2 D4 hook) */
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/lwlock.h"
@@ -269,12 +270,38 @@ cluster_fence_check_interrupts(void)
 	 * already returned early when CritSectionCount > 0 (postgres.c:
 	 * 3226-3227), so we cannot be inside a CS here. */
 
+	/*
+	 * Per spec-2.28 §3.7 C4:  read-clear-then-decide.
+	 *
+	 * 1. Cheap pre-check returns immediately for the common no-pending
+	 *    path (avoids the cost of writing a sig_atomic_t in the hot
+	 *    interrupt-checking loop).
+	 * 2. Clear the flag BEFORE the enabled-check + IsTransactionState
+	 *    check.  If we leave the flag set when GUC is disabled or we
+	 *    are idle, a later GUC re-enable + new transaction would see
+	 *    a stale freeze bit and ereport against a quorum loss that
+	 *    has long since recovered.  Clear-first is the same idiom PG
+	 *    uses for QueryCancelPending (postgres.c:3047-3070).
+	 * 3. After clearing, decide whether to actually ereport based on
+	 *    the GUC + transaction state.
+	 */
 	if (ClusterFenceFreezePending == 0)
 		return;
 
-	/* Step 2 D4 will atomic-clear and ereport ERROR 53R50 here.
-	 * Step 1 keeps the flag set + returns silently — no ereport
-	 * because postgres.c hook is not yet wired (Step 2). */
+	ClusterFenceFreezePending = 0;
+
+	if (!cluster_freeze_writes_enabled)
+		return; /* dev/debug GUC absorb */
+
+	if (!IsTransactionState())
+		return; /* idle backend absorb — commit gate handles next BEGIN */
+
+	ereport(ERROR, (errcode(ERRCODE_CLUSTER_QUORUM_LOST_BACKEND),
+					errmsg("transaction aborted: cluster quorum lost in flight"),
+					errhint("the cluster lost majority quorum during your "
+							"transaction;all uncommitted writes have been "
+							"rolled back;auto-retry will resume after quorum "
+							"recovers (typically O(seconds))")));
 }
 
 void
