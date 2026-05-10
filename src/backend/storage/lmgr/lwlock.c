@@ -206,6 +206,8 @@ static const char *const BuiltinTrancheNames[] = {
 	"ClusterScn",
 	/* PGRAC LWTRANCHE_CLUSTER_CSSD: */
 	"ClusterCssd",
+	/* PGRAC LWTRANCHE_CLUSTER_FENCE: spec-2.28 Sprint A Step 1 */
+	"ClusterFence",
 #endif
 };
 
