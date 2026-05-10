@@ -98,6 +98,10 @@ PG_FUNCTION_INFO_V1(cluster_get_cssd_peers);
 PG_FUNCTION_INFO_V1(cluster_get_quorum_state);
 PG_FUNCTION_INFO_V1(cluster_get_voting_disks);
 
+/* spec-2.28 D10 -- cluster_get_fence_state SRF symbol; body in
+ * cluster_fence.c (--enable-cluster) or stub at file end (--disable). */
+PG_FUNCTION_INFO_V1(cluster_get_fence_state);
+
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -1241,6 +1245,20 @@ cluster_get_voting_disks(PG_FUNCTION_ARGS pg_attribute_unused())
 {
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("cluster_get_voting_disks requires --enable-cluster")));
+	PG_RETURN_NULL();
+}
+
+/*
+ * spec-2.28 D10 -- cluster_get_fence_state disable-cluster stub.
+ * cluster_fence.c is gated on USE_PGRAC_CLUSTER and not linked in
+ * disable mode;but pg_proc.dat references the symbol unconditionally
+ * so fmgrtab.o needs a stub to resolve.
+ */
+Datum
+cluster_get_fence_state(PG_FUNCTION_ARGS pg_attribute_unused())
+{
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cluster_get_fence_state requires --enable-cluster")));
 	PG_RETURN_NULL();
 }
 #endif

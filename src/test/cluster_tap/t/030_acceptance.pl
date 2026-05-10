@@ -146,7 +146,7 @@ ok($phase_val =~ /^(init|running|shutdown|reconfig)$/,
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'64', 'E1 pg_stat_cluster_wait_events returns 64 rows (61 prior + 3 qvotec spec-2.6 D11)');
+	'65', 'E1 pg_stat_cluster_wait_events returns 65 rows (61 prior + 3 qvotec spec-2.6 D11 + 1 fence spec-2.28 D9)');
 
 ok($node->safe_psql('postgres',
 		q{SELECT count(*) > 0 FROM pg_stat_cluster_wait_events WHERE type='Cluster: GES'})
@@ -158,7 +158,7 @@ ok($node->safe_psql('postgres',
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_gcluster_wait_events'),
-	'64', 'E4 pg_stat_gcluster_wait_events returns 64 rows (single-node, +3 qvotec spec-2.6 D11)');
+	'65', 'E4 pg_stat_gcluster_wait_events returns 65 rows (single-node, +3 qvotec spec-2.6 D11 + 1 fence spec-2.28 D9)');
 
 
 # ============================================================
@@ -302,7 +302,7 @@ ok(defined $postgres_bin && -x $postgres_bin,
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-	'94', 'M1 94 injection points (89 prior + 5 qvotec spec-2.6 D14: poll-pre/post + voting-disk-write-fail + quorum-loss-broadcast + collision-detect)');
+	'97', 'M1 97 injection points (89 prior + 5 qvotec spec-2.6 D14 + 3 fence spec-2.28 D12: pre-freeze-broadcast / pre-self-fence-shutdown / post-thaw-broadcast)');
 
 is($node->safe_psql('postgres',
 		q{SELECT string_agg(name, ',' ORDER BY name) FROM pg_stat_cluster_injections WHERE name LIKE 'cluster-init-%'}),
@@ -332,8 +332,8 @@ ok( $node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT key) FROM pg_cluster_state
 		   WHERE category='inject' AND (key LIKE '%.fault_type' OR key LIKE '%.hits')}
-	) eq '188',
-	'M5 inject category has 94×2 = 188 sub-keys (.fault_type + .hits) after spec-2.6 D14');
+	) eq '194',
+	'M5 inject category has 97×2 = 194 sub-keys (.fault_type + .hits) after spec-2.28 D12');
 
 is($node->get_cluster_state_value('inject', 'armed_count'),
 	'0', 'M6 inject.armed_count starts at 0 in fresh backend');
