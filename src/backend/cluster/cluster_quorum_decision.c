@@ -144,8 +144,8 @@ decide_quorum_view(const ClusterVotingSlot *slots, const ClusterVotingDiskIoStat
 			 * non-ALIVE slots are clean-shutdown tombstones that must
 			 * not trip fast-restart false collision.
 			 */
-			if ((s->flags & CLUSTER_VOTING_SLOT_FLAG_ALIVE)
-				&& s->node_id == self_node_id && s->incarnation != self_incarnation) {
+			if ((s->flags & CLUSTER_VOTING_SLOT_FLAG_ALIVE) && s->node_id == self_node_id
+				&& s->incarnation != self_incarnation) {
 				if (self_incarnation > s->incarnation) {
 					/*
 					 * Q6 v0.2:  newer-self-FATAL.  Self is the newer
