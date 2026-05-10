@@ -129,48 +129,45 @@ done_testing();
 
 
 #-------------------------------------------------------------------------
-# spec-2.6 Hardening v0.5+ backlog — L4-L8 still SKIP.
+# spec-2.6 Hardening v0.5+ backlog — L4-L8 still SKIP (per spec-2.28
+# Sprint A Step 5 design-gap finding 2026-05-10):
 #
-#   L4   SIGSTOP node0 → node1 detects quorum loss within ~5s.
-#        Blocked on: cluster_freeze_writes ProcSignal broadcast
-#        (Hardening v0.3 backlog #1).  Without broadcast, backend
-#        fail-closed latency = lease_window + commit_boundary
-#        check granularity, which is observability-flaky for a
-#        5s assertion.
+#   L4-L5 SIGSTOP / SIGCONT peer postmaster → expected quorum_state
+#         OK→LOST→OK transition.
+#         **GAP DISCOVERED in spec-2.28 Sprint A Step 5 (098 TAP
+#         design)**: spec-2.6 decide_quorum_view computes quorum_
+#         state purely from disks_ok (per-disk read success);
+#         SIGSTOP peer postmaster does NOT change disks_ok on the
+#         survivor — both nodes can still read all 3 disk files.
+#         The alive_bitmap drops the SIGSTOP'd peer after heartbeat
+#         times out, but alive_bitmap is NOT used by quorum_state.
+#         Therefore SIGSTOP cannot trigger fence broadcast in
+#         current spec-2.6 design.
 #
-#   L5   SIGCONT → node0 rejoins, both back to in_quorum=t.
-#        Blocked on: same as L4 (the rejoin path needs the thaw
-#        signal companion).
+#         Whether to include peer-alive in quorum_state decision is
+#         an open architectural question for spec-2.6 hardening OR
+#         spec-2.29 reconfig coordinator;NOT silently bundled into
+#         spec-2.28.  See 098_fence_freeze_writes_2node.pl header
+#         for full rationale + 5 documentation items.
+#
+#         Real L4-L5 verification needs disk I/O failure injection
+#         (same harness as L8 below) to drive disks_ok < quorum_
+#         size → quorum_state=LOST → cluster_fence_broadcast_freeze.
 #
 #   L6   Two postmasters configured with the same node_id (forced
 #        via cluster_name_override style trick) → one observes
 #        Q6 v0.2 newer-self collision on disk and FATAL exits.
 #        Blocked on: ClusterPair currently hardcodes node_id 0/1;
-#        needs an opt-in collision-injection path.  Implementation
-#        cost is moderate (~50 LOC) but test-fixture stability
-#        requires that the loser's FATAL log line is deterministic,
-#        which we have not yet smoke-tested.
+#        needs an opt-in collision-injection path.
 #
 #   L7   kill -9 both postmasters → restart → boot-time epoch
-#        recovery: each node's current_epoch must be set to
-#        max(disk_epoch_seen) + 1.
-#        Blocked on: current_epoch_at_boot=0 placeholder
-#        (Hardening v0.5+ backlog #2).  Until that lands, restart
-#        races to the same epoch and the assertion is meaningless.
+#        recovery.  Blocked on: current_epoch_at_boot=0 placeholder.
 #
 #   L8   chmod 000 / truncate / unlink all 3 voting-disk files →
-#        both postmasters drop in_quorum within one poll cycle and
-#        backends fail-closed on COMMIT.
-#        Blocked on: stable I/O failure injection harness.  Naive
-#        unlink() on an open fd has divergent semantics on Linux
-#        (still readable through the fd) vs macOS, and chmod 000
-#        as the test user is a no-op when running as root in CI.
-#        Needs a small per-disk fault-injection GUC (Hardening
-#        v0.5+ backlog #4).
+#        both postmasters drop in_quorum within one poll cycle.
+#        Blocked on: stable I/O failure injection harness.
+#        (This is the harness needed for L4-L5 too — see above.)
 #
-# These five scenarios are tracked in spec-2.6 Hardening v0.5+
-# backlog appendix.  When the upstream blockers land (or a new
-# spec demands the coverage — e.g. spec-2.28 Fence-lite for L4/L5/
-# L8), reopen this file and append the L4-L8 implementations after
-# the done_testing() of L1-L3.
+# Tracked in spec-2.6 Hardening v0.5+ backlog appendix +
+# spec-2.28 Hardening v0.5+ backlog (shared blocker).
 #-------------------------------------------------------------------------

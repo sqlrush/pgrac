@@ -332,6 +332,86 @@ Size of each pre-allocated voting-disk file.  Each cluster instance
 owns one 512-byte slot at offset `node_id × 512`; the default holds
 slots for 128 instances.
 
+### `cluster.self_fence_enabled`
+
+> **EXPERIMENTAL.** Fence-lite path requires the voting-disk + quorum
+> coordinator;treat together with the EXPERIMENTAL surface above.
+
+| | |
+|---|---|
+| Type | bool |
+| Default | `on` (production fail-safe) |
+| Context | postmaster |
+
+Whether the postmaster initiates an orderly fast-shutdown when the
+cluster has lost quorum for longer than `cluster.self_fence_grace_ms`.
+When `on` (default), the postmaster self-signals SIGINT after the
+grace window, driving PG's standard fast-shutdown path; when `off`,
+operators must stop the instance manually.
+
+In-flight transaction abort on quorum loss is controlled separately
+by `cluster.freeze_writes_enabled` — this GUC only affects the
+postmaster shutdown decision, not the per-backend abort behaviour.
+
+The dev / test escape is `cluster.allow_single_node = on`:  in single-
+node mode the coordinator never enters the LOST quorum state, so
+self-fence cannot trigger regardless of this GUC's value.
+
+### `cluster.self_fence_grace_ms`
+
+| | |
+|---|---|
+| Type | integer (milliseconds) |
+| Default | `30000` (30 s) |
+| Range | `1000` – `300000` |
+| Context | postmaster |
+
+Delay between the cluster's quorum-loss broadcast and the postmaster's
+self-fence shutdown.  This delay applies **only** to the postmaster
+shutdown decision — the in-flight transaction freeze broadcast happens
+immediately when quorum is lost.
+
+The default (30 s ≈ 7.5× the lease window) absorbs short network
+flaps without triggering a self-shutdown.  Lower it for more
+aggressive shutdown on flap;raise it to give operators more time to
+intervene.
+
+### `cluster.freeze_writes_enabled`
+
+| | |
+|---|---|
+| Type | bool |
+| Default | `on` (production fail-safe) |
+| Context | postmaster |
+
+Whether backends abort in-flight transactions on receipt of the cluster
+quorum-loss broadcast (`PROCSIG_CLUSTER_FREEZE_WRITES`).  When `on`
+(default), the next `CHECK_FOR_INTERRUPTS` after the signal raises
+`ERRCODE_CLUSTER_QUORUM_LOST_BACKEND` (SQLSTATE `53R50`) and rolls
+back the transaction.  When `off`, the signal is silently absorbed
+and only the commit-boundary fail-closed gate (controlled by
+`cluster.voting_disks` / quorum lease) prevents writes.
+
+Off is for diagnosing fence-induced abort behaviour without losing
+in-flight work — production should keep on.  This setting does **not**
+bypass the commit-boundary gate either way.
+
+### `cluster.fence_audit_log`
+
+| | |
+|---|---|
+| Type | enum (`off` / `log` / `debug`) |
+| Default | `log` |
+| Context | postmaster |
+
+Verbosity of fence-related entries in the postmaster log.
+
+* `off` — silent;rely on `pg_cluster_fence_state` view + counters.
+* `log` — one LOG line per broadcast (freeze / thaw / self-fence
+  initiated).  Default;recommended for production.
+* `debug` — adds DEBUG2 entries for each backend that received the
+  freeze signal.  Verbose, dev / test only.
+
 ## pgrac.conf format
 
 INI-style: section headers in `[brackets]` and `key = value`

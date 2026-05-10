@@ -83,6 +83,45 @@ for column reference.
 > release.  Until then, `pg_cluster_quorum_state.in_quorum` reports the
 > fail-closed default.
 
+## In-flight transaction management on quorum loss
+
+When the cluster transitions from healthy to lost-quorum, two
+independent defenses fire to protect data integrity:
+
+1. **Commit-boundary fail-closed gate** (always-on).  Every
+   `CommitTransaction` call consults the lease-aware
+   `cluster_qvotec_in_quorum()` predicate;a `false` return raises
+   `ERRCODE_CLUSTER_QUORUM_LOST` (SQLSTATE `53R40`).  No transaction
+   that survives the lease window can commit through a quorum loss.
+
+2. **In-flight `PROCSIG_CLUSTER_FREEZE_WRITES` broadcast.** The cluster
+   coordinator (LMON) immediately signals every live backend; the next
+   `CHECK_FOR_INTERRUPTS` after the signal raises
+   `ERRCODE_CLUSTER_QUORUM_LOST_BACKEND` (SQLSTATE `53R50`) and rolls
+   back the transaction, even if it has not yet reached its commit
+   boundary.  Long-running queries are aborted within milliseconds
+   instead of seconds, removing wasted work and locks.
+
+If the quorum loss persists for `cluster.self_fence_grace_ms` (default
+30 s), the postmaster initiates a fast shutdown via SIGINT.  Backends
+receive SIGTERM, dirty buffers flush, and recovery resumes from the
+voting-disk slot on the next start.  This is a defense-in-depth
+backstop — the commit gate already prevents incorrect commits — but
+it removes inconsistent state from the cluster within a bounded
+window.
+
+The `pg_cluster_fence_state` view exposes per-backend signal counters,
+broadcast timestamps, and the self-fence-pending state.  The
+behaviour is governed by four PGC_POSTMASTER GUCs:
+`cluster.self_fence_enabled` / `cluster.self_fence_grace_ms` /
+`cluster.freeze_writes_enabled` / `cluster.fence_audit_log` (see
+[configuration.md](../user-guide/configuration.md) for full reference).
+
+> **Status.** The fence-lite path ships with the catalog surface +
+> end-to-end TAP coverage in this release.  External fence command
+> integration (IPMI / STONITH / cloud API) is not in scope and will
+> land in a future watchdog spec.
+
 ## Postmaster startup flow
 
 ```
