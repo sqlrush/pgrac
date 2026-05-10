@@ -38,6 +38,20 @@ use PostgreSQL::Test::Utils;
 #	                           force HELLO mismatch; default = same)
 #	  extra_conf             : arrayref of extra GUC lines appended
 #	                           to BOTH nodes' postgresql.conf
+#	  quorum_voting_disks    : positive integer N — opt-in spec-2.6
+#	                           strict-mode harness.  Pre-allocates N
+#	                           shared voting-disk files (zero-filled,
+#	                           64KB each) in a tempdir and configures
+#	                           BOTH nodes with cluster.allow_single_
+#	                           node=off + cluster.voting_disks=CSV.
+#	                           Default unset = legacy compatibility
+#	                           mode (allow_single_node=on, no voting
+#	                           disks); preserves behaviour for the 8
+#	                           pre-existing TAPs (075/076/079/080/
+#	                           081/085/090/097-style negative).  Use
+#	                           the ->voting_disk_paths accessor to
+#	                           recover the file list (e.g., for fault
+#	                           injection in future Hardening v0.5+).
 #-----------------------------------------------------------------------
 sub new_pair
 {
@@ -54,6 +68,28 @@ sub new_pair
 	  PostgreSQL::Test::Cluster->new("${cluster_name}_node0", port => $pg_port_0);
 	my $node1 =
 	  PostgreSQL::Test::Cluster->new("${cluster_name}_node1", port => $pg_port_1);
+
+	# spec-2.6 strict-mode opt-in: pre-allocate N shared voting-disk
+	# files (zero-filled, 128 slots × 512B = 64KB each) in a tempdir
+	# both postmasters can read/write.  Disks list is built once and
+	# written into both nodes' postgresql.conf so the same file paths
+	# back the same disk_index slots from both sides.
+	my $voting_disks_csv;
+	my @voting_disk_paths;
+	if (defined $opts{quorum_voting_disks} && $opts{quorum_voting_disks} > 0)
+	{
+		my $disk_dir = PostgreSQL::Test::Utils::tempdir();
+		for my $i (0 .. $opts{quorum_voting_disks} - 1)
+		{
+			my $path = "$disk_dir/disk$i";
+			open(my $fh, '>', $path) or die "open $path: $!";
+			binmode $fh;
+			print $fh ("\0" x (128 * 512));
+			close $fh;
+			push @voting_disk_paths, $path;
+		}
+		$voting_disks_csv = join(',', @voting_disk_paths);
+	}
 
 	for my $node ($node0, $node1)
 	{
@@ -74,10 +110,21 @@ sub new_pair
 		# every 2s; the polling adds background catalog activity
 		# that destabilises sensitive observability assertions
 		# (e.g. 090 L9c HTAB shrink check).  Tests that genuinely
-		# require strict mode set those GUCs explicitly via
+		# require strict mode opt in via quorum_voting_disks =>
+		# N (096 happy path) or set the GUCs explicitly via
 		# extra_conf (097 does this); ClusterPair stays neutral.
-		$node->append_conf('postgresql.conf',
-			"cluster.allow_single_node = on\n");
+		if (defined $voting_disks_csv)
+		{
+			$node->append_conf('postgresql.conf',
+				"cluster.allow_single_node = off\n");
+			$node->append_conf('postgresql.conf',
+				"cluster.voting_disks = '$voting_disks_csv'\n");
+		}
+		else
+		{
+			$node->append_conf('postgresql.conf',
+				"cluster.allow_single_node = on\n");
+		}
 
 		# Keep shared_buffers small so 2 postmasters fit in CI runners
 		# (R8 mitigation).
@@ -132,6 +179,7 @@ EOC
 		cluster_name => $cluster_name,
 		pg_ports    => [ $pg_port_0, $pg_port_1 ],
 		ic_ports    => [ $ic_port_0, $ic_port_1 ],
+		voting_disk_paths => \@voting_disk_paths,
 	}, $class;
 }
 
@@ -155,6 +203,21 @@ sub stop_pair
 sub node0   { return $_[0]->{node0}; }
 sub node1   { return $_[0]->{node1}; }
 sub ic_port { return $_[0]->{ic_ports}[ $_[1] ]; }
+
+#-----------------------------------------------------------------------
+# voting_disk_paths($self)
+#
+#	Returns the list of pre-allocated voting-disk file paths (one
+#	per element).  Empty list when ClusterPair was created without
+#	the quorum_voting_disks opt.  Lets future fault-injection TAPs
+#	(spec-2.6 Hardening v0.5+ — 096 L8 all-disk-fail) reach into the
+#	files for write/chmod/unlink scenarios.
+#-----------------------------------------------------------------------
+sub voting_disk_paths
+{
+	my ($self) = @_;
+	return @{ $self->{voting_disk_paths} // [] };
+}
 
 
 #-----------------------------------------------------------------------
