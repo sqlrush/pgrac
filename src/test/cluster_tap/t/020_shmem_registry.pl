@@ -78,14 +78,14 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_shmem}),
-   '14',
+   '15',
    'L2 pg_cluster_shmem returns 14 rows (13 prior + cluster_qvotec at spec-2.6 Sprint A Step 1)');
 
 is($node->safe_psql(
 		'postgres',
 		q{SELECT string_agg(name, ',' ORDER BY name) FROM pg_cluster_shmem}),
-   'pgrac cluster conf,pgrac cluster control,pgrac cluster cssd,pgrac cluster diag,pgrac cluster epoch,pgrac cluster lck,pgrac cluster lmon,pgrac cluster pcm grd,pgrac cluster qvotec,pgrac cluster scn,pgrac cluster smgr,pgrac cluster startup phase,pgrac cluster stats,pgrac cluster_ic_tier1',
-   'L3 pg_cluster_shmem rows are exactly the 14 foundational regions (13 prior + cluster_qvotec since spec-2.6)');
+   'pgrac cluster conf,pgrac cluster control,pgrac cluster cssd,pgrac cluster diag,pgrac cluster epoch,pgrac cluster fence,pgrac cluster lck,pgrac cluster lmon,pgrac cluster pcm grd,pgrac cluster qvotec,pgrac cluster scn,pgrac cluster smgr,pgrac cluster startup phase,pgrac cluster stats,pgrac cluster_ic_tier1',
+   'L3 pg_cluster_shmem rows are exactly the 15 foundational regions (14 prior + cluster_fence since spec-2.28)');
 
 
 # ----------
@@ -133,7 +133,7 @@ is($node->safe_psql(
 		'postgres',
 		q{SELECT value FROM pg_cluster_state
 		   WHERE category = 'shmem' AND key = 'region_count'}),
-   '14',
+   '15',
    'L8 pg_cluster_state.shmem.region_count = 14 (13 prior + cluster_qvotec at spec-2.6 Sprint A Step 1)');
 
 is($node->safe_psql(
@@ -153,14 +153,14 @@ is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='shmem' AND key LIKE 'region.%.bytes'}),
-   '14',
+   '15',
    'L10 pg_cluster_state.shmem has 14 region.<name>.bytes keys (one per region)');
 
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='shmem' AND key LIKE 'region.%.owner'}),
-   '14',
+   '15',
    'L11 pg_cluster_state.shmem has 14 region.<name>.owner keys (one per region)');
 
 
@@ -198,7 +198,7 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '94',
+   '97',
    'L15 total injection registry size is 83 (76 baseline + 4 SCN 1.15 + 2 BOC 1.17 + 2 spec-1.18 WAL emit/replay + 1 spec-1.19 page-init-thread-id)');
 
 
@@ -229,7 +229,7 @@ like($stderr,
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-   '64',
+   '65',
    'L17 pg_stat_cluster_wait_events still 58 rows after 1.3 (1.10 + 1.11 + 1.12 BgProc)');
 
 
@@ -243,7 +243,7 @@ $node->start;
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_shmem}),
-   '14',
+   '15',
    'L18 cluster.shmem_max_regions = 16 still admits the 14 baseline regions');
 
 is($node->safe_psql(

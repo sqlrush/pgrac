@@ -166,7 +166,7 @@ SKIP: {
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_shmem}),
-   '14',
+   '15',
    'L10 pg_cluster_shmem 14 rows (block format change is not a shmem region; ..1.12 baseline 6 + 1.13 diag + 1.14 stats + 1.15 scn + 2.2 cluster_ic_tier1 + 2.4 cluster_epoch + 2.5 cluster_cssd + 2.7 cluster_smgr + 2.6 cluster_qvotec)');
 
 
@@ -177,7 +177,7 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '94',
+   '97',
    'L11 pg_stat_cluster_injections is 51 (1.4 adds no new injection points; 4 PCM added by 1.7)');
 
 
@@ -188,7 +188,7 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-   '64',
+   '65',
    'L12 pg_stat_cluster_wait_events still 58 rows after 1.4');
 
 
