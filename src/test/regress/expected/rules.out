@@ -1323,6 +1323,15 @@ pg_cluster_cssd_peers| SELECT node_id,
     dead_since,
     suspected_transitions
    FROM cluster_get_cssd_peers() cluster_get_cssd_peers(node_id, state, last_heartbeat_send_at, last_heartbeat_recv_at, heartbeat_send_count, heartbeat_recv_count, suspected_since, dead_since, suspected_transitions);
+pg_cluster_fence_state| SELECT last_freeze_at,
+    last_thaw_at,
+    self_fence_pending,
+    self_fence_grace_remaining_ms,
+    freeze_broadcast_count,
+    thaw_broadcast_count,
+    self_fence_initiated_count,
+    freeze_signal_received_count
+   FROM cluster_get_fence_state() cluster_get_fence_state(last_freeze_at, last_thaw_at, self_fence_pending, self_fence_grace_remaining_ms, freeze_broadcast_count, thaw_broadcast_count, self_fence_initiated_count, freeze_signal_received_count);
 pg_cluster_ic_msg_types| SELECT msg_type,
     name,
     allowed_producer_mask,
