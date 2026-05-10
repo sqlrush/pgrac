@@ -396,9 +396,12 @@ cluster_qvotec_get_collision_state_name(void)
  *	expired / shmem absent — returns false → backend fail-closed.
  *
  *	Cost: 3 atomic loads + 1 GetCurrentTimestamp() call (~50ns).
- *	Called at every write-intent boundary (INSERT/UPDATE/DELETE/DDL
- *	entry — Step 3 D6) AND every commit boundary (Q5 v0.2 safety
- *	net).  Hot path acceptable.
+ *	v0.14.0 caller:  CommitTransaction (commit-boundary check; xact.c
+ *	D6).  Spec Q5 v0.2 write-intent boundary check at INSERT/UPDATE/
+ *	DELETE/DDL entry is deferred to Hardening v0.4+;correctness is
+ *	preserved by Q4 lease + commit gate (any write must commit
+ *	through the gate, so a lost-quorum decision is enforced before
+ *	durability).
  * ============================================================ */
 bool
 cluster_qvotec_in_quorum(void)
@@ -548,7 +551,92 @@ qvotec_poll_once(void)
 		return;
 	}
 
-	/* ---- 1. build self slot ---- */
+	/*
+	 * Hardening v0.4 P1.3:  read matrix BEFORE writing self slot so
+	 * we observe the OLD slot at our node_id offset.  If a peer is
+	 * alive with the same node_id and a different incarnation,
+	 * decide_quorum_view returns CLUSTER_COLLISION_FATAL_NEWER_SELF
+	 * and we must FATAL before overwriting the peer's slot (per
+	 * Q6 v0.2 newer-self-FATAL — the older serving instance keeps
+	 * its in-flight transactions / cached buffers).
+	 *
+	 * On the first poll after qvotec start, our own slot at offset
+	 * (cluster_node_id × 512) is whatever the previous incarnation
+	 * left behind (or generation==0 from format).  generation==0 is
+	 * skipped by decide_quorum_view;previous-incarnation slots with
+	 * higher incarnation than self trigger Q6 OBSERVED_OLDER (not
+	 * FATAL_NEWER_SELF) and we keep going.
+	 */
+
+	/* ---- 1. read full slot matrix BEFORE writing ---- */
+	memset(qvotec_slot_matrix, 0,
+		   sizeof(ClusterVotingSlot) * CLUSTER_MAX_VOTING_DISKS * CLUSTER_MAX_NODES);
+	for (i = 0; i < qvotec_n_disks; i++) {
+		uint32 node;
+
+		/* Hardening v0.4 P1.2: io_states starts OK and DOWNGRADES on
+		 * either header-read failure (whole-disk unreachable) OR a
+		 * write failure later in step 3.  Reset to OK each cycle so
+		 * a transient failure recovers, but do NOT ignore write
+		 * failures — they must propagate into the decide() input. */
+		io_states[i] = CLUSTER_VOTING_DISK_IO_OK;
+
+		for (node = 0; node < CLUSTER_MAX_NODES; node++) {
+			ClusterVotingSlot *cell = &qvotec_slot_matrix[i * CLUSTER_MAX_NODES + node];
+			ClusterVotingDiskIoState rrc;
+
+			rrc = cluster_voting_disk_read_slot(qvotec_fds[i], i, node, cell);
+			if (rrc != CLUSTER_VOTING_DISK_IO_OK) {
+				/* Per-slot miss is no-data;whole-disk failure only
+				 * on FAILED at offset 0 (header read).  TORN on one
+				 * peer's slot is not a whole-disk failure. */
+				if (node == 0 && rrc == CLUSTER_VOTING_DISK_IO_FAILED)
+					io_states[i] = CLUSTER_VOTING_DISK_IO_FAILED;
+				memset(cell, 0, sizeof(*cell));
+			}
+		}
+	}
+
+	/* ---- 2. decide BEFORE writing self slot ---- */
+	(void)decide_quorum_view(qvotec_slot_matrix, io_states, (uint32)qvotec_n_disks,
+							 CLUSTER_MAX_NODES, (uint32)cluster_node_id, qvotec_self_incarnation,
+							 now_us, heartbeat_timeout_us, &decision);
+
+	/*
+	 * Hardening v0.4 P1.1:  Q6 v0.2 newer-self-FATAL.  decide_quorum_
+	 * view observed an OK-disk fresh slot at our node_id offset with
+	 * an incarnation strictly less than ours — a peer was serving
+	 * with our node_id when we (the newer comer) booted.  Spec Q6
+	 * v0.2 contract:  the newer instance MUST exit so the older
+	 * peer's in-flight transactions / cached buffers stay valid.
+	 *
+	 * Publish the collision_state before FATAL so observability
+	 * sees it via pg_cluster_quorum_state on the surviving peer.
+	 * The FATAL ereport bypasses the rest of the cycle (no self
+	 * slot write); ShutdownRequestPending is tripped by FATAL exit
+	 * so the main loop's gate handles cleanup.
+	 */
+	if (decision.collision_state == CLUSTER_COLLISION_FATAL_NEWER_SELF) {
+		pg_atomic_write_u32(&QvotecShmem->collision_state, (uint32)decision.collision_state);
+		pg_atomic_write_u32(&QvotecShmem->quorum_state, (uint32)CLUSTER_QVOTEC_QUORUM_LOST);
+		cluster_pgstat_inc(qvotec_counter_collision);
+
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_NODE_ID_COLLISION),
+				 errmsg("cluster.node_id %d collides with a serving peer "
+						"(observed incarnation %llu, self incarnation %llu)",
+						cluster_node_id, (unsigned long long)decision.collision_other_incarnation,
+						(unsigned long long)qvotec_self_incarnation),
+				 errdetail("This instance booted with a higher incarnation than "
+						   "the peer slot already on disk — per Q6 v0.2 newer-"
+						   "self-FATAL the newer comer exits to preserve the "
+						   "older serving instance's in-flight state."),
+				 errhint("Reconfigure cluster.node_id to a unique value, or "
+						 "ensure the peer instance has exited before reusing "
+						 "this node_id.")));
+	}
+
+	/* ---- 3. build + write self slot to every disk ---- */
 	memset(&self_slot, 0, sizeof(self_slot));
 	self_slot.magic = CLUSTER_VOTING_SLOT_MAGIC;
 	self_slot.version = CLUSTER_VOTING_SLOT_VERSION;
@@ -558,7 +646,6 @@ qvotec_poll_once(void)
 	self_slot.current_epoch = pg_atomic_read_u64(&QvotecShmem->current_epoch_at_boot);
 	self_slot.flags = CLUSTER_VOTING_SLOT_FLAG_ALIVE;
 
-	/* ---- 2. write self slot to every disk ---- */
 	for (i = 0; i < qvotec_n_disks; i++) {
 		ClusterVotingDiskIoState wrc;
 
@@ -567,43 +654,41 @@ qvotec_poll_once(void)
 		self_slot.disk_index = (uint32)i;
 
 		wrc = cluster_voting_disk_write_slot(qvotec_fds[i], &self_slot);
-		if (wrc != CLUSTER_VOTING_DISK_IO_OK)
+		if (wrc != CLUSTER_VOTING_DISK_IO_OK) {
+			/*
+			 * Hardening v0.4 P1.2:  write failure must propagate to
+			 * the decide() inputs we just used.  But we ALREADY
+			 * decided this cycle before this write — that's the
+			 * trade-off of read-then-decide-then-write ordering.
+			 * The write failure affects the NEXT cycle's view of
+			 * this disk:  the read above will succeed reading our
+			 * stale slot (still on disk with old generation), so
+			 * the disk reports as OK but our heartbeat_ts_us ages
+			 * out.  After heartbeat_timeout_us elapses the freshness
+			 * gate (P2.1) drops self from alive_bitmap → quorum
+			 * naturally shrinks.  In addition we promote the
+			 * io_state for THIS cycle's published count so disks_ok
+			 * reflects the write failure immediately, even though
+			 * the decide() output already used the old value.
+			 */
+			io_states[i] = CLUSTER_VOTING_DISK_IO_FAILED;
 			cluster_pgstat_inc(qvotec_counter_disk_io_fail);
-	}
-
-	/* ---- 3. read full slot matrix ---- */
-	memset(qvotec_slot_matrix, 0,
-		   sizeof(ClusterVotingSlot) * CLUSTER_MAX_VOTING_DISKS * CLUSTER_MAX_NODES);
-	for (i = 0; i < qvotec_n_disks; i++) {
-		uint32 node;
-
-		io_states[i] = CLUSTER_VOTING_DISK_IO_OK;
-		for (node = 0; node < CLUSTER_MAX_NODES; node++) {
-			ClusterVotingSlot *cell = &qvotec_slot_matrix[i * CLUSTER_MAX_NODES + node];
-			ClusterVotingDiskIoState rrc;
-
-			rrc = cluster_voting_disk_read_slot(qvotec_fds[i], i, node, cell);
-			if (rrc != CLUSTER_VOTING_DISK_IO_OK) {
-				/* The slot row is bad but the disk may still be OK
-				 * for other nodes (TORN on a single peer's slot is
-				 * not a whole-disk failure).  Treat per-slot misses
-				 * as "no data" — leave the row zeroed (generation==0
-				 * so decide_quorum_view will skip it).  Promote the
-				 * disk's overall io_state only on FAILED at offset 0
-				 * (header read failure ⇒ whole disk unreachable). */
-				if (node == 0 && rrc == CLUSTER_VOTING_DISK_IO_FAILED)
-					io_states[i] = CLUSTER_VOTING_DISK_IO_FAILED;
-				memset(cell, 0, sizeof(*cell));
-			}
 		}
 	}
 
-	/* ---- 4. decide ---- */
-	(void)decide_quorum_view(qvotec_slot_matrix, io_states, (uint32)qvotec_n_disks,
-							 CLUSTER_MAX_NODES, (uint32)cluster_node_id, qvotec_self_incarnation,
-							 now_us, heartbeat_timeout_us, &decision);
+	/* Recompute disks_ok from possibly-downgraded io_states for the
+	 * shmem-published view (decide()'s output is authoritative for
+	 * quorum_state, but the count reflects post-write reality). */
+	{
+		uint32 disks_ok_post_write = 0;
+		for (i = 0; i < qvotec_n_disks; i++) {
+			if (io_states[i] == CLUSTER_VOTING_DISK_IO_OK)
+				disks_ok_post_write++;
+		}
+		decision.disks_ok_count = disks_ok_post_write;
+	}
 
-	/* ---- 5. publish shmem ---- */
+	/* ---- 4. publish shmem ---- */
 	{
 		uint32 prev_state = pg_atomic_read_u32(&QvotecShmem->quorum_state);
 
@@ -618,7 +703,9 @@ qvotec_poll_once(void)
 			cluster_pgstat_inc(qvotec_counter_quorum_loss);
 		}
 
-		if (decision.collision_state == CLUSTER_COLLISION_FATAL_NEWER_SELF)
+		/* OBSERVED_OLDER is also a collision but not FATAL — count
+		 * it so observability picks up the peer-incarnation race. */
+		if (decision.collision_state == CLUSTER_COLLISION_OBSERVED_OLDER)
 			cluster_pgstat_inc(qvotec_counter_collision);
 	}
 }
@@ -756,6 +843,17 @@ ClusterQvotecMain(void)
 	on_shmem_exit(qvotec_close_disks_atexit, (Datum)0);
 
 	/*
+	 * Hardening v0.4 P1.4: install per-I/O timeout handler for the
+	 * voting disk slot R/W syscalls.  qvotec is the sole production
+	 * caller of cluster_voting_disk_read_slot / write_slot, so it is
+	 * safe to claim SIGALRM here (we previously SIG_IGN'd it).  The
+	 * timeout value is read from cluster.voting_disk_io_timeout_ms
+	 * each cycle so SIGHUP can adjust without restart.
+	 */
+	cluster_voting_disk_io_install_timeout_handler();
+	cluster_voting_disk_io_set_timeout_ms(cluster_voting_disk_io_timeout_ms);
+
+	/*
 	 * P1.3 step 2 — boot incarnation + slot matrix + counter handles.
 	 * Incarnation = process start timestamp gives us a unique value
 	 * per qvotec run for Q6 collision detection.  Matrix lives in
@@ -778,6 +876,8 @@ ClusterQvotecMain(void)
 		if (ConfigReloadPending) {
 			ConfigReloadPending = false;
 			ProcessConfigFile(PGC_SIGHUP);
+			/* Re-publish I/O timeout in case admin tuned it. */
+			cluster_voting_disk_io_set_timeout_ms(cluster_voting_disk_io_timeout_ms);
 		}
 
 		/*

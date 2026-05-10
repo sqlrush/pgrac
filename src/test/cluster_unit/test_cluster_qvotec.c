@@ -300,6 +300,13 @@ MemoryContextAllocZero(MemoryContext context pg_attribute_unused(), Size size)
 	return calloc(1, size);
 }
 int cluster_quorum_poll_interval_ms = 2000;
+int cluster_voting_disk_io_timeout_ms = 5000;
+void
+cluster_voting_disk_io_install_timeout_handler(void)
+{}
+void
+cluster_voting_disk_io_set_timeout_ms(int timeout_ms pg_attribute_unused())
+{}
 
 /* spec-2.6 Sprint A Step 3 D7 stub: postmaster spawn wrapper.
  * Real impl in postmaster.c (file-static StartChildProcess);unit

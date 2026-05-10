@@ -33,11 +33,15 @@
  *	    interval — backends fail-closed without depending on
  *	    ProcSignal arriving promptly.
  *
- *	    Q5 v0.2 write-intent + commit boundary check + independent
- *	    SQLSTATE — backends check the helper at write-intent
- *	    (INSERT/UPDATE/DELETE/DDL) AND at commit boundary;the error
- *	    is ERRCODE_CLUSTER_QUORUM_LOST (53R40), NOT aliased to
- *	    ERRCODE_T_R_SERIALIZATION_FAILURE (40001).
+ *	    Q5 v0.2 fail-closed boundary check + independent SQLSTATE —
+ *	    v0.14.0 implements the COMMIT-boundary check only(xact.c
+ *	    CommitTransaction).  The write-intent early-reject hook at
+ *	    INSERT/UPDATE/DELETE/DDL entry is part of the spec Q5 v0.2
+ *	    contract but is deferred to Hardening v0.4+ follow-up;
+ *	    correctness is preserved by the Q4 lease + commit-boundary
+ *	    check(no committed write can outlive a lost-quorum decision).
+ *	    The error is ERRCODE_CLUSTER_QUORUM_LOST(53R40),NOT aliased
+ *	    to ERRCODE_T_R_SERIALIZATION_FAILURE(40001).
  *
  *	    Q6 v0.2 newer-self-FATAL collision detection — when
  *	    self.incarnation > slot.incarnation we detected an older
@@ -293,15 +297,27 @@ extern const char *cluster_qvotec_get_collision_state_name(void);
  *	/ shmem absent — returns false → backend fail-closed.
  *
  *	Cost: 3 atomic loads + 1 GetCurrentTimestamp() call (~50ns).
- *	Called at every write-intent boundary (INSERT/UPDATE/DELETE/DDL
- *	entry) AND every commit boundary (Q5 v0.2);hot path acceptable.
+ *	v0.14.0 callers:  CommitTransaction (commit-boundary check;xact.c
+ *	D6).  Spec Q5 v0.2 also calls for a write-intent boundary check at
+ *	INSERT/UPDATE/DELETE/DDL entry, but that path is deferred to
+ *	Hardening v0.4+ — correctness is preserved because no write that
+ *	survives Q4 lease expiry can pass the commit gate.
  * ---------- */
 extern bool cluster_qvotec_in_quorum(void);
 
 
 /* ----------
- * ProcSignal hook helpers — invoked from cluster_qvotec on quorum
- * state transition (D5);read by backend signal handler.
+ * ProcSignal hook helpers — process-local atomic flag setters.
+ *
+ *	Set by PROCSIG_CLUSTER_FREEZE_WRITES / _THAW_WRITES handler in
+ *	procsignal.c (D5 wired);read by cluster_qvotec_in_quorum() and
+ *	cluster_writes_currently_frozen().
+ *
+ *	Sender side (qvotec broadcasting on quorum state transition) is
+ *	NOT wired in v0.14.0 — see Hardening v0.3 backlog #1.  The flag
+ *	stays defensive infrastructure;Q4 v0.2 lease + commit-boundary
+ *	check provide the actual fail-closed contract until the
+ *	broadcast lands.
  * ---------- */
 extern void cluster_freeze_writes_set(void);
 extern void cluster_thaw_writes_set(void);

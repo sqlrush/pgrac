@@ -48,10 +48,96 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+
+/* ============================================================
+ * Hardening v0.4 P1.4 — per-I/O timeout via SIGALRM + setitimer.
+ *
+ *	cluster.voting_disk_io_timeout_ms in the original v0.14.0 ship was
+ *	a GUC with no enforcement — pread / pwrite / fdatasync ran without
+ *	any deadline, so a hung disk could pin qvotec indefinitely.  This
+ *	round wires the GUC to a real per-syscall guard:
+ *
+ *	  1. qvotec startup calls cluster_voting_disk_io_install_timeout_
+ *	     handler() once.  That replaces SIG_IGN with our async-signal-
+ *	     safe handler that flips a sig_atomic_t flag.
+ *	  2. cluster_voting_disk_io_set_timeout_ms(...) is called by qvotec
+ *	     each cycle (or on SIGHUP) to seed the deadline used by every
+ *	     subsequent read_slot / write_slot call.
+ *	  3. read_slot / write_slot wrap their syscalls in arm_timeout()
+ *	     / disarm_timeout() so SIGALRM fires after the configured
+ *	     deadline if the syscall hasn't returned.  EINTR + flag-set ⇒
+ *	     return CLUSTER_VOTING_DISK_IO_FAILED.
+ *
+ *	Only qvotec installs the handler;backends + other aux processes
+ *	use SIGALRM for statement_timeout / per-statement deadlines, so
+ *	installing this handler in their context would clobber PG's
+ *	machinery.  cluster_qvotec.c is the sole production caller.
+ *
+ *	timeout_ms == 0 disarms the timer (format / fsck tools want
+ *	unbounded I/O).
+ * ============================================================ */
+
+static volatile sig_atomic_t voting_disk_io_timeout_fired = 0;
+static int voting_disk_io_timeout_ms = 0;
+
+static void
+voting_disk_io_alarm_handler(SIGNAL_ARGS pg_attribute_unused())
+{
+	/* async-signal-safe: just set the flag.  No palloc, no elog. */
+	voting_disk_io_timeout_fired = 1;
+}
+
+void
+cluster_voting_disk_io_install_timeout_handler(void)
+{
+	struct sigaction act;
+
+	memset(&act, 0, sizeof(act));
+	act.sa_handler = voting_disk_io_alarm_handler;
+	sigemptyset(&act.sa_mask);
+	/* No SA_RESTART — we WANT pread/pwrite to return EINTR so we can
+	 * observe the timeout flag.  A restarted syscall would never
+	 * return until success/failure of its own. */
+	act.sa_flags = 0;
+	(void)sigaction(SIGALRM, &act, NULL);
+}
+
+void
+cluster_voting_disk_io_set_timeout_ms(int timeout_ms)
+{
+	voting_disk_io_timeout_ms = (timeout_ms < 0) ? 0 : timeout_ms;
+}
+
+static void
+voting_disk_io_arm_timeout(void)
+{
+	struct itimerval it;
+
+	voting_disk_io_timeout_fired = 0;
+	if (voting_disk_io_timeout_ms <= 0)
+		return; /* disabled */
+
+	memset(&it, 0, sizeof(it));
+	it.it_value.tv_sec = voting_disk_io_timeout_ms / 1000;
+	it.it_value.tv_usec = (long)(voting_disk_io_timeout_ms % 1000) * 1000;
+	(void)setitimer(ITIMER_REAL, &it, NULL);
+}
+
+static void
+voting_disk_io_disarm_timeout(void)
+{
+	struct itimerval it;
+
+	memset(&it, 0, sizeof(it));
+	(void)setitimer(ITIMER_REAL, &it, NULL);
+}
 
 
 /* ============================================================
@@ -155,10 +241,16 @@ cluster_voting_disk_read_slot(int fd, int expected_disk_index, uint32 node_id,
 
 	memset(&aligned, 0, sizeof(aligned));
 
+	/* Hardening v0.4 P1.4: arm per-I/O timeout (no-op when disabled). */
+	voting_disk_io_arm_timeout();
 	nread
 		= pread(fd, aligned.bytes, CLUSTER_VOTING_SLOT_BYTES, CLUSTER_VOTING_SLOT_OFFSET(node_id));
+	voting_disk_io_disarm_timeout();
 	if (nread != CLUSTER_VOTING_SLOT_BYTES) {
-		/* Short read / EIO / EOF — defensive treat as torn or failed. */
+		/* Short read / EIO / EOF / SIGALRM-interrupted (timeout) —
+		 * defensive treat as torn or failed.  voting_disk_io_timeout_
+		 * fired distinguishes timeout from other failures for the
+		 * caller's diagnostics. */
 		return CLUSTER_VOTING_DISK_IO_FAILED;
 	}
 
@@ -239,10 +331,17 @@ cluster_voting_disk_write_slot(int fd, ClusterVotingSlot *slot)
 	/* Reflect updated CRC back to caller for round-trip parity. */
 	slot->crc32c = aligned.slot.crc32c;
 
+	/* Hardening v0.4 P1.4: arm per-I/O timeout for pwrite + fdatasync.
+	 * We arm once for the combined operation since either can hang on
+	 * a stuck disk and the deadline applies to the full write attempt. */
+	voting_disk_io_arm_timeout();
+
 	nwritten = pwrite(fd, aligned.bytes, CLUSTER_VOTING_SLOT_BYTES,
 					  CLUSTER_VOTING_SLOT_OFFSET(slot->node_id));
-	if (nwritten != CLUSTER_VOTING_SLOT_BYTES)
+	if (nwritten != CLUSTER_VOTING_SLOT_BYTES) {
+		voting_disk_io_disarm_timeout();
 		return CLUSTER_VOTING_DISK_IO_FAILED;
+	}
 
 	/*
 	 * fdatasync forces in-flight blocks to durable storage.  O_SYNC
@@ -250,9 +349,12 @@ cluster_voting_disk_write_slot(int fd, ClusterVotingSlot *slot)
 	 * it for protocol uniformity — the cost is dwarfed by the actual
 	 * pwrite latency on shared storage.
 	 */
-	if (fdatasync(fd) != 0)
+	if (fdatasync(fd) != 0) {
+		voting_disk_io_disarm_timeout();
 		return CLUSTER_VOTING_DISK_IO_FAILED;
+	}
 
+	voting_disk_io_disarm_timeout();
 	return CLUSTER_VOTING_DISK_IO_OK;
 }
 

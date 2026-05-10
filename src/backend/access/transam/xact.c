@@ -46,10 +46,13 @@
  *	    OK).  Process-local cluster_writes_frozen flag (set by
  *	    PROCSIG_CLUSTER_FREEZE_WRITES handler in procsignal.c D5)
  *	    also wins regardless of lease — defensive double-gate.
- *	  - Step 3 D6 lands the safety-net commit-boundary check only;
- *	    write-intent early-reject (INSERT/UPDATE/DELETE/DDL entry
- *	    per Q5 v0.2 first layer) is deferred to Step 4 to keep
- *	    Sprint A Step 3 scope limited.
+ *	  - v0.14.0 lands the safety-net commit-boundary check only;
+ *	    spec Q5 v0.2 write-intent early-reject path (INSERT/UPDATE/
+ *	    DELETE/DDL entry, the first of the "double-layer" check) is
+ *	    deferred to Hardening v0.4+ as registered in spec-2.6
+ *	    Hardening v0.4 amend — correctness is preserved because
+ *	    every write must pass the commit gate, so a lost-quorum
+ *	    decision is enforced before any modification becomes durable.
  *
  *	What changed (spec-1.18 v0.2):
  *	  - XactLogCommitRecord(): new trailing SCN parameter; emits 8-byte
@@ -2335,11 +2338,12 @@ CommitTransaction(void)
 	 * 40001 retries the same transaction, 53R40 expects fallback
 	 * to read-only or alarm).
 	 *
-	 * Step 3 D6 lands the safety-net commit-boundary check only;
-	 * the write-intent early-reject hook (INSERT/UPDATE/DELETE/DDL
-	 * entry, per Q5 v0.2 first layer) is deferred to Step 4 so
-	 * Sprint A Step 3 keeps its scope limited to "wire one PG-
-	 * original hook for the fail-closed contract".
+	 * v0.14.0 lands the commit-boundary check only;the write-intent
+	 * early-reject hook (INSERT/UPDATE/DELETE/DDL entry, the first
+	 * of the Q5 v0.2 "double-layer" check) is deferred to Hardening
+	 * v0.4+ — correctness is preserved because every write must
+	 * commit through this gate, so a lost-quorum decision is
+	 * enforced before any modification becomes durable.
 	 */
 #ifdef USE_PGRAC_CLUSTER
 	/*
