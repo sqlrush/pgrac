@@ -340,6 +340,14 @@ cluster_qvotec_get_quorum_state_name(void)
 }
 
 int
+cluster_qvotec_get_quorum_state(void)
+{
+	if (QvotecShmem == NULL)
+		return (int)CLUSTER_QVOTEC_QUORUM_INITIALIZING;
+	return (int)pg_atomic_read_u32(&QvotecShmem->quorum_state);
+}
+
+int
 cluster_qvotec_get_disks_ok_count(void)
 {
 	if (QvotecShmem == NULL)

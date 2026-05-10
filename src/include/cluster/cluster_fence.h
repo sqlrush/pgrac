@@ -200,6 +200,21 @@ extern void cluster_fence_broadcast_thaw(const char *reason, uint64 scn);
 extern void cluster_fence_self_request(const char *reason, uint64 scn);
 
 /*
+ * cluster_fence_lmon_tick — LMON-only call site (spec-2.28 Step 3 D5).
+ *	Encapsulates quorum_state transition state machine + freeze/thaw
+ *	broadcast + self_request:  LMON reads cluster_qvotec_get_quorum_
+ *	state() each tick and calls this; the function tracks previous
+ *	state in process-local storage and triggers the right action on
+ *	OK→LOST (broadcast_freeze + self_request) or LOST→OK (broadcast_
+ *	thaw, which clears self_request via §3.7 C2).
+ *
+ *	Per Invariant I1:  freeze broadcast IMMEDIATE on OK→LOST (no
+ *	grace_ms delay).  Per Q3 = A LMON-mediated:  this is the only
+ *	production caller of broadcast_freeze / _thaw / _self_request.
+ */
+extern void cluster_fence_lmon_tick(void);
+
+/*
  * cluster_fence_check_interrupts — postgres.c ProcessInterrupts hook.
  * Reads-and-clears ClusterFenceFreezePending atomically; if was 1
  * AND IsTransactionState() AND cluster_freeze_writes_enabled →

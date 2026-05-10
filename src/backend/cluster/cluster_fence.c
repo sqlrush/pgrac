@@ -70,16 +70,24 @@
 
 #include <string.h>
 
+#include <signal.h> /* kill, SIGINT (spec-2.28 Step 3 D6 self-fence) */
+#include <unistd.h>
+
 #include "access/xact.h" /* IsTransactionState (spec-2.28 Step 2 D4 hook) */
 #include "miscadmin.h"
 #include "port/atomics.h"
+#include "storage/proc.h"		/* ProcGlobal->allProcs (Step 3 D5) */
+#include "storage/procarray.h"	/* (Step 3 D5 broadcast loop) */
+#include "storage/procsignal.h" /* SendProcSignal + PROCSIG_CLUSTER_* */
+#include "storage/sinvaladt.h"	/* BackendIdGetProc (Step 3 D5) */
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "utils/timestamp.h"
 #include "funcapi.h"
 
-#include "cluster/cluster_guc.h"   /* cluster_enabled */
-#include "cluster/cluster_shmem.h" /* cluster_shmem_register_region */
+#include "cluster/cluster_guc.h"	/* cluster_enabled */
+#include "cluster/cluster_qvotec.h" /* cluster_qvotec_get_quorum_state (Step 3 D5) */
+#include "cluster/cluster_shmem.h"	/* cluster_shmem_register_region */
 
 
 /* ============================================================
@@ -197,6 +205,8 @@ cluster_fence_shmem_register(void)
 void
 cluster_fence_broadcast_freeze(const char *reason, uint64 scn)
 {
+	int signaled = 0;
+
 	if (!cluster_enabled)
 		return; /* L19/L20 silent skip */
 	if (!cluster_freeze_writes_enabled)
@@ -204,19 +214,57 @@ cluster_fence_broadcast_freeze(const char *reason, uint64 scn)
 	if (ClusterFenceShmem == NULL)
 		return; /* shmem not yet initialised — pre-RUNNING */
 
-	(void)reason;
-	(void)scn;
+	(void)scn; /* TODO Step 4 — record scn in audit log / counter */
 
+	/* Update shmem timestamp + counter under lock. */
 	LWLockAcquire(&ClusterFenceShmem->lock, LW_EXCLUSIVE);
 	ClusterFenceShmem->last_freeze_at_us = GetCurrentTimestamp();
 	ClusterFenceShmem->freeze_event_count++;
-	/* Step 3 D5 will SendProcSignal loop here. */
 	LWLockRelease(&ClusterFenceShmem->lock);
+
+	/*
+	 * Loop ProcArray (PG-native via BackendIdGetProc) and SendProcSignal
+	 * PROCSIG_CLUSTER_FREEZE_WRITES to every live backend.  Per
+	 * sinvaladt.c:741-755 prior art, do NOT hold any lock while calling
+	 * SendProcSignal — kernel signal delivery may not be fast.  ProcArray
+	 * read of pid + backendId is a snapshot;a backend exiting between
+	 * read and SendProcSignal harmlessly fails (kernel ESRCH, swallowed).
+	 *
+	 * Skip self (LMON's own pid) — LMON is the broadcaster and does not
+	 * itself need to receive the freeze signal (no in-flight tx).
+	 *
+	 * Backend slots are 1..MaxBackends (BackendId namespace);auxiliary
+	 * processes do not run user transactions and don't need freeze.
+	 */
+	{
+		int beid;
+		pid_t self_pid = MyProcPid;
+
+		for (beid = 1; beid <= MaxBackends; beid++) {
+			PGPROC *proc = BackendIdGetProc((BackendId)beid);
+			pid_t pid;
+
+			if (proc == NULL)
+				continue;
+			pid = proc->pid;
+			if (pid == 0 || pid == self_pid)
+				continue;
+			(void)SendProcSignal(pid, PROCSIG_CLUSTER_FREEZE_WRITES, (BackendId)beid);
+			signaled++;
+		}
+	}
+
+	if (cluster_fence_audit_log >= CLUSTER_FENCE_AUDIT_LOG_LOG)
+		ereport(LOG, (errmsg("cluster fence: broadcasting FREEZE_WRITES to %d backend(s),"
+							 " reason=%s",
+							 signaled, reason ? reason : "(null)")));
 }
 
 void
 cluster_fence_broadcast_thaw(const char *reason, uint64 scn)
 {
+	int signaled = 0;
+
 	if (!cluster_enabled)
 		return;
 	if (!cluster_freeze_writes_enabled)
@@ -224,18 +272,47 @@ cluster_fence_broadcast_thaw(const char *reason, uint64 scn)
 	if (ClusterFenceShmem == NULL)
 		return;
 
-	(void)reason;
 	(void)scn;
 
+	/* Update shmem + cancel pending self-fence under lock. */
 	LWLockAcquire(&ClusterFenceShmem->lock, LW_EXCLUSIVE);
 	ClusterFenceShmem->last_thaw_at_us = GetCurrentTimestamp();
 	ClusterFenceShmem->thaw_event_count++;
-	/* Per Invariant I2:  thaw is observation-only — DO NOT clear
-	 * ClusterFenceFreezePending here, DO NOT change the commit gate
-	 * predicate.  Step 3 D5 also wires the cancel-pending-self-fence
-	 * effect:  self_fence_requested_at_us = 0. */
+	/* Per Invariant I2:  thaw is observation-only on backend side —
+	 * the handler does NOT clear ClusterFenceFreezePending and does NOT
+	 * change the commit gate predicate.  But it DOES cancel pending
+	 * self-fence: if quorum recovered before grace_ms elapsed,
+	 * postmaster_check on next tick reads self_fence_requested_at_us = 0
+	 * and skips pmdie. */
 	ClusterFenceShmem->self_fence_requested_at_us = 0;
 	LWLockRelease(&ClusterFenceShmem->lock);
+
+	/*
+	 * Broadcast THAW signal — informational on backend side per
+	 * Invariant I2.  Same ProcArray loop pattern as freeze.
+	 */
+	{
+		int beid;
+		pid_t self_pid = MyProcPid;
+
+		for (beid = 1; beid <= MaxBackends; beid++) {
+			PGPROC *proc = BackendIdGetProc((BackendId)beid);
+			pid_t pid;
+
+			if (proc == NULL)
+				continue;
+			pid = proc->pid;
+			if (pid == 0 || pid == self_pid)
+				continue;
+			(void)SendProcSignal(pid, PROCSIG_CLUSTER_THAW_WRITES, (BackendId)beid);
+			signaled++;
+		}
+	}
+
+	if (cluster_fence_audit_log >= CLUSTER_FENCE_AUDIT_LOG_LOG)
+		ereport(LOG, (errmsg("cluster fence: broadcasting THAW_WRITES to %d backend(s),"
+							 " reason=%s",
+							 signaled, reason ? reason : "(null)")));
 }
 
 void
@@ -258,6 +335,67 @@ cluster_fence_self_request(const char *reason, uint64 scn)
 	 * earliest timestamp so postmaster_check measures from first
 	 * request, not most recent. */
 	LWLockRelease(&ClusterFenceShmem->lock);
+}
+
+
+/* ============================================================
+ * cluster_fence_lmon_tick — quorum_state transition state machine.
+ *
+ *	LMON main loop calls this every tick after lmon_advance_liveness_
+ *	tick.  Reads cluster_qvotec_get_quorum_state();compares to last-
+ *	seen state in process-local static (only LMON calls this, single
+ *	writer);on transition triggers broadcast.
+ *
+ *	OK→LOST    : freeze broadcast IMMEDIATE per Invariant I1 +
+ *	             self_request (postmaster_check runs grace_ms later)
+ *	OK→UNCERTAIN: same as OK→LOST treat as quorum loss for safety
+ *	LOST→OK    : thaw broadcast (clears self_request inside thaw)
+ *	UNCERTAIN→OK: same as LOST→OK
+ *	others     : no action (transitions involving INITIALIZING are
+ *	             startup-only;LOST→UNCERTAIN / UNCERTAIN→LOST stay
+ *	             in fail-closed mode no broadcast needed)
+ *
+ *	Initial state is INITIALIZING;first transition out of it does NOT
+ *	count as a real quorum loss/gain event (LMON not yet observed).
+ * ============================================================ */
+void
+cluster_fence_lmon_tick(void)
+{
+	static int prev_state = (int)CLUSTER_QVOTEC_QUORUM_INITIALIZING;
+	int curr;
+
+	if (!cluster_enabled)
+		return;
+	if (ClusterFenceShmem == NULL)
+		return;
+
+	curr = cluster_qvotec_get_quorum_state();
+	if (curr == prev_state)
+		return; /* no transition */
+
+	/* OK→{LOST,UNCERTAIN}:  immediate freeze + self_request. */
+	if (prev_state == (int)CLUSTER_QVOTEC_QUORUM_OK
+		&& (curr == (int)CLUSTER_QVOTEC_QUORUM_LOST
+			|| curr == (int)CLUSTER_QVOTEC_QUORUM_UNCERTAIN)) {
+		cluster_fence_broadcast_freeze(curr == (int)CLUSTER_QVOTEC_QUORUM_LOST
+										   ? "qvotec quorum_state=LOST"
+										   : "qvotec quorum_state=UNCERTAIN",
+									   0);
+		cluster_fence_self_request(
+			curr == (int)CLUSTER_QVOTEC_QUORUM_LOST ? "quorum_lost" : "quorum_uncertain", 0);
+	}
+	/* {LOST,UNCERTAIN}→OK:  thaw broadcast (clears self_request). */
+	else if ((prev_state == (int)CLUSTER_QVOTEC_QUORUM_LOST
+			  || prev_state == (int)CLUSTER_QVOTEC_QUORUM_UNCERTAIN)
+			 && curr == (int)CLUSTER_QVOTEC_QUORUM_OK) {
+		cluster_fence_broadcast_thaw("qvotec quorum_state=OK", 0);
+	}
+	/* INITIALIZING→OK is the normal startup path, no event.
+	 * INITIALIZING→{LOST,UNCERTAIN} is a degraded boot — no in-flight
+	 * tx exists yet, so no broadcast needed;commit gate fail-closes
+	 * naturally. */
+
+	prev_state = curr;
 }
 
 void
@@ -307,6 +445,11 @@ cluster_fence_check_interrupts(void)
 void
 cluster_fence_postmaster_check(void)
 {
+	TimestampTz requested_at;
+	TimestampTz now_us;
+	int64 grace_us;
+	bool should_initiate = false;
+
 	if (IsUnderPostmaster)
 		return; /* CLAUDE.md rule 16 §postmaster-once / L91 EXEC_BACKEND */
 	if (!cluster_enabled)
@@ -316,14 +459,48 @@ cluster_fence_postmaster_check(void)
 	if (ClusterFenceShmem == NULL)
 		return;
 
-	/* Step 3 D6 will:
-	 *   read self_fence_requested_at_us
-	 *   if non-zero AND now - requested >= grace_ms × 1000:
-	 *     ereport(LOG, "self-fence on persistent quorum loss")
-	 *     inc self_fence_initiated_count
-	 *     kill(MyProcPid, SIGINT)   <- v0.3 F4 amend (no pmdie() callable)
-	 *
-	 * Step 1 no-op stub. */
+	/* Snapshot under lock — keep critical region small (no kill/ereport
+	 * inside lock per sinvaladt.c:741-755 pattern). */
+	LWLockAcquire(&ClusterFenceShmem->lock, LW_EXCLUSIVE);
+	requested_at = ClusterFenceShmem->self_fence_requested_at_us;
+	now_us = GetCurrentTimestamp();
+	grace_us = (int64)cluster_self_fence_grace_ms * INT64CONST(1000);
+	if (requested_at != 0 && (now_us - requested_at) >= grace_us) {
+		should_initiate = true;
+		ClusterFenceShmem->self_fence_initiated_count++;
+		/* Clear the request so we don't re-trigger if the SIGINT delivery
+		 * is somehow delayed and postmaster_check runs again. */
+		ClusterFenceShmem->self_fence_requested_at_us = 0;
+	}
+	LWLockRelease(&ClusterFenceShmem->lock);
+
+	if (!should_initiate)
+		return;
+
+	ereport(LOG, (errmsg("postmaster shutting down: self-fence on persistent quorum loss"),
+				  errdetail("cluster.self_fence_grace_ms (%d ms) elapsed since LMON detected"
+							" quorum loss",
+							cluster_self_fence_grace_ms),
+				  errhint("postmaster will perform orderly fast shutdown via SIGINT;"
+						  " backends receive SIGTERM;recovery on next start will resume"
+						  " from voting-disk slot")));
+
+	/*
+	 * Per spec-2.28 v0.3 F4 amend:  PG postmaster has no callable
+	 * pmdie() function.  Self-signal SIGINT — PG postmaster.c SIGINT
+	 * handler (line ~2825-2839) sets pending_pm_fast_shutdown_request
+	 * + pending_pm_shutdown_request + SetLatch(MyLatch);ServerLoop
+	 * next iteration line 1791 calls process_pm_shutdown_request()
+	 * which drives Shutdown = FastShutdown (postmaster.c:2849+) +
+	 * PostmasterStateMachine SIGTERM children + drain checkpointer/
+	 * bgwriter/walwriter/archiver + postmaster exits with status 0.
+	 * Equivalent to `pg_ctl stop -m fast`.
+	 */
+	if (kill(MyProcPid, SIGINT) != 0) {
+		/* Should never happen — MyProcPid is the postmaster's own pid.
+		 * Defensive log only. */
+		ereport(WARNING, (errmsg("postmaster self-fence SIGINT failed: %m")));
+	}
 }
 
 

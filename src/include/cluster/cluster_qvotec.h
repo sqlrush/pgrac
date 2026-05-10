@@ -294,6 +294,19 @@ extern void cluster_qvotec_shmem_register(void);
 extern int cluster_qvotec_get_pid(void);
 extern const char *cluster_qvotec_get_status_name(void);
 extern const char *cluster_qvotec_get_quorum_state_name(void);
+
+/*
+ * cluster_qvotec_get_quorum_state — raw enum read for Step 3 LMON
+ *	consumer (spec-2.28 §3.0 I1 freeze-immediate / §3.7 dual-set).
+ *	LMON tick calls this each iteration to detect OK→LOST transition
+ *	and trigger cluster_fence_broadcast_freeze.  Returns the raw
+ *	ClusterQvotecQuorumState enum value (cast to int for header
+ *	cleanliness), or CLUSTER_QVOTEC_QUORUM_INITIALIZING (0) when
+ *	shmem not yet initialised.  NOT lease-aware (in_quorum() is the
+ *	commit-gate path); this is for state-transition observation.
+ */
+extern int cluster_qvotec_get_quorum_state(void);
+
 extern int cluster_qvotec_get_disks_ok_count(void);
 extern int cluster_qvotec_get_disks_total_count(void);
 extern uint64 cluster_qvotec_get_current_epoch_at_boot(void);

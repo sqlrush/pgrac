@@ -454,6 +454,15 @@ ResetLatch(struct Latch *latch pg_attribute_unused())
 #include "miscadmin.h"
 BackendType MyBackendType = B_INVALID;
 
+/* spec-2.28 Sprint A Step 3 stub:  cluster_lmon.c now calls
+ * cluster_fence_lmon_tick() in its main loop (D5).  Empty stub for
+ * unit-test link;real broadcast logic is in cluster_fence.c +
+ * verified by test_cluster_fence T-fence-2/3/4/5/6 + 098 TAP. */
+void cluster_fence_lmon_tick(void);
+void
+cluster_fence_lmon_tick(void)
+{}
+
 
 UT_DEFINE_GLOBALS();
 

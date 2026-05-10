@@ -176,7 +176,8 @@
  * CreateSharedMemoryAndSemaphores() returns; see PGRAC MODIFICATIONS
  * banner above for the HC1 rationale.
  */
-#include "cluster/cluster_guc.h" /* cluster_enabled (spec-1.11 Sprint B) */
+#include "cluster/cluster_fence.h" /* cluster_fence_postmaster_check (spec-2.28 D6) */
+#include "cluster/cluster_guc.h"   /* cluster_enabled (spec-1.11 Sprint B) */
 #include "cluster/cluster_startup_phase.h"
 #endif
 
@@ -1912,6 +1913,27 @@ ServerLoop(void)
 		 */
 		if (cluster_enabled && qvotec_spawn_enabled && QvotecPID == 0 && pmState == PM_RUN)
 			QvotecPID = StartQvotec();
+
+		/*
+		 * PGRAC: spec-2.28 Sprint A Step 3 D6 — fence-lite postmaster
+		 * self-fence trigger.  cluster_fence_postmaster_check() reads
+		 * ClusterFenceShmem.self_fence_requested_at_us (set by LMON
+		 * via cluster_fence_self_request when QVOTEC quorum_state
+		 * transitions OK→{LOST,UNCERTAIN}) and, if grace_ms has
+		 * elapsed, kill(MyProcPid, SIGINT) to drive PG's standard
+		 * fast-shutdown (per v0.3 F4 amend — PG has no callable
+		 * pmdie() function).  Per Invariant I1, grace_ms ONLY delays
+		 * postmaster shutdown — the in-flight tx freeze broadcast
+		 * happens immediately at the OK→LOST transition above (LMON
+		 * cluster_fence_lmon_tick).
+		 *
+		 * Per CLAUDE.md rule 16 §postmaster-once + L91 EXEC_BACKEND:
+		 * the function checks IsUnderPostmaster internally and is a
+		 * no-op when called from a child backend (defensive — should
+		 * never be reachable from non-postmaster context).
+		 */
+		if (cluster_enabled)
+			cluster_fence_postmaster_check();
 #endif
 
 		/*

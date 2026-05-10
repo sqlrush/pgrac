@@ -56,7 +56,8 @@
 #include "utils/timestamp.h"
 
 #include "cluster/cluster_conf.h"
-#include "cluster/cluster_cssd.h" /* cluster_cssd_outbound_slots (spec-2.5 D2.6) */
+#include "cluster/cluster_cssd.h"  /* cluster_cssd_outbound_slots (spec-2.5 D2.6) */
+#include "cluster/cluster_fence.h" /* cluster_fence_lmon_tick (spec-2.28 D5) */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_envelope.h"
@@ -692,6 +693,17 @@ LmonMain(void)
 
 			lmon_advance_liveness_tick();
 
+			/*
+			 * spec-2.28 Sprint A Step 3 D5:  consume QVOTEC quorum_state
+			 * and broadcast PROCSIG_CLUSTER_FREEZE_WRITES / _THAW_WRITES
+			 * on OK→{LOST,UNCERTAIN} or {LOST,UNCERTAIN}→OK transitions.
+			 * Per Q3 = A LMON-mediated:  the only production caller of
+			 * cluster_fence_broadcast_freeze/_thaw.  Per Invariant I1:
+			 * freeze fires IMMEDIATELY (no grace_ms delay — that gates
+			 * only postmaster self-shutdown).
+			 */
+			cluster_fence_lmon_tick();
+
 			CLUSTER_INJECTION_POINT("cluster-lmon-main-loop-iter");
 
 			now = GetCurrentTimestamp();
@@ -1175,6 +1187,17 @@ LmonMain(void)
 				break;
 
 			lmon_advance_liveness_tick();
+
+			/*
+			 * spec-2.28 Sprint A Step 3 D5:  consume QVOTEC quorum_state
+			 * and broadcast PROCSIG_CLUSTER_FREEZE_WRITES / _THAW_WRITES
+			 * on OK→{LOST,UNCERTAIN} or {LOST,UNCERTAIN}→OK transitions.
+			 * Per Q3 = A LMON-mediated:  the only production caller of
+			 * cluster_fence_broadcast_freeze/_thaw.  Per Invariant I1:
+			 * freeze fires IMMEDIATELY (no grace_ms delay — that gates
+			 * only postmaster self-shutdown).
+			 */
+			cluster_fence_lmon_tick();
 
 			CLUSTER_INJECTION_POINT("cluster-lmon-main-loop-iter");
 
