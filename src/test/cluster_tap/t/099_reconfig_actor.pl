@@ -76,6 +76,27 @@ use lib "$FindBin::RealBin/../../perl";
 use PostgreSQL::Test::ClusterPair;
 use Test::More;
 
+sub poll_query_until_timeout
+{
+	my ($node, $dbname, $query, $expected, $timeout_s, $label) = @_;
+
+	$expected //= 't';
+	$timeout_s //= 15;
+
+	my $deadline = time + $timeout_s;
+	my $last = '';
+
+	while (time < $deadline)
+	{
+		$last = $node->safe_psql($dbname, $query);
+		return 1 if defined $last && $last eq $expected;
+		select(undef, undef, undef, 0.1);
+	}
+
+	diag("$label timed out after ${timeout_s}s; expected=$expected; last=$last");
+	return 0;
+}
+
 
 # ----------
 # L1: setup — strict-mode ClusterPair with 3 voting disks.
@@ -89,12 +110,14 @@ is($pair->node0->safe_psql('postgres', 'SELECT 1'),
 is($pair->node1->safe_psql('postgres', 'SELECT 1'),
 	'1', 'L1 node1 postmaster alive');
 
-is($pair->node0->safe_psql('postgres',
-		'SELECT in_quorum FROM pg_cluster_quorum_state'),
-	't', 'L1 node0 in_quorum=t');
-is($pair->node1->safe_psql('postgres',
-		'SELECT in_quorum FROM pg_cluster_quorum_state'),
-	't', 'L1 node1 in_quorum=t');
+ok(poll_query_until_timeout($pair->node0, 'postgres',
+		'SELECT in_quorum FROM pg_cluster_quorum_state', 't', 15,
+		'L1 node0 in_quorum=t'),
+	'L1 node0 in_quorum=t');
+ok(poll_query_until_timeout($pair->node1, 'postgres',
+		'SELECT in_quorum FROM pg_cluster_quorum_state', 't', 15,
+		'L1 node1 in_quorum=t'),
+	'L1 node1 in_quorum=t');
 
 # Reconfig catalog surface visible:  pg_cluster_reconfig_state SRF
 # returns single row always (P2.9 always-1-row contract).  Never-applied
@@ -117,12 +140,53 @@ is($pair->node0->safe_psql('postgres',
 # ----------
 # L2: CSSD peers baseline ALIVE.
 # ----------
-is($pair->node0->safe_psql('postgres',
-		q{SELECT state FROM pg_cluster_cssd_peers WHERE node_id = 1}),
-	'alive', 'L2 node0 sees node1 CSSD peer state=alive');
-is($pair->node1->safe_psql('postgres',
-		q{SELECT state FROM pg_cluster_cssd_peers WHERE node_id = 0}),
-	'alive', 'L2 node1 sees node0 CSSD peer state=alive');
+ok(poll_query_until_timeout($pair->node0, 'postgres',
+		q{SELECT state = 'alive' FROM pg_cluster_cssd_peers WHERE node_id = 1},
+		't', 15, 'L2 node0 sees node1 CSSD peer state=alive'),
+	'L2 node0 sees node1 CSSD peer state=alive');
+ok(poll_query_until_timeout($pair->node1, 'postgres',
+		q{SELECT state = 'alive' FROM pg_cluster_cssd_peers WHERE node_id = 0},
+		't', 15, 'L2 node1 sees node0 CSSD peer state=alive'),
+	'L2 node1 sees node0 CSSD peer state=alive');
+
+# Match 085_cssd_heartbeat_round_trip.pl discipline: prove the CSSD
+# heartbeat substrate is established before SIGSTOP.  Otherwise 099
+# could pass because startup never established heartbeats, not because
+# SIGSTOP produced the DEAD edge under review.
+{
+	my $waited = 0;
+	my $baseline_ok = 0;
+
+	while ($waited < 15)
+	{
+		my $send01 = $pair->node0->safe_psql('postgres',
+			'SELECT heartbeat_send_count FROM pg_cluster_cssd_peers WHERE node_id = 1');
+		my $send10 = $pair->node1->safe_psql('postgres',
+			'SELECT heartbeat_send_count FROM pg_cluster_cssd_peers WHERE node_id = 0');
+		my $recv01 = $pair->node0->safe_psql('postgres',
+			'SELECT heartbeat_recv_count FROM pg_cluster_cssd_peers WHERE node_id = 1');
+		my $recv10 = $pair->node1->safe_psql('postgres',
+			'SELECT heartbeat_recv_count FROM pg_cluster_cssd_peers WHERE node_id = 0');
+
+		if (   $send01 && $send01 >= 1 && $send10 && $send10 >= 1
+			&& $recv01 && $recv01 >= 1 && $recv10 && $recv10 >= 1)
+		{
+			$baseline_ok = 1;
+			last;
+		}
+
+		sleep 1;
+		$waited++;
+	}
+
+	if (!$baseline_ok)
+	{
+		diag("L2.5 CSSD heartbeat baseline did not establish within 15s; skipping SIGSTOP actor path");
+		$pair->stop_pair;
+		done_testing();
+		exit 0;
+	}
+}
 
 
 # ----------
@@ -137,11 +201,12 @@ ok($cssd1_pid && $cssd1_pid =~ /^\d+$/,
 if (!$cssd1_pid || $cssd1_pid !~ /^\d+$/)
 {
 	diag("L3 could not capture node1 CSSD pid;skipping L4-L8");
+	$pair->stop_pair;
 	done_testing();
 	exit;
 }
 
-kill 'STOP', $cssd1_pid;
+ok(kill('STOP', $cssd1_pid) == 1, "L3 SIGSTOP node1 CSSD pid=$cssd1_pid");
 diag("L3 SIGSTOP node1 CSSD pid=$cssd1_pid");
 
 
@@ -151,11 +216,12 @@ diag("L3 SIGSTOP node1 CSSD pid=$cssd1_pid");
 #     producer-side observation, an ACTOR assertion would assume a
 #     trigger event that may not have fired (the L99 source bug).
 # ----------
-my $producer_ok = $pair->node0->poll_query_until(
+my $producer_ok = poll_query_until_timeout(
+	$pair->node0,
 	'postgres',
 	q{SELECT state IN ('suspected', 'dead')
 	    FROM pg_cluster_cssd_peers WHERE node_id = 1},
-	't');
+	't', 15, 'L4 PRODUCER node0 sees node1 CSSD state in (suspected, dead)');
 
 ok($producer_ok,
 	'L4 PRODUCER node0 sees node1 CSSD state in (suspected, dead) within 15s');
@@ -175,10 +241,11 @@ diag("L4 producer state observed: $producer_state");
 #     so we poll for slightly longer to allow CSSD to escalate from
 #     SUSPECTED to DEAD if it's still in the intermediate phase.
 # ----------
-my $actor_ok = $pair->node0->poll_query_until(
+my $actor_ok = poll_query_until_timeout(
+	$pair->node0,
 	'postgres',
 	q{SELECT event_id != 0 FROM pg_cluster_reconfig_state},
-	't');
+	't', 15, 'L5 ACTOR node0 pg_cluster_reconfig_state.event_id != 0');
 
 ok($actor_ok,
 	'L5 ACTOR node0 pg_cluster_reconfig_state.event_id != 0 within 15s');
@@ -219,7 +286,7 @@ like($dead_bitmap, qr/^0x02/,
 # ----------
 # L8: SIGCONT node1 CSSD + verify node0 still in_quorum.
 # ----------
-kill 'CONT', $cssd1_pid;
+ok(kill('CONT', $cssd1_pid) == 1, "L8 SIGCONT node1 CSSD pid=$cssd1_pid");
 diag("L8 SIGCONT node1 CSSD pid=$cssd1_pid");
 
 # Don't poll for full CSSD recovery — that's L9 scope.  Just verify

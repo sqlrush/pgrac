@@ -436,7 +436,7 @@ Example query:
 
 ```sql
 SELECT * FROM pg_cluster_reconfig_state;
--- event_id            | 0xABCDEF...
+-- event_id            | 123456789012345678
 -- coordinator_node_id | 0
 -- old_epoch           | 5
 -- new_epoch           | 6

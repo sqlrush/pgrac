@@ -178,7 +178,7 @@ The retry path is deliberately fast.  Clients that observe `53R60`
 should retry the transaction immediately;the next attempt runs under
 the new membership epoch.  The coordinator broadcast and per-node
 `PROCSIG` delivery typically complete in a single LMON tick (default
-100 ms), so the visible downtime for a writable client is bounded by
+1000 ms), so the visible downtime for a writable client is bounded by
 the cssd deadband plus one tick.
 
 > **Status.** Reconfig coordinator A-scope (internal-only) ships with
