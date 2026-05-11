@@ -259,6 +259,25 @@ cluster_cssd_get_alive_peer_count(void)
 	return 0;
 }
 
+/*
+ * spec-2.9 v0.4 D2/D3 cross-module symbol stubs (CI strict-linker fix):
+ *
+ *	cluster_scn.c references CritSectionCount (Q6/I8 Assert in
+ *	cluster_scn_emit_broadcast_pulse;  inlined into cluster_scn_boc_tick
+ *	by LTO/static visibility) and MyBackendType (Q1 Assert in
+ *	cluster_scn_lmon_drain_boc_broadcast).  Linux ld + macOS strict ld
+ *	require these as defined symbols at link time;  local macOS ld is
+ *	more permissive and missed the gap during cluster_unit make check.
+ *
+ *	Standalone test binary never invokes either path, so initial values
+ *	are vacuous (CritSectionCount = 0 satisfies the walwriter-not-in-crit
+ *	Assert if ever exercised;  MyBackendType = B_LMON would satisfy the
+ *	drain LMON-only Assert if ever exercised).
+ */
+#include "miscadmin.h"
+volatile uint32 CritSectionCount = 0;
+BackendType MyBackendType = B_LMON;
+
 UT_DEFINE_GLOBALS();
 
 
