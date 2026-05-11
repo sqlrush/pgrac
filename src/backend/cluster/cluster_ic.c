@@ -102,6 +102,14 @@ PG_FUNCTION_INFO_V1(cluster_get_voting_disks);
  * cluster_fence.c (--enable-cluster) or stub at file end (--disable). */
 PG_FUNCTION_INFO_V1(cluster_get_fence_state);
 
+/*
+ * spec-2.29 D6 -- cluster_get_reconfig_state SRF symbol.  Body lives
+ * in cluster_reconfig.c for --enable-cluster; disable-cluster stub is
+ * at file end so pg_proc.dat's unconditional fmgrtab reference always
+ * links.
+ */
+PG_FUNCTION_INFO_V1(cluster_get_reconfig_state);
+
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -1259,6 +1267,20 @@ cluster_get_fence_state(PG_FUNCTION_ARGS pg_attribute_unused())
 {
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("cluster_get_fence_state requires --enable-cluster")));
+	PG_RETURN_NULL();
+}
+
+/*
+ * spec-2.29 D6 -- cluster_get_reconfig_state disable-cluster stub.
+ * cluster_reconfig.c is gated on USE_PGRAC_CLUSTER and not linked in
+ * disable mode; pg_proc.dat still references the symbol
+ * unconditionally through fmgrtab.o.
+ */
+Datum
+cluster_get_reconfig_state(PG_FUNCTION_ARGS pg_attribute_unused())
+{
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cluster_get_reconfig_state requires --enable-cluster")));
 	PG_RETURN_NULL();
 }
 #endif
