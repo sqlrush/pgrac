@@ -51,7 +51,7 @@
  *	internal table in cluster_views.c stays in sync with the enum.
  */
 #define CLUSTER_WAIT_EVENTS_COUNT                                                                  \
-	65 /* spec-2.28 D9: +1 ClusterFenceBackendInterruptCheck (was 64 spec-2.6) */
+	66 /* spec-2.29 D9: +1 BgProcLmonReconfigTick (was 65 spec-2.28) */
 
 
 /*

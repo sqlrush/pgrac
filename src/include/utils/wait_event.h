@@ -410,6 +410,12 @@ typedef enum {
 	 * transaction.  Lets pg_stat_activity expose freeze-induced abort
 	 * source distinct from generic ClientRead / WAL classes. */
 	WAIT_EVENT_CLUSTER_FENCE_BACKEND_INTERRUPT_CHECK,
+	/* spec-2.29 Sprint A Step 3 D9:  reconfig coordinator LMON tick.
+	 * Wraps cluster_reconfig_lmon_tick body which runs every LMON main
+	 * loop iteration (~100ms).  Lets pg_stat_activity attribute LMON
+	 * tick CPU to its dedicated wait class — useful for diagnosing
+	 * "is LMON spinning on reconfig dedup checks". */
+	WAIT_EVENT_CLUSTER_BGPROC_LMON_RECONFIG_TICK,
 } WaitEventCluster;
 
 

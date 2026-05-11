@@ -58,6 +58,7 @@
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_cssd.h"  /* cluster_cssd_outbound_slots (spec-2.5 D2.6) */
 #include "cluster/cluster_fence.h" /* cluster_fence_lmon_tick (spec-2.28 D5) */
+#include "cluster/cluster_reconfig.h" /* cluster_reconfig_lmon_tick (spec-2.29 Step 2 D3) */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_envelope.h"
@@ -704,6 +705,17 @@ LmonMain(void)
 			 */
 			cluster_fence_lmon_tick();
 
+			/*
+			 * spec-2.29 Sprint A Step 2 D3:  reconfig coordinator tick.
+			 * Consumes CSSD peer_state + cluster_qvotec_in_quorum +
+			 * cluster_cssd_get_dead_generation → Q2 A'' deterministic
+			 * coordinator decision → event_id dedup (P1.2 dead_bitmap ||
+			 * dead_gen) → I7 every-in_quorum-survivor PROCSIG broadcast
+			 * (P1.3 a) + I7 coordinator-only epoch++ via D18 (P1.3 b).
+			 * Idempotent within one DEAD episode (same event_id → skip).
+			 */
+			cluster_reconfig_lmon_tick();
+
 			CLUSTER_INJECTION_POINT("cluster-lmon-main-loop-iter");
 
 			now = GetCurrentTimestamp();
@@ -1198,6 +1210,17 @@ LmonMain(void)
 			 * only postmaster self-shutdown).
 			 */
 			cluster_fence_lmon_tick();
+
+			/*
+			 * spec-2.29 Sprint A Step 2 D3:  reconfig coordinator tick.
+			 * Consumes CSSD peer_state + cluster_qvotec_in_quorum +
+			 * cluster_cssd_get_dead_generation → Q2 A'' deterministic
+			 * coordinator decision → event_id dedup (P1.2 dead_bitmap ||
+			 * dead_gen) → I7 every-in_quorum-survivor PROCSIG broadcast
+			 * (P1.3 a) + I7 coordinator-only epoch++ via D18 (P1.3 b).
+			 * Idempotent within one DEAD episode (same event_id → skip).
+			 */
+			cluster_reconfig_lmon_tick();
 
 			CLUSTER_INJECTION_POINT("cluster-lmon-main-loop-iter");
 

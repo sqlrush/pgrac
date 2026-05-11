@@ -12329,4 +12329,21 @@
   proargnames => '{last_freeze_at,last_thaw_at,self_fence_pending,self_fence_grace_remaining_ms,freeze_broadcast_count,thaw_broadcast_count,self_fence_initiated_count,freeze_signal_received_count}',
   prosrc => 'cluster_get_fence_state' },
 
+# spec-2.29 D6 (2026-05-11) -- pg_cluster_reconfig_state SRF (oid 8920).
+# Always-1-row reconfig coordinator observability (P2.9):  event_id /
+# coordinator_node_id / old_epoch / new_epoch / dead_bitmap hex /
+# applied_at / observer_role (none/coordinator/survivor) / event_seq /
+# cssd_dead_generation.  Never-applied state surfaces as event_id=0 +
+# observer_role='none' + applied_at NULL.  cluster.enabled=off path
+# returns 0 rows.  provolatile=v (reads live shmem;not parallel safe
+# beyond restricted per L12 lesson).
+{ oid => '8920', descr => 'show reconfig coordinator state (spec-2.29)',
+  proname => 'cluster_get_reconfig_state', prorows => '1',
+  proretset => 't', provolatile => 'v', proparallel => 'r',
+  prorettype => 'record', proargtypes => '',
+  proallargtypes => '{int8,int4,int8,int8,text,timestamptz,text,int8,int8}',
+  proargmodes => '{o,o,o,o,o,o,o,o,o}',
+  proargnames => '{event_id,coordinator_node_id,old_epoch,new_epoch,dead_bitmap,applied_at,observer_role,event_seq,cssd_dead_generation}',
+  prosrc => 'cluster_get_reconfig_state' },
+
 ]

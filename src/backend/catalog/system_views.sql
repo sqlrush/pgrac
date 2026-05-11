@@ -1578,6 +1578,29 @@ CREATE VIEW pg_cluster_fence_state AS
 REVOKE ALL ON pg_cluster_fence_state FROM PUBLIC;
 GRANT SELECT ON pg_cluster_fence_state TO PUBLIC;
 
+-- PGRAC: pg_cluster_reconfig_state (spec-2.29 D7; 2026-05-11).
+--   Always-1-row view exposing reconfig coordinator state:  event_id,
+--   coordinator_node_id, old_epoch / new_epoch, dead_bitmap (hex text),
+--   applied_at (NULL when never applied), observer_role
+--   (none/coordinator/survivor), event_seq, cssd_dead_generation.
+--   Backed by cluster_get_reconfig_state (OID 8920).
+--   cluster.enabled=off path returns 0 rows; never-applied state surfaces
+--   as event_id=0 + observer_role='none' + applied_at NULL (P2.9 contract).
+CREATE VIEW pg_cluster_reconfig_state AS
+    SELECT event_id,
+           coordinator_node_id,
+           old_epoch,
+           new_epoch,
+           dead_bitmap,
+           applied_at,
+           observer_role,
+           event_seq,
+           cssd_dead_generation
+      FROM cluster_get_reconfig_state();
+
+REVOKE ALL ON pg_cluster_reconfig_state FROM PUBLIC;
+GRANT SELECT ON pg_cluster_reconfig_state TO PUBLIC;
+
 -- PGRAC: pg_cluster_ic_msg_types (spec-2.3 D8; 2026-05-08).
 --   Lists every IC message type registered in the process-local
 --   dispatch_table[] under cluster_ic_router.c.  Diagnostic /

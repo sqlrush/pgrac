@@ -229,4 +229,34 @@ extern void cluster_reconfig_check_pending_in_proc_interrupts(void);
 extern void cluster_reconfig_publish_event(const ReconfigEvent *evt);
 
 
+/* ============================================================
+ * Pure-function helper exposed for unit test coverage (Step 2 T-reconfig-2).
+ *
+ *	event_id = hash_bytes_extended(dead_bitmap[16] || cssd_dead_generation, seed=0).
+ *	Deterministic, no state.  Per spec-2.29 P1.2 fix the hash MUST NOT
+ *	include old_epoch (self-loops on coordinator bump).
+ * ============================================================
+ */
+
+extern uint64 cluster_reconfig_compute_event_id(
+	const uint8 dead_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES],
+	uint64      cssd_dead_generation);
+
+
+/* ============================================================
+ * Counter accessors (Step 2 + Step 3 SRF + unit test coverage).
+ *
+ *	apply_counter:           total reconfig events published
+ *	dedup_skip_counter:      total events skipped due to event_id ==
+ *	                         last_applied.event_id
+ *	procsig_broadcast_count: total PROCSIG broadcast tick invocations
+ *	                         (always-survivor branch, see I7)
+ * ============================================================
+ */
+
+extern uint64 cluster_reconfig_get_apply_counter(void);
+extern uint64 cluster_reconfig_get_dedup_skip_counter(void);
+extern uint64 cluster_reconfig_get_procsig_broadcast_count(void);
+
+
 #endif /* CLUSTER_RECONFIG_H */

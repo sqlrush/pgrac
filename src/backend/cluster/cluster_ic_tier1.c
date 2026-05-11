@@ -423,6 +423,9 @@ tier1_shmem_init(void)
 			pg_atomic_init_u64(&Tier1Shmem->peers[i].lamport_observe_advance_count, 0);
 			pg_atomic_init_u64(&Tier1Shmem->peers[i].chunk_reassembly_timeout_count, 0);
 			pg_atomic_init_u32(&Tier1Shmem->peers[i].chunk_reassembly_active, 0);
+			/* spec-2.29 D20 + D18b: hostile-spoof + epoch piggyback counters. */
+			pg_atomic_init_u64(&Tier1Shmem->peers[i].unreasonable_epoch_jump_count, 0);
+			pg_atomic_init_u64(&Tier1Shmem->peers[i].epoch_observe_advance_count, 0);
 			/* spec-2.4 v1.0.1 F3: LMON-mediated close request flag. */
 			pg_atomic_init_u32(&Tier1Shmem->peers[i].close_requested, 0);
 		}
@@ -657,6 +660,34 @@ cluster_ic_tier1_bump_chunk_reassembly_timeout(int32 peer_id)
 	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES || Tier1Shmem == NULL)
 		return;
 	pg_atomic_add_fetch_u64(&Tier1Shmem->peers[peer_id].chunk_reassembly_timeout_count, 1);
+}
+
+/*
+ * spec-2.29 D20: hostile-spoof defense.  Bumped when envelope verify
+ * sees env_epoch - my_epoch > CLUSTER_EPOCH_OBSERVE_MAX_JUMP (16) — the
+ * frame is DROP_NO_CLOSE'd to deny unbounded epoch advance via spoofed
+ * envelopes.  Visible via pg_stat_cluster_ic_peer (Step 3 SRF).
+ */
+void
+cluster_ic_tier1_bump_unreasonable_epoch_jump(int32 peer_id)
+{
+	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES || Tier1Shmem == NULL)
+		return;
+	pg_atomic_add_fetch_u64(&Tier1Shmem->peers[peer_id].unreasonable_epoch_jump_count, 1);
+}
+
+/*
+ * spec-2.29 D18b: Bumped when envelope verify sees env_epoch > my_epoch
+ * (within MAX_JUMP) AND cluster_epoch_observe_remote CAS-advanced
+ * my_epoch.  Cross-instance epoch convergence visibility — peers
+ * actively dragging this instance forward via Lamport piggyback.
+ */
+void
+cluster_ic_tier1_bump_epoch_observe_advance(int32 peer_id)
+{
+	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES || Tier1Shmem == NULL)
+		return;
+	pg_atomic_add_fetch_u64(&Tier1Shmem->peers[peer_id].epoch_observe_advance_count, 1);
 }
 
 void

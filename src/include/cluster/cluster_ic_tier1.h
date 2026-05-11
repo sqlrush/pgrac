@@ -82,10 +82,14 @@ typedef struct ClusterICPeerStateShmem {
 	char last_error_code[8]; /* SQLSTATE + NUL */
 	char last_error[CLUSTER_IC_TIER1_LAST_ERROR_LEN];
 	/* spec-2.4 D10: 4 NEW per-peer atomic counters */
-	pg_atomic_uint64 stale_epoch_drop_count;		 /* envelope verify step 7 reject */
+	pg_atomic_uint64 stale_epoch_drop_count;		 /* envelope verify step 7 reject (env < my) */
 	pg_atomic_uint64 lamport_observe_advance_count;	 /* envelope_observe_scn advance */
 	pg_atomic_uint64 chunk_reassembly_timeout_count; /* spec-2.4 D6 timeout cleanup */
 	pg_atomic_uint32 chunk_reassembly_active;		 /* in-flight reassembly seq_next */
+	/* spec-2.29 D20 hostile-spoof defense: env_epoch - my_epoch > MAX_JUMP. */
+	pg_atomic_uint64 unreasonable_epoch_jump_count;	 /* envelope verify step 7 reject (> MAX_JUMP) */
+	/* spec-2.29 D18b: my_epoch advanced via envelope-piggyback observe. */
+	pg_atomic_uint64 epoch_observe_advance_count;	 /* env_epoch > my_epoch, advanced */
 	/*
 	 * spec-2.4 hardening v1.0.1 F3 (L74 cross-aux-process-close-must-be-LMON-mediated):
 	 * close_requested = 1 when non-LMON aux context wants to close the peer.
@@ -204,6 +208,9 @@ extern bool cluster_ic_tier1_pending_outbound(int32 peer_id);
 extern void cluster_ic_tier1_bump_stale_epoch_drop(int32 peer_id);
 extern void cluster_ic_tier1_bump_lamport_advance(int32 peer_id);
 extern void cluster_ic_tier1_bump_chunk_reassembly_timeout(int32 peer_id);
+/* spec-2.29 D20: hostile-spoof defense + epoch piggyback observe counters. */
+extern void cluster_ic_tier1_bump_unreasonable_epoch_jump(int32 peer_id);
+extern void cluster_ic_tier1_bump_epoch_observe_advance(int32 peer_id);
 extern void cluster_ic_tier1_set_chunk_reassembly_active(int32 peer_id, uint32 active);
 
 /*

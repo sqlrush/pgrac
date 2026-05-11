@@ -211,6 +211,20 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	{ .name = "cluster-fence-pre-freeze-broadcast" },
 	{ .name = "cluster-fence-pre-self-fence-shutdown" },
 	{ .name = "cluster-fence-post-thaw-broadcast" },
+	/* spec-2.29 D10 (5 reconfig inject points):
+	 *   cluster-reconfig-tick-entry        : lmon_tick top of body
+	 *   cluster-reconfig-decide-coordinator: after Q2 A'' rule computed
+	 *   cluster-reconfig-epoch-bump-pre    : right before D18 advance
+	 *   cluster-reconfig-broadcast-procsig-pre: before ProcArray SendProcSignal
+	 *   cluster-cssd-mark-peer-dead        : unit/inject test bypass for CSSD
+	 *                                        deadband_scan (forces peer DEAD
+	 *                                        without real heartbeat miss)
+	 */
+	{ .name = "cluster-reconfig-tick-entry" },
+	{ .name = "cluster-reconfig-decide-coordinator" },
+	{ .name = "cluster-reconfig-epoch-bump-pre" },
+	{ .name = "cluster-reconfig-broadcast-procsig-pre" },
+	{ .name = "cluster-cssd-mark-peer-dead" },
 	/* Stage 1.15 (spec-1.15 D11 inject) — 4 SCN encoding-layer injects. */
 	{ .name = "cluster-scn-advance-pre" },
 	{ .name = "cluster-scn-advance-post" },

@@ -81,6 +81,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_fence.h" /* spec-2.28 D4 cluster_fence_check_interrupts */
+#include "cluster/cluster_reconfig.h" /* spec-2.29 D4 cluster_reconfig_check_pending_in_proc_interrupts */
 #endif
 
 /* ----------------
@@ -3048,6 +3049,31 @@ ProcessInterrupts(void)
 	 *	abort takes priority over connection check.
 	 */
 	cluster_fence_check_interrupts();
+
+	/*
+	 * PGRAC: spec-2.29 Sprint A Step 2 D4 — reconfig in-flight abort.
+	 *
+	 *	Per spec-2.29 §3.6 + Q5 A' (read-clear-then-decide, mirrors
+	 *	spec-2.28 §3.7 C4):
+	 *
+	 *	  if (cluster_reconfig_start_pending == 0) return;
+	 *	  cluster_reconfig_start_pending = false;      // clear FIRST
+	 *	  if (!IsTransactionState()) return;           // idle absorb (I6)
+	 *	  if (!cluster_qvotec_in_quorum())
+	 *	      ereport(ERROR, 53R50 quorum_lost_backend);
+	 *	  ereport(ERROR, 57R01 reconfig_in_progress);  // retry safe
+	 *
+	 *	I6 commit-durable safety:  PG ProcessInterrupts already returned
+	 *	early when CritSectionCount > 0 (postgres.c:3226-3227 prior gate)
+	 *	so the hook is unreachable inside a critical section.  Idle /
+	 *	post-commit cleanup tail absorbs via !IsTransactionState().
+	 *
+	 *	Hook anchor:  AFTER cluster_fence_check_interrupts (spec-2.28) —
+	 *	fence takes priority because freeze is the explicit quorum-loss
+	 *	gate;reconfig comes second to catch the membership-change abort
+	 *	case where epoch advanced but quorum did not collapse.
+	 */
+	cluster_reconfig_check_pending_in_proc_interrupts();
 #endif
 
 	if (CheckClientConnectionPending) {

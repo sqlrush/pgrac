@@ -1261,6 +1261,9 @@ pgstat_get_wait_cluster_bgproc(WaitEventCluster w)
 	case WAIT_EVENT_CLUSTER_FENCE_BACKEND_INTERRUPT_CHECK:
 		event_name = "ClusterFenceBackendInterruptCheck";
 		break;
+	case WAIT_EVENT_CLUSTER_BGPROC_LMON_RECONFIG_TICK:
+		event_name = "BgProcLmonReconfigTick";
+		break;
 	default:
 		break;
 	}

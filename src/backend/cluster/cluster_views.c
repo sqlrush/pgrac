@@ -190,6 +190,8 @@ static const uint32 cluster_wait_event_infos[CLUSTER_WAIT_EVENTS_COUNT] = {
 	WAIT_EVENT_CLUSTER_VOTING_DISK_WRITE,
 	/* spec-2.28 D9: fence-lite backend interrupt check wait event. */
 	WAIT_EVENT_CLUSTER_FENCE_BACKEND_INTERRUPT_CHECK,
+	/* spec-2.29 D9: reconfig coordinator LMON tick wait event. */
+	WAIT_EVENT_CLUSTER_BGPROC_LMON_RECONFIG_TICK,
 };
 
 /* Compile-time assertion: array length must match the documented count. */

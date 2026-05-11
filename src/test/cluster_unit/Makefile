@@ -389,7 +389,9 @@ test_cluster_fence: test_cluster_fence.c unit_test.h \
 test_cluster_reconfig: test_cluster_reconfig.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_RECONFIG_O) $(CLUSTER_EPOCH_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_VERSION_O) $(CLUSTER_RECONFIG_O) $(CLUSTER_EPOCH_O) -o $@
+		$(CLUSTER_VERSION_O) $(CLUSTER_RECONFIG_O) $(CLUSTER_EPOCH_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 # spec-2.6 Sprint A Step 2 D3: cluster_voting_disk_io.o standalone test.
 # Real syscalls (open / pread / pwrite / fdatasync) on a temp file —
