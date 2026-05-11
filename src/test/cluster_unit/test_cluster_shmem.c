@@ -385,6 +385,12 @@ void
 cluster_fence_shmem_register(void)
 {}
 
+/* spec-2.29 Sprint A Step 1 stub: cluster_reconfig shmem region. */
+void cluster_reconfig_shmem_register(void);
+void
+cluster_reconfig_shmem_register(void)
+{}
+
 
 UT_DEFINE_GLOBALS();
 

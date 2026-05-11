@@ -179,24 +179,30 @@ cluster_reconfig_get_last_event(ReconfigEvent *out)
 void
 cluster_reconfig_publish_event(const ReconfigEvent *evt)
 {
+	ReconfigEvent published;
+	uint64		event_seq;
+
 	Assert(evt != NULL);
 
 	if (ReconfigShmem == NULL)
 		return;
 
+	memcpy(&published, evt, sizeof(ReconfigEvent));
+
 	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
-	memcpy(&ReconfigShmem->last_applied, evt, sizeof(ReconfigEvent));
-	pg_atomic_fetch_add_u64(&ReconfigShmem->apply_counter, 1);
+	event_seq = pg_atomic_fetch_add_u64(&ReconfigShmem->apply_counter, 1) + 1;
+	published.event_seq = event_seq;
+	memcpy(&ReconfigShmem->last_applied, &published, sizeof(ReconfigEvent));
 	LWLockRelease(&ReconfigShmem->lock);
 
 	elog(DEBUG1,
 		 "cluster_reconfig: event %lu applied (coord=%d old=%lu new=%lu role=%d dead_gen=%lu)",
-		 (unsigned long) evt->event_id,
-		 evt->coordinator_node_id,
-		 (unsigned long) evt->old_epoch,
-		 (unsigned long) evt->new_epoch,
-		 evt->observer_role,
-		 (unsigned long) evt->cssd_dead_generation);
+		 (unsigned long) published.event_id,
+		 published.coordinator_node_id,
+		 (unsigned long) published.old_epoch,
+		 (unsigned long) published.new_epoch,
+		 published.observer_role,
+		 (unsigned long) published.cssd_dead_generation);
 }
 
 

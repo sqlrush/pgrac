@@ -213,7 +213,7 @@ UT_TEST(test_reconfig_publish_increments_apply_counter)
 	in.old_epoch = 5;
 	in.new_epoch = 6;
 	in.observer_role = CLUSTER_RECONFIG_OBSERVER_COORDINATOR;
-	in.event_seq = 1;
+	in.event_seq = 42; /* publish path owns the final monotonic value. */
 	in.cssd_dead_generation = 3;
 
 	cluster_reconfig_publish_event(&in);
@@ -223,7 +223,32 @@ UT_TEST(test_reconfig_publish_increments_apply_counter)
 	UT_ASSERT_EQ(evt.coordinator_node_id, 0);
 	UT_ASSERT_EQ((unsigned long long) evt.new_epoch, 6ULL);
 	UT_ASSERT_EQ(evt.observer_role, CLUSTER_RECONFIG_OBSERVER_COORDINATOR);
+	UT_ASSERT_EQ((unsigned long long) evt.event_seq, 1ULL);
 	UT_ASSERT_EQ((unsigned long long) evt.cssd_dead_generation, 3ULL);
+}
+
+
+UT_TEST(test_reconfig_publish_overwrites_event_seq_monotonically)
+{
+	ReconfigEvent evt;
+	ReconfigEvent in;
+
+	reconfig_init_done = false;
+	cluster_reconfig_shmem_init();
+
+	memset(&in, 0, sizeof(in));
+	in.event_id = 1;
+	in.event_seq = 99;
+	in.observer_role = CLUSTER_RECONFIG_OBSERVER_COORDINATOR;
+	cluster_reconfig_publish_event(&in);
+	cluster_reconfig_get_last_event(&evt);
+	UT_ASSERT_EQ((unsigned long long) evt.event_seq, 1ULL);
+
+	in.event_id = 2;
+	in.event_seq = 99;
+	cluster_reconfig_publish_event(&in);
+	cluster_reconfig_get_last_event(&evt);
+	UT_ASSERT_EQ((unsigned long long) evt.event_seq, 2ULL);
 }
 
 
@@ -367,7 +392,7 @@ UT_TEST(test_epoch_changed_at_lsn_set_and_get)
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(14);
 
 	/* T-reconfig-1 */
 	UT_RUN(test_reconfig_dead_bitmap_bytes_eq_16);
@@ -375,6 +400,7 @@ main(void)
 	UT_RUN(test_reconfig_shmem_size_positive);
 	UT_RUN(test_reconfig_shmem_init_idempotent);
 	UT_RUN(test_reconfig_publish_increments_apply_counter);
+	UT_RUN(test_reconfig_publish_overwrites_event_seq_monotonically);
 	UT_RUN(test_reconfig_broadcast_stub_increments_counter);
 
 	/* T-reconfig-9 */
