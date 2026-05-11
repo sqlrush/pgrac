@@ -106,11 +106,16 @@ is($pair->node1->safe_psql('postgres', 'SELECT 1'),
 	'1', 'L1 node1 postmaster alive');
 
 # IC heartbeat baseline (per L99 substrate verify): both peers must
-# see each other connected and exchanging IC heartbeats within 10s.
-# This establishes the tier1 fanout substrate that BOC broadcast rides.
-ok($pair->wait_for_peer_state(0, 1, 'connected', 10),
+# see each other connected and exchanging IC heartbeats.  30s timeout
+# is generous to absorb Ubuntu CI runner slow-tier1-TCP-connect (per
+# L66 family: Ubuntu nightly intermittently hits 8-10s ceiling on
+# postmaster startup + tier1 listener bind + active connect + HELLO
+# exchange when system load accumulates over 100+ tests in the suite;
+# macOS CI and local Apple silicon both <1s).  Generous timeout is
+# preferable to retag spiral.
+ok($pair->wait_for_peer_state(0, 1, 'connected', 30),
 	'L1 node0 sees node1 connected (tier1 substrate up)');
-ok($pair->wait_for_peer_state(1, 0, 'connected', 10),
+ok($pair->wait_for_peer_state(1, 0, 'connected', 30),
 	'L1 node1 sees node0 connected (tier1 substrate up)');
 
 # Give 3s for at least one IC heartbeat round to confirm substrate
