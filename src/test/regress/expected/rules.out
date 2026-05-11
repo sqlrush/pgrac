@@ -1378,6 +1378,16 @@ pg_cluster_quorum_state| SELECT in_quorum,
     last_quorum_loss_at,
     collision_state
    FROM cluster_get_quorum_state() cluster_get_quorum_state(in_quorum, quorum_size, disks_ok, disks_total, current_epoch_at_boot, last_quorum_loss_at, collision_state);
+pg_cluster_reconfig_state| SELECT event_id,
+    coordinator_node_id,
+    old_epoch,
+    new_epoch,
+    dead_bitmap,
+    applied_at,
+    observer_role,
+    event_seq,
+    cssd_dead_generation
+   FROM cluster_get_reconfig_state() cluster_get_reconfig_state(event_id, coordinator_node_id, old_epoch, new_epoch, dead_bitmap, applied_at, observer_role, event_seq, cssd_dead_generation);
 pg_cluster_shmem| SELECT name,
     size_bytes,
     lwlock_count,
