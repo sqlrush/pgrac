@@ -71,7 +71,7 @@
  *	symbols.  Provide local stubs so the unit test resolves at link
  *	time without dragging in the whole backend.  The test directly
  *	calls cluster_handle_reconfig_start_interrupt() and observes the
- *	flag transition; the SetLatch stub does nothing.
+ *	flag + InterruptPending transitions; the SetLatch stub does nothing.
  * ----------
  */
 #include "storage/latch.h"
@@ -166,11 +166,14 @@ UT_TEST(test_handler_sets_pending_flag)
 	 * anything observable in this binary.
 	 */
 	cluster_reconfig_start_pending = 0;
+	InterruptPending = 0;
 	cluster_handle_reconfig_start_interrupt();
 	UT_ASSERT_EQ(cluster_reconfig_start_pending, 1);
+	UT_ASSERT_EQ((int)InterruptPending, 1);
 
 	/* Restore for any subsequent tests; harmless either way. */
 	cluster_reconfig_start_pending = 0;
+	InterruptPending = 0;
 }
 
 UT_TEST(test_freeze_handler_arms_process_interrupts)

@@ -3059,14 +3059,16 @@ ProcessInterrupts(void)
 	 *	  if (cluster_reconfig_start_pending == 0) return;
 	 *	  cluster_reconfig_start_pending = false;      // clear FIRST
 	 *	  if (!IsTransactionState()) return;           // idle absorb (I6)
+	 *	  if (!TransactionIdIsValid(GetTopTransactionIdIfAny())) return;
 	 *	  if (!cluster_qvotec_in_quorum())
 	 *	      ereport(ERROR, 53R50 quorum_lost_backend);
-	 *	  ereport(ERROR, 57R01 reconfig_in_progress);  // retry safe
+	 *	  ereport(ERROR, 53R60 reconfig_in_progress);  // retry safe
 	 *
 	 *	I6 commit-durable safety:  PG ProcessInterrupts already returned
 	 *	early when CritSectionCount > 0 (postgres.c:3226-3227 prior gate)
 	 *	so the hook is unreachable inside a critical section.  Idle /
-	 *	post-commit cleanup tail absorbs via !IsTransactionState().
+	 *	post-commit cleanup tail absorbs via !IsTransactionState(); read-only
+	 *	transactions absorb via the no-top-xid guard.
 	 *
 	 *	Hook anchor:  AFTER cluster_fence_check_interrupts (spec-2.28) —
 	 *	fence takes priority because freeze is the explicit quorum-loss

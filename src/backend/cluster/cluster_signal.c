@@ -83,6 +83,7 @@ void
 cluster_handle_reconfig_start_interrupt(void)
 {
 	cluster_reconfig_start_pending = true;
+	InterruptPending = true;
 	SetLatch(MyLatch);
 }
 

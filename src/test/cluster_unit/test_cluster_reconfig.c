@@ -72,10 +72,12 @@ UT_DEFINE_GLOBALS();
  *	  - cluster_node_id (extern int)
  *	  - cluster_enabled (extern bool)
  *	  - IsTransactionState (D4 I6 absorb)
+ *	  - GetTopTransactionIdIfAny (D4 writable-tx guard)
  *	  - GetXLogInsertRecPtr (epoch_changed_at_lsn stamp)
  *	  - GetCurrentTimestamp (event applied_at)
  *	  - BackendIdGetProc / SendProcSignal / MaxBackends / MyProcPid
  *	  - cluster_reconfig_start_pending (handler-set sig_atomic_t)
+ *	  - cluster_injection_* (D10 injection point callsites)
  *
  *	Unit-test scope: T-2 (compute_event_id determinism), T-3 (publish
  *	dedup via lmon_tick gated path), T-7 (broadcast vs epoch++ split
@@ -187,13 +189,32 @@ cluster_conf_lookup_node(int32 node_id)
 	return ut_declared_set[node_id] ? &ut_dummy_node : NULL;
 }
 
+#include "access/transam.h"
+#include "access/xact.h"
 /* IsTransactionState stub.  D4 ProcessInterrupts I6 absorb path. */
 static bool ut_in_tx_state = false;
-#include "access/xact.h"
+static TransactionId ut_top_xid = InvalidTransactionId;
 bool
 IsTransactionState(void)
 {
 	return ut_in_tx_state;
+}
+TransactionId
+GetTopTransactionIdIfAny(void)
+{
+	return ut_top_xid;
+}
+
+/* Injection framework stubs for D10 callsites in cluster_reconfig.c. */
+#include "cluster/cluster_inject.h"
+int cluster_injection_armed_count = 0;
+void
+cluster_injection_run(const char *name pg_attribute_unused())
+{}
+bool
+cluster_injection_should_skip(const char *name pg_attribute_unused())
+{
+	return false;
 }
 
 /* GetCurrentTimestamp + GetXLogInsertRecPtr stubs. */
@@ -284,6 +305,7 @@ ut_reset_mocks(void)
 	ut_in_quorum_value = false;
 	ut_dead_generation = 0;
 	ut_in_tx_state = false;
+	ut_top_xid = InvalidTransactionId;
 	cluster_enabled = true;
 	cluster_node_id = 0;
 	cluster_reconfig_start_pending = 0;
@@ -363,6 +385,7 @@ UT_TEST(test_reconfig_publish_increments_apply_counter)
 	ReconfigEvent in;
 
 	reconfig_init_done = false;
+	cluster_enabled = true;
 	cluster_reconfig_shmem_init();
 
 	memset(&in, 0, sizeof(in));
@@ -410,22 +433,17 @@ UT_TEST(test_reconfig_publish_overwrites_event_seq_monotonically)
 }
 
 
-UT_TEST(test_reconfig_broadcast_stub_increments_counter)
+UT_TEST(test_reconfig_broadcast_increments_counter)
 {
 	reconfig_init_done = false;
 	cluster_reconfig_shmem_init();
 
-	/* Step 1 stub: broadcast_local_procsig only increments counter
-	 * (real ProcArray walk lands in Step 2 D2 body).  Verify the
-	 * stub still calls atomic_inc so observability surface in
-	 * Step 3 pg_cluster_reconfig_state shows non-zero. */
+	/* Real body walks ProcArray; MaxBackends=0 in this unit harness, so
+	 * the loop is empty but the invocation counter still advances. */
 	cluster_reconfig_broadcast_local_procsig();
 	cluster_reconfig_broadcast_local_procsig();
 
-	/* No direct accessor for procsig_broadcast_count yet (that lands
-	 * in Step 3 D5b SRF entry);Step 1 verifies via no-crash + state
-	 * struct sizeof + LWLock-protected publish path consistency. */
-	UT_ASSERT(true); /* stub invocation safety */
+	UT_ASSERT_EQ((unsigned long long) cluster_reconfig_get_procsig_broadcast_count(), 2ULL);
 }
 
 
@@ -883,11 +901,27 @@ UT_TEST(test_reconfig_check_pending_idle_absorbs_I6)
 }
 
 
+UT_TEST(test_reconfig_check_pending_read_only_xact_absorbs)
+{
+	ut_reset_mocks();
+	cluster_reconfig_start_pending = 1;
+	ut_in_tx_state = true;
+	ut_top_xid = InvalidTransactionId; /* no writes yet */
+	ut_in_quorum_value = true;
+
+	cluster_reconfig_check_pending_in_proc_interrupts();
+
+	UT_ASSERT_EQ(ut_ereport_fired_count, 0);
+	UT_ASSERT_EQ((int)cluster_reconfig_start_pending, 0);
+}
+
+
 UT_TEST(test_reconfig_check_pending_in_tx_quorum_lost_errors)
 {
 	ut_reset_mocks();
 	cluster_reconfig_start_pending = 1;
 	ut_in_tx_state = true;
+	ut_top_xid = 42;	/* writable tx */
 	ut_in_quorum_value = false; /* quorum lost → 53R50 branch */
 
 	if (sigsetjmp(ut_ereport_jump, 1) == 0)
@@ -904,12 +938,13 @@ UT_TEST(test_reconfig_check_pending_in_tx_quorum_lost_errors)
 }
 
 
-UT_TEST(test_reconfig_check_pending_in_tx_in_quorum_57R01_errors)
+UT_TEST(test_reconfig_check_pending_in_tx_in_quorum_53R60_errors)
 {
 	ut_reset_mocks();
 	cluster_reconfig_start_pending = 1;
 	ut_in_tx_state = true;
-	ut_in_quorum_value = true;	/* in_quorum → 57R01 reconfig_in_progress */
+	ut_top_xid = 42;	/* writable tx */
+	ut_in_quorum_value = true;	/* in_quorum → 53R60 reconfig_in_progress */
 
 	if (sigsetjmp(ut_ereport_jump, 1) == 0)
 	{
@@ -932,7 +967,7 @@ UT_TEST(test_reconfig_check_pending_in_tx_in_quorum_57R01_errors)
 int
 main(void)
 {
-	UT_PLAN(29);
+	UT_PLAN(31);
 
 	/* T-reconfig-1 */
 	UT_RUN(test_reconfig_dead_bitmap_bytes_eq_16);
@@ -941,7 +976,7 @@ main(void)
 	UT_RUN(test_reconfig_shmem_init_idempotent);
 	UT_RUN(test_reconfig_publish_increments_apply_counter);
 	UT_RUN(test_reconfig_publish_overwrites_event_seq_monotonically);
-	UT_RUN(test_reconfig_broadcast_stub_increments_counter);
+	UT_RUN(test_reconfig_broadcast_increments_counter);
 
 	/* T-reconfig-9 */
 	UT_RUN(test_epoch_observe_remote_advance_from_zero);
@@ -975,8 +1010,9 @@ main(void)
 	UT_RUN(test_reconfig_check_pending_disabled_silent);
 	UT_RUN(test_reconfig_check_pending_no_pending_fast_path);
 	UT_RUN(test_reconfig_check_pending_idle_absorbs_I6);
+	UT_RUN(test_reconfig_check_pending_read_only_xact_absorbs);
 	UT_RUN(test_reconfig_check_pending_in_tx_quorum_lost_errors);
-	UT_RUN(test_reconfig_check_pending_in_tx_in_quorum_57R01_errors);
+	UT_RUN(test_reconfig_check_pending_in_tx_in_quorum_53R60_errors);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

@@ -70,8 +70,9 @@ extern volatile sig_atomic_t cluster_reconfig_start_pending;
  *	called by procsignal_sigusr1_handler when a backend or cluster
  *	worker receives PROCSIG_CLUSTER_RECONFIG_START.
  *
- *	Sets cluster_reconfig_start_pending = true and SetLatch(MyLatch);
- *	never returns an error, never blocks, never allocates.
+ *	Sets cluster_reconfig_start_pending = true, InterruptPending = true,
+ *	and SetLatch(MyLatch); never returns an error, never blocks, never
+ *	allocates.
  */
 extern void cluster_handle_reconfig_start_interrupt(void);
 

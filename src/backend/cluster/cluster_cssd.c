@@ -723,6 +723,17 @@ cssd_deadband_scan_tick(void)
 		else
 			new_state = CLUSTER_CSSD_PEER_ALIVE;
 
+		/*
+		 * spec-2.29 D10: test-only bypass for reconfig actor tests.
+		 * When armed with SKIP, force the current declared peer to DEAD
+		 * without waiting for heartbeat deadband.  NONE/WARNING/SLEEP
+		 * modes still only record the callsite hit through the injection
+		 * framework.
+		 */
+		CLUSTER_INJECTION_POINT("cluster-cssd-mark-peer-dead");
+		if (cluster_injection_should_skip("cluster-cssd-mark-peer-dead"))
+			new_state = CLUSTER_CSSD_PEER_DEAD;
+
 		if (old_state != new_state) {
 			pg_atomic_write_u32(&CssdShmem->peers[peer].state, (uint32)new_state);
 

@@ -101,8 +101,8 @@ is(raise_and_get_sqlstate('cluster_reconfig_abort'), '40R01',
 	"cluster_reconfig_abort -> 40R01");
 is(raise_and_get_sqlstate('cluster_lms_queue_full'), '53R01',
 	"cluster_lms_queue_full -> 53R01");
-is(raise_and_get_sqlstate('cluster_reconfig_in_progress'), '57R01',
-	"cluster_reconfig_in_progress -> 57R01");
+is(raise_and_get_sqlstate('cluster_reconfig_in_progress'), '53R60',
+	"cluster_reconfig_in_progress -> 53R60");
 is(raise_and_get_sqlstate('cluster_shared_storage_failed'), '58R01',
 	"cluster_shared_storage_failed -> 58R01");
 

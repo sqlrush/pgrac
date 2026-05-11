@@ -118,7 +118,7 @@ UT_TEST(test_class_40_first_last)
 UT_TEST(test_class_53_first_last)
 {
 	UT_ASSERT_EQ(ERRCODE_CLUSTER_LMS_QUEUE_FULL, MAKE_SQLSTATE('5', '3', 'R', '0', '1'));
-	UT_ASSERT_EQ(ERRCODE_CLUSTER_RECONFIG_QUORUM_LOST, MAKE_SQLSTATE('5', '3', 'R', '0', '7'));
+	UT_ASSERT_EQ(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS, MAKE_SQLSTATE('5', '3', 'R', '6', '0'));
 }
 
 UT_TEST(test_class_55_first_last)
@@ -129,7 +129,7 @@ UT_TEST(test_class_55_first_last)
 
 UT_TEST(test_class_57_first_last)
 {
-	UT_ASSERT_EQ(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS, MAKE_SQLSTATE('5', '7', 'R', '0', '1'));
+	UT_ASSERT_EQ(ERRCODE_CLUSTER_FENCE_TRIGGERED, MAKE_SQLSTATE('5', '7', 'R', '0', '2'));
 	UT_ASSERT_EQ(ERRCODE_CLUSTER_ADG_APPLY_LAG_EXCESSIVE, MAKE_SQLSTATE('5', '7', 'R', '0', '6'));
 }
 
@@ -229,11 +229,12 @@ UT_TEST(test_per_class_anchors)
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_PROTOCOL_VERSION_MISMATCH, 5), '5');
 	/* Class 40 has 4 entries: 40R01..40R04 */
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_PI_INVALIDATED_RETRY, 5), '4');
-	/* Class 53 has 7 entries: 53R01..53R07 */
-	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_RECONFIG_QUORUM_LOST, 5), '7');
+	/* Class 53 spans base 53R01..53R07 plus quorum/fence/reconfig ranges up to 53R60. */
+	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS, 4), '6');
+	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS, 5), '0');
 	/* Class 55 has 6 entries: 55R01..55R06 */
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_BLOCK_MISSING_TEMPORARY, 5), '6');
-	/* Class 57 has 6 entries: 57R01..57R06 */
+	/* Class 57 keeps operator-intervention cluster codes 57R02..57R06. */
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_ADG_APPLY_LAG_EXCESSIVE, 5), '6');
 	/* Class 72 has 2 entries: 72R01..72R02 */
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_SNAPSHOT_UNAVAILABLE, 5), '2');

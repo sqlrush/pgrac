@@ -463,6 +463,15 @@ void
 cluster_fence_lmon_tick(void)
 {}
 
+/* spec-2.29 Sprint A Step 2 stub: cluster_lmon.c now calls
+ * cluster_reconfig_lmon_tick() in its main loop.  Empty stub for
+ * unit-test link;real coordinator behavior is covered by
+ * test_cluster_reconfig and TAP 099. */
+void cluster_reconfig_lmon_tick(void);
+void
+cluster_reconfig_lmon_tick(void)
+{}
+
 
 UT_DEFINE_GLOBALS();
 

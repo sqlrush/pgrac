@@ -486,8 +486,14 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 # C4 read-clear-then-decide).  Distinct error codes let log analysis +
 # client retry logic distinguish "tx start blocked at commit" vs "tx
 # aborted mid-flight by fence broadcast".  53R51-59 reserved for
-# future fence (spec-2.29 reconfig / spec-2.30 external fence).
+# future fence / backend fail-closed variants.
 53R50    E    ERRCODE_CLUSTER_QUORUM_LOST_BACKEND                            cluster_quorum_lost_backend
+
+# spec-2.29 D8 — retry-safe backend abort for in-flight membership
+# reconfig / epoch transition.  53R60 is intentionally separate from
+# 53R40 commit-boundary quorum loss and 53R50 fence/quorum-loss backend
+# abort so clients can pick distinct retry policy.
+53R60    E    ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS                           cluster_reconfig_in_progress
 
 Section: Class 54 - Program Limit Exceeded
 
@@ -528,7 +534,6 @@ Section: Class 57 - Operator Intervention
 
 Section: Class 57 - Operator Intervention (pgrac extension)
 
-57R01    E    ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS                           cluster_reconfig_in_progress
 57R02    E    ERRCODE_CLUSTER_FENCE_TRIGGERED                                cluster_fence_triggered
 57R03    E    ERRCODE_CLUSTER_ADMIN_SHUTDOWN                                 cluster_admin_shutdown
 57R04    E    ERRCODE_CLUSTER_NODE_DRAIN                                     cluster_node_drain

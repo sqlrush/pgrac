@@ -265,11 +265,17 @@ cluster_conf_lookup_node(int32 node_id)
  * counter bumpers.  Router tests do NOT invoke envelope_verify
  * directly, but link must resolve.
  */
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_scn.h"
 uint64
 cluster_epoch_get_current(void)
 {
 	return 0;
+}
+bool
+cluster_epoch_observe_remote(uint64 remote_epoch pg_attribute_unused())
+{
+	return false;
 }
 SCN
 cluster_scn_current(void)
@@ -284,6 +290,12 @@ cluster_ic_tier1_bump_stale_epoch_drop(int32 peer_id pg_attribute_unused())
 {}
 void
 cluster_ic_tier1_bump_lamport_advance(int32 peer_id pg_attribute_unused())
+{}
+void
+cluster_ic_tier1_bump_unreasonable_epoch_jump(int32 peer_id pg_attribute_unused())
+{}
+void
+cluster_ic_tier1_bump_epoch_observe_advance(int32 peer_id pg_attribute_unused())
 {}
 
 /* MyBackendType -- writable from tests to flip producer scope */

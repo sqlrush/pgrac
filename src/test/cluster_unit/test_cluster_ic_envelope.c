@@ -45,6 +45,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_scn.h" /* SCN typedef + stubbed observe/current */
 
@@ -116,6 +117,14 @@ cluster_epoch_get_current(void)
 {
 	return test_current_epoch;
 }
+bool
+cluster_epoch_observe_remote(uint64 remote_epoch)
+{
+	if (test_current_epoch >= remote_epoch)
+		return false;
+	test_current_epoch = remote_epoch;
+	return true;
+}
 
 static SCN test_current_scn = 0;
 static int test_observe_call_count = 0;
@@ -134,6 +143,8 @@ cluster_scn_observe(SCN remote)
 
 static int test_bump_stale_epoch_count = 0;
 static int test_bump_lamport_advance_count = 0;
+static int test_bump_unreasonable_epoch_jump_count = 0;
+static int test_bump_epoch_observe_advance_count = 0;
 void
 cluster_ic_tier1_bump_stale_epoch_drop(int32 peer_id pg_attribute_unused())
 {
@@ -143,6 +154,16 @@ void
 cluster_ic_tier1_bump_lamport_advance(int32 peer_id pg_attribute_unused())
 {
 	test_bump_lamport_advance_count++;
+}
+void
+cluster_ic_tier1_bump_unreasonable_epoch_jump(int32 peer_id pg_attribute_unused())
+{
+	test_bump_unreasonable_epoch_jump_count++;
+}
+void
+cluster_ic_tier1_bump_epoch_observe_advance(int32 peer_id pg_attribute_unused())
+{
+	test_bump_epoch_observe_advance_count++;
 }
 
 /*
@@ -683,6 +704,57 @@ UT_TEST(test_u10_verify_rejects_stale_epoch)
 	test_current_epoch = 0;
 }
 
+
+UT_TEST(test_u14_verify_observes_newer_epoch_within_max)
+{
+	ClusterICEnvelope env;
+	bool ok;
+
+	test_current_epoch = 5;
+	ok = cluster_ic_envelope_build(&env, PGRAC_IC_MSG_HEARTBEAT, TEST_PEER_NODE_ID,
+								   TEST_SELF_NODE_ID, NULL, 0);
+	UT_ASSERT(ok);
+
+	/* Simulate a valid peer envelope from a bounded newer epoch. */
+	env.epoch = 10;
+	env.payload_crc32c = cluster_ic_envelope_compute_crc(&env, NULL);
+
+	test_bump_epoch_observe_advance_count = 0;
+	test_bump_unreasonable_epoch_jump_count = 0;
+	UT_ASSERT(cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, TEST_PEER_NODE_ID)
+			  == CLUSTER_IC_ENVELOPE_OK);
+	UT_ASSERT_EQ((int)test_current_epoch, 10);
+	UT_ASSERT_EQ(test_bump_epoch_observe_advance_count, 1);
+	UT_ASSERT_EQ(test_bump_unreasonable_epoch_jump_count, 0);
+
+	test_current_epoch = 0;
+}
+
+
+UT_TEST(test_u15_verify_drops_unreasonable_epoch_jump)
+{
+	ClusterICEnvelope env;
+	bool ok;
+
+	test_current_epoch = 5;
+	ok = cluster_ic_envelope_build(&env, PGRAC_IC_MSG_HEARTBEAT, TEST_PEER_NODE_ID,
+								   TEST_SELF_NODE_ID, NULL, 0);
+	UT_ASSERT(ok);
+
+	env.epoch = 5 + CLUSTER_EPOCH_OBSERVE_MAX_JUMP + 1;
+	env.payload_crc32c = cluster_ic_envelope_compute_crc(&env, NULL);
+
+	test_bump_epoch_observe_advance_count = 0;
+	test_bump_unreasonable_epoch_jump_count = 0;
+	UT_ASSERT(cluster_ic_envelope_verify(&env, NULL, 0, TEST_SELF_NODE_ID, TEST_PEER_NODE_ID)
+			  == CLUSTER_IC_ENVELOPE_DROP_NO_CLOSE);
+	UT_ASSERT_EQ((int)test_current_epoch, 5);
+	UT_ASSERT_EQ(test_bump_epoch_observe_advance_count, 0);
+	UT_ASSERT_EQ(test_bump_unreasonable_epoch_jump_count, 1);
+
+	test_current_epoch = 0;
+}
+
 UT_TEST(test_u11_verify_does_not_observe_scn)
 {
 	ClusterICEnvelope env;
@@ -775,7 +847,7 @@ UT_TEST(test_u13_accept_and_observe_wraps_correctly)
 int
 main(void)
 {
-	UT_PLAN(32);
+	UT_PLAN(34);
 
 	/* U1 ABI lock (8 sub-tests) */
 	UT_RUN(test_u1_abi_sizeof_36);
@@ -821,6 +893,8 @@ main(void)
 
 	/* U10-U13 spec-2.4 D4 + Q2 修订 epoch enforce + observe split */
 	UT_RUN(test_u10_verify_rejects_stale_epoch);
+	UT_RUN(test_u14_verify_observes_newer_epoch_within_max);
+	UT_RUN(test_u15_verify_drops_unreasonable_epoch_jump);
 	UT_RUN(test_u11_verify_does_not_observe_scn);
 	UT_RUN(test_u12_observe_scn_advances_then_bumps);
 	UT_RUN(test_u13_accept_and_observe_wraps_correctly);

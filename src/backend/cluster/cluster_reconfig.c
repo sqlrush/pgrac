@@ -47,6 +47,7 @@
 
 #include <string.h>
 
+#include "access/transam.h"			   /* TransactionIdIsValid */
 #include "access/xact.h"			   /* IsTransactionState (Step 2 D4) */
 #include "access/xlog.h"			   /* GetXLogInsertRecPtr (Step 2 D2) */
 #include "common/hashfn.h"			   /* hash_bytes_extended */
@@ -67,6 +68,7 @@
 #include "cluster/cluster_elog.h"	   /* cluster_node_id */
 #include "cluster/cluster_epoch.h"	   /* advance + observe + set_changed_at_lsn */
 #include "cluster/cluster_guc.h"	   /* cluster_enabled */
+#include "cluster/cluster_inject.h"	   /* CLUSTER_INJECTION_POINT */
 #include "cluster/cluster_qvotec.h"	   /* cluster_qvotec_in_quorum */
 #include "cluster/cluster_shmem.h"	   /* cluster_shmem_register_region */
 #include "cluster/cluster_signal.h"	   /* cluster_reconfig_start_pending */
@@ -371,6 +373,8 @@ cluster_reconfig_lmon_tick(void)
 	if (!cluster_enabled)
 		return;
 
+	CLUSTER_INJECTION_POINT("cluster-reconfig-tick-entry");
+
 	/* spec-2.29 D9 wait event registered for pg_stat_cluster_wait_events
 	 * SRF visibility;pgstat_report_wait_start wrapping deferred to Sprint
 	 * A hardening (lmon_tick has many early returns; clean wait_start/
@@ -420,6 +424,8 @@ cluster_reconfig_lmon_tick(void)
 	coordinator = dead_bitmap_lowest_bit_set(alive_set);
 	if (coordinator < 0)
 		return;	/* total cluster failure;fail-closed already via QVOTEC */
+
+	CLUSTER_INJECTION_POINT("cluster-reconfig-decide-coordinator");
 
 	/* §3.2 P1.2: event_id from dead_bitmap + dead_generation snapshot. */
 	cssd_dead_generation = cluster_cssd_get_dead_generation();
@@ -487,6 +493,8 @@ cluster_reconfig_broadcast_local_procsig(void)
 	if (ReconfigShmem == NULL)
 		return;
 
+	CLUSTER_INJECTION_POINT("cluster-reconfig-broadcast-procsig-pre");
+
 	for (beid = 1; beid <= MaxBackends; beid++)
 	{
 		PGPROC *proc = BackendIdGetProc((BackendId) beid);
@@ -531,6 +539,8 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 	if (!cluster_enabled)
 		return;
 
+	CLUSTER_INJECTION_POINT("cluster-reconfig-epoch-bump-pre");
+
 	/* D18:  atomic CAS-loop increment.  Returns pre/post snapshots. */
 	cluster_epoch_advance_for_reconfig(&old_epoch, &new_epoch);
 
@@ -561,15 +571,16 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
  *	  returns early when CritSectionCount > 0, so the I6 commit-
  *	  durable safety guard (P1.5) is partially enforced by PG itself.
  *	  We additionally absorb when IsTransactionState() is false (idle /
- *	  post-commit cleanup completed) to avoid 53R60 firing on a
- *	  durable-committed transaction's tail.
+ *	  post-commit cleanup completed) or when no top-level xid has been
+ *	  assigned yet (read-only transaction so far) to avoid 53R60 firing
+ *	  on non-writes.
  *
  *	  Read-clear-then-decide pattern (per Q5 A' + spec-2.28 §3.7 C4):
  *	    1. cheap pre-check on sig_atomic_t (avoid hot-loop write)
  *	    2. clear flag BEFORE GUC / tx-state checks (prevents stale
  *	       pending after disable + re-enable + new tx)
- *	    3. decide whether to ereport based on GUC + tx state +
- *	       quorum state
+ *	    3. decide whether to ereport based on GUC + writable tx state
+ *	       + quorum state
  *
  *	  Error code routing (spec-2.29 §2.4):
  *	    - 53R50 ERRCODE_CLUSTER_QUORUM_LOST_BACKEND  — not in_quorum
@@ -590,6 +601,13 @@ cluster_reconfig_check_pending_in_proc_interrupts(void)
 	 * (postgres.c top of function).  We add IsTransactionState absorb
 	 * to silently no-op on idle / post-commit cleanup tail. */
 	if (!IsTransactionState())
+		return;
+
+	/* Q5 A': reconfig abort is write-path only.  Match the spec-2.6
+	 * CommitTransaction guard: a transaction with no top-level xid has
+	 * not performed durable writes yet, so read-only work absorbs the
+	 * signal instead of surfacing 53R60. */
+	if (!TransactionIdIsValid(GetTopTransactionIdIfAny()))
 		return;
 
 	if (!cluster_qvotec_in_quorum())
