@@ -739,6 +739,21 @@ cluster_cssd_get_main_loop_iters(void)
 	return 0;
 }
 
+/* spec-2.5 Hardening v1.0.3 stubs:  cluster_debug.c dump_cluster_cssd
+ * references declared_alive aggregate accessors;test_cluster_debug
+ * standalone link must resolve.  Stub returns 0 / zero bitmap. */
+int
+cluster_cssd_get_declared_alive_count(void)
+{
+	return 0;
+}
+void
+cluster_cssd_get_declared_alive_bitmap(uint8 out_bitmap[CLUSTER_CSSD_PEER_ALIVE_BITMAP_BYTES])
+{
+	if (out_bitmap != NULL)
+		memset(out_bitmap, 0, CLUSTER_CSSD_PEER_ALIVE_BITMAP_BYTES);
+}
+
 /* Spec-1.15 SCN encoding-layer stubs (cluster_debug.c references the
  * 7-key dump set; address-only in unit tests). */
 SCN
