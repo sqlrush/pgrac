@@ -18,9 +18,9 @@
 #      - Per-region rollup keys (region.<name>.bytes / .owner) appear
 #        for both registered regions.
 #      - cluster.shmem_max_regions GUC is int / postmaster context /
-#        default 64 / range [8, 256].
-#      - Lowering cluster.shmem_max_regions to 8 still allows the
-#        baseline 2 regions to register (no FATAL).
+#        default 64 / range [17, 256].
+#      - Lowering cluster.shmem_max_regions to the current baseline
+#        region count still allows every region to register (no FATAL).
 #      - 4 cluster-shmem-* injection points exist in
 #        pg_stat_cluster_injections (registry total: 24 = 20 + 4).
 #      - cluster_inject_fault('cluster-shmem-views-srf-entry','warning',0)
@@ -174,8 +174,8 @@ is($node->safe_psql(
 	  FROM pg_settings
 	 WHERE name = 'cluster.shmem_max_regions'
 }),
-   'integer|postmaster|64|16|256',
-   'L12 cluster.shmem_max_regions: int / postmaster / default 64 / [16,256]');
+   'integer|postmaster|64|17|256',
+   'L12 cluster.shmem_max_regions: int / postmaster / default 64 / [17,256]');
 
 is($node->safe_psql(
 		'postgres',
@@ -234,7 +234,7 @@ is($node->safe_psql(
 
 
 # ----------
-# L18: GUC max_regions=16 (boundary minimum) still admits 9 baseline regions.
+# L18: GUC max_regions=17 (boundary minimum) admits all baseline regions.
 # ----------
 $node->stop;
 $node->append_conf('postgresql.conf', "cluster.shmem_max_regions = 17\n");
