@@ -14,7 +14,8 @@
 #      L6   cluster.boc_sweep_interval_ms PGC_SIGHUP live adjust
 #      L7   inject :error on cluster-scn-boc-sweep-pre triggers
 #           SQLSTATE 53R0X (walwriter retries; PG auto-recover)
-#      L8   pg_cluster_state has all 14 SCN keys (10 from 1.16 + 4 BOC)
+#      L8   pg_cluster_state has all 19 SCN keys (10 from 1.16 + 4 BOC
+#           + 1 spec-2.10 fanout + 1 spec-2.11 defer + 3 spec-2.12 convergence)
 #      L9   observe CAS retry loop still bumps current_local correctly
 #           (round 9 inheritance: `>=` boundary + cur > remote_local
 #            break + wraparound guard)
@@ -197,7 +198,8 @@ is($boc_inject_post, '1',
 
 
 # ----------
-# L8: 14 SCN keys present (Q5 dump_scn 10 + 4 BOC).
+# L8: 19 SCN keys present (10 from 1.16 + 4 BOC + 1 spec-2.10 fanout
+# + 1 spec-2.11 defer + 3 spec-2.12 convergence).
 # ----------
 my @expected_keys = (
 	'scn_node_id',
@@ -215,12 +217,15 @@ my @expected_keys = (
 	'scn_boc_pending_at_last_sweep',
 	'scn_boc_max_batch_size',
 	'scn_boc_broadcast_fanout_count',
-	'scn_commit_lookup_defer_count');	  # spec-2.11 D5
+	'scn_commit_lookup_defer_count',	  # spec-2.11 D5
+	'scn_last_observe_at',				  # spec-2.12 D5
+	'scn_seconds_since_last_observe',	  # spec-2.12 D5
+	'scn_observed_max_observe_gap_ms');	  # spec-2.12 D5
 foreach my $k (@expected_keys)
 {
 	my $count = $node->safe_psql('postgres',
 		"SELECT count(*) FROM pg_cluster_state WHERE category='scn' AND key='$k'");
-	is($count, '1', "L8 pg_cluster_state has scn key '$k' (Q5 dump_scn 15 keys)");
+	is($count, '1', "L8 pg_cluster_state has scn key '$k' (Q5 dump_scn 19 keys after spec-2.12)");
 }
 
 

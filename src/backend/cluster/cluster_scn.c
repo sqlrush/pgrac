@@ -133,7 +133,34 @@ typedef struct ClusterScnSharedState {
 	 *	premature shmem layout commitment.  See spec-2.11 §3.0 I1.
 	 */
 	pg_atomic_uint64 commit_lookup_defer_count;
+	/*
+	 * spec-2.12 D2:  SCN observe local-proxy staleness metrics.
+	 *
+	 *	last_observe_at_us:  TimestampTz raw bits (int64 μs since 2000)
+	 *	of most recent cluster_scn_observe() CAS-Lamport bump (real SCN
+	 *	advance from remote);  NOT just envelope arrival (Q3.2 —
+	 *	distinguishes idle heartbeat from real cross-node SCN advance).
+	 *
+	 *	observed_max_observe_gap_ms:  historical peak of (now -
+	 *	prev_last_observe_at) across all CAS-Lamport bump events;
+	 *	atomic-max CAS pattern (mirror boc_max_batch_size from spec-1.17).
+	 *	Reset on shmem init (postmaster restart);  no SQL reset mechanism.
+	 *
+	 *	v0.2 P1.1 fix (L106 lesson):  USE pg_atomic_uint64 raw bits
+	 *	(NOT LWLock-protected TimestampTz).  cluster_scn_observe() CAS
+	 *	bump path is lock-free per spec-1.17 v0.2 Q2;  introducing
+	 *	LWLock would regress that invariant.  StaticAssertDecl below
+	 *	defends 8-byte raw-bits cast.
+	 */
+	pg_atomic_uint64 last_observe_at_us; /* TimestampTz raw bits */
+	pg_atomic_uint64 observed_max_observe_gap_ms;
 } ClusterScnSharedState;
+
+/* spec-2.12 D2:  defensive — raw-bits storage of TimestampTz in
+ * pg_atomic_uint64 assumes both are 8 bytes.  PG TimestampTz is int64
+ * μs since 2000 (PG 8.0+);  invariant has held for 25+ years. */
+StaticAssertDecl(sizeof(TimestampTz) == sizeof(uint64),
+				 "spec-2.12 D2: TimestampTz must be 8-byte to fit pg_atomic_uint64");
 
 
 static ClusterScnSharedState *cluster_scn_state = NULL;
@@ -440,6 +467,61 @@ cluster_scn_observe(SCN remote_scn)
 			 * compound which had the same issue caught by round 9 P2). */
 			pg_atomic_fetch_add_u64(&cluster_scn_state->observe_bump_count, 1);
 			pg_atomic_fetch_add_u64(&cluster_scn_state->total_advance_count, 1);
+
+			/*
+			 * spec-2.12 D3:  staleness / lag metric update (all-atomic,
+			 * NO LWLock per L106 lesson — matches spec-1.17 v0.2 Q2
+			 * lock-free CAS invariant).
+			 *
+			 *   Q3.2 semantic:  this site = "cross-node SCN real advance"
+			 *   (CAS-Lamport bump succeeded).  NOT envelope_observe_scn
+			 *   entry (idle heartbeat with no SCN advance 不刷新).
+			 *
+			 *   Race tolerated:  if concurrent observe overlaps,either
+			 *   ordering yields acceptable race results (each successful
+			 *   observe gets its own delta_ms vs whatever prev_bits was
+			 *   at swap time;  atomic-max ensures monotonic non-decreasing
+			 *   peak preserved).
+			 */
+			{
+				TimestampTz now_ts = GetCurrentTimestamp();
+				uint64 now_bits = (uint64)now_ts;
+				uint64 prev_bits;
+				TimestampTz prev_ts;
+
+				/* Step 1:  atomic swap last_observe_at_us;  recover prev. */
+				prev_bits
+					= pg_atomic_exchange_u64(&cluster_scn_state->last_observe_at_us, now_bits);
+				prev_ts = (TimestampTz)prev_bits;
+
+				if (prev_ts != 0) {
+					/* μs → ms.  TimestampTz is signed int64;  cast to
+					 * unsigned uint64 for delta_ms (guaranteed positive
+					 * because now_ts is monotonic forward — wall clock
+					 * may jump back but only via NTP step,not normal). */
+					int64 delta_us = (int64)now_ts - (int64)prev_ts;
+
+					if (delta_us > 0) {
+						uint64 delta_ms = (uint64)(delta_us / 1000);
+
+						/* Step 2:  atomic-max CAS (mirror
+						 * boc_max_batch_size pattern from spec-1.17). */
+						uint64 cur_max;
+
+						for (;;) {
+							cur_max = pg_atomic_read_u64(
+								&cluster_scn_state->observed_max_observe_gap_ms);
+							if (delta_ms <= cur_max)
+								break;
+							if (pg_atomic_compare_exchange_u64(
+									&cluster_scn_state->observed_max_observe_gap_ms, &cur_max,
+									delta_ms))
+								break;
+						}
+					}
+				}
+			}
+
 			bumped = true;
 			break;
 		}
@@ -1066,6 +1148,34 @@ cluster_scn_commit_lookup_defer_count(void)
 	return pg_atomic_read_u64(&cluster_scn_state->commit_lookup_defer_count);
 }
 
+/*
+ * spec-2.12 D4:  SCN convergence boundary verification accessors.
+ *
+ *	last_observe_at:  TimestampTz of most recent CAS-Lamport bump
+ *	  (cross-node SCN real advance;  NOT idle envelope arrival).
+ *	observed_max_observe_gap_ms:  historical peak inter-observe gap
+ *	  since shmem init.
+ *
+ *	Both are local-proxy staleness metrics — NOT true cross-node
+ *	propagation lag (which requires NTP and is measured by TAP 102).
+ *
+ *	Lock-free atomic read (L106 lesson — observe path is lock-free
+ *	per spec-1.17 v0.2 Q2;  these accessors mirror that invariant).
+ */
+TimestampTz
+cluster_scn_last_observe_at(void)
+{
+	Assert(cluster_scn_state != NULL);
+	return (TimestampTz)pg_atomic_read_u64(&cluster_scn_state->last_observe_at_us);
+}
+
+uint64
+cluster_scn_observed_max_observe_gap_ms(void)
+{
+	Assert(cluster_scn_state != NULL);
+	return pg_atomic_read_u64(&cluster_scn_state->observed_max_observe_gap_ms);
+}
+
 
 /*
  * ============================================================
@@ -1107,6 +1217,9 @@ cluster_scn_shmem_init(void)
 		pg_atomic_init_u64(&cluster_scn_state->boc_broadcast_fanout_count, 0);
 		/* spec-2.11 D3: init skeleton-phase commit_scn lookup defer counter. */
 		pg_atomic_init_u64(&cluster_scn_state->commit_lookup_defer_count, 0);
+		/* spec-2.12 D2 init zero (TimestampTz raw bits + atomic counter). */
+		pg_atomic_init_u64(&cluster_scn_state->last_observe_at_us, 0);
+		pg_atomic_init_u64(&cluster_scn_state->observed_max_observe_gap_ms, 0);
 	}
 }
 

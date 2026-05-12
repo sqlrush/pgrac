@@ -366,6 +366,30 @@ extern uint64 cluster_scn_commit_lookup_defer_count(void);
 
 
 /*
+ * spec-2.12 D4:  SCN convergence boundary verification accessors.
+ *
+ *	last_observe_at:  TimestampTz of most recent cluster_scn_observe()
+ *	  CAS-Lamport bump (cross-node SCN real advance;  NOT idle envelope
+ *	  arrival).  Lock-free atomic read of pg_atomic_uint64 raw bits
+ *	  (StaticAssertDecl in cluster_scn.c defends 8-byte invariant).
+ *	observed_max_observe_gap_ms:  historical peak (now - prev_observe_at)
+ *	  across all CAS-Lamport bump events;  atomic-max CAS in observe
+ *	  path;  monotonic non-decreasing since shmem init.
+ *
+ *	Both are local-proxy staleness metrics — NOT true cross-node
+ *	propagation lag (which requires NTP and is measured externally
+ *	by TAP 102 via poll-based wall clock from harness perspective).
+ *
+ *	GUC cluster.scn_max_propagation_lag_ms is the configuration bound
+ *	(config semantic intent = "propagation lag");  TAP 102 uses it as
+ *	hard assertion threshold;  future Hardening may add overrun
+ *	counter / WARNING alarms.
+ */
+extern TimestampTz cluster_scn_last_observe_at(void);
+extern uint64 cluster_scn_observed_max_observe_gap_ms(void);
+
+
+/*
  * spec-2.9 D3: PGRAC_IC_MSG_BOC_BROADCAST dispatch handler.
  *
  *	Registered by cluster_lmon.c phase 1 (spec-2.9 D1) as the recv-side

@@ -843,6 +843,22 @@ cluster_scn_commit_lookup_defer_count(void)
 	return 0;
 }
 
+/* spec-2.12 D4 / D5 / L104 stubs: cluster_debug emit_row references 2
+ * new spec-2.12 cluster_scn module accessors (scn_last_observe_at +
+ * scn_observed_max_observe_gap_ms);test_cluster_debug standalone
+ * binary doesn't link cluster_scn.o,vacuous stubs. */
+TimestampTz
+cluster_scn_last_observe_at(void)
+{
+	return 0;
+}
+
+uint64
+cluster_scn_observed_max_observe_gap_ms(void)
+{
+	return 0;
+}
+
 
 UT_DEFINE_GLOBALS();
 

@@ -144,6 +144,21 @@ int cluster_undo_segments_per_instance = 16;
  * check_GUC_init Assert (boot_val 与 C-var 初值不一致会触发 guc.c:4820 TRAP). */
 int cluster_boc_sweep_interval_ms = 100;
 
+/* PGRAC: spec-2.12 D1 — SCN cross-instance propagation lag bound.
+ *
+ *   Configuration bound (NOT enforcement action) — used by TAP 102 as
+ *   hard threshold for real cross-node propagation latency assertion.
+ *   In-process metric (scn_observe_staleness) is local proxy;  true
+ *   cross-node propagation lag requires NTP and is measured externally.
+ *
+ *   Q2.4 spec frozen: "propagation_lag" reflects ANY SCN propagation
+ *   (commit / abort advance / BOC tick / envelope piggyback),  NOT
+ *   only commit (spec-2.0 §469 original wording was inaccurate).
+ *
+ *   C-var init must match GUC default per check_GUC_init Assert
+ *   (spec-2.10 / spec-2.11 lesson inherited). */
+int cluster_scn_max_propagation_lag_ms = 5000;
+
 
 /*
  * cluster.enabled (Stage 1.11 Sprint B HC4 闭环; spec-1.11 D8).
@@ -834,6 +849,22 @@ cluster_init_guc(void)
 		 * 不动(LMON tick 1000ms 是 bottleneck per spec-2.10 §0 Q5 / §3.1).
 		 * Range 1..1000 保持. */
 		&cluster_boc_sweep_interval_ms, 100, 1, 1000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL, NULL);
+
+	/* PGRAC: spec-2.12 D1 — SCN cross-instance propagation lag bound.
+	 * Configuration only (no enforcement action — TAP 102 uses this as
+	 * hard threshold;  in-process metric is local staleness proxy). */
+	DefineCustomIntVariable(
+		"cluster.scn_max_propagation_lag_ms",
+		gettext_noop("SCN cross-instance propagation lag bound in milliseconds."),
+		gettext_noop("Configuration bound used by TAP convergence verification "
+					 "tests and future Hardening alarms.  In-process metric is "
+					 "scn_observe_staleness (local proxy via "
+					 "pg_cluster_state.scn.scn_seconds_since_last_observe);  "
+					 "true cross-node propagation lag requires NTP and is "
+					 "measured externally by TAP 102.  Range covers 0.1s "
+					 "tight assertions to 60s WAN-tolerant deployments."),
+		&cluster_scn_max_propagation_lag_ms, 5000, 100, 60000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
+		NULL);
 
 	DefineCustomBoolVariable(
 		"cluster.enabled",

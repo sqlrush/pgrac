@@ -191,10 +191,19 @@ void
 LWLockRelease(LWLock *l pg_attribute_unused())
 {}
 
+/*
+ * spec-2.12 D6 / T-scn-16d:  GetCurrentTimestamp stub now backed by
+ * a writable test_clock_us global.  Default 0 preserves spec-1.X /
+ * 2.X test semantics (existing tests do not set the global);
+ * T-scn-16d sets test_clock_us before each cluster_scn_observe call
+ * to drive deterministic max_gap_ms transitions.
+ */
+TimestampTz test_clock_us = 0;
+
 TimestampTz
 GetCurrentTimestamp(void)
 {
-	return 0;
+	return test_clock_us;
 }
 
 NodeId cluster_node_id = 0; /* GUC backing store mock */
@@ -738,6 +747,108 @@ UT_TEST(test_spec211_commit_lookup_defer_count_linkable)
 }
 
 /*
+ * spec-2.12 D6 T-scn-16:  SCN convergence boundary verification.
+ *
+ *	5 tests per spec-2.12 v0.3 Q4.3 + P1.1/P2.1 修正:
+ *	  T-scn-16a: GUC C-var cluster_scn_max_propagation_lag_ms == 5000
+ *	  T-scn-16b: 2 accessor 符号 linkable
+ *	  T-scn-16c: 真行为 single observe — first observe sets
+ *	             last_observe_at > 0, max_gap_ms still 0 (no prev to diff)
+ *	  T-scn-16d: 真行为 max_gap update via 可控 test_clock_us + 显式递增
+ *	             remote SCN (P2.1 fix:cluster_scn_observe 仅在
+ *	             cur > remote 不成立时 CAS bump,必须 ascending)
+ *	  T-scn-16e: L106 lock-free invariant + L104 cross-module stub
+ *	             (隐式 — accessors 都已 atomic_read,T-scn-15c init 路径
+ *	             也 already 测过 ShmemInitStruct P1.2 union pattern)
+ */
+
+extern TimestampTz test_clock_us; /* defined above as GetCurrentTimestamp backing */
+
+/*
+ * spec-2.11 P1.2 lesson inherited:  真 GUC default 验证移到 TAP 102 L3
+ * (stub-GUC == stub-value 在 unit 测无意义);unit test 只验 metric 真行为.
+ * 故 T-scn-16a (GUC default) 不在 unit test 实装.
+ */
+
+UT_TEST(test_spec212_last_observe_at_accessor_linkable)
+{
+	UT_ASSERT_NOT_NULL((void *)cluster_scn_last_observe_at);
+}
+
+UT_TEST(test_spec212_observed_max_observe_gap_accessor_linkable)
+{
+	UT_ASSERT_NOT_NULL((void *)cluster_scn_observed_max_observe_gap_ms);
+}
+
+UT_TEST(test_spec212_single_observe_real_behavior)
+{
+	/* P1.2 fix 模式:  init shmem then drive one observe with controllable
+	 * test_clock_us;  assert last_observe_at_us reflects clock value +
+	 * max_gap remains 0 (first observe — no prev_ts to diff). */
+	TimestampTz observe_t;
+
+	cluster_scn_shmem_init();
+
+	/* baseline:  fresh state */
+	UT_ASSERT_EQ((uint64)cluster_scn_last_observe_at(), (uint64)0);
+	UT_ASSERT_EQ(cluster_scn_observed_max_observe_gap_ms(), (uint64)0);
+
+	/* drive 1 observe at t=1_000_000us (1ms;trivial nonzero) */
+	test_clock_us = (TimestampTz)1000000;
+	cluster_scn_observe((SCN)100);
+	observe_t = cluster_scn_last_observe_at();
+
+	UT_ASSERT_EQ((uint64)observe_t, (uint64)1000000);
+	/* first observe — no prev → max_gap still 0 */
+	UT_ASSERT_EQ(cluster_scn_observed_max_observe_gap_ms(), (uint64)0);
+
+	/* cleanup global clock */
+	test_clock_us = 0;
+}
+
+UT_TEST(test_spec212_max_gap_update_ascending_remote_scn)
+{
+	/* spec-2.12 Q4.4-P1 + P2.1 真验位置:max_gap_ms atomic-max update
+	 * 行为唯一可控测试位置(TAP 102 不能 assert max_gap 上界).
+	 *
+	 *	Sequence (TimestampTz in microseconds;  delta_ms = delta_us/1000;
+	 *	ascending remote SCN per P2.1 fix):
+	 *	  T=1_000us  (1ms),  observe(SCN=200):  first → max_gap stays 0
+	 *	  T=4_000us  (4ms),  observe(SCN=300):  Δ=3000us=3ms → max_gap=3
+	 *	  T=5_000us  (5ms),  observe(SCN=400):  Δ=1ms < 3 → unchanged
+	 *	  T=10_000us (10ms), observe(SCN=500):  Δ=5ms > 3 → max_gap=5
+	 *
+	 *	Each remote SCN > prev cluster_scn current_local (since previous
+	 *	observe bumped current_local to remote+1);  cluster_scn_observe
+	 *	CAS bump succeeds → metric update fires.
+	 */
+	cluster_scn_shmem_init();
+
+	/* Step 1:  T=1ms, observe SCN=200 (first → max_gap stays 0) */
+	test_clock_us = (TimestampTz)1000;
+	cluster_scn_observe((SCN)200);
+	UT_ASSERT_EQ(cluster_scn_observed_max_observe_gap_ms(), (uint64)0);
+
+	/* Step 2:  T=4ms, observe SCN=300 (Δ=3ms → max_gap=3) */
+	test_clock_us = (TimestampTz)4000;
+	cluster_scn_observe((SCN)300);
+	UT_ASSERT_EQ(cluster_scn_observed_max_observe_gap_ms(), (uint64)3);
+
+	/* Step 3:  T=5ms, observe SCN=400 (Δ=1ms < 3 → unchanged) */
+	test_clock_us = (TimestampTz)5000;
+	cluster_scn_observe((SCN)400);
+	UT_ASSERT_EQ(cluster_scn_observed_max_observe_gap_ms(), (uint64)3);
+
+	/* Step 4:  T=10ms, observe SCN=500 (Δ=5ms > 3 → max_gap=5) */
+	test_clock_us = (TimestampTz)10000;
+	cluster_scn_observe((SCN)500);
+	UT_ASSERT_EQ(cluster_scn_observed_max_observe_gap_ms(), (uint64)5);
+
+	/* cleanup global clock */
+	test_clock_us = 0;
+}
+
+/*
  * spec-1.18 symbol-linkable smoke tests.
  *
  *	Real semantics (commit_scn round-tripping through xl_xact_scn,
@@ -814,7 +925,7 @@ UT_TEST(test_spec29_boc_broadcast_msg_type_enum_value)
 int
 main(void)
 {
-	UT_PLAN(37);
+	UT_PLAN(41);
 
 	/* Stage 1.4 stub (5) */
 	UT_RUN(test_scn_typedef_size_is_8_bytes);
@@ -877,6 +988,17 @@ main(void)
 	UT_RUN(test_spec211_lookup_result_enum_invariant);
 	UT_RUN(test_spec211_lookup_stub_real_behavior);
 	UT_RUN(test_spec211_commit_lookup_defer_count_linkable);
+
+	/* spec-2.12 D6 SCN convergence boundary verification (5) — T-scn-16
+	 * b/c/d/e:  2 accessor linkable + single observe real behavior +
+	 * max_gap update via 可控 test_clock_us + 显式递增 remote SCN (P2.1
+	 * fix:cluster_scn_observe lock-free CAS only bumps when cur > remote
+	 * 不成立).  T-scn-16a (GUC default) 真验证移到 TAP 102 L3 SHOW parse
+	 * (spec-2.11 P1.2 lesson:stub-GUC == stub-value 在 unit 测无意义). */
+	UT_RUN(test_spec212_last_observe_at_accessor_linkable);
+	UT_RUN(test_spec212_observed_max_observe_gap_accessor_linkable);
+	UT_RUN(test_spec212_single_observe_real_behavior);
+	UT_RUN(test_spec212_max_gap_update_ascending_remote_scn);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

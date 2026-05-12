@@ -709,6 +709,30 @@ dump_scn(ReturnSetInfo *rsinfo)
 		 * this counter.  See spec-2.11 §2.2 + §3.0 I1. */
 		emit_row(rsinfo, "scn", "scn_commit_lookup_defer_count",
 				 fmt_int64((int64)cluster_scn_commit_lookup_defer_count()));
+
+		/* PGRAC: spec-2.12 D5 — SCN convergence boundary verification
+		 * metric (3 rows):  last_observe_at + seconds_since_last_observe
+		 * (derived) + observed_max_observe_gap_ms.  See spec-2.12 §2.5. */
+		{
+			TimestampTz last_obs = cluster_scn_last_observe_at();
+
+			emit_row(rsinfo, "scn", "scn_last_observe_at",
+					 last_obs == 0 ? "(unset)" : pstrdup(timestamptz_to_str(last_obs)));
+
+			if (last_obs == 0) {
+				emit_row(rsinfo, "scn", "scn_seconds_since_last_observe", "(unset)");
+			} else {
+				TimestampTz now_ts = GetCurrentTimestamp();
+				double seconds = (now_ts - last_obs) / 1000000.0;
+				char buf[32];
+
+				snprintf(buf, sizeof(buf), "%.3f", seconds);
+				emit_row(rsinfo, "scn", "scn_seconds_since_last_observe", pstrdup(buf));
+			}
+
+			emit_row(rsinfo, "scn", "scn_observed_max_observe_gap_ms",
+					 fmt_int64((int64)cluster_scn_observed_max_observe_gap_ms()));
+		}
 	}
 }
 
