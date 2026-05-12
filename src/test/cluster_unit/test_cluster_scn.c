@@ -749,17 +749,16 @@ UT_TEST(test_spec211_commit_lookup_defer_count_linkable)
 /*
  * spec-2.12 D6 T-scn-16:  SCN convergence boundary verification.
  *
- *	5 tests per spec-2.12 v0.3 Q4.3 + P1.1/P2.1 修正:
- *	  T-scn-16a: GUC C-var cluster_scn_max_propagation_lag_ms == 5000
- *	  T-scn-16b: 2 accessor 符号 linkable
- *	  T-scn-16c: 真行为 single observe — first observe sets
+ *	4 unit tests per spec-2.12 v0.3 Q4.3 + P1.1/P2.1 修正:
+ *	  T-scn-16a: 2 accessor 符号 linkable
+ *	  T-scn-16b: 真行为 single observe — first observe sets
  *	             last_observe_at > 0, max_gap_ms still 0 (no prev to diff)
- *	  T-scn-16d: 真行为 max_gap update via 可控 test_clock_us + 显式递增
+ *	  T-scn-16c: 真行为 max_gap update via 可控 test_clock_us + 显式递增
  *	             remote SCN (P2.1 fix:cluster_scn_observe 仅在
  *	             cur > remote 不成立时 CAS bump,必须 ascending)
- *	  T-scn-16e: L106 lock-free invariant + L104 cross-module stub
- *	             (隐式 — accessors 都已 atomic_read,T-scn-15c init 路径
- *	             也 already 测过 ShmemInitStruct P1.2 union pattern)
+ *	  T-scn-16d: L106 lock-free invariant + L104 cross-module stub
+ *	             (隐式 — accessors 都已 atomic_read;test_cluster_debug.c
+ *	             提供 cross-module accessor stubs)
  */
 
 extern TimestampTz test_clock_us; /* defined above as GetCurrentTimestamp backing */
@@ -811,38 +810,50 @@ UT_TEST(test_spec212_max_gap_update_ascending_remote_scn)
 	/* spec-2.12 Q4.4-P1 + P2.1 真验位置:max_gap_ms atomic-max update
 	 * 行为唯一可控测试位置(TAP 102 不能 assert max_gap 上界).
 	 *
-	 *	Sequence (TimestampTz in microseconds;  delta_ms = delta_us/1000;
-	 *	ascending remote SCN per P2.1 fix):
-	 *	  T=1_000us  (1ms),  observe(SCN=200):  first → max_gap stays 0
-	 *	  T=4_000us  (4ms),  observe(SCN=300):  Δ=3000us=3ms → max_gap=3
-	 *	  T=5_000us  (5ms),  observe(SCN=400):  Δ=1ms < 3 → unchanged
-	 *	  T=10_000us (10ms), observe(SCN=500):  Δ=5ms > 3 → max_gap=5
+	 *	Sequence uses the existing last_observe_at as base so the test does
+	 *	not depend on prior test ordering or a fresh shmem buffer:
+	 *	  Δ=(base_gap+3)ms, observe(SCN=200): max_gap grows to target
+	 *	  Δ=1ms,            observe(SCN=300): max_gap unchanged
+	 *	  Δ=(target+5)ms,   observe(SCN=400): max_gap grows again
 	 *
 	 *	Each remote SCN > prev cluster_scn current_local (since previous
 	 *	observe bumped current_local to remote+1);  cluster_scn_observe
 	 *	CAS bump succeeds → metric update fires.
 	 */
+	TimestampTz base_ts;
+	uint64 base_gap;
+	uint64 target_gap;
+	uint64 larger_gap;
+
 	cluster_scn_shmem_init();
 
-	/* Step 1:  T=1ms, observe SCN=200 (first → max_gap stays 0) */
-	test_clock_us = (TimestampTz)1000;
+	base_ts = cluster_scn_last_observe_at();
+	base_gap = cluster_scn_observed_max_observe_gap_ms();
+	if (base_ts == 0) {
+		test_clock_us = (TimestampTz)1000000;
+		cluster_scn_observe((SCN)100);
+		base_ts = cluster_scn_last_observe_at();
+		base_gap = cluster_scn_observed_max_observe_gap_ms();
+	}
+	UT_ASSERT(base_ts != 0);
+
+	target_gap = base_gap + 3;
+	larger_gap = target_gap + 5;
+
+	/* Step 1: grow max_gap beyond whatever prior tests left behind. */
+	test_clock_us = base_ts + (TimestampTz)(target_gap * 1000);
 	cluster_scn_observe((SCN)200);
-	UT_ASSERT_EQ(cluster_scn_observed_max_observe_gap_ms(), (uint64)0);
+	UT_ASSERT_EQ(cluster_scn_observed_max_observe_gap_ms(), target_gap);
 
-	/* Step 2:  T=4ms, observe SCN=300 (Δ=3ms → max_gap=3) */
-	test_clock_us = (TimestampTz)4000;
+	/* Step 2:  Δ=1ms < target_gap → max_gap unchanged. */
+	test_clock_us += (TimestampTz)1000;
 	cluster_scn_observe((SCN)300);
-	UT_ASSERT_EQ(cluster_scn_observed_max_observe_gap_ms(), (uint64)3);
+	UT_ASSERT_EQ(cluster_scn_observed_max_observe_gap_ms(), target_gap);
 
-	/* Step 3:  T=5ms, observe SCN=400 (Δ=1ms < 3 → unchanged) */
-	test_clock_us = (TimestampTz)5000;
+	/* Step 3:  larger Δ updates atomic-max again. */
+	test_clock_us += (TimestampTz)(larger_gap * 1000);
 	cluster_scn_observe((SCN)400);
-	UT_ASSERT_EQ(cluster_scn_observed_max_observe_gap_ms(), (uint64)3);
-
-	/* Step 4:  T=10ms, observe SCN=500 (Δ=5ms > 3 → max_gap=5) */
-	test_clock_us = (TimestampTz)10000;
-	cluster_scn_observe((SCN)500);
-	UT_ASSERT_EQ(cluster_scn_observed_max_observe_gap_ms(), (uint64)5);
+	UT_ASSERT_EQ(cluster_scn_observed_max_observe_gap_ms(), larger_gap);
 
 	/* cleanup global clock */
 	test_clock_us = 0;

@@ -723,9 +723,14 @@ dump_scn(ReturnSetInfo *rsinfo)
 				emit_row(rsinfo, "scn", "scn_seconds_since_last_observe", "(unset)");
 			} else {
 				TimestampTz now_ts = GetCurrentTimestamp();
-				double seconds = (now_ts - last_obs) / 1000000.0;
+				double seconds;
 				char buf[32];
 
+				/* Wall-clock steps can move GetCurrentTimestamp() behind a
+				 * previously recorded observe timestamp.  This is an
+				 * observability row, so clamp to zero rather than exposing a
+				 * negative "seconds since" value. */
+				seconds = now_ts > last_obs ? (now_ts - last_obs) / 1000000.0 : 0.0;
 				snprintf(buf, sizeof(buf), "%.3f", seconds);
 				emit_row(rsinfo, "scn", "scn_seconds_since_last_observe", pstrdup(buf));
 			}

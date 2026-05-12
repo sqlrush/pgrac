@@ -840,7 +840,7 @@ cluster_init_guc(void)
 					 "cluster.boc_sweep_interval_ms.  Used for last_advance_at "
 					 "timestamp refresh, wraparound watermark check, and Stage 2+ "
 					 "cross-node broadcast pulse.  Actual frequency is bounded by "
-					 "Min(WalWriterDelay, this); set wal_writer_delay below this "
+					 "Max(WalWriterDelay, this); set wal_writer_delay below this "
 					 "value if you want sub-200ms BOC.  100us-class precision "
 					 "needs a future high-frequency-timing spec."),
 		/* PGRAC: spec-2.10 D1 — default 1 → 100ms.  spec-2.9 skeleton phase

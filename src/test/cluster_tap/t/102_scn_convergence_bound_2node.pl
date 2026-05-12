@@ -113,6 +113,16 @@ sub poll_query_elapsed
 }
 
 
+sub scn_counter
+{
+	my ($node, $key) = @_;
+
+	return $node->safe_psql('postgres',
+		"SELECT value::bigint FROM pg_cluster_state "
+			. "WHERE category='scn' AND key='$key'");
+}
+
+
 # ----------
 # Helper:  one bidirectional round.  Advance source past receiver's
 #	current_local before issuing commit (P2.2 fix), then poll receiver
@@ -124,26 +134,43 @@ sub run_one_round
 	my ($source, $receiver, $round_label, $hard_timeout_ms) = @_;
 
 	# Pre-snapshot on receiver (dual condition baseline per P2.2).
-	my $recv_pre_remote = $receiver->safe_psql('postgres',
-		"SELECT value::bigint FROM pg_cluster_state "
-		. "WHERE category='scn' AND key='scn_max_observed_remote'");
-	my $recv_pre_bump = $receiver->safe_psql('postgres',
-		"SELECT value::bigint FROM pg_cluster_state "
-		. "WHERE category='scn' AND key='scn_observe_bump_count'");
+	my $recv_pre_bump = scn_counter($receiver, 'scn_observe_bump_count');
+	my $recv_current = scn_counter($receiver, 'scn_current_local');
+	my $source_current = scn_counter($source, 'scn_current_local');
+	my $insert_count = 1;
 
-	# Source advance:  a single short DDL commits a real SCN advance.
-	# Each round uses a unique table name to avoid collisions across
-	# rounds.
+	# Keep this test robust when the receiver is already ahead after a
+	# reverse round.  Advance source enough times so the final source
+	# current_local is strictly greater than the receiver current_local
+	# captured before this round.
+	if ($source_current <= $recv_current)
+	{
+		$insert_count = ($recv_current - $source_current) + 1;
+	}
+
+	# Source advance: each round uses a unique table name to avoid collisions
+	# across rounds.  CREATE + INSERT loop + DROP gives enough committed SCN
+	# advances to put source past receiver before the final observed target.
 	my $table = "t_scn102_${round_label}";
 	$source->safe_psql('postgres', "CREATE TABLE $table(x int)");
+	for my $i (1 .. $insert_count)
+	{
+		$source->safe_psql('postgres', "INSERT INTO $table VALUES ($i)");
+	}
 	$source->safe_psql('postgres', "DROP TABLE $table");
+	my $source_after = scn_counter($source, 'scn_current_local');
+
+	diag("round $round_label source did not advance past receiver "
+			. "(source_before=$source_current receiver_before=$recv_current "
+			. "source_after=$source_after insert_count=$insert_count)")
+		if $source_after <= $recv_current;
 
 	# Poll receiver for dual condition (P2.2):  both bump_count > prior
-	# AND max_observed_remote > prior.  Either alone could be coincidence
-	# from a prior round still draining; together they prove THIS round's
-	# observe fired.
+	# AND max_observed_remote >= this round's final source current_local.
+	# Either alone could be coincidence from a prior round still draining;
+	# together they prove THIS round's final observed target arrived.
 	my $hard_s = $hard_timeout_ms / 1000.0;
-	my $dual_q = "SELECT (b > $recv_pre_bump) AND (r > $recv_pre_remote) FROM ("
+	my $dual_q = "SELECT (b > $recv_pre_bump) AND (r >= $source_after) FROM ("
 		. "  SELECT"
 		. "    (SELECT value::bigint FROM pg_cluster_state "
 		. "       WHERE category='scn' AND key='scn_observe_bump_count') AS b,"
