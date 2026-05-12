@@ -1423,7 +1423,38 @@ cluster_ic_tier1_continue_hello_recv(int anon_slot, int peer_fd, int32 *out_lear
 
 	/* Full HELLO assembled; parse + verify. */
 	if (!cluster_ic_parse_hello(tier1_anon_hello_buf[anon_slot], &msg)) {
-		ereport(LOG, (errmsg("cluster_ic tier1 HELLO bad magic on anon slot %d", anon_slot)));
+		/*
+		 * spec-2.13 Hardening v1.0.2 diagnostic instrumentation (L66-family
+		 * root-cause investigation):  when HELLO parse fails, dump the
+		 * actual wire bytes + connection metadata so we can distinguish
+		 * (a) PG startup-packet串线 / (b) HTTP probe / (c) old HELLO
+		 * version / (d) partial-recv accumulator bug / (e) memory
+		 * corruption / (f) other process串线.  Remove after root cause
+		 * pinpointed.
+		 */
+		{
+			struct sockaddr_in peer_sa;
+			socklen_t peer_sa_len = sizeof(peer_sa);
+			char peer_ip[INET_ADDRSTRLEN] = "?";
+			int peer_port = -1;
+			const uint8 *b = tier1_anon_hello_buf[anon_slot];
+			const char *self_name
+				= (ClusterConfShmem != NULL) ? ClusterConfShmem->cluster_name : "(no-conf)";
+
+			if (getpeername(peer_fd, (struct sockaddr *)&peer_sa, &peer_sa_len) == 0) {
+				if (inet_ntop(AF_INET, &peer_sa.sin_addr, peer_ip, sizeof(peer_ip)) == NULL)
+					strcpy(peer_ip, "?");
+				peer_port = ntohs(peer_sa.sin_port);
+			}
+			ereport(LOG,
+					(errmsg("cluster_ic tier1 HELLO bad magic on anon slot %d "
+							"(fd=%d peer=%s:%d cluster_name=\"%s\" accum_len=%d "
+							"hex[0..15]=%02x %02x %02x %02x %02x %02x %02x %02x "
+							"%02x %02x %02x %02x %02x %02x %02x %02x)",
+							anon_slot, peer_fd, peer_ip, peer_port, self_name,
+							tier1_anon_hello_len[anon_slot], b[0], b[1], b[2], b[3], b[4], b[5],
+							b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15])));
+		}
 		return false;
 	}
 

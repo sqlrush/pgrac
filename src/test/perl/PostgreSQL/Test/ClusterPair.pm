@@ -189,6 +189,20 @@ sub start_pair
 	my ($self, %opts) = @_;
 	$self->{node0}->start(%opts);
 	$self->{node1}->start(%opts);
+
+	# spec-2.13 Hardening v1.0.2 diagnostic instrumentation
+	# (L66-family HELLO bad magic root-cause investigation).
+	# Dump configured IC ports + PG ports + cluster_name so failure-
+	# postmortem can correlate getpeername() observed in C-side dump
+	# with TAP-time configured ports.  Cheap printf-class diag.
+	my $name = $self->{cluster_name} // '(unknown)';
+	my $pg0  = $self->{node0}->port;
+	my $pg1  = $self->{node1}->port;
+	my $ic0  = $self->{ic_ports}[0] // -1;
+	my $ic1  = $self->{ic_ports}[1] // -1;
+	Test::More::note(
+		"ClusterPair started: cluster_name='$name' "
+		. "node0=pg:$pg0/ic:$ic0 node1=pg:$pg1/ic:$ic1");
 	return;
 }
 
@@ -251,12 +265,50 @@ sub wait_for_peer_state
 	$timeout_s //= 10;
 	my $node = $from == 0 ? $self->{node0} : $self->{node1};
 	my $deadline = time + $timeout_s;
+	my $last_state = '(never-queried)';
 	while (time < $deadline)
 	{
 		my $state = $node->safe_psql('postgres',
 			"SELECT state FROM pg_cluster_ic_peers WHERE node_id = $to");
+		$last_state = $state // '(null)';
 		return 1 if defined $state && $state eq $expected_state;
 		select(undef, undef, undef, 0.25);
+	}
+
+	# spec-2.13 Hardening v1.0.2 diagnostic instrumentation
+	# (L66-family HELLO bad magic root-cause investigation).
+	# On timeout, dump full pg_cluster_ic_peers from BOTH sides + tail
+	# of both postmaster logs so we can correlate IC state machine
+	# with kernel-level connection state.
+	Test::More::diag(
+		"wait_for_peer_state TIMEOUT after ${timeout_s}s: from=node$from to=$to "
+		. "expected='$expected_state' last_observed='$last_state'");
+	for my $n (0, 1)
+	{
+		my $nm = $n == 0 ? $self->{node0} : $self->{node1};
+		my $peers = $nm->safe_psql(
+			'postgres',
+			q{SELECT node_id || '|state=' || state || }
+			. q{'|hb_send=' || heartbeat_send_count || }
+			. q{'|hb_recv=' || heartbeat_recv_count || }
+			. q{'|last_err=' || COALESCE(last_error_msg, '-') }
+			. q{FROM pg_cluster_ic_peers ORDER BY node_id});
+		Test::More::diag("  node$n pg_cluster_ic_peers:\n    "
+			. ($peers // '(query-failed)'));
+
+		# Tail postmaster log (last 40 lines).  Path via $node->logfile.
+		my $logfile = $nm->logfile;
+		if ($logfile && -r $logfile)
+		{
+			my @lines;
+			if (open my $fh, '<', $logfile)
+			{
+				while (<$fh>) { push @lines, $_; shift @lines if @lines > 40; }
+				close $fh;
+			}
+			Test::More::diag("  node$n postmaster log tail:\n"
+				. join('', map { "    $_" } @lines));
+		}
 	}
 	return 0;
 }
