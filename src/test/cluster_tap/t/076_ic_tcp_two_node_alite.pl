@@ -7,7 +7,7 @@
 #
 # Test matrix (8 L#):
 #   L1 ClusterPair start_pair OK -- both postmasters live, no FATAL
-#   L2 peer.state = connected on both sides (within 10s)
+#   L2 peer.state = connected on both sides (within 30s)
 #   L3 heartbeat_send_count > 0 on both sides (active connector low-id
 #      and passive accepter high-id, per §3.5 mesh role)
 #   L4 heartbeat_recv_count > 0 on both sides
@@ -51,12 +51,12 @@ use Test::More;
 	is($pair->node1->safe_psql('postgres', 'SELECT 1'), '1',
 		'L1 node1 postmaster accepts SQL after tier1 startup');
 
-	# L2 -- peer.state = connected on both sides (10s deadline; default
+	# L2 -- peer.state = connected on both sides (30s deadline; default
 	# heartbeat interval = 1s, default connect_timeout = 5s).
 	ok($pair->wait_for_peer_state(0, 1, 'connected', 30),
-		'L2 node0 sees peer node1 in state=connected within 10s');
+		'L2 node0 sees peer node1 in state=connected within 30s');
 	ok($pair->wait_for_peer_state(1, 0, 'connected', 30),
-		'L2 node1 sees peer node0 in state=connected within 10s');
+		'L2 node1 sees peer node0 in state=connected within 30s');
 
 	# L3 -- heartbeat_send_count > 0 on both (gives at least 2s for
 	# 1Hz heartbeat to fire after connected).  Default interval = 1s.
@@ -142,7 +142,7 @@ use Test::More;
 # L7: startup non-deadlock -- node0 must not block on missing peer.
 #
 # Per spec-2.2 §3.8 hard invariant: LMON READY does NOT depend on any
-# peer being reachable.  We start node0 alone, wait 10s, then start
+# peer being reachable.  We start node0 alone, wait 5s, then start
 # node1; node0 must accept SQL throughout (postmaster up + LMON ready).
 # ============================================================
 {

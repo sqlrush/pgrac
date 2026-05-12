@@ -8,7 +8,7 @@
 #   L1 ClusterPair start_pair OK -- both postmasters live (smoke
 #      that envelope wire pivot did not break startup; relies on
 #      076 for full HELLO + connected coverage)
-#   L2 peer.state = connected on both sides within 10s + heartbeat
+#   L2 peer.state = connected on both sides within 30s + heartbeat
 #      counts grow (sanity that envelope traffic actually flows)
 #   L3 bytes_send / bytes_recv match envelope frame size: after the
 #      one-time 64-byte HELLO, every heartbeat is exactly 36 bytes;
@@ -66,9 +66,9 @@ my $ENVELOPE_BYTES = 36;
 	# at least 2 heartbeats sent each direction.
 	# ============================================================
 	ok($pair->wait_for_peer_state(0, 1, 'connected', 30),
-		'L2 node0 sees node1 connected within 10s (envelope wire)');
+		'L2 node0 sees node1 connected within 30s (envelope wire)');
 	ok($pair->wait_for_peer_state(1, 0, 'connected', 30),
-		'L2 node1 sees node0 connected within 10s (envelope wire)');
+		'L2 node1 sees node0 connected within 30s (envelope wire)');
 
 	sleep 3;
 
