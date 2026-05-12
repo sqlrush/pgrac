@@ -76,6 +76,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_diag.h"  /* cluster_diag_status (spec-1.13 D12) */
 #include "cluster/cluster_lck.h"   /* cluster_lck_status (spec-1.12 D12) */
 #include "cluster/cluster_scn.h"   /* cluster_scn_current (spec-1.15 D6) */
+#include "cluster/cluster_ges.h"   /* cluster_ges_{request,reply}_defer_count (spec-2.13 D4) */
 #include "cluster/cluster_cssd.h"  /* cluster_cssd_status (spec-2.5 D12) */
 #include "cluster/cluster_stats.h" /* cluster_stats_status (spec-1.14 D12) */
 #include "cluster/cluster_lmon.h"  /* cluster_lmon_status (spec-1.11 Sprint B D12) */
@@ -743,6 +744,30 @@ dump_scn(ReturnSetInfo *rsinfo)
 
 
 /*
+ * dump_ges -- spec-2.13 D4 GES protocol skeleton observability.
+ *
+ *	Emits 2 rows under category='ges':
+ *	  - ges_request_defer_count:  bumped on every GES_REQUEST handler
+ *	    stub call (永远 DEFER per Q4.1).
+ *	  - ges_reply_defer_count:    bumped on every GES_REPLY handler
+ *	    stub call.
+ *
+ *	Skeleton phase (spec-2.13 ship):  no caller-side send (Q4.2 NONE
+ *	producer_mask),  so both counters stay 0 in production.  Future
+ *	spec-2.14+ caller-side bumps these on real GES traffic;  spec-2.15+
+ *	splits them per state (GRANTED / WAITING / CONVERTING / DEADLOCK).
+ */
+static void
+dump_ges(ReturnSetInfo *rsinfo)
+{
+	emit_row(rsinfo, "ges", "ges_request_defer_count",
+			 fmt_int64((int64)cluster_ges_request_defer_count()));
+	emit_row(rsinfo, "ges", "ges_reply_defer_count",
+			 fmt_int64((int64)cluster_ges_reply_defer_count()));
+}
+
+
+/*
  * dump_shared_fs -- Stage 1.1 cluster_shared_fs runtime state.
  *
  *	Emits two rows: the active backend's name (or "(none)" if init has
@@ -915,6 +940,7 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		dump_cluster_stats(rsinfo);
 		dump_cluster_cssd(rsinfo);
 		dump_scn(rsinfo);
+		dump_ges(rsinfo);
 	}
 #else
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

@@ -484,6 +484,22 @@ void
 cluster_reconfig_lmon_tick(void)
 {}
 
+/* spec-2.13 D8 / L104 stubs: cluster_lmon.c registers 2 GES handler
+ * function pointers (cluster_ges_{request,reply}_handler) into the
+ * ICMsgType registry in postmaster phase 1.  test_cluster_lmon
+ * standalone binary doesn't link cluster_ges.o, so symbols need
+ * vacuous stubs to satisfy the linker.  Real handler behavior
+ * verified by test_cluster_ges T-ges-1 a/b/c/d/e. */
+void
+cluster_ges_request_handler(const ClusterICEnvelope *env pg_attribute_unused(),
+							const void *payload pg_attribute_unused())
+{}
+
+void
+cluster_ges_reply_handler(const ClusterICEnvelope *env pg_attribute_unused(),
+						  const void *payload pg_attribute_unused())
+{}
+
 
 UT_DEFINE_GLOBALS();
 

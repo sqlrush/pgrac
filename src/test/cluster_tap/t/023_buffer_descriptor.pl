@@ -135,8 +135,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_cluster_shmem'),
-   '16',
-   'L10 spec-2.6 Sprint A Step 1 baseline: pg_cluster_shmem 16 rows (1.12 baseline 6 + 1.13 diag + 1.14 stats + 1.15 scn + 2.2 cluster_ic_tier1 + 2.4 cluster_epoch + 2.5 cluster_cssd + 2.7 cluster_smgr + 2.6 cluster_qvotec + 2.29 cluster_reconfig)');
+   '17',
+   'L10 spec-2.13 Sprint A Step 1 baseline: pg_cluster_shmem 17 rows (16 prior + 2.13 cluster_ges)');
 
 
 # ----------
@@ -156,8 +156,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT category) FROM pg_cluster_state}),
-   '17',
-   'L12 pg_cluster_state has 17 distinct categories (15 from 1.14 + scn 1.15)');
+   '18',
+   'L12 pg_cluster_state has 18 distinct categories (17 prior + ges spec-2.13)');
 
 
 # ----------
@@ -220,7 +220,7 @@ is($node->safe_psql('postgres',
 my $smoke_categories = $node->safe_psql(
 	'postgres',
 	q{SELECT count(DISTINCT category) FROM pg_cluster_state});
-is($smoke_categories, '17', 'L16 cluster_smoke surface integrates buffer_format + pcm + lmon + lck + diag + cluster_stats + scn (17 categories)');
+is($smoke_categories, '18', 'L16 cluster_smoke surface integrates buffer_format + pcm + lmon + lck + diag + cluster_stats + scn + ges (18 categories;spec-2.13 added ges)');
 
 
 # ----------

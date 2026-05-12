@@ -859,6 +859,21 @@ cluster_scn_observed_max_observe_gap_ms(void)
 	return 0;
 }
 
+/* spec-2.13 D8 / L104 stubs: cluster_debug dump_ges references 2 new
+ * spec-2.13 cluster_ges module accessors;  test_cluster_debug standalone
+ * binary doesn't link cluster_ges.o,  vacuous stubs. */
+uint64
+cluster_ges_request_defer_count(void)
+{
+	return 0;
+}
+
+uint64
+cluster_ges_reply_defer_count(void)
+{
+	return 0;
+}
+
 
 UT_DEFINE_GLOBALS();
 

@@ -359,6 +359,14 @@ void
 cluster_scn_shmem_register(void)
 {}
 
+/* spec-2.13 D8 / L104 stub: cluster_ges shmem region (real impl in
+ * cluster_ges.c).  cluster_shmem.c calls cluster_ges_shmem_register
+ * to register the "pgrac cluster ges" region; standalone unit test
+ * doesn't link cluster_ges.o. */
+void
+cluster_ges_shmem_register(void)
+{}
+
 /* spec-2.2 D3 stub: tier1 shmem region (real impl in cluster_ic_tier1.c). */
 void
 cluster_ic_tier1_shmem_register(void)

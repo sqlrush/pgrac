@@ -66,6 +66,7 @@
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_scn.h" /* cluster_scn_boc_broadcast_handler (spec-2.9 D1) */
+#include "cluster/cluster_ges.h" /* cluster_ges_{request,reply}_handler (spec-2.13 D3) */
 #include "utils/timestamp.h"
 #include "utils/wait_event.h" /* WAIT_EVENT_CLUSTER_BGPROC_LMON_MAIN_LOOP (1.11 Sprint B) */
 
@@ -245,6 +246,60 @@ cluster_lmon_shmem_init(void)
 
 			cluster_ic_register_msg_type(&boc_broadcast_info);
 			boc_broadcast_registered = true;
+		}
+	}
+
+	/*
+	 * spec-2.13 D3:  register PGRAC_IC_MSG_GES_REQUEST=4 and
+	 * PGRAC_IC_MSG_GES_REPLY=5 in postmaster phase 1.  Mirror BOC_BROADCAST
+	 * registration pattern above (static bool guard + struct literal).
+	 *
+	 * Skeleton phase (spec-2.13 ship):
+	 *   - allowed_producer_mask = CLUSTER_IC_PRODUCER_NONE (Q4.2 = D):
+	 *     this is the SKELETON防误发 default — NOT GES最终设计.
+	 *     spec-2.14 D1 第 1 件事 amend mask = CLUSTER_IC_PRODUCER_BACKEND
+	 *     when real caller-side send lands.  Do NOT inherit NONE as a
+	 *     permanent rule (spec-2.13 §3.2 + §10 explicit doc).
+	 *   - broadcast_ok = false:  GES request/reply are point-to-point,
+	 *     never broadcast.
+	 *   - handler:  stub永远 DEFER + atomic counter +1 + DEBUG2 log
+	 *     (cluster_ges_{request,reply}_handler in cluster_ges.c).
+	 *
+	 * Both msg_types registered in spec-2.13 (Q2=C: 2 个 wire ABI
+	 * 一次性 fixed) so spec-2.14/2.16 caller-side can直接调用 without
+	 * touching msg_type registration.
+	 */
+	{
+		static bool ges_request_registered = false;
+
+		if (!ges_request_registered) {
+			const ClusterICMsgTypeInfo ges_request_info = {
+				.msg_type = PGRAC_IC_MSG_GES_REQUEST,
+				.name = "ges_request",
+				.allowed_producer_mask = CLUSTER_IC_PRODUCER_NONE,
+				.broadcast_ok = false,
+				.handler = cluster_ges_request_handler,
+			};
+
+			cluster_ic_register_msg_type(&ges_request_info);
+			ges_request_registered = true;
+		}
+	}
+
+	{
+		static bool ges_reply_registered = false;
+
+		if (!ges_reply_registered) {
+			const ClusterICMsgTypeInfo ges_reply_info = {
+				.msg_type = PGRAC_IC_MSG_GES_REPLY,
+				.name = "ges_reply",
+				.allowed_producer_mask = CLUSTER_IC_PRODUCER_NONE,
+				.broadcast_ok = false,
+				.handler = cluster_ges_reply_handler,
+			};
+
+			cluster_ic_register_msg_type(&ges_reply_info);
+			ges_reply_registered = true;
 		}
 	}
 }
