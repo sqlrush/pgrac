@@ -475,6 +475,42 @@ tier1_send_bytes(int32 target_node_id, const void *buf, size_t len)
 		return CLUSTER_IC_SEND_HARD_ERROR; /* not connected */
 
 	/*
+	 * spec-2.13 Hardening v1.0.2 root-cause fix (L66-family真根因):
+	 * peer must be in CLUSTER_IC_PEER_CONNECTED state (HELLO handshake
+	 * completed both directions) before any envelope-class send.
+	 *
+	 *	Without this guard:  tier1_peer_fds[peer] becomes valid (>=0)
+	 *	the moment cluster_ic_tier1_connect_one() creates the socket,
+	 *	BEFORE finish_connect() / continue_hello_send() puts HELLO 64
+	 *	bytes on the wire.  Concurrent callers (CSSD outbound drain at
+	 *	cluster_lmon.c:984 — only guard is fd >= 0;  spec-2.5 v1.0.1 F2
+	 *	combined-send path) can race in this window and write an envelope
+	 *	frame (msg_type=11 CSSD_HEARTBEAT etc) to the socket BEFORE the
+	 *	HELLO bytes — node1's passive HELLO recv reads the envelope as
+	 *	the would-be HELLO,  parse_hello sees magic 0x4943 (envelope)
+	 *	instead of 0x4F4C4C48 (HELLO) → bad magic → close peer.  Loops
+	 *	every CSSD heartbeat tick (1Hz) until eventually a tick happens
+	 *	to fall after HELLO completes naturally on slow CI runners.
+	 *
+	 *	Observed wire hex (nightly run 25735044793, Ubuntu CI):
+	 *	  43 49 01 0b 00 00 00 00 01 00 00 00 ...
+	 *	  = envelope magic 0x4943 + version 1 + msg_type 11 (CSSD_HB)
+	 *	  + source_node_id=0 + dest_node_id=1 + epoch=0...
+	 *
+	 *	tier1_send_heartbeat (this file, line 1357-1362) already guards
+	 *	on state CONNECTED before calling cluster_ic_send_envelope.
+	 *	CSSD's outbound drain in cluster_lmon.c calls cluster_ic_send_bytes
+	 *	directly (combined env+payload single-buffer per L79), bypassing
+	 *	that guard.  Moving the guard inside tier1_send_bytes is the
+	 *	single defense for all caller paths (CSSD now + future GES /
+	 *	SCN_BROADCAST / SI / FENCE / RECONFIG that may share the same
+	 *	vtable path).
+	 */
+	if (Tier1Shmem == NULL
+		|| Tier1Shmem->peers[target_node_id].state != (int32)CLUSTER_IC_PEER_CONNECTED)
+		return CLUSTER_IC_SEND_WOULD_BLOCK; /* HELLO pending; caller retries */
+
+	/*
 	 * Hardening v1.0.1 F1 (spec-2.2 v1.0.1 + spec-2.3 v1.0.1 L68):
 	 * per-peer outbound buffer for partial writes.  If a previous send
 	 * for this peer left bytes pending, drain them first; only attempt
