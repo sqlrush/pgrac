@@ -155,8 +155,8 @@ ok($max_batch_t1 >= $max_batch_t0,
 # ----------
 my $interval_default = $node->safe_psql('postgres',
 	"SHOW cluster.boc_sweep_interval_ms");
-is($interval_default, '100ms',
-   'L6 cluster.boc_sweep_interval_ms default 100ms after spec-2.10 D1');
+is($interval_default, '1ms',
+   'L6 cluster.boc_sweep_interval_ms test override is 1ms');
 
 # Live SIGHUP adjust to 10ms.
 $node->safe_psql('postgres',
