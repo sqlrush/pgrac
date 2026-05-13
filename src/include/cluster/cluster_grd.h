@@ -159,7 +159,7 @@ extern bool cluster_grd_is_cluster_aware(const LOCKTAG *tag);
  *	  shard_for_hash (no counter increment).
  *	cluster_grd_lookup_master:  full lookup (shard_for_resource +
  *	  master[shard] + total counter + local-or-remote counter).
- *	  Returns master node_id.
+ *	  Returns master node_id, or -1 when the master map is not initialized.
  *	cluster_grd_shard_lookup:  thin compat wrapper.  Returns shard_id
  *	  + increments total counter only (does NOT read master, hence
  *	  does NOT increment local/remote counter).

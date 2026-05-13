@@ -3,18 +3,19 @@
  * test_cluster_grd.c
  *	  Standalone unit tests for spec-2.14 GRD routing substrate.
  *
- *	  T-grd-1 (6 tests, spec-2.14 D10):
+ *	  T-grd-1 (7 tests, spec-2.14 D10):
  *	    a) ClusterResId size 16 invariant + StaticAssertDecl 编译期 trigger
  *	    b) cluster_grd_resid_encode/decode roundtrip 4 LOCKTAG class
  *	    c) **真测 hash distribution uniform** — 16 golden vectors (lockmethodid
  *	       swapped → shard 变;field4 swapped → shard 不变) + 100k uniform
  *	       sample (max bucket / mean ≤ 2.0;NOT all-bucket-non-empty 概率
  *	       断言 — v0.4 P1 修正)
- *	    d) declared-node-aware master mapping sparse-node 场景(mock 3 节
+ *	    d) uninitialized master map returns -1, not zero-filled node 0
+ *	    e) declared-node-aware master mapping sparse-node 场景(mock 3 节
  *	       点 sparse 0/2/5 declared list verify);**v0.4 注解**:TAP 103
  *	       不做 2-node check,sparse-node coverage 由本 unit test 替代
- *	    e) is_local_master matrix(mock cluster_node_id 切换)
- *	    f) is_cluster_aware 分类 — 4 cluster-aware types true + 4 non-cluster
+ *	    f) is_local_master matrix(mock cluster_node_id 切换)
+ *	    g) is_cluster_aware 分类 — 4 cluster-aware types true + 4 non-cluster
  *	       types false(PAGE / TUPLE / RELATION_EXTEND / VIRTUALTRANSACTION)
  *
  *	  Stubs:
@@ -375,6 +376,34 @@ UT_TEST(test_grd_shard_lookup_hash_distribution_uniform)
 	UT_ASSERT(max_over_mean <= 2.0);
 }
 
+UT_TEST(test_grd_uninitialized_master_map_returns_unknown)
+{
+	ClusterResId resid;
+	uint64 before_total;
+	uint64 before_local;
+	uint64 before_remote;
+
+	cluster_grd_shmem_init();
+
+	memset(&resid, 0, sizeof(resid));
+	resid.field1 = 100;
+	resid.field2 = 200;
+	resid.type = LOCKTAG_RELATION;
+	resid.lockmethodid = 1;
+
+	before_total = cluster_grd_shard_lookup_count();
+	before_local = cluster_grd_local_master_lookup_count();
+	before_remote = cluster_grd_remote_master_lookup_count();
+
+	/* master[] is zero-filled before init; callers must see UNKNOWN, not node 0. */
+	UT_ASSERT_EQ(cluster_grd_shard_master(0), (int32)-1);
+	UT_ASSERT_EQ(cluster_grd_is_local_master(0), false);
+	UT_ASSERT_EQ(cluster_grd_lookup_master(&resid), (int32)-1);
+	UT_ASSERT_EQ(cluster_grd_shard_lookup_count(), before_total + 1);
+	UT_ASSERT_EQ(cluster_grd_local_master_lookup_count(), before_local);
+	UT_ASSERT_EQ(cluster_grd_remote_master_lookup_count(), before_remote);
+}
+
 UT_TEST(test_grd_master_map_sparse_declared_nodes)
 {
 	int32 sparse[] = { 0, 2, 5 };
@@ -466,11 +495,12 @@ UT_DEFINE_GLOBALS();
 int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(6);
+	UT_PLAN(7);
 
 	UT_RUN(test_grd_clusterresid_size_16);
 	UT_RUN(test_grd_resid_encode_decode_roundtrip);
 	UT_RUN(test_grd_shard_lookup_hash_distribution_uniform);
+	UT_RUN(test_grd_uninitialized_master_map_returns_unknown);
 	UT_RUN(test_grd_master_map_sparse_declared_nodes);
 	UT_RUN(test_grd_is_local_master_matrix);
 	UT_RUN(test_grd_is_cluster_aware_classification);

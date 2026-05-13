@@ -224,9 +224,12 @@ cluster_grd_lookup_master(const ClusterResId *resid)
 	Assert(cluster_grd_state != NULL);
 
 	shard_id = cluster_grd_shard_for_resource(resid);
-	master = (int32)pg_atomic_read_u32(&cluster_grd_state->master[shard_id]);
-
 	pg_atomic_fetch_add_u64(&cluster_grd_state->shard_lookup_count, 1);
+
+	if (pg_atomic_read_u32(&cluster_grd_state->master_map_initialized) == 0)
+		return -1;
+
+	master = (int32)pg_atomic_read_u32(&cluster_grd_state->master[shard_id]);
 	if (master == cluster_node_id)
 		pg_atomic_fetch_add_u64(&cluster_grd_state->local_master_lookup_count, 1);
 	else
@@ -265,13 +268,17 @@ cluster_grd_shard_master(uint32 shard_id)
 	Assert(cluster_grd_state != NULL);
 	if (shard_id >= PGRAC_GRD_SHARD_COUNT)
 		return -1;
+	if (pg_atomic_read_u32(&cluster_grd_state->master_map_initialized) == 0)
+		return -1;
 	return (int32)pg_atomic_read_u32(&cluster_grd_state->master[shard_id]);
 }
 
 bool
 cluster_grd_is_local_master(uint32 shard_id)
 {
-	return cluster_grd_shard_master(shard_id) == cluster_node_id;
+	int32 master = cluster_grd_shard_master(shard_id);
+
+	return master >= 0 && master == cluster_node_id;
 }
 
 void
@@ -290,7 +297,13 @@ cluster_grd_master_map_init(void)
 		if (cluster_conf_lookup_node(i) != NULL)
 			declared[declared_count++] = i;
 	}
-	Assert(declared_count > 0);
+	if (declared_count <= 0) {
+		ereport(FATAL, (errcode(ERRCODE_CONFIG_FILE_ERROR),
+						errmsg("cluster_grd: no declared nodes in pgrac.conf"),
+						errhint("Declare at least one [node.N] entry in pgrac.conf "
+								"before initializing the GRD master map.")));
+		return;
+	}
 	Assert(declared_count == cluster_conf_node_count());
 
 	/* Distribute 4096 shards over declared nodes (round-robin in
