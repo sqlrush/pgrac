@@ -33,8 +33,15 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_ges.h"
+#include "cluster/cluster_grd.h"
+#include "cluster/cluster_grd_outbound.h"
+#include "cluster/cluster_grd_work_queue.h"
+#include "cluster/cluster_guc.h" /* cluster_node_id */
 #include "cluster/cluster_ic_envelope.h"
+#include "cluster/cluster_qvotec.h" /* cluster_qvotec_in_quorum */
+#include "cluster/cluster_conf.h"   /* cluster_conf_lookup_node */
 #include "cluster/cluster_shmem.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
@@ -102,30 +109,133 @@ cluster_ges_shmem_register(void)
  *	  (4) bounded shmem only — single 8-byte field touched.
  * ============================================================ */
 
-void
-cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload pg_attribute_unused())
+/*
+ * Inbound 5-item validation per spec-2.16 v0.4 L1.8 (I36-I37).
+ *
+ *   Returns true if payload passes all 5 checks;  false → caller
+ *   drops + bumps ges_inbound_validation_fail_count.
+ *
+ *   For request handler (msg_type == GES_REQUEST):
+ *     opcode_min=1, opcode_max=3 (REQUEST / CONVERT / RELEASE)
+ *   For reply handler (msg_type == GES_REPLY):
+ *     opcode_min=1, opcode_max=2 (GRANT / REJECT)
+ */
+static bool
+ges_validate_inbound(const ClusterICEnvelope *env, uint32 payload_node_id, uint64 payload_epoch,
+					 uint32 payload_opcode, uint32 opcode_min, uint32 opcode_max)
 {
+	uint64 accepted_epoch;
+
+	/* (1) payload.node_id == env.source_node_id */
+	if (payload_node_id != env->source_node_id)
+		return false;
+
+	/* (2) payload.epoch == env.epoch */
+	if (payload_epoch != env->epoch)
+		return false;
+
+	/* (3) payload.epoch == local accepted_epoch */
+	accepted_epoch = cluster_epoch_get_current();
+	if (payload_epoch != accepted_epoch)
+		return false;
+
+	/* (4) source node declared + in_quorum */
+	if (cluster_conf_lookup_node((int32)env->source_node_id) == NULL)
+		return false;
+	if (!cluster_qvotec_in_quorum())
+		return false;
+
+	/* (5) opcode 属 family + self-source drop */
+	if (payload_opcode < opcode_min || payload_opcode > opcode_max)
+		return false;
+	if ((int)env->source_node_id == cluster_node_id)
+		return false;
+
+	return true;
+}
+
+void
+cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
+{
+	const GesRequestPayload *req;
+	uint64 holder_epoch;
+
 	Assert(env != NULL);
 	Assert(cluster_ges_state != NULL);
 
 	pg_atomic_fetch_add_u64(&cluster_ges_state->request_defer_count, 1);
 
-	ereport(DEBUG2, (errmsg_internal("cluster_ges: GES_REQUEST received from "
-									 "peer %u; skeleton DEFER (spec-2.16 真激活)",
-									 env->source_node_id)));
+	if (payload == NULL) {
+		cluster_grd_inc_ges_inbound_validation_fail();
+		return;
+	}
+	req = (const GesRequestPayload *)payload;
+
+	holder_epoch = ((uint64)req->holder_cluster_epoch_lo) |
+				   (((uint64)req->holder_cluster_epoch_hi) << 32);
+
+	/* spec-2.16 v0.4 L1.8 + v0.5:  5-item validation. */
+	if (!ges_validate_inbound(env, req->holder_node_id, holder_epoch, req->opcode,
+							  GES_REQ_OPCODE_REQUEST, GES_REQ_OPCODE_RELEASE)) {
+		cluster_grd_inc_ges_inbound_validation_fail();
+		return;
+	}
+
+	/* Phase 1 (handler):  enqueue into work_queue.  Grant decision runs
+	 * Phase 2 in LMON tick body (Step 4 D9 wires).  work_queue full →
+	 * REJECT_BUSY reply via reserved pool (I46 nofail). */
+	if (!cluster_grd_work_queue_enqueue(env->source_node_id, payload, sizeof(*req))) {
+		GesReplyPayload reject;
+
+		cluster_grd_inc_ges_work_queue_full();
+		memset(&reject, 0, sizeof(reject));
+		reject.opcode = GES_REPLY_OPCODE_REJECT;
+		reject.reject_reason = GES_REJECT_REASON_WORK_QUEUE_FULL;
+		reject.holder_node_id = req->holder_node_id;
+		reject.holder_procno = req->holder_procno;
+		reject.holder_cluster_epoch_lo = req->holder_cluster_epoch_lo;
+		reject.holder_cluster_epoch_hi = req->holder_cluster_epoch_hi;
+		reject.holder_request_id_lo = req->holder_request_id_lo;
+		reject.holder_request_id_hi = req->holder_request_id_hi;
+		memcpy(reject.resid, req->resid, sizeof(reject.resid));
+		cluster_grd_outbound_enqueue_lmon_reply(env->source_node_id, &reject, sizeof(reject));
+	}
 }
 
 void
-cluster_ges_reply_handler(const ClusterICEnvelope *env, const void *payload pg_attribute_unused())
+cluster_ges_reply_handler(const ClusterICEnvelope *env, const void *payload)
 {
+	const GesReplyPayload *rep;
+	uint64 holder_epoch;
+
 	Assert(env != NULL);
 	Assert(cluster_ges_state != NULL);
 
 	pg_atomic_fetch_add_u64(&cluster_ges_state->reply_defer_count, 1);
 
-	ereport(DEBUG2, (errmsg_internal("cluster_ges: GES_REPLY received from "
-									 "peer %u; skeleton DEFER (spec-2.16 真激活)",
-									 env->source_node_id)));
+	if (payload == NULL) {
+		cluster_grd_inc_ges_inbound_validation_fail();
+		return;
+	}
+	rep = (const GesReplyPayload *)payload;
+
+	holder_epoch = ((uint64)rep->holder_cluster_epoch_lo) |
+				   (((uint64)rep->holder_cluster_epoch_hi) << 32);
+
+	if (!ges_validate_inbound(env, rep->holder_node_id, holder_epoch, rep->opcode,
+							  GES_REPLY_OPCODE_GRANT, GES_REPLY_OPCODE_REJECT)) {
+		cluster_grd_inc_ges_inbound_validation_fail();
+		return;
+	}
+
+	/* Step 4 D9 wires pending_signal (CAS state + SetLatch).  For Step 3,
+	 * the validation pass is recorded via reply_defer_count.  Real
+	 * signal lands when pending table HTAB is allocated in Step 4. */
+	ereport(DEBUG2,
+			(errmsg_internal("cluster_ges_reply: validated reply opcode=%u "
+							 "reject_reason=%u from peer %u (Step 3 — pending signal "
+							 "wires Step 4)",
+							 rep->opcode, rep->reject_reason, env->source_node_id)));
 }
 
 

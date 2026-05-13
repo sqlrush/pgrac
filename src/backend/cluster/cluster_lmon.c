@@ -58,6 +58,7 @@
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_cssd.h"	  /* cluster_cssd_outbound_slots (spec-2.5 D2.6) */
 #include "cluster/cluster_fence.h"	  /* cluster_fence_lmon_tick (spec-2.28 D5) */
+#include "cluster/cluster_grd.h"	  /* cluster_grd_lmon_tick_dead_sweep (spec-2.16 D8) */
 #include "cluster/cluster_reconfig.h" /* cluster_reconfig_lmon_tick (spec-2.29 Step 2 D3) */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic.h"
@@ -802,6 +803,11 @@ LmonMain(void)
 			 * (P1.3 a) + I7 coordinator-only epoch++ via D18 (P1.3 b).
 			 * Idempotent within one DEAD episode (same event_id → skip).
 			 */
+			/* spec-2.16 D8 I47:  GRD newly-dead sweep MUST run BEFORE
+			 * reconfig epoch bump (S1 → S2 order writ).  bitmap diff
+			 * per v0.5 P1.2;  no-op when dead_generation unchanged. */
+			cluster_grd_lmon_tick_dead_sweep();
+
 			cluster_reconfig_lmon_tick();
 
 			/*
@@ -1315,6 +1321,11 @@ LmonMain(void)
 			 * (P1.3 a) + I7 coordinator-only epoch++ via D18 (P1.3 b).
 			 * Idempotent within one DEAD episode (same event_id → skip).
 			 */
+			/* spec-2.16 D8 I47:  GRD newly-dead sweep MUST run BEFORE
+			 * reconfig epoch bump (S1 → S2 order writ).  bitmap diff
+			 * per v0.5 P1.2;  no-op when dead_generation unchanged. */
+			cluster_grd_lmon_tick_dead_sweep();
+
 			cluster_reconfig_lmon_tick();
 
 			CLUSTER_INJECTION_POINT("cluster-lmon-main-loop-iter");

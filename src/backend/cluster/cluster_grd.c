@@ -37,6 +37,7 @@
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_guc.h" /* cluster_node_id, cluster_grd_max_entries */
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_cssd.h" /* spec-2.16 D8 newly-dead bitmap diff */
 #include "common/hashfn.h" /* hash_bytes_extended (spec-2.29 同款) */
 #include "miscadmin.h"
 #include "port/atomics.h"
@@ -1038,4 +1039,60 @@ cluster_grd_cleanup_stale_epoch(uint64 current_epoch)
 	ereport(DEBUG2, (errmsg_internal("cluster_grd_cleanup_stale_epoch(%lu): "
 									 "skeleton no-op (spec-2.16 Step 4 D11 真激活)",
 									 (unsigned long)current_epoch)));
+}
+
+
+/* ============================================================
+ * spec-2.16 D8:  LMON tick body GRD dead sweep — newly-dead bitmap
+ *   diff per v0.5 P1.2 + I51.
+ *
+ *   static last_dead_bitmap + per-tick diff:
+ *     - poll cluster_cssd_get_dead_generation();  unchanged → return
+ *     - scan peer_state for all peers;  state==DEAD → set bit
+ *     - newly_dead = current & ~last_dead_bitmap
+ *     - for each newly-dead peer → cluster_grd_cleanup_on_node_dead(id)
+ *     - last_dead_bitmap = current (commit AFTER sweep — crash-safe)
+ *
+ *   ALIVE / SUSPECTED不计;DEAD→ALIVE recovery 不重 sweep (bit drops
+ *   from current_dead_bitmap, but already in last_dead_bitmap; on next
+ *   transition ALIVE→DEAD bit re-enters newly_dead per AND-NOT logic).
+ *
+ *   Process-local static (per-postmaster).  LMON is singleton, so no
+ *   shared-state contention.
+ * ============================================================ */
+
+static uint64 cluster_grd_last_dead_bitmap = 0;
+static uint64 cluster_grd_last_dead_generation = 0;
+
+void
+cluster_grd_lmon_tick_dead_sweep(void)
+{
+	uint64 current_gen;
+	uint64 current_dead_bitmap = 0;
+	uint64 newly_dead;
+	int peer_id;
+
+	/* Postmaster-only tick (single LMON consumer).  No LWLock needed
+	 * for static state. */
+	current_gen = cluster_cssd_get_dead_generation();
+	if (current_gen == cluster_grd_last_dead_generation)
+		return;
+
+	/* Scan peer states to build current_dead_bitmap.  Only DEAD counts;
+	 * SUSPECTED is hysteresis-mid, not a sweep trigger. */
+	for (peer_id = 0; peer_id < CLUSTER_MAX_NODES && peer_id < 64; peer_id++) {
+		ClusterCssdPeerState s = cluster_cssd_get_peer_state(peer_id);
+		if (s == CLUSTER_CSSD_PEER_DEAD)
+			current_dead_bitmap |= ((uint64)1 << peer_id);
+	}
+
+	newly_dead = current_dead_bitmap & ~cluster_grd_last_dead_bitmap;
+	for (peer_id = 0; peer_id < 64; peer_id++) {
+		if (newly_dead & ((uint64)1 << peer_id))
+			cluster_grd_cleanup_on_node_dead((int32)peer_id);
+	}
+
+	/* Commit AFTER sweep — crash-safe idempotent;  reboot reconstructs. */
+	cluster_grd_last_dead_bitmap = current_dead_bitmap;
+	cluster_grd_last_dead_generation = current_gen;
 }

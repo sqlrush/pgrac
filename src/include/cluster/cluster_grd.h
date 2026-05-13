@@ -499,6 +499,21 @@ extern ClusterGrdEntryResult cluster_grd_entry_promote_waiter(ClusterGrdEntry *e
 extern void cluster_grd_cleanup_on_node_dead(int32 dead_node_id);
 
 /*
+ * LMON tick poll — newly-dead bitmap diff per spec-2.16 v0.5 P1.2 + I51.
+ *
+ *   Called from cluster_lmon_main_tick body BEFORE reconfig_lmon_tick
+ *   (per I47 LMON tick order: S1 GRD sweep → S2 reconfig epoch bump).
+ *   Polls cluster_cssd_get_dead_generation() — if changed, scans peer
+ *   states to build current_dead_bitmap, diffs against static
+ *   last_dead_bitmap, and invokes cleanup_on_node_dead for each
+ *   newly-dead peer.  SUSPECTED state不计;DEAD→ALIVE recovery 不重 sweep.
+ *
+ *   last_dead_bitmap is committed AFTER sweep (crash-safe idempotent;
+ *   reboot 从 0 重建).
+ */
+extern void cluster_grd_lmon_tick_dead_sweep(void);
+
+/*
  * Stale-epoch sweep (Step 4 D11):  holder.cluster_epoch < current_epoch
  *   → release.  Triggered post-reconfig epoch bump (LMON tick Step
  *   S2 per I47).  Independent rule from DEAD cleanup (I48 — touched
