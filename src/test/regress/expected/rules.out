@@ -1332,6 +1332,18 @@ pg_cluster_fence_state| SELECT last_freeze_at,
     self_fence_initiated_count,
     freeze_signal_received_count
    FROM cluster_get_fence_state() cluster_get_fence_state(last_freeze_at, last_thaw_at, self_fence_pending, self_fence_grace_remaining_ms, freeze_broadcast_count, thaw_broadcast_count, self_fence_initiated_count, freeze_signal_received_count);
+pg_cluster_grd_entries| SELECT shard_id,
+    field1,
+    field2,
+    field3,
+    field4,
+    type,
+    lockmethodid,
+    ngranted,
+    nwaiters,
+    nconverts,
+    state_flags
+   FROM cluster_get_grd_entries() cluster_get_grd_entries(shard_id, field1, field2, field3, field4, type, lockmethodid, ngranted, nwaiters, nconverts, state_flags);
 pg_cluster_grd_shards| SELECT shard_id,
     master_node_id,
     is_local
