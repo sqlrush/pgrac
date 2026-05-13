@@ -61,6 +61,31 @@ int cluster_shared_storage_backend = CLUSTER_SHARED_FS_BACKEND_STUB;
 bool cluster_smgr_user_relations = false;
 int cluster_shmem_max_regions = 64;
 int cluster_grd_max_entries = 0;
+int cluster_ges_request_timeout_ms = 60000; /* spec-2.16 D12 + v0.5 P1.5 */
+
+/*
+ * spec-2.16 D12 + v0.5 P1.5 helper:  effective timeout for GES grant
+ *   request.  PG lock_timeout=0 means "disabled" (无限等),  must NOT
+ *   degenerate to immediate timeout (I53).
+ *
+ *     effective = (lock_timeout==0)
+ *                   ? ges_request_timeout_ms
+ *                   : min(lock_timeout, ges_request_timeout_ms)
+ *
+ *   NOWAIT path (caller passes lock_timeout=-1) returns 0 → caller
+ *   short-circuits.
+ */
+int
+cluster_ges_effective_timeout_ms(int lock_timeout_ms)
+{
+	if (lock_timeout_ms < 0)
+		return 0; /* NOWAIT — caller short-circuits */
+	if (lock_timeout_ms == 0)
+		return cluster_ges_request_timeout_ms; /* PG disabled → use ours */
+	if (lock_timeout_ms < cluster_ges_request_timeout_ms)
+		return lock_timeout_ms;
+	return cluster_ges_request_timeout_ms;
+}
 
 /*
  * Spec-1.10 (2026-05-03) phase transition timeouts (HC4 user 修订 4).
@@ -441,6 +466,33 @@ cluster_init_guc(void)
 	 *	Spec: spec-1.7-pcm-state-placeholder.md §1.2 Deliverable 3 +
 	 *	      §11.1 GUC checklist.
 	 */
+	/*
+	 * spec-2.16 D12 + v0.5 P1.5 + v0.6 L1.6:
+	 *   cluster.ges_request_timeout_ms
+	 *
+	 *   GES cross-node grant request timeout (ms).  Range [1, 600000]
+	 *   (1ms - 10min).  Default 60000 (60s).  Removes -1 perpetual wait
+	 *   per v0.6 L1.6 (spec-2.17 deadlock ship 后 amend range放开).
+	 *   PGC_USERSET — backend-tunable.
+	 *
+	 *   effective_timeout = (lock_timeout == 0) ?
+	 *     ges_request_timeout_ms : min(lock_timeout, ges_request_timeout_ms)
+	 *   per v0.5 P1.5 (cluster_ges_effective_timeout_ms helper).
+	 */
+	DefineCustomIntVariable("cluster.ges_request_timeout_ms",
+							gettext_noop("Timeout for cross-node GES grant request (ms)."),
+							gettext_noop("Range [1, 600000] (1ms - 10min).  Default 60000.  "
+										 "Backend waits this long for grant reply before "
+										 "rolling back via GES_RELEASE.  PG lock_timeout=0 "
+										 "(disabled) does NOT short-circuit this — backend "
+										 "uses ges_request_timeout_ms when lock_timeout=0."),
+							&cluster_ges_request_timeout_ms, 60000, 1, 600000,
+							PGC_USERSET,
+							GUC_UNIT_MS,
+							NULL,
+							NULL,
+							NULL);
+
 	DefineCustomIntVariable("cluster.pcm_grd_max_entries",
 							gettext_noop("Maximum entries in the PCM GRD master shmem region."),
 							gettext_noop("Stage 1.7 stub: default 0 means no GRD shmem allocated. "

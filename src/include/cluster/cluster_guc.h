@@ -198,6 +198,11 @@ extern int cluster_shmem_max_regions;
  */
 extern int cluster_grd_max_entries;
 
+/* spec-2.16 D12 + v0.5 P1.5:  cluster.ges_request_timeout_ms +
+ * effective_timeout helper.  range [1, 600000];  default 60000. */
+extern int cluster_ges_request_timeout_ms;
+extern int cluster_ges_effective_timeout_ms(int lock_timeout_ms);
+
 
 /* ----------
  * cluster.phase{1..4}_timeout (Stage 1.10, spec-1.10 §2.2)

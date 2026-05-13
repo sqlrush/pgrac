@@ -280,12 +280,19 @@ typedef enum {
  * ----------
  */
 typedef enum {
-	/* Cluster: GES (5 events) -- subsystem #8 */
+	/* Cluster: GES (5+3 events) -- subsystem #8 */
 	WAIT_EVENT_GES_ENQUEUE_ACQUIRE = PG_WAIT_CLUSTER_GES,
 	WAIT_EVENT_GES_ENQUEUE_CONVERT,
 	WAIT_EVENT_GES_ENQUEUE_RELEASE_ACK,
 	WAIT_EVENT_GES_MASTER_QUERY,
 	WAIT_EVENT_GES_LOCAL_FAST_PATH,
+	/* spec-2.16 D13 (3 NEW per v0.4 Q13 + L2.1):  cross-node grant wait
+	 * surfaces.  GRANT_WAIT — backend wait latch for GES reply (S4 wait);
+	 * CONVERT_WAIT — caller wait for convert ack;  DRAIN — LMON drain
+	 * dirty-list / work queue. */
+	WAIT_EVENT_GES_GRANT_WAIT,
+	WAIT_EVENT_GES_CONVERT_WAIT,
+	WAIT_EVENT_GES_DRAIN,
 
 	/* Cluster: PCM (6 events) -- subsystem #6 */
 	WAIT_EVENT_PCM_BLOCK_READ_N_S = PG_WAIT_CLUSTER_PCM,

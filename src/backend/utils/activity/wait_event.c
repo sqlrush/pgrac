@@ -904,6 +904,15 @@ pgstat_get_wait_cluster_ges(WaitEventCluster w)
 	case WAIT_EVENT_GES_LOCAL_FAST_PATH:
 		event_name = "GesLocalFastPath";
 		break;
+	case WAIT_EVENT_GES_GRANT_WAIT:
+		event_name = "GesGrantWait";
+		break;
+	case WAIT_EVENT_GES_CONVERT_WAIT:
+		event_name = "GesConvertWait";
+		break;
+	case WAIT_EVENT_GES_DRAIN:
+		event_name = "GesDrain";
+		break;
 	default:
 		break;
 	}
