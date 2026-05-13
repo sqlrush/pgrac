@@ -25,6 +25,7 @@
 
 #include "cluster/cluster_grd_work_queue.h"
 #include "cluster/cluster_shmem.h"
+#include "miscadmin.h" /* IsBootstrapProcessingMode */
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "utils/elog.h"
@@ -57,7 +58,10 @@ cluster_grd_work_queue_shmem_init(void)
 	if (!found)
 		memset(cluster_grd_work_queue_state, 0, sizeof(*cluster_grd_work_queue_state));
 
-	cluster_grd_work_queue_lock = &(GetNamedLWLockTranche("ClusterGrdWorkQueue"))[0].lock;
+	/* Same bootstrap-safe gate as cluster_grd_outbound:  bootstrap mode
+	 * skips process_shmem_requests so tranche is not registered. */
+	if (!IsBootstrapProcessingMode())
+		cluster_grd_work_queue_lock = &(GetNamedLWLockTranche("ClusterGrdWorkQueue"))[0].lock;
 }
 
 static const ClusterShmemRegion cluster_grd_work_queue_region = {

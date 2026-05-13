@@ -103,8 +103,13 @@ cluster_grd_outbound_shmem_init(void)
 		memset(cluster_grd_outbound_state, 0, sizeof(*cluster_grd_outbound_state));
 	}
 
-	/* Resolve LWLock tranche (registered via cluster_request_shmem). */
-	cluster_grd_outbound_lock = &(GetNamedLWLockTranche("ClusterGrdOutbound"))[0].lock;
+	/* Resolve LWLock tranche (registered via cluster_grd_request_lwlocks
+	 * → process_shmem_requests).  Bootstrap mode skips request phase →
+	 * tranche not registered → skip lock resolution (no consumer runs
+	 * in bootstrap;  postmaster re-runs init_fn after process_shmem_
+	 * requests has populated the tranche). */
+	if (!IsBootstrapProcessingMode())
+		cluster_grd_outbound_lock = &(GetNamedLWLockTranche("ClusterGrdOutbound"))[0].lock;
 }
 
 static const ClusterShmemRegion cluster_grd_outbound_region = {
