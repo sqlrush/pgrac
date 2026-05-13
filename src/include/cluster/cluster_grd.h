@@ -154,6 +154,19 @@ typedef struct ClusterGrdShared {
 	pg_atomic_uint64 entry_create_count;	 /* lifetime ++ on HASH_ENTER_NULL OK + new */
 	pg_atomic_uint64 entry_lookup_hit_count; /* lifetime ++ on OK return (hit 语义;P2.5) */
 	pg_atomic_uint64 entry_full_count;		 /* lifetime ++ on FULL */
+
+	/* spec-2.16 D1:  4 cap counter + 5 nofail counter (skeleton-init;
+	 * mutator bodies + nofail paths land Step 2-4). */
+	pg_atomic_uint64 holders_full_count;
+	pg_atomic_uint64 waiters_full_count;
+	pg_atomic_uint64 converts_full_count;
+	pg_atomic_uint64 ngranted_promoted_count;
+
+	pg_atomic_uint64 ges_work_queue_full_count;			/* v0.4 L1.3 */
+	pg_atomic_uint64 ges_cleanup_deferred_count;		/* v0.4 L1.3 cleanup dirty-list */
+	pg_atomic_uint64 ges_inbound_validation_fail_count; /* v0.4 L1.8 */
+	pg_atomic_uint64 ges_reply_deferred_count;			/* v0.5 P1.1 reply dirty-list */
+	pg_atomic_uint64 ges_reply_dropped_count;			/* v0.6 L1.1 dirty-list full drop */
 } ClusterGrdShared;
 
 extern Size cluster_grd_shmem_size(void);
@@ -349,6 +362,142 @@ extern uint64 cluster_grd_entry_full_count(void); /* lifetime ++ on FULL (atomic
 typedef void (*ClusterGrdEntryRowVisitor)(void *ctx, const int32 row_fields[11]);
 
 extern void cluster_grd_entries_walk(ClusterGrdEntryRowVisitor visitor, void *ctx);
+
+
+/* ============================================================
+ * spec-2.16 D1:  mutator + LOCKMODE compat + 4 cap counter + 5
+ *   nofail counter + should_globalize + 6-step state machine helpers.
+ *
+ *   Skeleton phase (Step 1):  extern + struct + counter init only;
+ *   mutator bodies + state machine activation land in Step 2-4 per
+ *   spec-2.16 §5 Sprint A plan.  Stub bodies use规则 8
+ *   ERRCODE_FEATURE_NOT_SUPPORTED with errhint pointing to the
+ *   activating Step.
+ * ============================================================ */
+
+/*
+ * 4-tuple GES holder identity (spec-2.16 v0.3 L1.7 + v0.4 I49):
+ *   (node_id, cluster_epoch, procno, request_id)
+ *
+ *   - node_id:       originating cluster_node_id
+ *   - cluster_epoch: epoch at request time (per spec-2.4); used for
+ *                    stale-epoch cleanup discrimination (I48)
+ *   - procno:        PG ProcNumber of the requesting backend
+ *   - request_id:    per-backend monotonic counter (D3 pending key
+ *                    disambiguator)
+ *
+ *   Used in:
+ *     - GRD entry holders[] / waiters[] (spec-2.16 mutator)
+ *     - cluster_grd_pending.h key (4-tuple HTAB)
+ *     - inbound 5-item validation (I36-I37)
+ *     - GesRequestPayload / GesReplyPayload wire (cluster_ges.h
+ *       inlines the 6 uint32 fields explicitly per L8 frontend safety)
+ */
+typedef struct ClusterGrdHolderId {
+	uint32 node_id;
+	uint32 procno;
+	uint64 cluster_epoch;
+	uint64 request_id;
+} ClusterGrdHolderId;
+
+StaticAssertDecl(sizeof(ClusterGrdHolderId) == 24,
+				 "ClusterGrdHolderId 4-tuple ABI 24-byte lock");
+
+/*
+ * 4 cap counter + 5 nofail counter (Q12 v0.6).
+ *
+ *   cap counter (4):  holders_full / waiters_full / converts_full /
+ *     ngranted_promoted (set each cap surface, observability);
+ *   nofail counter (5):
+ *     - ges_work_queue_full_count       (v0.4 L1.3)
+ *     - ges_cleanup_deferred_count      (v0.4 L1.3 cleanup dirty-list)
+ *     - ges_inbound_validation_fail_count (v0.4 L1.8 5-item validation)
+ *     - ges_reply_deferred_count        (v0.5 P1.1 reply dirty-list)
+ *     - ges_reply_dropped_count         (v0.6 L1.1 dirty-list full drop)
+ *
+ *   All atomic uint64;  hot path 0-LWLock per L106.  Counters reside
+ *   in ClusterGrdShared (extending spec-2.15 v0.3 entry counters).
+ */
+
+/* extern accessors (cluster_debug emit_row + observability views) */
+extern uint64 cluster_grd_holders_full_count(void);
+extern uint64 cluster_grd_waiters_full_count(void);
+extern uint64 cluster_grd_converts_full_count(void);
+extern uint64 cluster_grd_ngranted_promoted_count(void);
+
+extern uint64 cluster_grd_ges_work_queue_full_count(void);
+extern uint64 cluster_grd_ges_cleanup_deferred_count(void);
+extern uint64 cluster_grd_ges_inbound_validation_fail_count(void);
+extern uint64 cluster_grd_ges_reply_deferred_count(void);
+extern uint64 cluster_grd_ges_reply_dropped_count(void);
+
+/*
+ * should_globalize (D10) — O(1) no-catalog allowlist.
+ *
+ *   Returns true if the given LOCKTAG should be cluster-globalized
+ *   (route through GES) rather than handled by PG-local lmgr only.
+ *   Skeleton (Step 1):  return false unconditionally (mirrors v0.3
+ *   skeleton DEFER contract).  Real allowlist body lands Step 4 D10.
+ */
+extern bool cluster_grd_should_globalize(const struct LOCKTAG *tag);
+
+/*
+ * LOCKMODE compatibility — Q2 v0.4 ★ B:  expose PG lmgr/lock.c
+ * LockMethodConflicts helper rather than复刻 matrix.
+ *
+ *   For now (Step 1) provide a thin wrapper extern that Step 4 D9
+ *   wires to the (NEW exposed) lmgr/lock.c LockMethodConflicts symbol.
+ *   Skeleton body returns true (any mode conflicts with any) to keep
+ *   safety contract before Step 4 activation.
+ */
+extern bool cluster_grd_lockmode_conflicts(int /* LOCKMODE */ held, int /* LOCKMODE */ wanted);
+
+/*
+ * Mutator API — caller (lmgr/lock.c PGRAC MODIFICATIONS Step 4 D9)
+ * grants / releases / converts a holder under the shard partition
+ * LWLock + entry slock_t.  Skeleton (Step 1):  ERRCODE_FEATURE_NOT_SUPPORTED
+ * + errhint pointing to Step 4 activation.
+ *
+ *   grant_holder:    add to entry->holders[] at given mode
+ *   release_holder:  remove (refcount 1→0 path);  may HASH_REMOVE entry
+ *                    when ngranted==0 && nwaiters==0 && nconverts==0
+ *   add_waiter:      add to entry->waiters[]
+ *   promote_waiter:  waiter → holder (grant decision callback)
+ *
+ *   All return ClusterGrdEntryResult sentinel (reuse spec-2.15 enum;
+ *   FULL covers all 4 cap surfaces).
+ */
+extern ClusterGrdEntryResult cluster_grd_entry_grant_holder(ClusterGrdEntry *entry,
+															const ClusterGrdHolderId *holder,
+															int /* LOCKMODE */ mode);
+extern ClusterGrdEntryResult cluster_grd_entry_release_holder(ClusterGrdEntry *entry,
+															  const ClusterGrdHolderId *holder);
+extern ClusterGrdEntryResult cluster_grd_entry_add_waiter(ClusterGrdEntry *entry,
+														  const ClusterGrdHolderId *holder,
+														  int /* LOCKMODE */ mode);
+extern ClusterGrdEntryResult cluster_grd_entry_promote_waiter(ClusterGrdEntry *entry,
+															  const ClusterGrdHolderId *holder);
+
+/*
+ * CSSD DEAD cleanup entry point (Step 4 D11 + LMON tick polling D8).
+ *
+ *   Called by LMON tick body when cluster_cssd_get_dead_generation()
+ *   detects a newly-dead peer (per spec-2.16 v0.5 P1.2 last_dead_bitmap
+ *   diff).  Sweeps all GRD entries: holder.node_id == dead_node_id
+ *   → release (independent of epoch per I48).
+ *
+ *   Idempotent (safe re-entry on bitmap re-sync).  Skeleton (Step 1):
+ *   no-op + DEBUG2 log.  Body activation Step 4 D11.
+ */
+extern void cluster_grd_cleanup_on_node_dead(int32 dead_node_id);
+
+/*
+ * Stale-epoch sweep (Step 4 D11):  holder.cluster_epoch < current_epoch
+ *   → release.  Triggered post-reconfig epoch bump (LMON tick Step
+ *   S2 per I47).  Independent rule from DEAD cleanup (I48 — touched
+ *   conditions don't merge).
+ */
+extern void cluster_grd_cleanup_stale_epoch(uint64 current_epoch);
 
 #endif /* !FRONTEND */
 

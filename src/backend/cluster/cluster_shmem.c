@@ -66,6 +66,7 @@
 #include "cluster/cluster_scn.h"	  /* cluster_scn_shmem_register (1.15) */
 #include "cluster/cluster_ges.h"	  /* cluster_ges_shmem_register (spec-2.13) */
 #include "cluster/cluster_grd.h"	  /* cluster_grd_shmem_register (spec-2.14) */
+#include "cluster/cluster_grd_pending.h" /* cluster_grd_pending_shmem_register (spec-2.16 D3) */
 #include "cluster/cluster_stats.h"	  /* cluster_stats_shmem_register (1.14 Sprint A) */
 #include "cluster/cluster_lmon.h"	  /* cluster_lmon_shmem_register (1.11 Sprint A) */
 #include "cluster/cluster_pcm_lock.h" /* cluster_pcm_lock_module_init (stage 1.7) */
@@ -396,6 +397,11 @@ cluster_init_shmem_module(void)
 	 * lock-free per Q9). */
 	if (cluster_shmem_lookup_region("pgrac cluster grd") == NULL)
 		cluster_grd_shmem_register();
+
+	/* spec-2.16 D3: register cluster_grd_pending shmem region
+	 * (skeleton phase — 0 byte size_fn).  Step 2 D4 wires real HTAB. */
+	if (cluster_shmem_lookup_region("pgrac cluster grd pending") == NULL)
+		cluster_grd_pending_shmem_register();
 
 	/*
 	 * spec-2.4 D2: register cluster_epoch shmem region.  64-byte cache-

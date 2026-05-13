@@ -140,6 +140,121 @@ extern void cluster_ges_reply_handler(const ClusterICEnvelope *env, const void *
 extern uint64 cluster_ges_request_defer_count(void);
 extern uint64 cluster_ges_reply_defer_count(void);
 
+
+/* ============================================================
+ * spec-2.16 D7:  GES payload struct + opcode + REJECT_REASON.
+ *
+ *   Wire-ABI extension over spec-2.13 skeleton:  GES_REQUEST = 4 and
+ *   GES_REPLY = 5 ICMsgType values stay unchanged (cluster_ic_envelope
+ *   header unchanged).  Payload follows the 36-byte envelope:
+ *
+ *     [ ClusterICEnvelope 36B ][ GesRequestPayload | GesReplyPayload ]
+ *
+ *   The opcode field inside the payload distinguishes the operation
+ *   within each msg_type family (per spec-2.16 v0.3 L1.2 decision —
+ *   reuse 2 wire msg_type + payload opcode rather than 6 wire msg_type).
+ *
+ *   GesRequestOpcode (within GES_REQUEST):
+ *     1 = REQUEST   (initial grant request)
+ *     2 = CONVERT   (lockmode upgrade)
+ *     3 = RELEASE   (cleanup release on abort/exit)
+ *
+ *   GesReplyOpcode (within GES_REPLY):
+ *     1 = GRANT
+ *     2 = REJECT  (reject_reason field carries why)
+ *
+ *   GesRejectReason (REPLY opcode 2 only):
+ *     1 = WORK_QUEUE_FULL  (handler enqueue failed; spec-2.16 L1.3)
+ *     2 = LOCK_CONFLICT    (incompatible mode held)
+ *     3 = EPOCH_MISMATCH   (payload.epoch != local accepted_epoch)
+ *     4 = TIMEOUT          (handler-side timeout; rare)
+ *
+ *   spec-2.16+:  Real handlers (cluster_ges_request_handler /
+ *   cluster_ges_reply_handler) cast `payload` to these structs and
+ *   dispatch on opcode.  Skeleton stub继续 DEFER counter bump until
+ *   Step 3 D6 真激活 5 项 inbound validation + work queue enqueue.
+ * ============================================================ */
+
+typedef enum GesRequestOpcode {
+	GES_REQ_OPCODE_REQUEST = 1,
+	GES_REQ_OPCODE_CONVERT = 2,
+	GES_REQ_OPCODE_RELEASE = 3
+} GesRequestOpcode;
+
+typedef enum GesReplyOpcode {
+	GES_REPLY_OPCODE_GRANT = 1,
+	GES_REPLY_OPCODE_REJECT = 2
+} GesReplyOpcode;
+
+typedef enum GesRejectReason {
+	GES_REJECT_REASON_NONE = 0, /* GRANT or undefined */
+	GES_REJECT_REASON_WORK_QUEUE_FULL = 1,
+	GES_REJECT_REASON_LOCK_CONFLICT = 2,
+	GES_REJECT_REASON_EPOCH_MISMATCH = 3,
+	GES_REJECT_REASON_TIMEOUT = 4
+} GesRejectReason;
+
+/* ClusterGrdHolderId 4-tuple typedef defined in cluster_grd.h (semantic
+ * layer:  GRD entity identity).  cluster_ges.h consumers must include
+ * cluster_grd.h before this header (cluster_shmem.c already does). */
+struct ClusterGrdHolderId;
+
+/*
+ * GES request payload (variant on GES_REQUEST msg_type=4).
+ *
+ *   Layout (all little-endian on wire):
+ *     [ 0,  4)  opcode          uint32 LE  (GesRequestOpcode)
+ *     [ 4,  8)  lockmode        uint32 LE  (PG LOCKMODE: 1..8)
+ *     [ 8, 32)  holder_id       24 bytes   (ClusterGrdHolderId)
+ *     [32, 48)  resid           16 bytes   (ClusterResId)
+ *
+ *   Total: 48 bytes.  Aligned to 8.
+ */
+typedef struct GesRequestPayload {
+	uint32 opcode;	 /* GesRequestOpcode */
+	uint32 lockmode; /* PG LOCKMODE (AccessShareLock..AccessExclusiveLock) */
+	/* 24-byte ClusterGrdHolderId inlined as 6 uint32 to avoid forward-decl
+	 * size dependency.  Layout matches ClusterGrdHolderId field-for-field
+	 * (StaticAssertDecl in cluster_grd.h locks both ABIs). */
+	uint32 holder_node_id;
+	uint32 holder_procno;
+	uint32 holder_cluster_epoch_lo;
+	uint32 holder_cluster_epoch_hi;
+	uint32 holder_request_id_lo;
+	uint32 holder_request_id_hi;
+	uint32 resid[4]; /* ClusterResId byte-image (16B) */
+} GesRequestPayload;
+
+StaticAssertDecl(sizeof(GesRequestPayload) == 48,
+				 "GesRequestPayload wire ABI 48-byte lock");
+
+/*
+ * GES reply payload (variant on GES_REPLY msg_type=5).
+ *
+ *   Layout:
+ *     [ 0,  4)  opcode          uint32 LE  (GesReplyOpcode)
+ *     [ 4,  8)  reject_reason   uint32 LE  (GesRejectReason; 0 for GRANT)
+ *     [ 8, 32)  holder_id       24 bytes   (echoes request)
+ *     [32, 48)  resid           16 bytes   (echoes request)
+ *
+ *   Total: 48 bytes.  Aligned to 8.
+ */
+typedef struct GesReplyPayload {
+	uint32 opcode;		  /* GesReplyOpcode */
+	uint32 reject_reason; /* GesRejectReason; 0 if GRANT */
+	/* 24-byte ClusterGrdHolderId inlined (mirror GesRequestPayload). */
+	uint32 holder_node_id;
+	uint32 holder_procno;
+	uint32 holder_cluster_epoch_lo;
+	uint32 holder_cluster_epoch_hi;
+	uint32 holder_request_id_lo;
+	uint32 holder_request_id_hi;
+	uint32 resid[4];
+} GesReplyPayload;
+
+StaticAssertDecl(sizeof(GesReplyPayload) == 48,
+				 "GesReplyPayload wire ABI 48-byte lock");
+
 #endif /* !FRONTEND */
 
 #endif /* CLUSTER_GES_H */

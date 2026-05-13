@@ -204,6 +204,19 @@ cluster_grd_shmem_init(void)
 		pg_atomic_init_u64(&cluster_grd_state->entry_create_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->entry_lookup_hit_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->entry_full_count, 0);
+
+		/* spec-2.16 D1:  4 cap counter + 5 nofail counter
+		 * (skeleton-init;  mutator + nofail path 真激活在 Step 2-4). */
+		pg_atomic_init_u64(&cluster_grd_state->holders_full_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->waiters_full_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->converts_full_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->ngranted_promoted_count, 0);
+
+		pg_atomic_init_u64(&cluster_grd_state->ges_work_queue_full_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->ges_cleanup_deferred_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->ges_inbound_validation_fail_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->ges_reply_deferred_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->ges_reply_dropped_count, 0);
 	}
 
 	/* spec-2.15 v0.4 P1.1:  entry HTAB allocation gated on GUC.  GUC=0
@@ -807,4 +820,187 @@ cluster_grd_entries_walk(ClusterGrdEntryRowVisitor visitor, void *ctx)
 
 		visitor(ctx, fields);
 	}
+}
+
+
+/* ============================================================
+ * spec-2.16 D2:  9 counter accessor + mutator stub + should_globalize
+ *   stub + LOCKMODE compat stub + cleanup stub.
+ *
+ *   All mutator bodies are规则 8 ERRCODE_FEATURE_NOT_SUPPORTED stubs
+ *   with errhint pointing to the activating Step (Step 4 D9).
+ *   Skeleton phase guarantees Step 1 ship does not break cluster_unit
+ *   or PG 219 regression.
+ * ============================================================ */
+
+uint64
+cluster_grd_holders_full_count(void)
+{
+	Assert(cluster_grd_state != NULL);
+	return pg_atomic_read_u64(&cluster_grd_state->holders_full_count);
+}
+
+uint64
+cluster_grd_waiters_full_count(void)
+{
+	Assert(cluster_grd_state != NULL);
+	return pg_atomic_read_u64(&cluster_grd_state->waiters_full_count);
+}
+
+uint64
+cluster_grd_converts_full_count(void)
+{
+	Assert(cluster_grd_state != NULL);
+	return pg_atomic_read_u64(&cluster_grd_state->converts_full_count);
+}
+
+uint64
+cluster_grd_ngranted_promoted_count(void)
+{
+	Assert(cluster_grd_state != NULL);
+	return pg_atomic_read_u64(&cluster_grd_state->ngranted_promoted_count);
+}
+
+uint64
+cluster_grd_ges_work_queue_full_count(void)
+{
+	Assert(cluster_grd_state != NULL);
+	return pg_atomic_read_u64(&cluster_grd_state->ges_work_queue_full_count);
+}
+
+uint64
+cluster_grd_ges_cleanup_deferred_count(void)
+{
+	Assert(cluster_grd_state != NULL);
+	return pg_atomic_read_u64(&cluster_grd_state->ges_cleanup_deferred_count);
+}
+
+uint64
+cluster_grd_ges_inbound_validation_fail_count(void)
+{
+	Assert(cluster_grd_state != NULL);
+	return pg_atomic_read_u64(&cluster_grd_state->ges_inbound_validation_fail_count);
+}
+
+uint64
+cluster_grd_ges_reply_deferred_count(void)
+{
+	Assert(cluster_grd_state != NULL);
+	return pg_atomic_read_u64(&cluster_grd_state->ges_reply_deferred_count);
+}
+
+uint64
+cluster_grd_ges_reply_dropped_count(void)
+{
+	Assert(cluster_grd_state != NULL);
+	return pg_atomic_read_u64(&cluster_grd_state->ges_reply_dropped_count);
+}
+
+
+/* ============================================================
+ * should_globalize — D10 skeleton.
+ *
+ *   Step 1:  always return false (no LOCKTAG enters cluster path).
+ *   Step 4 D10:  O(1) allowlist (RELATION / TRANSACTION / OBJECT /
+ *   ADVISORY classes per cluster_grd_is_cluster_aware contract).
+ * ============================================================ */
+
+bool
+cluster_grd_should_globalize(const LOCKTAG *tag pg_attribute_unused())
+{
+	return false; /* skeleton — Step 4 D10 真激活 */
+}
+
+
+/* ============================================================
+ * LOCKMODE compat — D9 helper (Step 1 skeleton).
+ *
+ *   Step 4 D9:  wires to lmgr/lock.c LockMethodConflicts (NEW
+ *   exposed symbol via PGRAC MODIFICATIONS in lock.c).  Skeleton
+ *   returns true conservatively (any-mode conflicts any-mode) to
+ *   keep safety contract — no false GRANT before Step 4 真激活.
+ * ============================================================ */
+
+bool
+cluster_grd_lockmode_conflicts(int held pg_attribute_unused(), int wanted pg_attribute_unused())
+{
+	return true; /* skeleton — Step 4 D9 wires real LockMethodConflicts */
+}
+
+
+/* ============================================================
+ * Mutator stubs — Step 4 D9 真激活.
+ *
+ *   规则 8:  ERRCODE_FEATURE_NOT_SUPPORTED + errhint pointing to
+ *   spec-2.16 Step 4.  cluster_unit tests in Step 6 必须显式 expect
+ *   FEATURE_NOT_SUPPORTED until Step 4 lands.
+ * ============================================================ */
+
+ClusterGrdEntryResult
+cluster_grd_entry_grant_holder(ClusterGrdEntry *entry pg_attribute_unused(),
+							   const ClusterGrdHolderId *holder pg_attribute_unused(),
+							   int mode pg_attribute_unused())
+{
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cluster_grd_entry_grant_holder not implemented in Step 1"),
+					errhint("spec-2.16 Step 4 D9 activates the 6-step state machine + mutator body")));
+	return CLUSTER_GRD_ENTRY_ERROR; /* unreachable */
+}
+
+ClusterGrdEntryResult
+cluster_grd_entry_release_holder(ClusterGrdEntry *entry pg_attribute_unused(),
+								 const ClusterGrdHolderId *holder pg_attribute_unused())
+{
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cluster_grd_entry_release_holder not implemented in Step 1"),
+					errhint("spec-2.16 Step 4 D9 activates release + HASH_REMOVE")));
+	return CLUSTER_GRD_ENTRY_ERROR;
+}
+
+ClusterGrdEntryResult
+cluster_grd_entry_add_waiter(ClusterGrdEntry *entry pg_attribute_unused(),
+							 const ClusterGrdHolderId *holder pg_attribute_unused(),
+							 int mode pg_attribute_unused())
+{
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cluster_grd_entry_add_waiter not implemented in Step 1"),
+					errhint("spec-2.16 Step 4 D9 activates waiter + cap surface")));
+	return CLUSTER_GRD_ENTRY_ERROR;
+}
+
+ClusterGrdEntryResult
+cluster_grd_entry_promote_waiter(ClusterGrdEntry *entry pg_attribute_unused(),
+								 const ClusterGrdHolderId *holder pg_attribute_unused())
+{
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cluster_grd_entry_promote_waiter not implemented in Step 1"),
+					errhint("spec-2.16 Step 4 D9 grant decision callback")));
+	return CLUSTER_GRD_ENTRY_ERROR;
+}
+
+
+/* ============================================================
+ * CSSD DEAD / stale-epoch cleanup stubs — Step 4 D11 真激活.
+ * ============================================================ */
+
+void
+cluster_grd_cleanup_on_node_dead(int32 dead_node_id)
+{
+	/* Step 1 skeleton:  log DEBUG2 only.  Step 4 D11 sweeps holders[]
+	 * + waiters[] per I48 (holder.node_id == dead_node_id, NO epoch
+	 * filter; independent of stale-epoch sweep). */
+	ereport(DEBUG2, (errmsg_internal("cluster_grd_cleanup_on_node_dead(%d): "
+									 "skeleton no-op (spec-2.16 Step 4 D11 真激活)",
+									 dead_node_id)));
+}
+
+void
+cluster_grd_cleanup_stale_epoch(uint64 current_epoch)
+{
+	/* Step 1 skeleton:  log DEBUG2 only.  Step 4 D11 sweeps holders[]
+	 * per I48 (holder.cluster_epoch < current_epoch).  Independent rule
+	 * from DEAD cleanup. */
+	ereport(DEBUG2, (errmsg_internal("cluster_grd_cleanup_stale_epoch(%lu): "
+									 "skeleton no-op (spec-2.16 Step 4 D11 真激活)",
+									 (unsigned long)current_epoch)));
 }

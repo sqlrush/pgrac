@@ -48,6 +48,7 @@ OBJS = \
 	cluster_fence.o \
 	cluster_ges.o \
 	cluster_grd.o \
+	cluster_grd_pending.o \
 	cluster_grd_srf.o \
 	cluster_reconfig.o \
 	cluster_guc.o \
