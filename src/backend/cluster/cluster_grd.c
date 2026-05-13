@@ -942,9 +942,21 @@ cluster_grd_inc_ges_reply_dropped(void)
  * ============================================================ */
 
 bool
-cluster_grd_should_globalize(const LOCKTAG *tag pg_attribute_unused())
+cluster_grd_should_globalize(const LOCKTAG *tag)
 {
-	return false; /* skeleton — Step 4 D10 真激活 */
+	/* Step 4 D10:  O(1) allowlist anchored on cluster_grd_is_cluster_aware
+	 * (4 LockTagType classes — RELATION / TRANSACTION / OBJECT / ADVISORY
+	 * per spec-2.14).  No catalog lookup;  branch-only dispatch.
+	 *
+	 *   spec-2.16 v0.4 L1.9 contract:  O(1), no catalog SQL, no LWLock,
+	 *   no allocation.  Fast path for non-cluster locks returns false
+	 *   immediately (~3 instructions).
+	 *
+	 *   Future spec-2.17+ may extend allowlist via cached relpersistence
+	 *   for RELATION class (heap_open + cache);  本 spec scope skip. */
+	if (tag == NULL)
+		return false;
+	return cluster_grd_is_cluster_aware(tag);
 }
 
 
@@ -1019,26 +1031,104 @@ cluster_grd_entry_promote_waiter(ClusterGrdEntry *entry pg_attribute_unused(),
  * CSSD DEAD / stale-epoch cleanup stubs — Step 4 D11 真激活.
  * ============================================================ */
 
+/*
+ * spec-2.16 Step 4 D11:  CSSD DEAD master sweep — traverses entry HTAB
+ *   and per-entry filters holders[] / waiters[] / converts[] by
+ *   node_id == dead_node_id (I48 — NO epoch filter).
+ *
+ *   Step 4 implementation:  uses cluster_grd_entry_htab via existing
+ *   hash_seq_search pattern (mirror cluster_grd_entries_walk).  For
+ *   each matching slot, decrement entry->ngranted / nwaiters / nconverts
+ *   under entry->lock and zero the slot.  Idempotent re-entry safe.
+ *
+ *   Counters per cleanup invocation tracked via existing entry mutator
+ *   counter family (spec-2.15 entry_current_count when ngranted hits 0).
+ *   本 Step 0 真 mutator caller (spec-2.16 ships caller-side hooks
+ *   stub only — full LockAcquireExtended 6-step integration in spec-
+ *   2.17), so sweep is a no-op until cluster_unit Step 6 inject test
+ *   exercises mutator + sweep round-trip.
+ */
 void
 cluster_grd_cleanup_on_node_dead(int32 dead_node_id)
 {
-	/* Step 1 skeleton:  log DEBUG2 only.  Step 4 D11 sweeps holders[]
-	 * + waiters[] per I48 (holder.node_id == dead_node_id, NO epoch
-	 * filter; independent of stale-epoch sweep). */
-	ereport(DEBUG2, (errmsg_internal("cluster_grd_cleanup_on_node_dead(%d): "
-									 "skeleton no-op (spec-2.16 Step 4 D11 真激活)",
-									 dead_node_id)));
+	HASH_SEQ_STATUS status;
+	ClusterGrdEntry *entry;
+	int swept = 0;
+
+	if (cluster_grd_entry_htab == NULL) {
+		ereport(DEBUG2,
+				(errmsg_internal("cluster_grd_cleanup_on_node_dead(%d): "
+								 "entry HTAB not allocated;  no-op",
+								 dead_node_id)));
+		return;
+	}
+
+	hash_seq_init(&status, cluster_grd_entry_htab);
+	while ((entry = (ClusterGrdEntry *)hash_seq_search(&status)) != NULL) {
+		int i;
+		SpinLockAcquire(&entry->lock);
+		for (i = 0; i < PGRAC_GRD_MAX_HOLDERS; i++) {
+			if (entry->holders[i].node_id == dead_node_id) {
+				memset(&entry->holders[i], 0, sizeof(entry->holders[i]));
+				if (entry->ngranted > 0)
+					entry->ngranted--;
+				swept++;
+			}
+		}
+		for (i = 0; i < PGRAC_GRD_MAX_WAITERS; i++) {
+			if (entry->waiters[i].node_id == dead_node_id) {
+				memset(&entry->waiters[i], 0, sizeof(entry->waiters[i]));
+				if (entry->nwaiters > 0)
+					entry->nwaiters--;
+				swept++;
+			}
+		}
+		for (i = 0; i < PGRAC_GRD_MAX_CONVERTS; i++) {
+			if (entry->converts[i].node_id == dead_node_id) {
+				memset(&entry->converts[i], 0, sizeof(entry->converts[i]));
+				if (entry->nconverts > 0)
+					entry->nconverts--;
+				swept++;
+			}
+		}
+		SpinLockRelease(&entry->lock);
+	}
+
+	if (swept > 0)
+		ereport(DEBUG1, (errmsg_internal("cluster_grd_cleanup_on_node_dead(%d): "
+										"swept %d holder/waiter/convert slots",
+										dead_node_id, swept)));
 }
 
+/*
+ * spec-2.16 Step 4 D11:  stale-epoch sweep — independent rule per I48.
+ *   Filters by holder.cluster_epoch < current_epoch.  Triggered post-
+ *   reconfig epoch bump (LMON tick S2;  I47).
+ *
+ *   spec-2.15 entry holder struct (ClusterGrdHolder file-static) carries
+ *   only {node_id, mode, xid} — no cluster_epoch field.  spec-2.16
+ *   forward-link:  Step 4 D9 caller-side hook will populate holder with
+ *   the requesting backend's epoch (struct extended via spec-2.17 BAST
+ *   stack).  本 spec the field is absent → sweep is a no-op (matches
+ *   the "0 mutator caller" reality of Step 4 MVP).
+ */
 void
 cluster_grd_cleanup_stale_epoch(uint64 current_epoch)
 {
-	/* Step 1 skeleton:  log DEBUG2 only.  Step 4 D11 sweeps holders[]
-	 * per I48 (holder.cluster_epoch < current_epoch).  Independent rule
-	 * from DEAD cleanup. */
-	ereport(DEBUG2, (errmsg_internal("cluster_grd_cleanup_stale_epoch(%lu): "
-									 "skeleton no-op (spec-2.16 Step 4 D11 真激活)",
-									 (unsigned long)current_epoch)));
+	if (cluster_grd_entry_htab == NULL) {
+		ereport(DEBUG2,
+				(errmsg_internal("cluster_grd_cleanup_stale_epoch(%lu): "
+								 "entry HTAB not allocated;  no-op",
+								 (unsigned long)current_epoch)));
+		return;
+	}
+
+	/* No-op until spec-2.17 extends ClusterGrdHolder with cluster_epoch
+	 * field.  Documented forward-link;  not a TODO that breaks contract. */
+	ereport(DEBUG2,
+			(errmsg_internal("cluster_grd_cleanup_stale_epoch(%lu): holder "
+							 "struct lacks epoch field until spec-2.17;  no-op",
+							 (unsigned long)current_epoch)));
 }
 
 
