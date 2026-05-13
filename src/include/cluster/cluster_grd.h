@@ -431,6 +431,13 @@ extern uint64 cluster_grd_ges_inbound_validation_fail_count(void);
 extern uint64 cluster_grd_ges_reply_deferred_count(void);
 extern uint64 cluster_grd_ges_reply_dropped_count(void);
 
+/* atomic inc helpers (D4 outbound + D5 work_queue producers) */
+extern void cluster_grd_inc_ges_work_queue_full(void);
+extern void cluster_grd_inc_ges_cleanup_deferred(void);
+extern void cluster_grd_inc_ges_inbound_validation_fail(void);
+extern void cluster_grd_inc_ges_reply_deferred(void);
+extern void cluster_grd_inc_ges_reply_dropped(void);
+
 /*
  * should_globalize (D10) — O(1) no-catalog allowlist.
  *

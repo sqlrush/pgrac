@@ -896,6 +896,41 @@ cluster_grd_ges_reply_dropped_count(void)
 	return pg_atomic_read_u64(&cluster_grd_state->ges_reply_dropped_count);
 }
 
+void
+cluster_grd_inc_ges_work_queue_full(void)
+{
+	Assert(cluster_grd_state != NULL);
+	pg_atomic_fetch_add_u64(&cluster_grd_state->ges_work_queue_full_count, 1);
+}
+
+void
+cluster_grd_inc_ges_cleanup_deferred(void)
+{
+	Assert(cluster_grd_state != NULL);
+	pg_atomic_fetch_add_u64(&cluster_grd_state->ges_cleanup_deferred_count, 1);
+}
+
+void
+cluster_grd_inc_ges_inbound_validation_fail(void)
+{
+	Assert(cluster_grd_state != NULL);
+	pg_atomic_fetch_add_u64(&cluster_grd_state->ges_inbound_validation_fail_count, 1);
+}
+
+void
+cluster_grd_inc_ges_reply_deferred(void)
+{
+	Assert(cluster_grd_state != NULL);
+	pg_atomic_fetch_add_u64(&cluster_grd_state->ges_reply_deferred_count, 1);
+}
+
+void
+cluster_grd_inc_ges_reply_dropped(void)
+{
+	Assert(cluster_grd_state != NULL);
+	pg_atomic_fetch_add_u64(&cluster_grd_state->ges_reply_dropped_count, 1);
+}
+
 
 /* ============================================================
  * should_globalize — D10 skeleton.

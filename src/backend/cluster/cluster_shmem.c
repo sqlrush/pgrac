@@ -66,7 +66,9 @@
 #include "cluster/cluster_scn.h"	  /* cluster_scn_shmem_register (1.15) */
 #include "cluster/cluster_ges.h"	  /* cluster_ges_shmem_register (spec-2.13) */
 #include "cluster/cluster_grd.h"	  /* cluster_grd_shmem_register (spec-2.14) */
-#include "cluster/cluster_grd_pending.h" /* cluster_grd_pending_shmem_register (spec-2.16 D3) */
+#include "cluster/cluster_grd_pending.h"		/* cluster_grd_pending_shmem_register (spec-2.16 D3) */
+#include "cluster/cluster_grd_outbound.h"	/* cluster_grd_outbound_shmem_register (spec-2.16 D4) */
+#include "cluster/cluster_grd_work_queue.h" /* cluster_grd_work_queue_shmem_register (spec-2.16 D5) */
 #include "cluster/cluster_stats.h"	  /* cluster_stats_shmem_register (1.14 Sprint A) */
 #include "cluster/cluster_lmon.h"	  /* cluster_lmon_shmem_register (1.11 Sprint A) */
 #include "cluster/cluster_pcm_lock.h" /* cluster_pcm_lock_module_init (stage 1.7) */
@@ -403,6 +405,14 @@ cluster_init_shmem_module(void)
 	if (cluster_shmem_lookup_region("pgrac cluster grd pending") == NULL)
 		cluster_grd_pending_shmem_register();
 
+	/* spec-2.16 D4: register cluster_grd_outbound shmem region (LMON-
+	 * owned ring + reserved pool + 2 dirty-list;真激活 ring + nofail
+	 * counter;Step 3/4 wires real producers).  D5: work queue. */
+	if (cluster_shmem_lookup_region("pgrac cluster grd outbound") == NULL)
+		cluster_grd_outbound_shmem_register();
+	if (cluster_shmem_lookup_region("pgrac cluster grd work queue") == NULL)
+		cluster_grd_work_queue_shmem_register();
+
 	/*
 	 * spec-2.4 D2: register cluster_epoch shmem region.  64-byte cache-
 	 * line aligned (false sharing防 on hot envelope build/verify path);
@@ -508,6 +518,13 @@ cluster_request_shmem(void)
 	 * without re-triggering RequestNamedLWLockTranche.
 	 */
 	cluster_grd_request_lwlocks();
+
+	/* spec-2.16 D4/D5:  request named LWLock tranches for outbound ring
+	 * and work queue (single LWLock each).  Same lifecycle constraint
+	 * as cluster_grd_request_lwlocks — call ONCE inside
+	 * process_shmem_requests_in_progress window. */
+	RequestNamedLWLockTranche("ClusterGrdOutbound", 1);
+	RequestNamedLWLockTranche("ClusterGrdWorkQueue", 1);
 }
 
 /*
