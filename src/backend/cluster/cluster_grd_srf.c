@@ -45,6 +45,7 @@
 #include "cluster/cluster_guc.h" /* cluster_node_id */
 
 #define CLUSTER_GET_GRD_SHARDS_NCOLS 3
+#define CLUSTER_GET_GRD_ENTRIES_NCOLS 11
 
 /*
  * NB: PG_FUNCTION_INFO_V1(cluster_get_grd_shards) is emitted in
@@ -73,6 +74,51 @@ cluster_get_grd_shards(PG_FUNCTION_ARGS)
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
+
+	return (Datum)0;
+}
+
+
+/*
+ * spec-2.15 D8:  cluster_get_grd_entries SRF body.
+ *
+ *  Diagnostic / observability only — NOT for production hot-path queries
+ *  (P1.5).  Iterates the entry HTAB via cluster_grd_entries_walk()
+ *  visitor;  per-entry slock_t snapshot keeps each row consistent.
+ *
+ *  spec-2.16 forward-link TODO (P2.4 + I14):  before caller-side
+ *  LockAcquire integration ships, this visitor must amend locking
+ *  (wrap hash_seq_search in 4096-shard LW_SHARED acquire OR chunked
+ *  snapshot) to defend against concurrent HASH_ENTER_NULL writers.
+ *  本 spec 0 caller → 0 row → 无并发问题.
+ *
+ *  NB: PG_FUNCTION_INFO_V1(cluster_get_grd_entries) is emitted in
+ *  cluster_ic.c (always-linked file), so pg_proc.dat resolves the
+ *  symbol in both --enable-cluster and --disable-cluster builds.
+ */
+static void
+emit_grd_entry_row(void *ctx, const int32 row_fields[11])
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *)ctx;
+	Datum values[CLUSTER_GET_GRD_ENTRIES_NCOLS];
+	bool nulls[CLUSTER_GET_GRD_ENTRIES_NCOLS];
+	int i;
+
+	memset(nulls, 0, sizeof(nulls));
+	for (i = 0; i < CLUSTER_GET_GRD_ENTRIES_NCOLS; i++)
+		values[i] = Int32GetDatum(row_fields[i]);
+
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
+
+Datum
+cluster_get_grd_entries(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *)fcinfo->resultinfo;
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	cluster_grd_entries_walk(emit_grd_entry_row, (void *)rsinfo);
 
 	return (Datum)0;
 }

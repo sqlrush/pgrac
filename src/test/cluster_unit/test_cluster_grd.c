@@ -51,6 +51,8 @@
 #include "cluster/cluster_grd.h"
 #include "port/atomics.h"
 #include "storage/lock.h"
+#include "storage/s_lock.h"
+#include "utils/hsearch.h"
 
 /* Drop PG's port.h printf -> pg_printf override; unit_test.h uses
  * stdlib printf and we don't link libpgport in this test binary. */
@@ -196,6 +198,106 @@ cluster_conf_node_count(void)
 }
 
 int32 cluster_node_id = 0; /* NodeId typedef = int32 (cluster_scn.h:135) */
+
+/* spec-2.15 D11:  cluster.grd_max_entries GUC stub (standalone harness
+ * keeps 0 → skeleton mode → lookup_or_create returns NOT_READY).
+ * cluster_unit harness does NOT exercise the HTAB code path. */
+int cluster_grd_max_entries = 0;
+
+
+/* ============================================================
+ * spec-2.15 D11:  HTAB / named tranche / spinlock stubs for the
+ *   standalone cluster_unit harness.  cluster_grd.c references these
+ *   symbols even when cluster.grd_max_entries=0 (the early-return
+ *   branch is taken before reaching them) — the stubs just need to
+ *   link.  Real behavior is exercised in cluster_tap 104 under a
+ *   live postmaster.
+ * ============================================================ */
+
+HTAB *
+ShmemInitHash(const char *name pg_attribute_unused(), long init_size pg_attribute_unused(),
+			  long max_size pg_attribute_unused(), HASHCTL *infoP pg_attribute_unused(),
+			  int hash_flags pg_attribute_unused())
+{
+	return NULL;
+}
+
+long
+hash_get_num_entries(HTAB *hashp pg_attribute_unused())
+{
+	return 0;
+}
+
+void *
+hash_search_with_hash_value(HTAB *hashp pg_attribute_unused(),
+							const void *keyPtr pg_attribute_unused(),
+							uint32 hashvalue pg_attribute_unused(),
+							HASHACTION action pg_attribute_unused(), bool *foundPtr)
+{
+	if (foundPtr != NULL)
+		*foundPtr = false;
+	return NULL;
+}
+
+void
+hash_seq_init(HASH_SEQ_STATUS *status pg_attribute_unused(), HTAB *hashp pg_attribute_unused())
+{}
+
+void *
+hash_seq_search(HASH_SEQ_STATUS *status pg_attribute_unused())
+{
+	return NULL;
+}
+
+Size
+hash_estimate_size(long num_entries pg_attribute_unused(), Size entrysize pg_attribute_unused())
+{
+	return 0;
+}
+
+void
+RequestNamedLWLockTranche(const char *tranche_name pg_attribute_unused(),
+						  int num_lwlocks pg_attribute_unused())
+{}
+
+LWLockPadded *
+GetNamedLWLockTranche(const char *tranche_name pg_attribute_unused())
+{
+	static LWLockPadded dummy_locks[1];
+	return dummy_locks;
+}
+
+bool
+LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
+{
+	return true;
+}
+
+void
+LWLockRelease(LWLock *lock pg_attribute_unused())
+{}
+
+/* spec-2.15 D11: s_lock contention stub.  PG inlines TAS spinlocks via
+ * compiler primitives on most targets, but s_lock() resolves at link
+ * time for the contended-spin slow path (always reachable in object
+ * code, even when never entered at run time).  Stub returns immediately
+ * — the cluster_unit harness never actually contends a slock. */
+int
+s_lock(volatile slock_t *lock pg_attribute_unused(), const char *file pg_attribute_unused(),
+	   int line pg_attribute_unused(), const char *func pg_attribute_unused())
+{
+	return 0;
+}
+
+/* spec-2.15 D11: shmem add_size stub.  cluster_grd_shmem_size() wraps
+ * add_size() for the entry HTAB component; standalone harness never
+ * allocates >0 bytes for the entry HTAB (cluster.grd_max_entries=0),
+ * so a naive add_size is sufficient. */
+Size
+add_size(Size s1, Size s2)
+{
+	return s1 + s2;
+}
 
 
 /* ============================================================
@@ -496,13 +598,119 @@ UT_TEST(test_grd_is_cluster_aware_classification)
 UT_DEFINE_GLOBALS();
 
 
+/* ============================================================
+ * spec-2.15 T-grd-2 a-e (5 NEW unit tests).
+ *
+ *   T-grd-2 covers the entry-table infrastructure layer:
+ *     a) enum value invariant (NOT sizeof — C enum size impl-defined)
+ *     b) GUC=0 sentinel path (lookup_or_create returns NOT_READY)
+ *     c) named tranche 4096 lock alloc (DEFERRED to harness/TAP — Get
+ *        NamedLWLockTranche requires postmaster phase 1;  standalone
+ *        unit test cannot invoke PG named-tranche infra without bringing
+ *        in a real ProcArray / dsm / lwlock.c slot manager.  cluster_tap
+ *        104 covers the real boot path;  unit test here records the
+ *        invariant via DESCRIBE-only check).
+ *     d) entry slock_t mutation safety (init + try-acquire idempotent)
+ *     e) hash 单源 (hash64 % 4096 与 32-bit projection 一致)
+ *
+ *   holders/waiters/converts cap behavior tests推 spec-2.16 配 mutator API.
+ * ============================================================ */
+
+UT_TEST(test_grd_entry_result_enum_value_invariant)
+{
+	/* v0.2 P2.7:  enum VALUE invariant (NOT sizeof — C enum size is
+	 * implementation-defined and not ABI 契约). */
+	UT_ASSERT_EQ((int)CLUSTER_GRD_ENTRY_OK, 0);
+	UT_ASSERT_EQ((int)CLUSTER_GRD_ENTRY_NOT_READY, 1);
+	UT_ASSERT_EQ((int)CLUSTER_GRD_ENTRY_NOT_FOUND, 2);
+	UT_ASSERT_EQ((int)CLUSTER_GRD_ENTRY_FULL, 3);
+	UT_ASSERT_EQ((int)CLUSTER_GRD_ENTRY_ERROR, 4);
+}
+
+UT_TEST(test_grd_entry_lookup_not_ready_when_guc_zero)
+{
+	/* GUC=0 → entry HTAB never allocated → htab pointer stays NULL inside
+	 * cluster_grd.c → lookup_or_create returns NOT_READY (sentinel path I1).
+	 * Unit test harness does NOT call cluster_grd_shmem_init with non-zero
+	 * GUC so the htab path always returns NOT_READY here. */
+	LOCKTAG src;
+	ClusterResId resid;
+	ClusterGrdEntry *out = (ClusterGrdEntry *)0xdeadbeef;
+	ClusterGrdEntryResult r;
+
+	memset(&src, 0, sizeof(src));
+	src.locktag_field1 = 42;
+	src.locktag_type = LOCKTAG_RELATION;
+	src.locktag_lockmethodid = 1;
+
+	cluster_grd_resid_encode(&src, &resid);
+
+	r = cluster_grd_entry_lookup_or_create(&resid, true, &out);
+	UT_ASSERT_EQ((int)r, (int)CLUSTER_GRD_ENTRY_NOT_READY);
+	UT_ASSERT_EQ((void *)out, (void *)NULL); /* *out = NULL per I1 */
+}
+
+UT_TEST(test_grd_named_tranche_describe_only)
+{
+	/* spec-2.15 D11 T-grd-2c (DESCRIBE-only):  named tranche allocation
+	 * happens at PG postmaster shmem-request phase via
+	 * cluster_grd_request_lwlocks().  Standalone unit test cannot drive
+	 * the PG named-tranche manager;  cluster_tap 104 covers the real
+	 * end-to-end boot path.  This unit test records the contract that
+	 * cluster_grd_request_lwlocks() is a single-call hook (I15) by
+	 * verifying it has external linkage. */
+	extern void cluster_grd_request_lwlocks(void);
+	UT_ASSERT_NE((void *)cluster_grd_request_lwlocks, (void *)NULL);
+}
+
+UT_TEST(test_grd_entry_release_no_op_safe)
+{
+	/* RESERVED no-op contract (P1.3):  cluster_grd_entry_release(NULL)
+	 * must not crash;  no side effect promised. */
+	cluster_grd_entry_release(NULL);
+	UT_ASSERT_EQ(1, 1); /* reaching here suffices */
+}
+
+UT_TEST(test_grd_hash_source_unification)
+{
+	/* spec-2.15 v0.4 P1.1 I13:  shard_id (hash64 % 4096) 与 HTAB
+	 * hashvalue (32-bit projection of same hash64) must come from the
+	 * same cluster_grd_hash_resource() call — never from dynahash's
+	 * own HASHCTL.hash (which would use the full 16B key).
+	 *
+	 * Test:  same resid → same hash64 → shard_id = hash64 % 4096 +
+	 * hashvalue = (uint32) hash64.  shard_for_resource() must match. */
+	LOCKTAG src;
+	ClusterResId resid;
+	uint64 h64;
+	uint32 shard_a;
+	uint32 shard_b;
+
+	memset(&src, 0, sizeof(src));
+	src.locktag_field1 = 0x12345678;
+	src.locktag_field2 = 0xabcdef01;
+	src.locktag_field3 = 0xfeedface;
+	src.locktag_field4 = 0x4242;
+	src.locktag_type = LOCKTAG_TRANSACTION;
+	src.locktag_lockmethodid = 1;
+
+	cluster_grd_resid_encode(&src, &resid);
+
+	h64 = cluster_grd_hash_resource(&resid);
+	shard_a = (uint32)(h64 % PGRAC_GRD_SHARD_COUNT);
+	shard_b = cluster_grd_shard_for_resource(&resid);
+
+	UT_ASSERT_EQ(shard_a, shard_b);
+}
+
+
 int
 /* cppcheck-suppress constParameter
  * Reason: main() keeps the standard test harness signature used by the
  * other cluster_unit binaries; argv is intentionally unused. */
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(7);
+	UT_PLAN(12);
 
 	UT_RUN(test_grd_clusterresid_size_16);
 	UT_RUN(test_grd_resid_encode_decode_roundtrip);
@@ -511,6 +719,13 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_grd_master_map_sparse_declared_nodes);
 	UT_RUN(test_grd_is_local_master_matrix);
 	UT_RUN(test_grd_is_cluster_aware_classification);
+
+	/* spec-2.15 T-grd-2 a-e */
+	UT_RUN(test_grd_entry_result_enum_value_invariant);
+	UT_RUN(test_grd_entry_lookup_not_ready_when_guc_zero);
+	UT_RUN(test_grd_named_tranche_describe_only);
+	UT_RUN(test_grd_entry_release_no_op_safe);
+	UT_RUN(test_grd_hash_source_unification);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

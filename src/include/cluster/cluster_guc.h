@@ -182,6 +182,24 @@ extern int cluster_shmem_max_regions;
 
 
 /* ----------
+ * cluster.grd_max_entries (spec-2.15)
+ *
+ *	Maximum number of cluster_grd entry table slots.  Default 0 means
+ *	skeleton mode: entry HTAB not allocated, cluster_grd_entry_lookup_
+ *	or_create() returns CLUSTER_GRD_ENTRY_NOT_READY.  Non-zero enables
+ *	ShmemInitHash allocation.
+ *
+ *	v0.4 P1.1:  HASH_PARTITION=4096 forces dynahash nbuckets >= 4096,
+ *	so hash_init_max_size = Max(GUC, 4096) and shmem reservation comes
+ *	from hash_estimate_size(Max(GUC, 4096), sizeof(ClusterGrdEntry)) —
+ *	even GUC=16 reserves ~3-5 MB shmem.
+ *	PGC_POSTMASTER.
+ * ----------
+ */
+extern int cluster_grd_max_entries;
+
+
+/* ----------
  * cluster.phase{1..4}_timeout (Stage 1.10, spec-1.10 §2.2)
  *
  *	Per-phase wall-clock deadlines (seconds) for postmaster startup

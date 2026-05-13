@@ -493,6 +493,15 @@ cluster_request_shmem(void)
 	idx = 0;
 	while (cluster_shmem_iter_regions(&idx, &region))
 		RequestAddinShmemSpace(region.size_fn());
+
+	/*
+	 * spec-2.15 v0.3 P1.1 + I15:  named tranche request hook is invoked
+	 * exactly once from within the process_shmem_requests_in_progress
+	 * window — kept outside size_fn so that diagnostic paths
+	 * (cluster_shmem_get_total_bytes) may call size_fn repeatedly
+	 * without re-triggering RequestNamedLWLockTranche.
+	 */
+	cluster_grd_request_lwlocks();
 }
 
 /*

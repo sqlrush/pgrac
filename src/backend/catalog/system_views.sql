@@ -1635,6 +1635,36 @@ CREATE VIEW pg_cluster_grd_shards AS
 REVOKE ALL ON pg_cluster_grd_shards FROM PUBLIC;
 GRANT SELECT ON pg_cluster_grd_shards TO PUBLIC;
 
+-- PGRAC: pg_cluster_grd_entries (spec-2.15 D7; 2026-05-13).
+--   Diagnostic / observability snapshot of the cluster_grd entry table.
+--   Backed by cluster_get_grd_entries (OID 8922).  NOT for production
+--   hot-path queries (P1.5):  hash_seq_search walks the entire HTAB
+--   under per-entry slock_t snapshot;  large N → high cost.  Production
+--   should use the dump_grd 6 NEW emit_row counters (cluster_state
+--   category='grd') for O(1) reads.
+--
+--   spec-2.16 forward-link (P2.4 + I14):  before caller-side
+--   LockAcquire integration ships, the SRF body must amend locking
+--   (hash_seq_search wrapped in 4096-shard LWLock LW_SHARED acquire
+--   OR chunked snapshot) to defend against concurrent HASH_ENTER_NULL.
+--   本 spec 0 caller → SRF 0 row → 无并发问题.
+CREATE VIEW pg_cluster_grd_entries AS
+    SELECT shard_id,
+           field1,
+           field2,
+           field3,
+           field4,
+           type,
+           lockmethodid,
+           ngranted,
+           nwaiters,
+           nconverts,
+           state_flags
+      FROM cluster_get_grd_entries();
+
+REVOKE ALL ON pg_cluster_grd_entries FROM PUBLIC;
+GRANT SELECT ON pg_cluster_grd_entries TO PUBLIC;
+
 -- PGRAC: pg_cluster_state (stage 0.29).
 --   One-stop diagnostic snapshot covering every cluster subsystem's
 --   runtime state expressed as (category, key, value) triples:

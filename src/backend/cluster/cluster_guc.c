@@ -60,6 +60,7 @@ char *cluster_injection_points = NULL; /* boot value filled by DefineCustomStrin
 int cluster_shared_storage_backend = CLUSTER_SHARED_FS_BACKEND_STUB;
 bool cluster_smgr_user_relations = false;
 int cluster_shmem_max_regions = 64;
+int cluster_grd_max_entries = 0;
 
 /*
  * Spec-1.10 (2026-05-03) phase transition timeouts (HC4 user 修订 4).
@@ -387,6 +388,38 @@ cluster_init_guc(void)
 										 "exceeded\"."),
 							&cluster_shmem_max_regions, 64, 18, 256,
 							PGC_POSTMASTER, /* registry array is palloc'd once at init */
+							0,				/* flags */
+							NULL,			/* check_hook */
+							NULL,			/* assign_hook */
+							NULL);			/* show_hook */
+
+	/*
+	 * spec-2.15:  cluster.grd_max_entries
+	 *
+	 *  Maximum number of cluster_grd entry table slots.  Default 0 — entry
+	 *  HTAB not allocated; cluster_grd_entry_lookup_or_create() returns
+	 *  CLUSTER_GRD_ENTRY_NOT_READY sentinel.  Non-zero enables ShmemInitHash
+	 *  allocation;  v0.4 P1.1:  PG dynahash HASH_PARTITION=4096 forces
+	 *  nbuckets >= 4096, so the effective init_max_size used internally is
+	 *  Max(GUC, 4096) and shmem reservation comes from
+	 *  hash_estimate_size(Max(GUC, 4096), sizeof(ClusterGrdEntry)).  Even
+	 *  GUC=16 reserves ~3-5MB shmem.  production 推荐 NBuffers × 2 (spec-
+	 *  2.16+ 真激活 caller-side LockAcquire 集成时调整).
+	 *
+	 *  PGC_POSTMASTER because ShmemInitHash is called once at postmaster
+	 *  init from this value.
+	 */
+	DefineCustomIntVariable("cluster.grd_max_entries",
+							gettext_noop("Maximum number of cluster_grd entry table slots."),
+							gettext_noop("Default 0 means skeleton mode: entry HTAB not allocated, "
+										 "cluster_grd_entry_lookup_or_create() returns NOT_READY. "
+										 "Non-zero allocates the entry table.  Note PG dynahash "
+										 "HASH_PARTITION=4096 forces internal nbuckets >= 4096, "
+										 "so even GUC=16 reserves ~3-5MB shmem via "
+										 "hash_estimate_size(Max(GUC, 4096), entry_size). "
+										 "Production 推荐 NBuffers × 2 (spec-2.16+ caller-side)."),
+							&cluster_grd_max_entries, 0, 0, 1048576,
+							PGC_POSTMASTER, /* ShmemInitHash size fixed at init */
 							0,				/* flags */
 							NULL,			/* check_hook */
 							NULL,			/* assign_hook */

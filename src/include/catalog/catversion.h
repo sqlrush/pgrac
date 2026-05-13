@@ -251,6 +251,9 @@
 /* spec-2.14 D8 (2026-05-13):  add cluster_get_grd_shards SRF + pg_cluster_grd_shards
  * view + cluster_grd shmem region.  catversion bump to invalidate any catalog-
  * aware tooling caches when spec-2.14 GRD routing substrate lands. */
-#define CATALOG_VERSION_NO 202605270
+/* spec-2.15 D9 (2026-05-13):  add cluster_get_grd_entries SRF + pg_cluster_grd_entries
+ * view + cluster_grd entry HTAB + cluster.grd_max_entries GUC + named tranche
+ * ClusterGrdShard.  catversion bump for catalog-aware tooling caches. */
+#define CATALOG_VERSION_NO 202605280
 
 #endif

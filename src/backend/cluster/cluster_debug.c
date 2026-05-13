@@ -785,6 +785,18 @@ dump_grd(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_grd_resid_encode_count()));
 	emit_row(rsinfo, "grd", "grd_master_map_refresh_count",
 			 fmt_int64((int64)cluster_grd_master_map_refresh_count_get()));
+
+	/* spec-2.15 v0.3 6 NEW emit_row (3 derived + 3 atomic;
+	 * holder/waiter/convert counter 推 spec-2.16). */
+	emit_row(rsinfo, "grd", "grd_max_entries", fmt_int32((int32)cluster_grd_max_entries_get()));
+	emit_row(rsinfo, "grd", "grd_entry_count", fmt_int32((int32)cluster_grd_entry_count()));
+	emit_row(rsinfo, "grd", "grd_allocated_bytes", fmt_int64((int64)cluster_grd_allocated_bytes()));
+	emit_row(rsinfo, "grd", "grd_entry_create_count",
+			 fmt_int64((int64)cluster_grd_entry_create_count()));
+	emit_row(rsinfo, "grd", "grd_entry_lookup_hit_count",
+			 fmt_int64((int64)cluster_grd_entry_lookup_hit_count()));
+	emit_row(rsinfo, "grd", "grd_entry_full_count",
+			 fmt_int64((int64)cluster_grd_entry_full_count()));
 }
 
 

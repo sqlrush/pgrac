@@ -919,6 +919,43 @@ cluster_grd_master_map_refresh_count_get(void)
 	return 0;
 }
 
+/* spec-2.15 D12 L104 stubs:  6 NEW accessor for dump_grd 6 NEW emit_row. */
+int
+cluster_grd_max_entries_get(void)
+{
+	return 0;
+}
+
+int
+cluster_grd_entry_count(void)
+{
+	return 0;
+}
+
+Size
+cluster_grd_allocated_bytes(void)
+{
+	return 0;
+}
+
+uint64
+cluster_grd_entry_create_count(void)
+{
+	return 0;
+}
+
+uint64
+cluster_grd_entry_lookup_hit_count(void)
+{
+	return 0;
+}
+
+uint64
+cluster_grd_entry_full_count(void)
+{
+	return 0;
+}
+
 
 UT_DEFINE_GLOBALS();
 

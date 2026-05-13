@@ -35,14 +35,17 @@
 
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_grd.h"
-#include "cluster/cluster_guc.h" /* cluster_node_id */
+#include "cluster/cluster_guc.h" /* cluster_node_id, cluster_grd_max_entries */
 #include "cluster/cluster_shmem.h"
 #include "common/hashfn.h" /* hash_bytes_extended (spec-2.29 同款) */
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/lock.h"
+#include "storage/lwlock.h"
 #include "storage/shmem.h"
+#include "storage/spin.h"
 #include "utils/elog.h"
+#include "utils/hsearch.h"
 
 
 /* ============================================================
@@ -51,23 +54,136 @@
 
 static ClusterGrdShared *cluster_grd_state = NULL;
 
+/* spec-2.15 v0.3 P1.3:  Per-shard LWLock array (named tranche).  4096
+ * LWLock managed by PG lwlock.c — cluster_grd_shmem_init only obtains
+ * the array pointer; PG auto-initializes the lock objects. */
+static LWLockPadded *cluster_grd_shard_locks = NULL;
+
+/* spec-2.15:  HTAB for entry storage.  NULL when cluster.grd_max_entries
+ * = 0 (skeleton mode → NOT_READY sentinel) or non-cluster builds. */
+static HTAB *cluster_grd_entry_htab = NULL;
+
+/* spec-2.15 v0.4 P1.1:  HTAB init size = Max(GUC, PGRAC_GRD_SHARD_COUNT)
+ * — HASH_PARTITION=4096 forces dynahash nbuckets >= 4096 (nbuckets =
+ * max(next_pow2(n), num_partitions)).  naive max_size=GUC=16 would let
+ * ShmemInitHash severely under-estimate size → init FATAL.  Use
+ * hash_estimate_size(hash_init_max_size, sizeof(ClusterGrdEntry)) for
+ * real reservation.  Cached at shmem_size first-call for diagnostic
+ * consistency (size_fn must stay pure per I15).
+ */
+static Size cluster_grd_entries_alloc_bytes = 0;
+
 
 /* ============================================================
- * Shmem region lifecycle (mirror cluster_ges pattern).
+ * spec-2.15:  Private file-static entry struct body (P1.1 opaque body —
+ *   header only declares opaque handle).  struct layout reserves
+ *   holders/waiters/converts arrays for spec-2.16 mutator API;  本 spec
+ *   仅初始化 zero,无 mutation 路径.
+ *
+ *   v0.3 scope 收紧 P1.3:  cap constants live here (private),不暴露;
+ *   spec-2.16 mutator API public extern 时再 expose 或 keep private.
  * ============================================================ */
+
+#define PGRAC_GRD_MAX_HOLDERS 16
+#define PGRAC_GRD_MAX_WAITERS 16
+#define PGRAC_GRD_MAX_CONVERTS 8
+
+typedef struct ClusterGrdHolder {
+	int32 node_id;
+	LOCKMODE mode;
+	TransactionId xid;
+} ClusterGrdHolder;
+
+typedef struct ClusterGrdWaiter {
+	int32 node_id;
+	LOCKMODE mode;
+	TimestampTz wait_start;
+} ClusterGrdWaiter;
+
+typedef struct ClusterGrdConvert {
+	int32 node_id;
+	LOCKMODE current_mode;
+	LOCKMODE requested_mode;
+} ClusterGrdConvert;
+
+struct ClusterGrdEntry {
+	ClusterResId resid; /* hash key (16B) */
+	slock_t lock;		/* entry-level spinlock (Q11 + P1.3 minor) */
+	int ngranted;
+	ClusterGrdHolder holders[PGRAC_GRD_MAX_HOLDERS];
+	int nwaiters;
+	ClusterGrdWaiter waiters[PGRAC_GRD_MAX_WAITERS];
+	int nconverts;
+	ClusterGrdConvert converts[PGRAC_GRD_MAX_CONVERTS];
+	uint64 last_modified_scn;
+	uint32 state_flags; /* 预留 spec-2.16 grant pending/DRM in-flight */
+};
+
+
+/* ============================================================
+ * spec-2.15 v0.3 P1.1:  named tranche request hook.  Single-call
+ *   contract — invoked once by cluster_request_shmem() inside the
+ *   process_shmem_requests_in_progress window.  size_fn stays pure so
+ *   diagnostic paths (cluster_shmem_get_total_bytes) can call it N
+ *   times without triggering RequestNamedLWLockTranche (which is
+ *   restricted to the request phase).
+ * ============================================================ */
+
+void
+cluster_grd_request_lwlocks(void)
+{
+	RequestNamedLWLockTranche("ClusterGrdShard", PGRAC_GRD_SHARD_COUNT);
+}
+
+
+/* ============================================================
+ * Shmem region lifecycle.
+ *
+ *   spec-2.15 v0.4 P1.1:  entry HTAB allocation gated on
+ *   cluster.grd_max_entries GUC.  GUC=0 → only ClusterGrdShared
+ *   allocated (skeleton mode, lookup_or_create returns NOT_READY).
+ *   GUC>0 → hash_init_max_size = Max(GUC, PGRAC_GRD_SHARD_COUNT) and
+ *   ShmemInitHash uses that size; grd_allocated_bytes reflects the
+ *   hash_estimate_size() pre-computation.
+ * ============================================================ */
+
+static Size
+grd_entries_init_max_size(void)
+{
+	/* v0.4 P1.1:  HASH_PARTITION=4096 forces nbuckets >= 4096; raise
+	 * the dynahash init max_size to match so the ShmemInitHash
+	 * reservation is realistic. */
+	if (cluster_grd_max_entries <= 0)
+		return 0;
+	return Max((Size)cluster_grd_max_entries, (Size)PGRAC_GRD_SHARD_COUNT);
+}
+
+static Size
+grd_entries_estimate_bytes(void)
+{
+	Size init_max_size = grd_entries_init_max_size();
+
+	if (init_max_size == 0)
+		return 0;
+	return hash_estimate_size(init_max_size, sizeof(ClusterGrdEntry));
+}
 
 Size
 cluster_grd_shmem_size(void)
 {
-	return sizeof(ClusterGrdShared);
+	/* size_fn MUST stay pure (idempotent) per I15 — cluster_shmem_get_
+	 * total_bytes() calls this N times for diagnostics.  No side effect
+	 * (no RequestNamedLWLockTranche, no global state mutation). */
+	return add_size(sizeof(ClusterGrdShared), grd_entries_estimate_bytes());
 }
 
 void
 cluster_grd_shmem_init(void)
 {
 	bool found;
+	Size entry_alloc = grd_entries_estimate_bytes();
 
-	cluster_grd_state = ShmemInitStruct("pgrac cluster grd", cluster_grd_shmem_size(), &found);
+	cluster_grd_state = ShmemInitStruct("pgrac cluster grd", sizeof(ClusterGrdShared), &found);
 	if (!found) {
 		int i;
 
@@ -80,6 +196,51 @@ cluster_grd_shmem_init(void)
 		pg_atomic_init_u64(&cluster_grd_state->local_master_lookup_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->remote_master_lookup_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->master_map_refresh_count, 0);
+
+		/* spec-2.15 v0.3 NEW 3 atomic counter. */
+		pg_atomic_init_u64(&cluster_grd_state->entry_create_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->entry_lookup_hit_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->entry_full_count, 0);
+	}
+
+	/* spec-2.15 v0.4 P1.1:  entry HTAB allocation gated on GUC.  GUC=0
+	 * → htab stays NULL → lookup_or_create returns NOT_READY → entire
+	 * shard partition LWLock path also unused → skip GetNamedLWLockTranche
+	 * lookup entirely.  Bootstrap mode (initdb --boot) runs cluster_init_
+	 * shmem without process_shmem_requests / cluster_grd_request_lwlocks,
+	 * so the tranche is not registered there;  gating here keeps the
+	 * skeleton-mode path FATAL-free. */
+	cluster_grd_shard_locks = NULL;
+
+	if (entry_alloc > 0) {
+		HASHCTL info;
+		Size init_max_size = grd_entries_init_max_size();
+
+		/* spec-2.15 v0.3 P1.3 + I15:  obtain the named tranche array
+		 * pointer (PG lwlock.c auto-initialized the 4096 LWLock;
+		 * DO NOT call LWLockInitialize manually per I4 + I15).  Only
+		 * reachable when cluster_grd_request_lwlocks() has run, i.e.
+		 * full postmaster init under cluster.grd_max_entries > 0. */
+		cluster_grd_shard_locks = GetNamedLWLockTranche("ClusterGrdShard");
+
+		memset(&info, 0, sizeof(info));
+		info.keysize = sizeof(ClusterResId);
+		info.entrysize = sizeof(ClusterGrdEntry);
+		info.num_partitions = PGRAC_GRD_SHARD_COUNT;
+		/* spec-2.15 v0.4 P1.1 I13:  HASHCTL.hash NOT set — single hash
+		 * source 走 hash_search_with_hash_value(hashvalue) with
+		 * cluster_grd_hash_resource() 32-bit projection.  Leaving
+		 * info.hash NULL means dynahash uses tag_hash by default for
+		 * HASH_BLOBS — but we always call hash_search_with_hash_value
+		 * so the default never fires; defensive choice. */
+
+		cluster_grd_entry_htab
+			= ShmemInitHash("pgrac cluster grd entries", init_max_size, init_max_size, &info,
+							HASH_ELEM | HASH_BLOBS | HASH_PARTITION);
+		cluster_grd_entries_alloc_bytes = entry_alloc;
+	} else {
+		cluster_grd_entry_htab = NULL;
+		cluster_grd_entries_alloc_bytes = 0;
 	}
 }
 
@@ -409,3 +570,220 @@ cluster_grd_master_map_refresh_count_get(void)
  * spec-2.3 cluster_ic_msg_types_srf.c split pattern) so test_cluster_grd
  * standalone unit test可以 link cluster_grd.o without pulling in
  * InitMaterializedSRF / tuplestore_putvalues / etc PG runtime symbols. */
+
+
+/* ============================================================
+ * spec-2.15:  Entry table API — lookup/create + release.
+ *
+ *   I13 hash 单源:cluster_grd_hash_resource() 算 14B hash;shard_id =
+ *   hash64 % 4096;HTAB bucket via hash_search_with_hash_value() with
+ *   32-bit projection of same hash64.  绝不让 dynahash 自己 hash key.
+ *
+ *   I17 double-cap check:soft cap (hash_get_num_entries vs GUC) in
+ *   shard lock + hard cap (HASH_ENTER_NULL → NULL) defensive.  Race
+ *   window ±N (N=concurrent shard count) — Oracle GRD soft cap 同款.
+ * ============================================================ */
+
+ClusterGrdEntryResult
+cluster_grd_entry_lookup_or_create(const ClusterResId *resid, bool create, ClusterGrdEntry **out)
+{
+	uint64 hash64;
+	uint32 shard_id;
+	uint32 hashvalue;
+	bool found;
+	HASHACTION action;
+	ClusterGrdEntry *entry;
+
+	Assert(resid != NULL);
+	Assert(out != NULL);
+	if (resid == NULL || out == NULL)
+		return CLUSTER_GRD_ENTRY_ERROR;
+
+	*out = NULL;
+
+	/* Step 1: skeleton-mode fast path (cluster.grd_max_entries=0 → htab
+	 * NULL → NOT_READY).  caller 必处理(spec-2.16 caller-side 真激活前
+	 * 固定走此路径). */
+	if (cluster_grd_entry_htab == NULL)
+		return CLUSTER_GRD_ENTRY_NOT_READY;
+
+	/* Step 2: I13 single hash source — shard_id 与 HTAB bucket 必同源.
+	 * cluster_grd_hash_resource() returns 14B hash (skip field4); use
+	 * % 4096 for shard_id and 32-bit projection for HTAB hashvalue. */
+	hash64 = cluster_grd_hash_resource(resid);
+	shard_id = (uint32)(hash64 % PGRAC_GRD_SHARD_COUNT);
+	hashvalue = (uint32)hash64;
+
+	/* Step 3: shard partition LWLock acquire (I5 + I6 — shard partition
+	 * LWLock 必先于 entry slock_t). */
+	LWLockAcquire(&cluster_grd_shard_locks[shard_id].lock, LW_EXCLUSIVE);
+
+	/* Step 4: v0.4 P1.2 double-cap check — soft cap first (I17).
+	 * HASH_PARTITION=4096 lets nbuckets >= 4096 even when GUC=16,
+	 * so HASH_ENTER_NULL alone cannot stop the soft cap. */
+	if (create && hash_get_num_entries(cluster_grd_entry_htab) >= cluster_grd_max_entries) {
+		LWLockRelease(&cluster_grd_shard_locks[shard_id].lock);
+		pg_atomic_fetch_add_u64(&cluster_grd_state->entry_full_count, 1);
+		ereport(LOG, (errmsg("cluster_grd: entry table soft cap reached "
+							 "(cluster.grd_max_entries = %d)",
+							 cluster_grd_max_entries)));
+		return CLUSTER_GRD_ENTRY_FULL;
+	}
+
+	/* Step 5: HASH_FIND or HASH_ENTER_NULL (v0.3 P1.2 — NOT HASH_ENTER
+	 * because the latter ereport(ERROR) FATAL cannot support the FULL
+	 * sentinel; HASH_ENTER_NULL returns NULL on shmem OOM for the hard
+	 * cap defensive bounce). */
+	action = create ? HASH_ENTER_NULL : HASH_FIND;
+	entry = hash_search_with_hash_value(cluster_grd_entry_htab, resid, hashvalue, action, &found);
+
+	/* Step 6: sentinel 5 paths — NOT_FOUND on lookup miss; FULL on
+	 * HASH_ENTER_NULL OOM defensive bounce; OK otherwise. */
+	if (entry == NULL) {
+		LWLockRelease(&cluster_grd_shard_locks[shard_id].lock);
+		if (create) {
+			/* HASH_ENTER_NULL returned NULL — shmem OOM defensive. */
+			pg_atomic_fetch_add_u64(&cluster_grd_state->entry_full_count, 1);
+			ereport(LOG, (errmsg("cluster_grd: HASH_ENTER_NULL returned NULL "
+								 "(shmem OOM defensive bounce)")));
+			return CLUSTER_GRD_ENTRY_FULL;
+		}
+		return CLUSTER_GRD_ENTRY_NOT_FOUND;
+	}
+
+	if (!found && create) {
+		/* New entry — init slock + body zero. */
+		SpinLockInit(&entry->lock);
+		entry->ngranted = 0;
+		entry->nwaiters = 0;
+		entry->nconverts = 0;
+		entry->last_modified_scn = 0;
+		entry->state_flags = 0;
+		/* holders / waiters / converts arrays left uninitialized;
+		 * spec-2.16 mutator path initializes per-slot on add. */
+		pg_atomic_fetch_add_u64(&cluster_grd_state->entry_create_count, 1);
+	}
+	pg_atomic_fetch_add_u64(&cluster_grd_state->entry_lookup_hit_count, 1);
+
+	/* Step 7: release shard partition LWLock — caller holds entry handle. */
+	LWLockRelease(&cluster_grd_shard_locks[shard_id].lock);
+
+	*out = entry;
+	return CLUSTER_GRD_ENTRY_OK;
+}
+
+void
+cluster_grd_entry_release(ClusterGrdEntry *entry)
+{
+	/* spec-2.15 RESERVED no-op (v0.3 P1.3 contract unified — header doc
+	 * + impl 一致).  本 spec 不保证任何 side effect:不 decrement
+	 * refcount,不 remove entry,不改 holders/waiters/converts 状态.
+	 *
+	 * spec-2.16 caller-side 集成时真实装 logic (API signature 不变,body
+	 * 加):decrement refcount + 若 ngranted == 0 && nwaiters == 0 &&
+	 * nconverts == 0 → HASH_REMOVE + DRM reclaim path (Stage 6).
+	 */
+	(void)entry;
+}
+
+
+/* ============================================================
+ * spec-2.15 v0.3:  6 observability accessor (P1.2 metric scope 收紧).
+ *
+ *   3 derived (GUC value / hash_get_num_entries / static allocated_bytes)
+ *   + 3 atomic (entry_create_count / entry_lookup_hit_count /
+ *               entry_full_count) = 6 cleanly-observable metric.
+ *
+ *   holder/waiter/convert counter 推 spec-2.16 配 mutator API.
+ * ============================================================ */
+
+int
+cluster_grd_max_entries_get(void)
+{
+	return cluster_grd_max_entries;
+}
+
+int
+cluster_grd_entry_count(void)
+{
+	if (cluster_grd_entry_htab == NULL)
+		return 0;
+	return (int)hash_get_num_entries(cluster_grd_entry_htab);
+}
+
+Size
+cluster_grd_allocated_bytes(void)
+{
+	return cluster_grd_entries_alloc_bytes;
+}
+
+uint64
+cluster_grd_entry_create_count(void)
+{
+	Assert(cluster_grd_state != NULL);
+	return pg_atomic_read_u64(&cluster_grd_state->entry_create_count);
+}
+
+uint64
+cluster_grd_entry_lookup_hit_count(void)
+{
+	Assert(cluster_grd_state != NULL);
+	return pg_atomic_read_u64(&cluster_grd_state->entry_lookup_hit_count);
+}
+
+uint64
+cluster_grd_entry_full_count(void)
+{
+	Assert(cluster_grd_state != NULL);
+	return pg_atomic_read_u64(&cluster_grd_state->entry_full_count);
+}
+
+
+/* ============================================================
+ * spec-2.15 D8:  SRF row visitor — hash_seq_search the entry HTAB
+ *   and emit one row per entry under per-entry slock_t snapshot.
+ *
+ *   **spec-2.16 forward-link TODO (P2.4 + I14)**:
+ *   Wrap hash_seq_search in full 4096-shard LW_SHARED acquire OR
+ *   chunked snapshot to defend concurrent HASH_ENTER_NULL writers
+ *   once caller-side LockAcquire integration lands.  本 spec 0
+ *   caller → 0 row → 无并发问题 (本 walker safe).
+ * ============================================================ */
+
+void
+cluster_grd_entries_walk(ClusterGrdEntryRowVisitor visitor, void *ctx)
+{
+	HASH_SEQ_STATUS status;
+	ClusterGrdEntry *entry;
+
+	Assert(visitor != NULL);
+
+	/* skeleton mode (cluster.grd_max_entries=0) → 0 row.  Mirrors the
+	 * NOT_READY sentinel surface for SRF callers. */
+	if (cluster_grd_entry_htab == NULL)
+		return;
+
+	hash_seq_init(&status, cluster_grd_entry_htab);
+	while ((entry = (ClusterGrdEntry *)hash_seq_search(&status)) != NULL) {
+		int32 fields[11];
+
+		/* per-entry slock_t snapshot — short critical section (memcpy
+		 * fixed-size struct fields).  spec-2.16 mutator writers also
+		 * acquire entry->lock so snapshot is consistent. */
+		SpinLockAcquire(&entry->lock);
+		fields[0] = (int32)(cluster_grd_hash_resource(&entry->resid) % PGRAC_GRD_SHARD_COUNT);
+		fields[1] = (int32)entry->resid.field1;
+		fields[2] = (int32)entry->resid.field2;
+		fields[3] = (int32)entry->resid.field3;
+		fields[4] = (int32)entry->resid.field4;
+		fields[5] = (int32)entry->resid.type;
+		fields[6] = (int32)entry->resid.lockmethodid;
+		fields[7] = entry->ngranted;
+		fields[8] = entry->nwaiters;
+		fields[9] = entry->nconverts;
+		fields[10] = (int32)entry->state_flags;
+		SpinLockRelease(&entry->lock);
+
+		visitor(ctx, fields);
+	}
+}

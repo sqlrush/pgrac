@@ -383,6 +383,15 @@ void
 cluster_grd_master_map_init(void)
 {}
 
+/* spec-2.15 D10 / L104 stub: cluster_grd_request_lwlocks (real impl in
+ * cluster_grd.c).  cluster_shmem.c::cluster_request_shmem() now invokes
+ * this hook once per postmaster init to RequestNamedLWLockTranche; the
+ * standalone unit test path must not call PG named-tranche machinery,
+ * so the stub is a no-op. */
+void
+cluster_grd_request_lwlocks(void)
+{}
+
 /* spec-2.14 D4 / L104 stub: cluster_conf_node_count (real impl in
  * cluster_conf.c).  cluster_shmem.c calls it as a triple-gate condition
  * before cluster_grd_master_map_init; standalone unit test returns 0 so

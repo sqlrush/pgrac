@@ -97,12 +97,37 @@ typedef struct ClusterResId {
 StaticAssertDecl(sizeof(ClusterResId) == 16, "ClusterResId wire ABI 16-byte lock (spec-2.14 §2.1)");
 
 /*
- * Opaque placeholder typedef (Q12 user-approved).  Real holders[] +
- * waiters + convert queue lands in spec-2.15 GES lock mode + grant
- * table.  Forward-declared here so spec-2.15+ can reference symbol
- * without amending this header (only struct body grows).
+ * Opaque ClusterGrdEntry handle.  Body 完全私有 cluster_grd.c file-static
+ * per spec-2.15 v0.2 P1.1 — defends forward compat with spec-2.16 grant +
+ * spec-2.17 deadlock + Stage 6 DRM layout changes.
  */
 typedef struct ClusterGrdEntry ClusterGrdEntry;
+
+/*
+ * spec-2.15:  Result enum for entry lookup/create API.
+ *
+ *  Sentinel separation per CLAUDE.md 规则 8 + spec-2.15 v0.2/v0.3 corrections:
+ *  NOT_READY (GUC=0, entry HTAB 未分配) vs NOT_FOUND (lookup miss with
+ *  create=false) vs FULL (HTAB cap / holders/waiters/convert cap hit) —
+ *  caller 必显式分流,不允许把 NOT_READY 当 NOT_FOUND;不允许把 FULL 当
+ *  NOT_FOUND.  ERROR=4 reserved for spec-2.16+ generic fatal path.
+ *
+ *  v0.2 P2.7:  StaticAssertDecl on enum VALUE not sizeof(enum)
+ *  (C enum size implementation-defined, not ABI 契约).
+ */
+typedef enum ClusterGrdEntryResult {
+	CLUSTER_GRD_ENTRY_OK = 0,		 /* entry returned via *out */
+	CLUSTER_GRD_ENTRY_NOT_READY = 1, /* GUC=0,entry HTAB 未分配 / skeleton 状态 */
+	CLUSTER_GRD_ENTRY_NOT_FOUND = 2, /* lookup miss with create=false */
+	CLUSTER_GRD_ENTRY_FULL = 3,		 /* HTAB / holders/waiters/converts cap hit */
+	CLUSTER_GRD_ENTRY_ERROR = 4		 /* RESERVED — spec-2.16+ generic fatal path */
+} ClusterGrdEntryResult;
+
+StaticAssertDecl(CLUSTER_GRD_ENTRY_OK == 0, "v0.2 P2.7 enum value ABI lock");
+StaticAssertDecl(CLUSTER_GRD_ENTRY_NOT_READY == 1, "v0.2 P2.7 enum value ABI lock");
+StaticAssertDecl(CLUSTER_GRD_ENTRY_NOT_FOUND == 2, "v0.2 P2.7 enum value ABI lock");
+StaticAssertDecl(CLUSTER_GRD_ENTRY_FULL == 3, "v0.2 P2.7 enum value ABI lock");
+StaticAssertDecl(CLUSTER_GRD_ENTRY_ERROR == 4, "v0.2 P2.7 enum value ABI lock");
 
 /*
  * Shmem region "pgrac cluster grd" — Q9 lock-free + Q11 shmem cache.
@@ -120,6 +145,12 @@ typedef struct ClusterGrdShared {
 	pg_atomic_uint64 local_master_lookup_count;	 /* lookup_master == self */
 	pg_atomic_uint64 remote_master_lookup_count; /* lookup_master != self */
 	pg_atomic_uint64 master_map_refresh_count;	 /* init + future DRM */
+
+	/* spec-2.15 v0.3:  3 NEW atomic counter (P1.3 scope 收紧 — 删
+	 * holder/waiter/convert counter,推 spec-2.16 配 mutator API). */
+	pg_atomic_uint64 entry_create_count;	 /* lifetime ++ on HASH_ENTER_NULL OK + new */
+	pg_atomic_uint64 entry_lookup_hit_count; /* lifetime ++ on OK return (hit 语义;P2.5) */
+	pg_atomic_uint64 entry_full_count;		 /* lifetime ++ on FULL */
 } ClusterGrdShared;
 
 extern Size cluster_grd_shmem_size(void);
@@ -211,6 +242,110 @@ extern uint64 cluster_grd_local_master_lookup_count(void);
 extern uint64 cluster_grd_remote_master_lookup_count(void);
 extern uint64 cluster_grd_resid_encode_count(void);
 extern uint64 cluster_grd_master_map_refresh_count_get(void);
+
+
+/* ============================================================
+ * spec-2.15:  entry table infrastructure (HTAB + named tranche +
+ *   opaque entry + sentinel API + observability).  caller-side
+ *   LockAcquire integration + holders/waiters/convert mutator API
+ *   推 spec-2.16(本 spec 0 caller / 0 mutation).
+ * ============================================================ */
+
+/*
+ * spec-2.15 v0.3 P1.1:  named tranche request hook (lifecycle fix).
+ *
+ *  Called ONCE from cluster_request_shmem() during the
+ *  process_shmem_requests_in_progress window — RequestNamedLWLockTranche
+ *  has lifetime constraint that prohibits calls outside this window.
+ *
+ *  size_fn (cluster_grd_shmem_size) MUST stay pure (idempotent, no side
+ *  effect) — cluster_shmem_get_total_bytes() calls size_fn N times for
+ *  diagnostics;  if Request were hidden in size_fn the diagnostic path
+ *  would re-call RequestNamedLWLockTranche → FATAL.
+ *
+ *  cluster_grd_shmem_init() then calls GetNamedLWLockTranche("ClusterGrdShard")
+ *  to obtain the array pointer;  PG lwlock.c initializes the 4096 LWLock
+ *  automatically — DO NOT call LWLockInitialize manually.
+ */
+extern void cluster_grd_request_lwlocks(void);
+
+/*
+ * spec-2.15:  Entry lookup/create API — 唯一入口 caller 拿 entry handle.
+ *
+ *  GUC `cluster.grd_max_entries == 0` 时 → CLUSTER_GRD_ENTRY_NOT_READY
+ *  (entry HTAB 未分配);caller 必处理 (spec-2.16 caller-side 真激活前
+ *  固定走此路径).
+ *
+ *  create=true → ShmemInitHash HASH_ENTER_NULL (v0.3 P1.2);
+ *  create=false → HASH_FIND.
+ *
+ *  v0.4 P1.2 双层 cap check:soft cap hash_get_num_entries vs
+ *  cluster_grd_max_entries 在 shard partition LWLock 内显式查 → FULL;
+ *  hard cap HASH_ENTER_NULL 返回 NULL → FULL (defensive 防 shmem OOM).
+ *
+ *  shard partition LWLock (named tranche) acquired internally;
+ *  caller 无需自己持锁.
+ *
+ *  v0.4 P1.1 hash 单源 (I13):shard_id 和 HTAB bucket 用同一
+ *  cluster_grd_hash_resource() 的 32-bit 投影 + hash_search_with_hash_value();
+ *  绝不调 hash_search() 让 dynahash 用 HASHCTL.hash 自己算.
+ */
+extern ClusterGrdEntryResult cluster_grd_entry_lookup_or_create(const ClusterResId *resid,
+																bool create, ClusterGrdEntry **out);
+
+/*
+ * spec-2.15:  Entry release — RESERVED no-op (v0.3 P1.3 contract unified).
+ *
+ *  本 spec 不保证任何 side effect:
+ *    - 不 decrement refcount
+ *    - 不 remove entry from HTAB
+ *    - 不改 holders/waiters/converts 状态
+ *
+ *  caller 调 release 是 stub safe-call (本 spec 0 caller,future spec-2.16+
+ *  caller-side 集成时按 reserved no-op 契约调用).  真 refcount + HASH_REMOVE
+ *  + reclaim logic 在 spec-2.16 caller-side 实装 (API signature 不变,body
+ *  加 logic).
+ */
+extern void cluster_grd_entry_release(ClusterGrdEntry *entry);
+
+/*
+ * spec-2.15 v0.3:  6 observability accessor extern — scope 收紧 P1.3 选 B
+ *  删 3 holder/waiter/convert accessor (推 spec-2.16).
+ *
+ *  All accessor are atomic_read O(1) / GUC / hash_get_num_entries cheap —
+ *  cleanly observable (P1.2:no PG-HTAB-unfriendly bucket_count/max_chain).
+ */
+extern int cluster_grd_max_entries_get(void);  /* GUC value (derived) */
+extern int cluster_grd_entry_count(void);	   /* hash_get_num_entries cheap (derived) */
+extern Size cluster_grd_allocated_bytes(void); /* init 时计算固定 (derived) */
+extern uint64
+cluster_grd_entry_create_count(void); /* lifetime ++ on HASH_ENTER_NULL OK + new (atomic) */
+extern uint64
+cluster_grd_entry_lookup_hit_count(void); /* lifetime ++ on OK return (atomic;P2.5 hit 语义) */
+extern uint64 cluster_grd_entry_full_count(void); /* lifetime ++ on FULL (atomic) */
+
+
+/*
+ * spec-2.15 D8:  SRF row visitor.  Iterates the entry HTAB (when
+ * allocated) and invokes `visitor(ctx, row_fields)` per entry under
+ * per-entry slock_t snapshot.  The 11 row_fields columns are
+ * (shard_id, field1, field2, field3, field4, type, lockmethodid,
+ * ngranted, nwaiters, nconverts, state_flags) — all stored as int32.
+ *
+ * This indirection lets `cluster_get_grd_entries` SRF (cluster_grd_
+ * srf.c) emit rows without exposing the private ClusterGrdEntry layout.
+ * GUC=0 / htab==NULL → visitor invoked zero times (caller sees empty
+ * result set, matching the NOT_READY sentinel surface).
+ *
+ * **spec-2.16 forward-link (P2.4 + I14)**:  before caller-side
+ * LockAcquire 集成 ships, this visitor must amend locking — wrap
+ * hash_seq_search in full 4096-shard LW_SHARED acquire or chunked
+ * snapshot to defend concurrent HASH_ENTER_NULL writers.  本 spec
+ * 0 caller → 0 row → 无并发问题.
+ */
+typedef void (*ClusterGrdEntryRowVisitor)(void *ctx, const int32 row_fields[11]);
+
+extern void cluster_grd_entries_walk(ClusterGrdEntryRowVisitor visitor, void *ctx);
 
 #endif /* !FRONTEND */
 
