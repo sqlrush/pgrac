@@ -38,7 +38,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_startup_phase test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_cssd test_cluster_qvotec test_cluster_voting_disk_io test_cluster_quorum_decision \
         test_cluster_xlog test_cluster_tt_slot test_cluster_undo_segment \
         test_cluster_epoch test_cluster_fence test_cluster_reconfig \
-        test_cluster_ges test_cluster_grd
+        test_cluster_ges test_cluster_grd test_cluster_lmd
 
 # Path to the cluster_version object (no PG deps, safe to link standalone).
 CLUSTER_VERSION_O = $(top_builddir)/src/backend/cluster/cluster_version.o
@@ -86,6 +86,7 @@ CLUSTER_QUORUM_DECISION_O = $(top_builddir)/src/backend/cluster/cluster_quorum_d
 CLUSTER_SCN_O = $(top_builddir)/src/backend/cluster/cluster_scn.o
 CLUSTER_GES_O = $(top_builddir)/src/backend/cluster/cluster_ges.o
 CLUSTER_GRD_O = $(top_builddir)/src/backend/cluster/cluster_grd.o
+CLUSTER_LMD_O = $(top_builddir)/src/backend/cluster/cluster_lmd.o
 
 # Most tests link only cluster_version.o.  test_cluster_guc /
 # test_cluster_shmem / test_cluster_signal / test_cluster_views /
@@ -93,7 +94,7 @@ CLUSTER_GRD_O = $(top_builddir)/src/backend/cluster/cluster_grd.o
 # separate rules because they also link additional cluster_*.o
 # objects (the test files stub the PG backend symbols those
 # objects reference).
-SIMPLE_TESTS = $(filter-out test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf test_cluster_ic_mock test_cluster_inject test_cluster_pgstat test_cluster_debug test_cluster_shared_fs test_cluster_smgr test_cluster_startup_phase test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_cssd test_cluster_qvotec test_cluster_voting_disk_io test_cluster_quorum_decision test_cluster_scn test_cluster_epoch test_cluster_fence test_cluster_reconfig test_cluster_ges test_cluster_grd,$(TESTS))
+SIMPLE_TESTS = $(filter-out test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf test_cluster_ic_mock test_cluster_inject test_cluster_pgstat test_cluster_debug test_cluster_shared_fs test_cluster_smgr test_cluster_startup_phase test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_cssd test_cluster_qvotec test_cluster_voting_disk_io test_cluster_quorum_decision test_cluster_scn test_cluster_epoch test_cluster_fence test_cluster_reconfig test_cluster_ges test_cluster_grd test_cluster_lmd,$(TESTS))
 
 # spec-2.4 D16: test_cluster_epoch links cluster_epoch.o standalone.
 # cluster_epoch.c references ShmemInitStruct + cluster_shmem_register_region
@@ -449,5 +450,20 @@ test_cluster_grd: test_cluster_grd.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_GRD_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_GRD_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-2.19 D13: test_cluster_lmd links cluster_lmd.o standalone.
+# cluster_lmd.c references ShmemInitStruct + cluster_shmem_register_region
+# + LWLock + ConditionVariable + pg_atomic_* + GetCurrentTimestamp; test
+# stubs all of these (union force-align for shmem buffer per L105) and
+# exercises HC4 exact-predicate (T-lmd-5 critical — `>= LMD_READY` false-
+# positive regression防御 / L124 NEW lesson) + HC2 4-state semantic split
+# + HC3 producer wake + HC6 skeleton "no graph maintenance" + L122
+# alphabetic ordering.
+test_cluster_lmd: test_cluster_lmd.c unit_test.h \
+		$(CLUSTER_VERSION_O) $(CLUSTER_LMD_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_LMD_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@

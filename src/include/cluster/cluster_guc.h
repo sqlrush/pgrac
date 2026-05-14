@@ -394,5 +394,22 @@ extern int cluster_undo_segments_per_instance;
  */
 extern bool cluster_allow_single_node;
 
+/*
+ * cluster.lmd_enabled (spec-2.19 D12).
+ *
+ *	context: PGC_POSTMASTER (HC1 startup-time fallback;runtime SET
+ *	         rejected by PGC_POSTMASTER enforcement)
+ *	default: true
+ *
+ *	Off → spec-2.17 caller-side 4-node deadlock-detection legacy path
+ *	active (LMD not forked).  On → postmaster forks LMD at PM_RUN,
+ *	caller-side legacy hard-disabled once cluster_lmd_is_ready() returns
+ *	true (exact state == LMD_READY).  Single ownership path硬契约
+ *	(HC1 / v0.2 P1.3):enabled=on but LMD not READY → backend caller
+ *	raises SQLSTATE 53R81 cluster_lmd_unavailable (silent fallback
+ *	to caller-side legacy forbidden).
+ */
+extern bool cluster_lmd_enabled;
+
 
 #endif /* CLUSTER_GUC_H */

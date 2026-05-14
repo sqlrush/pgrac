@@ -1665,6 +1665,32 @@ CREATE VIEW pg_cluster_grd_entries AS
 REVOKE ALL ON pg_cluster_grd_entries FROM PUBLIC;
 GRANT SELECT ON pg_cluster_grd_entries TO PUBLIC;
 
+-- PGRAC: pg_cluster_lmd (spec-2.19 D11; 2026-05-14).
+--   Returns 1 row containing LMD process state + 5 atomic counters.
+--   Backed by cluster_get_lmd_state (OID 8923).
+--   HC2 4-state semantic split (§1.4.6):  state IN ('disabled',
+--   'not_started', 'starting', 'ready', 'draining', 'stopped');
+--   reason IN ('disabled_by_config', 'lmd_not_ready',
+--   'crashed_unavailable', NULL).  reason IS NULL only when state =
+--   'ready'.  Caller-side ownership gate consumers branch on
+--   `cluster_lmd_is_ready()` (exact predicate;HC4 v0.3 codex P1.5);
+--   禁止 `state >= LMD_READY` 数值比较.
+CREATE VIEW pg_cluster_lmd AS
+    SELECT pid,
+           state,
+           reason,
+           started_at,
+           ready_at,
+           started_count,
+           edge_submission_count,
+           wake_count,
+           idle_count,
+           error_count
+      FROM cluster_get_lmd_state();
+
+REVOKE ALL ON pg_cluster_lmd FROM PUBLIC;
+GRANT SELECT ON pg_cluster_lmd TO PUBLIC;
+
 -- PGRAC: pg_cluster_state (stage 0.29).
 --   One-stop diagnostic snapshot covering every cluster subsystem's
 --   runtime state expressed as (category, key, value) triples:

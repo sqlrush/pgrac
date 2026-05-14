@@ -260,7 +260,14 @@
  * CANCEL_PENDING=7);PROCSIG_CLUSTER_GES_BAST + GES_CANCEL slot;
  * 53R72/53R73 SQLSTATE;4 NEW wait events;7 NEW GUCs(BAST retry +
  * deadlock budget).  catversion bump for catalog tooling. */
-#define CATALOG_VERSION_NO 202605300
+/* spec-2.19 D12 (2026-05-14):  LMD daemon skeleton + deadlock-detection
+ * ownership migration from spec-2.17 caller-side placeholder.  Adds
+ * pg_cluster_lmd view + cluster_get_lmd_state SRF (D11);3 NEW wait events
+ * (LMD_STARTUP/SCAN/IDLE);1 NEW GUC cluster.lmd_enabled PGC_POSTMASTER;
+ * 53R81 SQLSTATE cluster_lmd_unavailable;ClusterLmdShmem region +
+ * LWTRANCHE_CLUSTER_LMD;LmdProcess AuxProcType + NUM_AUXILIARY_PROCS
+ * 13 → 14.  catversion bump for catalog tooling. */
+#define CATALOG_VERSION_NO 202605310
 
 /* spec-2.16 D19 (2026-05-29):  GesRequestPayload + GesReplyPayload wire
  * payload structs (48B each + StaticAssertDecl);  ClusterGrdHolderId

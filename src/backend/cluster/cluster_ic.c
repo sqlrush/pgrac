@@ -84,6 +84,7 @@ PG_FUNCTION_INFO_V1(cluster_get_ic_peers);
 PG_FUNCTION_INFO_V1(cluster_get_ic_msg_types);
 PG_FUNCTION_INFO_V1(cluster_get_grd_shards);  /* spec-2.14 D7 */
 PG_FUNCTION_INFO_V1(cluster_get_grd_entries); /* spec-2.15 D6 */
+PG_FUNCTION_INFO_V1(cluster_get_lmd_state);   /* spec-2.19 D11 */
 
 /*
  * spec-2.5 D15 -- cluster_get_cssd_peers SRF.  Body lives in
@@ -1246,6 +1247,17 @@ cluster_get_grd_entries(PG_FUNCTION_ARGS pg_attribute_unused())
 {
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("cluster_get_grd_entries requires --enable-cluster")));
+	PG_RETURN_NULL();
+}
+
+/*
+ * spec-2.19 D11 -- cluster_get_lmd_state disable-cluster stub.
+ */
+Datum
+cluster_get_lmd_state(PG_FUNCTION_ARGS pg_attribute_unused())
+{
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cluster_get_lmd_state requires --enable-cluster")));
 	PG_RETURN_NULL();
 }
 

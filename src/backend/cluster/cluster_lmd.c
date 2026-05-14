@@ -81,6 +81,7 @@
 
 #include <signal.h>
 
+#include "cluster/cluster_guc.h"
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_shmem.h"
 #include "libpq/pqsignal.h"
@@ -175,7 +176,16 @@ cluster_lmd_shmem_init(void)
 	{
 		memset(cluster_lmd_state, 0, sizeof(*cluster_lmd_state));
 		LWLockInitialize(&cluster_lmd_state->lwlock, LWTRANCHE_CLUSTER_LMD);
-		pg_atomic_init_u32(&cluster_lmd_state->lmd_state, CLUSTER_LMD_NOT_STARTED);
+		/*
+		 * spec-2.19 §1.4.6 HC2 (d) — DISABLED state is set once at startup
+		 * when cluster.lmd_enabled=off (PGC_POSTMASTER restart-only).  The
+		 * caller-side legacy path then remains active as the唯一 fallback.
+		 * NOT_STARTED otherwise — LMD process will transition through
+		 * STARTING → READY when postmaster forks it at PM_RUN.
+		 */
+		pg_atomic_init_u32(&cluster_lmd_state->lmd_state,
+						   cluster_lmd_enabled ? CLUSTER_LMD_NOT_STARTED
+											   : CLUSTER_LMD_DISABLED);
 		/*
 		 * HC6:no ring buffer / hash table / queue placeholder.  Only
 		 * skeleton counters (6 atomic) and ConditionVariable substrate.

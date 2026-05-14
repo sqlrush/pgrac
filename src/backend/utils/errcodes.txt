@@ -510,6 +510,15 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 53R72    E    ERRCODE_CLUSTER_GES_DEADLOCK                                   cluster_ges_deadlock
 53R73    E    ERRCODE_CLUSTER_GES_CANCEL_PENDING                             cluster_ges_cancel_pending
 
+# spec-2.19 D12:  LMD unavailable fail-closed (HC1 / v0.2 P1.3)
+# 53R81 fires when backend caller-side deadlock detection path needs LMD
+# ownership (cluster.lmd_enabled = on) but cluster_lmd_is_ready() returns
+# false — i.e. LMD state is NOT_STARTED / STARTING / DRAINING / STOPPED /
+# CRASHED.  enabled=off → caller-side legacy path (PGC_POSTMASTER restart
+# only).  Backend recovers via natural retry / rollback (类 spec-2.16 53R70
+# cluster_ges_timeout pattern;L116 / L120 family).
+53R81    E    ERRCODE_CLUSTER_LMD_UNAVAILABLE                                cluster_lmd_unavailable
+
 Section: Class 54 - Program Limit Exceeded
 
 # this is for wired-in limits, not resource exhaustion problems (class borrowed from DB2)

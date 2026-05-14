@@ -220,6 +220,22 @@ bool cluster_enabled = true;
  */
 bool cluster_allow_single_node = true;
 
+/*
+ * spec-2.19 D12:  cluster.lmd_enabled.
+ *
+ *	PGC_POSTMASTER bool, default on.  When off (set in postgresql.conf
+ *	or via -c at startup), LMD process is NOT forked; spec-2.17
+ *	caller-side 4-node deadlock-detection legacy path remains active
+ *	(HC1 startup-time fallback;v0.2 P1.3).  Runtime SET is rejected by
+ *	PG's PGC_POSTMASTER enforcement; restart required to flip ownership.
+ *	HC4 exact predicate: caller-side ownership gate consults
+ *	cluster_lmd_is_ready() (exact state == LMD_READY); when LMD is
+ *	enabled=on but not yet READY, backend callers receive SQLSTATE
+ *	53R81 cluster_lmd_unavailable (silent fallback to caller-side is
+ *	forbidden — single ownership path硬契约).
+ */
+bool cluster_lmd_enabled = true;
+
 
 /*
  * Mapping from the cluster.interconnect_tier GUC enum string to the
@@ -421,7 +437,7 @@ cluster_init_guc(void)
 										 "registers one region.  Raise if FATAL on startup with "
 										 "errcode 53400 \"cluster shmem registry capacity "
 										 "exceeded\"."),
-							&cluster_shmem_max_regions, 64, 22, 256,
+							&cluster_shmem_max_regions, 64, 23, 256,
 							PGC_POSTMASTER, /* registry array is palloc'd once at init */
 							0,				/* flags */
 							NULL,			/* check_hook */
@@ -1035,4 +1051,23 @@ cluster_init_guc(void)
 					 "multi-node configuration errors -- those still FATAL "
 					 "regardless of this value (spec-2.1 §3.5 boundary invariant)."),
 		&cluster_allow_single_node, true, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	/*
+	 * spec-2.19 D12 — cluster.lmd_enabled.
+	 *
+	 *	PGC_POSTMASTER bool, default true.  See cluster_lmd_enabled global
+	 *	declaration above for HC1 / HC4 semantics.  Runtime SET rejected by
+	 *	PGC_POSTMASTER enforcement.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.lmd_enabled",
+		gettext_noop("Enable the LMD (Lock Manager Daemon — deadlock detection actor) "
+					 "cluster background process."),
+		gettext_noop("When on (default), postmaster forks LMD at PM_RUN and "
+					 "spec-2.17 caller-side 4-node deadlock-detection legacy path "
+					 "is hard-disabled once LMD reaches READY.  When off, LMD is "
+					 "not forked and the caller-side legacy path remains active.  "
+					 "PGC_POSTMASTER:restart required to flip ownership (HC1 "
+					 "fail-closed startup-time fallback;spec-2.19 v0.2 P1.3)."),
+		&cluster_lmd_enabled, true, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 }

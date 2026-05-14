@@ -1935,8 +1935,13 @@ ServerLoop(void)
 		 * PGRAC: spec-2.19 Sprint A — same ServerLoop respawn for LMD
 		 * (8th cluster aux process).  LMD is spawned by the phase 4
 		 * driver after LMS; respawn here mirrors the LMS pattern.
+		 * cluster.lmd_enabled = off (PGC_POSTMASTER) keeps LMD un-forked
+		 * and LMD shmem state == DISABLED;the spec-2.17 caller-side
+		 * 4-node deadlock-detection legacy path remains active as the
+		 *唯一 fallback (HC1 / §1.4.6 (a)).
 		 */
-		if (cluster_enabled && LmdPID == 0 && pmState == PM_RUN)
+		if (cluster_enabled && cluster_lmd_enabled && LmdPID == 0
+			&& pmState == PM_RUN)
 			LmdPID = StartLmd();
 
 		/*

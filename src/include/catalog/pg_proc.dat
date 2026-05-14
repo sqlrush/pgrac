@@ -12373,4 +12373,19 @@
   proargnames => '{shard_id,field1,field2,field3,field4,type,lockmethodid,ngranted,nwaiters,nconverts,state_flags}',
   prosrc => 'cluster_get_grd_entries' },
 
+
+# spec-2.19 D11 (2026-05-14) -- pg_cluster_lmd SRF (oid 8923).
+# Returns 1 row containing LMD process pid + state + reason (HC2 4-state
+# semantic split) + spawned_at/ready_at timestamps + 5 atomic counters
+# (started/edge_submission/wake/idle/error).  Backs the pg_cluster_lmd
+# view (system_views.sql).
+{ oid => '8923', descr => 'show cluster_lmd state + counters (spec-2.19)',
+  proname => 'cluster_get_lmd_state', prorows => '1',
+  proretset => 't', provolatile => 's', proparallel => 'r',
+  prorettype => 'record', proargtypes => '',
+  proallargtypes => '{int4,text,text,timestamptz,timestamptz,int8,int8,int8,int8,int8}',
+  proargmodes => '{o,o,o,o,o,o,o,o,o,o}',
+  proargnames => '{pid,state,reason,started_at,ready_at,started_count,edge_submission_count,wake_count,idle_count,error_count}',
+  prosrc => 'cluster_get_lmd_state' },
+
 ]
