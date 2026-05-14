@@ -62,6 +62,7 @@ OBJS = \
 	cluster_ic_tier1.o \
 	cluster_inject.o \
 	cluster_lck.o \
+	cluster_lmd.o \
 	cluster_lmon.o \
 	cluster_lms.o \
 	cluster_pcm_lock.o \

@@ -89,22 +89,23 @@ is($unknown_count, '0',
 # aux process is the second.  Spec-1.13 Sprint A: DIAG aux process
 # is the third.  Spec-1.14 Sprint A: Cluster Stats aux process is
 # the fourth.  Spec-2.18 Sprint A: LMS aux process is the seventh
-# cluster aux process and is now spawned by the PM_RUN ServerLoop
-# respawn path.  Other types (heartbeat / interconnect listener / etc)
-# remain deferred to Stage 2-6.  Excluded 'lmon', 'lck', 'diag',
-# 'cluster stats', and 'lms' from the "no pgrac process visible" assertion
-# accordingly.
+# cluster aux process spawned by the PM_RUN ServerLoop respawn path.
+# Spec-2.19 Sprint A: LMD aux process is the eighth cluster aux process,
+# spawned by the same PM_RUN ServerLoop respawn after LMS.  Other types
+# (heartbeat / interconnect listener / etc) remain deferred to Stage 2-6.
+# Excluded 'lmon', 'lck', 'diag', 'cluster stats', 'lms', and 'lmd' from
+# the "no pgrac process visible" assertion accordingly.
 my $pgrac_visible = $node->safe_psql(
 	'postgres',
 	q{SELECT count(*) FROM pg_stat_activity
 	   WHERE backend_type IN (
 	       'heartbeat', 'interconnect listener',
-	       'lmd', 'lms worker',
+	       'lms worker',
 	       'managed recovery process', 'recovery coordinator',
 	       'recovery worker', 'sinval broadcaster',
 	       'tt gc', 'undo cleaner')});
 is($pgrac_visible, '0',
-	'no pgrac process descriptor visible at stage 0.10 except LMON (1.11) + LCK (1.12) + DIAG (1.13) + Cluster Stats (1.14) + LMS (2.18) Sprint A (others deferred to Stage 2-6)');
+	'no pgrac process descriptor visible at stage 0.10 except LMON (1.11) + LCK (1.12) + DIAG (1.13) + Cluster Stats (1.14) + LMS (2.18) + LMD (2.19) Sprint A (others deferred to Stage 2-6)');
 
 # LMON is spawned by postmaster (spec-1.11 Sprint A).  Verify it
 # appears in pg_stat_activity exactly once.
@@ -147,6 +148,13 @@ ok($node->poll_query_until(
 	'postgres',
 	q{SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'lms'}),
 	'LMS aux process visible in pg_stat_activity (spec-2.18 Sprint A)');
+
+# LMD is spawned by postmaster (spec-2.19 Sprint A) from the PM_RUN
+# ServerLoop respawn path (after LMS).  Poll for the same reason as LMS.
+ok($node->poll_query_until(
+	'postgres',
+	q{SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'lmd'}),
+	'LMD aux process visible in pg_stat_activity (spec-2.19 Sprint A)');
 
 
 $node->stop;

@@ -78,6 +78,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_scn.h"  /* cluster_scn_current (spec-1.15 D6) */
 #include "cluster/cluster_ges.h"  /* cluster_ges_{request,reply}_defer_count (spec-2.13 D4) */
 #include "cluster/cluster_grd.h"  /* cluster_grd_* observability accessors (spec-2.14 D6) */
+#include "cluster/cluster_lmd.h"  /* cluster_lmd_* observability accessors (spec-2.19 D10) */
 #include "cluster/cluster_lms.h"  /* cluster_lms_* observability accessors (spec-2.18 D10) */
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_grd_pending.h"
@@ -883,6 +884,34 @@ dump_lms(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "lms", "lms_error_count", fmt_int64((int64)cluster_lms_get_error_count()));
 }
 
+/*
+ * dump_lmd -- spec-2.19 Sprint A Step 4 D10.
+ *
+ *	Emits 7 rows under category='lmd' (state string + 6 atomic counters)
+ *	corresponding to the LMD skeleton observability surface (HC2 4-state
+ *	semantic split via state column + 6 counters per §0 Q8;
+ *	add_edge / remove_edge / cycle_detected / victim_selected 分项 counter
+ *	推 spec-2.20+ 真激活 Tarjan).
+ *
+ *	**L122 alphabetic order**:'lmd' sorts BEFORE 'lmon' in
+ *	pg_cluster_state ORDER BY category(ASCII `d` 0x64 < `o` 0x6F).
+ */
+static void
+dump_lmd(ReturnSetInfo *rsinfo)
+{
+	ClusterLmdState s = cluster_lmd_get_state();
+
+	emit_row(rsinfo, "lmd", "lmd_state", cluster_lmd_state_to_string(s));
+	emit_row(rsinfo, "lmd", "lmd_started_count", fmt_int64((int64)cluster_lmd_get_started_count()));
+	emit_row(rsinfo, "lmd", "lmd_edge_submission_count",
+			 fmt_int64((int64)cluster_lmd_get_edge_submission_count()));
+	emit_row(rsinfo, "lmd", "lmd_wake_count",
+			 fmt_int64((int64)cluster_lmd_get_wake_count()));
+	emit_row(rsinfo, "lmd", "lmd_idle_count",
+			 fmt_int64((int64)cluster_lmd_get_idle_count()));
+	emit_row(rsinfo, "lmd", "lmd_error_count", fmt_int64((int64)cluster_lmd_get_error_count()));
+}
+
 
 /*
  * dump_ges -- spec-2.13 D4 GES protocol skeleton observability.
@@ -1083,6 +1112,7 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		dump_scn(rsinfo);
 		dump_ges(rsinfo);
 		dump_grd(rsinfo);
+		dump_lmd(rsinfo);
 		dump_lms(rsinfo);
 	}
 #else

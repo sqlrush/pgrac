@@ -1213,6 +1213,47 @@ cluster_lms_state_to_string(int s pg_attribute_unused())
 	return "(stub)";
 }
 
+/*
+ * spec-2.19 Sprint A Step 4 D10 L104 stubs: dump_lmd references
+ * cluster_lmd_* accessors via cluster_debug.o; standalone test
+ * harness must provide local zero-returning stubs.
+ */
+int
+cluster_lmd_get_state(void)
+{
+	return 0;
+}
+uint64
+cluster_lmd_get_started_count(void)
+{
+	return 0;
+}
+uint64
+cluster_lmd_get_edge_submission_count(void)
+{
+	return 0;
+}
+uint64
+cluster_lmd_get_wake_count(void)
+{
+	return 0;
+}
+uint64
+cluster_lmd_get_idle_count(void)
+{
+	return 0;
+}
+uint64
+cluster_lmd_get_error_count(void)
+{
+	return 0;
+}
+const char *
+cluster_lmd_state_to_string(int s pg_attribute_unused())
+{
+	return "(stub)";
+}
+
 UT_TEST(test_debug_links_against_pgstat_module)
 {
 	UT_ASSERT_NOT_NULL((void *)cluster_pgstat_get_count);

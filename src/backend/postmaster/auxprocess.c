@@ -41,6 +41,7 @@
 #include "cluster/cluster_cssd.h"	/* CssdMain (stage 2.5 Sprint A) */
 #include "cluster/cluster_qvotec.h" /* ClusterQvotecMain (spec-2.6 Sprint A Step 3 D7) */
 #include "cluster/cluster_lms.h"	/* LmsMain (spec-2.18 Sprint A Step 1) */
+#include "cluster/cluster_lmd.h"	/* LmdMain (spec-2.19 Sprint A Step 1) */
 #include "cluster/cluster_stats.h"	/* ClusterStatsMain (stage 1.14 Sprint A) */
 #endif
 
@@ -119,6 +120,16 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 	case LmsProcess:
 		MyBackendType = B_LMS;
 		break;
+	/*
+	 * PGRAC (spec-2.19 Sprint A Step 1): LMD aux process.  B_LMD
+	 * BackendType already exists (spec-1.10 backend types extension); D3
+	 * reuses existing surface without duplicate definition.  v0.3 codex
+	 * P1.7 audit (grep linkdb confirms miscadmin.h:375 B_LMD already
+	 * present + miscinit.c:357 GetBackendTypeDesc("lmd") already mapped).
+	 */
+	case LmdProcess:
+		MyBackendType = B_LMD;
+		break;
 #endif
 	default:
 		elog(PANIC, "unrecognized process type: %d", (int)MyAuxProcType);
@@ -157,15 +168,19 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 	 * auxiliary process type.
 	 */
 	/*
-	 * PGRAC: spec-2.18 Sprint A LMS skeleton does not consume PG ProcSignal
-	 * reasons yet.  Registering it in ProcSignal makes proc_exit() run
-	 * CleanupProcSignalState(), whose pss_barrierCV broadcast can spin during
-	 * fast shutdown on the current LMS no-work skeleton.  Keep LMS on the
-	 * ordinary aux-process PGPROC/latch path, but leave ProcSignal opt-in to
-	 * the later production spec that wires real BAST/CANCEL SIGUSR1 handling.
+	 * PGRAC: spec-2.18 Sprint A LMS skeleton + spec-2.19 Sprint A LMD
+	 * skeleton do not consume PG ProcSignal reasons yet.  Registering them
+	 * in ProcSignal makes proc_exit() run CleanupProcSignalState(), whose
+	 * pss_barrierCV broadcast can spin during fast shutdown on these
+	 * no-work skeletons.  Keep both on the ordinary aux-process PGPROC/latch
+	 * path, but leave ProcSignal opt-in to the later production spec that
+	 * wires real BAST/CANCEL SIGUSR1 handling.  I14 invariant (spec-2.19
+	 * §1.4 P1.4):LMD skeleton MUST NOT register ProcSignal slot;若 spec-2.20+
+	 * 需引入必同 spec ship 完整 register + cleanup + shutdown 语义 (L114
+	 * producer-consumer lifecycle 闭环 family).
 	 */
 #ifdef USE_PGRAC_CLUSTER
-	if (MyAuxProcType != LmsProcess)
+	if (MyAuxProcType != LmsProcess && MyAuxProcType != LmdProcess)
 #endif
 		ProcSignalInit(MaxBackends + MyAuxProcType + 1);
 
@@ -181,12 +196,16 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 	pgstat_beinit();
 #ifdef USE_PGRAC_CLUSTER
 	/*
-	 * LMS becomes externally visible in pg_stat_activity at pgstat_bestart(),
-	 * while its regular signal setup lives in LmsMain().  Install the same
-	 * minimal handlers before publishing backend status so fast shutdown
-	 * cannot lose SIGTERM in the pgstat-visible / pre-LmsMain window.
+	 * LMS / LMD become externally visible in pg_stat_activity at
+	 * pgstat_bestart(), while their regular signal setup lives in
+	 * LmsMain() / LmdMain().  Install the same minimal handlers before
+	 * publishing backend status so fast shutdown cannot lose SIGTERM in the
+	 * pgstat-visible / pre-LmsMain (resp. pre-LmdMain) window.  HC7 in
+	 * spec-2.19 §1.4.8 / L121 (spec-2.18 F1 root fix 14cd35c027):handler
+	 * install + sigprocmask UnBlockSig MUST happen BEFORE pgstat_bestart /
+	 * pgstat-visible publication / any LMS/LMD shmem-LWLock-CV operation.
 	 */
-	if (MyAuxProcType == LmsProcess) {
+	if (MyAuxProcType == LmsProcess || MyAuxProcType == LmdProcess) {
 		pqsignal(SIGHUP, SignalHandlerForConfigReload);
 		pqsignal(SIGINT, SignalHandlerForShutdownRequest);
 		pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
@@ -272,6 +291,12 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 	 * if the compiler does not honor the attribute. */
 	case LmsProcess:
 		LmsMain();
+		proc_exit(1);
+	/* PGRAC (spec-2.19 Sprint A Step 1): LMD aux process dispatch.  LmdMain
+	 * is pg_attribute_noreturn(); proc_exit(1) below is a defensive bailout
+	 * if the compiler does not honor the attribute.  See cluster_lmd.h. */
+	case LmdProcess:
+		LmdMain();
 		proc_exit(1);
 #endif
 

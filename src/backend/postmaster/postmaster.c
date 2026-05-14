@@ -328,6 +328,8 @@ static pid_t QvotecPID = 0;
 
 /* PGRAC (spec-2.18 Sprint A Step 1): LMS aux process pid;same pattern. */
 static pid_t LmsPID = 0;
+/* PGRAC (spec-2.19 Sprint A Step 1): LMD aux process pid;same pattern. */
+static pid_t LmdPID = 0;
 /*
  * spec-2.6 Sprint A Step 3 D8 deferral gate.  D7 lays down QvotecPID
  * tracking + reaper + LIFO + signal forwarding, but QVOTEC spawn
@@ -648,6 +650,7 @@ static void ShmemBackendArrayRemove(Backend *bn);
 #define StartCssd() StartChildProcess(CssdProcess)
 #define StartQvotec() StartChildProcess(QvotecProcess)
 #define StartLms() StartChildProcess(LmsProcess)
+#define StartLmd() StartChildProcess(LmdProcess)
 #endif
 
 /* Macros to check exit status of a child process */
@@ -1929,6 +1932,14 @@ ServerLoop(void)
 			LmsPID = StartLms();
 
 		/*
+		 * PGRAC: spec-2.19 Sprint A — same ServerLoop respawn for LMD
+		 * (8th cluster aux process).  LMD is spawned by the phase 4
+		 * driver after LMS; respawn here mirrors the LMS pattern.
+		 */
+		if (cluster_enabled && LmdPID == 0 && pmState == PM_RUN)
+			LmdPID = StartLmd();
+
+		/*
 		 * PGRAC: spec-2.28 Sprint A Step 3 D6 — fence-lite postmaster
 		 * self-fence trigger.  cluster_fence_postmaster_check() reads
 		 * ClusterFenceShmem.self_fence_requested_at_us (set by LMON
@@ -2815,6 +2826,8 @@ process_pm_reload_request(void)
 			signal_child(QvotecPID, SIGHUP);
 		if (LmsPID != 0) /* PGRAC spec-2.18 Sprint A Step 1 */
 			signal_child(LmsPID, SIGHUP);
+		if (LmdPID != 0) /* PGRAC spec-2.19 Sprint A Step 1 */
+			signal_child(LmdPID, SIGHUP);
 #endif
 		if (AutoVacPID != 0)
 			signal_child(AutoVacPID, SIGHUP);
@@ -3345,6 +3358,13 @@ process_pm_child_exit(void)
 				HandleChildCrash(pid, exitstatus, _("LMS process"));
 			continue;
 		}
+		/* PGRAC (spec-2.19 Sprint A Step 1): LMD reaper. */
+		if (pid == LmdPID) {
+			LmdPID = 0;
+			if (!EXIT_STATUS_0(exitstatus))
+				HandleChildCrash(pid, exitstatus, _("LMD process"));
+			continue;
+		}
 #endif
 
 		/*
@@ -3763,6 +3783,12 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 		LmsPID = 0;
 	else if (LmsPID != 0 && take_action)
 		sigquit_child(LmsPID);
+
+	/* PGRAC (spec-2.19 Sprint A Step 1): LMD crash handling. */
+	if (pid == LmdPID)
+		LmdPID = 0;
+	else if (LmdPID != 0 && take_action)
+		sigquit_child(LmdPID);
 #endif
 
 	/* Take care of the walreceiver too */
@@ -3920,7 +3946,12 @@ PostmasterStateMachine(void)
 		 * cluster_run_shutdown_sequence (which fires AFTER children
 		 * already exited) has no effect.  Q10 user-finding 2026-05-04.
 		 */
-		/* spec-2.18 Q10 LIFO: LMS first (last-spawned in Phase 2.C
+		/* spec-2.19 Q10 LIFO: LMD first (last-spawned in Phase 2.C
+		 * after LMS; SIGTERM sets ShutdownRequestPending which the LMD
+		 * main loop polls). */
+		if (LmdPID != 0)
+			signal_child(LmdPID, SIGTERM);
+		/* spec-2.18 Q10 LIFO: LMS next (was last-spawned in Phase 2.C
 		 * skeleton; spawn-integration site in Step 3+).  SIGTERM sets
 		 * ShutdownRequestPending which the LMS main loop polls. */
 		if (LmsPID != 0)
@@ -4004,6 +4035,8 @@ PostmasterStateMachine(void)
 			QvotecPID == 0 &&
 			/* PGRAC: spec-2.18 Sprint A — same wait for LMS. */
 			LmsPID == 0 &&
+			/* PGRAC: spec-2.19 Sprint A — same wait for LMD. */
+			LmdPID == 0 &&
 #endif
 			AutoVacPID == 0) {
 			if (Shutdown >= ImmediateShutdown || FatalError) {
@@ -4353,6 +4386,8 @@ TerminateChildren(int signal)
 		signal_child(QvotecPID, signal);
 	if (LmsPID != 0) /* PGRAC spec-2.18 Sprint A Step 1 */
 		signal_child(LmsPID, signal);
+	if (LmdPID != 0) /* PGRAC spec-2.19 Sprint A Step 1 */
+		signal_child(LmdPID, signal);
 #endif
 }
 
@@ -5830,6 +5865,29 @@ cluster_postmaster_start_lms(void)
 
 	LmsPID = StartLms();
 	return LmsPID;
+}
+
+/*
+ * cluster_postmaster_start_lmd -- spawn the LMD aux process.
+ *
+ *	PGRAC (spec-2.19 Sprint A Step 1): postmaster-owned narrow wrapper
+ *	for the cluster module to request LMD spawn.  Mirrors
+ *	cluster_postmaster_start_lms.  StartChildProcess is file-static to
+ *	postmaster.c, so cluster_lmd.c forwards here.
+ *
+ *	Sprint A skeleton:LMD spawn is gated by cluster_enabled (and will be
+ *	additionally gated by cluster.lmd_enabled GUC when Step 4 wires the
+ *	GUC plumbing).
+ *
+ *	Spec: spec-2.19-lmd-daemon-deadlock-ownership-migration.md Sprint A.
+ */
+pid_t
+cluster_postmaster_start_lmd(void)
+{
+	Assert(!IsUnderPostmaster);
+
+	LmdPID = StartLmd();
+	return LmdPID;
 }
 #endif
 

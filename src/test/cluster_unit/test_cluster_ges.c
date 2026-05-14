@@ -229,6 +229,22 @@ void cluster_lms_wake_drain(void);
 void
 cluster_lms_wake_drain(void)
 {}
+
+/* spec-2.19 Sprint A Step 3 D8 L104 stubs:  cluster_lmd_is_ready (HC4
+ * exact predicate) + cluster_lmd_submit_wait_edge (HC3 producer wake +
+ * HC6 skeleton "no graph maintenance").  Called from cluster_ges.c
+ * GES_REQ_OPCODE_DEADLOCK_PROBE handler. */
+bool cluster_lmd_is_ready(void);
+bool
+cluster_lmd_is_ready(void)
+{
+	/* Standalone unit test:LMD shmem not attached, predicate false. */
+	return false;
+}
+void cluster_lmd_submit_wait_edge(void);
+void
+cluster_lmd_submit_wait_edge(void)
+{}
 void
 cluster_grd_inc_ges_inbound_validation_fail(void)
 {

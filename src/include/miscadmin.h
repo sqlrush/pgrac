@@ -564,6 +564,21 @@ typedef enum {
 	 * cluster_lms.h.
 	 */
 	LmsProcess,
+	/*
+	 * LMD (Lock Manager Daemon — deadlock detection actor) is the 8th
+	 * cluster background process — spec-2.19 Sprint A.  Appended after
+	 * LmsProcess to preserve numeric values.  Spec-2.19 ships the LMD
+	 * skeleton + deadlock-detection ownership migration from spec-2.17
+	 * caller-side 4-node placeholder to LMD with single ownership path +
+	 * fail-closed semantics (no runtime caller-side fallback grant;
+	 * cluster.lmd_enabled=off is PGC_POSTMASTER startup-only fallback).
+	 * Real Tarjan cycle detection, wait-for graph maintenance, victim
+	 * selection, cancellation all defer to spec-2.20+ Phase 2.C + spec-5.9
+	 * Stage 5.  See cluster_lmd.h.  B_LMD BackendType already exists
+	 * (spec-1.10 backend types extension) — spec-2.19 D3 reuses existing
+	 * surface without duplicate definition.
+	 */
+	LmdProcess,
 #endif
 
 	NUM_AUXPROCTYPES /* Must be last! */
@@ -585,6 +600,7 @@ extern PGDLLIMPORT AuxProcType MyAuxProcType;
 #define AmCssdProcess() (MyAuxProcType == CssdProcess)
 #define AmQvotecProcess() (MyAuxProcType == QvotecProcess)
 #define AmLmsProcess() (MyAuxProcType == LmsProcess)
+#define AmLmdProcess() (MyAuxProcType == LmdProcess)
 #endif
 
 

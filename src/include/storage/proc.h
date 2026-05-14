@@ -437,13 +437,18 @@ extern PGDLLIMPORT PGPROC *PreparedXactProcs;
  * PGRAC: with --enable-cluster builds we add 7 more aux processes that all
  * coexist with WalWriter / BgWriter / Checkpointer at PM_RUN: LMON
  * (spec-1.11), LCK (spec-1.12), DIAG (spec-1.13), Cluster Stats
- * (spec-1.14), CSSD (spec-2.5), QVOTEC (spec-2.6), LMS (spec-2.18).  Bump
- * the slot reserve to 13 (PG 5 + cluster 7 + 1 slack) so we never trip
- * "all AuxiliaryProcs are in use".  Stage 2+ adds LMD (spec-2.19), Sinval
+ * (spec-1.14), CSSD (spec-2.5), QVOTEC (spec-2.6), LMS (spec-2.18),
+ * LMD (spec-2.19).  Bump the slot reserve to 14 (PG 5 + cluster 8 + 1 slack)
+ * so we never trip "all AuxiliaryProcs are in use".  Stage 2+ adds Sinval
  * Broadcaster, Recovery Coordinator, etc. — bump again then.
+ *
+ * I11 invariant (spec-2.18 / spec-2.19): NUM_AUXILIARY_PROCS MUST be ≥
+ * AuxProcType_Last + PG aux process count; StaticAssertDecl in the cluster
+ * shmem init path guards against "本地编译过 cluster init / TAP baseline 才爆"
+ * (L18 startup-time validation family).
  */
 #ifdef USE_PGRAC_CLUSTER
-#define NUM_AUXILIARY_PROCS 13
+#define NUM_AUXILIARY_PROCS 14
 #else
 #define NUM_AUXILIARY_PROCS 5
 #endif

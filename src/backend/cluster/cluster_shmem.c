@@ -76,6 +76,7 @@
 #include "cluster/cluster_fence.h"	/* cluster_fence_shmem_register (spec-2.28 Sprint A Step 1) */
 #include "cluster/cluster_reconfig.h" /* cluster_reconfig_shmem_register (spec-2.29 Sprint A Step 1) */
 #include "cluster/cluster_lms.h"	  /* cluster_lms_shmem_register (spec-2.18 Sprint A Step 1) */
+#include "cluster/cluster_lmd.h"	  /* cluster_lmd_shmem_register (spec-2.19 Sprint A Step 1) */
 /* spec-2.7 hardening F1: cluster_smgr_shmem_register;intentionally no
  * trailing line-end comment so the longer storage/ path doesn't force
  * clang-format to realign every neighbour include above. */
@@ -478,6 +479,18 @@ cluster_init_shmem_module(void)
 	 */
 	if (cluster_shmem_lookup_region("pgrac cluster lms") == NULL)
 		cluster_lms_shmem_register();
+
+	/*
+	 * PGRAC (spec-2.19 Sprint A Step 1 D7):register LMD shmem region.
+	 * Separate ClusterLmdShmem region (L98 cross-spec ownership invariant —
+	 * new actor / new shmem region / new LWLock tranche;不与 LMS shmem
+	 * 共享 region 违反 single-responsibility).  Idempotent guard via region
+	 * lookup mirrors LMS pattern.  Region lifecycle: cluster_lmd_shmem_size
+	 * + cluster_lmd_shmem_init invoked via spec-1.3 registry (see
+	 * cluster_lmd_region descriptor in cluster_lmd.c).
+	 */
+	if (cluster_shmem_lookup_region("pgrac cluster lmd") == NULL)
+		cluster_lmd_shmem_register();
 }
 
 

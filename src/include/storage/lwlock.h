@@ -273,6 +273,12 @@ typedef enum BuiltinTrancheIds {
 	 * for HC4 single ownership lock-free read on the LMON hot path
 	 * (cluster_lms_owns_grant). */
 	LWTRANCHE_CLUSTER_LMS,
+	/* PGRAC (spec-2.19 Sprint A Step 1): ClusterLmdSharedState lwlock
+	 * guards non-atomic LMD fields (pid / spawned_at / ready_at /
+	 * stopped_at / shutdown_requested).  lmd_state itself is atomic
+	 * for HC4 exact-predicate readiness check on the caller-side
+	 * ownership gate (cluster_lmd_is_ready). */
+	LWTRANCHE_CLUSTER_LMD,
 #endif
 	LWTRANCHE_FIRST_USER_DEFINED
 } BuiltinTrancheIds;
