@@ -434,15 +434,16 @@ extern PGDLLIMPORT PGPROC *PreparedXactProcs;
  * operation.  Startup process and WAL receiver also consume 2 slots, but WAL
  * writer is launched only after startup has exited, so PG-vanilla needs 5.
  *
- * PGRAC: with --enable-cluster builds we add 6 more aux processes that all
+ * PGRAC: with --enable-cluster builds we add 7 more aux processes that all
  * coexist with WalWriter / BgWriter / Checkpointer at PM_RUN: LMON
  * (spec-1.11), LCK (spec-1.12), DIAG (spec-1.13), Cluster Stats
- * (spec-1.14), CSSD (spec-2.5), QVOTEC (spec-2.6).  Bump the slot reserve
- * to 11 so we never trip "all AuxiliaryProcs are in use".  Stage 2+ adds
- * Sinval Broadcaster, Recovery Coordinator, etc. — bump again then.
+ * (spec-1.14), CSSD (spec-2.5), QVOTEC (spec-2.6), LMS (spec-2.18).  Bump
+ * the slot reserve to 13 (PG 5 + cluster 7 + 1 slack) so we never trip
+ * "all AuxiliaryProcs are in use".  Stage 2+ adds LMD (spec-2.19), Sinval
+ * Broadcaster, Recovery Coordinator, etc. — bump again then.
  */
 #ifdef USE_PGRAC_CLUSTER
-#define NUM_AUXILIARY_PROCS 12
+#define NUM_AUXILIARY_PROCS 13
 #else
 #define NUM_AUXILIARY_PROCS 5
 #endif

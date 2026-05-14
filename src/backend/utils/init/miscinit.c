@@ -359,6 +359,9 @@ GetBackendTypeDesc(BackendType backendType)
 	case B_LMON:
 		backendDesc = "lmon";
 		break;
+	case B_LMS:
+		backendDesc = "lms";
+		break;
 	case B_LMS_WORKER:
 		backendDesc = "lms worker";
 		break;

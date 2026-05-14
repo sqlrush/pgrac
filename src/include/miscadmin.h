@@ -374,6 +374,7 @@ typedef enum BackendType {
 	B_LCK,
 	B_LMD,
 	B_LMON,
+	B_LMS,
 	B_LMS_WORKER,
 	B_MRP,
 	B_QVOTEC,
@@ -550,6 +551,19 @@ typedef enum {
 	 * cluster_qvotec.h.
 	 */
 	QvotecProcess,
+	/*
+	 * LMS (Lock Master / Grant Service) is the 7th cluster background
+	 * process — spec-2.18 Sprint A.  Appended after QvotecProcess to
+	 * preserve numeric values.  Spec-2.18 ships the LMS skeleton +
+	 * grant-decision ownership migration from LMON to LMS with
+	 * single ownership path + fail-closed semantics (no runtime
+	 * LMON fallback grant; cluster.lms_enabled=off is PGC_POSTMASTER
+	 * startup-only fallback).  Real grant state machine activation,
+	 * BAST send, deadlock detection, cleanup_on_backend_exit, lock
+	 * class expansion all defer to spec-2.19+ Phase 2.C.  See
+	 * cluster_lms.h.
+	 */
+	LmsProcess,
 #endif
 
 	NUM_AUXPROCTYPES /* Must be last! */
@@ -570,6 +584,7 @@ extern PGDLLIMPORT AuxProcType MyAuxProcType;
 #define AmClusterStatsProcess() (MyAuxProcType == ClusterStatsProcess)
 #define AmCssdProcess() (MyAuxProcType == CssdProcess)
 #define AmQvotecProcess() (MyAuxProcType == QvotecProcess)
+#define AmLmsProcess() (MyAuxProcType == LmsProcess)
 #endif
 
 

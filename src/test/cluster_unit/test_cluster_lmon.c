@@ -499,6 +499,15 @@ void
 cluster_grd_deadlock_lmon_tick(void)
 {}
 
+/* spec-2.18 Sprint A Step 3 D8 L104 stub:  cluster_lms_owns_grant
+ * gates LMON ges drain path so LMS owns grant once READY. */
+bool cluster_lms_owns_grant(void);
+bool
+cluster_lms_owns_grant(void)
+{
+	return false;
+}
+
 int
 cluster_ges_lmon_drain_work_queue(void)
 {

@@ -325,6 +325,9 @@ static pid_t CssdPID = 0;
 
 /* PGRAC (spec-2.6 Sprint A Step 3 D7): QVOTEC aux process pid;same pattern. */
 static pid_t QvotecPID = 0;
+
+/* PGRAC (spec-2.18 Sprint A Step 1): LMS aux process pid;same pattern. */
+static pid_t LmsPID = 0;
 /*
  * spec-2.6 Sprint A Step 3 D8 deferral gate.  D7 lays down QvotecPID
  * tracking + reaper + LIFO + signal forwarding, but QVOTEC spawn
@@ -644,6 +647,7 @@ static void ShmemBackendArrayRemove(Backend *bn);
 #define StartClusterStats() StartChildProcess(ClusterStatsProcess)
 #define StartCssd() StartChildProcess(CssdProcess)
 #define StartQvotec() StartChildProcess(QvotecProcess)
+#define StartLms() StartChildProcess(LmsProcess)
 #endif
 
 /* Macros to check exit status of a child process */
@@ -2799,6 +2803,8 @@ process_pm_reload_request(void)
 			signal_child(CssdPID, SIGHUP);
 		if (QvotecPID != 0) /* PGRAC spec-2.6 Step 3 D7 */
 			signal_child(QvotecPID, SIGHUP);
+		if (LmsPID != 0) /* PGRAC spec-2.18 Sprint A Step 1 */
+			signal_child(LmsPID, SIGHUP);
 #endif
 		if (AutoVacPID != 0)
 			signal_child(AutoVacPID, SIGHUP);
@@ -3322,6 +3328,13 @@ process_pm_child_exit(void)
 				HandleChildCrash(pid, exitstatus, _("QVOTEC process"));
 			continue;
 		}
+		/* PGRAC (spec-2.18 Sprint A Step 1): LMS reaper. */
+		if (pid == LmsPID) {
+			LmsPID = 0;
+			if (!EXIT_STATUS_0(exitstatus))
+				HandleChildCrash(pid, exitstatus, _("LMS process"));
+			continue;
+		}
 #endif
 
 		/*
@@ -3734,6 +3747,12 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 		QvotecPID = 0;
 	else if (QvotecPID != 0 && take_action)
 		sigquit_child(QvotecPID);
+
+	/* PGRAC (spec-2.18 Sprint A Step 1): LMS crash handling. */
+	if (pid == LmsPID)
+		LmsPID = 0;
+	else if (LmsPID != 0 && take_action)
+		sigquit_child(LmsPID);
 #endif
 
 	/* Take care of the walreceiver too */
@@ -3891,7 +3910,12 @@ PostmasterStateMachine(void)
 		 * cluster_run_shutdown_sequence (which fires AFTER children
 		 * already exited) has no effect.  Q10 user-finding 2026-05-04.
 		 */
-		/* spec-2.6 Q10 LIFO: QVOTEC first (last-spawned in phase 4
+		/* spec-2.18 Q10 LIFO: LMS first (last-spawned in Phase 2.C
+		 * skeleton; spawn-integration site in Step 3+).  SIGTERM sets
+		 * ShutdownRequestPending which the LMS main loop polls. */
+		if (LmsPID != 0)
+			signal_child(LmsPID, SIGTERM);
+		/* spec-2.6 Q10 LIFO: QVOTEC next (was last-spawned in phase 4
 		 * driver fourth upgrade — DIAG + Stats + CSSD + QVOTEC serial
 		 * wait, QVOTEC added last). */
 		if (QvotecPID != 0)
@@ -4315,6 +4339,8 @@ TerminateChildren(int signal)
 		signal_child(CssdPID, signal);
 	if (QvotecPID != 0) /* PGRAC spec-2.6 Step 3 D7 */
 		signal_child(QvotecPID, signal);
+	if (LmsPID != 0) /* PGRAC spec-2.18 Sprint A Step 1 */
+		signal_child(LmsPID, signal);
 #endif
 }
 
@@ -5767,6 +5793,31 @@ cluster_postmaster_start_qvotec(void)
 	qvotec_spawn_enabled = true;
 	QvotecPID = StartQvotec();
 	return QvotecPID;
+}
+
+/*
+ * cluster_postmaster_start_lms -- spawn the LMS aux process.
+ *
+ *	PGRAC (spec-2.18 Sprint A Step 1): postmaster-owned narrow wrapper
+ *	for the cluster module to request LMS spawn.  Mirrors
+ *	cluster_postmaster_start_qvotec.  StartChildProcess is file-static
+ *	to postmaster.c, so cluster_lms.c forwards here.
+ *
+ *	Sprint A skeleton: LMS spawn is gated by cluster_enabled (and
+ *	will be additionally gated by cluster.lms_enabled GUC when Step 4
+ *	wires the GUC plumbing).  The phase 4 driver upgrade for LMS spawn
+ *	integration lands in Step 3+ alongside the LMON ↔ LMS ownership
+ *	transfer guard (HC4 single ownership).
+ *
+ *	Spec: spec-2.18-lms-daemon-grant-ownership-migration.md Sprint A.
+ */
+pid_t
+cluster_postmaster_start_lms(void)
+{
+	Assert(!IsUnderPostmaster);
+
+	LmsPID = StartLms();
+	return LmsPID;
 }
 #endif
 

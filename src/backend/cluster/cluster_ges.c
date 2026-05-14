@@ -37,6 +37,7 @@
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_grd_outbound.h"
+#include "cluster/cluster_lms.h"
 #include "cluster/cluster_grd_work_queue.h"
 #include "cluster/cluster_guc.h" /* cluster_node_id */
 #include "cluster/cluster_ic_envelope.h"
@@ -239,7 +240,21 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 		reject.holder_request_id_hi = req->holder_request_id_hi;
 		memcpy(reject.resid, req->resid, sizeof(reject.resid));
 		cluster_grd_outbound_enqueue_lmon_reply(env->source_node_id, &reject, sizeof(reject));
+		return;
 	}
+
+	/*
+	 * spec-2.18 Sprint A Step 3 D9 — HC3 (a) producer broadcast.
+	 *
+	 *	After successful work_queue enqueue, wake LMS to drain the new
+	 *	item.  cluster_lms_wake_drain is no-op when LMS DISABLED (so
+	 *	work_queue still drains via the LMON catch-up path until LMS
+	 *	is READY — D8 hard-disable guard takes over once LMS owns
+	 *	grant).  The wake call happens AFTER the producer LWLock
+	 *	release inside cluster_grd_work_queue_enqueue (avoids
+	 *	wake-then-reacquire spin per HC3 (a)).
+	 */
+	cluster_lms_wake_drain();
 }
 
 void

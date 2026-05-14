@@ -222,6 +222,13 @@ cluster_grd_inc_ges_work_queue_full(void)
 {
 	stub_work_queue_full++;
 }
+
+/* spec-2.18 Sprint A Step 3 D9 L104 stub:  cluster_lms_wake_drain
+ * broadcasts CV after successful work_queue enqueue. */
+void cluster_lms_wake_drain(void);
+void
+cluster_lms_wake_drain(void)
+{}
 void
 cluster_grd_inc_ges_inbound_validation_fail(void)
 {

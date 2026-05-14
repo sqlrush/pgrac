@@ -75,6 +75,7 @@
 #include "cluster/cluster_qvotec.h" /* cluster_qvotec_shmem_register (spec-2.6 Sprint A Step 1) */
 #include "cluster/cluster_fence.h"	/* cluster_fence_shmem_register (spec-2.28 Sprint A Step 1) */
 #include "cluster/cluster_reconfig.h" /* cluster_reconfig_shmem_register (spec-2.29 Sprint A Step 1) */
+#include "cluster/cluster_lms.h"	  /* cluster_lms_shmem_register (spec-2.18 Sprint A Step 1) */
 /* spec-2.7 hardening F1: cluster_smgr_shmem_register;intentionally no
  * trailing line-end comment so the longer storage/ path doesn't force
  * clang-format to realign every neighbour include above. */
@@ -466,6 +467,17 @@ cluster_init_shmem_module(void)
 	 */
 	if (cluster_shmem_lookup_region("pgrac cluster reconfig") == NULL)
 		cluster_reconfig_shmem_register();
+
+	/*
+	 * spec-2.18 Sprint A Step 1 D6/D7: register cluster_lms shmem region.
+	 * Single-tranche LWLock guards non-atomic LMS fields (pid /
+	 * spawned_at / ready_at / stopped_at / shutdown_requested).  lms_state
+	 * itself is atomic for HC4 single-ownership lock-free read on the
+	 * LMON hot-path (cluster_lms_owns_grant).  Real LMON ↔ LMS ownership
+	 * transfer guard wires in Step 3.
+	 */
+	if (cluster_shmem_lookup_region("pgrac cluster lms") == NULL)
+		cluster_lms_shmem_register();
 }
 
 

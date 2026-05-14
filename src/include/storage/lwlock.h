@@ -267,6 +267,12 @@ typedef enum BuiltinTrancheIds {
 	 * lesson — apply_counter inc + last_applied write share critical
 	 * section so concurrent SRF reads see consistent snapshot. */
 	LWTRANCHE_CLUSTER_RECONFIG,
+	/* PGRAC (spec-2.18 Sprint A Step 1): ClusterLmsSharedState lwlock
+	 * guards non-atomic LMS fields (pid / spawned_at / ready_at /
+	 * stopped_at / shutdown_requested).  lms_state itself is atomic
+	 * for HC4 single ownership lock-free read on the LMON hot path
+	 * (cluster_lms_owns_grant). */
+	LWTRANCHE_CLUSTER_LMS,
 #endif
 	LWTRANCHE_FIRST_USER_DEFINED
 } BuiltinTrancheIds;

@@ -452,6 +452,12 @@ void
 cluster_reconfig_shmem_register(void)
 {}
 
+/* spec-2.18 Sprint A Step 1 stub: cluster_lms shmem region (L104). */
+void cluster_lms_shmem_register(void);
+void
+cluster_lms_shmem_register(void)
+{}
+
 
 UT_DEFINE_GLOBALS();
 

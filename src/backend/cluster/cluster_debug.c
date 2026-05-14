@@ -78,6 +78,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_scn.h"  /* cluster_scn_current (spec-1.15 D6) */
 #include "cluster/cluster_ges.h"  /* cluster_ges_{request,reply}_defer_count (spec-2.13 D4) */
 #include "cluster/cluster_grd.h"  /* cluster_grd_* observability accessors (spec-2.14 D6) */
+#include "cluster/cluster_lms.h"  /* cluster_lms_* observability accessors (spec-2.18 D10) */
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_grd_pending.h"
 #include "cluster/cluster_grd_work_queue.h"
@@ -855,6 +856,33 @@ dump_grd(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_grd_deadlock_chunk_oo_buffer_overflow_count()));
 }
 
+/*
+ * dump_lms -- spec-2.18 Sprint A Step 4 D10.
+ *
+ *	Emits 6 rows under category='lms' corresponding to the 6 atomic
+ *	counters in ClusterLmsSharedState (v0.3 §1.4 F2 收紧;
+ *	grant/reject/convert 分项 counter 推 spec-2.20 真激活 grant state
+ *	machine 时一并 ship).
+ *
+ *	Plus the LMS state string for HC2 4-state semantic分流
+ *	observability.
+ */
+static void
+dump_lms(ReturnSetInfo *rsinfo)
+{
+	ClusterLmsState s = cluster_lms_get_state();
+
+	emit_row(rsinfo, "lms", "lms_state", cluster_lms_state_to_string(s));
+	emit_row(rsinfo, "lms", "lms_started_count", fmt_int64((int64)cluster_lms_get_started_count()));
+	emit_row(rsinfo, "lms", "lms_work_drained_count",
+			 fmt_int64((int64)cluster_lms_get_work_drained_count()));
+	emit_row(rsinfo, "lms", "lms_decision_count",
+			 fmt_int64((int64)cluster_lms_get_decision_count()));
+	emit_row(rsinfo, "lms", "lms_drain_empty_count",
+			 fmt_int64((int64)cluster_lms_get_drain_empty_count()));
+	emit_row(rsinfo, "lms", "lms_error_count", fmt_int64((int64)cluster_lms_get_error_count()));
+}
+
 
 /*
  * dump_ges -- spec-2.13 D4 GES protocol skeleton observability.
@@ -1055,6 +1083,7 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		dump_scn(rsinfo);
 		dump_ges(rsinfo);
 		dump_grd(rsinfo);
+		dump_lms(rsinfo);
 	}
 #else
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

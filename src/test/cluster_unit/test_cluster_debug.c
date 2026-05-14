@@ -1160,6 +1160,47 @@ UT_TEST(test_debug_links_against_inject_module)
 	UT_ASSERT_NOT_NULL((void *)cluster_injection_get_state_at);
 }
 
+/*
+ * spec-2.18 Sprint A Step 4 D10 L104 stubs: dump_cluster_lms references
+ * cluster_lms_* accessors via cluster_debug.o; standalone test
+ * harness must provide local zero-returning stubs.
+ */
+int
+cluster_lms_get_state(void)
+{
+	return 0;
+}
+uint64
+cluster_lms_get_started_count(void)
+{
+	return 0;
+}
+uint64
+cluster_lms_get_work_drained_count(void)
+{
+	return 0;
+}
+uint64
+cluster_lms_get_decision_count(void)
+{
+	return 0;
+}
+uint64
+cluster_lms_get_drain_empty_count(void)
+{
+	return 0;
+}
+uint64
+cluster_lms_get_error_count(void)
+{
+	return 0;
+}
+const char *
+cluster_lms_state_to_string(int s pg_attribute_unused())
+{
+	return "(stub)";
+}
+
 UT_TEST(test_debug_links_against_pgstat_module)
 {
 	UT_ASSERT_NOT_NULL((void *)cluster_pgstat_get_count);

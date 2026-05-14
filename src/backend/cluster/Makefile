@@ -63,6 +63,7 @@ OBJS = \
 	cluster_inject.o \
 	cluster_lck.o \
 	cluster_lmon.o \
+	cluster_lms.o \
 	cluster_pcm_lock.o \
 	cluster_pgstat.o \
 	cluster_quorum_decision.o \

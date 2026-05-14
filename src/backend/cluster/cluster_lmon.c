@@ -59,6 +59,7 @@
 #include "cluster/cluster_cssd.h"  /* cluster_cssd_outbound_slots (spec-2.5 D2.6) */
 #include "cluster/cluster_fence.h" /* cluster_fence_lmon_tick (spec-2.28 D5) */
 #include "cluster/cluster_grd.h"   /* cluster_grd_lmon_tick_dead_sweep (spec-2.16 D8) */
+#include "cluster/cluster_lms.h"   /* cluster_lms_owns_grant (spec-2.18 Sprint A Step 3 D8 HC4) */
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_reconfig.h" /* cluster_reconfig_lmon_tick (spec-2.29 Step 2 D3) */
 #include "cluster/cluster_guc.h"
@@ -806,8 +807,26 @@ LmonMain(void)
 			 * per v0.5 P1.2;  no-op when dead_generation unchanged. */
 			cluster_grd_lmon_tick_dead_sweep();
 			cluster_grd_deadlock_lmon_tick(); /* spec-2.17 Step 5 */
-			cluster_ges_lmon_drain_work_queue();
-			cluster_grd_outbound_lmon_drain_send();
+			/*
+			 * spec-2.18 Sprint A Step 3 D8 — HC4 single ownership guard.
+			 *
+			 *	When LMS owns grant decisions (state >= READY), LMON
+			 *	MUST hard-disable its work_queue drain path so the
+			 *	two actors never both execute grant logic concurrently.
+			 *	Until LMS is READY (or DISABLED → LMS never forks),
+			 *	LMON keeps the catch-up tick semantics so the
+			 *	work_queue does not stall during bootstrap.
+			 *
+			 *	HC1 fail-closed: when state == STOPPED (LMS crashed
+			 *	after READY), LMON also stays disabled — backends
+			 *	receive SQLSTATE 53R80 cluster_lms_unavailable (Step 4
+			 *	wires the raise) and retry; runtime NO ownership
+			 *	transfer path back to LMON.
+			 */
+			if (!cluster_lms_owns_grant()) {
+				cluster_ges_lmon_drain_work_queue();
+				cluster_grd_outbound_lmon_drain_send();
+			}
 
 			cluster_reconfig_lmon_tick();
 

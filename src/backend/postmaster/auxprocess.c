@@ -39,6 +39,7 @@
 #include "cluster/cluster_lmon.h"  /* LmonMain (stage 1.11 Sprint A) */
 #include "cluster/cluster_cssd.h"	/* CssdMain (stage 2.5 Sprint A) */
 #include "cluster/cluster_qvotec.h" /* ClusterQvotecMain (spec-2.6 Sprint A Step 3 D7) */
+#include "cluster/cluster_lms.h"	/* LmsMain (spec-2.18 Sprint A Step 1) */
 #include "cluster/cluster_stats.h" /* ClusterStatsMain (stage 1.14 Sprint A) */
 #endif
 
@@ -112,6 +113,10 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 	/* PGRAC (stage 2.6 Sprint A Step 3 D7): QVOTEC aux process. */
 	case QvotecProcess:
 		MyBackendType = B_QVOTEC;
+		break;
+	/* PGRAC (spec-2.18 Sprint A Step 1): LMS aux process. */
+	case LmsProcess:
+		MyBackendType = B_LMS;
 		break;
 #endif
 	default:
@@ -230,6 +235,12 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 	 * Spec: spec-2.6-voting-disk-quorum-lite.md Sprint A Step 3 D7. */
 	case QvotecProcess:
 		ClusterQvotecMain();
+		proc_exit(1);
+	/* PGRAC (spec-2.18 Sprint A Step 1): LMS aux process dispatch.  LmsMain
+	 * is pg_attribute_noreturn(); proc_exit(1) below is a defensive bailout
+	 * if the compiler does not honor the attribute. */
+	case LmsProcess:
+		LmsMain();
 		proc_exit(1);
 #endif
 
