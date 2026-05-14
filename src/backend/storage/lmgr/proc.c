@@ -36,8 +36,10 @@
 #include "access/transam.h"
 #include "access/twophase.h"
 #include "access/xlogutils.h"
+#ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_grd.h" /* spec-2.17 D28c — cluster_grd_alloc_generation */
 #include "cluster/cluster_guc.h" /* spec-2.17 — cluster_enabled */
+#endif
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
@@ -474,10 +476,12 @@ InitProcess(void)
 	 *      (cluster_grd 6-tuple identity payload target_generation 验证).
 	 * Spec: spec-2.17-bast-deadlock-caller-side-4node.md DRAFT v0.1 P1.7
 	 */
+#ifdef USE_PGRAC_CLUSTER
 	if (cluster_enabled && MyProc != NULL) {
 		MyProc->cluster_grd_generation = cluster_grd_alloc_generation();
 		MyProc->cluster_grd_bast_pending = false;
 	}
+#endif
 }
 
 /*
