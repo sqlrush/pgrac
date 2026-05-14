@@ -20,6 +20,7 @@
 #include "pgstat.h"
 #include "postmaster/auxprocess.h"
 #include "postmaster/bgwriter.h"
+#include "postmaster/interrupt.h"
 #include "postmaster/startup.h"
 #include "postmaster/walwriter.h"
 #include "replication/walreceiver.h"
@@ -167,6 +168,26 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 
 	/* Initialize backend status information */
 	pgstat_beinit();
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * LMS becomes externally visible in pg_stat_activity at pgstat_bestart(),
+	 * while its regular signal setup lives in LmsMain().  Install the same
+	 * minimal handlers before publishing backend status so fast shutdown
+	 * cannot lose SIGTERM in the pgstat-visible / pre-LmsMain window.
+	 */
+	if (MyAuxProcType == LmsProcess)
+	{
+		pqsignal(SIGHUP, SignalHandlerForConfigReload);
+		pqsignal(SIGINT, SignalHandlerForShutdownRequest);
+		pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
+		pqsignal(SIGALRM, SIG_IGN);
+		pqsignal(SIGPIPE, SIG_IGN);
+		pqsignal(SIGUSR1, procsignal_sigusr1_handler);
+		pqsignal(SIGUSR2, SIG_IGN);
+		pqsignal(SIGCHLD, SIG_DFL);
+		sigprocmask(SIG_SETMASK, &UnBlockSig, NULL);
+	}
+#endif
 	pgstat_bestart();
 
 	/* register a before-shutdown callback for LWLock cleanup */

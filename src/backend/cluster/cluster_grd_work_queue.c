@@ -86,6 +86,8 @@ cluster_grd_work_queue_enqueue(uint32 source_node_id, const void *payload, uint1
 	ClusterGrdWorkItem *slot;
 
 	Assert(cluster_grd_work_queue_state != NULL);
+	if (cluster_grd_work_queue_state == NULL || cluster_grd_work_queue_lock == NULL)
+		return false;
 	if (payload_len > sizeof(((ClusterGrdWorkItem *)0)->payload))
 		return false;
 
@@ -116,6 +118,8 @@ cluster_grd_work_queue_dequeue(ClusterGrdWorkItem *out)
 
 	Assert(cluster_grd_work_queue_state != NULL);
 	Assert(out != NULL);
+	if (cluster_grd_work_queue_state == NULL || cluster_grd_work_queue_lock == NULL || out == NULL)
+		return false;
 
 	LWLockAcquire(cluster_grd_work_queue_lock, LW_EXCLUSIVE);
 	if (cluster_grd_work_queue_state->count > 0) {

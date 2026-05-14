@@ -244,17 +244,13 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 	}
 
 	/*
-	 * spec-2.18 Sprint A Step 3 D9 — HC3 (a) producer broadcast.
-	 *
-	 *	After successful work_queue enqueue, wake LMS to drain the new
-	 *	item.  cluster_lms_wake_drain is no-op when LMS DISABLED (so
-	 *	work_queue still drains via the LMON catch-up path until LMS
-	 *	is READY — D8 hard-disable guard takes over once LMS owns
-	 *	grant).  The wake call happens AFTER the producer LWLock
-	 *	release inside cluster_grd_work_queue_enqueue (avoids
-	 *	wake-then-reacquire spin per HC3 (a)).
+	 * spec-2.18 Sprint A Step 1-6 skeleton: LMS daemon does not yet own
+	 * the work_queue drain loop; LMON tick body remains the sole consumer.
+	 * The cluster_lms_wake_drain() producer hook is retained as a no-op
+	 * compatibility surface and will be wired (alongside the LMS-side CV
+	 * consumer) in the Hardening round once the LMS ownership transfer is
+	 * verified safe end-to-end.
 	 */
-	cluster_lms_wake_drain();
 }
 
 void

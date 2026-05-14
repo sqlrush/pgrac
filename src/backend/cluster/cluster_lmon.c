@@ -823,10 +823,17 @@ LmonMain(void)
 			 *	wires the raise) and retry; runtime NO ownership
 			 *	transfer path back to LMON.
 			 */
-			if (!cluster_lms_owns_grant()) {
-				cluster_ges_lmon_drain_work_queue();
-				cluster_grd_outbound_lmon_drain_send();
-			}
+			/*
+			 * spec-2.18 Sprint A Step 1-6 skeleton:  LMS daemon exists for
+			 * catalog visibility but does NOT yet own grant decisions.  LMON
+			 * remains the sole drain consumer + outbound producer until the
+			 * Hardening round wires the ownership transfer.  The
+			 * cluster_lms_owns_grant() helper exists as the future toggle
+			 * point but the read returns false in the skeleton path because
+			 * LMS never advances past STARTING for the ownership purpose.
+			 */
+			cluster_ges_lmon_drain_work_queue();
+			cluster_grd_outbound_lmon_drain_send();
 
 			cluster_reconfig_lmon_tick();
 

@@ -1919,6 +1919,21 @@ ServerLoop(void)
 			QvotecPID = StartQvotec();
 
 		/*
+		 * PGRAC: spec-2.18 Sprint A — LMS auto-spawn disabled in Step 1-6
+		 * skeleton.  CleanupProcSignalState pss_barrierCV broadcast infinite-
+		 * loops when LMS exits — root cause not yet identified, suspected
+		 * interaction between LmsProcess slot index + PG-canonical barrier
+		 * mechanism.  Until the Hardening round wires the exit/recycle path
+		 * safely, leave all postmaster integration in place (reaper / SIGHUP /
+		 * SIGTERM / pmState wait) but skip the respawn so no LMS process is
+		 * created — the AuxProcType / BackendType / shmem region / lwlock
+		 * tranche / NUM_AUXILIARY_PROCS bump / SQL surfaces remain present
+		 * for catalog-visibility tests.  004_backend_types.pl LMS-visible
+		 * assertion is updated alongside this gate.
+		 */
+		(void) 0; /* StartLms() — deferred to Hardening round */
+
+		/*
 		 * PGRAC: spec-2.28 Sprint A Step 3 D6 — fence-lite postmaster
 		 * self-fence trigger.  cluster_fence_postmaster_check() reads
 		 * ClusterFenceShmem.self_fence_requested_at_us (set by LMON
@@ -3992,6 +4007,8 @@ PostmasterStateMachine(void)
 			CssdPID == 0 &&
 			/* PGRAC: spec-2.6 Sprint A Step 3 D7 — same wait for QVOTEC. */
 			QvotecPID == 0 &&
+			/* PGRAC: spec-2.18 Sprint A — same wait for LMS. */
+			LmsPID == 0 &&
 #endif
 			AutoVacPID == 0) {
 			if (Shutdown >= ImmediateShutdown || FatalError) {

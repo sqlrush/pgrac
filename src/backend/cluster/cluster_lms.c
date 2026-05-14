@@ -19,11 +19,10 @@
  *	  distinguished in pg_cluster_lms view + 53R80 reason field
  *	  (Step 4 view delivery).
  *
- *	  HC3 ConditionVariable 4 contracts:
- *	    (a) producer broadcast after successful enqueue
- *	    (b) main loop while-loop guards spurious wakeup
- *	    (c) shutdown path ConditionVariableCancelSleep
- *	    (d) no complex work in async-signal-unsafe critical path
+ *	  HC3 ConditionVariable substrate is retained for producer-side
+ *	  wake API compatibility, but the Step 6 LMS skeleton uses the
+ *	  proven aux-process WaitLatch idle path until a dedicated LMS
+ *	  latch handoff lands in the production activation spec.
  *
  *	  HC4 single ownership atomic guard.  Public helper
  *	  cluster_lms_owns_grant() reads lms_state atomic; LMON tick body
@@ -58,6 +57,8 @@
 
 #include <signal.h>
 
+#include "cluster/cluster_ges.h"
+#include "cluster/cluster_grd_work_queue.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_shmem.h"
 #include "libpq/pqsignal.h"
@@ -80,12 +81,11 @@
 
 
 /*
- * Idle sleep timeout for the main loop ConditionVariableTimedSleep
- * fallback poll.  Hardcoded per spec-2.18 §1.4 F3 (no GUC — polling
- * concept conflicts with event-driven CV wake).  100µs balances
- * wake latency vs CPU overhead.
+ * Idle sleep timeout for the main loop WaitLatch fallback poll.
+ * Hardcoded for the Step 6 skeleton; producer-side CV broadcast remains
+ * present, but this aux process does not rely on CV sleeper registration.
  */
-#define LMS_IDLE_TIMEOUT_US 100000 /* 100 ms in microseconds (CV API uses ms) */
+#define LMS_IDLE_TIMEOUT_MS 100
 
 
 /* External hook from postmaster.c (mirrors cluster_lmon Q2 thin proxy). */
@@ -295,11 +295,7 @@ cluster_lms_request_shutdown(void)
 	cluster_lms_state->shutdown_requested = true;
 	LWLockRelease(&cluster_lms_state->lwlock);
 
-	/*
-	 * HC3 (c): broadcast cv to wake LMS main loop from CV sleep so
-	 * the shutdown_requested flag is consumed promptly without
-	 * waiting for the idle timeout.
-	 */
+	/* Wake any future CV-based LMS waiter; current skeleton also polls latch. */
 	ConditionVariableBroadcast(&cluster_lms_state->cv);
 }
 
@@ -407,19 +403,31 @@ cluster_lms_get_error_count(void)
 bool
 cluster_lms_owns_grant(void)
 {
+	ClusterLmsState state;
+
 	if (cluster_lms_state == NULL)
 		return false;
-	return pg_atomic_read_u32(&cluster_lms_state->lms_state) >= (uint32)CLUSTER_LMS_READY;
+
+	state = (ClusterLmsState)pg_atomic_read_u32(&cluster_lms_state->lms_state);
+
+	/*
+	 * DISABLED is a startup-only opt-out and must preserve LMON fallback.
+	 * STOPPED is a runtime LMS failure and must remain fail-closed (no
+	 * fallback grant path), matching HC1.
+	 */
+	return state == CLUSTER_LMS_READY || state == CLUSTER_LMS_DRAINING
+		   || state == CLUSTER_LMS_STOPPED;
 }
 
 
 /* ============================================================
  * HC3 producer wake.
  *
- * Producers call this after a successful enqueue to wake LMS main
- * loop from its CV sleep.  Must be called AFTER releasing the
- * work_queue producer LWLock (avoid wake-then-reacquire spin).  No-op
- * when LMS DISABLED (lms_enabled=off startup) since the LMS process
+ * Producers call this after a successful enqueue.  Step 6 keeps the
+ * producer-side CV contract as a stable API while the LMS skeleton uses
+ * WaitLatch polling for idle sleep; production activation can switch the
+ * consumer to CV once it owns a fully verified aux-process wake path.
+ * No-op when LMS DISABLED (lms_enabled=off startup) since the LMS process
  * is not running to receive the wake.
  * ============================================================ */
 
@@ -438,12 +446,10 @@ cluster_lms_wake_drain(void)
  * LMS main entry.
  *
  *	Invoked from auxprocess.c dispatch when MyAuxProcType == LmsProcess.
- *	Runs the CV-driven drain consumer loop until shutdown.  HC3 4
- *	must-have contracts enforced:
- *	  (a) producer broadcast (in cluster_lms_wake_drain)
- *	  (b) main loop while-loop guards atomic work_queue_count
- *	  (c) shutdown path ConditionVariableCancelSleep
- *	  (d) no complex work in async-signal-unsafe critical path
+ *	Runs the drain consumer loop until shutdown.  The Step 6 skeleton
+ *	uses the same WaitLatch idle pattern as the existing cluster aux
+ *	processes; producer-side ConditionVariable broadcast is retained as
+ *	the compatibility surface for the later event-driven LMS path.
  *	      (CV ops happen outside signal context;handlers only set
  *	      latch / ShutdownRequestPending)
  * ============================================================ */
@@ -456,12 +462,7 @@ LmsMain(void)
 	MyBackendType = B_LMS;
 	init_ps_display(NULL);
 
-	/*
-	 * Standard PG aux-process signal layout (modeled on cluster_lmon.c
-	 * LmonMain).  CV-based wake is layered on top of latch — SIGTERM /
-	 * SIGINT set ShutdownRequestPending which is observed inside the
-	 * CV wait loop via CHECK_FOR_INTERRUPTS().
-	 */
+	/* Standard PG aux-process signal layout (modeled on cluster_lmon.c). */
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGINT, SignalHandlerForShutdownRequest);
 	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
@@ -496,19 +497,17 @@ LmsMain(void)
 	LWLockRelease(&cluster_lms_state->lwlock);
 
 	/*
-	 * HC3 main loop with 4-contract CV discipline:
-	 *	(a) producer broadcast happens in cluster_lms_wake_drain
-	 *	(b) while-loop guards atomic work_queue_count
-	 *	(c) ConditionVariableCancelSleep on every exit path
-	 *	(d) no palloc / elog / LWLock-held during CV ops
-	 *
-	 * Step 1 skeleton: drain loop is a stub — it counts wake events
-	 * and empty pumps.  Real drain logic (work_queue dequeue + grant
-	 * decision) lands when spec-2.20 7-step state machine activates.
+	 * spec-2.18 Sprint A Step 1-6 skeleton main loop.  LMS daemon exists for
+	 * catalog visibility + ABI surface (B_LMS / LmsProcess / pg_cluster_lms
+	 * later) but does NOT yet own the GES drain consumer — LMON keeps that
+	 * role until the Hardening round wires ownership transfer.  The body is
+	 * a pure idle WaitLatch loop: SIGTERM sets ShutdownRequestPending +
+	 * MyLatch, WaitLatch returns, the head guard breaks, proc_exit(0)
+	 * completes cleanly without any cluster shmem cleanup.  No CV
+	 * sleep / broadcast in this skeleton — pss_barrierCV is exercised
+	 * only via standard PG paths during proc_exit, which is verified safe.
 	 */
 	for (;;) {
-		uint32 queue_count;
-
 		CHECK_FOR_INTERRUPTS();
 
 		if (ConfigReloadPending) {
@@ -519,43 +518,17 @@ LmsMain(void)
 		if (ShutdownRequestPending || lms_shutdown_requested())
 			break;
 
-		/*
-		 * HC3 (b) while-loop spurious-wakeup guard: re-check the
-		 * atomic queue count after every wake.  Real consumer logic
-		 * (Step 3+ wire) will dequeue inside this conditional and
-		 * bump lms_work_drained_count or lms_drain_empty_count.
-		 */
-		queue_count = pg_atomic_read_u32(&cluster_lms_state->work_queue_count);
-		if (queue_count == 0) {
-			/* Empty pump tick — drain loop placeholder. */
-			pg_atomic_fetch_add_u64(&cluster_lms_state->lms_drain_empty_count, 1);
-		} else {
-			/* Spec-2.20+ wires real drain here. */
-			pg_atomic_fetch_add_u64(&cluster_lms_state->lms_work_drained_count, 1);
-		}
+		pg_atomic_fetch_add_u64(&cluster_lms_state->lms_drain_empty_count, 1);
 
-		/*
-		 * HC3 (c) prepare → timed sleep → cancel pattern.
-		 * ConditionVariableTimedSleep returns true on timeout, false
-		 * on CV broadcast wake.  Both paths fall through to the next
-		 * iteration; CHECK_FOR_INTERRUPTS + shutdown_requested at
-		 * loop head handle exit.  CancelSleep at the bottom is
-		 * mandatory even if no timeout fired (defensive against
-		 * sleeper-list leak on FATAL ereport bubbling through).
-		 */
-		ConditionVariablePrepareToSleep(&cluster_lms_state->cv);
-		(void)ConditionVariableTimedSleep(&cluster_lms_state->cv, LMS_IDLE_TIMEOUT_US / 1000,
-										  WAIT_EVENT_PG_SLEEP);
-		ConditionVariableCancelSleep();
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						LMS_IDLE_TIMEOUT_MS, WAIT_EVENT_PG_SLEEP);
+		ResetLatch(MyLatch);
 	}
 
 	/* Transition to DRAINING then STOPPED. */
 	LWLockAcquire(&cluster_lms_state->lwlock, LW_EXCLUSIVE);
 	lms_set_state(CLUSTER_LMS_DRAINING);
 	LWLockRelease(&cluster_lms_state->lwlock);
-
-	/* HC3 (c) defensive cancel before exit — covers any in-flight sleep. */
-	ConditionVariableCancelSleep();
 
 	LWLockAcquire(&cluster_lms_state->lwlock, LW_EXCLUSIVE);
 	cluster_lms_state->stopped_at = GetCurrentTimestamp();

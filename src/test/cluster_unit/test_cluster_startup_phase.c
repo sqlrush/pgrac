@@ -328,6 +328,18 @@ cluster_qvotec_wait_for_ready(int timeout_ms pg_attribute_unused())
 	return false;
 }
 
+/* spec-2.18 Sprint A stubs. */
+int
+cluster_lms_start(void)
+{
+	return 0;
+}
+bool
+cluster_lms_wait_for_ready(int timeout_ms pg_attribute_unused())
+{
+	return false;
+}
+
 
 UT_DEFINE_GLOBALS();
 

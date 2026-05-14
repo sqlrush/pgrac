@@ -62,6 +62,7 @@
 #include "cluster/cluster_stats.h"	/* cluster_stats_start / wait_for_ready (1.14 Sprint A) */
 #include "cluster/cluster_inject.h" /* CLUSTER_INJECTION_POINT */
 #include "cluster/cluster_lck.h"	/* cluster_lck_start / wait_for_ready (1.12 Sprint A) */
+#include "cluster/cluster_lms.h"	/* cluster_lms_start / wait_for_ready (spec-2.18 Sprint A) */
 #include "cluster/cluster_lmon.h"	/* cluster_lmon_start / wait_for_ready (1.11 Sprint A) */
 #include "cluster/cluster_scn.h"	/* SCN_NODE_ID_VALID (spec-1.16 D13) */
 #include "cluster/cluster_shmem.h"	/* cluster_shmem_register_region */
@@ -447,8 +448,9 @@ cluster_advance_phase(ClusterStartupPhase target)
  *	1.11-1.14 / Stage 2-4 replacement.
  * ============================================================ */
 
-/* Forward decl: phase_4_handler reads phase4_timeout via this helper. */
+/* Forward decls used by multi-child phase handlers. */
 static int cluster_phase_timeout_for(ClusterStartupPhase phase);
+static int cluster_phase_remaining_budget_ms(TimestampTz deadline, int driver_buffer_ms);
 
 static PhaseRunResult
 phase_1_handler(PhaseRunFailContext *fail_ctx)
@@ -521,14 +523,7 @@ phase_2_handler(PhaseRunFailContext *fail_ctx)
 		return PHASE_RUN_OK;
 	}
 
-	/*
-	 * Stage 1.12 Sprint A: spawn LCK aux process and synchronously
-	 * wait for it to publish CLUSTER_LCK_READY.  LMS / LMD remain
-	 * stubs (Stage 2+ GES feature).
-	 *
-	 * Spec: spec-1.12-lck-skeleton.md Sprint A D6 +
-	 *       spec-1.11.1 F13 PhaseRunFailContext API.
-	 */
+	/* Stage 1.12 Sprint A: spawn LCK and wait for READY. */
 	lck_pid = cluster_lck_start();
 	if (lck_pid == 0) {
 		fail_ctx->errcode = ERRCODE_CLUSTER_LCK_SPAWN_FAILED;
@@ -553,8 +548,8 @@ phase_2_handler(PhaseRunFailContext *fail_ctx)
 	}
 
 	elog(DEBUG1,
-		 "cluster phase 2: LCK ready (pid %d); LMS / LMD remain stubs "
-		 "(Stage 2+ GES feature)",
+		 "cluster phase 2: LCK ready (pid %d); LMS starts under PM_RUN "
+		 "ServerLoop respawn, LMD remains stub (Stage 2+ GES feature)",
 		 lck_pid);
 	return PHASE_RUN_OK;
 }
@@ -571,7 +566,7 @@ phase_3_handler(PhaseRunFailContext *fail_ctx pg_attribute_unused())
 
 
 /*
- * phase4_remaining_budget_ms -- spec-1.14 Q3 user 修订 single deadline.
+ * cluster_phase_remaining_budget_ms -- single-deadline remaining budget.
  *
  *	Returns max(deadline - now - driver_buffer_ms, 100ms floor).  Each
  *	child wait inside phase_4_handler computes its budget off the same
@@ -587,7 +582,7 @@ phase_3_handler(PhaseRunFailContext *fail_ctx pg_attribute_unused())
  *	wait_for_ready does not spuriously fail on a tight overflow.
  */
 static int
-phase4_remaining_budget_ms(TimestampTz deadline, int driver_buffer_ms)
+cluster_phase_remaining_budget_ms(TimestampTz deadline, int driver_buffer_ms)
 {
 	long secs;
 	int microsecs;
@@ -657,7 +652,7 @@ phase_4_handler(PhaseRunFailContext *fail_ctx)
 		return PHASE_RUN_FATAL;
 	}
 
-	diag_remaining_ms = phase4_remaining_budget_ms(phase4_deadline, 5000);
+	diag_remaining_ms = cluster_phase_remaining_budget_ms(phase4_deadline, 5000);
 	if (!cluster_diag_wait_for_ready(diag_remaining_ms)) {
 		fail_ctx->errcode = ERRCODE_CLUSTER_DIAG_NOT_READY;
 		fail_ctx->errmsg = "cluster phase 4: DIAG did not publish READY in time";
@@ -683,7 +678,7 @@ phase_4_handler(PhaseRunFailContext *fail_ctx)
 		return PHASE_RUN_FATAL;
 	}
 
-	stats_remaining_ms = phase4_remaining_budget_ms(phase4_deadline, 5000);
+	stats_remaining_ms = cluster_phase_remaining_budget_ms(phase4_deadline, 5000);
 	if (!cluster_stats_wait_for_ready(stats_remaining_ms)) {
 		fail_ctx->errcode = ERRCODE_CLUSTER_STATS_NOT_READY;
 		fail_ctx->errmsg = "cluster phase 4: Cluster Stats did not publish READY in time";
@@ -710,7 +705,7 @@ phase_4_handler(PhaseRunFailContext *fail_ctx)
 		return PHASE_RUN_FATAL;
 	}
 
-	cssd_remaining_ms = phase4_remaining_budget_ms(phase4_deadline, 5000);
+	cssd_remaining_ms = cluster_phase_remaining_budget_ms(phase4_deadline, 5000);
 	if (!cluster_cssd_wait_for_ready(cssd_remaining_ms)) {
 		fail_ctx->errcode = ERRCODE_CLUSTER_CSSD_NOT_READY;
 		fail_ctx->errmsg = "cluster phase 4: CSSD did not publish READY in time";
@@ -734,7 +729,7 @@ phase_4_handler(PhaseRunFailContext *fail_ctx)
 		return PHASE_RUN_FATAL;
 	}
 
-	qvotec_remaining_ms = phase4_remaining_budget_ms(phase4_deadline, 5000);
+	qvotec_remaining_ms = cluster_phase_remaining_budget_ms(phase4_deadline, 5000);
 	if (!cluster_qvotec_wait_for_ready(qvotec_remaining_ms)) {
 		fail_ctx->errcode = ERRCODE_CLUSTER_QVOTEC_NOT_READY;
 		fail_ctx->errmsg = "cluster phase 4: QVOTEC did not publish READY in time";

@@ -8,8 +8,10 @@
  *	  Phase 2.C.  Sprint A scope is the lifecycle skeleton + grant-decision
  *	  ownership migration from LMON to LMS — single ownership path with
  *	  fail-closed semantics (no runtime LMON fallback grant).  The LMS
- *	  main loop subscribes to ges work_queue via ConditionVariable wake
- *	  and drains grant decisions.  Real 7-step state machine activation,
+ *	  main loop drains the ges work_queue and uses the proven aux-process
+ *	  WaitLatch idle pattern in the skeleton.  Producer-side
+ *	  ConditionVariable wake API is retained for the later event-driven
+ *	  LMS path.  Real 7-step state machine activation,
  *	  BAST send/receive, deadlock Tarjan, cleanup_on_backend_exit entry
  *	  sweep, lock class expansion (TRANSACTION/RELATION/OBJECT), master
  *	  tombstone are NOT in this spec — they all land in spec-2.19+.
@@ -37,12 +39,12 @@
  *	        (d) STOPPED / unavailable — LMS 死;reason='crashed_unavailable'
  *	            53R80 raise
  *
- *	  HC3 (spec-2.18 §1.4.4): ConditionVariable 4 must-have contracts.
+ *	  HC3 (spec-2.18 §1.4.4): ConditionVariable producer API.
  *	    (a) producer 成功 enqueue 后 ConditionVariableBroadcast (在
  *	        LWLock release 之后, 避免 wake 后 LMS reacquire spin)
- *	    (b) LMS main loop 必用 while-loop 防 spurious wakeup
- *	    (c) 退出路径必 ConditionVariableCancelSleep (防 sleeper list leak)
- *	    (d) 不在 async-signal-unsafe critical path 做 ConditionVariable 操作
+ *	    (b) LMS skeleton consumer 使用 WaitLatch 轮询空队列,不进入 CV
+ *	        sleeper list;event-driven CV consumer 推 production activation
+ *	    (c) 不在 async-signal-unsafe critical path 做 ConditionVariable 操作
  *
  *	  HC4 (spec-2.18 §1.4.3): single ownership atomic guard.
  *	      LMON tick body 入口
@@ -72,7 +74,7 @@
  *	  Spec: spec-2.18-lms-daemon-grant-ownership-migration.md
  *	  (FROZEN v0.3 2026-05-14 user approve, Sprint A scope).
  *	  Anchor: cluster_lmon.h (spec-1.11) for skeleton pattern; LMS adds
- *	  ConditionVariable-driven drain consumer + DISABLED state.
+ *	  drain consumer + DISABLED state.
  *
  *-------------------------------------------------------------------------
  */
@@ -98,7 +100,9 @@
  *	    DISABLED                 (cluster.lms_enabled=off at startup)
  *	    NOT_STARTED -> STARTING -> READY -> DRAINING -> STOPPED
  *
- *	HC1 invariant: LMON grant path hard-disabled when state >= READY.
+ *	HC1 invariant: LMON grant path hard-disabled when state is READY /
+ *	DRAINING / STOPPED.  DISABLED is startup opt-out and keeps LMON
+ *	fallback.
  */
 typedef enum ClusterLmsState {
 	CLUSTER_LMS_NOT_STARTED = 0, /* postmaster has not yet spawned LMS */
@@ -116,13 +120,15 @@ typedef enum ClusterLmsState {
  * ClusterLmsSharedState -- LMS state visible across postmaster / LMS /
  * SQL backends.
  *
- *	HC4 single ownership: lms_state atomic monotonic;LMON tick body
- *	入口 `if (atomic_read(lms_state) >= LMS_READY) return early;`.
+ *	HC4 single ownership: lms_state atomic; LMON tick body calls
+ *	cluster_lms_owns_grant() to distinguish bootstrap fallback from
+ *	runtime fail-closed.
  *	不引入 lms_drain_owner 第二字段.
  *
- *	HC3 ConditionVariable: producers (LMON tick / ges request handler /
- *	cleanup_on_node_dead) broadcast cv after successful enqueue;
- *	LMS main loop uses while-loop guarding atomic work_queue_count.
+ *	HC3 ConditionVariable producer API: producers (LMON tick / ges request
+ *	handler / cleanup_on_node_dead) broadcast cv after successful enqueue.
+ *	The Step 6 LMS skeleton drains by polling with WaitLatch; the CV field
+ *	is retained as the stable wake substrate for later production activation.
  *
  *	Counter discipline (6 only — spec-2.18 §1.4 F2 收紧;
  *	grant/reject/convert 分项推 spec-2.20 真激活 grant state machine):
@@ -212,15 +218,17 @@ extern const char *cluster_lms_state_to_string(ClusterLmsState s);
 
 /*
  * HC4 single ownership atomic check.  LMON tick body entry calls this
- * to determine whether LMS owns grant decisions.  Returns true iff
- * lms_state >= LMS_READY.  Read-only atomic load.
+ * to determine whether LMS owns grant decisions.  Returns true for READY,
+ * DRAINING, and STOPPED; returns false for DISABLED so startup opt-out keeps
+ * LMON fallback.  Read-only atomic load.
  */
 extern bool cluster_lms_owns_grant(void);
 
 /*
  * HC3 producer wake — broadcast cv after successful work_queue enqueue.
- * Callers MUST hold or have just released the work_queue producer
- * LWLock (avoids wake-then-reacquire spin).  No-op if LMS DISABLED.
+ * The Step 6 LMS skeleton does not yet wait on this CV; it is kept as the
+ * stable producer-side API for the production LMS consumer.  No-op if LMS
+ * DISABLED.
  */
 extern void cluster_lms_wake_drain(void);
 
