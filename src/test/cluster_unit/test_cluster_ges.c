@@ -416,10 +416,25 @@ UT_TEST(test_ges_lmon_drain_work_queue_symbol_linkable)
 UT_DEFINE_GLOBALS();
 
 
+/* spec-2.17 Step 2 — NEW T-ges-3 opcode + payload size invariant. */
+static void
+test_ges_opcode_enum_spec_2_17_extension(void)
+{
+	/* spec-2.17 Q5 v0.6:  7 opcode 全集 — BAST=4 / BAST_ACK=5 /
+	 * DEADLOCK_PROBE=6 / CANCEL_PENDING=7. */
+	UT_ASSERT_EQ((int)GES_REQ_OPCODE_REQUEST, 1);
+	UT_ASSERT_EQ((int)GES_REQ_OPCODE_CONVERT, 2);
+	UT_ASSERT_EQ((int)GES_REQ_OPCODE_RELEASE, 3);
+	UT_ASSERT_EQ((int)GES_REQ_OPCODE_BAST, 4);
+	UT_ASSERT_EQ((int)GES_REQ_OPCODE_BAST_ACK, 5);
+	UT_ASSERT_EQ((int)GES_REQ_OPCODE_DEADLOCK_PROBE, 6);
+	UT_ASSERT_EQ((int)GES_REQ_OPCODE_CANCEL_PENDING, 7);
+}
+
 int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(9);
+	UT_PLAN(10);
 
 	UT_RUN(test_ges_request_handler_linkable);
 	UT_RUN(test_ges_reply_handler_linkable);
@@ -430,6 +445,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_ges_request_valid_payload_enqueues_work);
 	UT_RUN(test_ges_reply_valid_payload_echoes_local_holder);
 	UT_RUN(test_ges_lmon_drain_work_queue_symbol_linkable);
+	UT_RUN(test_ges_opcode_enum_spec_2_17_extension);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
