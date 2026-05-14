@@ -1001,6 +1001,18 @@ cluster_grd_ges_reply_dropped_count(void)
 {
 	return 0;
 }
+
+/* spec-2.17 D27 — 9 NEW counter stubs(BAST 6 + deadlock 3). */
+uint64 cluster_grd_bast_sent_count(void) { return 0; }
+uint64 cluster_grd_bast_received_count(void) { return 0; }
+uint64 cluster_grd_bast_ack_count(void) { return 0; }
+uint64 cluster_grd_bast_retry_count(void) { return 0; }
+uint64 cluster_grd_bast_reject_count(void) { return 0; }
+uint64 cluster_grd_bast_stale_drop_count(void) { return 0; }
+uint64 cluster_grd_deadlock_probe_drop_count(void) { return 0; }
+uint64 cluster_grd_deadlock_probe_collision_drop_count(void) { return 0; }
+uint64 cluster_grd_deadlock_chunk_oo_buffer_overflow_count(void) { return 0; }
+
 uint32
 cluster_grd_outbound_ring_depth(void)
 {

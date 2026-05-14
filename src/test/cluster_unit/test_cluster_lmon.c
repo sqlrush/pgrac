@@ -492,6 +492,13 @@ void
 cluster_grd_lmon_tick_dead_sweep(void)
 {}
 
+/* spec-2.17 Step 5 L104 stub:  cluster_grd_deadlock_lmon_tick wired
+ * into LMON tick body after dead sweep. */
+void cluster_grd_deadlock_lmon_tick(void);
+void
+cluster_grd_deadlock_lmon_tick(void)
+{}
+
 int
 cluster_ges_lmon_drain_work_queue(void)
 {

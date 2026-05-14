@@ -805,6 +805,7 @@ LmonMain(void)
 			 * reconfig epoch bump (S1 → S2 order writ).  bitmap diff
 			 * per v0.5 P1.2;  no-op when dead_generation unchanged. */
 			cluster_grd_lmon_tick_dead_sweep();
+			cluster_grd_deadlock_lmon_tick();	  /* spec-2.17 Step 5 */
 			cluster_ges_lmon_drain_work_queue();
 			cluster_grd_outbound_lmon_drain_send();
 

@@ -835,6 +835,26 @@ dump_grd(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "grd", "grd_work_queue_depth",
 			 fmt_int32((int32)cluster_grd_work_queue_depth()));
 	emit_row(rsinfo, "grd", "grd_pending_count", fmt_int64((int64)cluster_grd_pending_count()));
+
+	/* spec-2.17 D27 — BAST 6 counter + deadlock 3 counter(9 NEW row). */
+	emit_row(rsinfo, "grd", "grd_bast_sent_count",
+			 fmt_int64((int64)cluster_grd_bast_sent_count()));
+	emit_row(rsinfo, "grd", "grd_bast_received_count",
+			 fmt_int64((int64)cluster_grd_bast_received_count()));
+	emit_row(rsinfo, "grd", "grd_bast_ack_count",
+			 fmt_int64((int64)cluster_grd_bast_ack_count()));
+	emit_row(rsinfo, "grd", "grd_bast_retry_count",
+			 fmt_int64((int64)cluster_grd_bast_retry_count()));
+	emit_row(rsinfo, "grd", "grd_bast_reject_count",
+			 fmt_int64((int64)cluster_grd_bast_reject_count()));
+	emit_row(rsinfo, "grd", "grd_bast_stale_drop_count",
+			 fmt_int64((int64)cluster_grd_bast_stale_drop_count()));
+	emit_row(rsinfo, "grd", "grd_deadlock_probe_drop_count",
+			 fmt_int64((int64)cluster_grd_deadlock_probe_drop_count()));
+	emit_row(rsinfo, "grd", "grd_deadlock_probe_collision_drop_count",
+			 fmt_int64((int64)cluster_grd_deadlock_probe_collision_drop_count()));
+	emit_row(rsinfo, "grd", "grd_deadlock_chunk_oo_buffer_overflow_count",
+			 fmt_int64((int64)cluster_grd_deadlock_chunk_oo_buffer_overflow_count()));
 }
 
 

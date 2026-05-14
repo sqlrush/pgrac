@@ -236,6 +236,11 @@ cluster_grd_shmem_init(void)
 		pg_atomic_init_u64(&cluster_grd_state->ges_bast_retry_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->ges_bast_reject_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->ges_bast_stale_drop_count, 0);
+
+		/* spec-2.17 D26c — 3 deadlock chunked counter init 0. */
+		pg_atomic_init_u64(&cluster_grd_state->ges_deadlock_probe_drop_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->ges_deadlock_probe_collision_drop_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->ges_deadlock_chunk_oo_buffer_overflow_count, 0);
 	}
 
 	/* spec-2.15 v0.4 P1.1:  entry HTAB allocation gated on GUC.  GUC=0
@@ -1280,3 +1285,56 @@ DEFINE_BAST_COUNTER(bast_ack, bast_ack_count)
 DEFINE_BAST_COUNTER(bast_retry, bast_retry_count)
 DEFINE_BAST_COUNTER(bast_reject, bast_reject_count)
 DEFINE_BAST_COUNTER(bast_stale_drop, bast_stale_drop_count)
+
+
+/* ============================================================
+ * spec-2.17 Step 5/8:  deadlock detector skeleton.
+ *
+ *   Real activation:
+ *     - LMON tick body invokes cluster_grd_deadlock_lmon_tick() each
+ *       cluster.ges_deadlock_check_interval_ms(default 1000ms);
+ *     - Tick body builds wait-for graph via vertex dictionary + edge
+ *       chunk protocol(I82 collision-free);
+ *     - On cycle detected:  victim selection via deterministic age-based
+ *       4-tuple `(cluster_epoch, local_start_ts_ms DESC, node_id, xid)`
+ *       (I69 P2.2);
+ *     - Master enqueues GES_CANCEL_PENDING(opcode 7)or GES_RELEASE
+ *       (opcode 3)to victim's outbound(I73-I74).
+ *
+ *   Step 5/8 skeleton:  function symbol + 3 counter only.  Real Tarjan
+ *   SCC + vertex dict encode/decode + chunked reassembly buffer 推
+ *   Hardening round(本 skeleton 已建立完整调用面 + counter 接口供
+ *   Step 8 dump_grd + TAP test 钩入).
+ * ============================================================ */
+
+void
+cluster_grd_deadlock_lmon_tick(void)
+{
+	/* Skeleton — Hardening round real Tarjan + vertex dict. */
+}
+
+DEFINE_BAST_COUNTER(deadlock_probe_drop, deadlock_probe_drop_count)
+DEFINE_BAST_COUNTER(deadlock_probe_collision_drop, deadlock_probe_collision_drop_count)
+DEFINE_BAST_COUNTER(deadlock_chunk_oo_buffer_overflow, deadlock_chunk_oo_buffer_overflow_count)
+
+
+/* ============================================================
+ * spec-2.17 Step 6:  cleanup_on_backend_exit(D21 skeleton).
+ *
+ *   Real activation:  on_proc_exit hook + ResourceOwner callback wire
+ *   in Step 6;遍历 GRD entries 清单 backend procno 的 holders/waiters/
+ *   converts(类 cleanup_on_node_dead pattern;但 backend-level not
+ *   node-level)。
+ *
+ *   场景(I65 P1.1 — NOT BAST timeout):CANCEL / SIGTERM / on_proc_exit
+ *   / backend self-abort.
+ * ============================================================ */
+
+void
+cluster_grd_cleanup_on_backend_exit(int procno)
+{
+	/* Skeleton — Hardening round wire on_proc_exit hook + entry sweep. */
+	(void) procno;
+	if (MyProc != NULL)
+		MyProc->cluster_grd_bast_pending = false;
+}

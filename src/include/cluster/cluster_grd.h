@@ -177,6 +177,11 @@ typedef struct ClusterGrdShared {
 	pg_atomic_uint64 ges_bast_reject_count;
 	pg_atomic_uint64 ges_bast_stale_drop_count;
 
+	/* spec-2.17 Step 5/8 — deadlock chunked protocol 3 counter(D26c). */
+	pg_atomic_uint64 ges_deadlock_probe_drop_count;
+	pg_atomic_uint64 ges_deadlock_probe_collision_drop_count;
+	pg_atomic_uint64 ges_deadlock_chunk_oo_buffer_overflow_count;
+
 	/* spec-2.17 D28b — backend startup generation atomic counter.
 	 * InitProcess() atomic fetch_add 1 → MyProc->cluster_grd_generation.
 	 * init 从 1 开始(0 reserved sentinel = uninitialized). */
@@ -185,6 +190,20 @@ typedef struct ClusterGrdShared {
 
 /* spec-2.17 D28b — extern atomic generation alloc helper(InitProcess hook). */
 extern uint64 cluster_grd_alloc_generation(void);
+
+/* spec-2.17 D14-D18 — deadlock detector(skeleton phase;Step 5/8 真激活
+ * vertex dict + Tarjan + victim selection). */
+extern void cluster_grd_deadlock_lmon_tick(void); /* periodic 500ms */
+extern void cluster_grd_inc_deadlock_probe_drop(void);
+extern void cluster_grd_inc_deadlock_probe_collision_drop(void);
+extern void cluster_grd_inc_deadlock_chunk_oo_buffer_overflow(void);
+extern uint64 cluster_grd_deadlock_probe_drop_count(void);
+extern uint64 cluster_grd_deadlock_probe_collision_drop_count(void);
+extern uint64 cluster_grd_deadlock_chunk_oo_buffer_overflow_count(void);
+
+/* spec-2.17 D21 — cleanup_on_backend_exit(I65 — CANCEL/SIGTERM/
+ * on_proc_exit/self-abort;NOT BAST timeout). */
+extern void cluster_grd_cleanup_on_backend_exit(int procno);
 
 /* spec-2.17 D8 + D12 — BAST handler + 6 counter helpers(skeleton phase). */
 extern void cluster_grd_bast_handler(void);				/* ProcessInterrupts hook */
