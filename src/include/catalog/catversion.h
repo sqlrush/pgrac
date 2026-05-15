@@ -273,7 +273,7 @@
  * (mirror 53R81 LMD_UNAVAILABLE);LMD wait-for graph shmem region
  * "pgrac cluster lmd graph";WAIT_EVENT_CLUSTER_GES_S4_WAIT.  catversion
  * bump for catalog tooling. */
-#define CATALOG_VERSION_NO 202605320
+#define CATALOG_VERSION_NO 202605330
 
 /* spec-2.16 D19 (2026-05-29):  GesRequestPayload + GesReplyPayload wire
  * payload structs (48B each + StaticAssertDecl);  ClusterGrdHolderId

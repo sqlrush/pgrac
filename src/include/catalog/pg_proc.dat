@@ -12388,4 +12388,26 @@
   proargnames => '{pid,state,reason,started_at,ready_at,started_count,edge_submission_count,wake_count,idle_count,error_count}',
   prosrc => 'cluster_get_lmd_state' },
 
+# spec-2.22 D16 (2026-05-15) -- pg_cluster_lmd_inject_wait_edge (oid 8924).
+#
+# **TEST-ONLY** SRF.  Bypasses GES path entirely and writes synthetic
+# wait edges directly into the LMD graph (cluster_lmd_inject_wait_edge).
+# Intended for TAP 109 cycle construction:  production LMS handler in
+# spec-2.21 ship is a single-node立返-GRANT stub,so真 wait edges only
+# arise once spec-2.23 BAST 配套 wires LMS conflict matrix + waiter
+# queue.  Until then, TAP / cluster_unit harnesses use this SRF to
+# inject {waiter, blocker} pairs and observe Tarjan / victim cancel.
+#
+# Returns: boolean — true if edge added, false if HC12 cap rejected.
+# Defense:  superuser-only (volatile + parallel restricted; system_views
+# can wrap in REVOKE EXECUTE FROM PUBLIC).  Function name prefix
+# `pg_cluster_lmd_inject_*` signals test-only.
+{ oid => '8924', descr => 'TEST-ONLY: inject synthetic LMD wait edge (spec-2.22 D16)',
+  proname => 'pg_cluster_lmd_inject_wait_edge',
+  provolatile => 'v', proparallel => 'r',
+  prorettype => 'bool',
+  proargtypes => 'int4 int4 int8 int4 int4 int8',
+  proargnames => '{waiter_node,waiter_procno,waiter_request_id,blocker_node,blocker_procno,blocker_request_id}',
+  prosrc => 'pg_cluster_lmd_inject_wait_edge' },
+
 ]

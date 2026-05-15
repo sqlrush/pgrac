@@ -50,6 +50,7 @@
 
 #include "access/htup_details.h"
 #include "funcapi.h"
+#include "miscadmin.h"		   /* superuser() */
 #include "utils/builtins.h"
 #include "utils/timestamp.h"
 
@@ -144,6 +145,60 @@ cluster_get_lmd_state(PG_FUNCTION_ARGS)
 	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 
 	return (Datum)0;
+}
+
+
+/*
+ * pg_cluster_lmd_inject_wait_edge -- spec-2.22 D16 TEST-ONLY injector.
+ *
+ *	Bypasses GES path entirely and writes a synthetic (waiter, blocker)
+ *	wait edge into the LMD graph via cluster_lmd_inject_wait_edge().
+ *	Intended for TAP 109 cycle construction;production LMS handler is
+ *	a single-node-GRANT stub until spec-2.23 BAST 配套 wires real
+ *	conflict + waiter queue.
+ *
+ *	Returns boolean: true if edge added, false if cap rejected (HC12).
+ *	Superuser-only;LOG audit + inject_call_count bump on every call.
+ */
+PG_FUNCTION_INFO_V1(pg_cluster_lmd_inject_wait_edge);
+
+Datum
+pg_cluster_lmd_inject_wait_edge(PG_FUNCTION_ARGS)
+{
+	int32 w_node = PG_GETARG_INT32(0);
+	int32 w_procno = PG_GETARG_INT32(1);
+	int64 w_request_id = PG_GETARG_INT64(2);
+	int32 b_node = PG_GETARG_INT32(3);
+	int32 b_procno = PG_GETARG_INT32(4);
+	int64 b_request_id = PG_GETARG_INT64(5);
+	ClusterLmdVertex waiter, blocker;
+	bool ok;
+
+	if (!superuser())
+		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						errmsg("pg_cluster_lmd_inject_wait_edge is restricted to superusers"),
+						errhint("Test-only injector; production GES correctness is undefined "
+								"when used outside controlled test harnesses.")));
+
+	memset(&waiter, 0, sizeof(waiter));
+	waiter.node_id = w_node;
+	waiter.procno = (uint32) w_procno;
+	waiter.request_id = (uint64) w_request_id;
+	waiter.cluster_epoch = 1; /* spec-2.26 wires real epoch later */
+
+	memset(&blocker, 0, sizeof(blocker));
+	blocker.node_id = b_node;
+	blocker.procno = (uint32) b_procno;
+	blocker.request_id = (uint64) b_request_id;
+	blocker.cluster_epoch = 1;
+
+	ereport(LOG, (errmsg("pg_cluster_lmd_inject_wait_edge: TEST-ONLY injection "
+						 "waiter=(%d,%u," INT64_FORMAT ") blocker=(%d,%u," INT64_FORMAT ")",
+						 w_node, (uint32) w_procno, w_request_id,
+						 b_node, (uint32) b_procno, b_request_id)));
+
+	ok = cluster_lmd_inject_wait_edge(&waiter, &blocker);
+	PG_RETURN_BOOL(ok);
 }
 
 #endif /* USE_PGRAC_CLUSTER */
