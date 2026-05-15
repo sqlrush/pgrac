@@ -35,16 +35,18 @@
 
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_ges.h"
+#include "cluster/cluster_ges_reply_wait.h" /* spec-2.23 D1 5-tuple wait HTAB */
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_grd_work_queue.h"
-#include "cluster/cluster_guc.h" /* cluster_node_id */
+#include "cluster/cluster_guc.h" /* cluster_node_id + cluster_ges_request_timeout_ms */
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_qvotec.h" /* cluster_qvotec_in_quorum */
 #include "cluster/cluster_conf.h"	/* cluster_conf_lookup_node */
 #include "cluster/cluster_shmem.h"
+#include "storage/condition_variable.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "port/atomics.h"
@@ -349,13 +351,43 @@ cluster_ges_reply_handler(const ClusterICEnvelope *env, const void *payload)
 		return;
 	}
 
-	/* Step 4 D9 wires pending_signal (CAS state + SetLatch).  For Step 3,
-	 * the validation pass is recorded via reply_defer_count.  Real
-	 * signal lands when pending table HTAB is allocated in Step 4. */
-	ereport(DEBUG2, (errmsg_internal("cluster_ges_reply: validated reply opcode=%u "
-									 "reject_reason=%u from peer %u (Step 3 — pending signal "
-									 "wires Step 4)",
-									 rep->opcode, rep->reject_reason, env->source_node_id)));
+	/*
+	 * PGRAC: spec-2.23 D2 / HC17 — 5-tuple reply correlation.
+	 *
+	 *	The reply identifies the original caller via the holder tuple
+	 *	(holder_node_id == this node post-validation) plus the echoed
+	 *	request_id and reply_for_opcode.  Build the same 5-tuple key
+	 *	the caller used when inserting its wait entry, then look up.
+	 *
+	 *	Lookup miss → late reply (caller already timed out / canceled).
+	 *	Drop silently (handler context cannot ereport) and bump the
+	 *	late-drop counter so dump_ges surfaces it.
+	 */
+	{
+		GesReplyWaitKey key;
+		GesReplyWaitEntry *entry;
+
+		memset(&key, 0, sizeof(key));
+		key.request_id = ((uint64) rep->holder_request_id_lo)
+						 | (((uint64) rep->holder_request_id_hi) << 32);
+		key.source_node_id = cluster_node_id;	   /* this node was the sender */
+		key.dest_node_id = (int32) env->source_node_id; /* replying master */
+		key.request_opcode = rep->reply_for_opcode;
+		key.cluster_epoch = holder_epoch;
+
+		entry = cluster_ges_reply_wait_lookup(&key);
+		if (entry == NULL) {
+			cluster_ges_inc_reply_late_drop();
+			ereport(DEBUG2, (errmsg_internal("cluster_ges_reply: late reply (no waiter) "
+											 "request_id=" UINT64_FORMAT
+											 " opcode=%u from peer %u",
+											 key.request_id, rep->reply_for_opcode,
+											 env->source_node_id)));
+			return;
+		}
+
+		cluster_ges_reply_wait_wake(entry, rep->opcode, rep->reject_reason);
+	}
 }
 
 int
@@ -447,28 +479,108 @@ cluster_ges_reply_defer_count(void)
  * ============================================================ */
 
 uint32
-cluster_ges_send_request_and_wait(const struct ClusterResId *resid pg_attribute_unused(),
-								  uint32 lockmode pg_attribute_unused(),
-								  const struct ClusterGrdHolderId *holder pg_attribute_unused(),
-								  uint64 request_id pg_attribute_unused(),
-								  int timeout_ms pg_attribute_unused())
+cluster_ges_send_request_and_wait(const struct ClusterResId *resid, uint32 lockmode,
+								  const struct ClusterGrdHolderId *holder, uint64 request_id,
+								  int timeout_ms)
 {
 	int32 master;
+	GesReplyWaitKey key;
+	GesReplyWaitEntry *entry;
+	GesRequestPayload req;
+	TimestampTz deadline;
+	uint64 epoch;
+	int effective_timeout_ms;
+	uint32 reject_reason;
+
+	if (resid == NULL || holder == NULL)
+		return GES_REJECT_REASON_TIMEOUT;
+
+	master = cluster_grd_lookup_master(resid);
 
 	/*
-	 * MVP: local-master only.  A remote master would require a real
-	 * GES_REQUEST wire round-trip; returning success here would create a
-	 * false grant, so fail closed with TIMEOUT until that path is active.
+	 * Local-master fast path:  no cross-node IPC needed.  The LMS local
+	 * handle path runs entirely in-process (Step 4 D6 真激活 conflict
+	 * matrix + waiter queue).  Skeleton phase returns immediate grant so
+	 * the spec-2.21 caller can continue into the PG-native lock path.
 	 */
-	if (resid != NULL) {
-		master = cluster_grd_lookup_master(resid);
-		if (master >= 0 && master != cluster_node_id)
-			return GES_REJECT_REASON_TIMEOUT;
+	if (master < 0 || master == cluster_node_id) {
+		if (cluster_ges_state != NULL)
+			pg_atomic_fetch_add_u64(&cluster_ges_state->request_defer_count, 1);
+		return 0; /* GES_REJECT_NONE = grant OK (local-master MVP) */
+	}
+
+	/*
+	 * Remote-master path:  build reply wait entry (HC17 5-tuple) BEFORE
+	 * sending the request so the reply handler cannot race past the
+	 * waiter.  Then send via outbound queue; sleep on CV up to the
+	 * effective timeout; delete entry on wake or timeout (HC17:
+	 * unconditional delete prevents late reply matching a recycled slot).
+	 */
+	epoch = cluster_epoch_get_current();
+	effective_timeout_ms = timeout_ms > 0 ? timeout_ms : cluster_ges_request_timeout_ms;
+	deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), effective_timeout_ms);
+
+	memset(&key, 0, sizeof(key));
+	key.request_id = request_id;
+	key.source_node_id = cluster_node_id;
+	key.dest_node_id = master;
+	key.request_opcode = GES_REQ_OPCODE_REQUEST;
+	key.cluster_epoch = epoch;
+
+	entry = cluster_ges_reply_wait_insert(&key, deadline);
+	if (entry == NULL) {
+		/* 53R71 fail-closed at caller (spec-2.16 errcode ship). */
+		ereport(WARNING,
+				(errmsg_internal("cluster_ges_send_request_and_wait: reply wait table full "
+								 "(request_id=" UINT64_FORMAT " dest=%d) — fail closed",
+								 request_id, master)));
+		return GES_REJECT_REASON_TIMEOUT;
+	}
+
+	/* Build wire payload. */
+	memset(&req, 0, sizeof(req));
+	req.opcode = GES_REQ_OPCODE_REQUEST;
+	req.lockmode = lockmode;
+	req.holder_node_id = (uint32) holder->node_id;
+	req.holder_procno = (uint32) holder->procno;
+	req.holder_cluster_epoch_lo = (uint32) (holder->cluster_epoch & 0xffffffffu);
+	req.holder_cluster_epoch_hi = (uint32) (holder->cluster_epoch >> 32);
+	req.holder_request_id_lo = (uint32) (request_id & 0xffffffffu);
+	req.holder_request_id_hi = (uint32) (request_id >> 32);
+	memcpy(req.resid, resid, sizeof(req.resid));
+
+	if (!cluster_grd_outbound_enqueue_backend_request((uint32) master, &req, sizeof(req))) {
+		/* Outbound ring full — fail closed.  Caller may retry. */
+		cluster_ges_reply_wait_delete(&key);
+		return GES_REJECT_REASON_WORK_QUEUE_FULL;
 	}
 
 	if (cluster_ges_state != NULL)
 		pg_atomic_fetch_add_u64(&cluster_ges_state->request_defer_count, 1);
-	return 0; /* GES_REJECT_NONE = grant OK */
+
+	/*
+	 * Wait for reply via CV.  Reuse WAIT_EVENT_CLUSTER_GES_S4_WAIT
+	 * (spec-2.20 ship);  spec-2.23 D12 (Step 9) introduces a dedicated
+	 * WAIT_EVENT_CLUSTER_GES_REPLY_WAIT and the wait-event name swap is
+	 * a 1-line edit at that step.
+	 */
+	ConditionVariablePrepareToSleep(&entry->cv);
+	while (!entry->ready) {
+		if (!ConditionVariableTimedSleep(&entry->cv, effective_timeout_ms,
+										 WAIT_EVENT_CLUSTER_GES_S4_WAIT)) {
+			/* HC17:  timeout MUST unconditionally delete entry. */
+			cluster_ges_reply_wait_delete(&key);
+			ConditionVariableCancelSleep();
+			return GES_REJECT_REASON_TIMEOUT;
+		}
+	}
+	ConditionVariableCancelSleep();
+
+	/* Capture verdict, then delete entry (HC17 pairing invariant). */
+	reject_reason = entry->reject_reason;
+	cluster_ges_reply_wait_delete(&key);
+
+	return reject_reason;
 }
 
 uint32
