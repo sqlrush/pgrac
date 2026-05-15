@@ -831,10 +831,19 @@ LockAcquireExtended(const LOCKTAG *locktag,
 	 * cluster gate returned NEED_PG_NATIVE_LOCK; consumed at LOCKACQUIRE_OK
 	 * exit paths.  Spec-2.21 D2 / D4 P2.3.
 	 */
-	bool		cluster_need_s5 = false;
+	volatile bool cluster_need_s5 = false;
 	ClusterLockAcquireRequest cluster_req;
 
 	memset(&cluster_req, 0, sizeof(cluster_req));
+
+#define PGRAC_CLUSTER_CLEANUP_PENDING_ACQUIRE() \
+	do { \
+		if (cluster_need_s5) \
+		{ \
+			(void) cluster_lock_acquire_s7_cleanup(&cluster_req); \
+			cluster_need_s5 = false; \
+		} \
+	} while (0)
 #endif
 
 	if (lockmethodid <= 0 || lockmethodid >= lengthof(LockMethods))
@@ -951,6 +960,7 @@ LockAcquireExtended(const LOCKTAG *locktag,
 #ifdef USE_PGRAC_CLUSTER
 	if (cluster_enabled &&
 		cluster_lock_acquire_cluster_path &&
+		cluster_grd_max_entries > 0 &&
 		cluster_lock_should_globalize(locktag, lockmode, sessionLock))
 	{
 		ClusterLockAcquireResult cluster_r;
@@ -1084,6 +1094,8 @@ LockAcquireExtended(const LOCKTAG *locktag,
 				if (sr != CLUSTER_LOCK_ACQUIRE_OK_GRANTED &&
 					sr != CLUSTER_LOCK_ACQUIRE_OK_CONVERTED)
 				{
+					PGRAC_CLUSTER_CLEANUP_PENDING_ACQUIRE();
+					(void) LockRelease(locktag, lockmode, sessionLock);
 					ereport(ERROR,
 							(errcode(ERRCODE_INTERNAL_ERROR),
 							 errmsg("cluster S5 promote failed (result=%d)", (int) sr)));
@@ -1118,12 +1130,18 @@ LockAcquireExtended(const LOCKTAG *locktag,
 			if (locallockp)
 				*locallockp = NULL;
 			if (reportMemoryError)
+			{
+				PGRAC_CLUSTER_CLEANUP_PENDING_ACQUIRE();
 				ereport(ERROR,
 						(errcode(ERRCODE_OUT_OF_MEMORY),
 						 errmsg("out of shared memory"),
 						 errhint("You might need to increase %s.", "max_locks_per_transaction")));
+			}
 			else
+			{
+				PGRAC_CLUSTER_CLEANUP_PENDING_ACQUIRE();
 				return LOCKACQUIRE_NOT_AVAIL;
+			}
 		}
 	}
 
@@ -1156,12 +1174,18 @@ LockAcquireExtended(const LOCKTAG *locktag,
 		if (locallockp)
 			*locallockp = NULL;
 		if (reportMemoryError)
+		{
+			PGRAC_CLUSTER_CLEANUP_PENDING_ACQUIRE();
 			ereport(ERROR,
 					(errcode(ERRCODE_OUT_OF_MEMORY),
 					 errmsg("out of shared memory"),
 					 errhint("You might need to increase %s.", "max_locks_per_transaction")));
+		}
 		else
+		{
+			PGRAC_CLUSTER_CLEANUP_PENDING_ACQUIRE();
 			return LOCKACQUIRE_NOT_AVAIL;
+		}
 	}
 	locallock->proclock = proclock;
 	lock = proclock->tag.myLock;
@@ -1220,6 +1244,7 @@ LockAcquireExtended(const LOCKTAG *locktag,
 				RemoveLocalLock(locallock);
 			if (locallockp)
 				*locallockp = NULL;
+			PGRAC_CLUSTER_CLEANUP_PENDING_ACQUIRE();
 			return LOCKACQUIRE_NOT_AVAIL;
 		}
 
@@ -1239,7 +1264,16 @@ LockAcquireExtended(const LOCKTAG *locktag,
 										 locktag->locktag_type,
 										 lockmode);
 
-		WaitOnLock(locallock, owner);
+		PG_TRY();
+		{
+			WaitOnLock(locallock, owner);
+		}
+		PG_CATCH();
+		{
+			PGRAC_CLUSTER_CLEANUP_PENDING_ACQUIRE();
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
 
 		TRACE_POSTGRESQL_LOCK_WAIT_DONE(locktag->locktag_field1,
 										locktag->locktag_field2,
@@ -1265,6 +1299,7 @@ LockAcquireExtended(const LOCKTAG *locktag,
 			LOCK_PRINT("LockAcquire: INCONSISTENT", lock, lockmode);
 			/* Should we retry ? */
 			LWLockRelease(partitionLock);
+			PGRAC_CLUSTER_CLEANUP_PENDING_ACQUIRE();
 			elog(ERROR, "LockAcquire failed");
 		}
 		PROCLOCK_PRINT("LockAcquire: granted", proclock);
@@ -1302,6 +1337,8 @@ LockAcquireExtended(const LOCKTAG *locktag,
 		if (sr != CLUSTER_LOCK_ACQUIRE_OK_GRANTED &&
 			sr != CLUSTER_LOCK_ACQUIRE_OK_CONVERTED)
 		{
+			PGRAC_CLUSTER_CLEANUP_PENDING_ACQUIRE();
+			(void) LockRelease(locktag, lockmode, sessionLock);
 			ereport(ERROR,
 					(errcode(ERRCODE_INTERNAL_ERROR),
 					 errmsg("cluster S5 promote failed (result=%d)", (int) sr)));
@@ -1313,6 +1350,9 @@ LockAcquireExtended(const LOCKTAG *locktag,
 	}
 #endif
 	return LOCKACQUIRE_OK;
+#ifdef USE_PGRAC_CLUSTER
+#undef PGRAC_CLUSTER_CLEANUP_PENDING_ACQUIRE
+#endif
 }
 
 /*

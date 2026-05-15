@@ -205,6 +205,12 @@ cluster_conf_lookup_node(int32 node_id pg_attribute_unused())
 	return (const void *)&dummy;
 }
 
+int32
+cluster_grd_lookup_master(const struct ClusterResId *resid pg_attribute_unused())
+{
+	return cluster_node_id;
+}
+
 /* GRD inc helpers — stub bump local counters (test verifies via accessor) */
 static uint64 stub_work_queue_full = 0;
 static uint64 stub_inbound_validation_fail = 0;

@@ -125,12 +125,19 @@ struct PGPROC {
 };
 struct PGPROC *MyProc = NULL;
 
+int cluster_node_id = 0;
 bool cluster_local_fast_path_enabled = true;
 
 int64
 GetCurrentTimestamp(void)
 {
 	return 0;
+}
+
+uint64
+cluster_epoch_get_current(void)
+{
+	return 1;
 }
 
 void

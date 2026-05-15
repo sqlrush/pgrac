@@ -49,7 +49,7 @@ $node->start;
 # converts — gate predicate sends us through fast path.
 my $s3 = $node->safe_psql('postgres', q{
 	BEGIN;
-	SELECT pg_advisory_xact_lock(108001);
+	DO $$ BEGIN PERFORM pg_advisory_xact_lock(108001); END $$;
 	COMMIT;
 	SELECT 'S3_ok';
 });
@@ -59,8 +59,10 @@ is($s3, 'S3_ok', 'S3 local-master fast-path acquire+release');
 # S4 OK_CONVERTED upgrade smoke — same backend acquires shared then exclusive.
 my $s4 = $node->safe_psql('postgres', q{
 	BEGIN;
-	SELECT pg_advisory_xact_lock_shared(108002);
-	SELECT pg_advisory_xact_lock(108002);
+	DO $$ BEGIN
+		PERFORM pg_advisory_xact_lock_shared(108002);
+		PERFORM pg_advisory_xact_lock(108002);
+	END $$;
 	COMMIT;
 	SELECT 'S4_ok';
 });
@@ -71,7 +73,7 @@ is($s4, 'S4_ok', 'S4 shared→exclusive upgrade single-node smoke');
 # verify no panic on a clean acquire path that exercises the same code path.
 my $s6 = $node->safe_psql('postgres', q{
 	BEGIN;
-	SELECT pg_advisory_xact_lock(108006);
+	DO $$ BEGIN PERFORM pg_advisory_xact_lock(108006); END $$;
 	COMMIT;
 	SELECT 'S6_ok';
 });
@@ -82,7 +84,7 @@ is($s6, 'S6_ok', 'S6 FAIL_DEADLOCK_PEND error code path (stub — real Tarjan sp
 # immediately even if conflict — single-node MVP grants immediately.
 my $s7 = $node->safe_psql('postgres', q{
 	BEGIN;
-	SELECT pg_try_advisory_xact_lock(108007);
+	DO $$ BEGIN PERFORM pg_try_advisory_xact_lock(108007); END $$;
 	COMMIT;
 	SELECT 'S7_ok';
 });
@@ -93,9 +95,11 @@ is($s7, 'S7_ok', 'S7 dontwait pg_try_advisory_xact_lock — ConditionalLock sema
 # all reentrant via LOCALLOCK nLocks++ (HC10).
 my $s9 = $node->safe_psql('postgres', q{
 	BEGIN;
-	SELECT pg_advisory_xact_lock(108009);
-	SELECT pg_advisory_xact_lock(108009);
-	SELECT pg_advisory_xact_lock(108009);
+	DO $$ BEGIN
+		PERFORM pg_advisory_xact_lock(108009);
+		PERFORM pg_advisory_xact_lock(108009);
+		PERFORM pg_advisory_xact_lock(108009);
+	END $$;
 	COMMIT;
 	SELECT 'S9_ok';
 });
@@ -106,9 +110,11 @@ is($s9, 'S9_ok', 'S9 reservation idempotency — LOCALLOCK reentrant (HC10)');
 # without revisiting earlier steps;  smoke that no assertion fires.
 my $s10 = $node->safe_psql('postgres', q{
 	BEGIN;
-	SELECT pg_advisory_xact_lock(108100);
-	SELECT pg_advisory_xact_lock(108101);
-	SELECT pg_advisory_xact_lock(108102);
+	DO $$ BEGIN
+		PERFORM pg_advisory_xact_lock(108100);
+		PERFORM pg_advisory_xact_lock(108101);
+		PERFORM pg_advisory_xact_lock(108102);
+	END $$;
 	COMMIT;
 	SELECT 'S10_ok';
 });
@@ -119,10 +125,10 @@ is($s10, 'S10_ok', 'S10 I1 monotonic forward — multi-key acquire smoke');
 # immediately).  Verify acquire-release cycle never deadlocks on PENDING.
 my $s11 = $node->safe_psql('postgres', q{
 	BEGIN;
-	SELECT pg_advisory_xact_lock(108110);
+	DO $$ BEGIN PERFORM pg_advisory_xact_lock(108110); END $$;
 	COMMIT;
 	BEGIN;
-	SELECT pg_advisory_xact_lock(108110);
+	DO $$ BEGIN PERFORM pg_advisory_xact_lock(108110); END $$;
 	COMMIT;
 	SELECT 'S11_ok';
 });
@@ -133,10 +139,10 @@ is($s11, 'S11_ok', 'S11 I2 PENDING transition smoke — single-node bypass');
 # triggers S7 cleanup;  next acquire of same key must succeed cleanly.
 my $s12 = $node->safe_psql('postgres', q{
 	BEGIN;
-	SELECT pg_advisory_xact_lock(108120);
+	DO $$ BEGIN PERFORM pg_advisory_xact_lock(108120); END $$;
 	ROLLBACK;
 	BEGIN;
-	SELECT pg_advisory_xact_lock(108120);
+	DO $$ BEGIN PERFORM pg_advisory_xact_lock(108120); END $$;
 	COMMIT;
 	SELECT 'S12_ok';
 });

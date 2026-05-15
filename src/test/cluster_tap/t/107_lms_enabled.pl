@@ -78,7 +78,7 @@ $node_gate->start;
 #     (single-node MVP path: LMS handler grants immediately).
 my $xact_advisory = $node_gate->safe_psql('postgres', q{
 	BEGIN;
-	SELECT pg_advisory_xact_lock(42);
+	DO $$ BEGIN PERFORM pg_advisory_xact_lock(42); END $$;
 	COMMIT;
 	SELECT 'L4_ok';
 });
@@ -89,9 +89,11 @@ is($xact_advisory, 'L4_ok',
 #     LOCALLOCK reentrant path (HC10), does NOT re-enter 7-step.
 my $reentrant = $node_gate->safe_psql('postgres', q{
 	BEGIN;
-	SELECT pg_advisory_xact_lock(43);
-	SELECT pg_advisory_xact_lock(43);
-	SELECT pg_advisory_xact_lock(43);
+	DO $$ BEGIN
+		PERFORM pg_advisory_xact_lock(43);
+		PERFORM pg_advisory_xact_lock(43);
+		PERFORM pg_advisory_xact_lock(43);
+	END $$;
 	COMMIT;
 	SELECT 'L5_ok';
 });
@@ -100,8 +102,10 @@ is($reentrant, 'L5_ok',
 
 # L6: pg_advisory_lock — session-level stays native (HC11).
 my $session_advisory = $node_gate->safe_psql('postgres', q{
-	SELECT pg_advisory_lock(44);
-	SELECT pg_advisory_unlock(44);
+	DO $$ BEGIN
+		PERFORM pg_advisory_lock(44);
+		PERFORM pg_advisory_unlock(44);
+	END $$;
 	SELECT 'L6_ok';
 });
 is($session_advisory, 'L6_ok',
@@ -113,7 +117,9 @@ $node_gate->safe_psql('postgres',
 	q{CREATE TABLE l7_test(id int PRIMARY KEY, v int); INSERT INTO l7_test VALUES(1, 10);});
 my $non_advisory = $node_gate->safe_psql('postgres', q{
 	BEGIN;
-	SELECT * FROM l7_test WHERE id = 1 FOR UPDATE;
+	DO $$ DECLARE v_l7 int; BEGIN
+		SELECT v INTO v_l7 FROM l7_test WHERE id = 1 FOR UPDATE;
+	END $$;
 	COMMIT;
 	SELECT 'L7_ok';
 });
@@ -129,7 +135,7 @@ $node_gate->start;
 
 my $bypass = $node_gate->safe_psql('postgres', q{
 	BEGIN;
-	SELECT pg_advisory_xact_lock(45);
+	DO $$ BEGIN PERFORM pg_advisory_xact_lock(45); END $$;
 	COMMIT;
 	SELECT 'L8_ok';
 });

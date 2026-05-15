@@ -47,6 +47,7 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_guc.h"
@@ -74,6 +75,7 @@ static pg_atomic_uint64 stub_s5_promote_count;
 static pg_atomic_uint64 stub_s6_release_count;
 static pg_atomic_uint64 stub_s7_cleanup_count;
 static pg_atomic_uint64 stub_local_fast_path_count;
+static pg_atomic_uint64 request_id_counter;
 static bool stub_counter_initialized = false;
 
 static inline void
@@ -87,6 +89,7 @@ ensure_counter_initialized(void)
 		pg_atomic_init_u64(&stub_s6_release_count, 0);
 		pg_atomic_init_u64(&stub_s7_cleanup_count, 0);
 		pg_atomic_init_u64(&stub_local_fast_path_count, 0);
+		pg_atomic_init_u64(&request_id_counter, 0);
 		stub_counter_initialized = true;
 	}
 }
@@ -98,10 +101,17 @@ ensure_counter_initialized(void)
 static inline void
 fill_request_holder(ClusterLockAcquireRequest *req)
 {
-	req->holder.node_id = (uint32)(MyProc ? MyProc->pgprocno : 0);
+	uint64 request_id;
+
+	request_id = req->request_id;
+	if (request_id == 0)
+		request_id = pg_atomic_fetch_add_u64(&request_id_counter, 1) + 1;
+
+	req->request_id = request_id;
+	req->holder.node_id = (uint32)(cluster_node_id >= 0 ? cluster_node_id : 0);
 	req->holder.procno = (uint32)(MyProc ? MyProc->pgprocno : 0);
-	req->holder.cluster_epoch = 0; /* spec-2.26 wires real epoch */
-	req->holder.request_id = req->request_id ? req->request_id : (uint64)GetCurrentTimestamp();
+	req->holder.cluster_epoch = cluster_epoch_get_current();
+	req->holder.request_id = request_id;
 }
 
 
@@ -194,7 +204,7 @@ cluster_lock_acquire_s3_partition_reservation(const ClusterLockAcquireRequest *r
 	ClusterGrdEntryResult er;
 	bool fast_path = false;
 	uint64 gen_snapshot = 0;
-	int32 self_node = (int32)(MyProc ? MyProc->pgprocno : 0);
+	int32 self_node = cluster_node_id;
 
 	ensure_counter_initialized();
 
@@ -291,7 +301,7 @@ ClusterLockAcquireResult
 cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *req)
 {
 	ClusterGrdEntryResult er;
-	int32 self_node = (int32)(MyProc ? MyProc->pgprocno : 0);
+	int32 self_node = cluster_node_id;
 
 	ensure_counter_initialized();
 
@@ -323,7 +333,7 @@ cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *req)
 
 	(void)cluster_grd_release_holder_by_id(&req->resid, &req->holder);
 
-	if (cluster_grd_lookup_master(&req->resid) != (int32)(MyProc ? MyProc->pgprocno : 0)) {
+	if (cluster_grd_lookup_master(&req->resid) != cluster_node_id) {
 		/* Remote master: send GES_RELEASE (bounded ACK wait). */
 		(void)cluster_ges_send_release_and_wait(&req->resid, &req->holder, req->request_id);
 	}

@@ -93,8 +93,10 @@ static Size cluster_grd_entries_alloc_bytes = 0;
 
 typedef struct ClusterGrdHolder {
 	int32 node_id;
+	uint32 procno;
+	uint64 cluster_epoch;
+	uint64 request_id;
 	LOCKMODE mode;
-	TransactionId xid;
 } ClusterGrdHolder;
 
 typedef struct ClusterGrdWaiter {
@@ -1040,8 +1042,10 @@ cluster_grd_entry_grant_holder(ClusterGrdEntry *entry, const ClusterGrdHolderId 
 	}
 	slot = entry->ngranted++;
 	entry->holders[slot].node_id = (int32)holder->node_id;
+	entry->holders[slot].procno = holder->procno;
+	entry->holders[slot].cluster_epoch = holder->cluster_epoch;
+	entry->holders[slot].request_id = holder->request_id;
 	entry->holders[slot].mode = (LOCKMODE)mode;
-	entry->holders[slot].xid = (TransactionId)holder->request_id;
 	entry->generation++;
 	return CLUSTER_GRD_ENTRY_OK;
 }
@@ -1055,7 +1059,9 @@ cluster_grd_entry_release_holder(ClusterGrdEntry *entry, const ClusterGrdHolderI
 
 	for (i = 0; i < entry->ngranted; i++) {
 		if ((uint32)entry->holders[i].node_id == holder->node_id
-			&& (uint64)entry->holders[i].xid == holder->request_id) {
+			&& entry->holders[i].procno == holder->procno
+			&& entry->holders[i].cluster_epoch == holder->cluster_epoch
+			&& entry->holders[i].request_id == holder->request_id) {
 			/* compact down */
 			if (i < entry->ngranted - 1)
 				entry->holders[i] = entry->holders[entry->ngranted - 1];
@@ -1254,29 +1260,38 @@ cluster_grd_cleanup_on_node_dead(int32 dead_node_id)
 	while ((entry = (ClusterGrdEntry *)hash_seq_search(&status)) != NULL) {
 		int i;
 		SpinLockAcquire(&entry->lock);
-		for (i = 0; i < PGRAC_GRD_MAX_HOLDERS; i++) {
+		for (i = 0; i < entry->ngranted;) {
 			if (entry->holders[i].node_id == dead_node_id) {
-				memset(&entry->holders[i], 0, sizeof(entry->holders[i]));
-				if (entry->ngranted > 0)
-					entry->ngranted--;
+				if (i < entry->ngranted - 1)
+					entry->holders[i] = entry->holders[entry->ngranted - 1];
+				memset(&entry->holders[entry->ngranted - 1], 0, sizeof(entry->holders[0]));
+				entry->ngranted--;
 				swept++;
+				continue;
 			}
+			i++;
 		}
-		for (i = 0; i < PGRAC_GRD_MAX_WAITERS; i++) {
+		for (i = 0; i < entry->nwaiters;) {
 			if (entry->waiters[i].node_id == dead_node_id) {
-				memset(&entry->waiters[i], 0, sizeof(entry->waiters[i]));
-				if (entry->nwaiters > 0)
-					entry->nwaiters--;
+				if (i < entry->nwaiters - 1)
+					entry->waiters[i] = entry->waiters[entry->nwaiters - 1];
+				memset(&entry->waiters[entry->nwaiters - 1], 0, sizeof(entry->waiters[0]));
+				entry->nwaiters--;
 				swept++;
+				continue;
 			}
+			i++;
 		}
-		for (i = 0; i < PGRAC_GRD_MAX_CONVERTS; i++) {
+		for (i = 0; i < entry->nconverts;) {
 			if (entry->converts[i].node_id == dead_node_id) {
-				memset(&entry->converts[i], 0, sizeof(entry->converts[i]));
-				if (entry->nconverts > 0)
-					entry->nconverts--;
+				if (i < entry->nconverts - 1)
+					entry->converts[i] = entry->converts[entry->nconverts - 1];
+				memset(&entry->converts[entry->nconverts - 1], 0, sizeof(entry->converts[0]));
+				entry->nconverts--;
 				swept++;
+				continue;
 			}
+			i++;
 		}
 		SpinLockRelease(&entry->lock);
 	}
@@ -1292,16 +1307,17 @@ cluster_grd_cleanup_on_node_dead(int32 dead_node_id)
  *   Filters by holder.cluster_epoch < current_epoch.  Triggered post-
  *   reconfig epoch bump (LMON tick S2;  I47).
  *
- *   spec-2.15 entry holder struct (ClusterGrdHolder file-static) carries
- *   only {node_id, mode, xid} — no cluster_epoch field.  spec-2.16
- *   forward-link:  Step 4 D9 caller-side hook will populate holder with
- *   the requesting backend's epoch (struct extended via spec-2.17 BAST
- *   stack).  本 spec the field is absent → sweep is a no-op (matches
- *   the "0 mutator caller" reality of Step 4 MVP).
+ *   Filters real holders by cluster_epoch.  Reservation cleanup is owned
+ *   by caller-side S7 because reservations are local in-flight state, not
+ *   a cluster-visible grant.
  */
 void
 cluster_grd_cleanup_stale_epoch(uint64 current_epoch)
 {
+	HASH_SEQ_STATUS status;
+	ClusterGrdEntry *entry;
+	int swept = 0;
+
 	if (cluster_grd_entry_htab == NULL) {
 		ereport(DEBUG2, (errmsg_internal("cluster_grd_cleanup_stale_epoch(%lu): "
 										 "entry HTAB not allocated;  no-op",
@@ -1309,11 +1325,29 @@ cluster_grd_cleanup_stale_epoch(uint64 current_epoch)
 		return;
 	}
 
-	/* No-op until spec-2.17 extends ClusterGrdHolder with cluster_epoch
-	 * field.  Documented forward-link;  not a TODO that breaks contract. */
-	ereport(DEBUG2, (errmsg_internal("cluster_grd_cleanup_stale_epoch(%lu): holder "
-									 "struct lacks epoch field until spec-2.17;  no-op",
-									 (unsigned long)current_epoch)));
+	hash_seq_init(&status, cluster_grd_entry_htab);
+	while ((entry = (ClusterGrdEntry *)hash_seq_search(&status)) != NULL) {
+		int i;
+
+		SpinLockAcquire(&entry->lock);
+		for (i = 0; i < entry->ngranted;) {
+			if (entry->holders[i].cluster_epoch < current_epoch) {
+				if (i < entry->ngranted - 1)
+					entry->holders[i] = entry->holders[entry->ngranted - 1];
+				memset(&entry->holders[entry->ngranted - 1], 0, sizeof(entry->holders[0]));
+				entry->ngranted--;
+				swept++;
+				continue;
+			}
+			i++;
+		}
+		SpinLockRelease(&entry->lock);
+	}
+
+	if (swept > 0)
+		ereport(DEBUG1, (errmsg_internal("cluster_grd_cleanup_stale_epoch(%lu): "
+										 "swept %d holder slots",
+										 (unsigned long)current_epoch, swept)));
 }
 
 
@@ -1562,7 +1596,7 @@ cluster_grd_try_reserve(const ClusterResId *resid, const ClusterGrdHolderId *hol
 
 ClusterGrdEntryResult
 cluster_grd_revalidate_and_promote(const ClusterResId *resid, const ClusterGrdHolderId *holder,
-								   int32 self_node_id, uint64 gen_snapshot pg_attribute_unused())
+								   int32 self_node_id, uint64 gen_snapshot)
 {
 	ClusterGrdEntry *entry = NULL;
 	ClusterGrdEntryResult er;
@@ -1576,11 +1610,15 @@ cluster_grd_revalidate_and_promote(const ClusterResId *resid, const ClusterGrdHo
 
 	SpinLockAcquire(&entry->lock);
 	/*
-	 * P2.3 revalidate target = no remote holder ascended after the S3
-	 * snapshot.  Generation drift from other reservations is OK; only a
-	 * new remote real holder defeats the promote.
+	 * P2.3 revalidate target = no incompatible state ascended after the
+	 * S3 snapshot.  reservation_create() bumps generation exactly once
+	 * after gen_snapshot; any later mutation means the caller's reservation
+	 * is no longer the sole in-flight state we can safely promote.
 	 */
-	revalidate_ok = !cluster_grd_entry_has_remote_holder(entry, self_node_id);
+	revalidate_ok = (entry->generation == gen_snapshot + 1)
+					&& !cluster_grd_entry_has_remote_holder(entry, self_node_id)
+					&& !cluster_grd_entry_has_pending_waiter(entry)
+					&& !cluster_grd_entry_has_pending_convert(entry);
 	if (!revalidate_ok) {
 		(void)cluster_grd_reservation_cancel(entry, holder);
 		SpinLockRelease(&entry->lock);
