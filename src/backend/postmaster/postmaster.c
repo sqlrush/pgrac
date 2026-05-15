@@ -1927,9 +1927,11 @@ ServerLoop(void)
 		 * (7th cluster aux process).  LMS is spawned by the phase 4
 		 * driver after QVOTEC; respawn here mirrors the established
 		 * cluster aux process pattern for restart-after-crash and
-		 * external child termination paths.
+		 * external child termination paths.  cluster.lms_enabled = off
+		 * (PGC_POSTMASTER) keeps LMS un-forked and leaves the startup-time
+		 * PG-native fallback path active.
 		 */
-		if (cluster_enabled && LmsPID == 0 && pmState == PM_RUN)
+		if (cluster_enabled && cluster_lms_enabled && LmsPID == 0 && pmState == PM_RUN)
 			LmsPID = StartLms();
 
 		/*
@@ -5856,11 +5858,9 @@ cluster_postmaster_start_qvotec(void)
  *	cluster_postmaster_start_qvotec.  StartChildProcess is file-static
  *	to postmaster.c, so cluster_lms.c forwards here.
  *
- *	Sprint A skeleton: LMS spawn is gated by cluster_enabled (and
- *	will be additionally gated by cluster.lms_enabled GUC when Step 4
- *	wires the GUC plumbing).  The phase 4 driver upgrade for LMS spawn
- *	integration lands in Step 3+ alongside the LMON ↔ LMS ownership
- *	transfer guard (HC4 single ownership).
+ *	LMS spawn is gated by cluster_enabled and cluster.lms_enabled.  The
+ *	phase 4 driver upgrade for LMS spawn integration lands alongside the
+ *	LMON ↔ LMS ownership transfer guard (HC4 single ownership).
  *
  *	Spec: spec-2.18-lms-daemon-grant-ownership-migration.md Sprint A.
  */

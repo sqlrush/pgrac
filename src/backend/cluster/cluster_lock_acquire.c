@@ -20,10 +20,11 @@
  *	  本 ship 让 cluster_unit T-7step 可以 verify:
  *	  - HC1 fail-closed:S1 cluster_lms_is_ready() exact predicate
  *	  - I1 monotonic forward transition(S1 → S2 → S3 → S4 → S5 → S6;
- *	    error 走 S7 不回退)
+ *	    pre-reservation fail returns directly;post-reservation fail
+ *	    走 S7 cleanup 不回退)
  *	  - 5 SQLSTATE family return value 分流(53R70 / 53R71 / 53R72 /
  *	    53R73 / 53R80)
- *	  - S7 cleanup counter ++ 在 error path
+ *	  - S7 cleanup counter ++ only on post-reservation error path
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
@@ -67,8 +68,7 @@ static bool stub_counter_initialized = false;
 static inline void
 ensure_counter_initialized(void)
 {
-	if (!stub_counter_initialized)
-	{
+	if (!stub_counter_initialized) {
 		pg_atomic_init_u64(&stub_s1_entry_count, 0);
 		pg_atomic_init_u64(&stub_s7_cleanup_count, 0);
 		stub_counter_initialized = true;
@@ -82,9 +82,9 @@ ensure_counter_initialized(void)
  *	cluster_lms_is_ready() exact predicate(spec-2.19 L124 inherit;
  *	禁止 `state >= LMS_READY` 数值比较)。
  *	cluster.lms_enabled=on + LMS state != READY → 53R80 fail-closed。
- *	cluster.lms_enabled=off → caller-side legacy path(spec-2.21 wire 时
- *	gate-disable spec-2.17 placeholder);本 spec internal API 返回
- *	OK_GRANTED skip 因为不依赖 PG hook。
+ *	cluster.lms_enabled=off → caller-side legacy PG-native path.  Return
+ *	OK_NATIVE so the top-level dispatcher does not run S2-S7 and pretend
+ *	a cluster grant happened.
  */
 ClusterLockAcquireResult
 cluster_lock_acquire_s1_entry(const ClusterLockAcquireRequest *req)
@@ -99,24 +99,22 @@ cluster_lock_acquire_s1_entry(const ClusterLockAcquireRequest *req)
 	 * HC1 fail-closed:cluster.lms_enabled=on + LMS state != READY →
 	 * 53R80 LMS_UNAVAILABLE。**exact predicate** — spec-2.19 L124 inherit。
 	 */
-	if (!cluster_lms_enabled)
-	{
+	if (!cluster_lms_enabled) {
 		/*
 		 * Startup-time fallback path:caller-side legacy(spec-2.21
 		 * gate-disable wire 时走 PG-native LockAcquire 不入 cluster gate)。
-		 * 本 internal API 返回 OK_GRANTED skip downstream(spec-2.20
+		 * 本 internal API 返回 OK_NATIVE skip downstream(spec-2.20
 		 * 不实际走 hot path)。
 		 */
-		return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+		return CLUSTER_LOCK_ACQUIRE_OK_NATIVE;
 	}
 
-	if (!cluster_lms_is_ready())
-	{
+	if (!cluster_lms_is_ready()) {
 		/* 53R80 cluster_lms_unavailable caller retry/rollback。*/
 		return CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE;
 	}
 
-	return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;	/* dispatch to S2 */
+	return CLUSTER_LOCK_ACQUIRE_OK_GRANTED; /* dispatch to S2 */
 }
 
 
@@ -140,7 +138,7 @@ cluster_lock_acquire_s2_identity(const ClusterLockAcquireRequest *req)
 	 * 集成 API(spec-2.21 hot path 真 wire);本 internal API 仅 validate
 	 * S2 invariants — resid 必须 canonical 16B(spec-2.14 wire 检查)。
 	 */
-	return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;	/* dispatch to S3 */
+	return CLUSTER_LOCK_ACQUIRE_OK_GRANTED; /* dispatch to S3 */
 }
 
 
@@ -161,8 +159,7 @@ cluster_lock_acquire_s2_identity(const ClusterLockAcquireRequest *req)
  *	失败 rollback intent + remove reservation 走 S7 cleanup。
  */
 ClusterLockAcquireResult
-cluster_lock_acquire_s3_partition_reservation(
-	const ClusterLockAcquireRequest *req)
+cluster_lock_acquire_s3_partition_reservation(const ClusterLockAcquireRequest *req)
 {
 	if (req == NULL)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
@@ -176,7 +173,7 @@ cluster_lock_acquire_s3_partition_reservation(
 	 * mutator API(spec-2.16 ship caller-side 6-step state machine 待
 	 * spec-2.21 真激活 wire callsite)。
 	 */
-	return CLUSTER_LOCK_ACQUIRE_PENDING;	/* dispatch to S4(if remote)or S5(if local fast path)*/
+	return CLUSTER_LOCK_ACQUIRE_PENDING; /* dispatch to S4(if remote)or S5(if local fast path)*/
 }
 
 
@@ -192,8 +189,7 @@ cluster_lock_acquire_s3_partition_reservation(
  *	cancel 53R73。
  */
 ClusterLockAcquireResult
-cluster_lock_acquire_s4_remote_request_wait(
-	const ClusterLockAcquireRequest *req)
+cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req)
 {
 	if (req == NULL)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
@@ -203,7 +199,7 @@ cluster_lock_acquire_s4_remote_request_wait(
 	 * caller-side 接 cluster_ges_request_send + WaitLatch GES_S4_WAIT。
 	 */
 	if (req->dontwait)
-		return CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;	/* ConditionalLock semantic */
+		return CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT; /* ConditionalLock semantic */
 
 	return CLUSTER_LOCK_ACQUIRE_PENDING;
 }
@@ -215,8 +211,7 @@ cluster_lock_acquire_s4_remote_request_wait(
  *	PG LockAcquire success 调。
  */
 ClusterLockAcquireResult
-cluster_lock_acquire_s5_promote_holder(
-	const ClusterLockAcquireRequest *req)
+cluster_lock_acquire_s5_promote_holder(const ClusterLockAcquireRequest *req)
 {
 	if (req == NULL)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
@@ -280,8 +275,9 @@ cluster_lock_acquire_s7_cleanup(const ClusterLockAcquireRequest *req)
  *	spec-2.21 hot path:lock.c hook 调此函数。本 spec internal API
  *	让 cluster_unit verify S1-S7 全链 invariant。
  *
- *	I1 monotonic forward transition:任一 step FAIL_* 立即 short-circuit
- *	to S7 cleanup,不回退到 earlier step。
+ *	I1 monotonic forward transition:pre-reservation fail returns directly;
+ *	post-reservation FAIL_* short-circuits to S7 cleanup,不回退到 earlier
+ *	step。
  */
 ClusterLockAcquireResult
 cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *req)
@@ -290,53 +286,45 @@ cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *req)
 
 	/* S1 entry — HC1 fail-closed。*/
 	r = cluster_lock_acquire_s1_entry(req);
-	if (r == CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE ||
-		r == CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL)
-	{
-		(void) cluster_lock_acquire_s7_cleanup(req);
+	if (r == CLUSTER_LOCK_ACQUIRE_OK_NATIVE || r == CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE
+		|| r == CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL)
 		return r;
-	}
 
 	/* S2 identity。*/
 	r = cluster_lock_acquire_s2_identity(req);
 	if (r != CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
-	{
-		(void) cluster_lock_acquire_s7_cleanup(req);
 		return r;
-	}
 
 	/* S3 partition + reservation。*/
 	r = cluster_lock_acquire_s3_partition_reservation(req);
-	if (r == CLUSTER_LOCK_ACQUIRE_FAIL_RESERVATION_FULL ||
-		r == CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL)
-	{
-		(void) cluster_lock_acquire_s7_cleanup(req);
+	if (r == CLUSTER_LOCK_ACQUIRE_PENDING)
 		return r;
-	}
+	if (r == CLUSTER_LOCK_ACQUIRE_FAIL_RESERVATION_FULL || r == CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL)
+		return r;
 
 	/*
 	 * S4 remote request + wait — spec-2.20 internal API 返回 PENDING
 	 * signals spec-2.21 hot path wire 时 caller-side WaitLatch。
-	 * 本 spec internal:PENDING 视为 dispatch to S5(synchronous skeleton)。
+	 * 本 spec internal:PENDING 原样返回,避免在未 reservation / 未
+	 * GES_REPLY 的情况下伪造 OK_GRANTED。
 	 */
 	r = cluster_lock_acquire_s4_remote_request_wait(req);
-	if (r == CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT ||
-		r == CLUSTER_LOCK_ACQUIRE_FAIL_DEADLOCK ||
-		r == CLUSTER_LOCK_ACQUIRE_FAIL_CANCEL)
-	{
-		(void) cluster_lock_acquire_s7_cleanup(req);
+	if (r == CLUSTER_LOCK_ACQUIRE_PENDING)
+		return r;
+	if (r == CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT || r == CLUSTER_LOCK_ACQUIRE_FAIL_DEADLOCK
+		|| r == CLUSTER_LOCK_ACQUIRE_FAIL_CANCEL) {
+		(void)cluster_lock_acquire_s7_cleanup(req);
 		return r;
 	}
 
 	/* S5 promote holder。*/
 	r = cluster_lock_acquire_s5_promote_holder(req);
-	if (r == CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL)
-	{
-		(void) cluster_lock_acquire_s7_cleanup(req);
+	if (r == CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL) {
+		(void)cluster_lock_acquire_s7_cleanup(req);
 		return r;
 	}
 
-	return r;	/* OK_GRANTED / OK_CONVERTED */
+	return r; /* OK_GRANTED / OK_CONVERTED */
 }
 
 

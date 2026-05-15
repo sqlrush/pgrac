@@ -27,7 +27,8 @@
 #        + SELECT pg_cluster_shmem -> log WARNING.
 #      - pg_cluster_state.guc.cluster.shmem_max_regions reflects the
 #        current GUC value.
-#      - 0.16 baseline (pg_stat_cluster_wait_events 51 rows) unchanged.
+#      - pg_stat_cluster_wait_events baseline stays in sync with cluster
+#        wait-event additions.
 #      - 0.30 stage-0 acceptance baseline (pg_cluster_state row count
 #        non-decreasing) preserved by the additive shmem.region.* keys.
 #
@@ -222,15 +223,13 @@ like($stderr,
 
 
 # ----------
-# L17: 0.16 baseline (pg_stat_cluster_wait_events) unchanged at 51.
-# Stage 1.3 deliberately does not add wait events (registry is
-# postmaster-init only -- no runtime hot path).
+# L17: pg_stat_cluster_wait_events baseline includes spec-2.20 GES S4 wait.
 # ----------
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-   '69',
-   'L17 pg_stat_cluster_wait_events still 58 rows after 1.3 (1.10 + 1.11 + 1.12 BgProc)');
+   '70',
+   'L17 pg_stat_cluster_wait_events returns 70 rows after spec-2.20');
 
 
 # ----------

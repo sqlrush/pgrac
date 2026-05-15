@@ -59,6 +59,7 @@
 
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_grd_work_queue.h"
+#include "cluster/cluster_guc.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_shmem.h"
 #include "libpq/pqsignal.h"
@@ -150,7 +151,8 @@ cluster_lms_shmem_init(void)
 	if (!found) {
 		memset(cluster_lms_state, 0, sizeof(*cluster_lms_state));
 		LWLockInitialize(&cluster_lms_state->lwlock, LWTRANCHE_CLUSTER_LMS);
-		pg_atomic_init_u32(&cluster_lms_state->lms_state, CLUSTER_LMS_NOT_STARTED);
+		pg_atomic_init_u32(&cluster_lms_state->lms_state,
+						   cluster_lms_enabled ? CLUSTER_LMS_NOT_STARTED : CLUSTER_LMS_DISABLED);
 		pg_atomic_init_u32(&cluster_lms_state->work_queue_count, 0);
 		pg_atomic_init_u64(&cluster_lms_state->lms_started_count, 0);
 		pg_atomic_init_u64(&cluster_lms_state->lms_ready_at_us, 0);
@@ -233,17 +235,19 @@ cluster_lms_start(void)
 
 	Assert(!IsUnderPostmaster);
 
-	/*
-	 * Honor lms_enabled = off (PGC_POSTMASTER startup-time fallback;
-	 * §1.4.5 F1).  Caller (postmaster phase 1 driver) checks GUC and
-	 * skips this start() entirely when disabled; defense in depth here
-	 * marks DISABLED state to make the SQL view surface accurate.
-	 *
-	 * Note: the GUC itself lands in Step 4 (D12); until then this
-	 * branch is dead code that the compiler will optimize away.  Once
-	 * Step 4 ships cluster_enabled / cluster_lms_enabled GUC plumbing,
-	 * the phase 1 driver guard becomes the canonical disable path.
-	 */
+	if (!cluster_lms_enabled) {
+		/*
+		 * Startup-time fallback: no LMS child should be forked when the
+		 * POSTMASTER GUC is off.  Mark DISABLED so SQL/debug surfaces can
+		 * distinguish intentional opt-out from "not started yet".
+		 */
+		if (cluster_lms_state != NULL) {
+			LWLockAcquire(&cluster_lms_state->lwlock, LW_EXCLUSIVE);
+			lms_set_state(CLUSTER_LMS_DISABLED);
+			LWLockRelease(&cluster_lms_state->lwlock);
+		}
+		return 0;
+	}
 
 	pid = cluster_postmaster_start_lms();
 	return (int)pid;
@@ -465,8 +469,8 @@ cluster_lms_is_ready(void)
 	if (cluster_lms_state == NULL)
 		return false;
 
-	return ((ClusterLmsState) pg_atomic_read_u32(&cluster_lms_state->lms_state))
-		== CLUSTER_LMS_READY;
+	return ((ClusterLmsState)pg_atomic_read_u32(&cluster_lms_state->lms_state))
+		   == CLUSTER_LMS_READY;
 }
 
 

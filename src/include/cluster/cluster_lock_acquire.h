@@ -68,8 +68,8 @@
 #ifndef CLUSTER_LOCK_ACQUIRE_H
 #define CLUSTER_LOCK_ACQUIRE_H
 
-#include "cluster/cluster_grd.h"		/* ClusterResId */
-#include "storage/lock.h"				/* LOCKMODE */
+#include "cluster/cluster_grd.h" /* ClusterResId */
+#include "storage/lock.h"		 /* LOCKMODE */
 
 
 /*
@@ -80,18 +80,18 @@
  *	异步等(spec-2.21 hot path integration 时 caller 走 WaitLatch 等
  *	GES_REPLY)。
  */
-typedef enum ClusterLockAcquireResult
-{
-	CLUSTER_LOCK_ACQUIRE_OK_GRANTED = 0,	/* S5 promote success(new holder) */
-	CLUSTER_LOCK_ACQUIRE_OK_CONVERTED = 1,	/* S5 promote success(mode convert) */
-	CLUSTER_LOCK_ACQUIRE_PENDING = 2,		/* S4 async wait — caller waits GES_REPLY */
-	CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE = 10,		/* S1 53R80 fail-closed */
-	CLUSTER_LOCK_ACQUIRE_FAIL_GRD_NOT_READY = 11,		/* S2 cluster.grd_max_entries=0 */
-	CLUSTER_LOCK_ACQUIRE_FAIL_RESERVATION_FULL = 12,	/* S3 GRD entry full / 53R71 */
-	CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT = 13,				/* S4 53R70 cluster_ges_timeout */
-	CLUSTER_LOCK_ACQUIRE_FAIL_DEADLOCK = 14,			/* S4 53R72 cluster_ges_deadlock(spec-2.22 真激活)*/
-	CLUSTER_LOCK_ACQUIRE_FAIL_CANCEL = 15,				/* S4 53R73 cluster_ges_cancel_pending */
-	CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL = 16				/* S5/S6/S7 internal error */
+typedef enum ClusterLockAcquireResult {
+	CLUSTER_LOCK_ACQUIRE_OK_GRANTED = 0,   /* S5 promote success(new holder) */
+	CLUSTER_LOCK_ACQUIRE_OK_CONVERTED = 1, /* S5 promote success(mode convert) */
+	CLUSTER_LOCK_ACQUIRE_PENDING = 2,	   /* S4 async wait — caller waits GES_REPLY */
+	CLUSTER_LOCK_ACQUIRE_OK_NATIVE = 3,	   /* cluster gate disabled; caller uses PG-native path */
+	CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE = 10,	 /* S1 53R80 fail-closed */
+	CLUSTER_LOCK_ACQUIRE_FAIL_GRD_NOT_READY = 11,	 /* S2 cluster.grd_max_entries=0 */
+	CLUSTER_LOCK_ACQUIRE_FAIL_RESERVATION_FULL = 12, /* S3 GRD entry full / 53R71 */
+	CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT = 13,			 /* S4 53R70 cluster_ges_timeout */
+	CLUSTER_LOCK_ACQUIRE_FAIL_DEADLOCK = 14, /* S4 53R72 cluster_ges_deadlock(spec-2.22 真激活)*/
+	CLUSTER_LOCK_ACQUIRE_FAIL_CANCEL = 15,	 /* S4 53R73 cluster_ges_cancel_pending */
+	CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL = 16	 /* S5/S6/S7 internal error */
 } ClusterLockAcquireResult;
 
 
@@ -105,13 +105,13 @@ typedef enum ClusterLockAcquireResult
  *	HC4 exact predicate:caller 必走 cluster_lms_is_ready() helper +
  *	cluster_lmd_is_ready() helper;禁止 `state >= READY` 数值比较。
  */
-typedef struct ClusterLockAcquireRequest
-{
-	ClusterResId resid;			/* 16B canonical wire-encoded ResId(spec-2.14 ship)*/
-	LOCKMODE	lockmode;		/* requested PG lock mode */
-	int			lockmethod_id;	/* DEFAULT_LOCKMETHOD / SHORT_LOCKMETHOD / cluster-aware class */
-	bool		dontwait;		/* true → S4 immediate ConditionalLock semantic(no wait)*/
-	uint64		caller_local_start_ts_ms;	/* spec-2.17 P2.2 deterministic 4-tuple — DESC = newer = youngest victim */
+typedef struct ClusterLockAcquireRequest {
+	ClusterResId resid; /* 16B canonical wire-encoded ResId(spec-2.14 ship)*/
+	LOCKMODE lockmode;	/* requested PG lock mode */
+	int lockmethod_id;	/* DEFAULT_LOCKMETHOD / SHORT_LOCKMETHOD / cluster-aware class */
+	bool dontwait;		/* true → S4 immediate ConditionalLock semantic(no wait)*/
+	uint64
+		caller_local_start_ts_ms; /* spec-2.17 P2.2 deterministic 4-tuple — DESC = newer = youngest victim */
 } ClusterLockAcquireRequest;
 
 
@@ -128,8 +128,8 @@ typedef struct ClusterLockAcquireRequest
  *	deadlock / 53R73 cancel / 53R80 LMS_UNAVAILABLE / 53R81
  *	LMD_UNAVAILABLE — spec-2.22 wire)。
  */
-extern ClusterLockAcquireResult cluster_lock_acquire_seven_step(
-	const ClusterLockAcquireRequest *req);
+extern ClusterLockAcquireResult
+cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *req);
 
 
 /*
@@ -146,15 +146,14 @@ extern ClusterLockAcquireResult cluster_lock_acquire_seven_step(
  *	+ cluster_lmd_is_ready() 视 spec-2.22 wire);LMS_UNAVAILABLE → 53R80;
  *	LMD_UNAVAILABLE → 53R81(spec-2.22 wire)。
  */
-extern ClusterLockAcquireResult cluster_lock_acquire_s1_entry(
-	const ClusterLockAcquireRequest *req);
+extern ClusterLockAcquireResult cluster_lock_acquire_s1_entry(const ClusterLockAcquireRequest *req);
 
 /*
  * S2 identity:resolve ClusterResId valid + lockmethod_id is cluster-aware
  *	class(spec-2.14 4 class scaffolding;real expansion spec-2.25)。
  */
-extern ClusterLockAcquireResult cluster_lock_acquire_s2_identity(
-	const ClusterLockAcquireRequest *req);
+extern ClusterLockAcquireResult
+cluster_lock_acquire_s2_identity(const ClusterLockAcquireRequest *req);
 
 /*
  * S3 partition + reservation:S3.1-S3.6 sub-step sequence(spec-2.17
@@ -162,8 +161,8 @@ extern ClusterLockAcquireResult cluster_lock_acquire_s2_identity(
  *	S3.4 PG LockAcquire local 在 spec-2.20 internal API 返回 PENDING
  *	(spec-2.21 hot path wire)。
  */
-extern ClusterLockAcquireResult cluster_lock_acquire_s3_partition_reservation(
-	const ClusterLockAcquireRequest *req);
+extern ClusterLockAcquireResult
+cluster_lock_acquire_s3_partition_reservation(const ClusterLockAcquireRequest *req);
 
 /*
  * S4 remote request + wait:GES_REQUEST send + WAIT_EVENT_CLUSTER_GES_S4_WAIT
@@ -171,31 +170,31 @@ extern ClusterLockAcquireResult cluster_lock_acquire_s3_partition_reservation(
  *	LMD spec-2.22 wire)。local-master + no remote holder fast path 不
  *	进 S4(A1)。
  */
-extern ClusterLockAcquireResult cluster_lock_acquire_s4_remote_request_wait(
-	const ClusterLockAcquireRequest *req);
+extern ClusterLockAcquireResult
+cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req);
 
 /*
  * S5 promote holder:acquire partition LWLock + promote reservation to
  *	real holder + release partition。spec-2.21 hot path wire 时此 step
  *	post PG LockAcquire success 调。
  */
-extern ClusterLockAcquireResult cluster_lock_acquire_s5_promote_holder(
-	const ClusterLockAcquireRequest *req);
+extern ClusterLockAcquireResult
+cluster_lock_acquire_s5_promote_holder(const ClusterLockAcquireRequest *req);
 
 /*
  * S6 release:backend done 释放路径(LockRelease hook;spec-2.21 wire 到
  *	PG LockRelease)。
  */
-extern ClusterLockAcquireResult cluster_lock_acquire_s6_release(
-	const ClusterLockAcquireRequest *req);
+extern ClusterLockAcquireResult
+cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *req);
 
 /*
  * S7 cleanup:error/timeout 路径 rollback intent + remove reservation +
  *	send GES_CANCEL_PENDING / GES_RELEASE 视已 grant 状态(spec-2.17
  *	§1.4 P1.4 不同 opcode 分流硬契约)。
  */
-extern ClusterLockAcquireResult cluster_lock_acquire_s7_cleanup(
-	const ClusterLockAcquireRequest *req);
+extern ClusterLockAcquireResult
+cluster_lock_acquire_s7_cleanup(const ClusterLockAcquireRequest *req);
 
 
 /*
@@ -205,4 +204,4 @@ extern ClusterLockAcquireResult cluster_lock_acquire_s7_cleanup(
 extern uint64 cluster_lock_acquire_s1_entry_count(void);
 extern uint64 cluster_lock_acquire_s7_cleanup_count(void);
 
-#endif							/* CLUSTER_LOCK_ACQUIRE_H */
+#endif /* CLUSTER_LOCK_ACQUIRE_H */

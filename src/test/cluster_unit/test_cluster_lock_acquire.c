@@ -9,14 +9,14 @@
  *	    T-7step-1: 7 individual step API + top-level entry symbol
  *	               linkable + initial counter 0
  *	    T-7step-2: HC1 LMS fail-closed S1 entry — NULL req → INTERNAL;
- *	               cluster_lms_enabled=false → OK_GRANTED skip(legacy
+ *	               cluster_lms_enabled=false → OK_NATIVE skip(legacy
  *	               path signal)
  *	    T-7step-3: S2/S3/S4/S5/S6/S7 NULL req → INTERNAL
  *	    T-7step-4: top-level cluster_lock_acquire_seven_step() NULL req
- *	               → S1 INTERNAL + S7 cleanup invoked(counter +1)
+ *	               → S1 INTERNAL without S7 cleanup(pre-reservation fail)
  *	    T-7step-5: I1 monotonic forward transition contract — top-level
- *	               entry 在 any step FAIL_* 时立即 short-circuit to S7
- *	               cleanup,不回退到 earlier step
+ *	               entry returns OK_NATIVE/PENDING honestly and only
+ *	               post-reservation failures may run S7 cleanup
  *
  *	  Stubs:
  *	    - cluster_lms_is_ready / cluster_lms_enabled / cluster_lmd_is_ready
@@ -84,8 +84,8 @@ elog_finish(int e pg_attribute_unused(), const char *f pg_attribute_unused(), ..
  *	cluster_lms_enabled GUC — caller-side gate走 cluster_lms_enabled
  *	first, then cluster_lms_is_ready() second (HC1 fail-closed)。
  */
-bool		cluster_lms_enabled = true;
-bool		cluster_lmd_enabled = true;
+bool cluster_lms_enabled = true;
+bool cluster_lmd_enabled = true;
 static bool stub_lms_ready_for_test = true;
 
 bool
@@ -110,58 +110,55 @@ cluster_lmd_is_ready(void)
  */
 UT_TEST(test_7step_api_surface_linkable_and_initial_counters_zero)
 {
-	UT_ASSERT_NOT_NULL((void *) cluster_lock_acquire_s1_entry);
-	UT_ASSERT_NOT_NULL((void *) cluster_lock_acquire_s2_identity);
-	UT_ASSERT_NOT_NULL((void *) cluster_lock_acquire_s3_partition_reservation);
-	UT_ASSERT_NOT_NULL((void *) cluster_lock_acquire_s4_remote_request_wait);
-	UT_ASSERT_NOT_NULL((void *) cluster_lock_acquire_s5_promote_holder);
-	UT_ASSERT_NOT_NULL((void *) cluster_lock_acquire_s6_release);
-	UT_ASSERT_NOT_NULL((void *) cluster_lock_acquire_s7_cleanup);
-	UT_ASSERT_NOT_NULL((void *) cluster_lock_acquire_seven_step);
+	UT_ASSERT_NOT_NULL((void *)cluster_lock_acquire_s1_entry);
+	UT_ASSERT_NOT_NULL((void *)cluster_lock_acquire_s2_identity);
+	UT_ASSERT_NOT_NULL((void *)cluster_lock_acquire_s3_partition_reservation);
+	UT_ASSERT_NOT_NULL((void *)cluster_lock_acquire_s4_remote_request_wait);
+	UT_ASSERT_NOT_NULL((void *)cluster_lock_acquire_s5_promote_holder);
+	UT_ASSERT_NOT_NULL((void *)cluster_lock_acquire_s6_release);
+	UT_ASSERT_NOT_NULL((void *)cluster_lock_acquire_s7_cleanup);
+	UT_ASSERT_NOT_NULL((void *)cluster_lock_acquire_seven_step);
 
 	/*
 	 * Initial counters may be 0 OR > 0 across test runs(static init
 	 * persistent;not reset between UT_TEST functions in same binary).
 	 * Just verify accessor links + returns sensible value.
 	 */
-	UT_ASSERT_NOT_NULL((void *) cluster_lock_acquire_s1_entry_count);
-	UT_ASSERT_NOT_NULL((void *) cluster_lock_acquire_s7_cleanup_count);
+	UT_ASSERT_NOT_NULL((void *)cluster_lock_acquire_s1_entry_count);
+	UT_ASSERT_NOT_NULL((void *)cluster_lock_acquire_s7_cleanup_count);
 }
 
 /*
  * T-7step-2: HC1 LMS fail-closed S1 entry behavior.
  *
  *	- NULL req → INTERNAL
- *	- cluster_lms_enabled=false → OK_GRANTED(legacy path signal)
+ *	- cluster_lms_enabled=false → OK_NATIVE(legacy path signal)
  *	- cluster_lms_enabled=true + LMS not ready(stub返回 false)→
  *	  FAIL_LMS_UNAVAILABLE(HC4 exact predicate;53R80)
  */
 UT_TEST(test_7step_s1_hc1_fail_closed)
 {
 	ClusterLockAcquireRequest req;
-	uint64		pre = cluster_lock_acquire_s1_entry_count();
+	uint64 pre = cluster_lock_acquire_s1_entry_count();
 
 	/* NULL req → INTERNAL */
-	UT_ASSERT_EQ((int) cluster_lock_acquire_s1_entry(NULL),
-				 (int) CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
+	UT_ASSERT_EQ((int)cluster_lock_acquire_s1_entry(NULL), (int)CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
 	UT_ASSERT_EQ(cluster_lock_acquire_s1_entry_count(), pre + 1);
 
-	/* enabled=false → OK_GRANTED skip(legacy path)*/
+	/* enabled=false → OK_NATIVE skip(legacy path)*/
 	memset(&req, 0, sizeof(req));
 	cluster_lms_enabled = false;
-	UT_ASSERT_EQ((int) cluster_lock_acquire_s1_entry(&req),
-				 (int) CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ((int)cluster_lock_acquire_s1_entry(&req), (int)CLUSTER_LOCK_ACQUIRE_OK_NATIVE);
 
 	/* enabled=true + LMS not ready → FAIL_LMS_UNAVAILABLE(HC1)*/
 	cluster_lms_enabled = true;
 	stub_lms_ready_for_test = false;
-	UT_ASSERT_EQ((int) cluster_lock_acquire_s1_entry(&req),
-				 (int) CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE);
+	UT_ASSERT_EQ((int)cluster_lock_acquire_s1_entry(&req),
+				 (int)CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE);
 
 	/* enabled=true + LMS ready → OK_GRANTED(dispatch to S2)*/
 	stub_lms_ready_for_test = true;
-	UT_ASSERT_EQ((int) cluster_lock_acquire_s1_entry(&req),
-				 (int) CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ((int)cluster_lock_acquire_s1_entry(&req), (int)CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
 }
 
 /*
@@ -169,63 +166,68 @@ UT_TEST(test_7step_s1_hc1_fail_closed)
  */
 UT_TEST(test_7step_individual_steps_null_req_internal)
 {
-	UT_ASSERT_EQ((int) cluster_lock_acquire_s2_identity(NULL),
-				 (int) CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
-	UT_ASSERT_EQ((int) cluster_lock_acquire_s3_partition_reservation(NULL),
-				 (int) CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
-	UT_ASSERT_EQ((int) cluster_lock_acquire_s4_remote_request_wait(NULL),
-				 (int) CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
-	UT_ASSERT_EQ((int) cluster_lock_acquire_s5_promote_holder(NULL),
-				 (int) CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
-	UT_ASSERT_EQ((int) cluster_lock_acquire_s6_release(NULL),
-				 (int) CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
-	UT_ASSERT_EQ((int) cluster_lock_acquire_s7_cleanup(NULL),
-				 (int) CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
+	UT_ASSERT_EQ((int)cluster_lock_acquire_s2_identity(NULL),
+				 (int)CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
+	UT_ASSERT_EQ((int)cluster_lock_acquire_s3_partition_reservation(NULL),
+				 (int)CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
+	UT_ASSERT_EQ((int)cluster_lock_acquire_s4_remote_request_wait(NULL),
+				 (int)CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
+	UT_ASSERT_EQ((int)cluster_lock_acquire_s5_promote_holder(NULL),
+				 (int)CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
+	UT_ASSERT_EQ((int)cluster_lock_acquire_s6_release(NULL),
+				 (int)CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
+	UT_ASSERT_EQ((int)cluster_lock_acquire_s7_cleanup(NULL),
+				 (int)CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
 }
 
 /*
  * T-7step-4: top-level cluster_lock_acquire_seven_step() NULL req → S1
- * FAIL_INTERNAL + S7 cleanup invoked(counter ++).
+ * FAIL_INTERNAL without S7 cleanup.  S1/S2 fail before reservation, so
+ * top-level must not invoke S7 once S7 is wired to real cancel/release.
  */
 UT_TEST(test_7step_top_level_null_req_s7_cleanup_invoked)
 {
-	uint64		pre_s7 = cluster_lock_acquire_s7_cleanup_count();
+	uint64 pre_s7 = cluster_lock_acquire_s7_cleanup_count();
 	ClusterLockAcquireResult r;
 
 	r = cluster_lock_acquire_seven_step(NULL);
-	UT_ASSERT_EQ((int) r, (int) CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
-	UT_ASSERT_EQ(cluster_lock_acquire_s7_cleanup_count(), pre_s7 + 1);
+	UT_ASSERT_EQ((int)r, (int)CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
+	UT_ASSERT_EQ(cluster_lock_acquire_s7_cleanup_count(), pre_s7);
 }
 
 /*
  * T-7step-5: I1 monotonic forward transition — top-level entry with
- * normal req walks S1 → S2 → S3 → S4(returns PENDING per descoped
- * scope)→ S5 promote OK_GRANTED;no S7 cleanup invoke when no FAIL_*。
+ * normal req walks S1 → S2 → S3, then returns PENDING per descoped
+ * scope.  It must not continue to S5 and pretend an ungranted lock is
+ * OK_GRANTED.
  */
 UT_TEST(test_7step_top_level_monotonic_forward_no_cleanup_on_success)
 {
 	ClusterLockAcquireRequest req;
-	uint64		pre_s7 = cluster_lock_acquire_s7_cleanup_count();
+	uint64 pre_s7 = cluster_lock_acquire_s7_cleanup_count();
 	ClusterLockAcquireResult r;
 
 	memset(&req, 0, sizeof(req));
 	cluster_lms_enabled = true;
-	/*
-	 * S4 stub returns PENDING(not FAIL_*)so top-level dispatch
-	 * continues to S5 promote OK_GRANTED.  S7 cleanup NOT invoked.
-	 */
 	r = cluster_lock_acquire_seven_step(&req);
-	UT_ASSERT_EQ((int) r, (int) CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ((int)r, (int)CLUSTER_LOCK_ACQUIRE_PENDING);
 	UT_ASSERT_EQ(cluster_lock_acquire_s7_cleanup_count(), pre_s7);
 
+	cluster_lms_enabled = false;
+	r = cluster_lock_acquire_seven_step(&req);
+	UT_ASSERT_EQ((int)r, (int)CLUSTER_LOCK_ACQUIRE_OK_NATIVE);
+	UT_ASSERT_EQ(cluster_lock_acquire_s7_cleanup_count(), pre_s7);
+	cluster_lms_enabled = true;
+
 	/*
-	 * dontwait=true → S4 returns FAIL_TIMEOUT → S7 cleanup invoked +
-	 * top-level returns FAIL_TIMEOUT。
+	 * S4's dontwait timeout is still visible at the individual step
+	 * level; top-level cannot reach S4 until spec-2.21 wires S3
+	 * reservation completion.
 	 */
 	req.dontwait = true;
-	r = cluster_lock_acquire_seven_step(&req);
-	UT_ASSERT_EQ((int) r, (int) CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT);
-	UT_ASSERT_EQ(cluster_lock_acquire_s7_cleanup_count(), pre_s7 + 1);
+	r = cluster_lock_acquire_s4_remote_request_wait(&req);
+	UT_ASSERT_EQ((int)r, (int)CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT);
+	UT_ASSERT_EQ(cluster_lock_acquire_s7_cleanup_count(), pre_s7);
 }
 
 
@@ -233,7 +235,7 @@ UT_DEFINE_GLOBALS();
 
 
 int
-main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
+main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 {
 	UT_PLAN(5);
 
