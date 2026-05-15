@@ -42,9 +42,11 @@
  * Why: spec-2.21 wires the 7-step state machine into PG hot path.
  * Spec: spec-2.21-pg-lockacquire-integration-2node-smoke.md (D2 / D9)
  */
+#ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_grd.h"
+#endif
 
 #include "access/transam.h"
 #include "access/twophase.h"
@@ -823,6 +825,7 @@ LockAcquireExtended(const LOCKTAG *locktag,
 	LWLock	   *partitionLock;
 	bool		found_conflict;
 	bool		log_lock = false;
+#ifdef USE_PGRAC_CLUSTER
 	/*
 	 * PGRAC: cluster gate post-native S5 promote bookkeeping.  Set when the
 	 * cluster gate returned NEED_PG_NATIVE_LOCK; consumed at LOCKACQUIRE_OK
@@ -832,6 +835,7 @@ LockAcquireExtended(const LOCKTAG *locktag,
 	ClusterLockAcquireRequest cluster_req;
 
 	memset(&cluster_req, 0, sizeof(cluster_req));
+#endif
 
 	if (lockmethodid <= 0 || lockmethodid >= lengthof(LockMethods))
 		elog(ERROR, "unrecognized lock method: %d", lockmethodid);
@@ -890,10 +894,12 @@ LockAcquireExtended(const LOCKTAG *locktag,
 		locallock->lockOwners = (LOCALLOCKOWNER *)
 			MemoryContextAlloc(TopMemoryContext,
 							   locallock->maxLockOwners * sizeof(LOCALLOCKOWNER));
+#ifdef USE_PGRAC_CLUSTER
 		/* PGRAC: spec-2.21 D1 — cluster-aware state init */
 		locallock->cluster_registered = false;
 		locallock->cluster_request_id = 0;
 		memset(locallock->cluster_holder_raw, 0, sizeof(locallock->cluster_holder_raw));
+#endif
 	}
 	else
 	{
@@ -942,6 +948,7 @@ LockAcquireExtended(const LOCKTAG *locktag,
 	 *
 	 * Spec: spec-2.21-pg-lockacquire-integration-2node-smoke.md (D2)
 	 */
+#ifdef USE_PGRAC_CLUSTER
 	if (cluster_enabled &&
 		cluster_lock_acquire_cluster_path &&
 		cluster_lock_should_globalize(locktag, lockmode, sessionLock))
@@ -1000,6 +1007,7 @@ LockAcquireExtended(const LOCKTAG *locktag,
 						 errmsg("cluster_lock_acquire failed (result=%d)", (int) cluster_r)));
 		}
 	}
+#endif /* USE_PGRAC_CLUSTER */
 
 	/*
 	 * We don't acquire any other heavyweight lock while holding the relation
@@ -1068,6 +1076,7 @@ LockAcquireExtended(const LOCKTAG *locktag,
 			locallock->lock = NULL;
 			locallock->proclock = NULL;
 			GrantLockLocal(locallock, owner);
+#ifdef USE_PGRAC_CLUSTER
 			/* PGRAC: post-native S5 promote — spec-2.21 D2 / D4 P2.3. */
 			if (cluster_need_s5)
 			{
@@ -1084,6 +1093,7 @@ LockAcquireExtended(const LOCKTAG *locktag,
 				memcpy(locallock->cluster_holder_raw, &cluster_req.holder,
 					   sizeof(locallock->cluster_holder_raw));
 			}
+#endif
 			return LOCKACQUIRE_OK;
 		}
 	}
@@ -1284,6 +1294,7 @@ LockAcquireExtended(const LOCKTAG *locktag,
 							   locktag->locktag_field2);
 	}
 
+#ifdef USE_PGRAC_CLUSTER
 	/* PGRAC: post-native S5 promote — spec-2.21 D2 / D4 P2.3. */
 	if (cluster_need_s5)
 	{
@@ -1300,6 +1311,7 @@ LockAcquireExtended(const LOCKTAG *locktag,
 		memcpy(locallock->cluster_holder_raw, &cluster_req.holder,
 			   sizeof(locallock->cluster_holder_raw));
 	}
+#endif
 	return LOCKACQUIRE_OK;
 }
 
@@ -2182,6 +2194,7 @@ LockRelease(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 	if (locallock->nLocks > 0)
 		return true;
 
+#ifdef USE_PGRAC_CLUSTER
 	/*
 	 * PGRAC: cluster release hook — exactly-once exit per HC9.
 	 *
@@ -2208,6 +2221,7 @@ LockRelease(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 		cluster_lock_release(&crel);
 		locallock->cluster_registered = false;
 	}
+#endif
 
 	/*
 	 * At this point we can no longer suppose we are clear of invalidation
@@ -2410,6 +2424,7 @@ LockReleaseAll(LOCKMETHODID lockmethodid, bool allLocks)
 				locallock->numLockOwners = 0;
 		}
 
+#ifdef USE_PGRAC_CLUSTER
 		/*
 		 * PGRAC: cluster release hook for LockReleaseAll path (HC9 grant-
 		 * release 对称 — events that get here are about to release all of
@@ -2429,6 +2444,7 @@ LockReleaseAll(LOCKMETHODID lockmethodid, bool allLocks)
 			cluster_lock_release(&crel);
 			locallock->cluster_registered = false;
 		}
+#endif
 
 #ifdef USE_ASSERT_CHECKING
 

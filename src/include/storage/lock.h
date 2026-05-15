@@ -438,6 +438,7 @@ typedef struct LOCALLOCK
 	LOCALLOCKOWNER *lockOwners; /* dynamically resizable array */
 	bool		holdsStrongLockCount;	/* bumped FastPathStrongRelationLocks */
 	bool		lockCleared;	/* we read all sinval msgs for lock */
+#ifdef USE_PGRAC_CLUSTER
 	/*
 	 * PGRAC: cluster-aware lock state — spec-2.21 D1 ABI extend.
 	 *
@@ -450,9 +451,10 @@ typedef struct LOCALLOCK
 	 *      threaded through to S6 release.  In-memory only, not persisted.
 	 * Spec: spec-2.21-pg-lockacquire-integration-2node-smoke.md (D1 / P2.2)
 	 */
-	bool		cluster_registered;	/* PGRAC: true iff S5 promote success;gates cluster_lock_release exactly-once */
-	uint64		cluster_request_id;	/* PGRAC: from ClusterLockAcquireRequest.request_id */
-	uint8		cluster_holder_raw[24];	/* PGRAC: ClusterGrdHolderId byte-image (avoids cluster header include here) */
+	bool		cluster_registered;	/* PGRAC: true iff S5 promote success */
+	uint64		cluster_request_id;	/* PGRAC: from req.request_id */
+	uint8		cluster_holder_raw[24];	/* PGRAC: ClusterGrdHolderId byte-image */
+#endif
 } LOCALLOCK;
 
 #define LOCALLOCK_LOCKMETHOD(llock) ((llock).tag.lock.locktag_lockmethodid)

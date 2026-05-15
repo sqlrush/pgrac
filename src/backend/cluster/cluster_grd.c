@@ -1082,7 +1082,10 @@ cluster_grd_entry_add_waiter(ClusterGrdEntry *entry, const ClusterGrdHolderId *h
 	slot = entry->nwaiters++;
 	entry->waiters[slot].node_id = (int32)holder->node_id;
 	entry->waiters[slot].mode = (LOCKMODE)mode;
-	entry->waiters[slot].wait_start = GetCurrentTimestamp();
+	/* spec-2.21: 0 placeholder — real timestamp 推 spec-2.22 wait-edge maintenance.
+	 * Standalone cluster_unit binaries don't link utils/timestamp.o; using a real
+	 * GetCurrentTimestamp() call broke L41 link surface on macOS arm64. */
+	entry->waiters[slot].wait_start = 0;
 	entry->generation++;
 	return CLUSTER_GRD_ENTRY_OK;
 }
