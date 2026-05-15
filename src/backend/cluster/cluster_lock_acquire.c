@@ -54,6 +54,7 @@
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_lock_acquire.h"
+#include "cluster/cluster_signal.h" /* cluster_ges_cancel_pending sig_atomic_t */
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/lwlock.h"
@@ -411,6 +412,24 @@ ClusterLockAcquireResult
 cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *req)
 {
 	ClusterLockAcquireResult r;
+
+	/*
+	 * spec-2.22 D8 — cancel flag check point (a):  seven-step top dispatch
+	 * loop entry.  PROCSIG_CLUSTER_GES_CANCEL handler set this sig_atomic_t
+	 * (L118-safe);if set,we are the deadlock victim selected by LMD
+	 * coordinator.  Reset flag,run S7 cleanup,return FAIL_DEADLOCK so
+	 * outer caller (lock.c) ereports 40P01 after cleanup.
+	 *
+	 *	HC14 + L118 — never ereport in ProcessInterrupts handler;cleanup
+	 *	→ S7 → outer caller ereport.  P-new-2 check point (b) = future
+	 *	`cluster_ges_send_request_and_wait` real wait loop推 spec-2.23.
+	 */
+	if (cluster_ges_cancel_pending)
+	{
+		cluster_ges_cancel_pending = false;
+		(void) cluster_lock_acquire_s7_cleanup(req);
+		return CLUSTER_LOCK_ACQUIRE_FAIL_DEADLOCK;
+	}
 
 	/* S1 entry — HC1 fail-closed。*/
 	r = cluster_lock_acquire_s1_entry(req);
