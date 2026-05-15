@@ -895,7 +895,8 @@ dump_lms(ReturnSetInfo *rsinfo)
 /*
  * dump_lmd -- spec-2.19 Sprint A Step 4 D10.
  *
- *	Emits 7 rows under category='lmd' (state string + 6 atomic counters)
+ *	Emits 16 rows under category='lmd' (spec-2.19 daemon state/counters +
+ *	spec-2.22 graph/Tarjan counters)
  *	corresponding to the LMD skeleton observability surface (HC2 4-state
  *	semantic split via state column + 6 counters per §0 Q8;
  *	add_edge / remove_edge / cycle_detected / victim_selected 分项 counter
