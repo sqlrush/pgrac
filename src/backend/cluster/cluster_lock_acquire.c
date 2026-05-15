@@ -55,6 +55,7 @@
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_signal.h" /* cluster_ges_cancel_pending sig_atomic_t */
+#include "access/xact.h"			 /* GetTopTransactionIdIfAny */
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/lwlock.h"
@@ -113,6 +114,26 @@ fill_request_holder(ClusterLockAcquireRequest *req)
 	req->holder.procno = (uint32)(MyProc ? MyProc->pgprocno : 0);
 	req->holder.cluster_epoch = cluster_epoch_get_current();
 	req->holder.request_id = request_id;
+}
+
+/*
+ * spec-2.22 D7 — build LMD vertex from caller request.
+ *
+ *	Identity 4-tuple = (node_id, procno, cluster_epoch, request_id).
+ *	Sort metadata = (xid, local_start_ts_ms).  xid may be Invalid for
+ *	advisory locks acquired before any write.
+ */
+static inline void
+fill_lmd_vertex_from_request(const ClusterLockAcquireRequest *req,
+							 ClusterLmdVertex *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->node_id = (int32) req->holder.node_id;
+	out->procno = req->holder.procno;
+	out->cluster_epoch = req->holder.cluster_epoch;
+	out->request_id = req->request_id;
+	out->xid = GetTopTransactionIdIfAny(); /* may be InvalidTransactionId */
+	out->local_start_ts_ms = (int64) req->caller_local_start_ts_ms;
 }
 
 
@@ -368,7 +389,14 @@ cluster_lock_release(const ClusterLockReleaseRequest *req)
 	cluster_grd_resid_encode(&req->locktag, &internal.resid);
 
 	(void)cluster_lock_acquire_s6_release(&internal);
-	cluster_lmd_cancel_wait_edge();
+
+	/* spec-2.22 D7:remove wait edge by waiter identity (real wire). */
+	{
+		ClusterLmdVertex v;
+		fill_lmd_vertex_from_request(&internal, &v);
+		cluster_lmd_cancel_wait_edge_real(&v);
+	}
+	cluster_lmd_cancel_wait_edge(); /* keep stub counter ++ for spec-2.19 compat */
 }
 
 
@@ -391,8 +419,16 @@ cluster_lock_acquire_s7_cleanup(const ClusterLockAcquireRequest *req)
 	/*
 	 * spec-2.21 D4 — S7 cleanup:cancel any outstanding reservation +
 	 * wait-edge stub.  No-op safe if no reservation present (idempotent).
+	 *
+	 * spec-2.22 D7 — also remove real wait edge from LMD graph by waiter
+	 * identity 4-tuple.
 	 */
 	(void)cluster_grd_cancel_reservation_by_id(&req->resid, &req->holder);
+	{
+		ClusterLmdVertex v;
+		fill_lmd_vertex_from_request(req, &v);
+		cluster_lmd_cancel_wait_edge_real(&v);
+	}
 	cluster_lmd_cancel_wait_edge();
 	return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 }

@@ -93,7 +93,8 @@ typedef enum ClusterLockAcquireResult {
 	CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT = 13,			 /* S4 53R70 cluster_ges_timeout */
 	CLUSTER_LOCK_ACQUIRE_FAIL_DEADLOCK = 14, /* S4 53R72 cluster_ges_deadlock(spec-2.22 真激活)*/
 	CLUSTER_LOCK_ACQUIRE_FAIL_CANCEL = 15,	 /* S4 53R73 cluster_ges_cancel_pending */
-	CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL = 16	 /* S5/S6/S7 internal error */
+	CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL = 16,	 /* S5/S6/S7 internal error */
+	CLUSTER_LOCK_ACQUIRE_FAIL_LMD_WAIT_EDGE_FULL = 17 /* spec-2.22 D7: LMD wait-edge cap exhausted; caller maps to 53R82 fail-closed */
 } ClusterLockAcquireResult;
 
 

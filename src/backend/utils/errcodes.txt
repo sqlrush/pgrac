@@ -525,6 +525,14 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 # cluster_ges_timeout pattern;L116 / L120 family).
 53R81    E    ERRCODE_CLUSTER_LMD_UNAVAILABLE                                cluster_lmd_unavailable
 
+# spec-2.22 D11 (HC12 fail-closed):  LMD wait-for graph edge table full.
+# Caller submitting wait edge sees false return from
+# cluster_lmd_submit_wait_edge_real() — wait edges invisible to PG-native
+# deadlock detector,so falling back to PG local deadlock_timeout would be
+# blind wait (severely disallowed,esp. once cluster.ges_request_timeout_ms
+# = -1 spec-2.26 ships).  Caller走 S7 cleanup + ereport(53R82).
+53R82    E    ERRCODE_CLUSTER_LMD_WAIT_EDGE_FULL                             cluster_lmd_wait_edge_full
+
 Section: Class 54 - Program Limit Exceeded
 
 # this is for wired-in limits, not resource exhaustion problems (class borrowed from DB2)

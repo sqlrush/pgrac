@@ -1012,6 +1012,14 @@ LockAcquireExtended(const LOCKTAG *locktag,
 						(errcode(ERRCODE_T_R_DEADLOCK_DETECTED),
 						 errmsg("cluster deadlock pending detection"),
 						 errhint("Real cross-node deadlock detection lands in spec-2.22 (LMD Tarjan).")));
+			case CLUSTER_LOCK_ACQUIRE_FAIL_LMD_WAIT_EDGE_FULL:
+				/* spec-2.22 D11 — HC12 fail-closed wait edge cap. */
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_LMD_WAIT_EDGE_FULL),
+						 errmsg("cluster LMD wait edge table full"),
+						 errhint("Increase cluster.lmd_max_wait_edges or reduce concurrency. "
+								 "Fallback to PG local deadlock_timeout is severely disallowed "
+								 "(spec-2.22 HC12) — cluster wait edges invisible to PG-native detector.")));
 			case CLUSTER_LOCK_ACQUIRE_FAIL_CANCEL:
 			case CLUSTER_LOCK_ACQUIRE_FAIL_GRD_NOT_READY:
 			case CLUSTER_LOCK_ACQUIRE_FAIL_RESERVATION_FULL:
