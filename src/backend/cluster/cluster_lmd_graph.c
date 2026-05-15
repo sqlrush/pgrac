@@ -120,7 +120,8 @@ cluster_lmd_graph_shmem_size(void)
 void
 cluster_lmd_graph_shmem_request(void)
 {
-	RequestNamedLWLockTranche("ClusterLmdGraph", 1);
+	/* spec-2.22 D5:uses built-in tranche LWTRANCHE_CLUSTER_LMD_GRAPH,
+	 * no named tranche needed (mirror spec-2.19 cluster_lmd pattern). */
 }
 
 void
@@ -139,9 +140,7 @@ cluster_lmd_graph_shmem_init(void)
 		"pgrac cluster lmd graph", MAXALIGN(sizeof(ClusterLmdGraphShared)), &found);
 
 	if (!IsUnderPostmaster) {
-		LWLockPadded *padded = GetNamedLWLockTranche("ClusterLmdGraph");
-
-		LWLockInitialize(&cluster_lmd_graph_state->lwlock, padded[0].lock.tranche);
+		LWLockInitialize(&cluster_lmd_graph_state->lwlock, LWTRANCHE_CLUSTER_LMD_GRAPH);
 		pg_atomic_init_u64(&cluster_lmd_graph_state->generation, 1);
 		pg_atomic_init_u64(&cluster_lmd_graph_state->edge_count, 0);
 		pg_atomic_init_u64(&cluster_lmd_graph_state->wait_edge_full_count, 0);

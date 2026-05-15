@@ -279,6 +279,13 @@ typedef enum BuiltinTrancheIds {
 	 * for HC4 exact-predicate readiness check on the caller-side
 	 * ownership gate (cluster_lmd_is_ready). */
 	LWTRANCHE_CLUSTER_LMD,
+	/* PGRAC (spec-2.22 D5): ClusterLmdGraphShared lwlock guards the
+	 * wait-for graph hash table (waiter/blocker edges) + atomic
+	 * generation counter.  Separate tranche from CLUSTER_LMD because
+	 * the graph subsystem has a different contention profile (high
+	 * frequency add/remove during cluster lock acquire/release vs
+	 * low-frequency daemon-state mutations under LMD lwlock). */
+	LWTRANCHE_CLUSTER_LMD_GRAPH,
 #endif
 	LWTRANCHE_FIRST_USER_DEFINED
 } BuiltinTrancheIds;

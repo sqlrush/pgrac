@@ -543,6 +543,8 @@ cluster_request_shmem(void)
 	 * without re-triggering RequestNamedLWLockTranche.
 	 */
 	cluster_grd_request_lwlocks();
+	/* spec-2.22 D5:LMD wait-for graph named LWLock tranche. */
+	cluster_lmd_graph_shmem_request();
 }
 
 /*
