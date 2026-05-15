@@ -265,6 +265,18 @@ bool cluster_lock_acquire_cluster_path = true;
  */
 bool cluster_local_fast_path_enabled = true;
 
+/*
+ * spec-2.22 D9:cluster.lmd_max_wait_edges cap.  Default 1024.
+ * PGC_POSTMASTER — postmaster restart required to resize HTAB.
+ */
+int cluster_lmd_max_wait_edges = 1024;
+
+/*
+ * spec-2.22 D9:cluster.lmd_scan_interval_ms scan loop period.
+ * Default 1000ms.  PGC_SIGHUP — runtime tunable.
+ */
+int cluster_lmd_scan_interval_ms = 1000;
+
 
 /*
  * Mapping from the cluster.interconnect_tier GUC enum string to the
@@ -1142,4 +1154,25 @@ cluster_init_guc(void)
 										  "testing.  PGC_SIGHUP."),
 							 &cluster_local_fast_path_enabled, true, PGC_SIGHUP, 0, NULL, NULL,
 							 NULL);
+
+	/* spec-2.22 D9:LMD wait-edge cap GUC. */
+	DefineCustomIntVariable("cluster.lmd_max_wait_edges",
+							gettext_noop("Maximum LMD wait-for graph edges."),
+							gettext_noop("Cap for spec-2.22 LMD wait-for graph.  Overflow is "
+										 "fail-closed (HC12): submit returns false; caller "
+										 "ereports ERRCODE_CLUSTER_LMD_WAIT_EDGE_FULL (53R82).  "
+										 "Severely disallowed to fall back to PG local "
+										 "deadlock_timeout because cluster wait edges are "
+										 "invisible to PG-native detector."),
+							&cluster_lmd_max_wait_edges, 1024, 64, 65536,
+							PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	/* spec-2.22 D9:LMD scan loop period GUC. */
+	DefineCustomIntVariable("cluster.lmd_scan_interval_ms",
+							gettext_noop("LMD Tarjan scan loop period (ms)."),
+							gettext_noop("LmdMain Tarjan scan period.  Lower = faster deadlock "
+										 "detection at higher CPU.  CV wake on edge submission "
+										 "also triggers scan out-of-band.  PGC_SIGHUP."),
+							&cluster_lmd_scan_interval_ms, 1000, 50, 60000,
+							PGC_SIGHUP, 0, NULL, NULL, NULL);
 }

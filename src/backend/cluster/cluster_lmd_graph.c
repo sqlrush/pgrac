@@ -1,0 +1,368 @@
+/*-------------------------------------------------------------------------
+ *
+ * cluster_lmd_graph.c
+ *	  pgrac LMD wait-for graph — hash table of wait edges + atomic
+ *	  generation + snapshot copy under shard-style LWLock.
+ *
+ *	  spec-2.22 D4 / D5:本地 wait-for graph state lives in a dedicated
+ *	  shmem region "pgrac cluster lmd graph" (separate from spec-2.19
+ *	  ClusterLmdShmem daemon-state region, per L98 ownership).
+ *
+ *	  Vertex identity is the 4-tuple (node_id, procno, cluster_epoch,
+ *	  request_id) per HC13.  HTAB internally indexes by
+ *	  (node_id, procno, request_id) — a 16-byte slim key — but exposed
+ *	  semantics walk full 40-byte vertex.  Sort metadata (xid,
+ *	  local_start_ts_ms) is opaque to the graph layer;Tarjan picks
+ *	  victims using sort metadata after snapshot copy.
+ *
+ *	  Cap surface:cluster.lmd_max_wait_edges GUC (default 1024).
+ *	  Overflow fail-closed per HC12 (P1.2) — submit returns false;
+ *	  caller maps to 53R82 ERRCODE_CLUSTER_LMD_WAIT_EDGE_FULL.
+ *
+ *	  Generation:atomic uint64, bumped under shmem->lwlock on every
+ *	  add/remove. Snapshot copy读 generation_at_snapshot 给 Tarjan +
+ *	  revalidate fence (HC14 A3).
+ *
+ *
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2026, pgrac contributors
+ *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
+ * IDENTIFICATION
+ *	  src/backend/cluster/cluster_lmd_graph.c
+ *
+ * NOTES
+ *	  This is a pgrac-original file.  Compiled only in --enable-cluster
+ *	  builds.
+ *	  Spec: spec-2.22-lmd-tarjan-cross-node-deadlock.md (FROZEN v0.3).
+ *
+ *-------------------------------------------------------------------------
+ */
+#include "postgres.h"
+
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_lmd.h"
+#include "cluster/cluster_shmem.h"
+#include "miscadmin.h"
+#include "port/atomics.h"
+#include "storage/ipc.h"
+#include "storage/lwlock.h"
+#include "storage/shmem.h"
+#include "utils/hsearch.h"
+
+
+/* ============================================================
+ * Slim HTAB key — 16 bytes.  Full vertex identity (40 bytes) stored in
+ * the entry payload so callers always see complete identity (HC13).
+ * ============================================================ */
+
+typedef struct LmdEdgeKey
+{
+	int32 node_id;
+	uint32 procno;
+	uint64 request_id;
+} LmdEdgeKey;
+
+StaticAssertDecl(sizeof(LmdEdgeKey) == 16, "LmdEdgeKey HTAB key ABI 16-byte lock");
+
+typedef struct LmdEdgeEntry
+{
+	LmdEdgeKey key; /* HTAB key — must be first field */
+	ClusterLmdWaitEdge edge;
+} LmdEdgeEntry;
+
+
+/* ============================================================
+ * Shared state — region "pgrac cluster lmd graph".
+ * ============================================================ */
+
+typedef struct ClusterLmdGraphShared
+{
+	LWLock lwlock;					 /* LW_EXCLUSIVE for add/remove/snapshot;readers also exclusive (write generation)*/
+	pg_atomic_uint64 generation;	 /* monotonic; bumped on add/remove */
+	pg_atomic_uint64 edge_count;	 /* current edge count (cached) */
+	pg_atomic_uint64 wait_edge_full_count;
+	pg_atomic_uint64 inject_call_count;
+	int max_edges;					 /* snapshot of cluster.lmd_max_wait_edges at init */
+} ClusterLmdGraphShared;
+
+static ClusterLmdGraphShared *cluster_lmd_graph_state = NULL;
+static HTAB *cluster_lmd_graph_htab = NULL;
+
+
+/* ============================================================
+ * Forward declarations.
+ * ============================================================ */
+
+static void make_key(const ClusterLmdVertex *waiter, LmdEdgeKey *out);
+
+
+/* ============================================================
+ * Shmem region request / init / register.
+ * ============================================================ */
+
+Size
+cluster_lmd_graph_shmem_size(void)
+{
+	Size sz = MAXALIGN(sizeof(ClusterLmdGraphShared));
+	int max_edges = cluster_lmd_max_wait_edges;
+
+	if (max_edges < 64)
+		max_edges = 64;
+	if (max_edges > 65536)
+		max_edges = 65536;
+
+	/* HTAB sizing per PG hash_estimate_size pattern. */
+	sz = add_size(sz, hash_estimate_size((Size) max_edges, sizeof(LmdEdgeEntry)));
+	return sz;
+}
+
+void
+cluster_lmd_graph_shmem_request(void)
+{
+	RequestNamedLWLockTranche("ClusterLmdGraph", 1);
+}
+
+void
+cluster_lmd_graph_shmem_init(void)
+{
+	bool found;
+	HASHCTL hctl;
+	int max_edges = cluster_lmd_max_wait_edges;
+
+	if (max_edges < 64)
+		max_edges = 64;
+	if (max_edges > 65536)
+		max_edges = 65536;
+
+	cluster_lmd_graph_state = (ClusterLmdGraphShared *)
+		ShmemInitStruct("pgrac cluster lmd graph",
+						MAXALIGN(sizeof(ClusterLmdGraphShared)), &found);
+
+	if (!IsUnderPostmaster)
+	{
+		LWLockPadded *padded = GetNamedLWLockTranche("ClusterLmdGraph");
+
+		LWLockInitialize(&cluster_lmd_graph_state->lwlock, padded[0].lock.tranche);
+		pg_atomic_init_u64(&cluster_lmd_graph_state->generation, 1);
+		pg_atomic_init_u64(&cluster_lmd_graph_state->edge_count, 0);
+		pg_atomic_init_u64(&cluster_lmd_graph_state->wait_edge_full_count, 0);
+		pg_atomic_init_u64(&cluster_lmd_graph_state->inject_call_count, 0);
+		cluster_lmd_graph_state->max_edges = max_edges;
+	}
+
+	MemSet(&hctl, 0, sizeof(hctl));
+	hctl.keysize = sizeof(LmdEdgeKey);
+	hctl.entrysize = sizeof(LmdEdgeEntry);
+	cluster_lmd_graph_htab = ShmemInitHash("pgrac cluster lmd graph htab",
+										   max_edges, max_edges, &hctl,
+										   HASH_ELEM | HASH_BLOBS);
+}
+
+
+/* ============================================================
+ * Mutator API.
+ * ============================================================ */
+
+static void
+make_key(const ClusterLmdVertex *v, LmdEdgeKey *out)
+{
+	memset(out, 0, sizeof(*out)); /* clear padding for HTAB binary compare */
+	out->node_id = v->node_id;
+	out->procno = v->procno;
+	out->request_id = v->request_id;
+}
+
+bool
+cluster_lmd_graph_add_edge(const ClusterLmdWaitEdge *edge)
+{
+	LmdEdgeKey key;
+	LmdEdgeEntry *entry;
+	bool found;
+	uint64 cur_count;
+
+	Assert(edge != NULL);
+	if (cluster_lmd_graph_state == NULL || cluster_lmd_graph_htab == NULL)
+		return false;
+
+	/* Reject self-cycle (defensive — caller must check before).  See
+	 * TAP 109 L3 scenario. */
+	if (edge->waiter.node_id == edge->blocker.node_id &&
+		edge->waiter.procno == edge->blocker.procno &&
+		edge->waiter.request_id == edge->blocker.request_id)
+		return false;
+
+	make_key(&edge->waiter, &key);
+
+	LWLockAcquire(&cluster_lmd_graph_state->lwlock, LW_EXCLUSIVE);
+
+	cur_count = pg_atomic_read_u64(&cluster_lmd_graph_state->edge_count);
+	if (cur_count >= (uint64) cluster_lmd_graph_state->max_edges)
+	{
+		pg_atomic_fetch_add_u64(&cluster_lmd_graph_state->wait_edge_full_count, 1);
+		LWLockRelease(&cluster_lmd_graph_state->lwlock);
+		return false; /* HC12 fail-closed */
+	}
+
+	entry = (LmdEdgeEntry *) hash_search(cluster_lmd_graph_htab, &key,
+										 HASH_ENTER_NULL, &found);
+	if (entry == NULL)
+	{
+		pg_atomic_fetch_add_u64(&cluster_lmd_graph_state->wait_edge_full_count, 1);
+		LWLockRelease(&cluster_lmd_graph_state->lwlock);
+		return false; /* HTAB exhausted */
+	}
+	if (!found)
+		pg_atomic_fetch_add_u64(&cluster_lmd_graph_state->edge_count, 1);
+	entry->edge = *edge;
+	entry->edge.graph_generation =
+		pg_atomic_fetch_add_u64(&cluster_lmd_graph_state->generation, 1);
+
+	LWLockRelease(&cluster_lmd_graph_state->lwlock);
+	return true;
+}
+
+bool
+cluster_lmd_graph_remove_edge_by_waiter(const ClusterLmdVertex *waiter)
+{
+	LmdEdgeKey key;
+	bool found;
+
+	Assert(waiter != NULL);
+	if (cluster_lmd_graph_state == NULL || cluster_lmd_graph_htab == NULL)
+		return false;
+
+	make_key(waiter, &key);
+
+	LWLockAcquire(&cluster_lmd_graph_state->lwlock, LW_EXCLUSIVE);
+	(void) hash_search(cluster_lmd_graph_htab, &key, HASH_REMOVE, &found);
+	if (found)
+	{
+		pg_atomic_fetch_sub_u64(&cluster_lmd_graph_state->edge_count, 1);
+		pg_atomic_fetch_add_u64(&cluster_lmd_graph_state->generation, 1);
+	}
+	LWLockRelease(&cluster_lmd_graph_state->lwlock);
+	return found;
+}
+
+int
+cluster_lmd_graph_snapshot_copy(ClusterLmdWaitEdge *out_buf, int max_edges,
+								uint64 *out_gen_at_snapshot)
+{
+	HASH_SEQ_STATUS scan;
+	LmdEdgeEntry *e;
+	int copied = 0;
+
+	if (cluster_lmd_graph_state == NULL || cluster_lmd_graph_htab == NULL)
+	{
+		if (out_gen_at_snapshot)
+			*out_gen_at_snapshot = 0;
+		return 0;
+	}
+
+	LWLockAcquire(&cluster_lmd_graph_state->lwlock, LW_SHARED);
+	if (out_gen_at_snapshot)
+		*out_gen_at_snapshot = pg_atomic_read_u64(&cluster_lmd_graph_state->generation);
+	hash_seq_init(&scan, cluster_lmd_graph_htab);
+	while ((e = (LmdEdgeEntry *) hash_seq_search(&scan)) != NULL)
+	{
+		if (copied >= max_edges)
+		{
+			hash_seq_term(&scan);
+			break;
+		}
+		out_buf[copied++] = e->edge;
+	}
+	LWLockRelease(&cluster_lmd_graph_state->lwlock);
+	return copied;
+}
+
+
+/* ============================================================
+ * Accessors + counter helpers.
+ * ============================================================ */
+
+uint64
+cluster_lmd_graph_generation_get(void)
+{
+	if (cluster_lmd_graph_state == NULL)
+		return 0;
+	return pg_atomic_read_u64(&cluster_lmd_graph_state->generation);
+}
+
+uint64
+cluster_lmd_wait_edge_count_get(void)
+{
+	if (cluster_lmd_graph_state == NULL)
+		return 0;
+	return pg_atomic_read_u64(&cluster_lmd_graph_state->edge_count);
+}
+
+uint64
+cluster_lmd_wait_edge_full_count_get(void)
+{
+	if (cluster_lmd_graph_state == NULL)
+		return 0;
+	return pg_atomic_read_u64(&cluster_lmd_graph_state->wait_edge_full_count);
+}
+
+uint64
+cluster_lmd_inject_call_count_get(void)
+{
+	if (cluster_lmd_graph_state == NULL)
+		return 0;
+	return pg_atomic_read_u64(&cluster_lmd_graph_state->inject_call_count);
+}
+
+void
+cluster_lmd_inject_call_count_inc(void)
+{
+	if (cluster_lmd_graph_state != NULL)
+		pg_atomic_fetch_add_u64(&cluster_lmd_graph_state->inject_call_count, 1);
+}
+
+
+/* ============================================================
+ * submit/cancel real wire — top-level entry from S4/S5/S7.
+ * ============================================================ */
+
+bool
+cluster_lmd_submit_wait_edge_real(const ClusterLmdVertex *waiter,
+								  const ClusterLmdVertex *blocker,
+								  uint64 request_id)
+{
+	ClusterLmdWaitEdge edge;
+
+	Assert(waiter != NULL && blocker != NULL);
+
+	memset(&edge, 0, sizeof(edge));
+	edge.waiter = *waiter;
+	edge.blocker = *blocker;
+	edge.request_id = request_id;
+	/* graph_generation 在 add_edge 内 set */
+
+	return cluster_lmd_graph_add_edge(&edge);
+}
+
+void
+cluster_lmd_cancel_wait_edge_real(const ClusterLmdVertex *waiter)
+{
+	if (waiter == NULL)
+		return;
+	(void) cluster_lmd_graph_remove_edge_by_waiter(waiter);
+}
+
+/* D16 — test-only injection. */
+bool
+cluster_lmd_inject_wait_edge(const ClusterLmdVertex *waiter,
+							 const ClusterLmdVertex *blocker)
+{
+	bool ok;
+
+	Assert(waiter != NULL && blocker != NULL);
+	cluster_lmd_inject_call_count_inc();
+	ok = cluster_lmd_submit_wait_edge_real(waiter, blocker, waiter->request_id);
+	return ok;
+}

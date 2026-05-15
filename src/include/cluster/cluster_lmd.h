@@ -385,6 +385,20 @@ extern uint64 cluster_lmd_inject_call_count_get(void);
 extern bool cluster_lmd_inject_wait_edge(const ClusterLmdVertex *waiter,
 										 const ClusterLmdVertex *blocker);
 
+extern void cluster_lmd_inject_call_count_inc(void);
+
+/* spec-2.22 D4/D5 — graph shmem region API (registered via spec-1.3 registry). */
+extern Size cluster_lmd_graph_shmem_size(void);
+extern void cluster_lmd_graph_shmem_request(void);
+extern void cluster_lmd_graph_shmem_init(void);
+
+/* Graph low-level mutators (used by cluster_lmd_tarjan.c + D16 SRF). */
+extern bool cluster_lmd_graph_add_edge(const ClusterLmdWaitEdge *edge);
+extern bool cluster_lmd_graph_remove_edge_by_waiter(const ClusterLmdVertex *waiter);
+extern int cluster_lmd_graph_snapshot_copy(ClusterLmdWaitEdge *out_buf,
+										   int max_edges,
+										   uint64 *out_gen_at_snapshot);
+
 /*
  * shmem region helpers — registered by cluster_init_shmem_module()
  * via the spec-1.3 region registry.

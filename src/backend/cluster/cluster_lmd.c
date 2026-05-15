@@ -138,6 +138,20 @@ static const ClusterShmemRegion cluster_lmd_region = {
 	.reserved_flags = 0,
 };
 
+/*
+ * spec-2.22 D5:LMD wait-for graph region descriptor.  Separate from
+ * cluster_lmd_region (L98 ownership — daemon-state vs graph-state are
+ * distinct subsystems with different LWLock contention profiles).
+ */
+static const ClusterShmemRegion cluster_lmd_graph_region = {
+	.name = "pgrac cluster lmd graph",
+	.size_fn = cluster_lmd_graph_shmem_size,
+	.init_fn = cluster_lmd_graph_shmem_init,
+	.lwlock_count = 1,
+	.owner_subsys = "spec-2.22 LMD graph",
+	.reserved_flags = 0,
+};
+
 
 /* ============================================================
  * State string mapping.
@@ -206,6 +220,8 @@ void
 cluster_lmd_shmem_register(void)
 {
 	cluster_shmem_register_region(&cluster_lmd_region);
+	/* spec-2.22 D5:also register the wait-for graph region. */
+	cluster_shmem_register_region(&cluster_lmd_graph_region);
 }
 
 ClusterLmdSharedState *

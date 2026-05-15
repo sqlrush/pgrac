@@ -450,5 +450,29 @@ extern bool cluster_lock_acquire_cluster_path;
  */
 extern bool cluster_local_fast_path_enabled;
 
+/*
+ * cluster.lmd_max_wait_edges (spec-2.22 D9).
+ *
+ *	context: PGC_POSTMASTER
+ *	default: 1024 (min 64, max 65536)
+ *
+ *	Cap on LMD wait-for graph edges.  Overflow → HC12 fail-closed
+ *	(submit returns false; caller ereport 53R82).  Severely禁止 fallback
+ *	PG local deadlock detector (blind wait across cluster).
+ */
+extern int cluster_lmd_max_wait_edges;
+
+/*
+ * cluster.lmd_scan_interval_ms (spec-2.22 D9).
+ *
+ *	context: PGC_SIGHUP
+ *	default: 1000 (min 50, max 60000)
+ *
+ *	LmdMain Tarjan scan period.  Lower = faster deadlock detection,
+ *	higher CPU.  CV wake on edge submission also triggers scan
+ *	out-of-band (Q3 — timer 是 safety net,CV 是 low-latency path).
+ */
+extern int cluster_lmd_scan_interval_ms;
+
 
 #endif /* CLUSTER_GUC_H */
