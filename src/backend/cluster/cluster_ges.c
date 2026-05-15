@@ -241,8 +241,7 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 		 * CV broadcast.  Real graph maintenance推 spec-2.20+ 同 spec ship
 		 * producer + consumer (L114 family).
 		 */
-		if (cluster_lmd_is_ready())
-		{
+		if (cluster_lmd_is_ready()) {
 			cluster_lmd_submit_wait_edge();
 			return;
 		}
