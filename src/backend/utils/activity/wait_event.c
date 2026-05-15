@@ -1297,6 +1297,9 @@ pgstat_get_wait_cluster_bgproc(WaitEventCluster w)
 	case WAIT_EVENT_CLUSTER_GES_S4_WAIT:
 		event_name = "ClusterGesS4Wait";
 		break;
+	case WAIT_EVENT_CLUSTER_LMD_PROBE:
+		event_name = "ClusterLmdProbe";
+		break;
 	default:
 		break;
 	}

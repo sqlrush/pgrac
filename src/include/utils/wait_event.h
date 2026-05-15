@@ -439,6 +439,12 @@ typedef enum {
 	 * Local-master fast path (A1) does NOT enter S4_WAIT (no remote IPC).
 	 */
 	WAIT_EVENT_CLUSTER_GES_S4_WAIT,
+	/*
+	 * spec-2.22 D10:LMD coordinator handler processing DEADLOCK_PROBE
+	 * + snapshot_copy + REPORT encode.  Production cross-node broadcast
+	 * 推 spec-2.23 BAST 配套;本 spec scope 仅 handler dispatch + payload.
+	 */
+	WAIT_EVENT_CLUSTER_LMD_PROBE,
 } WaitEventCluster;
 
 

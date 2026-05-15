@@ -623,6 +623,17 @@ LmdMain(void)
 		current_submission_count
 			= pg_atomic_read_u64(&cluster_lmd_state->lmd_edge_submission_count);
 
+		/*
+		 * spec-2.22 D2:invoke Tarjan local scan.  We always run scan on
+		 * wake (CV broadcast) AND on periodic timeout — the scan itself
+		 * is cheap when graph is empty (early return), so no need to
+		 * differentiate paths.
+		 */
+		if (lmd_get_state() == CLUSTER_LMD_READY)
+		{
+			cluster_lmd_tarjan_run_local_scan();
+		}
+
 		if (current_submission_count > seen_submission_count) {
 			pg_atomic_fetch_add_u64(&cluster_lmd_state->lmd_wake_count, 1);
 			seen_submission_count = current_submission_count;
@@ -630,8 +641,10 @@ LmdMain(void)
 		}
 
 		pg_atomic_fetch_add_u64(&cluster_lmd_state->lmd_idle_count, 1);
+		/* spec-2.22 D9:scan interval GUC controls wake period. */
 		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-						LMD_IDLE_TIMEOUT_MS, WAIT_EVENT_CLUSTER_LMD_IDLE);
+						cluster_lmd_scan_interval_ms,
+						WAIT_EVENT_CLUSTER_LMD_SCAN);
 		ResetLatch(MyLatch);
 	}
 
