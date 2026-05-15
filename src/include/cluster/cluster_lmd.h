@@ -308,6 +308,83 @@ extern void cluster_lmd_submit_wait_edge(void);
  */
 extern void cluster_lmd_cancel_wait_edge(void);
 
+
+/* ============================================================
+ * spec-2.22 D1 — vertex identity + wait edge struct.
+ *
+ *	HC13 vertex identity = 4-tuple (node_id, procno, cluster_epoch,
+ *	request_id).  Sort metadata (xid, local_start_ts_ms) is victim-
+ *	selection only — xid may be InvalidTransactionId for advisory locks
+ *	acquired before any write, autovacuum, parallel workers, etc.
+ *
+ *	HTAB index 可优化 by (node_id, procno, request_id);snapshot/Tarjan
+ *	内部 vertex key 是完整 identity 4-tuple (P1.3 semantic).
+ * ============================================================ */
+
+typedef struct ClusterLmdVertex
+{
+	/* Identity 4-tuple (HC13). */
+	int32 node_id;
+	uint32 procno;
+	uint64 cluster_epoch;
+	uint64 request_id;
+
+	/* Sort metadata (A4 victim selection only;not part of identity). */
+	TransactionId xid;	   /* may be InvalidTransactionId — advisory lock OK */
+	int64 local_start_ts_ms;
+} ClusterLmdVertex;
+
+StaticAssertDecl(sizeof(ClusterLmdVertex) == 40,
+				 "ClusterLmdVertex ABI 40-byte lock (4+4+8+8 identity + 4+8 metadata + 4 pad)");
+
+typedef struct ClusterLmdWaitEdge
+{
+	ClusterLmdVertex waiter;  /* this backend stuck waiting on S4 */
+	ClusterLmdVertex blocker; /* current holder waiter is blocked by */
+	uint64 graph_generation;  /* snapshot at add time — revalidate basis */
+	uint64 request_id;		  /* matches ClusterLockAcquireRequest.request_id */
+} ClusterLmdWaitEdge;
+
+StaticAssertDecl(sizeof(ClusterLmdWaitEdge) == 96,
+				 "ClusterLmdWaitEdge ABI 96-byte lock (40 + 40 + 8 + 8)");
+
+
+/*
+ * spec-2.22 D1 — submit/cancel real API.
+ *
+ *	submit_wait_edge_real:  false return = wait edge table full;
+ *	caller MUST go through S7 cleanup + ereport 53R82 (HC12 fail-closed;
+ *	severely禁止 fallback PG local deadlock detector).
+ */
+extern bool cluster_lmd_submit_wait_edge_real(const ClusterLmdVertex *waiter,
+											  const ClusterLmdVertex *blocker,
+											  uint64 request_id);
+
+extern void cluster_lmd_cancel_wait_edge_real(const ClusterLmdVertex *waiter);
+
+/*
+ * Manual SQL trigger for Tarjan scan (admin / TAP test hook).
+ *	Runs one local scan + revalidate cycle synchronously.
+ */
+extern void cluster_lmd_run_tarjan_scan_now(void);
+
+/* Graph generation accessor — bumped monotonically on add/remove. */
+extern uint64 cluster_lmd_graph_generation_get(void);
+
+/* Counter accessors — populated by D4 graph + D3 tarjan. */
+extern uint64 cluster_lmd_wait_edge_count_get(void);
+extern uint64 cluster_lmd_wait_edge_full_count_get(void);
+extern uint64 cluster_lmd_tarjan_scan_count_get(void);
+extern uint64 cluster_lmd_cycle_detected_count_get(void);
+extern uint64 cluster_lmd_victim_cancel_sent_count_get(void);
+extern uint64 cluster_lmd_revalidate_fail_count_get(void);
+extern uint64 cluster_lmd_cross_node_victim_pending_count_get(void);
+extern uint64 cluster_lmd_inject_call_count_get(void);
+
+/* D16 test-only injection helper (also surfaced via SQL SRF). */
+extern bool cluster_lmd_inject_wait_edge(const ClusterLmdVertex *waiter,
+										 const ClusterLmdVertex *blocker);
+
 /*
  * shmem region helpers — registered by cluster_init_shmem_module()
  * via the spec-1.3 region registry.
