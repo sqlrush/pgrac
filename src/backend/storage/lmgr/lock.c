@@ -823,6 +823,15 @@ LockAcquireExtended(const LOCKTAG *locktag,
 	LWLock	   *partitionLock;
 	bool		found_conflict;
 	bool		log_lock = false;
+	/*
+	 * PGRAC: cluster gate post-native S5 promote bookkeeping.  Set when the
+	 * cluster gate returned NEED_PG_NATIVE_LOCK; consumed at LOCKACQUIRE_OK
+	 * exit paths.  Spec-2.21 D2 / D4 P2.3.
+	 */
+	bool		cluster_need_s5 = false;
+	ClusterLockAcquireRequest cluster_req;
+
+	memset(&cluster_req, 0, sizeof(cluster_req));
 
 	if (lockmethodid <= 0 || lockmethodid >= lengthof(LockMethods))
 		elog(ERROR, "unrecognized lock method: %d", lockmethodid);
@@ -937,32 +946,30 @@ LockAcquireExtended(const LOCKTAG *locktag,
 		cluster_lock_acquire_cluster_path &&
 		cluster_lock_should_globalize(locktag, lockmode, sessionLock))
 	{
-		ClusterLockAcquireRequest cluster_req;
 		ClusterLockAcquireResult cluster_r;
 
-		memset(&cluster_req, 0, sizeof(cluster_req));
 		cluster_req.locktag = *locktag;
 		cluster_req.lockmode = lockmode;
 		cluster_req.lockmethod_id = lockmethodid;
 		cluster_req.dontwait = dontWait;
 		cluster_req.sessionLock = sessionLock;
 		cluster_grd_resid_encode(locktag, &cluster_req.resid);
-		/* holder identity + request_id filled by S3 reservation (D4 Step 3). */
 
 		cluster_r = cluster_lock_acquire_seven_step(&cluster_req);
 
 		switch (cluster_r)
 		{
 			case CLUSTER_LOCK_ACQUIRE_OK_NATIVE:
+				/* cluster path disabled — proceed to PG-native only. */
+				break;
 			case CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK:
-				/*
-				 * Step 5 wires post-PG-native S5 promote at success exit;
-				 * for Step 2 fall through to native acquire only.
-				 */
+				/* S5 promote must run after PG-native acquire succeeds. */
+				cluster_need_s5 = true;
 				break;
 			case CLUSTER_LOCK_ACQUIRE_OK_GRANTED:
 			case CLUSTER_LOCK_ACQUIRE_OK_CONVERTED:
-				/* Until D4 returns NEED_PG_NATIVE_LOCK, treat as fall-through. */
+				/* Legacy paths: cluster already granted — proceed as native. */
+				cluster_need_s5 = true;
 				break;
 			case CLUSTER_LOCK_ACQUIRE_PENDING:
 				ereport(ERROR,
@@ -1061,6 +1068,22 @@ LockAcquireExtended(const LOCKTAG *locktag,
 			locallock->lock = NULL;
 			locallock->proclock = NULL;
 			GrantLockLocal(locallock, owner);
+			/* PGRAC: post-native S5 promote — spec-2.21 D2 / D4 P2.3. */
+			if (cluster_need_s5)
+			{
+				ClusterLockAcquireResult sr = cluster_lock_acquire_s5_promote(&cluster_req);
+				if (sr != CLUSTER_LOCK_ACQUIRE_OK_GRANTED &&
+					sr != CLUSTER_LOCK_ACQUIRE_OK_CONVERTED)
+				{
+					ereport(ERROR,
+							(errcode(ERRCODE_INTERNAL_ERROR),
+							 errmsg("cluster S5 promote failed (result=%d)", (int) sr)));
+				}
+				locallock->cluster_registered = true;
+				locallock->cluster_request_id = cluster_req.request_id;
+				memcpy(locallock->cluster_holder_raw, &cluster_req.holder,
+					   sizeof(locallock->cluster_holder_raw));
+			}
 			return LOCKACQUIRE_OK;
 		}
 	}
@@ -1261,6 +1284,22 @@ LockAcquireExtended(const LOCKTAG *locktag,
 							   locktag->locktag_field2);
 	}
 
+	/* PGRAC: post-native S5 promote — spec-2.21 D2 / D4 P2.3. */
+	if (cluster_need_s5)
+	{
+		ClusterLockAcquireResult sr = cluster_lock_acquire_s5_promote(&cluster_req);
+		if (sr != CLUSTER_LOCK_ACQUIRE_OK_GRANTED &&
+			sr != CLUSTER_LOCK_ACQUIRE_OK_CONVERTED)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("cluster S5 promote failed (result=%d)", (int) sr)));
+		}
+		locallock->cluster_registered = true;
+		locallock->cluster_request_id = cluster_req.request_id;
+		memcpy(locallock->cluster_holder_raw, &cluster_req.holder,
+			   sizeof(locallock->cluster_holder_raw));
+	}
 	return LOCKACQUIRE_OK;
 }
 
@@ -2144,6 +2183,33 @@ LockRelease(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 		return true;
 
 	/*
+	 * PGRAC: cluster release hook — exactly-once exit per HC9.
+	 *
+	 * nLocks just went from 1 -> 0 in this backend.  If the LOCALLOCK was
+	 * cluster_registered, dispatch S6 release + wait-edge cancel stub via
+	 * cluster_lock_release().  We clear cluster_registered before the call
+	 * is impossible since LOCALLOCK is about to be discarded after PG-
+	 * native release; the false-positive guard is the cluster_registered
+	 * flag itself (set only by S5 promote success).
+	 *
+	 * Spec: spec-2.21-pg-lockacquire-integration-2node-smoke.md (D2)
+	 */
+	if (locallock->cluster_registered)
+	{
+		ClusterLockReleaseRequest crel;
+
+		memset(&crel, 0, sizeof(crel));
+		crel.locktag = *locktag;
+		crel.lockmode = lockmode;
+		crel.sessionLock = sessionLock;
+		crel.request_id = locallock->cluster_request_id;
+		memcpy(&crel.holder, locallock->cluster_holder_raw, sizeof(crel.holder));
+		crel.cluster_registered = true;
+		cluster_lock_release(&crel);
+		locallock->cluster_registered = false;
+	}
+
+	/*
 	 * At this point we can no longer suppose we are clear of invalidation
 	 * messages related to this lock.  Although we'll delete the LOCALLOCK
 	 * object before any intentional return from this routine, it seems worth
@@ -2342,6 +2408,26 @@ LockReleaseAll(LOCKMETHODID lockmethodid, bool allLocks)
 			}
 			else
 				locallock->numLockOwners = 0;
+		}
+
+		/*
+		 * PGRAC: cluster release hook for LockReleaseAll path (HC9 grant-
+		 * release 对称 — events that get here are about to release all of
+		 * this LOCALLOCK).  spec-2.21 D2.
+		 */
+		if (locallock->cluster_registered)
+		{
+			ClusterLockReleaseRequest crel;
+
+			memset(&crel, 0, sizeof(crel));
+			crel.locktag = locallock->tag.lock;
+			crel.lockmode = locallock->tag.mode;
+			crel.sessionLock = false; /* LockReleaseAll path is xact-level */
+			crel.request_id = locallock->cluster_request_id;
+			memcpy(&crel.holder, locallock->cluster_holder_raw, sizeof(crel.holder));
+			crel.cluster_registered = true;
+			cluster_lock_release(&crel);
+			locallock->cluster_registered = false;
 		}
 
 #ifdef USE_ASSERT_CHECKING

@@ -279,6 +279,7 @@ StaticAssertDecl(sizeof(GesReplyPayload) == 48, "GesReplyPayload wire ABI 48-byt
  *	真 send/reply pipeline ship 仍 LMS local-handle(D8 minimal grant);
  *	远端 master pipeline 推 spec-2.23 BAST 配套 ship。
  */
+struct ClusterResId;
 extern uint32 cluster_ges_send_request_and_wait(const struct ClusterResId *resid,
 												uint32 lockmode,
 												const struct ClusterGrdHolderId *holder,

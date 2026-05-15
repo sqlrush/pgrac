@@ -387,3 +387,47 @@ cluster_ges_reply_defer_count(void)
 	Assert(cluster_ges_state != NULL);
 	return pg_atomic_read_u64(&cluster_ges_state->reply_defer_count);
 }
+
+
+/* ============================================================
+ * spec-2.21 D8 — GES request/release send-and-wait stubs.
+ *
+ *	Minimal real implementation for the ADVISORY MVP single-node case:
+ *	in spec-2.21 the LMS worker handles the request locally and grants
+ *	immediately (no real GES_REQUEST wire send to remote master).  When
+ *	spec-2.23 BAST 配套 ships the cross-node send/reply pipeline, these
+ *	helpers will:
+ *	  - cluster_ges_send_request_and_wait:enqueue GesRequestPayload + wait
+ *	    on cluster_ges_reply cv;return reject_reason from GesReplyPayload.
+ *	  - cluster_ges_send_release_and_wait:enqueue GES_RELEASE + bounded
+ *	    ACK wait.
+ *
+ *	For now both call the local LMS handler stub directly and inc deferred
+ *	counters so dump_ges remains observable.
+ * ============================================================ */
+
+uint32
+cluster_ges_send_request_and_wait(const struct ClusterResId *resid pg_attribute_unused(),
+								  uint32 lockmode pg_attribute_unused(),
+								  const struct ClusterGrdHolderId *holder pg_attribute_unused(),
+								  uint64 request_id pg_attribute_unused(),
+								  int timeout_ms pg_attribute_unused())
+{
+	/*
+	 * MVP: single-node — LMS local handler grants immediately; cross-node
+	 * pipeline ship 推 spec-2.23 BAST 配套.
+	 */
+	if (cluster_ges_state != NULL)
+		pg_atomic_fetch_add_u64(&cluster_ges_state->request_defer_count, 1);
+	return 0; /* GES_REJECT_NONE = grant OK */
+}
+
+uint32
+cluster_ges_send_release_and_wait(const struct ClusterResId *resid pg_attribute_unused(),
+								  const struct ClusterGrdHolderId *holder pg_attribute_unused(),
+								  uint64 request_id pg_attribute_unused())
+{
+	if (cluster_ges_state != NULL)
+		pg_atomic_fetch_add_u64(&cluster_ges_state->reply_defer_count, 1);
+	return 0;
+}

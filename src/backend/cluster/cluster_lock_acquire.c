@@ -47,12 +47,18 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_ges.h"
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_lock_acquire.h"
+#include "miscadmin.h"
 #include "port/atomics.h"
+#include "storage/lwlock.h"
+#include "storage/proc.h"
+#include "storage/spin.h"
+#include "utils/timestamp.h"
 
 
 /*
@@ -62,7 +68,12 @@
  * 不在 dump_lms 暴露)。
  */
 static pg_atomic_uint64 stub_s1_entry_count;
+static pg_atomic_uint64 stub_s3_reservation_count;
+static pg_atomic_uint64 stub_s4_remote_count;
+static pg_atomic_uint64 stub_s5_promote_count;
+static pg_atomic_uint64 stub_s6_release_count;
 static pg_atomic_uint64 stub_s7_cleanup_count;
+static pg_atomic_uint64 stub_local_fast_path_count;
 static bool stub_counter_initialized = false;
 
 static inline void
@@ -70,9 +81,28 @@ ensure_counter_initialized(void)
 {
 	if (!stub_counter_initialized) {
 		pg_atomic_init_u64(&stub_s1_entry_count, 0);
+		pg_atomic_init_u64(&stub_s3_reservation_count, 0);
+		pg_atomic_init_u64(&stub_s4_remote_count, 0);
+		pg_atomic_init_u64(&stub_s5_promote_count, 0);
+		pg_atomic_init_u64(&stub_s6_release_count, 0);
 		pg_atomic_init_u64(&stub_s7_cleanup_count, 0);
+		pg_atomic_init_u64(&stub_local_fast_path_count, 0);
 		stub_counter_initialized = true;
 	}
+}
+
+/*
+ * spec-2.21 D4 — encode ClusterGrdHolderId into LOCALLOCK 24-byte raw image.
+ * Mirror: see lock.h LOCALLOCK.cluster_holder_raw definition.
+ */
+static inline void
+fill_request_holder(ClusterLockAcquireRequest *req)
+{
+	req->holder.node_id = (uint32) (MyProc ? MyProc->pgprocno : 0);
+	req->holder.procno = (uint32) (MyProc ? MyProc->pgprocno : 0);
+	req->holder.cluster_epoch = 0;	/* spec-2.26 wires real epoch */
+	req->holder.request_id = req->request_id ? req->request_id
+		: (uint64) GetCurrentTimestamp();
 }
 
 
@@ -161,19 +191,38 @@ cluster_lock_acquire_s2_identity(const ClusterLockAcquireRequest *req)
 ClusterLockAcquireResult
 cluster_lock_acquire_s3_partition_reservation(const ClusterLockAcquireRequest *req)
 {
+	ClusterLockAcquireRequest *mut;
+	ClusterGrdEntryResult er;
+	bool fast_path = false;
+	uint64 gen_snapshot = 0;
+	int32 self_node = (int32) (MyProc ? MyProc->pgprocno : 0);
+
+	ensure_counter_initialized();
+
 	if (req == NULL)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 
-	/*
-	 * S3 internal API(spec-2.20 v0.4 descoped):返回 PENDING signals
-	 * spec-2.21 hot path wire 时 caller-side 接 PG LockAcquire local
-	 * + S5 promote。
-	 *
-	 * Real S3.1-S3.6 sub-step sequence wire to cluster_grd_entry_*
-	 * mutator API(spec-2.16 ship caller-side 6-step state machine 待
-	 * spec-2.21 真激活 wire callsite)。
-	 */
-	return CLUSTER_LOCK_ACQUIRE_PENDING; /* dispatch to S4(if remote)or S5(if local fast path)*/
+	mut = (ClusterLockAcquireRequest *) req;
+	fill_request_holder(mut);
+
+	er = cluster_grd_try_reserve(&req->resid, &req->holder, (int) req->lockmode,
+								 self_node,
+								 cluster_local_fast_path_enabled ? &fast_path : NULL,
+								 &gen_snapshot);
+	if (er == CLUSTER_GRD_ENTRY_NOT_READY)
+		return CLUSTER_LOCK_ACQUIRE_FAIL_GRD_NOT_READY;
+	if (er != CLUSTER_GRD_ENTRY_OK)
+		return CLUSTER_LOCK_ACQUIRE_FAIL_RESERVATION_FULL;
+
+	mut->master_gen_snapshot = gen_snapshot;
+	pg_atomic_fetch_add_u64(&stub_s3_reservation_count, 1);
+
+	if (cluster_local_fast_path_enabled && fast_path)
+	{
+		pg_atomic_fetch_add_u64(&stub_local_fast_path_count, 1);
+		return CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK;
+	}
+	return CLUSTER_LOCK_ACQUIRE_OK_GRANTED; /* dispatch to S4 */
 }
 
 
@@ -191,17 +240,37 @@ cluster_lock_acquire_s3_partition_reservation(const ClusterLockAcquireRequest *r
 ClusterLockAcquireResult
 cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req)
 {
+	uint32 reject;
+
+	ensure_counter_initialized();
+
 	if (req == NULL)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 
-	/*
-	 * S4 internal API:返回 PENDING signals spec-2.21 hot path wire 时
-	 * caller-side 接 cluster_ges_request_send + WaitLatch GES_S4_WAIT。
-	 */
 	if (req->dontwait)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT; /* ConditionalLock semantic */
 
-	return CLUSTER_LOCK_ACQUIRE_PENDING;
+	pg_atomic_fetch_add_u64(&stub_s4_remote_count, 1);
+
+	/*
+	 * spec-2.21 D8 minimal real remote-master path.  Single-node MVP:
+	 * helper currently returns 0 (GRANT) for ADVISORY — spec-2.23 BAST
+	 * 配套 wires real send/reply pipeline + 2-node ClusterPair routing.
+	 */
+	reject = cluster_ges_send_request_and_wait(&req->resid, (uint32) req->lockmode,
+											   &req->holder, req->request_id,
+											   /* timeout_ms */ 0);
+	if (reject == 0)
+		return CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK;
+
+	/* Non-zero reject reasons mapped per spec-2.21 §3.3. */
+	if (reject == 1 /* GES_REJECT_TIMEOUT placeholder */)
+		return CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+	if (reject == 2 /* GES_REJECT_DEADLOCK placeholder */)
+		return CLUSTER_LOCK_ACQUIRE_FAIL_DEADLOCK;
+	if (reject == 3 /* GES_REJECT_CANCEL placeholder */)
+		return CLUSTER_LOCK_ACQUIRE_FAIL_CANCEL;
+	return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 }
 
 
@@ -215,13 +284,32 @@ cluster_lock_acquire_s5_promote_holder(const ClusterLockAcquireRequest *req)
 {
 	if (req == NULL)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+	return cluster_lock_acquire_s5_promote(req);
+}
 
-	/*
-	 * S5 internal API:返回 OK_GRANTED(promote success default);
-	 * convert request 走 OK_CONVERTED(spec-2.21 hot path wire);
-	 * real promote wire to cluster_grd_entry_promote_holder()
-	 * (spec-2.16 mutator API 真激活推 spec-2.21)。
-	 */
+/*
+ * spec-2.21 D4 P2.3 — S5 promote with revalidate;失败 5-step backout.
+ */
+ClusterLockAcquireResult
+cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *req)
+{
+	ClusterGrdEntryResult er;
+	int32 self_node = (int32) (MyProc ? MyProc->pgprocno : 0);
+
+	ensure_counter_initialized();
+
+	if (req == NULL)
+		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+
+	er = cluster_grd_revalidate_and_promote(&req->resid, &req->holder, self_node,
+											req->master_gen_snapshot);
+	if (er != CLUSTER_GRD_ENTRY_OK)
+	{
+		(void) cluster_lock_acquire_s7_cleanup(req);
+		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+	}
+
+	pg_atomic_fetch_add_u64(&stub_s5_promote_count, 1);
 	return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 }
 
@@ -232,15 +320,49 @@ cluster_lock_acquire_s5_promote_holder(const ClusterLockAcquireRequest *req)
 ClusterLockAcquireResult
 cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *req)
 {
+	ensure_counter_initialized();
+
 	if (req == NULL)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 
-	/*
-	 * S6 internal API:返回 OK_GRANTED(release success);real release
-	 * wire to cluster_grd_entry_release_holder() + send GES_RELEASE
-	 * (spec-2.21 hot path)。
-	 */
+	(void) cluster_grd_release_holder_by_id(&req->resid, &req->holder);
+
+	if (cluster_grd_lookup_master(&req->resid) != (int32) (MyProc ? MyProc->pgprocno : 0))
+	{
+		/* Remote master: send GES_RELEASE (bounded ACK wait). */
+		(void) cluster_ges_send_release_and_wait(&req->resid, &req->holder, req->request_id);
+	}
+
+	pg_atomic_fetch_add_u64(&stub_s6_release_count, 1);
 	return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+}
+
+/*
+ * spec-2.21 D1/D6 — normal release entry point.
+ *
+ *	D2/D3 hooks (LockRelease / LockReleaseAll / ResourceOwnerRelease) call
+ *	this with the LOCALLOCK->cluster_* state when nLocks == 1.  Walks S6 +
+ *	wait-edge cancel stub.  Exactly-once gated by caller via
+ *	LOCALLOCK->cluster_registered (HC9).
+ */
+void
+cluster_lock_release(const ClusterLockReleaseRequest *req)
+{
+	ClusterLockAcquireRequest internal;
+
+	if (req == NULL || !req->cluster_registered)
+		return;
+
+	memset(&internal, 0, sizeof(internal));
+	internal.locktag = req->locktag;
+	internal.lockmode = req->lockmode;
+	internal.sessionLock = req->sessionLock;
+	internal.holder = req->holder;
+	internal.request_id = req->request_id;
+	cluster_grd_resid_encode(&req->locktag, &internal.resid);
+
+	(void) cluster_lock_acquire_s6_release(&internal);
+	cluster_lmd_cancel_wait_edge();
 }
 
 
@@ -261,10 +383,11 @@ cluster_lock_acquire_s7_cleanup(const ClusterLockAcquireRequest *req)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 
 	/*
-	 * S7 internal API:cleanup success → OK_GRANTED(表 cleanup 完成,
-	 * 不表 lock acquire success);real wire to cluster_grd_entry_*
-	 * release/cancel mutator(spec-2.21)。
+	 * spec-2.21 D4 — S7 cleanup:cancel any outstanding reservation +
+	 * wait-edge stub.  No-op safe if no reservation present (idempotent).
 	 */
+	(void) cluster_grd_cancel_reservation_by_id(&req->resid, &req->holder);
+	cluster_lmd_cancel_wait_edge();
 	return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 }
 
@@ -295,36 +418,44 @@ cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *req)
 	if (r != CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
 		return r;
 
-	/* S3 partition + reservation。*/
+	/*
+	 * S3 partition + reservation.  Returns:
+	 *   - NEED_PG_NATIVE_LOCK with local-fast-path: short-circuit success,
+	 *     caller does PG-native + S5 promote.
+	 *   - OK_GRANTED:  remote-master path, fall through to S4.
+	 *   - FAIL_*:  pre-reservation fail, do NOT run S7 cleanup
+	 *              (no reservation to cancel — F2 invariant from spec-2.20).
+	 */
 	r = cluster_lock_acquire_s3_partition_reservation(req);
-	if (r == CLUSTER_LOCK_ACQUIRE_PENDING)
+	if (r == CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK)
+		return r; /* lock.c will call S5 post-PG-native. */
+	if (r != CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
+		return r; /* pre-reservation fail */
+
+	/* S4 remote-master path (reservation already created). */
+	r = cluster_lock_acquire_s4_remote_request_wait(req);
+	if (r == CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK)
 		return r;
-	if (r == CLUSTER_LOCK_ACQUIRE_FAIL_RESERVATION_FULL || r == CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL)
+	if (r == CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT ||
+		r == CLUSTER_LOCK_ACQUIRE_FAIL_DEADLOCK ||
+		r == CLUSTER_LOCK_ACQUIRE_FAIL_CANCEL ||
+		r == CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL)
+	{
+		(void) cluster_lock_acquire_s7_cleanup(req);
 		return r;
+	}
 
 	/*
-	 * S4 remote request + wait — spec-2.20 internal API 返回 PENDING
-	 * signals spec-2.21 hot path wire 时 caller-side WaitLatch。
-	 * 本 spec internal:PENDING 原样返回,避免在未 reservation / 未
-	 * GES_REPLY 的情况下伪造 OK_GRANTED。
+	 * Legacy path:  if S4 returned OK_GRANTED (older stubs), still need
+	 * S5 promote to convert reservation -> holder.
 	 */
-	r = cluster_lock_acquire_s4_remote_request_wait(req);
-	if (r == CLUSTER_LOCK_ACQUIRE_PENDING)
-		return r;
-	if (r == CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT || r == CLUSTER_LOCK_ACQUIRE_FAIL_DEADLOCK
-		|| r == CLUSTER_LOCK_ACQUIRE_FAIL_CANCEL) {
-		(void)cluster_lock_acquire_s7_cleanup(req);
-		return r;
-	}
-
-	/* S5 promote holder。*/
 	r = cluster_lock_acquire_s5_promote_holder(req);
-	if (r == CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL) {
-		(void)cluster_lock_acquire_s7_cleanup(req);
-		return r;
+	if (r != CLUSTER_LOCK_ACQUIRE_OK_GRANTED &&
+		r != CLUSTER_LOCK_ACQUIRE_OK_CONVERTED)
+	{
+		(void) cluster_lock_acquire_s7_cleanup(req);
 	}
-
-	return r; /* OK_GRANTED / OK_CONVERTED */
+	return r;
 }
 
 
@@ -340,4 +471,38 @@ cluster_lock_acquire_s7_cleanup_count(void)
 {
 	ensure_counter_initialized();
 	return pg_atomic_read_u64(&stub_s7_cleanup_count);
+}
+
+/*
+ * spec-2.21 D4 P2.4 — dump 6 emit_row(s1_entry / s3_reservation / s4_remote /
+ *	s5_promote / s6_release / s7_cleanup).  030_acceptance L18 HC9 grant-
+ *	release 对称 acceptance gate consumes these.
+ */
+void
+cluster_lock_acquire_dump(void (*emit_row)(void *cookie, const char *key,
+										   const char *value),
+						  void *cookie)
+{
+	char buf[32];
+
+	ensure_counter_initialized();
+
+	snprintf(buf, sizeof(buf), UINT64_FORMAT,
+			 pg_atomic_read_u64(&stub_s1_entry_count));
+	emit_row(cookie, "s1_entry", buf);
+	snprintf(buf, sizeof(buf), UINT64_FORMAT,
+			 pg_atomic_read_u64(&stub_s3_reservation_count));
+	emit_row(cookie, "s3_reservation", buf);
+	snprintf(buf, sizeof(buf), UINT64_FORMAT,
+			 pg_atomic_read_u64(&stub_s4_remote_count));
+	emit_row(cookie, "s4_remote", buf);
+	snprintf(buf, sizeof(buf), UINT64_FORMAT,
+			 pg_atomic_read_u64(&stub_s5_promote_count));
+	emit_row(cookie, "s5_promote", buf);
+	snprintf(buf, sizeof(buf), UINT64_FORMAT,
+			 pg_atomic_read_u64(&stub_s6_release_count));
+	emit_row(cookie, "s6_release", buf);
+	snprintf(buf, sizeof(buf), UINT64_FORMAT,
+			 pg_atomic_read_u64(&stub_s7_cleanup_count));
+	emit_row(cookie, "s7_cleanup", buf);
 }

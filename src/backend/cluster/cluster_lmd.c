@@ -497,6 +497,25 @@ cluster_lmd_submit_wait_edge(void)
 	ConditionVariableBroadcast(&cluster_lmd_state->cv);
 }
 
+/*
+ * spec-2.21 D7 — cluster_lmd_cancel_wait_edge symmetric stub.
+ *
+ *	Reuses lmd_edge_submission_count atomic for now (real cancel counter +
+ *	wait-edge unregister lands in spec-2.22 LMD Tarjan).  No-op when LMD
+ *	shmem is uninitialized or disabled (callers from S7 cleanup may run
+ *	before LMD shmem is reachable in some early-bootstrap paths).
+ */
+void
+cluster_lmd_cancel_wait_edge(void)
+{
+	if (cluster_lmd_state == NULL)
+		return;
+	if (lmd_get_state() == CLUSTER_LMD_DISABLED)
+		return;
+	/* spec-2.22 wires a dedicated cancel counter; for now share submission_count. */
+	pg_atomic_fetch_add_u64(&cluster_lmd_state->lmd_edge_submission_count, 1);
+}
+
 
 /* ============================================================
  * LMD main entry.

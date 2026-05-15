@@ -120,6 +120,20 @@ struct ClusterGrdEntry {
 	ClusterGrdConvert converts[PGRAC_GRD_MAX_CONVERTS];
 	uint64 last_modified_scn;
 	uint32 state_flags; /* 预留 spec-2.16 grant pending/DRM in-flight */
+	/*
+	 * spec-2.21 D5 ABI extend:
+	 *   generation:  bumped on every mutator under entry->lock; S5 promote
+	 *     compares against S3 snapshot to detect race (P2.3 revalidate).
+	 *   nreservations:  pending reservations count (S3 → S5 promote window).
+	 *   reservations:  pending reservation slots (reuse holders[] LOCKMODE
+	 *     semantic;identified by holder.request_id;not yet a real holder).
+	 */
+	uint64 generation;
+	int nreservations;
+	struct {
+		ClusterGrdHolderId id;
+		LOCKMODE mode;
+	} reservations[PGRAC_GRD_MAX_HOLDERS];
 };
 
 
@@ -1001,54 +1015,219 @@ cluster_grd_lockmode_conflicts(int held pg_attribute_unused(), int wanted pg_att
 
 
 /* ============================================================
- * Mutator stubs — Step 4 D9 真激活.
+ * spec-2.21 D5 — minimal ADVISORY mutator real bodies.
  *
- *   规则 8:  ERRCODE_FEATURE_NOT_SUPPORTED + errhint pointing to
- *   spec-2.16 Step 4.  cluster_unit tests in Step 6 必须显式 expect
- *   FEATURE_NOT_SUPPORTED until Step 4 lands.
+ *   MVP scope: LOCKTAG_ADVISORY only (per spec-2.21 Q3 v1.1).  Caller
+ *   must hold the entry->lock spinlock (S3.1 / S5.1 / S6.1 sequence;
+ *   shard partition LWLock is the outer lock per HC8 lock-order safe).
+ *
+ *   Compatibility / queueing logic is intentionally minimal — full
+ *   conflict matrix + FIFO waiter promotion live in D8 LMS worker.
+ *   These helpers expose the slot lifecycle (grant / release / reserve)
+ *   that D8 + cluster_lock_acquire.c S3-S6 build on.
  * ============================================================ */
 
 ClusterGrdEntryResult
-cluster_grd_entry_grant_holder(ClusterGrdEntry *entry pg_attribute_unused(),
-							   const ClusterGrdHolderId *holder pg_attribute_unused(),
-							   int mode pg_attribute_unused())
+cluster_grd_entry_grant_holder(ClusterGrdEntry *entry,
+							   const ClusterGrdHolderId *holder,
+							   int mode)
 {
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("cluster_grd_entry_grant_holder not implemented in Step 1"),
-			 errhint("spec-2.16 Step 4 D9 activates the 6-step state machine + mutator body")));
-	return CLUSTER_GRD_ENTRY_ERROR; /* unreachable */
+	int slot;
+
+	Assert(entry != NULL && holder != NULL);
+
+	if (entry->ngranted >= PGRAC_GRD_MAX_HOLDERS)
+	{
+		cluster_grd_inc_ges_work_queue_full();
+		return CLUSTER_GRD_ENTRY_FULL;
+	}
+	slot = entry->ngranted++;
+	entry->holders[slot].node_id = (int32) holder->node_id;
+	entry->holders[slot].mode = (LOCKMODE) mode;
+	entry->holders[slot].xid = (TransactionId) holder->request_id;
+	entry->generation++;
+	return CLUSTER_GRD_ENTRY_OK;
 }
 
 ClusterGrdEntryResult
-cluster_grd_entry_release_holder(ClusterGrdEntry *entry pg_attribute_unused(),
-								 const ClusterGrdHolderId *holder pg_attribute_unused())
+cluster_grd_entry_release_holder(ClusterGrdEntry *entry,
+								 const ClusterGrdHolderId *holder)
 {
-	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					errmsg("cluster_grd_entry_release_holder not implemented in Step 1"),
-					errhint("spec-2.16 Step 4 D9 activates release + HASH_REMOVE")));
-	return CLUSTER_GRD_ENTRY_ERROR;
+	int i;
+
+	Assert(entry != NULL && holder != NULL);
+
+	for (i = 0; i < entry->ngranted; i++)
+	{
+		if ((uint32) entry->holders[i].node_id == holder->node_id &&
+			(uint64) entry->holders[i].xid == holder->request_id)
+		{
+			/* compact down */
+			if (i < entry->ngranted - 1)
+				entry->holders[i] = entry->holders[entry->ngranted - 1];
+			memset(&entry->holders[entry->ngranted - 1], 0, sizeof(ClusterGrdHolder));
+			entry->ngranted--;
+			entry->generation++;
+			return CLUSTER_GRD_ENTRY_OK;
+		}
+	}
+	return CLUSTER_GRD_ENTRY_NOT_FOUND;
 }
 
 ClusterGrdEntryResult
-cluster_grd_entry_add_waiter(ClusterGrdEntry *entry pg_attribute_unused(),
-							 const ClusterGrdHolderId *holder pg_attribute_unused(),
-							 int mode pg_attribute_unused())
+cluster_grd_entry_add_waiter(ClusterGrdEntry *entry,
+							 const ClusterGrdHolderId *holder,
+							 int mode)
 {
-	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					errmsg("cluster_grd_entry_add_waiter not implemented in Step 1"),
-					errhint("spec-2.16 Step 4 D9 activates waiter + cap surface")));
-	return CLUSTER_GRD_ENTRY_ERROR;
+	int slot;
+
+	Assert(entry != NULL && holder != NULL);
+
+	if (entry->nwaiters >= PGRAC_GRD_MAX_WAITERS)
+	{
+		cluster_grd_inc_ges_work_queue_full();
+		return CLUSTER_GRD_ENTRY_FULL;
+	}
+	slot = entry->nwaiters++;
+	entry->waiters[slot].node_id = (int32) holder->node_id;
+	entry->waiters[slot].mode = (LOCKMODE) mode;
+	entry->waiters[slot].wait_start = GetCurrentTimestamp();
+	entry->generation++;
+	return CLUSTER_GRD_ENTRY_OK;
 }
 
 ClusterGrdEntryResult
-cluster_grd_entry_promote_waiter(ClusterGrdEntry *entry pg_attribute_unused(),
-								 const ClusterGrdHolderId *holder pg_attribute_unused())
+cluster_grd_entry_promote_waiter(ClusterGrdEntry *entry,
+								 const ClusterGrdHolderId *holder)
 {
-	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					errmsg("cluster_grd_entry_promote_waiter not implemented in Step 1"),
-					errhint("spec-2.16 Step 4 D9 grant decision callback")));
-	return CLUSTER_GRD_ENTRY_ERROR;
+	int i;
+
+	Assert(entry != NULL && holder != NULL);
+
+	for (i = 0; i < entry->nwaiters; i++)
+	{
+		if ((uint32) entry->waiters[i].node_id == holder->node_id)
+		{
+			LOCKMODE mode = entry->waiters[i].mode;
+
+			if (i < entry->nwaiters - 1)
+				entry->waiters[i] = entry->waiters[entry->nwaiters - 1];
+			memset(&entry->waiters[entry->nwaiters - 1], 0, sizeof(ClusterGrdWaiter));
+			entry->nwaiters--;
+			entry->generation++;
+			return cluster_grd_entry_grant_holder(entry, holder, mode);
+		}
+	}
+	return CLUSTER_GRD_ENTRY_NOT_FOUND;
+}
+
+
+/* ============================================================
+ * spec-2.21 D5 — inspection + reservation helpers.
+ * ============================================================ */
+
+bool
+cluster_grd_entry_has_remote_holder(ClusterGrdEntry *entry, int32 self_node_id)
+{
+	int i;
+
+	Assert(entry != NULL);
+	for (i = 0; i < entry->ngranted; i++)
+		if (entry->holders[i].node_id != self_node_id)
+			return true;
+	return false;
+}
+
+bool
+cluster_grd_entry_has_pending_waiter(ClusterGrdEntry *entry)
+{
+	Assert(entry != NULL);
+	return entry->nwaiters > 0;
+}
+
+bool
+cluster_grd_entry_has_pending_convert(ClusterGrdEntry *entry)
+{
+	Assert(entry != NULL);
+	return entry->nconverts > 0;
+}
+
+uint64
+cluster_grd_entry_generation(ClusterGrdEntry *entry)
+{
+	Assert(entry != NULL);
+	return entry->generation;
+}
+
+ClusterGrdEntryResult
+cluster_grd_reservation_create(ClusterGrdEntry *entry,
+							   const ClusterGrdHolderId *holder, int mode)
+{
+	int slot;
+
+	Assert(entry != NULL && holder != NULL);
+
+	if (entry->nreservations >= PGRAC_GRD_MAX_HOLDERS)
+		return CLUSTER_GRD_ENTRY_FULL;
+	slot = entry->nreservations++;
+	entry->reservations[slot].id = *holder;
+	entry->reservations[slot].mode = (LOCKMODE) mode;
+	entry->generation++;
+	return CLUSTER_GRD_ENTRY_OK;
+}
+
+ClusterGrdEntryResult
+cluster_grd_reservation_cancel(ClusterGrdEntry *entry,
+							   const ClusterGrdHolderId *holder)
+{
+	int i;
+
+	Assert(entry != NULL && holder != NULL);
+
+	for (i = 0; i < entry->nreservations; i++)
+	{
+		if (entry->reservations[i].id.node_id == holder->node_id &&
+			entry->reservations[i].id.request_id == holder->request_id)
+		{
+			if (i < entry->nreservations - 1)
+				entry->reservations[i] = entry->reservations[entry->nreservations - 1];
+			memset(&entry->reservations[entry->nreservations - 1], 0,
+				   sizeof(entry->reservations[0]));
+			entry->nreservations--;
+			entry->generation++;
+			return CLUSTER_GRD_ENTRY_OK;
+		}
+	}
+	return CLUSTER_GRD_ENTRY_NOT_FOUND;
+}
+
+ClusterGrdEntryResult
+cluster_grd_reservation_promote(ClusterGrdEntry *entry,
+								const ClusterGrdHolderId *holder)
+{
+	int i;
+
+	Assert(entry != NULL && holder != NULL);
+
+	for (i = 0; i < entry->nreservations; i++)
+	{
+		if (entry->reservations[i].id.node_id == holder->node_id &&
+			entry->reservations[i].id.request_id == holder->request_id)
+		{
+			LOCKMODE mode = entry->reservations[i].mode;
+			ClusterGrdEntryResult r;
+
+			if (i < entry->nreservations - 1)
+				entry->reservations[i] = entry->reservations[entry->nreservations - 1];
+			memset(&entry->reservations[entry->nreservations - 1], 0,
+				   sizeof(entry->reservations[0]));
+			entry->nreservations--;
+			r = cluster_grd_entry_grant_holder(entry, holder, (int) mode);
+			/* generation already bumped by grant_holder */
+			return r;
+		}
+	}
+	return CLUSTER_GRD_ENTRY_NOT_FOUND;
 }
 
 
@@ -1354,4 +1533,120 @@ cluster_grd_cleanup_on_backend_exit(int procno)
 	 * The real implementation must sweep holders/waiters/converts for procno
 	 * under the same entry-lock discipline as cleanup_on_node_dead(). */
 	(void)procno;
+}
+
+
+/* ============================================================
+ * spec-2.21 D5 high-level helpers — encapsulate entry slock + 5-check +
+ * reservation/promote.  cluster_lock_acquire.c uses these so the entry
+ * struct definition can stay private to this file.
+ * ============================================================ */
+
+ClusterGrdEntryResult
+cluster_grd_try_reserve(const ClusterResId *resid,
+						const ClusterGrdHolderId *holder,
+						int mode, int32 self_node_id,
+						bool *fast_path_out,
+						uint64 *gen_snapshot_out)
+{
+	ClusterGrdEntry *entry = NULL;
+	ClusterGrdEntryResult er;
+	int32 master;
+	bool fast_path;
+
+	Assert(resid != NULL && holder != NULL);
+
+	er = cluster_grd_entry_lookup_or_create(resid, true, &entry);
+	if (er != CLUSTER_GRD_ENTRY_OK || entry == NULL)
+		return er;
+
+	master = cluster_grd_lookup_master(resid);
+
+	SpinLockAcquire(&entry->lock);
+	if (gen_snapshot_out)
+		*gen_snapshot_out = entry->generation;
+
+	fast_path = (master == self_node_id || master < 0) &&
+		!cluster_grd_entry_has_remote_holder(entry, self_node_id) &&
+		!cluster_grd_entry_has_pending_waiter(entry) &&
+		!cluster_grd_entry_has_pending_convert(entry);
+
+	er = cluster_grd_reservation_create(entry, holder, mode);
+	SpinLockRelease(&entry->lock);
+
+	if (fast_path_out)
+		*fast_path_out = fast_path && (er == CLUSTER_GRD_ENTRY_OK);
+	return er;
+}
+
+ClusterGrdEntryResult
+cluster_grd_revalidate_and_promote(const ClusterResId *resid,
+								   const ClusterGrdHolderId *holder,
+								   int32 self_node_id,
+								   uint64 gen_snapshot pg_attribute_unused())
+{
+	ClusterGrdEntry *entry = NULL;
+	ClusterGrdEntryResult er;
+	bool revalidate_ok;
+
+	Assert(resid != NULL && holder != NULL);
+
+	er = cluster_grd_entry_lookup_or_create(resid, false, &entry);
+	if (er != CLUSTER_GRD_ENTRY_OK || entry == NULL)
+		return CLUSTER_GRD_ENTRY_NOT_FOUND;
+
+	SpinLockAcquire(&entry->lock);
+	/*
+	 * P2.3 revalidate target = no remote holder ascended after the S3
+	 * snapshot.  Generation drift from other reservations is OK; only a
+	 * new remote real holder defeats the promote.
+	 */
+	revalidate_ok = !cluster_grd_entry_has_remote_holder(entry, self_node_id);
+	if (!revalidate_ok)
+	{
+		(void) cluster_grd_reservation_cancel(entry, holder);
+		SpinLockRelease(&entry->lock);
+		return CLUSTER_GRD_ENTRY_NOT_FOUND;
+	}
+	er = cluster_grd_reservation_promote(entry, holder);
+	SpinLockRelease(&entry->lock);
+	return er;
+}
+
+ClusterGrdEntryResult
+cluster_grd_release_holder_by_id(const ClusterResId *resid,
+								 const ClusterGrdHolderId *holder)
+{
+	ClusterGrdEntry *entry = NULL;
+	ClusterGrdEntryResult er;
+
+	Assert(resid != NULL && holder != NULL);
+
+	er = cluster_grd_entry_lookup_or_create(resid, false, &entry);
+	if (er != CLUSTER_GRD_ENTRY_OK || entry == NULL)
+		return CLUSTER_GRD_ENTRY_NOT_FOUND;
+
+	SpinLockAcquire(&entry->lock);
+	er = cluster_grd_entry_release_holder(entry, holder);
+	SpinLockRelease(&entry->lock);
+	return er;
+}
+
+ClusterGrdEntryResult
+cluster_grd_cancel_reservation_by_id(const ClusterResId *resid,
+									 const ClusterGrdHolderId *holder)
+{
+	ClusterGrdEntry *entry = NULL;
+	ClusterGrdEntryResult er;
+
+	Assert(resid != NULL && holder != NULL);
+
+	er = cluster_grd_entry_lookup_or_create(resid, false, &entry);
+	if (er != CLUSTER_GRD_ENTRY_OK || entry == NULL)
+		return CLUSTER_GRD_ENTRY_NOT_FOUND;
+
+	SpinLockAcquire(&entry->lock);
+	er = cluster_grd_reservation_cancel(entry, holder);
+	SpinLockRelease(&entry->lock);
+	return er;
 }

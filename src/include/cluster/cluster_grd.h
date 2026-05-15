@@ -538,6 +538,79 @@ extern ClusterGrdEntryResult cluster_grd_entry_promote_waiter(ClusterGrdEntry *e
 															  const ClusterGrdHolderId *holder);
 
 /*
+ * spec-2.21 D5 NEW:  minimal ADVISORY mutator + inspection API.
+ *
+ *   These extend spec-2.15/2.16 mutator scaffolding for the spec-2.21
+ *   ADVISORY-only MVP — full RELATION/TRANSACTION/OBJECT activation is
+ *   spec-2.25 lock class expansion.
+ *
+ *   Snapshot helpers (no_remote_holder / no_pending_waiter / no_pending_
+ *   convert / master_generation):  caller pre-acquires the shard
+ *   partition LWLock + entry slock_t before calling; helpers return
+ *   atomic snapshot of relevant state for S3 local-fast-path 5-check.
+ *
+ *   Reservation API (reservation_create / cancel / promote):  spec-2.21
+ *   S3 reserves a holder slot under shard LWLock, releases LWLock for
+ *   PG-native LockAcquire, then re-acquires + promotes (or cancels on
+ *   revalidate fail per HC9 / P2.3).
+ */
+extern bool cluster_grd_entry_has_remote_holder(ClusterGrdEntry *entry,
+												int32 self_node_id);
+extern bool cluster_grd_entry_has_pending_waiter(ClusterGrdEntry *entry);
+extern bool cluster_grd_entry_has_pending_convert(ClusterGrdEntry *entry);
+
+/* Entry-level generation counter (bumped on every mutator under entry->lock). */
+extern uint64 cluster_grd_entry_generation(ClusterGrdEntry *entry);
+
+extern ClusterGrdEntryResult cluster_grd_reservation_create(ClusterGrdEntry *entry,
+															const ClusterGrdHolderId *holder,
+															int /* LOCKMODE */ mode);
+extern ClusterGrdEntryResult cluster_grd_reservation_cancel(ClusterGrdEntry *entry,
+															const ClusterGrdHolderId *holder);
+extern ClusterGrdEntryResult cluster_grd_reservation_promote(ClusterGrdEntry *entry,
+															 const ClusterGrdHolderId *holder);
+
+/*
+ * spec-2.21 D5 high-level helpers — encapsulate entry slock + 5-check +
+ * reservation/promote under cluster_grd.c so callers in cluster_lock_
+ * acquire.c don't need internal struct visibility.
+ *
+ *   try_reserve:  S3.1-S3.3 — lookup/create entry, snapshot generation,
+ *     run 5-check, reservation_create.  Returns:
+ *       _OK with fast_path_out=true:  caller may use PG-native fast path
+ *       _OK with fast_path_out=false: caller must walk S4 remote path
+ *       _FULL / _NOT_READY:           caller maps to FAIL_RESERVATION_FULL
+ *                                     / FAIL_GRD_NOT_READY
+ *
+ *   revalidate_and_promote:  S5 — re-acquire entry slock, verify no remote
+ *     holder ascended after snapshot, promote reservation -> holder.
+ *     Returns OK on success;  NOT_FOUND if reservation already lost (race).
+ *
+ *   release_holder_by_id:  S6 — release holder under entry slock + remove
+ *     entry from HTAB if last holder.
+ */
+extern ClusterGrdEntryResult
+cluster_grd_try_reserve(const ClusterResId *resid,
+						const ClusterGrdHolderId *holder,
+						int mode, int32 self_node_id,
+						bool *fast_path_out,
+						uint64 *gen_snapshot_out);
+
+extern ClusterGrdEntryResult
+cluster_grd_revalidate_and_promote(const ClusterResId *resid,
+								   const ClusterGrdHolderId *holder,
+								   int32 self_node_id,
+								   uint64 gen_snapshot);
+
+extern ClusterGrdEntryResult
+cluster_grd_release_holder_by_id(const ClusterResId *resid,
+								 const ClusterGrdHolderId *holder);
+
+extern ClusterGrdEntryResult
+cluster_grd_cancel_reservation_by_id(const ClusterResId *resid,
+									 const ClusterGrdHolderId *holder);
+
+/*
  * CSSD DEAD cleanup entry point (Step 4 D11 + LMON tick polling D8).
  *
  *   Called by LMON tick body when cluster_cssd_get_dead_generation()
