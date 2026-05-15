@@ -1119,27 +1119,27 @@ cluster_init_guc(void)
 		&cluster_lms_enabled, true, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	/* spec-2.21 D2:emergency bypass GUC */
-	DefineCustomBoolVariable(
-		"cluster.lock_acquire_cluster_path",
-		gettext_noop("Enable the cluster lock acquire gate path."),
-		gettext_noop("When true (default), PG LockAcquireExtended routes "
-					 "cluster-aware locks (LOCKTAG_ADVISORY xact-level) "
-					 "through the 7-step state machine.  When false, all "
-					 "locks skip the cluster gate and use PG-native path "
-					 "only — emergency bypass for P0 incidents.  "
-					 "PGC_POSTMASTER:restart required."),
-		&cluster_lock_acquire_cluster_path, true, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("cluster.lock_acquire_cluster_path",
+							 gettext_noop("Enable the cluster lock acquire gate path."),
+							 gettext_noop("When true (default), PG LockAcquireExtended routes "
+										  "cluster-aware locks (LOCKTAG_ADVISORY xact-level) "
+										  "through the 7-step state machine.  When false, all "
+										  "locks skip the cluster gate and use PG-native path "
+										  "only — emergency bypass for P0 incidents.  "
+										  "PGC_POSTMASTER:restart required."),
+							 &cluster_lock_acquire_cluster_path, true, PGC_POSTMASTER, 0, NULL,
+							 NULL, NULL);
 
 	/* spec-2.21 D2:local-fast-path toggle GUC */
-	DefineCustomBoolVariable(
-		"cluster.local_fast_path_enabled",
-		gettext_noop("Enable the S3 local-fast-path 5-check (local master + "
-					 "no remote holder/waiter/convert + generation stable)."),
-		gettext_noop("When true (default), cluster lock acquires on resources "
-					 "mastered locally with no remote contention bypass the "
-					 "LMS work_queue.  When false, all acquires take the "
-					 "remote-master path — perf degradation ~10x vs "
-					 "spec-1.23 baseline; for fault-injection / chaos "
-					 "testing.  PGC_SIGHUP."),
-		&cluster_local_fast_path_enabled, true, PGC_SIGHUP, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("cluster.local_fast_path_enabled",
+							 gettext_noop("Enable the S3 local-fast-path 5-check (local master + "
+										  "no remote holder/waiter/convert + generation stable)."),
+							 gettext_noop("When true (default), cluster lock acquires on resources "
+										  "mastered locally with no remote contention bypass the "
+										  "LMS work_queue.  When false, all acquires take the "
+										  "remote-master path — perf degradation ~10x vs "
+										  "spec-1.23 baseline; for fault-injection / chaos "
+										  "testing.  PGC_SIGHUP."),
+							 &cluster_local_fast_path_enabled, true, PGC_SIGHUP, 0, NULL, NULL,
+							 NULL);
 }

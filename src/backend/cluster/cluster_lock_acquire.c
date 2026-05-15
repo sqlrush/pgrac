@@ -98,11 +98,10 @@ ensure_counter_initialized(void)
 static inline void
 fill_request_holder(ClusterLockAcquireRequest *req)
 {
-	req->holder.node_id = (uint32) (MyProc ? MyProc->pgprocno : 0);
-	req->holder.procno = (uint32) (MyProc ? MyProc->pgprocno : 0);
-	req->holder.cluster_epoch = 0;	/* spec-2.26 wires real epoch */
-	req->holder.request_id = req->request_id ? req->request_id
-		: (uint64) GetCurrentTimestamp();
+	req->holder.node_id = (uint32)(MyProc ? MyProc->pgprocno : 0);
+	req->holder.procno = (uint32)(MyProc ? MyProc->pgprocno : 0);
+	req->holder.cluster_epoch = 0; /* spec-2.26 wires real epoch */
+	req->holder.request_id = req->request_id ? req->request_id : (uint64)GetCurrentTimestamp();
 }
 
 
@@ -195,18 +194,17 @@ cluster_lock_acquire_s3_partition_reservation(const ClusterLockAcquireRequest *r
 	ClusterGrdEntryResult er;
 	bool fast_path = false;
 	uint64 gen_snapshot = 0;
-	int32 self_node = (int32) (MyProc ? MyProc->pgprocno : 0);
+	int32 self_node = (int32)(MyProc ? MyProc->pgprocno : 0);
 
 	ensure_counter_initialized();
 
 	if (req == NULL)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 
-	mut = (ClusterLockAcquireRequest *) req;
+	mut = (ClusterLockAcquireRequest *)req;
 	fill_request_holder(mut);
 
-	er = cluster_grd_try_reserve(&req->resid, &req->holder, (int) req->lockmode,
-								 self_node,
+	er = cluster_grd_try_reserve(&req->resid, &req->holder, (int)req->lockmode, self_node,
 								 cluster_local_fast_path_enabled ? &fast_path : NULL,
 								 &gen_snapshot);
 	if (er == CLUSTER_GRD_ENTRY_NOT_READY)
@@ -217,8 +215,7 @@ cluster_lock_acquire_s3_partition_reservation(const ClusterLockAcquireRequest *r
 	mut->master_gen_snapshot = gen_snapshot;
 	pg_atomic_fetch_add_u64(&stub_s3_reservation_count, 1);
 
-	if (cluster_local_fast_path_enabled && fast_path)
-	{
+	if (cluster_local_fast_path_enabled && fast_path) {
 		pg_atomic_fetch_add_u64(&stub_local_fast_path_count, 1);
 		return CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK;
 	}
@@ -257,8 +254,8 @@ cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req
 	 * helper currently returns 0 (GRANT) for ADVISORY — spec-2.23 BAST
 	 * 配套 wires real send/reply pipeline + 2-node ClusterPair routing.
 	 */
-	reject = cluster_ges_send_request_and_wait(&req->resid, (uint32) req->lockmode,
-											   &req->holder, req->request_id,
+	reject = cluster_ges_send_request_and_wait(&req->resid, (uint32)req->lockmode, &req->holder,
+											   req->request_id,
 											   /* timeout_ms */ 0);
 	if (reject == 0)
 		return CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK;
@@ -294,7 +291,7 @@ ClusterLockAcquireResult
 cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *req)
 {
 	ClusterGrdEntryResult er;
-	int32 self_node = (int32) (MyProc ? MyProc->pgprocno : 0);
+	int32 self_node = (int32)(MyProc ? MyProc->pgprocno : 0);
 
 	ensure_counter_initialized();
 
@@ -303,9 +300,8 @@ cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *req)
 
 	er = cluster_grd_revalidate_and_promote(&req->resid, &req->holder, self_node,
 											req->master_gen_snapshot);
-	if (er != CLUSTER_GRD_ENTRY_OK)
-	{
-		(void) cluster_lock_acquire_s7_cleanup(req);
+	if (er != CLUSTER_GRD_ENTRY_OK) {
+		(void)cluster_lock_acquire_s7_cleanup(req);
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 	}
 
@@ -325,12 +321,11 @@ cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *req)
 	if (req == NULL)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 
-	(void) cluster_grd_release_holder_by_id(&req->resid, &req->holder);
+	(void)cluster_grd_release_holder_by_id(&req->resid, &req->holder);
 
-	if (cluster_grd_lookup_master(&req->resid) != (int32) (MyProc ? MyProc->pgprocno : 0))
-	{
+	if (cluster_grd_lookup_master(&req->resid) != (int32)(MyProc ? MyProc->pgprocno : 0)) {
 		/* Remote master: send GES_RELEASE (bounded ACK wait). */
-		(void) cluster_ges_send_release_and_wait(&req->resid, &req->holder, req->request_id);
+		(void)cluster_ges_send_release_and_wait(&req->resid, &req->holder, req->request_id);
 	}
 
 	pg_atomic_fetch_add_u64(&stub_s6_release_count, 1);
@@ -361,7 +356,7 @@ cluster_lock_release(const ClusterLockReleaseRequest *req)
 	internal.request_id = req->request_id;
 	cluster_grd_resid_encode(&req->locktag, &internal.resid);
 
-	(void) cluster_lock_acquire_s6_release(&internal);
+	(void)cluster_lock_acquire_s6_release(&internal);
 	cluster_lmd_cancel_wait_edge();
 }
 
@@ -386,7 +381,7 @@ cluster_lock_acquire_s7_cleanup(const ClusterLockAcquireRequest *req)
 	 * spec-2.21 D4 — S7 cleanup:cancel any outstanding reservation +
 	 * wait-edge stub.  No-op safe if no reservation present (idempotent).
 	 */
-	(void) cluster_grd_cancel_reservation_by_id(&req->resid, &req->holder);
+	(void)cluster_grd_cancel_reservation_by_id(&req->resid, &req->holder);
 	cluster_lmd_cancel_wait_edge();
 	return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 }
@@ -436,12 +431,9 @@ cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *req)
 	r = cluster_lock_acquire_s4_remote_request_wait(req);
 	if (r == CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK)
 		return r;
-	if (r == CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT ||
-		r == CLUSTER_LOCK_ACQUIRE_FAIL_DEADLOCK ||
-		r == CLUSTER_LOCK_ACQUIRE_FAIL_CANCEL ||
-		r == CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL)
-	{
-		(void) cluster_lock_acquire_s7_cleanup(req);
+	if (r == CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT || r == CLUSTER_LOCK_ACQUIRE_FAIL_DEADLOCK
+		|| r == CLUSTER_LOCK_ACQUIRE_FAIL_CANCEL || r == CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL) {
+		(void)cluster_lock_acquire_s7_cleanup(req);
 		return r;
 	}
 
@@ -450,10 +442,8 @@ cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *req)
 	 * S5 promote to convert reservation -> holder.
 	 */
 	r = cluster_lock_acquire_s5_promote_holder(req);
-	if (r != CLUSTER_LOCK_ACQUIRE_OK_GRANTED &&
-		r != CLUSTER_LOCK_ACQUIRE_OK_CONVERTED)
-	{
-		(void) cluster_lock_acquire_s7_cleanup(req);
+	if (r != CLUSTER_LOCK_ACQUIRE_OK_GRANTED && r != CLUSTER_LOCK_ACQUIRE_OK_CONVERTED) {
+		(void)cluster_lock_acquire_s7_cleanup(req);
 	}
 	return r;
 }
@@ -479,30 +469,23 @@ cluster_lock_acquire_s7_cleanup_count(void)
  *	release 对称 acceptance gate consumes these.
  */
 void
-cluster_lock_acquire_dump(void (*emit_row)(void *cookie, const char *key,
-										   const char *value),
+cluster_lock_acquire_dump(void (*emit_row)(void *cookie, const char *key, const char *value),
 						  void *cookie)
 {
 	char buf[32];
 
 	ensure_counter_initialized();
 
-	snprintf(buf, sizeof(buf), UINT64_FORMAT,
-			 pg_atomic_read_u64(&stub_s1_entry_count));
+	snprintf(buf, sizeof(buf), UINT64_FORMAT, pg_atomic_read_u64(&stub_s1_entry_count));
 	emit_row(cookie, "s1_entry", buf);
-	snprintf(buf, sizeof(buf), UINT64_FORMAT,
-			 pg_atomic_read_u64(&stub_s3_reservation_count));
+	snprintf(buf, sizeof(buf), UINT64_FORMAT, pg_atomic_read_u64(&stub_s3_reservation_count));
 	emit_row(cookie, "s3_reservation", buf);
-	snprintf(buf, sizeof(buf), UINT64_FORMAT,
-			 pg_atomic_read_u64(&stub_s4_remote_count));
+	snprintf(buf, sizeof(buf), UINT64_FORMAT, pg_atomic_read_u64(&stub_s4_remote_count));
 	emit_row(cookie, "s4_remote", buf);
-	snprintf(buf, sizeof(buf), UINT64_FORMAT,
-			 pg_atomic_read_u64(&stub_s5_promote_count));
+	snprintf(buf, sizeof(buf), UINT64_FORMAT, pg_atomic_read_u64(&stub_s5_promote_count));
 	emit_row(cookie, "s5_promote", buf);
-	snprintf(buf, sizeof(buf), UINT64_FORMAT,
-			 pg_atomic_read_u64(&stub_s6_release_count));
+	snprintf(buf, sizeof(buf), UINT64_FORMAT, pg_atomic_read_u64(&stub_s6_release_count));
 	emit_row(cookie, "s6_release", buf);
-	snprintf(buf, sizeof(buf), UINT64_FORMAT,
-			 pg_atomic_read_u64(&stub_s7_cleanup_count));
+	snprintf(buf, sizeof(buf), UINT64_FORMAT, pg_atomic_read_u64(&stub_s7_cleanup_count));
 	emit_row(cookie, "s7_cleanup", buf);
 }

@@ -280,11 +280,9 @@ StaticAssertDecl(sizeof(GesReplyPayload) == 48, "GesReplyPayload wire ABI 48-byt
  *	远端 master pipeline 推 spec-2.23 BAST 配套 ship。
  */
 struct ClusterResId;
-extern uint32 cluster_ges_send_request_and_wait(const struct ClusterResId *resid,
-												uint32 lockmode,
+extern uint32 cluster_ges_send_request_and_wait(const struct ClusterResId *resid, uint32 lockmode,
 												const struct ClusterGrdHolderId *holder,
-												uint64 request_id,
-												int timeout_ms);
+												uint64 request_id, int timeout_ms);
 
 extern uint32 cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 												const struct ClusterGrdHolderId *holder,

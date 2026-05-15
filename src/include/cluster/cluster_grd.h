@@ -554,8 +554,7 @@ extern ClusterGrdEntryResult cluster_grd_entry_promote_waiter(ClusterGrdEntry *e
  *   PG-native LockAcquire, then re-acquires + promotes (or cancels on
  *   revalidate fail per HC9 / P2.3).
  */
-extern bool cluster_grd_entry_has_remote_holder(ClusterGrdEntry *entry,
-												int32 self_node_id);
+extern bool cluster_grd_entry_has_remote_holder(ClusterGrdEntry *entry, int32 self_node_id);
 extern bool cluster_grd_entry_has_pending_waiter(ClusterGrdEntry *entry);
 extern bool cluster_grd_entry_has_pending_convert(ClusterGrdEntry *entry);
 
@@ -589,26 +588,21 @@ extern ClusterGrdEntryResult cluster_grd_reservation_promote(ClusterGrdEntry *en
  *   release_holder_by_id:  S6 — release holder under entry slock + remove
  *     entry from HTAB if last holder.
  */
-extern ClusterGrdEntryResult
-cluster_grd_try_reserve(const ClusterResId *resid,
-						const ClusterGrdHolderId *holder,
-						int mode, int32 self_node_id,
-						bool *fast_path_out,
-						uint64 *gen_snapshot_out);
+extern ClusterGrdEntryResult cluster_grd_try_reserve(const ClusterResId *resid,
+													 const ClusterGrdHolderId *holder, int mode,
+													 int32 self_node_id, bool *fast_path_out,
+													 uint64 *gen_snapshot_out);
 
-extern ClusterGrdEntryResult
-cluster_grd_revalidate_and_promote(const ClusterResId *resid,
-								   const ClusterGrdHolderId *holder,
-								   int32 self_node_id,
-								   uint64 gen_snapshot);
+extern ClusterGrdEntryResult cluster_grd_revalidate_and_promote(const ClusterResId *resid,
+																const ClusterGrdHolderId *holder,
+																int32 self_node_id,
+																uint64 gen_snapshot);
 
-extern ClusterGrdEntryResult
-cluster_grd_release_holder_by_id(const ClusterResId *resid,
-								 const ClusterGrdHolderId *holder);
+extern ClusterGrdEntryResult cluster_grd_release_holder_by_id(const ClusterResId *resid,
+															  const ClusterGrdHolderId *holder);
 
-extern ClusterGrdEntryResult
-cluster_grd_cancel_reservation_by_id(const ClusterResId *resid,
-									 const ClusterGrdHolderId *holder);
+extern ClusterGrdEntryResult cluster_grd_cancel_reservation_by_id(const ClusterResId *resid,
+																  const ClusterGrdHolderId *holder);
 
 /*
  * CSSD DEAD cleanup entry point (Step 4 D11 + LMON tick polling D8).

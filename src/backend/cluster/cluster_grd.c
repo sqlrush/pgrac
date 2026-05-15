@@ -1028,40 +1028,34 @@ cluster_grd_lockmode_conflicts(int held pg_attribute_unused(), int wanted pg_att
  * ============================================================ */
 
 ClusterGrdEntryResult
-cluster_grd_entry_grant_holder(ClusterGrdEntry *entry,
-							   const ClusterGrdHolderId *holder,
-							   int mode)
+cluster_grd_entry_grant_holder(ClusterGrdEntry *entry, const ClusterGrdHolderId *holder, int mode)
 {
 	int slot;
 
 	Assert(entry != NULL && holder != NULL);
 
-	if (entry->ngranted >= PGRAC_GRD_MAX_HOLDERS)
-	{
+	if (entry->ngranted >= PGRAC_GRD_MAX_HOLDERS) {
 		cluster_grd_inc_ges_work_queue_full();
 		return CLUSTER_GRD_ENTRY_FULL;
 	}
 	slot = entry->ngranted++;
-	entry->holders[slot].node_id = (int32) holder->node_id;
-	entry->holders[slot].mode = (LOCKMODE) mode;
-	entry->holders[slot].xid = (TransactionId) holder->request_id;
+	entry->holders[slot].node_id = (int32)holder->node_id;
+	entry->holders[slot].mode = (LOCKMODE)mode;
+	entry->holders[slot].xid = (TransactionId)holder->request_id;
 	entry->generation++;
 	return CLUSTER_GRD_ENTRY_OK;
 }
 
 ClusterGrdEntryResult
-cluster_grd_entry_release_holder(ClusterGrdEntry *entry,
-								 const ClusterGrdHolderId *holder)
+cluster_grd_entry_release_holder(ClusterGrdEntry *entry, const ClusterGrdHolderId *holder)
 {
 	int i;
 
 	Assert(entry != NULL && holder != NULL);
 
-	for (i = 0; i < entry->ngranted; i++)
-	{
-		if ((uint32) entry->holders[i].node_id == holder->node_id &&
-			(uint64) entry->holders[i].xid == holder->request_id)
-		{
+	for (i = 0; i < entry->ngranted; i++) {
+		if ((uint32)entry->holders[i].node_id == holder->node_id
+			&& (uint64)entry->holders[i].xid == holder->request_id) {
 			/* compact down */
 			if (i < entry->ngranted - 1)
 				entry->holders[i] = entry->holders[entry->ngranted - 1];
@@ -1075,39 +1069,33 @@ cluster_grd_entry_release_holder(ClusterGrdEntry *entry,
 }
 
 ClusterGrdEntryResult
-cluster_grd_entry_add_waiter(ClusterGrdEntry *entry,
-							 const ClusterGrdHolderId *holder,
-							 int mode)
+cluster_grd_entry_add_waiter(ClusterGrdEntry *entry, const ClusterGrdHolderId *holder, int mode)
 {
 	int slot;
 
 	Assert(entry != NULL && holder != NULL);
 
-	if (entry->nwaiters >= PGRAC_GRD_MAX_WAITERS)
-	{
+	if (entry->nwaiters >= PGRAC_GRD_MAX_WAITERS) {
 		cluster_grd_inc_ges_work_queue_full();
 		return CLUSTER_GRD_ENTRY_FULL;
 	}
 	slot = entry->nwaiters++;
-	entry->waiters[slot].node_id = (int32) holder->node_id;
-	entry->waiters[slot].mode = (LOCKMODE) mode;
+	entry->waiters[slot].node_id = (int32)holder->node_id;
+	entry->waiters[slot].mode = (LOCKMODE)mode;
 	entry->waiters[slot].wait_start = GetCurrentTimestamp();
 	entry->generation++;
 	return CLUSTER_GRD_ENTRY_OK;
 }
 
 ClusterGrdEntryResult
-cluster_grd_entry_promote_waiter(ClusterGrdEntry *entry,
-								 const ClusterGrdHolderId *holder)
+cluster_grd_entry_promote_waiter(ClusterGrdEntry *entry, const ClusterGrdHolderId *holder)
 {
 	int i;
 
 	Assert(entry != NULL && holder != NULL);
 
-	for (i = 0; i < entry->nwaiters; i++)
-	{
-		if ((uint32) entry->waiters[i].node_id == holder->node_id)
-		{
+	for (i = 0; i < entry->nwaiters; i++) {
+		if ((uint32)entry->waiters[i].node_id == holder->node_id) {
 			LOCKMODE mode = entry->waiters[i].mode;
 
 			if (i < entry->nwaiters - 1)
@@ -1160,8 +1148,7 @@ cluster_grd_entry_generation(ClusterGrdEntry *entry)
 }
 
 ClusterGrdEntryResult
-cluster_grd_reservation_create(ClusterGrdEntry *entry,
-							   const ClusterGrdHolderId *holder, int mode)
+cluster_grd_reservation_create(ClusterGrdEntry *entry, const ClusterGrdHolderId *holder, int mode)
 {
 	int slot;
 
@@ -1171,24 +1158,21 @@ cluster_grd_reservation_create(ClusterGrdEntry *entry,
 		return CLUSTER_GRD_ENTRY_FULL;
 	slot = entry->nreservations++;
 	entry->reservations[slot].id = *holder;
-	entry->reservations[slot].mode = (LOCKMODE) mode;
+	entry->reservations[slot].mode = (LOCKMODE)mode;
 	entry->generation++;
 	return CLUSTER_GRD_ENTRY_OK;
 }
 
 ClusterGrdEntryResult
-cluster_grd_reservation_cancel(ClusterGrdEntry *entry,
-							   const ClusterGrdHolderId *holder)
+cluster_grd_reservation_cancel(ClusterGrdEntry *entry, const ClusterGrdHolderId *holder)
 {
 	int i;
 
 	Assert(entry != NULL && holder != NULL);
 
-	for (i = 0; i < entry->nreservations; i++)
-	{
-		if (entry->reservations[i].id.node_id == holder->node_id &&
-			entry->reservations[i].id.request_id == holder->request_id)
-		{
+	for (i = 0; i < entry->nreservations; i++) {
+		if (entry->reservations[i].id.node_id == holder->node_id
+			&& entry->reservations[i].id.request_id == holder->request_id) {
 			if (i < entry->nreservations - 1)
 				entry->reservations[i] = entry->reservations[entry->nreservations - 1];
 			memset(&entry->reservations[entry->nreservations - 1], 0,
@@ -1202,18 +1186,15 @@ cluster_grd_reservation_cancel(ClusterGrdEntry *entry,
 }
 
 ClusterGrdEntryResult
-cluster_grd_reservation_promote(ClusterGrdEntry *entry,
-								const ClusterGrdHolderId *holder)
+cluster_grd_reservation_promote(ClusterGrdEntry *entry, const ClusterGrdHolderId *holder)
 {
 	int i;
 
 	Assert(entry != NULL && holder != NULL);
 
-	for (i = 0; i < entry->nreservations; i++)
-	{
-		if (entry->reservations[i].id.node_id == holder->node_id &&
-			entry->reservations[i].id.request_id == holder->request_id)
-		{
+	for (i = 0; i < entry->nreservations; i++) {
+		if (entry->reservations[i].id.node_id == holder->node_id
+			&& entry->reservations[i].id.request_id == holder->request_id) {
 			LOCKMODE mode = entry->reservations[i].mode;
 			ClusterGrdEntryResult r;
 
@@ -1222,7 +1203,7 @@ cluster_grd_reservation_promote(ClusterGrdEntry *entry,
 			memset(&entry->reservations[entry->nreservations - 1], 0,
 				   sizeof(entry->reservations[0]));
 			entry->nreservations--;
-			r = cluster_grd_entry_grant_holder(entry, holder, (int) mode);
+			r = cluster_grd_entry_grant_holder(entry, holder, (int)mode);
 			/* generation already bumped by grant_holder */
 			return r;
 		}
@@ -1543,11 +1524,8 @@ cluster_grd_cleanup_on_backend_exit(int procno)
  * ============================================================ */
 
 ClusterGrdEntryResult
-cluster_grd_try_reserve(const ClusterResId *resid,
-						const ClusterGrdHolderId *holder,
-						int mode, int32 self_node_id,
-						bool *fast_path_out,
-						uint64 *gen_snapshot_out)
+cluster_grd_try_reserve(const ClusterResId *resid, const ClusterGrdHolderId *holder, int mode,
+						int32 self_node_id, bool *fast_path_out, uint64 *gen_snapshot_out)
 {
 	ClusterGrdEntry *entry = NULL;
 	ClusterGrdEntryResult er;
@@ -1566,10 +1544,10 @@ cluster_grd_try_reserve(const ClusterResId *resid,
 	if (gen_snapshot_out)
 		*gen_snapshot_out = entry->generation;
 
-	fast_path = (master == self_node_id || master < 0) &&
-		!cluster_grd_entry_has_remote_holder(entry, self_node_id) &&
-		!cluster_grd_entry_has_pending_waiter(entry) &&
-		!cluster_grd_entry_has_pending_convert(entry);
+	fast_path = (master == self_node_id || master < 0)
+				&& !cluster_grd_entry_has_remote_holder(entry, self_node_id)
+				&& !cluster_grd_entry_has_pending_waiter(entry)
+				&& !cluster_grd_entry_has_pending_convert(entry);
 
 	er = cluster_grd_reservation_create(entry, holder, mode);
 	SpinLockRelease(&entry->lock);
@@ -1580,10 +1558,8 @@ cluster_grd_try_reserve(const ClusterResId *resid,
 }
 
 ClusterGrdEntryResult
-cluster_grd_revalidate_and_promote(const ClusterResId *resid,
-								   const ClusterGrdHolderId *holder,
-								   int32 self_node_id,
-								   uint64 gen_snapshot pg_attribute_unused())
+cluster_grd_revalidate_and_promote(const ClusterResId *resid, const ClusterGrdHolderId *holder,
+								   int32 self_node_id, uint64 gen_snapshot pg_attribute_unused())
 {
 	ClusterGrdEntry *entry = NULL;
 	ClusterGrdEntryResult er;
@@ -1602,9 +1578,8 @@ cluster_grd_revalidate_and_promote(const ClusterResId *resid,
 	 * new remote real holder defeats the promote.
 	 */
 	revalidate_ok = !cluster_grd_entry_has_remote_holder(entry, self_node_id);
-	if (!revalidate_ok)
-	{
-		(void) cluster_grd_reservation_cancel(entry, holder);
+	if (!revalidate_ok) {
+		(void)cluster_grd_reservation_cancel(entry, holder);
 		SpinLockRelease(&entry->lock);
 		return CLUSTER_GRD_ENTRY_NOT_FOUND;
 	}
@@ -1614,8 +1589,7 @@ cluster_grd_revalidate_and_promote(const ClusterResId *resid,
 }
 
 ClusterGrdEntryResult
-cluster_grd_release_holder_by_id(const ClusterResId *resid,
-								 const ClusterGrdHolderId *holder)
+cluster_grd_release_holder_by_id(const ClusterResId *resid, const ClusterGrdHolderId *holder)
 {
 	ClusterGrdEntry *entry = NULL;
 	ClusterGrdEntryResult er;
@@ -1633,8 +1607,7 @@ cluster_grd_release_holder_by_id(const ClusterResId *resid,
 }
 
 ClusterGrdEntryResult
-cluster_grd_cancel_reservation_by_id(const ClusterResId *resid,
-									 const ClusterGrdHolderId *holder)
+cluster_grd_cancel_reservation_by_id(const ClusterResId *resid, const ClusterGrdHolderId *holder)
 {
 	ClusterGrdEntry *entry = NULL;
 	ClusterGrdEntryResult er;

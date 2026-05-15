@@ -85,7 +85,8 @@ typedef enum ClusterLockAcquireResult {
 	CLUSTER_LOCK_ACQUIRE_OK_CONVERTED = 1, /* S5 promote success(mode convert) */
 	CLUSTER_LOCK_ACQUIRE_PENDING = 2,	   /* S4 async wait — caller waits GES_REPLY */
 	CLUSTER_LOCK_ACQUIRE_OK_NATIVE = 3,	   /* cluster gate disabled; caller uses PG-native path */
-	CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK = 4, /* spec-2.21:S1-S4 reservation/grant 完成,caller(lock.c)调 PG-native LockAcquire + S5 promote */
+	CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK
+	= 4, /* spec-2.21:S1-S4 reservation/grant 完成,caller(lock.c)调 PG-native LockAcquire + S5 promote */
 	CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE = 10,	 /* S1 53R80 fail-closed */
 	CLUSTER_LOCK_ACQUIRE_FAIL_GRD_NOT_READY = 11,	 /* S2 cluster.grd_max_entries=0 */
 	CLUSTER_LOCK_ACQUIRE_FAIL_RESERVATION_FULL = 12, /* S3 GRD entry full / 53R71 */
@@ -107,17 +108,26 @@ typedef enum ClusterLockAcquireResult {
  *	cluster_lmd_is_ready() helper;禁止 `state >= READY` 数值比较。
  */
 typedef struct ClusterLockAcquireRequest {
-	ClusterResId resid; /* 16B canonical wire-encoded ResId(spec-2.14 ship)*/
-	LOCKTAG locktag;	/* spec-2.21 D1:caller PG LOCKTAG for IsClusterLockTag predicate + identity validation */
-	LOCKMODE lockmode;	/* requested PG lock mode */
-	int lockmethod_id;	/* DEFAULT_LOCKMETHOD / SHORT_LOCKMETHOD / cluster-aware class */
-	bool dontwait;		/* true → S4 immediate ConditionalLock semantic(no wait)*/
-	bool sessionLock;	/* spec-2.21 D1:HC11 session advisory stays native;sessionLock=true 不进 cluster path */
-	ClusterGrdHolderId holder; /* spec-2.21 D1:S3 reservation pin / S5 promote / S6 release identity */
-	uint64 request_id;	/* spec-2.21 D1:per-acquire monotonic id;LOCALLOCK exactly-once registration key */
-	uint64 master_gen_snapshot; /* spec-2.21 P2.3:S3 acquire 时 snapshot,S5 revalidate fail → backout */
-	uint64
-		caller_local_start_ts_ms; /* spec-2.17 P2.2 deterministic 4-tuple — DESC = newer = youngest victim */
+	/* 16B canonical wire-encoded ResId (spec-2.14 ship). */
+	ClusterResId resid;
+	/* spec-2.21 D1: caller PG LOCKTAG for gate predicate + identity. */
+	LOCKTAG locktag;
+	/* requested PG lock mode */
+	LOCKMODE lockmode;
+	/* DEFAULT_LOCKMETHOD / SHORT_LOCKMETHOD / cluster-aware class */
+	int lockmethod_id;
+	/* true → S4 immediate ConditionalLock semantic (no wait) */
+	bool dontwait;
+	/* spec-2.21 D1: HC11 session advisory stays native (skip cluster path). */
+	bool sessionLock;
+	/* spec-2.21 D1: S3 reservation pin / S5 promote / S6 release identity. */
+	ClusterGrdHolderId holder;
+	/* spec-2.21 D1: per-acquire monotonic id; LOCALLOCK exactly-once key. */
+	uint64 request_id;
+	/* spec-2.21 P2.3: S3 snapshot; S5 revalidate fail → backout. */
+	uint64 master_gen_snapshot;
+	/* spec-2.17 P2.2 deterministic 4-tuple — DESC = newer = youngest victim. */
+	uint64 caller_local_start_ts_ms;
 } ClusterLockAcquireRequest;
 
 /*
@@ -128,7 +138,7 @@ typedef struct ClusterLockAcquireRequest {
  *	gate exactly-once 调用(HC9 grant/release 对称契约)。
  */
 typedef struct ClusterLockReleaseRequest {
-	LOCKTAG locktag;	/* identity */
+	LOCKTAG locktag; /* identity */
 	LOCKMODE lockmode;
 	bool sessionLock;
 	ClusterGrdHolderId holder; /* from LOCALLOCK->cluster_holder */
@@ -236,7 +246,7 @@ cluster_lock_should_globalize(const LOCKTAG *locktag, LOCKMODE lockmode pg_attri
 	if (locktag == NULL)
 		return false;
 	if (sessionLock)
-		return false;	/* HC11: session advisory stays native */
+		return false; /* HC11: session advisory stays native */
 	return (locktag->locktag_type == LOCKTAG_ADVISORY);
 }
 
@@ -273,8 +283,7 @@ extern uint64 cluster_lock_acquire_s7_cleanup_count(void);
  *	s3_reservation / s4_remote / s5_promote / s6_release / s7_cleanup)
  *	供 030_acceptance L18 HC9 grant-release 对称 acceptance gate。
  */
-extern void cluster_lock_acquire_dump(void (*emit_row)(void *cookie,
-													   const char *key,
+extern void cluster_lock_acquire_dump(void (*emit_row)(void *cookie, const char *key,
 													   const char *value),
 									  void *cookie);
 
