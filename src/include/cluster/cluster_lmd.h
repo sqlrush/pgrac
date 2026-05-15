@@ -399,6 +399,25 @@ extern int cluster_lmd_graph_snapshot_copy(ClusterLmdWaitEdge *out_buf,
 										   int max_edges,
 										   uint64 *out_gen_at_snapshot);
 
+/* spec-2.22 D3 — Tarjan public API. */
+extern int cluster_lmd_tarjan_scan_snapshot(const ClusterLmdWaitEdge *edges,
+											int nedges,
+											ClusterLmdVertex *out_cycle_vertices,
+											int max_cycle_vertices,
+											int *out_cycle_count);
+extern void cluster_lmd_tarjan_pick_victim(const ClusterLmdVertex *cycle_vertices,
+										   int nvertices,
+										   ClusterLmdVertex *out_victim);
+extern bool cluster_lmd_tarjan_revalidate(const ClusterLmdVertex *cycle_vertices,
+										  int nvertices,
+										  uint64 snapshot_generation);
+extern void cluster_lmd_tarjan_run_local_scan(void);
+
+/* spec-2.22 D8 — victim signal helper (defined in cluster_lmd_tarjan.c
+ * Step 6;forward-declared so Step 4 build links). */
+extern void cluster_lmd_signal_local_victim(uint32 procno, uint64 request_id,
+											uint64 cluster_epoch);
+
 /*
  * shmem region helpers — registered by cluster_init_shmem_module()
  * via the spec-1.3 region registry.

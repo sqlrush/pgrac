@@ -66,6 +66,7 @@ OBJS = \
 	cluster_lmd.o \
 	cluster_lmd_graph.o \
 	cluster_lmd_srf.o \
+	cluster_lmd_tarjan.o \
 	cluster_lmon.o \
 	cluster_lms.o \
 	cluster_pcm_lock.o \
