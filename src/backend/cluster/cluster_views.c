@@ -200,6 +200,9 @@ static const uint32 cluster_wait_event_infos[CLUSTER_WAIT_EVENTS_COUNT] = {
 	WAIT_EVENT_CLUSTER_GES_S4_WAIT,
 	/* spec-2.22 D10: LMD coordinator handler processing DEADLOCK_PROBE. */
 	WAIT_EVENT_CLUSTER_LMD_PROBE,
+	/* spec-2.23 D12: cross-node GES reply 5-tuple wait + REPORT collect. */
+	WAIT_EVENT_CLUSTER_GES_REPLY_WAIT,
+	WAIT_EVENT_CLUSTER_LMD_PROBE_COLLECT,
 };
 
 /* Compile-time assertion: array length must match the documented count. */

@@ -693,7 +693,7 @@ cluster_ges_send_request_and_wait(const struct ClusterResId *resid, uint32 lockm
 	ConditionVariablePrepareToSleep(&entry->cv);
 	while (!entry->ready) {
 		if (!ConditionVariableTimedSleep(&entry->cv, effective_timeout_ms,
-										 WAIT_EVENT_CLUSTER_GES_S4_WAIT)) {
+										 WAIT_EVENT_CLUSTER_GES_REPLY_WAIT)) {
 			/* HC17:  timeout MUST unconditionally delete entry. */
 			cluster_ges_reply_wait_delete(&key);
 			ConditionVariableCancelSleep();

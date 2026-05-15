@@ -77,6 +77,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_lck.h"  /* cluster_lck_status (spec-1.12 D12) */
 #include "cluster/cluster_scn.h"  /* cluster_scn_current (spec-1.15 D6) */
 #include "cluster/cluster_ges.h"  /* cluster_ges_{request,reply}_defer_count (spec-2.13 D4) */
+#include "cluster/cluster_ges_reply_wait.h" /* spec-2.23 D13 reply wait counters */
 #include "cluster/cluster_grd.h"  /* cluster_grd_* observability accessors (spec-2.14 D6) */
 #include "cluster/cluster_lmd.h"  /* cluster_lmd_* observability accessors (spec-2.19 D10) */
 #include "cluster/cluster_lms.h"  /* cluster_lms_* observability accessors (spec-2.18 D10) */
@@ -937,6 +938,11 @@ dump_lmd(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_lmd_cross_node_victim_pending_count_get()));
 	emit_row(rsinfo, "lmd", "inject_call_count",
 			 fmt_int64((int64)cluster_lmd_inject_call_count_get()));
+	/* spec-2.23 D13 — 2 NEW coordinator probe counters. */
+	emit_row(rsinfo, "lmd", "probe_broadcast_count",
+			 fmt_int64((int64)cluster_lmd_probe_broadcast_count_get()));
+	emit_row(rsinfo, "lmd", "probe_partial_count",
+			 fmt_int64((int64)cluster_lmd_probe_partial_count_get()));
 }
 
 
@@ -961,6 +967,23 @@ dump_ges(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_ges_request_defer_count()));
 	emit_row(rsinfo, "ges", "ges_reply_defer_count",
 			 fmt_int64((int64)cluster_ges_reply_defer_count()));
+	/*
+	 * spec-2.23 D13 — 3 NEW counters for the cross-node reply wait HTAB.
+	 *
+	 *	reply_wait_table_active:  live entry count (HC17 5-tuple HTAB).
+	 *	reply_late_drop:          late reply observed after entry deleted.
+	 *	release_ack:              successful GES_RELEASE round-trip ACKs.
+	 *
+	 *	BAST lifecycle counters (grd_bast_sent / grd_bast_received /
+	 *	grd_bast_ack) remain the SSOT in dump_grd (spec-2.17 ship);
+	 *	dump_ges 不 duplicate them per FU-3 contract.
+	 */
+	emit_row(rsinfo, "ges", "ges_reply_wait_table_active",
+			 fmt_int64((int64)cluster_ges_reply_wait_table_active_count()));
+	emit_row(rsinfo, "ges", "ges_reply_late_drop_count",
+			 fmt_int64((int64)cluster_ges_reply_late_drop_count()));
+	emit_row(rsinfo, "ges", "ges_release_ack_count",
+			 fmt_int64((int64)cluster_ges_release_ack_count()));
 }
 
 

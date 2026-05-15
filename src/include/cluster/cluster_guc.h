@@ -203,6 +203,10 @@ extern int cluster_grd_max_entries;
 extern int cluster_ges_request_timeout_ms;
 extern int cluster_ges_effective_timeout_ms(int lock_timeout_ms);
 
+/* spec-2.23 D11 NEW: coordinator REPORT collect timeout + reply wait cap. */
+extern int cluster_lmd_probe_collect_timeout_ms;
+extern int cluster_ges_reply_wait_max_entries;
+
 /* spec-2.17 NEW GUCs(v0.6 frozen baseline). */
 extern int cluster_ges_bast_retry_interval_ms;		  /* D11 */
 extern int cluster_ges_bast_max_retries;			  /* D11 */

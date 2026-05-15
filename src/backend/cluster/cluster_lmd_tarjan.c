@@ -595,7 +595,7 @@ cluster_lmd_tarjan_run_coordinator_scan(int collect_timeout_ms)
 	TimestampTz now;
 
 	if (collect_timeout_ms <= 0)
-		collect_timeout_ms = 3000;	/* spec default, Step 9 D11 introduces GUC */
+		collect_timeout_ms = cluster_lmd_probe_collect_timeout_ms;
 
 	/* (1) Build active-peer list (skip self).  Active-status comes from
 	 *	  cluster_conf_node_count() + the conf cache. */
@@ -656,7 +656,7 @@ cluster_lmd_tarjan_run_coordinator_scan(int collect_timeout_ms)
 		}
 		CHECK_FOR_INTERRUPTS();
 		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 50,
-						 WAIT_EVENT_CLUSTER_LMD_PROBE);
+						 WAIT_EVENT_CLUSTER_LMD_PROBE_COLLECT);
 		ResetLatch(MyLatch);
 	}
 

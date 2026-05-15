@@ -445,6 +445,21 @@ typedef enum {
 	 * 推 spec-2.23 BAST 配套;本 spec scope 仅 handler dispatch + payload.
 	 */
 	WAIT_EVENT_CLUSTER_LMD_PROBE,
+	/*
+	 * spec-2.23 D12:cross-node GES reply 5-tuple wait (HC17).  Backend
+	 * sleeps on the per-entry ConditionVariable inserted into the
+	 * cluster_ges_reply_wait HTAB before sending a GES_REQUEST/RELEASE
+	 * to a remote master.  Wake on GES_REPLY arrival or timeout (53R70).
+	 */
+	WAIT_EVENT_CLUSTER_GES_REPLY_WAIT,
+	/*
+	 * spec-2.23 D12:LMD coordinator REPORT collect.  Coordinator scan
+	 * tick polls WaitLatch up to cluster.lmd_probe_collect_timeout_ms
+	 * for N-1 DEADLOCK_REPORTs after broadcasting PROBE.  Distinct from
+	 * WAIT_EVENT_CLUSTER_LMD_PROBE which covers the per-receiver
+	 * handler processing path.
+	 */
+	WAIT_EVENT_CLUSTER_LMD_PROBE_COLLECT,
 } WaitEventCluster;
 
 
