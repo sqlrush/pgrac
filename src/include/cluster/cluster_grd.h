@@ -604,6 +604,102 @@ extern ClusterGrdEntryResult cluster_grd_release_holder_by_id(const ClusterResId
 extern ClusterGrdEntryResult cluster_grd_cancel_reservation_by_id(const ClusterResId *resid,
 																  const ClusterGrdHolderId *holder);
 
+/* ============================================================
+ * spec-2.23 D6 — GRD-owned grant / waiter-pop API.
+ *
+ *	HC18 / HC19 / HC20 enforcement (spec-2.23 §3.2):  the LMS daemon
+ *	must drive cross-node grant decisions through GRD-owned APIs so the
+ *	ClusterGrdEntry body remains opaque (header declares forward decl
+ *	only at line 104).  spec-2.21 ship paths (`cluster_grd_entry_grant_
+ *	holder` / `add_waiter` / `release_holder`) stay intact for the local
+ *	S5 promote path; spec-2.23 adds two higher-level entry points that
+ *	bundle conflict matrix + waiter-identity carry + entry generation
+ *	bump under a single critical section.
+ * ============================================================ */
+
+/*
+ * Per-entry cap exposed to LMS dispatch so callers can size the
+ * conflict-holder snapshot buffer.  The cap mirrors the private
+ * cluster_grd.c PGRAC_GRD_MAX_HOLDERS (16);  surfacing the value via
+ * the header keeps cluster_lms.c / cluster_ges.c free of cluster_grd.c
+ * internal struct layout knowledge.
+ */
+#define PGRAC_GRD_MAX_HOLDERS_PUBLIC 16
+
+/*
+ * Conflict-holder snapshot returned to the LMS dispatch path.  Carries
+ * enough identity for the BAST send target list (Step 5 D4 — HC18:
+ * targeted BAST filtered by DoLockModesConflict, never peer broadcast).
+ */
+typedef struct ClusterGrdConflictHolder {
+	ClusterGrdHolderId holder;
+	int32			   source_node_id; /* hosting node — BAST destination */
+	LOCKMODE		   held_mode;
+} ClusterGrdConflictHolder;
+
+/*
+ * Waiter identity returned by release_and_pop — carries the full
+ * 5-tuple parts the LMS needs to build a GES_REPLY GRANT envelope
+ * and route it back to the originating backend.
+ */
+typedef struct ClusterGrdWaiterIdentity {
+	ClusterGrdHolderId holder;
+	int32			   source_node_id;
+	uint64			   request_id;
+	uint32			   request_opcode;
+	LOCKMODE		   mode;
+} ClusterGrdWaiterIdentity;
+
+/*
+ * enqueue_or_grant result discriminator.  Step 4 D6 dispatch:
+ *   GRANT_NOW         → LMS sends GES_REPLY GRANT immediately
+ *   ENQUEUED_WAITER   → LMS triggers targeted BAST (Step 5 D4); reply
+ *                       sent later when release_and_pop wakes this waiter
+ *   WAIT_QUEUE_FULL   → LMS sends GES_REPLY REJECT 53R71 fail-closed
+ *   NOT_READY         → GRD not yet initialised; LMS retries on next tick
+ */
+typedef enum ClusterGrdGrantAction {
+	CLUSTER_GRD_GRANT_NOW = 0,
+	CLUSTER_GRD_ENQUEUED_WAITER = 1,
+	CLUSTER_GRD_WAIT_QUEUE_FULL = 2,
+	CLUSTER_GRD_NOT_READY = 3,
+} ClusterGrdGrantAction;
+
+/*
+ * Single-shot grant-or-enqueue under the entry lock.
+ *
+ *	source_node_id / request_id / request_opcode carry forward into the
+ *	waiter slot (HC17/HC19) so the LMS can later route a GES_REPLY GRANT
+ *	to the originating backend without round-tripping through caller
+ *	state.  conflict_holders_out / n_conflict_out fill the BAST target
+ *	snapshot when result == ENQUEUED_WAITER; both may be NULL when the
+ *	caller doesn't need the snapshot (e.g. GRANT_NOW path).
+ *
+ *	conflict_holders_out buffer must hold at least PGRAC_GRD_MAX_HOLDERS
+ *	entries (16).  *n_conflict_out is 0 on GRANT_NOW.
+ */
+extern ClusterGrdGrantAction cluster_grd_entry_enqueue_or_grant(
+	const ClusterResId *resid, const ClusterGrdHolderId *holder, int32 source_node_id,
+	uint64 request_id, uint32 request_opcode, int /* LOCKMODE */ lockmode,
+	ClusterGrdConflictHolder *conflict_holders_out, int *n_conflict_out);
+
+/*
+ * Release a holder + pop the first FIFO-compatible waiter.
+ *
+ *	Returns the number of waiters granted (0 if none compatible).
+ *	granted_out buffer must hold at least 1 entry (Step 4 ships single-
+ *	pop semantics; a future amend may coalesce multiple shared-mode
+ *	waiters into one release path).  The caller is responsible for
+ *	sending GES_REPLY GRANT for each populated identity.
+ *
+ *	If the holder identity is not currently in the holders[] array,
+ *	the function returns 0 with *granted_out unchanged.
+ */
+extern int cluster_grd_entry_release_and_pop_compatible_waiter(
+	const ClusterResId *resid, const ClusterGrdHolderId *holder,
+	ClusterGrdWaiterIdentity *granted_out, int max_out);
+
+
 /*
  * CSSD DEAD cleanup entry point (Step 4 D11 + LMON tick polling D8).
  *

@@ -390,6 +390,31 @@ cluster_ges_reply_handler(const ClusterICEnvelope *env, const void *payload)
 	}
 }
 
+/*
+ * Build a GES_REPLY GRANT envelope addressed to a popped waiter and
+ * enqueue it via the LMON reply ring.  Helper for the drain path; keeps
+ * the envelope construction local to the file.
+ */
+static void
+ges_send_grant_reply(int32 dest_node_id, const ClusterGrdHolderId *holder,
+					 const ClusterResId *resid, uint32 request_opcode)
+{
+	GesReplyPayload reply;
+
+	memset(&reply, 0, sizeof(reply));
+	reply.opcode = GES_REPLY_OPCODE_GRANT;
+	reply.reply_for_opcode = request_opcode;
+	reply.reject_reason = GES_REJECT_REASON_NONE;
+	reply.holder_node_id = (uint32) holder->node_id;
+	reply.holder_procno = holder->procno;
+	reply.holder_cluster_epoch_lo = (uint32) (holder->cluster_epoch & 0xffffffffu);
+	reply.holder_cluster_epoch_hi = (uint32) (holder->cluster_epoch >> 32);
+	reply.holder_request_id_lo = (uint32) (holder->request_id & 0xffffffffu);
+	reply.holder_request_id_hi = (uint32) (holder->request_id >> 32);
+	memcpy(reply.resid, resid, sizeof(reply.resid));
+	cluster_grd_outbound_enqueue_lmon_reply((uint32) dest_node_id, &reply, sizeof(reply));
+}
+
 int
 cluster_ges_lmon_drain_work_queue(void)
 {
@@ -398,7 +423,10 @@ cluster_ges_lmon_drain_work_queue(void)
 
 	while (drained < 64 && cluster_grd_work_queue_dequeue(&item)) {
 		const GesRequestPayload *req;
-		GesReplyPayload reply;
+		ClusterGrdHolderId holder;
+		ClusterResId resid;
+		uint64 holder_epoch;
+		uint64 holder_request_id;
 
 		drained++;
 
@@ -407,32 +435,104 @@ cluster_ges_lmon_drain_work_queue(void)
 			continue;
 		}
 
-		req = (const GesRequestPayload *)item.payload;
+		req = (const GesRequestPayload *) item.payload;
 
-		/* RELEASE is cleanup-only in the current substrate path. */
-		if (req->opcode == GES_REQ_OPCODE_RELEASE)
-			continue;
+		holder_epoch = ((uint64) req->holder_cluster_epoch_lo)
+					   | (((uint64) req->holder_cluster_epoch_hi) << 32);
+		holder_request_id = ((uint64) req->holder_request_id_lo)
+							| (((uint64) req->holder_request_id_hi) << 32);
 
-		/*
-		 * The full grant/convert state machine is not wired to PG lock.c yet.
-		 * Reject rather than grant so a future caller can fail closed instead
-		 * of observing a false grant.
-		 */
-		memset(&reply, 0, sizeof(reply));
-		reply.opcode = GES_REPLY_OPCODE_REJECT;
-		/* PGRAC: spec-2.23 D1 / HC17 — echo original request opcode for
-		 * sender's reply wait table 5-tuple key match. */
-		reply.reply_for_opcode = req->opcode;
-		reply.reject_reason = GES_REJECT_REASON_LOCK_CONFLICT;
-		reply.holder_node_id = req->holder_node_id;
-		reply.holder_procno = req->holder_procno;
-		reply.holder_cluster_epoch_lo = req->holder_cluster_epoch_lo;
-		reply.holder_cluster_epoch_hi = req->holder_cluster_epoch_hi;
-		reply.holder_request_id_lo = req->holder_request_id_lo;
-		reply.holder_request_id_hi = req->holder_request_id_hi;
-		memcpy(reply.resid, req->resid, sizeof(reply.resid));
+		holder.node_id = req->holder_node_id;
+		holder.procno = req->holder_procno;
+		holder.cluster_epoch = holder_epoch;
+		holder.request_id = holder_request_id;
+		memcpy(&resid, req->resid, sizeof(resid));
 
-		cluster_grd_outbound_enqueue_lmon_reply(item.source_node_id, &reply, sizeof(reply));
+		switch ((GesRequestOpcode) req->opcode) {
+			case GES_REQ_OPCODE_REQUEST:
+			case GES_REQ_OPCODE_CONVERT: {
+				/*
+				 * spec-2.23 D6 — GRD-owned conflict matrix + waiter queue.
+				 *
+				 *	enqueue_or_grant handles the entry lock, conflict scan
+				 *	via DoLockModesConflict, and either grants immediately
+				 *	or enqueues a waiter carrying the full reply identity
+				 *	(HC17/HC19).  conflict_holders[] surface is consumed by
+				 *	Step 5 D4 cluster_ges_send_bast_targeted (HC18 BAST
+				 *	target filter).
+				 */
+				ClusterGrdConflictHolder conflict_holders[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+				int n_conflict = 0;
+				ClusterGrdGrantAction action;
+
+				action = cluster_grd_entry_enqueue_or_grant(
+					&resid, &holder, (int32) item.source_node_id, holder_request_id,
+					req->opcode, (int) req->lockmode, conflict_holders, &n_conflict);
+
+				if (action == CLUSTER_GRD_GRANT_NOW) {
+					ges_send_grant_reply((int32) item.source_node_id, &holder, &resid,
+										 req->opcode);
+				} else if (action == CLUSTER_GRD_ENQUEUED_WAITER) {
+					/*
+					 * Step 5 D4 wires the actual targeted BAST send here.
+					 * For Step 4 we just count the conflict surface so
+					 * dump_ges observability reflects how often the LMS
+					 * had to enqueue a waiter behind incompatible holders.
+					 */
+					(void) n_conflict;
+					(void) conflict_holders;
+				} else if (action == CLUSTER_GRD_WAIT_QUEUE_FULL) {
+					GesReplyPayload reject;
+
+					memset(&reject, 0, sizeof(reject));
+					reject.opcode = GES_REPLY_OPCODE_REJECT;
+					reject.reply_for_opcode = req->opcode;
+					reject.reject_reason = GES_REJECT_REASON_WORK_QUEUE_FULL;
+					reject.holder_node_id = req->holder_node_id;
+					reject.holder_procno = req->holder_procno;
+					reject.holder_cluster_epoch_lo = req->holder_cluster_epoch_lo;
+					reject.holder_cluster_epoch_hi = req->holder_cluster_epoch_hi;
+					reject.holder_request_id_lo = req->holder_request_id_lo;
+					reject.holder_request_id_hi = req->holder_request_id_hi;
+					memcpy(reject.resid, req->resid, sizeof(reject.resid));
+					cluster_grd_outbound_enqueue_lmon_reply(item.source_node_id, &reject,
+															sizeof(reject));
+				}
+				/* CLUSTER_GRD_NOT_READY → silently retry on next drain tick. */
+				break;
+			}
+			case GES_REQ_OPCODE_RELEASE: {
+				/*
+				 * spec-2.23 D6 — release_and_pop_compatible_waiter wakes
+				 * the first FIFO-compatible waiter (if any) and returns
+				 * its identity so we can send a GES_REPLY GRANT back.
+				 */
+				ClusterGrdWaiterIdentity granted[1];
+				int n_granted;
+
+				n_granted = cluster_grd_entry_release_and_pop_compatible_waiter(
+					&resid, &holder, granted, lengthof(granted));
+
+				/* Reply GRANT to the original releaser (acks the RELEASE). */
+				ges_send_grant_reply((int32) item.source_node_id, &holder, &resid,
+									 req->opcode);
+
+				for (int i = 0; i < n_granted; i++) {
+					ges_send_grant_reply(granted[i].source_node_id, &granted[i].holder, &resid,
+										 granted[i].request_opcode);
+				}
+				break;
+			}
+			default:
+				/*
+				 * BAST / BAST_ACK / DEADLOCK_* opcodes are dispatched in
+				 * cluster_ges_request_handler; should never reach the
+				 * drain path.  Count as inbound validation fail to surface
+				 * any future routing regression.
+				 */
+				cluster_grd_inc_ges_inbound_validation_fail();
+				break;
+		}
 	}
 
 	return drained;
