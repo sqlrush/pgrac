@@ -240,6 +240,19 @@ extern const char *cluster_lms_state_to_string(ClusterLmsState s);
 extern bool cluster_lms_owns_grant(void);
 
 /*
+ * HC4 EXACT predicate (spec-2.20 v0.3 frozen — L124 inherit from spec-2.19).
+ *
+ *	cluster_lms_is_ready() returns true iff lms_state == CLUSTER_LMS_READY.
+ *	**禁止使用 `state >= LMS_READY` 数值比较** — DRAINING / STOPPED /
+ *	DISABLED 全部不应 false-positive 匹配 READY(spec-2.18 既有
+ *	cluster_lms_owns_grant() 有 latent bug 返回 READY OR DRAINING OR
+ *	STOPPED;新代码必走 cluster_lms_is_ready())。
+ *
+ *	spec-2.20 7-step S1 entry 走此 helper 实现 HC1 fail-closed。
+ */
+extern bool cluster_lms_is_ready(void);
+
+/*
  * HC3 producer wake — broadcast cv after successful work_queue enqueue.
  * The Step 6 LMS skeleton does not yet wait on this CV; it is kept as the
  * stable producer-side API for the production LMS consumer.  No-op if LMS

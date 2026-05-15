@@ -446,6 +446,30 @@ cluster_lms_owns_grant(void)
 }
 
 
+/*
+ * HC4 EXACT predicate (spec-2.20 v0.3 frozen — L124 inherit).
+ *
+ *	cluster_lms_is_ready() returns true iff lms_state == CLUSTER_LMS_READY.
+ *	**Critical regression防御** — 既有 cluster_lms_owns_grant() 有 latent
+ *	bug 返回 READY OR DRAINING OR STOPPED(spec-2.19 P1.5 同款 bug 在 LMS
+ *	pre-existing,只是无 caller exercise 未暴露)。spec-2.20 新代码必走
+ *	cluster_lms_is_ready()(exact == READY)避免 false-positive:
+ *	  - DRAINING (3) — LMS 正在 shutdown
+ *	  - STOPPED (4) — LMS 已死 / not yet spawned
+ *	  - DISABLED (5) — startup-time opt-out
+ *	均 NOT ready。
+ */
+bool
+cluster_lms_is_ready(void)
+{
+	if (cluster_lms_state == NULL)
+		return false;
+
+	return ((ClusterLmsState) pg_atomic_read_u32(&cluster_lms_state->lms_state))
+		== CLUSTER_LMS_READY;
+}
+
+
 /* ============================================================
  * HC3 producer wake.
  *

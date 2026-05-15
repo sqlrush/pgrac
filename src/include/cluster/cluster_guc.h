@@ -411,5 +411,19 @@ extern bool cluster_allow_single_node;
  */
 extern bool cluster_lmd_enabled;
 
+/*
+ * cluster.lms_enabled (spec-2.20 D12).
+ *
+ *	context: PGC_POSTMASTER
+ *	default: true
+ *
+ *	Off → spec-2.17 caller-side legacy path走 PG-native LockAcquire skip
+ *	cluster gate.  On → cluster-aware lock acquires routed through
+ *	7-step state machine + LMS grant decision body(spec-2.20 D3/D4)。
+ *	Single ownership path硬契约(HC1):enabled=on 但 LMS not READY →
+ *	backend caller raises SQLSTATE 53R80 cluster_lms_unavailable。
+ */
+extern bool cluster_lms_enabled;
+
 
 #endif /* CLUSTER_GUC_H */

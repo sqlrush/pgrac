@@ -236,6 +236,21 @@ bool cluster_allow_single_node = true;
  */
 bool cluster_lmd_enabled = true;
 
+/*
+ * spec-2.20 D12:  cluster.lms_enabled.
+ *
+ *	PGC_POSTMASTER bool, default on.  Mirror cluster_lmd_enabled semantic
+ *	(spec-2.19).  When off (set in postgresql.conf or via -c at startup),
+ *	LMS process is NOT used for grant decisions; spec-2.17 caller-side
+ *	legacy path走 PG-native LockAcquire skip cluster gate (HC1 startup-
+ *	time fallback;spec-2.18 §1.4 F1 deferred 53R80 wording 一致)。
+ *	Runtime SET 被 PG PGC_POSTMASTER enforcement reject;restart required
+ *	to flip ownership.  HC4 exact predicate:caller-side ownership gate
+ *	走 cluster_lms_is_ready()(exact == LMS_READY);enabled=on 但非 READY
+ *	→ backend receives SQLSTATE 53R80 cluster_lms_unavailable。
+ */
+bool cluster_lms_enabled = true;
+
 
 /*
  * Mapping from the cluster.interconnect_tier GUC enum string to the
@@ -1070,4 +1085,22 @@ cluster_init_guc(void)
 					 "PGC_POSTMASTER:restart required to flip ownership (HC1 "
 					 "fail-closed startup-time fallback;spec-2.19 v0.2 P1.3)."),
 		&cluster_lmd_enabled, true, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	/*
+	 * spec-2.20 D12 — cluster.lms_enabled.
+	 *
+	 *	PGC_POSTMASTER bool, default true.  Mirror cluster_lmd_enabled.
+	 *	See cluster_lms_enabled declaration above.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.lms_enabled",
+		gettext_noop("Enable the LMS (Lock Master Server) cluster grant decision daemon."),
+		gettext_noop("When on (default), spec-2.17 caller-side 7-step state "
+					 "machine routes cluster-aware lock acquires through LMS "
+					 "(spec-2.18 daemon + spec-2.20 grant decision body).  "
+					 "When off, the spec-2.17 caller-side legacy path走 "
+					 "PG-native LockAcquire skip cluster gate.  PGC_POSTMASTER:"
+					 "restart required to flip ownership (HC1 fail-closed "
+					 "startup-time fallback;spec-2.18 §1.4 F1 deferred wording)。"),
+		&cluster_lms_enabled, true, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 }

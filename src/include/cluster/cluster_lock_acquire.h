@@ -1,0 +1,208 @@
+/*-------------------------------------------------------------------------
+ *
+ * cluster_lock_acquire.h
+ *	  pgrac 7-step state machine caller-side internal API — spec-2.20
+ *	  Sprint A skeleton (descoped scope per v0.4 — internal API only;
+ *	  PG LockAcquireExtended integration 推 spec-2.21).
+ *
+ *	  Spec-2.20 ships LMS + 7-step **internal** production wire:
+ *	  cluster_lock_acquire S1-S7 internal API + LMS grant decision body
+ *	  + unit tests.  **不碰** PG LockAcquireExtended hot path（推 spec-2.21
+ *	  PG hook integration ship 时 wire to lock.c）+ **不做** LMD Tarjan
+ *	  （推 spec-2.22 LMD Tarjan + cross-node deadlock detection ship）。
+ *
+ *	  spec-2.17 ship 了 caller-side 4-node placeholder（S1-S7 wire 点）+
+ *	  spec-2.18 ship LMS daemon skeleton + spec-2.19 ship LMD daemon
+ *	  skeleton.  spec-2.20 把 placeholder 内部填实 S1-S7 函数 body（不
+ *	  接入 PG hot path），让 cluster_unit 可以直接调 S1-S7 verify
+ *	  invariants（HC4 exact predicate / I2 reservation-before-LockAcquire /
+ *	  S3 sub-step 顺序硬契约）。
+ *
+ *	  HC1 LMS unavailable fail-closed:S1 entry 检查
+ *	  cluster_lms_is_ready() exact == LMS_READY;非 READY + enabled=on →
+ *	  返回 53R80 ERRCODE_CLUSTER_LMS_UNAVAILABLE caller retry/rollback。
+ *
+ *	  HC4 exact predicate(spec-2.19 L124 inherit):每 S1 entry 必 exact
+ *	  predicate(`state == LMS_READY`);禁止 `>= LMS_READY` 数值比较。
+ *
+ *	  spec-2.17 §1.4 Q6 F3 race window 防御(I2 hard contract):S3
+ *	  sub-step 顺序必走全:
+ *	    S3.1 acquire shard partition LWLock + check holders[]
+ *	    S3.2 insert PROCLOCK reservation slot
+ *	    S3.3 release partition LWLock
+ *	    S3.4 PG LockAcquire local（spec-2.21 wire — 本 spec internal API
+ *	         返回 PENDING）
+ *	    S3.5 acquire partition LWLock + promote reservation to real holder
+ *	    S3.6 release partition LWLock
+ *
+ *	  失败 rollback intent + remove reservation 走 S7 cleanup。
+ *
+ *	  Local-master fast path(A1 spec-2.20 v0.3 architectural):
+ *	    caller under GRD partition LWLock 判定 resource local-only
+ *	    (no remote holder/waiter/wait edge) → 直接 PG-native LockAcquire
+ *	    路径 + promote local holder;**不入 LMS work_queue**。
+ *	    spec-2.21 wire 时 in lock.c hook 内实现 fast path;本 spec
+ *	    internal API 仅声明边界。
+ *
+ *
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2026, pgrac contributors
+ *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
+ * IDENTIFICATION
+ *	  src/include/cluster/cluster_lock_acquire.h
+ *
+ * NOTES
+ *	  This is a pgrac-original file.  Compiled only in --enable-cluster
+ *	  builds.
+ *	  Spec: spec-2.20-7step-state-machine-activation.md(v0.4 descoped
+ *	  scope:LMS + 7-step internal production wire only;PG hook 推
+ *	  spec-2.21;LMD Tarjan 推 spec-2.22)。
+ *	  Anchor: spec-2.17 caller-side 4-node placeholder scaffolding(S1-S7
+ *	  wire 点)+ spec-2.18 LMS daemon API + spec-2.19 LMD daemon API。
+ *
+ *-------------------------------------------------------------------------
+ */
+#ifndef CLUSTER_LOCK_ACQUIRE_H
+#define CLUSTER_LOCK_ACQUIRE_H
+
+#include "cluster/cluster_grd.h"		/* ClusterResId */
+#include "storage/lock.h"				/* LOCKMODE */
+
+
+/*
+ * ClusterLockAcquireResult — 7-step state machine final outcome.
+ *
+ *	S1-S7 任一 step 失败走 S7 cleanup 返回 _FAIL_* 类;成功完整流程返回
+ *	OK_GRANTED 或 OK_CONVERTED(原 grant + new mode);PENDING 表示 S4
+ *	异步等(spec-2.21 hot path integration 时 caller 走 WaitLatch 等
+ *	GES_REPLY)。
+ */
+typedef enum ClusterLockAcquireResult
+{
+	CLUSTER_LOCK_ACQUIRE_OK_GRANTED = 0,	/* S5 promote success(new holder) */
+	CLUSTER_LOCK_ACQUIRE_OK_CONVERTED = 1,	/* S5 promote success(mode convert) */
+	CLUSTER_LOCK_ACQUIRE_PENDING = 2,		/* S4 async wait — caller waits GES_REPLY */
+	CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE = 10,		/* S1 53R80 fail-closed */
+	CLUSTER_LOCK_ACQUIRE_FAIL_GRD_NOT_READY = 11,		/* S2 cluster.grd_max_entries=0 */
+	CLUSTER_LOCK_ACQUIRE_FAIL_RESERVATION_FULL = 12,	/* S3 GRD entry full / 53R71 */
+	CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT = 13,				/* S4 53R70 cluster_ges_timeout */
+	CLUSTER_LOCK_ACQUIRE_FAIL_DEADLOCK = 14,			/* S4 53R72 cluster_ges_deadlock(spec-2.22 真激活)*/
+	CLUSTER_LOCK_ACQUIRE_FAIL_CANCEL = 15,				/* S4 53R73 cluster_ges_cancel_pending */
+	CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL = 16				/* S5/S6/S7 internal error */
+} ClusterLockAcquireResult;
+
+
+/*
+ * ClusterLockAcquireRequest — S1-S7 caller-side context.
+ *
+ *	spec-2.21 hot path integration 时 lock.c hook 填充此 struct + 调
+ *	cluster_lock_acquire_seven_step()。spec-2.20 internal API 让
+ *	cluster_unit 直接构造 + 验 S1-S7 invariants。
+ *
+ *	HC4 exact predicate:caller 必走 cluster_lms_is_ready() helper +
+ *	cluster_lmd_is_ready() helper;禁止 `state >= READY` 数值比较。
+ */
+typedef struct ClusterLockAcquireRequest
+{
+	ClusterResId resid;			/* 16B canonical wire-encoded ResId(spec-2.14 ship)*/
+	LOCKMODE	lockmode;		/* requested PG lock mode */
+	int			lockmethod_id;	/* DEFAULT_LOCKMETHOD / SHORT_LOCKMETHOD / cluster-aware class */
+	bool		dontwait;		/* true → S4 immediate ConditionalLock semantic(no wait)*/
+	uint64		caller_local_start_ts_ms;	/* spec-2.17 P2.2 deterministic 4-tuple — DESC = newer = youngest victim */
+} ClusterLockAcquireRequest;
+
+
+/*
+ * Public API — 7-step state machine entry point.
+ *
+ *	spec-2.21 hot path:lock.c hook 调此函数 — internal dispatch S1-S7。
+ *	spec-2.20 internal-only:cluster_unit T-7step 直接调 verify 各 step
+ *	invariant(HC4 exact / I2 reservation-before-LockAcquire / S3
+ *	sub-step 顺序 / 错误路径走 S7 cleanup)。
+ *
+ *	Returns: ClusterLockAcquireResult.  Caller-side error handling per
+ *	5 SQLSTATE family(53R70 timeout / 53R71 pending_full / 53R72
+ *	deadlock / 53R73 cancel / 53R80 LMS_UNAVAILABLE / 53R81
+ *	LMD_UNAVAILABLE — spec-2.22 wire)。
+ */
+extern ClusterLockAcquireResult cluster_lock_acquire_seven_step(
+	const ClusterLockAcquireRequest *req);
+
+
+/*
+ * S1-S7 individual step API — internal-only.
+ *
+ *	cluster_unit 直接调每 step verify invariants;
+ *	cluster_lock_acquire_seven_step() 内部按顺序 dispatch。spec-2.21
+ *	hot path integration 时不直接调 individual step,只调
+ *	cluster_lock_acquire_seven_step() top-level entry。
+ */
+
+/*
+ * S1 entry:HC1 fail-closed check(cluster_lms_is_ready() exact == READY
+ *	+ cluster_lmd_is_ready() 视 spec-2.22 wire);LMS_UNAVAILABLE → 53R80;
+ *	LMD_UNAVAILABLE → 53R81(spec-2.22 wire)。
+ */
+extern ClusterLockAcquireResult cluster_lock_acquire_s1_entry(
+	const ClusterLockAcquireRequest *req);
+
+/*
+ * S2 identity:resolve ClusterResId valid + lockmethod_id is cluster-aware
+ *	class(spec-2.14 4 class scaffolding;real expansion spec-2.25)。
+ */
+extern ClusterLockAcquireResult cluster_lock_acquire_s2_identity(
+	const ClusterLockAcquireRequest *req);
+
+/*
+ * S3 partition + reservation:S3.1-S3.6 sub-step sequence(spec-2.17
+ *	§1.4 Q6 F3 race window 防御 — 所有路径必走全;fast path 不绕过)。
+ *	S3.4 PG LockAcquire local 在 spec-2.20 internal API 返回 PENDING
+ *	(spec-2.21 hot path wire)。
+ */
+extern ClusterLockAcquireResult cluster_lock_acquire_s3_partition_reservation(
+	const ClusterLockAcquireRequest *req);
+
+/*
+ * S4 remote request + wait:GES_REQUEST send + WAIT_EVENT_CLUSTER_GES_S4_WAIT
+ *	+ GES_REPLY 等(timeout 53R70 / cancel 53R73 / deadlock 53R72 via
+ *	LMD spec-2.22 wire)。local-master + no remote holder fast path 不
+ *	进 S4(A1)。
+ */
+extern ClusterLockAcquireResult cluster_lock_acquire_s4_remote_request_wait(
+	const ClusterLockAcquireRequest *req);
+
+/*
+ * S5 promote holder:acquire partition LWLock + promote reservation to
+ *	real holder + release partition。spec-2.21 hot path wire 时此 step
+ *	post PG LockAcquire success 调。
+ */
+extern ClusterLockAcquireResult cluster_lock_acquire_s5_promote_holder(
+	const ClusterLockAcquireRequest *req);
+
+/*
+ * S6 release:backend done 释放路径(LockRelease hook;spec-2.21 wire 到
+ *	PG LockRelease)。
+ */
+extern ClusterLockAcquireResult cluster_lock_acquire_s6_release(
+	const ClusterLockAcquireRequest *req);
+
+/*
+ * S7 cleanup:error/timeout 路径 rollback intent + remove reservation +
+ *	send GES_CANCEL_PENDING / GES_RELEASE 视已 grant 状态(spec-2.17
+ *	§1.4 P1.4 不同 opcode 分流硬契约)。
+ */
+extern ClusterLockAcquireResult cluster_lock_acquire_s7_cleanup(
+	const ClusterLockAcquireRequest *req);
+
+
+/*
+ * Read-only accessor — 7-step S1-S7 path counters(diagnostics only;
+ *	不预设 production-granularity per spec-2.20 v0.4 frozen scope)。
+ */
+extern uint64 cluster_lock_acquire_s1_entry_count(void);
+extern uint64 cluster_lock_acquire_s7_cleanup_count(void);
+
+#endif							/* CLUSTER_LOCK_ACQUIRE_H */
