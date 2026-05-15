@@ -844,6 +844,10 @@ LockAcquireExtended(const LOCKTAG *locktag,
 			cluster_need_s5 = false; \
 		} \
 	} while (0)
+#else
+#define PGRAC_CLUSTER_CLEANUP_PENDING_ACQUIRE() \
+	do { \
+	} while (0)
 #endif
 
 	if (lockmethodid <= 0 || lockmethodid >= lengthof(LockMethods))
@@ -1350,9 +1354,7 @@ LockAcquireExtended(const LOCKTAG *locktag,
 	}
 #endif
 	return LOCKACQUIRE_OK;
-#ifdef USE_PGRAC_CLUSTER
 #undef PGRAC_CLUSTER_CLEANUP_PENDING_ACQUIRE
-#endif
 }
 
 /*
