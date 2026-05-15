@@ -235,6 +235,32 @@ GetCurrentTimestamp(void)
  * to exercise DISABLED state branch. */
 bool cluster_lmd_enabled = true;
 
+/* spec-2.22 D9 — LMD scan interval GUC stub (LmdMain real Tarjan loop). */
+int cluster_lmd_scan_interval_ms = 1000;
+int cluster_lmd_max_wait_edges = 1024;
+
+/* spec-2.22 D2/D3/D5 — LMD graph + Tarjan symbols pulled by cluster_lmd.o
+ * (LmdMain calls Tarjan scan; shmem region registry references graph
+ * shmem helpers).  Stub them out — TAP 109 covers real behavior.
+ */
+void
+cluster_lmd_tarjan_run_local_scan(void)
+{}
+
+Size
+cluster_lmd_graph_shmem_size(void)
+{
+	return 0;
+}
+
+void
+cluster_lmd_graph_shmem_request(void)
+{}
+
+void
+cluster_lmd_graph_shmem_init(void)
+{}
+
 /* MyProcPid stub — set by tests as needed. */
 int MyProcPid = 12345;
 
