@@ -108,6 +108,104 @@ cluster_lmd_is_ready(void)
 	return cluster_lmd_enabled;
 }
 
+void
+cluster_lmd_cancel_wait_edge(void)
+{}
+
+/*
+ * spec-2.21 stubs — wire enough cluster_grd / cluster_ges / PG runtime
+ * symbols for the standalone link surface.  All bodies return safe
+ * defaults so T-7step-1..5 still exercise the API contracts.
+ */
+#include "cluster/cluster_ges.h"
+#include "cluster/cluster_grd.h"
+
+struct PGPROC {
+	int pgprocno;
+};
+struct PGPROC *MyProc = NULL;
+
+bool cluster_local_fast_path_enabled = true;
+
+int64
+GetCurrentTimestamp(void)
+{
+	return 0;
+}
+
+void
+cluster_grd_resid_encode(const LOCKTAG *src pg_attribute_unused(), ClusterResId *dst)
+{
+	if (dst)
+		memset(dst, 0, sizeof(*dst));
+}
+
+uint32
+cluster_grd_shard_for_resource(const ClusterResId *resid pg_attribute_unused())
+{
+	return 0;
+}
+
+int32
+cluster_grd_lookup_master(const ClusterResId *resid pg_attribute_unused())
+{
+	return -1;
+}
+
+ClusterGrdEntryResult
+cluster_grd_try_reserve(const ClusterResId *resid pg_attribute_unused(),
+						const ClusterGrdHolderId *holder pg_attribute_unused(),
+						int mode pg_attribute_unused(), int32 self_node_id pg_attribute_unused(),
+						bool *fast_path_out, uint64 *gen_snapshot_out)
+{
+	if (fast_path_out)
+		*fast_path_out = false;
+	if (gen_snapshot_out)
+		*gen_snapshot_out = 0;
+	return CLUSTER_GRD_ENTRY_NOT_READY;
+}
+
+ClusterGrdEntryResult
+cluster_grd_revalidate_and_promote(const ClusterResId *resid pg_attribute_unused(),
+								   const ClusterGrdHolderId *holder pg_attribute_unused(),
+								   int32 self_node_id pg_attribute_unused(),
+								   uint64 gen_snapshot pg_attribute_unused())
+{
+	return CLUSTER_GRD_ENTRY_NOT_FOUND;
+}
+
+ClusterGrdEntryResult
+cluster_grd_release_holder_by_id(const ClusterResId *resid pg_attribute_unused(),
+								 const ClusterGrdHolderId *holder pg_attribute_unused())
+{
+	return CLUSTER_GRD_ENTRY_NOT_FOUND;
+}
+
+ClusterGrdEntryResult
+cluster_grd_cancel_reservation_by_id(const ClusterResId *resid pg_attribute_unused(),
+									 const ClusterGrdHolderId *holder pg_attribute_unused())
+{
+	return CLUSTER_GRD_ENTRY_NOT_FOUND;
+}
+
+uint32
+cluster_ges_send_request_and_wait(const struct ClusterResId *resid pg_attribute_unused(),
+								  uint32 lockmode pg_attribute_unused(),
+								  const struct ClusterGrdHolderId *holder pg_attribute_unused(),
+								  uint64 request_id pg_attribute_unused(),
+								  int timeout_ms pg_attribute_unused())
+{
+	return 0;
+}
+
+uint32
+cluster_ges_send_release_and_wait(const struct ClusterResId *resid pg_attribute_unused(),
+								  const struct ClusterGrdHolderId *holder pg_attribute_unused(),
+								  uint64 request_id pg_attribute_unused())
+{
+	return 0;
+}
+
 
 /* ============================================================
  * Test cases.
@@ -218,7 +316,12 @@ UT_TEST(test_7step_top_level_monotonic_forward_no_cleanup_on_success)
 	memset(&req, 0, sizeof(req));
 	cluster_lms_enabled = true;
 	r = cluster_lock_acquire_seven_step(&req);
-	UT_ASSERT_EQ((int)r, (int)CLUSTER_LOCK_ACQUIRE_PENDING);
+	/*
+	 * spec-2.21 update: stub cluster_grd_try_reserve returns NOT_READY,
+	 * which S3 maps to FAIL_GRD_NOT_READY (pre-reservation fail,
+	 * no S7 cleanup — F2 invariant).
+	 */
+	UT_ASSERT_EQ((int)r, (int)CLUSTER_LOCK_ACQUIRE_FAIL_GRD_NOT_READY);
 	UT_ASSERT_EQ(cluster_lock_acquire_s7_cleanup_count(), pre_s7);
 
 	cluster_lms_enabled = false;
