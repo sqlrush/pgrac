@@ -32,6 +32,20 @@
 #include <signal.h>
 #include <unistd.h>
 
+/*
+ * PGRAC: cluster integration headers — spec-2.21 D2/D9.
+ *
+ * Modified by: SqlRush <sqlrush@gmail.com>
+ * What changed: pull cluster_lock_acquire / cluster_guc / cluster_grd
+ *               into PG hot path to install the cluster gate at
+ *               LockAcquireExtended entry + symmetric release hooks.
+ * Why: spec-2.21 wires the 7-step state machine into PG hot path.
+ * Spec: spec-2.21-pg-lockacquire-integration-2node-smoke.md (D2 / D9)
+ */
+#include "cluster/cluster_lock_acquire.h"
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_grd.h"
+
 #include "access/transam.h"
 #include "access/twophase.h"
 #include "access/twophase_rmgr.h"
@@ -867,6 +881,10 @@ LockAcquireExtended(const LOCKTAG *locktag,
 		locallock->lockOwners = (LOCALLOCKOWNER *)
 			MemoryContextAlloc(TopMemoryContext,
 							   locallock->maxLockOwners * sizeof(LOCALLOCKOWNER));
+		/* PGRAC: spec-2.21 D1 — cluster-aware state init */
+		locallock->cluster_registered = false;
+		locallock->cluster_request_id = 0;
+		memset(locallock->cluster_holder_raw, 0, sizeof(locallock->cluster_holder_raw));
 	}
 	else
 	{
@@ -899,6 +917,81 @@ LockAcquireExtended(const LOCKTAG *locktag,
 			return LOCKACQUIRE_ALREADY_CLEAR;
 		else
 			return LOCKACQUIRE_ALREADY_HELD;
+	}
+
+	/*
+	 * PGRAC: cluster gate (spec-2.21 D2 / HC1 fail-closed / HC10 reentrant
+	 * already short-circuited above via nLocks > 0 return).
+	 *
+	 * Predicate Q2 v1.1: cluster_enabled && cluster.lock_acquire_cluster_path
+	 * && cluster_lock_should_globalize(locktag, lockmode, sessionLock).
+	 *
+	 * On NEED_PG_NATIVE_LOCK we fall through and run PG-native acquisition;
+	 * Step 5 wires the post-PG-native S5 promote callback on the success
+	 * path.  FAIL_LMS_UNAVAILABLE / FAIL_* paths ereport here per spec-2.21
+	 * §3.3 error propagation table.
+	 *
+	 * Spec: spec-2.21-pg-lockacquire-integration-2node-smoke.md (D2)
+	 */
+	if (cluster_enabled &&
+		cluster_lock_acquire_cluster_path &&
+		cluster_lock_should_globalize(locktag, lockmode, sessionLock))
+	{
+		ClusterLockAcquireRequest cluster_req;
+		ClusterLockAcquireResult cluster_r;
+
+		memset(&cluster_req, 0, sizeof(cluster_req));
+		cluster_req.locktag = *locktag;
+		cluster_req.lockmode = lockmode;
+		cluster_req.lockmethod_id = lockmethodid;
+		cluster_req.dontwait = dontWait;
+		cluster_req.sessionLock = sessionLock;
+		cluster_grd_resid_encode(locktag, &cluster_req.resid);
+		/* holder identity + request_id filled by S3 reservation (D4 Step 3). */
+
+		cluster_r = cluster_lock_acquire_seven_step(&cluster_req);
+
+		switch (cluster_r)
+		{
+			case CLUSTER_LOCK_ACQUIRE_OK_NATIVE:
+			case CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK:
+				/*
+				 * Step 5 wires post-PG-native S5 promote at success exit;
+				 * for Step 2 fall through to native acquire only.
+				 */
+				break;
+			case CLUSTER_LOCK_ACQUIRE_OK_GRANTED:
+			case CLUSTER_LOCK_ACQUIRE_OK_CONVERTED:
+				/* Until D4 returns NEED_PG_NATIVE_LOCK, treat as fall-through. */
+				break;
+			case CLUSTER_LOCK_ACQUIRE_PENDING:
+				ereport(ERROR,
+						(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+						 errmsg("cluster lock acquire pending (spec-2.21 Step 4 not yet wired)"),
+						 errhint("This path becomes async-wait in Step 4 D4/D8.")));
+			case CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE:
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_LMS_UNAVAILABLE),
+						 errmsg("cluster LMS not ready, fail-closed (spec-2.21 HC1)"),
+						 errhint("Wait for cluster_lms_is_ready() == LMS_READY before acquiring cluster-aware locks.")));
+			case CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT:
+				ereport(ERROR,
+						(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+						 errmsg("cluster lock acquire timeout"),
+						 errhint("Consider increasing cluster.ges_request_timeout_ms.")));
+			case CLUSTER_LOCK_ACQUIRE_FAIL_DEADLOCK:
+				ereport(ERROR,
+						(errcode(ERRCODE_T_R_DEADLOCK_DETECTED),
+						 errmsg("cluster deadlock pending detection"),
+						 errhint("Real cross-node deadlock detection lands in spec-2.22 (LMD Tarjan).")));
+			case CLUSTER_LOCK_ACQUIRE_FAIL_CANCEL:
+			case CLUSTER_LOCK_ACQUIRE_FAIL_GRD_NOT_READY:
+			case CLUSTER_LOCK_ACQUIRE_FAIL_RESERVATION_FULL:
+			case CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL:
+				ereport(ERROR,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("cluster_lock_acquire failed (result=%d)", (int) cluster_r)));
+		}
 	}
 
 	/*
