@@ -45,6 +45,7 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_lmd.h"
 #include "cluster/cluster_lock_acquire.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
@@ -111,6 +112,31 @@ cluster_lmd_is_ready(void)
 void
 cluster_lmd_cancel_wait_edge(void)
 {}
+
+/* spec-2.22 D7 — real wait edge mutators (no-op stubs in standalone test). */
+void
+cluster_lmd_cancel_wait_edge_real(const ClusterLmdVertex *waiter pg_attribute_unused())
+{}
+
+bool
+cluster_lmd_submit_wait_edge_real(const ClusterLmdVertex *waiter pg_attribute_unused(),
+								  const ClusterLmdVertex *blocker pg_attribute_unused(),
+								  uint64 request_id pg_attribute_unused())
+{
+	return true;
+}
+
+/* spec-2.17 — sig_atomic_t cancel flag (cluster_signal.o not linked). */
+#include <signal.h>
+volatile sig_atomic_t cluster_ges_cancel_pending = 0;
+
+/* PG-runtime xact stub — advisory locks have no xid. */
+#include "access/xact.h"
+TransactionId
+GetTopTransactionIdIfAny(void)
+{
+	return InvalidTransactionId;
+}
 
 /*
  * spec-2.21 stubs — wire enough cluster_grd / cluster_ges / PG runtime
