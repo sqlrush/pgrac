@@ -127,6 +127,14 @@ errhint(const char *fmt pg_attribute_unused(), ...)
 	return 0;
 }
 
+void
+ExceptionalCondition(const char *conditionName pg_attribute_unused(),
+					 const char *fileName pg_attribute_unused(),
+					 int lineNumber pg_attribute_unused())
+{
+	abort();
+}
+
 /*
  * spec-2.19 D13 (L105 inherit):  ShmemInitStruct stub uses union
  * force-align to guarantee 8-byte alignment for pg_atomic_uint64
