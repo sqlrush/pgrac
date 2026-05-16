@@ -277,7 +277,7 @@
  * NEW 2 wait events ClusterLmsNativeProbeWait + ClusterNativeProbeReply
  * Wait (COUNT 73 -> 75);  NEW 3 GUC lms_native_lock_probe_max_inflight /
  * retry_interval_ms / retry_budget;  NEW 7 lms counter + 1 grd counter;
- * per-shard LMS probe collector slot array (96B × 64 max) embedded in
+ * per-shard LMS probe collector slot array (128B × 64 max) embedded in
  * existing 'pgrac cluster lms' shmem region.  catversion bump for catalog
  * tooling. */
 #define CATALOG_VERSION_NO 202605360

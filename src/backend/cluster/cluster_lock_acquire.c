@@ -54,6 +54,7 @@
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_lock_acquire.h"
+#include "cluster/cluster_native_lock_probe.h"
 #include "cluster/cluster_signal.h" /* cluster_ges_cancel_pending sig_atomic_t */
 #include "access/htup_details.h"	/* GETSTRUCT */
 #include "access/xact.h"			/* GetTopTransactionIdIfAny */
@@ -250,6 +251,12 @@ cluster_lock_acquire_s3_partition_reservation(const ClusterLockAcquireRequest *r
 	pg_atomic_fetch_add_u64(&stub_s3_reservation_count, 1);
 
 	if (cluster_local_fast_path_enabled && fast_path) {
+		if (cluster_lms_native_probe_required(&req->resid, req->lockmode)
+			&& !cluster_lms_native_probe_wait_clear(&req->resid, req->lockmode, &req->holder,
+													/* timeout_ms */ 0)) {
+			(void)cluster_grd_cancel_reservation_by_id(&req->resid, &req->holder);
+			return CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+		}
 		pg_atomic_fetch_add_u64(&stub_local_fast_path_count, 1);
 		return CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK;
 	}

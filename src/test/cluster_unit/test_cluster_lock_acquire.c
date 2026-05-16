@@ -237,6 +237,22 @@ cluster_grd_cancel_reservation_by_id(const ClusterResId *resid pg_attribute_unus
 	return CLUSTER_GRD_ENTRY_NOT_FOUND;
 }
 
+bool
+cluster_lms_native_probe_required(const ClusterResId *resid pg_attribute_unused(),
+								  LOCKMODE lockmode pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_lms_native_probe_wait_clear(const ClusterResId *resid pg_attribute_unused(),
+									LOCKMODE lockmode pg_attribute_unused(),
+									const ClusterGrdHolderId *requester pg_attribute_unused(),
+									int timeout_ms pg_attribute_unused())
+{
+	return true;
+}
+
 uint32
 cluster_ges_send_request_and_wait(const struct ClusterResId *resid pg_attribute_unused(),
 								  uint32 lockmode pg_attribute_unused(),

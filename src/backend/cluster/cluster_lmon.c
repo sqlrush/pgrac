@@ -60,6 +60,7 @@
 #include "cluster/cluster_fence.h" /* cluster_fence_lmon_tick (spec-2.28 D5) */
 #include "cluster/cluster_grd.h"   /* cluster_grd_lmon_tick_dead_sweep (spec-2.16 D8) */
 #include "cluster/cluster_lms.h"   /* cluster_lms_owns_grant (spec-2.18 Sprint A Step 3 D8 HC4) */
+#include "cluster/cluster_native_lock_probe.h"
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_reconfig.h" /* cluster_reconfig_lmon_tick (spec-2.29 Step 2 D3) */
 #include "cluster/cluster_guc.h"
@@ -807,6 +808,7 @@ LmonMain(void)
 			 * per v0.5 P1.2;  no-op when dead_generation unchanged. */
 			cluster_grd_lmon_tick_dead_sweep();
 			cluster_grd_deadlock_lmon_tick(); /* spec-2.17 Step 5 */
+
 			/*
 			 * spec-2.18 Sprint A Step 3 D8 — HC4 single ownership guard.
 			 *
@@ -834,6 +836,7 @@ LmonMain(void)
 			 */
 			cluster_ges_lmon_drain_work_queue();
 			cluster_grd_outbound_lmon_drain_send();
+			cluster_lms_native_probe_retry_tick();
 
 			cluster_reconfig_lmon_tick();
 

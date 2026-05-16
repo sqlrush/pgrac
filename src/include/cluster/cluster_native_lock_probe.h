@@ -123,6 +123,8 @@ extern ClusterNativeLockProbeReply
 cluster_native_lock_probe_pg_state(const LOCKTAG *locktag, LOCKMODE lockmode,
 								   const ClusterGrdHolderId *exclude_holder);
 
+extern bool cluster_lms_native_probe_required(const ClusterResId *resid, LOCKMODE lockmode);
+
 /* ============================================================
  * spec-2.25 D4 — LMS per-shard collector slot.
  *
@@ -159,6 +161,12 @@ extern void cluster_lms_native_probe_aggregate_and_resolve(uint32 slot_idx);
 extern void cluster_lms_native_probe_retry_tick(void);
 extern void cluster_lms_native_probe_cleanup_on_node_dead(int32 dead_node_id);
 extern void cluster_lms_native_probe_cleanup_on_backend_exit(int procno);
+extern bool cluster_lms_native_probe_wait_clear(const ClusterResId *resid, LOCKMODE lockmode,
+												const ClusterGrdHolderId *requester,
+												int timeout_ms);
+extern bool cluster_lms_native_probe_schedule_grant(const ClusterResId *resid, LOCKMODE lockmode,
+													const ClusterGrdHolderId *requester,
+													int32 source_node_id, uint32 request_opcode);
 
 /* ============================================================
  * GUC defaults — actual values bound in cluster_guc.c (D9).

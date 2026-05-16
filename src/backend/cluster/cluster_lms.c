@@ -78,6 +78,7 @@
 #include "storage/shmem.h"
 #include "tcop/tcopprot.h"
 #include "utils/guc.h"
+#include "utils/wait_event.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
 #include "utils/timestamp.h"
@@ -604,6 +605,7 @@ LmsMain(void)
 			break;
 
 		pg_atomic_fetch_add_u64(&cluster_lms_state->lms_drain_empty_count, 1);
+		cluster_lms_native_probe_retry_tick();
 
 		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 						LMS_IDLE_TIMEOUT_MS, WAIT_EVENT_PG_SLEEP);
@@ -658,6 +660,89 @@ probe_active_capacity(void)
 	return cap;
 }
 
+#define CLUSTER_NATIVE_PROBE_FINAL_TIMEOUT 3U
+
+static bool
+native_probe_node_bit(int32 node_id, uint32 *bit_out)
+{
+	if (node_id < 0 || node_id >= 16 || bit_out == NULL)
+		return false;
+	*bit_out = 1u << (uint32)node_id;
+	return true;
+}
+
+bool
+cluster_lms_native_probe_required(const ClusterResId *resid, LOCKMODE lockmode)
+{
+	if (resid == NULL)
+		return false;
+	if (lockmode < ShareUpdateExclusiveLock)
+		return false;
+	return resid->type == LOCKTAG_RELATION || resid->type == LOCKTAG_OBJECT;
+}
+
+static uint32
+native_probe_aggregate_status(const ClusterLmsNativeLockProbeSlot *slot, bool *complete_out)
+{
+	uint32 status = (uint32)CLUSTER_NATIVE_LOCK_PROBE_CLEAR;
+
+	Assert(slot != NULL);
+	if (complete_out != NULL)
+		*complete_out = false;
+	if (slot->expected_replies_bitmap != slot->received_replies_bitmap)
+		return status;
+	if (complete_out != NULL)
+		*complete_out = true;
+
+	for (uint32 i = 0; i < 16; i++) {
+		uint32 node_status = (slot->aggregated_status_packed >> (i * 2)) & 0x3;
+
+		if (node_status > status)
+			status = node_status;
+	}
+	return status;
+}
+
+static void
+native_probe_send_grant_reply(const ClusterLmsNativeLockProbeSlot *slot)
+{
+	GesReplyPayload reply;
+
+	memset(&reply, 0, sizeof(reply));
+	reply.opcode = GES_REPLY_OPCODE_GRANT;
+	reply.reply_for_opcode = slot->request_opcode;
+	reply.reject_reason = GES_REJECT_REASON_NONE;
+	reply.holder_node_id = (uint32)slot->requester.node_id;
+	reply.holder_procno = slot->requester.procno;
+	reply.holder_cluster_epoch_lo = (uint32)(slot->requester.cluster_epoch & 0xffffffffu);
+	reply.holder_cluster_epoch_hi = (uint32)(slot->requester.cluster_epoch >> 32);
+	reply.holder_request_id_lo = (uint32)(slot->requester.request_id & 0xffffffffu);
+	reply.holder_request_id_hi = (uint32)(slot->requester.request_id >> 32);
+	memcpy(reply.resid, &slot->resid, sizeof(reply.resid));
+	cluster_grd_outbound_enqueue_lmon_reply((uint32)slot->grant_source_node_id, &reply,
+											sizeof(reply));
+}
+
+static void
+native_probe_send_reject_reply(const ClusterLmsNativeLockProbeSlot *slot, uint32 reject_reason)
+{
+	GesReplyPayload reply;
+
+	memset(&reply, 0, sizeof(reply));
+	reply.opcode = GES_REPLY_OPCODE_REJECT;
+	reply.reply_for_opcode = slot->request_opcode;
+	reply.reject_reason = reject_reason;
+	reply.holder_node_id = (uint32)slot->requester.node_id;
+	reply.holder_procno = slot->requester.procno;
+	reply.holder_cluster_epoch_lo = (uint32)(slot->requester.cluster_epoch & 0xffffffffu);
+	reply.holder_cluster_epoch_hi = (uint32)(slot->requester.cluster_epoch >> 32);
+	reply.holder_request_id_lo = (uint32)(slot->requester.request_id & 0xffffffffu);
+	reply.holder_request_id_hi = (uint32)(slot->requester.request_id >> 32);
+	memcpy(reply.resid, &slot->resid, sizeof(reply.resid));
+	cluster_grd_outbound_enqueue_lmon_reply((uint32)slot->grant_source_node_id, &reply,
+											sizeof(reply));
+}
+
 bool
 cluster_lms_native_probe_slot_acquire(int32 origin_node_id, const LOCKTAG *locktag,
 									  LOCKMODE lockmode, const ClusterGrdHolderId *requester,
@@ -687,11 +772,17 @@ cluster_lms_native_probe_slot_acquire(int32 origin_node_id, const LOCKTAG *lockt
 			slot->origin_node_id = origin_node_id;
 			slot->requester_procno = (int32)requester->procno;
 			slot->requester = *requester;
+			memset(&slot->resid, 0, sizeof(slot->resid));
 			slot->start_ts = GetCurrentTimestamp();
+			slot->grant_source_node_id = -1;
+			slot->request_opcode = GES_REQ_OPCODE_REQUEST;
 			slot->retry_count = 0;
 			slot->expected_replies_bitmap = 0;
 			slot->received_replies_bitmap = 0;
 			slot->aggregated_status_packed = 0;
+			slot->final_status = CLUSTER_NATIVE_PROBE_FINAL_TIMEOUT;
+			slot->grant_on_clear = false;
+			slot->final_ready = false;
 
 			*slot_idx_out = (uint32)i;
 			return true;
@@ -716,6 +807,8 @@ cluster_lms_native_probe_slot_release(uint32 slot_idx)
 		return;
 
 	slot = &cluster_lms_state->native_probe_slots[slot_idx];
+	slot->grant_on_clear = false;
+	slot->final_ready = false;
 	pg_atomic_write_u64(&slot->in_use, 0);
 }
 
@@ -737,6 +830,11 @@ cluster_lms_native_probe_dispatch(uint32 slot_idx)
 		return;
 
 	slot = &cluster_lms_state->native_probe_slots[slot_idx];
+	slot->expected_replies_bitmap = 0;
+	slot->received_replies_bitmap = 0;
+	slot->aggregated_status_packed = 0;
+	slot->final_ready = false;
+	slot->final_status = CLUSTER_NATIVE_PROBE_FINAL_TIMEOUT;
 
 	memset(&payload, 0, sizeof(payload));
 	payload.opcode = GES_REQ_OPCODE_NATIVE_LOCK_PROBE;
@@ -749,15 +847,18 @@ cluster_lms_native_probe_dispatch(uint32 slot_idx)
 		ClusterNativeLockProbeReply self_status;
 		uint32 self_bit;
 
+		if (!native_probe_node_bit(self_node, &self_bit)) {
+			pg_atomic_fetch_add_u64(&cluster_lms_state->native_probe_timeout_count, 1);
+			slot->final_status = CLUSTER_NATIVE_PROBE_FINAL_TIMEOUT;
+			slot->final_ready = true;
+			ConditionVariableBroadcast(&cluster_lms_state->cv);
+			return;
+		}
 		self_status
 			= cluster_native_lock_probe_local(&slot->locktag, slot->lockmode, &slot->requester);
-		self_bit = 1u << ((uint32)self_node & 31);
 		slot->expected_replies_bitmap |= self_bit;
 		slot->received_replies_bitmap |= self_bit;
-		if (self_node >= 0 && self_node < 16) {
-			slot->aggregated_status_packed |= ((uint32)self_status & 0x3)
-											  << ((uint32)self_node * 2);
-		}
+		slot->aggregated_status_packed |= ((uint32)self_status & 0x3) << ((uint32)self_node * 2);
 	}
 
 	/* Fan-out to live peers.  ClusterConfShmem.nodes[] is private to
@@ -777,7 +878,13 @@ cluster_lms_native_probe_dispatch(uint32 slot_idx)
 			conf_node = cluster_conf_lookup_node(candidate);
 			if (conf_node == NULL)
 				continue;
-			peer_bit = 1u << ((uint32)candidate & 31);
+			if (!native_probe_node_bit(candidate, &peer_bit)) {
+				pg_atomic_fetch_add_u64(&cluster_lms_state->native_probe_timeout_count, 1);
+				slot->final_status = CLUSTER_NATIVE_PROBE_FINAL_TIMEOUT;
+				slot->final_ready = true;
+				ConditionVariableBroadcast(&cluster_lms_state->cv);
+				return;
+			}
 			slot->expected_replies_bitmap |= peer_bit;
 			cluster_grd_outbound_enqueue_lms_native_probe((uint32)candidate, &payload,
 														  (uint16)sizeof(payload));
@@ -817,19 +924,18 @@ cluster_lms_native_probe_recv_reply(uint64 probe_id, int32 sender_node_id,
 		if (slot->probe_id != probe_id)
 			continue;
 
-		sender_bit = 1u << ((uint32)sender_node_id & 31);
+		if (!native_probe_node_bit(sender_node_id, &sender_bit))
+			return;
 		if ((slot->expected_replies_bitmap & sender_bit) == 0)
 			return; /* HC36 stale reply (not expected from this node) */
 		if ((slot->received_replies_bitmap & sender_bit) != 0)
 			return; /* duplicate reply — silent drop */
 
 		slot->received_replies_bitmap |= sender_bit;
-		if (sender_node_id >= 0 && sender_node_id < 16) {
-			slot->aggregated_status_packed |= ((uint32)status & 0x3)
-											  << ((uint32)sender_node_id * 2);
-		}
+		slot->aggregated_status_packed |= ((uint32)status & 0x3) << ((uint32)sender_node_id * 2);
 
 		/* Wake LMS to attempt aggregate resolution. */
+		cluster_lms_native_probe_aggregate_and_resolve((uint32)i);
 		ConditionVariableBroadcast(&cluster_lms_state->cv);
 		return;
 	}
@@ -841,9 +947,8 @@ void
 cluster_lms_native_probe_aggregate_and_resolve(uint32 slot_idx)
 {
 	ClusterLmsNativeLockProbeSlot *slot;
-	uint32 i;
-	bool saw_holder = false;
-	bool saw_waiter = false;
+	bool complete = false;
+	uint32 status;
 
 	Assert(cluster_lms_state != NULL);
 	Assert(slot_idx < CLUSTER_LMS_NATIVE_LOCK_PROBE_MAX_SLOTS);
@@ -851,34 +956,39 @@ cluster_lms_native_probe_aggregate_and_resolve(uint32 slot_idx)
 	slot = &cluster_lms_state->native_probe_slots[slot_idx];
 	if (pg_atomic_read_u64(&slot->in_use) == 0)
 		return;
-
-	if (slot->expected_replies_bitmap != slot->received_replies_bitmap)
-		return; /* not all replies in yet */
-
-	for (i = 0; i < 16; i++) {
-		uint32 status = (slot->aggregated_status_packed >> (i * 2)) & 0x3;
-
-		if (status == (uint32)CLUSTER_NATIVE_LOCK_PROBE_HOLDER_CONFLICT)
-			saw_holder = true;
-		else if (status == (uint32)CLUSTER_NATIVE_LOCK_PROBE_WAITER_CONFLICT)
-			saw_waiter = true;
-	}
-
-	if (saw_holder) {
-		pg_atomic_fetch_add_u64(&cluster_lms_state->native_probe_aggregate_holder_conflict_count,
-								1);
-		/* Caller (LMS grant decision) retries probe on next tick — slot kept
-		 * in_use; retry_tick advances retry_count. */
+	if (slot->final_ready && slot->final_status == CLUSTER_NATIVE_PROBE_FINAL_TIMEOUT) {
+		if (slot->grant_on_clear) {
+			(void)cluster_grd_release_holder_by_id(&slot->resid, &slot->requester);
+			native_probe_send_reject_reply(slot, GES_REJECT_REASON_TIMEOUT);
+			cluster_lms_native_probe_slot_release(slot_idx);
+		}
 		return;
 	}
-	if (saw_waiter) {
+
+	status = native_probe_aggregate_status(slot, &complete);
+	if (!complete)
+		return;
+
+	if (status == (uint32)CLUSTER_NATIVE_LOCK_PROBE_HOLDER_CONFLICT) {
+		pg_atomic_fetch_add_u64(&cluster_lms_state->native_probe_aggregate_holder_conflict_count,
+								1);
+		return;
+	}
+	if (status == (uint32)CLUSTER_NATIVE_LOCK_PROBE_WAITER_CONFLICT) {
 		pg_atomic_fetch_add_u64(&cluster_lms_state->native_probe_aggregate_waiter_conflict_count,
 								1);
 		return;
 	}
 
-	/* CLEAR aggregate — slot owner (grant decision) consumes status and
-	 * releases slot.  Step 6 ges request handler reply path drives this. */
+	if (slot->grant_on_clear) {
+		native_probe_send_grant_reply(slot);
+		cluster_lms_native_probe_slot_release(slot_idx);
+		return;
+	}
+
+	slot->final_status = (uint32)CLUSTER_NATIVE_LOCK_PROBE_CLEAR;
+	slot->final_ready = true;
+	ConditionVariableBroadcast(&cluster_lms_state->cv);
 }
 
 void
@@ -903,8 +1013,10 @@ cluster_lms_native_probe_retry_tick(void)
 
 		if (pg_atomic_read_u64(&slot->in_use) == 0)
 			continue;
-		if (slot->expected_replies_bitmap == slot->received_replies_bitmap)
-			continue; /* aggregate path drives non-retry advance */
+
+		cluster_lms_native_probe_aggregate_and_resolve((uint32)i);
+		if (pg_atomic_read_u64(&slot->in_use) == 0 || slot->final_ready)
+			continue;
 
 		diff_ms = (long)((now - slot->start_ts) / 1000); /* µs → ms */
 		if (diff_ms < interval_ms)
@@ -916,14 +1028,18 @@ cluster_lms_native_probe_retry_tick(void)
 		pg_atomic_fetch_add_u64(&cluster_lms_state->native_probe_retry_count, 1);
 
 		if (slot->retry_count > (uint32)budget) {
-			/* HC32 fail-closed:  emit timeout signal to caller (Step 6 ges
-			 * reply path encodes 53R83 → requester ereports).  Mark slot for
-			 * release once caller consumes timeout result. */
+			/* HC32 fail-closed: async grant path sends REJECT and removes
+			 * the provisional GRD holder; sync waiter observes TIMEOUT. */
 			pg_atomic_fetch_add_u64(&cluster_lms_state->native_probe_timeout_count, 1);
-			/* Release slot — caller's wait must time out via ges reply
-			 * pipeline; explicit 53R83 emission lands in Step 6 D5 when
-			 * grant decision body integrates. */
-			cluster_lms_native_probe_slot_release((uint32)i);
+			if (slot->grant_on_clear) {
+				(void)cluster_grd_release_holder_by_id(&slot->resid, &slot->requester);
+				native_probe_send_reject_reply(slot, GES_REJECT_REASON_TIMEOUT);
+				cluster_lms_native_probe_slot_release((uint32)i);
+			} else {
+				slot->final_status = CLUSTER_NATIVE_PROBE_FINAL_TIMEOUT;
+				slot->final_ready = true;
+				ConditionVariableBroadcast(&cluster_lms_state->cv);
+			}
 			continue;
 		}
 
@@ -950,7 +1066,8 @@ cluster_lms_native_probe_cleanup_on_node_dead(int32 dead_node_id)
 	 * Premature CLEAR-on-dead risks split-brain false grant. */
 
 	cap = probe_active_capacity();
-	dead_bit = 1u << ((uint32)dead_node_id & 31);
+	if (!native_probe_node_bit(dead_node_id, &dead_bit))
+		return;
 
 	for (i = 0; i < cap; i++) {
 		ClusterLmsNativeLockProbeSlot *slot = &cluster_lms_state->native_probe_slots[i];
@@ -989,4 +1106,94 @@ cluster_lms_native_probe_cleanup_on_backend_exit(int procno)
 		 * HC36 stale-reply path (probe_id no longer matches active slot). */
 		cluster_lms_native_probe_slot_release((uint32)i);
 	}
+}
+
+bool
+cluster_lms_native_probe_schedule_grant(const ClusterResId *resid, LOCKMODE lockmode,
+										const ClusterGrdHolderId *requester, int32 source_node_id,
+										uint32 request_opcode)
+{
+	LOCKTAG locktag;
+	uint32 slot_idx;
+	ClusterLmsNativeLockProbeSlot *slot;
+
+	if (!cluster_lms_native_probe_required(resid, lockmode))
+		return false;
+	if (cluster_lms_state == NULL || resid == NULL || requester == NULL)
+		return false;
+
+	cluster_grd_resid_decode(resid, &locktag);
+	if (!cluster_lms_native_probe_slot_acquire(cluster_node_id, &locktag, lockmode, requester,
+											   &slot_idx))
+		return false;
+
+	slot = &cluster_lms_state->native_probe_slots[slot_idx];
+	slot->resid = *resid;
+	slot->grant_source_node_id = source_node_id;
+	slot->request_opcode = request_opcode;
+	slot->grant_on_clear = true;
+	cluster_lms_native_probe_dispatch(slot_idx);
+	cluster_lms_native_probe_aggregate_and_resolve(slot_idx);
+	return true;
+}
+
+bool
+cluster_lms_native_probe_wait_clear(const ClusterResId *resid, LOCKMODE lockmode,
+									const ClusterGrdHolderId *requester, int timeout_ms)
+{
+	LOCKTAG locktag;
+	uint32 slot_idx;
+	ClusterLmsNativeLockProbeSlot *slot;
+	TimestampTz deadline;
+	bool clear = false;
+	int effective_timeout_ms;
+
+	if (!cluster_lms_native_probe_required(resid, lockmode))
+		return true;
+	if (cluster_lms_state == NULL || resid == NULL || requester == NULL)
+		return false;
+
+	cluster_grd_resid_decode(resid, &locktag);
+	if (!cluster_lms_native_probe_slot_acquire(cluster_node_id, &locktag, lockmode, requester,
+											   &slot_idx))
+		return false;
+
+	slot = &cluster_lms_state->native_probe_slots[slot_idx];
+	slot->resid = *resid;
+	slot->grant_source_node_id = cluster_node_id;
+	slot->request_opcode = GES_REQ_OPCODE_REQUEST;
+	slot->grant_on_clear = false;
+	cluster_lms_native_probe_dispatch(slot_idx);
+	cluster_lms_native_probe_aggregate_and_resolve(slot_idx);
+
+	effective_timeout_ms = timeout_ms > 0 ? timeout_ms : cluster_ges_request_timeout_ms;
+	deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), effective_timeout_ms);
+
+	ConditionVariablePrepareToSleep(&cluster_lms_state->cv);
+	while (!slot->final_ready) {
+		long remaining_ms;
+		TimestampTz now = GetCurrentTimestamp();
+
+		cluster_lms_native_probe_retry_tick();
+		if (slot->final_ready)
+			break;
+		if (now >= deadline) {
+			pg_atomic_fetch_add_u64(&cluster_lms_state->native_probe_timeout_count, 1);
+			slot->final_status = CLUSTER_NATIVE_PROBE_FINAL_TIMEOUT;
+			slot->final_ready = true;
+			break;
+		}
+		remaining_ms = (long)((deadline - now) / 1000);
+		if (remaining_ms <= 0)
+			remaining_ms = 1;
+		if (remaining_ms > 100)
+			remaining_ms = 100;
+		(void)ConditionVariableTimedSleep(&cluster_lms_state->cv, (long)remaining_ms,
+										  WAIT_EVENT_CLUSTER_NATIVE_PROBE_REPLY_WAIT);
+	}
+	ConditionVariableCancelSleep();
+
+	clear = slot->final_status == (uint32)CLUSTER_NATIVE_LOCK_PROBE_CLEAR;
+	cluster_lms_native_probe_slot_release(slot_idx);
+	return clear;
 }

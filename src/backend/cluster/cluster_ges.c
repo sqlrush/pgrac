@@ -280,6 +280,9 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 	 */
 	if (opcode == GES_REQ_OPCODE_NATIVE_LOCK_PROBE) {
 		const GesNativeLockProbePayload *probe;
+		LOCKTAG probe_locktag;
+		ClusterResId probe_resid;
+		int32 probe_master;
 		uint64 accepted_epoch;
 
 		if (env->payload_length != sizeof(GesNativeLockProbePayload)) {
@@ -287,10 +290,14 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 			return;
 		}
 		probe = (const GesNativeLockProbePayload *)payload;
+		memcpy(&probe_locktag, probe->locktag_bytes, sizeof(probe_locktag));
+		cluster_grd_resid_encode(&probe_locktag, &probe_resid);
+		probe_master = cluster_grd_lookup_master(&probe_resid);
 		accepted_epoch = cluster_epoch_get_current();
 		if (env->epoch != accepted_epoch
 			|| cluster_conf_lookup_node((int32)env->source_node_id) == NULL
-			|| !cluster_qvotec_in_quorum() || (int)env->source_node_id == cluster_node_id) {
+			|| !cluster_qvotec_in_quorum() || (int)env->source_node_id == cluster_node_id
+			|| probe_master != (int32)env->source_node_id) {
 			cluster_grd_inc_ges_inbound_validation_fail();
 			return;
 		}
@@ -588,7 +595,30 @@ cluster_ges_lmon_drain_work_queue(void)
 				(int)req->lockmode, conflict_holders, &n_conflict);
 
 			if (action == CLUSTER_GRD_GRANT_NOW) {
-				ges_send_grant_reply((int32)item.source_node_id, &holder, &resid, req->opcode);
+				if (cluster_lms_native_probe_required(&resid, (LOCKMODE)req->lockmode)) {
+					if (!cluster_lms_native_probe_schedule_grant(
+							&resid, (LOCKMODE)req->lockmode, &holder, (int32)item.source_node_id,
+							req->opcode)) {
+						GesReplyPayload reject;
+
+						(void)cluster_grd_release_holder_by_id(&resid, &holder);
+						memset(&reject, 0, sizeof(reject));
+						reject.opcode = GES_REPLY_OPCODE_REJECT;
+						reject.reply_for_opcode = req->opcode;
+						reject.reject_reason = GES_REJECT_REASON_WORK_QUEUE_FULL;
+						reject.holder_node_id = req->holder_node_id;
+						reject.holder_procno = req->holder_procno;
+						reject.holder_cluster_epoch_lo = req->holder_cluster_epoch_lo;
+						reject.holder_cluster_epoch_hi = req->holder_cluster_epoch_hi;
+						reject.holder_request_id_lo = req->holder_request_id_lo;
+						reject.holder_request_id_hi = req->holder_request_id_hi;
+						memcpy(reject.resid, req->resid, sizeof(reject.resid));
+						cluster_grd_outbound_enqueue_lmon_reply(item.source_node_id, &reject,
+																sizeof(reject));
+					}
+				} else {
+					ges_send_grant_reply((int32)item.source_node_id, &holder, &resid, req->opcode);
+				}
 			} else if (action == CLUSTER_GRD_ENQUEUED_WAITER) {
 				/*
 					 * spec-2.23 D4 / HC18 — targeted BAST.  conflict_holders

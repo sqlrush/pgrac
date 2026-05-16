@@ -71,7 +71,8 @@ $node_off->stop;
 
 my $node_gate = PgracClusterNode->new('lms_gate');
 $node_gate->init;
-$node_gate->append_conf('postgresql.conf', "cluster.node_id = 0\n");
+$node_gate->append_conf('postgresql.conf',
+	"cluster.node_id = 0\ncluster.grd_max_entries = 64\n");
 $node_gate->start;
 
 # L4: pg_advisory_xact_lock — xact-level advisory enters cluster gate
@@ -111,8 +112,8 @@ my $session_advisory = $node_gate->safe_psql('postgres', q{
 is($session_advisory, 'L6_ok',
    'L6 session-level pg_advisory_lock — HC11 session advisory stays native');
 
-# L7: non-advisory lock (SELECT FOR UPDATE on relation) — gate predicate
-#     filters out non-ADVISORY locktag types.
+# L7: low-mode RELATION lock (SELECT FOR UPDATE) — gate predicate filters
+#     relation modes below ShareUpdateExclusiveLock.
 $node_gate->safe_psql('postgres',
 	q{CREATE TABLE l7_test(id int PRIMARY KEY, v int); INSERT INTO l7_test VALUES(1, 10);});
 my $non_advisory = $node_gate->safe_psql('postgres', q{
@@ -124,7 +125,7 @@ my $non_advisory = $node_gate->safe_psql('postgres', q{
 	SELECT 'L7_ok';
 });
 is($non_advisory, 'L7_ok',
-   'L7 SELECT FOR UPDATE (non-advisory) — gate predicate skips cluster path');
+   'L7 SELECT FOR UPDATE (RowShare/RowExclusive < SUEX) — gate predicate skips cluster path');
 
 # L8: cluster.lock_acquire_cluster_path emergency bypass — when set false
 #     (PGC_POSTMASTER), entire gate is bypassed.
@@ -187,17 +188,23 @@ my $post_l15 = _grd_path_count();
 is($post_l15, $pre_l15,
 	'L15 VACUUM pg_class — HC24 system catalog skip, counter unchanged');
 
-# L16: CREATE TEMP TABLE + CREATE INDEX CONCURRENTLY — relpersistence='t'
-# skip per HC25.  Note: CREATE INDEX CONCURRENTLY not supported on temp;
-# use ALTER TABLE temp ADD COLUMN which acquires AccessExclusiveLock.
-my $pre_l16 = _grd_path_count();
-$node_gate->safe_psql('postgres', q{
+# L16: explicit ACCESS EXCLUSIVE on an already-created temp table —
+# relpersistence='t' skip per HC25.  Keep this in one session because temp
+# relations are session-local, and snapshot the counter after CREATE TEMP so
+# ancillary locks taken by table creation are not attributed to the branch.
+my $l16_counts = $node_gate->safe_psql('postgres', q{
 	CREATE TEMP TABLE pgrac_l16_temp (id int);
-	ALTER TABLE pgrac_l16_temp ADD COLUMN val text;
+	SELECT value::int FROM pg_cluster_state
+	 WHERE category='grd' AND key='grd_relation_object_cluster_path_count';
+	BEGIN;
+	LOCK TABLE pgrac_l16_temp IN ACCESS EXCLUSIVE MODE;
+	COMMIT;
+	SELECT value::int FROM pg_cluster_state
+	 WHERE category='grd' AND key='grd_relation_object_cluster_path_count';
 });
-my $post_l16 = _grd_path_count();
+my ($pre_l16, $post_l16) = split /\n/, $l16_counts;
 is($post_l16, $pre_l16,
-	'L16 TEMP table ALTER (relpersistence=t) — HC25 temp skip, counter unchanged');
+	'L16 TEMP relation ACCESS EXCLUSIVE — HC25 temp skip, counter unchanged');
 
 # L17: unlogged + ALTER (SUEX) — relpersistence='u' → routed (HC25 unlogged
 # still goes cluster per shared-disk semantic).  Counter increments.
@@ -207,8 +214,8 @@ $node_gate->safe_psql('postgres', q{
 	ALTER TABLE pgrac_l17_unlog ADD COLUMN val text;
 });
 my $post_l17 = _grd_path_count();
-cmp_ok($post_l17, '>=', $pre_l17,
-	'L17 UNLOGGED table ALTER — HC25 unlogged routes cluster (counter non-decreasing)');
+cmp_ok($post_l17, '>', $pre_l17,
+	'L17 UNLOGGED table ALTER — HC25 unlogged routes cluster, counter advances');
 
 # L18: DROP TYPE on user-created composite type (OBJECT path).  objoid is
 # user-range and mode is AccessExclusiveLock → HC26+HC27 branches → gate
@@ -219,8 +226,8 @@ $node_gate->safe_psql('postgres', q{
 	DROP TYPE pgrac_l18_t;
 });
 my $post_l18 = _grd_path_count();
-cmp_ok($post_l18, '>=', $pre_l18,
-	'L18 CREATE/DROP TYPE (OBJECT user oid + AccessExclusive) — gate true');
+cmp_ok($post_l18, '>', $pre_l18,
+	'L18 CREATE/DROP TYPE (OBJECT user oid + AccessExclusive) — gate true, counter advances');
 
 $node_gate->stop;
 

@@ -163,15 +163,22 @@ typedef struct ClusterLmsNativeLockProbeSlot {
 	int32 requester_procno;	 /* pgprocno of backend awaiting grant */
 	int32 _pad1;
 	ClusterGrdHolderId requester;	 /* HC32a exclude_holder identity */
+	ClusterResId resid;				 /* grant-on-clear target resource */
 	TimestampTz start_ts;			 /* dispatch timestamp */
+	int32 grant_source_node_id;		 /* reply destination for async grant */
+	uint32 request_opcode;			 /* original GesRequestOpcode */
 	uint32 retry_count;				 /* HC32 retry-poll counter */
 	uint32 expected_replies_bitmap;	 /* bit set per live peer (1 = need reply) */
 	uint32 received_replies_bitmap;	 /* bit set per received reply */
 	uint32 aggregated_status_packed; /* 2 bits per node × 16 max nodes */
+	uint32 final_status;			 /* sync waiter result; 0 clear,3 timeout */
+	bool grant_on_clear;			 /* async remote-master grant completion */
+	bool final_ready;				 /* sync waiter completion flag */
+	bool _pad2[2];
 } ClusterLmsNativeLockProbeSlot;
 
-StaticAssertDecl(sizeof(ClusterLmsNativeLockProbeSlot) == 96,
-				 "ClusterLmsNativeLockProbeSlot ABI 96B lock");
+StaticAssertDecl(sizeof(ClusterLmsNativeLockProbeSlot) == 128,
+				 "ClusterLmsNativeLockProbeSlot ABI 128B lock");
 
 typedef struct ClusterLmsSharedState {
 	LWLock lwlock;				/* LWTRANCHE_CLUSTER_LMS guards non-atomic fields */

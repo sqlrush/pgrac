@@ -520,6 +520,10 @@ cluster_grd_outbound_lmon_drain_send(void)
 	return 0;
 }
 
+void
+cluster_lms_native_probe_retry_tick(void)
+{}
+
 /* spec-2.13 D8 / L104 stubs: cluster_lmon.c registers 2 GES handler
  * function pointers (cluster_ges_{request,reply}_handler) into the
  * ICMsgType registry in postmaster phase 1.  test_cluster_lmon

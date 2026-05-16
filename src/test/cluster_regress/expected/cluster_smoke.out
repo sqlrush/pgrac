@@ -81,7 +81,7 @@ SELECT attname, format_type(atttypid, atttypmod)
 --    in cluster_views.c).
 -- ----------
 SELECT count(*) FROM pg_stat_cluster_wait_events;
- count
+ count 
 -------
     75
 (1 row)
@@ -104,7 +104,7 @@ SELECT count(DISTINCT type) FROM pg_stat_cluster_wait_events;
 --    multiply this by N).
 -- ----------
 SELECT count(*) FROM pg_stat_gcluster_wait_events;
- count
+ count 
 -------
     75
 (1 row)

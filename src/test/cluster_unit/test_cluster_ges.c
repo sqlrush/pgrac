@@ -51,6 +51,7 @@
 #include <string.h>
 
 #include "cluster/cluster_ges.h"
+#include "cluster/cluster_grd.h"
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_grd_work_queue.h"
 #include "cluster/cluster_ic_envelope.h"
@@ -234,6 +235,16 @@ int32
 cluster_grd_lookup_master(const struct ClusterResId *resid pg_attribute_unused())
 {
 	return cluster_node_id;
+}
+
+void
+cluster_grd_resid_encode(const LOCKTAG *src, struct ClusterResId *dst)
+{
+	memset(dst, 0, sizeof(*dst));
+	if (src != NULL) {
+		dst->type = src->locktag_type;
+		dst->lockmethodid = src->locktag_lockmethodid;
+	}
 }
 
 /* GRD inc helpers — stub bump local counters (test verifies via accessor) */
@@ -420,6 +431,22 @@ cluster_lms_native_probe_recv_reply(uint64 probe_id pg_attribute_unused(),
 	stub_native_probe_recv_calls++;
 }
 
+bool
+cluster_lms_native_probe_required(const struct ClusterResId *resid pg_attribute_unused(),
+								  int lockmode pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_lms_native_probe_schedule_grant(
+	const struct ClusterResId *resid pg_attribute_unused(), int lockmode pg_attribute_unused(),
+	const struct ClusterGrdHolderId *requester pg_attribute_unused(),
+	int32 source_node_id pg_attribute_unused(), uint32 request_opcode pg_attribute_unused())
+{
+	return false;
+}
+
 void
 cluster_grd_outbound_enqueue_lms_native_probe(uint32 dest, const void *p pg_attribute_unused(),
 											  uint16 len)
@@ -470,10 +497,7 @@ cluster_lmd_probe_collect_receive(const struct GesDeadlockReportHeader *r pg_att
 /* cluster_grd GRD-owned waiter API (spec-2.23 D6). */
 struct ClusterGrdConflictHolder;
 struct ClusterGrdWaiterIdentity;
-typedef enum {
-	UT_GRANT_NOW = 0,
-} UtGrantAction;
-int
+ClusterGrdGrantAction
 cluster_grd_entry_enqueue_or_grant(const struct ClusterResId *r pg_attribute_unused(),
 								   const struct ClusterGrdHolderId *h pg_attribute_unused(),
 								   int32 src pg_attribute_unused(),
@@ -484,7 +508,7 @@ cluster_grd_entry_enqueue_or_grant(const struct ClusterResId *r pg_attribute_unu
 {
 	if (nout != NULL)
 		*nout = 0;
-	return UT_GRANT_NOW;
+	return CLUSTER_GRD_GRANT_NOW;
 }
 int
 cluster_grd_entry_release_and_pop_compatible_waiter(
@@ -493,6 +517,13 @@ cluster_grd_entry_release_and_pop_compatible_waiter(
 	struct ClusterGrdWaiterIdentity *out pg_attribute_unused(), int max_out pg_attribute_unused())
 {
 	return 0;
+}
+
+ClusterGrdEntryResult
+cluster_grd_release_holder_by_id(const struct ClusterResId *r pg_attribute_unused(),
+								 const struct ClusterGrdHolderId *h pg_attribute_unused())
+{
+	return CLUSTER_GRD_ENTRY_OK;
 }
 
 /* GUC + PG runtime stubs. */
