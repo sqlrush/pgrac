@@ -169,19 +169,22 @@ cluster_shmem_iter_regions(int *idx pg_attribute_unused(),
 UT_DEFINE_GLOBALS();
 
 
-UT_TEST(test_cluster_wait_events_count_is_71)
+UT_TEST(test_cluster_wait_events_count_is_73)
 {
 	/*
 	 * Cumulative registration roster: 61 prior + 3 added by spec-2.6 D11
 	 * (ClusterBgProcQvotecMainLoop + ClusterVotingDiskRead/Write) + 1
 	 * added by spec-2.28 D9 (ClusterFenceBackendInterruptCheck) + 1
 	 * added by spec-2.29 D9 (BgProcLmonReconfigTick) + 3 added by
-	 * spec-2.19 D12 (LMD lifecycle events).  If a future
-	 * subsystem spec adds new cluster wait events, both the enum in
-	 * wait_event.h and CLUSTER_WAIT_EVENTS_COUNT must move together,
-	 * and this test number must be bumped in lockstep.
+	 * spec-2.19 D12 (LMD lifecycle events) + 1 added by spec-2.20 D12
+	 * (ClusterGesS4Wait) + 1 added by spec-2.22 D10 (ClusterLmdProbe) +
+	 * 2 added by spec-2.23 D12 (ClusterGesReplyWait + ClusterLmd-
+	 * ProbeCollect).  If a future subsystem spec adds new cluster wait
+	 * events, both the enum in wait_event.h and CLUSTER_WAIT_EVENTS_
+	 * COUNT must move together, and this test number must be bumped
+	 * in lockstep.
 	 */
-	UT_ASSERT_EQ(CLUSTER_WAIT_EVENTS_COUNT, 71);
+	UT_ASSERT_EQ(CLUSTER_WAIT_EVENTS_COUNT, 73);
 }
 
 
@@ -221,7 +224,7 @@ int
 main(void)
 {
 	UT_PLAN(4);
-	UT_RUN(test_cluster_wait_events_count_is_71);
+	UT_RUN(test_cluster_wait_events_count_is_73);
 	UT_RUN(test_srf_symbol_linkable);
 	UT_RUN(test_first_event_is_ges_enqueue_acquire);
 	UT_RUN(test_adg_scn_sync_wait_in_adg_class);

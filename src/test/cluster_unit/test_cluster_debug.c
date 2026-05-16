@@ -1320,6 +1320,32 @@ cluster_lmd_inject_call_count_get(void)
 {
 	return 0;
 }
+/* spec-2.23 D13 stub audit — new dump_ges / dump_lmd counter rows. */
+uint64
+cluster_ges_reply_wait_table_active_count(void)
+{
+	return 0;
+}
+uint64
+cluster_ges_reply_late_drop_count(void)
+{
+	return 0;
+}
+uint64
+cluster_ges_release_ack_count(void)
+{
+	return 0;
+}
+uint64
+cluster_lmd_probe_broadcast_count_get(void)
+{
+	return 0;
+}
+uint64
+cluster_lmd_probe_partial_count_get(void)
+{
+	return 0;
+}
 
 UT_TEST(test_debug_links_against_pgstat_module)
 {

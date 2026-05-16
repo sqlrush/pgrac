@@ -367,6 +367,15 @@ void
 cluster_ges_shmem_register(void)
 {}
 
+/* spec-2.23 D1 / L104 stub: cluster_ges_reply_wait shmem region (real
+ * impl in cluster_ges_reply_wait.c).  cluster_shmem.c calls
+ * cluster_ges_reply_wait_shmem_register to register the "pgrac cluster
+ * ges reply wait" region; standalone unit test doesn't link
+ * cluster_ges_reply_wait.o. */
+void
+cluster_ges_reply_wait_shmem_register(void)
+{}
+
 /* spec-2.14 D12 / L104 stub: cluster_grd shmem region (real impl in
  * cluster_grd.c).  cluster_shmem.c calls cluster_grd_shmem_register
  * to register the "pgrac cluster grd" region; standalone unit test

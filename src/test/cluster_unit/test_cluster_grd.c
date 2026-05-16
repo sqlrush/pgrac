@@ -357,6 +357,16 @@ void
 LWLockRelease(LWLock *lock pg_attribute_unused())
 {}
 
+/* spec-2.23 D6 stub: PG exported DoLockModesConflict — cluster_grd.c
+ * uses this in enqueue_or_grant / release_and_pop_compatible_waiter.
+ * Unit test never exercises conflict logic; return false so all
+ * mode pairs read as compatible (skeleton scaffolding behavior). */
+bool
+DoLockModesConflict(int a pg_attribute_unused(), int b pg_attribute_unused())
+{
+	return false;
+}
+
 /* spec-2.15 D11: s_lock contention stub.  PG inlines TAS spinlocks via
  * compiler primitives on most targets, but s_lock() resolves at link
  * time for the contended-spin slow path (always reachable in object

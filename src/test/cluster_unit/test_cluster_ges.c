@@ -336,6 +336,124 @@ cluster_grd_outbound_enqueue_lmon_reply(uint32 d pg_attribute_unused(),
 	stub_lmon_reply_enqueue_count++;
 }
 
+/* spec-2.23 D14 R13 stub audit — new symbol surface introduced by
+ * Steps 1-9 needs file-local stubs so cluster_ges.o links standalone
+ * in this test binary.  All stubs are minimal inert bodies; behavior
+ * coverage lives in TAP 108/109 where real backend wiring runs. */
+
+bool
+cluster_grd_outbound_enqueue_backend_request(uint32 d pg_attribute_unused(),
+											 const void *p pg_attribute_unused(),
+											 uint16 l pg_attribute_unused())
+{
+	return true;
+}
+
+void
+cluster_grd_inc_bast_sent(void)
+{}
+
+/* cluster_ges_reply_wait API stubs (spec-2.23 D1). */
+struct GesReplyWaitKey;
+struct GesReplyWaitEntry;
+struct GesReplyWaitEntry *
+cluster_ges_reply_wait_insert(const struct GesReplyWaitKey *k pg_attribute_unused(),
+							  int64 deadline pg_attribute_unused())
+{
+	return NULL;
+}
+struct GesReplyWaitEntry *
+cluster_ges_reply_wait_lookup(const struct GesReplyWaitKey *k pg_attribute_unused())
+{
+	return NULL;
+}
+void
+cluster_ges_reply_wait_wake(struct GesReplyWaitEntry *e pg_attribute_unused(),
+							uint32 opcode pg_attribute_unused(),
+							uint32 reason pg_attribute_unused())
+{}
+void
+cluster_ges_reply_wait_delete(const struct GesReplyWaitKey *k pg_attribute_unused())
+{}
+void
+cluster_ges_inc_release_ack(void)
+{}
+void
+cluster_ges_inc_reply_late_drop(void)
+{}
+
+/* cluster_lmd probe collector receive (spec-2.23 D8). */
+struct GesDeadlockReportHeader;
+bool
+cluster_lmd_probe_collect_receive(const struct GesDeadlockReportHeader *r pg_attribute_unused(),
+								  Size len pg_attribute_unused())
+{
+	return false;
+}
+
+/* cluster_grd GRD-owned waiter API (spec-2.23 D6). */
+struct ClusterGrdConflictHolder;
+struct ClusterGrdWaiterIdentity;
+typedef enum {
+	UT_GRANT_NOW = 0,
+} UtGrantAction;
+int
+cluster_grd_entry_enqueue_or_grant(const struct ClusterResId *r pg_attribute_unused(),
+								   const struct ClusterGrdHolderId *h pg_attribute_unused(),
+								   int32 src pg_attribute_unused(),
+								   uint64 req_id pg_attribute_unused(),
+								   uint32 op pg_attribute_unused(),
+								   int mode pg_attribute_unused(),
+								   struct ClusterGrdConflictHolder *out pg_attribute_unused(),
+								   int *nout pg_attribute_unused())
+{
+	if (nout != NULL)
+		*nout = 0;
+	return UT_GRANT_NOW;
+}
+int
+cluster_grd_entry_release_and_pop_compatible_waiter(
+	const struct ClusterResId *r pg_attribute_unused(),
+	const struct ClusterGrdHolderId *h pg_attribute_unused(),
+	struct ClusterGrdWaiterIdentity *out pg_attribute_unused(),
+	int max_out pg_attribute_unused())
+{
+	return 0;
+}
+
+/* GUC + PG runtime stubs. */
+int cluster_ges_request_timeout_ms = 60000;
+
+bool DoLockModesConflict(int a pg_attribute_unused(), int b pg_attribute_unused())
+{
+	return false;
+}
+
+int64
+GetCurrentTimestamp(void)
+{
+	return 0;
+}
+
+void *MyProc;
+
+#include "storage/condition_variable.h"
+void
+ConditionVariablePrepareToSleep(ConditionVariable *cv pg_attribute_unused())
+{}
+bool
+ConditionVariableCancelSleep(void)
+{
+	return false;
+}
+bool
+ConditionVariableTimedSleep(ConditionVariable *cv pg_attribute_unused(),
+							long timeout pg_attribute_unused(),
+							uint32 wait_event pg_attribute_unused())
+{
+	return true;
+}
+
 
 /* ============================================================
  * T-ges-1 a/b/c/d/e (spec-2.13 D6 Q5.2).
