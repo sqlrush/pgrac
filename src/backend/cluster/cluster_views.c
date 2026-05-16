@@ -203,6 +203,9 @@ static const uint32 cluster_wait_event_infos[CLUSTER_WAIT_EVENTS_COUNT] = {
 	/* spec-2.23 D12: cross-node GES reply 5-tuple wait + REPORT collect. */
 	WAIT_EVENT_CLUSTER_GES_REPLY_WAIT,
 	WAIT_EVENT_CLUSTER_LMD_PROBE_COLLECT,
+	/* spec-2.25 D11: native-lock probe collector wait + peer scan wait. */
+	WAIT_EVENT_CLUSTER_LMS_NATIVE_PROBE_WAIT,
+	WAIT_EVENT_CLUSTER_NATIVE_PROBE_REPLY_WAIT,
 };
 
 /* Compile-time assertion: array length must match the documented count. */

@@ -84,7 +84,9 @@
 #include "datatype/timestamp.h"
 #include "port/atomics.h"
 #include "storage/condition_variable.h"
+#include "storage/lock.h" /* LOCKTAG / LOCKMODE for probe slot */
 #include "storage/lwlock.h"
+#include "cluster/cluster_grd.h" /* ClusterGrdHolderId for probe slot */
 
 
 /*
@@ -141,6 +143,36 @@ typedef enum ClusterLmsState {
  *	  - lms_drain_empty_count   : drain pumps that found empty queue
  *	  - lms_error_count         : ereport-class errors (LMS-owned counter)
  */
+/* spec-2.25 D4 — native-lock probe collector slot (HC29 + L141 reuse).
+ *
+ *	Each slot tracks one in-flight (LOCKTAG, lockmode) probe + N-1
+ *	expected peer replies + aggregated 3-state status.  Static array
+ *	in ClusterLmsSharedState sized to CLUSTER_LMS_NATIVE_LOCK_PROBE_MAX_SLOTS
+ *	(= 64, matches GUC max range);  GUC
+ *	cluster.lms_native_lock_probe_max_inflight (default 8) bounds the
+ *	"active capacity" — slots beyond it are reserved but unused.
+ */
+#define CLUSTER_LMS_NATIVE_LOCK_PROBE_MAX_SLOTS 64
+
+typedef struct ClusterLmsNativeLockProbeSlot {
+	pg_atomic_uint64 in_use; /* 0 = free, 1 = allocated (slot-level guard) */
+	uint64 probe_id;		 /* monotonic per-shard id (HC36 epoch) */
+	LOCKTAG locktag;		 /* 16B PG LOCKTAG (RELATION / OBJECT) */
+	LOCKMODE lockmode;		 /* 4B PG LOCKMODE */
+	int32 origin_node_id;	 /* local cluster_node_id at acquire */
+	int32 requester_procno;	 /* pgprocno of backend awaiting grant */
+	int32 _pad1;
+	ClusterGrdHolderId requester;	 /* HC32a exclude_holder identity */
+	TimestampTz start_ts;			 /* dispatch timestamp */
+	uint32 retry_count;				 /* HC32 retry-poll counter */
+	uint32 expected_replies_bitmap;	 /* bit set per live peer (1 = need reply) */
+	uint32 received_replies_bitmap;	 /* bit set per received reply */
+	uint32 aggregated_status_packed; /* 2 bits per node × 16 max nodes */
+} ClusterLmsNativeLockProbeSlot;
+
+StaticAssertDecl(sizeof(ClusterLmsNativeLockProbeSlot) == 96,
+				 "ClusterLmsNativeLockProbeSlot ABI 96B lock");
+
 typedef struct ClusterLmsSharedState {
 	LWLock lwlock;				/* LWTRANCHE_CLUSTER_LMS guards non-atomic fields */
 	pg_atomic_uint32 lms_state; /* ClusterLmsState atomic (HC4 single ownership field) */
@@ -168,6 +200,19 @@ typedef struct ClusterLmsSharedState {
 	pg_atomic_uint64 lms_decision_convert_count;
 	pg_atomic_uint64 lms_drain_empty_count;
 	pg_atomic_uint64 lms_error_count;
+
+	/* spec-2.25 D4 / D13 — 7 NEW native-lock probe counters (HC29..HC36). */
+	pg_atomic_uint64 native_probe_sent_count;
+	pg_atomic_uint64 native_probe_reply_recv_count;
+	pg_atomic_uint64 native_probe_collector_slot_full_count;
+	pg_atomic_uint64 native_probe_aggregate_holder_conflict_count;
+	pg_atomic_uint64 native_probe_aggregate_waiter_conflict_count;
+	pg_atomic_uint64 native_probe_retry_count;
+	pg_atomic_uint64 native_probe_timeout_count;
+
+	/* probe collector slot array + monotonic id allocator (HC36). */
+	pg_atomic_uint64 native_probe_next_id;
+	ClusterLmsNativeLockProbeSlot native_probe_slots[CLUSTER_LMS_NATIVE_LOCK_PROBE_MAX_SLOTS];
 } ClusterLmsSharedState;
 
 
@@ -223,6 +268,15 @@ extern uint64 cluster_lms_get_decision_reject_count(void);
 extern uint64 cluster_lms_get_decision_convert_count(void);
 extern uint64 cluster_lms_get_drain_empty_count(void);
 extern uint64 cluster_lms_get_error_count(void);
+
+/* spec-2.25 D13 — 7 NEW native-lock probe counter accessors. */
+extern uint64 cluster_lms_get_native_probe_sent_count(void);
+extern uint64 cluster_lms_get_native_probe_reply_recv_count(void);
+extern uint64 cluster_lms_get_native_probe_collector_slot_full_count(void);
+extern uint64 cluster_lms_get_native_probe_aggregate_holder_conflict_count(void);
+extern uint64 cluster_lms_get_native_probe_aggregate_waiter_conflict_count(void);
+extern uint64 cluster_lms_get_native_probe_retry_count(void);
+extern uint64 cluster_lms_get_native_probe_timeout_count(void);
 
 /*
  * State enum -> canonical lowercase string ("disabled", "not_started",

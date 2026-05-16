@@ -186,7 +186,23 @@ typedef enum GesRequestOpcode {
 	GES_REQ_OPCODE_DEADLOCK_PROBE = 6, /* coordinator → all nodes probe req */
 	GES_REQ_OPCODE_CANCEL_PENDING = 7, /* backend → master cancel pending */
 	GES_REQ_OPCODE_DEADLOCK_REPORT
-	= 8 /* spec-2.22 D6: probed node → coordinator (read-only graph snapshot) */
+	= 8, /* spec-2.22 D6: probed node → coordinator (read-only graph snapshot) */
+	/* spec-2.25 NEW 2 opcode (Q11 v0.2) — native-lock probe protocol pair.
+	 *
+	 *	LMS → peer node:  NATIVE_LOCK_PROBE asks peer to scan local PG lock
+	 *	state for conflict on (LOCKTAG, lockmode);  peer replies with one
+	 *	of CLEAR / HOLDER_CONFLICT / WAITER_CONFLICT (see
+	 *	cluster_native_lock_probe.h ClusterNativeLockProbeReply enum).
+	 *
+	 *	Uses dedicated payload structs (GesNativeLockProbePayload /
+	 *	GesNativeLockProbeReplyPayload) — not the 48-byte GesRequestPayload.
+	 *	Dispatched via early opcode fork in cluster_ges_request_handler
+	 *	(mirrors DEADLOCK_PROBE / DEADLOCK_REPORT pattern at line 205+).
+	 *	Main ges_validate_inbound opcode_max stays at CANCEL_PENDING (7);
+	 *	these two opcodes use bespoke validation per HC33.
+	 */
+	GES_REQ_OPCODE_NATIVE_LOCK_PROBE = 9,
+	GES_REQ_OPCODE_NATIVE_LOCK_PROBE_REPLY = 10
 } GesRequestOpcode;
 
 typedef enum GesReplyOpcode {
@@ -394,6 +410,52 @@ StaticAssertDecl(sizeof(GesDeadlockReportHeader) == 32,
  */
 extern int cluster_ges_deadlock_probe_handler(const GesDeadlockProbePayload *probe, void *out_buf,
 											  Size *inout_buflen);
+
+/* ============================================================
+ * spec-2.25 D6:  Native-lock probe protocol payload structs
+ *
+ *	NATIVE_LOCK_PROBE asks a peer node to scan its local PG lock
+ *	state for conflicts on (LOCKTAG, lockmode);  peer replies with
+ *	one of CLEAR / HOLDER_CONFLICT / WAITER_CONFLICT.  Used by LMS
+ *	to satisfy the per-node native-lock reverse-check before
+ *	granting a cluster lock (HC30..HC32a).
+ *
+ *	Both payloads are fixed 32 bytes to keep the GES wire ABI
+ *	multi-opcode alignment uniform with GesDeadlockProbePayload
+ *	(24B) and GesDeadlockReportHeader (32B).
+ * ============================================================ */
+
+typedef struct GesNativeLockProbePayload {
+	uint32 opcode;			 /* [0,4)   = GES_REQ_OPCODE_NATIVE_LOCK_PROBE (9) */
+	uint32 lockmode;		 /* [4,8)   PG LOCKMODE (1..8) */
+	uint8 locktag_bytes[16]; /* [8,24)  LOCKTAG byte-image (16B serialized) */
+	uint64 probe_id;		 /* [24,32) monotonic per-shard collector slot id */
+} GesNativeLockProbePayload;
+
+StaticAssertDecl(sizeof(GesNativeLockProbePayload) == 32,
+				 "GesNativeLockProbePayload wire ABI 32-byte lock");
+
+typedef struct GesNativeLockProbeReplyPayload {
+	uint32 opcode;		   /* = GES_REQ_OPCODE_NATIVE_LOCK_PROBE_REPLY (10) */
+	uint32 status;		   /* ClusterNativeLockProbeReply enum value */
+	uint64 probe_id;	   /* echoes request (collector slot correlation) */
+	uint32 sender_node_id; /* node that performed the local scan (HC33 dual-check) */
+	uint8 reserved[12];	   /* pad to 32B */
+} GesNativeLockProbeReplyPayload;
+
+StaticAssertDecl(sizeof(GesNativeLockProbeReplyPayload) == 32,
+				 "GesNativeLockProbeReplyPayload wire ABI 32-byte lock");
+
+/*
+ * spec-2.25 D6 / Step 1 — native-lock probe handler entry points.  Wire
+ * dispatch from cluster_ges_request_handler;  body activation lands at
+ * Step 6 (D5 — request body scans local PG lock state via D8 helper;
+ * reply body feeds LMS collector via D4 cluster_lms_native_probe_recv_reply).
+ */
+extern void cluster_ges_handle_native_lock_probe_request(const ClusterICEnvelope *env,
+														 const GesNativeLockProbePayload *probe);
+extern void cluster_ges_handle_native_lock_probe_reply(const ClusterICEnvelope *env,
+													   const GesNativeLockProbeReplyPayload *reply);
 
 #endif /* !FRONTEND */
 

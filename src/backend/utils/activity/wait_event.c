@@ -1306,6 +1306,12 @@ pgstat_get_wait_cluster_bgproc(WaitEventCluster w)
 	case WAIT_EVENT_CLUSTER_LMD_PROBE_COLLECT:
 		event_name = "ClusterLmdProbeCollect";
 		break;
+	case WAIT_EVENT_CLUSTER_LMS_NATIVE_PROBE_WAIT:
+		event_name = "ClusterLmsNativeProbeWait";
+		break;
+	case WAIT_EVENT_CLUSTER_NATIVE_PROBE_REPLY_WAIT:
+		event_name = "ClusterNativeProbeReplyWait";
+		break;
 	default:
 		break;
 	}

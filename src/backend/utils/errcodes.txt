@@ -533,6 +533,14 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 # = -1 spec-2.26 ships).  Caller走 S7 cleanup + ereport(53R82).
 53R82    E    ERRCODE_CLUSTER_LMD_WAIT_EDGE_FULL                             cluster_lmd_wait_edge_full
 
+# spec-2.25 D10 (HC32 fail-closed):  per-node native-lock probe retry budget
+# exhausted before all peer nodes responded CLEAR.  LMS aggregates probe replies
+# (3-state CLEAR/HOLDER_CONFLICT/WAITER_CONFLICT) over N-1 peers;  any non-CLEAR
+# or timeout defers grant and retries every cluster.lms_native_lock_probe_retry_interval_ms.
+# Cumulative retry_count >= cluster.lms_native_lock_probe_retry_budget (default
+# 60 ≈ 30s) → caller ereport(53R83);  client retries the failing DDL or aborts.
+53R83    E    ERRCODE_CLUSTER_NATIVE_LOCK_PROBE_TIMEOUT                       cluster_native_lock_probe_timeout
+
 Section: Class 54 - Program Limit Exceeded
 
 # this is for wired-in limits, not resource exhaustion problems (class borrowed from DB2)

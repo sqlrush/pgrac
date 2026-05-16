@@ -1222,6 +1222,42 @@ cluster_lms_get_error_count(void)
 {
 	return 0;
 }
+/* spec-2.25 D13 R10 stub audit — 7 NEW native-lock probe counter accessors. */
+uint64
+cluster_lms_get_native_probe_sent_count(void)
+{
+	return 0;
+}
+uint64
+cluster_lms_get_native_probe_reply_recv_count(void)
+{
+	return 0;
+}
+uint64
+cluster_lms_get_native_probe_collector_slot_full_count(void)
+{
+	return 0;
+}
+uint64
+cluster_lms_get_native_probe_aggregate_holder_conflict_count(void)
+{
+	return 0;
+}
+uint64
+cluster_lms_get_native_probe_aggregate_waiter_conflict_count(void)
+{
+	return 0;
+}
+uint64
+cluster_lms_get_native_probe_retry_count(void)
+{
+	return 0;
+}
+uint64
+cluster_lms_get_native_probe_timeout_count(void)
+{
+	return 0;
+}
 const char *
 cluster_lms_state_to_string(int s pg_attribute_unused())
 {
@@ -1382,6 +1418,15 @@ cluster_grd_cleanup_skip_stale_cancel_count(void)
 {
 	return 0;
 }
+/* spec-2.25 D13 R10 stub audit — RELATION + OBJECT gate hit counter. */
+uint64
+cluster_grd_relation_object_cluster_path_count(void)
+{
+	return 0;
+}
+void
+cluster_grd_inc_relation_object_cluster_path(void)
+{}
 
 UT_TEST(test_debug_links_against_pgstat_module)
 {

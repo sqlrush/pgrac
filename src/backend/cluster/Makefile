@@ -64,6 +64,7 @@ OBJS = \
 	cluster_inject.o \
 	cluster_lck.o \
 	cluster_lock_acquire.o \
+	cluster_native_lock_probe.o \
 	cluster_lmd.o \
 	cluster_lmd_graph.o \
 	cluster_lmd_srf.o \

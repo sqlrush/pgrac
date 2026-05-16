@@ -210,6 +210,11 @@ extern int cluster_ges_reply_wait_max_entries;
 /* spec-2.24 D11 NEW: LMD periodic cleanup sweep interval. */
 extern int cluster_lmd_cleanup_sweep_interval_ms;
 
+/* spec-2.25 D9 NEW: per-node native-lock probe tunables. */
+extern int cluster_lms_native_lock_probe_max_inflight;
+extern int cluster_lms_native_lock_probe_retry_interval_ms;
+extern int cluster_lms_native_lock_probe_retry_budget;
+
 /* spec-2.17 NEW GUCs(v0.6 frozen baseline). */
 extern int cluster_ges_bast_retry_interval_ms;		  /* D11 */
 extern int cluster_ges_bast_max_retries;			  /* D11 */

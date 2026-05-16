@@ -40,6 +40,7 @@
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_lmd.h" /* + spec-2.23 D8 probe collector receive */
 #include "cluster/cluster_lms.h"
+#include "cluster/cluster_native_lock_probe.h" /* spec-2.25 D5 — probe protocol handlers */
 #include "cluster/cluster_grd_work_queue.h"
 #include "cluster/cluster_guc.h" /* cluster_node_id + cluster_ges_request_timeout_ms */
 #include "cluster/cluster_ic_envelope.h"
@@ -252,6 +253,70 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 		(void)cluster_lmd_probe_collect_receive(report, env->payload_length);
 		return;
 	}
+	/*
+	 * PGRAC: spec-2.25 D6 / HC33 — NATIVE_LOCK_PROBE (opcode 9) & REPLY (opcode
+	 * 10) use dedicated 32B payload structs.  Like DEADLOCK_PROBE/REPORT, they
+	 * bypass the generic 48B GesRequestPayload validator.  Both opcodes carry
+	 * bespoke source/target validation per HC33:
+	 *
+	 *	NATIVE_LOCK_PROBE request:
+	 *	  - envelope source must be the LMS owning the (resid-implied) shard
+	 *	    (cross-checked via cluster_conf_lookup_node + quorum)
+	 *	  - target (this node) processes the probe;  no explicit target field
+	 *	    needed since envelope already routed to us
+	 *	  - epoch must match current cluster epoch
+	 *
+	 *	NATIVE_LOCK_PROBE_REPLY:
+	 *	  - payload.sender_node_id must equal env->source_node_id (HC33 dual
+	 *	    check — prevents spoof where peer claims node A but envelope
+	 *	    came from B)
+	 *	  - collector slot lookup deferred to cluster_lms_native_probe_recv_reply
+	 *	    (which applies HC36 stale-reply drop via probe_id epoch + expected
+	 *	    bitmap match)
+	 *
+	 *	Skeleton:  handler body wired Step 6 (D5);  Step 1 only routes opcode
+	 *	to the dispatcher + applies validation + counter accounting.  Production
+	 *	dispatch lands when cluster_lms_* probe collector is online (Step 5).
+	 */
+	if (opcode == GES_REQ_OPCODE_NATIVE_LOCK_PROBE) {
+		const GesNativeLockProbePayload *probe;
+		uint64 accepted_epoch;
+
+		if (env->payload_length != sizeof(GesNativeLockProbePayload)) {
+			cluster_grd_inc_ges_inbound_validation_fail();
+			return;
+		}
+		probe = (const GesNativeLockProbePayload *)payload;
+		accepted_epoch = cluster_epoch_get_current();
+		if (env->epoch != accepted_epoch
+			|| cluster_conf_lookup_node((int32)env->source_node_id) == NULL
+			|| !cluster_qvotec_in_quorum() || (int)env->source_node_id == cluster_node_id) {
+			cluster_grd_inc_ges_inbound_validation_fail();
+			return;
+		}
+		cluster_ges_handle_native_lock_probe_request(env, probe);
+		return;
+	}
+	if (opcode == GES_REQ_OPCODE_NATIVE_LOCK_PROBE_REPLY) {
+		const GesNativeLockProbeReplyPayload *reply;
+		uint64 accepted_epoch;
+
+		if (env->payload_length != sizeof(GesNativeLockProbeReplyPayload)) {
+			cluster_grd_inc_ges_inbound_validation_fail();
+			return;
+		}
+		reply = (const GesNativeLockProbeReplyPayload *)payload;
+		accepted_epoch = cluster_epoch_get_current();
+		/* HC33 dual-source check: payload.sender ≡ envelope source */
+		if (reply->sender_node_id != env->source_node_id || env->epoch != accepted_epoch
+			|| cluster_conf_lookup_node((int32)env->source_node_id) == NULL
+			|| !cluster_qvotec_in_quorum() || (int)env->source_node_id == cluster_node_id) {
+			cluster_grd_inc_ges_inbound_validation_fail();
+			return;
+		}
+		cluster_ges_handle_native_lock_probe_reply(env, reply);
+		return;
+	}
 	if (env->payload_length != sizeof(GesRequestPayload)) {
 		cluster_grd_inc_ges_inbound_validation_fail();
 		return;
@@ -331,6 +396,14 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 		break;
 	case GES_REQ_OPCODE_DEADLOCK_PROBE:
 	case GES_REQ_OPCODE_DEADLOCK_REPORT:
+	case GES_REQ_OPCODE_NATIVE_LOCK_PROBE:
+	case GES_REQ_OPCODE_NATIVE_LOCK_PROBE_REPLY:
+		/*
+		 * spec-2.25 D6:  these opcodes use dedicated payload structs +
+		 * early dispatch path above (line 205-/256-).  Reaching the
+		 * GesRequestPayload switch means a request-sized envelope carried
+		 * a non-request opcode — fail closed.
+		 */
 		cluster_grd_inc_ges_inbound_validation_fail();
 		return;
 	}
@@ -999,4 +1072,103 @@ cluster_ges_deadlock_probe_handler(const GesDeadlockProbePayload *probe, void *o
 
 	pgstat_report_wait_end();
 	return 0;
+}
+
+/*
+ * spec-2.25 Step 1 D6 — native-lock probe handler skeleton entries.
+ *
+ *	Step 1 wires the early opcode dispatch path in cluster_ges_request_handler
+ *	(NATIVE_LOCK_PROBE = 9, NATIVE_LOCK_PROBE_REPLY = 10).  HC33 dual-source /
+ *	epoch / quorum validation has already passed when these handlers are
+ *	invoked.
+ *
+ *	Body activation (Step 6 D5):
+ *	  - request handler:  invoke cluster_native_lock_probe_local() via D8
+ *	    lock.c internal helper to scan node-local shared PG lock state for
+ *	    conflict on (locktag, lockmode);  build GesNativeLockProbeReplyPayload
+ *	    with status CLEAR/HOLDER_CONFLICT/WAITER_CONFLICT;  enqueue reply via
+ *	    D7 cluster_grd_outbound_enqueue_lms_native_probe (origin = 5).
+ *	  - reply handler:  call cluster_lms_native_probe_recv_reply(slot_idx,
+ *	    sender_node_id, status);  HC36 stale-reply drop applied at collector.
+ *
+ *	Step 1 skeleton mirrors spec-2.17 CANCEL_PENDING bring-up pattern:
+ *	dispatch wired + handler counter-stub only;  full body activation moved
+ *	to dedicated step (Step 6 D5).
+ */
+void
+cluster_ges_handle_native_lock_probe_request(const ClusterICEnvelope *env,
+											 const GesNativeLockProbePayload *probe)
+{
+	LOCKTAG probe_tag;
+	ClusterGrdHolderId remote_requester;
+	ClusterNativeLockProbeReply status;
+	GesNativeLockProbeReplyPayload reply;
+
+	Assert(env != NULL);
+	Assert(probe != NULL);
+
+	/*
+	 * spec-2.25 Step 6 D5 — peer-side probe execution.
+	 *
+	 *	1. Deserialize LOCKTAG from wire bytes.
+	 *	2. Build remote requester identity for HC32a exclude_holder —
+	 *	   the requester lives on env->source_node_id (the LMS sender).
+	 *	   On this node, the requester's PGPROC is not present (different
+	 *	   node);  exclude_holder.node_id matches will therefore never
+	 *	   trigger local PGPROC skip — correct behavior (peer has no
+	 *	   PGPROC of the origin requester).
+	 *	3. Run cluster_native_lock_probe_local under partition lock (HC30
+	 *	   子条 5 handled by D8 helper internally).
+	 *	4. Emit reply via cluster_grd_outbound_enqueue_lms_native_probe
+	 *	   (origin = 5, nofail per L141 family).
+	 */
+	memcpy(&probe_tag, probe->locktag_bytes, sizeof(LOCKTAG));
+
+	memset(&remote_requester, 0, sizeof(remote_requester));
+	remote_requester.node_id = env->source_node_id;
+	/* procno / epoch / request_id of remote requester are not authoritative
+	 * here — peer node only uses node_id field of exclude_holder to skip
+	 * PGPROC at same-node + matching procno (impossible here because the
+	 * remote requester is not on this node).  Filling them with 0 keeps
+	 * the exclude_holder non-NULL contract (HC32a). */
+
+	status
+		= cluster_native_lock_probe_local(&probe_tag, (LOCKMODE)probe->lockmode, &remote_requester);
+
+	memset(&reply, 0, sizeof(reply));
+	reply.opcode = GES_REQ_OPCODE_NATIVE_LOCK_PROBE_REPLY;
+	reply.status = (uint32)status;
+	reply.probe_id = probe->probe_id;
+	reply.sender_node_id = (uint32)cluster_node_id;
+
+	cluster_grd_outbound_enqueue_lms_native_probe(env->source_node_id, &reply,
+												  (uint16)sizeof(reply));
+}
+
+void
+cluster_ges_handle_native_lock_probe_reply(const ClusterICEnvelope *env,
+										   const GesNativeLockProbeReplyPayload *reply)
+{
+	ClusterNativeLockProbeReply status;
+
+	Assert(env != NULL);
+	Assert(reply != NULL);
+
+	/*
+	 * spec-2.25 Step 6 D5 — LMS-side reply consumption.
+	 *
+	 *	HC33 dual-source validation already passed in cluster_ges_request_handler
+	 *	(envelope source == reply.sender_node_id).  Forward to collector,
+	 *	which applies HC36 stale-reply drop via probe_id epoch + expected
+	 *	bitmap match.  Collector wakes any LMS waiter via cv broadcast.
+	 */
+	status = (ClusterNativeLockProbeReply)reply->status;
+	if (status != CLUSTER_NATIVE_LOCK_PROBE_CLEAR
+		&& status != CLUSTER_NATIVE_LOCK_PROBE_WAITER_CONFLICT
+		&& status != CLUSTER_NATIVE_LOCK_PROBE_HOLDER_CONFLICT) {
+		cluster_grd_inc_ges_inbound_validation_fail();
+		return;
+	}
+
+	cluster_lms_native_probe_recv_reply(reply->probe_id, (int32)reply->sender_node_id, status);
 }

@@ -174,6 +174,13 @@ typedef struct ClusterGrdShared {
 	 * helper(close to ges_inbound_validation_fail_count semantics). */
 	pg_atomic_uint64 cleanup_skip_stale_cancel_count;
 
+	/* spec-2.25 D13 — should_globalize gate command hit count for
+	 * RELATION + OBJECT path (HC23..HC27 branches).  Distinct from
+	 * ADVISORY (covered by existing should_globalize_advisory_count
+	 * — if any).  Bumped on every successful gate-true return for
+	 * either of the two NEW LOCKTAG types.  Surfaced via dump_grd. */
+	pg_atomic_uint64 relation_object_cluster_path_count;
+
 	/* spec-2.17 D12 — 6 BAST nofail counter(Q12 v0.6 rename:
 	 * sent / received / ack / retry / reject / stale_drop;timeout 拆 3). */
 	pg_atomic_uint64 ges_bast_sent_count;
@@ -499,6 +506,10 @@ extern uint64 cluster_grd_ges_inbound_validation_fail_count(void);
 
 /* spec-2.24 D5 — cleanup_skip_stale_cancel(4-tuple match fail in LMD CANCEL dispatch). */
 extern uint64 cluster_grd_cleanup_skip_stale_cancel_count(void);
+
+/* spec-2.25 D13 — RELATION + OBJECT cluster gate hit counter (HC23..HC27). */
+extern void cluster_grd_inc_relation_object_cluster_path(void);
+extern uint64 cluster_grd_relation_object_cluster_path_count(void);
 extern void cluster_grd_inc_cleanup_skip_stale_cancel(void);
 extern uint64 cluster_grd_ges_reply_deferred_count(void);
 extern uint64 cluster_grd_ges_reply_dropped_count(void);

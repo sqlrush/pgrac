@@ -46,6 +46,7 @@
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_grd.h"
+#include "cluster/cluster_native_lock_probe.h"
 #endif
 
 #include "access/transam.h"
@@ -888,6 +889,14 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 	if (cluster_enabled && cluster_lock_acquire_cluster_path && cluster_grd_max_entries > 0
 		&& cluster_lock_should_globalize(locktag, lockmode, sessionLock)) {
 		ClusterLockAcquireResult cluster_r;
+
+		/* spec-2.25 D13 — observability:  count cluster gate hits for
+		 * RELATION + OBJECT branches.  ADVISORY skipped because spec-2.21
+		 * already covers it via different observability surface (the
+		 * counter is named "relation_object" specifically). */
+		if (locktag->locktag_type == LOCKTAG_RELATION
+			|| locktag->locktag_type == LOCKTAG_OBJECT)
+			cluster_grd_inc_relation_object_cluster_path();
 
 		cluster_req.locktag = *locktag;
 		cluster_req.lockmode = lockmode;
@@ -3045,6 +3054,216 @@ GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode, int *countp)
 		*countp = count;
 	return vxids;
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/* ============================================================
+ * PGRAC MODIFICATIONS
+ *
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *	Spec: spec-2.25-lock-class-expansion-relation-object.md
+ *
+ *	What changed:  added cluster_native_lock_probe_pg_state — a
+ *	GetLockConflicts-derived scanner used by spec-2.25's per-node
+ *	native-lock probe (HC30..HC32a).  Unlike GetLockConflicts, this
+ *	helper:
+ *	  1. Does NOT exclude MyProc;  instead excludes a caller-supplied
+ *	     ClusterGrdHolderId (so the LMS process — not a backend —
+ *	     can run the scan on behalf of an originating requester).
+ *	  2. Walks LOCK->waitProcs in addition to procLocks holders so
+ *	     waiters are surfaced as WAITER_CONFLICT (GetLockConflicts
+ *	     returns only holders).
+ *	  3. Returns the 3-state ClusterNativeLockProbeReply enum
+ *	     (CLEAR / WAITER_CONFLICT / HOLDER_CONFLICT) instead of a
+ *	     VirtualTransactionId list.
+ *
+ *	Why:  spec-2.25 cluster_lock_should_globalize sends only modes
+ *	>= ShareUpdateExclusiveLock through the cluster path.  Lower
+ *	modes (AccessShare / RowShare / RowExclusive) remain PG-native
+ *	and invisible to LMS.  Before granting a cluster-mode acquire,
+ *	LMS must verify no PG-native holder/waiter on the same LOCKTAG
+ *	exists on any live node.  Probe target structures (HC30):
+ *	    1. LockMethodLockHash holder PROCLOCKs (shared partitioned)
+ *	    2. LOCK->waitProcs wait queue
+ *	    3. relation fast-path (FastPathStrongRelationLocks +
+ *	       per-PGPROC fpRelId bitmap;  scanned only when
+ *	       ConflictsWithRelationFastPath returns true)
+ *	    NOTE:  LockMethodLocalHash is backend-private and unusable
+ *	    from cluster aux processes — HC30 子条 4.
+ *
+ *	HC30 子条 5 partition lock contract:  the scan of LOCK->waitProcs
+ *	/ procLocks and the fast-path PGPROC iteration must hold their
+ *	respective LWLocks for the entire walk.  No elog(ERROR), palloc,
+ *	or SearchSysCache while holding;  result snapshot must be
+ *	consistent under the partition lock.
+ *
+ *	HC32a exclude_holder contract:  caller MUST pass a non-NULL
+ *	ClusterGrdHolderId identifying the originating backend.  Locks
+ *	held by that backend (matching cluster_node_id + procno) are
+ *	skipped to prevent same-xact mode escalation self-conflict
+ *	(e.g., RowExcl held by INSERT, then AccessExcl requested by
+ *	ALTER TABLE in the same xact).  exclude_holder == NULL → fail
+ *	closed (Assert in debug, conservative HOLDER_CONFLICT in
+ *	release to keep the cluster grant defensive).
+ *
+ *	Implementation mirrors GetLockConflicts() closely but with the
+ *	above three changes so the existing PG locking semantics and
+ *	partition-lock ordering remain identical (i.e., the new helper
+ *	cannot deadlock against any other lock.c path that PG already
+ *	considered safe).
+ * ============================================================ */
+ClusterNativeLockProbeReply
+cluster_native_lock_probe_pg_state(const LOCKTAG *locktag, LOCKMODE lockmode,
+								   const ClusterGrdHolderId *exclude_holder)
+{
+	LOCKMETHODID lockmethodid;
+	LockMethod lockMethodTable;
+	LOCK *lock;
+	LOCKMASK conflictMask;
+	dlist_iter proclock_iter;
+	PROCLOCK *proclock;
+	uint32 hashcode;
+	LWLock *partitionLock;
+	bool saw_holder = false;
+	bool saw_waiter = false;
+	int self_node_id;
+
+	Assert(locktag != NULL);
+	Assert(exclude_holder != NULL);
+	if (exclude_holder == NULL)
+		return CLUSTER_NATIVE_LOCK_PROBE_HOLDER_CONFLICT;	/* fail closed */
+
+	self_node_id = cluster_node_id;
+
+	lockmethodid = locktag->locktag_lockmethodid;
+	if (lockmethodid <= 0 || lockmethodid >= lengthof(LockMethods))
+		return CLUSTER_NATIVE_LOCK_PROBE_HOLDER_CONFLICT;	/* fail closed */
+	lockMethodTable = LockMethods[lockmethodid];
+	if (lockMethodTable == NULL)
+		return CLUSTER_NATIVE_LOCK_PROBE_HOLDER_CONFLICT;
+	if (lockmode <= 0 || lockmode > lockMethodTable->numLockModes)
+		return CLUSTER_NATIVE_LOCK_PROBE_HOLDER_CONFLICT;
+
+	hashcode = LockTagHashCode(locktag);
+	partitionLock = LockHashPartitionLock(hashcode);
+	conflictMask = lockMethodTable->conflictTab[lockmode];
+
+	/* HC30 #3:  relation fast-path PGPROC fpRelId bitmap scan (only when
+	 * conflict is possible against fast-path low modes). */
+	if (ConflictsWithRelationFastPath(locktag, lockmode))
+	{
+		int i;
+		Oid relid = locktag->locktag_field2;
+
+		for (i = 0; i < ProcGlobal->allProcCount; i++) {
+			PGPROC *proc = &ProcGlobal->allProcs[i];
+			uint32 f;
+
+			/* HC32a self-exclusion:  skip locks held by the originating
+			 * backend identified by (node_id, procno).  procno is the
+			 * PGPROC index in allProcs — equal to i here. */
+			if ((uint32) self_node_id == exclude_holder->node_id
+				&& (uint32) i == exclude_holder->procno)
+				continue;
+
+			LWLockAcquire(&proc->fpInfoLock, LW_SHARED);
+
+			if (proc->databaseId != locktag->locktag_field1) {
+				LWLockRelease(&proc->fpInfoLock);
+				continue;
+			}
+
+			for (f = 0; f < FP_LOCK_SLOTS_PER_BACKEND; f++) {
+				uint32 lockmask;
+
+				if (relid != proc->fpRelId[f])
+					continue;
+				lockmask = FAST_PATH_GET_BITS(proc, f);
+				if (!lockmask)
+					continue;
+				lockmask <<= FAST_PATH_LOCKNUMBER_OFFSET;
+
+				if ((lockmask & conflictMask) != 0) {
+					saw_holder = true;	/* fast-path holder is a holder */
+					break;
+				}
+			}
+
+			LWLockRelease(&proc->fpInfoLock);
+
+			/* HC31 priority:  HOLDER_CONFLICT subsumes WAITER_CONFLICT —
+			 * short-circuit further scans once we know we'll deny grant. */
+			if (saw_holder)
+				return CLUSTER_NATIVE_LOCK_PROBE_HOLDER_CONFLICT;
+		}
+	}
+
+	/* HC30 #1 + #2:  shared LOCK hash + waitProcs queue scan under
+	 * partition lock (HC30 子条 5 — hold throughout). */
+	LWLockAcquire(partitionLock, LW_SHARED);
+
+	lock = (LOCK *) hash_search_with_hash_value(LockMethodLockHash, locktag, hashcode,
+												HASH_FIND, NULL);
+	if (lock == NULL) {
+		/* No shared LOCK object → no holders, no waiters in shared table.
+		 * Fast-path was scanned above. */
+		LWLockRelease(partitionLock);
+		return CLUSTER_NATIVE_LOCK_PROBE_CLEAR;
+	}
+
+	/* HC30 #1:  iterate holders via procLocks. */
+	dlist_foreach(proclock_iter, &lock->procLocks)
+	{
+		PGPROC *proc;
+
+		proclock = dlist_container(PROCLOCK, lockLink, proclock_iter.cur);
+		proc = proclock->tag.myProc;
+
+		/* HC32a self-exclusion */
+		if ((uint32) self_node_id == exclude_holder->node_id
+			&& (uint32) proc->pgprocno == exclude_holder->procno)
+			continue;
+
+		if ((conflictMask & proclock->holdMask) != 0) {
+			saw_holder = true;
+			break;	/* HC31 short-circuit */
+		}
+	}
+
+	/* HC30 #2:  iterate waiters via lock->waitProcs queue.  Only consider
+	 * this branch if no holder was already seen (HC31 priority).
+	 * waitProcs is a dclist_head (PG 16+); iterate via dclist_foreach. */
+	if (!saw_holder) {
+		dlist_iter waiter_iter;
+
+		dclist_foreach(waiter_iter, &lock->waitProcs)
+		{
+			PGPROC *waiter;
+			LOCKMASK waiter_mode_mask;
+
+			waiter = dlist_container(PGPROC, links, waiter_iter.cur);
+
+			/* HC32a self-exclusion */
+			if ((uint32) self_node_id == exclude_holder->node_id
+				&& (uint32) waiter->pgprocno == exclude_holder->procno)
+				continue;
+
+			waiter_mode_mask = LOCKBIT_ON(waiter->waitLockMode);
+			if ((conflictMask & waiter_mode_mask) != 0) {
+				saw_waiter = true;
+				break;
+			}
+		}
+	}
+
+	LWLockRelease(partitionLock);
+
+	if (saw_holder)
+		return CLUSTER_NATIVE_LOCK_PROBE_HOLDER_CONFLICT;
+	if (saw_waiter)
+		return CLUSTER_NATIVE_LOCK_PROBE_WAITER_CONFLICT;
+	return CLUSTER_NATIVE_LOCK_PROBE_CLEAR;
+}
+#endif /* USE_PGRAC_CLUSTER */
 
 /*
  * Find a lock in the shared lock table and release it.  It is the caller's

@@ -460,6 +460,21 @@ typedef enum {
 	 * handler processing path.
 	 */
 	WAIT_EVENT_CLUSTER_LMD_PROBE_COLLECT,
+	/*
+	 * spec-2.25 D11:  LMS native-lock probe collector aggregate wait.
+	 *	LMS process sleeps on cluster_lms_state->cv while in-flight
+	 *	probe slots await N-1 peer replies (HC29 fan-out).  Wake on
+	 *	reply arrival (recv_reply broadcast) or retry tick.
+	 */
+	WAIT_EVENT_CLUSTER_LMS_NATIVE_PROBE_WAIT,
+	/*
+	 * spec-2.25 D11:  peer node scanning local PG lock state during a
+	 *	native-lock probe request handler invocation (HC30 scan of
+	 *	LockMethodLockHash + LOCK->waitProcs + relation fast-path).
+	 *	Distinct from LMS_NATIVE_PROBE_WAIT which covers the LMS
+	 *	collector side.
+	 */
+	WAIT_EVENT_CLUSTER_NATIVE_PROBE_REPLY_WAIT,
 } WaitEventCluster;
 
 

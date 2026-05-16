@@ -62,8 +62,8 @@ my $node_id = $node->safe_psql('postgres', 'SHOW cluster.node_id');
 # ----------
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_gcluster_wait_events'),
-	'73',
-	'pg_stat_gcluster_wait_events returns 73 rows (single-node projection of cluster wait events)');
+	'75',
+	'pg_stat_gcluster_wait_events returns 75 rows (single-node projection of cluster wait events)');
 
 
 # ----------

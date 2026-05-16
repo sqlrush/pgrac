@@ -70,6 +70,11 @@ int cluster_ges_reply_wait_max_entries = 1024;	 /* 5-tuple wait table cap */
 /* spec-2.24 D11: */
 int cluster_lmd_cleanup_sweep_interval_ms = 5000; /* LMD safety net cleanup interval */
 
+/* spec-2.25 D9 — native-lock probe tunables (HC29 / HC32). */
+int cluster_lms_native_lock_probe_max_inflight = 8;		   /* per-shard slot capacity */
+int cluster_lms_native_lock_probe_retry_interval_ms = 500; /* retry poll cadence */
+int cluster_lms_native_lock_probe_retry_budget = 60;	   /* ~30s @ 500ms before 53R83 */
+
 /* spec-2.17 NEW GUCs(v0.6 frozen baseline). */
 int cluster_ges_bast_retry_interval_ms = 10000;	   /* D11 */
 int cluster_ges_bast_max_retries = 3;			   /* D11 */
@@ -596,6 +601,39 @@ cluster_init_guc(void)
 					 "may set 500ms for fast verify."),
 		&cluster_lmd_cleanup_sweep_interval_ms, 5000, 100, 60000, PGC_SIGHUP, GUC_UNIT_MS, NULL,
 		NULL, NULL);
+
+	/* spec-2.25 D9 NEW:  native-lock probe tunables (HC29 / HC32 / 53R83). */
+	DefineCustomIntVariable(
+		"cluster.lms_native_lock_probe_max_inflight",
+		gettext_noop("Per-shard LMS native-lock probe collector slot capacity."),
+		gettext_noop("Range [1, 64].  Default 8.  Each LMS shard maintains this many "
+					 "concurrent probe slots — each slot tracks a single in-flight "
+					 "fan-out (LOCKTAG, lockmode) probe + N-1 expected replies + "
+					 "aggregated status.  Slot exhaustion enqueues new probes to "
+					 "the LMS pending queue (wait event ClusterLmsNativeProbeWait) "
+					 "until capacity frees.  PGC_POSTMASTER — shmem region sized "
+					 "at startup."),
+		&cluster_lms_native_lock_probe_max_inflight, 8, 1, 64, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable(
+		"cluster.lms_native_lock_probe_retry_interval_ms",
+		gettext_noop("LMS native-lock probe retry-poll cadence when peers return "
+					 "HOLDER_CONFLICT / WAITER_CONFLICT / timeout."),
+		gettext_noop("Range [50, 60000].  Default 500ms.  LMS re-fans-out the same "
+					 "probe (probe_id epoch advanced) until aggregate reaches CLEAR "
+					 "or retry_budget is exhausted (then SQLSTATE 53R83 fail-closed). "
+					 "Shorter intervals shorten DDL wait but raise interconnect load."),
+		&cluster_lms_native_lock_probe_retry_interval_ms, 500, 50, 60000, PGC_SIGHUP, GUC_UNIT_MS,
+		NULL, NULL, NULL);
+	DefineCustomIntVariable(
+		"cluster.lms_native_lock_probe_retry_budget",
+		gettext_noop("Cumulative retry budget per requester before native-lock "
+					 "probe fails closed with 53R83."),
+		gettext_noop("Range [1, 3600].  Default 60 (≈30s with the 500ms cadence "
+					 "default).  budget exceeded → SQLSTATE 53R83 "
+					 "ERRCODE_CLUSTER_NATIVE_LOCK_PROBE_TIMEOUT returned to caller; "
+					 "transaction must retry / abort.  spec-2.27 fairness escalation "
+					 "(priority-boost-after-K) will reduce default after wire."),
+		&cluster_lms_native_lock_probe_retry_budget, 60, 1, 3600, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	/* spec-2.17 D11:  BAST retry GUC(Q11 v0.6 — 不 kill healthy holder). */
 	DefineCustomIntVariable("cluster.ges_bast_retry_interval_ms",

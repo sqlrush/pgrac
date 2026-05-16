@@ -379,6 +379,56 @@ void
 cluster_grd_inc_bast_sent(void)
 {}
 
+/* spec-2.25 D14 R10 stub audit — native-lock probe 3 NEW symbols.
+ * Real behavior tested in test_cluster_native_lock_probe.c (Step 11
+ * forward-link).  Here we only need link-surface satisfaction +
+ * call counters for T-ges-14..16 dispatch assertions.
+ *
+ * NOTE:  cannot #include cluster_native_lock_probe.h here because it
+ * pulls in cluster_grd.h which conflicts with the local opaque stubs
+ * for cluster_grd_entry_enqueue_or_grant et al.  Forward-declare the
+ * probe enum + use struct ClusterGrdHolderId opaque (typedef'd in
+ * cluster_grd.h but compatible with opaque struct here per C tag/
+ * typedef rules — function pointer compares correctly at link time
+ * because all callers see the same struct tag). */
+static int stub_native_probe_local_calls;
+static int stub_native_probe_recv_calls;
+static int stub_native_probe_outbound_calls;
+static uint32 stub_native_probe_outbound_last_dest;
+static uint16 stub_native_probe_outbound_last_len;
+
+/* Forward decls matching real prototypes in
+ * src/include/cluster/cluster_native_lock_probe.h. */
+typedef enum ClusterNativeLockProbeReply {
+	CLUSTER_NATIVE_LOCK_PROBE_CLEAR_LOCAL = 0,
+} ClusterNativeLockProbeReplyLocal;
+
+int
+cluster_native_lock_probe_local(const void *locktag pg_attribute_unused(),
+								int lockmode pg_attribute_unused(),
+								const struct ClusterGrdHolderId *eh pg_attribute_unused())
+{
+	stub_native_probe_local_calls++;
+	return CLUSTER_NATIVE_LOCK_PROBE_CLEAR_LOCAL;
+}
+
+void
+cluster_lms_native_probe_recv_reply(uint64 probe_id pg_attribute_unused(),
+									int32 sender pg_attribute_unused(),
+									int status pg_attribute_unused())
+{
+	stub_native_probe_recv_calls++;
+}
+
+void
+cluster_grd_outbound_enqueue_lms_native_probe(uint32 dest, const void *p pg_attribute_unused(),
+											  uint16 len)
+{
+	stub_native_probe_outbound_calls++;
+	stub_native_probe_outbound_last_dest = dest;
+	stub_native_probe_outbound_last_len = len;
+}
+
 /* cluster_ges_reply_wait API stubs (spec-2.23 D1). */
 struct GesReplyWaitKey;
 struct GesReplyWaitEntry;
@@ -727,10 +777,79 @@ test_ges_bast_ack_opcode_validates_as_source_holder(void)
 	UT_ASSERT_EQ(stub_work_queue_enqueue_count, pre_enqueue);
 }
 
+/* ============================================================
+ * spec-2.25 T-ges-14..16 — NATIVE_LOCK_PROBE opcode dispatch tests.
+ *
+ *	T-ges-14:  opcode enum values 9 / 10 + opcode_max = 10 boundary.
+ *	T-ges-15:  request handler dispatches to local probe + outbound reply
+ *	           (HC33 source/target/sender validation prefix passes).
+ *	T-ges-16:  reply handler routes status to LMS collector (recv_reply
+ *	           counter increments;  HC36 stale drop deferred to TAP).
+ * ============================================================ */
+
+UT_TEST(test_ges_native_lock_probe_opcode_enum_extension)
+{
+	/* spec-2.25 D6:  opcode 9 + 10 ABI lock. */
+	UT_ASSERT_EQ((int)GES_REQ_OPCODE_NATIVE_LOCK_PROBE, 9);
+	UT_ASSERT_EQ((int)GES_REQ_OPCODE_NATIVE_LOCK_PROBE_REPLY, 10);
+	/* Payload size lock — wire ABI 32B. */
+	UT_ASSERT_EQ((int)sizeof(GesNativeLockProbePayload), 32);
+	UT_ASSERT_EQ((int)sizeof(GesNativeLockProbeReplyPayload), 32);
+}
+
+UT_TEST(test_ges_native_lock_probe_request_dispatch)
+{
+	/* spec-2.25 D5:  request handler probes local + emits reply. */
+	GesNativeLockProbePayload probe;
+	ClusterICEnvelope env;
+	int pre_local = stub_native_probe_local_calls;
+	int pre_outbound = stub_native_probe_outbound_calls;
+
+	memset(&env, 0, sizeof(env));
+	env.source_node_id = 7;
+	env.epoch = 0;
+	env.payload_length = sizeof(probe);
+
+	memset(&probe, 0, sizeof(probe));
+	probe.opcode = GES_REQ_OPCODE_NATIVE_LOCK_PROBE;
+	probe.lockmode = 5;
+	probe.probe_id = 0xDEADBEEFCAFEBABEull;
+
+	cluster_ges_handle_native_lock_probe_request(&env, &probe);
+
+	UT_ASSERT_EQ(stub_native_probe_local_calls, pre_local + 1);
+	UT_ASSERT_EQ(stub_native_probe_outbound_calls, pre_outbound + 1);
+	UT_ASSERT_EQ(stub_native_probe_outbound_last_dest, 7u); /* echo source */
+	UT_ASSERT_EQ((int)stub_native_probe_outbound_last_len, 32);
+}
+
+UT_TEST(test_ges_native_lock_probe_reply_dispatch)
+{
+	/* spec-2.25 D5:  reply handler routes to LMS collector. */
+	GesNativeLockProbeReplyPayload reply;
+	ClusterICEnvelope env;
+	int pre_recv = stub_native_probe_recv_calls;
+
+	memset(&env, 0, sizeof(env));
+	env.source_node_id = 3;
+	env.epoch = 0;
+	env.payload_length = sizeof(reply);
+
+	memset(&reply, 0, sizeof(reply));
+	reply.opcode = GES_REQ_OPCODE_NATIVE_LOCK_PROBE_REPLY;
+	reply.status = 0; /* CLUSTER_NATIVE_LOCK_PROBE_CLEAR — value 0 */
+	reply.probe_id = 0xAAAAAAAA00000001ull;
+	reply.sender_node_id = 3; /* HC33 dual-source: == env.source_node_id */
+
+	cluster_ges_handle_native_lock_probe_reply(&env, &reply);
+
+	UT_ASSERT_EQ(stub_native_probe_recv_calls, pre_recv + 1);
+}
+
 int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(13);
+	UT_PLAN(16);
 
 	UT_RUN(test_ges_request_handler_linkable);
 	UT_RUN(test_ges_reply_handler_linkable);
@@ -745,6 +864,9 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_ges_bast_opcode_validates_as_target_local);
 	UT_RUN(test_ges_cancel_pending_opcode_validates_as_target_local);
 	UT_RUN(test_ges_bast_ack_opcode_validates_as_source_holder);
+	UT_RUN(test_ges_native_lock_probe_opcode_enum_extension);
+	UT_RUN(test_ges_native_lock_probe_request_dispatch);
+	UT_RUN(test_ges_native_lock_probe_reply_dispatch);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

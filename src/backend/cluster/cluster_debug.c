@@ -832,6 +832,9 @@ dump_grd(ReturnSetInfo *rsinfo)
 	/* spec-2.24 D13 — cleanup_skip_stale_cancel(LMD CANCEL 4-tuple mismatch). */
 	emit_row(rsinfo, "grd", "grd_cleanup_skip_stale_cancel_count",
 			 fmt_int64((int64)cluster_grd_cleanup_skip_stale_cancel_count()));
+	/* spec-2.25 D13 — RELATION + OBJECT cluster gate hit (HC23..HC27). */
+	emit_row(rsinfo, "grd", "grd_relation_object_cluster_path_count",
+			 fmt_int64((int64)cluster_grd_relation_object_cluster_path_count()));
 	emit_row(rsinfo, "grd", "grd_outbound_ring_depth",
 			 fmt_int32((int32)cluster_grd_outbound_ring_depth()));
 	emit_row(rsinfo, "grd", "grd_outbound_reply_dirty_depth",
@@ -894,6 +897,22 @@ dump_lms(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "lms", "lms_drain_empty_count",
 			 fmt_int64((int64)cluster_lms_get_drain_empty_count()));
 	emit_row(rsinfo, "lms", "lms_error_count", fmt_int64((int64)cluster_lms_get_error_count()));
+
+	/* spec-2.25 D13 — 7 NEW native-lock probe counter rows. */
+	emit_row(rsinfo, "lms", "native_probe_sent_count",
+			 fmt_int64((int64)cluster_lms_get_native_probe_sent_count()));
+	emit_row(rsinfo, "lms", "native_probe_reply_recv_count",
+			 fmt_int64((int64)cluster_lms_get_native_probe_reply_recv_count()));
+	emit_row(rsinfo, "lms", "native_probe_collector_slot_full_count",
+			 fmt_int64((int64)cluster_lms_get_native_probe_collector_slot_full_count()));
+	emit_row(rsinfo, "lms", "native_probe_aggregate_holder_conflict_count",
+			 fmt_int64((int64)cluster_lms_get_native_probe_aggregate_holder_conflict_count()));
+	emit_row(rsinfo, "lms", "native_probe_aggregate_waiter_conflict_count",
+			 fmt_int64((int64)cluster_lms_get_native_probe_aggregate_waiter_conflict_count()));
+	emit_row(rsinfo, "lms", "native_probe_retry_count",
+			 fmt_int64((int64)cluster_lms_get_native_probe_retry_count()));
+	emit_row(rsinfo, "lms", "native_probe_timeout_count",
+			 fmt_int64((int64)cluster_lms_get_native_probe_timeout_count()));
 }
 
 /*

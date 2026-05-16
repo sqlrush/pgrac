@@ -68,8 +68,9 @@
 #ifndef CLUSTER_LOCK_ACQUIRE_H
 #define CLUSTER_LOCK_ACQUIRE_H
 
+#include "access/transam.h"		 /* FirstNormalObjectId for HC24/HC27 */
 #include "cluster/cluster_grd.h" /* ClusterResId + ClusterGrdHolderId */
-#include "storage/lock.h"		 /* LOCKMODE / LOCKTAG */
+#include "storage/lock.h"		 /* LOCKMODE / LOCKTAG / ShareUpdateExclusiveLock */
 
 
 /*
@@ -232,24 +233,64 @@ cluster_lock_acquire_s7_cleanup(const ClusterLockAcquireRequest *req);
 
 
 /*
- * spec-2.21 D1:cluster_lock_should_globalize — PG hot-path gate predicate
- *	inline helper.  Returns true iff this lock should enter the cluster
+ * spec-2.21 D1 + spec-2.25 D1:cluster_lock_should_globalize — PG hot-path
+ *	gate predicate.  Returns true iff this lock should enter the cluster
  *	7-step state machine instead of PG-native LockAcquire only.
  *
- *	MVP scope(spec-2.21 v0.3 frozen):仅 transaction-level LOCKTAG_ADVISORY
- *	(per Q3 v1.1 + HC11 session advisory stays native)。
+ *	spec-2.21 v0.3 frozen:仅 transaction-level LOCKTAG_ADVISORY。
+ *	spec-2.25 v0.2 frozen:扩展到 LOCKTAG_RELATION + LOCKTAG_OBJECT,
+ *	  HC23 lockmode >= ShareUpdateExclusiveLock(5) + HC24/HC27
+ *	  oid >= FirstNormalObjectId + HC25 relpersistence != 't'(temp skip)。
  *
- *	预期 cache-hot inline path ≤ 2 ns;static_inline 避免 function call。
+ *	预期 cache-hot inline path:ADVISORY 命中 ≤ 2 ns;低模式 RELATION
+ *	(SELECT/INSERT/UPDATE/DELETE)在 lockmode < SUEX 分支 ≤ 3 ns 短路;
+ *	高模式 RELATION 命中 syscache 路径 ~50 ns(仅 DDL — 不在 OLTP hot path)。
  */
+extern bool cluster_relation_is_persistent_or_unlogged(Oid relid);
+
 static inline bool
-cluster_lock_should_globalize(const LOCKTAG *locktag, LOCKMODE lockmode pg_attribute_unused(),
-							  bool sessionLock)
+cluster_lock_should_globalize(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 {
 	if (locktag == NULL)
 		return false;
 	if (sessionLock)
 		return false; /* HC11: session advisory stays native */
-	return (locktag->locktag_type == LOCKTAG_ADVISORY);
+
+	switch (locktag->locktag_type) {
+	case LOCKTAG_ADVISORY:
+		return true; /* spec-2.21 ship — no mode filter */
+
+	case LOCKTAG_RELATION:
+		/* HC23 OLTP fast-path:  AccessShare / RowShare / RowExclusive go
+			 * PG-native.  ShareUpdateExclusiveLock (=5) is the lowest mode
+			 * routed through cluster. */
+		if (lockmode < ShareUpdateExclusiveLock)
+			return false;
+		/* HC24 system-catalog bootstrap-safe:  pg_class etc oids
+			 * < FirstNormalObjectId never enter cluster gate. */
+		if (locktag->locktag_field2 < FirstNormalObjectId)
+			return false;
+		/* HC25 relpersistence skip:  temp tables go PG-native;
+			 * unlogged + permanent route through cluster. */
+		return cluster_relation_is_persistent_or_unlogged(locktag->locktag_field2);
+
+	case LOCKTAG_OBJECT:
+		/* HC26 mirror HC23 — only >= SUEX modes go cluster. */
+		if (lockmode < ShareUpdateExclusiveLock)
+			return false;
+		/* HC27 objoid >= FirstNormal — classoid is always system catalog
+			 * oid (pg_proc / pg_type etc).  Filter on objoid (field3). */
+		if (locktag->locktag_field3 < FirstNormalObjectId)
+			return false;
+		return true;
+
+	default:
+		/* HC28 — TRANSACTION / PAGE / TUPLE / RELATION_EXTEND /
+			 * VIRTUALTRANSACTION / SPECULATIVE_TOKEN / APPLY_TRANSACTION /
+			 * USERLOCK 永远 PG-native;  TRANSACTION 推 spec-2.26 + AD-012
+			 * cluster-aware xid encoding. */
+		return false;
+	}
 }
 
 

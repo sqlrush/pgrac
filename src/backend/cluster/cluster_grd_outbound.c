@@ -336,6 +336,38 @@ cluster_grd_outbound_enqueue_lmd_cancel(uint32 dest_node_id, const void *payload
 	LWLockRelease(cluster_grd_outbound_lock);
 }
 
+/*
+ * spec-2.25 D7 — LMS native-lock probe nofail enqueue.
+ *
+ *	Reliability contract per spec-2.25 §1.4:  probe correctness gate at
+ *	the LMS layer requires fan-out reach the wire (lost request → peer
+ *	never replies → LMS collector slot retries on poll, but if every probe
+ *	silently drops the requester eventually hits the retry budget and
+ *	returns 53R83 erroneously).  Mirror CLEANUP_RELEASE / LMD_CANCEL
+ *	semantics:  ring full → cleanup dirty-list nofail per L141 family
+ *	pattern (the CV-broadcast wake is owned by the LMS collector slot,
+ *	not this enqueue path — outbound ring is LMON-polled).
+ *
+ *	Same call site for both request (opcode 9) and reply (opcode 10) —
+ *	origin = CLUSTER_GRD_OUTBOUND_LMS_NATIVE_PROBE identifies both in
+ *	pg_stat_cluster_state rollups.
+ */
+void
+cluster_grd_outbound_enqueue_lms_native_probe(uint32 dest_node_id, const void *payload,
+											  uint16 payload_len)
+{
+	Assert(cluster_grd_outbound_state != NULL);
+
+	LWLockAcquire(cluster_grd_outbound_lock, LW_EXCLUSIVE);
+
+	if (!ring_push(PGRAC_IC_MSG_GES_REQUEST, CLUSTER_GRD_OUTBOUND_LMS_NATIVE_PROBE, dest_node_id,
+				   payload, payload_len))
+		cleanup_dirty_push(PGRAC_IC_MSG_GES_REQUEST, CLUSTER_GRD_OUTBOUND_LMS_NATIVE_PROBE,
+						   dest_node_id, payload, payload_len);
+
+	LWLockRelease(cluster_grd_outbound_lock);
+}
+
 
 /* ============================================================
  * LMON-side consumer.

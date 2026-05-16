@@ -75,7 +75,9 @@ typedef enum ClusterGrdOutboundOrigin {
 	CLUSTER_GRD_OUTBOUND_LMON_REPLY = 2,	  /* work_queue drain reply */
 	CLUSTER_GRD_OUTBOUND_CLEANUP_RELEASE = 3, /* LockReleaseAll / abort */
 	CLUSTER_GRD_OUTBOUND_LMD_CANCEL
-	= 4 /* spec-2.24 D4 — cross-node victim cancel forward (nofail reserved pool + dirty-list) */
+	= 4, /* spec-2.24 D4 — cross-node victim cancel forward (nofail reserved pool + dirty-list) */
+	CLUSTER_GRD_OUTBOUND_LMS_NATIVE_PROBE
+	= 5 /* spec-2.25 D7 — LMS native-lock probe request + reply (reserved pool + dirty-list nofail) */
 } ClusterGrdOutboundOrigin;
 
 /*
@@ -163,6 +165,21 @@ extern void cluster_grd_outbound_enqueue_cleanup_release(uint32 dest_node_id, co
  */
 extern void cluster_grd_outbound_enqueue_lmd_cancel(uint32 dest_node_id, const void *payload,
 													uint16 payload_len);
+
+/*
+ *   enqueue_lms_native_probe:  spec-2.25 D7 — LMS native-lock probe request
+ *                              or reply (32B payload).  Used by both LMS
+ *                              fan-out (request) and peer reply paths.
+ *                              Ring full → cleanup dirty-list (reusing the
+ *                              cleanup pool semantics like LMD_CANCEL) +
+ *                              native_probe_dirty_count++ (NEVER returns
+ *                              false — fail-closed correctness gate at
+ *                              the LMS layer relies on dispatch reaching
+ *                              the wire).  Producer must CV-broadcast LMON
+ *                              after enqueue per L141 family.
+ */
+extern void cluster_grd_outbound_enqueue_lms_native_probe(uint32 dest_node_id, const void *payload,
+														  uint16 payload_len);
 
 /*
  * LMON-side consumer API (Step 3 D6 wires real drain).

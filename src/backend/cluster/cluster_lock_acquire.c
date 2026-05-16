@@ -55,12 +55,15 @@
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_signal.h" /* cluster_ges_cancel_pending sig_atomic_t */
+#include "access/htup_details.h"	/* GETSTRUCT */
 #include "access/xact.h"			/* GetTopTransactionIdIfAny */
+#include "catalog/pg_class.h"		/* Form_pg_class for HC25 relpersistence */
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/lwlock.h"
 #include "storage/proc.h"
 #include "storage/spin.h"
+#include "utils/syscache.h" /* SearchSysCache1(RELOID, ...) */
 #include "utils/timestamp.h"
 
 
@@ -551,4 +554,46 @@ cluster_lock_acquire_dump(void (*emit_row)(void *cookie, const char *key, const 
 	emit_row(cookie, "s6_release", buf);
 	snprintf(buf, sizeof(buf), UINT64_FORMAT, pg_atomic_read_u64(&stub_s7_cleanup_count));
 	emit_row(cookie, "s7_cleanup", buf);
+}
+
+
+/*
+ * spec-2.25 D1 — relpersistence helper for cluster_lock_should_globalize HC25.
+ *
+ *	Returns true if the relation is unlogged or permanent (eligible for
+ *	cluster gate);  false if temp (must stay PG-native).  Cache-miss
+ *	defaults to permanent (HC25 fail-safe — over-acquire is correct;
+ *	under-acquire is a correctness bug because LMS visibility hole).
+ *
+ *	Cost:  SearchSysCache1(RELOID, oid) is ~50ns on hot catcache;  fires
+ *	only on lockmode >= ShareUpdateExclusiveLock + oid >= FirstNormalObjectId
+ *	paths (Q2 + Q3 + Q4 enforce — OLTP SELECT / INSERT / UPDATE / DELETE
+ *	short-circuits before reaching this helper).
+ *
+ *	Called from cluster_lock_acquire.h inline gate;  not a hot OLTP path.
+ */
+bool
+cluster_relation_is_persistent_or_unlogged(Oid relid)
+{
+	HeapTuple tuple;
+	bool eligible;
+
+	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	if (!HeapTupleIsValid(tuple)) {
+		/* HC25 fail-safe:  unknown oid → assume permanent (cluster gate
+		 * over-acquires defensively rather than skipping). */
+		return true;
+	}
+
+	{
+		Form_pg_class rel = (Form_pg_class)GETSTRUCT(tuple);
+		char persistence = rel->relpersistence;
+
+		/* RELPERSISTENCE_PERMANENT 'p' + RELPERSISTENCE_UNLOGGED 'u' route
+		 * through cluster;  RELPERSISTENCE_TEMP 't' skips. */
+		eligible = (persistence != RELPERSISTENCE_TEMP);
+	}
+
+	ReleaseSysCache(tuple);
+	return eligible;
 }

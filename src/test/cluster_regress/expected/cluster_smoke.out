@@ -76,14 +76,14 @@ SELECT attname, format_type(atttypid, atttypmod)
 (7 rows)
 
 -- ----------
--- 3. Cluster wait events: 73 rows (anchored by
+-- 3. Cluster wait events: 75 rows (anchored by
 --    CLUSTER_WAIT_EVENTS_COUNT, spec-0.11 + StaticAssertDecl
 --    in cluster_views.c).
 -- ----------
 SELECT count(*) FROM pg_stat_cluster_wait_events;
- count 
+ count
 -------
-    73
+    75
 (1 row)
 
 -- ----------
@@ -104,9 +104,9 @@ SELECT count(DISTINCT type) FROM pg_stat_cluster_wait_events;
 --    multiply this by N).
 -- ----------
 SELECT count(*) FROM pg_stat_gcluster_wait_events;
- count 
+ count
 -------
-    73
+    75
 (1 row)
 
 -- ----------

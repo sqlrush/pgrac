@@ -256,6 +256,8 @@ cluster_grd_shmem_init(void)
 		pg_atomic_init_u64(&cluster_grd_state->ges_cleanup_deferred_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->ges_inbound_validation_fail_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->cleanup_skip_stale_cancel_count, 0);
+		/* spec-2.25 D13 — RELATION + OBJECT cluster gate hit counter. */
+		pg_atomic_init_u64(&cluster_grd_state->relation_object_cluster_path_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->ges_reply_deferred_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->ges_reply_dropped_count, 0);
 
@@ -988,6 +990,22 @@ cluster_grd_cleanup_skip_stale_cancel_count(void)
 	if (cluster_grd_state == NULL)
 		return 0;
 	return pg_atomic_read_u64(&cluster_grd_state->cleanup_skip_stale_cancel_count);
+}
+
+/* spec-2.25 D13 — RELATION + OBJECT cluster gate hit counter accessor. */
+void
+cluster_grd_inc_relation_object_cluster_path(void)
+{
+	if (cluster_grd_state != NULL)
+		pg_atomic_fetch_add_u64(&cluster_grd_state->relation_object_cluster_path_count, 1);
+}
+
+uint64
+cluster_grd_relation_object_cluster_path_count(void)
+{
+	if (cluster_grd_state == NULL)
+		return 0;
+	return pg_atomic_read_u64(&cluster_grd_state->relation_object_cluster_path_count);
 }
 
 void

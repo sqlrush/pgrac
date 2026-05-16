@@ -166,6 +166,22 @@ cluster_epoch_get_current(void)
 	return 1;
 }
 
+/* spec-2.25 D8 R10 stub audit — SearchSysCache1 / ReleaseSysCache pulled
+ * in by cluster_relation_is_persistent_or_unlogged.  Standalone test does
+ * not exercise the helper directly;  null-safe stubs satisfy link. */
+struct HeapTupleData;
+typedef struct HeapTupleData *HeapTuple;
+
+HeapTuple
+SearchSysCache1(int cache_id pg_attribute_unused(), Datum key1 pg_attribute_unused())
+{
+	return NULL;
+}
+
+void
+ReleaseSysCache(HeapTuple tuple pg_attribute_unused())
+{}
+
 void
 cluster_grd_resid_encode(const LOCKTAG *src pg_attribute_unused(), ClusterResId *dst)
 {

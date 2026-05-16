@@ -119,12 +119,13 @@ is($node->safe_psql('postgres',
 
 # dump_grd category='grd' total row count: spec-2.14 ships 8 emit_row,
 # spec-2.15 v0.3 adds 6, spec-2.16 exposes 14 queue/pending counters,
-# spec-2.17 adds 9 BAST/deadlock checkpoint counters, and spec-2.24 adds
-# 1 cleanup_skip_stale_cancel_count counter.
+# spec-2.17 adds 9 BAST/deadlock checkpoint counters, spec-2.24 adds
+# 1 cleanup_skip_stale_cancel_count counter, and spec-2.25 adds
+# 1 relation_object_cluster_path_count counter.
 is($node->safe_psql('postgres',
 		q{SELECT count(*)::int FROM pg_cluster_state WHERE category='grd'}),
-   '38',
-   'L4b dump_grd category="grd" emits 38 rows (spec-2.14 8 + spec-2.15 6 + spec-2.16 14 + spec-2.17 9 + spec-2.24 1)');
+   '39',
+   'L4b dump_grd category="grd" emits 39 rows (spec-2.14 8 + spec-2.15 6 + spec-2.16 14 + spec-2.17 9 + spec-2.24 1 + spec-2.25 1)');
 
 # All 3 NEW atomic counter baseline 0 (本 spec 0 caller invokes
 # cluster_grd_entry_lookup_or_create).
