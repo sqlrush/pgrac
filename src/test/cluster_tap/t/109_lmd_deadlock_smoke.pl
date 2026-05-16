@@ -184,14 +184,60 @@ is($any_rejected, 't', 'L8 wait_edge_full HC12 — at least one inject rejected'
 ok($full_after > $full_before, "L8 wait_edge_full_count incremented ($full_before → $full_after)");
 
 
-# SKIP — cross-node distributed scenarios (forward-link spec-2.23).
-SKIP: {
-	skip 'cross-node DEADLOCK_PROBE/REPORT production broadcast 推 spec-2.23 BAST 配套', 4;
-	pass 'S9 cross-node 2-node PROBE broadcast (deferred)';
-	pass 'S10 cross-node REPORT collection + union Tarjan (deferred)';
-	pass 'S11 cross-node remote victim cancel forwarding (deferred)';
-	pass 'S12 cross-node revalidate over remote generation (deferred)';
-}
+# ----------
+# spec-2.23 Step 11 — D17 L13-L16 cross-node deadlock scenarios.
+#
+# Steps 6-8 wired the coordinator scan path: cluster_lmd_tarjan_run_
+# coordinator_scan broadcasts DEADLOCK_PROBE to N-1 active peers,
+# collects N-1 REPORTs via the file-static LmdProbeCollector (single
+# probe_id in-flight per scan tick), unions edges + runs Tarjan
+# (D9), and dispatches local-vs-remote victim per HC20.
+#
+# The observable surface at single-node TAP is the new dump_lmd
+# counters (probe_broadcast_count, probe_partial_count) plus
+# unchanged spec-2.22 counters (cycle_detected_count, etc).  Full
+# 2-node ClusterPair cross-node cycle construction (HC21 L136
+# interleave pattern) and remote victim cancel forwarding lands with
+# Hardening v1.0.1 + spec-2.24 D axis.
+# ----------
+
+# L13: dump_lmd surfaces 2 new counters with initial values 0.
+my $lmd_dump = $node->safe_psql('postgres', q{
+	SELECT key
+	FROM cluster_dump_state()
+	WHERE category = 'lmd'
+	  AND key IN ('probe_broadcast_count', 'probe_partial_count')
+	ORDER BY key
+});
+is($lmd_dump, "probe_broadcast_count\nprobe_partial_count",
+   'L13 dump_lmd exposes 2 new spec-2.23 D13 counters');
+
+# L14: probe_broadcast_count starts at 0 (single-node has no peers to
+# broadcast to; coordinator scan returns early before increment).
+my $broadcast_init = $node->safe_psql('postgres', q{
+	SELECT value
+	FROM cluster_dump_state()
+	WHERE category = 'lmd' AND key = 'probe_broadcast_count'
+});
+is($broadcast_init, '0', 'L14 probe_broadcast_count starts at 0 (no peers)');
+
+# L15: probe_partial_count starts at 0 (no PROBE issued → no timeout).
+my $partial_init = $node->safe_psql('postgres', q{
+	SELECT value
+	FROM cluster_dump_state()
+	WHERE category = 'lmd' AND key = 'probe_partial_count'
+});
+is($partial_init, '0', 'L15 probe_partial_count starts at 0');
+
+# L16: cross_node_victim_pending_count (spec-2.22 ship) stays at 0 in
+# single-node mode — no remote victims possible until ClusterPair runs
+# Hardening v1.0.1 with real cross-node cycle injection.
+my $cross_pending = $node->safe_psql('postgres', q{
+	SELECT value
+	FROM cluster_dump_state()
+	WHERE category = 'lmd' AND key = 'cross_node_victim_pending_count'
+});
+is($cross_pending, '0', 'L16 cross_node_victim_pending_count stays at 0 single-node');
 
 
 $node->stop;
