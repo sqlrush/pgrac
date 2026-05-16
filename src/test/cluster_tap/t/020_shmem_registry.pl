@@ -79,14 +79,14 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_shmem}),
-	   '24',
-	   'L2 pg_cluster_shmem returns 24 rows (spec-2.22 LMD graph region included)');
+	   '25',
+	   'L2 pg_cluster_shmem returns 25 rows (spec-2.23 D1 ges reply wait region included)');
 
 is($node->safe_psql(
 		'postgres',
 		q{SELECT string_agg(name, ',' ORDER BY name) FROM pg_cluster_shmem}),
-   'pgrac cluster conf,pgrac cluster control,pgrac cluster cssd,pgrac cluster diag,pgrac cluster epoch,pgrac cluster fence,pgrac cluster ges,pgrac cluster grd,pgrac cluster grd outbound,pgrac cluster grd pending,pgrac cluster grd work queue,pgrac cluster lck,pgrac cluster lmd,pgrac cluster lmd graph,pgrac cluster lmon,pgrac cluster lms,pgrac cluster pcm grd,pgrac cluster qvotec,pgrac cluster reconfig,pgrac cluster scn,pgrac cluster smgr,pgrac cluster startup phase,pgrac cluster stats,pgrac cluster_ic_tier1',
-   'L3 pg_cluster_shmem rows are exactly the 24 foundational regions (spec-2.22 LMD graph included)');
+   'pgrac cluster conf,pgrac cluster control,pgrac cluster cssd,pgrac cluster diag,pgrac cluster epoch,pgrac cluster fence,pgrac cluster ges,pgrac cluster ges reply wait,pgrac cluster grd,pgrac cluster grd outbound,pgrac cluster grd pending,pgrac cluster grd work queue,pgrac cluster lck,pgrac cluster lmd,pgrac cluster lmd graph,pgrac cluster lmon,pgrac cluster lms,pgrac cluster pcm grd,pgrac cluster qvotec,pgrac cluster reconfig,pgrac cluster scn,pgrac cluster smgr,pgrac cluster startup phase,pgrac cluster stats,pgrac cluster_ic_tier1',
+   'L3 pg_cluster_shmem rows are exactly the 25 foundational regions (spec-2.23 D1 ges reply wait included)');
 
 
 # ----------
@@ -228,29 +228,30 @@ like($stderr,
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-   '71',
-   'L17 pg_stat_cluster_wait_events returns 70 rows after spec-2.20');
+   '73',
+   'L17 pg_stat_cluster_wait_events returns 73 rows after spec-2.23 D12');
 
 
 # ----------
-# L18: GUC max_regions=24 (boundary minimum) admits all baseline regions.
+# L18: GUC max_regions=25 (boundary minimum, spec-2.23 D1 bump) admits
+# all baseline regions.
 # ----------
 $node->stop;
-$node->append_conf('postgresql.conf', "cluster.shmem_max_regions = 24\n");
+$node->append_conf('postgresql.conf', "cluster.shmem_max_regions = 25\n");
 $node->start;
 
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_shmem}),
-   '24',
-   'L18 cluster.shmem_max_regions = 24 exactly admits the 24 baseline regions (lower bound match)');
+   '25',
+   'L18 cluster.shmem_max_regions = 25 exactly admits the 25 baseline regions (lower bound match)');
 
 is($node->safe_psql(
 		'postgres',
 		q{SELECT value FROM pg_cluster_state
 		   WHERE category = 'guc' AND key = 'cluster.shmem_max_regions'}),
-   '24',
-   'L19 pg_cluster_state.guc.cluster.shmem_max_regions reflects override = 24');
+   '25',
+   'L19 pg_cluster_state.guc.cluster.shmem_max_regions reflects override = 25');
 
 $node->stop;
 

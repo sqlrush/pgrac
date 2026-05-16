@@ -267,13 +267,18 @@
  * 53R81 SQLSTATE cluster_lmd_unavailable;ClusterLmdShmem region +
  * LWTRANCHE_CLUSTER_LMD;LmdProcess AuxProcType + NUM_AUXILIARY_PROCS
  * 13 → 14.  catversion bump for catalog tooling. */
-/* spec-2.20 D12 (2026-05-15):  7-step state machine + LMS grant + LMD
- * Tarjan production wire.  Adds 3 NEW LMS counter (grant/reject/convert)
- * + pg_cluster_lms view 3 NEW column;53R80 SQLSTATE cluster_lms_unavailable
- * (mirror 53R81 LMD_UNAVAILABLE);LMD wait-for graph shmem region
- * "pgrac cluster lmd graph";WAIT_EVENT_CLUSTER_GES_S4_WAIT.  catversion
- * bump for catalog tooling. */
-#define CATALOG_VERSION_NO 202605330
+/* spec-2.23 D18 (2026-05-16):  cross-node GES grant + targeted BAST +
+ * cross-node deadlock probe/report MVP.  Adds 5-tuple reply wait HTAB
+ * (cluster_ges_reply_wait shmem region + LWLock tranche);  GesReply-
+ * Payload ABI bump 48B → 52B (NEW reply_for_opcode field, FU-5);  3
+ * NEW ges counters (reply_wait_table_active / reply_late_drop /
+ * release_ack);  2 NEW LMD counters (probe_broadcast / probe_partial);
+ * 2 NEW wait events (ClusterGesReplyWait + ClusterLmdProbeCollect);  2
+ * NEW GUCs (cluster.lmd_probe_collect_timeout_ms +
+ * cluster.ges_reply_wait_max_entries);  ClusterGrdWaiter struct
+ * extended with full reply identity.  catversion bump for catalog
+ * tooling. */
+#define CATALOG_VERSION_NO 202605340
 
 /* spec-2.16 D19 (2026-05-29):  GesRequestPayload + GesReplyPayload wire
  * payload structs (48B each + StaticAssertDecl);  ClusterGrdHolderId
