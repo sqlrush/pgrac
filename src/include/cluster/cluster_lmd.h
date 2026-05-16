@@ -430,6 +430,9 @@ extern bool cluster_lmd_cancel_queue_enqueue(uint32 source_node_id, const void *
 extern bool cluster_lmd_cancel_queue_dequeue(ClusterLmdCancelItem *out);
 extern void cluster_lmd_drain_cancel_queue(void);
 
+/* spec-2.24 D8 — LMD periodic dead-backend cleanup sweep (HC28). */
+extern void cluster_lmd_run_periodic_cleanup_sweep(void);
+
 /* spec-2.24 D12 — NEW counters. */
 extern uint64 cluster_lmd_cross_node_victim_cancel_sent_count_get(void);
 extern uint64 cluster_lmd_cross_node_cancel_received_count_get(void);

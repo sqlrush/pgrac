@@ -1496,6 +1496,10 @@ cluster_grd_reservation_promote(ClusterGrdEntry *entry, const ClusterGrdHolderId
  *   2.17), so sweep is a no-op until cluster_unit Step 6 inject test
  *   exercises mutator + sweep round-trip.
  */
+/* spec-2.24 D10 forward decl (definition later in same TU). */
+extern int cluster_grd_entry_cleanup_guarded(ClusterGrdEntry *entry, int dead_procno,
+											 int32 dead_node_id);
+
 void
 cluster_grd_cleanup_on_node_dead(int32 dead_node_id)
 {
@@ -1510,49 +1514,20 @@ cluster_grd_cleanup_on_node_dead(int32 dead_node_id)
 		return;
 	}
 
+	/*
+	 * spec-2.24 D9 — converge via D10 cluster_grd_entry_cleanup_guarded
+	 * (HC27 dual-path convergence;previously spec-2.16 had its own ad-hoc
+	 * sweep loop here).  D10 enforces HC25-26 / I-cleanup-1..4 — HASH_REMOVE
+	 * at-most-once + concurrent cleanup safety + RELEASE enqueue.
+	 */
 	hash_seq_init(&status, cluster_grd_entry_htab);
-	while ((entry = (ClusterGrdEntry *)hash_seq_search(&status)) != NULL) {
-		int i;
-		SpinLockAcquire(&entry->lock);
-		for (i = 0; i < entry->ngranted;) {
-			if (entry->holders[i].node_id == dead_node_id) {
-				if (i < entry->ngranted - 1)
-					entry->holders[i] = entry->holders[entry->ngranted - 1];
-				memset(&entry->holders[entry->ngranted - 1], 0, sizeof(entry->holders[0]));
-				entry->ngranted--;
-				swept++;
-				continue;
-			}
-			i++;
-		}
-		for (i = 0; i < entry->nwaiters;) {
-			if (entry->waiters[i].node_id == dead_node_id) {
-				if (i < entry->nwaiters - 1)
-					entry->waiters[i] = entry->waiters[entry->nwaiters - 1];
-				memset(&entry->waiters[entry->nwaiters - 1], 0, sizeof(entry->waiters[0]));
-				entry->nwaiters--;
-				swept++;
-				continue;
-			}
-			i++;
-		}
-		for (i = 0; i < entry->nconverts;) {
-			if (entry->converts[i].node_id == dead_node_id) {
-				if (i < entry->nconverts - 1)
-					entry->converts[i] = entry->converts[entry->nconverts - 1];
-				memset(&entry->converts[entry->nconverts - 1], 0, sizeof(entry->converts[0]));
-				entry->nconverts--;
-				swept++;
-				continue;
-			}
-			i++;
-		}
-		SpinLockRelease(&entry->lock);
+	while ((entry = (ClusterGrdEntry *) hash_seq_search(&status)) != NULL) {
+		swept += cluster_grd_entry_cleanup_guarded(entry, -1, dead_node_id);
 	}
 
 	if (swept > 0)
 		ereport(DEBUG1, (errmsg_internal("cluster_grd_cleanup_on_node_dead(%d): "
-										 "swept %d holder/waiter/convert slots",
+										 "swept %d holder/waiter/convert slots via D10 primitive",
 										 dead_node_id, swept)));
 }
 
@@ -1870,7 +1845,7 @@ cluster_grd_hashremove_if_still_empty(const ClusterResId *resid)
  *
  *	Returns number of slots removed across all 4 slot kinds.
  */
-static int
+int
 cluster_grd_entry_cleanup_guarded(ClusterGrdEntry *entry, int dead_procno, int32 dead_node_id)
 {
 	int removed = 0;
@@ -2014,6 +1989,69 @@ cluster_grd_cleanup_on_backend_exit(int procno)
  *	exit.  MyProcNumber is valid by InitPostgres time;  if -1 (auxiliary
  *	process pre-ProcSignalInit), I-cleanup-1 early return is safe.
  */
+/*
+ * spec-2.24 D8 helper — sweep local stale procnos.
+ *
+ *	HC28 chunked semantic:  iterate the GRD HTAB once, briefly snapshot
+ *	ProcArray for active local pgprocno set, then for each entry invoke
+ *	cluster_grd_entry_cleanup_guarded with the local stale procno if its
+ *	holders[].node_id == cluster_node_id and procno not in the active
+ *	set.  Per spec-2.24 §1.4 example 2 — must NOT compare local
+ *	ProcArray to remote holder procno.
+ *
+ *	Returns total slots removed.
+ */
+int
+cluster_grd_sweep_local_stale_procnos(void)
+{
+	HASH_SEQ_STATUS status;
+	ClusterGrdEntry *entry;
+	int total = 0;
+	uint8 *alive;
+	int n_alive_max = MaxBackends;
+
+	if (cluster_grd_entry_htab == NULL)
+		return 0;
+
+	alive = (uint8 *) palloc0((Size) n_alive_max);
+
+	/* Briefly snapshot ProcArray active pgprocno set. */
+	LWLockAcquire(ProcArrayLock, LW_SHARED);
+	{
+		int n = ProcGlobal->allProcCount;
+		for (int i = 0; i < n && i < n_alive_max; i++) {
+			PGPROC *p = &ProcGlobal->allProcs[i];
+			if (p->pid != 0)
+				alive[i] = 1;
+		}
+	}
+	LWLockRelease(ProcArrayLock);
+
+	hash_seq_init(&status, cluster_grd_entry_htab);
+	while ((entry = (ClusterGrdEntry *) hash_seq_search(&status)) != NULL) {
+		uint32 stale_procno = (uint32) -1;
+		uint32 i;
+
+		SpinLockAcquire(&entry->lock);
+		for (i = 0; i < (uint32) entry->ngranted; i++) {
+			if (entry->holders[i].node_id != (int32) cluster_node_id)
+				continue;
+			if (entry->holders[i].procno < (uint32) n_alive_max
+				&& alive[entry->holders[i].procno] == 0) {
+				stale_procno = entry->holders[i].procno;
+				break;
+			}
+		}
+		SpinLockRelease(&entry->lock);
+
+		if (stale_procno != (uint32) -1)
+			total += cluster_grd_entry_cleanup_guarded(entry, (int) stale_procno, -1);
+	}
+
+	pfree(alive);
+	return total;
+}
+
 void
 cluster_grd_cleanup_on_backend_exit_callback(int code, Datum arg)
 {

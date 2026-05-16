@@ -216,6 +216,10 @@ extern void cluster_grd_cleanup_on_backend_exit(int procno);
  * backend_exit (idempotent per I-cleanup-1). */
 extern void cluster_grd_cleanup_on_backend_exit_callback(int code, Datum arg);
 
+/* spec-2.24 D8 — local stale-procno sweep helper.  Called from LMD
+ * periodic safety net (HC28 — local-only;remote node death via D9). */
+extern int cluster_grd_sweep_local_stale_procnos(void);
+
 extern void cluster_grd_check_pending_interrupts(void);
 
 /* spec-2.17 D8 + D12 — BAST handler + 6 counter helpers(skeleton phase). */

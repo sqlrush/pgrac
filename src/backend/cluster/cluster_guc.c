@@ -67,6 +67,9 @@ int cluster_ges_request_timeout_ms = 60000; /* spec-2.16 D12 + v0.5 P1.5 */
 int cluster_lmd_probe_collect_timeout_ms = 3000; /* coordinator REPORT collect deadline */
 int cluster_ges_reply_wait_max_entries = 1024;	 /* 5-tuple wait table cap */
 
+/* spec-2.24 D11: */
+int cluster_lmd_cleanup_sweep_interval_ms = 5000; /* LMD safety net cleanup interval */
+
 /* spec-2.17 NEW GUCs(v0.6 frozen baseline). */
 int cluster_ges_bast_retry_interval_ms = 10000;	   /* D11 */
 int cluster_ges_bast_max_retries = 3;			   /* D11 */
@@ -580,6 +583,19 @@ cluster_init_guc(void)
 					 "with SQLSTATE 53R71 — request is rolled back rather than "
 					 "blocking indefinitely.  PGC_POSTMASTER — restart required."),
 		&cluster_ges_reply_wait_max_entries, 1024, 64, 65536, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	/* spec-2.24 D11 NEW:  LMD safety net cleanup sweep interval (HC28). */
+	DefineCustomIntVariable(
+		"cluster.lmd_cleanup_sweep_interval_ms",
+		gettext_noop("LMD periodic dead-backend cleanup sweep interval (ms)."),
+		gettext_noop("Range [100, 60000].  Default 5000ms.  LMD daemon walks GRD "
+					 "entries every interval looking for local backends whose procno "
+					 "is no longer alive in ProcArray (SIGKILL safety net per HC28). "
+					 "Remote-node death is handled separately by cssd dead-bitmap.  "
+					 "0 disables sweep (unrecommended outside benchmarking).  TAP "
+					 "may set 500ms for fast verify."),
+		&cluster_lmd_cleanup_sweep_interval_ms, 5000, 100, 60000, PGC_SIGHUP,
+		GUC_UNIT_MS, NULL, NULL, NULL);
 
 	/* spec-2.17 D11:  BAST retry GUC(Q11 v0.6 — 不 kill healthy holder). */
 	DefineCustomIntVariable("cluster.ges_bast_retry_interval_ms",

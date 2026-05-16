@@ -829,6 +829,9 @@ dump_grd(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_grd_ges_reply_deferred_count()));
 	emit_row(rsinfo, "grd", "grd_ges_reply_dropped_count",
 			 fmt_int64((int64)cluster_grd_ges_reply_dropped_count()));
+	/* spec-2.24 D13 — cleanup_skip_stale_cancel(LMD CANCEL 4-tuple mismatch). */
+	emit_row(rsinfo, "grd", "grd_cleanup_skip_stale_cancel_count",
+			 fmt_int64((int64) cluster_grd_cleanup_skip_stale_cancel_count()));
 	emit_row(rsinfo, "grd", "grd_outbound_ring_depth",
 			 fmt_int32((int32)cluster_grd_outbound_ring_depth()));
 	emit_row(rsinfo, "grd", "grd_outbound_reply_dirty_depth",
@@ -943,6 +946,19 @@ dump_lmd(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_lmd_probe_broadcast_count_get()));
 	emit_row(rsinfo, "lmd", "probe_partial_count",
 			 fmt_int64((int64)cluster_lmd_probe_partial_count_get()));
+	/* spec-2.24 D13 — 6 NEW counters (D + cleanup axes). */
+	emit_row(rsinfo, "lmd", "cleanup_lmd_sweep_count",
+			 fmt_int64((int64) cluster_lmd_cleanup_lmd_sweep_count_get()));
+	emit_row(rsinfo, "lmd", "cleanup_on_backend_exit_count",
+			 fmt_int64((int64) cluster_lmd_cleanup_on_backend_exit_count_get()));
+	emit_row(rsinfo, "lmd", "cleanup_skip_other_owner_count",
+			 fmt_int64((int64) cluster_lmd_cleanup_skip_other_owner_count_get()));
+	emit_row(rsinfo, "lmd", "cross_node_cancel_queue_full_count",
+			 fmt_int64((int64) cluster_lmd_cross_node_cancel_queue_full_count_get()));
+	emit_row(rsinfo, "lmd", "cross_node_cancel_received_count",
+			 fmt_int64((int64) cluster_lmd_cross_node_cancel_received_count_get()));
+	emit_row(rsinfo, "lmd", "cross_node_victim_cancel_sent_count",
+			 fmt_int64((int64) cluster_lmd_cross_node_victim_cancel_sent_count_get()));
 }
 
 

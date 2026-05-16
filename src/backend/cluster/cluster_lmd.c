@@ -339,6 +339,44 @@ cluster_lmd_drain_cancel_queue(void)
 	}
 }
 
+/*
+ * spec-2.24 D8 — LMD periodic dead-backend safety net sweep.
+ *
+ *	HC28 enforcement:
+ *	  - per-shard chunked iteration via cluster_grd_lmon_tick_cleanup_local_
+ *	    sweep (D8 helper in cluster_grd);
+ *	  - sweep ONLY local stale procnos (holder.node_id == cluster_node_id
+ *	    && procno not in local ProcArray) per user codereview Change 4 —
+ *	    remote node death is handled exclusively by cssd dead-bitmap path
+ *	    (D9 cluster_grd_cleanup_on_node_dead).
+ *
+ *	Called from LmdMain tick body at most once per
+ *	cluster.lmd_cleanup_sweep_interval_ms.
+ */
+static TimestampTz lmd_last_cleanup_sweep = 0;
+
+void
+cluster_lmd_run_periodic_cleanup_sweep(void)
+{
+	TimestampTz now;
+	int swept;
+
+	if (cluster_lmd_cleanup_sweep_interval_ms <= 0)
+		return; /* disabled */
+
+	now = GetCurrentTimestamp();
+	if (lmd_last_cleanup_sweep != 0
+		&& TimestampDifferenceExceeds(lmd_last_cleanup_sweep, now,
+									  cluster_lmd_cleanup_sweep_interval_ms) == false)
+		return; /* interval not elapsed */
+
+	lmd_last_cleanup_sweep = now;
+
+	swept = cluster_grd_sweep_local_stale_procnos();
+	if (swept > 0)
+		cluster_lmd_cleanup_lmd_sweep_count_inc((uint64) swept);
+}
+
 bool
 cluster_lmd_cancel_queue_dequeue(ClusterLmdCancelItem *out)
 {
@@ -781,6 +819,8 @@ LmdMain(void)
 			cluster_lmd_tarjan_run_local_scan();
 			/* spec-2.24 D5 — drain cancel queue. */
 			cluster_lmd_drain_cancel_queue();
+			/* spec-2.24 D8 — periodic safety net cleanup sweep. */
+			cluster_lmd_run_periodic_cleanup_sweep();
 		}
 
 		if (current_submission_count > seen_submission_count) {
