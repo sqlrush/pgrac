@@ -2007,6 +2007,23 @@ cluster_grd_cleanup_on_backend_exit(int procno)
 		cluster_lmd_cleanup_on_backend_exit_count_inc((uint64) swept);
 }
 
+/*
+ * spec-2.24 D7 — before_shmem_exit callback wrapper.
+ *
+ *	Registered from InitPostgres so every backend gets the hook on
+ *	exit.  MyProcNumber is valid by InitPostgres time;  if -1 (auxiliary
+ *	process pre-ProcSignalInit), I-cleanup-1 early return is safe.
+ */
+void
+cluster_grd_cleanup_on_backend_exit_callback(int code, Datum arg)
+{
+	(void) code;
+	(void) arg;
+	if (MyProc == NULL)
+		return;
+	cluster_grd_cleanup_on_backend_exit(MyProc->pgprocno);
+}
+
 
 /* ============================================================
  * spec-2.21 D5 high-level helpers — encapsulate entry slock + 5-check +

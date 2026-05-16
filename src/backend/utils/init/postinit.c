@@ -67,6 +67,10 @@
 #include "utils/syscache.h"
 #include "utils/timeout.h"
 
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_grd.h" /* spec-2.24 D7 cleanup_on_backend_exit_callback */
+#endif
+
 static HeapTuple GetDatabaseTuple(const char *dbname);
 static HeapTuple GetDatabaseTupleByOid(Oid dboid);
 static void PerformAuthentication(Port *port);
@@ -833,6 +837,19 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	 * AbortTransaction call to clean up.
 	 */
 	before_shmem_exit(ShutdownPostgres, 0);
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * spec-2.24 D7 — register cluster GRD cleanup_on_backend_exit hook.
+	 *
+	 *	Fires before_shmem_exit so the backend has a chance to sweep its
+	 *	holders/waiters/converts under cluster_grd_state before the GRD
+	 *	shmem region is detached.  cluster_grd_cleanup_on_backend_exit is
+	 *	safe to call multiple times (I-cleanup-1) so duplicate registration
+	 *	via re-exec on EXEC_BACKEND platforms is harmless.
+	 */
+	before_shmem_exit(cluster_grd_cleanup_on_backend_exit_callback, 0);
+#endif
 
 	/* The autovacuum launcher is done here */
 	if (IsAutoVacuumLauncherProcess())

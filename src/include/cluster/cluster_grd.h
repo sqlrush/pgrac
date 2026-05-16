@@ -210,6 +210,12 @@ extern uint64 cluster_grd_deadlock_chunk_oo_buffer_overflow_count(void);
 /* spec-2.17 D21 — cleanup_on_backend_exit(I65 — CANCEL/SIGTERM/
  * on_proc_exit/self-abort;NOT BAST timeout). */
 extern void cluster_grd_cleanup_on_backend_exit(int procno);
+
+/* spec-2.24 D7 — before_shmem_exit callback wrapper for InitPostgres
+ * registration site.  Reads MyProcNumber + delegates to cleanup_on_
+ * backend_exit (idempotent per I-cleanup-1). */
+extern void cluster_grd_cleanup_on_backend_exit_callback(int code, Datum arg);
+
 extern void cluster_grd_check_pending_interrupts(void);
 
 /* spec-2.17 D8 + D12 — BAST handler + 6 counter helpers(skeleton phase). */
