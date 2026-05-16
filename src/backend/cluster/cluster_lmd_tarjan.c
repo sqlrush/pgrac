@@ -45,6 +45,7 @@
 #include "cluster/cluster_conf.h"		  /* CLUSTER_MAX_NODES + active peers */
 #include "cluster/cluster_epoch.h"		  /* cluster_epoch_get_current */
 #include "cluster/cluster_ges.h"		  /* GesDeadlockProbePayload / Report */
+#include "cluster/cluster_grd.h"		  /* spec-2.24 ClusterGrdHolderId */
 #include "cluster/cluster_grd_outbound.h" /* cluster_grd_outbound_enqueue_backend_request */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_lmd.h"
@@ -764,16 +765,28 @@ cluster_lmd_tarjan_run_coordinator_scan(int collect_timeout_ms)
 				/* else revalidate_fail_count already incremented inside revalidate */
 			} else {
 				/*
-				 * Step 8 D10 — local-vs-remote victim 分流.  spec-2.23
-				 * scope does NOT forward the cancel signal to the
-				 * remote LMD;  spec-2.24 D axis wires the cross-node
-				 * cancel envelope.  Increment the pending counter so
-				 * dump_lmd surfaces the detection.
+				 * spec-2.24 D3 — cross-node victim cancel forwarding real wire.
+				 *
+				 *	Replaces spec-2.23 log + cross_node_victim_pending_count
+				 *	with real cluster_ges_send_cancel_pending forward.  The
+				 *	cluster_lmd_cross_node_victim_cancel_sent_count++ happens
+				 *	inside the sender.  The pending counter is retained as
+				 *	transient legacy semantic (steady-state should be 0; non-
+				 *	zero means coordinator detected but coordinator->LMD
+				 *	cancel forward enqueue path not reached yet — currently
+				 *	unreachable since send happens unconditionally below).
 				 */
-				cluster_lmd_cross_node_victim_pending_count_inc(1);
-				ereport(LOG, (errmsg("cluster LMD cross-node deadlock victim on node %d"
-									 " (procno=%u request_id=" UINT64_FORMAT ");"
-									 " cross-node cancel forwarding lands in spec-2.24",
+				ClusterGrdHolderId victim_target;
+
+				victim_target.node_id = (uint32) victim.node_id;
+				victim_target.procno = victim.procno;
+				victim_target.cluster_epoch = victim.cluster_epoch;
+				victim_target.request_id = victim.request_id;
+
+				cluster_ges_send_cancel_pending(victim.node_id, &victim_target);
+				ereport(LOG, (errmsg("cluster LMD cross-node deadlock detected"
+									 " (victim node=%d procno=%u request_id=" UINT64_FORMAT
+									 ");  cancel forwarded via CLUSTER_GRD_OUTBOUND_LMD_CANCEL",
 									 victim.node_id, victim.procno, victim.request_id)));
 			}
 		}
