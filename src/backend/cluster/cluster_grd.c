@@ -34,6 +34,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_ges.h" /* GesRequestPayload / RELEASE cleanup payload */
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_grd_outbound.h" /* cluster_grd_outbound_enqueue_cleanup_release (D10) */
 #include "cluster/cluster_lmd.h"		  /* spec-2.24 D10 cleanup_*_count_inc */
@@ -1800,7 +1801,8 @@ cluster_grd_hashremove_if_still_empty(const ClusterResId *resid)
 		= hash_search_with_hash_value(cluster_grd_entry_htab, resid, hashvalue, HASH_FIND, &found);
 	if (entry != NULL) {
 		SpinLockAcquire(&entry->lock);
-		if (entry->ngranted == 0 && entry->nwaiters == 0 && entry->nconverts == 0) {
+		if (entry->ngranted == 0 && entry->nwaiters == 0 && entry->nconverts == 0
+			&& entry->nreservations == 0) {
 			SpinLockRelease(&entry->lock);
 			(void)hash_search_with_hash_value(cluster_grd_entry_htab, resid, hashvalue, HASH_REMOVE,
 											  &found);
@@ -1850,8 +1852,7 @@ cluster_grd_entry_cleanup_guarded(ClusterGrdEntry *entry, int dead_procno, int32
 {
 	int removed = 0;
 	bool became_empty = false;
-	uint8 release_payloads[PGRAC_GRD_MAX_HOLDERS][24]; /* holder identity for release */
-	int32 release_master_nodes[PGRAC_GRD_MAX_HOLDERS];
+	GesRequestPayload release_payloads[PGRAC_GRD_MAX_HOLDERS];
 	int n_release = 0;
 	ClusterResId entry_resid;
 
@@ -1871,10 +1872,23 @@ cluster_grd_entry_cleanup_guarded(ClusterGrdEntry *entry, int dead_procno, int32
 		if (!match)
 			continue;
 
-		/* Stash holder identity for post-lock RELEASE enqueue. */
+		/* Stash a full GES_RELEASE payload for post-lock enqueue. */
 		if (n_release < PGRAC_GRD_MAX_HOLDERS) {
-			memcpy(release_payloads[n_release], &entry->holders[i], 24);
-			release_master_nodes[n_release] = entry->holders[i].node_id;
+			memset(&release_payloads[n_release], 0, sizeof(GesRequestPayload));
+			release_payloads[n_release].opcode = GES_REQ_OPCODE_RELEASE;
+			release_payloads[n_release].lockmode = (uint32)entry->holders[i].mode;
+			release_payloads[n_release].holder_node_id = (uint32)entry->holders[i].node_id;
+			release_payloads[n_release].holder_procno = entry->holders[i].procno;
+			release_payloads[n_release].holder_cluster_epoch_lo
+				= (uint32)(entry->holders[i].cluster_epoch & 0xffffffffu);
+			release_payloads[n_release].holder_cluster_epoch_hi
+				= (uint32)(entry->holders[i].cluster_epoch >> 32);
+			release_payloads[n_release].holder_request_id_lo
+				= (uint32)(entry->holders[i].request_id & 0xffffffffu);
+			release_payloads[n_release].holder_request_id_hi
+				= (uint32)(entry->holders[i].request_id >> 32);
+			memcpy(release_payloads[n_release].resid, &entry->resid,
+				   sizeof(release_payloads[n_release].resid));
 			n_release++;
 		}
 
@@ -1915,6 +1929,23 @@ cluster_grd_entry_cleanup_guarded(ClusterGrdEntry *entry, int dead_procno, int32
 		entry->nconverts--;
 		removed++;
 	}
+	for (int i = entry->nreservations - 1; i >= 0; i--) {
+		bool match = false;
+
+		if (dead_procno >= 0 && entry->reservations[i].id.node_id == (uint32)cluster_node_id
+			&& entry->reservations[i].id.procno == (uint32)dead_procno)
+			match = true;
+		if (dead_node_id >= 0 && entry->reservations[i].id.node_id == (uint32)dead_node_id)
+			match = true;
+		if (!match)
+			continue;
+
+		if (i < entry->nreservations - 1)
+			entry->reservations[i] = entry->reservations[entry->nreservations - 1];
+		memset(&entry->reservations[entry->nreservations - 1], 0, sizeof(entry->reservations[0]));
+		entry->nreservations--;
+		removed++;
+	}
 
 	/* HC25 — bump generation if any mutation; serves as ABA marker for
 	 * concurrent cleanup detection (other paths see new generation and
@@ -1922,17 +1953,23 @@ cluster_grd_entry_cleanup_guarded(ClusterGrdEntry *entry, int dead_procno, int32
 	if (removed > 0)
 		entry->generation++;
 
-	became_empty = (entry->ngranted == 0 && entry->nwaiters == 0 && entry->nconverts == 0);
+	became_empty = (entry->ngranted == 0 && entry->nwaiters == 0 && entry->nconverts == 0
+					&& entry->nreservations == 0);
 
 	memcpy(&entry_resid, &entry->resid, sizeof(entry_resid));
 
 	SpinLockRelease(&entry->lock);
 
-	/* Enqueue cluster_grd_outbound_enqueue_cleanup_release per real removed
-	 * holder (out-of-lock; spec-2.16 D4 reserved pool nofail). */
-	for (int i = 0; i < n_release; i++) {
-		cluster_grd_outbound_enqueue_cleanup_release((uint32)release_master_nodes[i],
-													 release_payloads[i], 24);
+	/* Enqueue one full GES_RELEASE per removed real holder.  Route to the
+	 * resource master, not to the holder node. */
+	if (n_release > 0) {
+		int32 master = cluster_grd_lookup_master(&entry_resid);
+
+		if (master >= 0 && master != cluster_node_id) {
+			for (int i = 0; i < n_release; i++)
+				cluster_grd_outbound_enqueue_cleanup_release((uint32)master, &release_payloads[i],
+															 sizeof(GesRequestPayload));
+		}
 	}
 
 	/* HC26 I-cleanup-4 — HASH_REMOVE at-most-once per entry lifetime.

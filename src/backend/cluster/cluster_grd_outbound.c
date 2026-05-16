@@ -191,7 +191,8 @@ reply_dirty_push(uint32 dest_node_id, const void *payload, uint16 payload_len)
 }
 
 static void
-cleanup_dirty_push(uint32 dest_node_id, const void *payload, uint16 payload_len)
+cleanup_dirty_push(uint8 msg_type, uint8 origin, uint32 dest_node_id, const void *payload,
+				   uint16 payload_len)
 {
 	ClusterGrdOutboundSlot *slot;
 
@@ -209,8 +210,8 @@ cleanup_dirty_push(uint32 dest_node_id, const void *payload, uint16 payload_len)
 	slot = &cluster_grd_outbound_state
 				->cleanup_dirty[cluster_grd_outbound_state->cleanup_dirty_head];
 	slot->dest_node_id = dest_node_id;
-	slot->msg_type = PGRAC_IC_MSG_GES_REQUEST;
-	slot->origin = CLUSTER_GRD_OUTBOUND_CLEANUP_RELEASE;
+	slot->msg_type = msg_type;
+	slot->origin = origin;
 	slot->payload_len = payload_len;
 	if (payload_len > 0)
 		memcpy(slot->payload, payload, payload_len);
@@ -231,7 +232,9 @@ requeue_slot(const ClusterGrdOutboundSlot *slot)
 		reply_dirty_push(slot->dest_node_id, slot->payload, slot->payload_len);
 		break;
 	case CLUSTER_GRD_OUTBOUND_CLEANUP_RELEASE:
-		cleanup_dirty_push(slot->dest_node_id, slot->payload, slot->payload_len);
+	case CLUSTER_GRD_OUTBOUND_LMD_CANCEL:
+		cleanup_dirty_push(slot->msg_type, slot->origin, slot->dest_node_id, slot->payload,
+						   slot->payload_len);
 		break;
 	case CLUSTER_GRD_OUTBOUND_BACKEND_REQUEST:
 	default:
@@ -301,7 +304,8 @@ cluster_grd_outbound_enqueue_cleanup_release(uint32 dest_node_id, const void *pa
 	 * cleanup dirty-list (LockReleaseAll cannot wait). */
 	if (!ring_push(PGRAC_IC_MSG_GES_REQUEST, CLUSTER_GRD_OUTBOUND_CLEANUP_RELEASE, dest_node_id,
 				   payload, payload_len))
-		cleanup_dirty_push(dest_node_id, payload, payload_len);
+		cleanup_dirty_push(PGRAC_IC_MSG_GES_REQUEST, CLUSTER_GRD_OUTBOUND_CLEANUP_RELEASE,
+						   dest_node_id, payload, payload_len);
 
 	LWLockRelease(cluster_grd_outbound_lock);
 }
@@ -326,7 +330,8 @@ cluster_grd_outbound_enqueue_lmd_cancel(uint32 dest_node_id, const void *payload
 
 	if (!ring_push(PGRAC_IC_MSG_GES_REQUEST, CLUSTER_GRD_OUTBOUND_LMD_CANCEL, dest_node_id, payload,
 				   payload_len))
-		cleanup_dirty_push(dest_node_id, payload, payload_len);
+		cleanup_dirty_push(PGRAC_IC_MSG_GES_REQUEST, CLUSTER_GRD_OUTBOUND_LMD_CANCEL, dest_node_id,
+						   payload, payload_len);
 
 	LWLockRelease(cluster_grd_outbound_lock);
 }

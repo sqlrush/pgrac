@@ -160,7 +160,7 @@ cluster_voting_disk_open(const char *path, bool create_if_missing)
 	if (create_if_missing)
 		flags |= O_CREAT | O_EXCL;
 
-		/*
+	/*
 		 * Best-effort O_DIRECT (Q2 v0.2):  bypass OS page cache when the
 		 * underlying filesystem supports it.  Linux ext4 / xfs / nvme do;
 		 * tmpfs / NFS commonly reject with EINVAL.  Fall back to O_SYNC

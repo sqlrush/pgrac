@@ -459,6 +459,7 @@ extern void cluster_lmd_graph_shmem_init(void);
 
 /* Graph low-level mutators (used by cluster_lmd_tarjan.c + D16 SRF). */
 extern bool cluster_lmd_graph_add_edge(const ClusterLmdWaitEdge *edge);
+extern bool cluster_lmd_graph_has_waiter(const ClusterLmdVertex *waiter);
 extern bool cluster_lmd_graph_remove_edge_by_waiter(const ClusterLmdVertex *waiter);
 extern int cluster_lmd_graph_snapshot_copy(ClusterLmdWaitEdge *out_buf, int max_edges,
 										   uint64 *out_gen_at_snapshot);

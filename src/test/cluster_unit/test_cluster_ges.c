@@ -245,6 +245,8 @@ static uint64 stub_reply_dropped = 0;
 static uint64 stub_work_queue_enqueue_count = 0;
 static uint64 stub_lmon_reply_enqueue_count = 0;
 static uint64 stub_bast_received = 0;
+static uint64 stub_lmd_cancel_enqueue_count = 0;
+static uint32 stub_lmd_cancel_last_source = 0;
 static uint64 stub_bast_ack = 0;
 static uint64 stub_deadlock_probe_drop = 0;
 
@@ -356,10 +358,11 @@ cluster_grd_outbound_enqueue_lmd_cancel(uint32 d pg_attribute_unused(),
 										uint16 l pg_attribute_unused())
 {}
 bool
-cluster_lmd_cancel_queue_enqueue(uint32 s pg_attribute_unused(),
-								 const void *p pg_attribute_unused(),
+cluster_lmd_cancel_queue_enqueue(uint32 s, const void *p pg_attribute_unused(),
 								 uint16 l pg_attribute_unused())
 {
+	stub_lmd_cancel_enqueue_count++;
+	stub_lmd_cancel_last_source = s;
 	return true;
 }
 void
@@ -672,6 +675,32 @@ test_ges_bast_opcode_validates_as_target_local(void)
 }
 
 static void
+test_ges_cancel_pending_opcode_validates_as_target_local(void)
+{
+	ClusterICEnvelope env;
+	GesRequestPayload req;
+	uint64 pre_fail = stub_inbound_validation_fail;
+	uint64 pre_cancel = stub_lmd_cancel_enqueue_count;
+
+	cluster_ges_shmem_init();
+	cluster_node_id = 0;
+	memset(&env, 0, sizeof(env));
+	env.source_node_id = 1; /* coordinator */
+	env.epoch = 0;
+	env.payload_length = sizeof(GesRequestPayload);
+
+	memset(&req, 0, sizeof(req));
+	req.opcode = GES_REQ_OPCODE_CANCEL_PENDING;
+	req.holder_node_id = 0; /* local victim target, not envelope source */
+
+	cluster_ges_request_handler(&env, &req);
+
+	UT_ASSERT_EQ(stub_inbound_validation_fail, pre_fail);
+	UT_ASSERT_EQ(stub_lmd_cancel_enqueue_count, pre_cancel + 1);
+	UT_ASSERT_EQ(stub_lmd_cancel_last_source, (uint32)1);
+}
+
+static void
 test_ges_bast_ack_opcode_validates_as_source_holder(void)
 {
 	ClusterICEnvelope env;
@@ -701,7 +730,7 @@ test_ges_bast_ack_opcode_validates_as_source_holder(void)
 int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
 
 	UT_RUN(test_ges_request_handler_linkable);
 	UT_RUN(test_ges_reply_handler_linkable);
@@ -714,6 +743,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_ges_lmon_drain_work_queue_symbol_linkable);
 	UT_RUN(test_ges_opcode_enum_spec_2_17_extension);
 	UT_RUN(test_ges_bast_opcode_validates_as_target_local);
+	UT_RUN(test_ges_cancel_pending_opcode_validates_as_target_local);
 	UT_RUN(test_ges_bast_ack_opcode_validates_as_source_holder);
 
 	UT_DONE();

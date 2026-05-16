@@ -108,12 +108,7 @@ typedef struct UBA {
  *	pattern used by InvalidScn (spec-1.4) and InvalidTransactionId
  *	(PG vanilla).
  */
-#define InvalidUba_init                                                                            \
-	{                                                                                              \
-		{                                                                                          \
-			0, 0                                                                                   \
-		}                                                                                          \
-	}
+#define InvalidUba_init { { 0, 0 } }
 
 static inline bool
 UBA_is_invalid(UBA u)

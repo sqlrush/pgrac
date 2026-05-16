@@ -289,6 +289,8 @@ cluster_lmd_cancel_queue_enqueue(uint32 source_node_id, const void *payload, uin
 		ok = true;
 	}
 	SpinLockRelease(&lmd_cancel_queue->lock);
+	if (ok && cluster_lmd_state != NULL)
+		ConditionVariableBroadcast(&cluster_lmd_state->cv);
 	return ok;
 }
 

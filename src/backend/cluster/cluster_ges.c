@@ -263,11 +263,13 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 
 	/* spec-2.16 v0.4 L1.8 + v0.5:  5-item validation.
 	 *
-	 * spec-2.17 adds BAST as master->holder advisory.  For that opcode the
-	 * payload holder node is the local target, not the envelope source.  The
-	 * remaining request-family opcodes still identify the remote sender and
-	 * must match env->source_node_id. */
-	payload_node_must_be_source = (req->opcode != GES_REQ_OPCODE_BAST);
+	 * spec-2.17 adds BAST as master->holder advisory, and spec-2.24
+	 * activates CANCEL_PENDING as coordinator->victim advisory.  For both
+	 * opcodes the payload holder node is the local target, not the envelope
+	 * source.  The remaining request-family opcodes still identify the
+	 * remote sender and must match env->source_node_id. */
+	payload_node_must_be_source
+		= (req->opcode != GES_REQ_OPCODE_BAST && req->opcode != GES_REQ_OPCODE_CANCEL_PENDING);
 	if (!ges_validate_inbound(env, req->holder_node_id, holder_epoch, req->opcode,
 							  GES_REQ_OPCODE_REQUEST, GES_REQ_OPCODE_CANCEL_PENDING,
 							  payload_node_must_be_source)) {

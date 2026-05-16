@@ -814,9 +814,32 @@ cluster_lmd_tarjan_run_coordinator_scan(int collect_timeout_ms)
 void
 cluster_lmd_signal_local_victim(uint32 procno, uint64 request_id, uint64 cluster_epoch)
 {
+	ClusterLmdVertex victim;
 	PGPROC *target;
 	pid_t target_pid;
 	int target_backendid;
+
+	memset(&victim, 0, sizeof(victim));
+	victim.node_id = cluster_node_id;
+	victim.procno = procno;
+	victim.cluster_epoch = cluster_epoch;
+	victim.request_id = request_id;
+
+	if (cluster_epoch != cluster_epoch_get_current()) {
+		cluster_lmd_revalidate_fail_count_inc(1);
+		ereport(LOG, (errmsg("cluster LMD victim procno=%u request_id=" UINT64_FORMAT
+							 " stale epoch " UINT64_FORMAT ", skipping",
+							 procno, request_id, cluster_epoch)));
+		return;
+	}
+
+	if (!cluster_lmd_graph_has_waiter(&victim)) {
+		cluster_lmd_revalidate_fail_count_inc(1);
+		ereport(LOG, (errmsg("cluster LMD victim procno=%u request_id=" UINT64_FORMAT
+							 " has no matching wait edge, skipping",
+							 procno, request_id)));
+		return;
+	}
 
 	if (procno >= (uint32)ProcGlobal->allProcCount) {
 		ereport(LOG, (errmsg("cluster LMD victim procno %u out of range, skipping", procno)));
@@ -832,17 +855,6 @@ cluster_lmd_signal_local_victim(uint32 procno, uint64 request_id, uint64 cluster
 							 procno)));
 		return;
 	}
-
-	/*
-	 * Note:  request_id / cluster_epoch verification is best-effort (no
-	 * authoritative source-of-truth field on PGPROC for these yet);  for
-	 * production-grade race protection we will revalidate via re-snapshot
-	 * (HC14) before signalling and again in the backend's own seven_step
-	 * dispatch flag check.  Stale procno + identity mismatch = backend
-	 * sees no edge in graph → falls through clean.
-	 */
-	(void)request_id;
-	(void)cluster_epoch;
 
 	(void)SendProcSignal(target_pid, PROCSIG_CLUSTER_GES_CANCEL, target_backendid);
 	ereport(DEBUG1, (errmsg("cluster LMD sent PROCSIG_CLUSTER_GES_CANCEL to "

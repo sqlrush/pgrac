@@ -247,6 +247,24 @@ cluster_lmd_graph_add_edge(const ClusterLmdWaitEdge *edge)
 }
 
 bool
+cluster_lmd_graph_has_waiter(const ClusterLmdVertex *waiter)
+{
+	LmdEdgeKey key;
+	LmdEdgeEntry *entry;
+
+	Assert(waiter != NULL);
+	if (cluster_lmd_graph_state == NULL || cluster_lmd_graph_htab == NULL)
+		return false;
+
+	make_key(waiter, &key);
+
+	LWLockAcquire(&cluster_lmd_graph_state->lwlock, LW_SHARED);
+	entry = (LmdEdgeEntry *)hash_search(cluster_lmd_graph_htab, &key, HASH_FIND, NULL);
+	LWLockRelease(&cluster_lmd_graph_state->lwlock);
+	return entry != NULL;
+}
+
+bool
 cluster_lmd_graph_remove_edge_by_waiter(const ClusterLmdVertex *waiter)
 {
 	LmdEdgeKey key;
