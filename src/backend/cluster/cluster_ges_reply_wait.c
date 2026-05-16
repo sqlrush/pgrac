@@ -60,11 +60,11 @@
  * ============================================================ */
 
 typedef struct ClusterGesReplyWaitShared {
-	LWLock lwlock;								/* guards HTAB structure */
-	pg_atomic_uint64 reply_wait_table_active;	/* live entry count */
-	pg_atomic_uint64 reply_late_drop_count;		/* HC17 late reply drops */
-	pg_atomic_uint64 release_ack_count;			/* spec-2.23 D3 wire */
-	pg_atomic_uint64 sweep_deleted_count;		/* timeout sweep total */
+	LWLock lwlock;							  /* guards HTAB structure */
+	pg_atomic_uint64 reply_wait_table_active; /* live entry count */
+	pg_atomic_uint64 reply_late_drop_count;	  /* HC17 late reply drops */
+	pg_atomic_uint64 release_ack_count;		  /* spec-2.23 D3 wire */
+	pg_atomic_uint64 sweep_deleted_count;	  /* timeout sweep total */
 } ClusterGesReplyWaitShared;
 
 static ClusterGesReplyWaitShared *reply_wait_state = NULL;
@@ -105,7 +105,7 @@ cluster_ges_reply_wait_shmem_init(void)
 	bool found;
 	HASHCTL hctl;
 
-	reply_wait_state = (ClusterGesReplyWaitShared *) ShmemInitStruct(
+	reply_wait_state = (ClusterGesReplyWaitShared *)ShmemInitStruct(
 		"pgrac cluster ges reply wait", MAXALIGN(sizeof(ClusterGesReplyWaitShared)), &found);
 
 	if (!IsUnderPostmaster) {
@@ -119,10 +119,9 @@ cluster_ges_reply_wait_shmem_init(void)
 	MemSet(&hctl, 0, sizeof(hctl));
 	hctl.keysize = sizeof(GesReplyWaitKey);
 	hctl.entrysize = sizeof(GesReplyWaitEntry);
-	reply_wait_htab = ShmemInitHash("pgrac cluster ges reply wait htab",
-									CLUSTER_GES_REPLY_WAIT_DEFAULT_MAX,
-									CLUSTER_GES_REPLY_WAIT_DEFAULT_MAX, &hctl,
-									HASH_ELEM | HASH_BLOBS);
+	reply_wait_htab
+		= ShmemInitHash("pgrac cluster ges reply wait htab", CLUSTER_GES_REPLY_WAIT_DEFAULT_MAX,
+						CLUSTER_GES_REPLY_WAIT_DEFAULT_MAX, &hctl, HASH_ELEM | HASH_BLOBS);
 }
 
 void
@@ -154,7 +153,7 @@ cluster_ges_reply_wait_insert(const GesReplyWaitKey *key, TimestampTz deadline)
 		return NULL;
 	}
 
-	entry = (GesReplyWaitEntry *) hash_search(reply_wait_htab, key, HASH_ENTER_NULL, &found);
+	entry = (GesReplyWaitEntry *)hash_search(reply_wait_htab, key, HASH_ENTER_NULL, &found);
 	if (entry == NULL) {
 		LWLockRelease(&reply_wait_state->lwlock);
 		return NULL;
@@ -190,7 +189,7 @@ cluster_ges_reply_wait_lookup(const GesReplyWaitKey *key)
 		return NULL;
 
 	LWLockAcquire(&reply_wait_state->lwlock, LW_SHARED);
-	entry = (GesReplyWaitEntry *) hash_search(reply_wait_htab, key, HASH_FIND, NULL);
+	entry = (GesReplyWaitEntry *)hash_search(reply_wait_htab, key, HASH_FIND, NULL);
 	LWLockRelease(&reply_wait_state->lwlock);
 
 	return entry; /* NULL = HC17 late reply path */
@@ -223,7 +222,7 @@ cluster_ges_reply_wait_delete(const GesReplyWaitKey *key)
 		return;
 
 	LWLockAcquire(&reply_wait_state->lwlock, LW_EXCLUSIVE);
-	(void) hash_search(reply_wait_htab, key, HASH_REMOVE, &found);
+	(void)hash_search(reply_wait_htab, key, HASH_REMOVE, &found);
 	if (found)
 		pg_atomic_fetch_sub_u64(&reply_wait_state->reply_wait_table_active, 1);
 	LWLockRelease(&reply_wait_state->lwlock);
@@ -249,9 +248,9 @@ cluster_ges_reply_wait_sweep_timeout(TimestampTz now)
 	LWLockAcquire(&reply_wait_state->lwlock, LW_EXCLUSIVE);
 
 	hash_seq_init(&scan, reply_wait_htab);
-	while ((entry = (GesReplyWaitEntry *) hash_seq_search(&scan)) != NULL) {
+	while ((entry = (GesReplyWaitEntry *)hash_seq_search(&scan)) != NULL) {
 		if (entry->deadline != 0 && entry->deadline <= now) {
-			if (n_victims < (int) lengthof(victim_keys))
+			if (n_victims < (int)lengthof(victim_keys))
 				victim_keys[n_victims++] = entry->key;
 		}
 	}
@@ -259,7 +258,7 @@ cluster_ges_reply_wait_sweep_timeout(TimestampTz now)
 	for (int i = 0; i < n_victims; i++) {
 		bool found;
 
-		(void) hash_search(reply_wait_htab, &victim_keys[i], HASH_REMOVE, &found);
+		(void)hash_search(reply_wait_htab, &victim_keys[i], HASH_REMOVE, &found);
 		if (found) {
 			pg_atomic_fetch_sub_u64(&reply_wait_state->reply_wait_table_active, 1);
 			pg_atomic_fetch_add_u64(&reply_wait_state->sweep_deleted_count, 1);

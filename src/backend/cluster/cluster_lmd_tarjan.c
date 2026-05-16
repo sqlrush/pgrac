@@ -42,10 +42,10 @@
  */
 #include "postgres.h"
 
-#include "cluster/cluster_conf.h"			/* CLUSTER_MAX_NODES + active peers */
-#include "cluster/cluster_epoch.h"			/* cluster_epoch_get_current */
-#include "cluster/cluster_ges.h"			/* GesDeadlockProbePayload / Report */
-#include "cluster/cluster_grd_outbound.h"	/* cluster_grd_outbound_enqueue_backend_request */
+#include "cluster/cluster_conf.h"		  /* CLUSTER_MAX_NODES + active peers */
+#include "cluster/cluster_epoch.h"		  /* cluster_epoch_get_current */
+#include "cluster/cluster_ges.h"		  /* GesDeadlockProbePayload / Report */
+#include "cluster/cluster_grd_outbound.h" /* cluster_grd_outbound_enqueue_backend_request */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_lmd.h"
 #include "miscadmin.h"
@@ -511,12 +511,12 @@ cluster_lmd_run_tarjan_scan_now(void)
  * ============================================================ */
 
 typedef struct LmdProbeCollector {
-	uint64				probe_id;	/* 0 = idle slot */
-	int32				n_expected;
-	int32				n_received;
-	TimestampTz			deadline;
+	uint64 probe_id; /* 0 = idle slot */
+	int32 n_expected;
+	int32 n_received;
+	TimestampTz deadline;
 	GesDeadlockReportHeader *reports[CLUSTER_MAX_NODES];
-	Size				report_sizes[CLUSTER_MAX_NODES];
+	Size report_sizes[CLUSTER_MAX_NODES];
 } LmdProbeCollector;
 
 static LmdProbeCollector probe_collector; /* file-static, single in-flight */
@@ -567,7 +567,7 @@ cluster_lmd_probe_collect_receive(const GesDeadlockReportHeader *report, Size re
 		return false;
 
 	probe_collector.reports[slot]
-		= (GesDeadlockReportHeader *) MemoryContextAlloc(TopMemoryContext, report_len);
+		= (GesDeadlockReportHeader *)MemoryContextAlloc(TopMemoryContext, report_len);
 	memcpy(probe_collector.reports[slot], report, report_len);
 	probe_collector.report_sizes[slot] = report_len;
 	pg_write_barrier();
@@ -614,7 +614,7 @@ cluster_lmd_tarjan_run_coordinator_scan(int collect_timeout_ms)
 	}
 
 	if (n_peers == 0)
-		return;	/* Single-node mode — no cross-node probe needed. */
+		return; /* Single-node mode — no cross-node probe needed. */
 
 	/* (2) Reset any stale collector state from a prior interrupted tick. */
 	probe_collector_reset();
@@ -627,7 +627,7 @@ cluster_lmd_tarjan_run_coordinator_scan(int collect_timeout_ms)
 	/* (3) Build PROBE payload + broadcast to each active peer. */
 	memset(&probe, 0, sizeof(probe));
 	probe.opcode = GES_REQ_OPCODE_DEADLOCK_PROBE;
-	probe.coordinator_node_id = (uint32) self_node;
+	probe.coordinator_node_id = (uint32)self_node;
 	probe.probe_id = probe_collector.probe_id;
 	/*
 	 * generation_snapshot is informational for HC20 cross-node revalidate
@@ -638,8 +638,7 @@ cluster_lmd_tarjan_run_coordinator_scan(int collect_timeout_ms)
 	probe.generation_snapshot = 0;
 
 	for (int i = 0; i < n_peers; i++) {
-		(void) cluster_grd_outbound_enqueue_backend_request((uint32) peers[i], &probe,
-															sizeof(probe));
+		(void)cluster_grd_outbound_enqueue_backend_request((uint32)peers[i], &probe, sizeof(probe));
 	}
 
 	/*
@@ -655,8 +654,8 @@ cluster_lmd_tarjan_run_coordinator_scan(int collect_timeout_ms)
 			break;
 		}
 		CHECK_FOR_INTERRUPTS();
-		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 50,
-						 WAIT_EVENT_CLUSTER_LMD_PROBE_COLLECT);
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 50,
+						WAIT_EVENT_CLUSTER_LMD_PROBE_COLLECT);
 		ResetLatch(MyLatch);
 	}
 
@@ -691,7 +690,7 @@ cluster_lmd_tarjan_run_coordinator_scan(int collect_timeout_ms)
 
 		for (int i = 0; i < CLUSTER_MAX_NODES; i++) {
 			if (probe_collector.reports[i] != NULL)
-				total_edges += (int) probe_collector.reports[i]->nedges;
+				total_edges += (int)probe_collector.reports[i]->nedges;
 		}
 		/* Reserve room for the local snapshot too. */
 		total_edges += max_local_edges;
@@ -701,10 +700,10 @@ cluster_lmd_tarjan_run_coordinator_scan(int collect_timeout_ms)
 			return;
 		}
 
-		union_edges = (ClusterLmdWaitEdge *) palloc(sizeof(ClusterLmdWaitEdge) * total_edges);
+		union_edges = (ClusterLmdWaitEdge *)palloc(sizeof(ClusterLmdWaitEdge) * total_edges);
 
 		/* Local snapshot first — the coordinator's own waiting edges. */
-		local_snapshot = (ClusterLmdWaitEdge *) palloc(sizeof(ClusterLmdWaitEdge) * max_local_edges);
+		local_snapshot = (ClusterLmdWaitEdge *)palloc(sizeof(ClusterLmdWaitEdge) * max_local_edges);
 		local_n = cluster_lmd_graph_snapshot_copy(local_snapshot, max_local_edges, &local_gen);
 		if (local_n > 0) {
 			memcpy(union_edges, local_snapshot, sizeof(ClusterLmdWaitEdge) * local_n);
@@ -720,13 +719,13 @@ cluster_lmd_tarjan_run_coordinator_scan(int collect_timeout_ms)
 
 			if (report == NULL)
 				continue;
-			report_edges = (const ClusterLmdWaitEdge *) (((const char *) report)
-														 + sizeof(GesDeadlockReportHeader));
-			if (n_union + (int) report->nedges > total_edges)
-				break;	/* defensive: should not happen given total_edges math */
+			report_edges = (const ClusterLmdWaitEdge *)(((const char *)report)
+														+ sizeof(GesDeadlockReportHeader));
+			if (n_union + (int)report->nedges > total_edges)
+				break; /* defensive: should not happen given total_edges math */
 			memcpy(union_edges + n_union, report_edges,
 				   sizeof(ClusterLmdWaitEdge) * report->nedges);
-			n_union += (int) report->nedges;
+			n_union += (int)report->nedges;
 		}
 
 		if (n_union == 0) {
@@ -735,7 +734,7 @@ cluster_lmd_tarjan_run_coordinator_scan(int collect_timeout_ms)
 			return;
 		}
 
-		cycle_vertices = (ClusterLmdVertex *) palloc(sizeof(ClusterLmdVertex) * n_union * 2);
+		cycle_vertices = (ClusterLmdVertex *)palloc(sizeof(ClusterLmdVertex) * n_union * 2);
 		n_cycle_v = cluster_lmd_tarjan_scan_snapshot(union_edges, n_union, cycle_vertices,
 													 n_union * 2, &cycle_count);
 

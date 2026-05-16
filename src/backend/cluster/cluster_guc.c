@@ -64,8 +64,8 @@ int cluster_grd_max_entries = 0;
 int cluster_ges_request_timeout_ms = 60000; /* spec-2.16 D12 + v0.5 P1.5 */
 
 /* spec-2.23 D11: */
-int cluster_lmd_probe_collect_timeout_ms = 3000;	/* coordinator REPORT collect deadline */
-int cluster_ges_reply_wait_max_entries = 1024;		/* 5-tuple wait table cap */
+int cluster_lmd_probe_collect_timeout_ms = 3000; /* coordinator REPORT collect deadline */
+int cluster_ges_reply_wait_max_entries = 1024;	 /* 5-tuple wait table cap */
 
 /* spec-2.17 NEW GUCs(v0.6 frozen baseline). */
 int cluster_ges_bast_retry_interval_ms = 10000;	   /* D11 */
@@ -572,14 +572,14 @@ cluster_init_guc(void)
 							GUC_UNIT_MS, NULL, NULL, NULL);
 
 	/* spec-2.23 D11 NEW:  reply wait HTAB cap (5-tuple key). */
-	DefineCustomIntVariable("cluster.ges_reply_wait_max_entries",
-							gettext_noop("Cap on the cross-node GES reply wait HTAB (5-tuple key)."),
-							gettext_noop("Range [64, 65536].  Default 1024.  Backends inserting a "
-										 "GES_REQUEST/RELEASE wait entry beyond the cap fail closed "
-										 "with SQLSTATE 53R71 — request is rolled back rather than "
-										 "blocking indefinitely.  PGC_POSTMASTER — restart required."),
-							&cluster_ges_reply_wait_max_entries, 1024, 64, 65536, PGC_POSTMASTER, 0,
-							NULL, NULL, NULL);
+	DefineCustomIntVariable(
+		"cluster.ges_reply_wait_max_entries",
+		gettext_noop("Cap on the cross-node GES reply wait HTAB (5-tuple key)."),
+		gettext_noop("Range [64, 65536].  Default 1024.  Backends inserting a "
+					 "GES_REQUEST/RELEASE wait entry beyond the cap fail closed "
+					 "with SQLSTATE 53R71 — request is rolled back rather than "
+					 "blocking indefinitely.  PGC_POSTMASTER — restart required."),
+		&cluster_ges_reply_wait_max_entries, 1024, 64, 65536, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	/* spec-2.17 D11:  BAST retry GUC(Q11 v0.6 — 不 kill healthy holder). */
 	DefineCustomIntVariable("cluster.ges_bast_retry_interval_ms",

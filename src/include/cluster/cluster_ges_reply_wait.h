@@ -89,12 +89,12 @@ StaticAssertDecl(sizeof(GesReplyWaitKey) == 32, "GesReplyWaitKey HTAB key 32-byt
  *	Step 2 D2 (cluster_ges_send_request_and_wait + reply handler wire).
  */
 typedef struct GesReplyWaitEntry {
-	GesReplyWaitKey key;	/* HTAB key (must be first; HASH_BLOBS) */
-	ConditionVariable cv;	/* per-entry wake target */
-	uint32 reject_reason;	/* set by reply handler; 0 = GRANT */
-	uint32 reply_opcode;	/* set by reply handler (GesReplyOpcode) */
-	TimestampTz deadline;	/* timeout sweep gate; 0 means no timeout */
-	bool ready;				/* CV check predicate */
+	GesReplyWaitKey key;  /* HTAB key (must be first; HASH_BLOBS) */
+	ConditionVariable cv; /* per-entry wake target */
+	uint32 reject_reason; /* set by reply handler; 0 = GRANT */
+	uint32 reply_opcode;  /* set by reply handler (GesReplyOpcode) */
+	TimestampTz deadline; /* timeout sweep gate; 0 means no timeout */
+	bool ready;			  /* CV check predicate */
 } GesReplyWaitEntry;
 
 /*

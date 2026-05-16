@@ -78,9 +78,9 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_scn.h"  /* cluster_scn_current (spec-1.15 D6) */
 #include "cluster/cluster_ges.h"  /* cluster_ges_{request,reply}_defer_count (spec-2.13 D4) */
 #include "cluster/cluster_ges_reply_wait.h" /* spec-2.23 D13 reply wait counters */
-#include "cluster/cluster_grd.h"  /* cluster_grd_* observability accessors (spec-2.14 D6) */
-#include "cluster/cluster_lmd.h"  /* cluster_lmd_* observability accessors (spec-2.19 D10) */
-#include "cluster/cluster_lms.h"  /* cluster_lms_* observability accessors (spec-2.18 D10) */
+#include "cluster/cluster_grd.h" /* cluster_grd_* observability accessors (spec-2.14 D6) */
+#include "cluster/cluster_lmd.h" /* cluster_lmd_* observability accessors (spec-2.19 D10) */
+#include "cluster/cluster_lms.h" /* cluster_lms_* observability accessors (spec-2.18 D10) */
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_grd_pending.h"
 #include "cluster/cluster_grd_work_queue.h"

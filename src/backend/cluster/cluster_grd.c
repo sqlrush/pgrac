@@ -107,12 +107,12 @@ typedef struct ClusterGrdWaiter {
 	 * (node_id, mode, wait_start);  the procno/request_id/request_opcode
 	 * + source_node_id additions are NEW for spec-2.23.
 	 */
-	int32 node_id;			   /* legacy: equal to source_node_id; kept for binary compat */
-	int32 source_node_id;	   /* node hosting the waiting backend */
-	uint32 procno;			   /* PG ProcNumber of the waiting backend */
-	uint64 cluster_epoch;	   /* epoch at waiter enqueue time */
-	uint64 request_id;		   /* per-backend monotonic id (for 5-tuple reply key) */
-	uint32 request_opcode;	   /* GesRequestOpcode of the queued request */
+	int32 node_id;		   /* legacy: equal to source_node_id; kept for binary compat */
+	int32 source_node_id;  /* node hosting the waiting backend */
+	uint32 procno;		   /* PG ProcNumber of the waiting backend */
+	uint64 cluster_epoch;  /* epoch at waiter enqueue time */
+	uint64 request_id;	   /* per-backend monotonic id (for 5-tuple reply key) */
+	uint32 request_opcode; /* GesRequestOpcode of the queued request */
 	LOCKMODE mode;
 	TimestampTz wait_start;
 } ClusterGrdWaiter;
@@ -1163,9 +1163,8 @@ cluster_grd_entry_promote_waiter(ClusterGrdEntry *entry, const ClusterGrdHolderI
 
 ClusterGrdGrantAction
 cluster_grd_entry_enqueue_or_grant(const ClusterResId *resid, const ClusterGrdHolderId *holder,
-								   int32 source_node_id, uint64 request_id,
-								   uint32 request_opcode, int lockmode,
-								   ClusterGrdConflictHolder *conflict_holders_out,
+								   int32 source_node_id, uint64 request_id, uint32 request_opcode,
+								   int lockmode, ClusterGrdConflictHolder *conflict_holders_out,
 								   int *n_conflict_out)
 {
 	ClusterGrdEntry *entry = NULL;
@@ -1189,13 +1188,12 @@ cluster_grd_entry_enqueue_or_grant(const ClusterResId *resid, const ClusterGrdHo
 	 *	  can later fan out a targeted BAST (HC18).
 	 */
 	for (int i = 0; i < entry->ngranted; i++) {
-		if (!DoLockModesConflict((LOCKMODE) lockmode, entry->holders[i].mode))
+		if (!DoLockModesConflict((LOCKMODE)lockmode, entry->holders[i].mode))
 			continue;
 		if (conflict_holders_out != NULL && n_conflict < PGRAC_GRD_MAX_HOLDERS) {
 			conflict_holders_out[n_conflict].holder.node_id = entry->holders[i].node_id;
 			conflict_holders_out[n_conflict].holder.procno = entry->holders[i].procno;
-			conflict_holders_out[n_conflict].holder.cluster_epoch
-				= entry->holders[i].cluster_epoch;
+			conflict_holders_out[n_conflict].holder.cluster_epoch = entry->holders[i].cluster_epoch;
 			conflict_holders_out[n_conflict].holder.request_id = entry->holders[i].request_id;
 			conflict_holders_out[n_conflict].source_node_id = entry->holders[i].node_id;
 			conflict_holders_out[n_conflict].held_mode = entry->holders[i].mode;
@@ -1216,11 +1214,11 @@ cluster_grd_entry_enqueue_or_grant(const ClusterResId *resid, const ClusterGrdHo
 			return CLUSTER_GRD_WAIT_QUEUE_FULL;
 		}
 		slot = entry->ngranted++;
-		entry->holders[slot].node_id = (int32) holder->node_id;
+		entry->holders[slot].node_id = (int32)holder->node_id;
 		entry->holders[slot].procno = holder->procno;
 		entry->holders[slot].cluster_epoch = holder->cluster_epoch;
 		entry->holders[slot].request_id = holder->request_id;
-		entry->holders[slot].mode = (LOCKMODE) lockmode;
+		entry->holders[slot].mode = (LOCKMODE)lockmode;
 		entry->generation++;
 		SpinLockRelease(&entry->lock);
 		cluster_grd_entry_release(entry);
@@ -1239,13 +1237,13 @@ cluster_grd_entry_enqueue_or_grant(const ClusterResId *resid, const ClusterGrdHo
 	}
 
 	slot = entry->nwaiters++;
-	entry->waiters[slot].node_id = (int32) holder->node_id;
+	entry->waiters[slot].node_id = (int32)holder->node_id;
 	entry->waiters[slot].source_node_id = source_node_id;
 	entry->waiters[slot].procno = holder->procno;
 	entry->waiters[slot].cluster_epoch = holder->cluster_epoch;
 	entry->waiters[slot].request_id = request_id;
 	entry->waiters[slot].request_opcode = request_opcode;
-	entry->waiters[slot].mode = (LOCKMODE) lockmode;
+	entry->waiters[slot].mode = (LOCKMODE)lockmode;
 	entry->waiters[slot].wait_start = 0;
 	entry->generation++;
 
@@ -1276,7 +1274,7 @@ cluster_grd_entry_release_and_pop_compatible_waiter(const ClusterResId *resid,
 
 	/* (1) Locate the holder slot by full 4-tuple match. */
 	for (int i = 0; i < entry->ngranted; i++) {
-		if ((uint32) entry->holders[i].node_id == holder->node_id
+		if ((uint32)entry->holders[i].node_id == holder->node_id
 			&& entry->holders[i].procno == holder->procno
 			&& entry->holders[i].cluster_epoch == holder->cluster_epoch
 			&& entry->holders[i].request_id == holder->request_id) {
@@ -1322,7 +1320,7 @@ cluster_grd_entry_release_and_pop_compatible_waiter(const ClusterResId *resid,
 			break;
 
 		/* Capture identity for the caller's GES_REPLY send. */
-		granted_out[popped].holder.node_id = (uint32) entry->waiters[chosen].node_id;
+		granted_out[popped].holder.node_id = (uint32)entry->waiters[chosen].node_id;
 		granted_out[popped].holder.procno = entry->waiters[chosen].procno;
 		granted_out[popped].holder.cluster_epoch = entry->waiters[chosen].cluster_epoch;
 		granted_out[popped].holder.request_id = entry->waiters[chosen].request_id;

@@ -47,9 +47,9 @@
 #include "cluster/cluster_conf.h"	/* cluster_conf_lookup_node */
 #include "cluster/cluster_shmem.h"
 #include "storage/condition_variable.h"
-#include "storage/proc.h"		 /* MyProc->cluster_grd_bast_pending (D5) */
-#include "storage/procarray.h"	 /* ProcSignalReason dispatch helper */
-#include "storage/procsignal.h"	 /* SendProcSignal + PROCSIG_CLUSTER_GES_BAST */
+#include "storage/proc.h"		/* MyProc->cluster_grd_bast_pending (D5) */
+#include "storage/procarray.h"	/* ProcSignalReason dispatch helper */
+#include "storage/procsignal.h" /* SendProcSignal + PROCSIG_CLUSTER_GES_BAST */
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "port/atomics.h"
@@ -249,7 +249,7 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 		 * helper returns false and we silently drop the late REPORT (HC8
 		 * partial OK contract — a future scan tick will retry).
 		 */
-		(void) cluster_lmd_probe_collect_receive(report, env->payload_length);
+		(void)cluster_lmd_probe_collect_receive(report, env->payload_length);
 		return;
 	}
 	if (env->payload_length != sizeof(GesRequestPayload)) {
@@ -392,21 +392,20 @@ cluster_ges_reply_handler(const ClusterICEnvelope *env, const void *payload)
 		GesReplyWaitEntry *entry;
 
 		memset(&key, 0, sizeof(key));
-		key.request_id = ((uint64) rep->holder_request_id_lo)
-						 | (((uint64) rep->holder_request_id_hi) << 32);
-		key.source_node_id = cluster_node_id;	   /* this node was the sender */
-		key.dest_node_id = (int32) env->source_node_id; /* replying master */
+		key.request_id
+			= ((uint64)rep->holder_request_id_lo) | (((uint64)rep->holder_request_id_hi) << 32);
+		key.source_node_id = cluster_node_id;		   /* this node was the sender */
+		key.dest_node_id = (int32)env->source_node_id; /* replying master */
 		key.request_opcode = rep->reply_for_opcode;
 		key.cluster_epoch = holder_epoch;
 
 		entry = cluster_ges_reply_wait_lookup(&key);
 		if (entry == NULL) {
 			cluster_ges_inc_reply_late_drop();
-			ereport(DEBUG2, (errmsg_internal("cluster_ges_reply: late reply (no waiter) "
-											 "request_id=" UINT64_FORMAT
-											 " opcode=%u from peer %u",
-											 key.request_id, rep->reply_for_opcode,
-											 env->source_node_id)));
+			ereport(DEBUG2,
+					(errmsg_internal("cluster_ges_reply: late reply (no waiter) "
+									 "request_id=" UINT64_FORMAT " opcode=%u from peer %u",
+									 key.request_id, rep->reply_for_opcode, env->source_node_id)));
 			return;
 		}
 
@@ -429,14 +428,14 @@ ges_send_grant_reply(int32 dest_node_id, const ClusterGrdHolderId *holder,
 	reply.opcode = GES_REPLY_OPCODE_GRANT;
 	reply.reply_for_opcode = request_opcode;
 	reply.reject_reason = GES_REJECT_REASON_NONE;
-	reply.holder_node_id = (uint32) holder->node_id;
+	reply.holder_node_id = (uint32)holder->node_id;
 	reply.holder_procno = holder->procno;
-	reply.holder_cluster_epoch_lo = (uint32) (holder->cluster_epoch & 0xffffffffu);
-	reply.holder_cluster_epoch_hi = (uint32) (holder->cluster_epoch >> 32);
-	reply.holder_request_id_lo = (uint32) (holder->request_id & 0xffffffffu);
-	reply.holder_request_id_hi = (uint32) (holder->request_id >> 32);
+	reply.holder_cluster_epoch_lo = (uint32)(holder->cluster_epoch & 0xffffffffu);
+	reply.holder_cluster_epoch_hi = (uint32)(holder->cluster_epoch >> 32);
+	reply.holder_request_id_lo = (uint32)(holder->request_id & 0xffffffffu);
+	reply.holder_request_id_hi = (uint32)(holder->request_id >> 32);
 	memcpy(reply.resid, resid, sizeof(reply.resid));
-	cluster_grd_outbound_enqueue_lmon_reply((uint32) dest_node_id, &reply, sizeof(reply));
+	cluster_grd_outbound_enqueue_lmon_reply((uint32)dest_node_id, &reply, sizeof(reply));
 }
 
 int
@@ -459,12 +458,12 @@ cluster_ges_lmon_drain_work_queue(void)
 			continue;
 		}
 
-		req = (const GesRequestPayload *) item.payload;
+		req = (const GesRequestPayload *)item.payload;
 
-		holder_epoch = ((uint64) req->holder_cluster_epoch_lo)
-					   | (((uint64) req->holder_cluster_epoch_hi) << 32);
-		holder_request_id = ((uint64) req->holder_request_id_lo)
-							| (((uint64) req->holder_request_id_hi) << 32);
+		holder_epoch = ((uint64)req->holder_cluster_epoch_lo)
+					   | (((uint64)req->holder_cluster_epoch_hi) << 32);
+		holder_request_id
+			= ((uint64)req->holder_request_id_lo) | (((uint64)req->holder_request_id_hi) << 32);
 
 		holder.node_id = req->holder_node_id;
 		holder.procno = req->holder_procno;
@@ -472,10 +471,10 @@ cluster_ges_lmon_drain_work_queue(void)
 		holder.request_id = holder_request_id;
 		memcpy(&resid, req->resid, sizeof(resid));
 
-		switch ((GesRequestOpcode) req->opcode) {
-			case GES_REQ_OPCODE_REQUEST:
-			case GES_REQ_OPCODE_CONVERT: {
-				/*
+		switch ((GesRequestOpcode)req->opcode) {
+		case GES_REQ_OPCODE_REQUEST:
+		case GES_REQ_OPCODE_CONVERT: {
+			/*
 				 * spec-2.23 D6 — GRD-owned conflict matrix + waiter queue.
 				 *
 				 *	enqueue_or_grant handles the entry lock, conflict scan
@@ -485,79 +484,77 @@ cluster_ges_lmon_drain_work_queue(void)
 				 *	Step 5 D4 cluster_ges_send_bast_targeted (HC18 BAST
 				 *	target filter).
 				 */
-				ClusterGrdConflictHolder conflict_holders[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
-				int n_conflict = 0;
-				ClusterGrdGrantAction action;
+			ClusterGrdConflictHolder conflict_holders[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+			int n_conflict = 0;
+			ClusterGrdGrantAction action;
 
-				action = cluster_grd_entry_enqueue_or_grant(
-					&resid, &holder, (int32) item.source_node_id, holder_request_id,
-					req->opcode, (int) req->lockmode, conflict_holders, &n_conflict);
+			action = cluster_grd_entry_enqueue_or_grant(
+				&resid, &holder, (int32)item.source_node_id, holder_request_id, req->opcode,
+				(int)req->lockmode, conflict_holders, &n_conflict);
 
-				if (action == CLUSTER_GRD_GRANT_NOW) {
-					ges_send_grant_reply((int32) item.source_node_id, &holder, &resid,
-										 req->opcode);
-				} else if (action == CLUSTER_GRD_ENQUEUED_WAITER) {
-					/*
+			if (action == CLUSTER_GRD_GRANT_NOW) {
+				ges_send_grant_reply((int32)item.source_node_id, &holder, &resid, req->opcode);
+			} else if (action == CLUSTER_GRD_ENQUEUED_WAITER) {
+				/*
 					 * spec-2.23 D4 / HC18 — targeted BAST.  conflict_holders
 					 * was captured under entry->lock in enqueue_or_grant;
 					 * send_bast_targeted re-verifies DoLockModesConflict at
 					 * send time and skips entries that the concurrent
 					 * release path may have already cleared.
 					 */
-					if (n_conflict > 0)
-						cluster_ges_send_bast_targeted(&resid, (int) req->lockmode,
-													   conflict_holders, n_conflict);
-				} else if (action == CLUSTER_GRD_WAIT_QUEUE_FULL) {
-					GesReplyPayload reject;
+				if (n_conflict > 0)
+					cluster_ges_send_bast_targeted(&resid, (int)req->lockmode, conflict_holders,
+												   n_conflict);
+			} else if (action == CLUSTER_GRD_WAIT_QUEUE_FULL) {
+				GesReplyPayload reject;
 
-					memset(&reject, 0, sizeof(reject));
-					reject.opcode = GES_REPLY_OPCODE_REJECT;
-					reject.reply_for_opcode = req->opcode;
-					reject.reject_reason = GES_REJECT_REASON_WORK_QUEUE_FULL;
-					reject.holder_node_id = req->holder_node_id;
-					reject.holder_procno = req->holder_procno;
-					reject.holder_cluster_epoch_lo = req->holder_cluster_epoch_lo;
-					reject.holder_cluster_epoch_hi = req->holder_cluster_epoch_hi;
-					reject.holder_request_id_lo = req->holder_request_id_lo;
-					reject.holder_request_id_hi = req->holder_request_id_hi;
-					memcpy(reject.resid, req->resid, sizeof(reject.resid));
-					cluster_grd_outbound_enqueue_lmon_reply(item.source_node_id, &reject,
-															sizeof(reject));
-				}
-				/* CLUSTER_GRD_NOT_READY → silently retry on next drain tick. */
-				break;
+				memset(&reject, 0, sizeof(reject));
+				reject.opcode = GES_REPLY_OPCODE_REJECT;
+				reject.reply_for_opcode = req->opcode;
+				reject.reject_reason = GES_REJECT_REASON_WORK_QUEUE_FULL;
+				reject.holder_node_id = req->holder_node_id;
+				reject.holder_procno = req->holder_procno;
+				reject.holder_cluster_epoch_lo = req->holder_cluster_epoch_lo;
+				reject.holder_cluster_epoch_hi = req->holder_cluster_epoch_hi;
+				reject.holder_request_id_lo = req->holder_request_id_lo;
+				reject.holder_request_id_hi = req->holder_request_id_hi;
+				memcpy(reject.resid, req->resid, sizeof(reject.resid));
+				cluster_grd_outbound_enqueue_lmon_reply(item.source_node_id, &reject,
+														sizeof(reject));
 			}
-			case GES_REQ_OPCODE_RELEASE: {
-				/*
+			/* CLUSTER_GRD_NOT_READY → silently retry on next drain tick. */
+			break;
+		}
+		case GES_REQ_OPCODE_RELEASE: {
+			/*
 				 * spec-2.23 D6 — release_and_pop_compatible_waiter wakes
 				 * the first FIFO-compatible waiter (if any) and returns
 				 * its identity so we can send a GES_REPLY GRANT back.
 				 */
-				ClusterGrdWaiterIdentity granted[1];
-				int n_granted;
+			ClusterGrdWaiterIdentity granted[1];
+			int n_granted;
 
-				n_granted = cluster_grd_entry_release_and_pop_compatible_waiter(
-					&resid, &holder, granted, lengthof(granted));
+			n_granted = cluster_grd_entry_release_and_pop_compatible_waiter(
+				&resid, &holder, granted, lengthof(granted));
 
-				/* Reply GRANT to the original releaser (acks the RELEASE). */
-				ges_send_grant_reply((int32) item.source_node_id, &holder, &resid,
-									 req->opcode);
+			/* Reply GRANT to the original releaser (acks the RELEASE). */
+			ges_send_grant_reply((int32)item.source_node_id, &holder, &resid, req->opcode);
 
-				for (int i = 0; i < n_granted; i++) {
-					ges_send_grant_reply(granted[i].source_node_id, &granted[i].holder, &resid,
-										 granted[i].request_opcode);
-				}
-				break;
+			for (int i = 0; i < n_granted; i++) {
+				ges_send_grant_reply(granted[i].source_node_id, &granted[i].holder, &resid,
+									 granted[i].request_opcode);
 			}
-			default:
-				/*
+			break;
+		}
+		default:
+			/*
 				 * BAST / BAST_ACK / DEADLOCK_* opcodes are dispatched in
 				 * cluster_ges_request_handler; should never reach the
 				 * drain path.  Count as inbound validation fail to surface
 				 * any future routing regression.
 				 */
-				cluster_grd_inc_ges_inbound_validation_fail();
-				break;
+			cluster_grd_inc_ges_inbound_validation_fail();
+			break;
 		}
 	}
 
@@ -667,15 +664,15 @@ cluster_ges_send_request_and_wait(const struct ClusterResId *resid, uint32 lockm
 	memset(&req, 0, sizeof(req));
 	req.opcode = GES_REQ_OPCODE_REQUEST;
 	req.lockmode = lockmode;
-	req.holder_node_id = (uint32) holder->node_id;
-	req.holder_procno = (uint32) holder->procno;
-	req.holder_cluster_epoch_lo = (uint32) (holder->cluster_epoch & 0xffffffffu);
-	req.holder_cluster_epoch_hi = (uint32) (holder->cluster_epoch >> 32);
-	req.holder_request_id_lo = (uint32) (request_id & 0xffffffffu);
-	req.holder_request_id_hi = (uint32) (request_id >> 32);
+	req.holder_node_id = (uint32)holder->node_id;
+	req.holder_procno = (uint32)holder->procno;
+	req.holder_cluster_epoch_lo = (uint32)(holder->cluster_epoch & 0xffffffffu);
+	req.holder_cluster_epoch_hi = (uint32)(holder->cluster_epoch >> 32);
+	req.holder_request_id_lo = (uint32)(request_id & 0xffffffffu);
+	req.holder_request_id_hi = (uint32)(request_id >> 32);
 	memcpy(req.resid, resid, sizeof(req.resid));
 
-	if (!cluster_grd_outbound_enqueue_backend_request((uint32) master, &req, sizeof(req))) {
+	if (!cluster_grd_outbound_enqueue_backend_request((uint32)master, &req, sizeof(req))) {
 		/* Outbound ring full — fail closed.  Caller may retry. */
 		cluster_ges_reply_wait_delete(&key);
 		return GES_REJECT_REASON_WORK_QUEUE_FULL;
@@ -782,15 +779,15 @@ cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 	memset(&req, 0, sizeof(req));
 	req.opcode = GES_REQ_OPCODE_RELEASE;
 	req.lockmode = 0;
-	req.holder_node_id = (uint32) holder->node_id;
-	req.holder_procno = (uint32) holder->procno;
-	req.holder_cluster_epoch_lo = (uint32) (holder->cluster_epoch & 0xffffffffu);
-	req.holder_cluster_epoch_hi = (uint32) (holder->cluster_epoch >> 32);
-	req.holder_request_id_lo = (uint32) (request_id & 0xffffffffu);
-	req.holder_request_id_hi = (uint32) (request_id >> 32);
+	req.holder_node_id = (uint32)holder->node_id;
+	req.holder_procno = (uint32)holder->procno;
+	req.holder_cluster_epoch_lo = (uint32)(holder->cluster_epoch & 0xffffffffu);
+	req.holder_cluster_epoch_hi = (uint32)(holder->cluster_epoch >> 32);
+	req.holder_request_id_lo = (uint32)(request_id & 0xffffffffu);
+	req.holder_request_id_hi = (uint32)(request_id >> 32);
 	memcpy(req.resid, resid, sizeof(req.resid));
 
-	if (!cluster_grd_outbound_enqueue_backend_request((uint32) master, &req, sizeof(req))) {
+	if (!cluster_grd_outbound_enqueue_backend_request((uint32)master, &req, sizeof(req))) {
 		cluster_ges_reply_wait_delete(&key);
 		return GES_REJECT_REASON_WORK_QUEUE_FULL;
 	}
@@ -800,8 +797,7 @@ cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 
 	ConditionVariablePrepareToSleep(&entry->cv);
 	while (!entry->ready) {
-		if (!ConditionVariableTimedSleep(&entry->cv, timeout_ms,
-										 WAIT_EVENT_CLUSTER_GES_S4_WAIT)) {
+		if (!ConditionVariableTimedSleep(&entry->cv, timeout_ms, WAIT_EVENT_CLUSTER_GES_S4_WAIT)) {
 			cluster_ges_reply_wait_delete(&key);
 			ConditionVariableCancelSleep();
 			return GES_REJECT_REASON_TIMEOUT;
@@ -858,7 +854,7 @@ cluster_ges_send_bast_targeted(const struct ClusterResId *resid, int requested_m
 		 * incompatible entries makes the routine idempotent under
 		 * concurrent release races.
 		 */
-		if (!DoLockModesConflict((LOCKMODE) requested_mode, held))
+		if (!DoLockModesConflict((LOCKMODE)requested_mode, held))
 			continue;
 
 		if (holder_node == cluster_node_id) {
@@ -876,17 +872,16 @@ cluster_ges_send_bast_targeted(const struct ClusterResId *resid, int requested_m
 
 			memset(&bast, 0, sizeof(bast));
 			bast.opcode = GES_REQ_OPCODE_BAST;
-			bast.lockmode = (uint32) requested_mode;
-			bast.holder_node_id = (uint32) holders[i].holder.node_id;
+			bast.lockmode = (uint32)requested_mode;
+			bast.holder_node_id = (uint32)holders[i].holder.node_id;
 			bast.holder_procno = holders[i].holder.procno;
-			bast.holder_cluster_epoch_lo
-				= (uint32) (holders[i].holder.cluster_epoch & 0xffffffffu);
-			bast.holder_cluster_epoch_hi = (uint32) (holders[i].holder.cluster_epoch >> 32);
-			bast.holder_request_id_lo = (uint32) (holders[i].holder.request_id & 0xffffffffu);
-			bast.holder_request_id_hi = (uint32) (holders[i].holder.request_id >> 32);
+			bast.holder_cluster_epoch_lo = (uint32)(holders[i].holder.cluster_epoch & 0xffffffffu);
+			bast.holder_cluster_epoch_hi = (uint32)(holders[i].holder.cluster_epoch >> 32);
+			bast.holder_request_id_lo = (uint32)(holders[i].holder.request_id & 0xffffffffu);
+			bast.holder_request_id_hi = (uint32)(holders[i].holder.request_id >> 32);
 			memcpy(bast.resid, resid, sizeof(bast.resid));
 
-			if (cluster_grd_outbound_enqueue_backend_request((uint32) holder_node, &bast,
+			if (cluster_grd_outbound_enqueue_backend_request((uint32)holder_node, &bast,
 															 sizeof(bast)))
 				cluster_grd_inc_bast_sent();
 		}

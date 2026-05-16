@@ -633,8 +633,8 @@ extern ClusterGrdEntryResult cluster_grd_cancel_reservation_by_id(const ClusterR
  */
 typedef struct ClusterGrdConflictHolder {
 	ClusterGrdHolderId holder;
-	int32			   source_node_id; /* hosting node — BAST destination */
-	LOCKMODE		   held_mode;
+	int32 source_node_id; /* hosting node — BAST destination */
+	LOCKMODE held_mode;
 } ClusterGrdConflictHolder;
 
 /*
@@ -644,10 +644,10 @@ typedef struct ClusterGrdConflictHolder {
  */
 typedef struct ClusterGrdWaiterIdentity {
 	ClusterGrdHolderId holder;
-	int32			   source_node_id;
-	uint64			   request_id;
-	uint32			   request_opcode;
-	LOCKMODE		   mode;
+	int32 source_node_id;
+	uint64 request_id;
+	uint32 request_opcode;
+	LOCKMODE mode;
 } ClusterGrdWaiterIdentity;
 
 /*

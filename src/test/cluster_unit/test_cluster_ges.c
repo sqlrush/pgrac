@@ -402,8 +402,7 @@ cluster_grd_entry_enqueue_or_grant(const struct ClusterResId *r pg_attribute_unu
 								   const struct ClusterGrdHolderId *h pg_attribute_unused(),
 								   int32 src pg_attribute_unused(),
 								   uint64 req_id pg_attribute_unused(),
-								   uint32 op pg_attribute_unused(),
-								   int mode pg_attribute_unused(),
+								   uint32 op pg_attribute_unused(), int mode pg_attribute_unused(),
 								   struct ClusterGrdConflictHolder *out pg_attribute_unused(),
 								   int *nout pg_attribute_unused())
 {
@@ -415,8 +414,7 @@ int
 cluster_grd_entry_release_and_pop_compatible_waiter(
 	const struct ClusterResId *r pg_attribute_unused(),
 	const struct ClusterGrdHolderId *h pg_attribute_unused(),
-	struct ClusterGrdWaiterIdentity *out pg_attribute_unused(),
-	int max_out pg_attribute_unused())
+	struct ClusterGrdWaiterIdentity *out pg_attribute_unused(), int max_out pg_attribute_unused())
 {
 	return 0;
 }
@@ -424,7 +422,8 @@ cluster_grd_entry_release_and_pop_compatible_waiter(
 /* GUC + PG runtime stubs. */
 int cluster_ges_request_timeout_ms = 60000;
 
-bool DoLockModesConflict(int a pg_attribute_unused(), int b pg_attribute_unused())
+bool
+DoLockModesConflict(int a pg_attribute_unused(), int b pg_attribute_unused())
 {
 	return false;
 }
