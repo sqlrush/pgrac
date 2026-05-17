@@ -27,9 +27,16 @@
  *	      reaching cap returns FULL fail-closed (caller emits
  *	      GES_REJECT_REASON_WORK_QUEUE_FULL — never evicts in-flight
  *	      entries because eviction would re-introduce double-grant risk).
- *	    - LMS restart causes generation bump → caller's retransmit uses
- *	      old generation, key lookup returns STALE_REPROCESS, handler
- *	      drops the stale entry and processes as new request.
+ *	    - LMS restart causes generation bump → LMS restart sweep
+ *	      (cluster_ges_dedup_drop_stale_entries) removes entries whose
+ *	      shard_master_generation < current LMS generation BEFORE the
+ *	      caller's retransmit arrives.  Caller's retransmit then hits
+ *	      the MISS_REGISTERED path with the fresh generation key.
+ *	      STALE_REPROCESS is sweep-side bookkeeping only — it counts
+ *	      entries swept, and is NEVER returned by
+ *	      cluster_ges_dedup_lookup_or_register (an inline stale check
+ *	      would loop because the caller would re-insert under the same
+ *	      stale key; HC51 in cluster_ges_dedup.c §invalidation-model).
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -74,7 +81,13 @@ typedef enum ClusterGesDedupLookupStatus {
 	CLUSTER_GES_DEDUP_IN_FLIGHT_DUPLICATE = 1,
 	/* Cached reply available; caller MUST resend (idempotent retransmit). */
 	CLUSTER_GES_DEDUP_CACHED_REPLY = 2,
-	/* Entry from prior LMS generation; caller drops + treats as new. */
+	/* Sweep-side bookkeeping only — counts entries removed by
+	 * cluster_ges_dedup_drop_stale_entries (LMS restart) whose
+	 * shard_master_generation < current LMS generation.  **Never returned
+	 * by cluster_ges_dedup_lookup_or_register** (inline stale check would
+	 * create drop-and-reregister loop; HC51 in cluster_ges_dedup.c
+	 * §invalidation-model).  Reserved as enum value 3 for stat surface
+	 * (cluster_ges_dedup_stale_reprocess_count accessor). */
 	CLUSTER_GES_DEDUP_STALE_REPROCESS = 3,
 	/* HTAB at cap; caller MUST fail-closed (REJECT_BUSY) — no eviction. */
 	CLUSTER_GES_DEDUP_FULL = 4

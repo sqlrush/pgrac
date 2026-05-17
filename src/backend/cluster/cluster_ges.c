@@ -534,9 +534,17 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 			return;
 
 		case CLUSTER_GES_DEDUP_STALE_REPROCESS:
-			/* Treated as fresh request by lookup (entry re-registered).  Fall
-			 * through to work_queue enqueue. */
-			break;
+			/* UNREACHABLE — STALE_REPROCESS is sweep-only bookkeeping
+			 * (cluster_ges_dedup_drop_stale_entries counter); never
+			 * returned by cluster_ges_dedup_lookup_or_register.  HC51 in
+			 * cluster_ges_dedup.c §invalidation-model explicitly rejects
+			 * inline stale detection (drop-and-reregister loop).  Stale
+			 * entries are removed by the LMS restart sweep before the
+			 * caller's retransmit arrives, after which the retransmit
+			 * registers a fresh entry (MISS_REGISTERED).  Assert in debug
+			 * to catch enum-misuse regressions. */
+			Assert(false);
+			return;
 
 		case CLUSTER_GES_DEDUP_FULL: {
 			GesReplyPayload reject;
@@ -909,6 +917,7 @@ cluster_ges_send_request_and_wait(const struct ClusterResId *resid, uint32 lockm
 	int max_attempts;
 	bool perpetual;
 	bool warned_starvation;
+	bool debug1_starvation_fired;
 
 	if (resid == NULL || holder == NULL)
 		return GES_REJECT_REASON_TIMEOUT;
@@ -1000,6 +1009,7 @@ cluster_ges_send_request_and_wait(const struct ClusterResId *resid, uint32 lockm
 	attempt = 0;
 	backoff_ms = 100;
 	warned_starvation = false;
+	debug1_starvation_fired = false;
 
 	ConditionVariablePrepareToSleep(&entry->cv);
 	while (!entry->ready) {
@@ -1043,24 +1053,31 @@ cluster_ges_send_request_and_wait(const struct ClusterResId *resid, uint32 lockm
 			return GES_REJECT_REASON_TIMEOUT;
 		}
 
-		/* HC54 priority starvation observability — fire when half the
-		 * retransmit budget is consumed (perpetual mode treats this as a
-		 * one-shot WARNING per acquire cycle; finite mode also bumps the
-		 * counter but bounded by max_attempts).  No wire message — bumps
-		 * a local LMS counter; reserved opcode 11 stays unused (HC54). */
-		if (!warned_starvation && max_attempts > 0 && attempt >= ((max_attempts + 1) / 2)) {
+		/* HC54 priority starvation observability — two one-shot events per
+		 * acquire cycle (spec-2.27 §1 line 222):
+		 *   1/2 threshold:  bump LMS counter + emit DEBUG1 (once).
+		 *   3/4 threshold:  emit WARNING (once;  no counter inc here).
+		 *
+		 *	Independent flags `debug1_starvation_fired` and `warned_starvation`
+		 *	enforce one-shot semantics so a slow-grant cycle bumps the counter
+		 *	exactly once regardless of how many retransmit iterations land in
+		 *	the [1/2, 3/4] window.  No wire message — reserved opcode 11
+		 *	(GES_REQ_OPCODE_PRIORITY_BOOST) stays unused until spec-2.28+ wires
+		 *	the integrated PG-core LockWaitQueueInsertAtHead receiver. */
+		if (!debug1_starvation_fired && max_attempts > 0 && attempt >= ((max_attempts + 1) / 2)) {
 			cluster_lms_inc_priority_starvation_observed();
 			ereport(DEBUG1,
 					(errmsg_internal("cluster_ges_send_request_and_wait priority starvation "
 									 "observed (request_id=" UINT64_FORMAT " dest=%d attempt=%d)",
 									 request_id, master, attempt)));
-			if (max_attempts > 0 && attempt >= ((max_attempts * 3) / 4)) {
-				ereport(WARNING,
-						(errmsg("cluster GES retransmit budget 3/4 consumed; possible starvation"),
-						 errhint("Consider raising cluster.ges_request_timeout_ms or "
-								 "cluster.ges_retransmit_max_attempts, or scaling LMS.")));
-				warned_starvation = true;
-			}
+			debug1_starvation_fired = true;
+		}
+		if (!warned_starvation && max_attempts > 0 && attempt >= ((max_attempts * 3) / 4)) {
+			ereport(WARNING,
+					(errmsg("cluster GES retransmit budget 3/4 consumed; possible starvation"),
+					 errhint("Consider raising cluster.ges_request_timeout_ms or "
+							 "cluster.ges_retransmit_max_attempts, or scaling LMS.")));
+			warned_starvation = true;
 		}
 
 		/* Re-enqueue request — receiver dedup HTAB suppresses double-grant. */
@@ -1150,6 +1167,7 @@ cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 		int attempt = 0;
 		int backoff_ms = 100;
 		bool warned_starvation = false;
+		bool debug1_starvation_fired = false;
 
 		if (perpetual) {
 			effective_timeout_ms = -1;
@@ -1227,14 +1245,25 @@ cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 				return GES_REJECT_REASON_TIMEOUT;
 			}
 
-			if (!warned_starvation && max_attempts > 0 && attempt >= ((max_attempts + 1) / 2)) {
+			/* HC54 priority starvation observability — two one-shot events
+			 * per release cycle (spec-2.27 §1 line 222 + F3 symmetry with
+			 * request path):
+			 *   1/2 threshold:  bump LMS counter + DEBUG1 (once).
+			 *   3/4 threshold:  WARNING (once;  no counter inc here). */
+			if (!debug1_starvation_fired && max_attempts > 0
+				&& attempt >= ((max_attempts + 1) / 2)) {
 				cluster_lms_inc_priority_starvation_observed();
-				if (max_attempts > 0 && attempt >= ((max_attempts * 3) / 4)) {
-					ereport(WARNING, (errmsg("cluster GES release retransmit budget 3/4 consumed"),
-									  errhint("Possible LMS starvation;  raise "
-											  "cluster.ges_request_timeout_ms or scale LMS.")));
-					warned_starvation = true;
-				}
+				ereport(DEBUG1, (errmsg_internal(
+									"cluster_ges_send_release_and_wait priority starvation "
+									"observed (request_id=" UINT64_FORMAT " dest=%d attempt=%d)",
+									request_id, master, attempt)));
+				debug1_starvation_fired = true;
+			}
+			if (!warned_starvation && max_attempts > 0 && attempt >= ((max_attempts * 3) / 4)) {
+				ereport(WARNING, (errmsg("cluster GES release retransmit budget 3/4 consumed"),
+								  errhint("Possible LMS starvation;  raise "
+										  "cluster.ges_request_timeout_ms or scale LMS.")));
+				warned_starvation = true;
 			}
 
 			if (!cluster_grd_outbound_enqueue_backend_request((uint32)master, &req, sizeof(req))) {
