@@ -757,19 +757,19 @@ cluster_init_guc(void)
 							&cluster_ges_deadlock_tick_budget_us, 5000, 500, 50000, PGC_SIGHUP, 0,
 							NULL, NULL, NULL);
 
-	DefineCustomIntVariable("cluster.pcm_grd_max_entries",
-							gettext_noop("Maximum entries in the PCM GRD master shmem region."),
-							gettext_noop("spec-2.30 PCM 9-state machine activation:  -1 (default) = "
-										 "auto-resolve to NBuffers at startup;  0 = explicit disable "
-										 "(preserves spec-1.7 stub:  mutation API ereports 0A000 "
-										 "FEATURE_NOT_SUPPORTED, query returns N);  positive value "
-										 "must cover NBuffers (HC62 fail-closed FATAL on shortfall)."),
-							&cluster_pcm_grd_max_entries, -1, -1, 1048576,
-							PGC_POSTMASTER, /* startup-fixed */
-							0,				/* flags */
-							NULL,			/* check_hook */
-							NULL,			/* assign_hook */
-							NULL);			/* show_hook */
+	DefineCustomIntVariable(
+		"cluster.pcm_grd_max_entries",
+		gettext_noop("Maximum entries in the PCM GRD master shmem region."),
+		gettext_noop("spec-2.30 PCM 9-state machine activation:  -1 (default) = "
+					 "auto-resolve to NBuffers at startup;  0 = explicit disable "
+					 "(preserves spec-1.7 stub:  mutation API ereports 0A000 "
+					 "FEATURE_NOT_SUPPORTED, query returns N);  positive value "
+					 "must cover NBuffers (HC62 fail-closed FATAL on shortfall)."),
+		&cluster_pcm_grd_max_entries, -1, -1, 1048576, PGC_POSTMASTER, /* startup-fixed */
+		0,															   /* flags */
+		NULL,														   /* check_hook */
+		NULL,														   /* assign_hook */
+		NULL);														   /* show_hook */
 
 	/* ----------
 	 * Stage 1.10 (2026-05-03) — postmaster startup phase transition
