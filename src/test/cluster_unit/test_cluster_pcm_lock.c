@@ -104,6 +104,14 @@ static sigjmp_buf ut_ereport_jump;
 static bool ut_ereport_jump_armed = false;
 static int ut_ereport_fired_count = 0;
 
+void
+ExceptionalCondition(const char *conditionName pg_attribute_unused(),
+					 const char *fileName pg_attribute_unused(),
+					 int lineNumber pg_attribute_unused())
+{
+	abort();
+}
+
 static BufferTag
 make_tag(uint32 blockno)
 {
