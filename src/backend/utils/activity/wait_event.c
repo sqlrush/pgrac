@@ -956,6 +956,14 @@ pgstat_get_wait_cluster_pcm(WaitEventCluster w)
 	case WAIT_EVENT_PCM_ITL_CLEANOUT:
 		event_name = "PcmItlCleanout";
 		break;
+	case WAIT_EVENT_PCM_GRD_INIT:
+		/* PGRAC (spec-2.30 D8): GrdEntry HTAB init at postmaster startup. */
+		event_name = "ClusterPcmGrdInit";
+		break;
+	case WAIT_EVENT_PCM_TRANSITION_APPLY:
+		/* PGRAC (spec-2.30 D8): per-entry entry_lock acquire hot path. */
+		event_name = "ClusterPcmTransitionApply";
+		break;
 	default:
 		break;
 	}

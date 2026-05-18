@@ -1,25 +1,17 @@
 /*-------------------------------------------------------------------------
  *
  * cluster_pcm_lock.c
- *	  pgrac cluster PCM (Parallel Cache Management) lock framework
- *	  scaffolding (Stage 1.7 stub implementation).
+ *	  pgrac cluster PCM (Parallel Cache Management) lock state machine.
  *
- *	  All public API functions in this file are Stage 1.7 stubs that
- *	  ereport ERRCODE_FEATURE_NOT_SUPPORTED.  Stage 2.X (#15 PCM
- *	  state machine + #11/#12 GRD master + #17 Cache Fusion) replaces
- *	  the 4 mutation function bodies with the actual 9-transition
- *	  state machine + Convert Queue + master routing protocol.
+ *	  spec-1.7 introduced the C API and shmem scaffolding.  spec-2.30
+ *	  activates the local PCM 9-transition state machine, GrdEntry HTAB,
+ *	  per-entry LWLockPadded protection, PI bitmap bookkeeping, and
+ *	  transition counters.  Buffer manager / GCS wire callers are still
+ *	  intentionally deferred to later Cache Fusion specs.
  *
- *	  The full GrdEntry struct definition lives in this file (private)
- *	  per Q3 user 修订 2026-05-02 opaque struct decision.  Stage 2.X
- *	  spec adds bitmap (s_holders / pi_holders) and convert_queue
- *	  fields without breaking the ABI of any (future) callers.
- *
- *	  Stage 1.7 has NO SQL-callable function (Q8 user 修订 2026-05-02
- *	  strong condition): cluster_pcm_lock_* are C internal only;
- *	  pg_proc.dat is not modified, system_views.sql is not modified,
- *	  no new catalog tuples / system view columns / SQL function
- *	  binding are added.  This keeps catversion = 202605050 (no bump).
+ *	  The full GrdEntry struct definition lives in this file (private) per
+ *	  the opaque-struct decision; callers use only the public helpers in
+ *	  cluster_pcm_lock.h.
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
@@ -44,118 +36,685 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "access/xlogdefs.h"
+#include "cluster/cluster_grd.h" /* PGRAC: spec-2.30 D1 — ClusterGrdHolderId 24B */
+#include "cluster/cluster_guc.h" /* PGRAC: spec-2.30 D3 — cluster_node_id */
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_shmem.h"
 #include "miscadmin.h"
+#include "port/atomics.h" /* PGRAC: spec-2.30 D1 — pg_atomic_uint32/64 */
 #include "storage/buf_internals.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "utils/elog.h"
+#include "utils/hsearch.h"	 /* PGRAC: spec-2.30 D2 — HTAB API */
+#include "pgstat.h"			 /* pgstat_report_wait_start/end */
+#include "utils/timestamp.h" /* PGRAC: spec-2.30 D1 — TimestampTz */
 
 
 /*
  * GUC: cluster.pcm_grd_max_entries
  *
- *	Default 0 (Q4 user 修订): no GRD shmem allocated by default.
- *	Range [0, 1048576] (max ~128 MB at sizeof(GrdEntry) ~128 B).
- *	PGC_POSTMASTER (startup-fixed; must restart to change).
- *
- *	Stage 2.X PCM 真值激活 spec changes default to NBuffers.
+ *	spec-2.30 D5:  default -1 (sentinel for "auto → NBuffers");  0 = explicit
+ *	disable (spec-1.7 stub behavior);  positive = explicit count (HC62
+ *	fail-closed if < NBuffers).  Range [-1, 1048576].  PGC_POSTMASTER.
  */
-int cluster_pcm_grd_max_entries = 0;
+int cluster_pcm_grd_max_entries = -1;
 
 
 /*
- * GrdEntry -- per-block global lock state (master node).
+ * PGRAC: spec-2.30 D5 + HC62 — resolve effective entry count from GUC value.
  *
- *	Private struct definition (Q3 user 修订 2026-05-02 opaque struct).
- *	Stage 1.7 ships only the count fields + tag + SCN/LSN + per-entry
- *	protect lock; Stage 2.X spec adds bitmap (s_holders / pi_holders)
- *	and convert_queue fields here.
+ *	Returns:
+ *	  0          — disabled (cluster_pcm_grd_max_entries == 0)
+ *	  positive   — resolved count to use for HTAB / accessor / mutation
+ *
+ *	Fail-closed paths (ereport FATAL) raised only when fatal_on_misconfig
+ *	is true (i.e. from init_fn after shmem reservation is fixed).  When
+ *	called from shmem_size (fatal_on_misconfig=false), invalid configs
+ *	return a plausible upper-bound to avoid under-reservation.
+ */
+static int
+pcm_grd_effective_entries(bool fatal_on_misconfig)
+{
+	int guc = cluster_pcm_grd_max_entries;
+
+	if (guc == 0)
+		return 0; /* explicit disable */
+
+	if (guc == -1) {
+		/* auto: resolve to NBuffers with HC62 checks */
+		if (NBuffers <= 0) {
+			if (fatal_on_misconfig)
+				ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+								errmsg("shared_buffers required for PCM activation"),
+								errhint("Set shared_buffers > 0 or "
+										"cluster.pcm_grd_max_entries=0 to disable.")));
+			return 0;
+		}
+		if (NBuffers > 1048576) {
+			if (fatal_on_misconfig)
+				ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+								errmsg("PCM GRD requires more than 1048576 entries "
+									   "(NBuffers=%d)",
+									   NBuffers),
+								errhint("Set cluster.pcm_grd_max_entries=0 to disable, "
+										"or reduce shared_buffers.")));
+			return 1048576;
+		}
+		return NBuffers;
+	}
+
+	/* explicit positive */
+	if (NBuffers > 0 && guc < NBuffers) {
+		if (fatal_on_misconfig)
+			ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("PCM GRD entries (%d) must cover NBuffers (%d)", guc, NBuffers),
+							errhint("Raise cluster.pcm_grd_max_entries to at least "
+									"NBuffers, or set to 0 to disable.")));
+		/* shmem_size path: return upper bound to avoid under-reservation */
+		return NBuffers;
+	}
+	return guc;
+}
+
+
+/*
+ * PGRAC: spec-2.30 D1 — file-private forward decl for ConvertQueue.
+ *
+ *	Convert queue node lifecycle / linked-list mutation is NOT in scope
+ *	for spec-2.30 (本 spec: 状态机 + GrdEntry shmem layout 真激活;wire
+ *	convert queue 推 spec-2.32 GCS req).  Forward decl 仅供 GrdEntry struct
+ *	field type 引用;runtime 始终 NULL until future spec wires.
+ */
+typedef struct PcmConvertQueue PcmConvertQueue;
+
+
+/*
+ * PGRAC: spec-2.30 D1 — GrdEntry full struct definition (file-private).
+ *
+ *	Header keeps `typedef struct GrdEntry GrdEntry;` opaque (spec-1.7 Q3
+ *	user-locked).  Callers/tests MUST go through accessor APIs; direct
+ *	deref of `GrdEntry *` is forbidden.
+ *
+ *	Layout (216B; PG-fact 修订 from spec-2.30 §2.1 nominal 208B):
+ *	  [  0,  20) BufferTag       tag                        (PG-native; 20B)
+ *	  [ 20,  24) pg_atomic_uint32 master_state              (PcmState N/S/X)
+ *	  [ 24,  28) int32           x_holder_node              (-1 = no X holder)
+ *	  [ 28,  32) pg_atomic_uint32 s_holders_bitmap          (per-node S bit)
+ *	  [ 32,  36) pg_atomic_uint32 pi_holders_bitmap         (per-node PI bit)
+ *	  [ 36,  40) uint32          _pad1                      (compiler-inserted; explicit for clarity)
+ *	  [ 40,  48) PcmConvertQueue *convert_queue             (NULL until spec-2.32)
+ *	  [ 48,  56) TimestampTz     last_transition_at         (GetCurrentTimestamp() on each transition)
+ *	  [ 56,  64) pg_atomic_uint64 transition_count_local    (per-entry monotone)
+ *	  [ 64,  88) ClusterGrdHolderId master_holder           (24B 4-tuple identity)
+ *	  [ 88, 216) LWLockPadded    entry_lock                 (PG_CACHE_LINE_SIZE=128B)
+ *
+ *	PGRAC: spec-2.30 §2.1 nominal 208B was based on BufferTag=16B
+ *	assumption;  PG 16.13 实证 sizeof(BufferTag) == 20B (per
+ *	test_cluster_buffer_desc.c:14 PIVOT B note + struct buftag in
+ *	buf_internals.h:138).  Actual 216B → flag for spec-2.30 Hardening
+ *	v1.0.1 appendix amend (Step 8 ship-level closeout).
+ *
+ *	HC57 — transition mutation must hold entry_lock EXCLUSIVE;
+ *	master_state read 路径 atomic uint32 read 无锁;atomic bitmap
+ *	primitives 保留 (HC58) 为 future read-mostly fast path 预留 (本 spec
+ *	所有 transition mutation 仍在 entry_lock 内 update).
  */
 struct GrdEntry {
-	BufferTag tag;			/* block identity */
-	uint16 x_holder;		/* INVALID_NODE_ID at stage 1.7 */
-	uint16 s_holder_count;	/* 0 at stage 1.7 (bitmap deferred to Stage 2) */
-	uint16 pi_holder_count; /* 0 at stage 1.7 */
-	uint16 reserved_1;		/* alignment padding */
-	SCN latest_block_scn;	/* InvalidScn */
-	XLogRecPtr latest_lsn;	/* InvalidXLogRecPtr */
-	LWLock protect;			/* per-entry; never acquired at stage 1.7 */
-							/*
-	 * Stage 2.X future fields:
-	 *   NodeIdSet s_holders;  -- 16-bit bitmap (16 nodes max per AD-012)
-	 *   NodeIdSet pi_holders; -- 16-bit bitmap
-	 *   ConvertQueue convert_queue;  -- LWLock-protected linked list
-	 */
+	BufferTag tag;							 /* 20B [  0,  20) */
+	pg_atomic_uint32 master_state;			 /*  4B [ 20,  24) PcmState atomic */
+	int32 x_holder_node;					 /*  4B [ 24,  28) -1 = no X holder */
+	pg_atomic_uint32 s_holders_bitmap;		 /*  4B [ 28,  32) per-node S bit */
+	pg_atomic_uint32 pi_holders_bitmap;		 /*  4B [ 32,  36) per-node PI bit */
+	uint32 _pad1;							 /*  4B [ 36,  40) 8B align _pad */
+	PcmConvertQueue *convert_queue;			 /*  8B [ 40,  48) NULL until spec-2.32 */
+	TimestampTz last_transition_at;			 /*  8B [ 48,  56) */
+	pg_atomic_uint64 transition_count_local; /*  8B [ 56,  64) per-entry monotone */
+	ClusterGrdHolderId master_holder;		 /* 24B [ 64,  88) 4-tuple identity */
+	LWLockPadded entry_lock;				 /*128B [ 88, 216) PG_CACHE_LINE_SIZE */
 };
 
+StaticAssertDecl(sizeof(struct GrdEntry) == 216,
+				 "spec-2.30 D1 GrdEntry ABI 216-byte lock (BufferTag=20B PG 16.13 + "
+				 "atomic fields + LWLockPadded 128B);  spec §2.1 nominal 208B from "
+				 "BufferTag=16B assumption — flag Hardening v1.0.1 F1 spec amend");
 
-/* Module-level shmem pointer to the GrdEntry array (set in init_fn). */
-static struct GrdEntry *GrdEntries = NULL;
+
+/*
+ * PGRAC: spec-2.30 D2 — shmem header for module-wide atomic counters.
+ *
+ *	The 9 transition counters must be visible to every backend (not
+ *	process-local) so dump_pcm / accessor SQL surface returns
+ *	cluster-wide values, not per-process zero readings.  Lives in the
+ *	'pgrac cluster pcm grd' shmem region as a header prefix before the
+ *	GrdEntry array.
+ *
+ *	The embedded HTAB LWLock serializes dynahash lookups/inserts/iteration.
+ *	Per-entry locks protect entry-local state after a stable pointer has been
+ *	obtained; they do not make concurrent HASH_ENTER_NULL safe by themselves.
+ */
+typedef struct ClusterPcmShared {
+	LWLockPadded htab_lock;
+	pg_atomic_uint64 trans_n_to_s_count;
+	pg_atomic_uint64 trans_n_to_x_count;
+	pg_atomic_uint64 trans_s_to_x_upgrade_count;
+	pg_atomic_uint64 trans_x_to_s_downgrade_count;
+	pg_atomic_uint64 trans_x_to_n_downgrade_count;
+	pg_atomic_uint64 trans_x_to_n_release_count;
+	pg_atomic_uint64 trans_s_to_n_invalidate_count;
+	pg_atomic_uint64 trans_s_to_n_release_count;
+	pg_atomic_uint64 trans_s_to_x_cleanout_count; /* HC60 永 0 in spec-2.30 */
+} ClusterPcmShared;
+
+StaticAssertDecl(sizeof(ClusterPcmShared) >= sizeof(LWLockPadded) + 72,
+				 "spec-2.30 D2 ClusterPcmShared carries htab lock plus 9 counters");
+
+/*
+ * Module-level shmem pointers (set in init_fn).
+ *
+ *	ClusterPcm        — header(9 atomic counters)+ lock-free read by accessors
+ *	cluster_pcm_htab  — HTAB keyed by BufferTag(20B);  HC59 lazy-alloc entries
+ *	                    on first cluster_pcm_lock_acquire(tag, mode);  entries
+ *	                    never freed until cluster shutdown.
+ */
+static ClusterPcmShared *ClusterPcm = NULL;
+static HTAB *cluster_pcm_htab = NULL;
+/*
+ * Resolved (post-HC62) entry count used by HTAB cap + accessor + errmsg.
+ *	Set in cluster_pcm_grd_init from pcm_grd_effective_entries(true) ;
+ *	0 means disabled.  Reading the raw GUC `cluster_pcm_grd_max_entries`
+ *	is fine for show / dump_pcm but NOT for sizing logic (which must use
+ *	the resolved value post HC62 fail-closed checks).
+ */
+static int pcm_grd_effective = 0;
+
+
+/* Forward decl — file-private HTAB lazy-alloc helper defined below init_fn. */
+static struct GrdEntry *pcm_get_or_create_entry(BufferTag tag);
+static struct GrdEntry *pcm_find_entry(BufferTag tag);
+static void pcm_entry_lock_exclusive(struct GrdEntry *entry);
+static uint32 pcm_holder_bit(int holder_node_id);
 
 
 /* ============================================================
- * Stub mutation API -- 4 ereport functions (Q1 精确 errmsg 文本).
+ * PGRAC: spec-2.30 D2 — transition validator + apply.
  *
- *	All 4 stubs share identical errmsg / errhint per Q1 user 修订
- *	2026-05-02 to avoid per-function variation.  Inject points are
- *	wired at function entry; arm a fault to override the default
- *	ereport(0A000) main path with the framework-injected behavior.
+ *	cluster_pcm_transition_legal(from, to, trans):  returns true iff
+ *	  (from, to, trans) combination matches AD-002 9-transition map.
+ *	  HC56 caller invokes before apply;  illegal combination MUST
+ *	  ereport(ERROR, ERRCODE_DATA_CORRUPTED) at caller side.
+ *
+ *	cluster_pcm_transition_apply(entry, trans, holder_node_id):
+ *	  caller MUST hold entry->entry_lock EXCLUSIVE (HC57 enforced via
+ *	  Assert(LWLockHeldByMeInMode));  applies transition body (master_state
+ *	  CAS + holder bitmap mutation);  bumps
+ *	  per-entry transition_count_local + module-level transition counter.
+ *	  Trans-9 fail-closed ereport (HC60).
+ * ============================================================ */
+bool
+cluster_pcm_transition_legal(PcmState from, PcmState to, PcmLockTransition trans)
+{
+	/*
+	 * Switch on trans, verify (from, to) matches AD-002 map.
+	 *
+	 *	1 N→S  / 2 N→X  / 3 S→X(upgrade)  / 4 X→S(downgrade)  / 5 X→N(downgrade)
+	 *	6 X→N(release)  / 7 S→N(invalidate)  / 8 S→N(release)  / 9 S→X(cleanout)
+	 */
+	switch (trans) {
+	case PCM_TRANS_N_TO_S:
+		return from == PCM_STATE_N && to == PCM_STATE_S;
+	case PCM_TRANS_N_TO_X:
+		return from == PCM_STATE_N && to == PCM_STATE_X;
+	case PCM_TRANS_S_TO_X_UPGRADE:
+		return from == PCM_STATE_S && to == PCM_STATE_X;
+	case PCM_TRANS_X_TO_S_DOWNGRADE:
+		return from == PCM_STATE_X && to == PCM_STATE_S;
+	case PCM_TRANS_X_TO_N_DOWNGRADE:
+		return from == PCM_STATE_X && to == PCM_STATE_N;
+	case PCM_TRANS_X_TO_N_RELEASE:
+		return from == PCM_STATE_X && to == PCM_STATE_N;
+	case PCM_TRANS_S_TO_N_INVALIDATE:
+		return from == PCM_STATE_S && to == PCM_STATE_N;
+	case PCM_TRANS_S_TO_N_RELEASE:
+		return from == PCM_STATE_S && to == PCM_STATE_N;
+	case PCM_TRANS_S_TO_X_CLEANOUT:
+		/*
+			 * HC60 reachable-from-validator:  validator accepts as legal entry
+			 * transition to keep enum complete;  apply body fail-closed.
+			 */
+		return from == PCM_STATE_S && to == PCM_STATE_X;
+	}
+	return false; /* unknown trans value */
+}
+
+
+void
+cluster_pcm_transition_apply(struct GrdEntry *entry, PcmLockTransition trans, int holder_node_id)
+{
+	uint32 holder_bit;
+
+	Assert(entry != NULL);
+	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
+	Assert(holder_node_id >= 0 && holder_node_id < 32);
+
+	holder_bit = (uint32)1u << (uint32)holder_node_id;
+
+	switch (trans) {
+	case PCM_TRANS_N_TO_S:
+		pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_S);
+		pg_atomic_fetch_or_u32(&entry->s_holders_bitmap, holder_bit);
+		pg_atomic_fetch_add_u64(&ClusterPcm->trans_n_to_s_count, 1);
+		break;
+	case PCM_TRANS_N_TO_X:
+		pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_X);
+		entry->x_holder_node = holder_node_id;
+		pg_atomic_fetch_add_u64(&ClusterPcm->trans_n_to_x_count, 1);
+		break;
+	case PCM_TRANS_S_TO_X_UPGRADE:
+		pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_X);
+		pg_atomic_fetch_and_u32(&entry->s_holders_bitmap, ~holder_bit);
+		entry->x_holder_node = holder_node_id;
+		pg_atomic_fetch_add_u64(&ClusterPcm->trans_s_to_x_upgrade_count, 1);
+		break;
+	case PCM_TRANS_X_TO_S_DOWNGRADE:
+		pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_S);
+		pg_atomic_fetch_or_u32(&entry->s_holders_bitmap, holder_bit);
+		pg_atomic_fetch_or_u32(&entry->pi_holders_bitmap, holder_bit); /* HC58 PI set */
+		entry->x_holder_node = -1;
+		pg_atomic_fetch_add_u64(&ClusterPcm->trans_x_to_s_downgrade_count, 1);
+		break;
+	case PCM_TRANS_X_TO_N_DOWNGRADE:
+		pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_N);
+		pg_atomic_fetch_or_u32(&entry->pi_holders_bitmap, holder_bit); /* HC58 PI set */
+		entry->x_holder_node = -1;
+		pg_atomic_fetch_add_u64(&ClusterPcm->trans_x_to_n_downgrade_count, 1);
+		break;
+	case PCM_TRANS_X_TO_N_RELEASE:
+		pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_N);
+		entry->x_holder_node = -1;
+		pg_atomic_fetch_add_u64(&ClusterPcm->trans_x_to_n_release_count, 1);
+		break;
+	case PCM_TRANS_S_TO_N_INVALIDATE:
+		pg_atomic_fetch_and_u32(&entry->s_holders_bitmap, ~holder_bit);
+		/* If no S holders remain after this clear, advance to N. */
+		if (pg_atomic_read_u32(&entry->s_holders_bitmap) == 0)
+			pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_N);
+		pg_atomic_fetch_add_u64(&ClusterPcm->trans_s_to_n_invalidate_count, 1);
+		break;
+	case PCM_TRANS_S_TO_N_RELEASE:
+		pg_atomic_fetch_and_u32(&entry->s_holders_bitmap, ~holder_bit);
+		if (pg_atomic_read_u32(&entry->s_holders_bitmap) == 0)
+			pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_N);
+		pg_atomic_fetch_add_u64(&ClusterPcm->trans_s_to_n_release_count, 1);
+		break;
+	case PCM_TRANS_S_TO_X_CLEANOUT:
+		/*
+			 * HC60 apply-fail-closed:  Trans-9 ITL cleanout body wired in
+			 * Stage 3 AD-006 第五轮 (~27000 LOC).  Counter intentionally
+			 * NOT bumped (cluster_pcm_get_trans_s_to_x_cleanout_count() 永 0
+			 * until Stage 3).
+			 */
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("PCM transition S→X cleanout is not implemented in spec-2.30"),
+						errhint("ITL cleanout (Trans-9) wires in Stage 3 AD-006 第五轮 "
+								"(spec-2.36+);  do not invoke this transition.")));
+		break;
+	}
+
+	entry->last_transition_at = GetCurrentTimestamp();
+	pg_atomic_fetch_add_u64(&entry->transition_count_local, 1);
+}
+
+
+static uint32
+pcm_holder_bit(int holder_node_id)
+{
+	Assert(holder_node_id >= 0 && holder_node_id < 32);
+	return (uint32)1u << (uint32)holder_node_id;
+}
+
+
+static void
+pcm_entry_lock_exclusive(struct GrdEntry *entry)
+{
+	pgstat_report_wait_start(WAIT_EVENT_PCM_TRANSITION_APPLY);
+	LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+	pgstat_report_wait_end();
+}
+
+
+/* ============================================================
+ * PGRAC: spec-2.30 D2 — 9 counter accessors (read-only observability).
+ * ============================================================ */
+uint64
+cluster_pcm_get_trans_n_to_s_count(void)
+{
+	return ClusterPcm != NULL ? pg_atomic_read_u64(&ClusterPcm->trans_n_to_s_count) : 0;
+}
+
+uint64
+cluster_pcm_get_trans_n_to_x_count(void)
+{
+	return ClusterPcm != NULL ? pg_atomic_read_u64(&ClusterPcm->trans_n_to_x_count) : 0;
+}
+
+uint64
+cluster_pcm_get_trans_s_to_x_upgrade_count(void)
+{
+	return ClusterPcm != NULL ? pg_atomic_read_u64(&ClusterPcm->trans_s_to_x_upgrade_count) : 0;
+}
+
+uint64
+cluster_pcm_get_trans_x_to_s_downgrade_count(void)
+{
+	return ClusterPcm != NULL ? pg_atomic_read_u64(&ClusterPcm->trans_x_to_s_downgrade_count) : 0;
+}
+
+uint64
+cluster_pcm_get_trans_x_to_n_downgrade_count(void)
+{
+	return ClusterPcm != NULL ? pg_atomic_read_u64(&ClusterPcm->trans_x_to_n_downgrade_count) : 0;
+}
+
+uint64
+cluster_pcm_get_trans_x_to_n_release_count(void)
+{
+	return ClusterPcm != NULL ? pg_atomic_read_u64(&ClusterPcm->trans_x_to_n_release_count) : 0;
+}
+
+uint64
+cluster_pcm_get_trans_s_to_n_invalidate_count(void)
+{
+	return ClusterPcm != NULL ? pg_atomic_read_u64(&ClusterPcm->trans_s_to_n_invalidate_count) : 0;
+}
+
+uint64
+cluster_pcm_get_trans_s_to_n_release_count(void)
+{
+	return ClusterPcm != NULL ? pg_atomic_read_u64(&ClusterPcm->trans_s_to_n_release_count) : 0;
+}
+
+uint64
+cluster_pcm_get_trans_s_to_x_cleanout_count(void)
+{
+	/* HC60 永 0 until Stage 3 AD-006 第五轮 wires Trans-9 body. */
+	return ClusterPcm != NULL ? pg_atomic_read_u64(&ClusterPcm->trans_s_to_x_cleanout_count) : 0;
+}
+
+
+/* ============================================================
+ * PGRAC: spec-2.30 D2 (Step 3) — 4 mutation API真激活.
+ *
+ *	HC56 transition validator gate + HC57 LWLock EXCLUSIVE held + HC58
+ *	bitmap mutation in lock + HC60 Trans-9 unreachable from acquire path.
+ *
+ *	disable-path:  cluster.pcm_grd_max_entries=0 → cluster_pcm_htab == NULL
+ *	→ preserve spec-1.7 stub behavior (ereport ERRCODE_FEATURE_NOT_SUPPORTED).
+ *
+ *	HC56 illegal transition path:  validator returns false → ereport(ERROR,
+ *	ERRCODE_DATA_CORRUPTED) — caller bug or GRD state corruption.
+ *
+ *	HC59 fail-closed cap path:  pcm_get_or_create_entry returns NULL when
+ *	HTAB FULL → ereport(ERROR, ERRCODE_OUT_OF_MEMORY).
  * ============================================================ */
 
-#define PCM_STUB_NOT_IMPLEMENTED                                                                   \
+#define PCM_STUB_DISABLED_PATH                                                                     \
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),                                        \
-					errmsg("PCM lock manager is not implemented in Stage 1.7 stub"),               \
-					errhint("Stage 1.7 exposes API and shmem scaffolding only; "                   \
-							"PCM lock transitions land in Stage 2.")))
+					errmsg("PCM lock manager disabled (cluster.pcm_grd_max_entries=0)"),           \
+					errhint("Set cluster.pcm_grd_max_entries to NBuffers and restart to "          \
+							"activate the spec-2.30 PCM state machine.")))
 
 
 void
 cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode)
 {
-	(void)tag;
-	(void)mode;
+	struct GrdEntry *entry;
+	PcmState cur;
+	PcmLockTransition trans;
+	int holder_node;
+
 	CLUSTER_INJECTION_POINT("cluster-pcm-acquire-entry");
-	PCM_STUB_NOT_IMPLEMENTED;
+
+	if (cluster_pcm_htab == NULL)
+		PCM_STUB_DISABLED_PATH;
+
+	if (mode != PCM_LOCK_MODE_S && mode != PCM_LOCK_MODE_X)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("cluster_pcm_lock_acquire: invalid mode %d (must be S=1 or X=2)",
+							   (int)mode)));
+
+	holder_node = cluster_node_id;
+	if (holder_node < 0 || holder_node >= 32)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("cluster_pcm_lock_acquire: cluster_node_id=%d out of [0, 32) range",
+							   holder_node)));
+
+	entry = pcm_get_or_create_entry(tag);
+	if (entry == NULL)
+		ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY),
+						errmsg("cluster_pcm_lock_acquire: PCM GRD HTAB FULL (cap=%d)",
+							   pcm_grd_effective)));
+
+	pcm_entry_lock_exclusive(entry);
+
+	cur = (PcmState)pg_atomic_read_u32(&entry->master_state);
+
+	/* Determine target transition.  S-mode admits multiple holders. */
+	if (cur == PCM_STATE_N && mode == PCM_LOCK_MODE_S)
+		trans = PCM_TRANS_N_TO_S;
+	else if (cur == PCM_STATE_N && mode == PCM_LOCK_MODE_X)
+		trans = PCM_TRANS_N_TO_X;
+	else if (cur == PCM_STATE_S && mode == PCM_LOCK_MODE_S) {
+		pg_atomic_fetch_or_u32(&entry->s_holders_bitmap, pcm_holder_bit(holder_node));
+		LWLockRelease(&entry->entry_lock.lock);
+		return;
+	} else {
+		LWLockRelease(&entry->entry_lock.lock);
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("cluster_pcm_lock_acquire: illegal acquire from state %d to mode %d",
+							   (int)cur, (int)mode),
+						errhint("Use cluster_pcm_lock_upgrade() for S→X;  current lock must be "
+								"released before re-acquire.")));
+	}
+
+	if (!cluster_pcm_transition_legal(cur, (PcmState)mode, trans)) {
+		LWLockRelease(&entry->entry_lock.lock);
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("cluster_pcm_lock_acquire: HC56 validator rejected transition "
+							   "(from=%d to=%d trans=%d)",
+							   (int)cur, (int)mode, (int)trans)));
+	}
+
+	cluster_pcm_transition_apply(entry, trans, holder_node);
+
+	LWLockRelease(&entry->entry_lock.lock);
 }
 
 
 void
 cluster_pcm_lock_release(BufferTag tag)
 {
-	/*
-	 * release-PRE not release-POST per Q6 user 修订 2026-05-02:
-	 * stage 1.7 stub never reaches a 'post' point because it ereports
-	 * immediately; naming the inject point 'release-pre' is honest.
-	 * Stage 2.X真值激活 keeps the inject point at release entry which
-	 * remains semantically correct (still pre-state-machine work).
-	 */
-	(void)tag;
+	struct GrdEntry *entry;
+	PcmState cur;
+	PcmLockTransition trans;
+	int holder_node;
+
 	CLUSTER_INJECTION_POINT("cluster-pcm-release-pre");
-	PCM_STUB_NOT_IMPLEMENTED;
+
+	if (cluster_pcm_htab == NULL)
+		PCM_STUB_DISABLED_PATH;
+
+	holder_node = cluster_node_id;
+	if (holder_node < 0 || holder_node >= 32)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("cluster_pcm_lock_release: cluster_node_id=%d out of [0, 32) range",
+							   holder_node)));
+
+	entry = pcm_find_entry(tag);
+	if (entry == NULL)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("cluster_pcm_lock_release: no PCM entry for BufferTag (released "
+							   "without prior acquire?)")));
+
+	pcm_entry_lock_exclusive(entry);
+
+	cur = (PcmState)pg_atomic_read_u32(&entry->master_state);
+
+	/* Release maps to trans 6 (X→N release) or trans 8 (S→N release). */
+	if (cur == PCM_STATE_X) {
+		if (entry->x_holder_node != holder_node) {
+			LWLockRelease(&entry->entry_lock.lock);
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("cluster_pcm_lock_release: node %d cannot release X held by node %d",
+							holder_node, entry->x_holder_node)));
+		}
+		trans = PCM_TRANS_X_TO_N_RELEASE;
+		cluster_pcm_transition_apply(entry, trans, holder_node);
+	} else if (cur == PCM_STATE_S) {
+		if ((pg_atomic_read_u32(&entry->s_holders_bitmap) & pcm_holder_bit(holder_node)) == 0) {
+			LWLockRelease(&entry->entry_lock.lock);
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("cluster_pcm_lock_release: node %d is not an S holder", holder_node)));
+		}
+		trans = PCM_TRANS_S_TO_N_RELEASE;
+		cluster_pcm_transition_apply(entry, trans, holder_node);
+	} else {
+		LWLockRelease(&entry->entry_lock.lock);
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("cluster_pcm_lock_release: nothing held (state=%d)", (int)cur)));
+	}
+
+	LWLockRelease(&entry->entry_lock.lock);
 }
 
 
 void
 cluster_pcm_lock_upgrade(BufferTag tag)
 {
-	(void)tag;
+	struct GrdEntry *entry;
+	PcmState cur;
+	int holder_node;
+
 	CLUSTER_INJECTION_POINT("cluster-pcm-convert-pre");
-	PCM_STUB_NOT_IMPLEMENTED;
+
+	if (cluster_pcm_htab == NULL)
+		PCM_STUB_DISABLED_PATH;
+
+	holder_node = cluster_node_id;
+	if (holder_node < 0 || holder_node >= 32)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("cluster_pcm_lock_upgrade: cluster_node_id=%d out of [0, 32) range",
+							   holder_node)));
+
+	entry = pcm_find_entry(tag);
+	if (entry == NULL)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("cluster_pcm_lock_upgrade: no PCM entry for BufferTag (must "
+							   "acquire S first)")));
+
+	pcm_entry_lock_exclusive(entry);
+
+	cur = (PcmState)pg_atomic_read_u32(&entry->master_state);
+	if (cur != PCM_STATE_S) {
+		LWLockRelease(&entry->entry_lock.lock);
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("cluster_pcm_lock_upgrade: state=%d (must be S to upgrade)", (int)cur)));
+	}
+	if ((pg_atomic_read_u32(&entry->s_holders_bitmap) & pcm_holder_bit(holder_node)) == 0) {
+		LWLockRelease(&entry->entry_lock.lock);
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("cluster_pcm_lock_upgrade: node %d is not an S holder", holder_node)));
+	}
+	if ((pg_atomic_read_u32(&entry->s_holders_bitmap) & ~pcm_holder_bit(holder_node)) != 0) {
+		LWLockRelease(&entry->entry_lock.lock);
+		ereport(ERROR, (errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+						errmsg("cluster_pcm_lock_upgrade: other S holders still present")));
+	}
+
+	cluster_pcm_transition_apply(entry, PCM_TRANS_S_TO_X_UPGRADE, holder_node);
+
+	LWLockRelease(&entry->entry_lock.lock);
 }
 
 
 void
 cluster_pcm_lock_downgrade(BufferTag tag, PcmLockMode target_mode, bool keep_pi)
 {
-	(void)tag;
-	(void)target_mode;
-	(void)keep_pi;
+	struct GrdEntry *entry;
+	PcmState cur;
+	PcmLockTransition trans;
+	int holder_node;
+
 	CLUSTER_INJECTION_POINT("cluster-pcm-downgrade-pre");
-	PCM_STUB_NOT_IMPLEMENTED;
+
+	if (cluster_pcm_htab == NULL)
+		PCM_STUB_DISABLED_PATH;
+
+	holder_node = cluster_node_id;
+	if (holder_node < 0 || holder_node >= 32)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("cluster_pcm_lock_downgrade: cluster_node_id=%d out of [0, 32) range",
+						holder_node)));
+
+	entry = pcm_find_entry(tag);
+	if (entry == NULL)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("cluster_pcm_lock_downgrade: no PCM entry for BufferTag (must "
+							   "acquire X first)")));
+
+	pcm_entry_lock_exclusive(entry);
+
+	cur = (PcmState)pg_atomic_read_u32(&entry->master_state);
+	if (cur != PCM_STATE_X) {
+		LWLockRelease(&entry->entry_lock.lock);
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("cluster_pcm_lock_downgrade: state=%d (must be X to downgrade)",
+							   (int)cur)));
+	}
+	if (entry->x_holder_node != holder_node) {
+		LWLockRelease(&entry->entry_lock.lock);
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("cluster_pcm_lock_downgrade: node %d cannot downgrade X held by node %d",
+						holder_node, entry->x_holder_node)));
+	}
+
+	/*
+	 * Downgrade transitions:
+	 *  X→S with PI    → trans 4 (PCM_TRANS_X_TO_S_DOWNGRADE)
+	 *  X→N with PI    → trans 5 (PCM_TRANS_X_TO_N_DOWNGRADE)
+	 *  X→N without PI → trans 6 (PCM_TRANS_X_TO_N_RELEASE)
+	 *  X→S without PI is illegal (downgrade always leaves PI per AD-002)
+	 */
+	if (target_mode == PCM_LOCK_MODE_S && keep_pi)
+		trans = PCM_TRANS_X_TO_S_DOWNGRADE;
+	else if (target_mode == PCM_LOCK_MODE_N && keep_pi)
+		trans = PCM_TRANS_X_TO_N_DOWNGRADE;
+	else if (target_mode == PCM_LOCK_MODE_N && !keep_pi)
+		trans = PCM_TRANS_X_TO_N_RELEASE;
+	else {
+		LWLockRelease(&entry->entry_lock.lock);
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("cluster_pcm_lock_downgrade: illegal target_mode=%d keep_pi=%d",
+							   (int)target_mode, keep_pi)));
+	}
+
+	if (!cluster_pcm_transition_legal(cur, (PcmState)target_mode, trans)) {
+		LWLockRelease(&entry->entry_lock.lock);
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("cluster_pcm_lock_downgrade: HC56 validator rejected transition")));
+	}
+
+	cluster_pcm_transition_apply(entry, trans, holder_node);
+
+	LWLockRelease(&entry->entry_lock.lock);
 }
 
 
@@ -166,26 +725,116 @@ cluster_pcm_lock_downgrade(BufferTag tag, PcmLockMode target_mode, bool keep_pi)
 PcmLockMode
 cluster_pcm_lock_query(BufferTag tag)
 {
-	(void)tag;
-	/* Stage 1.7: no PCM lock held anywhere; always return N. */
-	return PCM_LOCK_MODE_N;
+	struct GrdEntry *entry;
+	PcmState state;
+
+	/*
+	 * spec-2.30 D7 — real HTAB lookup.  No PCM lock + no entry → N.
+	 *
+	 *	disable-path (cluster_pcm_htab == NULL):  also returns N (consistent
+	 *	with spec-1.7 stub behavior so callers expecting query to never
+	 *	throw under disabled config still see N).
+	 *
+	 *	Lock-free read:  master_state is atomic uint32;  read without
+	 *	entry_lock is safe (HC57 mutation always within entry_lock + atomic
+	 *	store, so reader sees consistent value).
+	 */
+	if (cluster_pcm_htab == NULL)
+		return PCM_LOCK_MODE_N;
+
+	entry = pcm_find_entry(tag);
+	if (entry == NULL)
+		return PCM_LOCK_MODE_N;
+
+	state = (PcmState)pg_atomic_read_u32(&entry->master_state);
+	return (PcmLockMode)state;
 }
 
 
 int
 cluster_pcm_grd_count(void)
 {
-	/* Stage 1.7: no entries populated regardless of GUC value. */
-	return 0;
+	int count;
+
+	/*
+	 * spec-2.30 D7 — actual entry count from HTAB.
+	 *
+	 *	hash_get_num_entries returns the current number of entries in the
+	 *	HTAB.  disable-path returns 0 (htab is NULL).
+	 */
+	if (cluster_pcm_htab == NULL)
+		return 0;
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+	count = (int)hash_get_num_entries(cluster_pcm_htab);
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+	return count;
+}
+
+
+void
+cluster_pcm_grd_get_summary(int *n_count, int *s_count, int *x_count, int *pi_holders_total,
+							int *convert_queue_active)
+{
+	HASH_SEQ_STATUS status;
+	struct GrdEntry *entry;
+
+	*n_count = 0;
+	*s_count = 0;
+	*x_count = 0;
+	*pi_holders_total = 0;
+	*convert_queue_active = 0;
+
+	if (ClusterPcm == NULL || cluster_pcm_htab == NULL)
+		return;
+
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+	hash_seq_init(&status, cluster_pcm_htab);
+	while ((entry = (struct GrdEntry *)hash_seq_search(&status)) != NULL) {
+		uint32 pi_bitmap = pg_atomic_read_u32(&entry->pi_holders_bitmap);
+		PcmState state = (PcmState)pg_atomic_read_u32(&entry->master_state);
+
+		switch (state) {
+		case PCM_STATE_N:
+			(*n_count)++;
+			break;
+		case PCM_STATE_S:
+			(*s_count)++;
+			break;
+		case PCM_STATE_X:
+			(*x_count)++;
+			break;
+		default:
+			break;
+		}
+		while (pi_bitmap != 0) {
+			*pi_holders_total += (int)(pi_bitmap & 1U);
+			pi_bitmap >>= 1;
+		}
+		if (entry->convert_queue != NULL)
+			(*convert_queue_active)++;
+	}
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
 }
 
 
 Size
 cluster_pcm_grd_shmem_size(void)
 {
-	if (cluster_pcm_grd_max_entries == 0)
+	int eff;
+	Size sz;
+
+	/* shmem_size path: fatal_on_misconfig=false (HC62 FATALs from init_fn). */
+	eff = pcm_grd_effective_entries(false);
+	if (eff == 0)
 		return 0;
-	return mul_size(cluster_pcm_grd_max_entries, sizeof(struct GrdEntry));
+	/*
+	 * PGRAC: spec-2.30 D2 — header(ClusterPcmShared 72B aligned)+ HTAB
+	 * estimated size.  hash_estimate_size returns size for eff slots
+	 * given sizeof(struct GrdEntry) entry payload.
+	 */
+	sz = MAXALIGN(sizeof(ClusterPcmShared));
+	sz = add_size(sz, hash_estimate_size((Size)eff, sizeof(struct GrdEntry)));
+	return sz;
 }
 
 
@@ -193,35 +842,117 @@ void
 cluster_pcm_grd_init(void)
 {
 	bool found;
+	HASHCTL info;
 
 	/*
-	 * Q5 user 修订 2026-05-02: size=0 path safe early-return.
-	 *
-	 * PG ShmemInitStruct(name, 0, &found) behavior is undefined.
-	 * Default GUC=0 main path returns here without touching shmem;
-	 * pg_cluster_shmem view shows region_size_bytes = 0 (registered
-	 * but not allocated).
+	 * spec-2.30 D5 + HC62 — resolve effective entry count;  fatal_on_misconfig
+	 * raises FATAL on invalid configs (NBuffers=0 / NBuffers>cap / GUC<NBuffers).
+	 * Explicit `cluster.pcm_grd_max_entries=0` is the disable path:  ClusterPcm
+	 * + cluster_pcm_htab stay NULL → 9 counter accessors return 0;  mutation
+	 * API preserves spec-1.7 stub behavior (ereport ERRCODE_FEATURE_NOT_SUPPORTED).
 	 */
-	if (cluster_pcm_grd_max_entries == 0)
+	pcm_grd_effective = pcm_grd_effective_entries(true);
+	if (pcm_grd_effective == 0)
 		return;
 
-	GrdEntries = (struct GrdEntry *)ShmemInitStruct(
-		"pgrac cluster pcm grd", mul_size(cluster_pcm_grd_max_entries, sizeof(struct GrdEntry)),
-		&found);
+	pgstat_report_wait_start(WAIT_EVENT_PCM_GRD_INIT);
+	ClusterPcm = (ClusterPcmShared *)ShmemInitStruct("pgrac cluster pcm grd hdr",
+													 MAXALIGN(sizeof(ClusterPcmShared)), &found);
 
 	if (!found) {
-		/* Zero-init + per-entry LWLockInitialize. */
-		memset(GrdEntries, 0, mul_size(cluster_pcm_grd_max_entries, sizeof(struct GrdEntry)));
-		for (int i = 0; i < cluster_pcm_grd_max_entries; i++) {
-			/*
-			 * Stage 1.7 reuses LWTRANCHE_BUFFER_PCM_LOCK (1.6.1 hardening
-			 * registered tranche).  pcm_lock per BufferDesc + GrdEntry.protect
-			 * share the same tranche to keep lock-trace output simple
-			 * ("BufferPcmLock" name shows for both).
-			 */
-			LWLockInitialize(&GrdEntries[i].protect, LWTRANCHE_BUFFER_PCM_LOCK);
-		}
+		/*
+		 * PGRAC: spec-2.30 D2 — header init (9 atomic uint64 counters
+		 * zeroed).  Trans-9 (s_to_x_cleanout) counter starts 0 and stays 0
+		 * by HC60 apply-fail-closed.
+		 */
+		memset(ClusterPcm, 0, sizeof(*ClusterPcm));
+		LWLockInitialize(&ClusterPcm->htab_lock.lock, LWTRANCHE_CLUSTER_PCM);
+		pg_atomic_init_u64(&ClusterPcm->trans_n_to_s_count, 0);
+		pg_atomic_init_u64(&ClusterPcm->trans_n_to_x_count, 0);
+		pg_atomic_init_u64(&ClusterPcm->trans_s_to_x_upgrade_count, 0);
+		pg_atomic_init_u64(&ClusterPcm->trans_x_to_s_downgrade_count, 0);
+		pg_atomic_init_u64(&ClusterPcm->trans_x_to_n_downgrade_count, 0);
+		pg_atomic_init_u64(&ClusterPcm->trans_x_to_n_release_count, 0);
+		pg_atomic_init_u64(&ClusterPcm->trans_s_to_n_invalidate_count, 0);
+		pg_atomic_init_u64(&ClusterPcm->trans_s_to_n_release_count, 0);
+		pg_atomic_init_u64(&ClusterPcm->trans_s_to_x_cleanout_count, 0);
 	}
+
+	/*
+	 * PGRAC: spec-2.30 D2 — HTAB keyed by BufferTag (20B);  HASH_BLOBS
+	 * with memcmp/hash_bytes_extended.  HC59 lazy alloc:  entries inserted
+	 * on first cluster_pcm_lock_acquire(tag, mode) via HASH_ENTER_NULL +
+	 * never freed until cluster shutdown.  Cap = max_entries (FULL → fail-
+	 * closed ereport ERRCODE_OUT_OF_MEMORY at caller).
+	 */
+	memset(&info, 0, sizeof(info));
+	info.keysize = sizeof(BufferTag);
+	info.entrysize = sizeof(struct GrdEntry);
+	cluster_pcm_htab = ShmemInitHash("pgrac cluster pcm grd htab", (long)pcm_grd_effective,
+									 (long)pcm_grd_effective, &info, HASH_ELEM | HASH_BLOBS);
+	pgstat_report_wait_end();
+}
+
+
+/*
+ * PGRAC: spec-2.30 D2 — HC59 lazy-alloc entry helper (file-private).
+ *
+ *	Looks up entry by BufferTag;  on miss, inserts new entry with all
+ *	fields fresh (HC59 alloc on first acquire + LWLockInitialize entry_lock
+ *	+ master_state = PCM_STATE_N + x_holder_node = -1 + bitmaps zeroed).
+ *	Returns NULL when HTAB is at cap (HC59 fail-closed cap).
+ */
+static struct GrdEntry *
+pcm_get_or_create_entry(BufferTag tag)
+{
+	struct GrdEntry *entry;
+	bool found;
+
+	if (cluster_pcm_htab == NULL)
+		return NULL;
+
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_EXCLUSIVE);
+	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &tag, HASH_ENTER_NULL, &found);
+	if (entry == NULL) {
+		LWLockRelease(&ClusterPcm->htab_lock.lock);
+		return NULL; /* HTAB FULL — caller fail-closed */
+	}
+
+	if (!found) {
+		/*
+		 * HC59 fresh entry init.  hash_search wrote tag into entry->tag
+		 * (key field) already;  zero / init the rest.
+		 */
+		BufferTag saved_tag = entry->tag;
+		memset(entry, 0, sizeof(*entry));
+		entry->tag = saved_tag;
+		pg_atomic_init_u32(&entry->master_state, (uint32)PCM_STATE_N);
+		entry->x_holder_node = -1;
+		pg_atomic_init_u32(&entry->s_holders_bitmap, 0);
+		pg_atomic_init_u32(&entry->pi_holders_bitmap, 0);
+		pg_atomic_init_u64(&entry->transition_count_local, 0);
+		LWLockInitialize(&entry->entry_lock.lock, LWTRANCHE_CLUSTER_PCM);
+	}
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+
+	return entry;
+}
+
+
+static struct GrdEntry *
+pcm_find_entry(BufferTag tag)
+{
+	struct GrdEntry *entry;
+	bool found;
+
+	if (ClusterPcm == NULL || cluster_pcm_htab == NULL)
+		return NULL;
+
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &tag, HASH_FIND, &found);
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+
+	return (found && entry != NULL) ? entry : NULL;
 }
 
 

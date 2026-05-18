@@ -177,8 +177,12 @@ int cluster_injection_armed_count = 0;
  * provide a local definition matching the type so cluster_guc.c
  * (which references &cluster_pcm_grd_max_entries via
  * DefineCustomIntVariable) can link.
+ *
+ * spec-2.30 D5:  default changed 0 → -1 (sentinel auto-resolve to NBuffers
+ * at startup).  Test stub mirrors real default for clarity;  cluster_guc.c
+ * passes -1 as bootValue to DefineCustomIntVariable.
  */
-int cluster_pcm_grd_max_entries = 0;
+int cluster_pcm_grd_max_entries = -1;
 
 void
 cluster_injection_run(const char *name pg_attribute_unused())

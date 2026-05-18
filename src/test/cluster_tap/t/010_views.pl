@@ -10,11 +10,11 @@
 #    + view + SQL pipeline is intact end to end on a real PG instance:
 #
 #      - The view exists and is queryable.
-#      - It returns exactly 75 rows (one per cluster wait event through
+#      - It returns exactly 77 rows (one per cluster wait event through
 #        spec-2.23).
 #      - It exposes 10 distinct cluster wait classes (matching
 #        docs/cluster-wait-events-design.md §2.1).
-#      - Per-class row counts match the design doc (GES 5, PCM 6,
+#      - Per-class row counts match the design doc (GES 5, PCM 8,
 #        BufferShip 5, SCN 4, Reconfig 5, Recovery 5, Sinval 3,
 #        Interconnect 5, Undo 4, ADG 4).
 #      - Specific event names are present.
@@ -46,12 +46,12 @@ $node->start;
 
 
 # ----------
-# Total row count: 75 (spec-2.25 D11 +2 native lock probe).
+# Total row count: 77 (spec-2.30 D8 +2 PCM wait events).
 # ----------
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'75',
-	'pg_stat_cluster_wait_events returns 75 rows (spec-2.25 native-lock probe events included)');
+	'77',
+	'pg_stat_cluster_wait_events returns 77 rows (spec-2.30 PCM wait events included)');
 
 
 # ----------
@@ -69,7 +69,7 @@ is($node->safe_psql('postgres',
 # ----------
 my %expected = (
 	'Cluster: GES' => 5,
-	'Cluster: PCM' => 6,
+	'Cluster: PCM' => 8,
 	'Cluster: BufferShip' => 5,
 	'Cluster: SCN' => 4,
 	'Cluster: Reconfig' => 5,

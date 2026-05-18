@@ -759,13 +759,12 @@ cluster_init_guc(void)
 
 	DefineCustomIntVariable("cluster.pcm_grd_max_entries",
 							gettext_noop("Maximum entries in the PCM GRD master shmem region."),
-							gettext_noop("Stage 1.7 stub: default 0 means no GRD shmem allocated. "
-										 "Set non-zero to verify shmem pre-allocation startup "
-										 "stability (PCM lock API still ereports SQLSTATE 0A000 "
-										 "FEATURE_NOT_SUPPORTED at this stage).  Stage 2.X PCM "
-										 "lock state machine activation will change the default "
-										 "to NBuffers."),
-							&cluster_pcm_grd_max_entries, 0, 0, 1048576,
+							gettext_noop("spec-2.30 PCM 9-state machine activation:  -1 (default) = "
+										 "auto-resolve to NBuffers at startup;  0 = explicit disable "
+										 "(preserves spec-1.7 stub:  mutation API ereports 0A000 "
+										 "FEATURE_NOT_SUPPORTED, query returns N);  positive value "
+										 "must cover NBuffers (HC62 fail-closed FATAL on shortfall)."),
+							&cluster_pcm_grd_max_entries, -1, -1, 1048576,
 							PGC_POSTMASTER, /* startup-fixed */
 							0,				/* flags */
 							NULL,			/* check_hook */

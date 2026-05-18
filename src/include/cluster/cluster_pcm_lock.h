@@ -1,47 +1,31 @@
 /*-------------------------------------------------------------------------
  *
  * cluster_pcm_lock.h
- *	  pgrac cluster PCM (Parallel Cache Management) lock framework
- *	  scaffolding (Stage 1.7 stub).
+ *	  pgrac cluster PCM (Parallel Cache Management) lock state machine.
  *
- *	  Stage 1.7 ships only the API typedefs + opaque GrdEntry forward
- *	  declaration + 6 stub function prototypes + 1 GUC + shmem region
- *	  registration (size 0 by default).  All 4 mutation API calls
- *	  (acquire / release / upgrade / downgrade) ereport
- *	  ERRCODE_FEATURE_NOT_SUPPORTED with errmsg "PCM lock manager is
- *	  not implemented in Stage 1.7 stub".  Stage 2.X (#15 PCM state
- *	  machine + #11/#12 GRD master + #17 Cache Fusion) replaces the
- *	  4 stub function bodies with the actual 9-transition state
- *	  machine + Convert Queue + master routing protocol.
+ *	  spec-1.7 shipped the API typedefs, opaque GrdEntry forward
+ *	  declaration, GUC, inject points, and shmem registration surface.
+ *	  spec-2.30 activates the local PCM state-machine body:
+ *	  acquire / release / upgrade / downgrade now mutate a shmem HTAB
+ *	  of opaque GrdEntry records protected by per-entry LWLockPadded.
+ *	  Buffer manager callers, GCS wire requests, and convert-queue
+ *	  protocol are intentionally deferred to later Cache Fusion specs.
  *
  *	  GrdEntry is intentionally an opaque struct (Q3 user 修订
  *	  2026-05-02): the full struct definition lives in
  *	  src/backend/cluster/cluster_pcm_lock.c (private).  Header
- *	  exposes only the typedef + 3 helper functions
+ *	  exposes only the typedef + helper functions
  *	  (cluster_pcm_grd_count / cluster_pcm_grd_shmem_size /
- *	  cluster_pcm_grd_init).  Stage 2.X spec adds bitmap (s_holders /
- *	  pi_holders) and convert_queue fields without breaking ABI of
- *	  Stage 1.7 callers (none yet, but pattern locked).  Matches
- *	  PG's `typedef struct CheckpointStatsData CheckpointStatsData;`
- *	  opaque idiom in xlog.h.
+ *	  cluster_pcm_grd_init / cluster_pcm_grd_get_summary plus counter
+ *	  accessors).  The opaque boundary lets later specs evolve fields
+ *	  such as convert queues without exposing the internal ABI.
  *
- *	  GUC cluster.pcm_grd_max_entries default 0 (Q4 user 修订): the
- *	  cluster_pcm_grd shmem region is registered but allocated 0
- *	  bytes by default; users may set non-zero to verify shmem
- *	  pre-allocation startup stability (1.7 stub still ereports).
- *	  Stage 2.X PCM 真值激活 spec changes default to NBuffers.
+ *	  GUC cluster.pcm_grd_max_entries default -1: auto-resolve to
+ *	  NBuffers at startup.  Explicit 0 disables the PCM state machine
+ *	  and preserves the old scaffolding behavior.
  *
- *	  Why Stage 1.7 frame this scaffolding:
- *	  - PG-side has no PCM concept; cluster needs a clearly-named
- *	    layer with C internal API + shmem framework + diagnostic
- *	    surface so Stage 2 truth-activation just replaces stub
- *	    function bodies (no ABI break for callers).
- *	  - Inject points (4 of them, registered at stage 1.7) lock the
- *	    state-machine transition trace points for Stage 2 fault
- *	    injection testing without re-shuffling baseline numbers.
- *	  - pg_cluster_state.pcm category surfaces 6 keys for DBA
- *	    diagnostics (max_entries / allocated_bytes / active_entries
- *	    / mode_count / transition_count / api_state="stub").
+ *	  pg_cluster_state.pcm exposes the activation state, live HTAB
+ *	  summary rows, and per-transition counters for DBA diagnostics.
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
@@ -97,10 +81,8 @@ typedef PcmState PcmLockMode;
  * PcmLockTransition -- 9 legal state-machine transitions.
  *
  *	Defined per docs/pcm-lock-protocol-design.md §4.1 + AD-002.
- *	Stage 1.7 ships only the enum values (used in pg_cluster_state.pcm
- *	transition_count = 9 and as future Stage 2.X state-machine input).
- *	Actual transition logic is empty in Stage 1.7 (stub functions
- *	ereport before any transition).
+ *	spec-2.30 uses these values as the executable local PCM
+ *	state-machine input and increments one counter per transition.
  *
  *	Transition #9 (S→X cleanout) is reader-triggered ITL cleanout per
  *	AD-006 第四轮; Stage 3 (AD-006 第五轮 ~27000 LOC) wires actual
@@ -123,18 +105,10 @@ typedef enum PcmLockTransition {
 /*
  * GrdEntry -- opaque per-block global lock state (master node).
  *
- *	Stage 1.7 (Q3 user 修订 2026-05-02): full struct definition lives
- *	in src/backend/cluster/cluster_pcm_lock.c (private).  Header
- *	exposes only the typedef + 3 helper functions
- *	(cluster_pcm_grd_count / cluster_pcm_grd_shmem_size /
- *	cluster_pcm_grd_init).
- *
- *	Why opaque: Stage 2.X (#11/#12 GRD master + #15 PCM state machine)
- *	will add bitmap fields (s_holders / pi_holders) and a
- *	convert_queue field.  An opaque struct lets Stage 2 evolve
- *	internal layout without breaking the ABI of any (future) callers.
- *	Matches PG's `typedef struct CheckpointStatsData CheckpointStatsData;`
- *	idiom in xlog.h (implementation evolves; header interface stays).
+ *	Full struct definition lives in src/backend/cluster/cluster_pcm_lock.c
+ *	(private).  Header exposes only the typedef and accessor/mutation APIs.
+ *	The opaque boundary lets future Cache Fusion specs evolve fields such as
+ *	convert queues without leaking layout into callers.
  */
 typedef struct GrdEntry GrdEntry;
 
@@ -143,33 +117,19 @@ typedef struct GrdEntry GrdEntry;
  * GUC cluster.pcm_grd_max_entries -- maximum number of GrdEntry slots
  *	in the cluster_pcm_grd shmem region.
  *
- *	Default 0 (Q4 user 修订): no GRD shmem allocated by default.
- *	cluster_pcm_grd_init handles size=0 by early-returning before
- *	ShmemInitStruct (Q5 user 修订: PG ShmemInitStruct(name, 0,
- *	&found) behavior is undefined).  Range [0, 1048576] (max ~128 MB
- *	at sizeof(GrdEntry) ~128 B).  PGC_POSTMASTER (startup-fixed).
- *
- *	Stage 2.X PCM 真值激活 spec changes default to NBuffers (one
- *	GrdEntry per shared buffer block, since master tracks all blocks).
+ *	Default -1: auto-resolve to NBuffers at startup.  Explicit 0 disables
+ *	the PCM state machine.  Positive values must be >= NBuffers.  Range
+ *	[-1, 1048576].  PGC_POSTMASTER (startup-fixed).
  */
 extern int cluster_pcm_grd_max_entries;
 
 
 /*
- * PCM lock mutation API -- Stage 1.7 stubs.
+ * PCM lock mutation API.
  *
- *	All 4 functions ereport(ERROR, ERRCODE_FEATURE_NOT_SUPPORTED,
- *	errmsg("PCM lock manager is not implemented in Stage 1.7 stub"),
- *	errhint("Stage 1.7 exposes API and shmem scaffolding only; PCM
- *	lock transitions land in Stage 2.")) -- Q1 user 修订 2026-05-02
- *	精确 errmsg/errhint 文本.
- *
- *	Stage 1.7 has NO SQL-callable function (Q8 user 修订 2026-05-02
- *	strong condition): cluster_pcm_lock_* are C internal only;
- *	pg_proc.dat is not modified, system_views.sql is not modified,
- *	no new catalog tuples / system view columns / SQL function
- *	binding are added.  This keeps catversion = 202605050 (no bump).
- *	Stage 2.X PCM 真值激活 spec decides if any SQL binding is added.
+ *	spec-2.30 activates these as C-internal APIs.  They do not have
+ *	SQL-callable bindings; pg_proc.dat and system_views.sql are untouched
+ *	for this API surface.
  *
  *	Inject points wrap each function entry (Q6 user 修订 2026-05-02
  *	release-pre instead of release-post for naming honesty -- 1.7
@@ -188,26 +148,65 @@ extern void cluster_pcm_lock_downgrade(BufferTag tag, PcmLockMode target_mode, b
 /*
  * Diagnostic / introspection helpers (always-callable).
  *
- *	cluster_pcm_lock_query: returns PCM_LOCK_MODE_N at stage 1.7
- *	  (no PCM lock held anywhere; consistent with BufferDesc.pcm_state
- *	  placeholder in 1.6).
+ *	cluster_pcm_lock_query: returns the live local PCM state for the tag,
+ *	  or PCM_LOCK_MODE_N if no GRD entry exists.
  *
- *	cluster_pcm_grd_count: returns 0 at stage 1.7 (no entries
- *	  populated regardless of GUC value; stub never writes to GRD).
+ *	cluster_pcm_grd_count: returns the live HTAB entry count.
  *
- *	cluster_pcm_grd_shmem_size: returns 0 if GUC=0 (default), else
- *	  cluster_pcm_grd_max_entries * sizeof(struct GrdEntry).  Used
- *	  by the spec-1.3 shmem registry size_fn callback.
+ *	cluster_pcm_grd_shmem_size: returns 0 if GUC=0, else shmem for the
+ *	  header plus the resolved entry capacity.
  *
- *	cluster_pcm_grd_init: shmem registry init_fn callback.  Q5 user
- *	  修订: early-returns if cluster_pcm_grd_max_entries == 0
- *	  (avoids ShmemInitStruct undefined-behavior at size=0); else
- *	  allocates + zero-init's + LWLockInitialize per entry.
+ *	cluster_pcm_grd_init: shmem registry init_fn callback.  Explicit
+ *	  disable path (GUC=0) returns before ShmemInitStruct; otherwise it
+ *	  initializes the header, HTAB, HTAB lock, and per-entry locks lazily.
  */
 extern PcmLockMode cluster_pcm_lock_query(BufferTag tag);
 extern int cluster_pcm_grd_count(void);
+extern void cluster_pcm_grd_get_summary(int *n_count, int *s_count, int *x_count,
+										int *pi_holders_total, int *convert_queue_active);
 extern Size cluster_pcm_grd_shmem_size(void);
 extern void cluster_pcm_grd_init(void);
+
+
+/* ============================================================
+ * PGRAC: spec-2.30 D2 — transition validator + apply (file-private struct).
+ *
+ *	`struct GrdEntry` definition lives in cluster_pcm_lock.c (file-private
+ *	per spec-2.30 §2.1 + spec-1.7 Q3 opaque ABI 严守);  callers MUST go
+ *	through these accessors, never deref `GrdEntry *` directly.
+ *
+ *	cluster_pcm_transition_legal(from, to, trans):  returns true iff
+ *	  (from, to, trans) combination matches AD-002 9-transition map.
+ *	  Caller invokes before apply; illegal combination MUST
+ *	  ereport(ERROR, ERRCODE_DATA_CORRUPTED) at caller side (HC56).
+ *
+ *	cluster_pcm_transition_apply(entry, trans, holder_node_id):  caller
+ *	  MUST hold entry->entry_lock EXCLUSIVE (HC57 Asserted);  applies
+ *	  master_state / holder bitmap mutation + bumps counters.  Trans-9
+ *	  fail-closed ereport(ERRCODE_FEATURE_NOT_SUPPORTED) (HC60).
+ * ============================================================ */
+extern bool cluster_pcm_transition_legal(PcmState from, PcmState to, PcmLockTransition trans);
+extern void cluster_pcm_transition_apply(struct GrdEntry *entry, PcmLockTransition trans,
+										 int holder_node_id);
+
+
+/* ============================================================
+ * PGRAC: spec-2.30 D2 — 9 transition counter accessors.
+ *
+ *	Counters live in shmem header (ClusterPcmShared);  every backend sees
+ *	cluster-wide values.  Trans-9 (S→X cleanout) counter永 0 in spec-2.30
+ *	(HC60 apply-fail-closed) until Stage 3 AD-006 第五轮 wires ITL cleanout.
+ *	When cluster.pcm_grd_max_entries=0 (disable path) accessors return 0.
+ * ============================================================ */
+extern uint64 cluster_pcm_get_trans_n_to_s_count(void);
+extern uint64 cluster_pcm_get_trans_n_to_x_count(void);
+extern uint64 cluster_pcm_get_trans_s_to_x_upgrade_count(void);
+extern uint64 cluster_pcm_get_trans_x_to_s_downgrade_count(void);
+extern uint64 cluster_pcm_get_trans_x_to_n_downgrade_count(void);
+extern uint64 cluster_pcm_get_trans_x_to_n_release_count(void);
+extern uint64 cluster_pcm_get_trans_s_to_n_invalidate_count(void);
+extern uint64 cluster_pcm_get_trans_s_to_n_release_count(void);
+extern uint64 cluster_pcm_get_trans_s_to_x_cleanout_count(void);
 
 
 /*
@@ -217,10 +216,9 @@ extern void cluster_pcm_grd_init(void);
  *	register the cluster_pcm_grd region with the spec-1.3 shmem
  *	registry.  Idempotent (registry checks for duplicate names).
  *
- *	Stage 1.7: registers the region with size_fn = cluster_pcm_grd_
- *	shmem_size / init_fn = cluster_pcm_grd_init / lwlock_count = 0
- *	(per-entry LWLockInitialize happens in init_fn) /
- *	owner_subsys = "cluster_pcm".
+ *	spec-2.30 registers the region with size_fn = cluster_pcm_grd_shmem_size
+ *	and init_fn = cluster_pcm_grd_init.  The HTAB lock and per-entry locks
+ *	are initialized inside the region.
  */
 extern void cluster_pcm_lock_module_init(void);
 

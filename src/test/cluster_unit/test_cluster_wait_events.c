@@ -196,8 +196,9 @@ UT_TEST(test_last_event_per_category_in_class)
 
 /* ----------
  * Per-category event counts match the design doc roster
- *  (GES 5, PCM 6, BufferShip 5, SCN 4, Reconfig 5, Recovery 5,
- *   Sinval 3, Interconnect 5, Undo 4, ADG 4, SharedFs 5 -- total 51).
+ *  (GES 5, PCM 8, BufferShip 5, SCN 4, Reconfig 5, Recovery 5,
+ *   Sinval 3, Interconnect 5, Undo 4, ADG 4, SharedFs 5 -- plus later
+ *   subsystem classes, total tracked by CLUSTER_WAIT_EVENTS_COUNT).
  *
  *	Use (last - first + 1) within each category as the count.
  * ----------

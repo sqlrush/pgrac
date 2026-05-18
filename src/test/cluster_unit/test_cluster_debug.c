@@ -211,6 +211,9 @@ cluster_shmem_get_region_count(void)
  * (defined in cluster_pcm_lock.c).  cluster_pcm_lock.o is not linked
  * here; provide stubs returning the same defaults the real
  * implementation returns when GUC=0.
+ *
+ * spec-2.30 D9 (R10 stub audit):  dump_pcm calls 9 NEW transition
+ * counter accessors;  stub each to return 0 (matches GUC=0 disable path).
  */
 int cluster_pcm_grd_max_entries = 0;
 
@@ -222,6 +225,64 @@ cluster_pcm_grd_count(void)
 
 Size
 cluster_pcm_grd_shmem_size(void)
+{
+	return 0;
+}
+
+void
+cluster_pcm_grd_get_summary(int *n_count, int *s_count, int *x_count, int *pi_holders_total,
+							int *convert_queue_active)
+{
+	*n_count = 0;
+	*s_count = 0;
+	*x_count = 0;
+	*pi_holders_total = 0;
+	*convert_queue_active = 0;
+}
+
+/* PGRAC spec-2.30 D9 R10 stub audit — 9 transition counter accessors. */
+uint64
+cluster_pcm_get_trans_n_to_s_count(void)
+{
+	return 0;
+}
+uint64
+cluster_pcm_get_trans_n_to_x_count(void)
+{
+	return 0;
+}
+uint64
+cluster_pcm_get_trans_s_to_x_upgrade_count(void)
+{
+	return 0;
+}
+uint64
+cluster_pcm_get_trans_x_to_s_downgrade_count(void)
+{
+	return 0;
+}
+uint64
+cluster_pcm_get_trans_x_to_n_downgrade_count(void)
+{
+	return 0;
+}
+uint64
+cluster_pcm_get_trans_x_to_n_release_count(void)
+{
+	return 0;
+}
+uint64
+cluster_pcm_get_trans_s_to_n_invalidate_count(void)
+{
+	return 0;
+}
+uint64
+cluster_pcm_get_trans_s_to_n_release_count(void)
+{
+	return 0;
+}
+uint64
+cluster_pcm_get_trans_s_to_x_cleanout_count(void)
 {
 	return 0;
 }

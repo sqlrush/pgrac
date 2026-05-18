@@ -88,6 +88,10 @@ CLUSTER_GES_O = $(top_builddir)/src/backend/cluster/cluster_ges.o
 CLUSTER_GRD_O = $(top_builddir)/src/backend/cluster/cluster_grd.o
 CLUSTER_LMD_O = $(top_builddir)/src/backend/cluster/cluster_lmd.o
 CLUSTER_LOCK_ACQUIRE_O = $(top_builddir)/src/backend/cluster/cluster_lock_acquire.o
+# spec-2.30 D9: test_cluster_pcm_lock links cluster_pcm_lock.o to exercise
+# the transition validator + counter accessors standalone (20 PG-runtime
+# deps stubbed in the test binary).
+CLUSTER_PCM_LOCK_O = $(top_builddir)/src/backend/cluster/cluster_pcm_lock.o
 
 # Most tests link only cluster_version.o.  test_cluster_guc /
 # test_cluster_shmem / test_cluster_signal / test_cluster_views /
@@ -478,5 +482,18 @@ test_cluster_lock_acquire: test_cluster_lock_acquire.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_LOCK_ACQUIRE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_LOCK_ACQUIRE_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-2.30 D9: test_cluster_pcm_lock links cluster_pcm_lock.o standalone.
+# cluster_pcm_lock.c references 20 PG-runtime symbols (ShmemInit* / LWLock* /
+# hash_* / GetCurrentTimestamp / ereport / NBuffers / pg_atomic_* /
+# cluster_node_id / cluster_shmem_register_region / cluster_injection_*).
+# Test stubs all of these and drives a tiny fake shared HTAB so the real
+# acquire/release/upgrade/downgrade/query paths are exercised standalone.
+test_cluster_pcm_lock: test_cluster_pcm_lock.c unit_test.h \
+		$(CLUSTER_VERSION_O) $(CLUSTER_PCM_LOCK_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_PCM_LOCK_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@

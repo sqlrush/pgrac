@@ -281,7 +281,21 @@
  * (perpetual wait gated, default 60000 不变).  NEW LMS counter
  * priority_starvation_observed_count + lms_restart_generation atomic.
  * catversion bump for catalog tooling. */
-#define CATALOG_VERSION_NO 202605380
+/* spec-2.30 D10 (2026-05-17):  PCM 9-state machine activation —
+ * spec-1.7 PCM placeholder 4 stub bodies activated.  GrdEntry struct
+ * file-private full layout (216B; BufferTag=20B PG 16.13 + atomic fields
+ * + LWLockPadded 128B;  spec-2.30 §2.1 nominal 208B mismatch flagged for
+ * Hardening v1.0.1 F1 spec amend).  NEW shmem region 'pgrac cluster pcm
+ * grd hdr' + HTAB 'pgrac cluster pcm grd htab' (was placeholder array in
+ * spec-1.7).  NEW LWTRANCHE_CLUSTER_PCM (per-entry LWLockPadded HC57/HC61).
+ * 9 NEW transition counters (8 active + Trans-9 HC60永 0 until Stage 3).
+ * GUC cluster.pcm_grd_max_entries default 0 -> -1 sentinel (auto-resolve
+ * to NBuffers;  0 = explicit disable preserving spec-1.7 stub behavior;
+ * HC62 fail-closed FATAL on shortfall).  2 NEW wait events
+ * ClusterPcmGrdInit + ClusterPcmTransitionApply (CLUSTER_WAIT_EVENTS_COUNT
+ * 75 -> 77).  cluster_pcm_lock_query 真 lookup (spec-1.7 always-N 行为
+ * 撤销).  catversion bump for catalog tooling. */
+#define CATALOG_VERSION_NO 202605390
 
 /* spec-2.16 D19 (2026-05-29):  GesRequestPayload + GesReplyPayload wire
  * payload structs (48B each + StaticAssertDecl);  ClusterGrdHolderId

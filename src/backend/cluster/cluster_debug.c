@@ -93,7 +93,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_scn.h"		   /* SCN typedef (stage 1.4) */
 #include "cluster/cluster_itl_slot.h"	   /* CLUSTER_ITL_* constants (stage 1.5) */
 #include "cluster/cluster_buffer_desc.h"   /* BufferType / PcmState enums (stage 1.6) */
-#include "cluster/cluster_pcm_lock.h"	   /* PCM stub API + grd helpers (stage 1.7) */
+#include "cluster/cluster_pcm_lock.h"	   /* PCM state-machine API + grd helpers */
 #include "cluster/cluster_startup_phase.h" /* phase enum + accessors (stage 1.10) */
 #include "storage/bufpage.h"	   /* PG_PAGE_LAYOUT_VERSION, SizeOfPageHeaderData (stage 1.4) */
 #include "storage/buf_internals.h" /* BufferDesc layout (stage 1.6) */
@@ -1132,34 +1132,87 @@ dump_buffer_format(ReturnSetInfo *rsinfo)
 
 
 /*
- * dump_pcm -- Stage 1.7 PCM lock framework scaffolding diagnostics.
+ * dump_pcm -- PCM lock state-machine diagnostics.
  *
- *	Emits 6 rows surfacing the spec-1.7 PCM stub state for DBA
- *	visibility.  pcm_api_state="stub" makes it obvious that PCM lock
- *	manager is in scaffolding mode (not yet truth-activated).
- *
- *	Q4 user 修订 2026-05-02 added pcm_grd_allocated_bytes (actual
- *	shmem occupancy) and pcm_api_state (so DBAs aren't surprised by
- *	0A000 errors when calling PCM lock functions).
- *
- *	Spec: spec-1.7-pcm-state-placeholder.md §1.2 Deliverable 4 +
- *	      §11.4 pg_cluster_state.pcm checklist.
+ *	spec-1.7 introduced the initial diagnostic surface.  spec-2.30 expands
+ *	it with live PCM state summaries and transition counters.
  */
 static void
 dump_pcm(ReturnSetInfo *rsinfo)
 {
-	emit_row(rsinfo, "pcm", "pcm_grd_max_entries", fmt_int32(cluster_pcm_grd_max_entries));
 	/*
-	 * fmt_int64 (not int32) per codex 1.7 review P3: Stage 2 default
-	 * NBuffers + large shared_buffers can exceed 32-bit signed range.
-	 * Spec: spec-1.X-cluster-smgr-hardening §1.3.1 finding #4.
+	 * PGRAC: spec-2.30 D9 — dump_pcm activation surface.
+	 *
+	 *	Existing 6 row preserved (api_state 字符串值 "stub" → "active" 当
+	 *	cluster_pcm_grd_count() > 0 或 GUC=-1 default-on;disabled path 保留
+	 *	"stub").  NEW 5 state summary row + 9 transition counter row =
+	 *	14 NEW (total 20).
 	 */
+	emit_row(rsinfo, "pcm", "pcm_grd_max_entries", fmt_int32(cluster_pcm_grd_max_entries));
 	emit_row(rsinfo, "pcm", "pcm_grd_allocated_bytes",
 			 fmt_int64((int64)cluster_pcm_grd_shmem_size()));
 	emit_row(rsinfo, "pcm", "pcm_grd_active_entries", fmt_int32(cluster_pcm_grd_count()));
 	emit_row(rsinfo, "pcm", "pcm_lock_mode_count", "3");
 	emit_row(rsinfo, "pcm", "pcm_transition_count", fmt_int32(PCM_TRANSITION_COUNT));
-	emit_row(rsinfo, "pcm", "pcm_api_state", "stub");
+	/*
+	 * api_state: "active" if PCM 状态机已激活 (cluster.pcm_grd_max_entries
+	 * non-zero, either default -1 or explicit positive);  "stub" if explicit
+	 * disable (cluster.pcm_grd_max_entries=0 spec-2.30 disable path).
+	 */
+	emit_row(rsinfo, "pcm", "pcm_api_state",
+			 (cluster_pcm_grd_max_entries == 0) ? "stub" : "active");
+
+	/*
+	 * PGRAC: spec-2.30 D9 — 5 NEW state summary row.
+	 *
+	 *	master_state_n_count / s_count / x_count:  iterate live HTAB,
+	 *	count entries by master_state.  Could be expensive on large HTAB,
+	 *	but dump_pcm is admin-on-demand surface (not hot path);  acceptable.
+	 *	disable-path (htab NULL):  all 0.
+	 *
+	 *	pi_holders_total_count:  popcount(pi_holders_bitmap) summed across
+	 *	all entries.
+	 *
+	 *	convert_queue_active:  count of entries with convert_queue != NULL
+	 *	(spec-2.30 always 0 until spec-2.32 GCS req wires convert queue).
+	 */
+	{
+		int n_count = 0, s_count = 0, x_count = 0;
+		int pi_total = 0, convert_q_active = 0;
+
+		cluster_pcm_grd_get_summary(&n_count, &s_count, &x_count, &pi_total, &convert_q_active);
+		emit_row(rsinfo, "pcm", "master_state_n_count", fmt_int32(n_count));
+		emit_row(rsinfo, "pcm", "master_state_s_count", fmt_int32(s_count));
+		emit_row(rsinfo, "pcm", "master_state_x_count", fmt_int32(x_count));
+		emit_row(rsinfo, "pcm", "pi_holders_total_count", fmt_int32(pi_total));
+		emit_row(rsinfo, "pcm", "convert_queue_active", fmt_int32(convert_q_active));
+	}
+
+	/*
+	 * PGRAC: spec-2.30 D9 — 9 NEW transition counter row.
+	 *
+	 *	Trans-9 (s_to_x_cleanout) accessor exists but counter永 0 in
+	 *	spec-2.30 (HC60 apply-fail-closed until Stage 3 AD-006 第五轮
+	 *	wires ITL cleanout).
+	 */
+	emit_row(rsinfo, "pcm", "trans_n_to_s_count",
+			 fmt_int64((int64)cluster_pcm_get_trans_n_to_s_count()));
+	emit_row(rsinfo, "pcm", "trans_n_to_x_count",
+			 fmt_int64((int64)cluster_pcm_get_trans_n_to_x_count()));
+	emit_row(rsinfo, "pcm", "trans_s_to_x_upgrade_count",
+			 fmt_int64((int64)cluster_pcm_get_trans_s_to_x_upgrade_count()));
+	emit_row(rsinfo, "pcm", "trans_x_to_s_downgrade_count",
+			 fmt_int64((int64)cluster_pcm_get_trans_x_to_s_downgrade_count()));
+	emit_row(rsinfo, "pcm", "trans_x_to_n_downgrade_count",
+			 fmt_int64((int64)cluster_pcm_get_trans_x_to_n_downgrade_count()));
+	emit_row(rsinfo, "pcm", "trans_x_to_n_release_count",
+			 fmt_int64((int64)cluster_pcm_get_trans_x_to_n_release_count()));
+	emit_row(rsinfo, "pcm", "trans_s_to_n_invalidate_count",
+			 fmt_int64((int64)cluster_pcm_get_trans_s_to_n_invalidate_count()));
+	emit_row(rsinfo, "pcm", "trans_s_to_n_release_count",
+			 fmt_int64((int64)cluster_pcm_get_trans_s_to_n_release_count()));
+	emit_row(rsinfo, "pcm", "trans_s_to_x_cleanout_count",
+			 fmt_int64((int64)cluster_pcm_get_trans_s_to_x_cleanout_count()));
 }
 
 #endif /* USE_PGRAC_CLUSTER */

@@ -15,7 +15,7 @@
 #
 #    What this test verifies:
 #      - The global view exists and is queryable.
-#      - It returns exactly 51 rows (1 node x 51 cluster wait events).
+#      - It returns exactly 77 rows (1 node x 77 cluster wait events).
 #      - It exposes exactly 1 distinct node_id at 0.17 (placeholder).
 #      - The single node_id matches the cluster.node_id GUC.
 #      - Per-class row counts match docs/wait-events-design.md §2.1.
@@ -58,12 +58,12 @@ my $node_id = $node->safe_psql('postgres', 'SHOW cluster.node_id');
 
 
 # ----------
-# Total row count: 1 node x 51 events = 46.
+# Total row count: 1 node x 77 events = 77.
 # ----------
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_gcluster_wait_events'),
-	'75',
-	'pg_stat_gcluster_wait_events returns 75 rows (single-node projection of cluster wait events)');
+	'77',
+	'pg_stat_gcluster_wait_events returns 77 rows (single-node projection of cluster wait events)');
 
 
 # ----------
@@ -89,7 +89,7 @@ is($node->safe_psql('postgres',
 # ----------
 my %expected = (
 	'Cluster: GES' => 5,
-	'Cluster: PCM' => 6,
+	'Cluster: PCM' => 8,
 	'Cluster: BufferShip' => 5,
 	'Cluster: SCN' => 4,
 	'Cluster: Reconfig' => 5,

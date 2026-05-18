@@ -9,8 +9,8 @@
  *	  matching pg_proc.dat entry and a system_views.sql VIEW declaration.
  *
  *	  Stage 0.16 ships ONE SRF: cluster_get_wait_events, backing the
- *	  pg_stat_cluster_wait_events view.  It iterates the 51 cluster wait
- *	  event values registered by spec-0.11 and emits one row per event
+ *	  pg_stat_cluster_wait_events view.  It iterates the cluster wait
+ *	  event values registered by the wait-event roster and emits one row per event
  *	  with (type, name) populated by the existing pgstat_get_wait_event
  *	  / pgstat_get_wait_event_type lookups.
  *
@@ -94,13 +94,15 @@ static const uint32 cluster_wait_event_infos[CLUSTER_WAIT_EVENTS_COUNT] = {
 	WAIT_EVENT_GES_MASTER_QUERY,
 	WAIT_EVENT_GES_LOCAL_FAST_PATH,
 
-	/* Cluster: PCM (6) */
+	/* Cluster: PCM (8;  +2 NEW spec-2.30 D8) */
 	WAIT_EVENT_PCM_BLOCK_READ_N_S,
 	WAIT_EVENT_PCM_BLOCK_READ_N_X,
 	WAIT_EVENT_PCM_BLOCK_WRITE_S_X,
 	WAIT_EVENT_PCM_BLOCK_CONVERT_WAIT,
 	WAIT_EVENT_PCM_BLOCK_DOWNGRADE,
 	WAIT_EVENT_PCM_ITL_CLEANOUT,
+	WAIT_EVENT_PCM_GRD_INIT,		 /* PGRAC spec-2.30 D8 */
+	WAIT_EVENT_PCM_TRANSITION_APPLY, /* PGRAC spec-2.30 D8 */
 
 	/* Cluster: BufferShip (5) */
 	WAIT_EVENT_BUFFER_SHIP_CR_BUILD,

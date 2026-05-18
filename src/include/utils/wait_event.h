@@ -299,13 +299,17 @@ typedef enum {
 	WAIT_EVENT_GES_CANCEL_DRAIN,
 	WAIT_EVENT_GES_DEADLOCK_REASSEMBLY_WAIT,
 
-	/* Cluster: PCM (6 events) -- subsystem #6 */
+	/* Cluster: PCM (8 events; +2 NEW spec-2.30 D8) -- subsystem #6 */
 	WAIT_EVENT_PCM_BLOCK_READ_N_S = PG_WAIT_CLUSTER_PCM,
 	WAIT_EVENT_PCM_BLOCK_READ_N_X,
 	WAIT_EVENT_PCM_BLOCK_WRITE_S_X,
 	WAIT_EVENT_PCM_BLOCK_CONVERT_WAIT,
 	WAIT_EVENT_PCM_BLOCK_DOWNGRADE,
 	WAIT_EVENT_PCM_ITL_CLEANOUT,
+	/* PGRAC (spec-2.30 D8): GrdEntry HTAB init at postmaster startup. */
+	WAIT_EVENT_PCM_GRD_INIT,
+	/* PGRAC (spec-2.30 D8): per-entry entry_lock acquire hot path. */
+	WAIT_EVENT_PCM_TRANSITION_APPLY,
 
 	/* Cluster: BufferShip (5 events) -- subsystem #5 */
 	WAIT_EVENT_BUFFER_SHIP_CR_BUILD = PG_WAIT_CLUSTER_BUFFERSHIP,

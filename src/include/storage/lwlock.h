@@ -293,6 +293,12 @@ typedef enum BuiltinTrancheIds {
 	 * timeout sweep deletes stale entries.  HC17 invariant — late reply
 	 * after entry deletion is silently dropped + counter++. */
 	LWTRANCHE_CLUSTER_GES_REPLY_WAIT,
+	/* PGRAC (spec-2.30 D4): per-entry LWLockPadded on each GrdEntry slot in
+	 * the cluster_pcm_grd HTAB.  Guards transition mutation (master_state
+	 * CAS + holder bitmap update + master_holder).  HC57 invariant:  every
+	 * transition_apply MUST hold EXCLUSIVE;  HC61 forbids upgrade to a
+	 * per-shard / global lock granularity. */
+	LWTRANCHE_CLUSTER_PCM,
 #endif
 	LWTRANCHE_FIRST_USER_DEFINED
 } BuiltinTrancheIds;
