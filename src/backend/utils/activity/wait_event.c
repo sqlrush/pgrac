@@ -964,6 +964,12 @@ pgstat_get_wait_cluster_pcm(WaitEventCluster w)
 		/* PGRAC (spec-2.30 D8): per-entry entry_lock acquire hot path. */
 		event_name = "ClusterPcmTransitionApply";
 		break;
+	case WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT:
+		/* PGRAC (spec-2.31 D6 F3 v0.4): cluster_pcm_lock_acquire waiting on
+		 * wait_cv for incompatible holder to release;  bufmgr content-lock
+		 * hook contention path. */
+		event_name = "ClusterPcmCompatibleStateWait";
+		break;
 	default:
 		break;
 	}

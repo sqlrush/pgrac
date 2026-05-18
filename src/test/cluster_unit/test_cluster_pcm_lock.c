@@ -100,6 +100,21 @@ static LWLockMode fake_lwlock_mode = LW_EXCLUSIVE;
 static uint32 fake_init_wait_event_seen = 0;
 static uint32 fake_lwlock_wait_event_seen = 0;
 
+/* PGRAC: spec-2.31 D1 v0.4 — ConditionVariable stub counters (declared
+ * here so reset_fake_pcm_runtime() can clear them;  definitions of the
+ * stub functions themselves live below LWLockHeldByMeInMode). */
+static int fake_cv_init_count = 0;
+static int fake_cv_prepare_count = 0;
+static int fake_cv_sleep_count = 0;
+static int fake_cv_cancel_count = 0;
+static int fake_cv_broadcast_count = 0;
+static uint32 fake_cv_sleep_wait_event = 0;
+static struct {
+	BufferTag tag;
+	int holder_node;
+	bool armed;
+} fake_cv_wake_release = { { 0 }, 0, false };
+
 static sigjmp_buf ut_ereport_jump;
 static bool ut_ereport_jump_armed = false;
 static int ut_ereport_fired_count = 0;
@@ -142,6 +157,13 @@ reset_fake_pcm_runtime(int max_entries)
 	ut_wait_event_info_storage = 0;
 	ut_ereport_fired_count = 0;
 	ut_ereport_jump_armed = false;
+	fake_cv_init_count = 0;
+	fake_cv_prepare_count = 0;
+	fake_cv_sleep_count = 0;
+	fake_cv_cancel_count = 0;
+	fake_cv_broadcast_count = 0;
+	fake_cv_sleep_wait_event = 0;
+	fake_cv_wake_release.armed = false;
 	cluster_node_id = 0;
 	NBuffers = max_entries;
 	cluster_pcm_grd_max_entries = max_entries;
@@ -274,6 +296,62 @@ bool
 LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode)
 {
 	return fake_lwlock_held == lock && fake_lwlock_mode == mode;
+}
+
+/* ----------
+ * PGRAC: spec-2.31 D1 v0.4 — ConditionVariable stubs for PCM-H1..H4.
+ *
+ *	cluster_pcm_lock.c now uses ConditionVariable for incompatible-state
+ *	wait.  Unit tests are single-threaded, so the Sleep stub can't really
+ *	block;  instead it records the call and (if armed) performs a release
+ *	on a target tag so the acquire loop sees compatible state on retry.
+ *	Counter variable declarations live above (before reset_fake_pcm_runtime).
+ * ----------
+ */
+void
+ConditionVariableInit(ConditionVariable *cv pg_attribute_unused())
+{
+	fake_cv_init_count++;
+}
+
+void
+ConditionVariablePrepareToSleep(ConditionVariable *cv pg_attribute_unused())
+{
+	fake_cv_prepare_count++;
+}
+
+void
+ConditionVariableSleep(ConditionVariable *cv pg_attribute_unused(), uint32 wait_event_info)
+{
+	fake_cv_sleep_count++;
+	fake_cv_sleep_wait_event = wait_event_info;
+	if (fake_cv_wake_release.armed) {
+		int save_node = cluster_node_id;
+
+		fake_cv_wake_release.armed = false;
+		cluster_node_id = fake_cv_wake_release.holder_node;
+		cluster_pcm_lock_release(fake_cv_wake_release.tag);
+		cluster_node_id = save_node;
+	}
+}
+
+bool
+ConditionVariableCancelSleep(void)
+{
+	fake_cv_cancel_count++;
+	return false;
+}
+
+void
+ConditionVariableBroadcast(ConditionVariable *cv pg_attribute_unused())
+{
+	fake_cv_broadcast_count++;
+}
+
+void
+ConditionVariableSignal(ConditionVariable *cv pg_attribute_unused())
+{
+	/* unused by cluster_pcm_lock.c but linker may require */
 }
 
 TimestampTz
@@ -684,10 +762,121 @@ UT_TEST(test_pcm_real_wait_event_call_sites_are_exercised)
 }
 
 
+/* ============================================================
+ * PGRAC: spec-2.31 D1 v0.4 — PCM API hardening (PCM-H1..H4).
+ * ============================================================ */
+UT_TEST(test_pcm_H1_same_node_s_refcount_increments)
+{
+	BufferTag tag = make_tag(10);
+
+	reset_fake_pcm_runtime(4);
+
+	cluster_node_id = 0;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+	UT_ASSERT_EQ((int)cluster_pcm_lock_query(tag), (int)PCM_LOCK_MODE_S);
+	/* N→S transition counter incremented once */
+	UT_ASSERT_EQ((int)cluster_pcm_get_trans_n_to_s_count(), 1);
+
+	/* Second S acquire by same node — refcount bumps, no N→S transition. */
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+	UT_ASSERT_EQ((int)cluster_pcm_lock_query(tag), (int)PCM_LOCK_MODE_S);
+	UT_ASSERT_EQ((int)cluster_pcm_get_trans_n_to_s_count(), 1);
+
+	/* First release: state still S (refcount drops from 2 to 1). */
+	cluster_pcm_lock_release(tag);
+	UT_ASSERT_EQ((int)cluster_pcm_lock_query(tag), (int)PCM_LOCK_MODE_S);
+	UT_ASSERT_EQ((int)cluster_pcm_get_trans_s_to_n_release_count(), 0);
+}
+
+
+UT_TEST(test_pcm_H2_last_s_release_transitions_to_n)
+{
+	BufferTag tag = make_tag(11);
+
+	reset_fake_pcm_runtime(4);
+
+	cluster_node_id = 0;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+
+	/* First release: state remains S. */
+	cluster_pcm_lock_release(tag);
+	UT_ASSERT_EQ((int)cluster_pcm_lock_query(tag), (int)PCM_LOCK_MODE_S);
+
+	/* Second release (refcount→0): state→N, broadcast fires. */
+	cluster_pcm_lock_release(tag);
+	UT_ASSERT_EQ((int)cluster_pcm_lock_query(tag), (int)PCM_LOCK_MODE_N);
+	UT_ASSERT_EQ((int)cluster_pcm_get_trans_s_to_n_release_count(), 1);
+	UT_ASSERT((fake_cv_broadcast_count) >= (1));
+}
+
+
+UT_TEST(test_pcm_H3_incompatible_x_waits_and_wakes)
+{
+	BufferTag tag = make_tag(12);
+
+	reset_fake_pcm_runtime(4);
+
+	/* Node 0 holds X. */
+	cluster_node_id = 0;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_X);
+	UT_ASSERT_EQ((int)cluster_pcm_lock_query(tag), (int)PCM_LOCK_MODE_X);
+
+	/* Arm stub:  on first Sleep, simulate node-0 releasing X.  Then the
+	 * acquire loop sees state=N and proceeds to acquire X for node 1. */
+	fake_cv_wake_release.tag = tag;
+	fake_cv_wake_release.holder_node = 0;
+	fake_cv_wake_release.armed = true;
+
+	cluster_node_id = 1;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_X);
+
+	UT_ASSERT_EQ((int)cluster_pcm_lock_query(tag), (int)PCM_LOCK_MODE_X);
+	UT_ASSERT((fake_cv_sleep_count) >= (1));
+	UT_ASSERT_EQ((int)fake_cv_sleep_wait_event, (int)WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
+	UT_ASSERT((fake_cv_prepare_count) >= (1));
+	UT_ASSERT((fake_cv_cancel_count) >= (1));
+}
+
+
+UT_TEST(test_pcm_H4_release_broadcasts_only_on_state_change)
+{
+	BufferTag tag = make_tag(13);
+
+	reset_fake_pcm_runtime(4);
+
+	cluster_node_id = 0;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_X);
+
+	/* X→N release: broadcast fires (state changed to N). */
+	cluster_pcm_lock_release(tag);
+	UT_ASSERT_EQ((int)cluster_pcm_lock_query(tag), (int)PCM_LOCK_MODE_N);
+	UT_ASSERT_EQ(fake_cv_broadcast_count, 1);
+
+	/* S acquire + release (single holder): broadcast fires again. */
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+	cluster_pcm_lock_release(tag);
+	UT_ASSERT_EQ((int)cluster_pcm_lock_query(tag), (int)PCM_LOCK_MODE_N);
+	UT_ASSERT_EQ(fake_cv_broadcast_count, 2);
+
+	/* Two S acquires + one release: refcount 2→1, no state change, no broadcast. */
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+	cluster_pcm_lock_release(tag);
+	UT_ASSERT_EQ((int)cluster_pcm_lock_query(tag), (int)PCM_LOCK_MODE_S);
+	UT_ASSERT_EQ(fake_cv_broadcast_count, 2);
+
+	/* Second release: refcount 1→0, state→N, broadcast fires. */
+	cluster_pcm_lock_release(tag);
+	UT_ASSERT_EQ((int)cluster_pcm_lock_query(tag), (int)PCM_LOCK_MODE_N);
+	UT_ASSERT_EQ(fake_cv_broadcast_count, 3);
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(30);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
 	UT_RUN(test_pcm_lock_transition_enum_values_are_1_to_9);
@@ -714,6 +903,10 @@ main(void)
 	UT_RUN(test_pcm_real_upgrade_requires_single_s_holder);
 	UT_RUN(test_pcm_real_summary_counts_live_entries);
 	UT_RUN(test_pcm_real_wait_event_call_sites_are_exercised);
+	UT_RUN(test_pcm_H1_same_node_s_refcount_increments);
+	UT_RUN(test_pcm_H2_last_s_release_transitions_to_n);
+	UT_RUN(test_pcm_H3_incompatible_x_waits_and_wakes);
+	UT_RUN(test_pcm_H4_release_broadcasts_only_on_state_change);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

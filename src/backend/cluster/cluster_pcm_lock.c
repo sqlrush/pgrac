@@ -45,6 +45,7 @@
 #include "miscadmin.h"
 #include "port/atomics.h" /* PGRAC: spec-2.30 D1 — pg_atomic_uint32/64 */
 #include "storage/buf_internals.h"
+#include "storage/condition_variable.h" /* PGRAC: spec-2.31 D1 — wait_cv */
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "utils/elog.h"
@@ -132,30 +133,39 @@ typedef struct PcmConvertQueue PcmConvertQueue;
 
 
 /*
- * PGRAC: spec-2.30 D1 — GrdEntry full struct definition (file-private).
+ * PGRAC: spec-2.30 D1 + spec-2.31 D1 — GrdEntry full struct definition (file-private).
  *
  *	Header keeps `typedef struct GrdEntry GrdEntry;` opaque (spec-1.7 Q3
  *	user-locked).  Callers/tests MUST go through accessor APIs; direct
  *	deref of `GrdEntry *` is forbidden.
  *
- *	Layout (216B; PG-fact 修订 from spec-2.30 §2.1 nominal 208B):
+ *	Layout (spec-2.31 D1 v0.4 — size 实证 NEW; was 216B in spec-2.30):
  *	  [  0,  20) BufferTag       tag                        (PG-native; 20B)
  *	  [ 20,  24) pg_atomic_uint32 master_state              (PcmState N/S/X)
  *	  [ 24,  28) int32           x_holder_node              (-1 = no X holder)
  *	  [ 28,  32) pg_atomic_uint32 s_holders_bitmap          (per-node S bit)
  *	  [ 32,  36) pg_atomic_uint32 pi_holders_bitmap         (per-node PI bit)
- *	  [ 36,  40) uint32          _pad1                      (compiler-inserted; explicit for clarity)
+ *	  [ 36,  38) uint16          s_holder_refcount_local    (spec-2.31 D1 v0.4: same-node S refs)
+ *	  [ 38,  40) uint16          _pad1                      (4B align of next field)
  *	  [ 40,  48) PcmConvertQueue *convert_queue             (NULL until spec-2.32)
  *	  [ 48,  56) TimestampTz     last_transition_at         (GetCurrentTimestamp() on each transition)
  *	  [ 56,  64) pg_atomic_uint64 transition_count_local    (per-entry monotone)
  *	  [ 64,  88) ClusterGrdHolderId master_holder           (24B 4-tuple identity)
- *	  [ 88, 216) LWLockPadded    entry_lock                 (PG_CACHE_LINE_SIZE=128B)
+ *	  [ 88,  ??) ConditionVariable wait_cv                  (spec-2.31 D1 v0.4: incompatible state wait)
+ *	  [  ?,  ??) LWLockPadded    entry_lock                 (PG_CACHE_LINE_SIZE=128B)
  *
  *	PGRAC: spec-2.30 §2.1 nominal 208B was based on BufferTag=16B
  *	assumption;  PG 16.13 实证 sizeof(BufferTag) == 20B (per
  *	test_cluster_buffer_desc.c:14 PIVOT B note + struct buftag in
- *	buf_internals.h:138).  Actual 216B → flag for spec-2.30 Hardening
- *	v1.0.1 appendix amend (Step 8 ship-level closeout).
+ *	buf_internals.h:138).  spec-2.30 size 216B → flag Hardening v1.0.1 F1.
+ *
+ *	PGRAC: spec-2.31 D1 v0.4 — bufmgr-safe blocking/refcount API hardening
+ *	adds `s_holder_refcount_local` (same-node S refs; spec-2.32 wire 配套
+ *	时 extend 为 array per-node) + `wait_cv` (incompatible state wait via
+ *	ConditionVariableSleep(wait_cv, WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT)).
+ *	GrdEntry size 216 → 实证后定 (probable ~232-240B; StaticAssertDecl
+ *	enforces actual value).  spec-2.30 §2.1 frozen 不改;Hardening v1.0.2
+ *	forward-link appendix in ship-level closeout.
  *
  *	HC57 — transition mutation must hold entry_lock EXCLUSIVE;
  *	master_state read 路径 atomic uint32 read 无锁;atomic bitmap
@@ -168,18 +178,31 @@ struct GrdEntry {
 	int32 x_holder_node;					 /*  4B [ 24,  28) -1 = no X holder */
 	pg_atomic_uint32 s_holders_bitmap;		 /*  4B [ 28,  32) per-node S bit */
 	pg_atomic_uint32 pi_holders_bitmap;		 /*  4B [ 32,  36) per-node PI bit */
-	uint32 _pad1;							 /*  4B [ 36,  40) 8B align _pad */
+	uint16 s_holder_refcount_local;			 /*  2B [ 36,  38) spec-2.31 D1: same-node S refs */
+	uint16 _pad1;							 /*  2B [ 38,  40) 4B align */
 	PcmConvertQueue *convert_queue;			 /*  8B [ 40,  48) NULL until spec-2.32 */
 	TimestampTz last_transition_at;			 /*  8B [ 48,  56) */
 	pg_atomic_uint64 transition_count_local; /*  8B [ 56,  64) per-entry monotone */
 	ClusterGrdHolderId master_holder;		 /* 24B [ 64,  88) 4-tuple identity */
-	LWLockPadded entry_lock;				 /*128B [ 88, 216) PG_CACHE_LINE_SIZE */
+	ConditionVariable wait_cv;				 /* spec-2.31 D1 v0.4 incompatible state wait */
+	LWLockPadded entry_lock;				 /*128B PG_CACHE_LINE_SIZE — must stay last */
 };
 
-StaticAssertDecl(sizeof(struct GrdEntry) == 216,
-				 "spec-2.30 D1 GrdEntry ABI 216-byte lock (BufferTag=20B PG 16.13 + "
-				 "atomic fields + LWLockPadded 128B);  spec §2.1 nominal 208B from "
-				 "BufferTag=16B assumption — flag Hardening v1.0.1 F1 spec amend");
+/*
+ * PGRAC: spec-2.31 D1 v0.4 F2 — GrdEntry size bump from spec-2.30's 216B.
+ *
+ *	`sizeof(ConditionVariable) == sizeof(slock_t) + sizeof(proclist_head)`
+ *	depends on platform alignment (slock_t typically 4B on macOS / Linux;
+ *	proclist_head = 8B).  We assert the actual measured size matches an
+ *	expected value to catch silent layout drift; if the platform produces
+ *	a different size, the assertion fires and the constant must be amended
+ *	(with spec Hardening appendix) before ship.
+ */
+StaticAssertDecl(sizeof(struct GrdEntry) == 232,
+				 "spec-2.31 D1 v0.4 GrdEntry size 216 → 232 (added s_holder_refcount_local "
+				 "2B replacing 4B _pad1 → 2B + 2B align; + ConditionVariable wait_cv 12-16B "
+				 "+ LWLockPadded alignment); spec-2.30 was 216B; spec-2.30 Hardening v1.0.2 "
+				 "forward-link appendix to be added at ship-level closeout");
 
 
 /*
@@ -471,9 +494,9 @@ void
 cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode)
 {
 	struct GrdEntry *entry;
-	PcmState cur;
-	PcmLockTransition trans;
 	int holder_node;
+	uint32 holder_bit;
+	bool cv_prepared = false;
 
 	CLUSTER_INJECTION_POINT("cluster-pcm-acquire-entry");
 
@@ -497,39 +520,74 @@ cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode)
 						errmsg("cluster_pcm_lock_acquire: PCM GRD HTAB FULL (cap=%d)",
 							   pcm_grd_effective)));
 
-	pcm_entry_lock_exclusive(entry);
+	holder_bit = pcm_holder_bit(holder_node);
 
-	cur = (PcmState)pg_atomic_read_u32(&entry->master_state);
+	/*
+	 * PGRAC: spec-2.31 D1 v0.4 — bufmgr-safe blocking acquire loop.
+	 *
+	 *	Single-node multi-backend semantics:
+	 *	  - S + N (no holders)                → state→S, refcount=1
+	 *	  - S + S (this node already holds)   → refcount++ (no master change)
+	 *	  - S + S (other node holds; n/a in single-node) → set bit + refcount=1
+	 *	  - S + X                             → wait on wait_cv
+	 *	  - X + N                             → state→X
+	 *	  - X + S / X + X                     → wait on wait_cv
+	 *
+	 *	Wait path uses ConditionVariable with WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT
+	 *	for DBA observability (pg_stat_activity.wait_event).  HC57 still holds
+	 *	for transition mutation (only inside entry_lock EXCLUSIVE).
+	 */
+	for (;;) {
+		PcmState cur;
 
-	/* Determine target transition.  S-mode admits multiple holders. */
-	if (cur == PCM_STATE_N && mode == PCM_LOCK_MODE_S)
-		trans = PCM_TRANS_N_TO_S;
-	else if (cur == PCM_STATE_N && mode == PCM_LOCK_MODE_X)
-		trans = PCM_TRANS_N_TO_X;
-	else if (cur == PCM_STATE_S && mode == PCM_LOCK_MODE_S) {
-		pg_atomic_fetch_or_u32(&entry->s_holders_bitmap, pcm_holder_bit(holder_node));
+		pcm_entry_lock_exclusive(entry);
+
+		cur = (PcmState)pg_atomic_read_u32(&entry->master_state);
+
+		if (mode == PCM_LOCK_MODE_S) {
+			if (cur == PCM_STATE_N) {
+				cluster_pcm_transition_apply(entry, PCM_TRANS_N_TO_S, holder_node);
+				entry->s_holder_refcount_local = 1;
+				LWLockRelease(&entry->entry_lock.lock);
+				if (cv_prepared)
+					ConditionVariableCancelSleep();
+				return;
+			}
+			if (cur == PCM_STATE_S) {
+				/* Same-node S re-acquire: bump refcount; or join from other-node-S. */
+				if ((pg_atomic_read_u32(&entry->s_holders_bitmap) & holder_bit) != 0)
+					entry->s_holder_refcount_local++;
+				else {
+					pg_atomic_fetch_or_u32(&entry->s_holders_bitmap, holder_bit);
+					entry->s_holder_refcount_local = 1;
+				}
+				LWLockRelease(&entry->entry_lock.lock);
+				if (cv_prepared)
+					ConditionVariableCancelSleep();
+				return;
+			}
+			/* cur == X → fall through to wait */
+		} else /* mode == PCM_LOCK_MODE_X */
+		{
+			if (cur == PCM_STATE_N) {
+				cluster_pcm_transition_apply(entry, PCM_TRANS_N_TO_X, holder_node);
+				LWLockRelease(&entry->entry_lock.lock);
+				if (cv_prepared)
+					ConditionVariableCancelSleep();
+				return;
+			}
+			/* cur == S or X → fall through to wait */
+		}
+
+		/* Incompatible state — wait on CV. */
+		if (!cv_prepared) {
+			ConditionVariablePrepareToSleep(&entry->wait_cv);
+			cv_prepared = true;
+		}
 		LWLockRelease(&entry->entry_lock.lock);
-		return;
-	} else {
-		LWLockRelease(&entry->entry_lock.lock);
-		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-						errmsg("cluster_pcm_lock_acquire: illegal acquire from state %d to mode %d",
-							   (int)cur, (int)mode),
-						errhint("Use cluster_pcm_lock_upgrade() for S→X;  current lock must be "
-								"released before re-acquire.")));
+		ConditionVariableSleep(&entry->wait_cv, WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
+		/* loop and re-check master_state */
 	}
-
-	if (!cluster_pcm_transition_legal(cur, (PcmState)mode, trans)) {
-		LWLockRelease(&entry->entry_lock.lock);
-		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-						errmsg("cluster_pcm_lock_acquire: HC56 validator rejected transition "
-							   "(from=%d to=%d trans=%d)",
-							   (int)cur, (int)mode, (int)trans)));
-	}
-
-	cluster_pcm_transition_apply(entry, trans, holder_node);
-
-	LWLockRelease(&entry->entry_lock.lock);
 }
 
 
@@ -538,8 +596,9 @@ cluster_pcm_lock_release(BufferTag tag)
 {
 	struct GrdEntry *entry;
 	PcmState cur;
-	PcmLockTransition trans;
 	int holder_node;
+	uint32 holder_bit;
+	bool broadcast_needed = false;
 
 	CLUSTER_INJECTION_POINT("cluster-pcm-release-pre");
 
@@ -558,11 +617,23 @@ cluster_pcm_lock_release(BufferTag tag)
 						errmsg("cluster_pcm_lock_release: no PCM entry for BufferTag (released "
 							   "without prior acquire?)")));
 
+	holder_bit = pcm_holder_bit(holder_node);
+
 	pcm_entry_lock_exclusive(entry);
 
 	cur = (PcmState)pg_atomic_read_u32(&entry->master_state);
 
-	/* Release maps to trans 6 (X→N release) or trans 8 (S→N release). */
+	/*
+	 * PGRAC: spec-2.31 D1 v0.4 — refcount-aware release.
+	 *
+	 *	X → N release:  X holder unique per node; transition always to N;
+	 *	                broadcast (X waiter and S waiter both eligible).
+	 *	S release:      decrement same-node refcount;  if 0, call
+	 *	                S_TO_N_RELEASE which clears this node's bit and
+	 *	                transitions to N iff all node bits cleared.
+	 *	                broadcast only when state truly went to N (X waiter
+	 *	                wakes); same-node refcount-only paths skip broadcast.
+	 */
 	if (cur == PCM_STATE_X) {
 		if (entry->x_holder_node != holder_node) {
 			LWLockRelease(&entry->entry_lock.lock);
@@ -571,17 +642,32 @@ cluster_pcm_lock_release(BufferTag tag)
 					 errmsg("cluster_pcm_lock_release: node %d cannot release X held by node %d",
 							holder_node, entry->x_holder_node)));
 		}
-		trans = PCM_TRANS_X_TO_N_RELEASE;
-		cluster_pcm_transition_apply(entry, trans, holder_node);
+		cluster_pcm_transition_apply(entry, PCM_TRANS_X_TO_N_RELEASE, holder_node);
+		broadcast_needed = true;
 	} else if (cur == PCM_STATE_S) {
-		if ((pg_atomic_read_u32(&entry->s_holders_bitmap) & pcm_holder_bit(holder_node)) == 0) {
+		if ((pg_atomic_read_u32(&entry->s_holders_bitmap) & holder_bit) == 0) {
 			LWLockRelease(&entry->entry_lock.lock);
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("cluster_pcm_lock_release: node %d is not an S holder", holder_node)));
 		}
-		trans = PCM_TRANS_S_TO_N_RELEASE;
-		cluster_pcm_transition_apply(entry, trans, holder_node);
+		/*
+		 * PGRAC: spec-2.31 D1 v0.4 — refcount semantics under single-uint16
+		 * design (F4 user decision: same-node only).  refcount tracks nested
+		 * same-node acquires; cross-node simulations in unit tests may have
+		 * overwritten refcount via "other-node S join" branch.  Be lenient:
+		 * if refcount > 0, decrement; if refcount == 0 (either reached 0
+		 * just now, or was already 0 due to cross-node simulation), clear
+		 * this node's bit via transition_apply.
+		 */
+		if (entry->s_holder_refcount_local > 0)
+			entry->s_holder_refcount_local--;
+		if (entry->s_holder_refcount_local == 0) {
+			cluster_pcm_transition_apply(entry, PCM_TRANS_S_TO_N_RELEASE, holder_node);
+			if ((PcmState)pg_atomic_read_u32(&entry->master_state) == PCM_STATE_N)
+				broadcast_needed = true;
+		}
+		/* else: refcount > 0 still; same-node S holder remains; no state change */
 	} else {
 		LWLockRelease(&entry->entry_lock.lock);
 		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
@@ -589,6 +675,9 @@ cluster_pcm_lock_release(BufferTag tag)
 	}
 
 	LWLockRelease(&entry->entry_lock.lock);
+
+	if (broadcast_needed)
+		ConditionVariableBroadcast(&entry->wait_cv);
 }
 
 
@@ -931,6 +1020,8 @@ pcm_get_or_create_entry(BufferTag tag)
 		pg_atomic_init_u32(&entry->s_holders_bitmap, 0);
 		pg_atomic_init_u32(&entry->pi_holders_bitmap, 0);
 		pg_atomic_init_u64(&entry->transition_count_local, 0);
+		entry->s_holder_refcount_local = 0;		/* PGRAC: spec-2.31 D1 v0.4 */
+		ConditionVariableInit(&entry->wait_cv); /* PGRAC: spec-2.31 D1 v0.4 */
 		LWLockInitialize(&entry->entry_lock.lock, LWTRANCHE_CLUSTER_PCM);
 	}
 	LWLockRelease(&ClusterPcm->htab_lock.lock);

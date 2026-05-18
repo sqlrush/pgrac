@@ -123,6 +123,65 @@ typedef struct GrdEntry GrdEntry;
  */
 extern int cluster_pcm_grd_max_entries;
 
+/*
+ * PGRAC: spec-2.31 D2 v0.5 — gated PCM activation predicate.
+ *
+ *	Forward-declare cluster_enabled / cluster_node_id (defined in
+ *	cluster_guc.c) without including cluster_guc.h, to keep header
+ *	dependencies one-way (cluster_pcm_lock.h depends on PG core only;
+ *	cluster_guc.h is the source of truth for the extern itself).
+ *
+ *	cluster_pcm_is_active() is the single gate entry point used by
+ *	bufmgr LockBuffer / LockBufferForCleanup hot path (HC67).
+ *
+ *	Gate layers:
+ *	  1. compile-time: USE_PGRAC_CLUSTER (this header is empty outside it)
+ *	  2. cluster_enabled (Stage 1.11 GUC; PGC_POSTMASTER)
+ *	  3. cluster_node_id >= 0 (single-node fallback uses -1 sentinel until
+ *	     pgrac.conf loads;  during initdb / non-cluster bootstrap the
+ *	     PCM API would FATAL on the -1 range check, so we must skip the
+ *	     hook entirely until a node id is assigned)
+ *	  4. cluster_pcm_grd_max_entries != 0 (spec-1.7 disable path)
+ *
+ *	Inline expansion yields 3 global reads + predictable branch (default
+ *	cluster_enabled=true + max_entries=-1 → NBuffers + node_id set during
+ *	postmaster startup before any LockBuffer is reachable, so branch
+ *	predictor 99%+ taken in the steady state).
+ */
+extern bool cluster_enabled;
+extern int cluster_node_id;
+
+static inline bool
+cluster_pcm_is_active(void)
+{
+	return cluster_enabled && cluster_node_id >= 0 && cluster_pcm_grd_max_entries != 0;
+}
+
+
+/*
+ * PGRAC: spec-2.31 D5 v0.4 — apply PCM ownership fields to BufferDesc.
+ *
+ *	Defined here (not in cluster_buffer_desc.h) because we depend on
+ *	PcmLockMode which is owned by this header;  cluster_buffer_desc.h
+ *	already provides BUF_TYPE_SCUR / BUF_TYPE_XCUR / PCM_STATE_* via the
+ *	#include above, and this avoids the circular header dependency that
+ *	would result from cluster_buffer_desc.h declaring the helper itself.
+ *
+ *	Called by bufmgr LockBuffer hook on the success path only (HC66):
+ *	  - cluster_pcm_lock_acquire succeeded, AND
+ *	  - LWLockAcquire(content_lock) succeeded (no ereport)
+ *	→ then this helper updates the caller-supplied buffer_type pointer
+ *	  (monotone hint of last PCM ownership mode) and pcm_state pointer
+ *	  (real-time mirror of PCM master state).
+ */
+static inline void
+cluster_buffer_desc_apply_pcm_ownership_fields(uint8 *out_buffer_type, uint8 *out_pcm_state,
+											   PcmLockMode mode)
+{
+	*out_buffer_type = (mode == PCM_LOCK_MODE_S) ? (uint8)BUF_TYPE_SCUR : (uint8)BUF_TYPE_XCUR;
+	*out_pcm_state = (mode == PCM_LOCK_MODE_S) ? (uint8)PCM_STATE_S : (uint8)PCM_STATE_X;
+}
+
 
 /*
  * PCM lock mutation API.

@@ -1126,7 +1126,9 @@ dump_buffer_format(ReturnSetInfo *rsinfo)
 			 fmt_int32((int32)offsetof(BufferDesc, buffer_type)));
 	emit_row(rsinfo, "buffer_format", "buffer_cold_field_offset",
 			 fmt_int32((int32)offsetof(BufferDesc, cr_chain_head)));
-	emit_row(rsinfo, "buffer_format", "buffer_type_count", "3");
+	/* PGRAC: spec-2.31 D6 v0.5 — BufferType enum extended from 3 to 5
+	 * (added SCUR + XCUR for bufmgr content-lock PCM ownership). */
+	emit_row(rsinfo, "buffer_format", "buffer_type_count", "5");
 	emit_row(rsinfo, "buffer_format", "pcm_state_count", "3");
 }
 

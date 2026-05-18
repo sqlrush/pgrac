@@ -34,7 +34,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_ic_mock test_cluster_inject test_cluster_pgstat \
         test_cluster_debug test_cluster_shared_fs test_cluster_smgr \
         test_cluster_scn test_cluster_block_format test_cluster_itl_slot \
-        test_cluster_buffer_desc test_cluster_pcm_lock \
+        test_cluster_buffer_desc test_cluster_pcm_lock test_cluster_bufmgr_pcm_hook \
         test_cluster_startup_phase test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_cssd test_cluster_qvotec test_cluster_voting_disk_io test_cluster_quorum_decision \
         test_cluster_xlog test_cluster_tt_slot test_cluster_undo_segment \
         test_cluster_epoch test_cluster_fence test_cluster_reconfig \
@@ -492,6 +492,18 @@ test_cluster_lock_acquire: test_cluster_lock_acquire.c unit_test.h \
 # Test stubs all of these and drives a tiny fake shared HTAB so the real
 # acquire/release/upgrade/downgrade/query paths are exercised standalone.
 test_cluster_pcm_lock: test_cluster_pcm_lock.c unit_test.h \
+		$(CLUSTER_VERSION_O) $(CLUSTER_PCM_LOCK_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_PCM_LOCK_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-2.31 D9 v0.5: test_cluster_bufmgr_pcm_hook verifies the bufmgr
+# LockBuffer/LockBufferForCleanup PCM hook layer in isolation by using a
+# fake LockBuffer wrapper that mirrors the D3 hook structure.  Links
+# cluster_pcm_lock.o (real acquire/release behavior) + reuses the same
+# stub family as test_cluster_pcm_lock.
+test_cluster_bufmgr_pcm_hook: test_cluster_bufmgr_pcm_hook.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_PCM_LOCK_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_PCM_LOCK_O) \

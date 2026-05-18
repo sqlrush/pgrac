@@ -96,8 +96,8 @@ is($node->safe_psql(
 		'postgres',
 		q{SELECT value FROM pg_cluster_state
 		   WHERE category='buffer_format' AND key='buffer_type_count'}),
-   '3',
-   'L6 buffer_type_count = 3 (CURRENT / CR / PI)');
+   '5',
+   'L6 buffer_type_count = 5 (CURRENT / CR / PI / SCUR / XCUR — spec-2.31 D6 v0.5)');
 
 is($node->safe_psql(
 		'postgres',
@@ -124,8 +124,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-   '77',
-   'L9 pg_stat_cluster_wait_events returns 77 rows after spec-2.30 D8');
+   '78',
+   'L9 pg_stat_cluster_wait_events returns 78 rows after spec-2.30 D8');
 
 
 # ----------

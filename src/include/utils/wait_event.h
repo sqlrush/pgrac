@@ -299,7 +299,7 @@ typedef enum {
 	WAIT_EVENT_GES_CANCEL_DRAIN,
 	WAIT_EVENT_GES_DEADLOCK_REASSEMBLY_WAIT,
 
-	/* Cluster: PCM (8 events; +2 NEW spec-2.30 D8) -- subsystem #6 */
+	/* Cluster: PCM (9 events; +2 spec-2.30 D8 + 1 spec-2.31 D6) -- subsystem #6 */
 	WAIT_EVENT_PCM_BLOCK_READ_N_S = PG_WAIT_CLUSTER_PCM,
 	WAIT_EVENT_PCM_BLOCK_READ_N_X,
 	WAIT_EVENT_PCM_BLOCK_WRITE_S_X,
@@ -310,6 +310,11 @@ typedef enum {
 	WAIT_EVENT_PCM_GRD_INIT,
 	/* PGRAC (spec-2.30 D8): per-entry entry_lock acquire hot path. */
 	WAIT_EVENT_PCM_TRANSITION_APPLY,
+	/* PGRAC (spec-2.31 D6 F3 v0.4): wait_cv ConditionVariableSleep when
+	 * cluster_pcm_lock_acquire sees incompatible holder state.  Bufmgr
+	 * content-lock hook contention path; DBA sees backend waiting on
+	 * 'ClusterPcmCompatibleStateWait' in pg_stat_activity. */
+	WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT,
 
 	/* Cluster: BufferShip (5 events) -- subsystem #5 */
 	WAIT_EVENT_BUFFER_SHIP_CR_BUILD = PG_WAIT_CLUSTER_BUFFERSHIP,

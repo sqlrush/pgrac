@@ -17,7 +17,7 @@
 #	       string value "active"/"stub"
 #	  L4  9 transition counter rows present + non-negative
 #	  L5  ClusterPcmTransitionApply wait event in pg_stat_cluster_wait_events
-#	  L6  wait event baseline 75 → 77 (PCM_GRD_INIT + PCM_TRANSITION_APPLY)
+#	  L6  wait event baseline 75 → 77 → 78 (PCM_GRD_INIT + PCM_TRANSITION_APPLY)
 #	  L7  no PCM wire opcode smoke (L107 N+5 严守:no PCM wire enum added)
 #
 # Spec: spec-2.30-pcm-9-state-machine-activation.md (FROZEN v0.3)
@@ -81,8 +81,8 @@ is($apply_event, '1',
 # L6 — wait event count baseline 75 → 77
 my $wait_event_count = $node_default->safe_psql(
 	'postgres', "SELECT count(*) FROM pg_stat_cluster_wait_events");
-is($wait_event_count, '77',
-   'L6 wait event baseline 77 (spec-2.30 D8 +2 PCM_GRD_INIT + PCM_TRANSITION_APPLY)');
+is($wait_event_count, '78',
+   'L6 wait event baseline 78 (spec-2.30 D8 +2 PCM_GRD_INIT + PCM_TRANSITION_APPLY)');
 
 # L7 — no PCM wire opcode smoke (no SQL-visible PCM wire opcode enum surface)
 my $pcm_grd_init_event = $node_default->safe_psql(

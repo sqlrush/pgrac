@@ -51,7 +51,7 @@
  *	internal table in cluster_views.c stays in sync with the enum.
  */
 #define CLUSTER_WAIT_EVENTS_COUNT                                                                  \
-	77 /* spec-2.30 D8: +2 PCM_GRD_INIT + PCM_TRANSITION_APPLY (was 75 spec-2.25) */
+	78 /* spec-2.31 D6 F3 v0.4: +1 PCM_COMPATIBLE_STATE_WAIT (was 77 spec-2.30) */
 
 
 /*

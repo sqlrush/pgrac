@@ -49,6 +49,9 @@
 #include "pgstat.h"
 #include "postmaster/bgwriter.h"
 #include "storage/buf_internals.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_pcm_lock.h"
+#endif
 #include "storage/bufmgr.h"
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
@@ -4812,11 +4815,19 @@ UnlockBuffers(void)
 
 /*
  * Acquire or release the content_lock for the buffer.
+ *
+ * PGRAC: spec-2.31 wires the PCM state machine as the outer lock for
+ * shared-buffer content locks.  PCM acquisition happens before the local
+ * content_lock; release happens after the local content_lock is released.
  */
 void
 LockBuffer(Buffer buffer, int mode)
 {
 	BufferDesc *buf;
+#ifdef USE_PGRAC_CLUSTER
+	bool		pcm_acquired = false;
+	PcmLockMode pcm_mode = PCM_LOCK_MODE_N;
+#endif
 
 	Assert(BufferIsPinned(buffer));
 	if (BufferIsLocal(buffer))
@@ -4824,14 +4835,58 @@ LockBuffer(Buffer buffer, int mode)
 
 	buf = GetBufferDescriptor(buffer - 1);
 
+	if (mode != BUFFER_LOCK_UNLOCK &&
+		mode != BUFFER_LOCK_SHARE &&
+		mode != BUFFER_LOCK_EXCLUSIVE)
+		elog(ERROR, "unrecognized buffer lock mode: %d", mode);
+
+#ifdef USE_PGRAC_CLUSTER
+	if (mode != BUFFER_LOCK_UNLOCK && cluster_pcm_is_active())
+	{
+		pcm_mode = (mode == BUFFER_LOCK_SHARE) ? PCM_LOCK_MODE_S : PCM_LOCK_MODE_X;
+		cluster_pcm_lock_acquire(buf->tag, pcm_mode);
+		pcm_acquired = true;
+	}
+#endif
+
 	if (mode == BUFFER_LOCK_UNLOCK)
 		LWLockRelease(BufferDescriptorGetContentLock(buf));
-	else if (mode == BUFFER_LOCK_SHARE)
-		LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED);
-	else if (mode == BUFFER_LOCK_EXCLUSIVE)
-		LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE);
 	else
-		elog(ERROR, "unrecognized buffer lock mode: %d", mode);
+	{
+#ifdef USE_PGRAC_CLUSTER
+		PG_TRY();
+		{
+#endif
+			if (mode == BUFFER_LOCK_SHARE)
+				LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED);
+			else
+				LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+		}
+		PG_CATCH();
+		{
+			if (pcm_acquired)
+				cluster_pcm_lock_release(buf->tag);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+
+		if (pcm_acquired)
+			cluster_buffer_desc_apply_pcm_ownership_fields(&buf->buffer_type,
+														   &buf->pcm_state,
+														   pcm_mode);
+#endif
+	}
+
+#ifdef USE_PGRAC_CLUSTER
+	if (mode == BUFFER_LOCK_UNLOCK &&
+		cluster_pcm_is_active() &&
+		buf->pcm_state != (uint8) PCM_STATE_N)
+	{
+		cluster_pcm_lock_release(buf->tag);
+		buf->pcm_state = (uint8) cluster_pcm_lock_query(buf->tag);
+	}
+#endif
 }
 
 /*
@@ -4892,6 +4947,11 @@ CheckBufferIsPinnedOnce(Buffer buffer)
  * then call LockBufferForCleanup().  LockBufferForCleanup() is similar to
  * LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE), except that it loops until
  * it has successfully observed pin count = 1.
+ *
+ * PGRAC: no additional outer PCM acquire is needed here.  The internal
+ * LockBuffer(BUFFER_LOCK_EXCLUSIVE) / LockBuffer(BUFFER_LOCK_UNLOCK) loop
+ * drives the spec-2.31 PCM hook per attempt, and avoids holding PCM X while
+ * waiting for unrelated local pins to drain.
  */
 void
 LockBufferForCleanup(Buffer buffer)

@@ -101,16 +101,26 @@
 
 
 /*
- * BufferType -- buffer payload type (Oracle current / CR / PI taxonomy).
+ * BufferType -- buffer payload type (Oracle current / CR / PI / SCUR / XCUR taxonomy).
  *
  *	Stage 1.6 ships only the typedef; all buffers are zero-init'd to
  *	BUF_TYPE_CURRENT (= 0).  Stage 3 (AD-006 第五轮) implements the
  *	actual CR / PI buffer types when CR chain construction lands.
+ *
+ *	spec-2.31 D5 v0.4 extends the enum with SCUR (Shared current copy,
+ *	PCM=S) and XCUR (eXclusive current copy, PCM=X).  Updated by the
+ *	bufmgr LockBuffer hook on successful PCM acquire (HC66:  set only
+ *	on the success path, monotone hint — last successful PCM ownership
+ *	mode, not real-time PCM holding state).  pcm_state mirrors real-time
+ *	PCM via cluster_pcm_lock_query; buffer_type stays through release.
+ *	cluster_debug.c `buffer_type_count` surfaces 5 (was 3 in spec-1.6).
  */
 typedef enum {
 	BUF_TYPE_CURRENT = 0, /* current block copy (zero-init occupies) */
 	BUF_TYPE_CR = 1,	  /* Consistent Read copy (read-only, on-demand) */
-	BUF_TYPE_PI = 2		  /* Past Image (kept after X-lock let-go) */
+	BUF_TYPE_PI = 2,	  /* Past Image (kept after X-lock let-go) */
+	BUF_TYPE_SCUR = 3,	  /* Shared current copy (PCM=S; spec-2.31 D5 v0.4) */
+	BUF_TYPE_XCUR = 4	  /* eXclusive current copy (PCM=X; spec-2.31 D5 v0.4) */
 } BufferType;
 
 
