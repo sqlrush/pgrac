@@ -444,9 +444,9 @@ cluster_gcs_send_transition_and_wait(BufferTag tag, PcmLockTransition transition
 		if (gcs_send_envelope_or_loopback(PGRAC_IC_MSG_GCS_REQUEST, master_node, &payload,
 										  sizeof(payload))
 			!= CLUSTER_IC_SEND_DONE)
-			ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
-							errmsg("cluster_gcs: failed to send GCS request to node %d",
-								   master_node)));
+			ereport(ERROR,
+					(errcode(ERRCODE_CONNECTION_FAILURE),
+					 errmsg("cluster_gcs: failed to send GCS request to node %d", master_node)));
 
 		/*
 		 * Wait for reply or internal safety deadline.  Public timeout GUC

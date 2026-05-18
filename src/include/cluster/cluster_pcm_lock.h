@@ -248,7 +248,7 @@ extern bool cluster_pcm_transition_legal(PcmState from, PcmState to, PcmLockTran
 extern void cluster_pcm_transition_apply(struct GrdEntry *entry, PcmLockTransition trans,
 										 int holder_node_id);
 extern bool cluster_pcm_lock_apply_gcs_transition(BufferTag tag, PcmLockTransition trans,
-												 int holder_node_id);
+												  int holder_node_id);
 
 
 /* ============================================================

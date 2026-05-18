@@ -894,8 +894,7 @@ cluster_pcm_lock_downgrade(BufferTag tag, PcmLockMode target_mode, bool keep_pi)
 	if (cluster_pcm_htab == NULL)
 		PCM_STUB_DISABLED_PATH;
 
-	if (!((target_mode == PCM_LOCK_MODE_S && keep_pi)
-		  || (target_mode == PCM_LOCK_MODE_N && keep_pi)
+	if (!((target_mode == PCM_LOCK_MODE_S && keep_pi) || (target_mode == PCM_LOCK_MODE_N && keep_pi)
 		  || (target_mode == PCM_LOCK_MODE_N && !keep_pi)))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("cluster_pcm_lock_downgrade: illegal target_mode=%d keep_pi=%d",
