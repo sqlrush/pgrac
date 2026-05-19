@@ -303,6 +303,11 @@ typedef enum BuiltinTrancheIds {
 	 * cluster_gcs.c.  Guards reservation/release of MAX_OUTSTANDING_REQUESTS_PER_BACKEND
 	 * slots; per-backend granularity keeps contention surface tiny. */
 	LWTRANCHE_CLUSTER_GCS,
+	/* PGRAC (spec-2.33 D3): per-backend outstanding-block-request block lock in
+	 * cluster_gcs_block.c.  Same per-backend granularity as spec-2.32 control
+	 * plane; separate tranche so observability can distinguish data-plane
+	 * (block ship) contention from control-plane (transition request) contention. */
+	LWTRANCHE_CLUSTER_GCS_BLOCK,
 #endif
 	LWTRANCHE_FIRST_USER_DEFINED
 } BuiltinTrancheIds;

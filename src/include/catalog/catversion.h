@@ -295,7 +295,23 @@
  * ClusterPcmGrdInit + ClusterPcmTransitionApply (CLUSTER_WAIT_EVENTS_COUNT
  * 75 -> 77).  cluster_pcm_lock_query 真 lookup (spec-1.7 always-N 行为
  * 撤销).  catversion bump for catalog tooling. */
-#define CATALOG_VERSION_NO 202605390
+/* spec-2.33 D11 (2026-05-19):  Cache Fusion block-shipping data plane.
+ * NEW msg_type PGRAC_IC_MSG_GCS_BLOCK_REQUEST=14 + GCS_BLOCK_REPLY=15;
+ * NEW GcsBlockRequestPayload (64B) + GcsBlockReplyHeader (48B) + 8192B
+ * block_data;  NEW GcsBlockReplyStatus 7-value enum (GRANTED +
+ * STORAGE_FALLBACK + 4 DENIED + MASTER_NOT_HOLDER);  cluster_gcs_block
+ * shmem region + LWTRANCHE_CLUSTER_GCS_BLOCK;  8 NEW data-plane counters
+ * exposed via dump_gcs (14→22 rows);  NEW GUC cluster.gcs_reply_timeout_ms
+ * (PGC_SUSET 5000ms);  4 NEW wait events
+ * (CLUSTER_WAIT_EVENTS_COUNT 79→83):  ClusterGCSBlockShipWait +
+ * ClusterGCSBlockRequestDispatch + ClusterGCSBlockReplyDispatch +
+ * ClusterGCSBlockChecksumFail.  cluster_pcm_lock_acquire_buffer NEW
+ * (BufferDesc-aware variant);  tag-only cluster_pcm_lock_acquire fails
+ * closed on remote-master S/X with errhint.  bufmgr cluster_bufmgr_
+ * probe/copy_block_for_gcs helpers (HC82 XLogFlush(page_lsn) before ship
+ * + HC89 single-retry revalidation).  catversion bump for catalog
+ * tooling. */
+#define CATALOG_VERSION_NO 202605400
 
 /* spec-2.16 D19 (2026-05-29):  GesRequestPayload + GesReplyPayload wire
  * payload structs (48B each + StaticAssertDecl);  ClusterGrdHolderId
@@ -303,6 +319,6 @@
  * cluster_grd_pending + cluster_grd_outbound + cluster_grd_work_queue
  * shmem regions + LWLock tranches;  cluster.ges_request_timeout_ms GUC;
  * 53R70/53R71 SQLSTATE.  catversion bump for catalog tooling. */
-#define CATALOG_VERSION_NO_PRIOR 202605290
+#define CATALOG_VERSION_NO_PRIOR 202605390
 
 #endif

@@ -398,6 +398,17 @@ cluster_gcs_send_transition_and_wait(BufferTag tag pg_attribute_unused(),
 	abort();
 }
 
+/* spec-2.33 D3 stub: cluster_pcm_lock_acquire_buffer (D7) takes the data-
+ * plane branch when master is remote.  Fixture forces local path; reaching
+ * here = test bug. */
+void
+cluster_gcs_send_block_request_and_wait(struct BufferDesc *buf pg_attribute_unused(),
+										PcmLockTransition trans pg_attribute_unused(),
+										int master_node pg_attribute_unused())
+{
+	abort();
+}
+
 /* ereport stubs — minimal enough to satisfy linker.  ereport(ERROR, ...)
  * path in cluster_pcm_lock.o would call errstart_cold + errfinish;  none
  * of the tests in this binary trigger that path. */

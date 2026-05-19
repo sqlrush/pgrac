@@ -287,6 +287,15 @@ cluster_gcs_send_transition_and_wait(BufferTag tag pg_attribute_unused(),
 	abort();
 }
 
+/* spec-2.33 D3 stub:  data-plane sender unreachable in this fixture. */
+void
+cluster_gcs_send_block_request_and_wait(struct BufferDesc *buf pg_attribute_unused(),
+										PcmLockTransition trans pg_attribute_unused(),
+										int master_node pg_attribute_unused())
+{
+	abort();
+}
+
 Size
 hash_estimate_size(long num_entries, Size entry_size)
 {

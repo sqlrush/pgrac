@@ -359,6 +359,12 @@ void
 cluster_gcs_register_msg_types(void)
 {}
 
+/* spec-2.33 D4 stub:  cluster_lmon_shmem_init also calls
+ * cluster_gcs_register_block_msg_types (block-shipping data plane). */
+void
+cluster_gcs_register_block_msg_types(void)
+{}
+
 /* spec-2.2 D5 LMON drive references cluster_conf_lookup_node + cluster_node_id. */
 const struct ClusterNodeInfo *
 cluster_conf_lookup_node(int32 node_id pg_attribute_unused())

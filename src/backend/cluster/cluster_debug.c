@@ -95,6 +95,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_buffer_desc.h"   /* BufferType / PcmState enums (stage 1.6) */
 #include "cluster/cluster_pcm_lock.h"	   /* PCM state-machine API + grd helpers */
 #include "cluster/cluster_gcs.h"		   /* GCS request protocol surface (spec-2.32 D8) */
+#include "cluster/cluster_gcs_block.h"	   /* GCS block-ship data plane (spec-2.33 D10) */
 #include "cluster/cluster_startup_phase.h" /* phase enum + accessors (stage 1.10) */
 #include "storage/bufpage.h"	   /* PG_PAGE_LAYOUT_VERSION, SizeOfPageHeaderData (stage 1.4) */
 #include "storage/buf_internals.h" /* BufferDesc layout (stage 1.6) */
@@ -1220,10 +1221,13 @@ dump_pcm(ReturnSetInfo *rsinfo)
 
 
 /* ============================================================
- * dump_gcs -- GCS request protocol observability (spec-2.32 D8).
+ * dump_gcs -- GCS request protocol observability (spec-2.32 D8 + spec-2.33 D10).
  *
- *	14 rows:  api_state + 2 lookup counters + 2 envelope counters + 2
- *	reply counters + 4 byte/loop counters + 3 outstanding stats.
+ *	22 rows total = 14 control-plane rows (spec-2.32) + 8 data-plane rows
+ *	(spec-2.33 D10):  block_request_count + block_reply_count +
+ *	block_timeout_count + block_checksum_fail_count +
+ *	block_storage_fallback_count + block_master_not_holder_count +
+ *	block_wal_flush_before_ship_count + block_ship_bytes_total.
  * ============================================================ */
 static void
 dump_gcs(ReturnSetInfo *rsinfo)
@@ -1254,6 +1258,24 @@ dump_gcs(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "gcs", "max_outstanding", fmt_int64((int64)cluster_gcs_get_max_outstanding()));
 	emit_row(rsinfo, "gcs", "max_outstanding_per_backend",
 			 fmt_int32(MAX_OUTSTANDING_REQUESTS_PER_BACKEND));
+
+	/* spec-2.33 D10:  8 NEW data-plane counter rows (block ship substrate). */
+	emit_row(rsinfo, "gcs", "block_request_count",
+			 fmt_int64((int64)cluster_gcs_get_block_request_count()));
+	emit_row(rsinfo, "gcs", "block_reply_count",
+			 fmt_int64((int64)cluster_gcs_get_block_reply_count()));
+	emit_row(rsinfo, "gcs", "block_timeout_count",
+			 fmt_int64((int64)cluster_gcs_get_block_timeout_count()));
+	emit_row(rsinfo, "gcs", "block_checksum_fail_count",
+			 fmt_int64((int64)cluster_gcs_get_block_checksum_fail_count()));
+	emit_row(rsinfo, "gcs", "block_storage_fallback_count",
+			 fmt_int64((int64)cluster_gcs_get_block_storage_fallback_count()));
+	emit_row(rsinfo, "gcs", "block_master_not_holder_count",
+			 fmt_int64((int64)cluster_gcs_get_block_master_not_holder_count()));
+	emit_row(rsinfo, "gcs", "block_wal_flush_before_ship_count",
+			 fmt_int64((int64)cluster_gcs_get_block_wal_flush_before_ship_count()));
+	emit_row(rsinfo, "gcs", "block_ship_bytes_total",
+			 fmt_int64((int64)cluster_gcs_get_block_ship_bytes_total()));
 }
 
 #endif /* USE_PGRAC_CLUSTER */

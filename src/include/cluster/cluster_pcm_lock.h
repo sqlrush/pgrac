@@ -199,6 +199,20 @@ cluster_buffer_desc_apply_pcm_ownership_fields(uint8 *out_buffer_type, uint8 *ou
  *	  cluster_pcm_lock_downgrade -> "cluster-pcm-downgrade-pre"
  */
 extern void cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode);
+
+/*
+ * PGRAC: spec-2.33 D7 — BufferDesc-aware variant.  Used by bufmgr LockBuffer
+ * so that the GCS data-plane sender can install received block bytes into
+ * the caller's shared buffer (HC84) without requiring callers to thread
+ * BufferDesc through the tag-only path.  Falls back to the same local path
+ * as cluster_pcm_lock_acquire when master == self.
+ *
+ * For S/X with a remote master, this entry point invokes
+ * cluster_gcs_send_block_request_and_wait (spec-2.33 D3).  Tag-only
+ * cluster_pcm_lock_acquire fails closed in that case with an errhint
+ * directing callers here.
+ */
+extern void cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode);
 extern void cluster_pcm_lock_release(BufferTag tag);
 extern void cluster_pcm_lock_upgrade(BufferTag tag);
 extern void cluster_pcm_lock_downgrade(BufferTag tag, PcmLockMode target_mode, bool keep_pi);

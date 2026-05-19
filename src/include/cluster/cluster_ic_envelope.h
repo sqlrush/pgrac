@@ -143,9 +143,11 @@ typedef enum ClusterICMsgType {
 	/* 11 is already occupied by PGRAC_IC_MSG_CSSD_HEARTBEAT macro in
 	 * cluster_cssd.h:107 (spec-2.5 CSSD); skip 10/11 to avoid silent
 	 * wire-ABI collision (spec-2.32 v0.2 F1 PG-fact discovery). */
-	PGRAC_IC_MSG_GCS_REQUEST = 12, /* PGRAC: spec-2.32 D1 — Cache Fusion GCS request wire */
-	PGRAC_IC_MSG_GCS_REPLY = 13	   /* PGRAC: spec-2.32 D1 — Cache Fusion GCS reply wire */
-	/* values 14..255 available for future sub-spec; never reuse 0..13 */
+	PGRAC_IC_MSG_GCS_REQUEST = 12,	   /* PGRAC: spec-2.32 D1 — Cache Fusion GCS request wire */
+	PGRAC_IC_MSG_GCS_REPLY = 13,	   /* PGRAC: spec-2.32 D1 — Cache Fusion GCS reply wire */
+	PGRAC_IC_MSG_GCS_BLOCK_REQUEST = 14, /* PGRAC: spec-2.33 D1 — Cache Fusion block ship request wire */
+	PGRAC_IC_MSG_GCS_BLOCK_REPLY = 15	 /* PGRAC: spec-2.33 D1 — Cache Fusion block ship reply wire (8KB payload) */
+	/* values 16..255 available for future sub-spec; never reuse 0..15 */
 } ClusterICMsgType;
 
 

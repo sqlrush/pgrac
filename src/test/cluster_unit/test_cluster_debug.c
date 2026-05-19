@@ -354,6 +354,49 @@ cluster_gcs_get_api_state(void)
 	return "stub";
 }
 
+/* spec-2.33 D10 stubs: 8 NEW block-plane counter accessors referenced by
+ * cluster_dump_state (cluster_debug.c dump_gcs).  Return 0 for all. */
+uint64
+cluster_gcs_get_block_request_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_reply_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_timeout_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_checksum_fail_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_storage_fallback_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_master_not_holder_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_wal_flush_before_ship_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_ship_bytes_total(void)
+{
+	return 0;
+}
+
 Size
 cluster_shmem_get_total_bytes(void)
 {

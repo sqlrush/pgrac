@@ -39,6 +39,7 @@
 #include "cluster/cluster_grd.h" /* PGRAC: spec-2.30 D1 — ClusterGrdHolderId 24B */
 #include "cluster/cluster_guc.h" /* PGRAC: spec-2.30 D3 — cluster_node_id */
 #include "cluster/cluster_gcs.h" /* PGRAC: spec-2.32 D5 — master lookup + send_transition_and_wait */
+#include "cluster/cluster_gcs_block.h" /* PGRAC: spec-2.33 D7 — send_block_request_and_wait */
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_scn.h"
@@ -616,20 +617,31 @@ cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode)
 							   (int)mode)));
 
 	/*
-	 * PGRAC: spec-2.32 D5 — master lookup branch (HC72 production self
-	 * short-circuit / wire path test-only).  spec-2.32 placeholder lookup
-	 * always returns cluster_node_id in production; spec-2.33+ replaces
-	 * with real GRD master cache lookup.
+	 * PGRAC: spec-2.32 D5 / spec-2.33 D7 — master lookup branch.  HC72
+	 * production self short-circuit is the hot path;  spec-2.33 enables the
+	 * real deterministic-hash master lookup so remote-master is now a real
+	 * (non-test) outcome in multi-node topologies.
+	 *
+	 * S/X with remote master needs a block-shipping data plane round-trip
+	 * (HC79 GCS_BLOCK_REQUEST/REPLY) which requires a BufferDesc to install
+	 * the received bytes into.  This tag-only entry point has no BufferDesc,
+	 * so we fail closed with an errhint redirecting the caller to
+	 * cluster_pcm_lock_acquire_buffer().  Unit tests / non-bufmgr callers
+	 * that legitimately need tag-only semantics MUST stay on the master to
+	 * keep working;  any cross-node usage MUST go through the buffer-aware
+	 * variant.
 	 */
 	{
 		int master_node = cluster_gcs_lookup_master(tag);
 
 		if (master_node != cluster_node_id) {
-			PcmLockTransition trans
-				= (mode == PCM_LOCK_MODE_S) ? PCM_TRANS_N_TO_S : PCM_TRANS_N_TO_X;
-
-			cluster_gcs_send_transition_and_wait(tag, trans, master_node);
-			return; /* HC77: master applied transition; sender returns success */
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cluster_pcm_lock_acquire: remote-master S/X requires "
+							"BufferDesc-aware path"),
+					 errhint("Use cluster_pcm_lock_acquire_buffer() instead; the "
+							 "data plane needs a BufferDesc to install received "
+							 "block bytes under content_lock EXCLUSIVE (HC84).")));
 		}
 	}
 
@@ -713,6 +725,65 @@ cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode)
 		ConditionVariableSleep(&entry->wait_cv, WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
 		/* loop and re-check master_state */
 	}
+}
+
+
+/*
+ * PGRAC: spec-2.33 D7 — BufferDesc-aware PCM acquire.
+ *
+ *	Decision tree (§3.1):
+ *	  master == self    → local fast path (same as cluster_pcm_lock_acquire)
+ *	  master != self    → cluster_gcs_send_block_request_and_wait (HC79)
+ *
+ *	Required by bufmgr LockBuffer because the GCS data plane needs to
+ *	install received block bytes into this buffer's content on GRANTED
+ *	(HC84 PageSetLSN + memcpy under content_lock EXCLUSIVE).
+ */
+void
+cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode)
+{
+	BufferTag	tag;
+	int			master_node;
+
+	if (buf == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("cluster_pcm_lock_acquire_buffer: NULL BufferDesc")));
+
+	if (cluster_pcm_htab == NULL)
+		PCM_STUB_DISABLED_PATH;
+
+	if (mode != PCM_LOCK_MODE_S && mode != PCM_LOCK_MODE_X)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("cluster_pcm_lock_acquire_buffer: invalid mode %d "
+						"(must be S=1 or X=2)", (int) mode)));
+
+	tag = buf->tag;
+	master_node = cluster_gcs_lookup_master(tag);
+
+	if (master_node != cluster_node_id)
+	{
+		PcmLockTransition trans =
+			(mode == PCM_LOCK_MODE_S) ? PCM_TRANS_N_TO_S : PCM_TRANS_N_TO_X;
+
+		/*
+		 * HC79: data-plane block request.  Sender will install received
+		 * bytes into buf under content_lock EXCLUSIVE on GRANTED, or keep
+		 * the shared-storage page on GRANTED_STORAGE_FALLBACK (HC88).
+		 */
+		cluster_gcs_send_block_request_and_wait(buf, trans, master_node);
+		return;					/* HC77: master applied transition */
+	}
+
+	/*
+	 * Local fast path:  reuse the existing tag-only implementation now that
+	 * we've already established master == self (the inner master-lookup
+	 * branch in cluster_pcm_lock_acquire would otherwise fail-closed under
+	 * spec-2.33 D7 because it cannot reach the data plane without a
+	 * BufferDesc — but with master == self that branch is never taken).
+	 */
+	cluster_pcm_lock_acquire(tag, mode);
 }
 
 

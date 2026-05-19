@@ -293,6 +293,13 @@ int cluster_lmd_max_wait_edges = 1024;
  */
 int cluster_lmd_scan_interval_ms = 1000;
 
+/*
+ * PGRAC: spec-2.33 D8 — cluster.gcs_reply_timeout_ms (HC85).
+ * Default 5000ms.  PGC_SUSET — superusers and test fixtures may tune;
+ * unprivileged users may not perturb the Cache Fusion hot path.
+ */
+int cluster_gcs_reply_timeout_ms = 5000;
+
 
 /*
  * Mapping from the cluster.interconnect_tier GUC enum string to the
@@ -1327,4 +1334,21 @@ cluster_init_guc(void)
 					 "detection at higher CPU.  CV wake on edge submission "
 					 "also triggers scan out-of-band.  PGC_SIGHUP."),
 		&cluster_lmd_scan_interval_ms, 1000, 50, 60000, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	/*
+	 * PGRAC: spec-2.33 D8 — cluster.gcs_reply_timeout_ms (HC85).
+	 * Range [100, 60000];  defined via DefineCustomIntVariable's built-in
+	 * min/max validator (no separate check_hook needed for plain range).
+	 * PGC_SUSET so unprivileged users cannot perturb the Cache Fusion hot
+	 * path; superusers + test fixtures may tune for fault injection.
+	 */
+	DefineCustomIntVariable(
+		"cluster.gcs_reply_timeout_ms",
+		gettext_noop("GCS block-ship request reply timeout (ms)."),
+		gettext_noop("Sender ConditionVariableTimedSleep deadline for GCS "
+					 "block-ship reply.  On expiry, request cleanup + "
+					 "ereport(ERRCODE_QUERY_CANCELED) with errhint "
+					 "pointing to spec-2.34 retransmit.  HC85.  PGC_SUSET."),
+		&cluster_gcs_reply_timeout_ms, 5000, 100, 60000,
+		PGC_SUSET, 0, NULL, NULL, NULL);
 }

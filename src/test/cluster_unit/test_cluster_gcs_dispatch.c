@@ -45,6 +45,7 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_conf.h" /* ClusterNodeInfo (spec-2.33 D2 stub) */
 #include "cluster/cluster_cssd.h" /* PGRAC_IC_MSG_CSSD_HEARTBEAT */
 #include "cluster/cluster_gcs.h"
 #include "cluster/cluster_ic_envelope.h"
@@ -330,6 +331,23 @@ cluster_pcm_lock_apply_gcs_transition(BufferTag tag pg_attribute_unused(),
 									  int holder_node_id pg_attribute_unused())
 {
 	return true;
+}
+
+/* spec-2.33 D2 stub:  cluster_gcs_lookup_master now real (declared-node
+ * hash mod-N) calls cluster_conf_lookup_node.  Single-node fixture: return
+ * NULL for all slots except 0 to keep declared_count = 1 (HC72 self short-
+ * circuit). */
+const ClusterNodeInfo *
+cluster_conf_lookup_node(int32 node_id)
+{
+	static ClusterNodeInfo info_self = {0};
+
+	if (node_id == 0)
+	{
+		info_self.node_id = 0;
+		return &info_self;
+	}
+	return NULL;
 }
 
 

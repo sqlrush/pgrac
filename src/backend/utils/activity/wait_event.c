@@ -975,6 +975,30 @@ pgstat_get_wait_cluster_pcm(WaitEventCluster w)
 		 * waits on outstanding-slot reply CV for master node ACK. */
 		event_name = "ClusterGcsReplyWait";
 		break;
+	case WAIT_EVENT_GCS_BLOCK_SHIP_WAIT:
+		/* PGRAC (spec-2.33 D9): cluster_gcs_send_block_request_and_wait
+		 * sender ConditionVariableTimedSleep on outstanding-slot CV for
+		 * GCS_BLOCK_REPLY (8KB block payload).  HC85 deadline via
+		 * cluster.gcs_reply_timeout_ms. */
+		event_name = "ClusterGCSBlockShipWait";
+		break;
+	case WAIT_EVENT_GCS_BLOCK_REQUEST_DISPATCH:
+		/* PGRAC (spec-2.33 D9): receiver master-side latch on
+		 * GCS_BLOCK_REQUEST dispatch (rare; kept symmetric with control
+		 * plane).  Counter-only via cluster_gcs_block module. */
+		event_name = "ClusterGCSBlockRequestDispatch";
+		break;
+	case WAIT_EVENT_GCS_BLOCK_REPLY_DISPATCH:
+		/* PGRAC (spec-2.33 D9): receiver sender-side latch on
+		 * GCS_BLOCK_REPLY dispatch (rare; kept symmetric). */
+		event_name = "ClusterGCSBlockReplyDispatch";
+		break;
+	case WAIT_EVENT_GCS_BLOCK_CHECKSUM_FAIL:
+		/* PGRAC (spec-2.33 D9): sender-side cleanup path after HC83
+		 * CRC32C checksum mismatch on received block.  DBA-visible
+		 * diagnostic that wire-ABI drift or corruption is suspected. */
+		event_name = "ClusterGCSBlockChecksumFail";
+		break;
 	default:
 		break;
 	}

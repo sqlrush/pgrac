@@ -320,6 +320,18 @@ typedef enum {
 	 * Classified under PG_WAIT_CLUSTER_PCM family (semantic: waiting for
 	 * PCM/GCS transition reply, not GES lock acquire). */
 	WAIT_EVENT_GCS_REPLY_WAIT,
+	/* PGRAC (spec-2.33 D9 NEW 4 wait events; block-shipping data plane).
+	 * GCS_BLOCK_SHIP_WAIT — sender backend ConditionVariableTimedSleep on
+	 * outstanding-slot CV waiting for GCS_BLOCK_REPLY (HC85;  pg_stat_activity
+	 * shows 'ClusterGCSBlockShipWait').  GCS_BLOCK_REQUEST_DISPATCH /
+	 * GCS_BLOCK_REPLY_DISPATCH — receiver-side cluster_ic dispatch event
+	 * latch (rare, kept symmetric with control plane events).
+	 * GCS_BLOCK_CHECKSUM_FAIL — sender-side recovery / cleanup path after
+	 * HC83 CRC32C mismatch (DBA-visible diagnostic). */
+	WAIT_EVENT_GCS_BLOCK_SHIP_WAIT,
+	WAIT_EVENT_GCS_BLOCK_REQUEST_DISPATCH,
+	WAIT_EVENT_GCS_BLOCK_REPLY_DISPATCH,
+	WAIT_EVENT_GCS_BLOCK_CHECKSUM_FAIL,
 
 	/* Cluster: BufferShip (5 events) -- subsystem #5 */
 	WAIT_EVENT_BUFFER_SHIP_CR_BUILD = PG_WAIT_CLUSTER_BUFFERSHIP,

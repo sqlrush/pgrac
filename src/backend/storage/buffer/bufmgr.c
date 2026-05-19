@@ -4844,7 +4844,15 @@ LockBuffer(Buffer buffer, int mode)
 	if (mode != BUFFER_LOCK_UNLOCK && cluster_pcm_is_active())
 	{
 		pcm_mode = (mode == BUFFER_LOCK_SHARE) ? PCM_LOCK_MODE_S : PCM_LOCK_MODE_X;
-		cluster_pcm_lock_acquire(buf->tag, pcm_mode);
+		/*
+		 * PGRAC: spec-2.33 D7 — buffer-aware acquire so that the GCS
+		 * data-plane sender can install received block bytes directly into
+		 * this BufferDesc on GRANTED (HC84 PageSetLSN + memcpy under
+		 * content_lock EXCLUSIVE).  The legacy tag-only entry point
+		 * (cluster_pcm_lock_acquire) is retained for unit tests and
+		 * non-bufmgr callers but fails closed on remote-master S/X.
+		 */
+		cluster_pcm_lock_acquire_buffer(buf, pcm_mode);
 		pcm_acquired = true;
 	}
 #endif
@@ -5754,3 +5762,205 @@ TestForOldSnapshot_impl(Snapshot snapshot, Relation relation)
 				(errcode(ERRCODE_SNAPSHOT_TOO_OLD),
 				 errmsg("snapshot too old")));
 }
+
+
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * ============================================================================
+ * PGRAC MODIFICATIONS — spec-2.33 D4 (GCS block-shipping bufmgr helpers).
+ *
+ * Modified by: SqlRush <sqlrush@gmail.com>
+ *
+ * What changed:
+ *   Added two helper functions exposed to cluster_gcs_block.c so that the
+ *   master-side GCS_BLOCK_REQUEST handler can copy a buffer's 8KB page bytes
+ *   off the local buffer pool under the HC82 I-WAL-before-ship invariant.
+ *
+ *   - cluster_bufmgr_probe_block_for_gcs(tag): returns true iff a shared
+ *     buffer currently holds the tag.  Used by the master-side handler to
+ *     decide GRANTED_STORAGE_FALLBACK vs the full ship path (HC88).
+ *
+ *   - cluster_bufmgr_copy_block_for_gcs(tag, *out_page_lsn, *dst):  pin the
+ *     buffer, content_lock shared, read page_lsn, release the content_lock,
+ *     XLogFlush(page_lsn) (HC82 — I-WAL-before-ship anchor), reacquire the
+ *     content_lock shared, revalidate (tag still matches + PageGetLSN(page)
+ *     stable), memcpy BLCKSZ bytes into *dst, unpin.  HC89: on revalidation
+ *     mismatch the helper retries ONCE (release content_lock, re-XLogFlush
+ *     the new page_lsn, reacquire, revalidate again);  if the second
+ *     revalidation also fails the function returns false and the caller
+ *     replies DENIED_MASTER_NOT_HOLDER.  Unbounded loop forbidden (hot-page
+ *     starvation defense);  0-retry fail-closed forbidden (normal WAL drift
+ *     false positive defense).
+ *
+ * Why:
+ *   The block-shipping data plane (cluster_gcs_block.c) needs to read 8KB
+ *   page bytes safely from another module without leaking BufferDesc /
+ *   partition-lock internals.  Putting these helpers here lets bufmgr keep
+ *   ownership of pin / content_lock / buf table lookup semantics.
+ *
+ * Spec: spec-2.33-gcs-block-shipping-substrate.md §1.2 D4 + §3.2 + HC82 +
+ *       HC88 + HC89.
+ * ============================================================================
+ */
+
+#include "access/xlog.h"			/* XLogFlush */
+#include "cluster/cluster_gcs_block.h"
+
+/*
+ * Look up `tag` in the shared buffer table without pinning.  Returns true
+ * iff a valid buffer is present.  The partition lock is held only across
+ * the lookup itself.
+ *
+ * HC88: master-side handler uses this to distinguish "no holder" (no buffer
+ * present) from "holder may need block ship".  No content_lock acquired;
+ * pin not taken.  Race with eviction is acceptable — false negatives lead
+ * to DENIED_MASTER_NOT_HOLDER which is recoverable at the requester via
+ * spec-2.34 retransmit.
+ */
+bool
+cluster_bufmgr_probe_block_for_gcs(BufferTag tag)
+{
+	uint32		hashcode = BufTableHashCode(&tag);
+	LWLock	   *partition_lock = BufMappingPartitionLock(hashcode);
+	int			buf_id;
+
+	LWLockAcquire(partition_lock, LW_SHARED);
+	buf_id = BufTableLookup(&tag, hashcode);
+	LWLockRelease(partition_lock);
+
+	return (buf_id >= 0);
+}
+
+/*
+ * Copy the 8KB block bytes for `tag` into *dst, flushing WAL up to the
+ * page's LSN before reading the bytes (HC82 I-WAL-before-ship).  Sets
+ * *out_page_lsn to the page LSN observed at the second-stable revalidation.
+ *
+ * Returns false on:
+ *   - Buffer no longer in pool (evicted between probe and pin)
+ *   - HC89 revalidation single-retry exhausted
+ *
+ * Returns true with *dst populated and *out_page_lsn set otherwise.
+ *
+ * Concurrency: caller does NOT hold any buffer/partition locks.  We take a
+ * SHARED partition lock to look up, pin via PinBuffer_Locked, then drop
+ * the partition lock and operate on the buffer's content_lock.  Pin is
+ * always released before return.
+ */
+bool
+cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char *dst)
+{
+	uint32		hashcode;
+	LWLock	   *partition_lock;
+	int			buf_id;
+	BufferDesc *buf;
+	LWLock	   *content_lock;
+	XLogRecPtr	first_lsn;
+	XLogRecPtr	second_lsn;
+	int			retries;
+	bool		stable;
+	Page		page;
+
+	Assert(dst != NULL);
+	Assert(out_page_lsn != NULL);
+
+	hashcode = BufTableHashCode(&tag);
+	partition_lock = BufMappingPartitionLock(hashcode);
+
+	LWLockAcquire(partition_lock, LW_SHARED);
+	buf_id = BufTableLookup(&tag, hashcode);
+	if (buf_id < 0)
+	{
+		LWLockRelease(partition_lock);
+		return false;
+	}
+	buf = GetBufferDescriptor(buf_id);
+
+	/* PinBuffer_Locked requires the buf header lock; partition lock held
+	 * keeps the buffer from being recycled before we pin. */
+	{
+		uint32		buf_state;
+
+		buf_state = LockBufHdr(buf);
+		/* Re-verify tag under header lock to defend against tag-rewrite
+		 * races between the partition-lock-protected lookup and the pin. */
+		if (!BufferTagsEqual(&buf->tag, &tag))
+		{
+			UnlockBufHdr(buf, buf_state);
+			LWLockRelease(partition_lock);
+			return false;
+		}
+		PinBuffer_Locked(buf);	/* unlocks buf header */
+	}
+	LWLockRelease(partition_lock);
+
+	content_lock = BufferDescriptorGetContentLock(buf);
+	page = BufferGetPage(BufferDescriptorGetBuffer(buf));
+
+	/*
+	 * HC89: revalidation loop with single retry budget.
+	 *   retries = 0 — first attempt
+	 *   retries = 1 — single retry permitted
+	 *   retries = 2 — give up, fail-closed
+	 */
+	stable = false;
+	for (retries = 0; retries < 2; retries++)
+	{
+		/* Read page_lsn under content_lock SHARED. */
+		LWLockAcquire(content_lock, LW_SHARED);
+		first_lsn = PageGetLSN(page);
+		LWLockRelease(content_lock);
+
+		/*
+		 * HC82: flush WAL up to the page LSN before shipping the bytes.
+		 * Use XLogFlush(page_lsn) specifically — NOT XLogFlush(insert
+		 * pointer) which would be correct but over-flushes and doesn't
+		 * express the "flush this page before ship" safety contract.
+		 */
+#ifdef USE_CLUSTER_UNIT
+		if (cluster_gcs_block_test_xlog_flush_hook != NULL)
+			cluster_gcs_block_test_xlog_flush_hook((uint64) first_lsn);
+#endif
+		if (!XLogRecPtrIsInvalid(first_lsn))
+			XLogFlush(first_lsn);
+
+		/*
+		 * Reacquire content_lock SHARED and revalidate that the page LSN
+		 * has not advanced past first_lsn AND the buffer tag still matches.
+		 * Either signals concurrent mutation that would break HC82's "ship
+		 * the bytes that I just flushed WAL for" contract.
+		 */
+		LWLockAcquire(content_lock, LW_SHARED);
+		second_lsn = PageGetLSN(page);
+
+#ifdef USE_CLUSTER_UNIT
+		/*
+		 * Spec L25/L26 hook:  if the test injection returns N > 0 we mimic
+		 * N consecutive LSN drift events.  retries 0 + drift available
+		 * means second_lsn != first_lsn synthetically.
+		 */
+		if (cluster_gcs_block_test_lsn_drift_hook != NULL)
+		{
+			int			drift_remaining = cluster_gcs_block_test_lsn_drift_hook();
+
+			if (drift_remaining > retries)
+				second_lsn = first_lsn + 1;	/* synthetic mismatch */
+		}
+#endif
+
+		if (BufferTagsEqual(&buf->tag, &tag) && first_lsn == second_lsn)
+		{
+			memcpy(dst, page, BLCKSZ);
+			*out_page_lsn = second_lsn;
+			LWLockRelease(content_lock);
+			stable = true;
+			break;
+		}
+		LWLockRelease(content_lock);
+		/* fall through: retry once if budget remains */
+	}
+
+	UnpinBuffer(buf);
+	return stable;
+}
+#endif							/* USE_PGRAC_CLUSTER */

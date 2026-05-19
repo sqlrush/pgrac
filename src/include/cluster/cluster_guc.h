@@ -491,4 +491,20 @@ extern int cluster_lmd_max_wait_edges;
 extern int cluster_lmd_scan_interval_ms;
 
 
+/*
+ * cluster.gcs_reply_timeout_ms (spec-2.33 D8; HC85).
+ *
+ *	type: int   context: PGC_SUSET
+ *	default: 5000 (min 100, max 60000)
+ *
+ *	GCS block-ship request reply timeout in milliseconds.  Sender uses
+ *	ConditionVariableTimedSleep with this deadline; on expiry the request
+ *	is cleaned up and ereport(ERRCODE_QUERY_CANCELED) is raised with an
+ *	errhint pointing to spec-2.34 retransmit (HC86 — retry not in scope).
+ *	PGC_SUSET (not USERSET) so unprivileged users cannot perturb the
+ *	cache-fusion hot path; superusers + test fixtures may tune.
+ */
+extern int cluster_gcs_reply_timeout_ms;
+
+
 #endif /* CLUSTER_GUC_H */

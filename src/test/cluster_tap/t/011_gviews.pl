@@ -58,12 +58,12 @@ my $node_id = $node->safe_psql('postgres', 'SHOW cluster.node_id');
 
 
 # ----------
-# Total row count: 1 node x 79 events.
+# Total row count: 1 node x 83 events (spec-2.33 +4 block-ship).
 # ----------
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_gcluster_wait_events'),
-	'79',
-	'pg_stat_gcluster_wait_events returns 79 rows (single-node projection of cluster wait events)');
+	'83',
+	'pg_stat_gcluster_wait_events returns 83 rows (spec-2.33 +4 block-ship)');
 
 
 # ----------
@@ -89,7 +89,7 @@ is($node->safe_psql('postgres',
 # ----------
 my %expected = (
 	'Cluster: GES' => 5,
-	'Cluster: PCM' => 10,
+	'Cluster: PCM' => 14,
 	'Cluster: BufferShip' => 5,
 	'Cluster: SCN' => 4,
 	'Cluster: Reconfig' => 5,

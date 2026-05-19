@@ -74,6 +74,7 @@
 #include "cluster/cluster_stats.h"			/* cluster_stats_shmem_register (1.14 Sprint A) */
 #include "cluster/cluster_lmon.h"			/* cluster_lmon_shmem_register (1.11 Sprint A) */
 #include "cluster/cluster_gcs.h"			/* cluster_gcs_module_init (spec-2.32 D2) */
+#include "cluster/cluster_gcs_block.h"		/* cluster_gcs_block_module_init (spec-2.33 D3) */
 #include "cluster/cluster_pcm_lock.h"		/* cluster_pcm_lock_module_init (stage 1.7) */
 #include "cluster/cluster_qvotec.h" /* cluster_qvotec_shmem_register (spec-2.6 Sprint A Step 1) */
 #include "cluster/cluster_fence.h"	/* cluster_fence_shmem_register (spec-2.28 Sprint A Step 1) */
@@ -364,6 +365,17 @@ cluster_init_shmem_module(void)
 	 */
 	if (cluster_shmem_lookup_region("pgrac cluster gcs") == NULL)
 		cluster_gcs_module_init();
+
+	/*
+	 * spec-2.33 D3: register cluster_gcs_block shmem region (block-shipping
+	 * outstanding table per-backend + 8 data-plane observability counters).
+	 * Separate from cluster_gcs shmem so observability can distinguish
+	 * control-plane vs data-plane contention.
+	 *
+	 * Spec: spec-2.33-gcs-block-shipping-substrate.md §1.2 D3.
+	 */
+	if (cluster_shmem_lookup_region("pgrac cluster gcs block") == NULL)
+		cluster_gcs_block_module_init();
 
 	/*
 	 * Stage 1.10.1 (F1 hardening): register cluster_startup_phase shmem

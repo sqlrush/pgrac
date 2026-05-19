@@ -38,6 +38,7 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "access/xlogdefs.h"
+#include "cluster/cluster_conf.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_gcs.h"
 #include "cluster/cluster_guc.h"
@@ -45,6 +46,7 @@
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_shmem.h"
+#include "common/hashfn.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/condition_variable.h"
@@ -220,23 +222,64 @@ cluster_gcs_module_init(void)
  * Master lookup helper.
  * ============================================================ */
 
+/*
+ * PGRAC: spec-2.33 D2 — real GRD master cache via deterministic hash mod-N
+ * over the declared-node array.  Sparse node_id safe (HC81):  if topology
+ * is {0, 2, 5} the helper computes `declared[hash % 3]` and returns one of
+ * 0/2/5, never some out-of-topology index like 4.  Single-node (declared
+ * count <= 1) falls back to self for HC72 short-circuit.
+ *
+ * Test injection (USE_CLUSTER_UNIT) preserved from spec-2.32: when the
+ * fixture sets cluster_gcs_test_force_remote_master_node >= 0 the helper
+ * returns that override unconditionally to drive remote-master code paths
+ * in single-node test setups.
+ */
 int
 cluster_gcs_lookup_master(BufferTag tag)
 {
-	(void)tag; /* spec-2.32 placeholder; tag will be used in spec-2.33+ */
+	int			declared[CLUSTER_MAX_NODES];
+	int			declared_count = 0;
+	int			master_node;
+	uint32		h;
+	int			i;
 
 #ifdef USE_CLUSTER_UNIT
 	if (cluster_gcs_test_force_remote_master_node >= 0
-		&& cluster_gcs_test_force_remote_master_node != cluster_node_id) {
+		&& cluster_gcs_test_force_remote_master_node != cluster_node_id)
+	{
 		if (ClusterGcs != NULL)
 			pg_atomic_fetch_add_u64(&ClusterGcs->lookup_master_remote_count, 1);
 		return cluster_gcs_test_force_remote_master_node;
 	}
 #endif
 
+	/*
+	 * Build the declared-node array.  HC81 sparse-node safety:  hash modulo
+	 * declared_count (not CLUSTER_MAX_NODES) so the result is always an
+	 * index into declared[], i.e. always a real cluster.node_id.
+	 */
+	for (i = 0; i < CLUSTER_MAX_NODES; i++)
+		if (cluster_conf_lookup_node(i) != NULL)
+			declared[declared_count++] = i;
+
+	if (declared_count <= 1)
+	{
+		if (ClusterGcs != NULL)
+			pg_atomic_fetch_add_u64(&ClusterGcs->lookup_master_self_count, 1);
+		return cluster_node_id;	/* single-node fallback (HC72) */
+	}
+
+	h = hash_bytes((const unsigned char *) &tag, sizeof(tag));
+	master_node = declared[h % (uint32) declared_count];
+
 	if (ClusterGcs != NULL)
-		pg_atomic_fetch_add_u64(&ClusterGcs->lookup_master_self_count, 1);
-	return cluster_node_id;
+	{
+		if (master_node == cluster_node_id)
+			pg_atomic_fetch_add_u64(&ClusterGcs->lookup_master_self_count, 1);
+		else
+			pg_atomic_fetch_add_u64(&ClusterGcs->lookup_master_remote_count, 1);
+	}
+	return master_node;
 }
 
 

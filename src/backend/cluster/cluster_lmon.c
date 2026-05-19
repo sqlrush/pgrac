@@ -59,6 +59,7 @@
 #include "cluster/cluster_cssd.h"  /* cluster_cssd_outbound_slots (spec-2.5 D2.6) */
 #include "cluster/cluster_fence.h" /* cluster_fence_lmon_tick (spec-2.28 D5) */
 #include "cluster/cluster_gcs.h"   /* cluster_gcs_register_msg_types (spec-2.32 D4) */
+#include "cluster/cluster_gcs_block.h"	/* cluster_gcs_register_block_msg_types (spec-2.33 D4) */
 #include "cluster/cluster_grd.h"   /* cluster_grd_lmon_tick_dead_sweep (spec-2.16 D8) */
 #include "cluster/cluster_lms.h"   /* cluster_lms_owns_grant (spec-2.18 Sprint A Step 3 D8 HC4) */
 #include "cluster/cluster_native_lock_probe.h"
@@ -320,6 +321,24 @@ cluster_lmon_shmem_init(void)
 		if (!gcs_registered) {
 			cluster_gcs_register_msg_types();
 			gcs_registered = true;
+		}
+	}
+
+	/*
+	 * spec-2.33 D4: register block-shipping data-plane msg_types
+	 * (PGRAC_IC_MSG_GCS_BLOCK_REQUEST=14 / GCS_BLOCK_REPLY=15) alongside
+	 * the control-plane registration above.  Both handlers are real
+	 * (L107 N+5 anti-pattern compliant — receivers do validate + dispatch
+	 * + counter + reply, never stub).
+	 *
+	 * Spec: spec-2.33-gcs-block-shipping-substrate.md §1.2 D4 + L107.
+	 */
+	{
+		static bool gcs_block_registered = false;
+
+		if (!gcs_block_registered) {
+			cluster_gcs_register_block_msg_types();
+			gcs_block_registered = true;
 		}
 	}
 }
