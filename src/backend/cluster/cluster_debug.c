@@ -1276,6 +1276,29 @@ dump_gcs(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_gcs_get_block_wal_flush_before_ship_count()));
 	emit_row(rsinfo, "gcs", "block_ship_bytes_total",
 			 fmt_int64((int64)cluster_gcs_get_block_ship_bytes_total()));
+
+	/* spec-2.34 D10:  9 NEW reliability hardening counter rows
+	 * (dump_gcs 22 → 31 row).  Mirrors counters in
+	 * ClusterGcsBlockShared (5 sender/wake) + cluster_gcs_block_dedup
+	 * (4 dedup HTAB). */
+	emit_row(rsinfo, "gcs", "retransmit_attempt_count",
+			 fmt_int64((int64)cluster_gcs_get_block_retransmit_attempt_count()));
+	emit_row(rsinfo, "gcs", "retransmit_send_count",
+			 fmt_int64((int64)cluster_gcs_get_block_retransmit_send_count()));
+	emit_row(rsinfo, "gcs", "retransmit_exhausted_count",
+			 fmt_int64((int64)cluster_gcs_get_block_retransmit_exhausted_count()));
+	emit_row(rsinfo, "gcs", "dedup_hit_count",
+			 fmt_int64((int64)cluster_gcs_get_block_dedup_hit_count()));
+	emit_row(rsinfo, "gcs", "dedup_miss_count",
+			 fmt_int64((int64)cluster_gcs_get_block_dedup_miss_count()));
+	emit_row(rsinfo, "gcs", "dedup_collision_count",
+			 fmt_int64((int64)cluster_gcs_get_block_dedup_collision_count()));
+	emit_row(rsinfo, "gcs", "dedup_full_count",
+			 fmt_int64((int64)cluster_gcs_get_block_dedup_full_count()));
+	emit_row(rsinfo, "gcs", "epoch_invalidate_wake_count",
+			 fmt_int64((int64)cluster_gcs_get_block_epoch_invalidate_wake_count()));
+	emit_row(rsinfo, "gcs", "stale_reply_drop_count",
+			 fmt_int64((int64)cluster_gcs_get_block_stale_reply_drop_count()));
 }
 
 #endif /* USE_PGRAC_CLUSTER */

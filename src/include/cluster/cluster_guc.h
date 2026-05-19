@@ -507,4 +507,36 @@ extern int cluster_lmd_scan_interval_ms;
 extern int cluster_gcs_reply_timeout_ms;
 
 
+/*
+ * spec-2.34 D8 — GCS block reliability hardening (3 NEW GUC).
+ *
+ *	cluster.gcs_block_retransmit_max_retries
+ *	  type: int   context: PGC_SUSET
+ *	  default: 4 (min 0, max 8)
+ *	  Number of retry attempts after initial GCS_BLOCK_REQUEST send fails
+ *	  to receive a reply within cluster.gcs_reply_timeout_ms.  Each retry
+ *	  uses exponential backoff (see initial_backoff_ms).  N=0 disables
+ *	  retransmit (equivalent to spec-2.33 behavior).
+ *
+ *	cluster.gcs_block_retransmit_initial_backoff_ms
+ *	  type: int   context: PGC_SUSET
+ *	  default: 100 (min 10, max 5000)
+ *	  Backoff before retry 1.  Subsequent retries double:  100 → 200 →
+ *	  400 → 800 ms (with default max_retries=4, total backoff = 1500 ms).
+ *
+ *	cluster.gcs_block_dedup_max_entries
+ *	  type: int   context: PGC_POSTMASTER
+ *	  default: 1024 (min 256, max 16384)
+ *	  Per-node cap for the master-side dedup HTAB.  Each entry occupies
+ *	  sizeof(GcsBlockDedupEntry) = 8312B, so default cap → ~8.4 MB shmem
+ *	  on each node acting as GCS block-ship master.  HASH_ENTER_NULL on
+ *	  cap → DENIED_DEDUP_FULL fail-closed (sender retries via HC96).
+ *
+ *	HC97 retry math + HC92 cap + HC93 GC + HC96 transient.
+ */
+extern int cluster_gcs_block_retransmit_max_retries;
+extern int cluster_gcs_block_retransmit_initial_backoff_ms;
+extern int cluster_gcs_block_dedup_max_entries;
+
+
 #endif /* CLUSTER_GUC_H */

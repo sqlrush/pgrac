@@ -56,6 +56,7 @@ OBJS = \
 	cluster_grd_work_queue.o \
 	cluster_gcs.o \
 	cluster_gcs_block.o \
+	cluster_gcs_block_dedup.o \
 	cluster_reconfig.o \
 	cluster_guc.o \
 	cluster_ic.o \

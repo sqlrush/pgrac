@@ -397,6 +397,53 @@ cluster_gcs_get_block_ship_bytes_total(void)
 	return 0;
 }
 
+/* spec-2.34 D10 stubs: 9 NEW reliability hardening counter accessors. */
+uint64
+cluster_gcs_get_block_retransmit_attempt_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_retransmit_send_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_retransmit_exhausted_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_dedup_hit_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_dedup_miss_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_dedup_collision_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_dedup_full_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_epoch_invalidate_wake_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_stale_reply_drop_count(void)
+{
+	return 0;
+}
+
 Size
 cluster_shmem_get_total_bytes(void)
 {

@@ -306,6 +306,13 @@ errfinish(const char *f pg_attribute_unused(), int l pg_attribute_unused(),
 		siglongjmp(ut_ereport_jump, 1);
 }
 
+/* spec-2.34 D4 stub: cluster_reconfig_apply_epoch_bump_as_coordinator
+ * calls cluster_gcs_block_on_epoch_advance.  Fixture has no GCS shmem
+ * state; stub is a no-op. */
+void
+cluster_gcs_block_on_epoch_advance(uint64 new_epoch pg_attribute_unused())
+{}
+
 /* Reset helper for between-test mock state. */
 static void
 ut_reset_mocks(void)

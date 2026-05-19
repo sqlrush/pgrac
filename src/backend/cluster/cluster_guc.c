@@ -300,6 +300,14 @@ int cluster_lmd_scan_interval_ms = 1000;
  */
 int cluster_gcs_reply_timeout_ms = 5000;
 
+/*
+ * PGRAC: spec-2.34 D8 — 3 NEW GUC for GCS block reliability hardening.
+ * HC92 + HC97 — see cluster_guc.h for semantics.
+ */
+int cluster_gcs_block_retransmit_max_retries = 4;
+int cluster_gcs_block_retransmit_initial_backoff_ms = 100;
+int cluster_gcs_block_dedup_max_entries = 1024;
+
 
 /*
  * Mapping from the cluster.interconnect_tier GUC enum string to the
@@ -1349,4 +1357,41 @@ cluster_init_guc(void)
 					 "ereport(ERRCODE_QUERY_CANCELED) with errhint "
 					 "pointing to spec-2.34 retransmit.  HC85.  PGC_SUSET."),
 		&cluster_gcs_reply_timeout_ms, 5000, 100, 60000, PGC_SUSET, 0, NULL, NULL, NULL);
+
+	/*
+	 * PGRAC: spec-2.34 D8 — 3 NEW GUC for GCS block reliability hardening.
+	 * HC92 dedup cap + HC97 retransmit math.
+	 */
+	DefineCustomIntVariable(
+		"cluster.gcs_block_retransmit_max_retries",
+		gettext_noop("Maximum retry attempts after initial GCS block-ship reply timeout."),
+		gettext_noop("After the initial GCS_BLOCK_REQUEST send fails to receive "
+					 "a reply within cluster.gcs_reply_timeout_ms, the sender "
+					 "may retry up to this many times using exponential backoff "
+					 "(see cluster.gcs_block_retransmit_initial_backoff_ms).  "
+					 "N=0 disables retransmit.  Budget exhausted raises "
+					 "SQLSTATE 53R90.  HC97.  PGC_SUSET."),
+		&cluster_gcs_block_retransmit_max_retries, 4, 0, 8,
+		PGC_SUSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.gcs_block_retransmit_initial_backoff_ms",
+		gettext_noop("Initial backoff before retry 1 (subsequent retries double)."),
+		gettext_noop("Exponential backoff base for GCS block-ship retransmit:  "
+					 "retry 1 waits this much, retry 2 doubles, etc.  Default "
+					 "100 → 100/200/400/800 ms for N=4 retries (total 1500 ms).  "
+					 "HC97.  PGC_SUSET."),
+		&cluster_gcs_block_retransmit_initial_backoff_ms, 100, 10, 5000,
+		PGC_SUSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.gcs_block_dedup_max_entries",
+		gettext_noop("Master-side GCS block dedup HTAB capacity (entries)."),
+		gettext_noop("Each entry occupies sizeof(GcsBlockDedupEntry) = 8312B.  "
+					 "Default 1024 → ~8.4MB shmem on each node serving as "
+					 "GCS block-ship master.  HASH_ENTER_NULL on cap → "
+					 "DENIED_DEDUP_FULL fail-closed (sender retries via "
+					 "HC96 transient).  HC92.  PGC_POSTMASTER."),
+		&cluster_gcs_block_dedup_max_entries, 1024, 256, 16384,
+		PGC_POSTMASTER, 0, NULL, NULL, NULL);
 }

@@ -503,6 +503,14 @@ void
 cluster_grd_lmon_tick_dead_sweep(void)
 {}
 
+/* spec-2.34 D6 L104 stub:  cluster_lmon.c LMON tick body calls
+ * cluster_gcs_block_dedup_sweep_expired(now).  Standalone fixture has
+ * no dedup HTAB linked; vacuous stub. */
+void cluster_gcs_block_dedup_sweep_expired(TimestampTz now);
+void
+cluster_gcs_block_dedup_sweep_expired(TimestampTz now pg_attribute_unused())
+{}
+
 /* spec-2.17 Step 5 L104 stub:  cluster_grd_deadlock_lmon_tick wired
  * into LMON tick body after dead sweep. */
 void cluster_grd_deadlock_lmon_tick(void);

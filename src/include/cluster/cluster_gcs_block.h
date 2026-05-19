@@ -106,7 +106,11 @@ typedef enum GcsBlockReplyStatus {
 	GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT = 3,
 	GCS_BLOCK_REPLY_DENIED_EPOCH_STALE = 4,
 	GCS_BLOCK_REPLY_DENIED_CHECKSUM_FAIL = 5,
-	GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER = 6
+	GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER = 6,
+	GCS_BLOCK_REPLY_DENIED_DEDUP_FULL = 7	/* PGRAC: spec-2.34 D1 NEW;
+											 * HC96 transient — sender 走 retry
+											 * path 同 timeout 语义,budget 耗尽
+											 * 才 ereport 53R90 */
 } GcsBlockReplyStatus;
 
 
@@ -290,6 +294,46 @@ extern uint64 cluster_gcs_get_block_storage_fallback_count(void);
 extern uint64 cluster_gcs_get_block_master_not_holder_count(void);
 extern uint64 cluster_gcs_get_block_wal_flush_before_ship_count(void);
 extern uint64 cluster_gcs_get_block_ship_bytes_total(void);
+
+/* ============================================================
+ * spec-2.34 D1 — reliability hardening counter accessors (9 NEW).
+ *
+ *	dump_gcs rows 22→31:
+ *	  retransmit_attempt_count       — # of retry attempts entered
+ *	  retransmit_send_count          — # of resend envelopes emitted
+ *	  retransmit_exhausted_count     — # of budget-exhausted 53R90 ereports
+ *	  dedup_hit_count                — # of CACHED_REPLY hits on master
+ *	  dedup_miss_count               — # of MISS_REGISTERED on master
+ *	  dedup_collision_count          — # of HC91 tag/transition mismatch
+ *	  dedup_full_count               — # of HC92 cap-full DENIED_DEDUP_FULL
+ *	  epoch_invalidate_wake_count    — # of CV signals from eager wake hook
+ *	  stale_reply_drop_count         — # of HC100 stale-reply drops
+ * ============================================================ */
+extern uint64 cluster_gcs_get_block_retransmit_attempt_count(void);
+extern uint64 cluster_gcs_get_block_retransmit_send_count(void);
+extern uint64 cluster_gcs_get_block_retransmit_exhausted_count(void);
+extern uint64 cluster_gcs_get_block_dedup_hit_count(void);
+extern uint64 cluster_gcs_get_block_dedup_miss_count(void);
+extern uint64 cluster_gcs_get_block_dedup_collision_count(void);
+extern uint64 cluster_gcs_get_block_dedup_full_count(void);
+extern uint64 cluster_gcs_get_block_epoch_invalidate_wake_count(void);
+extern uint64 cluster_gcs_get_block_stale_reply_drop_count(void);
+
+
+/* ============================================================
+ * spec-2.34 D4 — eager wake on epoch advance.
+ *
+ *	Called by spec-2.29 reconfig coordinator inside
+ *	cluster_reconfig_apply_epoch_bump_as_coordinator() AFTER
+ *	cluster_epoch_advance_for_reconfig() + cluster_epoch_set_changed_at_lsn()
+ *	and BEFORE cluster_reconfig_publish_event() (HC95 ordering).
+ *
+ *	Action: sweep all per-backend block-outstanding slots; mark slots whose
+ *	request_epoch < new_epoch as stale + ConditionVariableBroadcast their
+ *	reply_cv so the sender wakes immediately rather than waiting for the
+ *	reply timeout safety net.
+ * ============================================================ */
+extern void cluster_gcs_block_on_epoch_advance(uint64 new_epoch);
 
 
 /* ============================================================

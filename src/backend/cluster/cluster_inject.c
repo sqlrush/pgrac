@@ -286,6 +286,25 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 *	   point is genuinely mixed.
 	 */
 	{ .name = "cluster-wal-page-init-thread-id" },
+	/*
+	 * spec-2.34 D17 (HC93 + retransmit / dedup / budget TAP support):
+	 *
+	 *	cluster-gcs-block-drop-reply-before-send:
+	 *	  Fires inside cluster_gcs_block.c master-side reply path BEFORE
+	 *	  cluster_ic_send_envelope.  Configured as SKIP via
+	 *	  cluster_injection_should_skip → master returns without sending
+	 *	  the reply for the next N requests, so the sender experiences
+	 *	  timeout → retransmit → eventually CACHED_REPLY (dedup hit) or
+	 *	  53R90 (budget exhausted).
+	 *
+	 *	cluster-gcs-block-force-epoch-stale-reply:
+	 *	  Fires inside master-side handler before producing the reply.
+	 *	  SKIP causes the master to send DENIED_EPOCH_STALE once, exercising
+	 *	  the HC94 lazy retry path (sender re-lookup_master + retransmit
+	 *	  within budget).
+	 */
+	{ .name = "cluster-gcs-block-drop-reply-before-send" },
+	{ .name = "cluster-gcs-block-force-epoch-stale-reply" },
 };
 
 #define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_points)

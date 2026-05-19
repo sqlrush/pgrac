@@ -67,6 +67,7 @@
 #include "cluster/cluster_cssd.h"	/* cluster_cssd_get_peer_state, get_dead_generation */
 #include "cluster/cluster_elog.h"	/* cluster_node_id */
 #include "cluster/cluster_epoch.h"	/* advance + observe + set_changed_at_lsn */
+#include "cluster/cluster_gcs_block.h"	/* spec-2.34 D4 — eager epoch wake hook */
 #include "cluster/cluster_guc.h"	/* cluster_enabled */
 #include "cluster/cluster_inject.h" /* CLUSTER_INJECTION_POINT */
 #include "cluster/cluster_qvotec.h" /* cluster_qvotec_in_quorum */
@@ -530,6 +531,17 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 	 * position;adequate for "approximately when" semantics. */
 	lsn = GetXLogInsertRecPtr();
 	cluster_epoch_set_changed_at_lsn((uint64)lsn);
+
+	/*
+	 * PGRAC: spec-2.34 D4 (HC95) — eager wake of GCS block-shipping
+	 * outstanding slots.  Must run AFTER cluster_epoch_advance_for_reconfig
+	 * + cluster_epoch_set_changed_at_lsn (so slot.request_epoch <
+	 * new_epoch comparison is well-defined) and BEFORE
+	 * cluster_reconfig_publish_event (so peer backends start retrying
+	 * before the reconfig event broadcast hits them).  Callsite uniqueness
+	 * enforced by DoD grep (spec-2.34 §7).
+	 */
+	cluster_gcs_block_on_epoch_advance(new_epoch);
 
 	memset(&evt, 0, sizeof(evt));
 	evt.event_id = cluster_reconfig_compute_event_id(dead_bitmap, cssd_dead_generation);

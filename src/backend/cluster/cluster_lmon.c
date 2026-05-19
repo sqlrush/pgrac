@@ -60,6 +60,7 @@
 #include "cluster/cluster_fence.h"	   /* cluster_fence_lmon_tick (spec-2.28 D5) */
 #include "cluster/cluster_gcs.h"	   /* cluster_gcs_register_msg_types (spec-2.32 D4) */
 #include "cluster/cluster_gcs_block.h" /* cluster_gcs_register_block_msg_types (spec-2.33 D4) */
+#include "cluster/cluster_gcs_block_dedup.h" /* cluster_gcs_block_dedup_sweep_expired (spec-2.34 D6) */
 #include "cluster/cluster_grd.h"	   /* cluster_grd_lmon_tick_dead_sweep (spec-2.16 D8) */
 #include "cluster/cluster_lms.h" /* cluster_lms_owns_grant (spec-2.18 Sprint A Step 3 D8 HC4) */
 #include "cluster/cluster_native_lock_probe.h"
@@ -900,6 +901,16 @@ LmonMain(void)
 			 */
 			cluster_scn_lmon_drain_boc_broadcast();
 
+			/*
+			 * spec-2.34 D6 (HC93 leg a):  TTL sweep of the GCS block
+			 * dedup HTAB.  Removes completed entries past
+			 * 2 × max_retransmit_window age and in-flight entries
+			 * abandoned past the same threshold.  Runs in LMON context
+			 * with raw LWLock + hash_seq (per L150;  no buffer pin / no
+			 * ResourceOwner).
+			 */
+			cluster_gcs_block_dedup_sweep_expired(GetCurrentTimestamp());
+
 			CLUSTER_INJECTION_POINT("cluster-lmon-main-loop-iter");
 
 			now = GetCurrentTimestamp();
@@ -1410,6 +1421,9 @@ LmonMain(void)
 			cluster_grd_lmon_tick_dead_sweep();
 
 			cluster_reconfig_lmon_tick();
+
+			/* spec-2.34 D6 (HC93 leg a):  TTL sweep GCS block dedup HTAB. */
+			cluster_gcs_block_dedup_sweep_expired(GetCurrentTimestamp());
 
 			CLUSTER_INJECTION_POINT("cluster-lmon-main-loop-iter");
 

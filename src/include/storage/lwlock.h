@@ -308,6 +308,13 @@ typedef enum BuiltinTrancheIds {
 	 * plane; separate tranche so observability can distinguish data-plane
 	 * (block ship) contention from control-plane (transition request) contention. */
 	LWTRANCHE_CLUSTER_GCS_BLOCK,
+	/* PGRAC (spec-2.34 D2): master-side dedup HTAB partition + counter lock.
+	 * Guards GcsBlockDedupEntry slot allocation / lookup / install / TTL sweep
+	 * (HC90/HC91/HC92/HC93).  LMON-owned region; backend producers (GCS_BLOCK_
+	 * REQUEST handler context) acquire briefly during lookup_or_register +
+	 * install_reply.  Separate tranche from CLUSTER_GCS_BLOCK so DBA can see
+	 * data-plane reliability path contention distinctly. */
+	LWTRANCHE_CLUSTER_GCS_BLOCK_DEDUP,
 #endif
 	LWTRANCHE_FIRST_USER_DEFINED
 } BuiltinTrancheIds;

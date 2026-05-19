@@ -311,7 +311,27 @@
  * probe/copy_block_for_gcs helpers (HC82 XLogFlush(page_lsn) before ship
  * + HC89 single-retry revalidation).  catversion bump for catalog
  * tooling. */
-#define CATALOG_VERSION_NO 202605400
+/* spec-2.34 D11 (2026-05-19):  GCS block reliability hardening.
+ * NEW GcsBlockReplyStatus value DENIED_DEDUP_FULL=7 (enum 7→8);
+ * NEW cluster_gcs_block_dedup shmem region (HTAB cap × 8312B fixed entry,
+ * default cap 1024 → 8.4MB per master node) + LWTRANCHE_CLUSTER_GCS_BLOCK_
+ * DEDUP built-in tranche;  3 NEW GUC (cluster.gcs_block_retransmit_max_
+ * retries PGC_SUSET 4 + ..._initial_backoff_ms PGC_SUSET 100 + ..._dedup_
+ * max_entries PGC_POSTMASTER 1024);  2 NEW wait events
+ * (CLUSTER_WAIT_EVENTS_COUNT 83→85):  ClusterGCSBlockRetransmitWait +
+ * ClusterGCSBlockEpochStaleRetry;  9 NEW data-plane reliability counters
+ * exposed via dump_gcs (22→31 rows):  retransmit_attempt_count /
+ * retransmit_send_count / retransmit_exhausted_count / dedup_hit_count /
+ * dedup_miss_count / dedup_collision_count / dedup_full_count /
+ * epoch_invalidate_wake_count / stale_reply_drop_count;  1 NEW SQLSTATE
+ * 53R90 cluster_gcs_block_retransmit_exhausted;  HC90-HC100 11 NEW.
+ * cluster_gcs_block_on_epoch_advance hook wired into spec-2.29
+ * cluster_reconfig_apply_epoch_bump_as_coordinator after epoch +
+ * LSN stamp, before publish_event (HC95 ordering).  2 NEW inject
+ * points (cluster-gcs-block-drop-reply-before-send +
+ * cluster-gcs-block-force-epoch-stale-reply).  catversion bump for
+ * catalog tooling. */
+#define CATALOG_VERSION_NO 202605410
 
 /* spec-2.16 D19 (2026-05-29):  GesRequestPayload + GesReplyPayload wire
  * payload structs (48B each + StaticAssertDecl);  ClusterGrdHolderId
@@ -319,6 +339,6 @@
  * cluster_grd_pending + cluster_grd_outbound + cluster_grd_work_queue
  * shmem regions + LWLock tranches;  cluster.ges_request_timeout_ms GUC;
  * 53R70/53R71 SQLSTATE.  catversion bump for catalog tooling. */
-#define CATALOG_VERSION_NO_PRIOR 202605390
+#define CATALOG_VERSION_NO_PRIOR 202605400
 
 #endif

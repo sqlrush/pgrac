@@ -999,6 +999,16 @@ pgstat_get_wait_cluster_pcm(WaitEventCluster w)
 		 * diagnostic that wire-ABI drift or corruption is suspected. */
 		event_name = "ClusterGCSBlockChecksumFail";
 		break;
+	case WAIT_EVENT_GCS_BLOCK_RETRANSMIT_WAIT:
+		/* PGRAC (spec-2.34 D7): sender WaitLatch sleep during exponential
+		 * backoff between retransmit attempts (HC97). */
+		event_name = "ClusterGCSBlockRetransmitWait";
+		break;
+	case WAIT_EVENT_GCS_BLOCK_EPOCH_STALE_RETRY:
+		/* PGRAC (spec-2.34 D7): sender CV-wake after DENIED_EPOCH_STALE
+		 * lazy retry (HC94);  re-lookup_master + retransmit follow. */
+		event_name = "ClusterGCSBlockEpochStaleRetry";
+		break;
 	default:
 		break;
 	}

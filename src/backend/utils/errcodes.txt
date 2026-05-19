@@ -541,6 +541,13 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 # 60 ≈ 30s) → caller ereport(53R83);  client retries the failing DDL or aborts.
 53R83    E    ERRCODE_CLUSTER_NATIVE_LOCK_PROBE_TIMEOUT                       cluster_native_lock_probe_timeout
 
+# spec-2.34 D9 (HC98):  GCS block reliability hardening retransmit budget
+# exhaustion.  Sender exhausts cluster.gcs_block_retransmit_max_retries
+# (default 4 retries, 100/200/400/800 ms exponential backoff) without a
+# valid reply → caller ereport(53R90).  Distinct from ERRCODE_QUERY_CANCELED
+# so ops can distinguish GCS reliability failure from backend cancellation.
+53R90    E    ERRCODE_CLUSTER_GCS_BLOCK_RETRANSMIT_EXHAUSTED                  cluster_gcs_block_retransmit_exhausted
+
 Section: Class 54 - Program Limit Exceeded
 
 # this is for wired-in limits, not resource exhaustion problems (class borrowed from DB2)

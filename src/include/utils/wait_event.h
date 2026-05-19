@@ -333,6 +333,14 @@ typedef enum {
 	WAIT_EVENT_GCS_BLOCK_REQUEST_DISPATCH,
 	WAIT_EVENT_GCS_BLOCK_REPLY_DISPATCH,
 	WAIT_EVENT_GCS_BLOCK_CHECKSUM_FAIL,
+	/* PGRAC (spec-2.34 D7 NEW 2 wait events; reliability hardening).
+	 * GCS_BLOCK_RETRANSMIT_WAIT — sender WaitLatch sleep during exponential
+	 * backoff between retry attempts (visible in pg_stat_activity as
+	 * 'ClusterGCSBlockRetransmitWait').  GCS_BLOCK_EPOCH_STALE_RETRY —
+	 * sender CV wake after DENIED_EPOCH_STALE + re-lookup_master path
+	 * (HC94 lazy retry annotation). */
+	WAIT_EVENT_GCS_BLOCK_RETRANSMIT_WAIT,
+	WAIT_EVENT_GCS_BLOCK_EPOCH_STALE_RETRY,
 
 	/* Cluster: BufferShip (5 events) -- subsystem #5 */
 	WAIT_EVENT_BUFFER_SHIP_CR_BUILD = PG_WAIT_CLUSTER_BUFFERSHIP,

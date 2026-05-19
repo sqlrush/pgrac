@@ -347,6 +347,12 @@ void
 cluster_gcs_block_module_init(void)
 {}
 
+/* Spec-2.34 D2 stub: cluster_init_shmem_module also calls
+ * cluster_gcs_block_dedup_module_init (cluster_gcs_block_dedup.c). */
+void
+cluster_gcs_block_dedup_module_init(void)
+{}
+
 
 /*
  * Spec-1.10.1 D1 F1 stub: cluster_init_shmem_module also calls
