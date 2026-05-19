@@ -1387,7 +1387,9 @@ cluster_init_guc(void)
 							gettext_noop("Master-side GCS block dedup HTAB capacity (entries)."),
 							gettext_noop("Each entry occupies sizeof(GcsBlockDedupEntry) = 8312B.  "
 										 "Default 1024 → ~8.4MB shmem on each node serving as "
-										 "GCS block-ship master.  HASH_ENTER_NULL on cap → "
+										 "GCS block-ship master; bootstrap/initdb with no "
+										 "configured cluster.node_id does not allocate the HTAB.  "
+										 "HASH_ENTER_NULL on cap → "
 										 "DENIED_DEDUP_FULL fail-closed (sender retries via "
 										 "HC96 transient).  HC92.  PGC_POSTMASTER."),
 							&cluster_gcs_block_dedup_max_entries, 1024, 256, 16384, PGC_POSTMASTER,

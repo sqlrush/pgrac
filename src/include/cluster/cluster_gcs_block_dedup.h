@@ -18,7 +18,9 @@
  *	          entry.transition_id == req.transition_id; mismatch →
  *	          DENIED_VALIDATOR_REJECT + dedup_collision_count++
  *	    HC92  fixed-size sizeof(GcsBlockDedupEntry) == 8312B (PG dynahash
- *	          cap × 8.3KB master memory ceiling; default 1024 → 8.4MB)
+ *	          cap × 8.3KB master memory ceiling; default 1024 → 8.4MB on
+ *	          configured cluster nodes; bootstrap/initdb with node_id=-1
+ *	          does not allocate the HTAB)
  *	    HC93  TTL sweep (completed_at_ts + registered_at_ts) + local
  *	          before_shmem_exit cleanup + CSSD DEAD cleanup — three-fold
  *	          GC; not solely epoch-based

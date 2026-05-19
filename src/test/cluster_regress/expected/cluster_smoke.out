@@ -83,7 +83,7 @@ SELECT attname, format_type(atttypid, atttypmod)
 SELECT count(*) FROM pg_stat_cluster_wait_events;
  count 
 -------
-    83
+    85
 (1 row)
 
 -- ----------
@@ -106,7 +106,7 @@ SELECT count(DISTINCT type) FROM pg_stat_cluster_wait_events;
 SELECT count(*) FROM pg_stat_gcluster_wait_events;
  count 
 -------
-    83
+    85
 (1 row)
 
 -- ----------

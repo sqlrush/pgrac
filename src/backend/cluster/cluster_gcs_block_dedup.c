@@ -68,6 +68,22 @@ static HTAB *cluster_gcs_block_dedup_htab = NULL;
 static bool dedup_backend_exit_hook_registered = false;
 
 
+static int
+cluster_gcs_block_dedup_effective_entries(void)
+{
+	/*
+	 * Heavy GCS block-dedup storage is only meaningful for configured
+	 * cluster nodes.  initdb/bootstrap runs with cluster_node_id = -1 and
+	 * tiny shared_buffers; allocating the 8KB-entry HTAB there can exceed
+	 * PG's bootstrap shmem budget before any cluster path is usable.
+	 */
+	if (!cluster_enabled || cluster_node_id < 0)
+		return 0;
+
+	return cluster_gcs_block_dedup_max_entries > 0 ? cluster_gcs_block_dedup_max_entries : 1024;
+}
+
+
 /* ============================================================
  * Shmem registry.
  * ============================================================ */
@@ -78,7 +94,9 @@ cluster_gcs_block_dedup_shmem_size(void)
 	Size sz;
 	int cap;
 
-	cap = cluster_gcs_block_dedup_max_entries > 0 ? cluster_gcs_block_dedup_max_entries : 1024;
+	cap = cluster_gcs_block_dedup_effective_entries();
+	if (cap == 0)
+		return 0;
 
 	sz = MAXALIGN(sizeof(ClusterGcsBlockDedupShared));
 	sz = add_size(sz, hash_estimate_size(cap, sizeof(GcsBlockDedupEntry)));
@@ -91,6 +109,10 @@ cluster_gcs_block_dedup_shmem_init(void)
 	bool found;
 	HASHCTL info;
 	int cap;
+
+	cap = cluster_gcs_block_dedup_effective_entries();
+	if (cap == 0)
+		return;
 
 	cluster_gcs_block_dedup_shared = (ClusterGcsBlockDedupShared *)ShmemInitStruct(
 		"pgrac cluster gcs block dedup", MAXALIGN(sizeof(ClusterGcsBlockDedupShared)), &found);
@@ -105,8 +127,6 @@ cluster_gcs_block_dedup_shmem_init(void)
 		pg_atomic_init_u64(&cluster_gcs_block_dedup_shared->full_count, 0);
 		pg_atomic_init_u32(&cluster_gcs_block_dedup_shared->entry_count, 0);
 	}
-
-	cap = cluster_gcs_block_dedup_max_entries > 0 ? cluster_gcs_block_dedup_max_entries : 1024;
 
 	memset(&info, 0, sizeof(info));
 	info.keysize = sizeof(GcsBlockDedupKey);
