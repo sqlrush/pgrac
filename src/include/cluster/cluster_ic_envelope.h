@@ -148,8 +148,10 @@ typedef enum ClusterICMsgType {
 	PGRAC_IC_MSG_GCS_BLOCK_REQUEST
 	= 14, /* PGRAC: spec-2.33 D1 — Cache Fusion block ship request wire */
 	PGRAC_IC_MSG_GCS_BLOCK_REPLY
-	= 15 /* PGRAC: spec-2.33 D1 — Cache Fusion block ship reply wire (8KB payload) */
-		 /* values 16..255 available for future sub-spec; never reuse 0..15 */
+	= 15, /* PGRAC: spec-2.33 D1 — Cache Fusion block ship reply wire (8KB payload) */
+	PGRAC_IC_MSG_GCS_BLOCK_FORWARD
+	= 16 /* PGRAC: spec-2.35 D1 — Cache Fusion 2-way master→holder forward wire (64B) */
+		 /* values 17..255 available for future sub-spec; never reuse 0..16 */
 } ClusterICMsgType;
 
 

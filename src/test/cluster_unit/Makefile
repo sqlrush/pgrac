@@ -34,7 +34,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_ic_mock test_cluster_inject test_cluster_pgstat \
         test_cluster_debug test_cluster_shared_fs test_cluster_smgr \
         test_cluster_scn test_cluster_block_format test_cluster_itl_slot \
-        test_cluster_buffer_desc test_cluster_pcm_lock test_cluster_bufmgr_pcm_hook test_cluster_gcs_dispatch test_cluster_gcs_block test_cluster_gcs_block_retransmit \
+        test_cluster_buffer_desc test_cluster_pcm_lock test_cluster_bufmgr_pcm_hook test_cluster_gcs_dispatch test_cluster_gcs_block test_cluster_gcs_block_retransmit test_cluster_gcs_block_2way \
         test_cluster_startup_phase test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_cssd test_cluster_qvotec test_cluster_voting_disk_io test_cluster_quorum_decision \
         test_cluster_xlog test_cluster_tt_slot test_cluster_undo_segment \
         test_cluster_epoch test_cluster_fence test_cluster_reconfig \
@@ -540,6 +540,18 @@ test_cluster_gcs_block: test_cluster_gcs_block.c unit_test.h $(CLUSTER_VERSION_O
 # events distinct, 85 cluster wait events).  Header-only;  behavioral
 # coverage in cluster_tap t/112.
 test_cluster_gcs_block_retransmit: test_cluster_gcs_block_retransmit.c unit_test.h \
+		$(CLUSTER_VERSION_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-2.35 D17:  test_cluster_gcs_block_2way verifies CF 2-way protocol
+# compile-time invariants (msg_type 16, status 8, GcsBlockForwardPayload
+# 64B, reply header reserved 重解读 sizeof 不变, dedup FORWARDED_DUPLICATE
+# return 5, helper round-trip).  Header-only;  behavioral coverage in
+# cluster_tap t/113.
+test_cluster_gcs_block_2way: test_cluster_gcs_block_2way.c unit_test.h \
 		$(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \

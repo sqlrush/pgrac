@@ -296,6 +296,11 @@ cluster_gcs_send_block_request_and_wait(struct BufferDesc *buf pg_attribute_unus
 	abort();
 }
 
+/* spec-2.35 D3 stub for HC110 master_holder lifecycle counter bump. */
+void
+cluster_gcs_block_bump_master_holder_lifecycle(void)
+{}
+
 Size
 hash_estimate_size(long num_entries, Size entry_size)
 {

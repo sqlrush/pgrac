@@ -7,7 +7,7 @@
 #	  any wire send (HC72), so wire path coverage is effectively limited
 #	  to SQL-visible surface invariants:
 #
-#	  L1  fresh cluster startup:  pg_cluster_state.gcs has 31 keys
+#	  L1  fresh cluster startup:  pg_cluster_state.gcs has 38 keys
 #	  L2  api_state = "active" after postmaster phase 1 init
 #	  L3  WAIT_EVENT_GCS_REPLY_WAIT registered in pg_stat_cluster_wait_events
 #	  L4  CLUSTER_WAIT_EVENTS_COUNT == 85 (spec-2.34 +2 reliability events)
@@ -63,12 +63,12 @@ $node->append_conf('postgresql.conf', "cluster.node_id = 0\n");
 $node->start;
 
 
-# L1 — pg_cluster_state.gcs surface has 31 keys.
+# L1 — pg_cluster_state.gcs surface has 38 keys.
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '31',
-   'L1 pg_cluster_state.gcs category has 31 keys (spec-2.34 D10)');
+   '38',
+   'L1 pg_cluster_state.gcs category has 38 keys (spec-2.34 D10)');
 
 
 # L2 — api_state = "active" after postmaster phase 1 init.

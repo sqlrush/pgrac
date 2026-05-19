@@ -409,6 +409,13 @@ cluster_gcs_send_block_request_and_wait(struct BufferDesc *buf pg_attribute_unus
 	abort();
 }
 
+/* spec-2.35 D3 stub:  HC110 master_holder lifecycle counter bump invoked
+ * from cluster_pcm_transition_apply helpers.  Standalone fixture has no
+ * ClusterGcsBlockShared; vacuous no-op. */
+void
+cluster_gcs_block_bump_master_holder_lifecycle(void)
+{}
+
 /* ereport stubs — minimal enough to satisfy linker.  ereport(ERROR, ...)
  * path in cluster_pcm_lock.o would call errstart_cold + errfinish;  none
  * of the tests in this binary trigger that path. */

@@ -331,7 +331,49 @@
  * points (cluster-gcs-block-drop-reply-before-send +
  * cluster-gcs-block-force-epoch-stale-reply).  catversion bump for
  * catalog tooling. */
-#define CATALOG_VERSION_NO 202605410
+/* spec-2.35 D14 (2026-05-19):  Cache Fusion 2-way protocol S-to-S read sharing.
+ * NEW ClusterICMsgType PGRAC_IC_MSG_GCS_BLOCK_FORWARD=16 (master→holder);
+ * NEW GcsBlockReplyStatus value GRANTED_FROM_HOLDER=8 (enum 8→9);
+ * NEW GcsBlockForwardPayload struct 64B (HC102 wire ABI);
+ * GcsBlockReplyHeader.reserved_0[10] reserved 重解读 → forwarding_master_
+ *   node_bytes[4] + reserved_0[6] (HC109; sizeof 48B 不变 but semantic 变 →
+ *   pg_upgrade catversion 强制 boundary;  uses memcpy helpers to encode
+ *   int32 little-endian and avoid struct padding alignment regression);
+ * NEW HC108 reply handler authorized chain validation (direct-from-master
+ *   OR forwarded-by-expected-master with status in {GRANTED_FROM_HOLDER,
+ *   DENIED_MASTER_NOT_HOLDER});
+ * HC110 master_holder lifecycle real maintenance across 8 PCM transitions
+ *   (was unset since spec-2.30);  cluster_pcm_master_holder_node_by_tag
+ *   helper exposed for master-side forward routing decision;
+ * HC111 s_holders_bitmap = "cache residency" 语义 (no longer transient
+ *   content-lock holding;  bit persists across UnlockBuffer for SCUR);
+ * HC112 bufmgr hook bifurcation:  撤 spec-2.31 D3 UnlockBuffer-triggered
+ *   release;  NEW cluster_pcm_lock_unlock_content_buffer no-op for SCUR
+ *   (bit preserved) + delegate-to-eviction-release for XCUR;  release
+ *   hook moved to InvalidateBuffer + InvalidateVictimBuffer eviction
+ *   paths (covers DropRelations*Buffers + DropDatabaseBuffers via
+ *   InvalidateBuffer chain);  rename cluster_pcm_lock_release_buffer →
+ *   cluster_pcm_lock_release_buffer_for_eviction;
+ * HC113 dedup state machine extension:  internal FORWARDED_IN_FLIGHT
+ *   status via status==GRANTED_FROM_HOLDER on entry + holder_node stored
+ *   in reply_header.sender_node;  NEW GCS_BLOCK_DEDUP_FORWARDED_DUPLICATE
+ *   return (distinct from CACHED_REPLY and IN_FLIGHT_DUPLICATE) so
+ *   duplicate requests re-forward to holder instead of being silent-
+ *   dropped;  HC114 entry inspection must check status before treating
+ *   as cached 8KB block;
+ * 7 NEW counters exposed via dump_gcs (31→38 rows):
+ *   block_forward_sent_count / block_forward_received_count /
+ *   block_from_holder_ship_count / block_forward_holder_evicted_count /
+ *   s_holders_bitmap_redirect_count / master_holder_lifecycle_count /
+ *   forward_replay_count;
+ * 0 NEW wait events (CLUSTER_WAIT_EVENTS_COUNT 保持 85;  sender does not
+ *   know forward path at sleep time so dedicated wait event would not
+ *   be observable per Q-D11 rationale);
+ * 2 NEW inject points (cluster-gcs-block-forward-master-side +
+ *   cluster-gcs-block-evict-holder-before-ship);
+ * HC101-HC114 14 NEW.  catversion bump for catalog tooling + wire ABI
+ * reserved 重解读 + bufmgr hook 重构. */
+#define CATALOG_VERSION_NO 202605420
 
 /* spec-2.16 D19 (2026-05-29):  GesRequestPayload + GesReplyPayload wire
  * payload structs (48B each + StaticAssertDecl);  ClusterGrdHolderId
@@ -339,6 +381,6 @@
  * cluster_grd_pending + cluster_grd_outbound + cluster_grd_work_queue
  * shmem regions + LWLock tranches;  cluster.ges_request_timeout_ms GUC;
  * 53R70/53R71 SQLSTATE.  catversion bump for catalog tooling. */
-#define CATALOG_VERSION_NO_PRIOR 202605400
+#define CATALOG_VERSION_NO_PRIOR 202605410
 
 #endif

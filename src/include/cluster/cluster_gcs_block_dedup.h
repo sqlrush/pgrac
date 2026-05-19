@@ -142,6 +142,17 @@ StaticAssertDecl(sizeof(GcsBlockDedupEntry) == 8312,
  *	CACHED_REPLY          same key + tag + transition_id match;
  *	                      caller may re-send the cached reply payload
  *	                      without re-flushing WAL or re-copying page.
+ *	FORWARDED_DUPLICATE   PGRAC spec-2.35 HC113 NEW — same key seen
+ *	                      previously forwarded to a holder (entry was
+ *	                      installed with status GRANTED_FROM_HOLDER but
+ *	                      master holds no 8KB cached block).  Caller
+ *	                      must re-forward GCS_BLOCK_FORWARD to the
+ *	                      stored holder (holder side is idempotent;
+ *	                      counter forward_replay_count++).  Without
+ *	                      this distinct return, the generic IN_FLIGHT_
+ *	                      DUPLICATE branch would silently drop the
+ *	                      retry and the sender's retransmit budget
+ *	                      would never reach a holder reply.
  *	VALIDATION_FAIL       HC91 — same key but different tag or
  *	                      transition_id;  caller replies
  *	                      DENIED_VALIDATOR_REJECT + counter++.
@@ -154,7 +165,8 @@ typedef enum GcsBlockDedupResult {
 	GCS_BLOCK_DEDUP_IN_FLIGHT_DUPLICATE = 1,
 	GCS_BLOCK_DEDUP_CACHED_REPLY = 2,
 	GCS_BLOCK_DEDUP_VALIDATION_FAIL = 3,
-	GCS_BLOCK_DEDUP_FULL = 4
+	GCS_BLOCK_DEDUP_FULL = 4,
+	GCS_BLOCK_DEDUP_FORWARDED_DUPLICATE = 5,	/* HC113 spec-2.35 NEW */
 } GcsBlockDedupResult;
 
 

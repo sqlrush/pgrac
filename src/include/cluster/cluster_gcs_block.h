@@ -107,10 +107,17 @@ typedef enum GcsBlockReplyStatus {
 	GCS_BLOCK_REPLY_DENIED_EPOCH_STALE = 4,
 	GCS_BLOCK_REPLY_DENIED_CHECKSUM_FAIL = 5,
 	GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER = 6,
-	GCS_BLOCK_REPLY_DENIED_DEDUP_FULL = 7 /* PGRAC: spec-2.34 D1 NEW;
+	GCS_BLOCK_REPLY_DENIED_DEDUP_FULL = 7, /* PGRAC: spec-2.34 D1 NEW;
 											 * HC96 transient — sender 走 retry
 											 * path 同 timeout 语义,budget 耗尽
 											 * 才 ereport 53R90 */
+	GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER = 8	  /* PGRAC: spec-2.35 D1 NEW;
+											   * holder ships block directly to
+											   * original requester (2-way CF read
+											   * sharing).  Sender HC108
+											   * authorized chain validates that
+											   * hdr.forwarding_master_node ==
+											   * slot.expected_master_node. */
 } GcsBlockReplyStatus;
 
 
@@ -156,7 +163,7 @@ StaticAssertDecl(sizeof(GcsBlockRequestPayload) == 64,
  *  Receiver decodes header in-place then reads block_data directly out
  *  of the envelope buffer (no separate alloc).
  *
- *  Layout (48B; HC80 + HC83 + HC84):
+ *  Layout (48B; HC80 + HC83 + HC84 + spec-2.35 HC109):
  *    [  0,   8) request_id              -- match outstanding
  *    [  8,  16) page_lsn                -- PageGetLSN(page) at ship time;
  *                                          receiver MUST PageSetLSN(page,
@@ -164,29 +171,114 @@ StaticAssertDecl(sizeof(GcsBlockRequestPayload) == 64,
  *                                          EXCLUSIVE (HC84)
  *    [ 16,  24) epoch                   -- cluster_epoch at reply
  *    [ 24,  28) checksum                -- CRC32C(block_data, 8192) (HC83)
- *    [ 28,  32) sender_node             -- int32 of replying master node
+ *    [ 28,  32) sender_node             -- int32 of replying node
+ *                                          (master for direct, holder for
+ *                                          forwarded-from-holder)
  *    [ 32,  36) requester_backend_id    -- compound key match (HC80)
  *    [ 36,  37) transition_id           -- echo from request
  *    [ 37,  38) status                  -- GcsBlockReplyStatus (HC83)
- *    [ 38,  48) reserved_0[10]          -- align + future fields
+ *    [ 38,  42) forwarding_master_node_bytes[4]
+ *                                       -- spec-2.35 HC109 reserved 重解读:
+ *                                          stored as uint8[4] (NOT int32) so
+ *                                          the compiler does not insert
+ *                                          padding before this field;  use
+ *                                          GcsBlockReplyHeaderGet/Set
+ *                                          ForwardingMasterNode() helpers to
+ *                                          encode/decode int32 little-endian.
+ *                                          0 == direct from master;  != 0 ==
+ *                                          forwarded by this master (sender
+ *                                          走 HC108 authorized chain).
+ *    [ 42,  48) reserved_0[6]           -- align + future fields
  * ============================================================ */
 typedef struct GcsBlockReplyHeader {
-	uint64 request_id;			/*  8B [  0,   8) */
-	uint64 page_lsn;			/*  8B [  8,  16) HC84 */
-	uint64 epoch;				/*  8B [ 16,  24) */
-	uint32 checksum;			/*  4B [ 24,  28) HC83 CRC32C */
-	int32 sender_node;			/*  4B [ 28,  32) */
-	int32 requester_backend_id; /* 4B [ 32,  36) */
-	uint8 transition_id;		/*  1B [ 36,  37) */
-	uint8 status;				/*  1B [ 37,  38) GcsBlockReplyStatus */
-	uint8 reserved_0[10];		/* 10B [ 38,  48) */
+	uint64 request_id;					/*  8B [  0,   8) */
+	uint64 page_lsn;					/*  8B [  8,  16) HC84 */
+	uint64 epoch;						/*  8B [ 16,  24) */
+	uint32 checksum;					/*  4B [ 24,  28) HC83 CRC32C */
+	int32 sender_node;					/*  4B [ 28,  32) */
+	int32 requester_backend_id;			/*  4B [ 32,  36) */
+	uint8 transition_id;				/*  1B [ 36,  37) */
+	uint8 status;						/*  1B [ 37,  38) GcsBlockReplyStatus */
+	uint8 forwarding_master_node_bytes[4];	/* 4B [ 38,  42) HC109 spec-2.35 */
+	uint8 reserved_0[6];				/*  6B [ 42,  48) */
 } GcsBlockReplyHeader;
 
 StaticAssertDecl(sizeof(GcsBlockReplyHeader) == 48,
-				 "spec-2.33 D1 GcsBlockReplyHeader wire ABI 48B "
+				 "spec-2.33 D1 + spec-2.35 HC109 GcsBlockReplyHeader wire ABI 48B "
 				 "(request_id 8 + page_lsn 8 + epoch 8 + checksum 4 + "
 				 "sender_node 4 + requester_backend_id 4 + transition_id 1 + "
-				 "status 1 + reserved 10)");
+				 "status 1 + forwarding_master_node_bytes 4 + reserved 6)");
+
+
+/* ============================================================
+ * Helpers for the spec-2.35 HC109 forwarding_master_node_bytes[4] field.
+ *
+ *	The field is stored as uint8[4] so the C compiler does not insert
+ *	alignment padding before it (placing an int32 at offset 38 would
+ *	otherwise require a 2-byte gap and expand the header from 48 to 56
+ *	bytes — that would silently break the wire ABI lock above).  Wire
+ *	encoding is little-endian, matching every other multi-byte field in
+ *	the envelope (cluster_ic_envelope.h uses LE for magic / payload_crc
+ *	/ etc).  0 sentinel marks "direct from master, not forwarded".
+ * ============================================================ */
+static inline int32
+GcsBlockReplyHeaderGetForwardingMasterNode(const GcsBlockReplyHeader *hdr)
+{
+	int32		v;
+
+	memcpy(&v, hdr->forwarding_master_node_bytes, sizeof(int32));
+	return v;
+}
+
+static inline void
+GcsBlockReplyHeaderSetForwardingMasterNode(GcsBlockReplyHeader *hdr, int32 node_id)
+{
+	memcpy(hdr->forwarding_master_node_bytes, &node_id, sizeof(int32));
+}
+
+
+/* ============================================================
+ * GcsBlockForwardPayload -- wire ABI for PGRAC_IC_MSG_GCS_BLOCK_FORWARD
+ *                          (spec-2.35 D2; HC102; master→holder direction).
+ *
+ *	When master decides to forward a GCS_BLOCK_REQUEST to an authorized
+ *	holder (HC101: state==S + master not local-resident + bitmap has the
+ *	holder bit), it emits this 64B payload to that holder.  Holder reads
+ *	original_requester_node + requester_backend_id to direct-ship the
+ *	GCS_BLOCK_REPLY (with status GRANTED_FROM_HOLDER + holder's node id
+ *	as sender_node + forwarding_master_node = master_node) back to the
+ *	original sender (skipping a proxy round-trip through master).
+ *
+ *	Layout (64B; same size as GcsBlockRequestPayload for ring slot
+ *	commonality, but with independent field semantics):
+ *	  [  0,   8) request_id            -- echo from original request
+ *	  [  8,  16) epoch                 -- master's epoch at forward time
+ *	  [ 16,  36) tag                   -- BufferTag (PG-fact 20B)
+ *	  [ 36,  40) original_requester_node -- "ship reply back to whom"
+ *	  [ 40,  44) requester_backend_id  -- HC80 compound key
+ *	  [ 44,  48) master_node           -- "this forward authorized by me"
+ *	                                      (holder copies into reply.
+ *	                                      forwarding_master_node)
+ *	  [ 48,  49) transition_id         -- PcmLockTransition (1..9)
+ *	  [ 49,  64) reserved_0[15]        -- align + future fields
+ * ============================================================ */
+typedef struct GcsBlockForwardPayload {
+	uint64 request_id;				/*  8B [  0,   8) */
+	uint64 epoch;					/*  8B [  8,  16) */
+	BufferTag tag;					/* 20B [ 16,  36) */
+	int32 original_requester_node;	/*  4B [ 36,  40) */
+	int32 requester_backend_id;		/*  4B [ 40,  44) */
+	int32 master_node;				/*  4B [ 44,  48) */
+	uint8 transition_id;			/*  1B [ 48,  49) */
+	uint8 reserved_0[15];			/* 15B [ 49,  64) */
+} GcsBlockForwardPayload;
+
+StaticAssertDecl(sizeof(GcsBlockForwardPayload) == 64,
+				 "spec-2.35 D2 GcsBlockForwardPayload wire ABI 64B "
+				 "(request_id 8 + epoch 8 + tag 20 + original_requester_node 4 + "
+				 "requester_backend_id 4 + master_node 4 + transition_id 1 + "
+				 "reserved 15; 64B = natural 8-aligned struct size; same sizeof "
+				 "as GcsBlockRequestPayload but independent semantics; HC102)");
 
 /* Compile-time assertion that block size matches PG BLCKSZ.  HC80. */
 StaticAssertDecl(GCS_BLOCK_DATA_SIZE == BLCKSZ,
@@ -278,6 +370,13 @@ extern void cluster_gcs_handle_block_request_envelope(const struct ClusterICEnve
 													  const void *payload);
 extern void cluster_gcs_handle_block_reply_envelope(const struct ClusterICEnvelope *env,
 													const void *payload);
+/* PGRAC: spec-2.35 D7 — holder-side forward handler.  Receives
+ * PGRAC_IC_MSG_GCS_BLOCK_FORWARD, copies the page bytes, direct-ships
+ * the GCS_BLOCK_REPLY (status GRANTED_FROM_HOLDER) to the original
+ * requester carried in fwd.original_requester_node.  HC103 + HC104 +
+ * HC105 (evict race fallback). */
+extern void cluster_gcs_handle_block_forward_envelope(const struct ClusterICEnvelope *env,
+													  const void *payload);
 
 
 /* ============================================================
@@ -318,6 +417,34 @@ extern uint64 cluster_gcs_get_block_dedup_collision_count(void);
 extern uint64 cluster_gcs_get_block_dedup_full_count(void);
 extern uint64 cluster_gcs_get_block_epoch_invalidate_wake_count(void);
 extern uint64 cluster_gcs_get_block_stale_reply_drop_count(void);
+
+/*
+ * PGRAC: spec-2.35 D12 — 7 NEW reliability/lifecycle counter accessors
+ * for CF 2-way read sharing.  Mirrors ClusterGcsBlockShared fields.
+ *
+ *	block_forward_sent_count            — master sent GCS_BLOCK_FORWARD
+ *	block_forward_received_count        — holder received FORWARD
+ *	block_from_holder_ship_count        — holder shipped GRANTED_FROM_HOLDER
+ *	block_forward_holder_evicted_count  — holder evict race DENIED reply
+ *	s_holders_bitmap_redirect_count     — master chose forward over fallback
+ *	master_holder_lifecycle_count       — HC110 update events
+ *	forward_replay_count                — dedup FORWARDED re-forward
+ */
+extern uint64 cluster_gcs_get_block_forward_sent_count(void);
+extern uint64 cluster_gcs_get_block_forward_received_count(void);
+extern uint64 cluster_gcs_get_block_from_holder_ship_count(void);
+extern uint64 cluster_gcs_get_block_forward_holder_evicted_count(void);
+extern uint64 cluster_gcs_get_block_s_holders_bitmap_redirect_count(void);
+extern uint64 cluster_gcs_get_block_master_holder_lifecycle_count(void);
+extern uint64 cluster_gcs_get_block_forward_replay_count(void);
+
+/*
+ * PGRAC: spec-2.35 D3 (HC110) — counter bump invoked from cluster_pcm_
+ *	transition_apply each time master_holder is mutated.  Keeping the
+ *	bump logic in cluster_gcs_block.c avoids exposing the atomic field
+ *	of ClusterGcsBlockShared to other translation units.
+ */
+extern void cluster_gcs_block_bump_master_holder_lifecycle(void);
 
 
 /* ============================================================

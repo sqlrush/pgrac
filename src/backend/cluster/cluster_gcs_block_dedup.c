@@ -212,6 +212,23 @@ cluster_gcs_block_dedup_lookup_or_register(const GcsBlockDedupKey *key, BufferTa
 			return GCS_BLOCK_DEDUP_VALIDATION_FAIL;
 		}
 
+		/* PGRAC: spec-2.35 HC113/HC114 — forwarded entry path.  Master
+		 * previously installed this entry with status=GRANTED_FROM_HOLDER
+		 * to mark "forward in flight"; reply_header.sender_node carries
+		 * the holder node id (not an 8KB cached block).  Caller must
+		 * re-forward to the same holder rather than treat as silent
+		 * duplicate.  This branch fires WHETHER OR NOT completed_at_ts
+		 * is zero — the forward install_reply path stamps completed_at_ts
+		 * so TTL sweep can age the entry; consumers distinguish FORWARDED
+		 * from genuine CACHED_REPLY via the status field. */
+		if (entry->status == (uint8) GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER)
+		{
+			if (cached_reply_out != NULL)
+				*cached_reply_out = *entry;
+			LWLockRelease(&cluster_gcs_block_dedup_shared->lock.lock);
+			return GCS_BLOCK_DEDUP_FORWARDED_DUPLICATE;
+		}
+
 		if (entry->completed_at_ts == 0) {
 			LWLockRelease(&cluster_gcs_block_dedup_shared->lock.lock);
 			return GCS_BLOCK_DEDUP_IN_FLIGHT_DUPLICATE;

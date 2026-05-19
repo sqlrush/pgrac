@@ -336,6 +336,92 @@ pcm_transition_target(PcmLockTransition trans)
 }
 
 
+/*
+ * PGRAC: spec-2.35 D3 (HC110) — master_holder lifecycle helpers.
+ *
+ *	master_holder is a 24B ClusterGrdHolderId 4-tuple (cluster_grd.h:
+ *	{node_id, procno, cluster_epoch, request_id}).  HC110 forbids direct
+ *	int-style assignment (cf. user codereview P1-2).  spec-2.35 only
+ *	requires the node_id field for forward routing; procno / cluster_
+ *	epoch / request_id remain opaque context for future specs (spec-2.36
+ *	S→X invalidation broadcast may populate them).
+ *
+ *	Sentinel: node_id == INVALID_PCM_MASTER_HOLDER_NODE marks "no holder
+ *	known".  Caller must check via cluster_pcm_master_holder_is_valid()
+ *	before consuming the node_id.
+ */
+#define INVALID_PCM_MASTER_HOLDER_NODE ((uint32) UINT32_MAX)
+
+static inline void
+pcm_master_holder_set_node(struct GrdEntry *entry, int32 node_id)
+{
+	Assert(node_id >= 0 && node_id < 32);
+	if (entry->master_holder.node_id == (uint32) node_id)
+		return;					/* no-op; do not bump lifecycle counter */
+	entry->master_holder.node_id = (uint32) node_id;
+	/* procno / cluster_epoch / request_id intentionally left at current
+	 * values (zero on fresh entry from pcm_get_or_create_entry); spec-2.35
+	 * scope does not consume them.  HC110. */
+	cluster_gcs_block_bump_master_holder_lifecycle();
+}
+
+static inline void
+pcm_master_holder_clear(struct GrdEntry *entry)
+{
+	if (entry->master_holder.node_id == INVALID_PCM_MASTER_HOLDER_NODE)
+		return;					/* already cleared; no lifecycle event */
+	memset(&entry->master_holder, 0, sizeof(ClusterGrdHolderId));
+	entry->master_holder.node_id = INVALID_PCM_MASTER_HOLDER_NODE;
+	cluster_gcs_block_bump_master_holder_lifecycle();
+}
+
+static inline bool
+pcm_master_holder_is_valid(const struct GrdEntry *entry)
+{
+	return entry->master_holder.node_id != INVALID_PCM_MASTER_HOLDER_NODE;
+}
+
+static inline int32
+pcm_lowest_set_bit_node(uint32 bitmap)
+{
+	uint32		i;
+
+	if (bitmap == 0)
+		return -1;
+	for (i = 0; i < 32; i++)
+		if (bitmap & ((uint32) 1u << i))
+			return (int32) i;
+	return -1;
+}
+
+/*
+ * Public extern wrapper:  master-side ship source decision (spec-2.35 D6)
+ * needs to know the master_holder.node_id of a tag's GrdEntry.  Returns
+ * -1 if no GRD entry exists or the slot is unset.  Caller invokes after
+ * cluster_pcm_lock_query(tag) returns S to decide whether forward is
+ * possible.
+ */
+int32
+cluster_pcm_master_holder_node_by_tag(BufferTag tag)
+{
+	struct GrdEntry *entry;
+	bool		found;
+	int32		node_id = -1;
+
+	if (cluster_pcm_htab == NULL)
+		return -1;
+
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+	entry = (struct GrdEntry *) hash_search(cluster_pcm_htab, &tag,
+											HASH_FIND, &found);
+	if (found && entry != NULL && pcm_master_holder_is_valid(entry))
+		node_id = (int32) entry->master_holder.node_id;
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+
+	return node_id;
+}
+
+
 void
 cluster_pcm_transition_apply(struct GrdEntry *entry, PcmLockTransition trans, int holder_node_id)
 {
@@ -351,17 +437,24 @@ cluster_pcm_transition_apply(struct GrdEntry *entry, PcmLockTransition trans, in
 	case PCM_TRANS_N_TO_S:
 		pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_S);
 		pg_atomic_fetch_or_u32(&entry->s_holders_bitmap, holder_bit);
+		/* HC110: first S holder becomes master_holder (forward target). */
+		pcm_master_holder_set_node(entry, holder_node_id);
 		pg_atomic_fetch_add_u64(&ClusterPcm->trans_n_to_s_count, 1);
 		break;
 	case PCM_TRANS_N_TO_X:
 		pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_X);
 		entry->x_holder_node = holder_node_id;
+		/* HC110: X holder becomes master_holder. */
+		pcm_master_holder_set_node(entry, holder_node_id);
 		pg_atomic_fetch_add_u64(&ClusterPcm->trans_n_to_x_count, 1);
 		break;
 	case PCM_TRANS_S_TO_X_UPGRADE:
 		pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_X);
 		pg_atomic_fetch_and_u32(&entry->s_holders_bitmap, ~holder_bit);
 		entry->x_holder_node = holder_node_id;
+		/* HC110: upgrading node becomes sole holder; spec-2.36 invalidates
+		 * other S holders.  master_holder follows upgraded node. */
+		pcm_master_holder_set_node(entry, holder_node_id);
 		pg_atomic_fetch_add_u64(&ClusterPcm->trans_s_to_x_upgrade_count, 1);
 		break;
 	case PCM_TRANS_X_TO_S_DOWNGRADE:
@@ -369,30 +462,72 @@ cluster_pcm_transition_apply(struct GrdEntry *entry, PcmLockTransition trans, in
 		pg_atomic_fetch_or_u32(&entry->s_holders_bitmap, holder_bit);
 		pg_atomic_fetch_or_u32(&entry->pi_holders_bitmap, holder_bit); /* HC58 PI set */
 		entry->x_holder_node = -1;
+		/* HC110: downgraded X→S node still holds the buffer cached. */
+		pcm_master_holder_set_node(entry, holder_node_id);
 		pg_atomic_fetch_add_u64(&ClusterPcm->trans_x_to_s_downgrade_count, 1);
 		break;
 	case PCM_TRANS_X_TO_N_DOWNGRADE:
 		pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_N);
 		pg_atomic_fetch_or_u32(&entry->pi_holders_bitmap, holder_bit); /* HC58 PI set */
 		entry->x_holder_node = -1;
+		/* HC110: X holder fully released; clear master_holder. */
+		pcm_master_holder_clear(entry);
 		pg_atomic_fetch_add_u64(&ClusterPcm->trans_x_to_n_downgrade_count, 1);
 		break;
 	case PCM_TRANS_X_TO_N_RELEASE:
 		pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_N);
 		entry->x_holder_node = -1;
+		/* HC110: X holder released, no cache claim remains. */
+		pcm_master_holder_clear(entry);
 		pg_atomic_fetch_add_u64(&ClusterPcm->trans_x_to_n_release_count, 1);
 		break;
 	case PCM_TRANS_S_TO_N_INVALIDATE:
 		pg_atomic_fetch_and_u32(&entry->s_holders_bitmap, ~holder_bit);
-		/* If no S holders remain after this clear, advance to N. */
-		if (pg_atomic_read_u32(&entry->s_holders_bitmap) == 0)
-			pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_N);
+		/* HC110: master_holder lifecycle on S release.
+		 *   bitmap == 0:     no remaining holder, clear
+		 *   master == holder being released: pick lowest remaining bit
+		 *   else:            keep existing master_holder
+		 */
+		{
+			uint32		bm_after = pg_atomic_read_u32(&entry->s_holders_bitmap);
+
+			if (bm_after == 0)
+			{
+				pg_atomic_write_u32(&entry->master_state, (uint32) PCM_STATE_N);
+				pcm_master_holder_clear(entry);
+			}
+			else if (pcm_master_holder_is_valid(entry)
+					 && (int32) entry->master_holder.node_id == holder_node_id)
+			{
+				int32 next_holder = pcm_lowest_set_bit_node(bm_after);
+				if (next_holder >= 0)
+					pcm_master_holder_set_node(entry, next_holder);
+				else
+					pcm_master_holder_clear(entry);
+			}
+		}
 		pg_atomic_fetch_add_u64(&ClusterPcm->trans_s_to_n_invalidate_count, 1);
 		break;
 	case PCM_TRANS_S_TO_N_RELEASE:
 		pg_atomic_fetch_and_u32(&entry->s_holders_bitmap, ~holder_bit);
-		if (pg_atomic_read_u32(&entry->s_holders_bitmap) == 0)
-			pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_N);
+		{
+			uint32		bm_after = pg_atomic_read_u32(&entry->s_holders_bitmap);
+
+			if (bm_after == 0)
+			{
+				pg_atomic_write_u32(&entry->master_state, (uint32) PCM_STATE_N);
+				pcm_master_holder_clear(entry);
+			}
+			else if (pcm_master_holder_is_valid(entry)
+					 && (int32) entry->master_holder.node_id == holder_node_id)
+			{
+				int32 next_holder = pcm_lowest_set_bit_node(bm_after);
+				if (next_holder >= 0)
+					pcm_master_holder_set_node(entry, next_holder);
+				else
+					pcm_master_holder_clear(entry);
+			}
+		}
 		pg_atomic_fetch_add_u64(&ClusterPcm->trans_s_to_n_release_count, 1);
 		break;
 	case PCM_TRANS_S_TO_X_CLEANOUT:
@@ -915,16 +1050,22 @@ cluster_pcm_lock_release(BufferTag tag)
 
 /*
  * PGRAC: spec-2.33 D7 hardening — BufferDesc/mode-aware release.
+ * PGRAC: spec-2.35 D5 (HC111 + HC112) — renamed to
+ *   cluster_pcm_lock_release_buffer_for_eviction.  Callers must invoke this
+ *   only on real cache-residency loss (InvalidateBuffer / InvalidateVictim
+ *   Buffer / DropRelations*Buffers / DropDatabaseBuffers + X content-lock
+ *   unlock delegated through cluster_pcm_lock_unlock_content_buffer).  See
+ *   cluster_pcm_lock.h banner for the bifurcation rationale.
  *
  * Remote-master release must mirror the mode acquired by
  * cluster_pcm_lock_acquire_buffer().  The tag-only API cannot distinguish an
  * S holder from an X holder when the authoritative entry lives on a remote
  * master, so it conservatively remains the tag-only/local API.  Bufmgr uses
  * this variant and passes the mode it acquired (or the BufferDesc mirror on
- * normal UNLOCK) so X locks release with X→N rather than the S→N transition.
+ * eviction) so X locks release with X→N rather than the S→N transition.
  */
 void
-cluster_pcm_lock_release_buffer(BufferDesc *buf, PcmLockMode mode)
+cluster_pcm_lock_release_buffer_for_eviction(BufferDesc *buf, PcmLockMode mode)
 {
 	BufferTag tag;
 	int master_node;
@@ -932,7 +1073,7 @@ cluster_pcm_lock_release_buffer(BufferDesc *buf, PcmLockMode mode)
 
 	if (buf == NULL)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-						errmsg("cluster_pcm_lock_release_buffer: NULL BufferDesc")));
+						errmsg("cluster_pcm_lock_release_buffer_for_eviction: NULL BufferDesc")));
 
 	if (cluster_pcm_htab == NULL)
 		PCM_STUB_DISABLED_PATH;
@@ -958,6 +1099,40 @@ cluster_pcm_lock_release_buffer(BufferDesc *buf, PcmLockMode mode)
 	 * one place.
 	 */
 	cluster_pcm_lock_release(tag);
+}
+
+/*
+ * PGRAC: spec-2.35 D5 (HC111 + HC112) — content-lock unlock variant.
+ *
+ *	Called from bufmgr LockBuffer(BUFFER_LOCK_UNLOCK) when the in-process
+ *	content_lock LWLock is dropped but the buffer is still resident in the
+ *	shared buffer pool.  Per HC111, an SCUR cache residency bit must
+ *	survive this event (so the master can still forward subsequent
+ *	GCS_BLOCK_REQUEST to this node).  XCUR is single-holder so content-lock
+ *	unlock genuinely releases (matches spec-2.31 D7 prior semantic for X).
+ */
+void
+cluster_pcm_lock_unlock_content_buffer(BufferDesc *buf, PcmLockMode mode)
+{
+	if (buf == NULL)
+		return;
+	if (cluster_pcm_htab == NULL)
+		return;
+
+	/* HC111: S-holder bit = cache residency, NOT transient content-lock
+	 * holding.  Content-lock unlock leaves the bit set so subsequent
+	 * read traffic on other nodes can be forwarded here. */
+	if (mode == PCM_LOCK_MODE_S)
+		return;
+
+	/* X is single-holder semantics; content-lock unlock = release X. */
+	if (mode == PCM_LOCK_MODE_X)
+	{
+		cluster_pcm_lock_release_buffer_for_eviction(buf, mode);
+		return;
+	}
+
+	/* mode == N: nothing to release */
 }
 
 

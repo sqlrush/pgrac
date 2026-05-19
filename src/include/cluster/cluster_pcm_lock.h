@@ -213,7 +213,53 @@ extern void cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode);
  * directing callers here.
  */
 extern void cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode);
-extern void cluster_pcm_lock_release_buffer(BufferDesc *buf, PcmLockMode mode);
+
+/*
+ * PGRAC: spec-2.35 D5 (HC111 + HC112) — bufmgr release hook bifurcation.
+ *
+ *	spec-2.31 D7 had a single cluster_pcm_lock_release_buffer() invoked
+ *	from bufmgr LockBuffer's UNLOCK path.  That conflated two semantically
+ *	distinct events:
+ *	  (a) "content lock released" — the in-process content_lock SHARED or
+ *	      EXCLUSIVE LWLock just dropped, but the buffer is still resident
+ *	      in shared_buffers and may still serve other backends as a SCUR
+ *	      cache holder (relevant for CF 2-way read sharing per spec-2.35).
+ *	  (b) "cache residency lost" — the buffer is being evicted from
+ *	      shared_buffers (InvalidateBuffer / InvalidateVictimBuffer /
+ *	      DropRelations*Buffers / DropDatabaseBuffers), so the master's
+ *	      s_holders_bitmap bit and master_holder lifecycle must clear.
+ *
+ *	HC111 redefines s_holders_bitmap as "cache residency" semantics.  HC112
+ *	requires bufmgr to call (a) on content-lock unlock and (b) only on
+ *	actual eviction.
+ *
+ *	cluster_pcm_lock_unlock_content_buffer(buf, mode):
+ *	  - SCUR: no-op (cache residency preserved; bit stays set so the
+ *	    master can still forward GCS_BLOCK_REQUEST to this node)
+ *	  - XCUR: delegates to cluster_pcm_lock_release_buffer_for_eviction
+ *	    (X is single-holder; releasing the X content lock also drops the
+ *	    cache claim, matching spec-2.31 D7 prior semantics for X)
+ *	  - N: no-op
+ *
+ *	cluster_pcm_lock_release_buffer_for_eviction(buf, mode):
+ *	  - Performs the bit-clearing + master_holder lifecycle update.
+ *	  - mode is taken from BufferDesc.pcm_state at eviction time so the
+ *	    caller does not need to remember which mode was last held.
+ */
+extern void cluster_pcm_lock_unlock_content_buffer(BufferDesc *buf, PcmLockMode mode);
+extern void cluster_pcm_lock_release_buffer_for_eviction(BufferDesc *buf, PcmLockMode mode);
+
+/*
+ * PGRAC: spec-2.35 D3 (HC110) — master_holder lookup for forward routing.
+ *
+ *	master-side GCS_BLOCK_REQUEST handler invokes this after
+ *	cluster_pcm_lock_query(tag) returns S to decide whether the request
+ *	can be forwarded to an authorized holder.  Returns -1 if no GrdEntry
+ *	exists for the tag, or if master_holder is in the cleared sentinel
+ *	state.  Otherwise returns the holder's cluster.node_id (0..31).
+ */
+extern int32 cluster_pcm_master_holder_node_by_tag(BufferTag tag);
+
 extern void cluster_pcm_lock_release(BufferTag tag);
 extern void cluster_pcm_lock_upgrade(BufferTag tag);
 extern void cluster_pcm_lock_downgrade(BufferTag tag, PcmLockMode target_mode, bool keep_pi);

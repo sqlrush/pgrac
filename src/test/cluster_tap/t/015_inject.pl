@@ -57,8 +57,8 @@ $node->start;
 # ----------
 is( $node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-	'104',
-	'pg_stat_cluster_injections returns 104 rows after spec-2.34 GCS block reliability additions');
+	'106',
+	'pg_stat_cluster_injections returns 106 rows after spec-2.35 CF 2-way protocol additions');
 
 
 # ----------

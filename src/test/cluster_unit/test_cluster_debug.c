@@ -444,6 +444,43 @@ cluster_gcs_get_block_stale_reply_drop_count(void)
 	return 0;
 }
 
+/* spec-2.35 D12 stubs: 7 NEW CF 2-way protocol counter accessors. */
+uint64
+cluster_gcs_get_block_forward_sent_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_forward_received_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_from_holder_ship_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_forward_holder_evicted_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_s_holders_bitmap_redirect_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_master_holder_lifecycle_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_forward_replay_count(void)
+{
+	return 0;
+}
+
 Size
 cluster_shmem_get_total_bytes(void)
 {

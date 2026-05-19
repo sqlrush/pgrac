@@ -305,6 +305,25 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 */
 	{ .name = "cluster-gcs-block-drop-reply-before-send" },
 	{ .name = "cluster-gcs-block-force-epoch-stale-reply" },
+	/*
+	 * spec-2.35 D15 — CF 2-way protocol fault injection.
+	 *
+	 *	cluster-gcs-block-forward-master-side:
+	 *	  Fires inside master-side decision tree just before the forward
+	 *	  branch is taken.  SKIP makes the master skip forward — falls
+	 *	  through to STORAGE_FALLBACK / MASTER_NOT_HOLDER so TAP can
+	 *	  exercise fallback paths under the same topology that would
+	 *	  otherwise trigger forward.
+	 *
+	 *	cluster-gcs-block-evict-holder-before-ship:
+	 *	  Fires inside holder-side forward handler before bufmgr copy.
+	 *	  SKIP simulates evict race:  holder pretends buffer is not
+	 *	  cached → reply DENIED_MASTER_NOT_HOLDER with HC108-authorized
+	 *	  forwarding_master_node so sender's HC105 retransmit budget
+	 *	  recovery path is exercised.
+	 */
+	{ .name = "cluster-gcs-block-forward-master-side" },
+	{ .name = "cluster-gcs-block-evict-holder-before-ship" },
 };
 
 #define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_points)

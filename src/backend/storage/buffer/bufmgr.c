@@ -1508,6 +1508,29 @@ retry:
 	buf_state &= ~(BUF_FLAG_MASK | BUF_USAGECOUNT_MASK);
 	UnlockBufHdr(buf, buf_state);
 
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: spec-2.35 D4 (HC112) — cache eviction hook.  Buffer is being
+	 * invalidated (DROP / TRUNCATE relation, DropDatabaseBuffers,
+	 * DropRelationsAllBuffers).  Drop the cache-residency bit + propagate
+	 * master_holder lifecycle (HC110).  Uses the saved oldTag because the
+	 * BufferDesc.tag was just cleared above.
+	 */
+	if (cluster_pcm_is_active()
+		&& BufTagGetRelNumber(&oldTag) >= FirstNormalObjectId
+		&& buf->pcm_state != (uint8) PCM_STATE_N)
+	{
+		PcmLockMode old_mode = (PcmLockMode) buf->pcm_state;
+
+		buf->tag = oldTag;	/* temporary restore so the release helper sees
+							 * the right tag — release sets pcm_state to N
+							 * but does not write tag */
+		cluster_pcm_lock_release_buffer_for_eviction(buf, old_mode);
+		ClearBufferTag(&buf->tag);
+		buf->pcm_state = (uint8) PCM_STATE_N;
+	}
+#endif
+
 	/*
 	 * Remove the buffer from the lookup hashtable, if it was in there.
 	 */
@@ -1589,6 +1612,26 @@ InvalidateVictimBuffer(BufferDesc *buf_hdr)
 	UnlockBufHdr(buf_hdr, buf_state);
 
 	Assert(BUF_STATE_GET_REFCOUNT(buf_state) > 0);
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: spec-2.35 D4 (HC112) — cache eviction hook for victim buffer.
+	 * LRU selected this buffer + we already confirmed it is reusable.
+	 * Drop the cache-residency bit + propagate master_holder lifecycle
+	 * (HC110) before BufTableDelete completes the eviction.
+	 */
+	if (cluster_pcm_is_active()
+		&& BufTagGetRelNumber(&tag) >= FirstNormalObjectId
+		&& buf_hdr->pcm_state != (uint8) PCM_STATE_N)
+	{
+		PcmLockMode old_mode = (PcmLockMode) buf_hdr->pcm_state;
+
+		buf_hdr->tag = tag;	/* restore for release helper (cleared above) */
+		cluster_pcm_lock_release_buffer_for_eviction(buf_hdr, old_mode);
+		ClearBufferTag(&buf_hdr->tag);
+		buf_hdr->pcm_state = (uint8) PCM_STATE_N;
+	}
+#endif
 
 	/* finally delete buffer from the buffer mapping table */
 	BufTableDelete(&tag, hash);
@@ -4887,7 +4930,14 @@ LockBuffer(Buffer buffer, int mode)
 		PG_CATCH();
 		{
 			if (pcm_acquired)
-				cluster_pcm_lock_release_buffer(buf, pcm_mode);
+			{
+				/* PGRAC: spec-2.35 D4 (HC112) — acquire-then-LWLock-fail
+				 * rollback path:  PCM acquire succeeded but LWLockAcquire
+				 * threw.  Roll back the cache-residency claim using the
+				 * eviction release (it fully clears the bitmap bit so the
+				 * partial acquire does not leak a stale holder). */
+				cluster_pcm_lock_release_buffer_for_eviction(buf, pcm_mode);
+			}
 			PG_RE_THROW();
 		}
 		PG_END_TRY();
@@ -4905,7 +4955,18 @@ LockBuffer(Buffer buffer, int mode)
 		cluster_bufmgr_should_pcm_track(buf) &&
 		buf->pcm_state != (uint8) PCM_STATE_N)
 	{
-		cluster_pcm_lock_release_buffer(buf, (PcmLockMode) buf->pcm_state);
+		/* PGRAC: spec-2.35 D4 (HC111 + HC112) — content-lock unlock path.
+		 * SCUR preserves cache residency (bit stays set so CF 2-way
+		 * forward can still target this node).  XCUR delegates to the
+		 * eviction release (single-holder semantic preserved).  Real
+		 * cache eviction is handled by the InvalidateBuffer /
+		 * InvalidateVictimBuffer / Drop*Buffers hook points (below). */
+		PcmLockMode old_mode = (PcmLockMode) buf->pcm_state;
+
+		cluster_pcm_lock_unlock_content_buffer(buf, old_mode);
+		/* Mirror PCM state — query for current (S residency preserved,
+		 * X cleared to N).  HC111 keeps the SCUR bit so the query
+		 * returns S; XCUR was just released so query returns N. */
 		buf->pcm_state = (uint8) cluster_pcm_lock_query(buf->tag);
 	}
 #endif
