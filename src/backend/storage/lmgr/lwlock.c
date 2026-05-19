@@ -222,6 +222,8 @@ static const char *const BuiltinTrancheNames[] = {
 	"ClusterPcm",
 	/* PGRAC LWTRANCHE_CLUSTER_GCS: spec-2.32 D2 outstanding-request block lock */
 	"ClusterGcs",
+	/* PGRAC LWTRANCHE_CLUSTER_GCS_BLOCK: spec-2.33 D3 block ship request lock */
+	"ClusterGcsBlock",
 #endif
 };
 

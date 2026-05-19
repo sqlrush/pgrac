@@ -316,13 +316,14 @@ is($scn_key_count, '19',
 
 # ----------
 # L12: catversion bumped at-or-after 202605181 detected via pg_controldata.
-# Spec-1.18 bumped 202605050 -> 202605181; later specs (1.22 -> 202605190)
-# may bump further.  Use a lower-bound regex that locks "post-1.18 catversion"
-# without forcing every later spec to amend this test.
+# Spec-1.18 bumped 202605050 -> 202605181; later specs may bump further.
+# Compare the extracted numeric catversion directly so this test does not
+# need another regex expansion on every future catalog bump.
 # ----------
 my $pg_controldata = $primary->config_data('--bindir') . '/pg_controldata';
 my $controldata_out = `$pg_controldata @{[$primary->data_dir]}`;
-like($controldata_out, qr/Catalog version number:\s+(20260518[1-9]|2026051[89]\d|20260520\d|2026052[1-9]\d|2026053\d{2}|20260[6-9]\d{3}|2026[1-9]\d{4}|202[7-9]\d{5}|20[3-9]\d{6})/,
+my ($catversion) = $controldata_out =~ /Catalog version number:\s+(\d+)/;
+ok(defined($catversion) && $catversion >= 202605181,
 	'L12 catversion bumped at-or-after 202605181 (Q2 ★ on-disk WAL format change; spec-1.22 -> 202605190; spec-2.2 -> 202605200)');
 
 

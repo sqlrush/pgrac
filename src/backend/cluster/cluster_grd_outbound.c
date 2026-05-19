@@ -39,6 +39,7 @@
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_ic_tier1.h"
+#include "cluster/cluster_lmon.h"
 #include "cluster/cluster_shmem.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
@@ -253,6 +254,14 @@ bool
 cluster_grd_outbound_enqueue_backend_request(uint32 dest_node_id, const void *payload,
 											 uint16 payload_len)
 {
+	return cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GES_REQUEST, dest_node_id, payload,
+													payload_len);
+}
+
+bool
+cluster_grd_outbound_enqueue_backend_msg(uint8 msg_type, uint32 dest_node_id, const void *payload,
+										 uint16 payload_len)
+{
 	bool ok;
 
 	Assert(cluster_grd_outbound_state != NULL);
@@ -268,9 +277,11 @@ cluster_grd_outbound_enqueue_backend_request(uint32 dest_node_id, const void *pa
 		return false;
 	}
 
-	ok = ring_push(PGRAC_IC_MSG_GES_REQUEST, CLUSTER_GRD_OUTBOUND_BACKEND_REQUEST, dest_node_id,
-				   payload, payload_len);
+	ok = ring_push(msg_type, CLUSTER_GRD_OUTBOUND_BACKEND_REQUEST, dest_node_id, payload,
+				   payload_len);
 	LWLockRelease(cluster_grd_outbound_lock);
+	if (ok)
+		cluster_lmon_wakeup();
 	return ok;
 }
 
@@ -290,6 +301,7 @@ cluster_grd_outbound_enqueue_lmon_reply(uint32 dest_node_id, const void *payload
 		reply_dirty_push(dest_node_id, payload, payload_len);
 
 	LWLockRelease(cluster_grd_outbound_lock);
+	cluster_lmon_wakeup();
 }
 
 void
@@ -308,6 +320,7 @@ cluster_grd_outbound_enqueue_cleanup_release(uint32 dest_node_id, const void *pa
 						   dest_node_id, payload, payload_len);
 
 	LWLockRelease(cluster_grd_outbound_lock);
+	cluster_lmon_wakeup();
 }
 
 /*
@@ -334,6 +347,7 @@ cluster_grd_outbound_enqueue_lmd_cancel(uint32 dest_node_id, const void *payload
 						   payload, payload_len);
 
 	LWLockRelease(cluster_grd_outbound_lock);
+	cluster_lmon_wakeup();
 }
 
 /*
@@ -366,6 +380,7 @@ cluster_grd_outbound_enqueue_lms_native_probe(uint32 dest_node_id, const void *p
 						   dest_node_id, payload, payload_len);
 
 	LWLockRelease(cluster_grd_outbound_lock);
+	cluster_lmon_wakeup();
 }
 
 

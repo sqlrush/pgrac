@@ -113,13 +113,13 @@ is($cols,
 # ----------
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'79',
-	'pg_stat_cluster_wait_events returns 79 rows after spec-2.30 D8');
+	'83',
+	'pg_stat_cluster_wait_events returns 83 rows after spec-2.33 D9');
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_gcluster_wait_events'),
-	'79',
-	'pg_stat_gcluster_wait_events returns 79 rows after spec-2.30 D8');
+	'83',
+	'pg_stat_gcluster_wait_events returns 83 rows after spec-2.33 D9');
 
 is($node->safe_psql('postgres', q{SHOW "cluster.interconnect_tier"}),
 	'stub',
@@ -152,6 +152,11 @@ role = standby
 EOC
 
 $node->append_conf('postgresql.conf', "cluster.node_id = 0\n");
+$node->append_conf('postgresql.conf', "cluster.interconnect_tier = 'mock'\n");
+# This test validates pgrac.conf parsing only.  Keep the cluster process
+# stack enabled, but disable PCM/GCS so ordinary catalog reads do not wait
+# for mock-tier block replies.
+$node->append_conf('postgresql.conf', "cluster.pcm_grd_max_entries = 0\n");
 $node->start;
 
 is($node->safe_psql('postgres', 'SELECT count(*) FROM pg_cluster_nodes'),

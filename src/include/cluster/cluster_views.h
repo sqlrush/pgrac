@@ -50,7 +50,8 @@
  *	Anchored as a compile-time constant so unit tests can verify the
  *	internal table in cluster_views.c stays in sync with the enum.
  */
-#define CLUSTER_WAIT_EVENTS_COUNT 79 /* spec-2.32 D7: +1 GCS_REPLY_WAIT (was 78 spec-2.31) */
+#define CLUSTER_WAIT_EVENTS_COUNT                                                                  \
+	83 /* spec-2.33 D9: +4 GCS block-ship wait events (was 79 spec-2.32) */
 
 
 /*

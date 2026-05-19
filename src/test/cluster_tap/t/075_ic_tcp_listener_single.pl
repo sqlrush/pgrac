@@ -158,8 +158,8 @@ is( $node->safe_psql('postgres', "SHOW cluster.interconnect_tier"),
 # ----------
 my $pg_controldata = $node->config_data('--bindir') . '/pg_controldata';
 my $controldata_out = `$pg_controldata @{[$node->data_dir]}`;
-like($controldata_out,
-	 qr/Catalog version number:\s+(20260520\d|2026052[1-9]\d|2026053\d{2}|20260[6-9]\d{3}|2026[1-9]\d{4}|202[7-9]\d{5})/,
+my ($catversion) = $controldata_out =~ /Catalog version number:\s+(\d+)/;
+ok(defined($catversion) && $catversion >= 202605200,
 	'L6 catversion >= 202605200 (spec-2.2 D10 bump for pg_cluster_ic_peers)');
 
 
@@ -169,8 +169,7 @@ like($controldata_out,
 # ClusterICEnvelope + new pg_cluster_ic_msg_types SRF/view.  Lower-bound
 # regex per L46 (later specs widen further).
 # ----------
-like($controldata_out,
-	 qr/Catalog version number:\s+(2026052[1-9]\d|2026053\d{2}|20260[6-9]\d{3}|2026[1-9]\d{4}|202[7-9]\d{5})/,
+ok(defined($catversion) && $catversion >= 202605210,
 	'L7 catversion >= 202605210 (spec-2.3 D7 bump for envelope ABI + msg_types view)');
 
 

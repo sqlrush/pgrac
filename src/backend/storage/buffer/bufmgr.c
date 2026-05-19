@@ -34,6 +34,9 @@
 #include <unistd.h>
 
 #include "access/tableam.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "access/transam.h"		/* FirstNormalObjectId */
+#endif
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
 #include "catalog/catalog.h"
@@ -78,6 +81,14 @@
 #define BUF_REUSABLE			0x02
 
 #define RELS_BSEARCH_THRESHOLD		20
+
+#ifdef USE_PGRAC_CLUSTER
+static inline bool
+cluster_bufmgr_should_pcm_track(BufferDesc *buf)
+{
+	return BufTagGetRelNumber(&buf->tag) >= FirstNormalObjectId;
+}
+#endif
 
 /*
  * This is the size (in the number of blocks) above which we scan the
@@ -4841,7 +4852,9 @@ LockBuffer(Buffer buffer, int mode)
 		elog(ERROR, "unrecognized buffer lock mode: %d", mode);
 
 #ifdef USE_PGRAC_CLUSTER
-	if (mode != BUFFER_LOCK_UNLOCK && cluster_pcm_is_active())
+	if (mode != BUFFER_LOCK_UNLOCK &&
+		cluster_pcm_is_active() &&
+		cluster_bufmgr_should_pcm_track(buf))
 	{
 		pcm_mode = (mode == BUFFER_LOCK_SHARE) ? PCM_LOCK_MODE_S : PCM_LOCK_MODE_X;
 		/*
@@ -4874,7 +4887,7 @@ LockBuffer(Buffer buffer, int mode)
 		PG_CATCH();
 		{
 			if (pcm_acquired)
-				cluster_pcm_lock_release(buf->tag);
+				cluster_pcm_lock_release_buffer(buf, pcm_mode);
 			PG_RE_THROW();
 		}
 		PG_END_TRY();
@@ -4889,9 +4902,10 @@ LockBuffer(Buffer buffer, int mode)
 #ifdef USE_PGRAC_CLUSTER
 	if (mode == BUFFER_LOCK_UNLOCK &&
 		cluster_pcm_is_active() &&
+		cluster_bufmgr_should_pcm_track(buf) &&
 		buf->pcm_state != (uint8) PCM_STATE_N)
 	{
-		cluster_pcm_lock_release(buf->tag);
+		cluster_pcm_lock_release_buffer(buf, (PcmLockMode) buf->pcm_state);
 		buf->pcm_state = (uint8) cluster_pcm_lock_query(buf->tag);
 	}
 #endif
@@ -5780,17 +5794,19 @@ TestForOldSnapshot_impl(Snapshot snapshot, Relation relation)
  *     buffer currently holds the tag.  Used by the master-side handler to
  *     decide GRANTED_STORAGE_FALLBACK vs the full ship path (HC88).
  *
- *   - cluster_bufmgr_copy_block_for_gcs(tag, *out_page_lsn, *dst):  pin the
- *     buffer, content_lock shared, read page_lsn, release the content_lock,
- *     XLogFlush(page_lsn) (HC82 — I-WAL-before-ship anchor), reacquire the
- *     content_lock shared, revalidate (tag still matches + PageGetLSN(page)
- *     stable), memcpy BLCKSZ bytes into *dst, unpin.  HC89: on revalidation
- *     mismatch the helper retries ONCE (release content_lock, re-XLogFlush
- *     the new page_lsn, reacquire, revalidate again);  if the second
- *     revalidation also fails the function returns false and the caller
- *     replies DENIED_MASTER_NOT_HOLDER.  Unbounded loop forbidden (hot-page
- *     starvation defense);  0-retry fail-closed forbidden (normal WAL drift
- *     false positive defense).
+ *   - cluster_bufmgr_copy_block_for_gcs(tag, *out_page_lsn, *dst):  pins the
+ *     buffer with a raw shared refcount increment (no backend-local
+ *     ResourceOwner / private-refcount state), takes content_lock shared,
+ *     reads page_lsn, releases the content_lock, XLogFlush(page_lsn)
+ *     (HC82 — I-WAL-before-ship anchor), reacquires the content_lock shared,
+ *     revalidates (tag still matches + PageGetLSN(page) stable), memcpy BLCKSZ
+ *     bytes into *dst, and drops the raw pin.  HC89: on revalidation mismatch
+ *     the helper retries ONCE (release content_lock, re-XLogFlush the new
+ *     page_lsn, reacquire, revalidate again);  if the second revalidation also
+ *     fails the function returns false and the caller replies
+ *     DENIED_MASTER_NOT_HOLDER.  Unbounded loop forbidden (hot-page starvation
+ *     defense);  0-retry fail-closed forbidden (normal WAL drift false
+ *     positive defense).
  *
  * Why:
  *   The block-shipping data plane (cluster_gcs_block.c) needs to read 8KB
@@ -5805,6 +5821,65 @@ TestForOldSnapshot_impl(Snapshot snapshot, Relation relation)
 
 #include "access/xlog.h"			/* XLogFlush */
 #include "cluster/cluster_gcs_block.h"
+
+/*
+ * LMON handles remote GCS_BLOCK_REQUEST messages, so the block-copy path
+ * cannot use PinBuffer_Locked()/UnpinBuffer(): those routines maintain
+ * backend-local private refcounts and CurrentResourceOwner state.  The raw pin
+ * below only protects the shared buffer from replacement while LMON copies
+ * bytes under content_lock.
+ */
+static void
+cluster_bufmgr_pin_for_gcs_locked(BufferDesc *buf, uint32 buf_state)
+{
+	Assert(buf_state & BM_LOCKED);
+
+	VALGRIND_MAKE_MEM_DEFINED(BufHdrGetBlock(buf), BLCKSZ);
+	buf_state += BUF_REFCOUNT_ONE;
+	UnlockBufHdr(buf, buf_state);
+}
+
+static void
+cluster_bufmgr_unpin_for_gcs(BufferDesc *buf)
+{
+	uint32		buf_state;
+	uint32		old_buf_state;
+
+	Assert(!LWLockHeldByMe(BufferDescriptorGetContentLock(buf)));
+
+	VALGRIND_MAKE_MEM_NOACCESS(BufHdrGetBlock(buf), BLCKSZ);
+
+	old_buf_state = pg_atomic_read_u32(&buf->state);
+	for (;;)
+	{
+		if (old_buf_state & BM_LOCKED)
+			old_buf_state = WaitBufHdrUnlocked(buf);
+
+		buf_state = old_buf_state;
+		buf_state -= BUF_REFCOUNT_ONE;
+
+		if (pg_atomic_compare_exchange_u32(&buf->state, &old_buf_state,
+										   buf_state))
+			break;
+	}
+
+	if (buf_state & BM_PIN_COUNT_WAITER)
+	{
+		buf_state = LockBufHdr(buf);
+
+		if ((buf_state & BM_PIN_COUNT_WAITER) &&
+			BUF_STATE_GET_REFCOUNT(buf_state) == 1)
+		{
+			int			wait_backend_pgprocno = buf->wait_backend_pgprocno;
+
+			buf_state &= ~BM_PIN_COUNT_WAITER;
+			UnlockBufHdr(buf, buf_state);
+			ProcSendSignal(wait_backend_pgprocno);
+		}
+		else
+			UnlockBufHdr(buf, buf_state);
+	}
+}
 
 /*
  * Look up `tag` in the shared buffer table without pinning.  Returns true
@@ -5823,12 +5898,22 @@ cluster_bufmgr_probe_block_for_gcs(BufferTag tag)
 	uint32		hashcode = BufTableHashCode(&tag);
 	LWLock	   *partition_lock = BufMappingPartitionLock(hashcode);
 	int			buf_id;
+	bool		valid = false;
 
 	LWLockAcquire(partition_lock, LW_SHARED);
 	buf_id = BufTableLookup(&tag, hashcode);
+	if (buf_id >= 0)
+	{
+		BufferDesc *buf = GetBufferDescriptor(buf_id);
+		uint32		buf_state;
+
+		buf_state = LockBufHdr(buf);
+		valid = ((buf_state & BM_VALID) != 0) && BufferTagsEqual(&buf->tag, &tag);
+		UnlockBufHdr(buf, buf_state);
+	}
 	LWLockRelease(partition_lock);
 
-	return (buf_id >= 0);
+	return valid;
 }
 
 /*
@@ -5843,9 +5928,9 @@ cluster_bufmgr_probe_block_for_gcs(BufferTag tag)
  * Returns true with *dst populated and *out_page_lsn set otherwise.
  *
  * Concurrency: caller does NOT hold any buffer/partition locks.  We take a
- * SHARED partition lock to look up, pin via PinBuffer_Locked, then drop
- * the partition lock and operate on the buffer's content_lock.  Pin is
- * always released before return.
+ * SHARED partition lock to look up, raw-pin the shared buffer refcount, then
+ * drop the partition lock and operate on the buffer's content_lock.  The raw
+ * pin is always released before return.
  */
 bool
 cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char *dst)
@@ -5876,8 +5961,7 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 	}
 	buf = GetBufferDescriptor(buf_id);
 
-	/* PinBuffer_Locked requires the buf header lock; partition lock held
-	 * keeps the buffer from being recycled before we pin. */
+	/* Partition lock keeps the buffer from being recycled before we raw-pin. */
 	{
 		uint32		buf_state;
 
@@ -5890,12 +5974,18 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 			LWLockRelease(partition_lock);
 			return false;
 		}
-		PinBuffer_Locked(buf);	/* unlocks buf header */
+		if ((buf_state & BM_VALID) == 0)
+		{
+			UnlockBufHdr(buf, buf_state);
+			LWLockRelease(partition_lock);
+			return false;
+		}
+		cluster_bufmgr_pin_for_gcs_locked(buf, buf_state);
 	}
 	LWLockRelease(partition_lock);
 
 	content_lock = BufferDescriptorGetContentLock(buf);
-	page = BufferGetPage(BufferDescriptorGetBuffer(buf));
+	page = (Page) BufHdrGetBlock(buf);
 
 	/*
 	 * HC89: revalidation loop with single retry budget.
@@ -5960,7 +6050,7 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 		/* fall through: retry once if budget remains */
 	}
 
-	UnpinBuffer(buf);
+	cluster_bufmgr_unpin_for_gcs(buf);
 	return stable;
 }
 #endif							/* USE_PGRAC_CLUSTER */

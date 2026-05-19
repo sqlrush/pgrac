@@ -151,6 +151,8 @@ extern void cluster_grd_outbound_shmem_register(void);
  */
 extern bool cluster_grd_outbound_enqueue_backend_request(uint32 dest_node_id, const void *payload,
 														 uint16 payload_len);
+extern bool cluster_grd_outbound_enqueue_backend_msg(uint8 msg_type, uint32 dest_node_id,
+													 const void *payload, uint16 payload_len);
 extern void cluster_grd_outbound_enqueue_lmon_reply(uint32 dest_node_id, const void *payload,
 													uint16 payload_len);
 extern void cluster_grd_outbound_enqueue_cleanup_release(uint32 dest_node_id, const void *payload,

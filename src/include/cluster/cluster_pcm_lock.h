@@ -213,6 +213,7 @@ extern void cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode);
  * directing callers here.
  */
 extern void cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode);
+extern void cluster_pcm_lock_release_buffer(BufferDesc *buf, PcmLockMode mode);
 extern void cluster_pcm_lock_release(BufferTag tag);
 extern void cluster_pcm_lock_upgrade(BufferTag tag);
 extern void cluster_pcm_lock_downgrade(BufferTag tag, PcmLockMode target_mode, bool keep_pi);

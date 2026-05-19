@@ -6,12 +6,12 @@
  *	  spec-2.33 activates cross-node 8KB block shipping on top of the
  *	  spec-2.32 GCS control plane (request/reply framework).  Wire opcodes
  *	  PGRAC_IC_MSG_GCS_BLOCK_REQUEST=14 / PGRAC_IC_MSG_GCS_BLOCK_REPLY=15
- *	  carry a 60B request and a 48B header + 8192B page payload, gated by
+ *	  carry a 64B request and a 48B header + 8192B page payload, gated by
  *	  the I-WAL-before-ship invariant (master XLogFlush(page_lsn) before
  *	  shipping bytes).
  *
  *	  Scope (FROZEN v0.4):
- *	    - Wire ABI definition (GcsBlockRequestPayload 60B /
+ *	    - Wire ABI definition (GcsBlockRequestPayload 64B /
  *	      GcsBlockReplyHeader 48B + 8192B block_data)
  *	    - GcsBlockReplyStatus enum (GRANTED / STORAGE_FALLBACK / 4 DENIED /
  *	      DENIED_MASTER_NOT_HOLDER)
@@ -32,7 +32,7 @@
  *
  *	  HC contracts in this header (HC79-HC89 11 NEW):
  *	    HC79 NEW msg_type 14/15;  spec-2.32 12/13 untouched
- *	    HC80 wire sizes 60B / 48B / 8192B;  reply key = (backend_id, request_id)
+ *	    HC80 wire sizes 64B / 48B / 8192B;  reply key = (backend_id, request_id)
  *	    HC81 deterministic hash mod-N over declared node_id array (sparse safe)
  *	    HC82 master-side XLogFlush(page_lsn) BEFORE block bytes ship
  *	    HC83 CRC32C checksum mandatory; fail-closed; receiver must verify
@@ -69,9 +69,9 @@
 #define CLUSTER_GCS_BLOCK_H
 
 #include "c.h"
-#include "cluster/cluster_pcm_lock.h"	/* PcmLockTransition */
-#include "storage/block.h"				/* BLCKSZ */
-#include "storage/buf_internals.h"		/* BufferTag, BufferDesc */
+#include "cluster/cluster_pcm_lock.h" /* PcmLockTransition */
+#include "storage/block.h"			  /* BLCKSZ */
+#include "storage/buf_internals.h"	  /* BufferTag, BufferDesc */
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -99,8 +99,7 @@
  *  DENIED_MASTER_NOT_HOLDER    master state != N and no buffer (HC88) OR
  *                              HC89 revalidation single-retry exhausted
  * ============================================================ */
-typedef enum GcsBlockReplyStatus
-{
+typedef enum GcsBlockReplyStatus {
 	GCS_BLOCK_REPLY_GRANTED = 0,
 	GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK = 1,
 	GCS_BLOCK_REPLY_DENIED_INCOMPATIBLE = 2,
@@ -127,15 +126,14 @@ typedef enum GcsBlockReplyStatus
  *    [ 44,  45) transition_id           -- PcmLockTransition (1..9)
  *    [ 45,  64) reserved_0[19]          -- pad + future fields
  * ============================================================ */
-typedef struct GcsBlockRequestPayload
-{
-	uint64		request_id;			/*  8B [  0,   8) */
-	uint64		epoch;				/*  8B [  8,  16) */
-	BufferTag	tag;				/* 20B [ 16,  36) */
-	int32		sender_node;		/*  4B [ 36,  40) */
-	int32		requester_backend_id;	/* 4B [ 40,  44) */
-	uint8		transition_id;		/*  1B [ 44,  45) */
-	uint8		reserved_0[19];		/* 19B [ 45,  64) */
+typedef struct GcsBlockRequestPayload {
+	uint64 request_id;			/*  8B [  0,   8) */
+	uint64 epoch;				/*  8B [  8,  16) */
+	BufferTag tag;				/* 20B [ 16,  36) */
+	int32 sender_node;			/*  4B [ 36,  40) */
+	int32 requester_backend_id; /* 4B [ 40,  44) */
+	uint8 transition_id;		/*  1B [ 44,  45) */
+	uint8 reserved_0[19];		/* 19B [ 45,  64) */
 } GcsBlockRequestPayload;
 
 StaticAssertDecl(sizeof(GcsBlockRequestPayload) == 64,
@@ -168,17 +166,16 @@ StaticAssertDecl(sizeof(GcsBlockRequestPayload) == 64,
  *    [ 37,  38) status                  -- GcsBlockReplyStatus (HC83)
  *    [ 38,  48) reserved_0[10]          -- align + future fields
  * ============================================================ */
-typedef struct GcsBlockReplyHeader
-{
-	uint64		request_id;			/*  8B [  0,   8) */
-	uint64		page_lsn;			/*  8B [  8,  16) HC84 */
-	uint64		epoch;				/*  8B [ 16,  24) */
-	uint32		checksum;			/*  4B [ 24,  28) HC83 CRC32C */
-	int32		sender_node;		/*  4B [ 28,  32) */
-	int32		requester_backend_id;	/* 4B [ 32,  36) */
-	uint8		transition_id;		/*  1B [ 36,  37) */
-	uint8		status;				/*  1B [ 37,  38) GcsBlockReplyStatus */
-	uint8		reserved_0[10];		/* 10B [ 38,  48) */
+typedef struct GcsBlockReplyHeader {
+	uint64 request_id;			/*  8B [  0,   8) */
+	uint64 page_lsn;			/*  8B [  8,  16) HC84 */
+	uint64 epoch;				/*  8B [ 16,  24) */
+	uint32 checksum;			/*  4B [ 24,  28) HC83 CRC32C */
+	int32 sender_node;			/*  4B [ 28,  32) */
+	int32 requester_backend_id; /* 4B [ 32,  36) */
+	uint8 transition_id;		/*  1B [ 36,  37) */
+	uint8 status;				/*  1B [ 37,  38) GcsBlockReplyStatus */
+	uint8 reserved_0[10];		/* 10B [ 38,  48) */
 } GcsBlockReplyHeader;
 
 StaticAssertDecl(sizeof(GcsBlockReplyHeader) == 48,
@@ -200,11 +197,9 @@ StaticAssertDecl(GCS_BLOCK_DATA_SIZE == BLCKSZ,
  *	static there.  Declared here so cluster_gcs_block.c can call them and
  *	bufmgr.c sees a prototype for its definitions.
  * ============================================================ */
-#include "access/xlogdefs.h"			/* XLogRecPtr */
+#include "access/xlogdefs.h" /* XLogRecPtr */
 extern bool cluster_bufmgr_probe_block_for_gcs(BufferTag tag);
-extern bool cluster_bufmgr_copy_block_for_gcs(BufferTag tag,
-											  XLogRecPtr *out_page_lsn,
-											  char *dst);
+extern bool cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char *dst);
 
 
 /* ============================================================
@@ -314,7 +309,7 @@ extern uint64 cluster_gcs_get_block_ship_bytes_total(void);
  *                                              to inject before stabilizing)
  */
 extern void (*cluster_gcs_block_test_xlog_flush_hook)(uint64 page_lsn);
-extern int	(*cluster_gcs_block_test_lsn_drift_hook)(void);
+extern int (*cluster_gcs_block_test_lsn_drift_hook)(void);
 
 #endif /* USE_CLUSTER_UNIT */
 
@@ -324,8 +319,7 @@ extern int	(*cluster_gcs_block_test_lsn_drift_hook)(void);
  * ============================================================ */
 
 /* Reply envelope payload total size = header + block_data. */
-#define GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE \
-	(sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE)
+#define GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE (sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE)
 
 
 #endif /* USE_PGRAC_CLUSTER */

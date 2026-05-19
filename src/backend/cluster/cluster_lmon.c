@@ -56,12 +56,12 @@
 #include "utils/timestamp.h"
 
 #include "cluster/cluster_conf.h"
-#include "cluster/cluster_cssd.h"  /* cluster_cssd_outbound_slots (spec-2.5 D2.6) */
-#include "cluster/cluster_fence.h" /* cluster_fence_lmon_tick (spec-2.28 D5) */
-#include "cluster/cluster_gcs.h"   /* cluster_gcs_register_msg_types (spec-2.32 D4) */
-#include "cluster/cluster_gcs_block.h"	/* cluster_gcs_register_block_msg_types (spec-2.33 D4) */
-#include "cluster/cluster_grd.h"   /* cluster_grd_lmon_tick_dead_sweep (spec-2.16 D8) */
-#include "cluster/cluster_lms.h"   /* cluster_lms_owns_grant (spec-2.18 Sprint A Step 3 D8 HC4) */
+#include "cluster/cluster_cssd.h"	   /* cluster_cssd_outbound_slots (spec-2.5 D2.6) */
+#include "cluster/cluster_fence.h"	   /* cluster_fence_lmon_tick (spec-2.28 D5) */
+#include "cluster/cluster_gcs.h"	   /* cluster_gcs_register_msg_types (spec-2.32 D4) */
+#include "cluster/cluster_gcs_block.h" /* cluster_gcs_register_block_msg_types (spec-2.33 D4) */
+#include "cluster/cluster_grd.h"	   /* cluster_grd_lmon_tick_dead_sweep (spec-2.16 D8) */
+#include "cluster/cluster_lms.h" /* cluster_lms_owns_grant (spec-2.18 Sprint A Step 3 D8 HC4) */
 #include "cluster/cluster_native_lock_probe.h"
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_reconfig.h" /* cluster_reconfig_lmon_tick (spec-2.29 Step 2 D3) */
@@ -499,6 +499,23 @@ cluster_lmon_pid(void)
 	result = cluster_lmon_state->pid;
 	LWLockRelease(&cluster_lmon_state->lwlock);
 	return result;
+}
+
+/*
+ * Wake LMON from backend producer paths that enqueue work into an
+ * LMON-drained ring.  SIGUSR1 is already installed as PG's proc-signal
+ * handler in LMON and wakes MyLatch; no specific reason flag is required
+ * for the ordinary main-loop drain path.
+ */
+void
+cluster_lmon_wakeup(void)
+{
+	pid_t pid = cluster_lmon_pid();
+
+	if (pid <= 0 || pid == MyProcPid)
+		return;
+
+	(void)kill(pid, SIGUSR1);
 }
 
 TimestampTz

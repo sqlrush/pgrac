@@ -452,6 +452,32 @@ cluster_pcm_lock_apply_gcs_transition(BufferTag tag, PcmLockTransition trans, in
 	pcm_entry_lock_exclusive(entry);
 	cur = (PcmState)pg_atomic_read_u32(&entry->master_state);
 
+	/*
+	 * GCS shared-read grant: a remote N->S acquire is compatible with an
+	 * existing S state.  AD-002 names the transition from the requester's
+	 * perspective (the requester has no copy yet); the master entry remains
+	 * S and only gains another S holder bit.
+	 */
+	if (trans == PCM_TRANS_N_TO_S && cur == PCM_STATE_S) {
+		pg_atomic_fetch_or_u32(&entry->s_holders_bitmap, holder_bit);
+		LWLockRelease(&entry->entry_lock.lock);
+		return true;
+	}
+
+	/*
+	 * The current PCM entry records S ownership as a per-node bitmap, not a
+	 * per-node refcount.  Multiple shared acquires by the same node collapse
+	 * into one bit, so remote S releases must be idempotent after that bit has
+	 * already been cleared by an earlier release from the same node.
+	 */
+	if ((trans == PCM_TRANS_S_TO_N_RELEASE || trans == PCM_TRANS_S_TO_N_INVALIDATE)
+		&& (cur == PCM_STATE_N
+			|| (cur == PCM_STATE_S
+				&& (pg_atomic_read_u32(&entry->s_holders_bitmap) & holder_bit) == 0))) {
+		LWLockRelease(&entry->entry_lock.lock);
+		return true;
+	}
+
 	if (!cluster_pcm_transition_legal(cur, target, trans)) {
 		LWLockRelease(&entry->entry_lock.lock);
 		return false;
@@ -635,13 +661,12 @@ cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode)
 		int master_node = cluster_gcs_lookup_master(tag);
 
 		if (master_node != cluster_node_id) {
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("cluster_pcm_lock_acquire: remote-master S/X requires "
-							"BufferDesc-aware path"),
-					 errhint("Use cluster_pcm_lock_acquire_buffer() instead; the "
-							 "data plane needs a BufferDesc to install received "
-							 "block bytes under content_lock EXCLUSIVE (HC84).")));
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("cluster_pcm_lock_acquire: remote-master S/X requires "
+								   "BufferDesc-aware path"),
+							errhint("Use cluster_pcm_lock_acquire_buffer() instead; the "
+									"data plane needs a BufferDesc to install received "
+									"block bytes under content_lock EXCLUSIVE (HC84).")));
 		}
 	}
 
@@ -742,30 +767,27 @@ cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode)
 void
 cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode)
 {
-	BufferTag	tag;
-	int			master_node;
+	BufferTag tag;
+	int master_node;
 
 	if (buf == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("cluster_pcm_lock_acquire_buffer: NULL BufferDesc")));
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("cluster_pcm_lock_acquire_buffer: NULL BufferDesc")));
 
 	if (cluster_pcm_htab == NULL)
 		PCM_STUB_DISABLED_PATH;
 
 	if (mode != PCM_LOCK_MODE_S && mode != PCM_LOCK_MODE_X)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("cluster_pcm_lock_acquire_buffer: invalid mode %d "
-						"(must be S=1 or X=2)", (int) mode)));
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("cluster_pcm_lock_acquire_buffer: invalid mode %d "
+							   "(must be S=1 or X=2)",
+							   (int)mode)));
 
 	tag = buf->tag;
 	master_node = cluster_gcs_lookup_master(tag);
 
-	if (master_node != cluster_node_id)
-	{
-		PcmLockTransition trans =
-			(mode == PCM_LOCK_MODE_S) ? PCM_TRANS_N_TO_S : PCM_TRANS_N_TO_X;
+	if (master_node != cluster_node_id) {
+		PcmLockTransition trans = (mode == PCM_LOCK_MODE_S) ? PCM_TRANS_N_TO_S : PCM_TRANS_N_TO_X;
 
 		/*
 		 * HC79: data-plane block request.  Sender will install received
@@ -773,7 +795,7 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode)
 		 * the shared-storage page on GRANTED_STORAGE_FALLBACK (HC88).
 		 */
 		cluster_gcs_send_block_request_and_wait(buf, trans, master_node);
-		return;					/* HC77: master applied transition */
+		return; /* HC77: master applied transition */
 	}
 
 	/*
@@ -888,6 +910,54 @@ cluster_pcm_lock_release(BufferTag tag)
 
 	if (broadcast_needed)
 		ConditionVariableBroadcast(&entry->wait_cv);
+}
+
+
+/*
+ * PGRAC: spec-2.33 D7 hardening — BufferDesc/mode-aware release.
+ *
+ * Remote-master release must mirror the mode acquired by
+ * cluster_pcm_lock_acquire_buffer().  The tag-only API cannot distinguish an
+ * S holder from an X holder when the authoritative entry lives on a remote
+ * master, so it conservatively remains the tag-only/local API.  Bufmgr uses
+ * this variant and passes the mode it acquired (or the BufferDesc mirror on
+ * normal UNLOCK) so X locks release with X→N rather than the S→N transition.
+ */
+void
+cluster_pcm_lock_release_buffer(BufferDesc *buf, PcmLockMode mode)
+{
+	BufferTag tag;
+	int master_node;
+	PcmLockTransition trans;
+
+	if (buf == NULL)
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("cluster_pcm_lock_release_buffer: NULL BufferDesc")));
+
+	if (cluster_pcm_htab == NULL)
+		PCM_STUB_DISABLED_PATH;
+
+	tag = buf->tag;
+	master_node = cluster_gcs_lookup_master(tag);
+
+	if (master_node != cluster_node_id) {
+		if (mode == PCM_LOCK_MODE_S)
+			trans = PCM_TRANS_S_TO_N_RELEASE;
+		else if (mode == PCM_LOCK_MODE_X)
+			trans = PCM_TRANS_X_TO_N_RELEASE;
+		else
+			return; /* nothing to release from the remote master */
+
+		cluster_gcs_send_transition_and_wait(tag, trans, master_node);
+		return;
+	}
+
+	/*
+	 * Local master remains authoritative in the local GRD entry.  Reuse the
+	 * existing tag-only release path so refcount and wakeup semantics stay in
+	 * one place.
+	 */
+	cluster_pcm_lock_release(tag);
 }
 
 

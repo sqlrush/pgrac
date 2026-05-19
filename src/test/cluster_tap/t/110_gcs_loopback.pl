@@ -7,11 +7,11 @@
 #	  any wire send (HC72), so wire path coverage is effectively limited
 #	  to SQL-visible surface invariants:
 #
-#	  L1  fresh cluster startup:  pg_cluster_state.gcs has 14 keys + api_state
+#	  L1  fresh cluster startup:  pg_cluster_state.gcs has 22 keys
 #	  L2  api_state = "active" after postmaster phase 1 init
 #	  L3  WAIT_EVENT_GCS_REPLY_WAIT registered in pg_stat_cluster_wait_events
-#	  L4  CLUSTER_WAIT_EVENTS_COUNT == 79 (was 78 in spec-2.31)
-#	  L5  msg_type registry surface visible:  pg_stat_cluster_msg_types has
+#	  L4  CLUSTER_WAIT_EVENTS_COUNT == 83 (spec-2.33 +4 block events)
+#	  L5  msg_type registry surface visible:  pg_cluster_ic_msg_types has
 #	       gcs_request + gcs_reply rows
 #	  L6  workload (SELECT/UPDATE/VACUUM) does NOT inc send_request_count
 #	       (HC72 production master==self short-circuits;  wire path test-only)
@@ -63,12 +63,12 @@ $node->append_conf('postgresql.conf', "cluster.node_id = 0\n");
 $node->start;
 
 
-# L1 — pg_cluster_state.gcs surface has 14 keys.
+# L1 — pg_cluster_state.gcs surface has 22 keys.
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '14',
-   'L1 pg_cluster_state.gcs category has 14 keys (spec-2.32 D8)');
+   '22',
+   'L1 pg_cluster_state.gcs category has 22 keys (spec-2.33 D10)');
 
 
 # L2 — api_state = "active" after postmaster phase 1 init.
@@ -85,11 +85,11 @@ is($gcs_reply_wait_event, '1',
    'L3 ClusterGcsReplyWait wait event registered (spec-2.32 D7)');
 
 
-# L4 — CLUSTER_WAIT_EVENTS_COUNT == 79.
+# L4 — CLUSTER_WAIT_EVENTS_COUNT == 83.
 my $total_wait_events = $node->safe_psql(
 	'postgres', 'SELECT count(*) FROM pg_stat_cluster_wait_events');
-is($total_wait_events, '79',
-   'L4 wait_events count 79 (spec-2.31 78 → spec-2.32 +1 GCS_REPLY_WAIT)');
+is($total_wait_events, '83',
+   'L4 wait_events count 83 (spec-2.33 +4 GCS block-ship wait events)');
 
 
 # L6 — Production workload does NOT trigger wire path (HC72 short-circuit).
@@ -124,22 +124,13 @@ is(gcs_value($node, 'reply_timeout_count'), '0',
    'L10b reply_timeout_count = 0 on healthy startup');
 
 
-# L5 — msg_type registry surface includes gcs_request + gcs_reply rows
-# (use pg_stat_cluster_msg_types if it exists, else skip).
-my $has_msg_types_view = $node->safe_psql(
+# L5 — msg_type registry surface includes gcs_request + gcs_reply rows.
+my $gcs_rows = $node->safe_psql(
 	'postgres',
-	q{SELECT count(*) FROM pg_views WHERE viewname='pg_stat_cluster_msg_types'});
-if ($has_msg_types_view eq '1') {
-	my $gcs_rows = $node->safe_psql(
-		'postgres',
-		q{SELECT count(*) FROM pg_stat_cluster_msg_types
-		   WHERE name IN ('gcs_request', 'gcs_reply')});
-	is($gcs_rows, '2',
-	   'L5 pg_stat_cluster_msg_types has gcs_request + gcs_reply rows');
-} else {
-	diag('L5 pg_stat_cluster_msg_types view absent; skip msg_type surface check');
-	pass('L5 msg_type view not present in current spec; skipped');
-}
+	q{SELECT count(*) FROM pg_cluster_ic_msg_types
+	   WHERE name IN ('gcs_request', 'gcs_reply')});
+is($gcs_rows, '2',
+   'L5 pg_cluster_ic_msg_types has gcs_request + gcs_reply rows');
 
 
 $node->stop;

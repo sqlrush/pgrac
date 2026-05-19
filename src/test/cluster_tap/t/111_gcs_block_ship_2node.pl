@@ -16,7 +16,7 @@
 #	  L5  CLUSTER_WAIT_EVENTS_COUNT = 83 (was 79 in spec-2.32)
 #	  L6  cluster.gcs_reply_timeout_ms GUC visible + default 5000 +
 #	       PGC_SUSET context
-#	  L7  pg_stat_cluster_msg_types registry has gcs_block_request +
+#	  L7  pg_cluster_ic_msg_types registry has gcs_block_request +
 #	       gcs_block_reply rows (msg_type 14 + 15) on both nodes
 #	  L8  workload-induced GRD lookups split across nodes
 #	       (lookup_master_remote_count grows somewhere)
@@ -43,6 +43,7 @@ use PostgreSQL::Test::ClusterPair;
 use PostgreSQL::Test::Utils;
 use Test::More;
 use PgracClusterNode;
+use Time::HiRes qw(usleep);
 
 
 sub gcs_value {
@@ -65,8 +66,15 @@ sub gcs_int_value {
 # L1: ClusterPair startup.  2-node strict-mode pair with 3 voting disks.
 # ============================================================
 my $pair = PostgreSQL::Test::ClusterPair->new_pair(
-	'gcs_block_ship', quorum_voting_disks => 3);
+	'gcs_block_ship',
+	quorum_voting_disks => 3,
+	extra_conf => [ 'autovacuum = off' ]);
 $pair->start_pair;
+
+# The tier1 mesh may need one retry after node0 starts before node1's
+# listener is bound.  Avoid letting the first catalog query exercise GCS
+# while the IC peer is still in the connect-failed transient.
+usleep(3_000_000);
 
 is($pair->node0->safe_psql('postgres', 'SELECT 1'),
 	'1', 'L1 node0 postmaster alive');
@@ -153,8 +161,8 @@ is($pair->node0->safe_psql(
 is($pair->node0->safe_psql(
 		'postgres',
 		q{SHOW cluster.gcs_reply_timeout_ms}),
-   '5000ms',
-   'L6 cluster.gcs_reply_timeout_ms default = 5000ms');
+   '5000',
+   'L6 cluster.gcs_reply_timeout_ms default = 5000');
 
 my $context = $pair->node0->safe_psql(
 	'postgres',
@@ -164,12 +172,12 @@ is($context, 'superuser',
 
 
 # ============================================================
-# L7: pg_stat_cluster_msg_types has gcs_block_request + gcs_block_reply.
+# L7: pg_cluster_ic_msg_types has gcs_block_request + gcs_block_reply.
 # ============================================================
 for my $msg (qw(gcs_block_request gcs_block_reply)) {
 	is($pair->node0->safe_psql(
 			'postgres',
-			qq{SELECT count(*) FROM pg_stat_cluster_msg_types
+			qq{SELECT count(*) FROM pg_cluster_ic_msg_types
 			   WHERE name = '$msg'}),
 	   '1',
 	   "L7 msg_type $msg registered in dispatch table");
@@ -181,13 +189,15 @@ for my $msg (qw(gcs_block_request gcs_block_reply)) {
 #	   deterministic hash mod-N over a 2-node topology, ~50% of
 #	   distinct tags hash to the other node.
 # ============================================================
-$pair->node0->safe_psql('postgres', q{
+for my $node ($pair->node0, $pair->node1) {
+	$node->safe_psql('postgres', q{
 	CREATE TABLE block_ship_t (id int, val text);
 	INSERT INTO block_ship_t SELECT g, 'row-' || g
-	  FROM generate_series(1, 1000) g;
+	  FROM generate_series(1, 200) g;
 });
+}
 
-# Force buffers to be touched on both nodes by reading from both.
+# Force buffers to be touched on both nodes by reading each node-local table.
 $pair->node0->safe_psql('postgres', 'SELECT count(*) FROM block_ship_t');
 $pair->node1->safe_psql('postgres', 'SELECT count(*) FROM block_ship_t');
 

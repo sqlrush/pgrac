@@ -88,9 +88,14 @@
 #define CLUSTER_IC_PRODUCER_LMON ((uint32)(1u << B_LMON))
 #define CLUSTER_IC_PRODUCER_WALWRITER ((uint32)(1u << B_WAL_WRITER))
 #define CLUSTER_IC_PRODUCER_BACKEND ((uint32)(1u << B_BACKEND))
-#define CLUSTER_IC_PRODUCER_AUTOVAC ((uint32)(1u << B_AUTOVAC_LAUNCHER))
+#define CLUSTER_IC_PRODUCER_AUTOVAC                                                                \
+	((uint32)((1u << B_AUTOVAC_LAUNCHER) | (1u << B_AUTOVAC_WORKER)))
+#define CLUSTER_IC_PRODUCER_BGWORKER ((uint32)(1u << B_BG_WORKER))
 #define CLUSTER_IC_PRODUCER_BGWRITER ((uint32)(1u << B_BG_WRITER))
 #define CLUSTER_IC_PRODUCER_CHECKPOINTER ((uint32)(1u << B_CHECKPOINTER))
+#define CLUSTER_IC_PRODUCER_BUFFER_CLIENTS                                                         \
+	(CLUSTER_IC_PRODUCER_BACKEND | CLUSTER_IC_PRODUCER_AUTOVAC | CLUSTER_IC_PRODUCER_BGWORKER      \
+	 | CLUSTER_IC_PRODUCER_BGWRITER | CLUSTER_IC_PRODUCER_CHECKPOINTER)
 /* spec-2.X may add more as new BackendType slots get assigned */
 
 

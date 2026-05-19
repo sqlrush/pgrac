@@ -158,8 +158,8 @@ like($phase, qr/^(init|running|shutdown|\(unset\))$/,
 # ----------
 is( $node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'79',
-	'pg_stat_cluster_wait_events returns 79 rows after spec-2.30 D8');
+	'83',
+	'pg_stat_cluster_wait_events returns 83 rows after spec-2.33 D9');
 
 $node->stop;
 

@@ -17,11 +17,11 @@
  *	    - PCM lock acquire / release / upgrade / downgrade integration via
  *	      master-lookup branch (HC72 self-short-circuit production hot path)
  *
- *	  Forward-link spec-2.33+:
- *	    - GRD master cache real activation (replace lookup placeholder)
- *	    - 2-node real cross-node wire send
- *	    - Block payload shipping substrate
- *	    - Reply timeout GUC + retransmit
+ *	  Forward-link status:
+ *	    - spec-2.33 replaces the master-cache placeholder with deterministic
+ *	      hash routing, enables 2-node cross-node wire send, and adds the
+ *	      block payload shipping substrate.
+ *	    - GCS control-message timeout GUC + retransmit remain spec-2.34+.
  *	    - Reconfig epoch invalidation handling
  *
  *	  HC contracts in this header (HC70-HC78 7+2 NEW):
@@ -166,7 +166,8 @@ extern int cluster_gcs_lookup_master(BufferTag tag);
  *       request_id, epoch=cluster_epoch_snapshot())
  *    4. cluster_ic_send_envelope(master_node, GCS_REQUEST, &payload, 48)
  *    5. ConditionVariableSleep(slot.reply_cv, WAIT_EVENT_GCS_REPLY_WAIT)
- *       with internal safety deadline (5s default; public GUC推 spec-2.33)
+ *       with internal safety deadline (5s default; public control-message
+ *       GUC + retransmit推 spec-2.34+)
  *    6. On wake: check status
  *       - GRANTED:  return (master already applied transition; HC77)
  *       - DENIED_*: ereport
@@ -182,8 +183,8 @@ extern void cluster_gcs_send_transition_and_wait(BufferTag tag, PcmLockTransitio
  * the same phase that registers GES / SCN / CSSD message types.
  *
  *  broadcast_ok = false (point-to-point only).
- *  producer mask covers backend (for test loopback);  spec-2.33 may
- *  narrow to LMON/LMS relay once true cross-node send lands.
+ *  producer mask covers buffer clients that enqueue through the LMON-drained
+ *  outbound ring for true cross-node send.
  */
 extern void cluster_gcs_register_msg_types(void);
 
@@ -213,7 +214,7 @@ extern void cluster_gcs_handle_reply_envelope(const struct ClusterICEnvelope *en
 
 
 /* ============================================================
- * Observability accessors (dump_gcs 14 rows).
+ * Observability accessors (dump_gcs 22 rows as of spec-2.33).
  *
  *  Each accessor returns a uint64 counter for SQL surface emit_row.
  *  When cluster_gcs module is not initialized (cluster_pcm_is_active
@@ -272,10 +273,10 @@ extern void cluster_gcs_test_loopback_dispatch(uint8 msg_type, const void *paylo
 
 /* Maximum concurrent outstanding GCS requests per backend (HC74).  This
  * keeps the outstanding table fixed-size (no shmem regrow during runtime).
- * spec-2.33 may promote to a GUC when true cross-node concurrency lands. */
+ * spec-2.34+ may promote to a GUC if true cross-node concurrency needs it. */
 #define MAX_OUTSTANDING_REQUESTS_PER_BACKEND 8
 
-/* Internal reply safety deadline before public GUC lands (spec-2.33+).
+/* Internal GCS control reply safety deadline before public GUC lands (spec-2.34+).
  * 5 seconds is generous for loopback (microseconds typical) yet still
  * caps the worst case in case the receiver leaks a reply due to bugs. */
 #define GCS_REPLY_INTERNAL_DEADLINE_MS 5000

@@ -90,81 +90,89 @@
 UT_DEFINE_GLOBALS();
 
 
+void
+ExceptionalCondition(const char *conditionName pg_attribute_unused(),
+					 const char *fileName pg_attribute_unused(),
+					 int lineNumber pg_attribute_unused())
+{
+	abort();
+}
+
+
 UT_TEST(test_gcs_block_msg_type_enum_values_no_collision)
 {
-	UT_ASSERT_EQ((int) PGRAC_IC_MSG_GCS_BLOCK_REQUEST, 14);
-	UT_ASSERT_EQ((int) PGRAC_IC_MSG_GCS_BLOCK_REPLY, 15);
-	UT_ASSERT_EQ((int) PGRAC_IC_MSG_GCS_REQUEST, 12);
-	UT_ASSERT_EQ((int) PGRAC_IC_MSG_GCS_REPLY, 13);
-	UT_ASSERT_EQ((int) PGRAC_IC_MSG_CSSD_HEARTBEAT, 11);
-	UT_ASSERT_EQ((int) PGRAC_IC_MSG_CF_BLOCK_SHIP, 6);
+	UT_ASSERT_EQ((int)PGRAC_IC_MSG_GCS_BLOCK_REQUEST, 14);
+	UT_ASSERT_EQ((int)PGRAC_IC_MSG_GCS_BLOCK_REPLY, 15);
+	UT_ASSERT_EQ((int)PGRAC_IC_MSG_GCS_REQUEST, 12);
+	UT_ASSERT_EQ((int)PGRAC_IC_MSG_GCS_REPLY, 13);
+	UT_ASSERT_EQ((int)PGRAC_IC_MSG_CSSD_HEARTBEAT, 11);
+	UT_ASSERT_EQ((int)PGRAC_IC_MSG_CF_BLOCK_SHIP, 6);
 }
 
 
 UT_TEST(test_gcs_block_payload_sizes_locked)
 {
-	UT_ASSERT_EQ((int) sizeof(GcsBlockRequestPayload), 64);
-	UT_ASSERT_EQ((int) sizeof(GcsBlockReplyHeader), 48);
-	UT_ASSERT_EQ((int) GCS_BLOCK_DATA_SIZE, 8192);
+	UT_ASSERT_EQ((int)sizeof(GcsBlockRequestPayload), 64);
+	UT_ASSERT_EQ((int)sizeof(GcsBlockReplyHeader), 48);
+	UT_ASSERT_EQ((int)GCS_BLOCK_DATA_SIZE, 8192);
 }
 
 
 UT_TEST(test_gcs_block_request_field_offsets)
 {
-	UT_ASSERT_EQ((int) offsetof(GcsBlockRequestPayload, request_id), 0);
-	UT_ASSERT_EQ((int) offsetof(GcsBlockRequestPayload, epoch), 8);
-	UT_ASSERT_EQ((int) offsetof(GcsBlockRequestPayload, tag), 16);
-	UT_ASSERT_EQ((int) offsetof(GcsBlockRequestPayload, sender_node), 36);
-	UT_ASSERT_EQ((int) offsetof(GcsBlockRequestPayload, requester_backend_id), 40);
-	UT_ASSERT_EQ((int) offsetof(GcsBlockRequestPayload, transition_id), 44);
-	UT_ASSERT_EQ((int) offsetof(GcsBlockRequestPayload, reserved_0), 45);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockRequestPayload, request_id), 0);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockRequestPayload, epoch), 8);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockRequestPayload, tag), 16);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockRequestPayload, sender_node), 36);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockRequestPayload, requester_backend_id), 40);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockRequestPayload, transition_id), 44);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockRequestPayload, reserved_0), 45);
 }
 
 
 UT_TEST(test_gcs_block_reply_header_field_offsets)
 {
-	UT_ASSERT_EQ((int) offsetof(GcsBlockReplyHeader, request_id), 0);
-	UT_ASSERT_EQ((int) offsetof(GcsBlockReplyHeader, page_lsn), 8);
-	UT_ASSERT_EQ((int) offsetof(GcsBlockReplyHeader, epoch), 16);
-	UT_ASSERT_EQ((int) offsetof(GcsBlockReplyHeader, checksum), 24);
-	UT_ASSERT_EQ((int) offsetof(GcsBlockReplyHeader, sender_node), 28);
-	UT_ASSERT_EQ((int) offsetof(GcsBlockReplyHeader, requester_backend_id), 32);
-	UT_ASSERT_EQ((int) offsetof(GcsBlockReplyHeader, transition_id), 36);
-	UT_ASSERT_EQ((int) offsetof(GcsBlockReplyHeader, status), 37);
-	UT_ASSERT_EQ((int) offsetof(GcsBlockReplyHeader, reserved_0), 38);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockReplyHeader, request_id), 0);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockReplyHeader, page_lsn), 8);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockReplyHeader, epoch), 16);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockReplyHeader, checksum), 24);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockReplyHeader, sender_node), 28);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockReplyHeader, requester_backend_id), 32);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockReplyHeader, transition_id), 36);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockReplyHeader, status), 37);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockReplyHeader, reserved_0), 38);
 }
 
 
 UT_TEST(test_gcs_block_reply_status_enum_count_is_7)
 {
-	UT_ASSERT_EQ((int) GCS_BLOCK_REPLY_GRANTED, 0);
-	UT_ASSERT_EQ((int) GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK, 1);
-	UT_ASSERT_EQ((int) GCS_BLOCK_REPLY_DENIED_INCOMPATIBLE, 2);
-	UT_ASSERT_EQ((int) GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT, 3);
-	UT_ASSERT_EQ((int) GCS_BLOCK_REPLY_DENIED_EPOCH_STALE, 4);
-	UT_ASSERT_EQ((int) GCS_BLOCK_REPLY_DENIED_CHECKSUM_FAIL, 5);
-	UT_ASSERT_EQ((int) GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER, 6);
+	UT_ASSERT_EQ((int)GCS_BLOCK_REPLY_GRANTED, 0);
+	UT_ASSERT_EQ((int)GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK, 1);
+	UT_ASSERT_EQ((int)GCS_BLOCK_REPLY_DENIED_INCOMPATIBLE, 2);
+	UT_ASSERT_EQ((int)GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT, 3);
+	UT_ASSERT_EQ((int)GCS_BLOCK_REPLY_DENIED_EPOCH_STALE, 4);
+	UT_ASSERT_EQ((int)GCS_BLOCK_REPLY_DENIED_CHECKSUM_FAIL, 5);
+	UT_ASSERT_EQ((int)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER, 6);
 }
 
 
 UT_TEST(test_gcs_block_sparse_hash_mod_n_distribution)
 {
-	const int	declared[3] = {0, 2, 5};
-	const int	declared_count = 3;
-	int			i;
+	const int declared[3] = { 0, 2, 5 };
+	const int declared_count = 3;
+	int i;
 
-	for (i = 0; i < 100; i++)
-	{
-		BufferTag	tag = {0};
-		uint32		h;
-		int			master;
+	for (i = 0; i < 100; i++) {
+		BufferTag tag = { 0 };
+		uint32 h;
+		int master;
 
-		tag.spcOid = (Oid) (i * 13 + 1);
-		tag.dbOid = (Oid) (i * 17 + 1);
-		tag.blockNum = (BlockNumber) (i * 19);
+		tag.spcOid = (Oid)(i * 13 + 1);
+		tag.dbOid = (Oid)(i * 17 + 1);
+		tag.blockNum = (BlockNumber)(i * 19);
 
-		h = hash_bytes((const unsigned char *) &tag, sizeof(tag));
-		master = declared[h % (uint32) declared_count];
+		h = hash_bytes((const unsigned char *)&tag, sizeof(tag));
+		master = declared[h % (uint32)declared_count];
 
 		UT_ASSERT(master == 0 || master == 2 || master == 5);
 	}
@@ -173,23 +181,22 @@ UT_TEST(test_gcs_block_sparse_hash_mod_n_distribution)
 
 UT_TEST(test_gcs_block_hash_deterministic_same_tag_same_master)
 {
-	const int	declared[4] = {0, 1, 2, 3};
-	const int	declared_count = 4;
-	BufferTag	tag = {0};
-	uint32		h1;
-	int			m1;
-	int			i;
+	const int declared[4] = { 0, 1, 2, 3 };
+	const int declared_count = 4;
+	BufferTag tag = { 0 };
+	uint32 h1;
+	int m1;
+	int i;
 
-	tag.spcOid = (Oid) 0x12345;
-	tag.dbOid = (Oid) 0x6789a;
-	tag.blockNum = (BlockNumber) 42;
+	tag.spcOid = (Oid)0x12345;
+	tag.dbOid = (Oid)0x6789a;
+	tag.blockNum = (BlockNumber)42;
 
-	h1 = hash_bytes((const unsigned char *) &tag, sizeof(tag));
-	m1 = declared[h1 % (uint32) declared_count];
-	for (i = 0; i < 32; i++)
-	{
-		uint32		h2 = hash_bytes((const unsigned char *) &tag, sizeof(tag));
-		int			m2 = declared[h2 % (uint32) declared_count];
+	h1 = hash_bytes((const unsigned char *)&tag, sizeof(tag));
+	m1 = declared[h1 % (uint32)declared_count];
+	for (i = 0; i < 32; i++) {
+		uint32 h2 = hash_bytes((const unsigned char *)&tag, sizeof(tag));
+		int m2 = declared[h2 % (uint32)declared_count];
 
 		UT_ASSERT_EQ(m1, m2);
 	}
@@ -198,25 +205,26 @@ UT_TEST(test_gcs_block_hash_deterministic_same_tag_same_master)
 
 UT_TEST(test_gcs_block_lwlock_tranche_distinct)
 {
-	UT_ASSERT((int) LWTRANCHE_CLUSTER_GCS_BLOCK != (int) LWTRANCHE_CLUSTER_GCS);
-	UT_ASSERT((int) LWTRANCHE_CLUSTER_GCS_BLOCK != (int) LWTRANCHE_CLUSTER_PCM);
+	UT_ASSERT((int)LWTRANCHE_CLUSTER_GCS_BLOCK != (int)LWTRANCHE_CLUSTER_GCS);
+	UT_ASSERT((int)LWTRANCHE_CLUSTER_GCS_BLOCK != (int)LWTRANCHE_CLUSTER_PCM);
 }
 
 
 UT_TEST(test_gcs_block_wait_events_distinct)
 {
-	UT_ASSERT((int) WAIT_EVENT_GCS_BLOCK_SHIP_WAIT != (int) WAIT_EVENT_GCS_REPLY_WAIT);
-	UT_ASSERT((int) WAIT_EVENT_GCS_BLOCK_REQUEST_DISPATCH != (int) WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
-	UT_ASSERT((int) WAIT_EVENT_GCS_BLOCK_REPLY_DISPATCH != (int) WAIT_EVENT_GCS_BLOCK_REQUEST_DISPATCH);
-	UT_ASSERT((int) WAIT_EVENT_GCS_BLOCK_CHECKSUM_FAIL != (int) WAIT_EVENT_GCS_BLOCK_REPLY_DISPATCH);
+	UT_ASSERT((int)WAIT_EVENT_GCS_BLOCK_SHIP_WAIT != (int)WAIT_EVENT_GCS_REPLY_WAIT);
+	UT_ASSERT((int)WAIT_EVENT_GCS_BLOCK_REQUEST_DISPATCH != (int)WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+	UT_ASSERT((int)WAIT_EVENT_GCS_BLOCK_REPLY_DISPATCH
+			  != (int)WAIT_EVENT_GCS_BLOCK_REQUEST_DISPATCH);
+	UT_ASSERT((int)WAIT_EVENT_GCS_BLOCK_CHECKSUM_FAIL != (int)WAIT_EVENT_GCS_BLOCK_REPLY_DISPATCH);
 }
 
 
 UT_TEST(test_gcs_block_reply_total_size_is_8240)
 {
-	UT_ASSERT_EQ((int) GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE, 8240);
-	UT_ASSERT_EQ((int) GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE,
-				 (int) (sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE));
+	UT_ASSERT_EQ((int)GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE, 8240);
+	UT_ASSERT_EQ((int)GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE,
+				 (int)(sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE));
 }
 
 
@@ -225,41 +233,39 @@ UT_TEST(test_gcs_block_reply_key_is_compound)
 	GcsBlockReplyHeader hdr;
 
 	memset(&hdr, 0xab, sizeof(hdr));
-	UT_ASSERT_EQ((int) offsetof(GcsBlockReplyHeader, request_id), 0);
-	UT_ASSERT_EQ((int) offsetof(GcsBlockReplyHeader, requester_backend_id), 32);
-	UT_ASSERT_EQ((int) sizeof(hdr.request_id), 8);
-	UT_ASSERT_EQ((int) sizeof(hdr.requester_backend_id), 4);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockReplyHeader, request_id), 0);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockReplyHeader, requester_backend_id), 32);
+	UT_ASSERT_EQ((int)sizeof(hdr.request_id), 8);
+	UT_ASSERT_EQ((int)sizeof(hdr.requester_backend_id), 4);
 }
 
 
 UT_TEST(test_gcs_block_reserved_padding_present)
 {
 	GcsBlockRequestPayload req;
-	GcsBlockReplyHeader	rep;
+	GcsBlockReplyHeader rep;
 
-	UT_ASSERT_EQ((int) sizeof(req.reserved_0), 19);
-	UT_ASSERT_EQ((int) sizeof(rep.reserved_0), 10);
+	UT_ASSERT_EQ((int)sizeof(req.reserved_0), 19);
+	UT_ASSERT_EQ((int)sizeof(rep.reserved_0), 10);
 	memset(&req, 0, sizeof(req));
 	memset(&rep, 0, sizeof(rep));
-	UT_ASSERT_EQ((int) req.reserved_0[0], 0);
-	UT_ASSERT_EQ((int) req.reserved_0[18], 0);
-	UT_ASSERT_EQ((int) rep.reserved_0[0], 0);
-	UT_ASSERT_EQ((int) rep.reserved_0[9], 0);
+	UT_ASSERT_EQ((int)req.reserved_0[0], 0);
+	UT_ASSERT_EQ((int)req.reserved_0[18], 0);
+	UT_ASSERT_EQ((int)rep.reserved_0[0], 0);
+	UT_ASSERT_EQ((int)rep.reserved_0[9], 0);
 }
 
 
 UT_TEST(test_gcs_block_data_size_equals_blcksz)
 {
-	UT_ASSERT_EQ((int) GCS_BLOCK_DATA_SIZE, (int) BLCKSZ);
+	UT_ASSERT_EQ((int)GCS_BLOCK_DATA_SIZE, (int)BLCKSZ);
 }
 
 
 UT_TEST(test_gcs_block_msg_type_enum_extends_without_gap)
 {
-	UT_ASSERT_EQ((int) PGRAC_IC_MSG_GCS_REPLY + 1,
-				 (int) PGRAC_IC_MSG_GCS_BLOCK_REQUEST);
-	UT_ASSERT_EQ((int) PGRAC_IC_MSG_GCS_BLOCK_REQUEST + 1,
-				 (int) PGRAC_IC_MSG_GCS_BLOCK_REPLY);
+	UT_ASSERT_EQ((int)PGRAC_IC_MSG_GCS_REPLY + 1, (int)PGRAC_IC_MSG_GCS_BLOCK_REQUEST);
+	UT_ASSERT_EQ((int)PGRAC_IC_MSG_GCS_BLOCK_REQUEST + 1, (int)PGRAC_IC_MSG_GCS_BLOCK_REPLY);
 }
 
 
@@ -268,8 +274,8 @@ UT_TEST(test_gcs_block_tag_is_standard_buffer_tag_20b)
 	GcsBlockRequestPayload req;
 
 	/* BufferTag in PG 16 is 5×uint32 = 20B (spec-2.30 v0.2 F1 PG-fact). */
-	UT_ASSERT_EQ((int) sizeof(req.tag), 20);
-	UT_ASSERT_EQ((int) sizeof(BufferTag), 20);
+	UT_ASSERT_EQ((int)sizeof(req.tag), 20);
+	UT_ASSERT_EQ((int)sizeof(BufferTag), 20);
 }
 
 

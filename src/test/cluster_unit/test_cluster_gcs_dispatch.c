@@ -48,6 +48,7 @@
 #include "cluster/cluster_conf.h" /* ClusterNodeInfo (spec-2.33 D2 stub) */
 #include "cluster/cluster_cssd.h" /* PGRAC_IC_MSG_CSSD_HEARTBEAT */
 #include "cluster/cluster_gcs.h"
+#include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_pcm_lock.h"
@@ -71,6 +72,8 @@
 
 
 UT_DEFINE_GLOBALS();
+
+BackendType MyBackendType = B_LMON;
 
 
 /* ============================================================
@@ -298,6 +301,15 @@ cluster_ic_send_envelope(uint8 msg_type pg_attribute_unused(),
 }
 
 bool
+cluster_grd_outbound_enqueue_backend_msg(uint8 msg_type pg_attribute_unused(),
+										 uint32 dest_node_id pg_attribute_unused(),
+										 const void *payload pg_attribute_unused(),
+										 uint16 payload_len pg_attribute_unused())
+{
+	return true;
+}
+
+bool
 cluster_ic_dispatch_envelope(const ClusterICEnvelope *env pg_attribute_unused(),
 							 const void *payload pg_attribute_unused(),
 							 int32 peer_id pg_attribute_unused())
@@ -340,10 +352,9 @@ cluster_pcm_lock_apply_gcs_transition(BufferTag tag pg_attribute_unused(),
 const ClusterNodeInfo *
 cluster_conf_lookup_node(int32 node_id)
 {
-	static ClusterNodeInfo info_self = {0};
+	static ClusterNodeInfo info_self = { 0 };
 
-	if (node_id == 0)
-	{
+	if (node_id == 0) {
 		info_self.node_id = 0;
 		return &info_self;
 	}

@@ -42,6 +42,7 @@
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_gcs.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_pcm_lock.h"
@@ -237,16 +238,15 @@ cluster_gcs_module_init(void)
 int
 cluster_gcs_lookup_master(BufferTag tag)
 {
-	int			declared[CLUSTER_MAX_NODES];
-	int			declared_count = 0;
-	int			master_node;
-	uint32		h;
-	int			i;
+	int declared[CLUSTER_MAX_NODES];
+	int declared_count = 0;
+	int master_node;
+	uint32 h;
+	int i;
 
 #ifdef USE_CLUSTER_UNIT
 	if (cluster_gcs_test_force_remote_master_node >= 0
-		&& cluster_gcs_test_force_remote_master_node != cluster_node_id)
-	{
+		&& cluster_gcs_test_force_remote_master_node != cluster_node_id) {
 		if (ClusterGcs != NULL)
 			pg_atomic_fetch_add_u64(&ClusterGcs->lookup_master_remote_count, 1);
 		return cluster_gcs_test_force_remote_master_node;
@@ -262,18 +262,16 @@ cluster_gcs_lookup_master(BufferTag tag)
 		if (cluster_conf_lookup_node(i) != NULL)
 			declared[declared_count++] = i;
 
-	if (declared_count <= 1)
-	{
+	if (declared_count <= 1) {
 		if (ClusterGcs != NULL)
 			pg_atomic_fetch_add_u64(&ClusterGcs->lookup_master_self_count, 1);
-		return cluster_node_id;	/* single-node fallback (HC72) */
+		return cluster_node_id; /* single-node fallback (HC72) */
 	}
 
-	h = hash_bytes((const unsigned char *) &tag, sizeof(tag));
-	master_node = declared[h % (uint32) declared_count];
+	h = hash_bytes((const unsigned char *)&tag, sizeof(tag));
+	master_node = declared[h % (uint32)declared_count];
 
-	if (ClusterGcs != NULL)
-	{
+	if (ClusterGcs != NULL) {
 		if (master_node == cluster_node_id)
 			pg_atomic_fetch_add_u64(&ClusterGcs->lookup_master_self_count, 1);
 		else
@@ -432,9 +430,22 @@ gcs_send_envelope_or_loopback(uint8 msg_type, int32 dest_node, const void *paylo
 {
 	ClusterICSendResult rc;
 
+	if (dest_node == cluster_node_id)
+		return gcs_dispatch_loopback(msg_type, payload, payload_len) ? CLUSTER_IC_SEND_DONE
+																	 : CLUSTER_IC_SEND_HARD_ERROR;
+
+	/*
+	 * GCS requests can be produced from bufmgr/content-lock backend paths.
+	 * Tier1 sockets are owned by LMON, so non-LMON request producers enqueue
+	 * to the existing GRD outbound ring and wait on the normal reply slot.
+	 */
+	if (msg_type == PGRAC_IC_MSG_GCS_REQUEST && MyBackendType != B_LMON)
+		return cluster_grd_outbound_enqueue_backend_msg(msg_type, (uint32)dest_node, payload,
+														(uint16)payload_len)
+				   ? CLUSTER_IC_SEND_DONE
+				   : CLUSTER_IC_SEND_WOULD_BLOCK;
+
 	rc = cluster_ic_send_envelope(msg_type, dest_node, payload, payload_len);
-	if (rc == CLUSTER_IC_SEND_DONE && dest_node == cluster_node_id)
-		(void)gcs_dispatch_loopback(msg_type, payload, payload_len);
 	return rc;
 }
 
@@ -493,8 +504,9 @@ cluster_gcs_send_transition_and_wait(BufferTag tag, PcmLockTransition transition
 
 		/*
 		 * Wait for reply or internal safety deadline.  Public timeout GUC
-		 * lands in spec-2.33; current 5s deadline catches receiver bugs
-		 * without exposing a user-visible knob yet.
+		 * for GCS control messages + retransmit lands in spec-2.34+; current
+		 * 5s deadline catches receiver bugs without exposing a user-visible
+		 * knob yet.
 		 */
 		deadline = GetCurrentTimestamp()
 				   + ((TimestampTz)GCS_REPLY_INTERNAL_DEADLINE_MS) * (TimestampTz)1000;
@@ -561,14 +573,15 @@ cluster_gcs_send_transition_and_wait(BufferTag tag, PcmLockTransition transition
 	case GCS_REPLY_DENIED_EPOCH_STALE:
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("cluster_gcs: request rejected due to stale epoch"),
-						errhint("Reconfig epoch invalidation handling lands in spec-2.33+.")));
+						errhint("Reconfig epoch invalidation handling lands in spec-2.34+.")));
 		break;
 	case GCS_REPLY_DENIED_INCOMPATIBLE:
 	default:
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("cluster_gcs: transition_id=%d denied or timed out (status=%d)",
-							   (int)final_transition, (int)final_status),
-						errhint("Public reply timeout GUC + retransmit land in spec-2.33+.")));
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cluster_gcs: transition_id=%d denied or timed out (status=%d)",
+						(int)final_transition, (int)final_status),
+				 errhint("Public GCS control timeout GUC + retransmit land in spec-2.34+.")));
 		break;
 	case GCS_REPLY_GRANTED:
 		Assert(false); /* handled above */

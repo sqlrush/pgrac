@@ -268,8 +268,8 @@ typedef enum {
 /* ----------
  * Wait Events - Cluster (PGRAC, stage 0.11)
  *
- * pgrac cluster wait events span 11 categories (10 from stage 0.11 plus
- * Cluster: SharedFs added by stage 1.1), each with its own class
+ * pgrac cluster wait events span 13 categories (10 from stage 0.11 plus
+ * SharedFs, StartupPhase, and BgProc), each with its own class
  * ID in the upper byte (PG_WAIT_CLUSTER_* macros from cluster_wait_events.h).
  * Within a category, events are densely packed.  See
  * docs/wait-events-design.md §3-§12 for per-event semantics and
@@ -299,7 +299,8 @@ typedef enum {
 	WAIT_EVENT_GES_CANCEL_DRAIN,
 	WAIT_EVENT_GES_DEADLOCK_REASSEMBLY_WAIT,
 
-	/* Cluster: PCM (9 events; +2 spec-2.30 D8 + 1 spec-2.31 D6) -- subsystem #6 */
+	/* Cluster: PCM (14 events: base 6 + spec-2.30 2 + spec-2.31 1 +
+	 * spec-2.32 1 + spec-2.33 4) -- subsystem #6 */
 	WAIT_EVENT_PCM_BLOCK_READ_N_S = PG_WAIT_CLUSTER_PCM,
 	WAIT_EVENT_PCM_BLOCK_READ_N_X,
 	WAIT_EVENT_PCM_BLOCK_WRITE_S_X,

@@ -183,6 +183,7 @@ extern void cluster_lmon_request_shutdown(void);
  */
 extern ClusterLmonStatus cluster_lmon_status(void);
 extern pid_t cluster_lmon_pid(void);
+extern void cluster_lmon_wakeup(void);
 extern TimestampTz cluster_lmon_spawned_at(void);
 extern TimestampTz cluster_lmon_ready_at(void);
 extern TimestampTz cluster_lmon_last_liveness_tick_at(void);

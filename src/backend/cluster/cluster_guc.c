@@ -547,7 +547,7 @@ cluster_init_guc(void)
 										 "registers one region.  Raise if FATAL on startup with "
 										 "errcode 53400 \"cluster shmem registry capacity "
 										 "exceeded\"."),
-							&cluster_shmem_max_regions, 64, 27, 256,
+							&cluster_shmem_max_regions, 64, 28, 256,
 							PGC_POSTMASTER, /* registry array is palloc'd once at init */
 							0,				/* flags */
 							NULL,			/* check_hook */
@@ -1343,12 +1343,10 @@ cluster_init_guc(void)
 	 * path; superusers + test fixtures may tune for fault injection.
 	 */
 	DefineCustomIntVariable(
-		"cluster.gcs_reply_timeout_ms",
-		gettext_noop("GCS block-ship request reply timeout (ms)."),
+		"cluster.gcs_reply_timeout_ms", gettext_noop("GCS block-ship request reply timeout (ms)."),
 		gettext_noop("Sender ConditionVariableTimedSleep deadline for GCS "
 					 "block-ship reply.  On expiry, request cleanup + "
 					 "ereport(ERRCODE_QUERY_CANCELED) with errhint "
 					 "pointing to spec-2.34 retransmit.  HC85.  PGC_SUSET."),
-		&cluster_gcs_reply_timeout_ms, 5000, 100, 60000,
-		PGC_SUSET, 0, NULL, NULL, NULL);
+		&cluster_gcs_reply_timeout_ms, 5000, 100, 60000, PGC_SUSET, 0, NULL, NULL, NULL);
 }
