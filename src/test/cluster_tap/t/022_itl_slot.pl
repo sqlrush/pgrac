@@ -193,8 +193,8 @@ SKIP: {
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '102',
-   'L12a pg_stat_cluster_injections is 51 (1.5 adds no inject points; 4 PCM added by 1.7)');
+   '104',
+   'L12a pg_stat_cluster_injections is 104 after spec-2.34');
 
 is($node->safe_psql(
 		'postgres',
@@ -205,8 +205,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_cluster_shmem'),
-	   '28',
-	   'L12c pg_cluster_shmem returns 28 rows (spec-2.33 GCS block region included)');
+	   '29',
+	   'L12c pg_cluster_shmem returns 29 rows (spec-2.34 GCS block dedup region included)');
 
 
 # ----------
