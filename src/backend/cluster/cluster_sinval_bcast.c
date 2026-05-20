@@ -65,11 +65,8 @@ SinvalBcastMain(void)
 
 	Assert(IsUnderPostmaster);
 
-	write_stderr("SI Broadcaster: entered SinvalBcastMain\n");
-
 	MyBackendType = B_SINVAL_BCAST;
 	init_ps_display(NULL);
-	write_stderr("SI Broadcaster: post init_ps_display\n");
 
 	/* Standard PG aux-process signal layout. */
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);

@@ -1962,7 +1962,7 @@ ServerLoop(void)
 		 * batch API + 9 counters remain fully functional;  test inject
 		 * path uses synchronous helpers (no aux process required).
 		 */
-		if (false && cluster_enabled && cluster_node_id >= 0 && SinvalBcastPID == 0
+		if (cluster_enabled && cluster_node_id >= 0 && SinvalBcastPID == 0
 			&& pmState == PM_RUN)
 			SinvalBcastPID = StartSinvalBcast();
 

@@ -324,7 +324,6 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 	 * a defensive bailout if the compiler does not honor the attribute.
 	 * See cluster_sinval_bcast.h. */
 	case SinvalBcastProcess:
-		write_stderr("AUXPROCESS DISPATCH: SinvalBcastProcess case hit\n");
 		SinvalBcastMain();
 		proc_exit(1);
 #endif
