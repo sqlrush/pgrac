@@ -46,6 +46,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
+#include "cluster/cluster_inject.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_sinval.h"
 #include "miscadmin.h"
@@ -358,6 +359,17 @@ cluster_sinval_handle_envelope(const ClusterICEnvelope *env, const void *payload
 	if (ClusterSinval == NULL)
 		return;
 
+	/* spec-2.38 D14:  fault inject — SKIP bypasses validation entirely.
+	 * Used by TAP to reproduce HC135 echo-defense violation scenarios. */
+	CLUSTER_INJECTION_POINT("cluster-sinval-receive-skip-validate");
+	if (cluster_injection_should_skip("cluster-sinval-receive-skip-validate")) {
+		msgs = (const SharedInvalidationMessage *)((const char *)hdr + sizeof(*hdr));
+		if (cluster_sinval_inbound_try_enqueue(hdr->batch_id, msgs, hdr->nmsgs, hdr->source_node))
+			pg_atomic_fetch_add_u64(&ClusterSinval->broadcast_receive_count, 1);
+		cluster_sinval_set_proc_latch();
+		return;
+	}
+
 	if (env->payload_length < (uint32)sizeof(SinvalBroadcastHeader)) {
 		pg_atomic_fetch_add_u64(&ClusterSinval->validation_drop_count, 1);
 		return;
@@ -443,6 +455,18 @@ cluster_sinval_drain_outbound_and_broadcast(void)
 		buf = (char *)palloc0(payload_len);
 		memcpy(buf, &hdr, sizeof(hdr));
 		memcpy(buf + sizeof(hdr), local.msgs, local.nmsgs * sizeof(SharedInvalidationMessage));
+
+		/* spec-2.38 D14:  fault inject — SKIP makes broadcaster silently
+		 * drop the batch (still consumes from outbound queue for fast-
+		 * forward semantics) and bumps echo_dropped_count for TAP
+		 * observability without surfacing failure to caller. */
+		CLUSTER_INJECTION_POINT("cluster-sinval-broadcast-drop-send");
+		if (cluster_injection_should_skip("cluster-sinval-broadcast-drop-send")) {
+			pg_atomic_fetch_add_u64(&ClusterSinval->echo_dropped_count, 1);
+			pfree(buf);
+			drained++;
+			continue;
+		}
 
 		if (cluster_ic_send_envelope(PGRAC_IC_MSG_SINVAL, PGRAC_IC_BROADCAST, buf, payload_len)
 			== CLUSTER_IC_SEND_DONE)

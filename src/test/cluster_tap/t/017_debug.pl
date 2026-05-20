@@ -63,8 +63,8 @@ is( $node->safe_psql(
 		'postgres',
 		q{SELECT string_agg(DISTINCT category, ',' ORDER BY category)
 		    FROM pg_cluster_state}),
-	'block_format,buffer_format,cluster_cssd,cluster_stats,conf,diag,gcs,ges,grd,guc,ic,inject,lck,lmd,lmon,lms,pcm,pgstat,phase,scn,shared_fs,shmem',
-	'all 22 categories appear (gcs added in spec-2.32;L122 alphabetic verify)');
+	'block_format,buffer_format,cluster_cssd,cluster_stats,conf,diag,gcs,ges,grd,guc,ic,inject,lck,lmd,lmon,lms,pcm,pgstat,phase,scn,shared_fs,shmem,sinval',
+	'all 23 categories appear (sinval added in spec-2.38;L122 alphabetic verify)');
 
 
 # ----------
@@ -123,15 +123,15 @@ is( $node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='inject' AND key LIKE '%.fault_type'}),
-	'110',
-	'all 110 injection points have a .fault_type entry under inject category after spec-2.36');
+	'112',
+	'all 112 injection points have a .fault_type entry under inject category after spec-2.38');
 
 is( $node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='inject' AND key LIKE '%.hits'}),
-	'110',
-	'all 110 injection points have a .hits entry under inject category after spec-2.36');
+	'112',
+	'all 112 injection points have a .hits entry under inject category after spec-2.38');
 
 
 # ----------

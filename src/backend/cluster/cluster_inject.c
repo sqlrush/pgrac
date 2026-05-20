@@ -352,6 +352,26 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	{ .name = "cluster-gcs-block-invalidate-stall-ack" },
 	{ .name = "cluster-gcs-block-x-forward-master-side" },
 	{ .name = "cluster-gcs-block-starvation-force-denied" },
+	/*
+	 * spec-2.38 D14 — SI Broadcaster fault injection.
+	 *
+	 *	cluster-sinval-broadcast-drop-send:
+	 *	  Fires inside cluster_sinval_drain_outbound_and_broadcast just
+	 *	  before cluster_ic_send_envelope.  SKIP makes the broadcaster
+	 *	  silently drop the batch (still consumes it from outbound queue
+	 *	  and bumps echo_dropped_count for observability) so TAP can
+	 *	  verify peer never sees the batch + validates HC134 fail-closed
+	 *	  observability semantics.
+	 *
+	 *	cluster-sinval-receive-skip-validate:
+	 *	  Fires inside cluster_sinval_handle_envelope before checksum /
+	 *	  epoch / source_node validation.  SKIP makes the handler bypass
+	 *	  validation entirely (still enqueues to inbound) so TAP can
+	 *	  reproduce HC135 echo-defense violation scenarios + confirm that
+	 *	  HC132 outbound-independence is the 唯一 hard echo 防线.
+	 */
+	{ .name = "cluster-sinval-broadcast-drop-send" },
+	{ .name = "cluster-sinval-receive-skip-validate" },
 };
 
 #define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_points)

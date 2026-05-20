@@ -79,14 +79,14 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_shmem}),
-	   '29',
-	   'L2 pg_cluster_shmem returns 29 rows (spec-2.34 GCS block dedup region included)');
+	   '31',
+	   'L2 pg_cluster_shmem returns 31 rows (spec-2.38 SI Broadcaster adds inbound + outbound regions)');
 
 is($node->safe_psql(
 		'postgres',
 		q{SELECT string_agg(name, ',' ORDER BY name) FROM pg_cluster_shmem}),
-   'pgrac cluster conf,pgrac cluster control,pgrac cluster cssd,pgrac cluster diag,pgrac cluster epoch,pgrac cluster fence,pgrac cluster gcs,pgrac cluster gcs block,pgrac cluster gcs block dedup,pgrac cluster ges,pgrac cluster ges dedup,pgrac cluster ges reply wait,pgrac cluster grd,pgrac cluster grd outbound,pgrac cluster grd pending,pgrac cluster grd work queue,pgrac cluster lck,pgrac cluster lmd,pgrac cluster lmd graph,pgrac cluster lmon,pgrac cluster lms,pgrac cluster pcm grd,pgrac cluster qvotec,pgrac cluster reconfig,pgrac cluster scn,pgrac cluster smgr,pgrac cluster startup phase,pgrac cluster stats,pgrac cluster_ic_tier1',
-   'L3 pg_cluster_shmem rows are exactly the 29 foundational regions (spec-2.34 GCS block dedup included)');
+   'pgrac cluster conf,pgrac cluster control,pgrac cluster cssd,pgrac cluster diag,pgrac cluster epoch,pgrac cluster fence,pgrac cluster gcs,pgrac cluster gcs block,pgrac cluster gcs block dedup,pgrac cluster ges,pgrac cluster ges dedup,pgrac cluster ges reply wait,pgrac cluster grd,pgrac cluster grd outbound,pgrac cluster grd pending,pgrac cluster grd work queue,pgrac cluster lck,pgrac cluster lmd,pgrac cluster lmd graph,pgrac cluster lmon,pgrac cluster lms,pgrac cluster pcm grd,pgrac cluster qvotec,pgrac cluster reconfig,pgrac cluster scn,pgrac cluster sinval inbound,pgrac cluster sinval outbound,pgrac cluster smgr,pgrac cluster startup phase,pgrac cluster stats,pgrac cluster_ic_tier1',
+   'L3 pg_cluster_shmem rows are exactly the 31 foundational regions (spec-2.38 adds sinval inbound + outbound)');
 
 
 # ----------
@@ -134,8 +134,8 @@ is($node->safe_psql(
 		'postgres',
 		q{SELECT value FROM pg_cluster_state
 		   WHERE category = 'shmem' AND key = 'region_count'}),
-	   '29',
-	   'L8 pg_cluster_state.shmem.region_count = 29 (spec-2.34 GCS block dedup included)');
+	   '31',
+	   'L8 pg_cluster_state.shmem.region_count = 31 (spec-2.38 SI Broadcaster regions included)');
 
 is($node->safe_psql(
 		'postgres', q{
@@ -154,15 +154,15 @@ is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='shmem' AND key LIKE 'region.%.bytes'}),
-	   '29',
-	   'L10 pg_cluster_state.shmem has 29 region.<name>.bytes keys (one per region)');
+	   '31',
+	   'L10 pg_cluster_state.shmem has 31 region.<name>.bytes keys (one per region)');
 
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='shmem' AND key LIKE 'region.%.owner'}),
-	   '29',
-	   'L11 pg_cluster_state.shmem has 29 region.<name>.owner keys (one per region)');
+	   '31',
+	   'L11 pg_cluster_state.shmem has 31 region.<name>.owner keys (one per region)');
 
 
 # ----------
@@ -175,8 +175,8 @@ is($node->safe_psql(
 	  FROM pg_settings
 	 WHERE name = 'cluster.shmem_max_regions'
 }),
-   'integer|postmaster|64|29|256',
-   'L12 cluster.shmem_max_regions: int / postmaster / default 64 / [29,256] (spec-2.34 GCS block dedup bumps min_val 28→29)');
+   'integer|postmaster|64|31|256',
+   'L12 cluster.shmem_max_regions: int / postmaster / default 64 / [31,256] (spec-2.38 SI Broadcaster bumps min_val 29→31)');
 
 is($node->safe_psql(
 		'postgres',
@@ -199,8 +199,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '110',
-   'L15 total injection registry size is 110 after spec-2.36');
+   '112',
+   'L15 total injection registry size is 112 after spec-2.38');
 
 
 # ----------
@@ -237,21 +237,21 @@ is($node->safe_psql(
 # all baseline regions.
 # ----------
 $node->stop;
-$node->append_conf('postgresql.conf', "cluster.shmem_max_regions = 29\n");
+$node->append_conf('postgresql.conf', "cluster.shmem_max_regions = 31\n");
 $node->start;
 
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_shmem}),
-	   '29',
-	   'L18 cluster.shmem_max_regions = 29 exactly admits the 29 baseline regions (lower bound match)');
+	   '31',
+	   'L18 cluster.shmem_max_regions = 31 exactly admits the 31 baseline regions (lower bound match)');
 
 is($node->safe_psql(
 		'postgres',
 		q{SELECT value FROM pg_cluster_state
    WHERE category = 'guc' AND key = 'cluster.shmem_max_regions'}),
-   '29',
-   'L19 pg_cluster_state.guc.cluster.shmem_max_regions reflects override = 29');
+   '31',
+   'L19 pg_cluster_state.guc.cluster.shmem_max_regions reflects override = 31');
 
 $node->stop;
 

@@ -146,7 +146,7 @@ ok($phase_val =~ /^(init|running|shutdown|reconfig)$/,
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'88', 'E1 pg_stat_cluster_wait_events returns 85 rows (spec-2.34 GCS block reliability events included)');
+	'88', 'E1 pg_stat_cluster_wait_events returns 88 rows (spec-2.38 adds 3 SI Broadcaster wait events on top of spec-2.34 baseline)');
 
 ok($node->safe_psql('postgres',
 		q{SELECT count(*) > 0 FROM pg_stat_cluster_wait_events WHERE type='Cluster: GES'})
@@ -158,7 +158,7 @@ ok($node->safe_psql('postgres',
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_gcluster_wait_events'),
-	'88', 'E4 pg_stat_gcluster_wait_events returns 85 rows (single-node, spec-2.34 D7)');
+	'88', 'E4 pg_stat_gcluster_wait_events returns 88 rows (single-node, spec-2.38 SI Broadcaster events included)');
 
 
 # ============================================================
@@ -297,12 +297,12 @@ ok(defined $postgres_bin && -x $postgres_bin,
 
 
 # ============================================================
-# §M  error injection 110 注入点 + 5 fault types (6 tests)
+# §M  error injection 112 注入点 + 5 fault types (6 tests)
 # ============================================================
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-	'110', 'M1 110 injection points (spec-2.36 adds 2 CF 3-way 4 injection points)');
+	'112', 'M1 112 injection points (spec-2.38 adds 2 SI Broadcaster injection points)');
 
 is($node->safe_psql('postgres',
 		q{SELECT string_agg(name, ',' ORDER BY name) FROM pg_stat_cluster_injections WHERE name LIKE 'cluster-init-%'}),
@@ -332,8 +332,8 @@ ok( $node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT key) FROM pg_cluster_state
 		   WHERE category='inject' AND (key LIKE '%.fault_type' OR key LIKE '%.hits')}
-	) eq '220',
-	'M5 inject category has 110×2 = 220 sub-keys (.fault_type + .hits) after spec-2.36');
+	) eq '224',
+	'M5 inject category has 112×2 = 224 sub-keys (.fault_type + .hits) after spec-2.38');
 
 is($node->get_cluster_state_value('inject', 'armed_count'),
 	'0', 'M6 inject.armed_count starts at 0 in fresh backend');
