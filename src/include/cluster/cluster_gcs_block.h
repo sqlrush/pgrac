@@ -202,18 +202,60 @@ typedef struct GcsBlockInvalidatePayload {
  *     2 = already_invalidated (race: buffer not resident)
  *
  *   Layout (64B fixed; same offsets as request payload to keep header
- *   parsing symmetric):
+ *   parsing symmetric through checksum; spec-2.37 reinterprets the first
+ *   8 bytes after checksum as the holder page_lsn so the master can advance
+ *   the authoritative PI watermark after a successful invalidate ACK):
+ *     [ 52,  60) page_lsn_bytes[8]      -- little-endian XLogRecPtr
+ *     [ 60,  64) reserved_1[4]          -- pad to 64B
  * ============================================================ */
 typedef struct GcsBlockInvalidateAckPayload {
-	uint64 request_id;	  /*  8B [  0,   8) */
-	uint64 epoch;		  /*  8B [  8,  16) */
-	BufferTag tag;		  /* 20B [ 16,  36) PG-fact */
-	int32 sender_node;	  /*  4B [ 36,  40) */
-	uint8 ack_status;	  /*  1B [ 40,  41) 0/1/2 */
-	uint8 reserved_0[7];  /*  7B [ 41,  48) */
-	uint32 checksum;	  /*  4B [ 48,  52) HC83 CRC32C */
-	uint8 reserved_1[12]; /* 12B [ 52,  64) */
+	uint64 request_id;		 /*  8B [  0,   8) */
+	uint64 epoch;			 /*  8B [  8,  16) */
+	BufferTag tag;			 /* 20B [ 16,  36) PG-fact */
+	int32 sender_node;		 /*  4B [ 36,  40) */
+	uint8 ack_status;		 /*  1B [ 40,  41) 0/1/2 */
+	uint8 reserved_0[7];	 /*  7B [ 41,  48) */
+	uint32 checksum;		 /*  4B [ 48,  52) HC83 CRC32C */
+	uint8 page_lsn_bytes[8]; /*  8B [ 52,  60) HC126 spec-2.37 */
+	uint8 reserved_1[4];	 /*  4B [ 60,  64) */
 } GcsBlockInvalidateAckPayload;
+
+StaticAssertDecl(sizeof(GcsBlockInvalidateAckPayload) == 64,
+				 "spec-2.36 D1 / spec-2.37 D7 GcsBlockInvalidateAckPayload wire ABI 64B");
+
+StaticAssertDecl(offsetof(GcsBlockInvalidateAckPayload, page_lsn_bytes) == 52,
+				 "spec-2.37 D7 HC126 — invalidate ACK page_lsn_bytes[8] must land at offset 52");
+
+static inline void
+GcsBlockInvalidateAckPayloadSetPageLsn(GcsBlockInvalidateAckPayload *p, XLogRecPtr lsn)
+{
+	uint64 v = (uint64)lsn;
+
+	p->page_lsn_bytes[0] = (uint8)(v & 0xff);
+	p->page_lsn_bytes[1] = (uint8)((v >> 8) & 0xff);
+	p->page_lsn_bytes[2] = (uint8)((v >> 16) & 0xff);
+	p->page_lsn_bytes[3] = (uint8)((v >> 24) & 0xff);
+	p->page_lsn_bytes[4] = (uint8)((v >> 32) & 0xff);
+	p->page_lsn_bytes[5] = (uint8)((v >> 40) & 0xff);
+	p->page_lsn_bytes[6] = (uint8)((v >> 48) & 0xff);
+	p->page_lsn_bytes[7] = (uint8)((v >> 56) & 0xff);
+}
+
+static inline XLogRecPtr
+GcsBlockInvalidateAckPayloadGetPageLsn(const GcsBlockInvalidateAckPayload *p)
+{
+	uint64 v = 0;
+
+	v |= (uint64)p->page_lsn_bytes[0];
+	v |= (uint64)p->page_lsn_bytes[1] << 8;
+	v |= (uint64)p->page_lsn_bytes[2] << 16;
+	v |= (uint64)p->page_lsn_bytes[3] << 24;
+	v |= (uint64)p->page_lsn_bytes[4] << 32;
+	v |= (uint64)p->page_lsn_bytes[5] << 40;
+	v |= (uint64)p->page_lsn_bytes[6] << 48;
+	v |= (uint64)p->page_lsn_bytes[7] << 56;
+	return (XLogRecPtr)v;
+}
 
 
 /* ============================================================

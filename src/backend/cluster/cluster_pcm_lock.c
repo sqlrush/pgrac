@@ -683,6 +683,7 @@ cluster_pcm_lock_pi_watermark_retire_for_tag(BufferTag tag)
 	if (found && entry != NULL) {
 		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
 		entry->pi_watermark_lsn = InvalidXLogRecPtr;
+		pg_atomic_write_u32(&entry->pi_holders_bitmap, 0);
 		LWLockRelease(&entry->entry_lock.lock);
 	}
 	LWLockRelease(&ClusterPcm->htab_lock.lock);
@@ -706,8 +707,10 @@ cluster_pcm_lock_pi_watermark_retire_for_relation_fork(Oid db_oid, RelFileNumber
 			|| entry->tag.forkNum != fork_num)
 			continue;
 		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
-		if (entry->pi_watermark_lsn != InvalidXLogRecPtr) {
+		if (entry->pi_watermark_lsn != InvalidXLogRecPtr
+			|| pg_atomic_read_u32(&entry->pi_holders_bitmap) != 0) {
 			entry->pi_watermark_lsn = InvalidXLogRecPtr;
+			pg_atomic_write_u32(&entry->pi_holders_bitmap, 0);
 			cleared++;
 		}
 		LWLockRelease(&entry->entry_lock.lock);
@@ -738,8 +741,10 @@ cluster_pcm_lock_pi_watermark_retire_for_truncate_range(Oid db_oid, RelFileNumbe
 		if (entry->tag.blockNum < new_nblocks)
 			continue;
 		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
-		if (entry->pi_watermark_lsn != InvalidXLogRecPtr) {
+		if (entry->pi_watermark_lsn != InvalidXLogRecPtr
+			|| pg_atomic_read_u32(&entry->pi_holders_bitmap) != 0) {
 			entry->pi_watermark_lsn = InvalidXLogRecPtr;
+			pg_atomic_write_u32(&entry->pi_holders_bitmap, 0);
 			cleared++;
 		}
 		LWLockRelease(&entry->entry_lock.lock);
@@ -771,6 +776,7 @@ cluster_pcm_lock_pi_watermark_retire_if_durable(BufferTag tag, XLogRecPtr writte
 		if ((uint64)written_page_lsn >= entry->pi_watermark_lsn
 			&& entry->pi_watermark_lsn != InvalidXLogRecPtr) {
 			entry->pi_watermark_lsn = InvalidXLogRecPtr;
+			pg_atomic_write_u32(&entry->pi_holders_bitmap, 0);
 			retired = true;
 		}
 		LWLockRelease(&entry->entry_lock.lock);

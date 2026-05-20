@@ -430,10 +430,17 @@ gcs_block_compute_invalidate_ack_checksum(const GcsBlockInvalidateAckPayload *ac
 {
 	const char *bytes = (const char *)ack;
 	uint32 c = 0;
+	size_t checksum_off = offsetof(GcsBlockInvalidateAckPayload, checksum);
 	size_t i;
 
-	for (i = 0; i < offsetof(GcsBlockInvalidateAckPayload, checksum); i++)
+	/* spec-2.37 D7: ACK carries page_lsn_bytes after checksum.  Hash every
+	 * payload byte except the checksum field itself so stale or corrupted
+	 * holder page_lsn cannot advance the master PI watermark. */
+	for (i = 0; i < sizeof(GcsBlockInvalidateAckPayload); i++) {
+		if (i >= checksum_off && i < checksum_off + sizeof(uint32))
+			continue;
 		c = (c * 31u) + (uint8)bytes[i];
+	}
 	return c;
 }
 
@@ -788,8 +795,8 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 			 * GUC cluster.gcs_block_lost_write_action selects ereport(53R93)
 			 * for production (default) or WARNING for staging/diagnostic. */
 			if (final_status == GCS_BLOCK_REPLY_DENIED_LOST_WRITE) {
-				terminal_denied = true;
 				if (cluster_gcs_block_lost_write_action == 0 /* ERROR */) {
+					terminal_denied = true;
 					ereport(ERROR, (errcode(ERRCODE_CLUSTER_LOST_WRITE_DETECTED),
 									errmsg("cluster_gcs_block: lost write detected on tag "
 										   "spc=%u db=%u rel=%u block=%u",
@@ -799,11 +806,14 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 											"lost_write_detected_count and cluster_pcm_grd "
 											"to identify the stale source.  HC131.")));
 				} else {
-					/* WARN action: do NOT ereport, business proceeds with the
-					 * (possibly stale) block — only safe for staging/diagnostic. */
+					/* WARN action: do NOT error.  This diagnostic mode intentionally
+					 * lets the caller proceed with the existing/storage-fallback block;
+					 * only safe for staging.  Avoid terminal_denied, otherwise the
+					 * post-loop switch raises a generic FEATURE_NOT_SUPPORTED. */
 					ereport(WARNING, (errmsg("cluster_gcs_block: lost write detected on tag "
 											 "spc=%u db=%u rel=%u block=%u (action=warn)",
 											 tag.spcOid, tag.dbOid, tag.relNumber, tag.blockNum)));
+					granted_storage_fallback = true;
 				}
 				break;
 			}
@@ -1635,7 +1645,8 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 				if (fwd_master == slot->expected_master_node
 					&& (hdr->status == (uint8)GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER
-						|| hdr->status == (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER))
+						|| hdr->status == (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER
+						|| hdr->status == (uint8)GCS_BLOCK_REPLY_DENIED_LOST_WRITE))
 					authorized = true;
 			}
 
@@ -1930,17 +1941,9 @@ cluster_gcs_handle_block_invalidate_envelope(const ClusterICEnvelope *env, const
 																 : PCM_TRANS_S_TO_N_INVALIDATE;
 		(void)cluster_pcm_lock_apply_gcs_transition(inv->tag, trans, cluster_node_id);
 
-		/* PGRAC: spec-2.37 D7 HC126 NEW — advance local PI watermark with the
-		 * holder's last page_lsn before invalidation.  D7 caller-side advance
-		 * (PCM state machine stays IO-free).  Single-node loopback case advances
-		 * the local master GrdEntry directly;  multi-node case advances only the
-		 * holder-local HTAB (master-side advance requires cross-node propagation
-		 * which is deferred per spec Hardening appendix limitation登记). */
-		if (!XLogRecPtrIsInvalid(page_lsn)) {
-			cluster_pcm_lock_pi_watermark_advance(inv->tag, page_lsn);
-			if (ClusterGcsBlock != NULL)
-				pg_atomic_fetch_add_u64(&ClusterGcsBlock->pi_watermark_advance_count, 1);
-		}
+		/* spec-2.37 D7: page_lsn is carried back in the ACK and applied by
+		 * the master-side ACK handler.  Do not advance the holder-local HTAB:
+		 * the master GrdEntry is the authoritative PI watermark owner. */
 	} else {
 		ack_status = 2; /* race: not resident */
 	}
@@ -1952,9 +1955,8 @@ send_ack:
 	ack.tag = inv->tag;
 	ack.sender_node = cluster_node_id;
 	ack.ack_status = ack_status;
-	{
-		ack.checksum = gcs_block_compute_invalidate_ack_checksum(&ack);
-	}
+	GcsBlockInvalidateAckPayloadSetPageLsn(&ack, page_lsn);
+	ack.checksum = gcs_block_compute_invalidate_ack_checksum(&ack);
 
 	(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK, inv->master_node, &ack,
 								   sizeof(ack));
@@ -1976,6 +1978,8 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 	uint64 current_req_id;
 	uint64 expected_epoch;
 	uint32 expected_bm;
+	XLogRecPtr ack_page_lsn = InvalidXLogRecPtr;
+	BufferTag ack_tag = { 0 };
 	bool valid = false;
 
 	if (ClusterGcsBlock == NULL)
@@ -2015,14 +2019,24 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 		return;
 	}
 
+	if (ack->ack_status == 0) {
+		ack_page_lsn = GcsBlockInvalidateAckPayloadGetPageLsn(ack);
+		ack_tag = ack->tag;
+	}
+
 	pg_atomic_fetch_or_u32(&ClusterGcsBlock->invalidate_broadcast_acked_bm,
 						   (uint32)1u << ack->sender_node);
 	pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_invalidate_ack_received_count, 1);
 	valid = true;
 	LWLockRelease(&ClusterGcsBlock->invalidate_broadcast_lock.lock);
 
-	if (valid)
+	if (valid) {
+		if (!XLogRecPtrIsInvalid(ack_page_lsn)) {
+			cluster_pcm_lock_pi_watermark_advance(ack_tag, ack_page_lsn);
+			pg_atomic_fetch_add_u64(&ClusterGcsBlock->pi_watermark_advance_count, 1);
+		}
 		ConditionVariableBroadcast(&ClusterGcsBlock->invalidate_broadcast_cv);
+	}
 }
 
 

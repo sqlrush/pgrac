@@ -154,6 +154,7 @@ UT_TEST(test_invalidate_ack_payload_field_offsets)
 	UT_ASSERT_EQ((int)offsetof(GcsBlockInvalidateAckPayload, sender_node), 36);
 	UT_ASSERT_EQ((int)offsetof(GcsBlockInvalidateAckPayload, ack_status), 40);
 	UT_ASSERT_EQ((int)offsetof(GcsBlockInvalidateAckPayload, checksum), 48);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockInvalidateAckPayload, page_lsn_bytes), 52);
 }
 
 

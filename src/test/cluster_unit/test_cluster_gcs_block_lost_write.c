@@ -148,6 +148,27 @@ UT_TEST(test_expected_pi_watermark_lsn_helper_round_trip)
 }
 
 
+UT_TEST(test_invalidate_ack_page_lsn_helper_round_trip)
+{
+	GcsBlockInvalidateAckPayload ack;
+	XLogRecPtr v;
+
+	memset(&ack, 0, sizeof(ack));
+	UT_ASSERT_EQ((int)offsetof(GcsBlockInvalidateAckPayload, page_lsn_bytes), 52);
+
+	GcsBlockInvalidateAckPayloadSetPageLsn(&ack, InvalidXLogRecPtr);
+	UT_ASSERT_EQ((uint64)GcsBlockInvalidateAckPayloadGetPageLsn(&ack), (uint64)InvalidXLogRecPtr);
+
+	v = (XLogRecPtr)0x0102030405060708ULL;
+	GcsBlockInvalidateAckPayloadSetPageLsn(&ack, v);
+	UT_ASSERT_EQ((uint64)GcsBlockInvalidateAckPayloadGetPageLsn(&ack), (uint64)v);
+
+	v = (XLogRecPtr)0x8877665544332211ULL;
+	GcsBlockInvalidateAckPayloadSetPageLsn(&ack, v);
+	UT_ASSERT_EQ((uint64)GcsBlockInvalidateAckPayloadGetPageLsn(&ack), (uint64)v);
+}
+
+
 /* ----- L7-L12: PI watermark helper prototypes linkable ----- */
 
 UT_TEST(test_pi_watermark_advance_prototype_linkable)
@@ -269,6 +290,7 @@ main(void)
 	UT_RUN(test_forward_payload_size_still_64_after_hc127);
 	UT_RUN(test_forward_payload_expected_pi_watermark_lsn_offset_49);
 	UT_RUN(test_expected_pi_watermark_lsn_helper_round_trip);
+	UT_RUN(test_invalidate_ack_page_lsn_helper_round_trip);
 	UT_RUN(test_pi_watermark_advance_prototype_linkable);
 	UT_RUN(test_pi_watermark_query_prototype_linkable);
 	UT_RUN(test_pi_watermark_retire_for_tag_prototype_linkable);
