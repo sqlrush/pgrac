@@ -77,6 +77,7 @@
 #include "cluster/cluster_gcs_block.h"		/* cluster_gcs_block_module_init (spec-2.33 D3) */
 #include "cluster/cluster_gcs_block_dedup.h" /* cluster_gcs_block_dedup_module_init (spec-2.34 D2) */
 #include "cluster/cluster_pcm_lock.h"		 /* cluster_pcm_lock_module_init (stage 1.7) */
+#include "cluster/cluster_sinval.h"			 /* cluster_sinval_module_init (spec-2.38 D2/D3) */
 #include "cluster/cluster_qvotec.h" /* cluster_qvotec_shmem_register (spec-2.6 Sprint A Step 1) */
 #include "cluster/cluster_fence.h"	/* cluster_fence_shmem_register (spec-2.28 Sprint A Step 1) */
 #include "cluster/cluster_reconfig.h" /* cluster_reconfig_shmem_register (spec-2.29 Sprint A Step 1) */
@@ -389,6 +390,16 @@ cluster_init_shmem_module(void)
 	 */
 	if (cluster_shmem_lookup_region("pgrac cluster gcs block dedup") == NULL)
 		cluster_gcs_block_dedup_module_init();
+
+	/*
+	 * spec-2.38 D2/D3: register cluster_sinval outbound + inbound shmem
+	 * regions (ring buffer queues for SI Broadcaster aux process — HC132
+	 * outbound 独立防 echo loop;HC133 inbound nonblocking try-enqueue).
+	 *
+	 * Spec: spec-2.38-si-broadcaster-skeleton.md §1.2 D2 + D3.
+	 */
+	if (cluster_shmem_lookup_region("pgrac cluster sinval outbound") == NULL)
+		cluster_sinval_module_init();
 
 	/*
 	 * Stage 1.10.1 (F1 hardening): register cluster_startup_phase shmem

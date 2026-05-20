@@ -35,14 +35,15 @@
 #include "utils/rel.h"
 
 #ifdef USE_PGRAC_CLUSTER
-#include "cluster/cluster_diag.h"	/* DiagMain (stage 1.13 Sprint A) */
-#include "cluster/cluster_lck.h"	/* LckMain (stage 1.12 Sprint A) */
-#include "cluster/cluster_lmon.h"	/* LmonMain (stage 1.11 Sprint A) */
-#include "cluster/cluster_cssd.h"	/* CssdMain (stage 2.5 Sprint A) */
-#include "cluster/cluster_qvotec.h" /* ClusterQvotecMain (spec-2.6 Sprint A Step 3 D7) */
-#include "cluster/cluster_lms.h"	/* LmsMain (spec-2.18 Sprint A Step 1) */
-#include "cluster/cluster_lmd.h"	/* LmdMain (spec-2.19 Sprint A Step 1) */
-#include "cluster/cluster_stats.h"	/* ClusterStatsMain (stage 1.14 Sprint A) */
+#include "cluster/cluster_diag.h"		  /* DiagMain (stage 1.13 Sprint A) */
+#include "cluster/cluster_lck.h"		  /* LckMain (stage 1.12 Sprint A) */
+#include "cluster/cluster_lmon.h"		  /* LmonMain (stage 1.11 Sprint A) */
+#include "cluster/cluster_cssd.h"		  /* CssdMain (stage 2.5 Sprint A) */
+#include "cluster/cluster_qvotec.h"		  /* ClusterQvotecMain (spec-2.6 Sprint A Step 3 D7) */
+#include "cluster/cluster_lms.h"		  /* LmsMain (spec-2.18 Sprint A Step 1) */
+#include "cluster/cluster_lmd.h"		  /* LmdMain (spec-2.19 Sprint A Step 1) */
+#include "cluster/cluster_sinval_bcast.h" /* SinvalBcastMain (spec-2.38 D4) */
+#include "cluster/cluster_stats.h"		  /* ClusterStatsMain (stage 1.14 Sprint A) */
 #endif
 
 
@@ -130,6 +131,17 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 	case LmdProcess:
 		MyBackendType = B_LMD;
 		break;
+	/*
+	 * spec-2.38 D4: SI Broadcaster (Shared Invalidation Broadcaster)
+	 * aux process — drains ClusterSinvalOutbound and broadcasts via
+	 * PGRAC_IC_MSG_SINVAL; drains ClusterSinvalInbound and applies
+	 * SendSharedInvalidMessages; executes fail-safe SIResetAll on
+	 * inbound overflow.  Producer mask CLUSTER_IC_PRODUCER_SINVAL_BCAST
+	 * (HC139); backends MUST enqueue via cluster_sinval_enqueue_batch.
+	 */
+	case SinvalBcastProcess:
+		MyBackendType = B_SINVAL_BCAST;
+		break;
 #endif
 	default:
 		elog(PANIC, "unrecognized process type: %d", (int)MyAuxProcType);
@@ -180,7 +192,8 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 	 * producer-consumer lifecycle 闭环 family).
 	 */
 #ifdef USE_PGRAC_CLUSTER
-	if (MyAuxProcType != LmsProcess && MyAuxProcType != LmdProcess)
+	if (MyAuxProcType != LmsProcess && MyAuxProcType != LmdProcess
+		&& MyAuxProcType != SinvalBcastProcess)
 #endif
 		ProcSignalInit(MaxBackends + MyAuxProcType + 1);
 
@@ -205,7 +218,8 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 	 * install + sigprocmask UnBlockSig MUST happen BEFORE pgstat_bestart /
 	 * pgstat-visible publication / any LMS/LMD shmem-LWLock-CV operation.
 	 */
-	if (MyAuxProcType == LmsProcess || MyAuxProcType == LmdProcess) {
+	if (MyAuxProcType == LmsProcess || MyAuxProcType == LmdProcess
+		|| MyAuxProcType == SinvalBcastProcess) {
 		pqsignal(SIGHUP, SignalHandlerForConfigReload);
 		pqsignal(SIGINT, SignalHandlerForShutdownRequest);
 		pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
@@ -304,6 +318,14 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 	 * if the compiler does not honor the attribute.  See cluster_lmd.h. */
 	case LmdProcess:
 		LmdMain();
+		proc_exit(1);
+	/* PGRAC (spec-2.38 D4): SI Broadcaster aux process dispatch.
+	 * SinvalBcastMain is pg_attribute_noreturn();  proc_exit(1) below is
+	 * a defensive bailout if the compiler does not honor the attribute.
+	 * See cluster_sinval_bcast.h. */
+	case SinvalBcastProcess:
+		write_stderr("AUXPROCESS DISPATCH: SinvalBcastProcess case hit\n");
+		SinvalBcastMain();
 		proc_exit(1);
 #endif
 

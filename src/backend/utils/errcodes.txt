@@ -571,6 +571,13 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 # issue,不 retry 掩盖;business 必须重新读 or 上层 retry whole statement.
 53R93    E    ERRCODE_CLUSTER_LOST_WRITE_DETECTED                             cluster_lost_write_detected
 
+# spec-2.38 D8 (HC134):  SI Broadcaster outbound queue full fail-closed.
+# Caller of cluster_sinval_enqueue_batch() receives false return (queue at
+# capacity);  spec-2.39 production DDL hook path will ereport(53R94) to
+# abort the DDL transaction.  Inbound queue full takes a different fail-
+# safe path (SIResetAll on SI Broadcaster aux process), not 53R94.
+53R94    E    ERRCODE_CLUSTER_SINVAL_QUEUE_FULL                                cluster_sinval_queue_full
+
 Section: Class 54 - Program Limit Exceeded
 
 # this is for wired-in limits, not resource exhaustion problems (class borrowed from DB2)

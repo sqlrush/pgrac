@@ -137,7 +137,12 @@ typedef enum ClusterICMsgType {
 	PGRAC_IC_MSG_GES_REQUEST = 4,	/* spec-2.13 reserved */
 	PGRAC_IC_MSG_GES_REPLY = 5,		/* spec-2.13 reserved */
 	PGRAC_IC_MSG_CF_BLOCK_SHIP = 6, /* spec-2.16 reserved */
-	PGRAC_IC_MSG_SINVAL = 7,		/* spec-2.18 reserved */
+	PGRAC_IC_MSG_SINVAL = 7,		/* PGRAC: spec-2.38 D1 真激活 — SI Broadcaster
+									 * skeleton (was spec-2.18 reserved).
+									 * SinvalBroadcastHeader 24B + variable-length
+									 * SharedInvalidationMessage[16B] tail;
+									 * producer mask = CLUSTER_IC_PRODUCER_SINVAL_BCAST
+									 * (HC139 — backend 不可 bypass outbound queue) */
 	PGRAC_IC_MSG_FENCE_NOTIFY = 8,	/* spec-2.28 reserved */
 	PGRAC_IC_MSG_RECONFIG = 9,		/* spec-2.29 reserved */
 	/* 11 is already occupied by PGRAC_IC_MSG_CSSD_HEARTBEAT macro in

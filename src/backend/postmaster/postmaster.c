@@ -331,6 +331,8 @@ static pid_t QvotecPID = 0;
 static pid_t LmsPID = 0;
 /* PGRAC (spec-2.19 Sprint A Step 1): LMD aux process pid;same pattern. */
 static pid_t LmdPID = 0;
+/* PGRAC (spec-2.38 D4): SI Broadcaster aux process pid;same pattern. */
+static pid_t SinvalBcastPID = 0;
 /*
  * spec-2.6 Sprint A Step 3 D8 deferral gate.  D7 lays down QvotecPID
  * tracking + reaper + LIFO + signal forwarding, but QVOTEC spawn
@@ -652,6 +654,8 @@ static void ShmemBackendArrayRemove(Backend *bn);
 #define StartQvotec() StartChildProcess(QvotecProcess)
 #define StartLms() StartChildProcess(LmsProcess)
 #define StartLmd() StartChildProcess(LmdProcess)
+/* PGRAC (spec-2.38 D4): SI Broadcaster aux process. */
+#define StartSinvalBcast() StartChildProcess(SinvalBcastProcess)
 #endif
 
 /* Macros to check exit status of a child process */
@@ -1945,6 +1949,22 @@ ServerLoop(void)
 		 */
 		if (cluster_enabled && cluster_lmd_enabled && LmdPID == 0 && pmState == PM_RUN)
 			LmdPID = StartLmd();
+
+		/*
+		 * PGRAC: spec-2.38 D4 — SI Broadcaster aux process spawn.
+		 * Skeleton scope: aux process spawn is wired but DISABLED by
+		 * default to avoid InitAuxiliaryProcess slot conflict observed
+		 * during initial Sprint A integration on macOS fork model.
+		 * Spec-2.38 Hardening v1.0.1 / spec-2.39 will diagnose root
+		 * cause (suspected:  AuxProcType count interaction with PG
+		 * 16.13 fixed-size aux process arrays).  Outbound /  inbound
+		 * queue shmem regions + IC handler + cluster_sinval_enqueue_
+		 * batch API + 9 counters remain fully functional;  test inject
+		 * path uses synchronous helpers (no aux process required).
+		 */
+		if (false && cluster_enabled && cluster_node_id >= 0 && SinvalBcastPID == 0
+			&& pmState == PM_RUN)
+			SinvalBcastPID = StartSinvalBcast();
 
 		/*
 		 * PGRAC: spec-2.28 Sprint A Step 3 D6 — fence-lite postmaster
@@ -3373,6 +3393,13 @@ process_pm_child_exit(void)
 				HandleChildCrash(pid, exitstatus, _("LMD process"));
 			continue;
 		}
+		/* PGRAC (spec-2.38 D4): SI Broadcaster reaper. */
+		if (pid == SinvalBcastPID) {
+			SinvalBcastPID = 0;
+			if (!EXIT_STATUS_0(exitstatus))
+				HandleChildCrash(pid, exitstatus, _("SI Broadcaster process"));
+			continue;
+		}
 #endif
 
 		/*
@@ -3797,6 +3824,12 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 		LmdPID = 0;
 	else if (LmdPID != 0 && take_action)
 		sigquit_child(LmdPID);
+
+	/* PGRAC (spec-2.38 D4): SI Broadcaster crash handling. */
+	if (pid == SinvalBcastPID)
+		SinvalBcastPID = 0;
+	else if (SinvalBcastPID != 0 && take_action)
+		sigquit_child(SinvalBcastPID);
 #endif
 
 	/* Take care of the walreceiver too */

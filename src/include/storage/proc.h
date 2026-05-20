@@ -448,7 +448,7 @@ extern PGDLLIMPORT PGPROC *PreparedXactProcs;
  * (L18 startup-time validation family).
  */
 #ifdef USE_PGRAC_CLUSTER
-#define NUM_AUXILIARY_PROCS 14
+#define NUM_AUXILIARY_PROCS 15 /* spec-2.38 D4: +SinvalBcastProcess (was 14) */
 #else
 #define NUM_AUXILIARY_PROCS 5
 #endif

@@ -579,6 +579,22 @@ typedef enum {
 	 * surface without duplicate definition.
 	 */
 	LmdProcess,
+	/*
+	 * SI Broadcaster (Shared Invalidation Broadcaster) is the 9th cluster
+	 * background process — spec-2.38 Sprint A D4.  Appended after
+	 * LmdProcess to preserve numeric values.  Cross-node sinval message
+	 * propagation:  drains ClusterSinvalOutbound and broadcasts via
+	 * PGRAC_IC_MSG_SINVAL wire envelope;  drains ClusterSinvalInbound
+	 * and applies SendSharedInvalidMessages (PG-native sinval API);
+	 * executes fail-safe SIResetAll() on inbound overflow (HC134).  The
+	 * IC inbound handler nonblocking 约束 (HC133) forbids LWLockAcquire
+	 * inside handler context, so all real apply work is deferred to this
+	 * aux process main loop.  Producer mask CLUSTER_IC_PRODUCER_SINVAL_
+	 * BCAST (= 1 << B_SINVAL_BCAST) means only this aux process may
+	 * directly send SINVAL wire envelopes (HC139); backends must enqueue
+	 * via cluster_sinval_enqueue_batch().  See cluster_sinval_bcast.h.
+	 */
+	SinvalBcastProcess,
 #endif
 
 	NUM_AUXPROCTYPES /* Must be last! */
@@ -601,6 +617,7 @@ extern PGDLLIMPORT AuxProcType MyAuxProcType;
 #define AmQvotecProcess() (MyAuxProcType == QvotecProcess)
 #define AmLmsProcess() (MyAuxProcType == LmsProcess)
 #define AmLmdProcess() (MyAuxProcType == LmdProcess)
+#define AmSinvalBcastProcess() (MyAuxProcType == SinvalBcastProcess)
 #endif
 
 

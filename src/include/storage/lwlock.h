@@ -315,6 +315,13 @@ typedef enum BuiltinTrancheIds {
 	 * install_reply.  Separate tranche from CLUSTER_GCS_BLOCK so DBA can see
 	 * data-plane reliability path contention distinctly. */
 	LWTRANCHE_CLUSTER_GCS_BLOCK_DEDUP,
+	/* PGRAC (spec-2.38 D2): SI Broadcaster outbound + inbound ring buffer
+	 * lock.  Both queues share this tranche.  Outbound uses LWLockAcquire
+	 * EXCLUSIVE in backend context (cluster_sinval_enqueue_batch).  Inbound
+	 * uses LWLockConditionalAcquire only from the IC handler (HC133
+	 * nonblocking constraint) and LWLockAcquire EXCLUSIVE only from the
+	 * SI Broadcaster aux process drain path. */
+	LWTRANCHE_CLUSTER_SINVAL,
 #endif
 	LWTRANCHE_FIRST_USER_DEFINED
 } BuiltinTrancheIds;

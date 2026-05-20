@@ -83,6 +83,8 @@ OBJS = \
 	cluster_voting_disk_io.o \
 	cluster_shmem.o \
 	cluster_signal.o \
+	cluster_sinval.o \
+	cluster_sinval_bcast.o \
 	cluster_startup_phase.o \
 	cluster_stats.o \
 	cluster_version.o \

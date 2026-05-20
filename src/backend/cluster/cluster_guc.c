@@ -348,6 +348,26 @@ static const struct config_enum_entry cluster_gcs_block_lost_write_action_option
 
 
 /*
+ * PGRAC: spec-2.38 D8 — 3 NEW GUC for SI Broadcaster skeleton.
+ *
+ *   cluster_sinval_broadcast_batch_size (HC138):  outbound queue drain
+ *     batch upper bound;  1..CLUSTER_SINVAL_BATCH_MAX (=64);  check hook
+ *     enforces range to prevent runtime misconfigure.
+ *   cluster_sinval_broadcast_batch_timeout_ms (HC136):  SI Broadcaster
+ *     main loop WaitLatch timeout (ms);  PGC_SIGHUP — aux process
+ *     reload picks up new value on next loop iteration.  Direct
+ *     PGC_SUSET would be misleading because session-set values don't
+ *     reach the aux process global anyway.
+ *   cluster_sinval_broadcast_max_queue_size (HC132/HC133):  ring buffer
+ *     capacity for both outbound and inbound queues;  PGC_POSTMASTER
+ *     because shmem size is computed at startup from this value.
+ */
+int cluster_sinval_broadcast_batch_size = 32;
+int cluster_sinval_broadcast_batch_timeout_ms = 10;
+int cluster_sinval_broadcast_max_queue_size = 1024;
+
+
+/*
  * Mapping from the cluster.interconnect_tier GUC enum string to the
  * ClusterICTier C enum.  PG's GUC machinery copies the int into
  * cluster_interconnect_tier; cluster_ic_init then dispatches.  The
@@ -1474,4 +1494,35 @@ cluster_init_guc(void)
 					 "not interrupted but silent corruption risk.  HC131.  PGC_SUSET."),
 		&cluster_gcs_block_lost_write_action, CLUSTER_GCS_LOST_WRITE_ACTION_ERROR,
 		cluster_gcs_block_lost_write_action_options, PGC_SUSET, 0, NULL, NULL, NULL);
+
+	/*
+	 * PGRAC: spec-2.38 D8 — 3 NEW GUC for SI Broadcaster skeleton.
+	 */
+	DefineCustomIntVariable(
+		"cluster.sinval_broadcast_batch_size",
+		gettext_noop("Outbound sinval batch drain upper bound."),
+		gettext_noop("SI Broadcaster aux process drains up to this many entries "
+					 "from the outbound queue per main loop iteration.  Range "
+					 "1..64 (CLUSTER_SINVAL_BATCH_MAX).  HC138 wire ABI bound.  "
+					 "PGC_POSTMASTER."),
+		&cluster_sinval_broadcast_batch_size, 32, 1, 64, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable("cluster.sinval_broadcast_batch_timeout_ms",
+							gettext_noop("SI Broadcaster main loop WaitLatch timeout (ms)."),
+							gettext_noop("SI Broadcaster aux process wakes every N ms even if no "
+										 "latch is set, to flush partial batches and process "
+										 "overflow reset requests.  PGC_SIGHUP — aux process "
+										 "picks up new value on next loop iteration after reload.  "
+										 "HC136."),
+							&cluster_sinval_broadcast_batch_timeout_ms, 10, 1, 60000, PGC_SIGHUP, 0,
+							NULL, NULL, NULL);
+	DefineCustomIntVariable("cluster.sinval_broadcast_max_queue_size",
+							gettext_noop("Outbound + inbound queue ring buffer capacity."),
+							gettext_noop("Slot count of both ClusterSinvalOutbound and "
+										 "ClusterSinvalInbound ring buffers (shared cap).  "
+										 "Outbound full → cluster_sinval_enqueue_batch returns "
+										 "false (HC134 fail-closed → 53R94).  Inbound full → "
+										 "fail-safe SIResetAll() by aux process (HC134).  "
+										 "PGC_POSTMASTER."),
+							&cluster_sinval_broadcast_max_queue_size, 1024, 64, 65536,
+							PGC_POSTMASTER, 0, NULL, NULL, NULL);
 }

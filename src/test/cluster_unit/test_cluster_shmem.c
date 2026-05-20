@@ -353,6 +353,12 @@ void
 cluster_gcs_block_dedup_module_init(void)
 {}
 
+/* Spec-2.38 D2/D3 stub: cluster_init_shmem_module also calls
+ * cluster_sinval_module_init (cluster_sinval.c). */
+void
+cluster_sinval_module_init(void)
+{}
+
 
 /*
  * Spec-1.10.1 D1 F1 stub: cluster_init_shmem_module also calls

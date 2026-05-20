@@ -34,7 +34,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_ic_mock test_cluster_inject test_cluster_pgstat \
         test_cluster_debug test_cluster_shared_fs test_cluster_smgr \
         test_cluster_scn test_cluster_block_format test_cluster_itl_slot \
-        test_cluster_buffer_desc test_cluster_pcm_lock test_cluster_bufmgr_pcm_hook test_cluster_gcs_dispatch test_cluster_gcs_block test_cluster_gcs_block_retransmit test_cluster_gcs_block_2way test_cluster_gcs_block_3way test_cluster_gcs_block_lost_write \
+        test_cluster_buffer_desc test_cluster_pcm_lock test_cluster_bufmgr_pcm_hook test_cluster_gcs_dispatch test_cluster_gcs_block test_cluster_gcs_block_retransmit test_cluster_gcs_block_2way test_cluster_gcs_block_3way test_cluster_gcs_block_lost_write test_cluster_sinval \
         test_cluster_startup_phase test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_cssd test_cluster_qvotec test_cluster_voting_disk_io test_cluster_quorum_decision \
         test_cluster_xlog test_cluster_tt_slot test_cluster_undo_segment \
         test_cluster_epoch test_cluster_fence test_cluster_reconfig \
@@ -577,6 +577,21 @@ test_cluster_gcs_block_3way: test_cluster_gcs_block_3way.c unit_test.h \
 # 256, all 6 watermark helper prototypes linkable, 4 counter accessors,
 # GUC variable).  Header-only;  behavioral coverage in cluster_tap t/116.
 test_cluster_gcs_block_lost_write: test_cluster_gcs_block_lost_write.c unit_test.h \
+		$(CLUSTER_VERSION_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-2.38 D11/D12:  test_cluster_sinval verifies SI Broadcaster skeleton
+# compile-time invariants (msg_type 7,  CLUSTER_IC_PRODUCER_SINVAL_BCAST
+# producer mask,  SinvalBroadcastHeader sizeof 24B,  SharedInvalidation-
+# Message sizeof 16B PG ABI lock,  CLUSTER_SINVAL_BATCH_MAX 64,  all 6
+# helper prototypes linkable,  9 counter accessors,  SinvalBcastProcess
+# AuxProcType valid,  B_SINVAL_BCAST BackendType valid,  53R94 SQLSTATE
+# encodable,  5 NEW regression test contracts for HC132/HC133/HC134).
+# Header-only;  behavioral coverage in cluster_tap t/117.
+test_cluster_sinval: test_cluster_sinval.c unit_test.h \
 		$(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \

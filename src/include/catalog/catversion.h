@@ -454,7 +454,41 @@
  *   watermark 用于 negative TAP).
  * catversion bump for catalog tooling + wire ABI reserved 重解读 +
  * GrdEntry sizeof bump + reply status extension. */
-#define CATALOG_VERSION_NO 202605440
+/* spec-2.38 D7 (2026-05-20):  SI Broadcaster skeleton — 真激活
+ * PGRAC_IC_MSG_SINVAL=7 wire msg type + B_SINVAL_BCAST aux process +
+ * 3 wait events (all 占位至 spec-2.38 起 wire-up real).
+ * NEW SinvalBroadcastHeader 24B fixed prefix + variable-length
+ *   N × SharedInvalidationMessage (16B each, HC137 PG ABI 锁) tail;
+ *   envelope.payload_length = 24 + 16 * nmsgs.
+ * NEW 2 shmem regions:  ClusterSinvalOutbound + ClusterSinvalInbound
+ *   (ring buffer + LWLockPadded;  capacity = cluster.sinval_broadcast_
+ *   max_queue_size default 1024).
+ * NEW AuxProcType SinvalBcastProcess (HC139 producer mask /
+ *   AuxiliaryProcessMain dispatch;  postmaster Phase 4 spawn).
+ * NEW public API cluster_sinval_enqueue_batch() — only outbound entry
+ *   point;  returns bool (HC134 fail-closed,禁 silent drop).
+ * NEW IC handler cluster_sinval_handle_envelope — checksum L164 + epoch
+ *   HC100 + source_node HC135 三层校验 + nonblocking try-enqueue
+ *   (LWLockConditionalAcquire only) + SetLatch;  inbound full → set
+ *   inbound_overflow_reset_pending flag,SI Broadcaster aux proc 执行
+ *   SIResetAll() fail-safe.
+ * NEW HC132 outbound queue 独立(防 echo loop;唯一硬防线)+ HC133 IC
+ *   handler nonblocking 约束 + HC134 fail-closed/fail-safe + HC135
+ *   source_node 辅助 echo defense + HC136 main loop drain pattern +
+ *   HC137 SharedInvalidationMessage sizeof 锁 + HC138 wire ABI variable-
+ *   length tail + HC139 producer mask/AuxProcType 双注册.
+ * NEW 3 GUC:  cluster.sinval_broadcast_batch_size PGC_POSTMASTER 32
+ *   (1..CLUSTER_SINVAL_BATCH_MAX check hook) + cluster.sinval_broadcast_
+ *   batch_timeout_ms PGC_SIGHUP 10 + cluster.sinval_broadcast_max_queue_
+ *   size PGC_POSTMASTER 1024.
+ * NEW 1 SQLSTATE:  53R94 cluster_sinval_queue_full (caller of
+ *   cluster_sinval_enqueue_batch maps to this on false return).
+ * NEW dump_sinval category +9 counter rows.
+ * NEW 2 inject points (110→112):  cluster-sinval-broadcast-drop-send +
+ *   cluster-sinval-receive-skip-validate.
+ * catversion bump for catalog tooling + wire ABI msg_type 7 真激活 +
+ * 2 shmem regions + new aux process boundary. */
+#define CATALOG_VERSION_NO 202605450
 
 /* spec-2.16 D19 (2026-05-29):  GesRequestPayload + GesReplyPayload wire
  * payload structs (48B each + StaticAssertDecl);  ClusterGrdHolderId

@@ -96,6 +96,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_pcm_lock.h"	   /* PCM state-machine API + grd helpers */
 #include "cluster/cluster_gcs.h"		   /* GCS request protocol surface (spec-2.32 D8) */
 #include "cluster/cluster_gcs_block.h"	   /* GCS block-ship data plane (spec-2.33 D10) */
+#include "cluster/cluster_sinval.h"		   /* SI Broadcaster counter accessors (spec-2.38 D10) */
 #include "cluster/cluster_startup_phase.h" /* phase enum + accessors (stage 1.10) */
 #include "storage/bufpage.h"	   /* PG_PAGE_LAYOUT_VERSION, SizeOfPageHeaderData (stage 1.4) */
 #include "storage/buf_internals.h" /* BufferDesc layout (stage 1.6) */
@@ -1339,6 +1340,26 @@ dump_gcs(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_gcs_get_lost_write_detected_count()));
 	emit_row(rsinfo, "gcs", "lost_write_avoid_count",
 			 fmt_int64((int64)cluster_gcs_get_lost_write_avoid_count()));
+
+	/* PGRAC: spec-2.38 D10 — 9 NEW counter rows for SI Broadcaster. */
+	emit_row(rsinfo, "sinval", "broadcast_send_count",
+			 fmt_int64((int64)cluster_sinval_get_broadcast_send_count()));
+	emit_row(rsinfo, "sinval", "broadcast_receive_count",
+			 fmt_int64((int64)cluster_sinval_get_broadcast_receive_count()));
+	emit_row(rsinfo, "sinval", "inject_local_queue_count",
+			 fmt_int64((int64)cluster_sinval_get_inject_local_queue_count()));
+	emit_row(rsinfo, "sinval", "outbound_queue_full_count",
+			 fmt_int64((int64)cluster_sinval_get_outbound_queue_full_count()));
+	emit_row(rsinfo, "sinval", "inbound_queue_full_count",
+			 fmt_int64((int64)cluster_sinval_get_inbound_queue_full_count()));
+	emit_row(rsinfo, "sinval", "inbound_overflow_reset_count",
+			 fmt_int64((int64)cluster_sinval_get_inbound_overflow_reset_count()));
+	emit_row(rsinfo, "sinval", "validation_drop_count",
+			 fmt_int64((int64)cluster_sinval_get_validation_drop_count()));
+	emit_row(rsinfo, "sinval", "stale_epoch_drop_count",
+			 fmt_int64((int64)cluster_sinval_get_stale_epoch_drop_count()));
+	emit_row(rsinfo, "sinval", "echo_dropped_count",
+			 fmt_int64((int64)cluster_sinval_get_echo_dropped_count()));
 }
 
 #endif /* USE_PGRAC_CLUSTER */

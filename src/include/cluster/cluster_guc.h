@@ -561,5 +561,19 @@ extern int cluster_gcs_block_starvation_max_retries;
  */
 extern int cluster_gcs_block_lost_write_action;
 
+/*
+ * PGRAC: spec-2.38 D8 — 3 NEW GUC for SI Broadcaster skeleton.
+ *
+ *	cluster.sinval_broadcast_batch_size — outbound drain batch upper
+ *	  bound (default 32, range 1..CLUSTER_SINVAL_BATCH_MAX).
+ *	cluster.sinval_broadcast_batch_timeout_ms — main loop WaitLatch
+ *	  timeout (default 10);  PGC_SIGHUP only.
+ *	cluster.sinval_broadcast_max_queue_size — ring buffer capacity for
+ *	  both outbound + inbound queues (default 1024).
+ */
+extern int cluster_sinval_broadcast_batch_size;
+extern int cluster_sinval_broadcast_batch_timeout_ms;
+extern int cluster_sinval_broadcast_max_queue_size;
+
 
 #endif /* CLUSTER_GUC_H */

@@ -535,6 +535,53 @@ cluster_gcs_get_lost_write_avoid_count(void)
 	return 0;
 }
 
+/* spec-2.38 D10 stubs: 9 NEW SI Broadcaster counter accessors. */
+uint64
+cluster_sinval_get_broadcast_send_count(void)
+{
+	return 0;
+}
+uint64
+cluster_sinval_get_broadcast_receive_count(void)
+{
+	return 0;
+}
+uint64
+cluster_sinval_get_inject_local_queue_count(void)
+{
+	return 0;
+}
+uint64
+cluster_sinval_get_outbound_queue_full_count(void)
+{
+	return 0;
+}
+uint64
+cluster_sinval_get_inbound_queue_full_count(void)
+{
+	return 0;
+}
+uint64
+cluster_sinval_get_inbound_overflow_reset_count(void)
+{
+	return 0;
+}
+uint64
+cluster_sinval_get_validation_drop_count(void)
+{
+	return 0;
+}
+uint64
+cluster_sinval_get_stale_epoch_drop_count(void)
+{
+	return 0;
+}
+uint64
+cluster_sinval_get_echo_dropped_count(void)
+{
+	return 0;
+}
+
 Size
 cluster_shmem_get_total_bytes(void)
 {
