@@ -21,8 +21,10 @@
  *	    L3  GcsBlockRequestPayload field offsets (64B layout — Sprint A
  *	         SA-F1 PG-fact:  natural 8-aligned struct size, reserved_0[19]
  *	         absorbs the trailing pad to 64B)
- *	    L4  GcsBlockReplyHeader field offsets (48B layout)
- *	    L5  GcsBlockReplyStatus enum has exactly 7 values
+ *	    L4  GcsBlockReplyHeader field offsets (48B layout; spec-2.35
+ *	         reuses 4 bytes of the original reserved budget for
+ *	         forwarding_master_node_bytes)
+ *	    L5  GcsBlockReplyStatus enum values through spec-2.35
  *	    L6  sparse node_id topology — hash mod-N over declared array
  *	         {0,2,5} only returns those three node_ids (HC81 math)
  *	    L7  deterministic hash determinism — same tag returns same master
@@ -140,11 +142,12 @@ UT_TEST(test_gcs_block_reply_header_field_offsets)
 	UT_ASSERT_EQ((int)offsetof(GcsBlockReplyHeader, requester_backend_id), 32);
 	UT_ASSERT_EQ((int)offsetof(GcsBlockReplyHeader, transition_id), 36);
 	UT_ASSERT_EQ((int)offsetof(GcsBlockReplyHeader, status), 37);
-	UT_ASSERT_EQ((int)offsetof(GcsBlockReplyHeader, reserved_0), 38);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockReplyHeader, forwarding_master_node_bytes), 38);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockReplyHeader, reserved_0), 42);
 }
 
 
-UT_TEST(test_gcs_block_reply_status_enum_count_is_7)
+UT_TEST(test_gcs_block_reply_status_enum_values_through_spec_2_35)
 {
 	UT_ASSERT_EQ((int)GCS_BLOCK_REPLY_GRANTED, 0);
 	UT_ASSERT_EQ((int)GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK, 1);
@@ -153,6 +156,8 @@ UT_TEST(test_gcs_block_reply_status_enum_count_is_7)
 	UT_ASSERT_EQ((int)GCS_BLOCK_REPLY_DENIED_EPOCH_STALE, 4);
 	UT_ASSERT_EQ((int)GCS_BLOCK_REPLY_DENIED_CHECKSUM_FAIL, 5);
 	UT_ASSERT_EQ((int)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER, 6);
+	UT_ASSERT_EQ((int)GCS_BLOCK_REPLY_DENIED_DEDUP_FULL, 7);
+	UT_ASSERT_EQ((int)GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER, 8);
 }
 
 
@@ -246,13 +251,16 @@ UT_TEST(test_gcs_block_reserved_padding_present)
 	GcsBlockReplyHeader rep;
 
 	UT_ASSERT_EQ((int)sizeof(req.reserved_0), 19);
-	UT_ASSERT_EQ((int)sizeof(rep.reserved_0), 10);
+	UT_ASSERT_EQ((int)sizeof(rep.forwarding_master_node_bytes), 4);
+	UT_ASSERT_EQ((int)sizeof(rep.reserved_0), 6);
 	memset(&req, 0, sizeof(req));
 	memset(&rep, 0, sizeof(rep));
 	UT_ASSERT_EQ((int)req.reserved_0[0], 0);
 	UT_ASSERT_EQ((int)req.reserved_0[18], 0);
+	UT_ASSERT_EQ((int)rep.forwarding_master_node_bytes[0], 0);
+	UT_ASSERT_EQ((int)rep.forwarding_master_node_bytes[3], 0);
 	UT_ASSERT_EQ((int)rep.reserved_0[0], 0);
-	UT_ASSERT_EQ((int)rep.reserved_0[9], 0);
+	UT_ASSERT_EQ((int)rep.reserved_0[5], 0);
 }
 
 
@@ -287,7 +295,7 @@ main(void)
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
 	UT_RUN(test_gcs_block_reply_header_field_offsets);
-	UT_RUN(test_gcs_block_reply_status_enum_count_is_7);
+	UT_RUN(test_gcs_block_reply_status_enum_values_through_spec_2_35);
 	UT_RUN(test_gcs_block_sparse_hash_mod_n_distribution);
 	UT_RUN(test_gcs_block_hash_deterministic_same_tag_same_master);
 	UT_RUN(test_gcs_block_lwlock_tranche_distinct);
