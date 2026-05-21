@@ -5,14 +5,16 @@
 #	  spec-2.40 D7:  TAP helper — same-row UPDATE contention workload
 #	  for GES grant + Cache Fusion block forwarding acceptance testing.
 #
-#	  Forks N psql sessions (default 2) on node0 + node1 all racing to
-#	  UPDATE the same row in a small table.  Each cycle exercises:
+#	  start_load() records a counter snapshot and initializes the hot row.
+#	  stop_load() runs a bounded synchronous UPDATE burst alternating node0
+#	  and node1.  This avoids SafePsql background teardown races in TAP while
+#	  still exercising:
 #	    - GES grant/release contention (spec-2.13-2.17)
 #	    - CF block ship + invalidate ack (spec-2.33/2.35/2.36)
 #	    - PCM N→X / X→X transitions (spec-2.30)
 #
-#	  Counter delta snapshots assert: ges_grant + cf_block_forward +
-#	  invalidate_ack > 0 + final row state consistent (no lost update).
+#	  Medium/long perf scripts increase the iteration count for longer
+#	  samples; TAP smoke keeps it small to avoid runner flake.
 #
 #	  Usage:
 #	    my $cont = PostgreSQL::Test::PgracClusterContention->new($pair,
@@ -39,9 +41,10 @@ sub new
 	my ($class, $pair, %opts) = @_;
 	my $self = {
 		pair                  => $pair,
-		sessions              => $opts{sessions}              // 2,
-		statement_timeout_ms  => $opts{statement_timeout_ms}  // 5000,
-		table_name            => $opts{table_name}            // 'contention_row',
+			sessions              => $opts{sessions}              // 2,
+			iterations            => $opts{iterations}            // (($opts{sessions} // 2) * 5),
+			statement_timeout_ms  => $opts{statement_timeout_ms}  // 5000,
+			table_name            => $opts{table_name}            // 'contention_row',
 		pids                  => [],
 		start_time            => undef,
 		snap_before           => undef,
@@ -61,9 +64,9 @@ sub _snap_counters
 		  || '|' ||
 		  (SELECT coalesce(value, '0') FROM pg_cluster_state WHERE category='ges' AND key='reply_count')
 		  || '|' ||
-		  (SELECT coalesce(value, '0') FROM pg_cluster_state WHERE category='gcs' AND key='block_forward_count')
-		  || '|' ||
-		  (SELECT coalesce(value, '0') FROM pg_cluster_state WHERE category='gcs' AND key='block_invalidate_ack_count')
+			  (SELECT coalesce(value, '0') FROM pg_cluster_state WHERE category='gcs' AND key='block_forward_sent_count')
+			  || '|' ||
+			  (SELECT coalesce(value, '0') FROM pg_cluster_state WHERE category='gcs' AND key='block_invalidate_ack_received_count')
 	};
 	my $raw = $self->{pair}->node0->safe_psql('postgres', $sql);
 	my @parts = split /\|/, $raw;
@@ -88,11 +91,11 @@ sub start_load
 
 	$self->{start_time}  = time;
 	$self->{snap_before} = $self->_snap_counters;
-	# spec-2.40 D7 v0.2: synchronous in-process UPDATE burst instead of
-	# fork — avoids SafePsql 'death by signal' race when parent calls
-	# stop_load.  GES contention real-time triggering deferred to manual
-	# scripts/perf/run-stage2-cluster-baseline.sh tier=medium.
-	$self->{iter_target} = $self->{iter_target} // ($self->{sessions} * 5);
+		# spec-2.40 D7 v0.2: synchronous in-process UPDATE burst instead of
+		# fork — avoids SafePsql 'death by signal' race when parent calls
+		# stop_load.  GES contention real-time triggering deferred to manual
+		# scripts/perf/run-stage2-cluster-baseline.sh tier=medium.
+		$self->{iter_target} = $self->{iterations};
 	return 1;
 }
 

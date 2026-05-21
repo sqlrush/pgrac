@@ -32,6 +32,9 @@ use PostgreSQL::Test::ClusterPair;
 use Test::More;
 use Time::HiRes qw(sleep time);
 
+my $pgbench_seconds = $ENV{STAGE2_PGBENCH_SECONDS} // 10;
+my $workload_sleep_seconds = $ENV{STAGE2_WORKLOAD_SECONDS} // 5;
+my $workload_iterations = $ENV{STAGE2_WORKLOAD_ITERATIONS} // 5;
 
 # Helper: extract TPS from pgbench stdout.
 sub _pgbench_tps
@@ -62,16 +65,16 @@ $node_off->start;
 $node_off->run_log([ 'pgbench', '-i', '-s', '1', '-q',
 	'-p', $node_off->port, '-h', $node_off->host, 'postgres' ]);
 
-# L1 — pgbench TPC-B select-only 10s smoke
+# L1 — pgbench TPC-B select-only smoke
 my $sel_off_out;
-$node_off->run_log([ 'pgbench', '-S', '-c', '4', '-T', '10', '-n',
+$node_off->run_log([ 'pgbench', '-S', '-c', '4', '-T', "$pgbench_seconds", '-n',
 	'-p', $node_off->port, '-h', $node_off->host, 'postgres' ],
 	'>', \$sel_off_out);
 my $sel_off_tps = _pgbench_tps($sel_off_out);
 
-# L2 — pgbench TPC-B 完整 10s smoke
+# L2 — pgbench TPC-B 完整 smoke
 my $full_off_out;
-$node_off->run_log([ 'pgbench', '-c', '4', '-T', '10', '-n',
+$node_off->run_log([ 'pgbench', '-c', '4', '-T', "$pgbench_seconds", '-n',
 	'-p', $node_off->port, '-h', $node_off->host, 'postgres' ],
 	'>', \$full_off_out);
 my $full_off_tps = _pgbench_tps($full_off_out);
@@ -92,13 +95,13 @@ $node_on->run_log([ 'pgbench', '-i', '-s', '1', '-q',
 	'-p', $node_on->port, '-h', $node_on->host, 'postgres' ]);
 
 my $sel_on_out;
-$node_on->run_log([ 'pgbench', '-S', '-c', '4', '-T', '10', '-n',
+$node_on->run_log([ 'pgbench', '-S', '-c', '4', '-T', "$pgbench_seconds", '-n',
 	'-p', $node_on->port, '-h', $node_on->host, 'postgres' ],
 	'>', \$sel_on_out);
 my $sel_on_tps = _pgbench_tps($sel_on_out);
 
 my $full_on_out;
-$node_on->run_log([ 'pgbench', '-c', '4', '-T', '10', '-n',
+$node_on->run_log([ 'pgbench', '-c', '4', '-T', "$pgbench_seconds", '-n',
 	'-p', $node_on->port, '-h', $node_on->host, 'postgres' ],
 	'>', \$full_on_out);
 my $full_on_tps = _pgbench_tps($full_on_out);
@@ -152,18 +155,22 @@ sleep 3;
 
 # L3 DDL loop helper smoke
 require PostgreSQL::Test::PgracClusterDdlLoop;
-my $loop = PostgreSQL::Test::PgracClusterDdlLoop->new($pair, table_prefix => 'l3_ddl');
+my $loop = PostgreSQL::Test::PgracClusterDdlLoop->new($pair,
+	table_prefix => 'l3_ddl',
+	iterations   => $workload_iterations);
 $loop->start_loop;
-sleep 5;
+sleep $workload_sleep_seconds;
 my $loop_metrics = $loop->stop_loop;
-cmp_ok($loop_metrics->{broadcast_send_delta}, '>=', 0,
+cmp_ok($loop_metrics->{broadcast_send_delta}, '>', 0,
 	"L3 DDL loop helper produces sinval broadcast_send delta ($loop_metrics->{broadcast_send_delta})");
 
 # L4 contention helper smoke
 require PostgreSQL::Test::PgracClusterContention;
-my $cont = PostgreSQL::Test::PgracClusterContention->new($pair, sessions => 2);
+my $cont = PostgreSQL::Test::PgracClusterContention->new($pair,
+	sessions   => 2,
+	iterations => $workload_iterations);
 $cont->start_load;
-sleep 5;
+sleep $workload_sleep_seconds;
 my $cont_metrics = $cont->stop_load;
 ok(defined($cont_metrics->{ges_request_delta}),
 	"L4 contention helper exits cleanly + GES request delta readable");
@@ -174,18 +181,18 @@ ok(defined($cont_metrics->{ges_request_delta}),
 require PostgreSQL::Test::Stage2AcceptanceReport;
 my $report = PostgreSQL::Test::Stage2AcceptanceReport->new(
 	tag => $ENV{STAGE2_TAG} // 'unknown');
-$report->record_perf_workload('pgbench-select-only-10s',
+$report->record_perf_workload("pgbench-select-only-${pgbench_seconds}s",
 	single_node_off => { tps => $sel_off_tps },
 	single_node_on  => { tps => $sel_on_tps },
-	gate            => 'hard ≤ 10%');
-$report->record_perf_workload('pgbench-full-10s',
+	gate            => 'warning ≤ 10%; sanity floor ≤ 60%');
+$report->record_perf_workload("pgbench-full-${pgbench_seconds}s",
 	single_node_off => { tps => $full_off_tps },
 	single_node_on  => { tps => $full_on_tps },
-	gate            => 'hard ≤ 15%');
-$report->record_perf_workload('ddl-loop-5s',
+	gate            => 'warning ≤ 15%; sanity floor ≤ 70%');
+$report->record_perf_workload("ddl-loop-${workload_sleep_seconds}s",
 	two_node => { sinval_broadcast_delta => $loop_metrics->{broadcast_send_delta} },
-	gate     => 'warning + counter delta readable');
-$report->record_perf_workload('contention-5s',
+	gate     => 'hard: broadcast_send_delta > 0');
+$report->record_perf_workload("contention-${workload_sleep_seconds}s",
 	two_node => { ges_request_delta => $cont_metrics->{ges_request_delta} },
 	gate     => 'warning + counter delta readable');
 

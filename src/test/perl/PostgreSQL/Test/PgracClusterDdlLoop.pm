@@ -2,20 +2,21 @@
 #
 # PostgreSQL::Test::PgracClusterDdlLoop
 #
-#	  spec-2.40 D6:  TAP helper — background DDL workload generator for
+#	  spec-2.40 D6:  TAP helper — bounded DDL workload generator for
 #	  cluster sinval propagation acceptance testing.
 #
-#	  Forks a background psql session that loops CREATE / DROP / ALTER
-#	  table at ~10 Hz (every 100ms).  Each cycle exercises the spec-2.39
-#	  DDL commit hook path → cluster_sinval_enqueue_and_wait_ack →
-#	  peer_enqueued ack/barrier.  Counter delta snapshots before/after
-#	  let the caller assert sinval_outbound_count / ack_received_count /
-#	  reset_all_broadcast_pending triggered.
+#	  The helper records a counter snapshot in start_loop(), then runs a
+#	  bounded synchronous CREATE / ALTER / DROP burst in stop_loop().  This
+#	  avoids the SafePsql "death by signal" race from background child
+#	  teardown while still exercising the spec-2.39 DDL commit hook path →
+#	  cluster_sinval_enqueue_and_wait_ack → peer_enqueued ack/barrier.
+#	  Medium/long scripts increase the iteration count instead of relying on
+#	  wallclock sleeps.
 #
 #	  Usage:
 #	    my $loop = PostgreSQL::Test::PgracClusterDdlLoop->new($pair, table_prefix => 'ddlloop');
 #	    $loop->start_loop;
-#	    sleep 30;
+#	    sleep 1; # optional; work is performed by stop_loop()
 #	    my $metrics = $loop->stop_loop;
 #	    # $metrics->{ddl_count}, ->{sinval_outbound_delta}, ->{ack_received_delta}
 #
@@ -37,11 +38,12 @@ sub new
 	my ($class, $pair, %opts) = @_;
 	my $self = {
 		pair         => $pair,
-		table_prefix => $opts{table_prefix} // 'ddlloop',
-		interval_ms  => $opts{interval_ms}  // 100,
-		pid          => undef,
-		start_time   => undef,
-		snap_before  => undef,
+			table_prefix => $opts{table_prefix} // 'ddlloop',
+			interval_ms  => $opts{interval_ms}  // 100,
+			iterations    => $opts{iterations}    // 5,
+			pid          => undef,
+			start_time   => undef,
+			snap_before  => undef,
 	};
 	return bless $self, $class;
 }
@@ -77,12 +79,12 @@ sub start_loop
 	my ($self) = @_;
 	$self->{start_time}  = time;
 	$self->{snap_before} = $self->_snap_counters;
-	# spec-2.40 D6 v0.2: synchronous in-process DDL burst instead of fork
-	# to avoid SafePsql 'death by signal' race when the parent stops the
-	# helper.  Caller invokes start_loop + sleep + stop_loop;  实际 DDL
-	# 在 stop_loop 触发后再批量跑(简化 race);  metric delta semantics
-	# 不变(counter 是 cluster shmem,与 in-process / out-of-process 无关).
-	$self->{iter_target} = $self->{iter_target} // 5;
+		# spec-2.40 D6 v0.2: synchronous in-process DDL burst instead of fork
+		# to avoid SafePsql 'death by signal' race when the parent stops the
+		# helper.  Caller invokes start_loop + sleep + stop_loop;  实际 DDL
+		# 在 stop_loop 触发后再批量跑(简化 race);  metric delta semantics
+		# 不变(counter 是 cluster shmem,与 in-process / out-of-process 无关).
+		$self->{iter_target} = $self->{iterations};
 	return 1;
 }
 

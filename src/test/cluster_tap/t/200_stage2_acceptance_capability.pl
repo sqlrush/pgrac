@@ -68,6 +68,9 @@ sleep 1;
 my $bcast_after = cnt($pair->node0, 'sinval', 'broadcast_send_count');
 cmp_ok($bcast_after, '>', $bcast_before,
 	"L1a DDL mechanism: sinval broadcast_send_count incremented ($bcast_before → $bcast_after)");
+my $ack_after = cnt($pair->node0, 'sinval', 'ack_received_count');
+cmp_ok($ack_after, '>=', $ack_before,
+	"L1a DDL mechanism: ack_received_count stable/incremented ($ack_before → $ack_after)");
 
 # L1b best-effort: try to observe cross-node visibility within 5s.
 my $node1_sees = 0;
@@ -100,7 +103,8 @@ cmp_ok($fwd_field_present, '>=', 1,
 # ============================================================
 my $lw_check = $pair->node0->safe_psql('postgres',
 	q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs' AND key LIKE 'pi_watermark%'});
-ok($lw_check >= 0, "L4 PI watermark counter category present (gcs.pi_watermark*)");
+cmp_ok($lw_check, '>=', 1,
+	"L4 PI watermark counter category present (gcs.pi_watermark*)");
 
 # ============================================================
 # L5 — SCN monotone cross-node smoke
@@ -108,6 +112,13 @@ ok($lw_check >= 0, "L4 PI watermark counter category present (gcs.pi_watermark*)
 my $scn_check = $pair->node0->safe_psql('postgres',
 	q{SELECT count(*) FROM pg_cluster_state WHERE category='scn'});
 cmp_ok($scn_check, '>=', 1, "L5 SCN category exposed in pg_cluster_state");
+my $scn0 = $pair->node0->safe_psql('postgres', 'SELECT cluster_scn_advance()');
+$pair->node1->safe_psql('postgres', "SELECT cluster_scn_observe($scn0)");
+my $scn1_local = $pair->node1->safe_psql('postgres',
+	q{SELECT value::bigint FROM pg_cluster_state
+	  WHERE category='scn' AND key='scn_current_local'});
+cmp_ok($scn1_local, '>', 0,
+	"L5 SCN observe path bumps/keeps node1 local SCN after observing node0 SCN");
 
 # ============================================================
 # L6 — GES grant contention smoke (counter readable)
@@ -119,12 +130,9 @@ cmp_ok($ges_check, '>=', 1, "L6 GES category exposed in pg_cluster_state");
 # ============================================================
 # L8 — fence freeze + thaw mechanism (53R50 SQLSTATE encodable)
 # ============================================================
-my ($sout, $serr);
-$pair->node0->psql('postgres',
-	q{\set VERBOSITY verbose
-	  DO $$ BEGIN RAISE WARNING SQLSTATE '53R50' USING MESSAGE='L8 fence test'; END $$;},
-	stdout => \$sout, stderr => \$serr);
-like($serr, qr/53R50|fence test/, 'L8 fence-lite SQLSTATE 53R50 encodable (verbose 或 message match)');
+my $fence_rows = $pair->node0->safe_psql('postgres',
+	q{SELECT count(*) FROM pg_cluster_fence_state});
+is($fence_rows, '1', 'L8 fence-lite state SRF returns one row');
 
 # ============================================================
 # L9 — CSSD heartbeat alive/dead snapshot
@@ -138,7 +146,7 @@ cmp_ok($cssd_ok, '>=', 1, "L9 CSSD heartbeat category exposed");
 # ============================================================
 my $retx = $pair->node0->safe_psql('postgres',
 	q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs' AND key LIKE '%retransmit%'});
-ok($retx >= 0, "L11 retransmit counter readable in gcs category");
+cmp_ok($retx, '>=', 1, "L11 retransmit counter readable in gcs category");
 
 # ============================================================
 # L12 — sinval ack/barrier 6-counter delta
@@ -162,6 +170,7 @@ ok($all_present, "L12 6 sinval ack/barrier counters all exposed in pg_cluster_st
 # ============================================================
 # L13 — RESET-all wire fallback (53R94 SQLSTATE + counter)
 # ============================================================
+my ($sout, $serr);
 $pair->node0->psql('postgres',
 	q{\set VERBOSITY verbose
 	  DO $$ BEGIN RAISE WARNING SQLSTATE '53R94' USING MESSAGE='L13 reset-all test'; END $$;},
@@ -192,8 +201,10 @@ cmp_ok($inv_check, '>=', 1, "L3 CF 3-way invalidate counter readable (3-node)");
 
 # L7 — reconfig category exposed (smoke;真 epoch bump under load 推 t/201 F1)
 my $rec_check = $triple->node0->safe_psql('postgres',
-	q{SELECT count(*) FROM pg_cluster_state WHERE category='cluster_cssd' AND key LIKE '%reconfig%' OR category='conf'});
-ok($rec_check >= 0, "L7 reconfig surface readable (3-node)");
+	q{SELECT count(*) FROM pg_cluster_state
+	  WHERE (category='cluster_cssd' AND key LIKE '%reconfig%')
+	     OR category='conf'});
+cmp_ok($rec_check, '>=', 1, "L7 reconfig/conf surface readable (3-node)");
 
 # L10 — voting disk quorum:  all 3 nodes report ALIVE state
 for my $n (0 .. 2) {
