@@ -489,7 +489,33 @@
  *   cluster-sinval-receive-skip-validate.
  * catversion bump for catalog tooling + wire ABI msg_type 7 真激活 +
  * 2 shmem regions + new aux process boundary. */
-#define CATALOG_VERSION_NO 202605450
+#define CATALOG_VERSION_NO 202605460
+
+/* spec-2.39 D10 (2026-05-21):  SI Broadcaster production activation —
+ * DDL commit hook (AtEOXact_Inval + COMMIT PREPARED via cluster-aware
+ * wrapper) + peer_enqueued ack/barrier (3-status enum DONE/DROPPED/
+ * RESET_PENDING) + fanout 3-partial-fail counter + RESET-all broadcast
+ * fail-safe (v0.3 P1 SINVAL_RESET_ALL_BROADCAST flag走 msg_type 7 复用).
+ * NEW IC msg_type 19 SINVAL_ACK (HC140 LMON-only producer mask;
+ * SinvalAckHeader 24B fixed).
+ * NEW 2 shmem regions:  ClusterSinvalAckWait (HTAB capacity GUC) +
+ *   ClusterSinvalAckOutbound (small ring).
+ * NEW 3 GUC:  cluster.sinval_ack_mode (enum none/peer_enqueued PGC_
+ *   SIGHUP default peer_enqueued) + cluster.sinval_ack_timeout_ms (int
+ *   PGC_SIGHUP 5000 [100, 60000]) + cluster.sinval_ack_wait_slots (int
+ *   PGC_POSTMASTER 256 [64, 4096]).
+ * NEW 1 SQLSTATE:  53R95 cluster_sinval_ack_timeout (WARN-path).
+ * NEW 3 wait events:  SinvalAckWait / SinvalAckSend / SinvalAckReceive.
+ * NEW 6 counter (3 fanout would_block/hard_error/peer_down + 3 ack
+ *   received/timeout/orphan);  dump_sinval category 9 → 15 rows.
+ * NEW 2 inject points (112→114):  cluster-sinval-ack-drop-send +
+ *   cluster-sinval-ack-skip-validate.
+ * v0.3 P1 wire ABI extension:  SINVAL_RESET_ALL_BROADCAST flag in
+ *   existing msg_type 7 SinvalBroadcastHeader.flags (nmsgs=0 sentinel
+ *   batch);remote handler 见此 flag → SIResetAll + bump existing
+ *   inbound_overflow_reset_count (spec-2.38).  SINVAL_KNOWN_FLAGS
+ *   扩 2 bits;HC135 validation refit.
+ * catversion bump for catalog tooling + dump_sinval row count change. */
 
 /* spec-2.16 D19 (2026-05-29):  GesRequestPayload + GesReplyPayload wire
  * payload structs (48B each + StaticAssertDecl);  ClusterGrdHolderId

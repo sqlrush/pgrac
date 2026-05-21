@@ -376,6 +376,14 @@ void
 cluster_sinval_drain_outbound_and_broadcast(void)
 {}
 
+/* spec-2.39 D5 + D7:  LMON-mediated ack drain + RESET-all broadcast. */
+void
+cluster_sinval_drain_ack_outbound_and_send(void)
+{}
+void
+cluster_sinval_broadcast_reset_all(void)
+{}
+
 /* spec-2.2 D5 LMON drive references cluster_conf_lookup_node + cluster_node_id. */
 const struct ClusterNodeInfo *
 cluster_conf_lookup_node(int32 node_id pg_attribute_unused())

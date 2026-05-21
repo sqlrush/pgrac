@@ -132,6 +132,51 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * PGRAC MODIFICATIONS — spec-2.39 D1 — DDL commit hook for cluster sinval
+ * propagation.
+ *
+ * Modified by: SqlRush <sqlrush@gmail.com>
+ *
+ * What changed:
+ *	  In AtEOXact_Inval(true) the SendSharedInvalidMessages callback passed
+ *	  to ProcessInvalidationMessagesMulti is wrapped by
+ *	  cluster_aware_send_shared_invalid_messages.  The wrapper invokes the
+ *	  PG-native SendSharedInvalidMessages first (preserves local SI
+ *	  semantics) and then cluster_sinval_enqueue_and_wait_ack to propagate
+ *	  the same batch cluster-wide (peer_enqueued ack/barrier).
+ *
+ * Why:
+ *	  Without this hook, DDL committed on one cluster node leaves
+ *	  catalog/relcache state stale on all other nodes — silent correctness
+ *	  failure for any cross-node read or planner reuse.  See
+ *	  pgrac specs/spec-2.39-sinval-ddl-commit-hook-ack-barrier.md (FROZEN
+ *	  v0.3) Q1 ★ A + Hardening v1.0.1 L172 (LMON-mediated outbound).
+ *
+ *	  COMMIT PREPARED path in twophase.c receives the same wrapper
+ *	  treatment (separate PGRAC MODIFICATIONS block in that file).
+ *
+ *	  Inbound apply path in cluster_sinval_bcast.c MUST continue to call
+ *	  SendSharedInvalidMessages directly (NOT the wrapper) to avoid
+ *	  re-broadcast echo loop (HC132).
+ */
+#include "cluster/cluster_sinval.h"
+#include "cluster/cluster_guc.h"
+
+static void
+cluster_aware_send_shared_invalid_messages(const SharedInvalidationMessage *msgs, int n)
+{
+	/* Always apply locally first (PG-native semantics unchanged). */
+	SendSharedInvalidMessages(msgs, n);
+
+	/* Cluster propagation — only when cluster_enabled and we actually have
+	 * messages.  enqueue_and_wait_ack handles GUC ack_mode=none fast path. */
+	if (cluster_enabled && n > 0)
+		(void)cluster_sinval_enqueue_and_wait_ack(msgs, n);
+}
+#endif
+
 
 /*
  * Pending requests are stored as ready-to-send SharedInvalidationMessages.
@@ -171,41 +216,37 @@
 #define RelCacheMsgs 1
 
 /* Pointers to main arrays in TopTransactionContext */
-typedef struct InvalMessageArray
-{
-	SharedInvalidationMessage *msgs;	/* palloc'd array (can be expanded) */
-	int			maxmsgs;		/* current allocated size of array */
+typedef struct InvalMessageArray {
+	SharedInvalidationMessage *msgs; /* palloc'd array (can be expanded) */
+	int maxmsgs;					 /* current allocated size of array */
 } InvalMessageArray;
 
 static InvalMessageArray InvalMessageArrays[2];
 
 /* Control information for one logical group of messages */
-typedef struct InvalidationMsgsGroup
-{
-	int			firstmsg[2];	/* first index in relevant array */
-	int			nextmsg[2];		/* last+1 index */
+typedef struct InvalidationMsgsGroup {
+	int firstmsg[2]; /* first index in relevant array */
+	int nextmsg[2];	 /* last+1 index */
 } InvalidationMsgsGroup;
 
 /* Macros to help preserve InvalidationMsgsGroup abstraction */
-#define SetSubGroupToFollow(targetgroup, priorgroup, subgroup) \
-	do { \
-		(targetgroup)->firstmsg[subgroup] = \
-			(targetgroup)->nextmsg[subgroup] = \
-			(priorgroup)->nextmsg[subgroup]; \
+#define SetSubGroupToFollow(targetgroup, priorgroup, subgroup)                                     \
+	do {                                                                                           \
+		(targetgroup)->firstmsg[subgroup] = (targetgroup)->nextmsg[subgroup]                       \
+			= (priorgroup)->nextmsg[subgroup];                                                     \
 	} while (0)
 
-#define SetGroupToFollow(targetgroup, priorgroup) \
-	do { \
-		SetSubGroupToFollow(targetgroup, priorgroup, CatCacheMsgs); \
-		SetSubGroupToFollow(targetgroup, priorgroup, RelCacheMsgs); \
+#define SetGroupToFollow(targetgroup, priorgroup)                                                  \
+	do {                                                                                           \
+		SetSubGroupToFollow(targetgroup, priorgroup, CatCacheMsgs);                                \
+		SetSubGroupToFollow(targetgroup, priorgroup, RelCacheMsgs);                                \
 	} while (0)
 
-#define NumMessagesInSubGroup(group, subgroup) \
+#define NumMessagesInSubGroup(group, subgroup)                                                     \
 	((group)->nextmsg[subgroup] - (group)->firstmsg[subgroup])
 
-#define NumMessagesInGroup(group) \
-	(NumMessagesInSubGroup(group, CatCacheMsgs) + \
-	 NumMessagesInSubGroup(group, RelCacheMsgs))
+#define NumMessagesInGroup(group)                                                                  \
+	(NumMessagesInSubGroup(group, CatCacheMsgs) + NumMessagesInSubGroup(group, RelCacheMsgs))
 
 
 /*----------------
@@ -226,18 +267,16 @@ typedef struct InvalidationMsgsGroup
  */
 
 /* fields common to both transactional and inplace invalidation */
-typedef struct InvalidationInfo
-{
+typedef struct InvalidationInfo {
 	/* Events emitted by current command */
 	InvalidationMsgsGroup CurrentCmdInvalidMsgs;
 
 	/* init file must be invalidated? */
-	bool		RelcacheInitFileInval;
+	bool RelcacheInitFileInval;
 } InvalidationInfo;
 
 /* subclass adding fields specific to transactional invalidation */
-typedef struct TransInvalidationInfo
-{
+typedef struct TransInvalidationInfo {
 	/* Base class */
 	struct InvalidationInfo ii;
 
@@ -248,7 +287,7 @@ typedef struct TransInvalidationInfo
 	struct TransInvalidationInfo *parent;
 
 	/* Subtransaction nesting depth */
-	int			my_level;
+	int my_level;
 } TransInvalidationInfo;
 
 static TransInvalidationInfo *transInvalInfo = NULL;
@@ -256,7 +295,7 @@ static TransInvalidationInfo *transInvalInfo = NULL;
 static InvalidationInfo *inplaceInvalInfo = NULL;
 
 /* GUC storage */
-int			debug_discard_caches = 0;
+int debug_discard_caches = 0;
 
 /*
  * Dynamically-registered callback functions.  Current implementation
@@ -271,25 +310,23 @@ int			debug_discard_caches = 0;
 #define MAX_SYSCACHE_CALLBACKS 64
 #define MAX_RELCACHE_CALLBACKS 10
 
-static struct SYSCACHECALLBACK
-{
-	int16		id;				/* cache number */
-	int16		link;			/* next callback index+1 for same cache */
+static struct SYSCACHECALLBACK {
+	int16 id;	/* cache number */
+	int16 link; /* next callback index+1 for same cache */
 	SyscacheCallbackFunction function;
-	Datum		arg;
-}			syscache_callback_list[MAX_SYSCACHE_CALLBACKS];
+	Datum arg;
+} syscache_callback_list[MAX_SYSCACHE_CALLBACKS];
 
 static int16 syscache_callback_links[SysCacheSize];
 
-static int	syscache_callback_count = 0;
+static int syscache_callback_count = 0;
 
-static struct RELCACHECALLBACK
-{
+static struct RELCACHECALLBACK {
 	RelcacheCallbackFunction function;
-	Datum		arg;
-}			relcache_callback_list[MAX_RELCACHE_CALLBACKS];
+	Datum arg;
+} relcache_callback_list[MAX_RELCACHE_CALLBACKS];
 
-static int	relcache_callback_count = 0;
+static int relcache_callback_count = 0;
 
 /* ----------------------------------------------------------------
  *				Invalidation subgroup support functions
@@ -310,29 +347,23 @@ AddInvalidationMessage(InvalidationMsgsGroup *group, int subgroup,
 					   const SharedInvalidationMessage *msg)
 {
 	InvalMessageArray *ima = &InvalMessageArrays[subgroup];
-	int			nextindex = group->nextmsg[subgroup];
+	int nextindex = group->nextmsg[subgroup];
 
-	if (nextindex >= ima->maxmsgs)
-	{
-		if (ima->msgs == NULL)
-		{
+	if (nextindex >= ima->maxmsgs) {
+		if (ima->msgs == NULL) {
 			/* Create new storage array in TopTransactionContext */
-			int			reqsize = 32;	/* arbitrary */
+			int reqsize = 32; /* arbitrary */
 
-			ima->msgs = (SharedInvalidationMessage *)
-				MemoryContextAlloc(TopTransactionContext,
-								   reqsize * sizeof(SharedInvalidationMessage));
+			ima->msgs = (SharedInvalidationMessage *)MemoryContextAlloc(
+				TopTransactionContext, reqsize * sizeof(SharedInvalidationMessage));
 			ima->maxmsgs = reqsize;
 			Assert(nextindex == 0);
-		}
-		else
-		{
+		} else {
 			/* Enlarge storage array */
-			int			reqsize = 2 * ima->maxmsgs;
+			int reqsize = 2 * ima->maxmsgs;
 
-			ima->msgs = (SharedInvalidationMessage *)
-				repalloc(ima->msgs,
-						 reqsize * sizeof(SharedInvalidationMessage));
+			ima->msgs = (SharedInvalidationMessage *)repalloc(
+				ima->msgs, reqsize * sizeof(SharedInvalidationMessage));
 			ima->maxmsgs = reqsize;
 		}
 	}
@@ -346,8 +377,7 @@ AddInvalidationMessage(InvalidationMsgsGroup *group, int subgroup,
  * the source subgroup to empty.
  */
 static void
-AppendInvalidationMessageSubGroup(InvalidationMsgsGroup *dest,
-								  InvalidationMsgsGroup *src,
+AppendInvalidationMessageSubGroup(InvalidationMsgsGroup *dest, InvalidationMsgsGroup *src,
 								  int subgroup)
 {
 	/* Messages must be adjacent in main array */
@@ -370,16 +400,14 @@ AppendInvalidationMessageSubGroup(InvalidationMsgsGroup *dest,
  * This is a macro that executes the given code fragment for each message in
  * a message subgroup.  The fragment should refer to the message as *msg.
  */
-#define ProcessMessageSubGroup(group, subgroup, codeFragment) \
-	do { \
-		int		_msgindex = (group)->firstmsg[subgroup]; \
-		int		_endmsg = (group)->nextmsg[subgroup]; \
-		for (; _msgindex < _endmsg; _msgindex++) \
-		{ \
-			SharedInvalidationMessage *msg = \
-				&InvalMessageArrays[subgroup].msgs[_msgindex]; \
-			codeFragment; \
-		} \
+#define ProcessMessageSubGroup(group, subgroup, codeFragment)                                      \
+	do {                                                                                           \
+		int _msgindex = (group)->firstmsg[subgroup];                                               \
+		int _endmsg = (group)->nextmsg[subgroup];                                                  \
+		for (; _msgindex < _endmsg; _msgindex++) {                                                 \
+			SharedInvalidationMessage *msg = &InvalMessageArrays[subgroup].msgs[_msgindex];        \
+			codeFragment;                                                                          \
+		}                                                                                          \
 	} while (0)
 
 /*
@@ -388,14 +416,14 @@ AppendInvalidationMessageSubGroup(InvalidationMsgsGroup *dest,
  * As above, but the code fragment can handle an array of messages.
  * The fragment should refer to the messages as msgs[], with n entries.
  */
-#define ProcessMessageSubGroupMulti(group, subgroup, codeFragment) \
-	do { \
-		int		n = NumMessagesInSubGroup(group, subgroup); \
-		if (n > 0) { \
-			SharedInvalidationMessage *msgs = \
-				&InvalMessageArrays[subgroup].msgs[(group)->firstmsg[subgroup]]; \
-			codeFragment; \
-		} \
+#define ProcessMessageSubGroupMulti(group, subgroup, codeFragment)                                 \
+	do {                                                                                           \
+		int n = NumMessagesInSubGroup(group, subgroup);                                            \
+		if (n > 0) {                                                                               \
+			SharedInvalidationMessage *msgs                                                        \
+				= &InvalMessageArrays[subgroup].msgs[(group)->firstmsg[subgroup]];                 \
+			codeFragment;                                                                          \
+		}                                                                                          \
 	} while (0)
 
 
@@ -411,13 +439,12 @@ AppendInvalidationMessageSubGroup(InvalidationMsgsGroup *dest,
  * Add a catcache inval entry
  */
 static void
-AddCatcacheInvalidationMessage(InvalidationMsgsGroup *group,
-							   int id, uint32 hashValue, Oid dbId)
+AddCatcacheInvalidationMessage(InvalidationMsgsGroup *group, int id, uint32 hashValue, Oid dbId)
 {
 	SharedInvalidationMessage msg;
 
 	Assert(id < CHAR_MAX);
-	msg.cc.id = (int8) id;
+	msg.cc.id = (int8)id;
 	msg.cc.dbId = dbId;
 	msg.cc.hashValue = hashValue;
 
@@ -439,8 +466,7 @@ AddCatcacheInvalidationMessage(InvalidationMsgsGroup *group,
  * Add a whole-catalog inval entry
  */
 static void
-AddCatalogInvalidationMessage(InvalidationMsgsGroup *group,
-							  Oid dbId, Oid catId)
+AddCatalogInvalidationMessage(InvalidationMsgsGroup *group, Oid dbId, Oid catId)
 {
 	SharedInvalidationMessage msg;
 
@@ -457,8 +483,7 @@ AddCatalogInvalidationMessage(InvalidationMsgsGroup *group,
  * Add a relcache inval entry
  */
 static void
-AddRelcacheInvalidationMessage(InvalidationMsgsGroup *group,
-							   Oid dbId, Oid relId)
+AddRelcacheInvalidationMessage(InvalidationMsgsGroup *group, Oid dbId, Oid relId)
 {
 	SharedInvalidationMessage msg;
 
@@ -468,10 +493,8 @@ AddRelcacheInvalidationMessage(InvalidationMsgsGroup *group,
 	 * don't need to add individual ones when it is present.
 	 */
 	ProcessMessageSubGroup(group, RelCacheMsgs,
-						   if (msg->rc.id == SHAREDINVALRELCACHE_ID &&
-							   (msg->rc.relId == relId ||
-								msg->rc.relId == InvalidOid))
-						   return);
+						   if (msg->rc.id == SHAREDINVALRELCACHE_ID
+							   && (msg->rc.relId == relId || msg->rc.relId == InvalidOid)) return);
 
 	/* OK, add the item */
 	msg.rc.id = SHAREDINVALRELCACHE_ID;
@@ -489,17 +512,15 @@ AddRelcacheInvalidationMessage(InvalidationMsgsGroup *group,
  * We put these into the relcache subgroup for simplicity.
  */
 static void
-AddSnapshotInvalidationMessage(InvalidationMsgsGroup *group,
-							   Oid dbId, Oid relId)
+AddSnapshotInvalidationMessage(InvalidationMsgsGroup *group, Oid dbId, Oid relId)
 {
 	SharedInvalidationMessage msg;
 
 	/* Don't add a duplicate item */
 	/* We assume dbId need not be checked because it will never change */
-	ProcessMessageSubGroup(group, RelCacheMsgs,
-						   if (msg->sn.id == SHAREDINVALSNAPSHOT_ID &&
-							   msg->sn.relId == relId)
-						   return);
+	ProcessMessageSubGroup(
+		group, RelCacheMsgs,
+		if (msg->sn.id == SHAREDINVALSNAPSHOT_ID && msg->sn.relId == relId) return);
 
 	/* OK, add the item */
 	msg.sn.id = SHAREDINVALSNAPSHOT_ID;
@@ -516,8 +537,7 @@ AddSnapshotInvalidationMessage(InvalidationMsgsGroup *group,
  * the source group to empty.
  */
 static void
-AppendInvalidationMessages(InvalidationMsgsGroup *dest,
-						   InvalidationMsgsGroup *src)
+AppendInvalidationMessages(InvalidationMsgsGroup *dest, InvalidationMsgsGroup *src)
 {
 	AppendInvalidationMessageSubGroup(dest, src, CatCacheMsgs);
 	AppendInvalidationMessageSubGroup(dest, src, RelCacheMsgs);
@@ -531,7 +551,7 @@ AppendInvalidationMessages(InvalidationMsgsGroup *dest,
  */
 static void
 ProcessInvalidationMessages(InvalidationMsgsGroup *group,
-							void (*func) (SharedInvalidationMessage *msg))
+							void (*func)(SharedInvalidationMessage *msg))
 {
 	ProcessMessageSubGroup(group, CatCacheMsgs, func(msg));
 	ProcessMessageSubGroup(group, RelCacheMsgs, func(msg));
@@ -543,7 +563,7 @@ ProcessInvalidationMessages(InvalidationMsgsGroup *group,
  */
 static void
 ProcessInvalidationMessagesMulti(InvalidationMsgsGroup *group,
-								 void (*func) (const SharedInvalidationMessage *msgs, int n))
+								 void (*func)(const SharedInvalidationMessage *msgs, int n))
 {
 	ProcessMessageSubGroupMulti(group, CatCacheMsgs, func(msgs, n));
 	ProcessMessageSubGroupMulti(group, RelCacheMsgs, func(msgs, n));
@@ -560,15 +580,11 @@ ProcessInvalidationMessagesMulti(InvalidationMsgsGroup *group,
  * Register an invalidation event for a catcache tuple entry.
  */
 static void
-RegisterCatcacheInvalidation(int cacheId,
-							 uint32 hashValue,
-							 Oid dbId,
-							 void *context)
+RegisterCatcacheInvalidation(int cacheId, uint32 hashValue, Oid dbId, void *context)
 {
-	InvalidationInfo *info = (InvalidationInfo *) context;
+	InvalidationInfo *info = (InvalidationInfo *)context;
 
-	AddCatcacheInvalidationMessage(&info->CurrentCmdInvalidMsgs,
-								   cacheId, hashValue, dbId);
+	AddCatcacheInvalidationMessage(&info->CurrentCmdInvalidMsgs, cacheId, hashValue, dbId);
 }
 
 /*
@@ -598,7 +614,7 @@ RegisterRelcacheInvalidation(InvalidationInfo *info, Oid dbId, Oid relId)
 	 * to ensure that the next CommandCounterIncrement() will think that we
 	 * need to do CommandEndInvalidationMessages().
 	 */
-	(void) GetCurrentCommandId(true);
+	(void)GetCurrentCommandId(true);
 
 	/*
 	 * If the relation being invalidated is one of those cached in a relcache
@@ -636,19 +652,16 @@ PrepareInvalidationState(void)
 	/* Can't queue transactional message while collecting inplace messages. */
 	Assert(inplaceInvalInfo == NULL);
 
-	if (transInvalInfo != NULL &&
-		transInvalInfo->my_level == GetCurrentTransactionNestLevel())
-		return (InvalidationInfo *) transInvalInfo;
+	if (transInvalInfo != NULL && transInvalInfo->my_level == GetCurrentTransactionNestLevel())
+		return (InvalidationInfo *)transInvalInfo;
 
-	myInfo = (TransInvalidationInfo *)
-		MemoryContextAllocZero(TopTransactionContext,
-							   sizeof(TransInvalidationInfo));
+	myInfo = (TransInvalidationInfo *)MemoryContextAllocZero(TopTransactionContext,
+															 sizeof(TransInvalidationInfo));
 	myInfo->parent = transInvalInfo;
 	myInfo->my_level = GetCurrentTransactionNestLevel();
 
 	/* Now, do we have a previous stack entry? */
-	if (transInvalInfo != NULL)
-	{
+	if (transInvalInfo != NULL) {
 		/* Yes; this one should be for a deeper nesting level. */
 		Assert(myInfo->my_level > transInvalInfo->my_level);
 
@@ -669,13 +682,9 @@ PrepareInvalidationState(void)
 		 * which is fine for the first (sub)transaction, but otherwise we need
 		 * to update them to follow whatever is already in the arrays.
 		 */
-		SetGroupToFollow(&myInfo->PriorCmdInvalidMsgs,
-						 &transInvalInfo->ii.CurrentCmdInvalidMsgs);
-		SetGroupToFollow(&myInfo->ii.CurrentCmdInvalidMsgs,
-						 &myInfo->PriorCmdInvalidMsgs);
-	}
-	else
-	{
+		SetGroupToFollow(&myInfo->PriorCmdInvalidMsgs, &transInvalInfo->ii.CurrentCmdInvalidMsgs);
+		SetGroupToFollow(&myInfo->ii.CurrentCmdInvalidMsgs, &myInfo->PriorCmdInvalidMsgs);
+	} else {
 		/*
 		 * Here, we need only clear any array pointers left over from a prior
 		 * transaction.
@@ -687,7 +696,7 @@ PrepareInvalidationState(void)
 	}
 
 	transInvalInfo = myInfo;
-	return (InvalidationInfo *) myInfo;
+	return (InvalidationInfo *)myInfo;
 }
 
 /*
@@ -706,14 +715,12 @@ PrepareInplaceInvalidationState(void)
 	Assert(inplaceInvalInfo == NULL);
 
 	/* gone after WAL insertion CritSection ends, so use current context */
-	myInfo = (InvalidationInfo *) palloc0(sizeof(InvalidationInfo));
+	myInfo = (InvalidationInfo *)palloc0(sizeof(InvalidationInfo));
 
 	/* Stash our messages past end of the transactional messages, if any. */
 	if (transInvalInfo != NULL)
-		SetGroupToFollow(&myInfo->CurrentCmdInvalidMsgs,
-						 &transInvalInfo->ii.CurrentCmdInvalidMsgs);
-	else
-	{
+		SetGroupToFollow(&myInfo->CurrentCmdInvalidMsgs, &transInvalInfo->ii.CurrentCmdInvalidMsgs);
+	else {
 		InvalMessageArrays[CatCacheMsgs].msgs = NULL;
 		InvalMessageArrays[CatCacheMsgs].maxmsgs = 0;
 		InvalMessageArrays[RelCacheMsgs].msgs = NULL;
@@ -732,21 +739,19 @@ PrepareInplaceInvalidationState(void)
 void
 InvalidateSystemCachesExtended(bool debug_discard)
 {
-	int			i;
+	int i;
 
 	InvalidateCatalogSnapshot();
 	ResetCatalogCachesExt(debug_discard);
 	RelationCacheInvalidate(debug_discard); /* gets smgr and relmap too */
 
-	for (i = 0; i < syscache_callback_count; i++)
-	{
+	for (i = 0; i < syscache_callback_count; i++) {
 		struct SYSCACHECALLBACK *ccitem = syscache_callback_list + i;
 
 		ccitem->function(ccitem->arg, ccitem->id, 0);
 	}
 
-	for (i = 0; i < relcache_callback_count; i++)
-	{
+	for (i = 0; i < relcache_callback_count; i++) {
 		struct RELCACHECALLBACK *ccitem = relcache_callback_list + i;
 
 		ccitem->function(ccitem->arg, InvalidOid);
@@ -763,49 +768,38 @@ InvalidateSystemCachesExtended(bool debug_discard)
 void
 LocalExecuteInvalidationMessage(SharedInvalidationMessage *msg)
 {
-	if (msg->id >= 0)
-	{
-		if (msg->cc.dbId == MyDatabaseId || msg->cc.dbId == InvalidOid)
-		{
+	if (msg->id >= 0) {
+		if (msg->cc.dbId == MyDatabaseId || msg->cc.dbId == InvalidOid) {
 			InvalidateCatalogSnapshot();
 
 			SysCacheInvalidate(msg->cc.id, msg->cc.hashValue);
 
 			CallSyscacheCallbacks(msg->cc.id, msg->cc.hashValue);
 		}
-	}
-	else if (msg->id == SHAREDINVALCATALOG_ID)
-	{
-		if (msg->cat.dbId == MyDatabaseId || msg->cat.dbId == InvalidOid)
-		{
+	} else if (msg->id == SHAREDINVALCATALOG_ID) {
+		if (msg->cat.dbId == MyDatabaseId || msg->cat.dbId == InvalidOid) {
 			InvalidateCatalogSnapshot();
 
 			CatalogCacheFlushCatalog(msg->cat.catId);
 
 			/* CatalogCacheFlushCatalog calls CallSyscacheCallbacks as needed */
 		}
-	}
-	else if (msg->id == SHAREDINVALRELCACHE_ID)
-	{
-		if (msg->rc.dbId == MyDatabaseId || msg->rc.dbId == InvalidOid)
-		{
-			int			i;
+	} else if (msg->id == SHAREDINVALRELCACHE_ID) {
+		if (msg->rc.dbId == MyDatabaseId || msg->rc.dbId == InvalidOid) {
+			int i;
 
 			if (msg->rc.relId == InvalidOid)
 				RelationCacheInvalidate(false);
 			else
 				RelationCacheInvalidateEntry(msg->rc.relId);
 
-			for (i = 0; i < relcache_callback_count; i++)
-			{
+			for (i = 0; i < relcache_callback_count; i++) {
 				struct RELCACHECALLBACK *ccitem = relcache_callback_list + i;
 
 				ccitem->function(ccitem->arg, msg->rc.relId);
 			}
 		}
-	}
-	else if (msg->id == SHAREDINVALSMGR_ID)
-	{
+	} else if (msg->id == SHAREDINVALSMGR_ID) {
 		/*
 		 * We could have smgr entries for relations of other databases, so no
 		 * short-circuit test is possible here.
@@ -813,26 +807,21 @@ LocalExecuteInvalidationMessage(SharedInvalidationMessage *msg)
 		RelFileLocatorBackend rlocator;
 
 		rlocator.locator = msg->sm.rlocator;
-		rlocator.backend = (msg->sm.backend_hi << 16) | (int) msg->sm.backend_lo;
+		rlocator.backend = (msg->sm.backend_hi << 16) | (int)msg->sm.backend_lo;
 		smgrcloserellocator(rlocator);
-	}
-	else if (msg->id == SHAREDINVALRELMAP_ID)
-	{
+	} else if (msg->id == SHAREDINVALRELMAP_ID) {
 		/* We only care about our own database and shared catalogs */
 		if (msg->rm.dbId == InvalidOid)
 			RelationMapInvalidate(true);
 		else if (msg->rm.dbId == MyDatabaseId)
 			RelationMapInvalidate(false);
-	}
-	else if (msg->id == SHAREDINVALSNAPSHOT_ID)
-	{
+	} else if (msg->id == SHAREDINVALSNAPSHOT_ID) {
 		/* We only care about our own database and shared catalogs */
 		if (msg->sn.dbId == InvalidOid)
 			InvalidateCatalogSnapshot();
 		else if (msg->sn.dbId == MyDatabaseId)
 			InvalidateCatalogSnapshot();
-	}
-	else
+	} else
 		elog(FATAL, "unrecognized SI message ID: %d", msg->id);
 }
 
@@ -870,8 +859,7 @@ AcceptInvalidationMessages(void)
 		AssertCouldGetRelation();
 #endif
 
-	ReceiveSharedInvalidMessages(LocalExecuteInvalidationMessage,
-								 InvalidateSystemCaches);
+	ReceiveSharedInvalidMessages(LocalExecuteInvalidationMessage, InvalidateSystemCaches);
 
 	/*----------
 	 * Test code to force cache flushes anytime a flush could happen.
@@ -900,10 +888,9 @@ AcceptInvalidationMessages(void)
 	 */
 #ifdef DISCARD_CACHES_ENABLED
 	{
-		static int	recursion_depth = 0;
+		static int recursion_depth = 0;
 
-		if (recursion_depth < debug_discard_caches)
-		{
+		if (recursion_depth < debug_discard_caches) {
 			recursion_depth++;
 			InvalidateSystemCachesExtended(true);
 			recursion_depth--;
@@ -944,16 +931,14 @@ PostPrepare_Inval(void)
  * see also xact_redo_commit() and xact_desc_commit()
  */
 int
-xactGetCommittedInvalidationMessages(SharedInvalidationMessage **msgs,
-									 bool *RelcacheInitFileInval)
+xactGetCommittedInvalidationMessages(SharedInvalidationMessage **msgs, bool *RelcacheInitFileInval)
 {
 	SharedInvalidationMessage *msgarray;
-	int			nummsgs;
-	int			nmsgs;
+	int nummsgs;
+	int nmsgs;
 
 	/* Quick exit if we haven't done anything with invalidation messages. */
-	if (transInvalInfo == NULL)
-	{
+	if (transInvalInfo == NULL) {
 		*RelcacheInitFileInval = false;
 		*msgs = NULL;
 		return 0;
@@ -977,38 +962,25 @@ xactGetCommittedInvalidationMessages(SharedInvalidationMessage **msgs,
 	 * is as similar as possible to original.  We want the same bugs, if any,
 	 * not new ones.
 	 */
-	nummsgs = NumMessagesInGroup(&transInvalInfo->PriorCmdInvalidMsgs) +
-		NumMessagesInGroup(&transInvalInfo->ii.CurrentCmdInvalidMsgs);
+	nummsgs = NumMessagesInGroup(&transInvalInfo->PriorCmdInvalidMsgs)
+			  + NumMessagesInGroup(&transInvalInfo->ii.CurrentCmdInvalidMsgs);
 
-	*msgs = msgarray = (SharedInvalidationMessage *)
-		MemoryContextAlloc(CurTransactionContext,
-						   nummsgs * sizeof(SharedInvalidationMessage));
+	*msgs = msgarray = (SharedInvalidationMessage *)MemoryContextAlloc(
+		CurTransactionContext, nummsgs * sizeof(SharedInvalidationMessage));
 
 	nmsgs = 0;
-	ProcessMessageSubGroupMulti(&transInvalInfo->PriorCmdInvalidMsgs,
-								CatCacheMsgs,
-								(memcpy(msgarray + nmsgs,
-										msgs,
-										n * sizeof(SharedInvalidationMessage)),
-								 nmsgs += n));
-	ProcessMessageSubGroupMulti(&transInvalInfo->ii.CurrentCmdInvalidMsgs,
-								CatCacheMsgs,
-								(memcpy(msgarray + nmsgs,
-										msgs,
-										n * sizeof(SharedInvalidationMessage)),
-								 nmsgs += n));
-	ProcessMessageSubGroupMulti(&transInvalInfo->PriorCmdInvalidMsgs,
-								RelCacheMsgs,
-								(memcpy(msgarray + nmsgs,
-										msgs,
-										n * sizeof(SharedInvalidationMessage)),
-								 nmsgs += n));
-	ProcessMessageSubGroupMulti(&transInvalInfo->ii.CurrentCmdInvalidMsgs,
-								RelCacheMsgs,
-								(memcpy(msgarray + nmsgs,
-										msgs,
-										n * sizeof(SharedInvalidationMessage)),
-								 nmsgs += n));
+	ProcessMessageSubGroupMulti(
+		&transInvalInfo->PriorCmdInvalidMsgs, CatCacheMsgs,
+		(memcpy(msgarray + nmsgs, msgs, n * sizeof(SharedInvalidationMessage)), nmsgs += n));
+	ProcessMessageSubGroupMulti(
+		&transInvalInfo->ii.CurrentCmdInvalidMsgs, CatCacheMsgs,
+		(memcpy(msgarray + nmsgs, msgs, n * sizeof(SharedInvalidationMessage)), nmsgs += n));
+	ProcessMessageSubGroupMulti(
+		&transInvalInfo->PriorCmdInvalidMsgs, RelCacheMsgs,
+		(memcpy(msgarray + nmsgs, msgs, n * sizeof(SharedInvalidationMessage)), nmsgs += n));
+	ProcessMessageSubGroupMulti(
+		&transInvalInfo->ii.CurrentCmdInvalidMsgs, RelCacheMsgs,
+		(memcpy(msgarray + nmsgs, msgs, n * sizeof(SharedInvalidationMessage)), nmsgs += n));
 	Assert(nmsgs == nummsgs);
 
 	return nmsgs;
@@ -1023,9 +995,8 @@ xactGetCommittedInvalidationMessages(SharedInvalidationMessage **msgs,
  * before and after we send the SI messages. See AtEOXact_Inval()
  */
 void
-ProcessCommittedInvalidationMessages(SharedInvalidationMessage *msgs,
-									 int nmsgs, bool RelcacheInitFileInval,
-									 Oid dbid, Oid tsid)
+ProcessCommittedInvalidationMessages(SharedInvalidationMessage *msgs, int nmsgs,
+									 bool RelcacheInitFileInval, Oid dbid, Oid tsid)
 {
 	if (nmsgs <= 0)
 		return;
@@ -1033,10 +1004,8 @@ ProcessCommittedInvalidationMessages(SharedInvalidationMessage *msgs,
 	elog(trace_recovery(DEBUG4), "replaying commit with %d messages%s", nmsgs,
 		 (RelcacheInitFileInval ? " and relcache file invalidation" : ""));
 
-	if (RelcacheInitFileInval)
-	{
-		elog(trace_recovery(DEBUG4), "removing relcache init files for database %u",
-			 dbid);
+	if (RelcacheInitFileInval) {
+		elog(trace_recovery(DEBUG4), "removing relcache init files for database %u", dbid);
 
 		/*
 		 * RelationCacheInitFilePreInvalidate, when the invalidation message
@@ -1050,8 +1019,7 @@ ProcessCommittedInvalidationMessages(SharedInvalidationMessage *msgs,
 
 		RelationCacheInitFilePreInvalidate();
 
-		if (OidIsValid(dbid))
-		{
+		if (OidIsValid(dbid)) {
 			pfree(DatabasePath);
 			DatabasePath = NULL;
 		}
@@ -1099,8 +1067,7 @@ AtEOXact_Inval(bool isCommit)
 	/* Must be at top of stack */
 	Assert(transInvalInfo->my_level == 1 && transInvalInfo->parent == NULL);
 
-	if (isCommit)
-	{
+	if (isCommit) {
 		/*
 		 * Relcache init file invalidation requires processing both before and
 		 * after we send the SI messages.  However, we need not do anything
@@ -1113,13 +1080,18 @@ AtEOXact_Inval(bool isCommit)
 								   &transInvalInfo->ii.CurrentCmdInvalidMsgs);
 
 		ProcessInvalidationMessagesMulti(&transInvalInfo->PriorCmdInvalidMsgs,
+#ifdef USE_PGRAC_CLUSTER
+										 /* PGRAC: spec-2.39 D1 — cluster-aware wrapper
+										  * (preserves PG-local SI semantics + adds
+										  * cluster_sinval_enqueue_and_wait_ack call). */
+										 cluster_aware_send_shared_invalid_messages);
+#else
 										 SendSharedInvalidMessages);
+#endif
 
 		if (transInvalInfo->ii.RelcacheInitFileInval)
 			RelationCacheInitFilePostInvalidate();
-	}
-	else
-	{
+	} else {
 		ProcessInvalidationMessages(&transInvalInfo->PriorCmdInvalidMsgs,
 									LocalExecuteInvalidationMessage);
 	}
@@ -1199,7 +1171,7 @@ ForgetInplace_Inval(void)
 void
 AtEOSubXact_Inval(bool isCommit)
 {
-	int			my_level;
+	int my_level;
 	TransInvalidationInfo *myInfo;
 
 	/*
@@ -1219,14 +1191,12 @@ AtEOSubXact_Inval(bool isCommit)
 
 	/* Also bail out quickly if messages are not for this level. */
 	my_level = GetCurrentTransactionNestLevel();
-	if (myInfo->my_level != my_level)
-	{
+	if (myInfo->my_level != my_level) {
 		Assert(myInfo->my_level < my_level);
 		return;
 	}
 
-	if (isCommit)
-	{
+	if (isCommit) {
 		/* If CurrentCmdInvalidMsgs still has anything, fix it */
 		CommandEndInvalidationMessages();
 
@@ -1236,8 +1206,7 @@ AtEOSubXact_Inval(bool isCommit)
 		 * and then freeing our own, we can just adjust the level of our own
 		 * entry.
 		 */
-		if (myInfo->parent == NULL || myInfo->parent->my_level < my_level - 1)
-		{
+		if (myInfo->parent == NULL || myInfo->parent->my_level < my_level - 1) {
 			myInfo->my_level--;
 			return;
 		}
@@ -1266,11 +1235,8 @@ AtEOSubXact_Inval(bool isCommit)
 
 		/* Need not free anything else explicitly */
 		pfree(myInfo);
-	}
-	else
-	{
-		ProcessInvalidationMessages(&myInfo->PriorCmdInvalidMsgs,
-									LocalExecuteInvalidationMessage);
+	} else {
+		ProcessInvalidationMessages(&myInfo->PriorCmdInvalidMsgs, LocalExecuteInvalidationMessage);
 
 		/* Pop the transaction state stack */
 		transInvalInfo = myInfo->parent;
@@ -1323,15 +1289,13 @@ CommandEndInvalidationMessages(void)
  *		Common logic for end-of-command and inplace variants.
  */
 static void
-CacheInvalidateHeapTupleCommon(Relation relation,
-							   HeapTuple tuple,
-							   HeapTuple newtuple,
-							   InvalidationInfo *(*prepare_callback) (void))
+CacheInvalidateHeapTupleCommon(Relation relation, HeapTuple tuple, HeapTuple newtuple,
+							   InvalidationInfo *(*prepare_callback)(void))
 {
 	InvalidationInfo *info;
-	Oid			tupleRelId;
-	Oid			databaseId;
-	Oid			relationId;
+	Oid tupleRelId;
+	Oid databaseId;
+	Oid relationId;
 
 	/* PrepareToInvalidateCacheTuple() needs relcache */
 	AssertCouldGetRelation();
@@ -1362,15 +1326,12 @@ CacheInvalidateHeapTupleCommon(Relation relation,
 	 * First let the catcache do its thing
 	 */
 	tupleRelId = RelationGetRelid(relation);
-	if (RelationInvalidatesSnapshotsOnly(tupleRelId))
-	{
+	if (RelationInvalidatesSnapshotsOnly(tupleRelId)) {
 		databaseId = IsSharedRelation(tupleRelId) ? InvalidOid : MyDatabaseId;
 		RegisterSnapshotInvalidation(info, databaseId, tupleRelId);
-	}
-	else
-		PrepareToInvalidateCacheTuple(relation, tuple, newtuple,
-									  RegisterCatcacheInvalidation,
-									  (void *) info);
+	} else
+		PrepareToInvalidateCacheTuple(relation, tuple, newtuple, RegisterCatcacheInvalidation,
+									  (void *)info);
 
 	/*
 	 * Now, is this tuple one of the primary definers of a relcache entry? See
@@ -1379,19 +1340,16 @@ CacheInvalidateHeapTupleCommon(Relation relation,
 	 * Note we ignore newtuple here; we assume an update cannot move a tuple
 	 * from being part of one relcache entry to being part of another.
 	 */
-	if (tupleRelId == RelationRelationId)
-	{
-		Form_pg_class classtup = (Form_pg_class) GETSTRUCT(tuple);
+	if (tupleRelId == RelationRelationId) {
+		Form_pg_class classtup = (Form_pg_class)GETSTRUCT(tuple);
 
 		relationId = classtup->oid;
 		if (classtup->relisshared)
 			databaseId = InvalidOid;
 		else
 			databaseId = MyDatabaseId;
-	}
-	else if (tupleRelId == AttributeRelationId)
-	{
-		Form_pg_attribute atttup = (Form_pg_attribute) GETSTRUCT(tuple);
+	} else if (tupleRelId == AttributeRelationId) {
+		Form_pg_attribute atttup = (Form_pg_attribute)GETSTRUCT(tuple);
 
 		relationId = atttup->attrelid;
 
@@ -1406,10 +1364,8 @@ CacheInvalidateHeapTupleCommon(Relation relation,
 		 * never come here for a shared rel anyway.)
 		 */
 		databaseId = MyDatabaseId;
-	}
-	else if (tupleRelId == IndexRelationId)
-	{
-		Form_pg_index indextup = (Form_pg_index) GETSTRUCT(tuple);
+	} else if (tupleRelId == IndexRelationId) {
+		Form_pg_index indextup = (Form_pg_index)GETSTRUCT(tuple);
 
 		/*
 		 * When a pg_index row is updated, we should send out a relcache inval
@@ -1419,25 +1375,19 @@ CacheInvalidateHeapTupleCommon(Relation relation,
 		 */
 		relationId = indextup->indexrelid;
 		databaseId = MyDatabaseId;
-	}
-	else if (tupleRelId == ConstraintRelationId)
-	{
-		Form_pg_constraint constrtup = (Form_pg_constraint) GETSTRUCT(tuple);
+	} else if (tupleRelId == ConstraintRelationId) {
+		Form_pg_constraint constrtup = (Form_pg_constraint)GETSTRUCT(tuple);
 
 		/*
 		 * Foreign keys are part of relcache entries, too, so send out an
 		 * inval for the table that the FK applies to.
 		 */
-		if (constrtup->contype == CONSTRAINT_FOREIGN &&
-			OidIsValid(constrtup->conrelid))
-		{
+		if (constrtup->contype == CONSTRAINT_FOREIGN && OidIsValid(constrtup->conrelid)) {
 			relationId = constrtup->conrelid;
 			databaseId = MyDatabaseId;
-		}
-		else
+		} else
 			return;
-	}
-	else
+	} else
 		return;
 
 	/*
@@ -1458,12 +1408,9 @@ CacheInvalidateHeapTupleCommon(Relation relation,
  * effort during an update.
  */
 void
-CacheInvalidateHeapTuple(Relation relation,
-						 HeapTuple tuple,
-						 HeapTuple newtuple)
+CacheInvalidateHeapTuple(Relation relation, HeapTuple tuple, HeapTuple newtuple)
 {
-	CacheInvalidateHeapTupleCommon(relation, tuple, newtuple,
-								   PrepareInvalidationState);
+	CacheInvalidateHeapTupleCommon(relation, tuple, newtuple, PrepareInvalidationState);
 }
 
 /*
@@ -1480,8 +1427,7 @@ CacheInvalidateHeapTuple(Relation relation,
  * e.g. pg_constraint.conrelid, which would trigger relcache inval.
  */
 void
-CacheInvalidateHeapTupleInplace(Relation relation,
-								HeapTuple key_equivalent_tuple)
+CacheInvalidateHeapTupleInplace(Relation relation, HeapTuple key_equivalent_tuple)
 {
 	CacheInvalidateHeapTupleCommon(relation, key_equivalent_tuple, NULL,
 								   PrepareInplaceInvalidationState);
@@ -1501,15 +1447,14 @@ CacheInvalidateHeapTupleInplace(Relation relation,
 void
 CacheInvalidateCatalog(Oid catalogId)
 {
-	Oid			databaseId;
+	Oid databaseId;
 
 	if (IsSharedRelation(catalogId))
 		databaseId = InvalidOid;
 	else
 		databaseId = MyDatabaseId;
 
-	RegisterCatalogInvalidation(PrepareInvalidationState(),
-								databaseId, catalogId);
+	RegisterCatalogInvalidation(PrepareInvalidationState(), databaseId, catalogId);
 }
 
 /*
@@ -1524,8 +1469,8 @@ CacheInvalidateCatalog(Oid catalogId)
 void
 CacheInvalidateRelcache(Relation relation)
 {
-	Oid			databaseId;
-	Oid			relationId;
+	Oid databaseId;
+	Oid relationId;
 
 	relationId = RelationGetRelid(relation);
 	if (relation->rd_rel->relisshared)
@@ -1533,8 +1478,7 @@ CacheInvalidateRelcache(Relation relation)
 	else
 		databaseId = MyDatabaseId;
 
-	RegisterRelcacheInvalidation(PrepareInvalidationState(),
-								 databaseId, relationId);
+	RegisterRelcacheInvalidation(PrepareInvalidationState(), databaseId, relationId);
 }
 
 /*
@@ -1547,8 +1491,7 @@ CacheInvalidateRelcache(Relation relation)
 void
 CacheInvalidateRelcacheAll(void)
 {
-	RegisterRelcacheInvalidation(PrepareInvalidationState(),
-								 InvalidOid, InvalidOid);
+	RegisterRelcacheInvalidation(PrepareInvalidationState(), InvalidOid, InvalidOid);
 }
 
 /*
@@ -1558,17 +1501,16 @@ CacheInvalidateRelcacheAll(void)
 void
 CacheInvalidateRelcacheByTuple(HeapTuple classTuple)
 {
-	Form_pg_class classtup = (Form_pg_class) GETSTRUCT(classTuple);
-	Oid			databaseId;
-	Oid			relationId;
+	Form_pg_class classtup = (Form_pg_class)GETSTRUCT(classTuple);
+	Oid databaseId;
+	Oid relationId;
 
 	relationId = classtup->oid;
 	if (classtup->relisshared)
 		databaseId = InvalidOid;
 	else
 		databaseId = MyDatabaseId;
-	RegisterRelcacheInvalidation(PrepareInvalidationState(),
-								 databaseId, relationId);
+	RegisterRelcacheInvalidation(PrepareInvalidationState(), databaseId, relationId);
 }
 
 /*
@@ -1580,7 +1522,7 @@ CacheInvalidateRelcacheByTuple(HeapTuple classTuple)
 void
 CacheInvalidateRelcacheByRelid(Oid relid)
 {
-	HeapTuple	tup;
+	HeapTuple tup;
 
 	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
 	if (!HeapTupleIsValid(tup))
@@ -1673,24 +1615,19 @@ CacheInvalidateRelmap(Oid databaseId)
  * flush all cached state anyway.
  */
 void
-CacheRegisterSyscacheCallback(int cacheid,
-							  SyscacheCallbackFunction func,
-							  Datum arg)
+CacheRegisterSyscacheCallback(int cacheid, SyscacheCallbackFunction func, Datum arg)
 {
 	if (cacheid < 0 || cacheid >= SysCacheSize)
 		elog(FATAL, "invalid cache ID: %d", cacheid);
 	if (syscache_callback_count >= MAX_SYSCACHE_CALLBACKS)
 		elog(FATAL, "out of syscache_callback_list slots");
 
-	if (syscache_callback_links[cacheid] == 0)
-	{
+	if (syscache_callback_links[cacheid] == 0) {
 		/* first callback for this cache */
 		syscache_callback_links[cacheid] = syscache_callback_count + 1;
-	}
-	else
-	{
+	} else {
 		/* add to end of chain, so that older callbacks are called first */
-		int			i = syscache_callback_links[cacheid] - 1;
+		int i = syscache_callback_links[cacheid] - 1;
 
 		while (syscache_callback_list[i].link > 0)
 			i = syscache_callback_list[i].link - 1;
@@ -1715,8 +1652,7 @@ CacheRegisterSyscacheCallback(int cacheid,
  * In this case the called routines should flush all cached state.
  */
 void
-CacheRegisterRelcacheCallback(RelcacheCallbackFunction func,
-							  Datum arg)
+CacheRegisterRelcacheCallback(RelcacheCallbackFunction func, Datum arg)
 {
 	if (relcache_callback_count >= MAX_RELCACHE_CALLBACKS)
 		elog(FATAL, "out of relcache_callback_list slots");
@@ -1736,14 +1672,13 @@ CacheRegisterRelcacheCallback(RelcacheCallbackFunction func,
 void
 CallSyscacheCallbacks(int cacheid, uint32 hashvalue)
 {
-	int			i;
+	int i;
 
 	if (cacheid < 0 || cacheid >= SysCacheSize)
 		elog(ERROR, "invalid cache ID: %d", cacheid);
 
 	i = syscache_callback_links[cacheid] - 1;
-	while (i >= 0)
-	{
+	while (i >= 0) {
 		struct SYSCACHECALLBACK *ccitem = syscache_callback_list + i;
 
 		Assert(ccitem->id == cacheid);
@@ -1765,7 +1700,7 @@ LogLogicalInvalidations(void)
 {
 	xl_xact_invals xlrec;
 	InvalidationMsgsGroup *group;
-	int			nmsgs;
+	int nmsgs;
 
 	/* Quick exit if we haven't done anything with invalidation messages. */
 	if (transInvalInfo == NULL)
@@ -1774,21 +1709,20 @@ LogLogicalInvalidations(void)
 	group = &transInvalInfo->ii.CurrentCmdInvalidMsgs;
 	nmsgs = NumMessagesInGroup(group);
 
-	if (nmsgs > 0)
-	{
+	if (nmsgs > 0) {
 		/* prepare record */
 		memset(&xlrec, 0, MinSizeOfXactInvals);
 		xlrec.nmsgs = nmsgs;
 
 		/* perform insertion */
 		XLogBeginInsert();
-		XLogRegisterData((char *) (&xlrec), MinSizeOfXactInvals);
-		ProcessMessageSubGroupMulti(group, CatCacheMsgs,
-									XLogRegisterData((char *) msgs,
-													 n * sizeof(SharedInvalidationMessage)));
-		ProcessMessageSubGroupMulti(group, RelCacheMsgs,
-									XLogRegisterData((char *) msgs,
-													 n * sizeof(SharedInvalidationMessage)));
+		XLogRegisterData((char *)(&xlrec), MinSizeOfXactInvals);
+		ProcessMessageSubGroupMulti(
+			group, CatCacheMsgs,
+			XLogRegisterData((char *)msgs, n * sizeof(SharedInvalidationMessage)));
+		ProcessMessageSubGroupMulti(
+			group, RelCacheMsgs,
+			XLogRegisterData((char *)msgs, n * sizeof(SharedInvalidationMessage)));
 		XLogInsert(RM_XACT_ID, XLOG_XACT_INVALIDATIONS);
 	}
 }

@@ -575,5 +575,14 @@ extern int cluster_sinval_broadcast_batch_size;
 extern int cluster_sinval_broadcast_batch_timeout_ms;
 extern int cluster_sinval_broadcast_max_queue_size;
 
+/* spec-2.39 D12:  3 NEW GUC for ack/barrier production gate. */
+typedef enum ClusterSinvalAckMode {
+	CLUSTER_SINVAL_ACK_MODE_NONE = 0,
+	CLUSTER_SINVAL_ACK_MODE_PEER_ENQUEUED = 1
+} ClusterSinvalAckMode;
+extern int cluster_sinval_ack_mode;
+extern int cluster_sinval_ack_timeout_ms;
+extern int cluster_sinval_ack_wait_slots;
+
 
 #endif /* CLUSTER_GUC_H */

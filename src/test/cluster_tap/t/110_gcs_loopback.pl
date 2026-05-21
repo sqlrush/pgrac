@@ -88,7 +88,7 @@ is($gcs_reply_wait_event, '1',
 # L4 — CLUSTER_WAIT_EVENTS_COUNT == 85.
 my $total_wait_events = $node->safe_psql(
 	'postgres', 'SELECT count(*) FROM pg_stat_cluster_wait_events');
-is($total_wait_events, '88',
+is($total_wait_events, '91',
    'L4 wait_events count 88 (spec-2.36 +3 GCS block reliability wait events)');
 
 

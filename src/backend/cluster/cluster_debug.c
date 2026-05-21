@@ -1360,6 +1360,19 @@ dump_gcs(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_sinval_get_stale_epoch_drop_count()));
 	emit_row(rsinfo, "sinval", "echo_dropped_count",
 			 fmt_int64((int64)cluster_sinval_get_echo_dropped_count()));
+	/* spec-2.39 D8/D9:  6 NEW counter rows — 3 fanout partial-fail + 3 ack. */
+	emit_row(rsinfo, "sinval", "fanout_would_block_count",
+			 fmt_int64((int64)cluster_sinval_get_fanout_would_block_count()));
+	emit_row(rsinfo, "sinval", "fanout_hard_error_count",
+			 fmt_int64((int64)cluster_sinval_get_fanout_hard_error_count()));
+	emit_row(rsinfo, "sinval", "fanout_peer_down_count",
+			 fmt_int64((int64)cluster_sinval_get_fanout_peer_down_count()));
+	emit_row(rsinfo, "sinval", "ack_received_count",
+			 fmt_int64((int64)cluster_sinval_get_ack_received_count()));
+	emit_row(rsinfo, "sinval", "ack_timeout_count",
+			 fmt_int64((int64)cluster_sinval_get_ack_timeout_count()));
+	emit_row(rsinfo, "sinval", "ack_orphan_count",
+			 fmt_int64((int64)cluster_sinval_get_ack_orphan_count()));
 }
 
 #endif /* USE_PGRAC_CLUSTER */

@@ -313,6 +313,13 @@ void
 cluster_gcs_block_on_epoch_advance(uint64 new_epoch pg_attribute_unused())
 {}
 
+/* spec-2.39 D14 stub: cluster_reconfig_apply_epoch_bump_as_coordinator
+ * calls cluster_sinval_reset_all_on_reconfig.  Fixture has no sinval shmem;
+ * stub no-op. */
+void
+cluster_sinval_reset_all_on_reconfig(void)
+{}
+
 /* Reset helper for between-test mock state. */
 static void
 ut_reset_mocks(void)

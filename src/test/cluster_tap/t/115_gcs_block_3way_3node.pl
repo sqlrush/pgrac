@@ -87,7 +87,7 @@ for my $i (0 .. 2)
 {
 	my $rows = $triple->node0->safe_psql('postgres',
 		q{SELECT count(*) FROM pg_stat_gcluster_wait_events});
-	cmp_ok($rows, '>=', 88,
+	cmp_ok($rows, '>=', 91,
 		"L2 node0 sees pg_stat_gcluster_wait_events with cluster events "
 		. "(found $rows rows)");
 }
@@ -125,7 +125,7 @@ for my $i (0 .. 2)
 
 	is($node->safe_psql('postgres',
 			'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-		'88',
+		'91',
 		"L4 node$i wait event count == 88");
 
 	is($node->safe_psql('postgres',

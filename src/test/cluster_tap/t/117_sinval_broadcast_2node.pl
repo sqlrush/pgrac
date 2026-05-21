@@ -93,8 +93,8 @@ cmp_ok($catver, '>=', 202605450,
 # ============================================================
 is($pair->node0->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'88',
-	'L3 wait event count == 88 (spec-2.38 wires existing 3 sinval events; no NEW)');
+	'91',
+	'L3 wait event count == 91 (spec-2.39 adds 3 ack/barrier events; baseline 88 → 91)');
 
 
 # ============================================================
@@ -103,14 +103,14 @@ is($pair->node0->safe_psql('postgres',
 is($pair->node0->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='sinval'}),
-   '9',
-   'L4 node0 pg_cluster_state.sinval category has 9 keys (D10 +9 counter rows)');
+   '15',
+   'L4 node0 pg_cluster_state.sinval category has 15 keys (spec-2.39 D8/D9 +6 counters)');
 
 is($pair->node1->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='sinval'}),
-   '9',
-   'L4 node1 pg_cluster_state.sinval category has 9 keys');
+   '15',
+   'L4 node1 pg_cluster_state.sinval category has 15 keys');
 
 for my $node ($pair->node0, $pair->node1)
 {

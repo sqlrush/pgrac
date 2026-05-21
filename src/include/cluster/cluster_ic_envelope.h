@@ -160,10 +160,15 @@ typedef enum ClusterICMsgType {
 	PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE
 	= 17, /* PGRAC: spec-2.36 D1 — CF 3-way master→S/X holder invalidate request (64B) */
 	PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK
-	= 18 /* PGRAC: spec-2.36 D1 — CF 3-way holder→master invalidate ack (64B);
+	= 18, /* PGRAC: spec-2.36 D1 — CF 3-way holder→master invalidate ack (64B);
 		   * MUST be a distinct msg_type from INVALIDATE — request+ack are both
 		   * 64B fixed, cannot demux by payload length (codereview F1 P0). */
-		 /* values 19..255 available for future sub-spec; never reuse 0..18 */
+	PGRAC_IC_MSG_SINVAL_ACK = 19 /* PGRAC: spec-2.39 D4 — SI Broadcaster peer_enqueued ACK envelope
+		   * (SinvalAckHeader 24B fixed;no tail).  Producer mask = LMON
+		   * (L172 family — tier1 fd LMON-exclusive-ownership).  Sent by
+		   * LMON drain of ClusterSinvalAckOutbound (single-peer fanout,
+		   * not broadcast). */
+	/* values 20..255 available for future sub-spec; never reuse 0..19 */
 } ClusterICMsgType;
 
 

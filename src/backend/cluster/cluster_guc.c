@@ -366,6 +366,16 @@ int cluster_sinval_broadcast_batch_size = 32;
 int cluster_sinval_broadcast_batch_timeout_ms = 10;
 int cluster_sinval_broadcast_max_queue_size = 1024;
 
+/* spec-2.39 D12:  3 NEW GUC for ack/barrier production gate. */
+int cluster_sinval_ack_mode = CLUSTER_SINVAL_ACK_MODE_PEER_ENQUEUED;
+int cluster_sinval_ack_timeout_ms = 5000;
+int cluster_sinval_ack_wait_slots = 256;
+
+static const struct config_enum_entry cluster_sinval_ack_mode_options[]
+	= { { "none", CLUSTER_SINVAL_ACK_MODE_NONE, false },
+		{ "peer_enqueued", CLUSTER_SINVAL_ACK_MODE_PEER_ENQUEUED, false },
+		{ NULL, 0, false } };
+
 
 /*
  * Mapping from the cluster.interconnect_tier GUC enum string to the
@@ -616,7 +626,7 @@ cluster_init_guc(void)
 										 "registers one region.  Raise if FATAL on startup with "
 										 "errcode 53400 \"cluster shmem registry capacity "
 										 "exceeded\"."),
-							&cluster_shmem_max_regions, 64, 31, 256,
+							&cluster_shmem_max_regions, 64, 33, 256,
 							PGC_POSTMASTER, /* registry array is palloc'd once at init */
 							0,				/* flags */
 							NULL,			/* check_hook */
@@ -1527,4 +1537,44 @@ cluster_init_guc(void)
 										 "PGC_POSTMASTER."),
 							&cluster_sinval_broadcast_max_queue_size, 1024, 64, 65536,
 							PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	/*
+	 * spec-2.39 D12:  cluster.sinval_ack_mode (enum) — DDL commit ack barrier
+	 * mode.  none = fire-and-forget (spec-2.38 行为);peer_enqueued = wait
+	 * until all declared+CSSD-ALIVE peers ACK received the batch into their
+	 * inbound queue (or走 RESET_PENDING fail-safe).  PGC_SIGHUP reload.
+	 */
+	DefineCustomEnumVariable("cluster.sinval_ack_mode",
+							 gettext_noop("Sinval propagation ack/barrier mode."),
+							 gettext_noop("none = fire-and-forget;peer_enqueued = wait IC ACK "
+										  "from each declared+CSSD-ALIVE peer (default).  Caller "
+										  "blocks WaitLatch until cluster.sinval_ack_timeout_ms."),
+							 &cluster_sinval_ack_mode, CLUSTER_SINVAL_ACK_MODE_PEER_ENQUEUED,
+							 cluster_sinval_ack_mode_options, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	/*
+	 * spec-2.39 D12:  cluster.sinval_ack_timeout_ms (int) — ack wait timeout.
+	 * On timeout WARN with SQLSTATE 53R95 + bump ack_timeout_count + DDL
+	 * continues (already committed locally + WAL flushed, no rollback).
+	 */
+	DefineCustomIntVariable(
+		"cluster.sinval_ack_timeout_ms", gettext_noop("Sinval ack wait timeout in milliseconds."),
+		gettext_noop("Maximum time cluster_sinval_enqueue_and_wait_ack will "
+					 "block waiting for peer ACKs.  Timeout → WARN 53R95 + "
+					 "ack_timeout_count++ + DDL continues.  PGC_SIGHUP."),
+		&cluster_sinval_ack_timeout_ms, 5000, 100, 60000, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	/*
+	 * spec-2.39 D12:  cluster.sinval_ack_wait_slots (int) — ack_wait HTAB
+	 * capacity (concurrent in-flight DDL ack waits).  PGC_POSTMASTER because
+	 * shmem is allocated once at startup from this value.
+	 */
+	DefineCustomIntVariable(
+		"cluster.sinval_ack_wait_slots", gettext_noop("Capacity of ClusterSinvalAckWait HTAB."),
+		gettext_noop("Maximum concurrent in-flight DDL ack waits per node.  "
+					 "Full → cluster_sinval_enqueue_and_wait_ack returns "
+					 "ENQUEUE_FAILED + bump outbound_queue_full_count + LMON "
+					 "broadcasts SINVAL_RESET_ALL_BROADCAST fail-safe.  "
+					 "PGC_POSTMASTER."),
+		&cluster_sinval_ack_wait_slots, 256, 64, 4096, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 }

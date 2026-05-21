@@ -917,6 +917,8 @@ LmonMain(void)
 			 */
 			cluster_scn_lmon_drain_boc_broadcast();
 			cluster_sinval_drain_outbound_and_broadcast();
+			cluster_sinval_drain_ack_outbound_and_send();
+			cluster_sinval_broadcast_reset_all();
 
 			/*
 			 * spec-2.34 D6 (HC93 leg a):  TTL sweep of the GCS block
@@ -1439,6 +1441,8 @@ LmonMain(void)
 
 			cluster_reconfig_lmon_tick();
 			cluster_sinval_drain_outbound_and_broadcast();
+			cluster_sinval_drain_ack_outbound_and_send();
+			cluster_sinval_broadcast_reset_all();
 
 			/* spec-2.34 D6 (HC93 leg a):  TTL sweep GCS block dedup HTAB. */
 			cluster_gcs_block_dedup_sweep_expired(GetCurrentTimestamp());

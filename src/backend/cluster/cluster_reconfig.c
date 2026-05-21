@@ -68,6 +68,7 @@
 #include "cluster/cluster_elog.h"	   /* cluster_node_id */
 #include "cluster/cluster_epoch.h"	   /* advance + observe + set_changed_at_lsn */
 #include "cluster/cluster_gcs_block.h" /* spec-2.34 D4 — eager epoch wake hook */
+#include "cluster/cluster_sinval.h"	   /* spec-2.39 D14 — RESET-all reconfig hook */
 #include "cluster/cluster_guc.h"	   /* cluster_enabled */
 #include "cluster/cluster_inject.h"	   /* CLUSTER_INJECTION_POINT */
 #include "cluster/cluster_qvotec.h"	   /* cluster_qvotec_in_quorum */
@@ -542,6 +543,15 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 	 * enforced by DoD grep (spec-2.34 §7).
 	 */
 	cluster_gcs_block_on_epoch_advance(new_epoch);
+
+	/*
+	 * spec-2.39 D14:  reconfig RESET-all hook.  Triggers local SIResetAll
+	 * via the SinvalBcast aux process + clears stale ack_wait entries so
+	 * blocked enqueuers don't wait forever on a peer that just died /
+	 * was added.  Local-only (each surviving node runs this for itself);
+	 * cluster弹性收敛.
+	 */
+	cluster_sinval_reset_all_on_reconfig();
 
 	memset(&evt, 0, sizeof(evt));
 	evt.event_id = cluster_reconfig_compute_event_id(dead_bitmap, cssd_dead_generation);

@@ -171,7 +171,7 @@ $stub_node->stop;
 is( $node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-		'88',
+		'91',
 		'pg_stat_cluster_wait_events returns 88 rows after spec-2.36 D7');
 
 $node->stop;

@@ -578,6 +578,13 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 # safe path (SIResetAll on SI Broadcaster aux process), not 53R94.
 53R94    E    ERRCODE_CLUSTER_SINVAL_QUEUE_FULL                                cluster_sinval_queue_full
 
+# PGRAC spec-2.39 D11:  ERRCODE_CLUSTER_SINVAL_ACK_TIMEOUT — DDL commit hook
+# called cluster_sinval_enqueue_and_wait_ack and one or more declared+CSSD-
+# ALIVE peers未 ACK within cluster.sinval_ack_timeout_ms (default 5s).  WARN
+# path only (DDL already committed locally + WAL flushed, no rollback).
+# Sender bumps ack_timeout_count;DBA monitors via pg_stat_cluster_counters.
+53R95    E    ERRCODE_CLUSTER_SINVAL_ACK_TIMEOUT                               cluster_sinval_ack_timeout
+
 Section: Class 54 - Program Limit Exceeded
 
 # this is for wired-in limits, not resource exhaustion problems (class borrowed from DB2)

@@ -1157,6 +1157,16 @@ pgstat_get_wait_cluster_sinval(WaitEventCluster w)
 	case WAIT_EVENT_SINVAL_INJECT_LOCAL_QUEUE:
 		event_name = "SinvalInjectLocalQueue";
 		break;
+	/* spec-2.39 D13:  3 NEW wait events for ack/barrier lifecycle. */
+	case WAIT_EVENT_SINVAL_ACK_WAIT:
+		event_name = "SinvalAckWait";
+		break;
+	case WAIT_EVENT_SINVAL_ACK_SEND:
+		event_name = "SinvalAckSend";
+		break;
+	case WAIT_EVENT_SINVAL_ACK_RECEIVE:
+		event_name = "SinvalAckReceive";
+		break;
 	default:
 		break;
 	}

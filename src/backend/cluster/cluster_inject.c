@@ -372,6 +372,23 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 */
 	{ .name = "cluster-sinval-broadcast-drop-send" },
 	{ .name = "cluster-sinval-receive-skip-validate" },
+	/*
+	 * spec-2.39 D17 — ACK envelope fault injection (2 NEW points).
+	 *
+	 *	cluster-sinval-ack-drop-send:
+	 *	  Fires inside cluster_sinval_drain_ack_outbound_and_send (LMON
+	 *	  context, after dequeue but before cluster_ic_send_envelope).
+	 *	  SKIP makes LMON silently drop the ACK envelope so sender path
+	 *	  exercises ack_timeout WARN 53R95 + bump ack_timeout_count.
+	 *
+	 *	cluster-sinval-ack-skip-validate:
+	 *	  Fires inside cluster_sinval_handle_ack_envelope.  SKIP bypasses
+	 *	  envelope CRC / acker_node bound / cluster_conf membership / status
+	 *	  validation entirely and proceeds directly to HTAB match (used
+	 *	  to reproduce malformed-ack scenarios for TAP coverage of HC140).
+	 */
+	{ .name = "cluster-sinval-ack-drop-send" },
+	{ .name = "cluster-sinval-ack-skip-validate" },
 };
 
 #define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_points)

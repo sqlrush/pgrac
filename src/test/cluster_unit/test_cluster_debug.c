@@ -581,6 +581,37 @@ cluster_sinval_get_echo_dropped_count(void)
 {
 	return 0;
 }
+/* spec-2.39 D8/D9:  6 NEW counter stubs. */
+uint64
+cluster_sinval_get_fanout_would_block_count(void)
+{
+	return 0;
+}
+uint64
+cluster_sinval_get_fanout_hard_error_count(void)
+{
+	return 0;
+}
+uint64
+cluster_sinval_get_fanout_peer_down_count(void)
+{
+	return 0;
+}
+uint64
+cluster_sinval_get_ack_received_count(void)
+{
+	return 0;
+}
+uint64
+cluster_sinval_get_ack_timeout_count(void)
+{
+	return 0;
+}
+uint64
+cluster_sinval_get_ack_orphan_count(void)
+{
+	return 0;
+}
 
 Size
 cluster_shmem_get_total_bytes(void)

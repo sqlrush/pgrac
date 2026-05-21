@@ -379,10 +379,13 @@ typedef enum {
 	WAIT_EVENT_RECOVERY_UNDO_REPLAY,
 	WAIT_EVENT_RECOVERY_PCM_STATE_RESTORE,
 
-	/* Cluster: Sinval (3 events) -- subsystem #9 */
+	/* Cluster: Sinval (6 events) -- subsystem #9; +3 NEW spec-2.39 D13 */
 	WAIT_EVENT_SINVAL_BROADCAST_SEND = PG_WAIT_CLUSTER_SINVAL,
 	WAIT_EVENT_SINVAL_BROADCAST_RECEIVE,
 	WAIT_EVENT_SINVAL_INJECT_LOCAL_QUEUE,
+	WAIT_EVENT_SINVAL_ACK_WAIT,		/* spec-2.39 D13:  enqueue_and_wait_ack WaitLatch */
+	WAIT_EVENT_SINVAL_ACK_SEND,		/* spec-2.39 D13:  LMON drain ack_outbound + send */
+	WAIT_EVENT_SINVAL_ACK_RECEIVE,	/* spec-2.39 D13:  IC handler ack envelope receive */
 
 	/* Cluster: Interconnect (5 events + 6 spec-2.2 D8) -- AD-007 */
 	WAIT_EVENT_INTERCONNECT_RDMA_SEND = PG_WAIT_CLUSTER_INTERCONNECT,

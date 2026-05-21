@@ -86,7 +86,7 @@ cmp_ok($catver, '>=', 202605440,
 
 is($pair->node0->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'88',
+	'91',
 	'L2 wait event count == 88 (spec-2.37 D11: 0 NEW wait events, lost-write check is non-blocking)');
 
 is($pair->node0->safe_psql(
