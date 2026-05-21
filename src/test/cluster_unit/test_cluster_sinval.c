@@ -10,7 +10,7 @@
  *
  *	  Tests in this binary (L1-L24):
  *	    L1  PGRAC_IC_MSG_SINVAL == 7
- *	    L2  CLUSTER_IC_PRODUCER_SINVAL_BCAST == (1u << B_SINVAL_BCAST) (HC139)
+ *	    L2  CLUSTER_IC_PRODUCER_SINVAL_FANOUT == (1u << B_LMON) (HC139)
  *	    L3  SinvalBroadcastHeader sizeof == 24B (HC138)
  *	    L4  SharedInvalidationMessage sizeof == 16B (HC137 锁 PG ABI)
  *	    L5  CLUSTER_SINVAL_BATCH_MAX == 64
@@ -87,10 +87,11 @@ UT_TEST(test_sinval_msg_type_is_7)
 	UT_ASSERT_EQ((int)PGRAC_IC_MSG_SINVAL, 7);
 }
 
-UT_TEST(test_producer_mask_equals_sinval_bcast_bit)
+UT_TEST(test_producer_mask_equals_lmon_bit)
 {
-	/* HC139: producer mask must equal exactly 1u << B_SINVAL_BCAST so
-	 * only the SI Broadcaster aux process may send SINVAL envelopes. */
+	/* HC139 hardening: outbound wire fanout must be LMON-mediated because
+	 * tier1 TCP fds are LMON process-local. */
+	UT_ASSERT_EQ((unsigned int)CLUSTER_IC_PRODUCER_SINVAL_FANOUT, (unsigned int)(1u << B_LMON));
 	UT_ASSERT_EQ((unsigned int)CLUSTER_IC_PRODUCER_SINVAL_BCAST,
 				 (unsigned int)(1u << B_SINVAL_BCAST));
 }
@@ -258,7 +259,7 @@ UT_TEST(test_wire_abi_tail_size_invariant)
 UT_TEST(test_no_rebroadcast_loop_invariant)
 {
 	/* HC132 防 echo loop:  outbound queue is the ONLY broadcast source.
-	 * The proxy main loop (cluster_sinval_drain_outbound_and_broadcast)
+	 * The LMON-mediated fanout path (cluster_sinval_drain_outbound_and_broadcast)
 	 * reads ClusterSinvalOutbound exclusively;  PG-native SI queue is
 	 * NEVER read by the broadcast path.  This test is a static contract
 	 * statement;  the actual no-rebroadcast invariant is verified by
@@ -318,7 +319,7 @@ int
 main(void)
 {
 	UT_RUN(test_sinval_msg_type_is_7);
-	UT_RUN(test_producer_mask_equals_sinval_bcast_bit);
+	UT_RUN(test_producer_mask_equals_lmon_bit);
 	UT_RUN(test_broadcast_header_sizeof_24);
 	UT_RUN(test_shared_inval_msg_sizeof_16);
 	UT_RUN(test_batch_max_is_64);

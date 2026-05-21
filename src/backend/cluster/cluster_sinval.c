@@ -13,10 +13,11 @@
  *	    - cluster_sinval_enqueue_batch public API (HC134 fail-closed)
  *	    - 9 counter accessors (HC134 observability)
  *
- *	  Drain paths (drain_outbound_and_broadcast / drain_inbound_and_apply /
- *	  apply_inbound_overflow_reset_if_pending) live in this file but are
- *	  called only from the SI Broadcaster aux process (cluster_sinval_bcast.c
- *	  main loop).  Backend / IC handler contexts MUST NOT call them.
+ *	  Drain paths live in this file but have split ownership:
+ *	    - outbound fanout is called only from LMON (tier1 fd owner);
+ *	    - inbound apply/reset is called only from the SI Broadcaster aux
+ *	      process (cluster_sinval_bcast.c main loop).
+ *	  Backend / IC handler contexts MUST NOT call drain helpers directly.
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
@@ -42,11 +43,16 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include <signal.h>
+#include <unistd.h>
+
+#include "cluster/cluster_conf.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_inject.h"
+#include "cluster/cluster_lmon.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_sinval.h"
 #include "miscadmin.h"
@@ -88,6 +94,7 @@ typedef struct ClusterSinvalQueue {
 
 typedef struct ClusterSinvalShared {
 	pg_atomic_uint32 inbound_overflow_reset_pending; /* HC134 fail-safe flag */
+	pg_atomic_uint32 sinval_bcast_pid;				 /* shared latch wake target */
 	pg_atomic_uint64 next_batch_id;					 /* monotone allocator */
 	/* 9 D10 counters */
 	pg_atomic_uint64 broadcast_send_count;
@@ -163,6 +170,7 @@ cluster_sinval_outbound_shmem_init(void)
 
 		ClusterSinval = (ClusterSinvalShared *)(block + queue_size);
 		pg_atomic_init_u32(&ClusterSinval->inbound_overflow_reset_pending, 0);
+		pg_atomic_init_u32(&ClusterSinval->sinval_bcast_pid, 0);
 		pg_atomic_init_u64(&ClusterSinval->next_batch_id, 1);
 		pg_atomic_init_u64(&ClusterSinval->broadcast_send_count, 0);
 		pg_atomic_init_u64(&ClusterSinval->broadcast_receive_count, 0);
@@ -268,7 +276,12 @@ cluster_sinval_enqueue_batch(const SharedInvalidationMessage *msgs, int n)
 	pg_atomic_write_u32(&ClusterSinvalOutbound->tail, (tail + 1) % ClusterSinvalOutbound->capacity);
 	LWLockRelease(&ClusterSinvalOutbound->lock.lock);
 
-	cluster_sinval_set_proc_latch();
+	/*
+	 * Outbound fanout is LMON-owned because LMON owns the process-local
+	 * tier1 TCP fds.  Wake LMON immediately; its main loop drains the
+	 * outbound queue via cluster_ic_send_envelope_fanout().
+	 */
+	cluster_lmon_wakeup();
 	return true;
 }
 
@@ -384,6 +397,12 @@ cluster_sinval_handle_envelope(const ClusterICEnvelope *env, const void *payload
 		pg_atomic_fetch_add_u64(&ClusterSinval->validation_drop_count, 1);
 		return;
 	}
+	if (hdr->flags != 0 || hdr->source_node < 0 || hdr->source_node >= CLUSTER_MAX_NODES
+		|| env->source_node_id != (uint32)hdr->source_node
+		|| cluster_conf_lookup_node(hdr->source_node) == NULL) {
+		pg_atomic_fetch_add_u64(&ClusterSinval->validation_drop_count, 1);
+		return;
+	}
 
 	/* HC100 epoch check */
 	current_epoch = cluster_epoch_get_current();
@@ -425,12 +444,22 @@ cluster_sinval_drain_outbound_and_broadcast(void)
 	if (ClusterSinvalOutbound == NULL)
 		return;
 
+	if (MyBackendType != B_LMON)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cluster_sinval_drain_outbound_and_broadcast: callable only "
+							   "from LMON process context"),
+						errhint("SINVAL outbound broadcast must be LMON-mediated because tier1 "
+								"TCP file descriptors are LMON process-local.")));
+
 	while (drained < batch_limit) {
 		ClusterSinvalQueueEntry local;
 		uint32 head;
 		SinvalBroadcastHeader hdr;
 		Size payload_len;
 		char *buf;
+		ClusterICFanoutResult per_peer[CLUSTER_MAX_NODES];
+		int peer;
+		bool sent_any = false;
 
 		LWLockAcquire(&ClusterSinvalOutbound->lock.lock, LW_EXCLUSIVE);
 		if (queue_is_empty_locked(ClusterSinvalOutbound)) {
@@ -468,8 +497,14 @@ cluster_sinval_drain_outbound_and_broadcast(void)
 			continue;
 		}
 
-		if (cluster_ic_send_envelope(PGRAC_IC_MSG_SINVAL, PGRAC_IC_BROADCAST, buf, payload_len)
-			== CLUSTER_IC_SEND_DONE)
+		cluster_ic_send_envelope_fanout(PGRAC_IC_MSG_SINVAL, buf, payload_len, per_peer);
+		for (peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
+			if (per_peer[peer] == CLUSTER_IC_FANOUT_DONE) {
+				sent_any = true;
+				break;
+			}
+		}
+		if (sent_any)
 			pg_atomic_fetch_add_u64(&ClusterSinval->broadcast_send_count, 1);
 
 		pfree(buf);
@@ -564,7 +599,7 @@ cluster_sinval_module_init(void)
 static const ClusterICMsgTypeInfo cluster_sinval_msg_info = {
 	.msg_type = PGRAC_IC_MSG_SINVAL,
 	.name = "cluster_sinval",
-	.allowed_producer_mask = CLUSTER_IC_PRODUCER_SINVAL_BCAST,
+	.allowed_producer_mask = CLUSTER_IC_PRODUCER_SINVAL_FANOUT,
 	.broadcast_ok = true,
 	.handler = cluster_sinval_handle_envelope,
 };
@@ -583,13 +618,36 @@ void
 cluster_sinval_register_proc_latch(Latch *latch)
 {
 	ClusterSinvalBcastLatch = latch;
+	if (ClusterSinval != NULL)
+		pg_atomic_write_u32(&ClusterSinval->sinval_bcast_pid, (uint32)MyProcPid);
+}
+
+void
+cluster_sinval_unregister_proc_latch(void)
+{
+	if (ClusterSinval != NULL
+		&& (pid_t)pg_atomic_read_u32(&ClusterSinval->sinval_bcast_pid) == MyProcPid)
+		pg_atomic_write_u32(&ClusterSinval->sinval_bcast_pid, 0);
+	if (ClusterSinvalBcastLatch != NULL)
+		ClusterSinvalBcastLatch = NULL;
 }
 
 void
 cluster_sinval_set_proc_latch(void)
 {
-	if (ClusterSinvalBcastLatch != NULL)
+	pid_t pid;
+
+	if (ClusterSinvalBcastLatch != NULL) {
 		SetLatch(ClusterSinvalBcastLatch);
+		return;
+	}
+
+	if (ClusterSinval == NULL)
+		return;
+
+	pid = (pid_t)pg_atomic_read_u32(&ClusterSinval->sinval_bcast_pid);
+	if (pid > 0 && pid != MyProcPid)
+		(void)kill(pid, SIGUSR1);
 }
 
 

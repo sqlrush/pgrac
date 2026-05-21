@@ -74,6 +74,7 @@
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_scn.h" /* cluster_scn_boc_broadcast_handler (spec-2.9 D1) */
 #include "cluster/cluster_ges.h" /* cluster_ges_{request,reply}_handler (spec-2.13 D3) */
+#include "cluster/cluster_sinval.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h" /* WAIT_EVENT_CLUSTER_BGPROC_LMON_MAIN_LOOP (1.11 Sprint B) */
 
@@ -340,6 +341,21 @@ cluster_lmon_shmem_init(void)
 		if (!gcs_block_registered) {
 			cluster_gcs_register_block_msg_types();
 			gcs_block_registered = true;
+		}
+	}
+
+	/*
+	 * spec-2.38 hardening: register SINVAL with LMON as producer.
+	 * Backends enqueue into ClusterSinvalOutbound; LMON owns tier1 TCP fds
+	 * and drains/fanouts the queue.  SinvalBcast applies inbound messages
+	 * locally and does not send wire frames.
+	 */
+	{
+		static bool sinval_registered = false;
+
+		if (!sinval_registered) {
+			cluster_sinval_register_msg_type();
+			sinval_registered = true;
 		}
 	}
 }
@@ -900,6 +916,7 @@ LmonMain(void)
 			 * in LMON because LMON owns the process-local IC fds.
 			 */
 			cluster_scn_lmon_drain_boc_broadcast();
+			cluster_sinval_drain_outbound_and_broadcast();
 
 			/*
 			 * spec-2.34 D6 (HC93 leg a):  TTL sweep of the GCS block
@@ -1421,6 +1438,7 @@ LmonMain(void)
 			cluster_grd_lmon_tick_dead_sweep();
 
 			cluster_reconfig_lmon_tick();
+			cluster_sinval_drain_outbound_and_broadcast();
 
 			/* spec-2.34 D6 (HC93 leg a):  TTL sweep GCS block dedup HTAB. */
 			cluster_gcs_block_dedup_sweep_expired(GetCurrentTimestamp());

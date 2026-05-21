@@ -583,16 +583,16 @@ typedef enum {
 	 * SI Broadcaster (Shared Invalidation Broadcaster) is the 9th cluster
 	 * background process — spec-2.38 Sprint A D4.  Appended after
 	 * LmdProcess to preserve numeric values.  Cross-node sinval message
-	 * propagation:  drains ClusterSinvalOutbound and broadcasts via
-	 * PGRAC_IC_MSG_SINVAL wire envelope;  drains ClusterSinvalInbound
-	 * and applies SendSharedInvalidMessages (PG-native sinval API);
-	 * executes fail-safe SIResetAll() on inbound overflow (HC134).  The
-	 * IC inbound handler nonblocking 约束 (HC133) forbids LWLockAcquire
-	 * inside handler context, so all real apply work is deferred to this
-	 * aux process main loop.  Producer mask CLUSTER_IC_PRODUCER_SINVAL_
-	 * BCAST (= 1 << B_SINVAL_BCAST) means only this aux process may
-	 * directly send SINVAL wire envelopes (HC139); backends must enqueue
-	 * via cluster_sinval_enqueue_batch().  See cluster_sinval_bcast.h.
+	 * propagation:  LMON drains ClusterSinvalOutbound and fanouts
+	 * PGRAC_IC_MSG_SINVAL wire envelopes because tier1 TCP descriptors
+	 * are LMON-local;  this aux process drains ClusterSinvalInbound and
+	 * applies SendSharedInvalidMessages (PG-native sinval API); executes
+	 * fail-safe SIResetAll() on inbound overflow (HC134).  The IC inbound
+	 * handler nonblocking 约束 (HC133) forbids LWLockAcquire inside handler
+	 * context, so all real apply work is deferred to this aux process main
+	 * loop.  Producer mask CLUSTER_IC_PRODUCER_SINVAL_FANOUT means only
+	 * LMON may directly send SINVAL wire envelopes (HC139); backends must
+	 * enqueue via cluster_sinval_enqueue_batch().  See cluster_sinval_bcast.h.
 	 */
 	SinvalBcastProcess,
 #endif

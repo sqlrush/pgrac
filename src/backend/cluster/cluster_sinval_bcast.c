@@ -5,16 +5,13 @@
  *
  *	  Aux process spawned by postmaster Phase 4 (after IC + LMON).
  *	  Main loop:
- *	    (1) drain ClusterSinvalOutbound — broadcast via PGRAC_IC_MSG_SINVAL
- *	    (2) apply pending fail-safe SIResetAll if inbound overflowed
- *	    (3) drain ClusterSinvalInbound — SendSharedInvalidMessages locally
- *	    (4) WaitLatch (cluster.sinval_broadcast_batch_timeout_ms)
+ *	    (1) apply pending fail-safe SIResetAll if inbound overflowed
+ *	    (2) drain ClusterSinvalInbound — SendSharedInvalidMessages locally
+ *	    (3) WaitLatch (cluster.sinval_broadcast_batch_timeout_ms)
  *
- *	  HC139 producer mask:  this aux process is the ONLY context where
- *	  cluster_ic_send_envelope(PGRAC_IC_MSG_SINVAL) is permitted by the
- *	  dispatch table (allowed_producer_mask = CLUSTER_IC_PRODUCER_SINVAL_BCAST).
- *	  Backends invoking cluster_ic_send_envelope with SINVAL msg_type are
- *	  rejected at send time.
+ *	  Outbound broadcast is LMON-mediated because tier1 TCP fds are LMON
+ *	  process-local.  Backends enqueue, LMON drains outbound + fanouts, and
+ *	  this aux process applies inbound messages locally.
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
@@ -54,6 +51,12 @@
 #include "utils/wait_event.h"
 
 
+static void
+SinvalBcastBeforeShmemExit(int code pg_attribute_unused(), Datum arg pg_attribute_unused())
+{
+	cluster_sinval_unregister_proc_latch();
+}
+
 /*
  * SinvalBcastMain — aux process main entry.  Modeled on LmonMain (spec-1.11)
  * and bgwriter.c / walwriter.c PG aux-process signal layout.
@@ -86,6 +89,7 @@ SinvalBcastMain(void)
 	 * IC handlers can SetLatch to wake us for drain work.
 	 */
 	cluster_sinval_register_proc_latch(MyLatch);
+	before_shmem_exit(SinvalBcastBeforeShmemExit, (Datum)0);
 
 	/* Error context for unexpected ereport ERROR — log and continue.
 	 * Skeleton scope: minimal error handling (no buffer/lock/smgr cleanup
@@ -112,11 +116,11 @@ SinvalBcastMain(void)
 
 		/*
 		 * HC136 main loop drain pattern (reuse spec-1.11 LMON):
-		 *   (1) outbound → broadcast
-		 *   (2) inbound overflow → SIResetAll fail-safe
-		 *   (3) inbound → SendSharedInvalidMessages
+		 *   (1) inbound overflow → SIResetAll fail-safe
+		 *   (2) inbound → SendSharedInvalidMessages
+		 *
+		 * Outbound fanout is drained by LMON, not this process.
 		 */
-		cluster_sinval_drain_outbound_and_broadcast();
 		cluster_sinval_apply_inbound_overflow_reset_if_pending();
 		cluster_sinval_drain_inbound_and_apply();
 

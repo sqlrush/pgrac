@@ -1952,18 +1952,10 @@ ServerLoop(void)
 
 		/*
 		 * PGRAC: spec-2.38 D4 — SI Broadcaster aux process spawn.
-		 * Skeleton scope: aux process spawn is wired but DISABLED by
-		 * default to avoid InitAuxiliaryProcess slot conflict observed
-		 * during initial Sprint A integration on macOS fork model.
-		 * Spec-2.38 Hardening v1.0.1 / spec-2.39 will diagnose root
-		 * cause (suspected:  AuxProcType count interaction with PG
-		 * 16.13 fixed-size aux process arrays).  Outbound /  inbound
-		 * queue shmem regions + IC handler + cluster_sinval_enqueue_
-		 * batch API + 9 counters remain fully functional;  test inject
-		 * path uses synchronous helpers (no aux process required).
+		 * LMON owns outbound fanout because tier1 TCP fds are LMON
+		 * process-local; SinvalBcast owns inbound apply + reset.
 		 */
-		if (cluster_enabled && cluster_node_id >= 0 && SinvalBcastPID == 0
-			&& pmState == PM_RUN)
+		if (cluster_enabled && cluster_node_id >= 0 && SinvalBcastPID == 0 && pmState == PM_RUN)
 			SinvalBcastPID = StartSinvalBcast();
 
 		/*
@@ -2855,6 +2847,8 @@ process_pm_reload_request(void)
 			signal_child(LmsPID, SIGHUP);
 		if (LmdPID != 0) /* PGRAC spec-2.19 Sprint A Step 1 */
 			signal_child(LmdPID, SIGHUP);
+		if (SinvalBcastPID != 0) /* PGRAC spec-2.38 SI Broadcaster */
+			signal_child(SinvalBcastPID, SIGHUP);
 #endif
 		if (AutoVacPID != 0)
 			signal_child(AutoVacPID, SIGHUP);
@@ -3987,9 +3981,10 @@ PostmasterStateMachine(void)
 		 * cluster_run_shutdown_sequence (which fires AFTER children
 		 * already exited) has no effect.  Q10 user-finding 2026-05-04.
 		 */
-		/* spec-2.19 Q10 LIFO: LMD first (last-spawned in Phase 2.C
-		 * after LMS; SIGTERM sets ShutdownRequestPending which the LMD
-		 * main loop polls). */
+		/* spec-2.38 LIFO: SinvalBcast first (last-spawned). */
+		if (SinvalBcastPID != 0)
+			signal_child(SinvalBcastPID, SIGTERM);
+		/* spec-2.19 Q10 LIFO: LMD next. */
 		if (LmdPID != 0)
 			signal_child(LmdPID, SIGTERM);
 		/* spec-2.18 Q10 LIFO: LMS next (was last-spawned in Phase 2.C
@@ -4078,6 +4073,8 @@ PostmasterStateMachine(void)
 			LmsPID == 0 &&
 			/* PGRAC: spec-2.19 Sprint A — same wait for LMD. */
 			LmdPID == 0 &&
+			/* PGRAC: spec-2.38 Sprint A — same wait for SI Broadcaster. */
+			SinvalBcastPID == 0 &&
 #endif
 			AutoVacPID == 0) {
 			if (Shutdown >= ImmediateShutdown || FatalError) {
@@ -4429,6 +4426,8 @@ TerminateChildren(int signal)
 		signal_child(LmsPID, signal);
 	if (LmdPID != 0) /* PGRAC spec-2.19 Sprint A Step 1 */
 		signal_child(LmdPID, signal);
+	if (SinvalBcastPID != 0) /* PGRAC spec-2.38 SI Broadcaster */
+		signal_child(SinvalBcastPID, signal);
 #endif
 }
 

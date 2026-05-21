@@ -6,9 +6,10 @@
  *	  spec-2.38 真激活 PGRAC_IC_MSG_SINVAL = 7 wire msg type + B_SINVAL_BCAST
  *	  BackendType + 3 wait events (all占位至 spec-2.38 起 wire-up real).
  *	  Skeleton MVP scope:
- *	    - aux process spawn + main loop (drain outbound queue → broadcast;
- *	      drain inbound queue → SIInsertDataEntries; fail-safe SIResetAll
- *	      on inbound overflow)
+ *	    - aux process spawn + main loop (drain inbound queue →
+ *	      SIInsertDataEntries; fail-safe SIResetAll on inbound overflow)
+ *	    - LMON drains outbound queue → IC fanout, because tier1 TCP fds are
+ *	      LMON process-local
  *	    - wire ABI: SinvalBroadcastHeader 24B fixed + variable-length tail
  *	      of N × SharedInvalidationMessage (PG-native 16B union)
  *	    - public API cluster_sinval_enqueue_batch() — only entry point for
@@ -31,8 +32,9 @@
  *	          spec-1.11 LMON pattern)
  *	    HC137 StaticAssertDecl(SharedInvalidationMessage == 16) 锁 PG ABI
  *	    HC138 wire ABI variable-length tail (reuse spec-2.4 chunked framing)
- *	    HC139 producer mask = CLUSTER_IC_PRODUCER_SINVAL_BCAST only;backend
- *	          不可 bypass outbound queue 直发 SINVAL wire
+ *	    HC139 producer mask = CLUSTER_IC_PRODUCER_SINVAL_FANOUT (LMON) only;
+ *	          backend / SinvalBcast 不可 bypass outbound queue 直发 SINVAL
+ *	          wire
  *
  *	  Wire layout (envelope payload):
  *	    [  0,  24)  SinvalBroadcastHeader (HC138 fixed-size prefix)
@@ -116,15 +118,13 @@ StaticAssertDecl(sizeof(SinvalBroadcastHeader) == 24,
 				 "variable-length tail nmsgs × SharedInvalidationMessage (16B each) follows");
 
 /* ============================================================
- * HC139:  producer mask — only the SI Broadcaster aux process (which
- *         holds B_SINVAL_BCAST BackendType) is permitted to send
- *         PGRAC_IC_MSG_SINVAL wire envelopes via cluster_ic_send_envelope.
- *         Backends MUST enqueue into ClusterSinvalOutbound via the public
- *         API cluster_sinval_enqueue_batch();  direct wire send by backend
- *         context is rejected at cluster_ic_send_envelope() time by the
- *         producer mask check (spec-2.32 §3.9 enforcement layer).
+ * HC139:  producer mask — only LMON may send PGRAC_IC_MSG_SINVAL wire
+ *         envelopes because it owns tier1 TCP fds.  Backends MUST enqueue
+ *         into ClusterSinvalOutbound via cluster_sinval_enqueue_batch();
+ *         SinvalBcast only applies inbound messages locally.
  * ============================================================ */
 #define CLUSTER_IC_PRODUCER_SINVAL_BCAST ((uint32)(1u << B_SINVAL_BCAST))
+#define CLUSTER_IC_PRODUCER_SINVAL_FANOUT ((uint32)(1u << B_LMON))
 
 
 /* ============================================================
@@ -164,10 +164,13 @@ extern bool cluster_sinval_inbound_try_enqueue(uint64 batch_id,
 											   int32 source_node);
 
 /*
- * Drain helpers — called from SI Broadcaster aux process main loop only.
- * Both perform real work that may block on LWLock or trigger PG sinval
- * operations (SIInsertDataEntries / SIResetAll);  IC inbound handler MUST
- * NOT call these directly.
+ * Drain helpers.
+ *
+ *   cluster_sinval_drain_outbound_and_broadcast is LMON-only because only
+ *   LMON owns tier1 TCP fds and may call cluster_ic_send_envelope_fanout().
+ *   The SI Broadcaster aux process owns inbound apply + reset only.
+ *
+ *   IC inbound handler MUST NOT call these directly.
  */
 extern void cluster_sinval_drain_outbound_and_broadcast(void);
 extern void cluster_sinval_drain_inbound_and_apply(void);
@@ -214,6 +217,7 @@ extern uint64 cluster_sinval_get_echo_dropped_count(void);
  */
 extern void cluster_sinval_set_proc_latch(void);
 extern void cluster_sinval_register_proc_latch(struct Latch *latch);
+extern void cluster_sinval_unregister_proc_latch(void);
 
 #endif /* USE_PGRAC_CLUSTER */
 #endif /* CLUSTER_SINVAL_H */

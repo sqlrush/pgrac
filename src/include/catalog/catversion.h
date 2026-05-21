@@ -456,14 +456,15 @@
  * GrdEntry sizeof bump + reply status extension. */
 /* spec-2.38 D7 (2026-05-20):  SI Broadcaster skeleton — 真激活
  * PGRAC_IC_MSG_SINVAL=7 wire msg type + B_SINVAL_BCAST aux process +
- * 3 wait events (all 占位至 spec-2.38 起 wire-up real).
+ * LMON-mediated outbound fanout + 3 wait events (all 占位至
+ * spec-2.38 起 wire-up real).
  * NEW SinvalBroadcastHeader 24B fixed prefix + variable-length
  *   N × SharedInvalidationMessage (16B each, HC137 PG ABI 锁) tail;
  *   envelope.payload_length = 24 + 16 * nmsgs.
  * NEW 2 shmem regions:  ClusterSinvalOutbound + ClusterSinvalInbound
  *   (ring buffer + LWLockPadded;  capacity = cluster.sinval_broadcast_
  *   max_queue_size default 1024).
- * NEW AuxProcType SinvalBcastProcess (HC139 producer mask /
+ * NEW AuxProcType SinvalBcastProcess (inbound apply/reset owner;
  *   AuxiliaryProcessMain dispatch;  postmaster Phase 4 spawn).
  * NEW public API cluster_sinval_enqueue_batch() — only outbound entry
  *   point;  returns bool (HC134 fail-closed,禁 silent drop).

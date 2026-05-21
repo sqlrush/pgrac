@@ -584,7 +584,7 @@ test_cluster_gcs_block_lost_write: test_cluster_gcs_block_lost_write.c unit_test
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 # spec-2.38 D11/D12:  test_cluster_sinval verifies SI Broadcaster skeleton
-# compile-time invariants (msg_type 7,  CLUSTER_IC_PRODUCER_SINVAL_BCAST
+# compile-time invariants (msg_type 7,  LMON-mediated SINVAL fanout
 # producer mask,  SinvalBroadcastHeader sizeof 24B,  SharedInvalidation-
 # Message sizeof 16B PG ABI lock,  CLUSTER_SINVAL_BATCH_MAX 64,  all 6
 # helper prototypes linkable,  9 counter accessors,  SinvalBcastProcess

@@ -141,8 +141,9 @@ typedef enum ClusterICMsgType {
 									 * skeleton (was spec-2.18 reserved).
 									 * SinvalBroadcastHeader 24B + variable-length
 									 * SharedInvalidationMessage[16B] tail;
-									 * producer mask = CLUSTER_IC_PRODUCER_SINVAL_BCAST
-									 * (HC139 — backend 不可 bypass outbound queue) */
+									 * producer mask = CLUSTER_IC_PRODUCER_SINVAL_FANOUT
+									 * (HC139 — LMON-mediated fanout; backend
+									 * 不可 bypass outbound queue) */
 	PGRAC_IC_MSG_FENCE_NOTIFY = 8,	/* spec-2.28 reserved */
 	PGRAC_IC_MSG_RECONFIG = 9,		/* spec-2.29 reserved */
 	/* 11 is already occupied by PGRAC_IC_MSG_CSSD_HEARTBEAT macro in

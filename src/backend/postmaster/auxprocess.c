@@ -133,11 +133,11 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 		break;
 	/*
 	 * spec-2.38 D4: SI Broadcaster (Shared Invalidation Broadcaster)
-	 * aux process — drains ClusterSinvalOutbound and broadcasts via
-	 * PGRAC_IC_MSG_SINVAL; drains ClusterSinvalInbound and applies
-	 * SendSharedInvalidMessages; executes fail-safe SIResetAll on
-	 * inbound overflow.  Producer mask CLUSTER_IC_PRODUCER_SINVAL_BCAST
-	 * (HC139); backends MUST enqueue via cluster_sinval_enqueue_batch.
+	 * aux process — drains ClusterSinvalInbound and applies
+	 * SendSharedInvalidMessages; executes fail-safe SIResetAll on inbound
+	 * overflow.  LMON drains ClusterSinvalOutbound and fanouts
+	 * PGRAC_IC_MSG_SINVAL because tier1 TCP descriptors are LMON-local.
+	 * Backends MUST enqueue via cluster_sinval_enqueue_batch.
 	 */
 	case SinvalBcastProcess:
 		MyBackendType = B_SINVAL_BCAST;

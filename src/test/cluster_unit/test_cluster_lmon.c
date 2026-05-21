@@ -365,6 +365,17 @@ void
 cluster_gcs_register_block_msg_types(void)
 {}
 
+/* spec-2.38 hardening stubs: LMON registers the SINVAL msg type and
+ * drains its outbound queue, but this standalone unit binary does not
+ * link cluster_sinval.o. */
+void
+cluster_sinval_register_msg_type(void)
+{}
+
+void
+cluster_sinval_drain_outbound_and_broadcast(void)
+{}
+
 /* spec-2.2 D5 LMON drive references cluster_conf_lookup_node + cluster_node_id. */
 const struct ClusterNodeInfo *
 cluster_conf_lookup_node(int32 node_id pg_attribute_unused())

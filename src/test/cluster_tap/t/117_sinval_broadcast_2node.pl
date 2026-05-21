@@ -3,7 +3,7 @@
 #
 # 117_sinval_broadcast_2node.pl
 #	  spec-2.38 SI Broadcaster skeleton integration on a 2-node ClusterPair.
-#	  Verifies aux process spawn + wire ABI + dump_sinval observability +
+#	  Verifies aux process spawn + LMON-mediated wire ABI + dump_sinval observability +
 #	  GUC defaults + 53R94 SQLSTATE.  Behavioral inject (echo defense,
 #	  inbound fail-safe reset, queue full fail-closed) lives in the
 #	  cluster_unit static contracts (L20-L24) since true cross-node

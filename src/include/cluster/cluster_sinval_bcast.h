@@ -4,8 +4,9 @@
  *	  pgrac cluster SI Broadcaster aux process — spec-2.38 D4.
  *
  *	  Aux process spawned by postmaster Phase 4 (after IC + LMON);
- *	  main loop drains ClusterSinvalOutbound + ClusterSinvalInbound and
- *	  performs fail-safe SIResetAll() on inbound overflow.
+ *	  main loop drains ClusterSinvalInbound and performs fail-safe
+ *	  SIResetAll() on inbound overflow.  Outbound fanout is LMON-mediated
+ *	  because tier1 TCP descriptors are LMON process-local.
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
