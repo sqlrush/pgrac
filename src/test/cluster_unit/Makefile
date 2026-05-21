@@ -34,7 +34,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_ic_mock test_cluster_inject test_cluster_pgstat \
         test_cluster_debug test_cluster_shared_fs test_cluster_smgr \
         test_cluster_scn test_cluster_block_format test_cluster_itl_slot \
-        test_cluster_buffer_desc test_cluster_pcm_lock test_cluster_bufmgr_pcm_hook test_cluster_gcs_dispatch test_cluster_gcs_block test_cluster_gcs_block_retransmit test_cluster_gcs_block_2way test_cluster_gcs_block_3way test_cluster_gcs_block_lost_write test_cluster_sinval test_cluster_sinval_ack \
+        test_cluster_buffer_desc test_cluster_pcm_lock test_cluster_bufmgr_pcm_hook test_cluster_gcs_dispatch test_cluster_gcs_block test_cluster_gcs_block_retransmit test_cluster_gcs_block_2way test_cluster_gcs_block_3way test_cluster_gcs_block_lost_write test_cluster_sinval test_cluster_sinval_ack test_cluster_stage2_acceptance \
         test_cluster_startup_phase test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_cssd test_cluster_qvotec test_cluster_voting_disk_io test_cluster_quorum_decision \
         test_cluster_xlog test_cluster_tt_slot test_cluster_undo_segment \
         test_cluster_epoch test_cluster_fence test_cluster_reconfig \
@@ -606,6 +606,20 @@ test_cluster_sinval: test_cluster_sinval.c unit_test.h \
 # accessors linkable, ClusterSinvalAckMode 2 enum values, 53R95 SQLSTATE
 # encodable).  Header-only;  behavioral coverage in cluster_tap t/118.
 test_cluster_sinval_ack: test_cluster_sinval_ack.c unit_test.h \
+		$(CLUSTER_VERSION_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-2.40 D8:  test_cluster_stage2_acceptance — 8 static contract
+# tests verifying Stage 2 final surface snapshot (catversion >= 202605460,
+# msg_types 7/12-19 cumulative, capability counter symbols linkable,
+# 5 fault inject point name strings, wait events count 91 snapshot,
+# SQLSTATE 53R60/90-95 encodable, GUC enum + shmem_max_regions
+# boot_val=64 snapshot, RESERVED_0=0 sentinel).  Header-only;
+# behavioral coverage in cluster_tap t/200-202.
+test_cluster_stage2_acceptance: test_cluster_stage2_acceptance.c unit_test.h \
 		$(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \

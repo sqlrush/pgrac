@@ -101,6 +101,15 @@ jobs:
         run: make check
 
       - name: Run cluster-check (unit + tap full + regress)
+        # spec-2.40 D9:  cluster_tap full suite (含 t/200_stage2_
+        # acceptance_capability + t/201_stage2_acceptance_fault_matrix +
+        # t/202_stage2_acceptance_perf_smoke)在此 job 已嵌入(tier-1 smoke).
+        # 真 tier-2 medium soak (4 workload × 10min × 2-node + 2 workload ×
+        # 10min × 3-node = 60min workload + 30min buffer = 90min) 是 manual
+        # via:  TIER=medium PORT0=... PORT1=... PORT2=... \
+        #         bash scripts/perf/run-stage2-cluster-baseline.sh
+        # (separate dedicated job future work per spec-2.40 D9 forward-link;
+        # 本 nightly job 不假设 build artifact 跨 job 复用 — spec v0.2 F2).
         run: make -C src/test cluster-check
 
       - name: Upload regression diffs on failure

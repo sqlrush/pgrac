@@ -62,3 +62,6 @@ src/test/cluster_*/regression.out
 # repo root (spec-1.18.1 ship-time hygiene).
 /cppcheck.xml
 /cppcheck-summary.txt
+
+# spec-2.40 D14:  Stage 2 acceptance JSON report tmp/ artifacts.
+src/test/cluster_tap/tmp/
