@@ -281,6 +281,14 @@ cluster_tt_status_hint_handle_envelope(const ClusterICEnvelope *env, const void 
 	if (ClusterTTHintCounters == NULL || env == NULL || payload == NULL)
 		return;
 
+	/* HC187: exact payload ABI only.  Reject short frames before reading
+	 * msg_version; reject long frames so reserved tail bytes cannot carry
+	 * unaudited state. */
+	if (env->payload_length != (uint32)sizeof(ClusterTTStatusHintMsg)) {
+		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+		return;
+	}
+
 	msg = (const ClusterTTStatusHintMsg *)payload;
 
 	/* HC187 forward-compat reject — V1 receiver drops V2+. */

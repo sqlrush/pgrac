@@ -12410,4 +12410,24 @@
   proargnames => '{waiter_node,waiter_procno,waiter_request_id,blocker_node,blocker_procno,blocker_request_id}',
   prosrc => 'pg_cluster_lmd_inject_wait_edge' },
 
+# spec-3.2 D5b (2026-05-22) -- test-only visibility fork injection
+# functions.  These are SQL-visible so TAP can drive a real
+# HeapTupleSatisfiesMVCC cluster-path miss and assert 53R97.  Production
+# builds link FEATURE_NOT_SUPPORTED stubs; --enable-injection-points builds
+# wire the shmem-backed implementation.
+{ oid => '8925', descr => 'TEST-ONLY: inject remote TT ref for MVCC visibility fork',
+  proname => 'cluster_test_inject_visibility_tt_ref',
+  provolatile => 'v', proparallel => 'u',
+  prorettype => 'bool',
+  proargtypes => 'xid int4 int4 int4 int4',
+  proargnames => '{xid,origin_node_id,undo_segment_id,tt_slot_id,cluster_epoch}',
+  prosrc => 'cluster_test_inject_visibility_tt_ref' },
+
+{ oid => '8926', descr => 'TEST-ONLY: clear MVCC visibility fork inject table',
+  proname => 'cluster_test_clear_visibility_injects',
+  provolatile => 'v', proparallel => 'u',
+  prorettype => 'int4',
+  proargtypes => '',
+  prosrc => 'cluster_test_clear_visibility_injects' },
+
 ]

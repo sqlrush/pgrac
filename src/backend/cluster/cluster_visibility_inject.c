@@ -6,9 +6,10 @@
  *	  spec-3.2 D5b (NEW;v0.3 N3 driver).
  *
  *	  ENABLE_INJECTION conditional:  production binary (no
- *	  --enable-injection-points configure flag) gets a stub body —
- *	  lookup helper returns false, no GUC registered, no SQL UDF
- *	  exposed.  See header file for full design rationale.
+ *	  --enable-injection-points configure flag) gets a stub body:
+ *	  lookup helper returns false, no GUC is registered, and SQL UDFs
+ *	  raise FEATURE_NOT_SUPPORTED.  See header file for full design
+ *	  rationale.
  *
  * Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 2026, pgrac contributors
@@ -25,6 +26,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_visibility_inject.h"
+#include "fmgr.h"
 
 #ifdef ENABLE_INJECTION
 
@@ -224,6 +226,29 @@ cluster_test_lookup_visibility_inject(TransactionId xid, ClusterUndoTTSlotRef *r
 	(void)xid;
 	(void)ref;
 	return false;
+}
+
+PG_FUNCTION_INFO_V1(cluster_test_inject_visibility_tt_ref);
+PG_FUNCTION_INFO_V1(cluster_test_clear_visibility_injects);
+
+Datum
+cluster_test_inject_visibility_tt_ref(PG_FUNCTION_ARGS)
+{
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cluster visibility inject support is not enabled"),
+					errhint("Rebuild with --enable-injection-points to use "
+							"cluster_test_inject_visibility_tt_ref().")));
+	PG_RETURN_BOOL(false);
+}
+
+Datum
+cluster_test_clear_visibility_injects(PG_FUNCTION_ARGS)
+{
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cluster visibility inject support is not enabled"),
+					errhint("Rebuild with --enable-injection-points to use "
+							"cluster_test_clear_visibility_injects().")));
+	PG_RETURN_INT32(0);
 }
 
 #endif /* ENABLE_INJECTION */

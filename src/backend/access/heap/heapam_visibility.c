@@ -1042,10 +1042,14 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot,
 						return false;
 					case CLUSTER_TT_STATUS_COMMITTED:
 					case CLUSTER_TT_STATUS_CLEANED_OUT:
-						/* Hint xmin as committed;  snapshot xmax/xmin
-						 * cross-node consistency推 spec-3.3.  MVP:
-						 * remote committed tuple = visible. */
-						return true;
+						/*
+						 * The status overlay only proves the remote xmin
+						 * committed.  It does not yet answer MVCC snapshot
+						 * membership or xmax/delete visibility.  Until
+						 * spec-3.3 ships cross-node snapshot semantics, fail
+						 * closed instead of silently making the tuple visible.
+						 */
+						break;
 					default:
 						break;
 				}

@@ -29,11 +29,12 @@
 #
 # Spec: spec-3.2-mvcc-cluster-path-tt-status-wire.md (v1.0 FROZEN 2026-05-22)
 #
-# Note: L4 + L5 use the spec-3.2 D5b test-only inject mechanism (GUC
-#   cluster_test_force_visibility_cluster_path + UDF cluster_test_
-#   inject_visibility_tt_ref) to drive cluster path entry. Production
-#   on-page ITL ref still returns placeholder tt_slot_id=0 → early-exit
-#   to PG-native (L3 silent invisible).
+# Note: L4 uses the spec-3.2 D5b test-only inject mechanism (GUC
+#   cluster_test_force_visibility_cluster_path + SQL UDF
+#   cluster_test_inject_visibility_tt_ref) to drive a real backend
+#   HeapTupleSatisfiesMVCC cluster-path miss. Production on-page ITL ref
+#   still returns placeholder tt_slot_id=0 → early-exit to PG-native (L3
+#   silent invisible).
 #
 #-------------------------------------------------------------------------
 
@@ -58,6 +59,22 @@ sub hint_int
 		qq{SELECT value FROM pg_cluster_state
 		   WHERE category='tt_status_hint' AND key='$key'});
 	return defined($v) && $v ne '' ? int($v) : 0;
+}
+
+sub wait_hint_delta
+{
+	my ($node, $key, $before, $target_delta, $label) = @_;
+
+	for my $i (1 .. 30)
+	{
+		my $cur = hint_int($node, $key);
+		return ($cur, $cur - $before) if $cur - $before >= $target_delta;
+		usleep(200_000);
+	}
+
+	my $final = hint_int($node, $key);
+	diag("$label timed out: before=$before final=$final delta=" . ($final - $before));
+	return ($final, $final - $before);
 }
 
 
@@ -92,7 +109,8 @@ my $n0_lookup_hit_before = $pair->node0->safe_psql('postgres',
 $n0_lookup_hit_before = $n0_lookup_hit_before ne '' ? int($n0_lookup_hit_before) : 0;
 
 $pair->node0->safe_psql('postgres', q{
-	CREATE TEMP TABLE l2_local (i int);
+	DROP TABLE IF EXISTS l2_local;
+	CREATE TABLE l2_local (i int);
 	INSERT INTO l2_local VALUES (1), (2), (3);
 });
 my $l2_count = $pair->node0->safe_psql('postgres',
@@ -119,48 +137,71 @@ $pair->node0->safe_psql('postgres', q{
 });
 usleep(500_000);
 
-# node1 SELECT — expect NO error, tuple silently invisible OR visible
-# depending on storage backend (shared-disk vs not).  The contract is
-# "no 53R97";  visibility outcome itself is honest-undefined per N1.
-my $l3_result = $pair->node1->psql('postgres',
-	'SELECT count(*) FROM l3_cross');
-ok($l3_result == 0 || $l3_result == 1,
-	'L3 cross-node SELECT returns success (no 53R97 in production silent path; v0.3 N1)');
+# node1 SELECT — expect NO cluster-visibility error.  With shared storage
+# enabled the relation may be visible and return a count; with isolated
+# ClusterPair data dirs it may report "relation does not exist".  The
+# contract here is strictly "production silent path does not raise 53R97".
+my ($l3_rc, $l3_stdout, $l3_stderr) =
+	$pair->node1->psql('postgres', 'SELECT count(*) FROM l3_cross');
+unlike($l3_stderr, qr/53R97|cluster TT status unknown/,
+	'L3 cross-node SELECT does not raise 53R97 in production silent path '
+	. '(visibility outcome/storage fixture is undefined)');
 
 
 # ============================================================
 # L4: D5b inject + overlay miss → 53R97 fail-fast.
 # ============================================================
-# Skip if --enable-injection-points not configured (ENABLE_INJECTION
-# undefined in production build).
+# Skip if --enable-injection-points not configured.  The SQL UDF is always
+# linked for pg_proc stability, but the test-only GUC exists only in
+# ENABLE_INJECTION builds.
 my $injection_enabled = $pair->node0->safe_psql('postgres', q{
-	SELECT count(*) FROM pg_proc
-	 WHERE proname = 'cluster_test_inject_visibility_tt_ref'
+	SELECT count(*) FROM pg_settings
+	 WHERE name = 'cluster_test_force_visibility_cluster_path'
 });
 
 SKIP: {
-	skip "ENABLE_INJECTION not configured (production build)", 1
+	skip "ENABLE_INJECTION not configured (production build)", 2
 		unless $injection_enabled == 1;
 
-	# Enable D5b force flag.
+	$pair->node0->safe_psql('postgres', q{
+		DROP TABLE IF EXISTS l4_visibility_force;
+		CREATE TABLE l4_visibility_force(id int PRIMARY KEY, payload text);
+		INSERT INTO l4_visibility_force VALUES (1, 'force-cluster-path');
+	});
+
+	my $l4_xid = $pair->node0->safe_psql('postgres', q{
+		SELECT xmin::text FROM l4_visibility_force WHERE id = 1
+	});
+
+	# Install a remote exact TT ref for the tuple's xmin while the force flag
+	# is still off, so catalog work for the UDF itself remains PG-native.
+	$pair->node0->safe_psql('postgres',
+		qq{SELECT cluster_test_inject_visibility_tt_ref('$l4_xid'::xid, 7, 3, 42, 0)});
+
+	# Enable D5b force flag and then run a real SELECT that must enter
+	# HeapTupleSatisfiesMVCC cluster path and fail closed with 53R97 because
+	# the exact TT status overlay has no matching remote key.
 	$pair->node0->safe_psql('postgres',
 		q{ALTER SYSTEM SET cluster_test_force_visibility_cluster_path = on});
 	$pair->node0->safe_psql('postgres', 'SELECT pg_reload_conf()');
 	usleep(500_000);
 
-	# Inject authoritative remote ref for a fake xid;  overlay won't
-	# have a matching key → lookup miss → 53R97.
-	$pair->node0->safe_psql('postgres',
-		q{SELECT cluster_test_inject_visibility_tt_ref(99999, 7, 3, 42, 1)});
+	my ($l4_rc, $l4_stdout, $l4_stderr) = $pair->node0->psql(
+		'postgres',
+		q{\set VERBOSITY verbose
+		  SELECT count(*) FROM l4_visibility_force;});
 
 	# Reset force flag for subsequent tests.
 	$pair->node0->safe_psql('postgres',
 		q{ALTER SYSTEM RESET cluster_test_force_visibility_cluster_path});
 	$pair->node0->safe_psql('postgres', 'SELECT pg_reload_conf()');
+	$pair->node0->safe_psql('postgres',
+		q{SELECT cluster_test_clear_visibility_injects()});
 
-	ok(1, 'L4 D5b inject UDF callable + force GUC reload (53R97 path '
-		. 'requires real tuple visibility entry;  D10 unit covers gate '
-		. 'logic;  end-to-end 53R97 inject 推 hardening)');
+	ok($l4_rc != 0,
+		'L4 forced visibility SELECT fails closed on missing remote TT status');
+	like($l4_stderr, qr/53R97|cluster TT status unknown/,
+		'L4 forced visibility SELECT surfaces SQLSTATE 53R97');
 }
 
 
@@ -178,15 +219,17 @@ $pair->node0->safe_psql('postgres', q{
 usleep(1_500_000);  # let LMON drain + tier1 fanout
 
 my $n0_emit_after = hint_int($pair->node0, 'emit_count');
-my $n1_receive_after = hint_int($pair->node1, 'receive_count');
-my $n1_install_after = hint_int($pair->node1, 'install_count');
+my ($n1_receive_after, $n1_receive_delta) =
+	wait_hint_delta($pair->node1, 'receive_count', $n1_receive_before, 1, 'L5 receive_count');
+my ($n1_install_after, $n1_install_delta) =
+	wait_hint_delta($pair->node1, 'install_count', $n1_install_before, 1, 'L5 install_count');
 
 cmp_ok($n0_emit_after - $n0_emit_before, '>=', 1,
 	'L5 node0 emit_count incremented after local commit');
-cmp_ok($n1_receive_after - $n1_receive_before, '>=', 0,
-	'L5 node1 receive_count monotonic (>= 0;  wire delivery best-effort)');
-cmp_ok($n1_install_after, '>=', $n1_install_before,
-	'L5 node1 install_count monotonic non-decreasing');
+cmp_ok($n1_receive_delta, '>=', 1,
+	"L5 node1 receive_count incremented after TT_STATUS_HINT fanout ($n1_receive_before → $n1_receive_after)");
+cmp_ok($n1_install_delta, '>=', 1,
+	"L5 node1 install_count incremented after TT_STATUS_HINT install ($n1_install_before → $n1_install_after)");
 
 
 # ============================================================

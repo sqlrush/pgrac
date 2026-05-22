@@ -489,7 +489,12 @@
  *   cluster-sinval-receive-skip-validate.
  * catversion bump for catalog tooling + wire ABI msg_type 7 真激活 +
  * 2 shmem regions + new aux process boundary. */
-#define CATALOG_VERSION_NO 202605460
+/* spec-3.2 hardening (2026-05-22): add test-only
+ * cluster_test_inject_visibility_tt_ref / cluster_test_clear_visibility_injects
+ * pg_proc rows so TAP can drive a real HeapTupleSatisfiesMVCC cluster-path
+ * miss and assert 53R97.  Production builds link FEATURE_NOT_SUPPORTED
+ * stubs; --enable-injection-points builds wire the shmem implementation. */
+#define CATALOG_VERSION_NO 202605470
 
 /* spec-2.39 D10 (2026-05-21):  SI Broadcaster production activation —
  * DDL commit hook (AtEOXact_Inval + COMMIT PREPARED via cluster-aware

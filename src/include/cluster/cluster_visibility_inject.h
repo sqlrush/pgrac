@@ -16,8 +16,9 @@
  *	    - lookup helper used by D5 fork entry
  *
  *	  ENABLE_INJECTION conditional:  production binary (no
- *	  --enable-injection-points configure) does not link this file's
- *	  body (all functions stub out;  GUC + UDF absent).
+ *	  --enable-injection-points configure) links no-op lookup/shmem
+ *	  helpers and SQL UDF stubs that raise FEATURE_NOT_SUPPORTED; the
+ *	  test-only GUC is absent.
  *
  * Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 2026, pgrac contributors

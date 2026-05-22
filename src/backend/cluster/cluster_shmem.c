@@ -81,6 +81,7 @@
 #include "cluster/cluster_tt_status.h"		 /* cluster_tt_status_shmem_register (spec-3.1 D2) */
 #include "cluster/cluster_tt_local.h"		 /* cluster_tt_local_shmem_register (spec-3.1 D5) */
 #include "cluster/cluster_tt_status_hint.h" /* cluster_tt_status_hint_shmem_register (spec-3.2 D3) */
+#include "cluster/cluster_visibility_inject.h" /* cluster_visibility_inject_shmem_register (spec-3.2 D5b) */
 #include "cluster/cluster_qvotec.h" /* cluster_qvotec_shmem_register (spec-2.6 Sprint A Step 1) */
 #include "cluster/cluster_fence.h"	/* cluster_fence_shmem_register (spec-2.28 Sprint A Step 1) */
 #include "cluster/cluster_reconfig.h" /* cluster_reconfig_shmem_register (spec-2.29 Sprint A Step 1) */
@@ -428,6 +429,15 @@ cluster_init_shmem_module(void)
 	 */
 	if (cluster_shmem_lookup_region("pgrac cluster tt status hint outbound") == NULL)
 		cluster_tt_status_hint_shmem_register();
+
+	/*
+	 * spec-3.2 D5b: register test-only visibility inject shmem.  The
+	 * production build exports a no-op register helper; ENABLE_INJECTION
+	 * builds use this table to drive real HeapTupleSatisfiesMVCC 53R97 TAP
+	 * coverage without changing production visibility behavior.
+	 */
+	if (cluster_shmem_lookup_region("pgrac cluster visibility inject") == NULL)
+		cluster_visibility_inject_shmem_register();
 
 	/*
 	 * Stage 1.10.1 (F1 hardening): register cluster_startup_phase shmem

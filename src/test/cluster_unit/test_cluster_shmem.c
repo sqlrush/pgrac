@@ -374,6 +374,12 @@ void
 cluster_tt_status_hint_shmem_register(void)
 {}
 
+/* spec-3.2 D5b stub: cluster_init_shmem_module also calls
+ * cluster_visibility_inject_shmem_register. */
+void
+cluster_visibility_inject_shmem_register(void)
+{}
+
 
 /*
  * Spec-1.10.1 D1 F1 stub: cluster_init_shmem_module also calls

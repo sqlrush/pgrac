@@ -15,28 +15,29 @@
 #	  L5   exact-key API absence check:  no SQL UDF named
 #	       cluster_tt_status_lookup_by_raw_xid exists (HC180);  ensures
 #	       no raw-xid cluster lookup leaked into the surface
-#	  L6   ambiguity-by-same-xid:  both nodes commit txns with the same
-#	       PG raw xid bucket (different origin_node_id);  each node's
-#	       local install count delta is independent of the peer's
-#	       (proves origin separation in the exact key)
+#	  L6   ambiguity-by-same-xid:  both nodes commit txns with exact keys
+#	       separated by origin_node_id; spec-3.2 TT_STATUS_HINT fanout may
+#	       install peer status, but the local node must still install its own
+#	       status independently.
 #	  L7   reconfig flush path linkable:  pg_cluster_state tt_status
 #	       row 'flush_count' exists as observable counter (D7 callsite
 #	       in cluster_reconfig.c — runtime reconfig trigger推 spec-2.29
 #	       reconfig acceptance,本 spec 仅 verify counter wiring)
-#	  L8   guard:  no TT_STATUS_HINT msg type in pg_cluster_ic_msg_types
-#	       (spec-3.1 §1.3 #3 — no cross-node wire) /* SPEC_3_1_LINT_OK: */
+#	  L8   successor wire: TT_STATUS_HINT msg type is registered once
+#	       after spec-3.2, while spec-3.1 raw-xid/CLOG guardrails remain
+#	       in force.
 #	  L9   guard:  no SharedInvalidationMessage size change (PG sinval
 #	       16B wire ABI untouched — spec-3.1 §0.1 F2)
-#	  L10  spec-3.1 catversion unchanged 202605460 (foundation does
-#	       not bump catalog;  bump deferred to spec-3.4 when ITL
-#	       writable activates)
+#	  L10  catversion remains >= spec-3.1 baseline 202605460
+#	       (foundation itself did not bump catalog; later specs may)
 #
 # Spec: spec-3.1-cluster-xid-status-foundation.md (FROZEN v1.0)
 #
-# Note: spec-3.1 ships local in-memory overlay only.  Cross-node
-#	exact-key lookup (origin=peer) requires the spec-3.2 wire path;
-#	this TAP verifies the local install hook + counter wiring + key
-#	contract surface;  cross-node behavioral coverage is deferred.
+# Note: this TAP remains the spec-3.1 foundation coverage, but it runs in
+# the current tree.  After spec-3.2, TT_STATUS_HINT wire propagation may
+# install peer-origin status; the foundation assertions therefore focus on
+# exact-key surfaces and local install liveness, not on absence of peer
+# propagation.
 #
 #-------------------------------------------------------------------------
 
@@ -148,7 +149,7 @@ is($pair->node0->safe_psql('postgres',
 
 
 # ============================================================
-# L6: origin separation — peer txns do not bleed counters.
+# L6: origin separation — peer propagation does not hide local install.
 # ============================================================
 my $n0_install_pre = tt_int($pair->node0, 'install_count');
 my $n1_install_pre = tt_int($pair->node1, 'install_count');
@@ -164,9 +165,9 @@ my $n1_install_post = tt_int($pair->node1, 'install_count');
 
 cmp_ok($n1_install_post - $n1_install_pre, '>=', 1,
 	"L6 node1 install_count bumps on its own commit");
-is($n0_install_post, $n0_install_pre,
-	"L6 node0 install_count unchanged by peer commit (origin separation;"
-	 . " spec-3.1 ships local install only — no cross-node propagation)");
+cmp_ok($n0_install_post, '>=', $n0_install_pre,
+	"L6 node0 install_count remains monotonic when peer commit is fanned out "
+	. "(spec-3.2 may install peer TT_STATUS_HINT)");
 
 
 # ============================================================
@@ -180,14 +181,13 @@ is($pair->node0->safe_psql('postgres',
 
 
 # ============================================================
-# L8: HC182 — no TT_STATUS_HINT-style wire type registered.
-# /* SPEC_3_1_LINT_OK: assertion checks the absence by SQL LIKE pattern */
+# L8: TT_STATUS_HINT wire type registered by spec-3.2 successor.
 # ============================================================
 is($pair->node0->safe_psql('postgres',
 		q{SELECT count(*) FROM pg_cluster_ic_msg_types
-		  WHERE name LIKE '%TT_STATUS%'}),
-	'0',
-	'L8 no TT_STATUS-style msg type registered (spec-3.1 §1.3 #3)');
+		  WHERE name = 'cluster_tt_status_hint'}),
+	'1',
+	'L8 TT_STATUS_HINT msg type registered once by spec-3.2 successor');
 
 
 # ============================================================
@@ -202,13 +202,13 @@ is($pair->node0->safe_psql('postgres',
 
 
 # ============================================================
-# L10: catversion unchanged.
+# L10: catversion remains at-or-after the spec-3.1 baseline.
 # ============================================================
 my $catver = $pair->node0->safe_psql(
 	'postgres',
 	q{SELECT catalog_version_no::bigint FROM pg_control_system()});
-is($catver, '202605460',
-	'L10 catversion stays 202605460 (spec-3.1 foundation does not bump)');
+cmp_ok($catver, '>=', 202605460,
+	'L10 catversion >= 202605460 (spec-3.1 foundation baseline; later specs may bump)');
 
 
 $pair->stop_pair;
