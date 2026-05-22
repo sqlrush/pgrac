@@ -145,6 +145,8 @@ UNIT_STUB_SUPP=(
   # spec-3.1 D9: tt_status test stub parameters mirror real prototypes
   # whose pointer args can't be widened to const without breaking callers.
   --suppress=constParameterCallback:src/test/cluster_unit/test_cluster_tt_status.c
+  # spec-3.2 D10: cluster_visibility_inject test stub same rationale.
+  --suppress=constParameterCallback:src/test/cluster_unit/test_cluster_visibility_fork.c
 )
 
 echo "## cppcheck $(cppcheck --version)"

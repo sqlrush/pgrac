@@ -92,6 +92,12 @@ constParameterPointer:src/test/cluster_unit/test_cluster_*.c
 # callers).  Reason: test stub signatures MUST match production.
 constParameterCallback:src/test/cluster_unit/test_cluster_tt_status.c
 
+# spec-3.2 D10: cluster_visibility_inject test stub address-takes the
+# real cluster_test_lookup_visibility_inject prototype which takes
+# 'ClusterUndoTTSlotRef *ref' as out-parameter.  Same rationale —
+# test stub MUST match production signature.
+constParameterCallback:src/test/cluster_unit/test_cluster_visibility_fork.c
+
 # === Inline suppressions ===
 # All inline /* cppcheck-suppress xxx */ comments must include a
 # "Reason:" line on the next line.  Currently:
