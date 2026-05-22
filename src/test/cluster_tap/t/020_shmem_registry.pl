@@ -134,8 +134,8 @@ is($node->safe_psql(
 		'postgres',
 		q{SELECT value FROM pg_cluster_state
 		   WHERE category = 'shmem' AND key = 'region_count'}),
-	   '35',
-	   'L8 pg_cluster_state.shmem.region_count = 35 (spec-3.1 TT status regions included)');
+	   '36',
+	   'L8 pg_cluster_state.shmem.region_count = 36 (spec-3.2 visibility inject region included)');
 
 is($node->safe_psql(
 		'postgres', q{
@@ -154,15 +154,15 @@ is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='shmem' AND key LIKE 'region.%.bytes'}),
-	   '35',
-	   'L10 pg_cluster_state.shmem has 35 region.<name>.bytes keys (one per region)');
+	   '36',
+	   'L10 pg_cluster_state.shmem has 36 region.<name>.bytes keys (one per region)');
 
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='shmem' AND key LIKE 'region.%.owner'}),
-	   '35',
-	   'L11 pg_cluster_state.shmem has 35 region.<name>.owner keys (one per region)');
+	   '36',
+	   'L11 pg_cluster_state.shmem has 36 region.<name>.owner keys (one per region)');
 
 
 # ----------
@@ -175,8 +175,8 @@ is($node->safe_psql(
 	  FROM pg_settings
 	 WHERE name = 'cluster.shmem_max_regions'
 }),
-   'integer|postmaster|64|35|256',
-   'L12 cluster.shmem_max_regions: int / postmaster / default 64 / [35,256] (spec-3.1 TT status regions bump min_val 33→35)');
+   'integer|postmaster|64|36|256',
+   'L12 cluster.shmem_max_regions: int / postmaster / default 64 / [36,256] (spec-3.2 visibility inject bumps min_val 35→36)');
 
 is($node->safe_psql(
 		'postgres',
@@ -233,25 +233,25 @@ is($node->safe_psql(
 
 
 # ----------
-# L18: GUC max_regions=35 (boundary minimum, spec-3.1 bump) admits
+# L18: GUC max_regions=36 (boundary minimum, spec-3.2 bump) admits
 # all baseline regions.
 # ----------
 $node->stop;
-$node->append_conf('postgresql.conf', "cluster.shmem_max_regions = 35\n");
+$node->append_conf('postgresql.conf', "cluster.shmem_max_regions = 36\n");
 $node->start;
 
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_shmem}),
-	   '35',
-	   'L18 cluster.shmem_max_regions = 35 exactly admits the 35 baseline regions (lower bound match)');
+	   '36',
+	   'L18 cluster.shmem_max_regions = 36 exactly admits the 36 baseline regions (lower bound match)');
 
 is($node->safe_psql(
 		'postgres',
 		q{SELECT value FROM pg_cluster_state
    WHERE category = 'guc' AND key = 'cluster.shmem_max_regions'}),
-   '35',
-   'L19 pg_cluster_state.guc.cluster.shmem_max_regions reflects override = 35');
+   '36',
+   'L19 pg_cluster_state.guc.cluster.shmem_max_regions reflects override = 36');
 
 $node->stop;
 

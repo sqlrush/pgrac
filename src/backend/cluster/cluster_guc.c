@@ -634,8 +634,9 @@ cluster_init_guc(void)
 	 * spec-1.15 for cluster_scn, 16 -> 17 in spec-2.13 for cluster_ges,
 	 * 28 -> 29 in spec-2.34 for cluster_gcs_block_dedup, and 29 -> 31 in
 	 * spec-2.38 for ClusterSinvalOutbound + ClusterSinvalInbound, 31 -> 33
-	 * in spec-2.39 for ClusterSinvalAckWait + ClusterSinvalAckOutbound, and
-	 * 33 -> 35 in spec-3.1 for ClusterTTStatus + ClusterTTLocalSeq, so the
+	 * in spec-2.39 for ClusterSinvalAckWait + ClusterSinvalAckOutbound,
+	 * 33 -> 35 in spec-3.1 for ClusterTTStatus + ClusterTTLocalSeq, and
+	 * 35 -> 36 in spec-3.2 for the visibility injection region, so the
 	 * published lower bound remains bootable.
 	 */
 	DefineCustomIntVariable("cluster.shmem_max_regions",
@@ -646,7 +647,7 @@ cluster_init_guc(void)
 										 "registers one region.  Raise if FATAL on startup with "
 										 "errcode 53400 \"cluster shmem registry capacity "
 										 "exceeded\"."),
-							&cluster_shmem_max_regions, 64, 35, 256,
+							&cluster_shmem_max_regions, 64, 36, 256,
 							PGC_POSTMASTER, /* registry array is palloc'd once at init */
 							0,				/* flags */
 							NULL,			/* check_hook */
