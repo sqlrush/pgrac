@@ -209,8 +209,10 @@ cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key, ClusterTTStatusRes
 	TimestampTz now;
 	uint32 current_epoch;
 
-	Assert(key != NULL);
-	Assert(result != NULL);
+	/* Explicit null guards (also satisfies CI cppcheck nullPointerRedundantCheck;
+	 * Assert-only is debug-build-only and cppcheck strips it). */
+	if (key == NULL || result == NULL)
+		return false;
 
 	/* HC181:  always set fail-closed sentinel first. */
 	result->status = CLUSTER_TT_STATUS_UNKNOWN;
@@ -292,7 +294,7 @@ void
 cluster_tt_status_flush_all(uint32 new_epoch)
 {
 	HASH_SEQ_STATUS hseq;
-	ClusterTTOverlayEntry *e;
+	const ClusterTTOverlayEntry *e;
 	uint64 removed = 0;
 
 	(void)new_epoch;

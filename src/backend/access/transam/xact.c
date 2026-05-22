@@ -145,7 +145,9 @@
 #include "cluster/cluster_guc.h"		/* PGRAC: spec-2.6 cluster_enabled gate */
 #include "cluster/cluster_qvotec.h" /* PGRAC: spec-2.6 in_quorum lease check */
 #include "cluster/cluster_scn.h"
+#ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_tt_local.h" /* PGRAC: spec-3.1 D6 commit/abort hook */
+#endif
 #endif
 
 /*
@@ -1621,8 +1623,10 @@ RecordTransactionCommit(void)
 	 * cluster_tt_local_record_commit (debug build) — keeps D5/D6 wired and
 	 * exercised by D10 L2 TAP via the self_consumer_hit counter.
 	 */
+#ifdef USE_PGRAC_CLUSTER
 	if (markXidCommitted)
 		cluster_tt_local_record_commit(xid);
+#endif
 
 	/*
 	 * Wait for synchronous replication, if required. Similar to the decision
@@ -1948,8 +1952,10 @@ RecordTransactionAbort(bool isSubXact)
 	 * aborts are tracked by PG's SUBTRANS path and are out of scope for
 	 * spec-3.1 (§1.3 #10 SUBTRANS cross-node sync defer to later spec).
 	 */
+#ifdef USE_PGRAC_CLUSTER
 	if (!isSubXact)
 		cluster_tt_local_record_abort(xid);
+#endif
 
 	/* Compute latestXid while we have the child XIDs handy */
 	latestXid = TransactionIdLatest(xid, nchildren, children);
