@@ -650,6 +650,38 @@ cluster_tt_status_get_evict_fail_count(void)
 	return 0;
 }
 
+/* spec-3.2 D8:  6 NEW TT status hint counter stubs. */
+uint64
+cluster_tt_status_hint_get_emit_count(void)
+{
+	return 0;
+}
+uint64
+cluster_tt_status_hint_get_receive_count(void)
+{
+	return 0;
+}
+uint64
+cluster_tt_status_hint_get_drop_invalid_count(void)
+{
+	return 0;
+}
+uint64
+cluster_tt_status_hint_get_drop_stale_epoch_count(void)
+{
+	return 0;
+}
+uint64
+cluster_tt_status_hint_get_drop_unknown_version_count(void)
+{
+	return 0;
+}
+uint64
+cluster_tt_status_hint_get_install_count(void)
+{
+	return 0;
+}
+
 Size
 cluster_shmem_get_total_bytes(void)
 {

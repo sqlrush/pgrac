@@ -375,6 +375,20 @@ int cluster_sinval_ack_wait_slots = 256;
 int cluster_tt_status_overlay_max_entries = 32768;
 int cluster_tt_status_overlay_ttl_ms = 30000;
 
+/* spec-3.2 D7:  2 NEW GUC for cross-node TT status hint wire (v0.3 删 commit_only). */
+int cluster_tt_status_hint_outbound_capacity = 256;
+int cluster_tt_status_hint_emit_mode = CLUSTER_TT_STATUS_HINT_EMIT_ALL_STATUS;
+
+static const struct config_enum_entry cluster_tt_status_hint_emit_mode_options[]
+	= { { "disabled", CLUSTER_TT_STATUS_HINT_EMIT_DISABLED, false },
+		{ "all_status", CLUSTER_TT_STATUS_HINT_EMIT_ALL_STATUS, false },
+		{ NULL, 0, false } };
+
+#ifdef ENABLE_INJECTION
+/* spec-3.2 D5b:  test-only GUC (production binary 0 触达). */
+bool cluster_test_force_visibility_cluster_path = false;
+#endif
+
 static const struct config_enum_entry cluster_sinval_ack_mode_options[]
 	= { { "none", CLUSTER_SINVAL_ACK_MODE_NONE, false },
 		{ "peer_enqueued", CLUSTER_SINVAL_ACK_MODE_PEER_ENQUEUED, false },
@@ -1612,4 +1626,46 @@ cluster_init_guc(void)
 					 "and lookup returns UNKNOWN.  Default 30000 (30s) covers typical OLTP active-"
 					 "xact window.  PGC_SIGHUP."),
 		&cluster_tt_status_overlay_ttl_ms, 30000, 1000, 600000, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	/*
+	 * spec-3.2 D7:  cross-node TT status hint wire GUCs.
+	 *
+	 * cluster.tt_status_hint_outbound_capacity — outbound ring slot count;
+	 * sized at postmaster startup; PGC_POSTMASTER.
+	 *
+	 * cluster.tt_status_hint_emit_mode — enum {disabled, all_status};
+	 * v0.3 删 commit_only(避免 ABORTED status 永久不传播);PGC_SIGHUP.
+	 */
+	DefineCustomIntVariable(
+		"cluster.tt_status_hint_outbound_capacity",
+		gettext_noop("Capacity of cluster TT status hint outbound ring (spec-3.2 D3)."),
+		gettext_noop("LMON-mediated fanout queue;fire-and-forget no ack;full → drop + "
+					 "WARNING (commit hot path not blocked).  PGC_POSTMASTER."),
+		&cluster_tt_status_hint_outbound_capacity, 256, 64, 4096, PGC_POSTMASTER, 0, NULL, NULL,
+		NULL);
+
+	DefineCustomEnumVariable(
+		"cluster.tt_status_hint_emit_mode",
+		gettext_noop("Emit mode for cross-node TT status hint propagation (spec-3.2 D7)."),
+		gettext_noop("disabled:0 emit;all_status:emit on commit + abort (default;"
+					 "v0.3 removed commit_only to avoid ABORTED never propagating)."),
+		&cluster_tt_status_hint_emit_mode, CLUSTER_TT_STATUS_HINT_EMIT_ALL_STATUS,
+		cluster_tt_status_hint_emit_mode_options, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+#ifdef ENABLE_INJECTION
+	/*
+	 * spec-3.2 D5b:  test-only GUC.  Production binary (no --enable-
+	 * injection-points) does not register this — symbol absent.
+	 */
+	DefineCustomBoolVariable(
+		"cluster_test_force_visibility_cluster_path",
+		gettext_noop("Test-only:  force HeapTupleSatisfiesMVCC cluster path entry via "
+					 "spec-3.2 D5b inject table (overrides placeholder ITL ref reader)."),
+		gettext_noop("Test build only;production binary 0 触达.  Enable + SQL UDF "
+					 "cluster_test_inject_visibility_tt_ref(...) to inject authoritative "
+					 "remote exact TT ref;visibility fork then takes cluster path.  "
+					 "PGC_SIGHUP."),
+		&cluster_test_force_visibility_cluster_path, false, PGC_SIGHUP, GUC_NOT_IN_SAMPLE, NULL,
+		NULL, NULL);
+#endif
 }

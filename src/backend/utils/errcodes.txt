@@ -585,6 +585,14 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 # Sender bumps ack_timeout_count;DBA monitors via pg_stat_cluster_counters.
 53R95    E    ERRCODE_CLUSTER_SINVAL_ACK_TIMEOUT                               cluster_sinval_ack_timeout
 
+# spec-3.1 D6 evict fail defensive (placeholder; not currently reachable).
+53R96    E    ERRCODE_CLUSTER_TT_OVERLAY_FULL                                  cluster_tt_overlay_full
+
+# spec-3.2 D5 — HeapTupleSatisfiesMVCC cluster path lookup miss.  Caller
+# decides retry / abort.  L177 fail-fast no wait policy enforces this is
+# raised synchronously without waiting on wire propagation.
+53R97    E    ERRCODE_CLUSTER_TT_STATUS_UNKNOWN                                cluster_tt_status_unknown
+
 Section: Class 54 - Program Limit Exceeded
 
 # this is for wired-in limits, not resource exhaustion problems (class borrowed from DB2)

@@ -89,6 +89,8 @@ OBJS = \
 	cluster_itl.o \
 	cluster_tt_local.o \
 	cluster_tt_status.o \
+	cluster_tt_status_hint.o \
+	cluster_visibility_inject.o \
 	cluster_stats.o \
 	cluster_version.o \
 	cluster_views.o \

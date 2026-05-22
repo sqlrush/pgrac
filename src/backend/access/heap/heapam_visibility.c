@@ -80,6 +80,16 @@
 #include "utils/combocid.h"
 #include "utils/snapmgr.h"
 
+#ifdef USE_PGRAC_CLUSTER
+/* spec-3.2 D5:  MVCC cluster visibility fork. */
+#include "cluster/cluster_guc.h"				/* cluster_enabled, cluster_node_id */
+#include "cluster/cluster_itl.h"				/* cluster_itl_get_tt_ref */
+#include "cluster/cluster_itl_slot.h"		/* CLUSTER_ITL_SLOT_UNALLOCATED */
+#include "cluster/cluster_tt_slot.h"		/* ClusterUndoTTSlotRef */
+#include "cluster/cluster_tt_status.h"		/* lookup_exact / Key / Result */
+#include "cluster/cluster_visibility_inject.h"	/* D5b test-only inject helper */
+#endif
+
 
 /*
  * SetHintBits()
@@ -966,6 +976,95 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot,
 
 	Assert(ItemPointerIsValid(&htup->t_self));
 	Assert(htup->t_tableOid != InvalidOid);
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC (spec-3.2 D5): MVCC cluster visibility fork.
+	 *
+	 * Strict authoritative-exact-TT-ref-only gate (spec-3.2 §0.1 F1 +
+	 * §3.3 + L176 spirit).  All early-exits fall through to the PG-
+	 * native body below — NO goto label (v0.3 M1 inline early-return
+	 * style).
+	 *
+	 * Hot path discipline (L177):  cluster path is fail-fast no-wait;
+	 * production hot path goes here only when ITL ref carries valid
+	 * remote origin + non-zero tt_slot_id (i.e. after spec-3.4 ITL
+	 * writable activation;  spec-3.2 阶段 production silent invisible
+	 * via PG-native body — v0.3 N1).
+	 *
+	 * v0.3 N4:  BufferIsValid guard prevents BufferGetPage(InvalidBuffer)
+	 * null-deref segfault in catalog scan / tqueue.c / heap_fetch caller
+	 * contexts (L178 candidate).
+	 */
+	if (cluster_enabled && BufferIsValid(buffer))
+	{
+		TransactionId raw_xmin = HeapTupleHeaderGetRawXmin(tuple);
+		ClusterUndoTTSlotRef ref;
+		bool		ref_filled = false;
+
+#ifdef ENABLE_INJECTION
+		/* spec-3.2 D5b:  test-only inject hook overrides placeholder
+		 * reader when cluster_test_force_visibility_cluster_path = on. */
+		if (cluster_test_force_visibility_cluster_path)
+			ref_filled = cluster_test_lookup_visibility_inject(raw_xmin, &ref);
+#endif
+
+		if (!ref_filled &&
+			tuple->t_itl_slot_idx != CLUSTER_ITL_SLOT_UNALLOCATED &&
+			cluster_itl_get_tt_ref(BufferGetPage(buffer),
+								   tuple->t_itl_slot_idx, &ref))
+			ref_filled = true;
+
+		if (ref_filled &&
+			ref.tt_slot_id != 0 &&				/* §3.3: skip spec-3.1 placeholder */
+			(int32) ref.origin_node_id != cluster_node_id)
+		{
+			/* Authoritative remote exact TT ref — enter cluster path. */
+			ClusterTTStatusKey key;
+			ClusterTTStatusResult result;
+
+			memset(&key, 0, sizeof(key));
+			key.origin_node_id = ref.origin_node_id;
+			key.undo_segment_id = ref.undo_segment_id;
+			key.tt_slot_id = ref.tt_slot_id;
+			key.cluster_epoch = ref.cluster_epoch;
+			key.local_xid = raw_xmin;
+
+			if (cluster_tt_status_lookup_exact(&key, &result) &&
+				result.authoritative)
+			{
+				switch (result.status)
+				{
+					case CLUSTER_TT_STATUS_ABORTED:
+						return false;
+					case CLUSTER_TT_STATUS_IN_PROGRESS:
+						/* Remote in-progress xact — snapshot can't see it. */
+						return false;
+					case CLUSTER_TT_STATUS_COMMITTED:
+					case CLUSTER_TT_STATUS_CLEANED_OUT:
+						/* Hint xmin as committed;  snapshot xmax/xmin
+						 * cross-node consistency推 spec-3.3.  MVP:
+						 * remote committed tuple = visible. */
+						return true;
+					default:
+						break;
+				}
+			}
+
+			/* HC181 fail-closed.  L177 NO WAIT (持 buffer pin + 可能
+			 * content lock + LWLock;  wait = 死锁源头). */
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+					 errmsg("cluster TT status unknown for xid %u", raw_xmin),
+					 errhint("Cross-node visibility requires spec-3.4 ITL writable "
+							 "activation;  current spec-3.2 ships fail-fast MVP. "
+							 "Retry or abort transaction.")));
+		}
+		/* else: ref placeholder / local origin / no ITL slot →
+		 * fall through to PG-native body (v0.3 N1 silent invisible
+		 * for cross-node tuple in production). */
+	}
+#endif							/* USE_PGRAC_CLUSTER */
 
 	if (!HeapTupleHeaderXminCommitted(tuple))
 	{

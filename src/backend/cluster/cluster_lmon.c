@@ -75,6 +75,7 @@
 #include "cluster/cluster_scn.h" /* cluster_scn_boc_broadcast_handler (spec-2.9 D1) */
 #include "cluster/cluster_ges.h" /* cluster_ges_{request,reply}_handler (spec-2.13 D3) */
 #include "cluster/cluster_sinval.h"
+#include "cluster/cluster_tt_status_hint.h" /* spec-3.2 D6 — drain hook + register */
 #include "utils/timestamp.h"
 #include "utils/wait_event.h" /* WAIT_EVENT_CLUSTER_BGPROC_LMON_MAIN_LOOP (1.11 Sprint B) */
 
@@ -356,6 +357,18 @@ cluster_lmon_shmem_init(void)
 		if (!sinval_registered) {
 			cluster_sinval_register_msg_type();
 			sinval_registered = true;
+		}
+	}
+
+	/* spec-3.2 D1 + D3:  register PGRAC_IC_MSG_TT_STATUS_HINT (msg_type 20)
+	 * via cluster_tt_status_hint subsystem entry point.  Producer mask
+	 * = LMON (HC185 / L172). */
+	{
+		static bool tt_status_hint_registered = false;
+
+		if (!tt_status_hint_registered) {
+			cluster_tt_status_hint_register_msg_type();
+			tt_status_hint_registered = true;
 		}
 	}
 }
@@ -920,6 +933,10 @@ LmonMain(void)
 			cluster_sinval_drain_ack_outbound_and_send();
 			cluster_sinval_broadcast_reset_all();
 
+			/* spec-3.2 D6:  LMON drain cross-node TT status hint outbound.
+			 * Fire-and-forget;  L172 family — only LMON owns tier1 fds. */
+			cluster_tt_status_hint_drain_outbound();
+
 			/*
 			 * spec-2.34 D6 (HC93 leg a):  TTL sweep of the GCS block
 			 * dedup HTAB.  Removes completed entries past
@@ -1443,6 +1460,10 @@ LmonMain(void)
 			cluster_sinval_drain_outbound_and_broadcast();
 			cluster_sinval_drain_ack_outbound_and_send();
 			cluster_sinval_broadcast_reset_all();
+
+			/* spec-3.2 D6:  LMON drain cross-node TT status hint outbound.
+			 * Fire-and-forget;  L172 family — only LMON owns tier1 fds. */
+			cluster_tt_status_hint_drain_outbound();
 
 			/* spec-2.34 D6 (HC93 leg a):  TTL sweep GCS block dedup HTAB. */
 			cluster_gcs_block_dedup_sweep_expired(GetCurrentTimestamp());

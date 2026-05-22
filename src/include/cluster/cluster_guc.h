@@ -588,5 +588,18 @@ extern int cluster_sinval_ack_wait_slots;
 extern int cluster_tt_status_overlay_max_entries;
 extern int cluster_tt_status_overlay_ttl_ms;
 
+/* spec-3.2 D7:  2 NEW GUC for cross-node TT status hint wire propagation. */
+typedef enum ClusterTTStatusHintEmitMode {
+	CLUSTER_TT_STATUS_HINT_EMIT_DISABLED = 0,
+	CLUSTER_TT_STATUS_HINT_EMIT_ALL_STATUS = 1
+} ClusterTTStatusHintEmitMode;
+extern int cluster_tt_status_hint_outbound_capacity;
+extern int cluster_tt_status_hint_emit_mode;
+
+#ifdef ENABLE_INJECTION
+/* spec-3.2 D5b:  test-only GUC (production binary 0 触达). */
+extern bool cluster_test_force_visibility_cluster_path;
+#endif
+
 
 #endif /* CLUSTER_GUC_H */

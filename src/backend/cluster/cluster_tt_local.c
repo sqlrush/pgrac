@@ -47,6 +47,7 @@
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_tt_local.h"
 #include "cluster/cluster_tt_status.h"
+#include "cluster/cluster_tt_status_hint.h" /* spec-3.2 D4 wire emit append */
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -178,6 +179,15 @@ install_status(TransactionId xid, ClusterTTStatus status)
 	Assert(hit && res.authoritative && res.status == status);
 	if (hit && res.authoritative && res.status == status)
 		cluster_tt_status_bump_self_consumer_hit();
+
+	/*
+	 * spec-3.2 D4:  cross-node TT status hint wire emit.  Uses the EXACT
+	 * key just minted + installed (HC184 — no raw-xid rebuild).  Fire-
+	 * and-forget;  emit_mode = disabled is a no-op inside the function.
+	 * commit/abort 对称(install_status is called from both
+	 * record_commit + record_abort).
+	 */
+	cluster_tt_status_hint_emit(&key, status);
 }
 
 /* ------------------------------------------------------------ */

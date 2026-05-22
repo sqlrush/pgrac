@@ -88,17 +88,18 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_stats.h" /* cluster_stats_status (spec-1.14 D12) */
 #include "cluster/cluster_lmon.h"  /* cluster_lmon_status (spec-1.11 Sprint B D12) */
 #include "cluster/cluster_guc.h"
-#include "cluster/cluster_ic.h"			   /* ClusterICOps_Active, ClusterICTier */
-#include "cluster/cluster_ic_tier1.h"	   /* listener metadata accessors (Hardening v1.0.1 F3) */
-#include "cluster/cluster_scn.h"		   /* SCN typedef (stage 1.4) */
-#include "cluster/cluster_itl_slot.h"	   /* CLUSTER_ITL_* constants (stage 1.5) */
-#include "cluster/cluster_buffer_desc.h"   /* BufferType / PcmState enums (stage 1.6) */
-#include "cluster/cluster_pcm_lock.h"	   /* PCM state-machine API + grd helpers */
-#include "cluster/cluster_gcs.h"		   /* GCS request protocol surface (spec-2.32 D8) */
-#include "cluster/cluster_gcs_block.h"	   /* GCS block-ship data plane (spec-2.33 D10) */
-#include "cluster/cluster_sinval.h"		   /* SI Broadcaster counter accessors (spec-2.38 D10) */
-#include "cluster/cluster_tt_status.h"	   /* TT status overlay counter accessors (spec-3.1 D9) */
-#include "cluster/cluster_startup_phase.h" /* phase enum + accessors (stage 1.10) */
+#include "cluster/cluster_ic.h"				/* ClusterICOps_Active, ClusterICTier */
+#include "cluster/cluster_ic_tier1.h"		/* listener metadata accessors (Hardening v1.0.1 F3) */
+#include "cluster/cluster_scn.h"			/* SCN typedef (stage 1.4) */
+#include "cluster/cluster_itl_slot.h"		/* CLUSTER_ITL_* constants (stage 1.5) */
+#include "cluster/cluster_buffer_desc.h"	/* BufferType / PcmState enums (stage 1.6) */
+#include "cluster/cluster_pcm_lock.h"		/* PCM state-machine API + grd helpers */
+#include "cluster/cluster_gcs.h"			/* GCS request protocol surface (spec-2.32 D8) */
+#include "cluster/cluster_gcs_block.h"		/* GCS block-ship data plane (spec-2.33 D10) */
+#include "cluster/cluster_sinval.h"			/* SI Broadcaster counter accessors (spec-2.38 D10) */
+#include "cluster/cluster_tt_status.h"		/* TT status overlay counter accessors (spec-3.1 D9) */
+#include "cluster/cluster_tt_status_hint.h" /* TT status hint counter accessors (spec-3.2 D8) */
+#include "cluster/cluster_startup_phase.h"	/* phase enum + accessors (stage 1.10) */
 #include "storage/bufpage.h"	   /* PG_PAGE_LAYOUT_VERSION, SizeOfPageHeaderData (stage 1.4) */
 #include "storage/buf_internals.h" /* BufferDesc layout (stage 1.6) */
 #include "cluster/cluster_pgstat.h"
@@ -1390,6 +1391,20 @@ dump_gcs(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_tt_status_get_self_consumer_hit_count()));
 	emit_row(rsinfo, "tt_status", "evict_fail_count",
 			 fmt_int64((int64)cluster_tt_status_get_evict_fail_count()));
+
+	/* spec-3.2 D8:  6 NEW counter rows for cross-node TT status hint wire. */
+	emit_row(rsinfo, "tt_status_hint", "emit_count",
+			 fmt_int64((int64)cluster_tt_status_hint_get_emit_count()));
+	emit_row(rsinfo, "tt_status_hint", "receive_count",
+			 fmt_int64((int64)cluster_tt_status_hint_get_receive_count()));
+	emit_row(rsinfo, "tt_status_hint", "drop_invalid_count",
+			 fmt_int64((int64)cluster_tt_status_hint_get_drop_invalid_count()));
+	emit_row(rsinfo, "tt_status_hint", "drop_stale_epoch_count",
+			 fmt_int64((int64)cluster_tt_status_hint_get_drop_stale_epoch_count()));
+	emit_row(rsinfo, "tt_status_hint", "drop_unknown_version_count",
+			 fmt_int64((int64)cluster_tt_status_hint_get_drop_unknown_version_count()));
+	emit_row(rsinfo, "tt_status_hint", "install_count",
+			 fmt_int64((int64)cluster_tt_status_hint_get_install_count()));
 }
 
 #endif /* USE_PGRAC_CLUSTER */

@@ -205,8 +205,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_cluster_shmem'),
-	   '35',
-	   'L12c pg_cluster_shmem returns 35 rows (spec-3.1 TT status regions included)');
+	   '36',
+	   'L12c pg_cluster_shmem returns 36 rows (spec-3.2 adds TT status hint outbound)');
 
 
 # ----------

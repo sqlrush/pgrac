@@ -384,6 +384,14 @@ void
 cluster_sinval_broadcast_reset_all(void)
 {}
 
+/* spec-3.2 D6 + D1:  LMON drain hook + msg_type register. */
+void
+cluster_tt_status_hint_drain_outbound(void)
+{}
+void
+cluster_tt_status_hint_register_msg_type(void)
+{}
+
 /* spec-2.2 D5 LMON drive references cluster_conf_lookup_node + cluster_node_id. */
 const struct ClusterNodeInfo *
 cluster_conf_lookup_node(int32 node_id pg_attribute_unused())

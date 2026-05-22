@@ -163,12 +163,18 @@ typedef enum ClusterICMsgType {
 	= 18, /* PGRAC: spec-2.36 D1 — CF 3-way holder→master invalidate ack (64B);
 		   * MUST be a distinct msg_type from INVALIDATE — request+ack are both
 		   * 64B fixed, cannot demux by payload length (codereview F1 P0). */
-	PGRAC_IC_MSG_SINVAL_ACK = 19 /* PGRAC: spec-2.39 D4 — SI Broadcaster peer_enqueued ACK envelope
+	PGRAC_IC_MSG_SINVAL_ACK = 19, /* PGRAC: spec-2.39 D4 — SI Broadcaster peer_enqueued ACK envelope
 		   * (SinvalAckHeader 24B fixed;no tail).  Producer mask = LMON
 		   * (L172 family — tier1 fd LMON-exclusive-ownership).  Sent by
 		   * LMON drain of ClusterSinvalAckOutbound (single-peer fanout,
 		   * not broadcast). */
-	/* values 20..255 available for future sub-spec; never reuse 0..19 */
+	PGRAC_IC_MSG_TT_STATUS_HINT = 20 /* PGRAC: spec-3.2 D1 — cross-node Undo TT
+		   * status hint(ClusterTTStatusHintMsg 32B fixed payload:8B header
+		   * + 24B embedded ClusterTTStatusKey;no tail).  Producer mask = LMON
+		   * (L172 family).  Sent by LMON drain of ClusterTTStatusHintOutbound;
+		   * fire-and-forget(无 ack);receiver install_local to spec-3.1
+		   * overlay using sender_node_id as origin.  spec-3.2 v1.0 FROZEN. */
+	/* values 21..255 available for future sub-spec; never reuse 0..20 */
 } ClusterICMsgType;
 
 

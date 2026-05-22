@@ -111,6 +111,7 @@ UT_TEST(test_stage2_msg_types_cumulative_registration)
 	UT_ASSERT_EQ((int)PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE, 17);	  /* spec-2.36 */
 	UT_ASSERT_EQ((int)PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK, 18); /* spec-2.36 */
 	UT_ASSERT_EQ((int)PGRAC_IC_MSG_SINVAL_ACK, 19);				  /* spec-2.39 */
+	UT_ASSERT_EQ((int)PGRAC_IC_MSG_TT_STATUS_HINT, 20);			  /* spec-3.2 */
 }
 
 

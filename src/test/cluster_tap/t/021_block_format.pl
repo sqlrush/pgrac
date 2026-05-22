@@ -166,8 +166,8 @@ SKIP: {
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_shmem}),
-	   '35',
-	   'L10 pg_cluster_shmem returns 35 rows (spec-3.1 TT status regions included)');
+	   '36',
+	   'L10 pg_cluster_shmem returns 36 rows (spec-3.2 adds TT status hint outbound)');
 
 
 # ----------
