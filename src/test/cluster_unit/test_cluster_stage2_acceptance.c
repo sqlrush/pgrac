@@ -248,7 +248,7 @@ UT_TEST(test_stage2_guc_enum_snapshot)
 	 * loads default since no postgresql.conf wired in this unit binary. */
 	UT_ASSERT_EQ(cluster_shmem_max_regions, 64);
 	/* boot_val/min_val/max_val GUC contract is enforced at registration
-	 * site in cluster_guc.c (DefineCustomIntVariable args 64/33/256);
+	 * site in cluster_guc.c (DefineCustomIntVariable args 64/35/256);
 	 * this test pins the boot_val.  min_val/max_val 是 GUC infra constant,
 	 * 不通过 extern 访问 — 由 030_acceptance.pl L? 在 production 验. */
 }
