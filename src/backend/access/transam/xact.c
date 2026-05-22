@@ -1619,9 +1619,9 @@ RecordTransactionCommit(void)
 	 * 轮);  cluster visibility (spec-3.2+) reaches TT status by exact key,
 	 * not by raw TransactionIdDidCommit(xid) (HC180 / HC181 / L176).
 	 *
-	 * Self-consumer assertion (spec-3.1 v0.4 N7) lives inside
-	 * cluster_tt_local_record_commit (debug build) — keeps D5/D6 wired and
-	 * exercised by D10 L2 TAP via the self_consumer_hit counter.
+	 * Self-consumer lookup (spec-3.1 v0.4 N7) lives inside
+	 * cluster_tt_local_record_commit — keeps D5/D6 wired in every build
+	 * and is exercised by D10 L2 TAP via the self_consumer_hit counter.
 	 */
 #ifdef USE_PGRAC_CLUSTER
 	if (markXidCommitted)

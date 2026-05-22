@@ -16,8 +16,8 @@
  *	      generation counter + counters.  SHARED for lookup_exact;
  *	      EXCLUSIVE for install/flush_all/evict (HC182).
  *	    - HTAB sized at postmaster startup from
- *	      cluster.tt_status_overlay_max_entries (PGC_SIGHUP wins only on
- *	      restart for capacity; TTL is read each lookup).
+ *	      cluster.tt_status_overlay_max_entries (PGC_POSTMASTER startup
+ *	      capacity; TTL is read each lookup).
  *
  *	  TTL / generation:
  *	    - each entry stamps install_ts; lookup_exact ages out entries
@@ -109,7 +109,7 @@ cluster_tt_status_shmem_size(void)
 {
 	Size sz;
 
-	if (IsBootstrapProcessingMode() || !cluster_enabled)
+	if (IsBootstrapProcessingMode() || !cluster_enabled || cluster_node_id < 0)
 		return 0;
 
 	sz = MAXALIGN(sizeof(ClusterTTStatusShmem));
@@ -126,7 +126,7 @@ cluster_tt_status_shmem_init(void)
 	bool found;
 	LWLockPadded *lockblock;
 
-	if (IsBootstrapProcessingMode() || !cluster_enabled)
+	if (IsBootstrapProcessingMode() || !cluster_enabled || cluster_node_id < 0)
 		return;
 
 	/* State header + counters. */
@@ -330,8 +330,8 @@ cluster_tt_status_generation(void)
 
 /*
  * cluster_tt_status_bump_self_consumer_hit -- internal counter bump used
- * by D6 commit hook to record the debug-build self-consumer assertion
- * (spec-3.1 v0.4 N7).  Not in the public header — only D5/D6 call this.
+ * by D6 commit hook to record the runtime self-consumer lookup
+ * (spec-3.1 v0.4 N7).  Only D5/D6 should call this.
  */
 void
 cluster_tt_status_bump_self_consumer_hit(void)

@@ -1599,8 +1599,8 @@ cluster_init_guc(void)
 			"Bounded in-memory cache of {origin_node, undo_segment, tt_slot, epoch, xid} "
 			"exact-key transaction status entries.  Miss returns CLUSTER_TT_STATUS_UNKNOWN "
 			"with authoritative=false (HC181 fail-closed); MUST NOT silent fallback to "
-			"PG CLOG (L176).  PGC_SIGHUP."),
-		&cluster_tt_status_overlay_max_entries, 32768, 1024, 1048576, PGC_SIGHUP, 0, NULL, NULL,
+			"PG CLOG (L176).  PGC_POSTMASTER."),
+		&cluster_tt_status_overlay_max_entries, 32768, 1024, 1048576, PGC_POSTMASTER, 0, NULL, NULL,
 		NULL);
 
 	DefineCustomIntVariable(

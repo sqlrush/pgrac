@@ -171,8 +171,8 @@ extern void cluster_tt_status_shmem_register(void);
 
 /*
  * cluster_tt_status_bump_self_consumer_hit -- internal counter bump used
- * ONLY by D5/D6 commit hook to record the debug-build N7 self-consumer
- * assertion (spec-3.1 v0.4 N7).  Do not call from production paths.
+ * ONLY by D5/D6 commit hook to record the runtime N7 self-consumer
+ * lookup (spec-3.1 v0.4 N7).  Do not call from unrelated paths.
  */
 extern void cluster_tt_status_bump_self_consumer_hit(void);
 

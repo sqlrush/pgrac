@@ -7,8 +7,8 @@
 #
 #	  L1   ClusterPair startup + both nodes alive
 #	  L2   spec-3.1 N7 self-consumer:  SQL commit on node0 bumps
-#	       sinval.install_count + self_consumer_hit (debug build) on
-#	       node0;  proves D5/D6 install hook + N7 self-consumer wired
+#	       install_count + self_consumer_hit on node0 in every build;
+#	       proves D5/D6 install hook + N7 self-consumer wired
 #	  L3   spec-3.1 N7 abort path:  SQL ROLLBACK bumps install_count
 #	       (status=ABORTED entry installed)
 #	  L4   tt_status pg_cluster_state category has 7 keys
@@ -23,7 +23,7 @@
 #	       row 'flush_count' exists as observable counter (D7 callsite
 #	       in cluster_reconfig.c — runtime reconfig trigger推 spec-2.29
 #	       reconfig acceptance,本 spec 仅 verify counter wiring)
-#	  L8   guard:  no TT_STATUS_HINT msg type in pg_cluster msg type SRF
+#	  L8   guard:  no TT_STATUS_HINT msg type in pg_cluster_ic_msg_types
 #	       (spec-3.1 §1.3 #3 — no cross-node wire) /* SPEC_3_1_LINT_OK: */
 #	  L9   guard:  no SharedInvalidationMessage size change (PG sinval
 #	       16B wire ABI untouched — spec-3.1 §0.1 F2)
@@ -106,9 +106,8 @@ cmp_ok($install_after - $install_before, '>=', 1,
 	"L2 install_count delta >= 1 on node0 after local commit");
 cmp_ok($lookup_hit_after - $lookup_hit_before, '>=', 1,
 	"L2 lookup_hit_count delta >= 1 (N7 self-consumer re-lookup)");
-# N7 self-consumer counter is debug-build only; non-strict check.
-cmp_ok($self_consumer_after, '>=', $self_consumer_before,
-	"L2 self_consumer_hit_count monotonic non-decreasing");
+cmp_ok($self_consumer_after - $self_consumer_before, '>=', 1,
+	"L2 self_consumer_hit_count delta >= 1 (N7 self-consumer runs in every build)");
 
 
 # ============================================================
@@ -185,8 +184,8 @@ is($pair->node0->safe_psql('postgres',
 # /* SPEC_3_1_LINT_OK: assertion checks the absence by SQL LIKE pattern */
 # ============================================================
 is($pair->node0->safe_psql('postgres',
-		q{SELECT count(*) FROM pg_cluster_msg_types
-		  WHERE msg_name LIKE '%TT_STATUS%'}),
+		q{SELECT count(*) FROM pg_cluster_ic_msg_types
+		  WHERE name LIKE '%TT_STATUS%'}),
 	'0',
 	'L8 no TT_STATUS-style msg type registered (spec-3.1 §1.3 #3)');
 

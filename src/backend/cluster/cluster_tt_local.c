@@ -18,9 +18,9 @@
  *
  *	  Caller: D6 xact.c commit/abort hook.  spec-3.1 v0.4 N7 requires
  *	  D6 to additionally re-`cluster_tt_status_lookup_exact` the just-
- *	  installed key in debug builds to prove the D5/D6 path is wired
- *	  (not dead helper); that self-consumer assertion happens in the
- *	  D6 caller, this file just provides the install + counter API.
+ *	  installed key in every build to prove the D5/D6 path is wired
+ *	  (not dead helper); assert builds add an assertion on top of the
+ *	  runtime counter evidence.
  *
  * Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -63,7 +63,7 @@ static ClusterTTLocalShmem *ClusterTTLocalState = NULL;
 Size
 cluster_tt_local_shmem_size(void)
 {
-	if (IsBootstrapProcessingMode() || !cluster_enabled)
+	if (IsBootstrapProcessingMode() || !cluster_enabled || cluster_node_id < 0)
 		return 0;
 	return MAXALIGN(sizeof(ClusterTTLocalShmem));
 }
@@ -73,7 +73,7 @@ cluster_tt_local_shmem_init(void)
 {
 	bool found;
 
-	if (IsBootstrapProcessingMode() || !cluster_enabled)
+	if (IsBootstrapProcessingMode() || !cluster_enabled || cluster_node_id < 0)
 		return;
 
 	ClusterTTLocalState = (ClusterTTLocalShmem *)ShmemInitStruct(
@@ -113,7 +113,7 @@ mint_provisional_tt_slot_id(void)
 	uint32 v;
 
 	if (ClusterTTLocalState == NULL)
-		return 1;
+		return 0;
 
 	v = pg_atomic_fetch_add_u32(&ClusterTTLocalState->slot_seq, 1);
 	if (v == 0) {
@@ -143,18 +143,16 @@ build_local_key(TransactionId xid, ClusterTTStatusKey *out)
 
 /*
  * install_status -- common path for commit / abort install + N7
- * self-consumer assertion (debug build).
+ * self-consumer lookup.
  */
 static void
 install_status(TransactionId xid, ClusterTTStatus status)
 {
 	ClusterTTStatusKey key;
-#ifdef USE_ASSERT_CHECKING
 	ClusterTTStatusResult res;
 	bool hit;
-#endif
 
-	if (!cluster_enabled)
+	if (!cluster_enabled || cluster_node_id < 0)
 		return;
 	if (!TransactionIdIsNormal(xid))
 		return;
@@ -169,19 +167,17 @@ install_status(TransactionId xid, ClusterTTStatus status)
 	 */
 	cluster_tt_status_install_local(&key, status, InvalidScn);
 
-#ifdef USE_ASSERT_CHECKING
 	/*
 	 * spec-3.1 v0.4 N7 self-consumer:  immediately re-lookup to prove
 	 * the just-installed key is reachable + bump the
-	 * self_consumer_hit_count counter (D9 T8 + D10 L2 covers).  This
-	 * keeps D5/D6 wired through release-build assert-stripped paths —
-	 * the lookup-hit_count counter incremented by lookup_exact also
-	 * proves liveness in TAP fixture reads.
+	 * self_consumer_hit_count counter (D9 T8 + D10 L2 covers).  This runs
+	 * in every build; assert builds additionally fail fast if the local
+	 * install path cannot read its own key.
 	 */
 	hit = cluster_tt_status_lookup_exact(&key, &res);
+	Assert(hit && res.authoritative && res.status == status);
 	if (hit && res.authoritative && res.status == status)
 		cluster_tt_status_bump_self_consumer_hit();
-#endif
 }
 
 /* ------------------------------------------------------------ */

@@ -18,8 +18,8 @@
  *	  cluster_tt_status_flush_all() must run before spec-3.4 swap-over.
  *
  *	  spec-3.1 v0.4 N7:  caller (D6 xact hook) MUST exercise the install
- *	  → lookup self-consumer path in debug builds to keep D5/D6 wired
- *	  (not dead helper; L173 defense).
+ *	  → lookup self-consumer path in every build to keep D5/D6 wired
+ *	  (not dead helper; L173 defense).  Assert builds add a fast-fail check.
  *
  * Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
