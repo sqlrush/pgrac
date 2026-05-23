@@ -47,7 +47,7 @@
 #include "cluster/cluster_guc.h" /* cluster_enabled */
 #include "cluster/cluster_itl.h" /* stamp_committed / stamp_aborted */
 #include "cluster/cluster_itl_touch.h"
-#include "miscadmin.h"		/* InterruptHoldoffCount */
+#include "miscadmin.h"		/* START_CRIT_SECTION / END_CRIT_SECTION */
 #include "storage/bufmgr.h" /* ReadBufferWithoutRelcache / LockBuffer */
 #include "utils/memutils.h"
 
@@ -76,13 +76,6 @@ cluster_itl_touch_register(const ClusterItlTouchHandle *handle)
 	uint32 i;
 
 	Assert(handle != NULL);
-
-	/*
-	 * Spec-3.4a forbids registration from signal handlers or any
-	 * async-unsafe context.  palloc + MemoryContextSwitchTo are not
-	 * async-signal-safe.
-	 */
-	Assert(InterruptHoldoffCount == 0);
 
 	for (i = 0; i < touch_count; i++) {
 		if (itl_touch_handle_matches(&touch_list[i], handle))

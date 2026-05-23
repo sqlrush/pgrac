@@ -92,8 +92,9 @@ StaticAssertDecl(offsetof(ClusterItlTouchHandle, flags) == 22, "spec-3.4a D1 —
  * the handle on the stack and passes by const pointer; this function
  * deep-copies into the list.
  *
- *	Asserts: !InterruptHoldoffCount (i.e. not in a signal handler);
- *	         spec-3.4a does not register from async contexts.
+ *	This may run while a surrounding utility/catalog path has interrupts
+ *	held off; that is still normal backend context, not an async signal
+ *	handler.
  *
  *	Subtransactions: callers must have already rejected
  *	GetCurrentTransactionNestLevel() > 1 with ERRCODE_FEATURE_NOT_
