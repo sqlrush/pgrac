@@ -67,6 +67,13 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC (spec-3.3 D2): cluster snapshot field refresh. */
+#include "cluster/cluster_epoch.h"
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_scn.h"
+#endif
+
 #define UINT32_ACCESS_ONCE(var)		 ((uint32)(*((volatile uint32 *)&(var))))
 
 /* Our shared memory area */
@@ -2106,6 +2113,37 @@ GetSnapshotDataInitOldSnapshot(Snapshot snapshot)
 	}
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * PGRAC (spec-3.3 D2): refresh cluster snapshot fields on every snapshot
+ * production path -- both the GetSnapshotDataReuse() fast path and the full
+ * rebuild path. Called inline (lock-free atomic reads, no syscall, no wait).
+ *
+ * R2 P0: the reuse path was previously leaving stale read_scn/read_epoch in
+ * place, which under Read Committed would let a new statement observe the
+ * previous statement's cluster snapshot point. Refresh both paths.
+ *
+ * R4 P1: explicit zero-fill on LOCAL semantics to keep _pad[7] reproducible.
+ */
+static inline void
+ClusterSnapshotRefreshFields(Snapshot snapshot)
+{
+	if (cluster_enabled)
+	{
+		snapshot->cluster_source = (uint8) SNAPSHOT_SOURCE_CLUSTER;
+		snapshot->read_scn = cluster_scn_current();
+		snapshot->read_epoch = cluster_epoch_get_current();
+	}
+	else
+	{
+		snapshot->cluster_source = (uint8) SNAPSHOT_SOURCE_LOCAL;
+		snapshot->read_scn = InvalidScn;
+		snapshot->read_epoch = 0;
+	}
+	memset(snapshot->_pad, 0, sizeof(snapshot->_pad));
+}
+#endif
+
 /*
  * Helper function for GetSnapshotData() that checks if the bulk of the
  * visibility information in the snapshot is still valid. If so, it updates
@@ -2161,6 +2199,14 @@ GetSnapshotDataReuse(Snapshot snapshot)
 	snapshot->copied = false;
 
 	GetSnapshotDataInitOldSnapshot(snapshot);
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC (spec-3.3 D2 / R2 P0): the reuse fast path was previously leaving
+	 * stale cluster fields in place. Refresh inline (lock-free atomic reads).
+	 */
+	ClusterSnapshotRefreshFields(snapshot);
+#endif
 
 	return true;
 }
@@ -2542,6 +2588,14 @@ GetSnapshotData(Snapshot snapshot)
 	snapshot->copied = false;
 
 	GetSnapshotDataInitOldSnapshot(snapshot);
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC (spec-3.3 D2): refresh cluster snapshot fields on full rebuild
+	 * path as well; see ClusterSnapshotRefreshFields() docs for R2 P0 detail.
+	 */
+	ClusterSnapshotRefreshFields(snapshot);
+#endif
 
 	return snapshot;
 }
