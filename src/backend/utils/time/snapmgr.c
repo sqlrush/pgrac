@@ -72,6 +72,10 @@
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
 
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"		/* PGRAC (spec-3.3 D3/D4): cluster_enabled */
+#endif
+
 
 /*
  * GUC parameters
@@ -192,6 +196,19 @@ typedef struct SerializedSnapshotData
 	CommandId	curcid;
 	TimestampTz whenTaken;
 	XLogRecPtr	lsn;
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC (spec-3.3 D4 root 6 — parallel worker carry): propagate cluster
+	 * snapshot fields so a parallel worker sees the same cluster_source /
+	 * read_scn / read_epoch as the leader. Without this, the worker would
+	 * observe garbage cluster fields after RestoreSnapshot() and could
+	 * either route catalog scans into the cluster path or compare against
+	 * a stale read_scn.
+	 */
+	uint8		cluster_source;
+	SCN			cluster_read_scn;
+	uint64		cluster_read_epoch;
+#endif
 } SerializedSnapshotData;
 
 Size
@@ -1271,6 +1288,25 @@ ExportSnapshot(Snapshot snapshot)
 	}
 	appendStringInfo(&buf, "rec:%u\n", snapshot->takenDuringRecovery);
 
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC (spec-3.3 D4 root 3 — Export/Import): emit cluster snapshot
+	 * fields. When a snapshot exported by a cluster-enabled backend is
+	 * later imported by a cluster-enabled backend, the SCN/epoch/source
+	 * must be preserved so that SET TRANSACTION SNAPSHOT semantics carry
+	 * the cluster snapshot point. Old format (no clu:* lines) imports as
+	 * LOCAL fail-closed -- see ImportSnapshot().
+	 *
+	 * R5 P1: don't silently weaken to LOCAL when format is incomplete;
+	 * the importer rejects mid-version downgrades instead.
+	 */
+	appendStringInfo(&buf, "clu_src:%u\n", (unsigned) snapshot->cluster_source);
+	appendStringInfo(&buf, "clu_scn:" UINT64_FORMAT "\n",
+					 (uint64) snapshot->read_scn);
+	appendStringInfo(&buf, "clu_epoch:" UINT64_FORMAT "\n",
+					 snapshot->read_epoch);
+#endif
+
 	/*
 	 * Now write the text representation into a file.  We first write to a
 	 * ".tmp" filename, and rename to final filename if no error.  This
@@ -1382,6 +1418,38 @@ parseXidFromText(const char *prefix, char **s, const char *filename)
 	*s = ptr + 1;
 	return val;
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * PGRAC (spec-3.3 D4 root 3): parse uint64 used for cluster SCN / epoch
+ * in exported snapshot files. Mirrors parseXidFromText() structure but
+ * accepts the full uint64 range.
+ */
+static uint64
+parseXid8FromText(const char *prefix, char **s, const char *filename)
+{
+	char	   *ptr = *s;
+	int			prefixlen = strlen(prefix);
+	uint64		val;
+
+	if (strncmp(ptr, prefix, prefixlen) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("invalid snapshot data in file \"%s\"", filename)));
+	ptr += prefixlen;
+	if (sscanf(ptr, UINT64_FORMAT, &val) != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("invalid snapshot data in file \"%s\"", filename)));
+	ptr = strchr(ptr, '\n');
+	if (!ptr)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("invalid snapshot data in file \"%s\"", filename)));
+	*s = ptr + 1;
+	return val;
+}
+#endif
 
 static void
 parseVxidFromText(const char *prefix, char **s, const char *filename,
@@ -1534,6 +1602,46 @@ ImportSnapshot(const char *idstr)
 	}
 
 	snapshot.takenDuringRecovery = parseIntFromText("rec:", &filebuf, path);
+
+#ifdef USE_PGRAC_CLUSTER
+	{
+		/*
+		 * PGRAC (spec-3.3 D4 root 3): parse cluster snapshot fields. Old
+		 * format files (pre spec-3.3) lack clu_src/clu_scn/clu_epoch lines.
+		 *
+		 * R5 P1 fail-closed policy: if cluster_enabled and the file lacks
+		 * cluster fields, reject the import outright. Silently downgrading
+		 * to LOCAL would weaken snapshot semantics and could mis-route
+		 * repeatable-read / serializable transactions.
+		 */
+		const char *peek = filebuf;
+		bool		has_cluster_fields = (strncmp(peek, "clu_src:", 8) == 0);
+
+		if (has_cluster_fields)
+		{
+			snapshot.cluster_source =
+				(uint8) parseIntFromText("clu_src:", &filebuf, path);
+			snapshot.read_scn =
+				(SCN) parseXid8FromText("clu_scn:", &filebuf, path);
+			snapshot.read_epoch =
+				(uint64) parseXid8FromText("clu_epoch:", &filebuf, path);
+		}
+		else if (cluster_enabled)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+					 errmsg("exported snapshot \"%s\" lacks cluster fields", idstr),
+					 errhint("Snapshot was exported by a pre-spec-3.3 backend; cluster-enabled imports require clu_src/clu_scn/clu_epoch.")));
+		}
+		else
+		{
+			snapshot.cluster_source = (uint8) SNAPSHOT_SOURCE_LOCAL;
+			snapshot.read_scn = InvalidScn;
+			snapshot.read_epoch = 0;
+		}
+		memset(snapshot._pad, 0, sizeof(snapshot._pad));
+	}
+#endif
 
 	/*
 	 * Do some additional sanity checking, just to protect ourselves.  We
@@ -2182,6 +2290,13 @@ SerializeSnapshot(Snapshot snapshot, char *start_address)
 	serialized_snapshot.whenTaken = snapshot->whenTaken;
 	serialized_snapshot.lsn = snapshot->lsn;
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC (spec-3.3 D4): carry cluster snapshot fields to worker. */
+	serialized_snapshot.cluster_source = snapshot->cluster_source;
+	serialized_snapshot.cluster_read_scn = snapshot->read_scn;
+	serialized_snapshot.cluster_read_epoch = snapshot->read_epoch;
+#endif
+
 	/*
 	 * Ignore the SubXID array if it has overflowed, unless the snapshot was
 	 * taken during recovery - in that case, top-level XIDs are in subxip as
@@ -2256,6 +2371,18 @@ RestoreSnapshot(char *start_address)
 	snapshot->whenTaken = serialized_snapshot.whenTaken;
 	snapshot->lsn = serialized_snapshot.lsn;
 	snapshot->snapXactCompletionCount = 0;
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC (spec-3.3 D4): restore cluster snapshot fields from leader.
+	 * Worker observes the same read_scn / read_epoch / cluster_source as
+	 * the leader at SerializeSnapshot() time.
+	 */
+	snapshot->cluster_source = serialized_snapshot.cluster_source;
+	snapshot->read_scn = serialized_snapshot.cluster_read_scn;
+	snapshot->read_epoch = serialized_snapshot.cluster_read_epoch;
+	memset(snapshot->_pad, 0, sizeof(snapshot->_pad));
+#endif
 
 	/* Copy XIDs, if present. */
 	if (serialized_snapshot.xcnt > 0)

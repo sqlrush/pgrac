@@ -1867,6 +1867,21 @@ ReorderBufferCopySnap(ReorderBuffer *rb, Snapshot orig_snap,
 	/* store the specified current CommandId */
 	snap->curcid = cid;
 
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC (spec-3.3 D4 root 5): reorder buffer snapshots are LOCAL.
+	 * The memcpy() above carried orig_snap's cluster fields, which should
+	 * already be LOCAL because snapbuild.c only produces LOCAL snapshots,
+	 * but we override defensively in case a future code path passes a
+	 * CLUSTER-source snapshot here -- logical decoding apply paths must
+	 * never enter the cluster visibility fork.
+	 */
+	snap->cluster_source = (uint8) SNAPSHOT_SOURCE_LOCAL;
+	snap->read_scn = InvalidScn;
+	snap->read_epoch = 0;
+	memset(snap->_pad, 0, sizeof(snap->_pad));
+#endif
+
 	return snap;
 }
 

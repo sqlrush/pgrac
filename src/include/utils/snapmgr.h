@@ -71,8 +71,28 @@ extern PGDLLIMPORT SnapshotData CatalogSnapshotData;
  * non-reentrant.  Instead, users of that snapshot type should declare a
  * local variable of type SnapshotData, and initialize it with this macro.
  */
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * PGRAC (spec-3.3 D4 root 1): static SnapshotData init macros must zero
+ * the cluster tail. Callers commonly declare `SnapshotData s;` on the
+ * stack (uninitialised garbage) and only invoke Init*Snapshot() to set
+ * snapshot_type. Without explicit zeroing, cluster_source could randomly
+ * be == CLUSTER (1) and route a Dirty / NonVacuumable / Toast snapshot
+ * into the cluster visibility path. Force LOCAL semantics for all
+ * non-MVCC static snapshots.
+ */
+#define PGRAC_INIT_SNAPSHOT_LOCAL(snapshotdata) \
+	((snapshotdata).cluster_source = (uint8) SNAPSHOT_SOURCE_LOCAL, \
+	 (snapshotdata).read_scn = InvalidScn, \
+	 (snapshotdata).read_epoch = 0, \
+	 memset((snapshotdata)._pad, 0, sizeof((snapshotdata)._pad)))
+#else
+#define PGRAC_INIT_SNAPSHOT_LOCAL(snapshotdata) ((void) 0)
+#endif
+
 #define InitDirtySnapshot(snapshotdata)  \
-	((snapshotdata).snapshot_type = SNAPSHOT_DIRTY)
+	((snapshotdata).snapshot_type = SNAPSHOT_DIRTY, \
+	 PGRAC_INIT_SNAPSHOT_LOCAL(snapshotdata))
 
 /*
  * Similarly, some initialization is required for a NonVacuumable snapshot.
@@ -81,7 +101,8 @@ extern PGDLLIMPORT SnapshotData CatalogSnapshotData;
  */
 #define InitNonVacuumableSnapshot(snapshotdata, vistestp)  \
 	((snapshotdata).snapshot_type = SNAPSHOT_NON_VACUUMABLE, \
-	 (snapshotdata).vistest = (vistestp))
+	 (snapshotdata).vistest = (vistestp), \
+	 PGRAC_INIT_SNAPSHOT_LOCAL(snapshotdata))
 
 /*
  * Similarly, some initialization is required for SnapshotToast.  We need
@@ -90,7 +111,8 @@ extern PGDLLIMPORT SnapshotData CatalogSnapshotData;
 #define InitToastSnapshot(snapshotdata, l, w)  \
 	((snapshotdata).snapshot_type = SNAPSHOT_TOAST, \
 	 (snapshotdata).lsn = (l),					\
-	 (snapshotdata).whenTaken = (w))
+	 (snapshotdata).whenTaken = (w), \
+	 PGRAC_INIT_SNAPSHOT_LOCAL(snapshotdata))
 
 /* This macro encodes the knowledge of which snapshots are MVCC-safe */
 #define IsMVCCSnapshot(snapshot)  \

@@ -551,6 +551,20 @@ SnapBuildBuildSnapshot(SnapBuild *builder)
 	snapshot->regd_count = 0;
 	snapshot->snapXactCompletionCount = 0;
 
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC (spec-3.3 D4 root 4): logical decoding snapshots are LOCAL. The
+	 * MemoryContextAllocZero() above zero-fills cluster_source/read_scn/
+	 * read_epoch/_pad to LOCAL semantics already (cluster_source = 0 =
+	 * SNAPSHOT_SOURCE_LOCAL, read_scn = 0 = InvalidScn), so this is a
+	 * defensive no-op left explicit to mark intent for future readers and
+	 * to survive any change to InvalidScn / SNAPSHOT_SOURCE_LOCAL values.
+	 */
+	snapshot->cluster_source = (uint8) SNAPSHOT_SOURCE_LOCAL;
+	snapshot->read_scn = InvalidScn;
+	snapshot->read_epoch = 0;
+#endif
+
 	return snapshot;
 }
 
