@@ -43,8 +43,11 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_guc.h"		/* cluster_enabled */
+#include "cluster/cluster_itl.h"		/* stamp_committed / stamp_aborted */
 #include "cluster/cluster_itl_touch.h"
 #include "miscadmin.h"			/* InterruptHoldoffCount */
+#include "storage/bufmgr.h"		/* ReadBufferWithoutRelcache / LockBuffer */
 #include "utils/memutils.h"
 
 #ifdef USE_PGRAC_CLUSTER
@@ -128,6 +131,98 @@ cluster_itl_touch_count(void)
 	return touch_count;
 }
 
+/* ---------- spec-3.4a D6 — xact.c pre-commit/abort hook ---------- */
+
+/*
+ * Helper: re-read the buffer indicated by `handle`, acquire EXCLUSIVE
+ * content lock, return the Buffer to the caller.  Caller is responsible
+ * for stamping + ReleaseBuffer.  Uses ReadBufferWithoutRelcache to
+ * avoid relcache lookup overhead and to keep the hook lightweight even
+ * during shutdown sequences where relcache may be torn down.
+ */
+static Buffer
+itl_touch_acquire_buffer(const ClusterItlTouchHandle *handle)
+{
+	Buffer buf;
+
+	buf = ReadBufferWithoutRelcache(handle->rloc, handle->forknum,
+									handle->block, RBM_NORMAL,
+									NULL, true /* permanent */);
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	return buf;
+}
+
+typedef struct ItlFinishCtx
+{
+	SCN  commit_scn;	/* InvalidScn for abort path */
+	bool is_commit;
+} ItlFinishCtx;
+
+static void
+itl_finish_one(const ClusterItlTouchHandle *handle, void *arg)
+{
+	ItlFinishCtx *ctx = (ItlFinishCtx *) arg;
+	Buffer buf;
+
+	buf = itl_touch_acquire_buffer(handle);
+
+	START_CRIT_SECTION();
+	if (ctx->is_commit)
+		cluster_itl_stamp_committed(buf, (uint8) handle->slot_idx,
+									ctx->commit_scn);
+	else
+		cluster_itl_stamp_aborted(buf, (uint8) handle->slot_idx);
+	/*
+	 * TODO spec-3.4a D8: emit xl_heap_itl_delta_block WAL record here
+	 * BEFORE END_CRIT_SECTION.  Currently the stamp mutates the page
+	 * + MarkBufferDirty, but the COMMITTED/ABORTED transition is not
+	 * yet WAL-logged separately from the original heap_insert /
+	 * heap_update WAL record.  Crash safety for ACTIVE -> COMMITTED
+	 * transition is provided by D8 (Step 7) in a follow-up commit.
+	 */
+	END_CRIT_SECTION();
+
+	UnlockReleaseBuffer(buf);
+}
+
+void
+cluster_itl_xact_precommit_finish(TransactionId xid, SCN commit_scn)
+{
+	ItlFinishCtx ctx;
+
+	(void) xid;					/* xid currently unused; reserved for WAL emit */
+
+	if (!cluster_enabled)
+		return;
+	if (touch_count == 0)
+		return;
+
+	Assert(SCN_VALID(commit_scn));	/* L181 — COMMITTED must carry valid SCN */
+
+	ctx.commit_scn = commit_scn;
+	ctx.is_commit = true;
+	cluster_itl_touch_foreach(itl_finish_one, &ctx);
+	cluster_itl_touch_reset_at_end_xact();
+}
+
+void
+cluster_itl_xact_abort_finish(TransactionId xid)
+{
+	ItlFinishCtx ctx;
+
+	(void) xid;
+
+	if (!cluster_enabled)
+		return;
+	if (touch_count == 0)
+		return;
+
+	ctx.commit_scn = InvalidScn;
+	ctx.is_commit = false;
+	cluster_itl_touch_foreach(itl_finish_one, &ctx);
+	cluster_itl_touch_reset_at_end_xact();
+}
+
 #else							/* !USE_PGRAC_CLUSTER */
 
 void
@@ -150,6 +245,17 @@ uint32
 cluster_itl_touch_count(void)
 {
 	return 0;
+}
+
+void
+cluster_itl_xact_precommit_finish(TransactionId xid pg_attribute_unused(),
+								  SCN commit_scn pg_attribute_unused())
+{
+}
+
+void
+cluster_itl_xact_abort_finish(TransactionId xid pg_attribute_unused())
+{
 }
 
 #endif							/* USE_PGRAC_CLUSTER */

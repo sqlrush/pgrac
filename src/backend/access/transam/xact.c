@@ -147,6 +147,7 @@
 #include "cluster/cluster_scn.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_tt_local.h" /* PGRAC: spec-3.1 D6 commit/abort hook */
+#include "cluster/cluster_itl_touch.h" /* PGRAC: spec-3.4a D6 pre-commit/abort */
 #endif
 #endif
 
@@ -1511,6 +1512,18 @@ RecordTransactionCommit(void)
 		commit_scn = cluster_scn_advance_for_commit();
 		/* spec-3.3 D7: copy to function-scope variable for TT hook below. */
 		tt_commit_scn = commit_scn;
+
+		/*
+		 * PGRAC (spec-3.4a D6 / N12 P0):
+		 * Stamp every touched ITL slot COMMITTED + emit WAL BEFORE the
+		 * commit XLOG record is written.  XACT_EVENT_COMMIT fires after
+		 * the commit record is durable -- too late to write ITL state
+		 * with crash-safe ordering -- so we use an explicit pre-commit
+		 * hook here instead of RegisterXactCallback (N10/N12).  The
+		 * hook is a no-op when the touched list is empty (DDL-only
+		 * transactions, autovacuum, etc.).
+		 */
+		cluster_itl_xact_precommit_finish(xid, tt_commit_scn);
 #endif
 
 		START_CRIT_SECTION();
@@ -1907,7 +1920,21 @@ RecordTransactionAbort(bool isSubXact)
 	 */
 #ifdef USE_PGRAC_CLUSTER
 	if (!isSubXact)
+	{
 		abort_scn = cluster_scn_advance_for_abort();
+
+		/*
+		 * PGRAC (spec-3.4a D6): stamp every touched ITL slot ABORTED
+		 * BEFORE the abort XLOG record is written.  Mirrors the commit
+		 * path; explicit hook (not RegisterXactCallback) so ITL state
+		 * is durable before the abort record is replayed.  No-op when
+		 * the touched list is empty.  Subxact abort intentionally NOT
+		 * routed here: spec-3.4a fails closed at the DML callsite when
+		 * GetCurrentTransactionNestLevel() > 1, so a subxact never
+		 * populates the top-level list.
+		 */
+		cluster_itl_xact_abort_finish(xid);
+	}
 #endif
 
 	/* XXX do we really need a critical section here? */

@@ -47,12 +47,14 @@
 
 #include "c.h"
 #include "postgres_ext.h"		/* Oid (used by RelFileLocator) */
+#include "access/transam.h"		/* TransactionId */
 #include "access/xlogdefs.h"
 #include "common/relpath.h"		/* ForkNumber */
 #include "storage/block.h"		/* BlockNumber */
 #include "storage/buf.h"		/* Buffer */
 #include "storage/itemptr.h"	/* OffsetNumber */
 #include "storage/relfilelocator.h"
+#include "cluster/cluster_scn.h"	/* SCN */
 
 /*
  * ClusterItlTouchHandle -- 24-byte fixed handle (HC: layout MUST stay
@@ -125,5 +127,23 @@ extern void cluster_itl_touch_reset_at_end_xact(void);
  * pg_cluster_state row in spec-3.4b+).  Cheap O(1) read.
  */
 extern uint32 cluster_itl_touch_count(void);
+
+/*
+ * cluster_itl_xact_precommit_finish / cluster_itl_xact_abort_finish --
+ * spec-3.4a D6 xact.c hook entry points.
+ *
+ *	NOT a RegisterXactCallback (N10/N12).  Called explicitly from
+ *	xact.c BEFORE the durable commit/abort XLOG record is written.
+ *	The hook iterates the xact-local touched list (D1), re-ReadBuffer
+ *	each handle, acquires EXCLUSIVE content lock, stamps the ITL slot
+ *	COMMITTED/ABORTED inside a critical section that also emits the
+ *	matching xl_heap_itl_delta_block WAL record (full WAL emit wired
+ *	in spec-3.4a D8 / Step 7).  Finally calls
+ *	cluster_itl_touch_reset_at_end_xact().
+ *
+ *	No-op when cluster_enabled is false or the touched list is empty.
+ */
+extern void cluster_itl_xact_precommit_finish(TransactionId xid, SCN commit_scn);
+extern void cluster_itl_xact_abort_finish(TransactionId xid);
 
 #endif							/* CLUSTER_ITL_TOUCH_H */
