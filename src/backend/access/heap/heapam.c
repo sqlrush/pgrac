@@ -9978,6 +9978,46 @@ heap_xlog_delete(XLogReaderState *record)
 			HeapTupleHeaderSetMovedPartitions(htup);
 		else
 			htup->t_ctid = target_tid;
+
+#ifdef USE_PGRAC_CLUSTER
+		/*
+		 * PGRAC (spec-3.4a D9): replay block-local ITL delta if the
+		 * heap_delete WAL record carried one (XLH_DELETE_ITL_DELTA).
+		 * memcpy handles xl_heap_delete / 8-byte SCN alignment mismatch.
+		 */
+		if (xlrec->flags & XLH_DELETE_ITL_DELTA)
+		{
+			char	   *itl_start = (char *) xlrec + SizeOfHeapDelete;
+			xl_heap_itl_delta_block hdr;
+			uint16		i;
+
+			memcpy(&hdr, itl_start,
+				   offsetof(xl_heap_itl_delta_block, deltas));
+			for (i = 0; i < hdr.ndeltas; i++)
+			{
+				xl_heap_itl_delta delta;
+				ClusterItlSlotData *slot;
+
+				memcpy(&delta,
+					   itl_start
+					   + offsetof(xl_heap_itl_delta_block, deltas)
+					   + i * sizeof(xl_heap_itl_delta),
+					   sizeof(xl_heap_itl_delta));
+
+				if (delta.flags_after == ITL_FLAG_COMMITTED &&
+					!SCN_VALID(delta.commit_scn))
+					elog(PANIC,
+						 "spec-3.4a D9: ITL COMMITTED delta with InvalidScn at heap_xlog_delete redo");
+
+				slot = &ClusterPageGetItlSlots(page)[delta.slot_idx];
+				slot->xid = delta.xid;
+				slot->flags = delta.flags_after;
+				slot->write_scn = delta.write_scn;
+				slot->commit_scn = delta.commit_scn;
+			}
+		}
+#endif
+
 		PageSetLSN(page, lsn);
 		MarkBufferDirty(buffer);
 	}
@@ -10085,6 +10125,47 @@ heap_xlog_insert(XLogReaderState *record)
 			elog(PANIC, "failed to add tuple");
 
 		freespace = PageGetHeapFreeSpace(page); /* needed to update FSM below */
+
+#ifdef USE_PGRAC_CLUSTER
+		/*
+		 * PGRAC (spec-3.4a D9): replay block-local ITL delta array if
+		 * the heap_insert WAL record carried one (XLH_INSERT_ITL_DELTA).
+		 * The delta block follows xl_heap_insert in main data.  We
+		 * memcpy to handle the 3-byte xlrec / 8-byte SCN alignment
+		 * mismatch on strict-alignment architectures.
+		 */
+		if (xlrec->flags & XLH_INSERT_ITL_DELTA)
+		{
+			char	   *itl_start = (char *) xlrec + SizeOfHeapInsert;
+			xl_heap_itl_delta_block hdr;
+			uint16		i;
+
+			memcpy(&hdr, itl_start,
+				   offsetof(xl_heap_itl_delta_block, deltas));
+			for (i = 0; i < hdr.ndeltas; i++)
+			{
+				xl_heap_itl_delta delta;
+				ClusterItlSlotData *slot;
+
+				memcpy(&delta,
+					   itl_start
+					   + offsetof(xl_heap_itl_delta_block, deltas)
+					   + i * sizeof(xl_heap_itl_delta),
+					   sizeof(xl_heap_itl_delta));
+
+				if (delta.flags_after == ITL_FLAG_COMMITTED &&
+					!SCN_VALID(delta.commit_scn))
+					elog(PANIC,
+						 "spec-3.4a D9: ITL COMMITTED delta with InvalidScn at heap_xlog_insert redo");
+
+				slot = &ClusterPageGetItlSlots(page)[delta.slot_idx];
+				slot->xid = delta.xid;
+				slot->flags = delta.flags_after;
+				slot->write_scn = delta.write_scn;
+				slot->commit_scn = delta.commit_scn;
+			}
+		}
+#endif
 
 		PageSetLSN(page, lsn);
 
