@@ -1625,6 +1625,29 @@ ImportSnapshot(const char *idstr)
 				(SCN) parseXid8FromText("clu_scn:", &filebuf, path);
 			snapshot.read_epoch =
 				(uint64) parseXid8FromText("clu_epoch:", &filebuf, path);
+
+			/*
+			 * PGRAC (spec-3.3 R5): malformed exported cluster fields must
+			 * fail closed.  In particular, an out-of-range clu_src value
+			 * must not behave like LOCAL and bypass the cluster visibility
+			 * path under cluster_enabled.
+			 */
+			if (snapshot.cluster_source != (uint8) SNAPSHOT_SOURCE_LOCAL &&
+				snapshot.cluster_source != (uint8) SNAPSHOT_SOURCE_CLUSTER)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+						 errmsg("invalid cluster snapshot source in file \"%s\"", path)));
+			if (snapshot.cluster_source == (uint8) SNAPSHOT_SOURCE_CLUSTER)
+			{
+				if (!SCN_VALID(snapshot.read_scn) || snapshot.read_epoch == 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+							 errmsg("invalid cluster snapshot fields in file \"%s\"", path)));
+			}
+			else if (snapshot.read_scn != InvalidScn || snapshot.read_epoch != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+						 errmsg("invalid local snapshot cluster fields in file \"%s\"", path)));
 		}
 		else if (cluster_enabled)
 		{

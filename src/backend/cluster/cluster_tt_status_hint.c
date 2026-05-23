@@ -295,6 +295,7 @@ cluster_tt_status_hint_handle_envelope(const ClusterICEnvelope *env, const void 
 	const ClusterTTStatusKey *key;
 	SCN			commit_scn;
 	uint32		current_epoch;
+	bool		v1_compat = false;
 
 	if (ClusterTTHintCounters == NULL || env == NULL || payload == NULL)
 		return;
@@ -334,10 +335,7 @@ cluster_tt_status_hint_handle_envelope(const ClusterICEnvelope *env, const void 
 		/* V1 wire carries no commit_scn -> install InvalidScn; snapshot
 		 * consumer flags such tuples UNKNOWN -> 53R97. */
 		commit_scn = InvalidScn;
-		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_v1_compat_count, 1);
-		ereport(WARNING,
-				(errmsg("cluster tt_status_hint V1 received from peer; spec-3.3 senders should emit V2"),
-				 errhint("Peer is running a pre-spec-3.3 binary; commit_scn=InvalidScn results in UNKNOWN visibility for cross-node COMMITs.")));
+		v1_compat = true;
 	}
 	else if (msg_version == CLUSTER_TT_STATUS_HINT_V2)
 	{
@@ -390,6 +388,26 @@ cluster_tt_status_hint_handle_envelope(const ClusterICEnvelope *env, const void 
 		return;
 	}
 
+	/*
+	 * spec-3.3 D9/L181: V2 COMMITTED messages must carry a real
+	 * commit_scn. V1 compat intentionally installs InvalidScn so the
+	 * visibility consumer fails closed with 53R97; do not reject it here.
+	 * ABORTED has no commit_scn and must keep the field InvalidScn.
+	 */
+	if (!v1_compat)
+	{
+		if (status_raw == CLUSTER_TT_STATUS_COMMITTED && !SCN_VALID(commit_scn))
+		{
+			pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+			return;
+		}
+		if (status_raw == CLUSTER_TT_STATUS_ABORTED && SCN_VALID(commit_scn))
+		{
+			pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+			return;
+		}
+	}
+
 	/* Reserved fields MUST be zero (M3 anti-tamper). */
 	if (flags_raw != 0 || reserved16_raw != 0 || key->_reserved != 0
 		|| key->_reserved2 != 0) {
@@ -398,6 +416,14 @@ cluster_tt_status_hint_handle_envelope(const ClusterICEnvelope *env, const void 
 	}
 
 	pg_atomic_fetch_add_u64(&ClusterTTHintCounters->receive_count, 1);
+
+	if (v1_compat)
+	{
+		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_v1_compat_count, 1);
+		ereport(WARNING,
+				(errmsg("cluster tt_status_hint V1 received from peer; spec-3.3 senders should emit V2"),
+				 errhint("Peer is running a pre-spec-3.3 binary; commit_scn=InvalidScn results in UNKNOWN visibility for cross-node COMMITs.")));
+	}
 
 	/*
 	 * spec-3.3 D9 (L181 chain step 6): install with commit_scn from
