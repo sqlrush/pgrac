@@ -87,6 +87,7 @@ OBJS = \
 	cluster_sinval_bcast.o \
 	cluster_startup_phase.o \
 	cluster_itl.o \
+	cluster_itl_touch.o \
 	cluster_tt_local.o \
 	cluster_tt_status.o \
 	cluster_tt_status_hint.o \
