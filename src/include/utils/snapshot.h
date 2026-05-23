@@ -9,6 +9,23 @@
  * src/include/utils/snapshot.h
  *
  *-------------------------------------------------------------------------
+ *
+ * PGRAC MODIFICATIONS (spec-3.3 D1):
+ *   Added explicit 24-byte cluster tail to SnapshotData: SCN read_scn (8B)
+ *   + uint64 read_epoch (8B) + uint8 cluster_source (1B) + uint8 _pad[7]
+ *   (7B). Explicit layout prevents hidden 4B padding (R4 P1) and avoids
+ *   uint32 wrap alias on cluster epoch (R9 P2).
+ *
+ *   New SnapshotSource enum {LOCAL=0, CLUSTER=1}:
+ *     LOCAL  - catalog scans, logical decoding, system snapshots; PG-native
+ *              visibility path unchanged.
+ *     CLUSTER- user-facing MVCC snapshots; read_scn / read_epoch carry the
+ *              cluster-wide SCN and epoch at GetSnapshotData() capture
+ *              instant.
+ *
+ *   Spec: spec-3.3-snapshot-consistency-cross-node.md §1.2 D1 / §2.1.
+ *   See also feature-121 + docs/spec-drafting-lessons.md v1.68 L180/L181.
+ *-------------------------------------------------------------------------
  */
 #ifndef SNAPSHOT_H
 #define SNAPSHOT_H
@@ -18,6 +35,10 @@
 #include "datatype/timestamp.h"
 #include "lib/pairingheap.h"
 #include "storage/buf.h"
+
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_scn.h"		/* PGRAC: SCN typedef */
+#endif
 
 
 /*
@@ -122,6 +143,22 @@ typedef struct SnapshotData *Snapshot;
 
 #define InvalidSnapshot		((Snapshot) NULL)
 
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * PGRAC: cluster snapshot source enum (spec-3.3 D1).
+ *
+ * LOCAL  - catalog scans / logical decoding / system snapshots; PG-native
+ *          visibility path unchanged; read_scn/read_epoch are InvalidScn/0.
+ * CLUSTER- user-facing MVCC snapshots; read_scn/read_epoch carry the
+ *          cluster-wide SCN/epoch at GetSnapshotData() capture instant.
+ */
+typedef enum SnapshotSource
+{
+	SNAPSHOT_SOURCE_LOCAL = 0,
+	SNAPSHOT_SOURCE_CLUSTER = 1
+} SnapshotSource;
+#endif
+
 /*
  * Struct representing all kind of possible snapshots.
  *
@@ -214,6 +251,36 @@ typedef struct SnapshotData
 	 * transactions completed since the last GetSnapshotData().
 	 */
 	uint64		snapXactCompletionCount;
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC (spec-3.3 D1): explicit 24-byte cluster tail. Field order matters
+	 * for ABI stability: SCN (8B aligned) + uint64 (8B aligned) leaves the
+	 * cluster_source byte at offset +16, with an explicit 7-byte _pad[7] to
+	 * pad out to 24 bytes. NO hidden compiler padding; NO uint32 truncation
+	 * on cluster epoch (R9 P2). All fields zero-initialised on LOCAL paths.
+	 *
+	 * read_scn       - cluster_scn_current() snapped at GetSnapshotData()
+	 *                  (or GetSnapshotDataReuse() refresh path). Compared via
+	 *                  scn_time_cmp() only; raw `<=` is banned (R1 P0).
+	 * read_epoch     - cluster_epoch_get_current() snapped likewise.
+	 *                  Reconfig bumps epoch; stale snapshots fail-closed.
+	 * cluster_source - SNAPSHOT_SOURCE_LOCAL=0 / CLUSTER=1.
+	 * _pad[7]        - explicit padding, must be zero (asserted by D12).
+	 */
+	SCN			read_scn;
+	uint64		read_epoch;
+	uint8		cluster_source;
+	uint8		_pad[7];
+#endif
 } SnapshotData;
+
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * PGRAC: D12 cluster_unit checks these offsets; if SnapshotData layout
+ * changes upstream, these StaticAssertDecl()s catch silent ABI drift.
+ */
+StaticAssertDecl(sizeof(SCN) == 8, "PGRAC: SCN must be 8 bytes");
+#endif
 
 #endif							/* SNAPSHOT_H */

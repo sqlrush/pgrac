@@ -494,7 +494,13 @@
  * pg_proc rows so TAP can drive a real HeapTupleSatisfiesMVCC cluster-path
  * miss and assert 53R97.  Production builds link FEATURE_NOT_SUPPORTED
  * stubs; --enable-injection-points builds wire the shmem implementation. */
-#define CATALOG_VERSION_NO 202605470
+/* spec-3.3 D1 (2026-05-23): SnapshotData explicit 24B cluster tail
+ * (SCN read_scn + uint64 read_epoch + uint8 cluster_source + uint8 _pad[7]).
+ * sizeof(SnapshotData) bump → catalog tooling that reads serialized snapshot
+ * payloads (snapbuild.c / pg_export_snapshot / parallel worker carry) must
+ * use the new layout.  R4 P1 explicit layout + R9 P2 uint64 epoch (no
+ * uint32 wrap alias).  See spec-3.3 §2.1 + D4 6-root ABI ripple audit. */
+#define CATALOG_VERSION_NO 202605480
 
 /* spec-2.39 D10 (2026-05-21):  SI Broadcaster production activation —
  * DDL commit hook (AtEOXact_Inval + COMMIT PREPARED via cluster-aware
