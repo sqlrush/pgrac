@@ -2344,6 +2344,11 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		bool		all_visible_cleared = false;
 		bool		all_frozen_set = false;
 		int			nthispage;
+#ifdef USE_PGRAC_CLUSTER
+		/* spec-3.4a D3: one ITL slot per (page, top_xid) for this batch. */
+		uint8		cluster_mi_slot = CLUSTER_ITL_SLOT_UNALLOCATED;
+		bool		cluster_mi_active = false;
+#endif
 
 		CHECK_FOR_INTERRUPTS();
 
@@ -2384,13 +2389,43 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		if (starting_with_empty_page && (options & HEAP_INSERT_FROZEN))
 			all_frozen_set = true;
 
+#ifdef USE_PGRAC_CLUSTER
+		/*
+		 * PGRAC (spec-3.4a D3): allocate ONE ITL slot per (page, top_xid)
+		 * for this batch of multi-insert tuples.  All tuples placed on
+		 * this page during the inner loop reference the same slot.
+		 * Failure (OVERFLOW) raises ERROR before the critical section.
+		 */
+		if (cluster_enabled && PageHasItl(page))
+		{
+			if (!cluster_itl_alloc_or_reuse_slot(buffer, xid, &cluster_mi_slot))
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("ITL slot OVERFLOW on heap page (INITRANS=%d full)",
+								CLUSTER_ITL_INITRANS_DEFAULT),
+						 errhint("Raise per-table INITRANS (spec-3.4b) or reduce write concurrency.")));
+			cluster_mi_active = true;
+		}
+#endif
+
 		/* NO EREPORT(ERROR) from here till changes are logged */
 		START_CRIT_SECTION();
+
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_mi_active)
+			cluster_itl_stamp_active(buffer, cluster_mi_slot, xid,
+									 cluster_scn_advance());
+#endif
 
 		/*
 		 * RelationGetBufferForTuple has ensured that the first tuple fits.
 		 * Put that on the page, and then as many other tuples as fit.
 		 */
+#ifdef USE_PGRAC_CLUSTER
+		/* spec-3.4a D3: patch tuple header to reference real slot. */
+		if (cluster_mi_active)
+			heaptuples[ndone]->t_data->t_itl_slot_idx = cluster_mi_slot;
+#endif
 		RelationPutHeapTuple(relation, buffer, heaptuples[ndone], false);
 
 		/*
@@ -2407,6 +2442,11 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			if (PageGetHeapFreeSpace(page) < MAXALIGN(heaptup->t_len) + saveFreeSpace)
 				break;
 
+#ifdef USE_PGRAC_CLUSTER
+			/* spec-3.4a D3: each tuple on this page shares the slot. */
+			if (cluster_mi_active)
+				heaptup->t_data->t_itl_slot_idx = cluster_mi_slot;
+#endif
 			RelationPutHeapTuple(relation, buffer, heaptup, false);
 
 			/*
@@ -2541,8 +2581,43 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			if (need_tuple_data)
 				bufflags |= REGBUF_KEEP_DATA;
 
+#ifdef USE_PGRAC_CLUSTER
+			/* spec-3.4a D3 / D7: set ITL delta flag on xlrec before
+			 * registering; multi_insert reuses XLH_INSERT_ITL_DELTA. */
+			if (cluster_mi_active)
+				xlrec->flags |= XLH_INSERT_ITL_DELTA;
+#endif
+
 			XLogBeginInsert();
 			XLogRegisterData((char *) xlrec, tupledata - scratch.data);
+
+#ifdef USE_PGRAC_CLUSTER
+			/*
+			 * PGRAC (spec-3.4a D8): emit single-delta block-local array
+			 * as MAIN data after xl_heap_multi_insert.  One slot per
+			 * (page, top_xid) so always exactly one delta describing
+			 * the ACTIVE stamp.
+			 */
+			if (cluster_mi_active)
+			{
+				xl_heap_itl_delta_block mi_hdr;
+				xl_heap_itl_delta mi_delta;
+
+				mi_hdr.ndeltas = 1;
+				mi_hdr.reserved = 0;
+				mi_hdr._pad = 0;
+				mi_delta.slot_idx = cluster_mi_slot;
+				mi_delta.flags_after = ITL_FLAG_ACTIVE;
+				mi_delta.xid = xid;
+				mi_delta.write_scn = ClusterPageGetItlSlots(page)[cluster_mi_slot].write_scn;
+				mi_delta.commit_scn = InvalidScn;
+
+				XLogRegisterData((char *) &mi_hdr,
+								 offsetof(xl_heap_itl_delta_block, deltas));
+				XLogRegisterData((char *) &mi_delta, sizeof(mi_delta));
+			}
+#endif
+
 			XLogRegisterBuffer(0, buffer, REGBUF_STANDARD | bufflags);
 
 			XLogRegisterBufData(0, tupledata, totaldatalen);
@@ -2556,6 +2631,24 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		}
 
 		END_CRIT_SECTION();
+
+#ifdef USE_PGRAC_CLUSTER
+		/*
+		 * PGRAC (spec-3.4a D3): register touched ITL handle per page.
+		 * Outside CRIT so palloc is safe.
+		 */
+		if (cluster_mi_active)
+		{
+			ClusterItlTouchHandle handle;
+
+			handle.rloc = relation->rd_locator;
+			handle.block = BufferGetBlockNumber(buffer);
+			handle.forknum = MAIN_FORKNUM;
+			handle.slot_idx = cluster_mi_slot;
+			handle.flags = 0;
+			cluster_itl_touch_register(&handle);
+		}
+#endif
 
 		/*
 		 * If we've frozen everything on the page, update the visibilitymap.
@@ -10505,6 +10598,48 @@ heap_xlog_multi_insert(XLogReaderState *record)
 			elog(PANIC, "total tuple length mismatch");
 
 		freespace = PageGetHeapFreeSpace(page); /* needed to update FSM below */
+
+#ifdef USE_PGRAC_CLUSTER
+		/*
+		 * PGRAC (spec-3.4a D9): replay ITL delta from MAIN data after
+		 * xl_heap_multi_insert (offset depends on offsets[] array).
+		 * Multi_insert layout in main data:
+		 *   xl_heap_multi_insert + (offsets[nthispage] if !init)
+		 *   + xl_heap_itl_delta_block + xl_heap_itl_delta
+		 */
+		if (xlrec->flags & XLH_INSERT_ITL_DELTA)
+		{
+			char	   *itl_cursor = (char *) xlrec + SizeOfHeapMultiInsert;
+			xl_heap_itl_delta_block hdr;
+			uint16		i;
+
+			if (!isinit)
+				itl_cursor += xlrec->ntuples * sizeof(OffsetNumber);
+
+			memcpy(&hdr, itl_cursor,
+				   offsetof(xl_heap_itl_delta_block, deltas));
+			for (i = 0; i < hdr.ndeltas; i++)
+			{
+				xl_heap_itl_delta delta;
+				ClusterItlSlotData *slot;
+
+				memcpy(&delta,
+					   itl_cursor
+					   + offsetof(xl_heap_itl_delta_block, deltas)
+					   + i * sizeof(xl_heap_itl_delta),
+					   sizeof(xl_heap_itl_delta));
+				if (delta.flags_after == ITL_FLAG_COMMITTED &&
+					!SCN_VALID(delta.commit_scn))
+					elog(PANIC,
+						 "spec-3.4a D9: ITL COMMITTED delta with InvalidScn at heap_xlog_multi_insert redo");
+				slot = &ClusterPageGetItlSlots(page)[delta.slot_idx];
+				slot->xid = delta.xid;
+				slot->flags = delta.flags_after;
+				slot->write_scn = delta.write_scn;
+				slot->commit_scn = delta.commit_scn;
+			}
+		}
+#endif
 
 		PageSetLSN(page, lsn);
 
