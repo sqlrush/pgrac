@@ -82,6 +82,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 /* spec-3.2 D5:  MVCC cluster visibility fork. */
+#include "cluster/cluster_epoch.h"			/* cluster_epoch_get_current (spec-3.3 D10) */
 #include "cluster/cluster_guc.h"				/* cluster_enabled, cluster_node_id */
 #include "cluster/cluster_itl.h"				/* cluster_itl_get_tt_ref */
 #include "cluster/cluster_itl_slot.h"		/* CLUSTER_ITL_SLOT_UNALLOCATED */
@@ -979,31 +980,59 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot,
 
 #ifdef USE_PGRAC_CLUSTER
 	/*
-	 * PGRAC (spec-3.2 D5): MVCC cluster visibility fork.
+	 * PGRAC (spec-3.2 D5 + spec-3.3 D10): MVCC cluster visibility fork.
 	 *
 	 * Strict authoritative-exact-TT-ref-only gate (spec-3.2 §0.1 F1 +
 	 * §3.3 + L176 spirit).  All early-exits fall through to the PG-
 	 * native body below — NO goto label (v0.3 M1 inline early-return
 	 * style).
 	 *
-	 * Hot path discipline (L177):  cluster path is fail-fast no-wait;
+	 * Hot path discipline (L177): cluster path is fail-fast no-wait;
 	 * production hot path goes here only when ITL ref carries valid
 	 * remote origin + non-zero tt_slot_id (i.e. after spec-3.4 ITL
-	 * writable activation;  spec-3.2 阶段 production silent invisible
+	 * writable activation; spec-3.2 阶段 production silent invisible
 	 * via PG-native body — v0.3 N1).
 	 *
-	 * v0.3 N4:  BufferIsValid guard prevents BufferGetPage(InvalidBuffer)
+	 * v0.3 N4: BufferIsValid guard prevents BufferGetPage(InvalidBuffer)
 	 * null-deref segfault in catalog scan / tqueue.c / heap_fetch caller
 	 * contexts (L178 candidate).
+	 *
+	 * spec-3.3 D10 entry gates:
+	 *   1. snapshot->cluster_source == LOCAL -> skip cluster path
+	 *      (catalog scan / logical decoding / static snapshots). Falls
+	 *      through to PG-native body; behaviour matches spec-3.2.
+	 *   2. snapshot->read_epoch != current cluster epoch -> reconfig
+	 *      invalidated this snapshot; raise 53R97 immediately. Caller
+	 *      retries with a fresh snapshot under the new epoch.
+	 *   3. case COMMITTED/CLEANED_OUT: use cluster_visibility_decide_by_scn()
+	 *      with the snapshot's read_scn instead of unconditional 53R97
+	 *      (spec-3.3 D10 reverses spec-3.2 §Hardening v1.0.1 D1).
 	 */
-	if (cluster_enabled && BufferIsValid(buffer))
+	if (cluster_enabled && BufferIsValid(buffer) &&
+		snapshot->cluster_source == (uint8) SNAPSHOT_SOURCE_CLUSTER)
 	{
 		TransactionId raw_xmin = HeapTupleHeaderGetRawXmin(tuple);
 		ClusterUndoTTSlotRef ref;
 		bool		ref_filled = false;
 
+		/*
+		 * spec-3.3 D10 (Q8 / R6): reconfig epoch fence. A snapshot
+		 * captured under epoch N becomes invalid the moment a peer
+		 * triggers reconfig and epoch advances. Compare via uint64 -- no
+		 * (uint32) cast (R9 P2).
+		 */
+		if (snapshot->read_epoch != cluster_epoch_get_current())
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+					 errmsg("cluster snapshot stale across reconfig"),
+					 errhint("snapshot.read_epoch=" UINT64_FORMAT
+							 " current epoch=" UINT64_FORMAT
+							 "; retry transaction.",
+							 snapshot->read_epoch,
+							 cluster_epoch_get_current())));
+
 #ifdef ENABLE_INJECTION
-		/* spec-3.2 D5b:  test-only inject hook overrides placeholder
+		/* spec-3.2 D5b: test-only inject hook overrides placeholder
 		 * reader when cluster_test_force_visibility_cluster_path = on. */
 		if (cluster_test_force_visibility_cluster_path)
 			ref_filled = cluster_test_lookup_visibility_inject(raw_xmin, &ref);
@@ -1042,27 +1071,49 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot,
 						return false;
 					case CLUSTER_TT_STATUS_COMMITTED:
 					case CLUSTER_TT_STATUS_CLEANED_OUT:
+					{
 						/*
-						 * The status overlay only proves the remote xmin
-						 * committed.  It does not yet answer MVCC snapshot
-						 * membership or xmax/delete visibility.  Until
-						 * spec-3.3 ships cross-node snapshot semantics, fail
-						 * closed instead of silently making the tuple visible.
+						 * spec-3.3 D10 (L181 chain step 7): SCN-based
+						 * visibility decision. result.commit_scn carries
+						 * the remote commit SCN (V2 wire / D5b inject);
+						 * snapshot->read_scn carries the cluster_scn_current()
+						 * value at GetSnapshotData() time. Helper uses
+						 * scn_time_cmp() not raw <= (R1 P0).
 						 */
+						ClusterVisibilityDecision decision;
+
+						decision = cluster_visibility_decide_by_scn(result.commit_scn,
+																	snapshot->read_scn);
+						switch (decision)
+						{
+							case CLUSTER_VISIBILITY_VISIBLE:
+								return true;
+							case CLUSTER_VISIBILITY_INVISIBLE:
+								return false;
+							case CLUSTER_VISIBILITY_UNKNOWN:
+								/* fall through to 53R97 below */
+								break;
+						}
 						break;
+					}
 					default:
 						break;
 				}
 			}
 
-			/* HC181 fail-closed.  L177 NO WAIT (持 buffer pin + 可能
-			 * content lock + LWLock;  wait = 死锁源头). */
+			/*
+			 * HC181 fail-closed. L177 NO WAIT (持 buffer pin + 可能
+			 * content lock + LWLock; wait = 死锁源头).
+			 *
+			 * Reaches here on: authoritative lookup miss, COMMITTED with
+			 * UNKNOWN decision (InvalidScn on either side), or unknown
+			 * status enum value.
+			 */
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
 					 errmsg("cluster TT status unknown for xid %u", raw_xmin),
-					 errhint("Cross-node visibility requires spec-3.4 ITL writable "
-							 "activation;  current spec-3.2 ships fail-fast MVP. "
-							 "Retry or abort transaction.")));
+					 errhint("Remote commit_scn not yet propagated, or TT "
+							 "overlay missed/stale; retry or abort.")));
 		}
 		/* else: ref placeholder / local origin / no ITL slot →
 		 * fall through to PG-native body (v0.3 N1 silent invisible
