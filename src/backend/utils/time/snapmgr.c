@@ -425,6 +425,27 @@ GetNonHistoricCatalogSnapshot(Oid relid)
 		/* Get new snapshot. */
 		CatalogSnapshot = GetSnapshotData(&CatalogSnapshotData);
 
+#ifdef USE_PGRAC_CLUSTER
+		/*
+		 * PGRAC (spec-3.3 D3): force catalog snapshot to LOCAL source.
+		 *
+		 * GetSnapshotData() above sets cluster_source = CLUSTER when
+		 * cluster_enabled.  But catalog scans must NEVER enter the cluster
+		 * visibility path: catalog rows have no cluster TT overlay, and
+		 * routing catalog reads through the cluster path can produce a
+		 * startup-time circular dependency (catalog scan -> cluster_tt
+		 * lookup -> catalog scan).  Snapshots returned from GetCatalogSnapshot
+		 * therefore always carry LOCAL semantics regardless of cluster_enabled.
+		 *
+		 * read_scn / read_epoch are forced to InvalidScn / 0 to make any
+		 * accidental cluster-path entry under a catalog snapshot fail loudly
+		 * (53R97 UNKNOWN) rather than silently take a stale comparison.
+		 */
+		CatalogSnapshot->cluster_source = (uint8) SNAPSHOT_SOURCE_LOCAL;
+		CatalogSnapshot->read_scn = InvalidScn;
+		CatalogSnapshot->read_epoch = 0;
+#endif
+
 		/*
 		 * Make sure the catalog snapshot will be accounted for in decisions
 		 * about advancing PGPROC->xmin.  We could apply RegisterSnapshot, but
