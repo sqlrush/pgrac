@@ -138,6 +138,55 @@ typedef struct ClusterTTStatusResult {
 } ClusterTTStatusResult;
 
 /*
+ * ClusterVisibilityDecision -- 3-state visibility decision (spec-3.3 D5).
+ *
+ * MVCC visibility is fundamentally 3-state: yes / no / data not available.
+ * Returning a bool collapses "unknown" into one of the two visible states
+ * and produces silent-wrong behaviour -- a caller cannot distinguish "tuple
+ * is invisible" from "we don't know if the tuple is visible because the
+ * remote commit_scn hasn't been propagated yet". L180 NEW candidate
+ * (visibility-decision-must-be-enum-not-bool) bans bool returns for any
+ * cluster visibility decision helper.
+ *
+ * Mapping at the cluster path (heapam_visibility.c D10):
+ *   VISIBLE   -> return true
+ *   INVISIBLE -> return false
+ *   UNKNOWN   -> ereport ERROR 53R97 (caller retries / aborts via PG
+ *                standard machinery; no wait inside the visibility hot
+ *                path -- L177).
+ */
+typedef enum ClusterVisibilityDecision {
+	CLUSTER_VISIBILITY_VISIBLE = 0,
+	CLUSTER_VISIBILITY_INVISIBLE = 1,
+	CLUSTER_VISIBILITY_UNKNOWN = 2
+} ClusterVisibilityDecision;
+
+/*
+ * cluster_visibility_decide_by_scn -- spec-3.3 D5 inline helper.
+ *
+ * Decides cluster-side MVCC visibility from a remote commit_scn and the
+ * snapshot's read_scn. Used by heapam_visibility.c D10 fork once an
+ * authoritative TT status returns COMMITTED / CLEANED_OUT.
+ *
+ * Hard rules:
+ *   - InvalidScn on either side -> UNKNOWN (NEVER short-circuit to
+ *     INVISIBLE; L180 P0).
+ *   - Compare via scn_time_cmp(), NEVER raw `<=` (R1 P0). SCN high bits
+ *     carry node_id and would pollute time ordering on raw compare.
+ *
+ * Pure / no syscall / no wait (L177 hot path).
+ */
+static inline ClusterVisibilityDecision
+cluster_visibility_decide_by_scn(SCN commit_scn, SCN read_scn)
+{
+	if (!SCN_VALID(commit_scn) || !SCN_VALID(read_scn))
+		return CLUSTER_VISIBILITY_UNKNOWN;
+	if (scn_time_cmp(commit_scn, read_scn) <= 0)
+		return CLUSTER_VISIBILITY_VISIBLE;
+	return CLUSTER_VISIBILITY_INVISIBLE;
+}
+
+/*
  * Public API.
  *
  * cluster_tt_status_lookup_exact:
