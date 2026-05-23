@@ -24,8 +24,9 @@
 #	       page/top_xid)
 #	  L10  cross-page UPDATE: each XLog block carries its own
 #	       block-local delta array (redo PASS via per-block replay)
-#	  L11  subxact DML inside SAVEPOINT fails closed with
-#	       ERRCODE_FEATURE_NOT_SUPPORTED
+#	  L11  subxact DML inside SAVEPOINT stays PG-native: the
+#	       relation-aware ITL gate skips cluster ITL touch registration
+#	       instead of fail-closing the user transaction.
 #	  L12  Reader (cluster_itl_get_tt_ref) reports real cached_commit_scn
 #	       after COMMIT (spec-3.4a D10) -- production cluster path still
 #	       falls back to PG-native because origin/segment/tt_slot triple
@@ -191,8 +192,8 @@ is($pair->node0->safe_psql('postgres',
 # spec-3.4a D8 (WAL emit) + D9 (WAL redo) are now wired:
 # - heap_xlog_insert / _delete / _update / _multi_insert parse the
 #   XLH_*_ITL_DELTA flag and replay ItlSlotData state from main data.
-# - xact pre-commit hook ITL stamp uses log_newpage_buffer FPI;
-#   crash redo replays the full-page image including stamped ITL.
+# - xact pre-commit hook ITL stamp uses generic WAL delta records;
+#   crash redo replays the small page delta including stamped ITL.
 # A real crash test requires PG kill -9 + restart + slot inspection
 # via pg_buffercache;  smoke check here verifies no crash on normal
 # INSERT (WAL emit path exercised under cluster_enabled).
@@ -249,19 +250,24 @@ ok(1, 'L10 cross-page UPDATE: block-local delta arrays wired '
 
 
 # ============================================================
-# L11: subxact DML fail-closed (N9 hard contract).
+# L11: subxact DML stays PG-native.
 # ============================================================
 my ($l11_rc, undef, $l11_stderr) = $pair->node0->psql('postgres', q{
 	\set VERBOSITY verbose
 	BEGIN;
 	SAVEPOINT sp;
 	INSERT INTO l2_itl_insert VALUES (99, 'savepoint');
-	ROLLBACK;
+	ROLLBACK TO sp;
+	COMMIT;
 });
-# Subxact INSERT should fail closed with ERRCODE_FEATURE_NOT_SUPPORTED.
-like($l11_stderr,
+ok($l11_rc == 0,
+	'L11 subxact INSERT succeeds via PG-native path');
+unlike($l11_stderr,
 	qr/cluster ITL writable path does not support subtransactions|ERRCODE_FEATURE_NOT_SUPPORTED|0A000/,
-	'L11 subxact INSERT fails closed per N9');
+	'L11 subxact INSERT does not enter cluster ITL writable path');
+is($pair->node0->safe_psql('postgres',
+		q{SELECT count(*) FROM l2_itl_insert WHERE id = 99}),
+	'0', 'L11 rolled-back subxact row is absent');
 
 
 # ============================================================

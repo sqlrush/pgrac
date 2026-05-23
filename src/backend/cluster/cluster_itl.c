@@ -226,9 +226,10 @@ cluster_itl_check_subxact_or_error(void)
 
 	/*
 	 * spec-3.4a N9: subxact / savepoint ITL writable path 推 spec-3.5
-	 * SUBTRANS.  Fail closed at the DML callsite so we never enter the
-	 * top-level touched list with a subxact-scoped DML (otherwise outer
-	 * commit could mis-stamp COMMITTED on a subxact-aborted ITL slot).
+	 * SUBTRANS.  The production heap AM path skips cluster ITL touch
+	 * registration for subtransactions via its relation-aware gate.  Keep
+	 * this helper as a hard caller fence for any future direct ITL writable
+	 * entry point that cannot use that gate.
 	 */
 	if (GetCurrentTransactionNestLevel() > 1)
 		ereport(ERROR,

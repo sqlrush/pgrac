@@ -155,12 +155,13 @@ extern void cluster_itl_stamp_committed(Buffer buf, uint8 slot_idx, SCN commit_s
 extern void cluster_itl_stamp_aborted(Buffer buf, uint8 slot_idx);
 
 /*
- * cluster_itl_check_subxact_or_error -- spec-3.4a N9 / Q5 guard.
+ * cluster_itl_check_subxact_or_error -- legacy spec-3.4a N9 caller fence.
  *
- *	Called from heap_insert / heap_update / heap_delete / heap_multi_insert
- *	at the very top (before any buffer lock) to fail closed when
- *	GetCurrentTransactionNestLevel() > 1.  Inline-style helper kept here
- *	to avoid leaking subxact knowledge into heap AM beyond a single call.
+ *	The production heap AM path now uses a relation-aware ITL gate and
+ *	skips cluster ITL registration for subtransactions, preserving
+ *	PG-native savepoint behaviour until spec-3.5 SUBTRANS.  This helper is
+ *	kept as a hard caller fence for any future direct ITL writable entry
+ *	point that cannot use that relation-aware gate.
  *
  *	No-op if cluster_enabled is false.
  */
