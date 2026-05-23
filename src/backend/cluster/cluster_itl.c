@@ -29,6 +29,7 @@
  */
 #include "postgres.h"
 
+#include "storage/bufmgr.h"		/* BufferGetPage, MarkBufferDirty (spec-3.4a D2) */
 #include "storage/bufpage.h"
 #include "cluster/cluster_itl.h"
 #include "cluster/cluster_itl_slot.h"
@@ -85,6 +86,118 @@ cluster_itl_get_tt_ref(Page page, uint8 itl_slot_idx, ClusterUndoTTSlotRef *ref)
 	return true;
 }
 
+/* ---------- spec-3.4a D2 — writer API ---------- */
+
+bool
+cluster_itl_alloc_or_reuse_slot(Buffer buf, TransactionId top_xid,
+								uint8 *out_slot_idx)
+{
+	Page page;
+	ClusterItlSlotData *slots;
+	uint8 i;
+	int free_idx;
+
+	Assert(BufferIsValid(buf));
+	Assert(TransactionIdIsValid(top_xid));
+	Assert(out_slot_idx != NULL);
+
+	page = BufferGetPage(buf);
+
+	if (!PageHasItl(page))
+		return false;
+
+	slots = ClusterPageGetItlSlots(page);
+	free_idx = -1;
+
+	/*
+	 * spec-3.4a N7: one ITL slot per (page, top_xid).  Reuse an
+	 * existing ACTIVE slot if it already belongs to top_xid; otherwise
+	 * remember the first FREE slot we see.
+	 */
+	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+	{
+		if (slots[i].flags == ITL_FLAG_ACTIVE && slots[i].xid == top_xid)
+		{
+			*out_slot_idx = i;
+			return true;
+		}
+		if (slots[i].flags == ITL_FLAG_FREE && free_idx < 0)
+			free_idx = i;
+	}
+
+	if (free_idx < 0)
+		return false;			/* OVERFLOW — caller raises ERROR before CRIT */
+
+	*out_slot_idx = (uint8) free_idx;
+	return true;
+}
+
+void
+cluster_itl_stamp_active(Buffer buf, uint8 slot_idx,
+						 TransactionId xid, SCN write_scn)
+{
+	Page page;
+	ClusterItlSlotData *slot;
+
+	Assert(BufferIsValid(buf));
+	Assert(slot_idx < CLUSTER_ITL_INITRANS_DEFAULT);
+
+	page = BufferGetPage(buf);
+	Assert(PageHasItl(page));
+
+	slot = &ClusterPageGetItlSlots(page)[slot_idx];
+	slot->xid = xid;
+	slot->flags = ITL_FLAG_ACTIVE;
+	slot->commit_scn = InvalidScn;
+	slot->write_scn = write_scn;
+	/* undo_segment_head / first_change_lsn untouched -- spec-3.4b/c populate. */
+
+	MarkBufferDirty(buf);
+}
+
+void
+cluster_itl_stamp_committed(Buffer buf, uint8 slot_idx, SCN commit_scn)
+{
+	Page page;
+	ClusterItlSlotData *slot;
+
+	Assert(BufferIsValid(buf));
+	Assert(slot_idx < CLUSTER_ITL_INITRANS_DEFAULT);
+	Assert(SCN_VALID(commit_scn));	/* L181 — COMMITTED must carry valid SCN */
+
+	page = BufferGetPage(buf);
+	Assert(PageHasItl(page));
+
+	slot = &ClusterPageGetItlSlots(page)[slot_idx];
+	Assert(slot->flags == ITL_FLAG_ACTIVE);
+
+	slot->flags = ITL_FLAG_COMMITTED;
+	slot->commit_scn = commit_scn;
+
+	MarkBufferDirty(buf);
+}
+
+void
+cluster_itl_stamp_aborted(Buffer buf, uint8 slot_idx)
+{
+	Page page;
+	ClusterItlSlotData *slot;
+
+	Assert(BufferIsValid(buf));
+	Assert(slot_idx < CLUSTER_ITL_INITRANS_DEFAULT);
+
+	page = BufferGetPage(buf);
+	Assert(PageHasItl(page));
+
+	slot = &ClusterPageGetItlSlots(page)[slot_idx];
+	Assert(slot->flags == ITL_FLAG_ACTIVE);
+
+	slot->flags = ITL_FLAG_ABORTED;
+	slot->commit_scn = InvalidScn;
+
+	MarkBufferDirty(buf);
+}
+
 #else /* !USE_PGRAC_CLUSTER */
 
 bool
@@ -94,6 +207,35 @@ cluster_itl_get_tt_ref(Page page, uint8 itl_slot_idx, ClusterUndoTTSlotRef *ref)
 	(void)itl_slot_idx;
 	(void)ref;
 	return false;
+}
+
+bool
+cluster_itl_alloc_or_reuse_slot(Buffer buf pg_attribute_unused(),
+								TransactionId top_xid pg_attribute_unused(),
+								uint8 *out_slot_idx pg_attribute_unused())
+{
+	return false;
+}
+
+void
+cluster_itl_stamp_active(Buffer buf pg_attribute_unused(),
+						 uint8 slot_idx pg_attribute_unused(),
+						 TransactionId xid pg_attribute_unused(),
+						 SCN write_scn pg_attribute_unused())
+{
+}
+
+void
+cluster_itl_stamp_committed(Buffer buf pg_attribute_unused(),
+							uint8 slot_idx pg_attribute_unused(),
+							SCN commit_scn pg_attribute_unused())
+{
+}
+
+void
+cluster_itl_stamp_aborted(Buffer buf pg_attribute_unused(),
+						  uint8 slot_idx pg_attribute_unused())
+{
 }
 
 #endif /* USE_PGRAC_CLUSTER */
