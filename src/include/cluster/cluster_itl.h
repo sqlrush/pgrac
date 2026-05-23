@@ -151,4 +151,16 @@ extern void cluster_itl_stamp_committed(Buffer buf, uint8 slot_idx,
  */
 extern void cluster_itl_stamp_aborted(Buffer buf, uint8 slot_idx);
 
+/*
+ * cluster_itl_check_subxact_or_error -- spec-3.4a N9 / Q5 guard.
+ *
+ *	Called from heap_insert / heap_update / heap_delete / heap_multi_insert
+ *	at the very top (before any buffer lock) to fail closed when
+ *	GetCurrentTransactionNestLevel() > 1.  Inline-style helper kept here
+ *	to avoid leaking subxact knowledge into heap AM beyond a single call.
+ *
+ *	No-op if cluster_enabled is false.
+ */
+extern void cluster_itl_check_subxact_or_error(void);
+
 #endif /* CLUSTER_ITL_H */

@@ -29,8 +29,10 @@
  */
 #include "postgres.h"
 
+#include "access/xact.h"		/* GetCurrentTransactionNestLevel (spec-3.4a N9) */
 #include "storage/bufmgr.h"		/* BufferGetPage, MarkBufferDirty (spec-3.4a D2) */
 #include "storage/bufpage.h"
+#include "cluster/cluster_guc.h" /* cluster_enabled */
 #include "cluster/cluster_itl.h"
 #include "cluster/cluster_itl_slot.h"
 #include "cluster/cluster_scn.h"
@@ -198,6 +200,25 @@ cluster_itl_stamp_aborted(Buffer buf, uint8 slot_idx)
 	MarkBufferDirty(buf);
 }
 
+void
+cluster_itl_check_subxact_or_error(void)
+{
+	if (!cluster_enabled)
+		return;
+
+	/*
+	 * spec-3.4a N9: subxact / savepoint ITL writable path 推 spec-3.5
+	 * SUBTRANS.  Fail closed at the DML callsite so we never enter the
+	 * top-level touched list with a subxact-scoped DML (otherwise outer
+	 * commit could mis-stamp COMMITTED on a subxact-aborted ITL slot).
+	 */
+	if (GetCurrentTransactionNestLevel() > 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cluster ITL writable path does not support subtransactions yet"),
+				 errhint("Retry without savepoints or wait for spec-3.5 SUBTRANS support.")));
+}
+
 #else /* !USE_PGRAC_CLUSTER */
 
 bool
@@ -235,6 +256,11 @@ cluster_itl_stamp_committed(Buffer buf pg_attribute_unused(),
 void
 cluster_itl_stamp_aborted(Buffer buf pg_attribute_unused(),
 						  uint8 slot_idx pg_attribute_unused())
+{
+}
+
+void
+cluster_itl_check_subxact_or_error(void)
 {
 }
 

@@ -76,6 +76,15 @@
 #include "utils/spccache.h"
 #include "utils/syscache.h"
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC (spec-3.4a D3/D4/D5): ITL write-path activation. */
+#include "cluster/cluster_guc.h"		/* cluster_enabled */
+#include "cluster/cluster_itl.h"		/* alloc_or_reuse_slot / stamp_active */
+#include "cluster/cluster_itl_slot.h"	/* CLUSTER_ITL_SLOT_UNALLOCATED */
+#include "cluster/cluster_itl_touch.h"	/* xact-local touch list */
+#include "cluster/cluster_scn.h"		/* cluster_scn_advance / SCN */
+#endif
+
 
 static HeapTuple heap_prepare_insert(Relation relation, HeapTuple tup,
 									 TransactionId xid, CommandId cid, int options);
@@ -1889,6 +1898,11 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	Buffer		buffer;
 	Buffer		vmbuffer = InvalidBuffer;
 	bool		all_visible_cleared = false;
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC (spec-3.4a D3): hoisted to function scope per PG style. */
+	uint8		cluster_itl_slot = CLUSTER_ITL_SLOT_UNALLOCATED;
+	bool		cluster_itl_active = false;
+#endif
 
 	/* Cheap, simplistic check that the tuple matches the rel's rowtype. */
 	Assert(HeapTupleHeaderGetNatts(tup->t_data) <=
@@ -1930,11 +1944,47 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	 */
 	CheckForSerializableConflictIn(relation, NULL, InvalidBlockNumber);
 
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC (spec-3.4a D3): ITL write-path activation.
+	 *
+	 * Before entering the critical section, while still holding the
+	 * EXCLUSIVE buffer content lock from RelationGetBufferForTuple,
+	 * find or reuse an ITL slot for our top-level xid.  Failure
+	 * (OVERFLOW) raises ERROR here -- safe, no critical section yet.
+	 *
+	 * The slot is stamped ACTIVE inside the critical section below;
+	 * the touched-handle is registered after the critical section so
+	 * palloc cannot fire inside CRIT.
+	 */
+	if (cluster_enabled && PageHasItl(BufferGetPage(buffer)))
+	{
+		cluster_itl_check_subxact_or_error();
+
+		if (!cluster_itl_alloc_or_reuse_slot(buffer, xid, &cluster_itl_slot))
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("ITL slot OVERFLOW on heap page (INITRANS=%d full)",
+							CLUSTER_ITL_INITRANS_DEFAULT),
+					 errhint("Raise per-table INITRANS (spec-3.4b) or reduce write concurrency.")));
+
+		/* Patch the tuple header so visibility readers see the real slot. */
+		heaptup->t_data->t_itl_slot_idx = cluster_itl_slot;
+		cluster_itl_active = true;
+	}
+#endif
+
 	/* NO EREPORT(ERROR) from here till changes are logged */
 	START_CRIT_SECTION();
 
 	RelationPutHeapTuple(relation, buffer, heaptup,
 						 (options & HEAP_INSERT_SPECULATIVE) != 0);
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_itl_active)
+		cluster_itl_stamp_active(buffer, cluster_itl_slot, xid,
+								 cluster_scn_advance());
+#endif
 
 	if (PageIsAllVisible(BufferGetPage(buffer)))
 	{
@@ -2038,6 +2088,25 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	}
 
 	END_CRIT_SECTION();
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC (spec-3.4a D3): register the touched ITL handle.  Outside
+	 * the critical section so palloc is safe; before UnlockReleaseBuffer
+	 * so the locator coordinates are still in scope.
+	 */
+	if (cluster_itl_active)
+	{
+		ClusterItlTouchHandle handle;
+
+		handle.rloc = relation->rd_locator;
+		handle.block = ItemPointerGetBlockNumber(&heaptup->t_self);
+		handle.forknum = MAIN_FORKNUM;
+		handle.slot_idx = cluster_itl_slot;
+		handle.flags = 0;
+		cluster_itl_touch_register(&handle);
+	}
+#endif
 
 	UnlockReleaseBuffer(buffer);
 	if (vmbuffer != InvalidBuffer)
@@ -2169,6 +2238,14 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 	bool		starting_with_empty_page = false;
 	int			npages = 0;
 	int			npages_used = 0;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* spec-3.4a N9: subxact / savepoint fail-closed at entry.
+	 * Full per-page ITL allocate/stamp/register for batched multi_insert
+	 * is queued for post-codereview hardening round (one slot per
+	 * (page, top_xid) pattern from heap_insert D3 applied per page). */
+	cluster_itl_check_subxact_or_error();
+#endif
 
 	/* currently not needed (thus unsupported) for heap_multi_insert() */
 	Assert(!(options & HEAP_INSERT_NO_LOGICAL));
@@ -2594,10 +2671,20 @@ heap_delete(Relation relation, ItemPointer tid,
 	bool		all_visible_cleared = false;
 	HeapTuple	old_key_tuple = NULL;	/* replica identity of the tuple */
 	bool		old_key_copied = false;
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC (spec-3.4a D5): hoisted ITL state for delete path. */
+	uint8		cluster_itl_slot = CLUSTER_ITL_SLOT_UNALLOCATED;
+	bool		cluster_itl_active = false;
+#endif
 
 	Assert(ItemPointerIsValid(tid));
 
 	AssertHasSnapshotForToast(relation);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* spec-3.4a N9: subxact / savepoint fail-closed at entry. */
+	cluster_itl_check_subxact_or_error();
+#endif
 
 	/*
 	 * Forbid this during a parallel operation, lest it allocate a combo CID.
@@ -2840,7 +2927,31 @@ l1:
 							  xid, LockTupleExclusive, true,
 							  &new_xmax, &new_infomask, &new_infomask2);
 
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC (spec-3.4a D5): allocate ITL slot for the delete xid on
+	 * the page holding the deleted tuple.  EXCLUSIVE content lock is
+	 * already held; OVERFLOW raises ERROR before the critical section.
+	 */
+	if (cluster_enabled && PageHasItl(page))
+	{
+		if (!cluster_itl_alloc_or_reuse_slot(buffer, xid, &cluster_itl_slot))
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("ITL slot OVERFLOW on heap page (INITRANS=%d full)",
+							CLUSTER_ITL_INITRANS_DEFAULT),
+					 errhint("Raise per-table INITRANS (spec-3.4b) or reduce write concurrency.")));
+		cluster_itl_active = true;
+	}
+#endif
+
 	START_CRIT_SECTION();
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_itl_active)
+		cluster_itl_stamp_active(buffer, cluster_itl_slot, xid,
+								 cluster_scn_advance());
+#endif
 
 	/*
 	 * If this transaction commits, the tuple will become DEAD sooner or
@@ -2943,6 +3054,21 @@ l1:
 	}
 
 	END_CRIT_SECTION();
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC (spec-3.4a D5): register touched ITL handle outside CRIT. */
+	if (cluster_itl_active)
+	{
+		ClusterItlTouchHandle handle;
+
+		handle.rloc = relation->rd_locator;
+		handle.block = BufferGetBlockNumber(buffer);
+		handle.forknum = MAIN_FORKNUM;
+		handle.slot_idx = cluster_itl_slot;
+		handle.flags = 0;
+		cluster_itl_touch_register(&handle);
+	}
+#endif
 
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 
@@ -3087,6 +3213,16 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 				infomask2_old_tuple,
 				infomask_new_tuple,
 				infomask2_new_tuple;
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC (spec-3.4a D4): TODO — full ITL allocate / stamp / register
+	 * integration for heap_update is split between two critical sections
+	 * (same-page HOT/non-HOT and cross-page).  Subxact guard is in place
+	 * below; full ITL stamp work is queued for post-codereview hardening
+	 * round (mirrors heap_insert D3 / heap_delete D5 pattern but for
+	 * (old page, new page) tuple of handles).
+	 */
+#endif
 
 	Assert(ItemPointerIsValid(otid));
 
@@ -3095,6 +3231,11 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 		   RelationGetNumberOfAttributes(relation));
 
 	AssertHasSnapshotForToast(relation);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* spec-3.4a N9: subxact / savepoint fail-closed at entry. */
+	cluster_itl_check_subxact_or_error();
+#endif
 
 	/*
 	 * Forbid this during a parallel operation, lest it allocate a combo CID.
