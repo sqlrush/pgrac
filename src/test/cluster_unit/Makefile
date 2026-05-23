@@ -34,7 +34,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_ic_mock test_cluster_inject test_cluster_pgstat \
         test_cluster_debug test_cluster_shared_fs test_cluster_smgr \
         test_cluster_scn test_cluster_block_format test_cluster_itl_slot \
-        test_cluster_buffer_desc test_cluster_pcm_lock test_cluster_bufmgr_pcm_hook test_cluster_gcs_dispatch test_cluster_gcs_block test_cluster_gcs_block_retransmit test_cluster_gcs_block_2way test_cluster_gcs_block_3way test_cluster_gcs_block_lost_write test_cluster_sinval test_cluster_sinval_ack test_cluster_stage2_acceptance test_cluster_tt_status test_cluster_tt_status_hint test_cluster_visibility_fork \
+        test_cluster_buffer_desc test_cluster_pcm_lock test_cluster_bufmgr_pcm_hook test_cluster_gcs_dispatch test_cluster_gcs_block test_cluster_gcs_block_retransmit test_cluster_gcs_block_2way test_cluster_gcs_block_3way test_cluster_gcs_block_lost_write test_cluster_sinval test_cluster_sinval_ack test_cluster_stage2_acceptance test_cluster_tt_status test_cluster_tt_status_hint test_cluster_visibility_fork test_cluster_visibility_decide_scn test_cluster_snapshot_source \
         test_cluster_startup_phase test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_cssd test_cluster_qvotec test_cluster_voting_disk_io test_cluster_quorum_decision \
         test_cluster_xlog test_cluster_tt_slot test_cluster_undo_segment \
         test_cluster_epoch test_cluster_fence test_cluster_reconfig \
@@ -663,6 +663,33 @@ test_cluster_tt_status_hint: test_cluster_tt_status_hint.c unit_test.h \
 # HeapTupleSatisfiesMVCC behavioral testing (requires real PG backend;
 # behavioral coverage in cluster_tap t/204).
 test_cluster_visibility_fork: test_cluster_visibility_fork.c unit_test.h \
+		$(CLUSTER_VERSION_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-3.3 D11:  test_cluster_visibility_decide_scn — 22 static +
+# behavioral mock tests verifying cluster_visibility_decide_by_scn() and
+# the ClusterVisibilityDecision enum (L180).  Covers InvalidScn ->
+# UNKNOWN sentinel handling, scn_time_cmp ordering across node_id high
+# bits (R1 P0), and the COMMITTED / ABORTED / CLEANED_OUT dispatch
+# mocks.  Standalone executable; behavioral coverage of the full
+# HeapTupleSatisfiesMVCC fork in cluster_tap t/205.  scn_time_cmp comes
+# from cluster_scn.o, which we link to support the cross-node SCN
+# comparison tests.
+test_cluster_visibility_decide_scn: test_cluster_visibility_decide_scn.c unit_test.h \
+		$(CLUSTER_VERSION_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-3.3 D12:  test_cluster_snapshot_source — 18 static + ABI tests
+# verifying SnapshotData explicit 24B cluster tail (D1), the SnapshotSource
+# enum (LOCAL=0, CLUSTER=1), and the ClusterTTStatusHint V1/V2 wire ABI
+# layout (D8: V1 32B + V2 40B with commit_scn at offset 32).
+test_cluster_snapshot_source: test_cluster_snapshot_source.c unit_test.h \
 		$(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
