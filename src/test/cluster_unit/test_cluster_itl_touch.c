@@ -88,17 +88,14 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
  */
 void
 cluster_itl_touch_register(const ClusterItlTouchHandle *handle pg_attribute_unused())
-{
-}
+{}
 void
 cluster_itl_touch_foreach(ClusterItlTouchCallback cb pg_attribute_unused(),
 						  void *arg pg_attribute_unused())
-{
-}
+{}
 void
 cluster_itl_touch_reset_at_end_xact(void)
-{
-}
+{}
 uint32
 cluster_itl_touch_count(void)
 {
@@ -107,15 +104,12 @@ cluster_itl_touch_count(void)
 void
 cluster_itl_xact_precommit_finish(TransactionId xid pg_attribute_unused(),
 								  SCN commit_scn pg_attribute_unused())
-{
-}
+{}
 void
 cluster_itl_xact_abort_finish(TransactionId xid pg_attribute_unused())
-{
-}
+{}
 bool
-cluster_itl_get_tt_ref(Page page pg_attribute_unused(),
-					   uint8 itl_slot_idx pg_attribute_unused(),
+cluster_itl_get_tt_ref(Page page pg_attribute_unused(), uint8 itl_slot_idx pg_attribute_unused(),
 					   ClusterUndoTTSlotRef *ref pg_attribute_unused())
 {
 	return false;
@@ -128,27 +122,20 @@ cluster_itl_alloc_or_reuse_slot(Buffer buf pg_attribute_unused(),
 	return false;
 }
 void
-cluster_itl_stamp_active(Buffer buf pg_attribute_unused(),
-						 uint8 slot_idx pg_attribute_unused(),
+cluster_itl_stamp_active(Buffer buf pg_attribute_unused(), uint8 slot_idx pg_attribute_unused(),
 						 TransactionId xid pg_attribute_unused(),
 						 SCN write_scn pg_attribute_unused())
-{
-}
+{}
 void
-cluster_itl_stamp_committed(Buffer buf pg_attribute_unused(),
-							uint8 slot_idx pg_attribute_unused(),
+cluster_itl_stamp_committed(Buffer buf pg_attribute_unused(), uint8 slot_idx pg_attribute_unused(),
 							SCN commit_scn pg_attribute_unused())
-{
-}
+{}
 void
-cluster_itl_stamp_aborted(Buffer buf pg_attribute_unused(),
-						  uint8 slot_idx pg_attribute_unused())
-{
-}
+cluster_itl_stamp_aborted(Buffer buf pg_attribute_unused(), uint8 slot_idx pg_attribute_unused())
+{}
 void
 cluster_itl_check_subxact_or_error(void)
-{
-}
+{}
 
 
 UT_TEST(test_t1_handle_sizeof_24)

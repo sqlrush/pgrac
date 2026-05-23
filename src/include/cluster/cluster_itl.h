@@ -101,8 +101,7 @@ extern bool cluster_itl_get_tt_ref(Page page, uint8 itl_slot_idx, ClusterUndoTTS
  *	GetCurrentTransactionNestLevel() > 1; callers must check that
  *	before invoking this helper.
  */
-extern bool cluster_itl_alloc_or_reuse_slot(Buffer buf, TransactionId top_xid,
-											uint8 *out_slot_idx);
+extern bool cluster_itl_alloc_or_reuse_slot(Buffer buf, TransactionId top_xid, uint8 *out_slot_idx);
 
 /*
  * cluster_itl_stamp_active -- write ACTIVE state into ITL slot
@@ -121,8 +120,7 @@ extern bool cluster_itl_alloc_or_reuse_slot(Buffer buf, TransactionId top_xid,
  *
  *	Marks the buffer dirty (caller still emits the WAL record).
  */
-extern void cluster_itl_stamp_active(Buffer buf, uint8 slot_idx,
-									 TransactionId xid, SCN write_scn);
+extern void cluster_itl_stamp_active(Buffer buf, uint8 slot_idx, TransactionId xid, SCN write_scn);
 
 /*
  * cluster_itl_stamp_committed -- transition ACTIVE → COMMITTED with
@@ -136,8 +134,7 @@ extern void cluster_itl_stamp_active(Buffer buf, uint8 slot_idx,
  *	Caller emits the COMMITTED WAL delta (spec-3.4a D8) within the
  *	same critical section.
  */
-extern void cluster_itl_stamp_committed(Buffer buf, uint8 slot_idx,
-										SCN commit_scn);
+extern void cluster_itl_stamp_committed(Buffer buf, uint8 slot_idx, SCN commit_scn);
 
 /*
  * cluster_itl_stamp_aborted -- transition ACTIVE → ABORTED.

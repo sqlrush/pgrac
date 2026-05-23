@@ -43,12 +43,12 @@
  */
 #include "postgres.h"
 
-#include "access/xloginsert.h"	/* log_newpage_buffer (spec-3.4a D8) */
-#include "cluster/cluster_guc.h"		/* cluster_enabled */
-#include "cluster/cluster_itl.h"		/* stamp_committed / stamp_aborted */
+#include "access/xloginsert.h"	 /* log_newpage_buffer (spec-3.4a D8) */
+#include "cluster/cluster_guc.h" /* cluster_enabled */
+#include "cluster/cluster_itl.h" /* stamp_committed / stamp_aborted */
 #include "cluster/cluster_itl_touch.h"
-#include "miscadmin.h"			/* InterruptHoldoffCount */
-#include "storage/bufmgr.h"		/* ReadBufferWithoutRelcache / LockBuffer */
+#include "miscadmin.h"		/* InterruptHoldoffCount */
+#include "storage/bufmgr.h" /* ReadBufferWithoutRelcache / LockBuffer */
 #include "utils/memutils.h"
 
 #ifdef USE_PGRAC_CLUSTER
@@ -62,13 +62,10 @@ static uint32 touch_count = 0;
 static uint32 touch_capacity = 0;
 
 static bool
-itl_touch_handle_matches(const ClusterItlTouchHandle *left,
-						 const ClusterItlTouchHandle *right)
+itl_touch_handle_matches(const ClusterItlTouchHandle *left, const ClusterItlTouchHandle *right)
 {
-	return RelFileLocatorEquals(left->rloc, right->rloc) &&
-		left->block == right->block &&
-		left->forknum == right->forknum &&
-		left->slot_idx == right->slot_idx;
+	return RelFileLocatorEquals(left->rloc, right->rloc) && left->block == right->block
+		   && left->forknum == right->forknum && left->slot_idx == right->slot_idx;
 }
 
 /* ---------- public API ---------- */
@@ -87,31 +84,27 @@ cluster_itl_touch_register(const ClusterItlTouchHandle *handle)
 	 */
 	Assert(InterruptHoldoffCount == 0);
 
-	for (i = 0; i < touch_count; i++)
-	{
+	for (i = 0; i < touch_count; i++) {
 		if (itl_touch_handle_matches(&touch_list[i], handle))
 			return;
 	}
 
 	/* Grow or allocate the list as needed. */
-	if (touch_list == NULL)
-	{
+	if (touch_list == NULL) {
 		MemoryContext oldcxt;
 
 		Assert(TopTransactionContext != NULL);
 		oldcxt = MemoryContextSwitchTo(TopTransactionContext);
 		touch_capacity = CLUSTER_ITL_TOUCH_INITIAL_CAPACITY;
-		touch_list = (ClusterItlTouchHandle *)
-			palloc(sizeof(ClusterItlTouchHandle) * touch_capacity);
+		touch_list
+			= (ClusterItlTouchHandle *)palloc(sizeof(ClusterItlTouchHandle) * touch_capacity);
 		MemoryContextSwitchTo(oldcxt);
 		touch_count = 0;
-	}
-	else if (touch_count == touch_capacity)
-	{
+	} else if (touch_count == touch_capacity) {
 		uint32 new_capacity = touch_capacity * 2;
 
-		touch_list = (ClusterItlTouchHandle *)
-			repalloc(touch_list, sizeof(ClusterItlTouchHandle) * new_capacity);
+		touch_list = (ClusterItlTouchHandle *)repalloc(touch_list, sizeof(ClusterItlTouchHandle)
+																	   * new_capacity);
 		touch_capacity = new_capacity;
 	}
 
@@ -164,33 +157,30 @@ itl_touch_acquire_buffer(const ClusterItlTouchHandle *handle)
 {
 	Buffer buf;
 
-	buf = ReadBufferWithoutRelcache(handle->rloc, handle->forknum,
-									handle->block, RBM_NORMAL,
-									NULL, true /* permanent */);
+	buf = ReadBufferWithoutRelcache(handle->rloc, handle->forknum, handle->block, RBM_NORMAL, NULL,
+									true /* permanent */);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 	return buf;
 }
 
-typedef struct ItlFinishCtx
-{
-	SCN  commit_scn;	/* InvalidScn for abort path */
+typedef struct ItlFinishCtx {
+	SCN commit_scn; /* InvalidScn for abort path */
 	bool is_commit;
 } ItlFinishCtx;
 
 static void
 itl_finish_one(const ClusterItlTouchHandle *handle, void *arg)
 {
-	ItlFinishCtx *ctx = (ItlFinishCtx *) arg;
+	ItlFinishCtx *ctx = (ItlFinishCtx *)arg;
 	Buffer buf;
 
 	buf = itl_touch_acquire_buffer(handle);
 
 	START_CRIT_SECTION();
 	if (ctx->is_commit)
-		cluster_itl_stamp_committed(buf, (uint8) handle->slot_idx,
-									ctx->commit_scn);
+		cluster_itl_stamp_committed(buf, (uint8)handle->slot_idx, ctx->commit_scn);
 	else
-		cluster_itl_stamp_aborted(buf, (uint8) handle->slot_idx);
+		cluster_itl_stamp_aborted(buf, (uint8)handle->slot_idx);
 
 	/*
 	 * spec-3.4a D8 (Step 7): the ACTIVE -> COMMITTED / ACTIVE -> ABORTED
@@ -214,17 +204,16 @@ cluster_itl_xact_precommit_finish(TransactionId xid, SCN commit_scn)
 {
 	ItlFinishCtx ctx;
 
-	(void) xid;					/* xid currently unused; reserved for WAL emit */
+	(void)xid; /* xid currently unused; reserved for WAL emit */
 
-	if (!cluster_enabled || cluster_node_id < 0)
-	{
+	if (!cluster_enabled || cluster_node_id < 0) {
 		cluster_itl_touch_reset_at_end_xact();
 		return;
 	}
 	if (touch_count == 0)
 		return;
 
-	Assert(SCN_VALID(commit_scn));	/* L181 — COMMITTED must carry valid SCN */
+	Assert(SCN_VALID(commit_scn)); /* L181 — COMMITTED must carry valid SCN */
 
 	ctx.commit_scn = commit_scn;
 	ctx.is_commit = true;
@@ -237,10 +226,9 @@ cluster_itl_xact_abort_finish(TransactionId xid)
 {
 	ItlFinishCtx ctx;
 
-	(void) xid;
+	(void)xid;
 
-	if (!cluster_enabled || cluster_node_id < 0)
-	{
+	if (!cluster_enabled || cluster_node_id < 0) {
 		cluster_itl_touch_reset_at_end_xact();
 		return;
 	}
@@ -253,23 +241,20 @@ cluster_itl_xact_abort_finish(TransactionId xid)
 	cluster_itl_touch_reset_at_end_xact();
 }
 
-#else							/* !USE_PGRAC_CLUSTER */
+#else /* !USE_PGRAC_CLUSTER */
 
 void
 cluster_itl_touch_register(const ClusterItlTouchHandle *handle pg_attribute_unused())
-{
-}
+{}
 
 void
 cluster_itl_touch_foreach(ClusterItlTouchCallback cb pg_attribute_unused(),
 						  void *arg pg_attribute_unused())
-{
-}
+{}
 
 void
 cluster_itl_touch_reset_at_end_xact(void)
-{
-}
+{}
 
 uint32
 cluster_itl_touch_count(void)
@@ -280,12 +265,10 @@ cluster_itl_touch_count(void)
 void
 cluster_itl_xact_precommit_finish(TransactionId xid pg_attribute_unused(),
 								  SCN commit_scn pg_attribute_unused())
-{
-}
+{}
 
 void
 cluster_itl_xact_abort_finish(TransactionId xid pg_attribute_unused())
-{
-}
+{}
 
-#endif							/* USE_PGRAC_CLUSTER */
+#endif /* USE_PGRAC_CLUSTER */

@@ -46,15 +46,15 @@
 #define CLUSTER_ITL_TOUCH_H
 
 #include "c.h"
-#include "postgres_ext.h"		/* Oid (used by RelFileLocator) */
-#include "access/transam.h"		/* TransactionId */
+#include "postgres_ext.h"	/* Oid (used by RelFileLocator) */
+#include "access/transam.h" /* TransactionId */
 #include "access/xlogdefs.h"
-#include "common/relpath.h"		/* ForkNumber */
-#include "storage/block.h"		/* BlockNumber */
-#include "storage/buf.h"		/* Buffer */
-#include "storage/itemptr.h"	/* OffsetNumber */
+#include "common/relpath.h"	 /* ForkNumber */
+#include "storage/block.h"	 /* BlockNumber */
+#include "storage/buf.h"	 /* Buffer */
+#include "storage/itemptr.h" /* OffsetNumber */
 #include "storage/relfilelocator.h"
-#include "cluster/cluster_scn.h"	/* SCN */
+#include "cluster/cluster_scn.h" /* SCN */
 
 /*
  * ClusterItlTouchHandle -- 24-byte fixed handle (HC: layout MUST stay
@@ -67,27 +67,23 @@
  *	  offset 20,  2B : slot_idx (0 .. INITRANS-1)
  *	  offset 22,  2B : flags (reserved; zero in v1.0)
  */
-typedef struct ClusterItlTouchHandle
-{
-	RelFileLocator rloc;		/* offset  0, 12B */
-	BlockNumber    block;		/* offset 12,  4B */
-	ForkNumber     forknum;		/* offset 16,  4B */
-	OffsetNumber   slot_idx;	/* offset 20,  2B */
-	uint16         flags;		/* offset 22,  2B */
+typedef struct ClusterItlTouchHandle {
+	RelFileLocator rloc;   /* offset  0, 12B */
+	BlockNumber block;	   /* offset 12,  4B */
+	ForkNumber forknum;	   /* offset 16,  4B */
+	OffsetNumber slot_idx; /* offset 20,  2B */
+	uint16 flags;		   /* offset 22,  2B */
 } ClusterItlTouchHandle;
 
 StaticAssertDecl(sizeof(ClusterItlTouchHandle) == 24,
 				 "spec-3.4a D1 — ClusterItlTouchHandle must be 24 bytes");
-StaticAssertDecl(offsetof(ClusterItlTouchHandle, rloc) == 0,
-				 "spec-3.4a D1 — rloc at offset 0");
-StaticAssertDecl(offsetof(ClusterItlTouchHandle, block) == 12,
-				 "spec-3.4a D1 — block at offset 12");
+StaticAssertDecl(offsetof(ClusterItlTouchHandle, rloc) == 0, "spec-3.4a D1 — rloc at offset 0");
+StaticAssertDecl(offsetof(ClusterItlTouchHandle, block) == 12, "spec-3.4a D1 — block at offset 12");
 StaticAssertDecl(offsetof(ClusterItlTouchHandle, forknum) == 16,
 				 "spec-3.4a D1 — forknum at offset 16");
 StaticAssertDecl(offsetof(ClusterItlTouchHandle, slot_idx) == 20,
 				 "spec-3.4a D1 — slot_idx at offset 20");
-StaticAssertDecl(offsetof(ClusterItlTouchHandle, flags) == 22,
-				 "spec-3.4a D1 — flags at offset 22");
+StaticAssertDecl(offsetof(ClusterItlTouchHandle, flags) == 22, "spec-3.4a D1 — flags at offset 22");
 
 /*
  * cluster_itl_touch_register -- append a handle to the xact-local
@@ -110,8 +106,7 @@ extern void cluster_itl_touch_register(const ClusterItlTouchHandle *handle);
  * order, invoking `cb(handle, arg)` for each.  Used by xact.c pre-
  * commit/abort hook (spec-3.4a D6).
  */
-typedef void (*ClusterItlTouchCallback) (const ClusterItlTouchHandle *handle,
-										 void *arg);
+typedef void (*ClusterItlTouchCallback)(const ClusterItlTouchHandle *handle, void *arg);
 
 extern void cluster_itl_touch_foreach(ClusterItlTouchCallback cb, void *arg);
 
@@ -146,4 +141,4 @@ extern uint32 cluster_itl_touch_count(void);
 extern void cluster_itl_xact_precommit_finish(TransactionId xid, SCN commit_scn);
 extern void cluster_itl_xact_abort_finish(TransactionId xid);
 
-#endif							/* CLUSTER_ITL_TOUCH_H */
+#endif /* CLUSTER_ITL_TOUCH_H */
