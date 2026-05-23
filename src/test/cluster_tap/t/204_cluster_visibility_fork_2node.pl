@@ -23,7 +23,7 @@
 #	       drop_stale_epoch_count delta (best-effort verify)
 #	  L10  drop_unknown_version_count counter present + monotonic
 #	       non-decreasing (V2 fake hint inject 推后续 hardening)
-#	  L11  pg_cluster_state 'tt_status_hint' category has 6 keys
+#	  L11  pg_cluster_state 'tt_status_hint' category has 7 keys (spec-3.3 D9)
 #	  L12  pg_cluster_state categories = 25 + tt_status_hint
 #	       字母序在 tt_status 之后
 #
@@ -303,13 +303,14 @@ cmp_ok($unknown_version, '>=', 0,
 
 
 # ============================================================
-# L11: pg_cluster_state 'tt_status_hint' category has 6 keys.
+# L11: pg_cluster_state 'tt_status_hint' category has 7 keys.
+#       (spec-3.3 D9 adds drop_v1_compat_count.)
 # ============================================================
 is($pair->node0->safe_psql('postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='tt_status_hint'}),
-	'6',
-	'L11 tt_status_hint category has 6 keys (v0.3 N5 + drop_unknown_version)');
+	'7',
+	'L11 tt_status_hint category has 7 keys (spec-3.3 D9 + drop_v1_compat)');
 
 
 # ============================================================

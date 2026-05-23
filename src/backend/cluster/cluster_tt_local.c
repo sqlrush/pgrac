@@ -186,13 +186,15 @@ install_status(TransactionId xid, ClusterTTStatus status, SCN commit_scn)
 		cluster_tt_status_bump_self_consumer_hit();
 
 	/*
-	 * spec-3.2 D4:  cross-node TT status hint wire emit.  Uses the EXACT
-	 * key just minted + installed (HC184 — no raw-xid rebuild).  Fire-
-	 * and-forget;  emit_mode = disabled is a no-op inside the function.
-	 * commit/abort 对称(install_status is called from both
-	 * record_commit + record_abort).
+	 * spec-3.2 D4 + spec-3.3 D6/D8 (L181 chain step 4): cross-node TT
+	 * status hint wire emit. Uses the EXACT key just minted + installed
+	 * (HC184 — no raw-xid rebuild); commit_scn flows through so peers
+	 * see the real value via V2 wire. Fire-and-forget; emit_mode =
+	 * disabled is a no-op inside the function. commit/abort 对称
+	 * (install_status is called from both record_commit + record_abort;
+	 * abort path passes InvalidScn).
 	 */
-	cluster_tt_status_hint_emit(&key, status);
+	cluster_tt_status_hint_emit(&key, status, commit_scn);
 }
 
 /* ------------------------------------------------------------ */

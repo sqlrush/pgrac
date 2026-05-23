@@ -64,9 +64,13 @@
 /*
  * Outbound ring entry — kept independent from wire payload to allow
  * future flag bits without bumping wire ABI.
+ *
+ * spec-3.3 D8: commit_scn carried alongside status; senders post
+ * spec-3.3 emit V2 (40B wire) so the drain path needs the SCN.
  */
 typedef struct ClusterTTStatusHintOutboundEntry {
 	ClusterTTStatusKey key;
+	SCN commit_scn;			/* spec-3.3 D8 */
 	uint16 status;
 	uint16 _pad[3];
 } ClusterTTStatusHintOutboundEntry;
@@ -86,6 +90,7 @@ typedef struct ClusterTTStatusHintState {
 	pg_atomic_uint64 drop_stale_epoch_count;
 	pg_atomic_uint64 drop_unknown_version_count;
 	pg_atomic_uint64 install_count;
+	pg_atomic_uint64 drop_v1_compat_count;	/* spec-3.3 D9: 7th counter */
 } ClusterTTStatusHintState;
 
 static ClusterTTStatusHintOutboundRing *ClusterTTHintOutbound = NULL;
@@ -139,6 +144,7 @@ cluster_tt_status_hint_shmem_init(void)
 		pg_atomic_init_u64(&ClusterTTHintCounters->drop_stale_epoch_count, 0);
 		pg_atomic_init_u64(&ClusterTTHintCounters->drop_unknown_version_count, 0);
 		pg_atomic_init_u64(&ClusterTTHintCounters->install_count, 0);
+		pg_atomic_init_u64(&ClusterTTHintCounters->drop_v1_compat_count, 0);
 	}
 }
 
@@ -180,7 +186,8 @@ cluster_tt_status_hint_register_msg_type(void)
 /* ------------------------------------------------------------ */
 
 void
-cluster_tt_status_hint_emit(const ClusterTTStatusKey *key, ClusterTTStatus status)
+cluster_tt_status_hint_emit(const ClusterTTStatusKey *key, ClusterTTStatus status,
+							SCN commit_scn)
 {
 	uint32 tail;
 	uint32 next_tail;
@@ -211,6 +218,7 @@ cluster_tt_status_hint_emit(const ClusterTTStatusKey *key, ClusterTTStatus statu
 	}
 
 	ClusterTTHintOutbound->slots[tail].key = *key;
+	ClusterTTHintOutbound->slots[tail].commit_scn = commit_scn;
 	ClusterTTHintOutbound->slots[tail].status = (uint16)status;
 	ClusterTTHintOutbound->slots[tail]._pad[0] = 0;
 	ClusterTTHintOutbound->slots[tail]._pad[1] = 0;
@@ -241,7 +249,7 @@ cluster_tt_status_hint_drain_outbound(void)
 
 	for (;;) {
 		ClusterTTStatusHintOutboundEntry local;
-		ClusterTTStatusHintMsg msg;
+		ClusterTTStatusHintMsgV2 msg;
 		ClusterICFanoutResult per_peer[CLUSTER_MAX_NODES];
 		uint32 head;
 
@@ -256,13 +264,18 @@ cluster_tt_status_hint_drain_outbound(void)
 							(head + 1) % ClusterTTHintOutbound->capacity);
 		LWLockRelease(&ClusterTTHintOutbound->lock.lock);
 
-		/* Build wire payload — V1 layout (HC184). */
+		/*
+		 * Build wire payload — V2 layout (spec-3.3 D8). Senders post
+		 * spec-3.3 emit V2 only. V1 backward-compat exists on the
+		 * receiver side for the upgrade window.
+		 */
 		memset(&msg, 0, sizeof(msg));
-		msg.msg_version = (uint16)CLUSTER_TT_STATUS_HINT_V1;
+		msg.msg_version = (uint16)CLUSTER_TT_STATUS_HINT_V2;
 		msg.status = local.status;
 		msg.flags = 0;
 		msg._reserved16 = 0;
 		msg.key = local.key;
+		msg.commit_scn = local.commit_scn;
 
 		cluster_ic_send_envelope_fanout(PGRAC_IC_MSG_TT_STATUS_HINT, &msg, sizeof(msg), per_peer);
 	}
@@ -275,66 +288,124 @@ cluster_tt_status_hint_drain_outbound(void)
 void
 cluster_tt_status_hint_handle_envelope(const ClusterICEnvelope *env, const void *payload)
 {
-	const ClusterTTStatusHintMsg *msg;
-	uint32 current_epoch;
+	uint16		msg_version;
+	uint16		status_raw;
+	uint16		flags_raw;
+	uint16		reserved16_raw;
+	const ClusterTTStatusKey *key;
+	SCN			commit_scn;
+	uint32		current_epoch;
 
 	if (ClusterTTHintCounters == NULL || env == NULL || payload == NULL)
 		return;
 
-	/* HC187: exact payload ABI only.  Reject short frames before reading
-	 * msg_version; reject long frames so reserved tail bytes cannot carry
-	 * unaudited state. */
-	if (env->payload_length != (uint32)sizeof(ClusterTTStatusHintMsg)) {
+	/*
+	 * spec-3.3 D9 (R6 P1): length-check-before-cast. Read the smallest
+	 * common prefix (msg_version) first, then validate exact payload
+	 * length per version, THEN cast to the version-specific struct.
+	 * Casting before length validation could read past a short frame.
+	 *
+	 * The header prefix (msg_version uint16 at offset 0) is shared by V1
+	 * and V2, so reading offsetof(V1, key) == 8 bytes is always safe
+	 * once we know payload_length >= 8.
+	 */
+	if (env->payload_length < (uint32) offsetof(ClusterTTStatusHintMsgV1, key)) {
 		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
 		return;
 	}
 
-	msg = (const ClusterTTStatusHintMsg *)payload;
+	memcpy(&msg_version, payload, sizeof(uint16));
 
-	/* HC187 forward-compat reject — V1 receiver drops V2+. */
-	if (msg->msg_version != CLUSTER_TT_STATUS_HINT_V1) {
+	if (msg_version == CLUSTER_TT_STATUS_HINT_V1)
+	{
+		const ClusterTTStatusHintMsgV1 *v1;
+
+		if (env->payload_length != (uint32) sizeof(ClusterTTStatusHintMsgV1))
+		{
+			pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+			return;
+		}
+
+		v1 = (const ClusterTTStatusHintMsgV1 *) payload;
+		status_raw = v1->status;
+		flags_raw = v1->flags;
+		reserved16_raw = v1->_reserved16;
+		key = &v1->key;
+		/* V1 wire carries no commit_scn -> install InvalidScn; snapshot
+		 * consumer flags such tuples UNKNOWN -> 53R97. */
+		commit_scn = InvalidScn;
+		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_v1_compat_count, 1);
+		ereport(WARNING,
+				(errmsg("cluster tt_status_hint V1 received from peer; spec-3.3 senders should emit V2"),
+				 errhint("Peer is running a pre-spec-3.3 binary; commit_scn=InvalidScn results in UNKNOWN visibility for cross-node COMMITs.")));
+	}
+	else if (msg_version == CLUSTER_TT_STATUS_HINT_V2)
+	{
+		const ClusterTTStatusHintMsgV2 *v2;
+
+		if (env->payload_length != (uint32) sizeof(ClusterTTStatusHintMsgV2))
+		{
+			pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+			return;
+		}
+
+		v2 = (const ClusterTTStatusHintMsgV2 *) payload;
+		status_raw = v2->status;
+		flags_raw = v2->flags;
+		reserved16_raw = v2->_reserved16;
+		key = &v2->key;
+		commit_scn = v2->commit_scn;
+	}
+	else
+	{
+		/* HC187 forward-compat: future V3+ unknown to this receiver. */
 		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_unknown_version_count, 1);
 		return;
 	}
 
 	/* Self-loop defense (also asserted by tier1 framework but double-
 	 * check). */
-	if ((int32)env->source_node_id == cluster_node_id) {
+	if ((int32) env->source_node_id == cluster_node_id) {
 		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
 		return;
 	}
 
 	/* HC186 anti-spoof — payload-declared origin must match framework-
 	 * set envelope source. */
-	if ((int32)msg->key.origin_node_id != (int32)env->source_node_id) {
+	if ((int32) key->origin_node_id != (int32) env->source_node_id) {
 		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
 		return;
 	}
 
 	/* Epoch fence (HC182 inherited from spec-3.1). */
-	current_epoch = (uint32)cluster_epoch_get_current();
-	if (msg->key.cluster_epoch != current_epoch) {
+	current_epoch = (uint32) cluster_epoch_get_current();
+	if (key->cluster_epoch != current_epoch) {
 		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_stale_epoch_count, 1);
 		return;
 	}
 
 	/* Status range. */
-	if (msg->status != CLUSTER_TT_STATUS_COMMITTED && msg->status != CLUSTER_TT_STATUS_ABORTED) {
+	if (status_raw != CLUSTER_TT_STATUS_COMMITTED && status_raw != CLUSTER_TT_STATUS_ABORTED) {
 		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
 		return;
 	}
 
 	/* Reserved fields MUST be zero (M3 anti-tamper). */
-	if (msg->flags != 0 || msg->_reserved16 != 0 || msg->key._reserved != 0
-		|| msg->key._reserved2 != 0) {
+	if (flags_raw != 0 || reserved16_raw != 0 || key->_reserved != 0
+		|| key->_reserved2 != 0) {
 		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
 		return;
 	}
 
 	pg_atomic_fetch_add_u64(&ClusterTTHintCounters->receive_count, 1);
 
-	/* HC184 direct install with sender-supplied key — no raw-xid rebuild. */
-	cluster_tt_status_install_local(&msg->key, (ClusterTTStatus)msg->status, InvalidScn);
+	/*
+	 * spec-3.3 D9 (L181 chain step 6): install with commit_scn from
+	 * the wire (real value for V2 senders, InvalidScn for V1 compat).
+	 * No raw-xid rebuild -- HC184 direct install with sender-supplied
+	 * key.
+	 */
+	cluster_tt_status_install_local(key, (ClusterTTStatus) status_raw, commit_scn);
 	pg_atomic_fetch_add_u64(&ClusterTTHintCounters->install_count, 1);
 }
 
@@ -356,6 +427,7 @@ CLUSTER_TT_HINT_GETTER(drop_invalid_count)
 CLUSTER_TT_HINT_GETTER(drop_stale_epoch_count)
 CLUSTER_TT_HINT_GETTER(drop_unknown_version_count)
 CLUSTER_TT_HINT_GETTER(install_count)
+CLUSTER_TT_HINT_GETTER(drop_v1_compat_count)
 
 #else /* !USE_PGRAC_CLUSTER */
 
@@ -374,10 +446,12 @@ cluster_tt_status_hint_shmem_register(void)
 {}
 
 void
-cluster_tt_status_hint_emit(const ClusterTTStatusKey *key, ClusterTTStatus status)
+cluster_tt_status_hint_emit(const ClusterTTStatusKey *key, ClusterTTStatus status,
+							SCN commit_scn)
 {
 	(void)key;
 	(void)status;
+	(void)commit_scn;
 }
 
 void
@@ -403,5 +477,6 @@ CLUSTER_TT_HINT_GETTER_STUB(drop_invalid_count)
 CLUSTER_TT_HINT_GETTER_STUB(drop_stale_epoch_count)
 CLUSTER_TT_HINT_GETTER_STUB(drop_unknown_version_count)
 CLUSTER_TT_HINT_GETTER_STUB(install_count)
+CLUSTER_TT_HINT_GETTER_STUB(drop_v1_compat_count)
 
 #endif /* USE_PGRAC_CLUSTER */

@@ -63,16 +63,25 @@ struct ClusterICEnvelope;
 /*
  * ClusterTTStatusHintVersion -- wire format version.
  *
- * V1:  spec-3.2 v1.0 baseline.  Future V2+ may add fields after
- * embedded key;  receiver in V1 era DROPs unknown-version msgs
+ * V1:  spec-3.2 v1.0 baseline.  32B payload (header 8 + embedded key 24).
+ *      commit_scn NOT carried -> overlay installs InvalidScn -> snapshot
+ *      consumer flags UNKNOWN.
+ * V2:  spec-3.3 D8.  40B payload (V1 32B + 8B SCN commit_scn @ offset 32).
+ *      Real commit_scn flows end-to-end so receiver-side overlay can
+ *      satisfy snapshot consumer at COMMITTED visibility (L181 chain).
+ *
+ * Senders post spec-3.3 emit V2 only. Receivers must accept both V1 and
+ * V2 for the upgrade window; V1 install path stores InvalidScn + bumps
+ * drop_v1_compat_count + emits WARNING. Unknown-version messages drop
  * (HC187 forward-compat reject).
  */
 typedef enum ClusterTTStatusHintVersion {
-	CLUSTER_TT_STATUS_HINT_V1 = 1
+	CLUSTER_TT_STATUS_HINT_V1 = 1,
+	CLUSTER_TT_STATUS_HINT_V2 = 2
 } ClusterTTStatusHintVersion;
 
 /*
- * ClusterTTStatusHintMsg -- 32 bytes wire-stable payload.
+ * ClusterTTStatusHintMsgV1 -- 32 bytes wire-stable payload (spec-3.2).
  *
  *	HC184: layout MUST stay byte-stable across pgrac versions.
  *
@@ -81,24 +90,58 @@ typedef enum ClusterTTStatusHintVersion {
  *	  offset  2,  2B : status (uint16; ClusterTTStatus enum value)
  *	  offset  4,  2B : flags (uint16; zero in V1)
  *	  offset  6,  2B : _reserved16 (zero on emit)
- *	  offset  8, 24B : key (ClusterTTStatusKey embed — origin_node_id +
- *	                  undo_segment_id + tt_slot_id + cluster_epoch +
- *	                  local_xid + _reserved + _reserved2)
+ *	  offset  8, 24B : key (ClusterTTStatusKey embed)
  */
-typedef struct ClusterTTStatusHintMsg {
+typedef struct ClusterTTStatusHintMsgV1 {
 	uint16 msg_version;		/* offset  0, 2B */
 	uint16 status;			/* offset  2, 2B */
 	uint16 flags;			/* offset  4, 2B */
 	uint16 _reserved16;		/* offset  6, 2B */
 	ClusterTTStatusKey key; /* offset  8, 24B */
-} ClusterTTStatusHintMsg;
+} ClusterTTStatusHintMsgV1;
 
-StaticAssertDecl(offsetof(ClusterTTStatusHintMsg, key) == 8,
-				 "ClusterTTStatusHintMsg.key must start at offset 8 "
+StaticAssertDecl(offsetof(ClusterTTStatusHintMsgV1, key) == 8,
+				 "ClusterTTStatusHintMsgV1.key must start at offset 8 "
 				 "(spec-3.2 HC184 wire ABI lock)");
-StaticAssertDecl(sizeof(ClusterTTStatusHintMsg) == 32,
-				 "ClusterTTStatusHintMsg must be 32 bytes wire-stable "
+StaticAssertDecl(sizeof(ClusterTTStatusHintMsgV1) == 32,
+				 "ClusterTTStatusHintMsgV1 must be 32 bytes wire-stable "
 				 "(spec-3.2 HC184)");
+
+/*
+ * ClusterTTStatusHintMsgV2 -- 40 bytes wire-stable payload (spec-3.3 D8).
+ *
+ *	V1 header + key preserved bit-for-bit; commit_scn appended at offset 32.
+ *
+ *	Field layout:
+ *	  offset  0, 32B : V1 base (msg_version=V2, status, flags, _reserved16, key)
+ *	  offset 32,  8B : commit_scn (SCN; InvalidScn for ABORTED / IN_PROGRESS;
+ *	                   real cluster_scn_advance_for_commit() value for
+ *	                   COMMITTED/CLEANED_OUT -- L181 chain)
+ */
+typedef struct ClusterTTStatusHintMsgV2 {
+	uint16 msg_version;		/* offset  0, 2B; = CLUSTER_TT_STATUS_HINT_V2 */
+	uint16 status;
+	uint16 flags;
+	uint16 _reserved16;
+	ClusterTTStatusKey key; /* offset  8, 24B */
+	SCN    commit_scn;		/* offset 32, 8B */
+} ClusterTTStatusHintMsgV2;
+
+StaticAssertDecl(offsetof(ClusterTTStatusHintMsgV2, key) == 8,
+				 "ClusterTTStatusHintMsgV2.key must start at offset 8");
+StaticAssertDecl(offsetof(ClusterTTStatusHintMsgV2, commit_scn) == 32,
+				 "ClusterTTStatusHintMsgV2.commit_scn must start at offset 32 "
+				 "(spec-3.3 D8 wire ABI lock)");
+StaticAssertDecl(sizeof(ClusterTTStatusHintMsgV2) == 40,
+				 "ClusterTTStatusHintMsgV2 must be 40 bytes wire-stable "
+				 "(spec-3.3 D8 / V2 wire ABI lock)");
+
+/*
+ * Legacy typedef preserved for source compatibility with internal callers
+ * that still reference ClusterTTStatusHintMsg without a version suffix.
+ * Always means the V1 32B layout; new code should pick V1 / V2 explicitly.
+ */
+typedef ClusterTTStatusHintMsgV1 ClusterTTStatusHintMsg;
 
 /*
  * Producer mask — LMON only (L172 family;tier1-fd-LMON-exclusive-
@@ -126,19 +169,22 @@ StaticAssertDecl(sizeof(ClusterTTStatusHintMsg) == 32,
  *	  LMON drain entry point.  Iterates alive peers (3-gate) and
  *	  fanout each hint via tier1 send.  Only LMON calls this (HC185).
  */
-extern void cluster_tt_status_hint_emit(const ClusterTTStatusKey *key, ClusterTTStatus status);
+extern void cluster_tt_status_hint_emit(const ClusterTTStatusKey *key,
+										ClusterTTStatus status,
+										SCN commit_scn);
 extern void cluster_tt_status_hint_handle_envelope(const struct ClusterICEnvelope *env,
 												   const void *payload);
 extern void cluster_tt_status_hint_drain_outbound(void);
 extern void cluster_tt_status_hint_register_msg_type(void);
 
-/* Counters (v0.3 N5:  6 counters; +drop_unknown_version). */
+/* Counters (spec-3.3 D9: 7 counters; +drop_v1_compat). */
 extern uint64 cluster_tt_status_hint_get_emit_count(void);
 extern uint64 cluster_tt_status_hint_get_receive_count(void);
 extern uint64 cluster_tt_status_hint_get_drop_invalid_count(void);
 extern uint64 cluster_tt_status_hint_get_drop_stale_epoch_count(void);
 extern uint64 cluster_tt_status_hint_get_drop_unknown_version_count(void);
 extern uint64 cluster_tt_status_hint_get_install_count(void);
+extern uint64 cluster_tt_status_hint_get_drop_v1_compat_count(void);
 
 extern Size cluster_tt_status_hint_shmem_size(void);
 extern void cluster_tt_status_hint_shmem_init(void);

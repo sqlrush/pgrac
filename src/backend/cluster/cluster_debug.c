@@ -1405,6 +1405,8 @@ dump_gcs(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_tt_status_hint_get_drop_unknown_version_count()));
 	emit_row(rsinfo, "tt_status_hint", "install_count",
 			 fmt_int64((int64)cluster_tt_status_hint_get_install_count()));
+	emit_row(rsinfo, "tt_status_hint", "drop_v1_compat_count",
+			 fmt_int64((int64)cluster_tt_status_hint_get_drop_v1_compat_count()));
 }
 
 #endif /* USE_PGRAC_CLUSTER */
