@@ -24,9 +24,9 @@
  *	    re-ReadBuffer the target page.
  *
  *	  Subxact:
- *	    spec-3.4a fails closed at the DML callsite when
- *	    GetCurrentTransactionNestLevel() > 1, so this module never
- *	    sees subxact-scoped registers; no nested-list bookkeeping.
+ *	    spec-3.4a leaves subtransaction writes on the PG-native path at
+ *	    the DML callsite, so this module never sees subxact-scoped
+ *	    registers; no nested-list bookkeeping.
  *
  * Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -47,7 +47,8 @@
 #include "cluster/cluster_guc.h" /* cluster_enabled */
 #include "cluster/cluster_itl.h" /* stamp_committed / stamp_aborted */
 #include "cluster/cluster_itl_touch.h"
-#include "storage/bufmgr.h" /* ReadBufferWithoutRelcache / LockBuffer */
+#include "storage/bufmgr.h" /* ReadBufferWithoutRelcache / ReleaseBuffer */
+#include "storage/buf_internals.h"
 #include "utils/memutils.h"
 
 #ifdef USE_PGRAC_CLUSTER
@@ -138,21 +139,39 @@ cluster_itl_touch_count(void)
 /* ---------- spec-3.4a D6 — xact.c pre-commit/abort hook ---------- */
 
 /*
- * Helper: re-read the buffer indicated by `handle`, acquire EXCLUSIVE
- * content lock, return the Buffer to the caller.  Caller is responsible
- * for stamping + ReleaseBuffer.  Uses ReadBufferWithoutRelcache to
- * avoid relcache lookup overhead and to keep the hook lightweight even
- * during shutdown sequences where relcache may be torn down.
+ * Helper: re-read the buffer indicated by `handle`, acquire the raw
+ * EXCLUSIVE content lock, return the Buffer to the caller.  Caller is
+ * responsible for stamping + direct content-lock release + ReleaseBuffer.
+ * Uses ReadBufferWithoutRelcache to avoid relcache lookup overhead and to
+ * keep the hook lightweight even during shutdown sequences where relcache
+ * may be torn down.
+ *
+ * Do not call LockBuffer() here.  The bufmgr LockBuffer wrapper drives the
+ * Cache Fusion PCM state machine for user-visible content locks; transaction-
+ * end ITL finish is a local page-metadata stamp and must not acquire/release
+ * cache ownership.
  */
 static Buffer
 itl_touch_acquire_buffer(const ClusterItlTouchHandle *handle)
 {
 	Buffer buf;
+	BufferDesc *buf_desc;
 
 	buf = ReadBufferWithoutRelcache(handle->rloc, handle->forknum, handle->block, RBM_NORMAL, NULL,
 									true /* permanent */);
-	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	buf_desc = GetBufferDescriptor(buf - 1);
+	LWLockAcquire(BufferDescriptorGetContentLock(buf_desc), LW_EXCLUSIVE);
 	return buf;
+}
+
+static void
+itl_touch_release_buffer(Buffer buf)
+{
+	BufferDesc *buf_desc;
+
+	buf_desc = GetBufferDescriptor(buf - 1);
+	LWLockRelease(BufferDescriptorGetContentLock(buf_desc));
+	ReleaseBuffer(buf);
 }
 
 typedef struct ItlFinishCtx {
@@ -202,7 +221,7 @@ itl_finish_one(const ClusterItlTouchHandle *handle, void *arg)
 	itl_finish_stamp_page(image, (uint8)handle->slot_idx, ctx);
 	GenericXLogFinish(state);
 
-	UnlockReleaseBuffer(buf);
+	itl_touch_release_buffer(buf);
 }
 
 void

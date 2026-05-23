@@ -13,8 +13,11 @@
  *	  The handle stores only persistent buffer-locator coordinates
  *	  (RelFileLocator + ForkNumber + BlockNumber + slot index) -- never
  *	  a Page* / Buffer pin.  L177 + the PG buffer manager require that
- *	  the xact finish hook re-`ReadBuffer` the target page, acquire an
- *	  EXCLUSIVE content lock, stamp, MarkBufferDirty, ReleaseBuffer.
+ *	  the xact finish hook re-`ReadBuffer` the target page, acquire the
+ *	  raw EXCLUSIVE content lock, stamp through generic WAL, release the
+ *	  content lock, ReleaseBuffer.  It intentionally bypasses LockBuffer()
+ *	  so transaction-end ITL finish does not drive Cache Fusion PCM
+ *	  acquire/release state.
  *	  Persisting Buffer pins across critical sections / xact end would
  *	  cause use-after-release or pin bloat (spec-3.4a N11).
  *
@@ -24,10 +27,10 @@
  *	  anyway, but explicit reset prevents stale state across nested
  *	  recovery / parallel-worker dispatch).
  *
- *	  Subtransactions: spec-3.4a fails closed (ERRCODE_FEATURE_NOT_
- *	  SUPPORTED) at the DML callsite if `GetCurrentTransactionNestLevel()
- *	  > 1`; this header therefore makes no provisions for subxact-scoped
- *	  list nesting.  Full SUBTRANS support is deferred to spec-3.5.
+ *	  Subtransactions: spec-3.4a leaves nested writes on the PG-native
+ *	  path at the DML callsite when `GetCurrentTransactionNestLevel() > 1`;
+ *	  this header therefore makes no provisions for subxact-scoped list
+ *	  nesting.  Full SUBTRANS support is deferred to spec-3.5.
  *
  * Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -98,9 +101,8 @@ StaticAssertDecl(offsetof(ClusterItlTouchHandle, flags) == 22, "spec-3.4a D1 —
  *	held off; that is still normal backend context, not an async signal
  *	handler.
  *
- *	Subtransactions: callers must have already rejected
- *	GetCurrentTransactionNestLevel() > 1 with ERRCODE_FEATURE_NOT_
- *	SUPPORTED (spec-3.4a N9).
+ *	Subtransactions: callers must have already skipped the cluster ITL
+ *	write path when GetCurrentTransactionNestLevel() > 1 (spec-3.4a N9).
  */
 extern void cluster_itl_touch_register(const ClusterItlTouchHandle *handle);
 
@@ -133,9 +135,9 @@ extern uint32 cluster_itl_touch_count(void);
  *	NOT a RegisterXactCallback (N10/N12).  Called explicitly from
  *	xact.c BEFORE the durable commit/abort XLOG record is written.
  *	The hook iterates the xact-local touched list (D1), re-ReadBuffer
- *	each handle, acquires EXCLUSIVE content lock, stamps the ITL slot
- *	COMMITTED/ABORTED through PG generic WAL delta logging (or the same
- *	generic critical-section path without WAL for unlogged relations).
+ *	each handle, acquires the raw EXCLUSIVE content lock, stamps the ITL
+ *	slot COMMITTED/ABORTED through PG generic WAL delta logging (or the
+ *	same generic critical-section path without WAL for unlogged relations).
  *	Finally calls
  *	cluster_itl_touch_reset_at_end_xact().
  *
