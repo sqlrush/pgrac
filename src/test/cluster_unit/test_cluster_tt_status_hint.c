@@ -80,7 +80,8 @@ int cluster_tt_status_hint_emit_mode = CLUSTER_TT_STATUS_HINT_EMIT_ALL_STATUS;
 
 void
 cluster_tt_status_hint_emit(const ClusterTTStatusKey *key pg_attribute_unused(),
-							ClusterTTStatus status pg_attribute_unused())
+							ClusterTTStatus status pg_attribute_unused(),
+							SCN commit_scn pg_attribute_unused())
 {}
 void
 cluster_tt_status_hint_handle_envelope(const ClusterICEnvelope *env pg_attribute_unused(),
@@ -105,6 +106,7 @@ HINT_GETTER_STUB(drop_invalid_count)
 HINT_GETTER_STUB(drop_stale_epoch_count)
 HINT_GETTER_STUB(drop_unknown_version_count)
 HINT_GETTER_STUB(install_count)
+HINT_GETTER_STUB(drop_v1_compat_count)	/* spec-3.3 D9 */
 
 Size
 cluster_tt_status_hint_shmem_size(void)

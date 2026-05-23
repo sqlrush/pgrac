@@ -681,6 +681,11 @@ cluster_tt_status_hint_get_install_count(void)
 {
 	return 0;
 }
+uint64
+cluster_tt_status_hint_get_drop_v1_compat_count(void)
+{
+	return 0;
+}
 
 Size
 cluster_shmem_get_total_bytes(void)
