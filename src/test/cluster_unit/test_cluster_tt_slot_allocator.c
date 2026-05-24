@@ -401,42 +401,62 @@ UT_TEST(test_t18_wrap_unchanged_same_xid_reuse)
 
 UT_TEST(test_t19_recycle_committed_bumps_wrap)
 {
-	/* No public API mutates status to COMMITTED in spec-3.4b yet (spec-3.4c
-	 * eager cleanout introduces it).  We exercise the path by patching
-	 * the shmem entry directly via internal layout knowledge (acceptable
-	 * because this is a unit test that controls the shmem buffer). */
-	struct
-	{
-		uint8 _entries[8 * 48];	/* matches ClusterTTSlotAllocEntry sizeof * count */
-	} _ignore pg_attribute_unused();
+	/*
+	 * L189 recycle policy: when no FREE slot is available, the allocator
+	 * must recycle a COMMITTED slot, bumping its wrap counter on the way.
+	 * We use the test-only force_status helper to drive a slot into
+	 * COMMITTED, fill the rest of the 48 slots with distinct ACTIVE xids,
+	 * then watch a fresh alloc choose the recyclable slot + bump wrap.
+	 */
+	uint16 first_off;
+	uint16 wrap_before;
+	int i;
+	uint16 recycled_off;
+	uint16 wrap_after;
 
 	reset_allocator();
-	(void) cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 100);
+	first_off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 100);
+	wrap_before = cluster_tt_slot_get_wrap(NODE0_SEG, first_off);
 
-	/* Hack: stamp slot 0 as COMMITTED so allocator must recycle it.
-	 * Entry layout (per cluster_tt_slot.c): xid(4) + wrap(2) + status(1) + pad(1).
-	 * Node 0's per-segment block sits at offset sizeof(LWLock) + sizeof(uint32)
-	 * inside per_node[0] = lock + segment_id + slots[48].  Rather than chase
-	 * struct offsets, we use the public API path: fill all 48 with distinct
-	 * xids, then mark one COMMITTED via direct shmem peek (the entries are
-	 * packed; for the unit test we just verify the user-visible side effect
-	 * via _free + alloc cycle as in T17 — full recycle wrap++ behaviour
-	 * has a TAP-level coverage gap we sink in Step 15 Hardening v1.0.X). */
-	UT_ASSERT_EQ(1, 1);
+	/* Mark slot 0 as COMMITTED. */
+	cluster_tt_slot_test_force_status(NODE0_SEG, first_off, 2 /* CTS_COMMITTED */);
+
+	/* Fill the remaining 47 slots with distinct ACTIVE xids so no FREE
+	 * slot remains; the next alloc must recycle the COMMITTED one. */
+	for (i = 1; i < TT_SLOTS_PER_SEGMENT; i++)
+		(void) cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)(2000 + i));
+
+	/* Fresh xid alloc -- only recyclable slot is slot first_off (COMMITTED). */
+	recycled_off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 99999);
+	UT_ASSERT_EQ((int) recycled_off, (int) first_off);
+
+	wrap_after = cluster_tt_slot_get_wrap(NODE0_SEG, recycled_off);
+	UT_ASSERT_EQ((int) (wrap_after > wrap_before), 1);
 }
 
 UT_TEST(test_t20_recycle_aborted_bumps_wrap)
 {
-	/* Same coverage gap as T19 — recycle requires status COMMITTED or
-	 * ABORTED, neither of which the public allocator API mutates today.
-	 * spec-3.4c cleanout will exercise this; smoke that the slot still
-	 * usable. */
-	uint16 off;
+	/* L189 recycle: same as T19 but with ABORTED status. */
+	uint16 first_off;
+	uint16 wrap_before;
+	int i;
+	uint16 recycled_off;
+	uint16 wrap_after;
 
 	reset_allocator();
-	off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 100);
-	cluster_tt_slot_free(NODE0_SEG, off);
-	UT_ASSERT_EQ((int) cluster_tt_slot_get_wrap(NODE0_SEG, off), 0);
+	first_off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 100);
+	wrap_before = cluster_tt_slot_get_wrap(NODE0_SEG, first_off);
+
+	cluster_tt_slot_test_force_status(NODE0_SEG, first_off, 3 /* CTS_ABORTED */);
+
+	for (i = 1; i < TT_SLOTS_PER_SEGMENT; i++)
+		(void) cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)(3000 + i));
+
+	recycled_off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 99998);
+	UT_ASSERT_EQ((int) recycled_off, (int) first_off);
+
+	wrap_after = cluster_tt_slot_get_wrap(NODE0_SEG, recycled_off);
+	UT_ASSERT_EQ((int) (wrap_after > wrap_before), 1);
 }
 
 UT_TEST(test_t21_own_active_reuse_no_wrap_bump)

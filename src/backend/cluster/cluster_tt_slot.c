@@ -383,3 +383,36 @@ cluster_tt_slot_reset_all(void)
 		LWLockRelease(&seg->lock);
 	}
 }
+
+
+/*
+ * cluster_tt_slot_test_force_status -- test-only helper to drive the
+ * L189 recycle policy (COMMITTED / ABORTED slots become recyclable).
+ *
+ *	Production code MUST NOT call this.  Production transitions to
+ *	COMMITTED/ABORTED status happen via spec-3.4c eager cleanout (not
+ *	yet wired).
+ */
+void
+cluster_tt_slot_test_force_status(uint32 segment_id, uint16 slot_offset,
+								  uint8 new_status)
+{
+	ClusterTTSlotAllocPerSegment *seg;
+
+	if (slot_offset >= TT_SLOTS_PER_SEGMENT)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("cluster_tt_slot_test_force_status: slot_offset %u out of range",
+						slot_offset)));
+	if (new_status != CTS_COMMITTED && new_status != CTS_ABORTED)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("cluster_tt_slot_test_force_status: new_status must be %u or %u",
+						(unsigned) CTS_COMMITTED, (unsigned) CTS_ABORTED)));
+
+	seg = cluster_tt_slot_get_or_init(segment_id);
+
+	LWLockAcquire(&seg->lock, LW_EXCLUSIVE);
+	seg->slots[slot_offset].status = new_status;
+	LWLockRelease(&seg->lock);
+}

@@ -327,4 +327,22 @@ extern void cluster_tt_slot_shmem_register(void);
 extern void cluster_tt_slot_reset_all(void);
 
 
+/*
+ * Test-only: forcibly transition a slot's status to COMMITTED or ABORTED.
+ *
+ *	spec-3.4b allocator does not yet expose a public mark_committed /
+ *	mark_aborted API — those transitions happen via the spec-3.4c eager
+ *	cleanout path which is not yet wired.  cluster_unit harness uses this
+ *	helper to drive the L189 recycle policy (alloc returns a recycled
+ *	COMMITTED/ABORTED slot with wrap++).
+ *
+ *	Production code MUST NOT call this.
+ *
+ *	new_status: 2 = COMMITTED, 3 = ABORTED (matches CTS_COMMITTED /
+ *	CTS_ABORTED enum values inside cluster_tt_slot.c).
+ */
+extern void cluster_tt_slot_test_force_status(uint32 segment_id, uint16 slot_offset,
+											  uint8 new_status);
+
+
 #endif /* CLUSTER_TT_SLOT_H */
