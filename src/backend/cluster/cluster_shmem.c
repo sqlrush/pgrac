@@ -80,6 +80,7 @@
 #include "cluster/cluster_sinval.h"			 /* cluster_sinval_module_init (spec-2.38 D2/D3) */
 #include "cluster/cluster_tt_status.h"		 /* cluster_tt_status_shmem_register (spec-3.1 D2) */
 #include "cluster/cluster_tt_local.h"		 /* cluster_tt_local_shmem_register (spec-3.1 D5) */
+#include "cluster/cluster_tt_slot.h"		 /* cluster_tt_slot_shmem_register (spec-3.4b D3) */
 #include "cluster/cluster_tt_status_hint.h" /* cluster_tt_status_hint_shmem_register (spec-3.2 D3) */
 #include "cluster/cluster_visibility_inject.h" /* cluster_visibility_inject_shmem_register (spec-3.2 D5b) */
 #include "cluster/cluster_qvotec.h" /* cluster_qvotec_shmem_register (spec-2.6 Sprint A Step 1) */
@@ -424,6 +425,15 @@ cluster_init_shmem_module(void)
 		cluster_tt_local_shmem_register();
 
 	/*
+	 * spec-3.4b D3:  register per-segment TT slot allocator shmem
+	 * (per-node 48-slot table + per-node LWLock).  Production cluster
+	 * path real allocator replaces the spec-3.1 provisional
+	 * tt_slot_id minting.
+	 */
+	if (cluster_shmem_lookup_region("pgrac cluster tt slot allocator") == NULL)
+		cluster_tt_slot_shmem_register();
+
+	/*
 	 * spec-3.2 D3:  register cluster_tt_status_hint outbound ring +
 	 * counters shmem (LMON-mediated fanout;  HC185 producer mask).
 	 */
@@ -688,6 +698,18 @@ cluster_init_shmem(void)
 		region.init_fn();
 		CLUSTER_INJECTION_POINT("cluster-shmem-region-init-post");
 	}
+
+	/*
+	 * spec-3.4b D8 / Q4 HC (L191): code-enforced automatic flush of the
+	 * cluster TT status overlay immediately after all shmem regions are
+	 * initialised.  Postmaster bootstrap path; backend forks inherit the
+	 * cleaned HTAB.  This is the only correctness guarantee that
+	 * production reader / spec-3.2 D5 fork never consumes stale provisional
+	 * spec-3.1/3.2/3.3/3.4a overlay entries during the spec-3.4b activation
+	 * boundary.  reconfig epoch bump (cluster_reconfig.c:571) remains as
+	 * runtime fallback only.
+	 */
+	cluster_tt_status_flush_all_at_activation();
 
 	/*
 	 * Stage 0.19: parse pgrac.conf into ClusterConfShmem.  Must run

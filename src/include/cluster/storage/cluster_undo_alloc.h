@@ -38,10 +38,43 @@
 
 
 /*
- * Stage 1.22 single-node owner constant.  cluster_node_id = 0 (default
- * single-node setting) + 1 = 1.  Stage 2+ extends to multi-instance.
+ * CLUSTER_UNDO_OWNER_INVALID — owner_instance sentinel meaning "absent /
+ * not yet allocated".  Renamed from CLUSTER_UNDO_DEFAULT_OWNER (which was
+ * spec-1.22's single-node hard-coded owner = 1) when spec-3.4b D2 unlocked
+ * the multi-instance allocator.  Real allocator callers MUST pass an
+ * owner_instance in [1, UNDO_OWNER_INSTANCE_MAX].
+ *
+ *	Spec: spec-3.4b-real-tt-allocator-uba-encoding-production-cross-node.md
  */
-#define CLUSTER_UNDO_DEFAULT_OWNER ((uint8)1)
+#define CLUSTER_UNDO_OWNER_INVALID ((uint8) 0)
+
+
+/*
+ * CLUSTER_UNDO_SEGS_PER_INSTANCE — segment-id range reserved per owning
+ * node, used by spec-3.4b cluster_uba_origin_node_id() to derive the
+ * owner node from a UBA segment_id in O(1) without reading the on-disk
+ * segment header.
+ *
+ *	Encoding:
+ *	    segment_id = (owner_instance - 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE
+ *	                + per_instance_slot + 1     (per_instance_slot in [0, N))
+ *	    owner_instance(segment_id) = ((segment_id - 1)
+ *	                                   / CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1
+ *
+ *	With N = 256 and max owner_instance = UNDO_OWNER_INSTANCE_MAX = 128,
+ *	max segment_id = 128 * 256 = 32768, which is comfortably inside
+ *	UINT16_MAX -- the spec-3.4b F4 exact-key alias guard requires
+ *	segment_id <= UINT16_MAX so the 16-bit fields in
+ *	ClusterUndoTTSlotRef / ClusterTTStatusKey don't silently truncate.
+ *
+ *	Backward-compat with spec-1.22 single-node:
+ *	    cluster_node_id = 0  →  owner_instance = 1  →  per-node range
+ *	    [1, 256].  Today spec-1.22 only allocates segment_id = 1, which
+ *	    maps back to owner_instance = 1 ✓.
+ *
+ *	Spec: spec-3.4b-real-tt-allocator-uba-encoding-production-cross-node.md
+ */
+#define CLUSTER_UNDO_SEGS_PER_INSTANCE ((uint32) 256)
 
 
 /*
@@ -65,27 +98,59 @@ extern int cluster_undo_path_resolve(uint8 instance, uint32 segment_id, char *bu
  *	  undo segment file.
  *
  *	  Behavior:
- *	    1. Open or create $PGDATA/pg_undo/instance_<N>/seg_<segment_id>.dat
- *	       with O_CREAT | O_RDWR.  If the file already exists, returns
- *	       silently (idempotent allocation; useful for crash-recovery
- *	       replay paths and Stage 2+ SCN-driven multi-instance).
- *	    2. Use the frontend-safe helper to fill an 8 KB buffer with the
- *	       freshly-allocated UndoSegmentHeaderData layout.
- *	    3. Lock + extend the file to UNDO_SEGMENT_SIZE_BYTES (64 MB).
- *	    4. pwrite the header to block 0 + fsync.
- *	    5. Emit XLOG_UNDO_SEGMENT_INIT (RM_CLUSTER_UNDO) so crash recovery
+ *	    1. Validate owner_instance + segment_id (spec-3.4b D2):
+ *	         - owner_instance in [1, UNDO_OWNER_INSTANCE_MAX]
+ *	         - owner_instance == cluster_node_id + 1 (node may only
+ *	           allocate its own segments)
+ *	         - segment_id != 0 (bootstrap-only sentinel)
+ *	         - segment_id <= UINT16_MAX (F4 exact-key alias guard)
+ *	         - segment_id within the node's reserved range, i.e.
+ *	           ((segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1
+ *	           must equal owner_instance.
+ *	    2. Resolve path, ensure parent dir, open-or-create file.
+ *	    3. Generate the 8 KB header bytes via the shared helper.
+ *	    4. ftruncate to UNDO_SEGMENT_SIZE_BYTES.
+ *	    5. pwrite block 0 + fsync + close + fsync parent dir.
+ *	    6. Emit XLOG_UNDO_SEGMENT_INIT (RM_CLUSTER_UNDO) so crash recovery
  *	       reapplies the same byte layout if the page is lost.
  *
- *	  Stage 1.22 limitations:
- *	    - owner_instance MUST equal CLUSTER_UNDO_DEFAULT_OWNER (1);
- *	      cross-instance allocation rejected with FEATURE_NOT_SUPPORTED.
- *	    - segment_size_bytes is hard-coded to UNDO_SEGMENT_SIZE_BYTES;
- *	      retention / sub-segment / extent layout deferred to feature-117.
+ *	  spec-3.4b D2 unlock: the previous Stage 1.22 single-node restriction
+ *	  (owner_instance must equal 1) is removed.  The remaining restriction
+ *	  is "owner_instance == cluster_node_id + 1" so a node never writes
+ *	  another node's segment directory.
  *
  *	  Caller MUST NOT be inside a critical section: function emits WAL
- *	  via XLogInsert + may ereport(ERROR) on path / I/O failures.
+ *	  via XLogInsert + may ereport(ERROR) on validation / I/O failures.
  */
 extern void cluster_undo_segment_allocate(uint32 segment_id, uint8 owner_instance);
+
+
+/*
+ * cluster_undo_active_segment_for_node_or_create
+ *
+ *	  Return the segment_id of this node's currently-active undo segment,
+ *	  creating it on first call (idempotent thanks to the underlying
+ *	  cluster_undo_segment_allocate).
+ *
+ *	  spec-3.4b MVP: each node uses a single active segment whose id is
+ *	  fixed at `per_instance_slot = 0`, i.e.
+ *
+ *	      segment_id = node_id * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1
+ *
+ *	  This gives node 0 → segment_id 1 (backward-compat with spec-1.22's
+ *	  single-allocated segment), node 1 → segment_id 257, etc.  All
+ *	  resulting segment_ids fall comfortably within the F4 alias guard
+ *	  (max = 128 * 256 = 32768 < UINT16_MAX).
+ *
+ *	  Failure modes (all ereport(ERROR), no provisional fallback per F7):
+ *	    - node_id outside [0, SCN_MAX_VALID_NODE_ID]
+ *	    - derived owner_instance outside [1, UNDO_OWNER_INSTANCE_MAX]
+ *	    - underlying cluster_undo_segment_allocate raises
+ *
+ *	  Caller MUST NOT be inside a critical section (transitively via
+ *	  cluster_undo_segment_allocate).
+ */
+extern uint32 cluster_undo_active_segment_for_node_or_create(int node_id);
 
 
 #endif /* CLUSTER_UNDO_ALLOC_H */

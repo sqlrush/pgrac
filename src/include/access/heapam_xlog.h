@@ -438,7 +438,7 @@ extern XLogRecPtr log_heap_visible(Relation rel, Buffer heap_buffer,
 
 #ifdef USE_PGRAC_CLUSTER
 
-#include "cluster/cluster_itl_slot.h"		/* ClusterItlFlags */
+#include "cluster/cluster_itl_slot.h"		/* ClusterItlFlags + UBA */
 #include "cluster/cluster_scn.h"			/* SCN */
 
 /*
@@ -499,12 +499,73 @@ typedef struct xl_heap_itl_delta_block
 {
 	uint16			ndeltas;		/* offset 0, 2B */
 	uint16			reserved;		/* offset 2, 2B (zero) */
-	uint32			_pad;			/* offset 4, 4B (zero; alignment) */
+	uint32			format_version;	/* offset 4, 4B (spec-3.4a: 0; spec-3.4b: 1; F9) */
 	xl_heap_itl_delta deltas[FLEXIBLE_ARRAY_MEMBER];
 } xl_heap_itl_delta_block;
 
 StaticAssertDecl(offsetof(xl_heap_itl_delta_block, deltas) == 8,
 				 "spec-3.4a D7 — block-local array header is 8 bytes (4 + 4B pad for SCN alignment)");
+
+
+/*
+ * PGRAC (spec-3.4b D6, F9): v2 ITL delta carries the real UBA bytes
+ * (`undo_segment_head`) so crash recovery preserves the spec-3.4b
+ * production cross-node visibility chain.
+ *
+ *	Wire format dispatch in heap_redo:
+ *	  xl_heap_itl_delta_block.format_version == 0  →  legacy v1 (24B
+ *	    deltas; UBA is restored to InvalidUba, reader 3-branch (D7)
+ *	    falls back to zero triple → PG-native).
+ *	  xl_heap_itl_delta_block.format_version == 1  →  v2 (40B deltas;
+ *	    UBA bytes restored from delta).
+ *	  Other values  →  PANIC (corruption).
+ *
+ *	Wire-stable layout (cluster_unit test_cluster_itl_wal enforces):
+ *	  xl_heap_itl_delta_v2 (40 bytes):
+ *	    offset  0,  2B : slot_idx
+ *	    offset  2,  2B : flags_after
+ *	    offset  4,  4B : xid
+ *	    offset  8,  8B : write_scn
+ *	    offset 16,  8B : commit_scn
+ *	    offset 24, 16B : undo_segment_head (UBA; InvalidUba on
+ *	                     COMMITTED/ABORTED finish deltas where the
+ *	                     binding is already on the page from the
+ *	                     ACTIVE delta -- redo MUST overwrite the slot
+ *	                     UBA only when the delta's UBA is non-Invalid)
+ *
+ *	COMMITTED/ABORTED finish deltas may emit InvalidUba so legacy v1
+ *	semantics (UBA carried on ACTIVE only) are preserved at redo time.
+ *	Redo restores UBA only when the delta carries non-Invalid bytes; a
+ *	finish delta with InvalidUba leaves the page's existing UBA intact.
+ */
+#define CLUSTER_ITL_DELTA_FORMAT_V1 ((uint32) 0)
+#define CLUSTER_ITL_DELTA_FORMAT_V2 ((uint32) 1)
+
+typedef struct xl_heap_itl_delta_v2
+{
+	uint16			slot_idx;			/* offset 0,  2B */
+	uint16			flags_after;		/* offset 2,  2B (ClusterItlFlags) */
+	TransactionId	xid;				/* offset 4,  4B */
+	SCN				write_scn;			/* offset 8,  8B */
+	SCN				commit_scn;			/* offset 16, 8B */
+	UBA				undo_segment_head;	/* offset 24, 16B */
+} xl_heap_itl_delta_v2;
+
+StaticAssertDecl(sizeof(xl_heap_itl_delta_v2) == 40,
+				 "spec-3.4b D6 F9 — xl_heap_itl_delta_v2 must be 40 bytes");
+StaticAssertDecl(offsetof(xl_heap_itl_delta_v2, slot_idx) == 0,
+				 "spec-3.4b D6 — slot_idx at offset 0");
+StaticAssertDecl(offsetof(xl_heap_itl_delta_v2, flags_after) == 2,
+				 "spec-3.4b D6 — flags_after at offset 2");
+StaticAssertDecl(offsetof(xl_heap_itl_delta_v2, xid) == 4,
+				 "spec-3.4b D6 — xid at offset 4");
+StaticAssertDecl(offsetof(xl_heap_itl_delta_v2, write_scn) == 8,
+				 "spec-3.4b D6 — write_scn at offset 8");
+StaticAssertDecl(offsetof(xl_heap_itl_delta_v2, commit_scn) == 16,
+				 "spec-3.4b D6 — commit_scn at offset 16");
+StaticAssertDecl(offsetof(xl_heap_itl_delta_v2, undo_segment_head) == 24,
+				 "spec-3.4b D6 — undo_segment_head at offset 24");
+
 
 #endif							/* USE_PGRAC_CLUSTER */
 

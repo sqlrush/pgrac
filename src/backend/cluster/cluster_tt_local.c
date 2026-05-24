@@ -46,8 +46,10 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_tt_local.h"
+#include "cluster/cluster_tt_slot.h"			/* spec-3.4b D4 real binding */
 #include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_tt_status_hint.h" /* spec-3.2 D4 wire emit append */
+#include "cluster/storage/cluster_undo_alloc.h" /* cluster_undo_active_segment_for_node_or_create */
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -105,41 +107,204 @@ cluster_tt_local_shmem_register(void)
 /* ------------------------------------------------------------ */
 
 /*
- * mint_provisional_tt_slot_id -- monotonic counter; 0 reserved invalid,
- * wraparound -> 1 (spec-3.1 v0.4 N6).
+ * spec-3.1 D5 monotonic provisional `tt_slot_id` mint
+ * (mint_provisional_tt_slot_id) was removed in spec-3.4b D4 / F7:
+ * production install paths now route exclusively through the real
+ * allocator binding below (cluster_tt_local_get_or_create_binding).
+ * The pg_atomic_uint32 slot_seq counter still lives in shmem for
+ * the peek introspection used by test_cluster_tt_status (D9 T17).
  */
-static uint32
-mint_provisional_tt_slot_id(void)
-{
-	uint32 v;
 
-	if (ClusterTTLocalState == NULL)
-		return 0;
 
-	v = pg_atomic_fetch_add_u32(&ClusterTTLocalState->slot_seq, 1);
-	if (v == 0) {
-		/* Just consumed value 0; mint next and skip. */
-		v = pg_atomic_fetch_add_u32(&ClusterTTLocalState->slot_seq, 1);
-		if (v == 0)
-			v = 1;
-	}
-	return v;
-}
+/* ------------------------------------------------------------ */
+/* spec-3.4b D4 — xact-local real TT binding (F11)              */
+/* ------------------------------------------------------------ */
 
 /*
- * build_local_key -- compose a provisional ClusterTTStatusKey for the
- * given xid using local origin / current epoch / minted tt_slot_id.
+ * Backend-local binding state.  Lives in static module storage so it
+ * survives across DML statements within the same xact but is wiped on
+ * end-of-xact via cluster_tt_local_reset_binding().  Postmaster restart
+ * clears shmem TT slot state and any next backend starts fresh.
+ *
+ * F11 key invariant: every ITL slot stamped by this xact (D5) AND the
+ * commit / abort install_status call (this file) MUST produce the same
+ * ClusterTTStatusKey bytes.  Achieved by routing both through
+ * cluster_tt_local_get_or_create_binding() / build_local_key().
  */
-static void
+typedef struct ClusterTTLocalBinding
+{
+	TransactionId top_xid;	/* InvalidTransactionId == no binding */
+	uint32 segment_id;
+	uint16 slot_offset;
+	uint16 _pad;
+	uint32 cluster_epoch;	/* snapshot at bind time */
+} ClusterTTLocalBinding;
+
+static ClusterTTLocalBinding cluster_tt_local_binding = {
+	InvalidTransactionId, 0, 0, 0, 0
+};
+
+
+/*
+ * cluster_tt_local_get_or_create_binding
+ *
+ *	Public entry point for heap DML (D5).  On first call within an
+ *	xact, allocates a real TT slot via cluster_tt_slot_alloc().  On
+ *	subsequent calls within the same xact, returns the cached binding.
+ *
+ *	Returns true when binding is available (caller proceeds with UBA
+ *	encode); returns false when cluster mode is disabled or xid is not
+ *	a normal transaction id (caller falls back to PG-native silent
+ *	per spec-3.4a A6).  F7: NO provisional fallback on allocator
+ *	failure -- raises ERROR fail-closed.
+ *
+ *	Caller MUST NOT be inside a critical section: this function may
+ *	take LWLocks (allocator) and call cluster_undo_segment_allocate
+ *	(which emits WAL on first segment creation).
+ */
+bool
+cluster_tt_local_get_or_create_binding(TransactionId top_xid,
+									   uint32 *out_segment_id,
+									   uint16 *out_slot_offset,
+									   uint32 *out_tt_slot_id)
+{
+	uint32 seg;
+	uint16 off;
+
+	if (!cluster_enabled || cluster_node_id < 0)
+		return false;
+	if (!TransactionIdIsNormal(top_xid))
+		return false;
+
+	if (cluster_tt_local_binding.top_xid == top_xid)
+	{
+		/* Idempotent reuse. */
+		*out_segment_id = cluster_tt_local_binding.segment_id;
+		*out_slot_offset = cluster_tt_local_binding.slot_offset;
+		*out_tt_slot_id = cluster_tt_slot_offset_to_id(cluster_tt_local_binding.slot_offset);
+		return true;
+	}
+
+	if (TransactionIdIsValid(cluster_tt_local_binding.top_xid))
+	{
+		/*
+		 * Stale binding from a prior xact that did not call reset
+		 * (should not happen in production -- xact.c always calls
+		 * record_commit/abort -> reset on commit/abort).  Best-effort
+		 * cleanup: free the orphaned slot then re-allocate.
+		 */
+		elog(WARNING,
+			 "cluster_tt_local: stale binding for xid %u while allocating for xid %u; "
+			 "freeing orphan",
+			 cluster_tt_local_binding.top_xid, top_xid);
+		cluster_tt_slot_free(cluster_tt_local_binding.segment_id,
+							 cluster_tt_local_binding.slot_offset);
+		cluster_tt_local_binding.top_xid = InvalidTransactionId;
+	}
+
+	seg = cluster_undo_active_segment_for_node_or_create(cluster_node_id);
+	off = cluster_tt_slot_alloc(seg, top_xid);
+	if (off == INVALID_TT_SLOT_OFFSET)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("cluster TT slot allocator exhausted on segment %u (48 slots full)",
+						seg),
+				 errhint("All concurrent xacts on this node hold ACTIVE slots; retry after "
+						 "shorter transactions commit or abort.")));
+
+	cluster_tt_local_binding.top_xid = top_xid;
+	cluster_tt_local_binding.segment_id = seg;
+	cluster_tt_local_binding.slot_offset = off;
+	cluster_tt_local_binding.cluster_epoch = (uint32) cluster_epoch_get_current();
+
+	*out_segment_id = seg;
+	*out_slot_offset = off;
+	*out_tt_slot_id = cluster_tt_slot_offset_to_id(off);
+	return true;
+}
+
+
+/*
+ * cluster_tt_local_peek_binding
+ *
+ *	Read-only accessor: returns true + fills outs if a binding exists
+ *	for `top_xid`, false otherwise.  Used by install_status to skip the
+ *	overlay install when no DML ever ran (DDL-only xact path).
+ */
+bool
+cluster_tt_local_peek_binding(TransactionId top_xid,
+							  uint32 *out_segment_id,
+							  uint16 *out_slot_offset,
+							  uint32 *out_tt_slot_id,
+							  uint32 *out_cluster_epoch)
+{
+	if (cluster_tt_local_binding.top_xid != top_xid
+		|| !TransactionIdIsValid(top_xid))
+		return false;
+
+	*out_segment_id = cluster_tt_local_binding.segment_id;
+	*out_slot_offset = cluster_tt_local_binding.slot_offset;
+	*out_tt_slot_id = cluster_tt_slot_offset_to_id(cluster_tt_local_binding.slot_offset);
+	*out_cluster_epoch = cluster_tt_local_binding.cluster_epoch;
+	return true;
+}
+
+
+/*
+ * cluster_tt_local_reset_binding
+ *
+ *	Free the TT slot and clear the binding.  Idempotent.  Called from
+ *	record_commit / record_abort after install_status fires, and as a
+ *	safety net from XactCallback in case those paths are skipped.
+ */
+void
+cluster_tt_local_reset_binding(void)
+{
+	if (!TransactionIdIsValid(cluster_tt_local_binding.top_xid))
+		return;
+
+	cluster_tt_slot_free(cluster_tt_local_binding.segment_id,
+						 cluster_tt_local_binding.slot_offset);
+
+	cluster_tt_local_binding.top_xid = InvalidTransactionId;
+	cluster_tt_local_binding.segment_id = 0;
+	cluster_tt_local_binding.slot_offset = 0;
+	cluster_tt_local_binding.cluster_epoch = 0;
+}
+
+
+/*
+ * build_local_key -- compose ClusterTTStatusKey for `xid`.
+ *
+ *	Returns true with the key populated when an xact-local binding
+ *	exists for `xid` (F11 real allocator path); returns false otherwise
+ *	and leaves `*out` zeroed.  spec-3.4b F7: production code paths MUST
+ *	NOT take a provisional id when the binding is absent -- this would
+ *	create a real/provisional key collision risk.  Callers should
+ *	silently skip install when build_local_key returns false (the
+ *	matching DML never stamped an ITL slot, so no overlay entry is
+ *	needed).
+ */
+static bool
 build_local_key(TransactionId xid, ClusterTTStatusKey *out)
 {
+	uint32 seg;
+	uint16 off;
+	uint32 tt_id;
+	uint32 epoch;
+
 	memset(out, 0, sizeof(*out));
-	out->origin_node_id = (uint16)cluster_node_id;
-	out->undo_segment_id = 0;
-	out->tt_slot_id = mint_provisional_tt_slot_id();
-	out->cluster_epoch = (uint32)cluster_epoch_get_current();
+
+	if (!cluster_tt_local_peek_binding(xid, &seg, &off, &tt_id, &epoch))
+		return false;
+
+	out->origin_node_id = (uint16) cluster_node_id;
+	out->undo_segment_id = (uint16) seg;
+	out->tt_slot_id = tt_id;
+	out->cluster_epoch = epoch;
 	out->local_xid = xid;
 	/* _reserved + _reserved2 already zero from memset. */
+	return true;
 }
 
 /*
@@ -163,7 +328,14 @@ install_status(TransactionId xid, ClusterTTStatus status, SCN commit_scn)
 	if (!TransactionIdIsNormal(xid))
 		return;
 
-	build_local_key(xid, &key);
+	/*
+	 * spec-3.4b D4 + F7 + F11: only install when an xact-local binding
+	 * exists.  No binding ⇒ this xact never stamped an ITL slot
+	 * (DDL-only or read-only); no overlay entry is needed and the
+	 * provisional fallback path is forbidden in production.
+	 */
+	if (!build_local_key(xid, &key))
+		return;
 
 	/*
 	 * spec-3.3 D6 (L181 chain step 2): install in-memory overlay entry
@@ -205,12 +377,22 @@ void
 cluster_tt_local_record_commit(TransactionId xid, SCN commit_scn)
 {
 	install_status(xid, CLUSTER_TT_STATUS_COMMITTED, commit_scn);
+	/*
+	 * spec-3.4b D4 / F11: free the binding's TT slot once the overlay
+	 * entry has been installed.  Subsequent xacts on this backend will
+	 * allocate a fresh binding via get_or_create_binding().  The overlay
+	 * entry's key references the just-freed slot offset, but the
+	 * ClusterTTStatusKey includes local_xid, so a future xact that
+	 * recycles the same slot offset will produce a different key.
+	 */
+	cluster_tt_local_reset_binding();
 }
 
 void
 cluster_tt_local_record_abort(TransactionId xid)
 {
 	install_status(xid, CLUSTER_TT_STATUS_ABORTED, InvalidScn);
+	cluster_tt_local_reset_binding();
 }
 
 uint32
@@ -255,5 +437,37 @@ cluster_tt_local_slot_seq_peek(void)
 {
 	return 0;
 }
+
+bool
+cluster_tt_local_get_or_create_binding(TransactionId top_xid,
+									   uint32 *out_segment_id,
+									   uint16 *out_slot_offset,
+									   uint32 *out_tt_slot_id)
+{
+	(void) top_xid;
+	(void) out_segment_id;
+	(void) out_slot_offset;
+	(void) out_tt_slot_id;
+	return false;
+}
+
+bool
+cluster_tt_local_peek_binding(TransactionId top_xid,
+							  uint32 *out_segment_id,
+							  uint16 *out_slot_offset,
+							  uint32 *out_tt_slot_id,
+							  uint32 *out_cluster_epoch)
+{
+	(void) top_xid;
+	(void) out_segment_id;
+	(void) out_slot_offset;
+	(void) out_tt_slot_id;
+	(void) out_cluster_epoch;
+	return false;
+}
+
+void
+cluster_tt_local_reset_binding(void)
+{}
 
 #endif /* USE_PGRAC_CLUSTER */

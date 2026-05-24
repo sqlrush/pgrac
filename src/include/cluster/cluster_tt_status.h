@@ -212,6 +212,17 @@ extern bool cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key,
 extern void cluster_tt_status_install_local(const ClusterTTStatusKey *key, ClusterTTStatus status,
 											SCN commit_scn);
 extern void cluster_tt_status_flush_all(uint32 new_epoch);
+
+/*
+ * cluster_tt_status_flush_all_at_activation:
+ *	  spec-3.4b D8 / Q4 HC (L191): code-enforced automatic flush wired
+ *	  into postmaster shmem init after the overlay HTAB region is set up.
+ *	  Guarantees no provisional spec-3.1/3.2/3.3/3.4a overlay entries
+ *	  survive into the spec-3.4b real-allocator era.  reconfig epoch
+ *	  flush remains as runtime fallback only.
+ */
+extern void cluster_tt_status_flush_all_at_activation(void);
+
 extern uint64 cluster_tt_status_generation(void);
 
 extern Size cluster_tt_status_shmem_size(void);

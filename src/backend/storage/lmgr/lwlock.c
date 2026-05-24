@@ -230,6 +230,8 @@ static const char *const BuiltinTrancheNames[] = {
 	"ClusterSinval",
 	/* PGRAC LWTRANCHE_CLUSTER_TT_STATUS: spec-3.1 D2 Undo TT status overlay HTAB */
 	"ClusterTTStatus",
+	/* PGRAC LWTRANCHE_CLUSTER_TT_SLOT: spec-3.4b D3 per-segment TT slot allocator */
+	"ClusterTTSlot",
 #endif
 };
 

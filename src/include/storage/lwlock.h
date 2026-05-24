@@ -325,6 +325,10 @@ typedef enum BuiltinTrancheIds {
 	/* PGRAC: spec-3.1 D2 — Undo TT status overlay HTAB (single-partition;
 	 * EXCLUSIVE for install/flush, SHARED for lookup_exact). */
 	LWTRANCHE_CLUSTER_TT_STATUS,
+	/* PGRAC: spec-3.4b D3 — per-undo-segment TT slot allocator LWLock array.
+	 * One LWLock per segment guards alloc / free / wrap mutations of the
+	 * 48-entry TT slot array embedded in UndoSegmentHeader. */
+	LWTRANCHE_CLUSTER_TT_SLOT,
 #endif
 	LWTRANCHE_FIRST_USER_DEFINED
 } BuiltinTrancheIds;

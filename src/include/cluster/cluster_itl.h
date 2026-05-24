@@ -46,6 +46,7 @@
 #define CLUSTER_ITL_H
 
 #include "c.h"
+#include "access/htup.h"			   /* HeapTupleHeader forward typedef */
 #include "access/transam.h"			 /* TransactionId */
 #include "storage/buf.h"			 /* Buffer */
 #include "storage/bufpage.h"		 /* Page typedef */
@@ -119,14 +120,23 @@ extern bool cluster_itl_alloc_or_reuse_slot(Buffer buf, TransactionId top_xid, u
  *	  slot->wrap         <unchanged>
  *	  slot->flags        = ITL_FLAG_ACTIVE
  *	  slot->lock_count   <unchanged>
- *	  slot->undo_segment_head = InvalidUba (spec-3.4b populates)
+ *	  slot->undo_segment_head = undo_segment_head (spec-3.4b D5: real UBA
+ *	                            from uba_encode(seg, 0, slot_off, 0),
+ *	                            keyed to the xact-local TT binding;
+ *	                            InvalidUba when binding is unavailable)
  *	  slot->commit_scn   = InvalidScn
  *	  slot->write_scn    = write_scn (cluster_scn_advance())
- *	  slot->first_change_lsn = InvalidXLogRecPtr (spec-3.4b/c populates)
+ *	  slot->first_change_lsn = InvalidXLogRecPtr (spec-3.4c populates)
  *
  *	Marks the buffer dirty (caller still emits the WAL record).
+ *
+ *	spec-3.4b D5: `undo_segment_head` MUST be the same UBA bytes for
+ *	every stamp_active call within an xact (F11).  Heap callers pull
+ *	the binding from cluster_tt_local_get_or_create_binding() outside
+ *	the critical section and pass the encoded UBA in here.
  */
-extern void cluster_itl_stamp_active(Buffer buf, uint8 slot_idx, TransactionId xid, SCN write_scn);
+extern void cluster_itl_stamp_active(Buffer buf, uint8 slot_idx, TransactionId xid,
+									 SCN write_scn, UBA undo_segment_head);
 
 /*
  * cluster_itl_stamp_committed -- transition ACTIVE → COMMITTED with
@@ -166,5 +176,56 @@ extern void cluster_itl_stamp_aborted(Buffer buf, uint8 slot_idx);
  *	No-op if cluster_enabled is false.
  */
 extern void cluster_itl_check_subxact_or_error(void);
+
+
+/*
+ * cluster_itl_redo_apply_block_local_delta
+ *
+ *	spec-3.4b D6 / F9: redo helper that replays a single block-local ITL
+ *	delta array onto `page`, dispatching by format_version:
+ *
+ *	  format_version == CLUSTER_ITL_DELTA_FORMAT_V1 (spec-3.4a, 24B deltas):
+ *	      restore xid/flags/write_scn/commit_scn; leave the slot's
+ *	      undo_segment_head unchanged (legacy stamps carry InvalidUba on
+ *	      the page; reader 3-branch (D7) falls back to zero triple).
+ *	  format_version == CLUSTER_ITL_DELTA_FORMAT_V2 (spec-3.4b, 40B deltas):
+ *	      additionally restore undo_segment_head from delta.  When the
+ *	      delta carries InvalidUba (e.g., COMMITTED/ABORTED finish stamps
+ *	      that do not re-bind UBA), the slot's existing UBA is preserved.
+ *	  Any other value -> PANIC.
+ *
+ *	`itl_block_start` MUST point to the start of an
+ *	xl_heap_itl_delta_block (header + deltas) inside the WAL record's
+ *	MAIN data area.  `htup` may be NULL when the caller has no tuple
+ *	header to patch with the slot index; otherwise its t_itl_slot_idx
+ *	is set to the last delta's slot_idx (spec-3.4a A9 L187).
+ *
+ *	Returns the total number of bytes consumed in the WAL record.
+ */
+extern Size cluster_itl_redo_apply_block_local_delta(Page page,
+													 HeapTupleHeader htup,
+													 const char *itl_block_start);
+
+/*
+ * cluster_itl_wal_block_consumed_bytes
+ *
+ *	spec-3.4b D6: utility to compute the WAL size of an ITL delta block
+ *	without applying it.  Dispatches by format_version (v1 24B / v2 40B).
+ *	Used by heap_xlog_update cross-page redo to skip the NEW block's
+ *	delta array before locating the OLD block's array.
+ */
+extern Size cluster_itl_wal_block_consumed_bytes(const char *itl_block_start);
+
+/*
+ * cluster_itl_wal_block_first_slot_idx
+ *
+ *	spec-3.4b D6: utility to read the first delta's slot_idx without
+ *	full apply.  Both v1 and v2 layouts put slot_idx at offset 0 of the
+ *	delta entry, so this is a format-agnostic uint16 read.  Used by
+ *	heap_xlog_{insert,multi_insert,update} to patch the freshly-built
+ *	tuple header's t_itl_slot_idx BEFORE PageAddItem (spec-3.4a A9 L187).
+ */
+extern uint16 cluster_itl_wal_block_first_slot_idx(const char *itl_block_start);
+
 
 #endif /* CLUSTER_ITL_H */

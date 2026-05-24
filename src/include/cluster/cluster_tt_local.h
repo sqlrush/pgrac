@@ -70,6 +70,42 @@ extern void cluster_tt_local_record_abort(TransactionId xid);
  */
 extern uint32 cluster_tt_local_slot_seq_peek(void);
 
+
+/*
+ * spec-3.4b D4 — xact-local real TT binding (F11).
+ *
+ *	Heap DML callsites (D5) invoke cluster_tt_local_get_or_create_binding
+ *	*before* entering the critical section.  First call within an xact
+ *	allocates a real (segment_id, slot_offset) tuple via the per-segment
+ *	allocator; subsequent calls within the same xact return the cached
+ *	binding.  cluster_tt_local_record_commit / _abort consume the same
+ *	binding when installing the overlay entry, then reset it via
+ *	cluster_tt_local_reset_binding().
+ *
+ *	F7: NO provisional fallback on allocator OVERFLOW -- the helper
+ *	raises ERROR fail-closed; caller MUST NOT install via the provisional
+ *	mint path.
+ *
+ *	Returns true and fills outs when binding is available; returns false
+ *	(without raising) when cluster mode is disabled or top_xid is not a
+ *	normal transaction id (caller falls back to PG-native silent per
+ *	spec-3.4a A6).
+ */
+extern bool cluster_tt_local_get_or_create_binding(TransactionId top_xid,
+												   uint32 *out_segment_id,
+												   uint16 *out_slot_offset,
+												   uint32 *out_tt_slot_id);
+
+/* Read-only accessor; does not allocate. */
+extern bool cluster_tt_local_peek_binding(TransactionId top_xid,
+										  uint32 *out_segment_id,
+										  uint16 *out_slot_offset,
+										  uint32 *out_tt_slot_id,
+										  uint32 *out_cluster_epoch);
+
+/* Free the bound TT slot and clear the binding (idempotent). */
+extern void cluster_tt_local_reset_binding(void);
+
 /*
  * Shmem helpers (the monotonic counter lives in shmem so EXEC_BACKEND
  * children share state with postmaster).

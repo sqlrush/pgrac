@@ -380,6 +380,18 @@ void
 cluster_visibility_inject_shmem_register(void)
 {}
 
+/* spec-3.4b D3 stub: cluster_init_shmem_module also calls
+ * cluster_tt_slot_shmem_register. */
+void
+cluster_tt_slot_shmem_register(void)
+{}
+
+/* spec-3.4b D8 stub: cluster_init_shmem additionally calls the Q4 HC
+ * activation flush after region iteration. */
+void
+cluster_tt_status_flush_all_at_activation(void)
+{}
+
 
 /*
  * Spec-1.10.1 D1 F1 stub: cluster_init_shmem_module also calls

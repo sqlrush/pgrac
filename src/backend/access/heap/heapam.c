@@ -83,6 +83,9 @@
 #include "cluster/cluster_itl_slot.h"	/* CLUSTER_ITL_SLOT_UNALLOCATED */
 #include "cluster/cluster_itl_touch.h"	/* xact-local touch list */
 #include "cluster/cluster_scn.h"		/* cluster_scn_advance / SCN */
+/* PGRAC (spec-3.4b D5): real UBA encode + xact-local TT binding. */
+#include "cluster/cluster_tt_local.h"	/* get_or_create_binding / peek_binding */
+#include "cluster/cluster_uba.h"		/* uba_encode */
 
 static inline bool
 cluster_itl_write_path_enabled(Relation relation)
@@ -92,8 +95,16 @@ cluster_itl_write_path_enabled(Relation relation)
 	 * SUBTRANS and local-buffer/temp relations are deferred; leaving the
 	 * tuple without an ITL slot keeps the existing PG-native path intact
 	 * instead of installing a partial cluster-visible status.
+	 *
+	 * spec-3.4b D9: tighten the node_id range from `>= 0` to the explicit
+	 * valid window [0, SCN_MAX_VALID_NODE_ID].  Multi-instance allocator
+	 * derivation paths (cluster_uba_origin_node_id / cluster_tt_slot)
+	 * cap the upper bound at 127; an out-of-range node_id would surface
+	 * as fail-closed ereport later, but rejecting it at the gate avoids
+	 * burning ITL slot capacity on an invalid configuration.
 	 */
-	return cluster_enabled && cluster_node_id >= 0
+	return cluster_enabled
+		   && cluster_node_id >= 0 && cluster_node_id <= SCN_MAX_VALID_NODE_ID
 		   && !RelationUsesLocalBuffers(relation)
 		   && GetCurrentTransactionNestLevel() <= 1;
 }
@@ -111,6 +122,8 @@ static XLogRecPtr log_heap_update(Relation reln, Buffer oldbuf,
 								  , TransactionId cluster_itl_xid
 								  , bool cluster_itl_old_active, uint8 cluster_itl_old_slot
 								  , bool cluster_itl_new_active, uint8 cluster_itl_new_slot
+								  /* spec-3.4b D6 — shared xact-local UBA */
+								  , UBA cluster_itl_uba
 #endif
 								  );
 #ifdef USE_ASSERT_CHECKING
@@ -1920,9 +1933,10 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	Buffer		vmbuffer = InvalidBuffer;
 	bool		all_visible_cleared = false;
 #ifdef USE_PGRAC_CLUSTER
-	/* PGRAC (spec-3.4a D3): hoisted to function scope per PG style. */
+	/* PGRAC (spec-3.4a D3 / spec-3.4b D5): hoisted to function scope per PG style. */
 	uint8		cluster_itl_slot = CLUSTER_ITL_SLOT_UNALLOCATED;
 	bool		cluster_itl_active = false;
+	UBA			cluster_itl_uba = InvalidUba_init;	/* spec-3.4b D5 real UBA */
 #endif
 
 	/* Cheap, simplistic check that the tuple matches the rel's rowtype. */
@@ -1980,6 +1994,21 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	 */
 	if (cluster_itl_write_path_enabled(relation) && PageHasItl(BufferGetPage(buffer)))
 	{
+		/*
+		 * spec-3.4b D5: get or create the xact-local TT binding (F11)
+		 * BEFORE allocating an ITL slot.  Binding allocator OVERFLOW
+		 * ereport(ERROR) lands here before any critical section is open.
+		 */
+		uint32 tt_seg;
+		uint16 tt_off;
+		uint32 tt_id_unused;
+
+		if (cluster_tt_local_get_or_create_binding(xid, &tt_seg, &tt_off, &tt_id_unused))
+			cluster_itl_uba = uba_encode(tt_seg, 0 /* block_no reserved */,
+										 tt_off, 0 /* row_off reserved */);
+		/* else: binding declined (e.g., not a normal xid); fall back to
+		 * InvalidUba — reader 3-branch (D7) will treat as legacy slot. */
+
 		if (!cluster_itl_alloc_or_reuse_slot(buffer, xid, &cluster_itl_slot))
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
@@ -2003,7 +2032,7 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	if (cluster_itl_active)
 	{
 		cluster_itl_stamp_active(buffer, cluster_itl_slot, xid,
-								 cluster_scn_advance());
+								 cluster_scn_advance(), cluster_itl_uba);
 	}
 #endif
 
@@ -2040,7 +2069,7 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 		int			bufflags = 0;
 #ifdef USE_PGRAC_CLUSTER
 		xl_heap_itl_delta_block cluster_itl_hdr;
-		xl_heap_itl_delta cluster_itl_delta;
+		xl_heap_itl_delta_v2 cluster_itl_delta;	/* spec-3.4b D6 F9 — v2 40B */
 #endif
 
 		/*
@@ -2096,12 +2125,13 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 		{
 			cluster_itl_hdr.ndeltas = 1;
 			cluster_itl_hdr.reserved = 0;
-			cluster_itl_hdr._pad = 0;
+			cluster_itl_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V2;
 			cluster_itl_delta.slot_idx = cluster_itl_slot;
 			cluster_itl_delta.flags_after = ITL_FLAG_ACTIVE;
 			cluster_itl_delta.xid = xid;
 			cluster_itl_delta.write_scn = ClusterPageGetItlSlots(BufferGetPage(buffer))[cluster_itl_slot].write_scn;
 			cluster_itl_delta.commit_scn = InvalidScn;
+			cluster_itl_delta.undo_segment_head = cluster_itl_uba;
 
 			xlrec.flags |= XLH_INSERT_ITL_DELTA;
 		}
@@ -2359,9 +2389,10 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		bool		all_frozen_set = false;
 		int			nthispage;
 #ifdef USE_PGRAC_CLUSTER
-		/* spec-3.4a D3: one ITL slot per (page, top_xid) for this batch. */
+		/* spec-3.4a D3 / spec-3.4b D5: one ITL slot per (page, top_xid). */
 		uint8		cluster_mi_slot = CLUSTER_ITL_SLOT_UNALLOCATED;
 		bool		cluster_mi_active = false;
+		UBA			cluster_mi_uba = InvalidUba_init;	/* spec-3.4b D5 real UBA */
 #endif
 
 		CHECK_FOR_INTERRUPTS();
@@ -2412,6 +2443,14 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		 */
 		if (cluster_itl_write_path_enabled(relation) && PageHasItl(page))
 		{
+			/* spec-3.4b D5: xact-local TT binding (F11; same for all pages). */
+			uint32 tt_seg;
+			uint16 tt_off;
+			uint32 tt_id_unused;
+
+			if (cluster_tt_local_get_or_create_binding(xid, &tt_seg, &tt_off, &tt_id_unused))
+				cluster_mi_uba = uba_encode(tt_seg, 0, tt_off, 0);
+
 			if (!cluster_itl_alloc_or_reuse_slot(buffer, xid, &cluster_mi_slot))
 				ereport(ERROR,
 						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
@@ -2428,7 +2467,7 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 #ifdef USE_PGRAC_CLUSTER
 		if (cluster_mi_active)
 			cluster_itl_stamp_active(buffer, cluster_mi_slot, xid,
-									 cluster_scn_advance());
+									 cluster_scn_advance(), cluster_mi_uba);
 #endif
 
 		/*
@@ -2615,16 +2654,17 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			if (cluster_mi_active)
 			{
 				xl_heap_itl_delta_block mi_hdr;
-				xl_heap_itl_delta mi_delta;
+				xl_heap_itl_delta_v2 mi_delta;	/* spec-3.4b D6 F9 — v2 40B */
 
 				mi_hdr.ndeltas = 1;
 				mi_hdr.reserved = 0;
-				mi_hdr._pad = 0;
+				mi_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V2;
 				mi_delta.slot_idx = cluster_mi_slot;
 				mi_delta.flags_after = ITL_FLAG_ACTIVE;
 				mi_delta.xid = xid;
 				mi_delta.write_scn = ClusterPageGetItlSlots(page)[cluster_mi_slot].write_scn;
 				mi_delta.commit_scn = InvalidScn;
+				mi_delta.undo_segment_head = cluster_mi_uba;
 
 				XLogRegisterData((char *) &mi_hdr,
 								 offsetof(xl_heap_itl_delta_block, deltas));
@@ -2822,9 +2862,10 @@ heap_delete(Relation relation, ItemPointer tid,
 	HeapTuple	old_key_tuple = NULL;	/* replica identity of the tuple */
 	bool		old_key_copied = false;
 #ifdef USE_PGRAC_CLUSTER
-	/* PGRAC (spec-3.4a D5): hoisted ITL state for delete path. */
+	/* PGRAC (spec-3.4a D5 / spec-3.4b D5): hoisted ITL state for delete path. */
 	uint8		cluster_itl_slot = CLUSTER_ITL_SLOT_UNALLOCATED;
 	bool		cluster_itl_active = false;
+	UBA			cluster_itl_uba = InvalidUba_init;	/* spec-3.4b D5 real UBA */
 #endif
 
 	Assert(ItemPointerIsValid(tid));
@@ -3080,6 +3121,14 @@ l1:
 	 */
 	if (cluster_itl_write_path_enabled(relation) && PageHasItl(page))
 	{
+		/* spec-3.4b D5: get or create xact-local TT binding (F11). */
+		uint32 tt_seg;
+		uint16 tt_off;
+		uint32 tt_id_unused;
+
+		if (cluster_tt_local_get_or_create_binding(xid, &tt_seg, &tt_off, &tt_id_unused))
+			cluster_itl_uba = uba_encode(tt_seg, 0, tt_off, 0);
+
 		if (!cluster_itl_alloc_or_reuse_slot(buffer, xid, &cluster_itl_slot))
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
@@ -3096,7 +3145,7 @@ l1:
 	if (cluster_itl_active)
 	{
 		cluster_itl_stamp_active(buffer, cluster_itl_slot, xid,
-								 cluster_scn_advance());
+								 cluster_scn_advance(), cluster_itl_uba);
 		tp.t_data->t_itl_slot_idx = cluster_itl_slot;
 	}
 #endif
@@ -3148,7 +3197,7 @@ l1:
 		XLogRecPtr	recptr;
 #ifdef USE_PGRAC_CLUSTER
 		xl_heap_itl_delta_block cluster_itl_hdr;
-		xl_heap_itl_delta cluster_itl_delta;
+		xl_heap_itl_delta_v2 cluster_itl_delta;	/* spec-3.4b D6 F9 — v2 40B */
 #endif
 
 		/*
@@ -3183,12 +3232,13 @@ l1:
 		{
 			cluster_itl_hdr.ndeltas = 1;
 			cluster_itl_hdr.reserved = 0;
-			cluster_itl_hdr._pad = 0;
+			cluster_itl_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V2;
 			cluster_itl_delta.slot_idx = cluster_itl_slot;
 			cluster_itl_delta.flags_after = ITL_FLAG_ACTIVE;
 			cluster_itl_delta.xid = xid;
 			cluster_itl_delta.write_scn = ClusterPageGetItlSlots(page)[cluster_itl_slot].write_scn;
 			cluster_itl_delta.commit_scn = InvalidScn;
+			cluster_itl_delta.undo_segment_head = cluster_itl_uba;
 			xlrec.flags |= XLH_DELETE_ITL_DELTA;
 		}
 #endif
@@ -3404,6 +3454,8 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 	uint8		cluster_itl_new_slot = CLUSTER_ITL_SLOT_UNALLOCATED;
 	bool		cluster_itl_old_active = false;
 	bool		cluster_itl_new_active = false;
+	/* spec-3.4b D5: single binding shared across old + new stamps (F11). */
+	UBA			cluster_itl_uba = InvalidUba_init;
 #endif
 
 	Assert(ItemPointerIsValid(otid));
@@ -4176,6 +4228,14 @@ l2:
 	 */
 	if (cluster_itl_write_path_enabled(relation) && PageHasItl(BufferGetPage(buffer)))
 	{
+		/* spec-3.4b D5: single xact-local TT binding shared by both stamps (F11). */
+		uint32 tt_seg;
+		uint16 tt_off;
+		uint32 tt_id_unused;
+
+		if (cluster_tt_local_get_or_create_binding(xid, &tt_seg, &tt_off, &tt_id_unused))
+			cluster_itl_uba = uba_encode(tt_seg, 0, tt_off, 0);
+
 		if (!cluster_itl_alloc_or_reuse_slot(buffer, xid, &cluster_itl_old_slot))
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
@@ -4201,17 +4261,18 @@ l2:
 	START_CRIT_SECTION();
 
 #ifdef USE_PGRAC_CLUSTER
-	/* spec-3.4a D4: stamp ACTIVE inside critical section. */
+	/* spec-3.4a D4: stamp ACTIVE inside critical section.
+	 * spec-3.4b D5: both stamps carry the same cluster_itl_uba (F11). */
 	if (cluster_itl_old_active)
 	{
 		cluster_itl_stamp_active(buffer, cluster_itl_old_slot, xid,
-								 cluster_scn_advance());
+								 cluster_scn_advance(), cluster_itl_uba);
 		oldtup.t_data->t_itl_slot_idx = cluster_itl_old_slot;
 	}
 	if (cluster_itl_new_active)
 	{
 		cluster_itl_stamp_active(newbuf, cluster_itl_new_slot, xid,
-								 cluster_scn_advance());
+								 cluster_scn_advance(), cluster_itl_uba);
 		heaptup->t_data->t_itl_slot_idx = cluster_itl_new_slot;
 	}
 	else if (cluster_itl_old_active)
@@ -4312,6 +4373,7 @@ l2:
 								 , xid
 								 , cluster_itl_old_active, cluster_itl_old_slot
 								 , cluster_itl_new_active, cluster_itl_new_slot
+								 , cluster_itl_uba
 #endif
 								 );
 		if (newbuf != buffer)
@@ -9334,6 +9396,7 @@ log_heap_update(Relation reln, Buffer oldbuf,
 				, TransactionId cluster_itl_xid
 				, bool cluster_itl_old_active, uint8 cluster_itl_old_slot
 				, bool cluster_itl_new_active, uint8 cluster_itl_new_slot
+				, UBA cluster_itl_uba
 #endif
 				)
 {
@@ -9351,9 +9414,9 @@ log_heap_update(Relation reln, Buffer oldbuf,
 	int			bufflags;
 #ifdef USE_PGRAC_CLUSTER
 	xl_heap_itl_delta_block cluster_itl_old_hdr;
-	xl_heap_itl_delta cluster_itl_old_delta;
+	xl_heap_itl_delta_v2 cluster_itl_old_delta;	/* spec-3.4b D6 F9 — v2 40B */
 	xl_heap_itl_delta_block cluster_itl_new_hdr;
-	xl_heap_itl_delta cluster_itl_new_delta;
+	xl_heap_itl_delta_v2 cluster_itl_new_delta;	/* spec-3.4b D6 F9 — v2 40B */
 #endif
 
 	/* Caller should not call me on a non-WAL-logged relation */
@@ -9456,23 +9519,25 @@ log_heap_update(Relation reln, Buffer oldbuf,
 		{
 			cluster_itl_new_hdr.ndeltas = 1;
 			cluster_itl_new_hdr.reserved = 0;
-			cluster_itl_new_hdr._pad = 0;
+			cluster_itl_new_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V2;
 			cluster_itl_new_delta.slot_idx = cluster_itl_new_slot;
 			cluster_itl_new_delta.flags_after = ITL_FLAG_ACTIVE;
 			cluster_itl_new_delta.xid = cluster_itl_xid;
 			cluster_itl_new_delta.write_scn = ClusterPageGetItlSlots(BufferGetPage(newbuf))[cluster_itl_new_slot].write_scn;
 			cluster_itl_new_delta.commit_scn = InvalidScn;
+			cluster_itl_new_delta.undo_segment_head = cluster_itl_uba;
 		}
 		if (cluster_itl_old_active && oldbuf != newbuf)
 		{
 			cluster_itl_old_hdr.ndeltas = 1;
 			cluster_itl_old_hdr.reserved = 0;
-			cluster_itl_old_hdr._pad = 0;
+			cluster_itl_old_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V2;
 			cluster_itl_old_delta.slot_idx = cluster_itl_old_slot;
 			cluster_itl_old_delta.flags_after = ITL_FLAG_ACTIVE;
 			cluster_itl_old_delta.xid = cluster_itl_xid;
 			cluster_itl_old_delta.write_scn = ClusterPageGetItlSlots(BufferGetPage(oldbuf))[cluster_itl_old_slot].write_scn;
 			cluster_itl_old_delta.commit_scn = InvalidScn;
+			cluster_itl_old_delta.undo_segment_head = cluster_itl_uba;
 		}
 		else if (cluster_itl_old_active)
 		{
@@ -9483,12 +9548,13 @@ log_heap_update(Relation reln, Buffer oldbuf,
 			 */
 			cluster_itl_new_hdr.ndeltas = 1;
 			cluster_itl_new_hdr.reserved = 0;
-			cluster_itl_new_hdr._pad = 0;
+			cluster_itl_new_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V2;
 			cluster_itl_new_delta.slot_idx = cluster_itl_old_slot;
 			cluster_itl_new_delta.flags_after = ITL_FLAG_ACTIVE;
 			cluster_itl_new_delta.xid = cluster_itl_xid;
 			cluster_itl_new_delta.write_scn = ClusterPageGetItlSlots(BufferGetPage(newbuf))[cluster_itl_old_slot].write_scn;
 			cluster_itl_new_delta.commit_scn = InvalidScn;
+			cluster_itl_new_delta.undo_segment_head = cluster_itl_uba;
 		}
 	}
 #endif
@@ -10280,41 +10346,15 @@ heap_xlog_delete(XLogReaderState *record)
 
 #ifdef USE_PGRAC_CLUSTER
 		/*
-		 * PGRAC (spec-3.4a D9): replay block-local ITL delta if the
-		 * heap_delete WAL record carried one (XLH_DELETE_ITL_DELTA).
-		 * memcpy handles xl_heap_delete / 8-byte SCN alignment mismatch.
+		 * PGRAC (spec-3.4a D9 / spec-3.4b D6): replay block-local ITL
+		 * delta when XLH_DELETE_ITL_DELTA is set.  The helper dispatches
+		 * by format_version (v1 24B legacy / v2 40B with UBA).
 		 */
 		if (xlrec->flags & XLH_DELETE_ITL_DELTA)
 		{
-			char	   *itl_start = (char *) xlrec + SizeOfHeapDelete;
-			xl_heap_itl_delta_block hdr;
-			uint16		i;
+			const char *itl_start = (char *) xlrec + SizeOfHeapDelete;
 
-			memcpy(&hdr, itl_start,
-				   offsetof(xl_heap_itl_delta_block, deltas));
-			for (i = 0; i < hdr.ndeltas; i++)
-			{
-				xl_heap_itl_delta delta;
-				ClusterItlSlotData *slot;
-
-				memcpy(&delta,
-					   itl_start
-					   + offsetof(xl_heap_itl_delta_block, deltas)
-					   + i * sizeof(xl_heap_itl_delta),
-					   sizeof(xl_heap_itl_delta));
-
-				if (delta.flags_after == ITL_FLAG_COMMITTED &&
-					!SCN_VALID(delta.commit_scn))
-					elog(PANIC,
-						 "spec-3.4a D9: ITL COMMITTED delta with InvalidScn at heap_xlog_delete redo");
-
-				slot = &ClusterPageGetItlSlots(page)[delta.slot_idx];
-				slot->xid = delta.xid;
-				slot->flags = delta.flags_after;
-				slot->write_scn = delta.write_scn;
-				slot->commit_scn = delta.commit_scn;
-				htup->t_itl_slot_idx = delta.slot_idx;
-			}
+			cluster_itl_redo_apply_block_local_delta(page, htup, itl_start);
 		}
 #endif
 
@@ -10405,20 +10445,11 @@ heap_xlog_insert(XLogReaderState *record)
 #ifdef USE_PGRAC_CLUSTER
 		if (xlrec->flags & XLH_INSERT_ITL_DELTA)
 		{
-			char	   *itl_start = (char *) xlrec + SizeOfHeapInsert;
-			xl_heap_itl_delta_block hdr;
-			xl_heap_itl_delta delta;
+			const char *itl_start = (char *) xlrec + SizeOfHeapInsert;
 
-			memcpy(&hdr, itl_start,
-				   offsetof(xl_heap_itl_delta_block, deltas));
-			if (hdr.ndeltas != 1)
-				elog(PANIC,
-					 "spec-3.4a D9: heap_xlog_insert expected exactly one ITL delta, got %u",
-					 hdr.ndeltas);
-			memcpy(&delta,
-				   itl_start + offsetof(xl_heap_itl_delta_block, deltas),
-				   sizeof(delta));
-			cluster_itl_replay_slot = delta.slot_idx;
+			/* slot_idx is at offset 0 of v1 and v2 deltas. */
+			cluster_itl_replay_slot =
+				(uint8) cluster_itl_wal_block_first_slot_idx(itl_start);
 			cluster_itl_replay_active = true;
 		}
 #endif
@@ -10457,43 +10488,15 @@ heap_xlog_insert(XLogReaderState *record)
 
 #ifdef USE_PGRAC_CLUSTER
 		/*
-		 * PGRAC (spec-3.4a D9): replay block-local ITL delta array if
-		 * the heap_insert WAL record carried one (XLH_INSERT_ITL_DELTA).
-		 * The delta block follows xl_heap_insert in main data.  We
-		 * memcpy to handle the 3-byte xlrec / 8-byte SCN alignment
-		 * mismatch on strict-alignment architectures.
+		 * PGRAC (spec-3.4a D9 / spec-3.4b D6): replay block-local ITL
+		 * delta array when XLH_INSERT_ITL_DELTA is set.  The helper
+		 * dispatches by format_version (v1 24B legacy / v2 40B with UBA).
 		 */
 		if (xlrec->flags & XLH_INSERT_ITL_DELTA)
 		{
-			char	   *itl_start = (char *) xlrec + SizeOfHeapInsert;
-			xl_heap_itl_delta_block hdr;
-			uint16		i;
+			const char *itl_start = (char *) xlrec + SizeOfHeapInsert;
 
-			memcpy(&hdr, itl_start,
-				   offsetof(xl_heap_itl_delta_block, deltas));
-			for (i = 0; i < hdr.ndeltas; i++)
-			{
-				xl_heap_itl_delta delta;
-				ClusterItlSlotData *slot;
-
-				memcpy(&delta,
-					   itl_start
-					   + offsetof(xl_heap_itl_delta_block, deltas)
-					   + i * sizeof(xl_heap_itl_delta),
-					   sizeof(xl_heap_itl_delta));
-
-				if (delta.flags_after == ITL_FLAG_COMMITTED &&
-					!SCN_VALID(delta.commit_scn))
-					elog(PANIC,
-						 "spec-3.4a D9: ITL COMMITTED delta with InvalidScn at heap_xlog_insert redo");
-
-				slot = &ClusterPageGetItlSlots(page)[delta.slot_idx];
-				slot->xid = delta.xid;
-				slot->flags = delta.flags_after;
-				slot->write_scn = delta.write_scn;
-				slot->commit_scn = delta.commit_scn;
-				htup->t_itl_slot_idx = delta.slot_idx;
-			}
+			cluster_itl_redo_apply_block_local_delta(page, htup, itl_start);
 		}
 #endif
 
@@ -10602,23 +10605,13 @@ heap_xlog_multi_insert(XLogReaderState *record)
 #ifdef USE_PGRAC_CLUSTER
 		if (xlrec->flags & XLH_INSERT_ITL_DELTA)
 		{
-			char	   *itl_cursor = (char *) xlrec + SizeOfHeapMultiInsert;
-			xl_heap_itl_delta_block hdr;
-			xl_heap_itl_delta delta;
+			const char *itl_cursor = (char *) xlrec + SizeOfHeapMultiInsert;
 
 			if (!isinit)
 				itl_cursor += xlrec->ntuples * sizeof(OffsetNumber);
 
-			memcpy(&hdr, itl_cursor,
-				   offsetof(xl_heap_itl_delta_block, deltas));
-			if (hdr.ndeltas != 1)
-				elog(PANIC,
-					 "spec-3.4a D9: heap_xlog_multi_insert expected exactly one ITL delta, got %u",
-					 hdr.ndeltas);
-			memcpy(&delta,
-				   itl_cursor + offsetof(xl_heap_itl_delta_block, deltas),
-				   sizeof(delta));
-			cluster_itl_replay_slot = delta.slot_idx;
+			cluster_itl_replay_slot =
+				(uint8) cluster_itl_wal_block_first_slot_idx(itl_cursor);
 			cluster_itl_replay_active = true;
 		}
 #endif
@@ -10682,43 +10675,18 @@ heap_xlog_multi_insert(XLogReaderState *record)
 
 #ifdef USE_PGRAC_CLUSTER
 		/*
-		 * PGRAC (spec-3.4a D9): replay ITL delta from MAIN data after
-		 * xl_heap_multi_insert (offset depends on offsets[] array).
-		 * Multi_insert layout in main data:
-		 *   xl_heap_multi_insert + (offsets[nthispage] if !init)
-		 *   + xl_heap_itl_delta_block + xl_heap_itl_delta
+		 * PGRAC (spec-3.4a D9 / spec-3.4b D6): replay block-local ITL
+		 * delta array.  No htup to patch here (multi_insert patches each
+		 * tuple inline above using cluster_itl_replay_slot).
 		 */
 		if (xlrec->flags & XLH_INSERT_ITL_DELTA)
 		{
-			char	   *itl_cursor = (char *) xlrec + SizeOfHeapMultiInsert;
-			xl_heap_itl_delta_block hdr;
-			uint16		i;
+			const char *itl_cursor = (char *) xlrec + SizeOfHeapMultiInsert;
 
 			if (!isinit)
 				itl_cursor += xlrec->ntuples * sizeof(OffsetNumber);
 
-			memcpy(&hdr, itl_cursor,
-				   offsetof(xl_heap_itl_delta_block, deltas));
-			for (i = 0; i < hdr.ndeltas; i++)
-			{
-				xl_heap_itl_delta delta;
-				ClusterItlSlotData *slot;
-
-				memcpy(&delta,
-					   itl_cursor
-					   + offsetof(xl_heap_itl_delta_block, deltas)
-					   + i * sizeof(xl_heap_itl_delta),
-					   sizeof(xl_heap_itl_delta));
-				if (delta.flags_after == ITL_FLAG_COMMITTED &&
-					!SCN_VALID(delta.commit_scn))
-					elog(PANIC,
-						 "spec-3.4a D9: ITL COMMITTED delta with InvalidScn at heap_xlog_multi_insert redo");
-				slot = &ClusterPageGetItlSlots(page)[delta.slot_idx];
-				slot->xid = delta.xid;
-				slot->flags = delta.flags_after;
-				slot->write_scn = delta.write_scn;
-				slot->commit_scn = delta.commit_scn;
-			}
+			cluster_itl_redo_apply_block_local_delta(page, NULL, itl_cursor);
 		}
 #endif
 
@@ -10873,42 +10841,13 @@ heap_xlog_update(XLogReaderState *record, bool hot_update)
 		 */
 		if ((xlrec->flags & XLH_UPDATE_ITL_DELTA) && oldblk != newblk)
 		{
-			char	   *itl_cursor = (char *) xlrec + SizeOfHeapUpdate;
-			xl_heap_itl_delta_block new_hdr;
-			uint16		i;
-			xl_heap_itl_delta_block old_hdr;
+			const char *itl_cursor = (char *) xlrec + SizeOfHeapUpdate;
 
-			/* Skip the new-block array first. */
-			memcpy(&new_hdr, itl_cursor,
-				   offsetof(xl_heap_itl_delta_block, deltas));
-			itl_cursor +=
-				offsetof(xl_heap_itl_delta_block, deltas)
-				+ new_hdr.ndeltas * sizeof(xl_heap_itl_delta);
+			/* Skip the new-block array (size dispatched by format_version). */
+			itl_cursor += cluster_itl_wal_block_consumed_bytes(itl_cursor);
 
-			/* Now itl_cursor points at the old-block delta_block. */
-			memcpy(&old_hdr, itl_cursor,
-				   offsetof(xl_heap_itl_delta_block, deltas));
-			for (i = 0; i < old_hdr.ndeltas; i++)
-			{
-				xl_heap_itl_delta delta;
-				ClusterItlSlotData *slot;
-
-				memcpy(&delta,
-					   itl_cursor
-					   + offsetof(xl_heap_itl_delta_block, deltas)
-					   + i * sizeof(xl_heap_itl_delta),
-					   sizeof(xl_heap_itl_delta));
-				if (delta.flags_after == ITL_FLAG_COMMITTED &&
-					!SCN_VALID(delta.commit_scn))
-					elog(PANIC,
-						 "spec-3.4a D9: ITL COMMITTED delta with InvalidScn at heap_xlog_update old-block redo");
-				slot = &ClusterPageGetItlSlots(page)[delta.slot_idx];
-				slot->xid = delta.xid;
-				slot->flags = delta.flags_after;
-				slot->write_scn = delta.write_scn;
-				slot->commit_scn = delta.commit_scn;
-				htup->t_itl_slot_idx = delta.slot_idx;
-			}
+			/* Apply the old-block array to the obuffer's page. */
+			cluster_itl_redo_apply_block_local_delta(page, htup, itl_cursor);
 		}
 #endif
 
@@ -10968,20 +10907,10 @@ heap_xlog_update(XLogReaderState *record, bool hot_update)
 #ifdef USE_PGRAC_CLUSTER
 		if (xlrec->flags & XLH_UPDATE_ITL_DELTA)
 		{
-			char	   *itl_cursor = (char *) xlrec + SizeOfHeapUpdate;
-			xl_heap_itl_delta_block hdr;
-			xl_heap_itl_delta delta;
+			const char *itl_cursor = (char *) xlrec + SizeOfHeapUpdate;
 
-			memcpy(&hdr, itl_cursor,
-				   offsetof(xl_heap_itl_delta_block, deltas));
-			if (hdr.ndeltas != 1)
-				elog(PANIC,
-					 "spec-3.4a D9: heap_xlog_update expected exactly one new-block ITL delta, got %u",
-					 hdr.ndeltas);
-			memcpy(&delta,
-				   itl_cursor + offsetof(xl_heap_itl_delta_block, deltas),
-				   sizeof(delta));
-			cluster_itl_new_replay_slot = delta.slot_idx;
+			cluster_itl_new_replay_slot =
+				(uint8) cluster_itl_wal_block_first_slot_idx(itl_cursor);
 			cluster_itl_new_replay_active = true;
 		}
 #endif
@@ -11098,34 +11027,11 @@ heap_xlog_update(XLogReaderState *record, bool hot_update)
 		 */
 		if (xlrec->flags & XLH_UPDATE_ITL_DELTA)
 		{
-			char	   *itl_cursor = (char *) xlrec + SizeOfHeapUpdate;
-			xl_heap_itl_delta_block hdr;
-			uint16		i;
+			const char *itl_cursor = (char *) xlrec + SizeOfHeapUpdate;
+			HeapTupleHeader htup_patch =
+				(oldblk == newblk && oldtup.t_data != NULL) ? oldtup.t_data : NULL;
 
-			memcpy(&hdr, itl_cursor,
-				   offsetof(xl_heap_itl_delta_block, deltas));
-			for (i = 0; i < hdr.ndeltas; i++)
-			{
-				xl_heap_itl_delta delta;
-				ClusterItlSlotData *slot;
-
-				memcpy(&delta,
-					   itl_cursor
-					   + offsetof(xl_heap_itl_delta_block, deltas)
-					   + i * sizeof(xl_heap_itl_delta),
-					   sizeof(xl_heap_itl_delta));
-				if (delta.flags_after == ITL_FLAG_COMMITTED &&
-					!SCN_VALID(delta.commit_scn))
-					elog(PANIC,
-						 "spec-3.4a D9: ITL COMMITTED delta with InvalidScn at heap_xlog_update new-block redo");
-				slot = &ClusterPageGetItlSlots(page)[delta.slot_idx];
-				slot->xid = delta.xid;
-				slot->flags = delta.flags_after;
-				slot->write_scn = delta.write_scn;
-				slot->commit_scn = delta.commit_scn;
-				if (oldblk == newblk && oldtup.t_data != NULL)
-					oldtup.t_data->t_itl_slot_idx = delta.slot_idx;
-			}
+			cluster_itl_redo_apply_block_local_delta(page, htup_patch, itl_cursor);
 		}
 #endif
 

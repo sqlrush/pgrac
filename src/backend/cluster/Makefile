@@ -88,6 +88,8 @@ OBJS = \
 	cluster_startup_phase.o \
 	cluster_itl.o \
 	cluster_itl_touch.o \
+	cluster_uba.o \
+	cluster_tt_slot.o \
 	cluster_tt_local.o \
 	cluster_tt_status.o \
 	cluster_tt_status_hint.o \

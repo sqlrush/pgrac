@@ -198,6 +198,72 @@ UT_TEST(test_t18_block_allows_zero_ndeltas)
 	UT_ASSERT_EQ((int)hdr.reserved, 0);
 }
 
+/* ---------- spec-3.4b D6 / F9 v2 40B ABI tests ---------- */
+
+UT_TEST(test_t19_delta_v2_sizeof_40)
+{
+	UT_ASSERT_EQ((int)sizeof(xl_heap_itl_delta_v2), 40);
+}
+
+UT_TEST(test_t20_delta_v2_slot_idx_offset_0)
+{
+	UT_ASSERT_EQ((int)offsetof(xl_heap_itl_delta_v2, slot_idx), 0);
+}
+
+UT_TEST(test_t21_delta_v2_flags_after_offset_2)
+{
+	UT_ASSERT_EQ((int)offsetof(xl_heap_itl_delta_v2, flags_after), 2);
+}
+
+UT_TEST(test_t22_delta_v2_xid_offset_4)
+{
+	UT_ASSERT_EQ((int)offsetof(xl_heap_itl_delta_v2, xid), 4);
+}
+
+UT_TEST(test_t23_delta_v2_write_scn_offset_8)
+{
+	UT_ASSERT_EQ((int)offsetof(xl_heap_itl_delta_v2, write_scn), 8);
+}
+
+UT_TEST(test_t24_delta_v2_commit_scn_offset_16)
+{
+	UT_ASSERT_EQ((int)offsetof(xl_heap_itl_delta_v2, commit_scn), 16);
+}
+
+UT_TEST(test_t25_delta_v2_undo_segment_head_offset_24)
+{
+	UT_ASSERT_EQ((int)offsetof(xl_heap_itl_delta_v2, undo_segment_head), 24);
+}
+
+UT_TEST(test_t26_format_version_v1_v2_distinct)
+{
+	UT_ASSERT_EQ((int)CLUSTER_ITL_DELTA_FORMAT_V1, 0);
+	UT_ASSERT_EQ((int)CLUSTER_ITL_DELTA_FORMAT_V2, 1);
+}
+
+UT_TEST(test_t27_block_format_version_repurposed_pad)
+{
+	/* spec-3.4b D6: header _pad field renamed to format_version.
+	 * Offset must remain 4 to preserve wire compatibility. */
+	UT_ASSERT_EQ((int)offsetof(xl_heap_itl_delta_block, format_version), 4);
+}
+
+UT_TEST(test_t28_block_deltas_offset_still_8)
+{
+	/* Backward-compat check: the deltas[] flexible array still starts at
+	 * offset 8 regardless of format_version (v1 24B vs v2 40B). */
+	UT_ASSERT_EQ((int)offsetof(xl_heap_itl_delta_block, deltas), 8);
+}
+
+UT_TEST(test_t29_v1_v2_slot_idx_same_offset)
+{
+	/* spec-3.4b D6: cluster_itl_wal_block_first_slot_idx relies on
+	 * slot_idx being at offset 0 for BOTH v1 and v2.  Catch regressions
+	 * that would reorder either struct. */
+	UT_ASSERT_EQ((int)offsetof(xl_heap_itl_delta, slot_idx),
+				 (int)offsetof(xl_heap_itl_delta_v2, slot_idx));
+}
+
 
 int
 main(void)
@@ -220,5 +286,16 @@ main(void)
 	UT_RUN(test_t16_block_reserved_offset_2);
 	UT_RUN(test_t17_committed_requires_valid_scn);
 	UT_RUN(test_t18_block_allows_zero_ndeltas);
+	UT_RUN(test_t19_delta_v2_sizeof_40);
+	UT_RUN(test_t20_delta_v2_slot_idx_offset_0);
+	UT_RUN(test_t21_delta_v2_flags_after_offset_2);
+	UT_RUN(test_t22_delta_v2_xid_offset_4);
+	UT_RUN(test_t23_delta_v2_write_scn_offset_8);
+	UT_RUN(test_t24_delta_v2_commit_scn_offset_16);
+	UT_RUN(test_t25_delta_v2_undo_segment_head_offset_24);
+	UT_RUN(test_t26_format_version_v1_v2_distinct);
+	UT_RUN(test_t27_block_format_version_repurposed_pad);
+	UT_RUN(test_t28_block_deltas_offset_still_8);
+	UT_RUN(test_t29_v1_v2_slot_idx_same_offset);
 	UT_DONE();
 }

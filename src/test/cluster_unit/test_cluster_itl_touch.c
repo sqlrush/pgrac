@@ -125,7 +125,8 @@ cluster_itl_alloc_or_reuse_slot(Buffer buf pg_attribute_unused(),
 void
 cluster_itl_stamp_active(Buffer buf pg_attribute_unused(), uint8 slot_idx pg_attribute_unused(),
 						 TransactionId xid pg_attribute_unused(),
-						 SCN write_scn pg_attribute_unused())
+						 SCN write_scn pg_attribute_unused(),
+						 UBA undo_segment_head pg_attribute_unused())
 {}
 void
 cluster_itl_stamp_committed(Buffer buf pg_attribute_unused(), uint8 slot_idx pg_attribute_unused(),

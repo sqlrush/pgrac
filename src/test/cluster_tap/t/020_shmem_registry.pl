@@ -134,8 +134,8 @@ is($node->safe_psql(
 		'postgres',
 		q{SELECT value FROM pg_cluster_state
 		   WHERE category = 'shmem' AND key = 'region_count'}),
-	   '36',
-	   'L8 pg_cluster_state.shmem.region_count = 36 (spec-3.2 visibility inject region included)');
+	   '37',
+	   'L8 pg_cluster_state.shmem.region_count = 37 (spec-3.4b TT slot allocator region added)');
 
 is($node->safe_psql(
 		'postgres', q{

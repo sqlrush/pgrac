@@ -320,6 +320,62 @@ cluster_tt_status_flush_all(uint32 new_epoch)
 	LWLockRelease(ClusterTTStatusLock);
 }
 
+
+/*
+ * cluster_tt_status_flush_all_at_activation
+ *
+ *	spec-3.4b D8 / Q4 HC (L191): wipe the overlay HTAB unconditionally,
+ *	called from postmaster shmem init AFTER the shmem region is set up.
+ *	This is the **code-enforced** guarantee that no spec-3.1 / spec-3.2 /
+ *	spec-3.3 / spec-3.4a provisional overlay entries can survive into the
+ *	spec-3.4b real-allocator era; runbook-based reconfig flush remains as
+ *	a fallback at cluster_reconfig.c:571 but is NOT the only correctness
+ *	mechanism.
+ *
+ *	Hard contract (L191):
+ *	  "Real TT allocator activation must clear all provisional TT-status
+ *	   overlay entries before any production visibility lookup can
+ *	   consume real TT keys.  Reconfig-triggered flush is a fallback, not
+ *	   the only correctness mechanism."
+ *
+ *	Safe to call before cluster_enabled is set: the function tolerates a
+ *	NULL HTAB pointer (returns silently).  Calling twice is a no-op.
+ *
+ *	NOT a postmaster-only callback per CLAUDE.md rule 16: the function
+ *	runs during ShmemInitStruct of postmaster, where the HTAB pointer is
+ *	first set; later backend forks inherit a clean HTAB without re-flush.
+ *	Under EXEC_BACKEND (Windows) each backend re-runs the init path; the
+ *	flush stays correct because it is idempotent (find nothing, remove
+ *	nothing).
+ */
+void
+cluster_tt_status_flush_all_at_activation(void)
+{
+	HASH_SEQ_STATUS hseq;
+	const ClusterTTOverlayEntry *e;
+	uint64 removed = 0;
+
+	if (ClusterTTStatusHTAB == NULL)
+		return;	/* shmem not initialised yet; nothing to flush */
+
+	LWLockAcquire(ClusterTTStatusLock, LW_EXCLUSIVE);
+
+	hash_seq_init(&hseq, ClusterTTStatusHTAB);
+	while ((e = (ClusterTTOverlayEntry *)hash_seq_search(&hseq)) != NULL) {
+		hash_search(ClusterTTStatusHTAB, &e->key, HASH_REMOVE, NULL);
+		removed++;
+	}
+
+	if (ClusterTTStatusState != NULL)
+	{
+		pg_atomic_fetch_add_u64(&ClusterTTStatusState->generation, 1);
+		pg_atomic_fetch_add_u64(&ClusterTTStatusState->flush_count, 1);
+		pg_atomic_fetch_add_u64(&ClusterTTStatusState->evict_count, removed);
+	}
+
+	LWLockRelease(ClusterTTStatusLock);
+}
+
 uint64
 cluster_tt_status_generation(void)
 {
@@ -404,6 +460,10 @@ cluster_tt_status_flush_all(uint32 new_epoch)
 {
 	(void)new_epoch;
 }
+
+void
+cluster_tt_status_flush_all_at_activation(void)
+{}
 
 uint64
 cluster_tt_status_generation(void)

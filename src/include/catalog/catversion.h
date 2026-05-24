@@ -500,7 +500,13 @@
  * payloads (snapbuild.c / pg_export_snapshot / parallel worker carry) must
  * use the new layout.  R4 P1 explicit layout + R9 P2 uint64 epoch (no
  * uint32 wrap alias).  See spec-3.3 §2.1 + D4 6-root ABI ripple audit. */
-#define CATALOG_VERSION_NO 202605480
+/* spec-3.4b D6 + D3 (2026-05-24, F8/F9): ITL WAL ABI extends with v2
+ * 40B delta (16B undo_segment_head) + xl_heap_itl_delta_block format_version
+ * field repurposed from _pad (legacy v1=0, v2=1).  Legacy 24B parser retained
+ * for backward-compat replay.  Additionally adds LWTRANCHE_CLUSTER_TT_SLOT
+ * tranche + per-node TT slot allocator shmem region.  Catalog tooling that
+ * inspects heap WAL deltas or LWLock tranche names must use the new layout. */
+#define CATALOG_VERSION_NO 202605490
 
 /* spec-2.39 D10 (2026-05-21):  SI Broadcaster production activation —
  * DDL commit hook (AtEOXact_Inval + COMMIT PREPARED via cluster-aware

@@ -214,4 +214,117 @@ StaticAssertDecl(sizeof(ClusterUndoTTSlotRef) == 32,
 				 " explicit _padding[7] required, no implicit padding");
 
 
+/*
+ * ============================================================
+ * PGRAC MODIFICATIONS by SqlRush <sqlrush@gmail.com>
+ *
+ * spec-3.4b D3 — NEW per-segment TT slot allocator API + offset/id
+ * separation helpers.
+ *
+ * What changed:
+ *   - Added INVALID_TT_SLOT_OFFSET sentinel (0xFFFF; out of valid range
+ *     [0, 47]) for cluster_tt_slot_alloc OVERFLOW signaling.
+ *   - Added inline cluster_tt_slot_offset_to_id / _id_to_offset helpers
+ *     (F1 — exact-key `tt_slot_id` 1..48 with 0 permanently invalid;
+ *     on-disk offset 0..47 used by allocator).
+ *   - Declared cluster_tt_slot_alloc / _free / _get_wrap as extern;
+ *     implementation lives in cluster_tt_slot.c (backend-only; pulls
+ *     LWLock state).  Shmem registration (request_shmem + init_shmem)
+ *     also lives in cluster_tt_slot.c.
+ *
+ * Why:
+ *   spec-3.4b Q3 ★ — production cluster path needs real TT slot
+ *   allocations (not provisional ids); allocator gives every active
+ *   xact a unique (segment_id, slot_offset) pair to write into
+ *   ItlSlot.undo_segment_head and to key the commit-time TT status
+ *   install (F11 xact-local binding).
+ *
+ * Frontend-safety preserved:  this header still has no backend-only
+ *   includes; allocator extern decls take only plain integer types,
+ *   so frontend tooling that reads slot bytes continues to compile.
+ * ============================================================
+ */
+
+/*
+ * INVALID_TT_SLOT_OFFSET — sentinel returned by cluster_tt_slot_alloc when
+ * the per-segment 48-slot table is fully occupied by ACTIVE entries.
+ * Value 0xFFFF is unambiguous: valid offsets are [0, TT_SLOTS_PER_SEGMENT - 1].
+ */
+#define INVALID_TT_SLOT_OFFSET ((uint16) 0xFFFF)
+
+
+/*
+ * cluster_tt_slot_offset_to_id / _id_to_offset
+ *
+ *	spec-3.4b F1: on-disk slot offset and exact-key tt_slot_id are
+ *	intentionally separated.
+ *
+ *	    offset  ∈ [0, TT_SLOTS_PER_SEGMENT)  — allocator-internal index
+ *	    id      ∈ [1, TT_SLOTS_PER_SEGMENT]  — exact-key (0 = invalid)
+ *
+ *	The invalid sentinel `tt_slot_id == 0` is consumed by spec-3.2 D5
+ *	to decide whether to enter the cluster visibility path; an allocator
+ *	that returned `tt_slot_id == 0` for a legitimate first-allocation
+ *	would route real cluster work to the PG-native fallback path.
+ */
+static inline uint32
+cluster_tt_slot_offset_to_id(uint16 slot_offset)
+{
+	Assert(slot_offset < TT_SLOTS_PER_SEGMENT);
+	return ((uint32) slot_offset) + 1;
+}
+
+static inline uint16
+cluster_tt_slot_id_to_offset(uint32 tt_slot_id)
+{
+	Assert(tt_slot_id >= 1 && tt_slot_id <= TT_SLOTS_PER_SEGMENT);
+	return (uint16) (tt_slot_id - 1);
+}
+
+
+/*
+ * Allocator API (impl in cluster_tt_slot.c).
+ *
+ *	cluster_tt_slot_alloc:
+ *	  Allocate-or-reuse a slot on `segment_id` for `top_xid`.  Three-tier
+ *	  fallback (L189 recycle policy):
+ *	    1) reuse a slot already owned by `top_xid` (idempotent)
+ *	    2) take any FREE slot
+ *	    3) recycle a COMMITTED / ABORTED slot, wrap++
+ *	  Returns offset in [0, TT_SLOTS_PER_SEGMENT) on success, or
+ *	  INVALID_TT_SLOT_OFFSET when all slots are ACTIVE.  Caller MUST be
+ *	  outside critical section (function takes LWLock).
+ *
+ *	cluster_tt_slot_free:
+ *	  Mark `slot_offset` on `segment_id` as FREE.  Called from
+ *	  cluster_tt_local end-of-xact path (commit + abort both free in
+ *	  spec-3.4b MVP; spec-3.4c delayed cleanout may keep COMMITTED
+ *	  status alive longer).
+ *
+ *	cluster_tt_slot_get_wrap:
+ *	  Read the wrap counter of `slot_offset` on `segment_id`.  Used by
+ *	  reader paths that want to detect slot reuse since a UBA was
+ *	  encoded.
+ */
+extern uint16 cluster_tt_slot_alloc(uint32 segment_id, TransactionId top_xid);
+extern void cluster_tt_slot_free(uint32 segment_id, uint16 slot_offset);
+extern uint16 cluster_tt_slot_get_wrap(uint32 segment_id, uint16 slot_offset);
+
+
+/*
+ * Shmem lifecycle (impl in cluster_tt_slot.c).
+ */
+extern Size cluster_tt_slot_shmem_size(void);
+extern void cluster_tt_slot_shmem_init(void);
+extern void cluster_tt_slot_shmem_register(void);
+
+
+/*
+ * Test-only: wipe all per-node allocator state back to zeroes.  Used by
+ * cluster_unit harness to set a clean baseline between cases.  Production
+ * code MUST NOT call this.
+ */
+extern void cluster_tt_slot_reset_all(void);
+
+
 #endif /* CLUSTER_TT_SLOT_H */
