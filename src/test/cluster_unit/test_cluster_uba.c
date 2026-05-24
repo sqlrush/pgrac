@@ -56,7 +56,7 @@
 #include <stddef.h>
 #include <string.h>
 
-#include "access/heapam_xlog.h"			/* CLUSTER_ITL_DELTA_FORMAT_V[12] */
+#include "access/heapam_xlog.h" /* CLUSTER_ITL_DELTA_FORMAT_V[12] */
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_tt_slot.h"
 #include "cluster/cluster_uba.h"
@@ -85,16 +85,16 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 
 UT_TEST(test_t1_uba_sizeof_16)
 {
-	UT_ASSERT_EQ((int) sizeof(UBA), 16);
+	UT_ASSERT_EQ((int)sizeof(UBA), 16);
 }
 
 UT_TEST(test_t2_invalid_uba_all_zero)
 {
 	UBA u = InvalidUba_init;
 
-	UT_ASSERT_EQ((int) (u.raw[0] == 0), 1);
-	UT_ASSERT_EQ((int) (u.raw[1] == 0), 1);
-	UT_ASSERT_EQ((int) UBA_is_invalid(u), 1);
+	UT_ASSERT_EQ((int)(u.raw[0] == 0), 1);
+	UT_ASSERT_EQ((int)(u.raw[1] == 0), 1);
+	UT_ASSERT_EQ((int)UBA_is_invalid(u), 1);
 }
 
 
@@ -106,7 +106,7 @@ UT_TEST(test_t3_decode_invalid_uba_returns_false)
 	uint32 seg, blk;
 	uint16 off, row;
 
-	UT_ASSERT_EQ((int) uba_decode(u, &seg, &blk, &off, &row), 0);
+	UT_ASSERT_EQ((int)uba_decode(u, &seg, &blk, &off, &row), 0);
 }
 
 UT_TEST(test_t4_roundtrip_low_values)
@@ -115,11 +115,11 @@ UT_TEST(test_t4_roundtrip_low_values)
 	uint32 seg, blk;
 	uint16 off, row;
 
-	UT_ASSERT_EQ((int) uba_decode(u, &seg, &blk, &off, &row), 1);
-	UT_ASSERT_EQ((int) seg, 1);
-	UT_ASSERT_EQ((int) blk, 0);
-	UT_ASSERT_EQ((int) off, 0);
-	UT_ASSERT_EQ((int) row, 0);
+	UT_ASSERT_EQ((int)uba_decode(u, &seg, &blk, &off, &row), 1);
+	UT_ASSERT_EQ((int)seg, 1);
+	UT_ASSERT_EQ((int)blk, 0);
+	UT_ASSERT_EQ((int)off, 0);
+	UT_ASSERT_EQ((int)row, 0);
 }
 
 UT_TEST(test_t5_roundtrip_high_values)
@@ -128,11 +128,11 @@ UT_TEST(test_t5_roundtrip_high_values)
 	uint32 seg, blk;
 	uint16 off, row;
 
-	UT_ASSERT_EQ((int) uba_decode(u, &seg, &blk, &off, &row), 1);
-	UT_ASSERT_EQ((int) seg, (int) UINT16_MAX);
-	UT_ASSERT_EQ((int) blk, (int) 0xFFFFFFFFu);
-	UT_ASSERT_EQ((int) off, TT_SLOTS_PER_SEGMENT - 1);
-	UT_ASSERT_EQ((int) row, (int) 0xFFFFu);
+	UT_ASSERT_EQ((int)uba_decode(u, &seg, &blk, &off, &row), 1);
+	UT_ASSERT_EQ((int)seg, (int)UINT16_MAX);
+	UT_ASSERT_EQ((int)blk, (int)0xFFFFFFFFu);
+	UT_ASSERT_EQ((int)off, TT_SLOTS_PER_SEGMENT - 1);
+	UT_ASSERT_EQ((int)row, (int)0xFFFFu);
 }
 
 UT_TEST(test_t6_roundtrip_mid_range)
@@ -141,11 +141,11 @@ UT_TEST(test_t6_roundtrip_mid_range)
 	uint32 seg, blk;
 	uint16 off, row;
 
-	UT_ASSERT_EQ((int) uba_decode(u, &seg, &blk, &off, &row), 1);
-	UT_ASSERT_EQ((int) seg, 257);
-	UT_ASSERT_EQ((int) blk, 12345);
-	UT_ASSERT_EQ((int) off, 3);
-	UT_ASSERT_EQ((int) row, 99);
+	UT_ASSERT_EQ((int)uba_decode(u, &seg, &blk, &off, &row), 1);
+	UT_ASSERT_EQ((int)seg, 257);
+	UT_ASSERT_EQ((int)blk, 12345);
+	UT_ASSERT_EQ((int)off, 3);
+	UT_ASSERT_EQ((int)row, 99);
 }
 
 UT_TEST(test_t7_decode_rejects_segment_zero)
@@ -158,9 +158,9 @@ UT_TEST(test_t7_decode_rejects_segment_zero)
 	uint32 seg, blk;
 	uint16 off, row;
 
-	u.raw[0] = (uint64) 12345 << 32;	/* block_no=12345, segment_id=0 */
-	u.raw[1] = 1;						/* slot_offset=1, row_offset=0 */
-	UT_ASSERT_EQ((int) uba_decode(u, &seg, &blk, &off, &row), 0);
+	u.raw[0] = (uint64)12345 << 32; /* block_no=12345, segment_id=0 */
+	u.raw[1] = 1;					/* slot_offset=1, row_offset=0 */
+	UT_ASSERT_EQ((int)uba_decode(u, &seg, &blk, &off, &row), 0);
 }
 
 UT_TEST(test_t8_decode_rejects_segment_over_uint16max)
@@ -169,9 +169,9 @@ UT_TEST(test_t8_decode_rejects_segment_over_uint16max)
 	uint32 seg, blk;
 	uint16 off, row;
 
-	u.raw[0] = (uint64) 0x10000ULL;		/* segment_id = 65536 */
+	u.raw[0] = (uint64)0x10000ULL; /* segment_id = 65536 */
 	u.raw[1] = 1;
-	UT_ASSERT_EQ((int) uba_decode(u, &seg, &blk, &off, &row), 0);
+	UT_ASSERT_EQ((int)uba_decode(u, &seg, &blk, &off, &row), 0);
 }
 
 UT_TEST(test_t9_decode_rejects_offset_overflow)
@@ -180,9 +180,9 @@ UT_TEST(test_t9_decode_rejects_offset_overflow)
 	uint32 seg, blk;
 	uint16 off, row;
 
-	u.raw[0] = 1;									/* segment_id = 1 */
-	u.raw[1] = (uint64) TT_SLOTS_PER_SEGMENT;		/* offset = 48 (out of range) */
-	UT_ASSERT_EQ((int) uba_decode(u, &seg, &blk, &off, &row), 0);
+	u.raw[0] = 1;							 /* segment_id = 1 */
+	u.raw[1] = (uint64)TT_SLOTS_PER_SEGMENT; /* offset = 48 (out of range) */
+	UT_ASSERT_EQ((int)uba_decode(u, &seg, &blk, &off, &row), 0);
 }
 
 UT_TEST(test_t10_decode_rejects_nonzero_reserved)
@@ -192,8 +192,8 @@ UT_TEST(test_t10_decode_rejects_nonzero_reserved)
 	uint16 off, row;
 
 	u.raw[0] = 1;
-	u.raw[1] = ((uint64) 1ULL << 32);		/* reserved high 32 bits non-zero */
-	UT_ASSERT_EQ((int) uba_decode(u, &seg, &blk, &off, &row), 0);
+	u.raw[1] = ((uint64)1ULL << 32); /* reserved high 32 bits non-zero */
+	UT_ASSERT_EQ((int)uba_decode(u, &seg, &blk, &off, &row), 0);
 }
 
 
@@ -203,14 +203,14 @@ UT_TEST(test_t11_get_segment_id)
 {
 	UBA u = uba_encode(257, 7, 5, 0);
 
-	UT_ASSERT_EQ((int) uba_get_segment_id(u), 257);
+	UT_ASSERT_EQ((int)uba_get_segment_id(u), 257);
 }
 
 UT_TEST(test_t12_get_tt_slot_offset)
 {
 	UBA u = uba_encode(257, 7, 5, 0);
 
-	UT_ASSERT_EQ((int) uba_get_tt_slot_offset(u), 5);
+	UT_ASSERT_EQ((int)uba_get_tt_slot_offset(u), 5);
 }
 
 
@@ -218,28 +218,25 @@ UT_TEST(test_t12_get_tt_slot_offset)
 
 UT_TEST(test_t13_offset_to_id_endpoints)
 {
-	UT_ASSERT_EQ((int) cluster_tt_slot_offset_to_id(0), 1);
-	UT_ASSERT_EQ((int) cluster_tt_slot_offset_to_id(TT_SLOTS_PER_SEGMENT - 1),
-				 TT_SLOTS_PER_SEGMENT);
+	UT_ASSERT_EQ((int)cluster_tt_slot_offset_to_id(0), 1);
+	UT_ASSERT_EQ((int)cluster_tt_slot_offset_to_id(TT_SLOTS_PER_SEGMENT - 1), TT_SLOTS_PER_SEGMENT);
 }
 
 UT_TEST(test_t14_id_to_offset_endpoints)
 {
-	UT_ASSERT_EQ((int) cluster_tt_slot_id_to_offset(1), 0);
-	UT_ASSERT_EQ((int) cluster_tt_slot_id_to_offset(TT_SLOTS_PER_SEGMENT),
-				 TT_SLOTS_PER_SEGMENT - 1);
+	UT_ASSERT_EQ((int)cluster_tt_slot_id_to_offset(1), 0);
+	UT_ASSERT_EQ((int)cluster_tt_slot_id_to_offset(TT_SLOTS_PER_SEGMENT), TT_SLOTS_PER_SEGMENT - 1);
 }
 
 UT_TEST(test_t15_offset_id_mutual_inverse)
 {
 	int i;
 
-	for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++)
-	{
-		uint32 id = cluster_tt_slot_offset_to_id((uint16) i);
+	for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+		uint32 id = cluster_tt_slot_offset_to_id((uint16)i);
 		uint16 off = cluster_tt_slot_id_to_offset(id);
 
-		UT_ASSERT_EQ((int) off, i);
+		UT_ASSERT_EQ((int)off, i);
 	}
 }
 
@@ -250,21 +247,21 @@ UT_TEST(test_t16_origin_node_invalid_uba)
 {
 	UBA u = InvalidUba_init;
 
-	UT_ASSERT_EQ((int) uba_origin_node_id(u), (int) InvalidNodeId);
+	UT_ASSERT_EQ((int)uba_origin_node_id(u), (int)InvalidNodeId);
 }
 
 UT_TEST(test_t17_origin_node_segment_1)
 {
-	UBA u = uba_encode(1, 0, 0, 0);		/* node 0's first segment */
+	UBA u = uba_encode(1, 0, 0, 0); /* node 0's first segment */
 
-	UT_ASSERT_EQ((int) uba_origin_node_id(u), 0);
+	UT_ASSERT_EQ((int)uba_origin_node_id(u), 0);
 }
 
 UT_TEST(test_t18_origin_node_segment_257)
 {
-	UBA u = uba_encode(257, 0, 0, 0);	/* node 1's first segment */
+	UBA u = uba_encode(257, 0, 0, 0); /* node 1's first segment */
 
-	UT_ASSERT_EQ((int) uba_origin_node_id(u), 1);
+	UT_ASSERT_EQ((int)uba_origin_node_id(u), 1);
 }
 
 UT_TEST(test_t19_origin_node_out_of_range_rejected)
@@ -277,7 +274,7 @@ UT_TEST(test_t19_origin_node_out_of_range_rejected)
 	 */
 	UBA u = uba_encode(32769, 0, 0, 0);
 
-	UT_ASSERT_EQ((int) uba_origin_node_id(u), (int) InvalidNodeId);
+	UT_ASSERT_EQ((int)uba_origin_node_id(u), (int)InvalidNodeId);
 }
 
 
@@ -285,27 +282,27 @@ UT_TEST(test_t19_origin_node_out_of_range_rejected)
 
 UT_TEST(test_t20_segs_per_instance_is_256)
 {
-	UT_ASSERT_EQ((int) CLUSTER_UNDO_SEGS_PER_INSTANCE, 256);
+	UT_ASSERT_EQ((int)CLUSTER_UNDO_SEGS_PER_INSTANCE, 256);
 }
 
 UT_TEST(test_t21_owner_invalid_is_zero)
 {
-	UT_ASSERT_EQ((int) CLUSTER_UNDO_OWNER_INVALID, 0);
+	UT_ASSERT_EQ((int)CLUSTER_UNDO_OWNER_INVALID, 0);
 }
 
 UT_TEST(test_t22_itl_delta_format_v1_is_zero)
 {
-	UT_ASSERT_EQ((int) CLUSTER_ITL_DELTA_FORMAT_V1, 0);
+	UT_ASSERT_EQ((int)CLUSTER_ITL_DELTA_FORMAT_V1, 0);
 }
 
 UT_TEST(test_t23_itl_delta_format_v2_is_one)
 {
-	UT_ASSERT_EQ((int) CLUSTER_ITL_DELTA_FORMAT_V2, 1);
+	UT_ASSERT_EQ((int)CLUSTER_ITL_DELTA_FORMAT_V2, 1);
 }
 
 UT_TEST(test_t24_invalid_tt_slot_offset_is_0xFFFF)
 {
-	UT_ASSERT_EQ((int) INVALID_TT_SLOT_OFFSET, (int) 0xFFFF);
+	UT_ASSERT_EQ((int)INVALID_TT_SLOT_OFFSET, (int)0xFFFF);
 }
 
 

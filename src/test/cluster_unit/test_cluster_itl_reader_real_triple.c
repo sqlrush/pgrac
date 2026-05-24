@@ -79,8 +79,7 @@ static int last_ereport_errcode = 0;
 bool
 errstart(int elevel, const char *domain pg_attribute_unused())
 {
-	if (elevel >= ERROR)
-	{
+	if (elevel >= ERROR) {
 		ereport_raised_count++;
 		return true;
 	}
@@ -94,8 +93,7 @@ errstart_cold(int elevel, const char *domain)
 }
 
 void
-errfinish(const char *filename pg_attribute_unused(),
-		  int lineno pg_attribute_unused(),
+errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
 		  const char *funcname pg_attribute_unused())
 {
 	siglongjmp(ereport_recover_jmp, 1);
@@ -109,9 +107,15 @@ errcode(int sqlerrcode)
 }
 
 int
-errmsg(const char *fmt pg_attribute_unused(), ...) { return 0; }
+errmsg(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
 int
-errhint(const char *fmt pg_attribute_unused(), ...) { return 0; }
+errhint(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
 
 
 void
@@ -125,10 +129,14 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 
 /* cluster_itl.c references these PG-side helpers we stub. */
 void
-MarkBufferDirty(Buffer buf pg_attribute_unused()) {}
+MarkBufferDirty(Buffer buf pg_attribute_unused())
+{}
 
 Page
-BufferGetPage(Buffer buf) { return (Page) (uintptr_t) buf; }
+BufferGetPage(Buffer buf)
+{
+	return (Page)(uintptr_t)buf;
+}
 
 /* PG core helpers we need to stub to avoid linking the full storage/page
  * subsystem.  PageInit / PageInitHeapPage are stubbed below; only the
@@ -136,11 +144,12 @@ BufferGetPage(Buffer buf) { return (Page) (uintptr_t) buf; }
  * set by hand. */
 void
 PageInit(Page page pg_attribute_unused(), Size pageSize pg_attribute_unused(),
-		 Size specialSize pg_attribute_unused()) {}
+		 Size specialSize pg_attribute_unused())
+{}
 void
-PageInitHeapPage(Page page pg_attribute_unused(),
-				 Size pageSize pg_attribute_unused(),
-				 Size specialSize pg_attribute_unused()) {}
+PageInitHeapPage(Page page pg_attribute_unused(), Size pageSize pg_attribute_unused(),
+				 Size specialSize pg_attribute_unused())
+{}
 
 /* Buffer manager globals referenced by cluster_itl.o's MarkBufferDirty
  * inline expansion / other transitive references. */
@@ -148,7 +157,10 @@ char *BufferBlocks = NULL;
 void *LocalBufferBlockPointers[1] = { NULL };
 
 int
-errmsg_internal(const char *fmt pg_attribute_unused(), ...) { return 0; }
+errmsg_internal(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
 
 
 /* cluster_epoch_get_current is called by reader; stub a deterministic value. */
@@ -168,7 +180,10 @@ int cluster_node_id = 0;
 /* GetCurrentTransactionNestLevel is called by cluster_itl_check_subxact_or_error
  * but the reader path doesn't reach it; stub to 1 (top-level). */
 int
-GetCurrentTransactionNestLevel(void) { return 1; }
+GetCurrentTransactionNestLevel(void)
+{
+	return 1;
+}
 
 
 /* ============================================================
@@ -185,13 +200,13 @@ build_itl_page(void)
 	PageHeader hdr;
 
 	memset(synthetic_page, 0, BLCKSZ);
-	hdr = (PageHeader) synthetic_page;
+	hdr = (PageHeader)synthetic_page;
 	hdr->pd_flags = PD_HAS_ITL;
-	hdr->pd_special = (LocationIndex) (BLCKSZ - CLUSTER_ITL_ARRAY_SIZE);
+	hdr->pd_special = (LocationIndex)(BLCKSZ - CLUSTER_ITL_ARRAY_SIZE);
 	hdr->pd_upper = hdr->pd_special;
 	hdr->pd_lower = SizeOfPageHeaderData;
 	hdr->pd_pagesize_version = BLCKSZ | PG_PAGE_LAYOUT_VERSION;
-	return (Page) synthetic_page;
+	return (Page)synthetic_page;
 }
 
 
@@ -208,21 +223,21 @@ slot_at(Page page, uint8 idx)
 
 UT_TEST(test_t1_ref_sizeof_32)
 {
-	UT_ASSERT_EQ((int) sizeof(ClusterUndoTTSlotRef), 32);
+	UT_ASSERT_EQ((int)sizeof(ClusterUndoTTSlotRef), 32);
 }
 
 UT_TEST(test_t2_null_page_returns_false)
 {
 	ClusterUndoTTSlotRef ref;
 
-	UT_ASSERT_EQ((int) cluster_itl_get_tt_ref(NULL, 0, &ref), 0);
+	UT_ASSERT_EQ((int)cluster_itl_get_tt_ref(NULL, 0, &ref), 0);
 }
 
 UT_TEST(test_t3_null_ref_returns_false)
 {
 	Page page = build_itl_page();
 
-	UT_ASSERT_EQ((int) cluster_itl_get_tt_ref(page, 0, NULL), 0);
+	UT_ASSERT_EQ((int)cluster_itl_get_tt_ref(page, 0, NULL), 0);
 }
 
 UT_TEST(test_t4_slot_idx_out_of_range_returns_false)
@@ -230,8 +245,8 @@ UT_TEST(test_t4_slot_idx_out_of_range_returns_false)
 	Page page = build_itl_page();
 	ClusterUndoTTSlotRef ref;
 
-	UT_ASSERT_EQ((int) cluster_itl_get_tt_ref(page, CLUSTER_ITL_INITRANS_DEFAULT, &ref), 0);
-	UT_ASSERT_EQ((int) cluster_itl_get_tt_ref(page, 255, &ref), 0);
+	UT_ASSERT_EQ((int)cluster_itl_get_tt_ref(page, CLUSTER_ITL_INITRANS_DEFAULT, &ref), 0);
+	UT_ASSERT_EQ((int)cluster_itl_get_tt_ref(page, 255, &ref), 0);
 }
 
 UT_TEST(test_t5_free_slot_returns_false)
@@ -241,7 +256,7 @@ UT_TEST(test_t5_free_slot_returns_false)
 	ClusterItlSlotData *s = slot_at(page, 0);
 
 	s->flags = ITL_FLAG_FREE;
-	UT_ASSERT_EQ((int) cluster_itl_get_tt_ref(page, 0, &ref), 0);
+	UT_ASSERT_EQ((int)cluster_itl_get_tt_ref(page, 0, &ref), 0);
 }
 
 UT_TEST(test_t6_no_itl_area_returns_false)
@@ -251,13 +266,13 @@ UT_TEST(test_t6_no_itl_area_returns_false)
 	ClusterUndoTTSlotRef ref;
 
 	memset(no_itl, 0, BLCKSZ);
-	hdr = (PageHeader) no_itl;
-	hdr->pd_flags = 0;	/* PD_HAS_ITL NOT set */
+	hdr = (PageHeader)no_itl;
+	hdr->pd_flags = 0; /* PD_HAS_ITL NOT set */
 	hdr->pd_special = BLCKSZ;
 	hdr->pd_upper = BLCKSZ;
 	hdr->pd_lower = SizeOfPageHeaderData;
 	hdr->pd_pagesize_version = BLCKSZ | PG_PAGE_LAYOUT_VERSION;
-	UT_ASSERT_EQ((int) cluster_itl_get_tt_ref((Page) no_itl, 0, &ref), 0);
+	UT_ASSERT_EQ((int)cluster_itl_get_tt_ref((Page)no_itl, 0, &ref), 0);
 }
 
 
@@ -270,14 +285,14 @@ UT_TEST(test_t7_legacy_invaliduba_returns_zero_triple)
 	ClusterItlSlotData *s = slot_at(page, 0);
 
 	s->flags = ITL_FLAG_ACTIVE;
-	s->xid = (TransactionId) 12345;
-	s->undo_segment_head = (UBA) InvalidUba_init;
+	s->xid = (TransactionId)12345;
+	s->undo_segment_head = (UBA)InvalidUba_init;
 	s->commit_scn = InvalidScn;
 
-	UT_ASSERT_EQ((int) cluster_itl_get_tt_ref(page, 0, &ref), 1);
-	UT_ASSERT_EQ((int) ref.origin_node_id, 0);
-	UT_ASSERT_EQ((int) ref.undo_segment_id, 0);
-	UT_ASSERT_EQ((int) ref.tt_slot_id, 0);
+	UT_ASSERT_EQ((int)cluster_itl_get_tt_ref(page, 0, &ref), 1);
+	UT_ASSERT_EQ((int)ref.origin_node_id, 0);
+	UT_ASSERT_EQ((int)ref.undo_segment_id, 0);
+	UT_ASSERT_EQ((int)ref.tt_slot_id, 0);
 }
 
 UT_TEST(test_t8_legacy_cached_commit_scn_passthrough)
@@ -285,15 +300,15 @@ UT_TEST(test_t8_legacy_cached_commit_scn_passthrough)
 	Page page = build_itl_page();
 	ClusterUndoTTSlotRef ref;
 	ClusterItlSlotData *s = slot_at(page, 0);
-	SCN expected = (SCN) 7777;
+	SCN expected = (SCN)7777;
 
 	s->flags = ITL_FLAG_COMMITTED;
-	s->xid = (TransactionId) 12345;
-	s->undo_segment_head = (UBA) InvalidUba_init;
+	s->xid = (TransactionId)12345;
+	s->undo_segment_head = (UBA)InvalidUba_init;
 	s->commit_scn = expected;
 
-	UT_ASSERT_EQ((int) cluster_itl_get_tt_ref(page, 0, &ref), 1);
-	UT_ASSERT_EQ((int) (ref.cached_commit_scn == expected), 1);
+	UT_ASSERT_EQ((int)cluster_itl_get_tt_ref(page, 0, &ref), 1);
+	UT_ASSERT_EQ((int)(ref.cached_commit_scn == expected), 1);
 }
 
 UT_TEST(test_t9_legacy_cluster_epoch_set)
@@ -303,12 +318,12 @@ UT_TEST(test_t9_legacy_cluster_epoch_set)
 	ClusterItlSlotData *s = slot_at(page, 0);
 
 	s->flags = ITL_FLAG_ACTIVE;
-	s->xid = (TransactionId) 12345;
-	s->undo_segment_head = (UBA) InvalidUba_init;
+	s->xid = (TransactionId)12345;
+	s->undo_segment_head = (UBA)InvalidUba_init;
 	s->commit_scn = InvalidScn;
 
-	UT_ASSERT_EQ((int) cluster_itl_get_tt_ref(page, 0, &ref), 1);
-	UT_ASSERT_EQ((int) ref.cluster_epoch, 42);	/* stub returns 42 */
+	UT_ASSERT_EQ((int)cluster_itl_get_tt_ref(page, 0, &ref), 1);
+	UT_ASSERT_EQ((int)ref.cluster_epoch, 42); /* stub returns 42 */
 }
 
 
@@ -321,13 +336,12 @@ UT_TEST(test_t10_real_uba_origin_node_derived)
 	ClusterItlSlotData *s = slot_at(page, 0);
 
 	s->flags = ITL_FLAG_ACTIVE;
-	s->xid = (TransactionId) 12345;
-	s->undo_segment_head = uba_encode(257 /* node 1's first segment */,
-									  0, 5, 0);
+	s->xid = (TransactionId)12345;
+	s->undo_segment_head = uba_encode(257 /* node 1's first segment */, 0, 5, 0);
 	s->commit_scn = InvalidScn;
 
-	UT_ASSERT_EQ((int) cluster_itl_get_tt_ref(page, 0, &ref), 1);
-	UT_ASSERT_EQ((int) ref.origin_node_id, 1);
+	UT_ASSERT_EQ((int)cluster_itl_get_tt_ref(page, 0, &ref), 1);
+	UT_ASSERT_EQ((int)ref.origin_node_id, 1);
 }
 
 UT_TEST(test_t11_real_uba_undo_segment_id)
@@ -337,11 +351,11 @@ UT_TEST(test_t11_real_uba_undo_segment_id)
 	ClusterItlSlotData *s = slot_at(page, 0);
 
 	s->flags = ITL_FLAG_ACTIVE;
-	s->xid = (TransactionId) 12345;
+	s->xid = (TransactionId)12345;
 	s->undo_segment_head = uba_encode(257, 0, 5, 0);
 
-	UT_ASSERT_EQ((int) cluster_itl_get_tt_ref(page, 0, &ref), 1);
-	UT_ASSERT_EQ((int) ref.undo_segment_id, 257);
+	UT_ASSERT_EQ((int)cluster_itl_get_tt_ref(page, 0, &ref), 1);
+	UT_ASSERT_EQ((int)ref.undo_segment_id, 257);
 }
 
 UT_TEST(test_t12_real_uba_tt_slot_id_offset_plus_1)
@@ -351,11 +365,11 @@ UT_TEST(test_t12_real_uba_tt_slot_id_offset_plus_1)
 	ClusterItlSlotData *s = slot_at(page, 0);
 
 	s->flags = ITL_FLAG_ACTIVE;
-	s->xid = (TransactionId) 12345;
+	s->xid = (TransactionId)12345;
 	s->undo_segment_head = uba_encode(257, 0, 5, 0);
 
-	UT_ASSERT_EQ((int) cluster_itl_get_tt_ref(page, 0, &ref), 1);
-	UT_ASSERT_EQ((int) ref.tt_slot_id, 6);	/* offset 5 → id 6 (F1) */
+	UT_ASSERT_EQ((int)cluster_itl_get_tt_ref(page, 0, &ref), 1);
+	UT_ASSERT_EQ((int)ref.tt_slot_id, 6); /* offset 5 → id 6 (F1) */
 }
 
 UT_TEST(test_t13_real_uba_slot0_id_is_1)
@@ -365,11 +379,11 @@ UT_TEST(test_t13_real_uba_slot0_id_is_1)
 	ClusterItlSlotData *s = slot_at(page, 0);
 
 	s->flags = ITL_FLAG_ACTIVE;
-	s->xid = (TransactionId) 12345;
+	s->xid = (TransactionId)12345;
 	s->undo_segment_head = uba_encode(1, 0, 0, 0);
 
-	UT_ASSERT_EQ((int) cluster_itl_get_tt_ref(page, 0, &ref), 1);
-	UT_ASSERT_EQ((int) ref.tt_slot_id, 1);	/* F1: offset 0 → id 1 (NOT 0) */
+	UT_ASSERT_EQ((int)cluster_itl_get_tt_ref(page, 0, &ref), 1);
+	UT_ASSERT_EQ((int)ref.tt_slot_id, 1); /* F1: offset 0 → id 1 (NOT 0) */
 }
 
 UT_TEST(test_t14_real_uba_slot47_id_is_48)
@@ -379,11 +393,11 @@ UT_TEST(test_t14_real_uba_slot47_id_is_48)
 	ClusterItlSlotData *s = slot_at(page, 0);
 
 	s->flags = ITL_FLAG_ACTIVE;
-	s->xid = (TransactionId) 12345;
+	s->xid = (TransactionId)12345;
 	s->undo_segment_head = uba_encode(1, 0, 47, 0);
 
-	UT_ASSERT_EQ((int) cluster_itl_get_tt_ref(page, 0, &ref), 1);
-	UT_ASSERT_EQ((int) ref.tt_slot_id, 48);
+	UT_ASSERT_EQ((int)cluster_itl_get_tt_ref(page, 0, &ref), 1);
+	UT_ASSERT_EQ((int)ref.tt_slot_id, 48);
 }
 
 UT_TEST(test_t15_malformed_uba_raises)
@@ -394,14 +408,13 @@ UT_TEST(test_t15_malformed_uba_raises)
 	int before = ereport_raised_count;
 
 	s->flags = ITL_FLAG_ACTIVE;
-	s->xid = (TransactionId) 12345;
+	s->xid = (TransactionId)12345;
 	/* Reserved high bits non-zero -> uba_decode returns false. */
 	s->undo_segment_head.raw[0] = 1;
-	s->undo_segment_head.raw[1] = ((uint64) 1ULL << 32);
+	s->undo_segment_head.raw[1] = ((uint64)1ULL << 32);
 
-	if (sigsetjmp(ereport_recover_jmp, 1) == 0)
-	{
-		(void) cluster_itl_get_tt_ref(page, 0, &ref);
+	if (sigsetjmp(ereport_recover_jmp, 1) == 0) {
+		(void)cluster_itl_get_tt_ref(page, 0, &ref);
 		UT_ASSERT_EQ(0, 1);
 	}
 	UT_ASSERT_NE(ereport_raised_count, before);
@@ -415,13 +428,11 @@ UT_TEST(test_t16_out_of_range_node_raises)
 	int before = ereport_raised_count;
 
 	s->flags = ITL_FLAG_ACTIVE;
-	s->xid = (TransactionId) 12345;
-	s->undo_segment_head = uba_encode(32769 /* derived node = 128 > 127 */,
-									  0, 0, 0);
+	s->xid = (TransactionId)12345;
+	s->undo_segment_head = uba_encode(32769 /* derived node = 128 > 127 */, 0, 0, 0);
 
-	if (sigsetjmp(ereport_recover_jmp, 1) == 0)
-	{
-		(void) cluster_itl_get_tt_ref(page, 0, &ref);
+	if (sigsetjmp(ereport_recover_jmp, 1) == 0) {
+		(void)cluster_itl_get_tt_ref(page, 0, &ref);
 		UT_ASSERT_EQ(0, 1);
 	}
 	UT_ASSERT_NE(ereport_raised_count, before);
@@ -437,12 +448,12 @@ UT_TEST(test_t17_has_cached_status_true_for_committed_valid_scn)
 	ClusterItlSlotData *s = slot_at(page, 0);
 
 	s->flags = ITL_FLAG_COMMITTED;
-	s->xid = (TransactionId) 12345;
+	s->xid = (TransactionId)12345;
 	s->undo_segment_head = uba_encode(1, 0, 0, 0);
-	s->commit_scn = (SCN) 9999;	/* valid */
+	s->commit_scn = (SCN)9999; /* valid */
 
-	UT_ASSERT_EQ((int) cluster_itl_get_tt_ref(page, 0, &ref), 1);
-	UT_ASSERT_EQ((int) ref.has_cached_status, 1);
+	UT_ASSERT_EQ((int)cluster_itl_get_tt_ref(page, 0, &ref), 1);
+	UT_ASSERT_EQ((int)ref.has_cached_status, 1);
 }
 
 UT_TEST(test_t18_has_cached_status_false_for_active)
@@ -452,12 +463,12 @@ UT_TEST(test_t18_has_cached_status_false_for_active)
 	ClusterItlSlotData *s = slot_at(page, 0);
 
 	s->flags = ITL_FLAG_ACTIVE;
-	s->xid = (TransactionId) 12345;
+	s->xid = (TransactionId)12345;
 	s->undo_segment_head = uba_encode(1, 0, 0, 0);
 	s->commit_scn = InvalidScn;
 
-	UT_ASSERT_EQ((int) cluster_itl_get_tt_ref(page, 0, &ref), 1);
-	UT_ASSERT_EQ((int) ref.has_cached_status, 0);
+	UT_ASSERT_EQ((int)cluster_itl_get_tt_ref(page, 0, &ref), 1);
+	UT_ASSERT_EQ((int)ref.has_cached_status, 0);
 }
 
 

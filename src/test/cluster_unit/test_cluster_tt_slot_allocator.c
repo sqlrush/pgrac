@@ -126,18 +126,20 @@ static sigjmp_buf ereport_recover_jmp;
 static int ereport_raised_count = 0;
 static int last_ereport_errcode = 0;
 
-#define EREPORT_RECOVER_SETUP() \
-	do { ereport_raised_count = 0; last_ereport_errcode = 0; } while (0)
+#define EREPORT_RECOVER_SETUP()                                                                    \
+	do {                                                                                           \
+		ereport_raised_count = 0;                                                                  \
+		last_ereport_errcode = 0;                                                                  \
+	} while (0)
 
 bool
 errstart(int elevel, const char *domain pg_attribute_unused())
 {
-	if (elevel >= ERROR)
-	{
+	if (elevel >= ERROR) {
 		ereport_raised_count++;
-		return true;	/* let errmsg / errcode get called, then we longjmp */
+		return true; /* let errmsg / errcode get called, then we longjmp */
 	}
-	return false;	/* drop sub-ERROR */
+	return false; /* drop sub-ERROR */
 }
 
 /* PG marks errstart_cold as a cold-path wrapper used by macro expansions. */
@@ -156,8 +158,7 @@ cluster_shmem_register_region(const struct ClusterShmemRegion *region pg_attribu
 {}
 
 void
-errfinish(const char *filename pg_attribute_unused(),
-		  int lineno pg_attribute_unused(),
+errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
 		  const char *funcname pg_attribute_unused())
 {
 	siglongjmp(ereport_recover_jmp, 1);
@@ -202,13 +203,12 @@ reset_allocator(void)
 	/* Reinitialise the shmem region; this wipes per-node state. */
 	bool dummy_found;
 
-	if (mock_shmem_buffer != NULL)
-	{
+	if (mock_shmem_buffer != NULL) {
 		free(mock_shmem_buffer);
 		mock_shmem_buffer = NULL;
 	}
 	cluster_tt_slot_shmem_init();
-	(void) dummy_found;
+	(void)dummy_found;
 
 	mock_lwlock_acquire_excl_count = 0;
 	mock_lwlock_acquire_shared_count = 0;
@@ -227,35 +227,34 @@ reset_allocator(void)
 
 UT_TEST(test_t1_invalid_offset_sentinel)
 {
-	UT_ASSERT_EQ((int) INVALID_TT_SLOT_OFFSET, (int) 0xFFFF);
+	UT_ASSERT_EQ((int)INVALID_TT_SLOT_OFFSET, (int)0xFFFF);
 }
 
 UT_TEST(test_t2_slots_per_segment)
 {
-	UT_ASSERT_EQ((int) TT_SLOTS_PER_SEGMENT, 48);
+	UT_ASSERT_EQ((int)TT_SLOTS_PER_SEGMENT, 48);
 }
 
 UT_TEST(test_t3_offset_to_id_endpoints)
 {
-	UT_ASSERT_EQ((int) cluster_tt_slot_offset_to_id(0), 1);
-	UT_ASSERT_EQ((int) cluster_tt_slot_offset_to_id(47), 48);
+	UT_ASSERT_EQ((int)cluster_tt_slot_offset_to_id(0), 1);
+	UT_ASSERT_EQ((int)cluster_tt_slot_offset_to_id(47), 48);
 }
 
 UT_TEST(test_t4_id_to_offset_endpoints)
 {
-	UT_ASSERT_EQ((int) cluster_tt_slot_id_to_offset(1), 0);
-	UT_ASSERT_EQ((int) cluster_tt_slot_id_to_offset(48), 47);
+	UT_ASSERT_EQ((int)cluster_tt_slot_id_to_offset(1), 0);
+	UT_ASSERT_EQ((int)cluster_tt_slot_id_to_offset(48), 47);
 }
 
 UT_TEST(test_t5_offset_id_mutual_inverse)
 {
 	int i;
 
-	for (i = 0; i < 48; i++)
-	{
-		uint32 id = cluster_tt_slot_offset_to_id((uint16) i);
+	for (i = 0; i < 48; i++) {
+		uint32 id = cluster_tt_slot_offset_to_id((uint16)i);
 
-		UT_ASSERT_EQ((int) cluster_tt_slot_id_to_offset(id), i);
+		UT_ASSERT_EQ((int)cluster_tt_slot_id_to_offset(id), i);
 	}
 }
 
@@ -263,9 +262,9 @@ UT_TEST(test_t6_shmem_size_nonzero)
 {
 	Size sz = cluster_tt_slot_shmem_size();
 
-	UT_ASSERT_NE((int) sz, 0);
+	UT_ASSERT_NE((int)sz, 0);
 	/* MAXALIGN'd: low bits zero (typically aligned to 8). */
-	UT_ASSERT_EQ((int) (sz & 0x7), 0);
+	UT_ASSERT_EQ((int)(sz & 0x7), 0);
 }
 
 UT_TEST(test_t7_shmem_init_fresh_state)
@@ -274,9 +273,9 @@ UT_TEST(test_t7_shmem_init_fresh_state)
 
 	/* Fresh state: first alloc on any segment must succeed and return
 	 * offset 0 because all slots are zero-init (CTS_FREE). */
-	uint16 off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 100);
+	uint16 off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
 
-	UT_ASSERT_EQ((int) off, 0);
+	UT_ASSERT_EQ((int)off, 0);
 }
 
 UT_TEST(test_t8_alloc_fresh_returns_offset_0)
@@ -284,8 +283,8 @@ UT_TEST(test_t8_alloc_fresh_returns_offset_0)
 	uint16 off;
 
 	reset_allocator();
-	off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 100);
-	UT_ASSERT_EQ((int) off, 0);
+	off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
+	UT_ASSERT_EQ((int)off, 0);
 }
 
 UT_TEST(test_t9_alloc_same_xid_idempotent)
@@ -293,9 +292,9 @@ UT_TEST(test_t9_alloc_same_xid_idempotent)
 	uint16 off1, off2;
 
 	reset_allocator();
-	off1 = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 100);
-	off2 = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 100);
-	UT_ASSERT_EQ((int) off1, (int) off2);
+	off1 = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
+	off2 = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
+	UT_ASSERT_EQ((int)off1, (int)off2);
 }
 
 UT_TEST(test_t10_alloc_distinct_xid_distinct_offset)
@@ -303,23 +302,22 @@ UT_TEST(test_t10_alloc_distinct_xid_distinct_offset)
 	uint16 off1, off2;
 
 	reset_allocator();
-	off1 = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 100);
-	off2 = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 200);
-	UT_ASSERT_NE((int) off1, (int) off2);
+	off1 = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
+	off2 = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)200);
+	UT_ASSERT_NE((int)off1, (int)off2);
 }
 
 UT_TEST(test_t11_alloc_48_distinct_returns_offsets_0_to_47)
 {
 	int i;
-	int seen[48] = {0};
+	int seen[48] = { 0 };
 
 	reset_allocator();
-	for (i = 0; i < 48; i++)
-	{
+	for (i = 0; i < 48; i++) {
 		uint16 off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)(1000 + i));
 
-		UT_ASSERT_NE((int) off, (int) INVALID_TT_SLOT_OFFSET);
-		UT_ASSERT_EQ((int) (off < 48), 1);
+		UT_ASSERT_NE((int)off, (int)INVALID_TT_SLOT_OFFSET);
+		UT_ASSERT_EQ((int)(off < 48), 1);
 		seen[off]++;
 	}
 	for (i = 0; i < 48; i++)
@@ -333,10 +331,10 @@ UT_TEST(test_t12_alloc_49th_returns_overflow)
 
 	reset_allocator();
 	for (i = 0; i < 48; i++)
-		(void) cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)(1000 + i));
+		(void)cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)(1000 + i));
 
-	off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 9999);
-	UT_ASSERT_EQ((int) off, (int) INVALID_TT_SLOT_OFFSET);
+	off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)9999);
+	UT_ASSERT_EQ((int)off, (int)INVALID_TT_SLOT_OFFSET);
 }
 
 UT_TEST(test_t13_free_then_alloc_reuses_offset)
@@ -344,17 +342,17 @@ UT_TEST(test_t13_free_then_alloc_reuses_offset)
 	uint16 off1, off2;
 
 	reset_allocator();
-	off1 = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 100);
+	off1 = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
 	cluster_tt_slot_free(NODE0_SEG, off1);
-	off2 = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 200);
-	UT_ASSERT_EQ((int) off1, (int) off2);
+	off2 = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)200);
+	UT_ASSERT_EQ((int)off1, (int)off2);
 }
 
 UT_TEST(test_t14_free_of_free_slot_is_idempotent)
 {
 	reset_allocator();
-	cluster_tt_slot_free(NODE0_SEG, 5);	/* never alloc'd, just free */
-	cluster_tt_slot_free(NODE0_SEG, 5);	/* free again */
+	cluster_tt_slot_free(NODE0_SEG, 5); /* never alloc'd, just free */
+	cluster_tt_slot_free(NODE0_SEG, 5); /* free again */
 	/* No crash, no ereport. */
 	UT_ASSERT_EQ(1, 1);
 }
@@ -362,8 +360,8 @@ UT_TEST(test_t14_free_of_free_slot_is_idempotent)
 UT_TEST(test_t15_get_wrap_fresh_zero)
 {
 	reset_allocator();
-	(void) cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 100);
-	UT_ASSERT_EQ((int) cluster_tt_slot_get_wrap(NODE0_SEG, 0), 0);
+	(void)cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
+	UT_ASSERT_EQ((int)cluster_tt_slot_get_wrap(NODE0_SEG, 0), 0);
 }
 
 UT_TEST(test_t16_wrap_unchanged_first_alloc)
@@ -371,8 +369,8 @@ UT_TEST(test_t16_wrap_unchanged_first_alloc)
 	uint16 off;
 
 	reset_allocator();
-	off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 100);
-	UT_ASSERT_EQ((int) cluster_tt_slot_get_wrap(NODE0_SEG, off), 0);
+	off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
+	UT_ASSERT_EQ((int)cluster_tt_slot_get_wrap(NODE0_SEG, off), 0);
 }
 
 UT_TEST(test_t17_wrap_unchanged_free_realloc_cycle_diff_xid)
@@ -382,11 +380,11 @@ UT_TEST(test_t17_wrap_unchanged_free_realloc_cycle_diff_xid)
 	uint16 off1, off2;
 
 	reset_allocator();
-	off1 = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 100);
+	off1 = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
 	cluster_tt_slot_free(NODE0_SEG, off1);
-	off2 = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 200);
-	UT_ASSERT_EQ((int) off1, (int) off2);
-	UT_ASSERT_EQ((int) cluster_tt_slot_get_wrap(NODE0_SEG, off2), 0);
+	off2 = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)200);
+	UT_ASSERT_EQ((int)off1, (int)off2);
+	UT_ASSERT_EQ((int)cluster_tt_slot_get_wrap(NODE0_SEG, off2), 0);
 }
 
 UT_TEST(test_t18_wrap_unchanged_same_xid_reuse)
@@ -394,9 +392,9 @@ UT_TEST(test_t18_wrap_unchanged_same_xid_reuse)
 	uint16 off;
 
 	reset_allocator();
-	off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 100);
-	(void) cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 100);
-	UT_ASSERT_EQ((int) cluster_tt_slot_get_wrap(NODE0_SEG, off), 0);
+	off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
+	(void)cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
+	UT_ASSERT_EQ((int)cluster_tt_slot_get_wrap(NODE0_SEG, off), 0);
 }
 
 UT_TEST(test_t19_recycle_committed_bumps_wrap)
@@ -415,7 +413,7 @@ UT_TEST(test_t19_recycle_committed_bumps_wrap)
 	uint16 wrap_after;
 
 	reset_allocator();
-	first_off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 100);
+	first_off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
 	wrap_before = cluster_tt_slot_get_wrap(NODE0_SEG, first_off);
 
 	/* Mark slot 0 as COMMITTED. */
@@ -424,14 +422,14 @@ UT_TEST(test_t19_recycle_committed_bumps_wrap)
 	/* Fill the remaining 47 slots with distinct ACTIVE xids so no FREE
 	 * slot remains; the next alloc must recycle the COMMITTED one. */
 	for (i = 1; i < TT_SLOTS_PER_SEGMENT; i++)
-		(void) cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)(2000 + i));
+		(void)cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)(2000 + i));
 
 	/* Fresh xid alloc -- only recyclable slot is slot first_off (COMMITTED). */
-	recycled_off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 99999);
-	UT_ASSERT_EQ((int) recycled_off, (int) first_off);
+	recycled_off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)99999);
+	UT_ASSERT_EQ((int)recycled_off, (int)first_off);
 
 	wrap_after = cluster_tt_slot_get_wrap(NODE0_SEG, recycled_off);
-	UT_ASSERT_EQ((int) (wrap_after > wrap_before), 1);
+	UT_ASSERT_EQ((int)(wrap_after > wrap_before), 1);
 }
 
 UT_TEST(test_t20_recycle_aborted_bumps_wrap)
@@ -444,19 +442,19 @@ UT_TEST(test_t20_recycle_aborted_bumps_wrap)
 	uint16 wrap_after;
 
 	reset_allocator();
-	first_off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 100);
+	first_off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
 	wrap_before = cluster_tt_slot_get_wrap(NODE0_SEG, first_off);
 
 	cluster_tt_slot_test_force_status(NODE0_SEG, first_off, 3 /* CTS_ABORTED */);
 
 	for (i = 1; i < TT_SLOTS_PER_SEGMENT; i++)
-		(void) cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)(3000 + i));
+		(void)cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)(3000 + i));
 
-	recycled_off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 99998);
-	UT_ASSERT_EQ((int) recycled_off, (int) first_off);
+	recycled_off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)99998);
+	UT_ASSERT_EQ((int)recycled_off, (int)first_off);
 
 	wrap_after = cluster_tt_slot_get_wrap(NODE0_SEG, recycled_off);
-	UT_ASSERT_EQ((int) (wrap_after > wrap_before), 1);
+	UT_ASSERT_EQ((int)(wrap_after > wrap_before), 1);
 }
 
 UT_TEST(test_t21_own_active_reuse_no_wrap_bump)
@@ -464,16 +462,16 @@ UT_TEST(test_t21_own_active_reuse_no_wrap_bump)
 	uint16 off;
 
 	reset_allocator();
-	off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 100);
-	(void) cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 100);
-	(void) cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 100);
-	UT_ASSERT_EQ((int) cluster_tt_slot_get_wrap(NODE0_SEG, off), 0);
+	off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
+	(void)cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
+	(void)cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
+	UT_ASSERT_EQ((int)cluster_tt_slot_get_wrap(NODE0_SEG, off), 0);
 }
 
 UT_TEST(test_t22_alloc_uses_lw_exclusive)
 {
 	reset_allocator();
-	(void) cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 100);
+	(void)cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
 	UT_ASSERT_NE(mock_lwlock_acquire_excl_count, 0);
 }
 
@@ -482,9 +480,9 @@ UT_TEST(test_t23_get_wrap_uses_lw_shared)
 	int before;
 
 	reset_allocator();
-	(void) cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 100);
+	(void)cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
 	before = mock_lwlock_acquire_shared_count;
-	(void) cluster_tt_slot_get_wrap(NODE0_SEG, 0);
+	(void)cluster_tt_slot_get_wrap(NODE0_SEG, 0);
 	UT_ASSERT_NE(mock_lwlock_acquire_shared_count, before);
 }
 
@@ -493,13 +491,13 @@ UT_TEST(test_t24_reset_all_wipes_state)
 	uint16 off;
 
 	reset_allocator();
-	(void) cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 100);
+	(void)cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
 	cluster_tt_slot_reset_all();
 
 	/* After reset_all, the per-node segment binding is cleared, so an
 	 * alloc on the same segment must again succeed with offset 0. */
-	off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 200);
-	UT_ASSERT_EQ((int) off, 0);
+	off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)200);
+	UT_ASSERT_EQ((int)off, 0);
 }
 
 UT_TEST(test_t25_per_node_isolation)
@@ -507,14 +505,14 @@ UT_TEST(test_t25_per_node_isolation)
 	uint16 off0, off1;
 
 	reset_allocator();
-	off0 = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 100);
+	off0 = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
 
 	/* Different segment for a different node -- must NOT share the
 	 * occupied-slot state. */
-	off1 = cluster_tt_slot_alloc(NODE1_SEG, (TransactionId) 200);
+	off1 = cluster_tt_slot_alloc(NODE1_SEG, (TransactionId)200);
 
-	UT_ASSERT_EQ((int) off0, 0);
-	UT_ASSERT_EQ((int) off1, 0);
+	UT_ASSERT_EQ((int)off0, 0);
+	UT_ASSERT_EQ((int)off1, 0);
 }
 
 UT_TEST(test_t26_multi_instance_unlock_node0_node1)
@@ -522,23 +520,21 @@ UT_TEST(test_t26_multi_instance_unlock_node0_node1)
 	/* Both node 0 (seg 1) and node 1 (seg 257) get fresh allocators. */
 	reset_allocator();
 
-	(void) cluster_tt_slot_alloc(NODE0_SEG, (TransactionId) 100);
-	(void) cluster_tt_slot_alloc(NODE1_SEG, (TransactionId) 200);
-	(void) cluster_tt_slot_alloc(NODE1_SEG, (TransactionId) 201);
+	(void)cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
+	(void)cluster_tt_slot_alloc(NODE1_SEG, (TransactionId)200);
+	(void)cluster_tt_slot_alloc(NODE1_SEG, (TransactionId)201);
 
 	/* Wraps still 0 -- multi-instance unlocked, no recycle yet. */
-	UT_ASSERT_EQ((int) cluster_tt_slot_get_wrap(NODE0_SEG, 0), 0);
-	UT_ASSERT_EQ((int) cluster_tt_slot_get_wrap(NODE1_SEG, 0), 0);
-	UT_ASSERT_EQ((int) cluster_tt_slot_get_wrap(NODE1_SEG, 1), 0);
+	UT_ASSERT_EQ((int)cluster_tt_slot_get_wrap(NODE0_SEG, 0), 0);
+	UT_ASSERT_EQ((int)cluster_tt_slot_get_wrap(NODE1_SEG, 0), 0);
+	UT_ASSERT_EQ((int)cluster_tt_slot_get_wrap(NODE1_SEG, 1), 0);
 }
 
 UT_TEST(test_t27_segment_zero_raises)
 {
 	reset_allocator();
-	if (sigsetjmp(ereport_recover_jmp, 1) == 0)
-	{
-		(void) cluster_tt_slot_alloc(0 /* bootstrap-only segment */,
-									 (TransactionId) 100);
+	if (sigsetjmp(ereport_recover_jmp, 1) == 0) {
+		(void)cluster_tt_slot_alloc(0 /* bootstrap-only segment */, (TransactionId)100);
 		/* Should not reach here. */
 		UT_ASSERT_EQ(0, 1);
 	}
@@ -548,10 +544,8 @@ UT_TEST(test_t27_segment_zero_raises)
 UT_TEST(test_t28_segment_over_uint16max_raises)
 {
 	reset_allocator();
-	if (sigsetjmp(ereport_recover_jmp, 1) == 0)
-	{
-		(void) cluster_tt_slot_alloc(0x10000u /* > UINT16_MAX */,
-									 (TransactionId) 100);
+	if (sigsetjmp(ereport_recover_jmp, 1) == 0) {
+		(void)cluster_tt_slot_alloc(0x10000u /* > UINT16_MAX */, (TransactionId)100);
 		UT_ASSERT_EQ(0, 1);
 	}
 	UT_ASSERT_NE(ereport_raised_count, 0);
@@ -560,9 +554,8 @@ UT_TEST(test_t28_segment_over_uint16max_raises)
 UT_TEST(test_t29_invalid_xid_raises)
 {
 	reset_allocator();
-	if (sigsetjmp(ereport_recover_jmp, 1) == 0)
-	{
-		(void) cluster_tt_slot_alloc(NODE0_SEG, InvalidTransactionId);
+	if (sigsetjmp(ereport_recover_jmp, 1) == 0) {
+		(void)cluster_tt_slot_alloc(NODE0_SEG, InvalidTransactionId);
 		UT_ASSERT_EQ(0, 1);
 	}
 	UT_ASSERT_NE(ereport_raised_count, 0);
@@ -571,8 +564,7 @@ UT_TEST(test_t29_invalid_xid_raises)
 UT_TEST(test_t30_free_offset_overflow_raises)
 {
 	reset_allocator();
-	if (sigsetjmp(ereport_recover_jmp, 1) == 0)
-	{
+	if (sigsetjmp(ereport_recover_jmp, 1) == 0) {
 		cluster_tt_slot_free(NODE0_SEG, 48 /* out of [0, 48) */);
 		UT_ASSERT_EQ(0, 1);
 	}
@@ -583,7 +575,7 @@ UT_TEST(test_t30_free_offset_overflow_raises)
 int
 main(void)
 {
-	cluster_tt_slot_shmem_init();		/* one-time init for tests that
+	cluster_tt_slot_shmem_init(); /* one-time init for tests that
 										   don't call reset_allocator */
 
 	UT_RUN(test_t1_invalid_offset_sentinel);

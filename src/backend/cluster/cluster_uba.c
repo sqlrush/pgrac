@@ -31,7 +31,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_uba.h"
-#include "cluster/storage/cluster_undo_alloc.h"	/* CLUSTER_UNDO_SEGS_PER_INSTANCE */
+#include "cluster/storage/cluster_undo_alloc.h" /* CLUSTER_UNDO_SEGS_PER_INSTANCE */
 
 
 /*
@@ -65,8 +65,8 @@ uba_origin_node_id(UBA u)
 		return InvalidNodeId;
 
 	derived = (seg_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE;
-	if (derived > (uint32) SCN_MAX_VALID_NODE_ID)
+	if (derived > (uint32)SCN_MAX_VALID_NODE_ID)
 		return InvalidNodeId;
 
-	return (NodeId) derived;
+	return (NodeId)derived;
 }

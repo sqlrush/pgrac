@@ -46,7 +46,7 @@
  *
  *	Spec: spec-3.4b-real-tt-allocator-uba-encoding-production-cross-node.md
  */
-#define CLUSTER_UNDO_OWNER_INVALID ((uint8) 0)
+#define CLUSTER_UNDO_OWNER_INVALID ((uint8)0)
 
 
 /*
@@ -74,7 +74,7 @@
  *
  *	Spec: spec-3.4b-real-tt-allocator-uba-encoding-production-cross-node.md
  */
-#define CLUSTER_UNDO_SEGS_PER_INSTANCE ((uint32) 256)
+#define CLUSTER_UNDO_SEGS_PER_INSTANCE ((uint32)256)
 
 
 /*

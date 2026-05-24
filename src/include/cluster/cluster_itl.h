@@ -46,7 +46,7 @@
 #define CLUSTER_ITL_H
 
 #include "c.h"
-#include "access/htup.h"			   /* HeapTupleHeader forward typedef */
+#include "access/htup.h"			 /* HeapTupleHeader forward typedef */
 #include "access/transam.h"			 /* TransactionId */
 #include "storage/buf.h"			 /* Buffer */
 #include "storage/bufpage.h"		 /* Page typedef */
@@ -135,8 +135,8 @@ extern bool cluster_itl_alloc_or_reuse_slot(Buffer buf, TransactionId top_xid, u
  *	the binding from cluster_tt_local_get_or_create_binding() outside
  *	the critical section and pass the encoded UBA in here.
  */
-extern void cluster_itl_stamp_active(Buffer buf, uint8 slot_idx, TransactionId xid,
-									 SCN write_scn, UBA undo_segment_head);
+extern void cluster_itl_stamp_active(Buffer buf, uint8 slot_idx, TransactionId xid, SCN write_scn,
+									 UBA undo_segment_head);
 
 /*
  * cluster_itl_stamp_committed -- transition ACTIVE → COMMITTED with
@@ -202,8 +202,7 @@ extern void cluster_itl_check_subxact_or_error(void);
  *
  *	Returns the total number of bytes consumed in the WAL record.
  */
-extern Size cluster_itl_redo_apply_block_local_delta(Page page,
-													 HeapTupleHeader htup,
+extern Size cluster_itl_redo_apply_block_local_delta(Page page, HeapTupleHeader htup,
 													 const char *itl_block_start);
 
 /*

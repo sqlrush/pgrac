@@ -38,7 +38,7 @@
 #include <unistd.h>
 
 #include "access/xlog.h"
-#include "cluster/cluster_scn.h"		   /* SCN_MAX_VALID_NODE_ID */
+#include "cluster/cluster_scn.h" /* SCN_MAX_VALID_NODE_ID */
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/cluster_undo_segment_init.h"
 #include "cluster/storage/cluster_undo_alloc.h"
@@ -184,28 +184,23 @@ cluster_undo_segment_allocate(uint32 segment_id, uint8 owner_instance)
 	 *   ("owner_instance must equal CLUSTER_UNDO_DEFAULT_OWNER (1)")
 	 *   is replaced with the multi-instance validation chain below.
 	 */
-	if (owner_instance == CLUSTER_UNDO_OWNER_INVALID
-		|| owner_instance > UNDO_OWNER_INSTANCE_MAX)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("owner_instance %u out of range [1, %u]",
-						(unsigned) owner_instance,
-						(unsigned) UNDO_OWNER_INSTANCE_MAX)));
+	if (owner_instance == CLUSTER_UNDO_OWNER_INVALID || owner_instance > UNDO_OWNER_INSTANCE_MAX)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("owner_instance %u out of range [1, %u]", (unsigned)owner_instance,
+							   (unsigned)UNDO_OWNER_INSTANCE_MAX)));
 
 	/* Spec-3.4b F2: segment 0 is the bootstrap-only sentinel. */
 	if (segment_id == 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("segment_id 0 is bootstrap-only and not allocatable")));
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("segment_id 0 is bootstrap-only and not allocatable")));
 
 	/* Spec-3.4b F4: exact-key alias guard against 16-bit truncation. */
 	if (segment_id > UINT16_MAX)
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("segment_id %u exceeds spec-3.4b limit of UINT16_MAX (%u)",
-						(unsigned) segment_id, (unsigned) UINT16_MAX),
-				 errhint("Stage 4/5 may bump ClusterUndoTTSlotRef.undo_segment_id "
-						 "and ClusterTTStatusKey.undo_segment_id to wider types.")));
+		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						errmsg("segment_id %u exceeds spec-3.4b limit of UINT16_MAX (%u)",
+							   (unsigned)segment_id, (unsigned)UINT16_MAX),
+						errhint("Stage 4/5 may bump ClusterUndoTTSlotRef.undo_segment_id "
+								"and ClusterTTStatusKey.undo_segment_id to wider types.")));
 
 	/*
 	 * Spec-3.4b D2: a node may only allocate segments whose id falls
@@ -217,22 +212,20 @@ cluster_undo_segment_allocate(uint32 segment_id, uint8 owner_instance)
 	{
 		uint32 derived_inst = ((segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1;
 
-		if (derived_inst != (uint32) owner_instance)
-			ereport(PANIC,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("segment_id %u maps to owner_instance %u, "
-							"but allocate was called with owner_instance %u",
-							(unsigned) segment_id, (unsigned) derived_inst,
-							(unsigned) owner_instance)));
+		if (derived_inst != (uint32)owner_instance)
+			ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("segment_id %u maps to owner_instance %u, "
+								   "but allocate was called with owner_instance %u",
+								   (unsigned)segment_id, (unsigned)derived_inst,
+								   (unsigned)owner_instance)));
 
 		/* And that owner must be this node. */
-		if ((int) owner_instance != cluster_node_id + 1)
+		if ((int)owner_instance != cluster_node_id + 1)
 			ereport(PANIC,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("attempt to allocate segment owned by instance %u "
 							"from cluster_node_id %d (own owner_instance %d)",
-							(unsigned) owner_instance, cluster_node_id,
-							cluster_node_id + 1)));
+							(unsigned)owner_instance, cluster_node_id, cluster_node_id + 1)));
 	}
 
 	if (cluster_undo_path_resolve(owner_instance, segment_id, path, sizeof(path)) != 0)
@@ -337,15 +330,14 @@ cluster_undo_active_segment_for_node_or_create(int node_id)
 	uint8 owner_instance;
 
 	if (node_id < 0 || node_id > SCN_MAX_VALID_NODE_ID)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("node_id %d out of range [0, %d] for undo segment selection",
-						node_id, SCN_MAX_VALID_NODE_ID)));
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("node_id %d out of range [0, %d] for undo segment selection",
+							   node_id, SCN_MAX_VALID_NODE_ID)));
 
-	owner_instance = (uint8) (node_id + 1);
+	owner_instance = (uint8)(node_id + 1);
 
 	/* per_instance_slot = 0 (spec-3.4b MVP, single active segment per node) */
-	segment_id = (uint32) node_id * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	segment_id = (uint32)node_id * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
 
 	/*
 	 * cluster_undo_segment_allocate is idempotent: it returns silently if

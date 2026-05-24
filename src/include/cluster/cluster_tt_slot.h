@@ -250,7 +250,7 @@ StaticAssertDecl(sizeof(ClusterUndoTTSlotRef) == 32,
  * the per-segment 48-slot table is fully occupied by ACTIVE entries.
  * Value 0xFFFF is unambiguous: valid offsets are [0, TT_SLOTS_PER_SEGMENT - 1].
  */
-#define INVALID_TT_SLOT_OFFSET ((uint16) 0xFFFF)
+#define INVALID_TT_SLOT_OFFSET ((uint16)0xFFFF)
 
 
 /*
@@ -271,14 +271,14 @@ static inline uint32
 cluster_tt_slot_offset_to_id(uint16 slot_offset)
 {
 	Assert(slot_offset < TT_SLOTS_PER_SEGMENT);
-	return ((uint32) slot_offset) + 1;
+	return ((uint32)slot_offset) + 1;
 }
 
 static inline uint16
 cluster_tt_slot_id_to_offset(uint32 tt_slot_id)
 {
 	Assert(tt_slot_id >= 1 && tt_slot_id <= TT_SLOTS_PER_SEGMENT);
-	return (uint16) (tt_slot_id - 1);
+	return (uint16)(tt_slot_id - 1);
 }
 
 

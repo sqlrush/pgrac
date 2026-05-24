@@ -29,18 +29,18 @@
  */
 #include "postgres.h"
 
-#include "access/heapam_xlog.h"	/* xl_heap_itl_delta / _v2 / _block (spec-3.4b D6) */
+#include "access/heapam_xlog.h"	 /* xl_heap_itl_delta / _v2 / _block (spec-3.4b D6) */
 #include "access/htup_details.h" /* HeapTupleHeaderData for t_itl_slot_idx */
-#include "access/xact.h"	/* GetCurrentTransactionNestLevel (spec-3.4a N9) */
-#include "storage/bufmgr.h" /* BufferGetPage, MarkBufferDirty (spec-3.4a D2) */
+#include "access/xact.h"		 /* GetCurrentTransactionNestLevel (spec-3.4a N9) */
+#include "storage/bufmgr.h"		 /* BufferGetPage, MarkBufferDirty (spec-3.4a D2) */
 #include "storage/bufpage.h"
-#include "cluster/cluster_epoch.h"		 /* cluster_epoch_get_current (spec-3.4b D7) */
-#include "cluster/cluster_guc.h" /* cluster_enabled */
+#include "cluster/cluster_epoch.h" /* cluster_epoch_get_current (spec-3.4b D7) */
+#include "cluster/cluster_guc.h"   /* cluster_enabled */
 #include "cluster/cluster_itl.h"
 #include "cluster/cluster_itl_slot.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_tt_slot.h"
-#include "cluster/cluster_uba.h"		 /* uba_decode / uba_origin_node_id (spec-3.4b D7) */
+#include "cluster/cluster_uba.h" /* uba_decode / uba_origin_node_id (spec-3.4b D7) */
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -89,39 +89,33 @@ cluster_itl_get_tt_ref(Page page, uint8 itl_slot_idx, ClusterUndoTTSlotRef *ref)
 
 	memset(ref, 0, sizeof(*ref));
 
-	if (UBA_is_invalid(slot->undo_segment_head))
-	{
+	if (UBA_is_invalid(slot->undo_segment_head)) {
 		/* Legacy spec-3.4a stamp; pre-3.4b ITL slots carry InvalidUba.
 		 * Reader falls back to zero triple — spec-3.1/3.4a behavior. */
 		ref->origin_node_id = 0;
 		ref->undo_segment_id = 0;
 		ref->tt_slot_id = 0;
-	}
-	else
-	{
+	} else {
 		uint32 seg_id;
 		uint32 blk_no;
 		uint16 tt_off;
 		uint16 row_off;
 		NodeId origin;
 
-		if (!uba_decode(slot->undo_segment_head, &seg_id, &blk_no,
-						&tt_off, &row_off))
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("malformed UBA in ITL slot %u", itl_slot_idx)));
+		if (!uba_decode(slot->undo_segment_head, &seg_id, &blk_no, &tt_off, &row_off))
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("malformed UBA in ITL slot %u", itl_slot_idx)));
 		origin = uba_origin_node_id(slot->undo_segment_head);
 		if (origin == InvalidNodeId)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("UBA decode: segment_id %u has no valid owner_instance",
-							seg_id)));
-		ref->origin_node_id = (uint16) origin;
-		ref->undo_segment_id = (uint16) seg_id;
+					 errmsg("UBA decode: segment_id %u has no valid owner_instance", seg_id)));
+		ref->origin_node_id = (uint16)origin;
+		ref->undo_segment_id = (uint16)seg_id;
 		ref->tt_slot_id = cluster_tt_slot_offset_to_id(tt_off);
 	}
 
-	ref->cluster_epoch = (uint32) cluster_epoch_get_current();
+	ref->cluster_epoch = (uint32)cluster_epoch_get_current();
 	ref->local_xid = slot->xid;
 	ref->cached_commit_scn = slot->commit_scn;
 	ref->has_cached_status = (slot->flags == ITL_FLAG_COMMITTED && SCN_VALID(slot->commit_scn));
@@ -304,15 +298,12 @@ cluster_itl_redo_apply_block_local_delta(Page page, HeapTupleHeader htup,
 	else if (hdr.format_version == CLUSTER_ITL_DELTA_FORMAT_V2)
 		delta_size = sizeof(xl_heap_itl_delta_v2);
 	else
-		elog(PANIC,
-			 "spec-3.4b D6: unknown xl_heap_itl_delta_block.format_version %u",
-			 (unsigned) hdr.format_version);
+		elog(PANIC, "spec-3.4b D6: unknown xl_heap_itl_delta_block.format_version %u",
+			 (unsigned)hdr.format_version);
 
-	for (i = 0; i < hdr.ndeltas; i++)
-	{
-		const char *p = itl_block_start
-						+ offsetof(xl_heap_itl_delta_block, deltas)
-						+ (Size) i * delta_size;
+	for (i = 0; i < hdr.ndeltas; i++) {
+		const char *p
+			= itl_block_start + offsetof(xl_heap_itl_delta_block, deltas) + (Size)i * delta_size;
 		ClusterItlSlotData *slot;
 		uint16 slot_idx;
 		uint16 flags_after;
@@ -321,8 +312,7 @@ cluster_itl_redo_apply_block_local_delta(Page page, HeapTupleHeader htup,
 		SCN d_commit_scn;
 		UBA d_uba = InvalidUba_init;
 
-		if (hdr.format_version == CLUSTER_ITL_DELTA_FORMAT_V1)
-		{
+		if (hdr.format_version == CLUSTER_ITL_DELTA_FORMAT_V1) {
 			xl_heap_itl_delta d;
 
 			memcpy(&d, p, sizeof(d));
@@ -335,9 +325,7 @@ cluster_itl_redo_apply_block_local_delta(Page page, HeapTupleHeader htup,
 			 * slot's existing UBA on page is preserved.  Legacy ACTIVE
 			 * stamps wrote InvalidUba to the page anyway, so reader
 			 * 3-branch (D7) will fall back to zero triple. */
-		}
-		else
-		{
+		} else {
 			xl_heap_itl_delta_v2 d;
 
 			memcpy(&d, p, sizeof(d));
@@ -350,12 +338,11 @@ cluster_itl_redo_apply_block_local_delta(Page page, HeapTupleHeader htup,
 		}
 
 		if (flags_after == ITL_FLAG_COMMITTED && !SCN_VALID(d_commit_scn))
-			elog(PANIC,
-				 "spec-3.4a D9: ITL COMMITTED delta with InvalidScn at heap redo");
+			elog(PANIC, "spec-3.4a D9: ITL COMMITTED delta with InvalidScn at heap redo");
 
 		slot = &ClusterPageGetItlSlots(page)[slot_idx];
 		slot->xid = d_xid;
-		slot->flags = (ClusterItlFlags) flags_after;
+		slot->flags = (ClusterItlFlags)flags_after;
 		slot->write_scn = d_write_scn;
 		slot->commit_scn = d_commit_scn;
 		/* spec-3.4b D6: preserve existing UBA when delta carries InvalidUba
@@ -369,8 +356,7 @@ cluster_itl_redo_apply_block_local_delta(Page page, HeapTupleHeader htup,
 			htup->t_itl_slot_idx = slot_idx;
 	}
 
-	consumed = offsetof(xl_heap_itl_delta_block, deltas)
-			   + (Size) hdr.ndeltas * delta_size;
+	consumed = offsetof(xl_heap_itl_delta_block, deltas) + (Size)hdr.ndeltas * delta_size;
 	return consumed;
 }
 
@@ -393,12 +379,10 @@ cluster_itl_wal_block_consumed_bytes(const char *itl_block_start)
 	else if (hdr.format_version == CLUSTER_ITL_DELTA_FORMAT_V2)
 		delta_size = sizeof(xl_heap_itl_delta_v2);
 	else
-		elog(PANIC,
-			 "spec-3.4b D6: unknown xl_heap_itl_delta_block.format_version %u",
-			 (unsigned) hdr.format_version);
+		elog(PANIC, "spec-3.4b D6: unknown xl_heap_itl_delta_block.format_version %u",
+			 (unsigned)hdr.format_version);
 
-	return offsetof(xl_heap_itl_delta_block, deltas)
-		   + (Size) hdr.ndeltas * delta_size;
+	return offsetof(xl_heap_itl_delta_block, deltas) + (Size)hdr.ndeltas * delta_size;
 }
 
 
@@ -413,9 +397,7 @@ cluster_itl_wal_block_first_slot_idx(const char *itl_block_start)
 	uint16 slot_idx;
 
 	Assert(itl_block_start != NULL);
-	memcpy(&slot_idx,
-		   itl_block_start + offsetof(xl_heap_itl_delta_block, deltas),
-		   sizeof(uint16));
+	memcpy(&slot_idx, itl_block_start + offsetof(xl_heap_itl_delta_block, deltas), sizeof(uint16));
 	return slot_idx;
 }
 

@@ -91,16 +91,12 @@ extern uint32 cluster_tt_local_slot_seq_peek(void);
  *	normal transaction id (caller falls back to PG-native silent per
  *	spec-3.4a A6).
  */
-extern bool cluster_tt_local_get_or_create_binding(TransactionId top_xid,
-												   uint32 *out_segment_id,
-												   uint16 *out_slot_offset,
-												   uint32 *out_tt_slot_id);
+extern bool cluster_tt_local_get_or_create_binding(TransactionId top_xid, uint32 *out_segment_id,
+												   uint16 *out_slot_offset, uint32 *out_tt_slot_id);
 
 /* Read-only accessor; does not allocate. */
-extern bool cluster_tt_local_peek_binding(TransactionId top_xid,
-										  uint32 *out_segment_id,
-										  uint16 *out_slot_offset,
-										  uint32 *out_tt_slot_id,
+extern bool cluster_tt_local_peek_binding(TransactionId top_xid, uint32 *out_segment_id,
+										  uint16 *out_slot_offset, uint32 *out_tt_slot_id,
 										  uint32 *out_cluster_epoch);
 
 /* Free the bound TT slot and clear the binding (idempotent). */

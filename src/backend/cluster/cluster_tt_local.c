@@ -46,9 +46,9 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_tt_local.h"
-#include "cluster/cluster_tt_slot.h"			/* spec-3.4b D4 real binding */
+#include "cluster/cluster_tt_slot.h" /* spec-3.4b D4 real binding */
 #include "cluster/cluster_tt_status.h"
-#include "cluster/cluster_tt_status_hint.h" /* spec-3.2 D4 wire emit append */
+#include "cluster/cluster_tt_status_hint.h"		/* spec-3.2 D4 wire emit append */
 #include "cluster/storage/cluster_undo_alloc.h" /* cluster_undo_active_segment_for_node_or_create */
 
 #ifdef USE_PGRAC_CLUSTER
@@ -131,18 +131,15 @@ cluster_tt_local_shmem_register(void)
  * ClusterTTStatusKey bytes.  Achieved by routing both through
  * cluster_tt_local_get_or_create_binding() / build_local_key().
  */
-typedef struct ClusterTTLocalBinding
-{
-	TransactionId top_xid;	/* InvalidTransactionId == no binding */
+typedef struct ClusterTTLocalBinding {
+	TransactionId top_xid; /* InvalidTransactionId == no binding */
 	uint32 segment_id;
 	uint16 slot_offset;
 	uint16 _pad;
-	uint32 cluster_epoch;	/* snapshot at bind time */
+	uint32 cluster_epoch; /* snapshot at bind time */
 } ClusterTTLocalBinding;
 
-static ClusterTTLocalBinding cluster_tt_local_binding = {
-	InvalidTransactionId, 0, 0, 0, 0
-};
+static ClusterTTLocalBinding cluster_tt_local_binding = { InvalidTransactionId, 0, 0, 0, 0 };
 
 
 /*
@@ -163,10 +160,8 @@ static ClusterTTLocalBinding cluster_tt_local_binding = {
  *	(which emits WAL on first segment creation).
  */
 bool
-cluster_tt_local_get_or_create_binding(TransactionId top_xid,
-									   uint32 *out_segment_id,
-									   uint16 *out_slot_offset,
-									   uint32 *out_tt_slot_id)
+cluster_tt_local_get_or_create_binding(TransactionId top_xid, uint32 *out_segment_id,
+									   uint16 *out_slot_offset, uint32 *out_tt_slot_id)
 {
 	uint32 seg;
 	uint16 off;
@@ -176,8 +171,7 @@ cluster_tt_local_get_or_create_binding(TransactionId top_xid,
 	if (!TransactionIdIsNormal(top_xid))
 		return false;
 
-	if (cluster_tt_local_binding.top_xid == top_xid)
-	{
+	if (cluster_tt_local_binding.top_xid == top_xid) {
 		/* Idempotent reuse. */
 		*out_segment_id = cluster_tt_local_binding.segment_id;
 		*out_slot_offset = cluster_tt_local_binding.slot_offset;
@@ -185,8 +179,7 @@ cluster_tt_local_get_or_create_binding(TransactionId top_xid,
 		return true;
 	}
 
-	if (TransactionIdIsValid(cluster_tt_local_binding.top_xid))
-	{
+	if (TransactionIdIsValid(cluster_tt_local_binding.top_xid)) {
 		/*
 		 * Stale binding from a prior xact that did not call reset
 		 * (should not happen in production -- xact.c always calls
@@ -207,15 +200,14 @@ cluster_tt_local_get_or_create_binding(TransactionId top_xid,
 	if (off == INVALID_TT_SLOT_OFFSET)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("cluster TT slot allocator exhausted on segment %u (48 slots full)",
-						seg),
+				 errmsg("cluster TT slot allocator exhausted on segment %u (48 slots full)", seg),
 				 errhint("All concurrent xacts on this node hold ACTIVE slots; retry after "
 						 "shorter transactions commit or abort.")));
 
 	cluster_tt_local_binding.top_xid = top_xid;
 	cluster_tt_local_binding.segment_id = seg;
 	cluster_tt_local_binding.slot_offset = off;
-	cluster_tt_local_binding.cluster_epoch = (uint32) cluster_epoch_get_current();
+	cluster_tt_local_binding.cluster_epoch = (uint32)cluster_epoch_get_current();
 
 	*out_segment_id = seg;
 	*out_slot_offset = off;
@@ -232,14 +224,11 @@ cluster_tt_local_get_or_create_binding(TransactionId top_xid,
  *	overlay install when no DML ever ran (DDL-only xact path).
  */
 bool
-cluster_tt_local_peek_binding(TransactionId top_xid,
-							  uint32 *out_segment_id,
-							  uint16 *out_slot_offset,
-							  uint32 *out_tt_slot_id,
+cluster_tt_local_peek_binding(TransactionId top_xid, uint32 *out_segment_id,
+							  uint16 *out_slot_offset, uint32 *out_tt_slot_id,
 							  uint32 *out_cluster_epoch)
 {
-	if (cluster_tt_local_binding.top_xid != top_xid
-		|| !TransactionIdIsValid(top_xid))
+	if (cluster_tt_local_binding.top_xid != top_xid || !TransactionIdIsValid(top_xid))
 		return false;
 
 	*out_segment_id = cluster_tt_local_binding.segment_id;
@@ -263,8 +252,7 @@ cluster_tt_local_reset_binding(void)
 	if (!TransactionIdIsValid(cluster_tt_local_binding.top_xid))
 		return;
 
-	cluster_tt_slot_free(cluster_tt_local_binding.segment_id,
-						 cluster_tt_local_binding.slot_offset);
+	cluster_tt_slot_free(cluster_tt_local_binding.segment_id, cluster_tt_local_binding.slot_offset);
 
 	cluster_tt_local_binding.top_xid = InvalidTransactionId;
 	cluster_tt_local_binding.segment_id = 0;
@@ -298,8 +286,8 @@ build_local_key(TransactionId xid, ClusterTTStatusKey *out)
 	if (!cluster_tt_local_peek_binding(xid, &seg, &off, &tt_id, &epoch))
 		return false;
 
-	out->origin_node_id = (uint16) cluster_node_id;
-	out->undo_segment_id = (uint16) seg;
+	out->origin_node_id = (uint16)cluster_node_id;
+	out->undo_segment_id = (uint16)seg;
 	out->tt_slot_id = tt_id;
 	out->cluster_epoch = epoch;
 	out->local_xid = xid;
@@ -439,30 +427,26 @@ cluster_tt_local_slot_seq_peek(void)
 }
 
 bool
-cluster_tt_local_get_or_create_binding(TransactionId top_xid,
-									   uint32 *out_segment_id,
-									   uint16 *out_slot_offset,
-									   uint32 *out_tt_slot_id)
+cluster_tt_local_get_or_create_binding(TransactionId top_xid, uint32 *out_segment_id,
+									   uint16 *out_slot_offset, uint32 *out_tt_slot_id)
 {
-	(void) top_xid;
-	(void) out_segment_id;
-	(void) out_slot_offset;
-	(void) out_tt_slot_id;
+	(void)top_xid;
+	(void)out_segment_id;
+	(void)out_slot_offset;
+	(void)out_tt_slot_id;
 	return false;
 }
 
 bool
-cluster_tt_local_peek_binding(TransactionId top_xid,
-							  uint32 *out_segment_id,
-							  uint16 *out_slot_offset,
-							  uint32 *out_tt_slot_id,
+cluster_tt_local_peek_binding(TransactionId top_xid, uint32 *out_segment_id,
+							  uint16 *out_slot_offset, uint32 *out_tt_slot_id,
 							  uint32 *out_cluster_epoch)
 {
-	(void) top_xid;
-	(void) out_segment_id;
-	(void) out_slot_offset;
-	(void) out_tt_slot_id;
-	(void) out_cluster_epoch;
+	(void)top_xid;
+	(void)out_segment_id;
+	(void)out_slot_offset;
+	(void)out_tt_slot_id;
+	(void)out_cluster_epoch;
 	return false;
 }
 

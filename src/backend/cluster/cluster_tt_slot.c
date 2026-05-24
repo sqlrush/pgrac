@@ -45,8 +45,8 @@
 #include "postgres.h"
 
 #include "access/transam.h"
-#include "cluster/cluster_scn.h"			   /* SCN_MAX_VALID_NODE_ID */
-#include "cluster/cluster_shmem.h"			   /* ClusterShmemRegion */
+#include "cluster/cluster_scn.h"   /* SCN_MAX_VALID_NODE_ID */
+#include "cluster/cluster_shmem.h" /* ClusterShmemRegion */
 #include "cluster/cluster_tt_slot.h"
 #include "cluster/storage/cluster_undo_alloc.h" /* CLUSTER_UNDO_SEGS_PER_INSTANCE */
 #include "miscadmin.h"
@@ -61,39 +61,35 @@
  * the next free slot and recycle completed ones.  The on-disk TTSlot
  * fields (commit_scn, first_undo_block, …) are wired by spec-3.4c+.
  */
-typedef enum ClusterTTSlotAllocStatus
-{
-	CTS_FREE = 0,			/* available for allocation */
-	CTS_ACTIVE = 1,			/* owned by an in-flight xact */
-	CTS_COMMITTED = 2,		/* committed; recyclable */
-	CTS_ABORTED = 3			/* aborted; recyclable */
+typedef enum ClusterTTSlotAllocStatus {
+	CTS_FREE = 0,	   /* available for allocation */
+	CTS_ACTIVE = 1,	   /* owned by an in-flight xact */
+	CTS_COMMITTED = 2, /* committed; recyclable */
+	CTS_ABORTED = 3	   /* aborted; recyclable */
 } ClusterTTSlotAllocStatus;
 
 
-typedef struct ClusterTTSlotAllocEntry
-{
-	TransactionId xid;		/* InvalidTransactionId when CTS_FREE */
-	uint16 wrap;			/* reuse counter (L189) */
-	uint8 status;			/* ClusterTTSlotAllocStatus */
-	uint8 _pad;				/* explicit padding to 8 bytes */
+typedef struct ClusterTTSlotAllocEntry {
+	TransactionId xid; /* InvalidTransactionId when CTS_FREE */
+	uint16 wrap;	   /* reuse counter (L189) */
+	uint8 status;	   /* ClusterTTSlotAllocStatus */
+	uint8 _pad;		   /* explicit padding to 8 bytes */
 } ClusterTTSlotAllocEntry;
 
 StaticAssertDecl(sizeof(ClusterTTSlotAllocEntry) == 8,
 				 "spec-3.4b D3: allocator entry must be 8 bytes for predictable shmem sizing");
 
 
-typedef struct ClusterTTSlotAllocPerSegment
-{
+typedef struct ClusterTTSlotAllocPerSegment {
 	LWLock lock;
-	uint32 segment_id;		/* 0 = not yet initialised; otherwise == derived id */
+	uint32 segment_id; /* 0 = not yet initialised; otherwise == derived id */
 	ClusterTTSlotAllocEntry slots[TT_SLOTS_PER_SEGMENT];
 } ClusterTTSlotAllocPerSegment;
 
 
-#define CLUSTER_TT_SLOT_MAX_NODES 128		/* matches SCN_MAX_VALID_NODE_ID + 1 */
+#define CLUSTER_TT_SLOT_MAX_NODES 128 /* matches SCN_MAX_VALID_NODE_ID + 1 */
 
-typedef struct ClusterTTSlotShmem
-{
+typedef struct ClusterTTSlotShmem {
 	ClusterTTSlotAllocPerSegment per_node[CLUSTER_TT_SLOT_MAX_NODES];
 } ClusterTTSlotShmem;
 
@@ -109,7 +105,7 @@ static inline int
 cluster_tt_slot_segment_to_node(uint32 segment_id)
 {
 	Assert(segment_id != 0);
-	return (int) ((segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE);
+	return (int)((segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE);
 }
 
 
@@ -125,27 +121,23 @@ cluster_tt_slot_get_or_init(uint32 segment_id)
 	ClusterTTSlotAllocPerSegment *seg;
 
 	if (ClusterTTSlotShm == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("cluster TT slot allocator shmem not initialised")));
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("cluster TT slot allocator shmem not initialised")));
 
 	if (segment_id == 0 || segment_id > UINT16_MAX)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("cluster_tt_slot: segment_id %u out of range (1, %u]",
-						segment_id, (unsigned) UINT16_MAX)));
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("cluster_tt_slot: segment_id %u out of range (1, %u]", segment_id,
+							   (unsigned)UINT16_MAX)));
 
 	node_id = cluster_tt_slot_segment_to_node(segment_id);
 	if (node_id < 0 || node_id >= CLUSTER_TT_SLOT_MAX_NODES)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("cluster_tt_slot: segment_id %u derives node_id %d outside [0, %d)",
-						segment_id, node_id, CLUSTER_TT_SLOT_MAX_NODES)));
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("cluster_tt_slot: segment_id %u derives node_id %d outside [0, %d)",
+							   segment_id, node_id, CLUSTER_TT_SLOT_MAX_NODES)));
 
 	seg = &ClusterTTSlotShm->per_node[node_id];
 
-	if (seg->segment_id == 0)
-	{
+	if (seg->segment_id == 0) {
 		/*
 		 * First-touch initialisation.  Take the lock so concurrent first
 		 * touches on the same node race-free.  All other fields are zero
@@ -155,9 +147,7 @@ cluster_tt_slot_get_or_init(uint32 segment_id)
 		if (seg->segment_id == 0)
 			seg->segment_id = segment_id;
 		LWLockRelease(&seg->lock);
-	}
-	else if (seg->segment_id != segment_id)
-	{
+	} else if (seg->segment_id != segment_id) {
 		/*
 		 * spec-3.4b MVP: single active segment per node.  A node that
 		 * presents two distinct segment_ids would either mean the per-node
@@ -192,43 +182,36 @@ cluster_tt_slot_alloc(uint32 segment_id, TransactionId top_xid)
 	int i;
 
 	if (!TransactionIdIsValid(top_xid))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("cluster_tt_slot_alloc: top_xid must be valid")));
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("cluster_tt_slot_alloc: top_xid must be valid")));
 
 	seg = cluster_tt_slot_get_or_init(segment_id);
 
 	LWLockAcquire(&seg->lock, LW_EXCLUSIVE);
 
 	/* Pass 1: idempotent reuse of own ACTIVE slot. */
-	for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++)
-	{
+	for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
 		ClusterTTSlotAllocEntry *e = &seg->slots[i];
 
-		if (e->status == CTS_ACTIVE && e->xid == top_xid)
-		{
+		if (e->status == CTS_ACTIVE && e->xid == top_xid) {
 			LWLockRelease(&seg->lock);
-			return (uint16) i;
+			return (uint16)i;
 		}
 		if (e->status == CTS_FREE && free_idx < 0)
 			free_idx = i;
-		else if ((e->status == CTS_COMMITTED || e->status == CTS_ABORTED)
-				 && reusable_idx < 0)
+		else if ((e->status == CTS_COMMITTED || e->status == CTS_ABORTED) && reusable_idx < 0)
 			reusable_idx = i;
 	}
 
 	/* Pass 2: prefer FREE over recyclable. */
-	if (free_idx >= 0)
-	{
+	if (free_idx >= 0) {
 		ClusterTTSlotAllocEntry *e = &seg->slots[free_idx];
 
 		e->xid = top_xid;
 		e->status = CTS_ACTIVE;
 		/* wrap unchanged on FREE → ACTIVE; first allocation keeps wrap=0 */
-		chosen = (uint16) free_idx;
-	}
-	else if (reusable_idx >= 0)
-	{
+		chosen = (uint16)free_idx;
+	} else if (reusable_idx >= 0) {
 		ClusterTTSlotAllocEntry *e = &seg->slots[reusable_idx];
 
 		e->xid = top_xid;
@@ -236,10 +219,8 @@ cluster_tt_slot_alloc(uint32 segment_id, TransactionId top_xid)
 		/* L189 wrap++ on recycle (saturate at TT_WRAP_MAX, defends ABA) */
 		if (e->wrap < TT_WRAP_MAX)
 			e->wrap++;
-		chosen = (uint16) reusable_idx;
-	}
-	else
-	{
+		chosen = (uint16)reusable_idx;
+	} else {
 		/* All 48 slots ACTIVE → OVERFLOW. */
 		LWLockRelease(&seg->lock);
 		return INVALID_TT_SLOT_OFFSET;
@@ -264,10 +245,9 @@ cluster_tt_slot_free(uint32 segment_id, uint16 slot_offset)
 	ClusterTTSlotAllocEntry *e;
 
 	if (slot_offset >= TT_SLOTS_PER_SEGMENT)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("cluster_tt_slot_free: slot_offset %u out of range [0, %d)",
-						slot_offset, TT_SLOTS_PER_SEGMENT)));
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("cluster_tt_slot_free: slot_offset %u out of range [0, %d)",
+							   slot_offset, TT_SLOTS_PER_SEGMENT)));
 
 	seg = cluster_tt_slot_get_or_init(segment_id);
 
@@ -293,10 +273,9 @@ cluster_tt_slot_get_wrap(uint32 segment_id, uint16 slot_offset)
 	uint16 wrap;
 
 	if (slot_offset >= TT_SLOTS_PER_SEGMENT)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("cluster_tt_slot_get_wrap: slot_offset %u out of range [0, %d)",
-						slot_offset, TT_SLOTS_PER_SEGMENT)));
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("cluster_tt_slot_get_wrap: slot_offset %u out of range [0, %d)",
+							   slot_offset, TT_SLOTS_PER_SEGMENT)));
 
 	seg = cluster_tt_slot_get_or_init(segment_id);
 
@@ -323,17 +302,13 @@ cluster_tt_slot_shmem_init(void)
 	bool found;
 	int i;
 
-	ClusterTTSlotShm = (ClusterTTSlotShmem *)
-		ShmemInitStruct("ClusterTTSlotShmem",
-						cluster_tt_slot_shmem_size(),
-						&found);
+	ClusterTTSlotShm = (ClusterTTSlotShmem *)ShmemInitStruct("ClusterTTSlotShmem",
+															 cluster_tt_slot_shmem_size(), &found);
 
-	if (!found)
-	{
+	if (!found) {
 		memset(ClusterTTSlotShm, 0, sizeof(ClusterTTSlotShmem));
 		for (i = 0; i < CLUSTER_TT_SLOT_MAX_NODES; i++)
-			LWLockInitialize(&ClusterTTSlotShm->per_node[i].lock,
-							 LWTRANCHE_CLUSTER_TT_SLOT);
+			LWLockInitialize(&ClusterTTSlotShm->per_node[i].lock, LWTRANCHE_CLUSTER_TT_SLOT);
 	}
 }
 
@@ -373,8 +348,7 @@ cluster_tt_slot_reset_all(void)
 	if (ClusterTTSlotShm == NULL)
 		return;
 
-	for (n = 0; n < CLUSTER_TT_SLOT_MAX_NODES; n++)
-	{
+	for (n = 0; n < CLUSTER_TT_SLOT_MAX_NODES; n++) {
 		ClusterTTSlotAllocPerSegment *seg = &ClusterTTSlotShm->per_node[n];
 
 		LWLockAcquire(&seg->lock, LW_EXCLUSIVE);
@@ -394,21 +368,18 @@ cluster_tt_slot_reset_all(void)
  *	yet wired).
  */
 void
-cluster_tt_slot_test_force_status(uint32 segment_id, uint16 slot_offset,
-								  uint8 new_status)
+cluster_tt_slot_test_force_status(uint32 segment_id, uint16 slot_offset, uint8 new_status)
 {
 	ClusterTTSlotAllocPerSegment *seg;
 
 	if (slot_offset >= TT_SLOTS_PER_SEGMENT)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("cluster_tt_slot_test_force_status: slot_offset %u out of range",
-						slot_offset)));
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("cluster_tt_slot_test_force_status: slot_offset %u out of range",
+							   slot_offset)));
 	if (new_status != CTS_COMMITTED && new_status != CTS_ABORTED)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("cluster_tt_slot_test_force_status: new_status must be %u or %u",
-						(unsigned) CTS_COMMITTED, (unsigned) CTS_ABORTED)));
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("cluster_tt_slot_test_force_status: new_status must be %u or %u",
+							   (unsigned)CTS_COMMITTED, (unsigned)CTS_ABORTED)));
 
 	seg = cluster_tt_slot_get_or_init(segment_id);
 

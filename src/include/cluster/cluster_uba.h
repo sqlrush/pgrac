@@ -72,8 +72,8 @@
 #define CLUSTER_UBA_H
 
 #include "c.h"
-#include "cluster/cluster_scn.h"				/* NodeId, SCN_MAX_VALID_NODE_ID */
-#include "cluster/cluster_tt_slot.h"			/* TT_SLOTS_PER_SEGMENT + UBA typedef chain */
+#include "cluster/cluster_scn.h"	 /* NodeId, SCN_MAX_VALID_NODE_ID */
+#include "cluster/cluster_tt_slot.h" /* TT_SLOTS_PER_SEGMENT + UBA typedef chain */
 
 
 /*
@@ -83,7 +83,7 @@
  *	meaning "unset / single-node fallback".  We reuse -1 as the lookup
  *	failure sentinel here.
  */
-#define InvalidNodeId ((NodeId) -1)
+#define InvalidNodeId ((NodeId) - 1)
 
 
 /* Sanity: spec-1.5 freezes UBA at exactly 16 bytes. */
@@ -101,12 +101,12 @@ uba_encode(uint32 segment_id, uint32 block_no, uint16 tt_slot_offset, uint16 row
 {
 	UBA u;
 
-	Assert(segment_id != 0);				   /* F2 — segment 0 bootstrap-only */
-	Assert(segment_id <= UINT16_MAX);		   /* F4 — exact-key uint16 alias guard */
+	Assert(segment_id != 0);		  /* F2 — segment 0 bootstrap-only */
+	Assert(segment_id <= UINT16_MAX); /* F4 — exact-key uint16 alias guard */
 	Assert(tt_slot_offset < TT_SLOTS_PER_SEGMENT);
 
-	u.raw[0] = ((uint64) segment_id) | (((uint64) block_no) << 32);
-	u.raw[1] = ((uint64) tt_slot_offset) | (((uint64) row_offset) << 16);
+	u.raw[0] = ((uint64)segment_id) | (((uint64)block_no) << 32);
+	u.raw[1] = ((uint64)tt_slot_offset) | (((uint64)row_offset) << 16);
 	return u;
 }
 
@@ -123,8 +123,7 @@ uba_encode(uint32 segment_id, uint32 block_no, uint16 tt_slot_offset, uint16 row
  *	  non-InvalidUba ITL slot.
  */
 static inline bool
-uba_decode(UBA u, uint32 *segment_id, uint32 *block_no,
-		   uint16 *tt_slot_offset, uint16 *row_offset)
+uba_decode(UBA u, uint32 *segment_id, uint32 *block_no, uint16 *tt_slot_offset, uint16 *row_offset)
 {
 	uint32 reserved;
 	uint32 seg;
@@ -133,9 +132,9 @@ uba_decode(UBA u, uint32 *segment_id, uint32 *block_no,
 	if (UBA_is_invalid(u))
 		return false;
 
-	seg = (uint32) (u.raw[0] & 0xFFFFFFFFULL);
-	off = (uint16) (u.raw[1] & 0xFFFFULL);
-	reserved = (uint32) (u.raw[1] >> 32);
+	seg = (uint32)(u.raw[0] & 0xFFFFFFFFULL);
+	off = (uint16)(u.raw[1] & 0xFFFFULL);
+	reserved = (uint32)(u.raw[1] >> 32);
 
 	if (seg == 0 || seg > UINT16_MAX)
 		return false;
@@ -145,9 +144,9 @@ uba_decode(UBA u, uint32 *segment_id, uint32 *block_no,
 		return false;
 
 	*segment_id = seg;
-	*block_no = (uint32) (u.raw[0] >> 32);
+	*block_no = (uint32)(u.raw[0] >> 32);
 	*tt_slot_offset = off;
-	*row_offset = (uint16) ((u.raw[1] >> 16) & 0xFFFFULL);
+	*row_offset = (uint16)((u.raw[1] >> 16) & 0xFFFFULL);
 	return true;
 }
 
@@ -162,14 +161,14 @@ uba_decode(UBA u, uint32 *segment_id, uint32 *block_no,
 static inline uint32
 uba_get_segment_id(UBA u)
 {
-	return (uint32) (u.raw[0] & 0xFFFFFFFFULL);
+	return (uint32)(u.raw[0] & 0xFFFFFFFFULL);
 }
 
 
 static inline uint16
 uba_get_tt_slot_offset(UBA u)
 {
-	return (uint16) (u.raw[1] & 0xFFFFULL);
+	return (uint16)(u.raw[1] & 0xFFFFULL);
 }
 
 

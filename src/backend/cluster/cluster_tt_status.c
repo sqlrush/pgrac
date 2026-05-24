@@ -356,7 +356,7 @@ cluster_tt_status_flush_all_at_activation(void)
 	uint64 removed = 0;
 
 	if (ClusterTTStatusHTAB == NULL)
-		return;	/* shmem not initialised yet; nothing to flush */
+		return; /* shmem not initialised yet; nothing to flush */
 
 	LWLockAcquire(ClusterTTStatusLock, LW_EXCLUSIVE);
 
@@ -366,8 +366,7 @@ cluster_tt_status_flush_all_at_activation(void)
 		removed++;
 	}
 
-	if (ClusterTTStatusState != NULL)
-	{
+	if (ClusterTTStatusState != NULL) {
 		pg_atomic_fetch_add_u64(&ClusterTTStatusState->generation, 1);
 		pg_atomic_fetch_add_u64(&ClusterTTStatusState->flush_count, 1);
 		pg_atomic_fetch_add_u64(&ClusterTTStatusState->evict_count, removed);
