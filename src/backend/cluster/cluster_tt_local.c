@@ -135,6 +135,10 @@ typedef struct ClusterTTLocalBinding {
 	TransactionId top_xid; /* InvalidTransactionId == no binding */
 	uint32 segment_id;
 	uint16 slot_offset;
+	/* cppcheck-suppress unusedStructMember
+	 * Reason: explicit padding between slot_offset (offset 10) and cluster_epoch (offset 12)
+	 * to align uint32 on a 4-byte boundary;  guards against implicit padding drift across
+	 * compilers (spec-3.4b F11 binding stability). */
 	uint16 _pad;
 	uint32 cluster_epoch; /* snapshot at bind time */
 } ClusterTTLocalBinding;

@@ -155,6 +155,8 @@ PageInitHeapPage(Page page pg_attribute_unused(), Size pageSize pg_attribute_unu
  * inline expansion / other transitive references. */
 char *BufferBlocks = NULL;
 void *LocalBufferBlockPointers[1] = { NULL };
+int NBuffers = 0;
+int NLocBuffer = 0;
 
 int
 errmsg_internal(const char *fmt pg_attribute_unused(), ...)

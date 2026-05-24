@@ -284,12 +284,12 @@ cluster_itl_redo_apply_block_local_delta(Page page, HeapTupleHeader htup,
 										 const char *itl_block_start)
 {
 	xl_heap_itl_delta_block hdr;
-	Size delta_size;
+	Size delta_size = 0; /* init silences cppcheck legacyUninitvar (elog PANIC no-return) */
 	Size consumed;
 	uint16 i;
 
-	Assert(page != NULL);
-	Assert(itl_block_start != NULL);
+	if (page == NULL || itl_block_start == NULL)
+		elog(PANIC, "spec-3.4b D6: cluster_itl_redo_apply_block_local_delta got NULL arg");
 
 	memcpy(&hdr, itl_block_start, offsetof(xl_heap_itl_delta_block, deltas));
 
@@ -369,9 +369,10 @@ Size
 cluster_itl_wal_block_consumed_bytes(const char *itl_block_start)
 {
 	xl_heap_itl_delta_block hdr;
-	Size delta_size;
+	Size delta_size = 0; /* init silences cppcheck legacyUninitvar */
 
-	Assert(itl_block_start != NULL);
+	if (itl_block_start == NULL)
+		elog(PANIC, "spec-3.4b D6: cluster_itl_wal_block_consumed_bytes got NULL arg");
 	memcpy(&hdr, itl_block_start, offsetof(xl_heap_itl_delta_block, deltas));
 
 	if (hdr.format_version == CLUSTER_ITL_DELTA_FORMAT_V1)

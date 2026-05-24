@@ -201,14 +201,11 @@ static void
 reset_allocator(void)
 {
 	/* Reinitialise the shmem region; this wipes per-node state. */
-	bool dummy_found;
-
 	if (mock_shmem_buffer != NULL) {
 		free(mock_shmem_buffer);
 		mock_shmem_buffer = NULL;
 	}
 	cluster_tt_slot_shmem_init();
-	(void)dummy_found;
 
 	mock_lwlock_acquire_excl_count = 0;
 	mock_lwlock_acquire_shared_count = 0;

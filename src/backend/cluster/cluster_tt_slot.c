@@ -191,7 +191,7 @@ cluster_tt_slot_alloc(uint32 segment_id, TransactionId top_xid)
 
 	/* Pass 1: idempotent reuse of own ACTIVE slot. */
 	for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
-		ClusterTTSlotAllocEntry *e = &seg->slots[i];
+		const ClusterTTSlotAllocEntry *e = &seg->slots[i];
 
 		if (e->status == CTS_ACTIVE && e->xid == top_xid) {
 			LWLockRelease(&seg->lock);
@@ -300,12 +300,13 @@ void
 cluster_tt_slot_shmem_init(void)
 {
 	bool found;
-	int i;
 
 	ClusterTTSlotShm = (ClusterTTSlotShmem *)ShmemInitStruct("ClusterTTSlotShmem",
 															 cluster_tt_slot_shmem_size(), &found);
 
 	if (!found) {
+		int i;
+
 		memset(ClusterTTSlotShm, 0, sizeof(ClusterTTSlotShmem));
 		for (i = 0; i < CLUSTER_TT_SLOT_MAX_NODES; i++)
 			LWLockInitialize(&ClusterTTSlotShm->per_node[i].lock, LWTRANCHE_CLUSTER_TT_SLOT);
