@@ -110,10 +110,19 @@ errmsg(const char *fmt pg_attribute_unused(), ...)
 
 
 /* ===== bufmgr API stubs — never reached because all tests pass
- *	   InvalidBuffer to drive the BufferIsValid guard.  Linker still
- *	   needs the symbols.  bufmgr.h provides BufferGetPage as a
- *	   static inline, so it does not need a local definition. ===== */
-int NBuffers = 0;
+ *	   InvalidBuffer (or a sentinel slot_idx out-of-bound) to drive
+ *	   the cluster_itl_cleanout_lazy guards.  Linker still needs the
+ *	   symbols.  bufmgr.h provides BufferGetPage as a static inline,
+ *	   so it does not need a local definition.
+ *
+ *	   NBuffers must be at least the Buffer indices we pass into
+ *	   lazy() so PG's AssertMacro((bufnum) <= NBuffers ...) inside
+ *	   BufferIsValid does not fire under USE_ASSERT_CHECKING builds
+ *	   (CI runners).  T12 passes Buffer=1 with slot_idx out-of-bound;
+ *	   our own guards never deref the buffer, but the macro check
+ *	   still trips when NBuffers=0.  CLUSTER_ITL_INITRANS_DEFAULT
+ *	   (=8) is conveniently above every Buffer index we pass. ===== */
+int NBuffers = CLUSTER_ITL_INITRANS_DEFAULT;
 int NLocBuffer = 0;
 char *BufferBlocks = NULL;
 Block *LocalBufferBlockPointers = NULL;
