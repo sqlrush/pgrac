@@ -38,7 +38,7 @@
 #	  L3   Single-row INSERT does not crash
 #	  L4   Empty-table SELECT returns 0
 #	  L5   Logical decoding does not crash
-#	  L6   pg_buffercache extension load OK
+#	  L6   pg_class catalog query OK
 #	  L7   RR snapshot SELECT does not crash
 #	  L8   shmem.region_count >= 20 (cluster module loaded)
 #	  L9   pg_cluster_state SRF returns rows

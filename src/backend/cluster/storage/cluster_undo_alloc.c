@@ -173,8 +173,11 @@ cluster_undo_segment_allocate(uint32 segment_id, uint8 owner_instance)
 {
 	char path[MAXPGPATH];
 	PGAlignedBlock page;
+	PGAlignedBlock existing;
 	int fd;
 	bool created;
+	struct stat st;
+	ssize_t readbytes;
 	ssize_t written;
 
 	/*
@@ -236,9 +239,49 @@ cluster_undo_segment_allocate(uint32 segment_id, uint8 owner_instance)
 	ensure_instance_subdir(owner_instance);
 
 	fd = open_or_create_segment(path, &created);
-	(void)created; /* tracked for logging/observability; ftruncate is unconditional */
 
 	cluster_undo_segment_make_header_bytes(segment_id, owner_instance, page.data);
+
+	/*
+	 * spec-3.4b hardening:
+	 *
+	 * cluster_undo_active_segment_for_node_or_create() sits on the DML hot
+	 * path.  The allocator is intentionally idempotent, but idempotent must
+	 * not mean "rewrite + fsync + emit XLOG_UNDO_SEGMENT_INIT every xact".
+	 * If the segment file already exists, has the expected size, and block 0
+	 * already matches the expected header bytes, return immediately.  We only
+	 * fall through to the repair/write path for newly-created, truncated, or
+	 * mismatched files.
+	 */
+	if (!created) {
+		if (fstat(fd, &st) != 0) {
+			int save_errno = errno;
+
+			close(fd);
+			errno = save_errno;
+			ereport(ERROR, (errcode_for_file_access(),
+							errmsg("could not stat undo segment file \"%s\": %m", path)));
+		}
+
+		if (st.st_size == UNDO_SEGMENT_SIZE_BYTES) {
+			readbytes = pg_pread(fd, existing.data, BLCKSZ, 0);
+			if (readbytes < 0) {
+				int save_errno = errno;
+
+				close(fd);
+				errno = save_errno;
+				ereport(ERROR, (errcode_for_file_access(),
+								errmsg("could not read undo segment header for \"%s\": %m", path)));
+			}
+
+			if (readbytes == BLCKSZ && memcmp(existing.data, page.data, BLCKSZ) == 0) {
+				if (close(fd) != 0)
+					ereport(ERROR, (errcode_for_file_access(),
+									errmsg("could not close undo segment file \"%s\": %m", path)));
+				return;
+			}
+		}
+	}
 
 	/*
 	 * Hardening v1.0.4 P1-2: unconditional ftruncate.
@@ -326,6 +369,8 @@ cluster_undo_segment_allocate(uint32 segment_id, uint8 owner_instance)
 uint32
 cluster_undo_active_segment_for_node_or_create(int node_id)
 {
+	static int cached_node_id = -1;
+	static uint32 cached_segment_id = 0;
 	uint32 segment_id;
 	uint8 owner_instance;
 
@@ -339,13 +384,19 @@ cluster_undo_active_segment_for_node_or_create(int node_id)
 	/* per_instance_slot = 0 (spec-3.4b MVP, single active segment per node) */
 	segment_id = (uint32)node_id * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
 
+	if (cached_node_id == node_id && cached_segment_id == segment_id)
+		return cached_segment_id;
+
 	/*
-	 * cluster_undo_segment_allocate is idempotent: it returns silently if
-	 * the file already exists with the right header.  Calling it here
-	 * means the first DML on this node lazily provisions the segment,
-	 * subsequent calls are cheap no-ops.
+	 * cluster_undo_segment_allocate is idempotent and cheap when the file
+	 * already exists with the right header.  Calling it here means the first
+	 * DML on this node lazily provisions the segment; subsequent calls in
+	 * this backend return from the cache above.
 	 */
 	cluster_undo_segment_allocate(segment_id, owner_instance);
+
+	cached_node_id = node_id;
+	cached_segment_id = segment_id;
 
 	return segment_id;
 }
