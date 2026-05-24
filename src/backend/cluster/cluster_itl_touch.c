@@ -127,8 +127,8 @@ cluster_itl_touch_foreach(ClusterItlTouchCallback cb, void *arg)
 static int
 itl_touch_handle_cmp(const void *a, const void *b)
 {
-	const ClusterItlTouchHandle *l = (const ClusterItlTouchHandle *) a;
-	const ClusterItlTouchHandle *r = (const ClusterItlTouchHandle *) b;
+	const ClusterItlTouchHandle *l = (const ClusterItlTouchHandle *)a;
+	const ClusterItlTouchHandle *r = (const ClusterItlTouchHandle *)b;
 
 	if (l->rloc.dbOid != r->rloc.dbOid)
 		return (l->rloc.dbOid < r->rloc.dbOid) ? -1 : 1;
@@ -148,7 +148,7 @@ itl_touch_handle_cmp(const void *a, const void *b)
 void
 cluster_itl_touch_foreach_per_page(ClusterItlTouchPagedCallback cb, void *arg)
 {
-	uint32			i;
+	uint32 i;
 	ClusterItlPagedHandle ph;
 
 	Assert(cb != NULL);
@@ -163,8 +163,7 @@ cluster_itl_touch_foreach_per_page(ClusterItlTouchPagedCallback cb, void *arg)
 	 * we can stream-aggregate consecutive same-page runs into a single
 	 * ClusterItlPagedHandle.
 	 */
-	qsort(touch_list, touch_count, sizeof(ClusterItlTouchHandle),
-		  itl_touch_handle_cmp);
+	qsort(touch_list, touch_count, sizeof(ClusterItlTouchHandle), itl_touch_handle_cmp);
 
 	memset(&ph, 0, sizeof(ph));
 	ph.rloc = touch_list[0].rloc;
@@ -173,16 +172,12 @@ cluster_itl_touch_foreach_per_page(ClusterItlTouchPagedCallback cb, void *arg)
 	ph.nslots = 0;
 	ph.flags = 0;
 
-	for (i = 0; i < touch_count; i++)
-	{
+	for (i = 0; i < touch_count; i++) {
 		const ClusterItlTouchHandle *h = &touch_list[i];
-		bool same_page = (i > 0)
-			&& RelFileLocatorEquals(h->rloc, ph.rloc)
-			&& h->forknum == ph.forknum
-			&& h->block == ph.block;
+		bool same_page = (i > 0) && RelFileLocatorEquals(h->rloc, ph.rloc)
+						 && h->forknum == ph.forknum && h->block == ph.block;
 
-		if (!same_page && i > 0)
-		{
+		if (!same_page && i > 0) {
 			cb(&ph, arg);
 			memset(&ph, 0, sizeof(ph));
 			ph.rloc = h->rloc;
@@ -199,8 +194,8 @@ cluster_itl_touch_foreach_per_page(ClusterItlTouchPagedCallback cb, void *arg)
 		 */
 		Assert(ph.nslots < CLUSTER_ITL_INITRANS_DEFAULT);
 		Assert(h->slot_idx < CLUSTER_ITL_INITRANS_DEFAULT);
-		ph.slot_indices[ph.nslots++] = (uint8) h->slot_idx;
-		ph.flags |= (uint8) h->flags;
+		ph.slot_indices[ph.nslots++] = (uint8)h->slot_idx;
+		ph.flags |= (uint8)h->flags;
 	}
 
 	cb(&ph, arg);
@@ -299,13 +294,13 @@ itl_finish_stamp_page(Page page, uint8 slot_idx, const ItlFinishCtx *ctx)
 static void
 itl_finish_page(const ClusterItlPagedHandle *page_handle, void *arg)
 {
-	const ItlFinishCtx *ctx = (const ItlFinishCtx *) arg;
+	const ItlFinishCtx *ctx = (const ItlFinishCtx *)arg;
 	ClusterItlTouchHandle key_handle;
 	GenericXLogState *state;
-	Buffer		buf;
-	Page		image;
-	bool		needs_wal;
-	uint8		i;
+	Buffer buf;
+	Page image;
+	bool needs_wal;
+	uint8 i;
 
 	memset(&key_handle, 0, sizeof(key_handle));
 	key_handle.rloc = page_handle->rloc;

@@ -127,8 +127,7 @@ void
 LockBuffer(Buffer buffer pg_attribute_unused(), int mode pg_attribute_unused())
 {}
 void
-MarkBufferDirtyHint(Buffer buffer pg_attribute_unused(),
-					bool buffer_std pg_attribute_unused())
+MarkBufferDirtyHint(Buffer buffer pg_attribute_unused(), bool buffer_std pg_attribute_unused())
 {}
 
 
@@ -220,23 +219,19 @@ UT_TEST(t11_lazy_invalid_buffer_false)
 UT_TEST(t12_lazy_slot_idx_out_of_bound_false)
 {
 	/* slot_idx = INITRANS (8) violates `slot_idx >= INITRANS` guard. */
-	UT_ASSERT_EQ((int)cluster_itl_cleanout_lazy(1 /* fake buf */,
-												CLUSTER_ITL_INITRANS_DEFAULT,
-												1234, 5678),
-				 0);
+	UT_ASSERT_EQ(
+		(int)cluster_itl_cleanout_lazy(1 /* fake buf */, CLUSTER_ITL_INITRANS_DEFAULT, 1234, 5678),
+		0);
 }
 
 UT_TEST(t13_lazy_invalid_xid_false)
 {
-	UT_ASSERT_EQ((int)cluster_itl_cleanout_lazy(InvalidBuffer, 0,
-												InvalidTransactionId, 5678),
-				 0);
+	UT_ASSERT_EQ((int)cluster_itl_cleanout_lazy(InvalidBuffer, 0, InvalidTransactionId, 5678), 0);
 }
 
 UT_TEST(t14_lazy_invalid_commit_scn_false)
 {
-	UT_ASSERT_EQ((int)cluster_itl_cleanout_lazy(InvalidBuffer, 0, 1234, InvalidScn),
-				 0);
+	UT_ASSERT_EQ((int)cluster_itl_cleanout_lazy(InvalidBuffer, 0, 1234, InvalidScn), 0);
 }
 
 

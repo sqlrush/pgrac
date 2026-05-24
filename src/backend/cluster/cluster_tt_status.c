@@ -305,7 +305,7 @@ cluster_tt_status_install_local(const ClusterTTStatusKey *key, ClusterTTStatus s
 bool
 cluster_tt_status_delete_exact(const ClusterTTStatusKey *key)
 {
-	bool		found;
+	bool found;
 
 	Assert(key != NULL);
 
@@ -313,7 +313,7 @@ cluster_tt_status_delete_exact(const ClusterTTStatusKey *key)
 		return false;
 
 	LWLockAcquire(ClusterTTStatusLock, LW_EXCLUSIVE);
-	(void) hash_search(ClusterTTStatusHTAB, key, HASH_REMOVE, &found);
+	(void)hash_search(ClusterTTStatusHTAB, key, HASH_REMOVE, &found);
 	LWLockRelease(ClusterTTStatusLock);
 
 	if (found)

@@ -58,7 +58,7 @@
 #include "storage/itemptr.h" /* OffsetNumber */
 #include "storage/relfilelocator.h"
 #include "cluster/cluster_itl_slot.h" /* CLUSTER_ITL_INITRANS_DEFAULT (spec-3.4c D14) */
-#include "cluster/cluster_scn.h" /* SCN */
+#include "cluster/cluster_scn.h"	  /* SCN */
 
 /*
  * ClusterItlTouchHandle -- 24-byte fixed handle (HC: layout MUST stay
@@ -134,15 +134,14 @@ extern void cluster_itl_touch_foreach(ClusterItlTouchCallback cb, void *arg);
  */
 typedef struct ClusterItlPagedHandle {
 	RelFileLocator rloc;
-	ForkNumber	   forknum;
-	BlockNumber	   block;
-	uint8		   slot_indices[CLUSTER_ITL_INITRANS_DEFAULT];
-	uint8		   nslots;
-	uint8		   flags;
+	ForkNumber forknum;
+	BlockNumber block;
+	uint8 slot_indices[CLUSTER_ITL_INITRANS_DEFAULT];
+	uint8 nslots;
+	uint8 flags;
 } ClusterItlPagedHandle;
 
-typedef void (*ClusterItlTouchPagedCallback)(const ClusterItlPagedHandle *page_handle,
-											 void *arg);
+typedef void (*ClusterItlTouchPagedCallback)(const ClusterItlPagedHandle *page_handle, void *arg);
 
 /*
  * cluster_itl_touch_foreach_per_page (spec-3.4c D14 / A4):

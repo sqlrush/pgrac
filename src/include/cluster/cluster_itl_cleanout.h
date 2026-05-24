@@ -55,10 +55,10 @@
 #define CLUSTER_ITL_CLEANOUT_H
 
 #include "c.h"
-#include "access/transam.h"			 /* TransactionId */
+#include "access/transam.h"			  /* TransactionId */
 #include "cluster/cluster_itl_slot.h" /* ClusterItlSlotData */
-#include "cluster/cluster_scn.h"	 /* SCN */
-#include "storage/buf.h"			 /* Buffer */
+#include "cluster/cluster_scn.h"	  /* SCN */
+#include "storage/buf.h"			  /* Buffer */
 
 
 /*
@@ -88,8 +88,7 @@
  *	should pass the tuple's xmin (TransactionId that allocated this
  *	ITL slot for this tuple version).
  */
-extern bool cluster_itl_cleanout_lazy(Buffer buf, uint8 slot_idx,
-									  TransactionId expected_xid,
+extern bool cluster_itl_cleanout_lazy(Buffer buf, uint8 slot_idx, TransactionId expected_xid,
 									  SCN expected_commit_scn);
 
 
@@ -109,8 +108,7 @@ extern bool cluster_itl_cleanout_lazy(Buffer buf, uint8 slot_idx,
  *	Caller MUST hold the buffer's content lock when checking.
  */
 extern bool cluster_itl_cleanout_can_stamp(const ClusterItlSlotData *slot,
-										   TransactionId expected_xid,
-										   SCN expected_commit_scn);
+										   TransactionId expected_xid, SCN expected_commit_scn);
 
 
 #endif /* CLUSTER_ITL_CLEANOUT_H */

@@ -155,8 +155,7 @@ cluster_itl_cleanout_can_stamp(const ClusterItlSlotData *slot pg_attribute_unuse
 }
 
 bool
-cluster_itl_cleanout_lazy(Buffer buf pg_attribute_unused(),
-						  uint8 slot_idx pg_attribute_unused(),
+cluster_itl_cleanout_lazy(Buffer buf pg_attribute_unused(), uint8 slot_idx pg_attribute_unused(),
 						  TransactionId expected_xid pg_attribute_unused(),
 						  SCN expected_commit_scn pg_attribute_unused())
 {

@@ -235,13 +235,11 @@ cluster_test_inject_visibility_tt_ref(PG_FUNCTION_ARGS)
 	 *    Verify immediately so a silent overlay-full drop (WARNING + bump
 	 *    evict_fail_count) cannot hide behind a successful PG_RETURN_BOOL(true).
 	 */
-	if (!cluster_tt_status_lookup_exact(&key, &res) ||
-		res.status != CLUSTER_TT_STATUS_COMMITTED ||
-		res.commit_scn != commit_scn)
-		ereport(ERROR,
-				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
-				 errmsg("cluster TT status overlay install verification failed"),
-				 errhint("Raise cluster.tt_status_overlay_max_entries or lower TTL.")));
+	if (!cluster_tt_status_lookup_exact(&key, &res) || res.status != CLUSTER_TT_STATUS_COMMITTED
+		|| res.commit_scn != commit_scn)
+		ereport(ERROR, (errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+						errmsg("cluster TT status overlay install verification failed"),
+						errhint("Raise cluster.tt_status_overlay_max_entries or lower TTL.")));
 
 	PG_RETURN_BOOL(true);
 }
@@ -280,7 +278,7 @@ cluster_test_clear_visibility_injects(PG_FUNCTION_ARGS)
 		key.tt_slot_id = e->ref.tt_slot_id;
 		key.cluster_epoch = e->ref.cluster_epoch;
 		key.local_xid = e->ref.local_xid;
-		(void) cluster_tt_status_delete_exact(&key);
+		(void)cluster_tt_status_delete_exact(&key);
 
 		hash_search(ClusterVisibilityInjectHTAB, &e->xid, HASH_REMOVE, NULL);
 		removed++;
