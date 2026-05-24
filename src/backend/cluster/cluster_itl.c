@@ -203,7 +203,16 @@ cluster_itl_stamp_active(Buffer buf, uint8 slot_idx, TransactionId xid, SCN writ
 	slot->write_scn = write_scn;
 	/* spec-3.4b D5: real UBA from xact-local binding (F11). */
 	slot->undo_segment_head = undo_segment_head;
-	/* first_change_lsn -- spec-3.4c populates. */
+	/*
+	 * spec-3.4c A2 / L194:  first_change_lsn is intentionally NOT populated.
+	 * The intended value is the LSN of the WAL record about to be emitted
+	 * for this stamp, but stamp_active runs in the critical section BEFORE
+	 * XLogInsert returns recptr, and re-stamping the slot after PageSetLSN
+	 * would require a second WAL emit (chicken-and-egg).  spec-3.4c MVP
+	 * keeps first_change_lsn = InvalidXLogRecPtr (spec-1.5 placeholder)
+	 * and defers true populate to a future spec when generic_xlog API
+	 * extends to provide inserted-LSN feedback.
+	 */
 
 	MarkBufferDirty(buf);
 }

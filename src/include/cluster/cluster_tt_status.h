@@ -214,6 +214,17 @@ extern void cluster_tt_status_install_local(const ClusterTTStatusKey *key, Clust
 extern void cluster_tt_status_flush_all(uint32 new_epoch);
 
 /*
+ * cluster_tt_status_delete_exact (spec-3.4c D6):
+ *	  Per-key delete companion of install_local.  Used by D5b clear UDF
+ *	  to remove a single overlay entry without triggering a full
+ *	  flush_all() blast radius.  Bumps evict_count if the entry was
+ *	  present; silent no-op if missing.  Returns true if an entry was
+ *	  actually deleted.  Spec-3.4c F4:  required so test-only clear does
+ *	  not fake-clear via writing ABORTED (semantic conflict).
+ */
+extern bool cluster_tt_status_delete_exact(const ClusterTTStatusKey *key);
+
+/*
  * cluster_tt_status_flush_all_at_activation:
  *	  spec-3.4b D8 / Q4 HC (L191): code-enforced automatic flush wired
  *	  into postmaster shmem init after the overlay HTAB region is set up.

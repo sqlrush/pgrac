@@ -57,6 +57,7 @@
 #include "storage/buf.h"	 /* Buffer */
 #include "storage/itemptr.h" /* OffsetNumber */
 #include "storage/relfilelocator.h"
+#include "cluster/cluster_itl_slot.h" /* CLUSTER_ITL_INITRANS_DEFAULT (spec-3.4c D14) */
 #include "cluster/cluster_scn.h" /* SCN */
 
 /*
@@ -114,6 +115,52 @@ extern void cluster_itl_touch_register(const ClusterItlTouchHandle *handle);
 typedef void (*ClusterItlTouchCallback)(const ClusterItlTouchHandle *handle, void *arg);
 
 extern void cluster_itl_touch_foreach(ClusterItlTouchCallback cb, void *arg);
+
+/*
+ * ClusterItlPagedHandle -- per-page aggregate of touched ITL slot indices
+ * (spec-3.4c D14 / A4 yellow perf hardening).
+ *
+ *	Represents every touched ITL slot on a single (rloc, forknum, block)
+ *	page; slot_indices[0 .. nslots-1] is sorted ascending and contains
+ *	no duplicates.  flags is the OR of all aggregated handles' flags
+ *	(currently just CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL).
+ *
+ *	The xact-end finish hook iterates pages instead of individual
+ *	handles so each (rloc, forknum, block) page incurs ONE
+ *	ReadBufferWithoutRelcache + ONE LWLockAcquire + ONE
+ *	GenericXLogStartLogged/Finish, regardless of how many slots on
+ *	that page were touched.  Replaces the spec-3.4a per-slot loop
+ *	that opened/locked/WAL-logged once per slot.
+ */
+typedef struct ClusterItlPagedHandle {
+	RelFileLocator rloc;
+	ForkNumber	   forknum;
+	BlockNumber	   block;
+	uint8		   slot_indices[CLUSTER_ITL_INITRANS_DEFAULT];
+	uint8		   nslots;
+	uint8		   flags;
+} ClusterItlPagedHandle;
+
+typedef void (*ClusterItlTouchPagedCallback)(const ClusterItlPagedHandle *page_handle,
+											 void *arg);
+
+/*
+ * cluster_itl_touch_foreach_per_page (spec-3.4c D14 / A4):
+ *
+ *	Iterate the registered touched-handle list grouped by
+ *	(rloc, forknum, block).  Internally:
+ *	  1. qsort handles by (rloc, forknum, block, slot)
+ *	  2. dedupe consecutive entries with identical key
+ *	  3. aggregate by (rloc, forknum, block) into ClusterItlPagedHandle
+ *	  4. invoke `cb(page_handle, arg)` once per unique page
+ *
+ *	Caller (xact.c pre-commit/abort hook) opens / locks / WAL-emits
+ *	exactly once per page rather than once per touched slot.
+ *
+ *	Performance target: spec-3.4a yellow 34.9% -> <=15% on pgbench
+ *	enable/disable baseline.
+ */
+extern void cluster_itl_touch_foreach_per_page(ClusterItlTouchPagedCallback cb, void *arg);
 
 /*
  * cluster_itl_touch_reset_at_end_xact -- release list memory.  Called

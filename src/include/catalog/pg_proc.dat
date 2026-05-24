@@ -12419,8 +12419,8 @@
   proname => 'cluster_test_inject_visibility_tt_ref',
   provolatile => 'v', proparallel => 'u',
   prorettype => 'bool',
-  proargtypes => 'xid int4 int4 int4 int4',
-  proargnames => '{xid,origin_node_id,undo_segment_id,tt_slot_id,cluster_epoch}',
+  proargtypes => 'xid int4 int4 int4 int4 int8',
+  proargnames => '{xid,origin_node_id,undo_segment_id,tt_slot_id,cluster_epoch,commit_scn}',
   prosrc => 'cluster_test_inject_visibility_tt_ref' },
 
 { oid => '8926', descr => 'TEST-ONLY: clear MVCC visibility fork inject table',

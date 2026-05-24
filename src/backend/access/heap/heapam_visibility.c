@@ -85,6 +85,7 @@
 #include "cluster/cluster_epoch.h"			/* cluster_epoch_get_current (spec-3.3 D10) */
 #include "cluster/cluster_guc.h"				/* cluster_enabled, cluster_node_id */
 #include "cluster/cluster_itl.h"				/* cluster_itl_get_tt_ref */
+#include "cluster/cluster_itl_cleanout.h"	/* cluster_itl_cleanout_lazy (spec-3.4c D4) */
 #include "cluster/cluster_itl_slot.h"		/* CLUSTER_ITL_SLOT_UNALLOCATED */
 #include "cluster/cluster_tt_slot.h"		/* ClusterUndoTTSlotRef */
 #include "cluster/cluster_tt_status.h"		/* lookup_exact / Key / Result */
@@ -1087,7 +1088,42 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot,
 						switch (decision)
 						{
 							case CLUSTER_VISIBILITY_VISIBLE:
+							{
+								/*
+								 * spec-3.4c D4 + F1:  opportunistic lazy
+								 * cleanout.  When the overlay says COMMITTED
+								 * but the on-page slot is still ACTIVE
+								 * (xact-end stamp didn't reach this page or
+								 * lost the race to a concurrent read),
+								 * stamp the page slot.commit_scn now via
+								 * ConditionalLockBuffer(buf) non-blocking
+								 * + MarkBufferDirtyHint(buf, true)  hint-
+								 * style (no WAL — HeapTupleSatisfiesMVCC
+								 * lacks a Relation argument, F1).  L177
+								 * no-wait:  failure is silently skipped
+								 * because visibility is already decided by
+								 * the overlay path.
+								 */
+								Page page = BufferGetPage(buffer);
+
+								if (PageHasItl(page) &&
+									tuple->t_itl_slot_idx != CLUSTER_ITL_SLOT_UNALLOCATED &&
+									tuple->t_itl_slot_idx < CLUSTER_ITL_INITRANS_DEFAULT)
+								{
+									ClusterItlSlotData *slot =
+										&ClusterPageGetItlSlots(page)[tuple->t_itl_slot_idx];
+
+									/* Fast-path short-circuit:  if page slot
+									 * already stamped COMMITTED, skip the
+									 * lazy helper entirely (no-op). */
+									if (slot->flags == ITL_FLAG_ACTIVE)
+										(void) cluster_itl_cleanout_lazy(buffer,
+																		 tuple->t_itl_slot_idx,
+																		 raw_xmin,
+																		 result.commit_scn);
+								}
 								return true;
+							}
 							case CLUSTER_VISIBILITY_INVISIBLE:
 								return false;
 							case CLUSTER_VISIBILITY_UNKNOWN:

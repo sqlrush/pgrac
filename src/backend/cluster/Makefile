@@ -87,6 +87,7 @@ OBJS = \
 	cluster_sinval_bcast.o \
 	cluster_startup_phase.o \
 	cluster_itl.o \
+	cluster_itl_cleanout.o \
 	cluster_itl_touch.o \
 	cluster_uba.o \
 	cluster_tt_slot.o \

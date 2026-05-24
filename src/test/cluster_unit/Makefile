@@ -39,7 +39,8 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_xlog test_cluster_tt_slot test_cluster_undo_segment \
         test_cluster_epoch test_cluster_fence test_cluster_reconfig \
         test_cluster_ges test_cluster_grd test_cluster_lmd test_cluster_lock_acquire \
-        test_cluster_tt_slot_allocator test_cluster_itl_reader_real_triple
+        test_cluster_tt_slot_allocator test_cluster_itl_reader_real_triple \
+        test_cluster_itl_cleanout test_cluster_visibility_inject test_cluster_itl_cleanout_perf
 
 # Path to the cluster_version object (no PG deps, safe to link standalone).
 CLUSTER_VERSION_O = $(top_builddir)/src/backend/cluster/cluster_version.o
@@ -754,5 +755,45 @@ test_cluster_itl_reader_real_triple: test_cluster_itl_reader_real_triple.c unit_
 		$(CLUSTER_VERSION_O) $(CLUSTER_ITL_O) $(CLUSTER_UBA_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_ITL_O) $(CLUSTER_UBA_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-3.4c D10: test_cluster_itl_cleanout — 20 tests covering the
+# lazy cleanout helper symbol surface + can_stamp() pure-data
+# boundary cases (NULL / wrong flags / xid mismatch / commit_scn
+# already set / invalid expected_scn) + lazy() outer-guard
+# short-circuits reachable via InvalidBuffer / InvalidScn /
+# InvalidTransactionId / slot_idx out-of-bound.  Links real
+# cluster_itl_cleanout.o; bufmgr APIs are locally stubbed.
+CLUSTER_ITL_CLEANOUT_O = $(top_builddir)/src/backend/cluster/cluster_itl_cleanout.o
+test_cluster_itl_cleanout: test_cluster_itl_cleanout.c unit_test.h \
+		$(CLUSTER_VERSION_O) $(CLUSTER_ITL_CLEANOUT_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_ITL_CLEANOUT_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-3.4c D11: test_cluster_visibility_inject — 16 tests covering
+# the D5b inject UDF surface + A1 install_local + F4 delete_exact
+# (D6) + F5 lookup_exact verify chain at the symbol / struct-layout
+# contract level.  Real overlay behaviour is exercised by
+# cluster_tap t/208.  Local stubs only — no PG core link required.
+test_cluster_visibility_inject: test_cluster_visibility_inject.c unit_test.h \
+		$(CLUSTER_VERSION_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-3.4c D13: test_cluster_itl_cleanout_perf — 8 tests covering
+# the D14 per-page aggregate layout (ClusterItlPagedHandle
+# slot_indices bound = CLUSTER_ITL_INITRANS_DEFAULT, foreach_per_page
+# symbol linkable) + ClusterItlTouchHandle 24B regression so the
+# qsort comparator's offset assumptions stay frozen.  Behavioural
+# coverage of dedupe / qsort / batch stamp lives in cluster_tap.
+test_cluster_itl_cleanout_perf: test_cluster_itl_cleanout_perf.c unit_test.h \
+		$(CLUSTER_VERSION_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@

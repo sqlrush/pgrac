@@ -175,8 +175,12 @@ SKIP: {
 
 	# Install a remote exact TT ref for the tuple's xmin while the force flag
 	# is still off, so catalog work for the UDF itself remains PG-native.
+	# spec-3.4c D8: 6-arg signature; commit_scn=0 (InvalidScn) drives the
+	# overlay to install COMMITTED + commit_scn=0, which leaves
+	# decide_by_scn returning UNKNOWN → 53R97 fall-through (the L4
+	# fail-closed semantic this test asserts).
 	$pair->node0->safe_psql('postgres',
-		qq{SELECT cluster_test_inject_visibility_tt_ref('$l4_xid'::xid, 7, 3, 42, 0)});
+		qq{SELECT cluster_test_inject_visibility_tt_ref('$l4_xid'::xid, 7, 3, 42, 0, 0::int8)});
 
 	# Enable D5b force flag and then run a real SELECT that must enter
 	# HeapTupleSatisfiesMVCC cluster path and fail closed with 53R97 because

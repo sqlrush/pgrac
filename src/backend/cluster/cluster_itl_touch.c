@@ -116,6 +116,96 @@ cluster_itl_touch_foreach(ClusterItlTouchCallback cb, void *arg)
 		cb(&touch_list[i], arg);
 }
 
+/* ---------- spec-3.4c D14 — per-page aggregate iteration ---------- */
+
+/*
+ * Compare two touch handles by (rloc, forknum, block, slot_idx).  Returns
+ * <0 / 0 / >0 in qsort convention.  The dedupe + aggregate pipeline relies
+ * on this ordering: all handles for the same page are consecutive, with
+ * slot_idx ascending within that run.
+ */
+static int
+itl_touch_handle_cmp(const void *a, const void *b)
+{
+	const ClusterItlTouchHandle *l = (const ClusterItlTouchHandle *) a;
+	const ClusterItlTouchHandle *r = (const ClusterItlTouchHandle *) b;
+
+	if (l->rloc.dbOid != r->rloc.dbOid)
+		return (l->rloc.dbOid < r->rloc.dbOid) ? -1 : 1;
+	if (l->rloc.spcOid != r->rloc.spcOid)
+		return (l->rloc.spcOid < r->rloc.spcOid) ? -1 : 1;
+	if (l->rloc.relNumber != r->rloc.relNumber)
+		return (l->rloc.relNumber < r->rloc.relNumber) ? -1 : 1;
+	if (l->forknum != r->forknum)
+		return (l->forknum < r->forknum) ? -1 : 1;
+	if (l->block != r->block)
+		return (l->block < r->block) ? -1 : 1;
+	if (l->slot_idx != r->slot_idx)
+		return (l->slot_idx < r->slot_idx) ? -1 : 1;
+	return 0;
+}
+
+void
+cluster_itl_touch_foreach_per_page(ClusterItlTouchPagedCallback cb, void *arg)
+{
+	uint32			i;
+	ClusterItlPagedHandle ph;
+
+	Assert(cb != NULL);
+
+	if (touch_count == 0)
+		return;
+
+	/*
+	 * cluster_itl_touch_register already dedupes by (rloc, block, forknum,
+	 * slot_idx) on append, so the list contains no duplicates -- but the
+	 * insertion order is interleaved across pages.  Sort by page key so
+	 * we can stream-aggregate consecutive same-page runs into a single
+	 * ClusterItlPagedHandle.
+	 */
+	qsort(touch_list, touch_count, sizeof(ClusterItlTouchHandle),
+		  itl_touch_handle_cmp);
+
+	memset(&ph, 0, sizeof(ph));
+	ph.rloc = touch_list[0].rloc;
+	ph.forknum = touch_list[0].forknum;
+	ph.block = touch_list[0].block;
+	ph.nslots = 0;
+	ph.flags = 0;
+
+	for (i = 0; i < touch_count; i++)
+	{
+		const ClusterItlTouchHandle *h = &touch_list[i];
+		bool same_page = (i > 0)
+			&& RelFileLocatorEquals(h->rloc, ph.rloc)
+			&& h->forknum == ph.forknum
+			&& h->block == ph.block;
+
+		if (!same_page && i > 0)
+		{
+			cb(&ph, arg);
+			memset(&ph, 0, sizeof(ph));
+			ph.rloc = h->rloc;
+			ph.forknum = h->forknum;
+			ph.block = h->block;
+			ph.nslots = 0;
+			ph.flags = 0;
+		}
+
+		/*
+		 * Register's dedupe already guarantees slot_idx uniqueness per
+		 * page; the bound check defends against future bumps to
+		 * CLUSTER_ITL_INITRANS_DEFAULT that bypass register's guard.
+		 */
+		Assert(ph.nslots < CLUSTER_ITL_INITRANS_DEFAULT);
+		Assert(h->slot_idx < CLUSTER_ITL_INITRANS_DEFAULT);
+		ph.slot_indices[ph.nslots++] = (uint8) h->slot_idx;
+		ph.flags |= (uint8) h->flags;
+	}
+
+	cb(&ph, arg);
+}
+
 void
 cluster_itl_touch_reset_at_end_xact(void)
 {
@@ -196,29 +286,41 @@ itl_finish_stamp_page(Page page, uint8 slot_idx, const ItlFinishCtx *ctx)
 	}
 }
 
+/*
+ * spec-3.4c D14 / A4 yellow perf hardening — per-page aggregate finish.
+ *
+ *	One open + lock + WAL emit per (rloc, forknum, block) page, stamping
+ *	every touched slot on that page in a single critical section.
+ *	Replaces spec-3.4a itl_finish_one (per-slot) which paid the open/lock/
+ *	WAL cost per touched ITL slot.  Same crash-safety semantics: the page
+ *	delta lands in WAL exactly once, with all slot mutations atomic from
+ *	the recovery POV.
+ */
 static void
-itl_finish_one(const ClusterItlTouchHandle *handle, void *arg)
+itl_finish_page(const ClusterItlPagedHandle *page_handle, void *arg)
 {
-	const ItlFinishCtx *ctx = (const ItlFinishCtx *)arg;
+	const ItlFinishCtx *ctx = (const ItlFinishCtx *) arg;
+	ClusterItlTouchHandle key_handle;
 	GenericXLogState *state;
-	Buffer buf;
-	Page image;
-	bool needs_wal;
+	Buffer		buf;
+	Page		image;
+	bool		needs_wal;
+	uint8		i;
 
-	buf = itl_touch_acquire_buffer(handle);
-	needs_wal = (handle->flags & CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL) != 0;
+	memset(&key_handle, 0, sizeof(key_handle));
+	key_handle.rloc = page_handle->rloc;
+	key_handle.forknum = page_handle->forknum;
+	key_handle.block = page_handle->block;
+	key_handle.slot_idx = 0;
+	key_handle.flags = page_handle->flags;
 
-	/*
-	 * spec-3.4a D8: commit/abort stamping must be crash-safe but must
-	 * not emit an 8KB FPI for every touched ITL slot.  Use PG's generic
-	 * rmgr to log the small page delta.  The handle carries the original
-	 * RelationNeedsWAL() decision so this transaction-end path avoids a
-	 * relcache lookup; GenericXLogFinish() still owns the critical section
-	 * and dirty marking for both logged and unlogged relations.
-	 */
+	buf = itl_touch_acquire_buffer(&key_handle);
+	needs_wal = (page_handle->flags & CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL) != 0;
+
 	state = GenericXLogStartLogged(needs_wal);
 	image = GenericXLogRegisterBuffer(state, buf, 0);
-	itl_finish_stamp_page(image, (uint8)handle->slot_idx, ctx);
+	for (i = 0; i < page_handle->nslots; i++)
+		itl_finish_stamp_page(image, page_handle->slot_indices[i], ctx);
 	GenericXLogFinish(state);
 
 	itl_touch_release_buffer(buf);
@@ -242,7 +344,7 @@ cluster_itl_xact_precommit_finish(TransactionId xid, SCN commit_scn)
 
 	ctx.commit_scn = commit_scn;
 	ctx.is_commit = true;
-	cluster_itl_touch_foreach(itl_finish_one, &ctx);
+	cluster_itl_touch_foreach_per_page(itl_finish_page, &ctx);
 	cluster_itl_touch_reset_at_end_xact();
 }
 
@@ -262,7 +364,7 @@ cluster_itl_xact_abort_finish(TransactionId xid)
 
 	ctx.commit_scn = InvalidScn;
 	ctx.is_commit = false;
-	cluster_itl_touch_foreach(itl_finish_one, &ctx);
+	cluster_itl_touch_foreach_per_page(itl_finish_page, &ctx);
 	cluster_itl_touch_reset_at_end_xact();
 }
 
@@ -275,6 +377,11 @@ cluster_itl_touch_register(const ClusterItlTouchHandle *handle pg_attribute_unus
 void
 cluster_itl_touch_foreach(ClusterItlTouchCallback cb pg_attribute_unused(),
 						  void *arg pg_attribute_unused())
+{}
+
+void
+cluster_itl_touch_foreach_per_page(ClusterItlTouchPagedCallback cb pg_attribute_unused(),
+								   void *arg pg_attribute_unused())
 {}
 
 void

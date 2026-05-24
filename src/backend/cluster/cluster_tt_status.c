@@ -293,6 +293,35 @@ cluster_tt_status_install_local(const ClusterTTStatusKey *key, ClusterTTStatus s
 	pg_atomic_fetch_add_u64(&ClusterTTStatusState->install_count, 1);
 }
 
+/*
+ * cluster_tt_status_delete_exact (spec-3.4c D6 / F4)
+ *
+ *	  Per-key delete companion of install_local.  Used by D5b
+ *	  cluster_test_clear_visibility_injects() to remove one overlay
+ *	  entry without flush_all()'s blast radius.  F4: must not fake-
+ *	  clear by writing ABORTED — semantic conflict with the real
+ *	  TT status state machine.
+ */
+bool
+cluster_tt_status_delete_exact(const ClusterTTStatusKey *key)
+{
+	bool		found;
+
+	Assert(key != NULL);
+
+	if (!cluster_enabled || ClusterTTStatusHTAB == NULL)
+		return false;
+
+	LWLockAcquire(ClusterTTStatusLock, LW_EXCLUSIVE);
+	(void) hash_search(ClusterTTStatusHTAB, key, HASH_REMOVE, &found);
+	LWLockRelease(ClusterTTStatusLock);
+
+	if (found)
+		pg_atomic_fetch_add_u64(&ClusterTTStatusState->evict_count, 1);
+
+	return found;
+}
+
 void
 cluster_tt_status_flush_all(uint32 new_epoch)
 {
@@ -452,6 +481,13 @@ cluster_tt_status_install_local(const ClusterTTStatusKey *key, ClusterTTStatus s
 	(void)key;
 	(void)status;
 	(void)commit_scn;
+}
+
+bool
+cluster_tt_status_delete_exact(const ClusterTTStatusKey *key)
+{
+	(void)key;
+	return false;
 }
 
 void

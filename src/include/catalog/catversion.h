@@ -506,7 +506,15 @@
  * for backward-compat replay.  Additionally adds LWTRANCHE_CLUSTER_TT_SLOT
  * tranche + per-node TT slot allocator shmem region.  Catalog tooling that
  * inspects heap WAL deltas or LWLock tranche names must use the new layout. */
-#define CATALOG_VERSION_NO 202605490
+/* spec-3.4c D7 + D8 (2026-05-24, A1/F5):  cluster_test_inject_visibility_tt_ref
+ * grows a 6th arg (commit_scn int8) so the inject UDF can synchronously install
+ * the TT status overlay entry (status=COMMITTED, commit_scn=<arg>) and verify
+ * via lookup_exact().  Without the 6-arg signature the inject path leaves the
+ * overlay empty -> lookup_exact miss -> 53R97 fail-closed even after a
+ * "successful" inject.  Catalog tooling that introspects proargtypes /
+ * proargnames must use the new layout.  Test-only UDF; production builds keep
+ * the FEATURE_NOT_SUPPORTED stub (same call shape). */
+#define CATALOG_VERSION_NO 202605500
 
 /* spec-2.39 D10 (2026-05-21):  SI Broadcaster production activation —
  * DDL commit hook (AtEOXact_Inval + COMMIT PREPARED via cluster-aware
