@@ -12,7 +12,7 @@
  *	  ordering / gate / success-path / failure-path / local-buffer / two
  *	  disable-mode invariants (L1-L8).
  *
- *	  L1  cluster_pcm_is_active() truth table (4 combos:enabled × max_entries)
+ *	  L1  cluster_pcm_is_active() truth table (enabled/node_id/peers/max_entries)
  *	  L2  PCM acquire fires before LWLock acquire (call_log order)
  *	  L3  PCM release fires after LWLock release (reverse order)
  *	  L4  success path:  buf->buffer_type = SCUR / XCUR; pcm_state = S / X
@@ -70,6 +70,11 @@ int cluster_node_id = 0;
 int NBuffers = 0;
 int cluster_injection_armed_count = 0;
 bool cluster_enabled = true; /* PGRAC: spec-2.31 D2 helper depends on this */
+static ClusterConf fake_cluster_conf = {
+	.magic = PGRAC_CLUSTER_CONF_MAGIC,
+	.node_count = 2,
+};
+ClusterConf *ClusterConfShmem = &fake_cluster_conf;
 
 static uint32 ut_wait_event_info_storage = 0;
 uint32 *my_wait_event_info = &ut_wait_event_info_storage;
@@ -475,6 +480,7 @@ reset_fixture(void)
 	fake_ereport_at_lwlock = false;
 	cluster_node_id = 0;
 	cluster_enabled = true;
+	fake_cluster_conf.node_count = 2;
 	NBuffers = 4;
 	cluster_pcm_grd_max_entries = 4;
 	cluster_pcm_grd_init();
@@ -487,10 +493,11 @@ reset_fixture(void)
 
 UT_TEST(test_L1_is_active_triple_gate_truth_table)
 {
-	/* (cluster_enabled, cluster_node_id, max_entries) → cluster_pcm_is_active().
-	 * spec-2.31 D2 v0.5 (initdb hardening) added node_id >= 0 as gate layer 3. */
+	/* (cluster_enabled, cluster_node_id, has_peers, max_entries)
+	 * → cluster_pcm_is_active(). */
 	cluster_enabled = true;
 	cluster_node_id = 0;
+	fake_cluster_conf.node_count = 2;
 	cluster_pcm_grd_max_entries = 4;
 	UT_ASSERT(cluster_pcm_is_active());
 
@@ -502,6 +509,10 @@ UT_TEST(test_L1_is_active_triple_gate_truth_table)
 	UT_ASSERT(!cluster_pcm_is_active());
 
 	cluster_node_id = 0;
+	fake_cluster_conf.node_count = 1;
+	UT_ASSERT(!cluster_pcm_is_active());
+
+	fake_cluster_conf.node_count = 2;
 	cluster_pcm_grd_max_entries = 0;
 	UT_ASSERT(!cluster_pcm_is_active());
 
@@ -638,7 +649,7 @@ UT_TEST(test_L8_max_entries_zero_skips_hook)
 
 	fake_LockBuffer(&buf, BUFFER_LOCK_SHARE, false);
 
-	/* Layer 3 gate: max_entries=0 → cluster_pcm_is_active() false. */
+	/* max_entries=0 gate: cluster_pcm_is_active() false. */
 	UT_ASSERT_EQ(call_log_len, 1);
 	UT_ASSERT(strcmp(call_log[0], "LWLock-acquire") == 0);
 }
