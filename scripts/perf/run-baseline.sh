@@ -166,7 +166,7 @@ run_one_mode() {
     if [ "$mode" = "enable" ] && [ "$VANILLA" != "yes" ]; then
         echo "$PROGNAME: bootstrapping via pgrac-init"
         "$install_prefix/bin/pgrac-init" -D "$pgdata" --node-id=0 \
-            --cluster-name=perf-baseline >/dev/null
+            --cluster-name=perf-baseline --force >/dev/null
     else
         echo "$PROGNAME: bootstrapping via initdb"
         "$install_prefix/bin/initdb" -D "$pgdata" -A trust -N >/dev/null

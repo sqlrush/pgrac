@@ -114,7 +114,6 @@ jobs:
             --duration="${PERF_DURATION:-30}" \
             --clients="${PERF_CLIENTS:-4}" \
             --jobs="${PERF_JOBS:-2}"
-        continue-on-error: true
 
       - name: Collect perf artifacts
         if: always()
