@@ -10,17 +10,18 @@
 #	  as expected.
 #
 #	  L1  fresh cluster:  capture startup baseline counters
-#	  L2  SELECT * FROM heap_t:  trans_n_to_s_count ≥ 1 (LockBuffer SHARE hook)
-#	  L3  UPDATE heap_t:  trans_n_to_x_count ≥ 1 (LockBuffer EXCLUSIVE hook)
-#	  L4  VACUUM heap_t:  trans_n_to_x_count further inc (LockBufferForCleanup
-#	       reuses internal LockBuffer hook per D4 audit)
+#	  L2  single-node/no-peer SELECT * FROM heap_t:  trans_n_to_s_count stays 0
+#	       (spec-3.4c no-peer perf gate skips PCM/GCS hot path)
+#	  L3  single-node/no-peer UPDATE heap_t:  X ownership counters stay 0
+#	  L4  single-node/no-peer VACUUM heap_t:  X ownership counters stay 0
 #	  L5  restart with cluster.enabled=off:  counter doesn't inc (Layer 2 gate)
 #	  L6  restart with cluster.pcm_grd_max_entries=0 + shared_buffers=128kB:
 #	       counter doesn't inc (Layer 3 gate);  shared_buffers配套 防 HC62 FATAL
 #	  L7  temp table workload:  diagnostic counter delta recorded
 #	       (NOT hard-zero asserted — temp DDL touches catalog shared buffer;
 #	        hard local-buffer skip covered by cluster_unit L6)
-#	  L8  workload-active state:  pcm_api_state = 'active' + pcm_grd_active_entries > 0
+#	  L8  workload no-peer state:  pcm_api_state may be active, but
+#	       pcm_grd_active_entries stays 0 because no peer means no PCM tax
 #
 # Spec: spec-2.31-bufmgr-pcm-content-lock-hook.md §4.2 (FROZEN v0.5)
 #
@@ -48,7 +49,11 @@ sub trans_count {
 
 
 # ============================================================
-# Default cluster — cluster.enabled=true + pcm_grd_max_entries=-1 (auto NBuffers).
+# Default cluster — cluster.enabled=true + pcm_grd_max_entries=-1 (auto NBuffers),
+# but no declared peers.  Since spec-3.4c, cluster_pcm_is_active() includes
+# cluster_conf_has_peers(), so single-node fallback does not pay PCM hot-path
+# cost.  Real PCM/GCS behavior is covered by the 2-node GCS TAPs and by
+# cluster_unit; this file now guards the no-peer perf contract.
 # ============================================================
 my $node = PgracClusterNode->new('bufmgr_pcm_default');
 $node->init;
@@ -66,7 +71,7 @@ ok($n_to_x_startup >= 0,
    "L1 captured startup trans_n_to_x_count baseline = $n_to_x_startup");
 
 
-# L2 — SELECT triggers LockBuffer(SHARE) hot path.
+# L2 — SELECT would trigger LockBuffer(SHARE), but no-peer gate skips PCM.
 $node->safe_psql('postgres', q{
 	CREATE TABLE heap_t (id int, val text);
 	INSERT INTO heap_t SELECT g, 'r' || g FROM generate_series(1, 100) g;
@@ -75,38 +80,35 @@ $node->safe_psql('postgres', q{
 my $n_to_s_before_select = trans_count($node, 'trans_n_to_s_count');
 $node->safe_psql('postgres', 'SELECT count(*) FROM heap_t');
 my $n_to_s_after_select = trans_count($node, 'trans_n_to_s_count');
-ok($n_to_s_after_select > $n_to_s_before_select,
-   "L2 SELECT * FROM heap_t increments trans_n_to_s_count " .
+is($n_to_s_after_select, $n_to_s_before_select,
+   "L2 no-peer SELECT skips trans_n_to_s_count " .
    "($n_to_s_before_select → $n_to_s_after_select)");
 
 
-# L3 — UPDATE triggers LockBuffer(EXCLUSIVE) hot path.  After spec-2.35,
-# prior SELECT leaves an S cache-residency bit behind, so the correct local
-# path may be S→X_UPGRADE rather than fresh N→X.
+# L3 — UPDATE would trigger LockBuffer(EXCLUSIVE), but no-peer gate skips PCM.
 my $n_to_x_before_update = trans_count($node, 'trans_n_to_x_count');
 my $s_to_x_before_update = trans_count($node, 'trans_s_to_x_upgrade_count');
 $node->safe_psql('postgres', 'UPDATE heap_t SET val = val || \'!\' WHERE id <= 50');
 my $n_to_x_after_update = trans_count($node, 'trans_n_to_x_count');
 my $s_to_x_after_update = trans_count($node, 'trans_s_to_x_upgrade_count');
-ok(($n_to_x_after_update + $s_to_x_after_update)
-	> ($n_to_x_before_update + $s_to_x_before_update),
-   "L3 UPDATE heap_t advances X ownership counter " .
+is(($n_to_x_after_update + $s_to_x_after_update),
+   ($n_to_x_before_update + $s_to_x_before_update),
+   "L3 no-peer UPDATE skips X ownership counter " .
    "(N→X $n_to_x_before_update → $n_to_x_after_update; " .
    "S→X $s_to_x_before_update → $s_to_x_after_update)");
 
 
-# L4 — VACUUM triggers LockBufferForCleanup which reuses internal LockBuffer.
+# L4 — VACUUM uses LockBufferForCleanup; no-peer gate skips PCM.
 my $n_to_x_before_vacuum = trans_count($node, 'trans_n_to_x_count');
 my $s_to_x_before_vacuum = trans_count($node, 'trans_s_to_x_upgrade_count');
 $node->safe_psql('postgres', 'VACUUM heap_t');
 my $n_to_x_after_vacuum = trans_count($node, 'trans_n_to_x_count');
 my $s_to_x_after_vacuum = trans_count($node, 'trans_s_to_x_upgrade_count');
-ok(($n_to_x_after_vacuum + $s_to_x_after_vacuum)
-	> ($n_to_x_before_vacuum + $s_to_x_before_vacuum),
-   "L4 VACUUM heap_t further advances X ownership counter " .
+is(($n_to_x_after_vacuum + $s_to_x_after_vacuum),
+   ($n_to_x_before_vacuum + $s_to_x_before_vacuum),
+   "L4 no-peer VACUUM skips X ownership counter " .
    "(N→X $n_to_x_before_vacuum → $n_to_x_after_vacuum; " .
-   "S→X $s_to_x_before_vacuum → $s_to_x_after_vacuum) " .
-   "via LockBufferForCleanup → internal LockBuffer(EXCLUSIVE) hook (D4 audit)");
+   "S→X $s_to_x_before_vacuum → $s_to_x_after_vacuum)");
 
 
 # L8 — active surface after workload:  pcm_api_state=active + entries > 0.
@@ -116,9 +118,9 @@ is($node->safe_psql('postgres',
    'active',
    'L8 pcm_api_state = active during workload');
 ok($node->safe_psql('postgres',
-		q{SELECT value::bigint > 0 FROM pg_cluster_state
+		q{SELECT value::bigint = 0 FROM pg_cluster_state
 		   WHERE category='pcm' AND key='pcm_grd_active_entries'}) eq 't',
-   'L8 pcm_grd_active_entries > 0 after workload (HTAB populated)');
+   'L8 no-peer pcm_grd_active_entries stays 0 after workload');
 
 
 # L7 — temp table workload:  diagnostic delta only.

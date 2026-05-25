@@ -15,8 +15,8 @@
 #	       gcs_request + gcs_reply rows
 #	  L6  workload (SELECT/UPDATE/VACUUM) does NOT inc send_request_count
 #	       (HC72 production master==self short-circuits;  wire path test-only)
-#	  L7  lookup_master_self_count grows with workload (placeholder returns
-#	       self every time; spec-2.33+ replaces with real GRD lookup)
+#	  L7  lookup_master_self_count stays 0 in no-peer single-node fallback;
+#	       spec-3.4c no-peer perf gate skips PCM/GCS lookup entirely
 #	  L8  outstanding_count = 0 baseline (no in-flight cross-node requests)
 #	  L9  cluster.enabled=off restart leaves api_state="stub"-or-zeroed
 #	       (4-layer gate skips all PCM paths, GCS module still inits but
@@ -55,7 +55,9 @@ sub gcs_value {
 
 
 # ============================================================
-# Default cluster — cluster.enabled=true + pcm_grd_max_entries=-1 (auto).
+# Default cluster — cluster.enabled=true + pcm_grd_max_entries=-1 (auto),
+# but no declared peers.  Since spec-3.4c, single-node fallback skips
+# PCM/GCS hot-path lookup entirely to avoid RAC write-side cost.
 # ============================================================
 my $node = PgracClusterNode->new('gcs_loopback');
 $node->init;
@@ -106,10 +108,10 @@ is($send_after, $send_before,
    "L6 production master==self short-circuit:  send_request_count unchanged ($send_before → $send_after) — HC72 wire path test-only");
 
 
-# L7 — lookup_master_self_count grows with workload (placeholder always-self).
+# L7 — no-peer gate skips lookup_master entirely.
 my $self_after = gcs_value($node, 'lookup_master_self_count');
-ok($self_after > 0,
-   "L7 lookup_master_self_count > 0 after workload ($self_after) — placeholder always returns self");
+is($self_after, '0',
+   "L7 no-peer lookup_master_self_count stays 0 after workload ($self_after)");
 
 
 # L8 — outstanding_count = 0 (no in-flight cross-node requests).
