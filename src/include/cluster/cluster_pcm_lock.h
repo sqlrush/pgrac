@@ -52,7 +52,7 @@
 
 #include "c.h"
 #include "cluster/cluster_buffer_desc.h" /* PcmState (1.6), INVALID_NODE_ID */
-#include "cluster/cluster_conf.h"		   /* cluster_conf_has_peers */
+#include "cluster/cluster_conf.h"		 /* cluster_conf_has_peers */
 #include "storage/buf_internals.h"		 /* BufferTag */
 
 #ifdef USE_PGRAC_CLUSTER
@@ -158,8 +158,7 @@ extern int cluster_node_id;
 static inline bool
 cluster_pcm_is_active(void)
 {
-	return cluster_enabled && cluster_node_id >= 0
-		   && cluster_conf_has_peers()
+	return cluster_enabled && cluster_node_id >= 0 && cluster_conf_has_peers()
 		   && cluster_pcm_grd_max_entries != 0;
 }
 
