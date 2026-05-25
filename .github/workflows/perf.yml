@@ -129,3 +129,98 @@ jobs:
           path: perf-baseline-artifact/
           if-no-files-found: ignore
           retention-days: 60
+
+
+  # ----------------------------------------------------------------------
+  # spec-3.4e D4 — NEW perf-2node-baseline job
+  #
+  # 4 workload class via ClusterPair fixture (Perl runner).  Per L91
+  # tier separation, weekly + manual workflow_dispatch only;
+  # warn-only artifact upload (not blocking).
+  #
+  # macOS gets continue-on-error per spec-3.4e F6 (ClusterPair
+  # stability on macOS runner not yet verified;Linux primary).
+  # ----------------------------------------------------------------------
+  perf-2node-baseline:
+    name: Stage 3.4e 2-node perf baseline (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    continue-on-error: ${{ matrix.os == 'macos-latest' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            libreadline-dev zlib1g-dev libicu-dev \
+            liblz4-dev libzstd-dev libssl-dev libxml2-dev \
+            pkg-config libipc-run-perl
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install readline icu4c lz4 zstd openssl@3 libxml2 pkg-config || true
+          sudo cpan -i IPC::Run || true
+          {
+            echo "PKG_CONFIG_PATH=$(brew --prefix icu4c)/lib/pkgconfig:$(brew --prefix openssl@3)/lib/pkgconfig:$(brew --prefix lz4)/lib/pkgconfig:$(brew --prefix zstd)/lib/pkgconfig"
+            echo "LDFLAGS=-L$(brew --prefix readline)/lib -L$(brew --prefix zstd)/lib -L$(brew --prefix lz4)/lib -L$(brew --prefix openssl@3)/lib -L$(brew --prefix icu4c)/lib"
+            echo "CPPFLAGS=-I$(brew --prefix readline)/include -I$(brew --prefix zstd)/include -I$(brew --prefix lz4)/include -I$(brew --prefix openssl@3)/include -I$(brew --prefix icu4c)/include"
+          } >> $GITHUB_ENV
+
+      - name: Configure (--enable-cluster + --enable-injection-points)
+        run: |
+          ./configure \
+            --prefix=$HOME/linkdb-install \
+            --enable-cassert --enable-debug \
+            --enable-injection-points --enable-tap-tests \
+            --with-openssl --with-icu --with-lz4 --with-zstd \
+            --enable-cluster
+
+      - name: Build + Install
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            make -j$(getconf _NPROCESSORS_ONLN)
+          else
+            make -j$(sysctl -n hw.ncpu)
+          fi
+          make install
+
+      - name: Run 2-node baseline (3 workload classes — warn-only)
+        run: |
+          export PGRAC_ENABLE_INSTALL=$HOME/linkdb-install
+          export PATH=$HOME/linkdb-install/bin:$PATH
+          # class 2/3/4 via Perl runner (ClusterPair fixture);
+          # class 1 (single-node-no-peer) covered by existing perf-baseline job above.
+          for class in 2node-local-affinity 2node-cross-node-visibility 2node-hot-row-lock; do
+            echo "=== Running $class ==="
+            scripts/perf/run-2node-baseline.sh \
+              --mode="$class" \
+              --scale="${PERF_SCALE:-10}" \
+              --duration="${PERF_DURATION:-30}" \
+              --clients="${PERF_CLIENTS:-4}" \
+              --jobs="${PERF_JOBS:-2}" \
+              || echo "::warning ::class $class failed (warn-only per spec-3.4e E2)"
+          done
+
+      - name: Collect 2-node perf artifacts
+        if: always()
+        run: |
+          mkdir -p perf-2node-artifact
+          cp -R scripts/perf/results perf-2node-artifact/results 2>/dev/null || true
+
+      - name: Upload 2-node perf artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-2node-baseline-${{ matrix.os }}-${{ github.run_id }}
+          path: perf-2node-artifact/
+          if-no-files-found: ignore
+          retention-days: 60

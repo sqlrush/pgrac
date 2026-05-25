@@ -40,28 +40,47 @@
 #include "cluster/cluster_itl_slot.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_tt_slot.h"
-#include "cluster/cluster_uba.h" /* uba_decode / uba_origin_node_id (spec-3.4b D7) */
-#include "port/atomics.h"		 /* pg_atomic_uint64 (spec-3.4d D11 counters) */
+#include "cluster/cluster_uba.h"   /* uba_decode / uba_origin_node_id (spec-3.4b D7) */
+#include "cluster/cluster_shmem.h" /* cluster_shmem_register_region (spec-3.4e D6) */
+#include "miscadmin.h"			   /* IsBootstrapProcessingMode (spec-3.4e D6) */
+#include "port/atomics.h"		   /* pg_atomic_uint64 (spec-3.4d D11 counters) */
+#include "storage/ipc.h"		   /* ShmemInitStruct (spec-3.4e D6) */
+#include "storage/shmem.h"
 
 #ifdef USE_PGRAC_CLUSTER
 
 /*
  * spec-3.4d D11:  5 NEW lock-path counter for row-lock observability.
  *
- *	Backend-local atomic counters (no shmem state — counters are per
- *	backend's lifetime, snapshot via getter at view query time).  Full
- *	shmem-backed cross-backend aggregation deferred to Hardening v1.0.1
- *	when the dump_lock_path category lands in pg_stat_cluster_state.
- *	For Sprint A scope:  per-backend counters are sufficient to verify
- *	hot-path behavior in cluster_unit + cluster_tap, and the cumulative
- *	cross-backend view follows the same pattern as spec-3.4a/c counters.
+ *	Backend-local atomic counters for 4/5 — per backend's lifetime,
+ *	snapshot via getter at view query time.  Full shmem-backed cross-
+ *	backend aggregation for remaining 4 counter deferred to Hardening
+ *	v1.0.1 when the dump_lock_path category lands in pg_stat_cluster_state.
+ *
+ *	spec-3.4e D6 / F2 P0 amendment:
+ *	  ClusterRemoteRowLockFailClosedCount promoted to shmem-attached
+ *	  atomic so pgbench collector backend can read deltas across N
+ *	  client backends.  Without this, class 4 hot-row metric reads 0
+ *	  from collector backend (per-backend counter increments invisible).
+ *	  Other 4 counters remain per-backend (Sprint A scope control;
+ *	  完整 5 counter aggregation 推 Hardening v1.0.1).
  */
 static pg_atomic_uint64 ClusterItlOverflowLockCount;
 static pg_atomic_uint64 ClusterMultixactLockRejectCount;
-static pg_atomic_uint64 ClusterRemoteRowLockFailClosedCount;
 static pg_atomic_uint64 ClusterLockOnlyItlStampCount;
 static pg_atomic_uint64 ClusterLockOnlyTtHintEmitCount;
 static bool ClusterLockPathCountersInited = false;
+
+/* spec-3.4e D6:  shmem-attached pointer for the cross-backend
+ * aggregated fail_closed counter.  NULL fallback uses an unattached
+ * per-backend atomic so cluster_unit / non-postmaster paths keep
+ * working (Q9 minimal scope). */
+typedef struct ClusterLockPathShmem {
+	pg_atomic_uint64 remote_row_lock_fail_closed_count;
+} ClusterLockPathShmem;
+
+static ClusterLockPathShmem *ClusterLockPathShmemState = NULL;
+static pg_atomic_uint64 ClusterRemoteRowLockFailClosedFallback;
 
 static inline void
 ensure_lock_counters_inited(void)
@@ -69,11 +88,66 @@ ensure_lock_counters_inited(void)
 	if (!ClusterLockPathCountersInited) {
 		pg_atomic_init_u64(&ClusterItlOverflowLockCount, 0);
 		pg_atomic_init_u64(&ClusterMultixactLockRejectCount, 0);
-		pg_atomic_init_u64(&ClusterRemoteRowLockFailClosedCount, 0);
+		pg_atomic_init_u64(&ClusterRemoteRowLockFailClosedFallback, 0);
 		pg_atomic_init_u64(&ClusterLockOnlyItlStampCount, 0);
 		pg_atomic_init_u64(&ClusterLockOnlyTtHintEmitCount, 0);
 		ClusterLockPathCountersInited = true;
 	}
+}
+
+/*
+ * spec-3.4e D6 shmem region:  fail_closed counter cross-backend
+ * aggregation.  Other lock-path counters remain per-backend (Sprint A
+ * scope control;  Hardening v1.0.1 expands).
+ */
+static Size
+cluster_lock_path_shmem_size(void)
+{
+	if (IsBootstrapProcessingMode() || !cluster_enabled || cluster_node_id < 0)
+		return 0;
+	return MAXALIGN(sizeof(ClusterLockPathShmem));
+}
+
+static void
+cluster_lock_path_shmem_init(void)
+{
+	bool found;
+
+	if (IsBootstrapProcessingMode() || !cluster_enabled || cluster_node_id < 0)
+		return;
+
+	ClusterLockPathShmemState = (ClusterLockPathShmem *)ShmemInitStruct(
+		"ClusterLockPathShmem", MAXALIGN(sizeof(ClusterLockPathShmem)), &found);
+	if (!found)
+		pg_atomic_init_u64(&ClusterLockPathShmemState->remote_row_lock_fail_closed_count, 0);
+}
+
+static const ClusterShmemRegion cluster_lock_path_region = {
+	.name = "pgrac cluster lock-path counters",
+	.size_fn = cluster_lock_path_shmem_size,
+	.init_fn = cluster_lock_path_shmem_init,
+	.lwlock_count = 0,
+	.owner_subsys = "cluster_itl_lock_path",
+	.reserved_flags = 0,
+};
+
+void
+cluster_lock_path_shmem_register(void)
+{
+	cluster_shmem_register_region(&cluster_lock_path_region);
+}
+
+/*
+ * Resolve the active fail_closed counter pointer:
+ *   - postmaster context with shmem attached → shmem-aggregated
+ *   - otherwise → per-backend fallback (cluster_unit / bootstrap)
+ */
+static inline pg_atomic_uint64 *
+fail_closed_counter(void)
+{
+	if (ClusterLockPathShmemState != NULL)
+		return &ClusterLockPathShmemState->remote_row_lock_fail_closed_count;
+	return &ClusterRemoteRowLockFailClosedFallback;
 }
 
 void
@@ -94,7 +168,7 @@ void
 cluster_itl_bump_remote_row_lock_fail_closed_count(void)
 {
 	ensure_lock_counters_inited();
-	pg_atomic_fetch_add_u64(&ClusterRemoteRowLockFailClosedCount, 1);
+	pg_atomic_fetch_add_u64(fail_closed_counter(), 1);
 }
 
 void
@@ -130,9 +204,11 @@ cluster_itl_get_multixact_lock_reject_count(void)
 uint64
 cluster_itl_get_remote_row_lock_fail_closed_count(void)
 {
+	if (ClusterLockPathShmemState != NULL)
+		return pg_atomic_read_u64(&ClusterLockPathShmemState->remote_row_lock_fail_closed_count);
 	if (!ClusterLockPathCountersInited)
 		return 0;
-	return pg_atomic_read_u64(&ClusterRemoteRowLockFailClosedCount);
+	return pg_atomic_read_u64(&ClusterRemoteRowLockFailClosedFallback);
 }
 
 uint64

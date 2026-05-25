@@ -304,5 +304,10 @@ extern uint64 cluster_itl_get_remote_row_lock_fail_closed_count(void);
 extern uint64 cluster_itl_get_lock_only_itl_stamp_count(void);
 extern uint64 cluster_itl_get_lock_only_tt_hint_emit_count(void);
 
+/* spec-3.4e D6 / F2 P0:  register shmem region for cross-backend
+ * aggregated fail_closed counter.  Called from cluster_shmem_init at
+ * postmaster startup. */
+extern void cluster_lock_path_shmem_register(void);
+
 
 #endif /* CLUSTER_ITL_H */
