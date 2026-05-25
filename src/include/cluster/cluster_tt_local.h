@@ -99,6 +99,9 @@ extern bool cluster_tt_local_peek_binding(TransactionId top_xid, uint32 *out_seg
 										  uint16 *out_slot_offset, uint32 *out_tt_slot_id,
 										  uint32 *out_cluster_epoch);
 
+/* Cheap xact-end predicate; true only when this xact owns a local TT binding. */
+extern bool cluster_tt_local_has_binding(TransactionId top_xid);
+
 /* Free the bound TT slot and clear the binding (idempotent). */
 extern void cluster_tt_local_reset_binding(void);
 

@@ -42,6 +42,12 @@ PGRAC_BINDIR="${PGRAC_BINDIR:-$(pwd)/tmp_install/usr/local/pgsql/bin}"
 if [[ ! -x "$PGRAC_BINDIR/initdb" ]]; then
     # Try alternate CI install path
     for cand in \
+        "$HOME/pgrac-install/bin" \
+        "$HOME/linkdb-install/bin" \
+        /home/runner/pgrac-install/bin \
+        /home/runner/linkdb-install/bin \
+        /Users/runner/pgrac-install/bin \
+        /Users/runner/linkdb-install/bin \
         /home/runner/work/linkdb/linkdb/tmp_install/usr/local/pgsql/bin \
         $(find tmp_install -name initdb -type f 2>/dev/null | head -1 | xargs dirname 2>/dev/null) \
         ; do

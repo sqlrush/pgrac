@@ -242,6 +242,12 @@ cluster_tt_local_peek_binding(TransactionId top_xid, uint32 *out_segment_id,
 	return true;
 }
 
+bool
+cluster_tt_local_has_binding(TransactionId top_xid)
+{
+	return cluster_tt_local_binding.top_xid == top_xid && TransactionIdIsValid(top_xid);
+}
+
 
 /*
  * cluster_tt_local_reset_binding
@@ -451,6 +457,13 @@ cluster_tt_local_peek_binding(TransactionId top_xid, uint32 *out_segment_id,
 	(void)out_slot_offset;
 	(void)out_tt_slot_id;
 	(void)out_cluster_epoch;
+	return false;
+}
+
+bool
+cluster_tt_local_has_binding(TransactionId top_xid)
+{
+	(void)top_xid;
 	return false;
 }
 

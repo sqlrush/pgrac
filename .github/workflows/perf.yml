@@ -2,11 +2,11 @@
 # .github/workflows/perf.yml
 #    linkdb performance baseline CI (Tier 3 of 3-tier CI model).
 #
-#    pgbench Stage 1 perf baseline check, completely decoupled from the
-#    push / tag / nightly path.  Per spec-1.23 Q8 B-WARN this is *not*
-#    a blocking gate (GitHub Actions shared runners exhibit 10-20%
-#    variance unsuitable for blocking thresholds);output is artifact
-#    for manual review.
+#    pgbench Stage 1/3 perf baseline check, completely decoupled from
+#    the push / tag / nightly path.  Per spec-1.23 Q8 B-WARN this is
+#    *not* a blocking gate (GitHub Actions shared runners exhibit
+#    10-20% variance unsuitable for blocking thresholds);output is an
+#    artifact for manual review.
 #
 #    Pre-3-tier this ran on every push as part of ci.yml.  The 60s
 #    pgbench × 2 platforms cost ~2 min wallclock for warn-only signal
@@ -38,13 +38,13 @@ concurrency:
 jobs:
 
   perf-baseline:
-    name: Stage 1 perf baseline (${{ matrix.os }})
+    name: Stage perf baseline (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -69,15 +69,33 @@ jobs:
             echo "CPPFLAGS=-I$(brew --prefix readline)/include -I$(brew --prefix zstd)/include -I$(brew --prefix lz4)/include -I$(brew --prefix openssl@3)/include -I$(brew --prefix icu4c)/include"
           } >> $GITHUB_ENV
 
-      - name: Configure (--enable-cluster)
+      - name: Configure (--disable-cluster baseline)
         run: |
           ./configure \
-            --prefix=$HOME/pgrac-install \
+            --prefix=$HOME/linkdb-disable-install \
+            --enable-cassert --enable-debug \
+            --with-openssl --with-icu --with-lz4 --with-zstd \
+            --disable-cluster
+
+      - name: Build + Install (--disable-cluster baseline)
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            make -j$(getconf _NPROCESSORS_ONLN)
+          else
+            make -j$(sysctl -n hw.ncpu)
+          fi
+          make install
+          make distclean
+
+      - name: Configure (--enable-cluster candidate)
+        run: |
+          ./configure \
+            --prefix=$HOME/linkdb-install \
             --enable-cassert --enable-debug \
             --with-openssl --with-icu --with-lz4 --with-zstd \
             --enable-cluster
 
-      - name: Build + Install
+      - name: Build + Install (--enable-cluster candidate)
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
             make -j$(getconf _NPROCESSORS_ONLN)
@@ -86,9 +104,23 @@ jobs:
           fi
           make install
 
-      - name: Stage 1 perf baseline check (warn-only)
-        run: bash scripts/ci/run-perf-baseline-check.sh
+      - name: Stage off/on pgbench baseline (warn-only)
+        run: |
+          PGRAC_ENABLE_INSTALL=$HOME/linkdb-install \
+          PGRAC_DISABLE_INSTALL=$HOME/linkdb-disable-install \
+          scripts/perf/run-baseline.sh \
+            --mode=both \
+            --scale="${PERF_SCALE:-10}" \
+            --duration="${PERF_DURATION:-30}" \
+            --clients="${PERF_CLIENTS:-4}" \
+            --jobs="${PERF_JOBS:-2}"
         continue-on-error: true
+
+      - name: Collect perf artifacts
+        if: always()
+        run: |
+          mkdir -p perf-baseline-artifact
+          cp -R scripts/perf/results perf-baseline-artifact/results 2>/dev/null || true
 
       - name: Upload perf baseline artifact
         if: always()

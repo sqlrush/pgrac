@@ -52,6 +52,7 @@
 
 #include "c.h"
 #include "cluster/cluster_buffer_desc.h" /* PcmState (1.6), INVALID_NODE_ID */
+#include "cluster/cluster_conf.h"		   /* cluster_conf_has_peers */
 #include "storage/buf_internals.h"		 /* BufferTag */
 
 #ifdef USE_PGRAC_CLUSTER
@@ -127,9 +128,11 @@ extern int cluster_pcm_grd_max_entries;
  * PGRAC: spec-2.31 D2 v0.5 — gated PCM activation predicate.
  *
  *	Forward-declare cluster_enabled / cluster_node_id (defined in
- *	cluster_guc.c) without including cluster_guc.h, to keep header
- *	dependencies one-way (cluster_pcm_lock.h depends on PG core only;
- *	cluster_guc.h is the source of truth for the extern itself).
+ *	cluster_guc.c) without including cluster_guc.h, to keep that
+ *	dependency one-way.  cluster_conf_has_peers() is included because
+ *	no-peer single-node mode must not enter PCM acquire/release: there
+ *	is no remote holder to coordinate with, and partial acquire/release
+ *	paths can otherwise turn a local buffer lock into spurious PCM work.
  *
  *	cluster_pcm_is_active() is the single gate entry point used by
  *	bufmgr LockBuffer / LockBufferForCleanup hot path (HC67).
@@ -141,9 +144,10 @@ extern int cluster_pcm_grd_max_entries;
  *	     pgrac.conf loads;  during initdb / non-cluster bootstrap the
  *	     PCM API would FATAL on the -1 range check, so we must skip the
  *	     hook entirely until a node id is assigned)
- *	  4. cluster_pcm_grd_max_entries != 0 (spec-1.7 disable path)
+ *	  4. cluster_conf_has_peers() (single-node fallback pays no PCM tax)
+ *	  5. cluster_pcm_grd_max_entries != 0 (spec-1.7 disable path)
  *
- *	Inline expansion yields 3 global reads + predictable branch (default
+ *	Inline expansion yields 4 global reads + predictable branch (default
  *	cluster_enabled=true + max_entries=-1 → NBuffers + node_id set during
  *	postmaster startup before any LockBuffer is reachable, so branch
  *	predictor 99%+ taken in the steady state).
@@ -154,7 +158,9 @@ extern int cluster_node_id;
 static inline bool
 cluster_pcm_is_active(void)
 {
-	return cluster_enabled && cluster_node_id >= 0 && cluster_pcm_grd_max_entries != 0;
+	return cluster_enabled && cluster_node_id >= 0
+		   && cluster_conf_has_peers()
+		   && cluster_pcm_grd_max_entries != 0;
 }
 
 

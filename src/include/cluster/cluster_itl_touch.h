@@ -175,6 +175,13 @@ extern void cluster_itl_touch_reset_at_end_xact(void);
 extern uint32 cluster_itl_touch_count(void);
 
 /*
+ * Cheap xact-end fast-path predicate.  Allows xact.c to skip the
+ * heavier finish entry points entirely when this transaction never
+ * touched an ITL slot.
+ */
+extern bool cluster_itl_touch_has_pending(void);
+
+/*
  * cluster_itl_xact_precommit_finish / cluster_itl_xact_abort_finish --
  * spec-3.4a D6 xact.c hook entry points.
  *

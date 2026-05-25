@@ -69,6 +69,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC (spec-3.3 D2): cluster snapshot field refresh. */
+#include "cluster/cluster_conf.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_scn.h"
@@ -2128,7 +2129,7 @@ GetSnapshotDataInitOldSnapshot(Snapshot snapshot)
 static inline void
 ClusterSnapshotRefreshFields(Snapshot snapshot)
 {
-	if (cluster_enabled)
+	if (cluster_enabled && cluster_conf_has_peers())
 	{
 		snapshot->cluster_source = (uint8) SNAPSHOT_SOURCE_CLUSTER;
 		snapshot->read_scn = cluster_scn_current();

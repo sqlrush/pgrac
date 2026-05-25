@@ -110,36 +110,34 @@ $node_on->stop;
 diag("L1 cluster_enabled=on: pgbench -S TPS=$sel_on_tps");
 diag("L2 cluster_enabled=on: pgbench full TPS=$full_on_tps");
 
-# spec-2.40 v0.2 实测发现:single-node cluster_enabled=on overhead 真实
-# 在 30-50% range(GH runner 10s smoke测量噪声大);v0.1 假设 ≤ 10/15%
-# bound 不切实际.  Stage 2 acceptance 把 single-node on/off 也降为
-# **warning gate + trend baseline**(同 user amend2 对 2-node 的处理),
-# 连续 N 次稳定 + spec-2.40 hardening v1.0.X amend 后再升 hard gate.
-# Hard gate 改 sanity-floor ≤ 60%(防 catastrophic regression),实际
-# trend percentage 以 diag report.
+# spec-3.4c hardening restored the paired single-node off/on gates:
+# single-node cluster.enabled=on no longer pays Stage 3 ITL/TT write-path
+# cost when there is no peer, while 2-node ClusterPair tests below still
+# exercise the real RAC paths.  Keep these hard gates so the previous
+# 30-50% yellow regression cannot silently pass again.
 
-# L1 trend baseline + sanity floor (was hard gate ≤ 10%; warning gate now)
+# L1 hard gate.
 SKIP: {
 	skip "L1 perf gate: pgbench output unparsed (TPS=0); CI flake skip", 1
 		if $sel_off_tps == 0 || $sel_on_tps == 0;
 	my $reg_pct = 100.0 * (1.0 - $sel_on_tps / $sel_off_tps);
 	my $status = $reg_pct <= 10.0 ? 'GREEN'
 		: $reg_pct <= 30.0 ? 'YELLOW' : 'RED';
-	diag(sprintf "L1 single-node on/off regression: %.1f%% [%s] (warning gate ≤ 10%% / sanity floor ≤ 60%%)", $reg_pct, $status);
-	cmp_ok($reg_pct, '<=', 60.0,
-		sprintf("L1 single-node on/off sanity floor ≤ 60%% (actual %.1f%%;trend baseline %s — hard 10%% gate defer to hardening v1.0.X)", $reg_pct, $status));
+	diag(sprintf "L1 single-node on/off regression: %.1f%% [%s] (hard gate ≤ 10%%)", $reg_pct, $status);
+	cmp_ok($reg_pct, '<=', 10.0,
+		sprintf("L1 single-node on/off hard gate ≤ 10%% (actual %.1f%%;%s)", $reg_pct, $status));
 }
 
-# L2 trend baseline + sanity floor (was hard gate ≤ 15%; warning gate now)
+# L2 hard gate.
 SKIP: {
 	skip "L2 perf gate: pgbench output unparsed (TPS=0); CI flake skip", 1
 		if $full_off_tps == 0 || $full_on_tps == 0;
 	my $reg_pct = 100.0 * (1.0 - $full_on_tps / $full_off_tps);
 	my $status = $reg_pct <= 15.0 ? 'GREEN'
 		: $reg_pct <= 40.0 ? 'YELLOW' : 'RED';
-	diag(sprintf "L2 single-node on/off full regression: %.1f%% [%s] (warning gate ≤ 15%% / sanity floor ≤ 70%%)", $reg_pct, $status);
-	cmp_ok($reg_pct, '<=', 70.0,
-		sprintf("L2 single-node on/off full sanity floor ≤ 70%% (actual %.1f%%;trend baseline %s — hard 15%% gate defer to hardening v1.0.X)", $reg_pct, $status));
+	diag(sprintf "L2 single-node on/off full regression: %.1f%% [%s] (hard gate ≤ 15%%)", $reg_pct, $status);
+	cmp_ok($reg_pct, '<=', 15.0,
+		sprintf("L2 single-node on/off full hard gate ≤ 15%% (actual %.1f%%;%s)", $reg_pct, $status));
 }
 
 # ============================================================
@@ -193,11 +191,11 @@ my $report = PostgreSQL::Test::Stage2AcceptanceReport->new(
 $report->record_perf_workload("pgbench-select-only-${pgbench_seconds}s",
 	single_node_off => { tps => $sel_off_tps },
 	single_node_on  => { tps => $sel_on_tps },
-	gate            => 'warning ≤ 10%; sanity floor ≤ 60%');
+	gate            => 'hard ≤ 10%');
 $report->record_perf_workload("pgbench-full-${pgbench_seconds}s",
 	single_node_off => { tps => $full_off_tps },
 	single_node_on  => { tps => $full_on_tps },
-	gate            => 'warning ≤ 15%; sanity floor ≤ 70%');
+	gate            => 'hard ≤ 15%');
 $report->record_perf_workload("ddl-loop-${workload_sleep_seconds}s",
 	two_node => { sinval_broadcast_delta => $loop_metrics->{broadcast_send_delta} },
 	gate     => 'hard: broadcast_send_delta > 0');

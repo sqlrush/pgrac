@@ -48,6 +48,7 @@
 
 #include "cluster/cluster_scn.h"
 
+#include "cluster/cluster_conf.h" /* cluster_conf_has_peers */
 #include "cluster/cluster_cssd.h" /* cluster_cssd_get_alive_peer_count (spec-2.9 D2 Q7 zero-peer short-circuit) */
 #include "cluster/cluster_guc.h"		 /* cluster_node_id GUC */
 #include "cluster/cluster_ic_envelope.h" /* ClusterICEnvelope (spec-2.9 D3) */
@@ -77,7 +78,7 @@ typedef struct ClusterScnSharedState {
 	NodeId node_id;						/* set-once at shmem_init; lock-free read safe */
 	pg_atomic_uint64 current_local_scn; /* spec-1.17: atomic for fetch_add hot path */
 	pg_atomic_uint64 max_observed_remote_scn; /* spec-1.17: atomic-max via CAS */
-	pg_atomic_uint64 total_advance_count;	  /* monotone counter */
+	pg_atomic_uint64 total_advance_count; /* manual advance counter; accessor adds event counters */
 	TimestampTz initialized_at;
 	TimestampTz last_advance_at; /* refreshed by BOC tick (≤ boc_sweep_interval_ms staleness) */
 	/* spec-1.16 additions: per-decision counters */
@@ -363,9 +364,11 @@ cluster_scn_advance(void)
 					 "unset / single-node-fallback sentinel and is not valid for SCN encoding.")));
 
 	/* Hot path: atomic fetch_add returns the OLD value, so add 1.
-	 * Wraparound check + last_advance_at refresh moved to BOC tick. */
+	 * Wraparound check + last_advance_at refresh moved to BOC tick.
+	 * total_advance_count is bumped only by direct SQL/manual callers;
+	 * the accessor derives commit/abort/observe counts separately to
+	 * avoid one extra contended atomic write per transaction. */
 	new_local = pg_atomic_fetch_add_u64(&cluster_scn_state->current_local_scn, 1) + 1;
-	pg_atomic_fetch_add_u64(&cluster_scn_state->total_advance_count, 1);
 
 	encoded = scn_encode(node, new_local);
 
@@ -460,13 +463,12 @@ cluster_scn_observe(SCN remote_scn)
 		scn_check_wraparound_watermark(target);
 
 		if (pg_atomic_compare_exchange_u64(&cluster_scn_state->current_local_scn, &cur, target)) {
-			/* Success.  Bump observe_bump_count + total_advance_count.
+			/* Success.  Bump observe_bump_count.
 			 * Atomic compound consistency: spec-1.17 atomic-only path
 			 * means dump may observe ns-scale partial state windows --
 			 * acceptable for monitoring (vs spec-1.16 LWLock-protected
 			 * compound which had the same issue caught by round 9 P2). */
 			pg_atomic_fetch_add_u64(&cluster_scn_state->observe_bump_count, 1);
-			pg_atomic_fetch_add_u64(&cluster_scn_state->total_advance_count, 1);
 
 			/*
 			 * spec-2.12 D3:  staleness / lag metric update (all-atomic,
@@ -575,6 +577,8 @@ cluster_scn_skip_hook_in_pre_running(void)
 		return true; /* shmem not yet initialised */
 	if (!SCN_NODE_ID_VALID(cluster_scn_state->node_id))
 		return true; /* bootstrap / single-node fallback */
+	if (!cluster_conf_has_peers())
+		return true; /* no peer: skip xact SCN WAL/counter hot-path cost */
 	return false;
 }
 
@@ -708,7 +712,10 @@ uint64
 cluster_scn_advance_count(void)
 {
 	Assert(cluster_scn_state != NULL);
-	return pg_atomic_read_u64(&cluster_scn_state->total_advance_count);
+	return pg_atomic_read_u64(&cluster_scn_state->total_advance_count)
+		   + pg_atomic_read_u64(&cluster_scn_state->commit_advance_count)
+		   + pg_atomic_read_u64(&cluster_scn_state->abort_advance_count)
+		   + pg_atomic_read_u64(&cluster_scn_state->observe_bump_count);
 }
 
 uint64
@@ -1284,6 +1291,7 @@ cluster_scn_advance_sql(PG_FUNCTION_ARGS)
 						errmsg("cluster_scn_advance() is restricted to superuser")));
 
 	scn = cluster_scn_advance();
+	pg_atomic_fetch_add_u64(&cluster_scn_state->total_advance_count, 1);
 	PG_RETURN_INT64((int64)scn);
 #else
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

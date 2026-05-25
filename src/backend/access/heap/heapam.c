@@ -78,6 +78,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC (spec-3.4a D3/D4/D5): ITL write-path activation. */
+#include "cluster/cluster_conf.h"		/* cluster_conf_has_peers */
 #include "cluster/cluster_guc.h"		/* cluster_enabled */
 #include "cluster/cluster_itl.h"		/* alloc_or_reuse_slot / stamp_active */
 #include "cluster/cluster_itl_slot.h"	/* CLUSTER_ITL_SLOT_UNALLOCATED */
@@ -102,9 +103,15 @@ cluster_itl_write_path_enabled(Relation relation)
 	 * cap the upper bound at 127; an out-of-range node_id would surface
 	 * as fail-closed ereport later, but rejecting it at the gate avoids
 	 * burning ITL slot capacity on an invalid configuration.
+	 *
+	 * Single-node cluster.enabled=on should not pay the Stage 3 ITL/TT
+	 * write-path tax.  With no peer, cross-node visibility cannot occur
+	 * and PG-native visibility remains authoritative.  Multi-node clusters
+	 * still activate the full ITL path.
 	 */
 	return cluster_enabled
 		   && cluster_node_id >= 0 && cluster_node_id <= SCN_MAX_VALID_NODE_ID
+		   && cluster_conf_has_peers()
 		   && !RelationUsesLocalBuffers(relation)
 		   && GetCurrentTransactionNestLevel() <= 1;
 }

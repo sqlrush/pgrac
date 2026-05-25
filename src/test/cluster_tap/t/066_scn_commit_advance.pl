@@ -57,7 +57,20 @@ $node->init;
 # Pin a deterministic node_id; cluster_finalize_startup_running validates
 # this before postmaster reaches RUNNING (spec-1.16 D13).
 $node->append_conf('postgresql.conf', "cluster.node_id = 7\n");
+$node->append_conf('postgresql.conf', "cluster.allow_single_node = on\n");
+$node->append_conf('postgresql.conf', "cluster.pcm_grd_max_entries = 0\n");
 $node->append_conf('postgresql.conf', "max_prepared_transactions = 8\n");
+PostgreSQL::Test::Utils::append_to_file(
+	$node->data_dir . '/pgrac.conf', <<'EOC');
+[cluster]
+name = scn_commit_advance
+
+[node.7]
+interconnect_addr = 127.0.0.1:19066
+
+[node.8]
+interconnect_addr = 127.0.0.1:19067
+EOC
 
 $node->start;
 

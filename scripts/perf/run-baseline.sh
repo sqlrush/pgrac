@@ -123,6 +123,10 @@ mkdir -p "$RESULTS_DIR"
 
 # Globals filled by run_one_mode for the trailing markdown append.
 declare -a SUMMARY_ROWS=()
+ENABLE_TPS_RW=""
+ENABLE_TPS_RO=""
+DISABLE_TPS_RW=""
+DISABLE_TPS_RO=""
 
 run_one_mode() {
     local mode="$1"
@@ -214,6 +218,14 @@ run_one_mode() {
     # Stash a row for later markdown append.
     SUMMARY_ROWS+=("| $(date -u +%Y-%m-%d) | $(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown) | $(uname -srm) | $mode | $tps_rw | $tps_ro | $lat_rw | $lat_ro |")
 
+    if [ "$mode" = "enable" ]; then
+        ENABLE_TPS_RW="$tps_rw"
+        ENABLE_TPS_RO="$tps_ro"
+    else
+        DISABLE_TPS_RW="$tps_rw"
+        DISABLE_TPS_RO="$tps_ro"
+    fi
+
     if [ "$KEEP_PGDATA" != "yes" ]; then
         rm -rf "$pgdata" "$logfile"
     fi
@@ -229,6 +241,19 @@ case "$MODE" in
         run_one_mode disable
         ;;
 esac
+
+if [ "$MODE" = "both" ] \
+   && [ -n "$ENABLE_TPS_RW" ] && [ -n "$ENABLE_TPS_RO" ] \
+   && [ -n "$DISABLE_TPS_RW" ] && [ -n "$DISABLE_TPS_RO" ]; then
+    rw_regression=$(awk -v enabled="$ENABLE_TPS_RW" -v disabled="$DISABLE_TPS_RW" \
+        'BEGIN { if (disabled > 0) printf "%.1f", ((disabled - enabled) * 100.0 / disabled); else printf "nan" }')
+    ro_regression=$(awk -v enabled="$ENABLE_TPS_RO" -v disabled="$DISABLE_TPS_RO" \
+        'BEGIN { if (disabled > 0) printf "%.1f", ((disabled - enabled) * 100.0 / disabled); else printf "nan" }')
+
+    printf "$PROGNAME: off/on regression rw=%s%% ro=%s%% (disable_rw=%s enable_rw=%s disable_ro=%s enable_ro=%s)\n" \
+        "$rw_regression" "$ro_regression" \
+        "$DISABLE_TPS_RW" "$ENABLE_TPS_RW" "$DISABLE_TPS_RO" "$ENABLE_TPS_RO"
+fi
 
 # ---- markdown append (opt-in) -----------------------------------------
 

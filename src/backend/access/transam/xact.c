@@ -141,6 +141,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: spec-1.16 commit/abort SCN hooks; spec-1.18 WAL emit + replay. */
+#include "cluster/cluster_conf.h"		/* cluster_conf_has_peers */
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_guc.h"		/* PGRAC: spec-2.6 cluster_enabled gate */
 #include "cluster/cluster_qvotec.h" /* PGRAC: spec-2.6 in_quorum lease check */
@@ -1509,21 +1510,25 @@ RecordTransactionCommit(void)
 		 * WAL bytestream is byte-identical to vanilla PG.
 		 */
 #ifdef USE_PGRAC_CLUSTER
-		commit_scn = cluster_scn_advance_for_commit();
-		/* spec-3.3 D7: copy to function-scope variable for TT hook below. */
-		tt_commit_scn = commit_scn;
+		if (cluster_conf_has_peers())
+		{
+			commit_scn = cluster_scn_advance_for_commit();
+			/* spec-3.3 D7: copy to function-scope variable for TT hook below. */
+			tt_commit_scn = commit_scn;
 
-		/*
-		 * PGRAC (spec-3.4a D6 / N12 P0):
-		 * Stamp every touched ITL slot COMMITTED + emit WAL BEFORE the
-		 * commit XLOG record is written.  XACT_EVENT_COMMIT fires after
-		 * the commit record is durable -- too late to write ITL state
-		 * with crash-safe ordering -- so we use an explicit pre-commit
-		 * hook here instead of RegisterXactCallback (N10/N12).  The
-		 * hook is a no-op when the touched list is empty (DDL-only
-		 * transactions, autovacuum, etc.).
-		 */
-		cluster_itl_xact_precommit_finish(xid, tt_commit_scn);
+			/*
+			 * PGRAC (spec-3.4a D6 / N12 P0):
+			 * Stamp every touched ITL slot COMMITTED + emit WAL BEFORE the
+			 * commit XLOG record is written.  XACT_EVENT_COMMIT fires after
+			 * the commit record is durable -- too late to write ITL state
+			 * with crash-safe ordering -- so we use an explicit pre-commit
+			 * hook here instead of RegisterXactCallback (N10/N12).  The
+			 * hook is a no-op when the touched list is empty (DDL-only
+			 * transactions, autovacuum, etc.).
+			 */
+			if (cluster_itl_touch_has_pending())
+				cluster_itl_xact_precommit_finish(xid, tt_commit_scn);
+		}
 #endif
 
 		START_CRIT_SECTION();
@@ -1649,7 +1654,7 @@ RecordTransactionCommit(void)
 	 * and is exercised by D10 L2 TAP via the self_consumer_hit counter.
 	 */
 #ifdef USE_PGRAC_CLUSTER
-	if (markXidCommitted)
+	if (markXidCommitted && cluster_conf_has_peers() && cluster_tt_local_has_binding(xid))
 		cluster_tt_local_record_commit(xid, tt_commit_scn);
 #endif
 
@@ -1919,7 +1924,7 @@ RecordTransactionAbort(bool isSubXact)
 	 * (ParseAbortRecord is an independent parser at xactdesc.c:142).
 	 */
 #ifdef USE_PGRAC_CLUSTER
-	if (!isSubXact)
+	if (!isSubXact && cluster_conf_has_peers())
 	{
 		abort_scn = cluster_scn_advance_for_abort();
 
@@ -1933,7 +1938,8 @@ RecordTransactionAbort(bool isSubXact)
 		 * GetCurrentTransactionNestLevel() > 1, so a subxact never
 		 * populates the top-level list.
 		 */
-		cluster_itl_xact_abort_finish(xid);
+		if (cluster_itl_touch_has_pending())
+			cluster_itl_xact_abort_finish(xid);
 	}
 #endif
 
@@ -1992,7 +1998,7 @@ RecordTransactionAbort(bool isSubXact)
 	 * spec-3.1 (§1.3 #10 SUBTRANS cross-node sync defer to later spec).
 	 */
 #ifdef USE_PGRAC_CLUSTER
-	if (!isSubXact)
+	if (!isSubXact && cluster_conf_has_peers() && cluster_tt_local_has_binding(xid))
 		cluster_tt_local_record_abort(xid);
 #endif
 

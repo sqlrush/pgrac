@@ -162,6 +162,7 @@
  *	  re-broadcast echo loop (HC132).
  */
 #include "cluster/cluster_sinval.h"
+#include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h"
 
 static void
@@ -172,7 +173,7 @@ cluster_aware_send_shared_invalid_messages(const SharedInvalidationMessage *msgs
 
 	/* Cluster propagation — only when cluster_enabled and we actually have
 	 * messages.  enqueue_and_wait_ack handles GUC ack_mode=none fast path. */
-	if (cluster_enabled && n > 0)
+	if (cluster_enabled && cluster_conf_has_peers() && n > 0)
 		(void)cluster_sinval_enqueue_and_wait_ack(msgs, n);
 }
 #endif

@@ -207,6 +207,12 @@ GetCurrentTimestamp(void)
 }
 
 NodeId cluster_node_id = 0; /* GUC backing store mock */
+ClusterConf test_cluster_conf = {
+	.magic = PGRAC_CLUSTER_CONF_MAGIC,
+	.node_count = 2,
+};
+ClusterConf *ClusterConfShmem = &test_cluster_conf;
+
 /* Spec-1.16 Hardening v1.0.1 (round 9 P1 finding 1): cluster_scn skip
  * helper now references cluster_enabled.  Pin to true so unit-test
  * advance/observe paths aren't silently skipped (behavior tests live
@@ -301,6 +307,12 @@ int
 cluster_cssd_get_alive_peer_count(void)
 {
 	return 0;
+}
+
+int
+cluster_conf_node_count(void)
+{
+	return 2;
 }
 
 /*

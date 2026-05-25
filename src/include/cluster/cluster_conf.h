@@ -169,6 +169,18 @@ extern const ClusterNodeInfo *cluster_conf_lookup_node(int32 node_id);
 /* Returns ClusterConfShmem->node_count, with NULL safety. */
 extern int cluster_conf_node_count(void);
 
+/*
+ * Hot-path peer predicate.  Use this instead of cluster_conf_node_count()
+ * in per-tuple / per-transaction gates so single-node fallback avoids an
+ * out-of-line function call.  The topology is postmaster-static after
+ * cluster_conf_load(); reconfig changes liveness, not the declared count.
+ */
+static inline bool
+cluster_conf_has_peers(void)
+{
+	return ClusterConfShmem != NULL && ClusterConfShmem->node_count > 1;
+}
+
 /* Bidirectional role <-> string mapping.  Used by parser and by SRF. */
 extern bool cluster_conf_role_from_string(const char *str, ClusterNodeRole *out);
 extern const char *cluster_conf_role_to_string(ClusterNodeRole role);

@@ -7,8 +7,8 @@
  *	  Lifecycle:
  *	    - DML path (spec-3.4a D3/D4/D5) appends a handle via
  *	      cluster_itl_touch_register() after the critical section.
- *	    - xact.c pre-commit/abort hook (spec-3.4a D6) calls
- *	      cluster_itl_touch_foreach() to stamp each touched ITL slot.
+ *	    - xact.c pre-commit/abort hook (spec-3.4a D6) calls the
+ *	      per-page aggregate iterator to stamp touched ITL slots.
  *	    - The hook tail calls cluster_itl_touch_reset_at_end_xact()
  *	      to release the list.
  *
@@ -232,6 +232,12 @@ cluster_itl_touch_count(void)
 	return touch_count;
 }
 
+bool
+cluster_itl_touch_has_pending(void)
+{
+	return touch_count != 0;
+}
+
 /* ---------- spec-3.4a D6 — xact.c pre-commit/abort hook ---------- */
 
 /*
@@ -302,40 +308,89 @@ itl_finish_stamp_page(Page page, uint8 slot_idx, const ItlFinishCtx *ctx)
  *	delta lands in WAL exactly once, with all slot mutations atomic from
  *	the recovery POV.
  */
-static void
-itl_finish_page(const ClusterItlPagedHandle *page_handle, void *arg)
-{
-	const ItlFinishCtx *ctx = (const ItlFinishCtx *)arg;
-	ClusterItlTouchHandle key_handle;
-	GenericXLogState *state;
-	Buffer buf;
-	Page image;
+typedef struct ItlFinishBatchCtx {
+	ItlFinishCtx finish;
+	ClusterItlPagedHandle pages[MAX_GENERIC_XLOG_PAGES];
+	uint8 npages;
 	bool needs_wal;
-	uint8 i;
+} ItlFinishBatchCtx;
 
-	memset(&key_handle, 0, sizeof(key_handle));
-	key_handle.rloc = page_handle->rloc;
-	key_handle.forknum = page_handle->forknum;
-	key_handle.block = page_handle->block;
-	key_handle.slot_idx = 0;
-	key_handle.flags = page_handle->flags;
+static inline bool
+itl_paged_handle_needs_wal(const ClusterItlPagedHandle *page_handle)
+{
+	return (page_handle->flags & CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL) != 0;
+}
 
-	buf = itl_touch_acquire_buffer(&key_handle);
-	needs_wal = (page_handle->flags & CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL) != 0;
+/*
+ * Flush one batch of sorted page handles as a single generic WAL record.
+ *
+ * Generic WAL can cover multiple buffers in one record.  spec-3.4c D14
+ * originally reduced the old per-slot finish path to one open/lock/WAL per
+ * page; this hardening step reduces the remaining per-page XLogInsert cost by
+ * grouping consecutive pages with the same WAL requirement.
+ */
+static void
+itl_finish_flush_batch(ItlFinishBatchCtx *bctx)
+{
+	GenericXLogState *state;
+	Buffer bufs[MAX_GENERIC_XLOG_PAGES];
+	uint8 nbufs = 0;
+	uint8 p;
 
-	state = GenericXLogStartLogged(needs_wal);
-	image = GenericXLogRegisterBuffer(state, buf, 0);
-	for (i = 0; i < page_handle->nslots; i++)
-		itl_finish_stamp_page(image, page_handle->slot_indices[i], ctx);
+	if (bctx->npages == 0)
+		return;
+
+	state = GenericXLogStartLogged(bctx->needs_wal);
+
+	for (p = 0; p < bctx->npages; p++) {
+		const ClusterItlPagedHandle *page_handle = &bctx->pages[p];
+		ClusterItlTouchHandle key_handle;
+		Page image;
+		uint8 i;
+
+		memset(&key_handle, 0, sizeof(key_handle));
+		key_handle.rloc = page_handle->rloc;
+		key_handle.forknum = page_handle->forknum;
+		key_handle.block = page_handle->block;
+		key_handle.slot_idx = 0;
+		key_handle.flags = page_handle->flags;
+
+		bufs[nbufs] = itl_touch_acquire_buffer(&key_handle);
+		image = GenericXLogRegisterBuffer(state, bufs[nbufs], 0);
+		nbufs++;
+
+		for (i = 0; i < page_handle->nslots; i++)
+			itl_finish_stamp_page(image, page_handle->slot_indices[i], &bctx->finish);
+	}
+
 	GenericXLogFinish(state);
 
-	itl_touch_release_buffer(buf);
+	for (p = 0; p < nbufs; p++)
+		itl_touch_release_buffer(bufs[p]);
+
+	bctx->npages = 0;
+}
+
+static void
+itl_finish_page_batched(const ClusterItlPagedHandle *page_handle, void *arg)
+{
+	ItlFinishBatchCtx *bctx = (ItlFinishBatchCtx *)arg;
+	bool needs_wal = itl_paged_handle_needs_wal(page_handle);
+
+	if (bctx->npages > 0
+		&& (bctx->npages == MAX_GENERIC_XLOG_PAGES || bctx->needs_wal != needs_wal))
+		itl_finish_flush_batch(bctx);
+
+	if (bctx->npages == 0)
+		bctx->needs_wal = needs_wal;
+
+	bctx->pages[bctx->npages++] = *page_handle;
 }
 
 void
 cluster_itl_xact_precommit_finish(TransactionId xid, SCN commit_scn)
 {
-	ItlFinishCtx ctx;
+	ItlFinishBatchCtx bctx;
 
 	(void)xid; /* xid currently unused; reserved for WAL emit */
 
@@ -348,16 +403,18 @@ cluster_itl_xact_precommit_finish(TransactionId xid, SCN commit_scn)
 
 	Assert(SCN_VALID(commit_scn)); /* L181 — COMMITTED must carry valid SCN */
 
-	ctx.commit_scn = commit_scn;
-	ctx.is_commit = true;
-	cluster_itl_touch_foreach_per_page(itl_finish_page, &ctx);
+	memset(&bctx, 0, sizeof(bctx));
+	bctx.finish.commit_scn = commit_scn;
+	bctx.finish.is_commit = true;
+	cluster_itl_touch_foreach_per_page(itl_finish_page_batched, &bctx);
+	itl_finish_flush_batch(&bctx);
 	cluster_itl_touch_reset_at_end_xact();
 }
 
 void
 cluster_itl_xact_abort_finish(TransactionId xid)
 {
-	ItlFinishCtx ctx;
+	ItlFinishBatchCtx bctx;
 
 	(void)xid;
 
@@ -368,9 +425,11 @@ cluster_itl_xact_abort_finish(TransactionId xid)
 	if (touch_count == 0)
 		return;
 
-	ctx.commit_scn = InvalidScn;
-	ctx.is_commit = false;
-	cluster_itl_touch_foreach_per_page(itl_finish_page, &ctx);
+	memset(&bctx, 0, sizeof(bctx));
+	bctx.finish.commit_scn = InvalidScn;
+	bctx.finish.is_commit = false;
+	cluster_itl_touch_foreach_per_page(itl_finish_page_batched, &bctx);
+	itl_finish_flush_batch(&bctx);
 	cluster_itl_touch_reset_at_end_xact();
 }
 
@@ -398,6 +457,12 @@ uint32
 cluster_itl_touch_count(void)
 {
 	return 0;
+}
+
+bool
+cluster_itl_touch_has_pending(void)
+{
+	return false;
 }
 
 void
