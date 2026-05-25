@@ -72,6 +72,46 @@
  */
 extern bool cluster_itl_get_tt_ref(Page page, uint8 itl_slot_idx, ClusterUndoTTSlotRef *ref);
 
+/*
+ * cluster_itl_find_lock_tt_ref_by_xmax (spec-3.4d D1 / F2 / F6):
+ *
+ *	Scan the ITL slot array on `page` for a LOCK_ONLY slot whose xid
+ *	matches `raw_xmax`, then fill `*ref` from that slot (UBA decode +
+ *	origin / segment / slot extraction same as cluster_itl_get_tt_ref).
+ *
+ *	Used by spec-3.4d remote ACTIVE detection in heap_lock_tuple /
+ *	HeapTupleSatisfiesUpdate, where the tuple carries HEAP_XMAX_LOCK_ONLY
+ *	infomask + xmax = lock_xid but there is NO tuple-header field
+ *	pointing at the lock-only ITL slot (v0.1 t_lock_itl_slot_idx scheme
+ *	rejected per F2 — derive instead of store, avoiding MAXALIGN tax).
+ *
+ *	Selection rules (5 重判别):
+ *	  1. slot.flags has ITL_FLAG_LOCK_ONLY set,
+ *	  2. slot.xid == raw_xmax (exact match),
+ *	  3. UBA valid (not InvalidUba),
+ *	  4. slot.cluster_epoch == current cluster_epoch_get_current() — stale
+ *	     COMMITTED/ABORTED slots from prior epoch are skipped,
+ *	  5. if multiple candidates qualify, pick the slot with highest
+ *	     wrap (generation counter) — recycled slot conservatism;
+ *	     if still ambiguous, return false + bump corruption counter
+ *	     (page metadata corruption; caller should fail closed).
+ *
+ *	Returns:
+ *	  true   matching LOCK_ONLY slot found, `*ref` filled.
+ *	  false  no match / PD_HAS_ITL false / ambiguous duplicate.
+ *
+ *	The page is not modified.
+ *
+ *	Spec-3.4d F2 lesson L198:  this is the canonical derive-not-store
+ *	pattern for lock-only ITL ref discovery.  Adding a t_lock_itl_slot_idx
+ *	byte would push SizeofHeapTupleHeader 24->25, and
+ *	MAXALIGN(SizeofHeapTupleHeader) makes the real cost +8B/tuple on 8B
+ *	align platforms (MinHeapTupleSize jumps from 24 to 32).  Scan over
+ *	8 ITL slots is O(8) ~ 50ns; storage cost is zero.
+ */
+extern bool cluster_itl_find_lock_tt_ref_by_xmax(Page page, TransactionId raw_xmax,
+												 ClusterUndoTTSlotRef *ref);
+
 /* ---------- spec-3.4a D2 — writer API ---------- */
 
 /*

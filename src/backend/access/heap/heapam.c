@@ -115,6 +115,30 @@ cluster_itl_write_path_enabled(Relation relation)
 		   && !RelationUsesLocalBuffers(relation)
 		   && GetCurrentTransactionNestLevel() <= 1;
 }
+
+/*
+ * cluster_itl_lock_path_enabled (spec-3.4d D11):
+ *
+ *	Parallel to cluster_itl_write_path_enabled, gating the heap_lock_tuple
+ *	lock-only ITL stamp + ACTIVE TT status install + TT_STATUS_HINT emit.
+ *	Same five conditions:  cluster_enabled / valid node_id / has_peers
+ *	(L195 no-peer fast path) / non-temp / non-subxact.
+ *
+ *	Kept as a distinct helper (rather than reusing _write_path_enabled)
+ *	because the counter classification differs:  lock-path OVERFLOW bumps
+ *	cluster_itl_overflow_lock_count whereas write-path bumps
+ *	cluster_itl_overflow_dml_count.  Future tuning may also diverge if
+ *	lock + data ITL share INITRANS=8 capacity (spec-3.4d Q5 / R2).
+ */
+static inline bool
+cluster_itl_lock_path_enabled(Relation relation)
+{
+	return cluster_enabled
+		   && cluster_node_id >= 0 && cluster_node_id <= SCN_MAX_VALID_NODE_ID
+		   && cluster_conf_has_peers()
+		   && !RelationUsesLocalBuffers(relation)
+		   && GetCurrentTransactionNestLevel() <= 1;
+}
 #endif
 
 

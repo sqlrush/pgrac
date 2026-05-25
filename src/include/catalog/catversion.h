@@ -514,7 +514,20 @@
  * "successful" inject.  Catalog tooling that introspects proargtypes /
  * proargnames must use the new layout.  Test-only UDF; production builds keep
  * the FEATURE_NOT_SUPPORTED stub (same call shape). */
-#define CATALOG_VERSION_NO 202605500
+/* spec-3.4d D8/D9 (2026-05-25, F2/F7):  cluster_test_inject_visibility_tt_ref
+ * grows a 7th arg (is_lock_only bool) so the D5b inject UDF can install
+ * status=ACTIVE + commit_scn=InvalidScn for cross-node row lock tests (not
+ * just COMMITTED state from spec-3.4c).  NEW 3 SQLSTATE 53R98 / 53R99 / 53R9A
+ * (cluster_remote_row_lock_wait_not_supported / cluster_multixact_lock_not_
+ * supported / cluster_itl_slot_overflow);  the latter does NOT reuse 53R94
+ * sinval_queue_full per spec-3.4d F7.  NEW 5 counter rows in dump_lock_path
+ * category (cluster_itl_overflow_lock_count, cluster_multixact_lock_reject_
+ * count, cluster_remote_row_lock_fail_closed_count, cluster_lock_only_itl_
+ * stamp_count, cluster_lock_only_tt_hint_emit_count).  Tuple header NOT bumped
+ * (v0.1 t_lock_itl_slot_idx scheme rejected per F2 — raw_xmax + ITL slot scan
+ * derives lock-only ref without header growth, avoiding MAXALIGN tax + disk
+ * format break).  Catalog tooling must use the new 7-arg layout. */
+#define CATALOG_VERSION_NO 202605510
 
 /* spec-2.39 D10 (2026-05-21):  SI Broadcaster production activation —
  * DDL commit hook (AtEOXact_Inval + COMMIT PREPARED via cluster-aware

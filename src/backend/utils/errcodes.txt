@@ -593,6 +593,27 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 # raised synchronously without waiting on wire propagation.
 53R97    E    ERRCODE_CLUSTER_TT_STATUS_UNKNOWN                                cluster_tt_status_unknown
 
+# spec-3.4d Q1 (v0.2 F1+F3 P0):  heap_lock_tuple / HeapTupleSatisfiesUpdate
+# detects remote ACTIVE row lock (via raw_xmax ITL scan + exact-key TT
+# lookup) and caller's wait_policy == LockWaitBlock.  Cross-node block-wait
+# is not supported in spec-3.4d; errhint forward-links to spec-5.2 GES TX.
+# LockWaitSkip -> TM_WouldBlock (no ERROR);  LockWaitError -> existing
+# ERRCODE_LOCK_NOT_AVAILABLE.  L199 NEW lesson — remote ACTIVE must fail
+# closed, never silent PG-native fallback.
+53R98    E    ERRCODE_CLUSTER_REMOTE_ROW_LOCK_WAIT_NOT_SUPPORTED               cluster_remote_row_lock_wait_not_supported
+
+# spec-3.4d Q5 (v0.2 F4 P1):  heap_lock_tuple peer mode + final xmax (after
+# compute_new_xmax_infomask) is a MultiXact.  MULTIXACT cross-node row lock
+# support is deferred to spec-3.5+.  cluster_multixact_lock_reject_count
+# counter is incremented.
+53R99    E    ERRCODE_CLUSTER_MULTIXACT_LOCK_NOT_SUPPORTED                     cluster_multixact_lock_not_supported
+
+# spec-3.4d Q5 (v0.2 F7 P1):  heap_lock_tuple peer mode cannot allocate ITL
+# slot (8 slot shared with data ITL is full).  Distinct from 53R94
+# cluster_sinval_queue_full (sinval semantics).  cluster_itl_overflow_lock_count
+# counter is incremented.  Raise INITRANS or wait for spec-3.5+ split capacity.
+53R9A    E    ERRCODE_CLUSTER_ITL_SLOT_OVERFLOW                                cluster_itl_slot_overflow
+
 Section: Class 54 - Program Limit Exceeded
 
 # this is for wired-in limits, not resource exhaustion problems (class borrowed from DB2)

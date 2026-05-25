@@ -82,8 +82,29 @@ typedef enum {
 	ITL_FLAG_ACTIVE = 1,		/* xid is currently writing; commit_scn unset */
 	ITL_FLAG_COMMITTED = 2,		/* xid committed; commit_scn populated */
 	ITL_FLAG_ABORTED = 3,		/* xid aborted; commit_scn = InvalidScn */
-	ITL_FLAG_NEEDS_CLEANOUT = 4 /* commit/abort done but heap rows not yet stamped */
+	ITL_FLAG_NEEDS_CLEANOUT = 4, /* commit/abort done but heap rows not yet stamped */
+	/* spec-3.4d (v0.2 F2 / Q1): lock-only ITL states for heap_lock_tuple.
+	 * Distinct enum values keep existing equality checks unchanged
+	 * (slot.flags == ITL_FLAG_ACTIVE etc.) while letting lock-only slot
+	 * states be discovered by raw_xmax scan helper.  Use
+	 * ITL_FLAG_IS_LOCK_ONLY() to test the category. */
+	ITL_FLAG_LOCK_ONLY_ACTIVE = 5,	/* lock_xid holds row-lock; commit_scn unset */
+	ITL_FLAG_LOCK_ONLY_COMMITTED = 6, /* lock_xid committed; lock released */
+	ITL_FLAG_LOCK_ONLY_ABORTED = 7	/* lock_xid aborted; lock released */
 } ClusterItlFlags;
+
+/* spec-3.4d helper:  test if an ITL slot flag value is one of the
+ * lock-only states (LOCK_ONLY_ACTIVE / LOCK_ONLY_COMMITTED /
+ * LOCK_ONLY_ABORTED).  Used by raw_xmax scan + xact-end finish path. */
+#define ITL_FLAG_IS_LOCK_ONLY(f)                                                                   \
+	((f) == ITL_FLAG_LOCK_ONLY_ACTIVE || (f) == ITL_FLAG_LOCK_ONLY_COMMITTED                       \
+	 || (f) == ITL_FLAG_LOCK_ONLY_ABORTED)
+
+/* spec-3.4d helper:  test if an ITL slot is a completed lock-only slot
+ * (LOCK_ONLY_COMMITTED / LOCK_ONLY_ABORTED).  Used by allocator to
+ * recycle slot when scanning for FREE. */
+#define ITL_FLAG_IS_LOCK_ONLY_COMPLETED(f)                                                         \
+	((f) == ITL_FLAG_LOCK_ONLY_COMMITTED || (f) == ITL_FLAG_LOCK_ONLY_ABORTED)
 
 
 /*
