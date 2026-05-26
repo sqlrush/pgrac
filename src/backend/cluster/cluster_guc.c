@@ -374,6 +374,8 @@ int cluster_sinval_ack_wait_slots = 256;
 /* spec-3.1 D8:  2 NEW GUC for TT status overlay (D2). */
 int cluster_tt_status_overlay_max_entries = 32768;
 int cluster_tt_status_overlay_ttl_ms = 30000;
+/* PGRAC spec-3.5 D5:  bounded reader lazy follow depth. */
+int cluster_subtrans_max_chain_depth = 32;
 
 /* spec-3.2 D7:  2 NEW GUC for cross-node TT status hint wire (v0.3 删 commit_only). */
 int cluster_tt_status_hint_outbound_capacity = 256;
@@ -1627,6 +1629,22 @@ cluster_init_guc(void)
 					 "and lookup returns UNKNOWN.  Default 30000 (30s) covers typical OLTP active-"
 					 "xact window.  PGC_SIGHUP."),
 		&cluster_tt_status_overlay_ttl_ms, 30000, 1000, 600000, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	/*
+	 * PGRAC spec-3.5 D5:  cluster.subtrans_max_chain_depth — bounded depth
+	 * for reader lazy follow of SUBCOMMITTED parent_key chain.  Hard
+	 * lookup_parent recursion stops at this depth and returns UNKNOWN ->
+	 * 53R97 fail-closed (HC205;L199;NOT PG-native fallback).  Default 32
+	 * covers ORM-stacked savepoint workloads; production deep-nesting
+	 * deployments may raise.  PGC_SIGHUP.
+	 */
+	DefineCustomIntVariable(
+		"cluster.subtrans_max_chain_depth",
+		gettext_noop("Bounded depth for cluster SUBTRANS reader lazy parent_key follow."),
+		gettext_noop("spec-3.5 D5:  reader recursion on SUBCOMMITTED parent_key chain stops "
+					 "at this depth and raises 53R97 fail-closed.  Default 32 covers ORM-"
+					 "stacked savepoint workloads."),
+		&cluster_subtrans_max_chain_depth, 32, 4, 1024, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	/*
 	 * spec-3.2 D7:  cross-node TT status hint wire GUCs.

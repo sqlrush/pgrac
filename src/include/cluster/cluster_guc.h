@@ -588,6 +588,9 @@ extern int cluster_sinval_ack_wait_slots;
 extern int cluster_tt_status_overlay_max_entries;
 extern int cluster_tt_status_overlay_ttl_ms;
 
+/* PGRAC spec-3.5 D5:  bounded depth for SUBCOMMITTED parent chain follow. */
+extern int cluster_subtrans_max_chain_depth;
+
 /* spec-3.2 D7:  2 NEW GUC for cross-node TT status hint wire propagation. */
 typedef enum ClusterTTStatusHintEmitMode {
 	CLUSTER_TT_STATUS_HINT_EMIT_DISABLED = 0,
