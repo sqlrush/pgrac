@@ -92,10 +92,12 @@ static inline bool
 cluster_itl_write_path_enabled(Relation relation)
 {
 	/*
-	 * spec-3.4a activates only top-level, shared-buffer heap writes.
-	 * SUBTRANS and local-buffer/temp relations are deferred; leaving the
-	 * tuple without an ITL slot keeps the existing PG-native path intact
-	 * instead of installing a partial cluster-visible status.
+	 * spec-3.4a activated top-level shared-buffer heap writes; spec-3.5
+	 * (Q4=A) removes the subxact barrier (former
+	 * GetCurrentTransactionNestLevel() <= 1 gate).  Subxact DML now
+	 * exercises the same ITL/TT cluster path as top-level DML;  SUBTRANS
+	 * cross-node visibility (spec-3.5 D7/D8) propagates child SUBCOMMITTED
+	 * + parent_key chain to peers.
 	 *
 	 * spec-3.4b D9: tighten the node_id range from `>= 0` to the explicit
 	 * valid window [0, SCN_MAX_VALID_NODE_ID].  Multi-instance allocator
@@ -112,8 +114,7 @@ cluster_itl_write_path_enabled(Relation relation)
 	return cluster_enabled
 		   && cluster_node_id >= 0 && cluster_node_id <= SCN_MAX_VALID_NODE_ID
 		   && cluster_conf_has_peers()
-		   && !RelationUsesLocalBuffers(relation)
-		   && GetCurrentTransactionNestLevel() <= 1;
+		   && !RelationUsesLocalBuffers(relation);
 }
 
 /*
@@ -121,8 +122,10 @@ cluster_itl_write_path_enabled(Relation relation)
  *
  *	Parallel to cluster_itl_write_path_enabled, gating the heap_lock_tuple
  *	lock-only ITL stamp + ACTIVE TT status install + TT_STATUS_HINT emit.
- *	Same five conditions:  cluster_enabled / valid node_id / has_peers
- *	(L195 no-peer fast path) / non-temp / non-subxact.
+ *	spec-3.5 (Q4=A) removes the prior subxact barrier
+ *	(GetCurrentTransactionNestLevel() <= 1).  Subxact lock-only ITL stamps
+ *	now exercise the same path as top-level; cross-node visibility is
+ *	carried by SUBTRANS spec-3.5 D7/D8 wire.
  *
  *	Kept as a distinct helper (rather than reusing _write_path_enabled)
  *	because the counter classification differs:  lock-path OVERFLOW bumps
@@ -136,8 +139,7 @@ cluster_itl_lock_path_enabled(Relation relation)
 	return cluster_enabled
 		   && cluster_node_id >= 0 && cluster_node_id <= SCN_MAX_VALID_NODE_ID
 		   && cluster_conf_has_peers()
-		   && !RelationUsesLocalBuffers(relation)
-		   && GetCurrentTransactionNestLevel() <= 1;
+		   && !RelationUsesLocalBuffers(relation);
 }
 #endif
 
