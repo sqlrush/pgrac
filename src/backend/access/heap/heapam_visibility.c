@@ -88,6 +88,7 @@
 #include "cluster/cluster_itl_cleanout.h"	/* cluster_itl_cleanout_lazy (spec-3.4c D4) */
 #include "cluster/cluster_itl_slot.h"		/* CLUSTER_ITL_SLOT_UNALLOCATED */
 #include "cluster/cluster_tt_slot.h"		/* ClusterUndoTTSlotRef */
+#include "cluster/cluster_subtrans.h"		/* spec-3.5 D8 lookup_parent */
 #include "cluster/cluster_tt_status.h"		/* lookup_exact / Key / Result */
 #include "cluster/cluster_visibility_inject.h"	/* D5b test-only inject helper */
 #endif
@@ -1063,12 +1064,33 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot,
 			if (cluster_tt_status_lookup_exact(&key, &result) &&
 				result.authoritative)
 			{
+				/*
+				 * PGRAC spec-3.5 D8:  if the remote xid is a SUBCOMMITTED
+				 * subxact, lazy follow the parent_key chain to resolve final
+				 * visibility.  Bounded by cluster.subtrans_max_chain_depth
+				 * (HC205).  Depth exceeded / parent overlay miss → UNKNOWN
+				 * authoritative=false → 53R97 fail-closed below (L199;NOT
+				 * PG-native fallback).
+				 */
+				if (result.status == CLUSTER_TT_STATUS_SUBCOMMITTED &&
+					result.has_parent_key)
+				{
+					result = cluster_subtrans_lookup_parent(&result,
+															cluster_subtrans_max_chain_depth);
+				}
+
 				switch (result.status)
 				{
 					case CLUSTER_TT_STATUS_ABORTED:
 						return false;
 					case CLUSTER_TT_STATUS_IN_PROGRESS:
-						/* Remote in-progress xact — snapshot can't see it. */
+					case CLUSTER_TT_STATUS_SUBCOMMITTED:
+						/*
+						 * Remote in-progress xact (or SUBCOMMITTED chain
+						 * not yet finalized at parent) — snapshot can't
+						 * see it.  This branch covers the "parent still
+						 * IN_PROGRESS" case after lazy follow as well.
+						 */
 						return false;
 					case CLUSTER_TT_STATUS_COMMITTED:
 					case CLUSTER_TT_STATUS_CLEANED_OUT:
