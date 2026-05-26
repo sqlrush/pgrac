@@ -92,6 +92,7 @@ my $pair = PostgreSQL::Test::ClusterPair->new_pair(
     extra_conf => [
         'autovacuum = off',
         'cluster.pcm_grd_max_entries = 0',
+        'cluster.tt_status_overlay_max_entries = 1048576',
         'shared_buffers = 16MB',
     ],
 );
@@ -111,6 +112,13 @@ $node0->command_ok(
     [ 'pgbench', '-i', '-s', $scale, 'postgres' ],
     'pgbench init scale ok',
 );
+if ($mode eq '2node-local-affinity') {
+    print "run_2node_baseline.pl: pgbench -i scale=$scale on node1\n";
+    $node1->command_ok(
+        [ 'pgbench', '-i', '-s', $scale, 'postgres' ],
+        'pgbench init scale ok on node1',
+    );
+}
 
 # ---- mode-specific setup ----------------------------------------------
 my $script_path;
@@ -118,8 +126,6 @@ my @pgbench_extra_args;
 
 if ($mode eq '2node-local-affinity') {
     $script_path = File::Spec->catfile($FindBin::RealBin, 'scripts', 'local_affinity.sql');
-    # pgbench :node_id var per-node (set via -D node_id=0/1)
-    @pgbench_extra_args = ('-D', 'node_id=0');
 }
 elsif ($mode eq '2node-cross-node-visibility') {
     # spec-3.4e §2.3 partial coverage:same-node D5b COMMITTED inject + force GUC
@@ -131,17 +137,11 @@ elsif ($mode eq '2node-cross-node-visibility') {
     });
     my $xid = $node0->safe_psql('postgres',
         q{SELECT xmin::text::int FROM perf_3_4e_visibility WHERE id = 1});
-    eval {
-        $node0->safe_psql('postgres',
-            qq{SELECT cluster_test_inject_visibility_tt_ref('$xid'::xid, 7, 3, 42, 0, 100::int8, false)});
-        $node0->safe_psql('postgres',
-            q{ALTER SYSTEM SET cluster_test_force_visibility_cluster_path = on});
-        $node0->safe_psql('postgres', 'SELECT pg_reload_conf()');
-    };
-    if ($@) {
-        warn "spec-3.4e class 3 pre-flight failed (ENABLE_INJECTION not configured?): $@\n";
-        warn "Marking run as partial — visibility class needs ENABLE_INJECTION build.\n";
-    }
+    $node0->safe_psql('postgres',
+        qq{SELECT cluster_test_inject_visibility_tt_ref('$xid'::xid, 7, 3, 42, 0, 100::int8, false)});
+    $node0->safe_psql('postgres',
+        q{ALTER SYSTEM SET cluster_test_force_visibility_cluster_path = on});
+    $node0->safe_psql('postgres', 'SELECT pg_reload_conf()');
     $script_path = File::Spec->catfile($FindBin::RealBin, 'scripts', 'cross_node_visibility_inject.sql');
 }
 elsif ($mode eq '2node-hot-row-lock') {
@@ -153,16 +153,11 @@ elsif ($mode eq '2node-hot-row-lock') {
     });
     my $xid = $node0->safe_psql('postgres',
         q{SELECT xmin::text::int FROM perf_3_4e_hot_row WHERE id = 1});
-    eval {
-        $node0->safe_psql('postgres',
-            qq{SELECT cluster_test_inject_visibility_tt_ref('$xid'::xid, 7, 3, 42, 0, 0::int8, true)});
-        $node0->safe_psql('postgres',
-            q{ALTER SYSTEM SET cluster_test_force_visibility_cluster_path = on});
-        $node0->safe_psql('postgres', 'SELECT pg_reload_conf()');
-    };
-    if ($@) {
-        warn "spec-3.4e class 4 pre-flight failed (ENABLE_INJECTION not configured?): $@\n";
-    }
+    $node0->safe_psql('postgres',
+        qq{SELECT cluster_test_inject_visibility_tt_ref('$xid'::xid, 7, 3, 42, 0, 0::int8, true)});
+    $node0->safe_psql('postgres',
+        q{ALTER SYSTEM SET cluster_test_force_visibility_cluster_path = on});
+    $node0->safe_psql('postgres', 'SELECT pg_reload_conf()');
     $script_path = File::Spec->catfile($FindBin::RealBin, 'scripts', 'hot_row_select_for_update.sql');
 }
 else {
@@ -209,26 +204,53 @@ my $c_before = snapshot_counters($node0);
 my $pgbench_log_prefix = File::Spec->catfile($results_dir, "${tag}-pgbench");
 print "run_2node_baseline.pl: pgbench -c $clients -j $jobs -T $duration\n";
 
-my $pgbench_cmd = [
-    'pgbench',
-    '-f', $script_path,
-    '-c', $clients,
-    '-j', $jobs,
-    '-T', $duration,
-    '-P', 5,
-    '--log',
-    '--sampling-rate=1.0',
-    '--log-prefix', $pgbench_log_prefix,
-    @pgbench_extra_args,
-    'postgres',
-];
+sub start_pgbench {
+    my ($node, $label, $extra_args) = @_;
+    my $prefix = "${pgbench_log_prefix}-${label}";
+    my $out_path = File::Spec->catfile($results_dir, "${tag}-${label}.txt");
+    my @cmd = (
+        'pgbench',
+        '-f', $script_path,
+        '-c', $clients,
+        '-j', $jobs,
+        '-T', $duration,
+        '-P', 5,
+        '--log',
+        '--sampling-rate=1.0',
+        '--log-prefix', $prefix,
+        @$extra_args,
+        $node->connstr('postgres'),
+    );
 
-my ($stdout, $stderr) = ('', '');
-eval {
-    open(my $fh, '>', $txt_path) or die "cannot write $txt_path:$!\n";
-    $node0->command_ok($pgbench_cmd, "pgbench class $mode ok");
-    close $fh;
-};
+    my $pid = fork();
+    die "fork failed:$!\n" unless defined $pid;
+    if ($pid == 0) {
+        open(STDOUT, '>', $out_path) or die "cannot write $out_path:$!\n";
+        open(STDERR, '>&', \*STDOUT) or die "cannot dup stderr:$!\n";
+        exec @cmd;
+        die "exec pgbench failed:$!\n";
+    }
+    return ($pid, $out_path);
+}
+
+my @children;
+if ($mode eq '2node-local-affinity') {
+    push @children, [ start_pgbench($node0, 'node0', [ '-D', 'node_id=0' ]) ];
+    push @children, [ start_pgbench($node1, 'node1', [ '-D', 'node_id=1' ]) ];
+} else {
+    push @children, [ start_pgbench($node0, 'node0', \@pgbench_extra_args) ];
+}
+
+my $pgbench_failed = 0;
+for my $child (@children) {
+    my ($pid, $out_path) = @$child;
+    waitpid($pid, 0);
+    if ($? != 0) {
+        warn "pgbench child pid=$pid output=$out_path failed with status $?\n";
+        $pgbench_failed = 1;
+    }
+}
+Test::More::ok(!$pgbench_failed, "pgbench class $mode ok");
 
 # ---- baseline counter snapshot after pgbench --------------------------
 my $c_after = snapshot_counters($node0);
@@ -262,6 +284,7 @@ if (@latencies) {
     my $idx = int(0.95 * scalar(@sorted));
     $p95_ms = $sorted[$idx] || $sorted[-1];
 }
+my $aggregate_tps = @latencies ? (scalar(@latencies) / $duration) : 0;
 
 # ---- ClusterPair teardown ---------------------------------------------
 $pair->stop_pair;
@@ -276,6 +299,7 @@ my $summary = {
     clients => $clients,
     jobs => $jobs,
     metrics => {
+        tps => $aggregate_tps,
         wal_bytes_per_sec => $wal_bytes_per_sec,
         fail_closed_rate_per_sec => $fail_closed_rate,
         tt_lookup_hit_miss_ratio => $hit_miss_ratio,
@@ -293,6 +317,7 @@ print $jfh encode_json($summary), "\n";
 close $jfh;
 
 print "run_2node_baseline.pl: summary -> $json_path\n";
+print "  tps=$aggregate_tps\n";
 print "  wal_bytes/sec=$wal_bytes_per_sec\n";
 print "  fail_closed_rate=$fail_closed_rate\n";
 print "  tt_hit_miss_ratio=$hit_miss_ratio (hit=$hit miss=$miss)\n";

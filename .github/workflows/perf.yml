@@ -213,8 +213,8 @@ jobs:
               --scale="${PERF_SCALE:-10}" \
               --duration="${PERF_DURATION:-30}" \
               --clients="${PERF_CLIENTS:-4}" \
-              --jobs="${PERF_JOBS:-2}" \
-              || echo "::warning ::class $class failed (warn-only per spec-3.4e E2)"
+              --jobs="${PERF_JOBS:-2}"
+            test -n "$(find scripts/perf/results -maxdepth 1 -name "3-4e-${class}-*.json" -print -quit)"
           done
 
       - name: Collect 2-node perf artifacts

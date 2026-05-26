@@ -103,11 +103,13 @@ cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key pg_attribute_unused
 {
 	return false;
 }
-void
+bool
 cluster_tt_status_install_local(const ClusterTTStatusKey *key pg_attribute_unused(),
 								ClusterTTStatus status pg_attribute_unused(),
 								SCN commit_scn pg_attribute_unused())
-{}
+{
+	return false;
+}
 bool
 cluster_tt_status_delete_exact(const ClusterTTStatusKey *key pg_attribute_unused())
 {

@@ -152,7 +152,7 @@ PG_FUNCTION_INFO_V1(cluster_test_clear_visibility_injects);
 /*
  * cluster_test_inject_visibility_tt_ref (spec-3.4c D7 + A1 + F5):
  *
- *	  6-arg signature.  In addition to stashing the inject ref into the
+ *	  7-arg signature.  In addition to stashing the inject ref into the
  *	  per-xid HTAB, the UDF synchronously installs the corresponding
  *	  TT status overlay entry (status=COMMITTED, commit_scn=<arg>) and
  *	  immediately verifies via lookup_exact() so an overlay-full drop
@@ -175,6 +175,7 @@ cluster_test_inject_visibility_tt_ref(PG_FUNCTION_ARGS)
 	uint32 epoch;
 	SCN commit_scn;
 	bool is_lock_only;
+	bool installed;
 	ClusterTTStatus install_status;
 	ClusterTTStatusKey key;
 	ClusterTTStatusResult res;
@@ -246,16 +247,17 @@ cluster_test_inject_visibility_tt_ref(PG_FUNCTION_ARGS)
 	key.cluster_epoch = epoch;
 	key.local_xid = xid;
 
-	cluster_tt_status_install_local(&key, install_status, commit_scn);
+	installed = cluster_tt_status_install_local(&key, install_status, commit_scn);
 
 	/*
 	 * 3. spec-3.4c F5 + spec-3.4d D9:  install_local() is best-effort and
-	 *    returns void.  Verify immediately so a silent overlay-full drop
-	 *    cannot hide behind a successful PG_RETURN_BOOL(true).  spec-3.4d
-	 *    extends the check to verify is_lock_only path installs IN_PROGRESS
-	 *    + InvalidScn commit_scn (not COMMITTED + valid commit_scn).
+	 *    returns false on overlay-full drop.  Verify immediately so a
+	 *    silent drop cannot hide behind a successful PG_RETURN_BOOL(true).
+	 *    spec-3.4d extends the check to verify is_lock_only path installs
+	 *    IN_PROGRESS + InvalidScn commit_scn (not COMMITTED + valid
+	 *    commit_scn).
 	 */
-	if (!cluster_tt_status_lookup_exact(&key, &res) || res.status != install_status
+	if (!installed || !cluster_tt_status_lookup_exact(&key, &res) || res.status != install_status
 		|| res.commit_scn != commit_scn)
 		ereport(ERROR, (errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 						errmsg("cluster TT status overlay install verification failed"),

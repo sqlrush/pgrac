@@ -253,7 +253,7 @@ cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key, ClusterTTStatusRes
 	return true;
 }
 
-void
+bool
 cluster_tt_status_install_local(const ClusterTTStatusKey *key, ClusterTTStatus status,
 								SCN commit_scn)
 {
@@ -263,7 +263,7 @@ cluster_tt_status_install_local(const ClusterTTStatusKey *key, ClusterTTStatus s
 	Assert(key != NULL);
 
 	if (!cluster_enabled || ClusterTTStatusHTAB == NULL)
-		return;
+		return false;
 
 	LWLockAcquire(ClusterTTStatusLock, LW_EXCLUSIVE);
 
@@ -280,7 +280,7 @@ cluster_tt_status_install_local(const ClusterTTStatusKey *key, ClusterTTStatus s
 		ereport(WARNING, (errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 						  errmsg("cluster tt status overlay full; install dropped"),
 						  errhint("Raise cluster.tt_status_overlay_max_entries or lower TTL.")));
-		return;
+		return false;
 	}
 
 	e->status = status;
@@ -291,6 +291,7 @@ cluster_tt_status_install_local(const ClusterTTStatusKey *key, ClusterTTStatus s
 	LWLockRelease(ClusterTTStatusLock);
 
 	pg_atomic_fetch_add_u64(&ClusterTTStatusState->install_count, 1);
+	return true;
 }
 
 /*
@@ -474,13 +475,14 @@ cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key, ClusterTTStatusRes
 	return false;
 }
 
-void
+bool
 cluster_tt_status_install_local(const ClusterTTStatusKey *key, ClusterTTStatus status,
 								SCN commit_scn)
 {
 	(void)key;
 	(void)status;
 	(void)commit_scn;
+	return false;
 }
 
 bool

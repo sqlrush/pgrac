@@ -196,6 +196,8 @@ cluster_visibility_decide_by_scn(SCN commit_scn, SCN read_scn)
  *
  * cluster_tt_status_install_local:
  *	  D5 local install helper companion;writes overlay entry.
+ *	  Returns true when the entry was installed, false when the overlay is
+ *	  unavailable/full and the install was dropped fail-closed.
  *
  * cluster_tt_status_flush_all:
  *	  reconfig epoch bump hook;clears all overlay entries and bumps
@@ -209,7 +211,7 @@ cluster_visibility_decide_by_scn(SCN commit_scn, SCN read_scn)
  */
 extern bool cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key,
 										   ClusterTTStatusResult *result);
-extern void cluster_tt_status_install_local(const ClusterTTStatusKey *key, ClusterTTStatus status,
+extern bool cluster_tt_status_install_local(const ClusterTTStatusKey *key, ClusterTTStatus status,
 											SCN commit_scn);
 extern void cluster_tt_status_flush_all(uint32 new_epoch);
 

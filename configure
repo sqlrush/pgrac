@@ -768,6 +768,7 @@ enable_coverage
 GENHTML
 LCOV
 GCOV
+enable_injection_points
 enable_cluster
 enable_debug
 enable_rpath
@@ -838,6 +839,7 @@ enable_spinlocks
 enable_atomics
 enable_debug
 enable_cluster
+enable_injection_points
 enable_profiling
 enable_coverage
 enable_dtrace
@@ -1534,6 +1536,8 @@ Optional Features:
   --enable-debug          build with debugging symbols (-g)
   --enable-cluster        build pgrac cluster subsystem (Cache Fusion, GES,
                           SCN)
+  --enable-injection-points
+                          build pgrac test-only injection helper bodies
   --enable-profiling      build with profiling enabled
   --enable-coverage       build with coverage testing instrumentation
   --enable-dtrace         build with DTrace support
@@ -3394,6 +3398,39 @@ else
 
 fi
 
+
+
+
+#
+# PGRAC: --enable-injection-points (build test-only visibility injection)
+#
+# The SQL injection helpers are catalog-visible in all builds but their
+# implementation is compiled only when ENABLE_INJECTION is defined.  This
+# keeps production binaries inert while allowing TAP/perf workflows to opt
+# into the test-only D5b visibility path.
+#
+
+# Check whether --enable-injection-points was given.
+if test "${enable_injection_points+set}" = set; then :
+  enableval=$enable_injection_points;
+  case $enableval in
+    yes)
+
+$as_echo "#define ENABLE_INJECTION 1" >>confdefs.h
+
+      ;;
+    no)
+      :
+      ;;
+    *)
+      as_fn_error $? "no argument expected for --enable-injection-points option" "$LINENO" 5
+      ;;
+  esac
+
+else
+  enable_injection_points=no
+
+fi
 
 
 

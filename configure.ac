@@ -232,6 +232,20 @@ PGAC_ARG_BOOL(enable, cluster, no,
 AC_SUBST(enable_cluster)
 
 #
+# PGRAC: --enable-injection-points (build test-only visibility injection)
+#
+# The SQL injection helpers are catalog-visible in all builds but their
+# implementation is compiled only when ENABLE_INJECTION is defined.  This
+# keeps production binaries inert while allowing TAP/perf workflows to opt
+# into the test-only D5b visibility path.
+#
+PGAC_ARG_BOOL(enable, injection-points, no,
+              [build pgrac test-only injection helper bodies],
+              [AC_DEFINE([ENABLE_INJECTION], 1,
+                         [Define to 1 to build pgrac test-only injection helper bodies. (--enable-injection-points)])])
+AC_SUBST(enable_injection_points)
+
+#
 # --enable-profiling enables gcc profiling
 #
 PGAC_ARG_BOOL(enable, profiling, no,

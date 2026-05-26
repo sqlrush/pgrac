@@ -320,6 +320,7 @@ install_status(TransactionId xid, ClusterTTStatus status, SCN commit_scn)
 	ClusterTTStatusKey key;
 	ClusterTTStatusResult res;
 	bool hit;
+	bool installed;
 
 	if (!cluster_enabled || cluster_node_id < 0)
 		return;
@@ -341,7 +342,9 @@ install_status(TransactionId xid, ClusterTTStatus status, SCN commit_scn)
 	 * carries commit_scn to (a) self-consumer N7 lookup and (b) the wire
 	 * emit path which will ship it to peers in V2 hints (D8).
 	 */
-	cluster_tt_status_install_local(&key, status, commit_scn);
+	installed = cluster_tt_status_install_local(&key, status, commit_scn);
+	if (!installed)
+		return;
 
 	/*
 	 * spec-3.1 v0.4 N7 self-consumer:  immediately re-lookup to prove

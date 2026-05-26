@@ -698,6 +698,9 @@
 /* Define to 1 to build with assertion checks. (--enable-cassert) */
 #undef USE_ASSERT_CHECKING
 
+/* PGRAC: Define to 1 to build test-only injection helpers. (--enable-injection-points) */
+#undef ENABLE_INJECTION
+
 /* Define to 1 to build with Bonjour support. (--with-bonjour) */
 #undef USE_BONJOUR
 
