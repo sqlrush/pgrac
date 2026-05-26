@@ -197,10 +197,17 @@ jobs:
         run: |
           export PGRAC_ENABLE_INSTALL=$HOME/linkdb-install
           export PATH=$HOME/linkdb-install/bin:$PATH
+          # PGRAC: PG TAP framework needs port-reservation directory + pg_regress
+          # path for ClusterPair --config-auth (spec-3.4e Hardening v1.0.1 fix —
+          # ubuntu-latest 1st run silently no-op'd class 2/3/4 without these).
+          mkdir -p /tmp/pgrac-portlock
+          export PG_TEST_PORT_DIR=/tmp/pgrac-portlock
+          export PG_REGRESS="$(pwd)/src/test/regress/pg_regress"
           # class 2/3/4 via Perl runner (ClusterPair fixture);
           # class 1 (single-node-no-peer) covered by existing perf-baseline job above.
           for class in 2node-local-affinity 2node-cross-node-visibility 2node-hot-row-lock; do
             echo "=== Running $class ==="
+            rm -rf tmp_check  # avoid "File exists" Bail between classes
             scripts/perf/run-2node-baseline.sh \
               --mode="$class" \
               --scale="${PERF_SCALE:-10}" \
@@ -215,6 +222,10 @@ jobs:
         run: |
           mkdir -p perf-2node-artifact
           cp -R scripts/perf/results perf-2node-artifact/results 2>/dev/null || true
+          # PGRAC: also upload PG TAP framework regress logs for diagnostics
+          # (Perl runner redirects STDOUT/STDERR there; without these, CI silent
+          # failures are invisible).
+          cp -R log perf-2node-artifact/log 2>/dev/null || true
 
       - name: Upload 2-node perf artifact
         if: always()
