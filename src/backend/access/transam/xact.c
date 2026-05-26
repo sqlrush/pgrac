@@ -2701,6 +2701,29 @@ PrepareTransaction(void)
 	Assert(s->parent == NULL);
 
 	/*
+	 * PGRAC spec-3.5 D10 HW1 P0 fail-closed guard:  reject PREPARE
+	 * TRANSACTION when the current xact has installed any cluster
+	 * SUBTRANS state (subxact ACTIVE / SUBCOMMITTED overlay).  spec-3.5
+	 * does NOT implement COMMIT PREPARED final emit;  allowing prepare
+	 * here would let COMMIT PREPARED (from a different backend) leave
+	 * remote readers stuck on `SUBCOMMITTED → parent unknown` — a
+	 * cross-node correctness bug (L199 prohibits PG-native fallback).
+	 * 2PC full support is forward-linked to an independent 2PC spec.
+	 *
+	 * Single-node / no-peer cluster: guard is a no-op
+	 * (cluster_subtrans_xact_has_state returns false).
+	 */
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_subtrans_xact_has_state(xid))
+		ereport(ERROR,
+				(errcode(ERRCODE_PREPARE_TRANSACTION_WITH_CLUSTER_SUBTRANS_STATE),
+				 errmsg("PREPARE TRANSACTION with cluster SUBTRANS state not supported in spec-3.5"),
+				 errhint("2PC full support (PREPARE + COMMIT PREPARED final emit) "
+						 "forward-linked to a future 2PC spec.  Use plain COMMIT/ROLLBACK "
+						 "for transactions that touched cluster cross-node visibility paths.")));
+#endif
+
+	/*
 	 * Do pre-commit processing that involves calling user-defined code, such
 	 * as triggers.  Since closing cursors could queue trigger actions,
 	 * triggers could open cursors, etc, we have to keep looping until there's

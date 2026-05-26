@@ -614,6 +614,12 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 # counter is incremented.  Raise INITRANS or wait for spec-3.5+ split capacity.
 53R9A    E    ERRCODE_CLUSTER_ITL_SLOT_OVERFLOW                                cluster_itl_slot_overflow
 
+# spec-3.5 HW1 P0 fail-closed guard:  PREPARE TRANSACTION 不允许 carry
+# active cluster SUBTRANS state.  本 spec 不实现 COMMIT PREPARED final
+# emit;  允许 prepare 后会留 cross-node `SUBCOMMITTED → parent unknown`
+# correctness bug.  errhint forward-link 独立 2PC spec.
+53R9B    E    ERRCODE_PREPARE_TRANSACTION_WITH_CLUSTER_SUBTRANS_STATE          prepare_transaction_with_cluster_subtrans_state
+
 Section: Class 54 - Program Limit Exceeded
 
 # this is for wired-in limits, not resource exhaustion problems (class borrowed from DB2)
