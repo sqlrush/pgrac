@@ -74,6 +74,17 @@ typedef struct ClusterTTOverlayEntry {
 	SCN commit_scn;
 	uint32 status_epoch;
 	TimestampTz install_ts;
+
+	/*
+	 * PGRAC (spec-3.5): parent_key for SUBCOMMITTED entries.
+	 *
+	 * Only populated when status == CLUSTER_TT_STATUS_SUBCOMMITTED.
+	 * has_parent_key=false / parent_key zeroed for all other states.
+	 * Reader follows this chain via cluster_tt_status_lookup_exact
+	 * (bounded by cluster.subtrans_max_chain_depth).
+	 */
+	bool has_parent_key;
+	ClusterTTStatusKey parent_key;
 } ClusterTTOverlayEntry;
 
 /*
@@ -92,6 +103,11 @@ typedef struct ClusterTTStatusShmem {
 	pg_atomic_uint64 self_consumer_hit_count;
 	pg_atomic_uint64 ambiguous_raw_xid_reject_count;
 	pg_atomic_uint64 evict_fail_count;
+
+	/* PGRAC (spec-3.5): SUBCOMMITTED path counters. */
+	pg_atomic_uint64 subcommitted_install_count;
+	pg_atomic_uint64 subcommitted_lookup_hit_count;
+	pg_atomic_uint64 parent_chain_follow_count;
 } ClusterTTStatusShmem;
 
 #ifdef USE_PGRAC_CLUSTER
@@ -142,6 +158,10 @@ cluster_tt_status_shmem_init(void)
 		pg_atomic_init_u64(&ClusterTTStatusState->self_consumer_hit_count, 0);
 		pg_atomic_init_u64(&ClusterTTStatusState->ambiguous_raw_xid_reject_count, 0);
 		pg_atomic_init_u64(&ClusterTTStatusState->evict_fail_count, 0);
+		/* PGRAC (spec-3.5) */
+		pg_atomic_init_u64(&ClusterTTStatusState->subcommitted_install_count, 0);
+		pg_atomic_init_u64(&ClusterTTStatusState->subcommitted_lookup_hit_count, 0);
+		pg_atomic_init_u64(&ClusterTTStatusState->parent_chain_follow_count, 0);
 	}
 
 	/* Lock. */
@@ -222,6 +242,9 @@ cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key, ClusterTTStatusRes
 	result->commit_scn = InvalidScn;
 	result->status_epoch = 0;
 	result->authoritative = false;
+	/* PGRAC (spec-3.5): parent_key sentinel — must be zero for non-SUBCOMMITTED. */
+	result->has_parent_key = false;
+	memset(&result->parent_key, 0, sizeof(result->parent_key));
 
 	if (!cluster_enabled || ClusterTTStatusHTAB == NULL)
 		return false;
@@ -247,9 +270,19 @@ cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key, ClusterTTStatusRes
 	result->commit_scn = e->commit_scn;
 	result->status_epoch = e->status_epoch;
 	result->authoritative = true;
+	/*
+	 * PGRAC (spec-3.5): copy parent_key chain metadata only for
+	 * SUBCOMMITTED entries.  Bump dedicated SUBCOMMITTED hit counter.
+	 */
+	if (e->status == CLUSTER_TT_STATUS_SUBCOMMITTED && e->has_parent_key) {
+		result->has_parent_key = true;
+		result->parent_key = e->parent_key;
+	}
 
 	LWLockRelease(ClusterTTStatusLock);
 	pg_atomic_fetch_add_u64(&ClusterTTStatusState->lookup_hit_count, 1);
+	if (result->status == CLUSTER_TT_STATUS_SUBCOMMITTED)
+		pg_atomic_fetch_add_u64(&ClusterTTStatusState->subcommitted_lookup_hit_count, 1);
 	return true;
 }
 
@@ -287,10 +320,64 @@ cluster_tt_status_install_local(const ClusterTTStatusKey *key, ClusterTTStatus s
 	e->commit_scn = commit_scn;
 	e->status_epoch = key->cluster_epoch;
 	e->install_ts = GetCurrentTimestamp();
+	/*
+	 * PGRAC (spec-3.5): install_local NEVER carries parent_key — it is
+	 * reserved for install_subcommitted.  Clear here defensively.
+	 */
+	e->has_parent_key = false;
+	memset(&e->parent_key, 0, sizeof(e->parent_key));
 
 	LWLockRelease(ClusterTTStatusLock);
 
 	pg_atomic_fetch_add_u64(&ClusterTTStatusState->install_count, 1);
+	return true;
+}
+
+/*
+ * cluster_tt_status_install_subcommitted (spec-3.5 D2 NEW)
+ *
+ *	  Installs SUBCOMMITTED status with parent_key chain pointer.
+ *	  Used by spec-3.5 D7 xact.c CommitSubTransaction hook.  Caller
+ *	  MUST first ensure parent_key has its own overlay binding via
+ *	  cluster_subtrans_ensure_parent_binding().
+ */
+bool
+cluster_tt_status_install_subcommitted(const ClusterTTStatusKey *child_key,
+									   const ClusterTTStatusKey *parent_key)
+{
+	ClusterTTOverlayEntry *e;
+	bool found;
+
+	Assert(child_key != NULL);
+	Assert(parent_key != NULL);
+
+	if (!cluster_enabled || ClusterTTStatusHTAB == NULL)
+		return false;
+
+	LWLockAcquire(ClusterTTStatusLock, LW_EXCLUSIVE);
+
+	e = (ClusterTTOverlayEntry *)hash_search(ClusterTTStatusHTAB, child_key, HASH_ENTER_NULL,
+											 &found);
+	if (e == NULL) {
+		LWLockRelease(ClusterTTStatusLock);
+		pg_atomic_fetch_add_u64(&ClusterTTStatusState->evict_fail_count, 1);
+		ereport(WARNING, (errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+						  errmsg("cluster tt status overlay full; subcommitted install dropped"),
+						  errhint("Raise cluster.tt_status_overlay_max_entries or lower TTL.")));
+		return false;
+	}
+
+	e->status = CLUSTER_TT_STATUS_SUBCOMMITTED;
+	e->commit_scn = InvalidScn; /* subxact not yet finalized */
+	e->status_epoch = child_key->cluster_epoch;
+	e->install_ts = GetCurrentTimestamp();
+	e->has_parent_key = true;
+	e->parent_key = *parent_key;
+
+	LWLockRelease(ClusterTTStatusLock);
+
+	pg_atomic_fetch_add_u64(&ClusterTTStatusState->install_count, 1);
+	pg_atomic_fetch_add_u64(&ClusterTTStatusState->subcommitted_install_count, 1);
 	return true;
 }
 
@@ -445,6 +532,10 @@ CLUSTER_TT_STATUS_COUNTER_GETTER(evict_count)
 CLUSTER_TT_STATUS_COUNTER_GETTER(flush_count)
 CLUSTER_TT_STATUS_COUNTER_GETTER(self_consumer_hit_count)
 CLUSTER_TT_STATUS_COUNTER_GETTER(evict_fail_count)
+/* PGRAC (spec-3.5): SUBCOMMITTED counters. */
+CLUSTER_TT_STATUS_COUNTER_GETTER(subcommitted_install_count)
+CLUSTER_TT_STATUS_COUNTER_GETTER(subcommitted_lookup_hit_count)
+CLUSTER_TT_STATUS_COUNTER_GETTER(parent_chain_follow_count)
 
 #else /* !USE_PGRAC_CLUSTER */
 
@@ -470,6 +561,9 @@ cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key, ClusterTTStatusRes
 		result->commit_scn = 0;
 		result->status_epoch = 0;
 		result->authoritative = false;
+		/* PGRAC (spec-3.5): parent_key sentinel in disable-cluster build. */
+		result->has_parent_key = false;
+		memset(&result->parent_key, 0, sizeof(result->parent_key));
 	}
 	(void)key;
 	return false;
@@ -482,6 +576,15 @@ cluster_tt_status_install_local(const ClusterTTStatusKey *key, ClusterTTStatus s
 	(void)key;
 	(void)status;
 	(void)commit_scn;
+	return false;
+}
+
+bool
+cluster_tt_status_install_subcommitted(const ClusterTTStatusKey *child_key,
+									   const ClusterTTStatusKey *parent_key)
+{
+	(void)child_key;
+	(void)parent_key;
 	return false;
 }
 
@@ -525,5 +628,9 @@ CLUSTER_TT_STATUS_COUNTER_GETTER_STUB(evict_count)
 CLUSTER_TT_STATUS_COUNTER_GETTER_STUB(flush_count)
 CLUSTER_TT_STATUS_COUNTER_GETTER_STUB(self_consumer_hit_count)
 CLUSTER_TT_STATUS_COUNTER_GETTER_STUB(evict_fail_count)
+/* PGRAC (spec-3.5) */
+CLUSTER_TT_STATUS_COUNTER_GETTER_STUB(subcommitted_install_count)
+CLUSTER_TT_STATUS_COUNTER_GETTER_STUB(subcommitted_lookup_hit_count)
+CLUSTER_TT_STATUS_COUNTER_GETTER_STUB(parent_chain_follow_count)
 
 #endif /* USE_PGRAC_CLUSTER */

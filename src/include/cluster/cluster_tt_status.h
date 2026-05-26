@@ -70,15 +70,21 @@
  * ClusterTTStatus -- cluster-aware transaction status enum.
  *
  * Distinct from PG TransactionIdStatus to keep PG-core API untouched
- * (feature-069 AD-006 第五轮 PG CLOG 原生不动).  SUBCOMMITTED reserved for
- * future SUBTRANS spec — NOT in spec-3.1 scope (spec-3.1 §0.1 F4 + §1.3 #10).
+ * (feature-069 AD-006 第五轮 PG CLOG 原生不动).
+ *
+ * PGRAC (spec-3.5): SUBCOMMITTED = 5 added for SUBTRANS cross-node
+ * visibility.  When a savepoint commits, origin emits SUBCOMMITTED +
+ * parent_key to peers; remote reader lazy-follows parent_key to resolve
+ * final visibility (bounded by cluster.subtrans_max_chain_depth).
+ * Existing 0-4 values MUST NOT be reordered (HC183 + wire ABI lock).
  */
 typedef enum ClusterTTStatus {
 	CLUSTER_TT_STATUS_UNKNOWN = 0,
 	CLUSTER_TT_STATUS_IN_PROGRESS = 1,
 	CLUSTER_TT_STATUS_COMMITTED = 2,
 	CLUSTER_TT_STATUS_ABORTED = 3,
-	CLUSTER_TT_STATUS_CLEANED_OUT = 4
+	CLUSTER_TT_STATUS_CLEANED_OUT = 4,
+	CLUSTER_TT_STATUS_SUBCOMMITTED = 5	/* spec-3.5 NEW */
 } ClusterTTStatus;
 
 /*
@@ -135,6 +141,18 @@ typedef struct ClusterTTStatusResult {
 	SCN commit_scn; /* valid for COMMITTED/CLEANED_OUT */
 	uint32 status_epoch;
 	bool authoritative;
+	/*
+	 * PGRAC (spec-3.5): parent_key + has_parent_key NEW for SUBCOMMITTED.
+	 *
+	 * If status == SUBCOMMITTED and has_parent_key == true, parent_key is
+	 * the exact key of the parent (top-level or intermediate) transaction.
+	 * Reader must recurse cluster_tt_status_lookup_exact(parent_key) to
+	 * resolve final visibility (bounded by cluster.subtrans_max_chain_depth
+	 * GUC default 32).  For status != SUBCOMMITTED, has_parent_key=false
+	 * and parent_key MUST be zeroed.
+	 */
+	bool has_parent_key;
+	ClusterTTStatusKey parent_key;
 } ClusterTTStatusResult;
 
 /*
@@ -261,5 +279,25 @@ extern uint64 cluster_tt_status_get_evict_count(void);
 extern uint64 cluster_tt_status_get_flush_count(void);
 extern uint64 cluster_tt_status_get_self_consumer_hit_count(void);
 extern uint64 cluster_tt_status_get_evict_fail_count(void);
+
+/*
+ * PGRAC (spec-3.5): SUBCOMMITTED install + counter API.
+ *
+ * cluster_tt_status_install_subcommitted:
+ *	  D2 NEW API for spec-3.5 SUBTRANS hook (eager emit on subcommit).
+ *	  Installs CLUSTER_TT_STATUS_SUBCOMMITTED overlay entry with
+ *	  child_key + parent_key + commit_scn=InvalidScn.  Caller MUST
+ *	  ensure parent binding exists first (cluster_subtrans_ensure_parent_binding).
+ *	  Returns true on install, false if overlay full / unavailable.
+ */
+extern bool cluster_tt_status_install_subcommitted(const ClusterTTStatusKey *child_key,
+												   const ClusterTTStatusKey *parent_key);
+
+/*
+ * Counter getters for spec-3.5 SUBCOMMITTED path (always linked).
+ */
+extern uint64 cluster_tt_status_get_subcommitted_install_count(void);
+extern uint64 cluster_tt_status_get_subcommitted_lookup_hit_count(void);
+extern uint64 cluster_tt_status_get_parent_chain_follow_count(void);
 
 #endif /* CLUSTER_TT_STATUS_H */

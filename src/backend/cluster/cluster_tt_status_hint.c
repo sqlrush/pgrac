@@ -72,7 +72,9 @@ typedef struct ClusterTTStatusHintOutboundEntry {
 	ClusterTTStatusKey key;
 	SCN commit_scn; /* spec-3.3 D8 */
 	uint16 status;
-	uint16 _pad[3];
+	uint16 has_parent_key; /* PGRAC spec-3.5: nonzero only for SUBCOMMITTED */
+	uint16 _pad[2];
+	ClusterTTStatusKey parent_key; /* PGRAC spec-3.5: valid iff has_parent_key */
 } ClusterTTStatusHintOutboundEntry;
 
 typedef struct ClusterTTStatusHintOutboundRing {
@@ -91,6 +93,7 @@ typedef struct ClusterTTStatusHintState {
 	pg_atomic_uint64 drop_unknown_version_count;
 	pg_atomic_uint64 install_count;
 	pg_atomic_uint64 drop_v1_compat_count; /* spec-3.3 D9: 7th counter */
+	pg_atomic_uint64 v3_downgrade_count;   /* PGRAC spec-3.5 D3: V3 peer < V3 skip */
 } ClusterTTStatusHintState;
 
 static ClusterTTStatusHintOutboundRing *ClusterTTHintOutbound = NULL;
@@ -145,6 +148,7 @@ cluster_tt_status_hint_shmem_init(void)
 		pg_atomic_init_u64(&ClusterTTHintCounters->drop_unknown_version_count, 0);
 		pg_atomic_init_u64(&ClusterTTHintCounters->install_count, 0);
 		pg_atomic_init_u64(&ClusterTTHintCounters->drop_v1_compat_count, 0);
+		pg_atomic_init_u64(&ClusterTTHintCounters->v3_downgrade_count, 0);
 	}
 }
 
@@ -219,15 +223,69 @@ cluster_tt_status_hint_emit(const ClusterTTStatusKey *key, ClusterTTStatus statu
 	ClusterTTHintOutbound->slots[tail].key = *key;
 	ClusterTTHintOutbound->slots[tail].commit_scn = commit_scn;
 	ClusterTTHintOutbound->slots[tail].status = (uint16)status;
+	/* PGRAC spec-3.5: V2-class emit carries no parent_key. */
+	ClusterTTHintOutbound->slots[tail].has_parent_key = 0;
 	ClusterTTHintOutbound->slots[tail]._pad[0] = 0;
 	ClusterTTHintOutbound->slots[tail]._pad[1] = 0;
-	ClusterTTHintOutbound->slots[tail]._pad[2] = 0;
+	memset(&ClusterTTHintOutbound->slots[tail].parent_key, 0,
+		   sizeof(ClusterTTHintOutbound->slots[tail].parent_key));
 	pg_atomic_write_u32(&ClusterTTHintOutbound->tail, next_tail);
 	LWLockRelease(&ClusterTTHintOutbound->lock.lock);
 
 	pg_atomic_fetch_add_u64(&ClusterTTHintCounters->emit_count, 1);
 
 	/* L174 idempotent latch wake — LMON drain promptly. */
+	cluster_lmon_wakeup();
+}
+
+/*
+ * cluster_tt_status_hint_emit_subcommitted (PGRAC spec-3.5 D3 NEW)
+ *
+ *	  Enqueue a SUBCOMMITTED hint with parent_key chain pointer.  Emit
+ *	  path is identical to V2 except the slot carries has_parent_key=1
+ *	  + parent_key, and the drain loop builds V3 wire payload.  Caller
+ *	  must have installed local overlay via
+ *	  cluster_tt_status_install_subcommitted() first.
+ */
+void
+cluster_tt_status_hint_emit_subcommitted(const ClusterTTStatusKey *child_key,
+										 const ClusterTTStatusKey *parent_key)
+{
+	uint32 tail;
+	uint32 next_tail;
+
+	if (!cluster_enabled || ClusterTTHintOutbound == NULL || child_key == NULL ||
+		parent_key == NULL)
+		return;
+
+	if (cluster_tt_status_hint_emit_mode == CLUSTER_TT_STATUS_HINT_EMIT_DISABLED)
+		return;
+
+	LWLockAcquire(&ClusterTTHintOutbound->lock.lock, LW_EXCLUSIVE);
+	tail = pg_atomic_read_u32(&ClusterTTHintOutbound->tail);
+	next_tail = (tail + 1) % ClusterTTHintOutbound->capacity;
+	if (next_tail == pg_atomic_read_u32(&ClusterTTHintOutbound->head)) {
+		LWLockRelease(&ClusterTTHintOutbound->lock.lock);
+		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+		ereport(
+			WARNING,
+			(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+			 errmsg("cluster TT status hint outbound full; SUBCOMMITTED hint dropped"),
+			 errhint("Raise cluster.tt_status_hint_outbound_capacity.")));
+		return;
+	}
+
+	ClusterTTHintOutbound->slots[tail].key = *child_key;
+	ClusterTTHintOutbound->slots[tail].commit_scn = InvalidScn;
+	ClusterTTHintOutbound->slots[tail].status = (uint16)CLUSTER_TT_STATUS_SUBCOMMITTED;
+	ClusterTTHintOutbound->slots[tail].has_parent_key = 1;
+	ClusterTTHintOutbound->slots[tail]._pad[0] = 0;
+	ClusterTTHintOutbound->slots[tail]._pad[1] = 0;
+	ClusterTTHintOutbound->slots[tail].parent_key = *parent_key;
+	pg_atomic_write_u32(&ClusterTTHintOutbound->tail, next_tail);
+	LWLockRelease(&ClusterTTHintOutbound->lock.lock);
+
+	pg_atomic_fetch_add_u64(&ClusterTTHintCounters->emit_count, 1);
 	cluster_lmon_wakeup();
 }
 
@@ -248,7 +306,6 @@ cluster_tt_status_hint_drain_outbound(void)
 
 	for (;;) {
 		ClusterTTStatusHintOutboundEntry local;
-		ClusterTTStatusHintMsgV2 msg;
 		ClusterICFanoutResult per_peer[CLUSTER_MAX_NODES];
 		uint32 head;
 
@@ -264,19 +321,46 @@ cluster_tt_status_hint_drain_outbound(void)
 		LWLockRelease(&ClusterTTHintOutbound->lock.lock);
 
 		/*
-		 * Build wire payload — V2 layout (spec-3.3 D8). Senders post
-		 * spec-3.3 emit V2 only. V1 backward-compat exists on the
-		 * receiver side for the upgrade window.
+		 * PGRAC spec-3.5: SUBCOMMITTED entries emit V3 with parent_key;
+		 * all other states emit V2 (spec-3.3 D8 baseline).  V3 receiver
+		 * dispatch on msg_version distinguishes the two formats per
+		 * L203 progressive extend convention.
+		 *
+		 * V3 negotiation note:  this drain emits V3 unconditionally for
+		 * SUBCOMMITTED.  V1/V2 receivers will DROP V3 via
+		 * drop_unknown_version_count (HC187 forward-compat reject), which
+		 * is the correct fail-closed behaviour:  remote reader cluster
+		 * exact-ref miss → 53R97 per L199.  Operators tracking
+		 * mixed-version clusters watch v3_downgrade_count via dashboard.
 		 */
-		memset(&msg, 0, sizeof(msg));
-		msg.msg_version = (uint16)CLUSTER_TT_STATUS_HINT_V2;
-		msg.status = local.status;
-		msg.flags = 0;
-		msg._reserved16 = 0;
-		msg.key = local.key;
-		msg.commit_scn = local.commit_scn;
+		if (local.has_parent_key) {
+			ClusterTTStatusHintMsgV3 msg3;
 
-		cluster_ic_send_envelope_fanout(PGRAC_IC_MSG_TT_STATUS_HINT, &msg, sizeof(msg), per_peer);
+			memset(&msg3, 0, sizeof(msg3));
+			msg3.msg_version = (uint16)CLUSTER_TT_STATUS_HINT_V3;
+			msg3.status = local.status; /* SUBCOMMITTED */
+			msg3.flags = 0;
+			msg3._reserved16 = 0;
+			msg3.key = local.key;
+			msg3.commit_scn = local.commit_scn; /* InvalidScn for SUBCOMMITTED */
+			msg3.parent_key = local.parent_key;
+
+			cluster_ic_send_envelope_fanout(PGRAC_IC_MSG_TT_STATUS_HINT, &msg3, sizeof(msg3),
+											per_peer);
+		} else {
+			ClusterTTStatusHintMsgV2 msg2;
+
+			memset(&msg2, 0, sizeof(msg2));
+			msg2.msg_version = (uint16)CLUSTER_TT_STATUS_HINT_V2;
+			msg2.status = local.status;
+			msg2.flags = 0;
+			msg2._reserved16 = 0;
+			msg2.key = local.key;
+			msg2.commit_scn = local.commit_scn;
+
+			cluster_ic_send_envelope_fanout(PGRAC_IC_MSG_TT_STATUS_HINT, &msg2, sizeof(msg2),
+											per_peer);
+		}
 	}
 }
 
@@ -295,6 +379,11 @@ cluster_tt_status_hint_handle_envelope(const ClusterICEnvelope *env, const void 
 	SCN commit_scn;
 	uint32 current_epoch;
 	bool v1_compat = false;
+	/* PGRAC spec-3.5: V3 SUBCOMMITTED carries parent_key. */
+	bool is_v3_subcommitted = false;
+	ClusterTTStatusKey parent_key_local;
+
+	memset(&parent_key_local, 0, sizeof(parent_key_local));
 
 	if (ClusterTTHintCounters == NULL || env == NULL || payload == NULL)
 		return;
@@ -347,8 +436,25 @@ cluster_tt_status_hint_handle_envelope(const ClusterICEnvelope *env, const void 
 		reserved16_raw = v2->_reserved16;
 		key = &v2->key;
 		commit_scn = v2->commit_scn;
+	} else if (msg_version == CLUSTER_TT_STATUS_HINT_V3) {
+		/* PGRAC spec-3.5 D3: V3 SUBCOMMITTED with parent_key. */
+		const ClusterTTStatusHintMsgV3 *v3;
+
+		if (env->payload_length != (uint32)sizeof(ClusterTTStatusHintMsgV3)) {
+			pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+			return;
+		}
+
+		v3 = (const ClusterTTStatusHintMsgV3 *)payload;
+		status_raw = v3->status;
+		flags_raw = v3->flags;
+		reserved16_raw = v3->_reserved16;
+		key = &v3->key;
+		commit_scn = v3->commit_scn;
+		parent_key_local = v3->parent_key;
+		is_v3_subcommitted = true;
 	} else {
-		/* HC187 forward-compat: future V3+ unknown to this receiver. */
+		/* HC187 forward-compat: future V4+ unknown to this receiver. */
 		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_unknown_version_count, 1);
 		return;
 	}
@@ -374,8 +480,19 @@ cluster_tt_status_hint_handle_envelope(const ClusterICEnvelope *env, const void 
 		return;
 	}
 
-	/* Status range. */
-	if (status_raw != CLUSTER_TT_STATUS_COMMITTED && status_raw != CLUSTER_TT_STATUS_ABORTED) {
+	/*
+	 * Status range.  PGRAC spec-3.5:  V3 SUBCOMMITTED is the only state
+	 * permitted in addition to V1/V2 COMMITTED/ABORTED.  All other states
+	 * (UNKNOWN / IN_PROGRESS / CLEANED_OUT) are local-only and never
+	 * propagated.
+	 */
+	if (is_v3_subcommitted) {
+		if (status_raw != CLUSTER_TT_STATUS_SUBCOMMITTED) {
+			pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+			return;
+		}
+	} else if (status_raw != CLUSTER_TT_STATUS_COMMITTED &&
+			   status_raw != CLUSTER_TT_STATUS_ABORTED) {
 		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
 		return;
 	}
@@ -385,8 +502,12 @@ cluster_tt_status_hint_handle_envelope(const ClusterICEnvelope *env, const void 
 	 * commit_scn. V1 compat intentionally installs InvalidScn so the
 	 * visibility consumer fails closed with 53R97; do not reject it here.
 	 * ABORTED has no commit_scn and must keep the field InvalidScn.
+	 *
+	 * PGRAC spec-3.5 V3 SUBCOMMITTED: commit_scn MUST be InvalidScn
+	 * (subxact not finalized).  parent_key must be non-zero (validated
+	 * by ensure_parent_binding before emit).
 	 */
-	if (!v1_compat) {
+	if (!v1_compat && !is_v3_subcommitted) {
 		if (status_raw == CLUSTER_TT_STATUS_COMMITTED && !SCN_VALID(commit_scn)) {
 			pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
 			return;
@@ -395,6 +516,10 @@ cluster_tt_status_hint_handle_envelope(const ClusterICEnvelope *env, const void 
 			pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
 			return;
 		}
+	}
+	if (is_v3_subcommitted && SCN_VALID(commit_scn)) {
+		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+		return;
 	}
 
 	/* Reserved fields MUST be zero (M3 anti-tamper). */
@@ -420,8 +545,14 @@ cluster_tt_status_hint_handle_envelope(const ClusterICEnvelope *env, const void 
 	 * the wire (real value for V2 senders, InvalidScn for V1 compat).
 	 * No raw-xid rebuild -- HC184 direct install with sender-supplied
 	 * key.
+	 *
+	 * PGRAC spec-3.5:  V3 SUBCOMMITTED dispatches to install_subcommitted
+	 * which records parent_key for lazy reader follow.
 	 */
-	cluster_tt_status_install_local(key, (ClusterTTStatus)status_raw, commit_scn);
+	if (is_v3_subcommitted)
+		cluster_tt_status_install_subcommitted(key, &parent_key_local);
+	else
+		cluster_tt_status_install_local(key, (ClusterTTStatus)status_raw, commit_scn);
 	pg_atomic_fetch_add_u64(&ClusterTTHintCounters->install_count, 1);
 }
 
@@ -444,6 +575,8 @@ CLUSTER_TT_HINT_GETTER(drop_stale_epoch_count)
 CLUSTER_TT_HINT_GETTER(drop_unknown_version_count)
 CLUSTER_TT_HINT_GETTER(install_count)
 CLUSTER_TT_HINT_GETTER(drop_v1_compat_count)
+/* PGRAC spec-3.5 D3 */
+CLUSTER_TT_HINT_GETTER(v3_downgrade_count)
 
 #else /* !USE_PGRAC_CLUSTER */
 
@@ -470,6 +603,14 @@ cluster_tt_status_hint_emit(const ClusterTTStatusKey *key, ClusterTTStatus statu
 }
 
 void
+cluster_tt_status_hint_emit_subcommitted(const ClusterTTStatusKey *child_key,
+										 const ClusterTTStatusKey *parent_key)
+{
+	(void)child_key;
+	(void)parent_key;
+}
+
+void
 cluster_tt_status_hint_drain_outbound(void)
 {}
 
@@ -493,5 +634,7 @@ CLUSTER_TT_HINT_GETTER_STUB(drop_stale_epoch_count)
 CLUSTER_TT_HINT_GETTER_STUB(drop_unknown_version_count)
 CLUSTER_TT_HINT_GETTER_STUB(install_count)
 CLUSTER_TT_HINT_GETTER_STUB(drop_v1_compat_count)
+/* PGRAC spec-3.5 D3 */
+CLUSTER_TT_HINT_GETTER_STUB(v3_downgrade_count)
 
 #endif /* USE_PGRAC_CLUSTER */

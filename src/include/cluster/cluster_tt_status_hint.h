@@ -77,7 +77,8 @@ struct ClusterICEnvelope;
  */
 typedef enum ClusterTTStatusHintVersion {
 	CLUSTER_TT_STATUS_HINT_V1 = 1,
-	CLUSTER_TT_STATUS_HINT_V2 = 2
+	CLUSTER_TT_STATUS_HINT_V2 = 2,
+	CLUSTER_TT_STATUS_HINT_V3 = 3 /* spec-3.5 NEW: SUBCOMMITTED + parent_key */
 } ClusterTTStatusHintVersion;
 
 /*
@@ -137,9 +138,56 @@ StaticAssertDecl(sizeof(ClusterTTStatusHintMsgV2) == 40,
 				 "(spec-3.3 D8 / V2 wire ABI lock)");
 
 /*
+ * ClusterTTStatusHintMsgV3 -- 64 bytes wire-stable payload (spec-3.5 D3).
+ *
+ *	V2 layout 0-39 preserved bit-for-bit;parent_key (ClusterTTStatusKey 24B)
+ *	appended at offset 40.  This is the strict progressive extend convention
+ *	(HC184 V1 key offset 8 + spec-3.3 D8 V2 commit_scn offset 32);see
+ *	docs/spec-drafting-lessons.md L203 for the canonical statement.
+ *
+ *	Field layout:
+ *	  offset  0, 40B : V2 base (msg_version=V3, status, flags, _reserved16,
+ *	                   key, commit_scn=InvalidScn for SUBCOMMITTED)
+ *	  offset 40, 24B : parent_key (ClusterTTStatusKey;zero unless
+ *	                   status == SUBCOMMITTED)
+ *
+ *	V1/V2 receivers MUST NOT decode V3 — version dispatch first; they bump
+ *	drop_unknown_version_count + DROP (HC187 forward-compat reject).  Origin
+ *	on peer < V3 does NOT downgrade-emit V2 for SUBCOMMITTED (V2 cannot
+ *	carry parent_key — silent-wrong) but skips SUBCOMMITTED emit entirely
+ *	+ bumps cluster_tt_hint_v3_downgrade_count.  Remote reader cluster
+ *	exact-ref miss → 53R97 fail-closed (L199;NOT PG-native fallback).
+ */
+typedef struct ClusterTTStatusHintMsgV3 {
+	uint16 msg_version; /* offset  0, 2B; = CLUSTER_TT_STATUS_HINT_V3 */
+	uint16 status;
+	uint16 flags;
+	uint16 _reserved16;
+	ClusterTTStatusKey key;		   /* offset  8, 24B */
+	SCN commit_scn;				   /* offset 32, 8B */
+	ClusterTTStatusKey parent_key; /* offset 40, 24B (NEW V3) */
+} ClusterTTStatusHintMsgV3;
+
+StaticAssertDecl(offsetof(ClusterTTStatusHintMsgV3, msg_version) == 0,
+				 "ClusterTTStatusHintMsgV3.msg_version must start at offset 0 "
+				 "(L203 progressive extend convention)");
+StaticAssertDecl(offsetof(ClusterTTStatusHintMsgV3, key) == 8,
+				 "ClusterTTStatusHintMsgV3.key must start at offset 8 "
+				 "(HC184 + L203 progressive extend convention)");
+StaticAssertDecl(offsetof(ClusterTTStatusHintMsgV3, commit_scn) == 32,
+				 "ClusterTTStatusHintMsgV3.commit_scn must start at offset 32 "
+				 "(spec-3.3 D8 + L203 progressive extend convention)");
+StaticAssertDecl(offsetof(ClusterTTStatusHintMsgV3, parent_key) == 40,
+				 "ClusterTTStatusHintMsgV3.parent_key must start at offset 40 "
+				 "(spec-3.5 D3 V3 wire ABI lock)");
+StaticAssertDecl(sizeof(ClusterTTStatusHintMsgV3) == 64,
+				 "ClusterTTStatusHintMsgV3 must be 64 bytes wire-stable "
+				 "(spec-3.5 D3 / V3 wire ABI lock)");
+
+/*
  * Legacy typedef preserved for source compatibility with internal callers
  * that still reference ClusterTTStatusHintMsg without a version suffix.
- * Always means the V1 32B layout; new code should pick V1 / V2 explicitly.
+ * Always means the V1 32B layout; new code should pick V1 / V2 / V3 explicitly.
  */
 typedef ClusterTTStatusHintMsgV1 ClusterTTStatusHintMsg;
 
@@ -171,6 +219,17 @@ typedef ClusterTTStatusHintMsgV1 ClusterTTStatusHintMsg;
  */
 extern void cluster_tt_status_hint_emit(const ClusterTTStatusKey *key, ClusterTTStatus status,
 										SCN commit_scn);
+
+/*
+ * cluster_tt_status_hint_emit_subcommitted (spec-3.5 D3 NEW):
+ *	  Emit a V3 SUBCOMMITTED hint with parent_key chain pointer.  Used by
+ *	  spec-3.5 D7 xact.c CommitSubTransaction hook.  Caller MUST have
+ *	  already installed local overlay via cluster_tt_status_install_subcommitted.
+ *	  V3-only peers receive correctly;V1/V2 peers DROP (forward-compat).
+ *	  Origin skips emit if no peer >= V3 (warn-only counter bump).
+ */
+extern void cluster_tt_status_hint_emit_subcommitted(const ClusterTTStatusKey *child_key,
+													 const ClusterTTStatusKey *parent_key);
 extern void cluster_tt_status_hint_handle_envelope(const struct ClusterICEnvelope *env,
 												   const void *payload);
 extern void cluster_tt_status_hint_drain_outbound(void);
@@ -184,6 +243,8 @@ extern uint64 cluster_tt_status_hint_get_drop_stale_epoch_count(void);
 extern uint64 cluster_tt_status_hint_get_drop_unknown_version_count(void);
 extern uint64 cluster_tt_status_hint_get_install_count(void);
 extern uint64 cluster_tt_status_hint_get_drop_v1_compat_count(void);
+/* PGRAC (spec-3.5):  V3 downgrade counter (peer < V3 → skip SUBCOMMITTED emit). */
+extern uint64 cluster_tt_status_hint_get_v3_downgrade_count(void);
 
 extern Size cluster_tt_status_hint_shmem_size(void);
 extern void cluster_tt_status_hint_shmem_init(void);
