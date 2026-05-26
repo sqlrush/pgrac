@@ -124,6 +124,8 @@ PG_FUNCTION_INFO_V1(cluster_get_reconfig_state);
  */
 PG_FUNCTION_INFO_V1(cluster_test_inject_visibility_tt_ref);
 PG_FUNCTION_INFO_V1(cluster_test_clear_visibility_injects);
+/* PGRAC spec-3.5 D19:  same always-linked pattern for SUBCOMMITTED inject SRF. */
+PG_FUNCTION_INFO_V1(cluster_test_inject_subtrans_subcommitted);
 #endif
 
 
@@ -1358,5 +1360,14 @@ cluster_test_clear_visibility_injects(PG_FUNCTION_ARGS pg_attribute_unused())
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("cluster_test_clear_visibility_injects requires --enable-cluster")));
 	PG_RETURN_INT32(0);
+}
+
+/* PGRAC spec-3.5 D19:  SUBCOMMITTED inject SRF disable-cluster stub. */
+Datum
+cluster_test_inject_subtrans_subcommitted(PG_FUNCTION_ARGS pg_attribute_unused())
+{
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cluster_test_inject_subtrans_subcommitted requires --enable-cluster")));
+	PG_RETURN_BOOL(false);
 }
 #endif
