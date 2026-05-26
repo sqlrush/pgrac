@@ -444,8 +444,7 @@ cluster_init_shmem_module(void)
 	/*
 	 * PGRAC spec-3.5 D5:  register cluster_subtrans shmem (counter-only).
 	 */
-	if (cluster_shmem_lookup_region("pgrac cluster subtrans state") == NULL)
-	{
+	if (cluster_shmem_lookup_region("pgrac cluster subtrans state") == NULL) {
 		extern void cluster_subtrans_shmem_register(void);
 		cluster_subtrans_shmem_register();
 	}

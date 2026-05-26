@@ -254,8 +254,8 @@ cluster_tt_status_hint_emit_subcommitted(const ClusterTTStatusKey *child_key,
 	uint32 tail;
 	uint32 next_tail;
 
-	if (!cluster_enabled || ClusterTTHintOutbound == NULL || child_key == NULL ||
-		parent_key == NULL)
+	if (!cluster_enabled || ClusterTTHintOutbound == NULL || child_key == NULL
+		|| parent_key == NULL)
 		return;
 
 	if (cluster_tt_status_hint_emit_mode == CLUSTER_TT_STATUS_HINT_EMIT_DISABLED)
@@ -267,11 +267,9 @@ cluster_tt_status_hint_emit_subcommitted(const ClusterTTStatusKey *child_key,
 	if (next_tail == pg_atomic_read_u32(&ClusterTTHintOutbound->head)) {
 		LWLockRelease(&ClusterTTHintOutbound->lock.lock);
 		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
-		ereport(
-			WARNING,
-			(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
-			 errmsg("cluster TT status hint outbound full; SUBCOMMITTED hint dropped"),
-			 errhint("Raise cluster.tt_status_hint_outbound_capacity.")));
+		ereport(WARNING, (errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+						  errmsg("cluster TT status hint outbound full; SUBCOMMITTED hint dropped"),
+						  errhint("Raise cluster.tt_status_hint_outbound_capacity.")));
 		return;
 	}
 
@@ -491,8 +489,8 @@ cluster_tt_status_hint_handle_envelope(const ClusterICEnvelope *env, const void 
 			pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
 			return;
 		}
-	} else if (status_raw != CLUSTER_TT_STATUS_COMMITTED &&
-			   status_raw != CLUSTER_TT_STATUS_ABORTED) {
+	} else if (status_raw != CLUSTER_TT_STATUS_COMMITTED
+			   && status_raw != CLUSTER_TT_STATUS_ABORTED) {
 		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
 		return;
 	}

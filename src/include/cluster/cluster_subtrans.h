@@ -71,8 +71,7 @@
  *	  Idempotent:  safe to call multiple times for same child_xid.
  *	  Returns true on emit, false on cluster disabled / no-peer.
  */
-extern bool cluster_subtrans_emit_subcommit(TransactionId child_xid,
-											TransactionId parent_xid);
+extern bool cluster_subtrans_emit_subcommit(TransactionId child_xid, TransactionId parent_xid);
 
 /*
  * cluster_subtrans_emit_subabort (spec-3.5 D5 NEW)
@@ -102,8 +101,7 @@ extern bool cluster_subtrans_emit_subabort(TransactionId child_xid);
  *	  Pure / no syscall / no wait (L177 hot path).
  */
 extern ClusterTTStatusResult
-cluster_subtrans_lookup_parent(const ClusterTTStatusResult *child_result,
-							   int						   depth_remaining);
+cluster_subtrans_lookup_parent(const ClusterTTStatusResult *child_result, int depth_remaining);
 
 /*
  * cluster_subtrans_xact_has_state (spec-3.5 D5 NEW)
@@ -130,7 +128,7 @@ extern bool cluster_subtrans_xact_has_state(TransactionId top_xid);
  *	  Returns true on success and writes parent_key_out;false on
  *	  cluster disabled / no-peer (parent_key_out untouched).
  */
-extern bool cluster_subtrans_ensure_parent_binding(TransactionId		 parent_xid,
+extern bool cluster_subtrans_ensure_parent_binding(TransactionId parent_xid,
 												   ClusterTTStatusKey *parent_key_out);
 
 /*
