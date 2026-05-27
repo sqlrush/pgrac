@@ -135,8 +135,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_cluster_shmem'),
-	   '38',
-	   'L10 pg_cluster_shmem returns 38 rows (spec-3.4e D6 adds lock-path counters region)');
+	   '39',
+	   'L10 pg_cluster_shmem returns 39 rows (spec-3.5 D5 adds subtrans state region)');
 
 
 # ----------
