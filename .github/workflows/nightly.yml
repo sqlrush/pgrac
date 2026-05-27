@@ -101,6 +101,12 @@ jobs:
         run: make check
 
       - name: Run cluster-check (unit + tap full + regress)
+        env:
+          # Keep Stage 2 perf smoke blocking on Linux, where fast/nightly
+          # already validated the no-peer path.  macOS hosted runners are
+          # retained for build/TAP parity but perf remains report-only, matching
+          # perf.yml's warn-only shared-runner policy.
+          STAGE2_PERF_HARD_GATE: ${{ runner.os == 'Linux' && '1' || '0' }}
         run: make -C src/test cluster-check
 
       - name: Upload regression diffs on failure

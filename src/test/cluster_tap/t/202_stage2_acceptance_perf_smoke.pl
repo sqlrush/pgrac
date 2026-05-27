@@ -35,6 +35,8 @@ use Time::HiRes qw(sleep time);
 my $pgbench_seconds = $ENV{STAGE2_PGBENCH_SECONDS} // 10;
 my $workload_sleep_seconds = $ENV{STAGE2_WORKLOAD_SECONDS} // 5;
 my $workload_iterations = $ENV{STAGE2_WORKLOAD_ITERATIONS} // 5;
+my $perf_hard_gate = !defined($ENV{STAGE2_PERF_HARD_GATE})
+	|| $ENV{STAGE2_PERF_HARD_GATE} !~ /^(?:0|false|off|no)$/i;
 
 # Helper: extract TPS from pgbench stdout.
 sub _pgbench_tps
@@ -124,8 +126,12 @@ SKIP: {
 	my $status = $reg_pct <= 10.0 ? 'GREEN'
 		: $reg_pct <= 30.0 ? 'YELLOW' : 'RED';
 	diag(sprintf "L1 single-node on/off regression: %.1f%% [%s] (hard gate ≤ 10%%)", $reg_pct, $status);
-	cmp_ok($reg_pct, '<=', 10.0,
-		sprintf("L1 single-node on/off hard gate ≤ 10%% (actual %.1f%%;%s)", $reg_pct, $status));
+	if ($perf_hard_gate) {
+		cmp_ok($reg_pct, '<=', 10.0,
+			sprintf("L1 single-node on/off hard gate ≤ 10%% (actual %.1f%%;%s)", $reg_pct, $status));
+	} else {
+		pass(sprintf("L1 single-node on/off perf report only (actual %.1f%%;%s)", $reg_pct, $status));
+	}
 }
 
 # L2 hard gate.
@@ -136,8 +142,12 @@ SKIP: {
 	my $status = $reg_pct <= 15.0 ? 'GREEN'
 		: $reg_pct <= 40.0 ? 'YELLOW' : 'RED';
 	diag(sprintf "L2 single-node on/off full regression: %.1f%% [%s] (hard gate ≤ 15%%)", $reg_pct, $status);
-	cmp_ok($reg_pct, '<=', 15.0,
-		sprintf("L2 single-node on/off full hard gate ≤ 15%% (actual %.1f%%;%s)", $reg_pct, $status));
+	if ($perf_hard_gate) {
+		cmp_ok($reg_pct, '<=', 15.0,
+			sprintf("L2 single-node on/off full hard gate ≤ 15%% (actual %.1f%%;%s)", $reg_pct, $status));
+	} else {
+		pass(sprintf("L2 single-node on/off full perf report only (actual %.1f%%;%s)", $reg_pct, $status));
+	}
 }
 
 # ============================================================
