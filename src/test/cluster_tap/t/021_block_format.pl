@@ -47,6 +47,13 @@ my $node = PgracClusterNode->new('main');
 $node->init;
 $node->start;
 
+my $has_visibility_inject =
+  $node->safe_psql(
+	  'postgres',
+	  q{SELECT count(*) FROM pg_cluster_shmem
+	     WHERE name = 'pgrac cluster visibility inject'}) eq '1';
+my $expected_region_count = $has_visibility_inject ? '41' : '40';
+
 
 # ----------
 # L1: pg_cluster_state.block_format category exists.
@@ -166,8 +173,8 @@ SKIP: {
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_shmem}),
-	   '39',
-	   'L10 pg_cluster_shmem returns 39 rows (spec-3.5 D5 adds subtrans state region)');
+   $expected_region_count,
+   "L10 pg_cluster_shmem returns $expected_region_count rows after spec-3.6");
 
 
 # ----------
