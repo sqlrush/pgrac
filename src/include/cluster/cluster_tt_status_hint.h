@@ -153,10 +153,11 @@ StaticAssertDecl(sizeof(ClusterTTStatusHintMsgV2) == 40,
  *
  *	V1/V2 receivers MUST NOT decode V3 — version dispatch first; they bump
  *	drop_unknown_version_count + DROP (HC187 forward-compat reject).  Origin
- *	on peer < V3 does NOT downgrade-emit V2 for SUBCOMMITTED (V2 cannot
- *	carry parent_key — silent-wrong) but skips SUBCOMMITTED emit entirely
- *	+ bumps cluster_tt_hint_v3_downgrade_count.  Remote reader cluster
- *	exact-ref miss → 53R97 fail-closed (L199;NOT PG-native fallback).
+ *	in spec-3.5 has no peer-version table, so it does not downgrade V3 to V2
+ *	(V2 cannot carry parent_key without silent-wrong).  The
+ *	cluster_tt_hint_v3_downgrade_count counter is reserved for a future
+ *	explicit mixed-version negotiation path.  Remote reader cluster exact-ref
+ *	miss → 53R97 fail-closed (L199;NOT PG-native fallback).
  */
 typedef struct ClusterTTStatusHintMsgV3 {
 	uint16 msg_version; /* offset  0, 2B; = CLUSTER_TT_STATUS_HINT_V3 */

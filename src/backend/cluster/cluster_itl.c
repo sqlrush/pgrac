@@ -620,21 +620,11 @@ cluster_itl_stamp_aborted(Buffer buf, uint8 slot_idx)
 void
 cluster_itl_check_subxact_or_error(void)
 {
-	if (!cluster_enabled || cluster_node_id < 0)
-		return;
-
 	/*
-	 * spec-3.4a N9: subxact / savepoint ITL writable path 推 spec-3.5
-	 * SUBTRANS.  The production heap AM path skips cluster ITL touch
-	 * registration for subtransactions via its relation-aware gate.  Keep
-	 * this helper as a hard caller fence for any future direct ITL writable
-	 * entry point that cannot use that gate.
+	 * Legacy spec-3.4a fence.  spec-3.5 adds SUBTRANS-aware ITL touch
+	 * range ownership, so this helper must not reject savepoints anymore.
+	 * Kept as an ABI-compatible no-op for older callsites/tests.
 	 */
-	if (GetCurrentTransactionNestLevel() > 1)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cluster ITL writable path does not support subtransactions yet"),
-				 errhint("Retry without savepoints or wait for spec-3.5 SUBTRANS support.")));
 }
 
 

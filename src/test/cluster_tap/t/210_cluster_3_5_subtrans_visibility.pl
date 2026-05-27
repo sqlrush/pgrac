@@ -122,25 +122,10 @@ my ($rc5, $out5, $err5) = $pair->node0->psql('postgres',
 	  RELEASE SAVEPOINT prep_guard;
 	  PREPARE TRANSACTION 'p_subtrans_guard';});
 
-# Either 53R9B fires (full HW1 guard working) OR the guard's
-# xact_has_state returned false (subxact didn't actually install
-# cluster overlay because L195 fast-path / no overlay capacity etc).
-# Both are acceptable smoke states;  hard assertion lives in
-# Hardening v1.0.X once the path is fully wired in production.
-if ($rc5 != 0)
-{
-	like($err5,
-		qr/53R9B|prepare_transaction_with_cluster_subtrans_state|cluster SUBTRANS state/i,
-		'L5 PREPARE TRANSACTION with savepoint raises 53R9B');
-}
-else
-{
-	# Best-effort smoke: roll back the prepared xact so we don't leak state
-	$pair->node0->safe_psql('postgres',
-		q{ROLLBACK PREPARED 'p_subtrans_guard'});
-	pass('L5 PREPARE smoke (xact_has_state false on this build — '
-		. 'Hardening v1.0.X tightens)');
-}
+isnt($rc5, 0, 'L5 PREPARE TRANSACTION with savepoint fails in peer mode');
+like($err5,
+	qr/53R9B|prepare_transaction_with_cluster_subtrans_state|cluster SUBTRANS state/i,
+	'L5 PREPARE TRANSACTION with savepoint raises 53R9B');
 
 
 # ============================================================

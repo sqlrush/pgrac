@@ -537,6 +537,13 @@ CLUSTER_TT_STATUS_COUNTER_GETTER(subcommitted_install_count)
 CLUSTER_TT_STATUS_COUNTER_GETTER(subcommitted_lookup_hit_count)
 CLUSTER_TT_STATUS_COUNTER_GETTER(parent_chain_follow_count)
 
+void
+cluster_tt_status_bump_parent_chain_follow(void)
+{
+	if (ClusterTTStatusState != NULL)
+		pg_atomic_fetch_add_u64(&ClusterTTStatusState->parent_chain_follow_count, 1);
+}
+
 #else /* !USE_PGRAC_CLUSTER */
 
 Size
@@ -632,5 +639,9 @@ CLUSTER_TT_STATUS_COUNTER_GETTER_STUB(evict_fail_count)
 CLUSTER_TT_STATUS_COUNTER_GETTER_STUB(subcommitted_install_count)
 CLUSTER_TT_STATUS_COUNTER_GETTER_STUB(subcommitted_lookup_hit_count)
 CLUSTER_TT_STATUS_COUNTER_GETTER_STUB(parent_chain_follow_count)
+
+void
+cluster_tt_status_bump_parent_chain_follow(void)
+{}
 
 #endif /* USE_PGRAC_CLUSTER */

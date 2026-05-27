@@ -43,6 +43,7 @@
  */
 #include "postgres.h"
 
+#include "access/transam.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/ipc.h"
@@ -93,7 +94,7 @@ typedef struct ClusterTTStatusHintState {
 	pg_atomic_uint64 drop_unknown_version_count;
 	pg_atomic_uint64 install_count;
 	pg_atomic_uint64 drop_v1_compat_count; /* spec-3.3 D9: 7th counter */
-	pg_atomic_uint64 v3_downgrade_count;   /* PGRAC spec-3.5 D3: V3 peer < V3 skip */
+	pg_atomic_uint64 v3_downgrade_count;   /* reserved for future mixed-version negotiation */
 } ClusterTTStatusHintState;
 
 static ClusterTTStatusHintOutboundRing *ClusterTTHintOutbound = NULL;
@@ -202,9 +203,14 @@ cluster_tt_status_hint_emit(const ClusterTTStatusKey *key, ClusterTTStatus statu
 	if (cluster_tt_status_hint_emit_mode == CLUSTER_TT_STATUS_HINT_EMIT_DISABLED)
 		return;
 
-	/* Only commit / abort propagate;  in-progress and other states are
-	 * never emitted (status range guardrail). */
-	if (status != CLUSTER_TT_STATUS_COMMITTED && status != CLUSTER_TT_STATUS_ABORTED)
+	/*
+	 * COMMITTED / ABORTED are the spec-3.2 baseline.  spec-3.4d added
+	 * lock-only ACTIVE hints, represented as IN_PROGRESS + InvalidScn;
+	 * spec-3.5 also uses that state for a SUBCOMMITTED child's parent
+	 * chain.  Other states remain local-only.
+	 */
+	if (status != CLUSTER_TT_STATUS_COMMITTED && status != CLUSTER_TT_STATUS_ABORTED
+		&& status != CLUSTER_TT_STATUS_IN_PROGRESS)
 		return;
 
 	LWLockAcquire(&ClusterTTHintOutbound->lock.lock, LW_EXCLUSIVE);
@@ -328,8 +334,9 @@ cluster_tt_status_hint_drain_outbound(void)
 		 * SUBCOMMITTED.  V1/V2 receivers will DROP V3 via
 		 * drop_unknown_version_count (HC187 forward-compat reject), which
 		 * is the correct fail-closed behaviour:  remote reader cluster
-		 * exact-ref miss → 53R97 per L199.  Operators tracking
-		 * mixed-version clusters watch v3_downgrade_count via dashboard.
+		 * exact-ref miss → 53R97 per L199.  v3_downgrade_count is reserved
+		 * for a future explicit mixed-version negotiation path; spec-3.5
+		 * has no peer-version table, so it never downgrades.
 		 */
 		if (local.has_parent_key) {
 			ClusterTTStatusHintMsgV3 msg3;
@@ -479,18 +486,17 @@ cluster_tt_status_hint_handle_envelope(const ClusterICEnvelope *env, const void 
 	}
 
 	/*
-	 * Status range.  PGRAC spec-3.5:  V3 SUBCOMMITTED is the only state
-	 * permitted in addition to V1/V2 COMMITTED/ABORTED.  All other states
-	 * (UNKNOWN / IN_PROGRESS / CLEANED_OUT) are local-only and never
-	 * propagated.
+	 * Status range.  PGRAC spec-3.5: V3 carries SUBCOMMITTED only.
+	 * V1/V2 carry terminal COMMITTED/ABORTED plus spec-3.4d lock-only
+	 * IN_PROGRESS.  UNKNOWN / CLEANED_OUT remain local-only.
 	 */
 	if (is_v3_subcommitted) {
 		if (status_raw != CLUSTER_TT_STATUS_SUBCOMMITTED) {
 			pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
 			return;
 		}
-	} else if (status_raw != CLUSTER_TT_STATUS_COMMITTED
-			   && status_raw != CLUSTER_TT_STATUS_ABORTED) {
+	} else if (status_raw != CLUSTER_TT_STATUS_COMMITTED && status_raw != CLUSTER_TT_STATUS_ABORTED
+			   && status_raw != CLUSTER_TT_STATUS_IN_PROGRESS) {
 		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
 		return;
 	}
@@ -502,8 +508,8 @@ cluster_tt_status_hint_handle_envelope(const ClusterICEnvelope *env, const void 
 	 * ABORTED has no commit_scn and must keep the field InvalidScn.
 	 *
 	 * PGRAC spec-3.5 V3 SUBCOMMITTED: commit_scn MUST be InvalidScn
-	 * (subxact not finalized).  parent_key must be non-zero (validated
-	 * by ensure_parent_binding before emit).
+	 * (subxact not finalized).  V2 IN_PROGRESS also carries InvalidScn:
+	 * it is a live parent / lock-only marker, not a commit ordering fact.
 	 */
 	if (!v1_compat && !is_v3_subcommitted) {
 		if (status_raw == CLUSTER_TT_STATUS_COMMITTED && !SCN_VALID(commit_scn)) {
@@ -511,6 +517,10 @@ cluster_tt_status_hint_handle_envelope(const ClusterICEnvelope *env, const void 
 			return;
 		}
 		if (status_raw == CLUSTER_TT_STATUS_ABORTED && SCN_VALID(commit_scn)) {
+			pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+			return;
+		}
+		if (status_raw == CLUSTER_TT_STATUS_IN_PROGRESS && SCN_VALID(commit_scn)) {
 			pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
 			return;
 		}
@@ -524,6 +534,15 @@ cluster_tt_status_hint_handle_envelope(const ClusterICEnvelope *env, const void 
 	if (flags_raw != 0 || reserved16_raw != 0 || key->_reserved != 0 || key->_reserved2 != 0) {
 		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
 		return;
+	}
+	if (is_v3_subcommitted) {
+		if (parent_key_local._reserved != 0 || parent_key_local._reserved2 != 0
+			|| parent_key_local.origin_node_id != key->origin_node_id
+			|| parent_key_local.cluster_epoch != key->cluster_epoch
+			|| !TransactionIdIsNormal(parent_key_local.local_xid)) {
+			pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+			return;
+		}
 	}
 
 	pg_atomic_fetch_add_u64(&ClusterTTHintCounters->receive_count, 1);

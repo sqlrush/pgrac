@@ -24,9 +24,11 @@
  *	    re-ReadBuffer the target page.
  *
  *	  Subxact:
- *	    spec-3.4a leaves subtransaction writes on the PG-native path at
- *	    the DML callsite, so this module never sees subxact-scoped
- *	    registers; no nested-list bookkeeping.
+ *	    spec-3.5 removes the prior GetCurrentTransactionNestLevel() gate.
+ *	    We track a stack of touch_count boundaries so aborting a child
+ *	    subtransaction stamps only its own ITL slots ABORTED and truncates
+ *	    them.  A subcommit only pops the boundary, promoting its touched
+ *	    slots to the parent range.
  *
  * Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -44,6 +46,7 @@
 #include "postgres.h"
 
 #include "access/generic_xlog.h" /* GenericXLog delta WAL (spec-3.4a D8) */
+#include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h" /* cluster_enabled */
 #include "cluster/cluster_itl.h" /* stamp_committed / stamp_aborted */
 #include "cluster/cluster_itl_touch.h"
@@ -60,6 +63,15 @@
 static ClusterItlTouchHandle *touch_list = NULL;
 static uint32 touch_count = 0;
 static uint32 touch_capacity = 0;
+
+typedef struct ClusterItlTouchSubxactBoundary {
+	SubTransactionId subid;
+	uint32 start_count;
+} ClusterItlTouchSubxactBoundary;
+
+static ClusterItlTouchSubxactBoundary *subxact_stack = NULL;
+static uint32 subxact_depth = 0;
+static uint32 subxact_capacity = 0;
 
 static bool
 itl_touch_handle_matches(const ClusterItlTouchHandle *left, const ClusterItlTouchHandle *right)
@@ -114,6 +126,80 @@ cluster_itl_touch_foreach(ClusterItlTouchCallback cb, void *arg)
 
 	for (i = 0; i < touch_count; i++)
 		cb(&touch_list[i], arg);
+}
+
+void
+cluster_itl_touch_subxact_start(SubTransactionId subid)
+{
+	MemoryContext oldcxt;
+
+	if (!cluster_enabled || cluster_node_id < 0 || !cluster_conf_has_peers())
+		return;
+
+	if (subxact_stack == NULL) {
+		Assert(TopTransactionContext != NULL);
+		oldcxt = MemoryContextSwitchTo(TopTransactionContext);
+		subxact_capacity = 8;
+		subxact_stack = (ClusterItlTouchSubxactBoundary *)palloc(
+			sizeof(ClusterItlTouchSubxactBoundary) * subxact_capacity);
+		MemoryContextSwitchTo(oldcxt);
+	} else if (subxact_depth == subxact_capacity) {
+		subxact_capacity *= 2;
+		subxact_stack = (ClusterItlTouchSubxactBoundary *)repalloc(
+			subxact_stack, sizeof(ClusterItlTouchSubxactBoundary) * subxact_capacity);
+	}
+
+	subxact_stack[subxact_depth].subid = subid;
+	subxact_stack[subxact_depth].start_count = touch_count;
+	subxact_depth++;
+}
+
+static bool
+itl_touch_pop_subxact(SubTransactionId subid, uint32 *start_count_out)
+{
+	if (start_count_out != NULL)
+		*start_count_out = touch_count;
+
+	if (subxact_depth == 0)
+		return false;
+
+	/*
+	 * PG subxacts close in strict LIFO order.  If an error path ever
+	 * reaches us out-of-order, fail soft: find the matching boundary and
+	 * drop everything above it as part of the same cleanup rather than
+	 * leaving stale child ranges to be committed by the parent.
+	 */
+	if (subxact_stack[subxact_depth - 1].subid != subid) {
+		int i;
+
+		for (i = (int)subxact_depth - 2; i >= 0; i--) {
+			if (subxact_stack[i].subid == subid) {
+				if (start_count_out != NULL)
+					*start_count_out = subxact_stack[i].start_count;
+				subxact_depth = (uint32)i;
+				return true;
+			}
+		}
+		return false;
+	}
+
+	subxact_depth--;
+	if (start_count_out != NULL)
+		*start_count_out = subxact_stack[subxact_depth].start_count;
+	return true;
+}
+
+void
+cluster_itl_touch_subxact_commit(SubTransactionId subid)
+{
+	uint32 ignored;
+
+	/*
+	 * Promote child touches to the parent by popping only the boundary.
+	 * The handles remain in touch_list and will be finalized by the parent
+	 * commit/abort or an ancestor subabort.
+	 */
+	(void)itl_touch_pop_subxact(subid, &ignored);
 }
 
 /* ---------- spec-3.4c D14 — per-page aggregate iteration ---------- */
@@ -212,6 +298,62 @@ cluster_itl_touch_foreach_per_page(ClusterItlTouchPagedCallback cb, void *arg)
 	cb(&ph, arg);
 }
 
+static void
+cluster_itl_touch_foreach_range_per_page(uint32 start, uint32 end, ClusterItlTouchPagedCallback cb,
+										 void *arg)
+{
+	uint32 i;
+	ClusterItlPagedHandle ph;
+	ClusterItlTouchHandle *base;
+	uint32 count;
+
+	Assert(cb != NULL);
+	Assert(start <= end);
+	Assert(end <= touch_count);
+
+	count = end - start;
+	if (count == 0)
+		return;
+
+	base = &touch_list[start];
+	qsort(base, count, sizeof(ClusterItlTouchHandle), itl_touch_handle_cmp);
+
+	memset(&ph, 0, sizeof(ph));
+	ph.rloc = base[0].rloc;
+	ph.forknum = base[0].forknum;
+	ph.block = base[0].block;
+	ph.nslots = 0;
+	ph.flags = 0;
+
+	for (i = 0; i < count; i++) {
+		const ClusterItlTouchHandle *h = &base[i];
+		bool same_page = (i > 0) && RelFileLocatorEquals(h->rloc, ph.rloc)
+						 && h->forknum == ph.forknum && h->block == ph.block;
+
+		if (!same_page && i > 0) {
+			cb(&ph, arg);
+			memset(&ph, 0, sizeof(ph));
+			ph.rloc = h->rloc;
+			ph.forknum = h->forknum;
+			ph.block = h->block;
+			ph.nslots = 0;
+			ph.flags = 0;
+		}
+
+		if (same_page && ph.nslots > 0 && ph.slot_indices[ph.nslots - 1] == h->slot_idx) {
+			ph.flags |= (uint8)h->flags;
+			continue;
+		}
+
+		Assert(ph.nslots < CLUSTER_ITL_INITRANS_DEFAULT);
+		Assert(h->slot_idx < CLUSTER_ITL_INITRANS_DEFAULT);
+		ph.slot_indices[ph.nslots++] = (uint8)h->slot_idx;
+		ph.flags |= (uint8)h->flags;
+	}
+
+	cb(&ph, arg);
+}
+
 void
 cluster_itl_touch_reset_at_end_xact(void)
 {
@@ -224,6 +366,9 @@ cluster_itl_touch_reset_at_end_xact(void)
 	touch_list = NULL;
 	touch_count = 0;
 	touch_capacity = 0;
+	subxact_stack = NULL;
+	subxact_depth = 0;
+	subxact_capacity = 0;
 }
 
 uint32
@@ -448,6 +593,45 @@ cluster_itl_xact_abort_finish(TransactionId xid)
 	cluster_itl_touch_reset_at_end_xact();
 }
 
+void
+cluster_itl_xact_subabort_finish(TransactionId xid, SubTransactionId subid)
+{
+	ItlFinishBatchCtx bctx;
+	uint32 start_count;
+	uint32 end_count;
+
+	(void)xid;
+
+	if (!cluster_enabled || cluster_node_id < 0)
+		return;
+	if (touch_count == 0) {
+		(void)itl_touch_pop_subxact(subid, &start_count);
+		return;
+	}
+	if (!itl_touch_pop_subxact(subid, &start_count))
+		return;
+
+	end_count = touch_count;
+	if (start_count >= end_count) {
+		touch_count = start_count;
+		return;
+	}
+
+	memset(&bctx, 0, sizeof(bctx));
+	bctx.finish.commit_scn = InvalidScn;
+	bctx.finish.is_commit = false;
+	cluster_itl_touch_foreach_range_per_page(start_count, end_count, itl_finish_page_batched,
+											 &bctx);
+	itl_finish_flush_batch(&bctx);
+
+	/*
+	 * Remove aborted child handles so a later parent commit cannot stamp
+	 * them COMMITTED.  This is the spec-3.5 SUBTRANS invariant that was
+	 * absent while spec-3.4a kept subxacts on PG-native path.
+	 */
+	touch_count = start_count;
+}
+
 #else /* !USE_PGRAC_CLUSTER */
 
 void
@@ -466,6 +650,14 @@ cluster_itl_touch_foreach_per_page(ClusterItlTouchPagedCallback cb pg_attribute_
 
 void
 cluster_itl_touch_reset_at_end_xact(void)
+{}
+
+void
+cluster_itl_touch_subxact_start(SubTransactionId subid pg_attribute_unused())
+{}
+
+void
+cluster_itl_touch_subxact_commit(SubTransactionId subid pg_attribute_unused())
 {}
 
 uint32
@@ -487,6 +679,11 @@ cluster_itl_xact_precommit_finish(TransactionId xid pg_attribute_unused(),
 
 void
 cluster_itl_xact_abort_finish(TransactionId xid pg_attribute_unused())
+{}
+
+void
+cluster_itl_xact_subabort_finish(TransactionId xid pg_attribute_unused(),
+								 SubTransactionId subid pg_attribute_unused())
 {}
 
 #endif /* USE_PGRAC_CLUSTER */

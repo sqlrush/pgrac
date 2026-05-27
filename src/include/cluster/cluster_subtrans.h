@@ -95,7 +95,7 @@ extern bool cluster_subtrans_emit_subabort(TransactionId child_xid);
  *	  CLUSTER_TT_STATUS_UNKNOWN + result.authoritative=false (caller
  *	  raises 53R97 fail-closed per L199).
  *
- *	  Bumps cluster_subtrans_parent_chain_follow_count per recurse +
+ *	  Bumps cluster_tt_status_parent_chain_follow_count per recurse +
  *	  cluster_subtrans_chain_depth_exceeded_count if depth bound hit.
  *
  *	  Pure / no syscall / no wait (L177 hot path).

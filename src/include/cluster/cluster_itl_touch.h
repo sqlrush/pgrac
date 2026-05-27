@@ -27,10 +27,13 @@
  *	  anyway, but explicit reset prevents stale state across nested
  *	  recovery / parallel-worker dispatch).
  *
- *	  Subtransactions: spec-3.4a leaves nested writes on the PG-native
- *	  path at the DML callsite when `GetCurrentTransactionNestLevel() > 1`;
- *	  this header therefore makes no provisions for subxact-scoped list
- *	  nesting.  Full SUBTRANS support is deferred to spec-3.5.
+ *	  Subtransactions: spec-3.5 removes the nested-write barrier.  This
+ *	  module therefore records a per-subxact touch_count boundary at
+ *	  StartSubTransaction.  CommitSubTransaction promotes the range to the
+ *	  parent by popping only the boundary; AbortSubTransaction stamps just
+ *	  the range [start_count, touch_count) ABORTED and truncates it before
+ *	  the subxact abort record is written.  Without this, a later parent
+ *	  commit would incorrectly stamp an aborted child ITL slot COMMITTED.
  *
  * Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -102,10 +105,21 @@ StaticAssertDecl(offsetof(ClusterItlTouchHandle, flags) == 22, "spec-3.4a D1 —
  *	held off; that is still normal backend context, not an async signal
  *	handler.
  *
- *	Subtransactions: callers must have already skipped the cluster ITL
- *	write path when GetCurrentTransactionNestLevel() > 1 (spec-3.4a N9).
+ *	Subtransactions: spec-3.5 callers may register from a subxact; the
+ *	subxact start/commit/abort APIs below maintain the range ownership.
  */
 extern void cluster_itl_touch_register(const ClusterItlTouchHandle *handle);
+
+/*
+ * spec-3.5 hardening: subxact range ownership for touched ITL slots.
+ *
+ * StartSubTransaction records the current touch_count as the subxact range
+ * start.  CommitSubTransaction promotes the range to the parent by popping
+ * the boundary only.  AbortSubTransaction stamps and truncates the current
+ * subxact range through cluster_itl_xact_subabort_finish().
+ */
+extern void cluster_itl_touch_subxact_start(SubTransactionId subid);
+extern void cluster_itl_touch_subxact_commit(SubTransactionId subid);
 
 /*
  * cluster_itl_touch_foreach -- iterate registered handles in insertion
@@ -198,5 +212,6 @@ extern bool cluster_itl_touch_has_pending(void);
  */
 extern void cluster_itl_xact_precommit_finish(TransactionId xid, SCN commit_scn);
 extern void cluster_itl_xact_abort_finish(TransactionId xid);
+extern void cluster_itl_xact_subabort_finish(TransactionId xid, SubTransactionId subid);
 
 #endif /* CLUSTER_ITL_TOUCH_H */

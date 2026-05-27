@@ -299,5 +299,6 @@ extern bool cluster_tt_status_install_subcommitted(const ClusterTTStatusKey *chi
 extern uint64 cluster_tt_status_get_subcommitted_install_count(void);
 extern uint64 cluster_tt_status_get_subcommitted_lookup_hit_count(void);
 extern uint64 cluster_tt_status_get_parent_chain_follow_count(void);
+extern void cluster_tt_status_bump_parent_chain_follow(void);
 
 #endif /* CLUSTER_TT_STATUS_H */

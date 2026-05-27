@@ -41,6 +41,7 @@
 #include "port/atomics.h"
 #include "storage/ipc.h"
 #include "storage/shmem.h"
+#include "utils/memutils.h"
 
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
@@ -121,10 +122,12 @@ cluster_tt_local_shmem_register(void)
 /* ------------------------------------------------------------ */
 
 /*
- * Backend-local binding state.  Lives in static module storage so it
- * survives across DML statements within the same xact but is wiped on
- * end-of-xact via cluster_tt_local_reset_binding().  Postmaster restart
- * clears shmem TT slot state and any next backend starts fresh.
+ * Backend-local binding state.  spec-3.4b needed a single binding because
+ * subxacts were still gated off.  spec-3.5 can have parent + child xids
+ * live at the same time, so keep a small backend-local binding table and
+ * free all entries at top-level xact end via cluster_tt_local_reset_binding().
+ * Postmaster restart clears shmem TT slot state and any next backend starts
+ * fresh.
  *
  * F11 key invariant: every ITL slot stamped by this xact (D5) AND the
  * commit / abort install_status call (this file) MUST produce the same
@@ -143,7 +146,46 @@ typedef struct ClusterTTLocalBinding {
 	uint32 cluster_epoch; /* snapshot at bind time */
 } ClusterTTLocalBinding;
 
-static ClusterTTLocalBinding cluster_tt_local_binding = { InvalidTransactionId, 0, 0, 0, 0 };
+static ClusterTTLocalBinding *cluster_tt_local_bindings = NULL;
+static uint32 cluster_tt_local_binding_count = 0;
+static uint32 cluster_tt_local_binding_capacity = 0;
+
+static int
+cluster_tt_local_find_binding(TransactionId xid)
+{
+	uint32 i;
+
+	for (i = 0; i < cluster_tt_local_binding_count; i++) {
+		if (cluster_tt_local_bindings[i].top_xid == xid)
+			return (int)i;
+	}
+	return -1;
+}
+
+static ClusterTTLocalBinding *
+cluster_tt_local_append_binding(void)
+{
+	MemoryContext oldcxt;
+
+	if (cluster_tt_local_bindings == NULL) {
+		Assert(TopTransactionContext != NULL);
+		oldcxt = MemoryContextSwitchTo(TopTransactionContext);
+		cluster_tt_local_binding_capacity = 8;
+		cluster_tt_local_bindings = (ClusterTTLocalBinding *)palloc0(
+			sizeof(ClusterTTLocalBinding) * cluster_tt_local_binding_capacity);
+		MemoryContextSwitchTo(oldcxt);
+	} else if (cluster_tt_local_binding_count == cluster_tt_local_binding_capacity) {
+		cluster_tt_local_binding_capacity *= 2;
+		cluster_tt_local_bindings = (ClusterTTLocalBinding *)repalloc(
+			cluster_tt_local_bindings,
+			sizeof(ClusterTTLocalBinding) * cluster_tt_local_binding_capacity);
+	}
+
+	memset(&cluster_tt_local_bindings[cluster_tt_local_binding_count], 0,
+		   sizeof(ClusterTTLocalBinding));
+	cluster_tt_local_bindings[cluster_tt_local_binding_count].top_xid = InvalidTransactionId;
+	return &cluster_tt_local_bindings[cluster_tt_local_binding_count++];
+}
 
 
 /*
@@ -175,50 +217,45 @@ cluster_tt_local_get_or_create_binding(TransactionId top_xid, uint32 *out_segmen
 	if (!TransactionIdIsNormal(top_xid))
 		return false;
 
-	if (cluster_tt_local_binding.top_xid == top_xid) {
-		/* Idempotent reuse. */
-		*out_segment_id = cluster_tt_local_binding.segment_id;
-		*out_slot_offset = cluster_tt_local_binding.slot_offset;
-		*out_tt_slot_id = cluster_tt_slot_offset_to_id(cluster_tt_local_binding.slot_offset);
-		return true;
+	{
+		int idx = cluster_tt_local_find_binding(top_xid);
+
+		if (idx >= 0) {
+			ClusterTTLocalBinding *b = &cluster_tt_local_bindings[idx];
+
+			/* Idempotent reuse. */
+			*out_segment_id = b->segment_id;
+			*out_slot_offset = b->slot_offset;
+			*out_tt_slot_id = cluster_tt_slot_offset_to_id(b->slot_offset);
+			return true;
+		}
 	}
 
-	if (TransactionIdIsValid(cluster_tt_local_binding.top_xid)) {
-		/*
-		 * Stale binding from a prior xact that did not call reset
-		 * (should not happen in production -- xact.c always calls
-		 * record_commit/abort -> reset on commit/abort).  Best-effort
-		 * cleanup: free the orphaned slot then re-allocate.
-		 */
-		elog(WARNING,
-			 "cluster_tt_local: stale binding for xid %u while allocating for xid %u; "
-			 "freeing orphan",
-			 cluster_tt_local_binding.top_xid, top_xid);
-		cluster_tt_slot_free(cluster_tt_local_binding.segment_id,
-							 cluster_tt_local_binding.slot_offset);
-		cluster_tt_local_binding.top_xid = InvalidTransactionId;
-	}
+	{
+		ClusterTTLocalBinding *b;
 
-	seg = cluster_undo_active_segment_for_node_or_create(cluster_node_id);
-	off = cluster_tt_slot_alloc(seg, top_xid);
-	if (off == INVALID_TT_SLOT_OFFSET)
-		ereport(ERROR,
+		seg = cluster_undo_active_segment_for_node_or_create(cluster_node_id);
+		off = cluster_tt_slot_alloc(seg, top_xid);
+		if (off == INVALID_TT_SLOT_OFFSET)
+			ereport(
+				ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("cluster TT slot allocator exhausted on segment %u (48 slots full)", seg),
 				 errhint("All concurrent xacts on this node hold ACTIVE slots; retry after "
 						 "shorter transactions commit or abort.")));
 
-	cluster_tt_local_binding.top_xid = top_xid;
-	cluster_tt_local_binding.segment_id = seg;
-	cluster_tt_local_binding.slot_offset = off;
-	cluster_tt_local_binding.cluster_epoch = (uint32)cluster_epoch_get_current();
+		b = cluster_tt_local_append_binding();
+		b->top_xid = top_xid;
+		b->segment_id = seg;
+		b->slot_offset = off;
+		b->cluster_epoch = (uint32)cluster_epoch_get_current();
 
-	*out_segment_id = seg;
-	*out_slot_offset = off;
-	*out_tt_slot_id = cluster_tt_slot_offset_to_id(off);
-	return true;
+		*out_segment_id = seg;
+		*out_slot_offset = off;
+		*out_tt_slot_id = cluster_tt_slot_offset_to_id(off);
+		return true;
+	}
 }
-
 
 /*
  * cluster_tt_local_peek_binding
@@ -232,44 +269,52 @@ cluster_tt_local_peek_binding(TransactionId top_xid, uint32 *out_segment_id,
 							  uint16 *out_slot_offset, uint32 *out_tt_slot_id,
 							  uint32 *out_cluster_epoch)
 {
-	if (cluster_tt_local_binding.top_xid != top_xid || !TransactionIdIsValid(top_xid))
+	int idx;
+	ClusterTTLocalBinding *b;
+
+	idx = cluster_tt_local_find_binding(top_xid);
+	if (idx < 0 || !TransactionIdIsValid(top_xid))
 		return false;
 
-	*out_segment_id = cluster_tt_local_binding.segment_id;
-	*out_slot_offset = cluster_tt_local_binding.slot_offset;
-	*out_tt_slot_id = cluster_tt_slot_offset_to_id(cluster_tt_local_binding.slot_offset);
-	*out_cluster_epoch = cluster_tt_local_binding.cluster_epoch;
+	b = &cluster_tt_local_bindings[idx];
+	*out_segment_id = b->segment_id;
+	*out_slot_offset = b->slot_offset;
+	*out_tt_slot_id = cluster_tt_slot_offset_to_id(b->slot_offset);
+	*out_cluster_epoch = b->cluster_epoch;
 	return true;
 }
 
 bool
 cluster_tt_local_has_binding(TransactionId top_xid)
 {
-	return cluster_tt_local_binding.top_xid == top_xid && TransactionIdIsValid(top_xid);
+	return TransactionIdIsValid(top_xid) && cluster_tt_local_find_binding(top_xid) >= 0;
 }
-
 
 /*
  * cluster_tt_local_reset_binding
  *
- *	Free the TT slot and clear the binding.  Idempotent.  Called from
- *	record_commit / record_abort after install_status fires, and as a
- *	safety net from XactCallback in case those paths are skipped.
+ *	Free every backend-local TT slot binding and clear the table.
+ *	Idempotent.  Called from record_commit / record_abort after the final
+ *	status for the top xid is installed.  Child/subxact bindings are freed
+ *	here too; their overlay entries already carry exact keys and remain
+ *	valid because local_xid is part of ClusterTTStatusKey.
  */
 void
 cluster_tt_local_reset_binding(void)
 {
-	if (!TransactionIdIsValid(cluster_tt_local_binding.top_xid))
-		return;
+	uint32 i;
 
-	cluster_tt_slot_free(cluster_tt_local_binding.segment_id, cluster_tt_local_binding.slot_offset);
+	for (i = 0; i < cluster_tt_local_binding_count; i++) {
+		if (!TransactionIdIsValid(cluster_tt_local_bindings[i].top_xid))
+			continue;
+		cluster_tt_slot_free(cluster_tt_local_bindings[i].segment_id,
+							 cluster_tt_local_bindings[i].slot_offset);
+	}
 
-	cluster_tt_local_binding.top_xid = InvalidTransactionId;
-	cluster_tt_local_binding.segment_id = 0;
-	cluster_tt_local_binding.slot_offset = 0;
-	cluster_tt_local_binding.cluster_epoch = 0;
+	cluster_tt_local_bindings = NULL;
+	cluster_tt_local_binding_count = 0;
+	cluster_tt_local_binding_capacity = 0;
 }
-
 
 /*
  * build_local_key -- compose ClusterTTStatusKey for `xid`.

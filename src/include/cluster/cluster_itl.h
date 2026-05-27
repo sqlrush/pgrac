@@ -146,9 +146,9 @@ extern bool cluster_itl_find_lock_tt_ref_by_xmax(Page page, TransactionId raw_xm
  *	NOTE: This function does NOT write the page.  Stamping happens via
  *	cluster_itl_stamp_active() inside the critical section.
  *
- *	Subxact: spec-3.4a fails closed at the callsite when
- *	GetCurrentTransactionNestLevel() > 1; callers must check that
- *	before invoking this helper.
+ *	Subxact: spec-3.5 owns per-subxact touch ranges, so callers may invoke
+ *	this helper from savepoint scopes as long as they use
+ *	cluster_itl_touch_register() for xact-end finalization.
  */
 extern bool cluster_itl_alloc_or_reuse_slot(Buffer buf, TransactionId top_xid, uint8 *out_slot_idx);
 
@@ -230,13 +230,11 @@ extern void cluster_itl_stamp_aborted(Buffer buf, uint8 slot_idx);
 /*
  * cluster_itl_check_subxact_or_error -- legacy spec-3.4a N9 caller fence.
  *
- *	The production heap AM path now uses a relation-aware ITL gate and
- *	skips cluster ITL registration for subtransactions, preserving
- *	PG-native savepoint behaviour until spec-3.5 SUBTRANS.  This helper is
- *	kept as a hard caller fence for any future direct ITL writable entry
- *	point that cannot use that relation-aware gate.
+ *	spec-3.5 adds SUBTRANS-aware touch range ownership, so the former hard
+ *	savepoint fence is now an ABI-compatible no-op.  Keep the symbol to
+ *	avoid breaking older static tests / direct helper callers.
  *
- *	No-op if cluster_enabled is false.
+ *	Always no-op.
  */
 extern void cluster_itl_check_subxact_or_error(void);
 

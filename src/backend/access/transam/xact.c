@@ -1925,22 +1925,34 @@ RecordTransactionAbort(bool isSubXact)
 	 * (ParseAbortRecord is an independent parser at xactdesc.c:142).
 	 */
 #ifdef USE_PGRAC_CLUSTER
-	if (!isSubXact && cluster_conf_has_peers())
+	if (cluster_conf_has_peers())
 	{
-		abort_scn = cluster_scn_advance_for_abort();
+		if (!isSubXact)
+		{
+			abort_scn = cluster_scn_advance_for_abort();
 
-		/*
-		 * PGRAC (spec-3.4a D6): stamp every touched ITL slot ABORTED
-		 * BEFORE the abort XLOG record is written.  Mirrors the commit
-		 * path; explicit hook (not RegisterXactCallback) so ITL state
-		 * is durable before the abort record is replayed.  No-op when
-		 * the touched list is empty.  Subxact abort intentionally NOT
-		 * routed here: spec-3.4a fails closed at the DML callsite when
-		 * GetCurrentTransactionNestLevel() > 1, so a subxact never
-		 * populates the top-level list.
-		 */
-		if (cluster_itl_touch_has_pending())
-			cluster_itl_xact_abort_finish(xid);
+			/*
+			 * PGRAC (spec-3.4a D6): stamp every touched ITL slot ABORTED
+			 * BEFORE the abort XLOG record is written.  Mirrors the commit
+			 * path; explicit hook (not RegisterXactCallback) so ITL state
+			 * is durable before the abort record is replayed.  No-op when
+			 * the touched list is empty.
+			 */
+			if (cluster_itl_touch_has_pending())
+				cluster_itl_xact_abort_finish(xid);
+		}
+		else
+		{
+			/*
+			 * PGRAC spec-3.5 hardening: subxact DML now stamps ITL slots.
+			 * Abort only the current subxact range and truncate it so a
+			 * later parent commit cannot stamp aborted child slots
+			 * COMMITTED.  Subxact abort keeps abort_scn InvalidScn per
+			 * spec-1.16 Q4.
+			 */
+			if (cluster_itl_touch_has_pending())
+				cluster_itl_xact_subabort_finish(xid, CurrentTransactionState->subTransactionId);
+		}
 	}
 #endif
 
@@ -5225,6 +5237,16 @@ StartSubTransaction(void)
 
 	s->state = TRANS_INPROGRESS;
 
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC spec-3.5 hardening: mark the current touch_count as this
+	 * subxact's ITL ownership boundary.  Subcommit promotes the range to
+	 * the parent; subabort stamps/truncates only this range before the
+	 * abort record is written.
+	 */
+	cluster_itl_touch_subxact_start(s->subTransactionId);
+#endif
+
 	/*
 	 * Call start-of-subxact callbacks
 	 */
@@ -5290,6 +5312,7 @@ CommitSubTransaction(void)
 
 		(void) cluster_subtrans_emit_subcommit(child_xid, parent_xid);
 	}
+	cluster_itl_touch_subxact_commit(s->subTransactionId);
 #endif
 
 	/*

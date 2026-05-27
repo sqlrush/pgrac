@@ -164,11 +164,12 @@ cluster_subtrans_ensure_parent_binding(TransactionId parent_xid, ClusterTTStatus
 
 	/*
 	 * Install parent as IN_PROGRESS in the local overlay (HC203).  This
-	 * makes sure remote readers performing lazy follow find an overlay
-	 * entry rather than missing through to 53R97 prematurely.  Idempotent:
+	 * makes sure readers performing lazy follow find an overlay entry
+	 * rather than missing through to 53R97 prematurely.  Idempotent:
 	 * install_local overwrites existing entry without bumping eviction.
 	 */
 	cluster_tt_status_install_local(&key, CLUSTER_TT_STATUS_IN_PROGRESS, InvalidScn);
+	cluster_tt_status_hint_emit(&key, CLUSTER_TT_STATUS_IN_PROGRESS, InvalidScn);
 
 	*parent_key_out = key;
 	return true;
@@ -263,8 +264,7 @@ cluster_subtrans_lookup_parent(const ClusterTTStatusResult *child_result, int de
 			return cur;
 		}
 
-		if (ClusterSubtransState != NULL)
-			pg_atomic_fetch_add_u64(&ClusterSubtransState->chain_depth_exceeded_count, 0);
+		cluster_tt_status_bump_parent_chain_follow();
 
 		if (parent_res.status != CLUSTER_TT_STATUS_SUBCOMMITTED)
 			return parent_res;
