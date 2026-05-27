@@ -1687,8 +1687,8 @@ cluster_init_guc(void)
 							gettext_noop("V4 sidecar outbound queue slot count (spec-3.6 D4)."),
 							gettext_noop("Each slot reserves 4120B (header 24 + 256 × 16).  "
 										 "Default 1024 ≈ 4.1 MiB shmem.  PGC_POSTMASTER."),
-							&cluster_multixact_hint_outbound_slots, 1024, 128, 8192,
-							PGC_POSTMASTER, 0, NULL, NULL, NULL);
+							&cluster_multixact_hint_outbound_slots, 1024, 128, 8192, PGC_POSTMASTER,
+							0, NULL, NULL, NULL);
 
 	/*
 	 * spec-3.2 D7:  cross-node TT status hint wire GUCs.
