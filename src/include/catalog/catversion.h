@@ -540,7 +540,22 @@
  * - CLUSTER_TT_STATUS_SUBCOMMITTED = 5 enum value
  * - cluster.subtrans_max_chain_depth NEW GUC
  */
-#define CATALOG_VERSION_NO 202605520
+/*
+ * 202605530 = 2026-05-27 spec-3.6 v0.3:
+ * - NEW SQLSTATE 53R9C (cluster_multixact_member_overlay_miss)
+ * - 3 NEW GUC (cluster.multixact_member_overlay_max_members /
+ *   cluster.multixact_member_overlay_max_entries /
+ *   cluster.multixact_hint_outbound_slots)
+ * - V4 sidecar wire variant (TT_STATUS_HINT msg_version=4;
+ *   non-progressive — L204 NEW lesson family)
+ * - NEW page-format ITL flag ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI = 8
+ *   (lock-only ITL slot whose xid field stores MultiXactId for
+ *   reader cluster origin marker;  spec-3.6 D7b)
+ * - NEW shmem regions:  cluster_multixact_member_overlay HTAB +
+ *   ClusterMultiXactHintOutboundRing fixed-size queue (~4.1 MiB
+ *   default with 1024 slots)
+ */
+#define CATALOG_VERSION_NO 202605530
 
 /* spec-2.39 D10 (2026-05-21):  SI Broadcaster production activation —
  * DDL commit hook (AtEOXact_Inval + COMMIT PREPARED via cluster-aware
