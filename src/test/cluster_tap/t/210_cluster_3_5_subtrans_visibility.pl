@@ -162,14 +162,15 @@ else
 # ============================================================
 # L7: counter accessors linkable via SQL UDF (compile-time symbol check)
 # ============================================================
-my $cnt_l7 = $pair->node0->safe_psql('postgres', q{
-	SELECT cluster_subtrans_chain_depth_exceeded_count(),
-	       cluster_subtrans_xact_has_state_check_count()
-}) or undef;
-
-if (defined $cnt_l7 && $cnt_l7 ne '')
+if (has_func($pair->node0, 'cluster_subtrans_chain_depth_exceeded_count')
+	&& has_func($pair->node0, 'cluster_subtrans_xact_has_state_check_count'))
 {
-	ok(1, 'L7 cluster_subtrans counter SQL UDFs link + return values');
+	my $cnt_l7 = $pair->node0->safe_psql('postgres', q{
+		SELECT cluster_subtrans_chain_depth_exceeded_count(),
+		       cluster_subtrans_xact_has_state_check_count()
+	});
+	ok(defined $cnt_l7 && $cnt_l7 ne '',
+		'L7 cluster_subtrans counter SQL UDFs link + return values');
 }
 else
 {
