@@ -34,7 +34,7 @@
 #include "access/xact.h"		 /* GetCurrentTransactionNestLevel (spec-3.4a N9) */
 #include "storage/bufmgr.h"		 /* BufferGetPage, MarkBufferDirty (spec-3.4a D2) */
 #include "storage/bufpage.h"
-#include "access/multixact.h" /* MultiXactId / MultiXactIdIsValid */
+#include "access/multixact.h"	   /* MultiXactId / MultiXactIdIsValid */
 #include "cluster/cluster_epoch.h" /* cluster_epoch_get_current (spec-3.4b D7) */
 #include "cluster/cluster_guc.h"   /* cluster_enabled */
 #include "cluster/cluster_itl.h"
@@ -568,13 +568,12 @@ cluster_itl_find_multixact_origin_by_xmax(Page page, MultiXactId multixact_id,
 		return false;
 
 	slots = ClusterPageGetItlSlots(page);
-	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
-	{
+	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
 		const ClusterItlSlotData *slot = &slots[i];
 
 		if (slot->flags != ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI)
 			continue;
-		if ((MultiXactId) slot->xid != multixact_id)
+		if ((MultiXactId)slot->xid != multixact_id)
 			continue;
 
 		/*
@@ -582,7 +581,7 @@ cluster_itl_find_multixact_origin_by_xmax(Page page, MultiXactId multixact_id,
 		 * reader, so origin is the current node.  Stage 4+ shared-heap
 		 * needs marker slot to encode origin via UBA / extra field.
 		 */
-		*origin_node_id = (uint16) cluster_node_id;
+		*origin_node_id = (uint16)cluster_node_id;
 		return true;
 	}
 	return false;
@@ -615,22 +614,20 @@ cluster_itl_stamp_multixact_marker(Buffer buf, MultiXactId multixact_id)
 		return CLUSTER_ITL_SLOT_UNALLOCATED;
 
 	slots = ClusterPageGetItlSlots(page);
-	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
-	{
+	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
 		if (slots[i].flags == ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI
-			&& (MultiXactId) slots[i].xid == multixact_id)
-		{
-			found_idx = (int) i;
+			&& (MultiXactId)slots[i].xid == multixact_id) {
+			found_idx = (int)i;
 			break;
 		}
 		if (slots[i].flags == ITL_FLAG_FREE && free_idx < 0)
-			free_idx = (int) i;
+			free_idx = (int)i;
 		else if (cluster_itl_slot_is_completed_reusable(slots[i].flags) && reusable_idx < 0)
-			reusable_idx = (int) i;
+			reusable_idx = (int)i;
 	}
 
 	if (found_idx >= 0)
-		return (uint8) found_idx; /* already stamped */
+		return (uint8)found_idx; /* already stamped */
 
 	{
 		int idx = (free_idx >= 0) ? free_idx : reusable_idx;
@@ -642,14 +639,14 @@ cluster_itl_stamp_multixact_marker(Buffer buf, MultiXactId multixact_id)
 		slot = &slots[idx];
 		if (slot->flags != ITL_FLAG_FREE)
 			slot->wrap++;
-		slot->xid = (TransactionId) multixact_id; /* repurposed as MultiXactId */
+		slot->xid = (TransactionId)multixact_id; /* repurposed as MultiXactId */
 		slot->flags = ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI;
 		slot->commit_scn = InvalidScn;
 		slot->write_scn = InvalidScn;
 		memset(&slot->undo_segment_head, 0, sizeof(slot->undo_segment_head));
 
 		MarkBufferDirty(buf);
-		return (uint8) idx;
+		return (uint8)idx;
 	}
 }
 

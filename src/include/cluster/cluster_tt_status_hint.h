@@ -267,13 +267,12 @@ extern uint64 cluster_tt_status_hint_get_v3_downgrade_count(void);
  */
 #include "cluster/cluster_multixact.h" /* ClusterMultiXactKey + ClusterMultiXactMember */
 
-typedef struct ClusterTTStatusHintMsgV4Header
-{
-	uint16 msg_version;		   /* offset  0, 2B = 4 */
-	uint16 payload_kind;	   /* offset  2, 2B = 1 for "multixact overlay" */
-	uint16 flags;			   /* offset  4, 2B zero */
-	uint16 member_count;	   /* offset  6, 2B per-message member count */
-	ClusterMultiXactKey key;   /* offset  8, 16B identity */
+typedef struct ClusterTTStatusHintMsgV4Header {
+	uint16 msg_version;		 /* offset  0, 2B = 4 */
+	uint16 payload_kind;	 /* offset  2, 2B = 1 for "multixact overlay" */
+	uint16 flags;			 /* offset  4, 2B zero */
+	uint16 member_count;	 /* offset  6, 2B per-message member count */
+	ClusterMultiXactKey key; /* offset  8, 16B identity */
 	/* offset 24:  ClusterMultiXactMember members[member_count] (variable) */
 } ClusterTTStatusHintMsgV4Header;
 
@@ -281,8 +280,7 @@ StaticAssertDecl(offsetof(ClusterTTStatusHintMsgV4Header, msg_version) == 0,
 				 "V4 msg_version offset 0 (L203 family)");
 StaticAssertDecl(offsetof(ClusterTTStatusHintMsgV4Header, key) == 8,
 				 "V4 key offset 8 (HC208 wire ABI lock)");
-StaticAssertDecl(sizeof(ClusterTTStatusHintMsgV4Header) == 24,
-				 "V4 header 24B wire-stable (HC208)");
+StaticAssertDecl(sizeof(ClusterTTStatusHintMsgV4Header) == 24, "V4 header 24B wire-stable (HC208)");
 
 /*
  * Fixed-size sidecar queue entry for LMON-mediated outbound V4.
@@ -291,8 +289,7 @@ StaticAssertDecl(sizeof(ClusterTTStatusHintMsgV4Header) == 24,
  */
 #define CLUSTER_MULTIXACT_HINT_MAX_MEMBERS 256
 
-typedef struct ClusterMultiXactHintOutboundEntry
-{
+typedef struct ClusterMultiXactHintOutboundEntry {
 	ClusterTTStatusHintMsgV4Header header; /* 24B */
 	ClusterMultiXactMember members[CLUSTER_MULTIXACT_HINT_MAX_MEMBERS];
 } ClusterMultiXactHintOutboundEntry;

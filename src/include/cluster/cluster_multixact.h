@@ -72,13 +72,12 @@
  *   offset  8, 4B : cluster_epoch
  *   offset 12, 4B : _reserved (zero on emit;future wrap bits)
  */
-typedef struct ClusterMultiXactKey
-{
-	uint16		origin_node_id;
-	uint16		_pad16;
+typedef struct ClusterMultiXactKey {
+	uint16 origin_node_id;
+	uint16 _pad16;
 	MultiXactId multixact_id;
-	uint32		cluster_epoch;
-	uint32		_reserved;
+	uint32 cluster_epoch;
+	uint32 _reserved;
 } ClusterMultiXactKey;
 
 StaticAssertDecl(sizeof(ClusterMultiXactKey) == 16,
@@ -100,14 +99,13 @@ StaticAssertDecl(sizeof(ClusterMultiXactKey) == 16,
  *   offset  8, 4B : epoch
  *   offset 12, 4B : _reserved2 (zero on emit)
  */
-typedef struct ClusterMultiXactMember
-{
+typedef struct ClusterMultiXactMember {
 	TransactionId xid;
-	uint8		status;
-	uint8		_pad8;
-	uint16		origin_node_id;
-	uint32		epoch;
-	uint32		_reserved2;
+	uint8 status;
+	uint8 _pad8;
+	uint16 origin_node_id;
+	uint32 epoch;
+	uint32 _reserved2;
 } ClusterMultiXactMember;
 
 StaticAssertDecl(sizeof(ClusterMultiXactMember) == 16,
@@ -121,11 +119,10 @@ StaticAssertDecl(sizeof(ClusterMultiXactMember) == 16,
  * writes member_count + members[].  If buffer too small returns false +
  * member_count set to actual needed length.
  */
-typedef struct ClusterMultiXactMemberOverlayResult
-{
-	bool		authoritative;
-	uint16		member_count;
-	uint16		_pad16;
+typedef struct ClusterMultiXactMemberOverlayResult {
+	bool authoritative;
+	uint16 member_count;
+	uint16 _pad16;
 	TimestampTz generation_ts;
 	ClusterMultiXactMember members[FLEXIBLE_ARRAY_MEMBER];
 } ClusterMultiXactMemberOverlayResult;

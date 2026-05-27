@@ -53,17 +53,15 @@
  */
 #define CLUSTER_MULTIXACT_MAX_MEMBERS 256
 
-typedef struct ClusterMultiXactOverlayEntry
-{
+typedef struct ClusterMultiXactOverlayEntry {
 	ClusterMultiXactKey key;
-	uint16		member_count;
-	uint16		_pad16;
+	uint16 member_count;
+	uint16 _pad16;
 	TimestampTz generation_ts;
 	ClusterMultiXactMember members[CLUSTER_MULTIXACT_MAX_MEMBERS];
 } ClusterMultiXactOverlayEntry;
 
-typedef struct ClusterMultiXactShmem
-{
+typedef struct ClusterMultiXactShmem {
 	pg_atomic_uint64 overlay_install_count;
 	pg_atomic_uint64 overlay_lookup_hit_count;
 	pg_atomic_uint64 overlay_miss_count;
@@ -106,8 +104,7 @@ cluster_multixact_shmem_init(void)
 
 	ClusterMultiXactState = (ClusterMultiXactShmem *)ShmemInitStruct(
 		"ClusterMultiXactState", MAXALIGN(sizeof(ClusterMultiXactShmem)), &found);
-	if (!found)
-	{
+	if (!found) {
 		pg_atomic_init_u64(&ClusterMultiXactState->overlay_install_count, 0);
 		pg_atomic_init_u64(&ClusterMultiXactState->overlay_lookup_hit_count, 0);
 		pg_atomic_init_u64(&ClusterMultiXactState->overlay_miss_count, 0);
@@ -125,10 +122,9 @@ cluster_multixact_shmem_init(void)
 	info.keysize = sizeof(ClusterMultiXactKey);
 	info.entrysize = sizeof(ClusterMultiXactOverlayEntry);
 	info.num_partitions = 1;
-	ClusterMultiXactHTAB
-		= ShmemInitHash("ClusterMultiXactOverlay", cluster_multixact_member_overlay_max_entries,
-						cluster_multixact_member_overlay_max_entries, &info,
-						HASH_ELEM | HASH_BLOBS);
+	ClusterMultiXactHTAB = ShmemInitHash(
+		"ClusterMultiXactOverlay", cluster_multixact_member_overlay_max_entries,
+		cluster_multixact_member_overlay_max_entries, &info, HASH_ELEM | HASH_BLOBS);
 }
 
 static const ClusterShmemRegion cluster_multixact_region = {
@@ -160,9 +156,8 @@ cluster_multixact_member_overlay_install(const ClusterMultiXactKey *key, uint16 
 	if (key == NULL || members == NULL || ClusterMultiXactHTAB == NULL)
 		return false;
 
-	if (member_count == 0 || member_count > cluster_multixact_member_overlay_max_members ||
-		member_count > CLUSTER_MULTIXACT_MAX_MEMBERS)
-	{
+	if (member_count == 0 || member_count > cluster_multixact_member_overlay_max_members
+		|| member_count > CLUSTER_MULTIXACT_MAX_MEMBERS) {
 		if (ClusterMultiXactState != NULL)
 			pg_atomic_fetch_add_u64(&ClusterMultiXactState->overlay_overflow_count, 1);
 		return false;
@@ -171,8 +166,7 @@ cluster_multixact_member_overlay_install(const ClusterMultiXactKey *key, uint16 
 	LWLockAcquire(ClusterMultiXactLock, LW_EXCLUSIVE);
 	e = (ClusterMultiXactOverlayEntry *)hash_search(ClusterMultiXactHTAB, key, HASH_ENTER_NULL,
 													&found);
-	if (e == NULL)
-	{
+	if (e == NULL) {
 		LWLockRelease(ClusterMultiXactLock);
 		pg_atomic_fetch_add_u64(&ClusterMultiXactState->overlay_overflow_count, 1);
 		ereport(WARNING, (errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
@@ -209,8 +203,7 @@ cluster_multixact_member_overlay_lookup(const ClusterMultiXactKey *key,
 	out->generation_ts = 0;
 
 	current_epoch = (uint32)cluster_epoch_get_current();
-	if (key->cluster_epoch != current_epoch)
-	{
+	if (key->cluster_epoch != current_epoch) {
 		pg_atomic_fetch_add_u64(&ClusterMultiXactState->overlay_miss_count, 1);
 		return false;
 	}
@@ -218,15 +211,13 @@ cluster_multixact_member_overlay_lookup(const ClusterMultiXactKey *key,
 	LWLockAcquire(ClusterMultiXactLock, LW_SHARED);
 	e = (const ClusterMultiXactOverlayEntry *)hash_search(ClusterMultiXactHTAB, key, HASH_FIND,
 														  NULL);
-	if (e == NULL)
-	{
+	if (e == NULL) {
 		LWLockRelease(ClusterMultiXactLock);
 		pg_atomic_fetch_add_u64(&ClusterMultiXactState->overlay_miss_count, 1);
 		return false;
 	}
 
-	if ((int)e->member_count > max_members_buf)
-	{
+	if ((int)e->member_count > max_members_buf) {
 		LWLockRelease(ClusterMultiXactLock);
 		out->member_count = e->member_count; /* tell caller how big buf needed */
 		pg_atomic_fetch_add_u64(&ClusterMultiXactState->overlay_overflow_count, 1);
@@ -271,8 +262,7 @@ cluster_multixact_resolve_visibility(const ClusterMultiXactMemberOverlayResult *
 	if (ClusterMultiXactState != NULL)
 		pg_atomic_fetch_add_u64(&ClusterMultiXactState->resolve_visibility_count, 1);
 
-	for (i = 0; i < overlay->member_count; i++)
-	{
+	for (i = 0; i < overlay->member_count; i++) {
 		const ClusterMultiXactMember *m = &overlay->members[i];
 		uint8 status = m->status;
 
@@ -306,9 +296,8 @@ cluster_multixact_resolve_visibility(const ClusterMultiXactMemberOverlayResult *
 				continue; /* aborted updater does not hide tuple */
 			if (ttres.status == CLUSTER_TT_STATUS_IN_PROGRESS)
 				continue; /* in-progress update not yet visible: tuple still visible */
-			if (ttres.status == CLUSTER_TT_STATUS_COMMITTED ||
-				ttres.status == CLUSTER_TT_STATUS_CLEANED_OUT)
-			{
+			if (ttres.status == CLUSTER_TT_STATUS_COMMITTED
+				|| ttres.status == CLUSTER_TT_STATUS_CLEANED_OUT) {
 				ClusterVisibilityDecision d
 					= cluster_visibility_decide_by_scn(ttres.commit_scn, snap->read_scn);
 				if (d == CLUSTER_VISIBILITY_INVISIBLE)
@@ -356,8 +345,7 @@ cluster_multixact_purge_epoch(uint32 obsolete_epoch)
 
 	LWLockAcquire(ClusterMultiXactLock, LW_EXCLUSIVE);
 	hash_seq_init(&hseq, ClusterMultiXactHTAB);
-	while ((e = (ClusterMultiXactOverlayEntry *)hash_seq_search(&hseq)) != NULL)
-	{
+	while ((e = (ClusterMultiXactOverlayEntry *)hash_seq_search(&hseq)) != NULL) {
 		if (e->key.cluster_epoch < obsolete_epoch)
 			hash_search(ClusterMultiXactHTAB, &e->key, HASH_REMOVE, NULL);
 	}
@@ -413,8 +401,7 @@ cluster_multixact_member_overlay_lookup(const ClusterMultiXactKey *key,
 {
 	(void)key;
 	(void)max_members_buf;
-	if (out != NULL)
-	{
+	if (out != NULL) {
 		out->authoritative = false;
 		out->member_count = 0;
 		out->generation_ts = 0;

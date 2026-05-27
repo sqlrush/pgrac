@@ -68,9 +68,9 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 /* ===== Local stubs — pure-ABI binary does not link real cluster.o ===== */
 
 bool
-cluster_multixact_member_overlay_install(const ClusterMultiXactKey *key pg_attribute_unused(),
-										 uint16 member_count pg_attribute_unused(),
-										 const ClusterMultiXactMember *members pg_attribute_unused())
+cluster_multixact_member_overlay_install(
+	const ClusterMultiXactKey *key pg_attribute_unused(), uint16 member_count pg_attribute_unused(),
+	const ClusterMultiXactMember *members pg_attribute_unused())
 {
 	return false;
 }
@@ -80,8 +80,7 @@ cluster_multixact_member_overlay_lookup(const ClusterMultiXactKey *key pg_attrib
 										ClusterMultiXactMemberOverlayResult *out,
 										int max_members_buf pg_attribute_unused())
 {
-	if (out != NULL)
-	{
+	if (out != NULL) {
 		out->authoritative = false;
 		out->member_count = 0;
 	}
@@ -90,7 +89,7 @@ cluster_multixact_member_overlay_lookup(const ClusterMultiXactKey *key pg_attrib
 
 ClusterVisibilityDecision
 cluster_multixact_resolve_visibility(const ClusterMultiXactMemberOverlayResult *overlay
-									 pg_attribute_unused(),
+										 pg_attribute_unused(),
 									 const Snapshot snap pg_attribute_unused())
 {
 	return CLUSTER_VISIBILITY_UNKNOWN;
@@ -106,31 +105,53 @@ void
 cluster_multixact_purge_epoch(uint32 obsolete_epoch pg_attribute_unused())
 {}
 
-uint64 cluster_multixact_get_overlay_install_count(void) { return 0; }
-uint64 cluster_multixact_get_overlay_lookup_hit_count(void) { return 0; }
-uint64 cluster_multixact_get_overlay_miss_count(void) { return 0; }
-uint64 cluster_multixact_get_overlay_overflow_count(void) { return 0; }
-uint64 cluster_multixact_get_resolve_visibility_count(void) { return 0; }
+uint64
+cluster_multixact_get_overlay_install_count(void)
+{
+	return 0;
+}
+uint64
+cluster_multixact_get_overlay_lookup_hit_count(void)
+{
+	return 0;
+}
+uint64
+cluster_multixact_get_overlay_miss_count(void)
+{
+	return 0;
+}
+uint64
+cluster_multixact_get_overlay_overflow_count(void)
+{
+	return 0;
+}
+uint64
+cluster_multixact_get_resolve_visibility_count(void)
+{
+	return 0;
+}
 
 void
-cluster_tt_status_hint_emit_multixact_overlay(const ClusterMultiXactKey *key
-											  pg_attribute_unused(),
-											  uint16 member_count pg_attribute_unused(),
-											  const ClusterMultiXactMember *members
-											  pg_attribute_unused())
+cluster_tt_status_hint_emit_multixact_overlay(
+	const ClusterMultiXactKey *key pg_attribute_unused(), uint16 member_count pg_attribute_unused(),
+	const ClusterMultiXactMember *members pg_attribute_unused())
 {}
 
-uint64 cluster_tt_status_hint_get_v4_drop_unknown_count(void) { return 0; }
+uint64
+cluster_tt_status_hint_get_v4_drop_unknown_count(void)
+{
+	return 0;
+}
 
 
 /* ===== T1: ClusterMultiXactKey sizeof / offsetof ===== */
 
 UT_TEST(t1_multixact_key_layout)
 {
-	UT_ASSERT_EQ((int) sizeof(ClusterMultiXactKey), 16);
-	UT_ASSERT_EQ((int) offsetof(ClusterMultiXactKey, origin_node_id), 0);
-	UT_ASSERT_EQ((int) offsetof(ClusterMultiXactKey, multixact_id), 4);
-	UT_ASSERT_EQ((int) offsetof(ClusterMultiXactKey, cluster_epoch), 8);
+	UT_ASSERT_EQ((int)sizeof(ClusterMultiXactKey), 16);
+	UT_ASSERT_EQ((int)offsetof(ClusterMultiXactKey, origin_node_id), 0);
+	UT_ASSERT_EQ((int)offsetof(ClusterMultiXactKey, multixact_id), 4);
+	UT_ASSERT_EQ((int)offsetof(ClusterMultiXactKey, cluster_epoch), 8);
 }
 
 
@@ -138,10 +159,10 @@ UT_TEST(t1_multixact_key_layout)
 
 UT_TEST(t2_multixact_member_layout)
 {
-	UT_ASSERT_EQ((int) sizeof(ClusterMultiXactMember), 16);
-	UT_ASSERT_EQ((int) offsetof(ClusterMultiXactMember, xid), 0);
-	UT_ASSERT_EQ((int) offsetof(ClusterMultiXactMember, status), 4);
-	UT_ASSERT_EQ((int) offsetof(ClusterMultiXactMember, origin_node_id), 6);
+	UT_ASSERT_EQ((int)sizeof(ClusterMultiXactMember), 16);
+	UT_ASSERT_EQ((int)offsetof(ClusterMultiXactMember, xid), 0);
+	UT_ASSERT_EQ((int)offsetof(ClusterMultiXactMember, status), 4);
+	UT_ASSERT_EQ((int)offsetof(ClusterMultiXactMember, origin_node_id), 6);
 }
 
 
@@ -149,9 +170,9 @@ UT_TEST(t2_multixact_member_layout)
 
 UT_TEST(t3_v4_header_layout)
 {
-	UT_ASSERT_EQ((int) sizeof(ClusterTTStatusHintMsgV4Header), 24);
-	UT_ASSERT_EQ((int) offsetof(ClusterTTStatusHintMsgV4Header, msg_version), 0);
-	UT_ASSERT_EQ((int) offsetof(ClusterTTStatusHintMsgV4Header, key), 8);
+	UT_ASSERT_EQ((int)sizeof(ClusterTTStatusHintMsgV4Header), 24);
+	UT_ASSERT_EQ((int)offsetof(ClusterTTStatusHintMsgV4Header, msg_version), 0);
+	UT_ASSERT_EQ((int)offsetof(ClusterTTStatusHintMsgV4Header, key), 8);
 }
 
 
@@ -159,10 +180,10 @@ UT_TEST(t3_v4_header_layout)
 
 UT_TEST(t4_v4_enum_is_4)
 {
-	UT_ASSERT_EQ((int) CLUSTER_TT_STATUS_HINT_V4, 4);
-	UT_ASSERT_EQ((int) CLUSTER_TT_STATUS_HINT_V3, 3);
-	UT_ASSERT_EQ((int) CLUSTER_TT_STATUS_HINT_V2, 2);
-	UT_ASSERT_EQ((int) CLUSTER_TT_STATUS_HINT_V1, 1);
+	UT_ASSERT_EQ((int)CLUSTER_TT_STATUS_HINT_V4, 4);
+	UT_ASSERT_EQ((int)CLUSTER_TT_STATUS_HINT_V3, 3);
+	UT_ASSERT_EQ((int)CLUSTER_TT_STATUS_HINT_V2, 2);
+	UT_ASSERT_EQ((int)CLUSTER_TT_STATUS_HINT_V1, 1);
 }
 
 
@@ -171,8 +192,8 @@ UT_TEST(t4_v4_enum_is_4)
 UT_TEST(t5_v4_outbound_entry_sizeof)
 {
 	/* 24 + 256 × 16 = 4120 */
-	UT_ASSERT_EQ((int) sizeof(ClusterMultiXactHintOutboundEntry), 4120);
-	UT_ASSERT_EQ((int) CLUSTER_MULTIXACT_HINT_MAX_MEMBERS, 256);
+	UT_ASSERT_EQ((int)sizeof(ClusterMultiXactHintOutboundEntry), 4120);
+	UT_ASSERT_EQ((int)CLUSTER_MULTIXACT_HINT_MAX_MEMBERS, 256);
 }
 
 
@@ -190,8 +211,8 @@ UT_TEST(t6_cluster_multixact_api_link)
 
 	UT_ASSERT(!cluster_multixact_member_overlay_install(&key, 1, &member));
 	UT_ASSERT(!cluster_multixact_member_overlay_lookup(&key, &res, 1));
-	(void) cluster_multixact_resolve_visibility(&res, NULL);
-	UT_ASSERT_EQ((int) cluster_multixact_get_member_count(&key), 0);
+	(void)cluster_multixact_resolve_visibility(&res, NULL);
+	UT_ASSERT_EQ((int)cluster_multixact_get_member_count(&key), 0);
 	cluster_multixact_purge_epoch(1);
 }
 
@@ -213,19 +234,19 @@ UT_TEST(t7_hint_emit_multixact_overlay_link)
 
 UT_TEST(t8_overlay_install_count_link)
 {
-	UT_ASSERT_EQ((uint64) cluster_multixact_get_overlay_install_count(), (uint64) 0);
-	UT_ASSERT_EQ((uint64) cluster_multixact_get_overlay_lookup_hit_count(), (uint64) 0);
+	UT_ASSERT_EQ((uint64)cluster_multixact_get_overlay_install_count(), (uint64)0);
+	UT_ASSERT_EQ((uint64)cluster_multixact_get_overlay_lookup_hit_count(), (uint64)0);
 }
 
 UT_TEST(t9_overlay_miss_overflow_link)
 {
-	UT_ASSERT_EQ((uint64) cluster_multixact_get_overlay_miss_count(), (uint64) 0);
-	UT_ASSERT_EQ((uint64) cluster_multixact_get_overlay_overflow_count(), (uint64) 0);
+	UT_ASSERT_EQ((uint64)cluster_multixact_get_overlay_miss_count(), (uint64)0);
+	UT_ASSERT_EQ((uint64)cluster_multixact_get_overlay_overflow_count(), (uint64)0);
 }
 
 UT_TEST(t10_resolve_visibility_count_link)
 {
-	UT_ASSERT_EQ((uint64) cluster_multixact_get_resolve_visibility_count(), (uint64) 0);
+	UT_ASSERT_EQ((uint64)cluster_multixact_get_resolve_visibility_count(), (uint64)0);
 }
 
 
@@ -233,11 +254,11 @@ UT_TEST(t10_resolve_visibility_count_link)
 
 UT_TEST(t11_itl_flag_xmax_is_multi)
 {
-	UT_ASSERT_EQ((int) ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI, 8);
+	UT_ASSERT_EQ((int)ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI, 8);
 	/* spec-3.4d existing flags 0-7 preserved */
-	UT_ASSERT_EQ((int) ITL_FLAG_FREE, 0);
-	UT_ASSERT_EQ((int) ITL_FLAG_LOCK_ONLY_ACTIVE, 5);
-	UT_ASSERT_EQ((int) ITL_FLAG_LOCK_ONLY_ABORTED, 7);
+	UT_ASSERT_EQ((int)ITL_FLAG_FREE, 0);
+	UT_ASSERT_EQ((int)ITL_FLAG_LOCK_ONLY_ACTIVE, 5);
+	UT_ASSERT_EQ((int)ITL_FLAG_LOCK_ONLY_ABORTED, 7);
 }
 
 
@@ -245,12 +266,12 @@ UT_TEST(t11_itl_flag_xmax_is_multi)
 
 UT_TEST(t12_multixactstatus_preservation)
 {
-	UT_ASSERT_EQ((int) MultiXactStatusForKeyShare, 0);
-	UT_ASSERT_EQ((int) MultiXactStatusForShare, 1);
-	UT_ASSERT_EQ((int) MultiXactStatusForNoKeyUpdate, 2);
-	UT_ASSERT_EQ((int) MultiXactStatusForUpdate, 3);
-	UT_ASSERT_EQ((int) MultiXactStatusNoKeyUpdate, 4);
-	UT_ASSERT_EQ((int) MultiXactStatusUpdate, 5);
+	UT_ASSERT_EQ((int)MultiXactStatusForKeyShare, 0);
+	UT_ASSERT_EQ((int)MultiXactStatusForShare, 1);
+	UT_ASSERT_EQ((int)MultiXactStatusForNoKeyUpdate, 2);
+	UT_ASSERT_EQ((int)MultiXactStatusForUpdate, 3);
+	UT_ASSERT_EQ((int)MultiXactStatusNoKeyUpdate, 4);
+	UT_ASSERT_EQ((int)MultiXactStatusUpdate, 5);
 }
 
 
@@ -260,7 +281,7 @@ UT_TEST(t13_errcode_53r9c)
 {
 	int code = ERRCODE_CLUSTER_MULTIXACT_MEMBER_OVERLAY_MISS;
 	UT_ASSERT_NE(code, 0);
-	UT_ASSERT_EQ(code, (int) MAKE_SQLSTATE('5', '3', 'R', '9', 'C'));
+	UT_ASSERT_EQ(code, (int)MAKE_SQLSTATE('5', '3', 'R', '9', 'C'));
 }
 
 
@@ -268,7 +289,7 @@ UT_TEST(t13_errcode_53r9c)
 
 UT_TEST(t14_v4_drop_unknown_count_link)
 {
-	UT_ASSERT_EQ((uint64) cluster_tt_status_hint_get_v4_drop_unknown_count(), (uint64) 0);
+	UT_ASSERT_EQ((uint64)cluster_tt_status_hint_get_v4_drop_unknown_count(), (uint64)0);
 }
 
 
@@ -276,7 +297,7 @@ UT_TEST(t14_v4_drop_unknown_count_link)
 
 UT_TEST(t15_default_guc_cap_is_32)
 {
-	UT_ASSERT_EQ((int) cluster_multixact_member_overlay_max_members, 32);
+	UT_ASSERT_EQ((int)cluster_multixact_member_overlay_max_members, 32);
 }
 
 
@@ -295,12 +316,12 @@ local_lockonly_always_visible(uint8 status)
 
 UT_TEST(t16_obs1_lockonly_visible_truth)
 {
-	UT_ASSERT(local_lockonly_always_visible((uint8) MultiXactStatusForKeyShare));
-	UT_ASSERT(local_lockonly_always_visible((uint8) MultiXactStatusForShare));
-	UT_ASSERT(local_lockonly_always_visible((uint8) MultiXactStatusForNoKeyUpdate));
-	UT_ASSERT(local_lockonly_always_visible((uint8) MultiXactStatusForUpdate));
-	UT_ASSERT(!local_lockonly_always_visible((uint8) MultiXactStatusNoKeyUpdate));
-	UT_ASSERT(!local_lockonly_always_visible((uint8) MultiXactStatusUpdate));
+	UT_ASSERT(local_lockonly_always_visible((uint8)MultiXactStatusForKeyShare));
+	UT_ASSERT(local_lockonly_always_visible((uint8)MultiXactStatusForShare));
+	UT_ASSERT(local_lockonly_always_visible((uint8)MultiXactStatusForNoKeyUpdate));
+	UT_ASSERT(local_lockonly_always_visible((uint8)MultiXactStatusForUpdate));
+	UT_ASSERT(!local_lockonly_always_visible((uint8)MultiXactStatusNoKeyUpdate));
+	UT_ASSERT(!local_lockonly_always_visible((uint8)MultiXactStatusUpdate));
 }
 
 

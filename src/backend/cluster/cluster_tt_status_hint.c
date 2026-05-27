@@ -107,8 +107,7 @@ static ClusterTTStatusHintState *ClusterTTHintCounters = NULL;
  * 256 × 16 members).  Default 1024 slots ≈ 4.1 MiB shmem (GUC
  * cluster.multixact_hint_outbound_slots).
  */
-typedef struct ClusterMultiXactHintOutboundRing
-{
+typedef struct ClusterMultiXactHintOutboundRing {
 	pg_atomic_uint32 head;
 	pg_atomic_uint32 tail;
 	uint32 capacity;
@@ -188,13 +187,11 @@ cluster_tt_status_hint_shmem_init(void)
 
 		ClusterMultiXactHintOutbound = (ClusterMultiXactHintOutboundRing *)ShmemInitStruct(
 			"ClusterMultiXactHintOutbound", v4_ring_sz, &v4_found);
-		if (!v4_found)
-		{
+		if (!v4_found) {
 			pg_atomic_init_u32(&ClusterMultiXactHintOutbound->head, 0);
 			pg_atomic_init_u32(&ClusterMultiXactHintOutbound->tail, 0);
 			ClusterMultiXactHintOutbound->capacity = cluster_multixact_hint_outbound_slots;
-			LWLockInitialize(&ClusterMultiXactHintOutbound->lock.lock,
-							 LWTRANCHE_CLUSTER_TT_STATUS);
+			LWLockInitialize(&ClusterMultiXactHintOutbound->lock.lock, LWTRANCHE_CLUSTER_TT_STATUS);
 		}
 	}
 }
@@ -348,8 +345,7 @@ cluster_tt_status_hint_emit_subcommitted(const ClusterTTStatusKey *child_key,
  *   (does NOT pollute V2/V3 fixed ring).
  */
 void
-cluster_tt_status_hint_emit_multixact_overlay(const ClusterMultiXactKey *key,
-											  uint16 member_count,
+cluster_tt_status_hint_emit_multixact_overlay(const ClusterMultiXactKey *key, uint16 member_count,
 											  const ClusterMultiXactMember *members)
 {
 	uint32 tail;
@@ -360,22 +356,19 @@ cluster_tt_status_hint_emit_multixact_overlay(const ClusterMultiXactKey *key,
 	if (cluster_tt_status_hint_emit_mode == CLUSTER_TT_STATUS_HINT_EMIT_DISABLED)
 		return;
 
-	if (member_count == 0 || member_count > cluster_multixact_member_overlay_max_members ||
-		member_count > CLUSTER_MULTIXACT_HINT_MAX_MEMBERS)
-	{
-		ereport(WARNING,
-				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
-				 errmsg("cluster multixact V4 emit overflow:  member_count %u > cap",
-						(unsigned)member_count),
-				 errhint("Raise cluster.multixact_member_overlay_max_members.")));
+	if (member_count == 0 || member_count > cluster_multixact_member_overlay_max_members
+		|| member_count > CLUSTER_MULTIXACT_HINT_MAX_MEMBERS) {
+		ereport(WARNING, (errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+						  errmsg("cluster multixact V4 emit overflow:  member_count %u > cap",
+								 (unsigned)member_count),
+						  errhint("Raise cluster.multixact_member_overlay_max_members.")));
 		return;
 	}
 
 	LWLockAcquire(&ClusterMultiXactHintOutbound->lock.lock, LW_EXCLUSIVE);
 	tail = pg_atomic_read_u32(&ClusterMultiXactHintOutbound->tail);
 	next_tail = (tail + 1) % ClusterMultiXactHintOutbound->capacity;
-	if (next_tail == pg_atomic_read_u32(&ClusterMultiXactHintOutbound->head))
-	{
+	if (next_tail == pg_atomic_read_u32(&ClusterMultiXactHintOutbound->head)) {
 		LWLockRelease(&ClusterMultiXactHintOutbound->lock.lock);
 		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
 		ereport(WARNING, (errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
@@ -483,10 +476,8 @@ cluster_tt_status_hint_drain_outbound(void)
 	 * PGRAC spec-3.6 D4:  V4 sidecar outbound queue drain.  Separate
 	 * loop because variable members[] cannot share V2/V3 ring.
 	 */
-	if (ClusterMultiXactHintOutbound != NULL)
-	{
-		for (;;)
-		{
+	if (ClusterMultiXactHintOutbound != NULL) {
+		for (;;) {
 			ClusterMultiXactHintOutboundEntry local;
 			ClusterICFanoutResult per_peer[CLUSTER_MAX_NODES];
 			uint32 head;
@@ -495,8 +486,7 @@ cluster_tt_status_hint_drain_outbound(void)
 
 			LWLockAcquire(&ClusterMultiXactHintOutbound->lock.lock, LW_EXCLUSIVE);
 			head = pg_atomic_read_u32(&ClusterMultiXactHintOutbound->head);
-			if (head == pg_atomic_read_u32(&ClusterMultiXactHintOutbound->tail))
-			{
+			if (head == pg_atomic_read_u32(&ClusterMultiXactHintOutbound->tail)) {
 				LWLockRelease(&ClusterMultiXactHintOutbound->lock.lock);
 				break;
 			}
@@ -661,9 +651,8 @@ cluster_tt_status_hint_handle_envelope(const ClusterICEnvelope *env, const void 
 			return;
 		}
 
-		v4_members
-			= (const ClusterMultiXactMember *)((const char *)payload
-											   + sizeof(ClusterTTStatusHintMsgV4Header));
+		v4_members = (const ClusterMultiXactMember *)((const char *)payload
+													  + sizeof(ClusterTTStatusHintMsgV4Header));
 
 		(void)cluster_multixact_member_overlay_install(&v4hdr->key, v4_member_count, v4_members);
 
@@ -872,8 +861,7 @@ CLUSTER_TT_HINT_GETTER_STUB(v3_downgrade_count)
 CLUSTER_TT_HINT_GETTER_STUB(v4_drop_unknown_count)
 
 void
-cluster_tt_status_hint_emit_multixact_overlay(const ClusterMultiXactKey *key,
-											  uint16 member_count,
+cluster_tt_status_hint_emit_multixact_overlay(const ClusterMultiXactKey *key, uint16 member_count,
 											  const ClusterMultiXactMember *members)
 {
 	(void)key;
