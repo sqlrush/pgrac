@@ -620,6 +620,14 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 # correctness bug.  errhint forward-link 独立 2PC spec.
 53R9B    E    ERRCODE_PREPARE_TRANSACTION_WITH_CLUSTER_SUBTRANS_STATE          prepare_transaction_with_cluster_subtrans_state
 
+# spec-3.6 v0.3:  reader sees remote MultiXact xmax but cluster overlay
+# lookup miss / overflow / authoritative UNKNOWN.  Per L199 cross-node
+# fall-through → fail-closed (NOT PG-native SLRU fallback).  errhint
+# directs caller retry after origin re-emit;  on-demand re-emit 推
+# spec-3.6b/3.7.  IN_PROGRESS authoritative state NOT in this class
+# (per OBS-1 truth table:  走 VISIBLE 路径).
+53R9C    E    ERRCODE_CLUSTER_MULTIXACT_MEMBER_OVERLAY_MISS                    cluster_multixact_member_overlay_miss
+
 Section: Class 54 - Program Limit Exceeded
 
 # this is for wired-in limits, not resource exhaustion problems (class borrowed from DB2)

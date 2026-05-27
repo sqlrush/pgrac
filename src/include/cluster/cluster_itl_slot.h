@@ -90,7 +90,20 @@ typedef enum {
 	 * ITL_FLAG_IS_LOCK_ONLY() to test the category. */
 	ITL_FLAG_LOCK_ONLY_ACTIVE = 5,	  /* lock_xid holds row-lock; commit_scn unset */
 	ITL_FLAG_LOCK_ONLY_COMMITTED = 6, /* lock_xid committed; lock released */
-	ITL_FLAG_LOCK_ONLY_ABORTED = 7	  /* lock_xid aborted; lock released */
+	ITL_FLAG_LOCK_ONLY_ABORTED = 7,	  /* lock_xid aborted; lock released */
+	/*
+	 * spec-3.6 v0.3 D7b NEW page-format ITL flag:  MultiXact xmax marker.
+	 *	slot->xid stores the local MultiXactId (NOT a TransactionId).
+	 *	Used by cluster_itl_find_multixact_origin_by_xmax() reader to
+	 *	derive origin info for building ClusterMultiXactKey overlay
+	 *	lookup.  Page-format ABI extension (HC208 catversion bump).
+	 *
+	 *	Spec-3.6 partial coverage caveat:  origin_node_id derived from
+	 *	current cluster_node_id (ClusterPair fixture writer = reader);
+	 *	真 shared-heap Stage 4+ 时需 marker slot 自身编码 origin (UBA
+	 *	high bytes 或扩 slot field;留 spec-3.6b/3.7).
+	 */
+	ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI = 8
 } ClusterItlFlags;
 
 /* spec-3.4d helper:  test if an ITL slot flag value is one of the

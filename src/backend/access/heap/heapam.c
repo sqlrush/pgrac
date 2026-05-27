@@ -5625,15 +5625,78 @@ failed:
 
 	if (cluster_itl_lock_path_enabled(relation) && PageHasItl(page))
 	{
+		bool cluster_will_stamp_multixact_marker = false;
+		MultiXactId cluster_marker_multixact_id = InvalidMultiXactId;
+
 		if (new_infomask & HEAP_XMAX_IS_MULTI)
 		{
-			cluster_itl_bump_multixact_lock_reject_count();
-			ereport(ERROR,
-					(errcode(ERRCODE_CLUSTER_MULTIXACT_LOCK_NOT_SUPPORTED),
-					 errmsg("cluster MULTIXACT row lock not supported in spec-3.4d"),
-					 errhint("MULTIXACT lock support deferred to spec-3.5+;"
-							 " application should retry as non-multixact lock"
-							 " or wait for spec-3.5 SUBTRANS to ship.")));
+			/*
+			 * PGRAC spec-3.6 v0.3 D7a:  53R99 narrow rule.
+			 *
+			 *   Allow local-all-member peer-mode MultiXact compose;
+			 *   raise 53R99 only when existing tuple xmax has remote
+			 *   origin.  Heuristic:
+			 *     - Existing xmax was an already-marked-remote multixact
+			 *       (cluster_itl_find_multixact_origin_by_xmax origin !=
+			 *       cluster_node_id) -> remote-member compose -> 53R99
+			 *     - Existing xmax was a local single xid (TransactionId
+			 *       InProgress or DidCommit locally per ProcArray /
+			 *       CLOG) -> all-local -> allow
+			 *     - Otherwise (Invalid existing xmax, or local marker
+			 *       hit) -> all-local -> allow
+			 *
+			 *   D5 multixact.c hook iterates the final member list and
+			 *   only emits V4 overlay if all members have local TT
+			 *   bindings;  this D7a check is a fast-path filter that
+			 *   keeps the obvious remote-compose case fail-closed.
+			 */
+			TransactionId existing_xmax = HeapTupleHeaderGetRawXmax(tuple->t_data);
+			bool is_remote_compose = false;
+
+			if (TransactionIdIsValid(existing_xmax))
+			{
+				if (tuple->t_data->t_infomask & HEAP_XMAX_IS_MULTI)
+				{
+					uint16 mx_origin = 0;
+					if (cluster_itl_find_multixact_origin_by_xmax(page,
+																  (MultiXactId) existing_xmax,
+																  &mx_origin)
+						&& (int32) mx_origin != cluster_node_id)
+						is_remote_compose = true;
+				}
+				else
+				{
+					/*
+					 * Single existing xid:  use PG-native check.  If PG
+					 * can't determine status locally (InProgress nor
+					 * DidCommit/Abort), assume remote when peer mode.
+					 */
+					if (!TransactionIdIsCurrentTransactionId(existing_xmax)
+						&& !TransactionIdIsInProgress(existing_xmax)
+						&& !TransactionIdDidCommit(existing_xmax)
+						&& !TransactionIdDidAbort(existing_xmax))
+						is_remote_compose = true;
+				}
+			}
+
+			if (is_remote_compose)
+			{
+				cluster_itl_bump_multixact_lock_reject_count();
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_MULTIXACT_LOCK_NOT_SUPPORTED),
+						 errmsg("cluster MULTIXACT row lock with remote member not supported"),
+						 errhint("lock-side compose with remote member 推 spec-3.6b/3.7;"
+								 " application should retry as non-multixact lock")));
+			}
+
+			/*
+			 * Local-all-member case:  allow MultiXact compose;  remember to
+			 * stamp marker after the lock-only ITL stamp succeeds.  The
+			 * actual MultiXactId is assigned later inside critical section
+			 * (compute_new_xmax_infomask already decided it'll be a multi).
+			 * D5 multixact.c hook handles V4 wire emit.
+			 */
+			cluster_will_stamp_multixact_marker = true;
 		}
 
 		if (!cluster_itl_alloc_or_reuse_lock_slot(*buffer, xid, &cluster_lock_slot_idx))

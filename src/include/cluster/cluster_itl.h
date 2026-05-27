@@ -111,6 +111,39 @@ extern bool cluster_itl_get_tt_ref(Page page, uint8 itl_slot_idx, ClusterUndoTTS
 extern bool cluster_itl_find_lock_tt_ref_by_xmax(Page page, TransactionId raw_xmax,
 												 ClusterUndoTTSlotRef *ref);
 
+/*
+ * cluster_itl_find_multixact_origin_by_xmax (spec-3.6 v0.3 D7b NEW;OBS-2
+ * buffer lock contract per L200 / spec-3.4d Hardening v1.0.1 F10 family).
+ *
+ *	Scans page ITL slots for a slot where:
+ *	  slot->flags == ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI
+ *	  slot->xid   == multixact_id
+ *	On hit, populates *origin_node_id with the origin of the MultiXact
+ *	composition.  Returns true on hit, false on miss (caller raises
+ *	53R9C cluster_multixact_member_overlay_miss).
+ *
+ *	**HC contract:  Caller MUST hold buffer content lock (LW_SHARED or
+ *	stronger) covering `page` for the entire call (L200 family).  Pure /
+ *	no syscall / no wait (L177 hot path).**
+ *
+ *	Spec-3.6 partial coverage caveat:  origin_node_id derived from
+ *	current cluster_node_id (ClusterPair fixture writer = reader).  真
+ *	shared-heap Stage 4+ needs marker slot 自身 encode origin.
+ */
+extern bool cluster_itl_find_multixact_origin_by_xmax(Page page, MultiXactId multixact_id,
+													  uint16 *origin_node_id);
+
+/*
+ * cluster_itl_stamp_multixact_marker (spec-3.6 v0.3 D7b NEW):
+ *	Stamp ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI marker slot for `multixact_id`
+ *	on the page backing `buf`.  Reuses cluster_itl_alloc_or_reuse_lock_slot
+ *	allocator pattern;  marker slot can be recycled on next stamp.  Caller
+ *	MUST hold buffer EXCLUSIVE content lock.  Returns slot_idx on success,
+ *	CLUSTER_ITL_SLOT_UNALLOCATED on OVERFLOW (caller decides whether to
+ *	skip / continue with V4 emit alone).
+ */
+extern uint8 cluster_itl_stamp_multixact_marker(Buffer buf, MultiXactId multixact_id);
+
 /* ---------- spec-3.4a D2 — writer API ---------- */
 
 /*

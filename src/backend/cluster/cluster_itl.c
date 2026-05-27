@@ -34,6 +34,7 @@
 #include "access/xact.h"		 /* GetCurrentTransactionNestLevel (spec-3.4a N9) */
 #include "storage/bufmgr.h"		 /* BufferGetPage, MarkBufferDirty (spec-3.4a D2) */
 #include "storage/bufpage.h"
+#include "access/multixact.h" /* MultiXactId / MultiXactIdIsValid */
 #include "cluster/cluster_epoch.h" /* cluster_epoch_get_current (spec-3.4b D7) */
 #include "cluster/cluster_guc.h"   /* cluster_enabled */
 #include "cluster/cluster_itl.h"
@@ -538,6 +539,120 @@ cluster_itl_alloc_or_reuse_lock_slot(Buffer buf, TransactionId top_xid, uint8 *o
 	return false;
 }
 
+/*
+ * cluster_itl_find_multixact_origin_by_xmax (spec-3.6 v0.3 D7b NEW)
+ *
+ *	Helper for D6 heapam_visibility reader.  Scan page ITL for marker
+ *	slot stamped by D7b (cluster_itl_stamp_multixact_marker);  return
+ *	origin info on hit.
+ *
+ *	**Caller MUST hold buffer content lock** (L200;  validated by
+ *	debug-build LWLockHeldByMe assert at caller site).
+ *
+ *	Spec-3.6 partial coverage:  origin_node_id derived from cluster_node_id
+ *	(ClusterPair writer == reader).
+ */
+bool
+cluster_itl_find_multixact_origin_by_xmax(Page page, MultiXactId multixact_id,
+										  uint16 *origin_node_id)
+{
+	const ClusterItlSlotData *slots;
+	uint8 i;
+
+	Assert(page != NULL);
+	Assert(origin_node_id != NULL);
+
+	if (!PageHasItl(page))
+		return false;
+	if (!MultiXactIdIsValid(multixact_id))
+		return false;
+
+	slots = ClusterPageGetItlSlots(page);
+	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+	{
+		const ClusterItlSlotData *slot = &slots[i];
+
+		if (slot->flags != ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI)
+			continue;
+		if ((MultiXactId) slot->xid != multixact_id)
+			continue;
+
+		/*
+		 * Spec-3.6 partial coverage:  on ClusterPair fixture writer ==
+		 * reader, so origin is the current node.  Stage 4+ shared-heap
+		 * needs marker slot to encode origin via UBA / extra field.
+		 */
+		*origin_node_id = (uint16) cluster_node_id;
+		return true;
+	}
+	return false;
+}
+
+/*
+ * cluster_itl_stamp_multixact_marker (spec-3.6 v0.3 D7b NEW)
+ *
+ *	Stamp the MultiXact xmax marker into a free/reusable ITL slot on
+ *	page backing `buf`.  Caller must hold EXCLUSIVE buffer content lock.
+ *	Returns slot index on success, CLUSTER_ITL_SLOT_UNALLOCATED if
+ *	page ITL is full (caller may skip emit;  V4 wire emit alone covers
+ *	cluster propagation — page-side marker is a partial-coverage helper).
+ */
+uint8
+cluster_itl_stamp_multixact_marker(Buffer buf, MultiXactId multixact_id)
+{
+	Page page;
+	ClusterItlSlotData *slots;
+	int found_idx = -1;
+	int free_idx = -1;
+	int reusable_idx = -1;
+	uint8 i;
+
+	Assert(BufferIsValid(buf));
+	Assert(MultiXactIdIsValid(multixact_id));
+
+	page = BufferGetPage(buf);
+	if (!PageHasItl(page))
+		return CLUSTER_ITL_SLOT_UNALLOCATED;
+
+	slots = ClusterPageGetItlSlots(page);
+	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+	{
+		if (slots[i].flags == ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI
+			&& (MultiXactId) slots[i].xid == multixact_id)
+		{
+			found_idx = (int) i;
+			break;
+		}
+		if (slots[i].flags == ITL_FLAG_FREE && free_idx < 0)
+			free_idx = (int) i;
+		else if (cluster_itl_slot_is_completed_reusable(slots[i].flags) && reusable_idx < 0)
+			reusable_idx = (int) i;
+	}
+
+	if (found_idx >= 0)
+		return (uint8) found_idx; /* already stamped */
+
+	{
+		int idx = (free_idx >= 0) ? free_idx : reusable_idx;
+		ClusterItlSlotData *slot;
+
+		if (idx < 0)
+			return CLUSTER_ITL_SLOT_UNALLOCATED; /* OVERFLOW */
+
+		slot = &slots[idx];
+		if (slot->flags != ITL_FLAG_FREE)
+			slot->wrap++;
+		slot->xid = (TransactionId) multixact_id; /* repurposed as MultiXactId */
+		slot->flags = ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI;
+		slot->commit_scn = InvalidScn;
+		slot->write_scn = InvalidScn;
+		memset(&slot->undo_segment_head, 0, sizeof(slot->undo_segment_head));
+
+		MarkBufferDirty(buf);
+		return (uint8) idx;
+	}
+}
+
 void
 cluster_itl_stamp_active(Buffer buf, uint8 slot_idx, TransactionId xid, SCN write_scn,
 						 UBA undo_segment_head)
@@ -784,6 +899,21 @@ cluster_itl_alloc_or_reuse_lock_slot(Buffer buf pg_attribute_unused(),
 									 uint8 *out_slot_idx pg_attribute_unused())
 {
 	return false;
+}
+
+bool
+cluster_itl_find_multixact_origin_by_xmax(Page page pg_attribute_unused(),
+										  MultiXactId multixact_id pg_attribute_unused(),
+										  uint16 *origin_node_id pg_attribute_unused())
+{
+	return false;
+}
+
+uint8
+cluster_itl_stamp_multixact_marker(Buffer buf pg_attribute_unused(),
+								   MultiXactId multixact_id pg_attribute_unused())
+{
+	return 0xff; /* CLUSTER_ITL_SLOT_UNALLOCATED */
 }
 
 void
