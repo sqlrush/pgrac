@@ -137,4 +137,13 @@ extern bool cluster_subtrans_ensure_parent_binding(TransactionId parent_xid,
 extern uint64 cluster_subtrans_get_chain_depth_exceeded_count(void);
 extern uint64 cluster_subtrans_get_xact_has_state_check_count(void);
 
+/*
+ * shmem hooks (defined in cluster_subtrans.c when USE_PGRAC_CLUSTER;
+ * disable-cluster stubs return 0 / no-op so the same shmem registry
+ * call site in cluster_shmem.c links unconditionally).
+ */
+extern Size cluster_subtrans_shmem_size(void);
+extern void cluster_subtrans_shmem_init(void);
+extern void cluster_subtrans_shmem_register(void);
+
 #endif /* CLUSTER_SUBTRANS_H */
