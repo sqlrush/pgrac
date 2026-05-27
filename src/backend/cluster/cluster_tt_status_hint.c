@@ -93,12 +93,37 @@ typedef struct ClusterTTStatusHintState {
 	pg_atomic_uint64 drop_stale_epoch_count;
 	pg_atomic_uint64 drop_unknown_version_count;
 	pg_atomic_uint64 install_count;
-	pg_atomic_uint64 drop_v1_compat_count; /* spec-3.3 D9: 7th counter */
-	pg_atomic_uint64 v3_downgrade_count;   /* reserved for future mixed-version negotiation */
+	pg_atomic_uint64 drop_v1_compat_count;	/* spec-3.3 D9: 7th counter */
+	pg_atomic_uint64 v3_downgrade_count;	/* reserved for future mixed-version negotiation */
+	pg_atomic_uint64 v4_drop_unknown_count; /* PGRAC spec-3.6 D4: V4 DROP counter */
 } ClusterTTStatusHintState;
 
 static ClusterTTStatusHintOutboundRing *ClusterTTHintOutbound = NULL;
 static ClusterTTStatusHintState *ClusterTTHintCounters = NULL;
+
+/*
+ * PGRAC spec-3.6 D4:  V4 sidecar outbound queue (fixed-size, separate
+ * from V2/V3 single-key ring).  Each slot reserves 4120B (header 24 +
+ * 256 × 16 members).  Default 1024 slots ≈ 4.1 MiB shmem (GUC
+ * cluster.multixact_hint_outbound_slots).
+ */
+typedef struct ClusterMultiXactHintOutboundRing
+{
+	pg_atomic_uint32 head;
+	pg_atomic_uint32 tail;
+	uint32 capacity;
+	LWLockPadded lock;
+	ClusterMultiXactHintOutboundEntry slots[FLEXIBLE_ARRAY_MEMBER];
+} ClusterMultiXactHintOutboundRing;
+
+static ClusterMultiXactHintOutboundRing *ClusterMultiXactHintOutbound = NULL;
+
+static Size
+v4_outbound_ring_size(int capacity)
+{
+	return offsetof(ClusterMultiXactHintOutboundRing, slots)
+		   + mul_size(sizeof(ClusterMultiXactHintOutboundEntry), capacity);
+}
 
 /* ------------------------------------------------------------ */
 /* shmem layout                                                 */
@@ -117,7 +142,8 @@ cluster_tt_status_hint_shmem_size(void)
 	if (IsBootstrapProcessingMode() || !cluster_enabled || cluster_node_id < 0)
 		return 0;
 	return MAXALIGN(hint_outbound_struct_size(cluster_tt_status_hint_outbound_capacity))
-		   + MAXALIGN(sizeof(ClusterTTStatusHintState));
+		   + MAXALIGN(sizeof(ClusterTTStatusHintState))
+		   + MAXALIGN(v4_outbound_ring_size(cluster_multixact_hint_outbound_slots));
 }
 
 void
@@ -150,6 +176,26 @@ cluster_tt_status_hint_shmem_init(void)
 		pg_atomic_init_u64(&ClusterTTHintCounters->install_count, 0);
 		pg_atomic_init_u64(&ClusterTTHintCounters->drop_v1_compat_count, 0);
 		pg_atomic_init_u64(&ClusterTTHintCounters->v3_downgrade_count, 0);
+		pg_atomic_init_u64(&ClusterTTHintCounters->v4_drop_unknown_count, 0);
+	}
+
+	/*
+	 * PGRAC spec-3.6 D4:  V4 sidecar outbound queue init.
+	 */
+	{
+		Size v4_ring_sz = MAXALIGN(v4_outbound_ring_size(cluster_multixact_hint_outbound_slots));
+		bool v4_found;
+
+		ClusterMultiXactHintOutbound = (ClusterMultiXactHintOutboundRing *)ShmemInitStruct(
+			"ClusterMultiXactHintOutbound", v4_ring_sz, &v4_found);
+		if (!v4_found)
+		{
+			pg_atomic_init_u32(&ClusterMultiXactHintOutbound->head, 0);
+			pg_atomic_init_u32(&ClusterMultiXactHintOutbound->tail, 0);
+			ClusterMultiXactHintOutbound->capacity = cluster_multixact_hint_outbound_slots;
+			LWLockInitialize(&ClusterMultiXactHintOutbound->lock.lock,
+							 LWTRANCHE_CLUSTER_TT_STATUS);
+		}
 	}
 }
 
@@ -293,6 +339,71 @@ cluster_tt_status_hint_emit_subcommitted(const ClusterTTStatusKey *child_key,
 	cluster_lmon_wakeup();
 }
 
+/*
+ * cluster_tt_status_hint_emit_multixact_overlay (PGRAC spec-3.6 D4 NEW)
+ *
+ *   Enqueue a V4 sidecar emit (multixact composition overlay) for LMON
+ *   drain.  Sender member_count > GUC cap → fail-closed (no partial
+ *   emit) + overflow counter.  Uses dedicated V4 sidecar outbound queue
+ *   (does NOT pollute V2/V3 fixed ring).
+ */
+void
+cluster_tt_status_hint_emit_multixact_overlay(const ClusterMultiXactKey *key,
+											  uint16 member_count,
+											  const ClusterMultiXactMember *members)
+{
+	uint32 tail;
+	uint32 next_tail;
+
+	if (!cluster_enabled || ClusterMultiXactHintOutbound == NULL || key == NULL || members == NULL)
+		return;
+	if (cluster_tt_status_hint_emit_mode == CLUSTER_TT_STATUS_HINT_EMIT_DISABLED)
+		return;
+
+	if (member_count == 0 || member_count > cluster_multixact_member_overlay_max_members ||
+		member_count > CLUSTER_MULTIXACT_HINT_MAX_MEMBERS)
+	{
+		ereport(WARNING,
+				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+				 errmsg("cluster multixact V4 emit overflow:  member_count %u > cap",
+						(unsigned)member_count),
+				 errhint("Raise cluster.multixact_member_overlay_max_members.")));
+		return;
+	}
+
+	LWLockAcquire(&ClusterMultiXactHintOutbound->lock.lock, LW_EXCLUSIVE);
+	tail = pg_atomic_read_u32(&ClusterMultiXactHintOutbound->tail);
+	next_tail = (tail + 1) % ClusterMultiXactHintOutbound->capacity;
+	if (next_tail == pg_atomic_read_u32(&ClusterMultiXactHintOutbound->head))
+	{
+		LWLockRelease(&ClusterMultiXactHintOutbound->lock.lock);
+		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+		ereport(WARNING, (errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+						  errmsg("cluster V4 sidecar outbound full; multixact hint dropped"),
+						  errhint("Raise cluster.multixact_hint_outbound_slots.")));
+		return;
+	}
+
+	{
+		ClusterMultiXactHintOutboundEntry *slot = &ClusterMultiXactHintOutbound->slots[tail];
+
+		memset(&slot->header, 0, sizeof(slot->header));
+		slot->header.msg_version = (uint16)CLUSTER_TT_STATUS_HINT_V4;
+		slot->header.payload_kind = 1; /* multixact overlay */
+		slot->header.flags = 0;
+		slot->header.member_count = member_count;
+		slot->header.key = *key;
+
+		memset(slot->members, 0, sizeof(slot->members));
+		memcpy(slot->members, members, member_count * sizeof(ClusterMultiXactMember));
+	}
+	pg_atomic_write_u32(&ClusterMultiXactHintOutbound->tail, next_tail);
+	LWLockRelease(&ClusterMultiXactHintOutbound->lock.lock);
+
+	pg_atomic_fetch_add_u64(&ClusterTTHintCounters->emit_count, 1);
+	cluster_lmon_wakeup();
+}
+
 /* ------------------------------------------------------------ */
 /* LMON drain (L172 family — LMON-only HC185)                   */
 /* ------------------------------------------------------------ */
@@ -364,6 +475,46 @@ cluster_tt_status_hint_drain_outbound(void)
 			msg2.commit_scn = local.commit_scn;
 
 			cluster_ic_send_envelope_fanout(PGRAC_IC_MSG_TT_STATUS_HINT, &msg2, sizeof(msg2),
+											per_peer);
+		}
+	}
+
+	/*
+	 * PGRAC spec-3.6 D4:  V4 sidecar outbound queue drain.  Separate
+	 * loop because variable members[] cannot share V2/V3 ring.
+	 */
+	if (ClusterMultiXactHintOutbound != NULL)
+	{
+		for (;;)
+		{
+			ClusterMultiXactHintOutboundEntry local;
+			ClusterICFanoutResult per_peer[CLUSTER_MAX_NODES];
+			uint32 head;
+			uint16 member_count;
+			Size wire_len;
+
+			LWLockAcquire(&ClusterMultiXactHintOutbound->lock.lock, LW_EXCLUSIVE);
+			head = pg_atomic_read_u32(&ClusterMultiXactHintOutbound->head);
+			if (head == pg_atomic_read_u32(&ClusterMultiXactHintOutbound->tail))
+			{
+				LWLockRelease(&ClusterMultiXactHintOutbound->lock.lock);
+				break;
+			}
+			local = ClusterMultiXactHintOutbound->slots[head];
+			pg_atomic_write_u32(&ClusterMultiXactHintOutbound->head,
+								(head + 1) % ClusterMultiXactHintOutbound->capacity);
+			LWLockRelease(&ClusterMultiXactHintOutbound->lock.lock);
+
+			/*
+			 * Wire length = 24B header + member_count × 16B members.
+			 * Sender already capped member_count at GUC (emit path);
+			 * receiver re-validates per HC208.
+			 */
+			member_count = local.header.member_count;
+			wire_len = sizeof(ClusterTTStatusHintMsgV4Header)
+					   + (Size)member_count * sizeof(ClusterMultiXactMember);
+
+			cluster_ic_send_envelope_fanout(PGRAC_IC_MSG_TT_STATUS_HINT, &local, wire_len,
 											per_peer);
 		}
 	}
@@ -458,8 +609,70 @@ cluster_tt_status_hint_handle_envelope(const ClusterICEnvelope *env, const void 
 		commit_scn = v3->commit_scn;
 		parent_key_local = v3->parent_key;
 		is_v3_subcommitted = true;
+	} else if (msg_version == CLUSTER_TT_STATUS_HINT_V4) {
+		/*
+		 * PGRAC spec-3.6 D4:  V4 sidecar multixact composition payload.
+		 *
+		 *   Strict payload length:  24B header + member_count × 16B
+		 *   members[].  Receiver MUST validate exact length match.
+		 *   member_count > GUC cap → DROP + overlay_overflow_count +1.
+		 *   anti-spoof:  key.origin_node_id == env->source_node_id.
+		 *   Install via cluster_multixact_member_overlay_install.
+		 *
+		 *   This branch is the L204 sidecar dispatch:  V1/V2/V3 single-key
+		 *   payload path remains byte-for-byte unchanged above.
+		 */
+		const ClusterTTStatusHintMsgV4Header *v4hdr;
+		const ClusterMultiXactMember *v4_members;
+		uint16 v4_member_count;
+		Size expected_len;
+
+		if (env->payload_length < (uint32)sizeof(ClusterTTStatusHintMsgV4Header)) {
+			pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+			return;
+		}
+
+		v4hdr = (const ClusterTTStatusHintMsgV4Header *)payload;
+		v4_member_count = v4hdr->member_count;
+		expected_len = (Size)sizeof(ClusterTTStatusHintMsgV4Header)
+					   + (Size)v4_member_count * sizeof(ClusterMultiXactMember);
+
+		if ((Size)env->payload_length != expected_len) {
+			pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+			return;
+		}
+
+		if (v4_member_count == 0
+			|| (int)v4_member_count > cluster_multixact_member_overlay_max_members) {
+			pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+			return;
+		}
+
+		/* anti-spoof HC186 family:  key.origin_node_id == env source */
+		if ((int32)v4hdr->key.origin_node_id != (int32)env->source_node_id) {
+			pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+			return;
+		}
+
+		/* reserved / pad must be zero (M3 anti-tamper) */
+		if (v4hdr->flags != 0 || v4hdr->payload_kind != 1 || v4hdr->key._pad16 != 0
+			|| v4hdr->key._reserved != 0) {
+			pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_invalid_count, 1);
+			return;
+		}
+
+		v4_members
+			= (const ClusterMultiXactMember *)((const char *)payload
+											   + sizeof(ClusterTTStatusHintMsgV4Header));
+
+		(void)cluster_multixact_member_overlay_install(&v4hdr->key, v4_member_count, v4_members);
+
+		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->receive_count, 1);
+		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->install_count, 1);
+		return; /* V4 path bypasses single-key install below */
 	} else {
-		/* HC187 forward-compat: future V4+ unknown to this receiver. */
+		/* HC187 forward-compat: future V5+ unknown to this receiver. */
+		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->v4_drop_unknown_count, 1);
 		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->drop_unknown_version_count, 1);
 		return;
 	}
@@ -594,6 +807,8 @@ CLUSTER_TT_HINT_GETTER(install_count)
 CLUSTER_TT_HINT_GETTER(drop_v1_compat_count)
 /* PGRAC spec-3.5 D3 */
 CLUSTER_TT_HINT_GETTER(v3_downgrade_count)
+/* PGRAC spec-3.6 D4 */
+CLUSTER_TT_HINT_GETTER(v4_drop_unknown_count)
 
 #else /* !USE_PGRAC_CLUSTER */
 
@@ -653,5 +868,17 @@ CLUSTER_TT_HINT_GETTER_STUB(install_count)
 CLUSTER_TT_HINT_GETTER_STUB(drop_v1_compat_count)
 /* PGRAC spec-3.5 D3 */
 CLUSTER_TT_HINT_GETTER_STUB(v3_downgrade_count)
+/* PGRAC spec-3.6 D4 */
+CLUSTER_TT_HINT_GETTER_STUB(v4_drop_unknown_count)
+
+void
+cluster_tt_status_hint_emit_multixact_overlay(const ClusterMultiXactKey *key,
+											  uint16 member_count,
+											  const ClusterMultiXactMember *members)
+{
+	(void)key;
+	(void)member_count;
+	(void)members;
+}
 
 #endif /* USE_PGRAC_CLUSTER */

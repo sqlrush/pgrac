@@ -78,7 +78,8 @@ struct ClusterICEnvelope;
 typedef enum ClusterTTStatusHintVersion {
 	CLUSTER_TT_STATUS_HINT_V1 = 1,
 	CLUSTER_TT_STATUS_HINT_V2 = 2,
-	CLUSTER_TT_STATUS_HINT_V3 = 3 /* spec-3.5 NEW: SUBCOMMITTED + parent_key */
+	CLUSTER_TT_STATUS_HINT_V3 = 3, /* spec-3.5 NEW: SUBCOMMITTED + parent_key */
+	CLUSTER_TT_STATUS_HINT_V4 = 4  /* spec-3.6 NEW: sidecar — multixact composition */
 } ClusterTTStatusHintVersion;
 
 /*
@@ -246,6 +247,72 @@ extern uint64 cluster_tt_status_hint_get_install_count(void);
 extern uint64 cluster_tt_status_hint_get_drop_v1_compat_count(void);
 /* PGRAC (spec-3.5):  V3 downgrade counter (peer < V3 → skip SUBCOMMITTED emit). */
 extern uint64 cluster_tt_status_hint_get_v3_downgrade_count(void);
+
+/*
+ * PGRAC spec-3.6 D3:  V4 sidecar wire variant.
+ *
+ *	  Sidecar pattern (L204 NEW lesson):  msg_type = PGRAC_IC_MSG_TT_STATUS_HINT
+ *	  reused, msg_version = 4 sub-dispatch to ClusterTTStatusHintMsgV4Header
+ *	  + variable members[].  V1/V2/V3 single-key payload byte-for-byte
+ *	  unchanged;  V4 carries different data model (MultiXact composition).
+ *
+ *	  Strict payload length contract:
+ *	      payload_length == 24 + member_count × 16
+ *	  Receiver mismatch → DROP + drop_invalid_count +1.
+ *	  member_count > cluster.multixact_member_overlay_max_members
+ *	  → DROP + overlay_overflow_count +1.
+ *
+ *	  V1/V2/V3 receivers see msg_version=4 → DROP + drop_unknown_version_count
+ *	  +1 (HC187 forward-compat reject).
+ */
+#include "cluster/cluster_multixact.h" /* ClusterMultiXactKey + ClusterMultiXactMember */
+
+typedef struct ClusterTTStatusHintMsgV4Header
+{
+	uint16 msg_version;		   /* offset  0, 2B = 4 */
+	uint16 payload_kind;	   /* offset  2, 2B = 1 for "multixact overlay" */
+	uint16 flags;			   /* offset  4, 2B zero */
+	uint16 member_count;	   /* offset  6, 2B per-message member count */
+	ClusterMultiXactKey key;   /* offset  8, 16B identity */
+	/* offset 24:  ClusterMultiXactMember members[member_count] (variable) */
+} ClusterTTStatusHintMsgV4Header;
+
+StaticAssertDecl(offsetof(ClusterTTStatusHintMsgV4Header, msg_version) == 0,
+				 "V4 msg_version offset 0 (L203 family)");
+StaticAssertDecl(offsetof(ClusterTTStatusHintMsgV4Header, key) == 8,
+				 "V4 key offset 8 (HC208 wire ABI lock)");
+StaticAssertDecl(sizeof(ClusterTTStatusHintMsgV4Header) == 24,
+				 "V4 header 24B wire-stable (HC208)");
+
+/*
+ * Fixed-size sidecar queue entry for LMON-mediated outbound V4.
+ * V2/V3 outbound ring remains byte-for-byte unchanged;  V4 uses a
+ * separate queue so variable members[] never pollutes single-key entries.
+ */
+#define CLUSTER_MULTIXACT_HINT_MAX_MEMBERS 256
+
+typedef struct ClusterMultiXactHintOutboundEntry
+{
+	ClusterTTStatusHintMsgV4Header header; /* 24B */
+	ClusterMultiXactMember members[CLUSTER_MULTIXACT_HINT_MAX_MEMBERS];
+} ClusterMultiXactHintOutboundEntry;
+
+StaticAssertDecl(sizeof(ClusterMultiXactHintOutboundEntry) == 4120,
+				 "V4 outbound entry = 24 + 256 × 16 (F3/F7)");
+
+/*
+ * cluster_tt_status_hint_emit_multixact_overlay (spec-3.6 D4):
+ *   Enqueue V4 sidecar emit for cross-node MultiXact member overlay
+ *   broadcast.  Used by D5 multixact.c hook end of MultiXactIdCreate /
+ *   Expand (local-all-member path).  Caller must have already installed
+ *   local overlay via cluster_multixact_member_overlay_install.
+ *   Sender member_count > GUC cap → fail-closed (no partial emit).
+ */
+extern void cluster_tt_status_hint_emit_multixact_overlay(const ClusterMultiXactKey *key,
+														  uint16 member_count,
+														  const ClusterMultiXactMember *members);
+
+extern uint64 cluster_tt_status_hint_get_v4_drop_unknown_count(void);
 
 extern Size cluster_tt_status_hint_shmem_size(void);
 extern void cluster_tt_status_hint_shmem_init(void);
