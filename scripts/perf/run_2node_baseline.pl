@@ -181,6 +181,17 @@ elsif ($mode eq '2node-multixact-shared-lock') {
     $node0->safe_psql('postgres', 'SELECT pg_reload_conf()');
     $script_path = File::Spec->catfile($FindBin::RealBin, 'scripts', 'multixact_shared_lock.sql');
 }
+elsif ($mode eq '2node-undo-write-pressure') {
+    # spec-3.7 class 7: single-backend 4 op DML mix to exercise
+    # cluster_undo_record_alloc + per-instance segment + durable flush
+    # (per W2 self-contained no-WAL ordering).  MVP: heap_insert real
+    # undo emit; UPDATE / SELECT FOR SHARE / DELETE fall through TT-only
+    # path under MVP (Hardening v1.0.2 H-4/5/6 amend pending).
+    $node0->safe_psql('postgres',
+        'ALTER SYSTEM SET cluster.undo_record_inline_max_bytes = 1024');
+    $node0->safe_psql('postgres', 'SELECT pg_reload_conf()');
+    $script_path = File::Spec->catfile($FindBin::RealBin, 'scripts', 'undo_write_pressure.sql');
+}
 else {
     $pair->stop_pair;
     die "unknown mode: $mode\n";
