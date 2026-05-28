@@ -42,7 +42,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_tt_slot_allocator test_cluster_itl_reader_real_triple \
         test_cluster_itl_cleanout test_cluster_visibility_inject test_cluster_itl_cleanout_perf \
         test_cluster_heap_lock_tuple test_cluster_perf_gates \
-        test_cluster_subtrans test_cluster_multixact
+        test_cluster_subtrans test_cluster_multixact test_cluster_undo_format
 
 # Path to the cluster_version object (no PG deps, safe to link standalone).
 CLUSTER_VERSION_O = $(top_builddir)/src/backend/cluster/cluster_version.o
@@ -839,6 +839,17 @@ test_cluster_subtrans: test_cluster_subtrans.c unit_test.h \
 # Behavioural lifecycle / overlay install / resolve_visibility coverage
 # lives in cluster_tap t/212.
 test_cluster_multixact: test_cluster_multixact.c unit_test.h \
+		$(CLUSTER_VERSION_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-3.7 D12: test_cluster_undo_format — 12 pure ABI / offsetof /
+# sizeof / magic / enum / SQLSTATE tests for Undo Record Format +
+# Allocator module + HC211-HC217 ABI lock.  Behavioural / DML emit /
+# allocator runtime coverage lives in cluster_tap t/213 (D13).
+test_cluster_undo_format: test_cluster_undo_format.c unit_test.h \
 		$(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
