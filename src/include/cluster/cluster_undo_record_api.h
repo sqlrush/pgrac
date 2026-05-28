@@ -43,12 +43,12 @@
 #ifndef FRONTEND
 
 #include "postgres.h"
-#include "access/transam.h"			/* TransactionId */
-#include "storage/relfilelocator.h" /* RelFileLocator */
-#include "storage/block.h"			/* BlockNumber */
-#include "storage/itemptr.h"		/* OffsetNumber */
-#include "common/relpath.h"			/* ForkNumber */
-#include "cluster/cluster_itl_slot.h"  /* UBA */
+#include "access/transam.h"				 /* TransactionId */
+#include "storage/relfilelocator.h"		 /* RelFileLocator */
+#include "storage/block.h"				 /* BlockNumber */
+#include "storage/itemptr.h"			 /* OffsetNumber */
+#include "common/relpath.h"				 /* ForkNumber */
+#include "cluster/cluster_itl_slot.h"	 /* UBA */
 #include "cluster/cluster_undo_record.h" /* UndoRecordType */
 
 
@@ -58,13 +58,12 @@
  *	supply RelFileLocator + ForkNumber + BlockNumber + OffsetNumber
  *	(per codex review F4).
  */
-typedef struct ClusterUndoRecordTarget
-{
-	RelFileLocator	locator;
-	ForkNumber		forknum;
-	BlockNumber		blockno;
-	OffsetNumber	offnum;
-	uint16			_pad;	/* alignment */
+typedef struct ClusterUndoRecordTarget {
+	RelFileLocator locator;
+	ForkNumber forknum;
+	BlockNumber blockno;
+	OffsetNumber offnum;
+	uint16 _pad; /* alignment */
 } ClusterUndoRecordTarget;
 
 StaticAssertDecl(sizeof(ClusterUndoRecordTarget) == 24,
@@ -97,13 +96,9 @@ StaticAssertDecl(sizeof(ClusterUndoRecordTarget) == 24,
  *	storage before this function returns).  TT/ITL slot UBA publication
  *	occurs AFTER this function returns,inside START_CRIT_SECTION.
  */
-extern UBA cluster_undo_record_alloc(uint8 record_type,
-									 const ClusterUndoRecordTarget *target,
-									 uint16 tt_slot_segment_id,
-									 uint16 tt_slot_offset,
-									 const void *payload,
-									 uint16 payload_len,
-									 UBA prev_uba);
+extern UBA cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *target,
+									 uint16 tt_slot_segment_id, uint16 tt_slot_offset,
+									 const void *payload, uint16 payload_len, UBA prev_uba);
 
 
 /*

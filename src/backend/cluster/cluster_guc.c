@@ -1317,23 +1317,22 @@ cluster_init_guc(void)
 	/*
 	 * spec-3.7 D9 — 3 NEW undo GUCs.
 	 */
-	DefineCustomStringVariable("cluster.undo_tablespace_path",
-							   gettext_noop("Relative path under PGDATA for the per-instance undo tablespace."),
-							   gettext_noop("Spec-3.7 D9. Default \"pg_undo\". Per-instance subdir "
-											"layout pg_undo/instance_<N>/seg_<id>.dat. PGC_POSTMASTER "
-											"because runtime change would race segment lookups; "
-											"hot-add tablespace path 推 spec-3.8 lifecycle."),
-							   &cluster_undo_tablespace_path, "pg_undo", PGC_POSTMASTER, 0,
-							   NULL, NULL, NULL);
+	DefineCustomStringVariable(
+		"cluster.undo_tablespace_path",
+		gettext_noop("Relative path under PGDATA for the per-instance undo tablespace."),
+		gettext_noop("Spec-3.7 D9. Default \"pg_undo\". Per-instance subdir "
+					 "layout pg_undo/instance_<N>/seg_<id>.dat. PGC_POSTMASTER "
+					 "because runtime change would race segment lookups; "
+					 "hot-add tablespace path 推 spec-3.8 lifecycle."),
+		&cluster_undo_tablespace_path, "pg_undo", PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
-	DefineCustomIntVariable("cluster.undo_segment_size_mb",
-							gettext_noop("Per-segment file size in MB."),
-							gettext_noop("Spec-3.7 D9. Default 32 MB. Affects per-instance "
-										 "undo capacity (= undo_segments_per_instance × this). "
-										 "PGC_POSTMASTER — segment header at block 0 encodes "
-										 "segment_size_blocks at create time."),
-							&cluster_undo_segment_size_mb, 32, 8, 1024, PGC_POSTMASTER, 0,
-							NULL, NULL, NULL);
+	DefineCustomIntVariable(
+		"cluster.undo_segment_size_mb", gettext_noop("Per-segment file size in MB."),
+		gettext_noop("Spec-3.7 D9. Default 32 MB. Affects per-instance "
+					 "undo capacity (= undo_segments_per_instance × this). "
+					 "PGC_POSTMASTER — segment header at block 0 encodes "
+					 "segment_size_blocks at create time."),
+		&cluster_undo_segment_size_mb, 32, 8, 1024, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	DefineCustomIntVariable("cluster.undo_record_inline_max_bytes",
 							gettext_noop("Maximum inline payload size for a single undo record."),

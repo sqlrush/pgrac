@@ -93,8 +93,8 @@ UT_TEST(test_undo_record_header)
 UT_TEST(test_undo_record_target)
 {
 	/* RelFileLocator(12) + ForkNumber(4) + BlockNumber(4) + OffsetNumber(2) + pad(2) = 24 */
-	UT_ASSERT_EQ((int) (sizeof(RelFileLocator) + sizeof(ForkNumber)
-						+ sizeof(BlockNumber) + sizeof(OffsetNumber) + 2),
+	UT_ASSERT_EQ((int)(sizeof(RelFileLocator) + sizeof(ForkNumber) + sizeof(BlockNumber)
+					   + sizeof(OffsetNumber) + 2),
 				 24);
 }
 
@@ -140,7 +140,7 @@ UT_TEST(test_undo_itl_payload)
 /* ---- T9: magic constant ---- */
 UT_TEST(test_undo_block_magic)
 {
-	UT_ASSERT_EQ((long long) PGRAC_UNDO_BLOCK_MAGIC, (long long) 0x55444F31U);
+	UT_ASSERT_EQ((long long)PGRAC_UNDO_BLOCK_MAGIC, (long long)0x55444F31U);
 	UT_ASSERT_EQ(UNDO_BLOCK_VERSION_1, 1);
 }
 
@@ -157,8 +157,7 @@ UT_TEST(test_undo_record_type)
 /* ---- T11: 53R9D SQLSTATE ---- */
 UT_TEST(test_sqlstate_53R9D)
 {
-	UT_ASSERT_EQ(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA,
-				 MAKE_SQLSTATE('5','3','R','9','D'));
+	UT_ASSERT_EQ(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA, MAKE_SQLSTATE('5', '3', 'R', '9', 'D'));
 }
 
 /* ---- T12: cluster_undo_block_has_space helper ---- */

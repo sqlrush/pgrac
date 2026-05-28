@@ -84,16 +84,15 @@
  *	+ _pad12(4) + first_change_scn(8, SCN 8B-aligned)+ first_change_lsn(8)
  *	+ crc64(8) = 40 bytes.  spec body 32B claim missed SCN alignment pad.
  */
-typedef struct UndoBlockHeader
-{
-	uint32 magic;			   /* offset  0,  PGRAC_UNDO_BLOCK_MAGIC */
-	uint16 block_version;	   /* offset  4,  UNDO_BLOCK_VERSION_1 */
-	uint16 slot_count;		   /* offset  6,  # of records in this block */
-	uint32 free_offset;		   /* offset  8,  byte offset to next free byte */
-	uint32 _pad12;			   /* offset 12,  alignment to 8B for SCN below */
-	SCN	   first_change_scn;   /* offset 16,  SCN of first record in block */
+typedef struct UndoBlockHeader {
+	uint32 magic;				 /* offset  0,  PGRAC_UNDO_BLOCK_MAGIC */
+	uint16 block_version;		 /* offset  4,  UNDO_BLOCK_VERSION_1 */
+	uint16 slot_count;			 /* offset  6,  # of records in this block */
+	uint32 free_offset;			 /* offset  8,  byte offset to next free byte */
+	uint32 _pad12;				 /* offset 12,  alignment to 8B for SCN below */
+	SCN first_change_scn;		 /* offset 16,  SCN of first record in block */
 	XLogRecPtr first_change_lsn; /* offset 24,  PG LSN at first record (cross-correlation) */
-	uint64 crc64;			   /* offset 32,  block self CRC (computed with crc64 field zeroed) */
+	uint64 crc64;				 /* offset 32,  block self CRC (computed with crc64 field zeroed) */
 } UndoBlockHeader;
 
 StaticAssertDecl(sizeof(UndoBlockHeader) == 40,
@@ -103,7 +102,7 @@ StaticAssertDecl(sizeof(UndoBlockHeader) == 40,
 #define UNDO_BLOCK_PAYLOAD_BYTES (BLCKSZ - sizeof(UndoBlockHeader))
 
 /* Initial free_offset value when block is fresh. */
-#define UNDO_BLOCK_INIT_FREE_OFFSET ((uint32) sizeof(UndoBlockHeader))
+#define UNDO_BLOCK_INIT_FREE_OFFSET ((uint32)sizeof(UndoBlockHeader))
 
 
 /*
@@ -113,16 +112,14 @@ StaticAssertDecl(sizeof(UndoBlockHeader) == 40,
  *	The UBA row_offset (spec-3.4b) addresses the slot index;  reader follows
  *	slot → record bytes.
  */
-typedef struct UndoSlotDirEntry
-{
+typedef struct UndoSlotDirEntry {
 	uint32 record_offset; /* byte offset within block to record start */
 	uint16 record_length; /* total record byte length (header + payload) */
-	uint8  record_type;	  /* UNDO_INSERT / UNDO_UPDATE / UNDO_DELETE / UNDO_ITL */
-	uint8  flags;		  /* FIRST_IN_TX / CONTINUED / TOAST / etc. */
+	uint8 record_type;	  /* UNDO_INSERT / UNDO_UPDATE / UNDO_DELETE / UNDO_ITL */
+	uint8 flags;		  /* FIRST_IN_TX / CONTINUED / TOAST / etc. */
 } UndoSlotDirEntry;
 
-StaticAssertDecl(sizeof(UndoSlotDirEntry) == 8,
-				 "UndoSlotDirEntry must be 8B — HC212");
+StaticAssertDecl(sizeof(UndoSlotDirEntry) == 8, "UndoSlotDirEntry must be 8B — HC212");
 
 
 /*
@@ -131,10 +128,10 @@ StaticAssertDecl(sizeof(UndoSlotDirEntry) == 8,
  *	Slots grow downward from end of block.  Slot 0 is at offset BLCKSZ-8;
  *	slot N is at offset BLCKSZ - 8*(N+1).
  */
-#define UNDO_SLOT_DIR_OFFSET(slot_idx) \
-	((uint32) (BLCKSZ - (((uint32)(slot_idx) + 1) * sizeof(UndoSlotDirEntry))))
+#define UNDO_SLOT_DIR_OFFSET(slot_idx)                                                             \
+	((uint32)(BLCKSZ - (((uint32)(slot_idx) + 1) * sizeof(UndoSlotDirEntry))))
 
-#define UNDO_SLOT_DIR_PTR(block_buf, slot_idx) \
+#define UNDO_SLOT_DIR_PTR(block_buf, slot_idx)                                                     \
 	((UndoSlotDirEntry *)((char *)(block_buf) + UNDO_SLOT_DIR_OFFSET(slot_idx)))
 
 
@@ -145,7 +142,7 @@ StaticAssertDecl(sizeof(UndoSlotDirEntry) == 8,
 static inline bool
 cluster_undo_block_has_space(uint32 free_offset, uint16 slot_count, uint16 record_length)
 {
-	uint32 slot_dir_low = (uint32) BLCKSZ - ((uint32) (slot_count + 1) * sizeof(UndoSlotDirEntry));
+	uint32 slot_dir_low = (uint32)BLCKSZ - ((uint32)(slot_count + 1) * sizeof(UndoSlotDirEntry));
 
 	return (free_offset + record_length) <= slot_dir_low;
 }

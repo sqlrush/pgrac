@@ -73,12 +73,11 @@
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/storage/cluster_undo_alloc.h"
 
-#include "access/xlog.h"  /* GetXLogWriteRecPtr */
+#include "access/xlog.h" /* GetXLogWriteRecPtr */
 
 /* Local helper to express InvalidUba sentinel (all-zero UBA). */
 static const UBA InvalidUbaVal = InvalidUba_init;
 #define InvalidUba (InvalidUbaVal)
-
 
 
 /*
@@ -95,14 +94,13 @@ static const UBA InvalidUbaVal = InvalidUba_init;
  *	  - 5 atomic counters
  *	  - cursor_lock       : LWLock protect cursor advance
  */
-typedef struct ClusterUndoRecordShared
-{
+typedef struct ClusterUndoRecordShared {
 	uint32 active_segment_id;
 	uint32 current_block;
 	uint32 free_offset;
 	uint16 slot_count;
 	uint16 block_dirty;
-	SCN	   block_first_scn;
+	SCN block_first_scn;
 	uint32 _pad_align;
 
 	pg_atomic_uint64 record_alloc_count;
@@ -156,12 +154,10 @@ cluster_undo_record_shmem_init(void)
 {
 	bool found;
 
-	UndoRecordShared = ShmemInitStruct("ClusterUndoRecordShared",
-									   cluster_undo_record_shmem_size(),
-									   &found);
+	UndoRecordShared
+		= ShmemInitStruct("ClusterUndoRecordShared", cluster_undo_record_shmem_size(), &found);
 
-	if (!found)
-	{
+	if (!found) {
 		MemSet(UndoRecordShared, 0, sizeof(*UndoRecordShared));
 		UndoRecordShared->active_segment_id = 0;
 		UndoRecordShared->current_block = 0;
@@ -176,8 +172,7 @@ cluster_undo_record_shmem_init(void)
 		pg_atomic_init_u64(&UndoRecordShared->block_flush_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->reader_lookup_count, 0);
 
-		LWLockInitialize(&UndoRecordShared->cursor_lock.lock,
-						 LWLockNewTrancheId());
+		LWLockInitialize(&UndoRecordShared->cursor_lock.lock, LWLockNewTrancheId());
 		LWLockRegisterTranche(UndoRecordShared->cursor_lock.lock.tranche,
 							  "cluster_undo_record_cursor");
 	}
@@ -189,7 +184,7 @@ cluster_undo_record_shmem_init(void)
 static inline uint16
 undo_record_total_length(uint8 record_type, uint16 payload_len)
 {
-	return (uint16) (sizeof(UndoRecordHeader) + payload_len);
+	return (uint16)(sizeof(UndoRecordHeader) + payload_len);
 }
 
 
@@ -199,8 +194,8 @@ static int
 open_segment_fd(uint32 segment_id, uint8 owner_instance)
 {
 	char path[MAXPGPATH];
-	int	 ret;
-	int	 fd;
+	int ret;
+	int fd;
 
 	ret = cluster_undo_path_resolve(owner_instance, segment_id, path, sizeof(path));
 	if (ret != 0)
@@ -214,16 +209,16 @@ open_segment_fd(uint32 segment_id, uint8 owner_instance)
 static bool
 read_undo_block(uint32 segment_id, uint8 owner_instance, uint32 block_no, char *buf)
 {
-	int		fd;
-	off_t	offset;
+	int fd;
+	off_t offset;
 	ssize_t nread;
-	bool	ok;
+	bool ok;
 
 	fd = open_segment_fd(segment_id, owner_instance);
 	if (fd < 0)
 		return false;
 
-	offset = (off_t) block_no * BLCKSZ;
+	offset = (off_t)block_no * BLCKSZ;
 	nread = pg_pread(fd, buf, BLCKSZ, offset);
 	ok = (nread == BLCKSZ);
 
@@ -233,25 +228,24 @@ read_undo_block(uint32 segment_id, uint8 owner_instance, uint32 block_no, char *
 
 
 static bool
-write_undo_block(uint32 segment_id, uint8 owner_instance, uint32 block_no,
-				 const char *buf, bool do_fsync)
+write_undo_block(uint32 segment_id, uint8 owner_instance, uint32 block_no, const char *buf,
+				 bool do_fsync)
 {
-	int		fd;
-	off_t	offset;
+	int fd;
+	off_t offset;
 	ssize_t nwritten;
-	bool	ok = true;
+	bool ok = true;
 
 	fd = open_segment_fd(segment_id, owner_instance);
 	if (fd < 0)
 		return false;
 
-	offset = (off_t) block_no * BLCKSZ;
+	offset = (off_t)block_no * BLCKSZ;
 	nwritten = pg_pwrite(fd, buf, BLCKSZ, offset);
 	if (nwritten != BLCKSZ)
 		ok = false;
 
-	if (ok && do_fsync)
-	{
+	if (ok && do_fsync) {
 		if (pg_fsync(fd) != 0)
 			ok = false;
 	}
@@ -284,13 +278,9 @@ write_undo_block(uint32 segment_id, uint8 owner_instance, uint32 block_no,
  *	  14. Encode UBA and return
  */
 UBA
-cluster_undo_record_alloc(uint8 record_type,
-						  const ClusterUndoRecordTarget *target,
-						  uint16 tt_slot_segment_id,
-						  uint16 tt_slot_offset,
-						  const void *payload,
-						  uint16 payload_len,
-						  UBA prev_uba)
+cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *target,
+						  uint16 tt_slot_segment_id, uint16 tt_slot_offset, const void *payload,
+						  uint16 payload_len, UBA prev_uba)
 {
 	UBA result = InvalidUba;
 	uint16 record_length;
@@ -319,7 +309,7 @@ cluster_undo_record_alloc(uint8 record_type,
 	record_length = undo_record_total_length(record_type, payload_len);
 
 	/* Enforce inline cap GUC. */
-	inline_cap = (uint16) cluster_undo_record_inline_max_bytes;
+	inline_cap = (uint16)cluster_undo_record_inline_max_bytes;
 	if (payload_len > inline_cap)
 		return InvalidUba; /* caller ereport 53R9D oversize */
 
@@ -329,7 +319,7 @@ cluster_undo_record_alloc(uint8 record_type,
 
 	/* Owner instance is current node_id + 1 (per cluster_undo_alloc.c
 	 * convention: owner_instance is 1-indexed). */
-	owner_instance = (uint8) (cluster_node_id + 1);
+	owner_instance = (uint8)(cluster_node_id + 1);
 
 	/* SCN stamp for write_scn (advance Lamport). */
 	current_scn = cluster_scn_advance();
@@ -338,11 +328,9 @@ cluster_undo_record_alloc(uint8 record_type,
 
 	/* Claim active segment if none. */
 	segment_id = UndoRecordShared->active_segment_id;
-	if (segment_id == 0)
-	{
+	if (segment_id == 0) {
 		segment_id = cluster_undo_active_segment_for_node_or_create(cluster_node_id);
-		if (segment_id == 0)
-		{
+		if (segment_id == 0) {
 			LWLockRelease(&UndoRecordShared->cursor_lock.lock);
 			return InvalidUba; /* segment claim failed */
 		}
@@ -360,12 +348,10 @@ cluster_undo_record_alloc(uint8 record_type,
 	slot_count = UndoRecordShared->slot_count;
 
 	/* Check block fit;  advance to next block if needed. */
-	if (!cluster_undo_block_has_space(free_offset, slot_count, record_length))
-	{
+	if (!cluster_undo_block_has_space(free_offset, slot_count, record_length)) {
 		/* Advance to next block. */
 		current_block++;
-		if (current_block >= UNDO_BLOCKS_PER_SEGMENT)
-		{
+		if (current_block >= UNDO_BLOCKS_PER_SEGMENT) {
 			/* Segment exhausted — fail-closed.  spec-3.8 lifecycle
 			 * will autoextend; for now caller gets 53R9D. */
 			LWLockRelease(&UndoRecordShared->cursor_lock.lock);
@@ -380,11 +366,10 @@ cluster_undo_record_alloc(uint8 record_type,
 	}
 
 	/* Read current block (or zeroed if first write to this block). */
-	if (slot_count == 0)
-	{
+	if (slot_count == 0) {
 		/* Fresh block — init zeroed buffer + header. */
 		MemSet(block_buf, 0, BLCKSZ);
-		blkhdr = (UndoBlockHeader *) block_buf;
+		blkhdr = (UndoBlockHeader *)block_buf;
 		blkhdr->magic = PGRAC_UNDO_BLOCK_MAGIC;
 		blkhdr->block_version = UNDO_BLOCK_VERSION_1;
 		blkhdr->slot_count = 0;
@@ -392,28 +377,24 @@ cluster_undo_record_alloc(uint8 record_type,
 		blkhdr->first_change_scn = current_scn;
 		blkhdr->first_change_lsn = GetXLogWriteRecPtr();
 		blkhdr->crc64 = 0;
-	}
-	else
-	{
-		if (!read_undo_block(segment_id, owner_instance, current_block, block_buf))
-		{
+	} else {
+		if (!read_undo_block(segment_id, owner_instance, current_block, block_buf)) {
 			LWLockRelease(&UndoRecordShared->cursor_lock.lock);
 			return InvalidUba; /* I/O fail */
 		}
-		blkhdr = (UndoBlockHeader *) block_buf;
+		blkhdr = (UndoBlockHeader *)block_buf;
 	}
 
 	/* Construct UndoRecordHeader at free_offset. */
-	rechdr = (UndoRecordHeader *) (block_buf + free_offset);
+	rechdr = (UndoRecordHeader *)(block_buf + free_offset);
 	MemSet(rechdr, 0, sizeof(UndoRecordHeader));
 	rechdr->record_type = record_type;
-	rechdr->flags = (slot_count == 0 && current_block == 1)
-		? UNDO_REC_FLAG_FIRST_IN_TX : 0;
+	rechdr->flags = (slot_count == 0 && current_block == 1) ? UNDO_REC_FLAG_FIRST_IN_TX : 0;
 	rechdr->payload_length = payload_len;
 	rechdr->xid = GetCurrentTransactionIdIfAny();
-	rechdr->origin_node_id = (uint16) cluster_node_id;
+	rechdr->origin_node_id = (uint16)cluster_node_id;
 	rechdr->tt_slot_segment_id = tt_slot_segment_id;
-	rechdr->tt_slot_id = (uint32) tt_slot_offset;
+	rechdr->tt_slot_id = (uint32)tt_slot_offset;
 	rechdr->write_scn = current_scn;
 	rechdr->prev_uba = prev_uba;
 	rechdr->target_locator = target->locator;
@@ -422,8 +403,7 @@ cluster_undo_record_alloc(uint8 record_type,
 	rechdr->target_offset = target->offnum;
 
 	/* Copy op-specific payload bytes after the header. */
-	memcpy(block_buf + free_offset + sizeof(UndoRecordHeader),
-		   payload, payload_len);
+	memcpy(block_buf + free_offset + sizeof(UndoRecordHeader), payload, payload_len);
 
 	/* Append slot directory entry. */
 	new_slot_idx = slot_count;
@@ -434,13 +414,12 @@ cluster_undo_record_alloc(uint8 record_type,
 	slot->flags = rechdr->flags;
 
 	/* Update block header. */
-	blkhdr->slot_count = (uint16) (slot_count + 1);
+	blkhdr->slot_count = (uint16)(slot_count + 1);
 	blkhdr->free_offset = free_offset + record_length;
 
 	/* Write block back to file. */
-	if (!write_undo_block(segment_id, owner_instance, current_block,
-						  block_buf, /* do_fsync = */ true))
-	{
+	if (!write_undo_block(segment_id, owner_instance, current_block, block_buf,
+						  /* do_fsync = */ true)) {
 		LWLockRelease(&UndoRecordShared->cursor_lock.lock);
 		return InvalidUba; /* I/O fail */
 	}
@@ -450,7 +429,7 @@ cluster_undo_record_alloc(uint8 record_type,
 
 	/* Advance shared cursor. */
 	UndoRecordShared->free_offset = free_offset + record_length;
-	UndoRecordShared->slot_count = (uint16) (slot_count + 1);
+	UndoRecordShared->slot_count = (uint16)(slot_count + 1);
 	UndoRecordShared->block_dirty = 0; /* just flushed */
 
 	pg_atomic_fetch_add_u64(&UndoRecordShared->record_alloc_count, 1);
@@ -462,8 +441,7 @@ cluster_undo_record_alloc(uint8 record_type,
 
 	/* Encode UBA per spec-3.4b: (segment_id, block_no, tt_slot_offset, row_offset).
 	 * For undo records, row_offset = slot-dir index within block. */
-	result = uba_encode((uint32) segment_id, current_block,
-						tt_slot_offset, new_slot_idx);
+	result = uba_encode((uint32)segment_id, current_block, tt_slot_offset, new_slot_idx);
 
 	return result;
 }
@@ -491,11 +469,10 @@ cluster_undo_get_record(UBA uba, void *out_buffer, size_t buffer_size)
 
 	/* Map segment_id back to owner_instance.  Per spec-3.4b convention:
 	 *   owner_instance = (segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE + 1 */
-	owner_instance = (uint8) ((segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE + 1);
+	owner_instance = (uint8)((segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE + 1);
 
 	/* Own-instance only at spec-3.7. */
-	if (owner_instance != (uint8) (cluster_node_id + 1))
-	{
+	if (owner_instance != (uint8)(cluster_node_id + 1)) {
 		ereport(WARNING,
 				(errmsg("cluster_undo_get_record: cross-instance read not supported at spec-3.7"),
 				 errhint("cross-instance undo read 推 spec-3.9 CR construction / Cache Fusion")));
@@ -505,7 +482,7 @@ cluster_undo_get_record(UBA uba, void *out_buffer, size_t buffer_size)
 	if (!read_undo_block(segment_id, owner_instance, block_no, block_buf))
 		return 0;
 
-	blkhdr = (UndoBlockHeader *) block_buf;
+	blkhdr = (UndoBlockHeader *)block_buf;
 	if (blkhdr->magic != PGRAC_UNDO_BLOCK_MAGIC)
 		return 0;
 

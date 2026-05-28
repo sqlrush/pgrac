@@ -57,13 +57,13 @@
 #define CLUSTER_UNDO_RECORD_H
 
 #include "c.h"
-#include "access/transam.h"		   /* TransactionId */
-#include "storage/block.h"		   /* BlockNumber */
-#include "storage/itemptr.h"	   /* OffsetNumber */
-#include "storage/relfilelocator.h" /* RelFileLocator */
-#include "common/relpath.h"		   /* ForkNumber */
-#include "cluster/cluster_scn.h"   /* SCN */
-#include "cluster/cluster_itl_slot.h" /* UBA */
+#include "access/transam.h"				 /* TransactionId */
+#include "storage/block.h"				 /* BlockNumber */
+#include "storage/itemptr.h"			 /* OffsetNumber */
+#include "storage/relfilelocator.h"		 /* RelFileLocator */
+#include "common/relpath.h"				 /* ForkNumber */
+#include "cluster/cluster_scn.h"		 /* SCN */
+#include "cluster/cluster_itl_slot.h"	 /* UBA */
 #include "cluster/cluster_undo_format.h" /* UndoBlockHeader for cap macro */
 
 
@@ -73,8 +73,7 @@
  *	Values match spec-3.7 §2.1 + D6 DML emit hook mapping.
  *	0 reserved as invalid sentinel.
  */
-typedef enum UndoRecordType
-{
+typedef enum UndoRecordType {
 	UNDO_RECORD_INVALID = 0,
 	UNDO_RECORD_INSERT = 1,
 	UNDO_RECORD_UPDATE = 2,
@@ -87,8 +86,8 @@ typedef enum UndoRecordType
  * UndoRecordFlags -- record header flags field.
  */
 #define UNDO_REC_FLAG_FIRST_IN_TX 0x01 /* first record in this xid's undo chain */
-#define UNDO_REC_FLAG_CONTINUED	  0x02 /* continued from previous block (future) */
-#define UNDO_REC_FLAG_TOAST		  0x04 /* payload references TOAST (future) */
+#define UNDO_REC_FLAG_CONTINUED 0x02   /* continued from previous block (future) */
+#define UNDO_REC_FLAG_TOAST 0x04	   /* payload references TOAST (future) */
 
 
 /*
@@ -115,26 +114,24 @@ typedef enum UndoRecordType
  *	  ------  ----
  *	  64    total
  */
-typedef struct UndoRecordHeader
-{
-	uint8			record_type;		/* offset  0 */
-	uint8			flags;				/* offset  1 */
-	uint16			payload_length;		/* offset  2 */
-	TransactionId	xid;				/* offset  4 */
-	uint16			origin_node_id;		/* offset  8 */
-	uint16			tt_slot_segment_id; /* offset 10 */
-	uint32			tt_slot_id;			/* offset 12 */
-	SCN				write_scn;			/* offset 16 */
-	UBA				prev_uba;			/* offset 24 (16B) */
-	RelFileLocator	target_locator;		/* offset 40 (12B) */
-	ForkNumber		target_fork;		/* offset 52 (4B) */
-	BlockNumber		target_block;		/* offset 56 */
-	OffsetNumber	target_offset;		/* offset 60 (2B) */
-	uint16			_pad_target;		/* offset 62, alignment */
+typedef struct UndoRecordHeader {
+	uint8 record_type;			   /* offset  0 */
+	uint8 flags;				   /* offset  1 */
+	uint16 payload_length;		   /* offset  2 */
+	TransactionId xid;			   /* offset  4 */
+	uint16 origin_node_id;		   /* offset  8 */
+	uint16 tt_slot_segment_id;	   /* offset 10 */
+	uint32 tt_slot_id;			   /* offset 12 */
+	SCN write_scn;				   /* offset 16 */
+	UBA prev_uba;				   /* offset 24 (16B) */
+	RelFileLocator target_locator; /* offset 40 (12B) */
+	ForkNumber target_fork;		   /* offset 52 (4B) */
+	BlockNumber target_block;	   /* offset 56 */
+	OffsetNumber target_offset;	   /* offset 60 (2B) */
+	uint16 _pad_target;			   /* offset 62, alignment */
 } UndoRecordHeader;
 
-StaticAssertDecl(sizeof(UndoRecordHeader) == 64,
-				 "UndoRecordHeader must be 64B — HC213");
+StaticAssertDecl(sizeof(UndoRecordHeader) == 64, "UndoRecordHeader must be 64B — HC213");
 
 
 /*
@@ -144,8 +141,7 @@ StaticAssertDecl(sizeof(UndoRecordHeader) == 64,
  *	Payload only carries optional sanity length + flags;  rollback apply
  *	(spec-3.X) does heap delete at target_block:target_offset.
  */
-typedef struct UndoInsertPayload
-{
+typedef struct UndoInsertPayload {
 	uint16 inserted_tuple_len; /* optional sanity length; 0 for delete-line-pointer undo */
 	uint16 flags;
 } UndoInsertPayload;
@@ -161,13 +157,12 @@ StaticAssertDecl(sizeof(UndoInsertPayload) == 4, "UndoInsertPayload must be 4B �
  *	old tuple location.  new_block/new_offset locate replacement tuple
  *	(for HOT chain reconstruction in spec-3.9 CR construction).
  */
-typedef struct UndoUpdatePayload
-{
-	BlockNumber	 new_block;		   /* offset  0,  replacement tuple location */
-	OffsetNumber new_offset;	   /* offset  4 */
-	uint16		 old_tuple_length; /* offset  6,  HeapTupleHeaderData + data byte count */
-	uint16		 old_tuple_offset; /* offset  8,  offset within record to old tuple bytes */
-	uint16		 flags;			   /* offset 10 */
+typedef struct UndoUpdatePayload {
+	BlockNumber new_block;	 /* offset  0,  replacement tuple location */
+	OffsetNumber new_offset; /* offset  4 */
+	uint16 old_tuple_length; /* offset  6,  HeapTupleHeaderData + data byte count */
+	uint16 old_tuple_offset; /* offset  8,  offset within record to old tuple bytes */
+	uint16 flags;			 /* offset 10 */
 } UndoUpdatePayload;
 
 StaticAssertDecl(sizeof(UndoUpdatePayload) == 12, "UndoUpdatePayload must be 12B — HC215");
@@ -180,10 +175,9 @@ StaticAssertDecl(sizeof(UndoUpdatePayload) == 12, "UndoUpdatePayload must be 12B
  *	Common header target_locator + target_block + target_offset identify
  *	deleted tuple location.
  */
-typedef struct UndoDeletePayload
-{
-	uint16 full_tuple_length;  /* HeapTupleHeaderData + data byte count */
-	uint16 full_tuple_offset;  /* offset within record to tuple bytes */
+typedef struct UndoDeletePayload {
+	uint16 full_tuple_length; /* HeapTupleHeaderData + data byte count */
+	uint16 full_tuple_offset; /* offset within record to tuple bytes */
 	uint32 flags;
 } UndoDeletePayload;
 
@@ -197,18 +191,17 @@ StaticAssertDecl(sizeof(UndoDeletePayload) == 8, "UndoDeletePayload must be 8B �
  *	transition.  Used by spec-3.X rollback apply for ROLLBACK after
  *	SELECT ... FOR SHARE / FOR UPDATE / FOR NO KEY UPDATE.
  */
-typedef struct UndoItlPayload
-{
-	uint8			itl_slot_idx;
-	uint8			prev_flags;		   /* ITL_FLAG_* before transition */
-	uint8			new_flags;		   /* ITL_FLAG_* after */
-	uint8			lock_mode;		   /* HEAP_XMAX_* semantic snapshot */
-	TransactionId	lock_xid;
-	TransactionId	prev_xmax;		   /* tuple header before lock-only change */
-	uint16			prev_infomask;
-	uint16			prev_infomask2;
-	SCN				prev_commit_scn;
-	UBA				prev_undo_segment_head; /* 16B */
+typedef struct UndoItlPayload {
+	uint8 itl_slot_idx;
+	uint8 prev_flags; /* ITL_FLAG_* before transition */
+	uint8 new_flags;  /* ITL_FLAG_* after */
+	uint8 lock_mode;  /* HEAP_XMAX_* semantic snapshot */
+	TransactionId lock_xid;
+	TransactionId prev_xmax; /* tuple header before lock-only change */
+	uint16 prev_infomask;
+	uint16 prev_infomask2;
+	SCN prev_commit_scn;
+	UBA prev_undo_segment_head; /* 16B */
 } UndoItlPayload;
 
 StaticAssertDecl(sizeof(UndoItlPayload) == 40, "UndoItlPayload must be 40B — HC217");
@@ -217,17 +210,15 @@ StaticAssertDecl(sizeof(UndoItlPayload) == 40, "UndoItlPayload must be 40B — H
 /*
  * Convenience macros for record total length computation.
  */
-#define UNDO_REC_INSERT_TOTAL_LEN \
-	(sizeof(UndoRecordHeader) + sizeof(UndoInsertPayload))
+#define UNDO_REC_INSERT_TOTAL_LEN (sizeof(UndoRecordHeader) + sizeof(UndoInsertPayload))
 
-#define UNDO_REC_UPDATE_TOTAL_LEN(tuple_bytes) \
+#define UNDO_REC_UPDATE_TOTAL_LEN(tuple_bytes)                                                     \
 	(sizeof(UndoRecordHeader) + sizeof(UndoUpdatePayload) + (tuple_bytes))
 
-#define UNDO_REC_DELETE_TOTAL_LEN(tuple_bytes) \
+#define UNDO_REC_DELETE_TOTAL_LEN(tuple_bytes)                                                     \
 	(sizeof(UndoRecordHeader) + sizeof(UndoDeletePayload) + (tuple_bytes))
 
-#define UNDO_REC_ITL_TOTAL_LEN \
-	(sizeof(UndoRecordHeader) + sizeof(UndoItlPayload))
+#define UNDO_REC_ITL_TOTAL_LEN (sizeof(UndoRecordHeader) + sizeof(UndoItlPayload))
 
 
 /*
@@ -236,7 +227,8 @@ StaticAssertDecl(sizeof(UndoItlPayload) == 40, "UndoItlPayload must be 40B — H
  *	→ ereport 53R9D fail-closed (caller in heap critical section before).
  */
 #define UNDO_RECORD_MAX_INLINE_BYTES_DEFAULT 1024
-#define UNDO_RECORD_HARD_CAP_BYTES (BLCKSZ - sizeof(UndoBlockHeader) - 16) /* leave room for at least 1 slot dir + safety */
+#define UNDO_RECORD_HARD_CAP_BYTES                                                                 \
+	(BLCKSZ - sizeof(UndoBlockHeader) - 16) /* leave room for at least 1 slot dir + safety */
 
 
 #endif /* CLUSTER_UNDO_RECORD_H */
