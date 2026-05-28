@@ -567,7 +567,7 @@
  *   PGRAC MODIFICATIONS in heapam.c heap_insert path (other 3 op +
  *   multi_insert deferred per Hardening v1.0.2 H-4/5/6/7).
  */
-#define CATALOG_VERSION_NO 202605540
+#define CATALOG_VERSION_NO 202605550
 
 /* spec-2.39 D10 (2026-05-21):  SI Broadcaster production activation —
  * DDL commit hook (AtEOXact_Inval + COMMIT PREPARED via cluster-aware

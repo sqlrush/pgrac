@@ -12441,4 +12441,18 @@
   proargnames => '{child_xid,parent_xid,origin_node_id,undo_segment_id,tt_slot_id,cluster_epoch}',
   prosrc => 'cluster_test_inject_subtrans_subcommitted' },
 
+# spec-3.7 D8 (2026-05-28) -- cluster_undo_get_record sanity reader (oid 8928).
+# Returns the raw bytes of one undo record (UndoRecordHeader 64B + payload)
+# given a 16-byte UBA.  Own-instance read only at spec-3.7;  cross-instance
+# read via Cache Fusion deferred to spec-3.9.  Requires pg_read_server_files
+# role (per spec-3.7 §3.5 Q5=A).  Returns NULL on invalid UBA / missing
+# segment file / cross-instance.
+{ oid => '8928', descr => 'cluster undo record sanity reader (spec-3.7 D8)',
+  proname => 'cluster_undo_get_record',
+  provolatile => 's', proparallel => 'r',
+  prorettype => 'bytea',
+  proargtypes => 'bytea',
+  proargnames => '{uba}',
+  prosrc => 'cluster_undo_get_record_srf' },
+
 ]
