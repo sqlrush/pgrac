@@ -84,6 +84,7 @@
 #include "cluster/cluster_tt_status_hint.h" /* cluster_tt_status_hint_shmem_register (spec-3.2 D3) */
 #include "cluster/cluster_subtrans.h"		/* cluster_subtrans_shmem_register (spec-3.5 D5) */
 #include "cluster/cluster_multixact.h"		/* cluster_multixact_shmem_register (spec-3.6 D2) */
+#include "cluster/cluster_undo_record_api.h" /* cluster_undo_record_shmem_register (spec-3.7 D5) */
 #include "cluster/cluster_visibility_inject.h" /* cluster_visibility_inject_shmem_register (spec-3.2 D5b) */
 #include "cluster/cluster_itl.h"			   /* cluster_lock_path_shmem_register (spec-3.4e D6) */
 #include "cluster/cluster_qvotec.h" /* cluster_qvotec_shmem_register (spec-2.6 Sprint A Step 1) */
@@ -455,6 +456,13 @@ cluster_init_shmem_module(void)
 	 */
 	if (cluster_shmem_lookup_region("pgrac cluster multixact overlay") == NULL)
 		cluster_multixact_shmem_register();
+
+	/*
+	 * PGRAC spec-3.7 D5:  register cluster_undo_record cursor + counters
+	 * shmem region (per-instance record-level allocator state on top of
+	 * spec-3.4b segment-level allocator).
+	 */
+	cluster_undo_record_shmem_register();
 
 	/*
 	 * spec-3.2 D5b: register test-only visibility inject shmem.  The

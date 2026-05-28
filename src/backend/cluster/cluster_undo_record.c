@@ -66,6 +66,7 @@
 
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_scn.h"
+#include "cluster/cluster_shmem.h"
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_undo_format.h"
 #include "cluster/cluster_undo_record.h"
@@ -131,23 +132,10 @@ cluster_undo_record_shmem_size(void)
 
 
 /*
- * cluster_undo_record_shmem_register
- *	  Postmaster-once shmem space request.
- */
-void
-cluster_undo_record_shmem_register(void)
-{
-	if (IsUnderPostmaster)
-		return;
-
-	RequestAddinShmemSpace(cluster_undo_record_shmem_size());
-	RequestNamedLWLockTranche("cluster_undo_record_cursor", 1);
-}
-
-
-/*
  * cluster_undo_record_shmem_init
- *	  Postmaster-once shmem layout + initial values.
+ *	  Postmaster-once shmem layout + initial values.  Called via the
+ *	  ClusterShmemRegion.init_fn callback during postmaster shmem
+ *	  attachment.
  */
 void
 cluster_undo_record_shmem_init(void)
@@ -158,6 +146,8 @@ cluster_undo_record_shmem_init(void)
 		= ShmemInitStruct("ClusterUndoRecordShared", cluster_undo_record_shmem_size(), &found);
 
 	if (!found) {
+		int tranche_id = LWLockNewTrancheId();
+
 		memset(UndoRecordShared, 0, sizeof(*UndoRecordShared));
 		UndoRecordShared->active_segment_id = 0;
 		UndoRecordShared->current_block = 0;
@@ -172,10 +162,28 @@ cluster_undo_record_shmem_init(void)
 		pg_atomic_init_u64(&UndoRecordShared->block_flush_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->reader_lookup_count, 0);
 
-		LWLockInitialize(&UndoRecordShared->cursor_lock.lock, LWLockNewTrancheId());
-		LWLockRegisterTranche(UndoRecordShared->cursor_lock.lock.tranche,
-							  "cluster_undo_record_cursor");
+		LWLockInitialize(&UndoRecordShared->cursor_lock.lock, tranche_id);
+		LWLockRegisterTranche(tranche_id, "cluster_undo_record_cursor");
 	}
+}
+
+
+/*
+ * ClusterShmemRegion descriptor + registration entry.
+ */
+static const ClusterShmemRegion cluster_undo_record_region = {
+	.name = "pgrac cluster undo record cursor",
+	.size_fn = cluster_undo_record_shmem_size,
+	.init_fn = cluster_undo_record_shmem_init,
+	.lwlock_count = 1,
+	.owner_subsys = "cluster_undo_record",
+	.reserved_flags = 0,
+};
+
+void
+cluster_undo_record_shmem_register(void)
+{
+	cluster_shmem_register_region(&cluster_undo_record_region);
 }
 
 
