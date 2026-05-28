@@ -158,7 +158,7 @@ cluster_undo_record_shmem_init(void)
 		= ShmemInitStruct("ClusterUndoRecordShared", cluster_undo_record_shmem_size(), &found);
 
 	if (!found) {
-		MemSet(UndoRecordShared, 0, sizeof(*UndoRecordShared));
+		memset(UndoRecordShared, 0, sizeof(*UndoRecordShared));
 		UndoRecordShared->active_segment_id = 0;
 		UndoRecordShared->current_block = 0;
 		UndoRecordShared->free_offset = 0;
@@ -282,7 +282,7 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 						  uint16 tt_slot_segment_id, uint16 tt_slot_offset, const void *payload,
 						  uint16 payload_len, UBA prev_uba)
 {
-	UBA result = InvalidUba;
+	UBA result;
 	uint16 record_length;
 	uint16 inline_cap;
 	uint8 owner_instance;
@@ -368,7 +368,7 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 	/* Read current block (or zeroed if first write to this block). */
 	if (slot_count == 0) {
 		/* Fresh block — init zeroed buffer + header. */
-		MemSet(block_buf, 0, BLCKSZ);
+		memset(block_buf, 0, BLCKSZ);
 		blkhdr = (UndoBlockHeader *)block_buf;
 		blkhdr->magic = PGRAC_UNDO_BLOCK_MAGIC;
 		blkhdr->block_version = UNDO_BLOCK_VERSION_1;
@@ -387,7 +387,7 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 
 	/* Construct UndoRecordHeader at free_offset. */
 	rechdr = (UndoRecordHeader *)(block_buf + free_offset);
-	MemSet(rechdr, 0, sizeof(UndoRecordHeader));
+	memset(rechdr, 0, sizeof(UndoRecordHeader));
 	rechdr->record_type = record_type;
 	rechdr->flags = (slot_count == 0 && current_block == 1) ? UNDO_REC_FLAG_FIRST_IN_TX : 0;
 	rechdr->payload_length = payload_len;
@@ -456,8 +456,8 @@ cluster_undo_get_record(UBA uba, void *out_buffer, size_t buffer_size)
 	uint32 segment_id, block_no;
 	uint16 tt_slot_offset, row_offset;
 	char block_buf[BLCKSZ];
-	UndoBlockHeader *blkhdr;
-	UndoSlotDirEntry *slot;
+	const UndoBlockHeader *blkhdr;
+	const UndoSlotDirEntry *slot;
 	uint8 owner_instance;
 	size_t copy_bytes;
 
