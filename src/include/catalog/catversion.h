@@ -554,8 +554,20 @@
  * - NEW shmem regions:  cluster_multixact_member_overlay HTAB +
  *   ClusterMultiXactHintOutboundRing fixed-size queue (~4.1 MiB
  *   default with 1024 slots)
+ *
+ * 202605540: spec-3.7 D11 — Undo Record Format + Allocator runtime
+ *   真激活.  NEW SQLSTATE 53R9D (cluster_undo_record_invalid_uba) +
+ *   3 NEW GUCs (undo_tablespace_path / undo_segment_size_mb /
+ *   undo_record_inline_max_bytes; existing undo_segments_per_instance
+ *   default 16 unchanged per Q9=A) + NEW shmem region
+ *   ClusterUndoRecordShared (cursor state + 5 atomic counters +
+ *   1 LWLock tranche cluster_undo_record_cursor) + NEW page-format
+ *   extension (UndoBlockHeader 40B + UndoSlotDirEntry 8B + UndoRecordHeader
+ *   64B per spec §2.1-2.2 + Hardening v1.0.1 H-1/H-2 arithmetic fix).
+ *   PGRAC MODIFICATIONS in heapam.c heap_insert path (other 3 op +
+ *   multi_insert deferred per Hardening v1.0.2 H-4/5/6/7).
  */
-#define CATALOG_VERSION_NO 202605530
+#define CATALOG_VERSION_NO 202605540
 
 /* spec-2.39 D10 (2026-05-21):  SI Broadcaster production activation —
  * DDL commit hook (AtEOXact_Inval + COMMIT PREPARED via cluster-aware

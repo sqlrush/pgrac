@@ -150,6 +150,7 @@
 #include "cluster/cluster_tt_local.h" /* PGRAC: spec-3.1 D6 commit/abort hook */
 #include "cluster/cluster_itl_touch.h" /* PGRAC: spec-3.4a D6 pre-commit/abort */
 #include "cluster/cluster_subtrans.h"  /* PGRAC: spec-3.5 D7 subxact lifecycle hook */
+#include "cluster/cluster_undo_record_api.h"  /* PGRAC: spec-3.7 D16 PREPARE guard */
 #endif
 #endif
 
@@ -2733,6 +2734,24 @@ PrepareTransaction(void)
 				 errhint("2PC full support (PREPARE + COMMIT PREPARED final emit) "
 						 "forward-linked to a future 2PC spec.  Use plain COMMIT/ROLLBACK "
 						 "for transactions that touched cluster cross-node visibility paths.")));
+
+	/*
+	 * PGRAC (spec-3.7 D16):  PREPARE TRANSACTION fail-closed guard for
+	 * transactions that wrote undo records.  Spec-3.7 ships undo write +
+	 * sanity reader, but **not** prepared-xact undo durability:  if a
+	 * PREPARED xact's undo record is lost on crash before COMMIT PREPARED,
+	 * rollback apply would be unsafe.  Per spec-3.7 §3.6,reject PREPARE on
+	 * any xact that触发 cluster_undo_record_alloc() during execution.
+	 *
+	 * Prepared-xact undo durability is forward-linked to spec-3.14.
+	 */
+	if (cluster_undo_record_is_touched())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("PREPARE TRANSACTION with cluster undo records not supported in spec-3.7"),
+				 errhint("2PC prepared-xact undo durability is forward-linked to spec-3.14. "
+						 "Use plain COMMIT/ROLLBACK for transactions that wrote cluster undo records "
+						 "(any DML touching shared-buffer heap in cluster-enabled mode).")));
 #endif
 
 	/*
@@ -2993,6 +3012,12 @@ PrepareTransaction(void)
 	 */
 	s->state = TRANS_DEFAULT;
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC (spec-3.7 D16):  reset per-backend undo touched flag at
+	 * end of xact (commit path).  Backend reuse → next xact starts fresh. */
+	cluster_undo_record_xact_reset();
+#endif
+
 	RESUME_INTERRUPTS();
 }
 
@@ -3208,6 +3233,12 @@ CleanupTransaction(void)
 	 */
 	AtCleanup_Portals();		/* now safe to release portal memory */
 	AtEOXact_Snapshot(false, true); /* and release the transaction's snapshots */
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC (spec-3.7 D16):  reset per-backend undo touched flag at
+	 * end of xact (abort path).  Backend reuse → next xact starts fresh. */
+	cluster_undo_record_xact_reset();
+#endif
 
 	CurrentResourceOwner = NULL;	/* and resource owner */
 	if (TopTransactionResourceOwner)
