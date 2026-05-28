@@ -687,6 +687,34 @@ cluster_tt_status_hint_get_drop_v1_compat_count(void)
 	return 0;
 }
 
+/* spec-3.7 D10 stubs: cluster_debug dump_undo() references 5 counter
+ * accessors from cluster_undo_record.o which test_cluster_debug doesn't link. */
+uint64
+cluster_undo_record_alloc_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_segment_claim_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_block_write_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_block_flush_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_reader_lookup_count(void)
+{
+	return 0;
+}
+
 Size
 cluster_shmem_get_total_bytes(void)
 {
