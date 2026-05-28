@@ -87,6 +87,10 @@
 /* PGRAC (spec-3.4b D5): real UBA encode + xact-local TT binding. */
 #include "cluster/cluster_tt_local.h"	/* get_or_create_binding / peek_binding */
 #include "cluster/cluster_uba.h"		/* uba_encode */
+/* PGRAC (spec-3.7 D6): undo record emit hook in DML 4 op paths. */
+#include "cluster/cluster_undo_record.h"		/* UndoRecordType + 4 payload */
+#include "cluster/cluster_undo_record_api.h"	/* cluster_undo_record_alloc */
+#include "utils/rel.h"				/* RelationGetSmgr */
 
 static inline bool
 cluster_itl_write_path_enabled(Relation relation)
@@ -2048,6 +2052,50 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 					 errmsg("ITL slot OVERFLOW on heap page (INITRANS=%d full)",
 							CLUSTER_ITL_INITRANS_DEFAULT),
 					 errhint("Raise per-table INITRANS (spec-3.4b) or reduce write concurrency.")));
+
+		/*
+		 * PGRAC (spec-3.7 D6 — INSERT undo emit):  before START_CRIT_SECTION,
+		 * write an UndoInsertPayload record to per-instance undo segment + get
+		 * back a 16B UBA that replaces cluster_itl_uba.  Failure → ereport
+		 * 53R9D outside critical section (I1 + I3 invariants per §3.3).
+		 *
+		 * For heap_insert pre-CRIT,target_offset is the next OffsetNumber
+		 * that PageAddItem will use(PageGetMaxOffsetNumber + 1)— matches
+		 * the tuple position after RelationPutHeapTuple inside CRIT.
+		 */
+		if (TransactionIdIsNormal(xid) && tt_seg != 0)
+		{
+			ClusterUndoRecordTarget undo_target;
+			UndoInsertPayload undo_payload;
+			UBA undo_uba;
+
+			memset(&undo_target, 0, sizeof(undo_target));
+			undo_target.locator = RelationGetSmgr(relation)->smgr_rlocator.locator;
+			undo_target.forknum = MAIN_FORKNUM;
+			undo_target.blockno = BufferGetBlockNumber(buffer);
+			undo_target.offnum = PageGetMaxOffsetNumber(BufferGetPage(buffer)) + 1;
+
+			memset(&undo_payload, 0, sizeof(undo_payload));
+			undo_payload.inserted_tuple_len = (uint16) (heaptup->t_len > UINT16_MAX
+													   ? 0 : heaptup->t_len);
+
+			undo_uba = cluster_undo_record_alloc(UNDO_RECORD_INSERT,
+												 &undo_target,
+												 (uint16) tt_seg,
+												 tt_off,
+												 &undo_payload,
+												 sizeof(undo_payload),
+												 cluster_itl_uba);
+
+			if (UBA_is_invalid(undo_uba))
+				ereport(ERROR,
+						(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
+						 errmsg("cluster undo record alloc failed for heap_insert"),
+						 errhint("Increase cluster.undo_segments_per_instance or wait "
+								 "for spec-3.8 lifecycle autoextend.")));
+
+			cluster_itl_uba = undo_uba;
+		}
 
 		/* Patch the tuple header so visibility readers see the real slot. */
 		heaptup->t_data->t_itl_slot_idx = cluster_itl_slot;
