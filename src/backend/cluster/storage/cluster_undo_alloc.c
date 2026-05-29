@@ -593,7 +593,6 @@ cluster_undo_segment_extend_or_create(uint8 owner_instance, bool *out_at_hard_ca
 	uint32 slot;
 	uint32 base_segment_id;
 	uint32 effective_cap;
-	uint32 new_segment_id;
 
 	if (out_at_hard_cap != NULL)
 		*out_at_hard_cap = false;
@@ -665,8 +664,7 @@ cluster_undo_segment_extend_or_create(uint8 owner_instance, bool *out_at_hard_ca
 		char path[MAXPGPATH];
 		int ret;
 		int fd;
-
-		new_segment_id = base_segment_id + slot;
+		uint32 new_segment_id = base_segment_id + slot;
 
 		ret = cluster_undo_path_resolve(owner_instance, new_segment_id, path, sizeof(path));
 		if (ret != 0)

@@ -489,17 +489,10 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 			/* Recheck: maybe race winner already extended. */
 			if (UndoRecordShared->active_segment_id != old_segment_id) {
 				/* Race winner already extended — release lifecycle_lock
-				 * + retry under cursor_lock. */
+				 * + recursive retry.  The recursive call re-reads cursor
+				 * state under cursor_lock from scratch,  so we don't need
+				 * to repopulate locals here. */
 				LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
-				LWLockAcquire(&UndoRecordShared->cursor_lock.lock, LW_EXCLUSIVE);
-				/* Re-read shared cursor state and retry. */
-				segment_id = UndoRecordShared->active_segment_id;
-				current_block = UndoRecordShared->current_block;
-				free_offset = UndoRecordShared->free_offset;
-				slot_count = UndoRecordShared->slot_count;
-				/* Fall through to has_space check via re-entry would
-				 * be cleaner but for MVP just trust the new state. */
-				LWLockRelease(&UndoRecordShared->cursor_lock.lock);
 				return cluster_undo_record_alloc(record_type, target, tt_slot_segment_id,
 												 tt_slot_offset, payload, payload_len, prev_uba);
 			}
