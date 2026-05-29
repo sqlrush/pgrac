@@ -43,7 +43,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_itl_cleanout test_cluster_visibility_inject test_cluster_itl_cleanout_perf \
         test_cluster_heap_lock_tuple test_cluster_perf_gates \
         test_cluster_subtrans test_cluster_multixact test_cluster_undo_format \
-        test_cluster_undo_record
+        test_cluster_undo_record test_cluster_undo_lifecycle
 
 # Path to the cluster_version object (no PG deps, safe to link standalone).
 CLUSTER_VERSION_O = $(top_builddir)/src/backend/cluster/cluster_version.o
@@ -860,6 +860,17 @@ test_cluster_undo_format: test_cluster_undo_format.c unit_test.h \
 # spec-3.7 D12: test_cluster_undo_record — 12 encode/decode round-trip
 # tests for UndoRecordHeader + 4 payloads + slot dir addressing.
 test_cluster_undo_record: test_cluster_undo_record.c unit_test.h \
+		$(CLUSTER_VERSION_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-3.8 D12: test_cluster_undo_lifecycle — 10 pure ABI / enum /
+# SQLSTATE / sizeof / offsetof tests for Undo Segment Lifecycle MVP +
+# Autoextend.  Behavioural lifecycle / autoextend / concurrency coverage
+# lives in cluster_tap t/214.
+test_cluster_undo_lifecycle: test_cluster_undo_lifecycle.c unit_test.h \
 		$(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \

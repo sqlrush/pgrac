@@ -192,6 +192,19 @@ elsif ($mode eq '2node-undo-write-pressure') {
     $node0->safe_psql('postgres', 'SELECT pg_reload_conf()');
     $script_path = File::Spec->catfile($FindBin::RealBin, 'scripts', 'undo_write_pressure.sql');
 }
+elsif ($mode eq '2node-undo-autoextend-pressure') {
+    # spec-3.8 class 8:  stress autoextend lazy at exhaustion path +
+    # lifecycle_lock + double-checked locking pattern;  measure file
+    # create + fsync latency tax.  Per F4 codex review,真 trigger 应
+    # 靠 test hook / debug helper 把 active cursor 移到 segment 尾部,
+    # 不依赖自然填满 64MB segment.
+    $node0->safe_psql('postgres',
+        'ALTER SYSTEM SET cluster.undo_segments_max_per_instance = 256');
+    $node0->safe_psql('postgres',
+        'ALTER SYSTEM SET cluster.undo_segment_create_timeout_ms = 5000');
+    $node0->safe_psql('postgres', 'SELECT pg_reload_conf()');
+    $script_path = File::Spec->catfile($FindBin::RealBin, 'scripts', 'undo_autoextend_pressure.sql');
+}
 else {
     $pair->stop_pair;
     die "unknown mode: $mode\n";
