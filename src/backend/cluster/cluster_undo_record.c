@@ -619,6 +619,15 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 
 	LWLockRelease(&UndoRecordShared->cursor_lock.lock);
 
+	/*
+	 * spec-3.8 D6:  mark block_no as used in segment's free_block_bitmap.
+	 * Called outside cursor_lock since it does its own file I/O.
+	 * Idempotent — re-mark of already-used block is no-op.
+	 */
+	cluster_undo_segment_mark_block_used((uint32) segment_id,
+										 (uint8) (cluster_node_id + 1),
+										 current_block);
+
 	/* Mark backend touched for D16 PREPARE guard. */
 	cluster_undo_touched_in_xact = true;
 
