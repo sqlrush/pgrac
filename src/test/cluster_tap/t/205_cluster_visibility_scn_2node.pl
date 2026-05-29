@@ -30,7 +30,7 @@
 #	  L13  exported snapshot -- pg_export_snapshot() returns non-null;
 #	       same-session pg_export_snapshot succeeds (clu_src/scn/epoch
 #	       lines written to snapshot file)
-#	  L14  pg_cluster_state categories = 25 + tt_status_hint = 7 keys
+#	  L14  pg_cluster_state categories = 26 + tt_status_hint = 7 keys
 #	       (spec-3.3 D9 drop_v1_compat_count delta)
 #	  L15  wait events 91 unchanged (L177 no-wait policy preserved;
 #	       spec-3.3 adds zero new wait events)
@@ -291,12 +291,12 @@ ok(defined($exported) && length($exported) > 0,
 
 
 # ============================================================
-# L14: pg_cluster_state categories = 25 + tt_status_hint = 7 keys.
+# L14: pg_cluster_state categories = 26 + tt_status_hint = 7 keys.
 # ============================================================
 is($pair->node0->safe_psql('postgres',
 		q{SELECT count(DISTINCT category) FROM pg_cluster_state}),
-	'25',
-	'L14a pg_cluster_state has 25 categories');
+	'26',
+	'L14a pg_cluster_state has 26 categories');
 
 is($pair->node0->safe_psql('postgres',
 		q{SELECT count(*) FROM pg_cluster_state

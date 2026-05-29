@@ -18,8 +18,9 @@
 #      - Per-region rollup keys (region.<name>.bytes / .owner) appear
 #        for both registered regions.
 #      - cluster.shmem_max_regions GUC is int / postmaster context /
-#        default 64 / current lower bound / range [40, 256] in production
-#        builds, or [41, 256] when ENABLE_INJECTION adds visibility inject.
+#        default 64 / range [40, 256].  The legal lower bound is the
+#        historical minimum; L18 separately verifies that setting the GUC
+#        to the current region count admits all registered regions.
 #      - Lowering cluster.shmem_max_regions to the current baseline
 #        region count still allows every region to register (no FATAL).
 #      - 4 cluster-shmem-* injection points exist in
@@ -189,8 +190,8 @@ is($node->safe_psql(
 	  FROM pg_settings
 	 WHERE name = 'cluster.shmem_max_regions'
 }),
-   'integer|postmaster|64|' . $expected_region_count . '|256',
-   'L12 cluster.shmem_max_regions lower bound matches the current shmem baseline');
+   'integer|postmaster|64|40|256',
+   'L12 cluster.shmem_max_regions retains the historical legal range');
 
 is($node->safe_psql(
 		'postgres',

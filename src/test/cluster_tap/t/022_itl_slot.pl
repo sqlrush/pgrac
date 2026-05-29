@@ -67,7 +67,7 @@ my $has_visibility_inject =
 	  'postgres',
 	  q{SELECT count(*) FROM pg_cluster_shmem
 	     WHERE name = 'pgrac cluster visibility inject'}) eq '1';
-my $expected_region_count = $has_visibility_inject ? '41' : '40';
+my $expected_region_count = $has_visibility_inject ? '42' : '41';
 
 
 # ----------

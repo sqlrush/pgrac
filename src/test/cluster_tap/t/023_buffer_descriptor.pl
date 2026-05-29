@@ -55,7 +55,7 @@ my $has_visibility_inject =
 	  'postgres',
 	  q{SELECT count(*) FROM pg_cluster_shmem
 	     WHERE name = 'pgrac cluster visibility inject'}) eq '1';
-my $expected_region_count = $has_visibility_inject ? '41' : '40';
+my $expected_region_count = $has_visibility_inject ? '42' : '41';
 
 
 # ----------
@@ -164,7 +164,7 @@ is($node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT category) FROM pg_cluster_state}),
    '26',
-   'L12 pg_cluster_state has 25 distinct categories (tt_status_hint added in spec-3.2)');
+   'L12 pg_cluster_state has 26 distinct categories (undo_record added in spec-3.7)');
 
 
 # ----------
