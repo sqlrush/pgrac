@@ -436,7 +436,7 @@ read_segment_header_via_smgr(uint32 segment_id, uint8 owner_instance, char *bloc
 {
 	if (!cluster_undo_smgr_read_block(segment_id, owner_instance, 0, blockbuf))
 		return false;
-	*out_hdr = (UndoSegmentHeaderData *) blockbuf;
+	*out_hdr = (UndoSegmentHeaderData *)blockbuf;
 	return true;
 }
 
@@ -551,7 +551,7 @@ cluster_undo_segment_mark_block_used(uint32 segment_id, uint8 owner_instance, ui
 	if (!UndoSegmentBitmap_mark_used(hdr->free_block_bitmap, block_no))
 		return; /* already marked */
 
-	(void) write_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data);
+	(void)write_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data);
 }
 
 
@@ -611,25 +611,25 @@ cluster_undo_segment_extend_or_create(uint8 owner_instance, bool *out_at_hard_ca
 	 */
 	{
 		extern int cluster_undo_segments_max_per_instance;
-		int		   guc_val = cluster_undo_segments_max_per_instance;
-		uint32	   current_pool_size = 0;
-		uint32	   probe_slot;
+		int guc_val = cluster_undo_segments_max_per_instance;
+		uint32 current_pool_size = 0;
+		uint32 probe_slot;
 
-		if (guc_val <= 0 || guc_val > (int) CLUSTER_UNDO_SEGS_PER_INSTANCE)
+		if (guc_val <= 0 || guc_val > (int)CLUSTER_UNDO_SEGS_PER_INSTANCE)
 			effective_cap = CLUSTER_UNDO_SEGS_PER_INSTANCE;
 		else
-			effective_cap = (uint32) guc_val;
+			effective_cap = (uint32)guc_val;
 
 		/* Probe current pool size by counting existing segment files. */
 		for (probe_slot = 0; probe_slot < CLUSTER_UNDO_SEGS_PER_INSTANCE; probe_slot++) {
 			char path[MAXPGPATH];
-			int	 path_ret;
-			int	 probe_fd;
-			uint32 probe_segment_id = (uint32) (owner_instance - 1)
-									 * CLUSTER_UNDO_SEGS_PER_INSTANCE + probe_slot + 1;
+			int path_ret;
+			int probe_fd;
+			uint32 probe_segment_id
+				= (uint32)(owner_instance - 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE + probe_slot + 1;
 
-			path_ret = cluster_undo_path_resolve(owner_instance, probe_segment_id, path,
-												 sizeof(path));
+			path_ret
+				= cluster_undo_path_resolve(owner_instance, probe_segment_id, path, sizeof(path));
 			if (path_ret != 0)
 				break;
 
@@ -642,7 +642,7 @@ cluster_undo_segment_extend_or_create(uint8 owner_instance, bool *out_at_hard_ca
 
 		/* No retro-shrink:  if configured GUC < current pool size,
 		 * use current pool as floor + WARNING per spec §3.6 + R9. */
-		if (guc_val > 0 && (uint32) guc_val < current_pool_size) {
+		if (guc_val > 0 && (uint32)guc_val < current_pool_size) {
 			ereport(WARNING,
 					(errmsg("cluster.undo_segments_max_per_instance (%d) is less than "
 							"current pool size (%u); using current pool size as effective floor",
@@ -726,12 +726,12 @@ cluster_undo_segment_scan_max_existing(uint8 owner_instance)
 	if (owner_instance < 1 || owner_instance > UNDO_OWNER_INSTANCE_MAX)
 		return 0;
 
-	base_segment_id = (uint32) (owner_instance - 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	base_segment_id = (uint32)(owner_instance - 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
 
 	for (slot = 0; slot < CLUSTER_UNDO_SEGS_PER_INSTANCE; slot++) {
 		char path[MAXPGPATH];
-		int	 ret;
-		int	 fd;
+		int ret;
+		int fd;
 		uint32 probe_id = base_segment_id + slot;
 
 		ret = cluster_undo_path_resolve(owner_instance, probe_id, path, sizeof(path));

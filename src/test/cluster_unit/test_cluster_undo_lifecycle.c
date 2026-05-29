@@ -212,11 +212,11 @@ UT_TEST(test_bitmap_is_full_margin)
 
 	/* Exactly 1 block free → is_full = true (margin). */
 	memset(bitmap, 0xFF, sizeof(bitmap));
-	bitmap[0] &= ~((uint8) 0x01); /* clear bit 0 */
+	bitmap[0] &= ~((uint8)0x01); /* clear bit 0 */
 	UT_ASSERT_EQ(UndoSegmentBitmap_is_full(bitmap, sizeof(bitmap)), true);
 
 	/* Exactly 2 blocks free → is_full = false. */
-	bitmap[0] &= ~((uint8) 0x02); /* also clear bit 1 */
+	bitmap[0] &= ~((uint8)0x02); /* also clear bit 1 */
 	UT_ASSERT_EQ(UndoSegmentBitmap_is_full(bitmap, sizeof(bitmap)), false);
 }
 
@@ -225,7 +225,7 @@ UT_TEST(test_segment_flags_is_full)
 {
 	UT_ASSERT_EQ(UndoSegmentFlags_is_full(0), false);
 	UT_ASSERT_EQ(UndoSegmentFlags_is_full(UNDO_SEGMENT_FLAG_FULL), true);
-	UT_ASSERT_EQ(UndoSegmentFlags_is_full(0xFF), true); /* FULL bit + others */
+	UT_ASSERT_EQ(UndoSegmentFlags_is_full(0xFF), true);	 /* FULL bit + others */
 	UT_ASSERT_EQ(UndoSegmentFlags_is_full(0x02), false); /* future flag, not FULL */
 }
 
@@ -240,7 +240,7 @@ UT_TEST(test_header_mutation_roundtrip)
 	UndoSegmentHeaderData *hdr;
 
 	memset(buf, 0, sizeof(buf));
-	hdr = (UndoSegmentHeaderData *) buf;
+	hdr = (UndoSegmentHeaderData *)buf;
 
 	/* Initial:  zero-init ALLOCATED state, owner sentinel,  not full. */
 	UT_ASSERT_EQ(hdr->segment_state, SEGMENT_ALLOCATED);

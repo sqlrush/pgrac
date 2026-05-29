@@ -428,7 +428,7 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 	/* Publish active segment into shared cursor state if this is the first writer. */
 	segment_id = UndoRecordShared->active_segment_id;
 	if (segment_id == 0) {
-		uint8 init_owner = (uint8) (cluster_node_id + 1);
+		uint8 init_owner = (uint8)(cluster_node_id + 1);
 
 		segment_id = ensured_segment_id;
 		UndoRecordShared->active_segment_id = segment_id;
@@ -447,8 +447,8 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 		 * the hot lock (per spec §3.2).
 		 */
 		LWLockRelease(&UndoRecordShared->cursor_lock.lock);
-		(void) cluster_undo_segment_mark_active(segment_id, init_owner);
-		(void) cluster_undo_segment_tail_block_init(segment_id, init_owner, 1);
+		(void)cluster_undo_segment_mark_active(segment_id, init_owner);
+		(void)cluster_undo_segment_tail_block_init(segment_id, init_owner, 1);
 		LWLockAcquire(&UndoRecordShared->cursor_lock.lock, LW_EXCLUSIVE);
 	}
 
@@ -524,17 +524,16 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 					ereport(ERROR,
 							(errcode(ERRCODE_CLUSTER_UNDO_SEGMENTS_HARD_CAP_REACHED),
 							 errmsg("cluster undo segment pool hard cap reached for instance %u",
-									(unsigned) (cluster_node_id + 1)),
+									(unsigned)(cluster_node_id + 1)),
 							 errhint("Increase cluster.undo_segments_max_per_instance "
 									 "(current limit reached);  or wait for spec-3.12 "
 									 "segment recycle to free slots.")));
 				else
-					ereport(ERROR,
-							(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-							 errmsg("cluster undo segment autoextend failed "
-									"(filesystem error or timeout)"),
-							 errhint("Check disk space on $PGDATA/pg_undo and "
-									 "cluster.undo_segment_create_timeout_ms.")));
+					ereport(ERROR, (errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+									errmsg("cluster undo segment autoextend failed "
+										   "(filesystem error or timeout)"),
+									errhint("Check disk space on $PGDATA/pg_undo and "
+											"cluster.undo_segment_create_timeout_ms.")));
 				return InvalidUba; /* unreachable */
 			}
 
@@ -546,8 +545,8 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 			(void)cluster_undo_segment_mark_full(old_segment_id, ownerinst);
 
 			/* Mark NEW segment ACTIVE + init tail_block per spec-3.8 D1+D5. */
-			(void) cluster_undo_segment_mark_active(new_segment_id, ownerinst);
-			(void) cluster_undo_segment_tail_block_init(new_segment_id, ownerinst, 1);
+			(void)cluster_undo_segment_mark_active(new_segment_id, ownerinst);
+			(void)cluster_undo_segment_tail_block_init(new_segment_id, ownerinst, 1);
 
 			/* Publish NEW active_segment_id under cursor_lock. */
 			LWLockAcquire(&UndoRecordShared->cursor_lock.lock, LW_EXCLUSIVE);

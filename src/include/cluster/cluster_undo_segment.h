@@ -350,7 +350,7 @@ static inline bool
 UndoSegmentBitmap_mark_used(uint8 *bitmap, uint32 block_no)
 {
 	uint32 byte_idx = block_no / 8;
-	uint8  bit_mask = (uint8) (1u << (block_no % 8));
+	uint8 bit_mask = (uint8)(1u << (block_no % 8));
 
 	if ((bitmap[byte_idx] & bit_mask) != 0)
 		return false;
@@ -369,7 +369,7 @@ UndoSegmentBitmap_count_free_capped(const uint8 *bitmap, uint32 bytes, uint32 ca
 		uint8 j;
 
 		for (j = 0; j < 8; j++) {
-			if ((byte & ((uint8) 1u << j)) == 0) {
+			if ((byte & ((uint8)1u << j)) == 0) {
 				free_count++;
 				if (free_count > cap)
 					return free_count;
