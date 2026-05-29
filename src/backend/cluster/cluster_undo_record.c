@@ -119,6 +119,61 @@ static ClusterUndoRecordShared *UndoRecordShared = NULL;
 /* Per-backend state(D16 PREPARE guard support). */
 static bool cluster_undo_touched_in_xact = false;
 
+/*
+ * Backend-local latest undo head per TT slot.
+ *
+ * spec-3.7 v0.4 says TTSlot.first_undo_block is logically the latest/head
+ * undo UBA.  Existing spec-3.4b DML callers still pass the TT-only UBA as
+ * `prev_uba` on every operation, so the record allocator must maintain the
+ * true per-xact undo chain locally until later specs persist the TT head in
+ * the undo segment header.  This state is reset at xact end together with
+ * cluster_undo_touched_in_xact.
+ */
+typedef struct ClusterUndoLocalHead {
+	uint16 tt_slot_segment_id;
+	uint16 tt_slot_offset;
+	UBA head;
+} ClusterUndoLocalHead;
+
+#define CLUSTER_UNDO_LOCAL_HEAD_MAX 1024
+static ClusterUndoLocalHead cluster_undo_local_heads[CLUSTER_UNDO_LOCAL_HEAD_MAX];
+static uint32 cluster_undo_local_head_count = 0;
+
+
+static int
+cluster_undo_local_head_find(uint16 tt_slot_segment_id, uint16 tt_slot_offset)
+{
+	uint32 i;
+
+	for (i = 0; i < cluster_undo_local_head_count; i++) {
+		if (cluster_undo_local_heads[i].tt_slot_segment_id == tt_slot_segment_id
+			&& cluster_undo_local_heads[i].tt_slot_offset == tt_slot_offset)
+			return (int)i;
+	}
+	return -1;
+}
+
+
+static bool
+cluster_undo_local_head_ensure(uint16 tt_slot_segment_id, uint16 tt_slot_offset, int *out_idx)
+{
+	int idx = cluster_undo_local_head_find(tt_slot_segment_id, tt_slot_offset);
+
+	if (idx >= 0) {
+		*out_idx = idx;
+		return true;
+	}
+	if (cluster_undo_local_head_count >= CLUSTER_UNDO_LOCAL_HEAD_MAX)
+		return false;
+
+	idx = (int)cluster_undo_local_head_count++;
+	cluster_undo_local_heads[idx].tt_slot_segment_id = tt_slot_segment_id;
+	cluster_undo_local_heads[idx].tt_slot_offset = tt_slot_offset;
+	cluster_undo_local_heads[idx].head = InvalidUba;
+	*out_idx = idx;
+	return true;
+}
+
 
 /*
  * cluster_undo_record_shmem_size
@@ -304,6 +359,10 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 	UndoRecordHeader *rechdr;
 	UndoSlotDirEntry *slot;
 	SCN current_scn;
+	uint32 ensured_segment_id;
+	int local_head_idx;
+	UBA effective_prev_uba;
+	bool first_in_tx;
 
 	/* Input validation. */
 	if (record_type == UNDO_RECORD_INVALID || record_type > UNDO_RECORD_ITL)
@@ -329,19 +388,42 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 	 * convention: owner_instance is 1-indexed). */
 	owner_instance = (uint8)(cluster_node_id + 1);
 
+	/*
+	 * Segment creation may ereport(ERROR), emit WAL, and perform filesystem I/O.
+	 * Do it before taking the record cursor LWLock; otherwise an ERROR would
+	 * leave the LWLock held and wedge all future undo writers in this backend.
+	 */
+	ensured_segment_id = cluster_undo_active_segment_for_node_or_create(cluster_node_id);
+	if (ensured_segment_id == 0)
+		return InvalidUba;
+
+	if (!cluster_undo_local_head_ensure(tt_slot_segment_id, tt_slot_offset, &local_head_idx))
+		return InvalidUba;
+	effective_prev_uba = cluster_undo_local_heads[local_head_idx].head;
+	if (UBA_is_invalid(effective_prev_uba) && !UBA_is_invalid(prev_uba)) {
+		uint32 prev_segment;
+		uint32 prev_block;
+		uint16 prev_tt_off;
+		uint16 prev_row_off;
+
+		/* Accept caller-supplied prev_uba only if it points to an actual undo
+		 * record.  TT-only UBAs from spec-3.4b have block_no == 0 and must not
+		 * be written into the undo chain. */
+		if (uba_decode(prev_uba, &prev_segment, &prev_block, &prev_tt_off, &prev_row_off)
+			&& prev_block != 0)
+			effective_prev_uba = prev_uba;
+	}
+	first_in_tx = UBA_is_invalid(effective_prev_uba);
+
 	/* SCN stamp for write_scn (advance Lamport). */
 	current_scn = cluster_scn_advance();
 
 	LWLockAcquire(&UndoRecordShared->cursor_lock.lock, LW_EXCLUSIVE);
 
-	/* Claim active segment if none. */
+	/* Publish active segment into shared cursor state if this is the first writer. */
 	segment_id = UndoRecordShared->active_segment_id;
 	if (segment_id == 0) {
-		segment_id = cluster_undo_active_segment_for_node_or_create(cluster_node_id);
-		if (segment_id == 0) {
-			LWLockRelease(&UndoRecordShared->cursor_lock.lock);
-			return InvalidUba; /* segment claim failed */
-		}
+		segment_id = ensured_segment_id;
 		UndoRecordShared->active_segment_id = segment_id;
 		UndoRecordShared->current_block = 1; /* block 0 is segment header */
 		UndoRecordShared->free_offset = sizeof(UndoBlockHeader);
@@ -397,14 +479,14 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 	rechdr = (UndoRecordHeader *)(block_buf + free_offset);
 	memset(rechdr, 0, sizeof(UndoRecordHeader));
 	rechdr->record_type = record_type;
-	rechdr->flags = (slot_count == 0 && current_block == 1) ? UNDO_REC_FLAG_FIRST_IN_TX : 0;
+	rechdr->flags = first_in_tx ? UNDO_REC_FLAG_FIRST_IN_TX : 0;
 	rechdr->payload_length = payload_len;
 	rechdr->xid = GetCurrentTransactionIdIfAny();
 	rechdr->origin_node_id = (uint16)cluster_node_id;
 	rechdr->tt_slot_segment_id = tt_slot_segment_id;
-	rechdr->tt_slot_id = (uint32)tt_slot_offset;
+	rechdr->tt_slot_id = cluster_tt_slot_offset_to_id(tt_slot_offset);
 	rechdr->write_scn = current_scn;
-	rechdr->prev_uba = prev_uba;
+	rechdr->prev_uba = effective_prev_uba;
 	rechdr->target_locator = target->locator;
 	rechdr->target_fork = target->forknum;
 	rechdr->target_block = target->blockno;
@@ -450,6 +532,7 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 	/* Encode UBA per spec-3.4b: (segment_id, block_no, tt_slot_offset, row_offset).
 	 * For undo records, row_offset = slot-dir index within block. */
 	result = uba_encode((uint32)segment_id, current_block, tt_slot_offset, new_slot_idx);
+	cluster_undo_local_heads[local_head_idx].head = result;
 
 	return result;
 }
@@ -521,6 +604,8 @@ void
 cluster_undo_record_xact_reset(void)
 {
 	cluster_undo_touched_in_xact = false;
+	memset(cluster_undo_local_heads, 0, sizeof(cluster_undo_local_heads));
+	cluster_undo_local_head_count = 0;
 }
 
 

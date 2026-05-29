@@ -3228,8 +3228,25 @@ l1:
 		if (TransactionIdIsNormal(xid) && tt_seg != 0)
 		{
 			ClusterUndoRecordTarget undo_target;
-			UndoDeletePayload undo_payload;
+			UndoDeletePayload *undo_payload;
+			char *undo_payload_buf;
+			uint16 undo_payload_len;
+			uint16 old_tuple_bytes;
 			UBA undo_uba;
+
+			if (tp.t_len > UINT16_MAX - sizeof(UndoDeletePayload))
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+						 errmsg("cluster undo DELETE payload is too large")));
+
+			old_tuple_bytes = (uint16) tp.t_len;
+			undo_payload_len = sizeof(UndoDeletePayload) + old_tuple_bytes;
+			undo_payload_buf = (char *) palloc0(undo_payload_len);
+			undo_payload = (UndoDeletePayload *) undo_payload_buf;
+			undo_payload->full_tuple_length = old_tuple_bytes;
+			undo_payload->full_tuple_offset = sizeof(UndoDeletePayload);
+			memcpy(undo_payload_buf + sizeof(UndoDeletePayload), tp.t_data,
+				   old_tuple_bytes);
 
 			memset(&undo_target, 0, sizeof(undo_target));
 			undo_target.locator = RelationGetSmgr(relation)->smgr_rlocator.locator;
@@ -3237,17 +3254,14 @@ l1:
 			undo_target.blockno = ItemPointerGetBlockNumber(&tp.t_self);
 			undo_target.offnum = ItemPointerGetOffsetNumber(&tp.t_self);
 
-			memset(&undo_payload, 0, sizeof(undo_payload));
-			undo_payload.full_tuple_length = (uint16) (tp.t_len > UINT16_MAX ? 0 : tp.t_len);
-			undo_payload.full_tuple_offset = sizeof(UndoDeletePayload);
-
 			undo_uba = cluster_undo_record_alloc(UNDO_RECORD_DELETE,
-												 &undo_target,
-												 (uint16) tt_seg,
-												 tt_off,
-												 &undo_payload,
-												 sizeof(undo_payload),
-												 cluster_itl_uba);
+											 &undo_target,
+											 (uint16) tt_seg,
+											 tt_off,
+											 undo_payload_buf,
+											 undo_payload_len,
+											 cluster_itl_uba);
+			pfree(undo_payload_buf);
 
 			if (UBA_is_invalid(undo_uba))
 				ereport(ERROR,
@@ -4386,9 +4400,27 @@ l2:
 		if (TransactionIdIsNormal(xid) && tt_seg != 0)
 		{
 			ClusterUndoRecordTarget undo_target;
-			UndoUpdatePayload undo_payload;
-			UBA undo_uba;
+			UndoUpdatePayload *undo_payload;
+			char *undo_payload_buf;
+			uint16 undo_payload_len;
 			uint16 old_tuple_bytes;
+			UBA undo_uba;
+
+			if (oldtup.t_len > UINT16_MAX - sizeof(UndoUpdatePayload))
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+						 errmsg("cluster undo UPDATE payload is too large")));
+
+			old_tuple_bytes = (uint16) oldtup.t_len;
+			undo_payload_len = sizeof(UndoUpdatePayload) + old_tuple_bytes;
+			undo_payload_buf = (char *) palloc0(undo_payload_len);
+			undo_payload = (UndoUpdatePayload *) undo_payload_buf;
+			undo_payload->new_block = ItemPointerGetBlockNumber(&heaptup->t_self);
+			undo_payload->new_offset = ItemPointerGetOffsetNumber(&heaptup->t_self);
+			undo_payload->old_tuple_length = old_tuple_bytes;
+			undo_payload->old_tuple_offset = sizeof(UndoUpdatePayload);
+			memcpy(undo_payload_buf + sizeof(UndoUpdatePayload), oldtup.t_data,
+				   old_tuple_bytes);
 
 			memset(&undo_target, 0, sizeof(undo_target));
 			undo_target.locator = RelationGetSmgr(relation)->smgr_rlocator.locator;
@@ -4396,23 +4428,14 @@ l2:
 			undo_target.blockno = ItemPointerGetBlockNumber(&oldtup.t_self);
 			undo_target.offnum = ItemPointerGetOffsetNumber(&oldtup.t_self);
 
-			memset(&undo_payload, 0, sizeof(undo_payload));
-			undo_payload.new_block = ItemPointerGetBlockNumber(&heaptup->t_self);
-			undo_payload.new_offset = ItemPointerGetOffsetNumber(&heaptup->t_self);
-			old_tuple_bytes = (uint16) (oldtup.t_len > UINT16_MAX ? 0 : oldtup.t_len);
-			undo_payload.old_tuple_length = old_tuple_bytes;
-			undo_payload.old_tuple_offset = sizeof(UndoUpdatePayload);
-
-			/* For MVP store only payload struct (pre-image bytes deferred to
-			 * Hardening v1.0.3+ — needs `payload + var bytes` interface
-			 * adjustment).  payload_length = sizeof(payload). */
 			undo_uba = cluster_undo_record_alloc(UNDO_RECORD_UPDATE,
-												 &undo_target,
-												 (uint16) tt_seg,
-												 tt_off,
-												 &undo_payload,
-												 sizeof(undo_payload),
-												 cluster_itl_uba);
+											 &undo_target,
+											 (uint16) tt_seg,
+											 tt_off,
+											 undo_payload_buf,
+											 undo_payload_len,
+											 cluster_itl_uba);
+			pfree(undo_payload_buf);
 
 			if (UBA_is_invalid(undo_uba))
 				ereport(ERROR,
@@ -5547,6 +5570,7 @@ l3:
 						switch (cres.status)
 						{
 							case CLUSTER_TT_STATUS_IN_PROGRESS:
+							case CLUSTER_TT_STATUS_SUBCOMMITTED:
 								cluster_itl_bump_remote_row_lock_fail_closed_count();
 								switch (wait_policy)
 								{
@@ -5762,7 +5786,6 @@ failed:
 	if (cluster_itl_lock_path_enabled(relation) && PageHasItl(page))
 	{
 		bool cluster_will_stamp_multixact_marker = false;
-		MultiXactId cluster_marker_multixact_id = InvalidMultiXactId;
 
 		if (new_infomask & HEAP_XMAX_IS_MULTI)
 		{
@@ -5847,7 +5870,6 @@ failed:
 		if (cluster_will_stamp_multixact_marker)
 		{
 			(void) cluster_itl_stamp_multixact_marker(*buffer, (MultiXactId) xid);
-			cluster_marker_multixact_id = (MultiXactId) xid;
 			/*
 			 * Don't set cluster_did_lock_stamp:  no spec-3.4d single-xid
 			 * lock-only slot was allocated.  Marker is page-format hint
@@ -5901,10 +5923,12 @@ failed:
 					undo_payload.itl_slot_idx = cluster_lock_slot_idx;
 					undo_payload.prev_flags = 0; /* prev state ITL_FLAG_FREE */
 					undo_payload.new_flags = 5; /* ITL_FLAG_LOCK_ONLY_ACTIVE */
+					undo_payload.prev_xmax = xmax;
+					undo_payload.prev_infomask = old_infomask;
+					undo_payload.prev_infomask2 = tuple->t_data->t_infomask2;
+					undo_payload.prev_commit_scn = InvalidScn;
 					undo_payload.lock_mode = (uint8) mode;
 					undo_payload.lock_xid = xid;
-					/* prev_xmax / prev_infomask / prev_infomask2 left zero
-					 * (read from tuple if needed by rollback) */
 
 					undo_uba = cluster_undo_record_alloc(UNDO_RECORD_ITL,
 														 &undo_target,
