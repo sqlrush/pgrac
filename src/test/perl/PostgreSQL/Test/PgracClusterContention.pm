@@ -84,10 +84,16 @@ sub start_load
 	my ($self) = @_;
 	my $tbl = $self->{table_name};
 
-	# Initialize contention row (idempotent).
-	$self->{pair}->node0->safe_psql('postgres',
-		"CREATE TABLE IF NOT EXISTS $tbl (id int PRIMARY KEY, ctr bigint NOT NULL DEFAULT 0);
-		 INSERT INTO $tbl (id) VALUES (1) ON CONFLICT (id) DO NOTHING;");
+	# Initialize contention row (idempotent) on both ClusterPair nodes.
+	# ClusterPair is a two-postmaster fixture, not a shared-catalog fixture;
+	# creating the table only on node0 makes the alternating node1 UPDATEs
+	# fail before they can exercise the smoke helper path.
+	for my $node ($self->{pair}->node0, $self->{pair}->node1)
+	{
+		$node->safe_psql('postgres',
+			"CREATE TABLE IF NOT EXISTS $tbl (id int PRIMARY KEY, ctr bigint NOT NULL DEFAULT 0);
+			 INSERT INTO $tbl (id) VALUES (1) ON CONFLICT (id) DO NOTHING;");
+	}
 
 	$self->{start_time}  = time;
 	$self->{snap_before} = $self->_snap_counters;

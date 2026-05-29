@@ -4415,8 +4415,16 @@ l2:
 			undo_payload_len = sizeof(UndoUpdatePayload) + old_tuple_bytes;
 			undo_payload_buf = (char *) palloc0(undo_payload_len);
 			undo_payload = (UndoUpdatePayload *) undo_payload_buf;
-			undo_payload->new_block = ItemPointerGetBlockNumber(&heaptup->t_self);
-			undo_payload->new_offset = ItemPointerGetOffsetNumber(&heaptup->t_self);
+			/*
+			 * The replacement tuple is not placed on the page until
+			 * RelationPutHeapTuple() inside the critical section below.  Do
+			 * not read heaptup->t_self here: cassert builds correctly treat
+			 * it as invalid.  CR replay can recover the old pre-image from
+			 * this record; a future post-insert location patch, if needed,
+			 * must happen after RelationPutHeapTuple().
+			 */
+			undo_payload->new_block = InvalidBlockNumber;
+			undo_payload->new_offset = InvalidOffsetNumber;
 			undo_payload->old_tuple_length = old_tuple_bytes;
 			undo_payload->old_tuple_offset = sizeof(UndoUpdatePayload);
 			memcpy(undo_payload_buf + sizeof(UndoUpdatePayload), oldtup.t_data,
