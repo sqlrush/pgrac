@@ -110,6 +110,12 @@ typedef struct ClusterUndoRecordShared {
 	pg_atomic_uint64 block_flush_count;
 	pg_atomic_uint64 reader_lookup_count;
 
+	/* spec-3.8 D10: 4 NEW lifecycle counters. */
+	pg_atomic_uint64 autoextend_count;			 /* cluster_undo_segment_extend_or_create success */
+	pg_atomic_uint64 segment_switch_count;		 /* active_segment_id 切换 */
+	pg_atomic_uint64 segment_create_fail_count;	 /* FS error / timeout */
+	pg_atomic_uint64 segment_hard_cap_fail_count; /* 53R9E hard cap */
+
 	LWLockPadded cursor_lock;
 	/* spec-3.8 D3: lifecycle_lock — protects autoextend slow path
 	 * (active_segment_id publication + state transitions).  Per spec
@@ -223,6 +229,12 @@ cluster_undo_record_shmem_init(void)
 		pg_atomic_init_u64(&UndoRecordShared->block_write_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->block_flush_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->reader_lookup_count, 0);
+
+		/* spec-3.8 D10: 4 NEW lifecycle counters. */
+		pg_atomic_init_u64(&UndoRecordShared->autoextend_count, 0);
+		pg_atomic_init_u64(&UndoRecordShared->segment_switch_count, 0);
+		pg_atomic_init_u64(&UndoRecordShared->segment_create_fail_count, 0);
+		pg_atomic_init_u64(&UndoRecordShared->segment_hard_cap_fail_count, 0);
 
 		LWLockInitialize(&UndoRecordShared->cursor_lock.lock, tranche_id);
 		LWLockInitialize(&UndoRecordShared->lifecycle_lock.lock, tranche_id);
@@ -506,15 +518,20 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 
 			if (new_segment_id == 0) {
 				/* Failed:  hard cap or FS fail.  Release lifecycle_lock
-				 * + caller decides which SQLSTATE based on at_hard_cap. */
+				 * + counter bump + caller decides SQLSTATE. */
 				if (at_hard_cap)
 					pg_atomic_fetch_add_u64(
-						&UndoRecordShared->reader_lookup_count, 0);
+						&UndoRecordShared->segment_hard_cap_fail_count, 1);
+				else
+					pg_atomic_fetch_add_u64(
+						&UndoRecordShared->segment_create_fail_count, 1);
 				LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
-				/* Counter bump per spec D10 — placeholder until Step 7
-				 * adds dedicated _segment_hard_cap_fail_count atomic. */
 				return InvalidUba;
 			}
+
+			/* Success — counter bumps. */
+			pg_atomic_fetch_add_u64(&UndoRecordShared->autoextend_count, 1);
+			pg_atomic_fetch_add_u64(&UndoRecordShared->segment_switch_count, 1);
 
 			/* Mark old segment FULL(state remains ACTIVE per §3.3 I2). */
 			(void) cluster_undo_segment_mark_full(old_segment_id, ownerinst);
@@ -761,4 +778,37 @@ cluster_undo_reader_lookup_count(void)
 	if (UndoRecordShared == NULL)
 		return 0;
 	return pg_atomic_read_u64(&UndoRecordShared->reader_lookup_count);
+}
+
+/* spec-3.8 D10: 4 NEW lifecycle counter accessors. */
+uint64
+cluster_undo_autoextend_count(void)
+{
+	if (UndoRecordShared == NULL)
+		return 0;
+	return pg_atomic_read_u64(&UndoRecordShared->autoextend_count);
+}
+
+uint64
+cluster_undo_segment_switch_count(void)
+{
+	if (UndoRecordShared == NULL)
+		return 0;
+	return pg_atomic_read_u64(&UndoRecordShared->segment_switch_count);
+}
+
+uint64
+cluster_undo_segment_create_fail_count(void)
+{
+	if (UndoRecordShared == NULL)
+		return 0;
+	return pg_atomic_read_u64(&UndoRecordShared->segment_create_fail_count);
+}
+
+uint64
+cluster_undo_segment_hard_cap_fail_count(void)
+{
+	if (UndoRecordShared == NULL)
+		return 0;
+	return pg_atomic_read_u64(&UndoRecordShared->segment_hard_cap_fail_count);
 }

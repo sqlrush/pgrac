@@ -1351,6 +1351,32 @@ cluster_init_guc(void)
 							&cluster_undo_record_inline_max_bytes, 1024, 16, 8192, PGC_SIGHUP, 0,
 							NULL, NULL, NULL);
 
+	/*
+	 * spec-3.8 D9 — 2 NEW undo lifecycle GUCs.
+	 */
+	DefineCustomIntVariable(
+		"cluster.undo_segments_max_per_instance",
+		gettext_noop("Hard cap of per-instance undo segment pool size."),
+		gettext_noop("Spec-3.8 D9. Default 256 = CLUSTER_UNDO_SEGS_PER_INSTANCE "
+					 "encoding limit (F2 codex review). Range 16..256; "
+					 "超过 256 需要 future ABI/segment-id encoding spec. "
+					 "SIGHUP reload allowed but configured value lower than current "
+					 "pool size results in WARNING + effective floor at current pool "
+					 "(no retro-shrink). Hard cap reached → SQLSTATE 53R9E "
+					 "(cluster_undo_segments_hard_cap_reached)."),
+		&cluster_undo_segments_max_per_instance, 256, 16, 256, PGC_SIGHUP, 0, NULL, NULL,
+		NULL);
+
+	DefineCustomIntVariable(
+		"cluster.undo_segment_create_timeout_ms",
+		gettext_noop("Segment file create + initial fsync elapsed-time guard."),
+		gettext_noop("Spec-3.8 D9. Default 5000ms. Elapsed-time check after file "
+					 "create + fsync completes; exceeding this threshold raises "
+					 "SQLSTATE 53R9D with errhint to check storage latency. "
+					 "Not an asynchronous I/O cancellation/preemption mechanism."),
+		&cluster_undo_segment_create_timeout_ms, 5000, 100, 60000, PGC_SIGHUP, 0,
+		NULL, NULL, NULL);
+
 	DefineCustomIntVariable(
 		"cluster.boc_sweep_interval_ms",
 		gettext_noop("walwriter BOC sweep staleness target in milliseconds."),

@@ -156,6 +156,12 @@ extern uint64 cluster_undo_block_write_count(void);
 extern uint64 cluster_undo_block_flush_count(void);
 extern uint64 cluster_undo_reader_lookup_count(void);
 
+/* spec-3.8 D10: 4 NEW lifecycle counter accessors. */
+extern uint64 cluster_undo_autoextend_count(void);
+extern uint64 cluster_undo_segment_switch_count(void);
+extern uint64 cluster_undo_segment_create_fail_count(void);
+extern uint64 cluster_undo_segment_hard_cap_fail_count(void);
+
 
 #endif /* !FRONTEND */
 

@@ -635,6 +635,14 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 # 4 op emit must ereport BEFORE START_CRIT_SECTION (per §3.3 I1 + I3 invariants).
 53R9D    E    ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA                          cluster_undo_record_invalid_uba
 
+# spec-3.8 v0.3 D10:  autoextend hard cap reached (区别 53R9D record-level
+# fail).  Trigger:  cluster_undo_segment_extend_or_create() detects pool
+# size >= cluster.undo_segments_max_per_instance (default 256 = encoding
+# limit).  errhint:  "Increase cluster.undo_segments_max_per_instance up
+# to 256, or wait for spec-3.12 cleaner to recycle COMMITTED segments".
+# Counter cluster_undo_segment_hard_cap_fail_count bump.
+53R9E    E    ERRCODE_CLUSTER_UNDO_SEGMENTS_HARD_CAP_REACHED                   cluster_undo_segments_hard_cap_reached
+
 Section: Class 54 - Program Limit Exceeded
 
 # this is for wired-in limits, not resource exhaustion problems (class borrowed from DB2)
