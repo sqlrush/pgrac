@@ -248,13 +248,13 @@ UT_TEST(test_block_magic_init)
 UT_TEST(test_record_type_flags_bytes)
 {
 	UndoRecordHeader hdr;
-	uint8 *bytes;
+	const uint8 *bytes;
 
 	memset(&hdr, 0, sizeof(hdr));
 	hdr.record_type = UNDO_RECORD_ITL;
 	hdr.flags = UNDO_REC_FLAG_FIRST_IN_TX | UNDO_REC_FLAG_CONTINUED;
 
-	bytes = (uint8 *)&hdr;
+	bytes = (const uint8 *)&hdr;
 	UT_ASSERT_EQ(bytes[0], UNDO_RECORD_ITL);
 	UT_ASSERT_EQ(bytes[1], UNDO_REC_FLAG_FIRST_IN_TX | UNDO_REC_FLAG_CONTINUED);
 }

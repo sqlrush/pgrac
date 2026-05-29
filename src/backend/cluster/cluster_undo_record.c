@@ -490,7 +490,6 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 				 * to repopulate locals here.
 				 */
 				LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
-				lifecycle_lock_held = false;
 				return cluster_undo_record_alloc(record_type, target, tt_slot_segment_id,
 												 tt_slot_offset, payload, payload_len, prev_uba);
 			}
@@ -510,7 +509,6 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 				else
 					pg_atomic_fetch_add_u64(&UndoRecordShared->segment_create_fail_count, 1);
 				LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
-				lifecycle_lock_held = false;
 
 				if (at_hard_cap)
 					ereport(ERROR,
@@ -536,7 +534,6 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 			/* Mark old segment FULL(state remains ACTIVE per §3.3 I2). */
 			if (!cluster_undo_segment_mark_full(old_segment_id, ownerinst)) {
 				LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
-				lifecycle_lock_held = false;
 				return InvalidUba;
 			}
 
