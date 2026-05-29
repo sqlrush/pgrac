@@ -41,6 +41,7 @@
 #include "cluster/cluster_scn.h" /* SCN_MAX_VALID_NODE_ID */
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/cluster_undo_segment_init.h"
+#include "cluster/cluster_undo_smgr.h"
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "miscadmin.h"
@@ -418,42 +419,32 @@ cluster_undo_active_segment_for_node_or_create(int node_id)
  *   (caller's concern).
  * ============================================================ */
 
-static int
-open_segment_for_rmw(uint8 owner_instance, uint32 segment_id)
-{
-	char path[MAXPGPATH];
-	int ret;
-	int fd;
-
-	ret = cluster_undo_path_resolve(owner_instance, segment_id, path, sizeof(path));
-	if (ret != 0)
-		return -1;
-
-	fd = BasicOpenFile(path, O_RDWR | PG_BINARY);
-	return fd;
-}
-
+/*
+ * spec-3.8 Fix #372:  lifecycle helpers now read/write the 8 KB segment
+ * header via cluster_undo_smgr block I/O instead of inline BasicOpenFile +
+ * pg_pread/pwrite.  The undo segment header occupies block 0 (8192 bytes),
+ * so a header RMW becomes:  smgr_read_block(0) → modify hdr → smgr_write_block
+ * (0, do_fsync=true).
+ *
+ * A PGAlignedBlock-sized scratch buffer is used so the temporary cast back
+ * to UndoSegmentHeaderData stays alignment-safe.
+ */
 
 static bool
-read_segment_header(int fd, UndoSegmentHeaderData *out_hdr)
+read_segment_header_via_smgr(uint32 segment_id, uint8 owner_instance, char *blockbuf,
+							 UndoSegmentHeaderData **out_hdr)
 {
-	ssize_t nread;
-
-	nread = pg_pread(fd, out_hdr, sizeof(UndoSegmentHeaderData), 0);
-	return (nread == (ssize_t)sizeof(UndoSegmentHeaderData));
-}
-
-
-static bool
-write_segment_header(int fd, const UndoSegmentHeaderData *hdr)
-{
-	ssize_t nwritten;
-
-	nwritten = pg_pwrite(fd, hdr, sizeof(UndoSegmentHeaderData), 0);
-	if (nwritten != (ssize_t)sizeof(UndoSegmentHeaderData))
+	if (!cluster_undo_smgr_read_block(segment_id, owner_instance, 0, blockbuf))
 		return false;
+	*out_hdr = (UndoSegmentHeaderData *) blockbuf;
+	return true;
+}
 
-	return (pg_fsync(fd) == 0);
+
+static bool
+write_segment_header_via_smgr(uint32 segment_id, uint8 owner_instance, const char *blockbuf)
+{
+	return cluster_undo_smgr_write_block(segment_id, owner_instance, 0, blockbuf, true);
 }
 
 
@@ -467,35 +458,21 @@ write_segment_header(int fd, const UndoSegmentHeaderData *hdr)
 bool
 cluster_undo_segment_mark_active(uint32 segment_id, uint8 owner_instance)
 {
-	int fd;
-	UndoSegmentHeaderData hdr;
-	bool ok;
+	PGAlignedBlock blockbuf;
+	UndoSegmentHeaderData *hdr;
 
-	fd = open_segment_for_rmw(owner_instance, segment_id);
-	if (fd < 0)
+	if (!read_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data, &hdr))
 		return false;
 
-	if (!read_segment_header(fd, &hdr)) {
-		close(fd);
+	/* Pure-kernel invariant check (covered by cluster_unit T11). */
+	if (!UndoSegmentState_can_become_active(hdr->segment_state))
 		return false;
-	}
 
-	if (hdr.segment_state == SEGMENT_ACTIVE) {
-		close(fd);
+	if (hdr->segment_state == SEGMENT_ACTIVE)
 		return true; /* idempotent — already ACTIVE */
-	}
 
-	if (hdr.segment_state != SEGMENT_ALLOCATED) {
-		/* Per spec §3.3 I3:  not ALLOCATED/ACTIVE means COMMITTED /
-		 * RECYCLABLE / INVALID — fail-closed,  do not silent reuse. */
-		close(fd);
-		return false;
-	}
-
-	hdr.segment_state = SEGMENT_ACTIVE;
-	ok = write_segment_header(fd, &hdr);
-	close(fd);
-	return ok;
+	hdr->segment_state = SEGMENT_ACTIVE;
+	return write_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data);
 }
 
 
@@ -509,28 +486,17 @@ cluster_undo_segment_mark_active(uint32 segment_id, uint8 owner_instance)
 bool
 cluster_undo_segment_mark_full(uint32 segment_id, uint8 owner_instance)
 {
-	int fd;
-	UndoSegmentHeaderData hdr;
-	bool ok;
+	PGAlignedBlock blockbuf;
+	UndoSegmentHeaderData *hdr;
 
-	fd = open_segment_for_rmw(owner_instance, segment_id);
-	if (fd < 0)
+	if (!read_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data, &hdr))
 		return false;
 
-	if (!read_segment_header(fd, &hdr)) {
-		close(fd);
-		return false;
-	}
-
-	if ((hdr.segment_flags & UNDO_SEGMENT_FLAG_FULL) != 0) {
-		close(fd);
+	if (UndoSegmentFlags_is_full(hdr->segment_flags))
 		return true; /* idempotent — already FULL */
-	}
 
-	hdr.segment_flags |= UNDO_SEGMENT_FLAG_FULL;
-	ok = write_segment_header(fd, &hdr);
-	close(fd);
-	return ok;
+	hdr->segment_flags |= UNDO_SEGMENT_FLAG_FULL;
+	return write_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data);
 }
 
 
@@ -547,23 +513,14 @@ bool
 cluster_undo_segment_tail_block_init(uint32 segment_id, uint8 owner_instance,
 									 BlockNumber initial_tail)
 {
-	int fd;
-	UndoSegmentHeaderData hdr;
-	bool ok;
+	PGAlignedBlock blockbuf;
+	UndoSegmentHeaderData *hdr;
 
-	fd = open_segment_for_rmw(owner_instance, segment_id);
-	if (fd < 0)
+	if (!read_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data, &hdr))
 		return false;
 
-	if (!read_segment_header(fd, &hdr)) {
-		close(fd);
-		return false;
-	}
-
-	hdr.tail_block = initial_tail;
-	ok = write_segment_header(fd, &hdr);
-	close(fd);
-	return ok;
+	hdr->tail_block = initial_tail;
+	return write_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data);
 }
 
 
@@ -581,72 +538,34 @@ cluster_undo_segment_tail_block_init(uint32 segment_id, uint8 owner_instance,
 void
 cluster_undo_segment_mark_block_used(uint32 segment_id, uint8 owner_instance, uint32 block_no)
 {
-	int fd;
-	UndoSegmentHeaderData hdr;
-	uint32 byte_idx;
-	uint8 bit_mask;
+	PGAlignedBlock blockbuf;
+	UndoSegmentHeaderData *hdr;
 
 	if (block_no >= UNDO_BLOCKS_PER_SEGMENT)
 		return; /* out-of-range,  ignore */
 
-	fd = open_segment_for_rmw(owner_instance, segment_id);
-	if (fd < 0)
+	if (!read_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data, &hdr))
 		return;
 
-	if (!read_segment_header(fd, &hdr)) {
-		close(fd);
-		return;
-	}
-
-	byte_idx = block_no / 8;
-	bit_mask = (uint8)(1u << (block_no % 8));
-
-	if ((hdr.free_block_bitmap[byte_idx] & bit_mask) != 0) {
-		close(fd);
+	/* Pure-kernel mutator (covered by cluster_unit T13/T14). */
+	if (!UndoSegmentBitmap_mark_used(hdr->free_block_bitmap, block_no))
 		return; /* already marked */
-	}
 
-	hdr.free_block_bitmap[byte_idx] |= bit_mask;
-	(void)write_segment_header(fd, &hdr);
-	close(fd);
+	(void) write_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data);
 }
 
 
 bool
 cluster_undo_segment_is_full(uint32 segment_id, uint8 owner_instance)
 {
-	int fd;
-	UndoSegmentHeaderData hdr;
-	uint32 free_count;
-	uint32 i;
+	PGAlignedBlock blockbuf;
+	UndoSegmentHeaderData *hdr;
 
-	fd = open_segment_for_rmw(owner_instance, segment_id);
-	if (fd < 0)
+	if (!read_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data, &hdr))
 		return false;
 
-	if (!read_segment_header(fd, &hdr)) {
-		close(fd);
-		return false;
-	}
-
-	close(fd);
-
-	/* Count free bits (clear).  Per spec §3.7,  return true if
-	 * free count <= 1 (margin). */
-	free_count = 0;
-	for (i = 0; i < UNDO_FREE_BITMAP_BYTES; i++) {
-		uint8 byte = hdr.free_block_bitmap[i];
-		uint8 j;
-
-		for (j = 0; j < 8; j++) {
-			if ((byte & ((uint8)1u << j)) == 0) {
-				free_count++;
-				if (free_count > 1)
-					return false; /* still has space */
-			}
-		}
-	}
-	return (free_count <= 1);
+	/* Pure-kernel decision (covered by cluster_unit T15). */
+	return UndoSegmentBitmap_is_full(hdr->free_block_bitmap, UNDO_FREE_BITMAP_BYTES);
 }
 
 

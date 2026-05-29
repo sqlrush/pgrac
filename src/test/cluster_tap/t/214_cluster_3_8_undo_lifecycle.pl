@@ -21,11 +21,12 @@
 #
 #	  L9   autoextend trigger via test hook: force segment_end + DML →
 #	       autoextend_count + segment_switch_count both increment
-#	  L10  test hook on empty active_segment returns false (no DML yet)
-#	  L11-L12(hard cap real trigger + restart scan + concurrency
-#	  double-checked locking)推 future test hook ship 后真测;本 spec smoke
-#	  level coverage for L11-L12.  真 hard-cap baseline collection 推
-#	  perf class 8 + Hardening v1.0.X.
+#	  L10  repeated trigger monotonicity
+#	  L11  hard cap real trigger:  set max_per_instance ≤ current pool
+#	       size (SIGHUP race-safe floor takes effect) → repeated
+#	       force_segment_end + DML eventually raises SQLSTATE 53R9E +
+#	       segment_hard_cap_fail_count increments
+#	  L12  concurrency double-checked locking — see L12 block below
 #
 #	  Spec: spec-3.8-undo-segment-lifecycle-autoextend.md (FROZEN v0.3 +
 #	        Hardening v1.0.1 H-1/H-2)
@@ -210,6 +211,128 @@ my $final_autoex2 = $node0->safe_psql('postgres',
        WHERE category='undo' AND key='autoextend_count'});
 ok($final_autoex2 > $mid_autoex,
     "L10 repeated autoextend monotonic (mid=$mid_autoex final=$final_autoex2)");
+
+
+# ----------
+# L11: hard cap real trigger
+#    Strategy:
+#     a) Snapshot hard_cap_fail_count
+#     b) Set max_per_instance = 2 (SIGHUP race-safe floor will use current
+#        pool size if it's already > 2, but that's fine — eventually
+#        force+DML will push past the floor)
+#     c) Loop up to 256 cycles of force_segment_end + INSERT.  Catch
+#        the first INSERT that raises SQLSTATE 53R9E (cluster_undo_segments
+#        _hard_cap_reached).
+#     d) Verify:  53R9E raised + hard_cap_fail_count > snapshot.
+# ----------
+# GUC range is [16, 256] (cluster_guc.c).  Set to floor 16; pool will hit
+# cap at 16 segments.  Race-safe floor only kicks in if current pool > 16,
+# which isn't possible at this point in the test (L9/L10 created maybe 3-4
+# segments at most).
+$node0->safe_psql('postgres',
+    'ALTER SYSTEM SET cluster.undo_segments_max_per_instance = 16');
+$node0->safe_psql('postgres', 'SELECT pg_reload_conf()');
+usleep(500_000);
+
+my $pre_hard_cap = $node0->safe_psql('postgres',
+    q{SELECT value::bigint FROM pg_cluster_state
+       WHERE category='undo' AND key='segment_hard_cap_fail_count'});
+
+my $caught_53r9e = 0;
+my $cycles_done  = 0;
+for my $i (1..32) {
+    $cycles_done = $i;
+    $node0->safe_psql('postgres',
+        q{SELECT cluster_undo_test_force_segment_end()});
+    # Use --set VERBOSITY=verbose so SQLSTATE prefix appears in stderr.
+    my ($rc, $stdout, $stderr) = $node0->psql('postgres',
+        qq{INSERT INTO t_autoex VALUES ($i + 1000, 'hard cap probe')},
+        extra_params => ['-v', 'VERBOSITY=verbose']);
+    if ($rc != 0 && ($stderr =~ /53R9E/ || $stderr =~ /hard cap reached/)) {
+        $caught_53r9e = 1;
+        last;
+    }
+    last if $rc != 0;  # 任何其他错误 → 终止避免无限重试
+}
+
+ok($caught_53r9e == 1,
+    "L11a hard cap raised within $cycles_done force+DML cycles (53R9E / hard cap reached)");
+
+my $post_hard_cap = $node0->safe_psql('postgres',
+    q{SELECT value::bigint FROM pg_cluster_state
+       WHERE category='undo' AND key='segment_hard_cap_fail_count'});
+ok($post_hard_cap > $pre_hard_cap,
+    "L11b segment_hard_cap_fail_count incremented (pre=$pre_hard_cap post=$post_hard_cap)");
+
+# Restore GUC for subsequent tests
+$node0->safe_psql('postgres',
+    'ALTER SYSTEM SET cluster.undo_segments_max_per_instance = 256');
+$node0->safe_psql('postgres', 'SELECT pg_reload_conf()');
+usleep(500_000);
+
+
+# ----------
+# L12: concurrency — publication path under double-checked locking
+#    Setup:  two background_psql sessions s1 + s2 (separate backends).
+#    Sequence:
+#     a) Snapshot autoextend_count A_pre + segment_switch_count S_pre
+#     b) s1 + s2 both run force_segment_end (cursor at last block in
+#        both backends' shared view)
+#     c) s1 INSERT — wins autoextend race:  acquires lifecycle_lock,
+#        extends, mark_full(old) + mark_active(new), publishes new
+#        active_segment_id under cursor_lock, A_pre+1
+#     d) s2 INSERT — does NOT re-force_segment_end.  When s2 enters
+#        cluster_undo_record_alloc, it reads the NEW cursor (published
+#        by s1) which points at the fresh segment block 1.  No
+#        cursor-exhaustion branch entered → NO autoextend.
+#     e) Snapshot autoextend_count A_post + segment_switch_count S_post
+#     f) Assert:  delta A = 1 (not 2),  delta S = 1 (not 2).
+#
+#    This proves the publication half of double-checked locking:  the
+#    cursor_lock-protected active_segment_id store is visible to the
+#    second writer without it re-entering autoextend.  The race-loser
+#    recheck-under-lifecycle-lock path (both writers reach exhaustion
+#    simultaneously) requires true parallel execution and is exercised
+#    by perf class 8 stress workload (Step 11 baseline).
+# ----------
+{
+    my $a_pre = $node0->safe_psql('postgres',
+        q{SELECT value::bigint FROM pg_cluster_state
+           WHERE category='undo' AND key='autoextend_count'});
+    my $s_pre = $node0->safe_psql('postgres',
+        q{SELECT value::bigint FROM pg_cluster_state
+           WHERE category='undo' AND key='segment_switch_count'});
+
+    my $s1 = $node0->background_psql('postgres', on_error_die => 1);
+    my $s2 = $node0->background_psql('postgres', on_error_die => 1);
+
+    $s1->query_safe('SELECT cluster_undo_test_force_segment_end()');
+    $s2->query_safe('SELECT cluster_undo_test_force_segment_end()');
+
+    # s1 wins race
+    $s1->query_safe(q{INSERT INTO t_autoex VALUES (9001, 'race winner')});
+
+    # s2 follows — cursor has been published by s1, no autoextend expected
+    $s2->query_safe(q{INSERT INTO t_autoex VALUES (9002, 'race observer')});
+
+    $s1->quit;
+    $s2->quit;
+
+    my $a_post = $node0->safe_psql('postgres',
+        q{SELECT value::bigint FROM pg_cluster_state
+           WHERE category='undo' AND key='autoextend_count'});
+    my $s_post = $node0->safe_psql('postgres',
+        q{SELECT value::bigint FROM pg_cluster_state
+           WHERE category='undo' AND key='segment_switch_count'});
+
+    my $da = $a_post - $a_pre;
+    my $ds = $s_post - $s_pre;
+
+    ok($da == 1,
+        "L12a publication path: autoextend delta = 1 not 2 (pre=$a_pre post=$a_post)");
+    ok($ds == 1,
+        "L12b publication path: segment_switch delta = 1 not 2 (pre=$s_pre post=$s_post)");
+}
 
 
 $pair->stop_pair;

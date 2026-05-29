@@ -324,4 +324,78 @@ UndoSegmentHeader_owner(const UndoSegmentHeaderData *hdr)
 }
 
 
+/*
+ * spec-3.8 Fix #375:  pure-logic kernels extracted from cluster_undo_alloc.c
+ * so cluster_unit behavioural tests can exercise the lifecycle invariants
+ * without postgres shmem / file I/O.  The backend wrappers in alloc.c call
+ * these same kernels on the in-memory header buffer after pread(),  so the
+ * cluster_unit tests cover the actual invariant logic.
+ *
+ *   UndoSegmentBitmap_mark_used:  set bit for block_no; returns true iff
+ *	   the bit changed (idempotency proof). Caller must ensure block_no in
+ *	   [0, UNDO_BLOCKS_PER_SEGMENT).
+ *
+ *   UndoSegmentBitmap_count_free_capped:  count clear bits up to cap + 1
+ *	   then short-circuit.  Used by is_full(margin = 1).
+ *
+ *   UndoSegmentBitmap_is_full:  free count <= 1 (1 = safety margin per
+ *	   spec §3.7).
+ *
+ *   UndoSegmentState_can_become_active:  ALLOCATED → true (legal transition),
+ *	   ACTIVE → true (idempotent), others → false (fail-closed per spec §3.3 I3).
+ *
+ *   UndoSegmentFlags_is_full:  pure flag read.
+ */
+static inline bool
+UndoSegmentBitmap_mark_used(uint8 *bitmap, uint32 block_no)
+{
+	uint32 byte_idx = block_no / 8;
+	uint8  bit_mask = (uint8) (1u << (block_no % 8));
+
+	if ((bitmap[byte_idx] & bit_mask) != 0)
+		return false;
+	bitmap[byte_idx] |= bit_mask;
+	return true;
+}
+
+static inline uint32
+UndoSegmentBitmap_count_free_capped(const uint8 *bitmap, uint32 bytes, uint32 cap)
+{
+	uint32 free_count = 0;
+	uint32 i;
+
+	for (i = 0; i < bytes; i++) {
+		uint8 byte = bitmap[i];
+		uint8 j;
+
+		for (j = 0; j < 8; j++) {
+			if ((byte & ((uint8) 1u << j)) == 0) {
+				free_count++;
+				if (free_count > cap)
+					return free_count;
+			}
+		}
+	}
+	return free_count;
+}
+
+static inline bool
+UndoSegmentBitmap_is_full(const uint8 *bitmap, uint32 bytes)
+{
+	return UndoSegmentBitmap_count_free_capped(bitmap, bytes, 1) <= 1;
+}
+
+static inline bool
+UndoSegmentState_can_become_active(uint8 state)
+{
+	return state == SEGMENT_ALLOCATED || state == SEGMENT_ACTIVE;
+}
+
+static inline bool
+UndoSegmentFlags_is_full(uint8 flags)
+{
+	return (flags & UNDO_SEGMENT_FLAG_FULL) != 0;
+}
+
+
 #endif /* CLUSTER_UNDO_SEGMENT_H */

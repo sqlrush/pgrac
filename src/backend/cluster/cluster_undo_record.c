@@ -28,9 +28,12 @@
  *	  cluster_undo_record_alloc() 返回 non-InvalidUba 前必须 undo block
  *	  bytes 已 fsync 到 shared storage。
  *
- *	  File I/O 模式:复用 `cluster_undo_alloc.c` 既有 pattern
- *	  (BasicOpenFile + pg_pwrite + pg_fsync);spec-3.7 Step 5 D7 后续把
- *	  block-level I/O 抽象到 cluster_undo_smgr.c。
+ *	  File I/O 模式:全部走 cluster_undo_smgr 抽象层
+ *	  (cluster_undo_smgr_read_block / write_block) — spec-3.8 Fix #372
+ *	  落地后,record.c + alloc.c lifecycle helpers 不再 inline
+ *	  BasicOpenFile + pg_pread/pwrite。File create + WAL-protect 仍走
+ *	  cluster_undo_segment_allocate(),smgr_create_segment_file 是其
+ *	  公开 wrapper。
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -72,6 +75,7 @@
 #include "cluster/cluster_undo_record.h"
 #include "cluster/cluster_undo_record_api.h"
 #include "cluster/cluster_undo_segment.h"
+#include "cluster/cluster_undo_smgr.h"
 #include "cluster/storage/cluster_undo_alloc.h"
 
 #include "access/xlog.h" /* GetXLogWriteRecPtr */
@@ -274,42 +278,21 @@ undo_record_total_length(uint8 record_type, uint16 payload_len)
 }
 
 
-/* ---- Helper: read/write undo block via BasicOpenFile ---- */
-
-static int
-open_segment_fd(uint32 segment_id, uint8 owner_instance)
-{
-	char path[MAXPGPATH];
-	int ret;
-	int fd;
-
-	ret = cluster_undo_path_resolve(owner_instance, segment_id, path, sizeof(path));
-	if (ret != 0)
-		return -1;
-
-	fd = BasicOpenFile(path, O_RDWR | PG_BINARY);
-	return fd;
-}
-
+/*
+ * spec-3.8 Fix #372:  inline BasicOpenFile + pg_pread/pwrite/fsync helpers
+ * replaced by cluster_undo_smgr layer.  The smgr layer is the single I/O
+ * surface for undo segment block I/O — used here by the record allocator,
+ * by cluster_undo_alloc.c for state-machine helpers, and (future) by
+ * spec-3.9 CR construction + spec-3.10 CR cache.
+ *
+ * Thin static wrappers preserve the call-site signatures so the autoextend
+ * branch and reader path don't have to thread through new APIs.
+ */
 
 static bool
 read_undo_block(uint32 segment_id, uint8 owner_instance, uint32 block_no, char *buf)
 {
-	int fd;
-	off_t offset;
-	ssize_t nread;
-	bool ok;
-
-	fd = open_segment_fd(segment_id, owner_instance);
-	if (fd < 0)
-		return false;
-
-	offset = (off_t)block_no * BLCKSZ;
-	nread = pg_pread(fd, buf, BLCKSZ, offset);
-	ok = (nread == BLCKSZ);
-
-	close(fd);
-	return ok;
+	return cluster_undo_smgr_read_block(segment_id, owner_instance, block_no, buf);
 }
 
 
@@ -317,27 +300,7 @@ static bool
 write_undo_block(uint32 segment_id, uint8 owner_instance, uint32 block_no, const char *buf,
 				 bool do_fsync)
 {
-	int fd;
-	off_t offset;
-	ssize_t nwritten;
-	bool ok = true;
-
-	fd = open_segment_fd(segment_id, owner_instance);
-	if (fd < 0)
-		return false;
-
-	offset = (off_t)block_no * BLCKSZ;
-	nwritten = pg_pwrite(fd, buf, BLCKSZ, offset);
-	if (nwritten != BLCKSZ)
-		ok = false;
-
-	if (ok && do_fsync) {
-		if (pg_fsync(fd) != 0)
-			ok = false;
-	}
-
-	close(fd);
-	return ok;
+	return cluster_undo_smgr_write_block(segment_id, owner_instance, block_no, buf, do_fsync);
 }
 
 
@@ -546,14 +509,33 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 			new_segment_id = cluster_undo_segment_extend_or_create(ownerinst, &at_hard_cap);
 
 			if (new_segment_id == 0) {
-				/* Failed:  hard cap or FS fail.  Release lifecycle_lock
-				 * + counter bump + caller decides SQLSTATE. */
+				/* spec-3.8 §3.5:  hard cap → 53R9E;  FS fail → 53R9D.
+				 * Counter bump first,  release lifecycle_lock,  then
+				 * ereport ERROR.  Direct raise (not return InvalidUba)
+				 * so the SQLSTATE reaches the SQL client instead of
+				 * being masked by the heap-level INVALID_UBA wrapper. */
 				if (at_hard_cap)
 					pg_atomic_fetch_add_u64(&UndoRecordShared->segment_hard_cap_fail_count, 1);
 				else
 					pg_atomic_fetch_add_u64(&UndoRecordShared->segment_create_fail_count, 1);
 				LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
-				return InvalidUba;
+
+				if (at_hard_cap)
+					ereport(ERROR,
+							(errcode(ERRCODE_CLUSTER_UNDO_SEGMENTS_HARD_CAP_REACHED),
+							 errmsg("cluster undo segment pool hard cap reached for instance %u",
+									(unsigned) (cluster_node_id + 1)),
+							 errhint("Increase cluster.undo_segments_max_per_instance "
+									 "(current limit reached);  or wait for spec-3.12 "
+									 "segment recycle to free slots.")));
+				else
+					ereport(ERROR,
+							(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+							 errmsg("cluster undo segment autoextend failed "
+									"(filesystem error or timeout)"),
+							 errhint("Check disk space on $PGDATA/pg_undo and "
+									 "cluster.undo_segment_create_timeout_ms.")));
+				return InvalidUba; /* unreachable */
 			}
 
 			/* Success — counter bumps. */
