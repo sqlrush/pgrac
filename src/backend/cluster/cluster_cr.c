@@ -39,9 +39,16 @@
 #include "storage/shmem.h"
 #include "utils/elog.h"
 #include "utils/memutils.h"
+#include "utils/wait_event.h"
 
 #include "cluster/cluster_cr.h"
+#include "cluster/cluster_cr_apply.h"
+#include "cluster/cluster_guc.h" /* cluster_cr_chain_walk_max_steps, cluster_node_id */
+#include "cluster/cluster_itl_slot.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_uba.h"
+#include "cluster/cluster_undo_record.h"
+#include "cluster/cluster_undo_record_api.h"
 
 
 /*
@@ -172,27 +179,186 @@ cr_scratch_ensure(void)
  * ============================================================ */
 
 /*
- * cr_walk_and_apply -- walk ITL[itl_idx].uba_head backward and inverse-apply
- *	every undo record newer than read_scn onto scratch_page.
+ * cr_walk_and_apply -- walk ITL[itl_idx].undo_segment_head backward and
+ *	inverse-apply every undo record newer than read_scn onto scratch_page.
  *
- *	Step 2 ships the signature + non-reentrant integration only; the real
- *	chain walk + SCN stop condition + chain terminal taxonomy + step cap
- *	land in Step 3 (spec-3.9 D3).  Explicit FEATURE_NOT_SUPPORTED keeps the
- *	intermediate commit honest (CLAUDE.md 规则 8) — nothing calls
- *	cluster_cr_construct_block until Step 5 (heapam_visibility integration).
+ *	Stop conditions + chain terminal taxonomy (spec-3.9 §3.1 I-chain-1..4):
+ *	  - I-chain-1  write_scn <= read_scn : the unconditional normal stop;
+ *	               this record + everything older is already in the snapshot.
+ *	  - I-chain-2  invalid prev_uba (chain end) is a legal base state ONLY
+ *	               when no record was applied (empty chain) or the last
+ *	               applied record was an INSERT (the row was created after
+ *	               read_scn and inverse-INSERT made it LP_UNUSED).
+ *	  - I-chain-3  reaching chain end while still write_scn > read_scn after
+ *	               an UPDATE/DELETE/ITL record => the older base needed to
+ *	               reach read_scn is unreachable (most likely retention
+ *	               recycled) => 53R9F snapshot_too_old (fail-closed, NEVER
+ *	               silent-success).
+ *	  - missing record (reader returns 0) => 53R9F.
+ *	  - cross-instance origin => 53R9G.
+ *	  - malformed UBA / short record / unknown record_type / step cap
+ *	    exceeded => data_corrupted.
+ *
+ *	The inverse-apply bodies live in cluster_cr_apply.c (Step 4); the
+ *	helpers return bool and the caller MUST ereport on false (I-fail-4).
+ *
+ *	Caller already memcpy'd the buffer page into scratch_page and holds the
+ *	non-reentrant guard; this function performs no locking (I-lock-2).
  */
 static void
 cr_walk_and_apply(char *scratch_page, Buffer buf, SCN read_scn, int itl_idx)
 {
-	(void)scratch_page;
-	(void)buf;
-	(void)read_scn;
-	(void)itl_idx;
+	Page page = (Page)scratch_page;
+	ClusterItlSlotData *slots;
+	UBA uba;
+	uint32 steps = 0;
+	uint32 max_steps = (uint32)cluster_cr_chain_walk_max_steps;
+	uint8 last_record_type = UNDO_RECORD_INVALID;
+	PGAlignedBlock record_buf;
 
-	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					errmsg("cluster CR chain walker not yet implemented"),
-					errhint("Lands in spec-3.9 Step 3 (D3); this path is not reachable "
-							"until Step 5 visibility integration.")));
+	(void)buf; /* page bytes already copied into scratch by the caller */
+
+	if (itl_idx < 0 || itl_idx >= CLUSTER_ITL_INITRANS_DEFAULT)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("cluster CR itl_idx %d out of range [0, %d)", itl_idx,
+							   CLUSTER_ITL_INITRANS_DEFAULT)));
+
+	if (!PageHasItl(page))
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("cluster CR target page has no ITL special area")));
+
+	slots = ClusterPageGetItlSlots(page);
+	uba = slots[itl_idx].undo_segment_head;
+
+	while (!UBA_is_invalid(uba)) {
+		UndoRecordHeader *hdr;
+		size_t len;
+		uint32 seg;
+		uint32 blk;
+		uint16 tt_off;
+		uint16 row_off;
+
+		if (++steps > max_steps)
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("cluster CR chain walk exceeded %u steps", max_steps),
+							errhint("chain walk infinite loop suspected; raise "
+									"cluster.cr_chain_walk_max_steps if a hot row legitimately "
+									"has a longer in-snapshot undo chain.")));
+
+		if (!uba_decode(uba, &seg, &blk, &tt_off, &row_off))
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("cluster CR encountered a malformed UBA in the undo chain")));
+
+		len = cluster_undo_get_record(uba, record_buf.data, sizeof(record_buf.data));
+		if (len == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_CR_SNAPSHOT_TOO_OLD),
+					 errmsg("snapshot too old: CR cannot read undo record at segment %u block %u "
+							"(recycled or retention exceeded)",
+							seg, blk),
+					 errhint("Increase undo retention; spec-3.11 will enforce snapshot-age "
+							 "retention policy.")));
+		if (len < sizeof(UndoRecordHeader))
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("cluster CR read a short undo record (%zu < %zu bytes)", len,
+								   sizeof(UndoRecordHeader))));
+
+		hdr = (UndoRecordHeader *)record_buf.data;
+
+		/* Own-instance CR only (spec-3.9 I-cr-5). */
+		if (hdr->origin_node_id != (uint16)cluster_node_id)
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CR_CROSS_INSTANCE_UNSUPPORTED),
+							errmsg("cluster CR cross-instance UBA encountered "
+								   "(origin_node_id=%u, local=%d)",
+								   hdr->origin_node_id, cluster_node_id),
+							errhint("spec-3.9 supports own-instance CR only; cross-instance CR "
+									"is Stage 4 (Cache Fusion CR coordinator).")));
+
+		/* I-chain-1: normal SCN stop. */
+		if (hdr->write_scn <= read_scn)
+			break;
+
+		switch (hdr->record_type) {
+		case UNDO_RECORD_INSERT: {
+			const UndoInsertPayload *p
+				= (const UndoInsertPayload *)(record_buf.data + sizeof(UndoRecordHeader));
+
+			if (!cluster_cr_apply_insert_inverse(scratch_page, hdr, p))
+				ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+								errmsg("cluster CR insert inverse-apply failed")));
+			if (CRShared != NULL)
+				pg_atomic_fetch_add_u64(&CRShared->cr_inverse_insert_count, 1);
+			break;
+		}
+		case UNDO_RECORD_UPDATE: {
+			const UndoUpdatePayload *p
+				= (const UndoUpdatePayload *)(record_buf.data + sizeof(UndoRecordHeader));
+			const char *old_bytes = record_buf.data + p->old_tuple_offset;
+
+			if ((size_t)p->old_tuple_offset + p->old_tuple_length > len)
+				ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+								errmsg("cluster CR update payload old-tuple bytes out of bounds")));
+			if (!cluster_cr_apply_update_inverse(scratch_page, hdr, p, old_bytes,
+												 p->old_tuple_length))
+				ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+								errmsg("cluster CR update inverse-apply failed")));
+			if (CRShared != NULL)
+				pg_atomic_fetch_add_u64(&CRShared->cr_inverse_update_count, 1);
+			break;
+		}
+		case UNDO_RECORD_DELETE: {
+			const UndoDeletePayload *p
+				= (const UndoDeletePayload *)(record_buf.data + sizeof(UndoRecordHeader));
+			const char *full_bytes = record_buf.data + p->full_tuple_offset;
+
+			if ((size_t)p->full_tuple_offset + p->full_tuple_length > len)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("cluster CR delete payload full-tuple bytes out of bounds")));
+			if (!cluster_cr_apply_delete_inverse(scratch_page, hdr, p, full_bytes,
+												 p->full_tuple_length))
+				ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+								errmsg("cluster CR delete inverse-apply failed")));
+			if (CRShared != NULL)
+				pg_atomic_fetch_add_u64(&CRShared->cr_inverse_delete_count, 1);
+			break;
+		}
+		case UNDO_RECORD_ITL: {
+			if (!cluster_cr_apply_itl_inverse(scratch_page, hdr, itl_idx))
+				ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+								errmsg("cluster CR ITL inverse-apply failed")));
+			if (CRShared != NULL)
+				pg_atomic_fetch_add_u64(&CRShared->cr_inverse_itl_count, 1);
+			break;
+		}
+		default:
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("cluster CR encountered unknown undo record type %u "
+								   "(version skew or corruption)",
+								   hdr->record_type)));
+		}
+
+		last_record_type = hdr->record_type;
+		uba = hdr->prev_uba;
+	}
+
+	/*
+	 * Chain terminal taxonomy (I-chain-2/3): if we left the loop via an
+	 * invalid prev_uba (chain end) rather than the SCN stop, the scratch
+	 * page is a legal read_scn base ONLY for an empty chain or an
+	 * INSERT-rooted chain.  Any other terminator means the older base was
+	 * unreachable -> fail-closed as snapshot_too_old, never silent success.
+	 */
+	if (UBA_is_invalid(uba) && last_record_type != UNDO_RECORD_INVALID
+		&& last_record_type != UNDO_RECORD_INSERT)
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CR_SNAPSHOT_TOO_OLD),
+						errmsg("snapshot too old: CR undo chain ended before reaching the "
+							   "read_scn base state"),
+						errhint("The required older row version is no longer reachable; "
+								"increase undo retention.")));
+
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->cr_chain_walk_steps_sum, steps);
 }
 
 
@@ -222,10 +388,15 @@ cluster_cr_construct_block(Buffer buf, SCN read_scn, int itl_idx)
 	{
 		/* I-lock-1/2/4: caller holds the content lock; we only read the
 		 * page bytes into backend-local scratch — no buffer lock, no WAL,
-		 * no dirty. */
+		 * no dirty.  The wait event covers the undo I/O of the chain walk
+		 * so it is observable in pg_stat_activity (spec-3.9 §2 / TAP L8). */
+		pgstat_report_wait_start(WAIT_EVENT_CLUSTER_CR_CONSTRUCT);
+
 		memcpy(cr_scratch, BufferGetPage(buf), BLCKSZ);
 
 		cr_walk_and_apply(cr_scratch, buf, read_scn, itl_idx);
+
+		pgstat_report_wait_end();
 
 		if (CRShared != NULL)
 			pg_atomic_fetch_add_u64(&CRShared->cr_construct_count, 1);
@@ -234,6 +405,7 @@ cluster_cr_construct_block(Buffer buf, SCN read_scn, int itl_idx)
 	}
 	PG_CATCH();
 	{
+		pgstat_report_wait_end();
 		cr_in_progress = false;
 		PG_RE_THROW();
 	}

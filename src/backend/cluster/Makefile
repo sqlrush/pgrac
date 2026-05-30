@@ -93,6 +93,7 @@ OBJS = \
 	cluster_undo_record.o \
 	cluster_undo_srf.o \
 	cluster_cr.o \
+	cluster_cr_apply.o \
 	cluster_tt_slot.o \
 	cluster_tt_local.o \
 	cluster_tt_status.o \
