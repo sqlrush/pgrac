@@ -217,6 +217,23 @@ int cluster_undo_segment_create_timeout_ms = 5000;
 int cluster_cr_chain_walk_max_steps = 4096;
 
 /*
+ * spec-3.9 D5 NEW GUC:
+ *   cluster.cr_mvcc_gate -- master switch for the own-instance CR 3-tier
+ *   MVCC short-circuit gate in HeapTupleSatisfiesMVCC.  DEFAULT OFF.
+ *
+ *   The CR construction machinery (cluster_cr_construct_block + chain walker
+ *   + inverse helpers) is fully shipped and unit/TAP-tested; but the precise
+ *   firing condition for routing a live SELECT through a reconstructed
+ *   historical block — vs trusting PG-style multi-version heap + spec-3.3
+ *   SCN visibility — is a visibility-correctness decision deferred to user
+ *   codereview (see spec-3.9 Step 5 NOTE).  Default-off keeps existing
+ *   spec-3.2/3.3 visibility behavior byte-for-byte; t/215 flips it on to
+ *   exercise the end-to-end CR read path.  PGC_USERSET so a test session can
+ *   scope it without a reload.
+ */
+bool cluster_cr_mvcc_gate = false;
+
+/*
  * cluster.boc_sweep_interval_ms (spec-1.17 D4 v0.2).  walwriter BOC
  * sweep target staleness in ms.  Range [1, 1000]; default 100ms.  Actual
  * sweep frequency is bounded by Min(WalWriterDelay, this); user must
@@ -1393,6 +1410,16 @@ cluster_init_guc(void)
 					 "\"chain walk infinite loop suspected\". Tune higher if a hot "
 					 "row legitimately accumulates a very long in-snapshot undo chain."),
 		&cluster_cr_chain_walk_max_steps, 4096, 64, 65536, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"cluster.cr_mvcc_gate",
+		gettext_noop("Enable the own-instance CR 3-tier MVCC short-circuit gate."),
+		gettext_noop("Spec-3.9 D5. DEFAULT OFF. When on, a local-origin tuple whose "
+					 "block and ITL write_scn are both newer than the snapshot read_scn "
+					 "is read through a reconstructed historical block image. Off keeps "
+					 "spec-3.2/3.3 SCN visibility behavior unchanged. The firing-condition "
+					 "semantics are pending user codereview; treat as experimental."),
+		&cluster_cr_mvcc_gate, false, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
 		"cluster.boc_sweep_interval_ms",

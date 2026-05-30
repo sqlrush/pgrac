@@ -92,6 +92,7 @@
 #include "cluster/cluster_multixact.h"		/* spec-3.6 D6 reader overlay */
 #include "cluster/cluster_tt_status.h"		/* lookup_exact / Key / Result */
 #include "cluster/cluster_visibility_inject.h"	/* D5b test-only inject helper */
+#include "cluster/cluster_cr.h"					/* spec-3.9 D5 CR 3-tier MVCC gate */
 #endif
 
 
@@ -1017,6 +1018,26 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot,
 		TransactionId raw_xmin = HeapTupleHeaderGetRawXmin(tuple);
 		ClusterUndoTTSlotRef ref;
 		bool		ref_filled = false;
+
+		/*
+		 * PGRAC spec-3.9 D5: own-instance CR 3-tier short-circuit gate.
+		 *
+		 *   Fires only for a local-origin tuple whose block (pd_block_scn)
+		 *   AND own ITL slot (write_scn) are both newer than the snapshot
+		 *   read_scn — i.e. the physical row has changed after the snapshot
+		 *   and must be read through a reconstructed historical block image.
+		 *   The page-gate / ITL-gate tiers inside the helper keep the common
+		 *   fast path free of CR construction.  When the gate does not fire
+		 *   (remote tuple, block at/before snapshot, or no local undo chain)
+		 *   it returns false and we continue to the existing spec-3.2/3.3
+		 *   remote-xid path + PG-native body below, unchanged.
+		 */
+		{
+			bool		cr_visible;
+
+			if (cluster_cr_satisfies_mvcc(htup, snapshot, buffer, &cr_visible))
+				return cr_visible;
+		}
 
 		/*
 		 * spec-3.3 D10 (Q8 / R6): reconfig epoch fence. A snapshot

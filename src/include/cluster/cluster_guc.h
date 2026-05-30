@@ -412,6 +412,14 @@ extern int cluster_undo_segment_create_timeout_ms;
  */
 extern int cluster_cr_chain_walk_max_steps;
 
+/*
+ *   cluster.cr_mvcc_gate (spec-3.9 D5) -- master switch for the own-instance
+ *                                         CR 3-tier MVCC short-circuit gate
+ *                                         (default off; PGC_USERSET;
+ *                                         experimental pending codereview)
+ */
+extern bool cluster_cr_mvcc_gate;
+
 
 /*
  * cluster.allow_single_node (spec-2.1 D1; Stage 2.1 backward-compat

@@ -543,3 +543,84 @@ cluster_visibility_decide_cr_tuple(HeapTuple htup, Snapshot snapshot)
 	 */
 	return cr_decide_by_infomask(htup->t_data);
 }
+
+
+/* ============================================================
+ * MVCC 3-tier short-circuit gate (spec-3.9 Step 5)
+ * ============================================================ */
+
+bool
+cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool *out_visible)
+{
+	HeapTupleHeader tup = htup->t_data;
+	Page page;
+	PageHeader phdr;
+	uint8 itl_idx;
+	const ClusterItlSlotData *slot;
+	const char *cr_page;
+	HeapTupleData cr_htup;
+	ClusterVisibilityDecision decision;
+
+	/*
+	 * Master switch (default off).  The firing-condition semantics are
+	 * pending user codereview (spec-3.9 Step 5 NOTE); with the gate off the
+	 * CR read path is never taken from visibility and spec-3.2/3.3 behavior
+	 * is unchanged.
+	 */
+	if (!cluster_cr_mvcc_gate)
+		return false;
+
+	if (!cluster_enabled || !BufferIsValid(buffer)
+		|| snapshot->cluster_source != (uint8)SNAPSHOT_SOURCE_CLUSTER)
+		return false;
+
+	page = BufferGetPage(buffer);
+	if (!PageHasItl(page))
+		return false;
+
+	itl_idx = tup->t_itl_slot_idx;
+	if (itl_idx == CLUSTER_ITL_SLOT_UNALLOCATED || itl_idx >= CLUSTER_ITL_INITRANS_DEFAULT)
+		return false;
+
+	phdr = (PageHeader)page;
+
+	/* Tier 1 (page gate): block already at/before snapshot -> not our case;
+	 * the existing visibility path / PG-native body handles it. */
+	if (!SCN_VALID(phdr->pd_block_scn) || !SCN_VALID(snapshot->read_scn))
+		return false;
+	if (scn_time_cmp(phdr->pd_block_scn, snapshot->read_scn) <= 0)
+		return false;
+
+	slot = &ClusterPageGetItlSlots(page)[itl_idx];
+
+	/* Tier 2 (ITL gate): this tuple's own change is already in the snapshot. */
+	if (!SCN_VALID(slot->write_scn))
+		return false;
+	if (scn_time_cmp(slot->write_scn, snapshot->read_scn) <= 0)
+		return false;
+
+	/* Tier 3 (own-instance only): remote tuples are resolved by the existing
+	 * spec-3.2/3.3 remote-xid block; cross-instance CR is Stage 4. */
+	if (UBA_is_invalid(slot->undo_segment_head))
+		return false;
+	if ((int32)uba_origin_node_id(slot->undo_segment_head) != cluster_node_id)
+		return false;
+
+	/*
+	 * Gate fired: construct the read_scn block image and decide on the
+	 * historical tuple.  cluster_cr_lookup_or_construct never returns NULL —
+	 * it ereports the precise SQLSTATE on failure (I-fail-1).
+	 */
+	cr_page = cluster_cr_lookup_or_construct(buffer, snapshot->read_scn, itl_idx);
+
+	if (!cluster_cr_remap_tuple(cr_page, ItemPointerGetOffsetNumber(&htup->t_self), &cr_htup)) {
+		/* CR-removed (inverse-INSERT made it LP_UNUSED): the row did not
+		 * exist at read_scn -> invisible. */
+		*out_visible = false;
+		return true;
+	}
+
+	decision = cluster_visibility_decide_cr_tuple(&cr_htup, snapshot);
+	*out_visible = (decision == CLUSTER_VISIBILITY_VISIBLE);
+	return true;
+}

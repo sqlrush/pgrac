@@ -124,6 +124,24 @@ extern ClusterVisibilityDecision cluster_visibility_decide_tuple(HeapTuple htup,
 extern ClusterVisibilityDecision cluster_visibility_decide_cr_tuple(HeapTuple htup,
 																	Snapshot snapshot);
 
+/*
+ * cluster_cr_satisfies_mvcc -- spec-3.9 Step 5 MVCC 3-tier short-circuit gate.
+ *
+ *   Called additively at the top of HeapTupleSatisfiesMVCC's cluster path.
+ *   Returns true and sets *out_visible when the own-instance historical-CR
+ *   case applies (block_scn > read_scn AND the tuple's ITL write_scn >
+ *   read_scn AND the tuple is local-origin); the caller then returns
+ *   *out_visible.  Returns false (gate did not fire) for every other case —
+ *   the caller continues to the existing spec-3.2/3.3 remote-xid path /
+ *   PG-native body unchanged.
+ *
+ *   The three short-circuit tiers (page gate / ITL gate) avoid constructing
+ *   a CR image on the common fast path; only a genuinely post-snapshot
+ *   local tuple reaches cluster_cr_lookup_or_construct.
+ */
+extern bool cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer,
+									  bool *out_visible);
+
 /* Counter accessors (spec-3.9 §2.5 — 9 counters). */
 extern uint64 cluster_cr_construct_count(void);
 extern uint64 cluster_cr_snapshot_too_old_count(void);
