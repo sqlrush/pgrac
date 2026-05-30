@@ -179,7 +179,6 @@ cr_scratch_ensure(void)
  * Test injection hooks (spec-3.9 Step 7; SKIP-style precondition)
  * ============================================================ */
 
-#ifdef ENABLE_INJECTION
 /*
  * cr_check_error_injections -- if a CR error injection point is armed, raise
  *	the CR code's OWN precise SQLSTATE (NOT the framework's generic XX000).
@@ -217,7 +216,6 @@ cr_check_error_injections(void)
 						errhint("test injection cr_corruption param 1..4.")));
 	}
 }
-#endif /* ENABLE_INJECTION */
 
 
 /* ============================================================
@@ -264,11 +262,9 @@ cr_walk_and_apply(char *scratch_page, Buffer buf, SCN read_scn, int itl_idx)
 
 	(void)buf; /* page bytes already copied into scratch by the caller */
 
-#ifdef ENABLE_INJECTION
 	/* spec-3.9 Step 7: deterministic error injection (raises CR's own
 	 * SQLSTATE).  Checked FIRST so L4/L5/L6 fire regardless of page state. */
 	cr_check_error_injections();
-#endif
 
 	if (itl_idx < 0 || itl_idx >= CLUSTER_ITL_INITRANS_DEFAULT)
 		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
@@ -462,7 +458,6 @@ cluster_cr_construct_block(Buffer buf, SCN read_scn, int itl_idx)
 		 * so it is observable in pg_stat_activity (spec-3.9 §2 / TAP L8). */
 		pgstat_report_wait_start(WAIT_EVENT_CLUSTER_CR_CONSTRUCT);
 
-#ifdef ENABLE_INJECTION
 		/* spec-3.9 Step 7: deterministic wait-event window for TAP L8.
 		 * pg_usleep with the armed microsecond param under the wait event. */
 		{
@@ -471,7 +466,6 @@ cluster_cr_construct_block(Buffer buf, SCN read_scn, int itl_idx)
 			if (cluster_cr_injection_armed("cr_construct_delay_us", &delay_us) && delay_us > 0)
 				pg_usleep((long)delay_us);
 		}
-#endif
 
 		memcpy(cr_scratch, BufferGetPage(buf), BLCKSZ);
 

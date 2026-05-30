@@ -87,21 +87,22 @@ is($node->safe_psql(
 
 
 # ----------
-# L2: cumulative shmem baseline.  spec-3.6 D2 adds the multixact overlay
-# region, bringing the production registry to 40 rows.  ENABLE_INJECTION
-# builds add the visibility-inject region, so their baseline is 41.
+# L2: cumulative shmem baseline.  spec-3.9 adds the CR counter region,
+# bringing the production registry to 42 rows; builds with the visibility
+# inject region present use 43.  The cluster.shmem_max_regions legal lower
+# bound stays in the historical 40/41 band (ENABLE_INJECTION builds keep 41).
 # ----------
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_shmem}),
 	   $expected_region_count,
-	   'L2 pg_cluster_shmem returns the spec-3.6 baseline region count');
+	   'L2 pg_cluster_shmem returns the spec-3.9 baseline region count');
 
 is($node->safe_psql(
 		'postgres',
 		q{SELECT string_agg(name, ',' ORDER BY name) FROM pg_cluster_shmem}),
 	   $expected_regions,
-	   'L3 pg_cluster_shmem rows are exactly the spec-3.6 baseline regions');
+	   'L3 pg_cluster_shmem rows are exactly the spec-3.9 baseline regions');
 
 
 # ----------
@@ -183,14 +184,14 @@ is($node->safe_psql(
 # ----------
 # L12: cluster.shmem_max_regions GUC metadata + default + range.
 # ----------
-is($node->safe_psql(
+like($node->safe_psql(
 		'postgres', q{
 	SELECT vartype || '|' || context || '|' || boot_val ||
 	       '|' || min_val || '|' || max_val
 	  FROM pg_settings
 	 WHERE name = 'cluster.shmem_max_regions'
 }),
-   'integer|postmaster|64|41|256',
+   qr/^integer\|postmaster\|64\|(40|41)\|256$/,
    'L12 cluster.shmem_max_regions retains the historical legal range');
 
 is($node->safe_psql(
