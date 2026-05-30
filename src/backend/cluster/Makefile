@@ -94,6 +94,7 @@ OBJS = \
 	cluster_undo_srf.o \
 	cluster_cr.o \
 	cluster_cr_apply.o \
+	cluster_cr_srf.o \
 	cluster_tt_slot.o \
 	cluster_tt_local.o \
 	cluster_tt_status.o \
@@ -122,7 +123,7 @@ else
 # it (spec-1.1 does not introduce a SRF; pg_cluster_state extension
 # lives in cluster_debug.c which is always linked).
 OBJS = cluster_conf.o cluster_debug.o cluster_ic.o cluster_inject.o cluster_undo_srf.o \
-	cluster_pgstat.o cluster_scn.o cluster_views.o
+	cluster_cr_srf.o cluster_pgstat.o cluster_scn.o cluster_views.o
 endif
 
 include $(top_srcdir)/src/backend/common.mk

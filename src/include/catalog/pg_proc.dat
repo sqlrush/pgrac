@@ -12466,4 +12466,16 @@
   proargtypes => '',
   prosrc => 'cluster_undo_test_force_segment_end_srf' },
 
+# spec-3.9 D10 (2026-05-30) -- TEST-ONLY: drive own-instance CR block
+# construction on rel's block `blockno` / ITL slot `itl_idx` at `read_scn`,
+# bypassing the (default-off) MVCC gate so cluster_tap t/215 can exercise
+# the CR read path + injection taxonomy deterministically.  Superuser-only.
+{ oid => '8930', descr => 'TEST-ONLY: construct own-instance CR block image (spec-3.9)',
+  proname => 'cluster_cr_test_construct',
+  provolatile => 'v', proparallel => 'u',
+  prorettype => 'bool',
+  proargtypes => 'regclass int4 int4 int8',
+  proargnames => '{rel,blockno,itl_idx,read_scn}',
+  prosrc => 'cluster_cr_test_construct' },
+
 ]

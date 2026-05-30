@@ -570,7 +570,12 @@
 /* spec-3.8 Fix 6 (2026-05-29):  cluster_undo_test_force_segment_end TEST-ONLY
  * SQL function (oid 8929) to make autoextend / hard-cap path TAP-testable
  * deterministically.  Bumps CATALOG_VERSION_NO; pg_proc.dat gets one row. */
-#define CATALOG_VERSION_NO 202605590
+/* spec-3.9 D10 (2026-05-30):  TEST-ONLY cluster_cr_test_construct SQL
+ * function (oid 8930) to drive own-instance CR block construction from
+ * cluster_tap t/215.  One pg_proc row → catversion bump.  (The 2 NEW
+ * SQLSTATEs 53R9F/53R9G are in errcodes.h, not catalog, and do not by
+ * themselves require a bump.) */
+#define CATALOG_VERSION_NO 202605600
 
 /* spec-2.39 D10 (2026-05-21):  SI Broadcaster production activation —
  * DDL commit hook (AtEOXact_Inval + COMMIT PREPARED via cluster-aware

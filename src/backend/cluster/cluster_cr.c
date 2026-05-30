@@ -264,6 +264,12 @@ cr_walk_and_apply(char *scratch_page, Buffer buf, SCN read_scn, int itl_idx)
 
 	(void)buf; /* page bytes already copied into scratch by the caller */
 
+#ifdef ENABLE_INJECTION
+	/* spec-3.9 Step 7: deterministic error injection (raises CR's own
+	 * SQLSTATE).  Checked FIRST so L4/L5/L6 fire regardless of page state. */
+	cr_check_error_injections();
+#endif
+
 	if (itl_idx < 0 || itl_idx >= CLUSTER_ITL_INITRANS_DEFAULT)
 		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("cluster CR itl_idx %d out of range [0, %d)", itl_idx,
@@ -272,11 +278,6 @@ cr_walk_and_apply(char *scratch_page, Buffer buf, SCN read_scn, int itl_idx)
 	if (!PageHasItl(page))
 		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("cluster CR target page has no ITL special area")));
-
-#ifdef ENABLE_INJECTION
-	/* spec-3.9 Step 7: deterministic error injection (raises CR's own SQLSTATE). */
-	cr_check_error_injections();
-#endif
 
 	slots = ClusterPageGetItlSlots(page);
 	uba = slots[itl_idx].undo_segment_head;
