@@ -460,3 +460,86 @@ cluster_cr_remap_tuple(const char *cr_page, OffsetNumber off, HeapTupleData *out
 	 * block); CR scratch alone does not carry it. */
 	return true;
 }
+
+
+/* ============================================================
+ * Tuple-level cluster visibility helpers (spec-3.9 Step 4.5)
+ *
+ *   spec-3.9 §5 places cluster_visibility_decide_tuple in the generic
+ *   cluster visibility helper layer and cluster_visibility_decide_cr_tuple
+ *   in cluster_cr.c.  linkdb has no standalone generic cluster_visibility.c
+ *   (only cluster_visibility_inject.c), so both helpers live here for now;
+ *   FLAG FOR USER CODEREVIEW — if a dedicated cluster_visibility.c is
+ *   wanted, decide_tuple moves there unchanged.
+ *
+ *   Both decide visibility WITHOUT PG-native ProcArray/CLOG (AD-012 例外 9
+ *   / spec-3.9 I-fail-2/3).  They use SCN-based decisions and the tuple
+ *   header committed/invalid bits.
+ *
+ *   VISIBILITY SEMANTICS (MVP — flag for codereview):
+ *     - decide_tuple is for the 3-tier fast-path exits, where the block is
+ *       already at/before read_scn so the physical tuple IS the read_scn
+ *       version.  When the tuple's ITL slot carries a valid commit_scn it
+ *       defers to cluster_visibility_decide_by_scn(commit_scn, read_scn);
+ *       otherwise it uses the tuple's xmin-committed / xmax-invalid bits.
+ *     - decide_cr_tuple is for a CR image already reconstructed to read_scn:
+ *       post-read_scn changes are undone, so the row is VISIBLE iff its
+ *       image xmin is committed/frozen and its xmax is invalid.  No buffer,
+ *       no hint-bit writes (I-lock-4).
+ * ============================================================ */
+
+/*
+ * Pure tuple-header visibility approximation (no syscall, no ProcArray).
+ *   VISIBLE iff xmin is committed/frozen AND xmax is invalid.
+ */
+static ClusterVisibilityDecision
+cr_decide_by_infomask(HeapTupleHeader htup)
+{
+	bool xmin_committed = (htup->t_infomask & HEAP_XMIN_COMMITTED) != 0;
+	bool xmax_invalid = (htup->t_infomask & HEAP_XMAX_INVALID) != 0
+						|| !TransactionIdIsValid(HeapTupleHeaderGetRawXmax(htup));
+
+	if (xmin_committed && xmax_invalid)
+		return CLUSTER_VISIBILITY_VISIBLE;
+	return CLUSTER_VISIBILITY_INVISIBLE;
+}
+
+ClusterVisibilityDecision
+cluster_visibility_decide_tuple(HeapTuple htup, Snapshot snapshot, Buffer buffer)
+{
+	HeapTupleHeader tup = htup->t_data;
+
+	/*
+	 * If the tuple's ITL slot carries an authoritative commit_scn, decide by
+	 * SCN against the snapshot read_scn (cluster semantics).  Else fall back
+	 * to the tuple-header committed/invalid bits.  Never consult
+	 * ProcArray/CLOG (I-fail-2).
+	 */
+	if (BufferIsValid(buffer)) {
+		Page page = BufferGetPage(buffer);
+
+		if (PageHasItl(page) && tup->t_itl_slot_idx != CLUSTER_ITL_SLOT_UNALLOCATED
+			&& tup->t_itl_slot_idx < CLUSTER_ITL_INITRANS_DEFAULT) {
+			const ClusterItlSlotData *slot = &ClusterPageGetItlSlots(page)[tup->t_itl_slot_idx];
+
+			if (SCN_VALID(slot->commit_scn) && SCN_VALID(snapshot->read_scn))
+				return cluster_visibility_decide_by_scn(slot->commit_scn, snapshot->read_scn);
+		}
+	}
+
+	return cr_decide_by_infomask(tup);
+}
+
+ClusterVisibilityDecision
+cluster_visibility_decide_cr_tuple(HeapTuple htup, Snapshot snapshot)
+{
+	(void)snapshot; /* CR image already reconstructed to read_scn */
+
+	/*
+	 * The CR image tuple is the row as of read_scn (post-read_scn changes
+	 * undone).  It is VISIBLE iff it existed and was live at read_scn:
+	 * xmin committed/frozen and xmax invalid in the reconstructed image.
+	 * No buffer, no hint-bit writes (I-lock-4 / I-fail-3).
+	 */
+	return cr_decide_by_infomask(htup->t_data);
+}
