@@ -209,6 +209,14 @@ int cluster_undo_segments_max_per_instance = 256;
 int cluster_undo_segment_create_timeout_ms = 5000;
 
 /*
+ * spec-3.9 D1 NEW GUC:
+ *   cluster.cr_chain_walk_max_steps -- CR block construction chain walker
+ *   single-call hard cap (infinite-loop / corruption guard).  Default 4096,
+ *   range [64, 65536], PGC_SIGHUP.  Exceeding it ereports DATA_CORRUPTED.
+ */
+int cluster_cr_chain_walk_max_steps = 4096;
+
+/*
  * cluster.boc_sweep_interval_ms (spec-1.17 D4 v0.2).  walwriter BOC
  * sweep target staleness in ms.  Range [1, 1000]; default 100ms.  Actual
  * sweep frequency is bounded by Min(WalWriterDelay, this); user must
@@ -1374,6 +1382,17 @@ cluster_init_guc(void)
 					 "SQLSTATE 53R9D with errhint to check storage latency. "
 					 "Not an asynchronous I/O cancellation/preemption mechanism."),
 		&cluster_undo_segment_create_timeout_ms, 5000, 100, 60000, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.cr_chain_walk_max_steps",
+		gettext_noop("Hard cap on undo chain walk steps per CR block construction."),
+		gettext_noop("Spec-3.9 D1. Default 4096, range 64..65536, PGC_SIGHUP. "
+					 "Bounds the own-instance CR construction chain walker so a "
+					 "corrupt / cyclic undo chain cannot loop forever; exceeding it "
+					 "raises SQLSTATE XX001 (data_corrupted) with errhint "
+					 "\"chain walk infinite loop suspected\". Tune higher if a hot "
+					 "row legitimately accumulates a very long in-snapshot undo chain."),
+		&cluster_cr_chain_walk_max_steps, 4096, 64, 65536, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
 		"cluster.boc_sweep_interval_ms",

@@ -1,0 +1,146 @@
+/*-------------------------------------------------------------------------
+ *
+ * cluster_cr.h
+ *	  pgrac own-instance Consistent Read (CR) block construction API.
+ *
+ *	  Stage 3 第 13 sub-spec.  Builds a snapshot-visible historical block
+ *	  image at snapshot.read_scn by copying the current page into a
+ *	  backend-local scratch slot, then walking the ITL-rooted undo chain
+ *	  backward and inverse-applying each undo record whose write_scn is
+ *	  newer than read_scn.  Consumes spec-3.7 undo reader + spec-3.4a/b
+ *	  ITL on-page metadata + spec-3.8 segment lifecycle + cluster_undo_smgr.
+ *
+ *	  2-layer API (spec-3.9 §2.1 Q9a):
+ *	    - cluster_cr_construct_block()       — bottom layer; always constructs
+ *	    - cluster_cr_lookup_or_construct()   — top layer; spec-3.9 fall-through
+ *	                                            to construct, spec-3.10 adds a
+ *	                                            CR cache lookup here
+ *
+ *	  The MVCC cluster visibility path (heapam_visibility.c PGRAC
+ *	  MODIFICATIONS) calls ONLY the top layer.
+ *
+ *	  Invariants (spec-3.9 §3.1):
+ *	    - I-lock-1   caller holds >= BUFFER_LOCK_SHARE on buf
+ *	    - I-lock-2   CR internal 0 LockBuffer / 0 LWLockAcquire / 0 spinlock
+ *	    - I-lock-3   non-reentrant (single backend-local scratch slot)
+ *	    - I-lock-4   read-only: no mark dirty / no WAL / no shared-buffer replace
+ *	    - I-fail-1   CR construction failure is NEVER tuple-invisible; raise
+ *	                 ereport(ERROR) with the precise SQLSTATE (53R9F / 53R9G /
+ *	                 data_corrupted), never a silent NULL/false
+ *
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2026, pgrac contributors
+ *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
+ * Spec: spec-3.9-own-instance-cr-block-construction.md (FROZEN v0.4)
+ *
+ * IDENTIFICATION
+ *	  src/include/cluster/cluster_cr.h
+ *
+ * NOTES
+ *	  This is a pgrac-original file (no derivation from PostgreSQL).
+ *	  Function bodies land in src/backend/cluster/cluster_cr.c (Step 2-4);
+ *	  this header declares the schema only (spec-3.9 Step 1 / D1).
+ *
+ *-------------------------------------------------------------------------
+ */
+#ifndef CLUSTER_CR_H
+#define CLUSTER_CR_H
+
+#ifndef FRONTEND
+
+#include "postgres.h"
+
+#include "access/htup.h"
+#include "cluster/cluster_scn.h"
+#include "cluster/cluster_tt_status.h" /* ClusterVisibilityDecision */
+#include "storage/bufmgr.h"
+#include "utils/snapshot.h"
+
+
+/*
+ * cluster_cr_lookup_or_construct -- top-layer CR API (Q9a B forward-link).
+ *
+ *   spec-3.9: fall-through to cluster_cr_construct_block().
+ *   spec-3.10: insert CR cache lookup here (miss → construct + cache,
+ *              hit → return cached image).  Visibility caller MUST use
+ *              this entry, NOT the bottom layer.
+ *
+ *   Return semantics identical to cluster_cr_construct_block().
+ */
+extern const char *cluster_cr_lookup_or_construct(Buffer buf, SCN read_scn, int itl_idx);
+
+/*
+ * cluster_cr_construct_block -- bottom-layer CR construction (always builds).
+ *
+ *   1. Assert caller holds >= BUFFER_LOCK_SHARE + non-reentrant guard.
+ *   2. memcpy(scratch, BufferGetPage(buf), BLCKSZ).
+ *   3. Walk ITL[itl_idx].uba_head backward; for each undo record with
+ *      write_scn > read_scn, inverse-apply to scratch page.
+ *   4. Stop when record.write_scn <= read_scn (normal) — reaching chain end
+ *      without a reconstructable base state is an ERROR, not silent success.
+ *
+ *   Return:
+ *     - success: const char * to the backend-local scratch page; VALID only
+ *       until the next cluster_cr_construct_block / lookup_or_construct call;
+ *       caller MUST NOT free / modify / cache the pointer.
+ *     - On failure the function ereport(ERROR)s (53R9F / 53R9G / data_corrupted)
+ *       before returning; it does not return a silent NULL to the visibility
+ *       caller (spec-3.9 I-fail-1).
+ */
+extern const char *cluster_cr_construct_block(Buffer buf, SCN read_scn, int itl_idx);
+
+/*
+ * cluster_cr_remap_tuple -- materialize a HeapTupleData wrapper for a CR-image
+ *                           tuple at the given offset on the CR scratch page.
+ *
+ *   out_htup is caller-owned (stack) storage; this fills t_data / t_len /
+ *   t_self / t_tableOid(InvalidOid).  out_htup->t_data points INTO cr_page
+ *   and is valid only while cr_page is valid.  Returns false if off is
+ *   out-of-range or the ItemId is LP_UNUSED (CR-removed via inverse INSERT).
+ */
+extern bool cluster_cr_remap_tuple(const char *cr_page, OffsetNumber off,
+								   HeapTupleData *out_htup);
+
+/*
+ * cluster_visibility_decide_tuple -- tuple-level cluster visibility helper.
+ *
+ *   spec-3.9 adds the tuple-level helper used by the MVCC cluster path fast
+ *   exits (page gate / ITL gate).  MUST NOT call XidInMVCCSnapshot(),
+ *   TransactionIdDidCommit(), or any CLOG/ProcArray fallback (AD-012 例外 9).
+ *   Generic helper; implemented in the cluster visibility helper layer.
+ */
+extern ClusterVisibilityDecision cluster_visibility_decide_tuple(HeapTuple htup,
+																 Snapshot snapshot,
+																 Buffer buffer);
+
+/*
+ * cluster_visibility_decide_cr_tuple -- tuple-level helper for transient CR
+ *   image tuples.  Same SCN/ITL/TT visibility semantics as
+ *   cluster_visibility_decide_tuple, but the tuple storage lives in
+ *   backend-local CR scratch: the helper MUST NOT set hint bits nor assume
+ *   the tuple belongs to a dirtyable shared buffer.  Implemented in cluster_cr.c.
+ */
+extern ClusterVisibilityDecision cluster_visibility_decide_cr_tuple(HeapTuple htup,
+																	Snapshot snapshot);
+
+/* Counter accessors (spec-3.9 §2.5 — 9 counters). */
+extern uint64 cluster_cr_construct_count(void);
+extern uint64 cluster_cr_snapshot_too_old_count(void);
+extern uint64 cluster_cr_cross_instance_unsupported_count(void);
+extern uint64 cluster_cr_corruption_count(void);
+extern uint64 cluster_cr_chain_walk_steps_sum(void);
+extern uint64 cluster_cr_inverse_insert_count(void);
+extern uint64 cluster_cr_inverse_update_count(void);
+extern uint64 cluster_cr_inverse_delete_count(void);
+extern uint64 cluster_cr_inverse_itl_count(void);
+
+/* Shmem region register / size / init (L206 5-step). */
+extern Size cluster_cr_shmem_size(void);
+extern void cluster_cr_shmem_init(void);
+
+#endif /* !FRONTEND */
+
+#endif /* CLUSTER_CR_H */

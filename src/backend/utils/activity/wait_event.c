@@ -1239,6 +1239,9 @@ pgstat_get_wait_cluster_undo(WaitEventCluster w)
 	case WAIT_EVENT_UNDO_RETENTION_WAIT:
 		event_name = "UndoRetentionWait";
 		break;
+	case WAIT_EVENT_CLUSTER_CR_CONSTRUCT:
+		event_name = "ClusterCRConstruct"; /* spec-3.9 */
+		break;
 	default:
 		break;
 	}

@@ -404,6 +404,14 @@ extern int cluster_undo_record_inline_max_bytes;
 extern int cluster_undo_segments_max_per_instance;
 extern int cluster_undo_segment_create_timeout_ms;
 
+/*
+ *   cluster.cr_chain_walk_max_steps (spec-3.9 D1) -- CR block construction
+ *                                                    chain walker single-call
+ *                                                    hard cap (default 4096,
+ *                                                    range 64..65536, SIGHUP)
+ */
+extern int cluster_cr_chain_walk_max_steps;
+
 
 /*
  * cluster.allow_single_node (spec-2.1 D1; Stage 2.1 backward-compat

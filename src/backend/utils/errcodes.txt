@@ -643,6 +643,20 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 # Counter cluster_undo_segment_hard_cap_fail_count bump.
 53R9E    E    ERRCODE_CLUSTER_UNDO_SEGMENTS_HARD_CAP_REACHED                   cluster_undo_segments_hard_cap_reached
 
+# spec-3.9 D6:  own-instance CR block construction cannot reconstruct the
+# snapshot-visible version at read_scn because the undo chain reaches a
+# recycled / retention-exceeded segment.  Aligned with Oracle ORA-01555
+# "snapshot too old".  Raised by cluster_cr_construct_block() chain walker;
+# counter cluster_cr_snapshot_too_old_count bump.  NEVER silent-fail to
+# tuple invisible (spec-3.9 I-fail-1).
+53R9F    E    ERRCODE_CLUSTER_CR_SNAPSHOT_TOO_OLD                              cluster_cr_snapshot_too_old
+
+# spec-3.9 D6:  CR chain walker encountered a cross-instance UBA
+# (record.origin_node_id != local node).  spec-3.9 supports own-instance
+# CR only; cross-instance CR is Stage 4 (Cache Fusion CR coordinator).
+# counter cluster_cr_cross_instance_unsupported_count bump.
+53R9G    E    ERRCODE_CLUSTER_CR_CROSS_INSTANCE_UNSUPPORTED                    cluster_cr_cross_instance_unsupported
+
 Section: Class 54 - Program Limit Exceeded
 
 # this is for wired-in limits, not resource exhaustion problems (class borrowed from DB2)
