@@ -43,7 +43,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_itl_cleanout test_cluster_visibility_inject test_cluster_itl_cleanout_perf \
         test_cluster_heap_lock_tuple test_cluster_perf_gates \
         test_cluster_subtrans test_cluster_multixact test_cluster_undo_format \
-        test_cluster_undo_record test_cluster_undo_lifecycle test_cluster_cr
+        test_cluster_undo_record test_cluster_undo_lifecycle test_cluster_cr test_cluster_cr_cache
 
 # Path to the cluster_version object (no PG deps, safe to link standalone).
 CLUSTER_VERSION_O = $(top_builddir)/src/backend/cluster/cluster_version.o
@@ -885,5 +885,15 @@ test_cluster_cr: test_cluster_cr.c unit_test.h \
 		$(CLUSTER_CR_APPLY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_CR_APPLY_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-3.10 D8: test_cluster_cr_cache — backend-local clock CR cache
+# (cluster_cr_cache.o) with malloc-backed MemoryContext stubs.
+CLUSTER_CR_CACHE_O = $(top_builddir)/src/backend/cluster/cluster_cr_cache.o
+test_cluster_cr_cache: test_cluster_cr_cache.c unit_test.h \
+		$(CLUSTER_CR_CACHE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_CR_CACHE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@

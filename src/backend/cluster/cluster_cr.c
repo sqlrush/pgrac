@@ -819,6 +819,15 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 	/*
 	 * spec-3.9 Hardening (L214): xmin-side (creation) visibility.
 	 *
+	 * spec-3.10 NOTE: this per-tuple check is now SUPERSEDED by the construct-
+	 * time cluster_cr_prune_post_snapshot_versions() (full-block CR), which
+	 * marks LP_UNUSED every post-read_scn-created tuple BEFORE remap — so any
+	 * tuple reaching here has a pre-read_scn creator and cr_xmin != slot->xid,
+	 * i.e. this branch never fires (verified across t/215 + t/216).  Kept as a
+	 * zero-cost defense-in-depth backstop; removable in a future cleanup
+	 * (spec-3.10 §v0.4 D-A).  L214 alone could NOT handle same-row-multi-update
+	 * (a doubly-updated tuple's live slot is its latest modifier, not creator).
+	 *
 	 * cluster_visibility_decide_cr_tuple is xmax-only and assumes every tuple
 	 * still present in the CR image existed at read_scn.  That holds for a
 	 * fresh INSERT (inverse-INSERTed to LP_UNUSED -> remap false above) and a

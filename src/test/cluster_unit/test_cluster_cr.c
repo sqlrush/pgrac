@@ -55,6 +55,24 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 	abort();
 }
 
+/*
+ * scn_time_cmp -- byte-faithful local stub (spec-3.10): cluster_cr_apply.o's
+ * candidate collect/cmp reference it.  Linking cluster_scn.o would drag in
+ * shmem/atomics; the header-only scn_local() inline matches the real impl.
+ */
+int
+scn_time_cmp(SCN a, SCN b)
+{
+	uint64 la = scn_local(a);
+	uint64 lb = scn_local(b);
+
+	if (la < lb)
+		return -1;
+	if (la > lb)
+		return 1;
+	return 0;
+}
+
 /* ============================================================
  *	Synthetic 8 KB heap page with an ITL special area + one tuple
  * ============================================================ */
@@ -534,10 +552,225 @@ UT_TEST(test_itl_inverse_slot_zero_and_max_minus_one)
 }
 
 
+/* ============================================================
+ *	spec-3.10 D1: candidate chain collect + write_scn-DESC order
+ * ============================================================ */
+
+/* Build an ITL slot array with given write_scns; head.raw[0] = i+1 to identify. */
+static void
+build_slots(ClusterItlSlotData *slots, const SCN *write_scns, int n)
+{
+	int i;
+
+	memset(slots, 0, sizeof(ClusterItlSlotData) * CLUSTER_ITL_INITRANS_DEFAULT);
+	for (i = 0; i < n; i++) {
+		slots[i].write_scn = write_scns[i];
+		slots[i].undo_segment_head.raw[0] = (uint64)(i + 1);
+	}
+}
+
+UT_TEST(test_collect_filters_by_write_scn)
+{
+	ClusterItlSlotData slots[CLUSTER_ITL_INITRANS_DEFAULT];
+	ClusterCRCandidateChain out[CLUSTER_ITL_INITRANS_DEFAULT];
+	/* slot0=100(<=rs) slot1=200(>rs) slot2=Invalid slot3=300(>rs) */
+	SCN ws[4] = { (SCN)100, (SCN)200, InvalidScn, (SCN)300 };
+	int n;
+
+	build_slots(slots, ws, 4);
+	n = cluster_cr_collect_candidate_chains(slots, (SCN)150, out, CLUSTER_ITL_INITRANS_DEFAULT);
+	/* read_scn=150 -> only slot1(200) + slot3(300) qualify; 100<=150 + Invalid skipped */
+	UT_ASSERT_EQ(n, 2);
+}
+
+UT_TEST(test_collect_captures_head_and_scn)
+{
+	ClusterItlSlotData slots[CLUSTER_ITL_INITRANS_DEFAULT];
+	ClusterCRCandidateChain out[CLUSTER_ITL_INITRANS_DEFAULT];
+	SCN ws[2] = { (SCN)500, (SCN)600 };
+	int n;
+
+	build_slots(slots, ws, 2);
+	n = cluster_cr_collect_candidate_chains(slots, (SCN)100, out, CLUSTER_ITL_INITRANS_DEFAULT);
+	UT_ASSERT_EQ(n, 2);
+	/* fields captured verbatim (collection order = slot order) */
+	UT_ASSERT_EQ((int)out[0].slot_idx, 0);
+	UT_ASSERT_EQ((int)(out[0].write_scn == (SCN)500), 1);
+	UT_ASSERT_EQ((int)(out[0].undo_segment_head.raw[0] == 1ULL), 1);
+	UT_ASSERT_EQ((int)(out[1].undo_segment_head.raw[0] == 2ULL), 1);
+}
+
+UT_TEST(test_cmp_orders_write_scn_desc)
+{
+	/* unsorted 100/300/200 -> sorted newest-first 300/200/100 (Q10) */
+	ClusterCRCandidateChain c[3];
+
+	memset(c, 0, sizeof(c));
+	c[0].slot_idx = 0;
+	c[0].write_scn = (SCN)100;
+	c[1].slot_idx = 1;
+	c[1].write_scn = (SCN)300;
+	c[2].slot_idx = 2;
+	c[2].write_scn = (SCN)200;
+
+	qsort(c, 3, sizeof(c[0]), cluster_cr_chain_cmp_by_write_scn_desc);
+
+	UT_ASSERT_EQ((int)(c[0].write_scn == (SCN)300), 1);
+	UT_ASSERT_EQ((int)(c[1].write_scn == (SCN)200), 1);
+	UT_ASSERT_EQ((int)(c[2].write_scn == (SCN)100), 1);
+}
+
+UT_TEST(test_cmp_tie_break_slot_idx)
+{
+	/* equal write_scn -> deterministic slot_idx ascending */
+	ClusterCRCandidateChain c[2];
+
+	memset(c, 0, sizeof(c));
+	c[0].slot_idx = 5;
+	c[0].write_scn = (SCN)200;
+	c[1].slot_idx = 2;
+	c[1].write_scn = (SCN)200;
+
+	qsort(c, 2, sizeof(c[0]), cluster_cr_chain_cmp_by_write_scn_desc);
+	UT_ASSERT_EQ((int)c[0].slot_idx, 2);
+	UT_ASSERT_EQ((int)c[1].slot_idx, 5);
+}
+
+UT_TEST(test_collect_snapshot_before_mutation)
+{
+	/* collect captures a snapshot; mutating the slots afterwards must NOT
+	 * change the captured candidates (candidate-snapshot property, D1). */
+	ClusterItlSlotData slots[CLUSTER_ITL_INITRANS_DEFAULT];
+	ClusterCRCandidateChain out[CLUSTER_ITL_INITRANS_DEFAULT];
+	SCN ws[2] = { (SCN)700, (SCN)800 };
+	int n;
+
+	build_slots(slots, ws, 2);
+	n = cluster_cr_collect_candidate_chains(slots, (SCN)100, out, CLUSTER_ITL_INITRANS_DEFAULT);
+	UT_ASSERT_EQ(n, 2);
+
+	/* simulate inverse-apply rewriting the ITL slots */
+	slots[0].write_scn = InvalidScn;
+	slots[0].undo_segment_head.raw[0] = 0xDEAD;
+	/* the live slot really changed (so the out[] stability below is meaningful) */
+	UT_ASSERT_EQ((int)SCN_VALID(slots[0].write_scn), 0);
+	UT_ASSERT_EQ((int)(slots[0].undo_segment_head.raw[0] == 0xDEADULL), 1);
+
+	/* captured out[] is unchanged */
+	UT_ASSERT_EQ((int)(out[0].write_scn == (SCN)700), 1);
+	UT_ASSERT_EQ((int)(out[0].undo_segment_head.raw[0] == 1ULL), 1);
+	UT_ASSERT_EQ((int)(out[1].write_scn == (SCN)800), 1);
+}
+
+UT_TEST(test_collect_null_args_zero)
+{
+	ClusterCRCandidateChain out[CLUSTER_ITL_INITRANS_DEFAULT];
+
+	UT_ASSERT_EQ(
+		cluster_cr_collect_candidate_chains(NULL, (SCN)100, out, CLUSTER_ITL_INITRANS_DEFAULT), 0);
+}
+
+
+/* ============================================================
+ *	spec-3.10 D1: post-snapshot version prune (full-block completion)
+ * ============================================================ */
+
+/* Build a page with n LP_NORMAL tuples (offsets 1..n), tuple i has xmin=xmins[i]. */
+static Page
+build_page_with_tuples(const TransactionId *xmins, int n)
+{
+	PageHeader hdr;
+	int i;
+	int data_off = (int)(BLCKSZ - CLUSTER_ITL_ARRAY_SIZE);
+
+	memset(synthetic_page, 0, BLCKSZ);
+	hdr = (PageHeader)synthetic_page;
+	hdr->pd_flags = PD_HAS_ITL;
+	hdr->pd_special = (LocationIndex)(BLCKSZ - CLUSTER_ITL_ARRAY_SIZE);
+	hdr->pd_pagesize_version = BLCKSZ | PG_PAGE_LAYOUT_VERSION;
+	hdr->pd_lower = SizeOfPageHeaderData + (uint16)(n * sizeof(ItemIdData));
+
+	for (i = 0; i < n; i++) {
+		ItemId iid;
+		HeapTupleHeader htup;
+
+		data_off -= TEST_TUPLE_LEN;
+		iid = PageGetItemId((Page)synthetic_page, FirstOffsetNumber + i);
+		ItemIdSetNormal(iid, data_off, TEST_TUPLE_LEN);
+		htup = (HeapTupleHeader)(synthetic_page + data_off);
+		memset(htup, 0, sizeof(HeapTupleHeaderData));
+		HeapTupleHeaderSetXmin(htup, xmins[i]);
+		htup->t_infomask = HEAP_XMAX_INVALID;
+	}
+	hdr->pd_upper = (LocationIndex)data_off;
+	return (Page)synthetic_page;
+}
+
+UT_TEST(test_prune_removes_candidate_xmin)
+{
+	/* 3 tuples (xmin 100/200/300); candidates {200,300} -> prune 2, keep 100 */
+	TransactionId xmins[3] = { 100, 200, 300 };
+	Page page = build_page_with_tuples(xmins, 3);
+	ClusterCRCandidateChain chains[2];
+	int pruned;
+
+	memset(chains, 0, sizeof(chains));
+	chains[0].xid = 200;
+	chains[1].xid = 300;
+	pruned = cluster_cr_prune_post_snapshot_versions((char *)page, chains, 2);
+	UT_ASSERT_EQ(pruned, 2);
+	UT_ASSERT_EQ((int)ItemIdIsNormal(PageGetItemId(page, 1)), 1); /* xmin=100 kept */
+	UT_ASSERT_EQ((int)ItemIdIsNormal(PageGetItemId(page, 2)), 0); /* xmin=200 pruned */
+	UT_ASSERT_EQ((int)ItemIdIsNormal(PageGetItemId(page, 3)), 0); /* xmin=300 pruned */
+}
+
+UT_TEST(test_prune_keeps_noncandidate_xmin)
+{
+	/* slot-reuse-shaped: a tuple whose creator is NOT among the candidates is
+	 * KEPT.  Correct for a pre-read_scn creator; the slot-reuse edge (a
+	 * post-read_scn creator whose ITL slot was recycled so it is not a
+	 * candidate) is exactly this kept case (spec-3.10 §3.3). */
+	TransactionId xmins[1] = { 999 };
+	Page page = build_page_with_tuples(xmins, 1);
+	ClusterCRCandidateChain chains[1];
+	int pruned;
+
+	memset(chains, 0, sizeof(chains));
+	chains[0].xid = 200; /* 999 is not a candidate */
+	pruned = cluster_cr_prune_post_snapshot_versions((char *)page, chains, 1);
+	UT_ASSERT_EQ(pruned, 0);
+	UT_ASSERT_EQ((int)ItemIdIsNormal(PageGetItemId(page, 1)), 1);
+}
+
+UT_TEST(test_prune_empty_candidates_noop)
+{
+	TransactionId xmins[2] = { 100, 200 };
+	Page page = build_page_with_tuples(xmins, 2);
+
+	UT_ASSERT_EQ(cluster_cr_prune_post_snapshot_versions((char *)page, NULL, 0), 0);
+	UT_ASSERT_EQ((int)ItemIdIsNormal(PageGetItemId(page, 1)), 1);
+	UT_ASSERT_EQ((int)ItemIdIsNormal(PageGetItemId(page, 2)), 1);
+}
+
+UT_TEST(test_prune_skips_invalid_xmin)
+{
+	/* tuple0 xmin=Invalid (skip), tuple1 xmin=200 (candidate -> prune) */
+	TransactionId xmins[2] = { InvalidTransactionId, 200 };
+	Page page = build_page_with_tuples(xmins, 2);
+	ClusterCRCandidateChain chains[1];
+
+	memset(chains, 0, sizeof(chains));
+	chains[0].xid = 200;
+	UT_ASSERT_EQ(cluster_cr_prune_post_snapshot_versions((char *)page, chains, 1), 1);
+	UT_ASSERT_EQ((int)ItemIdIsNormal(PageGetItemId(page, 1)), 1); /* invalid xmin kept */
+	UT_ASSERT_EQ((int)ItemIdIsNormal(PageGetItemId(page, 2)), 0); /* pruned */
+}
+
+
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(26);
+	UT_PLAN(36);
 
 	UT_RUN(test_sqlstate_53R9F);
 	UT_RUN(test_sqlstate_53R9G);
@@ -570,6 +803,18 @@ main(int argc, char **argv)
 
 	UT_RUN(test_insert_then_update_inverse_sequence);
 	UT_RUN(test_insert_inverse_zero_len_skips_sanity);
+
+	UT_RUN(test_collect_filters_by_write_scn);
+	UT_RUN(test_collect_captures_head_and_scn);
+	UT_RUN(test_cmp_orders_write_scn_desc);
+	UT_RUN(test_cmp_tie_break_slot_idx);
+	UT_RUN(test_collect_snapshot_before_mutation);
+	UT_RUN(test_collect_null_args_zero);
+
+	UT_RUN(test_prune_removes_candidate_xmin);
+	UT_RUN(test_prune_keeps_noncandidate_xmin);
+	UT_RUN(test_prune_empty_candidates_noop);
+	UT_RUN(test_prune_skips_invalid_xmin);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

@@ -7,7 +7,8 @@
 #	  L1  ClusterPair up + GUC cluster.cr_chain_walk_max_steps default 4096
 #	      + cluster.cr_mvcc_gate default on + 53R9F/53R9G registered + the
 #	      4 CR injection points present in pg_stat_cluster_injections
-#	  L2  pg_cluster_state cr category has 9 rows (the 9 cluster_cr counters)
+#	  L2  pg_cluster_state cr category has 13 rows (9 cluster_cr counters +
+#	      4 spec-3.10 CR cache counters)
 #	  L3  cluster_cr_test_construct on a real ITL heap block succeeds
 #	      (high read_scn → chain walk stops immediately) → cr_construct_count++
 #	  L4  53R9F: arm cr_snapshot_too_old + invoke (single session) → CR's
@@ -91,7 +92,7 @@ my $node0 = $pair->node0;
 # ----------
 my $cr_rows = $node0->safe_psql('postgres',
 	q{SELECT count(*) FROM pg_cluster_state WHERE category='cr'});
-is($cr_rows, '9', 'L2 cr category has 9 counter rows');
+is($cr_rows, '13', 'L2 cr category has 13 counter rows (9 + 4 spec-3.10 cache)');
 
 
 # ----------
