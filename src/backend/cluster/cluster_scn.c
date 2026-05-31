@@ -576,9 +576,14 @@ cluster_scn_skip_hook_in_pre_running(void)
 	if (cluster_scn_state == NULL)
 		return true; /* shmem not yet initialised */
 	if (!SCN_NODE_ID_VALID(cluster_scn_state->node_id))
-		return true; /* bootstrap / single-node fallback */
-	if (!cluster_conf_has_peers())
-		return true; /* no peer: skip xact SCN WAL/counter hot-path cost */
+		return true; /* bootstrap / no node_id configured */
+	/*
+	 * P0 (2026-05-31):  do NOT skip on single-node (no-peer).  cluster.enabled
+	 * + valid node_id == storage mode, and own-instance CR / cluster snapshots
+	 * need read_scn / commit_scn to advance even with one node.  The guards
+	 * above (cluster_enabled, shmem ready, valid node_id) already encode the
+	 * storage gate; peers only add the cross-node wire on top.
+	 */
 	return false;
 }
 

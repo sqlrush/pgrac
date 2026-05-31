@@ -40,6 +40,7 @@
 #include "storage/fd.h"
 #include "utils/elog.h"
 
+#include "cluster/cluster_undo_record_api.h" /* smgr syscall counter bumps */
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/storage/cluster_undo_alloc.h"
@@ -87,12 +88,15 @@ cluster_undo_smgr_read_block(uint32 segment_id, uint8 owner_instance, uint32 blo
 	fd = open_segment_rdonly(segment_id, owner_instance);
 	if (fd < 0)
 		return false;
+	cluster_undo_record_note_smgr_open();
 
 	offset = (off_t)block_no * BLCKSZ;
 	nread = pg_pread(fd, buf, BLCKSZ, offset);
+	cluster_undo_record_note_smgr_pread();
 	ok = (nread == BLCKSZ);
 
 	close(fd);
+	cluster_undo_record_note_smgr_close();
 	return ok;
 }
 
@@ -112,9 +116,11 @@ cluster_undo_smgr_write_block(uint32 segment_id, uint8 owner_instance, uint32 bl
 	fd = open_segment_rdwr(segment_id, owner_instance);
 	if (fd < 0)
 		return false;
+	cluster_undo_record_note_smgr_open();
 
 	offset = (off_t)block_no * BLCKSZ;
 	nwritten = pg_pwrite(fd, buf, BLCKSZ, offset);
+	cluster_undo_record_note_smgr_pwrite();
 	if (nwritten != BLCKSZ)
 		ok = false;
 
@@ -124,6 +130,7 @@ cluster_undo_smgr_write_block(uint32 segment_id, uint8 owner_instance, uint32 bl
 	}
 
 	close(fd);
+	cluster_undo_record_note_smgr_close();
 	return ok;
 }
 

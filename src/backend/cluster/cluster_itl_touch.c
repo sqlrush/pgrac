@@ -50,6 +50,7 @@
 #include "cluster/cluster_guc.h" /* cluster_enabled */
 #include "cluster/cluster_itl.h" /* stamp_committed / stamp_aborted */
 #include "cluster/cluster_itl_touch.h"
+#include "cluster/cluster_mode.h" /* cluster_storage_mode_enabled */
 #include "storage/bufmgr.h" /* ReadBufferWithoutRelcache / ReleaseBuffer */
 #include "storage/buf_internals.h"
 #include "utils/memutils.h"
@@ -133,7 +134,9 @@ cluster_itl_touch_subxact_start(SubTransactionId subid)
 {
 	MemoryContext oldcxt;
 
-	if (!cluster_enabled || cluster_node_id < 0 || !cluster_conf_has_peers())
+	/* P0 (2026-05-31): subxact touch tracking is a STORAGE path (feeds local
+	 * ITL finish/cleanout); gate on storage mode, not cluster_conf_has_peers(). */
+	if (!cluster_storage_mode_enabled())
 		return;
 
 	if (subxact_stack == NULL) {

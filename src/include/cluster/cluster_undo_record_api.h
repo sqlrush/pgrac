@@ -147,6 +147,16 @@ extern bool cluster_undo_record_is_touched(void);
 
 
 /*
+ * cluster_undo_xact_precommit_flush -- P0 perf hardening (2026-05-31).
+ *	fsync this xact's dirtied undo segment files ONCE, on the commit path,
+ *	BEFORE the commit becomes visible (replaces per-record fsync).  ereport(ERROR)
+ *	on fsync failure (runs before the commit critical section -> clean abort).
+ *	No-op for a xact that wrote no undo.
+ */
+extern void cluster_undo_xact_precommit_flush(void);
+
+
+/*
  * Counter accessors -- for emit_row / cluster_tap verification + D10 counters.
  *	Spec-3.7 §2.6: 5 NEW counter(per Hardening v1.0.1 + D10).
  */
@@ -161,6 +171,22 @@ extern uint64 cluster_undo_autoextend_count(void);
 extern uint64 cluster_undo_segment_switch_count(void);
 extern uint64 cluster_undo_segment_create_fail_count(void);
 extern uint64 cluster_undo_segment_hard_cap_fail_count(void);
+
+/* P0 perf hardening: per-commit undo fsync counters. */
+extern uint64 cluster_undo_commit_fsync_count(void);
+extern uint64 cluster_undo_commit_fsync_segment_count(void);
+extern uint64 cluster_undo_commit_fsync_failure_count(void);
+
+/* P0 perf hardening: undo smgr syscall observability.  Bumps are called from
+ * cluster_undo_smgr.c; accessors back pg_cluster_state / TAP. */
+extern void cluster_undo_record_note_smgr_open(void);
+extern void cluster_undo_record_note_smgr_close(void);
+extern void cluster_undo_record_note_smgr_pread(void);
+extern void cluster_undo_record_note_smgr_pwrite(void);
+extern uint64 cluster_undo_smgr_open_count(void);
+extern uint64 cluster_undo_smgr_close_count(void);
+extern uint64 cluster_undo_smgr_pread_count(void);
+extern uint64 cluster_undo_smgr_pwrite_count(void);
 
 /* spec-3.8 Fix 6: deterministic autoextend trigger test hook. */
 extern bool cluster_undo_test_force_segment_end(void);

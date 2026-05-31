@@ -79,6 +79,7 @@
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC (spec-3.4a D3/D4/D5): ITL write-path activation. */
 #include "cluster/cluster_conf.h"		/* cluster_conf_has_peers */
+#include "cluster/cluster_mode.h"		/* cluster_storage_mode_enabled / cluster_peer_mode_enabled */
 #include "cluster/cluster_guc.h"		/* cluster_enabled */
 #include "cluster/cluster_itl.h"		/* alloc_or_reuse_slot / stamp_active */
 #include "cluster/cluster_itl_slot.h"	/* CLUSTER_ITL_SLOT_UNALLOCATED */
@@ -110,15 +111,14 @@ cluster_itl_write_path_enabled(Relation relation)
 	 * as fail-closed ereport later, but rejecting it at the gate avoids
 	 * burning ITL slot capacity on an invalid configuration.
 	 *
-	 * Single-node cluster.enabled=on should not pay the Stage 3 ITL/TT
-	 * write-path tax.  With no peer, cross-node visibility cannot occur
-	 * and PG-native visibility remains authoritative.  Multi-node clusters
-	 * still activate the full ITL path.
+	 * P0 (2026-05-31):  cluster.enabled is a DEPLOYMENT MODE, not a switch
+	 * keyed on the current topology size.  A single-node cluster.enabled
+	 * deployment MUST generate ITL/TT/Undo so peers can join/recover against
+	 * consistent on-page/TT/undo metadata and own-instance CR is well-defined.
+	 * Gate on cluster_storage_mode_enabled (cluster.enabled + valid node_id),
+	 * NOT cluster_conf_has_peers().  Local (temp) buffers stay PG-native.
 	 */
-	return cluster_enabled
-		   && cluster_node_id >= 0 && cluster_node_id <= SCN_MAX_VALID_NODE_ID
-		   && cluster_conf_has_peers()
-		   && !RelationUsesLocalBuffers(relation);
+	return cluster_storage_mode_enabled() && !RelationUsesLocalBuffers(relation);
 }
 
 /*
@@ -140,10 +140,7 @@ cluster_itl_write_path_enabled(Relation relation)
 static inline bool
 cluster_itl_lock_path_enabled(Relation relation)
 {
-	return cluster_enabled
-		   && cluster_node_id >= 0 && cluster_node_id <= SCN_MAX_VALID_NODE_ID
-		   && cluster_conf_has_peers()
-		   && !RelationUsesLocalBuffers(relation);
+	return cluster_storage_mode_enabled() && !RelationUsesLocalBuffers(relation);
 }
 #endif
 
@@ -5524,9 +5521,7 @@ l3:
 				 *   - ref origin == self_node (local lock — native path).
 				 */
 				if (HEAP_XMAX_IS_LOCKED_ONLY(infomask)
-					&& cluster_enabled
-					&& cluster_node_id >= 0
-					&& cluster_conf_has_peers())
+					&& cluster_peer_mode_enabled())
 				{
 					ClusterUndoTTSlotRef cref;
 					bool		have_remote_ref = false;

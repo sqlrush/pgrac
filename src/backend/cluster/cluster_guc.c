@@ -1418,9 +1418,10 @@ cluster_init_guc(void)
 		gettext_noop("Spec-3.9 D5. DEFAULT ON. When on, a cluster-source snapshot reading "
 					 "a local-origin tuple whose block (pd_block_scn) and ITL write_scn are "
 					 "both newer than the snapshot read_scn is resolved through a "
-					 "reconstructed read_scn-consistent block image. Only meaningful in a "
-					 "multi-node cluster (cluster_conf_has_peers); single-node snapshots are "
-					 "LOCAL-source and never reach this path. Set off to fall back to the "
+					 "reconstructed read_scn-consistent block image. Active whenever cluster "
+					 "storage mode is on (cluster.enabled + a valid cluster.node_id), INCLUDING a "
+					 "single-node cluster deployment (cluster snapshots are CLUSTER-source "
+						 "there too). Set off to fall back to the "
 					 "spec-3.2/3.3 SCN/PG-native visibility path."),
 		&cluster_cr_mvcc_gate, true, PGC_USERSET, 0, NULL, NULL, NULL);
 

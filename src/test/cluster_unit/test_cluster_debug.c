@@ -735,6 +735,43 @@ cluster_undo_segment_hard_cap_fail_count(void)
 {
 	return 0;
 }
+/* P0 perf hardening: per-commit fsync + smgr syscall counter accessors
+ * (dump_undo emits these; cluster_undo_record.o not linked here). */
+uint64
+cluster_undo_commit_fsync_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_commit_fsync_segment_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_commit_fsync_failure_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_smgr_open_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_smgr_close_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_smgr_pread_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_smgr_pwrite_count(void)
+{
+	return 0;
+}
 
 /* spec-3.9 D8 stubs: dump_cr() references 9 cluster_cr counter accessors
  * from cluster_cr.o which test_cluster_debug doesn't link. */
@@ -780,6 +817,28 @@ cluster_cr_inverse_delete_count(void)
 }
 uint64
 cluster_cr_inverse_itl_count(void)
+{
+	return 0;
+}
+/* spec-3.10 D5 cache counters: cluster_debug.o emits these rows; cluster_cr.o
+ * is not linked here so they are stubbed too. */
+uint64
+cluster_cr_cache_hit_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_cache_miss_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_cache_evict_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_cache_install_count(void)
 {
 	return 0;
 }

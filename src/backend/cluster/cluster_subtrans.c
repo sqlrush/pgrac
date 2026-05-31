@@ -39,6 +39,7 @@
 #include "cluster/cluster_elog.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_mode.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_subtrans.h"
 #include "cluster/cluster_tt_local.h"
@@ -154,7 +155,7 @@ cluster_subtrans_ensure_parent_binding(TransactionId parent_xid, ClusterTTStatus
 		return false;
 	memset(parent_key_out, 0, sizeof(*parent_key_out));
 
-	if (!cluster_enabled || !cluster_conf_has_peers())
+	if (!cluster_peer_mode_enabled())
 		return false;
 	if (!TransactionIdIsNormal(parent_xid))
 		return false;
@@ -181,7 +182,7 @@ cluster_subtrans_emit_subcommit(TransactionId child_xid, TransactionId parent_xi
 	ClusterTTStatusKey child_key;
 	ClusterTTStatusKey parent_key;
 
-	if (!cluster_enabled || !cluster_conf_has_peers())
+	if (!cluster_peer_mode_enabled())
 		return false;
 	if (!TransactionIdIsNormal(child_xid) || !TransactionIdIsNormal(parent_xid))
 		return false;
@@ -204,7 +205,7 @@ cluster_subtrans_emit_subabort(TransactionId child_xid)
 {
 	ClusterTTStatusKey child_key;
 
-	if (!cluster_enabled || !cluster_conf_has_peers())
+	if (!cluster_peer_mode_enabled())
 		return false;
 	if (!TransactionIdIsNormal(child_xid))
 		return false;
@@ -294,7 +295,7 @@ cluster_subtrans_xact_has_state(TransactionId top_xid)
 	ClusterTTStatusKey key;
 	ClusterTTStatusResult res;
 
-	if (!cluster_enabled || !cluster_conf_has_peers())
+	if (!cluster_peer_mode_enabled())
 		return false;
 	if (!TransactionIdIsNormal(top_xid))
 		return false;

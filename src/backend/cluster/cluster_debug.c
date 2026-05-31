@@ -1440,6 +1440,19 @@ dump_undo(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_undo_segment_create_fail_count()));
 	emit_row(rsinfo, "undo", "segment_hard_cap_fail_count",
 			 fmt_int64((int64)cluster_undo_segment_hard_cap_fail_count()));
+	/* P0 perf hardening: per-commit (group) undo fsync observability. */
+	emit_row(rsinfo, "undo", "commit_fsync_count",
+			 fmt_int64((int64)cluster_undo_commit_fsync_count()));
+	emit_row(rsinfo, "undo", "commit_fsync_segment_count",
+			 fmt_int64((int64)cluster_undo_commit_fsync_segment_count()));
+	emit_row(rsinfo, "undo", "commit_fsync_failure_count",
+			 fmt_int64((int64)cluster_undo_commit_fsync_failure_count()));
+	/* P0 perf hardening: undo segment-file syscall observability. */
+	emit_row(rsinfo, "undo", "smgr_open_count", fmt_int64((int64)cluster_undo_smgr_open_count()));
+	emit_row(rsinfo, "undo", "smgr_close_count", fmt_int64((int64)cluster_undo_smgr_close_count()));
+	emit_row(rsinfo, "undo", "smgr_pread_count", fmt_int64((int64)cluster_undo_smgr_pread_count()));
+	emit_row(rsinfo, "undo", "smgr_pwrite_count",
+			 fmt_int64((int64)cluster_undo_smgr_pwrite_count()));
 }
 
 /*

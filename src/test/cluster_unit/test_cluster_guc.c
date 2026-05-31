@@ -184,6 +184,10 @@ int cluster_injection_armed_count = 0;
  */
 int cluster_pcm_grd_max_entries = -1;
 
+/* spec-3.10 stub: cluster_cr_cache_max_blocks lives in cluster_cr_cache.c
+ * (not linked here); cluster_guc.c references it via DefineCustomIntVariable. */
+int cluster_cr_cache_max_blocks = 64;
+
 void
 cluster_injection_run(const char *name pg_attribute_unused())
 {}

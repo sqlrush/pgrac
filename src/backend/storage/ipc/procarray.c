@@ -72,6 +72,7 @@
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_mode.h"
 #include "cluster/cluster_scn.h"
 #endif
 
@@ -2129,7 +2130,14 @@ GetSnapshotDataInitOldSnapshot(Snapshot snapshot)
 static inline void
 ClusterSnapshotRefreshFields(Snapshot snapshot)
 {
-	if (cluster_enabled && cluster_conf_has_peers())
+	/*
+	 * P0 (2026-05-31):  cluster snapshot source + read_scn follow the STORAGE
+	 * gate (cluster.enabled + valid node_id), NOT cluster_conf_has_peers().  A
+	 * single-node cluster.enabled deployment takes cluster snapshots so
+	 * own-instance CR / cluster visibility are well-defined; peers only add the
+	 * cross-node wire on top.
+	 */
+	if (cluster_storage_mode_enabled())
 	{
 		snapshot->cluster_source = (uint8) SNAPSHOT_SOURCE_CLUSTER;
 		snapshot->read_scn = cluster_scn_current();

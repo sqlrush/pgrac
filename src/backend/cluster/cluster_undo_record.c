@@ -120,6 +120,24 @@ typedef struct ClusterUndoRecordShared {
 	pg_atomic_uint64 segment_create_fail_count; /* FS error / timeout */
 	pg_atomic_uint64 segment_hard_cap_fail_count; /* 53R9E hard cap */
 
+	/* P0 perf hardening (2026-05-31): per-commit (group) undo fsync.
+	 * Durability ordering unchanged (undo durable BEFORE commit visible), but
+	 * fsync granularity moved from per-record (inside cursor_lock) to per-xact
+	 * precommit (outside the lock).  commit_fsync_count ~= committing xacts that
+	 * wrote undo;  segment_count = segment files actually fsync'd. */
+	pg_atomic_uint64 commit_fsync_count;
+	pg_atomic_uint64 commit_fsync_segment_count;
+	pg_atomic_uint64 commit_fsync_failure_count;
+
+	/* P0 perf hardening: undo segment-file syscall observability (bumped by
+	 * cluster_undo_smgr).  Before the fd cache / active-block cache these track
+	 * 1:1 with undo records; after, opens drop to per-segment-switch and
+	 * preads/pwrites drop to per-block. */
+	pg_atomic_uint64 smgr_open_count;
+	pg_atomic_uint64 smgr_close_count;
+	pg_atomic_uint64 smgr_pread_count;
+	pg_atomic_uint64 smgr_pwrite_count;
+
 	LWLockPadded cursor_lock;
 	/* spec-3.8 D3: lifecycle_lock — protects autoextend slow path
 	 * (active_segment_id publication + state transitions).  Per spec
@@ -135,6 +153,70 @@ static ClusterUndoRecordShared *UndoRecordShared = NULL;
 
 /* Per-backend state(D16 PREPARE guard support). */
 static bool cluster_undo_touched_in_xact = false;
+
+/*
+ * P0 perf hardening (2026-05-31): per-backend touched-undo-segment list.
+ *
+ *	cluster_undo_record_alloc() no longer fsyncs each record (that serialized
+ *	every backend inside cursor_lock).  Instead it records which undo segment
+ *	files this xact has dirtied; cluster_undo_xact_precommit_flush() fsyncs them
+ *	ONCE, BEFORE the commit becomes visible (commit_scn publish / commit record
+ *	flush).  Granularity is the segment FILE (fsync is file-level), so the list
+ *	dedups on (segment_id, owner_instance); the shared-cursor model keeps an
+ *	xact's undo in 1-2 active segments, so this is typically a single fsync.
+ *
+ *	Top-xact aggregation: subxact undo writes append to the same per-backend
+ *	list and are flushed by the parent's precommit (no per-savepoint fsync).
+ *	Reset (clear) happens at end of top-xact in cluster_undo_record_xact_reset.
+ *	Overflow (> MAX distinct segments in one xact — pathological) degrades to an
+ *	inline fsync of the overflowing segment, never back to per-record fsync.
+ */
+#define CLUSTER_UNDO_TOUCHED_SEG_MAX 16
+typedef struct ClusterUndoTouchedSeg {
+	uint32 segment_id;
+	uint8 owner_instance;
+} ClusterUndoTouchedSeg;
+static ClusterUndoTouchedSeg cluster_undo_touched_segs[CLUSTER_UNDO_TOUCHED_SEG_MAX];
+static int cluster_undo_touched_seg_count = 0;
+
+/*
+ * cluster_undo_record_touched_segment -- note that this xact dirtied an undo
+ *	segment file (to be fsync'd once at precommit).  Dedups on
+ *	(segment_id, owner_instance).  MUST be called OUTSIDE cursor_lock (the whole
+ *	point is to keep fsync — and this bookkeeping — off the serialized path).
+ *	Pathological overflow (> MAX distinct segments in one xact) fsyncs the
+ *	overflowing segment inline (still off the cursor_lock) rather than dropping
+ *	it — correctness over the perf optimization, but never per-record fsync.
+ */
+static void
+cluster_undo_record_touched_segment(uint32 segment_id, uint8 owner_instance)
+{
+	int i;
+
+	for (i = 0; i < cluster_undo_touched_seg_count; i++)
+		if (cluster_undo_touched_segs[i].segment_id == segment_id
+			&& cluster_undo_touched_segs[i].owner_instance == owner_instance)
+			return; /* already tracked — fsync'd once at precommit */
+
+	if (cluster_undo_touched_seg_count >= CLUSTER_UNDO_TOUCHED_SEG_MAX) {
+		/* pathological: degrade to inline per-segment fsync, never per-record. */
+		if (!cluster_undo_smgr_fsync_segment_file(segment_id, owner_instance)) {
+			if (UndoRecordShared != NULL)
+				pg_atomic_fetch_add_u64(&UndoRecordShared->commit_fsync_failure_count, 1);
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("cluster undo overflow fsync failed for segment %u (instance %u)",
+							segment_id, owner_instance)));
+		}
+		if (UndoRecordShared != NULL)
+			pg_atomic_fetch_add_u64(&UndoRecordShared->commit_fsync_segment_count, 1);
+		return;
+	}
+
+	cluster_undo_touched_segs[cluster_undo_touched_seg_count].segment_id = segment_id;
+	cluster_undo_touched_segs[cluster_undo_touched_seg_count].owner_instance = owner_instance;
+	cluster_undo_touched_seg_count++;
+}
 
 /*
  * Backend-local latest undo head per TT slot.
@@ -239,6 +321,15 @@ cluster_undo_record_shmem_init(void)
 		pg_atomic_init_u64(&UndoRecordShared->segment_switch_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->segment_create_fail_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->segment_hard_cap_fail_count, 0);
+
+		/* P0 perf hardening: per-commit undo fsync counters. */
+		pg_atomic_init_u64(&UndoRecordShared->commit_fsync_count, 0);
+		pg_atomic_init_u64(&UndoRecordShared->commit_fsync_segment_count, 0);
+		pg_atomic_init_u64(&UndoRecordShared->commit_fsync_failure_count, 0);
+		pg_atomic_init_u64(&UndoRecordShared->smgr_open_count, 0);
+		pg_atomic_init_u64(&UndoRecordShared->smgr_close_count, 0);
+		pg_atomic_init_u64(&UndoRecordShared->smgr_pread_count, 0);
+		pg_atomic_init_u64(&UndoRecordShared->smgr_pwrite_count, 0);
 
 		LWLockInitialize(&UndoRecordShared->cursor_lock.lock, tranche_id);
 		LWLockInitialize(&UndoRecordShared->lifecycle_lock.lock, tranche_id);
@@ -612,9 +703,13 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 	blkhdr->slot_count = (uint16)(slot_count + 1);
 	blkhdr->free_offset = free_offset + record_length;
 
-	/* Write block back to file. */
+	/* Write block back to file.  P0 perf hardening (2026-05-31): do NOT fsync
+	 * here — fsync moved out of cursor_lock to a single per-xact precommit
+	 * (cluster_undo_xact_precommit_flush) that still completes BEFORE the commit
+	 * becomes visible.  Durable ordering preserved; per-record serialized fsync
+	 * removed.  The dirtied segment is tracked below (outside cursor_lock). */
 	if (!write_undo_block(segment_id, owner_instance, current_block, block_buf,
-						  /* do_fsync = */ true)) {
+						  /* do_fsync = */ false)) {
 		LWLockRelease(&UndoRecordShared->cursor_lock.lock);
 		if (lifecycle_lock_held)
 			LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
@@ -647,7 +742,8 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 	}
 
 	pg_atomic_fetch_add_u64(&UndoRecordShared->block_write_count, 1);
-	pg_atomic_fetch_add_u64(&UndoRecordShared->block_flush_count, 1);
+	/* block_flush_count is no longer bumped per-record: fsync is deferred to the
+	 * per-xact precommit flush (P0 perf hardening). */
 
 	/* Advance shared cursor. */
 	UndoRecordShared->current_block = current_block;
@@ -655,7 +751,7 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 	UndoRecordShared->slot_count = (uint16)(slot_count + 1);
 	if (block_was_fresh)
 		UndoRecordShared->block_first_scn = current_scn;
-	UndoRecordShared->block_dirty = 0; /* just flushed */
+	UndoRecordShared->block_dirty = 0; /* written (pwrite); fsync deferred to precommit */
 
 	pg_atomic_fetch_add_u64(&UndoRecordShared->record_alloc_count, 1);
 
@@ -665,6 +761,10 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 
 	/* Mark backend touched for D16 PREPARE guard. */
 	cluster_undo_touched_in_xact = true;
+
+	/* P0 perf hardening: record the dirtied undo segment for a single per-xact
+	 * precommit fsync.  Done OUTSIDE cursor_lock (released above). */
+	cluster_undo_record_touched_segment(segment_id, owner_instance);
 
 	/* Encode UBA per spec-3.4b: (segment_id, block_no, tt_slot_offset, row_offset).
 	 * For undo records, row_offset = slot-dir index within block. */
@@ -734,8 +834,61 @@ cluster_undo_get_record(UBA uba, void *out_buffer, size_t buffer_size)
 
 
 /*
+ * cluster_undo_xact_precommit_flush -- P0 perf hardening (2026-05-31).
+ *
+ *	fsync every undo segment file this xact dirtied, ONCE, replacing the old
+ *	per-record fsync.  MUST be called on the commit path BEFORE the commit
+ *	becomes visible — i.e. before commit_scn publish (ITL/TT) and before the
+ *	commit XLOG record is flushed.  Durable ordering:
+ *
+ *	    undo segment fsync  ->  ITL/TT commit_scn publish  ->  commit XLogFlush
+ *
+ *	so a crash can never leave a visible commit whose undo is not durable.
+ *
+ *	On any fsync failure this ereport(ERROR)s: it runs before the commit's
+ *	critical section, so the xact aborts cleanly (its un-fsync'd undo blocks are
+ *	irrelevant to an aborted xact) — never a silent half-durable commit.
+ *
+ *	No-op for a xact that wrote no undo (DDL-only / read-only).  The touched
+ *	list is cleared by cluster_undo_record_xact_reset at end of xact.
+ */
+void
+cluster_undo_xact_precommit_flush(void)
+{
+	int i;
+
+	if (cluster_undo_touched_seg_count == 0)
+		return;
+
+	for (i = 0; i < cluster_undo_touched_seg_count; i++) {
+		if (!cluster_undo_smgr_fsync_segment_file(cluster_undo_touched_segs[i].segment_id,
+												  cluster_undo_touched_segs[i].owner_instance)) {
+			if (UndoRecordShared != NULL)
+				pg_atomic_fetch_add_u64(&UndoRecordShared->commit_fsync_failure_count, 1);
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("cluster undo precommit fsync failed for segment %u (instance %u)",
+							cluster_undo_touched_segs[i].segment_id,
+							cluster_undo_touched_segs[i].owner_instance)));
+		}
+		if (UndoRecordShared != NULL)
+			pg_atomic_fetch_add_u64(&UndoRecordShared->commit_fsync_segment_count, 1);
+	}
+
+	if (UndoRecordShared != NULL)
+		pg_atomic_fetch_add_u64(&UndoRecordShared->commit_fsync_count, 1);
+}
+
+
+/*
  * cluster_undo_record_xact_reset -- end-of-xact hook;  reset per-backend
  *	touched flag.  Called from xact.c CommitTransaction / AbortTransaction.
+ *
+ *	Also clears the per-xact touched-undo-segment list.  On commit the list was
+ *	already fsync'd by cluster_undo_xact_precommit_flush; on abort it is simply
+ *	dropped (un-fsync'd undo of an aborted xact needs no durability) — this is
+ *	the lazy/best-effort abort path.  Clearing here prevents leakage into the
+ *	next xact on this backend.
  */
 void
 cluster_undo_record_xact_reset(void)
@@ -743,6 +896,7 @@ cluster_undo_record_xact_reset(void)
 	cluster_undo_touched_in_xact = false;
 	memset(cluster_undo_local_heads, 0, sizeof(cluster_undo_local_heads));
 	cluster_undo_local_head_count = 0;
+	cluster_undo_touched_seg_count = 0;
 }
 
 
@@ -829,6 +983,87 @@ cluster_undo_segment_hard_cap_fail_count(void)
 	if (UndoRecordShared == NULL)
 		return 0;
 	return pg_atomic_read_u64(&UndoRecordShared->segment_hard_cap_fail_count);
+}
+
+/* P0 perf hardening: per-commit undo fsync counter accessors. */
+uint64
+cluster_undo_commit_fsync_count(void)
+{
+	if (UndoRecordShared == NULL)
+		return 0;
+	return pg_atomic_read_u64(&UndoRecordShared->commit_fsync_count);
+}
+
+uint64
+cluster_undo_commit_fsync_segment_count(void)
+{
+	if (UndoRecordShared == NULL)
+		return 0;
+	return pg_atomic_read_u64(&UndoRecordShared->commit_fsync_segment_count);
+}
+
+uint64
+cluster_undo_commit_fsync_failure_count(void)
+{
+	if (UndoRecordShared == NULL)
+		return 0;
+	return pg_atomic_read_u64(&UndoRecordShared->commit_fsync_failure_count);
+}
+
+/* P0 perf hardening: smgr syscall counter bumps (called from
+ * cluster_undo_smgr.c) + accessors. */
+void
+cluster_undo_record_note_smgr_open(void)
+{
+	if (UndoRecordShared != NULL)
+		pg_atomic_fetch_add_u64(&UndoRecordShared->smgr_open_count, 1);
+}
+void
+cluster_undo_record_note_smgr_close(void)
+{
+	if (UndoRecordShared != NULL)
+		pg_atomic_fetch_add_u64(&UndoRecordShared->smgr_close_count, 1);
+}
+void
+cluster_undo_record_note_smgr_pread(void)
+{
+	if (UndoRecordShared != NULL)
+		pg_atomic_fetch_add_u64(&UndoRecordShared->smgr_pread_count, 1);
+}
+void
+cluster_undo_record_note_smgr_pwrite(void)
+{
+	if (UndoRecordShared != NULL)
+		pg_atomic_fetch_add_u64(&UndoRecordShared->smgr_pwrite_count, 1);
+}
+
+uint64
+cluster_undo_smgr_open_count(void)
+{
+	if (UndoRecordShared == NULL)
+		return 0;
+	return pg_atomic_read_u64(&UndoRecordShared->smgr_open_count);
+}
+uint64
+cluster_undo_smgr_close_count(void)
+{
+	if (UndoRecordShared == NULL)
+		return 0;
+	return pg_atomic_read_u64(&UndoRecordShared->smgr_close_count);
+}
+uint64
+cluster_undo_smgr_pread_count(void)
+{
+	if (UndoRecordShared == NULL)
+		return 0;
+	return pg_atomic_read_u64(&UndoRecordShared->smgr_pread_count);
+}
+uint64
+cluster_undo_smgr_pwrite_count(void)
+{
+	if (UndoRecordShared == NULL)
+		return 0;
+	return pg_atomic_read_u64(&UndoRecordShared->smgr_pwrite_count);
 }
 
 

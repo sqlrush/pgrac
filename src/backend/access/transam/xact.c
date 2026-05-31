@@ -142,6 +142,7 @@
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: spec-1.16 commit/abort SCN hooks; spec-1.18 WAL emit + replay. */
 #include "cluster/cluster_conf.h"		/* cluster_conf_has_peers */
+#include "cluster/cluster_mode.h"		/* cluster_storage_mode_enabled */
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_guc.h"		/* PGRAC: spec-2.6 cluster_enabled gate */
 #include "cluster/cluster_qvotec.h" /* PGRAC: spec-2.6 in_quorum lease check */
@@ -1512,8 +1513,20 @@ RecordTransactionCommit(void)
 		 * WAL bytestream is byte-identical to vanilla PG.
 		 */
 #ifdef USE_PGRAC_CLUSTER
-		if (cluster_conf_has_peers())
+		if (cluster_storage_mode_enabled())
 		{
+			/*
+			 * P0 perf hardening (2026-05-31): make this xact's undo durable
+			 * BEFORE the commit becomes visible.  Durable ordering:
+			 *   undo segment fsync -> commit_scn publish (ITL/TT) -> commit
+			 *   XLOG flush.
+			 * Replaces the old per-record fsync (one fsync per xact instead of
+			 * one per undo record, off the cursor_lock).  Runs before
+			 * START_CRIT_SECTION, so an fsync failure ereport(ERROR)s into a
+			 * clean abort (an aborted xact's un-fsync'd undo is irrelevant).
+			 */
+			cluster_undo_xact_precommit_flush();
+
 			commit_scn = cluster_scn_advance_for_commit();
 			/* spec-3.3 D7: copy to function-scope variable for TT hook below. */
 			tt_commit_scn = commit_scn;
@@ -1656,7 +1669,7 @@ RecordTransactionCommit(void)
 	 * and is exercised by D10 L2 TAP via the self_consumer_hit counter.
 	 */
 #ifdef USE_PGRAC_CLUSTER
-	if (markXidCommitted && cluster_conf_has_peers() && cluster_tt_local_has_binding(xid))
+	if (markXidCommitted && cluster_storage_mode_enabled() && cluster_tt_local_has_binding(xid))
 		cluster_tt_local_record_commit(xid, tt_commit_scn);
 #endif
 
@@ -1926,7 +1939,7 @@ RecordTransactionAbort(bool isSubXact)
 	 * (ParseAbortRecord is an independent parser at xactdesc.c:142).
 	 */
 #ifdef USE_PGRAC_CLUSTER
-	if (cluster_conf_has_peers())
+	if (cluster_storage_mode_enabled())
 	{
 		if (!isSubXact)
 		{
@@ -2012,7 +2025,7 @@ RecordTransactionAbort(bool isSubXact)
 	 * spec-3.1 (§1.3 #10 SUBTRANS cross-node sync defer to later spec).
 	 */
 #ifdef USE_PGRAC_CLUSTER
-	if (!isSubXact && cluster_conf_has_peers() && cluster_tt_local_has_binding(xid))
+	if (!isSubXact && cluster_storage_mode_enabled() && cluster_tt_local_has_binding(xid))
 		cluster_tt_local_record_abort(xid);
 #endif
 

@@ -331,6 +331,10 @@ cluster_injection_assign_hook(const char *newval pg_attribute_unused(),
  */
 int cluster_pcm_grd_max_entries = 0;
 
+/* spec-3.10 stub: cluster_guc.o (linked here) references the CR cache GUC
+ * global; cluster_cr_cache.o is not linked into this test, so stub it. */
+int cluster_cr_cache_max_blocks = 64;
+
 void
 cluster_pcm_lock_module_init(void)
 {}

@@ -105,6 +105,7 @@
  *   member detection;  unreachable here when any member is remote.
  */
 #include "cluster/cluster_conf.h"		/* cluster_conf_has_peers */
+#include "cluster/cluster_mode.h"		/* cluster_peer_mode_enabled */
 #include "cluster/cluster_epoch.h"		/* cluster_epoch_get_current */
 #include "cluster/cluster_guc.h"		/* cluster_enabled / cluster_node_id */
 #include "cluster/cluster_multixact.h"	/* overlay install + types */
@@ -895,7 +896,7 @@ MultiXactIdCreateFromMembers(int nmembers, MultiXactMember *members)
 	 *   member_count > GUC cap → defensive skip + emit_overlay 自身
 	 *   会 reject + counter；本 hook 不重复 ereport.
 	 */
-	if (cluster_enabled && cluster_conf_has_peers() && nmembers > 0
+	if (cluster_peer_mode_enabled() && nmembers > 0
 		&& nmembers <= cluster_multixact_member_overlay_max_members
 		&& nmembers <= CLUSTER_MULTIXACT_HINT_MAX_MEMBERS)
 	{
