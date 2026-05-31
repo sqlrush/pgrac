@@ -362,8 +362,6 @@ static void
 install_status(TransactionId xid, ClusterTTStatus status, SCN commit_scn)
 {
 	ClusterTTStatusKey key;
-	ClusterTTStatusResult res;
-	bool hit;
 	bool installed;
 
 	if (!cluster_enabled || cluster_node_id < 0)
@@ -391,16 +389,25 @@ install_status(TransactionId xid, ClusterTTStatus status, SCN commit_scn)
 		return;
 
 	/*
-	 * spec-3.1 v0.4 N7 self-consumer:  immediately re-lookup to prove
-	 * the just-installed key is reachable + bump the
-	 * self_consumer_hit_count counter (D9 T8 + D10 L2 covers).  This runs
-	 * in every build; assert builds additionally fail fast if the local
-	 * install path cannot read its own key.
+	 * spec-3.1 v0.4 N7 self-consumer:  re-lookup to prove the just-installed key
+	 * is reachable + bump self_consumer_hit_count (D9 T8 + D10 L2).
+	 *
+	 * P0 perf hardening: this is now a DEBUG-ONLY invariant check.  In every
+	 * commit it cost an extra HTAB lookup + LW_SHARED on the hot path; the
+	 * production install path does not need to re-read its own write.  Assert
+	 * builds still fail fast if the install cannot read its own key, and the
+	 * self_consumer_hit_count counter is now a debug-build signal.
 	 */
-	hit = cluster_tt_status_lookup_exact(&key, &res);
-	Assert(hit && res.authoritative && res.status == status);
-	if (hit && res.authoritative && res.status == status)
-		cluster_tt_status_bump_self_consumer_hit();
+#ifdef USE_ASSERT_CHECKING
+	{
+		ClusterTTStatusResult res;
+		bool hit = cluster_tt_status_lookup_exact(&key, &res);
+
+		Assert(hit && res.authoritative && res.status == status);
+		if (hit && res.authoritative && res.status == status)
+			cluster_tt_status_bump_self_consumer_hit();
+	}
+#endif
 
 	/*
 	 * spec-3.2 D4 + spec-3.3 D6/D8 (L181 chain step 4): cross-node TT
