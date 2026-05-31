@@ -69,7 +69,9 @@ cluster_cr_test_construct(PG_FUNCTION_ARGS)
 
 	relid = PG_GETARG_OID(0);
 	blockno = PG_GETARG_INT32(1);
-	itl_idx = PG_GETARG_INT32(2);
+	itl_idx = PG_GETARG_INT32(2); /* spec-3.10 D7: retained for ABI but ignored
+								   * (full-block CR rolls back every chain) */
+	(void)itl_idx;
 	read_scn_in = PG_GETARG_INT64(3);
 	read_scn = (SCN)read_scn_in;
 
@@ -82,7 +84,7 @@ cluster_cr_test_construct(PG_FUNCTION_ARGS)
 	{
 		/* construct_block ereports the CR taxonomy SQLSTATE on failure /
 		 * armed injection; on success returns the scratch image pointer. */
-		cr_page = cluster_cr_construct_block(buf, read_scn, itl_idx);
+		cr_page = cluster_cr_construct_block(buf, read_scn);
 	}
 	PG_CATCH();
 	{

@@ -62,6 +62,106 @@ cr_target_itemid(char *scratch_page, OffsetNumber off)
 }
 
 
+/* ============================================================
+ * spec-3.10 D1: full-block candidate chain collection + ordering
+ * ============================================================ */
+
+/*
+ * cluster_cr_collect_candidate_chains -- see header.  Captures the chain head +
+ * write_scn of every ITL slot with a valid write_scn newer than read_scn,
+ * BEFORE any inverse-apply mutates the page's ITL slots.  FREE / lock-only
+ * slots carry InvalidScn write_scn and are skipped by the SCN_VALID guard.
+ */
+int
+cluster_cr_collect_candidate_chains(const ClusterItlSlotData *slots, SCN read_scn,
+									ClusterCRCandidateChain *out, int max_out)
+{
+	int n = 0;
+	int i;
+
+	if (slots == NULL || out == NULL)
+		return 0;
+
+	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT && n < max_out; i++) {
+		SCN ws = slots[i].write_scn;
+
+		if (!SCN_VALID(ws))
+			continue;
+		if (!SCN_VALID(read_scn))
+			continue;
+		if (scn_time_cmp(ws, read_scn) <= 0)
+			continue; /* this slot's change is already in the snapshot */
+
+		out[n].slot_idx = (uint8)i;
+		out[n].xid = slots[i].xid;
+		out[n].write_scn = ws;
+		out[n].undo_segment_head = slots[i].undo_segment_head;
+		n++;
+	}
+	return n;
+}
+
+/*
+ * cluster_cr_chain_cmp_by_write_scn_desc -- qsort comparator, write_scn DESC
+ * (newest transaction first; spec-3.10 Q10).  Deterministic slot_idx tie-break
+ * (own-instance write_scns are distinct, but keep the order reproducible).
+ */
+int
+cluster_cr_chain_cmp_by_write_scn_desc(const void *a, const void *b)
+{
+	const ClusterCRCandidateChain *ca = (const ClusterCRCandidateChain *)a;
+	const ClusterCRCandidateChain *cb = (const ClusterCRCandidateChain *)b;
+	int c;
+
+	/* DESC: scn_time_cmp(cb, ca) is negative when ca is newer -> ca first. */
+	c = scn_time_cmp(cb->write_scn, ca->write_scn);
+	if (c != 0)
+		return c;
+	return (int)ca->slot_idx - (int)cb->slot_idx;
+}
+
+/*
+ * cluster_cr_prune_post_snapshot_versions -- see header.  Mark LP_UNUSED every
+ * normal-line-pointer tuple whose raw xmin matches one of the candidate
+ * (post-read_scn) transaction xids.
+ */
+int
+cluster_cr_prune_post_snapshot_versions(char *scratch_page, const ClusterCRCandidateChain *chains,
+										int nchains)
+{
+	Page page = (Page)scratch_page;
+	OffsetNumber off;
+	OffsetNumber maxoff;
+	int pruned = 0;
+
+	if (scratch_page == NULL || (chains == NULL && nchains > 0))
+		return 0;
+
+	maxoff = PageGetMaxOffsetNumber(page);
+	for (off = FirstOffsetNumber; off <= maxoff; off++) {
+		ItemId iid = PageGetItemId(page, off);
+		HeapTupleHeader htup;
+		TransactionId xmin;
+		int j;
+
+		if (!ItemIdIsNormal(iid))
+			continue;
+		htup = (HeapTupleHeader)PageGetItem(page, iid);
+		xmin = HeapTupleHeaderGetRawXmin(htup);
+		if (!TransactionIdIsValid(xmin))
+			continue;
+		for (j = 0; j < nchains; j++) {
+			if (chains[j].xid == xmin) {
+				ItemIdSetUnused(iid); /* created after read_scn */
+				pruned++;
+				break;
+			}
+		}
+	}
+	return pruned;
+}
+
+
 /*
  * cluster_cr_apply_insert_inverse -- undo an INSERT: remove the inserted
  *	tuple by marking its line pointer LP_UNUSED.  A seqscan / index fetch

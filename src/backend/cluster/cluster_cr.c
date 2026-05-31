@@ -43,6 +43,7 @@
 
 #include "cluster/cluster_cr.h"
 #include "cluster/cluster_cr_apply.h"
+#include "cluster/cluster_cr_cache.h"
 #include "cluster/cluster_guc.h" /* cluster_cr_chain_walk_max_steps, cluster_node_id */
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_itl_slot.h"
@@ -69,6 +70,11 @@ typedef struct ClusterCRShared {
 	pg_atomic_uint64 cr_inverse_update_count;
 	pg_atomic_uint64 cr_inverse_delete_count;
 	pg_atomic_uint64 cr_inverse_itl_count;
+	/* spec-3.10 D5: CR block cache (4 counters, 9 -> 13 cr-category rows). */
+	pg_atomic_uint64 cr_cache_hit_count;
+	pg_atomic_uint64 cr_cache_miss_count;
+	pg_atomic_uint64 cr_cache_evict_count;
+	pg_atomic_uint64 cr_cache_install_count;
 } ClusterCRShared;
 
 static ClusterCRShared *CRShared = NULL;
@@ -116,6 +122,10 @@ cluster_cr_shmem_init(void)
 		pg_atomic_init_u64(&CRShared->cr_inverse_update_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_inverse_delete_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_inverse_itl_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_cache_hit_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_cache_miss_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_cache_evict_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_cache_install_count, 0);
 	}
 }
 
@@ -157,6 +167,10 @@ CR_COUNTER_ACCESSOR(cluster_cr_inverse_insert_count, cr_inverse_insert_count)
 CR_COUNTER_ACCESSOR(cluster_cr_inverse_update_count, cr_inverse_update_count)
 CR_COUNTER_ACCESSOR(cluster_cr_inverse_delete_count, cr_inverse_delete_count)
 CR_COUNTER_ACCESSOR(cluster_cr_inverse_itl_count, cr_inverse_itl_count)
+CR_COUNTER_ACCESSOR(cluster_cr_cache_hit_count, cr_cache_hit_count)
+CR_COUNTER_ACCESSOR(cluster_cr_cache_miss_count, cr_cache_miss_count)
+CR_COUNTER_ACCESSOR(cluster_cr_cache_evict_count, cr_cache_evict_count)
+CR_COUNTER_ACCESSOR(cluster_cr_cache_install_count, cr_cache_install_count)
 
 
 /* ============================================================
@@ -223,8 +237,10 @@ cr_check_error_injections(void)
  * ============================================================ */
 
 /*
- * cr_walk_and_apply -- walk ITL[itl_idx].undo_segment_head backward and
- *	inverse-apply every undo record newer than read_scn onto scratch_page.
+ * cr_walk_chain -- walk one per-transaction undo chain from start_uba backward
+ *	and inverse-apply every undo record newer than read_scn onto scratch_page.
+ *	*steps is a running total across all candidate chains in one construction
+ *	(spec-3.10); cluster_cr_construct_block_into calls this once per chain.
  *
  *	Stop conditions + chain terminal taxonomy (spec-3.9 §3.1 I-chain-1..4):
  *	  - I-chain-1  write_scn not later than read_scn: the unconditional
@@ -251,32 +267,10 @@ cr_check_error_injections(void)
  *	non-reentrant guard; this function performs no locking (I-lock-2).
  */
 static void
-cr_walk_and_apply(char *scratch_page, Buffer buf, SCN read_scn, int itl_idx)
+cr_walk_chain(char *scratch_page, UBA start_uba, SCN read_scn, uint32 *steps, uint32 max_steps)
 {
-	Page page = (Page)scratch_page;
-	ClusterItlSlotData *slots;
-	UBA uba;
-	uint32 steps = 0;
-	uint32 max_steps = (uint32)cluster_cr_chain_walk_max_steps;
+	UBA uba = start_uba;
 	PGAlignedBlock record_buf;
-
-	(void)buf; /* page bytes already copied into scratch by the caller */
-
-	/* spec-3.9 Step 7: deterministic error injection (raises CR's own
-	 * SQLSTATE).  Checked FIRST so L4/L5/L6 fire regardless of page state. */
-	cr_check_error_injections();
-
-	if (itl_idx < 0 || itl_idx >= CLUSTER_ITL_INITRANS_DEFAULT)
-		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-						errmsg("cluster CR itl_idx %d out of range [0, %d)", itl_idx,
-							   CLUSTER_ITL_INITRANS_DEFAULT)));
-
-	if (!PageHasItl(page))
-		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-						errmsg("cluster CR target page has no ITL special area")));
-
-	slots = ClusterPageGetItlSlots(page);
-	uba = slots[itl_idx].undo_segment_head;
 
 	while (!UBA_is_invalid(uba)) {
 		UndoRecordHeader *hdr;
@@ -286,7 +280,7 @@ cr_walk_and_apply(char *scratch_page, Buffer buf, SCN read_scn, int itl_idx)
 		uint16 tt_off;
 		uint16 row_off;
 
-		if (++steps > max_steps)
+		if (++(*steps) > max_steps)
 			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 							errmsg("cluster CR chain walk exceeded %u steps", max_steps),
 							errhint("chain walk infinite loop suspected; raise "
@@ -401,27 +395,16 @@ cr_walk_and_apply(char *scratch_page, Buffer buf, SCN read_scn, int itl_idx)
 	}
 
 	/*
-	 * Chain terminal taxonomy (revised after verify-linkdb-first; flag for
-	 * codereview — supersedes the v0.2 F4 I-chain-2/3 assumption).
-	 *
-	 *   The ITL undo_segment_head chain is PER-TRANSACTION (it threads every
-	 *   undo record written under that ITL slot's xact), NOT per-row.  Each
-	 *   record fully restores the prior physical state of its target tuple,
-	 *   so once we have inverse-applied every record on this chain whose
-	 *   only records newer than read_scn, the scratch page reflects the read_scn state
-	 *   for the tuples this xact touched — and a clean `invalid prev_uba`
-	 *   simply means the xact's undo is exhausted.  That is a LEGITIMATE
-	 *   terminal, NOT "older base unreachable".
-	 *
-	 *   The v0.2 F4 audit assumed a per-row chain where chain-end before the
-	 *   SCN stop implied a truncated history.  With the real per-xact chain,
-	 *   a genuine truncation (retention recycled an older record we still
-	 *   needed) instead surfaces as cluster_undo_get_record() returning 0 in
-	 *   the loop above -> 53R9F there.  So clean chain-end is success and we
-	 *   do not raise here.
+	 * Clean chain-end is a LEGITIMATE terminal: the ITL undo_segment_head chain
+	 * is PER-TRANSACTION (threads every undo record under that slot's xact, NOT
+	 * per-row), so an invalid prev_uba simply means the xact's undo is
+	 * exhausted and the tuples it touched are back at read_scn.  A genuine
+	 * truncation (retention recycled a still-needed older record) instead
+	 * surfaces as cluster_undo_get_record() == 0 -> 53R9F inside the loop.
+	 * *steps is a running total across all candidate chains; the caller
+	 * (cluster_cr_construct_block_into) accumulates cr_chain_walk_steps_sum
+	 * once after every chain completes.
 	 */
-	if (CRShared != NULL)
-		pg_atomic_fetch_add_u64(&CRShared->cr_chain_walk_steps_sum, steps);
 }
 
 
@@ -429,37 +412,50 @@ cr_walk_and_apply(char *scratch_page, Buffer buf, SCN read_scn, int itl_idx)
  * 2-layer public API
  * ============================================================ */
 
-const char *
-cluster_cr_construct_block(Buffer buf, SCN read_scn, int itl_idx)
+/*
+ * cluster_cr_construct_block_into -- full-block CR into a caller-provided
+ *	BLCKSZ destination (the CR cache victim slot in spec-3.10, or the backend
+ *	scratch via the public wrapper).  memcpy the live page, then inverse-apply
+ *	EVERY candidate ITL chain (write_scn > read_scn) in write_scn-DESC order so
+ *	the whole block is rolled back to read_scn (Oracle block-level CR).
+ *
+ *	Candidate chains are snapshotted BEFORE any inverse-apply (cluster_cr_apply
+ *	itl_inverse mutates the page's ITL slots; re-reading heads mid-walk would
+ *	corrupt selection — spec-3.10 D1).  Order is newest-first because each
+ *	per-transaction chain's inverse is an unconditional old-image restore and a
+ *	row touched by txB then txC must be peeled C->B (spec-3.10 Q10).
+ *
+ *	I-lock-3 non-reentrant + I-fail-1 balanced guard (PG_TRY resets cr_in_progress
+ *	and re-throws the precise SQLSTATE).  Returns dst_page.
+ */
+static const char *
+cluster_cr_construct_block_into(Buffer buf, SCN read_scn, char *dst_page)
 {
-	/* Init silences cppcheck uninitvar: the only non-throwing exit assigns
-	 * result in the PG_TRY body; PG_CATCH always PG_RE_THROWs, but cppcheck
-	 * cannot reason through the longjmp. */
+	/* Init silences cppcheck uninitvar across the PG_RE_THROW longjmp. */
 	const char *result = NULL;
 
 	Assert(BufferIsValid(buf));
+	Assert(dst_page != NULL);
 	Assert(!cr_in_progress); /* I-lock-3 non-reentrant */
 
-	cr_scratch_ensure();
-
-	/*
-	 * I-lock-3 + I-fail-1: the guard MUST be balanced even if the chain
-	 * walker ereport(ERROR)s, otherwise the next construction Asserts /
-	 * the guard wedges this backend.  PG_TRY/PG_CATCH resets the flag and
-	 * re-throws so the caller still sees the precise SQLSTATE.
-	 */
 	cr_in_progress = true;
 
 	PG_TRY();
 	{
-		/* I-lock-1/2/4: caller holds the content lock; we only read the
-		 * page bytes into backend-local scratch — no buffer lock, no WAL,
-		 * no dirty.  The wait event covers the undo I/O of the chain walk
-		 * so it is observable in pg_stat_activity (spec-3.9 §2 / TAP L8). */
+		Page page;
+		const ClusterItlSlotData *slots;
+		ClusterCRCandidateChain chains[CLUSTER_ITL_INITRANS_DEFAULT];
+		int nchains;
+		int i;
+		uint32 steps = 0;
+		uint32 max_steps = (uint32)cluster_cr_chain_walk_max_steps;
+
+		/* I-lock-1/2/4: caller holds the content lock; we only read page bytes
+		 * into dst — no buffer lock, no WAL, no dirty.  The wait event covers
+		 * the undo I/O of the chain walks (spec-3.9 §2 / TAP L8). */
 		pgstat_report_wait_start(WAIT_EVENT_CLUSTER_CR_CONSTRUCT);
 
-		/* spec-3.9 Step 7: deterministic wait-event window for TAP L8.
-		 * pg_usleep with the armed microsecond param under the wait event. */
+		/* deterministic wait-event window for TAP L8 (armed µs sleep). */
 		{
 			uint64 delay_us = 0;
 
@@ -467,26 +463,53 @@ cluster_cr_construct_block(Buffer buf, SCN read_scn, int itl_idx)
 				pg_usleep((long)delay_us);
 		}
 
-		memcpy(cr_scratch, BufferGetPage(buf), BLCKSZ);
+		memcpy(dst_page, BufferGetPage(buf), BLCKSZ);
 
-		cr_walk_and_apply(cr_scratch, buf, read_scn, itl_idx);
+		/* spec-3.9 Step 7: injection-forced taxonomy fires FIRST (TAP L4/L5/L6),
+		 * before any page inspection, so it is page-state-independent. */
+		cr_check_error_injections();
+
+		page = (Page)dst_page;
+		if (!PageHasItl(page))
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("cluster CR target page has no ITL special area")));
+
+		/* Snapshot candidate chains BEFORE mutation, then peel newest-first. */
+		slots = ClusterPageGetItlSlots(page);
+		nchains = cluster_cr_collect_candidate_chains(slots, read_scn, chains,
+													  CLUSTER_ITL_INITRANS_DEFAULT);
+		if (nchains > 1)
+			qsort(chains, nchains, sizeof(chains[0]), cluster_cr_chain_cmp_by_write_scn_desc);
+
+		for (i = 0; i < nchains; i++)
+			cr_walk_chain(dst_page, chains[i].undo_segment_head, read_scn, &steps, max_steps);
+
+		/*
+		 * spec-3.10 D1 (L4b): remove NEW tuple versions created after read_scn.
+		 * Chain revert clears xmax but does not remove the new physical version
+		 * an UPDATE produced (heap_update emits only UNDO_RECORD_UPDATE, no
+		 * INSERT-undo for the new version); the helper marks LP_UNUSED every
+		 * tuple whose xmin is a candidate (post-read_scn) transaction.  See its
+		 * header for the correctness invariant + the slot-reuse edge (§3.3).
+		 */
+		(void)cluster_cr_prune_post_snapshot_versions(dst_page, chains, nchains);
 
 		pgstat_report_wait_end();
 
-		if (CRShared != NULL)
+		if (CRShared != NULL) {
 			pg_atomic_fetch_add_u64(&CRShared->cr_construct_count, 1);
+			pg_atomic_fetch_add_u64(&CRShared->cr_chain_walk_steps_sum, steps);
+		}
 
-		result = cr_scratch;
+		result = dst_page;
 	}
 	PG_CATCH();
 	{
 		/*
 		 * spec-3.9 Step 6: centralized error-taxonomy counter bump.  Every
-		 * failure path in cr_walk_and_apply ereports with a precise SQLSTATE
-		 * (53R9F / 53R9G / data_corrupted, I-fail-1); reading it here with
-		 * geterrcode() bumps the matching counter exactly once per failed
-		 * construction without touching the ~15 ereport sites.  Injection-
-		 * forced failures (Step 7) flow through here too.
+		 * failure path ereports a precise SQLSTATE (53R9F / 53R9G /
+		 * data_corrupted); geterrcode() bumps the matching counter once per
+		 * failed construction.  Injection-forced failures flow through here too.
 		 */
 		if (CRShared != NULL) {
 			int sqlerr = geterrcode();
@@ -510,14 +533,69 @@ cluster_cr_construct_block(Buffer buf, SCN read_scn, int itl_idx)
 }
 
 const char *
-cluster_cr_lookup_or_construct(Buffer buf, SCN read_scn, int itl_idx)
+cluster_cr_construct_block(Buffer buf, SCN read_scn)
+{
+	/* Public fallback: construct into the backend-local scratch.  Used by the
+	 * test SRF and as the cache-disabled path (spec-3.10 §3.1). */
+	cr_scratch_ensure();
+	return cluster_cr_construct_block_into(buf, read_scn, cr_scratch);
+}
+
+/*
+ * cr_build_cache_key -- CR cache identity for `buf` at `read_scn`.  base_page_lsn
+ * is the live page LSN (bumped by every WAL-logged physical change incl.
+ * HOT-prune / VACUUM), the version guard that forces a miss after a relayout
+ * (spec-3.10 §3.2).  memset zeroes padding so the key compares cleanly.
+ */
+static ClusterCRCacheKey
+cr_build_cache_key(Buffer buf, SCN read_scn)
+{
+	ClusterCRCacheKey key;
+
+	memset(&key, 0, sizeof(key));
+	BufferGetTag(buf, &key.rlocator, &key.forknum, &key.blockno);
+	key.read_scn = read_scn;
+	key.base_page_lsn = PageGetLSN(BufferGetPage(buf));
+	return key;
+}
+
+const char *
+cluster_cr_lookup_or_construct(Buffer buf, SCN read_scn)
 {
 	/*
-	 * spec-3.9: fall-through to construction.  spec-3.10 inserts the CR
-	 * cache lookup here (miss → construct + cache, hit → cached image),
-	 * without touching the visibility caller.
+	 * spec-3.10 D3: probe the backend-local CR cache; on a hit serve the
+	 * immutable cached image (no construction).  On a miss, reserve a victim
+	 * slot, construct the full-block CR directly into it (two-phase: a throwing
+	 * construction never commits the slot), then commit + return.  Disabled
+	 * (max_blocks == 0): lookup always misses, victim_slot returns the fallback
+	 * buffer, so this degrades to plain construction.
 	 */
-	return cluster_cr_construct_block(buf, read_scn, itl_idx);
+	ClusterCRCacheKey key = cr_build_cache_key(buf, read_scn);
+	const char *hit;
+	char *slot;
+	bool evicted = false;
+
+	hit = cluster_cr_cache_lookup(&key);
+	if (hit != NULL) {
+		if (CRShared != NULL)
+			pg_atomic_fetch_add_u64(&CRShared->cr_cache_hit_count, 1);
+		return hit;
+	}
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->cr_cache_miss_count, 1);
+
+	slot = cluster_cr_cache_victim_slot(&key, &evicted);
+	if (evicted && CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->cr_cache_evict_count, 1);
+
+	/* Construct INTO the reserved slot.  ereports on failure with the slot
+	 * left uncommitted (invalid -> never served). */
+	(void)cluster_cr_construct_block_into(buf, read_scn, slot);
+
+	cluster_cr_cache_commit_slot();
+	if (CRShared != NULL)
+		pg_atomic_fetch_add_u64(&CRShared->cr_cache_install_count, 1);
+	return slot;
 }
 
 
@@ -722,11 +800,14 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 		return false;
 
 	/*
-	 * Gate fired: construct the read_scn block image and decide on the
-	 * historical tuple.  cluster_cr_lookup_or_construct never returns NULL —
-	 * it ereports the precise SQLSTATE on failure (I-fail-1).
+	 * Gate fired: construct the read_scn block image (full-block CR, spec-3.10)
+	 * and decide on the historical tuple.  cluster_cr_lookup_or_construct never
+	 * returns NULL — it ereports the precise SQLSTATE on failure (I-fail-1).
+	 * itl_idx is no longer passed (full-block rolls back every candidate chain);
+	 * the queried tuple's live `slot` (already resolved above) still drives the
+	 * tier-2 + xmin-side checks.
 	 */
-	cr_page = cluster_cr_lookup_or_construct(buffer, snapshot->read_scn, itl_idx);
+	cr_page = cluster_cr_lookup_or_construct(buffer, snapshot->read_scn);
 
 	if (!cluster_cr_remap_tuple(cr_page, ItemPointerGetOffsetNumber(&htup->t_self), &cr_htup)) {
 		/* CR-removed (inverse-INSERT made it LP_UNUSED): the row did not

@@ -1467,6 +1467,13 @@ dump_cr(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_cr_inverse_delete_count()));
 	emit_row(rsinfo, "cr", "cr_inverse_itl_count",
 			 fmt_int64((int64)cluster_cr_inverse_itl_count()));
+	/* spec-3.10 D6: CR block cache counters (cr category 9 -> 13 rows). */
+	emit_row(rsinfo, "cr", "cr_cache_hit_count", fmt_int64((int64)cluster_cr_cache_hit_count()));
+	emit_row(rsinfo, "cr", "cr_cache_miss_count", fmt_int64((int64)cluster_cr_cache_miss_count()));
+	emit_row(rsinfo, "cr", "cr_cache_evict_count",
+			 fmt_int64((int64)cluster_cr_cache_evict_count()));
+	emit_row(rsinfo, "cr", "cr_cache_install_count",
+			 fmt_int64((int64)cluster_cr_cache_install_count()));
 }
 
 #endif /* USE_PGRAC_CLUSTER */

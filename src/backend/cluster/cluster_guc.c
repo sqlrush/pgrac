@@ -38,6 +38,7 @@
 
 #include "utils/guc.h"
 
+#include "cluster/cluster_cr_cache.h" /* cluster_cr_cache_max_blocks (spec-3.10 D4) */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic.h"				   /* ClusterICTier enum values */
 #include "cluster/cluster_inject.h"			   /* cluster_injection_assign_hook (stage 0.27) */
@@ -1422,6 +1423,16 @@ cluster_init_guc(void)
 					 "LOCAL-source and never reach this path. Set off to fall back to the "
 					 "spec-3.2/3.3 SCN/PG-native visibility path."),
 		&cluster_cr_mvcc_gate, true, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.cr_cache_max_blocks",
+		gettext_noop("Backend-local CR block cache capacity in 8 KB blocks (0 disables)."),
+		gettext_noop("Spec-3.10 D4. Default 64, range 0..4096, PGC_USERSET. Caches full-block "
+					 "CR images keyed by (RelFileLocator, fork, block, read_scn, page_lsn) so a "
+					 "block re-read under the same snapshot/version is served without re-walking "
+					 "the undo chains. 0 disables caching (every CR is reconstructed; useful for "
+					 "perf A/B and as a fallback). Each block costs 8 KB of backend-local memory."),
+		&cluster_cr_cache_max_blocks, 64, 0, 4096, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
 		"cluster.boc_sweep_interval_ms",

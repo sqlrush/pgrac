@@ -64,24 +64,27 @@
  * cluster_cr_lookup_or_construct -- top-layer CR API (Q9a B forward-link).
  *
  *   spec-3.9: fall-through to cluster_cr_construct_block().
- *   spec-3.10: insert CR cache lookup here (miss → construct + cache,
- *              hit → return cached image).  Visibility caller MUST use
- *              this entry, NOT the bottom layer.
+ *   spec-3.10: insert CR cache probe/install here (miss → construct + cache,
+ *              hit → return cached image).  Visibility caller MUST use this
+ *              entry, NOT the bottom layer.  itl_idx retired (spec-3.10 D7):
+ *              full-block CR rolls back every candidate chain, so no single
+ *              chain index is passed; the gate still reads the queried tuple's
+ *              live ITL slot for its tier-2 + xmin-side checks.
  *
  *   Return semantics identical to cluster_cr_construct_block().
  */
-extern const char *cluster_cr_lookup_or_construct(Buffer buf, SCN read_scn, int itl_idx);
+extern const char *cluster_cr_lookup_or_construct(Buffer buf, SCN read_scn);
 
 /*
- * cluster_cr_construct_block -- bottom-layer CR construction (always builds).
+ * cluster_cr_construct_block -- bottom-layer full-block CR (always builds).
  *
  *   1. Assert caller holds >= BUFFER_LOCK_SHARE + non-reentrant guard.
  *   2. memcpy(scratch, BufferGetPage(buf), BLCKSZ).
- *   3. Walk ITL[itl_idx].uba_head backward; for each undo record newer than
- *      read_scn, inverse-apply to scratch page.
- *   4. Stop when record.write_scn is not later than read_scn (normal) —
- *      reaching chain end without a reconstructable base state is an ERROR,
- *      not silent success.
+ *   3. Snapshot every ITL slot with write_scn > read_scn (candidate chains),
+ *      then inverse-apply each chain newest-transaction-first (write_scn DESC)
+ *      until each record's write_scn is not later than read_scn.
+ *   4. Reaching a chain end without a reconstructable base state surfaces as
+ *      a missing undo record (53R9F), not silent success.
  *
  *   Return:
  *     - success: const char * to the backend-local scratch page; VALID only
@@ -91,7 +94,7 @@ extern const char *cluster_cr_lookup_or_construct(Buffer buf, SCN read_scn, int 
  *       before returning; it does not return a silent NULL to the visibility
  *       caller (spec-3.9 I-fail-1).
  */
-extern const char *cluster_cr_construct_block(Buffer buf, SCN read_scn, int itl_idx);
+extern const char *cluster_cr_construct_block(Buffer buf, SCN read_scn);
 
 /*
  * cluster_cr_remap_tuple -- materialize a HeapTupleData wrapper for a CR-image
@@ -143,7 +146,7 @@ extern ClusterVisibilityDecision cluster_visibility_decide_cr_tuple(HeapTuple ht
 extern bool cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer,
 									  bool *out_visible);
 
-/* Counter accessors (spec-3.9 §2.5 — 9 counters). */
+/* Counter accessors (spec-3.9 §2.5 — 9 counters; spec-3.10 D5 +4 cache = 13). */
 extern uint64 cluster_cr_construct_count(void);
 extern uint64 cluster_cr_snapshot_too_old_count(void);
 extern uint64 cluster_cr_cross_instance_unsupported_count(void);
@@ -153,6 +156,10 @@ extern uint64 cluster_cr_inverse_insert_count(void);
 extern uint64 cluster_cr_inverse_update_count(void);
 extern uint64 cluster_cr_inverse_delete_count(void);
 extern uint64 cluster_cr_inverse_itl_count(void);
+extern uint64 cluster_cr_cache_hit_count(void);
+extern uint64 cluster_cr_cache_miss_count(void);
+extern uint64 cluster_cr_cache_evict_count(void);
+extern uint64 cluster_cr_cache_install_count(void);
 
 /* Shmem region register / size / init (L206 5-step). */
 extern Size cluster_cr_shmem_size(void);
