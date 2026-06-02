@@ -115,7 +115,7 @@
 #include "storage/off.h"
 
 #ifdef USE_PGRAC_CLUSTER
-#include "cluster/cluster_scn.h" /* SCN typedef + InvalidScn (stage 1.4) */
+#include "cluster/cluster_scn.h"	  /* SCN typedef + InvalidScn (stage 1.4) */
 #include "cluster/cluster_itl_slot.h" /* ClusterItlSlotData + CLUSTER_ITL_ARRAY_SIZE (stage 1.5) */
 #endif
 
@@ -191,20 +191,19 @@ typedef uint16 LocationIndex;
  * For historical reasons, the 64-bit LSN value is stored as two 32-bit
  * values.
  */
-typedef struct
-{
-	uint32		xlogid;			/* high bits */
-	uint32		xrecoff;		/* low bits */
+typedef struct {
+	uint32 xlogid;	/* high bits */
+	uint32 xrecoff; /* low bits */
 } PageXLogRecPtr;
 
 static inline XLogRecPtr
 PageXLogRecPtrGet(PageXLogRecPtr val)
 {
-	return (uint64) val.xlogid << 32 | val.xrecoff;
+	return (uint64)val.xlogid << 32 | val.xrecoff;
 }
 
-#define PageXLogRecPtrSet(ptr, lsn) \
-	((ptr).xlogid = (uint32) ((lsn) >> 32), (ptr).xrecoff = (uint32) (lsn))
+#define PageXLogRecPtrSet(ptr, lsn)                                                                \
+	((ptr).xlogid = (uint32)((lsn) >> 32), (ptr).xrecoff = (uint32)(lsn))
 
 /*
  * disk page organization
@@ -252,17 +251,16 @@ PageXLogRecPtrGet(PageXLogRecPtr val)
  * are 15 bits.
  */
 
-typedef struct PageHeaderData
-{
+typedef struct PageHeaderData {
 	/* XXX LSN is member of *any* block, not only page-organized ones */
-	PageXLogRecPtr pd_lsn;		/* LSN: next byte after last byte of xlog
+	PageXLogRecPtr pd_lsn;	  /* LSN: next byte after last byte of xlog
 								 * record for last change to this page */
-	uint16		pd_checksum;	/* checksum */
-	uint16		pd_flags;		/* flag bits, see below */
-	LocationIndex pd_lower;		/* offset to start of free space */
-	LocationIndex pd_upper;		/* offset to end of free space */
-	LocationIndex pd_special;	/* offset to start of special space */
-	uint16		pd_pagesize_version;
+	uint16 pd_checksum;		  /* checksum */
+	uint16 pd_flags;		  /* flag bits, see below */
+	LocationIndex pd_lower;	  /* offset to start of free space */
+	LocationIndex pd_upper;	  /* offset to end of free space */
+	LocationIndex pd_special; /* offset to start of special space */
+	uint16 pd_pagesize_version;
 	TransactionId pd_prune_xid; /* oldest prunable XID, or zero if none */
 #ifdef USE_PGRAC_CLUSTER
 	/*
@@ -273,9 +271,9 @@ typedef struct PageHeaderData
 	 *	8 bytes on 64-bit ABI; offset 24 from start of header (after
 	 *	pd_prune_xid) -> SizeOfPageHeaderData becomes 32 (was 24).
 	 */
-	SCN			pd_block_scn;
+	SCN pd_block_scn;
 #endif
-	ItemIdData	pd_linp[FLEXIBLE_ARRAY_MEMBER]; /* line pointer array */
+	ItemIdData pd_linp[FLEXIBLE_ARRAY_MEMBER]; /* line pointer array */
 } PageHeaderData;
 
 typedef PageHeaderData *PageHeader;
@@ -292,9 +290,10 @@ typedef PageHeaderData *PageHeader;
  * page for its new tuple version; this suggests that a prune is needed.
  * Again, this is just a hint.
  */
-#define PD_HAS_FREE_LINES	0x0001	/* are there any unused line pointers? */
-#define PD_PAGE_FULL		0x0002	/* not enough free space for new tuple? */
-#define PD_ALL_VISIBLE		0x0004	/* all tuples on page are visible to
+#define PD_HAS_FREE_LINES 0x0001 /* are there any unused line pointers? */
+#define PD_PAGE_FULL 0x0002		 /* not enough free space for new tuple? */
+#define PD_ALL_VISIBLE                                                                             \
+	0x0004 /* all tuples on page are visible to
 									 * everyone */
 
 #ifdef USE_PGRAC_CLUSTER
@@ -305,7 +304,7 @@ typedef PageHeaderData *PageHeader;
  * bit to know whether (page + SizeOfPageHeaderData) is the start of
  * 384 bytes of ClusterItlSlotData or the start of pd_linp.
  */
-#define PD_HAS_ITL			0x0008
+#define PD_HAS_ITL 0x0008
 /*
  * PGRAC (stage 1.22): block 0 of every undo segment file
  * (pg_undo/instance_<N>/seg_<id>.dat) is laid out as
@@ -322,10 +321,10 @@ typedef PageHeaderData *PageHeader;
  *
  * Spec: spec-1.22-undo-tablespace-bootstrap.md §2.1 Q-1 ★ A.
  */
-#define PD_UNDO_SEG_HEADER	0x0010
-#define PD_VALID_FLAG_BITS	0x001F	/* OR of all valid pd_flags bits */
+#define PD_UNDO_SEG_HEADER 0x0010
+#define PD_VALID_FLAG_BITS 0x001F /* OR of all valid pd_flags bits */
 #else
-#define PD_VALID_FLAG_BITS	0x0007	/* OR of all valid pd_flags bits */
+#define PD_VALID_FLAG_BITS 0x0007 /* OR of all valid pd_flags bits */
 #endif
 
 /*
@@ -348,11 +347,11 @@ typedef PageHeaderData *PageHeader;
  *		v1.1 §15 stage 1 + spec-1.4.
  */
 #ifdef USE_PGRAC_CLUSTER
-#define PG_PAGE_LAYOUT_VERSION		5
+#define PG_PAGE_LAYOUT_VERSION 5
 #else
-#define PG_PAGE_LAYOUT_VERSION		4
+#define PG_PAGE_LAYOUT_VERSION 4
 #endif
-#define PG_DATA_CHECKSUM_VERSION	1
+#define PG_DATA_CHECKSUM_VERSION 1
 
 /* ----------------------------------------------------------------
  *						page support functions
@@ -379,7 +378,7 @@ typedef PageHeaderData *PageHeader;
 static inline bool
 PageIsEmpty(Page page)
 {
-	return ((PageHeader) page)->pd_lower <= SizeOfPageHeaderData;
+	return ((PageHeader)page)->pd_lower <= SizeOfPageHeaderData;
 }
 
 /*
@@ -389,7 +388,7 @@ PageIsEmpty(Page page)
 static inline bool
 PageIsNew(Page page)
 {
-	return ((PageHeader) page)->pd_upper == 0;
+	return ((PageHeader)page)->pd_upper == 0;
 }
 
 /*
@@ -399,7 +398,7 @@ PageIsNew(Page page)
 static inline ItemId
 PageGetItemId(Page page, OffsetNumber offsetNumber)
 {
-	return &((PageHeader) page)->pd_linp[offsetNumber - 1];
+	return &((PageHeader)page)->pd_linp[offsetNumber - 1];
 }
 
 /*
@@ -413,7 +412,7 @@ PageGetItemId(Page page, OffsetNumber offsetNumber)
 static inline char *
 PageGetContents(Page page)
 {
-	return (char *) page + MAXALIGN(SizeOfPageHeaderData);
+	return (char *)page + MAXALIGN(SizeOfPageHeaderData);
 }
 
 /* ----------------
@@ -432,7 +431,7 @@ PageGetContents(Page page)
 static inline Size
 PageGetPageSize(Page page)
 {
-	return (Size) (((PageHeader) page)->pd_pagesize_version & (uint16) 0xFF00);
+	return (Size)(((PageHeader)page)->pd_pagesize_version & (uint16)0xFF00);
 }
 
 /*
@@ -442,7 +441,7 @@ PageGetPageSize(Page page)
 static inline uint8
 PageGetPageLayoutVersion(Page page)
 {
-	return (((PageHeader) page)->pd_pagesize_version & 0x00FF);
+	return (((PageHeader)page)->pd_pagesize_version & 0x00FF);
 }
 
 /*
@@ -458,7 +457,7 @@ PageSetPageSizeAndVersion(Page page, Size size, uint8 version)
 	Assert((size & 0xFF00) == size);
 	Assert((version & 0x00FF) == version);
 
-	((PageHeader) page)->pd_pagesize_version = size | version;
+	((PageHeader)page)->pd_pagesize_version = size | version;
 }
 
 /* ----------------
@@ -472,7 +471,7 @@ PageSetPageSizeAndVersion(Page page, Size size, uint8 version)
 static inline uint16
 PageGetSpecialSize(Page page)
 {
-	return (PageGetPageSize(page) - ((PageHeader) page)->pd_special);
+	return (PageGetPageSize(page) - ((PageHeader)page)->pd_special);
 }
 
 /*
@@ -484,8 +483,8 @@ static inline void
 PageValidateSpecialPointer(Page page)
 {
 	Assert(page);
-	Assert(((PageHeader) page)->pd_special <= BLCKSZ);
-	Assert(((PageHeader) page)->pd_special >= SizeOfPageHeaderData);
+	Assert(((PageHeader)page)->pd_special <= BLCKSZ);
+	Assert(((PageHeader)page)->pd_special >= SizeOfPageHeaderData);
 }
 
 /*
@@ -496,7 +495,7 @@ static inline char *
 PageGetSpecialPointer(Page page)
 {
 	PageValidateSpecialPointer(page);
-	return (char *) page + ((PageHeader) page)->pd_special;
+	return (char *)page + ((PageHeader)page)->pd_special;
 }
 
 /*
@@ -513,7 +512,7 @@ PageGetItem(Page page, ItemId itemId)
 	Assert(page);
 	Assert(ItemIdHasStorage(itemId));
 
-	return (Item) (((char *) page) + ItemIdGetOffset(itemId));
+	return (Item)(((char *)page) + ItemIdGetOffset(itemId));
 }
 
 /*
@@ -528,7 +527,7 @@ PageGetItem(Page page, ItemId itemId)
 static inline OffsetNumber
 PageGetMaxOffsetNumber(Page page)
 {
-	PageHeader	pageheader = (PageHeader) page;
+	PageHeader pageheader = (PageHeader)page;
 
 	if (pageheader->pd_lower <= SizeOfPageHeaderData)
 		return 0;
@@ -542,74 +541,73 @@ PageGetMaxOffsetNumber(Page page)
 static inline XLogRecPtr
 PageGetLSN(Page page)
 {
-	return PageXLogRecPtrGet(((PageHeader) page)->pd_lsn);
+	return PageXLogRecPtrGet(((PageHeader)page)->pd_lsn);
 }
 static inline void
 PageSetLSN(Page page, XLogRecPtr lsn)
 {
-	PageXLogRecPtrSet(((PageHeader) page)->pd_lsn, lsn);
+	PageXLogRecPtrSet(((PageHeader)page)->pd_lsn, lsn);
 }
 
 static inline bool
 PageHasFreeLinePointers(Page page)
 {
-	return ((PageHeader) page)->pd_flags & PD_HAS_FREE_LINES;
+	return ((PageHeader)page)->pd_flags & PD_HAS_FREE_LINES;
 }
 static inline void
 PageSetHasFreeLinePointers(Page page)
 {
-	((PageHeader) page)->pd_flags |= PD_HAS_FREE_LINES;
+	((PageHeader)page)->pd_flags |= PD_HAS_FREE_LINES;
 }
 static inline void
 PageClearHasFreeLinePointers(Page page)
 {
-	((PageHeader) page)->pd_flags &= ~PD_HAS_FREE_LINES;
+	((PageHeader)page)->pd_flags &= ~PD_HAS_FREE_LINES;
 }
 
 static inline bool
 PageIsFull(Page page)
 {
-	return ((PageHeader) page)->pd_flags & PD_PAGE_FULL;
+	return ((PageHeader)page)->pd_flags & PD_PAGE_FULL;
 }
 static inline void
 PageSetFull(Page page)
 {
-	((PageHeader) page)->pd_flags |= PD_PAGE_FULL;
+	((PageHeader)page)->pd_flags |= PD_PAGE_FULL;
 }
 static inline void
 PageClearFull(Page page)
 {
-	((PageHeader) page)->pd_flags &= ~PD_PAGE_FULL;
+	((PageHeader)page)->pd_flags &= ~PD_PAGE_FULL;
 }
 
 static inline bool
 PageIsAllVisible(Page page)
 {
-	return ((PageHeader) page)->pd_flags & PD_ALL_VISIBLE;
+	return ((PageHeader)page)->pd_flags & PD_ALL_VISIBLE;
 }
 static inline void
 PageSetAllVisible(Page page)
 {
-	((PageHeader) page)->pd_flags |= PD_ALL_VISIBLE;
+	((PageHeader)page)->pd_flags |= PD_ALL_VISIBLE;
 }
 static inline void
 PageClearAllVisible(Page page)
 {
-	((PageHeader) page)->pd_flags &= ~PD_ALL_VISIBLE;
+	((PageHeader)page)->pd_flags &= ~PD_ALL_VISIBLE;
 }
 
 /*
  * These two require "access/transam.h", so left as macros.
  */
-#define PageSetPrunable(page, xid) \
-do { \
-	Assert(TransactionIdIsNormal(xid)); \
-	if (!TransactionIdIsValid(((PageHeader) (page))->pd_prune_xid) || \
-		TransactionIdPrecedes(xid, ((PageHeader) (page))->pd_prune_xid)) \
-		((PageHeader) (page))->pd_prune_xid = (xid); \
-} while (0)
-#define PageClearPrunable(page) \
-	(((PageHeader) (page))->pd_prune_xid = InvalidTransactionId)
+#define PageSetPrunable(page, xid)                                                                 \
+	do {                                                                                           \
+		Assert(TransactionIdIsNormal(xid));                                                        \
+		if (!TransactionIdIsValid(((PageHeader)(page))->pd_prune_xid)                              \
+			|| TransactionIdPrecedes(xid, ((PageHeader)(page))->pd_prune_xid))                     \
+			((PageHeader)(page))->pd_prune_xid = (xid);                                            \
+	} while (0)
+#define PageClearPrunable(page) (((PageHeader)(page))->pd_prune_xid = InvalidTransactionId)
 
 
 /* ----------------------------------------------------------------
@@ -618,21 +616,19 @@ do { \
  */
 
 /* flags for PageAddItemExtended() */
-#define PAI_OVERWRITE			(1 << 0)
-#define PAI_IS_HEAP				(1 << 1)
+#define PAI_OVERWRITE (1 << 0)
+#define PAI_IS_HEAP (1 << 1)
 
 /* flags for PageIsVerifiedExtended() */
-#define PIV_LOG_WARNING			(1 << 0)
-#define PIV_REPORT_STAT			(1 << 1)
+#define PIV_LOG_WARNING (1 << 0)
+#define PIV_REPORT_STAT (1 << 1)
 
-#define PageAddItem(page, item, size, offsetNumber, overwrite, is_heap) \
-	PageAddItemExtended(page, item, size, offsetNumber, \
-						((overwrite) ? PAI_OVERWRITE : 0) | \
-						((is_heap) ? PAI_IS_HEAP : 0))
+#define PageAddItem(page, item, size, offsetNumber, overwrite, is_heap)                            \
+	PageAddItemExtended(page, item, size, offsetNumber,                                            \
+						((overwrite) ? PAI_OVERWRITE : 0) | ((is_heap) ? PAI_IS_HEAP : 0))
 
-#define PageIsVerified(page, blkno) \
-	PageIsVerifiedExtended(page, blkno, \
-						   PIV_LOG_WARNING | PIV_REPORT_STAT)
+#define PageIsVerified(page, blkno)                                                                \
+	PageIsVerifiedExtended(page, blkno, PIV_LOG_WARNING | PIV_REPORT_STAT)
 
 /*
  * Check that BLCKSZ is a multiple of sizeof(size_t).  In
@@ -677,7 +673,7 @@ extern void PageInitHeapPage(Page page, Size pageSize, Size specialSize);
 static inline bool
 PageHasItl(Page page)
 {
-	return (((PageHeader) page)->pd_flags & PD_HAS_ITL) != 0;
+	return (((PageHeader)page)->pd_flags & PD_HAS_ITL) != 0;
 }
 
 /*
@@ -698,8 +694,17 @@ static inline ClusterItlSlotData *
 ClusterPageGetItlSlots(Page page)
 {
 	Assert(PageHasItl(page));
-	Assert(PageGetSpecialSize(page) >= CLUSTER_ITL_SPECIAL_SIZE);
-	return (ClusterItlSlotData *) PageGetSpecialPointer(page);
+	/*
+	 * The slot array occupies the FIRST CLUSTER_ITL_ARRAY_SIZE (384) bytes of
+	 * the special area, so slot access only requires >= 384 -- NOT the full
+	 * 392 special size (spec-3.10 §v0.5: the 8B ITL header trails the slots).
+	 * Keeping this at CLUSTER_ITL_ARRAY_SIZE lets pre-v0.5 unit-test fixtures
+	 * that reserve a 384-byte special area (and never touch the header) keep
+	 * exercising the slot reader.  ClusterPageGetItlHeader below requires the
+	 * full CLUSTER_ITL_SPECIAL_SIZE.
+	 */
+	Assert(PageGetSpecialSize(page) >= CLUSTER_ITL_ARRAY_SIZE);
+	return (ClusterItlSlotData *)PageGetSpecialPointer(page);
 }
 
 /*
@@ -713,8 +718,7 @@ ClusterPageGetItlHeader(Page page)
 {
 	Assert(PageHasItl(page));
 	Assert(PageGetSpecialSize(page) >= CLUSTER_ITL_SPECIAL_SIZE);
-	return (ClusterItlPageHeader *) ((char *) PageGetSpecialPointer(page)
-									 + CLUSTER_ITL_ARRAY_SIZE);
+	return (ClusterItlPageHeader *)((char *)PageGetSpecialPointer(page) + CLUSTER_ITL_ARRAY_SIZE);
 }
 
 /*
@@ -758,9 +762,7 @@ ClusterPageGetItlSlot(Page page, uint8 slot_idx)
  *
  *	Spec: spec-1.22-undo-tablespace-bootstrap.md §2.2 + §D2 (v0.2 Q-6 ★ A).
  */
-extern void PageInitUndoSegmentHeader(Page page,
-									  Size pageSize,
-									  uint32 segment_id,
+extern void PageInitUndoSegmentHeader(Page page, Size pageSize, uint32 segment_id,
 									  uint8 owner_instance);
 
 /*
@@ -775,12 +777,12 @@ extern void PageInitUndoSegmentHeader(Page page,
 static inline bool
 PageIsUndoSegmentHeader(Page page)
 {
-	return (((PageHeader) page)->pd_flags & PD_UNDO_SEG_HEADER) != 0;
+	return (((PageHeader)page)->pd_flags & PD_UNDO_SEG_HEADER) != 0;
 }
 #endif
 extern bool PageIsVerifiedExtended(Page page, BlockNumber blkno, int flags);
-extern OffsetNumber PageAddItemExtended(Page page, Item item, Size size,
-										OffsetNumber offsetNumber, int flags);
+extern OffsetNumber PageAddItemExtended(Page page, Item item, Size size, OffsetNumber offsetNumber,
+										int flags);
 extern Page PageGetTempPage(Page page);
 extern Page PageGetTempPageCopy(Page page);
 extern Page PageGetTempPageCopySpecial(Page page);
@@ -794,9 +796,8 @@ extern Size PageGetHeapFreeSpace(Page page);
 extern void PageIndexTupleDelete(Page page, OffsetNumber offnum);
 extern void PageIndexMultiDelete(Page page, OffsetNumber *itemnos, int nitems);
 extern void PageIndexTupleDeleteNoCompact(Page page, OffsetNumber offnum);
-extern bool PageIndexTupleOverwrite(Page page, OffsetNumber offnum,
-									Item newtup, Size newsize);
+extern bool PageIndexTupleOverwrite(Page page, OffsetNumber offnum, Item newtup, Size newsize);
 extern char *PageSetChecksumCopy(Page page, BlockNumber blkno);
 extern void PageSetChecksumInplace(Page page, BlockNumber blkno);
 
-#endif							/* BUFPAGE_H */
+#endif /* BUFPAGE_H */
