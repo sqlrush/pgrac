@@ -1414,8 +1414,10 @@ dump_gcs(ReturnSetInfo *rsinfo)
 /*
  * dump_undo -- spec-3.7 D10 + D6 真激活 counter observability.
  *
- *	Emits 5 rows under category='undo' for the cluster_undo_record
- *	allocator counters.  Backs cluster_tap t/213 L2/L6/L10 verification
+ *	Emits 16 rows under category='undo': 5 record-level allocator counters
+ *	(spec-3.7) + 4 segment-lifecycle counters (spec-3.8) + 3 commit-fsync +
+ *	4 smgr counters (the latter 7 added by the perf-merge undo
+ *	instrumentation).  Backs cluster_tap t/213 + t/214 L2 verification
  *	+ perf class 7 baseline tracking.
  */
 static void
