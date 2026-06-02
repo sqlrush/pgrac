@@ -60,6 +60,16 @@
 extern void cluster_tt_local_record_commit(TransactionId xid, SCN commit_scn);
 
 /*
+ * cluster_tt_local_precommit_durable_finish (spec-3.11 D4) -- durably stamp
+ * commit_scn on this xact's TT slot (undo segment header) + emit
+ * XLOG_UNDO_TT_SLOT_COMMIT, BEFORE the commit record (xact.c pre-commit hook;
+ * spec-3.11 C1).  No-op when the xact has no TT binding.  Distinct from
+ * cluster_tt_local_record_commit (post-commit overlay install) -- this is the
+ * durable-write half (D4 / C1; record_commit must NOT do durable I/O).
+ */
+extern void cluster_tt_local_precommit_durable_finish(TransactionId xid, SCN commit_scn);
+
+/*
  * cluster_tt_local_record_abort -- install ABORTED status for a local
  * transaction.  Same invariants as record_commit.
  */

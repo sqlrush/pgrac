@@ -1543,6 +1543,21 @@ RecordTransactionCommit(void)
 			 */
 			if (cluster_itl_touch_has_pending())
 				cluster_itl_xact_precommit_finish(xid, tt_commit_scn);
+
+			/*
+			 * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+			 * What changed: spec-3.11 D4 -- durably stamp commit_scn on this
+			 * xact's TT slot in the undo segment header (+ emit
+			 * XLOG_UNDO_TT_SLOT_COMMIT) BEFORE the commit XLOG record, so the
+			 * durable TT survives overlay eviction / restart and the spec-3.10
+			 * watermark gate resolves commit_scn precisely (own-instance).
+			 * Why: C1 ordering -- WAL before commit record, flushed by the
+			 * commit record's XLogFlush (no independent fsync, C10).  No-op
+			 * when the xact has no TT binding.  Distinct from the post-CLOG
+			 * cluster_tt_local_record_commit() overlay install (C1b: this only
+			 * stamps commit_scn; committed-ness stays CLOG's authority).
+			 */
+			cluster_tt_local_precommit_durable_finish(xid, tt_commit_scn);
 		}
 #endif
 

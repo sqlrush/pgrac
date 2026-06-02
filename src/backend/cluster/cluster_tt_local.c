@@ -46,6 +46,7 @@
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_tt_durable.h" /* spec-3.11 D4 durable commit */
 #include "cluster/cluster_tt_local.h"
 #include "cluster/cluster_tt_slot.h" /* spec-3.4b D4 real binding */
 #include "cluster/cluster_tt_status.h"
@@ -388,7 +389,7 @@ install_status(TransactionId xid, ClusterTTStatus status, SCN commit_scn)
 	if (!installed)
 		return;
 
-		/*
+	/*
 	 * spec-3.1 v0.4 N7 self-consumer:  re-lookup to prove the just-installed key
 	 * is reachable + bump self_consumer_hit_count (D9 T8 + D10 L2).
 	 *
@@ -424,6 +425,32 @@ install_status(TransactionId xid, ClusterTTStatus status, SCN commit_scn)
 /* ------------------------------------------------------------ */
 /* public API                                                   */
 /* ------------------------------------------------------------ */
+
+void
+cluster_tt_local_precommit_durable_finish(TransactionId xid, SCN commit_scn)
+{
+	uint32 segment_id;
+	uint16 slot_offset;
+	uint32 tt_slot_id;
+	uint32 cluster_epoch;
+	uint16 wrap;
+
+	/*
+	 * spec-3.11 D4 / C1: durably stamp commit_scn on this xact's TT slot in the
+	 * undo segment header, emitting XLOG_UNDO_TT_SLOT_COMMIT BEFORE the commit
+	 * record (caller is the xact.c pre-commit hook; the commit record's flush
+	 * makes it durable -- no independent fsync, C10).  No binding = DDL-only /
+	 * read-only xact that never allocated a slot -> nothing durable.  Runs
+	 * before reset_binding() (post-commit in record_commit), so the binding is
+	 * still present.  C1b: this only stamps commit_scn; whether the xact
+	 * actually committed is still decided by the commit record / CLOG.
+	 */
+	if (!cluster_tt_local_peek_binding(xid, &segment_id, &slot_offset, &tt_slot_id, &cluster_epoch))
+		return;
+
+	wrap = cluster_tt_slot_get_wrap(segment_id, slot_offset);
+	cluster_tt_slot_durable_commit(segment_id, slot_offset, xid, wrap, commit_scn);
+}
 
 void
 cluster_tt_local_record_commit(TransactionId xid, SCN commit_scn)
