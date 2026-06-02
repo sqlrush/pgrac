@@ -32,6 +32,7 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/transam.h" /* spec-3.11 D6/C1b: TransactionIdDidCommit, TransactionIdIsNormal */
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/bufmgr.h"
@@ -48,6 +49,7 @@
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_itl_slot.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_tt_durable.h" /* spec-3.11 D6: watermark by-xid resolve */
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_undo_record.h"
 #include "cluster/cluster_undo_record_api.h"
@@ -408,6 +410,102 @@ cr_walk_chain(char *scratch_page, UBA start_uba, SCN read_scn, uint32 *steps, ui
 }
 
 
+/*
+ * cr_resolve_kept_tuples_durable -- spec-3.11 D6/C4/C5.
+ *
+ * Called only when the block's ITL recycle watermark exceeds read_scn: a
+ * completed DATA ITL slot whose write_scn is newer than the snapshot was
+ * recycled out of this block, so cluster_cr_collect_candidate_chains above may
+ * not have captured that writer and a post-read_scn tuple version it created
+ * could survive the candidate prune as a false-visible (spec-3.10 §v0.5 A).
+ *
+ * For every still-NORMAL tuple whose xmin is NOT one of the live candidate
+ * xids, resolve xmin's commit_scn from the durable TT by xid (spec-3.11 D2):
+ *
+ *   - committed (CLOG-confirmed -- C1b) + commit_scn  > read_scn: the evicted
+ *     post-read_scn creator -> prune (LP_UNUSED).
+ *   - committed                        + commit_scn <= read_scn: a legitimate
+ *     pre-read_scn version -> keep.
+ *   - not committed per CLOG (aborted / still in flight at this read): the
+ *     creator's row was not visible at read_scn -> prune.
+ *   - durable lookup miss / ambiguous: cannot prove either way -> fail closed
+ *     (53R9F).  Never leave a possibly-post-read_scn version visible (规则 8.A).
+ *
+ * This retires the spec-3.10 blanket fail-closed for every kept tuple whose
+ * durable slot is still resolvable; only a tuple whose own slot was already
+ * recycled (lookup miss) still fails closed -- spec-3.12 retention shrinks that
+ * window.  Own-instance only (the watermark is a local-block property; remote
+ * origins resolve via Cache Fusion in Stage 4).
+ *
+ * Mutates dst_page (LP_UNUSED marks); the caller leaves them unrepaired (the CR
+ * image is read-only and visibility scans skip LP_UNUSED, matching prune-AFTER).
+ */
+static void
+cr_resolve_kept_tuples_durable(char *dst_page, SCN read_scn, const ClusterCRCandidateChain *chains,
+							   int nchains)
+{
+	Page page = (Page)dst_page;
+	OffsetNumber off;
+	OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+
+	for (off = FirstOffsetNumber; off <= maxoff; off = OffsetNumberNext(off)) {
+		ItemId lp = PageGetItemId(page, off);
+		HeapTupleHeader htup;
+		TransactionId xmin;
+		SCN durable_scn = InvalidScn;
+		bool is_candidate = false;
+		int c;
+
+		if (!ItemIdIsNormal(lp))
+			continue;
+
+		htup = (HeapTupleHeader)PageGetItem(page, lp);
+		xmin = HeapTupleHeaderGetRawXmin(htup);
+
+		/* Frozen / bootstrap xids predate any cluster snapshot -> visible. */
+		if (!TransactionIdIsNormal(xmin))
+			continue;
+
+		/* xmin already covered by the candidate prune/walk -> nothing to do. */
+		for (c = 0; c < nchains; c++) {
+			if (chains[c].xid == xmin) {
+				is_candidate = true;
+				break;
+			}
+		}
+		if (is_candidate)
+			continue;
+
+		/*
+		 * xmin fell outside the (possibly incomplete) candidate set.  Resolve it
+		 * durably by xid; a miss / ambiguity is unresolvable -> fail closed.
+		 */
+		if (!cluster_tt_slot_durable_lookup_by_xid(xmin, &durable_scn))
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CR_SNAPSHOT_TOO_OLD),
+							errmsg("cluster CR cannot reconstruct block: durable TT slot for "
+								   "writer xid %u is unavailable after ITL slot reuse",
+								   xmin),
+							errhint("retry the transaction with a fresh snapshot")));
+
+		/*
+		 * C1b (规则 8.A): the durable slot is stamped at pre-commit, so a
+		 * COMMITTED stamp alone does not prove the xact committed.  Confirm via
+		 * CLOG: an xact that stamped then aborted (or is still in flight at this
+		 * read) was not visible at read_scn -> prune.
+		 */
+		if (!TransactionIdDidCommit(xmin)) {
+			ItemIdSetUnused(lp);
+			continue;
+		}
+
+		/* Committed after the snapshot -> evicted post-read_scn creator -> prune. */
+		if (scn_time_cmp(durable_scn, read_scn) > 0)
+			ItemIdSetUnused(lp);
+		/* else committed at/before read_scn -> legitimate pre-read_scn -> keep. */
+	}
+}
+
+
 /* ============================================================
  * 2-layer public API
  * ============================================================ */
@@ -449,6 +547,7 @@ cluster_cr_construct_block_into(Buffer buf, SCN read_scn, char *dst_page)
 		int i;
 		uint32 steps = 0;
 		uint32 max_steps = (uint32)cluster_cr_chain_walk_max_steps;
+		bool watermark_exceeds = false; /* spec-3.11 D6: durable resolve gate */
 
 		/* I-lock-1/2/4: caller holds the content lock; we only read page bytes
 		 * into dst — no buffer lock, no WAL, no dirty.  The wait event covers
@@ -475,24 +574,22 @@ cluster_cr_construct_block_into(Buffer buf, SCN read_scn, char *dst_page)
 							errmsg("cluster CR target page has no ITL special area")));
 
 		/*
-		 * spec-3.10 §v0.5: slot-reuse fail-closed.  If a completed DATA ITL
-		 * slot whose write_scn is newer than this reader's snapshot was
+		 * spec-3.10 §v0.5 / spec-3.11 D6: slot-reuse gate.  If a completed DATA
+		 * ITL slot whose write_scn is newer than this reader's snapshot was
 		 * recycled out of this block (its undo-chain anchor overwritten), the
 		 * per-page candidate set may be incomplete and a post-read_scn tuple
-		 * version could survive prune as a false-visible.  Page-level
-		 * construction cannot distinguish that evicted writer from a
-		 * legitimate pre-read_scn creator (§v0.5 A), so fail closed (53R9F)
-		 * rather than risk returning a wrong CR image.  spec-3.11 durable TT
-		 * will instead resolve the evicted writer's commit_scn precisely.
+		 * version could survive the candidate prune as a false-visible.
+		 *
+		 * spec-3.10 failed the whole block closed (53R9F) here.  spec-3.11 D6
+		 * instead defers to cr_resolve_kept_tuples_durable() after the candidate
+		 * prune + walk: each kept tuple whose xmin is not a live candidate is
+		 * resolved against the durable TT by xid, so only a tuple whose own
+		 * durable slot was already recycled still fails closed (§v0.5 A).
 		 */
 		{
 			SCN recycle_wm = ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn;
 
-			if (SCN_VALID(recycle_wm) && scn_time_cmp(recycle_wm, read_scn) > 0)
-				ereport(ERROR, (errcode(ERRCODE_CLUSTER_CR_SNAPSHOT_TOO_OLD),
-								errmsg("cluster CR cannot reconstruct block: ITL slot reused "
-									   "after snapshot"),
-								errhint("retry the transaction with a fresh snapshot")));
+			watermark_exceeds = SCN_VALID(recycle_wm) && scn_time_cmp(recycle_wm, read_scn) > 0;
 		}
 
 		/* Snapshot candidate chains BEFORE mutation, then peel newest-first. */
@@ -533,6 +630,16 @@ cluster_cr_construct_block_into(Buffer buf, SCN read_scn, char *dst_page)
 			cr_walk_chain(dst_page, chains[i].undo_segment_head, read_scn, &steps, max_steps);
 
 		(void)cluster_cr_prune_post_snapshot_versions(dst_page, chains, nchains);
+
+		/*
+		 * spec-3.11 D6/C4: if a completed post-read_scn DATA slot was evicted
+		 * (watermark > read_scn), the candidate set above may miss its writer.
+		 * Resolve every kept tuple whose xmin is not a live candidate against the
+		 * durable TT by xid, pruning evicted post-read_scn versions and failing
+		 * closed only on an unresolvable (recycled) slot.
+		 */
+		if (watermark_exceeds)
+			cr_resolve_kept_tuples_durable(dst_page, read_scn, chains, nchains);
 
 		pgstat_report_wait_end();
 
