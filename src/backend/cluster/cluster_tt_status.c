@@ -48,6 +48,7 @@
  */
 #include "postgres.h"
 
+#include "access/transam.h" /* spec-3.11 D5/C1b: TransactionIdDidCommit */
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/ipc.h"
@@ -59,6 +60,8 @@
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_tt_durable.h" /* spec-3.11 D5: overlay-miss durable lookup */
+#include "cluster/cluster_tt_slot.h"	/* cluster_tt_slot_id_to_offset, TT_SLOTS_PER_SEGMENT */
 #include "cluster/cluster_tt_status.h"
 
 /*
@@ -263,6 +266,34 @@ cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key, ClusterTTStatusRes
 	if (e == NULL || !is_entry_fresh(e, now)) {
 		LWLockRelease(ClusterTTStatusLock);
 		pg_atomic_fetch_add_u64(&ClusterTTStatusState->lookup_miss_count, 1);
+
+		/*
+		 * spec-3.11 D5/C3: overlay miss -> own-instance durable TT lookup.  The
+		 * durable TT slot in the undo segment header survives overlay eviction
+		 * and restart while still bound to local_xid, so this retires the
+		 * fail-closed those cases otherwise force.  Only own-instance (origin ==
+		 * local node); a remote origin's durable TT is Stage 4 (Cache Fusion).
+		 *
+		 * C1b (规则 8.A): the durable slot is stamped at pre-commit (spec-3.11
+		 * C1), so it alone does not prove the xact committed -- confirm via CLOG
+		 * (TransactionIdDidCommit) before reporting COMMITTED.  A pre-commit
+		 * stamp left by an xact that then aborted thus does not become visible.
+		 */
+		if (cluster_node_id >= 0 && key->origin_node_id == (uint16)cluster_node_id
+			&& key->tt_slot_id >= 1 && key->tt_slot_id <= TT_SLOTS_PER_SEGMENT) {
+			SCN durable_scn;
+
+			if (cluster_tt_slot_durable_lookup(key->undo_segment_id,
+											   cluster_tt_slot_id_to_offset(key->tt_slot_id),
+											   key->local_xid, &durable_scn)
+				&& TransactionIdDidCommit(key->local_xid)) {
+				result->status = CLUSTER_TT_STATUS_COMMITTED;
+				result->commit_scn = durable_scn;
+				result->status_epoch = current_epoch;
+				result->authoritative = true;
+				return true;
+			}
+		}
 		return false;
 	}
 

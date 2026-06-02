@@ -87,11 +87,12 @@ cluster_tt_durable_redo_decide(uint8 slot_status, TransactionId slot_xid, uint16
 }
 
 bool
-cluster_tt_durable_slot_match(uint8 slot_status, TransactionId slot_xid, uint16 slot_wrap,
-							  SCN slot_commit_scn, TransactionId want_xid, uint16 want_wrap)
+cluster_tt_durable_slot_match(uint8 slot_status, TransactionId slot_xid, SCN slot_commit_scn,
+							  TransactionId want_xid)
 {
-	/* spec-3.11 C5: COMMITTED + exact (xid, wrap) + valid commit_scn. */
-	return slot_status == (uint8)TT_SLOT_COMMITTED && slot_xid == want_xid && slot_wrap == want_wrap
+	/* spec-3.11 C5: COMMITTED + exact xid + valid commit_scn.  xid mismatch is
+	 * the recycle detector (reuse stamps a new owner xid). */
+	return slot_status == (uint8)TT_SLOT_COMMITTED && slot_xid == want_xid
 		   && SCN_VALID(slot_commit_scn);
 }
 
@@ -141,7 +142,7 @@ cluster_tt_slot_durable_commit(uint32 segment_id, uint16 slot_offset, Transactio
 
 bool
 cluster_tt_slot_durable_lookup(uint32 segment_id, uint16 slot_offset, TransactionId xid,
-							   uint16 wrap, SCN *commit_scn)
+							   SCN *commit_scn)
 {
 	uint8 owner;
 	uint32 off;
@@ -157,12 +158,11 @@ cluster_tt_slot_durable_lookup(uint32 segment_id, uint16 slot_offset, Transactio
 		return false; /* segment absent / I/O -> miss (caller fail-closes) */
 
 	/*
-	 * spec-3.11 C5 (规则 8.A): the slot must still be bound to this xid/wrap and
-	 * be COMMITTED with a valid commit_scn.  wrap/xid mismatch = the slot was
-	 * recycled by a later owner; never return that owner's commit_scn.
+	 * spec-3.11 C5 (规则 8.A): the slot must still be bound to this xid and be
+	 * COMMITTED with a valid commit_scn.  xid mismatch = the slot was recycled
+	 * by a later owner; never return that owner's commit_scn.
 	 */
-	if (!cluster_tt_durable_slot_match(slot.status, slot.xid, slot.wrap, slot.commit_scn, xid,
-									   wrap))
+	if (!cluster_tt_durable_slot_match(slot.status, slot.xid, slot.commit_scn, xid))
 		return false;
 
 	*commit_scn = slot.commit_scn;

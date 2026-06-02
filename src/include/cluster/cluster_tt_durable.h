@@ -63,12 +63,15 @@ extern ClusterTTRedoDecision cluster_tt_durable_redo_decide(uint8 slot_status,
 
 /*
  * cluster_tt_durable_slot_match -- true iff a durable slot with the given
- *	(status, xid, wrap, commit_scn) is a valid still-bound COMMITTED match for
- *	the wanted (xid, wrap) (spec-3.11 C5).  Pure; no I/O.
+ *	(status, xid, commit_scn) is a valid still-bound COMMITTED match for the
+ *	wanted xid (spec-3.11 C5).  Pure; no I/O.
+ *
+ *	Matches on xid (not wrap): slot reuse stamps a new owner xid, so an xid
+ *	mismatch is the recycle detector (the lookup key -- ClusterTTStatusKey --
+ *	carries local_xid, not wrap; wrap is the WAL/redo ordering field only).
  */
 extern bool cluster_tt_durable_slot_match(uint8 slot_status, TransactionId slot_xid,
-										  uint16 slot_wrap, SCN slot_commit_scn,
-										  TransactionId want_xid, uint16 want_wrap);
+										  SCN slot_commit_scn, TransactionId want_xid);
 
 /*
  * cluster_tt_slot_durable_commit -- durably stamp commit_scn (status COMMITTED)
@@ -83,12 +86,13 @@ extern void cluster_tt_slot_durable_commit(uint32 segment_id, uint16 slot_offset
 /*
  * cluster_tt_slot_durable_lookup -- read the durable TT slot (segment_id,
  *	slot_offset) and return its commit_scn iff the slot is still bound to
- *	`xid`/`wrap` and COMMITTED with a valid commit_scn.  wrap/xid mismatch
- *	(slot recycled by a later owner) or UNUSED -> false (never returns another
- *	owner's commit_scn -- spec-3.11 C5).  Returns true + *commit_scn on hit.
+ *	`xid` and COMMITTED with a valid commit_scn.  xid mismatch (slot recycled
+ *	by a later owner) or UNUSED -> false (never returns another owner's
+ *	commit_scn -- spec-3.11 C5).  Returns true + *commit_scn on hit.  Callers
+ *	must apply the C1b CLOG cross-check (the slot is stamped at pre-commit).
  */
 extern bool cluster_tt_slot_durable_lookup(uint32 segment_id, uint16 slot_offset, TransactionId xid,
-										   uint16 wrap, SCN *commit_scn);
+										   SCN *commit_scn);
 
 /*
  * cluster_tt_slot_durable_lookup_by_xid -- scan the local node's undo segment

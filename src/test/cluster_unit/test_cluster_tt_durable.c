@@ -11,9 +11,9 @@
  *
  *	  U1  byte-layout (sizeof TTSlot==32, xl_undo_tt_slot_commit==24)
  *	  U2  cluster_tt_durable_redo_decide -- all 5 outcomes (wrap table §2.3)
- *	  U3  cluster_tt_durable_slot_match -- exact / wrong-wrap / wrong-xid /
- *	      UNUSED / invalid-scn
- *	  U4  cluster_tt_slot_durable_lookup -- match / wrong-wrap / unused /
+ *	  U3  cluster_tt_durable_slot_match -- exact / wrong-xid / UNUSED /
+ *	      invalid-scn (xid-match; recycle stamps a new owner xid)
+ *	  U4  cluster_tt_slot_durable_lookup -- match / wrong-xid / unused /
  *	      read-fail (mocked smgr)
  *	  U5  cluster_tt_slot_durable_lookup_by_xid -- 0 / 1 / >1 matches (mocked
  *	      block); ambiguity fail-closed (规则 8.A)
@@ -210,31 +210,23 @@ UT_TEST(test_redo_decide_bad_status)
  * ============================================================ */
 UT_TEST(test_slot_match_exact)
 {
-	UT_ASSERT_EQ(
-		(int)cluster_tt_durable_slot_match(TT_SLOT_COMMITTED, 100, 5, scn_encode(1, 42), 100, 5),
-		1);
-}
-UT_TEST(test_slot_match_wrong_wrap)
-{
-	UT_ASSERT_EQ(
-		(int)cluster_tt_durable_slot_match(TT_SLOT_COMMITTED, 100, 6, scn_encode(1, 42), 100, 5),
-		0);
+	UT_ASSERT_EQ((int)cluster_tt_durable_slot_match(TT_SLOT_COMMITTED, 100, scn_encode(1, 42), 100),
+				 1);
 }
 UT_TEST(test_slot_match_wrong_xid)
 {
-	UT_ASSERT_EQ(
-		(int)cluster_tt_durable_slot_match(TT_SLOT_COMMITTED, 999, 5, scn_encode(1, 42), 100, 5),
-		0);
+	/* recycle stamps a new owner xid -> xid mismatch is the recycle detector. */
+	UT_ASSERT_EQ((int)cluster_tt_durable_slot_match(TT_SLOT_COMMITTED, 999, scn_encode(1, 42), 100),
+				 0);
 }
 UT_TEST(test_slot_match_unused)
 {
-	UT_ASSERT_EQ(
-		(int)cluster_tt_durable_slot_match(TT_SLOT_UNUSED, 100, 5, scn_encode(1, 42), 100, 5), 0);
+	UT_ASSERT_EQ((int)cluster_tt_durable_slot_match(TT_SLOT_UNUSED, 100, scn_encode(1, 42), 100),
+				 0);
 }
 UT_TEST(test_slot_match_invalid_scn)
 {
-	UT_ASSERT_EQ((int)cluster_tt_durable_slot_match(TT_SLOT_COMMITTED, 100, 5, InvalidScn, 100, 5),
-				 0);
+	UT_ASSERT_EQ((int)cluster_tt_durable_slot_match(TT_SLOT_COMMITTED, 100, InvalidScn, 100), 0);
 }
 
 
@@ -252,21 +244,20 @@ UT_TEST(test_lookup_match)
 	g_canned_slot.wrap = 5;
 	g_canned_slot.commit_scn = scn_encode(1, 42);
 
-	UT_ASSERT_EQ((int)cluster_tt_slot_durable_lookup(1, 0, 100, 5, &got), 1);
+	UT_ASSERT_EQ((int)cluster_tt_slot_durable_lookup(1, 0, 100, &got), 1);
 	UT_ASSERT_EQ((int)(scn_local(got)), 42);
 }
-UT_TEST(test_lookup_wrong_wrap_miss)
+UT_TEST(test_lookup_wrong_xid_miss)
 {
 	SCN got = InvalidScn;
 
 	g_read_hdr_ok = true;
 	memset(&g_canned_slot, 0, sizeof(g_canned_slot));
 	g_canned_slot.status = TT_SLOT_COMMITTED;
-	g_canned_slot.xid = 100;
-	g_canned_slot.wrap = 6; /* slot recycled to newer generation */
+	g_canned_slot.xid = 999; /* slot recycled to a new owner xid */
 	g_canned_slot.commit_scn = scn_encode(1, 42);
 
-	UT_ASSERT_EQ((int)cluster_tt_slot_durable_lookup(1, 0, 100, 5, &got), 0);
+	UT_ASSERT_EQ((int)cluster_tt_slot_durable_lookup(1, 0, 100, &got), 0);
 }
 UT_TEST(test_lookup_unused_miss)
 {
@@ -275,14 +266,14 @@ UT_TEST(test_lookup_unused_miss)
 	g_read_hdr_ok = true;
 	memset(&g_canned_slot, 0, sizeof(g_canned_slot)); /* status=UNUSED(0) */
 
-	UT_ASSERT_EQ((int)cluster_tt_slot_durable_lookup(1, 0, 100, 5, &got), 0);
+	UT_ASSERT_EQ((int)cluster_tt_slot_durable_lookup(1, 0, 100, &got), 0);
 }
 UT_TEST(test_lookup_read_fail_miss)
 {
 	SCN got = InvalidScn;
 
 	g_read_hdr_ok = false; /* segment absent / I/O error */
-	UT_ASSERT_EQ((int)cluster_tt_slot_durable_lookup(1, 0, 100, 5, &got), 0);
+	UT_ASSERT_EQ((int)cluster_tt_slot_durable_lookup(1, 0, 100, &got), 0);
 }
 
 
@@ -323,7 +314,7 @@ UT_TEST(test_by_xid_two_match_ambiguous_failclosed)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(18);
+	UT_PLAN(17);
 
 	UT_RUN(test_layout_sizes);
 
@@ -334,13 +325,12 @@ main(int argc, char **argv)
 	UT_RUN(test_redo_decide_bad_status);
 
 	UT_RUN(test_slot_match_exact);
-	UT_RUN(test_slot_match_wrong_wrap);
 	UT_RUN(test_slot_match_wrong_xid);
 	UT_RUN(test_slot_match_unused);
 	UT_RUN(test_slot_match_invalid_scn);
 
 	UT_RUN(test_lookup_match);
-	UT_RUN(test_lookup_wrong_wrap_miss);
+	UT_RUN(test_lookup_wrong_xid_miss);
 	UT_RUN(test_lookup_unused_miss);
 	UT_RUN(test_lookup_read_fail_miss);
 
