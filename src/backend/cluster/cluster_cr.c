@@ -422,9 +422,9 @@ cr_walk_chain(char *scratch_page, UBA start_uba, SCN read_scn, uint32 *steps, ui
  * For every still-NORMAL tuple whose xmin is NOT one of the live candidate
  * xids, resolve xmin's commit_scn from the durable TT by xid (spec-3.11 D2):
  *
- *   - committed (CLOG-confirmed -- C1b) + commit_scn  > read_scn: the evicted
- *     post-read_scn creator -> prune (LP_UNUSED).
- *   - committed                        + commit_scn <= read_scn: a legitimate
+ *   - committed (CLOG-confirmed -- C1b) and commit_scn is later than read_scn:
+ *     the evicted post-read_scn creator -> prune (LP_UNUSED).
+ *   - committed and commit_scn is not later than read_scn: a legitimate
  *     pre-read_scn version -> keep.
  *   - not committed per CLOG (aborted / still in flight at this read): the
  *     creator's row was not visible at read_scn -> prune.
