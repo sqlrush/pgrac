@@ -43,12 +43,11 @@
  * and exercised directly by cluster_unit (file I/O behavior is e2e in t/219).
  */
 
-/* Redo wrap-comparison decision (spec-3.11 §2.3 table). */
+/* Redo decision (spec-3.11 §2.3): last-writer-wins by wrap generation. */
 typedef enum ClusterTTRedoDecision {
-	CLUSTER_TT_REDO_APPLY,	  /* rec.wrap > slot.wrap, or == with same xid (idempotent) */
-	CLUSTER_TT_REDO_SKIP,	  /* rec.wrap < slot.wrap (stale; newer commit durable) */
-	CLUSTER_TT_REDO_CORRUPT,  /* rec.wrap == slot.wrap, different xid (8.A; PANIC) */
-	CLUSTER_TT_REDO_BADSTATUS /* slot.status out of [0,4] (corruption; PANIC) */
+	CLUSTER_TT_REDO_APPLY,	  /* rec.wrap >= slot.wrap: fresh / reuse / recycle / idempotent */
+	CLUSTER_TT_REDO_SKIP,	  /* rec.wrap < slot.wrap (stale; a newer commit is already durable) */
+	CLUSTER_TT_REDO_BADSTATUS /* on-disk slot.status out of [0,4] (garbage; PANIC) */
 } ClusterTTRedoDecision;
 
 /*

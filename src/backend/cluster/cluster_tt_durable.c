@@ -73,17 +73,29 @@ ClusterTTRedoDecision
 cluster_tt_durable_redo_decide(uint8 slot_status, TransactionId slot_xid, uint16 slot_wrap,
 							   TransactionId rec_xid, uint16 rec_wrap)
 {
-	/* spec-3.11 §2.3 wrap-comparison table. */
+	/*
+	 * spec-3.11 §2.3 redo: XLOG_UNDO_TT_SLOT_COMMIT records are authoritative and
+	 * replay in LSN order, so the last commit per (segment, slot) wins.  APPLY
+	 * unless the on-disk slot already shows a strictly newer generation
+	 * (slot_wrap > rec_wrap) -- a later commit already made durable -- in which
+	 * case SKIP so an older record does not regress it.
+	 *
+	 * A zero-init (UNUSED) slot or a FREE-path slot reuse keeps wrap unchanged
+	 * while the xid differs: BIND is not WAL'd, so the on-disk slot lags the
+	 * record, and the allocator only bumps wrap on recycle (COMMITTED/ABORTED ->
+	 * ACTIVE), NOT on FREE -> ACTIVE reuse (cluster_tt_slot.c).  Hence "same
+	 * wrap, different xid" is the normal first-write / sequential-reuse case
+	 * during redo, NOT corruption -- it must APPLY.  规则 8.A: a crash after a
+	 * committed slot reuse must replay cleanly, never PANIC.  slot_xid therefore
+	 * does not affect the decision; xid identity is enforced at lookup time (C5),
+	 * and WAL CRC -- not this predicate -- guards record authenticity.
+	 */
+	(void)slot_xid;
 	if (slot_status > (uint8)TT_SLOT_RECYCLABLE)
-		return CLUSTER_TT_REDO_BADSTATUS; /* status out of [0,4] = corruption */
-	if (rec_wrap > slot_wrap)
-		return CLUSTER_TT_REDO_APPLY; /* recycle-then-commit (normal) / fresh slot */
-	if (rec_wrap == slot_wrap) {
-		if (slot_xid == rec_xid)
-			return CLUSTER_TT_REDO_APPLY; /* idempotent same-owner */
-		return CLUSTER_TT_REDO_CORRUPT;	  /* same generation, different owner (8.A) */
-	}
-	return CLUSTER_TT_REDO_SKIP; /* rec_wrap < slot_wrap: stale; newer commit durable */
+		return CLUSTER_TT_REDO_BADSTATUS; /* on-disk status byte out of [0,4] = garbage */
+	if (rec_wrap >= slot_wrap)
+		return CLUSTER_TT_REDO_APPLY; /* fresh / reuse / recycle / idempotent */
+	return CLUSTER_TT_REDO_SKIP;	  /* rec_wrap < slot_wrap: stale; newer commit durable */
 }
 
 bool

@@ -379,15 +379,6 @@ cluster_undo_redo_tt_slot_commit(XLogReaderState *record)
 						errmsg("undo segment \"%s\" TT slot %u has invalid status %u during redo",
 							   path, rec->slot_offset, slot->status)));
 		break;
-	case CLUSTER_TT_REDO_CORRUPT:
-		/* same generation, different owner = corruption (规则 8.A; never guess). */
-		close(fd);
-		ereport(PANIC,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("undo segment \"%s\" TT slot %u redo conflict: record xid %u wrap %u "
-						"vs on-disk xid %u wrap %u",
-						path, rec->slot_offset, rec->xid, rec->wrap, slot->xid, slot->wrap)));
-		break;
 	case CLUSTER_TT_REDO_SKIP:
 		/* stale record; a newer commit is already durable -> no write. */
 		break;

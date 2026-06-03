@@ -6,15 +6,25 @@
 #        INITRANS (=8) distinct writers to that block, then drive a CR
 #        construction with a read_scn older than the recycle -> the per-page
 #        itl_recycle_watermark_scn is newer than read_scn -> construct fails
-#        closed with 53R9F "ITL slot reused after snapshot" (never returns a
-#        possibly false-visible CR image).
+#        closed (53R9F; never returns a possibly false-visible CR image).
 #   E7:  restart the node and re-run the same construct -> the watermark
 #        survived WAL redo / checkpoint, so it still fails closed (proves the
 #        guard is not lost across crash recovery; not FPI-dependent in unit
 #        test_cluster_itl_reader_real_triple t32).
 #
+# spec-3.11 note: D6 replaced the blanket watermark fail-closed with a durable
+# TT by-xid resolve.  In this scenario the writers' durable TT slots have been
+# reused (the slot allocator frees + reuses the lowest slot per committed txn
+# without retention -- spec-3.11 §1.3 / spec-3.12), so by-xid misses and the
+# construct STILL fails closed -- now with the spec-3.11 message
+# "durable TT slot for writer xid N is unavailable after ITL slot reuse".
+# The invariant under test (slot-reuse never yields a false-visible image; it
+# fails closed) is unchanged; the regex below accepts either message.  The
+# spec-3.11 GUC-off blanket path + the durable mechanism counters are exercised
+# by t/219.
+#
 # Author: SqlRush <sqlrush@gmail.com>
-# Spec: spec-3.10-cr-block-cache.md (§v0.5)
+# Spec: spec-3.10-cr-block-cache.md (§v0.5); spec-3.11-durable-tt-slot.md (D6)
 
 use strict;
 use warnings;
@@ -55,17 +65,19 @@ for my $i (1 .. 12)
 my ($rc, $out, $err) = $node->psql('postgres',
 	"SELECT cluster_cr_test_construct('t'::regclass, 0, 0, $scn_before)");
 isnt($rc, 0, 'E1: CR construct with pre-reuse read_scn errors');
-like($err, qr/ITL slot reused after snapshot/,
-	'E1: fail-closed message is the §v0.5 slot-reuse guard (53R9F)');
-# (default psql does not print the SQLSTATE; the distinct errmsg above
-#  uniquely identifies the §v0.5 ERRCODE_CLUSTER_CR_SNAPSHOT_TOO_OLD path.)
+like($err,
+	qr/ITL slot reused after snapshot|durable TT slot for writer xid \d+ is unavailable/,
+	'E1: fail-closed on slot reuse (§v0.5 blanket / spec-3.11 D6 by-xid-miss)');
+# (default psql does not print the SQLSTATE; either errmsg above uniquely
+#  identifies the ERRCODE_CLUSTER_CR_SNAPSHOT_TOO_OLD fail-closed path.)
 
 # Negative control: a maximal read_scn is never older than the watermark, so
 # the slot-reuse guard must NOT fire (it may still fail for unrelated reasons,
 # but never with the slot-reuse message).
 my (undef, undef, $err_max) = $node->psql('postgres',
 	"SELECT cluster_cr_test_construct('t'::regclass, 0, 0, 9223372036854775807)");
-unlike($err_max // '', qr/ITL slot reused after snapshot/,
+unlike($err_max // '',
+	qr/ITL slot reused after snapshot|durable TT slot for writer xid \d+ is unavailable/,
 	'control: max read_scn does not trip the slot-reuse guard');
 
 # --- E7: watermark survives restart (WAL redo / checkpoint) -----------------
@@ -74,8 +86,9 @@ $node->restart;
 
 my (undef, undef, $err_after) = $node->psql('postgres',
 	"SELECT cluster_cr_test_construct('t'::regclass, 0, 0, $scn_before)");
-like($err_after, qr/ITL slot reused after snapshot/,
-	'E7: watermark persisted across restart -> still fails closed');
+like($err_after,
+	qr/ITL slot reused after snapshot|durable TT slot for writer xid \d+ is unavailable/,
+	'E7: watermark/durable-miss persisted across restart -> still fails closed');
 
 $node->stop;
 done_testing();

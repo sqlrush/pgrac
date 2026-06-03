@@ -10,7 +10,8 @@
  *	  spec-3.9 / spec-3.10 CR -- undo segment I/O needs a real $PGDATA).
  *
  *	  U1  byte-layout (sizeof TTSlot==32, xl_undo_tt_slot_commit==24)
- *	  U2  cluster_tt_durable_redo_decide -- all 5 outcomes (wrap table §2.3)
+ *	  U2  cluster_tt_durable_redo_decide -- APPLY (newer / same-wrap reuse /
+ *	      unused-slot first write) / SKIP (stale) / BADSTATUS (§2.3 last-writer)
  *	  U3  cluster_tt_durable_slot_match -- exact / wrong-xid / UNUSED /
  *	      invalid-scn (xid-match; recycle stamps a new owner xid)
  *	  U4  cluster_tt_slot_durable_lookup -- match / wrong-xid / unused /
@@ -211,10 +212,21 @@ UT_TEST(test_redo_decide_same_wrap_same_xid_idempotent)
 	UT_ASSERT_EQ((int)cluster_tt_durable_redo_decide(TT_SLOT_COMMITTED, 100, 5, 100, 5),
 				 (int)CLUSTER_TT_REDO_APPLY);
 }
-UT_TEST(test_redo_decide_same_wrap_diff_xid_corrupt)
+UT_TEST(test_redo_decide_same_wrap_diff_xid_applies)
 {
+	/* spec-3.11 §2.3 (P0 fix): FREE-path slot reuse keeps wrap unchanged while
+	 * the xid differs; BIND is not WAL'd so the on-disk slot lags.  "same wrap,
+	 * different xid" during redo is normal reuse -> APPLY (last-writer-wins),
+	 * NOT corruption (规则 8.A: crash recovery of a reused slot must not PANIC). */
 	UT_ASSERT_EQ((int)cluster_tt_durable_redo_decide(TT_SLOT_COMMITTED, 100, 5, 999, 5),
-				 (int)CLUSTER_TT_REDO_CORRUPT);
+				 (int)CLUSTER_TT_REDO_APPLY);
+}
+UT_TEST(test_redo_decide_unused_slot_applies)
+{
+	/* zero-init (UNUSED, xid 0, wrap 0) slot + first commit record (wrap 0) ->
+	 * APPLY (the crash-recovery PANIC this fix repaired: t/219 L2/L7). */
+	UT_ASSERT_EQ((int)cluster_tt_durable_redo_decide(TT_SLOT_UNUSED, 0, 0, 768, 0),
+				 (int)CLUSTER_TT_REDO_APPLY);
 }
 UT_TEST(test_redo_decide_older_wrap_skips)
 {
@@ -338,13 +350,14 @@ UT_TEST(test_by_xid_two_match_ambiguous_failclosed)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(17);
+	UT_PLAN(18);
 
 	UT_RUN(test_layout_sizes);
 
 	UT_RUN(test_redo_decide_newer_wrap_applies);
 	UT_RUN(test_redo_decide_same_wrap_same_xid_idempotent);
-	UT_RUN(test_redo_decide_same_wrap_diff_xid_corrupt);
+	UT_RUN(test_redo_decide_same_wrap_diff_xid_applies);
+	UT_RUN(test_redo_decide_unused_slot_applies);
 	UT_RUN(test_redo_decide_older_wrap_skips);
 	UT_RUN(test_redo_decide_bad_status);
 
