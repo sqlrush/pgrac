@@ -43,8 +43,9 @@
 #include "access/xloginsert.h"
 #include "access/xlogreader.h"
 #include "access/xlogutils.h"
-#include "cluster/cluster_tt_durable.h"	  /* spec-3.11: redo decision predicate */
-#include "cluster/cluster_undo_segment.h" /* UNDO_SEGMENT_SIZE_BYTES */
+#include "cluster/cluster_tt_durable.h"			/* spec-3.11: redo decision predicate */
+#include "cluster/cluster_undo_segment.h"		/* UNDO_SEGMENT_SIZE_BYTES */
+#include "cluster/storage/cluster_undo_alloc.h" /* header identity check (3.13 reuse redo) */
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "miscadmin.h"
 #include "storage/bufpage.h"
@@ -214,6 +215,40 @@ cluster_undo_emit_segment_recycle(uint8 instance, uint32 segment_id, uint32 expe
 	XLogRegisterData((char *)&rec, sizeof(rec));
 
 	lsn = XLogInsert(RM_CLUSTER_UNDO_ID, XLOG_UNDO_SEGMENT_RECYCLE);
+
+	return lsn;
+}
+
+
+/*
+ * cluster_undo_emit_segment_reuse -- spec-3.13 D4.
+ *
+ *   Registers the 16B record header plus the full BLCKSZ fresh block-0
+ *   image.  Same v0.3 (1) caller contract as recycle: XLogFlush(lsn)
+ *   -> pwrite block 0 -> fsync segment file.
+ */
+XLogRecPtr
+cluster_undo_emit_segment_reuse(uint8 instance, uint32 segment_id, uint32 old_generation,
+								uint32 new_generation, const char *fresh_header_image)
+{
+	xl_undo_segment_reuse rec;
+	XLogRecPtr lsn;
+
+	Assert(instance >= 1);
+	Assert(new_generation == old_generation + 1);
+	Assert(fresh_header_image != NULL);
+
+	memset(&rec, 0, sizeof(rec));
+	rec.segment_id = segment_id;
+	rec.old_generation = old_generation;
+	rec.new_generation = new_generation;
+	rec.instance = instance;
+
+	XLogBeginInsert();
+	XLogRegisterData((char *)&rec, sizeof(rec));
+	XLogRegisterData(unconstify(char *, fresh_header_image), BLCKSZ);
+
+	lsn = XLogInsert(RM_CLUSTER_UNDO_ID, XLOG_UNDO_SEGMENT_REUSE);
 
 	return lsn;
 }
@@ -563,6 +598,104 @@ cluster_undo_redo_segment_recycle(XLogReaderState *record)
 
 
 /*
+ * Replay XLOG_UNDO_SEGMENT_REUSE (spec-3.13 D4).
+ *
+ *   Idempotent whole-block-0 rebirth.  Mirrors the SEGMENT_INIT redo
+ *   file-lifecycle ownership (mkdir parent / O_CREAT / ftruncate) so a
+ *   standby or post-checkpoint crash replay works even when the file
+ *   vanished.  Generation decision via the header-inline pure table.
+ */
+static void
+cluster_undo_redo_segment_reuse(XLogReaderState *record)
+{
+	xl_undo_segment_reuse *rec;
+	const char *image;
+	char path[MAXPGPATH];
+	int fd;
+	PGAlignedBlock blockbuf;
+	bool header_valid = false;
+	uint32 disk_generation = 0;
+	ssize_t nread;
+
+	if (XLogRecGetDataLen(record) != sizeof(*rec) + BLCKSZ)
+		ereport(PANIC, (errmsg("invalid XLOG_UNDO_SEGMENT_REUSE record length: %u",
+							   XLogRecGetDataLen(record))));
+	rec = (xl_undo_segment_reuse *)XLogRecGetData(record);
+	image = XLogRecGetData(record) + sizeof(*rec);
+
+	if (build_undo_segment_path(rec->instance, rec->segment_id, path, sizeof(path)) != 0)
+		ereport(PANIC, (errmsg("undo segment path too long: instance=%u seg=%u", rec->instance,
+							   rec->segment_id)));
+
+	ensure_undo_instance_subdir(rec->instance);
+
+	fd = BasicOpenFile(path, O_RDWR | O_CREAT | PG_BINARY);
+	if (fd < 0)
+		ereport(PANIC,
+				(errcode_for_file_access(),
+				 errmsg("could not open undo segment file \"%s\" for reuse redo: %m", path)));
+
+	if (ftruncate(fd, (off_t)UNDO_SEGMENT_SIZE_BYTES) != 0) {
+		int save_errno = errno;
+
+		close(fd);
+		errno = save_errno;
+		ereport(PANIC, (errcode_for_file_access(),
+						errmsg("could not extend undo segment file \"%s\": %m", path)));
+	}
+
+	nread = pg_pread(fd, blockbuf.data, BLCKSZ, 0);
+	if (nread == BLCKSZ
+		&& cluster_undo_segment_header_identity_ok(blockbuf.data, rec->segment_id, rec->instance)) {
+		header_valid = true;
+		disk_generation = ((UndoSegmentHeaderData *)blockbuf.data)->wrap_count;
+	}
+
+	switch (cluster_undo_segment_reuse_redo_decide(header_valid, disk_generation, rec)) {
+	case CLUSTER_SEGREUSE_REDO_SKIP_STALE:
+		break;
+	case CLUSTER_SEGREUSE_REDO_BAD_GENERATION:
+		close(fd);
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("undo segment \"%s\" generation %u behind reuse record (%u -> %u) "
+							   "during redo",
+							   path, disk_generation, rec->old_generation, rec->new_generation)));
+		break;
+	case CLUSTER_SEGREUSE_REDO_APPLY: {
+		ssize_t written;
+
+		written = pg_pwrite(fd, image, BLCKSZ, 0);
+		if (written != BLCKSZ) {
+			int save_errno = errno;
+
+			close(fd);
+			errno = save_errno;
+			ereport(PANIC,
+					(errcode_for_file_access(),
+					 errmsg("could not write undo segment \"%s\" reuse image: wrote %zd of %d "
+							"bytes",
+							path, written, BLCKSZ)));
+		}
+		if (pg_fsync(fd) != 0) {
+			int save_errno = errno;
+
+			close(fd);
+			errno = save_errno;
+			ereport(PANIC,
+					(errcode_for_file_access(),
+					 errmsg("could not fsync undo segment \"%s\" after reuse redo: %m", path)));
+		}
+		break;
+	}
+	}
+
+	if (close(fd) != 0)
+		ereport(PANIC, (errcode_for_file_access(),
+						errmsg("could not close undo segment file \"%s\": %m", path)));
+}
+
+
+/*
  * cluster_undo_redo -- RM_CLUSTER_UNDO redo handler entry point.
  *
  *   Dispatches by xl_info & XLR_INFO_MASK after stripping the framework
@@ -582,6 +715,9 @@ cluster_undo_redo(XLogReaderState *record)
 		break;
 	case XLOG_UNDO_SEGMENT_RECYCLE:
 		cluster_undo_redo_segment_recycle(record);
+		break;
+	case XLOG_UNDO_SEGMENT_REUSE:
+		cluster_undo_redo_segment_reuse(record);
 		break;
 	default:
 		ereport(PANIC, (errmsg("cluster_undo_redo: unknown op code %u", info)));

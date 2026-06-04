@@ -192,5 +192,16 @@ typedef enum ClusterUndoSegTryRecycle {
 extern ClusterUndoSegTryRecycle
 cluster_undo_segment_try_mark_recyclable(uint32 segment_id, uint8 owner_instance, SCN horizon);
 
+/* spec-3.13 D4: in-place rebirth of a RECYCLABLE segment (caller holds lifecycle_lock). */
+extern uint32 cluster_undo_segment_reuse_in_place(uint32 segment_id, uint8 owner_instance,
+												  uint32 old_generation);
+
+/* spec-3.13 D4: durable segment generation (== header wrap_count; 0 = unknown). */
+extern uint32 cluster_undo_segment_generation(uint32 segment_id, uint8 owner_instance);
+
+/* spec-3.13: identity check exported for redo + reuse peek (L212 surface). */
+extern bool cluster_undo_segment_header_identity_ok(const char *blockbuf, uint32 segment_id,
+													uint8 owner_instance);
+
 
 #endif /* CLUSTER_UNDO_ALLOC_H */

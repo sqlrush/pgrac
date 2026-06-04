@@ -64,6 +64,14 @@ cluster_undo_desc(StringInfo buf, XLogReaderState *record)
 						 xlrec->new_state);
 		break;
 	}
+	case XLOG_UNDO_SEGMENT_REUSE: {
+		xl_undo_segment_reuse *xlrec = (xl_undo_segment_reuse *)rec;
+
+		appendStringInfo(buf, "instance %u seg %u gen %u->%u (fresh header image)",
+						 xlrec->instance, xlrec->segment_id, xlrec->old_generation,
+						 xlrec->new_generation);
+		break;
+	}
 	}
 	default:
 		appendStringInfo(buf, "unknown op %u", info);
@@ -82,6 +90,8 @@ cluster_undo_identify(uint8 info)
 		return "UNDO_TT_SLOT_COMMIT";
 	case XLOG_UNDO_SEGMENT_RECYCLE:
 		return "UNDO_SEGMENT_RECYCLE";
+	case XLOG_UNDO_SEGMENT_REUSE:
+		return "UNDO_SEGMENT_REUSE";
 	default:
 		return NULL;
 	}

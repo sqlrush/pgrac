@@ -70,7 +70,8 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_shmem.h"
-#include "cluster/cluster_tt_slot.h" /* spec-3.12 D2b: TT allocator rollover */
+#include "cluster/cluster_tt_slot.h"	  /* spec-3.12 D2b: TT allocator rollover */
+#include "cluster/cluster_undo_cleaner.h" /* Q8 pressure wakeup (3.13) */
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_undo_format.h"
 #include "cluster/cluster_undo_record.h"
@@ -120,6 +121,10 @@ typedef struct ClusterUndoRecordShared {
 	pg_atomic_uint64 segment_switch_count;		/* active_segment_id 切换 */
 	pg_atomic_uint64 segment_create_fail_count; /* FS error / timeout */
 	pg_atomic_uint64 segment_hard_cap_fail_count; /* 53R9E hard cap */
+
+	/* spec-3.13 D4: RECYCLABLE segments reborn in place by the allocator
+	 * (reuse-first extend path).  dump_undo row lands at step 8. */
+	pg_atomic_uint64 segment_reuse_count;
 
 	/* spec-3.12 D2b: TT-slot retention-pressure segment rollovers (a long
 	 * reader's retained COMMITTED slots filled the active segment, so the
@@ -333,6 +338,7 @@ cluster_undo_record_shmem_init(void)
 		pg_atomic_init_u64(&UndoRecordShared->segment_switch_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->segment_create_fail_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->segment_hard_cap_fail_count, 0);
+		pg_atomic_init_u64(&UndoRecordShared->segment_reuse_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->tt_retention_rollover_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->segment_retain_skip_count, 0);
 
@@ -615,6 +621,8 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 					pg_atomic_fetch_add_u64(&UndoRecordShared->segment_create_fail_count, 1);
 				LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
 
+				/* Q8: at the hard cap every recyclable segment counts. */
+				cluster_undo_cleaner_wakeup();
 				if (at_hard_cap)
 					ereport(ERROR,
 							(errcode(ERRCODE_CLUSTER_UNDO_SEGMENTS_HARD_CAP_REACHED),
@@ -1048,6 +1056,10 @@ cluster_undo_tt_rollover_locked(int node_id, uint32 old_segment_id, bool *out_at
 	}
 
 	pg_atomic_fetch_add_u64(&UndoRecordShared->tt_retention_rollover_count, 1);
+
+	/* Q8: a retention-pressure rollover is exactly when RECYCLABLE supply
+	 * matters -- nudge the cleaner instead of waiting out its interval. */
+	cluster_undo_cleaner_wakeup();
 	/*
 	 * spec-3.12 D5: the rolled-away segment's committed slots all have
 	 * commit_scn at or newer than the horizon (that retention is exactly why
@@ -1274,4 +1286,21 @@ cluster_undo_segment_advance_recyclable(uint32 segment_id, SCN horizon)
 	LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
 
 	return result;
+}
+
+
+/* spec-3.13 D4: allocator-side reuse counter hook (alloc.c has no shmem view). */
+void
+cluster_undo_record_note_segment_reuse(void)
+{
+	if (UndoRecordShared != NULL)
+		pg_atomic_fetch_add_u64(&UndoRecordShared->segment_reuse_count, 1);
+}
+
+uint64
+cluster_undo_segment_reuse_count(void)
+{
+	if (UndoRecordShared == NULL)
+		return 0;
+	return pg_atomic_read_u64(&UndoRecordShared->segment_reuse_count);
 }

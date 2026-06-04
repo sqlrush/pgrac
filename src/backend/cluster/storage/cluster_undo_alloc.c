@@ -41,9 +41,11 @@
 #include "cluster/cluster_scn.h" /* SCN_MAX_VALID_NODE_ID */
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/cluster_undo_segment_init.h"
+#include "cluster/cluster_undo_record_api.h" /* reuse counter note (3.13) */
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/storage/cluster_undo_xlog.h" /* emit_segment_recycle (3.13 D3) */
 #include "cluster/cluster_undo_retention.h"	   /* segment recyclable predicate */
+#include "cluster/cluster_undo_segment_init.h" /* fresh header builder (D4 reuse) */
 #include "access/xlog.h"					   /* XLogFlush (3.13 v0.3 (1)) */
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "cluster/storage/cluster_undo_xlog.h"
@@ -163,8 +165,9 @@ ensure_instance_subdir(uint8 owner_instance)
  * means "the header identity is valid", not "the whole block still equals the
  * freshly allocated zero template".
  */
-static bool
-segment_header_identity_matches(const char *blockbuf, uint32 segment_id, uint8 owner_instance)
+bool
+cluster_undo_segment_header_identity_ok(const char *blockbuf, uint32 segment_id,
+										uint8 owner_instance)
 {
 	PageHeader ph = (PageHeader)blockbuf;
 	const UndoSegmentHeaderData *hdr = (const UndoSegmentHeaderData *)blockbuf;
@@ -314,7 +317,8 @@ cluster_undo_segment_allocate(uint32 segment_id, uint8 owner_instance)
 			}
 
 			if (readbytes == BLCKSZ
-				&& segment_header_identity_matches(existing.data, segment_id, owner_instance)) {
+				&& cluster_undo_segment_header_identity_ok(existing.data, segment_id,
+														   owner_instance)) {
 				if (close(fd) != 0)
 					ereport(ERROR, (errcode_for_file_access(),
 									errmsg("could not close undo segment file \"%s\": %m", path)));
@@ -568,7 +572,7 @@ cluster_undo_segment_try_mark_recyclable(uint32 segment_id, uint8 owner_instance
 
 	if (!read_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data, &hdr))
 		return CLUSTER_SEG_RECYCLE_READ_FAIL;
-	if (!segment_header_identity_matches(blockbuf.data, segment_id, owner_instance))
+	if (!cluster_undo_segment_header_identity_ok(blockbuf.data, segment_id, owner_instance))
 		return CLUSTER_SEG_RECYCLE_READ_FAIL; /* L212: identity, not template bytes */
 
 	if (hdr->segment_state == SEGMENT_RECYCLABLE)
@@ -590,6 +594,65 @@ cluster_undo_segment_try_mark_recyclable(uint32 segment_id, uint8 owner_instance
 		return CLUSTER_SEG_RECYCLE_WRITE_FAIL;
 
 	return CLUSTER_SEG_RECYCLE_ADVANCED;
+}
+
+
+/*
+ * cluster_undo_segment_reuse_in_place -- spec-3.13 D4.
+ *
+ *	Whole-segment rebirth of a RECYCLABLE segment: fresh block-0 image
+ *	(SEGMENT_ALLOCATED, TT slots zeroed) at generation old+1, durable per
+ *	the v0.3 (1) three-step contract (0x50 WAL + XLogFlush -> pwrite ->
+ *	fsync).  Data blocks are NOT zeroed (lazy overwrite; C-R3/C-R4: no
+ *	live reader can legally dereference into a recyclable segment, and
+ *	block headers carry first_change_scn for generation telling).
+ *	Caller holds lifecycle_lock (extend/rollover path).  Returns the
+ *	segment_id, or 0 on I/O failure (caller falls back to fresh create).
+ */
+uint32
+cluster_undo_segment_reuse_in_place(uint32 segment_id, uint8 owner_instance, uint32 old_generation)
+{
+	PGAlignedBlock page;
+	UndoSegmentHeaderData *hdr;
+	XLogRecPtr lsn;
+
+	cluster_undo_segment_make_header_bytes(segment_id, owner_instance, page.data);
+	hdr = (UndoSegmentHeaderData *)page.data;
+	hdr->wrap_count = old_generation + 1;
+
+	lsn = cluster_undo_emit_segment_reuse(owner_instance, segment_id, old_generation,
+										  old_generation + 1, page.data);
+	XLogFlush(lsn);
+
+	if (!write_segment_header_via_smgr(segment_id, owner_instance, page.data))
+		return 0;
+	if (!cluster_undo_smgr_fsync_segment_file(segment_id, owner_instance))
+		return 0;
+
+	cluster_undo_record_note_segment_reuse();
+
+	return segment_id;
+}
+
+
+/*
+ * cluster_undo_segment_generation -- spec-3.13 D4 accessor (3.18 D1 undo
+ * buffer keying contract: cache keys must be (segment, generation)).
+ *
+ *	Returns the on-disk wrap_count, or 0 when the header is unreadable /
+ *	fails identity (callers treat 0 as \"generation zero or unknown\").
+ */
+uint32
+cluster_undo_segment_generation(uint32 segment_id, uint8 owner_instance)
+{
+	PGAlignedBlock blockbuf;
+	UndoSegmentHeaderData *hdr;
+
+	if (!read_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data, &hdr))
+		return 0;
+	if (!cluster_undo_segment_header_identity_ok(blockbuf.data, segment_id, owner_instance))
+		return 0;
+	return hdr->wrap_count;
 }
 
 
@@ -789,8 +852,30 @@ cluster_undo_segment_extend_or_create(uint8 owner_instance, bool *out_at_hard_ca
 
 		fd = BasicOpenFile(path, O_RDONLY | PG_BINARY);
 		if (fd >= 0) {
-			/* File exists — slot is taken. */
+			/*
+			 * spec-3.13 D4 reuse-first: an existing segment whose header says
+			 * SEGMENT_RECYCLABLE is reborn in place (generation+1) instead of
+			 * consuming a fresh slot.  Identity-checked read (L212); any
+			 * doubt falls through to \"slot is taken\" (fail-closed: never
+			 * overwrite a segment we cannot positively classify).
+			 */
+			PGAlignedBlock peek;
+			ssize_t rb = pg_pread(fd, peek.data, BLCKSZ, 0);
+
 			close(fd);
+			if (rb == BLCKSZ
+				&& cluster_undo_segment_header_identity_ok(peek.data, new_segment_id,
+														   owner_instance)
+				&& ((UndoSegmentHeaderData *)peek.data)->segment_state == SEGMENT_RECYCLABLE) {
+				uint32 reused = cluster_undo_segment_reuse_in_place(
+					new_segment_id, owner_instance,
+					((UndoSegmentHeaderData *)peek.data)->wrap_count);
+
+				if (reused != 0)
+					return reused;
+				/* reuse failed (I/O): fall through as taken; retry next time */
+			}
+			/* File exists — slot is taken. */
 			continue;
 		}
 

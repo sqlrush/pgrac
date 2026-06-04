@@ -54,6 +54,7 @@
 #define XLOG_UNDO_SEGMENT_INIT 0x10
 #define XLOG_UNDO_TT_SLOT_COMMIT 0x30  /* spec-3.11 D3: durable TT slot commit_scn */
 #define XLOG_UNDO_SEGMENT_RECYCLE 0x40 /* spec-3.13 D3: COMMITTED -> RECYCLABLE */
+#define XLOG_UNDO_SEGMENT_REUSE 0x50   /* spec-3.13 D4: whole-segment rebirth */
 
 
 /*
@@ -180,6 +181,50 @@ cluster_undo_segment_recycle_redo_decide(uint32 disk_generation, uint8 disk_stat
 	return CLUSTER_SEGRECYCLE_REDO_BAD_STATE;
 }
 
+
+/*
+ * On-disk WAL payload header for XLOG_UNDO_SEGMENT_REUSE (spec-3.13 D4).
+ *
+ *   Followed in the WAL record by the full BLCKSZ fresh block-0 image
+ *   (state SEGMENT_ALLOCATED, TT slots zeroed, wrap_count ==
+ *   new_generation).  Redo writes the image when the on-disk generation
+ *   is not newer:
+ *     disk gen >  new_generation -> stale skip (later reuse durable);
+ *     disk gen <  old_generation -> PANIC (earlier REUSE replays must
+ *                                   have aligned; lost-write corruption);
+ *     otherwise (== old / == new / unreadable-fresh) -> APPLY image
+ *     (idempotent; also repairs torn block-0 writes).
+ */
+typedef struct xl_undo_segment_reuse {
+	uint32 segment_id;
+	uint32 old_generation; /* generation being retired */
+	uint32 new_generation; /* == old_generation + 1 */
+	uint8 instance;
+	uint8 _pad[3];
+} xl_undo_segment_reuse;
+
+StaticAssertDecl(sizeof(xl_undo_segment_reuse) == 16,
+				 "spec-3.13: xl_undo_segment_reuse is 16 bytes, no implicit padding");
+
+typedef enum ClusterUndoSegReuseRedo {
+	CLUSTER_SEGREUSE_REDO_APPLY = 0,
+	CLUSTER_SEGREUSE_REDO_SKIP_STALE = 1,
+	CLUSTER_SEGREUSE_REDO_BAD_GENERATION = 2
+} ClusterUndoSegReuseRedo;
+
+static inline ClusterUndoSegReuseRedo
+cluster_undo_segment_reuse_redo_decide(bool disk_header_valid, uint32 disk_generation,
+									   const xl_undo_segment_reuse *rec)
+{
+	if (!disk_header_valid)
+		return CLUSTER_SEGREUSE_REDO_APPLY; /* fresh / torn block 0: image repairs */
+	if (disk_generation > rec->new_generation)
+		return CLUSTER_SEGREUSE_REDO_SKIP_STALE;
+	if (disk_generation < rec->old_generation)
+		return CLUSTER_SEGREUSE_REDO_BAD_GENERATION;
+	return CLUSTER_SEGREUSE_REDO_APPLY;
+}
+
 StaticAssertDecl(sizeof(xl_undo_tt_slot_commit) == 24,
 				 "xl_undo_tt_slot_commit must be exactly 24 bytes (WAL ABI lock; "
 				 "spec-3.11 §2.3 + L45/L48)");
@@ -218,6 +263,11 @@ extern XLogRecPtr cluster_undo_emit_tt_slot_commit(uint8 instance, uint32 segmen
 extern XLogRecPtr cluster_undo_emit_segment_recycle(uint8 instance, uint32 segment_id,
 													uint32 expected_generation, uint8 old_state,
 													uint8 new_state);
+
+/* spec-3.13 D4: emit XLOG_UNDO_SEGMENT_REUSE (rec header + BLCKSZ fresh image). */
+extern XLogRecPtr cluster_undo_emit_segment_reuse(uint8 instance, uint32 segment_id,
+												  uint32 old_generation, uint32 new_generation,
+												  const char *fresh_header_image);
 
 /*
  * cluster_undo_redo

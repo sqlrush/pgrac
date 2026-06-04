@@ -102,6 +102,56 @@ UT_TEST(test_r5_same_gen_alien_state_is_corruption)
 }
 
 
+/* ---- XLOG_UNDO_SEGMENT_REUSE (0x50) redo table (D4) ---- */
+
+static xl_undo_segment_reuse
+make_reuse(uint32 old_gen)
+{
+	xl_undo_segment_reuse rec;
+
+	memset(&rec, 0, sizeof(rec));
+	rec.segment_id = 1;
+	rec.old_generation = old_gen;
+	rec.new_generation = old_gen + 1;
+	rec.instance = 1;
+	return rec;
+}
+
+UT_TEST(test_r6_reuse_fresh_or_torn_header_applies)
+{
+	xl_undo_segment_reuse rec = make_reuse(4);
+
+	UT_ASSERT_EQ((int)cluster_undo_segment_reuse_redo_decide(false, 0, &rec),
+				 (int)CLUSTER_SEGREUSE_REDO_APPLY);
+}
+
+UT_TEST(test_r7_reuse_old_or_new_generation_applies_idempotent)
+{
+	xl_undo_segment_reuse rec = make_reuse(4);
+
+	UT_ASSERT_EQ((int)cluster_undo_segment_reuse_redo_decide(true, 4, &rec),
+				 (int)CLUSTER_SEGREUSE_REDO_APPLY);
+	UT_ASSERT_EQ((int)cluster_undo_segment_reuse_redo_decide(true, 5, &rec),
+				 (int)CLUSTER_SEGREUSE_REDO_APPLY);
+}
+
+UT_TEST(test_r8_reuse_disk_newer_skips_stale)
+{
+	xl_undo_segment_reuse rec = make_reuse(4);
+
+	UT_ASSERT_EQ((int)cluster_undo_segment_reuse_redo_decide(true, 6, &rec),
+				 (int)CLUSTER_SEGREUSE_REDO_SKIP_STALE);
+}
+
+UT_TEST(test_r9_reuse_disk_older_than_old_gen_is_corruption)
+{
+	xl_undo_segment_reuse rec = make_reuse(4);
+
+	UT_ASSERT_EQ((int)cluster_undo_segment_reuse_redo_decide(true, 3, &rec),
+				 (int)CLUSTER_SEGREUSE_REDO_BAD_GENERATION);
+}
+
+
 int
 main(void)
 {
@@ -110,6 +160,10 @@ main(void)
 	UT_RUN(test_r3_disk_gen_higher_skips_stale);
 	UT_RUN(test_r4_disk_gen_lower_is_corruption);
 	UT_RUN(test_r5_same_gen_alien_state_is_corruption);
+	UT_RUN(test_r6_reuse_fresh_or_torn_header_applies);
+	UT_RUN(test_r7_reuse_old_or_new_generation_applies_idempotent);
+	UT_RUN(test_r8_reuse_disk_newer_skips_stale);
+	UT_RUN(test_r9_reuse_disk_older_than_old_gen_is_corruption);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

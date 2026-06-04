@@ -198,6 +198,9 @@ extern void cluster_undo_record_note_smgr_open(void);
 extern void cluster_undo_record_note_smgr_close(void);
 extern void cluster_undo_record_note_smgr_pread(void);
 extern void cluster_undo_record_note_smgr_pwrite(void);
+/* spec-3.13 D4 */
+extern void cluster_undo_record_note_segment_reuse(void);
+extern uint64 cluster_undo_segment_reuse_count(void);
 extern uint64 cluster_undo_smgr_open_count(void);
 extern uint64 cluster_undo_smgr_close_count(void);
 extern uint64 cluster_undo_smgr_pread_count(void);
