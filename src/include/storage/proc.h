@@ -455,12 +455,15 @@ extern PGDLLIMPORT PGPROC *PreparedXactProcs;
  * Broadcaster, Recovery Coordinator, etc. — bump again then.
  *
  * I11 invariant (spec-2.18 / spec-2.19): NUM_AUXILIARY_PROCS MUST be ≥
- * AuxProcType_Last + PG aux process count; StaticAssertDecl in the cluster
- * shmem init path guards against "本地编译过 cluster init / TAP baseline 才爆"
+ * AuxProcType_Last + PG aux process count.  The guard is a REAL
+ * StaticAssertDecl(NUM_AUXILIARY_PROCS >= NUM_AUXPROCTYPES) in
+ * auxprocess.c (spec-3.13 β: the spec-2.18 comment promised it but never
+ * landed it — the 3.13 UndoCleaner append overflowed the aux PGPROC /
+ * backend-status arrays and segfaulted pgstat_bestart at runtime).
  * (L18 startup-time validation family).
  */
 #ifdef USE_PGRAC_CLUSTER
-#define NUM_AUXILIARY_PROCS 15 /* spec-2.38 D4: +SinvalBcastProcess (was 14) */
+#define NUM_AUXILIARY_PROCS 16 /* spec-3.13 D1: +UndoCleanerProcess (was 15 spec-2.38) */
 #else
 #define NUM_AUXILIARY_PROCS 5
 #endif

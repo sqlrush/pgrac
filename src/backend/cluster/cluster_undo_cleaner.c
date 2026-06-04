@@ -384,13 +384,13 @@ undo_cleaner_run_pass(void)
 		{
 			uint8 owner = (uint8)(cluster_node_id + 1);
 			uint32 base = (uint32)cluster_node_id * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
-			uint32 nseg = cluster_undo_segment_scan_max_existing(owner);
+			uint32 max_seg = cluster_undo_segment_scan_max_existing(owner);
 			uint32 active_seg = cluster_undo_record_active_segment_id();
 			uint32 tt_seg = cluster_tt_slot_current_segment(cluster_node_id);
 			int batch = cluster_undo_cleaner_batch_segments;
 			uint32 seg;
 
-			for (seg = base; seg < base + nseg && batch > 0; seg++) {
+			for (seg = base; seg <= max_seg && batch > 0; seg++) {
 				if (seg == active_seg || seg == tt_seg)
 					continue;
 

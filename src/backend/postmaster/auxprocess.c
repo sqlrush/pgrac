@@ -44,7 +44,20 @@
 #include "cluster/cluster_lmd.h"		  /* LmdMain (spec-2.19 Sprint A Step 1) */
 #include "cluster/cluster_sinval_bcast.h" /* SinvalBcastMain (spec-2.38 D4) */
 #include "cluster/cluster_stats.h"		  /* ClusterStatsMain (stage 1.14 Sprint A) */
-#include "cluster/cluster_undo_cleaner.h"  /* UndoCleanerMain (stage 3.13) */
+#include "cluster/cluster_undo_cleaner.h" /* UndoCleanerMain (stage 3.13) */
+
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * PGRAC spec-3.13 (I11 made real): every AuxProcType needs an aux PGPROC
+ * + backend-status slot.  spec-2.18 documented this invariant as a
+ * StaticAssertDecl but never landed it; appending UndoCleanerProcess
+ * without bumping NUM_AUXILIARY_PROCS then overflowed the aux arrays and
+ * crashed pgstat_bestart.  Compile-time now, forever.
+ */
+StaticAssertDecl(NUM_AUXILIARY_PROCS >= NUM_AUXPROCTYPES,
+				 "NUM_AUXILIARY_PROCS (storage/proc.h) must cover every AuxProcType; "
+				 "bump it when appending a cluster aux process");
+#endif
 #endif
 
 

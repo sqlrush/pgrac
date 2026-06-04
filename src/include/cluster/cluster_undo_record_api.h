@@ -209,12 +209,10 @@ extern uint64 cluster_undo_smgr_pwrite_count(void);
 /* spec-3.8 Fix 6: deterministic autoextend trigger test hook. */
 extern bool cluster_undo_test_force_segment_end(void);
 
-
-#endif /* !FRONTEND */
-
-
 /* spec-3.13 D3: cleaner-side segment lifecycle surface. */
 extern uint32 cluster_undo_record_active_segment_id(void);
 extern ClusterUndoSegTryRecycle cluster_undo_segment_advance_recyclable(uint32 segment_id,
 																		SCN horizon);
+
+#endif /* !FRONTEND */
 #endif /* CLUSTER_UNDO_RECORD_API_H */
