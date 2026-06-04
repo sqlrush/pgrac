@@ -1050,8 +1050,9 @@ cluster_undo_tt_rollover_locked(int node_id, uint32 old_segment_id, bool *out_at
 	pg_atomic_fetch_add_u64(&UndoRecordShared->tt_retention_rollover_count, 1);
 	/*
 	 * spec-3.12 D5: the rolled-away segment's committed slots all have
-	 * commit_scn >= horizon (that retention is exactly why the rollover fired),
-	 * so its retention watermark >= horizon -> it was skipped for recycle.
+	 * commit_scn at or newer than the horizon (that retention is exactly why
+	 * the rollover fired), so its retention watermark is not older than the
+	 * horizon -> it was skipped for recycle.
 	 */
 	pg_atomic_fetch_add_u64(&UndoRecordShared->segment_retain_skip_count, 1);
 

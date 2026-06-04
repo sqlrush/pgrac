@@ -7,7 +7,8 @@
  *	  backends' live snapshots (each backend publishes its per-backend min into
  *	  PGPROC->cluster_read_scn_atomic via snapmgr; spec-3.12 D1).  TT slots and
  *	  undo segments whose commit_scn is strictly below the horizon are needed by
- *	  no live reader and may be recycled; commit_scn >= horizon is retained.
+ *	  no live reader and may be recycled; commit_scn at or newer than the
+ *	  horizon is retained.
  *	  This retires the spec-3.11 L4 watermark fail-closed + D5 old-slot
  *	  fail-closed (durable TT slot kept alive while a reader needs it).
  *
@@ -57,10 +58,11 @@ extern SCN cluster_undo_retention_horizon(void);
  *	  Given a TT-slot allocator status (ClusterTTSlotAllocStatus value), its
  *	  commit_scn, and the current horizon, decide whether the slot may be
  *	  recycled.  ABORTED -> always (C7); COMMITTED -> only when
- *	  commit_scn < horizon (strict; a reader at read_scn == commit_scn still
- *	  needs the pre-image).  InvalidScn horizon (cluster disabled) -> the gate
- *	  carries no constraint, so COMMITTED is recyclable.  A COMMITTED slot with
- *	  an unresolved (InvalidScn) commit_scn is retained (rule 8.A fail-closed).
+ *	  commit_scn is strictly older than the horizon (a reader at the same SCN
+ *	  as commit_scn still needs the pre-image).  InvalidScn horizon (cluster
+ *	  disabled) -> the gate carries no constraint, so COMMITTED is recyclable.
+ *	  A COMMITTED slot with an unresolved (InvalidScn) commit_scn is retained
+ *	  (rule 8.A fail-closed).
  *
  *	cluster_undo_segment_recyclable:
  *	  An undo segment may be recycled only when it is SEGMENT_COMMITTED AND its

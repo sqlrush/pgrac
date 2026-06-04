@@ -266,7 +266,7 @@ StaticAssertDecl(sizeof(ClusterUndoTTSlotRef) == 32,
 typedef enum ClusterTTSlotAllocStatus {
 	CTS_FREE = 0,	   /* available for allocation */
 	CTS_ACTIVE = 1,	   /* owned by an in-flight xact */
-	CTS_COMMITTED = 2, /* committed; recyclable once commit_scn < horizon */
+	CTS_COMMITTED = 2, /* committed; recyclable once commit_scn is older than horizon */
 	CTS_ABORTED = 3	   /* aborted; immediately recyclable (spec-3.12 C7) */
 } ClusterTTSlotAllocStatus;
 
@@ -345,7 +345,7 @@ extern uint16 cluster_tt_slot_get_wrap(uint32 segment_id, uint16 slot_offset);
  *	  ACTIVE -> COMMITTED, retaining owner xid + wrap + commit_scn so the
  *	  durable segment-header TT slot is NOT overwritten by a later writer
  *	  while a reader's read_scn still needs the pre-image.  The slot becomes
- *	  recyclable only once commit_scn < the retention horizon (gate in
+ *	  recyclable only once commit_scn is older than the retention horizon (gate in
  *	  cluster_tt_slot_alloc; predicate cluster_tt_slot_recyclable).  Replaces
  *	  the spec-3.4b commit-time cluster_tt_slot_free().
  *

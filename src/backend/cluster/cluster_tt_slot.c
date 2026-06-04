@@ -191,7 +191,8 @@ cluster_tt_slot_get_or_init(uint32 segment_id)
  *	    1) reuse a slot already owned by `top_xid` (idempotent)
  *	    2) take any FREE slot
  *	    3) recycle a *retention-eligible* COMMITTED / ABORTED slot, wrap++
- *	A COMMITTED slot is retention-eligible only when commit_scn < horizon
+ *	A COMMITTED slot is retention-eligible only when commit_scn is older than
+ *	the horizon
  *	(cluster_tt_slot_recyclable); ABORTED is always eligible (C7).  When the
  *	retention GUC is off, the gate is bypassed (spec-3.11 immediate recycle, C6).
  *
@@ -262,7 +263,7 @@ cluster_tt_slot_alloc_ext(uint32 segment_id, TransactionId top_xid, bool *out_re
 				if (reusable_idx < 0)
 					reusable_idx = i;
 			} else {
-				/* COMMITTED & commit_scn >= horizon: retention keeps it alive. */
+				/* COMMITTED and not older than horizon: retention keeps it alive. */
 				retained_pressure = true;
 				retain_skip_seen++; /* C16: per skip event, not de-duped */
 			}

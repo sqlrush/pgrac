@@ -234,10 +234,11 @@ cluster_tt_slot_durable_lookup_by_xid(TransactionId xid, SCN *commit_scn)
 	 * resolves to 0 matches -> fail-closed), and rollover (D2b) keeps a rolled-
 	 * away segment's durable slots intact while never reusing their offsets, so
 	 * recycle can never raise the count to >1.  C4: this lookup is reached only
-	 * for a post-read_scn writer (its ITL was recycled with watermark > read_scn,
-	 * i.e. write_scn > read_scn => commit_scn >= horizon), whose slot retention
-	 * keeps alive -> the match is guaranteed to hit.  spec-3.13 xid index is a
-	 * scan-cost optimization (§6 risk), not a correctness change.
+	 * for a writer newer than read_scn (its ITL was recycled with a watermark
+	 * newer than read_scn, so the writer's commit_scn is at or newer than the
+	 * horizon), whose slot retention keeps alive -> the match is guaranteed to
+	 * hit.  spec-3.13 xid index is a scan-cost optimization (§6 risk), not a
+	 * correctness change.
 	 */
 	cluster_tt_durable_io_wait_start();
 	for (segment_id = seg_lo; segment_id <= seg_hi; segment_id++) {
