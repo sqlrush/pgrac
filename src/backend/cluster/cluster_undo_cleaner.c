@@ -415,6 +415,29 @@ undo_cleaner_run_pass(void)
 	undo_cleaner_state->segments_marked_recyclable += stats.segments_marked_recyclable;
 	undo_cleaner_state->stale_active_skipped += stats.stale_active_skipped;
 	LWLockRelease(&undo_cleaner_state->lwlock);
+
+	/*
+	 * L213 pinned-horizon observability: a pass that found retained
+	 * inventory but made zero recycle progress means a long reader is
+	 * pinning the horizon.  LOG once per pinned episode (re-arms when
+	 * progress resumes); counters above stay per-event.
+	 */
+	{
+		static bool pinned_logged = false;
+		bool pinned = (stats.header_retained_committed > 0 && stats.shmem_tt_slots_gcd == 0
+					   && stats.header_tt_slots_below_horizon == 0
+					   && stats.segments_marked_recyclable == 0);
+
+		if (pinned && !pinned_logged) {
+			pinned_logged = true;
+			ereport(LOG, (errmsg("cluster undo cleaner: retention horizon pinned; no recyclable "
+								 "inventory this pass"),
+						  errhint("A long-running snapshot is holding the horizon. Undo segment "
+								  "pool may grow until it ends (53R9E at the hard cap).")));
+		} else if (!pinned && pinned_logged) {
+			pinned_logged = false;
+		}
+	}
 }
 
 
@@ -512,6 +535,48 @@ UndoCleanerMain(void)
 	 * exit -> ServerLoop respawns us on the next iteration (HC5).
 	 */
 	proc_exit(0);
+}
+
+
+/* ============================================================
+ * D6 counter accessors (single-writer uint64 under the region lock;
+ * read for dump_undo + tests).
+ * ============================================================ */
+
+#define UNDO_CLEANER_COUNTER_ACCESSOR(name)                                                        \
+	uint64 cluster_undo_cleaner_##name(void)                                                       \
+	{                                                                                              \
+		uint64 v;                                                                                  \
+		if (undo_cleaner_state == NULL)                                                            \
+			return 0;                                                                              \
+		LWLockAcquire(&undo_cleaner_state->lwlock, LW_SHARED);                                     \
+		v = undo_cleaner_state->name;                                                              \
+		LWLockRelease(&undo_cleaner_state->lwlock);                                                \
+		return v;                                                                                  \
+	}
+
+UNDO_CLEANER_COUNTER_ACCESSOR(pass_count)
+UNDO_CLEANER_COUNTER_ACCESSOR(shmem_tt_slots_gcd)
+UNDO_CLEANER_COUNTER_ACCESSOR(segments_marked_recyclable)
+UNDO_CLEANER_COUNTER_ACCESSOR(stale_active_skipped)
+
+
+/* ============================================================
+ * D6 segment-scan wait event wrappers (mirrors the spec-3.11
+ * cluster_tt_durable_io_wait_* indirection so cluster_unit binaries
+ * can stub them without pulling pgstat).
+ * ============================================================ */
+
+void
+cluster_undo_cleaner_scan_wait_start(void)
+{
+	pgstat_report_wait_start(WAIT_EVENT_CLUSTER_UNDO_CLEANER_SEGMENT_SCAN);
+}
+
+void
+cluster_undo_cleaner_scan_wait_end(void)
+{
+	pgstat_report_wait_end();
 }
 
 #endif /* USE_PGRAC_CLUSTER */

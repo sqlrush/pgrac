@@ -51,7 +51,7 @@
  *	internal table in cluster_views.c stays in sync with the enum.
  */
 #define CLUSTER_WAIT_EVENTS_COUNT                                                                  \
-	92 /* spec-3.13 D1: +1 Undo Cleaner main-loop wait event; was 91 spec-2.39 */
+	93 /* spec-3.13 D6: +1 cleaner segment-scan; was 92 (D1 main-loop) */
 
 
 /*

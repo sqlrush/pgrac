@@ -1356,6 +1356,9 @@ pgstat_get_wait_cluster_bgproc(WaitEventCluster w)
 	case WAIT_EVENT_CLUSTER_BGPROC_UNDO_CLEANER_MAIN_LOOP:
 		event_name = "ClusterBgProcUndoCleanerMainLoop";
 		break;
+	case WAIT_EVENT_CLUSTER_UNDO_CLEANER_SEGMENT_SCAN:
+		event_name = "ClusterUndoCleanerSegmentScan";
+		break;
 	case WAIT_EVENT_CLUSTER_BGPROC_CSSD_MAIN_LOOP:
 		event_name = "ClusterBgProcCssdMainLoop";
 		break;

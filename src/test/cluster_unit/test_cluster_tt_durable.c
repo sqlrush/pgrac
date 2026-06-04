@@ -156,6 +156,14 @@ void
 cluster_tt_durable_io_wait_end(void)
 {}
 
+/* spec-3.13 D6 stubs: scan-pass wait wrappers (no pgstat in unit). */
+void
+cluster_undo_cleaner_scan_wait_start(void)
+{}
+void
+cluster_undo_cleaner_scan_wait_end(void)
+{}
+
 bool
 cluster_undo_smgr_read_header_bytes(uint32 segment_id pg_attribute_unused(),
 									uint8 owner_instance pg_attribute_unused(), uint32 offset,

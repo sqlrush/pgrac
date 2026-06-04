@@ -139,6 +139,16 @@ extern TimestampTz cluster_undo_cleaner_ready_at(void);
 extern TimestampTz cluster_undo_cleaner_last_liveness_tick_at(void);
 extern int64 cluster_undo_cleaner_main_loop_iters(void);
 
+/* D6 counter accessors (dump_undo + tests). */
+extern uint64 cluster_undo_cleaner_pass_count(void);
+extern uint64 cluster_undo_cleaner_shmem_tt_slots_gcd(void);
+extern uint64 cluster_undo_cleaner_segments_marked_recyclable(void);
+extern uint64 cluster_undo_cleaner_stale_active_skipped(void);
+
+/* D6 segment-scan wait wrappers (stubbed by cluster_unit binaries). */
+extern void cluster_undo_cleaner_scan_wait_start(void);
+extern void cluster_undo_cleaner_scan_wait_end(void);
+
 /*
  * ClusterUndoCleanerPassStats -- per-pass tallies (D2/D3/D5 producers,
  * D6 publishes a chosen subset into UndoCleanerSharedState).  Plain
@@ -151,6 +161,7 @@ typedef struct ClusterUndoCleanerPassStats {
 	uint32 header_unresolved_committed;	  /* D2-B: COMMITTED with invalid scn (8.A retain) */
 	uint32 segments_marked_recyclable;	  /* D3 */
 	uint32 segments_reused;				  /* D4 (allocator-side, reported back) */
+	uint32 header_retained_committed;	  /* D2-B: COMMITTED at/above horizon (pinned signal) */
 	uint32 stale_active_skipped;		  /* HC6: durable-side ACTIVE residue skipped */
 	uint32 slots_wrap_retired;			  /* D5 */
 } ClusterUndoCleanerPassStats;

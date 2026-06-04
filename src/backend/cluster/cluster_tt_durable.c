@@ -307,9 +307,13 @@ cluster_undo_segment_tt_header_scan_pass(uint32 segment_id, uint8 owner_instance
 	Assert(stats != NULL);
 
 	/* Whole-block read mirrors the by-xid scan shape (one smgr surface). */
-	if (!cluster_undo_smgr_read_block(segment_id, owner_instance, 0, block.data))
+	cluster_undo_cleaner_scan_wait_start();
+	if (!cluster_undo_smgr_read_block(segment_id, owner_instance, 0, block.data)) {
+		cluster_undo_cleaner_scan_wait_end();
 		return false; /* absent / I/O: caller counts and moves on */
+	}
 	hdr = (const UndoSegmentHeaderData *)block.data;
+	cluster_undo_cleaner_scan_wait_end();
 
 	for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
 		const TTSlot *s = &hdr->tt_slots[i];
@@ -320,6 +324,8 @@ cluster_undo_segment_tt_header_scan_pass(uint32 segment_id, uint8 owner_instance
 				stats->header_unresolved_committed++;
 			else if (SCN_VALID(horizon) && scn_time_cmp(s->commit_scn, horizon) < 0)
 				stats->header_tt_slots_below_horizon++;
+			else
+				stats->header_retained_committed++; /* at/above horizon: pinned signal */
 			break;
 		case TT_SLOT_ACTIVE:
 			stats->stale_active_skipped++; /* HC6: never judged, only counted */

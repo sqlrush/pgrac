@@ -71,7 +71,7 @@ my $node0 = $pair->node0;
 
 
 # ----------
-# L2: undo category has 26 rows
+# L2: undo category has 32 rows
 #   5 record-level (spec-3.7) + 4 lifecycle (spec-3.8) + 3 commit-fsync +
 #   4 smgr (the latter 7 added by the perf-merge undo instrumentation) +
 #   5 durable TT slot counters (spec-3.11 D8: commit / lookup hit / lookup
@@ -81,8 +81,8 @@ my $node0 = $pair->node0;
 # ----------
 my $undo_row_count = $node0->safe_psql('postgres',
 	q{SELECT count(*) FROM pg_cluster_state WHERE category='undo'});
-is($undo_row_count, '26',
-	"L2 undo category has 26 rows (5 record + 4 lifecycle + 3 fsync + 4 smgr + 5 durable-tt + 5 retention)"
+is($undo_row_count, '32',
+	"L2 undo category has 32 rows (5 record + 4 lifecycle + 3 fsync + 4 smgr + 5 durable-tt + 5 retention + 6 cleaner)"
 );
 
 

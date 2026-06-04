@@ -1523,6 +1523,20 @@ dump_undo(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_tt_slot_retention_recycle_count()));
 	emit_row(rsinfo, "undo", "tt_retention_rollover_count",
 			 fmt_int64((int64)cluster_undo_tt_retention_rollover_count()));
+
+	/* spec-3.13 D6: 6 cleaner/reuse counters (26 -> 32 rows). */
+	emit_row(rsinfo, "undo", "cleaner_pass_count",
+			 fmt_int64((int64)cluster_undo_cleaner_pass_count()));
+	emit_row(rsinfo, "undo", "cleaner_shmem_tt_slots_gcd",
+			 fmt_int64((int64)cluster_undo_cleaner_shmem_tt_slots_gcd()));
+	emit_row(rsinfo, "undo", "cleaner_segments_marked_recyclable",
+			 fmt_int64((int64)cluster_undo_cleaner_segments_marked_recyclable()));
+	emit_row(rsinfo, "undo", "cleaner_stale_active_skipped",
+			 fmt_int64((int64)cluster_undo_cleaner_stale_active_skipped()));
+	emit_row(rsinfo, "undo", "segment_reuse_count",
+			 fmt_int64((int64)cluster_undo_segment_reuse_count()));
+	emit_row(rsinfo, "undo", "tt_slot_wrap_retired_count",
+			 fmt_int64((int64)cluster_tt_slot_wrap_retired_count()));
 }
 
 /*
