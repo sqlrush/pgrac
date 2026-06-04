@@ -62,6 +62,7 @@ PG_FUNCTION_INFO_V1(cluster_cr_test_image);
 
 #include "access/htup_details.h"
 #include "access/relation.h"
+#include "catalog/pg_type.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
@@ -160,6 +161,7 @@ cluster_cr_test_image(PG_FUNCTION_ARGS)
 	Page page;
 	OffsetNumber off;
 	OffsetNumber maxoff;
+	int i;
 	char *image; /* private copy of the reconstructed CR image */
 	Datum *out_values;
 	bool *out_nulls;
@@ -191,6 +193,30 @@ cluster_cr_test_image(PG_FUNCTION_ARGS)
 							   "cr_off plus the relation's %d column(s)",
 							   nrelatts),
 						errhint("e.g. AS r(cr_off int2, <relation columns...>)")));
+	}
+	if (TupleDescAttr(out_desc, 0)->atttypid != INT2OID) {
+		relation_close(rel, AccessShareLock);
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("cluster_cr_test_image first output column must be int2"),
+						errhint("e.g. AS r(cr_off int2, <relation columns...>)")));
+	}
+	for (i = 0; i < nrelatts; i++) {
+		Form_pg_attribute rel_att = TupleDescAttr(rel_desc, i);
+		Form_pg_attribute out_att = TupleDescAttr(out_desc, i + 1);
+
+		if (rel_att->attisdropped)
+			continue;
+
+		if (out_att->atttypid != rel_att->atttypid || out_att->atttypmod != rel_att->atttypmod) {
+			relation_close(rel, AccessShareLock);
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("cluster_cr_test_image output column %d must match relation column type",
+						i + 2),
+				 errhint("declare column %s with type OID %u and typmod %d",
+						 NameStr(rel_att->attname), rel_att->atttypid, rel_att->atttypmod)));
+		}
 	}
 
 	image = (char *)palloc(BLCKSZ);

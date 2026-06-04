@@ -316,6 +316,13 @@ GetTransactionSnapshot(void)
 			/* Mark it as "registered" in FirstXactSnapshot */
 			FirstXactSnapshot->regd_count++;
 			pairingheap_add(&RegisteredSnapshots, &FirstXactSnapshot->ph_node);
+#ifdef USE_PGRAC_CLUSTER
+			/*
+			 * spec-3.12 D1: transaction-level snapshots bypass
+			 * RegisterSnapshotOnOwner(), so publish their read_scn here.
+			 */
+			cluster_recompute_proc_read_scn();
+#endif
 		}
 		else
 			CurrentSnapshot = GetSnapshotData(&CurrentSnapshotData);

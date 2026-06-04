@@ -17,11 +17,11 @@
 #	         durability + crash-recovery half (C1/C2 write side) and guards the
 #	         P0 fixed in this spec: a zero-init (UNUSED) or FREE-reused slot
 #	         must redo-APPLY, not PANIC as a same-wrap/different-xid "conflict".
-#	  L5     watermark by-xid boundary -- a slot-reuse watermark scenario drives
-#	         the D6 by-xid resolve (tt_durable_by_xid_scan_count rises); because
-#	         the writers' durable slots were reused without retention, by-xid
-#	         misses and the construct fails closed (53R9F).  规则 8.A: never a
-#	         false-visible image.
+#	  L5     watermark by-xid path -- a slot-reuse watermark scenario drives
+#	         the D6 by-xid resolve (tt_durable_by_xid_scan_count rises).  After
+#	         spec-3.12 retention, the default path succeeds because needed
+#	         durable slots are retained; t/220 L4 owns the CR image content
+#	         assertion.
 #	  L6     GUC fallback (C6)      -- cluster.tt_durable_lookup=off routes the
 #	         watermark gate back to the spec-3.10 blanket message; =on routes to
 #	         the spec-3.11 by-xid message.  The differing messages prove the gate.
@@ -98,7 +98,7 @@ my $counter = sub {
 		'L7: XLOG_UNDO_TT_SLOT_COMMIT redo applied during crash recovery');
 }
 
-# --- L5: watermark by-xid resolve boundary (reused slots -> 53R9F) ----------
+# --- L5: watermark by-xid resolve runs; 3.12 retention makes it succeed -----
 my $scn_l5;
 {
 	$node->safe_psql('postgres', 'CREATE TABLE l5(id int, v int)');
@@ -106,16 +106,16 @@ my $scn_l5;
 		'INSERT INTO l5 SELECT g, 0 FROM generate_series(1, 80) g');
 	$scn_l5 = $node->safe_psql('postgres', 'SELECT cluster_scn_current()');
 	# > INITRANS(8) distinct committed writers on block 0 -> ITL recycle +
-	# watermark > scn_l5; their durable TT slots get reused (no retention).
+	# watermark > scn_l5; with spec-3.12 retention on by default, their durable
+	# TT slots are kept and the by-xid resolve can be precise.
 	$node->safe_psql('postgres', "UPDATE l5 SET v = v + 1 WHERE id = $_")
 		for (1 .. 12);
 
 	my $before_scan = $counter->('tt_durable_by_xid_scan_count');
 	my ($rc, undef, $err) = $node->psql('postgres',
 		"SELECT cluster_cr_test_construct('l5'::regclass, 0, 0, $scn_l5)");
-	isnt($rc, 0, 'L5: watermark construct over reused slots fails closed');
-	like($err, qr/durable TT slot for writer xid \d+ is unavailable/,
-		'L5: spec-3.11 D6 by-xid-miss fail-closed message (53R9F)');
+	is($rc, 0, 'L5: watermark construct succeeds with 3.12 retention');
+	is($err // '', '', 'L5: no durable-miss fail-closed error with retained slots');
 	cmp_ok($counter->('tt_durable_by_xid_scan_count'), '>', $before_scan,
 		'L5: the by-xid durable resolve mechanism actually ran (counter moved)');
 }

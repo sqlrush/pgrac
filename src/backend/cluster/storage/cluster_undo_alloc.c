@@ -154,6 +154,39 @@ ensure_instance_subdir(uint8 owner_instance)
 						errmsg("could not create undo instance subdir \"%s\": %m", path)));
 }
 
+/*
+ * Existing undo segment files are mutable: lifecycle state, block bitmap, and
+ * durable TT slots all live in block 0 after allocation.  Idempotence therefore
+ * means "the header identity is valid", not "the whole block still equals the
+ * freshly allocated zero template".
+ */
+static bool
+segment_header_identity_matches(const char *blockbuf, uint32 segment_id, uint8 owner_instance)
+{
+	PageHeader ph = (PageHeader)blockbuf;
+	const UndoSegmentHeaderData *hdr = (const UndoSegmentHeaderData *)blockbuf;
+
+	if ((ph->pd_flags & PD_UNDO_SEG_HEADER) == 0)
+		return false;
+	if (PageGetPageSize((Page)blockbuf) != BLCKSZ
+		|| PageGetPageLayoutVersion((Page)blockbuf) != PG_PAGE_LAYOUT_VERSION)
+		return false;
+
+	if (hdr->segment_id != segment_id || hdr->segment_size_bytes != UNDO_SEGMENT_SIZE_BYTES
+		|| hdr->owner_instance != owner_instance || hdr->tt_slots_count != TT_SLOTS_PER_SEGMENT)
+		return false;
+
+	switch (hdr->segment_state) {
+	case SEGMENT_ALLOCATED:
+	case SEGMENT_ACTIVE:
+	case SEGMENT_COMMITTED:
+	case SEGMENT_RECYCLABLE:
+		return true;
+	default:
+		return false;
+	}
+}
+
 
 /*
  * cluster_undo_segment_allocate
@@ -248,9 +281,10 @@ cluster_undo_segment_allocate(uint32 segment_id, uint8 owner_instance)
 	 * path.  The allocator is intentionally idempotent, but idempotent must
 	 * not mean "rewrite + fsync + emit XLOG_UNDO_SEGMENT_INIT every xact".
 	 * If the segment file already exists, has the expected size, and block 0
-	 * already matches the expected header bytes, return immediately.  We only
-	 * fall through to the repair/write path for newly-created, truncated, or
-	 * mismatched files.
+	 * is a valid header for this segment identity, return immediately.  Do not
+	 * compare the whole block against the fresh zero template: block 0 later
+	 * carries durable TT slots, lifecycle state, and bitmap updates that must
+	 * survive repeated idempotent allocator calls from new backends.
 	 */
 	if (!created) {
 		if (fstat(fd, &st) != 0) {
@@ -276,7 +310,8 @@ cluster_undo_segment_allocate(uint32 segment_id, uint8 owner_instance)
 								errmsg("could not read undo segment header for \"%s\": %m", path)));
 			}
 
-			if (readbytes == BLCKSZ && memcmp(existing.data, page.data, BLCKSZ) == 0) {
+			if (readbytes == BLCKSZ
+				&& segment_header_identity_matches(existing.data, segment_id, owner_instance)) {
 				if (close(fd) != 0)
 					ereport(ERROR, (errcode_for_file_access(),
 									errmsg("could not close undo segment file \"%s\": %m", path)));
