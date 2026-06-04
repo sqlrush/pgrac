@@ -27,7 +27,7 @@
  *	    L10 Total backoff = initial × (2^N - 1) = 1500ms default
  *	    L11 LWTRANCHE_CLUSTER_GCS_BLOCK_DEDUP distinct from CLUSTER_GCS_BLOCK
  *	    L12 2 NEW wait events distinct values
- *	    L13 CLUSTER_WAIT_EVENTS_COUNT == 85 (was 83 spec-2.33)
+ *	    L13 CLUSTER_WAIT_EVENTS_COUNT == 93 (current Stage 3.13 snapshot)
  *	    L14 53R90 SQLSTATE: hardcoded raw value cross-check
  *	    L15 BLCKSZ == GCS_BLOCK_DATA_SIZE invariant (defensive)
  *	    L16 Dedup key offsets — origin/backend/req_id/epoch
@@ -195,11 +195,12 @@ UT_TEST(test_new_wait_events_distinct)
 }
 
 
-UT_TEST(test_cluster_wait_events_count_91)
+UT_TEST(test_cluster_wait_events_count_93)
 {
 	/* spec-2.34 D7: 83 → 85 (+ 2 reliability wait events).
-	 * spec-2.36 D8: 85 → 88 (+ 3 CF 3-way wait events). */
-	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 91);
+	 * spec-2.36 D8: 85 → 88 (+ 3 CF 3-way wait events).
+	 * spec-3.13 D6: 91 → 93 (+ 2 undo cleaner wait events). */
+	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 93);
 }
 
 
@@ -305,7 +306,7 @@ main(void)
 	UT_RUN(test_retry_total_backoff_default_1500ms);
 	UT_RUN(test_lwtranche_distinct);
 	UT_RUN(test_new_wait_events_distinct);
-	UT_RUN(test_cluster_wait_events_count_91);
+	UT_RUN(test_cluster_wait_events_count_93);
 	UT_RUN(test_dedup_full_status_distinct_from_master_not_holder);
 	UT_RUN(test_block_data_size_equals_blcksz);
 	UT_RUN(test_dedup_entry_collision_field_layout);

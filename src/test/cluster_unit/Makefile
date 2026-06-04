@@ -632,7 +632,7 @@ test_cluster_sinval_ack: test_cluster_sinval_ack.c unit_test.h \
 # spec-2.40 D8:  test_cluster_stage2_acceptance — 8 static contract
 # tests verifying Stage 2 final surface snapshot (catversion >= 202605460,
 # msg_types 7/12-19 cumulative, capability counter symbols linkable,
-# 5 fault inject point name strings, wait events count 91 snapshot,
+# 5 fault inject point name strings, wait events count 93 snapshot,
 # SQLSTATE 53R60/90-95 encodable, GUC enum + shmem_max_regions
 # boot_val=64 snapshot, RESERVED_0=0 sentinel).  Header-only;
 # behavioral coverage in cluster_tap t/200-202.
