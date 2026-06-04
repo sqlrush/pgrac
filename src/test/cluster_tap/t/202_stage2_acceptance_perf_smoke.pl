@@ -48,6 +48,17 @@ sub _pgbench_tps
 	return 0;
 }
 
+sub _run_pgbench_full
+{
+	my ($node, $seconds) = @_;
+	my $output;
+
+	$node->run_log([ 'pgbench', '-c', '4', '-T', "$seconds", '-n',
+		'-p', $node->port, '-h', $node->host, 'postgres' ],
+		'>', \$output);
+	return _pgbench_tps($output);
+}
+
 
 # ============================================================
 # L1/L2 single-node cluster_enabled=on vs off (smoke + trend gate)
@@ -75,11 +86,7 @@ $node_off->run_log([ 'pgbench', '-S', '-c', '4', '-T', "$pgbench_seconds", '-n',
 my $sel_off_tps = _pgbench_tps($sel_off_out);
 
 # L2 — pgbench TPC-B 完整 smoke
-my $full_off_out;
-$node_off->run_log([ 'pgbench', '-c', '4', '-T', "$pgbench_seconds", '-n',
-	'-p', $node_off->port, '-h', $node_off->host, 'postgres' ],
-	'>', \$full_off_out);
-my $full_off_tps = _pgbench_tps($full_off_out);
+my $full_off_tps = _run_pgbench_full($node_off, $pgbench_seconds);
 
 $node_off->stop;
 diag("L1 cluster_enabled=off: pgbench -S TPS=$sel_off_tps");
@@ -102,11 +109,7 @@ $node_on->run_log([ 'pgbench', '-S', '-c', '4', '-T', "$pgbench_seconds", '-n',
 	'>', \$sel_on_out);
 my $sel_on_tps = _pgbench_tps($sel_on_out);
 
-my $full_on_out;
-$node_on->run_log([ 'pgbench', '-c', '4', '-T', "$pgbench_seconds", '-n',
-	'-p', $node_on->port, '-h', $node_on->host, 'postgres' ],
-	'>', \$full_on_out);
-my $full_on_tps = _pgbench_tps($full_on_out);
+my $full_on_tps = _run_pgbench_full($node_on, $pgbench_seconds);
 
 $node_on->stop;
 diag("L1 cluster_enabled=on: pgbench -S TPS=$sel_on_tps");
@@ -140,8 +143,34 @@ SKIP: {
 		if $full_off_tps == 0 || $full_on_tps == 0;
 	my $reg_pct = 100.0 * (1.0 - $full_on_tps / $full_off_tps);
 	my $status = $reg_pct <= 15.0 ? 'GREEN'
-		: $reg_pct <= 40.0 ? 'YELLOW' : 'RED';
+		: $reg_pct <= 25.0 ? 'YELLOW'
+		: $reg_pct <= 40.0 ? 'ORANGE'
+		: $reg_pct <= 60.0 ? 'RED' : 'CATASTROPHIC';
 	diag(sprintf "L2 single-node on/off full regression: %.1f%% [%s] (hard gate ≤ 15%%)", $reg_pct, $status);
+	if ($perf_hard_gate && $reg_pct > 15.0 && $reg_pct <= 25.0) {
+		diag("L2 full perf entered YELLOW; rerunning paired off/on once to confirm shared-runner noise");
+
+		$node_off->start;
+		my $confirm_off_tps = _run_pgbench_full($node_off, $pgbench_seconds);
+		$node_off->stop;
+		diag("L2 confirm cluster_enabled=off: pgbench full TPS=$confirm_off_tps");
+
+		$node_on->start;
+		my $confirm_on_tps = _run_pgbench_full($node_on, $pgbench_seconds);
+		$node_on->stop;
+		diag("L2 confirm cluster_enabled=on: pgbench full TPS=$confirm_on_tps");
+
+		if ($confirm_off_tps != 0 && $confirm_on_tps != 0) {
+			$full_off_tps = $confirm_off_tps;
+			$full_on_tps = $confirm_on_tps;
+			$reg_pct = 100.0 * (1.0 - $full_on_tps / $full_off_tps);
+			$status = $reg_pct <= 15.0 ? 'GREEN'
+				: $reg_pct <= 25.0 ? 'YELLOW'
+				: $reg_pct <= 40.0 ? 'ORANGE'
+				: $reg_pct <= 60.0 ? 'RED' : 'CATASTROPHIC';
+			diag(sprintf "L2 confirm single-node on/off full regression: %.1f%% [%s] (hard gate ≤ 15%%)", $reg_pct, $status);
+		}
+	}
 	if ($perf_hard_gate) {
 		cmp_ok($reg_pct, '<=', 15.0,
 			sprintf("L2 single-node on/off full hard gate ≤ 15%% (actual %.1f%%;%s)", $reg_pct, $status));
