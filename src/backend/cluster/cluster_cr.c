@@ -269,7 +269,8 @@ cr_check_error_injections(void)
  *	non-reentrant guard; this function performs no locking (I-lock-2).
  */
 static void
-cr_walk_chain(char *scratch_page, UBA start_uba, SCN read_scn, uint32 *steps, uint32 max_steps)
+cr_walk_chain(char *scratch_page, UBA start_uba, SCN read_scn,
+			  const ClusterCRCandidateChain *chains, int nchains, uint32 *steps, uint32 max_steps)
 {
 	UBA uba = start_uba;
 	PGAlignedBlock record_buf;
@@ -394,6 +395,19 @@ cr_walk_chain(char *scratch_page, UBA start_uba, SCN read_scn, uint32 *steps, ui
 								   "(version skew or corruption)",
 								   hdr->record_type)));
 		}
+
+		/*
+		 * Keep the transient CR image close to the read_scn shape.  A hot row can
+		 * have many post-read_scn intermediate versions on the same page
+		 * (pgbench_tellers is the small-table repro): if the walk re-adds every
+		 * intermediate image and defers pruning to the very end, the scratch page
+		 * can temporarily overflow or present a foreign NORMAL tuple at a later
+		 * restore offset.  Any tuple whose xmin is one of the candidate xids did
+		 * not exist at read_scn, so it is safe to remove immediately after each
+		 * inverse step, then compact before the next older undo record.
+		 */
+		(void)cluster_cr_prune_post_snapshot_versions(scratch_page, chains, nchains);
+		PageRepairFragmentation((Page)scratch_page);
 
 		uba = hdr->prev_uba;
 	}
@@ -602,6 +616,24 @@ cluster_cr_construct_block_into(Buffer buf, SCN read_scn, char *dst_page)
 			qsort(chains, nchains, sizeof(chains[0]), cluster_cr_chain_cmp_by_write_scn_desc);
 
 		/*
+		 * If the recycle watermark says the candidate set may be incomplete,
+		 * resolve evicted post-read_scn tuple creators before walking undo.
+		 * Otherwise a recycled-slot tuple can remain NORMAL at the target
+		 * offset and block an older UPDATE/DELETE restore with a length/identity
+		 * mismatch.  The post-walk call below remains as the final fail-closed
+		 * guard for tuples materialized by the chain walk itself.
+		 */
+		if (watermark_exceeds) {
+			if (cluster_tt_durable_lookup)
+				cr_resolve_kept_tuples_durable(dst_page, read_scn, chains, nchains);
+			else
+				ereport(ERROR, (errcode(ERRCODE_CLUSTER_CR_SNAPSHOT_TOO_OLD),
+								errmsg("cluster CR cannot reconstruct block: ITL slot reused "
+									   "after snapshot"),
+								errhint("retry the transaction with a fresh snapshot")));
+		}
+
+		/*
 		 * spec-3.10 §v0.6: prune post-read_scn versions BOTH before and after
 		 * the inverse-apply (v0.4 pruned only after).
 		 *
@@ -629,7 +661,8 @@ cluster_cr_construct_block_into(Buffer buf, SCN read_scn, char *dst_page)
 		PageRepairFragmentation((Page)dst_page);
 
 		for (i = 0; i < nchains; i++)
-			cr_walk_chain(dst_page, chains[i].undo_segment_head, read_scn, &steps, max_steps);
+			cr_walk_chain(dst_page, chains[i].undo_segment_head, read_scn, chains, nchains, &steps,
+						  max_steps);
 
 		(void)cluster_cr_prune_post_snapshot_versions(dst_page, chains, nchains);
 
@@ -644,15 +677,8 @@ cluster_cr_construct_block_into(Buffer buf, SCN read_scn, char *dst_page)
 		 * overlay-only behavior: any watermark > read_scn fails the whole block
 		 * closed (53R9F) without consulting the durable TT.
 		 */
-		if (watermark_exceeds) {
-			if (cluster_tt_durable_lookup)
-				cr_resolve_kept_tuples_durable(dst_page, read_scn, chains, nchains);
-			else
-				ereport(ERROR, (errcode(ERRCODE_CLUSTER_CR_SNAPSHOT_TOO_OLD),
-								errmsg("cluster CR cannot reconstruct block: ITL slot reused "
-									   "after snapshot"),
-								errhint("retry the transaction with a fresh snapshot")));
-		}
+		if (watermark_exceeds)
+			cr_resolve_kept_tuples_durable(dst_page, read_scn, chains, nchains);
 
 		pgstat_report_wait_end();
 

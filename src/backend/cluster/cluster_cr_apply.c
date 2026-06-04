@@ -358,10 +358,23 @@ cluster_cr_apply_itl_inverse(char *scratch_page, const UndoRecordHeader *hdr,
 	if (!PageHasItl(page))
 		return false;
 
-	/* Restore the tuple header the lock-only change touched. */
-	itemid = cr_target_itemid(scratch_page, hdr->target_offset);
-	if (itemid == NULL || !ItemIdIsNormal(itemid))
+	/*
+	 * Restore the tuple header the lock-only change touched.  If prune-first /
+	 * incremental prune already removed this tuple because its xmin belongs to a
+	 * post-read_scn candidate, the lock-only header transition is irrelevant to
+	 * the final CR image.  Treat in-page non-NORMAL and plausibly truncated
+	 * offsets as idempotent no-ops, mirroring insert-inverse after prune-first.
+	 */
+	if (hdr->target_offset < FirstOffsetNumber)
 		return false;
+	itemid = cr_target_itemid(scratch_page, hdr->target_offset);
+	if (itemid == NULL) {
+		if (hdr->target_offset <= MaxHeapTuplesPerPage)
+			return true;
+		return false;
+	}
+	if (!ItemIdIsNormal(itemid))
+		return true;
 	htup = (HeapTupleHeader)PageGetItem(page, itemid);
 	HeapTupleHeaderSetXmax(htup, payload->prev_xmax);
 	htup->t_infomask = payload->prev_infomask;

@@ -224,6 +224,19 @@ is_entry_fresh(const ClusterTTOverlayEntry *e, TimestampTz now)
 	return age_us < ((int64)cluster_tt_status_overlay_ttl_ms * 1000);
 }
 
+static void
+note_overlay_full(const char *dropped_kind)
+{
+	uint64 old_count;
+
+	Assert(ClusterTTStatusState != NULL);
+	old_count = pg_atomic_fetch_add_u64(&ClusterTTStatusState->evict_fail_count, 1);
+	if (old_count == 0)
+		ereport(LOG, (errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+					  errmsg("cluster tt status overlay full; %s dropped", dropped_kind),
+					  errhint("Raise cluster.tt_status_overlay_max_entries or lower TTL.")));
+}
+
 /* ------------------------------------------------------------ */
 /* public API                                                   */
 /* ------------------------------------------------------------ */
@@ -335,16 +348,14 @@ cluster_tt_status_install_local(const ClusterTTStatusKey *key, ClusterTTStatus s
 	e = (ClusterTTOverlayEntry *)hash_search(ClusterTTStatusHTAB, key, HASH_ENTER_NULL, &found);
 	if (e == NULL) {
 		/*
-		 * HTAB full and no eviction implemented in foundation spec.  Bump
-		 * evict_fail_count (defensive; spec-3.1 D9 T22 covers).  Caller
-		 * still proceeds — overlay is best-effort cache, miss returns
-		 * UNKNOWN per HC181.
+		 * HTAB full and no eviction implemented in foundation spec.  The
+		 * overlay is best-effort: a miss returns UNKNOWN per HC181 and newer
+		 * durable-TT paths can still resolve committed rows.  Do not emit a
+		 * client WARNING per commit after the first capacity miss; that floods
+		 * pgbench / OLTP clients and turns observability into write-path cost.
 		 */
 		LWLockRelease(ClusterTTStatusLock);
-		pg_atomic_fetch_add_u64(&ClusterTTStatusState->evict_fail_count, 1);
-		ereport(WARNING, (errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
-						  errmsg("cluster tt status overlay full; install dropped"),
-						  errhint("Raise cluster.tt_status_overlay_max_entries or lower TTL.")));
+		note_overlay_full("install");
 		return false;
 	}
 
@@ -392,10 +403,7 @@ cluster_tt_status_install_subcommitted(const ClusterTTStatusKey *child_key,
 											 &found);
 	if (e == NULL) {
 		LWLockRelease(ClusterTTStatusLock);
-		pg_atomic_fetch_add_u64(&ClusterTTStatusState->evict_fail_count, 1);
-		ereport(WARNING, (errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
-						  errmsg("cluster tt status overlay full; subcommitted install dropped"),
-						  errhint("Raise cluster.tt_status_overlay_max_entries or lower TTL.")));
+		note_overlay_full("subcommitted install");
 		return false;
 	}
 

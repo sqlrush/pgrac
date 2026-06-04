@@ -473,6 +473,21 @@ UT_TEST(test_itl_inverse_offset_out_of_range_false)
 	UT_ASSERT_EQ((int)cluster_cr_apply_itl_inverse(synthetic_page, &hdr, &p), 0);
 }
 
+UT_TEST(test_itl_inverse_pruned_target_idempotent)
+{
+	Page page = build_page_with_tuple();
+	UndoRecordHeader hdr;
+	UndoItlPayload p;
+
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.target_offset = TEST_TUPLE_OFFSET;
+	memset(&p, 0, sizeof(p));
+	p.itl_slot_idx = 0;
+	ItemIdSetUnused(PageGetItemId(page, TEST_TUPLE_OFFSET));
+
+	UT_ASSERT_EQ((int)cluster_cr_apply_itl_inverse(synthetic_page, &hdr, &p), 1);
+}
+
 
 /* ============================================================
  *	insert inverse idempotency-ish + multi-helper interplay
@@ -877,7 +892,7 @@ UT_TEST(test_prune_skips_invalid_xmin)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(36);
+	UT_PLAN(37);
 
 	UT_RUN(test_sqlstate_53R9F);
 	UT_RUN(test_sqlstate_53R9G);
@@ -901,6 +916,7 @@ main(int argc, char **argv)
 	UT_RUN(test_itl_inverse_bad_slot_idx_false);
 	UT_RUN(test_itl_inverse_no_itl_page_false);
 	UT_RUN(test_itl_inverse_offset_out_of_range_false);
+	UT_RUN(test_itl_inverse_pruned_target_idempotent);
 
 	UT_RUN(test_update_inverse_truncated_readds);
 	UT_RUN(test_update_inverse_unused_itemid_readds);
