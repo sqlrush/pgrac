@@ -178,7 +178,11 @@ static TimestampTz AlignTimestampToMinuteBoundary(TimestampTz ts);
 static Snapshot CopySnapshot(Snapshot snapshot);
 static void FreeSnapshot(Snapshot snapshot);
 static void SnapshotResetXmin(void);
+#ifdef USE_PGRAC_CLUSTER
 static void cluster_recompute_proc_read_scn(void); /* PGRAC: spec-3.12 D1 */
+#else
+#define cluster_recompute_proc_read_scn() ((void) 0)
+#endif
 
 /*
  * Snapshot fields to be serialized.
@@ -992,6 +996,7 @@ xmin_cmp(const pairingheap_node *a, const pairingheap_node *b, void *arg)
  * stack entry has the oldest xmin.  (Current uses of GetOldestSnapshot() are
  * not actually critical, but this would be.)
  */
+#ifdef USE_PGRAC_CLUSTER
 /*
  * PGRAC: spec-3.12 D1 — recompute this backend's retention read_scn.
  *
@@ -1003,7 +1008,7 @@ xmin_cmp(const pairingheap_node *a, const pairingheap_node *b, void *arg)
  * Unlike SnapshotResetXmin's xmin (which uses the heap's min-xmin node), we
  * cannot piggyback the min-xmin snapshot: read_scn and xmin can tie-break
  * differently (two snapshots may share xmin but differ in read_scn), so a
- * stale min-xmin pick could publish a read_scn ABOVE the true min and let
+ * stale min-xmin pick could publish a read_scn newer than the true min and let
  * retention recycle undo a live reader still needs (规则 8.A false-recycle).
  * We therefore walk every live snapshot for the true min read_scn.  Atomic
  * write because the helper runs outside ProcArrayLock.
@@ -1047,6 +1052,7 @@ cluster_recompute_proc_read_scn(void)
 
 	pg_atomic_write_u64(&MyProc->cluster_read_scn_atomic, (uint64) min);
 }
+#endif
 
 static void
 SnapshotResetXmin(void)
