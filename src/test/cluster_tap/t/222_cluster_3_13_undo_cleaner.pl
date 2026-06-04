@@ -202,4 +202,123 @@ is($cleaner_off, '0', 'L10 cluster.enabled=off spawns no undo cleaner (HC4)');
 $node_c->stop;
 
 
+
+# ============================================================
+# Node D: recycle / reuse / pinned-horizon / crash-redo e2e
+# (L11-L15; spec-3.13 step 9).  Fast cleaner interval so passes
+# run every 200ms; a background REPEATABLE READ snapshot pins the
+# retention horizon for the L14 phase.
+# ============================================================
+my $node_d = PgracClusterNode->new('recycle');
+$node_d->init;
+$node_d->append_conf('postgresql.conf',
+	"log_min_messages = debug1\ncluster.undo_cleaner_interval_ms = 200\n");
+$node_d->start;
+
+$node_d->safe_psql('postgres',
+	'CREATE TABLE t313(id int primary key, v int)');
+
+# dump_undo reader helper.
+sub undo_counter {
+	my ($node, $key) = @_;
+	return $node->safe_psql('postgres',
+		qq{SELECT value::bigint FROM pg_cluster_state
+		    WHERE category = 'undo' AND key = '$key'});
+}
+
+# Write N single-statement transactions (each binds a TT slot, writes
+# undo, commits -> commit-retained while the horizon is pinned).
+sub write_txns {
+	my ($node, $base, $n) = @_;
+	for my $i (0 .. $n - 1) {
+		my $id = $base + $i;
+		$node->safe_psql('postgres',
+			"INSERT INTO t313 VALUES ($id, $id)");
+	}
+}
+
+my $marked_baseline = undo_counter($node_d, 'cleaner_segments_marked_recyclable');
+
+# ----------
+# L14 setup: pin the horizon with a live REPEATABLE READ snapshot.
+# ----------
+my $pin = $node_d->background_psql('postgres');
+$pin->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+$pin->query_safe('SELECT count(*) FROM t313'); # materialize the snapshot
+
+# Fill the current TT segment past its 48 slots: every committed slot is
+# retained (horizon pinned), so allocation pressure forces a rollover and
+# leaves a drained COMMITTED segment behind.
+write_txns($node_d, 1000, 60);
+
+# ----------
+# L14: pinned horizon -> cleaner makes zero recycle progress and LOGs
+# the pinned-episode message exactly once-per-episode.
+# ----------
+sleep 1; # >= 3 cleaner passes at 200ms
+my $marked_pinned = undo_counter($node_d, 'cleaner_segments_marked_recyclable');
+is($marked_pinned, $marked_baseline,
+   'L14 pinned horizon: cleaner marks no segment recyclable');
+my $log_l14 = slurp_file($node_d->logfile);
+like($log_l14, qr/retention horizon pinned/,
+	 'L14 pinned-horizon LOG-once message emitted');
+
+# ----------
+# L11: release the reader -> the drained COMMITTED segment crosses the
+# horizon and the cleaner advances it to RECYCLABLE.
+# ----------
+$pin->quit;
+ok($node_d->poll_query_until('postgres',
+		qq{SELECT value::bigint > $marked_baseline FROM pg_cluster_state
+		   WHERE category = 'undo' AND key = 'cleaner_segments_marked_recyclable'}),
+   'L11 cleaner advances drained segment COMMITTED -> RECYCLABLE after reader exits');
+
+# ----------
+# L12 + L13: keep writing; the allocator must REUSE recyclable segments
+# (segment_reuse_count grows) and the on-disk pool must stop growing.
+# ----------
+my $undo_dir = $node_d->data_dir . '/pg_undo/instance_0';
+my $count_files = sub {
+	opendir(my $dh, $undo_dir) or return -1;
+	my @f = grep { /^seg_\d+\.dat$/ } readdir($dh);
+	closedir($dh);
+	return scalar @f;
+};
+my $files_before = $count_files->();
+
+write_txns($node_d, 2000, 60);
+ok($node_d->poll_query_until('postgres',
+		q{SELECT value::bigint > 0 FROM pg_cluster_state
+		   WHERE category = 'undo' AND key = 'segment_reuse_count'}),
+   'L12 allocator reuses a RECYCLABLE segment (segment_reuse_count > 0)');
+
+write_txns($node_d, 3000, 60);
+my $files_after = $count_files->();
+cmp_ok($files_after, '<=', $files_before,
+	   "L13 undo segment pool capped by reuse (files before=$files_before after=$files_after)");
+
+# Data sanity across recycle/reuse: every inserted row is intact.
+my $rowcheck = $node_d->safe_psql('postgres',
+	'SELECT count(*), coalesce(sum(id),0) FROM t313');
+is($rowcheck, '180|' . (1000*60+59*30 + 2000*60+59*30 + 3000*60+59*30),
+   'L12b all 180 rows intact across recycle + reuse');
+
+# ----------
+# L15: crash (immediate) + restart -> 0x40/0x50 redo leaves segment
+# lifecycle consistent; writes keep working and the cleaner resumes.
+# ----------
+$node_d->stop('immediate');
+$node_d->start;
+write_txns($node_d, 4000, 10);
+my $rowcheck2 = $node_d->safe_psql('postgres', 'SELECT count(*) FROM t313');
+is($rowcheck2, '190', 'L15 post-crash redo: writes resume, rows intact');
+ok($node_d->poll_query_until('postgres',
+		q{SELECT value = 'ready' FROM pg_cluster_state
+		   WHERE category = 'undo_cleaner' AND key = 'undo_cleaner_status'}),
+   'L15 cleaner resumes after crash recovery');
+my $log_l15 = slurp_file($node_d->logfile);
+unlike($log_l15, qr/PANIC/, 'L15 no PANIC during recycle/reuse redo');
+$node_d->stop;
+
+
 done_testing();
