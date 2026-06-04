@@ -870,6 +870,44 @@ cluster_tt_durable_redo_apply_count(void)
 {
 	return 0;
 }
+/* spec-3.13 D1 Undo Cleaner accessor stubs (dump_undo_cleaner references). */
+#include "cluster/cluster_undo_cleaner.h"
+UndoCleanerStatus
+cluster_undo_cleaner_status(void)
+{
+	return UNDO_CLEANER_NOT_STARTED;
+}
+const char *
+cluster_undo_cleaner_status_to_string(UndoCleanerStatus st)
+{
+	(void)st;
+	return "not_started";
+}
+pid_t
+cluster_undo_cleaner_pid(void)
+{
+	return 0;
+}
+TimestampTz
+cluster_undo_cleaner_spawned_at(void)
+{
+	return 0;
+}
+TimestampTz
+cluster_undo_cleaner_ready_at(void)
+{
+	return 0;
+}
+TimestampTz
+cluster_undo_cleaner_last_liveness_tick_at(void)
+{
+	return 0;
+}
+int64
+cluster_undo_cleaner_main_loop_iters(void)
+{
+	return 0;
+}
 /* spec-3.12 D5 retention counter stubs (dump_undo references these). */
 uint64
 cluster_tt_slot_retention_horizon_scn(void)

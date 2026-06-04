@@ -44,6 +44,7 @@
 #include "cluster/cluster_lmd.h"		  /* LmdMain (spec-2.19 Sprint A Step 1) */
 #include "cluster/cluster_sinval_bcast.h" /* SinvalBcastMain (spec-2.38 D4) */
 #include "cluster/cluster_stats.h"		  /* ClusterStatsMain (stage 1.14 Sprint A) */
+#include "cluster/cluster_undo_cleaner.h"  /* UndoCleanerMain (stage 3.13) */
 #endif
 
 
@@ -112,6 +113,10 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 	/* PGRAC (stage 2.5 Sprint A): CSSD aux process. */
 	case CssdProcess:
 		MyBackendType = B_CSSD;
+		break;
+	/* PGRAC (stage 3.13): Undo Cleaner aux process. */
+	case UndoCleanerProcess:
+		MyBackendType = B_UNDO_CLEANER;
 		break;
 	/* PGRAC (stage 2.6 Sprint A Step 3 D7): QVOTEC aux process. */
 	case QvotecProcess:
@@ -297,6 +302,10 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 	/* PGRAC (stage 2.5 Sprint A): CSSD aux process dispatch. */
 	case CssdProcess:
 		CssdMain();
+		proc_exit(1);
+	/* PGRAC (stage 3.13): Undo Cleaner aux process dispatch. */
+	case UndoCleanerProcess:
+		UndoCleanerMain();
 		proc_exit(1);
 	/* PGRAC (stage 2.6 Sprint A Step 3 D7): QVOTEC aux process dispatch.
 	 * ClusterQvotecMain is pg_attribute_noreturn() (proc_exit on shutdown);

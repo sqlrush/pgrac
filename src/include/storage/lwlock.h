@@ -329,6 +329,8 @@ typedef enum BuiltinTrancheIds {
 	 * One LWLock per segment guards alloc / free / wrap mutations of the
 	 * 48-entry TT slot array embedded in UndoSegmentHeader. */
 	LWTRANCHE_CLUSTER_TT_SLOT,
+	/* PGRAC: spec-3.13 Undo Cleaner aux process state region. */
+	LWTRANCHE_CLUSTER_UNDO_CLEANER,
 #endif
 	LWTRANCHE_FIRST_USER_DEFINED
 } BuiltinTrancheIds;

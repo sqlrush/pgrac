@@ -88,9 +88,10 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_grd_pending.h"
 #include "cluster/cluster_grd_work_queue.h"
-#include "cluster/cluster_cssd.h"  /* cluster_cssd_status (spec-2.5 D12) */
-#include "cluster/cluster_stats.h" /* cluster_stats_status (spec-1.14 D12) */
-#include "cluster/cluster_lmon.h"  /* cluster_lmon_status (spec-1.11 Sprint B D12) */
+#include "cluster/cluster_cssd.h"		  /* cluster_cssd_status (spec-2.5 D12) */
+#include "cluster/cluster_stats.h"		  /* cluster_stats_status (spec-1.14 D12) */
+#include "cluster/cluster_undo_cleaner.h" /* dump_undo_cleaner (spec-3.13 D1) */
+#include "cluster/cluster_lmon.h"		  /* cluster_lmon_status (spec-1.11 Sprint B D12) */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic.h"				/* ClusterICOps_Active, ClusterICTier */
 #include "cluster/cluster_ic_tier1.h"		/* listener metadata accessors (Hardening v1.0.1 F3) */
@@ -647,6 +648,44 @@ dump_cluster_cssd(ReturnSetInfo *rsinfo)
 		hex_buf[2 + CLUSTER_CSSD_PEER_ALIVE_BITMAP_BYTES * 2] = '\0';
 		emit_row(rsinfo, "cluster_cssd", "cssd.declared_alive_bitmap", pstrdup(hex_buf));
 	}
+}
+
+
+/*
+ * dump_undo_cleaner -- Stage 3.13 Undo Cleaner aux process state
+ * diagnostics (mirrors dump_cluster_stats F11 7-key model: 2 status +
+ * 5 lifecycle).
+ */
+static void
+dump_undo_cleaner(ReturnSetInfo *rsinfo)
+{
+	UndoCleanerStatus s = cluster_undo_cleaner_status();
+	pid_t pid;
+	TimestampTz spawned_at, ready_at, last_tick;
+	int64 iters;
+
+	emit_row(rsinfo, "undo_cleaner", "undo_cleaner_status",
+			 cluster_undo_cleaner_status_to_string(s));
+	emit_row(rsinfo, "undo_cleaner", "undo_cleaner_status_enum_value", fmt_int32((int32)s));
+
+	pid = cluster_undo_cleaner_pid();
+	emit_row(rsinfo, "undo_cleaner", "undo_cleaner_pid",
+			 pid == 0 ? "(unset)" : fmt_int64((int64)pid));
+
+	spawned_at = cluster_undo_cleaner_spawned_at();
+	emit_row(rsinfo, "undo_cleaner", "undo_cleaner_spawned_at",
+			 spawned_at == 0 ? "(unset)" : pstrdup(timestamptz_to_str(spawned_at)));
+
+	ready_at = cluster_undo_cleaner_ready_at();
+	emit_row(rsinfo, "undo_cleaner", "undo_cleaner_ready_at",
+			 ready_at == 0 ? "(unset)" : pstrdup(timestamptz_to_str(ready_at)));
+
+	last_tick = cluster_undo_cleaner_last_liveness_tick_at();
+	emit_row(rsinfo, "undo_cleaner", "undo_cleaner_last_liveness_tick_at",
+			 last_tick == 0 ? "(unset)" : pstrdup(timestamptz_to_str(last_tick)));
+
+	iters = cluster_undo_cleaner_main_loop_iters();
+	emit_row(rsinfo, "undo_cleaner", "undo_cleaner_main_loop_iters", fmt_int64(iters));
 }
 
 
@@ -1560,6 +1599,7 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		dump_diag(rsinfo);
 		dump_cluster_stats(rsinfo);
 		dump_cluster_cssd(rsinfo);
+		dump_undo_cleaner(rsinfo);
 		dump_scn(rsinfo);
 		dump_ges(rsinfo);
 		dump_grd(rsinfo);

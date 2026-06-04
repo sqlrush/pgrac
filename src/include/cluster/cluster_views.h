@@ -51,7 +51,7 @@
  *	internal table in cluster_views.c stays in sync with the enum.
  */
 #define CLUSTER_WAIT_EVENTS_COUNT                                                                  \
-	91 /* spec-2.39 D13: +3 ack/barrier wait events (SinvalAckWait/Send/Receive); was 88 spec-2.38 */
+	92 /* spec-3.13 D1: +1 Undo Cleaner main-loop wait event; was 91 spec-2.39 */
 
 
 /*

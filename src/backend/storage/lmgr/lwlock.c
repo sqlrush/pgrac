@@ -232,6 +232,8 @@ static const char *const BuiltinTrancheNames[] = {
 	"ClusterTTStatus",
 	/* PGRAC LWTRANCHE_CLUSTER_TT_SLOT: spec-3.4b D3 per-segment TT slot allocator */
 	"ClusterTTSlot",
+	/* PGRAC LWTRANCHE_CLUSTER_UNDO_CLEANER: spec-3.13 Undo Cleaner state */
+	"ClusterUndoCleaner",
 #endif
 };
 

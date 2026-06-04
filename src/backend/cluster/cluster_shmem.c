@@ -59,6 +59,7 @@
 #include "cluster/cluster_ic.h"				/* cluster_ic_init / shutdown (stage 0.18) */
 #include "cluster/cluster_ic_tier1.h"		/* cluster_ic_tier1_shmem_register (spec-2.2 D3) */
 #include "cluster/cluster_cssd.h"			/* cluster_cssd_shmem_register (2.5 Sprint A) */
+#include "cluster/cluster_undo_cleaner.h"	/* cluster_undo_cleaner_shmem_register (3.13) */
 #include "cluster/cluster_diag.h"			/* cluster_diag_shmem_register (1.13 Sprint A) */
 #include "cluster/cluster_inject.h"			/* CLUSTER_INJECTION_POINT */
 #include "cluster/cluster_lck.h"			/* cluster_lck_shmem_register (1.12 Sprint A) */
@@ -536,6 +537,10 @@ cluster_init_shmem_module(void)
 	/* spec-2.5 Sprint A D6: register cluster_cssd shmem region. */
 	if (cluster_shmem_lookup_region("pgrac cluster cssd") == NULL)
 		cluster_cssd_shmem_register();
+
+	/* spec-3.13 D1: register Undo Cleaner shmem region. */
+	if (cluster_shmem_lookup_region("pgrac cluster undo cleaner") == NULL)
+		cluster_undo_cleaner_shmem_register();
 
 	/* spec-2.2 D3 (2026-05-07): register cluster_ic_tier1 shmem region. */
 	if (cluster_shmem_lookup_region("pgrac cluster_ic_tier1") == NULL)

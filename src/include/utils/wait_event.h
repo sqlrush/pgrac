@@ -526,6 +526,8 @@ typedef enum {
 	 *	collector side.
 	 */
 	WAIT_EVENT_CLUSTER_NATIVE_PROBE_REPLY_WAIT,
+	/* spec-3.13 D1: Undo Cleaner main-loop idle wait. */
+	WAIT_EVENT_CLUSTER_BGPROC_UNDO_CLEANER_MAIN_LOOP,
 } WaitEventCluster;
 
 

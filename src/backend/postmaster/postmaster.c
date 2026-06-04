@@ -320,6 +320,7 @@ static pid_t DiagPID = 0;
 
 /* PGRAC (stage 1.14 Sprint A): Cluster Stats aux process pid; same pattern. */
 static pid_t ClusterStatsPID = 0;
+static pid_t UndoCleanerPID = 0; /* PGRAC: spec-3.13 Undo Cleaner (ServerLoop-managed) */
 
 /* PGRAC (stage 2.5 Sprint A): CSSD aux process pid; same pattern. */
 static pid_t CssdPID = 0;
@@ -650,6 +651,7 @@ static void ShmemBackendArrayRemove(Backend *bn);
 #define StartLck() StartChildProcess(LckProcess)
 #define StartDiag() StartChildProcess(DiagProcess)
 #define StartClusterStats() StartChildProcess(ClusterStatsProcess)
+#define StartUndoCleaner() StartChildProcess(UndoCleanerProcess) /* PGRAC: spec-3.13 */
 #define StartCssd() StartChildProcess(CssdProcess)
 #define StartQvotec() StartChildProcess(QvotecProcess)
 #define StartLms() StartChildProcess(LmsProcess)
@@ -1909,6 +1911,16 @@ ServerLoop(void)
 			ClusterStatsPID = StartClusterStats();
 
 		/*
+		 * PGRAC: spec-3.13 — Undo Cleaner is ServerLoop-managed only (NOT
+		 * phase-4 gated).  First spawn AND respawn both happen here: the
+		 * cleaner is best-effort (absence degrades to spec-3.12 lazy-only
+		 * recycling), so it has no startup gate, no wait-for-ready, and
+		 * no spawn-failure SQLSTATE.
+		 */
+		if (cluster_enabled && UndoCleanerPID == 0 && pmState == PM_RUN)
+			UndoCleanerPID = StartUndoCleaner();
+
+		/*
 		 * PGRAC: spec-2.5 Sprint A — same ServerLoop respawn for CSSD
 		 * (5th cluster aux process).  Spawned post PM_RUN by phase4
 		 * driver third upgrade;respawn here closes restart_after_crash
@@ -2839,6 +2851,9 @@ process_pm_reload_request(void)
 			signal_child(DiagPID, SIGHUP);
 		if (ClusterStatsPID != 0)
 			signal_child(ClusterStatsPID, SIGHUP);
+		/* PGRAC: spec-3.13 — same SIGHUP fan-out for Undo Cleaner. */
+		if (UndoCleanerPID != 0)
+			signal_child(UndoCleanerPID, SIGHUP);
 		if (CssdPID != 0)
 			signal_child(CssdPID, SIGHUP);
 		if (QvotecPID != 0) /* PGRAC spec-2.6 Step 3 D7 */
@@ -3342,6 +3357,13 @@ process_pm_child_exit(void)
 				HandleChildCrash(pid, exitstatus, _("cluster stats process"));
 			continue;
 		}
+		/* PGRAC: spec-3.13 — Undo Cleaner normal-exit harvest; ServerLoop respawns. */
+		if (pid == UndoCleanerPID) {
+			UndoCleanerPID = 0;
+			if (!EXIT_STATUS_0(exitstatus))
+				HandleChildCrash(pid, exitstatus, _("undo cleaner process"));
+			continue;
+		}
 		/*
 		 * PGRAC: stage 2.5 Sprint A — CSSD aux process exit handling
 		 * mirrors Cluster Stats / DIAG / LCK / LMON.  Same HC5 normal/
@@ -3794,6 +3816,11 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 		ClusterStatsPID = 0;
 	else if (ClusterStatsPID != 0 && take_action)
 		sigquit_child(ClusterStatsPID);
+	/* PGRAC: spec-3.13 — same crash cross-kill for Undo Cleaner. */
+	if (pid == UndoCleanerPID)
+		UndoCleanerPID = 0;
+	else if (UndoCleanerPID != 0 && take_action)
+		sigquit_child(UndoCleanerPID);
 
 	/* PGRAC (stage 2.5 Sprint A): same pattern for CSSD. */
 	if (pid == CssdPID)
@@ -4003,6 +4030,9 @@ PostmasterStateMachine(void)
 		/* spec-1.14 Q10 LIFO: Cluster Stats next. */
 		if (ClusterStatsPID != 0)
 			signal_child(ClusterStatsPID, SIGTERM);
+		/* PGRAC: spec-3.13 — same shutdown SIGTERM for Undo Cleaner. */
+		if (UndoCleanerPID != 0)
+			signal_child(UndoCleanerPID, SIGTERM);
 		/* spec-1.13 Q10 LIFO: DIAG next. */
 		if (DiagPID != 0)
 			signal_child(DiagPID, SIGTERM);
@@ -4065,6 +4095,8 @@ PostmasterStateMachine(void)
 			DiagPID == 0 &&
 			/* PGRAC: spec-1.14 Sprint A — same wait for Cluster Stats. */
 			ClusterStatsPID == 0 &&
+			/* PGRAC: spec-3.13 — same wait for Undo Cleaner. */
+			UndoCleanerPID == 0 &&
 			/* PGRAC: spec-2.5 Sprint A — same wait for CSSD. */
 			CssdPID == 0 &&
 			/* PGRAC: spec-2.6 Sprint A Step 3 D7 — same wait for QVOTEC. */
@@ -4418,6 +4450,9 @@ TerminateChildren(int signal)
 		signal_child(DiagPID, signal);
 	if (ClusterStatsPID != 0)
 		signal_child(ClusterStatsPID, signal);
+	/* PGRAC: spec-3.13 — same TerminateChildren for Undo Cleaner. */
+	if (UndoCleanerPID != 0)
+		signal_child(UndoCleanerPID, signal);
 	if (CssdPID != 0)
 		signal_child(CssdPID, signal);
 	if (QvotecPID != 0) /* PGRAC spec-2.6 Step 3 D7 */

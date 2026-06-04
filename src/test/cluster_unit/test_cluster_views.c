@@ -169,7 +169,7 @@ cluster_shmem_iter_regions(int *idx pg_attribute_unused(),
 UT_DEFINE_GLOBALS();
 
 
-UT_TEST(test_cluster_wait_events_count_is_91)
+UT_TEST(test_cluster_wait_events_count_is_92)
 {
 	/*
 	 * Cumulative registration roster: 61 prior + 3 added by spec-2.6 D11
@@ -192,7 +192,7 @@ UT_TEST(test_cluster_wait_events_count_is_91)
 	 * enum in wait_event.h and CLUSTER_WAIT_EVENTS_COUNT must move
 	 * together, and this test number must be bumped in lockstep.
 	 */
-	UT_ASSERT_EQ(CLUSTER_WAIT_EVENTS_COUNT, 91);
+	UT_ASSERT_EQ(CLUSTER_WAIT_EVENTS_COUNT, 92);
 }
 
 
@@ -232,7 +232,7 @@ int
 main(void)
 {
 	UT_PLAN(4);
-	UT_RUN(test_cluster_wait_events_count_is_91);
+	UT_RUN(test_cluster_wait_events_count_is_92);
 	UT_RUN(test_srf_symbol_linkable);
 	UT_RUN(test_first_event_is_ges_enqueue_acquire);
 	UT_RUN(test_adg_scn_sync_wait_in_adg_class);

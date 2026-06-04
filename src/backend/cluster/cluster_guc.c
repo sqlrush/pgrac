@@ -149,6 +149,11 @@ int cluster_diag_main_loop_interval = 1000;
 /* spec-1.14 D8: cluster.cluster_stats_main_loop_interval (mirror). */
 int cluster_cluster_stats_main_loop_interval = 1000;
 
+/* spec-3.13 D1: Undo Cleaner mirrors. */
+int cluster_undo_cleaner_interval_ms = 30000;
+bool cluster_undo_cleaner_enabled = true;
+int cluster_undo_cleaner_batch_segments = 8;
+
 /* spec-2.5 D9: CSSD main-loop tick interval (ms). */
 int cluster_cssd_main_loop_interval_ms = 1000;
 /* spec-2.5 D9: CSSD heartbeat broadcast interval (ms). */
@@ -1174,6 +1179,25 @@ cluster_init_guc(void)
 										 "functionally equivalent at this stage."),
 							&cluster_cluster_stats_main_loop_interval, 1000, 100, 60000, PGC_SIGHUP,
 							GUC_UNIT_MS, NULL, NULL, NULL);
+
+	/* spec-3.13 D1: Undo Cleaner GUC trio (专项 #9 §3.3.1 30s 承诺实名化). */
+	DefineCustomIntVariable("cluster.undo_cleaner_interval_ms",
+							gettext_noop("Undo Cleaner pass interval in milliseconds."),
+							gettext_noop("Cadence of proactive undo/TT-slot retention GC passes "
+										 "(spec-3.13). 0 = pressure-wakeup only."),
+							&cluster_undo_cleaner_interval_ms, 30000, 0, 3600000, PGC_SIGHUP, 0,
+							NULL, NULL, NULL);
+	DefineCustomBoolVariable(
+		"cluster.undo_cleaner_enabled",
+		gettext_noop("Enable proactive undo/TT-slot retention GC passes."),
+		gettext_noop("off = the Undo Cleaner process stays resident but each pass no-ops, "
+					 "reverting to spec-3.12 lazy-only recycling."),
+		&cluster_undo_cleaner_enabled, true, PGC_SIGHUP, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable(
+		"cluster.undo_cleaner_batch_segments",
+		gettext_noop("Max own-instance undo segments scanned per cleaner pass."),
+		gettext_noop("Bounds per-pass tail latency (spec-3.13 R7)."),
+		&cluster_undo_cleaner_batch_segments, 8, 1, 256, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	/* spec-2.5 D9: 3 NEW CSSD GUCs (PGC_POSTMASTER per spec §2.3 — applied
 	 * at postmaster init;hot-reload via SIGHUP not supported because

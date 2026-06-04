@@ -303,6 +303,10 @@ extern int cluster_cluster_stats_main_loop_interval;
  *                                at max(2, factor-1) × interval.
  */
 extern int cluster_cssd_main_loop_interval_ms;
+/* spec-3.13 D1: Undo Cleaner pass cadence / enable / batch GUCs. */
+extern int cluster_undo_cleaner_interval_ms;
+extern bool cluster_undo_cleaner_enabled;
+extern int cluster_undo_cleaner_batch_segments;
 extern int cluster_cssd_heartbeat_interval_ms;
 extern int cluster_cssd_dead_deadband_factor;
 

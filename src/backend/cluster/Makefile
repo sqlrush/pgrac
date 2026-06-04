@@ -90,6 +90,7 @@ OBJS = \
 	cluster_itl_cleanout.o \
 	cluster_itl_touch.o \
 	cluster_uba.o \
+	cluster_undo_cleaner.o \
 	cluster_undo_record.o \
 	cluster_undo_retention.o \
 	cluster_undo_srf.o \

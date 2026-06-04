@@ -595,8 +595,18 @@ typedef enum {
 	 * enqueue via cluster_sinval_enqueue_batch().  See cluster_sinval_bcast.h.
 	 */
 	SinvalBcastProcess,
-#endif
 
+	/*
+	 * Undo Cleaner is the Stage 3.13 cluster background process —
+	 * proactive undo/TT-slot retention GC (spec-3.13).  Appended after
+	 * SinvalBcastProcess to preserve numeric values.  Consumes the
+	 * B_UNDO_CLEANER BackendType reserved at Stage 1.  ServerLoop-
+	 * managed (NOT phase-4 gated): absence degrades to spec-3.12
+	 * lazy-only recycling.  See cluster_undo_cleaner.h.
+	 */
+	UndoCleanerProcess,
+
+#endif
 	NUM_AUXPROCTYPES /* Must be last! */
 } AuxProcType;
 
@@ -618,6 +628,7 @@ extern PGDLLIMPORT AuxProcType MyAuxProcType;
 #define AmLmsProcess() (MyAuxProcType == LmsProcess)
 #define AmLmdProcess() (MyAuxProcType == LmdProcess)
 #define AmSinvalBcastProcess() (MyAuxProcType == SinvalBcastProcess)
+#define AmUndoCleanerProcess() (MyAuxProcType == UndoCleanerProcess)
 #endif
 
 

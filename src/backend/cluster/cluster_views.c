@@ -199,6 +199,8 @@ static const uint32 cluster_wait_event_infos[CLUSTER_WAIT_EVENTS_COUNT] = {
 	WAIT_EVENT_CLUSTER_BGPROC_CLUSTER_STATS_MAIN_LOOP,
 	/* spec-2.5 D8: 5-process symmetric grep (enum/lookup/count/registry). */
 	WAIT_EVENT_CLUSTER_BGPROC_CSSD_MAIN_LOOP,
+	/* spec-3.13 D1: undo cleaner main loop (symmetric 4-place grep). */
+	WAIT_EVENT_CLUSTER_BGPROC_UNDO_CLEANER_MAIN_LOOP,
 	/* spec-2.6 D11: qvotec main loop (6th cluster aux process). */
 	WAIT_EVENT_CLUSTER_BGPROC_QVOTEC_MAIN_LOOP,
 	/* spec-2.6 D11: voting disk I/O (2 events;cluster_voting_disk_io). */
