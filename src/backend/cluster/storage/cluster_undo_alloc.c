@@ -42,6 +42,9 @@
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/cluster_undo_segment_init.h"
 #include "cluster/cluster_undo_smgr.h"
+#include "cluster/storage/cluster_undo_xlog.h" /* emit_segment_recycle (3.13 D3) */
+#include "cluster/cluster_undo_retention.h"	   /* segment recyclable predicate */
+#include "access/xlog.h"					   /* XLogFlush (3.13 v0.3 (1)) */
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "miscadmin.h"
@@ -539,6 +542,54 @@ cluster_undo_segment_mark_committed(uint32 segment_id, uint8 owner_instance)
 
 	hdr->segment_state = SEGMENT_COMMITTED;
 	return write_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data);
+}
+
+
+/*
+ * cluster_undo_segment_try_mark_recyclable -- spec-3.13 D3.
+ *
+ *	COMMITTED -> RECYCLABLE under the shipped 3.12 predicate
+ *	(cluster_undo_segment_recyclable: watermark strictly below horizon,
+ *	unresolved committed slot retains).  Durability order is the v0.3 (1)
+ *	three-step contract for direct pg_undo metadata:
+ *	  XLOG_UNDO_SEGMENT_RECYCLE insert -> XLogFlush -> pwrite block 0 ->
+ *	  fsync segment file.
+ *	Caller holds the undo lifecycle_lock (serializes against rollover /
+ *	extend / future reuse claim) and has already excluded the active
+ *	record segment.  No ereport on the WRITE_FAIL path: the cleaner is
+ *	best-effort and retries next pass (observability lands in step 8).
+ */
+ClusterUndoSegTryRecycle
+cluster_undo_segment_try_mark_recyclable(uint32 segment_id, uint8 owner_instance, SCN horizon)
+{
+	PGAlignedBlock blockbuf;
+	UndoSegmentHeaderData *hdr;
+	XLogRecPtr lsn;
+
+	if (!read_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data, &hdr))
+		return CLUSTER_SEG_RECYCLE_READ_FAIL;
+	if (!segment_header_identity_matches(blockbuf.data, segment_id, owner_instance))
+		return CLUSTER_SEG_RECYCLE_READ_FAIL; /* L212: identity, not template bytes */
+
+	if (hdr->segment_state == SEGMENT_RECYCLABLE)
+		return CLUSTER_SEG_RECYCLE_ALREADY; /* idempotent */
+	if (hdr->segment_state != SEGMENT_COMMITTED)
+		return CLUSTER_SEG_RECYCLE_NOT_COMMITTED;
+
+	if (!cluster_undo_segment_recyclable(hdr, horizon))
+		return CLUSTER_SEG_RECYCLE_RETAINED; /* live reader may need it (8.A) */
+
+	lsn = cluster_undo_emit_segment_recycle(owner_instance, segment_id, hdr->wrap_count,
+											(uint8)SEGMENT_COMMITTED, (uint8)SEGMENT_RECYCLABLE);
+	XLogFlush(lsn);
+
+	hdr->segment_state = SEGMENT_RECYCLABLE;
+	if (!write_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data))
+		return CLUSTER_SEG_RECYCLE_WRITE_FAIL;
+	if (!cluster_undo_smgr_fsync_segment_file(segment_id, owner_instance))
+		return CLUSTER_SEG_RECYCLE_WRITE_FAIL;
+
+	return CLUSTER_SEG_RECYCLE_ADVANCED;
 }
 
 

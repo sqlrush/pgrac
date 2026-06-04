@@ -44,7 +44,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_heap_lock_tuple test_cluster_perf_gates \
         test_cluster_subtrans test_cluster_multixact test_cluster_undo_format \
         test_cluster_undo_record test_cluster_undo_lifecycle test_cluster_cr test_cluster_cr_cache test_cluster_tt_durable \
-        test_cluster_retention
+        test_cluster_retention test_cluster_undo_cleaner
 
 # Path to the cluster_version object (no PG deps, safe to link standalone).
 CLUSTER_VERSION_O = $(top_builddir)/src/backend/cluster/cluster_version.o

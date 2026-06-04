@@ -43,13 +43,14 @@
 #ifndef FRONTEND
 
 #include "postgres.h"
-#include "access/transam.h"				 /* TransactionId */
-#include "storage/relfilelocator.h"		 /* RelFileLocator */
-#include "storage/block.h"				 /* BlockNumber */
-#include "storage/itemptr.h"			 /* OffsetNumber */
-#include "common/relpath.h"				 /* ForkNumber */
-#include "cluster/cluster_itl_slot.h"	 /* UBA */
-#include "cluster/cluster_undo_record.h" /* UndoRecordType */
+#include "access/transam.h"						/* TransactionId */
+#include "storage/relfilelocator.h"				/* RelFileLocator */
+#include "storage/block.h"						/* BlockNumber */
+#include "storage/itemptr.h"					/* OffsetNumber */
+#include "common/relpath.h"						/* ForkNumber */
+#include "cluster/cluster_itl_slot.h"			/* UBA */
+#include "cluster/cluster_undo_record.h"		/* UndoRecordType */
+#include "cluster/storage/cluster_undo_alloc.h" /* ClusterUndoSegTryRecycle (3.13) */
 
 
 /*
@@ -208,4 +209,9 @@ extern bool cluster_undo_test_force_segment_end(void);
 
 #endif /* !FRONTEND */
 
+
+/* spec-3.13 D3: cleaner-side segment lifecycle surface. */
+extern uint32 cluster_undo_record_active_segment_id(void);
+extern ClusterUndoSegTryRecycle cluster_undo_segment_advance_recyclable(uint32 segment_id,
+																		SCN horizon);
 #endif /* CLUSTER_UNDO_RECORD_API_H */

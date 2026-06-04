@@ -176,5 +176,21 @@ extern uint32 cluster_undo_segment_extend_or_create(uint8 owner_instance, bool *
  */
 extern uint32 cluster_undo_segment_scan_max_existing(uint8 owner_instance);
 
+/*
+ * spec-3.13 D3: COMMITTED -> RECYCLABLE advancement outcome.
+ */
+typedef enum ClusterUndoSegTryRecycle {
+	CLUSTER_SEG_RECYCLE_ADVANCED = 0,	   /* transitioned + durable */
+	CLUSTER_SEG_RECYCLE_ALREADY = 1,	   /* idempotent: already RECYCLABLE */
+	CLUSTER_SEG_RECYCLE_RETAINED = 2,	   /* predicate says a reader may need it */
+	CLUSTER_SEG_RECYCLE_NOT_COMMITTED = 3, /* ALLOCATED / ACTIVE: not a candidate */
+	CLUSTER_SEG_RECYCLE_READ_FAIL = 4,	   /* absent / I/O / identity mismatch */
+	CLUSTER_SEG_RECYCLE_WRITE_FAIL = 5	   /* pwrite / fsync failed; retry next pass */
+} ClusterUndoSegTryRecycle;
+
+/* Caller holds undo lifecycle_lock and excluded the active record segment. */
+extern ClusterUndoSegTryRecycle
+cluster_undo_segment_try_mark_recyclable(uint32 segment_id, uint8 owner_instance, SCN horizon);
+
 
 #endif /* CLUSTER_UNDO_ALLOC_H */

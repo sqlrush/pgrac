@@ -175,7 +175,7 @@ typedef enum UndoSegmentState {
  *   Per Hardening v1.0.1 H-2: spec-3.8 §3.5 wrap_count text 暗示 field
  *   already exists;  linkdb SSOT has no segment-level wrap_count field.
  *   TT slot wrap (per-slot, spec-1.20) preserved as-is;  segment-level
- *   wrap_count field introduction deferred to spec-3.12 真 recycle.
+ *   wrap_count landed at spec-3.13 D3 (offset 2680, see below).
  *   D4 changed to "TT slot wrap invariant preserve" (no-op per spec-1.20
  *   SSOT).
  */
@@ -259,8 +259,17 @@ typedef struct UndoSegmentHeaderData {
 	 *   state, etc.  All zero-init in Stage 1; Stage 2+ specs may
 	 *   carve named fields here (with catversion bump).
 	 */
-	uint8 _reserved[8192 - 1656 - UNDO_FREE_BITMAP_BYTES]; /* offset 2680 */
-														   /* total: 8192 bytes (one PG block) */
+	/*
+	 * spec-3.13 D3: segment reuse generation.  0 for a never-reused
+	 * segment (zero-init template); ++ on every whole-segment reuse
+	 * (XLOG_UNDO_SEGMENT_REUSE).  generation == wrap_count; redo of
+	 * 0x40/0x50 orders by it (stale-skip / impossible-state PANIC).
+	 * Lands in the first 4 bytes of the former _reserved area so all
+	 * prior field offsets are unchanged (catversion bumped).
+	 */
+	uint32 wrap_count;			  /* offset 2680 */
+	uint8 _reserved[8192 - 2684]; /* offset 2684 */
+								  /* total: 8192 bytes (one PG block) */
 } UndoSegmentHeaderData;
 
 
@@ -280,6 +289,11 @@ StaticAssertDecl(offsetof(UndoSegmentHeaderData, tt_slots) == 112,
 StaticAssertDecl(offsetof(UndoSegmentHeaderData, free_block_bitmap) == 1656,
 				 "spec-1.21 invariant: free_block_bitmap at byte 1656 "
 				 "(C natural alignment shifts the v0.2 body table value 1652 by +4)");
+StaticAssertDecl(offsetof(UndoSegmentHeaderData, wrap_count) == 2680,
+				 "spec-3.13 D3: wrap_count at byte 2680 (first 4B of former "
+				 "_reserved; no prior offset moves)");
+StaticAssertDecl(offsetof(UndoSegmentHeaderData, _reserved) == 2684,
+				 "spec-3.13 D3: _reserved shrinks to byte 2684");
 StaticAssertDecl(UNDO_BLOCKS_PER_SEGMENT == 8192,
 				 "spec-1.21 invariant: 64 MB segment / 8 KB block = 8192 blocks");
 /*

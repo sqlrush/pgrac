@@ -1219,3 +1219,59 @@ cluster_undo_test_force_segment_end(void)
 	LWLockRelease(&UndoRecordShared->cursor_lock.lock);
 	return true;
 }
+
+
+/*
+ * cluster_undo_record_active_segment_id -- spec-3.13 D3 accessor.
+ *
+ *	Snapshot of the shared record cursor's active segment (0 = none yet).
+ *	cursor_lock SHARED for a consistent read; callers use it as an
+ *	exclusion hint (the lifecycle_lock recheck in the advance wrapper is
+ *	the authoritative guard).
+ */
+uint32
+cluster_undo_record_active_segment_id(void)
+{
+	uint32 seg;
+
+	if (UndoRecordShared == NULL)
+		return 0;
+
+	LWLockAcquire(&UndoRecordShared->cursor_lock.lock, LW_SHARED);
+	seg = UndoRecordShared->active_segment_id;
+	LWLockRelease(&UndoRecordShared->cursor_lock.lock);
+	return seg;
+}
+
+
+/*
+ * cluster_undo_segment_advance_recyclable -- spec-3.13 D3 orchestration.
+ *
+ *	Takes the undo lifecycle_lock (Q6: the cleaner is just another
+ *	low-frequency allocator caller -- same lock order, no new lock
+ *	level), double-checks the segment is not the active record cursor
+ *	segment, then runs the COMMITTED -> RECYCLABLE transition with the
+ *	v0.3 (1) durability contract.  Horizon was computed by the caller
+ *	BEFORE this lock (C17).
+ */
+ClusterUndoSegTryRecycle
+cluster_undo_segment_advance_recyclable(uint32 segment_id, SCN horizon)
+{
+	ClusterUndoSegTryRecycle result;
+	uint8 owner;
+
+	if (UndoRecordShared == NULL || cluster_node_id < 0)
+		return CLUSTER_SEG_RECYCLE_READ_FAIL;
+
+	owner = (uint8)(cluster_node_id + 1);
+
+	LWLockAcquire(&UndoRecordShared->lifecycle_lock.lock, LW_EXCLUSIVE);
+	if (segment_id == UndoRecordShared->active_segment_id) {
+		LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
+		return CLUSTER_SEG_RECYCLE_NOT_COMMITTED; /* writer-active: never a candidate */
+	}
+	result = cluster_undo_segment_try_mark_recyclable(segment_id, owner, horizon);
+	LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
+
+	return result;
+}

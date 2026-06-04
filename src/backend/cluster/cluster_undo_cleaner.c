@@ -62,8 +62,10 @@
 
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
-#include "cluster/cluster_mode.h"			/* cluster_storage_mode_enabled */
-#include "cluster/cluster_undo_retention.h" /* horizon (C17: once per pass) */
+#include "cluster/cluster_mode.h"			 /* cluster_storage_mode_enabled */
+#include "cluster/cluster_undo_retention.h"	 /* horizon (C17: once per pass) */
+#include "cluster/cluster_tt_slot.h"		 /* current TT segment (exclusion) */
+#include "cluster/cluster_undo_record_api.h" /* active segment + advance (D3) */
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_undo_cleaner.h"
 
@@ -372,16 +374,46 @@ undo_cleaner_run_pass(void)
 		cluster_tt_slot_gc_current_pass(horizon, &stats);
 
 		/*
-		 * D2-B durable header scan + D3 segment advancement iterate the
-		 * rolled-away segment inventory under
-		 * cluster.undo_cleaner_batch_segments — wired in steps 4-8.
+		 * D2-B + D3: walk this instance's rolled-away segment inventory,
+		 * batch-bounded (R7).  For each segment that is neither the record
+		 * cursor's active segment nor the TT allocator's current segment:
+		 * read-only TT inventory scan, then COMMITTED -> RECYCLABLE
+		 * advancement under lifecycle_lock (Q6; horizon already computed
+		 * above, C17).
 		 */
+		{
+			uint8 owner = (uint8)(cluster_node_id + 1);
+			uint32 base = (uint32)cluster_node_id * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+			uint32 nseg = cluster_undo_segment_scan_max_existing(owner);
+			uint32 active_seg = cluster_undo_record_active_segment_id();
+			uint32 tt_seg = cluster_tt_slot_current_segment(cluster_node_id);
+			int batch = cluster_undo_cleaner_batch_segments;
+			uint32 seg;
+
+			for (seg = base; seg < base + nseg && batch > 0; seg++) {
+				if (seg == active_seg || seg == tt_seg)
+					continue;
+
+				CHECK_FOR_INTERRUPTS();
+
+				if (!cluster_undo_segment_tt_header_scan_pass(seg, owner, horizon, &stats))
+					continue; /* absent / unreadable: retry next pass */
+				batch--;
+
+				if (cluster_undo_segment_advance_recyclable(seg, horizon)
+					== CLUSTER_SEG_RECYCLE_ADVANCED)
+					stats.segments_marked_recyclable++;
+			}
+		}
 	}
 
 	Assert(undo_cleaner_state != NULL);
 	LWLockAcquire(&undo_cleaner_state->lwlock, LW_EXCLUSIVE);
 	undo_cleaner_state->pass_count++;
 	undo_cleaner_state->shmem_tt_slots_gcd += stats.shmem_tt_slots_gcd;
+	undo_cleaner_state->header_tt_slots_below_horizon += stats.header_tt_slots_below_horizon;
+	undo_cleaner_state->segments_marked_recyclable += stats.segments_marked_recyclable;
+	undo_cleaner_state->stale_active_skipped += stats.stale_active_skipped;
 	LWLockRelease(&undo_cleaner_state->lwlock);
 }
 

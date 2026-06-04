@@ -582,7 +582,8 @@
 /* spec-3.10 §v0.6 (2026-06-02):  TEST-ONLY cluster_cr_test_image SQL function
  * (oid 8931, SETOF record) so t/218 can assert CR-image CONTENT after the
  * line-pointer-reuse rebuild fix.  One pg_proc row -> catversion bump. */
-#define CATALOG_VERSION_NO 202606021
+/* spec-3.13 D3: undo segment header wrap_count @2680 + XLOG_UNDO_SEGMENT_RECYCLE 0x40 */
+#define CATALOG_VERSION_NO 202606041
 
 /* spec-2.39 D10 (2026-05-21):  SI Broadcaster production activation —
  * DDL commit hook (AtEOXact_Inval + COMMIT PREPARED via cluster-aware

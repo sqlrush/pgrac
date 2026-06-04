@@ -56,6 +56,14 @@ cluster_undo_desc(StringInfo buf, XLogReaderState *record)
 			(unsigned)rec->instance, (unsigned)rec->segment_id, (unsigned)rec->slot_offset,
 			(unsigned)rec->wrap, (unsigned)rec->xid, (uint64)rec->commit_scn);
 		break;
+	case XLOG_UNDO_SEGMENT_RECYCLE: {
+		xl_undo_segment_recycle *xlrec = (xl_undo_segment_recycle *)rec;
+
+		appendStringInfo(buf, "instance %u seg %u gen %u state %u->%u", xlrec->instance,
+						 xlrec->segment_id, xlrec->expected_generation, xlrec->old_state,
+						 xlrec->new_state);
+		break;
+	}
 	}
 	default:
 		appendStringInfo(buf, "unknown op %u", info);
@@ -72,6 +80,8 @@ cluster_undo_identify(uint8 info)
 		return "UNDO_SEGMENT_INIT";
 	case XLOG_UNDO_TT_SLOT_COMMIT:
 		return "UNDO_TT_SLOT_COMMIT";
+	case XLOG_UNDO_SEGMENT_RECYCLE:
+		return "UNDO_SEGMENT_RECYCLE";
 	default:
 		return NULL;
 	}

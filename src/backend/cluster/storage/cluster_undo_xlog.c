@@ -185,6 +185,41 @@ cluster_undo_emit_tt_slot_commit(uint8 instance, uint32 segment_id, uint16 slot_
 
 
 /*
+ * cluster_undo_emit_segment_recycle -- spec-3.13 D3.
+ *
+ *   WAL-before-data with EXPLICIT durability (spec-3.13 v0.3 (1)):
+ *   the caller sequence is XLogFlush(returned lsn) -> pwrite block 0
+ *   -> fsync segment file.  Pure WAL+redo is NOT sufficient for these
+ *   direct pg_undo writes: once a checkpoint advances past this
+ *   record, a page-cache-lost header rewrite would never be replayed
+ *   (pg_undo files are not in the checkpointer sync queue).
+ */
+XLogRecPtr
+cluster_undo_emit_segment_recycle(uint8 instance, uint32 segment_id, uint32 expected_generation,
+								  uint8 old_state, uint8 new_state)
+{
+	xl_undo_segment_recycle rec;
+	XLogRecPtr lsn;
+
+	Assert(instance >= 1);
+
+	memset(&rec, 0, sizeof(rec));
+	rec.segment_id = segment_id;
+	rec.expected_generation = expected_generation;
+	rec.instance = instance;
+	rec.old_state = old_state;
+	rec.new_state = new_state;
+
+	XLogBeginInsert();
+	XLogRegisterData((char *)&rec, sizeof(rec));
+
+	lsn = XLogInsert(RM_CLUSTER_UNDO_ID, XLOG_UNDO_SEGMENT_RECYCLE);
+
+	return lsn;
+}
+
+
+/*
  * Replay XLOG_UNDO_SEGMENT_INIT.
  *
  *   Spec-1.22 Hardening v1.0.3: full idempotent create + size + restore
@@ -421,6 +456,113 @@ cluster_undo_redo_tt_slot_commit(XLogReaderState *record)
 
 
 /*
+ * Replay XLOG_UNDO_SEGMENT_RECYCLE (spec-3.13 D3).
+ *
+ *   Generation-ordered block-0 state RMW, mirroring the 0x30 redo I/O
+ *   shape.  Decision via the header-inline pure table
+ *   (cluster_undo_segment_recycle_redo_decide):
+ *     disk gen >  rec gen -> stale skip (a later reuse is durable);
+ *     disk gen == rec gen -> idempotent apply when state is old/new;
+ *     disk gen <  rec gen -> PANIC (the preceding REUSE redo must have
+ *                            aligned the generation; v0.3 (2));
+ *     same gen, alien state -> PANIC.
+ */
+static void
+cluster_undo_redo_segment_recycle(XLogReaderState *record)
+{
+	xl_undo_segment_recycle *rec;
+	char path[MAXPGPATH];
+	int fd;
+	PGAlignedBlock blockbuf;
+	UndoSegmentHeaderData *hdr;
+	ssize_t nread;
+
+	if (XLogRecGetDataLen(record) != sizeof(*rec))
+		ereport(PANIC, (errmsg("invalid XLOG_UNDO_SEGMENT_RECYCLE record length: %u",
+							   XLogRecGetDataLen(record))));
+	rec = (xl_undo_segment_recycle *)XLogRecGetData(record);
+
+	if (build_undo_segment_path(rec->instance, rec->segment_id, path, sizeof(path)) != 0)
+		ereport(PANIC, (errmsg("undo segment path too long: instance=%u seg=%u", rec->instance,
+							   rec->segment_id)));
+
+	fd = BasicOpenFile(path, O_RDWR | PG_BINARY);
+	if (fd < 0)
+		ereport(PANIC,
+				(errcode_for_file_access(),
+				 errmsg("could not open undo segment file \"%s\" for recycle redo: %m", path),
+				 errhint("XLOG_UNDO_SEGMENT_INIT must precede XLOG_UNDO_SEGMENT_RECYCLE.")));
+
+	nread = pg_pread(fd, blockbuf.data, BLCKSZ, 0);
+	if (nread != BLCKSZ) {
+		int save_errno = errno;
+
+		close(fd);
+		errno = save_errno;
+		ereport(PANIC, (errcode_for_file_access(),
+						errmsg("could not read undo segment header \"%s\": read %zd of %d bytes",
+							   path, nread, BLCKSZ)));
+	}
+
+	hdr = (UndoSegmentHeaderData *)blockbuf.data;
+
+	switch (cluster_undo_segment_recycle_redo_decide(hdr->wrap_count, hdr->segment_state, rec)) {
+	case CLUSTER_SEGRECYCLE_REDO_SKIP_STALE:
+		break; /* a later whole-segment reuse is already durable */
+	case CLUSTER_SEGRECYCLE_REDO_BAD_GENERATION:
+		close(fd);
+		ereport(PANIC,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("undo segment \"%s\" generation %u behind recycle record %u during redo",
+						path, hdr->wrap_count, rec->expected_generation),
+				 errdetail("The preceding XLOG_UNDO_SEGMENT_REUSE replay must have aligned the "
+						   "on-disk generation; a lower value indicates lost writes.")));
+		break;
+	case CLUSTER_SEGRECYCLE_REDO_BAD_STATE:
+		close(fd);
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("undo segment \"%s\" state %u incompatible with recycle redo "
+							   "(%u -> %u) at generation %u",
+							   path, hdr->segment_state, rec->old_state, rec->new_state,
+							   rec->expected_generation)));
+		break;
+	case CLUSTER_SEGRECYCLE_REDO_APPLY: {
+		ssize_t written;
+
+		hdr->segment_state = rec->new_state;
+
+		written = pg_pwrite(fd, blockbuf.data, BLCKSZ, 0);
+		if (written != BLCKSZ) {
+			int save_errno = errno;
+
+			close(fd);
+			errno = save_errno;
+			ereport(PANIC,
+					(errcode_for_file_access(),
+					 errmsg("could not write undo segment \"%s\" recycle state: wrote %zd of %d "
+							"bytes",
+							path, written, BLCKSZ)));
+		}
+		if (pg_fsync(fd) != 0) {
+			int save_errno = errno;
+
+			close(fd);
+			errno = save_errno;
+			ereport(PANIC,
+					(errcode_for_file_access(),
+					 errmsg("could not fsync undo segment \"%s\" after recycle redo: %m", path)));
+		}
+		break;
+	}
+	}
+
+	if (close(fd) != 0)
+		ereport(PANIC, (errcode_for_file_access(),
+						errmsg("could not close undo segment file \"%s\": %m", path)));
+}
+
+
+/*
  * cluster_undo_redo -- RM_CLUSTER_UNDO redo handler entry point.
  *
  *   Dispatches by xl_info & XLR_INFO_MASK after stripping the framework
@@ -437,6 +579,9 @@ cluster_undo_redo(XLogReaderState *record)
 		break;
 	case XLOG_UNDO_TT_SLOT_COMMIT:
 		cluster_undo_redo_tt_slot_commit(record);
+		break;
+	case XLOG_UNDO_SEGMENT_RECYCLE:
+		cluster_undo_redo_segment_recycle(record);
 		break;
 	default:
 		ereport(PANIC, (errmsg("cluster_undo_redo: unknown op code %u", info)));

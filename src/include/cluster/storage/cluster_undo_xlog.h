@@ -48,11 +48,12 @@
  *   Stage 1.22: XLOG_UNDO_SEGMENT_INIT only.  feature-117/120 may add:
  *     0x20 XLOG_UNDO_TT_SLOT_BIND
  *     0x30 XLOG_UNDO_TT_SLOT_COMMIT
- *     0x40 XLOG_UNDO_SEGMENT_RECYCLE
+ *     0x40 XLOG_UNDO_SEGMENT_RECYCLE (landed: spec-3.13 D3)
  *     ... up to 0xF0 (low nibble used for XLR_INFO_MASK by xlog framework).
  */
 #define XLOG_UNDO_SEGMENT_INIT 0x10
-#define XLOG_UNDO_TT_SLOT_COMMIT 0x30 /* spec-3.11 D3: durable TT slot commit_scn */
+#define XLOG_UNDO_TT_SLOT_COMMIT 0x30  /* spec-3.11 D3: durable TT slot commit_scn */
+#define XLOG_UNDO_SEGMENT_RECYCLE 0x40 /* spec-3.13 D3: COMMITTED -> RECYCLABLE */
 
 
 /*
@@ -129,6 +130,56 @@ typedef struct xl_undo_tt_slot_commit {
 	SCN commit_scn;		  /* offset 16; 8 B */
 } xl_undo_tt_slot_commit; /* total 24 B */
 
+/*
+ * On-disk WAL payload for XLOG_UNDO_SEGMENT_RECYCLE (spec-3.13 D3).
+ *
+ *   Generation-ordered state delta: redo applies new_state to block 0
+ *   only when the on-disk wrap_count equals expected_generation and the
+ *   on-disk state is old_state/new_state (idempotent).  A HIGHER disk
+ *   generation means a later whole-segment reuse is already durable ->
+ *   stale skip.  A LOWER disk generation is impossible once the
+ *   preceding XLOG_UNDO_SEGMENT_REUSE has replayed -> corruption, PANIC
+ *   (spec-3.13 v0.3 (2): no silent skip).
+ *
+ *   12 bytes, no implicit padding (explicit _pad).
+ */
+typedef struct xl_undo_segment_recycle {
+	uint32 segment_id;			/* absolute segment id */
+	uint32 expected_generation; /* hdr->wrap_count at transition time */
+	uint8 instance;				/* owner instance (1-based) */
+	uint8 old_state;			/* SEGMENT_COMMITTED */
+	uint8 new_state;			/* SEGMENT_RECYCLABLE */
+	uint8 _pad;					/* explicit padding */
+} xl_undo_segment_recycle;
+
+StaticAssertDecl(sizeof(xl_undo_segment_recycle) == 12,
+				 "spec-3.13: xl_undo_segment_recycle is 12 bytes, no implicit padding");
+
+/*
+ * Pure redo decision for XLOG_UNDO_SEGMENT_RECYCLE (cluster_unit-tested;
+ * spec-3.13 §2.4 redo table).  Header-inline so the table is testable
+ * without linking the WAL machinery.
+ */
+typedef enum ClusterUndoSegRecycleRedo {
+	CLUSTER_SEGRECYCLE_REDO_APPLY = 0,
+	CLUSTER_SEGRECYCLE_REDO_SKIP_STALE = 1,		/* disk gen > rec gen: later reuse durable */
+	CLUSTER_SEGRECYCLE_REDO_BAD_GENERATION = 2, /* disk gen < rec gen: impossible -> PANIC */
+	CLUSTER_SEGRECYCLE_REDO_BAD_STATE = 3		/* same gen, state not old/new -> PANIC */
+} ClusterUndoSegRecycleRedo;
+
+static inline ClusterUndoSegRecycleRedo
+cluster_undo_segment_recycle_redo_decide(uint32 disk_generation, uint8 disk_state,
+										 const xl_undo_segment_recycle *rec)
+{
+	if (disk_generation > rec->expected_generation)
+		return CLUSTER_SEGRECYCLE_REDO_SKIP_STALE;
+	if (disk_generation < rec->expected_generation)
+		return CLUSTER_SEGRECYCLE_REDO_BAD_GENERATION;
+	if (disk_state == rec->old_state || disk_state == rec->new_state)
+		return CLUSTER_SEGRECYCLE_REDO_APPLY;
+	return CLUSTER_SEGRECYCLE_REDO_BAD_STATE;
+}
+
 StaticAssertDecl(sizeof(xl_undo_tt_slot_commit) == 24,
 				 "xl_undo_tt_slot_commit must be exactly 24 bytes (WAL ABI lock; "
 				 "spec-3.11 §2.3 + L45/L48)");
@@ -162,6 +213,11 @@ extern XLogRecPtr cluster_undo_emit_segment_init(uint8 instance, uint32 segment_
 extern XLogRecPtr cluster_undo_emit_tt_slot_commit(uint8 instance, uint32 segment_id,
 												   uint16 slot_offset, uint16 wrap,
 												   TransactionId xid, SCN commit_scn);
+
+/* spec-3.13 D3: emit XLOG_UNDO_SEGMENT_RECYCLE (caller XLogFlush + pwrite + fsync). */
+extern XLogRecPtr cluster_undo_emit_segment_recycle(uint8 instance, uint32 segment_id,
+													uint32 expected_generation, uint8 old_state,
+													uint8 new_state);
 
 /*
  * cluster_undo_redo
