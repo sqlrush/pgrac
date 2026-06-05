@@ -2966,20 +2966,32 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 		uint16		marker_origin = 0;
 
 		if (cluster_itl_find_multixact_origin_by_xmax(page, (MultiXactId) xwait, &marker_origin)
-			&& (int32) marker_origin != cluster_node_id)
+			&& (int32) marker_origin != cluster_node_id) {
 			cluster_vis_bump_vis_conflict_failclosed_count();
 			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
 							errmsg("cross-node write conflict: remote multixact writer %u on node %u",
 								   xwait, marker_origin),
 							errhint("Retry the transaction; cross-node wait lands at Stage 5.2.")));
+		}
 		return; /* local multixact: native wait is correct */
 	}
 
-	if (tup->t_data->t_itl_slot_idx == CLUSTER_ITL_SLOT_UNALLOCATED
-		|| !cluster_itl_get_tt_ref(page, tup->t_data->t_itl_slot_idx, &cref)
-		|| cref.tt_slot_id == 0 || cref.local_xid != xwait
-		|| (int32) cref.origin_node_id == cluster_node_id)
+	if (HEAP_XMAX_IS_LOCKED_ONLY(saved_infomask)) {
+		if (!cluster_itl_find_lock_tt_ref_by_xmax(page, xwait, &cref)
+			|| cref.tt_slot_id == 0 || (int32) cref.origin_node_id == cluster_node_id)
+			return; /* local / placeholder / no lock-only ITL: native wait is correct */
+		if (cref.local_xid != xwait)
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+							errmsg("cluster TT slot recycled for remote lock_xid %u", xwait),
+							errhint("ITL slot no longer maps to this xid; retry.")));
+	} else if (tup->t_data->t_itl_slot_idx == CLUSTER_ITL_SLOT_UNALLOCATED
+			   || !cluster_itl_get_tt_ref(page, tup->t_data->t_itl_slot_idx, &cref)
+			   || cref.tt_slot_id == 0 || (int32) cref.origin_node_id == cluster_node_id)
 		return; /* local / placeholder / not-this-xid: native wait is correct */
+	else if (cref.local_xid != xwait)
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+						errmsg("cluster TT slot recycled for remote writer %u", xwait),
+						errhint("ITL slot no longer maps to this xid; retry.")));
 
 	/* Drop the buffer content lock before the TT lookup (lock order). */
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
@@ -2998,12 +3010,20 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 						errhint("Remote commit_scn not yet propagated; retry or abort.")));
 
 	if (cres.status == CLUSTER_TT_STATUS_IN_PROGRESS
-		|| cres.status == CLUSTER_TT_STATUS_SUBCOMMITTED)
+		|| cres.status == CLUSTER_TT_STATUS_SUBCOMMITTED) {
 		cluster_vis_bump_vis_conflict_failclosed_count();
+		if (HEAP_XMAX_IS_LOCKED_ONLY(saved_infomask))
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_REMOTE_ROW_LOCK_WAIT_NOT_SUPPORTED),
+							errmsg("cannot wait for remote row lock held by transaction %u on node %u",
+								   xwait, cref.origin_node_id),
+							errhint("Cross-node block-wait is not supported in spec-3.4d; "
+									"application should retry, use SKIP LOCKED, or wait for "
+									"spec-5.2 GES TX to ship.")));
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
 						errmsg("cross-node write conflict: remote writer %u on node %u still running",
 							   xwait, cref.origin_node_id),
 						errhint("Retry the transaction; cross-node write wait lands at Stage 5.2.")));
+	}
 
 	/* Remote writer already terminal (committed/aborted): restore the buffer
 	 * content lock; the native path's xmax_infomask_changed recheck handles

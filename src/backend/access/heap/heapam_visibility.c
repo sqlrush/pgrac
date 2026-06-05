@@ -1028,7 +1028,7 @@ HeapTupleSatisfiesUpdate(HeapTuple htup, CommandId curcid, Buffer buffer)
  *	fail-closes to 53R9H.  Tuple ITL evidence gate.
  */
 static bool
-cluster_satisfies_dirty_fork(HeapTuple htup, Buffer buffer, bool *visible)
+cluster_satisfies_dirty_fork(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool *visible)
 {
 	HeapTupleHeader tuple = htup->t_data;
 	TransactionId raw_xid = HeapTupleHeaderGetRawXmin(tuple);
@@ -1131,11 +1131,10 @@ cluster_satisfies_dirty_fork(HeapTuple htup, Buffer buffer, bool *visible)
 			}
 		}
 		/* local xmax. */
-		if (TransactionIdIsInProgress(raw_xmax))
-			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
-							errmsg("cross-node write conflict: in-progress xmax over remote xmin"),
-							errhint("Retry; cross-node wait lands at Stage 5.2.")));
-		if (TransactionIdDidCommit(raw_xmax))
+		if (TransactionIdIsInProgress(raw_xmax)) {
+			snapshot->xmax = raw_xmax;
+			*visible = true;
+		} else if (TransactionIdDidCommit(raw_xmax))
 			*visible = false;
 		else
 			*visible = true;
@@ -1160,7 +1159,7 @@ HeapTupleSatisfiesDirty(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 	{
 		bool		cluster_vis;
 
-		if (cluster_satisfies_dirty_fork(htup, buffer, &cluster_vis)) {
+		if (cluster_satisfies_dirty_fork(htup, snapshot, buffer, &cluster_vis)) {
 			cluster_vis_bump_vis_dirty_fork_count();
 			return cluster_vis;
 		}
@@ -2019,6 +2018,9 @@ HeapTupleSatisfiesVacuumHorizon(HeapTuple htup, Buffer buffer, TransactionId *de
 static bool
 HeapTupleSatisfiesNonVacuumable(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 {
+	TransactionId dead_after = InvalidTransactionId;
+	HTSV_Result res;
+
 #ifdef USE_PGRAC_CLUSTER
 	/* spec-3.14 D5: remote writer evidence -> not removable (keep). */
 	if (cluster_storage_mode_enabled()
@@ -2027,9 +2029,6 @@ HeapTupleSatisfiesNonVacuumable(HeapTuple htup, Snapshot snapshot, Buffer buffer
 		return true;
 	}
 #endif
-
-	TransactionId dead_after = InvalidTransactionId;
-	HTSV_Result res;
 
 	res = HeapTupleSatisfiesVacuumHorizon(htup, buffer, &dead_after);
 
