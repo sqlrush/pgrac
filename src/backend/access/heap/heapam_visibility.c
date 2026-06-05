@@ -94,6 +94,7 @@
 #include "cluster/cluster_visibility_inject.h" /* D5b test-only inject helper */
 #include "cluster/cluster_cr.h"				   /* spec-3.9 D5 CR 3-tier MVCC gate */
 #include "cluster/cluster_visibility_resolve.h" /* spec-3.14 D1 单一解析器 */
+#include "cluster/cluster_mode.h"			   /* spec-3.14 storage-mode gate */
 #endif
 
 
@@ -428,6 +429,163 @@ HeapTupleSatisfiesToast(HeapTuple htup, Snapshot snapshot, Buffer buffer)
  *	the current transaction.  Callers that want to distinguish that case must
  *	test for it themselves.)
  */
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * spec-3.14 D2a: HeapTupleSatisfiesUpdate cluster fork.
+ *
+ *	Closes prospecting hole #1 (lost update): without this, a remote
+ *	in-progress xmax falls into the PG-native body and is judged via the
+ *	LOCAL CLOG -- a remote running writer reads as "not in progress" ->
+ *	TM_Ok -> lost update.  SatisfiesUpdate has no snapshot, so the gate
+ *	is tuple ITL evidence (D1), not snapshot_source.
+ *
+ *	Returns true + *res when the cluster path decides; false to fall
+ *	through to the PG-native body (own xid / no remote evidence / fully
+ *	local tuple -- all correct on the local CLOG).
+ *
+ *	C-V4: a remote in-progress writer maps to TM_BeingModified here; the
+ *	caller-side wait bridge (D2b) translates it to 53R9H after the ABA
+ *	recheck, so wait_policy (SKIP LOCKED / NOWAIT) is preserved.  The
+ *	lock-only remote path reuses the spec-3.4d bridge unchanged.
+ */
+static bool
+cluster_satisfies_update_fork(HeapTuple htup, Buffer buffer, TM_Result *res)
+{
+	HeapTupleHeader tuple = htup->t_data;
+	TransactionId raw_xmin = HeapTupleHeaderGetRawXmin(tuple);
+	TransactionId raw_xmax;
+	ClusterVisResolve r;
+	bool		xmin_remote_visible = false;
+	bool		lock_only;
+	bool		is_delete;
+	ClusterVisXidKind kind;
+
+	if (!cluster_storage_mode_enabled() || !BufferIsValid(buffer))
+		return false;
+	if (!PageHasItl(BufferGetPage(buffer)))
+		return false;
+
+	/* Our own insert: PG-native handles cmin / self-modified correctly. */
+	if (TransactionIdIsCurrentTransactionId(raw_xmin))
+		return false;
+
+	/* ---- xmin ---- */
+	cluster_visibility_resolve_tuple(buffer, tuple, raw_xmin, CLUSTER_VIS_XMIN, &r);
+	if (r.evidence == CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS)
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+						errmsg("cluster TT slot recycled for xmin %u", raw_xmin),
+						errhint("ITL slot no longer maps to this xid; retry.")));
+	if (r.evidence == CLUSTER_VIS_EVIDENCE_REMOTE) {
+		switch (cluster_vis_update_xmin_verdict(r.status)) {
+		case CVV_INVISIBLE:
+			*res = TM_Invisible;
+			return true;
+		case CVV_FAILCLOSED_UNKNOWN:
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+							errmsg("cluster TT status unknown for xmin %u", raw_xmin),
+							errhint("Remote commit_scn not yet propagated; retry or abort.")));
+			break;
+		case CVV_VISIBLE:
+			xmin_remote_visible = true;
+			break;
+		default:
+			break;
+		}
+	}
+	/* xmin NONE/LOCAL: leave xmin to PG unless we must intercept the xmax. */
+
+	/* ---- xmax ---- */
+	if (tuple->t_infomask & HEAP_XMAX_INVALID) {
+		if (xmin_remote_visible) {
+			*res = TM_Ok; /* live remote-committed tuple, no deleter */
+			return true;
+		}
+		return false; /* local xmin: PG-native */
+	}
+
+	raw_xmax = HeapTupleHeaderGetRawXmax(tuple);
+
+	if (tuple->t_infomask & HEAP_XMAX_IS_MULTI) {
+		ClusterVisResolve mr;
+
+		cluster_visibility_resolve_tuple(buffer, tuple, raw_xmax, CLUSTER_VIS_XMAX_MULTI, &mr);
+		if (mr.multi_marker_is_remote) {
+			*res = TM_BeingModified; /* remote multixact -> D2b bridge 53R9H */
+			return true;
+		}
+		if (xmin_remote_visible)
+			/* local multixact over a remote-inserted tuple: rare; cannot
+			 * judge members against the remote xmin safely here. Conservative
+			 * fail-closed (53R9H, retryable) rather than risk a wrong verdict. */
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
+							errmsg("cross-node write conflict on multixact-locked tuple"),
+							errhint("Retry the transaction; cross-node multixact wait lands "
+									"at Stage 5.2.")));
+		return false; /* fully local: PG-native */
+	}
+
+	/* Our own xmax: PG-native (self-modified). */
+	if (TransactionIdIsCurrentTransactionId(raw_xmax)) {
+		if (xmin_remote_visible) {
+			*res = TM_SelfModified;
+			return true;
+		}
+		return false;
+	}
+
+	lock_only = HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask);
+	is_delete = !lock_only && !HeapTupleHeaderIndicatesMovedPartitions(tuple)
+				&& ItemPointerEquals(&htup->t_self, &tuple->t_ctid);
+	kind = lock_only ? CLUSTER_VIS_XMAX_LOCK_ONLY : CLUSTER_VIS_XMAX_UPDATE;
+
+	cluster_visibility_resolve_tuple(buffer, tuple, raw_xmax, kind, &r);
+	if (r.evidence == CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS)
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+						errmsg("cluster TT slot recycled for xmax %u", raw_xmax),
+						errhint("ITL slot no longer maps to this xid; retry.")));
+	if (r.evidence == CLUSTER_VIS_EVIDENCE_REMOTE) {
+		switch (cluster_vis_update_xmax_verdict(r.status, is_delete)) {
+		case CVV_VISIBLE:
+			*res = TM_Ok;
+			return true;
+		case CVV_GONE_UPDATED:
+			*res = TM_Updated;
+			return true;
+		case CVV_GONE_DELETED:
+			*res = TM_Deleted;
+			return true;
+		case CVV_BEING_MODIFIED:
+			*res = TM_BeingModified; /* -> D2b bridge (writer 53R9H / lock-only 53R98) */
+			return true;
+		case CVV_FAILCLOSED_UNKNOWN:
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+							errmsg("cluster TT status unknown for xmax %u", raw_xmax),
+							errhint("Remote commit_scn not yet propagated; retry or abort.")));
+			break;
+		default:
+			break;
+		}
+	}
+
+	/*
+	 * xmax NONE/LOCAL.  If xmin is remote-committed we MUST NOT fall through
+	 * (the PG body would re-judge the remote xmin via local CLOG, hole #1);
+	 * judge the local xmax with PG primitives (correct for a local xid).
+	 */
+	if (xmin_remote_visible) {
+		if (TransactionIdIsInProgress(raw_xmax))
+			*res = TM_BeingModified;
+		else if (TransactionIdDidCommit(raw_xmax))
+			*res = is_delete ? TM_Deleted : TM_Updated;
+		else
+			*res = TM_Ok; /* xmax aborted */
+		return true;
+	}
+
+	return false; /* fully local tuple: PG-native */
+}
+#endif /* USE_PGRAC_CLUSTER */
+
 TM_Result
 HeapTupleSatisfiesUpdate(HeapTuple htup, CommandId curcid, Buffer buffer)
 {
@@ -435,6 +593,15 @@ HeapTupleSatisfiesUpdate(HeapTuple htup, CommandId curcid, Buffer buffer)
 
 	Assert(ItemPointerIsValid(&htup->t_self));
 	Assert(htup->t_tableOid != InvalidOid);
+
+#ifdef USE_PGRAC_CLUSTER
+	{
+		TM_Result	cluster_res;
+
+		if (cluster_satisfies_update_fork(htup, buffer, &cluster_res))
+			return cluster_res;
+	}
+#endif
 
 	if (!HeapTupleHeaderXminCommitted(tuple)) {
 		if (HeapTupleHeaderXminInvalid(tuple))

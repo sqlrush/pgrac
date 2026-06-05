@@ -601,6 +601,7 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 # ERRCODE_LOCK_NOT_AVAILABLE.  L199 NEW lesson — remote ACTIVE must fail
 # closed, never silent PG-native fallback.
 53R98    E    ERRCODE_CLUSTER_REMOTE_ROW_LOCK_WAIT_NOT_SUPPORTED               cluster_remote_row_lock_wait_not_supported
+53R9H    E    ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT                        cluster_cross_node_write_conflict
 
 # spec-3.4d Q5 (v0.2 F4 P1):  heap_lock_tuple peer mode + final xmax (after
 # compute_new_xmax_infomask) is a MultiXact.  MULTIXACT cross-node row lock
