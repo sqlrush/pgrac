@@ -207,11 +207,14 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 	 * wires real BAST/CANCEL SIGUSR1 handling.  I14 invariant (spec-2.19
 	 * §1.4 P1.4):LMD skeleton MUST NOT register ProcSignal slot;若 spec-2.20+
 	 * 需引入必同 spec ship 完整 register + cleanup + shutdown 语义 (L114
-	 * producer-consumer lifecycle 闭环 family).
+	 * producer-consumer lifecycle 闭环 family).  SinvalBcastProcess and
+	 * UndoCleanerProcess likewise use direct signals + latches only at their
+	 * current stage, so keep them out of ProcSignal until a later spec wires
+	 * a real SIGUSR1 reason consumer.
 	 */
 #ifdef USE_PGRAC_CLUSTER
 	if (MyAuxProcType != LmsProcess && MyAuxProcType != LmdProcess
-		&& MyAuxProcType != SinvalBcastProcess)
+		&& MyAuxProcType != SinvalBcastProcess && MyAuxProcType != UndoCleanerProcess)
 #endif
 		ProcSignalInit(MaxBackends + MyAuxProcType + 1);
 
@@ -237,16 +240,16 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 	 * pgstat-visible publication / any LMS/LMD shmem-LWLock-CV operation.
 	 */
 	if (MyAuxProcType == LmsProcess || MyAuxProcType == LmdProcess
-		|| MyAuxProcType == SinvalBcastProcess) {
+		|| MyAuxProcType == SinvalBcastProcess || MyAuxProcType == UndoCleanerProcess) {
 		pqsignal(SIGHUP, SignalHandlerForConfigReload);
 		pqsignal(SIGINT, SignalHandlerForShutdownRequest);
 		pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
 		pqsignal(SIGALRM, SIG_IGN);
 		pqsignal(SIGPIPE, SIG_IGN);
 		/*
-		 * LMS / LMD deliberately skip ProcSignalInit() in this skeleton
-		 * phase.  Installing procsignal_sigusr1_handler before a slot exists
-		 * makes any startup-window SIGUSR1 dereference uninitialized state.
+		 * These cluster aux processes deliberately skip ProcSignalInit() in
+		 * this stage.  Installing procsignal_sigusr1_handler before a slot
+		 * exists makes any startup-window SIGUSR1 dereference uninitialized state.
 		 * Keep SIGUSR1 ignored until the production spec registers the full
 		 * ProcSignal lifecycle.
 		 */

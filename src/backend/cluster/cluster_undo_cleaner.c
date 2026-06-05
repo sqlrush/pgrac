@@ -456,7 +456,8 @@ UndoCleanerMain(void)
 	 *	SIGHUP  -> ProcessConfigFile reload (interval / enabled GUCs)
 	 *	SIGTERM/SIGINT -> ShutdownRequestPending (graceful exit)
 	 *	SIGQUIT -> installed by InitPostmasterChild (immediate)
-	 *	SIGUSR1 -> procsignal_sigusr1_handler
+	 *	SIGUSR1 -> ignored (this stage uses direct signals + latch wakeups,
+	 *	           not ProcSignal reasons)
 	 */
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGINT, SignalHandlerForShutdownRequest);
@@ -464,7 +465,7 @@ UndoCleanerMain(void)
 	/* SIGQUIT installed by InitPostmasterChild */
 	pqsignal(SIGALRM, SIG_IGN);
 	pqsignal(SIGPIPE, SIG_IGN);
-	pqsignal(SIGUSR1, procsignal_sigusr1_handler);
+	pqsignal(SIGUSR1, SIG_IGN);
 	pqsignal(SIGUSR2, SIG_IGN);
 	pqsignal(SIGCHLD, SIG_DFL);
 
