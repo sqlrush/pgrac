@@ -181,6 +181,112 @@ HeapTupleSetHintBits(HeapTupleHeader tuple, Buffer buffer, uint16 infomask, Tran
  *			(Xmax != my-transaction &&			the row was deleted by another transaction
  *			 Xmax is not committed)))			that has not been committed
  */
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * spec-3.14 D4: HeapTupleSatisfiesSelf cluster fork (OBS-4).
+ *
+ *	Self visibility = "committed now": xmin committed AND not deleted by
+ *	a committed xmax.  No snapshot ordering.  Tuple ITL evidence gate
+ *	(the static SnapshotSelf is always LOCAL).  When xmin is remote we
+ *	must not fall through (PG would re-judge it via local CLOG); local
+ *	xmax is judged with PG primitives (correct for a local xid).
+ */
+static bool
+cluster_satisfies_self_fork(HeapTuple htup, Buffer buffer, bool *visible)
+{
+	HeapTupleHeader tuple = htup->t_data;
+	TransactionId raw_xid = HeapTupleHeaderGetRawXmin(tuple);
+	TransactionId raw_xmax;
+	ClusterVisResolve r;
+
+	if (!cluster_storage_mode_enabled() || !BufferIsValid(buffer))
+		return false;
+	if (!PageHasItl(BufferGetPage(buffer)))
+		return false;
+	if (TransactionIdIsCurrentTransactionId(raw_xid))
+		return false;
+
+	cluster_visibility_resolve_tuple(buffer, tuple, raw_xid, CLUSTER_VIS_XMIN, &r);
+	if (r.evidence == CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS)
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+						errmsg("cluster TT status unknown for xid %u", raw_xid),
+						errhint("Remote commit_scn not yet propagated; retry or abort.")));
+	if (r.evidence != CLUSTER_VIS_EVIDENCE_REMOTE)
+		return false; /* local xmin: PG-native (xmax also judged there) */
+
+	switch (cluster_vis_self_verdict(r.status)) {
+	case CVV_INVISIBLE:
+		*visible = false;
+		return true;
+	case CVV_FAILCLOSED_UNKNOWN:
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+						errmsg("cluster TT status unknown for xid %u", raw_xid),
+						errhint("Remote commit_scn not yet propagated; retry or abort.")));
+		break;
+	default:
+		break; /* CVV_VISIBLE: xmin committed, check xmax for deletion */
+	}
+
+	/* A lock-only or absent xmax never deletes the tuple. */
+	if ((tuple->t_infomask & HEAP_XMAX_INVALID)
+		|| HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask)) {
+		*visible = true;
+		return true;
+	}
+
+	raw_xmax = HeapTupleHeaderGetRawXmax(tuple);
+
+	if (tuple->t_infomask & HEAP_XMAX_IS_MULTI) {
+		/* Multixact deleter: conservative -- treat as not-yet-committed
+		 * delete (still visible).  A committed cross-node multixact update
+		 * is rare on a self-snapshot path; correctness errs visible. */
+		*visible = true;
+		return true;
+	}
+
+	if (TransactionIdIsCurrentTransactionId(raw_xmax)) {
+		*visible = false; /* deleted by our own xact */
+		return true;
+	}
+
+	{
+		ClusterVisResolve xr;
+
+		cluster_visibility_resolve_tuple(buffer, tuple, raw_xmax, CLUSTER_VIS_XMAX_UPDATE, &xr);
+		if (xr.evidence == CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS) {
+			raw_xid = raw_xmax;
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+						errmsg("cluster TT status unknown for xid %u", raw_xid),
+						errhint("Remote commit_scn not yet propagated; retry or abort.")));
+		}
+		if (xr.evidence == CLUSTER_VIS_EVIDENCE_REMOTE) {
+			switch (cluster_vis_self_verdict(xr.status)) {
+			case CVV_VISIBLE:
+				*visible = false; /* deleter committed -> deleted */
+				return true;
+			case CVV_FAILCLOSED_UNKNOWN: {
+				raw_xid = raw_xmax;
+				ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+						errmsg("cluster TT status unknown for xid %u", raw_xid),
+						errhint("Remote commit_scn not yet propagated; retry or abort.")));
+				break;
+			}
+			default:
+				*visible = true; /* deleter in-progress/aborted -> not deleted */
+				return true;
+			}
+		}
+		/* local xmax: PG primitives are correct for a local xid. */
+		if (TransactionIdDidCommit(raw_xmax))
+			*visible = false;
+		else
+			*visible = true;
+		return true;
+	}
+}
+#endif /* USE_PGRAC_CLUSTER */
+
+
 static bool
 HeapTupleSatisfiesSelf(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 {
@@ -188,6 +294,15 @@ HeapTupleSatisfiesSelf(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 
 	Assert(ItemPointerIsValid(&htup->t_self));
 	Assert(htup->t_tableOid != InvalidOid);
+
+#ifdef USE_PGRAC_CLUSTER
+	{
+		bool		cluster_vis;
+
+		if (cluster_satisfies_self_fork(htup, buffer, &cluster_vis))
+			return cluster_vis;
+	}
+#endif
 
 	if (!HeapTupleHeaderXminCommitted(tuple)) {
 		if (HeapTupleHeaderXminInvalid(tuple))
@@ -345,6 +460,56 @@ HeapTupleSatisfiesAny(HeapTuple htup, Snapshot snapshot, Buffer buffer)
  * Among other things, this means you can't do UPDATEs of rows in a TOAST
  * table.
  */
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * spec-3.14 D4: HeapTupleSatisfiesToast cluster fork (OBS-5).
+ *
+ *	Toast chunks are insert-only and read only after the main row passed
+ *	visibility, so PG-native is permissive: only an ABORTED writer hides
+ *	the chunk; it never inspects xmax.  We mirror that -- xmin evidence
+ *	only.  Snapshot-source cannot gate (the toast snapshot is the static
+ *	SnapshotToast, always LOCAL), so the gate is tuple ITL evidence.
+ */
+static bool
+cluster_satisfies_toast_fork(HeapTuple htup, Buffer buffer, bool *visible)
+{
+	HeapTupleHeader tuple = htup->t_data;
+	TransactionId raw_xid = HeapTupleHeaderGetRawXmin(tuple);
+	ClusterVisResolve r;
+
+	if (!cluster_storage_mode_enabled() || !BufferIsValid(buffer))
+		return false;
+	if (!PageHasItl(BufferGetPage(buffer)))
+		return false;
+	if (TransactionIdIsCurrentTransactionId(raw_xid))
+		return false;
+
+	cluster_visibility_resolve_tuple(buffer, tuple, raw_xid, CLUSTER_VIS_XMIN, &r);
+	if (r.evidence == CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS)
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+						errmsg("cluster TT status unknown for xid %u", raw_xid),
+						errhint("Remote commit_scn not yet propagated; retry or abort.")));
+	if (r.evidence != CLUSTER_VIS_EVIDENCE_REMOTE)
+		return false;
+
+	switch (cluster_vis_toast_verdict(r.status)) {
+	case CVV_INVISIBLE:
+		*visible = false;
+		return true;
+	case CVV_FAILCLOSED_UNKNOWN:
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+						errmsg("cluster TT status unknown for xid %u", raw_xid),
+						errhint("Remote commit_scn not yet propagated; retry or abort.")));
+		break;
+	default:
+		*visible = true; /* CVV_VISIBLE */
+		return true;
+	}
+	return true; /* unreachable */
+}
+#endif /* USE_PGRAC_CLUSTER */
+
+
 static bool
 HeapTupleSatisfiesToast(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 {
@@ -352,6 +517,15 @@ HeapTupleSatisfiesToast(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 
 	Assert(ItemPointerIsValid(&htup->t_self));
 	Assert(htup->t_tableOid != InvalidOid);
+
+#ifdef USE_PGRAC_CLUSTER
+	{
+		bool		cluster_vis;
+
+		if (cluster_satisfies_toast_fork(htup, buffer, &cluster_vis))
+			return cluster_vis;
+	}
+#endif
 
 	if (!HeapTupleHeaderXminCommitted(tuple)) {
 		if (HeapTupleHeaderXminInvalid(tuple))
@@ -837,6 +1011,134 @@ HeapTupleSatisfiesUpdate(HeapTuple htup, CommandId curcid, Buffer buffer)
  * on the insertion without aborting the whole transaction, the associated
  * token is also returned in snapshot->speculativeToken.
  */
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * spec-3.14 D3: HeapTupleSatisfiesDirty cluster fork (OBS-3).
+ *
+ *	Dirty (used by nbtinsert uniqueness, RI, replication) has NO
+ *	wait_policy layer and reports an in-progress writer back via
+ *	snapshot->xmin/xmax for the caller to wait on.  A REMOTE in-progress
+ *	writer cannot be reported as a local wait handle (poisoning), so it
+ *	fail-closes to 53R9H.  Tuple ITL evidence gate.
+ */
+static bool
+cluster_satisfies_dirty_fork(HeapTuple htup, Buffer buffer, bool *visible)
+{
+	HeapTupleHeader tuple = htup->t_data;
+	TransactionId raw_xid = HeapTupleHeaderGetRawXmin(tuple);
+	TransactionId raw_xmax;
+	ClusterVisResolve r;
+
+	if (!cluster_storage_mode_enabled() || !BufferIsValid(buffer))
+		return false;
+	if (!PageHasItl(BufferGetPage(buffer)))
+		return false;
+	if (TransactionIdIsCurrentTransactionId(raw_xid))
+		return false;
+
+	cluster_visibility_resolve_tuple(buffer, tuple, raw_xid, CLUSTER_VIS_XMIN, &r);
+	if (r.evidence == CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS)
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+						errmsg("cluster TT status unknown for xid %u", raw_xid),
+						errhint("Remote commit_scn not yet propagated; retry or abort.")));
+	if (r.evidence == CLUSTER_VIS_EVIDENCE_REMOTE) {
+		switch (cluster_vis_dirty_verdict(r.status, false, false)) {
+		case CVV_FAILCLOSED_CONFLICT:
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
+							errmsg("cross-node write conflict: remote in-progress xmin %u", raw_xid),
+							errhint("Retry; cross-node wait lands at Stage 5.2.")));
+			break;
+		case CVV_INVISIBLE:
+			*visible = false;
+			return true;
+		case CVV_FAILCLOSED_UNKNOWN:
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+						errmsg("cluster TT status unknown for xid %u", raw_xid),
+						errhint("Remote commit_scn not yet propagated; retry or abort.")));
+			break;
+		default:
+			break; /* CVV_VISIBLE: xmin committed, check xmax */
+		}
+	} else if (r.evidence != CLUSTER_VIS_EVIDENCE_LOCAL) {
+		return false; /* NONE: local xmin path, PG-native */
+	} else {
+		return false; /* LOCAL xmin: PG-native */
+	}
+
+	/* xmin remote committed: judge xmax (cannot fall through). */
+	if ((tuple->t_infomask & HEAP_XMAX_INVALID)
+		|| HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask)) {
+		*visible = true;
+		return true;
+	}
+
+	raw_xmax = HeapTupleHeaderGetRawXmax(tuple);
+
+	if (tuple->t_infomask & HEAP_XMAX_IS_MULTI) {
+		ClusterVisResolve mr;
+
+		cluster_visibility_resolve_tuple(buffer, tuple, raw_xmax, CLUSTER_VIS_XMAX_MULTI, &mr);
+		if (mr.multi_marker_is_remote)
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
+							errmsg("cross-node write conflict: remote multixact xmax"),
+							errhint("Retry; cross-node wait lands at Stage 5.2.")));
+		*visible = true; /* local multixact over remote xmin: conservative visible */
+		return true;
+	}
+
+	if (TransactionIdIsCurrentTransactionId(raw_xmax)) {
+		*visible = false; /* deleted by self */
+		return true;
+	}
+
+	{
+		ClusterVisResolve xr;
+
+		cluster_visibility_resolve_tuple(buffer, tuple, raw_xmax, CLUSTER_VIS_XMAX_UPDATE, &xr);
+		if (xr.evidence == CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS) {
+			raw_xid = raw_xmax;
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+						errmsg("cluster TT status unknown for xid %u", raw_xid),
+						errhint("Remote commit_scn not yet propagated; retry or abort.")));
+		}
+		if (xr.evidence == CLUSTER_VIS_EVIDENCE_REMOTE) {
+			switch (cluster_vis_dirty_verdict(xr.status, true, false)) {
+			case CVV_FAILCLOSED_CONFLICT:
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
+						 errmsg("cross-node write conflict: remote in-progress xmax %u", raw_xmax),
+						 errhint("Retry; cross-node wait lands at Stage 5.2.")));
+				break;
+			case CVV_GONE_UPDATED:
+			case CVV_GONE_DELETED:
+				*visible = false;
+				return true;
+			case CVV_FAILCLOSED_UNKNOWN:
+				raw_xid = raw_xmax;
+				ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+						errmsg("cluster TT status unknown for xid %u", raw_xid),
+						errhint("Remote commit_scn not yet propagated; retry or abort.")));
+				break;
+			default:
+				*visible = true;
+				return true;
+			}
+		}
+		/* local xmax. */
+		if (TransactionIdIsInProgress(raw_xmax))
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
+							errmsg("cross-node write conflict: in-progress xmax over remote xmin"),
+							errhint("Retry; cross-node wait lands at Stage 5.2.")));
+		if (TransactionIdDidCommit(raw_xmax))
+			*visible = false;
+		else
+			*visible = true;
+		return true;
+	}
+}
+#endif /* USE_PGRAC_CLUSTER */
+
+
 static bool
 HeapTupleSatisfiesDirty(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 {
@@ -847,6 +1149,15 @@ HeapTupleSatisfiesDirty(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 
 	snapshot->xmin = snapshot->xmax = InvalidTransactionId;
 	snapshot->speculativeToken = 0;
+
+#ifdef USE_PGRAC_CLUSTER
+	{
+		bool		cluster_vis;
+
+		if (cluster_satisfies_dirty_fork(htup, buffer, &cluster_vis))
+			return cluster_vis;
+	}
+#endif
 
 	if (!HeapTupleHeaderXminCommitted(tuple)) {
 		if (HeapTupleHeaderXminInvalid(tuple))
