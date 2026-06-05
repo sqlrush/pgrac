@@ -190,7 +190,7 @@ ok($hits >= 1,
 is( $node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
 	'93',
-	'pg_stat_cluster_wait_events returns 91 rows after spec-2.39');
+	'pg_stat_cluster_wait_events returns 93 rows after spec-2.39');
 
 # ----------
 # Test 11 (Hardening v1.0.1 / codex review P2-2): SQL SRF rejects

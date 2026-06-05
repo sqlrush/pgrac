@@ -63,8 +63,8 @@ is( $node->safe_psql(
 		'postgres',
 		q{SELECT string_agg(DISTINCT category, ',' ORDER BY category)
 		    FROM pg_cluster_state}),
-	'block_format,buffer_format,cluster_cssd,cluster_stats,conf,cr,diag,gcs,ges,grd,guc,ic,inject,lck,lmd,lmon,lms,pcm,pgstat,phase,scn,shared_fs,shmem,sinval,tt_status,tt_status_hint,undo',
-	'all 27 categories appear (spec-3.9 adds cr; tt_status_hint added in spec-3.2;L122 alphabetic verify)');
+	'block_format,buffer_format,cluster_cssd,cluster_stats,conf,cr,diag,gcs,ges,grd,guc,ic,inject,lck,lmd,lmon,lms,pcm,pgstat,phase,scn,shared_fs,shmem,sinval,tt_status,tt_status_hint,undo,undo_cleaner',
+	'all 28 categories appear (spec-3.9 adds cr; tt_status_hint added in spec-3.2;L122 alphabetic verify)');
 
 
 # ----------
@@ -157,8 +157,8 @@ like($phase, qr/^(init|running|shutdown|\(unset\))$/,
 # ----------
 is( $node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'91',
-	'pg_stat_cluster_wait_events returns 91 rows after spec-2.39');
+	'93',
+	'pg_stat_cluster_wait_events returns 93 rows after spec-2.39');
 
 $node->stop;
 

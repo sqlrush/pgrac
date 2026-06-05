@@ -189,7 +189,7 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT category) FROM pg_cluster_state}),
-   '27',
+   '28',
    'L7b pg_cluster_state has 27 distinct categories (spec-3.9 adds cr)');
 
 
@@ -209,7 +209,7 @@ is($node->safe_psql(
 my $smoke_categories = $node->safe_psql(
 	'postgres',
 	q{SELECT count(DISTINCT category) FROM pg_cluster_state});
-is($smoke_categories, '27', 'L9 cluster_smoke surface integrates pcm + gcs + tt_status + tt_status_hint + undo_record categories (27 categories (spec-3.9 adds cr))');
+is($smoke_categories, '28', 'L9 cluster_smoke surface integrates pcm + gcs + tt_status + tt_status_hint + undo_record categories (28 categories (spec-3.9 adds cr))');
 
 
 # ----------

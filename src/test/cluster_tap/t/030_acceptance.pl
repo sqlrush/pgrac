@@ -146,7 +146,7 @@ ok($phase_val =~ /^(init|running|shutdown|reconfig)$/,
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'91', 'E1 pg_stat_cluster_wait_events returns 91 rows (spec-2.39 baseline)');
+	'93', 'E1 pg_stat_cluster_wait_events returns 93 rows (spec-2.39 baseline)');
 
 ok($node->safe_psql('postgres',
 		q{SELECT count(*) > 0 FROM pg_stat_cluster_wait_events WHERE type='Cluster: GES'})
@@ -158,7 +158,7 @@ ok($node->safe_psql('postgres',
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_gcluster_wait_events'),
-	'91', 'E4 pg_stat_gcluster_wait_events returns 91 rows (single-node, spec-2.39 baseline)');
+	'93', 'E4 pg_stat_gcluster_wait_events returns 93 rows (single-node, spec-2.39 baseline)');
 
 
 # ============================================================
@@ -367,8 +367,8 @@ ok($node->safe_psql('postgres',
 
 is($node->safe_psql('postgres',
 		q{SELECT string_agg(DISTINCT category, ',' ORDER BY category) FROM pg_cluster_state}),
-	'block_format,buffer_format,cluster_cssd,cluster_stats,conf,cr,diag,gcs,ges,grd,guc,ic,inject,lck,lmd,lmon,lms,pcm,pgstat,phase,scn,shared_fs,shmem,sinval,tt_status,tt_status_hint,undo',
-	'O2 pg_cluster_state has all 27 categories (tt_status_hint added in spec-3.2; cr added in spec-3.9)');
+	'block_format,buffer_format,cluster_cssd,cluster_stats,conf,cr,diag,gcs,ges,grd,guc,ic,inject,lck,lmd,lmon,lms,pcm,pgstat,phase,scn,shared_fs,shmem,sinval,tt_status,tt_status_hint,undo,undo_cleaner',
+	'O2 pg_cluster_state has all 28 categories (tt_status_hint added in spec-3.2; cr added in spec-3.9)');
 
 is($node->safe_psql('postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE value IS NULL}),
