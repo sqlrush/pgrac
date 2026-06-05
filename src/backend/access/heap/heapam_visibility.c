@@ -93,6 +93,7 @@
 #include "cluster/cluster_tt_status.h"		   /* lookup_exact / Key / Result */
 #include "cluster/cluster_visibility_inject.h" /* D5b test-only inject helper */
 #include "cluster/cluster_cr.h"				   /* spec-3.9 D5 CR 3-tier MVCC gate */
+#include "cluster/cluster_visibility_resolve.h" /* spec-3.14 D1 单一解析器 */
 #endif
 
 
@@ -944,80 +945,51 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 			ref_filled = cluster_test_lookup_visibility_inject(raw_xmin, &ref);
 #endif
 
-		if (!ref_filled && tuple->t_itl_slot_idx != CLUSTER_ITL_SLOT_UNALLOCATED
-			&& cluster_itl_get_tt_ref(BufferGetPage(buffer), tuple->t_itl_slot_idx, &ref))
-			ref_filled = true;
+		/*
+		 * spec-3.14 D1:  xmin status resolution extracted to the shared
+		 * cluster_visibility_resolve_* layer (L212).  Behaviour-equivalent
+		 * to the prior inline body on the happy path; the explicit
+		 * local_xid == raw_xid check now fail-closes a recycled slot at the
+		 * ref layer (STALE_OR_AMBIGUOUS -> 53R97) instead of after a futile
+		 * overlay miss.  The SCN decision + lazy cleanout (MVCC policy) stay
+		 * here; only the evidence/status resolution moved.
+		 */
+		{
+			ClusterVisResolve res;
 
-		if (ref_filled && ref.tt_slot_id != 0 && /* §3.3: skip spec-3.1 placeholder */
-			(int32)ref.origin_node_id != cluster_node_id) {
-			/* Authoritative remote exact TT ref — enter cluster path. */
-			ClusterTTStatusKey key;
-			ClusterTTStatusResult result;
+			if (ref_filled)
+				cluster_visibility_resolve_from_ref(raw_xmin, &ref, &res);
+			else
+				cluster_visibility_resolve_tuple(buffer, tuple, raw_xmin, CLUSTER_VIS_XMIN, &res);
 
-			memset(&key, 0, sizeof(key));
-			key.origin_node_id = ref.origin_node_id;
-			key.undo_segment_id = ref.undo_segment_id;
-			key.tt_slot_id = ref.tt_slot_id;
-			key.cluster_epoch = ref.cluster_epoch;
-			key.local_xid = raw_xmin;
+			if (res.evidence == CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS)
+				ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+								errmsg("cluster TT slot recycled for xid %u", raw_xmin),
+								errhint("ITL slot no longer maps to this xid (slot reused); "
+										"retry the transaction with a fresh snapshot.")));
 
-			if (cluster_tt_status_lookup_exact(&key, &result) && result.authoritative) {
-				/*
-				 * PGRAC spec-3.5 D8:  if the remote xid is a SUBCOMMITTED
-				 * subxact, lazy follow the parent_key chain to resolve final
-				 * visibility.  Bounded by cluster.subtrans_max_chain_depth
-				 * (HC205).  Depth exceeded / parent overlay miss → UNKNOWN
-				 * authoritative=false → 53R97 fail-closed below (L199;NOT
-				 * PG-native fallback).
-				 */
-				if (result.status == CLUSTER_TT_STATUS_SUBCOMMITTED && result.has_parent_key) {
-					result
-						= cluster_subtrans_lookup_parent(&result, cluster_subtrans_max_chain_depth);
-				}
-
-				switch (result.status) {
+			if (res.evidence == CLUSTER_VIS_EVIDENCE_REMOTE) {
+				switch (res.status) {
 				case CLUSTER_TT_STATUS_ABORTED:
 					return false;
 				case CLUSTER_TT_STATUS_IN_PROGRESS:
 				case CLUSTER_TT_STATUS_SUBCOMMITTED:
-					/*
-						 * Remote in-progress xact (or SUBCOMMITTED chain
-						 * not yet finalized at parent) — snapshot can't
-						 * see it.  This branch covers the "parent still
-						 * IN_PROGRESS" case after lazy follow as well.
-						 */
+					/* Remote in-progress (or parent still in-progress after
+					 * lazy follow) -- snapshot can't see it. */
 					return false;
 				case CLUSTER_TT_STATUS_COMMITTED:
 				case CLUSTER_TT_STATUS_CLEANED_OUT: {
-					/*
-						 * spec-3.3 D10 (L181 chain step 7): SCN-based
-						 * visibility decision. result.commit_scn carries
-						 * the remote commit SCN (V2 wire / D5b inject);
-						 * snapshot->read_scn carries the cluster_scn_current()
-						 * value at GetSnapshotData() time. Helper uses
-						 * scn_time_cmp() not raw <= (R1 P0).
-						 */
 					ClusterVisibilityDecision decision;
 
-					decision
-						= cluster_visibility_decide_by_scn(result.commit_scn, snapshot->read_scn);
+					decision = cluster_visibility_decide_by_scn(res.commit_scn, snapshot->read_scn);
 					switch (decision) {
 					case CLUSTER_VISIBILITY_VISIBLE: {
 						/*
-								 * spec-3.4c D4 + F1:  opportunistic lazy
-								 * cleanout.  When the overlay says COMMITTED
-								 * but the on-page slot is still ACTIVE
-								 * (xact-end stamp didn't reach this page or
-								 * lost the race to a concurrent read),
-								 * stamp the page slot.commit_scn now via
-								 * ConditionalLockBuffer(buf) non-blocking
-								 * + MarkBufferDirtyHint(buf, true)  hint-
-								 * style (no WAL — HeapTupleSatisfiesMVCC
-								 * lacks a Relation argument, F1).  L177
-								 * no-wait:  failure is silently skipped
-								 * because visibility is already decided by
-								 * the overlay path.
-								 */
+						 * spec-3.4c D4 + F1: opportunistic lazy cleanout
+						 * (hint-style, no WAL; L177 no-wait).  Stamp the page
+						 * slot commit_scn when the overlay says COMMITTED but
+						 * the on-page slot is still ACTIVE.
+						 */
 						Page page = BufferGetPage(buffer);
 
 						if (PageHasItl(page)
@@ -1026,42 +998,36 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 							ClusterItlSlotData *slot
 								= &ClusterPageGetItlSlots(page)[tuple->t_itl_slot_idx];
 
-							/* Fast-path short-circuit:  if page slot
-									 * already stamped COMMITTED, skip the
-									 * lazy helper entirely (no-op). */
 							if (slot->flags == ITL_FLAG_ACTIVE)
-								(void)cluster_itl_cleanout_lazy(buffer, tuple->t_itl_slot_idx,
-																raw_xmin, result.commit_scn);
+								(void) cluster_itl_cleanout_lazy(buffer, tuple->t_itl_slot_idx,
+																 raw_xmin, res.commit_scn);
 						}
 						return true;
 					}
 					case CLUSTER_VISIBILITY_INVISIBLE:
 						return false;
 					case CLUSTER_VISIBILITY_UNKNOWN:
-						/* fall through to 53R97 below */
-						break;
+						break; /* fall through to 53R97 */
 					}
 					break;
 				}
 				default:
 					break;
 				}
-			}
 
-			/*
-			 * HC181 fail-closed. L177 NO WAIT (持 buffer pin + 可能
-			 * content lock + LWLock; wait = 死锁源头).
-			 *
-			 * Reaches here on: authoritative lookup miss, COMMITTED with
-			 * UNKNOWN decision (InvalidScn on either side), or unknown
-			 * status enum value.
-			 */
-			ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-							errmsg("cluster TT status unknown for xid %u", raw_xmin),
-							errhint("Remote commit_scn not yet propagated, or TT "
-									"overlay missed/stale; retry or abort.")));
+				/*
+				 * HC181 fail-closed.  L177 NO WAIT.  Reaches here on overlay
+				 * lookup miss, COMMITTED with UNKNOWN SCN decision, or an
+				 * unknown status enum value.  evidence is REMOTE so there is
+				 * NO PG-native fallback (C-V2 / L199).
+				 */
+				ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+								errmsg("cluster TT status unknown for xid %u", raw_xmin),
+								errhint("Remote commit_scn not yet propagated, or TT "
+										"overlay missed/stale; retry or abort.")));
+			}
 		}
-		/* else: ref placeholder / local origin / no ITL slot →
+		/* else: ref placeholder / local origin / no ITL slot ->
 		 * fall through to PG-native body (v0.3 N1 silent invisible
 		 * for cross-node tuple in production). */
 
