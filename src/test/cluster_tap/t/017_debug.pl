@@ -57,14 +57,14 @@ ok($row_count >= 20,
 
 
 # ----------
-# Test 2: All 7 categories present.
+# Test 2: All categories present.
 # ----------
 is( $node->safe_psql(
 		'postgres',
 		q{SELECT string_agg(DISTINCT category, ',' ORDER BY category)
 		    FROM pg_cluster_state}),
-	'block_format,buffer_format,cluster_cssd,cluster_stats,conf,cr,diag,gcs,ges,grd,guc,ic,inject,lck,lmd,lmon,lms,pcm,pgstat,phase,scn,shared_fs,shmem,sinval,tt_status,tt_status_hint,undo,undo_cleaner,visibility',
-	'all 29 categories appear (spec-3.14 adds visibility;L122 alphabetic verify)');
+	'block_format,buffer_format,cluster_cssd,cluster_stats,conf,cr,diag,gcs,ges,grd,guc,ic,inject,lck,lmd,lmon,lms,pcm,pgstat,phase,scn,shared_fs,shmem,sinval,tt_2pc,tt_status,tt_status_hint,undo,undo_cleaner,visibility',
+	'all 30 categories appear (spec-3.15 adds tt_2pc;L122 alphabetic verify)');
 
 
 # ----------

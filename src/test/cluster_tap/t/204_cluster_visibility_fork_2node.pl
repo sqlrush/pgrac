@@ -322,19 +322,19 @@ is($pair->node0->safe_psql('postgres',
 # ============================================================
 is($pair->node0->safe_psql('postgres',
 		q{SELECT count(DISTINCT category) FROM pg_cluster_state}),
-	'29',
-	'L12a pg_cluster_state has 29 categories (spec-3.14 adds visibility)');
+	'30',
+	'L12a pg_cluster_state has 30 categories (spec-3.15 adds tt_2pc)');
 
-my $last_two = $pair->node0->safe_psql('postgres', q{
+my $tt_categories = $pair->node0->safe_psql('postgres', q{
 	SELECT string_agg(c, ',' ORDER BY c)
 	  FROM (
 		SELECT DISTINCT category AS c FROM pg_cluster_state
 		 WHERE category LIKE 'tt_%'
 	  ) s
 });
-is($last_two, 'tt_status,tt_status_hint',
-	'L12b tt_status alphabetically precedes tt_status_hint (spec-3.2 '
-	. 'category 字母序 + tt_ group preservation)');
+is($tt_categories, 'tt_2pc,tt_status,tt_status_hint',
+	'L12b tt_2pc alphabetically precedes tt_status and tt_status_hint '
+	. '(spec-3.15 category 字母序 + tt_ group preservation)');
 
 
 $pair->stop_pair;
