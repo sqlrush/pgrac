@@ -180,3 +180,66 @@ jobs:
             src/test/cluster_tap/tmp_check/log/
           if-no-files-found: ignore
           retention-days: 30
+
+  # ====================================================================
+  # Tier 2.3 — Stage 3 MVCC acceptance medium representative job
+  # --------------------------------------------------------------------
+  # Self-contained Ubuntu job (rebuilds/install locally).  Runs the
+  # spec-3.17 Stage 3 acceptance TAPs — capability cross-cutting (t/226)
+  # and the workload perf smoke (t/227, pgbench) — with longer knobs than
+  # fast-gate, plus the static contract unit binary, and uploads the
+  # generated JSON reports.  All perf numbers are report-only (the Stage 3
+  # performance bar is owned by spec-3.18);  this job gates only on the
+  # functional/correctness assertions.
+  # ====================================================================
+  stage3-acceptance-medium:
+    name: Stage 3 acceptance medium (Ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            libreadline-dev zlib1g-dev libicu-dev \
+            liblz4-dev libzstd-dev libssl-dev libxml2-dev \
+            libipc-run-perl pkg-config
+
+      - name: Configure (--enable-cluster)
+        run: |
+          ./configure \
+            --prefix=$HOME/pgrac-install \
+            --enable-cassert --enable-debug \
+            --with-openssl --with-icu --with-lz4 --with-zstd \
+            --enable-cluster --enable-tap-tests
+
+      - name: Build and install
+        run: |
+          make -j$(getconf _NPROCESSORS_ONLN)
+          make install
+
+      - name: Run Stage 3 static contract unit binary
+        run: make -C src/test/cluster_unit check
+
+      - name: Run Stage 3 acceptance TAP matrix
+        env:
+          PGRAC_TAG: ${{ github.ref_name }}
+          STAGE3_PGBENCH_SECONDS: "20"
+        run: |
+          make -C src/test/cluster_tap check \
+            PROVE_TESTS="t/226_stage3_mvcc_acceptance_capability.pl t/227_stage3_mvcc_workload_smoke.pl"
+
+      - name: Upload Stage 3 acceptance reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage3-acceptance-medium-${{ github.run_id }}
+          path: |
+            src/test/cluster_tap/tmp/stage3-acceptance-*.json
+            src/test/cluster_tap/tmp_check/log/
+          if-no-files-found: ignore
+          retention-days: 30

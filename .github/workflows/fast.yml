@@ -152,16 +152,19 @@ jobs:
       - name: Run cluster_regress (7 SQL smoke tests)
         run: make -C src/test/cluster_regress check
 
-      - name: Run smoke TAP subset (010 + 030 + 050 + 200 + 202)
+      - name: Run smoke TAP subset (010 + 030 + 050 + 200 + 202 + 226)
         run: |
-          # Tier 1 fast gate: 5 TAP files covering basic catalog views,
+          # Tier 1 fast gate: TAP files covering basic catalog views,
           # acceptance lifecycle, smgr opt-in workflow + spec-2.40 Stage 2
-          # acceptance capability smoke (t/200) + perf smoke (t/202).
+          # acceptance capability smoke (t/200) + perf smoke (t/202) +
+          # spec-3.17 Stage 3 MVCC capability cross-cutting smoke (t/226,
+          # single-node, ~5s).
           # t/201 fault matrix NOT here (avoid fast-gate inject flake).
+          # t/227 Stage 3 workload perf smoke runs pgbench (>30s) -> nightly.
           # Full cluster_tap suite + 2-node ClusterPair + heartbeat round-
-          # trip + Stage 2 medium perf matrix tests run in nightly.yml.
+          # trip + Stage 2/3 medium perf matrix tests run in nightly.yml.
           make -C src/test/cluster_tap check \
-            PROVE_TESTS="t/010_views.pl t/030_acceptance.pl t/050_shared_storage_initdb.pl t/200_stage2_acceptance_capability.pl t/202_stage2_acceptance_perf_smoke.pl"
+            PROVE_TESTS="t/010_views.pl t/030_acceptance.pl t/050_shared_storage_initdb.pl t/200_stage2_acceptance_capability.pl t/202_stage2_acceptance_perf_smoke.pl t/226_stage3_mvcc_acceptance_capability.pl"
 
       - name: Upload regression diffs on failure
         if: failure()
