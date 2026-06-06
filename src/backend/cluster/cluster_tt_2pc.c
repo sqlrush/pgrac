@@ -45,6 +45,8 @@
 #include "cluster/cluster_tt_slot.h"		 /* protected-slot map (D6/V-4) */
 #include "cluster/cluster_tt_status.h"		 /* SUBCOMMITTED overlay rebuild */
 #include "cluster/cluster_undo_record_api.h" /* xact_reset (PostPrepare) */
+#include "cluster/cluster_tt_durable.h"		 /* durable 0x30 commit (prefinish) */
+#include "cluster/cluster_tt_status_hint.h"	 /* cross-node hint emit (prefinish) */
 
 
 /*
@@ -207,6 +209,64 @@ cluster_tt_twophase_postabort(TransactionId xid, uint16 info, void *recdata, uin
 	(void)recdata;
 	(void)len;
 	(void)cluster_tt_slot_unprotect_xid(xid);
+}
+
+
+/*
+ * cluster_tt_twophase_prefinish -- spec-3.15 D5 (C-P6 resolve-before-WAL).
+ *
+ *	Runs inside FinishPreparedTransaction AFTER final_scn is produced
+ *	and BEFORE RecordTransactionCommitPrepared/AbortPrepared.  The
+ *	backend-local bindings are long gone (PostPrepare cleared them; this
+ *	may be another backend or a restarted instance), so everything is
+ *	driven from the 2PC record.
+ *
+ *	Commit: per-binding durable 0x30 commit (same primitive as the
+ *	single-machine pre-commit hook, spec-3.11 C1/C10: no independent
+ *	fsync -- the prepared-commit WAL flush carries the 0x30 record) plus
+ *	the COMMITTED overlay install + cross-node hint.  Sub-links need no
+ *	explicit resolve: the spec-3.5 lazy parent-follow reads the parent's
+ *	terminal state.
+ *
+ *	Abort: per-binding durable 0x31 abort-clear (step 7) plus the
+ *	ABORTED overlay install + hint.
+ *
+ *	Failure anywhere here is safe (C-P6): the transaction is still
+ *	prepared and the command can be retried.
+ */
+void
+cluster_tt_twophase_prefinish(TransactionId xid, SCN final_scn, bool is_commit, const void *recdata,
+							  uint32 len)
+{
+	ClusterTT2PCParsed p;
+	uint16 i;
+
+	Assert(cluster_node_id >= 0);
+
+	parse_or_corrupt(xid, recdata, len, &p);
+
+	for (i = 0; i < p.nbindings; i++) {
+		const ClusterTT2PCBinding *b = &p.bindings[i];
+		ClusterTTStatusKey key;
+
+		memset(&key, 0, sizeof(key));
+		key.origin_node_id = (uint16)cluster_node_id;
+		key.undo_segment_id = (uint16)b->undo_segment_id;
+		key.tt_slot_id = cluster_tt_slot_offset_to_id(b->slot_offset);
+		key.cluster_epoch = b->cluster_epoch;
+		key.local_xid = b->xid;
+
+		if (is_commit) {
+			cluster_tt_slot_durable_commit(b->undo_segment_id, b->slot_offset, b->xid, b->wrap,
+										   final_scn);
+			(void)cluster_tt_status_install_local(&key, CLUSTER_TT_STATUS_COMMITTED, final_scn);
+			cluster_tt_status_hint_emit(&key, CLUSTER_TT_STATUS_COMMITTED, final_scn);
+		} else {
+			/* step 7 lands the durable 0x31 abort-clear here. */
+			(void)cluster_tt_status_install_local(&key, CLUSTER_TT_STATUS_ABORTED, InvalidScn);
+			cluster_tt_status_hint_emit(&key, CLUSTER_TT_STATUS_ABORTED, InvalidScn);
+		}
+	}
 }
 
 #endif /* USE_PGRAC_CLUSTER */

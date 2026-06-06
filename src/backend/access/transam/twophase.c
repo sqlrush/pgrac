@@ -148,6 +148,8 @@
 /* PGRAC: spec-2.39 D1 — COMMIT PREPARED cluster sinval propagation. */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_sinval.h"
+/* PGRAC: spec-3.15 — prepared TT prefinish (C-P6). */
+#include "cluster/cluster_tt_2pc.h"
 #endif
 
 /*
@@ -249,6 +251,10 @@ static void RecordTransactionAbortPrepared(TransactionId xid, int nchildren,
 										   int nstats, xl_xact_stats_item *stats, const char *gid,
 										   SCN abort_scn); /* PGRAC: 1.18 */
 static void ProcessRecords(char *bufptr, TransactionId xid, const TwoPhaseCallback callbacks[]);
+#ifdef USE_PGRAC_CLUSTER
+static void ProcessClusterTTPrefinish(char *bufptr, TransactionId xid, SCN final_scn,
+									  bool isCommit);
+#endif
 static void RemoveGXact(GlobalTransaction gxact);
 
 static void XlogReadTwoPhaseData(XLogRecPtr lsn, char **buf, int *len);
@@ -1496,6 +1502,15 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 		final_scn = cluster_scn_advance_for_commit();
 	else
 		final_scn = cluster_scn_advance_for_abort();
+
+	/*
+	 * PGRAC (spec-3.15 D5, C-P6): durably resolve this prepared xact's
+	 * cluster TT state BEFORE the prepared commit/abort WAL record.
+	 * Commit: per-binding 0x30 (+ overlay COMMITTED).  Abort: per-binding
+	 * 0x31 abort-clear (+ overlay ABORTED).  bufptr already points at the
+	 * on-disk 2PC records (sliced above).
+	 */
+	ProcessClusterTTPrefinish(bufptr, xid, final_scn, isCommit);
 #endif
 
 	/*
@@ -1634,6 +1649,37 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 
 	pfree(buf);
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * PGRAC (spec-3.15 D5, C-P6): walk the on-disk 2PC records and run the
+ * cluster TT prefinish for each TWOPHASE_RM_CLUSTER_TT_ID payload.
+ * Same traversal shape as ProcessRecords below, but it runs BEFORE
+ * RecordTransactionCommitPrepared/AbortPrepared (the post callbacks
+ * are too late and carry no final_scn -- C-P7), and a failure here is
+ * safe: the xact is still prepared and retryable.
+ */
+static void
+ProcessClusterTTPrefinish(char *bufptr, TransactionId xid, SCN final_scn, bool isCommit)
+{
+	for (;;) {
+		TwoPhaseRecordOnDisk *record = (TwoPhaseRecordOnDisk *)bufptr;
+
+		Assert(record->rmid <= TWOPHASE_RM_MAX_ID);
+		if (record->rmid == TWOPHASE_RM_END_ID)
+			break;
+
+		bufptr += MAXALIGN(sizeof(TwoPhaseRecordOnDisk));
+
+		if (record->rmid == TWOPHASE_RM_CLUSTER_TT_ID)
+			cluster_tt_twophase_prefinish(xid, final_scn, isCommit, (void *)bufptr,
+										  record->len);
+
+		bufptr += MAXALIGN(record->len);
+	}
+}
+#endif /* USE_PGRAC_CLUSTER */
+
 
 /*
  * Scan 2PC state data in memory and call the indicated callbacks for each 2PC record.
