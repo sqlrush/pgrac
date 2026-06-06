@@ -2743,45 +2743,17 @@ PrepareTransaction(void)
 	Assert(s->parent == NULL);
 
 	/*
-	 * PGRAC spec-3.5 D10 HW1 P0 fail-closed guard:  reject PREPARE
-	 * TRANSACTION when the current xact has installed any cluster
-	 * SUBTRANS state (subxact ACTIVE / SUBCOMMITTED overlay).  spec-3.5
-	 * does NOT implement COMMIT PREPARED final emit;  allowing prepare
-	 * here would let COMMIT PREPARED (from a different backend) leave
-	 * remote readers stuck on `SUBCOMMITTED → parent unknown` — a
-	 * cross-node correctness bug (L199 prohibits PG-native fallback).
-	 * 2PC full support is forward-linked to an independent 2PC spec.
-	 *
-	 * Single-node / no-peer cluster: guard is a no-op
-	 * (cluster_subtrans_xact_has_state returns false).
+	 * PGRAC (spec-3.15 D4): the spec-3.5 D10 HW1 and spec-3.7 D16 PREPARE
+	 * guards were REMOVED here -- two-phase commit of cluster state is now
+	 * fully supported:
+	 *   - undo durability before PREPARE WAL: cluster_undo_xact_precommit_
+	 *     flush() above (C-P5);
+	 *   - TT bindings + SUBCOMMITTED links travel in the 2PC record
+	 *     (AtPrepare_ClusterTT / TWOPHASE_RM_CLUSTER_TT_ID);
+	 *   - COMMIT/ROLLBACK PREPARED resolve durably via the prefinish hook
+	 *     BEFORE the prepared commit/abort WAL (0x30 / 0x31, C-P6);
+	 *   - crash recovery re-pins prepared slots (protected-slot map, V-4).
 	 */
-#ifdef USE_PGRAC_CLUSTER
-	if (cluster_subtrans_xact_has_state(xid))
-		ereport(ERROR,
-				(errcode(ERRCODE_PREPARE_TRANSACTION_WITH_CLUSTER_SUBTRANS_STATE),
-				 errmsg("PREPARE TRANSACTION with cluster SUBTRANS state not supported in spec-3.5"),
-				 errhint("2PC full support (PREPARE + COMMIT PREPARED final emit) "
-						 "forward-linked to a future 2PC spec.  Use plain COMMIT/ROLLBACK "
-						 "for transactions that touched cluster cross-node visibility paths.")));
-
-	/*
-	 * PGRAC (spec-3.7 D16):  PREPARE TRANSACTION fail-closed guard for
-	 * transactions that wrote undo records.  Spec-3.7 ships undo write +
-	 * sanity reader, but **not** prepared-xact undo durability:  if a
-	 * PREPARED xact's undo record is lost on crash before COMMIT PREPARED,
-	 * rollback apply would be unsafe.  Per spec-3.7 §3.6,reject PREPARE on
-	 * any xact that触发 cluster_undo_record_alloc() during execution.
-	 *
-	 * Prepared-xact undo durability is forward-linked to spec-3.14.
-	 */
-	if (cluster_undo_record_is_touched())
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("PREPARE TRANSACTION with cluster undo records not supported in spec-3.7"),
-				 errhint("2PC prepared-xact undo durability is forward-linked to spec-3.14. "
-						 "Use plain COMMIT/ROLLBACK for transactions that wrote cluster undo records "
-						 "(any DML touching shared-buffer heap in cluster-enabled mode).")));
-#endif
 
 	/*
 	 * Do pre-commit processing that involves calling user-defined code, such
