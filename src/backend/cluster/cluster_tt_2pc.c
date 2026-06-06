@@ -63,8 +63,8 @@
 void
 AtPrepare_ClusterTT(void)
 {
-	ClusterTT2PCBinding bindings[CLUSTER_TT_2PC_MAX_BINDINGS];
-	ClusterTT2PCSubLink sublinks[CLUSTER_TT_2PC_MAX_SUBLINKS];
+	ClusterTT2PCBinding bindings[CLUSTER_TT_2PC_MAX_BINDINGS + 1];
+	ClusterTT2PCSubLink sublinks[CLUSTER_TT_2PC_MAX_SUBLINKS + 1];
 	uint16 nbindings;
 	uint32 nsublinks;
 	uint32 len;
@@ -267,10 +267,12 @@ cluster_tt_twophase_prefinish(TransactionId xid, SCN final_scn, bool is_commit, 
 		if (is_commit) {
 			cluster_tt_slot_durable_commit(b->undo_segment_id, b->slot_offset, b->xid, b->wrap,
 										   final_scn);
+			cluster_tt_slot_mark_committed(b->undo_segment_id, b->slot_offset, b->xid, final_scn);
 			(void)cluster_tt_status_install_local(&key, CLUSTER_TT_STATUS_COMMITTED, final_scn);
 			cluster_tt_status_hint_emit(&key, CLUSTER_TT_STATUS_COMMITTED, final_scn);
 		} else {
 			cluster_tt_slot_durable_abort(b->undo_segment_id, b->slot_offset, b->xid, b->wrap);
+			cluster_tt_slot_mark_aborted(b->undo_segment_id, b->slot_offset, b->xid);
 			(void)cluster_tt_status_install_local(&key, CLUSTER_TT_STATUS_ABORTED, InvalidScn);
 			cluster_tt_status_hint_emit(&key, CLUSTER_TT_STATUS_ABORTED, InvalidScn);
 		}

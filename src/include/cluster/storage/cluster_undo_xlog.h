@@ -49,13 +49,25 @@
  *     0x20 XLOG_UNDO_TT_SLOT_BIND
  *     0x30 XLOG_UNDO_TT_SLOT_COMMIT
  *     0x40 XLOG_UNDO_SEGMENT_RECYCLE (landed: spec-3.13 D3)
+ *     0x60 XLOG_UNDO_TT_SLOT_ABORT (landed: spec-3.15 D5)
  *     ... up to 0xF0 (low nibble used for XLR_INFO_MASK by xlog framework).
  */
 #define XLOG_UNDO_SEGMENT_INIT 0x10
 #define XLOG_UNDO_TT_SLOT_COMMIT 0x30  /* spec-3.11 D3: durable TT slot commit_scn */
-#define XLOG_UNDO_TT_SLOT_ABORT 0x31   /* spec-3.15 D5: prepared rollback targeted abort */
 #define XLOG_UNDO_SEGMENT_RECYCLE 0x40 /* spec-3.13 D3: COMMITTED -> RECYCLABLE */
 #define XLOG_UNDO_SEGMENT_REUSE 0x50   /* spec-3.13 D4: whole-segment rebirth */
+#define XLOG_UNDO_TT_SLOT_ABORT 0x60   /* spec-3.15 D5: prepared rollback targeted abort */
+
+StaticAssertDecl((XLOG_UNDO_SEGMENT_INIT & XLR_INFO_MASK) == 0,
+				 "cluster undo WAL opcodes must leave XLR_INFO_MASK bits clear");
+StaticAssertDecl((XLOG_UNDO_TT_SLOT_COMMIT & XLR_INFO_MASK) == 0,
+				 "cluster undo WAL opcodes must leave XLR_INFO_MASK bits clear");
+StaticAssertDecl((XLOG_UNDO_SEGMENT_RECYCLE & XLR_INFO_MASK) == 0,
+				 "cluster undo WAL opcodes must leave XLR_INFO_MASK bits clear");
+StaticAssertDecl((XLOG_UNDO_SEGMENT_REUSE & XLR_INFO_MASK) == 0,
+				 "cluster undo WAL opcodes must leave XLR_INFO_MASK bits clear");
+StaticAssertDecl((XLOG_UNDO_TT_SLOT_ABORT & XLR_INFO_MASK) == 0,
+				 "cluster undo WAL opcodes must leave XLR_INFO_MASK bits clear");
 
 
 /*

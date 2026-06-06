@@ -14,11 +14,12 @@
 #           write load cannot steal it -> COMMIT PREPARED -> visible
 #      L5   prepared transaction with subtransactions (SAVEPOINT chain)
 #           -> COMMIT PREPARED -> parent + child writes all visible
+#      L6   repeated prepared resolves recycle TT allocator state
 #      L7   prepare undo flush counter moves (C-P5 durability evidence;
 #           L4's crash leg is the behavioural proof)
 #      L8   local non-2PC path zero regression
 #
-#    (L6 "guards removed" is proven by L1/L5 themselves: those PREPAREs
+#    ("guards removed" is proven by L1/L5 themselves: those PREPAREs
 #    would have been rejected by the spec-3.5/3.7 guards.)
 #
 # IDENTIFICATION
@@ -43,10 +44,14 @@ use Test::More;
 my $node = PgracClusterNode->new('twophase');
 $node->init;
 $node->append_conf('postgresql.conf',
-	"max_prepared_transactions = 10\n");
+	"cluster.enabled = on\n" . "cluster.node_id = 0\n"
+	. "cluster.allow_single_node = on\n"
+	. "max_prepared_transactions = 10\n");
 $node->start;
 
 $node->safe_psql('postgres', 'CREATE TABLE t315 (id int primary key, v text)');
+$node->safe_psql('postgres',
+	'CREATE TABLE t315_reuse (id int, v text); ALTER TABLE t315_reuse ALTER COLUMN v SET STORAGE PLAIN');
 
 sub tt2pc_counter {
 	my ($key) = @_;
@@ -150,6 +155,29 @@ $node->safe_psql('postgres', q{COMMIT PREPARED 'gx4'});
 is($node->safe_psql('postgres',
 		q{SELECT string_agg(v, ',' ORDER BY id) FROM t315 WHERE id IN (4, 5)}),
    'parent,child', 'L5 parent + subxact writes visible after COMMIT PREPARED');
+
+# ============================================================
+# L6: repeated prepared resolves recycle shmem TT allocator state.
+#     Without the spec-3.15 prefinish mark_committed/mark_aborted handoff,
+#     each resolved prepared xact leaves its slot ACTIVE and the 8-slot
+#     allocator exhausts after a handful of sequential 2PC transactions.
+# ============================================================
+for my $i (20 .. 31) {
+	my $gid = "gx_reuse_$i";
+	$node->safe_psql('postgres', qq{
+		BEGIN;
+		INSERT INTO t315_reuse VALUES ($i, repeat('reuse', 1000));
+		PREPARE TRANSACTION '$gid';
+	});
+	if ($i % 2 == 0) {
+		$node->safe_psql('postgres', qq{COMMIT PREPARED '$gid'});
+	} else {
+		$node->safe_psql('postgres', qq{ROLLBACK PREPARED '$gid'});
+	}
+}
+is($node->safe_psql('postgres',
+	'SELECT count(*) FROM t315_reuse WHERE id BETWEEN 20 AND 31'),
+   '6', 'L6 repeated prepared commit/abort does not exhaust TT slots');
 
 # ============================================================
 # L7: prepare undo flush counter moved (C-P5).
