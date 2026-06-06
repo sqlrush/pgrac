@@ -189,7 +189,7 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT category) FROM pg_cluster_state}),
-   '30',
+   '31',
    'L7b pg_cluster_state has 31 distinct categories (spec-3.15 adds tt_2pc;spec-3.16 adds recovery)');
 
 

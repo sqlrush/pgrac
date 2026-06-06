@@ -318,11 +318,11 @@ is($pair->node0->safe_psql('postgres',
 
 
 # ============================================================
-# L12: categories = 25 + tt_status_hint alphabetic order.
+# L12: current Stage 3 category count + tt_status_hint alphabetic order.
 # ============================================================
 is($pair->node0->safe_psql('postgres',
 		q{SELECT count(DISTINCT category) FROM pg_cluster_state}),
-	'30',
+	'31',
 	'L12a pg_cluster_state has 31 categories (spec-3.15 adds tt_2pc;spec-3.16 adds recovery)');
 
 my $tt_categories = $pair->node0->safe_psql('postgres', q{

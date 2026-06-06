@@ -156,13 +156,13 @@ is($node->safe_psql(
 
 
 # ----------
-# L12: pg_cluster_state categories total = 10 (was 9 in 1.5; spec-1.6
-# adds buffer_format).
+# L12: pg_cluster_state categories total follows the current Stage 3
+# observability surface.
 # ----------
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT category) FROM pg_cluster_state}),
-   '30',
+   '31',
    'L12 pg_cluster_state has 31 categories (spec-3.15 adds tt_2pc;spec-3.16 adds recovery)');
 
 
