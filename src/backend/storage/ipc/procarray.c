@@ -2168,7 +2168,17 @@ ClusterSnapshotRefreshFields(Snapshot snapshot)
  * into PGPROC->cluster_read_scn_atomic via snapmgr).  TT slots / undo segments
  * whose commit_scn is strictly below this are needed by no live reader and may
  * be recycled (spec-3.12 C1/C3/C5).  No live cluster reader -> cluster_scn_current()
- * (everything recyclable).  Mirrors GetOldestXmin's ProcArray scan under a
+ * (everything recyclable).
+ *
+ * spec-3.15 V-3: prepared transactions' dummy PGPROCs never publish a
+ * cluster_read_scn_atomic (only snapmgr does, for live snapshots; proc.c
+ * inits it to InvalidScn and the remove paths clear it) -- so prepared
+ * xacts do NOT pin this horizon.  Their undo safety comes from the TT
+ * slot staying ACTIVE (segment drained predicate fails -> never
+ * COMMITTED/RECYCLABLE, spec-3.12/3.13) plus the protected-slot map
+ * (spec-3.15 D6), NOT from this horizon.
+ *
+ * Mirrors GetOldestXmin's ProcArray scan under a
  * SHARED ProcArrayLock; callers must NOT hold seg->lock / undo lifecycle_lock
  * when calling (C17 lock ordering: compute horizon first).
  */

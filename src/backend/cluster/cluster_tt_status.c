@@ -119,6 +119,14 @@ typedef struct ClusterTTStatusShmem {
 	pg_atomic_uint64 vis_conflict_failclosed_count; /* 53R9H */
 	pg_atomic_uint64 prune_remote_keep_count;
 	pg_atomic_uint64 vis_variant_unknown_failclosed_count;
+
+	/* spec-3.15 D9: two-phase commit observability. */
+	pg_atomic_uint64 twopc_prepare_records;
+	pg_atomic_uint64 twopc_prepare_undo_flushes;
+	pg_atomic_uint64 twopc_postprepare_transfers;
+	pg_atomic_uint64 twopc_prefinish_commits;
+	pg_atomic_uint64 twopc_prefinish_aborts;
+	pg_atomic_uint64 twopc_recover_rebinds;
 } ClusterTTStatusShmem;
 
 #ifdef USE_PGRAC_CLUSTER
@@ -180,6 +188,13 @@ cluster_tt_status_shmem_init(void)
 		pg_atomic_init_u64(&ClusterTTStatusState->vis_conflict_failclosed_count, 0);
 		pg_atomic_init_u64(&ClusterTTStatusState->prune_remote_keep_count, 0);
 		pg_atomic_init_u64(&ClusterTTStatusState->vis_variant_unknown_failclosed_count, 0);
+		/* PGRAC (spec-3.15 D9) */
+		pg_atomic_init_u64(&ClusterTTStatusState->twopc_prepare_records, 0);
+		pg_atomic_init_u64(&ClusterTTStatusState->twopc_prepare_undo_flushes, 0);
+		pg_atomic_init_u64(&ClusterTTStatusState->twopc_postprepare_transfers, 0);
+		pg_atomic_init_u64(&ClusterTTStatusState->twopc_prefinish_commits, 0);
+		pg_atomic_init_u64(&ClusterTTStatusState->twopc_prefinish_aborts, 0);
+		pg_atomic_init_u64(&ClusterTTStatusState->twopc_recover_rebinds, 0);
 	}
 
 	/* Lock. */
@@ -623,6 +638,14 @@ CLUSTER_VIS_BUMP(vis_selftoast_fork_count)
 CLUSTER_VIS_BUMP(vis_conflict_failclosed_count)
 CLUSTER_VIS_BUMP(prune_remote_keep_count)
 CLUSTER_VIS_BUMP(vis_variant_unknown_failclosed_count)
+
+/* spec-3.15 D9: 2PC counters (same single-writer bump/read shape). */
+CLUSTER_VIS_BUMP(twopc_prepare_records)
+CLUSTER_VIS_BUMP(twopc_prepare_undo_flushes)
+CLUSTER_VIS_BUMP(twopc_postprepare_transfers)
+CLUSTER_VIS_BUMP(twopc_prefinish_commits)
+CLUSTER_VIS_BUMP(twopc_prefinish_aborts)
+CLUSTER_VIS_BUMP(twopc_recover_rebinds)
 
 #else /* !USE_PGRAC_CLUSTER */
 

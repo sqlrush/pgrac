@@ -95,6 +95,7 @@ AtPrepare_ClusterTT(void)
 						errhint("Split the transaction, or resolve it without two-phase commit.")));
 
 	RegisterTwoPhaseRecord(TWOPHASE_RM_CLUSTER_TT_ID, 0, buf, len);
+	cluster_vis_bump_twopc_prepare_records();
 	pfree(buf);
 }
 
@@ -118,6 +119,7 @@ PostPrepare_ClusterTT(void)
 	cluster_subtrans_reset_local_links();
 	cluster_itl_touch_reset_at_end_xact();
 	cluster_undo_record_xact_reset(); /* touched-undo list + D16 flag */
+	cluster_vis_bump_twopc_postprepare_transfers();
 }
 
 
@@ -158,6 +160,7 @@ cluster_tt_twophase_recover(TransactionId xid, uint16 info, void *recdata, uint3
 
 	(void)info;
 	parse_or_corrupt(xid, recdata, len, &p);
+	cluster_vis_bump_twopc_recover_rebinds();
 
 	for (i = 0; i < p.nbindings; i++) {
 		const ClusterTT2PCBinding *b = &p.bindings[i];
@@ -244,6 +247,11 @@ cluster_tt_twophase_prefinish(TransactionId xid, SCN final_scn, bool is_commit, 
 	Assert(cluster_node_id >= 0);
 
 	parse_or_corrupt(xid, recdata, len, &p);
+
+	if (is_commit)
+		cluster_vis_bump_twopc_prefinish_commits();
+	else
+		cluster_vis_bump_twopc_prefinish_aborts();
 
 	for (i = 0; i < p.nbindings; i++) {
 		const ClusterTT2PCBinding *b = &p.bindings[i];

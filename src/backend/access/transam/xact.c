@@ -2923,6 +2923,7 @@ PrepareTransaction(void)
 	 * commit_fsync_* counters intentionally count both).
 	 */
 	cluster_undo_xact_precommit_flush();
+	cluster_vis_bump_twopc_prepare_undo_flushes();
 #endif
 
 	StartPrepare(gxact);

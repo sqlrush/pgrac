@@ -1465,6 +1465,27 @@ dump_gcs(ReturnSetInfo *rsinfo)
  *	baseline tracking.
  */
 /*
+ * dump_tt_2pc -- spec-3.15 D9 two-phase commit observability (6 rows).
+ */
+static void
+dump_tt_2pc(ReturnSetInfo *rsinfo)
+{
+	emit_row(rsinfo, "tt_2pc", "twopc_prepare_records",
+			 fmt_int64((int64)cluster_vis_get_twopc_prepare_records()));
+	emit_row(rsinfo, "tt_2pc", "twopc_prepare_undo_flushes",
+			 fmt_int64((int64)cluster_vis_get_twopc_prepare_undo_flushes()));
+	emit_row(rsinfo, "tt_2pc", "twopc_postprepare_transfers",
+			 fmt_int64((int64)cluster_vis_get_twopc_postprepare_transfers()));
+	emit_row(rsinfo, "tt_2pc", "twopc_prefinish_commits",
+			 fmt_int64((int64)cluster_vis_get_twopc_prefinish_commits()));
+	emit_row(rsinfo, "tt_2pc", "twopc_prefinish_aborts",
+			 fmt_int64((int64)cluster_vis_get_twopc_prefinish_aborts()));
+	emit_row(rsinfo, "tt_2pc", "twopc_recover_rebinds",
+			 fmt_int64((int64)cluster_vis_get_twopc_recover_rebinds()));
+}
+
+
+/*
  * dump_visibility -- spec-3.14 D8 HeapTupleSatisfies* variant fork
  * observability (6 counters under category='visibility').
  */
@@ -1637,6 +1658,7 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		dump_cluster_cssd(rsinfo);
 		dump_undo_cleaner(rsinfo);
 		dump_visibility(rsinfo);
+		dump_tt_2pc(rsinfo);
 		dump_scn(rsinfo);
 		dump_ges(rsinfo);
 		dump_grd(rsinfo);

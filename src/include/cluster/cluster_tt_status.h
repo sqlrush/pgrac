@@ -288,6 +288,20 @@ extern void cluster_vis_bump_prune_remote_keep_count(void);
 extern uint64 cluster_vis_get_prune_remote_keep_count(void);
 extern void cluster_vis_bump_vis_variant_unknown_failclosed_count(void);
 extern uint64 cluster_vis_get_vis_variant_unknown_failclosed_count(void);
+
+/* spec-3.15 D9: 2PC counters. */
+extern void cluster_vis_bump_twopc_prepare_records(void);
+extern uint64 cluster_vis_get_twopc_prepare_records(void);
+extern void cluster_vis_bump_twopc_prepare_undo_flushes(void);
+extern uint64 cluster_vis_get_twopc_prepare_undo_flushes(void);
+extern void cluster_vis_bump_twopc_postprepare_transfers(void);
+extern uint64 cluster_vis_get_twopc_postprepare_transfers(void);
+extern void cluster_vis_bump_twopc_prefinish_commits(void);
+extern uint64 cluster_vis_get_twopc_prefinish_commits(void);
+extern void cluster_vis_bump_twopc_prefinish_aborts(void);
+extern uint64 cluster_vis_get_twopc_prefinish_aborts(void);
+extern void cluster_vis_bump_twopc_recover_rebinds(void);
+extern uint64 cluster_vis_get_twopc_recover_rebinds(void);
 extern uint64 cluster_tt_status_get_lookup_miss_count(void);
 extern uint64 cluster_tt_status_get_evict_count(void);
 extern uint64 cluster_tt_status_get_flush_count(void);

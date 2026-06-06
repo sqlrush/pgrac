@@ -870,6 +870,38 @@ cluster_tt_durable_redo_apply_count(void)
 {
 	return 0;
 }
+/* spec-3.15 D9 2PC counter accessor stubs (dump_tt_2pc rows). */
+uint64
+cluster_vis_get_twopc_prepare_records(void)
+{
+	return 0;
+}
+uint64
+cluster_vis_get_twopc_prepare_undo_flushes(void)
+{
+	return 0;
+}
+uint64
+cluster_vis_get_twopc_postprepare_transfers(void)
+{
+	return 0;
+}
+uint64
+cluster_vis_get_twopc_prefinish_commits(void)
+{
+	return 0;
+}
+uint64
+cluster_vis_get_twopc_prefinish_aborts(void)
+{
+	return 0;
+}
+uint64
+cluster_vis_get_twopc_recover_rebinds(void)
+{
+	return 0;
+}
+
 /* spec-3.14 D8 visibility counter accessor stubs (dump_visibility rows). */
 uint64
 cluster_vis_get_vis_update_fork_count(void)
