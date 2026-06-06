@@ -146,4 +146,9 @@ extern Size cluster_subtrans_shmem_size(void);
 extern void cluster_subtrans_shmem_init(void);
 extern void cluster_subtrans_shmem_register(void);
 
+
+/* spec-3.15 D7: PREPARE-side SUBCOMMITTED link export/reset. */
+struct ClusterTT2PCSubLink; /* forward (cluster_tt_2pc.h) */
+extern uint32 cluster_subtrans_export_links(struct ClusterTT2PCSubLink *dst, uint32 max);
+extern void cluster_subtrans_reset_local_links(void);
 #endif /* CLUSTER_SUBTRANS_H */

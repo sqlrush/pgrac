@@ -42,6 +42,8 @@
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_subtrans.h"
+#include "access/xact.h"			/* GetTopTransactionIdIfAny (spec-3.15 D7) */
+#include "cluster/cluster_tt_2pc.h" /* sub-link export (spec-3.15 D7) */
 #include "cluster/cluster_tt_local.h"
 #include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_tt_status_hint.h"
@@ -58,6 +60,30 @@ typedef struct ClusterSubtransShmem {
 } ClusterSubtransShmem;
 
 static ClusterSubtransShmem *ClusterSubtransState = NULL;
+
+/*
+ * spec-3.15 D7: backend-local SUBCOMMITTED link list for PREPARE.
+ *
+ *	install_subcommitted() appends (child,parent) here so AtPrepare can
+ *	serialize the chain into the 2PC record (the shmem overlay does not
+ *	survive crash).  Lazily reset keyed by top xid: the first append of
+ *	a new top-level xact clears the previous xact's list -- no xact-end
+ *	hook needed.  PostPrepare resets explicitly (ownership transfer).
+ */
+static ClusterTT2PCSubLink subtrans_local_links[CLUSTER_TT_2PC_MAX_SUBLINKS];
+static uint32 subtrans_local_link_count = 0;
+static bool subtrans_local_links_overflow = false;
+static TransactionId subtrans_local_links_top_xid = InvalidTransactionId;
+
+static void
+subtrans_local_links_lazy_reset(TransactionId cur_top)
+{
+	if (subtrans_local_links_top_xid != cur_top) {
+		subtrans_local_link_count = 0;
+		subtrans_local_links_overflow = false;
+		subtrans_local_links_top_xid = cur_top;
+	}
+}
 
 /* ------------------------------------------------------------ */
 /* shmem registration                                           */
@@ -197,6 +223,20 @@ cluster_subtrans_emit_subcommit(TransactionId child_xid, TransactionId parent_xi
 		return false;
 
 	cluster_tt_status_hint_emit_subcommitted(&child_key, &parent_key);
+
+	/* spec-3.15 D7: track the link for a potential PREPARE. */
+	{
+		TransactionId cur_top = GetTopTransactionIdIfAny();
+
+		subtrans_local_links_lazy_reset(cur_top);
+		if (subtrans_local_link_count < CLUSTER_TT_2PC_MAX_SUBLINKS) {
+			subtrans_local_links[subtrans_local_link_count].child_key = child_key;
+			subtrans_local_links[subtrans_local_link_count].parent_key = parent_key;
+			subtrans_local_link_count++;
+		} else {
+			subtrans_local_links_overflow = true; /* AtPrepare will reject */
+		}
+	}
 	return true;
 }
 
@@ -352,6 +392,39 @@ cluster_subtrans_get_xact_has_state_check_count(void)
 	if (ClusterSubtransState == NULL)
 		return 0;
 	return pg_atomic_read_u64(&ClusterSubtransState->xact_has_state_check_count);
+}
+
+
+/*
+ * spec-3.15 D7: PREPARE-side sub-link export (read-only) + reset.
+ *
+ *	Saturation contract mirrors cluster_tt_local_export_bindings: when
+ *	the xact overflowed the cap, return max so the AtPrepare shell's
+ *	serialize() rejects (no silent truncation of the chain).
+ */
+uint32
+cluster_subtrans_export_links(ClusterTT2PCSubLink *dst, uint32 max)
+{
+	TransactionId cur_top = GetTopTransactionIdIfAny();
+	uint32 n;
+
+	if (subtrans_local_links_top_xid != cur_top)
+		return 0; /* stale list from a previous xact */
+	if (subtrans_local_links_overflow)
+		return max; /* saturated -> caller rejects */
+
+	n = Min(subtrans_local_link_count, max);
+	if (n > 0)
+		memcpy(dst, subtrans_local_links, n * sizeof(ClusterTT2PCSubLink));
+	return n;
+}
+
+void
+cluster_subtrans_reset_local_links(void)
+{
+	subtrans_local_link_count = 0;
+	subtrans_local_links_overflow = false;
+	subtrans_local_links_top_xid = InvalidTransactionId;
 }
 
 #else /* !USE_PGRAC_CLUSTER */

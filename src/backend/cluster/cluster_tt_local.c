@@ -48,6 +48,7 @@
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_tt_durable.h" /* spec-3.11 D4 durable commit */
 #include "cluster/cluster_tt_local.h"
+#include "cluster/cluster_tt_2pc.h"			 /* ClusterTT2PCBinding export (spec-3.15) */
 #include "cluster/cluster_tt_slot.h"		 /* spec-3.4b D4 real binding */
 #include "cluster/cluster_undo_record_api.h" /* spec-3.12 D2b cluster_undo_tt_rollover_locked */
 #include "cluster/cluster_tt_status.h"
@@ -338,6 +339,38 @@ cluster_tt_local_has_binding(TransactionId top_xid)
 {
 	return TransactionIdIsValid(top_xid) && cluster_tt_local_find_binding(top_xid) >= 0;
 }
+
+/*
+ * cluster_tt_local_export_bindings -- spec-3.15 D1 (PREPARE serialize).
+ *
+ *	Copy every backend-local binding into the caller's 2PC binding
+ *	array.  Returns the binding count; when the count exceeds `max`
+ *	the copy stops at max and the SATURATED count (max) is returned --
+ *	the AtPrepare shell passes max = CAP+1 so saturation reads as
+ *	"over cap" and serialize() rejects it (no silent truncation).
+ *	Read-only: PREPARE may still fail and abort needs the bindings.
+ */
+uint16
+cluster_tt_local_export_bindings(ClusterTT2PCBinding *dst, uint16 max)
+{
+	uint16 n = 0;
+	uint32 i;
+
+	for (i = 0; i < cluster_tt_local_binding_count && n < max; i++) {
+		const ClusterTTLocalBinding *b = &cluster_tt_local_bindings[i];
+
+		if (!TransactionIdIsValid(b->top_xid))
+			continue;
+		dst[n].undo_segment_id = b->segment_id;
+		dst[n].slot_offset = b->slot_offset;
+		dst[n].wrap = b->wrap;
+		dst[n].cluster_epoch = b->cluster_epoch;
+		dst[n].xid = b->top_xid;
+		n++;
+	}
+	return n;
+}
+
 
 /*
  * cluster_tt_local_reset_binding

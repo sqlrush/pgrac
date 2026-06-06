@@ -138,6 +138,9 @@ extern bool cluster_tt_local_peek_binding(TransactionId top_xid, uint32 *out_seg
 extern bool cluster_tt_local_has_binding(TransactionId top_xid);
 
 /* Free the bound TT slot and clear the binding (idempotent). */
+/* spec-3.15 D1: PREPARE-side export (read-only; saturates at max). */
+struct ClusterTT2PCBinding; /* forward (cluster_tt_2pc.h) */
+extern uint16 cluster_tt_local_export_bindings(struct ClusterTT2PCBinding *dst, uint16 max);
 extern void cluster_tt_local_reset_binding(void);
 
 /*

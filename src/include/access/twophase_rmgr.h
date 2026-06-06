@@ -26,7 +26,9 @@ typedef uint8 TwoPhaseRmgrId;
 #define TWOPHASE_RM_PGSTAT_ID		2
 #define TWOPHASE_RM_MULTIXACT_ID	3
 #define TWOPHASE_RM_PREDICATELOCK_ID	4
-#define TWOPHASE_RM_MAX_ID			TWOPHASE_RM_PREDICATELOCK_ID
+/* PGRAC (spec-3.15 D2): cluster TT bindings + SUBCOMMITTED links in 2PC. */
+#define TWOPHASE_RM_CLUSTER_TT_ID	5
+#define TWOPHASE_RM_MAX_ID			TWOPHASE_RM_CLUSTER_TT_ID
 
 extern PGDLLIMPORT const TwoPhaseCallback twophase_recover_callbacks[];
 extern PGDLLIMPORT const TwoPhaseCallback twophase_postcommit_callbacks[];
