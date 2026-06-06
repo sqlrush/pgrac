@@ -291,11 +291,11 @@ ok(defined($exported) && length($exported) > 0,
 
 
 # ============================================================
-# L14: pg_cluster_state categories = 26 + tt_status_hint = 7 keys.
+# L14: pg_cluster_state categories include tt_2pc and recovery.
 # ============================================================
 is($pair->node0->safe_psql('postgres',
 		q{SELECT count(DISTINCT category) FROM pg_cluster_state}),
-	'30',
+	'31',
 	'L14a pg_cluster_state has 31 categories (spec-3.15 adds tt_2pc;spec-3.16 adds recovery)');
 
 is($pair->node0->safe_psql('postgres',
