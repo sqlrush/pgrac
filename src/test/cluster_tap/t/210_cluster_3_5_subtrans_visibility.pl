@@ -11,8 +11,8 @@
 #	  L3   2-node subxact create + commit + remote visible via overlay
 #	       follow (best-effort — partial cross-node coverage in fixture)
 #	  L4   2-node subxact create + abort + ABORTED emit visible in counter
-#	  L5   PREPARE TRANSACTION with savepoint installs cluster state →
-#	       53R9B fail-closed (HW1 P0 guard)
+#	  L5   PREPARE TRANSACTION with savepoint succeeds after spec-3.15
+#	       exports SUBCOMMITTED links into the 2PC record
 #	  L6   no-peer PREPARE smoke — plain PG vanilla path (no 53R9B)
 #	  L7   chain_depth_exceeded counter accessor linkable
 #	  L8   spec-3.4a/d subxact barrier removed — INSERT inside savepoint
@@ -43,6 +43,7 @@ my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	extra_conf => [
 		'autovacuum = off',
 		'cluster.pcm_grd_max_entries = 0',
+		'max_prepared_transactions = 10',
 	]);
 $pair->start_pair;
 
@@ -110,9 +111,9 @@ else
 
 
 # ============================================================
-# L5: PREPARE TRANSACTION with savepoint → 53R9B fail-closed (peer mode)
-# Note: ClusterPair has 2 nodes ⇒ cluster_conf_has_peers() returns true,
-# so the guard should fire when subxact installed state.
+# L5: PREPARE TRANSACTION with savepoint succeeds after spec-3.15.
+# spec-3.5 HW1 used to fail-closed here with 53R9B; spec-3.15 D4/D7
+# removes that guard by carrying SUBCOMMITTED links in the 2PC record.
 # ============================================================
 my ($rc5, $out5, $err5) = $pair->node0->psql('postgres',
 	q{\set VERBOSITY verbose
@@ -122,10 +123,17 @@ my ($rc5, $out5, $err5) = $pair->node0->psql('postgres',
 	  RELEASE SAVEPOINT prep_guard;
 	  PREPARE TRANSACTION 'p_subtrans_guard';});
 
-isnt($rc5, 0, 'L5 PREPARE TRANSACTION with savepoint fails in peer mode');
-like($err5,
-	qr/53R9B|prepare_transaction_with_cluster_subtrans_state|cluster SUBTRANS state/i,
-	'L5 PREPARE TRANSACTION with savepoint raises 53R9B');
+is($rc5, 0, 'L5 PREPARE TRANSACTION with savepoint succeeds after spec-3.15');
+if ($rc5 == 0)
+{
+	$pair->node0->safe_psql('postgres', q{ROLLBACK PREPARED 'p_subtrans_guard'});
+	pass('L5 prepared savepoint transaction cleaned up with ROLLBACK PREPARED');
+}
+else
+{
+	diag("L5 stderr: $err5");
+	fail('L5 prepared savepoint transaction cleanup skipped because PREPARE failed');
+}
 
 
 # ============================================================
