@@ -182,6 +182,12 @@ cluster_undo_smgr_write_block(uint32 segment_id pg_attribute_unused(),
 	return true;
 }
 
+/* XLogFlush stub: the write-back flush path (flush_dirty_slot) references it,
+ * but U1-U6 run with write-back gated off so it is never executed. */
+void
+XLogFlush(XLogRecPtr record pg_attribute_unused())
+{}
+
 /* Re-init the pool fresh for a test (forces a new malloc'd region). */
 static void
 fresh_pool(void)

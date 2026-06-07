@@ -214,6 +214,47 @@ choose_victim(void)
 }
 
 
+/*
+ * Flush one buffered-dirty slot to disk (D2b write-back).  Caller MUST hold a
+ * pin on slotno so it cannot be evicted across the I/O.  Snapshots the image +
+ * its protecting LSN under the content lock and clears dirty, then OUTSIDE the
+ * lock XLogFlush(lsn) (WAL-before-data) + write-through + fsync.  A no-op if the
+ * slot is no longer dirty (a concurrent flush / evict won the race).
+ */
+static void
+flush_dirty_slot(int slotno)
+{
+	UndoBufSlot *s = &UndoBufSlots[slotno];
+	PGAlignedBlock localbuf;
+	XLogRecPtr wal_lsn = InvalidXLogRecPtr;
+	uint32 seg = 0;
+	uint8 owner = 0;
+	uint32 blk = 0;
+	bool need_write = false;
+
+	LWLockAcquire(&s->content_lock, LW_EXCLUSIVE);
+	if (s->dirty) {
+		memcpy(localbuf.data, SLOT_DATA(slotno), BLCKSZ);
+		wal_lsn = s->last_wal_lsn;
+		seg = s->segment_id;
+		owner = s->owner;
+		blk = s->block_no;
+		s->dirty = false;
+		need_write = true;
+	}
+	LWLockRelease(&s->content_lock);
+
+	if (need_write) {
+		XLogFlush(wal_lsn); /* WAL-before-data */
+		if (!cluster_undo_smgr_write_block(seg, owner, blk, localbuf.data, /* do_fsync = */ true))
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+							errmsg("cluster undo buffer write-back flush failed "
+								   "seg=%u owner=%u block=%u",
+								   seg, owner, blk)));
+	}
+}
+
+
 char *
 cluster_undo_buf_pin(uint32 segment_id, uint8 owner, uint32 block_no, ClusterUndoBufMode mode,
 					 ClusterUndoBufPin *pin)
@@ -264,11 +305,26 @@ cluster_undo_buf_pin(uint32 segment_id, uint8 owner, uint32 block_no, ClusterUnd
 								   UndoBufPool->nslots),
 							errhint("increase cluster.undo_buffers")));
 		}
+		if (UndoBufSlots[slotno].dirty) {
+			/*
+			 * D2b write-back victim: its buffered changes must reach disk
+			 * before the slot is reused (otherwise a later read would see the
+			 * stale on-disk block).  Pin it, flush OUTSIDE map_lock, then
+			 * re-loop and re-pick a victim (now clean).  Dormant while
+			 * write-back is gated off -- a write-through victim is never dirty.
+			 */
+			UndoBufSlot *s = &UndoBufSlots[slotno];
+
+			pg_atomic_fetch_add_u32(&s->pincount, 1);
+			LWLockRelease(&UndoBufPool->map_lock);
+			flush_dirty_slot(slotno);
+			pg_atomic_fetch_sub_u32(&s->pincount, 1);
+			slotno = -1;
+			continue; /* re-lookup / re-pick a clean victim */
+		}
 		{
 			UndoBufSlot *s = &UndoBufSlots[slotno];
 
-			/* D1 write-through => a victim is never dirty (alpha gate). */
-			Assert(!s->dirty);
 			if (s->valid)
 				pg_atomic_fetch_add_u64(&UndoBufPool->evict_count, 1);
 
@@ -398,55 +454,28 @@ cluster_undo_buf_flush_all(bool is_checkpoint)
 	 * or before this checkpoint's redo point is flushed here, which is what
 	 * makes the DELAY_CHKPT_START guarantee real (spec-3.18 §2.6 v0.8).
 	 *
-	 * Per slot: pin it (un-evictable across the I/O), copy the image + its
-	 * protecting LSN under the content lock, clear dirty, then OUTSIDE the lock
-	 * XLogFlush(lsn) (WAL-before-data) and write-through+fsync.  A concurrent
-	 * re-dirty after we clear sets dirty again -> next checkpoint flushes it.
+	 * Per slot: pin it (un-evictable across the I/O), then flush_dirty_slot
+	 * copies the image + LSN, clears dirty, XLogFlush(lsn) (WAL-before-data),
+	 * write-through + fsync -- all but the snapshot OUTSIDE the lock.  A
+	 * concurrent re-dirty after we clear sets dirty again -> next checkpoint
+	 * flushes it.
 	 */
 	(void)is_checkpoint;
 	for (int i = 0; i < UndoBufPool->nslots; i++) {
 		UndoBufSlot *s = &UndoBufSlots[i];
-		PGAlignedBlock localbuf;
-		XLogRecPtr wal_lsn = InvalidXLogRecPtr;
-		uint32 seg = 0;
-		uint8 owner = 0;
-		uint32 blk = 0;
-		bool need_write = false;
+		bool pinned = false;
 
-		/* Pin if dirty (keeps the slot from being evicted under us). */
 		LWLockAcquire(&UndoBufPool->map_lock, LW_EXCLUSIVE);
 		if (s->valid && s->dirty) {
 			pg_atomic_fetch_add_u32(&s->pincount, 1);
-			need_write = true;
+			pinned = true;
 		}
 		LWLockRelease(&UndoBufPool->map_lock);
-		if (!need_write)
+		if (!pinned)
 			continue;
 
-		/* Snapshot the image + LSN under EXCLUSIVE; clear dirty. */
-		LWLockAcquire(&s->content_lock, LW_EXCLUSIVE);
-		need_write = false;
-		if (s->dirty) {
-			memcpy(localbuf.data, SLOT_DATA(i), BLCKSZ);
-			wal_lsn = s->last_wal_lsn;
-			seg = s->segment_id;
-			owner = s->owner;
-			blk = s->block_no;
-			s->dirty = false;
-			need_write = true;
-		}
-		LWLockRelease(&s->content_lock);
+		flush_dirty_slot(i);
 		pg_atomic_fetch_sub_u32(&s->pincount, 1);
-
-		if (need_write) {
-			XLogFlush(wal_lsn); /* WAL-before-data */
-			if (!cluster_undo_smgr_write_block(seg, owner, blk, localbuf.data,
-											   /* do_fsync = */ true))
-				ereport(ERROR, (errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-								errmsg("cluster undo buffer checkpoint flush failed "
-									   "seg=%u owner=%u block=%u",
-									   seg, owner, blk)));
-		}
 	}
 }
 
