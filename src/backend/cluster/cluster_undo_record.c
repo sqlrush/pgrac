@@ -64,6 +64,7 @@
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
+#include "storage/proc.h" /* spec-3.18 D2b MyProc->delayChkptFlags (DELAY_CHKPT_START) */
 #include "storage/shmem.h"
 #include "utils/elog.h"
 
@@ -424,7 +425,7 @@ read_undo_block(uint32 segment_id, uint8 owner_instance, uint32 block_no, char *
 
 static bool
 write_undo_block(uint32 segment_id, uint8 owner_instance, uint32 block_no, const char *buf,
-				 bool do_fsync)
+				 bool do_fsync, XLogRecPtr wal_lsn)
 {
 	ClusterUndoBufPin pin;
 	char *img;
@@ -448,9 +449,62 @@ write_undo_block(uint32 segment_id, uint8 owner_instance, uint32 block_no, const
 	if (img == NULL)
 		return cluster_undo_smgr_write_block(segment_id, owner_instance, block_no, buf, false);
 	memcpy(img, buf, BLCKSZ);
-	cluster_undo_buf_mark_dirty(&pin, InvalidXLogRecPtr); /* write-through pwrite */
+	/* wal_lsn = the XLOG_UNDO_BLOCK_WRITE LSN (spec-3.18 D2): write-through
+	 * (gate off) writes now; write-back (gate on) defers behind this LSN. */
+	cluster_undo_buf_mark_dirty(&pin, wal_lsn);
 	cluster_undo_buf_unpin(&pin);
 	return true;
+}
+
+
+/*
+ * cluster_undo_wal_protect_block (spec-3.18 D2)
+ *	  WAL-protect + persist one undo DATA block (block_no >= 1).  block_buf is
+ *	  the full new image (block_lsn still old);  old_block_lsn / rec_off /
+ *	  rec_len / slot_off describe the change for the FPI-vs-delta decision.
+ *
+ *	  Gate off (D2a): emit always-FPI then write-through, no DELAY_CHKPT_START.
+ *	  Gate on (D2b): hold DELAY_CHKPT_START across the decision + XLogInsert +
+ *	  block_lsn stamp + (write-back) mark_dirty, so a checkpoint that adopts a
+ *	  redo point past old_block_lsn cannot complete until our block reaches
+ *	  disk via the checkpoint-flush set -- closing the FPW race (§2.6 v0.8).
+ *	  PG_FINALLY clears the flag on the error path (a real guard, not Assert).
+ *	  Returns false on a block-write I/O failure (caller fail-closes).
+ */
+static bool
+cluster_undo_wal_protect_block(uint32 segment_id, uint8 owner_instance, uint32 block_no,
+							   char *block_buf, XLogRecPtr old_block_lsn, uint16 rec_off,
+							   uint16 rec_len, uint16 slot_off)
+{
+	UndoBlockHeader *blkhdr = (UndoBlockHeader *)block_buf;
+	XLogRecPtr lsn;
+	bool ok;
+
+	if (!cluster_undo_buf_writeback_allowed()) {
+		/* D2a: always-FPI, write-through (no checkpoint-race window). */
+		lsn = cluster_undo_emit_block_write(owner_instance, segment_id, block_no, block_buf,
+											old_block_lsn, rec_off, rec_len, slot_off);
+		blkhdr->block_lsn = lsn;
+		return write_undo_block(segment_id, owner_instance, block_no, block_buf,
+								/* do_fsync = */ false, lsn);
+	}
+
+	/* D2b: DELAY_CHKPT_START spans the decision + insert + block write. */
+	MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+	PG_TRY();
+	{
+		lsn = cluster_undo_emit_block_write(owner_instance, segment_id, block_no, block_buf,
+											old_block_lsn, rec_off, rec_len, slot_off);
+		blkhdr->block_lsn = lsn;
+		ok = write_undo_block(segment_id, owner_instance, block_no, block_buf,
+							  /* do_fsync = */ false, lsn);
+	}
+	PG_FINALLY();
+	{
+		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+	}
+	PG_END_TRY();
+	return ok;
 }
 
 
@@ -766,26 +820,21 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 	blkhdr->free_offset = free_offset + record_length;
 
 	/*
-	 * spec-3.18 D2a: WAL-protect this undo data block before it is written
-	 * out.  D2a emits an always-FPI XLOG_UNDO_BLOCK_WRITE (the full image;
-	 * crash redo restores it wholesale, repairing any torn write) and stamps
-	 * block_lsn with the record's own LSN (§2.6 -- block_lsn never travels in
-	 * the WAL body).  Emitted under cursor_lock so the WAL image matches the
-	 * block we are about to write.  Write-through + precommit fsync are
-	 * unchanged in D2a; the write-back + 3-range delta + DELAY_CHKPT_START
-	 * rework is D2b.
+	 * spec-3.18 D2: WAL-protect + persist this undo data block.  The appended
+	 * record sits at [free_offset, free_offset + record_length) and its slot
+	 * dir entry at UNDO_SLOT_DIR_OFFSET(new_slot_idx) -- those are the 3-range
+	 * delta the protector emits when write-back is on (else a full image).
+	 * blkhdr->block_lsn still holds the block's PREVIOUS page-LSN, which drives
+	 * the FPI-on-first-touch decision; the protector overwrites it with the new
+	 * record LSN.  Done under cursor_lock so the WAL image matches the block.
+	 * Write-through + precommit fsync (gate off) or write-back + checkpoint-
+	 * flush (gate on) are chosen inside cluster_undo_wal_protect_block.
 	 */
 	Assert(current_block >= 1); /* data blocks only; block 0 is the segment header */
-	blkhdr->block_lsn
-		= cluster_undo_emit_block_write(owner_instance, segment_id, current_block, block_buf);
-
-	/* Write block back to file.  P0 perf hardening (2026-05-31): do NOT fsync
-	 * here — fsync moved out of cursor_lock to a single per-xact precommit
-	 * (cluster_undo_xact_precommit_flush) that still completes BEFORE the commit
-	 * becomes visible.  Durable ordering preserved; per-record serialized fsync
-	 * removed.  The dirtied segment is tracked below (outside cursor_lock). */
-	if (!write_undo_block(segment_id, owner_instance, current_block, block_buf,
-						  /* do_fsync = */ false)) {
+	if (!cluster_undo_wal_protect_block(segment_id, owner_instance, current_block, block_buf,
+										blkhdr->block_lsn, (uint16)free_offset,
+										(uint16)record_length,
+										(uint16)UNDO_SLOT_DIR_OFFSET(new_slot_idx))) {
 		LWLockRelease(&UndoRecordShared->cursor_lock.lock);
 		if (lifecycle_lock_held)
 			LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);

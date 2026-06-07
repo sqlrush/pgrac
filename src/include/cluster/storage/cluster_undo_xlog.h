@@ -404,15 +404,23 @@ extern XLogRecPtr cluster_undo_emit_segment_reuse(uint8 instance, uint32 segment
 												  const char *fresh_header_image);
 
 /*
- * cluster_undo_emit_block_write (spec-3.18 D2a)
+ * cluster_undo_emit_block_write (spec-3.18 D2)
  *	  Emit XLOG_UNDO_BLOCK_WRITE for one undo data block (block_no >= 1).
- *	  D2a ships always-FPI: the full BLCKSZ image is carried and redo restores
- *	  it wholesale (torn-write safe, no checkpoint-relative FPI decision; the
- *	  3-range delta + DELAY_CHKPT_START race-close is D2b).  Caller stamps the
- *	  returned LSN into the block's block_lsn before write-through (§2.6).
+ *	  block_image is the full new block; old_block_lsn is its page-LSN before
+ *	  this write; rec_off/rec_len/slot_off describe the appended record + slot
+ *	  for the delta form.
+ *
+ *	  Write-back gated off (D2a): always full image (has_fpi=1) -- torn-write
+ *	  safe, no checkpoint-relative decision.  Write-back on (D2b): full image
+ *	  only on the block's first touch since the last checkpoint (or
+ *	  full_page_writes off / fresh block), else a 3-range delta.  The D2b caller
+ *	  MUST hold DELAY_CHKPT_START across this call + the block write so a racing
+ *	  checkpoint cannot complete before the block is flushed (§2.6 v0.8).
+ *	  Returns the record LSN; the caller stamps it into block_lsn.
  */
 extern XLogRecPtr cluster_undo_emit_block_write(uint8 instance, uint32 segment_id, uint32 block_no,
-												const char *block_image);
+												const char *block_image, XLogRecPtr old_block_lsn,
+												uint16 rec_off, uint16 rec_len, uint16 slot_off);
 
 /*
  * cluster_undo_redo

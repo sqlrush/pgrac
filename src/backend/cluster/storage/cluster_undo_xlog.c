@@ -47,10 +47,12 @@
 #include "cluster/cluster_tt_durable.h"			/* spec-3.11: redo decision predicate */
 #include "cluster/cluster_undo_segment.h"		/* UNDO_SEGMENT_SIZE_BYTES */
 #include "cluster/storage/cluster_undo_alloc.h" /* header identity check (3.13 reuse redo) */
+#include "cluster/storage/cluster_undo_buf.h"	/* spec-3.18 D2b write-back gate */
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "miscadmin.h"
 #include "storage/bufpage.h"
 #include "storage/fd.h"
+#include "storage/proc.h" /* spec-3.18 D2b MyProc->delayChkptFlags assert */
 
 
 /*
@@ -299,24 +301,57 @@ cluster_undo_emit_segment_reuse(uint8 instance, uint32 segment_id, uint32 old_ge
  */
 XLogRecPtr
 cluster_undo_emit_block_write(uint8 instance, uint32 segment_id, uint32 block_no,
-							  const char *block_image)
+							  const char *block_image, XLogRecPtr old_block_lsn, uint16 rec_off,
+							  uint16 rec_len, uint16 slot_off)
 {
 	xl_undo_block_write rec;
 	XLogRecPtr lsn;
+	bool use_delta = false;
 
 	Assert(instance >= 1);
 	Assert(block_no >= 1); /* block 0 is the segment header (SEGMENT_INIT/REUSE) */
 	Assert(block_image != NULL);
 
+	/*
+	 * FPI-vs-delta decision (§2.6 v0.8).  Always-FPI while write-back is gated
+	 * off (D2a): the full image self-repairs torn writes with no checkpoint-
+	 * relative decision.  With write-back on (D2b): emit a 3-range delta unless
+	 * this is the block's first touch since the last checkpoint (old_block_lsn
+	 * <= RedoRecPtr), full_page_writes is off, or the block is fresh
+	 * (old_block_lsn invalid) -- those require a full image so crash redo can
+	 * rebuild the pre-checkpoint bytes a delta would not carry.  The caller
+	 * holds DELAY_CHKPT_START across this + the block write, which (with undo
+	 * blocks in the checkpoint-flush set) closes the FPW race.
+	 */
+	if (cluster_undo_buf_writeback_allowed()) {
+		XLogRecPtr redo;
+		bool do_page_writes;
+
+		Assert((MyProc->delayChkptFlags & DELAY_CHKPT_START) != 0);
+		GetFullPageWriteInfo(&redo, &do_page_writes);
+		use_delta = do_page_writes && !XLogRecPtrIsInvalid(old_block_lsn) && old_block_lsn > redo;
+	}
+
 	memset(&rec, 0, sizeof(rec));
 	rec.segment_id = segment_id;
 	rec.block_no = block_no;
 	rec.instance = instance;
-	rec.has_fpi = 1; /* D2a: always full image (rec_off/rec_len/slot_off unused) */
+	rec.has_fpi = use_delta ? 0 : 1;
 
 	XLogBeginInsert();
-	XLogRegisterData((char *)&rec, sizeof(rec));
-	XLogRegisterData(unconstify(char *, block_image), BLCKSZ);
+	if (use_delta) {
+		rec.rec_off = rec_off;
+		rec.rec_len = rec_len;
+		rec.slot_off = slot_off;
+		XLogRegisterData((char *)&rec, sizeof(rec));
+		/* body = hdr_prefix [0,40) ++ record ++ slot (matches the redo apply). */
+		XLogRegisterData(unconstify(char *, block_image), UNDO_BLOCK_HDR_PREFIX_LEN);
+		XLogRegisterData(unconstify(char *, block_image) + rec_off, rec_len);
+		XLogRegisterData(unconstify(char *, block_image) + slot_off, sizeof(UndoSlotDirEntry));
+	} else {
+		XLogRegisterData((char *)&rec, sizeof(rec));
+		XLogRegisterData(unconstify(char *, block_image), BLCKSZ);
+	}
 
 	lsn = XLogInsert(RM_CLUSTER_UNDO_ID, XLOG_UNDO_BLOCK_WRITE);
 
