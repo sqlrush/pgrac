@@ -143,6 +143,8 @@
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: spec-1.19 cluster-wal-page-init-thread-id injection point. */
 #include "cluster/cluster_inject.h"
+/* PGRAC: spec-3.18 D2b undo buffer pool checkpoint write-back flush. */
+#include "cluster/storage/cluster_undo_buf.h"
 #endif
 
 extern uint32 bootstrap_data_checksum_version;
@@ -7168,6 +7170,19 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 	CheckPointMultiXact();
 	CheckPointPredicate();
 	CheckPointBuffers(flags);
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: spec-3.18 D2b — flush the undo buffer pool's write-back dirty
+	 * blocks (XLogFlush their protecting LSN, then write-through + fsync) so
+	 * undo data is durable as of this checkpoint.  This is the phase-2 flush
+	 * the DELAY_CHKPT_START guarantee relies on for undo (undo files live
+	 * outside the RelFileLocator namespace, so CheckPointBuffers does not
+	 * cover them).  No-op while write-back is gated off (pool disabled or
+	 * cluster.undo_buffer_writeback off).
+	 */
+	cluster_undo_buf_flush_all(true);
+#endif
 
 	/* Perform all queued up fsyncs */
 	TRACE_POSTGRESQL_BUFFER_CHECKPOINT_SYNC_START();

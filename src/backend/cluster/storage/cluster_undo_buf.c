@@ -44,6 +44,7 @@
 
 #include "postgres.h"
 
+#include "access/xlog.h" /* XLogFlush — WAL-before-data on write-back (D2b) */
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/storage/cluster_undo_buf.h"
@@ -390,8 +391,63 @@ cluster_undo_buf_flush_all(bool is_checkpoint)
 		return;
 	}
 
-	/* D2 write-back path lands the real dirty-block flush here. */
+	/*
+	 * D2b write-back: flush every buffered-dirty block.  Called from
+	 * CheckPointGuts (is_checkpoint=true) in checkpoint phase 2, AFTER the
+	 * DELAY_CHKPT_START barrier — so any in-flight undo write whose WAL is at
+	 * or before this checkpoint's redo point is flushed here, which is what
+	 * makes the DELAY_CHKPT_START guarantee real (spec-3.18 §2.6 v0.8).
+	 *
+	 * Per slot: pin it (un-evictable across the I/O), copy the image + its
+	 * protecting LSN under the content lock, clear dirty, then OUTSIDE the lock
+	 * XLogFlush(lsn) (WAL-before-data) and write-through+fsync.  A concurrent
+	 * re-dirty after we clear sets dirty again -> next checkpoint flushes it.
+	 */
 	(void)is_checkpoint;
+	for (int i = 0; i < UndoBufPool->nslots; i++) {
+		UndoBufSlot *s = &UndoBufSlots[i];
+		PGAlignedBlock localbuf;
+		XLogRecPtr wal_lsn = InvalidXLogRecPtr;
+		uint32 seg = 0;
+		uint8 owner = 0;
+		uint32 blk = 0;
+		bool need_write = false;
+
+		/* Pin if dirty (keeps the slot from being evicted under us). */
+		LWLockAcquire(&UndoBufPool->map_lock, LW_EXCLUSIVE);
+		if (s->valid && s->dirty) {
+			pg_atomic_fetch_add_u32(&s->pincount, 1);
+			need_write = true;
+		}
+		LWLockRelease(&UndoBufPool->map_lock);
+		if (!need_write)
+			continue;
+
+		/* Snapshot the image + LSN under EXCLUSIVE; clear dirty. */
+		LWLockAcquire(&s->content_lock, LW_EXCLUSIVE);
+		need_write = false;
+		if (s->dirty) {
+			memcpy(localbuf.data, SLOT_DATA(i), BLCKSZ);
+			wal_lsn = s->last_wal_lsn;
+			seg = s->segment_id;
+			owner = s->owner;
+			blk = s->block_no;
+			s->dirty = false;
+			need_write = true;
+		}
+		LWLockRelease(&s->content_lock);
+		pg_atomic_fetch_sub_u32(&s->pincount, 1);
+
+		if (need_write) {
+			XLogFlush(wal_lsn); /* WAL-before-data */
+			if (!cluster_undo_smgr_write_block(seg, owner, blk, localbuf.data,
+											   /* do_fsync = */ true))
+				ereport(ERROR, (errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+								errmsg("cluster undo buffer checkpoint flush failed "
+									   "seg=%u owner=%u block=%u",
+									   seg, owner, blk)));
+		}
+	}
 }
 
 
