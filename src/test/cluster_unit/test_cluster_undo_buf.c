@@ -1,0 +1,305 @@
+/*-------------------------------------------------------------------------
+ *
+ * test_cluster_undo_buf.c
+ *	  pgrac spec-3.18 D1 — undo buffer pool unit tests.
+ *
+ *	  Links the real cluster_undo_buf.o and stubs the PG primitives it
+ *	  references (ShmemInitStruct -> malloc, LWLock* -> no-op single-threaded,
+ *	  cluster_undo_smgr_{read,write}_block -> capture/replay).  Verifies the
+ *	  pool LOGIC (interface-lock v1.1):
+ *	    U1  writeback_allowed() == false (D1 alpha gate)
+ *	    U2  block 0 is NOT poolable (pin returns NULL -> caller direct path)
+ *	    U3  miss reads via smgr once;  same block then hits (no 2nd read)
+ *	    U4  mark_dirty write-throughs with do_fsync=false (NOT per-unpin fsync)
+ *	    U5  data round-trips (modify under EXCLUSIVE pin -> write-through bytes)
+ *	    U6  eviction reuses a slot when the pool is full of unpinned blocks
+ *
+ *	  Concurrency + the fail-closed pool-exhausted ERROR path are covered by
+ *	  the integration e2e (the undo write path running on the pool), not here.
+ *
+ *
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2026, pgrac contributors
+ *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
+ * IDENTIFICATION
+ *	  src/test/cluster_unit/test_cluster_undo_buf.c
+ *
+ * NOTES
+ *	  pgrac-original file.
+ *	  Spec: spec-3.18-write-path-performance-overhaul.md (v0.6 RE-SCOPE)
+ *
+ *-------------------------------------------------------------------------
+ */
+#define USE_PGRAC_CLUSTER 1
+
+#include "postgres.h"
+
+#include <stdlib.h>
+#include <string.h>
+
+#include "cluster/cluster_shmem.h"
+#include "cluster/cluster_undo_smgr.h"
+#include "cluster/storage/cluster_undo_buf.h"
+#include "storage/lwlock.h"
+#include "storage/shmem.h"
+
+#undef printf
+#undef fprintf
+#undef snprintf
+#undef sprintf
+#undef vsnprintf
+#undef vfprintf
+#undef vprintf
+#undef vsprintf
+#undef strerror
+#undef strerror_r
+
+#include "unit_test.h"
+
+
+UT_DEFINE_GLOBALS();
+
+void
+ExceptionalCondition(const char *conditionName pg_attribute_unused(),
+					 const char *fileName pg_attribute_unused(),
+					 int lineNumber pg_attribute_unused())
+{
+	abort();
+}
+
+/* ----- GUC globals the pool reads ----- */
+int cluster_undo_buffers = 4; /* small pool for evict testing */
+bool cluster_undo_buffer_writeback = false;
+
+/* ----- shmem stub:  one malloc'd region, "found" on re-init ----- */
+static void *shmem_buf = NULL;
+static Size shmem_sz = 0;
+
+void *
+ShmemInitStruct(const char *name pg_attribute_unused(), Size size, bool *foundPtr)
+{
+	if (shmem_buf == NULL) {
+		shmem_buf = malloc(size);
+		shmem_sz = size;
+		memset(shmem_buf, 0, size);
+		*foundPtr = false;
+	} else
+		*foundPtr = true;
+	return shmem_buf;
+}
+
+/* ----- LWLock stubs (single-threaded test) ----- */
+void
+LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute_unused())
+{}
+bool
+LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
+{
+	return true;
+}
+void
+LWLockRelease(LWLock *lock pg_attribute_unused())
+{}
+
+void
+cluster_shmem_register_region(const ClusterShmemRegion *region pg_attribute_unused())
+{}
+
+/* ----- Size arithmetic (real ones overflow-check; stubs suffice here) ----- */
+Size
+add_size(Size s1, Size s2)
+{
+	return s1 + s2;
+}
+Size
+mul_size(Size s1, Size s2)
+{
+	return s1 * s2;
+}
+
+/* ----- elog/ereport stubs (the U1-U6 paths never raise; symbols only) ----- */
+bool
+errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+{
+	return true;
+}
+bool
+errstart_cold(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+{
+	return true;
+}
+void
+errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
+		  const char *funcname pg_attribute_unused())
+{
+	abort(); /* no U1-U6 test reaches an error */
+}
+int
+errcode(int sqlerrcode pg_attribute_unused())
+{
+	return 0;
+}
+int
+errmsg(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+int
+errhint(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+/* ----- smgr stubs:  capture writes, replay reads with a per-block marker ----- */
+static int smgr_read_calls = 0;
+static int smgr_write_calls = 0;
+static bool smgr_last_write_fsync = true;
+static uint32 smgr_last_write_block = 0;
+static char smgr_last_write_byte0 = 0;
+
+bool
+cluster_undo_smgr_read_block(uint32 segment_id pg_attribute_unused(),
+							 uint8 owner_instance pg_attribute_unused(), uint32 block_no, char *buf)
+{
+	smgr_read_calls++;
+	memset(buf, 0, BLCKSZ);
+	buf[0] = (char)block_no; /* marker so we can tell which block was read */
+	return true;
+}
+
+bool
+cluster_undo_smgr_write_block(uint32 segment_id pg_attribute_unused(),
+							  uint8 owner_instance pg_attribute_unused(), uint32 block_no,
+							  const char *buf, bool do_fsync)
+{
+	smgr_write_calls++;
+	smgr_last_write_fsync = do_fsync;
+	smgr_last_write_block = block_no;
+	smgr_last_write_byte0 = buf[0];
+	return true;
+}
+
+/* Re-init the pool fresh for a test (forces a new malloc'd region). */
+static void
+fresh_pool(void)
+{
+	if (shmem_buf) {
+		free(shmem_buf);
+		shmem_buf = NULL;
+	}
+	smgr_read_calls = smgr_write_calls = 0;
+	smgr_last_write_fsync = true;
+	cluster_undo_buf_shmem_init();
+}
+
+
+/* ===== U1 — writeback gate is hard-false in D1 ===== */
+UT_TEST(test_undo_buf_writeback_gated_off)
+{
+	UT_ASSERT_EQ((int)cluster_undo_buf_writeback_allowed(), 0);
+}
+
+
+/* ===== U2 — block 0 is not poolable ===== */
+UT_TEST(test_undo_buf_block0_not_poolable)
+{
+	ClusterUndoBufPin pin;
+	char *img;
+
+	fresh_pool();
+	img = cluster_undo_buf_pin(1, 0, 0, CLUSTER_UNDO_BUF_SHARED, &pin);
+	UT_ASSERT_NULL(img); /* caller falls back to direct smgr */
+	UT_ASSERT_EQ(pin.slot, -1);
+	UT_ASSERT_EQ(smgr_read_calls, 0); /* block 0 never touches the pool */
+}
+
+
+/* ===== U3 — miss reads once, then hits ===== */
+UT_TEST(test_undo_buf_miss_then_hit)
+{
+	ClusterUndoBufPin pin;
+	char *img;
+
+	fresh_pool();
+
+	img = cluster_undo_buf_pin(1, 0, 5, CLUSTER_UNDO_BUF_SHARED, &pin);
+	UT_ASSERT_NOT_NULL(img);
+	UT_ASSERT_EQ(smgr_read_calls, 1);			 /* disk read on miss */
+	UT_ASSERT_EQ((int)(unsigned char)img[0], 5); /* read the right block */
+	cluster_undo_buf_unpin(&pin);
+
+	img = cluster_undo_buf_pin(1, 0, 5, CLUSTER_UNDO_BUF_SHARED, &pin);
+	UT_ASSERT_NOT_NULL(img);
+	UT_ASSERT_EQ(smgr_read_calls, 1); /* hit — no second read */
+	UT_ASSERT_EQ((int)cluster_undo_buf_get_hit_count(), 1);
+	UT_ASSERT_EQ((int)cluster_undo_buf_get_miss_count(), 1);
+	cluster_undo_buf_unpin(&pin);
+}
+
+
+/* ===== U4/U5 — mark_dirty write-throughs with do_fsync=false + bytes ===== */
+UT_TEST(test_undo_buf_write_through)
+{
+	ClusterUndoBufPin pin;
+	char *img;
+
+	fresh_pool();
+
+	img = cluster_undo_buf_pin(1, 0, 7, CLUSTER_UNDO_BUF_EXCLUSIVE, &pin);
+	UT_ASSERT_NOT_NULL(img);
+	img[0] = (char)0x42; /* mutate under EXCLUSIVE pin */
+	cluster_undo_buf_mark_dirty(&pin, InvalidXLogRecPtr);
+
+	/* write-through happened, NOT a per-unpin fsync */
+	UT_ASSERT_EQ(smgr_write_calls, 1);
+	UT_ASSERT_EQ((int)smgr_last_write_fsync, 0); /* do_fsync == false */
+	UT_ASSERT_EQ((int)smgr_last_write_block, 7);
+	UT_ASSERT_EQ((int)(unsigned char)smgr_last_write_byte0, 0x42);
+	UT_ASSERT_EQ((int)cluster_undo_buf_get_writethrough_count(), 1);
+
+	cluster_undo_buf_unpin(&pin);
+	/* unpin does NOT write again (write-through already flushed) */
+	UT_ASSERT_EQ(smgr_write_calls, 1);
+}
+
+
+/* ===== U6 — eviction reuses a slot when the pool is full ===== */
+UT_TEST(test_undo_buf_evicts_when_full)
+{
+	ClusterUndoBufPin pin;
+	char *img;
+
+	fresh_pool(); /* cluster_undo_buffers = 4 */
+
+	/* Fill all 4 slots with distinct blocks, unpinning each (evictable). */
+	for (uint32 b = 1; b <= 4; b++) {
+		img = cluster_undo_buf_pin(1, 0, b, CLUSTER_UNDO_BUF_SHARED, &pin);
+		UT_ASSERT_NOT_NULL(img);
+		cluster_undo_buf_unpin(&pin);
+	}
+	UT_ASSERT_EQ(smgr_read_calls, 4);
+	UT_ASSERT_EQ((int)cluster_undo_buf_get_evict_count(), 0);
+
+	/* A 5th distinct block must evict one of the unpinned slots. */
+	img = cluster_undo_buf_pin(1, 0, 99, CLUSTER_UNDO_BUF_SHARED, &pin);
+	UT_ASSERT_NOT_NULL(img);
+	UT_ASSERT_EQ((int)(unsigned char)img[0], 99);
+	UT_ASSERT_EQ(smgr_read_calls, 5);
+	UT_ASSERT_EQ((int)cluster_undo_buf_get_evict_count(), 1);
+	cluster_undo_buf_unpin(&pin);
+}
+
+
+int
+main(void)
+{
+	UT_RUN(test_undo_buf_writeback_gated_off);
+	UT_RUN(test_undo_buf_block0_not_poolable);
+	UT_RUN(test_undo_buf_miss_then_hit);
+	UT_RUN(test_undo_buf_write_through);
+	UT_RUN(test_undo_buf_evicts_when_full);
+	UT_DONE();
+}
