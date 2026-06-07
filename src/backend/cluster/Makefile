@@ -119,6 +119,7 @@ OBJS = \
 	storage/cluster_shared_fs_local.o \
 	storage/cluster_smgr.o \
 	storage/cluster_undo_alloc.o \
+	storage/cluster_undo_buf.o \
 	storage/cluster_undo_smgr.o \
 	storage/cluster_undo_xlog.o
 else

@@ -100,6 +100,7 @@
  * clang-format to realign every neighbour include above. */
 #include "cluster/storage/cluster_smgr.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/storage/cluster_undo_buf.h" /* spec-3.18 D1 region */
 #include "cluster/cluster_startup_phase.h" /* cluster_phase_shmem_register (1.10.1) */
 #include "cluster/cluster_version_macros.h"
 
@@ -355,6 +356,11 @@ cluster_init_shmem_module(void)
 		cluster_shmem_register_region(&cluster_ctl_region);
 	if (cluster_shmem_lookup_region(cluster_conf_region.name) == NULL)
 		cluster_shmem_register_region(&cluster_conf_region);
+
+	/* spec-3.18 D1: undo block buffer pool (size_fn returns 0 when
+	 * cluster.undo_buffers=0, so registration is near-free when disabled). */
+	if (cluster_shmem_lookup_region("pgrac undo buffer pool") == NULL)
+		cluster_undo_buf_register_region();
 
 	/*
 	 * Stage 1.7: register cluster_pcm_grd (PCM GRD master state).

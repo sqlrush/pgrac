@@ -331,6 +331,11 @@ typedef enum BuiltinTrancheIds {
 	LWTRANCHE_CLUSTER_TT_SLOT,
 	/* PGRAC: spec-3.13 Undo Cleaner aux process state region. */
 	LWTRANCHE_CLUSTER_UNDO_CLEANER,
+	/* PGRAC: spec-3.18 D1 — undo block buffer pool.  Two sub-uses share this
+	 * tranche:  a single pool map_lock (slot lookup / allocate / evict) and a
+	 * per-slot content_lock (SHARED reader / EXCLUSIVE writer; mode fixed at
+	 * pin time — no in-place upgrade). */
+	LWTRANCHE_CLUSTER_UNDO_BUF,
 #endif
 	LWTRANCHE_FIRST_USER_DEFINED
 } BuiltinTrancheIds;
