@@ -78,6 +78,7 @@
 #include "cluster/cluster_undo_record_api.h"
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/cluster_undo_smgr.h"
+#include "cluster/storage/cluster_undo_buf.h" /* spec-3.18 D1 read/write-through */
 #include "cluster/storage/cluster_undo_alloc.h"
 
 #include "access/xlog.h" /* GetXLogWriteRecPtr */
@@ -403,7 +404,20 @@ undo_record_total_length(uint8 record_type, uint16 payload_len)
 static bool
 read_undo_block(uint32 segment_id, uint8 owner_instance, uint32 block_no, char *buf)
 {
-	return cluster_undo_smgr_read_block(segment_id, owner_instance, block_no, buf);
+	ClusterUndoBufPin pin;
+	char *img;
+
+	/*
+	 * spec-3.18 D1:  read-through the undo buffer pool for DATA blocks.  A NULL
+	 * pin means block 0 (not poolable) or the pool is disabled — fall back to
+	 * the direct smgr read.  On a hit/miss-fill the pool owns the disk read.
+	 */
+	img = cluster_undo_buf_pin(segment_id, owner_instance, block_no, CLUSTER_UNDO_BUF_SHARED, &pin);
+	if (img == NULL)
+		return cluster_undo_smgr_read_block(segment_id, owner_instance, block_no, buf);
+	memcpy(buf, img, BLCKSZ);
+	cluster_undo_buf_unpin(&pin);
+	return true;
 }
 
 
@@ -411,7 +425,31 @@ static bool
 write_undo_block(uint32 segment_id, uint8 owner_instance, uint32 block_no, const char *buf,
 				 bool do_fsync)
 {
-	return cluster_undo_smgr_write_block(segment_id, owner_instance, block_no, buf, do_fsync);
+	ClusterUndoBufPin pin;
+	char *img;
+
+	/*
+	 * spec-3.18 D1:  do_fsync is only set for block-0 segment-header writes
+	 * (cluster_undo_alloc), which are not poolable;  DATA-block record writes
+	 * are always do_fsync=false (precommit flush owns the fsync).  So a
+	 * do_fsync request goes straight to the direct smgr write.
+	 */
+	if (do_fsync)
+		return cluster_undo_smgr_write_block(segment_id, owner_instance, block_no, buf, true);
+
+	/*
+	 * Write-through the pool for DATA blocks:  update the cached image and
+	 * pwrite (do_fsync=false) so durability is identical to today while reads
+	 * stay coherent.  NULL pin (block 0 / pool disabled) -> direct write.
+	 */
+	img = cluster_undo_buf_pin(segment_id, owner_instance, block_no, CLUSTER_UNDO_BUF_EXCLUSIVE,
+							   &pin);
+	if (img == NULL)
+		return cluster_undo_smgr_write_block(segment_id, owner_instance, block_no, buf, false);
+	memcpy(img, buf, BLCKSZ);
+	cluster_undo_buf_mark_dirty(&pin, InvalidXLogRecPtr); /* write-through pwrite */
+	cluster_undo_buf_unpin(&pin);
+	return true;
 }
 
 
