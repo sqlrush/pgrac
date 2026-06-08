@@ -90,14 +90,19 @@ static char *UndoBufData = NULL;
 
 
 /*
- * cluster_undo_buf_writeback_allowed -- the D1 alpha gate (interface-lock §5).
- *	Hard false during D1:  buffered write-back has no WAL protection yet.
- *	D2 flips this after the crash-restart redo proof.
+ * cluster_undo_buf_writeback_allowed -- is buffered write-back active?
+ *	D2b: write-back runs when the pool exists AND cluster.undo_buffer_writeback
+ *	is on.  The pool is REQUIRED -- dirty blocks are made durable by the
+ *	checkpoint write-back flush (cluster_undo_buf_flush_all from CheckPointGuts)
+ *	+ eviction flush, which is what makes the DELAY_CHKPT_START guarantee real;
+ *	with no pool, fall back to always-FPI write-through (D2a).  WAL protection
+ *	(XLOG_UNDO_BLOCK_WRITE FPI/delta + redo) is unconditional, so flipping the
+ *	GUC is safe (spec-3.18 §2.6 v0.8).
  */
 bool
 cluster_undo_buf_writeback_allowed(void)
 {
-	return false; /* D1 phase — opened only by the D2 alpha. */
+	return UndoBufPool != NULL && cluster_undo_buffer_writeback;
 }
 
 

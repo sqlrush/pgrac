@@ -41,9 +41,9 @@
 #include "cluster/cluster_cr_cache.h" /* cluster_cr_cache_max_blocks (spec-3.10 D4) */
 #include "cluster/cluster_guc.h"
 #include "cluster/storage/cluster_undo_buf.h" /* cluster_undo_buf_writeback_allowed (spec-3.18 D1) */
-#include "cluster/cluster_ic.h"				   /* ClusterICTier enum values */
-#include "cluster/cluster_inject.h"			   /* cluster_injection_assign_hook (stage 0.27) */
-#include "cluster/cluster_pcm_lock.h"		   /* cluster_pcm_grd_max_entries (stage 1.7) */
+#include "cluster/cluster_ic.h"				  /* ClusterICTier enum values */
+#include "cluster/cluster_inject.h"			  /* cluster_injection_assign_hook (stage 0.27) */
+#include "cluster/cluster_pcm_lock.h"		  /* cluster_pcm_grd_max_entries (stage 1.7) */
 #include "cluster/storage/cluster_shared_fs.h" /* ClusterSharedFsBackendId (stage 1.1) */
 
 
@@ -64,10 +64,10 @@ bool cluster_smgr_user_relations = false;
 int cluster_shmem_max_regions = 64;
 
 /* spec-3.18 D1: undo block buffer pool slot count (0 = disabled). */
-int			cluster_undo_buffers = 2048;
+int cluster_undo_buffers = 2048;
 /* spec-3.18 D1: buffered write-back — MUST stay off until the D2 alpha
  * (check_hook hard-rejects on;  interface-lock §5). */
-bool		cluster_undo_buffer_writeback = false;
+bool cluster_undo_buffer_writeback = false;
 int cluster_grd_max_entries = 0;
 int cluster_ges_request_timeout_ms = 60000; /* spec-2.16 D12 + v0.5 P1.5 */
 
@@ -580,24 +580,21 @@ cluster_ges_retransmit_max_attempts_check_hook(int *newval, void **extra, GucSou
 }
 
 /*
- * spec-3.18 D1 (interface-lock §5):  hard-reject turning undo buffer write-back
- * on while it is not yet WAL-protected (the D2 alpha gate).  A real runtime
- * guard — Assert is stripped in production (L214/L218), and a default alone can
- * be overridden;  only this check_hook actually prevents the unsafe state.
+ * spec-3.18 D2b:  undo buffer write-back is now WAL-protected
+ * (XLOG_UNDO_BLOCK_WRITE FPI/delta + redo) and made durable by the checkpoint
+ * write-back flush (CheckPointGuts -> cluster_undo_buf_flush_all) + eviction
+ * flush + DELAY_CHKPT_START, so enabling the GUC is safe.  The D1 hard-reject
+ * is removed (it called cluster_undo_buf_writeback_allowed(), which is now the
+ * GUC itself -> circular).  When the pool is disabled (cluster.undo_buffers =
+ * 0) write-back simply has no effect -- writeback_allowed() stays false and
+ * undo writes use the direct write-through path -- so no validation is needed.
  */
 static bool
 cluster_undo_buffer_writeback_check_hook(bool *newval, void **extra, GucSource source)
 {
-	(void) extra;
-	(void) source;
-	if (*newval && !cluster_undo_buf_writeback_allowed())
-	{
-		GUC_check_errcode(ERRCODE_FEATURE_NOT_SUPPORTED);
-		GUC_check_errdetail("cluster.undo_buffer_writeback requires D2 WAL protection "
-							"(the D1+D2 correctness alpha);  buffered undo without WAL would "
-							"lose data on crash.  Not yet enabled.");
-		return false;
-	}
+	(void)newval;
+	(void)extra;
+	(void)source;
 	return true;
 }
 
@@ -791,26 +788,21 @@ cluster_init_guc(void)
 							NULL);			/* show_hook */
 
 	/* spec-3.18 D1: undo block buffer pool (AD-014 form restoration). */
-	DefineCustomIntVariable("cluster.undo_buffers",
-							gettext_noop("Number of cluster undo block buffer pool slots."),
-							gettext_noop("Each slot caches one 8KB undo DATA block (block 0 is "
-										 "not poolable).  0 disables the pool (direct smgr I/O).  "
-										 "Default 2048 = ~16MB per instance."),
-							&cluster_undo_buffers, 2048, 0, 1048576,
-							PGC_POSTMASTER, /* shmem sized once at init */
-							0,
-							NULL, NULL, NULL);
+	DefineCustomIntVariable(
+		"cluster.undo_buffers", gettext_noop("Number of cluster undo block buffer pool slots."),
+		gettext_noop("Each slot caches one 8KB undo DATA block (block 0 is "
+					 "not poolable).  0 disables the pool (direct smgr I/O).  "
+					 "Default 2048 = ~16MB per instance."),
+		&cluster_undo_buffers, 2048, 0, 1048576, PGC_POSTMASTER, /* shmem sized once at init */
+		0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable("cluster.undo_buffer_writeback",
 							 gettext_noop("Enable buffered write-back for the undo buffer pool."),
 							 gettext_noop("MUST stay off until the spec-3.18 D2 WAL-protection "
 										  "alpha;  the check_hook hard-rejects turning it on.  "
 										  "Off = write-through (durability identical to today)."),
-							 &cluster_undo_buffer_writeback, false,
-							 PGC_SIGHUP,
-							 0,
-							 cluster_undo_buffer_writeback_check_hook,
-							 NULL, NULL);
+							 &cluster_undo_buffer_writeback, false, PGC_SIGHUP, 0,
+							 cluster_undo_buffer_writeback_check_hook, NULL, NULL);
 
 	/*
 	 * spec-2.15:  cluster.grd_max_entries

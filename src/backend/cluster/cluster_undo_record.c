@@ -985,6 +985,19 @@ cluster_undo_xact_precommit_flush(void)
 	if (cluster_undo_touched_seg_count == 0)
 		return;
 
+	/*
+	 * spec-3.18 D2b:  with write-back on, undo blocks are made durable by the
+	 * checkpoint write-back flush (CheckPointGuts -> cluster_undo_buf_flush_all)
+	 * + WAL redo -- the commit record's XLogFlush makes the protecting
+	 * XLOG_UNDO_BLOCK_WRITE records durable, and a crash replays them.  So the
+	 * per-commit data fsync (the L1 write-path tax this spec targets) is no
+	 * longer needed.  With write-back off (D2a) the write-through blocks are
+	 * not otherwise fsync'd before a checkpoint recycles their WAL, so the
+	 * precommit fsync stays.
+	 */
+	if (cluster_undo_buf_writeback_allowed())
+		return;
+
 	for (i = 0; i < cluster_undo_touched_seg_count; i++) {
 		if (!cluster_undo_smgr_fsync_segment_file(cluster_undo_touched_segs[i].segment_id,
 												  cluster_undo_touched_segs[i].owner_instance)) {
