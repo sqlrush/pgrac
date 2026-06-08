@@ -79,6 +79,7 @@
 #include "cluster/cluster_undo_record_api.h"
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/cluster_undo_smgr.h"
+#include "cluster/cluster_undo_extent.h"	  /* spec-3.18 D3 per-txn extent */
 #include "cluster/storage/cluster_undo_buf.h" /* spec-3.18 D1 read/write-through */
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "cluster/storage/cluster_undo_xlog.h" /* spec-3.18 D2a XLOG_UNDO_BLOCK_WRITE */
@@ -187,6 +188,16 @@ static ClusterUndoRecordShared *UndoRecordShared = NULL;
 
 /* Per-backend state(D16 PREPARE guard support). */
 static bool cluster_undo_touched_in_xact = false;
+
+/*
+ * spec-3.18 D3:  the backend's currently-held undo extent.  segment_id ==
+ * CLUSTER_UNDO_EXTENT_NONE means "no extent held" (claim one on next write).
+ * The cursor (cur_block / cur_free_offset / cur_slot_count) advances lock-free
+ * within the extent;  only claiming a new extent touches lifecycle_lock.  Reset
+ * to NONE at end of xact (cluster_undo_record_xact_reset) -- residual blocks
+ * are dropped (D3.3 will add the Q2 hybrid residual cache).
+ */
+static ClusterUndoExtent cluster_undo_current_extent = { 0 };
 
 /*
  * P0 perf hardening (2026-05-31): per-backend touched-undo-segment list.
@@ -539,6 +550,116 @@ cluster_undo_wal_protect_block(uint32 segment_id, uint8 owner_instance, uint32 b
 
 
 /*
+ * spec-3.18 D3:  result of an extent claim.  CLAIM_OK fills *ext;  the error
+ * results map to the same SQLSTATEs the pre-D3 cursor path raised, but the
+ * ereport is done by the caller OUTSIDE lifecycle_lock (the claim releases the
+ * lock before returning any error).
+ */
+typedef enum UndoExtentClaimResult {
+	CLAIM_OK = 0,
+	CLAIM_HARD_CAP, /* 53R9E: segment pool hard cap */
+	CLAIM_FS_FAIL,	/* 53R9D: autoextend FS error / timeout */
+	CLAIM_IO_FAIL	/* block-0 header read/write failed -> InvalidUba */
+} UndoExtentClaimResult;
+
+/*
+ * claim_undo_extent -- spec-3.18 D3 (mini-plan §1).
+ *
+ *	Claim a run of undo data blocks (cluster.undo_extent_blocks) for this
+ *	backend's exclusive lock-free use, touching lifecycle_lock exactly once
+ *	(vs the pre-D3 per-record cursor_lock).  Under lifecycle_lock:
+ *	  - select the active segment (ensured_segment_id on first claim);
+ *	  - resume the high-water from the segment bitmap when the shmem cache is
+ *	    cold (B1 restart resume -- never reset to block 1 over existing data);
+ *	  - autoextend (reuse-first; retention rollover inside) when the segment is
+ *	    full, marking the old segment FULL + activating the new one;
+ *	  - batch-mark the claimed range used (A1, one block-0 RMW + fsync);
+ *	  - advance the shared high-water + publish active_segment_id.
+ *
+ *	On success *ext is a held extent parked at its first (fresh) block.  Errors
+ *	release the lock first (caller ereports).  Activation mirrors the pre-D3
+ *	path: mark_active + tail_block_init(1) whenever a segment becomes active
+ *	(tail_block=1 is the conservative retention base, safe on restart resume).
+ */
+static UndoExtentClaimResult
+claim_undo_extent(ClusterUndoExtent *ext, uint8 owner_instance, uint32 ensured_segment_id,
+				  SCN current_scn)
+{
+	uint32 seg;
+	uint32 hw;
+	uint32 n;
+	bool needs_activation;
+
+	LWLockAcquire(&UndoRecordShared->lifecycle_lock.lock, LW_EXCLUSIVE);
+
+	seg = UndoRecordShared->active_segment_id;
+	needs_activation = (seg == 0); /* first claim ever, or post-restart resume */
+	if (seg == 0)
+		seg = ensured_segment_id;
+
+	/* High-water: steady-state shmem cache, else B1 rebuild from the bitmap. */
+	hw = UndoRecordShared->next_extent_block;
+	if (hw == 0)
+		hw = cluster_undo_segment_first_free_block(seg, owner_instance); /* 0 => full/corrupt */
+
+	n = (hw == 0) ? 0
+				  : cluster_undo_extent_compute(hw, (uint32)cluster_undo_extent_blocks,
+												UNDO_BLOCKS_PER_SEGMENT, ext);
+
+	if (n == 0) {
+		/* Segment full / corrupt bitmap -> autoextend (reuse-first inside). */
+		uint32 old_seg = seg;
+		bool at_hard_cap = false;
+		uint32 new_seg = cluster_undo_segment_extend_or_create(owner_instance, &at_hard_cap);
+
+		if (new_seg == 0) {
+			if (at_hard_cap)
+				pg_atomic_fetch_add_u64(&UndoRecordShared->segment_hard_cap_fail_count, 1);
+			else
+				pg_atomic_fetch_add_u64(&UndoRecordShared->segment_create_fail_count, 1);
+			LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
+			return at_hard_cap ? CLAIM_HARD_CAP : CLAIM_FS_FAIL;
+		}
+		pg_atomic_fetch_add_u64(&UndoRecordShared->autoextend_count, 1);
+		pg_atomic_fetch_add_u64(&UndoRecordShared->segment_switch_count, 1);
+		if (old_seg != 0 && old_seg != new_seg)
+			(void)cluster_undo_segment_mark_full(old_seg, owner_instance);
+		seg = new_seg;
+		needs_activation = true;
+		hw = 1; /* fresh segment: data blocks from 1 */
+		n = cluster_undo_extent_compute(hw, (uint32)cluster_undo_extent_blocks,
+										UNDO_BLOCKS_PER_SEGMENT, ext);
+		/* fresh segment has full room => n > 0 */
+	}
+
+	if (needs_activation) {
+		if (!cluster_undo_segment_mark_active(seg, owner_instance)
+			|| !cluster_undo_segment_tail_block_init(seg, owner_instance, 1)) {
+			LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
+			return CLAIM_IO_FAIL;
+		}
+		pg_atomic_fetch_add_u64(&UndoRecordShared->segment_claim_count, 1);
+		UndoRecordShared->block_first_scn = current_scn;
+	}
+
+	/* A1: batch-mark the whole claimed range used in one block-0 RMW + fsync. */
+	if (!cluster_undo_segment_mark_block_range_used(seg, owner_instance, hw, n)) {
+		LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
+		return CLAIM_IO_FAIL;
+	}
+
+	/* Publish: advance high-water + active segment. */
+	UndoRecordShared->next_extent_block = hw + n;
+	UndoRecordShared->active_segment_id = seg;
+	ext->segment_id = seg;
+	pg_atomic_fetch_add_u64(&UndoRecordShared->extent_claim_count, 1);
+
+	LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
+	return CLAIM_OK;
+}
+
+
+/*
  * cluster_undo_record_alloc -- record-level allocator main API.
  *
  *	Implementation outline:
@@ -587,9 +708,6 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 	int local_head_idx;
 	UBA effective_prev_uba;
 	bool first_in_tx;
-	bool lifecycle_lock_held = false;
-	bool segment_needs_activation = false;
-	bool block_was_fresh = false;
 
 	/* Input validation. */
 	if (record_type == UNDO_RECORD_INVALID || record_type > UNDO_RECORD_ITL)
@@ -664,136 +782,63 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 	/* SCN stamp for write_scn (advance Lamport). */
 	current_scn = cluster_scn_advance();
 
-	LWLockAcquire(&UndoRecordShared->cursor_lock.lock, LW_EXCLUSIVE);
-
 	/*
-	 * Select active segment.  Publish to shared cursor only after the
-	 * first undo record is durable and lifecycle metadata is updated.
+	 * spec-3.18 D3:  obtain a writable block from this backend's extent.  The
+	 * extent's blocks are private to us, so per-record writes take NO shared
+	 * lock (only an extent claim touches lifecycle_lock);  per-block content is
+	 * serialized by the D1 pool's content_lock inside write_undo_block.
+	 *
+	 *   current block has room          -> write there
+	 *   current block full, extent more -> advance backend-local cursor (fresh)
+	 *   extent NONE / exhausted         -> claim a new extent (lifecycle_lock)
 	 */
-	segment_id = UndoRecordShared->active_segment_id;
-	if (segment_id == 0) {
-		segment_id = ensured_segment_id;
-		current_block = 1; /* block 0 is segment header */
-		free_offset = sizeof(UndoBlockHeader);
-		slot_count = 0;
-		segment_needs_activation = true;
-	} else {
-		current_block = UndoRecordShared->current_block;
-		free_offset = UndoRecordShared->free_offset;
-		slot_count = UndoRecordShared->slot_count;
-	}
+	{
+		ClusterUndoExtent *ext = &cluster_undo_current_extent;
 
-	/* Check block fit;  advance to next block if needed. */
-	if (!cluster_undo_block_has_space(free_offset, slot_count, record_length)) {
-		/* Advance to next block. */
-		current_block++;
-		if (current_block >= UNDO_BLOCKS_PER_SEGMENT) {
-			/*
-			 * Segment exhausted — spec-3.8 D8: try autoextend instead
-			 * of immediate 53R9D fail.  Per spec §3.2 lock contract:
-			 *   1. Release cursor_lock(避免持 cursor_lock 期间 I/O)
-			 *   2. Acquire lifecycle_lock
-			 *   3. Recheck active_segment_id(double-checked locking)
-			 *   4. If race winner already extended → release lifecycle_lock
-			 *      + re-acquire cursor_lock + retry from segment_id load
-			 *   5. Otherwise call cluster_undo_segment_extend_or_create()
-			 *   6. Mark old segment full
-			 *   7. Re-acquire cursor_lock + write first record into new
-			 *      segment
-			 *   8. Mark NEW segment ACTIVE and publish active_segment_id
-			 *
-			 * On hard cap → caller ereport 53R9E
-			 * On FS fail → caller ereport 53R9D
-			 */
-			uint32 old_segment_id = segment_id;
-			uint32 new_segment_id;
-			bool at_hard_cap = false;
-			uint8 ownerinst;
+		for (;;) {
+			if (!cluster_undo_extent_exhausted(ext)
+				&& cluster_undo_block_has_space(ext->cur_free_offset, ext->cur_slot_count,
+												record_length))
+				break; /* current block has room for this record */
 
-			LWLockRelease(&UndoRecordShared->cursor_lock.lock);
-
-			LWLockAcquire(&UndoRecordShared->lifecycle_lock.lock, LW_EXCLUSIVE);
-			lifecycle_lock_held = true;
-
-			/* Recheck: maybe race winner already extended. */
-			if (UndoRecordShared->active_segment_id != old_segment_id) {
-				/*
-				 * Race winner already extended — release lifecycle_lock
-				 * + recursive retry.  The recursive call re-reads cursor
-				 * state under cursor_lock from scratch,  so we don't need
-				 * to repopulate locals here.
-				 */
-				LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
-				return cluster_undo_record_alloc(record_type, target, tt_slot_segment_id,
-												 tt_slot_offset, payload, payload_len, prev_uba);
+			if (!cluster_undo_extent_exhausted(ext)) {
+				/* Current block full but the extent has more blocks. */
+				cluster_undo_extent_next_block(ext);
+				continue; /* a fresh block always fits one <= hard-cap record */
 			}
 
-			/* I am the race winner — try autoextend. */
-			ownerinst = (uint8)(cluster_node_id + 1);
-			new_segment_id = cluster_undo_segment_extend_or_create(ownerinst, &at_hard_cap);
-
-			if (new_segment_id == 0) {
-				/* spec-3.8 §3.5:  hard cap → 53R9E;  FS fail → 53R9D.
-				 * Counter bump first,  release lifecycle_lock,  then
-				 * ereport ERROR.  Direct raise (not return InvalidUba)
-				 * so the SQLSTATE reaches the SQL client instead of
-				 * being masked by the heap-level INVALID_UBA wrapper. */
-				if (at_hard_cap)
-					pg_atomic_fetch_add_u64(&UndoRecordShared->segment_hard_cap_fail_count, 1);
-				else
-					pg_atomic_fetch_add_u64(&UndoRecordShared->segment_create_fail_count, 1);
-				LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
-
-				/* Q8: at the hard cap every recyclable segment counts. */
+			/* No usable extent -> claim one (the only lifecycle_lock touch). */
+			switch (claim_undo_extent(ext, owner_instance, ensured_segment_id, current_scn)) {
+			case CLAIM_OK:
+				break; /* held at a fresh first block;  re-loop confirms space */
+			case CLAIM_HARD_CAP:
+				cluster_undo_cleaner_wakeup(); /* Q8: every recyclable segment counts */
+				ereport(ERROR, (errcode(ERRCODE_CLUSTER_UNDO_SEGMENTS_HARD_CAP_REACHED),
+								errmsg("cluster undo segment pool hard cap reached for instance %u",
+									   (unsigned)(cluster_node_id + 1)),
+								errhint("Increase cluster.undo_segments_max_per_instance "
+										"(current limit reached);  end the long-running reader "
+										"holding the retention horizon, or wait for the spec-3.13 "
+										"cleaner to reclaim recyclable segments.")));
+				break; /* unreachable (ereport does not return) */
+			case CLAIM_FS_FAIL:
 				cluster_undo_cleaner_wakeup();
-				if (at_hard_cap)
-					ereport(ERROR,
-							(errcode(ERRCODE_CLUSTER_UNDO_SEGMENTS_HARD_CAP_REACHED),
-							 errmsg("cluster undo segment pool hard cap reached for instance %u",
-									(unsigned)(cluster_node_id + 1)),
-							 errhint("Increase cluster.undo_segments_max_per_instance "
-									 "(current limit reached);  end the long-running reader "
-									 "holding the retention horizon, or wait for the spec-3.13 "
-									 "cleaner to reclaim recyclable segments.")));
-				else
-					ereport(ERROR, (errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
-									errmsg("cluster undo segment autoextend failed "
-										   "(filesystem error or timeout)"),
-									errhint("Check disk space on $PGDATA/pg_undo and "
-											"cluster.undo_segment_create_timeout_ms.")));
-				return InvalidUba; /* unreachable */
+				ereport(ERROR, (errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+								errmsg("cluster undo segment autoextend failed "
+									   "(filesystem error or timeout)"),
+								errhint("Check disk space on $PGDATA/pg_undo and "
+										"cluster.undo_segment_create_timeout_ms.")));
+				break; /* unreachable */
+			case CLAIM_IO_FAIL:
+				return InvalidUba; /* block-0 header I/O fail */
 			}
-
-			/* Success — counter bumps. */
-			pg_atomic_fetch_add_u64(&UndoRecordShared->autoextend_count, 1);
-			pg_atomic_fetch_add_u64(&UndoRecordShared->segment_switch_count, 1);
-
-			/* Mark old segment FULL(state remains ACTIVE per §3.3 I2). */
-			if (!cluster_undo_segment_mark_full(old_segment_id, ownerinst)) {
-				LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
-				return InvalidUba;
-			}
-
-			/*
-			 * Prepare NEW segment cursor.  The NEW active_segment_id is
-			 * published only after its first record write and header
-			 * activation succeed.
-			 */
-			LWLockAcquire(&UndoRecordShared->cursor_lock.lock, LW_EXCLUSIVE);
-
-			/* Fall through with NEW segment state. */
-			segment_id = new_segment_id;
-			current_block = 1;
-			free_offset = sizeof(UndoBlockHeader);
-			slot_count = 0;
-			segment_needs_activation = true;
-		} else {
-			free_offset = sizeof(UndoBlockHeader);
-			slot_count = 0;
 		}
-	}
 
-	block_was_fresh = (slot_count == 0);
+		segment_id = ext->segment_id;
+		current_block = ext->cur_block;
+		free_offset = ext->cur_free_offset;
+		slot_count = ext->cur_slot_count;
+	}
 
 	/* Read current block (or zeroed if first write to this block). */
 	if (slot_count == 0) {
@@ -808,12 +853,9 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 		blkhdr->first_change_lsn = GetXLogWriteRecPtr();
 		blkhdr->crc64 = 0;
 	} else {
-		if (!read_undo_block(segment_id, owner_instance, current_block, block_buf)) {
-			LWLockRelease(&UndoRecordShared->cursor_lock.lock);
-			if (lifecycle_lock_held)
-				LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
-			return InvalidUba; /* I/O fail */
-		}
+		/* Mid-extent block we already wrote -> read it back from the pool. */
+		if (!read_undo_block(segment_id, owner_instance, current_block, block_buf))
+			return InvalidUba; /* I/O fail (no shared lock held in D3 path) */
 		blkhdr = (UndoBlockHeader *)block_buf;
 	}
 
@@ -856,63 +898,33 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 	 * delta the protector emits when write-back is on (else a full image).
 	 * blkhdr->block_lsn still holds the block's PREVIOUS page-LSN, which drives
 	 * the FPI-on-first-touch decision; the protector overwrites it with the new
-	 * record LSN.  Done under cursor_lock so the WAL image matches the block.
-	 * Write-through + precommit fsync (gate off) or write-back + checkpoint-
-	 * flush (gate on) are chosen inside cluster_undo_wal_protect_block.
+	 * record LSN.  spec-3.18 D3:  the block is private to this backend's extent
+	 * (no cursor_lock);  the D1 pool's per-block content_lock serializes the
+	 * pool slot, and the block was marked used + segment activated at claim time
+	 * (NOT here -- mark_block_range_used precedes any record write, the B1
+	 * marked >= has-data invariant).  Write-through + precommit fsync (gate off)
+	 * or write-back + checkpoint-flush (gate on) are chosen inside it.
 	 */
 	Assert(current_block >= 1); /* data blocks only; block 0 is the segment header */
-	if (!cluster_undo_wal_protect_block(segment_id, owner_instance, current_block, block_buf,
-										blkhdr->block_lsn, (uint16)free_offset,
-										(uint16)record_length,
-										(uint16)UNDO_SLOT_DIR_OFFSET(new_slot_idx))) {
-		LWLockRelease(&UndoRecordShared->cursor_lock.lock);
-		if (lifecycle_lock_held)
-			LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
-		return InvalidUba; /* I/O fail */
-	}
-
-	if (segment_needs_activation) {
-		uint8 ownerinst = (uint8)(cluster_node_id + 1);
-
-		if (!cluster_undo_segment_mark_active(segment_id, ownerinst)
-			|| !cluster_undo_segment_tail_block_init(segment_id, ownerinst, 1)) {
-			LWLockRelease(&UndoRecordShared->cursor_lock.lock);
-			if (lifecycle_lock_held)
-				LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
-			return InvalidUba;
-		}
-		UndoRecordShared->active_segment_id = segment_id;
-		UndoRecordShared->current_block = current_block;
-		UndoRecordShared->block_first_scn = current_scn;
-		pg_atomic_fetch_add_u64(&UndoRecordShared->segment_claim_count, 1);
-	}
-
-	if (block_was_fresh
-		&& !cluster_undo_segment_mark_block_used((uint32)segment_id, (uint8)(cluster_node_id + 1),
-												 current_block)) {
-		LWLockRelease(&UndoRecordShared->cursor_lock.lock);
-		if (lifecycle_lock_held)
-			LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
-		return InvalidUba;
-	}
+	if (!cluster_undo_wal_protect_block(
+			segment_id, owner_instance, current_block, block_buf, blkhdr->block_lsn,
+			(uint16)free_offset, (uint16)record_length, (uint16)UNDO_SLOT_DIR_OFFSET(new_slot_idx)))
+		return InvalidUba; /* I/O fail (no shared lock held in D3 path) */
 
 	pg_atomic_fetch_add_u64(&UndoRecordShared->block_write_count, 1);
 	/* block_flush_count is no longer bumped per-record: fsync is deferred to the
 	 * per-xact precommit flush (P0 perf hardening). */
 
-	/* Advance shared cursor. */
-	UndoRecordShared->current_block = current_block;
-	UndoRecordShared->free_offset = free_offset + record_length;
-	UndoRecordShared->slot_count = (uint16)(slot_count + 1);
-	if (block_was_fresh)
-		UndoRecordShared->block_first_scn = current_scn;
-	UndoRecordShared->block_dirty = 0; /* written (pwrite); fsync deferred to precommit */
+	/*
+	 * spec-3.18 D3:  advance the BACKEND-LOCAL extent cursor (no shared publish;
+	 * the shared high-water moved forward at claim time).  The old shared cursor
+	 * fields (current_block / free_offset / slot_count) are left for the
+	 * undo_extent_blocks=1 / pre-D3 observability path and updated best-effort.
+	 */
+	cluster_undo_current_extent.cur_free_offset = free_offset + record_length;
+	cluster_undo_current_extent.cur_slot_count = (uint16)(slot_count + 1);
 
 	pg_atomic_fetch_add_u64(&UndoRecordShared->record_alloc_count, 1);
-
-	LWLockRelease(&UndoRecordShared->cursor_lock.lock);
-	if (lifecycle_lock_held)
-		LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
 
 	/* Mark backend touched for D16 PREPARE guard. */
 	cluster_undo_touched_in_xact = true;
@@ -1065,6 +1077,10 @@ cluster_undo_record_xact_reset(void)
 	memset(cluster_undo_local_heads, 0, sizeof(cluster_undo_local_heads));
 	cluster_undo_local_head_count = 0;
 	cluster_undo_touched_seg_count = 0;
+	/* spec-3.18 D3: drop the backend-local extent at xact end.  Residual blocks
+	 * are not reused (D3.3 will add the Q2 hybrid residual cache);  they are
+	 * reclaimed when the whole segment recycles -- no leak (mini-plan §7). */
+	memset(&cluster_undo_current_extent, 0, sizeof(cluster_undo_current_extent));
 	/* P0 perf hardening: drop the cached undo segment fd at xact end to bound
 	 * stale-fd exposure (e.g. a recycled segment) across transactions. */
 	cluster_undo_smgr_fd_cache_reset();
@@ -1372,19 +1388,31 @@ cluster_undo_test_force_segment_end(void)
 	if (UndoRecordShared == NULL)
 		return false;
 
-	LWLockAcquire(&UndoRecordShared->cursor_lock.lock, LW_EXCLUSIVE);
+	/*
+	 * spec-3.18 D3: drive the EXTENT high-water (next_extent_block) to the
+	 * segment end, so the next claim_undo_extent computes a 0-block extent and
+	 * runs the autoextend / reuse / hard-cap path -- without writing 64 MB.
+	 * next_extent_block is protected by lifecycle_lock (the claim lock), not
+	 * cursor_lock.  Also reset THIS backend's held extent so a same-session DML
+	 * re-claims;  a fresh-backend DML (new connection) starts with no extent
+	 * anyway.  The old cursor fields are set too for pre-D3 observability.
+	 */
+	LWLockAcquire(&UndoRecordShared->lifecycle_lock.lock, LW_EXCLUSIVE);
 
 	if (UndoRecordShared->active_segment_id == 0) {
-		LWLockRelease(&UndoRecordShared->cursor_lock.lock);
+		LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
 		return false;
 	}
 
+	UndoRecordShared->next_extent_block = UNDO_BLOCKS_PER_SEGMENT; /* claim -> 0 -> autoextend */
 	UndoRecordShared->current_block = UNDO_BLOCKS_PER_SEGMENT - 1;
 	UndoRecordShared->free_offset = BLCKSZ; /* triggers has_space() == false */
 	UndoRecordShared->slot_count = 0;
 	UndoRecordShared->block_dirty = 0;
 
-	LWLockRelease(&UndoRecordShared->cursor_lock.lock);
+	LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
+
+	memset(&cluster_undo_current_extent, 0, sizeof(cluster_undo_current_extent));
 	return true;
 }
 
