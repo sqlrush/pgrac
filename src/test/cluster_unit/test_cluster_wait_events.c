@@ -226,9 +226,11 @@ UT_TEST(test_per_category_event_counts)
 	UT_ASSERT_EQ((uint32)WAIT_EVENT_INTERCONNECT_CONNECT_RETRY
 					 - (uint32)WAIT_EVENT_INTERCONNECT_RDMA_SEND + 1,
 				 5);
-	/* spec-3.9: Undo category grows 4 -> 5 with WAIT_EVENT_CLUSTER_CR_CONSTRUCT */
-	UT_ASSERT_EQ((uint32)WAIT_EVENT_CLUSTER_CR_CONSTRUCT - (uint32)WAIT_EVENT_UNDO_REMOTE_READ + 1,
-				 5);
+	/* Undo category: 4 (AD-010) + CR_CONSTRUCT (spec-3.9) + TT_DURABLE_IO
+	 * (spec-3.11) + BUF_FLUSH + EXTENT_CLAIM (spec-3.18 D7) = 8.  Count the
+	 * full range to the last event so future additions are caught here (F12). */
+	UT_ASSERT_EQ(
+		(uint32)WAIT_EVENT_CLUSTER_UNDO_EXTENT_CLAIM - (uint32)WAIT_EVENT_UNDO_REMOTE_READ + 1, 8);
 	UT_ASSERT_EQ((uint32)WAIT_EVENT_ADG_SCN_SYNC_WAIT - (uint32)WAIT_EVENT_ADG_MRP_APPLY_WAIT + 1,
 				 4);
 	UT_ASSERT_EQ((uint32)WAIT_EVENT_CLUSTER_SHARED_FS_FSYNC

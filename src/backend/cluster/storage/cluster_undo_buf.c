@@ -56,6 +56,7 @@
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "utils/errcodes.h"
+#include "utils/wait_event.h" /* spec-3.18 D7: ClusterUndoBufFlush wait event */
 
 /* GUCs (registered in cluster_guc.c). */
 extern int cluster_undo_buffers;		   /* pool slot count;  0 = disabled */
@@ -83,6 +84,7 @@ typedef struct ClusterUndoBufPool {
 	pg_atomic_uint64 miss_count;
 	pg_atomic_uint64 writethrough_count;
 	pg_atomic_uint64 evict_count;
+	pg_atomic_uint64 writeback_count; /* spec-3.18 D7: D2b write-back flushes */
 	/* UndoBufSlot slots[nslots] follows; char data[nslots * BLCKSZ] after. */
 } ClusterUndoBufPool;
 
@@ -166,6 +168,7 @@ cluster_undo_buf_shmem_init(void)
 	pg_atomic_init_u64(&UndoBufPool->miss_count, 0);
 	pg_atomic_init_u64(&UndoBufPool->writethrough_count, 0);
 	pg_atomic_init_u64(&UndoBufPool->evict_count, 0);
+	pg_atomic_init_u64(&UndoBufPool->writeback_count, 0); /* spec-3.18 D7 */
 
 	for (int i = 0; i < n; i++) {
 		UndoBufSlot *s = &UndoBufSlots[i];
@@ -276,12 +279,24 @@ flush_dirty_slot(int slotno)
 	if (!need_write)
 		return;
 
-	XLogFlush(flushed_lsn); /* WAL-before-data */
-	if (!cluster_undo_smgr_write_block(seg, owner, blk, localbuf.data, /* do_fsync = */ true))
+	XLogFlush(flushed_lsn); /* WAL-before-data (XLogFlush carries its own wait event) */
+
+	/*
+	 * PGRAC (spec-3.18 D7): attribute the write-back data-file I/O (pwrite +
+	 * fsync) to a dedicated wait event so a backend blocked here is visible in
+	 * pg_stat_activity.wait_event.  Only the smgr write is wrapped -- the
+	 * XLogFlush above is attributed to its own WAL wait event.
+	 */
+	pgstat_report_wait_start(WAIT_EVENT_CLUSTER_UNDO_BUF_FLUSH);
+	if (!cluster_undo_smgr_write_block(seg, owner, blk, localbuf.data, /* do_fsync = */ true)) {
+		pgstat_report_wait_end();
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
 						errmsg("cluster undo buffer write-back flush failed "
 							   "seg=%u owner=%u block=%u",
 							   seg, owner, blk)));
+	}
+	pgstat_report_wait_end();
+	pg_atomic_fetch_add_u64(&UndoBufPool->writeback_count, 1); /* spec-3.18 D7 */
 
 	/* Write durable -> clear dirty unless a newer write re-dirtied the slot. */
 	LWLockAcquire(&s->content_lock, LW_EXCLUSIVE);
@@ -579,4 +594,10 @@ uint64
 cluster_undo_buf_get_evict_count(void)
 {
 	return UndoBufPool ? pg_atomic_read_u64(&UndoBufPool->evict_count) : 0;
+}
+
+uint64
+cluster_undo_buf_get_writeback_count(void)
+{
+	return UndoBufPool ? pg_atomic_read_u64(&UndoBufPool->writeback_count) : 0;
 }

@@ -114,9 +114,9 @@ Network transport layer.
 | `ClusterICHeartbeatWait` | LMON main loop is idle, waiting for the next heartbeat tick |
 | `ClusterICReconnect` | LMON waiting before re-attempting a connection to a peer that is currently `down` |
 
-## Cluster: Undo (4 events)
+## Cluster: Undo (8 events)
 
-Cross-node undo segment access.
+Undo segment access, durable transaction-table I/O, and the local undo buffer pool.
 
 | Name | Description |
 |---|---|
@@ -124,6 +124,10 @@ Cross-node undo segment access.
 | `UndoTtLookupRemote` | Waiting for a remote transaction-table lookup |
 | `UndoSegmentFetch` | Waiting for an undo segment fetch |
 | `UndoRetentionWait` | Waiting on undo retention to expire |
+| `ClusterCRConstruct` | Waiting to construct a consistent-read block image |
+| `ClusterTTDurableIO` | Waiting on durable transaction-table slot header I/O |
+| `ClusterUndoBufFlush` | Waiting on an undo buffer write-back to storage |
+| `ClusterUndoExtentClaim` | Waiting to extend an undo segment while claiming an extent |
 
 ## Cluster: ADG (4 events)
 

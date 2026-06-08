@@ -699,6 +699,27 @@ cluster_undo_segment_claim_count(void)
 {
 	return 0;
 }
+/* spec-3.18 D7: dump_undo now reads the extent + undo-buffer counters. */
+uint64
+cluster_undo_extent_claim_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_buf_get_hit_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_buf_get_miss_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_buf_get_writeback_count(void)
+{
+	return 0;
+}
 uint64
 cluster_undo_block_write_count(void)
 {

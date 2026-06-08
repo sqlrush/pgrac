@@ -82,9 +82,10 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_lmd.h"	 /* cluster_lmd_* observability accessors (spec-2.19 D10) */
 #include "cluster/cluster_lms.h"	 /* cluster_lms_* observability accessors (spec-2.18 D10) */
 #include "cluster/cluster_tt_slot.h" /* spec-3.12 D5 retention counters */
-#include "cluster/cluster_undo_record_api.h" /* cluster_undo_* counter accessors (spec-3.7 D10) */
-#include "cluster/cluster_cr.h"				 /* cluster_cr_* counter accessors (spec-3.9 D8) */
-#include "cluster/cluster_tt_durable.h"		 /* cluster_tt_durable_* counters (spec-3.11 D8) */
+#include "cluster/cluster_undo_record_api.h"  /* cluster_undo_* counter accessors (spec-3.7 D10) */
+#include "cluster/storage/cluster_undo_buf.h" /* spec-3.18 D7: undo buffer counters */
+#include "cluster/cluster_cr.h"				  /* cluster_cr_* counter accessors (spec-3.9 D8) */
+#include "cluster/cluster_tt_durable.h"		  /* cluster_tt_durable_* counters (spec-3.11 D8) */
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_grd_pending.h"
 #include "cluster/cluster_grd_work_queue.h"
@@ -1531,6 +1532,15 @@ dump_undo(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_undo_record_alloc_count()));
 	emit_row(rsinfo, "undo", "segment_claim_count",
 			 fmt_int64((int64)cluster_undo_segment_claim_count()));
+	/* spec-3.18 D7: per-txn extent claim (D3) + undo buffer pool (D1/D2b). */
+	emit_row(rsinfo, "undo", "extent_claim_count",
+			 fmt_int64((int64)cluster_undo_extent_claim_count()));
+	emit_row(rsinfo, "undo", "undo_buf_hit_count",
+			 fmt_int64((int64)cluster_undo_buf_get_hit_count()));
+	emit_row(rsinfo, "undo", "undo_buf_miss_count",
+			 fmt_int64((int64)cluster_undo_buf_get_miss_count()));
+	emit_row(rsinfo, "undo", "undo_buf_writeback_count",
+			 fmt_int64((int64)cluster_undo_buf_get_writeback_count()));
 	emit_row(rsinfo, "undo", "block_write_count",
 			 fmt_int64((int64)cluster_undo_block_write_count()));
 	emit_row(rsinfo, "undo", "block_flush_count",

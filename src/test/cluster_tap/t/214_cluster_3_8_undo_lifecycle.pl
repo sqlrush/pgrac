@@ -81,8 +81,8 @@ my $node0 = $pair->node0;
 # ----------
 my $undo_row_count = $node0->safe_psql('postgres',
 	q{SELECT count(*) FROM pg_cluster_state WHERE category='undo'});
-is($undo_row_count, '32',
-	"L2 undo category has 32 rows (5 record + 4 lifecycle + 3 fsync + 4 smgr + 5 durable-tt + 5 retention + 6 cleaner)"
+is($undo_row_count, '36',
+	"L2 undo category has 36 rows (5 record + 4 lifecycle + 3 fsync + 4 smgr + 5 durable-tt + 5 retention + 6 cleaner + 4 buf/extent obs [spec-3.18 D7])"
 );
 
 

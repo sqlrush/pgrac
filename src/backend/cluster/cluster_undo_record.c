@@ -67,6 +67,7 @@
 #include "storage/proc.h" /* spec-3.18 D2b MyProc->delayChkptFlags (DELAY_CHKPT_START) */
 #include "storage/shmem.h"
 #include "utils/elog.h"
+#include "utils/wait_event.h" /* spec-3.18 D7: ClusterUndoExtentClaim wait event */
 
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_scn.h"
@@ -610,7 +611,18 @@ claim_undo_extent(ClusterUndoExtent *ext, uint8 owner_instance, uint32 ensured_s
 		/* Segment full / corrupt bitmap -> autoextend (reuse-first inside). */
 		uint32 old_seg = seg;
 		bool at_hard_cap = false;
-		uint32 new_seg = cluster_undo_segment_extend_or_create(owner_instance, &at_hard_cap);
+		uint32 new_seg;
+
+		/*
+		 * PGRAC (spec-3.18 D7): attribute the autoextend file-create + fsync I/O
+		 * (the lifecycle_lock-held slow path) to a dedicated wait event so a
+		 * backend blocked extending undo is visible in pg_stat_activity.  Only
+		 * the I/O is wrapped -- the lifecycle_lock acquire is already attributed
+		 * to its LWLock tranche (A1: no double-attribution of the lock wait).
+		 */
+		pgstat_report_wait_start(WAIT_EVENT_CLUSTER_UNDO_EXTENT_CLAIM);
+		new_seg = cluster_undo_segment_extend_or_create(owner_instance, &at_hard_cap);
+		pgstat_report_wait_end();
 
 		if (new_seg == 0) {
 			if (at_hard_cap)
@@ -1159,6 +1171,14 @@ cluster_undo_segment_claim_count(void)
 	if (UndoRecordShared == NULL)
 		return 0;
 	return pg_atomic_read_u64(&UndoRecordShared->segment_claim_count);
+}
+
+uint64
+cluster_undo_extent_claim_count(void)
+{
+	if (UndoRecordShared == NULL)
+		return 0;
+	return pg_atomic_read_u64(&UndoRecordShared->extent_claim_count);
 }
 
 uint64

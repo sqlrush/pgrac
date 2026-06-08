@@ -1245,6 +1245,12 @@ pgstat_get_wait_cluster_undo(WaitEventCluster w)
 	case WAIT_EVENT_UNDO_TT_DURABLE_IO:
 		event_name = "ClusterTTDurableIO"; /* spec-3.11 */
 		break;
+	case WAIT_EVENT_CLUSTER_UNDO_BUF_FLUSH:
+		event_name = "ClusterUndoBufFlush"; /* spec-3.18 D7 */
+		break;
+	case WAIT_EVENT_CLUSTER_UNDO_EXTENT_CLAIM:
+		event_name = "ClusterUndoExtentClaim"; /* spec-3.18 D7 */
+		break;
 	default:
 		break;
 	}

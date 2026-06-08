@@ -163,6 +163,7 @@ extern void cluster_undo_xact_precommit_flush(void);
  */
 extern uint64 cluster_undo_record_alloc_count(void);
 extern uint64 cluster_undo_segment_claim_count(void);
+extern uint64 cluster_undo_extent_claim_count(void); /* spec-3.18 D3/D7 */
 extern uint64 cluster_undo_block_write_count(void);
 extern uint64 cluster_undo_block_flush_count(void);
 extern uint64 cluster_undo_reader_lookup_count(void);

@@ -129,5 +129,6 @@ extern uint64 cluster_undo_buf_get_hit_count(void);
 extern uint64 cluster_undo_buf_get_miss_count(void);
 extern uint64 cluster_undo_buf_get_writethrough_count(void);
 extern uint64 cluster_undo_buf_get_evict_count(void);
+extern uint64 cluster_undo_buf_get_writeback_count(void); /* spec-3.18 D7 */
 
 #endif /* CLUSTER_UNDO_BUF_H */

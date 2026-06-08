@@ -75,6 +75,15 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 int cluster_undo_buffers = 4; /* small pool for evict testing */
 bool cluster_undo_buffer_writeback = false;
 
+/*
+ * spec-3.18 D7 -- flush_dirty_slot() calls pgstat_report_wait_start/_end for
+ * WAIT_EVENT_CLUSTER_UNDO_BUF_FLUSH.  The inline helpers reference
+ * my_wait_event_info (pgstat backend global); provide a file-static fake so the
+ * standalone link resolves cleanly (mirrors test_cluster_ges.c).
+ */
+static uint32 ut_wait_event_info_storage = 0;
+uint32 *my_wait_event_info = &ut_wait_event_info_storage;
+
 /* ----- single-node latch: cluster_conf_has_peers() reads ClusterConfShmem;
  * NULL => no peers => latch does not block write-back (U1-U6 are single-node). */
 ClusterConf *ClusterConfShmem = NULL;
