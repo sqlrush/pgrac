@@ -594,7 +594,8 @@ extern XLogRecPtr XactLogCommitRecord(TimestampTz commit_time,
 									  int xactflags,
 									  TransactionId twophase_xid,
 									  const char *twophase_gid,
-									  SCN commit_scn);	/* PGRAC: spec-1.18 */
+									  SCN commit_scn,	/* PGRAC: spec-1.18 */
+									  const xl_xact_tt_commit *tt_commit);	/* PGRAC: spec-3.18 D4.1 */
 
 extern XLogRecPtr XactLogAbortRecord(TimestampTz abort_time,
 									 int nsubxacts, TransactionId *subxacts,

@@ -83,6 +83,20 @@ extern void cluster_tt_slot_durable_commit(uint32 segment_id, uint16 slot_offset
 										   uint16 wrap, SCN commit_scn);
 
 /*
+ * cluster_tt_slot_durable_commit_writeonly -- spec-3.18 D4.1 (normal commit).
+ *	Same per-slot 32-byte COMMITTED stamp as cluster_tt_slot_durable_commit, but
+ *	WITHOUT the standalone XLOG_UNDO_TT_SLOT_COMMIT (0x30): the caller folds an
+ *	equivalent xl_xact_tt_commit delta into the commit record, whose flush makes
+ *	both durable atomically.  Returns the owner instance (1..128) for the
+ *	delta's path-resolution field.  ereport(ERROR) on I/O failure.  Redo side:
+ *	cluster_tt_durable_redo_stamp_slot() (cluster_undo_xlog.c), driven by
+ *	xact_redo_commit instead of the 0x30 redo.
+ */
+extern uint8 cluster_tt_slot_durable_commit_writeonly(uint32 segment_id, uint16 slot_offset,
+													  TransactionId xid, uint16 wrap,
+													  SCN commit_scn);
+
+/*
  * cluster_tt_slot_durable_abort -- spec-3.15 D5 (ROLLBACK PREPARED).
  * Stamps TT_SLOT_ABORTED preserving xid/wrap (V-2), emitting 0x31.
  * Same C10 durability contract as durable_commit.

@@ -37,6 +37,7 @@
  */
 #include "postgres.h"
 
+#include "access/xact.h" /* spec-3.18 D4.1: xl_xact_tt_commit fold delta */
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/ipc.h"
@@ -529,28 +530,38 @@ install_status(TransactionId xid, ClusterTTStatus status, SCN commit_scn)
 /* public API                                                   */
 /* ------------------------------------------------------------ */
 
-void
-cluster_tt_local_precommit_durable_finish(TransactionId xid, SCN commit_scn)
+bool
+cluster_tt_local_precommit_durable_finish(TransactionId xid, SCN commit_scn,
+										  xl_xact_tt_commit *out_fold)
 {
 	uint32 segment_id;
 	uint16 slot_offset;
 	uint32 tt_slot_id;
 	uint32 cluster_epoch;
 	uint16 wrap;
+	uint8 owner;
 
 	/*
 	 * spec-3.11 D4 / C1: durably stamp commit_scn on this xact's TT slot in the
-	 * undo segment header, emitting XLOG_UNDO_TT_SLOT_COMMIT BEFORE the commit
-	 * record (caller is the xact.c pre-commit hook; the commit record's flush
-	 * makes it durable -- no independent fsync, C10).  No binding = DDL-only /
-	 * read-only xact that never allocated a slot -> nothing durable.  Runs
-	 * before reset_binding() (post-commit in record_commit), so the binding is
-	 * still present.  C1b: this only stamps commit_scn; whether the xact
-	 * actually committed is still decided by the commit record / CLOG.
+	 * undo segment header BEFORE the commit record (caller is the xact.c
+	 * pre-commit hook; the commit record's flush makes it durable -- no
+	 * independent fsync, C10).  No binding = DDL-only / read-only xact that
+	 * never allocated a slot -> nothing durable; return false so the caller
+	 * leaves XACT_XINFO_HAS_TT_COMMIT clear (WAL byte-identical to vanilla).
+	 * Runs before reset_binding() (post-commit in record_commit), so the
+	 * binding is still present.  C1b: this only stamps commit_scn; whether the
+	 * xact actually committed is still decided by the commit record / CLOG.
+	 *
+	 * spec-3.18 D4.1: instead of emitting a standalone 0x30, write the slot via
+	 * cluster_tt_slot_durable_commit_writeonly() and hand the equivalent delta
+	 * back to RecordTransactionCommit, which folds it into the commit record.
+	 * One record now carries both the TT stamp and CLOG commit -> they become
+	 * durable atomically (no stamped-but-uncommitted window).  2PC keeps the
+	 * standalone 0x30 (cluster_tt_slot_durable_commit) -- not this path.
 	 */
 	if (!cluster_tt_local_peek_binding(xid, &segment_id, &slot_offset, &tt_slot_id, &cluster_epoch,
 									   &wrap))
-		return;
+		return false;
 
 	/*
 	 * spec-3.12 D2b: use the wrap captured at bind time, NOT a fresh
@@ -559,7 +570,24 @@ cluster_tt_local_precommit_durable_finish(TransactionId xid, SCN commit_scn)
 	 * fresh read of the (now stale) segment ERROR.  The slot is held ACTIVE for
 	 * the whole xact, so its wrap cannot have changed.
 	 */
-	cluster_tt_slot_durable_commit(segment_id, slot_offset, xid, wrap, commit_scn);
+	owner
+		= cluster_tt_slot_durable_commit_writeonly(segment_id, slot_offset, xid, wrap, commit_scn);
+
+	/*
+	 * Build the fold delta (mirrors xl_undo_tt_slot_commit fields).  xid is the
+	 * committing top-xid (== slot owner for a non-prepared xact); instance is
+	 * the slot's owner instance, needed for path resolution at redo.
+	 */
+	out_fold->segment_id = segment_id;
+	out_fold->slot_offset = slot_offset;
+	out_fold->wrap = wrap;
+	out_fold->xid = xid;
+	out_fold->instance = owner;
+	out_fold->_pad[0] = 0;
+	out_fold->_pad[1] = 0;
+	out_fold->_pad[2] = 0;
+	out_fold->commit_scn = commit_scn;
+	return true;
 }
 
 void

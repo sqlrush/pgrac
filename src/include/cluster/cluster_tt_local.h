@@ -42,6 +42,9 @@
 #include "cluster/cluster_scn.h"	   /* SCN */
 #include "cluster/cluster_tt_status.h" /* ClusterTTStatus */
 
+/* spec-3.18 D4.1: fold-delta out-param; full def in access/xact.h. */
+struct xl_xact_tt_commit;
+
 /*
  * cluster_tt_local_record_commit -- install COMMITTED status for a
  * local transaction into the in-memory TT status overlay.
@@ -60,14 +63,18 @@
 extern void cluster_tt_local_record_commit(TransactionId xid, SCN commit_scn);
 
 /*
- * cluster_tt_local_precommit_durable_finish (spec-3.11 D4) -- durably stamp
- * commit_scn on this xact's TT slot (undo segment header) + emit
- * XLOG_UNDO_TT_SLOT_COMMIT, BEFORE the commit record (xact.c pre-commit hook;
- * spec-3.11 C1).  No-op when the xact has no TT binding.  Distinct from
- * cluster_tt_local_record_commit (post-commit overlay install) -- this is the
- * durable-write half (D4 / C1; record_commit must NOT do durable I/O).
+ * cluster_tt_local_precommit_durable_finish (spec-3.11 D4 / spec-3.18 D4.1) --
+ * durably stamp commit_scn on this xact's TT slot (undo segment header) BEFORE
+ * the commit record (xact.c pre-commit hook; spec-3.11 C1).  D4.1: writes the
+ * slot WITHOUT a standalone 0x30; on success fills *out_fold with the delta to
+ * fold into the commit record and returns true.  Returns false (out_fold
+ * untouched) when the xact has no TT binding -> caller leaves
+ * XACT_XINFO_HAS_TT_COMMIT clear.  Distinct from cluster_tt_local_record_commit
+ * (post-commit overlay install) -- this is the durable-write half (record_commit
+ * must NOT do durable I/O).
  */
-extern void cluster_tt_local_precommit_durable_finish(TransactionId xid, SCN commit_scn);
+extern bool cluster_tt_local_precommit_durable_finish(TransactionId xid, SCN commit_scn,
+													  struct xl_xact_tt_commit *out_fold);
 
 /*
  * cluster_tt_local_record_abort -- install ABORTED status for a local

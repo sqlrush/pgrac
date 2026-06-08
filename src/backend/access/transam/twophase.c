@@ -2332,7 +2332,8 @@ RecordTransactionCommitPrepared(TransactionId xid, int nchildren, TransactionId 
 	recptr = XactLogCommitRecord(committs, nchildren, children, nrels, rels, nstats, stats,
 								 ninvalmsgs, invalmsgs, initfileinval,
 								 MyXactFlags | XACT_FLAGS_ACQUIREDACCESSEXCLUSIVELOCK, xid, gid,
-								 commit_scn); /* PGRAC: spec-1.18 */
+								 commit_scn,	/* PGRAC: spec-1.18 */
+								 NULL);			/* PGRAC: spec-3.18 D4.1: 2PC keeps standalone 0x30 */
 
 
 	if (replorigin)

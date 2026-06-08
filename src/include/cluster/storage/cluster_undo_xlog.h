@@ -390,6 +390,18 @@ extern XLogRecPtr cluster_undo_emit_tt_slot_commit(uint8 instance, uint32 segmen
 												   uint16 slot_offset, uint16 wrap,
 												   TransactionId xid, SCN commit_scn);
 
+/*
+ * cluster_tt_durable_redo_stamp_slot (spec-3.11 D3 / spec-3.18 D4.1)
+ *	  Recovery-side block-0 RMW stamping one TTSlot COMMITTED + commit_scn,
+ *	  shared by the standalone 0x30 redo (cluster_undo_redo_tt_slot_commit) and
+ *	  the folded xl_xact_tt_commit redo (xact_redo_commit).  PANICs on I/O error
+ *	  / missing segment (WAL ordering violation).  Idempotent (last-writer-wins
+ *	  wrap predicate); fsyncs the stamped block before returning.
+ */
+extern void cluster_tt_durable_redo_stamp_slot(uint8 instance, uint32 segment_id,
+											   uint16 slot_offset, uint16 wrap, TransactionId xid,
+											   SCN commit_scn);
+
 /* spec-3.15 D5: emit XLOG_UNDO_TT_SLOT_ABORT (prepared rollback). */
 extern XLogRecPtr cluster_undo_emit_tt_slot_abort(uint8 instance, uint32 segment_id,
 												  uint16 slot_offset, uint16 wrap,

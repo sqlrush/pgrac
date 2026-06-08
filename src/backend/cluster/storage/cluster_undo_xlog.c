@@ -509,13 +509,24 @@ cluster_undo_redo_segment_init(XLogReaderState *record)
 
 
 /*
- * Replay XLOG_UNDO_TT_SLOT_COMMIT (spec-3.11 D3).
+ * cluster_tt_durable_redo_stamp_slot -- shared block-0 RMW that stamps one
+ * TTSlot COMMITTED + commit_scn during recovery (spec-3.11 D3 / spec-3.18 D4.1).
  *
- *   Block-0 read-modify-write of one TTSlot.commit_scn, gated by the shared
- *   last-writer-wins wrap predicate (spec-3.11 v0.3 F1).  The segment + header
- *   block are created by the preceding XLOG_UNDO_SEGMENT_INIT in WAL order, so
- *   this delta record requires the segment file to exist (open without O_CREAT;
- *   missing = WAL ordering violation = PANIC).
+ *   Called from two redo sites with identical semantics:
+ *     - cluster_undo_redo_tt_slot_commit() below, replaying the standalone 0x30
+ *       (2PC COMMIT PREPARED path).
+ *     - xact_redo_commit() (xact.c), replaying the D4.1 xl_xact_tt_commit delta
+ *       folded into a normal commit record.
+ *   Sharing one primitive guarantees the fold redo can never diverge from the
+ *   0x30 redo (规则 8.A: visibility/recovery correctness must not fork).
+ *
+ *   Block-0 read-modify-write gated by the shared last-writer-wins wrap
+ *   predicate (cluster_tt_durable_redo_decide; spec-3.11 v0.3 F1).  The segment
+ *   + header block are created by the preceding XLOG_UNDO_SEGMENT_INIT in WAL
+ *   order, so the file must already exist (open without O_CREAT; missing = WAL
+ *   ordering violation = PANIC).  For the fold path the same ordering holds: the
+ *   segment's 0x10 SEGMENT_INIT precedes any undo write, which precedes this
+ *   xact's commit record.
  *
  *   Redo decision:
  *     rec.wrap >= slot.wrap -> APPLY (fresh UNUSED slot, FREE-path same-wrap
@@ -528,10 +539,10 @@ cluster_undo_redo_segment_init(XLogReaderState *record)
  *   manager -- pg_undo files are outside RelFileLocator namespace (no FPI /
  *   page-LSN skip), so the wrap table is the stale-safety mechanism.
  */
-static void
-cluster_undo_redo_tt_slot_commit(XLogReaderState *record)
+void
+cluster_tt_durable_redo_stamp_slot(uint8 instance, uint32 segment_id, uint16 slot_offset,
+								   uint16 wrap, TransactionId xid, SCN commit_scn)
 {
-	xl_undo_tt_slot_commit *rec;
 	char path[MAXPGPATH];
 	int fd;
 	PGAlignedBlock blockbuf;
@@ -539,18 +550,13 @@ cluster_undo_redo_tt_slot_commit(XLogReaderState *record)
 	TTSlot *slot;
 	ssize_t nread;
 
-	if (XLogRecGetDataLen(record) != sizeof(*rec))
-		ereport(PANIC, (errmsg("invalid XLOG_UNDO_TT_SLOT_COMMIT record length: %u",
-							   XLogRecGetDataLen(record))));
-	rec = (xl_undo_tt_slot_commit *)XLogRecGetData(record);
+	if (slot_offset >= TT_SLOTS_PER_SEGMENT)
+		ereport(PANIC, (errmsg("TT slot commit redo: slot_offset %u out of range (max %d)",
+							   slot_offset, TT_SLOTS_PER_SEGMENT - 1)));
 
-	if (rec->slot_offset >= TT_SLOTS_PER_SEGMENT)
-		ereport(PANIC, (errmsg("XLOG_UNDO_TT_SLOT_COMMIT slot_offset %u out of range (max %d)",
-							   rec->slot_offset, TT_SLOTS_PER_SEGMENT - 1)));
-
-	if (build_undo_segment_path(rec->instance, rec->segment_id, path, sizeof(path)) != 0)
-		ereport(PANIC, (errmsg("undo segment path too long: instance=%u seg=%u", rec->instance,
-							   rec->segment_id)));
+	if (build_undo_segment_path(instance, segment_id, path, sizeof(path)) != 0)
+		ereport(PANIC,
+				(errmsg("undo segment path too long: instance=%u seg=%u", instance, segment_id)));
 
 	fd = BasicOpenFile(path, O_RDWR | PG_BINARY);
 	if (fd < 0)
@@ -558,7 +564,7 @@ cluster_undo_redo_tt_slot_commit(XLogReaderState *record)
 			PANIC,
 			(errcode_for_file_access(),
 			 errmsg("could not open undo segment file \"%s\" for TT slot commit redo: %m", path),
-			 errhint("XLOG_UNDO_SEGMENT_INIT must precede XLOG_UNDO_TT_SLOT_COMMIT in WAL.")));
+			 errhint("XLOG_UNDO_SEGMENT_INIT must precede the TT slot commit in WAL.")));
 
 	nread = pg_pread(fd, blockbuf.data, BLCKSZ, 0);
 	if (nread != BLCKSZ) {
@@ -572,16 +578,15 @@ cluster_undo_redo_tt_slot_commit(XLogReaderState *record)
 	}
 
 	hdr = (UndoSegmentHeaderData *)blockbuf.data;
-	slot = &hdr->tt_slots[rec->slot_offset];
+	slot = &hdr->tt_slots[slot_offset];
 
 	/* Decide via the shared pure predicate (cluster_unit-tested; spec-3.11 §2.3). */
-	switch (
-		cluster_tt_durable_redo_decide(slot->status, slot->xid, slot->wrap, rec->xid, rec->wrap)) {
+	switch (cluster_tt_durable_redo_decide(slot->status, slot->xid, slot->wrap, xid, wrap)) {
 	case CLUSTER_TT_REDO_BADSTATUS:
 		close(fd);
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("undo segment \"%s\" TT slot %u has invalid status %u during redo",
-							   path, rec->slot_offset, slot->status)));
+							   path, slot_offset, slot->status)));
 		break;
 	case CLUSTER_TT_REDO_SKIP:
 		/* stale record; a newer commit is already durable -> no write. */
@@ -591,10 +596,10 @@ cluster_undo_redo_tt_slot_commit(XLogReaderState *record)
 		ssize_t written;
 
 		/* overwrite (recycle-then-commit) or idempotent same-owner. */
-		slot->xid = rec->xid;
-		slot->wrap = rec->wrap;
+		slot->xid = xid;
+		slot->wrap = wrap;
 		slot->status = TT_SLOT_COMMITTED;
-		slot->commit_scn = rec->commit_scn;
+		slot->commit_scn = commit_scn;
 
 		written = pg_pwrite(fd, blockbuf.data, BLCKSZ, 0);
 		if (written != BLCKSZ) {
@@ -625,6 +630,25 @@ cluster_undo_redo_tt_slot_commit(XLogReaderState *record)
 	if (close(fd) != 0)
 		ereport(PANIC, (errcode_for_file_access(),
 						errmsg("could not close undo segment file \"%s\": %m", path)));
+}
+
+/*
+ * Replay XLOG_UNDO_TT_SLOT_COMMIT (spec-3.11 D3) -- the standalone 0x30 record
+ * (now emitted only by the 2PC COMMIT PREPARED path; spec-3.18 D4.1).  Thin
+ * wrapper: validate the record, then delegate to the shared stamp primitive.
+ */
+static void
+cluster_undo_redo_tt_slot_commit(XLogReaderState *record)
+{
+	xl_undo_tt_slot_commit *rec;
+
+	if (XLogRecGetDataLen(record) != sizeof(*rec))
+		ereport(PANIC, (errmsg("invalid XLOG_UNDO_TT_SLOT_COMMIT record length: %u",
+							   XLogRecGetDataLen(record))));
+	rec = (xl_undo_tt_slot_commit *)XLogRecGetData(record);
+
+	cluster_tt_durable_redo_stamp_slot(rec->instance, rec->segment_id, rec->slot_offset, rec->wrap,
+									   rec->xid, rec->commit_scn);
 }
 
 

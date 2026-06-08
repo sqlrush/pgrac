@@ -183,6 +183,21 @@ ParseCommitRecord(uint8 info, xl_xact_commit *xlrec, xl_xact_parsed_commit *pars
 
 		data += sizeof(xl_xact_scn);
 	}
+
+	/*
+	 * PGRAC (spec-3.18 D4.1): xl_xact_tt_commit follows xl_xact_scn in the
+	 * unaligned tail.  memcpy onto the parsed struct (24B; commit_scn at +16
+	 * needs 8-byte alignment the WAL stream does not guarantee).  Emit order in
+	 * XactLogCommitRecord is origin -> scn -> tt_commit, matched here.
+	 */
+	parsed->has_tt_commit = false;
+	if (parsed->xinfo & XACT_XINFO_HAS_TT_COMMIT)
+	{
+		memcpy(&parsed->tt_commit, data, sizeof(xl_xact_tt_commit));
+		parsed->has_tt_commit = true;
+
+		data += sizeof(xl_xact_tt_commit);
+	}
 }
 
 void
@@ -434,6 +449,16 @@ xact_desc_commit(StringInfo buf, uint8 info, xl_xact_commit *xlrec, RepOriginId 
 	if (parsed.xinfo & XACT_XINFO_HAS_SCN)
 		appendStringInfo(buf, "; scn: " SCN_FORMAT,
 						 SCN_FORMAT_ARG(parsed.scn));
+
+	/*
+	 * PGRAC (spec-3.18 D4.1): show the folded durable-TT commit delta so
+	 * pg_waldump exposes the seg/slot/wrap/instance the redo will stamp.
+	 */
+	if (parsed.xinfo & XACT_XINFO_HAS_TT_COMMIT)
+		appendStringInfo(buf, "; tt_commit: seg %u slot %u wrap %u inst %u scn " SCN_FORMAT,
+						 parsed.tt_commit.segment_id, (unsigned) parsed.tt_commit.slot_offset,
+						 (unsigned) parsed.tt_commit.wrap, (unsigned) parsed.tt_commit.instance,
+						 SCN_FORMAT_ARG(parsed.tt_commit.commit_scn));
 }
 
 static void

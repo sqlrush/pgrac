@@ -110,31 +110,22 @@ cluster_tt_durable_slot_match(uint8 slot_status, TransactionId slot_xid, SCN slo
 }
 
 
-void
-cluster_tt_slot_durable_commit(uint32 segment_id, uint16 slot_offset, TransactionId xid,
-							   uint16 wrap, SCN commit_scn)
+/*
+ * tt_slot_write_committed -- the per-slot 32B targeted RMW shared by the
+ * WAL-emitting durable commit (2PC, standalone 0x30) and the spec-3.18 D4.1
+ * fold path (no 0x30; the delta rides the commit record).  Read the slot
+ * (preserve flags / first_undo_block), stamp COMMITTED + commit_scn, write 32B
+ * back.  Lock-free -- this xact is the sole owner of this slot (spec-3.11
+ * §2.2).  NOT fsync'd (C10): durability comes from the WAL flush of whichever
+ * record carries the delta; a crash before that flush leaves neither durable.
+ */
+static void
+tt_slot_write_committed(uint32 segment_id, uint8 owner, uint16 slot_offset, TransactionId xid,
+						uint16 wrap, SCN commit_scn)
 {
-	uint8 owner = tt_owner_instance_for_segment(segment_id);
 	uint32 off = tt_slot_file_offset(slot_offset);
 	TTSlot slot;
 
-	Assert(slot_offset < TT_SLOTS_PER_SEGMENT);
-	Assert(TransactionIdIsValid(xid));
-	Assert(SCN_VALID(commit_scn));
-
-	/*
-	 * spec-3.11 C1: WAL BEFORE the commit record (caller is in the pre-commit
-	 * hook).  The commit record's XLogFlush / group commit makes it durable;
-	 * the data-file write below is NOT fsync'd (C10) -- a crash before the
-	 * commit record means neither is durable; after, redo replays this WAL.
-	 */
-	(void)cluster_undo_emit_tt_slot_commit(owner, segment_id, slot_offset, wrap, xid, commit_scn);
-
-	/*
-	 * Per-slot 32B targeted RMW: read the slot (preserve flags /
-	 * first_undo_block), set the commit fields, write 32B back.  Lock-free --
-	 * this xact is the sole owner of this slot (spec-3.11 §2.2).
-	 */
 	cluster_tt_durable_io_wait_start();
 
 	if (!cluster_undo_smgr_read_header_bytes(segment_id, owner, off, (char *)&slot, sizeof(slot))) {
@@ -159,6 +150,57 @@ cluster_tt_slot_durable_commit(uint32 segment_id, uint16 slot_offset, Transactio
 
 	cluster_tt_durable_io_wait_end();
 	cluster_tt_durable_count_commit();
+}
+
+void
+cluster_tt_slot_durable_commit(uint32 segment_id, uint16 slot_offset, TransactionId xid,
+							   uint16 wrap, SCN commit_scn)
+{
+	uint8 owner = tt_owner_instance_for_segment(segment_id);
+
+	Assert(slot_offset < TT_SLOTS_PER_SEGMENT);
+	Assert(TransactionIdIsValid(xid));
+	Assert(SCN_VALID(commit_scn));
+
+	/*
+	 * spec-3.11 C1: standalone XLOG_UNDO_TT_SLOT_COMMIT (0x30) BEFORE the
+	 * commit record (caller is the 2PC COMMIT PREPARED durable hook).  The
+	 * commit record's XLogFlush / group commit makes it durable; the data-file
+	 * write below is NOT fsync'd (C10) -- a crash before the commit record
+	 * means neither is durable; after, redo replays this WAL.
+	 *
+	 * spec-3.18 D4.1: only the 2PC path still emits 0x30; normal commits fold
+	 * the equivalent delta into the commit record via
+	 * cluster_tt_slot_durable_commit_writeonly() (no 0x30).  Leaving 2PC on the
+	 * standalone record keeps PREPARE/COMMIT PREPARED untouched (user boundary).
+	 */
+	(void)cluster_undo_emit_tt_slot_commit(owner, segment_id, slot_offset, wrap, xid, commit_scn);
+
+	tt_slot_write_committed(segment_id, owner, slot_offset, xid, wrap, commit_scn);
+}
+
+uint8
+cluster_tt_slot_durable_commit_writeonly(uint32 segment_id, uint16 slot_offset, TransactionId xid,
+										 uint16 wrap, SCN commit_scn)
+{
+	uint8 owner = tt_owner_instance_for_segment(segment_id);
+
+	Assert(slot_offset < TT_SLOTS_PER_SEGMENT);
+	Assert(TransactionIdIsValid(xid));
+	Assert(SCN_VALID(commit_scn));
+
+	/*
+	 * spec-3.18 D4.1 (normal commit): write the 32B slot WITHOUT emitting a
+	 * standalone 0x30.  The caller (cluster_tt_local_precommit_durable_finish)
+	 * folds an equivalent xl_xact_tt_commit delta into the commit record, whose
+	 * flush makes both the delta and CLOG durable atomically (one record, no
+	 * intermediate stamped-but-uncommitted window).  Redo re-stamps via
+	 * cluster_tt_durable_redo_stamp_slot() from xact_redo_commit instead of the
+	 * 0x30 redo.  Returns the owner instance so the caller can fill the delta's
+	 * path-resolution field.
+	 */
+	tt_slot_write_committed(segment_id, owner, slot_offset, xid, wrap, commit_scn);
+	return owner;
 }
 
 

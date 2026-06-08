@@ -153,6 +153,7 @@
 #include "cluster/cluster_tt_2pc.h"	 /* PGRAC: spec-3.15 PREPARE record */
 #include "cluster/cluster_subtrans.h"  /* PGRAC: spec-3.5 D7 subxact lifecycle hook */
 #include "cluster/cluster_undo_record_api.h"  /* PGRAC: spec-3.7 D16 PREPARE guard */
+#include "cluster/storage/cluster_undo_xlog.h" /* PGRAC: spec-3.18 D4.1 TT fold redo stamp */
 #endif
 #endif
 
@@ -1470,6 +1471,8 @@ RecordTransactionCommit(void)
 	{
 		bool		replorigin;
 		SCN			commit_scn = InvalidScn;	/* PGRAC: spec-1.18 */
+		bool		has_tt_fold = false;		/* PGRAC: spec-3.18 D4.1 */
+		xl_xact_tt_commit tt_fold;				/* PGRAC: spec-3.18 D4.1 (valid iff has_tt_fold) */
 
 		/*
 		 * Are we using the replication origins feature?  Or, in other words,
@@ -1558,7 +1561,8 @@ RecordTransactionCommit(void)
 			 * cluster_tt_local_record_commit() overlay install (C1b: this only
 			 * stamps commit_scn; committed-ness stays CLOG's authority).
 			 */
-			cluster_tt_local_precommit_durable_finish(xid, tt_commit_scn);
+			has_tt_fold =
+				cluster_tt_local_precommit_durable_finish(xid, tt_commit_scn, &tt_fold);
 		}
 #endif
 
@@ -1575,7 +1579,8 @@ RecordTransactionCommit(void)
 							RelcacheInitFileInval,
 							MyXactFlags,
 							InvalidTransactionId, NULL /* plain commit */ ,
-							commit_scn);	/* PGRAC: spec-1.18 */
+							commit_scn,		/* PGRAC: spec-1.18 */
+							has_tt_fold ? &tt_fold : NULL); /* PGRAC: spec-3.18 D4.1 */
 
 		if (replorigin)
 			/* Move LSNs forward for this replication origin */
@@ -6056,7 +6061,8 @@ XactLogCommitRecord(TimestampTz commit_time,
 					bool relcacheInval,
 					int xactflags, TransactionId twophase_xid,
 					const char *twophase_gid,
-					SCN commit_scn)		/* PGRAC: spec-1.18 */
+					SCN commit_scn,		/* PGRAC: spec-1.18 */
+					const xl_xact_tt_commit *tt_commit)	/* PGRAC: spec-3.18 D4.1 */
 {
 	xl_xact_commit xlrec;
 	xl_xact_xinfo xl_xinfo;
@@ -6068,6 +6074,7 @@ XactLogCommitRecord(TimestampTz commit_time,
 	xl_xact_twophase xl_twophase;
 	xl_xact_origin xl_origin;
 	xl_xact_scn xl_scn;			/* PGRAC: spec-1.18 */
+	xl_xact_tt_commit xl_tt;	/* PGRAC: spec-3.18 D4.1 */
 	uint8		info;
 
 	Assert(CritSectionCount > 0);
@@ -6169,6 +6176,22 @@ XactLogCommitRecord(TimestampTz commit_time,
 		xl_scn.scn = commit_scn;
 	}
 
+	/*
+	 * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+	 * What changed: spec-3.18 D4.1 -- fold the durable TT commit delta
+	 * (xl_xact_tt_commit) into the commit record when the caller stamped a TT
+	 * slot for this xact (normal commit only; tt_commit == NULL otherwise).
+	 * Replaces the standalone XLOG_UNDO_TT_SLOT_COMMIT (0x30) per normal
+	 * commit so the TT stamp and CLOG commit become durable atomically.
+	 * Why: removes one WAL record + one XLogFlush dependency per write txn
+	 * (D4.1 latency lever); 2PC keeps the standalone 0x30 (passes NULL here).
+	 */
+	if (tt_commit != NULL)
+	{
+		xl_xinfo.xinfo |= XACT_XINFO_HAS_TT_COMMIT;
+		xl_tt = *tt_commit;
+	}
+
 	if (xl_xinfo.xinfo != 0)
 		info |= XLOG_XACT_HAS_INFO;
 
@@ -6232,6 +6255,14 @@ XactLogCommitRecord(TimestampTz commit_time,
 	 */
 	if (xl_xinfo.xinfo & XACT_XINFO_HAS_SCN)
 		XLogRegisterData((char *) (&xl_scn), sizeof(xl_xact_scn));
+
+	/*
+	 * PGRAC (spec-3.18 D4.1): xl_xact_tt_commit is registered after xl_xact_scn
+	 * -- the new last section in the unaligned tail.  Emit order here must match
+	 * the read order in ParseCommitRecord (origin -> scn -> tt_commit).
+	 */
+	if (xl_xinfo.xinfo & XACT_XINFO_HAS_TT_COMMIT)
+		XLogRegisterData((char *) (&xl_tt), sizeof(xl_xact_tt_commit));
 
 	/* we allow filtering by xacts */
 	XLogSetRecordFlags(XLOG_INCLUDE_ORIGIN);
@@ -6456,6 +6487,27 @@ xact_redo_commit(xl_xact_parsed_commit *parsed,
 	 * shmem != NULL and does not check cluster_enabled (cluster_scn.c:339).
 	 */
 	cluster_scn_recovery_replay_observe(parsed->scn);
+
+	/*
+	 * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+	 * What changed: spec-3.18 D4.1 -- when the commit record folded a TT
+	 * commit delta (XACT_XINFO_HAS_TT_COMMIT), re-stamp the durable TT slot
+	 * during recovery via the shared block-0 RMW primitive (identical to the
+	 * standalone 0x30 redo; cluster_tt_durable_redo_stamp_slot).
+	 * Why: replaces the 0x30 redo for normal commits -- the stamp now replays
+	 * atomically with the CLOG commit this very record applies (one record, no
+	 * intermediate stamped-but-uncommitted window).  The owning segment's 0x10
+	 * SEGMENT_INIT precedes any undo write, which precedes this commit record,
+	 * so the segment file is guaranteed present (PANIC if missing = WAL
+	 * ordering violation, same contract as the 0x30 redo).
+	 */
+	if (parsed->has_tt_commit)
+		cluster_tt_durable_redo_stamp_slot(parsed->tt_commit.instance,
+										   parsed->tt_commit.segment_id,
+										   parsed->tt_commit.slot_offset,
+										   parsed->tt_commit.wrap,
+										   parsed->tt_commit.xid,
+										   parsed->tt_commit.commit_scn);
 #endif
 
 	max_xid = TransactionIdLatest(xid, parsed->nsubxacts, parsed->subxacts);
