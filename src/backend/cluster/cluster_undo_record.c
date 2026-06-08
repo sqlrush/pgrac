@@ -111,6 +111,16 @@ typedef struct ClusterUndoRecordShared {
 	uint16 slot_count;
 	uint16 block_dirty;
 	SCN block_first_scn;
+
+	/*
+	 * spec-3.18 D3 extent high-water:  next free data block in active_segment_id
+	 * available to claim as an extent (everything in [1, next_extent_block) is
+	 * already claimed).  Advanced under lifecycle_lock at extent-claim time;
+	 * shmem-only, rebuilt on restart from the segment's bitmap (B1).  The old
+	 * current_block / free_offset / slot_count cursor stays for the
+	 * undo_extent_blocks=1 / pre-D3 fallback path + observability.
+	 */
+	uint32 next_extent_block;
 	uint32 _pad_align;
 
 	pg_atomic_uint64 record_alloc_count;
@@ -133,6 +143,10 @@ typedef struct ClusterUndoRecordShared {
 	 * reader's retained COMMITTED slots filled the active segment, so the
 	 * allocator rebound to a fresh one instead of erroring "48 slots full"). */
 	pg_atomic_uint64 tt_retention_rollover_count;
+
+	/* spec-3.18 D3: extent claims (one per ~undo_extent_blocks records per
+	 * backend instead of one cursor_lock acquire per record). */
+	pg_atomic_uint64 extent_claim_count;
 
 	/* spec-3.12 D5: undo segments skipped for recycle because their retention
 	 * watermark was >= the horizon.  In this lazy MVP the active segment is the
@@ -329,6 +343,7 @@ cluster_undo_record_shmem_init(void)
 		UndoRecordShared->slot_count = 0;
 		UndoRecordShared->block_dirty = 0;
 		UndoRecordShared->block_first_scn = InvalidScn;
+		UndoRecordShared->next_extent_block = 0; /* spec-3.18 D3: 0 => rebuild on first claim */
 
 		pg_atomic_init_u64(&UndoRecordShared->record_alloc_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->segment_claim_count, 0);
@@ -344,6 +359,7 @@ cluster_undo_record_shmem_init(void)
 		pg_atomic_init_u64(&UndoRecordShared->segment_reuse_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->tt_retention_rollover_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->segment_retain_skip_count, 0);
+		pg_atomic_init_u64(&UndoRecordShared->extent_claim_count, 0); /* spec-3.18 D3 */
 
 		/* P0 perf hardening: per-commit undo fsync counters. */
 		pg_atomic_init_u64(&UndoRecordShared->commit_fsync_count, 0);
