@@ -65,75 +65,80 @@ $node->start;
 
 $node->safe_psql('postgres', 'CREATE TABLE t318 (id int primary key, v text)');
 $node->safe_psql('postgres',
-	q{INSERT INTO t318 SELECT g, 'base' || g FROM generate_series(1, 40) g});
+	q{INSERT INTO t318 SELECT g, 'base' || g FROM generate_series(1, 6) g});
 
-# Pre-checkpoint undo: UPDATEs write old-tuple undo records into the active
-# undo data block (block 1 of the active segment).  These are the "old bytes".
-$node->safe_psql('postgres', q{UPDATE t318 SET v = v || '_a' WHERE id <= 10});
-
+# spec-3.18 D3:  a backend claims a per-transaction undo extent and writes its
+# records into that extent's blocks;  the extent is dropped at xact end.  So to
+# get pre- AND post-checkpoint records into the SAME block, the writes that
+# straddle the checkpoint must be in ONE transaction (a persistent session),
+# with few enough records to stay within the extent's first block.  A separate
+# session issues the CHECKPOINT in between.
+my $bg = $node->background_psql('postgres');
+$bg->query_safe('BEGIN');
+$bg->query_safe(q{UPDATE t318 SET v = v || '_a'});   # pre-checkpoint "old bytes"
 $node->safe_psql('postgres', 'CHECKPOINT');
+$bg->query_safe(q{UPDATE t318 SET v = v || '_b'});   # post-checkpoint -> full-image FPI
+$bg->query_safe('COMMIT');
+$bg->quit;
 
-# Post-checkpoint undo to the SAME block: each append re-emits a full-image
-# XLOG_UNDO_BLOCK_WRITE covering the whole block (old + new records).
-$node->safe_psql('postgres', q{UPDATE t318 SET v = v || '_b' WHERE id BETWEEN 11 AND 20});
-
-# Locate the active undo data block (block 1 whose header carries the magic)
-# and capture its exact bytes -- this is what redo must reconstruct.
+# Locate the active undo data block: the HIGHEST data block carrying the magic
+# (the most recently claimed extent's block -- where the straddling txn wrote).
 my $undo_dir = $node->data_dir . '/pg_undo/instance_0';
 my @segs     = glob("$undo_dir/seg_*.dat");
 ok(scalar(@segs) >= 1, "found undo segment file(s) under $undo_dir");
 
-my ($active_path, $expected);
+my ($active_path, $active_block, $expected);
 for my $path (@segs)
 {
-	my $blk = read_block($path, DATA_BLOCK_NO);
-	next unless defined $blk;
-	my $magic = unpack('L<', substr($blk, 0, 4));
-	if ($magic == UNDO_BLOCK_MAGIC)
+	for (my $b = 1; $b < 64; $b++)
 	{
-		$active_path = $path;
-		$expected    = $blk;
-		last;
+		my $blk = read_block($path, $b);
+		next unless defined $blk;
+		next unless unpack('L<', substr($blk, 0, 4)) == UNDO_BLOCK_MAGIC;
+		$active_path  = $path;
+		$active_block = $b;
+		$expected     = $blk;   # keep scanning -> last match wins (highest block)
 	}
 }
-ok(defined $active_path, 'active undo data block 1 located (magic present)');
+ok(defined $active_path, "active undo data block located (seg, block $active_block)");
 
-# Crash BEFORE corrupting: stop('immediate') leaves block 1 on disk in its
+# Crash BEFORE corrupting: stop('immediate') leaves the block on disk in its
 # last write-through state (== $expected); no shutdown checkpoint advances the
 # redo point past the post-checkpoint XLOG_UNDO_BLOCK_WRITE records.
 $node->stop('immediate');
 
 # Torn-write simulation: smash the pre-checkpoint region (header + first
-# records) of block 1 with garbage.  A delta-log would not carry these bytes;
-# only the always-FPI image can restore them.
-corrupt_block_prefix($active_path, DATA_BLOCK_NO, 512, "\xEE");
+# records) of the active block with garbage.  A delta-log would not carry these
+# bytes;  only the always-FPI image can restore them.
+corrupt_block_prefix($active_path, $active_block, 512, "\xEE");
 
-my $corrupted = read_block($active_path, DATA_BLOCK_NO);
+my $corrupted = read_block($active_path, $active_block);
 isnt(unpack('L<', substr($corrupted, 0, 4)),
-	UNDO_BLOCK_MAGIC, 'block 1 magic clobbered by injected corruption (pre-restart)');
+	UNDO_BLOCK_MAGIC, 'block magic clobbered by injected corruption (pre-restart)');
 
 # Restart -> crash recovery -> redo replays the post-checkpoint full-image
-# XLOG_UNDO_BLOCK_WRITE for block 1, overwriting the corruption.
+# XLOG_UNDO_BLOCK_WRITE for the block, overwriting the corruption.
 $node->start;
 
-my $repaired = read_block($active_path, DATA_BLOCK_NO);
+my $repaired = read_block($active_path, $active_block);
 is(unpack('L<', substr($repaired, 0, 4)),
-	UNDO_BLOCK_MAGIC, 'L1 block 1 magic restored by crash redo (always-FPI)');
+	UNDO_BLOCK_MAGIC, 'L1 block magic restored by crash redo (always-FPI)');
 ok($repaired eq $expected,
-	'L1 block 1 byte-restored to its pre-crash image (FPI carried the old bytes)');
+	'L1 block byte-restored to its pre-crash image (FPI carried the old bytes)');
 
 my $log = slurp_file($node->logfile);
 unlike($log, qr/PANIC/, 'L1 no PANIC during crash recovery of corrupted undo block');
 
 # ============================================================
-# L2: the repaired undo is functionally usable.
+# L2: the repaired undo is functionally usable.  The straddling txn committed
+# both UPDATEs, so every row resolves to base<N>_a_b after redo.
 # ============================================================
 is($node->safe_psql('postgres', q{SELECT v FROM t318 WHERE id = 5}),
-	'base5_a', 'L2 pre-checkpoint UPDATEd row resolves after redo repair');
-is($node->safe_psql('postgres', q{SELECT v FROM t318 WHERE id = 15}),
-	'base15_b', 'L2 post-checkpoint UPDATEd row resolves after redo repair');
+	'base5_a_b', 'L2 committed (pre+post checkpoint) UPDATEs resolve after redo repair');
+is($node->safe_psql('postgres', q{SELECT count(*) FROM t318 WHERE v LIKE 'base%\_a\_b'}),
+	'6', 'L2 all rows resolve to the committed value after corrupt-and-redo');
 is($node->safe_psql('postgres', q{SELECT count(*) FROM t318}),
-	'40', 'L2 all rows intact after corrupt-and-redo');
+	'6', 'L2 all rows intact after corrupt-and-redo');
 
 $node->stop;
 done_testing();

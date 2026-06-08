@@ -145,31 +145,39 @@ unlike(slurp_file($node->logfile), qr/PANIC/, 'L4 no PANIC during write-back cra
 
 # ============================================================
 # L5: corrupt-old-bytes under write-back (FPI-on-first-touch repairs).
+# spec-3.18 D3: the pre- + post-checkpoint writes must share one extent (one
+# transaction; the extent drops at xact end), and the active block is found
+# dynamically (the highest data block carrying the magic).
 # ============================================================
-$node->safe_psql('postgres', q{UPDATE t318b SET v = v||'_a' WHERE id <= 6}); # pre-checkpoint
-$node->safe_psql('postgres', 'CHECKPOINT');                                  # flush block to disk
-$node->safe_psql('postgres', q{UPDATE t318b SET v = v||'_b' WHERE id <= 6}); # post-checkpoint FPI + delta
+my $bg5 = $node->background_psql('postgres');
+$bg5->query_safe('BEGIN');
+$bg5->query_safe(q{UPDATE t318b SET v = v||'_a' WHERE id <= 6}); # pre-checkpoint old bytes
+$node->safe_psql('postgres', 'CHECKPOINT');                      # flush block to disk
+$bg5->query_safe(q{UPDATE t318b SET v = v||'_b' WHERE id <= 6}); # post-checkpoint FPI-on-first-touch
+$bg5->query_safe('COMMIT');
+$bg5->quit;
 
 my $undo_dir = $node->data_dir . '/pg_undo/instance_0';
-my ($active_path, $expected);
+my ($active_path, $active_block, $expected);
 for my $path (glob("$undo_dir/seg_*.dat"))
 {
-	my $blk = read_block($path, DATA_BLOCK_NO);
-	next unless defined $blk;
-	if (unpack('L<', substr($blk, 0, 4)) == UNDO_BLOCK_MAGIC)
+	for (my $b = 1; $b < 64; $b++)
 	{
-		$active_path = $path;
-		$expected    = $blk;
-		last;
+		my $blk = read_block($path, $b);
+		next unless defined $blk;
+		next unless unpack('L<', substr($blk, 0, 4)) == UNDO_BLOCK_MAGIC;
+		$active_path  = $path;
+		$active_block = $b;
+		$expected     = $blk;   # last (highest) magic block = the straddling extent
 	}
 }
-ok(defined $active_path, 'L5 active undo data block located');
+ok(defined $active_path, "L5 active undo data block located (block $active_block)");
 
 $node->stop('immediate');
-corrupt_block_prefix($active_path, DATA_BLOCK_NO, 512, "\xEE");
+corrupt_block_prefix($active_path, $active_block, 512, "\xEE");
 $node->start;
 
-my $repaired = read_block($active_path, DATA_BLOCK_NO);
+my $repaired = read_block($active_path, $active_block);
 is(unpack('L<', substr($repaired, 0, 4)),
 	UNDO_BLOCK_MAGIC, 'L5 block magic restored by post-checkpoint FPI redo');
 # NB: no exact byte-compare here (unlike t/228's write-through path).  Under
