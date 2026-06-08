@@ -456,25 +456,19 @@ cluster_undo_buf_flush_all(bool is_checkpoint)
 	if (UndoBufPool == NULL)
 		return;
 
-	if (!cluster_undo_buf_writeback_allowed()) {
-		/*
-		 * D1 write-through:  nothing is buffered-dirty, so flush is a no-op.
-		 * Assert the invariant in debug builds (the real guard is that
-		 * mark_dirty never leaves dirty=true while write-back is gated off).
-		 */
-#ifdef USE_ASSERT_CHECKING
-		for (int i = 0; i < UndoBufPool->nslots; i++)
-			Assert(!UndoBufSlots[i].dirty);
-#endif
-		return;
-	}
-
 	/*
-	 * D2b write-back: flush every buffered-dirty block.  Called from
-	 * CheckPointGuts (is_checkpoint=true) in checkpoint phase 2, AFTER the
-	 * DELAY_CHKPT_START barrier — so any in-flight undo write whose WAL is at
-	 * or before this checkpoint's redo point is flushed here, which is what
-	 * makes the DELAY_CHKPT_START guarantee real (spec-3.18 §2.6 v0.8).
+	 * Flush every buffered-dirty block.  Called from CheckPointGuts
+	 * (is_checkpoint=true) in checkpoint phase 2, AFTER the DELAY_CHKPT_START
+	 * barrier — so any in-flight undo write whose WAL is at or before this
+	 * checkpoint's redo point is flushed here, which is what makes the
+	 * DELAY_CHKPT_START guarantee real (spec-3.18 §2.6 v0.8).
+	 *
+	 * Always scan for dirty slots regardless of the current write-back gate:
+	 * with write-back off no slot is ever left dirty (mark_dirty write-throughs
+	 * with dirty=false), so the scan is a cheap no-op;  but if the GUC was
+	 * toggled on->off via SIGHUP while dirty slots existed, those slots still
+	 * need flushing for durability -- the gate decides whether NEW writes
+	 * buffer, not whether already-dirty blocks get persisted.
 	 *
 	 * Per slot: pin it (un-evictable across the I/O), then flush_dirty_slot
 	 * copies the image + LSN, clears dirty, XLogFlush(lsn) (WAL-before-data),

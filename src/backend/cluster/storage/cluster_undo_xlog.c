@@ -325,10 +325,31 @@ cluster_undo_emit_block_write(uint8 instance, uint32 segment_id, uint32 block_no
 	 */
 	if (cluster_undo_buf_writeback_allowed()) {
 		XLogRecPtr redo;
+		XLogRecPtr stale_redo;
 		bool do_page_writes;
 
 		Assert((MyProc->delayChkptFlags & DELAY_CHKPT_START) != 0);
-		GetFullPageWriteInfo(&redo, &do_page_writes);
+
+		/*
+		 * The FPI-vs-delta decision MUST use the authoritative redo pointer,
+		 * not the backend-local cache.  GetFullPageWriteInfo() returns the
+		 * stale cached RedoRecPtr (xlog.c), which is only refreshed when this
+		 * backend itself inserts WAL / calls GetRedoRecPtr().  A checkpoint
+		 * advances XLogCtl->RedoRecPtr (under info_lck) BEFORE it waits on
+		 * DELAY_CHKPT_START, so the cache can lag the real redo point:  using
+		 * it could pick a delta for a block whose first post-checkpoint touch
+		 * needs an FPI, and a torn write would then be unrecoverable from the
+		 * post-checkpoint redo stream.  GetRedoRecPtr() reads
+		 * XLogCtl->RedoRecPtr under info_lck;  with DELAY_CHKPT_START held the
+		 * checkpoint that advanced redo is blocked on us, so the value is
+		 * current AND stable until we release.  This mirrors PG's own
+		 * XLogSaveBufferForHint, which also uses GetRedoRecPtr() under
+		 * DELAY_CHKPT_START.  GetFullPageWriteInfo is used only for
+		 * do_page_writes (full_page_writes / forced-FPW state).
+		 */
+		GetFullPageWriteInfo(&stale_redo, &do_page_writes);
+		(void)stale_redo; /* discarded; GetRedoRecPtr() is the authoritative redo */
+		redo = GetRedoRecPtr();
 		use_delta = do_page_writes && !XLogRecPtrIsInvalid(old_block_lsn) && old_block_lsn > redo;
 	}
 

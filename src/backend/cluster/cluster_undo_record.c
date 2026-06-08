@@ -448,11 +448,25 @@ write_undo_block(uint32 segment_id, uint8 owner_instance, uint32 block_no, const
 							   &pin);
 	if (img == NULL)
 		return cluster_undo_smgr_write_block(segment_id, owner_instance, block_no, buf, false);
-	memcpy(img, buf, BLCKSZ);
-	/* wal_lsn = the XLOG_UNDO_BLOCK_WRITE LSN (spec-3.18 D2): write-through
-	 * (gate off) writes now; write-back (gate on) defers behind this LSN. */
-	cluster_undo_buf_mark_dirty(&pin, wal_lsn);
-	cluster_undo_buf_unpin(&pin);
+
+	/*
+	 * PG_FINALLY guarantees the EXCLUSIVE pin + content lock are released even
+	 * if mark_dirty raises (it can ereport on a write-through pwrite failure,
+	 * or the write-back monotone-LSN guard).  Without it an ERROR would leave
+	 * the slot pinned + content-locked, deadlocking later readers/writers.
+	 */
+	PG_TRY();
+	{
+		memcpy(img, buf, BLCKSZ);
+		/* wal_lsn = the XLOG_UNDO_BLOCK_WRITE LSN (spec-3.18 D2): write-through
+		 * (gate off) writes now; write-back (gate on) defers behind this LSN. */
+		cluster_undo_buf_mark_dirty(&pin, wal_lsn);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_buf_unpin(&pin);
+	}
+	PG_END_TRY();
 	return true;
 }
 

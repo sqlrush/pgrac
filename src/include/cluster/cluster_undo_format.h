@@ -13,9 +13,9 @@
  *
  *	    offset  size  description
  *	    ------  ----  -------------------------------------------
- *	    0       40    UndoBlockHeader (HC211 v1.0.1: 40B per
- *	                  arithmetic fix from spec body 32B claim)
- *	    40      ...   record 1 var bytes (UndoRecordHeader 64B +
+ *	    0       48    UndoBlockHeader (HC211 v1.0.1: 40B record+SCN
+ *	                  portion + spec-3.18 D2 block_lsn(8) = 48B)
+ *	    48      ...   record 1 var bytes (UndoRecordHeader 64B +
  *	                  payload variable)
  *	    ...     ...   record 2, 3, ...
  *	    ...     ...   FREE SPACE
@@ -25,10 +25,10 @@
  *	            8     slot_1 (first record's UndoSlotDirEntry)
  *	    8192          end of block
  *
- *	  Records grow upward from offset 40;  slot directory grows
- *	  downward from offset 8192.  free_offset (in UndoBlockHeader) is
- *	  the lower-bound of available space.  Block full when
- *	  (free_offset + 8 × (slot_count + 1)) > 8192.
+ *	  Records grow upward from offset 48 (= sizeof(UndoBlockHeader));
+ *	  slot directory grows downward from offset 8192.  free_offset (in
+ *	  UndoBlockHeader) is the lower-bound of available space.  Block full
+ *	  when (free_offset + 8 × (slot_count + 1)) > 8192.
  *
  *	  Slot directory invariant:  slot index 0 is the most-recently
  *	  written record (at offset 8184);  slot index slot_count-1 is
@@ -37,7 +37,8 @@
  *	  resolves slot → record_offset → record bytes.
  *
  *	  HC211 / HC212 ABI lock(static asserts in this header):
- *	    HC211 sizeof(UndoBlockHeader) == 40 (v1.0.1 arithmetic fix)
+ *	    HC211 sizeof(UndoBlockHeader) == 48 (40B HC211 v1.0.1 +
+ *	          spec-3.18 D2 block_lsn 8B)
  *	    HC212 sizeof(UndoSlotDirEntry) == 8
  *
  *	  Frontend-safe: this header has no backend-only includes.

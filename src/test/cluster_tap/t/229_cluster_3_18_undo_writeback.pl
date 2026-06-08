@@ -183,6 +183,25 @@ is($node->safe_psql('postgres', q{SELECT left(v,2) FROM t318b WHERE id = 1}),
 	'd8', 'L5 row resolves after corrupt-and-redo');
 unlike(slurp_file($node->logfile), qr/PANIC/, 'L5 no PANIC');
 
+# ============================================================
+# L6: the recovered undo CHAIN is usable for CR, not just the live tuple.
+#     Pin a repeatable-read snapshot, then UPDATE id=1;  the snapshot must
+#     still read the pre-UPDATE value by constructing CR from the undo that
+#     the post-checkpoint FPI repaired after the crash.  (left(v,2) on the
+#     live row only proves the block wasn't trashed;  this proves the undo
+#     bytes a delta could NOT have restored are actually readable.)
+# ============================================================
+my $bg6 = $node->background_psql('postgres');
+$bg6->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+$bg6->query_safe('SELECT count(*) FROM t318b'); # pin snapshot at the recovered state
+my $pre = $node->safe_psql('postgres', q{SELECT left(v, 2) FROM t318b WHERE id = 1});
+$node->safe_psql('postgres', q{UPDATE t318b SET v = 'cr' WHERE id = 1});
+is($bg6->query_safe(q{SELECT left(v, 2) FROM t318b WHERE id = 1}),
+	$pre, 'L6 RR snapshot reads pre-UPDATE version via CR over recovered undo');
+$bg6->query_safe('COMMIT');
+$bg6->quit;
+unlike(slurp_file($node->logfile), qr/PANIC|inverse-apply failed/, 'L6 no CR failure');
+
 $node->stop;
 done_testing();
 
