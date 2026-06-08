@@ -101,7 +101,7 @@
 #include "cluster/storage/cluster_smgr.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/storage/cluster_undo_buf.h" /* spec-3.18 D1 region */
-#include "cluster/cluster_startup_phase.h" /* cluster_phase_shmem_register (1.10.1) */
+#include "cluster/cluster_startup_phase.h"	  /* cluster_phase_shmem_register (1.10.1) */
 #include "cluster/cluster_version_macros.h"
 
 
