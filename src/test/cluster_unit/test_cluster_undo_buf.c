@@ -134,6 +134,17 @@ mul_size(Size s1, Size s2)
 	return s1 * s2;
 }
 
+/* ----- PG_TRY/PG_FINALLY machinery (D2b hardening wraps flush_dirty_slot in
+ * PG_TRY in the evict + flush_all paths; the U1-U6 tests never throw, so these
+ * only resolve the standalone link). ----- */
+sigjmp_buf *PG_exception_stack = NULL;
+struct ErrorContextCallback *error_context_stack = NULL;
+void
+pg_re_throw(void)
+{
+	abort();
+}
+
 /* ----- elog/ereport stubs (the U1-U6 paths never raise; symbols only) ----- */
 bool
 errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
