@@ -586,7 +586,11 @@
 /* spec-3.18 D2 (2026-06-07): UndoBlockHeader += block_lsn @40 (40B->48B page-LSN
  * for FPI-on-first-touch undo WAL) + XLOG_UNDO_BLOCK_WRITE 0x70.  On-disk undo
  * block layout change -> bump forces re-initdb (Stage 3 dev only). */
-#define CATALOG_VERSION_NO 202606071
+/* spec-3.18 D4.1 (2026-06-08): XACT_XINFO_HAS_TT_COMMIT (xinfo bit 10) +
+ * xl_xact_tt_commit section folded into the normal commit record (TT-slot
+ * commit no longer a standalone XLOG_UNDO_TT_SLOT_COMMIT 0x30).  Commit-record
+ * WAL format change -> bump forces re-initdb (A1: no mixed-version replay). */
+#define CATALOG_VERSION_NO 202606081
 
 /* spec-2.39 D10 (2026-05-21):  SI Broadcaster production activation —
  * DDL commit hook (AtEOXact_Inval + COMMIT PREPARED via cluster-aware

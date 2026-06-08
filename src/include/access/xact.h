@@ -236,6 +236,9 @@ typedef struct SavedTransactionCharacteristics
 #define XACT_XINFO_HAS_DROPPED_STATS	(1U << 8)
 /* PGRAC (spec-1.18): bit 9 -- cluster SCN section (xl_xact_scn, 8 bytes). */
 #define XACT_XINFO_HAS_SCN				(1U << 9)
+/* PGRAC (spec-3.18 D4.1): bit 10 -- durable TT-slot commit section
+ * (xl_xact_tt_commit), folded in from the standalone 0x30 WAL record. */
+#define XACT_XINFO_HAS_TT_COMMIT		(1U << 10)
 
 /*
  * Also stored in xinfo, these indicating a variety of additional actions that
@@ -364,6 +367,27 @@ typedef struct xl_xact_scn
 	SCN			scn;			/* commit/abort SCN captured at WAL emit */
 } xl_xact_scn;
 
+/*
+ * PGRAC (spec-3.18 D4.1): durable-TT-slot commit sub-record, folded into the
+ * normal commit record instead of a standalone XLOG_UNDO_TT_SLOT_COMMIT (0x30)
+ * -- saves one WAL record + XLogInsert per commit.  Present iff
+ * XACT_XINFO_HAS_TT_COMMIT.  Stored unaligned (like xl_xact_scn) -- readers
+ * MUST memcpy.  Mirrors xl_undo_tt_slot_commit so xact_redo_commit can reuse
+ * the existing redo decision (cluster_tt_durable_redo_decide).  The 2PC path
+ * (PREPARE / COMMIT PREPARED) keeps the standalone 0x30 -- a prepared xact's
+ * TT durability is not in a normal commit record.
+ */
+typedef struct xl_xact_tt_commit
+{
+	uint32		segment_id;
+	uint16		slot_offset;
+	uint16		wrap;
+	TransactionId xid;			/* slot owner xid (may differ from the commit's xid? no -- same) */
+	uint8		instance;		/* owner instance (1..128) for path resolution */
+	uint8		_pad[3];
+	SCN			commit_scn;
+} xl_xact_tt_commit;
+
 typedef struct xl_xact_commit
 {
 	TimestampTz xact_time;		/* time of commit */
@@ -454,6 +478,8 @@ typedef struct xl_xact_parsed_commit
 	TimestampTz origin_timestamp;
 
 	SCN			scn;			/* PGRAC (spec-1.18): InvalidScn if !HAS_SCN */
+	bool		has_tt_commit;	/* PGRAC (spec-3.18 D4.1): XACT_XINFO_HAS_TT_COMMIT set */
+	xl_xact_tt_commit tt_commit;	/* PGRAC (spec-3.18 D4.1): valid iff has_tt_commit */
 } xl_xact_parsed_commit;
 
 typedef xl_xact_parsed_commit xl_xact_parsed_prepare;
