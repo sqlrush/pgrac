@@ -941,17 +941,19 @@ cluster_visibility_decide_tuple(HeapTuple htup, Snapshot snapshot, Buffer buffer
  * committed own-instance deleter (cr_xmax) recorded on a CR image, for the
  * spec-3.21 xmax-side visibility decision.  Returns true + *out_scn on success.
  *
+ *	Used only for the committed-at/before-read_scn branch: the committed-AFTER-
+ *	read_scn case is decided VISIBLE in the caller via the live slot (tier-2 has
+ *	already proved the live deleter's write_scn > read_scn, hence commit_scn >
+ *	read_scn -- the sound direction of write_scn, NOT the P1-a inverse).  So this
+ *	resolver is reached only when the LIVE slot was recycled to a newer writer.
+ *
  *	Exact-key source order (spec-3.21 D2; never a CLOG/write_scn proxy -- P1-a):
- *	  1. the CR SCRATCH page ITL slot at itl_idx, IFF slot.xid == cr_xmax (the
- *	     scratch ITL is rolled back to read_scn state in cluster_cr_apply.c) and
- *	     its commit_scn is stamped -- the read_scn-era commit stamp;
- *	  2. the BOC / spec-3.6 overlay by the exact key (the scratch slot's ITL ref
- *	     + local_xid == cr_xmax) -- a delayed-cleanout writer whose slot stamp is
- *	     still InvalidScn;
+ *	  1. the CR SCRATCH page ITL slot at itl_idx, IFF slot.xid == cr_xmax;
+ *	  2. the BOC / spec-3.6 overlay by exact key (scratch ITL ref + local_xid);
  *	  3. the durable TT by exact xid -- survives an ITL slot recycle.
- *	A slot/xid mismatch (recycle) or InvalidScn at every source -> false, and the
- *	caller fails closed (53R9F); rule 8.A: an unresolved deleter is NEVER treated
- *	as a committed-before-read_scn delete (which would false-hide a live row).
+ *	A slot/xid mismatch or InvalidScn at every source -> false, and the caller
+ *	fails closed (53R9F); rule 8.A: an unresolved deleter is NEVER treated as a
+ *	committed-before-read_scn delete (which would false-hide a live row).
  */
 static bool
 cluster_cr_resolve_xmax_commit_scn(const char *cr_page, uint8 itl_idx, TransactionId cr_xmax,
@@ -1275,17 +1277,36 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 		else if (!TransactionIdDidCommit(cr_xmax))
 			xmax_status = CLUSTER_TT_STATUS_ABORTED;
 		else {
-			/* Committed deleter: invisible IFF the delete is visible at read_scn,
-			 * proven by the EXACT commit_scn (P1-a: no CLOG/write_scn proxy). */
+			/* Committed deleter: invisible IFF the delete is visible at read_scn. */
 			SCN xmax_cscn;
 
+			/*
+			 * Live-slot shortcut: if the LIVE tuple's ITL slot still holds cr_xmax
+			 * (the deleter), tier-2 above already proved slot->write_scn > read_scn,
+			 * so commit_scn >= write_scn > read_scn -- the delete committed AFTER
+			 * the snapshot -> the row was live at read_scn -> VISIBLE.  (Sound
+			 * direction of write_scn; P1-a forbids only the inverse.)  This is the
+			 * common RR-snapshot + concurrent-commit case (t/229 L6) whose deleter
+			 * slot has not been recycled; its commit_scn need not be stamped yet.
+			 */
+			if (slot->xid == cr_xmax) {
+				*out_visible = true;
+				return true;
+			}
+
+			/*
+			 * The live slot was recycled to a newer writer (slot->xid != cr_xmax):
+			 * resolve cr_xmax's EXACT commit_scn by exact xid (P1-a: no proxy) and
+			 * compare to read_scn, or fail closed (53R9F).
+			 */
 			if (!cluster_cr_resolve_xmax_commit_scn(cr_page, cr_tup->t_itl_slot_idx, cr_xmax,
 													&xmax_cscn))
 				ereport(ERROR, (errcode(ERRCODE_CLUSTER_CR_SNAPSHOT_TOO_OLD),
 								errmsg("cluster CR cannot resolve commit_scn for deleting xmax %u",
 									   cr_xmax),
-								errhint("ITL slot recycled and overlay/durable TT miss; retry the "
-										"transaction with a fresh snapshot.")));
+								errhint("ITL slot recycled and no own-instance commit_scn-by-xid "
+										"history source yet (Stage 4.1); retry with a fresh "
+										"snapshot.")));
 			xmax_status = CLUSTER_TT_STATUS_COMMITTED;
 			scn_decision = cluster_visibility_decide_by_scn(xmax_cscn, snapshot->read_scn);
 		}

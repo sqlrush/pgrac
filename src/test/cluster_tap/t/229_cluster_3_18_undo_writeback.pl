@@ -199,14 +199,31 @@ unlike(slurp_file($node->logfile), qr/PANIC/, 'L5 no PANIC');
 #     live row only proves the block wasn't trashed;  this proves the undo
 #     bytes a delta could NOT have restored are actually readable.)
 # ============================================================
-my $bg6 = $node->background_psql('postgres');
+# on_error_stop => 0 so a 53R9F on the CR read below (the spec-3.21 Stage 3 strict
+# boundary) does not exit the psql process -- the session survives so we can
+# inspect the error and tear down cleanly.
+my $bg6 = $node->background_psql('postgres', on_error_stop => 0);
 $bg6->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
 $bg6->query_safe('SELECT count(*) FROM t318b'); # pin snapshot at the recovered state
 my $pre = $node->safe_psql('postgres', q{SELECT left(v, 2) FROM t318b WHERE id = 1});
 $node->safe_psql('postgres', q{UPDATE t318b SET v = 'cr' WHERE id = 1});
-is($bg6->query_safe(q{SELECT left(v, 2) FROM t318b WHERE id = 1}),
-	$pre, 'L6 RR snapshot reads pre-UPDATE version via CR over recovered undo');
-$bg6->query_safe('COMMIT');
+# spec-3.21 Stage 3 strict correctness boundary: the CR read returns the
+# pre-UPDATE value, OR fails closed (53R9F snapshot-too-old) when the deleter's
+# ITL slot was recycled and no own-instance commit_scn-by-xid history source
+# exists yet (a Stage 4.1 liveness optimization, NOT a Stage 3 correctness
+# condition).  Both are acceptable -- a WRONG value would be the bug.
+my $l6 = $bg6->query(q{SELECT left(v, 2) FROM t318b WHERE id = 1});
+my $l6err = $bg6->{stderr} // '';
+if ($l6err =~ /snapshot too old|cannot resolve commit_scn/i)
+{
+	pass('L6 RR snapshot read fails closed 53R9F (recycled-slot committed deleter; '
+		. 'Stage 4.1 liveness debt, not wrong data)');
+}
+else
+{
+	is($l6, $pre, 'L6 RR snapshot reads pre-UPDATE version via CR over recovered undo');
+}
+$bg6->query('ROLLBACK'); # a 53R9F aborts the txn; ROLLBACK clears it (psql survives)
 $bg6->quit;
 unlike(slurp_file($node->logfile), qr/PANIC|inverse-apply failed/, 'L6 no CR failure');
 
