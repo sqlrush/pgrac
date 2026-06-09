@@ -97,7 +97,7 @@ sub _run_workload
 	close($fh);
 
 	my ($out, $err);
-	$node->run_log(
+	my $ok = $node->run_log(
 		[ 'pgbench', '-n', '-f', $script_path,
 			'-c', $clients, '-j', $jobs, '-T', $seconds,
 			'-p', $node->port, '-h', $node->host, 'postgres' ],
@@ -113,25 +113,42 @@ sub _run_workload
 	# just aborts the client; tolerated here, only counted.
 	my $cr_retry = () = $all =~ /cluster CR cannot reconstruct block/gi;
 
-	# Anything genuinely unexpected: a FATAL/PANIC, or a backend ERROR that is
-	# neither the invisible-tuple bug nor the tolerated retryable CR fail-closed.
-	my $fatal = $all =~ /(?:FATAL|PANIC):/i;
+	# Anything genuinely unexpected: a FATAL/PANIC, or a backend ERROR/pgbench
+	# error that is neither the invisible-tuple bug nor the tolerated retryable
+	# CR fail-closed.  We must check this explicitly: IPC::Run::run returns
+	# false on pgbench abort, but this test intentionally tolerates the retryable
+	# CR abort path for the high-contention L2 workload.
+	my @unexpected_errors;
+	for my $line (split /\n/, $all)
+	{
+		next if $line =~ /cluster CR cannot reconstruct block/i;
+		next if $cr_retry
+			&& $line =~ /pgbench:\s+error:\s+Run was aborted; the above results are incomplete\./i;
+		push @unexpected_errors, $line
+			if $line =~ /(?:ERROR|FATAL|PANIC):|pgbench:\s+error:/i;
+	}
 
 	my $failed = ($out // '') =~ /number of failed transactions: (\d+)/m ? $1 + 0 : 0;
+	my $processed =
+	  ($out // '') =~ /number of transactions actually processed: (\d+)/m ? $1 + 0 : 0;
 
-	if ($invisible || $fatal)
+	if ($invisible || @unexpected_errors)
 	{
 		my $stub = substr(($err // ''), 0, 2048);
 		diag("$label pgbench stderr (first 2KB):\n$stub");
+		diag("$label unexpected errors:\n" . join("\n", @unexpected_errors))
+			if @unexpected_errors;
 	}
 
 	$node->stop;
 
 	return {
-		invisible => $invisible ? 1 : 0,
-		cr_retry  => $cr_retry,
-		fatal     => $fatal ? 1 : 0,
-		failed    => $failed,
+		ok                => $ok ? 1 : 0,
+		invisible         => $invisible ? 1 : 0,
+		cr_retry          => $cr_retry,
+		unexpected_errors => scalar @unexpected_errors,
+		failed            => $failed,
+		processed         => $processed,
 	};
 }
 
@@ -144,10 +161,13 @@ sub _run_workload
 my $off = _run_workload('croff', 'off');
 ok(!$off->{invisible},
 	"L1 control (cr_mvcc_gate=off): no invisible-tuple error");
-ok(!$off->{fatal},
-	"L1 control (cr_mvcc_gate=off): no FATAL/PANIC");
+ok(!$off->{unexpected_errors},
+	"L1 control (cr_mvcc_gate=off): no unexpected ERROR/FATAL/PANIC");
+ok($off->{ok}, "L1 control (cr_mvcc_gate=off): pgbench exits cleanly");
 is($off->{failed}, 0,
 	"L1 control (cr_mvcc_gate=off): zero failed transactions");
+cmp_ok($off->{processed}, '>', 0,
+	"L1 control (cr_mvcc_gate=off): workload processed transactions");
 
 # ----------------------------------------------------------------------
 # L2 / spec-3.19 D3 regression gate: cr_mvcc_gate = on.  THE assertion is
@@ -161,8 +181,10 @@ is($off->{failed}, 0,
 my $on = _run_workload('cron', 'on');
 ok(!$on->{invisible},
 	"L2 (cr_mvcc_gate=on): no invisible-tuple error [spec-3.19 D3 fix]");
-ok(!$on->{fatal},
-	"L2 (cr_mvcc_gate=on): no FATAL/PANIC");
+ok(!$on->{unexpected_errors},
+	"L2 (cr_mvcc_gate=on): no unexpected ERROR/FATAL/PANIC");
+cmp_ok($on->{processed}, '>', 0,
+	"L2 (cr_mvcc_gate=on): workload processed transactions");
 diag("L2 tolerated retryable CR-reconstruct fail-closed count: $on->{cr_retry} "
 	. "(correct behavior, not the bug)");
 

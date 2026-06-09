@@ -1019,7 +1019,7 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 		TransactionId live_xmin = HeapTupleHeaderGetRawXmin(tup);
 
 		if (TransactionIdIsNormal(live_xmin) && !TransactionIdIsCurrentTransactionId(live_xmin)
-			&& (!TransactionIdDidCommit(live_xmin) || TransactionIdIsInProgress(live_xmin))) {
+			&& (TransactionIdIsInProgress(live_xmin) || !TransactionIdDidCommit(live_xmin))) {
 			*out_visible = false;
 			return true;
 		}
