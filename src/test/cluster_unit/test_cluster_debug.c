@@ -863,6 +863,27 @@ cluster_cr_cache_install_count(void)
 {
 	return 0;
 }
+/* spec-3.22 D3: xmax recycled-slot resolve outcome buckets. */
+uint64
+cluster_cr_xmax_resolved_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_xmax_recycled_invisible_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_xmax_invalid_or_ambiguous_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_xmax_scan_unavail_or_no_proof_count(void)
+{
+	return 0;
+}
 
 /* spec-3.11 D8: durable TT slot counters (cluster_tt_durable_stat.c) are not
  * linked here; stub the 5 accessors dump_undo reads. */
@@ -1059,6 +1080,11 @@ cluster_tt_slot_retain_skip_count(void)
 }
 uint64
 cluster_tt_slot_retention_recycle_count(void)
+{
+	return 0;
+}
+uint64
+cluster_tt_slot_retention_off_recycle_count(void) /* spec-3.22 */
 {
 	return 0;
 }
