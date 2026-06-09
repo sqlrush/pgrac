@@ -214,10 +214,11 @@ $node->safe_psql('postgres', q{UPDATE t318b SET v = 'cr' WHERE id = 1});
 # condition).  Both are acceptable -- a WRONG value would be the bug.
 my $l6 = $bg6->query(q{SELECT left(v, 2) FROM t318b WHERE id = 1});
 my $l6err = $bg6->{stderr} // '';
-if ($l6err =~ /snapshot too old|cannot resolve commit_scn/i)
+if ($l6err =~ /snapshot too old|cannot resolve commit_scn|durable scan unavailable/i)
 {
 	pass('L6 RR snapshot read fails closed 53R9F (recycled-slot committed deleter; '
-		. 'Stage 4.1 liveness debt, not wrong data)');
+		. 'spec-3.22 resolves the recycled-below-horizon case, this is the residual '
+		. 'delayed-cleanout/wrap edge, not wrong data)');
 }
 else
 {

@@ -116,6 +116,7 @@ sub _invariant
 # retries the txn, never a wrong/lost result (spec-3.21 acceptance #1).
 my $tolerated_on =
   qr{cluster\ CR\ cannot\ resolve\ commit_scn
+	|cluster\ CR\ durable\ scan\ unavailable
 	|cluster\ CR\ xmax\ visibility\ unresolved
 	|cluster\ CR\ cannot\ reconstruct\ block
 	|cluster\ undo\ record\ alloc\ failed
@@ -189,7 +190,7 @@ my $tolerated_off =
 	|ITL\ slot\ overflow}xi;
 my @bad_off = _unexpected_lines($all_off, $tolerated_off);
 my $cr_off = $all_off =~
-  /cluster CR cannot resolve commit_scn|cluster CR xmax visibility|cluster CR cannot reconstruct/i;
+  /cluster CR cannot resolve commit_scn|cluster CR durable scan unavailable|cluster CR xmax visibility|cluster CR cannot reconstruct/i;
 diag("L2 first 2KB:\n" . substr($all_off, 0, 2048)) if ($all_off =~ /UPDATE0 / || @bad_off || $cr_off);
 ok($all_off !~ /UPDATE0 /, 'L2 (gate off control): no UPDATE 0 (no false-invisible without the gate)');
 ok(!$cr_off, 'L2 (gate off control): no CR-gate visibility error (the gate is off)');
