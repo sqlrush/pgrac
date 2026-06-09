@@ -943,9 +943,9 @@ cluster_visibility_decide_tuple(HeapTuple htup, Snapshot snapshot, Buffer buffer
  *
  *	Used only for the committed-at/before-read_scn branch: the committed-AFTER-
  *	read_scn case is decided VISIBLE in the caller via the live slot (tier-2 has
- *	already proved the live deleter's write_scn > read_scn, hence commit_scn >
- *	read_scn -- the sound direction of write_scn, NOT the P1-a inverse).  So this
- *	resolver is reached only when the LIVE slot was recycled to a newer writer.
+ *	already proved the live deleter wrote after read_scn, hence its commit is also
+ *	after read_scn -- the sound direction of write_scn, NOT the P1-a inverse).  So
+ *	this resolver is reached only when the LIVE slot was recycled to a newer writer.
  *
  *	Exact-key source order (spec-3.21 D2; never a CLOG/write_scn proxy -- P1-a):
  *	  1. the CR SCRATCH page ITL slot at itl_idx, IFF slot.xid == cr_xmax;
@@ -1282,12 +1282,13 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 
 			/*
 			 * Live-slot shortcut: if the LIVE tuple's ITL slot still holds cr_xmax
-			 * (the deleter), tier-2 above already proved slot->write_scn > read_scn,
-			 * so commit_scn >= write_scn > read_scn -- the delete committed AFTER
-			 * the snapshot -> the row was live at read_scn -> VISIBLE.  (Sound
-			 * direction of write_scn; P1-a forbids only the inverse.)  This is the
-			 * common RR-snapshot + concurrent-commit case (t/229 L6) whose deleter
-			 * slot has not been recycled; its commit_scn need not be stamped yet.
+			 * (the deleter), tier-2 above already proved the slot wrote after
+			 * read_scn, so its commit (at or after the write) is also after
+			 * read_scn -- the delete committed AFTER the snapshot -> the row was
+			 * live at read_scn -> VISIBLE.  (Sound direction of write_scn; P1-a
+			 * forbids only the inverse.)  This is the common RR-snapshot +
+			 * concurrent-commit case (t/229 L6) whose deleter slot has not been
+			 * recycled; its commit_scn need not be stamped yet.
 			 */
 			if (slot->xid == cr_xmax) {
 				*out_visible = true;
