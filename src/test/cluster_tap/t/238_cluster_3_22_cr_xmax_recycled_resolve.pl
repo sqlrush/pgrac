@@ -234,7 +234,28 @@ cmp_ok(_counter($ret, 'undo', 'retention_off_recycle_count'), '>', 0,
 is(_invariant($ret), 't',
 	'L3 (retention off): invariant holds -- no false-invisible despite the off-window');
 is(_counter($ret, 'cr', 'cr_xmax_recycled_invisible_count'), $shortcut_before,
-	'L3: RECYCLED->invisible shortcut disabled once an off-window is seen (sticky fail-closed)');
+	'L3: RECYCLED->invisible shortcut disabled while retention is off');
+
+# L3b: the sticky guard OUTLIVES the off-window.  Re-enable retention -- now the
+# GUC leg (b) passes again, so the ONLY thing still disabling the shortcut is the
+# sticky retention_off_recycle_count (leg c).  Re-run the recycle-heavy workload:
+# the RECYCLED path IS exercised (the no-proof bucket grows), but the shortcut must
+# STAY disabled (recycled_invisible flat).  This isolates the sticky counter from
+# the live-GUC leg -- if the counter were cleared on re-enable, recycled_invisible
+# would resume growing here.  L3 alone could not prove this (GUC-off masks leg c).
+$ret->safe_psql('postgres', 'ALTER SYSTEM SET cluster.undo_retention_horizon_enabled = on');
+$ret->safe_psql('postgres', 'SELECT pg_reload_conf()');
+my $shortcut_pre_reenable = _counter($ret, 'cr', 'cr_xmax_recycled_invisible_count');
+my $noproof_pre_reenable  = _counter($ret, 'cr', 'cr_xmax_scan_unavail_or_no_proof_count');
+_run_tpcb($ret);    # retention back ON, but this incarnation already saw an off-window
+
+cmp_ok(_counter($ret, 'undo', 'retention_off_recycle_count'), '>', 0,
+	'L3b: retention_off_recycle_count stays set after re-enable (sticky, not cleared)');
+cmp_ok(_counter($ret, 'cr', 'cr_xmax_scan_unavail_or_no_proof_count'), '>', $noproof_pre_reenable,
+	'L3b: recycled deleters were exercised and fail-closed (no-proof bucket grew)');
+is(_counter($ret, 'cr', 'cr_xmax_recycled_invisible_count'), $shortcut_pre_reenable,
+	'L3b: shortcut STAYS disabled after retention re-enable (sticky guard leg c, not the live GUC)');
+is(_invariant($ret), 't', 'L3b (retention re-enabled): invariant still holds');
 
 $on->stop;
 $off->stop;

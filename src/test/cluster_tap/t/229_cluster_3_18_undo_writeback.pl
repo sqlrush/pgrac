@@ -207,11 +207,15 @@ $bg6->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
 $bg6->query_safe('SELECT count(*) FROM t318b'); # pin snapshot at the recovered state
 my $pre = $node->safe_psql('postgres', q{SELECT left(v, 2) FROM t318b WHERE id = 1});
 $node->safe_psql('postgres', q{UPDATE t318b SET v = 'cr' WHERE id = 1});
-# spec-3.21 Stage 3 strict correctness boundary: the CR read returns the
-# pre-UPDATE value, OR fails closed (53R9F snapshot-too-old) when the deleter's
-# ITL slot was recycled and no own-instance commit_scn-by-xid history source
-# exists yet (a Stage 4.1 liveness optimization, NOT a Stage 3 correctness
-# condition).  Both are acceptable -- a WRONG value would be the bug.
+# This L6 deleter is committed-AFTER the pinned RR snapshot (the UPDATE runs after
+# the snapshot is pinned), so the row was live at read_scn -> the CR read must
+# return the pre-UPDATE value.  The gate resolves that via RESOLVED_SCN (the
+# committed-after deleter's TT slot is RETAINED, never a 0-match) or, if its
+# commit_scn is not yet stamped, fails closed 53R9F (the delayed-cleanout residual).
+# It is NOT the spec-3.22 recycled-below-horizon case (a committed-after deleter is
+# never recyclable, I2) -- that 0-match -> invisible path is covered deterministically
+# by t/238 L1.  So L6 tolerates value-OR-53R9F: 53R9F here is the residual edge
+# (delayed cleanout / wrap), never wrong data.
 my $l6 = $bg6->query(q{SELECT left(v, 2) FROM t318b WHERE id = 1});
 my $l6err = $bg6->{stderr} // '';
 if ($l6err =~ /snapshot too old|cannot resolve commit_scn|durable scan unavailable/i)
