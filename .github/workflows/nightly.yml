@@ -5,9 +5,11 @@
 #    Runs the heavy parts that fast.yml intentionally skips, sharded for
 #    wallclock:
 #      - linux-pg-regress: PG 219 three-mode (own job, off the TAP path)
-#      - linux-cluster-tap: ALL cluster_tap files (110) split into 3 parallel
-#        shards (foundation / stage2-gcs / stage3-mvcc) + cluster_unit
-#        (+ cluster_regress on the foundation shard)
+#      - linux-cluster-tap: cluster_tap files split into 6 parallel shards
+#        (foundation-core / foundation-stage1 / stage2-ic-cssd / stage2-gcs /
+#        stage3-core / stage3-recent), with Stage 2/3 acceptance files kept in
+#        their dedicated medium jobs.  cluster_unit + cluster_regress run once
+#        on the foundation-core shard.
 #      - build-test-macos: PG 219 + cluster_unit + cluster_regress + a curated
 #        cluster_tap SMOKE subset (the full cluster_tap on macOS was the
 #        wallclock bottleneck; Linux is the primary target)
@@ -25,9 +27,10 @@
 #   - workflow_dispatch (manual trigger by maintainer)
 #   - push to tags v* (mandatory ship-time verification)
 #
-# Total wallclock target: ≤ 14 min (Linux TAP shards + pg-regress + macOS
+# Total wallclock target: ≤ 7 min (Linux TAP shards + pg-regress + macOS
 # smoke all run in parallel; the slowest shard is the bound).  Was ~26 min
-# (single macOS full cluster_tap job) before sharding + macOS smoke.
+# (single macOS full cluster_tap job) before sharding + macOS smoke, then
+# ~8-9 min with 3 broad Linux TAP shards.
 # Trade-off: more runner-minutes (each shard self-builds) for less wallclock,
 # per the maintainer's "GitHub job sharding is more stable than prove -j"
 # guidance (TAP has port/tmp/IPC/cluster-node resource contention).
@@ -100,16 +103,16 @@ jobs:
           retention-days: 14
 
   # ====================================================================
-  # Tier 2.1b — Linux cluster_tap (ALL 110 files, 3 parallel shards)
+  # Tier 2.1b — Linux cluster_tap (6 parallel shards)
   # --------------------------------------------------------------------
-  # Shards by leading test-file number (no per-test timing yet, so file
-  # ranges are the proxy; foundation 39 / stage2-gcs 38 / stage3-mvcc 33):
-  #   foundation  001-071  framework, GUC, shmem, wait events, ITL/PCM
-  #               + cluster_unit + cluster_regress (run once here)
-  #   stage2-gcs  072-202  IC/CSSD/quorum/GRD/GCS, 2-node ClusterPair,
-  #               Stage 2 acceptance (the 2-node tests are the slowest)
-  #   stage3-mvcc 203-235  Stage 3 MVCC/undo/CR/retention/cleaner/2PC/
-  #               recovery/spec-3.18/spec-3.19
+  # Shards by leading test-file number.  Stage acceptance files are not
+  # duplicated here:
+  #   - 200-202 are owned by stage2-acceptance-medium below.
+  #   - 226-227 are owned by stage3-acceptance-medium below.
+  #
+  # cluster_unit + cluster_regress run only in foundation-core; the other
+  # shards run their TAP slice only.  This saves repeated unit/regress work
+  # and keeps the longest Linux TAP shard below the macOS smoke bound.
   # ====================================================================
   linux-cluster-tap:
     name: Linux cluster_tap (${{ matrix.shard.name }})
@@ -119,9 +122,12 @@ jobs:
       fail-fast: false
       matrix:
         shard:
-          - { name: foundation,  lo: 1,   hi: 71,  regress: true }
-          - { name: stage2-gcs,  lo: 72,  hi: 202, regress: false }
-          - { name: stage3-mvcc, lo: 203, hi: 299, regress: false }
+          - { name: foundation-core,   ranges: "001-030", unit: true,  regress: true }
+          - { name: foundation-stage1, ranges: "050-071", unit: false, regress: false }
+          - { name: stage2-ic-cssd,    ranges: "072-099", unit: false, regress: false }
+          - { name: stage2-gcs,        ranges: "100-118", unit: false, regress: false }
+          - { name: stage3-core,       ranges: "203-225", unit: false, regress: false }
+          - { name: stage3-recent,     ranges: "228-237", unit: false, regress: false }
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -149,22 +155,32 @@ jobs:
           make install
 
       - name: Run cluster_unit
+        if: matrix.shard.unit
         run: make -C src/test/cluster_unit check
 
-      - name: Run cluster_regress (foundation shard only)
+      - name: Run cluster_regress (foundation-core shard only)
         if: matrix.shard.regress
         run: make -C src/test/cluster_regress check
 
       - name: Run cluster_tap shard ${{ matrix.shard.name }}
         env:
-          # Stage 2 perf smoke (t/202) blocks on Linux; it lands in the
-          # stage2-gcs shard.  Harmless to set everywhere — only t/202 reads it.
+          # Harmless to set everywhere.  The medium Stage 2 acceptance job
+          # owns t/202; keep the env here so manual shard experiments behave
+          # the same if t/202 is temporarily included in a range.
           STAGE2_PERF_HARD_GATE: '1'
         run: |
-          SEL=$(cd src/test/cluster_tap && for f in t/*.pl; do \
+          SEL=$(cd src/test/cluster_tap && ranges="${{ matrix.shard.ranges }}"; for f in t/*.pl; do \
             n=$(basename "$f" .pl | cut -d_ -f1); \
             d=$((10#$n)); \
-            if [ "$d" -ge ${{ matrix.shard.lo }} ] && [ "$d" -le ${{ matrix.shard.hi }} ]; then \
+            include=0; \
+            for r in $ranges; do \
+              lo=${r%-*}; hi=${r#*-}; \
+              lo_d=$((10#$lo)); hi_d=$((10#$hi)); \
+              if [ "$d" -ge "$lo_d" ] && [ "$d" -le "$hi_d" ]; then \
+                include=1; break; \
+              fi; \
+            done; \
+            if [ "$include" -eq 1 ]; then \
               printf '%s ' "$f"; \
             fi; \
           done)
