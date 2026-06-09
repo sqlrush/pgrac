@@ -115,6 +115,26 @@ jobs:
             --clients="${PERF_CLIENTS:-4}" \
             --jobs="${PERF_JOBS:-2}"
 
+      # spec-3.23 D0/D1: write-path four-quadrant matrix (gate x writeback x fsync).
+      # Linux-only clean channel (规则 23: macOS perf is noise, not final).  Separates
+      # the CR-gate tax / writeback benefit / pure structural tax so the ≤10% judgment
+      # lands on quadrant C, and the spec-3.23 CR-gate hot-path fix can be re-tested
+      # by one CI run.  warn-only (perf is never a hard gate, 规则 20.A).
+      - name: Write-path four-quadrant matrix (warn-only, Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p scripts/perf/results
+          PGRAC_ENABLE_INSTALL=$HOME/linkdb-install \
+          PGRAC_DISABLE_INSTALL=$HOME/linkdb-disable-install \
+          QM_SCALE="${PERF_SCALE:-10}" \
+          QM_DURATION="${QM_DURATION:-15}" \
+          QM_REPS="${QM_REPS:-3}" \
+          QM_CLIENTS="${QM_CLIENTS:-8}" \
+          QM_JOBS="${QM_JOBS:-4}" \
+          FSYNC_MATRIX="${FSYNC_MATRIX:-yes}" \
+          scripts/perf/run-quadrant-matrix.sh \
+            | tee "scripts/perf/results/quadrant-matrix-${{ github.run_id }}.md"
+
       - name: Collect perf artifacts
         if: always()
         run: |
