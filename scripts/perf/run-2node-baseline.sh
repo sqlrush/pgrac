@@ -98,7 +98,7 @@ Spec-3.4e v0.2 §2.4 + F4:bash 不能直接调 ClusterPair.pm — Perl runner
 owns 2-postmaster lifecycle + pgbench log parsing + metric collection。
 
 For real CI invocation, prefer:
-  gh workflow run perf.yml -R sqlrush/linkdb
+  gh workflow run perf.yml -R sqlrush/pgrac-PostgreSQL-run-as-OracleRAC
 EOF
 }
 
