@@ -90,6 +90,23 @@ Four wait events cover the shared-storage bookkeeping I/O:
 `ClusterWalThreadClaimRead`/`Write` (claim file) and
 `ClusterWalStateRead`/`Write` (registry).
 
+## Recovery plan (informational)
+
+On every plain local startup (clean or crash; not as a standby and not
+during archive recovery), a node with `cluster.wal_threads_dir` set
+scans the registry and reports, per WAL thread, whether it looks
+cleanly stopped, live on another node, a *crash candidate* (still
+marked active but not refreshed within
+`cluster.recovery_stale_active_ms`, default 10s), or unreadable.  The
+result appears in the startup log ("recovery plan (not acted upon)")
+and under the `recovery` category of `pg_cluster_state` (`plan_*`
+keys).  This release only reports the classification — cross-thread
+merged recovery is not performed.  An `unknown` thread is never treated
+as crashed; if unknowns persist, check the shared WAL storage.  If
+peer nodes run a larger `cluster.cluster_stats_main_loop_interval`,
+raise `cluster.recovery_stale_active_ms` accordingly so live peers are
+not reported as crash candidates.
+
 ## Compatibility notes
 
 - Setting `cluster.wal_threads_dir` is optional.  Without it the flat
