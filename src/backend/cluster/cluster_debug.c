@@ -85,6 +85,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_undo_record_api.h"  /* cluster_undo_* counter accessors (spec-3.7 D10) */
 #include "cluster/storage/cluster_undo_buf.h" /* spec-3.18 D7: undo buffer counters */
 #include "cluster/cluster_cr.h"				  /* cluster_cr_* counter accessors (spec-3.9 D8) */
+#include "cluster/cluster_wal_state.h"		  /* wal_state registry dump (spec-4.2 D5) */
 #include "cluster/cluster_wal_thread.h"		  /* wal_thread dump accessors (spec-4.1 D7) */
 #include "cluster/cluster_tt_durable.h"		  /* cluster_tt_durable_* counters (spec-3.11 D8) */
 #include "cluster/cluster_grd_outbound.h"
@@ -1678,6 +1679,30 @@ dump_wal_thread(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "wal_thread", "claim_created", fmt_bool(cluster_wal_thread_claim_created()));
 	emit_row(rsinfo, "wal_thread", "page_stamp_count",
 			 fmt_int64((int64)cluster_wal_thread_page_stamp_count()));
+
+	/* spec-4.2 D5: ClusterWalState registry keys (5 -> 10; live reads). */
+	{
+		ClusterWalStateSlot slot;
+		bool ready = cluster_wal_state_registry_ready();
+		ClusterWalSlotVerdict v = CLUSTER_WAL_SLOT_EMPTY;
+
+		if (ready)
+			v = cluster_wal_state_read_slot(cluster_wal_thread_dump_thread_id(), &slot);
+
+		emit_row(rsinfo, "wal_thread", "registry_ready", fmt_bool(ready));
+		emit_row(rsinfo, "wal_thread", "registry_slot_state",
+				 !ready
+					 ? "-"
+					 : (v == CLUSTER_WAL_SLOT_OK
+							? (slot.state == CLUSTER_WAL_SLOT_STATE_ACTIVE ? "active" : "stopped")
+							: (v == CLUSTER_WAL_SLOT_EMPTY ? "empty" : "unknown")));
+		emit_row(rsinfo, "wal_thread", "registry_last_updated",
+				 (ready && v == CLUSTER_WAL_SLOT_OK) ? fmt_int64(slot.last_updated) : "-");
+		emit_row(rsinfo, "wal_thread", "registry_highest_lsn",
+				 (ready && v == CLUSTER_WAL_SLOT_OK) ? fmt_uint64_hex(slot.highest_lsn) : "-");
+		emit_row(rsinfo, "wal_thread", "registry_highest_scn",
+				 (ready && v == CLUSTER_WAL_SLOT_OK) ? fmt_int64((int64)slot.highest_scn) : "-");
+	}
 }
 
 #endif /* USE_PGRAC_CLUSTER */

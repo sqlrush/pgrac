@@ -67,6 +67,7 @@
 #include "cluster/cluster_scn.h"	/* SCN_NODE_ID_VALID (spec-1.16 D13) */
 #include "cluster/cluster_shmem.h"	/* cluster_shmem_register_region */
 #include "cluster/cluster_startup_phase.h"
+#include "cluster/cluster_wal_state.h" /* spec-4.2 publish_active (phase->RUNNING) */
 
 
 /*
@@ -1223,6 +1224,16 @@ cluster_finalize_startup_running(void)
 									"distinct failure domains), or set cluster.allow_single_"
 									"node = on for single-node development mode.")));
 	}
+
+	/*
+	 * spec-4.2 v0.2 P1: publish ACTIVE to the ClusterWalState registry
+	 * ONLY here -- recovery has succeeded and the node is about to
+	 * serve.  A node that dies during recovery never reaches this
+	 * point, so its slot keeps the previous content (EMPTY on a first
+	 * boot), which is exactly the raw material spec-4.3 needs for the
+	 * crashed inference.  FATAL 53RA2 inside on write failure.
+	 */
+	cluster_wal_state_publish_active();
 
 	cluster_advance_phase(CLUSTER_PHASE_RUNNING);
 }

@@ -180,6 +180,7 @@
 #include "cluster/cluster_guc.h"   /* cluster_enabled (spec-1.11 Sprint B) */
 #include "cluster/cluster_lmd.h"   /* cluster_lmd_mark_child_exit (spec-2.19 D12 hardening) */
 #include "cluster/cluster_startup_phase.h"
+#include "cluster/cluster_wal_state.h" /* PGRAC: spec-4.2 publish_stopped on clean shutdown */
 #endif
 
 #ifdef EXEC_BACKEND
@@ -4232,6 +4233,18 @@ PostmasterStateMachine(void)
 			 * during smart -> fast -> immediate shutdown upgrades stay
 			 * safe.  HC1 PostmasterMain-only Assert applies.
 			 */
+			/*
+			 * PGRAC (spec-4.2): publish STOPPED to the ClusterWalState
+			 * registry on CLEAN shutdowns only.  Immediate shutdown and
+			 * crash-induced exits (FatalError) must leave the slot
+			 * ACTIVE with a stale timestamp -- recovery is required and
+			 * spec-4.3 readers infer "crashed" from exactly that.
+			 * publish_stopped() WARNs on failure; shutdown is never
+			 * blocked.
+			 */
+			if (Shutdown != NoShutdown && Shutdown < ImmediateShutdown && !FatalError)
+				cluster_wal_state_publish_stopped();
+
 			cluster_run_shutdown_sequence();
 #endif
 

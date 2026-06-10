@@ -59,6 +59,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_stats.h"
+#include "cluster/cluster_wal_state.h" /* spec-4.2 D4 registry refresh */
 #include "cluster/cluster_shmem.h"
 
 
@@ -491,6 +492,14 @@ ClusterStatsMain(void)
 			break;
 
 		stats_advance_liveness_tick();
+
+		/*
+		 * spec-4.2 D4: best-effort ClusterWalState registry refresh on
+		 * the same cadence (cluster.cluster_stats_main_loop_interval).
+		 * Gated inside on the own slot reading back OK+ACTIVE, so it
+		 * is a no-op until publish_active() ran and on flat layouts.
+		 */
+		cluster_wal_state_refresh_own_slot();
 
 		/* Sprint B inject: main-loop-iter (test mid-loop fault). */
 		CLUSTER_INJECTION_POINT("cluster-stats-main-loop-iter");
