@@ -44,6 +44,7 @@
 
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_recovery_plan.h"
+#include "cluster/cluster_scn.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_wal_thread.h"
 #include "lib/stringinfo.h"
@@ -121,6 +122,8 @@ cluster_recovery_plan_generate(uint32 dbstate_at_startup, bool local_recovery_ne
 	uint16 own_thread;
 	int64 now_us;
 	uint16 tid;
+	XLogRecPtr max_scn_lsn = 0; /* scn_recovery_cmp tie-break carriers */
+	NodeId max_scn_node = 0;
 
 	if (cluster_wal_threads_dir == NULL || cluster_wal_threads_dir[0] == '\0')
 		return;
@@ -171,8 +174,17 @@ cluster_recovery_plan_generate(uint32 dbstate_at_startup, bool local_recovery_ne
 		if (v == CLUSTER_WAL_SLOT_OK) {
 			if (slot.highest_lsn > plan.max_highest_lsn)
 				plan.max_highest_lsn = slot.highest_lsn;
-			if (slot.highest_scn > plan.max_highest_scn)
+			/* SCN ordering goes through the spec-1.15 recovery comparator
+			 * (raw operators are CI-gated); the three-level tie-break
+			 * (local_scn -> LSN -> node) carries the winner's lsn/node. */
+			if (scn_recovery_cmp((SCN)slot.highest_scn, (XLogRecPtr)slot.highest_lsn,
+								 (NodeId)(tid - 1), (SCN)plan.max_highest_scn, max_scn_lsn,
+								 max_scn_node)
+				> 0) {
 				plan.max_highest_scn = slot.highest_scn;
+				max_scn_lsn = (XLogRecPtr)slot.highest_lsn;
+				max_scn_node = (NodeId)(tid - 1);
+			}
 		}
 
 		switch (verdict) {
