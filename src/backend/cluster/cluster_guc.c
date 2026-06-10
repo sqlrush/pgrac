@@ -66,9 +66,14 @@ int cluster_shmem_max_regions = 64;
 
 /* spec-3.18 D1: undo block buffer pool slot count (0 = disabled). */
 int cluster_undo_buffers = 2048;
-/* spec-3.18 D1: buffered write-back — MUST stay off until the D2 alpha
- * (check_hook hard-rejects on;  interface-lock §5). */
-bool cluster_undo_buffer_writeback = false;
+/*
+ * spec-3.18 D1/D2b + spec-3.25 D4: buffered write-back.  DEFAULT ON since
+ * spec-3.25 (auto semantics): the runtime latch in
+ * cluster_undo_buf_writeback_allowed() forces write-through whenever the node
+ * has peers, so the default only takes effect on a known single-node topology.
+ * The check_hook is feedback-only (never rejects).
+ */
+bool cluster_undo_buffer_writeback = true;
 int cluster_grd_max_entries = 0;
 int cluster_ges_request_timeout_ms = 60000; /* spec-2.16 D12 + v0.5 P1.5 */
 
@@ -830,10 +835,12 @@ cluster_init_guc(void)
 	DefineCustomBoolVariable("cluster.undo_buffer_writeback",
 							 gettext_noop("Enable buffered write-back for the undo buffer pool."),
 							 gettext_noop("On = buffered undo, durable via WAL + checkpoint flush "
-										  "(drops the per-commit undo fsync).  SINGLE-NODE only -- "
-										  "ignored when the node has peers.  Off = write-through "
-										  "(per-commit fsync to shared storage)."),
-							 &cluster_undo_buffer_writeback, false, PGC_SIGHUP, 0,
+										  "(drops the per-commit undo fsync).  DEFAULT ON since "
+										  "spec-3.25 D4 (auto semantics): the runtime guard forces "
+										  "write-through whenever the node has peers, so the default "
+										  "only takes effect on a single-node topology.  Off = "
+										  "write-through (per-commit fsync to shared storage)."),
+							 &cluster_undo_buffer_writeback, true, PGC_SIGHUP, 0,
 							 cluster_undo_buffer_writeback_check_hook, NULL, NULL);
 
 	/*

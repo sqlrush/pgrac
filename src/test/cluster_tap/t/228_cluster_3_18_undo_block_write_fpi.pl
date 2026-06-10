@@ -56,6 +56,10 @@ $node->append_conf('postgresql.conf',
 	    "cluster.enabled = on\n"
 	  . "cluster.node_id = 0\n"
 	  . "cluster.allow_single_node = on\n"
+	  # spec-3.25 D4: writeback default flipped ON; this test proves the
+	  # WRITE-THROUGH (D2a always-FPI) semantics, so pin it off.  The
+	  # writeback+delta redo path is covered by t/229 and t/225.
+	  . "cluster.undo_buffer_writeback = off\n"
 	  # Keep the proof deterministic: no auto-checkpoint between the post-
 	  # checkpoint writes and the crash, no autovacuum undo touching block 1.
 	  . "checkpoint_timeout = 1h\n"
