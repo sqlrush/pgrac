@@ -46,7 +46,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_undo_record test_cluster_undo_lifecycle test_cluster_cr test_cluster_cr_cache test_cluster_tt_durable \
         test_cluster_retention test_cluster_undo_cleaner test_cluster_visibility_variants test_cluster_tt_2pc \
         test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_undo_extent \
-        test_cluster_wal_thread test_cluster_wal_state
+        test_cluster_wal_thread test_cluster_wal_state test_cluster_recovery_plan
 
 # Path to the cluster_version object (no PG deps, safe to link standalone).
 CLUSTER_VERSION_O = $(top_builddir)/src/backend/cluster/cluster_version.o
@@ -943,6 +943,20 @@ test_cluster_undo_record: test_cluster_undo_record.c unit_test.h \
 # explicit per L229 (layout/StaticAssert snapshots must rebuild when
 # the header moves).
 test_cluster_wal_state: test_cluster_wal_state.c unit_test.h \
+		../../../src/include/cluster/cluster_wal_state.h $(CLUSTER_VERSION_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-4.3 D6: test_cluster_recovery_plan — 16 pure-classifier tests
+# for the recovery plan (§3.2 truth table 1:1: own-priority family,
+# identity-invariant -> UNKNOWN, stale boundary, bitmap addressing,
+# sweep conservation + bitmap<->verdict coherence).  Header-only
+# inclusion; libpgcommon + libpgport supply pg_crc32c for the slot
+# fill helper.  Header dependencies explicit per L229.
+test_cluster_recovery_plan: test_cluster_recovery_plan.c unit_test.h \
+		../../../src/include/cluster/cluster_recovery_plan.h \
 		../../../src/include/cluster/cluster_wal_state.h $(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
