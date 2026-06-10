@@ -118,6 +118,21 @@ extern char *cluster_config_file;
 
 
 /*
+ * cluster_wal_threads_dir -- shared-storage root of the per-thread WAL
+ * stream layout (spec-4.1 D5).
+ *
+ *	Empty (default) keeps the flat pg_wal layout.  When set, postmaster
+ *	startup requires $PGDATA/pg_wal to resolve to
+ *	<dir>/thread_<cluster.node_id + 1> and validates the thread claim
+ *	file; mismatches are FATAL 53RA0 / 53RA1 (cluster_wal_thread_init).
+ *
+ *	context: PGC_POSTMASTER (the WAL stream location cannot move while
+ *	         the server runs).  check_hook: empty or absolute path.
+ */
+extern char *cluster_wal_threads_dir;
+
+
+/*
  * cluster_injection_points -- comma-separated names to auto-arm at startup.
  *
  *	Empty by default.  Each name is armed with fault_type=WARNING; the

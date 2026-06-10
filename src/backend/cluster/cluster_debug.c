@@ -85,6 +85,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_undo_record_api.h"  /* cluster_undo_* counter accessors (spec-3.7 D10) */
 #include "cluster/storage/cluster_undo_buf.h" /* spec-3.18 D7: undo buffer counters */
 #include "cluster/cluster_cr.h"				  /* cluster_cr_* counter accessors (spec-3.9 D8) */
+#include "cluster/cluster_wal_thread.h"		  /* wal_thread dump accessors (spec-4.1 D7) */
 #include "cluster/cluster_tt_durable.h"		  /* cluster_tt_durable_* counters (spec-3.11 D8) */
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_grd_pending.h"
@@ -1656,6 +1657,29 @@ dump_cr(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_cr_xmax_scan_unavail_or_no_proof_count()));
 }
 
+
+/*
+ * dump_wal_thread -- spec-4.1 D7 per-thread WAL routing state.
+ *
+ *	Emits 5 rows under category='wal_thread'.  thread_id /
+ *	dir_configured / dir_validated / claim_created are startup-time
+ *	snapshots mirrored in the 'pgrac wal thread' shmem region (written
+ *	once by cluster_wal_thread_init, EXEC_BACKEND-safe);
+ *	page_stamp_count is the accumulator bumped per real-id WAL page
+ *	stamp (zero whenever the node stamps LEGACY -- L29 silence matrix).
+ */
+static void
+dump_wal_thread(ReturnSetInfo *rsinfo)
+{
+	emit_row(rsinfo, "wal_thread", "thread_id",
+			 fmt_int64((int64)cluster_wal_thread_dump_thread_id()));
+	emit_row(rsinfo, "wal_thread", "dir_configured", fmt_bool(cluster_wal_thread_dir_configured()));
+	emit_row(rsinfo, "wal_thread", "dir_validated", fmt_bool(cluster_wal_thread_dir_validated()));
+	emit_row(rsinfo, "wal_thread", "claim_created", fmt_bool(cluster_wal_thread_claim_created()));
+	emit_row(rsinfo, "wal_thread", "page_stamp_count",
+			 fmt_int64((int64)cluster_wal_thread_page_stamp_count()));
+}
+
 #endif /* USE_PGRAC_CLUSTER */
 
 
@@ -1707,6 +1731,7 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		dump_lms(rsinfo);
 		dump_undo(rsinfo);
 		dump_cr(rsinfo);
+		dump_wal_thread(rsinfo);
 	}
 #else
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

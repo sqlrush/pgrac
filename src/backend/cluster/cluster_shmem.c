@@ -70,6 +70,7 @@
 #include "cluster/cluster_grd.h"			/* cluster_grd_shmem_register (spec-2.14) */
 #include "cluster/cluster_grd_pending.h"	/* cluster_grd_pending_shmem_register (spec-2.16 D3) */
 #include "cluster/cluster_ges_dedup.h"		/* cluster_ges_dedup_shmem_register (spec-2.27 D2) */
+#include "cluster/cluster_wal_thread.h"		/* cluster_wal_thread_shmem_register (spec-4.1 D7) */
 #include "cluster/cluster_grd_outbound.h"	/* cluster_grd_outbound_shmem_register (spec-2.16 D4) */
 #include "cluster/cluster_grd_work_queue.h" /* cluster_grd_work_queue_shmem_register (spec-2.16 D5) */
 #include "cluster/cluster_stats.h"			/* cluster_stats_shmem_register (1.14 Sprint A) */
@@ -671,6 +672,15 @@ cluster_init_shmem_module(void)
 	 */
 	if (cluster_shmem_lookup_region("pgrac cluster ges dedup") == NULL)
 		cluster_ges_dedup_shmem_register();
+
+	/*
+	 * PGRAC (spec-4.1 D7):  register the per-thread WAL routing region.
+	 * 'pgrac wal thread' — one page-stamp counter + a small identity
+	 * mirror written once by cluster_wal_thread_init() so the dump
+	 * accessors stay correct under EXEC_BACKEND.
+	 */
+	if (cluster_shmem_lookup_region("pgrac wal thread") == NULL)
+		cluster_wal_thread_shmem_register();
 }
 
 

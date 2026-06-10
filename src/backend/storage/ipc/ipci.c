@@ -88,6 +88,7 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_shmem.h"	/* PGRAC: cluster_init_shmem() */
 #include "cluster/storage/cluster_shared_fs.h"	/* PGRAC: cluster_shared_fs_init() */
+#include "cluster/cluster_wal_thread.h"			/* PGRAC: cluster_wal_thread_init() (spec-4.1) */
 #endif
 
 /* GUCs */
@@ -353,6 +354,16 @@ CreateSharedMemoryAndSemaphores(void)
 	 * shmem-using backend can take a ClusterShmem pointer directly.
 	 */
 	cluster_shared_fs_init();
+
+	/*
+	 * PGRAC: spec-4.1 per-thread WAL routing validation.  Must run in
+	 * the postmaster (or standalone backend) after the cluster shmem
+	 * regions are attached (identity mirror lives in 'pgrac wal
+	 * thread') and before StartupXLOG reads any WAL.  No-op when
+	 * cluster.wal_threads_dir is unset; IsUnderPostmaster guard inside
+	 * makes EXEC_BACKEND re-entry a no-op (postmaster-once, rule 16).
+	 */
+	cluster_wal_thread_init();
 #endif
 
 #ifdef EXEC_BACKEND

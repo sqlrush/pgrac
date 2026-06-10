@@ -114,6 +114,7 @@ OBJS = \
 	cluster_stats.o \
 	cluster_version.o \
 	cluster_views.o \
+	cluster_wal_thread.o \
 	storage/cluster_shared_fs.o \
 	storage/cluster_shared_fs_stub.o \
 	storage/cluster_shared_fs_local.o \

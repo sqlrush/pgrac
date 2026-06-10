@@ -658,6 +658,25 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 # counter cluster_cr_cross_instance_unsupported_count bump.
 53R9G    E    ERRCODE_CLUSTER_CR_CROSS_INSTANCE_UNSUPPORTED                    cluster_cr_cross_instance_unsupported
 
+# spec-4.1 D7:  per-thread WAL routing startup validation (53RA0+ opens
+# the Stage-4 WAL/recovery band; 53R70/71 belong to GES).  53RA0 fires
+# at postmaster startup when cluster.wal_threads_dir is configured but
+# the configuration is contradictory (cluster.enabled=off, or
+# cluster.node_id unset), the thread directory is missing, or
+# $PGDATA/pg_wal does not resolve to <wal_threads_dir>/thread_<id> for
+# this node (mis-linked symlink / wrong mount).  Fail-closed: startup is
+# refused; never a silent fallback to the flat pg_wal layout.
+53RA0    E    ERRCODE_CLUSTER_WAL_THREAD_ROUTING_MISMATCH                      cluster_wal_thread_routing_mismatch
+
+# spec-4.1 D7:  the thread claim file (pgrac_thread.claim, written once
+# on first validated startup) guards a thread directory against a
+# DIFFERENT node writing into it.  53RA1 fires at postmaster startup
+# when the claim belongs to another node_id / thread_id, is corrupt
+# (bad magic / version / CRC), or cannot be created (O_EXCL or fsync
+# failure).  Never auto-rebuilt: operator confirms ownership and removes
+# the file manually (errhint carries the procedure).
+53RA1    E    ERRCODE_CLUSTER_WAL_THREAD_CLAIM_CONFLICT                        cluster_wal_thread_claim_conflict
+
 Section: Class 54 - Program Limit Exceeded
 
 # this is for wired-in limits, not resource exhaustion problems (class borrowed from DB2)

@@ -409,6 +409,23 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	{ .name = "cr_corruption" },
 	{ .name = "cr_cross_instance" },
 	{ .name = "cr_construct_delay_us" },
+
+	/*
+	 * spec-4.1 D7 — per-thread WAL routing (2 NEW points).
+	 *
+	 *	cluster-wal-thread-validate-pre:
+	 *	  Observational.  Fires in cluster_wal_thread_init right before
+	 *	  the directory-identity check (postmaster startup, only when
+	 *	  cluster.wal_threads_dir is set).
+	 *
+	 *	cluster-wal-thread-claim-create-fail:
+	 *	  Decision-style (cluster_injection_should_skip): when armed,
+	 *	  claim_create() simulates an O_EXCL/fsync failure so cluster_tap
+	 *	  exercises the FATAL 53RA1 first-boot path without real storage
+	 *	  faults (t/242 L11).
+	 */
+	{ .name = "cluster-wal-thread-validate-pre" },
+	{ .name = "cluster-wal-thread-claim-create-fail" },
 };
 
 #define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_points)

@@ -467,6 +467,11 @@ typedef enum {
 	WAIT_EVENT_CLUSTER_BGPROC_QVOTEC_MAIN_LOOP,		   /* spec-2.6 D11 */
 	WAIT_EVENT_CLUSTER_VOTING_DISK_READ,			   /* spec-2.6 D11 */
 	WAIT_EVENT_CLUSTER_VOTING_DISK_WRITE,			   /* spec-2.6 D11 */
+	/* spec-4.1 D7: WAL thread claim file I/O (postmaster startup, once
+	 * per boot;  the VotingDisk pattern -- direct file I/O on shared
+	 * storage, not routed through cluster_shared_fs). */
+	WAIT_EVENT_CLUSTER_WAL_THREAD_CLAIM_READ,
+	WAIT_EVENT_CLUSTER_WAL_THREAD_CLAIM_WRITE,
 	/* spec-2.28 Sprint A Step 4 D9:  fence-lite backend interrupt check
 	 * wait event.  Backend ProcessInterrupts hook (postgres.c D4) sets
 	 * this wait event briefly while reading + clearing ClusterFenceFreeze

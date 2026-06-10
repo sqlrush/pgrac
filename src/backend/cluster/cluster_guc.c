@@ -60,6 +60,7 @@ int cluster_node_id = -1;
 int cluster_interconnect_tier = CLUSTER_IC_TIER_STUB;
 char *cluster_config_file = NULL;	   /* boot value filled by DefineCustomStringVariable */
 char *cluster_injection_points = NULL; /* boot value filled by DefineCustomStringVariable */
+char *cluster_wal_threads_dir = NULL;  /* spec-4.1 D5; '' = flat pg_wal layout */
 int cluster_shared_storage_backend = CLUSTER_SHARED_FS_BACKEND_STUB;
 bool cluster_smgr_user_relations = false;
 int cluster_shmem_max_regions = 64;
@@ -569,6 +570,31 @@ static const struct config_enum_entry cluster_shared_storage_backend_options[]
  *	      while current cluster.ges_request_timeout_ms == -1
  *	      → ERROR, value unchanged.
  */
+/*
+ * spec-4.1 D5 — cluster.wal_threads_dir shape check.
+ *
+ *	Accepts the empty string (flat layout) or an absolute path; a
+ *	relative path would silently depend on the postmaster cwd and make
+ *	the startup validator (cluster_wal_thread_init) compare the wrong
+ *	directory.  Semantic validation (directory exists, pg_wal resolves
+ *	into it, claim ownership) is startup's job, not the parser's.
+ */
+static bool
+cluster_wal_threads_dir_check_hook(char **newval, void **extra, GucSource source)
+{
+	(void)extra;
+	(void)source;
+	if (*newval == NULL || (*newval)[0] == '\0')
+		return true;
+	if (!is_absolute_path(*newval)) {
+		GUC_check_errcode(ERRCODE_INVALID_PARAMETER_VALUE);
+		GUC_check_errdetail("cluster.wal_threads_dir must be an absolute path (or empty to keep "
+							"the flat pg_wal layout).");
+		return false;
+	}
+	return true;
+}
+
 static bool
 cluster_ges_request_timeout_ms_check_hook(int *newval, void **extra, GucSource source)
 {
@@ -696,6 +722,31 @@ cluster_init_guc(void)
 		PGC_POSTMASTER,						/* topology reload requires restart */
 		0,									/* flags */
 		NULL,								/* check_hook */
+		NULL,								/* assign_hook */
+		NULL);								/* show_hook */
+
+	/*
+	 * cluster.wal_threads_dir -- shared-storage root of the per-thread
+	 * WAL stream layout (spec-4.1 D5).  Empty (the default) keeps the
+	 * flat pg_wal layout untouched.  When set, postmaster startup
+	 * validates that $PGDATA/pg_wal resolves to
+	 * <dir>/thread_<cluster.node_id + 1> and that this node owns the
+	 * thread claim file; any mismatch is FATAL 53RA0/53RA1
+	 * (cluster_wal_thread_init, spec-4.1 §2.4 -- never a silent
+	 * fallback).  The relocation itself is bootstrap-managed
+	 * (pgrac-init --wal-threads-dir via initdb -X); the only consumer
+	 * of this GUC is the startup validator, no hot path reads it.
+	 */
+	DefineCustomStringVariable(
+		"cluster.wal_threads_dir",
+		gettext_noop("Shared-storage root directory of the per-thread WAL layout."),
+		gettext_noop("Empty keeps the flat pg_wal layout.  When set, pg_wal must resolve "
+					 "to <dir>/thread_<id> for this node (id = cluster.node_id + 1); "
+					 "startup is refused otherwise."),
+		&cluster_wal_threads_dir, "",		/* boot value */
+		PGC_POSTMASTER,						/* layout is fixed at startup */
+		0,									/* flags */
+		cluster_wal_threads_dir_check_hook, /* check_hook */
 		NULL,								/* assign_hook */
 		NULL);								/* show_hook */
 
