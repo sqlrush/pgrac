@@ -28,6 +28,12 @@
 #      PGRAC_DISABLE_INSTALL  --disable-cluster prefix (required; native baseline)
 #      QM_SCALE (10) QM_DURATION (20) QM_REPS (3) QM_CLIENTS (8) QM_JOBS (4)
 #      FSYNC_MATRIX (no)      yes -> also run an fsync=off pass
+#      QM_PROFILE (no)        yes -> spec-3.25 D0 structural profile on the
+#                             native/C/Dfp cells: pg_waldump --stats=record
+#                             over the rw-rep LSN window (per-rmgr/record-type
+#                             count+bytes; the heap vs CLUSTER_UNDO vs xact
+#                             WAL split) + pg_cluster_state counter deltas +
+#                             txn count for bytes/txn normalization
 #
 #    Author: SqlRush <sqlrush@gmail.com>
 #    Spec: spec-3.23-write-path-perf-retest.md (Hardening v1.0.1 §C four-quadrant)
@@ -44,9 +50,14 @@ REPS="${QM_REPS:-3}"
 CL="${QM_CLIENTS:-8}"
 J="${QM_JOBS:-4}"
 FSYNC_MATRIX="${FSYNC_MATRIX:-no}"
+# spec-3.25 D0: profile on by default -- perf.yml does not pass QM_PROFILE, and
+# the D0 structural artifact must ride the weekly/dispatch runs unchanged.
+QM_PROFILE="${QM_PROFILE:-yes}"
 PORT=55401
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
-RESULTS="${QM_RESULTS_DIR:-/tmp/qm-$TS}"
+# Default into the script-side results/ dir: perf.yml archives that directory
+# wholesale, so the d0-profile file lands in the run artifact.
+RESULTS="${QM_RESULTS_DIR:-$(cd "$(dirname "$0")" && pwd)/results}"
 mkdir -p "$RESULTS"
 
 die() { echo "$PROG: ERROR: $*" >&2; exit 1; }
@@ -59,9 +70,18 @@ median() {
   printf '%s\n' "$sorted" | sed -n "${mid}p"
 }
 
-# run one cell: prefix datadir node-on(0|1) gate wb fsync  -> echoes "rw_med ro_med rw_all ro_all"
+# spec-3.25 D0: dump the pg_cluster_state counter table (category.key=value lines).
+counters_snapshot() {
+  local prefix="$1"
+  "$prefix/bin/psql" -h /tmp -p "$PORT" -At postgres \
+    -c "SELECT category||'.'||key||'='||value FROM pg_cluster_state ORDER BY 1" 2>/dev/null
+}
+
+# run one cell: prefix datadir node-on(0|1) gate wb fsync [fastpath] [label]
+#   -> echoes "rw_med ro_med rw_all ro_all"; QM_PROFILE=yes emits a D0 profile
+#      section to stderr-free stdout via a temp file appended after the cell.
 run_cell() {
-  local prefix="$1" dd="$2" clon="$3" gate="$4" wb="$5" fsync="$6" fastpath="${7:-off}"
+  local prefix="$1" dd="$2" clon="$3" gate="$4" wb="$5" fsync="$6" fastpath="${7:-off}" lbl="${8:-}"
   local log="$dd.log"
   export PATH="$prefix/bin:$PATH"
   rm -rf "$dd" "$log"
@@ -86,8 +106,18 @@ run_cell() {
   "$prefix/bin/pg_ctl" -D "$dd" -l "$log" -w -t 60 start >/dev/null 2>&1 || die "start failed ($dd; see $log)"
   "$prefix/bin/pgbench" -h /tmp -p "$PORT" -i -s "$SCALE" --quiet postgres >/dev/null 2>&1
 
+  # spec-3.25 D0 profile pre-window state (native/C/Dfp cells only).
+  local do_prof=no lsn0="" cnt0="" txns=0
+  if [ "$QM_PROFILE" = yes ]; then
+    case "$lbl" in native|C|Dfp) do_prof=yes ;; esac
+  fi
+  if [ "$do_prof" = yes ]; then
+    lsn0=$("$prefix/bin/psql" -h /tmp -p "$PORT" -At postgres -c "SELECT pg_current_wal_lsn()")
+    [ "$clon" = 1 ] && cnt0=$(counters_snapshot "$prefix")
+  fi
+
   local rw_all=() ro_all=()
-  local r out tps failed
+  local r out tps failed nx
   for r in $(seq 1 "$REPS"); do
     out=$("$prefix/bin/pgbench" -h /tmp -p "$PORT" -c "$CL" -j "$J" -T "$DUR" postgres 2>&1)
     failed=$(printf '%s\n' "$out" | awk -F'[ (]' '/number of failed/ {print $0}' | grep -oE '[0-9]+ \(' | grep -oE '^[0-9]+' | head -1)
@@ -95,7 +125,36 @@ run_cell() {
     [ -n "$tps" ] || die "no rw tps ($dd rep $r)"
     [ "${failed:-0}" = 0 ] || echo "$PROG: WARN rw cell gate=$gate wb=$wb fsync=$fsync rep=$r failed=$failed (污染,记但标)" >&2
     rw_all+=("$tps")
+    nx=$(printf '%s\n' "$out" | awk '/number of transactions actually processed/ {print $6; exit}')
+    txns=$(( txns + ${nx:-0} ))
   done
+
+  # spec-3.25 D0 profile: WAL split over the rw window + counter deltas.
+  # pg_waldump reads the live pg_wal directory; the [lsn0,lsn1) window is
+  # quiesced (reps finished, ro loop not started), so no partial-record tail.
+  if [ "$do_prof" = yes ]; then
+    local lsn1 prof="$dd.profile"
+    lsn1=$("$prefix/bin/psql" -h /tmp -p "$PORT" -At postgres -c "SELECT pg_current_wal_lsn()")
+    {
+      echo ""
+      echo "== D0 PROFILE cell=$lbl fsync=$fsync txns=$txns lsn=[$lsn0,$lsn1) =="
+      "$prefix/bin/pg_waldump" --path "$dd/pg_wal" --start "$lsn0" --end "$lsn1" \
+          --stats=record 2>&1 | awk 'NF' \
+        || echo "D0-PROFILE-WARN: pg_waldump failed (non-fatal)"
+      if [ "$clon" = 1 ]; then
+        echo "-- pg_cluster_state deltas (rw window; zero-delta keys omitted) --"
+        local cnt1
+        cnt1=$(counters_snapshot "$prefix")
+        awk -F= 'NR==FNR {b[$1]=$2; next}
+                 { d=$2-b[$1]; if (d != 0) printf "%s delta=%s\n", $1, d }' \
+            <(printf '%s\n' "$cnt0") <(printf '%s\n' "$cnt1")
+      fi
+      echo "== D0 PROFILE END cell=$lbl =="
+    } > "$prof"
+    cat "$prof" >&2   # stderr: visible in CI step log without corrupting the
+                      # "rw|ro|..." stdout contract of run_cell
+    cat "$prof" >> "$RESULTS/d0-profile-$TS.txt"
+  fi
   for r in $(seq 1 "$REPS"); do
     out=$("$prefix/bin/pgbench" -h /tmp -p "$PORT" -S -c "$CL" -j "$J" -T "$DUR" postgres 2>&1)
     tps=$(printf '%s\n' "$out" | awk '/^tps = /{print $3; exit}')
@@ -118,13 +177,13 @@ run_one_fsync() {
   echo "$PROG: fsync=$fsync synchronous_commit=$fsync  scale=$SCALE dur=${DUR}s reps=$REPS clients=$CL"
   echo "============================================================"
   local nat A B C D Dfp
-  nat=$(run_cell "$DIS" "/tmp/qm_native" 0 -   -   "$fsync")
-  A=$(run_cell  "$EN" "/tmp/qm_A" 1 on  off "$fsync")
-  B=$(run_cell  "$EN" "/tmp/qm_B" 1 off off "$fsync")
-  C=$(run_cell  "$EN" "/tmp/qm_C" 1 off on  "$fsync")
-  D=$(run_cell  "$EN" "/tmp/qm_D" 1 on  on  "$fsync")
+  nat=$(run_cell "$DIS" "/tmp/qm_native" 0 -   -   "$fsync" off native)
+  A=$(run_cell  "$EN" "/tmp/qm_A" 1 on  off "$fsync" off A)
+  B=$(run_cell  "$EN" "/tmp/qm_B" 1 off off "$fsync" off B)
+  C=$(run_cell  "$EN" "/tmp/qm_C" 1 off on  "$fsync" off C)
+  D=$(run_cell  "$EN" "/tmp/qm_D" 1 on  on  "$fsync" off D)
   # spec-3.24 D1: product-optimized + no-peer CR-gate fast path (gate+wb+fastpath on).
-  Dfp=$(run_cell "$EN" "/tmp/qm_Dfp" 1 on on "$fsync" on)
+  Dfp=$(run_cell "$EN" "/tmp/qm_Dfp" 1 on on "$fsync" on Dfp)
   local nrw; nrw=$(echo "$nat" | cut -d'|' -f1)
   local nro; nro=$(echo "$nat" | cut -d'|' -f2)
   echo ""
