@@ -885,6 +885,34 @@ cluster_cr_xmax_scan_unavail_or_no_proof_count(void)
 	return 0;
 }
 
+/* spec-4.1 D7: per-thread WAL routing accessors (cluster_wal_thread.c) are
+ * not linked here; stub the 5 accessors dump_wal_thread reads (L104). */
+uint64
+cluster_wal_thread_page_stamp_count(void)
+{
+	return 0;
+}
+uint16
+cluster_wal_thread_dump_thread_id(void)
+{
+	return 0;
+}
+bool
+cluster_wal_thread_dir_configured(void)
+{
+	return false;
+}
+bool
+cluster_wal_thread_dir_validated(void)
+{
+	return false;
+}
+bool
+cluster_wal_thread_claim_created(void)
+{
+	return false;
+}
+
 /* spec-3.11 D8: durable TT slot counters (cluster_tt_durable_stat.c) are not
  * linked here; stub the 5 accessors dump_undo reads. */
 uint64

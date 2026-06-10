@@ -67,7 +67,7 @@ my $has_visibility_inject =
 	  'postgres',
 	  q{SELECT count(*) FROM pg_cluster_shmem
 	     WHERE name = 'pgrac cluster visibility inject'}) eq '1';
-my $expected_region_count = $has_visibility_inject ? '46' : '45';
+my $expected_region_count = $has_visibility_inject ? '47' : '46';
 
 
 # ----------
@@ -200,14 +200,14 @@ SKIP: {
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '118',
-   'L12a pg_stat_cluster_injections is 114 (+4 spec-3.9 CR injection points) = 118');
+   '120',
+   'L12a pg_stat_cluster_injections is 120 (spec-4.1 +2 wal-thread points)');
 
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-   '93',
-   'L12b pg_stat_cluster_wait_events returns 93 rows after spec-2.39');
+   '95',
+   'L12b pg_stat_cluster_wait_events returns 95 rows (spec-4.1)');
 
 is($node->safe_psql(
 		'postgres',

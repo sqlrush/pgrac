@@ -197,7 +197,7 @@ is($pair->node0->safe_psql('postgres',
 # additions to sinval surface).
 is($pair->node0->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'93',
+	'95',
 	'L9 wait events count updated to 93 (no new TT status wait events)');
 
 

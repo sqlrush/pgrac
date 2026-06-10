@@ -627,6 +627,12 @@ void
 cluster_ges_dedup_shmem_request(void)
 {}
 
+/* spec-4.1 D7 stub: cluster_wal_thread shmem region (L104). */
+void cluster_wal_thread_shmem_register(void);
+void
+cluster_wal_thread_shmem_register(void)
+{}
+
 
 UT_DEFINE_GLOBALS();
 

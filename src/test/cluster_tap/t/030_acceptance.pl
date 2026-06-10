@@ -146,7 +146,7 @@ ok($phase_val =~ /^(init|running|shutdown|reconfig)$/,
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'93', 'E1 pg_stat_cluster_wait_events returns 93 rows (spec-2.39 baseline)');
+	'95', 'E1 pg_stat_cluster_wait_events returns 95 rows (spec-4.1 +2 wal-thread claim I/O)');
 
 ok($node->safe_psql('postgres',
 		q{SELECT count(*) > 0 FROM pg_stat_cluster_wait_events WHERE type='Cluster: GES'})
@@ -158,7 +158,7 @@ ok($node->safe_psql('postgres',
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_gcluster_wait_events'),
-	'93', 'E4 pg_stat_gcluster_wait_events returns 93 rows (single-node, spec-2.39 baseline)');
+	'95', 'E4 pg_stat_gcluster_wait_events returns 95 rows (single-node, spec-4.1 baseline)');
 
 
 # ============================================================
@@ -302,7 +302,7 @@ ok(defined $postgres_bin && -x $postgres_bin,
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-	'118', 'M1 114 injection points (spec-2.38 adds 2 SI Broadcaster injection points) (+4 spec-3.9 CR injection points) = 118');
+	'120', 'M1 120 injection points (spec-4.1 adds 2 wal-thread points; was 118)');
 
 is($node->safe_psql('postgres',
 		q{SELECT string_agg(name, ',' ORDER BY name) FROM pg_stat_cluster_injections WHERE name LIKE 'cluster-init-%'}),
@@ -332,8 +332,8 @@ ok( $node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT key) FROM pg_cluster_state
 		   WHERE category='inject' AND (key LIKE '%.fault_type' OR key LIKE '%.hits')}
-	) eq '236',
-	'M5 inject category has 118×2 = 236 sub-keys (.fault_type + .hits; +4 spec-3.9 CR injection points)');
+	) eq '240',
+	'M5 inject category has 120×2 = 240 sub-keys (.fault_type + .hits; spec-4.1 +2 points)');
 
 is($node->get_cluster_state_value('inject', 'armed_count'),
 	'0', 'M6 inject.armed_count starts at 0 in fresh backend');
@@ -367,8 +367,8 @@ ok($node->safe_psql('postgres',
 
 is($node->safe_psql('postgres',
 		q{SELECT string_agg(DISTINCT category, ',' ORDER BY category) FROM pg_cluster_state}),
-	'block_format,buffer_format,cluster_cssd,cluster_stats,conf,cr,diag,gcs,ges,grd,guc,ic,inject,lck,lmd,lmon,lms,pcm,pgstat,phase,recovery,scn,shared_fs,shmem,sinval,tt_2pc,tt_status,tt_status_hint,undo,undo_cleaner,visibility',
-	'O2 pg_cluster_state has all 31 categories (tt_2pc added in spec-3.15)');
+	'block_format,buffer_format,cluster_cssd,cluster_stats,conf,cr,diag,gcs,ges,grd,guc,ic,inject,lck,lmd,lmon,lms,pcm,pgstat,phase,recovery,scn,shared_fs,shmem,sinval,tt_2pc,tt_status,tt_status_hint,undo,undo_cleaner,visibility,wal_thread',
+	'O2 pg_cluster_state has all 32 categories (wal_thread added in spec-4.1)');
 
 is($node->safe_psql('postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE value IS NULL}),

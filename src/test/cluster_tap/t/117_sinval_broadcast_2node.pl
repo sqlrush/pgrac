@@ -89,12 +89,12 @@ cmp_ok($catver, '>=', 202605450,
 
 
 # ============================================================
-# L3: wait events count remains 88.
+# L3: wait events count baseline.
 # ============================================================
 is($pair->node0->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'93',
-	'L3 wait event count == 93 (spec-2.39 adds 3 ack/barrier events; baseline 88 → 93)');
+	'95',
+	'L3 wait event count == 95 (spec-4.1 adds 2 wal-thread claim I/O events)');
 
 
 # ============================================================

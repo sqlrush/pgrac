@@ -64,14 +64,17 @@ my $has_visibility_inject =
 	  'postgres',
 	  q{SELECT count(*) FROM pg_cluster_shmem
 	     WHERE name = 'pgrac cluster visibility inject'}) eq '1';
-my $expected_region_count = $has_visibility_inject ? '46' : '45';
+my $expected_region_count = $has_visibility_inject ? '47' : '46';
 my $expected_regions =
   'pgrac cluster conf,pgrac cluster control,pgrac cluster cr counters,pgrac cluster cssd,pgrac cluster diag,pgrac cluster durable tt counters,pgrac cluster epoch,pgrac cluster fence,pgrac cluster gcs,pgrac cluster gcs block,pgrac cluster gcs block dedup,pgrac cluster ges,pgrac cluster ges dedup,pgrac cluster ges reply wait,pgrac cluster grd,pgrac cluster grd outbound,pgrac cluster grd pending,pgrac cluster grd work queue,pgrac cluster lck,pgrac cluster lmd,pgrac cluster lmd graph,pgrac cluster lmon,pgrac cluster lms,pgrac cluster lock-path counters,pgrac cluster multixact overlay,pgrac cluster pcm grd,pgrac cluster qvotec,pgrac cluster reconfig,pgrac cluster scn,pgrac cluster sinval ack outbound,pgrac cluster sinval ack wait,pgrac cluster sinval inbound,pgrac cluster sinval outbound,pgrac cluster smgr,pgrac cluster startup phase,pgrac cluster stats,pgrac cluster subtrans state,pgrac cluster tt local seq,pgrac cluster tt slot allocator,pgrac cluster tt status hint outbound,pgrac cluster tt status overlay,pgrac cluster undo cleaner,pgrac cluster undo record cursor';
 $expected_regions .= ',pgrac cluster visibility inject'
   if $has_visibility_inject;
 $expected_regions .= ',pgrac cluster_ic_tier1';
-# spec-3.18 D1: undo buffer pool region;  sorts last (ORDER BY name: 'u' > 'c').
+# spec-3.18 D1: undo buffer pool region;  sorts after the 'pgrac cluster*'
+# block (ORDER BY name: 'u' > 'c').
 $expected_regions .= ',pgrac undo buffer pool';
+# spec-4.1 D7: per-thread WAL routing region;  sorts last ('w' > 'u').
+$expected_regions .= ',pgrac wal thread';
 
 
 # ----------
@@ -217,8 +220,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '118',
-   'L15 total injection registry size is 118 (114 + 4 spec-3.9 CR injection points)');
+   '120',
+   'L15 total injection registry size is 120 (spec-4.1 +2 wal-thread points)');
 
 
 # ----------
@@ -246,8 +249,8 @@ like($stderr,
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	   '93',
-	   'L17 pg_stat_cluster_wait_events returns 93 rows after spec-2.39');
+	   '95',
+	   'L17 pg_stat_cluster_wait_events returns 95 rows (spec-4.1)');
 
 
 # ----------
