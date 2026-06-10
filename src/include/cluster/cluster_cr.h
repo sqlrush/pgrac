@@ -160,8 +160,7 @@ extern bool cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer 
  *   Fail-closed: any uncertainty returns false -> the CR/SCN cluster path runs.
  *   Dependency-free so the full truth table is unit-tested without a backend.
  */
-extern bool cluster_cr_no_peer_fastpath_decide(bool gate_on, bool has_peers,
-											   bool session_local);
+extern bool cluster_cr_no_peer_fastpath_decide(bool gate_on, bool has_peers, bool session_local);
 
 /*
  * cluster_cr_no_peer_fastpath_eligible -- live-state wrapper over the pure

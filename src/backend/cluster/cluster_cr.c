@@ -48,8 +48,8 @@
 #include "cluster/cluster_cr.h"
 #include "cluster/cluster_cr_apply.h"
 #include "cluster/cluster_cr_cache.h"
-#include "cluster/cluster_conf.h"		/* spec-3.24 D1: cluster_conf_has_peers */
-#include "cluster/cluster_guc.h" /* cluster_cr_chain_walk_max_steps, cluster_node_id */
+#include "cluster/cluster_conf.h" /* spec-3.24 D1: cluster_conf_has_peers */
+#include "cluster/cluster_guc.h"  /* cluster_cr_chain_walk_max_steps, cluster_node_id */
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_itl.h" /* spec-3.21: cluster_itl_get_tt_ref (xmax overlay key) */
 #include "cluster/cluster_itl_slot.h"
@@ -1205,8 +1205,7 @@ cluster_cr_no_peer_fastpath_eligible(Snapshot snapshot)
 	 * LOCAL / static snapshot carries cluster_snapshot_session_local as plain
 	 * padding -- guard here too so no other caller can fast-path one.
 	 */
-	if (snapshot == NULL
-		|| snapshot->cluster_source != (uint8) SNAPSHOT_SOURCE_CLUSTER)
+	if (snapshot == NULL || snapshot->cluster_source != (uint8)SNAPSHOT_SOURCE_CLUSTER)
 		return false;
 
 #ifdef ENABLE_INJECTION
