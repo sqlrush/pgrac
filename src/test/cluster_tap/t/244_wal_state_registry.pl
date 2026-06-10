@@ -47,6 +47,7 @@ use lib "$FindBin::RealBin/../lib";
 
 use File::Path qw(make_path);
 use PgracClusterNode;
+use PgracWalState qw(crc32c read_file_raw write_file_raw read_slot_raw patch_byte forge_slot_node_id);
 use PostgreSQL::Test::Utils;
 use Test::More;
 
@@ -56,67 +57,6 @@ sub dumpkey
 	return $node->safe_psql('postgres', qq{
 		SELECT value FROM pg_cluster_state
 		WHERE category='wal_thread' AND key='$key'});
-}
-
-# Raw slot peek: offset 512 + (tid-1)*512, unpack a few fixed fields.
-sub read_slot_raw
-{
-	my ($regfile, $tid) = @_;
-	open my $fh, '<:raw', $regfile or die "open $regfile: $!";
-	sysseek($fh, 512 + ($tid - 1) * 512, 0) or die "seek: $!";
-	sysread($fh, my $buf, 512) == 512 or die "short read";
-	close $fh;
-	my ($magic, $version, $thread_id, $node_id, $state) = unpack('LSSlL', $buf);
-	my ($started_at) = unpack('q', substr($buf, 24, 8));
-	return { magic => $magic, thread_id => $thread_id, node_id => $node_id,
-		state => $state, started_at => $started_at };
-}
-
-# CRC32C (Castagnoli, reflected, poly 0x82F63B78) -- must match PG's
-# pg_crc32c so a crafted slot classifies OK (L11 needs a VALID foreign
-# slot; a torn one would self-heal instead of FATAL).
-sub crc32c
-{
-	my ($data) = @_;
-	my $crc = 0xFFFFFFFF;
-	foreach my $b (unpack('C*', $data))
-	{
-		$crc ^= $b;
-		for (1 .. 8)
-		{
-			$crc = ($crc >> 1) ^ (($crc & 1) ? 0x82F63B78 : 0);
-		}
-	}
-	return $crc ^ 0xFFFFFFFF;
-}
-
-sub read_file_raw
-{
-	my ($path) = @_;
-	open my $fh, '<:raw', $path or die "open $path: $!";
-	local $/;
-	my $data = <$fh>;
-	close $fh;
-	return $data;
-}
-
-sub write_file_raw
-{
-	my ($path, $data) = @_;
-	open my $fh, '+<:raw', $path or die "open $path: $!";
-	syswrite($fh, $data) == length($data) or die "write $path: $!";
-	close $fh;
-}
-
-sub patch_byte
-{
-	my ($path, $off) = @_;
-	open my $fh, '+<:raw', $path or die "open $path: $!";
-	sysseek($fh, $off, 0) or die "seek: $!";
-	sysread($fh, my $old, 1) or die "read: $!";
-	sysseek($fh, $off, 0) or die "seek: $!";
-	syswrite($fh, chr(ord($old) ^ 0xFF), 1) or die "write: $!";
-	close $fh;
 }
 
 my $wroot = PostgreSQL::Test::Utils::tempdir();
@@ -305,15 +245,7 @@ is($node->safe_psql('postgres',
 $node->stop;
 my $full_image = read_file_raw($regfile);
 is(length($full_image), 66048, 'L11 precondition: full registry image saved');
-{
-	# Rewrite slot 4's node_id 3 -> 7 and recompute a VALID crc.
-	my $slot = substr($full_image, 2048, 512);
-	substr($slot, 8, 4) = pack('l', 7);
-	substr($slot, 504, 4) = pack('L', crc32c(substr($slot, 0, 504)));
-	my $patched = $full_image;
-	substr($patched, 2048, 512) = $slot;
-	write_file_raw($regfile, $patched);
-}
+forge_slot_node_id($regfile, 4, 7);    # valid CRC, foreign owner
 is(read_slot_raw($regfile, 4)->{node_id}, 7, 'L11 crafted slot says node 7');
 $log_off = -s $node->logfile;
 is($node->start(fail_ok => 1), 0, 'L11 start refused: own slot owned by another node');

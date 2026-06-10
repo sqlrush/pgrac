@@ -255,6 +255,12 @@ is($standby->safe_psql('postgres',
 	'L9 standby replayed the primary thread-4 stream (RL1)');
 is(dumpkey($standby, 'thread_id'), '10',
 	'L9 standby own identity is independent of replayed stream');
+# spec-4.3 gate: standby mode never generates a recovery plan (the
+# plan pass shares the RL1 plain-local gate).
+is($standby->safe_psql('postgres', q{
+		SELECT value FROM pg_cluster_state
+		WHERE category='recovery' AND key='plan_state'}),
+	'none', 'L9 standby mode produces no recovery plan (spec-4.3 gate)');
 $standby->stop;
 
 # ============================================================
