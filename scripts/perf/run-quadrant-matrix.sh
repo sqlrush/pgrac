@@ -61,7 +61,7 @@ median() {
 
 # run one cell: prefix datadir node-on(0|1) gate wb fsync  -> echoes "rw_med ro_med rw_all ro_all"
 run_cell() {
-  local prefix="$1" dd="$2" clon="$3" gate="$4" wb="$5" fsync="$6"
+  local prefix="$1" dd="$2" clon="$3" gate="$4" wb="$5" fsync="$6" fastpath="${7:-off}"
   local log="$dd.log"
   export PATH="$prefix/bin:$PATH"
   rm -rf "$dd" "$log"
@@ -80,6 +80,7 @@ run_cell() {
     if [ "$clon" = 1 ]; then
       echo "cluster.cr_mvcc_gate = $gate"
       echo "cluster.undo_buffer_writeback = $wb"
+      echo "cluster.cr_gate_no_peer_fastpath = $fastpath"
     fi
   } >> "$dd/postgresql.conf"
   "$prefix/bin/pg_ctl" -D "$dd" -l "$log" -w -t 60 start >/dev/null 2>&1 || die "start failed ($dd; see $log)"
@@ -116,29 +117,32 @@ run_one_fsync() {
   echo "============================================================"
   echo "$PROG: fsync=$fsync synchronous_commit=$fsync  scale=$SCALE dur=${DUR}s reps=$REPS clients=$CL"
   echo "============================================================"
-  local nat A B C D
+  local nat A B C D Dfp
   nat=$(run_cell "$DIS" "/tmp/qm_native" 0 -   -   "$fsync")
   A=$(run_cell  "$EN" "/tmp/qm_A" 1 on  off "$fsync")
   B=$(run_cell  "$EN" "/tmp/qm_B" 1 off off "$fsync")
   C=$(run_cell  "$EN" "/tmp/qm_C" 1 off on  "$fsync")
   D=$(run_cell  "$EN" "/tmp/qm_D" 1 on  on  "$fsync")
+  # spec-3.24 D1: product-optimized + no-peer CR-gate fast path (gate+wb+fastpath on).
+  Dfp=$(run_cell "$EN" "/tmp/qm_Dfp" 1 on on "$fsync" on)
   local nrw; nrw=$(echo "$nat" | cut -d'|' -f1)
   local nro; nro=$(echo "$nat" | cut -d'|' -f2)
   echo ""
-  echo "| cell | gate | wb | rw_tps(med) | rw_tax% | ro_tps(med) | ro_tax% | rw_all |"
-  echo "|---|---|---|---|---|---|---|---|"
-  printf "| native | - | - | %s | 0 | %s | 0 | %s |\n" "$nrw" "$nro" "$(echo "$nat"|cut -d'|' -f3)"
-  for row in "A|on|off|$A" "B|off|off|$B" "C|off|on|$C" "D|on|on|$D"; do
-    local lbl g w cell rw ro rwall
-    lbl=$(echo "$row"|cut -d'|' -f1); g=$(echo "$row"|cut -d'|' -f2); w=$(echo "$row"|cut -d'|' -f3)
-    cell=$(echo "$row"|cut -d'|' -f4-); rw=$(echo "$cell"|cut -d'|' -f1); ro=$(echo "$cell"|cut -d'|' -f2)
+  echo "| cell | gate | wb | fp | rw_tps(med) | rw_tax% | ro_tps(med) | ro_tax% | rw_all |"
+  echo "|---|---|---|---|---|---|---|---|---|"
+  printf "| native | - | - | - | %s | 0 | %s | 0 | %s |\n" "$nrw" "$nro" "$(echo "$nat"|cut -d'|' -f3)"
+  for row in "A|on|off|off|$A" "B|off|off|off|$B" "C|off|on|off|$C" "D|on|on|off|$D" "Dfp|on|on|on|$Dfp"; do
+    local lbl g w fp cell rw ro rwall
+    lbl=$(echo "$row"|cut -d'|' -f1); g=$(echo "$row"|cut -d'|' -f2); w=$(echo "$row"|cut -d'|' -f3); fp=$(echo "$row"|cut -d'|' -f4)
+    cell=$(echo "$row"|cut -d'|' -f5-); rw=$(echo "$cell"|cut -d'|' -f1); ro=$(echo "$cell"|cut -d'|' -f2)
     rwall=$(echo "$cell"|cut -d'|' -f3)
-    printf "| %s | %s | %s | %s | %s | %s | %s | %s |\n" \
-      "$lbl" "$g" "$w" "$rw" "$(tax "$nrw" "$rw")" "$ro" "$(tax "$nro" "$ro")" "$rwall"
+    printf "| %s | %s | %s | %s | %s | %s | %s | %s | %s |\n" \
+      "$lbl" "$g" "$w" "$fp" "$rw" "$(tax "$nrw" "$rw")" "$ro" "$(tax "$nro" "$ro")" "$rwall"
   done
   local arw brw crw drw
   arw=$(echo "$A"|cut -d'|' -f1); brw=$(echo "$B"|cut -d'|' -f1)
   crw=$(echo "$C"|cut -d'|' -f1); drw=$(echo "$D"|cut -d'|' -f1)
+  local dfprw; dfprw=$(echo "$Dfp"|cut -d'|' -f1)
   echo ""
   echo "$PROG: fsync=$fsync DECOMPOSITION (rw):"
   echo "  C (gate-off, wb-on) = 纯结构写路径税 = $(tax "$nrw" "$crw")%  <-- ≤10% 终判看这个"
@@ -146,6 +150,9 @@ run_one_fsync() {
   echo "  CR gate tax (D vs C) = $(tax "$crw" "$drw")% extra slowdown of gate-on at wb-on"
   echo "  writeback benefit (B->C) = native-tax drops $(tax "$nrw" "$brw")% -> $(tax "$nrw" "$crw")% (AD-014)"
   echo "  A (default product) tax = $(tax "$nrw" "$arw")% ; D (product-optimized) tax = $(tax "$nrw" "$drw")%"
+  echo "  -- spec-3.24 D1 (no-peer + session-local CR-gate fast path) --"
+  echo "  Dfp (gate+wb+fastpath on) tax = $(tax "$nrw" "$dfprw")%  <-- D1 product-optimized (D was $(tax "$nrw" "$drw")%; target -> C)"
+  echo "  CR gate residual under fastpath (Dfp vs C) = $(tax "$crw" "$dfprw")%  <-- D1 STOP GATE: should be <= 2%"
 }
 
 echo "$PROG: enable=$EN disable=$DIS  $(uname -srm)  $(git -C "$(dirname "$0")/../.." rev-parse --short HEAD 2>/dev/null || echo ?)"
