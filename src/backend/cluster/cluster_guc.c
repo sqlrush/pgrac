@@ -249,6 +249,18 @@ int cluster_cr_chain_walk_max_steps = 4096;
 bool cluster_cr_mvcc_gate = true;
 
 /*
+ * cluster.cr_gate_no_peer_fastpath (spec-3.24 D1).  DEFAULT OFF (fail-closed).
+ * When on, a no-peer + session-local cluster snapshot skips the CR/SCN cluster
+ * visibility fork entirely and uses the PG-native MVCC body: with no peers the
+ * AD-012 例外 9 "never PG-native" premise (a remote xid absent from the local
+ * ProcArray) is void, so for a session-local snapshot (row #1) the PG-native
+ * verdict equals the SCN/CR verdict.  Imported snapshots (row #2) and any
+ * has-peers topology are excluded.  Stays OFF until the CR-forced vs
+ * no-peer-fastpath differential equivalence proof is green.
+ */
+bool cluster_cr_gate_no_peer_fastpath = false;
+
+/*
  * cluster.tt_durable_lookup (spec-3.11 D7).  When on (default), visibility / CR
  * resolve commit_scn from the durable undo-segment-header TT slot on overlay
  * miss (D5) and resolve the watermark gate by xid (D6).  Off falls back to the
@@ -1561,6 +1573,22 @@ cluster_init_guc(void)
 					 "there too). Set off to fall back to the "
 					 "spec-3.2/3.3 SCN/PG-native visibility path."),
 		&cluster_cr_mvcc_gate, true, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"cluster.cr_gate_no_peer_fastpath",
+		gettext_noop("Skip the CR/SCN cluster visibility fork for a no-peer, "
+					 "session-local snapshot (use the PG-native MVCC body)."),
+		gettext_noop("Spec-3.24 D1. DEFAULT OFF (fail-closed). When on, a "
+					 "cluster-source snapshot that this backend took itself "
+					 "(not an imported / SET TRANSACTION SNAPSHOT / parallel-"
+					 "worker snapshot) and that runs with no cluster peers "
+					 "bypasses the own-instance CR gate and SCN resolver and is "
+					 "judged by the PG-native MVCC path. With no peers there are "
+					 "no cross-node xids, so AD-012 例外 9's 'never PG-native' "
+					 "premise is void and the PG-native verdict equals the "
+					 "SCN/CR verdict. Stays off until the CR-forced vs "
+					 "no-peer-fastpath differential equivalence proof is green."),
+		&cluster_cr_gate_no_peer_fastpath, false, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
 		"cluster.tt_durable_lookup",

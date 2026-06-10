@@ -495,7 +495,9 @@
  * miss and assert 53R97.  Production builds link FEATURE_NOT_SUPPORTED
  * stubs; --enable-injection-points builds wire the shmem implementation. */
 /* spec-3.3 D1 (2026-05-23): SnapshotData explicit 24B cluster tail
- * (SCN read_scn + uint64 read_epoch + uint8 cluster_source + uint8 _pad[7]).
+ * (SCN read_scn + uint64 read_epoch + uint8 cluster_source + uint8 _pad[7];
+ * spec-3.24 D1 repurposed one pad byte -> uint8 cluster_snapshot_session_local
+ * + uint8 _pad[6], same 24B tail, serialized payload unchanged).
  * sizeof(SnapshotData) bump → catalog tooling that reads serialized snapshot
  * payloads (snapbuild.c / pg_export_snapshot / parallel worker carry) must
  * use the new layout.  R4 P1 explicit layout + R9 P2 uint64 epoch (no

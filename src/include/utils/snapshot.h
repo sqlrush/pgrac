@@ -12,7 +12,8 @@
  *
  * PGRAC MODIFICATIONS (spec-3.3 D1):
  *   Added explicit 24-byte cluster tail to SnapshotData: SCN read_scn (8B)
- *   + uint64 read_epoch (8B) + uint8 cluster_source (1B) + uint8 _pad[7]
+ *   + uint64 read_epoch (8B) + uint8 cluster_source (1B)
+ *   + uint8 cluster_snapshot_session_local (1B, spec-3.24 D1) + uint8 _pad[6]
  *   (7B). Explicit layout prevents hidden 4B padding (R4 P1) and avoids
  *   uint32 wrap alias on cluster epoch (R9 P2).
  *
@@ -256,8 +257,9 @@ typedef struct SnapshotData
 	/*
 	 * PGRAC (spec-3.3 D1): explicit 24-byte cluster tail. Field order matters
 	 * for ABI stability: SCN (8B aligned) + uint64 (8B aligned) leaves the
-	 * cluster_source byte at offset +16, with an explicit 7-byte _pad[7] to
-	 * pad out to 24 bytes. NO hidden compiler padding; NO uint32 truncation
+	 * cluster_source byte at offset +16, the spec-3.24 D1
+	 * cluster_snapshot_session_local byte at +17, and an explicit 6-byte _pad[6]
+	 * to pad out to 24 bytes. NO hidden compiler padding; NO uint32 truncation
 	 * on cluster epoch (R9 P2). All fields zero-initialised on LOCAL paths.
 	 *
 	 * read_scn       - cluster_scn_current() snapped at GetSnapshotData()
@@ -266,12 +268,22 @@ typedef struct SnapshotData
 	 * read_epoch     - cluster_epoch_get_current() snapped likewise.
 	 *                  Reconfig bumps epoch; stale snapshots fail-closed.
 	 * cluster_source - SNAPSHOT_SOURCE_LOCAL=0 / CLUSTER=1.
-	 * _pad[7]        - explicit padding, must be zero (asserted by D12).
+	 * cluster_snapshot_session_local - spec-3.24 D1: 1 iff this snapshot was
+	 *                  produced by this backend's GetSnapshotData() path, so the
+	 *                  local ProcArray matched its creation moment (AD-012 例外
+	 *                  9 row #1).  0 for an imported / restored snapshot (SET
+	 *                  TRANSACTION SNAPSHOT, or a parallel worker via
+	 *                  RestoreSnapshot) -- AD-012 row #2, which keeps the SCN/CR
+	 *                  path even with no peers.  Repurposed from a _pad byte (no
+	 *                  ABI size change); NOT serialized -- a restored snapshot is
+	 *                  imported by definition (SetTransactionSnapshot clears it).
+	 * _pad[6]        - explicit padding, must be zero (asserted by D12).
 	 */
 	SCN			read_scn;
 	uint64		read_epoch;
 	uint8		cluster_source;
-	uint8		_pad[7];
+	uint8		cluster_snapshot_session_local;
+	uint8		_pad[6];
 #endif
 } SnapshotData;
 

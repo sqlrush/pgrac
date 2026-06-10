@@ -83,6 +83,7 @@ extern PGDLLIMPORT SnapshotData CatalogSnapshotData;
  */
 #define PGRAC_INIT_SNAPSHOT_LOCAL(snapshotdata) \
 	((snapshotdata).cluster_source = (uint8) SNAPSHOT_SOURCE_LOCAL, \
+	 (snapshotdata).cluster_snapshot_session_local = 0, \
 	 (snapshotdata).read_scn = InvalidScn, \
 	 (snapshotdata).read_epoch = 0, \
 	 memset((snapshotdata)._pad, 0, sizeof((snapshotdata)._pad)))

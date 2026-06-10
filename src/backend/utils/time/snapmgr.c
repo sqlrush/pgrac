@@ -601,6 +601,22 @@ SetTransactionSnapshot(Snapshot sourcesnap, VirtualTransactionId *sourcevxid,
 
 	CurrentSnapshot->snapXactCompletionCount = 0;
 
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC (spec-3.24 D1): copy the SOURCE's cluster fields.  GetSnapshotData()
+	 * above stamped CurrentSnapshot with THIS backend's fresh read_scn / epoch /
+	 * source; the imported snapshot's visibility must instead use the source's
+	 * point, or the SCN/CR path would compare against the wrong read_scn.  The
+	 * imported snapshot is never session-local (the live ProcArray did not match
+	 * its creation moment, AD-012 例外 9 row #2), so it stays off the no-peer
+	 * fast path.
+	 */
+	CurrentSnapshot->cluster_source = sourcesnap->cluster_source;
+	CurrentSnapshot->read_scn = sourcesnap->read_scn;
+	CurrentSnapshot->read_epoch = sourcesnap->read_epoch;
+	CurrentSnapshot->cluster_snapshot_session_local = 0;
+#endif
+
 	/*
 	 * Now we have to fix what GetSnapshotData did with MyProc->xmin and
 	 * TransactionXmin.  There is a race condition: to make sure we are not
@@ -2484,6 +2500,16 @@ RestoreSnapshot(char *start_address)
 	snapshot->cluster_source = serialized_snapshot.cluster_source;
 	snapshot->read_scn = serialized_snapshot.cluster_read_scn;
 	snapshot->read_epoch = serialized_snapshot.cluster_read_epoch;
+	/*
+	 * PGRAC (spec-3.24 D1): a restored snapshot is NOT session-local -- a
+	 * parallel worker observes the leader's snapshot point, not its own
+	 * ProcArray (AD-012 例外 9 row #2).  Parallel scan paths call
+	 * RestoreSnapshot() directly (table / index / bitmap-heap scans), NOT via
+	 * SetTransactionSnapshot(), so this MUST be cleared here -- the struct is
+	 * MemoryContextAlloc'd (not zeroed), so leaving it would let a restored
+	 * snapshot read garbage and wrongly take the no-peer fast path.
+	 */
+	snapshot->cluster_snapshot_session_local = 0;
 	memset(snapshot->_pad, 0, sizeof(snapshot->_pad));
 #endif
 

@@ -428,6 +428,12 @@ extern int cluster_cr_chain_walk_max_steps;
  */
 extern bool cluster_cr_mvcc_gate;
 
+/* cluster.cr_gate_no_peer_fastpath (spec-3.24 D1): a no-peer + session-local
+ * cluster snapshot skips the CR/SCN visibility fork and uses the PG-native MVCC
+ * body (AD-012 例外 9 row #1).  Default OFF (fail-closed) until the CR-forced
+ * vs no-peer-fastpath differential proof is green. */
+extern bool cluster_cr_gate_no_peer_fastpath;
+
 /* cluster.tt_durable_lookup (spec-3.11 D7): durable TT slot read-side resolve
  * on overlay miss / watermark gate (default on; PGC_USERSET). */
 extern bool cluster_tt_durable_lookup;

@@ -146,6 +146,31 @@ extern ClusterVisibilityDecision cluster_visibility_decide_cr_tuple(HeapTuple ht
 extern bool cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer,
 									  bool *out_visible);
 
+/*
+ * cluster_cr_no_peer_fastpath_decide -- spec-3.24 D1 pure verdict.
+ *
+ *   Returns true (=> the caller skips the whole cluster visibility fork and
+ *   uses the PG-native MVCC body) ONLY when ALL hold:
+ *     gate_on       cluster.cr_gate_no_peer_fastpath is on
+ *     !has_peers    no cross-node xids exist, so AD-012 例外 9's "never
+ *                   PG-native" premise (remote xid absent from local ProcArray)
+ *                   is void -> PG-native verdict == SCN/CR verdict
+ *     session_local snapshot taken by this backend's GetSnapshotData (AD-012
+ *                   row #1); an imported/restored snapshot (row #2) is excluded
+ *   Fail-closed: any uncertainty returns false -> the CR/SCN cluster path runs.
+ *   Dependency-free so the full truth table is unit-tested without a backend.
+ */
+extern bool cluster_cr_no_peer_fastpath_decide(bool gate_on, bool has_peers,
+											   bool session_local);
+
+/*
+ * cluster_cr_no_peer_fastpath_eligible -- live-state wrapper over the pure
+ * verdict (reads the GUC, topology, and the snapshot's session-local flag).
+ * Returns false under an active cluster_test_force_visibility_cluster_path
+ * override so a forced-CR test still exercises the cluster path.
+ */
+extern bool cluster_cr_no_peer_fastpath_eligible(Snapshot snapshot);
+
 /* Counter accessors (spec-3.9 §2.5 — 9 counters; spec-3.10 D5 +4 cache = 13). */
 extern uint64 cluster_cr_construct_count(void);
 extern uint64 cluster_cr_snapshot_too_old_count(void);

@@ -2133,7 +2133,7 @@ GetSnapshotDataInitOldSnapshot(Snapshot snapshot)
  * place, which under Read Committed would let a new statement observe the
  * previous statement's cluster snapshot point. Refresh both paths.
  *
- * R4 P1: explicit zero-fill on LOCAL semantics to keep _pad[7] reproducible.
+ * R4 P1: explicit zero-fill on LOCAL semantics to keep _pad[6] reproducible.
  */
 static inline void
 ClusterSnapshotRefreshFields(Snapshot snapshot)
@@ -2157,6 +2157,14 @@ ClusterSnapshotRefreshFields(Snapshot snapshot)
 		snapshot->read_scn = InvalidScn;
 		snapshot->read_epoch = 0;
 	}
+
+	/*
+	 * PGRAC (spec-3.24 D1): every snapshot produced by this path is taken by
+	 * THIS backend's GetSnapshotData (full rebuild or reuse), so the local
+	 * ProcArray matched its creation moment -- it is session-local (AD-012 例外
+	 * 9 row #1).  SetTransactionSnapshot() clears this for an imported snapshot.
+	 */
+	snapshot->cluster_snapshot_session_local = 1;
 	memset(snapshot->_pad, 0, sizeof(snapshot->_pad));
 }
 

@@ -48,6 +48,7 @@
 #include "cluster/cluster_cr.h"
 #include "cluster/cluster_cr_apply.h"
 #include "cluster/cluster_cr_cache.h"
+#include "cluster/cluster_conf.h"		/* spec-3.24 D1: cluster_conf_has_peers */
 #include "cluster/cluster_guc.h" /* cluster_cr_chain_walk_max_steps, cluster_node_id */
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_itl.h" /* spec-3.21: cluster_itl_get_tt_ref (xmax overlay key) */
@@ -1181,6 +1182,43 @@ cluster_visibility_decide_cr_tuple(HeapTuple htup, Snapshot snapshot)
 /* ============================================================
  * MVCC 3-tier short-circuit gate (spec-3.9 Step 5)
  * ============================================================ */
+
+/*
+ * spec-3.24 D1: no-peer + session-local CR-gate fast path.  The pure verdict
+ * (cluster_cr_no_peer_fastpath_decide) is unit-tested as a full truth table;
+ * the eligible() wrapper binds it to live GUC / topology / snapshot state and
+ * yields to a forced-CR test override.  See cluster_cr.h for the soundness
+ * contract (AD-012 例外 9 row #1).
+ */
+bool
+cluster_cr_no_peer_fastpath_decide(bool gate_on, bool has_peers, bool session_local)
+{
+	return gate_on && !has_peers && session_local;
+}
+
+bool
+cluster_cr_no_peer_fastpath_eligible(Snapshot snapshot)
+{
+	/*
+	 * Fail-closed: only a CLUSTER-source snapshot can take this path.  The
+	 * caller (HeapTupleSatisfiesMVCC) already gates on cluster_source, but a
+	 * LOCAL / static snapshot carries cluster_snapshot_session_local as plain
+	 * padding -- guard here too so no other caller can fast-path one.
+	 */
+	if (snapshot == NULL
+		|| snapshot->cluster_source != (uint8) SNAPSHOT_SOURCE_CLUSTER)
+		return false;
+
+#ifdef ENABLE_INJECTION
+	/* A forced-CR test must still exercise the cluster path. */
+	if (cluster_test_force_visibility_cluster_path)
+		return false;
+#endif
+
+	return cluster_cr_no_peer_fastpath_decide(cluster_cr_gate_no_peer_fastpath,
+											  cluster_conf_has_peers(),
+											  snapshot->cluster_snapshot_session_local != 0);
+}
 
 bool
 cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool *out_visible)

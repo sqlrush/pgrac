@@ -12,7 +12,7 @@
  *	    T3   read_scn is SCN (uint64) size
  *	    T4   read_epoch is uint64 (R9 P2: no uint32 wrap alias)
  *	    T5   cluster_source is uint8
- *	    T6   _pad[7] is 7 bytes (R4 P1 explicit padding)
+ *	    T6   _pad[6] is 6 bytes (R4 P1 explicit padding; spec-3.24 D1 took 1B)
  *	    T7   cluster tail total occupies 24 bytes when measured
  *	         offsetof(_pad)+sizeof(_pad) - offsetof(read_scn)
  *	    T8   sizeof(SnapshotData) is a multiple of 8 bytes (R4 P1 no
@@ -30,6 +30,7 @@
  *	    T17  Legacy typedef ClusterTTStatusHintMsg == V1 (32B)
  *	    T18  Snapshot CLUSTER+InvalidScn pair is representable (manual
  *	         construction does not overflow uint8 cluster_source)
+ *	    T19  cluster_snapshot_session_local is uint8 (spec-3.24 D1)
  *
  *	  Standalone executable; no PG backend required.
  *
@@ -101,8 +102,9 @@ UT_TEST(test_t2_snapshot_cluster_tail_members_present)
 	s.read_scn = InvalidScn;
 	s.read_epoch = 0;
 	s.cluster_source = (uint8)SNAPSHOT_SOURCE_LOCAL;
+	s.cluster_snapshot_session_local = 0;
 	s._pad[0] = 0;
-	s._pad[6] = 0;
+	s._pad[5] = 0;
 	UT_ASSERT_EQ((int)s.cluster_source, 0);
 }
 
@@ -122,9 +124,15 @@ UT_TEST(test_t5_cluster_source_is_uint8)
 	UT_ASSERT_EQ((int)sizeof(((SnapshotData *)0)->cluster_source), 1);
 }
 
-UT_TEST(test_t6_pad_is_seven_bytes)
+UT_TEST(test_t6_pad_is_six_bytes)
 {
-	UT_ASSERT_EQ((int)sizeof(((SnapshotData *)0)->_pad), 7);
+	/* spec-3.24 D1 repurposed one _pad byte to cluster_snapshot_session_local. */
+	UT_ASSERT_EQ((int)sizeof(((SnapshotData *)0)->_pad), 6);
+}
+
+UT_TEST(test_t19_session_local_is_uint8)
+{
+	UT_ASSERT_EQ((int)sizeof(((SnapshotData *)0)->cluster_snapshot_session_local), 1);
 }
 
 UT_TEST(test_t7_cluster_tail_spans_24_bytes)
@@ -213,7 +221,8 @@ main(void)
 	UT_RUN(test_t3_read_scn_is_scn);
 	UT_RUN(test_t4_read_epoch_is_uint64);
 	UT_RUN(test_t5_cluster_source_is_uint8);
-	UT_RUN(test_t6_pad_is_seven_bytes);
+	UT_RUN(test_t6_pad_is_six_bytes);
+	UT_RUN(test_t19_session_local_is_uint8);
 	UT_RUN(test_t7_cluster_tail_spans_24_bytes);
 	UT_RUN(test_t8_snapshot_struct_multiple_of_8);
 	UT_RUN(test_t9_local_cluster_distinct);

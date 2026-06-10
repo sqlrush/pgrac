@@ -1375,8 +1375,19 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 	 *      with the snapshot's read_scn instead of unconditional 53R97
 	 *      (spec-3.3 D10 reverses spec-3.2 §Hardening v1.0.1 D1).
 	 */
+	/*
+	 * PGRAC (spec-3.24 D1): a no-peer + session-local cluster snapshot is judged
+	 * by the PG-native MVCC body below (AD-012 例外 9 row #1: local xid + local
+	 * snapshot -> ProcArray-native).  The fast path must skip the WHOLE fork,
+	 * not just the CR gate: skipping only the CR gate would leave the SCN
+	 * resolver to hide a post-read_scn current version without reconstructing
+	 * the older one (spec-3.21 lost-update), whereas the PG-native body finds
+	 * the correct older version via the heap update chain.  Defaults off
+	 * (fail-closed) and yields to a forced-CR test override.
+	 */
 	if (cluster_enabled && BufferIsValid(buffer)
-		&& snapshot->cluster_source == (uint8)SNAPSHOT_SOURCE_CLUSTER) {
+		&& snapshot->cluster_source == (uint8)SNAPSHOT_SOURCE_CLUSTER
+		&& !cluster_cr_no_peer_fastpath_eligible(snapshot)) {
 		TransactionId raw_xmin = HeapTupleHeaderGetRawXmin(tuple);
 		ClusterUndoTTSlotRef ref;
 		bool ref_filled = false;
