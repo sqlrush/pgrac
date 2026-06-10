@@ -64,9 +64,25 @@ ever read back afterwards.
 | `dir_validated` | startup validation passed |
 | `claim_created` | this boot created the claim file (first boot only) |
 | `page_stamp_count` | WAL pages stamped with the real thread id since startup |
+| `registry_ready` | the shared WAL-state registry file is present and valid |
+| `registry_slot_state` | this node's registry slot: `active` / `stopped` / `empty` / `unknown` |
+| `registry_last_updated` | liveness stamp of this node's slot (refreshed periodically) |
+| `registry_highest_lsn` | WAL write position recorded at the last refresh |
+| `registry_highest_scn` | cluster SCN recorded at the last refresh |
 
-Two wait events cover the claim file I/O:
-`ClusterWalThreadClaimRead` and `ClusterWalThreadClaimWrite`.
+When `cluster.wal_threads_dir` is set, the cluster also keeps a small
+registry file `<dir>/pgrac_wal_state` recording, for every node, whether
+its WAL stream is in use (`active`), was shut down cleanly (`stopped`),
+and how far it had written.  A node marks itself `active` only once it
+has finished recovery and is about to serve; a crashed node simply stops
+refreshing its slot.  The file is created automatically on first start
+and never needs manual editing; if it reports as corrupt (SQLSTATE
+`53RA2`), confirm the shared storage is healthy, remove the file, and
+restart — it is rebuilt empty and repopulates as nodes start.
+
+Four wait events cover the shared-storage bookkeeping I/O:
+`ClusterWalThreadClaimRead`/`Write` (claim file) and
+`ClusterWalStateRead`/`Write` (registry).
 
 ## Compatibility notes
 
