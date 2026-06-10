@@ -55,6 +55,10 @@ sub _new_node
 		  . "cluster.node_id = 0\n"
 		  . "cluster.allow_single_node = on\n"
 		  . "cluster.interconnect_tier = stub\n"
+		  # spec-3.24 D1: pin the no-peer CR-gate fast path OFF so this CR-path
+		  # test exercises the CR/SCN path (default is now ON; t/239 covers the
+		  # fast path + the differential equivalence).
+		  . "cluster.cr_gate_no_peer_fastpath = off\n"
 		  . "cluster.cr_mvcc_gate = $gate\n"
 		  . "cluster.undo_buffers = 128\n"
 		  . "autovacuum = off\n");

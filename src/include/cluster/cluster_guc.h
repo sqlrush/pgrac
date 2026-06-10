@@ -430,8 +430,8 @@ extern bool cluster_cr_mvcc_gate;
 
 /* cluster.cr_gate_no_peer_fastpath (spec-3.24 D1): a no-peer + session-local
  * cluster snapshot skips the CR/SCN visibility fork and uses the PG-native MVCC
- * body (AD-012 例外 9 row #1).  Default OFF (fail-closed) until the CR-forced
- * vs no-peer-fastpath differential proof is green. */
+ * body (AD-012 例外 9 row #1).  Default ON (the D1 differential + clean-CI Dfp
+ * stop gate proved equivalence); CR-specific single-node tests pin it off. */
 extern bool cluster_cr_gate_no_peer_fastpath;
 
 /* cluster.tt_durable_lookup (spec-3.11 D7): durable TT slot read-side resolve

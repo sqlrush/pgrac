@@ -249,16 +249,18 @@ int cluster_cr_chain_walk_max_steps = 4096;
 bool cluster_cr_mvcc_gate = true;
 
 /*
- * cluster.cr_gate_no_peer_fastpath (spec-3.24 D1).  DEFAULT OFF (fail-closed).
+ * cluster.cr_gate_no_peer_fastpath (spec-3.24 D1).  DEFAULT ON.
  * When on, a no-peer + session-local cluster snapshot skips the CR/SCN cluster
  * visibility fork entirely and uses the PG-native MVCC body: with no peers the
  * AD-012 例外 9 "never PG-native" premise (a remote xid absent from the local
  * ProcArray) is void, so for a session-local snapshot (row #1) the PG-native
  * verdict equals the SCN/CR verdict.  Imported snapshots (row #2) and any
- * has-peers topology are excluded.  Stays OFF until the CR-forced vs
- * no-peer-fastpath differential equivalence proof is green.
+ * has-peers topology are excluded.  Default flipped ON after the spec-3.24 D1
+ * differential (t/239) AND the clean-CI Dfp stop gate both proved equivalence
+ * (CR gate residual Dfp vs C = 0.2-0.3% << 2%); turn off as a diagnostic escape
+ * hatch.  CR-specific single-node tests pin it off to keep exercising CR.
  */
-bool cluster_cr_gate_no_peer_fastpath = false;
+bool cluster_cr_gate_no_peer_fastpath = true;
 
 /*
  * cluster.tt_durable_lookup (spec-3.11 D7).  When on (default), visibility / CR
@@ -1578,7 +1580,7 @@ cluster_init_guc(void)
 		"cluster.cr_gate_no_peer_fastpath",
 		gettext_noop("Skip the CR/SCN cluster visibility fork for a no-peer, "
 					 "session-local snapshot (use the PG-native MVCC body)."),
-		gettext_noop("Spec-3.24 D1. DEFAULT OFF (fail-closed). When on, a "
+		gettext_noop("Spec-3.24 D1. DEFAULT ON. When on, a "
 					 "cluster-source snapshot that this backend took itself "
 					 "(not an imported / SET TRANSACTION SNAPSHOT / parallel-"
 					 "worker snapshot) and that runs with no cluster peers "
@@ -1586,9 +1588,10 @@ cluster_init_guc(void)
 					 "judged by the PG-native MVCC path. With no peers there are "
 					 "no cross-node xids, so AD-012 例外 9's 'never PG-native' "
 					 "premise is void and the PG-native verdict equals the "
-					 "SCN/CR verdict. Stays off until the CR-forced vs "
-					 "no-peer-fastpath differential equivalence proof is green."),
-		&cluster_cr_gate_no_peer_fastpath, false, PGC_USERSET, 0, NULL, NULL, NULL);
+					 "SCN/CR verdict. Default flipped on after the D1 differential "
+					 "and clean-CI Dfp stop gate proved equivalence; set off as a "
+					 "diagnostic escape hatch."),
+		&cluster_cr_gate_no_peer_fastpath, true, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
 		"cluster.tt_durable_lookup",
