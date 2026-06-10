@@ -1491,8 +1491,9 @@ dbstate_text(uint32 dbstate)
 		return "in_archive_recovery";
 	case DB_IN_PRODUCTION:
 		return "in_production";
+	default:
+		return "unknown";
 	}
-	return "unknown";
 }
 
 /*
@@ -1511,8 +1512,8 @@ verdict_csv(const ClusterRecoveryPlan *plan, ClusterRecoveryThreadVerdict want)
 			appendStringInfo(&buf, "%s%u", buf.len > 0 ? "," : "", (unsigned)tid);
 	}
 	if (buf.len == 0)
-		return "-";
-	return buf.data;
+		appendStringInfoString(&buf, "-");
+	return buf.data; /* tuplestore copies; same lifetime as fmt_* helpers */
 }
 
 /*
