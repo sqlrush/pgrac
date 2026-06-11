@@ -154,7 +154,7 @@ is(plankey($node0, 'plan_n_alive') + plankey($node0, 'plan_n_crashed_candidate')
 	'L6 impossible owner is neither ALIVE nor a candidate (P2)');
 
 # ============================================================
-# L7: recovery category = 17 keys (4 spec-3.16 counters + 13 plan).
+# L7: recovery category = 25 keys (4 spec-3.16 + 13 plan + 8 worker).
 # ============================================================
 is($node0->safe_psql('postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category = 'recovery'}),
