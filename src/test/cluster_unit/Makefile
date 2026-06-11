@@ -46,7 +46,8 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_undo_record test_cluster_undo_lifecycle test_cluster_cr test_cluster_cr_cache test_cluster_tt_durable \
         test_cluster_retention test_cluster_undo_cleaner test_cluster_visibility_variants test_cluster_tt_2pc \
         test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_undo_extent \
-        test_cluster_wal_thread test_cluster_wal_state test_cluster_recovery_plan
+        test_cluster_wal_thread test_cluster_wal_state test_cluster_recovery_plan \
+        test_cluster_recovery_worker
 
 # Path to the cluster_version object (no PG deps, safe to link standalone).
 CLUSTER_VERSION_O = $(top_builddir)/src/backend/cluster/cluster_version.o
@@ -943,6 +944,18 @@ test_cluster_undo_record: test_cluster_undo_record.c unit_test.h \
 # explicit per L229 (layout/StaticAssert snapshots must rebuild when
 # the header moves).
 test_cluster_wal_state: test_cluster_wal_state.c unit_test.h \
+		../../../src/include/cluster/cluster_wal_state.h $(CLUSTER_VERSION_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-4.4 D7: test_cluster_recovery_worker — 15 pure-helper tests
+# (round-robin striping conservation, page-header check incl. the P0
+# recycled-pageaddr kill, target-page math incl. the exact-segment-
+# boundary case).  Header-only inclusion; header deps per L229.
+test_cluster_recovery_worker: test_cluster_recovery_worker.c unit_test.h \
+		../../../src/include/cluster/cluster_recovery_worker.h \
 		../../../src/include/cluster/cluster_wal_state.h $(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \

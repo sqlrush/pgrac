@@ -916,6 +916,15 @@ cluster_recovery_plan_snapshot(ClusterRecoveryPlan *out pg_attribute_unused())
 	return false;
 }
 
+/* spec-4.4 D6 stub: worker pool snapshot (cluster_recovery_worker.c
+ * not linked; dump_recovery's worker keys read '-'). */
+#include "cluster/cluster_recovery_worker.h"
+bool
+cluster_recovery_worker_pool_snapshot(ClusterRecoveryWorkerPool *out pg_attribute_unused())
+{
+	return false;
+}
+
 uint64
 cluster_wal_thread_page_stamp_count(void)
 {
