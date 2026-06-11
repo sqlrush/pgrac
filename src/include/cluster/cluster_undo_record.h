@@ -128,7 +128,17 @@ typedef struct UndoRecordHeader {
 	ForkNumber target_fork;		   /* offset 52 (4B) */
 	BlockNumber target_block;	   /* offset 56 */
 	OffsetNumber target_offset;	   /* offset 60 (2B) */
-	uint16 _pad_target;			   /* offset 62, alignment */
+	uint16 tt_wrap_plus1;		   /* offset 62 (2B); spec-4.5a G4 (F3): the
+									* bound TT slot's reuse generation at
+									* record-write time, stored +1 so the
+									* historical zero in this formerly-
+									* padding byte pair reads as "unknown".
+									* Readers (the G5 per-origin resolver /
+									* remote chain walkers) derive
+									* expected_wrap from it; a durable slot
+									* whose wrap differs was recycled --
+									* possibly to a same-valued xid after a
+									* 32-bit wrap -- and must not match. */
 } UndoRecordHeader;
 
 StaticAssertDecl(sizeof(UndoRecordHeader) == 64, "UndoRecordHeader must be 64B — HC213");

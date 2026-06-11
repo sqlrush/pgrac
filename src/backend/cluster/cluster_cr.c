@@ -1069,6 +1069,7 @@ cluster_cr_resolve_xmax_commit_scn(const char *cr_page, uint8 itl_idx, Transacti
 								   SCN *out_scn)
 {
 	Page page = (Page)cr_page; /* read-only ITL access on the scratch image */
+	uint32 expected_wrap = CLUSTER_TT_WRAP_ANY;
 
 	*out_scn = InvalidScn;
 
@@ -1125,7 +1126,7 @@ cluster_cr_resolve_xmax_commit_scn(const char *cr_page, uint8 itl_idx, Transacti
 	 * provably below horizon, IF the gate's retention proof holds) is no longer
 	 * conflated with a delayed-cleanout / wrap / unreadable miss (all fail closed).
 	 */
-	switch (cluster_tt_slot_durable_resolve_by_xid(cr_xmax, out_scn)) {
+	switch (cluster_tt_slot_durable_resolve_by_xid(cr_xmax, expected_wrap, out_scn)) {
 	case CLUSTER_TT_DURABLE_RESOLVED_SCN:
 		return CLUSTER_CR_XMAX_RESOLVED_SCN; /* *out_scn set by the resolve */
 	case CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH:

@@ -70,6 +70,7 @@
 #include "utils/wait_event.h" /* spec-3.18 D7: ClusterUndoExtentClaim wait event */
 
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_tt_local.h"		/* PGRAC: spec-4.5a G4 peek binding wrap */
 #include "cluster/cluster_recovery_merge.h" /* PGRAC: spec-4.5a is_materialized */
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_shmem.h"
@@ -1148,6 +1149,28 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 	rechdr->origin_node_id = (uint16)cluster_node_id;
 	rechdr->tt_slot_segment_id = tt_slot_segment_id;
 	rechdr->tt_slot_id = cluster_tt_slot_offset_to_id(tt_slot_offset);
+
+	/*
+	 * spec-4.5a G4 (F3): record the bound TT slot's reuse generation
+	 * (+1; 0 stays "unknown" for the memset default and for any path
+	 * without a same-slot binding).  Readers turn it into expected_wrap
+	 * so a durable slot recycled to a same-valued wrapped xid never
+	 * matches.  The peek is the writer's own backend-local binding; the
+	 * segment/offset cross-check keeps a stale or foreign binding from
+	 * stamping the wrong generation.
+	 */
+	{
+		uint32 bind_seg;
+		uint16 bind_off;
+		uint32 bind_tt_id;
+		uint32 bind_epoch;
+		uint16 bind_wrap;
+
+		if (cluster_tt_local_peek_binding(rechdr->xid, &bind_seg, &bind_off, &bind_tt_id,
+										  &bind_epoch, &bind_wrap)
+			&& bind_seg == (uint32)tt_slot_segment_id && bind_off == tt_slot_offset)
+			rechdr->tt_wrap_plus1 = (uint16)(bind_wrap + 1);
+	}
 	rechdr->write_scn = current_scn;
 	rechdr->prev_uba = effective_prev_uba;
 	rechdr->target_locator = target->locator;

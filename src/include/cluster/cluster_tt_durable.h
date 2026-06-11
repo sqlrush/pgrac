@@ -61,16 +61,28 @@ extern ClusterTTRedoDecision cluster_tt_durable_redo_decide(uint8 slot_status,
 															uint16 rec_wrap);
 
 /*
+ * CLUSTER_TT_WRAP_ANY -- "no wrap expectation" sentinel for the durable
+ *	lookup/match/scan APIs (spec-4.5a G4).  uint32-wide so it can never
+ *	collide with a real uint16 slot wrap value.
+ */
+#define CLUSTER_TT_WRAP_ANY 0xFFFFFFFFU
+
+/*
  * cluster_tt_durable_slot_match -- true iff a durable slot with the given
  *	(status, xid, commit_scn) is a valid still-bound COMMITTED match for the
  *	wanted xid (spec-3.11 C5).  Pure; no I/O.
  *
- *	Matches on xid (not wrap): slot reuse stamps a new owner xid, so an xid
- *	mismatch is the recycle detector (the lookup key -- ClusterTTStatusKey --
- *	carries local_xid, not wrap; wrap is the WAL/redo ordering field only).
+ *	spec-4.5a G4 (F3): xid alone cannot detect a slot recycled to a NEW
+ *	generation whose 32-bit xid wrapped to the SAME value -- the match would
+ *	return the new generation's commit_scn for the old tuple.  When the
+ *	caller knows the binding-time generation (expected_wrap, carried by the
+ *	ITL TT ref / undo record header tt_wrap_plus1 fields), a wrap mismatch
+ *	is the recycle detector; CLUSTER_TT_WRAP_ANY preserves the xid-only
+ *	pre-4.5a behaviour for callers with no expectation.
  */
 extern bool cluster_tt_durable_slot_match(uint8 slot_status, TransactionId slot_xid,
-										  SCN slot_commit_scn, TransactionId want_xid);
+										  uint16 slot_wrap, SCN slot_commit_scn,
+										  TransactionId want_xid, uint32 expected_wrap);
 
 /*
  * spec-3.22: durable by-xid RESOLVE result.  Splits the spec-3.21 recycled-slot
@@ -150,7 +162,7 @@ extern void cluster_tt_slot_durable_abort(uint32 segment_id, uint16 slot_offset,
  *	must apply the C1b CLOG cross-check (the slot is stamped at pre-commit).
  */
 extern bool cluster_tt_slot_durable_lookup(uint32 segment_id, uint16 slot_offset, TransactionId xid,
-										   SCN *commit_scn);
+										   uint32 expected_wrap, SCN *commit_scn);
 
 /*
  * cluster_tt_slot_durable_lookup_by_xid -- scan the local node's undo segment
@@ -178,8 +190,8 @@ extern bool cluster_tt_slot_durable_lookup_by_xid(TransactionId xid, SCN *commit
  *	a 0-match as proof-of-below-horizon after a complete scan.  Sets *commit_scn on
  *	RESOLVED_SCN, else InvalidScn.
  */
-extern ClusterTTDurableResolve cluster_tt_slot_durable_resolve_by_xid(TransactionId xid,
-																	  SCN *commit_scn);
+extern ClusterTTDurableResolve
+cluster_tt_slot_durable_resolve_by_xid(TransactionId xid, uint32 expected_wrap, SCN *commit_scn);
 
 
 /*

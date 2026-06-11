@@ -340,7 +340,7 @@ cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key, ClusterTTStatusRes
 
 			if (cluster_tt_slot_durable_lookup(key->undo_segment_id,
 											   cluster_tt_slot_id_to_offset(key->tt_slot_id),
-											   key->local_xid, &durable_scn)
+											   key->local_xid, CLUSTER_TT_WRAP_ANY, &durable_scn)
 				&& TransactionIdDidCommit(key->local_xid)) {
 				result->status = CLUSTER_TT_STATUS_COMMITTED;
 				result->commit_scn = durable_scn;

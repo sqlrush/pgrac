@@ -299,23 +299,39 @@ UT_TEST(test_redo_decide_bad_status)
  * ============================================================ */
 UT_TEST(test_slot_match_exact)
 {
-	UT_ASSERT_EQ((int)cluster_tt_durable_slot_match(TT_SLOT_COMMITTED, 100, scn_encode(1, 42), 100),
+	UT_ASSERT_EQ((int)cluster_tt_durable_slot_match(TT_SLOT_COMMITTED, 100, 5, scn_encode(1, 42),
+													100, CLUSTER_TT_WRAP_ANY),
 				 1);
 }
 UT_TEST(test_slot_match_wrong_xid)
 {
 	/* recycle stamps a new owner xid -> xid mismatch is the recycle detector. */
-	UT_ASSERT_EQ((int)cluster_tt_durable_slot_match(TT_SLOT_COMMITTED, 999, scn_encode(1, 42), 100),
+	UT_ASSERT_EQ((int)cluster_tt_durable_slot_match(TT_SLOT_COMMITTED, 999, 5, scn_encode(1, 42),
+													100, CLUSTER_TT_WRAP_ANY),
 				 0);
 }
 UT_TEST(test_slot_match_unused)
 {
-	UT_ASSERT_EQ((int)cluster_tt_durable_slot_match(TT_SLOT_UNUSED, 100, scn_encode(1, 42), 100),
+	UT_ASSERT_EQ((int)cluster_tt_durable_slot_match(TT_SLOT_UNUSED, 100, 5, scn_encode(1, 42), 100,
+													CLUSTER_TT_WRAP_ANY),
 				 0);
 }
 UT_TEST(test_slot_match_invalid_scn)
 {
-	UT_ASSERT_EQ((int)cluster_tt_durable_slot_match(TT_SLOT_COMMITTED, 100, InvalidScn, 100), 0);
+	UT_ASSERT_EQ((int)cluster_tt_durable_slot_match(TT_SLOT_COMMITTED, 100, 5, InvalidScn, 100,
+													CLUSTER_TT_WRAP_ANY),
+				 0);
+
+	/* spec-4.5a G4 (F3, L9b): wrap-qualified matching.  A known expected
+	 * wrap MATCHES its own generation and EXCLUDES a recycled slot whose
+	 * 32-bit xid wrapped to the same value (same xid, different wrap) --
+	 * the case xid-only matching could not detect. */
+	UT_ASSERT_EQ(
+		(int)cluster_tt_durable_slot_match(TT_SLOT_COMMITTED, 100, 5, scn_encode(1, 42), 100, 5),
+		1);
+	UT_ASSERT_EQ(
+		(int)cluster_tt_durable_slot_match(TT_SLOT_COMMITTED, 100, 6, scn_encode(1, 42), 100, 5),
+		0);
 }
 
 
@@ -333,7 +349,7 @@ UT_TEST(test_lookup_match)
 	g_canned_slot.wrap = 5;
 	g_canned_slot.commit_scn = scn_encode(1, 42);
 
-	UT_ASSERT_EQ((int)cluster_tt_slot_durable_lookup(1, 0, 100, &got), 1);
+	UT_ASSERT_EQ((int)cluster_tt_slot_durable_lookup(1, 0, 100, CLUSTER_TT_WRAP_ANY, &got), 1);
 	UT_ASSERT_EQ((int)(scn_local(got)), 42);
 }
 UT_TEST(test_lookup_wrong_xid_miss)
@@ -346,7 +362,7 @@ UT_TEST(test_lookup_wrong_xid_miss)
 	g_canned_slot.xid = 999; /* slot recycled to a new owner xid */
 	g_canned_slot.commit_scn = scn_encode(1, 42);
 
-	UT_ASSERT_EQ((int)cluster_tt_slot_durable_lookup(1, 0, 100, &got), 0);
+	UT_ASSERT_EQ((int)cluster_tt_slot_durable_lookup(1, 0, 100, CLUSTER_TT_WRAP_ANY, &got), 0);
 }
 UT_TEST(test_lookup_unused_miss)
 {
@@ -355,14 +371,14 @@ UT_TEST(test_lookup_unused_miss)
 	g_read_hdr_ok = true;
 	memset(&g_canned_slot, 0, sizeof(g_canned_slot)); /* status=UNUSED(0) */
 
-	UT_ASSERT_EQ((int)cluster_tt_slot_durable_lookup(1, 0, 100, &got), 0);
+	UT_ASSERT_EQ((int)cluster_tt_slot_durable_lookup(1, 0, 100, CLUSTER_TT_WRAP_ANY, &got), 0);
 }
 UT_TEST(test_lookup_read_fail_miss)
 {
 	SCN got = InvalidScn;
 
 	g_read_hdr_ok = false; /* segment absent / I/O error */
-	UT_ASSERT_EQ((int)cluster_tt_slot_durable_lookup(1, 0, 100, &got), 0);
+	UT_ASSERT_EQ((int)cluster_tt_slot_durable_lookup(1, 0, 100, CLUSTER_TT_WRAP_ANY, &got), 0);
 }
 
 
@@ -454,7 +470,7 @@ UT_TEST(test_resolve_zero_match_recycled)
 	memset(g_canned_block, 0, sizeof(g_canned_block));
 	/* slot recycled to a DIFFERENT owner xid -> 0 matches for the target. */
 	seed_block_slot(5, TT_SLOT_COMMITTED, 999, scn_encode(1, 50));
-	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, &got),
+	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, CLUSTER_TT_WRAP_ANY, &got),
 				 (int)CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH);
 	UT_ASSERT_EQ((int)SCN_VALID(got), 0); /* commit_scn cleared on non-RESOLVED */
 }
@@ -466,7 +482,7 @@ UT_TEST(test_resolve_one_valid_resolved)
 	g_unreadable_existing_segment = 0;
 	memset(g_canned_block, 0, sizeof(g_canned_block));
 	seed_block_slot(3, TT_SLOT_COMMITTED, 12345, scn_encode(1, 77));
-	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, &got),
+	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, CLUSTER_TT_WRAP_ANY, &got),
 				 (int)CLUSTER_TT_DURABLE_RESOLVED_SCN);
 	UT_ASSERT_EQ((int)(scn_local(got)), 77);
 }
@@ -481,7 +497,7 @@ UT_TEST(test_resolve_xid_match_invalid_scn_not_recycled)
 	g_unreadable_existing_segment = 0;
 	memset(g_canned_block, 0, sizeof(g_canned_block));
 	seed_block_slot(7, TT_SLOT_COMMITTED, 12345, InvalidScn);
-	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, &got),
+	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, CLUSTER_TT_WRAP_ANY, &got),
 				 (int)CLUSTER_TT_DURABLE_XID_MATCH_INVALID_SCN);
 	UT_ASSERT_EQ((int)SCN_VALID(got), 0);
 }
@@ -494,7 +510,7 @@ UT_TEST(test_resolve_two_match_ambiguous)
 	memset(g_canned_block, 0, sizeof(g_canned_block));
 	seed_block_slot(3, TT_SLOT_COMMITTED, 12345, scn_encode(1, 77));
 	seed_block_slot(9, TT_SLOT_COMMITTED, 12345, scn_encode(1, 88));
-	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, &got),
+	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, CLUSTER_TT_WRAP_ANY, &got),
 				 (int)CLUSTER_TT_DURABLE_AMBIGUOUS_WRAP);
 }
 UT_TEST(test_resolve_node_degraded_unavailable)
@@ -504,7 +520,7 @@ UT_TEST(test_resolve_node_degraded_unavailable)
 	/* single-node degraded: NO durable scan possible -> SCAN_UNAVAILABLE,
 	 * never a 0-match (which would false-prove "recycled below horizon"). */
 	cluster_node_id = -1;
-	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, &got),
+	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, CLUSTER_TT_WRAP_ANY, &got),
 				 (int)CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE);
 	cluster_node_id = 0; /* restore for later tests */
 }
@@ -518,7 +534,7 @@ UT_TEST(test_resolve_unreadable_existing_segment_unavailable)
 	cluster_node_id = 0;
 	memset(g_canned_block, 0, sizeof(g_canned_block));
 	g_unreadable_existing_segment = 2;
-	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, &got),
+	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, CLUSTER_TT_WRAP_ANY, &got),
 				 (int)CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE);
 	g_unreadable_existing_segment = 0; /* restore */
 }

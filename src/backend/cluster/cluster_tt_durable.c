@@ -100,11 +100,18 @@ cluster_tt_durable_redo_decide(uint8 slot_status, TransactionId slot_xid, uint16
 }
 
 bool
-cluster_tt_durable_slot_match(uint8 slot_status, TransactionId slot_xid, SCN slot_commit_scn,
-							  TransactionId want_xid)
+cluster_tt_durable_slot_match(uint8 slot_status, TransactionId slot_xid, uint16 slot_wrap,
+							  SCN slot_commit_scn, TransactionId want_xid, uint32 expected_wrap)
 {
 	/* spec-3.11 C5: COMMITTED + exact xid + valid commit_scn.  xid mismatch is
-	 * the recycle detector (reuse stamps a new owner xid). */
+	 * the recycle detector (reuse stamps a new owner xid).
+	 *
+	 * spec-4.5a G4 (F3): when the caller carries the binding-time generation,
+	 * a wrap mismatch is ALSO the recycle detector -- it catches the slot
+	 * recycled to a new generation whose 32-bit xid wrapped to the same
+	 * value, which xid alone cannot.  CLUSTER_TT_WRAP_ANY = no expectation. */
+	if (expected_wrap != CLUSTER_TT_WRAP_ANY && slot_wrap != (uint16)expected_wrap)
+		return false;
 	return slot_status == (uint8)TT_SLOT_COMMITTED && slot_xid == want_xid
 		   && SCN_VALID(slot_commit_scn);
 }
@@ -282,7 +289,7 @@ cluster_tt_slot_durable_abort(uint32 segment_id, uint16 slot_offset, Transaction
 
 bool
 cluster_tt_slot_durable_lookup(uint32 segment_id, uint16 slot_offset, TransactionId xid,
-							   SCN *commit_scn)
+							   uint32 expected_wrap, SCN *commit_scn)
 {
 	uint8 owner;
 	uint32 off;
@@ -307,7 +314,8 @@ cluster_tt_slot_durable_lookup(uint32 segment_id, uint16 slot_offset, Transactio
 	 * COMMITTED with a valid commit_scn.  xid mismatch = the slot was recycled
 	 * by a later owner; never return that owner's commit_scn.
 	 */
-	if (!cluster_tt_durable_slot_match(slot.status, slot.xid, slot.commit_scn, xid)) {
+	if (!cluster_tt_durable_slot_match(slot.status, slot.xid, slot.wrap, slot.commit_scn, xid,
+									   expected_wrap)) {
 		cluster_tt_durable_count_lookup(false);
 		return false;
 	}
@@ -319,7 +327,7 @@ cluster_tt_slot_durable_lookup(uint32 segment_id, uint16 slot_offset, Transactio
 
 
 ClusterTTDurableResolve
-cluster_tt_slot_durable_resolve_by_xid(TransactionId xid, SCN *commit_scn)
+cluster_tt_slot_durable_resolve_by_xid(TransactionId xid, uint32 expected_wrap, SCN *commit_scn)
 {
 	int node;
 	uint8 owner;
@@ -385,7 +393,12 @@ cluster_tt_slot_durable_resolve_by_xid(TransactionId xid, SCN *commit_scn)
 		for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
 			const TTSlot *s = &hdr->tt_slots[i];
 
-			if (s->status == (uint8)TT_SLOT_COMMITTED && s->xid == xid) {
+			/* spec-4.5a G4 (F3): a known expected_wrap excludes a slot recycled
+			 * to a same-valued xid of a NEWER generation -- that exclusion turns
+			 * the dangerous false 1-match into a sound 0-match (RECYCLED, the
+			 * retention theorem then applies).  WRAP_ANY = pre-4.5a behaviour. */
+			if (s->status == (uint8)TT_SLOT_COMMITTED && s->xid == xid
+				&& (expected_wrap == CLUSTER_TT_WRAP_ANY || s->wrap == (uint16)expected_wrap)) {
 				xid_matches++;
 				if (SCN_VALID(s->commit_scn)) {
 					match_has_valid_scn = true;
@@ -411,7 +424,7 @@ cluster_tt_slot_durable_lookup_by_xid(TransactionId xid, SCN *commit_scn)
 	 * (true IFF exactly one resolved match; every other enum -> false).  The
 	 * xmax-side gate (spec-3.22) consumes the enum directly via resolve_by_xid.
 	 */
-	return cluster_tt_slot_durable_resolve_by_xid(xid, commit_scn)
+	return cluster_tt_slot_durable_resolve_by_xid(xid, CLUSTER_TT_WRAP_ANY, commit_scn)
 		   == CLUSTER_TT_DURABLE_RESOLVED_SCN;
 }
 
