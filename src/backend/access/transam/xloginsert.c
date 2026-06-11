@@ -512,6 +512,15 @@ XLogInsert(RmgrId rmid, uint8 info)
 			registered_buffer *rb = &registered_buffers[i];
 
 			if (rb->in_use && rb->force_fpi_applied)
+				/*
+				 * PGRAC 4.5a obligation: for XLogSaveBufferForHint rb->page
+				 * is a stack copy, so this clears the bit on the copy, not
+				 * the shared page.  Harmless today (no setter installs the
+				 * bit, spec-4.5 A-closure); when 4.5a adds
+				 * gcs_block_install_block's setter, the hint path must
+				 * clear the bit on the ORIGINAL buffer after a successful
+				 * insert.
+				 */
 				PageClearForceFpi(rb->page);
 		}
 	}

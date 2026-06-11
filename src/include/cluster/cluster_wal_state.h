@@ -135,6 +135,7 @@ typedef struct ClusterWalStateSlot {
 
 StaticAssertDecl(offsetof(ClusterWalStateSlot, checkpoint_redo_lsn) == 56,
 				 "spec-4.5 extension region starts at 56");
+StaticAssertDecl(offsetof(ClusterWalStateSlot, fpw_was_off) == 68, "spec-4.5 fpw_was_off layout");
 StaticAssertDecl(offsetof(ClusterWalStateSlot, merge_recovered_lsn) == 72,
 				 "spec-4.5 merge_recovered_lsn layout");
 

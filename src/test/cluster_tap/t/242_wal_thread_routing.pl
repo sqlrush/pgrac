@@ -132,6 +132,7 @@ my $lsn1 = $node->safe_psql('postgres', 'SELECT pg_current_wal_lsn()');
 
 my $wd = wal_window_dump($node, $lsn0, $lsn1);
 like($wd, qr/thread: 4/, 'L2 records stamped with thread 4');
+like($wd, qr/scn: \d+/, 'L2 waldump prints the spec-4.5 scn field');
 unlike($wd, qr/thread: 0\b/, 'L2 no legacy-stamped records inside the window');
 
 # ============================================================

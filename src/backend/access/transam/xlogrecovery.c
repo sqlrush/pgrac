@@ -448,9 +448,9 @@ static bool recoveryStopAfter;
 /* prototypes for local functions */
 static void ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *replayTLI);
 #ifdef USE_PGRAC_CLUSTER
-static void cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start,
-										   TimeLineID tli, uint16 own_thread,
-										   TimeLineID *replayTLI);
+static XLogRecPtr cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start,
+												 TimeLineID tli, uint16 own_thread,
+												 TimeLineID *replayTLI);
 #endif
 
 static void EnableStandbyMode(void);
@@ -1706,11 +1706,14 @@ PerformWalRecovery(void)
 		 * crash candidates) instead of the single-stream loop below.
 		 */
 		if (cluster_engage == CLUSTER_MERGE_ENGAGE) {
-			cluster_recovery_merged_replay(cluster_merge_bitmap, cluster_merge_start, replayTLI,
-										   cluster_wal_thread_id(), &replayTLI);
+			XLogRecPtr merged_end;
+
+			merged_end
+				= cluster_recovery_merged_replay(cluster_merge_bitmap, cluster_merge_start,
+												 replayTLI, cluster_wal_thread_id(), &replayTLI);
 			RmgrCleanup();
 			ereport(LOG, (errmsg("redo done (merged) at %X/%X system usage: %s",
-								 LSN_FORMAT_ARGS(xlogreader->ReadRecPtr), pg_rusage_show(&ru0))));
+								 LSN_FORMAT_ARGS(merged_end), pg_rusage_show(&ru0))));
 			InRedo = false;
 			goto cluster_merged_redo_done;
 		}
@@ -1882,10 +1885,11 @@ PerformWalRecovery(void)
  *	Per candidate, merge_recovered_lsn is published for its later
  *	self-recovery (§3.3c).
  */
-static void
+static XLogRecPtr
 cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start, TimeLineID tli,
 							   uint16 own_thread, TimeLineID *replayTLI)
 {
+	XLogRecPtr own_end = InvalidXLogRecPtr;
 	ClusterRecoveryMergeState *st;
 	XLogReaderState *r;
 	uint16 thread;
@@ -1941,6 +1945,8 @@ cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start, Ti
 
 		cluster_recovery_merge_set_scn(rec->xl_scn);
 		ApplyWalRecord(r, rec, replayTLI);
+		if (is_own)
+			own_end = r->EndRecPtr;
 
 	advance:
 		if (!is_own && r->EndRecPtr > max_recovered[thread])
@@ -1960,6 +1966,7 @@ cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start, Ti
 	}
 	ereport(LOG, (errmsg("cluster merged recovery: replay complete (own thread %u)",
 						 (unsigned)own_thread)));
+	return own_end;
 }
 #endif
 

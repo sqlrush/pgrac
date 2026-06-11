@@ -245,6 +245,16 @@ cluster_recovery_merge_decide(uint16 own_thread, XLogRecPtr own_redo, uint64 out
 					 "4.5a).")));
 
 	/*
+	 * PGRAC A-closure (spec-4.5, 2026-06-11): the capability FATAL above
+	 * is UNCONDITIONAL in this build, so everything below (the §3.2 gate
+	 * and the CLUSTER_MERGE_ENGAGE return) is skeleton-ship -- unreachable
+	 * until the shared-data backend (roadmap 4.5a) exists and the
+	 * capability guard is lifted.  pg_unreachable() in the ereport macro
+	 * suppresses the dead-code warning.  Kept structurally complete so
+	 * 4.5a re-enables it by deleting one ereport, not by re-deriving it.
+	 */
+
+	/*
 	 * §3.2 hard gate.  Collect every blocking reason, then FATAL 53RA3
 	 * once with the full list -- never silently fall back to single
 	 * stream (that would skip a crashed peer's committed WAL).
