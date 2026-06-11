@@ -288,8 +288,10 @@ XLogBeginRead(XLogReaderState *state, XLogRecPtr RecPtr)
 	ResetDecoder(state);
 
 	/* Begin at the passed-in record pointer. */
-	state->cluster_last_scn = 0; /* PGRAC: reset spec-4.5 monotonic check */
 	state->EndRecPtr = RecPtr;
+#ifdef USE_PGRAC_CLUSTER
+	state->cluster_last_scn = 0;	/* PGRAC spec-4.5 D3: reset monotonic baseline */
+#endif
 	state->NextRecPtr = RecPtr;
 	state->ReadRecPtr = InvalidXLogRecPtr;
 	state->DecodeRecPtr = InvalidXLogRecPtr;
@@ -1229,30 +1231,7 @@ ValidXLogRecordHeader(XLogReaderState *state, XLogRecPtr RecPtr,
 		 * check guards against torn WAL pages where a stale but valid-looking
 		 * WAL record starts on a sector boundary.
 		 */
-	#ifdef USE_PGRAC_CLUSTER
-	/* PGRAC spec-4.5 D3: per-thread xl_scn monotonicity + zero-prefix. */
-	if (record->xl_scn == 0)
-	{
-		if (state->cluster_last_scn != 0)
-		{
-			report_invalid_record(state,
-								  "xl_scn is zero after non-zero at %X/%X",
-								  LSN_FORMAT_ARGS(RecPtr));
-			return false;
-		}
-	}
-	else if (state->cluster_last_scn != 0 && record->xl_scn < state->cluster_last_scn)
-	{
-		report_invalid_record(state,
-							  "xl_scn went backwards at %X/%X (" UINT64_FORMAT " < " UINT64_FORMAT ")",
-							  LSN_FORMAT_ARGS(RecPtr),
-							  record->xl_scn, state->cluster_last_scn);
-		return false;
-	}
-	state->cluster_last_scn = Max(state->cluster_last_scn, record->xl_scn);
-#endif
-
-	if (record->xl_prev != PrevRecPtr)
+		if (record->xl_prev != PrevRecPtr)
 		{
 			report_invalid_record(state,
 								  "record with incorrect prev-link %X/%X at %X/%X",
@@ -1261,6 +1240,43 @@ ValidXLogRecordHeader(XLogReaderState *state, XLogRecPtr RecPtr,
 			return false;
 		}
 	}
+
+#ifdef USE_PGRAC_CLUSTER
+
+	/*
+	 * PGRAC spec-4.5 D3 + A-closure correction (surfaced by the user
+	 * review P1 fix): xl_scn zero-prefix check only.
+	 *
+	 * The original design assumed xl_scn is non-decreasing in LSN order
+	 * within a thread (§2.2/§345 "stamp is atomic with the LSN slot").
+	 * That assumption is FALSE: PG reserves the LSN with one atomic but
+	 * stamps the header under one of NUM_XLOGINSERT_LOCKS (8) separate
+	 * locks, so a later-LSN record can be stamped with a smaller
+	 * cluster_scn_current() than an earlier-LSN record when a concurrent
+	 * commit advances the SCN in between.  A strict backwards check
+	 * therefore FATALs on legal concurrent-insert WAL and breaks normal
+	 * single-stream recovery.  Within a thread the causal order is the
+	 * LSN order (already enforced by xl_prev); xl_scn is the CROSS-thread
+	 * ordering hint (advanced by cluster_scn_observe on GCS handoff).
+	 * The k-way merge (gated off until 4.5a) must therefore order
+	 * within-thread by LSN and across-thread by SCN -- a 4.5a obligation;
+	 * the per-thread strict-monotonic invariant is withdrawn here.
+	 *
+	 * Zero-prefix stays valid: InvalidScn (0) is only legal as a boot/
+	 * pre-cluster prefix, never after a real scn on the same stream.
+	 */
+	if (record->xl_scn == 0)
+	{
+		if (state->cluster_last_scn != 0)
+		{
+			report_invalid_record(state, "xl_scn is zero after non-zero at %X/%X",
+								  LSN_FORMAT_ARGS(RecPtr));
+			return false;
+		}
+	}
+	else
+		state->cluster_last_scn = record->xl_scn;
+#endif
 
 	return true;
 }
