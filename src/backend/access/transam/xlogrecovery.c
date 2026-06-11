@@ -63,6 +63,22 @@
  *	  apply-centralised model) needs the merge-set enumeration input
  *	  for spec-4.4/4.5; in this stage the plan is observational only
  *	  and never blocks or alters recovery (spec-4.3 §3.3).
+ *
+ * PGRAC MODIFICATIONS (spec-4.4 v1.0)
+ *
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *	Spec: spec-4.4-recovery-worker-skeleton.md
+ *
+ *	What changed:
+ *	  - InitWalRecovery(): after the spec-4.3 plan pass and under the
+ *	    same plain-local gate, launch the candidate stream-validation
+ *	    workers (cluster_recovery_workers_launch; registration only,
+ *	    never waits).
+ *
+ *	Why:
+ *	  Observational pre-merge stream evidence for spec-4.5; workers
+ *	  read only OTHER threads' directories and never interact with
+ *	  this node's own-stream replay.
  */
 
 #include "postgres.h"
@@ -81,6 +97,7 @@
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: spec-4.1 own-stream strict thread-id for crash recovery. */
 #include "cluster/cluster_recovery_plan.h"
+#include "cluster/cluster_recovery_worker.h"
 #include "cluster/cluster_wal_thread.h"
 #endif
 #include "access/xlogarchive.h"
@@ -670,8 +687,20 @@ InitWalRecovery(ControlFileData *ControlFile, bool *wasShutdown_ptr,
 	 * only, never blocks startup (spec-4.3 §3.3 fail-open).
 	 */
 	if (!ArchiveRecoveryRequested && !StandbyModeRequested)
+	{
 		cluster_recovery_plan_generate((uint32) ControlFile->state,
 									   ControlFile->state != DB_SHUTDOWNED);
+
+		/*
+		 * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+		 * What changed: spec-4.4 -- launch the candidate stream
+		 * validation workers (dynamic bgworkers) when the plan reports
+		 * crash candidates.  Registration only; never waits, recovery
+		 * is not delayed (spec-4.4 §3.1).
+		 * Why: pre-merge stream readability evidence for spec-4.5.
+		 */
+		cluster_recovery_workers_launch();
+	}
 #endif
 
 	/*

@@ -8,6 +8,24 @@
  *	  src/backend/postmaster/bgworker.c
  *
  *-------------------------------------------------------------------------
+ *
+ * PGRAC MODIFICATIONS (spec-4.4 v1.0)
+ *
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *	Spec: spec-4.4-recovery-worker-skeleton.md
+ *
+ *	What changed:
+ *	  - InternalBGWorkers[]: added cluster_recovery_worker_main, the
+ *	    pgrac recovery stream-validation worker entry point (the first
+ *	    in-core pgrac background worker; dynamic registration happens
+ *	    in cluster_recovery_worker.c).
+ *
+ *	Why:
+ *	  In-core entry points must be resolvable through this table
+ *	  (LookupBackgroundWorkerFunction); same pattern as
+ *	  ParallelApplyWorkerMain.
+ *
+ *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
@@ -22,6 +40,9 @@
 #include "postmaster/postmaster.h"
 #include "replication/logicallauncher.h"
 #include "replication/logicalworker.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_recovery_worker.h" /* PGRAC: worker entry (spec-4.4) */
+#endif
 #include "storage/dsm.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
@@ -131,7 +152,13 @@ static const struct
 	},
 	{
 		"ParallelApplyWorkerMain", ParallelApplyWorkerMain
-	}
+	},
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: recovery stream-validation worker (spec-4.4). */
+	{
+		"cluster_recovery_worker_main", cluster_recovery_worker_main
+	},
+#endif
 };
 
 /* Private functions. */
