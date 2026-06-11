@@ -322,7 +322,20 @@ typedef PageHeaderData *PageHeader;
  * Spec: spec-1.22-undo-tablespace-bootstrap.md §2.1 Q-1 ★ A.
  */
 #define PD_UNDO_SEG_HEADER 0x0010
-#define PD_VALID_FLAG_BITS 0x001F /* OR of all valid pd_flags bits */
+/*
+ * PGRAC (spec-4.5 §3.3d): force a full-page image on the next
+ * WAL-logged modification of this page, regardless of the (possibly
+ * foreign-thread, hence incomparable) page LSN.  Set when a GCS block
+ * ship installs a remote image; cleared ONLY after an FPI with
+ * BKPIMAGE_APPLY was actually emitted AND the insertion returned a
+ * valid EndPos (xloginsert.c).  Persistent: rides the page to shared
+ * disk, so eviction/reload/crash keep the guarantee.  Five-rule
+ * semantics in the spec (round-7): REGBUF_FORCE_IMAGE/NO_IMAGE/
+ * WILL_INIT and !doPageWrites keep their existing priority over this
+ * bit; replay restoring a set bit costs one benign extra FPI.
+ */
+#define PD_CLUSTER_FORCE_FPI 0x0020
+#define PD_VALID_FLAG_BITS 0x003F /* OR of all valid pd_flags bits */
 #else
 #define PD_VALID_FLAG_BITS 0x0007 /* OR of all valid pd_flags bits */
 #endif
@@ -596,6 +609,25 @@ PageClearAllVisible(Page page)
 {
 	((PageHeader)page)->pd_flags &= ~PD_ALL_VISIBLE;
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC spec-4.5 §3.3d: force-FPI bit accessors. */
+static inline bool
+PageHasForceFpi(Page page)
+{
+	return (((PageHeader)page)->pd_flags & PD_CLUSTER_FORCE_FPI) != 0;
+}
+static inline void
+PageSetForceFpi(Page page)
+{
+	((PageHeader)page)->pd_flags |= PD_CLUSTER_FORCE_FPI;
+}
+static inline void
+PageClearForceFpi(Page page)
+{
+	((PageHeader)page)->pd_flags &= ~PD_CLUSTER_FORCE_FPI;
+}
+#endif
 
 /*
  * These two require "access/transam.h", so left as macros.

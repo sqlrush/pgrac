@@ -105,14 +105,38 @@ typedef struct ClusterWalStateSlot {
 	uint32 state;	  /* ClusterWalSlotState; 0 / others invalid */
 	uint32 tli;		  /* writer's insertion TimeLineID at write time */
 	char _pad_20[4];
-	int64 started_at;	 /* this incarnation's startup time */
-	int64 last_updated;	 /* liveness stamp: advanced only on real writes */
-	uint64 highest_lsn;	 /* GetXLogWriteRecPtr() at refresh (observational) */
-	uint64 highest_scn;	 /* cluster_scn_current() at refresh */
-	char _reserved[448]; /* incarnation / coordinator fields headroom */
-	uint32 crc;			 /* crc32c over bytes [0, 504) */
+	int64 started_at;	/* this incarnation's startup time */
+	int64 last_updated; /* liveness stamp: advanced only on real writes */
+	uint64 highest_lsn; /* GetXLogWriteRecPtr() at refresh (observational) */
+	uint64 highest_scn; /* cluster_scn_current() at refresh */
+	/*
+	 * spec-4.5 extension region (offset 56..503).  Owner writes are
+	 * read-modify-PRESERVE (never memset through fill); §3.3d.4.  Zero
+	 * means "unknown" and is fail-closed at the merged-recovery engage
+	 * gate.  CRC range [0,504) is unchanged so old slots validate.
+	 */
+	uint64 checkpoint_redo_lsn; /* 56: this thread's last checkpoint redo
+								 * start; merged-recovery start point (Q5).
+								 * 0 -> 53RA3. Owner: CreateCheckPoint. */
+	uint32 refresh_interval_ms; /* 64: owner's stats refresh cadence
+								 * (closes 4.3 R2). 0 -> plan GUC fallback. */
+	uint32 fpw_was_off;			/* 68: sticky -- set on the authoritative
+								 * full_page_writes on->off path; never auto
+								 * cleared.  Any merge-set thread set -> 53RA3
+								 * (§3.3d.3). */
+	uint64 merge_recovered_lsn; /* 72: recovery authority (§3.3c) -- own-LSN
+								 * skip bound for the candidate's later self
+								 * recovery.  Writer: coordinator; owner
+								 * clears at RUNNING publish. */
+	char _reserved[424];		/* 80: remaining headroom */
+	uint32 crc;					/* crc32c over bytes [0, 504) */
 	char _pad_508[4];
 } ClusterWalStateSlot;
+
+StaticAssertDecl(offsetof(ClusterWalStateSlot, checkpoint_redo_lsn) == 56,
+				 "spec-4.5 extension region starts at 56");
+StaticAssertDecl(offsetof(ClusterWalStateSlot, merge_recovered_lsn) == 72,
+				 "spec-4.5 merge_recovered_lsn layout");
 
 StaticAssertDecl(sizeof(ClusterWalStateSlot) == CLUSTER_WAL_STATE_SLOT_SIZE,
 				 "spec-4.2 slot is one 512B sector-shaped block");
