@@ -60,6 +60,7 @@ OBJS = \
 	cluster_reconfig.o \
 	cluster_recovery_plan.o \
 	cluster_recovery_worker.o \
+	cluster_recovery_merge.o \
 	cluster_guc.o \
 	cluster_ic.o \
 	cluster_ic_chunk.o \

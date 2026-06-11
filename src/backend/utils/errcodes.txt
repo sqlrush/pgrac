@@ -684,6 +684,11 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 # the STOPPED publish fails.  Periodic cluster_stats refreshes are
 # best-effort and never raise this (LOG-once + counter instead).
 53RA2    E    ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE                             cluster_wal_state_io_failure
+# spec-4.5:  merged k-way SCN recovery refused (cold-crash engage gate;
+# plan UNKNOWN, stream not OK, missing checkpoint_redo_lsn, fpw history,
+# or an unclassifiable foreign record).  Fail-closed -- never silently
+# fall back to single-stream recovery (would skip a peer's committed WAL).
+53RA3    E    ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED                          cluster_merged_recovery_blocked
 
 Section: Class 54 - Program Limit Exceeded
 

@@ -143,6 +143,10 @@ extern int cluster_recovery_stale_active_ms;
  */
 extern int cluster_recovery_workers_max;
 
+/* spec-4.5 D9: merged recovery enable (default off) + worker wait. */
+extern bool cluster_merged_recovery;
+extern int cluster_recovery_merge_wait_timeout;
+
 
 /*
  * cluster_injection_points -- comma-separated names to auto-arm at startup.

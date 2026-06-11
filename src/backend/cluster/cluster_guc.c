@@ -67,6 +67,10 @@ int cluster_recovery_stale_active_ms = 10000;
 
 /* spec-4.4 D2: recovery worker cap (0 = plan-only, no workers). */
 int cluster_recovery_workers_max = 4;
+
+/* spec-4.5 D9: merged k-way recovery (default OFF, Q8) + wait timeout. */
+bool cluster_merged_recovery = false;
+int cluster_recovery_merge_wait_timeout = 10000;
 int cluster_shared_storage_backend = CLUSTER_SHARED_FS_BACKEND_STUB;
 bool cluster_smgr_user_relations = false;
 int cluster_shmem_max_regions = 64;
@@ -800,6 +804,30 @@ cluster_init_guc(void)
 		NULL,							  /* check_hook */
 		NULL,							  /* assign_hook */
 		NULL);							  /* show_hook */
+
+	/*
+	 * cluster.merged_recovery -- enable cold-crash k-way SCN merged
+	 * recovery (spec-4.5).  Default OFF (Q8): merged replay only engages
+	 * on a plain local crash when no foreign node is ALIVE and there are
+	 * crash candidates, and even then a 53RA3 hard gate must pass.  OFF
+	 * is today's single-stream behaviour, byte-identical.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.merged_recovery", gettext_noop("Enable cold-crash k-way SCN merged recovery."),
+		gettext_noop("Off keeps single-stream recovery (this node's own thread only)."),
+		&cluster_merged_recovery, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	/*
+	 * cluster.recovery_merge_wait_timeout -- how long the merge
+	 * coordinator waits for the spec-4.4 stream-validation workers
+	 * before falling back to inline re-validation (spec-4.5 Q6).
+	 */
+	DefineCustomIntVariable(
+		"cluster.recovery_merge_wait_timeout",
+		gettext_noop("Time to wait for stream-validation workers before merged recovery."),
+		gettext_noop("After this, the coordinator re-validates candidate streams inline."),
+		&cluster_recovery_merge_wait_timeout, 10000, 0, 600000, PGC_POSTMASTER, GUC_UNIT_MS, NULL,
+		NULL, NULL);
 
 	/*
 	 * cluster.injection_points -- comma-separated list of injection point
