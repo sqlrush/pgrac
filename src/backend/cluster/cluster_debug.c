@@ -1592,6 +1592,10 @@ dump_recovery(ReturnSetInfo *rsinfo)
 					started++;
 					failed++;
 					break;
+				case CLUSTER_RECOVERY_WORKER_SPAWN_FAILED:
+					/* round-2 P2: never existed; failed but not started */
+					failed++;
+					break;
 				default:
 					break;
 				}

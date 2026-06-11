@@ -207,6 +207,13 @@ cluster_recovery_worker_main(Datum main_arg)
 
 	before_shmem_exit(mark_failed_on_exit, Int32GetDatum(slot));
 
+	/* Round-2 P1-2: the bgworker framework starts the entry point with
+	 * signals blocked; unblock before any file I/O so SIGTERM during a
+	 * stuck shared-storage read or a shutdown is delivered promptly
+	 * (the default bgworker_die handler FATALs, which lands in the
+	 * before_shmem_exit FAILED path above). */
+	BackgroundWorkerUnblockSignals();
+
 	now_us = (int64)GetCurrentTimestamp();
 	for (tid = 1; tid <= CLUSTER_WAL_STATE_SLOT_COUNT; tid++) {
 		ClusterWalStateSlot wal_slot;
@@ -317,8 +324,11 @@ cluster_recovery_workers_launch(void)
 		if (!RegisterDynamicBackgroundWorker(&bgw, &handle)) {
 			uint32 expected = CLUSTER_RECOVERY_WORKER_REQUESTED;
 
+			/* Round-2 P2: registration failure means no worker ever
+			 * existed -- distinct terminal state so the dump never
+			 * counts it as started. */
 			pg_atomic_compare_exchange_u32(&pool->slot_state[slot], &expected,
-										   CLUSTER_RECOVERY_WORKER_FAILED);
+										   CLUSTER_RECOVERY_WORKER_SPAWN_FAILED);
 			if (!warned) {
 				warned = true;
 				ereport(WARNING,

@@ -4,7 +4,7 @@
  *	  pgrac spec-4.4 D7 — cluster_unit tests for the recovery-worker
  *	  pure helpers (cluster_recovery_worker.h, header-only inline).
  *
- *	  15 tests covering:
+ *	  17 tests covering:
  *	    T1   striping cap >= N: one candidate per slot (1:1)
  *	    T2   striping cap < N: round-robin, pairwise disjoint, full
  *	         cover (union == candidate set)
@@ -230,6 +230,30 @@ UT_TEST(test_page_check_wrong_thread)
 				 (int)CLUSTER_RECOVERY_STREAM_SUSPECT);
 }
 
+/* Round-2 P1-1: the check must reject what the production reader
+ * rejects -- undefined xlp_info bits and non-reserved cluster flags. */
+UT_TEST(test_page_check_invalid_info_bits)
+{
+	char page[XLOG_BLCKSZ];
+	XLogPageHeaderData *hdr = (XLogPageHeaderData *)page;
+
+	fill_page_header(page, 0x1A2B0000, 7);
+	hdr->xlp_info = 0x0010; /* outside XLP_ALL_FLAGS */
+	UT_ASSERT_EQ((int)cluster_recovery_stream_page_check(page, 0x1A2B0000, 7),
+				 (int)CLUSTER_RECOVERY_STREAM_SUSPECT);
+}
+
+UT_TEST(test_page_check_invalid_cluster_flags)
+{
+	char page[XLOG_BLCKSZ];
+	XLogPageHeaderData *hdr = (XLogPageHeaderData *)page;
+
+	fill_page_header(page, 0x1A2B0000, 7);
+	hdr->xlp_cluster_flags = 1; /* reserved must be 0 */
+	UT_ASSERT_EQ((int)cluster_recovery_stream_page_check(page, 0x1A2B0000, 7),
+				 (int)CLUSTER_RECOVERY_STREAM_SUSPECT);
+}
+
 UT_TEST(test_page_check_legacy_stamp_ok)
 {
 	char page[XLOG_BLCKSZ];
@@ -246,6 +270,7 @@ UT_TEST(test_enum_value_locks)
 	UT_ASSERT_EQ((int)CLUSTER_RECOVERY_WORKER_RUNNING, 2);
 	UT_ASSERT_EQ((int)CLUSTER_RECOVERY_WORKER_DONE, 3);
 	UT_ASSERT_EQ((int)CLUSTER_RECOVERY_WORKER_FAILED, 4);
+	UT_ASSERT_EQ((int)CLUSTER_RECOVERY_WORKER_SPAWN_FAILED, 5);
 	UT_ASSERT_EQ((int)CLUSTER_RECOVERY_STREAM_NONE, 0);
 	UT_ASSERT_EQ((int)CLUSTER_RECOVERY_STREAM_OK, 1);
 	UT_ASSERT_EQ((int)CLUSTER_RECOVERY_STREAM_SUSPECT, 2);
@@ -300,7 +325,7 @@ UT_TEST(test_target_pageaddr_contains_target)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(15);
+	UT_PLAN(17);
 
 	UT_RUN(test_striping_cap_ge_n);
 	UT_RUN(test_striping_cap_lt_n_roundrobin);
@@ -312,6 +337,8 @@ main(int argc, char **argv)
 	UT_RUN(test_page_check_bad_magic);
 	UT_RUN(test_page_check_recycled_pageaddr);
 	UT_RUN(test_page_check_wrong_thread);
+	UT_RUN(test_page_check_invalid_info_bits);
+	UT_RUN(test_page_check_invalid_cluster_flags);
 	UT_RUN(test_page_check_legacy_stamp_ok);
 	UT_RUN(test_enum_value_locks);
 	UT_RUN(test_target_page_math);

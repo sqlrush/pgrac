@@ -48,15 +48,19 @@
 
 #include "access/xlog_internal.h"
 #include "cluster/cluster_wal_state.h"
+#include "cluster/cluster_xlog.h"
 #include "port/atomics.h"
 
 /* Worker slot lifecycle (§2.1; on-shmem as pg_atomic_uint32 values). */
 typedef enum ClusterRecoveryWorkerState {
 	CLUSTER_RECOVERY_WORKER_UNUSED = 0,
-	CLUSTER_RECOVERY_WORKER_REQUESTED, /* coordinator registered the bgworker */
-	CLUSTER_RECOVERY_WORKER_RUNNING,   /* worker attached, validating         */
-	CLUSTER_RECOVERY_WORKER_DONE,	   /* all assigned verdicts written       */
-	CLUSTER_RECOVERY_WORKER_FAILED,	   /* spawn failed / worker error exit    */
+	CLUSTER_RECOVERY_WORKER_REQUESTED,	  /* coordinator registered the bgworker */
+	CLUSTER_RECOVERY_WORKER_RUNNING,	  /* worker attached, validating         */
+	CLUSTER_RECOVERY_WORKER_DONE,		  /* all assigned verdicts written       */
+	CLUSTER_RECOVERY_WORKER_FAILED,		  /* worker error exit after RUNNING     */
+	CLUSTER_RECOVERY_WORKER_SPAWN_FAILED, /* registration failed: no worker
+										   * ever existed (round-2 P2: must not
+										   * count as started)                 */
 } ClusterRecoveryWorkerState;
 
 /* Per-thread stream validation verdict. */
@@ -124,10 +128,15 @@ cluster_recovery_worker_assign(const uint64 candidate_bitmap[2], uint16 n_candid
  *	offset (the caller derives it from the registry highest_lsn -- the
  *	preallocated/recycled tail must never reach here, spec-4.4 P0).
  *
- *	OK requires: xlp_magic valid; xlp_pageaddr equals the page's own
- *	address (kills recycled-segment stale content, which carries the
- *	OLD segment's pageaddr); xlp_thread_id is the expected thread or
- *	the LEGACY 0 stamp (mixed segments are legal, spec-4.1).
+ *	OK requires exactly what the production WAL reader requires of a
+ *	page header (round-2 P1-1: stream_ok feeds spec-4.5 as pre-merge
+ *	evidence and must never accept a page replay would reject):
+ *	xlp_magic; no undefined xlp_info bits (~XLP_ALL_FLAGS, mirroring
+ *	XLogReaderValidatePageHeader); xlp_pageaddr equals the page's own
+ *	address (kills recycled-segment stale content); and the spec-4.1
+ *	cluster-field predicate cluster_xlog_validate_page_header
+ *	(cluster_flags reserved-0, thread range, LEGACY-0 legal, real id
+ *	must equal the expected thread).
  */
 static inline ClusterRecoveryStreamVerdict
 cluster_recovery_stream_page_check(const char *page, uint64 expected_pageaddr,
@@ -137,9 +146,12 @@ cluster_recovery_stream_page_check(const char *page, uint64 expected_pageaddr,
 
 	if (hdr->xlp_magic != XLOG_PAGE_MAGIC)
 		return CLUSTER_RECOVERY_STREAM_SUSPECT;
+	if ((hdr->xlp_info & ~XLP_ALL_FLAGS) != 0)
+		return CLUSTER_RECOVERY_STREAM_SUSPECT;
 	if (hdr->xlp_pageaddr != (XLogRecPtr)expected_pageaddr)
 		return CLUSTER_RECOVERY_STREAM_SUSPECT;
-	if (hdr->xlp_thread_id != expected_thread && hdr->xlp_thread_id != XLP_THREAD_ID_LEGACY)
+	if (!cluster_xlog_validate_page_header(hdr->xlp_thread_id, hdr->xlp_cluster_flags,
+										   expected_thread))
 		return CLUSTER_RECOVERY_STREAM_SUSPECT;
 	return CLUSTER_RECOVERY_STREAM_OK;
 }
