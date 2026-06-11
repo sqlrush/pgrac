@@ -107,6 +107,13 @@ claim file and the last written WAL page located from the registry
 watermark — and report per-thread results under the same category
 (`stream_ok_threads`, `stream_suspect_or_unreadable_threads`).  The
 workers never delay startup and never read a live node's stream.
+When `cluster.merged_recovery` is on and a crash candidate is found,
+the node currently refuses to start with a clear error: cross-node
+merged recovery needs a shared data-file storage backend, which this
+release does not provide (the cluster filesystem is per-node).
+Recover such a node with `cluster.merged_recovery = off` (its own WAL
+stream); merged recovery across nodes is a later milestone.
+
 This release only reports the classification — cross-thread
 merged recovery is not performed.  An `unknown` thread is never treated
 as crashed; if unknowns persist, check the shared WAL storage.  If

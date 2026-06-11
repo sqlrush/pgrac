@@ -116,6 +116,7 @@ struct ClusterRecoveryMergeState {
  * foreign streams are not this node's running WAL).
  */
 static void
+/* cppcheck-suppress constParameterCallback */
 merge_segment_open(XLogReaderState *state, XLogSegNo nextSegNo, TimeLineID *tli_p)
 {
 	MergeStream *ms = (MergeStream *)state->private_data;
@@ -178,7 +179,7 @@ stream_advance(ClusterRecoveryMergeState *st, int idx)
 {
 	MergeStream *ms = &st->streams[idx];
 	char *errm = NULL;
-	XLogRecord *rec;
+	const XLogRecord *rec;
 
 	if (ms->exhausted)
 		return;
