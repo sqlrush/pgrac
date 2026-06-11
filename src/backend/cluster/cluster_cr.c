@@ -51,7 +51,8 @@
 #include "cluster/cluster_conf.h" /* spec-3.24 D1: cluster_conf_has_peers */
 #include "cluster/cluster_guc.h"  /* cluster_cr_chain_walk_max_steps, cluster_node_id */
 #include "cluster/cluster_inject.h"
-#include "cluster/cluster_itl.h" /* spec-3.21: cluster_itl_get_tt_ref (xmax overlay key) */
+#include "cluster/cluster_itl.h"
+#include "cluster/cluster_recovery_merge.h" /* PGRAC: spec-4.5a is_materialized */ /* spec-3.21: cluster_itl_get_tt_ref (xmax overlay key) */
 #include "cluster/cluster_itl_slot.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_tt_durable.h"			/* spec-3.11 D6: watermark by-xid resolve */
@@ -343,14 +344,18 @@ cr_walk_chain(char *scratch_page, UBA start_uba, SCN read_scn,
 
 		hdr = (UndoRecordHeader *)record_buf.data;
 
-		/* Own-instance CR only (spec-3.9 I-cr-5). */
-		if (hdr->origin_node_id != (uint16)cluster_node_id)
+		/* Own-instance, or a merged-materialized remote instance whose undo
+		 * lives in the local pg_undo/instance_<origin> tree (spec-4.5a D8).
+		 * Anything else stays the spec-3.9 fail-closed. */
+		if (hdr->origin_node_id != (uint16)cluster_node_id
+			&& !cluster_merged_instance_is_materialized((int)hdr->origin_node_id))
 			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CR_CROSS_INSTANCE_UNSUPPORTED),
 							errmsg("cluster CR cross-instance UBA encountered "
 								   "(origin_node_id=%u, local=%d)",
 								   hdr->origin_node_id, cluster_node_id),
-							errhint("spec-3.9 supports own-instance CR only; cross-instance CR "
-									"is Stage 4 (Cache Fusion CR coordinator).")));
+							errhint("Own-instance CR only unless the origin was materialized by "
+									"merged recovery; runtime cross-instance CR is Stage 4 "
+									"(Cache Fusion CR coordinator).")));
 
 		/* I-chain-1: normal SCN stop. */
 		if (scn_time_cmp(hdr->write_scn, read_scn) <= 0)
@@ -1232,7 +1237,7 @@ cluster_cr_no_peer_fastpath_eligible(Snapshot snapshot)
 											  snapshot->cluster_snapshot_session_local != 0);
 }
 
-bool
+ClusterCrVerdict
 cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool *out_visible)
 {
 	HeapTupleHeader tup = htup->t_data;
@@ -1243,6 +1248,7 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 	const char *cr_page;
 	HeapTupleData cr_htup;
 	ClusterVisibilityDecision decision;
+	bool remote_materialized = false;
 
 	/*
 	 * Master switch (default on after spec-3.9 Hardening v1.0.1).  Turning it
@@ -1251,43 +1257,53 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 	 * read_scn.
 	 */
 	if (!cluster_cr_mvcc_gate)
-		return false;
+		return CLUSTER_CR_NOT_APPLICABLE;
 
 	if (!cluster_enabled || !BufferIsValid(buffer)
 		|| snapshot->cluster_source != (uint8)SNAPSHOT_SOURCE_CLUSTER)
-		return false;
+		return CLUSTER_CR_NOT_APPLICABLE;
 
 	page = BufferGetPage(buffer);
 	if (!PageHasItl(page))
-		return false;
+		return CLUSTER_CR_NOT_APPLICABLE;
 
 	itl_idx = tup->t_itl_slot_idx;
 	if (itl_idx == CLUSTER_ITL_SLOT_UNALLOCATED || itl_idx >= CLUSTER_ITL_INITRANS_DEFAULT)
-		return false;
+		return CLUSTER_CR_NOT_APPLICABLE;
 
 	phdr = (PageHeader)page;
 
 	/* Tier 1 (page gate): block already at/before snapshot -> not our case;
 	 * the existing visibility path / PG-native body handles it. */
 	if (!SCN_VALID(phdr->pd_block_scn) || !SCN_VALID(snapshot->read_scn))
-		return false;
+		return CLUSTER_CR_NOT_APPLICABLE;
 	if (scn_time_cmp(phdr->pd_block_scn, snapshot->read_scn) <= 0)
-		return false;
+		return CLUSTER_CR_NOT_APPLICABLE;
 
 	slot = &ClusterPageGetItlSlots(page)[itl_idx];
 
 	/* Tier 2 (ITL gate): this tuple's own change is already in the snapshot. */
 	if (!SCN_VALID(slot->write_scn))
-		return false;
+		return CLUSTER_CR_NOT_APPLICABLE;
 	if (scn_time_cmp(slot->write_scn, snapshot->read_scn) <= 0)
-		return false;
+		return CLUSTER_CR_NOT_APPLICABLE;
 
-	/* Tier 3 (own-instance only): remote tuples are resolved by the existing
-	 * spec-3.2/3.3 remote-xid block; cross-instance CR is Stage 4. */
+	/* Tier 3 (spec-4.5a D8): own-instance, OR a remote instance whose undo
+	 * this node MATERIALIZED during merged recovery (persistent
+	 * merge_recovered_lsn authority).  A non-materialized remote origin
+	 * keeps today's fall-through to the spec-3.2/3.3 remote-xid block;
+	 * runtime warm cross-instance CR stays 4.6/4.7. */
 	if (UBA_is_invalid(slot->undo_segment_head))
-		return false;
-	if ((int32)uba_origin_node_id(slot->undo_segment_head) != cluster_node_id)
-		return false;
+		return CLUSTER_CR_NOT_APPLICABLE;
+	{
+		int32 tuple_origin = (int32)uba_origin_node_id(slot->undo_segment_head);
+
+		if (tuple_origin != cluster_node_id) {
+			if (!cluster_merged_instance_is_materialized((int)tuple_origin))
+				return CLUSTER_CR_NOT_APPLICABLE;
+			remote_materialized = true;
+		}
+	}
 
 	/*
 	 * spec-3.19 D3: live-tuple xmin guard (fail-closed toward invisible).
@@ -1320,10 +1336,21 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 	{
 		TransactionId live_xmin = HeapTupleHeaderGetRawXmin(tup);
 
+		/*
+		 * spec-4.5a D8: for a materialized-remote tuple the live xmin is the
+		 * PEER's xid; TransactionIdIsInProgress / TransactionIdDidCommit
+		 * would consult the LOCAL ProcArray / CLOG by raw xid -- a
+		 * cross-instance alias (AD-012 例外 9).  Until the per-origin
+		 * commit-outcome authority (spec-4.5a G5 / D10) is wired, this
+		 * commit-state question is unanswerable here: fail closed.
+		 */
+		if (remote_materialized)
+			return CLUSTER_CR_FAILCLOSED;
+
 		if (TransactionIdIsNormal(live_xmin) && !TransactionIdIsCurrentTransactionId(live_xmin)
 			&& (TransactionIdIsInProgress(live_xmin) || !TransactionIdDidCommit(live_xmin))) {
 			*out_visible = false;
-			return true;
+			return CLUSTER_CR_DECIDED;
 		}
 	}
 
@@ -1341,7 +1368,7 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 		/* CR-removed (inverse-INSERT made it LP_UNUSED): the row did not
 		 * exist at read_scn -> invisible. */
 		*out_visible = false;
-		return true;
+		return CLUSTER_CR_DECIDED;
 	}
 
 	/*
@@ -1385,7 +1412,7 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 
 		if (TransactionIdIsValid(cr_xmin) && cr_xmin == slot->xid) {
 			*out_visible = false;
-			return true;
+			return CLUSTER_CR_DECIDED;
 		}
 	}
 
@@ -1393,7 +1420,7 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 	if (decision == CLUSTER_VISIBILITY_VISIBLE) {
 		/* xmax invalid -> the row was never deleted -> visible. */
 		*out_visible = true;
-		return true;
+		return CLUSTER_CR_DECIDED;
 	}
 
 	/*
@@ -1423,7 +1450,7 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 		 */
 		if (HEAP_XMAX_IS_LOCKED_ONLY(cr_infomask)) {
 			*out_visible = true;
-			return true;
+			return CLUSTER_CR_DECIDED;
 		}
 
 		/* MultiXact: decode the UPDATE member; a lockers-only multi has no
@@ -1436,8 +1463,18 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 		if (!TransactionIdIsValid(cr_xmax) || TransactionIdIsCurrentTransactionId(cr_xmax)) {
 			/* lockers-only multi, or our own delete (native handles self). */
 			*out_visible = true;
-			return true;
+			return CLUSTER_CR_DECIDED;
 		}
+
+		/*
+		 * spec-4.5a D8: the deleter's commit-state below is judged by the
+		 * LOCAL ProcArray / CLOG / durable-TT by raw xid -- all of which
+		 * alias across instances for a materialized-remote chain.  Fail
+		 * closed until the per-origin outcome authority (G5 / D10) and the
+		 * wrap-qualified remote TT lookup (G4 / D9) are wired.
+		 */
+		if (remote_materialized)
+			return CLUSTER_CR_FAILCLOSED;
 
 		/* Own-instance authoritative classification of the deleting xact. */
 		if (TransactionIdIsInProgress(cr_xmax))
@@ -1460,7 +1497,7 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 			 */
 			if (slot->xid == cr_xmax) {
 				*out_visible = true;
-				return true;
+				return CLUSTER_CR_DECIDED;
 			}
 
 			/*
@@ -1485,7 +1522,7 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 				if (cluster_cr_retention_proof_valid(snapshot->read_scn)) {
 					cluster_cr_count_xmax_recycled_invisible();
 					*out_visible = false; /* deleter proven below horizon -> invisible */
-					return true;
+					return CLUSTER_CR_DECIDED;
 				}
 				cluster_cr_count_xmax_scan_unavail_or_no_proof();
 				ereport(
@@ -1520,10 +1557,10 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 		switch (cluster_vis_cr_xmax_verdict(xmax_status, scn_decision)) {
 		case CVV_VISIBLE:
 			*out_visible = true;
-			return true;
+			return CLUSTER_CR_DECIDED;
 		case CVV_INVISIBLE:
 			*out_visible = false;
-			return true;
+			return CLUSTER_CR_DECIDED;
 		case CVV_FAILCLOSED_UNKNOWN:
 		default:
 			/*

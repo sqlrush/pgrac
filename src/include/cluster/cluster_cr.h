@@ -129,22 +129,48 @@ extern ClusterVisibilityDecision cluster_visibility_decide_cr_tuple(HeapTuple ht
 																	Snapshot snapshot);
 
 /*
+ * ClusterCrVerdict -- spec-4.5a D8 (P0-2): the CR gate's tri-state result.
+ *
+ *   bool could not distinguish "the gate did not fire" from "the gate fired
+ *   but a REMOTE-origin chain is unresolvable": both were false, and the
+ *   caller silently fell through to the remote-xid / PG-native paths --
+ *   which resolve by a different (exact-identity / local-ProcArray) model
+ *   and may return a wrong answer for a materialized-remote tuple.  The
+ *   FAILCLOSED arm makes that case an explicit caller-side ereport.
+ *
+ *   NOT_APPLICABLE is 0 so a zeroed default stays the safe fall-through.
+ */
+typedef enum ClusterCrVerdict {
+	CLUSTER_CR_NOT_APPLICABLE = 0, /* gate did not fire: caller continues to
+									* the remote-xid path / PG-native body
+									* (pre-4.5a `false`) */
+	CLUSTER_CR_DECIDED,			   /* *out_visible is authoritative: caller
+									* returns it (pre-4.5a `true`) */
+	CLUSTER_CR_FAILCLOSED,		   /* a materialized-remote chain could not be
+									* resolved: caller MUST ereport (53R9G) --
+									* NEVER fall through (规则 8.A) */
+} ClusterCrVerdict;
+
+/*
  * cluster_cr_satisfies_mvcc -- spec-3.9 Step 5 MVCC 3-tier short-circuit gate.
  *
  *   Called additively at the top of HeapTupleSatisfiesMVCC's cluster path.
- *   Returns true and sets *out_visible when the own-instance historical-CR
- *   case applies (block_scn is newer than read_scn AND the tuple's ITL
- *   write_scn is newer than read_scn AND the tuple is local-origin); the caller then returns
- *   *out_visible.  Returns false (gate did not fire) for every other case —
- *   the caller continues to the existing spec-3.2/3.3 remote-xid path /
- *   PG-native body unchanged.
+ *   DECIDED + *out_visible when the historical-CR case applies (block_scn
+ *   newer than read_scn AND the tuple's ITL write_scn newer than read_scn
+ *   AND the tuple's origin is this instance OR a merged-materialized remote
+ *   instance -- spec-4.5a D8).  NOT_APPLICABLE for every other case — the
+ *   caller continues to the existing spec-3.2/3.3 remote-xid path /
+ *   PG-native body unchanged.  FAILCLOSED when a materialized-remote
+ *   tuple's chain needs a commit-state the local node cannot lawfully
+ *   answer yet (raw-xid CLOG/ProcArray would cross-instance alias --
+ *   AD-012 例外 9); the caller ereports 53R9G.
  *
  *   The three short-circuit tiers (page gate / ITL gate) avoid constructing
  *   a CR image on the common fast path; only a genuinely post-snapshot
- *   local tuple reaches cluster_cr_lookup_or_construct.
+ *   tuple reaches cluster_cr_lookup_or_construct.
  */
-extern bool cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer,
-									  bool *out_visible);
+extern ClusterCrVerdict cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer,
+												  bool *out_visible);
 
 /*
  * cluster_cr_no_peer_fastpath_decide -- spec-3.24 D1 pure verdict.

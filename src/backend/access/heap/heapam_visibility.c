@@ -1417,8 +1417,33 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 				cr_eligible = false;
 #endif
 
-			if (cr_eligible && cluster_cr_satisfies_mvcc(htup, snapshot, buffer, &cr_visible))
-				return cr_visible;
+			if (cr_eligible)
+			{
+				/*
+				 * PGRAC: spec-4.5a D8 (P0-2) -- the CR gate is tri-state.
+				 * FAILCLOSED means a materialized-remote chain could not be
+				 * lawfully resolved (raw-xid CLOG/ProcArray would alias
+				 * across instances); falling through to the remote-xid /
+				 * native paths would answer from the wrong model, so error
+				 * out instead (规则 8.A).
+				 */
+				switch (cluster_cr_satisfies_mvcc(htup, snapshot, buffer, &cr_visible))
+				{
+					case CLUSTER_CR_DECIDED:
+						return cr_visible;
+					case CLUSTER_CR_FAILCLOSED:
+						ereport(ERROR,
+								(errcode(ERRCODE_CLUSTER_CR_CROSS_INSTANCE_UNSUPPORTED),
+								 errmsg("cluster CR cannot resolve a materialized remote-origin tuple"),
+								 errhint("The peer's undo was materialized by merged recovery, but "
+										 "its commit outcome is not yet readable here (spec-4.5a "
+										 "G4/G5 authority pending in this build); retry later or "
+										 "rebuild the snapshot.")));
+						break;	/* unreachable */
+					case CLUSTER_CR_NOT_APPLICABLE:
+						break;	/* continue to the remote-xid / native paths */
+				}
+			}
 		}
 
 		/*

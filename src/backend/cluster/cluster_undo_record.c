@@ -70,6 +70,7 @@
 #include "utils/wait_event.h" /* spec-3.18 D7: ClusterUndoExtentClaim wait event */
 
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_recovery_merge.h" /* PGRAC: spec-4.5a is_materialized */
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_tt_slot.h"	  /* spec-3.12 D2b: TT allocator rollover */
@@ -1274,8 +1275,13 @@ cluster_undo_get_record(UBA uba, void *out_buffer, size_t buffer_size)
 	 *   owner_instance = (segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE + 1 */
 	owner_instance = (uint8)((segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE + 1);
 
-	/* Own-instance only at spec-3.7. */
-	if (owner_instance != (uint8)(cluster_node_id + 1)) {
+	/* Own-instance, or a merged-materialized remote instance (spec-4.5a D8):
+	 * the path builder below derives the directory from owner_instance, so a
+	 * materialized peer's records read straight from the local
+	 * pg_undo/instance_<origin> tree.  Other cross-instance reads stay
+	 * unsupported (runtime Cache Fusion is 4.6/4.7). */
+	if (owner_instance != (uint8)(cluster_node_id + 1)
+		&& !cluster_merged_instance_is_materialized((int)owner_instance - 1)) {
 		ereport(WARNING,
 				(errmsg("cluster_undo_get_record: cross-instance read not supported at spec-3.7"),
 				 errhint("cross-instance undo read 推 spec-3.9 CR construction / Cache Fusion")));
