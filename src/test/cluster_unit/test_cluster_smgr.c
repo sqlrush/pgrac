@@ -311,6 +311,81 @@ mdwriteback(SMgrRelation r pg_attribute_unused(), ForkNumber f pg_attribute_unus
 {}
 
 
+/* ----------
+ * spec-4.5a: stubs pulled in by cluster_shared_fs_sharedfs.o (sentinel
+ * raw I/O + path building).  Link-only; the runtime behaviour lives in
+ * test_cluster_shared_fs_sharedfs.c.
+ * ----------
+ */
+#include "port/pg_crc32c.h"
+
+char *cluster_shared_data_dir = NULL;
+char *cluster_shared_storage_uuid = NULL;
+int cluster_node_id = 0;
+int pg_dir_create_mode = 0700;
+
+char *
+psprintf(const char *fmt pg_attribute_unused(), ...)
+{
+	return NULL;
+}
+
+char *
+pstrdup(const char *in pg_attribute_unused())
+{
+	return NULL;
+}
+
+int
+pg_mkdir_p(char *path pg_attribute_unused(), int omode pg_attribute_unused())
+{
+	return -1;
+}
+
+int
+OpenTransientFile(const char *fileName pg_attribute_unused(), int fileFlags pg_attribute_unused())
+{
+	return -1;
+}
+
+int
+CloseTransientFile(int fd pg_attribute_unused())
+{
+	return 0;
+}
+
+int
+pg_fsync(int fd pg_attribute_unused())
+{
+	return 0;
+}
+
+bool
+pg_strong_random(void *buf pg_attribute_unused(), size_t len pg_attribute_unused())
+{
+	return false;
+}
+
+extern pg_crc32c pg_comp_crc32c_sse42(pg_crc32c crc, const void *data, size_t len);
+extern pg_crc32c pg_comp_crc32c_armv8(pg_crc32c crc, const void *data, size_t len);
+
+pg_crc32c
+pg_comp_crc32c_sse42(pg_crc32c crc, const void *data pg_attribute_unused(),
+					 size_t len pg_attribute_unused())
+{
+	return crc;
+}
+
+pg_crc32c
+pg_comp_crc32c_armv8(pg_crc32c crc, const void *data pg_attribute_unused(),
+					 size_t len pg_attribute_unused())
+{
+	return crc;
+}
+
+pg_crc32c (*pg_comp_crc32c)(pg_crc32c crc, const void *data, size_t len) = pg_comp_crc32c_sse42;
+
+
 UT_DEFINE_GLOBALS();
 
 

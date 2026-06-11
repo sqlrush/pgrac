@@ -569,8 +569,7 @@ static const struct config_enum_entry cluster_shared_storage_backend_options[]
 static bool
 check_cluster_shared_data_dir(char **newval, void **extra, GucSource source)
 {
-	if (*newval != NULL && (*newval)[0] != '\0' && !is_absolute_path(*newval))
-	{
+	if (*newval != NULL && (*newval)[0] != '\0' && !is_absolute_path(*newval)) {
 		GUC_check_errdetail("cluster.shared_data_dir must be an absolute path.");
 		return false;
 	}
@@ -916,8 +915,8 @@ cluster_init_guc(void)
 					 "<shared_data_dir>/<relpath>.  Required when "
 					 "shared_storage_backend=cluster_fs; ignored otherwise."),
 		&cluster_shared_data_dir, "",
-		PGC_POSTMASTER, /* path is frozen for the postmaster lifetime */
-		0,				/* flags */
+		PGC_POSTMASTER,				   /* path is frozen for the postmaster lifetime */
+		0,							   /* flags */
 		check_cluster_shared_data_dir, /* check_hook */
 		NULL,						   /* assign_hook */
 		NULL);						   /* show_hook */

@@ -39,6 +39,7 @@
 #include "postgres.h"
 
 #include "cluster/storage/cluster_shared_fs.h"
+#include "port/pg_crc32c.h"
 #include "storage/relfilelocator.h"
 
 #undef printf
@@ -71,6 +72,10 @@
  * the smgr_user_relations cross-check. */
 int cluster_shared_storage_backend = 0;
 bool cluster_smgr_user_relations = false;
+/* spec-4.5a: sharedfs backend GUC storages + node id (link-only). */
+char *cluster_shared_data_dir = NULL;
+char *cluster_shared_storage_uuid = NULL;
+int cluster_node_id = 0;
 
 /*
  * miscadmin global referenced by cluster_shared_fs_init's WARNING
@@ -236,6 +241,77 @@ void
 before_shmem_exit(pg_on_exit_callback function pg_attribute_unused(),
 				  Datum arg pg_attribute_unused())
 {}
+
+/* ----------
+ * spec-4.5a: additional stubs pulled in by cluster_shared_fs_sharedfs.o
+ * (sentinel raw I/O + path building).  Link-only; never invoked here --
+ * the runtime behaviour lives in test_cluster_shared_fs_sharedfs.c.
+ * ----------
+ */
+char *
+psprintf(const char *fmt pg_attribute_unused(), ...)
+{
+	return NULL;
+}
+
+char *
+pstrdup(const char *in pg_attribute_unused())
+{
+	return NULL;
+}
+
+int pg_dir_create_mode = 0700;
+
+int
+pg_mkdir_p(char *path pg_attribute_unused(), int omode pg_attribute_unused())
+{
+	return -1;
+}
+
+int
+OpenTransientFile(const char *fileName pg_attribute_unused(), int fileFlags pg_attribute_unused())
+{
+	return -1;
+}
+
+int
+CloseTransientFile(int fd pg_attribute_unused())
+{
+	return 0;
+}
+
+int
+pg_fsync(int fd pg_attribute_unused())
+{
+	return 0;
+}
+
+bool
+pg_strong_random(void *buf pg_attribute_unused(), size_t len pg_attribute_unused())
+{
+	return false;
+}
+
+/* CRC32C symbol for the active platform variant (identity stub; the
+ * sentinel paths that compute CRCs never run in this binary). */
+extern pg_crc32c pg_comp_crc32c_sse42(pg_crc32c crc, const void *data, size_t len);
+extern pg_crc32c pg_comp_crc32c_armv8(pg_crc32c crc, const void *data, size_t len);
+
+pg_crc32c
+pg_comp_crc32c_sse42(pg_crc32c crc, const void *data pg_attribute_unused(),
+					 size_t len pg_attribute_unused())
+{
+	return crc;
+}
+
+pg_crc32c
+pg_comp_crc32c_armv8(pg_crc32c crc, const void *data pg_attribute_unused(),
+					 size_t len pg_attribute_unused())
+{
+	return crc;
+}
+
+pg_crc32c (*pg_comp_crc32c)(pg_crc32c crc, const void *data, size_t len) = pg_comp_crc32c_sse42;
 
 
 UT_DEFINE_GLOBALS();
@@ -449,6 +525,42 @@ UT_TEST(test_stub_create_signature_has_isRedo)
 }
 
 
+/* spec-4.5a D12: the sharedfs vtable joins the built-ins. */
+UT_TEST(test_sharedfs_vtable_callbacks_nonnull)
+{
+	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_sharedfs_ops.exists);
+	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_sharedfs_ops.open_existing);
+	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_sharedfs_ops.create);
+	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_sharedfs_ops.close);
+	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_sharedfs_ops.read);
+	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_sharedfs_ops.write);
+	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_sharedfs_ops.extend);
+	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_sharedfs_ops.nblocks);
+	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_sharedfs_ops.truncate);
+	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_sharedfs_ops.immedsync);
+	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_sharedfs_ops.unlink);
+	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_sharedfs_ops.init);
+	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_sharedfs_ops.shutdown);
+}
+
+UT_TEST(test_sharedfs_vtable_identity)
+{
+	UT_ASSERT_EQ(cluster_shared_fs_sharedfs_ops.id, CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS);
+	UT_ASSERT_STR_EQ(cluster_shared_fs_sharedfs_ops.name, "shared_fs");
+	UT_ASSERT(cluster_shared_fs_sharedfs_ops.read != cluster_shared_fs_local_ops.read);
+	UT_ASSERT(cluster_shared_fs_sharedfs_ops.write != cluster_shared_fs_local_ops.write);
+}
+
+UT_TEST(test_sharedfs_sentinel_symbols_linkable)
+{
+	void (*attach_fn)(void) = cluster_shared_fs_sentinel_attach;
+	bool (*has_fn)(int) = cluster_shared_fs_sentinel_has_participant;
+
+	UT_ASSERT_NOT_NULL((void *)attach_fn);
+	UT_ASSERT_NOT_NULL((void *)has_fn);
+}
+
+
 /* ============================================================
  * Test runner
  * ============================================================ */
@@ -456,7 +568,7 @@ UT_TEST(test_stub_create_signature_has_isRedo)
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(15);
 	UT_RUN(test_shared_fs_backend_max_constant);
 	UT_RUN(test_shared_fs_backend_id_enum_frozen);
 	UT_RUN(test_shared_fs_vtable_struct_nonempty);
@@ -469,6 +581,9 @@ main(void)
 	UT_RUN(test_get_backend_at_out_of_range);
 	UT_RUN(test_create_signature_has_isRedo);
 	UT_RUN(test_stub_create_signature_has_isRedo);
+	UT_RUN(test_sharedfs_vtable_callbacks_nonnull);
+	UT_RUN(test_sharedfs_vtable_identity);
+	UT_RUN(test_sharedfs_sentinel_symbols_linkable);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
