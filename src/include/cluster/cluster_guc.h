@@ -178,6 +178,22 @@ extern int cluster_shared_storage_backend;
 
 
 /*
+ * cluster_shared_data_dir -- shared data root for the cluster_fs
+ *	(shared_fs) backend (spec-4.5a D2).
+ *
+ *	The shared_fs backend resolves every relation file under
+ *	<shared_data_dir>/<relpathperm> so all nodes pointing at the same
+ *	shared mount land on the same file.  Required (non-empty, absolute)
+ *	when shared_storage_backend=cluster_fs; the startup cross-check lives
+ *	in cluster_shared_fs_init.
+ *
+ *	Boot default: "" (empty -- inert for stub/local).
+ *	context:      PGC_POSTMASTER (path frozen for the postmaster lifetime).
+ */
+extern char *cluster_shared_data_dir;
+
+
+/*
  * cluster_smgr_user_relations -- opt-in switch routing user-relation
  *	smgr operations through cluster_smgr (smgr_which=1) instead of
  *	md.c (smgr_which=0).  Default off keeps stage 0 / 1.1 behaviour

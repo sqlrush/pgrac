@@ -72,6 +72,8 @@ int cluster_recovery_workers_max = 4;
 bool cluster_merged_recovery = false;
 int cluster_recovery_merge_wait_timeout = 10000;
 int cluster_shared_storage_backend = CLUSTER_SHARED_FS_BACKEND_STUB;
+/* spec-4.5a D2: shared data root for the cluster_fs (shared_fs) backend. */
+char *cluster_shared_data_dir = NULL;
 bool cluster_smgr_user_relations = false;
 int cluster_shmem_max_regions = 64;
 
@@ -552,6 +554,29 @@ static const struct config_enum_entry cluster_shared_storage_backend_options[]
 
 
 /*
+ * check_cluster_shared_data_dir -- GUC check_hook for
+ *	cluster.shared_data_dir (spec-4.5a D2).
+ *
+ *	An empty value is allowed (the shared_fs backend is not in use, or the
+ *	startup cross-check in cluster_shared_fs_init will reject the
+ *	combination shared_storage_backend=cluster_fs + empty dir).  A
+ *	non-empty value must be an absolute path: the shared_fs backend
+ *	prepends it to a relative relpath, and every node must name the same
+ *	shared mount, which only an absolute path can express unambiguously.
+ */
+static bool
+check_cluster_shared_data_dir(char **newval, void **extra, GucSource source)
+{
+	if (*newval != NULL && (*newval)[0] != '\0' && !is_absolute_path(*newval))
+	{
+		GUC_check_errdetail("cluster.shared_data_dir must be an absolute path.");
+		return false;
+	}
+	return true;
+}
+
+
+/*
  * cluster_init_guc -- register all cluster GUC variables.
  *
  *	Called once from PostmasterMain after PG's built-in GUCs are
@@ -871,6 +896,29 @@ cluster_init_guc(void)
 							 NULL,			 /* check_hook */
 							 NULL,			 /* assign_hook */
 							 NULL);			 /* show_hook */
+
+	/*
+	 * cluster.shared_data_dir -- shared data root for the cluster_fs
+	 * (shared_fs) backend (spec-4.5a D2).  The shared_fs backend resolves
+	 * every relation file under <shared_data_dir>/<relpathperm> so that
+	 * all nodes pointing at the same shared mount land on the same file.
+	 * Required (non-empty, absolute) when shared_storage_backend=cluster_fs;
+	 * the startup cross-check lives in cluster_shared_fs_init.  Default
+	 * empty keeps the GUC inert for stub/local deployments.
+	 */
+	DefineCustomStringVariable(
+		"cluster.shared_data_dir",
+		gettext_noop("Shared data root for the cluster_fs shared-storage backend."),
+		gettext_noop("Absolute path on the shared mount that every node points at.  "
+					 "The shared_fs backend stores each relation file under "
+					 "<shared_data_dir>/<relpath>.  Required when "
+					 "shared_storage_backend=cluster_fs; ignored otherwise."),
+		&cluster_shared_data_dir, "",
+		PGC_POSTMASTER, /* path is frozen for the postmaster lifetime */
+		0,				/* flags */
+		check_cluster_shared_data_dir, /* check_hook */
+		NULL,						   /* assign_hook */
+		NULL);						   /* show_hook */
 
 	/*
 	 * cluster.smgr_user_relations -- opt-in switch routing user-

@@ -175,6 +175,14 @@ cluster_shared_fs_init(void)
 	 */
 	cluster_shared_fs_register_backend(&cluster_shared_fs_stub_ops);
 	cluster_shared_fs_register_backend(&cluster_shared_fs_local_ops);
+	/*
+	 * PGRAC: spec-4.5a D3 -- shared_fs (id 3 CLUSTER_FS) is the first
+	 * cluster_shared_fs backend on genuinely cross-node-shared storage.
+	 * Registering it turns cluster.shared_storage_backend=cluster_fs from
+	 * the Stage-2 "not registered -> FATAL" placeholder into a live
+	 * passthrough over the configured cluster.shared_data_dir root.
+	 */
+	cluster_shared_fs_register_backend(&cluster_shared_fs_sharedfs_ops);
 
 	/*
 	 * Resolve cluster.shared_storage_backend GUC -> active vtable.
@@ -190,10 +198,11 @@ cluster_shared_fs_init(void)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cluster.shared_storage_backend selected backend (id %d) is not available",
 						(int)requested),
-				 errhint("Backends \"stub\" and \"local\" are built in; "
-						 "\"block_device\", \"cluster_fs\", \"rbd\", and \"multi_attach\" "
-						 "land in Stage 2.  Set cluster.shared_storage_backend=stub or "
-						 "=local in postgresql.conf and restart.")));
+				 errhint("Backends \"stub\", \"local\", and \"cluster_fs\" (shared_fs, "
+						 "spec-4.5a) are built in; \"block_device\", \"rbd\", and "
+						 "\"multi_attach\" land in Stage 6.  Set "
+						 "cluster.shared_storage_backend to one of the built-in "
+						 "backends in postgresql.conf and restart.")));
 
 	cluster_shared_fs_active_ops = ops;
 	elog(LOG, "cluster_shared_fs: active backend is \"%s\" (id %d)", ops->name, (int)ops->id);

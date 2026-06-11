@@ -259,6 +259,8 @@ extern void cluster_shared_fs_unlink(RelFileLocator rlocator, ForkNumber forknum
  */
 extern const ClusterSharedFsOps cluster_shared_fs_stub_ops;
 extern const ClusterSharedFsOps cluster_shared_fs_local_ops;
+/* Stage 4.5a (spec-4.5a D1): first genuinely cross-node-shared backend. */
+extern const ClusterSharedFsOps cluster_shared_fs_sharedfs_ops;
 
 
 #endif /* CLUSTER_SHARED_FS_H */
