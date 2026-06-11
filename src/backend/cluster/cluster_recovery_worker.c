@@ -194,13 +194,16 @@ cluster_recovery_worker_main(Datum main_arg)
 	int n_bad = 0;
 	int n_skipped = 0;
 
+	/* Returning from a bgworker entry point is a clean exit(0)
+	 * (StartBackgroundWorker proc_exits after we return); cppcheck
+	 * does not model proc_exit as noreturn, so guards use return. */
 	if (pool == NULL || slot < 0 || slot >= CLUSTER_RECOVERY_WORKER_MAX_SLOTS)
-		proc_exit(0);
+		return;
 
 	/* Claim the slot; a stale/raced state means this spawn is moot. */
 	if (!pg_atomic_compare_exchange_u32(&pool->slot_state[slot], &expected,
 										CLUSTER_RECOVERY_WORKER_RUNNING))
-		proc_exit(0);
+		return;
 
 	before_shmem_exit(mark_failed_on_exit, Int32GetDatum(slot));
 
@@ -253,7 +256,6 @@ cluster_recovery_worker_main(Datum main_arg)
 	expected = CLUSTER_RECOVERY_WORKER_RUNNING;
 	pg_atomic_compare_exchange_u32(&pool->slot_state[slot], &expected,
 								   CLUSTER_RECOVERY_WORKER_DONE);
-	proc_exit(0);
 }
 
 /*
