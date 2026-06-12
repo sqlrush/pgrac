@@ -142,6 +142,21 @@ void
 MarkBufferDirty(Buffer buf pg_attribute_unused())
 {}
 
+/* spec-4.5a G6: cluster_itl.c's slot-pin check calls the merged-recovery
+ * materialized gate (cluster_recovery_merge.o, not linked here).  Stub to
+ * "nothing materialized" so the allocator behaves exactly as pre-G6 in this
+ * pure ITL-reader fixture. */
+bool
+cluster_merged_any_remote_materialized(void)
+{
+	return false;
+}
+bool
+cluster_merged_instance_is_materialized(int origin_node pg_attribute_unused())
+{
+	return false;
+}
+
 Page
 BufferGetPage(Buffer buf)
 {
