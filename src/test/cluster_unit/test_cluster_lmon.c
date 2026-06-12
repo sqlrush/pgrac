@@ -530,6 +530,14 @@ void
 cluster_grd_lmon_tick_dead_sweep(void)
 {}
 
+/* spec-4.6 D1 L104 stub:  cluster_lmon.c calls cluster_grd_recovery_
+ * lmon_tick() after reconfig_lmon_tick (P0-P7 recovery sequence).
+ * Standalone fixture doesn't link cluster_grd.o;  vacuous stub. */
+void cluster_grd_recovery_lmon_tick(void);
+void
+cluster_grd_recovery_lmon_tick(void)
+{}
+
 /* spec-2.34 D6 L104 stub:  cluster_lmon.c LMON tick body calls
  * cluster_gcs_block_dedup_sweep_expired(now).  Standalone fixture has
  * no dedup HTAB linked; vacuous stub. */

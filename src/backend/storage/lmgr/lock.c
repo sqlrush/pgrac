@@ -601,10 +601,19 @@ LockOrStrongerHeldByMe(const LOCKTAG *locktag, LOCKMODE lockmode)
 	return LockHeldByMeExtended(locktag, lockmode, true);
 }
 
-#ifdef USE_ASSERT_CHECKING
+#if defined(USE_ASSERT_CHECKING) || defined(USE_PGRAC_CLUSTER)
 /*
  * GetLockMethodLocalHash -- return the hash of local locks, for modules that
  *		evaluate assertions based on all locks held.
+ *
+ * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+ * What changed: also exported under USE_PGRAC_CLUSTER (not only
+ *               assert-enabled builds).
+ * Why: spec-4.6 D3 cooperative holder rebind — each backend walks its
+ *      OWN LocalLockHash (read-only) to redeclare cluster_registered
+ *      grants after a failure-driven remaster.  Read-only accessor;
+ *      the lock state machine is not touched.
+ * Spec: spec-4.6-recovery-aware-grd-ges-remaster.md (D3)
  */
 HTAB *
 GetLockMethodLocalHash(void)

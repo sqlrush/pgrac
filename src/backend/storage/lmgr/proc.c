@@ -282,6 +282,8 @@ InitProcGlobal(void)
 		pg_atomic_init_u64(&(proc->waitStart), 0);
 		/* PGRAC: spec-3.12 D1 — retention horizon read_scn (InvalidScn == 0). */
 		pg_atomic_init_u64(&(proc->cluster_read_scn_atomic), 0);
+		/* PGRAC: spec-4.6 D3 — holder-rebind barrier ack generation. */
+		pg_atomic_init_u64(&(proc->cluster_grd_redeclare_acked), 0);
 	}
 
 	/*
@@ -482,6 +484,11 @@ InitProcess(void)
 	if (cluster_enabled && MyProc != NULL) {
 		MyProc->cluster_grd_generation = cluster_grd_alloc_generation();
 		MyProc->cluster_grd_bast_pending = false;
+		/* spec-4.6 D3 — seed the rebind-barrier ack with the CURRENT
+		 * redeclare generation:  a backend born after the broadcast has
+		 * no stale-epoch grants and must not block the barrier. */
+		pg_atomic_write_u64(&MyProc->cluster_grd_redeclare_acked,
+							cluster_grd_redeclare_generation());
 	}
 #endif
 }

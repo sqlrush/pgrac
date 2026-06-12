@@ -410,8 +410,12 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 	 * remote sender and must match env->source_node_id. */
 	payload_node_must_be_source
 		= (req->opcode != GES_REQ_OPCODE_BAST && req->opcode != GES_REQ_OPCODE_CANCEL_PENDING);
+	/* spec-4.6 D3:  opcode_max extended to REDECLARE (12).  Opcodes 8-11
+	 * passing the coarse range check still fail closed in the explicit
+	 * switch below (dedicated-payload opcodes never reach this handler
+	 * legitimately — early dispatch above). */
 	if (!ges_validate_inbound(env, req->holder_node_id, holder_epoch, req->opcode,
-							  GES_REQ_OPCODE_REQUEST, GES_REQ_OPCODE_CANCEL_PENDING,
+							  GES_REQ_OPCODE_REQUEST, GES_REQ_OPCODE_REDECLARE,
 							  payload_node_must_be_source)) {
 		cluster_grd_inc_ges_inbound_validation_fail();
 		return;
@@ -468,6 +472,7 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 	case GES_REQ_OPCODE_REQUEST:
 	case GES_REQ_OPCODE_CONVERT:
 	case GES_REQ_OPCODE_RELEASE:
+	case GES_REQ_OPCODE_REDECLARE: /* spec-4.6 D3 — same work_queue path */
 		break;
 	case GES_REQ_OPCODE_DEADLOCK_PROBE:
 	case GES_REQ_OPCODE_DEADLOCK_REPORT:
@@ -503,7 +508,7 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 	 *	REJECT_BUSY fail-closed.  MISS_REGISTERED -> proceed to enqueue.
 	 */
 	if (req->opcode == GES_REQ_OPCODE_REQUEST || req->opcode == GES_REQ_OPCODE_CONVERT
-		|| req->opcode == GES_REQ_OPCODE_RELEASE) {
+		|| req->opcode == GES_REQ_OPCODE_RELEASE || req->opcode == GES_REQ_OPCODE_REDECLARE) {
 		ClusterGesDedupKey dkey;
 		uint8 dreply_buf[sizeof(GesReplyPayload)];
 		uint16 dreply_len = 0;
@@ -748,6 +753,36 @@ cluster_ges_lmon_drain_work_queue(void)
 			int n_conflict = 0;
 			ClusterGrdGrantAction action;
 
+			/*
+				 * spec-4.6 D4 — master-side shard recovery gate.  A shard
+				 * in FROZEN/REBUILDING must not serve new grants:  the
+				 * holder rebuild (D3) is still filling holders[], so a
+				 * grant decided against the partial set could double
+				 * grant.  REJECT(SHARD_FROZEN);  the requester short-waits
+				 * and retries (or raises 53R9I).  REDECLARE/RELEASE stay
+				 * allowed (they are the rebuild traffic itself).
+				 */
+			if (cluster_grd_shard_phase(cluster_grd_shard_for_resource(&resid))
+				!= GRD_SHARD_NORMAL) {
+				GesReplyPayload reject;
+
+				memset(&reject, 0, sizeof(reject));
+				reject.opcode = GES_REPLY_OPCODE_REJECT;
+				reject.reply_for_opcode = req->opcode;
+				reject.reject_reason = GES_REJECT_REASON_SHARD_FROZEN;
+				reject.holder_node_id = req->holder_node_id;
+				reject.holder_procno = req->holder_procno;
+				reject.holder_cluster_epoch_lo = req->holder_cluster_epoch_lo;
+				reject.holder_cluster_epoch_hi = req->holder_cluster_epoch_hi;
+				reject.holder_request_id_lo = req->holder_request_id_lo;
+				reject.holder_request_id_hi = req->holder_request_id_hi;
+				memcpy(reject.resid, req->resid, sizeof(reject.resid));
+				ges_record_dedup_reply_for_request((uint32)item.source_node_id, req, &reject);
+				cluster_grd_outbound_enqueue_lmon_reply(item.source_node_id, &reject,
+														sizeof(reject));
+				break;
+			}
+
 			action = cluster_grd_entry_enqueue_or_grant(
 				&resid, &holder, (int32)item.source_node_id, holder_request_id,
 				ges_request_shard_master_generation(req), req->opcode, (int)req->lockmode,
@@ -843,6 +878,52 @@ cluster_ges_lmon_drain_work_queue(void)
 			}
 			break;
 		}
+		case GES_REQ_OPCODE_REDECLARE: {
+			/*
+				 * spec-4.6 D3 — cooperative holder rebind (insert-or-rebind).
+				 *
+				 *	The payload carries the NEW current-epoch holder
+				 *	(validated above:  payload epoch == accepted epoch).
+				 *	Match key for an existing holder = (node_id, procno,
+				 *	lockmode) + resid;  match → overwrite the holder
+				 *	identity in place (unaffected-shard rebind, idempotent
+				 *	for retransmits);  no match → insert (remastered-shard
+				 *	rebuild:  the new master fills holders[] from these
+				 *	re-declarations ONLY).  Allowed in every shard phase —
+				 *	this IS the rebuild traffic.
+				 */
+			ClusterGrdEntryResult rr;
+
+			rr = cluster_grd_entry_rebind_or_insert_holder(
+				&resid, &holder, (int32)item.source_node_id, (int)req->lockmode);
+			if (rr == CLUSTER_GRD_ENTRY_OK) {
+				GesReplyPayload reply;
+
+				ges_send_grant_reply((int32)item.source_node_id, &holder, &resid, req->opcode,
+									 &reply);
+				ges_record_dedup_reply_for_request((uint32)item.source_node_id, req, &reply);
+			} else {
+				GesReplyPayload reject;
+
+				memset(&reject, 0, sizeof(reject));
+				reject.opcode = GES_REPLY_OPCODE_REJECT;
+				reject.reply_for_opcode = req->opcode;
+				reject.reject_reason = (rr == CLUSTER_GRD_ENTRY_FULL)
+										   ? GES_REJECT_REASON_WORK_QUEUE_FULL
+										   : GES_REJECT_REASON_LOCK_CONFLICT;
+				reject.holder_node_id = req->holder_node_id;
+				reject.holder_procno = req->holder_procno;
+				reject.holder_cluster_epoch_lo = req->holder_cluster_epoch_lo;
+				reject.holder_cluster_epoch_hi = req->holder_cluster_epoch_hi;
+				reject.holder_request_id_lo = req->holder_request_id_lo;
+				reject.holder_request_id_hi = req->holder_request_id_hi;
+				memcpy(reject.resid, req->resid, sizeof(reject.resid));
+				ges_record_dedup_reply_for_request((uint32)item.source_node_id, req, &reject);
+				cluster_grd_outbound_enqueue_lmon_reply(item.source_node_id, &reject,
+														sizeof(reject));
+			}
+			break;
+		}
 		default:
 			/*
 				 * BAST / BAST_ACK / DEADLOCK_* opcodes are dispatched in
@@ -898,10 +979,16 @@ cluster_ges_reply_defer_count(void)
  *	counters so dump_ges remains observable.
  * ============================================================ */
 
-uint32
-cluster_ges_send_request_and_wait(const struct ClusterResId *resid, uint32 lockmode,
-								  const struct ClusterGrdHolderId *holder, uint64 request_id,
-								  int timeout_ms)
+/*
+ * spec-4.6 D3 — shared body for REQUEST and REDECLARE send-and-wait.
+ *	Both opcodes ride the identical GesRequestPayload + retransmit +
+ *	5-tuple reply-wait machinery;  only the opcode byte differs (and
+ *	REDECLARE is idempotent on the master, so retransmit stays safe).
+ */
+static uint32
+ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmode,
+								 const struct ClusterGrdHolderId *holder, uint64 request_id,
+								 int timeout_ms, uint32 send_opcode)
 {
 	int32 master;
 	GesReplyWaitKey key;
@@ -968,7 +1055,7 @@ cluster_ges_send_request_and_wait(const struct ClusterResId *resid, uint32 lockm
 	key.request_id = request_id;
 	key.source_node_id = cluster_node_id;
 	key.dest_node_id = master;
-	key.request_opcode = GES_REQ_OPCODE_REQUEST;
+	key.request_opcode = send_opcode;
 	key.cluster_epoch = epoch;
 
 	entry = cluster_ges_reply_wait_insert(&key, deadline);
@@ -983,7 +1070,7 @@ cluster_ges_send_request_and_wait(const struct ClusterResId *resid, uint32 lockm
 
 	/* Build wire payload (constant across retransmits). */
 	memset(&req, 0, sizeof(req));
-	req.opcode = GES_REQ_OPCODE_REQUEST;
+	req.opcode = send_opcode;
 	req.lockmode = lockmode;
 	req.holder_node_id = (uint32)holder->node_id;
 	req.holder_procno = (uint32)holder->procno;
@@ -1100,6 +1187,31 @@ cluster_ges_send_request_and_wait(const struct ClusterResId *resid, uint32 lockm
 	cluster_ges_reply_wait_delete(&key);
 
 	return reject_reason;
+}
+
+uint32
+cluster_ges_send_request_and_wait(const struct ClusterResId *resid, uint32 lockmode,
+								  const struct ClusterGrdHolderId *holder, uint64 request_id,
+								  int timeout_ms)
+{
+	return ges_send_request_opcode_and_wait(resid, lockmode, holder, request_id, timeout_ms,
+											GES_REQ_OPCODE_REQUEST);
+}
+
+/*
+ * spec-4.6 D3 — send the NEW current-epoch holder to the resource's
+ * current master and wait for the insert-or-rebind ack.  Caller (the
+ * cooperative redeclare walker) only overwrites LOCALLOCK.cluster_holder_
+ * raw AFTER this returns 0 (§2.3 step 4);  any reject/timeout leaves the
+ * old holder in place — fail-closed.
+ */
+uint32
+cluster_ges_send_redeclare_and_wait(const struct ClusterResId *resid, uint32 lockmode,
+									const struct ClusterGrdHolderId *new_holder, uint64 request_id)
+{
+	return ges_send_request_opcode_and_wait(resid, lockmode, new_holder, request_id,
+											/* timeout_ms = GUC default */ 0,
+											GES_REQ_OPCODE_REDECLARE);
 }
 
 uint32

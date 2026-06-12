@@ -92,6 +92,10 @@ bool cluster_undo_buffer_writeback = true;
 int cluster_grd_max_entries = 0;
 int cluster_ges_request_timeout_ms = 60000; /* spec-2.16 D12 + v0.5 P1.5 */
 
+/* spec-4.6 D4/D1 — failure-driven remaster tunables. */
+int cluster_grd_remaster_wait_ms = 200;	   /* frozen-shard short wait before 53R9I */
+int cluster_grd_rebuild_timeout_ms = 5000; /* holder-rebuild barrier deadline */
+
 #ifdef ENABLE_INJECTION
 #define CLUSTER_SHMEM_MIN_REGIONS 41
 #else
@@ -1140,6 +1144,26 @@ cluster_init_guc(void)
 					 "**never evict in-flight entries** (HC51 — eviction would re-introduce "
 					 "double-grant risk).  PGC_POSTMASTER — sized at startup."),
 		&cluster_ges_dedup_max_entries, 8192, 256, 1048576, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	/* spec-4.6 D4/D1 — failure-driven remaster tunables. */
+	DefineCustomIntVariable(
+		"cluster.grd_remaster_wait_ms",
+		gettext_noop("Short wait on a GRD shard frozen by failure-driven remaster (ms)."),
+		gettext_noop("Range [0, 60000].  Default 200.  A request landing on a shard in "
+					 "FROZEN/REBUILDING phase waits up to this long (wait event "
+					 "ClusterGrdShardRemaster) for the remaster to finish;  expiry raises "
+					 "53R9I cluster_grd_shard_remastering (fail-closed, application retries)."),
+		&cluster_grd_remaster_wait_ms, 200, 0, 60000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL, NULL);
+	DefineCustomIntVariable(
+		"cluster.grd_rebuild_timeout_ms",
+		gettext_noop("Holder-rebuild barrier deadline after a failure-driven remaster (ms)."),
+		gettext_noop("Range [100, 600000].  Default 5000.  LMON waits this long for every "
+					 "live backend to ack the cooperative holder rebind;  expiry bumps "
+					 "rebuild_timeout, KEEPS the affected shards frozen (fail-closed — a "
+					 "half-rebuilt shard is never opened), and re-broadcasts the redeclare "
+					 "request with a fresh deadline."),
+		&cluster_grd_rebuild_timeout_ms, 5000, 100, 600000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
+		NULL);
 
 	/* spec-2.23 D11 NEW:  coordinator REPORT collect deadline. */
 	DefineCustomIntVariable("cluster.lmd_probe_collect_timeout_ms",

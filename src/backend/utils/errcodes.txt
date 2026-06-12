@@ -658,6 +658,24 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 # counter cluster_cr_cross_instance_unsupported_count bump.
 53R9G    E    ERRCODE_CLUSTER_CR_CROSS_INSTANCE_UNSUPPORTED                    cluster_cr_cross_instance_unsupported
 
+# spec-4.6 D4:  request landed on a GRD shard that is FROZEN/REBUILDING
+# during failure-driven remaster and the short wait
+# (cluster.grd_remaster_wait_ms) expired, or the holder-rebuild barrier
+# failed/timed out (fail-closed; the shard is never half-opened).
+# Application retry semantics like serialization_failure.
+53R9I    E    ERRCODE_CLUSTER_GRD_SHARD_REMASTERING                            cluster_grd_shard_remastering
+
+# spec-4.6 D4:  request/reply carried a stale routing generation (old
+# epoch / old master after a remaster).  Dropped + retried against the
+# current master; never served by the dead/old master.
+53R9J    E    ERRCODE_CLUSTER_GRD_STALE_MASTER_GENERATION                      cluster_grd_stale_master_generation
+
+# spec-4.6 D4 / L12:  block-level (GCS/PCM) access to a remastered shard
+# before Stage-4.7 block-state rebuild exists.  The GES logical-lock
+# layer is rebuilt by 4.6, but PCM/dirty-block state is NOT; fail-closed
+# instead of serving stale block state through the new master map.
+53R9K    E    ERRCODE_CLUSTER_GCS_BLOCK_PATH_NOT_REBUILT                       cluster_gcs_block_path_not_rebuilt
+
 # spec-4.1 D7:  per-thread WAL routing startup validation (53RA0+ opens
 # the Stage-4 WAL/recovery band; 53R70/71 belong to GES).  53RA0 fires
 # at postmaster startup when cluster.wal_threads_dir is configured but

@@ -49,6 +49,7 @@
 
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_grd.h"
+#include "cluster/cluster_reconfig.h" /* spec-4.6 D1 — ReconfigEvent stub type */
 #include "port/atomics.h"
 #include "storage/lock.h"
 #include "storage/s_lock.h"
@@ -237,6 +238,51 @@ cluster_lms_get_shard_master_generation(void)
 {
 	return mock_lms_shard_master_generation;
 }
+
+/* spec-4.6 D1 stubs:  the recovery tick (P0-P7) consumes reconfig
+ * events / epoch reads / ProcArray walks / ProcSignal broadcast.
+ * Standalone fixture pins them inert (cluster_enabled=false → the
+ * tick early-returns;  end-to-end coverage is TAP t/249).  Types are
+ * primitive-equivalent;  the real headers are not pulled in. */
+bool cluster_enabled = false;
+int cluster_grd_rebuild_timeout_ms = 5000;
+volatile sig_atomic_t cluster_grd_redeclare_pending = false;
+int MyProcPid = 0;
+
+uint64
+cluster_epoch_get_current(void)
+{
+	return 0;
+}
+
+void
+cluster_reconfig_get_last_event(ReconfigEvent *out)
+{
+	memset(out, 0, sizeof(*out));
+}
+
+struct PGPROC *
+BackendIdGetProc(int backendID pg_attribute_unused())
+{
+	return NULL;
+}
+
+int
+SendProcSignal(int pid pg_attribute_unused(), int reason pg_attribute_unused(),
+			   int backendId pg_attribute_unused())
+{
+	return 0;
+}
+
+int64
+GetCurrentTimestamp(void)
+{
+	return 0;
+}
+
+void
+cluster_grd_redeclare_all_registered(void)
+{}
 
 #define FAKE_GRD_HTAB_MAX_ENTRIES 4
 #define FAKE_GRD_HTAB_ENTRY_BYTES 4096

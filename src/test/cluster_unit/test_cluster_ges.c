@@ -223,12 +223,39 @@ cluster_epoch_get_current(void)
 	return 0; /* default epoch 0 — matches env_sentinel.epoch */
 }
 
-/* cluster_conf — return non-NULL so validation step 4 declared check passes */
-const void *
+/* cluster_conf — return non-NULL so validation step 4 declared check
+ * passes.  Signature must match cluster_conf.h (pulled in via
+ * cluster_grd.h since spec-4.6). */
+const ClusterNodeInfo *
 cluster_conf_lookup_node(int32 node_id pg_attribute_unused())
 {
-	static char dummy;
-	return (const void *)&dummy;
+	static ClusterNodeInfo dummy;
+	return &dummy;
+}
+
+/* spec-4.6 D3/D4 stubs:  the drain path now reads the shard recovery
+ * phase (master-side freeze gate) and handles GES_REDECLARE via the
+ * insert-or-rebind entry API.  Standalone fixture:  NORMAL phase +
+ * always-OK rebind. */
+uint32
+cluster_grd_shard_for_resource(const ClusterResId *resid pg_attribute_unused())
+{
+	return 0;
+}
+
+ClusterGrdShardPhase
+cluster_grd_shard_phase(uint32 shard_id pg_attribute_unused())
+{
+	return GRD_SHARD_NORMAL;
+}
+
+ClusterGrdEntryResult
+cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid pg_attribute_unused(),
+										  const struct ClusterGrdHolderId *nh pg_attribute_unused(),
+										  int32 src pg_attribute_unused(),
+										  int lockmode pg_attribute_unused())
+{
+	return CLUSTER_GRD_ENTRY_OK;
 }
 
 int32

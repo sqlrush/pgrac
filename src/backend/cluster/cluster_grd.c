@@ -43,9 +43,14 @@
 #include "cluster/cluster_pcm_lock.h"	  /* spec-2.36 HC124 pending_x node-dead cleanup */
 #include "cluster/cluster_signal.h"
 #include "cluster/cluster_shmem.h"
-#include "cluster/cluster_cssd.h" /* spec-2.16 D8 newly-dead bitmap diff */
-#include "storage/proc.h"		  /* spec-2.17 D8 — MyProc->cluster_grd_bast_pending */
-#include "common/hashfn.h"		  /* hash_bytes_extended (spec-2.29 同款) */
+#include "cluster/cluster_cssd.h"	  /* spec-2.16 D8 newly-dead bitmap diff */
+#include "cluster/cluster_epoch.h"	  /* spec-4.6 D1 — accepted epoch reads */
+#include "cluster/cluster_reconfig.h" /* spec-4.6 D1 — reconfig event consume */
+#include "storage/procsignal.h"		  /* spec-4.6 D3 — redeclare broadcast */
+#include "storage/sinvaladt.h"		  /* spec-4.6 D3 — BackendIdGetProc */
+#include "utils/timestamp.h"		  /* spec-4.6 D1 — barrier deadline */
+#include "storage/proc.h"			  /* spec-2.17 D8 — MyProc->cluster_grd_bast_pending */
+#include "common/hashfn.h"			  /* hash_bytes_extended (spec-2.29 同款) */
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/lock.h"
@@ -288,6 +293,14 @@ cluster_grd_shmem_init(void)
 
 		/* spec-4.6 D2/D5 — remaster epoch + 13 grd_recovery counters. */
 		pg_atomic_init_u64(&cluster_grd_state->reconfig_remaster_epoch, 0);
+		/* spec-4.6 D1 — recovery sequence cursor. */
+		pg_atomic_init_u64(&cluster_grd_state->recovery_last_event_id, 0);
+		pg_atomic_init_u32(&cluster_grd_state->recovery_state, (uint32)GRD_RECOVERY_IDLE);
+		for (i = 0; i < (CLUSTER_MAX_NODES + 63) / 64; i++)
+			pg_atomic_init_u64(&cluster_grd_state->recovery_dead_bitmap[i], 0);
+		pg_atomic_init_u64(&cluster_grd_state->recovery_event_old_epoch, 0);
+		pg_atomic_init_u64(&cluster_grd_state->recovery_redeclare_generation, 0);
+		pg_atomic_init_u64(&cluster_grd_state->recovery_barrier_deadline, 0);
 		pg_atomic_init_u64(&cluster_grd_state->remaster_started_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->remaster_done_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->remaster_failed_count, 0);
@@ -769,6 +782,480 @@ cluster_grd_shard_set_phase(uint32 shard_id, ClusterGrdShardPhase phase)
 	if (shard_id >= PGRAC_GRD_SHARD_COUNT)
 		return;
 	pg_atomic_write_u32(&cluster_grd_state->shard_phase[shard_id], (uint32)phase);
+}
+
+
+/* ============================================================
+ * spec-4.6 D1 — GRD recovery sequence (P0-P7).
+ *
+ *	LMON tick driver, sequenced AFTER cluster_reconfig_lmon_tick in the
+ *	LMON main loop:
+ *	  P0 accept DEAD     reconfig event published (quorum/evict/fence)
+ *	  P1 freeze affected shards whose CURRENT master is dead → FROZEN
+ *	  P2 cleanup dead    dead_sweep (earlier in the tick, I47)
+ *	  P3 scoped sweep    epoch-stale leftovers on affected shards only
+ *	  P4 remaster        cluster_grd_master_map_remaster (D2)
+ *	  P5 rebuild         REBUILDING + redeclare broadcast + ack barrier
+ *	  P6 global sweep    post-barrier ONLY (P0#3)
+ *	  P7 unfreeze        NORMAL
+ *	Phase regressions are impossible by construction (single LMON
+ *	writer + the recovery_state cursor);  the P5→P6 edge is the hard
+ *	barrier:  running the global sweep before every live backend acked
+ *	would re-create P0#2 (deleting live-but-not-yet-rebound holders).
+ * ============================================================ */
+
+#define GRD_SHARD_BITMAP_WORDS (PGRAC_GRD_SHARD_COUNT / 64)
+
+static inline bool
+grd_shard_bitmap_test(const uint64 *bm, uint32 shard)
+{
+	return (bm[shard >> 6] >> (shard & 63)) & 1;
+}
+
+static inline void
+grd_shard_bitmap_set(uint64 *bm, uint32 shard)
+{
+	bm[shard >> 6] |= ((uint64)1 << (shard & 63));
+}
+
+uint64
+cluster_grd_redeclare_generation(void)
+{
+	/* NULL-safe:  InitProcess seeds the PGPROC ack from this before the
+	 * backend ever touches GRD state;  shmem-less contexts read 0. */
+	if (cluster_grd_state == NULL)
+		return 0;
+	return pg_atomic_read_u64(&cluster_grd_state->recovery_redeclare_generation);
+}
+
+/*
+ * cluster_grd_cleanup_stale_epoch_scoped — spec-4.6 P0#2 (P3).
+ *
+ *	Pre-remaster hygiene:  remove epoch-stale holders/waiters ONLY on
+ *	the affected (about-to-be-remastered) shards, so the new master
+ *	does not inherit dirt from an earlier mastership era.  Unaffected
+ *	shards are NOT touched here — their live holders are rebound in
+ *	place by their owner backends (P5) and the global sweep waits for
+ *	the ack barrier (P6).
+ */
+void
+cluster_grd_cleanup_stale_epoch_scoped(uint64 current_epoch, const uint64 *affected_shards)
+{
+	HASH_SEQ_STATUS status;
+	ClusterGrdEntry *entry;
+	int swept = 0;
+
+	if (cluster_grd_entry_htab == NULL || affected_shards == NULL)
+		return;
+
+	hash_seq_init(&status, cluster_grd_entry_htab);
+	while ((entry = (ClusterGrdEntry *)hash_seq_search(&status)) != NULL) {
+		int i;
+
+		if (!grd_shard_bitmap_test(affected_shards, cluster_grd_shard_for_resource(&entry->resid)))
+			continue;
+
+		SpinLockAcquire(&entry->lock);
+		for (i = 0; i < entry->ngranted;) {
+			if (entry->holders[i].cluster_epoch < current_epoch) {
+				if (i < entry->ngranted - 1)
+					entry->holders[i] = entry->holders[entry->ngranted - 1];
+				memset(&entry->holders[entry->ngranted - 1], 0, sizeof(entry->holders[0]));
+				entry->ngranted--;
+				swept++;
+				continue;
+			}
+			i++;
+		}
+		for (i = 0; i < entry->nwaiters;) {
+			if (entry->waiters[i].cluster_epoch < current_epoch) {
+				if (i < entry->nwaiters - 1)
+					entry->waiters[i] = entry->waiters[entry->nwaiters - 1];
+				memset(&entry->waiters[entry->nwaiters - 1], 0, sizeof(entry->waiters[0]));
+				entry->nwaiters--;
+				swept++;
+				continue;
+			}
+			i++;
+		}
+		SpinLockRelease(&entry->lock);
+	}
+
+	if (swept > 0)
+		ereport(DEBUG1, (errmsg_internal("cluster_grd_cleanup_stale_epoch_scoped(" UINT64_FORMAT
+										 "): swept %d affected-shard slots",
+										 current_epoch, swept)));
+}
+
+/*
+ * cluster_grd_cleanup_stale_epoch_postbarrier — spec-4.6 P0#3 (P6).
+ *
+ *	Global stale sweep, legal ONLY after the redeclare ack barrier:
+ *	every live backend has rebound all its registered grants to the
+ *	current epoch, so any remaining old-epoch holder/waiter is provably
+ *	unclaimed (its backend exited mid-window, or its release was
+ *	epoch-rejected during the window) and MUST be removed — a leaked
+ *	holder blocks the resource forever.  Converts carry no epoch and
+ *	are not swept here (dead-node converts fall to dead_sweep;  a
+ *	live-node stale convert self-resolves through its requester's
+ *	timeout + retry).
+ */
+uint32
+cluster_grd_cleanup_stale_epoch_postbarrier(uint64 current_epoch)
+{
+	HASH_SEQ_STATUS status;
+	ClusterGrdEntry *entry;
+	uint32 swept = 0;
+	uint32 waiters_dropped = 0;
+
+	if (cluster_grd_entry_htab == NULL)
+		return 0;
+
+	hash_seq_init(&status, cluster_grd_entry_htab);
+	while ((entry = (ClusterGrdEntry *)hash_seq_search(&status)) != NULL) {
+		int i;
+
+		SpinLockAcquire(&entry->lock);
+		for (i = 0; i < entry->ngranted;) {
+			if (entry->holders[i].cluster_epoch < current_epoch) {
+				if (i < entry->ngranted - 1)
+					entry->holders[i] = entry->holders[entry->ngranted - 1];
+				memset(&entry->holders[entry->ngranted - 1], 0, sizeof(entry->holders[0]));
+				entry->ngranted--;
+				swept++;
+				continue;
+			}
+			i++;
+		}
+		for (i = 0; i < entry->nwaiters;) {
+			if (entry->waiters[i].cluster_epoch < current_epoch) {
+				if (i < entry->nwaiters - 1)
+					entry->waiters[i] = entry->waiters[entry->nwaiters - 1];
+				memset(&entry->waiters[entry->nwaiters - 1], 0, sizeof(entry->waiters[0]));
+				entry->nwaiters--;
+				waiters_dropped++;
+				continue;
+			}
+			i++;
+		}
+		SpinLockRelease(&entry->lock);
+	}
+
+	if (swept > 0)
+		pg_atomic_fetch_add_u64(&cluster_grd_state->stale_holder_swept_count, swept);
+	if (waiters_dropped > 0)
+		pg_atomic_fetch_add_u64(&cluster_grd_state->waiters_requeued_count, waiters_dropped);
+	if (swept > 0 || waiters_dropped > 0)
+		ereport(DEBUG1,
+				(errmsg_internal("cluster_grd_cleanup_stale_epoch_postbarrier(" UINT64_FORMAT
+								 "): swept %u leaked holders + %u stale waiters",
+								 current_epoch, swept, waiters_dropped)));
+	return swept;
+}
+
+/*
+ * Broadcast PROCSIG_CLUSTER_GRD_REDECLARE to every live backend.
+ * Pattern mirrors cluster_reconfig_broadcast_local_procsig.
+ */
+static int
+grd_recovery_broadcast_redeclare(void)
+{
+	int beid;
+	int signaled = 0;
+	pid_t self_pid = MyProcPid;
+
+	for (beid = 1; beid <= MaxBackends; beid++) {
+		PGPROC *proc = BackendIdGetProc((BackendId)beid);
+		pid_t pid;
+
+		if (proc == NULL)
+			continue;
+		pid = proc->pid;
+		if (pid == 0 || pid == self_pid)
+			continue;
+		(void)SendProcSignal(pid, PROCSIG_CLUSTER_GRD_REDECLARE, (BackendId)beid);
+		signaled++;
+	}
+	return signaled;
+}
+
+/*
+ * Barrier check:  every live backend has acked the redeclare
+ * generation.  Backends born after the broadcast were seeded with the
+ * current generation at InitProcess (they hold no stale-epoch grants);
+ * backends that exited simply drop out of the scan (their leaked
+ * master-side state is exactly what P6 sweeps).
+ */
+static bool
+grd_recovery_barrier_complete(uint64 gen)
+{
+	int beid;
+	pid_t self_pid = MyProcPid;
+
+	for (beid = 1; beid <= MaxBackends; beid++) {
+		PGPROC *proc = BackendIdGetProc((BackendId)beid);
+
+		if (proc == NULL)
+			continue;
+		if (proc->pid == 0 || proc->pid == self_pid)
+			continue;
+		if (pg_atomic_read_u64(&proc->cluster_grd_redeclare_acked) < gen)
+			return false;
+	}
+	return true;
+}
+
+void
+cluster_grd_recovery_lmon_tick(void)
+{
+	uint32 state;
+
+	if (!cluster_enabled || cluster_grd_state == NULL)
+		return;
+	if (pg_atomic_read_u32(&cluster_grd_state->master_map_initialized) == 0)
+		return;
+
+	state = pg_atomic_read_u32(&cluster_grd_state->recovery_state);
+
+	if (state == (uint32)GRD_RECOVERY_IDLE) {
+		ReconfigEvent evt;
+		uint64 ev_id;
+		int b;
+
+		cluster_reconfig_get_last_event(&evt);
+		ev_id = evt.event_id;
+		if (ev_id == 0 || ev_id == pg_atomic_read_u64(&cluster_grd_state->recovery_last_event_id))
+			return;
+
+		/* P0 accept:  a fresh reconfig event (quorum-accepted dead set). */
+		pg_atomic_write_u64(&cluster_grd_state->recovery_last_event_id, ev_id);
+		for (b = 0; b < (CLUSTER_MAX_NODES + 63) / 64; b++) {
+			uint64 word = 0;
+			int j;
+
+			for (j = 0; j < 8; j++) {
+				int byte_idx = b * 8 + j;
+
+				if (byte_idx < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES)
+					word |= ((uint64)evt.dead_bitmap[byte_idx]) << (8 * j);
+			}
+			pg_atomic_write_u64(&cluster_grd_state->recovery_dead_bitmap[b], word);
+		}
+		pg_atomic_write_u64(&cluster_grd_state->recovery_event_old_epoch, evt.old_epoch);
+		pg_atomic_fetch_add_u64(&cluster_grd_state->remaster_started_count, 1);
+		pg_atomic_write_u32(&cluster_grd_state->recovery_state, (uint32)GRD_RECOVERY_WAIT_EPOCH);
+		state = (uint32)GRD_RECOVERY_WAIT_EPOCH;
+		ereport(DEBUG1, (errmsg_internal("cluster_grd_recovery: P0 accept event " UINT64_FORMAT
+										 " (old epoch " UINT64_FORMAT ")",
+										 ev_id, evt.old_epoch)));
+		/* fall through — the coordinator already bumped the epoch this
+		 * tick, so P1-P5 usually run immediately below. */
+	}
+
+	if (state == (uint32)GRD_RECOVERY_WAIT_EPOCH) {
+		uint64 cur_epoch = cluster_epoch_get_current();
+		uint64 old_epoch = pg_atomic_read_u64(&cluster_grd_state->recovery_event_old_epoch);
+		uint64 dead[(CLUSTER_MAX_NODES + 63) / 64];
+		uint64 affected[GRD_SHARD_BITMAP_WORDS];
+		uint32 nfrozen = 0;
+		uint32 moved;
+		uint64 gen;
+		TimestampTz deadline;
+		int i;
+		int signaled;
+
+		/*
+		 * Gate on the ACCEPTED epoch having advanced past the episode's
+		 * old epoch:  the coordinator bumped it earlier this tick;  a
+		 * non-coordinator survivor observes it via IC envelope piggyback
+		 * a tick or two later.  Running the rebind before the local
+		 * epoch advances would mint holders the new master rejects.
+		 */
+		if (cur_epoch <= old_epoch)
+			return;
+
+		for (i = 0; i < (CLUSTER_MAX_NODES + 63) / 64; i++)
+			dead[i] = pg_atomic_read_u64(&cluster_grd_state->recovery_dead_bitmap[i]);
+
+		/* P1 freeze affected:  master map not yet flipped, so affected =
+		 * shards whose CURRENT master carries a dead bit. */
+		memset(affected, 0, sizeof(affected));
+		for (i = 0; i < PGRAC_GRD_SHARD_COUNT; i++) {
+			uint32 m = pg_atomic_read_u32(&cluster_grd_state->master[i]);
+
+			if (grd_dead_bitmap_test(dead, (int32)m)) {
+				cluster_grd_shard_set_phase((uint32)i, GRD_SHARD_FROZEN);
+				grd_shard_bitmap_set(affected, (uint32)i);
+				nfrozen++;
+			}
+		}
+		ereport(DEBUG1,
+				(errmsg_internal("cluster_grd_recovery: P1 freeze %u affected shards", nfrozen)));
+
+		/* P3 scoped stale sweep (P2 dead_sweep ran earlier in the tick,
+		 * I47:  dead sweep precedes the epoch bump). */
+		cluster_grd_cleanup_stale_epoch_scoped(cur_epoch, affected);
+
+		/* P4 remaster (D2, deterministic from the accepted snapshot). */
+		moved = cluster_grd_master_map_remaster(dead, cur_epoch);
+		ereport(DEBUG1,
+				(errmsg_internal("cluster_grd_recovery: P4 remaster moved %u shards", moved)));
+
+		/* Affected shards now have a live master but unrebuilt holder
+		 * state:  REBUILDING (requests stay fenced until P7). */
+		for (i = 0; i < PGRAC_GRD_SHARD_COUNT; i++) {
+			if (grd_shard_bitmap_test(affected, (uint32)i))
+				cluster_grd_shard_set_phase((uint32)i, GRD_SHARD_REBUILDING);
+		}
+
+		/* P5 arm the cooperative-rebind barrier + broadcast.  The rebind
+		 * is CLUSTER-WIDE (P0#3):  the epoch bump staled EVERY stored
+		 * holder identity, not only those on remastered shards. */
+		gen = pg_atomic_add_fetch_u64(&cluster_grd_state->recovery_redeclare_generation, 1);
+		deadline
+			= TimestampTzPlusMilliseconds(GetCurrentTimestamp(), cluster_grd_rebuild_timeout_ms);
+		pg_atomic_write_u64(&cluster_grd_state->recovery_barrier_deadline, (uint64)deadline);
+		signaled = grd_recovery_broadcast_redeclare();
+		pg_atomic_write_u32(&cluster_grd_state->recovery_state, (uint32)GRD_RECOVERY_WAIT_BARRIER);
+		ereport(DEBUG1, (errmsg_internal("cluster_grd_recovery: P5 redeclare gen " UINT64_FORMAT
+										 " broadcast to %d backends",
+										 gen, signaled)));
+		return; /* barrier evaluated from the next tick on */
+	}
+
+	if (state == (uint32)GRD_RECOVERY_WAIT_BARRIER) {
+		uint64 gen = pg_atomic_read_u64(&cluster_grd_state->recovery_redeclare_generation);
+
+		if (grd_recovery_barrier_complete(gen)) {
+			uint64 cur_epoch = cluster_epoch_get_current();
+			uint32 swept;
+			uint32 unfrozen = 0;
+			int i;
+
+			/* P6 post-barrier global sweep (P0#3:  only legal HERE). */
+			swept = cluster_grd_cleanup_stale_epoch_postbarrier(cur_epoch);
+
+			/* P7 unfreeze. */
+			for (i = 0; i < PGRAC_GRD_SHARD_COUNT; i++) {
+				if (pg_atomic_read_u32(&cluster_grd_state->shard_phase[i])
+					!= (uint32)GRD_SHARD_NORMAL) {
+					cluster_grd_shard_set_phase((uint32)i, GRD_SHARD_NORMAL);
+					unfrozen++;
+				}
+			}
+			pg_atomic_fetch_add_u64(&cluster_grd_state->remaster_done_count, 1);
+			pg_atomic_write_u32(&cluster_grd_state->recovery_state, (uint32)GRD_RECOVERY_IDLE);
+			ereport(DEBUG1, (errmsg_internal("cluster_grd_recovery: P6 swept %u leaked slots; "
+											 "P7 unfroze %u shards (gen " UINT64_FORMAT ")",
+											 swept, unfrozen, gen)));
+			return;
+		}
+
+		if (GetCurrentTimestamp()
+			> (TimestampTz)pg_atomic_read_u64(&cluster_grd_state->recovery_barrier_deadline)) {
+			TimestampTz deadline;
+
+			/*
+			 * Barrier deadline expired:  fail-closed.  Affected shards
+			 * STAY frozen (a half-rebuilt shard is never opened — the
+			 * 53R9I surface on the request path is the user-visible
+			 * fail-closed), the global sweep does NOT run, and the
+			 * redeclare is re-broadcast with a fresh deadline so a
+			 * slow-but-alive backend converges on its next CFI.
+			 * (ereport(FATAL) here would crash-loop the respawned LMON
+			 * against the same stalled barrier;  WARNING + retry keeps
+			 * the fail-closed posture without self-DoS.)
+			 */
+			pg_atomic_fetch_add_u64(&cluster_grd_state->rebuild_timeout_count, 1);
+			pg_atomic_fetch_add_u64(&cluster_grd_state->remaster_failed_count, 1);
+			ereport(WARNING,
+					(errcode(ERRCODE_CLUSTER_GRD_SHARD_REMASTERING),
+					 errmsg("cluster GRD holder-rebuild barrier timed out; affected shards "
+							"stay frozen"),
+					 errhint("A backend has not acked the cooperative rebind within "
+							 "cluster.grd_rebuild_timeout_ms; re-broadcasting.")));
+			deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+												   cluster_grd_rebuild_timeout_ms);
+			pg_atomic_write_u64(&cluster_grd_state->recovery_barrier_deadline, (uint64)deadline);
+			(void)grd_recovery_broadcast_redeclare();
+		}
+	}
+}
+
+/*
+ * cluster_grd_entry_rebind_or_insert_holder — spec-4.6 D3 master side.
+ *
+ *	Match key = (node_id, procno, lockmode) + resid:  a backend holds at
+ *	most one grant per (resid, mode) (LOCALLOCK uniqueness), so the
+ *	stale epoch/request_id of the old identity carry no information the
+ *	master could verify.  Match → overwrite identity in place
+ *	(unaffected-shard rebind;  idempotent for retransmits);  no match →
+ *	insert (remastered-shard rebuild;  the new master fills holders[]
+ *	from re-declarations ONLY).  Defensive double-grant check:  an
+ *	insert that CONFLICTS with another backend's live holder is refused
+ *	(the pre-crash grant set was compatible by construction, so a
+ *	conflict here means a protocol anomaly — fail closed, the sender
+ *	stays un-acked and its shard frozen).
+ */
+ClusterGrdEntryResult
+cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid,
+										  const ClusterGrdHolderId *new_holder,
+										  int32 source_node_id, int lockmode)
+{
+	ClusterGrdEntry *entry = NULL;
+	ClusterGrdEntryResult er;
+	int i;
+
+	Assert(resid != NULL && new_holder != NULL);
+
+	er = cluster_grd_entry_lookup_or_create(resid, true, &entry);
+	if (er != CLUSTER_GRD_ENTRY_OK || entry == NULL)
+		return er;
+
+	SpinLockAcquire(&entry->lock);
+
+	/* In-place rebind:  same backend + same mode. */
+	for (i = 0; i < entry->ngranted; i++) {
+		if ((uint32)entry->holders[i].node_id == new_holder->node_id
+			&& entry->holders[i].procno == new_holder->procno
+			&& entry->holders[i].mode == (LOCKMODE)lockmode) {
+			entry->holders[i].cluster_epoch = new_holder->cluster_epoch;
+			entry->holders[i].request_id = new_holder->request_id;
+			entry->generation++;
+			SpinLockRelease(&entry->lock);
+			pg_atomic_fetch_add_u64(&cluster_grd_state->holders_rebound_count, 1);
+			return CLUSTER_GRD_ENTRY_OK;
+		}
+	}
+
+	/* Defensive double-grant refusal (see header comment). */
+	for (i = 0; i < entry->ngranted; i++) {
+		if (((uint32)entry->holders[i].node_id != new_holder->node_id
+			 || entry->holders[i].procno != new_holder->procno)
+			&& DoLockModesConflict((LOCKMODE)lockmode, entry->holders[i].mode)) {
+			SpinLockRelease(&entry->lock);
+			return CLUSTER_GRD_ENTRY_ERROR;
+		}
+	}
+
+	if (entry->ngranted >= PGRAC_GRD_MAX_HOLDERS) {
+		pg_atomic_fetch_add_u64(&cluster_grd_state->holders_full_count, 1);
+		SpinLockRelease(&entry->lock);
+		return CLUSTER_GRD_ENTRY_FULL;
+	}
+
+	entry->holders[entry->ngranted].node_id = (int32)new_holder->node_id;
+	entry->holders[entry->ngranted].procno = new_holder->procno;
+	entry->holders[entry->ngranted].cluster_epoch = new_holder->cluster_epoch;
+	entry->holders[entry->ngranted].request_id = new_holder->request_id;
+	entry->holders[entry->ngranted].mode = (LOCKMODE)lockmode;
+	entry->ngranted++;
+	entry->generation++;
+	SpinLockRelease(&entry->lock);
+
+	(void)source_node_id; /* identity already carried by new_holder */
+	pg_atomic_fetch_add_u64(&cluster_grd_state->holders_redeclared_count, 1);
+	return CLUSTER_GRD_ENTRY_OK;
 }
 
 
@@ -1549,9 +2036,29 @@ cluster_grd_entry_release_and_pop_compatible_waiter(const ClusterResId *resid,
 	/*
 	 * (2) Scan FIFO waiters; pop the first whose mode is compatible with
 	 *	  every surviving holder.  Promote to holders[].
+	 *
+	 * spec-4.6 P0#3 window guard:  a waiter queued under an OLD epoch
+	 * must never be promoted — its GRANT reply would echo the stale
+	 * holder tuple and be rejected by the requester's inbound
+	 * validation, leaving a zombie grant nobody owns.  Drop such
+	 * waiters here (the requester self-retries under the current
+	 * epoch);  count as stale_request_drop.
 	 */
 	while (popped < max_out && entry->nwaiters > 0) {
 		int chosen = -1;
+		uint64 cur_epoch = cluster_epoch_get_current();
+
+		for (int w = 0; w < entry->nwaiters;) {
+			if (entry->waiters[w].cluster_epoch < cur_epoch) {
+				if (w < entry->nwaiters - 1)
+					entry->waiters[w] = entry->waiters[entry->nwaiters - 1];
+				memset(&entry->waiters[entry->nwaiters - 1], 0, sizeof(entry->waiters[0]));
+				entry->nwaiters--;
+				pg_atomic_fetch_add_u64(&cluster_grd_state->stale_request_drop_count, 1);
+				continue;
+			}
+			w++;
+		}
 
 		for (int w = 0; w < entry->nwaiters; w++) {
 			bool compatible = true;
@@ -1946,6 +2453,15 @@ cluster_grd_check_pending_interrupts(void)
 	if (cluster_ges_cancel_pending) {
 		cluster_ges_cancel_pending = false;
 		cluster_grd_cancel_handler();
+	}
+
+	/* spec-4.6 D3 — cooperative holder rebind.  Clear-then-work (a new
+	 * broadcast re-arms the flag);  the walker is no-throw and acks the
+	 * barrier generation only on full success, so a partial pass simply
+	 * leaves this backend un-acked until LMON's re-broadcast. */
+	if (cluster_grd_redeclare_pending) {
+		cluster_grd_redeclare_pending = false;
+		cluster_grd_redeclare_all_registered();
 	}
 }
 

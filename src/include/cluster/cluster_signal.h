@@ -70,6 +70,11 @@ extern volatile sig_atomic_t cluster_reconfig_start_pending;
 extern volatile sig_atomic_t cluster_ges_bast_pending;
 extern volatile sig_atomic_t cluster_ges_cancel_pending;
 
+/* spec-4.6 D3: cooperative holder-rebind pending flag.  Same two-phase
+ * pattern;  the real LOCALLOCK walk + GES REDECLARE round-trips run
+ * later from ProcessInterrupts (no-throw), never in signal context. */
+extern volatile sig_atomic_t cluster_grd_redeclare_pending;
+
 
 /*
  * cluster_handle_reconfig_start_interrupt -- async-signal-safe handler
@@ -133,6 +138,9 @@ extern void cluster_handle_thaw_writes_interrupt(void);
  * Real GRD work runs later from ProcessInterrupts, not here. */
 extern void cluster_handle_ges_bast_interrupt(void);
 extern void cluster_handle_ges_cancel_interrupt(void);
+
+/* spec-4.6 D3 — cooperative holder-rebind async-signal-safe handler. */
+extern void cluster_handle_grd_redeclare_interrupt(void);
 
 
 #endif /* CLUSTER_SIGNAL_H */

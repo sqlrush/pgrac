@@ -166,6 +166,52 @@ cluster_epoch_get_current(void)
 	return 1;
 }
 
+/* spec-4.6 D3 stubs — the cooperative redeclare walker is inert in the
+ * standalone fixture:  cluster_grd_redeclare_generation() == 0 makes
+ * cluster_grd_redeclare_all_registered early-return, so the hash_seq /
+ * LocalLockHash symbols are link-only and never reached at runtime. */
+bool cluster_enabled = false;
+
+uint64
+cluster_grd_redeclare_generation(void)
+{
+	return 0;
+}
+
+uint32
+cluster_ges_send_redeclare_and_wait(const struct ClusterResId *resid pg_attribute_unused(),
+									uint32 lockmode pg_attribute_unused(),
+									const struct ClusterGrdHolderId *nh pg_attribute_unused(),
+									uint64 request_id pg_attribute_unused())
+{
+	return 0;
+}
+
+ClusterGrdEntryResult
+cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid pg_attribute_unused(),
+										  const struct ClusterGrdHolderId *nh pg_attribute_unused(),
+										  int32 src pg_attribute_unused(),
+										  int lockmode pg_attribute_unused())
+{
+	return CLUSTER_GRD_ENTRY_OK;
+}
+
+HTAB *
+GetLockMethodLocalHash(void)
+{
+	return NULL;
+}
+
+void
+hash_seq_init(HASH_SEQ_STATUS *status pg_attribute_unused(), HTAB *hashp pg_attribute_unused())
+{}
+
+void *
+hash_seq_search(HASH_SEQ_STATUS *status pg_attribute_unused())
+{
+	return NULL;
+}
+
 /* spec-2.25 D8 R10 stub audit — SearchSysCache1 / ReleaseSysCache pulled
  * in by cluster_relation_is_persistent_or_unlogged.  Standalone test does
  * not exercise the helper directly;  null-safe stubs satisfy link. */

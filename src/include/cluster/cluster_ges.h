@@ -214,7 +214,23 @@ typedef enum GesRequestOpcode {
 	 *	integrated receiver would be a wire-with-stub-receiver反模式
 	 *	(L107 family N+5;  spec-2.27 brainstorm Q3 catch).
 	 */
-	GES_REQ_OPCODE_PRIORITY_BOOST = 11
+	GES_REQ_OPCODE_PRIORITY_BOOST = 11,
+	/*
+	 * spec-4.6 D3 — cooperative holder rebind after failure-driven
+	 * remaster.  Payload is the standard GesRequestPayload carrying the
+	 * NEW (current-epoch) holder 4-tuple;  the wire ABI is unchanged
+	 * (Q3-C).  The OLD holder identity does not ride the wire:  the
+	 * master-side match key is (node_id, procno, lockmode) + resid —
+	 * a backend holds at most one grant per (resid, mode), so the stale
+	 * epoch/request_id components carry no extra information the master
+	 * could verify.  Master semantics = insert-or-rebind:
+	 *	  entry holder with same (node_id, procno, mode) → overwrite its
+	 *	  identity with the new 4-tuple (unaffected-shard in-place rebind;
+	 *	  idempotent for retransmits);
+	 *	  no match → insert as holder (remastered-shard rebuild;  the new
+	 *	  master fills holders[] from these re-declarations ONLY).
+	 */
+	GES_REQ_OPCODE_REDECLARE = 12
 } GesRequestOpcode;
 
 typedef enum GesReplyOpcode {
@@ -227,7 +243,8 @@ typedef enum GesRejectReason {
 	GES_REJECT_REASON_WORK_QUEUE_FULL = 1,
 	GES_REJECT_REASON_LOCK_CONFLICT = 2,
 	GES_REJECT_REASON_EPOCH_MISMATCH = 3,
-	GES_REJECT_REASON_TIMEOUT = 4
+	GES_REJECT_REASON_TIMEOUT = 4,
+	GES_REJECT_REASON_SHARD_FROZEN = 5 /* spec-4.6 D4: shard FROZEN/REBUILDING */
 } GesRejectReason;
 
 /* ClusterGrdHolderId 4-tuple typedef defined in cluster_grd.h (semantic
@@ -341,6 +358,14 @@ extern uint32 cluster_ges_send_request_and_wait(const struct ClusterResId *resid
 extern uint32 cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 												const struct ClusterGrdHolderId *holder,
 												uint64 request_id);
+
+/* spec-4.6 D3 — send GES_REDECLARE (NEW current-epoch holder) to the
+ * resource's current master and wait for the GRANT/REJECT ack.  Returns
+ * GES_REJECT_REASON_NONE (0) on ack;  non-zero reason on reject/timeout
+ * (caller leaves the old holder in place — fail-closed, no overwrite). */
+extern uint32 cluster_ges_send_redeclare_and_wait(const struct ClusterResId *resid, uint32 lockmode,
+												  const struct ClusterGrdHolderId *new_holder,
+												  uint64 request_id);
 
 
 /* ============================================================

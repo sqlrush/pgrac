@@ -135,14 +135,14 @@ UT_TEST(test_pg_native_reasons_unchanged)
 }
 
 
-UT_TEST(test_num_procsignals_is_19)
+UT_TEST(test_num_procsignals_is_20)
 {
 	/* PG's 14 native reasons (PROCSIG_CATCHUP_INTERRUPT through
-	 * PROCSIG_RECOVERY_CONFLICT_STARTUP_DEADLOCK) + 5 pgrac reasons:
+	 * PROCSIG_RECOVERY_CONFLICT_STARTUP_DEADLOCK) + 6 pgrac reasons:
 	 * RECONFIG_START (spec-1.11) + CLUSTER_FREEZE_WRITES +
 	 * CLUSTER_THAW_WRITES (spec-2.6 D5) + GES_BAST + GES_CANCEL
-	 * (spec-2.17 Q8 + Q9). */
-	UT_ASSERT_EQ(NUM_PROCSIGNALS, 19);
+	 * (spec-2.17 Q8 + Q9) + GRD_REDECLARE (spec-4.6 D3). */
+	UT_ASSERT_EQ(NUM_PROCSIGNALS, 20);
 }
 
 
@@ -221,7 +221,7 @@ main(void)
 	UT_PLAN(8);
 	UT_RUN(test_cluster_reconfig_start_after_recovery_conflict_bufferpin);
 	UT_RUN(test_pg_native_reasons_unchanged);
-	UT_RUN(test_num_procsignals_is_19);
+	UT_RUN(test_num_procsignals_is_20);
 	UT_RUN(test_cluster_reconfig_start_pending_default_false);
 	UT_RUN(test_handler_symbol_linkable);
 	UT_RUN(test_handler_sets_pending_flag);

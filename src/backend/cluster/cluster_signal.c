@@ -65,6 +65,7 @@
 volatile sig_atomic_t cluster_reconfig_start_pending = false;
 volatile sig_atomic_t cluster_ges_bast_pending = false;
 volatile sig_atomic_t cluster_ges_cancel_pending = false;
+volatile sig_atomic_t cluster_grd_redeclare_pending = false; /* spec-4.6 D3 */
 
 
 /* ============================================================
@@ -173,6 +174,26 @@ void
 cluster_handle_ges_cancel_interrupt(void)
 {
 	cluster_ges_cancel_pending = true;
+	InterruptPending = true;
+	SetLatch(MyLatch);
+}
+
+/*
+ * cluster_handle_grd_redeclare_interrupt -- handler for
+ *	PROCSIG_CLUSTER_GRD_REDECLARE (spec-4.6 D3).
+ *
+ *	Cooperative holder rebind:  LMON broadcast tells every live backend
+ *	to walk its OWN cluster_registered LOCALLOCKs and rebind them to the
+ *	current accepted epoch (old→new holder, §2.3).  Signal context only
+ *	marks the pending flag;  the LOCALLOCK walk + GES round-trips run
+ *	from ProcessInterrupts (cluster_grd_check_pending_interrupts), and
+ *	idle backends reach it via DoingCommandRead CHECK_FOR_INTERRUPTS
+ *	(InterruptPending set here, same as the BAST/CANCEL pattern).
+ */
+void
+cluster_handle_grd_redeclare_interrupt(void)
+{
+	cluster_grd_redeclare_pending = true;
 	InterruptPending = true;
 	SetLatch(MyLatch);
 }

@@ -14,9 +14,9 @@
 #    init (cluster_grd_master_map_refresh is a Stage-6 DRM no-op
 #    placeholder), so a dead node owns its shards forever.
 #
-#    Leg map (XFAIL-gap legs assert TODAY's broken behaviour and are
-#    annotated "XFAIL-gap"; D2-D4 flip them to the fixed expectation —
-#    same leg numbers, spec-4.6 §4.2):
+#    Leg map (originally measure-first XFAIL pins of the pre-4.6 gap;
+#    legs flip to the fixed expectation as each deliverable lands —
+#    git history of this file documents the pinned broken behaviour):
 #      L0  strict-mode ClusterPair (3 voting disks) + master map sanity:
 #          both nodes agree on a 2-way round-robin master map.
 #      L1  PREMISE: node1 acquires xact-advisory locks; discovery finds
@@ -25,18 +25,19 @@
 #      L2  kill -9 node0 postmaster → CSSD deadband DEAD edge →
 #          reconfig coordinator fires on node1 (epoch advances).
 #          Substrate legs — these must PASS both before and after 4.6.
-#      L3  XFAIL-gap: master map on node1 STILL routes shard S to the
-#          DEAD node0 (no failure-driven remaster).  D2 flips: master
-#          becomes a survivor (node1).
-#      L4  XFAIL-gap: a NEW request for a node0-mastered resource from
-#          node1 fails (bounded GES timeout, SQLSTATE 55P03 today).
-#          D2-D4 flip: acquire succeeds against the new master.
-#      L5  XFAIL-gap: the surviving holder's release is silently
-#          swallowed toward the dead master (commit completes, grant
-#          state unrecoverable), and re-acquiring the SAME resource
-#          fails like L4.  D3 flips: holder rebinds, release reaches
-#          the new master, re-acquire succeeds.
-#      L6  XFAIL-gap: no grd_recovery observability category exists.
+#      L3  (D2+D1 flipped) failure-driven remaster moves every shard of
+#          the dead node to the survivor; dead node owns 0 shards.
+#          Pinned gap was: map statically frozen, dead node owns 2048.
+#      L6  (D3) the surviving holder is rebuilt on the NEW master via
+#          the cooperative redeclare (idle-in-transaction backend
+#          reached through DoingCommandRead CHECK_FOR_INTERRUPTS).
+#      L4  (D2-D4 flipped) a NEW request for a previously-dead-mastered
+#          resource succeeds.  Pinned gap was: bounded GES wait then
+#          FAIL_INTERNAL(16) via the stale S4 reject mapping.
+#      L5  (D3 flipped) the rebound holder's release lands on the new
+#          master and the resource is immediately re-acquirable.
+#          Pinned gap was: release silently swallowed, resource wedged.
+#      L7  XFAIL-gap: no grd_recovery observability category exists.
 #          D5 flips: 13 counters under category='grd_recovery'.
 #
 #    Discipline notes:
@@ -258,75 +259,68 @@ ok(poll_query_until_timeout($pair->node1, 'postgres',
 
 
 # ----------
-# L3: XFAIL-gap — master map frozen: shard S still routed to DEAD node0.
-#     D2 flips this leg to: master_node_id = 1 (deterministic survivor)
-#     + master_generation bump.
+# L3 (FLIPPED by D2+D1): failure-driven remaster moves every dead-owned
+#     shard to the survivor.  Poll: the LMON recovery sequence (P0-P7)
+#     runs within a tick or two of the reconfig event.
 # ----------
-my $master_after = $pair->node1->safe_psql('postgres',
-	"SELECT master_node_id FROM pg_cluster_grd_shards WHERE shard_id = $S_hold");
-is($master_after, '0',
-	'L3 XFAIL-gap pinned: master map still routes shard S to DEAD node0 '
-	. '(cluster_grd_master_map_refresh is a no-op placeholder; D2 flips to survivor)');
+ok(poll_query_until_timeout($pair->node1, 'postgres',
+		"SELECT master_node_id = 1 FROM pg_cluster_grd_shards WHERE shard_id = $S_hold",
+		't', 20, 'L3 shard S remastered to survivor node1'),
+	'L3 shard S remastered from dead node0 to survivor node1 (D2 flip)');
 
-my $dead_owned = $pair->node1->safe_psql('postgres',
-	q{SELECT count(*) FROM pg_cluster_grd_shards WHERE master_node_id = 0});
-ok($dead_owned > 0,
-	"L3 XFAIL-gap pinned: dead node0 still owns $dead_owned shards on node1's map "
-	. '(D2 flips to 0)');
-
-note('spec-4.6 gap pinned: GRD master map is statically frozen at LMON init; '
-	. 'a dead node owns its shards forever — the 4.6 closure target.');
+is($pair->node1->safe_psql('postgres',
+		q{SELECT count(*) FROM pg_cluster_grd_shards WHERE master_node_id = 0}),
+	'0', 'L3 dead node0 owns zero shards after remaster (D2 flip)');
 
 
 # ----------
-# L4: XFAIL-gap — NEW request for the node0-mastered probe key fails.
-#     The GES request is routed to the dead master and dies after the
-#     bounded GES wait.  Pinned surface today: "cluster_lock_acquire
-#     failed (result=16)" = FAIL_INTERNAL, because the S4 reject-reason
-#     mapping uses placeholder values (1/2/3) that do not match the
-#     real GES_REJECT_REASON_* enum (TIMEOUT=4) — a pre-existing wart
-#     owned by spec-4.6 D4 (the request-path SQLSTATE surface).
-#     D2-D4 flip this leg to: acquire SUCCEEDS against the new master.
+# L6-core (D3): the surviving holder was rebound — its grant lives in
+#     node1's own GRD entry (the new master) with ngranted=1.  The bg
+#     session is idle in an open transaction; the cooperative redeclare
+#     reaches it via the DoingCommandRead CHECK_FOR_INTERRUPTS path.
+# ----------
+ok(poll_query_until_timeout($pair->node1, 'postgres',
+		qq{SELECT ngranted = 1 FROM pg_cluster_grd_entries
+		    WHERE type = 10 AND lockmethodid = 2 AND field4 = 1 AND field3 = $K_hold},
+		't', 20, 'L6 surviving holder rebuilt on new master'),
+	'L6 surviving holder rebuilt on the new master via cooperative rebind (D3)');
+
+
+# ----------
+# L4 (FLIPPED by D2-D4): a NEW request for the previously-dead-mastered
+#     probe key now succeeds — the shard is locally mastered by node1.
 # ----------
 my ($rc4, $out4, $err4) = $pair->node1->psql('postgres',
 	"BEGIN;\nSELECT pg_advisory_xact_lock($K_probe);\nCOMMIT;",
 	timeout => 60);
-isnt($rc4, 0,
-	'L4 XFAIL-gap pinned: new acquire of dead-master resource errors out '
-	. '(D2-D4 flip: succeeds against remastered survivor)');
-like($err4, qr/cluster lock acquire timeout|cluster_lock_acquire failed/,
-	"L4 XFAIL-gap pinned: bounded GES wait then error (err=$err4)");
+is($rc4, 0,
+	"L4 new acquire of remastered resource succeeds (was: dead-master timeout; err=$err4)");
 
 
 # ----------
-# L5: XFAIL-gap — surviving holder cannot meaningfully release: the
-#     release toward the dead master is swallowed after the bounded
-#     wait (commit still completes — pinned), and the resource stays
-#     unreachable (re-acquire fails like L4).  D3 flips: holder is
-#     rebound to the new master during rebuild, release reaches the
-#     new master, re-acquire succeeds.
+# L5 (FLIPPED by D3): the rebound holder releases against the NEW
+#     master (rebind made cluster_holder_raw current-epoch, so the
+#     release is not rejected), and the resource is immediately
+#     re-acquirable by a fresh session.
 # ----------
 $discovery->query('COMMIT');
-ok(1, 'L5 XFAIL-gap pinned: holder COMMIT completes (release toward dead '
-	. 'master silently swallowed after bounded wait — leak by design today)');
+ok(1, 'L5 holder COMMIT completes (release now lands on the new master)');
 $discovery->quit;
 
 my ($rc5, $out5, $err5) = $pair->node1->psql('postgres',
 	"BEGIN;\nSELECT pg_advisory_xact_lock($K_hold);\nCOMMIT;",
 	timeout => 60);
-isnt($rc5, 0,
-	'L5 XFAIL-gap pinned: re-acquire of the previously-held resource fails '
-	. '(master map still points at dead node; D3 flips: rebind + remaster '
-	. 'make the resource reachable again)');
+is($rc5, 0,
+	"L5 re-acquire of the released resource succeeds post-rebind (err=$err5)");
 
 
 # ----------
-# L6: XFAIL-gap — no grd_recovery observability yet (D5 flips: 13
+# L7: XFAIL-gap — no grd_recovery observability yet (D5 flips: 13
 #     counters under category='grd_recovery').
 # ----------
 is($pair->node1->safe_psql('postgres',
 		q{SELECT count(*) FROM cluster_dump_state() WHERE category = 'grd_recovery'}),
-	'0', 'L6 XFAIL-gap pinned: grd_recovery dump category absent (D5 adds 13 counters)');
+	'0', 'L7 XFAIL-gap pinned: grd_recovery dump category absent (D5 adds 13 counters)');
 
 
 $pair->stop_pair;

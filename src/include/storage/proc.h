@@ -317,6 +317,17 @@ struct PGPROC {
 	bool cluster_grd_bast_pending;
 
 	/*
+	 * spec-4.6 D3 — cooperative holder-rebind barrier ack.  This backend
+	 * has rebound ALL its cluster_registered LOCALLOCKs to the current
+	 * accepted epoch for redeclare generation <= this value.  Written by
+	 * the owning backend (ProcessInterrupts redeclare pass), read by
+	 * LMON's barrier check.  InitProcess seeds it with the CURRENT
+	 * redeclare generation:  a backend born after the broadcast holds no
+	 * stale-epoch grants and must not block the barrier.
+	 */
+	pg_atomic_uint64 cluster_grd_redeclare_acked;
+
+	/*
 	 * spec-3.12 D1 — undo/TT-slot retention horizon.  Min CLUSTER-source
 	 * read_scn over this backend's live snapshots (active stack + registered);
 	 * InvalidScn when this backend holds no live cluster snapshot.  Published in

@@ -29,6 +29,12 @@
  *	    the spec-2.6 commit gate and the spec-2.28 ProcessInterrupts in-flight
  *	    abort path.
  *
+ *	  Stage 4.6 (recovery-aware GRD/GES remaster):
+ *	    Added PROCSIG_CLUSTER_GRD_REDECLARE.  LMON broadcasts it after a
+ *	    failure-driven remaster; every live backend walks its OWN
+ *	    cluster_registered LOCALLOCKs at CFI and rebinds them to the
+ *	    current accepted epoch (cooperative holder rebuild, spec-4.6 D3).
+ *
  *	  Each cluster reason is dispatched in
  *	  src/backend/storage/ipc/procsignal.c::procsignal_sigusr1_handler
  *	  to a handler — for stages 0.15+ in cluster_signal.c, for
@@ -88,6 +94,7 @@ typedef enum
 	PROCSIG_CLUSTER_THAW_WRITES,	/* spec-2.6: qvotec quorum recover → resume */
 	PROCSIG_CLUSTER_GES_BAST,		/* spec-2.17 Q8: BAST advisory notify */
 	PROCSIG_CLUSTER_GES_CANCEL,		/* spec-2.17 Q9: CANCEL wait/grant */
+	PROCSIG_CLUSTER_GRD_REDECLARE,	/* spec-4.6 D3: cooperative holder rebind */
 #endif
 
 	NUM_PROCSIGNALS				/* Must be last! */

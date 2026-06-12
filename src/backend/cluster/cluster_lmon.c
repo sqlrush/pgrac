@@ -924,6 +924,16 @@ LmonMain(void)
 			cluster_reconfig_lmon_tick();
 
 			/*
+			 * spec-4.6 D1:  GRD recovery sequence (P0-P7) — consumes the
+			 * reconfig event published by the tick above:  freeze affected
+			 * shards → scoped stale sweep → failure-driven remaster →
+			 * cooperative holder-rebind barrier → post-barrier global
+			 * sweep → unfreeze.  Must run AFTER cluster_reconfig_lmon_tick
+			 * (event/epoch source) and AFTER dead_sweep (I47, P2).
+			 */
+			cluster_grd_recovery_lmon_tick();
+
+			/*
 			 * spec-2.9 D2 review fix: BOC_BROADCAST is triggered by
 			 * walwriter BOC sweeps, but the actual tier1 fanout must run
 			 * in LMON because LMON owns the process-local IC fds.
@@ -1457,6 +1467,8 @@ LmonMain(void)
 			cluster_grd_lmon_tick_dead_sweep();
 
 			cluster_reconfig_lmon_tick();
+			/* spec-4.6 D1:  GRD recovery sequence (see main-loop site). */
+			cluster_grd_recovery_lmon_tick();
 			cluster_sinval_drain_outbound_and_broadcast();
 			cluster_sinval_drain_ack_outbound_and_send();
 			cluster_sinval_broadcast_reset_all();

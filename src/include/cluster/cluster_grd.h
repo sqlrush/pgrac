@@ -65,6 +65,7 @@
 
 #ifndef FRONTEND
 
+#include "cluster/cluster_conf.h" /* CLUSTER_MAX_NODES (spec-4.6 D1 bitmap sizing) */
 #include "port/atomics.h"
 #include "storage/lock.h" /* LOCKTAG */
 
@@ -244,6 +245,22 @@ typedef struct ClusterGrdShared {
 	 * remaster (observability + idempotency cross-check). */
 	pg_atomic_uint64 reconfig_remaster_epoch;
 
+	/* spec-4.6 D1 — GRD recovery sequence cursor (LMON-only writer;
+	 * shmem so an LMON respawn resumes instead of replaying P1-P7).
+	 *	recovery_last_event_id   last reconfig event consumed
+	 *	recovery_state           ClusterGrdRecoveryState
+	 *	recovery_dead_bitmap     accepted dead bitmap of the episode
+	 *	recovery_event_old_epoch episode's pre-bump epoch (observe gate)
+	 *	recovery_redeclare_generation  cooperative-rebind barrier ++;
+	 *	   backends ack into PGPROC.cluster_grd_redeclare_acked
+	 *	recovery_barrier_deadline  TimestampTz barrier expiry */
+	pg_atomic_uint64 recovery_last_event_id;
+	pg_atomic_uint32 recovery_state;
+	pg_atomic_uint64 recovery_dead_bitmap[(CLUSTER_MAX_NODES + 63) / 64];
+	pg_atomic_uint64 recovery_event_old_epoch;
+	pg_atomic_uint64 recovery_redeclare_generation;
+	pg_atomic_uint64 recovery_barrier_deadline;
+
 	/* spec-4.6 D5 — 13 grd_recovery counters (dump category
 	 * 'grd_recovery';  each has a t/249 leg).  Incremented along
 	 * D1-D4 paths as the corresponding deliverable lands. */
@@ -419,6 +436,60 @@ extern uint32 cluster_grd_shard_master_generation(uint32 shard_id);
 /* spec-4.6 D1/D4 — shard recovery phase (LMON-only writer). */
 extern ClusterGrdShardPhase cluster_grd_shard_phase(uint32 shard_id);
 extern void cluster_grd_shard_set_phase(uint32 shard_id, ClusterGrdShardPhase phase);
+
+/*
+ * spec-4.6 D1 — GRD recovery sequence (P0-P7, LMON tick driver).
+ *
+ *	IDLE         no episode in flight.
+ *	WAIT_EPOCH   reconfig event accepted;  waiting for the local accepted
+ *	             epoch to advance past the episode's old epoch (the
+ *	             coordinator bumps in the same tick;  non-coordinator
+ *	             survivors observe via IC piggyback) before P1-P5 run.
+ *	WAIT_BARRIER P5 redeclare broadcast done;  waiting for every live
+ *	             backend's PGPROC ack;  then P6 post-barrier sweep + P7
+ *	             unfreeze.  Deadline expiry keeps shards frozen
+ *	             (fail-closed) and re-broadcasts.
+ */
+typedef enum ClusterGrdRecoveryState {
+	GRD_RECOVERY_IDLE = 0,
+	GRD_RECOVERY_WAIT_EPOCH = 1,
+	GRD_RECOVERY_WAIT_BARRIER = 2,
+} ClusterGrdRecoveryState;
+
+extern void cluster_grd_recovery_lmon_tick(void);
+extern uint64 cluster_grd_redeclare_generation(void);
+
+/* spec-4.6 P0#2 — pre-remaster stale-epoch sweep SCOPED to the affected
+ * (dead-master) shards;  affected_shards is a PGRAC_GRD_SHARD_COUNT-bit
+ * bitmap (uint64 words).  Global sweeping before the rebind barrier
+ * would delete surviving holders on unaffected shards → double grant. */
+extern void cluster_grd_cleanup_stale_epoch_scoped(uint64 current_epoch,
+												   const uint64 *affected_shards);
+
+/* spec-4.6 P0#3 — post-barrier GLOBAL stale sweep (P6).  Only legal
+ * AFTER the redeclare ack barrier completes:  every live backend has
+ * rebound ALL its registered grants, so remaining old-epoch state is
+ * provably unclaimed (mid-window backend exit / epoch-rejected release)
+ * and MUST be removed (a leaked holder blocks the resource forever).
+ * Returns the number of slots swept. */
+extern uint32 cluster_grd_cleanup_stale_epoch_postbarrier(uint64 current_epoch);
+
+/* spec-4.6 D3 — master-side insert-or-rebind for GES_REDECLARE (see
+ * GES_REQ_OPCODE_REDECLARE contract in cluster_ges.h).  struct tag +
+ * forward declaration:  the ClusterGrdHolderId typedef appears later
+ * in this header. */
+struct ClusterGrdHolderId;
+extern ClusterGrdEntryResult
+cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid,
+										  const struct ClusterGrdHolderId *new_holder,
+										  int32 source_node_id, int lockmode);
+
+/* spec-4.6 D3 — backend-side cooperative rebind walker (defined in
+ * cluster_lock_acquire.c;  runs at CFI from cluster_grd_check_pending_
+ * interrupts, no-throw).  Walks this backend's cluster_registered
+ * LOCALLOCKs, rebinds every grant to the current epoch, and acks the
+ * barrier generation on full success. */
+extern void cluster_grd_redeclare_all_registered(void);
 
 /*
  * Master map lifecycle — LMON entry point (D3).

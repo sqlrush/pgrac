@@ -706,6 +706,9 @@ procsignal_sigusr1_handler(SIGNAL_ARGS)
 		cluster_handle_ges_bast_interrupt();
 	if (CheckProcSignal(PROCSIG_CLUSTER_GES_CANCEL))
 		cluster_handle_ges_cancel_interrupt();
+	/* spec-4.6 D3 — cooperative holder rebind dispatch. */
+	if (CheckProcSignal(PROCSIG_CLUSTER_GRD_REDECLARE))
+		cluster_handle_grd_redeclare_interrupt();
 #endif
 
 	SetLatch(MyLatch);

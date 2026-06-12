@@ -265,6 +265,15 @@ extern int cluster_ges_effective_timeout_ms(int lock_timeout_ms);
 extern int cluster_lmd_probe_collect_timeout_ms;
 extern int cluster_ges_reply_wait_max_entries;
 
+/* spec-4.6 D4/D1:  failure-driven remaster tunables.
+ * grd_remaster_wait_ms — backend short wait on a FROZEN/REBUILDING shard
+ *   before fail-closed 53R9I (default 200ms;  SIGHUP).
+ * grd_rebuild_timeout_ms — LMON holder-rebuild barrier deadline;  expiry
+ *   keeps affected shards frozen (fail-closed) + re-broadcasts (default
+ *   5000ms;  SIGHUP). */
+extern int cluster_grd_remaster_wait_ms;
+extern int cluster_grd_rebuild_timeout_ms;
+
 /* spec-2.24 D11 NEW: LMD periodic cleanup sweep interval. */
 extern int cluster_lmd_cleanup_sweep_interval_ms;
 

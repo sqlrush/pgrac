@@ -56,6 +56,8 @@
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_native_lock_probe.h"
 #include "cluster/cluster_signal.h" /* cluster_ges_cancel_pending sig_atomic_t */
+#include "storage/lock.h"			/* spec-4.6 D3 — LOCALLOCK + GetLockMethodLocalHash */
+#include "utils/hsearch.h"			/* spec-4.6 D3 — hash_seq over LocalLockHash */
 #include "access/htup_details.h"	/* GETSTRUCT */
 #include "access/xact.h"			/* GetTopTransactionIdIfAny */
 #include "catalog/pg_class.h"		/* Form_pg_class for HC25 relpersistence */
@@ -603,4 +605,123 @@ cluster_relation_is_persistent_or_unlogged(Oid relid)
 
 	ReleaseSysCache(tuple);
 	return eligible;
+}
+
+
+/*
+ * cluster_grd_redeclare_all_registered — spec-4.6 D3 backend walker.
+ *
+ *	Runs at CFI (cluster_grd_check_pending_interrupts) after LMON
+ *	broadcast PROCSIG_CLUSTER_GRD_REDECLARE.  Walks THIS backend's
+ *	LocalLockHash (the only process that legally can — lock.h:454
+ *	backend-private), and for every cluster_registered LOCALLOCK
+ *	performs the old→new holder rebind (§2.3):
+ *
+ *	  1. the stored cluster_holder_raw (old epoch) is the PROOF this
+ *	     backend held the grant — it selects WHAT to redeclare;  its
+ *	     stale epoch/request_id never ride the wire;
+ *	  2. a NEW holder is minted from the CURRENT accepted epoch + a
+ *	     fresh request_id (routing generation is recomputed by the send
+ *	     path — never exported from the stale LOCALLOCK);
+ *	  3. the new holder goes to the resource's CURRENT master
+ *	     (post-remaster map):  local master → direct insert-or-rebind,
+ *	     remote master → GES_REDECLARE send-and-wait;
+ *	  4. ONLY on ack are cluster_holder_raw / cluster_request_id
+ *	     overwritten, so the later release path (lock.c) presents the
+ *	     current-epoch holder.  No-ack → old holder kept, no barrier
+ *	     ack → the shard stays frozen (fail-closed).
+ *
+ *	Scope is CLUSTER-WIDE (P0#3):  every registered grant rebinds, not
+ *	only those on remastered shards — the epoch bump staled every
+ *	stored identity, and an un-rebound holder on an UNAFFECTED shard
+ *	would fail its own release/convert forever.
+ *
+ *	No-throw contract:  runs from ProcessInterrupts (including the
+ *	DoingCommandRead idle path);  all failures are swallowed into
+ *	"don't ack" — LMON re-broadcasts until the barrier completes.
+ */
+void
+cluster_grd_redeclare_all_registered(void)
+{
+	uint64 gen;
+	uint64 cur_epoch;
+	HTAB *locallocks;
+	HASH_SEQ_STATUS status;
+	LOCALLOCK *locallock;
+	bool all_ok = true;
+
+	if (!cluster_enabled || MyProc == NULL)
+		return;
+
+	gen = cluster_grd_redeclare_generation();
+	if (gen == 0)
+		return; /* no barrier ever armed */
+	if (pg_atomic_read_u64(&MyProc->cluster_grd_redeclare_acked) >= gen)
+		return; /* already acked this generation */
+
+	cur_epoch = cluster_epoch_get_current();
+	locallocks = GetLockMethodLocalHash();
+	if (locallocks != NULL) {
+		hash_seq_init(&status, locallocks);
+		while ((locallock = (LOCALLOCK *)hash_seq_search(&status)) != NULL) {
+			ClusterGrdHolderId old_holder;
+			ClusterGrdHolderId new_holder;
+			ClusterResId resid;
+			int32 master;
+			uint64 fresh_request_id;
+			bool ok = false;
+
+			if (!locallock->cluster_registered)
+				continue;
+
+			/*
+			 * Release-in-flight guard:  the lock.c cluster release hook
+			 * runs at the nLocks 1→0 edge, and its GES_RELEASE wait can
+			 * CFI into this walker.  Rebinding a lock whose release is
+			 * already in flight would mint a CURRENT-epoch holder the
+			 * (old-epoch) release can never remove — a leak even P6
+			 * cannot sweep.  Skip it:  the old-epoch master-side slot
+			 * stays leaked-by-old-epoch and P6 sweeps it as designed.
+			 */
+			if (locallock->nLocks == 0)
+				continue;
+
+			memcpy(&old_holder, locallock->cluster_holder_raw, sizeof(old_holder));
+			if (old_holder.cluster_epoch >= cur_epoch)
+				continue; /* already current (idempotent re-entry) */
+
+			cluster_grd_resid_encode(&locallock->tag.lock, &resid);
+
+			fresh_request_id = pg_atomic_fetch_add_u64(&request_id_counter, 1) + 1;
+			new_holder.node_id = old_holder.node_id;
+			new_holder.procno = old_holder.procno;
+			new_holder.cluster_epoch = cur_epoch;
+			new_holder.request_id = fresh_request_id;
+
+			master = cluster_grd_lookup_master(&resid);
+			if (master == cluster_node_id) {
+				/* Local master (incl. shard just remastered TO this
+				 * node):  direct insert-or-rebind, no wire. */
+				ok = (cluster_grd_entry_rebind_or_insert_holder(
+						  &resid, &new_holder, cluster_node_id, (int)locallock->tag.mode)
+					  == CLUSTER_GRD_ENTRY_OK);
+			} else if (master >= 0) {
+				ok = (cluster_ges_send_redeclare_and_wait(&resid, (uint32)locallock->tag.mode,
+														  &new_holder, fresh_request_id)
+					  == 0);
+			}
+
+			if (ok) {
+				/* §2.3 step 4 — overwrite ONLY after the master acked. */
+				memcpy(locallock->cluster_holder_raw, &new_holder,
+					   sizeof(locallock->cluster_holder_raw));
+				locallock->cluster_request_id = fresh_request_id;
+			} else {
+				all_ok = false;
+			}
+		}
+	}
+
+	if (all_ok)
+		pg_atomic_write_u64(&MyProc->cluster_grd_redeclare_acked, gen);
 }
