@@ -211,8 +211,8 @@ cmp_ok($catver, '>=', 202605420,
 is($pair->node0->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'97',
-	'L9 wait event count remains 85 (spec-2.35 D11 explicit 0 NEW)');
+	'98',
+	'L9 pg_stat_cluster_wait_events returns 98 rows (spec-4.6 +1 GRD shard remaster)');
 
 
 done_testing();

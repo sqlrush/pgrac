@@ -144,8 +144,8 @@ for my $we_name (
 is($pair->node0->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-   '97',
-   'L5 total cluster wait event count = 85 (spec-2.33 83 + 2 NEW)');
+   '98',
+   'L5 pg_stat_cluster_wait_events returns 98 rows (spec-4.6 +1 GRD shard remaster)');
 
 
 # ============================================================

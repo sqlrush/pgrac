@@ -286,7 +286,7 @@ cmp_ok($l12_cats, '>=', 24,
 # ============================================================
 is($pair->node0->safe_psql('postgres',
 		q{SELECT count(DISTINCT category) FROM pg_cluster_state}),
-	'32', 'L13a pg_cluster_state has 32 categories (spec-4.1 adds wal_thread)');
+	'33', 'L13a pg_cluster_state has 33 categories (spec-4.6 adds grd_recovery)');
 
 is($pair->node0->safe_psql('postgres',
 		q{SELECT count(*) FROM pg_cluster_state
