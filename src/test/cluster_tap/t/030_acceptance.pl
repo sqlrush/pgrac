@@ -332,8 +332,8 @@ ok( $node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT key) FROM pg_cluster_state
 		   WHERE category='inject' AND (key LIKE '%.fault_type' OR key LIKE '%.hits')}
-	) eq '246',
-	'M5 inject category has 123×2 = 246 sub-keys (.fault_type + .hits; spec-4.5a +1 point)');
+	) eq '248',
+	'M5 inject category has 124×2 = 248 sub-keys (.fault_type + .hits; spec-4.6 +1 point)');
 
 is($node->get_cluster_state_value('inject', 'armed_count'),
 	'0', 'M6 inject.armed_count starts at 0 in fresh backend');
