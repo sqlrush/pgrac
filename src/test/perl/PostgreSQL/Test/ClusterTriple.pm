@@ -66,6 +66,28 @@ sub new_triple
 			"${cluster_name}_node$i", port => $pg_ports[$i]);
 	}
 
+	# spec-4.6: strict-mode opt-in (mirror ClusterPair) — pre-allocate N
+	# shared voting-disk files so QVOTEC reaches quorum_state=OK and the
+	# GES inbound validation (in_quorum, check 4) accepts cross-node
+	# traffic.  Without it, legacy mode never publishes OK and every
+	# remote GES request is silently dropped at the master.
+	my $voting_disks_csv;
+	my @voting_disk_paths;
+	if (defined $opts{quorum_voting_disks} && $opts{quorum_voting_disks} > 0)
+	{
+		my $disk_dir = PostgreSQL::Test::Utils::tempdir();
+		for my $i (0 .. $opts{quorum_voting_disks} - 1)
+		{
+			my $path = "$disk_dir/disk$i";
+			open(my $fh, '>', $path) or die "open $path: $!";
+			binmode $fh;
+			print $fh ("\0" x (128 * 512));
+			close $fh;
+			push @voting_disk_paths, $path;
+		}
+		$voting_disks_csv = join(',', @voting_disk_paths);
+	}
+
 	for my $node (@nodes)
 	{
 		$node->init;
@@ -74,8 +96,18 @@ sub new_triple
 		$node->append_conf('postgresql.conf', "cluster.enabled = on\n");
 		$node->append_conf('postgresql.conf',
 			"cluster.interconnect_tier = tier1\n");
-		$node->append_conf('postgresql.conf',
-			"cluster.allow_single_node = on\n");
+		if (defined $voting_disks_csv)
+		{
+			$node->append_conf('postgresql.conf',
+				"cluster.allow_single_node = off\n");
+			$node->append_conf('postgresql.conf',
+				"cluster.voting_disks = '$voting_disks_csv'\n");
+		}
+		else
+		{
+			$node->append_conf('postgresql.conf',
+				"cluster.allow_single_node = on\n");
+		}
 
 		# Keep shared_buffers small so 3 postmasters fit in CI runners.
 		$node->append_conf('postgresql.conf', "shared_buffers = 16MB\n");
@@ -146,6 +178,22 @@ sub start_triple
 	return;
 }
 
+
+#-----------------------------------------------------------------------
+# kill_node9($self, $idx)
+#
+#	spec-4.6 — hard-kill one node of the triple (SIGKILL to the
+#	postmaster) for recovery-remaster TAPs.  Mirrors
+#	ClusterPair::kill_node9;  kill9 clears _pid so stop_triple skips
+#	the dead node.
+#-----------------------------------------------------------------------
+sub kill_node9
+{
+	my ($self, $idx) = @_;
+	Test::More::note("ClusterTriple kill_node9: SIGKILL node$idx postmaster");
+	$self->{nodes}[$idx]->kill9;
+	return;
+}
 
 sub stop_triple
 {

@@ -51,6 +51,7 @@
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_inject.h" /* spec-4.6 L11/L14 — redeclare-skip probe */
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_lock_acquire.h"
@@ -709,6 +710,19 @@ cluster_grd_redeclare_all_registered(void)
 
 	if (!cluster_enabled || MyProc == NULL)
 		return;
+
+	/* spec-4.6 L11/L14 — armed backend neither rebinds nor acks:  the
+	 * barrier stalls fail-closed (rebuild_timeout + frozen shards), and
+	 * a terminated armed backend leaves the P6 leak-sweep evidence.
+	 * STICKY probe (cluster_cr_injection_armed peeks without consuming;
+	 * the generic should_skip is one-shot and could not hold the barrier
+	 * across LMON's re-broadcast ticks). */
+	{
+		uint64 skip_param;
+
+		if (cluster_cr_injection_armed("cluster-grd-redeclare-skip", &skip_param))
+			return;
+	}
 
 	gen = cluster_grd_redeclare_generation();
 	if (gen == 0)

@@ -457,6 +457,22 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 *	  read_scns are runtime/warm cross-instance reads (4.6/4.7).
 	 */
 	{ .name = "cr_force_read_scn" },
+
+	/*
+	 * spec-4.6 §4.2 L11/L14 (1 NEW point).
+	 *
+	 *	cluster-grd-redeclare-skip:
+	 *	  SKIP fault on the backend-side cooperative rebind walker
+	 *	  (cluster_grd_redeclare_all_registered):  the armed backend
+	 *	  neither rebinds nor acks, so the LMON rebuild barrier stalls —
+	 *	  drives the rebuild_timeout fail-closed leg (shards stay frozen,
+	 *	  53R9I on the request path, old holder NOT overwritten) and the
+	 *	  post-barrier leak-sweep leg (terminate the armed backend:  its
+	 *	  old-epoch release is wire-rejected, the leaked holder is swept
+	 *	  at P6 on the master).  Per-backend arm (spec-0.27 §3.6):  arm
+	 *	  and hold in the SAME session.
+	 */
+	{ .name = "cluster-grd-redeclare-skip" },
 };
 
 #define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_points)

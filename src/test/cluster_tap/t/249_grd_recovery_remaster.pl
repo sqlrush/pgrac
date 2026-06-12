@@ -129,6 +129,8 @@ my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 		# max_attempts > 0) stay out of psql stderr.
 		"cluster.ges_request_timeout_ms = 3000",
 		"cluster.ges_retransmit_max_attempts = 0",
+		# L3 ordering assertions scrape the DEBUG1 phase trail.
+		"log_min_messages = debug1",
 	]);
 $pair->start_pair;
 
@@ -319,6 +321,32 @@ ok(poll_query_until_timeout($pair->node1, 'postgres',
 		   WHERE category = 'grd_recovery' AND key = 'remaster_done'},
 		't', 20, 'episode completion (remaster_done >= 1)'),
 	'recovery episode completed through P7 unfreeze (remaster_done >= 1)');
+
+
+# ----------
+# L3-order (D1): the DEBUG1 trail shows the P-sequence in order on the
+#     survivor: P1 freeze -> P4 remaster -> P5 redeclare broadcast ->
+#     local barrier done -> P6 sweep + P7 unfreeze.
+# ----------
+{
+	my $log = PostgreSQL::Test::Utils::slurp_file($pair->node1->logfile);
+	my @needles = (
+		'cluster_grd_recovery: P1 freeze',
+		'cluster_grd_recovery: P4 remaster moved',
+		'cluster_grd_recovery: P5 redeclare gen',
+		'cluster_grd_recovery: local barrier done',
+		'cluster_grd_recovery: cluster gate passed; P6 swept',
+	);
+	my $pos = 0;
+	my $in_order = 1;
+	for my $needle (@needles)
+	{
+		my $found = index($log, $needle, $pos);
+		if ($found < 0) { $in_order = 0; diag("L3 missing/out-of-order: $needle"); last; }
+		$pos = $found;
+	}
+	ok($in_order, 'L3 P-sequence appears in order in the survivor log (D1 ordering)');
+}
 
 
 # ----------

@@ -230,7 +230,19 @@ typedef enum GesRequestOpcode {
 	 *	  no match → insert as holder (remastered-shard rebuild;  the new
 	 *	  master fills holders[] from these re-declarations ONLY).
 	 */
-	GES_REQ_OPCODE_REDECLARE = 12
+	GES_REQ_OPCODE_REDECLARE = 12,
+	/*
+	 * spec-4.6 P0#3 cluster gate — fire-and-forget "my local rebind
+	 * barrier is complete for the current epoch" announcement.  Standard
+	 * GesRequestPayload (holder.node_id = sender, epoch = current;  resid
+	 * unused) — zero wire-ABI change.  The post-barrier GLOBAL stale
+	 * sweep (P6) on ANY node must wait until EVERY survivor announced:
+	 * the sweep removes old-epoch holders owned by REMOTE backends, so a
+	 * node-local barrier alone would delete a live-but-not-yet-rebound
+	 * remote holder → double grant.  No reply;  senders re-announce每
+	 * tick until their own P6 gate passes (lost-message tolerance).
+	 */
+	GES_REQ_OPCODE_REDECLARE_DONE = 13
 } GesRequestOpcode;
 
 typedef enum GesReplyOpcode {

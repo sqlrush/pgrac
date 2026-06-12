@@ -261,6 +261,11 @@ typedef struct ClusterGrdShared {
 	pg_atomic_uint64 recovery_redeclare_generation;
 	pg_atomic_uint64 recovery_barrier_deadline;
 
+	/* spec-4.6 P0#3 cluster gate — per-node epoch for which that node
+	 * last announced "local rebind barrier complete" (REDECLARE_DONE).
+	 * P6 requires done_epoch[s] >= current epoch for EVERY survivor. */
+	pg_atomic_uint64 recovery_done_epoch[CLUSTER_MAX_NODES];
+
 	/* spec-4.6 D5 — 13 grd_recovery counters (dump category
 	 * 'grd_recovery';  each has a t/249 leg).  Incremented along
 	 * D1-D4 paths as the corresponding deliverable lands. */
@@ -454,10 +459,18 @@ typedef enum ClusterGrdRecoveryState {
 	GRD_RECOVERY_IDLE = 0,
 	GRD_RECOVERY_WAIT_EPOCH = 1,
 	GRD_RECOVERY_WAIT_BARRIER = 2,
+	/* spec-4.6 P0#3 cluster gate:  local barrier done + announced;
+	 * waiting for every survivor's REDECLARE_DONE before P6. */
+	GRD_RECOVERY_WAIT_CLUSTER = 3,
 } ClusterGrdRecoveryState;
 
 extern void cluster_grd_recovery_lmon_tick(void);
 extern uint64 cluster_grd_redeclare_generation(void);
+
+/* spec-4.6 P0#3 cluster gate — REDECLARE_DONE receiver (cluster_ges.c
+ * inbound handler):  record that `node` completed its local rebind
+ * barrier for `epoch`. */
+extern void cluster_grd_recovery_mark_peer_done(int32 node, uint64 epoch);
 
 /* spec-4.6 D4/D5 — recovery counter bumps for out-of-module call sites. */
 extern void cluster_grd_inc_stale_request_drop(void);

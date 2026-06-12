@@ -301,6 +301,9 @@ cluster_grd_shmem_init(void)
 		pg_atomic_init_u64(&cluster_grd_state->recovery_event_old_epoch, 0);
 		pg_atomic_init_u64(&cluster_grd_state->recovery_redeclare_generation, 0);
 		pg_atomic_init_u64(&cluster_grd_state->recovery_barrier_deadline, 0);
+		/* spec-4.6 P0#3 cluster gate — per-node barrier-done epochs. */
+		for (i = 0; i < CLUSTER_MAX_NODES; i++)
+			pg_atomic_init_u64(&cluster_grd_state->recovery_done_epoch[i], 0);
 		pg_atomic_init_u64(&cluster_grd_state->remaster_started_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->remaster_done_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->remaster_failed_count, 0);
@@ -1057,6 +1060,58 @@ grd_recovery_barrier_complete(uint64 gen)
 	return true;
 }
 
+/*
+ * spec-4.6 P0#3 cluster gate — announce "my local rebind barrier is
+ * complete for `epoch`" to every declared peer (fire-and-forget;  the
+ * WAIT_CLUSTER state re-announces each tick).  Standard
+ * GesRequestPayload, zero wire-ABI change.
+ */
+static void
+grd_recovery_broadcast_done(uint64 epoch)
+{
+	GesRequestPayload req;
+	uint64 master_gen = cluster_lms_get_shard_master_generation();
+	int i;
+
+	memset(&req, 0, sizeof(req));
+	req.opcode = GES_REQ_OPCODE_REDECLARE_DONE;
+	req.holder_node_id = (uint32)cluster_node_id;
+	req.holder_procno = 0;
+	req.holder_cluster_epoch_lo = (uint32)(epoch & 0xffffffffu);
+	req.holder_cluster_epoch_hi = (uint32)(epoch >> 32);
+	req.shard_master_generation_lo = (uint32)(master_gen & 0xffffffffu);
+	req.shard_master_generation_hi = (uint32)(master_gen >> 32);
+
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		if (i == cluster_node_id)
+			continue;
+		if (cluster_conf_lookup_node(i) == NULL)
+			continue;
+		/* Dead peers neither gate P6 nor drain their inbound — do not
+		 * stuff per-tick announcements into the outbound ring for them. */
+		if (cluster_cssd_get_peer_state(i) == CLUSTER_CSSD_PEER_DEAD)
+			continue;
+		(void)cluster_grd_outbound_enqueue_backend_request((uint32)i, &req, sizeof(req));
+	}
+}
+
+/* REDECLARE_DONE receiver (cluster_ges.c inbound handler). */
+void
+cluster_grd_recovery_mark_peer_done(int32 node, uint64 epoch)
+{
+	uint64 prev;
+
+	if (cluster_grd_state == NULL || node < 0 || node >= CLUSTER_MAX_NODES)
+		return;
+	/* Monotonic max:  late/duplicate announcements never regress. */
+	prev = pg_atomic_read_u64(&cluster_grd_state->recovery_done_epoch[node]);
+	while (epoch > prev) {
+		if (pg_atomic_compare_exchange_u64(&cluster_grd_state->recovery_done_epoch[node], &prev,
+										   epoch))
+			break;
+	}
+}
+
 void
 cluster_grd_recovery_lmon_tick(void)
 {
@@ -1180,26 +1235,23 @@ cluster_grd_recovery_lmon_tick(void)
 
 		if (grd_recovery_barrier_complete(gen)) {
 			uint64 cur_epoch = cluster_epoch_get_current();
-			uint32 swept;
-			uint32 unfrozen = 0;
-			int i;
 
-			/* P6 post-barrier global sweep (P0#3:  only legal HERE). */
-			swept = cluster_grd_cleanup_stale_epoch_postbarrier(cur_epoch);
-
-			/* P7 unfreeze. */
-			for (i = 0; i < PGRAC_GRD_SHARD_COUNT; i++) {
-				if (pg_atomic_read_u32(&cluster_grd_state->shard_phase[i])
-					!= (uint32)GRD_SHARD_NORMAL) {
-					cluster_grd_shard_set_phase((uint32)i, GRD_SHARD_NORMAL);
-					unfrozen++;
-				}
-			}
-			pg_atomic_fetch_add_u64(&cluster_grd_state->remaster_done_count, 1);
-			pg_atomic_write_u32(&cluster_grd_state->recovery_state, (uint32)GRD_RECOVERY_IDLE);
-			ereport(DEBUG1, (errmsg_internal("cluster_grd_recovery: P6 swept %u leaked slots; "
-											 "P7 unfroze %u shards (gen " UINT64_FORMAT ")",
-											 swept, unfrozen, gen)));
+			/*
+			 * Local rebind barrier complete:  announce to every survivor
+			 * (REDECLARE_DONE) and record self.  P6 must NOT run yet —
+			 * this master's HTAB holds grants owned by REMOTE backends,
+			 * and sweeping before THEIR barriers complete would delete a
+			 * live-but-not-yet-rebound holder (double grant).
+			 */
+			pg_atomic_write_u64(&cluster_grd_state->recovery_done_epoch[cluster_node_id],
+								cur_epoch);
+			grd_recovery_broadcast_done(cur_epoch);
+			pg_atomic_write_u32(&cluster_grd_state->recovery_state,
+								(uint32)GRD_RECOVERY_WAIT_CLUSTER);
+			ereport(DEBUG1, (errmsg_internal("cluster_grd_recovery: local barrier done "
+											 "(gen " UINT64_FORMAT "); announced REDECLARE_DONE, "
+											 "waiting for all survivors",
+											 gen)));
 			return;
 		}
 
@@ -1230,6 +1282,62 @@ cluster_grd_recovery_lmon_tick(void)
 												   cluster_grd_rebuild_timeout_ms);
 			pg_atomic_write_u64(&cluster_grd_state->recovery_barrier_deadline, (uint64)deadline);
 			(void)grd_recovery_broadcast_redeclare();
+		}
+		return;
+	}
+
+	if (state == (uint32)GRD_RECOVERY_WAIT_CLUSTER) {
+		uint64 cur_epoch = cluster_epoch_get_current();
+		uint64 dead[(CLUSTER_MAX_NODES + 63) / 64];
+		bool all_done = true;
+		int i;
+
+		for (i = 0; i < (CLUSTER_MAX_NODES + 63) / 64; i++)
+			dead[i] = pg_atomic_read_u64(&cluster_grd_state->recovery_dead_bitmap[i]);
+
+		/*
+		 * P6 cluster gate (P0#3):  EVERY survivor (declared ∧ not dead in
+		 * this episode) must have announced its local barrier for the
+		 * current epoch.  No timeout:  fail-closed — affected shards stay
+		 * frozen until the cluster converges;  the lagging node's own
+		 * rebuild_timeout WARNING is the observability surface.
+		 */
+		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+			if (cluster_conf_lookup_node(i) == NULL)
+				continue;
+			if (grd_dead_bitmap_test(dead, i))
+				continue;
+			if (pg_atomic_read_u64(&cluster_grd_state->recovery_done_epoch[i]) < cur_epoch) {
+				all_done = false;
+				break;
+			}
+		}
+
+		/* Re-announce each tick until released:  REDECLARE_DONE is
+		 * fire-and-forget and a lost packet must not wedge a peer. */
+		grd_recovery_broadcast_done(cur_epoch);
+
+		if (all_done) {
+			uint32 swept;
+			uint32 unfrozen = 0;
+
+			/* P6 post-barrier global sweep (P0#3:  only legal HERE). */
+			swept = cluster_grd_cleanup_stale_epoch_postbarrier(cur_epoch);
+
+			/* P7 unfreeze. */
+			for (i = 0; i < PGRAC_GRD_SHARD_COUNT; i++) {
+				if (pg_atomic_read_u32(&cluster_grd_state->shard_phase[i])
+					!= (uint32)GRD_SHARD_NORMAL) {
+					cluster_grd_shard_set_phase((uint32)i, GRD_SHARD_NORMAL);
+					unfrozen++;
+				}
+			}
+			pg_atomic_fetch_add_u64(&cluster_grd_state->remaster_done_count, 1);
+			pg_atomic_write_u32(&cluster_grd_state->recovery_state, (uint32)GRD_RECOVERY_IDLE);
+			ereport(DEBUG1,
+					(errmsg_internal("cluster_grd_recovery: cluster gate passed; P6 swept %u "
+									 "leaked slots; P7 unfroze %u shards",
+									 swept, unfrozen)));
 		}
 	}
 }

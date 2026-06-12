@@ -302,7 +302,7 @@ ok(defined $postgres_bin && -x $postgres_bin,
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-	'123', 'M1 123 injection points (spec-4.5a +1 cr_force_read_scn; was 122)');
+	'124', 'M1 124 injection points (spec-4.6 +1 cluster-grd-redeclare-skip; was 123)');
 
 is($node->safe_psql('postgres',
 		q{SELECT string_agg(name, ',' ORDER BY name) FROM pg_stat_cluster_injections WHERE name LIKE 'cluster-init-%'}),

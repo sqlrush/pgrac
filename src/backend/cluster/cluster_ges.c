@@ -410,14 +410,22 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 	 * remote sender and must match env->source_node_id. */
 	payload_node_must_be_source
 		= (req->opcode != GES_REQ_OPCODE_BAST && req->opcode != GES_REQ_OPCODE_CANCEL_PENDING);
-	/* spec-4.6 D3:  opcode_max extended to REDECLARE (12).  Opcodes 8-11
-	 * passing the coarse range check still fail closed in the explicit
-	 * switch below (dedicated-payload opcodes never reach this handler
-	 * legitimately — early dispatch above). */
+	/* spec-4.6 D3:  opcode_max extended to REDECLARE_DONE (13).  Opcodes
+	 * 8-11 passing the coarse range check still fail closed in the
+	 * explicit switch below (dedicated-payload opcodes never reach this
+	 * handler legitimately — early dispatch above). */
 	if (!ges_validate_inbound(env, req->holder_node_id, holder_epoch, req->opcode,
-							  GES_REQ_OPCODE_REQUEST, GES_REQ_OPCODE_REDECLARE,
+							  GES_REQ_OPCODE_REQUEST, GES_REQ_OPCODE_REDECLARE_DONE,
 							  payload_node_must_be_source)) {
 		cluster_grd_inc_ges_inbound_validation_fail();
+		return;
+	}
+
+	/* spec-4.6 P0#3 cluster gate — fire-and-forget barrier announcement:
+	 * record and return (no work queue, no reply, no dedup;  the sender
+	 * re-announces each tick, the receiver write is a monotonic max). */
+	if (req->opcode == GES_REQ_OPCODE_REDECLARE_DONE) {
+		cluster_grd_recovery_mark_peer_done((int32)env->source_node_id, holder_epoch);
 		return;
 	}
 
@@ -479,6 +487,7 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 	case GES_REQ_OPCODE_NATIVE_LOCK_PROBE:
 	case GES_REQ_OPCODE_NATIVE_LOCK_PROBE_REPLY:
 	case GES_REQ_OPCODE_PRIORITY_BOOST:
+	case GES_REQ_OPCODE_REDECLARE_DONE: /* handled + returned above */
 		/*
 			 * spec-2.25 D6:  these opcodes use dedicated payload structs +
 		 * early dispatch path above (line 205-/256-).  Reaching the
