@@ -1107,6 +1107,9 @@ pgstat_get_wait_cluster_reconfig(WaitEventCluster w)
 	case WAIT_EVENT_RECONFIG_BARRIER_WAIT:
 		event_name = "ReconfigBarrierWait";
 		break;
+	case WAIT_EVENT_CLUSTER_GRD_SHARD_REMASTER:
+		event_name = "ClusterGrdShardRemaster";
+		break;
 	default:
 		break;
 	}
@@ -1364,9 +1367,6 @@ pgstat_get_wait_cluster_bgproc(WaitEventCluster w)
 		break;
 	case WAIT_EVENT_CLUSTER_UNDO_CLEANER_SEGMENT_SCAN:
 		event_name = "ClusterUndoCleanerSegmentScan";
-		break;
-	case WAIT_EVENT_CLUSTER_GRD_SHARD_REMASTER:
-		event_name = "ClusterGrdShardRemaster";
 		break;
 	case WAIT_EVENT_CLUSTER_BGPROC_CSSD_MAIN_LOOP:
 		event_name = "ClusterBgProcCssdMainLoop";

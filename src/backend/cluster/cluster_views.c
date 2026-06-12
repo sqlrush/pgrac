@@ -134,6 +134,8 @@ static const uint32 cluster_wait_event_infos[CLUSTER_WAIT_EVENTS_COUNT] = {
 	WAIT_EVENT_RECONFIG_FENCE_WAIT,
 	WAIT_EVENT_RECONFIG_MASTER_SELECTION,
 	WAIT_EVENT_RECONFIG_BARRIER_WAIT,
+	/* spec-4.6 D4: GRD shard remaster short-wait (Reconfig class). */
+	WAIT_EVENT_CLUSTER_GRD_SHARD_REMASTER,
 
 	/* Cluster: Recovery (5) */
 	WAIT_EVENT_RECOVERY_WAL_FETCH,
@@ -203,8 +205,6 @@ static const uint32 cluster_wait_event_infos[CLUSTER_WAIT_EVENTS_COUNT] = {
 	WAIT_EVENT_CLUSTER_BGPROC_UNDO_CLEANER_MAIN_LOOP,
 	/* spec-3.13 D6: cleaner segment-scan I/O (4-place symmetric). */
 	WAIT_EVENT_CLUSTER_UNDO_CLEANER_SEGMENT_SCAN,
-	/* spec-4.6 D4: backend short-wait on a FROZEN/REBUILDING GRD shard. */
-	WAIT_EVENT_CLUSTER_GRD_SHARD_REMASTER,
 	/* spec-2.6 D11: qvotec main loop (6th cluster aux process). */
 	WAIT_EVENT_CLUSTER_BGPROC_QVOTEC_MAIN_LOOP,
 	/* spec-2.6 D11: voting disk I/O (2 events;cluster_voting_disk_io). */

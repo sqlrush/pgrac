@@ -371,6 +371,10 @@ typedef enum {
 	WAIT_EVENT_RECONFIG_FENCE_WAIT,
 	WAIT_EVENT_RECONFIG_MASTER_SELECTION,
 	WAIT_EVENT_RECONFIG_BARRIER_WAIT,
+	/* spec-4.6 D4: backend short-wait on a FROZEN/REBUILDING GRD shard
+	 * during failure-driven remaster.  Reconfig business class (NOT
+	 * BgProc — see that segment's contract). */
+	WAIT_EVENT_CLUSTER_GRD_SHARD_REMASTER,
 
 	/* Cluster: Recovery (5 events) -- #86 */
 	WAIT_EVENT_RECOVERY_WAL_FETCH = PG_WAIT_CLUSTER_RECOVERY,
@@ -541,9 +545,6 @@ typedef enum {
 	WAIT_EVENT_CLUSTER_BGPROC_UNDO_CLEANER_MAIN_LOOP,
 	/* spec-3.13 D6: cleaner durable-header segment scan I/O. */
 	WAIT_EVENT_CLUSTER_UNDO_CLEANER_SEGMENT_SCAN,
-	/* spec-4.6 D4: backend short-wait on a FROZEN/REBUILDING GRD shard
-	 * during failure-driven remaster (cluster.grd_remaster_wait_ms). */
-	WAIT_EVENT_CLUSTER_GRD_SHARD_REMASTER,
 } WaitEventCluster;
 
 
