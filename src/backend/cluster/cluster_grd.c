@@ -831,6 +831,14 @@ cluster_grd_redeclare_generation(void)
 	return pg_atomic_read_u64(&cluster_grd_state->recovery_redeclare_generation);
 }
 
+uint64
+cluster_grd_redeclare_episode_epoch(void)
+{
+	if (cluster_grd_state == NULL)
+		return 0;
+	return pg_atomic_read_u64(&cluster_grd_state->recovery_episode_epoch);
+}
+
 /* spec-4.6 D4/D5 — recovery counter bump helpers for out-of-module
  * call sites (S4 stale mapping in cluster_lock_acquire.c;  GCS block
  * fail-closed guard in cluster_gcs_block.c). */
@@ -1031,7 +1039,7 @@ grd_recovery_broadcast_redeclare(void)
  * master-side state is exactly what P6 sweeps).
  */
 static bool
-grd_recovery_barrier_complete(uint64 gen)
+grd_recovery_barrier_complete(uint64 gen, uint64 episode_epoch)
 {
 	int beid;
 	pid_t self_pid = MyProcPid;
@@ -1055,6 +1063,12 @@ grd_recovery_barrier_complete(uint64 gen)
 		if (pg_atomic_read_u32(&proc->cluster_grd_registered_count) == 0)
 			continue;
 		if (pg_atomic_read_u64(&proc->cluster_grd_redeclare_acked) < gen)
+			return false;
+		/* P0-1:  the ack must be coherent with the LOCKED episode epoch.
+		 * A proc that acked an earlier generation under the old epoch and
+		 * then short-circuited (acked >= gen via a stale generation race)
+		 * must not satisfy the barrier for a newer epoch. */
+		if (pg_atomic_read_u64(&proc->cluster_grd_redeclare_acked_epoch) != episode_epoch)
 			return false;
 	}
 	return true;
@@ -1112,6 +1126,30 @@ cluster_grd_recovery_mark_peer_done(int32 node, uint64 epoch)
 	}
 }
 
+/*
+ * spec-4.6 P0-1 / P1-2 — abort the in-flight episode back to IDLE.
+ *
+ *	Called when a mid-episode epoch bump (P0-1) or a fresh reconfig event
+ *	(P1-2:  a SECOND node died during recovery) invalidates the locked
+ *	episode.  Affected shards STAY frozen (fail-closed; never opened
+ *	half-rebuilt) and the master map keeps its already-remastered state;
+ *	resetting recovery_last_event_id forces the IDLE branch to re-consume
+ *	the (now-current) event next tick, which re-snapshots the epoch,
+ *	bumps a fresh redeclare generation (forcing every backend to re-walk
+ *	and rebind under the new epoch), and re-runs P1-P7.  Convergent:  the
+ *	epoch eventually stops moving and an episode completes.
+ */
+static void
+grd_recovery_abort_to_idle(void)
+{
+	pg_atomic_fetch_add_u64(&cluster_grd_state->remaster_failed_count, 1);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_last_event_id, 0);
+	pg_atomic_write_u32(&cluster_grd_state->recovery_state, (uint32)GRD_RECOVERY_IDLE);
+	ereport(DEBUG1,
+			(errmsg_internal("cluster_grd_recovery: episode aborted (epoch moved / new event "
+							 "mid-recovery); shards stay frozen, re-running under the new epoch")));
+}
+
 void
 cluster_grd_recovery_lmon_tick(void)
 {
@@ -1131,10 +1169,27 @@ cluster_grd_recovery_lmon_tick(void)
 
 		cluster_reconfig_get_last_event(&evt);
 		ev_id = evt.event_id;
-		if (ev_id == 0 || ev_id == pg_atomic_read_u64(&cluster_grd_state->recovery_last_event_id))
+		if (ev_id == 0 || ev_id == pg_atomic_read_u64(&cluster_grd_state->recovery_last_event_id)) {
+			/*
+			 * P1-3 (Fable review) — idle:  track the CURRENT epoch as the
+			 * pre-reconfig baseline.  We must NOT trust evt.old_epoch as
+			 * the WAIT_EPOCH gate baseline:  for a non-coordinator
+			 * survivor it is a fresh read taken when the survivor-role
+			 * event was published, and an IC piggyback can deliver the
+			 * coordinator's bumped epoch BEFORE this node's own deadband
+			 * fires, making old_epoch already == the post-bump epoch and
+			 * wedging WAIT_EPOCH forever (cur <= old).  The last stable
+			 * idle epoch is the reliable "before reconfig" value.
+			 */
+			pg_atomic_write_u64(&cluster_grd_state->recovery_event_old_epoch,
+								cluster_epoch_get_current());
 			return;
+		}
 
-		/* P0 accept:  a fresh reconfig event (quorum-accepted dead set). */
+		/* P0 accept:  a fresh reconfig event (quorum-accepted dead set).
+		 * recovery_event_old_epoch already holds last idle tick's stable
+		 * epoch (the genuine pre-reconfig baseline) — do NOT overwrite it
+		 * with evt.old_epoch here. */
 		pg_atomic_write_u64(&cluster_grd_state->recovery_last_event_id, ev_id);
 		for (b = 0; b < (CLUSTER_MAX_NODES + 63) / 64; b++) {
 			uint64 word = 0;
@@ -1148,13 +1203,14 @@ cluster_grd_recovery_lmon_tick(void)
 			}
 			pg_atomic_write_u64(&cluster_grd_state->recovery_dead_bitmap[b], word);
 		}
-		pg_atomic_write_u64(&cluster_grd_state->recovery_event_old_epoch, evt.old_epoch);
 		pg_atomic_fetch_add_u64(&cluster_grd_state->remaster_started_count, 1);
 		pg_atomic_write_u32(&cluster_grd_state->recovery_state, (uint32)GRD_RECOVERY_WAIT_EPOCH);
 		state = (uint32)GRD_RECOVERY_WAIT_EPOCH;
-		ereport(DEBUG1, (errmsg_internal("cluster_grd_recovery: P0 accept event " UINT64_FORMAT
-										 " (old epoch " UINT64_FORMAT ")",
-										 ev_id, evt.old_epoch)));
+		ereport(DEBUG1,
+				(errmsg_internal(
+					"cluster_grd_recovery: P0 accept event " UINT64_FORMAT
+					" (pre-reconfig baseline epoch " UINT64_FORMAT ")",
+					ev_id, pg_atomic_read_u64(&cluster_grd_state->recovery_event_old_epoch))));
 		/* fall through — the coordinator already bumped the epoch this
 		 * tick, so P1-P5 usually run immediately below. */
 	}
@@ -1215,6 +1271,12 @@ cluster_grd_recovery_lmon_tick(void)
 				cluster_grd_shard_set_phase((uint32)i, GRD_SHARD_REBUILDING);
 		}
 
+		/* P0-1:  LOCK the episode to this epoch.  Everything downstream
+		 * (rebind ack, barrier, REDECLARE_DONE, P6 sweep) is coherent
+		 * against this one value;  a mid-episode bump aborts back to IDLE
+		 * (see the WAIT_BARRIER / WAIT_CLUSTER epoch-change guards). */
+		pg_atomic_write_u64(&cluster_grd_state->recovery_episode_epoch, cur_epoch);
+
 		/* P5 arm the cooperative-rebind barrier + broadcast.  The rebind
 		 * is CLUSTER-WIDE (P0#3):  the epoch bump staled EVERY stored
 		 * holder identity, not only those on remastered shards. */
@@ -1232,26 +1294,37 @@ cluster_grd_recovery_lmon_tick(void)
 
 	if (state == (uint32)GRD_RECOVERY_WAIT_BARRIER) {
 		uint64 gen = pg_atomic_read_u64(&cluster_grd_state->recovery_redeclare_generation);
+		uint64 episode_epoch = pg_atomic_read_u64(&cluster_grd_state->recovery_episode_epoch);
 
-		if (grd_recovery_barrier_complete(gen)) {
-			uint64 cur_epoch = cluster_epoch_get_current();
+		/* P0-1 epoch-coherence guard:  a SECOND epoch bump landed
+		 * mid-episode (e.g. a third node's heartbeat flap re-fired
+		 * reconfig).  The holders rebound under episode_epoch are now
+		 * stale;  abort to IDLE and re-consume the event under the new
+		 * epoch (shards stay frozen the whole time). */
+		if (cluster_epoch_get_current() != episode_epoch) {
+			grd_recovery_abort_to_idle();
+			return;
+		}
 
+		if (grd_recovery_barrier_complete(gen, episode_epoch)) {
 			/*
 			 * Local rebind barrier complete:  announce to every survivor
-			 * (REDECLARE_DONE) and record self.  P6 must NOT run yet —
-			 * this master's HTAB holds grants owned by REMOTE backends,
-			 * and sweeping before THEIR barriers complete would delete a
-			 * live-but-not-yet-rebound holder (double grant).
+			 * (REDECLARE_DONE) and record self for the LOCKED episode
+			 * epoch.  P6 must NOT run yet — this master's HTAB holds
+			 * grants owned by REMOTE backends, and sweeping before THEIR
+			 * barriers complete would delete a live-but-not-yet-rebound
+			 * holder (double grant).
 			 */
 			pg_atomic_write_u64(&cluster_grd_state->recovery_done_epoch[cluster_node_id],
-								cur_epoch);
-			grd_recovery_broadcast_done(cur_epoch);
+								episode_epoch);
+			grd_recovery_broadcast_done(episode_epoch);
 			pg_atomic_write_u32(&cluster_grd_state->recovery_state,
 								(uint32)GRD_RECOVERY_WAIT_CLUSTER);
-			ereport(DEBUG1, (errmsg_internal("cluster_grd_recovery: local barrier done "
-											 "(gen " UINT64_FORMAT "); announced REDECLARE_DONE, "
-											 "waiting for all survivors",
-											 gen)));
+			ereport(DEBUG1,
+					(errmsg_internal("cluster_grd_recovery: local barrier done "
+									 "(gen " UINT64_FORMAT " epoch " UINT64_FORMAT
+									 "); announced REDECLARE_DONE, waiting for all survivors",
+									 gen, episode_epoch)));
 			return;
 		}
 
@@ -1287,10 +1360,19 @@ cluster_grd_recovery_lmon_tick(void)
 	}
 
 	if (state == (uint32)GRD_RECOVERY_WAIT_CLUSTER) {
-		uint64 cur_epoch = cluster_epoch_get_current();
+		uint64 episode_epoch = pg_atomic_read_u64(&cluster_grd_state->recovery_episode_epoch);
 		uint64 dead[(CLUSTER_MAX_NODES + 63) / 64];
 		bool all_done = true;
 		int i;
+
+		/* P0-1 epoch-coherence guard (same as WAIT_BARRIER):  a
+		 * mid-episode bump invalidates every node's locked barrier, so
+		 * abort and re-run under the new epoch rather than sweep with a
+		 * fresher epoch than the holders were rebound under. */
+		if (cluster_epoch_get_current() != episode_epoch) {
+			grd_recovery_abort_to_idle();
+			return;
+		}
 
 		for (i = 0; i < (CLUSTER_MAX_NODES + 63) / 64; i++)
 			dead[i] = pg_atomic_read_u64(&cluster_grd_state->recovery_dead_bitmap[i]);
@@ -1298,16 +1380,16 @@ cluster_grd_recovery_lmon_tick(void)
 		/*
 		 * P6 cluster gate (P0#3):  EVERY survivor (declared ∧ not dead in
 		 * this episode) must have announced its local barrier for the
-		 * current epoch.  No timeout:  fail-closed — affected shards stay
-		 * frozen until the cluster converges;  the lagging node's own
-		 * rebuild_timeout WARNING is the observability surface.
+		 * LOCKED episode epoch.  No timeout:  fail-closed — affected
+		 * shards stay frozen until the cluster converges;  the lagging
+		 * node's own rebuild_timeout WARNING is the observability surface.
 		 */
 		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 			if (cluster_conf_lookup_node(i) == NULL)
 				continue;
 			if (grd_dead_bitmap_test(dead, i))
 				continue;
-			if (pg_atomic_read_u64(&cluster_grd_state->recovery_done_epoch[i]) < cur_epoch) {
+			if (pg_atomic_read_u64(&cluster_grd_state->recovery_done_epoch[i]) < episode_epoch) {
 				all_done = false;
 				break;
 			}
@@ -1315,14 +1397,16 @@ cluster_grd_recovery_lmon_tick(void)
 
 		/* Re-announce each tick until released:  REDECLARE_DONE is
 		 * fire-and-forget and a lost packet must not wedge a peer. */
-		grd_recovery_broadcast_done(cur_epoch);
+		grd_recovery_broadcast_done(episode_epoch);
 
 		if (all_done) {
 			uint32 swept;
 			uint32 unfrozen = 0;
 
-			/* P6 post-barrier global sweep (P0#3:  only legal HERE). */
-			swept = cluster_grd_cleanup_stale_epoch_postbarrier(cur_epoch);
+			/* P6 post-barrier global sweep (P0#3 + P0-1:  legal HERE and
+			 * coherent against the LOCKED episode epoch — holders rebound
+			 * under it survive, only genuinely older state is removed). */
+			swept = cluster_grd_cleanup_stale_epoch_postbarrier(episode_epoch);
 
 			/* P7 unfreeze. */
 			for (i = 0; i < PGRAC_GRD_SHARD_COUNT; i++) {
@@ -1336,8 +1420,8 @@ cluster_grd_recovery_lmon_tick(void)
 			pg_atomic_write_u32(&cluster_grd_state->recovery_state, (uint32)GRD_RECOVERY_IDLE);
 			ereport(DEBUG1,
 					(errmsg_internal("cluster_grd_recovery: cluster gate passed; P6 swept %u "
-									 "leaked slots; P7 unfroze %u shards",
-									 swept, unfrozen)));
+									 "leaked slots; P7 unfroze %u shards (epoch " UINT64_FORMAT ")",
+									 swept, unfrozen, episode_epoch)));
 		}
 	}
 }

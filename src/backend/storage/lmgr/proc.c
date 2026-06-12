@@ -285,6 +285,7 @@ InitProcGlobal(void)
 		/* PGRAC: spec-4.6 D3 — holder-rebind barrier ack generation +
 		 * live registered-grant count (barrier scope filter). */
 		pg_atomic_init_u64(&(proc->cluster_grd_redeclare_acked), 0);
+		pg_atomic_init_u64(&(proc->cluster_grd_redeclare_acked_epoch), 0);
 		pg_atomic_init_u32(&(proc->cluster_grd_registered_count), 0);
 	}
 
@@ -492,6 +493,11 @@ InitProcess(void)
 		 * registered-grant count restarts at zero with the fresh proc. */
 		pg_atomic_write_u64(&MyProc->cluster_grd_redeclare_acked,
 							cluster_grd_redeclare_generation());
+		/* P0-1: seed the ack epoch with the locked episode epoch so a
+		 * backend born mid-episode does not fail the barrier's epoch
+		 * check (it holds no stale grants either way). */
+		pg_atomic_write_u64(&MyProc->cluster_grd_redeclare_acked_epoch,
+							cluster_grd_redeclare_episode_epoch());
 		pg_atomic_write_u32(&MyProc->cluster_grd_registered_count, 0);
 	}
 #endif

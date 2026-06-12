@@ -284,6 +284,17 @@ void
 cluster_grd_redeclare_all_registered(void)
 {}
 
+/* spec-4.6 P0#3 stub:  REDECLARE_DONE broadcast enqueues to the outbound
+ * ring.  Standalone fixture has no ring; no-op success.  (peer-state stub
+ * for the dead-peer skip already exists above.) */
+bool
+cluster_grd_outbound_enqueue_backend_request(uint32 dest_node_id pg_attribute_unused(),
+											 const void *payload pg_attribute_unused(),
+											 uint32 payload_len pg_attribute_unused())
+{
+	return true;
+}
+
 #define FAKE_GRD_HTAB_MAX_ENTRIES 4
 #define FAKE_GRD_HTAB_ENTRY_BYTES 4096
 

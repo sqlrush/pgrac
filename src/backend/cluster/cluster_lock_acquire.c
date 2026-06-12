@@ -793,6 +793,16 @@ cluster_grd_redeclare_all_registered(void)
 		}
 	}
 
-	if (all_ok)
+	/*
+	 * P0-1 epoch coherence:  ack ONLY if the epoch did not move while we
+	 * walked.  If it did, the holders we just stamped are already stale;
+	 * leaving this proc un-acked makes LMON's barrier wait, and the next
+	 * generation (re-broadcast under the new episode epoch) re-walks us.
+	 * We publish the ack EPOCH alongside the generation so the barrier
+	 * can reject an ack that pre-dates a mid-episode epoch bump.
+	 */
+	if (all_ok && cluster_epoch_get_current() == cur_epoch) {
+		pg_atomic_write_u64(&MyProc->cluster_grd_redeclare_acked_epoch, cur_epoch);
 		pg_atomic_write_u64(&MyProc->cluster_grd_redeclare_acked, gen);
+	}
 }

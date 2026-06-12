@@ -211,6 +211,16 @@ cluster_grd_redeclare_generation(void)
 	return 0;
 }
 
+/* spec-4.6 L11/L14 stub:  redeclare-skip sticky probe.  Standalone
+ * fixture arms nothing; never skip. */
+bool
+cluster_cr_injection_armed(const char *name pg_attribute_unused(), uint64 *out_param)
+{
+	if (out_param != NULL)
+		*out_param = 0;
+	return false;
+}
+
 uint32
 cluster_ges_send_redeclare_and_wait(const struct ClusterResId *resid pg_attribute_unused(),
 									uint32 lockmode pg_attribute_unused(),

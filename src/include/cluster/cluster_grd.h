@@ -261,6 +261,20 @@ typedef struct ClusterGrdShared {
 	pg_atomic_uint64 recovery_redeclare_generation;
 	pg_atomic_uint64 recovery_barrier_deadline;
 
+	/*
+	 * spec-4.6 P0-1 (Fable review) — the epoch this episode is LOCKED to.
+	 * Set when WAIT_EPOCH passes; the rebind barrier, the REDECLARE_DONE
+	 * announcements, and the P6 sweep are ALL coherent against this one
+	 * value.  If a SECOND epoch bump lands mid-episode (CSSD
+	 * dead_generation bumps on ANY peer transition -> reconfig re-fire ->
+	 * coordinator epoch++, even with an unchanged dead set), the tick
+	 * aborts the episode to IDLE and re-consumes the event under the new
+	 * epoch (shards stay frozen).  Without this lock the P6 sweep would
+	 * use a fresher epoch than the holders were rebound under and delete
+	 * a live holder -> cross-node double grant (rule 8.A).
+	 */
+	pg_atomic_uint64 recovery_episode_epoch;
+
 	/* spec-4.6 P0#3 cluster gate — per-node epoch for which that node
 	 * last announced "local rebind barrier complete" (REDECLARE_DONE).
 	 * P6 requires done_epoch[s] >= current epoch for EVERY survivor. */
@@ -466,6 +480,8 @@ typedef enum ClusterGrdRecoveryState {
 
 extern void cluster_grd_recovery_lmon_tick(void);
 extern uint64 cluster_grd_redeclare_generation(void);
+/* spec-4.6 P0-1 — the epoch the current episode is locked to (0 = none). */
+extern uint64 cluster_grd_redeclare_episode_epoch(void);
 
 /* spec-4.6 P0#3 cluster gate — REDECLARE_DONE receiver (cluster_ges.c
  * inbound handler):  record that `node` completed its local rebind

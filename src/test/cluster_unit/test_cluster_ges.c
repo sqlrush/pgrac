@@ -249,6 +249,13 @@ cluster_grd_shard_phase(uint32 shard_id pg_attribute_unused())
 	return GRD_SHARD_NORMAL;
 }
 
+/* spec-4.6 P0#3 stub:  REDECLARE_DONE handler records peer barrier
+ * completion.  Standalone fixture has no recovery shmem; no-op. */
+void
+cluster_grd_recovery_mark_peer_done(int32 node pg_attribute_unused(),
+									uint64 epoch pg_attribute_unused())
+{}
+
 ClusterGrdEntryResult
 cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid pg_attribute_unused(),
 										  const struct ClusterGrdHolderId *nh pg_attribute_unused(),

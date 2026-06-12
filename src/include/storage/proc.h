@@ -328,6 +328,16 @@ struct PGPROC {
 	pg_atomic_uint64 cluster_grd_redeclare_acked;
 
 	/*
+	 * spec-4.6 P0-1 (Fable review) — the epoch this backend's rebind ack
+	 * is coherent with.  Written together with cluster_grd_redeclare_acked
+	 * by the redeclare walker (the holder was stamped with this epoch).
+	 * LMON's barrier accepts an ack ONLY when this matches the locked
+	 * episode epoch, so a mid-episode epoch bump cannot let a holder
+	 * rebound under the old epoch satisfy the barrier for the new one.
+	 */
+	pg_atomic_uint64 cluster_grd_redeclare_acked_epoch;
+
+	/*
 	 * spec-4.6 D3 — live count of this backend's cluster_registered
 	 * LOCALLOCKs (S5 promote ++ / S6 release --).  The rebind barrier
 	 * skips procs with count == 0:  they hold nothing to rebind, and
