@@ -1322,15 +1322,21 @@ HeapTupleSatisfiesDirty(HeapTuple htup, Snapshot snapshot, Buffer buffer)
  *	The cluster xmin-resolution branch of HeapTupleSatisfiesMVCC returns its
  *	verdict directly and NEVER falls through to the PG-native xmax check, so a
  *	tuple whose remote xmin resolved visible has not yet been tested for a
- *	committed remote DELETER.  Without this, every superseded version on a
+ *	committed DELETER.  Without this, every superseded version on a
  *	merged-materialized page stays visible (all chain versions returned at
- *	once).  Mirrors the non-CR xmax arm of cluster_cr_satisfies_mvcc, on the
- *	LIVE tuple (the block is at/before read_scn, so the live row IS the
- *	as-of-snapshot row -- no CR construction needed).
+ *	once).  Works on the LIVE tuple (the block is at/before read_scn, so the
+ *	live row IS the as-of-snapshot row -- no CR construction needed):
+ *	  - REMOTE deleter: per-origin authority + the spec-3.21 verdict table
+ *	    (mirrors the non-CR xmax arm of cluster_cr_satisfies_mvcc);
+ *	  - OWN deleter (slot-bound; post-merge local DML on a materialized row
+ *	    is ordinary operation) / our own in-progress delete: PG-native
+ *	    snapshot semantics, alias-free for own xids;
+ *	  - anything unprovable (recycled slot, no evidence, foreign multixact,
+ *	    in-doubt outcome): fail closed.
  *
- *	Returns: 1 keep the xmin verdict (no committed-before-read_scn deleter);
- *	0 the deleter committed at/before read_scn -> tuple invisible; -1 deleter
- *	outcome unknown -> caller fail-closes (53R97, 规则 8.A).
+ *	Returns: 1 keep the xmin verdict (no delete visible at this snapshot);
+ *	0 the delete is visible at this snapshot -> tuple invisible; -1 deleter
+ *	outcome unprovable -> caller fail-closes (53R97, 规则 8.A).
  */
 static int
 cluster_remote_live_xmax_keeps_visible(Buffer buffer, HeapTupleHeader tuple, Snapshot snapshot)
@@ -1343,36 +1349,73 @@ cluster_remote_live_xmax_keeps_visible(Buffer buffer, HeapTupleHeader tuple, Sna
 		return 1;
 	if (HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
 		return 1; /* a lock-only xmax never deletes the row */
-	if (tuple->t_infomask & HEAP_XMAX_IS_MULTI)
+	if (tuple->t_infomask & HEAP_XMAX_IS_MULTI) {
+		uint16 marker_origin = 0;
+
+		/*
+		 * A multixact id is node-local: its members may be decoded from the
+		 * LOCAL pg_multixact only when the page marker proves the multi is
+		 * OURS.  An in-window foreign multi FATALs the merge (D10b), but a
+		 * pre-window foreign multi can sit on a checkpoint-flushed page;
+		 * decoding its id locally would alias (AD-012 例外 9) -- fail closed.
+		 */
+		if (cluster_itl_find_multixact_origin_by_xmax(BufferGetPage(buffer),
+													  (MultiXactId)HeapTupleHeaderGetRawXmax(tuple),
+													  &marker_origin)
+			&& (int32)marker_origin != cluster_node_id)
+			return -1;
 		xmax = HeapTupleGetUpdateXid(tuple);
-	else
+	} else
 		xmax = HeapTupleHeaderGetRawXmax(tuple);
-	if (!TransactionIdIsValid(xmax) || TransactionIdIsCurrentTransactionId(xmax))
-		return 1; /* lockers-only multi, or our own delete (native self) */
+	if (!TransactionIdIsValid(xmax))
+		return 1; /* lockers-only multi: no update xid -> never a delete */
+	if (TransactionIdIsCurrentTransactionId(xmax)) {
+		/* Our own in-progress delete of the (remote-origin) row: native
+		 * command-id semantics apply -- deleted before this scan started
+		 * means invisible. */
+		if (HeapTupleHeaderGetCmax(tuple) >= snapshot->curcid)
+			return 1; /* deleted after scan started */
+		return 0;	  /* deleted before scan started */
+	}
 
 	cluster_visibility_resolve_tuple(buffer, tuple, xmax, CLUSTER_VIS_XMAX_UPDATE, &xr);
 
-	/*
-	 * Only a REMOTE deleter is this branch's concern: the xmin path reaches
-	 * here for a remote-origin tuple, whose deleter on a cold-merge page is
-	 * also remote.  A non-remote deleter (own-instance / no ITL evidence)
-	 * cannot be resolved here without the native CLOG path the cluster branch
-	 * deliberately bypassed -- fail closed rather than guess (规则 8.A).
-	 */
-	if (xr.evidence != CLUSTER_VIS_EVIDENCE_REMOTE)
-		return -1;
+	if (xr.evidence == CLUSTER_VIS_EVIDENCE_REMOTE) {
+		if (xr.status == CLUSTER_TT_STATUS_COMMITTED
+			|| xr.status == CLUSTER_TT_STATUS_CLEANED_OUT)
+			scn_decision = cluster_visibility_decide_by_scn(xr.commit_scn, snapshot->read_scn);
 
-	if (xr.status == CLUSTER_TT_STATUS_COMMITTED || xr.status == CLUSTER_TT_STATUS_CLEANED_OUT)
-		scn_decision = cluster_visibility_decide_by_scn(xr.commit_scn, snapshot->read_scn);
-
-	switch (cluster_vis_cr_xmax_verdict(xr.status, scn_decision)) {
-	case CVV_VISIBLE:
-		return 1;
-	case CVV_INVISIBLE:
-		return 0;
-	default:
-		return -1; /* unknown / unresolved -> fail closed */
+		switch (cluster_vis_cr_xmax_verdict(xr.status, scn_decision)) {
+		case CVV_VISIBLE:
+			return 1;
+		case CVV_INVISIBLE:
+			return 0;
+		default:
+			return -1; /* unknown / unresolved -> fail closed */
+		}
 	}
+
+	/*
+	 * Own-instance deleter (post-merge local DML on a materialized row is
+	 * ordinary operation).  The xid is OURS only when the slot evidence still
+	 * binds it (origin == self AND slot xid == xmax): then the local
+	 * ProcArray / CLOG / snapshot are authoritative with no cross-instance
+	 * aliasing (AD-012 例外 9 row #1) -- mirror the PG-native xmax half.  The
+	 * on-page HEAP_XMAX_COMMITTED hint is deliberately NOT trusted here: on a
+	 * shared page it may have been stamped by the peer for a same-valued
+	 * foreign xid.  A LOCAL slot recycled past xmax (slot xid != xmax) or no
+	 * slot evidence at all leaves the deleter's origin unprovable -> fail
+	 * closed (规则 8.A).
+	 */
+	if (xr.evidence == CLUSTER_VIS_EVIDENCE_LOCAL && xr.ref.local_xid == xmax) {
+		if (XidInMVCCSnapshot(xmax, snapshot))
+			return 1; /* still in progress per this snapshot */
+		if (!TransactionIdDidCommit(xmax))
+			return 1; /* aborted or crashed -> never deleted */
+		return 0;	  /* our committed delete, visible to this snapshot */
+	}
+
+	return -1; /* origin unprovable -> fail closed */
 }
 #endif
 

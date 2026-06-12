@@ -43,6 +43,27 @@
 #include "cluster/cluster_subtrans.h"		/* SUBCOMMITTED parent follow */
 #include "cluster/cluster_tt_status.h"		/* lookup_exact / Key / Result */
 #include "cluster/cluster_visibility_resolve.h"
+#include "cluster/cluster_wal_state.h" /* CLUSTER_WAL_STATE_SLOT_COUNT */
+
+/*
+ * Backend-lifetime cache over cluster_merged_instance_is_materialized().
+ * The STALE fallback below runs per TUPLE on recycled remote-origin slots;
+ * the uncached check opens the authority-marker file each time.  An origin
+ * only becomes materialized during startup recovery (no live backends), so
+ * a cached verdict cannot go stale in the unsafe (false-negative) direction.
+ */
+static int8 materialized_origin_cache[CLUSTER_WAL_STATE_SLOT_COUNT]; /* 0 ? / 1 yes / -1 no */
+
+static bool
+merged_origin_materialized_cached(int origin)
+{
+	if (origin < 0 || origin >= CLUSTER_WAL_STATE_SLOT_COUNT)
+		return false;
+	if (materialized_origin_cache[origin] == 0)
+		materialized_origin_cache[origin]
+			= cluster_merged_instance_is_materialized(origin) ? 1 : -1;
+	return materialized_origin_cache[origin] == 1;
+}
 
 
 /*
@@ -151,7 +172,7 @@ classify_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, ClusterVisR
 		 * xid would need a full 32-bit wraparound inside that window's pages
 		 * (task#90 wrap-generation family, same posture as WRAP_ANY readers).
 		 */
-		if (cluster_merged_instance_is_materialized((int)ref->origin_node_id)) {
+		if (merged_origin_materialized_cached((int)ref->origin_node_id)) {
 			SCN outcome_scn;
 
 			switch (

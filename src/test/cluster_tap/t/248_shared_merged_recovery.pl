@@ -629,6 +629,25 @@ is(query_retry($na, 'SELECT count(*) FROM t_a'), '100',
 	'L4c own-stream recovery completes with merged_recovery=off');
 is($na->safe_psql('postgres', 'SELECT count(*) FROM t_b'), '100',
 	'L4c previously materialized remote rows remain readable');
+
+# ----------------------------------------------------------------
+# L15: post-merge LOCAL DML on materialized remote rows is ordinary
+# operation (the survivor cleaning up after disaster recovery).  The
+# steady-state xmax gate must resolve the OWN deleter through native
+# snapshot semantics (alias-free for own xids) instead of failing
+# closed -- without that, the first committed local UPDATE/DELETE of
+# a remote row turns every later read of the table into a 53R97.
+# ----------------------------------------------------------------
+is($na->safe_psql('postgres',
+		"UPDATE t_b SET v = 1101 WHERE v = 101;\n"
+	  . 'SELECT v FROM t_b WHERE v = 1101'),
+	'1101', 'L15 A updates a materialized remote row and reads the new version');
+is($na->safe_psql('postgres', 'SELECT count(*) FROM t_b'), '100',
+	'L15 the superseded remote version is invisible (own committed updater)');
+is($na->safe_psql('postgres',
+		"DELETE FROM t_b WHERE v = 200;\n"
+	  . 'SELECT count(*) FROM t_b'),
+	'99', 'L15 A deletes a materialized remote row; the row stays gone');
 $pair->stop_pair;
 
 done_testing();

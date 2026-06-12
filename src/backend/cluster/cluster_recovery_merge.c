@@ -193,7 +193,16 @@ cluster_merged_authority_publish(int origin_node, uint64 recovered_lsn)
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
 						errmsg("merged recovery: authority marker path too long for origin %d",
 							   origin_node)));
-	if (mkdir(dir, S_IRWXU) != 0 && errno != EEXIST)
+	if (mkdir(dir, S_IRWXU) == 0) {
+		/* Freshly created (an origin merged without undo records): the new
+		 * dirent must be durable too, or a crash strands the marker in an
+		 * unreachable directory (harmless -- the cold rerun re-merges -- but
+		 * the durability claim below would be false). */
+		char parent[MAXPGPATH];
+
+		if (snprintf(parent, sizeof(parent), "%s/pg_undo", DataDir) < (int)sizeof(parent))
+			fsync_fname(parent, true);
+	} else if (errno != EEXIST)
 		ereport(FATAL, (errcode_for_file_access(),
 						errmsg("merged recovery: could not create \"%s\": %m", dir)));
 
