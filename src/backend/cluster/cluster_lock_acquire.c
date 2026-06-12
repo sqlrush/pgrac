@@ -564,8 +564,23 @@ cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *req)
 	r = cluster_lock_acquire_s4_remote_request_wait(req);
 	if (r == CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK)
 		return r;
-	if (r == CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT || r == CLUSTER_LOCK_ACQUIRE_FAIL_DEADLOCK
-		|| r == CLUSTER_LOCK_ACQUIRE_FAIL_CANCEL || r == CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL) {
+
+	/*
+	 * spec-4.6 P0 (user review) — DEFAULT-DENY after S4.
+	 *
+	 *	Only the explicit success outcomes may continue toward S5
+	 *	promote.  The previous FAIL_* allowlist (TIMEOUT / DEADLOCK /
+	 *	CANCEL / INTERNAL) silently let any value outside it fall
+	 *	through:  when spec-4.6 added FAIL_SHARD_REMASTERING /
+	 *	FAIL_STALE_GENERATION, a master that explicitly REJECTED the
+	 *	request (frozen shard / stale generation) still saw the caller
+	 *	promote its local reservation into a holder — fail-OPEN on the
+	 *	exact paths the remaster protocol must fail closed.  Any
+	 *	non-success S4 outcome now cancels the reservation (S7) and
+	 *	surfaces the original error;  a future new FAIL code cannot
+	 *	re-open this hole.
+	 */
+	if (r != CLUSTER_LOCK_ACQUIRE_OK_GRANTED && r != CLUSTER_LOCK_ACQUIRE_OK_CONVERTED) {
 		(void)cluster_lock_acquire_s7_cleanup(req);
 		return r;
 	}

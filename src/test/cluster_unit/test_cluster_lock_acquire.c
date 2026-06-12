@@ -290,6 +290,16 @@ cluster_grd_lookup_master(const ClusterResId *resid pg_attribute_unused())
 	return -1;
 }
 
+/* spec-4.6 P0 regression harness — test-controlled S3/S4 outcomes.
+ *	stub_reserve_result default NOT_READY keeps the legacy tests on the
+ *	pre-reservation-fail path;  the S4 default-deny test flips it to OK
+ *	so seven_step reaches S4 with a reservation created.
+ *	stub_revalidate_calls counts S5 promote entry (revalidate is the
+ *	mandatory first step of a real promote) — the default-deny test
+ *	asserts it does NOT move when S4 rejects. */
+static ClusterGrdEntryResult stub_reserve_result = CLUSTER_GRD_ENTRY_NOT_READY;
+static int stub_revalidate_calls = 0;
+
 ClusterGrdEntryResult
 cluster_grd_try_reserve(const ClusterResId *resid pg_attribute_unused(),
 						const ClusterGrdHolderId *holder pg_attribute_unused(),
@@ -300,7 +310,7 @@ cluster_grd_try_reserve(const ClusterResId *resid pg_attribute_unused(),
 		*fast_path_out = false;
 	if (gen_snapshot_out)
 		*gen_snapshot_out = 0;
-	return CLUSTER_GRD_ENTRY_NOT_READY;
+	return stub_reserve_result;
 }
 
 ClusterGrdEntryResult
@@ -309,6 +319,7 @@ cluster_grd_revalidate_and_promote(const ClusterResId *resid pg_attribute_unused
 								   int32 self_node_id pg_attribute_unused(),
 								   uint64 gen_snapshot pg_attribute_unused())
 {
+	stub_revalidate_calls++;
 	return CLUSTER_GRD_ENTRY_NOT_FOUND;
 }
 
@@ -342,6 +353,10 @@ cluster_lms_native_probe_wait_clear(const ClusterResId *resid pg_attribute_unuse
 	return true;
 }
 
+/* spec-4.6 P0 regression harness — test-controlled GES reject reason
+ * (GesRejectReason values; 0 = GRANT). */
+static uint32 stub_ges_reject_reason = 0;
+
 uint32
 cluster_ges_send_request_and_wait(const struct ClusterResId *resid pg_attribute_unused(),
 								  uint32 lockmode pg_attribute_unused(),
@@ -349,7 +364,7 @@ cluster_ges_send_request_and_wait(const struct ClusterResId *resid pg_attribute_
 								  uint64 request_id pg_attribute_unused(),
 								  int timeout_ms pg_attribute_unused())
 {
-	return 0;
+	return stub_ges_reject_reason;
 }
 
 uint32
@@ -497,6 +512,67 @@ UT_TEST(test_7step_top_level_monotonic_forward_no_cleanup_on_success)
 
 
 /* ============================================================
+ * spec-4.6 P0 regression (user review) — S4 master-side rejects must
+ *	DEFAULT-DENY at the top-level dispatch.
+ *
+ *	The race t/250 G5 cannot cover:  the request passed the
+ *	requester-side freeze gate and S3 created a reservation, and only
+ *	the MASTER's reply says SHARD_FROZEN / stale generation.  The
+ *	pre-fix allowlist (TIMEOUT/DEADLOCK/CANCEL/INTERNAL) let the two
+ *	spec-4.6 FAIL codes fall through to S5 promote — the caller turned
+ *	a master-side REJECT into a locally-granted holder (fail-open).
+ *
+ *	Asserts, for both new FAIL codes:  top-level returns the original
+ *	failure, S7 cleanup runs (reservation cancelled), and S5 promote is
+ *	NEVER entered (revalidate call count frozen).  Control leg:  a
+ *	GRANT (reject = 0) still routes to NEED_PG_NATIVE_LOCK with no
+ *	cleanup.
+ * ============================================================ */
+UT_TEST(test_7step_s4_master_reject_default_deny)
+{
+	ClusterLockAcquireRequest req;
+	uint64 pre_s7;
+	int pre_reval;
+	ClusterLockAcquireResult r;
+
+	cluster_lms_enabled = true;
+	stub_reserve_result = CLUSTER_GRD_ENTRY_OK; /* S3 succeeds -> S4 reachable */
+
+	/* (a) master says SHARD_FROZEN (GES_REJECT_REASON_SHARD_FROZEN=5). */
+	memset(&req, 0, sizeof(req));
+	stub_ges_reject_reason = 5;
+	pre_s7 = cluster_lock_acquire_s7_cleanup_count();
+	pre_reval = stub_revalidate_calls;
+	r = cluster_lock_acquire_seven_step(&req);
+	UT_ASSERT_EQ((int)r, (int)CLUSTER_LOCK_ACQUIRE_FAIL_SHARD_REMASTERING);
+	UT_ASSERT_EQ(cluster_lock_acquire_s7_cleanup_count(), pre_s7 + 1);
+	UT_ASSERT_EQ(stub_revalidate_calls, pre_reval); /* S5 never entered */
+
+	/* (b) master says stale epoch (GES_REJECT_REASON_EPOCH_MISMATCH=3). */
+	memset(&req, 0, sizeof(req));
+	stub_ges_reject_reason = 3;
+	pre_s7 = cluster_lock_acquire_s7_cleanup_count();
+	pre_reval = stub_revalidate_calls;
+	r = cluster_lock_acquire_seven_step(&req);
+	UT_ASSERT_EQ((int)r, (int)CLUSTER_LOCK_ACQUIRE_FAIL_STALE_GENERATION);
+	UT_ASSERT_EQ(cluster_lock_acquire_s7_cleanup_count(), pre_s7 + 1);
+	UT_ASSERT_EQ(stub_revalidate_calls, pre_reval);
+
+	/* (c) control:  GRANT still proceeds, no cleanup. */
+	memset(&req, 0, sizeof(req));
+	stub_ges_reject_reason = 0;
+	pre_s7 = cluster_lock_acquire_s7_cleanup_count();
+	r = cluster_lock_acquire_seven_step(&req);
+	UT_ASSERT_EQ((int)r, (int)CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK);
+	UT_ASSERT_EQ(cluster_lock_acquire_s7_cleanup_count(), pre_s7);
+
+	/* Restore harness defaults for any later test. */
+	stub_reserve_result = CLUSTER_GRD_ENTRY_NOT_READY;
+	stub_ges_reject_reason = 0;
+}
+
+
+/* ============================================================
  * spec-2.26 T-7step-N..N+2 — LOCKTAG_TRANSACTION gate + 7-step routing.
  *
  *	T-7step-N    cluster_lock_should_globalize exact mode + node-id gate.
@@ -591,13 +667,14 @@ UT_DEFINE_GLOBALS();
 int
 main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 {
-	UT_PLAN(8);
+	UT_PLAN(9);
 
 	UT_RUN(test_7step_api_surface_linkable_and_initial_counters_zero);
 	UT_RUN(test_7step_s1_hc1_fail_closed);
 	UT_RUN(test_7step_individual_steps_null_req_internal);
 	UT_RUN(test_7step_top_level_null_req_s7_cleanup_invoked);
 	UT_RUN(test_7step_top_level_monotonic_forward_no_cleanup_on_success);
+	UT_RUN(test_7step_s4_master_reject_default_deny);
 	UT_RUN(test_7step_transaction_should_globalize_gate);
 	UT_RUN(test_7step_transaction_locktag_path_routes_through_cluster);
 	UT_RUN(test_7step_transaction_locktag_release_path_safe);
