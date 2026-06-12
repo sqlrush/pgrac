@@ -279,6 +279,25 @@ sub stop_pair
 	return;
 }
 
+#-----------------------------------------------------------------------
+# kill_node9($self, $idx)
+#
+#	spec-4.6 D0 — hard-kill one side of the pair (SIGKILL to the
+#	postmaster) to simulate real node death for recovery-remaster
+#	TAPs.  Children (the CSSD heartbeat producer included) exit on
+#	postmaster death, so the SURVIVOR's deadband fires the DEAD
+#	edge without any cooperative shutdown handshake.  kill9 clears
+#	the node's _pid, so a later stop_pair skips the dead node.
+#-----------------------------------------------------------------------
+sub kill_node9
+{
+	my ($self, $idx) = @_;
+	my $node = $idx == 0 ? $self->{node0} : $self->{node1};
+	Test::More::note("ClusterPair kill_node9: SIGKILL node$idx postmaster");
+	$node->kill9;
+	return;
+}
+
 sub node0   { return $_[0]->{node0}; }
 sub node1   { return $_[0]->{node1}; }
 sub ic_port { return $_[0]->{ic_ports}[ $_[1] ]; }
