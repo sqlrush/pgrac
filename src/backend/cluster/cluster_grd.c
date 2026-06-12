@@ -39,6 +39,7 @@
 #include "cluster/cluster_grd_outbound.h" /* cluster_grd_outbound_enqueue_cleanup_release (D10) */
 #include "cluster/cluster_lmd.h"		  /* spec-2.24 D10 cleanup_*_count_inc */
 #include "cluster/cluster_guc.h"		  /* cluster_node_id, cluster_grd_max_entries */
+#include "cluster/cluster_lms.h"		  /* spec-4.6 D2 — Q3-C wire routing token */
 #include "cluster/cluster_pcm_lock.h"	  /* spec-2.36 HC124 pending_x node-dead cleanup */
 #include "cluster/cluster_signal.h"
 #include "cluster/cluster_shmem.h"
@@ -230,8 +231,12 @@ cluster_grd_shmem_init(void)
 		int i;
 
 		/* spec-2.14 D3 init zero (Q9 all-atomic, no LWLock). */
-		for (i = 0; i < PGRAC_GRD_SHARD_COUNT; i++)
+		for (i = 0; i < PGRAC_GRD_SHARD_COUNT; i++) {
 			pg_atomic_init_u32(&cluster_grd_state->master[i], 0);
+			/* spec-4.6 D2/D1: remaster generation + recovery phase. */
+			pg_atomic_init_u32(&cluster_grd_state->master_generation[i], 0);
+			pg_atomic_init_u32(&cluster_grd_state->shard_phase[i], (uint32)GRD_SHARD_NORMAL);
+		}
 		pg_atomic_init_u32(&cluster_grd_state->master_map_initialized, 0);
 		pg_atomic_init_u64(&cluster_grd_state->resid_encode_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->shard_lookup_count, 0);
@@ -280,6 +285,22 @@ cluster_grd_shmem_init(void)
 		pg_atomic_init_u64(&cluster_grd_state->ges_deadlock_probe_drop_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->ges_deadlock_probe_collision_drop_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->ges_deadlock_chunk_oo_buffer_overflow_count, 0);
+
+		/* spec-4.6 D2/D5 — remaster epoch + 13 grd_recovery counters. */
+		pg_atomic_init_u64(&cluster_grd_state->reconfig_remaster_epoch, 0);
+		pg_atomic_init_u64(&cluster_grd_state->remaster_started_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->remaster_done_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->remaster_failed_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->shards_remastered_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->holders_redeclared_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->holders_rebound_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->waiters_requeued_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->converts_requeued_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->stale_request_drop_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->rebuild_timeout_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->block_path_failclosed_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->unaffected_holder_survived_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->stale_holder_swept_count, 0);
 	}
 
 	/* spec-2.15 v0.4 P1.1:  entry HTAB allocation gated on GUC.  GUC=0
@@ -614,12 +635,140 @@ cluster_grd_master_map_init(void)
 void
 cluster_grd_master_map_refresh(void)
 {
-	/* Stage 6 DRM placeholder — real implementation will be LMON-mediated
-	 * full master[] refresh + epoch field check.  Body for now is a no-op
-	 * except for the observability counter increment so future spec-2.X
-	 * test可以 observe call site exists. */
+	/* Affinity/DRM placeholder (Stage 6) — ALIVE→ALIVE migration only.
+	 * Failure-driven remaster is REAL since spec-4.6:  see
+	 * cluster_grd_master_map_remaster() below.  Body stays a no-op
+	 * except for the observability counter. */
 	if (cluster_grd_state != NULL)
 		pg_atomic_fetch_add_u64(&cluster_grd_state->master_map_refresh_count, 1);
+}
+
+/* spec-4.6 D2 — dead-bitmap bit test (CLUSTER_MAX_NODES bits as uint64
+ * words;  word [node >> 6], bit (node & 63)). */
+static inline bool
+grd_dead_bitmap_test(const uint64 *dead_bitmap, int32 node_id)
+{
+	if (node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return false;
+	return (dead_bitmap[node_id >> 6] >> (node_id & 63)) & 1;
+}
+
+/*
+ * cluster_grd_master_map_remaster
+ *
+ *	spec-4.6 D2 — failure-driven remaster.  See cluster_grd.h for the
+ *	full contract (deterministic survivor recompute from the accepted
+ *	membership snapshot;  idempotent;  generation bumps only on real
+ *	master movement).
+ *
+ *	Concurrency:  master[] writes are lock-free atomics;  callers are
+ *	ordered by the spec-4.6 D1 P0-P7 barrier (P1 freeze precedes this,
+ *	so backend lookups on affected shards are already fenced by the
+ *	shard phase, and unaffected shards never change here).
+ */
+uint32
+cluster_grd_master_map_remaster(const uint64 *dead_bitmap, uint64 reconfig_epoch)
+{
+	int32 survivors[CLUSTER_MAX_NODES];
+	int survivor_count = 0;
+	uint32 moved = 0;
+	int i;
+
+	Assert(cluster_grd_state != NULL);
+
+	if (dead_bitmap == NULL)
+		return 0;
+	if (pg_atomic_read_u32(&cluster_grd_state->master_map_initialized) == 0)
+		return 0; /* no map yet — nothing to remaster */
+
+	/*
+	 * Accepted membership snapshot = declared list (pgrac.conf, ascending
+	 * scan order) minus the reconfig-accepted dead bits.  NEVER ad-hoc
+	 * local peer_state (hard-gate #1:  every node must compute the same
+	 * survivor list from the same snapshot).
+	 */
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		if (cluster_conf_lookup_node(i) == NULL)
+			continue;
+		if (!grd_dead_bitmap_test(dead_bitmap, i))
+			survivors[survivor_count++] = i;
+	}
+	if (survivor_count <= 0) {
+		/* Total declared death — fail-closed upstream (QVOTEC quorum
+		 * loss freezes writes);  never reassign shards to nobody. */
+		return 0;
+	}
+
+	for (i = 0; i < PGRAC_GRD_SHARD_COUNT; i++) {
+		uint32 cur = pg_atomic_read_u32(&cluster_grd_state->master[i]);
+		int32 target;
+
+		if (!grd_dead_bitmap_test(dead_bitmap, (int32)cur))
+			continue; /* master alive — failure-driven only, no affinity */
+
+		target = survivors[i % survivor_count];
+		pg_atomic_write_u32(&cluster_grd_state->master[i], (uint32)target);
+		pg_atomic_fetch_add_u32(&cluster_grd_state->master_generation[i], 1);
+		moved++;
+	}
+
+	if (moved > 0) {
+		pg_atomic_write_u64(&cluster_grd_state->reconfig_remaster_epoch, reconfig_epoch);
+		pg_atomic_fetch_add_u64(&cluster_grd_state->shards_remastered_count, moved);
+		pg_atomic_fetch_add_u64(&cluster_grd_state->master_map_refresh_count, 1);
+		ereport(DEBUG1, (errmsg_internal("cluster_grd_master_map_remaster: moved %u shards "
+										 "to %d survivors (reconfig epoch " UINT64_FORMAT ")",
+										 moved, survivor_count, reconfig_epoch)));
+	}
+	return moved;
+}
+
+/*
+ * cluster_grd_lookup_master_gen
+ *
+ *	spec-4.6 D2 — master lookup + wire routing token.  Q3-C:  the token
+ *	is the EXISTING (accepted_epoch<<32)|lms_restart_gen verbatim;  the
+ *	per-shard remaster generation never rides the wire.
+ */
+int32
+cluster_grd_lookup_master_gen(const ClusterResId *resid, uint64 *out_routing_generation)
+{
+	if (out_routing_generation)
+		*out_routing_generation = cluster_lms_get_shard_master_generation();
+	return cluster_grd_lookup_master(resid);
+}
+
+uint32
+cluster_grd_shard_master_generation(uint32 shard_id)
+{
+	Assert(cluster_grd_state != NULL);
+	if (shard_id >= PGRAC_GRD_SHARD_COUNT)
+		return 0;
+	return pg_atomic_read_u32(&cluster_grd_state->master_generation[shard_id]);
+}
+
+/*
+ * Shard recovery phase accessors — spec-4.6 D1/D4.
+ *
+ *	LMON is the only writer (set_phase);  backends read lock-free on
+ *	the request path.  Unknown shard ids read as NORMAL (defensive:
+ *	the caller-side resid→shard mapping already bounds the id).
+ */
+ClusterGrdShardPhase
+cluster_grd_shard_phase(uint32 shard_id)
+{
+	if (cluster_grd_state == NULL || shard_id >= PGRAC_GRD_SHARD_COUNT)
+		return GRD_SHARD_NORMAL;
+	return (ClusterGrdShardPhase)pg_atomic_read_u32(&cluster_grd_state->shard_phase[shard_id]);
+}
+
+void
+cluster_grd_shard_set_phase(uint32 shard_id, ClusterGrdShardPhase phase)
+{
+	Assert(cluster_grd_state != NULL);
+	if (shard_id >= PGRAC_GRD_SHARD_COUNT)
+		return;
+	pg_atomic_write_u32(&cluster_grd_state->shard_phase[shard_id], (uint32)phase);
 }
 
 

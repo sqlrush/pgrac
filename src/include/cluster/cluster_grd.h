@@ -137,8 +137,39 @@ StaticAssertDecl(CLUSTER_GRD_ENTRY_ERROR == 4, "v0.2 P2.7 enum value ABI lock");
  *	answer "lookup volume / local vs remote ratio / refresh history /
  *	encode volume" without後续 spec 追加 emit_row.
  */
+/*
+ * spec-4.6 D1/D4 — per-shard recovery phase.
+ *
+ *	NORMAL      steady state, requests served.
+ *	FROZEN      reconfig accepted a dead master for this shard; new
+ *	            requests short-wait (cluster.grd_remaster_wait_ms) then
+ *	            fail-closed 53R9I.
+ *	REBUILDING  master map already remastered (D2); cooperative holder
+ *	            rebuild (D3) in flight; requests treated like FROZEN.
+ *
+ *	Stored as pg_atomic_uint32 per shard (no atomic u8 in PG); only
+ *	LMON transitions phases, backends read lock-free.
+ */
+typedef enum ClusterGrdShardPhase {
+	GRD_SHARD_NORMAL = 0,
+	GRD_SHARD_FROZEN = 1,
+	GRD_SHARD_REBUILDING = 2,
+} ClusterGrdShardPhase;
+
 typedef struct ClusterGrdShared {
 	pg_atomic_uint32 master[PGRAC_GRD_SHARD_COUNT];
+
+	/* spec-4.6 D2 — per-shard remaster generation:  ++ ONLY when this
+	 * shard's master actually changes (failure-driven remaster).  Shmem
+	 * scope ONLY for idempotency / observability;  NEVER placed on the
+	 * wire (Q3-C:  the wire token stays the existing
+	 * shard_master_generation = (accepted_epoch<<32)|lms_restart_gen,
+	 * because 4.6 remasters 1:1 with the reconfig epoch bump). */
+	pg_atomic_uint32 master_generation[PGRAC_GRD_SHARD_COUNT];
+
+	/* spec-4.6 D1/D4 — per-shard recovery phase (ClusterGrdShardPhase). */
+	pg_atomic_uint32 shard_phase[PGRAC_GRD_SHARD_COUNT];
+
 	pg_atomic_uint32 master_map_initialized;	 /* 0 until LMON init */
 	pg_atomic_uint64 resid_encode_count;		 /* incremented per encode */
 	pg_atomic_uint64 shard_lookup_count;		 /* total lookups */
@@ -208,6 +239,27 @@ typedef struct ClusterGrdShared {
 	 * InitProcess() atomic fetch_add 1 → MyProc->cluster_grd_generation.
 	 * init 从 1 开始(0 reserved sentinel = uninitialized). */
 	pg_atomic_uint64 next_generation;
+
+	/* spec-4.6 D2 — reconfig epoch of the most recent failure-driven
+	 * remaster (observability + idempotency cross-check). */
+	pg_atomic_uint64 reconfig_remaster_epoch;
+
+	/* spec-4.6 D5 — 13 grd_recovery counters (dump category
+	 * 'grd_recovery';  each has a t/249 leg).  Incremented along
+	 * D1-D4 paths as the corresponding deliverable lands. */
+	pg_atomic_uint64 remaster_started_count;		   /* P1 freeze entered */
+	pg_atomic_uint64 remaster_done_count;			   /* P7 unfreeze reached */
+	pg_atomic_uint64 remaster_failed_count;			   /* barrier/timeout fail-closed */
+	pg_atomic_uint64 shards_remastered_count;		   /* D2 shards moved */
+	pg_atomic_uint64 holders_redeclared_count;		   /* D3 redeclare accepted */
+	pg_atomic_uint64 holders_rebound_count;			   /* D3 old→new rebind done (L14) */
+	pg_atomic_uint64 waiters_requeued_count;		   /* D3 waiter re-declared */
+	pg_atomic_uint64 converts_requeued_count;		   /* D3 convert re-declared */
+	pg_atomic_uint64 stale_request_drop_count;		   /* D4 stale gen/epoch drop (53R9J) */
+	pg_atomic_uint64 rebuild_timeout_count;			   /* D3 barrier timeout (53R9I) */
+	pg_atomic_uint64 block_path_failclosed_count;	   /* D4 GCS/PCM 53R9K (L12) */
+	pg_atomic_uint64 unaffected_holder_survived_count; /* L13 sweep-scope guard */
+	pg_atomic_uint64 stale_holder_swept_count;		   /* P6 post-barrier sweep (L15) */
 } ClusterGrdShared;
 
 /* spec-2.17 D28b — extern atomic generation alloc helper(InitProcess hook). */
@@ -321,6 +373,52 @@ extern uint32 cluster_grd_shard_lookup(const ClusterResId *resid);
  */
 extern int32 cluster_grd_shard_master(uint32 shard_id);
 extern bool cluster_grd_is_local_master(uint32 shard_id);
+
+/*
+ * spec-4.6 D2 — failure-driven remaster (NOT affinity/DRM, NOT
+ * ALIVE→ALIVE).
+ *
+ *	Called by LMON AFTER quorum accepts the reconfig epoch (eviction /
+ *	fence result included), the epoch bump, and the scoped stale sweep.
+ *	Deterministically re-assigns every shard whose CURRENT master has
+ *	its bit set in dead_bitmap to a SURVIVOR:
+ *	  survivors = declared list (pgrac.conf, ascending) minus dead bits
+ *	  new master[shard] = survivors[shard % survivor_count]
+ *	All nodes compute the same result from the same accepted membership
+ *	snapshot (declared conf + accepted dead bitmap + reconfig_epoch);
+ *	NEVER from ad-hoc local peer_state reads.
+ *
+ *	dead_bitmap:  CLUSTER_MAX_NODES bits as uint64 words
+ *	  (word [node >> 6], bit (node & 63));  caller passes the accepted
+ *	  reconfig dead bitmap.
+ *	Idempotent:  re-running with the same dead_bitmap is a no-op (the
+ *	affected masters are survivors after the first run);
+ *	master_generation[shard] bumps ONLY when the master actually moves.
+ *	Returns the number of shards remastered.
+ */
+extern uint32 cluster_grd_master_map_remaster(const uint64 *dead_bitmap, uint64 reconfig_epoch);
+
+/*
+ * spec-4.6 D2 — per-shard master lookup + wire routing token.
+ *
+ *	Q3-C:  *out_routing_generation is the EXISTING shard_master_
+ *	generation token = (accepted_epoch << 32) | lms_restart_gen,
+ *	returned UNCHANGED — the wire ABI is not touched.  The per-shard
+ *	remaster generation lives in shmem master_generation[] for
+ *	idempotency/observability ONLY and is NEVER placed on the wire
+ *	(4.6 remasters 1:1 with the epoch bump, so the epoch alone is a
+ *	sufficient staleness discriminator;  stale replies are dropped by
+ *	the existing epoch-keyed dedup).
+ */
+extern int32 cluster_grd_lookup_master_gen(const ClusterResId *resid,
+										   uint64 *out_routing_generation);
+
+/* spec-4.6 D2 — per-shard remaster generation read (observability). */
+extern uint32 cluster_grd_shard_master_generation(uint32 shard_id);
+
+/* spec-4.6 D1/D4 — shard recovery phase (LMON-only writer). */
+extern ClusterGrdShardPhase cluster_grd_shard_phase(uint32 shard_id);
+extern void cluster_grd_shard_set_phase(uint32 shard_id, ClusterGrdShardPhase phase);
 
 /*
  * Master map lifecycle — LMON entry point (D3).

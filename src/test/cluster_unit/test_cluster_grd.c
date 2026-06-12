@@ -153,7 +153,9 @@ ShmemInitStruct(const char *name, Size size, bool *foundPtr)
 			 * standalone shmem stub's alignment to at least 8 bytes for
 			 * pg_atomic_uint64 fields inside ClusterGrdShared. */
 			uint64 force_align;
-			char data[131072]; /* 4096 atomic uint32 + counter fields < 17KB; buffer 128KB 充足 */
+			char data[131072]; /* 3×4096 atomic uint32 arrays + counters < 50KB
+								* (spec-4.6 adds master_generation[] + shard_phase[]);
+								* buffer 128KB 充足 */
 		} grd_buf;
 		static bool grd_initialized = false;
 
@@ -225,6 +227,16 @@ cluster_cssd_get_peer_state(int32 peer_id pg_attribute_unused())
  * → skeleton mode → lookup_or_create returns NOT_READY; the soft-cap
  * regression test sets 1 and drives a tiny fake HTAB path. */
 int cluster_grd_max_entries = 0;
+
+/* spec-4.6 D2 stub:  cluster_grd_lookup_master_gen forwards the LMS
+ * wire routing token verbatim (Q3-C).  Settable so the unit test can
+ * assert verbatim pass-through. */
+static uint64 mock_lms_shard_master_generation = 0;
+uint64
+cluster_lms_get_shard_master_generation(void)
+{
+	return mock_lms_shard_master_generation;
+}
 
 #define FAKE_GRD_HTAB_MAX_ENTRIES 4
 #define FAKE_GRD_HTAB_ENTRY_BYTES 4096
@@ -1047,13 +1059,188 @@ UT_TEST(test_grd_entry_existing_hit_survives_soft_cap)
 }
 
 
+/* ============================================================
+ * spec-4.6 D2 — failure-driven remaster unit suite
+ *	(test_cluster_grd_remaster section;  lives in this binary because
+ *	the mock-conf + shmem-stub harness is already here).
+ * ============================================================ */
+
+UT_TEST(test_grd_remaster_failure_driven_deterministic)
+{
+	int32 nodes3[] = { 0, 1, 2 };
+	uint64 dead[2] = { 0, 0 };
+	uint32 gen0_before;
+	uint32 gen1_before;
+	uint32 moved;
+	uint32 moved_again;
+	uint32 i;
+
+	cluster_grd_shmem_init();
+	set_mock_declared(3, nodes3);
+	cluster_grd_master_map_init();
+
+	/* Baseline: shard i → declared[i % 3]. */
+	UT_ASSERT_EQ(cluster_grd_shard_master(0), (int32)0);
+	UT_ASSERT_EQ(cluster_grd_shard_master(1), (int32)1);
+	UT_ASSERT_EQ(cluster_grd_shard_master(2), (int32)2);
+
+	gen0_before = cluster_grd_shard_master_generation(0);
+	gen1_before = cluster_grd_shard_master_generation(1);
+
+	/* node0 dies (accepted dead bitmap bit 0). */
+	dead[0] = (uint64)1 << 0;
+	moved = cluster_grd_master_map_remaster(dead, /* reconfig_epoch */ 7);
+
+	/* 4096 = 3*1365 + 1 → shards ≡ 0 (mod 3) count = 1366. */
+	UT_ASSERT_EQ(moved, (uint32)1366);
+
+	/* Survivors {1, 2}:  affected shard s → survivors[s % 2]. */
+	UT_ASSERT_EQ(cluster_grd_shard_master(0), (int32)1);
+	UT_ASSERT_EQ(cluster_grd_shard_master(3), (int32)2);
+	UT_ASSERT_EQ(cluster_grd_shard_master(6), (int32)1);
+
+	/* No shard is mastered by the dead node any more. */
+	for (i = 0; i < PGRAC_GRD_SHARD_COUNT; i++)
+		UT_ASSERT_NE(cluster_grd_shard_master(i), (int32)0);
+
+	/* Unaffected shards untouched (master + generation). */
+	UT_ASSERT_EQ(cluster_grd_shard_master(1), (int32)1);
+	UT_ASSERT_EQ(cluster_grd_shard_master(2), (int32)2);
+	UT_ASSERT_EQ(cluster_grd_shard_master_generation(1), gen1_before);
+
+	/* Moved shard generation bumped exactly once. */
+	UT_ASSERT_EQ(cluster_grd_shard_master_generation(0), gen0_before + 1);
+	UT_ASSERT_EQ(cluster_grd_shard_master_generation(3), cluster_grd_shard_master_generation(6));
+
+	/* Idempotent:  same dead bitmap re-run is a no-op (affected masters
+	 * are survivors now), generation does NOT bump again. */
+	moved_again = cluster_grd_master_map_remaster(dead, 7);
+	UT_ASSERT_EQ(moved_again, (uint32)0);
+	UT_ASSERT_EQ(cluster_grd_shard_master_generation(0), gen0_before + 1);
+}
+
+UT_TEST(test_grd_remaster_same_snapshot_same_result)
+{
+	/* Hard-gate #1:  every node computes the same map from the same
+	 * accepted snapshot.  Simulate "another node" by re-running init +
+	 * remaster with identical inputs and comparing the full map. */
+	int32 nodes3[] = { 0, 1, 2 };
+	uint64 dead[2] = { 0, 0 };
+	static int32 first_run[PGRAC_GRD_SHARD_COUNT];
+	uint32 i;
+
+	cluster_grd_shmem_init();
+	set_mock_declared(3, nodes3);
+	cluster_grd_master_map_init();
+	dead[0] = (uint64)1 << 1; /* node1 dies this time */
+	(void)cluster_grd_master_map_remaster(dead, 11);
+	for (i = 0; i < PGRAC_GRD_SHARD_COUNT; i++)
+		first_run[i] = cluster_grd_shard_master(i);
+
+	/* "Other node":  identical declared conf + identical dead bitmap. */
+	cluster_grd_master_map_init();
+	(void)cluster_grd_master_map_remaster(dead, 11);
+	for (i = 0; i < PGRAC_GRD_SHARD_COUNT; i++)
+		UT_ASSERT_EQ(cluster_grd_shard_master(i), first_run[i]);
+}
+
+UT_TEST(test_grd_remaster_multi_death_and_sparse)
+{
+	/* Sparse declared {0, 2, 5};  nodes 0 and 5 die in ONE reconfig →
+	 * every affected shard lands on the lone survivor 2. */
+	int32 sparse[] = { 0, 2, 5 };
+	uint64 dead[2] = { 0, 0 };
+	uint32 moved;
+	uint32 i;
+
+	cluster_grd_shmem_init();
+	set_mock_declared(3, sparse);
+	cluster_grd_master_map_init();
+
+	dead[0] = ((uint64)1 << 0) | ((uint64)1 << 5);
+	moved = cluster_grd_master_map_remaster(dead, 13);
+
+	/* shards ≡0 (1366) + ≡2 (1365) mod 3 move. */
+	UT_ASSERT_EQ(moved, (uint32)(1366 + 1365));
+	for (i = 0; i < PGRAC_GRD_SHARD_COUNT; i++)
+		UT_ASSERT_EQ(cluster_grd_shard_master(i), (int32)2);
+}
+
+UT_TEST(test_grd_remaster_no_survivor_fail_closed)
+{
+	/* All declared dead → no reassignment (fail-closed upstream via
+	 * quorum);  the map must be left untouched, return 0. */
+	int32 nodes2[] = { 0, 1 };
+	uint64 dead[2] = { 0, 0 };
+	uint32 moved;
+
+	cluster_grd_shmem_init();
+	set_mock_declared(2, nodes2);
+	cluster_grd_master_map_init();
+
+	dead[0] = ((uint64)1 << 0) | ((uint64)1 << 1);
+	moved = cluster_grd_master_map_remaster(dead, 17);
+	UT_ASSERT_EQ(moved, (uint32)0);
+	UT_ASSERT_EQ(cluster_grd_shard_master(0), (int32)0);
+	UT_ASSERT_EQ(cluster_grd_shard_master(1), (int32)1);
+}
+
+UT_TEST(test_grd_lookup_master_gen_q3c_verbatim)
+{
+	/* Q3-C:  out_routing_generation = LMS wire token VERBATIM;  the
+	 * per-shard remaster generation never rides the wire. */
+	int32 nodes2[] = { 0, 1 };
+	LOCKTAG src;
+	ClusterResId resid;
+	uint64 token = 0;
+	int32 master;
+
+	cluster_grd_shmem_init();
+	set_mock_declared(2, nodes2);
+	cluster_grd_master_map_init();
+
+	memset(&src, 0, sizeof(src));
+	src.locktag_field1 = 4960;
+	src.locktag_type = LOCKTAG_RELATION;
+	src.locktag_lockmethodid = 1;
+	cluster_grd_resid_encode(&src, &resid);
+
+	mock_lms_shard_master_generation = (((uint64)21 << 32) | 0x000000aa);
+	master = cluster_grd_lookup_master_gen(&resid, &token);
+	UT_ASSERT_EQ(token, ((((uint64)21) << 32) | 0x000000aa));
+	UT_ASSERT_EQ(master, cluster_grd_lookup_master(&resid));
+	mock_lms_shard_master_generation = 0;
+}
+
+UT_TEST(test_grd_shard_phase_accessors)
+{
+	int32 nodes2[] = { 0, 1 };
+
+	cluster_grd_shmem_init();
+	set_mock_declared(2, nodes2);
+
+	/* Default NORMAL;  LMON-set transitions read back;  out-of-range
+	 * shard ids read as NORMAL and writes are ignored (defensive). */
+	UT_ASSERT_EQ((int)cluster_grd_shard_phase(40), (int)GRD_SHARD_NORMAL);
+	cluster_grd_shard_set_phase(40, GRD_SHARD_FROZEN);
+	UT_ASSERT_EQ((int)cluster_grd_shard_phase(40), (int)GRD_SHARD_FROZEN);
+	cluster_grd_shard_set_phase(40, GRD_SHARD_REBUILDING);
+	UT_ASSERT_EQ((int)cluster_grd_shard_phase(40), (int)GRD_SHARD_REBUILDING);
+	cluster_grd_shard_set_phase(40, GRD_SHARD_NORMAL);
+	UT_ASSERT_EQ((int)cluster_grd_shard_phase(40), (int)GRD_SHARD_NORMAL);
+	UT_ASSERT_EQ((int)cluster_grd_shard_phase(PGRAC_GRD_SHARD_COUNT), (int)GRD_SHARD_NORMAL);
+	cluster_grd_shard_set_phase(PGRAC_GRD_SHARD_COUNT, GRD_SHARD_FROZEN);
+	UT_ASSERT_EQ((int)cluster_grd_shard_phase(PGRAC_GRD_SHARD_COUNT), (int)GRD_SHARD_NORMAL);
+}
+
+
 int
 /* cppcheck-suppress constParameter
  * Reason: main() keeps the standard test harness signature used by the
  * other cluster_unit binaries; argv is intentionally unused. */
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(16);
+	UT_PLAN(22);
 
 	UT_RUN(test_grd_clusterresid_size_16);
 	UT_RUN(test_grd_resid_encode_decode_roundtrip);
@@ -1076,6 +1263,14 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_grd_transaction_cleanup_on_node_dead_removes_entry);
 
 	UT_RUN(test_grd_entry_existing_hit_survives_soft_cap);
+
+	/* spec-4.6 D2 — failure-driven remaster suite. */
+	UT_RUN(test_grd_remaster_failure_driven_deterministic);
+	UT_RUN(test_grd_remaster_same_snapshot_same_result);
+	UT_RUN(test_grd_remaster_multi_death_and_sparse);
+	UT_RUN(test_grd_remaster_no_survivor_fail_closed);
+	UT_RUN(test_grd_lookup_master_gen_q3c_verbatim);
+	UT_RUN(test_grd_shard_phase_accessors);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
