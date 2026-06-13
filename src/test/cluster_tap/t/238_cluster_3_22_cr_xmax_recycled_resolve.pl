@@ -185,6 +185,11 @@ is(_invariant($on), 't',
 my $rinv = _counter($on, 'cr', 'cr_xmax_recycled_invisible_count');
 cmp_ok($rinv, '>', 0,
 	"L1: RECYCLED->invisible shortcut fired ($rinv) -- spec-3.22 removes the recycled-slot 53R9F");
+# spec-4.8 D4: the recycled-slot liveness relax is also surfaced under the
+# tt_recovery category (task#84 observability).  Every shortcut firing bumps it,
+# so it tracks the cr-category count in this all-on, proof-valid incarnation.
+is(_counter($on, 'tt_recovery', 'recycled_liveness_relaxed'), $rinv,
+	"L1 (spec-4.8 D4): tt_recovery.recycled_liveness_relaxed tracks the relax ($rinv)");
 # every recycled-invisible decision was proof-gated: an ungated recycle would
 # have disqualified the shortcut, so this stays 0 in the all-on incarnation.
 is(_counter($on, 'undo', 'retention_off_recycle_count'), 0,

@@ -1608,6 +1608,18 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 			case CLUSTER_CR_XMAX_RECYCLED:
 				if (cluster_cr_retention_proof_valid(snapshot->read_scn)) {
 					cluster_cr_count_xmax_recycled_invisible();
+					/* spec-4.8 D4 (task#84): surface the recycled-slot liveness
+					 * relax under the tt_recovery category too.  The §3.5 proof
+					 * chain's own-instance legs (a-e) ARE this 3.22 retention
+					 * proof + D3's generation gate (condition 6); a 53R9F that
+					 * this proof turns into a sound INVISIBLE is the relax.  The
+					 * cross-node INDOUBT->ABORTED lever (§3.5 condition 1,
+					 * recovery-completeness) is NOT added: recovered_through >=
+					 * page LSN proves the deleter's WRITE is covered, not its
+					 * (later) COMMIT LSN, so an INDOUBT could be an as-yet-
+					 * unrecovered commit -> relaxing it would be false-visible
+					 * (规则 8.A).  Q5 strict fallback applies; forward. */
+					cluster_tt_recovery_count_recycled_liveness_relaxed();
 					*out_visible = false; /* deleter proven below horizon -> invisible */
 					return CLUSTER_CR_DECIDED;
 				}
