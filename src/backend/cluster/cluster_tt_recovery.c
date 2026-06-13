@@ -63,15 +63,15 @@
  */
 #include "postgres.h"
 
-#include "access/transam.h"		/* TransactionIdDidCommit */
-#include "storage/procarray.h"	/* TransactionIdIsInProgress */
+#include "access/transam.h"	   /* TransactionIdDidCommit */
+#include "storage/procarray.h" /* TransactionIdIsInProgress */
 #include "utils/elog.h"
 
 #include "cluster/cluster_guc.h" /* cluster_enabled / cluster_node_id / GUC */
 #include "cluster/cluster_tt_durable.h"
-#include "cluster/cluster_tt_slot.h"	  /* TTSlot, TT_SLOT_ACTIVE, TT_SLOTS_PER_SEGMENT */
-#include "cluster/cluster_undo_segment.h" /* UndoSegmentHeaderData */
-#include "cluster/cluster_undo_smgr.h"	  /* cluster_undo_smgr_read_block */
+#include "cluster/cluster_tt_slot.h"			/* TTSlot, TT_SLOT_ACTIVE, TT_SLOTS_PER_SEGMENT */
+#include "cluster/cluster_undo_segment.h"		/* UndoSegmentHeaderData */
+#include "cluster/cluster_undo_smgr.h"			/* cluster_undo_smgr_read_block */
 #include "cluster/storage/cluster_undo_alloc.h" /* CLUSTER_UNDO_SEGS_PER_INSTANCE */
 
 /*
@@ -91,8 +91,8 @@
 ClusterTtRecoveryLiveness
 cluster_tt_recovery_xact_liveness(TransactionId xid)
 {
-	bool		did_commit;
-	bool		is_in_progress;
+	bool did_commit;
+	bool is_in_progress;
 
 	if (!TransactionIdIsValid(xid) || !TransactionIdIsNormal(xid))
 		return CLUSTER_TT_RECOVERY_AMBIGUOUS;
@@ -124,13 +124,13 @@ cluster_tt_recovery_xact_liveness(TransactionId xid)
 int
 cluster_tt_recovery_resolve_active_slots(void)
 {
-	int			node;
-	uint8		owner;
-	uint32		seg_lo;
-	uint32		seg_hi;
-	uint32		segment_id;
+	int node;
+	uint8 owner;
+	uint32 seg_lo;
+	uint32 seg_hi;
+	uint32 segment_id;
 	PGAlignedBlock blockbuf;
-	int			resolved = 0;
+	int resolved = 0;
 
 	if (!cluster_enabled || !cluster_tt_recovery_resolve_active)
 		return 0;
@@ -138,32 +138,30 @@ cluster_tt_recovery_resolve_active_slots(void)
 		return 0;
 
 	node = cluster_node_id;
-	owner = (uint8) (node + 1);
-	seg_lo = (uint32) node * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	owner = (uint8)(node + 1);
+	seg_lo = (uint32)node * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
 	seg_hi = seg_lo + CLUSTER_UNDO_SEGS_PER_INSTANCE - 1;
 
-	for (segment_id = seg_lo; segment_id <= seg_hi; segment_id++)
-	{
+	for (segment_id = seg_lo; segment_id <= seg_hi; segment_id++) {
 		UndoSegmentHeaderData *hdr;
-		uint16		i;
+		uint16 i;
 
 		if (!cluster_undo_smgr_read_block(segment_id, owner, 0, blockbuf.data))
-			continue;			/* absent / unreadable -> skip (never false-abort) */
+			continue; /* absent / unreadable -> skip (never false-abort) */
 
-		hdr = (UndoSegmentHeaderData *) blockbuf.data;
-		for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++)
-		{
+		hdr = (UndoSegmentHeaderData *)blockbuf.data;
+		for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
 			const TTSlot *s = &hdr->tt_slots[i];
 			ClusterTtRecoveryLiveness verdict;
 
-			if (s->status != (uint8) TT_SLOT_ACTIVE)
+			if (s->status != (uint8)TT_SLOT_ACTIVE)
 				continue;
 			if (!TransactionIdIsValid(s->xid))
 				continue;
 
 			verdict = cluster_tt_recovery_xact_liveness(s->xid);
 			if (verdict == CLUSTER_TT_RECOVERY_LIVE)
-				continue;		/* committed / resurrected prepared -> keep ACTIVE */
+				continue; /* committed / resurrected prepared -> keep ACTIVE */
 
 			/* DEAD or AMBIGUOUS -> fail-closed ABORTED (durable, WAL 0x60). */
 			cluster_tt_slot_durable_abort(segment_id, i, s->xid, s->wrap);
@@ -173,9 +171,10 @@ cluster_tt_recovery_resolve_active_slots(void)
 	}
 
 	if (resolved > 0)
-		ereport(LOG,
-				(errmsg("cluster undo/TT recovery: resolved %d crash-left ACTIVE TT slot(s) to ABORTED",
-						resolved)));
+		ereport(
+			LOG,
+			(errmsg("cluster undo/TT recovery: resolved %d crash-left ACTIVE TT slot(s) to ABORTED",
+					resolved)));
 
 	return resolved;
 }

@@ -216,9 +216,9 @@ cluster_tt_slot_durable_resolve_by_xid(TransactionId xid, uint32 expected_wrap, 
  * slot we cannot prove live is aborted); LIVE keeps the slot ACTIVE.
  */
 typedef enum ClusterTtRecoveryLiveness {
-	CLUSTER_TT_RECOVERY_DEAD,	   /* not committed, not in-progress -> ABORTED */
-	CLUSTER_TT_RECOVERY_LIVE,	   /* committed, or resurrected prepared 2PC -> keep */
-	CLUSTER_TT_RECOVERY_AMBIGUOUS  /* cannot determine -> fail-closed ABORTED */
+	CLUSTER_TT_RECOVERY_DEAD,	  /* not committed, not in-progress -> ABORTED */
+	CLUSTER_TT_RECOVERY_LIVE,	  /* committed, or resurrected prepared 2PC -> keep */
+	CLUSTER_TT_RECOVERY_AMBIGUOUS /* cannot determine -> fail-closed ABORTED */
 } ClusterTtRecoveryLiveness;
 
 /*
@@ -228,9 +228,8 @@ typedef enum ClusterTtRecoveryLiveness {
  *	if its slot is still ACTIVE -- a lost commit_scn stamp is not an abort);
  *	an in-progress xid is LIVE (resurrected prepared 2PC); otherwise DEAD.
  */
-extern ClusterTtRecoveryLiveness cluster_tt_recovery_classify_liveness(bool determinable,
-																	   bool did_commit,
-																	   bool is_in_progress);
+extern ClusterTtRecoveryLiveness
+cluster_tt_recovery_classify_liveness(bool determinable, bool did_commit, bool is_in_progress);
 
 /*
  * cluster_tt_recovery_xact_liveness -- backend wrapper that consults PG's CLOG
@@ -285,14 +284,14 @@ extern uint64 cluster_tt_durable_redo_apply_count(void);
  * 'tt_recovery'.  Bumped by the recovery resolution / cross-node authority /
  * wrap-generation / liveness-relax / SCN-recovery / physical-revert paths.
  */
-extern void cluster_tt_recovery_count_active_resolved_aborted(void);  /* D1 */
-extern void cluster_tt_recovery_count_remote_active_failclosed(void);  /* D2 */
-extern void cluster_tt_recovery_count_wrap_generation_disambiguated(void); /* D3 */
-extern void cluster_tt_recovery_count_recycled_liveness_relaxed(void); /* D4 */
-extern void cluster_tt_recovery_count_scn_highwater_recovered(void);  /* D5 */
-extern void cluster_tt_recovery_count_recovery_verdict_failclosed(void); /* D2/D7 */
+extern void cluster_tt_recovery_count_active_resolved_aborted(void);		 /* D1 */
+extern void cluster_tt_recovery_count_remote_active_failclosed(void);		 /* D2 */
+extern void cluster_tt_recovery_count_wrap_generation_disambiguated(void);	 /* D3 */
+extern void cluster_tt_recovery_count_recycled_liveness_relaxed(void);		 /* D4 */
+extern void cluster_tt_recovery_count_scn_highwater_recovered(void);		 /* D5 */
+extern void cluster_tt_recovery_count_recovery_verdict_failclosed(void);	 /* D2/D7 */
 extern void cluster_tt_recovery_count_heap_tuples_physically_reverted(void); /* D7 */
-extern void cluster_tt_recovery_count_undo_revert_failclosed(void);   /* D7 */
+extern void cluster_tt_recovery_count_undo_revert_failclosed(void);			 /* D7 */
 
 extern uint64 cluster_tt_recovery_active_resolved_aborted_count(void);
 extern uint64 cluster_tt_recovery_remote_active_failclosed_count(void);

@@ -55,14 +55,14 @@ typedef struct ClusterTTDurableShared {
 	pg_atomic_uint64 redo_apply_count;			/* XLOG_UNDO_TT_SLOT_COMMIT APPLY */
 
 	/* spec-4.8 tt_recovery counters (8), dump category 'tt_recovery'. */
-	pg_atomic_uint64 active_resolved_aborted;		   /* D1 crash-left ACTIVE -> ABORTED */
-	pg_atomic_uint64 remote_active_failclosed;		   /* D2 cross-node authority fail-closed */
-	pg_atomic_uint64 wrap_generation_disambiguated;	   /* D3 (xid,gen) disambiguation */
-	pg_atomic_uint64 recycled_liveness_relaxed;		   /* D4 53R9F proof-gated relax */
-	pg_atomic_uint64 scn_highwater_recovered;		   /* D5 SCN high-watermark recovery */
-	pg_atomic_uint64 recovery_verdict_failclosed;	   /* D2/D7 verdict fail-closed */
-	pg_atomic_uint64 heap_tuples_physically_reverted;  /* D7 physical revert */
-	pg_atomic_uint64 undo_revert_failclosed;		   /* D7 revert safety-gate fail-closed */
+	pg_atomic_uint64 active_resolved_aborted;		  /* D1 crash-left ACTIVE -> ABORTED */
+	pg_atomic_uint64 remote_active_failclosed;		  /* D2 cross-node authority fail-closed */
+	pg_atomic_uint64 wrap_generation_disambiguated;	  /* D3 (xid,gen) disambiguation */
+	pg_atomic_uint64 recycled_liveness_relaxed;		  /* D4 53R9F proof-gated relax */
+	pg_atomic_uint64 scn_highwater_recovered;		  /* D5 SCN high-watermark recovery */
+	pg_atomic_uint64 recovery_verdict_failclosed;	  /* D2/D7 verdict fail-closed */
+	pg_atomic_uint64 heap_tuples_physically_reverted; /* D7 physical revert */
+	pg_atomic_uint64 undo_revert_failclosed;		  /* D7 revert safety-gate fail-closed */
 } ClusterTTDurableShared;
 
 #ifdef USE_PGRAC_CLUSTER
