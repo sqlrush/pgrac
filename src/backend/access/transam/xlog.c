@@ -5935,6 +5935,15 @@ StartupXLOG(void)
 	 * cluster.enabled + cluster.tt_recovery_resolve_active.
 	 */
 	cluster_tt_recovery_resolve_active_slots();
+
+	/*
+	 * PGRAC MODIFICATIONS (spec-4.8 D5, L222): advance cluster_scn to the
+	 * durable TT commit_scn high-watermark so a reader's read_scn taken after
+	 * crash-restart is not left below the durable commit/retention bound (which
+	 * over-fail-closes CR "snapshot too old" until organic SCN advance catches
+	 * up).  Lamport-monotonic, so it can only advance cluster_scn.
+	 */
+	cluster_tt_recovery_observe_scn_highwater();
 #endif
 
 	/*

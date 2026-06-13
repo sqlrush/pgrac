@@ -150,34 +150,37 @@ cmp_ok($resolved_a, '>=', 0,
 $na->stop;
 
 # ======================================================================
-# FINDING 2 — fast path OFF (cluster CR path forced): D5 / L222 over-fail-
-# closed reproduces deterministically after crash-restart.
+# FINDING 2 / D5 (L222) — fast path OFF (cluster CR path forced): D5 advances
+# cluster_scn to the durable TT commit_scn high-watermark at startup, so the
+# post-restart CR read no longer over-fail-closes "snapshot too old".  In D0
+# this was a window-dependent over-fail-closed; D5 closes it deterministically.
 # ======================================================================
 my $nb = _new_node('s48_fpoff', 'off');
 $nb->start;
 _crash_with_inflight_delete($nb);
 
-# FINDING 2 is window-dependent (NON-deterministic): whether post-restart
-# read_scn < durable horizon depends on the exact SCN values, so the over-
-# fail-closed reproduces only in some runs and self-heals once SCN advances.
-# We therefore DOCUMENT it via diag rather than assert it (no CI flake); the
-# D5 acceptance leg asserts the FIX (read_scn >= recovered high-watermark)
-# deterministically once cluster_scn high-watermark recovery lands.
+# D5 fired at startup: the committed INSERT left a durable COMMITTED TT slot, so
+# the high-watermark observe ran (scn_highwater_recovered >= 1) -- deterministic.
+my $hw = $nb->safe_psql('postgres',
+	q{SELECT value FROM pg_cluster_state WHERE category='tt_recovery' AND key='scn_highwater_recovered'});
+cmp_ok($hw, '>=', 1,
+	'D5 (L222): startup observed the durable TT commit_scn high-watermark into cluster_scn (scn_highwater_recovered >= 1)');
+
+# The cluster CR-path read after crash-restart now succeeds: cluster_scn was
+# bumped past the durable peak at startup, so read_scn >= the retention horizon
+# (no over-fail-closed).  Use psql (not safe_psql) to capture rather than die.
 my ($ret, $stdout, $stderr) =
   $nb->psql('postgres', q{SELECT count(*) FROM t48});
 my $is_snapshot_too_old = ($stderr =~ /snapshot too old/);
-diag("measure-first FINDING 2 (D5/L222, window-dependent): post-restart "
-	  . "cluster CR read ret=$ret over_fail_closed="
-	  . ($is_snapshot_too_old ? 'YES (snapshot-too-old reproduced this run)'
-		: 'no (SCN window self-healed this run)'));
+diag("D5: post-restart cluster CR read ret=$ret"
+	  . ($is_snapshot_too_old ? ' STILL over-fail-closed (unexpected)' : ' ok (no snapshot-too-old)'));
+ok(!$is_snapshot_too_old,
+	'D5 (L222): post-restart cluster CR read does NOT over-fail-closed snapshot-too-old (cluster_scn recovered to the durable high-watermark)');
 
-# 规则 8.A holds either way: snapshot-too-old is fail-closed (an error), never
-# wrong data.  We do NOT re-read t48 here -- the over-fail-closed window
-# persists on the fast-path-off node until SCN advances past the durable peak
-# (the D5 gap itself), and a dying safe_psql would break the pipe.  The
-# no-false-committed invariant is asserted on node A (readable) above.
-ok($ret != 0 ? $is_snapshot_too_old : 1,
-	'FINDING 2: 规则 8.A — any post-restart CR-path failure is fail-closed (snapshot-too-old error), never wrong data');
+# 规则 8.A: even if a CR-path read failed, it must be fail-closed (an error),
+# never wrong data.
+ok($ret == 0 || $is_snapshot_too_old,
+	'FINDING 2: 规则 8.A — any residual CR-path failure is fail-closed (snapshot-too-old), never wrong data');
 $nb->stop;
 
 # ======================================================================

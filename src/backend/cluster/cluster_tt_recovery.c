@@ -68,6 +68,7 @@
 #include "utils/elog.h"
 
 #include "cluster/cluster_guc.h" /* cluster_enabled / cluster_node_id / GUC */
+#include "cluster/cluster_scn.h" /* spec-4.8 D5: SCN high-watermark recovery */
 #include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_tt_slot.h"			/* TTSlot, TT_SLOT_ACTIVE, TT_SLOTS_PER_SEGMENT */
 #include "cluster/cluster_undo_segment.h"		/* UndoSegmentHeaderData */
@@ -177,4 +178,81 @@ cluster_tt_recovery_resolve_active_slots(void)
 					resolved)));
 
 	return resolved;
+}
+
+/*
+ * cluster_tt_recovery_observe_scn_highwater -- spec-4.8 D5 (L222).
+ *
+ *	Scan this instance's undo segment headers for the maximum durable TT
+ *	commit_scn and Lamport-observe it into cluster_scn at startup, so a reader's
+ *	read_scn taken after crash-restart is not left below the durable commit/
+ *	retention high-watermark.  Without this, the post-restart window has
+ *	cluster_scn lagging the durable peak until organic advance catches up, so a
+ *	CR read whose read_scn predates the retention horizon over-fail-closes
+ *	"snapshot too old" (规则 8.A-compliant -- an error, not wrong data -- but an
+ *	availability regression; window-dependent, self-heals as the SCN advances).
+ *
+ *	cluster_scn_recovery_replay_observe is Lamport-monotonic: observing the peak
+ *	can only advance cluster_scn (never rewind), so it is correctness-safe even
+ *	if the peak is conservatively high.  Page-level pd_block_scn is already
+ *	covered by the redo-path xl_scn observe (spec-1.18); this closes the TT
+ *	commit_scn arm of L222.  Returns the number of commit_scn peaks observed
+ *	(0 or 1).  Called once from StartupXLOG after recovery completes; gated by
+ *	cluster.enabled only (independent of cluster.tt_recovery_resolve_active).
+ */
+int
+cluster_tt_recovery_observe_scn_highwater(void)
+{
+	int node;
+	uint8 owner;
+	uint32 seg_lo;
+	uint32 seg_hi;
+	uint32 segment_id;
+	PGAlignedBlock blockbuf;
+	SCN max_commit_scn = InvalidScn;
+
+	if (!cluster_enabled)
+		return 0;
+	if (cluster_node_id < 0)
+		return 0;
+
+	node = cluster_node_id;
+	owner = (uint8)(node + 1);
+	seg_lo = (uint32)node * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	seg_hi = seg_lo + CLUSTER_UNDO_SEGS_PER_INSTANCE - 1;
+
+	for (segment_id = seg_lo; segment_id <= seg_hi; segment_id++) {
+		UndoSegmentHeaderData *hdr;
+		uint16 i;
+
+		if (!cluster_undo_smgr_read_block(segment_id, owner, 0, blockbuf.data))
+			continue; /* absent / unreadable -> skip */
+
+		hdr = (UndoSegmentHeaderData *)blockbuf.data;
+		for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+			const TTSlot *s = &hdr->tt_slots[i];
+
+			if (s->status != (uint8)TT_SLOT_COMMITTED)
+				continue;
+			if (!SCN_VALID(s->commit_scn))
+				continue;
+			if (!SCN_VALID(max_commit_scn) || scn_time_cmp(s->commit_scn, max_commit_scn) > 0)
+				max_commit_scn = s->commit_scn;
+		}
+	}
+
+	if (!SCN_VALID(max_commit_scn))
+		return 0;
+
+	/* Lamport-monotonic: bumps cluster_scn to >= the durable commit peak. */
+	cluster_scn_recovery_replay_observe(max_commit_scn);
+	cluster_tt_recovery_count_scn_highwater_recovered();
+
+	ereport(
+		LOG,
+		(errmsg(
+			"cluster undo/TT recovery: observed durable TT commit_scn high-watermark " UINT64_FORMAT
+			" into cluster_scn",
+			(uint64)max_commit_scn)));
+	return 1;
 }

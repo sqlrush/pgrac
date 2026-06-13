@@ -271,6 +271,15 @@ extern ClusterTtRecoveryLiveness cluster_tt_recovery_xact_liveness(TransactionId
  */
 extern int cluster_tt_recovery_resolve_active_slots(void);
 
+/*
+ * cluster_tt_recovery_observe_scn_highwater -- spec-4.8 D5 (L222): scan this
+ *	instance's durable TT slots for the max commit_scn and Lamport-observe it
+ *	into cluster_scn at startup, so a post-crash-restart read_scn is not left
+ *	below the durable high-watermark (which over-fail-closes CR "snapshot too
+ *	old").  Monotonic; correctness-safe.  Returns 0/1.  Backend-only.
+ */
+extern int cluster_tt_recovery_observe_scn_highwater(void);
+
 
 /*
  * Observability (spec-3.11 D7/D8) -- implemented in cluster_tt_durable_stat.c
