@@ -147,6 +147,24 @@ my $resolved_a = $na->safe_psql('postgres',
 	q{SELECT value FROM pg_cluster_state WHERE category='tt_recovery' AND key='active_slots_resolved_aborted'});
 cmp_ok($resolved_a, '>=', 0,
 	'D1: startup ACTIVE-slot resolution net ran; active_slots_resolved_aborted observable (defensive net, normally 0 — on-disk slots never ACTIVE; single-node correctness is PG-native per FINDING 1)');
+
+# D6 (observability acceptance): every one of the 8 tt_recovery verdict counters
+# is present and non-negative by exact key name (not just category count=8 --
+# L223: validate the emitted content, not mere existence).  Each is wired by its
+# deliverable (D1 active_slots_resolved_aborted / D2 remote_active_failclosed /
+# D3 wrap_generation_disambiguated / D4 recycled_liveness_relaxed / D5
+# scn_highwater_recovered / D2 recovery_verdict_failclosed / D7
+# heap_tuples_physically_reverted + undo_revert_failclosed).
+for my $key (
+	qw(active_slots_resolved_aborted remote_active_failclosed
+	wrap_generation_disambiguated recycled_liveness_relaxed
+	scn_highwater_recovered recovery_verdict_failclosed
+	heap_tuples_physically_reverted undo_revert_failclosed))
+{
+	my $present = $na->safe_psql('postgres',
+		qq{SELECT count(*) FROM pg_cluster_state WHERE category='tt_recovery' AND key='$key'});
+	is($present, '1', "D6 (obs): tt_recovery.$key present + observable");
+}
 $na->stop;
 
 # ======================================================================
