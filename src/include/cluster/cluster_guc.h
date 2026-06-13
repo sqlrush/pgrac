@@ -504,6 +504,9 @@ extern bool cluster_cr_gate_no_peer_fastpath;
 /* cluster.tt_durable_lookup (spec-3.11 D7): durable TT slot read-side resolve
  * on overlay miss / watermark gate (default on; PGC_USERSET). */
 extern bool cluster_tt_durable_lookup;
+/* spec-4.8 D1: resolve crash-left ACTIVE TT slots to ABORTED at startup
+ * (default on; PGC_POSTMASTER). */
+extern bool cluster_tt_recovery_resolve_active;
 
 
 /*

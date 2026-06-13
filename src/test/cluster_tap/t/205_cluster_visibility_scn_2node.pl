@@ -295,8 +295,8 @@ ok(defined($exported) && length($exported) > 0,
 # ============================================================
 is($pair->node0->safe_psql('postgres',
 		q{SELECT count(DISTINCT category) FROM pg_cluster_state}),
-	'34',
-	'L14a pg_cluster_state has 34 categories (spec-4.6 adds grd_recovery)');
+	'35',
+	'L14a pg_cluster_state has 35 categories (spec-4.8 adds tt_recovery)');
 
 is($pair->node0->safe_psql('postgres',
 		q{SELECT count(*) FROM pg_cluster_state

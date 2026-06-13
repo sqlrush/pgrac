@@ -1020,6 +1020,48 @@ cluster_tt_durable_redo_apply_count(void)
 {
 	return 0;
 }
+/* spec-4.8: tt_recovery counter accessors (cluster_tt_durable_stat.c) are not
+ * linked here; stub the 8 accessors the tt_recovery dump rows read. */
+uint64
+cluster_tt_recovery_active_resolved_aborted_count(void)
+{
+	return 0;
+}
+uint64
+cluster_tt_recovery_remote_active_failclosed_count(void)
+{
+	return 0;
+}
+uint64
+cluster_tt_recovery_wrap_generation_disambiguated_count(void)
+{
+	return 0;
+}
+uint64
+cluster_tt_recovery_recycled_liveness_relaxed_count(void)
+{
+	return 0;
+}
+uint64
+cluster_tt_recovery_scn_highwater_recovered_count(void)
+{
+	return 0;
+}
+uint64
+cluster_tt_recovery_recovery_verdict_failclosed_count(void)
+{
+	return 0;
+}
+uint64
+cluster_tt_recovery_heap_tuples_physically_reverted_count(void)
+{
+	return 0;
+}
+uint64
+cluster_tt_recovery_undo_revert_failclosed_count(void)
+{
+	return 0;
+}
 /* spec-3.16 D5 recovery counter accessor stubs (dump_recovery rows). */
 uint64
 cluster_vis_get_recovery_undo_redo_applies(void)

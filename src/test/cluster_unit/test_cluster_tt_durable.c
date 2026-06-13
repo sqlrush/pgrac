@@ -690,10 +690,55 @@ UT_TEST(test_redo_decide_abort_shares_commit_table)
 }
 
 
+/* ============================================================
+ *	spec-4.8 D1: crash-left ACTIVE liveness classifier truth table
+ * ============================================================ */
+UT_TEST(test_recovery_liveness_indeterminable_is_ambiguous)
+{
+	/* !determinable -> AMBIGUOUS (fail-closed -> caller aborts the slot). */
+	UT_ASSERT_EQ((int)cluster_tt_recovery_classify_liveness(false, false, false),
+				 (int)CLUSTER_TT_RECOVERY_AMBIGUOUS);
+	UT_ASSERT_EQ((int)cluster_tt_recovery_classify_liveness(false, true, true),
+				 (int)CLUSTER_TT_RECOVERY_AMBIGUOUS);
+}
+UT_TEST(test_recovery_liveness_committed_is_live)
+{
+	/* did_commit -> LIVE (never abort a committed xact, even if slot ACTIVE). */
+	UT_ASSERT_EQ((int)cluster_tt_recovery_classify_liveness(true, true, false),
+				 (int)CLUSTER_TT_RECOVERY_LIVE);
+}
+UT_TEST(test_recovery_liveness_committed_precedence_over_inprogress)
+{
+	/* did_commit wins over is_in_progress (fail-safe precedence). */
+	UT_ASSERT_EQ((int)cluster_tt_recovery_classify_liveness(true, true, true),
+				 (int)CLUSTER_TT_RECOVERY_LIVE);
+}
+UT_TEST(test_recovery_liveness_inprogress_is_live)
+{
+	/* !did_commit && is_in_progress -> LIVE (resurrected prepared 2PC). */
+	UT_ASSERT_EQ((int)cluster_tt_recovery_classify_liveness(true, false, true),
+				 (int)CLUSTER_TT_RECOVERY_LIVE);
+}
+UT_TEST(test_recovery_liveness_neither_is_dead)
+{
+	/* determinable, !committed, !in_progress -> DEAD (crash-left -> ABORTED). */
+	UT_ASSERT_EQ((int)cluster_tt_recovery_classify_liveness(true, false, false),
+				 (int)CLUSTER_TT_RECOVERY_DEAD);
+}
+UT_TEST(test_recovery_liveness_dead_and_ambiguous_both_abort)
+{
+	/* The resolve loop aborts both DEAD and AMBIGUOUS; LIVE alone is kept. */
+	UT_ASSERT(cluster_tt_recovery_classify_liveness(true, false, false)
+			  != CLUSTER_TT_RECOVERY_LIVE);
+	UT_ASSERT(cluster_tt_recovery_classify_liveness(false, false, false)
+			  != CLUSTER_TT_RECOVERY_LIVE);
+}
+
+
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(36);
+	UT_PLAN(42);
 
 	UT_RUN(test_layout_sizes);
 
@@ -739,6 +784,13 @@ main(int argc, char **argv)
 
 	UT_RUN(test_redo_decide_idempotent_replay);
 	UT_RUN(test_redo_decide_abort_shares_commit_table);
+
+	UT_RUN(test_recovery_liveness_indeterminable_is_ambiguous);
+	UT_RUN(test_recovery_liveness_committed_is_live);
+	UT_RUN(test_recovery_liveness_committed_precedence_over_inprogress);
+	UT_RUN(test_recovery_liveness_inprogress_is_live);
+	UT_RUN(test_recovery_liveness_neither_is_dead);
+	UT_RUN(test_recovery_liveness_dead_and_ambiguous_both_abort);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

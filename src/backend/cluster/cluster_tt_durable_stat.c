@@ -53,6 +53,16 @@ typedef struct ClusterTTDurableShared {
 	pg_atomic_uint64 durable_lookup_miss_count; /* seg/slot lookup miss (D5) */
 	pg_atomic_uint64 by_xid_scan_count;			/* by-xid watermark scan (D6) */
 	pg_atomic_uint64 redo_apply_count;			/* XLOG_UNDO_TT_SLOT_COMMIT APPLY */
+
+	/* spec-4.8 tt_recovery counters (8), dump category 'tt_recovery'. */
+	pg_atomic_uint64 active_resolved_aborted;		   /* D1 crash-left ACTIVE -> ABORTED */
+	pg_atomic_uint64 remote_active_failclosed;		   /* D2 cross-node authority fail-closed */
+	pg_atomic_uint64 wrap_generation_disambiguated;	   /* D3 (xid,gen) disambiguation */
+	pg_atomic_uint64 recycled_liveness_relaxed;		   /* D4 53R9F proof-gated relax */
+	pg_atomic_uint64 scn_highwater_recovered;		   /* D5 SCN high-watermark recovery */
+	pg_atomic_uint64 recovery_verdict_failclosed;	   /* D2/D7 verdict fail-closed */
+	pg_atomic_uint64 heap_tuples_physically_reverted;  /* D7 physical revert */
+	pg_atomic_uint64 undo_revert_failclosed;		   /* D7 revert safety-gate fail-closed */
 } ClusterTTDurableShared;
 
 #ifdef USE_PGRAC_CLUSTER
@@ -83,6 +93,14 @@ cluster_tt_durable_shmem_init(void)
 		pg_atomic_init_u64(&TTDurableShared->durable_lookup_miss_count, 0);
 		pg_atomic_init_u64(&TTDurableShared->by_xid_scan_count, 0);
 		pg_atomic_init_u64(&TTDurableShared->redo_apply_count, 0);
+		pg_atomic_init_u64(&TTDurableShared->active_resolved_aborted, 0);
+		pg_atomic_init_u64(&TTDurableShared->remote_active_failclosed, 0);
+		pg_atomic_init_u64(&TTDurableShared->wrap_generation_disambiguated, 0);
+		pg_atomic_init_u64(&TTDurableShared->recycled_liveness_relaxed, 0);
+		pg_atomic_init_u64(&TTDurableShared->scn_highwater_recovered, 0);
+		pg_atomic_init_u64(&TTDurableShared->recovery_verdict_failclosed, 0);
+		pg_atomic_init_u64(&TTDurableShared->heap_tuples_physically_reverted, 0);
+		pg_atomic_init_u64(&TTDurableShared->undo_revert_failclosed, 0);
 	}
 }
 
@@ -171,6 +189,37 @@ TT_DURABLE_ACCESSOR(cluster_tt_durable_lookup_miss_count, durable_lookup_miss_co
 TT_DURABLE_ACCESSOR(cluster_tt_durable_by_xid_scan_count, by_xid_scan_count)
 TT_DURABLE_ACCESSOR(cluster_tt_durable_redo_apply_count, redo_apply_count)
 
+/* spec-4.8 tt_recovery counters: bump hooks + accessors. */
+#define TT_RECOVERY_BUMP(fn, field)                                                                \
+	void fn(void)                                                                                  \
+	{                                                                                              \
+		if (TTDurableShared != NULL)                                                               \
+			pg_atomic_fetch_add_u64(&TTDurableShared->field, 1);                                   \
+	}
+
+TT_RECOVERY_BUMP(cluster_tt_recovery_count_active_resolved_aborted, active_resolved_aborted)
+TT_RECOVERY_BUMP(cluster_tt_recovery_count_remote_active_failclosed, remote_active_failclosed)
+TT_RECOVERY_BUMP(cluster_tt_recovery_count_wrap_generation_disambiguated,
+				 wrap_generation_disambiguated)
+TT_RECOVERY_BUMP(cluster_tt_recovery_count_recycled_liveness_relaxed, recycled_liveness_relaxed)
+TT_RECOVERY_BUMP(cluster_tt_recovery_count_scn_highwater_recovered, scn_highwater_recovered)
+TT_RECOVERY_BUMP(cluster_tt_recovery_count_recovery_verdict_failclosed, recovery_verdict_failclosed)
+TT_RECOVERY_BUMP(cluster_tt_recovery_count_heap_tuples_physically_reverted,
+				 heap_tuples_physically_reverted)
+TT_RECOVERY_BUMP(cluster_tt_recovery_count_undo_revert_failclosed, undo_revert_failclosed)
+
+TT_DURABLE_ACCESSOR(cluster_tt_recovery_active_resolved_aborted_count, active_resolved_aborted)
+TT_DURABLE_ACCESSOR(cluster_tt_recovery_remote_active_failclosed_count, remote_active_failclosed)
+TT_DURABLE_ACCESSOR(cluster_tt_recovery_wrap_generation_disambiguated_count,
+					wrap_generation_disambiguated)
+TT_DURABLE_ACCESSOR(cluster_tt_recovery_recycled_liveness_relaxed_count, recycled_liveness_relaxed)
+TT_DURABLE_ACCESSOR(cluster_tt_recovery_scn_highwater_recovered_count, scn_highwater_recovered)
+TT_DURABLE_ACCESSOR(cluster_tt_recovery_recovery_verdict_failclosed_count,
+					recovery_verdict_failclosed)
+TT_DURABLE_ACCESSOR(cluster_tt_recovery_heap_tuples_physically_reverted_count,
+					heap_tuples_physically_reverted)
+TT_DURABLE_ACCESSOR(cluster_tt_recovery_undo_revert_failclosed_count, undo_revert_failclosed)
+
 #else /* !USE_PGRAC_CLUSTER */
 
 Size
@@ -242,5 +291,33 @@ cluster_tt_durable_redo_apply_count(void)
 {
 	return 0;
 }
+
+/* spec-4.8 tt_recovery counters: no-op bumps + zero accessors. */
+#define TT_RECOVERY_BUMP_NOOP(fn)                                                                  \
+	void fn(void)                                                                                  \
+	{}
+#define TT_RECOVERY_ZERO(fn)                                                                       \
+	uint64 fn(void)                                                                                \
+	{                                                                                              \
+		return 0;                                                                                  \
+	}
+
+TT_RECOVERY_BUMP_NOOP(cluster_tt_recovery_count_active_resolved_aborted)
+TT_RECOVERY_BUMP_NOOP(cluster_tt_recovery_count_remote_active_failclosed)
+TT_RECOVERY_BUMP_NOOP(cluster_tt_recovery_count_wrap_generation_disambiguated)
+TT_RECOVERY_BUMP_NOOP(cluster_tt_recovery_count_recycled_liveness_relaxed)
+TT_RECOVERY_BUMP_NOOP(cluster_tt_recovery_count_scn_highwater_recovered)
+TT_RECOVERY_BUMP_NOOP(cluster_tt_recovery_count_recovery_verdict_failclosed)
+TT_RECOVERY_BUMP_NOOP(cluster_tt_recovery_count_heap_tuples_physically_reverted)
+TT_RECOVERY_BUMP_NOOP(cluster_tt_recovery_count_undo_revert_failclosed)
+
+TT_RECOVERY_ZERO(cluster_tt_recovery_active_resolved_aborted_count)
+TT_RECOVERY_ZERO(cluster_tt_recovery_remote_active_failclosed_count)
+TT_RECOVERY_ZERO(cluster_tt_recovery_wrap_generation_disambiguated_count)
+TT_RECOVERY_ZERO(cluster_tt_recovery_recycled_liveness_relaxed_count)
+TT_RECOVERY_ZERO(cluster_tt_recovery_scn_highwater_recovered_count)
+TT_RECOVERY_ZERO(cluster_tt_recovery_recovery_verdict_failclosed_count)
+TT_RECOVERY_ZERO(cluster_tt_recovery_heap_tuples_physically_reverted_count)
+TT_RECOVERY_ZERO(cluster_tt_recovery_undo_revert_failclosed_count)
 
 #endif /* USE_PGRAC_CLUSTER */

@@ -170,6 +170,7 @@
 #include "cluster/cluster_scn.h" /* PGRAC: xl_scn stamp (spec-4.5) */
 #include "cluster/cluster_wal_state.h" /* PGRAC: checkpoint redo / fpw sticky (spec-4.5) */
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_tt_durable.h" /* PGRAC: spec-4.8 D1 crash-left ACTIVE resolution */
 #endif
 
 extern uint32 bootstrap_data_checksum_version;
@@ -5916,6 +5917,25 @@ StartupXLOG(void)
 
 	UpdateControlFile();
 	LWLockRelease(ControlFileLock);
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC MODIFICATIONS (spec-4.8 D1): resolve crash-left undo TT slots.
+	 *
+	 * Recovery is now complete (RECOVERY_STATE_DONE, WAL writes enabled at
+	 * LocalSetXLogInsertAllowed above) and prepared 2PC xacts have been
+	 * resurrected into the proc array (RecoverPreparedTransactions above), so
+	 * RecoveryInProgress() is false and TransactionIdIsInProgress() resolves a
+	 * resurrected prepared xact via the normal proc array.  Any durable TT slot
+	 * still TT_SLOT_ACTIVE belongs to a transaction that was in flight at crash;
+	 * resolve each to TT_SLOT_ABORTED unless its owning xact committed or is a
+	 * resurrected prepared xact, so cluster visibility never treats an
+	 * in-flight-at-crash transaction as committed (规则 8.A).  Runs once here in
+	 * the startup process, before backends are allowed to connect.  No-op unless
+	 * cluster.enabled + cluster.tt_recovery_resolve_active.
+	 */
+	cluster_tt_recovery_resolve_active_slots();
+#endif
 
 	/*
 	 * Shutdown the recovery environment.  This must occur after

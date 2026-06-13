@@ -334,6 +334,34 @@ cluster_tt_slot_durable_resolve_by_xid(TransactionId xid, uint32 expected_wrap, 
 														 commit_scn);
 }
 
+
+/*
+ * cluster_tt_recovery_classify_liveness -- spec-4.8 D1 pure classifier.
+ *
+ *	Maps the (determinable, did_commit, is_in_progress) facts about a crash-
+ *	left ACTIVE slot's owning xid to a liveness verdict.  No I/O, no shmem --
+ *	unit-tested truth table (test_cluster_tt_durable).  Precedence (规则 8.A):
+ *	  - !determinable  -> AMBIGUOUS (fail-closed -> the caller aborts the slot);
+ *	  - did_commit     -> LIVE (never abort a committed xact; an ACTIVE slot for
+ *	                     a committed xid is a lost commit_scn stamp, not an abort);
+ *	  - is_in_progress -> LIVE (a resurrected prepared 2PC xact still in flight);
+ *	  - otherwise      -> DEAD (an in-flight-at-crash, non-prepared xact -> abort).
+ *
+ *	did_commit takes precedence over is_in_progress: a committed xact is never
+ *	"in progress" post-recovery, but the ordering makes the fail-safe explicit.
+ */
+ClusterTtRecoveryLiveness
+cluster_tt_recovery_classify_liveness(bool determinable, bool did_commit, bool is_in_progress)
+{
+	if (!determinable)
+		return CLUSTER_TT_RECOVERY_AMBIGUOUS;
+	if (did_commit)
+		return CLUSTER_TT_RECOVERY_LIVE;
+	if (is_in_progress)
+		return CLUSTER_TT_RECOVERY_LIVE;
+	return CLUSTER_TT_RECOVERY_DEAD;
+}
+
 /*
  * cluster_tt_slot_durable_resolve_by_xid_origin -- spec-4.5a G6 (P1 #2): the
  * origin-qualified durable by-xid scan.  A materialized foreign read cannot

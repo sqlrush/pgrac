@@ -1439,6 +1439,24 @@ dump_gcs(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "gcs_recovery", "before_boundary_failclosed",
 			 fmt_int64((int64)cluster_gcs_get_recovery_before_boundary_failclosed()));
 
+	/* PGRAC: spec-4.8 — 8 tt_recovery counter rows (undo/TT recovery verdicts). */
+	emit_row(rsinfo, "tt_recovery", "active_slots_resolved_aborted",
+			 fmt_int64((int64)cluster_tt_recovery_active_resolved_aborted_count()));
+	emit_row(rsinfo, "tt_recovery", "remote_active_failclosed",
+			 fmt_int64((int64)cluster_tt_recovery_remote_active_failclosed_count()));
+	emit_row(rsinfo, "tt_recovery", "wrap_generation_disambiguated",
+			 fmt_int64((int64)cluster_tt_recovery_wrap_generation_disambiguated_count()));
+	emit_row(rsinfo, "tt_recovery", "recycled_liveness_relaxed",
+			 fmt_int64((int64)cluster_tt_recovery_recycled_liveness_relaxed_count()));
+	emit_row(rsinfo, "tt_recovery", "scn_highwater_recovered",
+			 fmt_int64((int64)cluster_tt_recovery_scn_highwater_recovered_count()));
+	emit_row(rsinfo, "tt_recovery", "recovery_verdict_failclosed",
+			 fmt_int64((int64)cluster_tt_recovery_recovery_verdict_failclosed_count()));
+	emit_row(rsinfo, "tt_recovery", "heap_tuples_physically_reverted",
+			 fmt_int64((int64)cluster_tt_recovery_heap_tuples_physically_reverted_count()));
+	emit_row(rsinfo, "tt_recovery", "undo_revert_failclosed",
+			 fmt_int64((int64)cluster_tt_recovery_undo_revert_failclosed_count()));
+
 	/* PGRAC: spec-2.38 D10 — 9 NEW counter rows for SI Broadcaster. */
 	emit_row(rsinfo, "sinval", "broadcast_send_count",
 			 fmt_int64((int64)cluster_sinval_get_broadcast_send_count()));

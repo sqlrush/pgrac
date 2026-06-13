@@ -297,6 +297,18 @@ bool cluster_cr_gate_no_peer_fastpath = true;
 bool cluster_tt_durable_lookup = true;
 
 /*
+ * cluster.tt_recovery_resolve_active (spec-4.8 D1).  When on (default), the
+ * startup process, after redo + prepared-xact recovery, resolves every crash-
+ * left TT_SLOT_ACTIVE durable slot to TT_SLOT_ABORTED unless its owning xact is
+ * committed or a resurrected prepared 2PC xact (fail-closed: an ACTIVE slot we
+ * cannot prove live is aborted).  Off skips the resolution: slots stay ACTIVE
+ * and fall through to the pre-4.8 by-xid 0-match path (no correctness loss --
+ * only the explicit ABORTED verdict + housekeeping).  PGC_POSTMASTER: the
+ * resolution runs once at startup.
+ */
+bool cluster_tt_recovery_resolve_active = true;
+
+/*
  * cluster.undo_retention_horizon_enabled (spec-3.12 D5).  When on (default),
  * the TT-slot / undo-segment allocators keep COMMITTED slots/segments alive
  * while a live reader's read_scn still needs the durable pre-image (own-
@@ -1855,6 +1867,19 @@ cluster_init_guc(void)
 					 "+ crash redo) are never gated; toggling off only disables read-side "
 					 "resolution and never loses durable commit_scn."),
 		&cluster_tt_durable_lookup, true, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"cluster.tt_recovery_resolve_active",
+		gettext_noop("Resolve crash-left ACTIVE durable TT slots to ABORTED at startup."),
+		gettext_noop("Spec-4.8 D1. DEFAULT ON. After redo + prepared-xact recovery, the startup "
+					 "process scans this instance's undo segment headers and durably transitions "
+					 "every crash-left TT_SLOT_ACTIVE slot to TT_SLOT_ABORTED unless its owning "
+					 "xact is committed (CLOG) or a resurrected prepared 2PC xact -- so cluster "
+					 "visibility never treats an in-flight-at-crash transaction as committed "
+					 "(规则 8.A; an ACTIVE slot that cannot be proven live is aborted). Off skips "
+					 "the resolution: slots stay ACTIVE and fall through to the by-xid 0-match "
+					 "path (no correctness loss, only the explicit verdict + housekeeping)."),
+		&cluster_tt_recovery_resolve_active, true, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
 		"cluster.cr_cache_max_blocks",

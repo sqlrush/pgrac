@@ -109,6 +109,7 @@ OBJS = \
 	cluster_tt_2pc_record.o \
 	cluster_tt_durable.o \
 	cluster_tt_durable_stat.o \
+	cluster_tt_recovery.o \
 	cluster_tt_local.o \
 	cluster_tt_status.o \
 	cluster_tt_status_hint.o \

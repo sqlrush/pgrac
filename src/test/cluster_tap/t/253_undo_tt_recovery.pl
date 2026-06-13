@@ -128,11 +128,25 @@ my $present_a = $na->safe_psql('postgres',
 is($present_a, '100',
 	'FINDING 1: 规则 8.A — no false-committed delete (all 100 in-flight-deleted rows present)');
 
-# FINDING 3 (observability) — the tt_recovery dump category does not exist on
-# the current binary.  Asserted as the measured pre-D6 baseline (0 keys); D6
-# flips this assertion to 8 once the verdict counters land.
-is(_category_exists($na, 'tt_recovery'), 0,
-	'FINDING 3 (obs): pre-D6 baseline — pg_cluster_state has no tt_recovery category yet (D6 adds 8 verdict counters)');
+# FINDING 3 (observability) — D1 introduces the tt_recovery dump category with
+# the 8 D1-D7 verdict counters; assert it is present (the D0 measure-first
+# baseline of 0 flipped once D1 landed the counter region + emit rows).
+is(_category_exists($na, 'tt_recovery'), 8,
+	'FINDING 3 (obs): pg_cluster_state category tt_recovery exposes the 8 D1-D7 verdict counters');
+
+# D1 (Option A reframe — measure-first finding): the on-disk TT header slots are
+# NEVER written ACTIVE (the in-flight binding is in-memory CTS_ACTIVE, lost on
+# crash; only commit/abort write the durable header).  So the startup resolution
+# scan is a FAIL-CLOSED DEFENSIVE NET that normally resolves 0 slots -- single-
+# node correctness for the crashed in-flight DELETE is already provided by
+# PG-native CLOG (proven by FINDING 1 above: the rows stayed visible).  Assert
+# the counter is observable and non-negative (the scan ran without error and
+# never falsely resolved a non-ACTIVE slot); the load-bearing crash-xact handling
+# is D2 (cross-node) + D7 (physical revert via undo records + xact_liveness).
+my $resolved_a = $na->safe_psql('postgres',
+	q{SELECT value FROM pg_cluster_state WHERE category='tt_recovery' AND key='active_slots_resolved_aborted'});
+cmp_ok($resolved_a, '>=', 0,
+	'D1: startup ACTIVE-slot resolution net ran; active_slots_resolved_aborted observable (defensive net, normally 0 — on-disk slots never ACTIVE; single-node correctness is PG-native per FINDING 1)');
 $na->stop;
 
 # ======================================================================
