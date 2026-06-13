@@ -384,6 +384,40 @@ extern uint64 cluster_pcm_lock_clear_pending_x_for_node(int32 dead_node);
  * read.  Returns 0 if entry not present (treated as "no holders"). */
 extern uint32 cluster_pcm_lock_query_s_holders_bitmap(BufferTag tag);
 
+/* PGRAC: spec-4.7a D3 — strict master-side check "is `node` already a
+ * recorded holder of `tag` whose grant covers `trans`?"  Enables idempotent
+ * re-acknowledge of a holder's re-request instead of DENIED_MASTER_NOT_HOLDER
+ * (which loops to 53R90).  S→X never qualifies (real writer path).  Missing
+ * entry / uncertainty → false → caller fails closed. */
+extern bool cluster_pcm_master_requester_is_holder(BufferTag tag, int32 node,
+												   PcmLockTransition trans);
+
+/* PGRAC: spec-4.7a D4 — does a node OTHER than `sender` hold `tag` (X or S)
+ * and is still LIVE?  The GCS block master bounded-fail-closes an X request
+ * before any state mutation when this is true (writer transfer deferred).
+ * DEAD holders excluded (warm-recovery path).  See cluster_pcm_lock.c. */
+extern bool cluster_pcm_master_other_live_holder_exists(BufferTag tag, int32 sender);
+
+/*
+ * cluster_pcm_mode_covers — spec-4.7a D2.
+ *
+ *	Does a node already holding PCM mode `have` cover a new request for `want`?
+ *	X ⊇ {S, X}; S ⊇ {S}; N covers nothing.  The bufmgr acquire gate uses this
+ *	to skip a remote master round-trip when the node still holds a sufficient
+ *	mode (hold-until-revoked).  Safe ONLY because buf->pcm_state is cleared by
+ *	the INVALIDATE handler and the eviction/drop paths, so a non-N value here
+ *	means this node still genuinely holds the lock (Rule 8.A — no stale grant).
+ */
+static inline bool
+cluster_pcm_mode_covers(PcmLockMode have, PcmLockMode want)
+{
+	if (have == PCM_LOCK_MODE_X)
+		return true; /* X holder can read (S) and write (X) */
+	if (have == PCM_LOCK_MODE_S)
+		return want == PCM_LOCK_MODE_S; /* S holder can read only */
+	return false;						/* N (or anything else) covers nothing */
+}
+
 /* ============================================================
  * PGRAC: spec-2.37 D2/D7/D8/D9 HC125-HC130 — PI watermark API.
  *

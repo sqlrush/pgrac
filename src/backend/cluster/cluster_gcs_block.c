@@ -1077,6 +1077,26 @@ gcs_block_produce_reply(const GcsBlockRequestPayload *req, char *block_buf,
 		return true;
 	}
 
+	/*
+	 * PGRAC: spec-4.7a D3 — idempotent re-acknowledge for a requester the
+	 * master already records as a holder.  WITHOUT this, a node that released
+	 * its content_lock (buf->pcm_state → N) while still recorded as x_holder
+	 * re-requests N→S and gets DENIED_MASTER_NOT_HOLDER → sender retransmit
+	 * loop → 53R90 (the D0 bug).  Master state is UNCHANGED: do NOT call
+	 * apply_gcs_transition (N→S on an X state is an illegal transition,
+	 * spec-4.7a v0.2 amend 2); the requester already holds a covering local
+	 * mode (X ⊇ S).  S→X is excluded by the helper (real writer path → spec-
+	 * 2.36 invalidate-then-grant, no double X).  Strict GrdEntry read; any
+	 * uncertainty falls through to the fail-closed DENIED below (Rule 8.A).
+	 */
+	if (!found
+		&& cluster_pcm_master_requester_is_holder(req->tag, req->sender_node,
+												  (PcmLockTransition)req->transition_id)) {
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_storage_fallback_count, 1);
+		*out_status = GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK;
+		return true;
+	}
+
 	if (!found) {
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_master_not_holder_count, 1);
 		*out_status = GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
@@ -1290,6 +1310,31 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 		uint64 current_lsn;
 		int32 x_holder;
 
+		/*
+		 * PGRAC: spec-4.7a D4 / HG7 — bounded fail-closed for cross-node X
+		 * contention.  Granting X to this requester would require invalidating
+		 * or transferring the block away from ANOTHER LIVE node that holds it
+		 * (in X, or in S).  That is the writer-transfer path, deferred to
+		 * spec-2.36 completion / 4.7 / Stage 6 and NOT implemented here.  Fail
+		 * closed RIGHT NOW — before set_pending_x, before any invalidate
+		 * broadcast or forward — so:
+		 *   (1) no master state is mutated on the failure path;
+		 *   (2) the requester gets a bounded terminal DENIED (FEATURE_NOT_
+		 *       SUPPORTED), never a GRANTED_* and never a long invalidate-budget
+		 *       wait / hang;
+		 *   (3) pending_x is not set, so there is nothing to leak/clear;
+		 *   (4) the existing holder is untouched and stays usable;
+		 *   (5) a second X holder can never be granted (HG5 no double-X).
+		 * A dead holder is NOT handled here — that is the dead-master / warm-
+		 * recovery path (53R9K / spec-4.7); leave it to the flow below.
+		 */
+		if (cluster_pcm_master_other_live_holder_exists(req->tag, req->sender_node)) {
+			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_master_not_holder_count, 1);
+			gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER,
+								 InvalidXLogRecPtr, NULL);
+			return;
+		}
+
 		current_lsn = (uint64)GetXLogInsertRecPtr();
 		cluster_pcm_lock_set_pending_x(req->tag, req->sender_node, current_lsn);
 
@@ -1306,6 +1351,22 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 
 		if (pre_state == PCM_LOCK_MODE_X) {
 			x_holder = cluster_pcm_master_holder_node_by_tag(req->tag);
+			/*
+			 * PGRAC: spec-4.7a D3 — the requester already IS the x_holder
+			 * (it released its content_lock locally but the master still
+			 * records it).  Idempotent re-grant: do NOT self-forward (would
+			 * loop back to the sender) and do NOT change master state.  Clear
+			 * the pending_x we set above so a later N→S is not falsely
+			 * barriered (HG3).  Covers an N→X/S→X re-request from the node
+			 * that already holds X. */
+			if (x_holder == req->sender_node) {
+				cluster_pcm_lock_clear_pending_x(req->tag);
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_storage_fallback_count, 1);
+				status = GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK;
+				page_lsn = InvalidXLogRecPtr;
+				block_payload = NULL;
+				goto build_and_send_reply;
+			}
 			if (x_holder >= 0 && x_holder != cluster_node_id) {
 				GcsBlockForwardPayload fwd;
 				GcsBlockReplyHeader fwd_hdr;
@@ -1364,14 +1425,19 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 			goto build_and_send_reply;
 		} else if (pre_state == PCM_LOCK_MODE_S) {
 			uint32 holders_bm = cluster_pcm_lock_query_s_holders_bitmap(req->tag);
+			bool requester_is_s_holder = (req->sender_node >= 0 && req->sender_node < 32
+										  && (holders_bm & ((uint32)1u << req->sender_node)) != 0);
 
-			/* Q5=A merged path:  S→X upgrade excludes self from invalidate
-			 * targets (sender is already an S holder and will transition
-			 * its own bit via apply_gcs_transition after grant). */
-			if (req->transition_id == PCM_TRANS_S_TO_X_UPGRADE && req->sender_node >= 0
-				&& req->sender_node < 32) {
+			/* Q5=A merged path + spec-4.7a D3:  exclude the requester's own S
+			 * bit from the invalidate set.  It is upgrading its OWN access to X
+			 * and must not invalidate itself (self-invalidate self-loops to
+			 * DENIED_INVALIDATE_TIMEOUT — the D0 bug).  Applies whether the
+			 * request is labeled S→X_UPGRADE or N→X:  the bufmgr acquire path
+			 * emits N→X even when the node already holds S (state-agnostic), so
+			 * the master keys off its own authoritative s_holders record, not
+			 * the requester's transition label. */
+			if (requester_is_s_holder)
 				holders_bm &= ~((uint32)1u << req->sender_node);
-			}
 
 			if (holders_bm != 0) {
 				if (!gcs_block_broadcast_invalidate_and_wait(req, holders_bm)) {
@@ -1385,6 +1451,28 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 					return;
 				}
 				/* All acks collected; fall through to direct grant. */
+			}
+
+			/*
+			 * PGRAC: spec-4.7a D3 — explicit X grant to the upgrading S holder.
+			 * After the OTHER S holders are invalidated the requester is the
+			 * sole remaining S holder, so S→X_UPGRADE is now legal:  apply it
+			 * (master_state→X, x_holder=sender, clear s-bits — single x_holder,
+			 * HG5) and reply STORAGE_FALLBACK so the requester writes its own
+			 * resident / shared-storage copy.  WITHOUT this, produce_reply
+			 * (state still S, master not resident) replies DENIED_MASTER_NOT_
+			 * HOLDER and the sender retransmit-loops to 53R90.  Cross-node X
+			 * contention (requester was NOT an S holder) falls to the flow below.
+			 */
+			if (requester_is_s_holder
+				&& cluster_pcm_lock_apply_gcs_transition(req->tag, PCM_TRANS_S_TO_X_UPGRADE,
+														 req->sender_node)) {
+				cluster_pcm_lock_clear_pending_x(req->tag);
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_storage_fallback_count, 1);
+				status = GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK;
+				page_lsn = InvalidXLogRecPtr;
+				block_payload = NULL;
+				goto build_and_send_reply;
 			}
 		}
 		/* pre_state == N OR fell through after successful S broadcast OR
@@ -1437,7 +1525,15 @@ x_path_skipped:
 		CLUSTER_INJECTION_POINT("cluster-gcs-block-forward-master-side");
 
 		if (req->transition_id == PCM_TRANS_N_TO_S && pre_state == PCM_LOCK_MODE_S
-			&& !local_resident && holder_node >= 0 && holder_node != cluster_node_id
+			&& !local_resident && holder_node >= 0
+			&& holder_node != cluster_node_id
+			/* PGRAC: spec-4.7a D3 — never forward to the requester itself.  When
+			 * the recorded S-holder IS the sender (it released its content_lock
+			 * but the master still records it), forwarding would self-loop.  Fall
+			 * through to produce_reply, whose D3 self-holder branch idempotently
+			 * re-grants.  Without this guard the N→S re-request self-forwards and
+			 * the sender retransmit-loops to 53R90 (the D0 bug). */
+			&& holder_node != req->sender_node
 			&& !cluster_injection_should_skip("cluster-gcs-block-forward-master-side")) {
 			GcsBlockForwardPayload fwd;
 			uint64 current_epoch;
@@ -1962,6 +2058,19 @@ cluster_gcs_handle_block_invalidate_envelope(const ClusterICEnvelope *env, const
 		goto send_ack;
 	}
 
+	/*
+	 * PGRAC: spec-4.7a invariant note (D2/D4).  With hold-until-revoked X
+	 * (D2), pre_state can now be X here, which would drive an X->N downgrade
+	 * whose remote release path (cluster_pcm_lock_release_buffer_for_eviction
+	 * -> send_transition_and_wait) blocks on the very master that is
+	 * invalidating us.  In 4.7a scope that case is UNREACHABLE: D4 bounded-
+	 * fail-closes the only trigger that could make a peer acquire X while this
+	 * node holds X (cross-node writer transfer), so a live X holder never
+	 * receives an INVALIDATE; the S->X grant path uses S_TO_N_INVALIDATE on S
+	 * holders only.  When the deferred writer-transfer (spec-2.36 / 4.7 /
+	 * Stage 6) lands, this X branch goes live and must be hardened against the
+	 * release-to-the-invalidating-master round-trip (codereview P2-1).
+	 */
 	if (cluster_bufmgr_invalidate_block_for_gcs(inv->tag, pre_state, &page_lsn)) {
 		PcmLockTransition trans = (pre_state == PCM_LOCK_MODE_X) ? PCM_TRANS_X_TO_N_DOWNGRADE
 																 : PCM_TRANS_S_TO_N_INVALIDATE;

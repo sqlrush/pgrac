@@ -660,6 +660,10 @@ extern int cluster_gcs_reply_timeout_ms;
  */
 extern int cluster_gcs_block_retransmit_max_retries;
 extern int cluster_gcs_block_retransmit_initial_backoff_ms;
+
+/* PGRAC: spec-4.7a D2/Q8 — hold-until-revoked node-level PCM cache kill-switch
+ * (default on).  See cluster_guc.c for semantics. */
+extern bool cluster_gcs_block_local_cache;
 extern int cluster_gcs_block_dedup_max_entries;
 
 /*

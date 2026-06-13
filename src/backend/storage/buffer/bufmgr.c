@@ -54,6 +54,7 @@
 #include "storage/buf_internals.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_pcm_lock.h"
+#include "cluster/cluster_guc.h"		/* spec-4.7a D2 — cluster_gcs_block_local_cache */
 #endif
 #include "storage/bufmgr.h"
 #include "storage/ipc.h"
@@ -4901,15 +4902,34 @@ LockBuffer(Buffer buffer, int mode)
 	{
 		pcm_mode = (mode == BUFFER_LOCK_SHARE) ? PCM_LOCK_MODE_S : PCM_LOCK_MODE_X;
 		/*
-		 * PGRAC: spec-2.33 D7 — buffer-aware acquire so that the GCS
-		 * data-plane sender can install received block bytes directly into
-		 * this BufferDesc on GRANTED (HC84 PageSetLSN + memcpy under
-		 * content_lock EXCLUSIVE).  The legacy tag-only entry point
-		 * (cluster_pcm_lock_acquire) is retained for unit tests and
-		 * non-bufmgr callers but fails closed on remote-master S/X.
+		 * PGRAC: spec-4.7a D2 — hold-until-revoked acquire gate.
+		 *
+		 *	If this node already holds a PCM mode that covers the requested
+		 *	mode (X ⊇ {S,X}, S ⊇ S), skip the remote master round-trip
+		 *	entirely.  buf->pcm_state is the node-level cache: it is finalized
+		 *	after a successful acquire (below) and cleared by the INVALIDATE
+		 *	handler + eviction/drop paths, so a covering value means the node
+		 *	still genuinely holds the lock (Rule 8.A — no stale grant).  This
+		 *	is what stops a bulk single-node workload from issuing one PCM
+		 *	round-trip per LockBuffer (the spec-4.7a D0 request storm that
+		 *	floods the dedup HTAB → DENIED_DEDUP_FULL → 53R90).
+		 *
+		 *	spec-2.33 D7 — when an acquire IS needed, the buffer-aware entry
+		 *	point lets the GCS data-plane sender install received block bytes
+		 *	directly into this BufferDesc on GRANTED (HC84 PageSetLSN + memcpy
+		 *	under content_lock EXCLUSIVE).
 		 */
-		cluster_pcm_lock_acquire_buffer(buf, pcm_mode);
-		pcm_acquired = true;
+		if (cluster_gcs_block_local_cache &&
+			cluster_pcm_mode_covers((PcmLockMode) buf->pcm_state, pcm_mode))
+		{
+			/* Already covered locally — no master round-trip, nothing to
+			 * finalize or roll back (pcm_acquired stays false). */
+		}
+		else
+		{
+			cluster_pcm_lock_acquire_buffer(buf, pcm_mode);
+			pcm_acquired = true;
+		}
 	}
 #endif
 
@@ -4963,11 +4983,21 @@ LockBuffer(Buffer buffer, int mode)
 		 * InvalidateVictimBuffer / Drop*Buffers hook points (below). */
 		PcmLockMode old_mode = (PcmLockMode) buf->pcm_state;
 
-		cluster_pcm_lock_unlock_content_buffer(buf, old_mode);
-		/* Mirror PCM state — query for current (S residency preserved,
-		 * X cleared to N).  HC111 keeps the SCUR bit so the query
-		 * returns S; XCUR was just released so query returns N. */
-		buf->pcm_state = (uint8) cluster_pcm_lock_query(buf->tag);
+		/*
+		 * PGRAC: spec-4.7a D2 — hold-until-revoked.  With the node-level cache
+		 * on, the PCM lock (S residency per HC111, AND X per spec-4.7a) is kept
+		 * across content-lock unlock; buf->pcm_state is preserved so the next
+		 * acquire is served locally with no master round-trip.  The lock and
+		 * buf->pcm_state are cleared together by the INVALIDATE handler and the
+		 * eviction/drop hooks (Rule 8.A — no stale grant).  With the cache off,
+		 * fall back to the spec-2.33/2.35 behavior: release X here and mirror
+		 * the queried state (X → N, S residency preserved).
+		 */
+		if (!cluster_gcs_block_local_cache)
+		{
+			cluster_pcm_lock_unlock_content_buffer(buf, old_mode);
+			buf->pcm_state = (uint8) cluster_pcm_lock_query(buf->tag);
+		}
 	}
 #endif
 }

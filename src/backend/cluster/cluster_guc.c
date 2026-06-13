@@ -430,6 +430,14 @@ int cluster_gcs_reply_timeout_ms = 5000;
  */
 int cluster_gcs_block_retransmit_max_retries = 4;
 int cluster_gcs_block_retransmit_initial_backoff_ms = 100;
+
+/* PGRAC: spec-4.7a D2/Q8 — hold-until-revoked node-level PCM cache kill-switch.
+ * ON (default): the bufmgr acquire gate skips the remote master round-trip when
+ * the node already holds a covering PCM mode (X ⊇ {S,X}, S ⊇ S), and X is held
+ * across content-lock unlock (released only on INVALIDATE / eviction).  OFF:
+ * reverts to per-LockBuffer remote requests + X released on every unlock (the
+ * spec-2.33 behavior) — an escape hatch if a stale-grant edge is ever found. */
+bool cluster_gcs_block_local_cache = true;
 int cluster_gcs_block_dedup_max_entries = 1024;
 
 /*
@@ -2026,6 +2034,18 @@ cluster_init_guc(void)
 					 "N=0 disables retransmit.  Budget exhausted raises "
 					 "SQLSTATE 53R90.  HC97.  PGC_SUSET."),
 		&cluster_gcs_block_retransmit_max_retries, 4, 0, 8, PGC_SUSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"cluster.gcs_block_local_cache",
+		gettext_noop("Hold PCM block locks until revoked (node-level cache)."),
+		gettext_noop("When on (default), the bufmgr acquire gate skips the "
+					 "remote GCS master round-trip when this node already holds "
+					 "a covering PCM mode (X covers S/X, S covers S), and X is "
+					 "held across content-lock unlock (released only on "
+					 "INVALIDATE or eviction).  This eliminates the per-LockBuffer "
+					 "round-trip storm.  Off reverts to the spec-2.33 per-acquire "
+					 "request behavior (escape hatch).  spec-4.7a D2.  PGC_SUSET."),
+		&cluster_gcs_block_local_cache, true, PGC_SUSET, 0, NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
 		"cluster.gcs_block_retransmit_initial_backoff_ms",

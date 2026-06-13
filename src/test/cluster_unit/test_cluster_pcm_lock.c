@@ -45,6 +45,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_buffer_desc.h" /* PcmState (1.6) */
+#include "cluster/cluster_cssd.h"		 /* spec-4.7a D4 — ClusterCssdPeerState for stub */
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_shmem.h"
@@ -168,6 +169,17 @@ reset_fake_pcm_runtime(int max_entries)
 	NBuffers = max_entries;
 	cluster_pcm_grd_max_entries = max_entries;
 	cluster_pcm_grd_init();
+}
+
+/* spec-4.7a D4 — stub CSSD peer liveness for the other-live-holder gate.
+ * Default: every peer ALIVE.  A test sets fake_cssd_dead_node to mark one
+ * peer DEAD (to verify a dead holder is NOT counted by the D4 gate). */
+static int32 fake_cssd_dead_node = -1;
+
+ClusterCssdPeerState
+cluster_cssd_get_peer_state(int32 peer_id)
+{
+	return (peer_id == fake_cssd_dead_node) ? CLUSTER_CSSD_PEER_DEAD : CLUSTER_CSSD_PEER_ALIVE;
 }
 
 void *
@@ -931,6 +943,85 @@ UT_TEST(test_pcm_H4_release_broadcasts_only_on_state_change)
 }
 
 
+/* ============================================================
+ * spec-4.7a D2/D3/D4 — block coherence gate decision logic (direct unit
+ * coverage of the master-side X-contention gate, since the non-injection
+ * e2e is blocked by the deferred concurrent-relation data plane — see
+ * t/252 + spec-4.7a §4.1).
+ * ============================================================ */
+
+UT_TEST(test_pcm_d2_mode_covers_truth_table)
+{
+	/* X covers {S,X}; S covers {S}; N covers nothing (hold-until-revoked gate). */
+	UT_ASSERT(cluster_pcm_mode_covers(PCM_LOCK_MODE_X, PCM_LOCK_MODE_S));
+	UT_ASSERT(cluster_pcm_mode_covers(PCM_LOCK_MODE_X, PCM_LOCK_MODE_X));
+	UT_ASSERT(cluster_pcm_mode_covers(PCM_LOCK_MODE_S, PCM_LOCK_MODE_S));
+	UT_ASSERT(!cluster_pcm_mode_covers(PCM_LOCK_MODE_S, PCM_LOCK_MODE_X));
+	UT_ASSERT(!cluster_pcm_mode_covers(PCM_LOCK_MODE_N, PCM_LOCK_MODE_S));
+	UT_ASSERT(!cluster_pcm_mode_covers(PCM_LOCK_MODE_N, PCM_LOCK_MODE_X));
+}
+
+UT_TEST(test_pcm_d3_requester_is_holder_strict)
+{
+	BufferTag tag = make_tag(40);
+
+	reset_fake_pcm_runtime(4);
+	fake_cssd_dead_node = -1;
+
+	cluster_node_id = 2;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_X); /* node 2 holds X */
+
+	/* x_holder==sender covers N→S and N→X (idempotent re-grant, D3). */
+	UT_ASSERT(cluster_pcm_master_requester_is_holder(tag, 2, PCM_TRANS_N_TO_S));
+	UT_ASSERT(cluster_pcm_master_requester_is_holder(tag, 2, PCM_TRANS_N_TO_X));
+	/* S→X never self-regrants (real writer path → invalidate-then-grant). */
+	UT_ASSERT(!cluster_pcm_master_requester_is_holder(tag, 2, PCM_TRANS_S_TO_X_UPGRADE));
+	/* A non-holder is never a holder (fail-closed). */
+	UT_ASSERT(!cluster_pcm_master_requester_is_holder(tag, 1, PCM_TRANS_N_TO_S));
+	/* Missing entry → false (Rule 8.A fail-closed). */
+	UT_ASSERT(!cluster_pcm_master_requester_is_holder(make_tag(41), 2, PCM_TRANS_N_TO_S));
+}
+
+UT_TEST(test_pcm_d4_other_live_holder_gate)
+{
+	BufferTag xtag = make_tag(42);
+	BufferTag stag = make_tag(43);
+	BufferTag selftag = make_tag(44);
+
+	reset_fake_pcm_runtime(4);
+	fake_cssd_dead_node = -1;
+
+	/* node 2 holds X. */
+	cluster_node_id = 2;
+	cluster_pcm_lock_acquire(xtag, PCM_LOCK_MODE_X);
+
+	/* Another live node (2) holds X → a different sender is BLOCKED (D4). */
+	UT_ASSERT(cluster_pcm_master_other_live_holder_exists(xtag, 1));
+	/* The holder itself is not an "other" holder → not blocked (self path). */
+	UT_ASSERT(!cluster_pcm_master_other_live_holder_exists(xtag, 2));
+	/* Missing entry → no holder → not blocked. */
+	UT_ASSERT(!cluster_pcm_master_other_live_holder_exists(make_tag(99), 1));
+
+	/* A DEAD holder is NOT counted — that is the warm-recovery path, not D4. */
+	fake_cssd_dead_node = 2;
+	UT_ASSERT(!cluster_pcm_master_other_live_holder_exists(xtag, 1));
+	fake_cssd_dead_node = -1;
+
+	/* node 1 and node 3 both hold S on stag. */
+	cluster_node_id = 1;
+	cluster_pcm_lock_acquire(stag, PCM_LOCK_MODE_S);
+	cluster_node_id = 3;
+	cluster_pcm_lock_acquire(stag, PCM_LOCK_MODE_S);
+	UT_ASSERT(cluster_pcm_master_other_live_holder_exists(stag, 1)); /* sees node 3 */
+	UT_ASSERT(cluster_pcm_master_other_live_holder_exists(stag, 3)); /* sees node 1 */
+	UT_ASSERT(cluster_pcm_master_other_live_holder_exists(stag, 0)); /* non-holder sees both */
+
+	/* Sole S holder → no OTHER holder → not blocked (self can upgrade). */
+	cluster_node_id = 1;
+	cluster_pcm_lock_acquire(selftag, PCM_LOCK_MODE_S);
+	UT_ASSERT(!cluster_pcm_master_other_live_holder_exists(selftag, 1));
+}
+
 int
 main(void)
 {
@@ -966,6 +1057,9 @@ main(void)
 	UT_RUN(test_pcm_H2b_same_node_s_residency_upgrades_to_x);
 	UT_RUN(test_pcm_H3_incompatible_x_waits_and_wakes);
 	UT_RUN(test_pcm_H4_release_broadcasts_only_on_state_change);
+	UT_RUN(test_pcm_d2_mode_covers_truth_table);
+	UT_RUN(test_pcm_d3_requester_is_holder_strict);
+	UT_RUN(test_pcm_d4_other_live_holder_gate);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -41,6 +41,7 @@
 #include "cluster/cluster_gcs.h" /* PGRAC: spec-2.32 D5 — master lookup + send_transition_and_wait */
 #include "cluster/cluster_gcs_block.h" /* PGRAC: spec-2.33 D7 — send_block_request_and_wait */
 #include "cluster/cluster_inject.h"
+#include "cluster/cluster_cssd.h" /* PGRAC: spec-4.7a D4 — peer liveness for other-holder check */
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_shmem.h"
@@ -560,6 +561,111 @@ cluster_pcm_lock_query_s_holders_bitmap(BufferTag tag)
 	LWLockRelease(&ClusterPcm->htab_lock.lock);
 
 	return bitmap;
+}
+
+/*
+ * cluster_pcm_master_requester_is_holder — spec-4.7a D3.
+ *
+ *	Strict master-side coherence check:  does the GrdEntry for `tag`
+ *	authoritatively record `node` as a holder whose existing grant already
+ *	covers `trans`?  The GCS block master uses this to idempotently re-
+ *	acknowledge a holder's re-request (GRANTED_STORAGE_FALLBACK, master state
+ *	UNCHANGED) instead of replying DENIED_MASTER_NOT_HOLDER — which the sender
+ *	would retransmit-loop into 53R90.  That loop is the spec-4.7a D0 bug:  a
+ *	node releases its content_lock (buf->pcm_state → N) while the master still
+ *	records it as the x_holder, so its next LockBuffer re-request diverges.
+ *
+ *	Returns true ONLY when the GrdEntry records `node`:
+ *	  - x_holder_node == node                 → covers N→S and N→X (X ⊇ {S,X})
+ *	  - (trans == N→S) && node ∈ s_holders_bitmap → covers N→S
+ *	S→X_UPGRADE returns false: it is a real writer transition that MUST run
+ *	the spec-2.36 invalidate-then-grant path (no self-regrant short-circuit,
+ *	no double X — spec-4.7a v0.2 amend 2 / HG5).
+ *	Missing entry / out-of-range node / any uncertainty → false → caller
+ *	fails closed (Rule 8.A).
+ */
+bool
+cluster_pcm_master_requester_is_holder(BufferTag tag, int32 node, PcmLockTransition trans)
+{
+	struct GrdEntry *entry;
+	bool found;
+	bool is_holder = false;
+
+	if (node < 0 || node >= 32)
+		return false;
+	if (cluster_pcm_htab == NULL)
+		return false;
+	/* Only fresh-acquire transitions can be idempotent re-grants; upgrades
+	 * (S→X) and releases must take their real paths. */
+	if (trans != PCM_TRANS_N_TO_S && trans != PCM_TRANS_N_TO_X)
+		return false;
+
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &tag, HASH_FIND, &found);
+	if (found && entry != NULL) {
+		if (entry->x_holder_node == node)
+			is_holder = true; /* X holder covers N→S and N→X */
+		else if (trans == PCM_TRANS_N_TO_S
+				 && (pg_atomic_read_u32(&entry->s_holders_bitmap) & (1u << (uint32)node)) != 0)
+			is_holder = true; /* S holder covers N→S */
+	}
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+
+	return is_holder;
+}
+
+/*
+ * cluster_pcm_master_other_live_holder_exists — spec-4.7a D4.
+ *
+ *	Does a node OTHER than `sender` currently hold `tag` in X or S, and is
+ *	that node still LIVE (CSSD peer state != DEAD)?  The GCS block master
+ *	calls this on an X request (N→X / S→X) to bounded-fail-closed BEFORE any
+ *	state mutation when granting X would require invalidating / transferring
+ *	the block from a live peer — the deferred writer-transfer path (spec-2.36
+ *	completion / 4.7 / Stage 6, NOT implemented in 4.7a).  A DEAD holder is
+ *	deliberately NOT counted: that is the dead-master / warm-recovery path
+ *	(53R9K / spec-4.7).  Strict GrdEntry read; missing entry or no other live
+ *	holder → false (Rule 8.A — the caller then proceeds to the normal grant
+ *	path; it must never grant when this returns true).
+ */
+bool
+cluster_pcm_master_other_live_holder_exists(BufferTag tag, int32 sender)
+{
+	struct GrdEntry *entry;
+	bool found;
+	int32 x_holder = -1;
+	uint32 s_bitmap = 0;
+	int n;
+
+	if (cluster_pcm_htab == NULL)
+		return false;
+
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &tag, HASH_FIND, &found);
+	if (found && entry != NULL) {
+		x_holder = entry->x_holder_node;
+		s_bitmap = pg_atomic_read_u32(&entry->s_holders_bitmap);
+	}
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+
+	if (!found)
+		return false;
+
+	/* Another node holds X. */
+	if (x_holder >= 0 && x_holder != sender
+		&& cluster_cssd_get_peer_state(x_holder) != CLUSTER_CSSD_PEER_DEAD)
+		return true;
+
+	/* Another node holds S (exclude the requester's own S bit). */
+	if (sender >= 0 && sender < 32)
+		s_bitmap &= ~((uint32)1u << sender);
+	for (n = 0; n < 32; n++) {
+		if ((s_bitmap & ((uint32)1u << n)) != 0
+			&& cluster_cssd_get_peer_state(n) != CLUSTER_CSSD_PEER_DEAD)
+			return true;
+	}
+
+	return false;
 }
 
 uint64
