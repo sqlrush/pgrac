@@ -367,8 +367,8 @@ ok($node->safe_psql('postgres',
 
 is($node->safe_psql('postgres',
 		q{SELECT string_agg(DISTINCT category, ',' ORDER BY category) FROM pg_cluster_state}),
-	'block_format,buffer_format,cluster_cssd,cluster_stats,conf,cr,diag,gcs,ges,grd,grd_recovery,guc,ic,inject,lck,lmd,lmon,lms,pcm,pgstat,phase,recovery,scn,shared_fs,shmem,sinval,tt_2pc,tt_status,tt_status_hint,undo,undo_cleaner,visibility,wal_thread',
-	'O2 pg_cluster_state has all 33 categories (grd_recovery added in spec-4.6)');
+	'block_format,buffer_format,cluster_cssd,cluster_stats,conf,cr,diag,gcs,gcs_recovery,ges,grd,grd_recovery,guc,ic,inject,lck,lmd,lmon,lms,pcm,pgstat,phase,recovery,scn,shared_fs,shmem,sinval,tt_2pc,tt_status,tt_status_hint,undo,undo_cleaner,visibility,wal_thread',
+	'O2 pg_cluster_state has all 34 categories (gcs_recovery added in spec-4.7 D6)');
 
 is($node->safe_psql('postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE value IS NULL}),
