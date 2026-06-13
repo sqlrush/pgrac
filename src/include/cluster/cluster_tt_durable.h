@@ -253,6 +253,29 @@ extern bool cluster_tt_recovery_wrap_suspect(uint32 expected_wrap, SCN matched_s
 											 bool retention_reliable);
 
 /*
+ * spec-4.8 D7 -- index-aware physical rollback verdict (mini-plan v2).  Only a
+ * DELETE inverse (clear the aborted deleter's xmax) is index-safe; INSERT/UPDATE
+ * need a synchronous per-entry index point-delete that PG lacks -> fail-closed.
+ */
+typedef enum ClusterTtRecoveryRevertVerdict {
+	CLUSTER_TT_REVERT_APPLY,	 /* DELETE inverse: clear xmax (index-safe) */
+	CLUSTER_TT_REVERT_SKIP_DONE, /* idempotent: xmax already clear */
+	CLUSTER_TT_REVERT_FAILCLOSED /* not index-safely revertable -> MVCC fallback */
+} ClusterTtRecoveryRevertVerdict;
+
+/*
+ * cluster_tt_recovery_classify_revert -- spec-4.8 D7 pure gate: may an ABORTED
+ *	xact's undo record be physically reverted on the real heap WITHOUT an index
+ *	op?  APPLY iff a DELETE record + aborted deleter + the tuple still carries
+ *	this deleter's xmax (identity); SKIP_DONE if the xmax is already clear
+ *	(idempotent); FAILCLOSED otherwise (INSERT/UPDATE index-unsafe, or identity
+ *	mismatch).  Pure; no I/O.
+ */
+extern ClusterTtRecoveryRevertVerdict
+cluster_tt_recovery_classify_revert(bool is_delete_record, bool record_xid_aborted,
+									bool tuple_xmax_matches, bool tuple_xmax_already_clear);
+
+/*
  * cluster_tt_recovery_xact_liveness -- backend wrapper that consults PG's CLOG
  *	(TransactionIdDidCommit) and proc array (TransactionIdIsInProgress) for xid,
  *	then classifies via cluster_tt_recovery_classify_liveness.  Implemented in

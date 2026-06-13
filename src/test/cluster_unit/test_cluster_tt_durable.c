@@ -799,11 +799,53 @@ UT_TEST(test_wrap_suspect_unjudgeable_unreliable_failclosed)
 											   false));
 }
 
+/* ============================================================
+ *	spec-4.8 D7 (mini-plan v2): index-aware physical rollback safety matrix
+ * ============================================================ */
+UT_TEST(test_revert_non_delete_failclosed)
+{
+	/* INSERT/UPDATE (not a DELETE record) -> fail-closed (index-unsafe),
+	 * regardless of the other inputs. */
+	UT_ASSERT_EQ((int)cluster_tt_recovery_classify_revert(false, true, true, false),
+				 (int)CLUSTER_TT_REVERT_FAILCLOSED);
+	UT_ASSERT_EQ((int)cluster_tt_recovery_classify_revert(false, false, false, true),
+				 (int)CLUSTER_TT_REVERT_FAILCLOSED);
+}
+UT_TEST(test_revert_delete_not_aborted_failclosed)
+{
+	/* DELETE record but the deleter is not aborted -> never revert. */
+	UT_ASSERT_EQ((int)cluster_tt_recovery_classify_revert(true, false, true, false),
+				 (int)CLUSTER_TT_REVERT_FAILCLOSED);
+}
+UT_TEST(test_revert_delete_already_clear_skip_done)
+{
+	/* DELETE + aborted + xmax already clear -> idempotent SKIP (done). */
+	UT_ASSERT_EQ((int)cluster_tt_recovery_classify_revert(true, true, false, true),
+				 (int)CLUSTER_TT_REVERT_SKIP_DONE);
+	/* SKIP_DONE wins even if identity would otherwise match. */
+	UT_ASSERT_EQ((int)cluster_tt_recovery_classify_revert(true, true, true, true),
+				 (int)CLUSTER_TT_REVERT_SKIP_DONE);
+}
+UT_TEST(test_revert_delete_identity_match_apply)
+{
+	/* DELETE + aborted + not-clear + tuple still carries this deleter's xmax
+	 * -> APPLY (clear xmax). */
+	UT_ASSERT_EQ((int)cluster_tt_recovery_classify_revert(true, true, true, false),
+				 (int)CLUSTER_TT_REVERT_APPLY);
+}
+UT_TEST(test_revert_delete_identity_mismatch_failclosed)
+{
+	/* DELETE + aborted + not-clear but the tuple no longer carries this
+	 * deleter's xmax (slot/tuple reused) -> fail-closed (identity gate). */
+	UT_ASSERT_EQ((int)cluster_tt_recovery_classify_revert(true, true, false, false),
+				 (int)CLUSTER_TT_REVERT_FAILCLOSED);
+}
+
 
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(51);
+	UT_PLAN(56);
 
 	UT_RUN(test_layout_sizes);
 
@@ -867,6 +909,12 @@ main(int argc, char **argv)
 	UT_RUN(test_wrap_suspect_below_horizon_unreliable_is_suspect);
 	UT_RUN(test_wrap_suspect_at_or_above_horizon_not_suspect);
 	UT_RUN(test_wrap_suspect_unjudgeable_unreliable_failclosed);
+
+	UT_RUN(test_revert_non_delete_failclosed);
+	UT_RUN(test_revert_delete_not_aborted_failclosed);
+	UT_RUN(test_revert_delete_already_clear_skip_done);
+	UT_RUN(test_revert_delete_identity_match_apply);
+	UT_RUN(test_revert_delete_identity_mismatch_failclosed);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

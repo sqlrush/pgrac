@@ -423,6 +423,42 @@ cluster_tt_recovery_wrap_suspect(uint32 expected_wrap, SCN matched_scn, SCN hori
 	return scn_time_cmp(matched_scn, horizon) < 0;
 }
 
+
+/*
+ * cluster_tt_recovery_classify_revert -- spec-4.8 D7 pure gate (index-aware
+ *	physical rollback safety matrix; user-approved mini-plan v2).
+ *
+ *	Decides whether an ABORTED xact's undo record may be PHYSICALLY reverted on
+ *	the real heap during recovery WITHOUT an index operation.  Only a DELETE
+ *	inverse is index-safe: PG never removes index entries on DELETE (they stay
+ *	until vacuum), so clearing the aborted deleter's xmax (restoring the tuple
+ *	to live) leaves every existing index entry valid -- no index op needed.
+ *	INSERT / UPDATE revert would have to REMOVE index entries, and PG's index AM
+ *	has no synchronous per-entry point-delete (only ambulkdelete via vacuum +
+ *	lazy kill_prior_tuple), so they cannot be index-safely closed -> fail closed
+ *	(the tuple stays; xmin / new-version aborted -> MVCC-invisible; vacuum
+ *	reclaims heap+index together -- the I10 fallback).  Never produces a dangling
+ *	index entry.  NOT a full Oracle SMON rollback (closure must say so).
+ *
+ *	Gates (规则 8.A): only a DELETE record; only a genuinely-aborted deleter;
+ *	the tuple must still carry exactly this deleter's xmax (identity).  Idempotent:
+ *	a tuple whose xmax is already clear is done -> SKIP.  Pure; no I/O; unit-tested.
+ */
+ClusterTtRecoveryRevertVerdict
+cluster_tt_recovery_classify_revert(bool is_delete_record, bool record_xid_aborted,
+									bool tuple_xmax_matches, bool tuple_xmax_already_clear)
+{
+	if (!is_delete_record)
+		return CLUSTER_TT_REVERT_FAILCLOSED; /* INSERT/UPDATE: index-unsafe */
+	if (!record_xid_aborted)
+		return CLUSTER_TT_REVERT_FAILCLOSED; /* only revert an aborted deleter */
+	if (tuple_xmax_already_clear)
+		return CLUSTER_TT_REVERT_SKIP_DONE; /* idempotent: already reverted */
+	if (!tuple_xmax_matches)
+		return CLUSTER_TT_REVERT_FAILCLOSED; /* identity gate: tuple no longer this deleter's */
+	return CLUSTER_TT_REVERT_APPLY;
+}
+
 /*
  * cluster_tt_slot_durable_resolve_by_xid_origin -- spec-4.5a G6 (P1 #2): the
  * origin-qualified durable by-xid scan.  A materialized foreign read cannot
