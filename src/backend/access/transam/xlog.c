@@ -5944,6 +5944,17 @@ StartupXLOG(void)
 	 * up).  Lamport-monotonic, so it can only advance cluster_scn.
 	 */
 	cluster_tt_recovery_observe_scn_highwater();
+
+	/*
+	 * PGRAC MODIFICATIONS (spec-4.8 D7): index-safe physical rollback of
+	 * aborted transactions' DELETE writes (durably-ABORTED TT slot chains).
+	 * Clears the aborted deleter's xmax (HEAP_XMAX_INVALID hint -- WAL-free,
+	 * idempotent, no index op so no dangling entry), restoring the tuple to
+	 * live.  INSERT/UPDATE and crash-left in-flight xacts are matrix
+	 * fail-closed (MVCC-invisible + vacuum reclaim).  Best-effort cleanout;
+	 * correctness never depends on it.
+	 */
+	cluster_tt_recovery_physical_rollback();
 #endif
 
 	/*

@@ -63,17 +63,27 @@
  */
 #include "postgres.h"
 
-#include "access/transam.h"	   /* TransactionIdDidCommit */
-#include "storage/procarray.h" /* TransactionIdIsInProgress */
+#include "access/htup_details.h"   /* HEAP_XMAX_INVALID, HeapTupleHeaderGetRawXmax (D7) */
+#include "access/transam.h"		   /* TransactionIdDidCommit */
+#include "storage/buf_internals.h" /* GetBufferDescriptor / content lock (D7) */
+#include "storage/bufmgr.h"		   /* ReadBufferWithoutRelcache (D7) */
+#include "storage/bufpage.h"	   /* PageGetItemId / PageGetItem (D7) */
+#include "storage/procarray.h"	   /* TransactionIdIsInProgress */
 #include "utils/elog.h"
 
 #include "cluster/cluster_guc.h" /* cluster_enabled / cluster_node_id / GUC */
 #include "cluster/cluster_scn.h" /* spec-4.8 D5: SCN high-watermark recovery */
 #include "cluster/cluster_tt_durable.h"
-#include "cluster/cluster_tt_slot.h"			/* TTSlot, TT_SLOT_ACTIVE, TT_SLOTS_PER_SEGMENT */
+#include "cluster/cluster_tt_slot.h"			/* TTSlot, TT_SLOT_*, TT_SLOTS_PER_SEGMENT */
+#include "cluster/cluster_uba.h"				/* UBA_is_invalid (D7 chain walk) */
+#include "cluster/cluster_undo_record.h"		/* UndoRecordHeader, UNDO_RECORD_DELETE (D7) */
+#include "cluster/cluster_undo_record_api.h"	/* cluster_undo_get_record (D7) */
 #include "cluster/cluster_undo_segment.h"		/* UndoSegmentHeaderData */
 #include "cluster/cluster_undo_smgr.h"			/* cluster_undo_smgr_read_block */
 #include "cluster/storage/cluster_undo_alloc.h" /* CLUSTER_UNDO_SEGS_PER_INSTANCE */
+
+/* spec-4.8 D7: hard cap on an undo chain walk (malformed-chain loop guard). */
+#define CLUSTER_TT_RECOVERY_MAX_CHAIN_STEPS 1000000
 
 /*
  * cluster_tt_recovery_xact_liveness -- spec-4.8 D1.
@@ -255,4 +265,210 @@ cluster_tt_recovery_observe_scn_highwater(void)
 			" into cluster_scn",
 			(uint64)max_commit_scn)));
 	return 1;
+}
+
+/*
+ * revert_one_delete_record -- spec-4.8 D7 part 2: physically revert one DELETE
+ *	undo record of an aborted xact, index-safely.
+ *
+ *	INSERT/UPDATE records fail closed immediately (index-unsafe: PG has no
+ *	synchronous per-entry index point-delete; the matrix leaves them to MVCC
+ *	invisible + vacuum -- I10).  For a DELETE record, read the target heap page
+ *	(ReadBufferWithoutRelcache, recovery has no relcache), and if the tuple
+ *	still carries exactly this aborted deleter's single-xact xmax, set the
+ *	HEAP_XMAX_INVALID hint -- the standard PG aborted-xmax cleanout (a hint bit,
+ *	WAL-free + idempotent by design), restoring the tuple to live.  DELETE never
+ *	removed the index entry, so the restored tuple keeps every index entry valid
+ *	(no index op, no dangling entry).  All decisions go through the unit-tested
+ *	classifier (cluster_tt_recovery_classify_revert).  Returns 1 if a tuple was
+ *	reverted, else 0.
+ */
+static int
+revert_one_delete_record(const UndoRecordHeader *hdr, TransactionId aborted_xid)
+{
+	Buffer buf;
+	BufferDesc *desc;
+	Page page;
+	ItemId iid;
+	HeapTupleHeader htup;
+	TransactionId raw_xmax;
+	bool xmax_matches;
+	bool xmax_already_clear;
+	ClusterTtRecoveryRevertVerdict verdict;
+	int reverted = 0;
+
+	/* Index-unsafe records never touch the heap (matrix v2: fail-closed). */
+	if (hdr->record_type != (uint8)UNDO_RECORD_DELETE) {
+		cluster_tt_recovery_count_undo_revert_failclosed();
+		return 0;
+	}
+	/* Malformed locator -> never read/mutate a garbage page (fail-closed). */
+	if (!RelFileNumberIsValid(hdr->target_locator.relNumber)) {
+		cluster_tt_recovery_count_undo_revert_failclosed();
+		return 0;
+	}
+
+	buf = ReadBufferWithoutRelcache(hdr->target_locator, hdr->target_fork, hdr->target_block,
+									RBM_NORMAL, NULL, true /* permanent */);
+	if (!BufferIsValid(buf)) {
+		cluster_tt_recovery_count_undo_revert_failclosed();
+		return 0;
+	}
+	desc = GetBufferDescriptor(buf - 1);
+	LWLockAcquire(BufferDescriptorGetContentLock(desc), LW_EXCLUSIVE);
+	page = BufferGetPage(buf);
+
+	/* Bounds: the target offset must be a normal line pointer on this page. */
+	if (hdr->target_offset < FirstOffsetNumber
+		|| hdr->target_offset > PageGetMaxOffsetNumber(page)) {
+		LWLockRelease(BufferDescriptorGetContentLock(desc));
+		ReleaseBuffer(buf);
+		cluster_tt_recovery_count_undo_revert_failclosed();
+		return 0;
+	}
+	iid = PageGetItemId(page, hdr->target_offset);
+	if (!ItemIdIsNormal(iid)) {
+		LWLockRelease(BufferDescriptorGetContentLock(desc));
+		ReleaseBuffer(buf);
+		cluster_tt_recovery_count_undo_revert_failclosed();
+		return 0;
+	}
+	htup = (HeapTupleHeader)PageGetItem(page, iid);
+
+	/* Identity (I7): the tuple must still carry exactly this aborted deleter's
+	 * single-xact xmax.  A multixact xmax is not this deleter alone -> no match. */
+	raw_xmax = HeapTupleHeaderGetRawXmax(htup);
+	xmax_matches
+		= !(htup->t_infomask & HEAP_XMAX_IS_MULTI) && TransactionIdEquals(raw_xmax, aborted_xid);
+	xmax_already_clear = (htup->t_infomask & HEAP_XMAX_INVALID) != 0;
+
+	verdict = cluster_tt_recovery_classify_revert(true /* delete */, true /* slot aborted */,
+												  xmax_matches, xmax_already_clear);
+	switch (verdict) {
+	case CLUSTER_TT_REVERT_APPLY:
+		/* WAL-free idempotent hint: aborted xmax -> tuple live (= PG's own
+			 * aborted-xmax cleanout).  No index op; the index entry stays valid. */
+		htup->t_infomask |= HEAP_XMAX_INVALID;
+		MarkBufferDirty(buf);
+		cluster_tt_recovery_count_heap_tuples_physically_reverted();
+		reverted = 1;
+		break;
+	case CLUSTER_TT_REVERT_SKIP_DONE:
+		break; /* idempotent: already reverted */
+	case CLUSTER_TT_REVERT_FAILCLOSED:
+	default:
+		cluster_tt_recovery_count_undo_revert_failclosed();
+		break;
+	}
+
+	LWLockRelease(BufferDescriptorGetContentLock(desc));
+	ReleaseBuffer(buf);
+	return reverted;
+}
+
+/*
+ * revert_aborted_undo_chain -- spec-4.8 D7 part 2: walk one aborted xact's undo
+ *	chain (prev_uba from the durable TT slot's first_undo_block head) and
+ *	physically revert each of its DELETE records.  Only records owned by
+ *	aborted_xid are acted on (the chain is per-transaction).  A short/unreadable
+ *	record stops the walk (fail-safe); a hard step cap guards a malformed chain.
+ *	Returns the number of tuples reverted.
+ */
+static int
+revert_aborted_undo_chain(UBA head, TransactionId aborted_xid)
+{
+	UBA uba = head;
+	int steps = 0;
+	int reverted = 0;
+
+	while (!UBA_is_invalid(uba) && steps < CLUSTER_TT_RECOVERY_MAX_CHAIN_STEPS) {
+		PGAlignedBlock recbuf;
+		size_t len;
+		const UndoRecordHeader *hdr;
+		UBA next;
+
+		steps++;
+		len = cluster_undo_get_record(uba, recbuf.data, sizeof(recbuf.data));
+		if (len < sizeof(UndoRecordHeader))
+			break; /* unreadable / short -> stop (fail-safe) */
+
+		hdr = (const UndoRecordHeader *)recbuf.data;
+		next = hdr->prev_uba; /* capture before any work */
+
+		if (TransactionIdEquals(hdr->xid, aborted_xid))
+			reverted += revert_one_delete_record(hdr, aborted_xid);
+
+		uba = next;
+	}
+	return reverted;
+}
+
+/*
+ * cluster_tt_recovery_physical_rollback -- spec-4.8 D7 part 2 (mini-plan v2).
+ *
+ *	Index-aware physical rollback of ABORTED transactions' DELETE writes, for
+ *	the enumerable subset: durably-ABORTED TT slots (a 2PC ROLLBACK PREPARED
+ *	wrote XLOG_UNDO_TT_SLOT_ABORT, so the on-disk slot is TT_SLOT_ABORTED with a
+ *	valid first_undo_block chain head).  Crash-left in-flight xacts have no
+ *	durable chain head (spec-4.8 D1: the in-flight binding is in-memory and lost
+ *	on crash), so they are not enumerable here and stay fail-closed -> MVCC
+ *	invisible + vacuum (I10) -- consistent with the matrix.
+ *
+ *	Reuses the existing cluster_undo_get_record + prev_uba chain walk (no new
+ *	undo-region scanner) and the unit-tested classifier; the only heap mutation
+ *	is the WAL-free idempotent HEAP_XMAX_INVALID hint on a DELETE-record tuple.
+ *	Called once from StartupXLOG after recovery completes, after D1 resolution +
+ *	D5 SCN high-watermark.  Returns the number of tuples reverted.
+ *
+ *	NOT a full Oracle SMON rollback: INSERT/UPDATE and crash-left in-flight are
+ *	matrix-reasoned fail-closed (see closure docs).
+ */
+int
+cluster_tt_recovery_physical_rollback(void)
+{
+	int node;
+	uint8 owner;
+	uint32 seg_lo;
+	uint32 seg_hi;
+	uint32 segment_id;
+	PGAlignedBlock blockbuf;
+	int reverted = 0;
+
+	if (!cluster_enabled || !cluster_tt_recovery_resolve_active)
+		return 0;
+	if (cluster_node_id < 0)
+		return 0;
+
+	node = cluster_node_id;
+	owner = (uint8)(node + 1);
+	seg_lo = (uint32)node * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	seg_hi = seg_lo + CLUSTER_UNDO_SEGS_PER_INSTANCE - 1;
+
+	for (segment_id = seg_lo; segment_id <= seg_hi; segment_id++) {
+		UndoSegmentHeaderData *hdr;
+		uint16 i;
+
+		if (!cluster_undo_smgr_read_block(segment_id, owner, 0, blockbuf.data))
+			continue; /* absent / unreadable -> skip */
+
+		hdr = (UndoSegmentHeaderData *)blockbuf.data;
+		for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+			const TTSlot *s = &hdr->tt_slots[i];
+
+			if (s->status != (uint8)TT_SLOT_ABORTED)
+				continue;
+			if (!TransactionIdIsValid(s->xid))
+				continue;
+			if (UBA_is_invalid(s->first_undo_block))
+				continue; /* no durable chain head -> not enumerable here */
+
+			reverted += revert_aborted_undo_chain(s->first_undo_block, s->xid);
+		}
+	}
+
+	if (reverted > 0)
+		ereport(LOG,
+				(errmsg("cluster undo/TT recovery: physically reverted %d aborted DELETE tuple(s)",
+						reverted)));
+	return reverted;
 }

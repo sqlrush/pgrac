@@ -303,6 +303,16 @@ extern int cluster_tt_recovery_resolve_active_slots(void);
  */
 extern int cluster_tt_recovery_observe_scn_highwater(void);
 
+/*
+ * cluster_tt_recovery_physical_rollback -- spec-4.8 D7 part 2 (mini-plan v2):
+ *	index-aware physical rollback of ABORTED xacts' DELETE writes (durably-
+ *	ABORTED TT slot chains only).  Clears the aborted deleter's xmax
+ *	(HEAP_XMAX_INVALID hint; WAL-free, idempotent, index-safe).  INSERT/UPDATE
+ *	+ crash-left in-flight (no durable head) are matrix fail-closed (I10).
+ *	Gated by classify_revert + identity.  Returns tuples reverted.  Backend-only.
+ */
+extern int cluster_tt_recovery_physical_rollback(void);
+
 
 /*
  * Observability (spec-3.11 D7/D8) -- implemented in cluster_tt_durable_stat.c
