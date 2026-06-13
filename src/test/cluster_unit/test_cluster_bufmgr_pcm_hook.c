@@ -70,6 +70,16 @@ int cluster_node_id = 0;
 int NBuffers = 0;
 int cluster_injection_armed_count = 0;
 bool cluster_enabled = true; /* PGRAC: spec-2.31 D2 helper depends on this */
+
+/* spec-4.7a D4 — cluster_pcm_lock.o now references cluster_cssd_get_peer_state
+ * (the other-live-holder gate).  This test links cluster_pcm_lock.o, so it
+ * must provide the symbol; return ALIVE (this test does not exercise the D4
+ * gate, only the bufmgr PCM hook).  Mirrors test_cluster_grd.c's stub. */
+int /* ClusterCssdPeerState */
+cluster_cssd_get_peer_state(int32 peer_id pg_attribute_unused())
+{
+	return 0; /* CLUSTER_CSSD_PEER_ALIVE */
+}
 static ClusterConf fake_cluster_conf = {
 	.magic = PGRAC_CLUSTER_CONF_MAGIC,
 	.node_count = 2,
