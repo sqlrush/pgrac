@@ -1360,6 +1360,50 @@ cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode)
 			/* cur == S or X → fall through to wait */
 		}
 
+		/*
+		 * PGRAC: spec-4.7a B (HG7 local-path completion) — bounded fail-closed
+		 * for cross-node write contention on the LOCAL master path.  With
+		 * hold-until-revoked (cluster_gcs_block_local_cache on), the
+		 * incompatible holder reached here is a remote LIVE node that will NOT
+		 * release on its own — the cross-node writer transfer / BAST that would
+		 * revoke it is deferred (spec-2.36 / 4.7 / Stage 6).  Waiting on wait_cv
+		 * would hang forever (this local master path emits no cross-node
+		 * invalidate).  Fail closed with a bounded terminal instead — mirrors
+		 * the D4 remote-dispatch gate so HG7's "no hang" covers BOTH the
+		 * remote-request and local-master acquire paths.  Cache off (serialized-
+		 * node merged-recovery / shared-data smoke tests) keeps the legitimate
+		 * short wait (the holder releases on content-lock unlock).  Read the
+		 * conflicting holder under the already-held entry_lock (no extra
+		 * htab_lock → no lock-order inversion).
+		 */
+		if (cluster_gcs_block_local_cache) {
+			int32 confl_x = entry->x_holder_node;
+			uint32 confl_s = pg_atomic_read_u32(&entry->s_holders_bitmap) & ~holder_bit;
+			bool remote_live = false;
+			int n;
+
+			if (confl_x >= 0 && confl_x != holder_node
+				&& cluster_cssd_get_peer_state(confl_x) != CLUSTER_CSSD_PEER_DEAD)
+				remote_live = true;
+			for (n = 0; !remote_live && n < 32; n++)
+				if ((confl_s & ((uint32)1u << n)) != 0
+					&& cluster_cssd_get_peer_state(n) != CLUSTER_CSSD_PEER_DEAD)
+					remote_live = true;
+
+			if (remote_live) {
+				LWLockRelease(&entry->entry_lock.lock);
+				if (cv_prepared)
+					ConditionVariableCancelSleep();
+				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								errmsg("cluster_pcm: cross-node block write transfer not "
+									   "supported in this stage"),
+								errhint("Another live node holds this block; concurrent "
+										"cross-node write (writer transfer) lands in "
+										"spec-2.36 / 4.7. Set cluster.gcs_block_local_cache "
+										"= off for serialized-node workloads.")));
+			}
+		}
+
 		/* Incompatible state — wait on CV. */
 		if (!cv_prepared) {
 			ConditionVariablePrepareToSleep(&entry->wait_cv);

@@ -133,6 +133,14 @@ $node->stop;
 			'cluster.merged_recovery = on',
 			'cluster.recovery_workers_max = 0',
 			'cluster.recovery_stale_active_ms = 1000',
+			# spec-4.7a: this leg builds a WAL/undo window for merged recovery,
+			# NOT a writer-transfer test.  It has both nodes write the SAME
+			# relation concurrently (pre-crash), which under hold-until-revoked
+			# (default on) is the deferred cross-node writer-transfer case and
+			# bounded-fail-closes.  Disable the node-level PCM cache here so the
+			# holder releases on content-lock unlock (pre-4.7a semantics) and
+			# the concurrent pre-crash writes proceed.
+			'cluster.gcs_block_local_cache = off',
 		]);
 	my $na = $pair->node0;
 	my $nb = $pair->node1;

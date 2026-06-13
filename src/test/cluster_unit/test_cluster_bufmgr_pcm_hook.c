@@ -71,6 +71,12 @@ int NBuffers = 0;
 int cluster_injection_armed_count = 0;
 bool cluster_enabled = true; /* PGRAC: spec-2.31 D2 helper depends on this */
 
+/* spec-4.7a D2 — the bufmgr PCM hook reads this GUC to decide hold-until-revoked
+ * (preserve buf->pcm_state on content-lock unlock).  Stubbed ON (production
+ * default) so these tests exercise the preserve path; that path is single-node
+ * honest (local buf->pcm_state retention, no peer liveness needed). */
+bool cluster_gcs_block_local_cache = true;
+
 /* spec-4.7a D4 — cluster_pcm_lock.o now references cluster_cssd_get_peer_state
  * (the other-live-holder gate).  This test links cluster_pcm_lock.o, so it
  * must provide the symbol; return ALIVE (this test does not exercise the D4

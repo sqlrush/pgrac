@@ -171,6 +171,17 @@ reset_fake_pcm_runtime(int max_entries)
 	cluster_pcm_grd_init();
 }
 
+/*
+ * spec-4.7a B — cluster_pcm_lock.o's local acquire wait-path reads this GUC to
+ * decide the bounded-fail-closed for a cross-node write transfer.  Stubbed OFF
+ * here: the acquire state-machine tests below exercise transition logic, which
+ * is GUC-independent.  The GUC-on bounded-fail-closed (B) needs a REAL remote
+ * live holder (cssd liveness of a peer); the single-node unit harness stubs
+ * cssd always-alive and fakes the GrdEntry, so it cannot model that path
+ * honestly — it is e2e-tested by t/252 L3b (2-node, real cssd liveness).
+ */
+bool cluster_gcs_block_local_cache = false;
+
 /* spec-4.7a D4 — stub CSSD peer liveness for the other-live-holder gate.
  * Default: every peer ALIVE.  A test sets fake_cssd_dead_node to mark one
  * peer DEAD (to verify a dead holder is NOT counted by the D4 gate). */
@@ -428,9 +439,9 @@ void
 cluster_gcs_block_bump_master_holder_lifecycle(void)
 {}
 
-/* ereport stubs — minimal enough to satisfy linker.  ereport(ERROR, ...)
- * path in cluster_pcm_lock.o would call errstart_cold + errfinish;  none
- * of the tests in this binary trigger that path. */
+/* ereport stubs — minimal enough to satisfy linker.  ereport(ERROR, ...) in
+ * cluster_pcm_lock.o calls errstart_cold + errfinish; test_pcm_b_local_master_
+ * remote_x_holder_fail_closed exercises that path via UT_EXPECT_EREPORT. */
 bool
 errstart(int elevel, const char *domain pg_attribute_unused())
 {
@@ -1022,10 +1033,49 @@ UT_TEST(test_pcm_d4_other_live_holder_gate)
 	UT_ASSERT(!cluster_pcm_master_other_live_holder_exists(selftag, 1));
 }
 
+/*
+ * spec-4.7a B (HG7 local-path completion) — the acquire-side bounded fail-closed.
+ * When the local master path meets an incompatible LIVE remote holder and
+ * hold-until-revoked is on, it must ereport (FEATURE_NOT_SUPPORTED) rather than
+ * hang on wait_cv (the writer transfer that would revoke the holder is deferred).
+ * This is the acquire-path mirror of the D4 master-dispatch gate above; together
+ * they cover both round-trip paths HG7 promises "no hang" for.
+ */
+UT_TEST(test_pcm_b_local_master_remote_x_holder_fail_closed)
+{
+	BufferTag tag = make_tag(45);
+	bool save = cluster_gcs_block_local_cache;
+
+	reset_fake_pcm_runtime(4);
+	fake_cssd_dead_node = -1;
+
+	/* node 2 holds X — the conflicting remote LIVE holder. */
+	cluster_node_id = 2;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_X);
+
+	/* node 1 (local master) wants X with hold-until-revoked on → fail-closed. */
+	cluster_node_id = 1;
+	cluster_gcs_block_local_cache = true;
+	UT_EXPECT_EREPORT(cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_X));
+	cluster_gcs_block_local_cache = save;
+
+	/* The holder is untouched — no illegal transition applied on the fail-closed
+	 * path (node 2 still records X). */
+	UT_ASSERT(cluster_pcm_master_other_live_holder_exists(tag, 1));
+
+	/* A DEAD conflicting holder is NOT fail-closed — that block belongs to the
+	 * warm-recovery path; the acquire falls through to the legitimate wait.  We
+	 * assert only the holder-liveness scoping of the gate here (the wait itself
+	 * is covered by H3); do not call acquire (it would block on wait_cv). */
+	fake_cssd_dead_node = 2;
+	UT_ASSERT(!cluster_pcm_master_other_live_holder_exists(tag, 1));
+	fake_cssd_dead_node = -1;
+}
+
 int
 main(void)
 {
-	UT_PLAN(31);
+	UT_PLAN(35);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
 	UT_RUN(test_pcm_lock_transition_enum_values_are_1_to_9);
@@ -1060,6 +1110,7 @@ main(void)
 	UT_RUN(test_pcm_d2_mode_covers_truth_table);
 	UT_RUN(test_pcm_d3_requester_is_holder_strict);
 	UT_RUN(test_pcm_d4_other_live_holder_gate);
+	UT_RUN(test_pcm_b_local_master_remote_x_holder_fail_closed);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
