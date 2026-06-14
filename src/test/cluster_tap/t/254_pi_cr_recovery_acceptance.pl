@@ -79,9 +79,20 @@ sub poll_query_until_timeout
 	return 0;
 }
 
-# Single-node cluster (cluster mode, stub interconnect, LOCAL tables).  The
-# cluster CR path is active (cr_mvcc_gate on) so the local CR cache + TT verdict
-# are exercised, without the shared-block PCM-holder-lost restart behavior.
+# Single-node cluster (cluster mode, stub interconnect, LOCAL tables).
+#
+#   D0 measure-first finding (codereview P0): a single-node LOCAL read does NOT
+#   traverse the cluster CR fork -- the serve-path gate
+#   (heapam_visibility.c:1520) requires a CLUSTER-source snapshot AND remote
+#   evidence; a single-node local-table read has neither, so the read is judged
+#   by PG-native MVCC (verified: all cr_* counters stay 0 even with fastpath
+#   off).  The cluster CR fork is fundamentally a cross-node / remote-evidence
+#   mechanism (cross-node e2e -> FEATURE_NOT_SUPPORTED, Stage 5 forward; see L6).
+#   So this single-node section proves PG-NATIVE post-recovery correctness (the
+#   reachable composition), and the cluster CR cache / xmax verdict are proven
+#   at cluster_unit (test_cluster_cr_cache.c:123-130 base_page_lsn key MISS;
+#   test_cluster_visibility_variants cluster_vis_cr_xmax_verdict; per Q4 #1/#4
+#   may be unit/injection -- only #5 must be a real 2-node scenario).
 sub _new_single_node
 {
 	my ($name) = @_;
@@ -93,7 +104,6 @@ sub _new_single_node
 		  . "cluster.allow_single_node = on\n"
 		  . "cluster.interconnect_tier = stub\n"
 		  . "cluster.cr_mvcc_gate = on\n"
-		  . "cluster.cr_gate_no_peer_fastpath = on\n"
 		  . "autovacuum = off\n");
 	return $node;
 }
@@ -128,11 +138,12 @@ for my $cat (sort keys %expect_cat)
 }
 
 # ----------------------------------------------------------------------
-# L2 (D2, hard gate #1) — CR cache never serves a stale CR page after a
-#   restart.  The CR cache is backend-local (spec-3.10) and its key carries
-#   base_page_lsn (cluster_cr_cache.h:73), so a fresh post-restart backend
-#   starts empty and a read whose page advanced cannot hit a pre-restart
-#   image.  Deterministic.
+# L2 (D2, hard gate #1 — e2e baseline) — post-recovery read returns the
+#   correct (current) page version, never a stale one.  On a single node a
+#   LOCAL read is PG-native (see _new_single_node note); the CLUSTER CR cache
+#   key-safety -- a changed base_page_lsn forces a cache MISS -- is unit-proven
+#   at test_cluster_cr_cache.c:123-130 (per Q4 #1 may be unit).  This leg proves
+#   recovery does not corrupt / stale the read path.  Deterministic.
 # ----------------------------------------------------------------------
 $node->safe_psql('postgres', q{
 	CREATE TABLE pcr_t (id int primary key, v text);
@@ -142,20 +153,23 @@ is($node->safe_psql('postgres', 'SELECT count(*) FROM pcr_t'), '50',
 	'L2 pre-restart: 50 rows');
 $node->safe_psql('postgres', q{UPDATE pcr_t SET v = 'new' WHERE id <= 10});
 $node->safe_psql('postgres', 'CHECKPOINT');
-$node->restart;    # fresh backends; backend-local CR cache is empty
+$node->restart;
 is($node->safe_psql('postgres', q{SELECT count(*) FROM pcr_t WHERE v = 'new'}),
 	'10',
-	'L2 (hard gate #1): post-restart read returns the NEW page version '
-	. '(CR cache empty + base_page_lsn key -> no stale pre-restart image)');
+	'L2 (#1 e2e baseline): post-restart read returns the NEW page version '
+	. '(no stale pre-restart image; cluster CR-cache key-safety unit-proven)');
 is($node->safe_psql('postgres', 'SELECT count(*) FROM pcr_t'), '50',
-	'L2 (hard gate #1): full row set intact after restart (no stale/lost rows)');
+	'L2 (#1 e2e baseline): full row set intact after restart (no stale/lost rows)');
 
 # ----------------------------------------------------------------------
-# L4 (D3, hard gate #4) — recovered TT verdict + CR xmax compose with no
-#   false-visible / false-invisible.  A crash-left in-flight DELETE never
-#   committed; after recovery the TT verdict + CLOG resolve it ABORTED, so
-#   the rows stay live and visible (8.A: never show a half-deleted row as
-#   gone).  Deterministic.
+# L4 (D3, hard gate #4 — e2e baseline) — a crash-left in-flight DELETE never
+#   committed; after recovery it resolves ABORTED so the rows stay live and
+#   visible (8.A: never show a half-deleted row as gone).  On a single node
+#   this is PG-native CLOG/abort recovery (consistent with spec-4.8 D1: on-disk
+#   TT slots are never ACTIVE -- in-flight binding is lost on crash); the
+#   CLUSTER xmax verdict (cluster_vis_cr_xmax_verdict, no false-visible/
+#   invisible across recycled/wrap) is unit-proven at
+#   test_cluster_visibility_variants (per Q4 #4 may be unit).  Deterministic.
 # ----------------------------------------------------------------------
 my $bg = $node->background_psql('postgres', on_error_stop => 0);
 $bg->query('BEGIN');
@@ -165,13 +179,13 @@ $node->stop('immediate');         # crash before commit
 eval { $bg->quit };
 $node->start;
 is($node->safe_psql('postgres', 'SELECT count(*) FROM pcr_t'), '50',
-	'L4 (hard gate #4): crash-left in-flight DELETE -> recovered ABORTED -> '
+	'L4 (#4 e2e baseline): crash-left in-flight DELETE -> recovered ABORTED -> '
 	. 'all 50 rows live (no false-invisible / no lost rows)');
 is($node->safe_psql('postgres', q{
 		SET enable_seqscan = off;
 		SELECT count(*) FROM pcr_t WHERE id BETWEEN 1 AND 25;
 	}), '25',
-	'L4 (hard gate #4): primary-key index scan over the un-deleted range is '
+	'L4 (#4 e2e baseline): primary-key index scan over the un-deleted range is '
 	. 'consistent with the recovered heap (no false-invisible via index)');
 $node->stop;
 
@@ -237,21 +251,35 @@ SKIP:
 		q{SELECT COALESCE(MAX(value::bigint), 0) FROM cluster_dump_state()
 		    WHERE category='gcs' AND key='pi_watermark_retire_count'});
 	$retire_after = 0 if !defined $retire_after || $retire_after eq '';
-	cmp_ok($retire_after, '>=', $retire_before,
-		'L_obs (hard gate #2): pi_watermark retire count monotone across the '
+	# Discriminating (codereview P1): the property is retire NOT bumped BY the
+	# epoch -> retire must be FLAT across a pure remaster epoch (no relation
+	# drop/truncate in this window).  `==` fails in the unsafe direction (an
+	# epoch-tied clear is a retire -> after > before); `>=` would pass it.
+	is($retire_after, $retire_before,
+		'L_obs (hard gate #2): pi_watermark retire count FLAT across the '
 		. "remaster epoch (retire is tag-lifecycle-only, never epoch-tied; "
 		. "before=$retire_before after=$retire_after)");
 
 	# --------------------------------------------------------------
-	# L6 (hard gate #5) — REAL 2-node shared-storage survivor read
-	#   across the peer crash/remaster.  node1 (survivor) reads the
-	#   shared-data table node0 wrote, AFTER node0 was killed.  8.A:
-	#   correct data (50) OR a fail-closed SQLSTATE -- never wrong data.
-	#   Liveness is diag.
+	# L6 (hard gate #5) — REAL 2-node shared-storage survivor read across
+	#   the peer crash/remaster.  node1 (survivor) reads the shared-data
+	#   table node0 wrote, AFTER node0 was killed.  Measure-first finding:
+	#   the POSITIVE cross-node read (survivor serves a dead peer's block)
+	#   needs cross-node block transfer = FEATURE_NOT_SUPPORTED today (Stage
+	#   5 forward; same reason t/248 serializes).  So the reachable outcome
+	#   is a SAFE refusal.  8.A hard assert (codereview P1, Q7): correct data
+	#   (50) OR an EXPLICIT registered safe outcome -- a CR/authority
+	#   fail-closed SQLSTATE (53R9F/53R9G), CR horizon (snapshot too old), or
+	#   the explicit FEATURE_NOT_SUPPORTED cross-node-block refusal.  NOT a
+	#   broad substring match (no bare GCS/PCM/recover) -- those could mask an
+	#   arbitrary/unrelated error as "safe".  Never wrong data.  Liveness diag.
 	# --------------------------------------------------------------
 	my ($rc, $out, $err) =
 	  $n1->psql('postgres', 'SELECT count(*) FROM scr_t', timeout => 30);
-	my $failclosed = ($err =~ /snapshot too old|53R9[FG]|recover|remaster|not.*holder|GCS|PCM|master rejected/i);
+	my $failclosed =
+	     $err =~ /\b53R9[FG]\b/                          # registered CR / remote-authority fail-closed
+	  || $err =~ /snapshot too old/i                     # registered CR horizon fail-closed
+	  || $err =~ /cross-node block.*not supported/i;     # explicit FEATURE_NOT_SUPPORTED (Stage 5 forward)
 	my $correct = ($rc == 0 && $out eq '50');
 	diag("L6: survivor cross-node read rc=$rc out='$out'"
 		  . ($failclosed ? " fail-closed (SAFE)" : ($correct ? " correct" : " err=$err")));
