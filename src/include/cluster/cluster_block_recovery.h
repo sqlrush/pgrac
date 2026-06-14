@@ -79,6 +79,11 @@ typedef enum ClusterBlkRecAction {
 extern bool cluster_online_block_recovery;
 extern int cluster_block_recovery_on_unrecoverable;
 
+/* D6 observability: shmem counters (registered via the cluster shmem registry). */
+extern void cluster_block_recovery_shmem_register(void);
+extern uint64 cluster_block_recovery_get_blocks_recovered(void);
+extern uint64 cluster_block_recovery_get_failclosed(void);
+
 struct SMgrRelationData;
 
 /*

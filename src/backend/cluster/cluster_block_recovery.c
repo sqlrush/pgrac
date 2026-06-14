@@ -51,15 +51,83 @@
 #include "access/xlogreader.h"
 #include "access/xlogrecord.h"
 #include "access/xlogutils.h"
+#include "port/atomics.h"
 #include "storage/bufpage.h"
 #include "storage/checksum.h"
 #include "storage/fd.h"
 #include "storage/relfilelocator.h"
+#include "storage/shmem.h"
 #include "storage/smgr.h"
 
 #include "cluster/cluster_block_apply.h"
 #include "cluster/cluster_block_recovery.h"
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_shmem.h"
+
+/*
+ * D6 observability counters (shmem).  blocks_recovered / recovery_failclosed
+ * are the two live-site outcomes of the synchronous read-path recovery
+ * (cluster_block_recovery_on_read).  Finer reasons (fpi-not-found vs
+ * replay-incomplete), the in-progress gauge, and the BlockRecovery wait event
+ * have no live site in the synchronous single-node model -- they belong to the
+ * recovering-set / cross-node model and land with D5.
+ */
+typedef struct ClusterBlockRecoveryShmem {
+	pg_atomic_uint64 blocks_recovered;	  /* rebuilt + installed */
+	pg_atomic_uint64 recovery_failclosed; /* attempted, could not rebuild */
+} ClusterBlockRecoveryShmem;
+
+static ClusterBlockRecoveryShmem *cluster_block_recovery_shmem = NULL;
+
+static Size
+cluster_block_recovery_shmem_size(void)
+{
+	return MAXALIGN(sizeof(ClusterBlockRecoveryShmem));
+}
+
+static void
+cluster_block_recovery_shmem_init(void)
+{
+	bool found;
+
+	cluster_block_recovery_shmem = (ClusterBlockRecoveryShmem *)ShmemInitStruct(
+		"pgrac block recovery", cluster_block_recovery_shmem_size(), &found);
+	if (!found) {
+		pg_atomic_init_u64(&cluster_block_recovery_shmem->blocks_recovered, 0);
+		pg_atomic_init_u64(&cluster_block_recovery_shmem->recovery_failclosed, 0);
+	}
+}
+
+static const ClusterShmemRegion cluster_block_recovery_region = {
+	.name = "pgrac block recovery",
+	.size_fn = cluster_block_recovery_shmem_size,
+	.init_fn = cluster_block_recovery_shmem_init,
+	.lwlock_count = 0,
+	.owner_subsys = "spec-4.10 block recovery",
+	.reserved_flags = 0,
+};
+
+void
+cluster_block_recovery_shmem_register(void)
+{
+	cluster_shmem_register_region(&cluster_block_recovery_region);
+}
+
+uint64
+cluster_block_recovery_get_blocks_recovered(void)
+{
+	return cluster_block_recovery_shmem
+			   ? pg_atomic_read_u64(&cluster_block_recovery_shmem->blocks_recovered)
+			   : 0;
+}
+
+uint64
+cluster_block_recovery_get_failclosed(void)
+{
+	return cluster_block_recovery_shmem
+			   ? pg_atomic_read_u64(&cluster_block_recovery_shmem->recovery_failclosed)
+			   : 0;
+}
 
 /*
  * page_header_sane -- header-only validity of a reconstructed page (8.A).
@@ -286,8 +354,12 @@ cluster_block_recovery_on_read(struct SMgrRelationData *reln, ForkNumber forknum
 		return false;
 
 	if (cluster_block_recovery_reconstruct(rlocator, forknum, blocknum, lo, hi, scratch.data)
-		!= CLUSTER_BLKREC_RECOVERED)
+		!= CLUSTER_BLKREC_RECOVERED) {
+		/* attempted (passed all gates) but could not rebuild -> fail-closed */
+		if (cluster_block_recovery_shmem)
+			pg_atomic_fetch_add_u64(&cluster_block_recovery_shmem->recovery_failclosed, 1);
 		return false;
+	}
 
 	/* Reconstruct validated header-sanity + pd_lsn == target. */
 	memcpy(buffer, scratch.data, BLCKSZ);
@@ -304,6 +376,9 @@ cluster_block_recovery_on_read(struct SMgrRelationData *reln, ForkNumber forknum
 	XLogFlush(PageGetLSN((Page)buffer));
 	PageSetChecksumInplace((Page)buffer, blocknum);
 	smgrwrite(reln, forknum, blocknum, buffer, false);
+
+	if (cluster_block_recovery_shmem)
+		pg_atomic_fetch_add_u64(&cluster_block_recovery_shmem->blocks_recovered, 1);
 	return true;
 }
 

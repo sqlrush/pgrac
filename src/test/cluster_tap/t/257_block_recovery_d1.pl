@@ -130,6 +130,13 @@ sub flip_in_marker
 	# safe_psql dies on error; without recovery the bad checksum would ERROR.
 	my $got = $node->safe_psql('postgres', 'SELECT count(*), coalesce(sum(id), 0) FROM t1');
 	is($got, $exp, 'L1 corrupt block read -> online recovery returns correct data');
+
+	# D6 observability: the blocks_recovered counter incremented (same server
+	# lifetime; shmem counters reset on restart).
+	my $recovered = $node->safe_psql('postgres',
+		q{SELECT value FROM pg_cluster_state
+		  WHERE category = 'recovery' AND key = 'block_recovery_blocks_recovered'});
+	cmp_ok($recovered, '>=', 1, 'L1 D6 blocks_recovered counter incremented');
 }
 
 # ============================================================

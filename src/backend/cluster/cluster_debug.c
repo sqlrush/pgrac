@@ -100,6 +100,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_recovery_worker.h"
 #include "cluster/cluster_recovery_merge.h" /* is_materialized (spec-4.5a D11) */
+#include "cluster/cluster_block_recovery.h" /* block-recovery counters (spec-4.10 D6) */
 #include "cluster/cluster_remote_xact.h"	/* remote outcome counters (spec-4.5a D11) */
 #include "cluster/cluster_ic.h"				/* ClusterICOps_Active, ClusterICTier */
 #include "cluster/cluster_ic_tier1.h"		/* listener metadata accessors (Hardening v1.0.1 F3) */
@@ -1602,6 +1603,12 @@ dump_recovery(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_vis_get_recovery_2pc_standby_rebuilds()));
 	emit_row(rsinfo, "recovery", "recovery_overlay_rebuild_count",
 			 fmt_int64((int64)cluster_vis_get_recovery_overlay_rebuild_count()));
+
+	/* spec-4.10 D6: online single-block recovery outcomes. */
+	emit_row(rsinfo, "recovery", "block_recovery_blocks_recovered",
+			 fmt_int64((int64)cluster_block_recovery_get_blocks_recovered()));
+	emit_row(rsinfo, "recovery", "block_recovery_failclosed",
+			 fmt_int64((int64)cluster_block_recovery_get_failclosed()));
 
 	/* spec-4.3 D5: recovery plan (observational; '-' before a plan). */
 	have_plan = cluster_recovery_plan_snapshot(&plan);
