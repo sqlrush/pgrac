@@ -598,7 +598,11 @@
  *
  * spec-4.10 D2: cluster_block_recovery_reconstruct_test (oid 8933) -- the
  * online single-block recovery reconstruct differential driver.  +1 row. */
-#define CATALOG_VERSION_NO 202606141
+/* spec-4.11 D1 (2026-06-14): pg_proc gains TEST-ONLY
+ * cluster_thread_apply_redo_test (oid 8934) -- the LSN-gated online
+ * thread-recovery apply matrix byte-for-byte parity + idempotence differential
+ * driver.  One pg_proc row -> bump. */
+#define CATALOG_VERSION_NO 202606142
 
 /* spec-2.39 D10 (2026-05-21):  SI Broadcaster production activation —
  * DDL commit hook (AtEOXact_Inval + COMMIT PREPARED via cluster-aware
