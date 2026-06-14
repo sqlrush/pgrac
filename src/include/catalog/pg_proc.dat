@@ -12487,4 +12487,17 @@
   proargnames => '{rel,blockno,read_scn}',
   prosrc => 'cluster_cr_test_image' },
 
+# spec-4.10 D3b: reconstruct one block by single-block redo-apply over a
+# WAL LSN range, for the byte-for-byte differential vs PG real redo.
+# Returns the reconstructed page as bytea, or NULL when reconstruction
+# fails closed.  Superuser-only.
+{ oid => '8932',
+  descr => 'TEST-ONLY: single-block redo-apply reconstruction over WAL (spec-4.10)',
+  proname => 'cluster_block_apply_redo_test',
+  provolatile => 'v', proparallel => 'u',
+  prorettype => 'bytea',
+  proargtypes => 'regclass int4 int8 pg_lsn pg_lsn',
+  proargnames => '{rel,forknum,blocknum,start_lsn,end_lsn}',
+  prosrc => 'cluster_block_apply_redo_test' },
+
 ]

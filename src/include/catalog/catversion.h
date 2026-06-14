@@ -592,7 +592,10 @@
  * xl_xact_tt_commit section folded into the normal commit record (TT-slot
  * commit no longer a standalone XLOG_UNDO_TT_SLOT_COMMIT 0x30).  Commit-record
  * WAL format change -> bump forces re-initdb (A1: no mixed-version replay). */
-#define CATALOG_VERSION_NO 202606111
+/* spec-4.10 D3b (2026-06-14): pg_proc gains TEST-ONLY
+ * cluster_block_apply_redo_test (oid 8932) -- the single-block redo-apply
+ * byte-for-byte differential driver.  One pg_proc row -> bump. */
+#define CATALOG_VERSION_NO 202606140
 
 /* spec-2.39 D10 (2026-05-21):  SI Broadcaster production activation —
  * DDL commit hook (AtEOXact_Inval + COMMIT PREPARED via cluster-aware
