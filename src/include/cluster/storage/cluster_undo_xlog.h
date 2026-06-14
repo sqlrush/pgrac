@@ -39,7 +39,8 @@
 #include "access/xlogreader.h"
 #include "lib/stringinfo.h"
 
-#include "cluster/cluster_scn.h"		 /* SCN typedef (spec-3.11 D3 xl_undo_tt_slot_commit) */
+#include "cluster/cluster_itl_slot.h" /* UBA (spec-4.8 D7-A xl_undo_tt_slot_set_head) */
+#include "cluster/cluster_scn.h"	  /* SCN typedef (spec-3.11 D3 xl_undo_tt_slot_commit) */
 #include "cluster/cluster_undo_format.h" /* UndoBlockHeader/UndoSlotDirEntry (spec-3.18 D2 block_write) */
 
 
@@ -63,6 +64,9 @@
 #define XLOG_UNDO_BLOCK_WRITE_MULTI                                                                \
 	0x80 /* spec-3.25 D1b: one record covers N contiguous undo records + their                     \
 		  * slot-dir span (deferred per-(xact,block) merge); 0x70 redo kept (Q7-A) */
+#define XLOG_UNDO_TT_SLOT_SET_HEAD                                                                 \
+	0x90 /* spec-4.8 D7-A: durably set TTSlot.first_undo_block (undo-chain head) from the 2PC       \
+		  * record at ROLLBACK PREPARED, so D7 physical rollback can walk it after crash-restart */
 
 StaticAssertDecl((XLOG_UNDO_SEGMENT_INIT & XLR_INFO_MASK) == 0,
 				 "cluster undo WAL opcodes must leave XLR_INFO_MASK bits clear");
@@ -75,6 +79,8 @@ StaticAssertDecl((XLOG_UNDO_SEGMENT_REUSE & XLR_INFO_MASK) == 0,
 StaticAssertDecl((XLOG_UNDO_TT_SLOT_ABORT & XLR_INFO_MASK) == 0,
 				 "cluster undo WAL opcodes must leave XLR_INFO_MASK bits clear");
 StaticAssertDecl((XLOG_UNDO_BLOCK_WRITE & XLR_INFO_MASK) == 0,
+				 "cluster undo WAL opcodes must leave XLR_INFO_MASK bits clear");
+StaticAssertDecl((XLOG_UNDO_TT_SLOT_SET_HEAD & XLR_INFO_MASK) == 0,
 				 "cluster undo WAL opcodes must leave XLR_INFO_MASK bits clear");
 
 
@@ -174,6 +180,29 @@ typedef struct xl_undo_tt_slot_abort {
 
 StaticAssertDecl(sizeof(xl_undo_tt_slot_abort) == 16,
 				 "spec-3.15: xl_undo_tt_slot_abort is 16 bytes, no implicit padding");
+
+/*
+ * On-disk WAL payload for XLOG_UNDO_TT_SLOT_SET_HEAD (spec-4.8 D7-A).
+ *
+ *   Durably stamps TTSlot.first_undo_block (the undo-chain head) onto block 0,
+ *   gated by the slot still owning (xid, wrap) -- it does NOT change slot.status
+ *   (a separate 0x60 abort sets ABORTED).  Emitted at ROLLBACK PREPARED
+ *   prefinish from the 2PC record's captured head, so D7 physical rollback can
+ *   walk the chain after a crash-restart.  The 16-byte fixed prefix mirrors
+ *   xl_undo_tt_slot_abort; first_undo_block follows.
+ */
+typedef struct xl_undo_tt_slot_set_head {
+	uint32 segment_id;
+	uint16 slot_offset;
+	uint16 wrap;
+	TransactionId xid;
+	uint8 instance;
+	uint8 _pad[3];
+	UBA first_undo_block; /* 16B undo-chain head */
+} xl_undo_tt_slot_set_head;
+
+StaticAssertDecl(sizeof(xl_undo_tt_slot_set_head) == 32,
+				 "spec-4.8 D7-A: xl_undo_tt_slot_set_head is 32 bytes, no implicit padding");
 
 /*
  * On-disk WAL payload for XLOG_UNDO_SEGMENT_RECYCLE (spec-3.13 D3).
@@ -453,6 +482,11 @@ extern void cluster_tt_durable_redo_stamp_slot(uint8 instance, uint32 segment_id
 extern XLogRecPtr cluster_undo_emit_tt_slot_abort(uint8 instance, uint32 segment_id,
 												  uint16 slot_offset, uint16 wrap,
 												  TransactionId xid);
+
+/* spec-4.8 D7-A: emit XLOG_UNDO_TT_SLOT_SET_HEAD (durable undo-chain head). */
+extern XLogRecPtr cluster_undo_emit_tt_slot_set_head(uint8 instance, uint32 segment_id,
+													 uint16 slot_offset, uint16 wrap,
+													 TransactionId xid, UBA first_undo_block);
 
 /* spec-3.13 D3: emit XLOG_UNDO_SEGMENT_RECYCLE (caller XLogFlush + pwrite + fsync). */
 extern XLogRecPtr cluster_undo_emit_segment_recycle(uint8 instance, uint32 segment_id,

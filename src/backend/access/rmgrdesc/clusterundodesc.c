@@ -98,6 +98,14 @@ cluster_undo_desc(StringInfo buf, XLogReaderState *record)
 						 (unsigned)xlrec->rec_len, (unsigned)xlrec->slot_len);
 		break;
 	}
+	case XLOG_UNDO_TT_SLOT_SET_HEAD: {
+		xl_undo_tt_slot_set_head *xlrec = (xl_undo_tt_slot_set_head *)payload;
+
+		appendStringInfo(buf, "instance %u seg %u slot %u wrap %u xid %u (set undo head)",
+						 xlrec->instance, xlrec->segment_id, xlrec->slot_offset, xlrec->wrap,
+						 xlrec->xid);
+		break;
+	}
 	default:
 		appendStringInfo(buf, "unknown op %u", info);
 		break;
@@ -123,6 +131,8 @@ cluster_undo_identify(uint8 info)
 		return "UNDO_BLOCK_WRITE";
 	case XLOG_UNDO_BLOCK_WRITE_MULTI:
 		return "UNDO_BLOCK_WRITE_MULTI";
+	case XLOG_UNDO_TT_SLOT_SET_HEAD:
+		return "UNDO_TT_SLOT_SET_HEAD";
 	default:
 		return NULL;
 	}

@@ -133,6 +133,18 @@ cluster_undo_emit_tt_slot_abort(uint8 instance pg_attribute_unused(),
 	return InvalidXLogRecPtr;
 }
 
+/* spec-4.8 D7-A stub: 0x90 set-head emit (WAL machinery not linked in unit). */
+XLogRecPtr
+cluster_undo_emit_tt_slot_set_head(uint8 instance pg_attribute_unused(),
+								   uint32 segment_id pg_attribute_unused(),
+								   uint16 slot_offset pg_attribute_unused(),
+								   uint16 wrap pg_attribute_unused(),
+								   TransactionId xid pg_attribute_unused(),
+								   UBA first_undo_block pg_attribute_unused())
+{
+	return InvalidXLogRecPtr;
+}
+
 XLogRecPtr
 cluster_undo_emit_tt_slot_commit(uint8 instance pg_attribute_unused(),
 								 uint32 segment_id pg_attribute_unused(),

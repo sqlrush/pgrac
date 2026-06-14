@@ -36,7 +36,8 @@
 #ifndef CLUSTER_TT_DURABLE_H
 #define CLUSTER_TT_DURABLE_H
 
-#include "cluster/cluster_scn.h" /* SCN */
+#include "cluster/cluster_itl_slot.h" /* UBA (spec-4.8 D7-A set_head) */
+#include "cluster/cluster_scn.h"	  /* SCN */
 
 /*
  * Pure decision predicates (no I/O) -- shared by the runtime lookup/redo paths
@@ -152,6 +153,15 @@ extern uint8 cluster_tt_slot_durable_commit_writeonly(uint32 segment_id, uint16 
  */
 extern void cluster_tt_slot_durable_abort(uint32 segment_id, uint16 slot_offset, TransactionId xid,
 										  uint16 wrap);
+
+/*
+ * cluster_tt_slot_durable_set_head -- spec-4.8 D7-A.  Durably stamp the slot's
+ *	undo-chain head (first_undo_block) via WAL 0x90 + targeted RMW, gated by the
+ *	slot still owning (xid, wrap); does not change slot.status.  Called from the
+ *	ROLLBACK PREPARED prefinish abort path so D7 physical rollback can walk it.
+ */
+extern void cluster_tt_slot_durable_set_head(uint32 segment_id, uint16 slot_offset,
+											 TransactionId xid, uint16 wrap, UBA first_undo_block);
 
 /*
  * cluster_tt_slot_durable_lookup -- read the durable TT slot (segment_id,

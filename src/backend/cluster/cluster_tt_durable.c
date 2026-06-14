@@ -287,6 +287,58 @@ cluster_tt_slot_durable_abort(uint32 segment_id, uint16 slot_offset, Transaction
 }
 
 
+/*
+ * cluster_tt_slot_durable_set_head -- spec-4.8 D7-A.
+ *
+ *	Durably stamp the undo-chain head (TTSlot.first_undo_block) onto the slot,
+ *	gated by the slot still owning (xid, wrap).  WAL 0x90 first (the prepared-
+ *	abort flush carries it, C10), then the 32B targeted RMW.  Does NOT touch
+ *	slot.status (the paired 0x60 abort already set ABORTED + xid + wrap, so the
+ *	identity gate matches here).  A slot recycled to a different owner since the
+ *	abort is left untouched (规则 8.A: never stamp another xact's slot).  Called
+ *	from the ROLLBACK PREPARED prefinish abort path with the head captured into
+ *	the 2PC record at PREPARE, so D7 physical rollback can walk it.
+ */
+void
+cluster_tt_slot_durable_set_head(uint32 segment_id, uint16 slot_offset, TransactionId xid,
+								 uint16 wrap, UBA first_undo_block)
+{
+	uint8 owner = tt_owner_instance_for_segment(segment_id);
+	uint32 off = tt_slot_file_offset(slot_offset);
+	TTSlot slot;
+
+	Assert(slot_offset < TT_SLOTS_PER_SEGMENT);
+	Assert(TransactionIdIsValid(xid));
+
+	(void)cluster_undo_emit_tt_slot_set_head(owner, segment_id, slot_offset, wrap, xid,
+											 first_undo_block);
+
+	cluster_tt_durable_io_wait_start();
+
+	if (!cluster_undo_smgr_read_header_bytes(segment_id, owner, off, (char *)&slot, sizeof(slot))) {
+		cluster_tt_durable_io_wait_end();
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("cluster durable TT: cannot read slot %u of undo segment %u",
+							   slot_offset, segment_id)));
+	}
+
+	/* Identity gate (规则 8.A): only stamp the head if the slot still owns this
+	 * (xid, wrap); a recycled slot belongs to a newer owner -> leave untouched. */
+	if (slot.xid == xid && slot.wrap == wrap) {
+		slot.first_undo_block = first_undo_block;
+		if (!cluster_undo_smgr_write_header_bytes(segment_id, owner, off, (const char *)&slot,
+												  sizeof(slot))) {
+			cluster_tt_durable_io_wait_end();
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("cluster durable TT: cannot write slot %u of undo segment %u",
+								   slot_offset, segment_id)));
+		}
+	}
+
+	cluster_tt_durable_io_wait_end();
+}
+
+
 bool
 cluster_tt_slot_durable_lookup(uint32 segment_id, uint16 slot_offset, TransactionId xid,
 							   uint32 expected_wrap, SCN *commit_scn)

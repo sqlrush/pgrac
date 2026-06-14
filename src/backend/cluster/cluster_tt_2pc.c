@@ -363,6 +363,18 @@ cluster_tt_twophase_prefinish(TransactionId xid, SCN final_scn, bool is_commit, 
 			cluster_tt_status_hint_emit(&key, CLUSTER_TT_STATUS_COMMITTED, final_scn);
 		} else {
 			cluster_tt_slot_durable_abort(b->undo_segment_id, b->slot_offset, b->xid, b->wrap);
+			/*
+			 * spec-4.8 D7-A: persist this binding's undo-chain head (captured
+			 * into the v2 2PC record at PREPARE) durably onto the now-ABORTED
+			 * slot, so D7 physical rollback can walk the chain after a crash-
+			 * restart.  Emit order matters: durable_abort above stamped the
+			 * slot's xid/wrap, so set_head's identity gate matches at redo.  A
+			 * v1 record / a binding with no undo (heads NULL or InvalidUba) is a
+			 * no-op -> D7 fails closed for it (MVCC invisible + vacuum, I10).
+			 */
+			if (p.heads != NULL && !UBA_is_invalid(p.heads[i]))
+				cluster_tt_slot_durable_set_head(b->undo_segment_id, b->slot_offset, b->xid,
+												 b->wrap, p.heads[i]);
 			cluster_tt_slot_mark_aborted(b->undo_segment_id, b->slot_offset, b->xid);
 			(void)cluster_tt_status_install_local(&key, CLUSTER_TT_STATUS_ABORTED, InvalidScn);
 			cluster_tt_status_hint_emit(&key, CLUSTER_TT_STATUS_ABORTED, InvalidScn);

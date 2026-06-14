@@ -229,4 +229,49 @@ SKIP:
 	ok(1, 'sig(c) placeholder');
 }
 
+# ======================================================================
+# L7 (D7 + D7-A) — index-aware physical rollback of a 2PC-aborted DELETE.
+#   2PC DELETE -> PREPARE -> ROLLBACK PREPARED -> crash/restart -> D7 physically
+#   reverts the aborted deleter's xmax (HEAP_XMAX_INVALID).  The head is durable:
+#   AtPrepare captured it into the v2 2PC record, ROLLBACK PREPARED prefinish
+#   stamped it onto the ABORTED slot via the WAL 0x90 record, redo restored it,
+#   and D7's startup scan walked the chain.  Verifies counter > 0, tuple live,
+#   and the primary-key index scan stays consistent (no dangling entry).
+# ======================================================================
+my $nc = _new_node('s48_d7a', 'on');
+$nc->append_conf('postgresql.conf', "max_prepared_transactions = 10\n");
+$nc->start;
+$nc->safe_psql('postgres', q{
+	CREATE TABLE t48d7 (id int primary key, v int);
+	INSERT INTO t48d7 SELECT g, g FROM generate_series(1, 50) g;
+});
+# 2PC transaction that DELETEs, prepares, then rolls back the prepared xact.
+$nc->safe_psql('postgres', q{
+	BEGIN;
+	DELETE FROM t48d7 WHERE id <= 25;
+	PREPARE TRANSACTION 'p48d7';
+});
+$nc->safe_psql('postgres', q{ROLLBACK PREPARED 'p48d7'});
+# Crash after the rollback is durable; restart drives redo + D7 startup scan.
+$nc->stop('immediate');
+$nc->start;
+
+my $reverted = $nc->safe_psql('postgres',
+	q{SELECT value FROM pg_cluster_state WHERE category='tt_recovery' AND key='heap_tuples_physically_reverted'});
+cmp_ok($reverted, '>=', 1,
+	"L7 (D7+D7-A): 2PC-aborted DELETE physically reverted at startup (heap_tuples_physically_reverted=$reverted)");
+
+# The rolled-back DELETE never committed, so every row is live (seq scan).
+my $live = $nc->safe_psql('postgres', q{SELECT count(*) FROM t48d7});
+is($live, '50', 'L7: all 50 rows live after the prepared DELETE was rolled back + reverted');
+
+# Index consistency (no dangling entry): the primary-key index scan over the
+# reverted rows returns them (forced index scan), matching the seq-scan count.
+my $idx = $nc->safe_psql('postgres', q{
+	SET enable_seqscan = off;
+	SELECT count(*) FROM t48d7 WHERE id BETWEEN 1 AND 25;
+});
+is($idx, '25', 'L7: primary-key index scan over the reverted rows is consistent (no dangling entry)');
+$nc->stop;
+
 done_testing();
