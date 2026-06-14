@@ -719,6 +719,16 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 # or an unclassifiable foreign record).  Fail-closed -- never silently
 # fall back to single-stream recovery (would skip a peer's committed WAL).
 53RA3    E    ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED                          cluster_merged_recovery_blocked
+# spec-4.11:  online single-thread recovery refused.  A survivor cannot
+# safely online-replay a dead thread's WAL data to shared storage within
+# the reconfig freeze window (missing WAL segment, indeterminate target
+# LSN, full_page_writes was off, insufficient checkpoint history,
+# incomplete undo/TT authority, a cross-node merge contradiction, or an
+# rmgr not in the online apply matrix).  Result-returning fail-closed:
+# the dead thread's resources stay frozen (never serve a possibly stale
+# page); the survivor is NOT crashed unless
+# cluster.thread_recovery_on_unrecoverable=panic.
+53RA4    E    ERRCODE_CLUSTER_THREAD_RECOVERY_BLOCKED                          cluster_thread_recovery_blocked
 
 Section: Class 54 - Program Limit Exceeded
 

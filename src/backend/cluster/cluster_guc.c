@@ -38,9 +38,10 @@
 
 #include "utils/guc.h"
 
-#include "cluster/cluster_block_recovery.h" /* spec-4.10 D1 online block recovery GUCs */
-#include "cluster/cluster_conf.h"			/* cluster_conf_has_peers (spec-3.18 D2b latch) */
-#include "cluster/cluster_cr_cache.h"		/* cluster_cr_cache_max_blocks (spec-3.10 D4) */
+#include "cluster/cluster_block_recovery.h"	 /* spec-4.10 D1 online block recovery GUCs */
+#include "cluster/cluster_thread_recovery.h" /* spec-4.11 D1 online thread recovery GUCs */
+#include "cluster/cluster_conf.h"			 /* cluster_conf_has_peers (spec-3.18 D2b latch) */
+#include "cluster/cluster_cr_cache.h"		 /* cluster_cr_cache_max_blocks (spec-3.10 D4) */
 #include "cluster/cluster_guc.h"
 #include "cluster/storage/cluster_undo_buf.h" /* cluster_undo_buf_writeback_allowed (spec-3.18 D1) */
 #include "cluster/cluster_ic.h"				  /* ClusterICTier enum values */
@@ -508,6 +509,18 @@ int cluster_block_recovery_on_unrecoverable = CLUSTER_BLKREC_ACTION_ERROR;
 static const struct config_enum_entry cluster_block_recovery_on_unrecoverable_options[]
 	= { { "error", CLUSTER_BLKREC_ACTION_ERROR, false },
 		{ "panic", CLUSTER_BLKREC_ACTION_PANIC, false },
+		{ NULL, 0, false } };
+
+/* spec-4.11 D1: online single-thread recovery (storage defined here; logic in
+ * cluster_thread_recovery.c).  Dev default OFF (Q7/P2): default-on only once
+ * the D7 capability gate is complete and every unsupported environment is
+ * proven fail-closed; flip to true at ship. */
+bool cluster_online_thread_recovery = false;
+int cluster_thread_recovery_on_unrecoverable = CLUSTER_THREADREC_ACTION_KEEP_FROZEN;
+
+static const struct config_enum_entry cluster_thread_recovery_on_unrecoverable_options[]
+	= { { "keep_frozen", CLUSTER_THREADREC_ACTION_KEEP_FROZEN, false },
+		{ "panic", CLUSTER_THREADREC_ACTION_PANIC, false },
 		{ NULL, 0, false } };
 
 
@@ -2194,6 +2207,30 @@ cluster_init_guc(void)
 					 "(no FPI base / WAL recycled / unsupported delta / cross-node)."),
 		&cluster_block_recovery_on_unrecoverable, CLUSTER_BLKREC_ACTION_ERROR,
 		cluster_block_recovery_on_unrecoverable_options, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	/*
+	 * PGRAC: spec-4.11 D1 — online single-thread recovery (2 NEW GUC).
+	 */
+	DefineCustomBoolVariable(
+		"cluster.online_thread_recovery",
+		gettext_noop("Let a survivor online-replay a dead WAL thread's data to shared "
+					 "storage in the reconfig freeze window instead of waiting for the "
+					 "dead node's cold restart."),
+		gettext_noop("Dev default off (flips on at ship once the capability gate is "
+					 "complete).  2-node scope only; requires a shared-data (cluster_fs) "
+					 "backend; single-node and >2-node survivors are not applicable / not "
+					 "supported.  fail-closed: a thread that cannot be replayed completely "
+					 "stays frozen (never serves a stale page)."),
+		&cluster_online_thread_recovery, false, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	DefineCustomEnumVariable(
+		"cluster.thread_recovery_on_unrecoverable",
+		gettext_noop("Action when a dead thread cannot be online-recovered."),
+		gettext_noop("keep_frozen (default): result-returning fail-closed; the dead "
+					 "thread's resources stay frozen and the survivor keeps running.  "
+					 "panic: escalate to PANIC the survivor (operator opt-in)."),
+		&cluster_thread_recovery_on_unrecoverable, CLUSTER_THREADREC_ACTION_KEEP_FROZEN,
+		cluster_thread_recovery_on_unrecoverable_options, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	/*
 	 * PGRAC: spec-2.38 D8 — 3 NEW GUC for SI Broadcaster skeleton.
