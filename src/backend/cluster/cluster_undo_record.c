@@ -368,6 +368,23 @@ cluster_undo_local_head_ensure(uint16 tt_slot_segment_id, uint16 tt_slot_offset,
 	return true;
 }
 
+/*
+ * cluster_undo_local_head_get -- spec-4.8 D7-A: read the backend-local latest
+ *	undo-chain head for a TT slot (segment_id, slot_offset), or InvalidUba if
+ *	this backend wrote no undo for that slot this transaction.  Used by
+ *	AtPrepare_ClusterTT to capture the head into the 2PC record while it is
+ *	still in memory (the local head array is reset at xact end).
+ */
+UBA
+cluster_undo_local_head_get(uint16 tt_slot_segment_id, uint16 tt_slot_offset)
+{
+	int idx = cluster_undo_local_head_find(tt_slot_segment_id, tt_slot_offset);
+
+	if (idx < 0)
+		return InvalidUba;
+	return cluster_undo_local_heads[idx].head;
+}
+
 
 /*
  * cluster_undo_record_shmem_size

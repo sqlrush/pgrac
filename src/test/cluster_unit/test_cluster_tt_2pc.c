@@ -82,8 +82,8 @@ UT_TEST(test_s1_roundtrip_single_binding)
 	uint32 len;
 	ClusterTT2PCParsed p;
 
-	len = cluster_tt_2pc_serialize(&b, 1, NULL, 0, buf, sizeof(buf));
-	UT_ASSERT_EQ((int)(len == cluster_tt_2pc_record_size(1, 0)), 1);
+	len = cluster_tt_2pc_serialize(&b, NULL, 1, NULL, 0, buf, sizeof(buf));
+	UT_ASSERT_EQ((int)(len == cluster_tt_2pc_record_size(CLUSTER_TT_2PC_VERSION, 1, 0)), 1);
 	UT_ASSERT_EQ((int)cluster_tt_2pc_parse_record(buf, len, &p), 1);
 	UT_ASSERT_EQ((int)p.nbindings, 1);
 	UT_ASSERT_EQ((int)p.nsublinks, 0);
@@ -108,7 +108,7 @@ UT_TEST(test_s2_roundtrip_multi_with_sublinks)
 	ls[0] = mk_link(3001, 2000);
 	ls[1] = mk_link(3002, 2000);
 
-	len = cluster_tt_2pc_serialize(bs, 3, ls, 2, buf, sizeof(buf));
+	len = cluster_tt_2pc_serialize(bs, NULL, 3, ls, 2, buf, sizeof(buf));
 	UT_ASSERT_EQ((int)(len > 0), 1);
 	UT_ASSERT_EQ((int)cluster_tt_2pc_parse_record(buf, len, &p), 1);
 	UT_ASSERT_EQ((int)p.nbindings, 3);
@@ -128,7 +128,7 @@ UT_TEST(test_s3_roundtrip_empty)
 	uint32 len;
 	ClusterTT2PCParsed p;
 
-	len = cluster_tt_2pc_serialize(NULL, 0, NULL, 0, buf, sizeof(buf));
+	len = cluster_tt_2pc_serialize(NULL, NULL, 0, NULL, 0, buf, sizeof(buf));
 	UT_ASSERT_EQ((int)(len == sizeof(ClusterTT2PCRecord)), 1);
 	UT_ASSERT_EQ((int)cluster_tt_2pc_parse_record(buf, len, &p), 1);
 	UT_ASSERT_EQ((int)p.nbindings, 0);
@@ -145,8 +145,8 @@ UT_TEST(test_s4_cap_bindings_reject)
 
 	for (i = 0; i <= CLUSTER_TT_2PC_MAX_BINDINGS; i++)
 		bs[i] = mk_binding(1, 0, 0, 1, 100 + i);
-	UT_ASSERT_EQ((int)cluster_tt_2pc_serialize(bs, CLUSTER_TT_2PC_MAX_BINDINGS + 1, NULL, 0, buf,
-											   sizeof(buf)),
+	UT_ASSERT_EQ((int)cluster_tt_2pc_serialize(bs, NULL, CLUSTER_TT_2PC_MAX_BINDINGS + 1, NULL, 0,
+											   buf, sizeof(buf)),
 				 0);
 }
 
@@ -158,8 +158,8 @@ UT_TEST(test_s5_cap_sublinks_reject)
 
 	for (i = 0; i <= CLUSTER_TT_2PC_MAX_SUBLINKS; i++)
 		ls[i] = mk_link(100 + i, 50);
-	UT_ASSERT_EQ((int)cluster_tt_2pc_serialize(NULL, 0, ls, CLUSTER_TT_2PC_MAX_SUBLINKS + 1, buf,
-											   sizeof(buf)),
+	UT_ASSERT_EQ((int)cluster_tt_2pc_serialize(NULL, NULL, 0, ls, CLUSTER_TT_2PC_MAX_SUBLINKS + 1,
+											   buf, sizeof(buf)),
 				 0);
 }
 
@@ -168,7 +168,7 @@ UT_TEST(test_s6_dstcap_too_small_reject)
 	ClusterTT2PCBinding b = mk_binding(1, 0, 0, 1, 100);
 	char buf[8];
 
-	UT_ASSERT_EQ((int)cluster_tt_2pc_serialize(&b, 1, NULL, 0, buf, sizeof(buf)), 0);
+	UT_ASSERT_EQ((int)cluster_tt_2pc_serialize(&b, NULL, 1, NULL, 0, buf, sizeof(buf)), 0);
 }
 
 UT_TEST(test_s7_crc_corruption_reject)
@@ -178,7 +178,7 @@ UT_TEST(test_s7_crc_corruption_reject)
 	uint32 len;
 	ClusterTT2PCParsed p;
 
-	len = cluster_tt_2pc_serialize(&b, 1, NULL, 0, buf, sizeof(buf));
+	len = cluster_tt_2pc_serialize(&b, NULL, 1, NULL, 0, buf, sizeof(buf));
 	buf[sizeof(ClusterTT2PCRecord) + 3] ^= 0x40; /* flip a payload bit */
 	UT_ASSERT_EQ((int)cluster_tt_2pc_parse_record(buf, len, &p), 0);
 }
@@ -191,7 +191,7 @@ UT_TEST(test_s8_version_mismatch_reject)
 	ClusterTT2PCParsed p;
 	ClusterTT2PCRecord *hdr = (ClusterTT2PCRecord *)buf;
 
-	len = cluster_tt_2pc_serialize(&b, 1, NULL, 0, buf, sizeof(buf));
+	len = cluster_tt_2pc_serialize(&b, NULL, 1, NULL, 0, buf, sizeof(buf));
 	hdr->version = CLUSTER_TT_2PC_VERSION + 1;
 	UT_ASSERT_EQ((int)cluster_tt_2pc_parse_record(buf, len, &p), 0);
 }
@@ -204,7 +204,7 @@ UT_TEST(test_s9_magic_mismatch_reject)
 	ClusterTT2PCParsed p;
 	ClusterTT2PCRecord *hdr = (ClusterTT2PCRecord *)buf;
 
-	len = cluster_tt_2pc_serialize(&b, 1, NULL, 0, buf, sizeof(buf));
+	len = cluster_tt_2pc_serialize(&b, NULL, 1, NULL, 0, buf, sizeof(buf));
 	hdr->magic = 0xDEADBEEF;
 	UT_ASSERT_EQ((int)cluster_tt_2pc_parse_record(buf, len, &p), 0);
 }
@@ -216,7 +216,7 @@ UT_TEST(test_s10_length_mismatch_reject)
 	uint32 len;
 	ClusterTT2PCParsed p;
 
-	len = cluster_tt_2pc_serialize(&b, 1, NULL, 0, buf, sizeof(buf));
+	len = cluster_tt_2pc_serialize(&b, NULL, 1, NULL, 0, buf, sizeof(buf));
 	UT_ASSERT_EQ((int)cluster_tt_2pc_parse_record(buf, len - 1, &p), 0); /* truncated */
 	UT_ASSERT_EQ((int)cluster_tt_2pc_parse_record(buf, len + 1, &p), 0); /* padded */
 	UT_ASSERT_EQ((int)cluster_tt_2pc_parse_record(buf, sizeof(ClusterTT2PCRecord) - 1, &p), 0);
@@ -230,11 +230,54 @@ UT_TEST(test_s11_count_tamper_trips_length_check)
 	ClusterTT2PCParsed p;
 	ClusterTT2PCRecord *hdr = (ClusterTT2PCRecord *)buf;
 
-	len = cluster_tt_2pc_serialize(&b, 1, NULL, 0, buf, sizeof(buf));
+	len = cluster_tt_2pc_serialize(&b, NULL, 1, NULL, 0, buf, sizeof(buf));
 	/* Claim 2 bindings: even with a freshly-stamped CRC the length
 	 * arithmetic must trip (defence-in-depth ordering). */
 	hdr->nbindings = 2;
 	UT_ASSERT_EQ((int)cluster_tt_2pc_parse_record(buf, len, &p), 0);
+}
+
+/* spec-4.8 D7-A: v2 heads[] section round-trips parallel to bindings[]. */
+UT_TEST(test_s12_v2_heads_roundtrip)
+{
+	ClusterTT2PCBinding bs[2];
+	UBA heads[2];
+	char buf[512];
+	uint32 len;
+	ClusterTT2PCParsed p;
+
+	bs[0] = mk_binding(11, 5, 2, 9, 1001);
+	bs[1] = mk_binding(12, 6, 3, 9, 1002);
+	memset(heads, 0, sizeof(heads));
+	heads[0].raw[0] = 0xABCD1234;
+	heads[0].raw[1] = 0x5678;
+	heads[1].raw[0] = 0x0; /* binding 1: no head (InvalidUba) */
+	heads[1].raw[1] = 0x0;
+
+	len = cluster_tt_2pc_serialize(bs, heads, 2, NULL, 0, buf, sizeof(buf));
+	UT_ASSERT_EQ((int)(len == cluster_tt_2pc_record_size(CLUSTER_TT_2PC_VERSION, 2, 0)), 1);
+	UT_ASSERT_EQ((int)cluster_tt_2pc_parse_record(buf, len, &p), 1);
+	UT_ASSERT_EQ((int)p.version, CLUSTER_TT_2PC_VERSION);
+	UT_ASSERT_EQ((int)(p.heads != NULL), 1);
+	UT_ASSERT_EQ((int)(p.heads[0].raw[0] == 0xABCD1234), 1);
+	UT_ASSERT_EQ((int)(p.heads[0].raw[1] == 0x5678), 1);
+	UT_ASSERT_EQ((int)UBA_is_invalid(p.heads[1]), 1); /* binding 1: InvalidUba */
+}
+
+/* spec-4.8 D7-A: NULL heads serializes an all-InvalidUba heads[] section; the
+ * record is still v2 (heads != NULL on parse) -> D7 no-op per binding. */
+UT_TEST(test_s13_v2_null_heads_all_invalid)
+{
+	ClusterTT2PCBinding b = mk_binding(11, 5, 2, 9, 1001);
+	char buf[256];
+	uint32 len;
+	ClusterTT2PCParsed p;
+
+	len = cluster_tt_2pc_serialize(&b, NULL, 1, NULL, 0, buf, sizeof(buf));
+	UT_ASSERT_EQ((int)cluster_tt_2pc_parse_record(buf, len, &p), 1);
+	UT_ASSERT_EQ((int)p.version, CLUSTER_TT_2PC_VERSION);
+	UT_ASSERT_EQ((int)(p.heads != NULL), 1);
+	UT_ASSERT_EQ((int)UBA_is_invalid(p.heads[0]), 1);
 }
 
 
@@ -252,6 +295,8 @@ main(void)
 	UT_RUN(test_s9_magic_mismatch_reject);
 	UT_RUN(test_s10_length_mismatch_reject);
 	UT_RUN(test_s11_count_tamper_trips_length_check);
+	UT_RUN(test_s12_v2_heads_roundtrip);
+	UT_RUN(test_s13_v2_null_heads_all_invalid);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

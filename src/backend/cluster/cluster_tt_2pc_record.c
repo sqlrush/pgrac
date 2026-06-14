@@ -34,14 +34,21 @@
 
 
 /*
- * cluster_tt_2pc_record_size -- exact serialized length.
+ * cluster_tt_2pc_record_size -- exact serialized length for a format version.
+ *
+ *	v1 (CLUSTER_TT_2PC_VERSION_NO_HEADS): [hdr][bindings][sublinks].
+ *	v2 (CLUSTER_TT_2PC_VERSION): + [heads nbindings * sizeof(UBA)] (spec-4.8 D7-A).
  */
 uint32
-cluster_tt_2pc_record_size(uint16 nbindings, uint32 nsublinks)
+cluster_tt_2pc_record_size(uint16 version, uint16 nbindings, uint32 nsublinks)
 {
-	return (uint32)sizeof(ClusterTT2PCRecord)
-		   + (uint32)nbindings * (uint32)sizeof(ClusterTT2PCBinding)
-		   + nsublinks * (uint32)sizeof(ClusterTT2PCSubLink);
+	uint32 sz = (uint32)sizeof(ClusterTT2PCRecord)
+				+ (uint32)nbindings * (uint32)sizeof(ClusterTT2PCBinding)
+				+ nsublinks * (uint32)sizeof(ClusterTT2PCSubLink);
+
+	if (version >= CLUSTER_TT_2PC_VERSION)
+		sz += (uint32)nbindings * (uint32)sizeof(UBA);
+	return sz;
 }
 
 
@@ -80,12 +87,12 @@ record_crc(const char *buf, uint32 len)
  *	§1.4-4 capacity ereport).
  */
 uint32
-cluster_tt_2pc_serialize(const ClusterTT2PCBinding *bindings, uint16 nbindings,
+cluster_tt_2pc_serialize(const ClusterTT2PCBinding *bindings, const UBA *heads, uint16 nbindings,
 						 const ClusterTT2PCSubLink *sublinks, uint32 nsublinks, char *dst,
 						 uint32 dstcap)
 {
 	ClusterTT2PCRecord hdr;
-	uint32 need = cluster_tt_2pc_record_size(nbindings, nsublinks);
+	uint32 need = cluster_tt_2pc_record_size(CLUSTER_TT_2PC_VERSION, nbindings, nsublinks);
 	char *p;
 
 	if (nbindings > CLUSTER_TT_2PC_MAX_BINDINGS)
@@ -97,7 +104,7 @@ cluster_tt_2pc_serialize(const ClusterTT2PCBinding *bindings, uint16 nbindings,
 
 	memset(&hdr, 0, sizeof(hdr));
 	hdr.magic = CLUSTER_TT_2PC_MAGIC;
-	hdr.version = CLUSTER_TT_2PC_VERSION;
+	hdr.version = CLUSTER_TT_2PC_VERSION; /* always serialize the current (v2) format */
 	hdr.nbindings = nbindings;
 	hdr.nsublinks = nsublinks;
 	hdr.crc = 0;
@@ -109,9 +116,19 @@ cluster_tt_2pc_serialize(const ClusterTT2PCBinding *bindings, uint16 nbindings,
 		memcpy(p, bindings, (size_t)nbindings * sizeof(ClusterTT2PCBinding));
 		p += (size_t)nbindings * sizeof(ClusterTT2PCBinding);
 	}
-	if (nsublinks > 0)
+	if (nsublinks > 0) {
 		memcpy(p, sublinks, (size_t)nsublinks * sizeof(ClusterTT2PCSubLink));
-	/* total length == record_size() by construction (S1-S3 lock it). */
+		p += (size_t)nsublinks * sizeof(ClusterTT2PCSubLink);
+	}
+	/* spec-4.8 D7-A: v2 heads[] section (parallel to bindings).  A NULL heads
+	 * array serializes all-zero == InvalidUba (no recorded head). */
+	if (nbindings > 0) {
+		if (heads != NULL)
+			memcpy(p, heads, (size_t)nbindings * sizeof(UBA));
+		else
+			memset(p, 0, (size_t)nbindings * sizeof(UBA));
+	}
+	/* total length == record_size(v2) by construction. */
 
 	/* Stamp crc last (computed with the field zeroed). */
 	((ClusterTT2PCRecord *)dst)->crc = record_crc(dst, need);
@@ -141,19 +158,22 @@ cluster_tt_2pc_parse_record(const void *recdata, uint32 len, ClusterTT2PCParsed 
 	memcpy(&hdr, buf, sizeof(hdr));
 	if (hdr.magic != CLUSTER_TT_2PC_MAGIC)
 		return false;
-	if (hdr.version != CLUSTER_TT_2PC_VERSION)
+	/* Accept the current (v2) format and the v1 legacy format (no heads[]);
+	 * anything else fails closed (spec-4.8 D7-A: old/no-head -> no-op). */
+	if (hdr.version != CLUSTER_TT_2PC_VERSION && hdr.version != CLUSTER_TT_2PC_VERSION_NO_HEADS)
 		return false;
 	if (hdr.nbindings > CLUSTER_TT_2PC_MAX_BINDINGS)
 		return false;
 	if (hdr.nsublinks > CLUSTER_TT_2PC_MAX_SUBLINKS)
 		return false;
 
-	need = cluster_tt_2pc_record_size(hdr.nbindings, hdr.nsublinks);
+	need = cluster_tt_2pc_record_size(hdr.version, hdr.nbindings, hdr.nsublinks);
 	if (len != need)
 		return false;
 	if (record_crc(buf, len) != hdr.crc)
 		return false;
 
+	out->version = hdr.version;
 	out->nbindings = hdr.nbindings;
 	out->nsublinks = hdr.nsublinks;
 	out->bindings = (hdr.nbindings > 0)
@@ -164,6 +184,12 @@ cluster_tt_2pc_parse_record(const void *recdata, uint32 len, ClusterTT2PCParsed 
 			  ? (const ClusterTT2PCSubLink *)(buf + sizeof(ClusterTT2PCRecord)
 											  + (size_t)hdr.nbindings * sizeof(ClusterTT2PCBinding))
 			  : NULL;
+	/* spec-4.8 D7-A: heads[] follows sublinks[] in v2 only; v1 -> NULL. */
+	out->heads = (hdr.version >= CLUSTER_TT_2PC_VERSION && hdr.nbindings > 0)
+					 ? (const UBA *)(buf + sizeof(ClusterTT2PCRecord)
+									 + (size_t)hdr.nbindings * sizeof(ClusterTT2PCBinding)
+									 + (size_t)hdr.nsublinks * sizeof(ClusterTT2PCSubLink))
+					 : NULL;
 	return true;
 }
 

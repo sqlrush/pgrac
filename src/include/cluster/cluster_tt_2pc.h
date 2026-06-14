@@ -41,14 +41,24 @@
 #include "c.h"
 #include "access/transam.h"
 
+#include "cluster/cluster_itl_slot.h" /* UBA (spec-4.8 D7-A undo head) */
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_tt_status.h" /* ClusterTTStatusKey */
 
 
 #define CLUSTER_TT_2PC_MAGIC 0x50324354 /* "P2CT" */
-#define CLUSTER_TT_2PC_VERSION 1
-#define CLUSTER_TT_2PC_MAX_BINDINGS 64 /* §1.4-4: xact-local TT bindings cap */
-#define CLUSTER_TT_2PC_MAX_SUBLINKS 64 /* SUBCOMMITTED links cap (R7) */
+/*
+ * Version 1 (spec-3.15): [hdr][bindings 16B][sublinks].
+ * Version 2 (spec-4.8 D7-A): appends a heads[] section parallel to bindings[]
+ *	-- heads[i] is binding[i]'s latest undo-chain head (TTSlot.first_undo_block)
+ *	captured at PREPARE while it is still in backend-local memory.  The binding
+ *	struct is UNCHANGED (16B, zero-copy) so a v1 record still parses (its
+ *	heads[] is absent -> NULL -> D7 physical rollback is a no-op for it).
+ */
+#define CLUSTER_TT_2PC_VERSION 2
+#define CLUSTER_TT_2PC_VERSION_NO_HEADS 1 /* legacy: bindings only, no heads[] */
+#define CLUSTER_TT_2PC_MAX_BINDINGS 64	  /* §1.4-4: xact-local TT bindings cap */
+#define CLUSTER_TT_2PC_MAX_SUBLINKS 64	  /* SUBCOMMITTED links cap (R7) */
 
 /*
  * One TT binding of the prepared transaction.  origin is implicitly the
@@ -98,10 +108,18 @@ StaticAssertDecl(sizeof(ClusterTT2PCRecord) == 16,
  * buffer; no copies).
  */
 typedef struct ClusterTT2PCParsed {
+	uint16 version;
 	uint16 nbindings;
 	uint32 nsublinks;
 	const ClusterTT2PCBinding *bindings;
 	const ClusterTT2PCSubLink *sublinks;
+	/*
+	 * spec-4.8 D7-A: heads[i] is bindings[i]'s undo-chain head, present iff
+	 * version >= CLUSTER_TT_2PC_VERSION (2) AND nbindings > 0; else NULL (a v1
+	 * legacy record -> no heads -> D7 physical rollback no-op for it).  A
+	 * heads[i] of InvalidUba means "no recorded head for this binding".
+	 */
+	const UBA *heads;
 } ClusterTT2PCParsed;
 
 
@@ -115,13 +133,16 @@ typedef struct ClusterTT2PCParsed {
  * pointers into `recdata`; returns false on any mismatch (caller
  * fail-closes with DATA_CORRUPTED).
  */
-/* Exact serialized size for given counts (header + payload). */
-extern uint32 cluster_tt_2pc_record_size(uint16 nbindings, uint32 nsublinks);
-/* Serialize into caller-provided buffer (dstcap >= record_size); returns
- * bytes written, 0 on cap/limit violation.  Pure: no allocation. */
-extern uint32 cluster_tt_2pc_serialize(const ClusterTT2PCBinding *bindings, uint16 nbindings,
-									   const ClusterTT2PCSubLink *sublinks, uint32 nsublinks,
-									   char *dst, uint32 dstcap);
+/* Exact serialized size for a given format version + counts (header + payload).
+ * version 1 = bindings + sublinks; version 2 = + heads[nbindings]. */
+extern uint32 cluster_tt_2pc_record_size(uint16 version, uint16 nbindings, uint32 nsublinks);
+/* Serialize a version-2 record into a caller-provided buffer (dstcap >=
+ * record_size(2,...)); returns bytes written, 0 on cap/limit violation.  heads
+ * (parallel to bindings; may be NULL -> all InvalidUba) carries each binding's
+ * undo-chain head.  Pure: no allocation. */
+extern uint32 cluster_tt_2pc_serialize(const ClusterTT2PCBinding *bindings, const UBA *heads,
+									   uint16 nbindings, const ClusterTT2PCSubLink *sublinks,
+									   uint32 nsublinks, char *dst, uint32 dstcap);
 extern bool cluster_tt_2pc_parse_record(const void *recdata, uint32 len, ClusterTT2PCParsed *out);
 
 /*

@@ -121,6 +121,14 @@ extern UBA cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordT
  */
 extern size_t cluster_undo_get_record(UBA uba, void *out_buffer, size_t buffer_size);
 
+/*
+ * cluster_undo_local_head_get -- spec-4.8 D7-A: backend-local latest undo-chain
+ *	head for a TT slot (segment_id, slot_offset), or InvalidUba if none this
+ *	xact.  Captured into the 2PC record at PREPARE (the local head is reset at
+ *	xact end, so this must be read before PostPrepare/commit).
+ */
+extern UBA cluster_undo_local_head_get(uint16 tt_slot_segment_id, uint16 tt_slot_offset);
+
 
 /*
  * Shmem region API.  cluster_undo_record_alloc() uses per-instance

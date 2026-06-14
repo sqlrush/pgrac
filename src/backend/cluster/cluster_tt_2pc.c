@@ -64,11 +64,13 @@ void
 AtPrepare_ClusterTT(void)
 {
 	ClusterTT2PCBinding bindings[CLUSTER_TT_2PC_MAX_BINDINGS + 1];
+	UBA heads[CLUSTER_TT_2PC_MAX_BINDINGS + 1];
 	ClusterTT2PCSubLink sublinks[CLUSTER_TT_2PC_MAX_SUBLINKS + 1];
 	uint16 nbindings;
 	uint32 nsublinks;
 	uint32 len;
 	char *buf;
+	uint16 i;
 
 	if (!cluster_enabled || cluster_node_id < 0)
 		return;
@@ -80,14 +82,26 @@ AtPrepare_ClusterTT(void)
 		return; /* Q5: nothing to carry */
 
 	/*
+	 * spec-4.8 D7-A: capture each binding's latest undo-chain head into the v2
+	 * heads[] section.  The head is backend-local (cluster_undo_record.c) and is
+	 * reset at xact end, so it must be read here at PREPARE while still live;
+	 * the durable TT slot header does not persist it (deferred).  A binding with
+	 * no undo this xact gets InvalidUba (-> D7 physical rollback no-op for it).
+	 */
+	for (i = 0; i < nbindings && i <= CLUSTER_TT_2PC_MAX_BINDINGS; i++)
+		heads[i] = cluster_undo_local_head_get((uint16)bindings[i].undo_segment_id,
+											   bindings[i].slot_offset);
+
+	/*
 	 * §1.4-4 capacity: export functions return count+1 saturated when the
 	 * backend-local state exceeds the cap, which serialize() rejects --
 	 * surface it as a clean PREPARE failure, not silent truncation.
 	 */
-	len = cluster_tt_2pc_record_size(Min(nbindings, CLUSTER_TT_2PC_MAX_BINDINGS),
+	len = cluster_tt_2pc_record_size(CLUSTER_TT_2PC_VERSION,
+									 Min(nbindings, CLUSTER_TT_2PC_MAX_BINDINGS),
 									 Min(nsublinks, CLUSTER_TT_2PC_MAX_SUBLINKS));
 	buf = palloc(len);
-	if (cluster_tt_2pc_serialize(bindings, nbindings, sublinks, nsublinks, buf, len) == 0)
+	if (cluster_tt_2pc_serialize(bindings, heads, nbindings, sublinks, nsublinks, buf, len) == 0)
 		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 						errmsg("cannot PREPARE a transaction with more than %d cluster TT bindings "
 							   "or %d subtransaction links",
