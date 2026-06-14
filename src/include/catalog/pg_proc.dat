@@ -12500,4 +12500,17 @@
   proargnames => '{rel,forknum,blocknum,start_lsn,end_lsn}',
   prosrc => 'cluster_block_apply_redo_test' },
 
+# spec-4.10 D2: reconstruct one block via the online single-block recovery
+# orchestrator over an explicit WAL window, for the byte-for-byte differential
+# vs PG real crash-recovery redo.  Returns the reconstructed page as bytea, or
+# NULL when reconstruction fails closed.  Superuser-only.
+{ oid => '8933',
+  descr => 'TEST-ONLY: online single-block recovery reconstruction over WAL (spec-4.10)',
+  proname => 'cluster_block_recovery_reconstruct_test',
+  provolatile => 'v', proparallel => 'u',
+  prorettype => 'bytea',
+  proargtypes => 'regclass int4 int8 pg_lsn pg_lsn',
+  proargnames => '{rel,forknum,blocknum,scan_lower,scan_upper}',
+  prosrc => 'cluster_block_recovery_reconstruct_test' },
+
 ]

@@ -23,12 +23,20 @@
 #    (the post-restart CHECKPOINT must not recycle the WAL the SRF re-reads),
 #    and the table is NEVER read before the compare (no hint bits).
 #
-#      L1   single INSERT: reconstruct from the heap FPI plus the trailing
-#           cluster ITL-touch (Generic) record on the same block
-#      L2   heap INSERT delta on top of an FPI base  (D3b.3)
-#      L3   heap DELETE delta on top of an FPI base  (D3b.3)
-#      L4   heap UPDATE delta: new-tuple block + old-tuple block  (D3b.3)
-#      L5   fail-closed: a delta with no FPI base -> SRF returns NULL
+#    Apply core (D3b), via the raw apply SRF:
+#      L1   single INSERT: heap FPI + trailing cluster ITL-touch (Generic)
+#      L2   heap INSERT delta on top of an FPI base
+#      L3   heap DELETE delta on top of an FPI base
+#      L4   heap HOT UPDATE delta (same page; prefix/suffix-from-old)
+#      L5   heap non-HOT UPDATE delta (same page)
+#      L6   fail-closed: a delta with no FPI base -> SRF returns NULL (8.A)
+#
+#    Online reconstructor (D2), via cluster_block_recovery_reconstruct over an
+#    explicit window -- same crash-recovery differential:
+#      R1   reconstruct (FPI base + delta) byte-for-byte == real redo
+#      R2   skip-pre-base + latest-FPI-wins (window opens after an earlier FPI;
+#           a second checkpoint's FPI is the base; an earlier delta is skipped)
+#      R3   fail-closed: window holds no FPI base -> UNRECOVERABLE (NULL, 8.A)
 #
 #    pg_ctl-level stop('immediate')/start cycles (not the TAP bootstrap
 #    path), so the crash-restart legs run on this host directly (cf. t/225).
@@ -85,6 +93,33 @@ sub crash_and_diff
 			SELECT cluster_block_apply_redo_test(
 					   '$rel'::regclass, 0, 0,
 					   '$start'::pg_lsn, '$end'::pg_lsn) AS recon
+		)
+		SELECT CASE
+				 WHEN recon IS NULL THEN 'recon-null'
+				 WHEN recon = pg_read_binary_file(
+						 pg_relation_filepath('$rel'), 0, 8192) THEN 'match'
+				 ELSE 'mismatch'
+			   END
+		FROM r;
+	});
+}
+
+# Same crash-recovery differential, but through the D2 online-recovery
+# reconstructor (cluster_block_recovery_reconstruct over an explicit window),
+# not the raw apply SRF.
+sub crash_and_diff_recon
+{
+	my ($rel, $scan_lower, $scan_upper) = @_;
+
+	$node->stop('immediate');
+	$node->start;
+	$node->safe_psql('postgres', 'CHECKPOINT');
+
+	return $node->safe_psql('postgres', qq{
+		WITH r AS (
+			SELECT cluster_block_recovery_reconstruct_test(
+					   '$rel'::regclass, 0, 0,
+					   '$scan_lower'::pg_lsn, '$scan_upper'::pg_lsn) AS recon
 		)
 		SELECT CASE
 				 WHEN recon IS NULL THEN 'recon-null'
@@ -215,6 +250,67 @@ sub seed_and_checkpoint
 	});
 	is($is_null, 't',
 		'L6 fail-closed: delta with no FPI base in range -> NULL (8.A)');
+}
+
+# ============================================================
+# R1 (D2): online reconstruct over an explicit window == real redo.
+#     scan_lower before op1's FPI, scan_upper after op2's delta -> the
+#     reconstructor finds the FPI base and applies the delta to the
+#     WAL-derived target (op2).
+# ============================================================
+{
+	seed_and_checkpoint('t256_r1');
+	my $lo = $node->safe_psql('postgres', 'SELECT pg_current_wal_lsn()');
+	$node->safe_psql('postgres', "INSERT INTO t256_r1 VALUES (100, 'op1_fpi')");
+	$node->safe_psql('postgres', "INSERT INTO t256_r1 VALUES (101, 'op2_delta')");
+	my $hi = $node->safe_psql('postgres', 'SELECT pg_current_wal_lsn()');
+
+	is(crash_and_diff_recon('t256_r1', $lo, $hi), 'match',
+		'R1 D2 reconstruct (FPI base + delta) byte-for-byte == real redo');
+}
+
+# ============================================================
+# R2 (D2): skip-pre-base + latest-FPI-wins.
+#     The window opens AFTER op1's FPI, so the first in-window block touch is
+#     op2 (a delta with no base) -- the reconstructor must SKIP it.  A second
+#     checkpoint makes op3 carry a fresh FPI (the latest FPI <= target); op4 is
+#     a delta on top.  The reconstruction must use FPI(op3) as the base and end
+#     at op4, ignoring the earlier FPI(op1) and the skipped delta(op2).
+# ============================================================
+{
+	seed_and_checkpoint('t256_r2');
+	$node->safe_psql('postgres', "INSERT INTO t256_r2 VALUES (100, 'op1_fpi_a')");
+	my $lo = $node->safe_psql('postgres', 'SELECT pg_current_wal_lsn()');   # after op1
+	$node->safe_psql('postgres', "INSERT INTO t256_r2 VALUES (101, 'op2_delta_b')");
+	$node->safe_psql('postgres', 'CHECKPOINT');                              # ckpt2
+	$node->safe_psql('postgres', "INSERT INTO t256_r2 VALUES (102, 'op3_fpi_c')");
+	$node->safe_psql('postgres', "INSERT INTO t256_r2 VALUES (103, 'op4_delta_d')");
+	my $hi = $node->safe_psql('postgres', 'SELECT pg_current_wal_lsn()');   # after op4
+
+	is(crash_and_diff_recon('t256_r2', $lo, $hi), 'match',
+		'R2 D2 reconstruct skip-pre-base + latest-FPI-wins == real redo');
+}
+
+# ============================================================
+# R3 (D2, 8.A): fail-closed when the window holds no FPI base.
+#     scan_lower after op1's FPI -> only op2's delta is in window -> the
+#     reconstructor has no base and returns UNRECOVERABLE (NULL).  (No crash:
+#     this exercises the reconstructor's no-base guard.)
+# ============================================================
+{
+	seed_and_checkpoint('t256_r3');
+	$node->safe_psql('postgres', "INSERT INTO t256_r3 VALUES (100, 'op1_fpi')");
+	my $lo = $node->safe_psql('postgres', 'SELECT pg_current_wal_lsn()');   # after op1 FPI
+	$node->safe_psql('postgres', "INSERT INTO t256_r3 VALUES (101, 'op2_delta')");
+	my $hi = $node->safe_psql('postgres', 'SELECT pg_current_wal_lsn()');
+
+	my $is_null = $node->safe_psql('postgres', qq{
+		SELECT cluster_block_recovery_reconstruct_test(
+				   't256_r3'::regclass, 0, 0,
+				   '$lo'::pg_lsn, '$hi'::pg_lsn) IS NULL;
+	});
+	is($is_null, 't',
+		'R3 D2 reconstruct fail-closed: no FPI base in window -> NULL (8.A)');
 }
 
 $node->stop;
