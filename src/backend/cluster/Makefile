@@ -68,6 +68,8 @@ OBJS = \
 	cluster_block_recovery_srf.o \
 	cluster_thread_recovery_apply.o \
 	cluster_thread_recovery_apply_srf.o \
+	cluster_thread_recovery_replay.o \
+	cluster_thread_recovery_replay_srf.o \
 	cluster_remote_xact.o \
 	cluster_guc.o \
 	cluster_ic.o \
@@ -148,7 +150,7 @@ else
 # it (spec-1.1 does not introduce a SRF; pg_cluster_state extension
 # lives in cluster_debug.c which is always linked).
 OBJS = cluster_conf.o cluster_debug.o cluster_ic.o cluster_inject.o cluster_undo_srf.o \
-	cluster_cr_srf.o cluster_block_apply_srf.o cluster_block_recovery_srf.o cluster_thread_recovery_apply_srf.o cluster_pgstat.o cluster_scn.o cluster_views.o
+	cluster_cr_srf.o cluster_block_apply_srf.o cluster_block_recovery_srf.o cluster_thread_recovery_apply_srf.o cluster_thread_recovery_replay_srf.o cluster_pgstat.o cluster_scn.o cluster_views.o
 endif
 
 include $(top_srcdir)/src/backend/common.mk

@@ -12515,6 +12515,21 @@
   proargnames => '{rel,forknum,blocknum,start_lsn,end_lsn,base_page}',
   prosrc => 'cluster_thread_apply_redo_test' },
 
+# spec-4.11 D1 increment 3a: drive the online thread-recovery RMW replay engine
+# over an explicit WAL window against shared storage, optionally seeding one
+# block with a known (older) page first, for the byte-for-byte differential vs
+# PG real redo + idempotence + fail-closed.  Returns a ':'-delimited summary
+# (result:records:applied:gated:out_of_scope:recovered_through).  Superuser-only.
+{ oid => '8935',
+  descr => 'TEST-ONLY: online thread-recovery RMW replay over WAL + shared storage (spec-4.11)',
+  proname => 'cluster_thread_replay_test',
+  proisstrict => 'f',
+  provolatile => 'v', proparallel => 'u',
+  prorettype => 'text',
+  proargtypes => 'pg_lsn pg_lsn regclass int4 int8 bytea',
+  proargnames => '{scan_lower,scan_upper,seed_rel,seed_forknum,seed_blocknum,seed_page}',
+  prosrc => 'cluster_thread_replay_test' },
+
 # spec-4.10 D2: reconstruct one block via the online single-block recovery
 # orchestrator over an explicit WAL window, for the byte-for-byte differential
 # vs PG real crash-recovery redo.  Returns the reconstructed page as bytea, or

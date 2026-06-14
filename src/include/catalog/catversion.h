@@ -602,7 +602,11 @@
  * cluster_thread_apply_redo_test (oid 8934) -- the LSN-gated online
  * thread-recovery apply matrix byte-for-byte parity + idempotence differential
  * driver.  One pg_proc row -> bump. */
-#define CATALOG_VERSION_NO 202606142
+/* spec-4.11 D1 increment 3a (2026-06-14): pg_proc gains TEST-ONLY
+ * cluster_thread_replay_test (oid 8935) -- drives the online thread-recovery RMW
+ * replay engine over WAL + shared storage (streaming + gates + idempotence +
+ * fail-closed differential).  One pg_proc row -> bump. */
+#define CATALOG_VERSION_NO 202606143
 
 /* spec-2.39 D10 (2026-05-21):  SI Broadcaster production activation —
  * DDL commit hook (AtEOXact_Inval + COMMIT PREPARED via cluster-aware

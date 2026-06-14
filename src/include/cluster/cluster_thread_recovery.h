@@ -39,7 +39,10 @@
 #define CLUSTER_THREAD_RECOVERY_H
 
 #include "access/xlogdefs.h"
+#include "storage/block.h"
 #include "cluster/cluster_wal_thread.h"
+
+struct XLogReaderState;
 
 /*
  * Result of attempting to online-recover one dead thread (spec-4.11 §2.2).
@@ -113,6 +116,73 @@ cluster_thread_recovery_decide_scope(bool guc_on, bool has_peers, bool shared_fs
 	return CLUSTER_THREADREC_SCOPE_APPLICABLE;
 }
 
+/*
+ * Per-block-reference classification for the RMW replay engine (spec-4.11 D1
+ * increment 3a).  PURE, so it is the unit-testable authority for the
+ * corruption-critical gate (mirrors cluster_thread_apply_decide): the .c engine
+ * computes the smgr facts and calls this, the unit pins every branch.
+ *
+ *	TARGET        a genuinely shared user-relation block that exists and is in
+ *	              range -> read-modify-write it on shared storage.
+ *	OUT_OF_SCOPE  not a shared user-relation block (temp / catalog / cluster_fs
+ *	              off / opt-in GUC off): a per-node concern the survivor owns, so
+ *	              it is a data-pass skip, NOT a recovery failure.
+ *	BLOCKED       fail-closed (8.A): either the relation no longer exists, or the
+ *	              record references a block at/beyond EOF (relation extension /
+ *	              new init page).  3a runs only the data-page apply matrix -- it
+ *	              does NOT replay the smgr create/drop/truncate records that would
+ *	              explain a missing file or an extension, so it cannot safely skip
+ *	              them the way a full PG redo pass can (BLK_NOTFOUND).  Both stay
+ *	              frozen and forward (extension/truncation -> Stage 5).
+ */
+typedef enum ClusterThreadReplayBlockClass {
+	CLUSTER_THREADREPLAY_BLK_TARGET = 0,
+	CLUSTER_THREADREPLAY_BLK_OUT_OF_SCOPE,
+	CLUSTER_THREADREPLAY_BLK_BLOCKED,
+} ClusterThreadReplayBlockClass;
+
+/*
+ *	which_for    cluster_smgr_which_for(rlocator, InvalidBackendId): 1 == routes
+ *	             to genuinely shared storage, 0 == per-node md.c.
+ *	rel_exists   smgrexists(reln, forknum) (amend 1: a missing file fails closed,
+ *	             never a BLK_NOTFOUND-style skip -- there is no storage rmgr here).
+ *	blocknum     the record's target block; nblocks = smgrnblocks(reln, forknum).
+ */
+static inline ClusterThreadReplayBlockClass
+cluster_thread_replay_classify_block(int which_for, bool rel_exists, BlockNumber blocknum,
+									 BlockNumber nblocks)
+{
+	if (which_for != 1)
+		return CLUSTER_THREADREPLAY_BLK_OUT_OF_SCOPE; /* per-node: data-pass skip */
+	if (!rel_exists)
+		return CLUSTER_THREADREPLAY_BLK_BLOCKED; /* dropped: fail-closed (amend 1) */
+	if (blocknum >= nblocks)
+		return CLUSTER_THREADREPLAY_BLK_BLOCKED; /* extension / new page: forward */
+	return CLUSTER_THREADREPLAY_BLK_TARGET;
+}
+
+/*
+ * Streaming-replay outcome counters (spec-4.11 D1 increment 3a, observability).
+ * recovered_through is the EndRecPtr of the LAST record every block reference of
+ * which was handled cleanly; it advances only after a whole record is processed
+ * without a BLOCKED, so a fail-closed never leaves it claiming an unfinished
+ * record (8.A).
+ *
+ * blocks_applied counts smgrwrite WRITE-BACKs, NOT durable writes: cluster_fs
+ * write is a bare pwrite with no inline fsync (amend 2).  3a does not publish
+ * authority, so a write-back that has not reached disk is safe (a crash before
+ * 3b's durability barrier re-replays from a validated lower bound, redo-
+ * idempotent via the LSN-gate).  3b MUST fsync the touched relations BEFORE
+ * publishing any 3-way authority, or authority could outlive un-fsync'd pages.
+ */
+typedef struct ClusterThreadReplayStats {
+	uint64 records_scanned;
+	uint64 blocks_applied;		  /* APPLIED -> smgrwrite (write-back; NOT durable) */
+	uint64 blocks_gated;		  /* DONE: LSN-gate idempotent skip */
+	uint64 blocks_out_of_scope;	  /* OUT_OF_SCOPE: per-node block refs skipped */
+	XLogRecPtr recovered_through; /* EndRecPtr of last fully-processed record */
+} ClusterThreadReplayStats;
+
 #ifndef FRONTEND
 
 /* GUC storage (defined in cluster_guc.c). */
@@ -135,6 +205,41 @@ extern ClusterThreadRecResult cluster_thread_recovery_replay_one(uint16 dead_tid
  * later increment.
  */
 extern bool cluster_thread_recovery_local_complete(uint16 dead_tid, XLogRecPtr required_lsn);
+
+/*
+ * RMW replay engine (spec-4.11 D1 increment 3a).  Read each record of a
+ * positioned WAL reader, and for every block reference to a genuinely shared
+ * user-relation page: read the LIVE page from shared storage, apply the record
+ * (LSN-gated, idempotent), and write the page back -- bypassing the buffer pool
+ * (the dead thread's pages are fenced for the freeze window, so there is no
+ * concurrent access = the coherence precondition).
+ *
+ * cluster_thread_recovery_replay_stream is the SOURCE-AGNOSTIC core: the caller
+ * owns the positioned reader (amend 4).  3a builds a local-WAL reader; 3b will
+ * build the foreign dead-thread reader and call the same core.  It does NOT
+ * publish authority, start a worker, or unfreeze -- that is 3b.
+ *
+ * PRECONDITION (amend 3): scan_upper MUST be a validated-complete AND durable
+ * dead-thread WAL boundary; the engine does NOT flush WAL.  Reaching clean
+ * end-of-WAL short of scan_upper means the WAL is incomplete -> BLOCKED (8.A).
+ *
+ * Returns DONE (recovered_through reached scan_upper) or BLOCKED (fail-closed:
+ * read error, off-matrix/unusable record, dropped relation, extension, or an
+ * incomplete window).  *stats is always written (NULL allowed).
+ */
+extern ClusterThreadRecResult
+cluster_thread_recovery_replay_stream(struct XLogReaderState *reader, XLogRecPtr scan_upper,
+									  ClusterThreadReplayStats *stats);
+
+/*
+ * 3a-LOCAL / TEST convenience: build a local-WAL reader over [scan_lower,
+ * scan_upper], position it, and drive cluster_thread_recovery_replay_stream.
+ * LOCAL source only (single-machine test simulates a foreign thread with local
+ * WAL); 3b adds the foreign-source entry calling the same core.
+ */
+extern ClusterThreadRecResult cluster_thread_recovery_replay_data(XLogRecPtr scan_lower,
+																  XLogRecPtr scan_upper,
+																  ClusterThreadReplayStats *stats);
 
 #endif /* !FRONTEND */
 
