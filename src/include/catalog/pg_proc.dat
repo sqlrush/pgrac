@@ -12645,6 +12645,34 @@
   proargnames => '{dead_node}',
   prosrc => 'cluster_thread_recovery_launch_test' },
 
+# spec-4.11 D1 increment 3b-4b Part 4 e2e: READ-ONLY observer of a dead thread's
+# online replay-state slot (idle 0 / replaying 1 / done 2 / blocked 3; -1 noslot),
+# so a TAP can watch the FSM-launched worker drive the slot without perturbing it.
+# Superuser-only.
+{ oid => '8945',
+  descr => 'TEST-ONLY: read online thread-recovery 3b-4b replay-state slot (spec-4.11)',
+  proname => 'cluster_thread_replay_slot_state_test',
+  proisstrict => 'f',
+  provolatile => 'v', proparallel => 'u',
+  prorettype => 'int4',
+  proargtypes => 'int4',
+  proargnames => '{dead_tid}',
+  prosrc => 'cluster_thread_replay_slot_state_test' },
+
+# spec-4.11 D1 increment 3b-4b Part 4 e2e: drive a SYNTHETIC reconfig episode on
+# this node (coordinator) marking dead_node dead, so the e2e exercises the real
+# inject -> lmon GRD recovery FSM -> WAIT_CLUSTER -> launch_workers wiring without a
+# real peer death + CSSD deadband.  Superuser-only.
+{ oid => '8946',
+  descr => 'TEST-ONLY: inject a synthetic dead-node reconfig episode (spec-4.11)',
+  proname => 'cluster_reconfig_inject_dead_node_test',
+  proisstrict => 'f',
+  provolatile => 'v', proparallel => 'u',
+  prorettype => 'bool',
+  proargtypes => 'int4',
+  proargnames => '{dead_node}',
+  prosrc => 'cluster_reconfig_inject_dead_node_test' },
+
 # spec-4.10 D2: reconstruct one block via the online single-block recovery
 # orchestrator over an explicit WAL window, for the byte-for-byte differential
 # vs PG real crash-recovery redo.  Returns the reconstructed page as bytea, or

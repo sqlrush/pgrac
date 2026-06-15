@@ -56,6 +56,8 @@ PG_FUNCTION_INFO_V1(cluster_thread_gate_unfreeze_test);
 PG_FUNCTION_INFO_V1(cluster_thread_replay_slot_test);
 PG_FUNCTION_INFO_V1(cluster_thread_recovery_worker_run_test);
 PG_FUNCTION_INFO_V1(cluster_thread_recovery_launch_test);
+PG_FUNCTION_INFO_V1(cluster_thread_replay_slot_state_test);
+PG_FUNCTION_INFO_V1(cluster_reconfig_inject_dead_node_test);
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -64,8 +66,11 @@ PG_FUNCTION_INFO_V1(cluster_thread_recovery_launch_test);
 #include "utils/builtins.h"
 #include "utils/pg_lsn.h"
 
-#include "cluster/cluster_conf.h" /* CLUSTER_MAX_NODES (dead bitmap width) */
-#include "cluster/cluster_grd.h"  /* live recovery episode epoch (worker L235 test) */
+#include "cluster/cluster_conf.h"	  /* CLUSTER_MAX_NODES (dead bitmap width) */
+#include "cluster/cluster_cssd.h"	  /* cluster_cssd_get_dead_generation (inject) */
+#include "cluster/cluster_grd.h"	  /* live recovery episode epoch (worker L235 test) */
+#include "cluster/cluster_guc.h"	  /* cluster_node_id (inject coordinator) */
+#include "cluster/cluster_reconfig.h" /* synthetic reconfig inject (Part 4 e2e) */
 #include "cluster/cluster_thread_recovery.h"
 
 static const char *
@@ -389,6 +394,83 @@ cluster_thread_recovery_launch_test(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(cstring_to_text(psprintf("%d", (int)state)));
 }
 
+/*
+ * cluster_thread_replay_slot_state_test -- READ-ONLY observer of a dead thread's
+ * online replay-state shmem slot (spec-4.11 3b-4b Part 4 e2e).  Unlike
+ * cluster_thread_replay_slot_test (which round-trips / mutates the slot), this
+ * only reads the current state so a TAP can watch the slot transition
+ * IDLE -> REPLAYING -> BLOCKED as the reconfig FSM launches the executor worker
+ * and the worker fails closed on an unrecoverable dead thread, WITHOUT perturbing
+ * it.  Returns the ClusterThreadRecReplayState int (idle 0 / replaying 1 /
+ * done 2 / blocked 3), or -1 when dead_tid names no slot.  TEST-ONLY, superuser.
+ */
+Datum
+cluster_thread_replay_slot_state_test(PG_FUNCTION_ARGS)
+{
+	int32 dead_tid;
+	ClusterThreadRecReplayState state;
+
+	if (!superuser())
+		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						errmsg("cluster_thread_replay_slot_state_test is superuser-only")));
+
+	if (PG_ARGISNULL(0))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("dead_tid must not be NULL")));
+
+	dead_tid = PG_GETARG_INT32(0);
+	/* Out-of-uint16 ids fail closed in the accessor's range gate (-> noslot). */
+	if (dead_tid < 0 || dead_tid > PG_UINT16_MAX)
+		dead_tid = 0;
+
+	if (!cluster_thread_recovery_replay_read((uint16)dead_tid, &state, NULL))
+		PG_RETURN_INT32(-1);
+
+	PG_RETURN_INT32((int32)state);
+}
+
+/*
+ * cluster_reconfig_inject_dead_node_test -- drive a SYNTHETIC reconfig episode on
+ * THIS node as coordinator (spec-4.11 3b-4b Part 4 e2e), marking dead_node dead in
+ * the reconfig dead bitmap.  This publishes a ReconfigEvent the local lmon GRD
+ * recovery FSM consumes on its next tick, so the e2e can exercise the REAL
+ * inject -> FSM -> WAIT_CLUSTER -> launch_workers wiring deterministically, without
+ * relying on a real peer death + CSSD deadband (the t/099 path).  The dead node is
+ * NOT actually killed; the survivor recovers an (intentionally non-recoverable in
+ * this single-machine harness) foreign thread and stays fail-closed frozen.
+ *
+ * The bit convention mirrors cluster_reconfig.c dead_bitmap_set_bit():
+ * node n -> byte n/8, bit n%8 (the GRD FSM maps it to word n/64, bit n%64).
+ * TEST-ONLY, superuser-only.
+ */
+Datum
+cluster_reconfig_inject_dead_node_test(PG_FUNCTION_ARGS)
+{
+	int32 dead_node;
+	uint8 dead_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+
+	if (!superuser())
+		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						errmsg("cluster_reconfig_inject_dead_node_test is superuser-only")));
+
+	if (PG_ARGISNULL(0))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("dead_node must not be NULL")));
+
+	dead_node = PG_GETARG_INT32(0);
+	if (dead_node < 0 || dead_node >= CLUSTER_MAX_NODES)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("dead_node %d out of range [0, %d)", dead_node, CLUSTER_MAX_NODES)));
+
+	memset(dead_bitmap, 0, sizeof(dead_bitmap));
+	dead_bitmap[dead_node / 8] |= (uint8)(1u << (dead_node % 8));
+
+	cluster_reconfig_apply_epoch_bump_as_coordinator(dead_bitmap, cluster_node_id,
+													 cluster_cssd_get_dead_generation());
+
+	PG_RETURN_BOOL(true);
+}
+
 #else /* !USE_PGRAC_CLUSTER */
 
 Datum
@@ -438,6 +520,20 @@ cluster_thread_recovery_launch_test(PG_FUNCTION_ARGS pg_attribute_unused())
 {
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("cluster_thread_recovery_launch_test requires --enable-cluster")));
+}
+
+Datum
+cluster_thread_replay_slot_state_test(PG_FUNCTION_ARGS pg_attribute_unused())
+{
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cluster_thread_replay_slot_state_test requires --enable-cluster")));
+}
+
+Datum
+cluster_reconfig_inject_dead_node_test(PG_FUNCTION_ARGS pg_attribute_unused())
+{
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cluster_reconfig_inject_dead_node_test requires --enable-cluster")));
 }
 
 #endif /* USE_PGRAC_CLUSTER */

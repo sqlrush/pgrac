@@ -25,6 +25,22 @@
  *	  (LookupBackgroundWorkerFunction); same pattern as
  *	  ParallelApplyWorkerMain.
  *
+ * PGRAC MODIFICATIONS (spec-4.11 D1 increment 3b-4b)
+ *
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *	Spec: spec-4.11-thread-recovery.md
+ *
+ *	What changed:
+ *	  - InternalBGWorkers[]: added cluster_thread_recovery_worker_main,
+ *	    the per-episode online thread-recovery executor (the reconfig FSM
+ *	    registers it dynamically in cluster_thread_recovery_worker.c).
+ *
+ *	Why:
+ *	  Same reason as the spec-4.4 entry above: an in-core dynamic-bgworker
+ *	  entry point named with bgw_library_name="postgres" must be resolvable
+ *	  through this table, else RegisterDynamicBackgroundWorker starts the
+ *	  worker but it dies with "internal function not found".
+ *
  *-------------------------------------------------------------------------
  */
 
@@ -41,7 +57,8 @@
 #include "replication/logicallauncher.h"
 #include "replication/logicalworker.h"
 #ifdef USE_PGRAC_CLUSTER
-#include "cluster/cluster_recovery_worker.h" /* PGRAC: worker entry (spec-4.4) */
+#include "cluster/cluster_recovery_worker.h"  /* PGRAC: worker entry (spec-4.4) */
+#include "cluster/cluster_thread_recovery.h" /* PGRAC: worker entry (spec-4.11) */
 #endif
 #include "storage/dsm.h"
 #include "storage/ipc.h"
@@ -157,6 +174,10 @@ static const struct
 	/* PGRAC: recovery stream-validation worker (spec-4.4). */
 	{
 		"cluster_recovery_worker_main", cluster_recovery_worker_main
+	},
+	/* PGRAC: online thread-recovery executor (spec-4.11 3b-4b). */
+	{
+		"cluster_thread_recovery_worker_main", cluster_thread_recovery_worker_main
 	},
 #endif
 };
