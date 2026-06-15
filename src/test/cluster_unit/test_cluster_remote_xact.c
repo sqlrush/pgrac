@@ -165,10 +165,62 @@ UT_TEST(test_remote_xact_indoubt_is_zero)
 }
 
 
+/* ============================================================
+ * R13 online-blocked elevel boundary (spec-4.11 3b-2)
+ * ============================================================ */
+
+UT_TEST(test_remote_xact_blocked_elevel_cold_is_fatal)
+{
+	/* Cold merged replay (online=false) keeps the pre-spec-4.11 FATAL: a clean
+	 * re-merge on the next startup. */
+	UT_ASSERT_EQ(cluster_remote_xact_blocked_elevel(false), FATAL);
+}
+
+UT_TEST(test_remote_xact_blocked_elevel_online_is_catchable)
+{
+	/* Online thread recovery (online=true) raises a CATCHABLE ERROR so the R13
+	 * harness can demote it to BLOCKED and the survivor keeps running.  The
+	 * producer (ERROR) must sit strictly below the consumer's rethrow boundary
+	 * (cluster_thread_recovery_should_rethrow == elevel >= FATAL), or an online
+	 * block could masquerade as a crash. */
+	UT_ASSERT_EQ(cluster_remote_xact_blocked_elevel(true), ERROR);
+	UT_ASSERT(cluster_remote_xact_blocked_elevel(true) < FATAL);
+	UT_ASSERT(cluster_remote_xact_blocked_elevel(false) >= FATAL);
+}
+
+
+/* ============================================================
+ * R14 materialization-writer admission (spec-4.11 3b-2)
+ * ============================================================ */
+
+UT_TEST(test_remote_xact_writer_allowed_startup)
+{
+	/* The startup process is always a legitimate writer (cold merged replay),
+	 * with or without an online scope. */
+	UT_ASSERT(cluster_remote_xact_writer_allowed(true, 0));
+	UT_ASSERT(cluster_remote_xact_writer_allowed(true, 1));
+}
+
+UT_TEST(test_remote_xact_writer_allowed_online_scope)
+{
+	/* A non-startup process (the recovery-apply bgworker) is admitted ONLY
+	 * inside an episode-fenced online-writer scope (depth > 0). */
+	UT_ASSERT(cluster_remote_xact_writer_allowed(false, 1));
+	UT_ASSERT(cluster_remote_xact_writer_allowed(false, 3)); /* re-entrant */
+}
+
+UT_TEST(test_remote_xact_writer_denied_outside_scope)
+{
+	/* Not startup AND no online scope -> illegal context: fail closed (the
+	 * assert must trip rather than let a stray writer corrupt the store). */
+	UT_ASSERT(!cluster_remote_xact_writer_allowed(false, 0));
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(13);
 	UT_RUN(test_remote_xact_entry_width);
 	UT_RUN(test_remote_xact_origin_partition_disjoint);
 	UT_RUN(test_remote_xact_origin_no_cross_partition_overlap);
@@ -176,6 +228,13 @@ main(void)
 	UT_RUN(test_remote_xact_side_effects_blocked);
 	UT_RUN(test_remote_xact_unrelated_xinfo_not_blocked);
 	UT_RUN(test_remote_xact_indoubt_is_zero);
+
+	UT_RUN(test_remote_xact_blocked_elevel_cold_is_fatal);
+	UT_RUN(test_remote_xact_blocked_elevel_online_is_catchable);
+	UT_RUN(test_remote_xact_writer_allowed_startup);
+	UT_RUN(test_remote_xact_writer_allowed_online_scope);
+	UT_RUN(test_remote_xact_writer_denied_outside_scope);
+
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -161,13 +161,16 @@ merged_authority_path(int origin_node, char *buf, size_t buf_size)
 }
 
 /*
- * cluster_merged_authority_publish -- record local read authority for one
- *	materialized origin (startup process, end of merged replay).  FATAL on
- *	any failure: the materialized state would otherwise be unreachable to
- *	readers, and a clean FATAL re-merges on the next start.
+ * merged_authority_publish_impl -- write the node-local read-authority marker.
+ *
+ *	elevel selects the fail-closed severity (spec-4.11 3b-2, R13).  Cold merged
+ *	replay (startup) passes FATAL: an unreachable marker re-merges cleanly on the
+ *	next start.  Online thread recovery passes ERROR (catchable): the orchestrator
+ *	runs this under its R13 harness, so a marker write failure demotes to BLOCKED
+ *	and the survivor keeps running, having published NO serving authority (8.A).
  */
-void
-cluster_merged_authority_publish(int origin_node, uint64 recovered_lsn)
+static void
+merged_authority_publish_impl(int origin_node, uint64 recovered_lsn, int elevel)
 {
 	ClusterMergedAuthorityFile f;
 	char dir[MAXPGPATH];
@@ -190,9 +193,9 @@ cluster_merged_authority_publish(int origin_node, uint64 recovered_lsn)
 	dret = snprintf(dir, sizeof(dir), "%s/pg_undo/instance_%d", DataDir, origin_node);
 	if (dret < 0 || (size_t)dret >= sizeof(dir)
 		|| merged_authority_path(origin_node, path, sizeof(path)) < 0)
-		ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
-						errmsg("merged recovery: authority marker path too long for origin %d",
-							   origin_node)));
+		ereport(elevel, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+						 errmsg("merged recovery: authority marker path too long for origin %d",
+								origin_node)));
 	if (mkdir(dir, S_IRWXU) == 0) {
 		/* Freshly created (an origin merged without undo records): the new
 		 * dirent must be durable too, or a crash strands the marker in an
@@ -203,23 +206,48 @@ cluster_merged_authority_publish(int origin_node, uint64 recovered_lsn)
 		if (snprintf(parent, sizeof(parent), "%s/pg_undo", DataDir) < (int)sizeof(parent))
 			fsync_fname(parent, true);
 	} else if (errno != EEXIST)
-		ereport(FATAL, (errcode_for_file_access(),
-						errmsg("merged recovery: could not create \"%s\": %m", dir)));
+		ereport(elevel, (errcode_for_file_access(),
+						 errmsg("merged recovery: could not create \"%s\": %m", dir)));
 
 	fd = OpenTransientFile(path, O_CREAT | O_TRUNC | O_WRONLY | PG_BINARY);
 	if (fd < 0)
-		ereport(FATAL,
+		ereport(elevel,
 				(errcode_for_file_access(),
 				 errmsg("merged recovery: could not create authority marker \"%s\": %m", path)));
 	if (write(fd, &f, sizeof(f)) != sizeof(f) || pg_fsync(fd) != 0)
-		ereport(FATAL,
+		ereport(elevel,
 				(errcode_for_file_access(),
 				 errmsg("merged recovery: could not write authority marker \"%s\": %m", path)));
 	if (CloseTransientFile(fd) != 0)
-		ereport(FATAL,
+		ereport(elevel,
 				(errcode_for_file_access(),
 				 errmsg("merged recovery: could not close authority marker \"%s\": %m", path)));
 	fsync_fname(dir, true);
+}
+
+/*
+ * cluster_merged_authority_publish -- record local read authority for one
+ *	materialized origin (startup process, end of merged replay).  FATAL on
+ *	any failure: the materialized state would otherwise be unreachable to
+ *	readers, and a clean FATAL re-merges on the next start.
+ */
+void
+cluster_merged_authority_publish(int origin_node, uint64 recovered_lsn)
+{
+	merged_authority_publish_impl(origin_node, recovered_lsn, FATAL);
+}
+
+/*
+ * cluster_merged_authority_publish_online -- the spec-4.11 3b-2 online variant:
+ *	same marker, but a failure raises a CATCHABLE ERROR so the thread-recovery
+ *	orchestrator's R13 harness demotes it to BLOCKED (the survivor keeps running
+ *	and publishes no serving authority).  Called only after a full DONE replay +
+ *	durability barrier, as the LAST of the 3-way authority writes.
+ */
+void
+cluster_merged_authority_publish_online(int origin_node, uint64 recovered_lsn)
+{
+	merged_authority_publish_impl(origin_node, recovered_lsn, ERROR);
 }
 
 /*

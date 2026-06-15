@@ -298,5 +298,9 @@ extern bool cluster_merged_instance_is_materialized(int origin_node);
 extern uint64 cluster_merged_instance_recovered_through(int origin_node);
 extern bool cluster_merged_any_remote_materialized(void);
 extern void cluster_merged_authority_publish(int origin_node, uint64 recovered_lsn);
+/* spec-4.11 3b-2 (R13): online variant -- a failure raises a CATCHABLE ERROR so
+ * the thread-recovery orchestrator's harness demotes it to BLOCKED (no serving
+ * authority published; survivor keeps running). */
+extern void cluster_merged_authority_publish_online(int origin_node, uint64 recovered_lsn);
 
 #endif /* CLUSTER_RECOVERY_MERGE_H */

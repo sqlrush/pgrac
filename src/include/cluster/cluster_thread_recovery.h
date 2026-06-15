@@ -117,6 +117,28 @@ cluster_thread_recovery_decide_scope(bool guc_on, bool has_peers, bool shared_fs
 }
 
 /*
+ * What the orchestrator does on a FINAL BLOCKED (spec-4.11 §3, Q5 policy).
+ * Maps the cluster.thread_recovery_on_unrecoverable GUC (a
+ * ClusterThreadRecAction) to the action: keep_frozen returns the BLOCKED to the
+ * reconfig FSM (the dead thread's resources stay frozen, the survivor keeps
+ * running -- minimum blast radius, 8.A), panic crashes the survivor at
+ * postmaster level (an operator escape valve only).  PURE so the escalation
+ * boundary is unit-pinned (it must NEVER turn keep_frozen into a crash).
+ */
+typedef enum ClusterThreadRecOnBlocked {
+	CLUSTER_THREADREC_ONBLOCKED_KEEP_FROZEN = 0, /* return BLOCKED, survivor lives */
+	CLUSTER_THREADREC_ONBLOCKED_PANIC,			 /* PANIC survivor (escape valve) */
+} ClusterThreadRecOnBlocked;
+
+static inline ClusterThreadRecOnBlocked
+cluster_thread_recovery_decide_on_blocked(int on_unrecoverable_policy)
+{
+	return (on_unrecoverable_policy == CLUSTER_THREADREC_ACTION_PANIC)
+			   ? CLUSTER_THREADREC_ONBLOCKED_PANIC
+			   : CLUSTER_THREADREC_ONBLOCKED_KEEP_FROZEN;
+}
+
+/*
  * Per-block-reference classification for the RMW replay engine (spec-4.11 D1
  * increment 3a).  PURE, so it is the unit-testable authority for the
  * corruption-critical gate (mirrors cluster_thread_apply_decide): the .c engine
@@ -185,11 +207,52 @@ typedef struct ClusterThreadReplayStats {
 
 #ifndef FRONTEND
 
-#include "utils/elog.h" /* elevel constants for the R13 rethrow boundary */
+#include "utils/elog.h"				/* elevel constants for the R13 rethrow boundary */
+#include "storage/relfilelocator.h" /* RelFileLocator for the touched-rel collector */
 
 /* GUC storage (defined in cluster_guc.c). */
 extern bool cluster_online_thread_recovery;
 extern int cluster_thread_recovery_on_unrecoverable;
+
+/*
+ * Visibility context for the combined replay pass (spec-4.11 3b-2).  3a replayed
+ * DATA only; 3b-2 weaves the foreign-outcome visibility pass into the SAME
+ * per-record loop so one completeness gate covers both: after a record's data
+ * block refs apply cleanly, an RM_XACT / RM_CLOG / RM_MULTIXACT / RM_COMMIT_TS
+ * record is diverted to cluster_remote_xact_apply(origin_node, .., online=true)
+ * -- the online analog of the cold merge loop's XACT/CLOG divert
+ * (xlogrecovery.c).  Without it, a survivor recovers the dead thread's pages but
+ * not its commit/abort outcomes -> false-visible (8.A).  do_visibility=false
+ * reproduces the 3a data-only stream exactly (the 3a-local / test callers).
+ */
+typedef struct ClusterThreadVisCtx {
+	bool do_visibility; /* false = 3a data-only; true = data + visibility pass */
+	int origin_node;	/* per-origin outcome store key = dead thread id - 1 */
+} ClusterThreadVisCtx;
+
+/*
+ * Touched-relation collector for the durability barrier (spec-4.11 3b-2,
+ * amend 2).  The engine's smgrwrite is a WRITE-BACK (cluster_fs is a bare pwrite
+ * with no inline fsync and does NOT register a checkpointer sync request), so a
+ * live survivor's checkpoint never learns of these dead-origin page writes.
+ * The orchestrator MUST therefore smgrimmedsync every relation the engine wrote
+ * BEFORE publishing any 3-way authority, or a published "recovered" authority
+ * could outlive un-fsync'd pages -> serve a stale page after a crash (8.A).  The
+ * engine appends each APPLIED (RelFileLocator, ForkNumber) here (deduplicated);
+ * the orchestrator syncs them all on DONE.  NULL = do not collect (data-only /
+ * test callers that publish nothing).
+ */
+typedef struct ClusterThreadTouchedRel {
+	RelFileLocator rlocator;
+	ForkNumber forknum;
+} ClusterThreadTouchedRel;
+
+typedef struct ClusterThreadTouchedRels {
+	ClusterThreadTouchedRel *items;
+	int n;
+	int cap;
+	MemoryContext mcxt; /* context the items array grows in (set by the caller) */
+} ClusterThreadTouchedRels;
 
 /*
  * R13 error-demotion boundary (spec-4.11 3b-1, amend 1).  The online driver
@@ -249,6 +312,29 @@ cluster_thread_recovery_replay_stream(struct XLogReaderState *reader, XLogRecPtr
 									  ClusterThreadReplayStats *stats);
 
 /*
+ * cluster_thread_recovery_replay_stream_ex (spec-4.11 3b-2) -- the same core,
+ * extended with the COMBINED pass: when vis->do_visibility, each foreign
+ * XACT/CLOG/MULTIXACT/COMMIT_TS record is diverted to the per-origin outcome
+ * store (online), so one completeness gate covers data AND visibility; and when
+ * touched != NULL, every APPLIED (rel, fork) is recorded for the orchestrator's
+ * durability barrier.  vis == NULL / touched == NULL reproduce the 3a data-only
+ * behaviour exactly (cluster_thread_recovery_replay_stream is the vis=NULL,
+ * touched=NULL wrapper).  An online visibility ERROR propagates out (the
+ * caller's R13 harness demotes it -> BLOCKED).
+ */
+extern ClusterThreadRecResult cluster_thread_recovery_replay_stream_ex(
+	struct XLogReaderState *reader, XLogRecPtr scan_upper, const ClusterThreadVisCtx *vis,
+	ClusterThreadTouchedRels *touched, ClusterThreadReplayStats *stats);
+
+/*
+ * Durability-barrier helpers for the touched-rel collector (spec-4.11 3b-2).
+ * _sync_all smgrimmedsyncs every collected (rel, fork) -- the orchestrator calls
+ * it on DONE, before publishing authority.  _free releases the items array.
+ */
+extern void cluster_thread_recovery_touched_sync_all(const ClusterThreadTouchedRels *touched);
+extern void cluster_thread_recovery_touched_free(ClusterThreadTouchedRels *touched);
+
+/*
  * 3a-LOCAL / TEST convenience: build a local-WAL reader over [scan_lower,
  * scan_upper], position it, and drive cluster_thread_recovery_replay_stream.
  * LOCAL source only (single-machine test simulates a foreign thread with local
@@ -279,6 +365,38 @@ extern ClusterThreadRecResult cluster_thread_recovery_drive_data(uint16 dead_tid
 																 XLogRecPtr scan_lower,
 																 XLogRecPtr scan_upper,
 																 ClusterThreadReplayStats *stats);
+
+/*
+ * GENERAL R13-guarded driver (spec-4.11 3b-2).  Builds the dead thread's reader
+ * and drives cluster_thread_recovery_replay_stream_ex under the same R13
+ * harness as drive_data, but with an optional visibility pass + touched-rel
+ * collector.  cluster_thread_recovery_drive_data is the vis-off / no-collector
+ * wrapper (3b-1).  vis/touched may be NULL.  Same fail-closed + FATAL-rethrow
+ * contract as drive_data.
+ */
+extern ClusterThreadRecResult cluster_thread_recovery_drive(uint16 dead_tid, XLogRecPtr scan_lower,
+															XLogRecPtr scan_upper,
+															const ClusterThreadVisCtx *vis,
+															ClusterThreadTouchedRels *touched,
+															ClusterThreadReplayStats *stats);
+
+/*
+ * ORCHESTRATOR core (spec-4.11 3b-2), window-EXPLICIT.  Online-recover ONE dead
+ * thread over [scan_lower, scan_upper]: drive the combined data+visibility pass
+ * under the R13 harness inside an episode-fenced online-writer scope; on DONE,
+ * issue the durability barrier (immedsync touched rels + flush the outcome
+ * store) and publish the 3-way authority (registry skip-bound + node-local
+ * reader authority); on BLOCKED, publish NOTHING (partial-apply = "never
+ * recovered", 8.A) and apply the on_unrecoverable policy.  This is what the
+ * public replay_one calls after deriving the window; it is also the TEST entry
+ * (the SRF drives it with an explicit, deterministic window on one machine).
+ * Real validated-boundary derivation for replay_one(dead_tid, epoch) is D4
+ * (3b-4); 3b-2 derives only a basic window.
+ */
+extern ClusterThreadRecResult
+cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower,
+										  XLogRecPtr scan_upper, uint64 episode_epoch,
+										  ClusterThreadReplayStats *stats);
 
 #endif /* !FRONTEND */
 

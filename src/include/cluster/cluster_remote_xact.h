@@ -56,6 +56,7 @@
 #include "access/xlogdefs.h"
 #include "cluster/cluster_scn.h"
 #include "storage/block.h" /* BLCKSZ */
+#include "utils/elog.h"	   /* ERROR / FATAL for the R13 online-blocked elevel */
 
 struct XLogReaderState; /* forward; avoid xlogreader.h in this header */
 
@@ -100,6 +101,45 @@ cluster_remote_xact_commit_blocked(int nrels, int nmsgs, int nstats, int nsubxac
 }
 
 /*
+ * R13 (spec-4.11 3b-2): the elevel cluster_remote_xact_apply raises when a
+ * foreign record cannot be materialized (multixact/commit_ts, an unsupported
+ * commit/abort side effect, a missing SCN, or a 2PC/assignment record).
+ *
+ *	COLD merged replay (startup, online=false) -> FATAL: a clean re-merge on the
+ *	next start, exactly as before this spec.
+ *	ONLINE thread recovery (online=true) -> ERROR: catchable, so the 3b-1 R13
+ *	harness (cluster_thread_recovery_drive*) demotes it to a result-returning
+ *	BLOCKED and the recovery-apply worker SURVIVES + keep_frozen, instead of
+ *	crashing the live survivor.
+ *
+ * PURE so the boundary is unit-pinned.  It is the producer side of the R13
+ * contract whose consumer side is cluster_thread_recovery_should_rethrow:
+ * ERROR < FATAL, so an online block is always demotable and a cold FATAL never
+ * is (a survivor crash the cold path intended can never masquerade as BLOCKED).
+ */
+static inline int
+cluster_remote_xact_blocked_elevel(bool online)
+{
+	return online ? ERROR : FATAL;
+}
+
+/*
+ * R14 (spec-4.11 3b-2): may THIS process write the per-origin materialization
+ * store right now?  Historically the writer was the startup process ONLY
+ * (single-threaded cold merged replay; see cluster_remote_xact_set's assert).
+ * Online thread recovery adds one more legitimate writer -- the recovery-apply
+ * bgworker -- but ONLY inside an episode-fenced online-writer scope
+ * (cluster_remote_xact_online_writer_push/pop).  Outside startup AND outside
+ * that scope, a writer is in an illegal context: the assert must fail closed.
+ * PURE so the corruption-critical writer assert is unit-pinned.
+ */
+static inline bool
+cluster_remote_xact_writer_allowed(bool is_startup, int online_writer_depth)
+{
+	return is_startup || online_writer_depth > 0;
+}
+
+/*
  * Resolver verdict.  INDOUBT is the fail-closed arm: a TT pre-commit
  * stamp without a materialized commit/abort record proves nothing.
  */
@@ -122,11 +162,27 @@ extern void cluster_remote_xact_shmem_init(void);
  *	unsupported side effect (nrels / nmsgs / nstats / nsubxacts / 2PC /
  *	AE locks; foreign MULTIXACT and COMMIT_TS divert here too) is
  *	fail-closed 53RA3 (P1-1) -- never silently skipped.
+ *
+ *	online (spec-4.11 3b-2, R13): false = cold merged replay (startup) -> an
+ *	unmaterializable record FATALs (re-merge next start).  true = online thread
+ *	recovery -> it raises a catchable ERROR (cluster_remote_xact_blocked_elevel)
+ *	so the R13 harness demotes it to BLOCKED and the survivor keeps running.
  */
-extern void cluster_remote_xact_apply(int origin_node, struct XLogReaderState *record);
+extern void cluster_remote_xact_apply(int origin_node, struct XLogReaderState *record, bool online);
 
 /* Flush dirty SLRU pages to pg_xact_remote/ (merged-replay completion). */
 extern void cluster_remote_xact_flush(void);
+
+/*
+ * Online-writer scope (spec-4.11 3b-2, R14).  The online thread-recovery
+ * orchestrator brackets its visibility apply so cluster_remote_xact_set's
+ * startup-only assert admits the episode-fenced recovery-apply bgworker writer.
+ * Re-entrant (depth-counted); push/pop MUST balance.  _depth() is for
+ * observability / unit tests.
+ */
+extern void cluster_remote_xact_online_writer_push(void);
+extern void cluster_remote_xact_online_writer_pop(void);
+extern int cluster_remote_xact_online_writer_depth(void);
 
 /*
  * cluster_remote_commit_outcome -- D10c authority read.

@@ -610,7 +610,12 @@
  * cluster_thread_drive_test (oid 8936) -- drives the online thread-recovery data
  * driver over a dead thread's per-thread WAL under the R13 harness.  One pg_proc
  * row -> bump. */
-#define CATALOG_VERSION_NO 202606144
+/* spec-4.11 D1 increment 3b-2 (2026-06-15): pg_proc gains two TEST-ONLY entries
+ * cluster_thread_replay_one_test (oid 8937) + cluster_thread_replay_one_auto_test
+ * (oid 8938) -- drive the online thread-recovery orchestrator (combined data +
+ * visibility pass + durability barrier + 3-way authority publish).  Two pg_proc
+ * rows -> bump. */
+#define CATALOG_VERSION_NO 202606145
 
 /* spec-2.39 D10 (2026-05-21):  SI Broadcaster production activation —
  * DDL commit hook (AtEOXact_Inval + COMMIT PREPARED via cluster-aware

@@ -12545,6 +12545,34 @@
   proargnames => '{dead_tid,scan_lower,scan_upper}',
   prosrc => 'cluster_thread_drive_test' },
 
+# spec-4.11 D1 increment 3b-2: drive the online thread-recovery ORCHESTRATOR
+# (combined data + visibility pass + durability barrier + 3-way authority
+# publish) over an explicit, deterministic window.  Returns a ':'-delimited
+# summary (result:records:applied:gated:out_of_scope:recovered_through).
+# Superuser-only.
+{ oid => '8937',
+  descr => 'TEST-ONLY: online thread-recovery orchestrator over an explicit window (spec-4.11)',
+  proname => 'cluster_thread_replay_one_test',
+  proisstrict => 'f',
+  provolatile => 'v', proparallel => 'u',
+  prorettype => 'text',
+  proargtypes => 'int4 pg_lsn pg_lsn',
+  proargnames => '{dead_tid,scan_lower,scan_upper}',
+  prosrc => 'cluster_thread_replay_one_test' },
+
+# spec-4.11 D1 increment 3b-2: drive the FSM-facing replay_one (scope gate +
+# basic window derivation).  Returns not_applicable on a single node / no shared
+# data backend (the common single-machine case).  Superuser-only.
+{ oid => '8938',
+  descr => 'TEST-ONLY: online thread-recovery scope gate + basic window (spec-4.11)',
+  proname => 'cluster_thread_replay_one_auto_test',
+  proisstrict => 'f',
+  provolatile => 'v', proparallel => 'u',
+  prorettype => 'text',
+  proargtypes => 'int4',
+  proargnames => '{dead_tid}',
+  prosrc => 'cluster_thread_replay_one_auto_test' },
+
 # spec-4.10 D2: reconstruct one block via the online single-block recovery
 # orchestrator over an explicit WAL window, for the byte-for-byte differential
 # vs PG real crash-recovery redo.  Returns the reconstructed page as bytea, or

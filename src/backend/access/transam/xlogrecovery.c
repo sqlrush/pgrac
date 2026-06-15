@@ -2204,7 +2204,10 @@ cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start, Ti
 			if (rec->xl_rmid == RM_XACT_ID || rec->xl_rmid == RM_CLOG_ID ||
 				rec->xl_rmid == RM_MULTIXACT_ID || rec->xl_rmid == RM_COMMIT_TS_ID) {
 				cluster_recovery_merge_set_scn(rec->xl_scn);
-				cluster_remote_xact_apply((int)thread - 1, r);
+				/* online=false: cold startup merged replay keeps the FATAL
+				 * fail-closed (spec-4.11 3b-2 R13); the online survivor path
+				 * passes true so an unmaterializable record is demotable. */
+				cluster_remote_xact_apply((int)thread - 1, r, false);
 				cluster_vis_bump_merged_records_applied(); /* D11 */
 				goto advance;
 			}

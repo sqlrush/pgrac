@@ -85,8 +85,9 @@
 #include "storage/fd.h"
 #include "utils/wait_event.h"
 
-#include "cluster/cluster_guc.h"	/* cluster_wal_threads_dir */
-#include "cluster/cluster_inject.h" /* CLUSTER_INJECTION_POINT (R13 proof) */
+#include "cluster/cluster_guc.h"		 /* cluster_wal_threads_dir */
+#include "cluster/cluster_inject.h"		 /* CLUSTER_INJECTION_POINT (R13 proof) */
+#include "cluster/cluster_remote_xact.h" /* online-writer scope (R14, spec-4.11 3b-2) */
 #include "cluster/cluster_thread_recovery.h"
 #include "cluster/cluster_wal_state.h" /* CLUSTER_WAL_STATE_SLOT_COUNT */
 
@@ -184,6 +185,7 @@ thread_wal_page_read(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLe
  */
 static ClusterThreadRecResult
 drive_data_inner(uint16 dead_tid, XLogRecPtr scan_lower, XLogRecPtr scan_upper,
+				 const ClusterThreadVisCtx *vis, ClusterThreadTouchedRels *touched,
 				 ClusterThreadReplayStats *stats)
 {
 	ThreadWalReadPrivate *priv;
@@ -258,7 +260,7 @@ drive_data_inner(uint16 dead_tid, XLogRecPtr scan_lower, XLogRecPtr scan_upper,
 		return CLUSTER_THREADREC_BLOCKED; /* cannot position at lower -> fail-closed */
 	}
 
-	res = cluster_thread_recovery_replay_stream(reader, scan_upper, stats);
+	res = cluster_thread_recovery_replay_stream_ex(reader, scan_upper, vis, touched, stats);
 
 	if (priv->seg_fd >= 0)
 		close(priv->seg_fd);
@@ -268,28 +270,39 @@ drive_data_inner(uint16 dead_tid, XLogRecPtr scan_lower, XLogRecPtr scan_upper,
 }
 
 /*
- * cluster_thread_recovery_drive_data -- the public R13-guarded data driver.
+ * cluster_thread_recovery_drive -- the public R13-guarded GENERAL driver
+ *		(spec-4.11 3b-2).
  *
- *	See the file header.  Builds the dead thread's reader, drives the engine, and
- *	demotes a catchable ERROR to BLOCKED (worker survives) while NEVER swallowing
- *	a FATAL/PANIC (amend 1).  Publishes no authority and has no live caller (this
- *	is 3b-1).
+ *	Builds the dead thread's reader and drives the combined replay engine, with
+ *	an optional visibility pass (vis) + touched-rel collector (touched).  Demotes
+ *	a catchable ERROR to BLOCKED (worker survives) while NEVER swallowing a
+ *	FATAL/PANIC (amend 1).  When vis->do_visibility, the whole drive runs inside
+ *	an episode-fenced online-writer scope so the visibility apply's
+ *	cluster_remote_xact_set is admitted (R14); the scope is popped on every
+ *	survivable exit (a re-thrown FATAL tears the process down, so the unpopped
+ *	depth dies with it).
  *
  * Author: SqlRush <sqlrush@gmail.com>
  */
 ClusterThreadRecResult
-cluster_thread_recovery_drive_data(uint16 dead_tid, XLogRecPtr scan_lower, XLogRecPtr scan_upper,
-								   ClusterThreadReplayStats *stats)
+cluster_thread_recovery_drive(uint16 dead_tid, XLogRecPtr scan_lower, XLogRecPtr scan_upper,
+							  const ClusterThreadVisCtx *vis, ClusterThreadTouchedRels *touched,
+							  ClusterThreadReplayStats *stats)
 {
 	volatile ClusterThreadRecResult res = CLUSTER_THREADREC_BLOCKED;
 	MemoryContext caller_ctx = CurrentMemoryContext;
+	bool writer_scope = (vis != NULL && vis->do_visibility);
 
 	if (stats)
 		memset(stats, 0, sizeof(*stats));
 
+	/* R14: admit the visibility apply's per-origin writes from this bgworker. */
+	if (writer_scope)
+		cluster_remote_xact_online_writer_push();
+
 	PG_TRY();
 	{
-		res = drive_data_inner(dead_tid, scan_lower, scan_upper, stats);
+		res = drive_data_inner(dead_tid, scan_lower, scan_upper, vis, touched, stats);
 	}
 	PG_CATCH();
 	{
@@ -299,9 +312,14 @@ cluster_thread_recovery_drive_data(uint16 dead_tid, XLogRecPtr scan_lower, XLogR
 		MemoryContextSwitchTo(caller_ctx);
 		edata = CopyErrorData();
 
-		/* amend 1: a FATAL/PANIC is never demoted -- re-throw it. */
+		/* amend 1: a FATAL/PANIC is never demoted -- re-throw it.  Pop the
+		 * online-writer scope first so the depth balances on the (unlikely)
+		 * chance the re-throw is itself caught further up; a process-fatal
+		 * re-throw makes this moot. */
 		if (cluster_thread_recovery_should_rethrow(edata->elevel)) {
 			FreeErrorData(edata);
+			if (writer_scope)
+				cluster_remote_xact_online_writer_pop();
 			PG_RE_THROW();
 		}
 
@@ -319,7 +337,26 @@ cluster_thread_recovery_drive_data(uint16 dead_tid, XLogRecPtr scan_lower, XLogR
 	}
 	PG_END_TRY();
 
+	if (writer_scope)
+		cluster_remote_xact_online_writer_pop();
+
 	return res;
+}
+
+/*
+ * cluster_thread_recovery_drive_data -- the public R13-guarded DATA driver
+ *		(increment 3b-1): the vis-off / no-collector special case of
+ *		cluster_thread_recovery_drive.  Publishes no authority, does no
+ *		visibility pass, issues no durability barrier (the future replay_one
+ *		orchestrator and the TEST SRF call it).
+ *
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+ClusterThreadRecResult
+cluster_thread_recovery_drive_data(uint16 dead_tid, XLogRecPtr scan_lower, XLogRecPtr scan_upper,
+								   ClusterThreadReplayStats *stats)
+{
+	return cluster_thread_recovery_drive(dead_tid, scan_lower, scan_upper, NULL, NULL, stats);
 }
 
 #else /* !USE_PGRAC_CLUSTER */

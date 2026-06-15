@@ -62,6 +62,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "access/rmgr.h" /* RmgrId + RM_XACT_ID/RM_CLOG_ID/... for the visibility pass */
 #include "access/xlog.h"
 #include "access/xlogreader.h"
 #include "access/xlogrecord.h"
@@ -70,10 +71,86 @@
 #include "storage/bufpage.h"
 #include "storage/relfilelocator.h"
 #include "storage/smgr.h"
+#include "utils/memutils.h" /* MemoryContextAlloc for the touched-rel collector */
 
+#include "cluster/cluster_remote_xact.h" /* online visibility divert (spec-4.11 3b-2) */
 #include "cluster/cluster_thread_recovery.h"
 #include "cluster/cluster_thread_recovery_apply.h"
 #include "cluster/storage/cluster_smgr.h"
+
+/*
+ * touched_add -- record one APPLIED (rel, fork) for the durability barrier
+ *		(spec-4.11 3b-2, amend 2), deduplicated.  The set is usually tiny (the
+ *		relations one dead thread touched in a freeze window), so a linear scan
+ *		is fine; recovery is not a hot path.  Grows in touched->mcxt (the
+ *		orchestrator's context, so it survives the drive).  NULL = do not collect.
+ */
+static void
+touched_add(ClusterThreadTouchedRels *touched, const RelFileLocator *rl, ForkNumber forknum)
+{
+	int i;
+
+	if (touched == NULL)
+		return;
+
+	for (i = 0; i < touched->n; i++) {
+		if (touched->items[i].forknum == forknum
+			&& RelFileLocatorEquals(touched->items[i].rlocator, *rl))
+			return; /* already collected */
+	}
+
+	if (touched->n == touched->cap) {
+		int newcap = (touched->cap == 0) ? 8 : touched->cap * 2;
+		MemoryContext ctx = (touched->mcxt != NULL) ? touched->mcxt : CurrentMemoryContext;
+
+		if (touched->items == NULL)
+			touched->items = (ClusterThreadTouchedRel *)MemoryContextAlloc(
+				ctx, sizeof(ClusterThreadTouchedRel) * newcap);
+		else
+			touched->items = (ClusterThreadTouchedRel *)repalloc(
+				touched->items, sizeof(ClusterThreadTouchedRel) * newcap);
+		touched->cap = newcap;
+	}
+
+	touched->items[touched->n].rlocator = *rl;
+	touched->items[touched->n].forknum = forknum;
+	touched->n++;
+}
+
+/*
+ * cluster_thread_recovery_touched_sync_all -- the durability barrier (spec-4.11
+ *		3b-2, amend 2).  smgrimmedsync (synchronous fsync via the cluster_fs
+ *		backend) every collected (rel, fork) so a published authority can never
+ *		outlive an un-fsync'd dead-origin page write (8.A).  The orchestrator
+ *		calls this on DONE, before publishing any authority.  May ereport on I/O
+ *		failure -- the orchestrator runs it under its R13 harness -> BLOCKED.
+ */
+void
+cluster_thread_recovery_touched_sync_all(const ClusterThreadTouchedRels *touched)
+{
+	int i;
+
+	if (touched == NULL)
+		return;
+
+	for (i = 0; i < touched->n; i++) {
+		SMgrRelation reln = smgropen(touched->items[i].rlocator, InvalidBackendId);
+
+		smgrimmedsync(reln, touched->items[i].forknum);
+	}
+}
+
+void
+cluster_thread_recovery_touched_free(ClusterThreadTouchedRels *touched)
+{
+	if (touched == NULL)
+		return;
+	if (touched->items != NULL)
+		pfree(touched->items);
+	touched->items = NULL;
+	touched->n = 0;
+	touched->cap = 0;
+}
 
 /*
  * replay_one_block -- classify and (if TARGET) read-modify-write one block
@@ -85,7 +162,8 @@
  *	is the caller's scratch (one read-modify-write at a time, no buffer pool).
  */
 static bool
-replay_one_block(XLogReaderState *reader, uint8 block_id, char *page, ClusterThreadReplayStats *st)
+replay_one_block(XLogReaderState *reader, uint8 block_id, char *page,
+				 ClusterThreadTouchedRels *touched, ClusterThreadReplayStats *st)
 {
 	RelFileLocator rl;
 	ForkNumber forknum;
@@ -143,6 +221,9 @@ replay_one_block(XLogReaderState *reader, uint8 block_id, char *page, ClusterThr
 		 */
 		PageSetChecksumInplace((Page)page, blocknum);
 		smgrwrite(reln, forknum, blocknum, page, false);
+		/* Record the write-back for the orchestrator's durability barrier
+		 * (amend 2): a write-back is NOT durable until smgrimmedsync. */
+		touched_add(touched, &rl, forknum);
 		st->blocks_applied++;
 		return true;
 
@@ -168,17 +249,29 @@ replay_one_block(XLogReaderState *reader, uint8 block_id, char *page, ClusterThr
 }
 
 /*
- * cluster_thread_recovery_replay_stream -- source-agnostic RMW replay core.
+ * cluster_thread_recovery_replay_stream_ex -- source-agnostic combined replay
+ *		core (spec-4.11 3b-2 extends the 3a data-only core).
  *
- *	Replays a positioned WAL reader up to scan_upper onto shared storage.  See
- *	the header for the precondition (scan_upper is a validated-durable boundary)
- *	and the DONE / BLOCKED contract.
+ *	Replays a positioned WAL reader up to scan_upper onto shared storage.  For
+ *	each record: apply its shared user-relation data block refs (RMW), then -- if
+ *	vis->do_visibility -- divert a foreign XACT/CLOG/MULTIXACT/COMMIT_TS record's
+ *	OUTCOME to the per-origin store (online), the online analog of the cold merge
+ *	loop's divert.  recovered_through advances ONLY after a record's data AND
+ *	visibility were both handled, so ONE completeness gate covers both (8.A).
+ *	touched (if non-NULL) collects every APPLIED (rel, fork) for the
+ *	orchestrator's durability barrier.  See the header for the precondition
+ *	(scan_upper is a validated-durable boundary) and the DONE / BLOCKED contract.
+ *
+ *	An online visibility ERROR (an unmaterializable foreign record) propagates
+ *	OUT of here -- the caller's R13 harness demotes it to BLOCKED.
  *
  * Author: SqlRush <sqlrush@gmail.com>
  */
 ClusterThreadRecResult
-cluster_thread_recovery_replay_stream(XLogReaderState *reader, XLogRecPtr scan_upper,
-									  ClusterThreadReplayStats *stats)
+cluster_thread_recovery_replay_stream_ex(XLogReaderState *reader, XLogRecPtr scan_upper,
+										 const ClusterThreadVisCtx *vis,
+										 ClusterThreadTouchedRels *touched,
+										 ClusterThreadReplayStats *stats)
 {
 	ClusterThreadReplayStats st;
 	PGAlignedBlock pagebuf;
@@ -228,7 +321,7 @@ cluster_thread_recovery_replay_stream(XLogReaderState *reader, XLogRecPtr scan_u
 
 		max_id = XLogRecMaxBlockId(reader);
 		for (block_id = 0; block_id <= max_id; block_id++) {
-			if (!replay_one_block(reader, (uint8)block_id, pagebuf.data, &st)) {
+			if (!replay_one_block(reader, (uint8)block_id, pagebuf.data, touched, &st)) {
 				record_blocked = true;
 				break;
 			}
@@ -240,9 +333,29 @@ cluster_thread_recovery_replay_stream(XLogReaderState *reader, XLogRecPtr scan_u
 		}
 
 		/*
-		 * Advance recovered_through ONLY after every block reference of this
-		 * record was handled cleanly, so a fail-closed never claims an
-		 * unfinished record (8.A).
+		 * Visibility pass (spec-4.11 3b-2): a foreign XACT/CLOG/MULTIXACT/
+		 * COMMIT_TS record carries no data block ref (the block loop above was a
+		 * no-op for it), but it carries the dead thread's commit/abort OUTCOME.
+		 * Divert it to the per-origin outcome store (online), the online analog
+		 * of the cold merge loop's divert (xlogrecovery.c) -- without it the
+		 * survivor recovers the pages but not whether they are committed
+		 * (false-visible, 8.A).  An online unmaterializable record raises a
+		 * CATCHABLE ERROR (cluster_remote_xact_blocked_elevel) that propagates to
+		 * the caller's R13 harness -> BLOCKED; recovered_through is NOT advanced
+		 * for it (this record never completed).
+		 */
+		if (vis != NULL && vis->do_visibility) {
+			RmgrId rmid = XLogRecGetRmid(reader);
+
+			if (rmid == RM_XACT_ID || rmid == RM_CLOG_ID || rmid == RM_MULTIXACT_ID
+				|| rmid == RM_COMMIT_TS_ID)
+				cluster_remote_xact_apply(vis->origin_node, reader, true);
+		}
+
+		/*
+		 * Advance recovered_through ONLY after every block reference AND the
+		 * visibility pass of this record were handled cleanly, so a fail-closed
+		 * never claims an unfinished record (8.A).
 		 */
 		st.recovered_through = reader->EndRecPtr;
 	}
@@ -260,6 +373,20 @@ cluster_thread_recovery_replay_stream(XLogReaderState *reader, XLogRecPtr scan_u
 	if (aborted || !reached)
 		return CLUSTER_THREADREC_BLOCKED;
 	return CLUSTER_THREADREC_DONE;
+}
+
+/*
+ * cluster_thread_recovery_replay_stream -- the 3a data-only entry: the combined
+ *		core with no visibility pass and no touched-rel collection.  Preserved so
+ *		the 3a-local / test callers (and increment 3b-1's driver) are unchanged.
+ *
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+ClusterThreadRecResult
+cluster_thread_recovery_replay_stream(XLogReaderState *reader, XLogRecPtr scan_upper,
+									  ClusterThreadReplayStats *stats)
+{
+	return cluster_thread_recovery_replay_stream_ex(reader, scan_upper, NULL, NULL, stats);
 }
 
 /*

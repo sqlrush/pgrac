@@ -87,6 +87,37 @@ typedef struct ClusterRemoteXactShared {
 
 static ClusterRemoteXactShared *RemoteXactShared = NULL;
 
+/*
+ * Online-writer scope depth (spec-4.11 3b-2, R14).  Process-local: the online
+ * thread-recovery orchestrator brackets its visibility apply with
+ * cluster_remote_xact_online_writer_push/pop so that cluster_remote_xact_set's
+ * historically startup-only writer assert admits the episode-fenced
+ * recovery-apply bgworker.  Process-local is correct (the assert asks "is THIS
+ * process a legitimate writer right now"); a FATAL/PANIC tears the process down
+ * so a leaked depth cannot outlive it.
+ */
+static int remote_xact_online_writer_depth_v = 0;
+
+void
+cluster_remote_xact_online_writer_push(void)
+{
+	remote_xact_online_writer_depth_v++;
+}
+
+void
+cluster_remote_xact_online_writer_pop(void)
+{
+	Assert(remote_xact_online_writer_depth_v > 0);
+	if (remote_xact_online_writer_depth_v > 0)
+		remote_xact_online_writer_depth_v--;
+}
+
+int
+cluster_remote_xact_online_writer_depth(void)
+{
+	return remote_xact_online_writer_depth_v;
+}
+
 static bool
 remote_xact_page_precedes(int page1, int page2)
 {
@@ -191,7 +222,17 @@ cluster_remote_xact_set(int origin_node, TransactionId xid, ClusterRemoteXactOut
 	int slotno;
 	ClusterRemoteXactEntry *entry;
 
-	Assert(!IsUnderPostmaster || AmStartupProcess());
+	/*
+	 * R14 (spec-4.11 3b-2): historically startup-only.  Online thread recovery
+	 * adds the recovery-apply bgworker as a legitimate writer, but ONLY inside
+	 * an episode-fenced online-writer scope -- a stray non-startup writer
+	 * outside that scope still fails closed (cluster_remote_xact_writer_allowed
+	 * pins the boundary).  !IsUnderPostmaster (bootstrap/standalone) is admitted
+	 * as before.
+	 */
+	Assert(!IsUnderPostmaster
+		   || cluster_remote_xact_writer_allowed(AmStartupProcess(),
+												 remote_xact_online_writer_depth_v));
 	Assert(origin_node >= 0 && origin_node < (1 << 7));
 
 	slotno = remote_xact_open_page(origin_node, xid, true);
@@ -342,13 +383,21 @@ cluster_remote_xact_flush(void)
 
 /*
  * cluster_remote_xact_apply -- D10b divert (P1-1 fail-closed parse).
+ *
+ *	online (spec-4.11 3b-2, R13): false = cold merged replay (startup) FATALs on
+ *	an unmaterializable record; true = online thread recovery raises a CATCHABLE
+ *	ERROR (cluster_remote_xact_blocked_elevel) so the R13 harness demotes it to
+ *	BLOCKED and the survivor keeps running.  The materializing branches
+ *	(cluster_remote_xact_set) run only under the orchestrator's online-writer
+ *	scope (R14).
  */
 void
-cluster_remote_xact_apply(int origin_node, XLogReaderState *record)
+cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 {
 	RmgrId rmid = XLogRecGetRmid(record);
 	uint8 info = XLogRecGetInfo(record) & XLOG_XACT_OPMASK;
 	TransactionId xid = XLogRecGetXid(record);
+	int blocked_elevel = cluster_remote_xact_blocked_elevel(online);
 
 	if (rmid == RM_MULTIXACT_ID || rmid == RM_COMMIT_TS_ID) {
 		/*
@@ -357,13 +406,14 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record)
 		 * same aliasing as pg_xact -- but this store has no per-origin
 		 * representation for either.  Fail closed, never apply locally.
 		 */
-		ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
-						errmsg("merged recovery: foreign %s record cannot be materialized "
-							   "(origin node %d, xid %u)",
-							   rmid == RM_MULTIXACT_ID ? "multixact" : "commit-timestamp",
-							   origin_node, xid),
-						errhint("Cross-instance multixact / commit-timestamp state is not yet "
-								"mergeable; recover with cluster.merged_recovery=off.")));
+		ereport(
+			blocked_elevel,
+			(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+			 errmsg("merged recovery: foreign %s record cannot be materialized "
+					"(origin node %d, xid %u)",
+					rmid == RM_MULTIXACT_ID ? "multixact" : "commit-timestamp", origin_node, xid),
+			 errhint("Cross-instance multixact / commit-timestamp state is not yet "
+					 "mergeable; recover with cluster.merged_recovery=off.")));
 	}
 
 	if (rmid == RM_CLOG_ID) {
@@ -412,7 +462,7 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record)
 											   parsed.nsubxacts, parsed.xinfo,
 											   XACT_XINFO_HAS_TWOPHASE, XACT_XINFO_HAS_AE_LOCKS))
 			ereport(
-				FATAL,
+				blocked_elevel,
 				(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
 				 errmsg("merged recovery: foreign commit record carries an unsupported "
 						"side effect (origin node %d, xid %u)",
@@ -424,12 +474,13 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record)
 						 "recover with cluster.merged_recovery=off.")));
 
 		if (!SCN_VALID(parsed.scn))
-			ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
-							errmsg("merged recovery: foreign commit record carries no SCN "
-								   "(origin node %d, xid %u)",
-								   origin_node, xid),
-							errhint("spec-1.18 stamps every commit record; a missing SCN means "
-									"a pre-cluster WAL stream, which cannot be merged.")));
+			ereport(blocked_elevel,
+					(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+					 errmsg("merged recovery: foreign commit record carries no SCN "
+							"(origin node %d, xid %u)",
+							origin_node, xid),
+					 errhint("spec-1.18 stamps every commit record; a missing SCN means "
+							 "a pre-cluster WAL stream, which cannot be merged.")));
 
 		/*
 		 * Mirror the two cluster side effects xact_redo_commit would have
@@ -464,11 +515,12 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record)
 		ParseAbortRecord(XLogRecGetInfo(record), xlrec, &parsed);
 		if (parsed.nrels > 0 || parsed.nstats > 0 || parsed.nsubxacts > 0
 			|| (parsed.xinfo & XACT_XINFO_HAS_TWOPHASE) != 0)
-			ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
-							errmsg("merged recovery: foreign abort record carries an unsupported "
-								   "side effect (origin node %d, xid %u)",
-								   origin_node, xid),
-							errhint("Recover with cluster.merged_recovery=off.")));
+			ereport(blocked_elevel,
+					(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+					 errmsg("merged recovery: foreign abort record carries an unsupported "
+							"side effect (origin node %d, xid %u)",
+							origin_node, xid),
+					 errhint("Recover with cluster.merged_recovery=off.")));
 
 		/* Mirror xact_redo_abort's Lamport observe (see the commit arm). */
 		cluster_scn_recovery_replay_observe(parsed.scn);
@@ -483,12 +535,13 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record)
 		 * INVALIDATIONS: all carry cross-instance machinery this store
 		 * cannot honestly absorb yet.
 		 */
-		ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
-						errmsg("merged recovery: unsupported foreign xact record (info 0x%02x, "
-							   "origin node %d, xid %u)",
-							   (unsigned)info, origin_node, xid),
-						errhint("2PC / assignment / standalone-invalidation records are not yet "
-								"mergeable; recover with cluster.merged_recovery=off.")));
+		ereport(blocked_elevel,
+				(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+				 errmsg("merged recovery: unsupported foreign xact record (info 0x%02x, "
+						"origin node %d, xid %u)",
+						(unsigned)info, origin_node, xid),
+				 errhint("2PC / assignment / standalone-invalidation records are not yet "
+						 "mergeable; recover with cluster.merged_recovery=off.")));
 	}
 }
 
