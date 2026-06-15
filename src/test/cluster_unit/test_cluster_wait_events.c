@@ -219,9 +219,8 @@ UT_TEST(test_per_category_event_counts)
 		(uint32)WAIT_EVENT_RECONFIG_BARRIER_WAIT - (uint32)WAIT_EVENT_RECONFIG_GRD_REBUILD + 1, 5);
 	/* Recovery category: 5 (#86) + ClusterThreadRecovery (spec-4.11 D5) = 6.
 	 * Count the full range to the LAST event so future additions are caught (F12). */
-	UT_ASSERT_EQ((uint32)WAIT_EVENT_CLUSTER_THREAD_RECOVERY
-					 - (uint32)WAIT_EVENT_RECOVERY_WAL_FETCH + 1,
-				 6);
+	UT_ASSERT_EQ(
+		(uint32)WAIT_EVENT_CLUSTER_THREAD_RECOVERY - (uint32)WAIT_EVENT_RECOVERY_WAL_FETCH + 1, 6);
 	UT_ASSERT_EQ((uint32)WAIT_EVENT_SINVAL_INJECT_LOCAL_QUEUE
 					 - (uint32)WAIT_EVENT_SINVAL_BROADCAST_SEND + 1,
 				 3);
