@@ -74,6 +74,7 @@ OBJS = \
 	cluster_thread_recovery_driver_srf.o \
 	cluster_thread_recovery_orchestrator.o \
 	cluster_thread_recovery_orchestrator_srf.o \
+	cluster_thread_recovery_worker.o \
 	cluster_remote_xact.o \
 	cluster_guc.o \
 	cluster_ic.o \

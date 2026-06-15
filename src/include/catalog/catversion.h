@@ -625,7 +625,10 @@
 /* spec-4.11 D1 increment 3b-4b Part 1 (2026-06-15): pg_proc gains one TEST-ONLY
  * entry cluster_thread_replay_slot_test (oid 8942) -- exercises the per-thread
  * online replay-state shmem slot round-trip.  One pg_proc row -> bump. */
-#define CATALOG_VERSION_NO 202606148
+/* spec-4.11 D1 increment 3b-4b Part 2 (2026-06-15): pg_proc gains one TEST-ONLY
+ * entry cluster_thread_recovery_worker_run_test (oid 8943) -- drives the
+ * executor worker's testable core.  One pg_proc row -> bump. */
+#define CATALOG_VERSION_NO 202606149
 
 /* spec-2.39 D10 (2026-05-21):  SI Broadcaster production activation —
  * DDL commit hook (AtEOXact_Inval + COMMIT PREPARED via cluster-aware

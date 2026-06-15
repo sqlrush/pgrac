@@ -189,11 +189,39 @@ UT_TEST(test_epoch_aborts_unstamped_slot_aborts)
 	UT_ASSERT(cluster_thread_recovery_replay_epoch_aborts(5, 0));
 }
 
+/*
+ * spec-4.11 3b-4b Part 2: the executor worker maps a replay_one verdict to the
+ * terminal slot state.  PURE so the fail-closed direction is unit-pinned: ONLY a
+ * DONE marks the slot DONE; everything else (BLOCKED, and the defensive
+ * NOT_APPLICABLE that an in-scope-launched worker should never see) marks
+ * BLOCKED, so the observable slot never claims "done" for an unfinished recovery.
+ */
+UT_TEST(test_worker_terminal_state_done_only_for_done)
+{
+	UT_ASSERT_EQ((int)cluster_thread_recovery_worker_terminal_state(CLUSTER_THREADREC_DONE),
+				 (int)CLUSTER_THREADREC_REPLAY_DONE);
+}
+
+UT_TEST(test_worker_terminal_state_blocked_is_blocked)
+{
+	UT_ASSERT_EQ((int)cluster_thread_recovery_worker_terminal_state(CLUSTER_THREADREC_BLOCKED),
+				 (int)CLUSTER_THREADREC_REPLAY_BLOCKED);
+}
+
+UT_TEST(test_worker_terminal_state_not_applicable_is_blocked)
+{
+	/* NOT_APPLICABLE -> BLOCKED, never DONE: an out-of-scope verdict must not
+	 * present as a completed recovery (fail-closed observability). */
+	UT_ASSERT_EQ(
+		(int)cluster_thread_recovery_worker_terminal_state(CLUSTER_THREADREC_NOT_APPLICABLE),
+		(int)CLUSTER_THREADREC_REPLAY_BLOCKED);
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(18);
 	UT_RUN(test_on_blocked_keep_frozen_default);
 	UT_RUN(test_on_blocked_panic_when_policy_panic);
 	UT_RUN(test_on_blocked_unknown_policy_is_keep_frozen);
@@ -209,6 +237,9 @@ main(void)
 	UT_RUN(test_epoch_aborts_same_epoch_continues);
 	UT_RUN(test_epoch_aborts_different_epoch_aborts);
 	UT_RUN(test_epoch_aborts_unstamped_slot_aborts);
+	UT_RUN(test_worker_terminal_state_done_only_for_done);
+	UT_RUN(test_worker_terminal_state_blocked_is_blocked);
+	UT_RUN(test_worker_terminal_state_not_applicable_is_blocked);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

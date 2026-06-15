@@ -12620,6 +12620,19 @@
   proargnames => '{dead_tid}',
   prosrc => 'cluster_thread_replay_slot_test' },
 
+# spec-4.11 D1 increment 3b-4b Part 2: drive the executor worker's testable core
+# (slot read + L235 epoch guard + replay_one dispatch + terminal slot write).
+# Superuser-only.
+{ oid => '8943',
+  descr => 'TEST-ONLY: online thread-recovery 3b-4b executor worker run (spec-4.11)',
+  proname => 'cluster_thread_recovery_worker_run_test',
+  proisstrict => 'f',
+  provolatile => 'v', proparallel => 'u',
+  prorettype => 'text',
+  proargtypes => 'int4 int8 bool',
+  proargnames => '{dead_tid,epoch_offset,do_mark}',
+  prosrc => 'cluster_thread_recovery_worker_run_test' },
+
 # spec-4.10 D2: reconstruct one block via the online single-block recovery
 # orchestrator over an explicit WAL window, for the byte-for-byte differential
 # vs PG real crash-recovery redo.  Returns the reconstructed page as bytea, or

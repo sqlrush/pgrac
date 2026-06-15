@@ -54,6 +54,7 @@ PG_FUNCTION_INFO_V1(cluster_thread_replay_one_auto_test);
 PG_FUNCTION_INFO_V1(cluster_thread_local_complete_test);
 PG_FUNCTION_INFO_V1(cluster_thread_gate_unfreeze_test);
 PG_FUNCTION_INFO_V1(cluster_thread_replay_slot_test);
+PG_FUNCTION_INFO_V1(cluster_thread_recovery_worker_run_test);
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -63,6 +64,7 @@ PG_FUNCTION_INFO_V1(cluster_thread_replay_slot_test);
 #include "utils/pg_lsn.h"
 
 #include "cluster/cluster_conf.h" /* CLUSTER_MAX_NODES (dead bitmap width) */
+#include "cluster/cluster_grd.h"  /* live recovery episode epoch (worker L235 test) */
 #include "cluster/cluster_thread_recovery.h"
 
 static const char *
@@ -277,6 +279,68 @@ cluster_thread_replay_slot_test(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(cstring_to_text(out));
 }
 
+/*
+ * cluster_thread_recovery_worker_run_test -- exercise the executor worker's
+ * testable core (spec-4.11 3b-4b Part 2) in-process: simulate the lmon launch by
+ * stamping the slot REPLAYING at (live recovery episode + epoch_offset), then run
+ * cluster_thread_recovery_worker_run and report  <res>:<final_slot_state>  (or
+ * <res>:noslot for a bad id), then restore IDLE.  res is a ClusterThreadRecResult
+ * (done 0 / blocked 1 / not_applicable 2); final_slot_state is a
+ * ClusterThreadRecReplayState (idle 0 / replaying 1 / done 2 / blocked 3).
+ *
+ *	epoch_offset 0 + do_mark = a FRESH launch (epoch matches the live episode):
+ *	the worker dispatches replay_one and writes the terminal slot state.  A
+ *	non-zero offset makes the slot STALE so the L235 guard aborts BEFORE
+ *	replay_one and leaves the slot REPLAYING.  do_mark=false leaves the slot IDLE
+ *	to exercise the not-REPLAYING guard.  TEST-ONLY, superuser-only.
+ */
+Datum
+cluster_thread_recovery_worker_run_test(PG_FUNCTION_ARGS)
+{
+	int32 dead_tid;
+	int64 epoch_offset;
+	bool do_mark;
+	uint16 tid;
+	ClusterThreadRecResult res;
+	ClusterThreadRecReplayState final_state;
+	const char *out;
+
+	if (!superuser())
+		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						errmsg("cluster_thread_recovery_worker_run_test is superuser-only")));
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2))
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("dead_tid, epoch_offset and do_mark must not be NULL")));
+
+	dead_tid = PG_GETARG_INT32(0);
+	epoch_offset = PG_GETARG_INT64(1);
+	do_mark = PG_GETARG_BOOL(2);
+
+	/* Out-of-uint16 ids fail closed in the slot accessor (-> noslot). */
+	if (dead_tid < 0 || dead_tid > PG_UINT16_MAX)
+		dead_tid = 0;
+	tid = (uint16)dead_tid;
+
+	if (do_mark) {
+		uint64 epoch = cluster_grd_redeclare_episode_epoch() + (uint64)epoch_offset;
+
+		cluster_thread_recovery_replay_mark_replaying(tid, epoch);
+	}
+
+	res = cluster_thread_recovery_worker_run(tid);
+
+	if (!cluster_thread_recovery_replay_read(tid, &final_state, NULL))
+		PG_RETURN_TEXT_P(cstring_to_text(psprintf("%d:noslot", (int)res)));
+
+	out = psprintf("%d:%d", (int)res, (int)final_state);
+
+	/* Restore IDLE so reruns are deterministic (Part 2 has no live launcher). */
+	cluster_thread_recovery_replay_set_state(tid, CLUSTER_THREADREC_REPLAY_IDLE);
+
+	PG_RETURN_TEXT_P(cstring_to_text(out));
+}
+
 #else /* !USE_PGRAC_CLUSTER */
 
 Datum
@@ -312,6 +376,13 @@ cluster_thread_replay_slot_test(PG_FUNCTION_ARGS pg_attribute_unused())
 {
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("cluster_thread_replay_slot_test requires --enable-cluster")));
+}
+
+Datum
+cluster_thread_recovery_worker_run_test(PG_FUNCTION_ARGS pg_attribute_unused())
+{
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cluster_thread_recovery_worker_run_test requires --enable-cluster")));
 }
 
 #endif /* USE_PGRAC_CLUSTER */

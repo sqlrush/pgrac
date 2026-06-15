@@ -338,6 +338,21 @@ cluster_thread_recovery_replay_epoch_aborts(uint64 slot_epoch, uint64 current_ep
 }
 
 /*
+ * cluster_thread_recovery_worker_terminal_state -- map an executor worker's
+ * replay_one verdict to the terminal replay-slot state (spec-4.11 3b-4b Part 2).
+ * PURE so the fail-closed direction is unit-pinned: ONLY a DONE marks the slot
+ * DONE; BLOCKED and the defensive NOT_APPLICABLE (an in-scope-launched worker
+ * should never see it) both map to BLOCKED, so the observable slot NEVER claims
+ * "done" for a recovery that did not complete.
+ */
+static inline ClusterThreadRecReplayState
+cluster_thread_recovery_worker_terminal_state(ClusterThreadRecResult res)
+{
+	return (res == CLUSTER_THREADREC_DONE) ? CLUSTER_THREADREC_REPLAY_DONE
+										   : CLUSTER_THREADREC_REPLAY_BLOCKED;
+}
+
+/*
  * Online-replay ONE dead thread's WAL data through to shared storage
  * within the reconfig freeze window (spec-4.11 D2).  Implemented in a
  * later increment (the Q10-B apply matrix); declared here for the
@@ -393,6 +408,26 @@ extern bool cluster_thread_recovery_replay_set_state(uint16 dead_tid,
 extern bool cluster_thread_recovery_replay_read(uint16 dead_tid,
 												ClusterThreadRecReplayState *state_out,
 												uint64 *epoch_out);
+
+/*
+ * Online thread-recovery executor (spec-4.11 3b-4b Part 2).
+ *
+ * cluster_thread_recovery_worker_run online-recovers ONE dead thread in the
+ * calling process: it reads the per-thread replay slot (the lmon launch marked
+ * it REPLAYING and stamped the launch episode), enforces the L235 episode
+ * staleness guard against the live GRD recovery episode, drives
+ * cluster_thread_recovery_replay_one, and writes the terminal slot state.  It
+ * publishes NO authority itself (replay_one owns that on DONE).  Returns the
+ * replay_one verdict; NOT_APPLICABLE also covers "slot is not REPLAYING / stale
+ * launch epoch" (abort, keep frozen, the slot is left for the live episode).
+ *
+ * cluster_thread_recovery_worker_main is the dynamic-bgworker entry point the
+ * lmon launch (Part 3) registers (bgw_function_name); main_arg carries the dead
+ * thread id.  A thin wrapper: claim, install the abnormal-exit fail-closed
+ * callback (RUNNING slot -> BLOCKED, keep frozen), unblock signals, run, log.
+ */
+extern ClusterThreadRecResult cluster_thread_recovery_worker_run(uint16 dead_tid);
+extern void cluster_thread_recovery_worker_main(Datum main_arg);
 
 /*
  * RMW replay engine (spec-4.11 D1 increment 3a).  Read each record of a
