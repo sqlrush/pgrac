@@ -364,6 +364,26 @@ extern bool cluster_write_fence_allowed(void);
  */
 extern void cluster_write_fence_reject_if_fenced(const char *op);
 
+/*
+ * cluster_write_fence_verify_durable -- spec-4.12 D6 (Option B, Oracle-aligned).
+ *	Direct durable read of the voting-disk fence markers (bypassing the cache token):
+ *	true iff a quorum-majority of the CONFIGURED disks carry an identical marker with
+ *	fence_epoch == required_epoch.  Gates authority publication on the recovery /
+ *	rejoin / startup paths (a superseded episode is rejected, 8.A).  Does NOT bound
+ *	replay -- full redo is applied (Oracle-aligned); the non-cooperating zombie's
+ *	over-apply is AD-013 hardware-fence scope.  Enforcement off -> true.
+ */
+extern bool cluster_write_fence_verify_durable(uint64 required_epoch);
+
+/*
+ * cluster_write_fence_startup_self_check -- spec-4.12 D6 rejoin/startup gate (Q5=C).
+ *	True iff a durable quorum-majority marker lists THIS node as fenced; arms the
+ *	local self_fenced token so D5 rejects all shared writes immediately.  The caller
+ *	enters a non-serving, NON-FATAL terminal (recover only via controlled rejoin /
+ *	cold-admin; no online rejoin in Stage 4).  Enforcement off -> false.
+ */
+extern bool cluster_write_fence_startup_self_check(void);
+
 #endif /* !FRONTEND */
 
 #endif /* CLUSTER_WRITE_FENCE_H */

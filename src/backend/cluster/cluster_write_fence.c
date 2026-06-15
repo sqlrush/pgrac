@@ -37,11 +37,12 @@
 #include "storage/shmem.h"
 #include "utils/timestamp.h"
 
-#include "cluster/cluster_epoch.h"		 /* cluster_epoch_get_current */
-#include "cluster/cluster_guc.h"		 /* cluster_node_id */
-#include "cluster/cluster_qvotec.h"		 /* ClusterVotingSlot (marker layout asserts) */
-#include "cluster/cluster_shmem.h"		 /* cluster_shmem_register_region */
-#include "cluster/cluster_write_fence.h" /* region + judge + wrapper + marker */
+#include "cluster/cluster_epoch.h"			/* cluster_epoch_get_current */
+#include "cluster/cluster_guc.h"			/* cluster_node_id, cluster_voting_disks */
+#include "cluster/cluster_qvotec.h"			/* ClusterVotingSlot (marker layout asserts) */
+#include "cluster/cluster_shmem.h"			/* cluster_shmem_register_region */
+#include "cluster/cluster_voting_disk_io.h" /* D6 direct durable marker read */
+#include "cluster/cluster_write_fence.h"	/* region + judge + wrapper + marker */
 
 /*
  * spec-4.12 D1: pin the fence-marker on-disk layout against the voting slot, so a
@@ -168,6 +169,149 @@ cluster_write_fence_allowed(void)
 
 	return cluster_write_fence_decide(enforcement_on, region_attached, epoch_current,
 									  authorized_epoch, now_us, lease_expire_us, self_fenced);
+}
+
+/*
+ * cluster_write_fence_read_durable_authority -- spec-4.12 D6 helper.  DIRECTLY read
+ *	the voting-disk fence markers (bypassing the qvotec cache token) and decide
+ *	authority over the TOTAL configured disk count.  Returns false when no voting
+ *	disks are configured (caller decides what that means).  An unreadable disk stays
+ *	has_marker=false and still counts toward the total, so a minority of readable
+ *	disks can never fake a majority (P0a).  Reuses cluster_fence_authority_decide.
+ */
+static bool
+cluster_write_fence_read_durable_authority(ClusterFenceAuthority *out)
+{
+	ClusterFenceMarker disk_markers[CLUSTER_MAX_VOTING_DISKS];
+	bool disk_has_marker[CLUSTER_MAX_VOTING_DISKS];
+	int n_total = 0;
+	const char *p;
+
+	if (cluster_voting_disks == NULL || cluster_voting_disks[0] == '\0')
+		return false; /* no voting disks configured */
+
+	p = cluster_voting_disks;
+	while (*p && n_total < CLUSTER_MAX_VOTING_DISKS) {
+		const char *start = p;
+		const char *end;
+		char path[MAXPGPATH];
+		size_t len;
+		int fd;
+		int slot_idx = n_total;
+
+		while (*p && *p != ',')
+			p++;
+		end = p;
+		if (*p == ',')
+			p++;
+		while (start < end && (*start == ' ' || *start == '\t'))
+			start++;
+		while (end > start && (end[-1] == ' ' || end[-1] == '\t'))
+			end--;
+		len = (size_t)(end - start);
+		if (len == 0 || len >= MAXPGPATH)
+			continue; /* empty/oversized token: skip without consuming a disk slot */
+
+		memcpy(path, start, len);
+		path[len] = '\0';
+
+		disk_has_marker[slot_idx] = false;
+		fd = cluster_voting_disk_open(path, false);
+		if (fd >= 0) {
+			uint32 node;
+			bool found = false;
+			ClusterFenceMarker best;
+
+			memset(&best, 0, sizeof(best));
+			for (node = 0; node < CLUSTER_MAX_NODES; node++) {
+				ClusterVotingSlot slot;
+				ClusterFenceMarker m;
+
+				if (cluster_voting_disk_read_slot(fd, slot_idx, node, &slot)
+					!= CLUSTER_VOTING_DISK_IO_OK)
+					continue;
+				if (!cluster_fence_marker_unpack(slot._reserved1, &m))
+					continue;
+				if (!found || m.fence_epoch > best.fence_epoch
+					|| (m.fence_epoch == best.fence_epoch
+						&& m.fence_generation > best.fence_generation)) {
+					best = m;
+					found = true;
+				}
+			}
+			cluster_voting_disk_close(fd);
+			disk_has_marker[slot_idx] = found;
+			if (found)
+				disk_markers[slot_idx] = best;
+		}
+		n_total++;
+	}
+
+	*out = cluster_fence_authority_decide(disk_markers, disk_has_marker, n_total);
+	return true;
+}
+
+/*
+ * cluster_write_fence_verify_durable -- spec-4.12 D6 (Option B, Oracle-aligned).
+ *	The recovery / rejoin / startup direct durable check: true iff a quorum-majority
+ *	of the CONFIGURED voting disks carry an identical marker whose fence_epoch ==
+ *	required_epoch.  Used to gate authority publication (a superseded recovery worker
+ *	whose episode is no longer the durable fence epoch is rejected, 8.A) -- NOT to
+ *	bound replay (full redo is applied, Oracle-aligned; the non-cooperating zombie's
+ *	over-apply is AD-013 hardware-fence scope).  Enforcement off -> verified (true).
+ */
+bool
+cluster_write_fence_verify_durable(uint64 required_epoch)
+{
+	ClusterFenceAuthority authority;
+
+	if (cluster_write_fence_enforcement != CLUSTER_WRITE_FENCE_ENFORCE_ON)
+		return true; /* not enforced: recovery proceeds as PG-native */
+
+	/* Enforcement ON but no durable majority marker for required_epoch -> fail
+	 * closed (no authority granted): missing disks / superseded epoch / no marker. */
+	if (cluster_write_fence_read_durable_authority(&authority) && authority.has_authority
+		&& authority.marker.fence_epoch == required_epoch)
+		return true;
+
+	if (cluster_write_fence_shmem != NULL)
+		pg_atomic_fetch_add_u64(&cluster_write_fence_shmem->durable_check_blocked, 1);
+	return false;
+}
+
+/*
+ * cluster_write_fence_startup_self_check -- spec-4.12 D6 rejoin/startup gate (Q5=C).
+ *	A restarting node reads the durable marker directly; if a quorum-majority marker
+ *	lists THIS node in its fenced_dead_bitmap, the node is still fenced.  Sets the
+ *	local self_fenced token immediately (so D5 rejects every shared write from the
+ *	first instant, closing the window before qvotec's first poll) and returns true.
+ *	The caller enters a non-serving, NON-FATAL terminal (no permanent lockout): the
+ *	node recovers only via a controlled rejoin / cold-admin procedure (Stage 4 does
+ *	not do online rejoin).  Enforcement off -> not fenced (false).
+ */
+bool
+cluster_write_fence_startup_self_check(void)
+{
+	ClusterFenceAuthority authority;
+
+	if (cluster_write_fence_enforcement != CLUSTER_WRITE_FENCE_ENFORCE_ON)
+		return false; /* not enforced */
+
+	if (!cluster_write_fence_read_durable_authority(&authority) || !authority.has_authority)
+		return false; /* no durable majority marker -> not durably fenced */
+
+	if (!cluster_fence_marker_node_is_fenced(authority.marker.fenced_dead_bitmap, cluster_node_id))
+		return false; /* this node is not in the fenced set */
+
+	/* Self is durably fenced: arm the local token so D5 fails closed at once. */
+	if (cluster_write_fence_shmem != NULL) {
+		pg_atomic_write_u32(&cluster_write_fence_shmem->self_fenced, 1);
+		pg_atomic_write_u64(&cluster_write_fence_shmem->authorized_epoch,
+							authority.marker.fence_epoch);
+		pg_atomic_write_u64(&cluster_write_fence_shmem->fence_event_id,
+							authority.marker.fence_event_id);
+	}
+	return true;
 }
 
 /*

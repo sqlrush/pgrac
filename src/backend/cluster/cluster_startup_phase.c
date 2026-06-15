@@ -67,7 +67,8 @@
 #include "cluster/cluster_scn.h"	/* SCN_NODE_ID_VALID (spec-1.16 D13) */
 #include "cluster/cluster_shmem.h"	/* cluster_shmem_register_region */
 #include "cluster/cluster_startup_phase.h"
-#include "cluster/cluster_wal_state.h" /* spec-4.2 publish_active (phase->RUNNING) */
+#include "cluster/cluster_wal_state.h"	 /* spec-4.2 publish_active (phase->RUNNING) */
+#include "cluster/cluster_write_fence.h" /* spec-4.12 D6 rejoin self-fence gate (Q5=C) */
 
 
 /*
@@ -1226,14 +1227,38 @@ cluster_finalize_startup_running(void)
 	}
 
 	/*
-	 * spec-4.2 v0.2 P1: publish ACTIVE to the ClusterWalState registry
-	 * ONLY here -- recovery has succeeded and the node is about to
-	 * serve.  A node that dies during recovery never reaches this
-	 * point, so its slot keeps the previous content (EMPTY on a first
-	 * boot), which is exactly the raw material spec-4.3 needs for the
-	 * crashed inference.  FATAL 53RA2 inside on write failure.
+	 * spec-4.12 D6 (Q5=C) rejoin/startup self-fence gate.  Before advertising any
+	 * serving authority, do a DIRECT durable read of the voting-disk fence marker:
+	 * if a quorum-majority marker still lists THIS node as fenced (declared dead by
+	 * a membership reconfiguration), enter a non-serving, NON-FATAL terminal --
+	 * skip publish_active (advertise no serving authority) and rely on the armed
+	 * self_fenced token (set inside the check) so D5 rejects every shared write.
+	 * Not FATAL: the node recovers via a controlled rejoin / cold-admin procedure
+	 * (Stage 4 has no online rejoin); a manual marker clear while the cluster is
+	 * live = self-unfencing = split-brain, so it is forbidden by the errhint.
 	 */
-	cluster_wal_state_publish_active();
+	if (cluster_write_fence_startup_self_check())
+		ereport(WARNING,
+				(errcode(ERRCODE_CLUSTER_WRITE_FENCED),
+				 errmsg("this node is fenced by a membership reconfiguration; entering "
+						"non-serving mode"),
+				 errdetail("A durable quorum-majority voting-disk marker still lists this "
+						   "node as dead.  All shared-storage writes are rejected (53R51) "
+						   "and this node publishes no serving authority."),
+				 errhint("Recover only via the controlled rejoin / cold-admin procedure once "
+						 "the cluster confirms this node may rejoin; never clear the fence "
+						 "marker manually while the cluster is live.")));
+	else {
+		/*
+		 * spec-4.2 v0.2 P1: publish ACTIVE to the ClusterWalState registry
+		 * ONLY here -- recovery has succeeded and the node is about to
+		 * serve.  A node that dies during recovery never reaches this
+		 * point, so its slot keeps the previous content (EMPTY on a first
+		 * boot), which is exactly the raw material spec-4.3 needs for the
+		 * crashed inference.  FATAL 53RA2 inside on write failure.
+		 */
+		cluster_wal_state_publish_active();
+	}
 
 	cluster_advance_phase(CLUSTER_PHASE_RUNNING);
 }

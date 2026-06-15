@@ -78,6 +78,7 @@
 #include "cluster/cluster_remote_xact.h"	   /* per-origin outcome store flush              */
 #include "cluster/cluster_thread_recovery.h"   /* engine / driver / pure gates                */
 #include "cluster/cluster_wal_state.h"		   /* slot read + registry skip-bound publish     */
+#include "cluster/cluster_write_fence.h"	   /* spec-4.12 D6 durable authority verify        */
 #include "cluster/storage/cluster_shared_fs.h" /* CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS         */
 
 /*
@@ -306,9 +307,9 @@ cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower
 	if (dead_tid < 1 || dead_tid > CLUSTER_WAL_STATE_SLOT_COUNT)
 		return CLUSTER_THREADREC_BLOCKED;
 
-	/* L235 episode-epoch abort-on-bump enforcement is 3b-3 (needs shmem
-	 * replay-state); 3b-2 threads the value through unchanged. */
-	(void)episode_epoch;
+	/* episode_epoch: the L235 in-memory abort-on-bump gate uses it upstream; here
+	 * spec-4.12 D6 re-checks it against the DURABLE voting-disk marker before the
+	 * authority publish below (8.A ground-truth cross-check). */
 
 	memset(&touched, 0, sizeof(touched));
 	touched.mcxt = caller_ctx; /* the items array must outlive the drive */
@@ -349,6 +350,26 @@ cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower
 		PG_TRY();
 		{
 			XLogRecPtr through = stats->recovered_through;
+
+			/*
+			 * 0. spec-4.12 D6 (8.A): direct durable re-check BEFORE publishing any
+			 * authority.  The 4.11 in-memory episode-epoch gate proved this worker
+			 * is current; the durable voting-disk fence marker is the GROUND TRUTH.
+			 * If a newer reconfig has superseded this episode (the durable majority
+			 * marker's fence_epoch no longer equals episode_epoch), publish NOTHING
+			 * -- this catchable ERROR is demoted to BLOCKED (keep_frozen) by the R13
+			 * harness below.  Enforcement off -> verify returns true (no-op).  We do
+			 * NOT bound replay here (full redo already applied, Oracle-aligned).
+			 */
+			if (!cluster_write_fence_verify_durable(episode_epoch))
+				ereport(ERROR, (errcode(ERRCODE_CLUSTER_WRITE_FENCED),
+								errmsg("thread recovery authority rejected: the durable fence "
+									   "marker does not confirm episode epoch %llu",
+									   (unsigned long long)episode_epoch),
+								errdetail("A newer membership reconfiguration has superseded this "
+										  "recovery episode; the dead thread stays frozen (no "
+										  "serving authority is published) until the current "
+										  "episode recovers it.")));
 
 			/*
 			 * 1. data pages durable (amend 2): cluster_fs write-back is not
