@@ -12633,6 +12633,18 @@
   proargnames => '{dead_tid,epoch_offset,do_mark}',
   prosrc => 'cluster_thread_recovery_worker_run_test' },
 
+# spec-4.11 D1 increment 3b-4b Part 3: drive the lmon launch side with a synthetic
+# dead-node bitmap (a no-op out of scope on a single node).  Superuser-only.
+{ oid => '8944',
+  descr => 'TEST-ONLY: online thread-recovery 3b-4b lmon launch (spec-4.11)',
+  proname => 'cluster_thread_recovery_launch_test',
+  proisstrict => 'f',
+  provolatile => 'v', proparallel => 'u',
+  prorettype => 'text',
+  proargtypes => 'int4',
+  proargnames => '{dead_node}',
+  prosrc => 'cluster_thread_recovery_launch_test' },
+
 # spec-4.10 D2: reconstruct one block via the online single-block recovery
 # orchestrator over an explicit WAL window, for the byte-for-byte differential
 # vs PG real crash-recovery redo.  Returns the reconstructed page as bytea, or

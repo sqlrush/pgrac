@@ -55,6 +55,7 @@ PG_FUNCTION_INFO_V1(cluster_thread_local_complete_test);
 PG_FUNCTION_INFO_V1(cluster_thread_gate_unfreeze_test);
 PG_FUNCTION_INFO_V1(cluster_thread_replay_slot_test);
 PG_FUNCTION_INFO_V1(cluster_thread_recovery_worker_run_test);
+PG_FUNCTION_INFO_V1(cluster_thread_recovery_launch_test);
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -341,6 +342,53 @@ cluster_thread_recovery_worker_run_test(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(cstring_to_text(out));
 }
 
+/*
+ * cluster_thread_recovery_launch_test -- exercise the lmon launch side (spec-4.11
+ * 3b-4b Part 3) with a synthetic single-dead-node bitmap (node = dead_node).
+ * Returns the dead thread's replay-slot state after the call as an int
+ * (idle 0 / replaying 1 / done 2 / blocked 3), or 'noslot'.  On a single machine
+ * the launch is OUT OF SCOPE (no peers), so it is a NO-OP -> the slot stays IDLE
+ * (0): this pins that the FSM wiring never launches / never stamps a slot out of
+ * scope (the in-scope firing is the 2-node e2e, Part 4).  TEST-ONLY, superuser.
+ */
+Datum
+cluster_thread_recovery_launch_test(PG_FUNCTION_ARGS)
+{
+	int32 dead_node;
+	uint16 dead_tid;
+	uint64 dead[(CLUSTER_MAX_NODES + 63) / 64];
+	ClusterThreadRecReplayState state;
+
+	if (!superuser())
+		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						errmsg("cluster_thread_recovery_launch_test is superuser-only")));
+
+	if (PG_ARGISNULL(0))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("dead_node must not be NULL")));
+
+	dead_node = PG_GETARG_INT32(0);
+
+	memset(dead, 0, sizeof(dead));
+	if (dead_node >= 0 && dead_node < CLUSTER_MAX_NODES)
+		dead[dead_node / 64] |= (UINT64CONST(1) << (dead_node % 64));
+	dead_tid = (uint16)(dead_node + 1);
+
+	/* Clean baseline so the result reflects only this call. */
+	cluster_thread_recovery_replay_set_state(dead_tid, CLUSTER_THREADREC_REPLAY_IDLE);
+
+	cluster_thread_recovery_launch_workers(dead, (int)(sizeof(dead) / sizeof(dead[0])),
+										   cluster_grd_redeclare_episode_epoch());
+
+	if (!cluster_thread_recovery_replay_read(dead_tid, &state, NULL))
+		PG_RETURN_TEXT_P(cstring_to_text("noslot"));
+
+	/* Restore IDLE so reruns are deterministic. */
+	cluster_thread_recovery_replay_set_state(dead_tid, CLUSTER_THREADREC_REPLAY_IDLE);
+
+	PG_RETURN_TEXT_P(cstring_to_text(psprintf("%d", (int)state)));
+}
+
 #else /* !USE_PGRAC_CLUSTER */
 
 Datum
@@ -383,6 +431,13 @@ cluster_thread_recovery_worker_run_test(PG_FUNCTION_ARGS pg_attribute_unused())
 {
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("cluster_thread_recovery_worker_run_test requires --enable-cluster")));
+}
+
+Datum
+cluster_thread_recovery_launch_test(PG_FUNCTION_ARGS pg_attribute_unused())
+{
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cluster_thread_recovery_launch_test requires --enable-cluster")));
 }
 
 #endif /* USE_PGRAC_CLUSTER */

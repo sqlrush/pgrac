@@ -217,11 +217,62 @@ UT_TEST(test_worker_terminal_state_not_applicable_is_blocked)
 		(int)CLUSTER_THREADREC_REPLAY_BLOCKED);
 }
 
+/*
+ * spec-4.11 3b-4b Part 3: the lmon launch decision -- should the FSM launch an
+ * executor worker for a dead origin this tick?  PURE so the idempotency boundary
+ * is unit-pinned: out of scope NEVER launches (the t/249-252 no-op guarantee);
+ * in scope, launch an IDLE slot or one stamped by a DIFFERENT episode, and SKIP a
+ * slot already handling THIS episode (REPLAYING/DONE/BLOCKED at the current
+ * epoch) so each tick does not re-register a running/finished worker.
+ */
+UT_TEST(test_should_launch_out_of_scope_never_launches)
+{
+	/* Any non-APPLICABLE scope -> false regardless of slot/epoch (no regression
+	 * to the spec-4.6/4.7 reconfig FSM on a single node / GUC off / >2-node). */
+	UT_ASSERT(!cluster_thread_recovery_should_launch(CLUSTER_THREADREC_SCOPE_DISABLED,
+													 CLUSTER_THREADREC_REPLAY_IDLE, 0, 0));
+	UT_ASSERT(!cluster_thread_recovery_should_launch(CLUSTER_THREADREC_SCOPE_SINGLE_NODE,
+													 CLUSTER_THREADREC_REPLAY_IDLE, 5, 9));
+	UT_ASSERT(!cluster_thread_recovery_should_launch(CLUSTER_THREADREC_SCOPE_MULTI_SURVIVOR,
+													 CLUSTER_THREADREC_REPLAY_IDLE, 5, 9));
+}
+
+UT_TEST(test_should_launch_idle_slot_launches)
+{
+	/* In scope + IDLE -> launch (the slot is available). */
+	UT_ASSERT(cluster_thread_recovery_should_launch(CLUSTER_THREADREC_SCOPE_APPLICABLE,
+													CLUSTER_THREADREC_REPLAY_IDLE, 0, 9));
+}
+
+UT_TEST(test_should_launch_current_episode_is_idempotent)
+{
+	/* In scope but the slot is already handling THIS episode -> do NOT relaunch
+	 * (REPLAYING/DONE/BLOCKED at the current epoch). */
+	UT_ASSERT(!cluster_thread_recovery_should_launch(CLUSTER_THREADREC_SCOPE_APPLICABLE,
+													 CLUSTER_THREADREC_REPLAY_REPLAYING, 9, 9));
+	UT_ASSERT(!cluster_thread_recovery_should_launch(CLUSTER_THREADREC_SCOPE_APPLICABLE,
+													 CLUSTER_THREADREC_REPLAY_DONE, 9, 9));
+	UT_ASSERT(!cluster_thread_recovery_should_launch(CLUSTER_THREADREC_SCOPE_APPLICABLE,
+													 CLUSTER_THREADREC_REPLAY_BLOCKED, 9, 9));
+}
+
+UT_TEST(test_should_launch_stale_episode_relaunches)
+{
+	/* In scope + a slot stamped by an OLDER/different episode -> (re)launch for
+	 * the new episode, whatever its terminal state. */
+	UT_ASSERT(cluster_thread_recovery_should_launch(CLUSTER_THREADREC_SCOPE_APPLICABLE,
+													CLUSTER_THREADREC_REPLAY_REPLAYING, 8, 9));
+	UT_ASSERT(cluster_thread_recovery_should_launch(CLUSTER_THREADREC_SCOPE_APPLICABLE,
+													CLUSTER_THREADREC_REPLAY_DONE, 8, 9));
+	UT_ASSERT(cluster_thread_recovery_should_launch(CLUSTER_THREADREC_SCOPE_APPLICABLE,
+													CLUSTER_THREADREC_REPLAY_BLOCKED, 8, 9));
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(22);
 	UT_RUN(test_on_blocked_keep_frozen_default);
 	UT_RUN(test_on_blocked_panic_when_policy_panic);
 	UT_RUN(test_on_blocked_unknown_policy_is_keep_frozen);
@@ -240,6 +291,10 @@ main(void)
 	UT_RUN(test_worker_terminal_state_done_only_for_done);
 	UT_RUN(test_worker_terminal_state_blocked_is_blocked);
 	UT_RUN(test_worker_terminal_state_not_applicable_is_blocked);
+	UT_RUN(test_should_launch_out_of_scope_never_launches);
+	UT_RUN(test_should_launch_idle_slot_launches);
+	UT_RUN(test_should_launch_current_episode_is_idempotent);
+	UT_RUN(test_should_launch_stale_episode_relaunches);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

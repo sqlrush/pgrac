@@ -353,6 +353,28 @@ cluster_thread_recovery_worker_terminal_state(ClusterThreadRecResult res)
 }
 
 /*
+ * cluster_thread_recovery_should_launch -- the lmon launch decision (spec-4.11
+ * 3b-4b Part 3): should the reconfig FSM launch an executor worker for a dead
+ * origin this WAIT_CLUSTER tick?  PURE so the idempotency boundary is unit-pinned.
+ * Out of scope NEVER launches (the spec-4.6/4.7 reconfig FSM is unchanged on a
+ * single node / GUC off / >2-node -- no regression).  In scope, launch an IDLE
+ * slot or one stamped by a DIFFERENT episode (a new reconfig retries), and SKIP a
+ * slot already handling THIS episode (REPLAYING/DONE/BLOCKED at the current
+ * epoch), so a per-tick re-attempt never re-registers a running/finished worker.
+ */
+static inline bool
+cluster_thread_recovery_should_launch(ClusterThreadRecScope scope,
+									  ClusterThreadRecReplayState slot_state, uint64 slot_epoch,
+									  uint64 episode_epoch)
+{
+	if (scope != CLUSTER_THREADREC_SCOPE_APPLICABLE)
+		return false;
+	if (slot_state == CLUSTER_THREADREC_REPLAY_IDLE)
+		return true;
+	return slot_epoch != episode_epoch;
+}
+
+/*
  * Online-replay ONE dead thread's WAL data through to shared storage
  * within the reconfig freeze window (spec-4.11 D2).  Implemented in a
  * later increment (the Q10-B apply matrix); declared here for the
@@ -428,6 +450,17 @@ extern bool cluster_thread_recovery_replay_read(uint16 dead_tid,
  */
 extern ClusterThreadRecResult cluster_thread_recovery_worker_run(uint16 dead_tid);
 extern void cluster_thread_recovery_worker_main(Datum main_arg);
+
+/*
+ * cluster_thread_recovery_launch_workers -- the lmon launch side (spec-4.11
+ * 3b-4b Part 3): the reconfig FSM calls this each WAIT_CLUSTER tick with the
+ * episode's dead-node bitmap (LSB = node 0) and the locked episode epoch; it
+ * registers one per-episode executor worker per in-scope dead origin not already
+ * handled this episode.  Out of scope (the same decide_scope as replay_one) it
+ * is a NO-OP, so the reconfig FSM is unchanged; idempotent per tick.
+ */
+extern void cluster_thread_recovery_launch_workers(const uint64 *dead, int nwords,
+												   uint64 episode_epoch);
 
 /*
  * RMW replay engine (spec-4.11 D1 increment 3a).  Read each record of a

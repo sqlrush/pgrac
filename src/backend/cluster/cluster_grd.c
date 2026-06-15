@@ -1500,6 +1500,16 @@ cluster_grd_recovery_lmon_tick(void)
 			dead[i] = pg_atomic_read_u64(&cluster_grd_state->recovery_dead_bitmap[i]);
 
 		/*
+		 * spec-4.11 D1 (3b-4b Part 3) — launch one per-episode online thread-
+		 * recovery worker for each in-scope dead origin (idempotent per tick;
+		 * a NO-OP out of scope, so the spec-4.7 path is unchanged).  The worker
+		 * online-replays the dead thread's WAL data + visibility to shared
+		 * storage and publishes the node-local materialization authority; the
+		 * D3 gate below then holds the GES shards frozen until it lands.
+		 */
+		cluster_thread_recovery_launch_workers(dead, (CLUSTER_MAX_NODES + 63) / 64, episode_epoch);
+
+		/*
 		 * P6 cluster gate (P0#3):  EVERY survivor (declared ∧ not dead in
 		 * this episode) must have announced its local barrier for the
 		 * LOCKED episode epoch.  No timeout:  fail-closed — affected

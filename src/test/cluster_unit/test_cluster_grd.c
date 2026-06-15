@@ -314,6 +314,16 @@ cluster_thread_recovery_gate_unfreeze(const uint64 *dead_bitmap pg_attribute_unu
 	return false;
 }
 
+/* spec-4.11 3b-4b Part 3 stub:  cluster_grd.c's WAIT_CLUSTER tick now launches
+ * the online thread-recovery executor for in-scope dead origins.  These tests
+ * drive the GES/GRD remaster FSM, not online thread recovery, so the launch is
+ * out of scope -> a no-op (no worker is registered). */
+void
+cluster_thread_recovery_launch_workers(const uint64 *dead pg_attribute_unused(),
+									   int nwords pg_attribute_unused(),
+									   uint64 episode_epoch pg_attribute_unused())
+{}
+
 struct PGPROC *
 BackendIdGetProc(int backendID pg_attribute_unused())
 {
