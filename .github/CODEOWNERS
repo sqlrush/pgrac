@@ -1,0 +1,3 @@
+# Default owner for everything in the repo.
+# Opening a PR automatically requests review from the owner.
+* @sqlrush
