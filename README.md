@@ -22,6 +22,17 @@ one shared database, Cache Fusion / SCN / GES — to PostgreSQL 16.13.
 > ⭐ If "Postgres with RAC-style shared storage" is something you've wanted,
 > star the repo to follow the build.
 
+## See it run
+
+Two PostgreSQL nodes, one cluster, a live TCP heartbeat interconnect — the
+per-peer heartbeat counters climb in real time:
+
+![pgrac two-node heartbeat demo](diagrams/heartbeat-demo.gif)
+
+Reproduce it locally in about a minute — see
+[Multi-node cluster](docs/user-guide/bootstrap.md#multi-node-cluster-tier1-tcp-interconnect)
+in the bootstrap guide.
+
 **Project site:** **[pgrac.dev](https://pgrac.dev)** — architecture deep-dives,
 the full feature catalog, and a side-by-side comparison with Oracle RAC
 (coming online).

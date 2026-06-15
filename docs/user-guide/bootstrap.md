@@ -89,19 +89,79 @@ information.  This makes single-node development convenient: you
 do not need to write a `pgrac.conf` to run linkdb as a stand-alone
 PostgreSQL server with the cluster GUCs available.
 
+## Multi-node cluster (`tier1` TCP interconnect)
+
+The default `cluster.interconnect_tier = stub` runs a single node.  To run
+a real multi-node cluster with the LMON heartbeat interconnect, set
+`tier1` and declare every peer (including self) in a shared `pgrac.conf`.
+
+This example brings up two nodes on one host over loopback — interconnect
+ports `6432`/`6433`, client SQL ports `65433`/`65434`:
+
+```bash
+# One identical pgrac.conf for BOTH nodes — every peer, self included.
+read -r -d '' PGRAC_CONF <<'CONF'
+[cluster]
+name = demo
+
+[node.0]
+interconnect_addr = 127.0.0.1:6432
+hostname          = demo-0
+role              = primary
+
+[node.1]
+interconnect_addr = 127.0.0.1:6433
+hostname          = demo-1
+role              = standby
+CONF
+
+for n in 0 1; do
+  D=/tmp/pgrac-demo/n$n
+  pgrac-init -D "$D" --node-id=$n --cluster-name=demo
+  printf '%s\n' "$PGRAC_CONF" > "$D/pgrac.conf"
+  {
+    echo "port = $((65433 + n))"
+    echo "unix_socket_directories = '/tmp'"
+    echo "listen_addresses = ''"
+    echo "cluster.interconnect_tier = tier1"
+  } >> "$D/postgresql.conf"
+  pgrac-start -D "$D" -l "/tmp/pgrac-demo/n$n.log" -w
+done
+
+# Membership + live interconnect state, observed from node 0:
+psql -h /tmp -p 65433 -d postgres \
+  -c 'SELECT node_id, hostname, role, is_self FROM pg_cluster_nodes ORDER BY node_id;'
+psql -h /tmp -p 65433 -d postgres \
+  -c 'SELECT node_id, state, heartbeat_send_count, heartbeat_recv_count
+        FROM pg_cluster_ic_peers WHERE heartbeat_recv_count > 0;'
+```
+
+Each node connects to its peers' `interconnect_addr`, exchanges a HELLO
+handshake, and trades a 1 Hz heartbeat; `pg_cluster_ic_peers` exposes the
+per-peer `state`, heartbeat counters, and last-seen timestamps.  Re-run the
+second query a few seconds apart and the counters climb.
+
+Because the shared `pgrac.conf` lists `[node.0]` first, `pgrac-start` prints
+a heuristic warning on every node whose id isn't `0` — startup still succeeds
+as long as this node's `cluster.node_id` appears as some `[node.N]`.  Across
+hosts, replace the loopback addresses with routable `host:port` pairs and make
+sure the interconnect ports are reachable.
+
 ## Current limitations
 
-- **Single node only**: cross-node interconnect is currently not
-  supported.  Setting `cluster.interconnect_tier` to anything other
-  than `stub` causes the postmaster to refuse to start with
-  `ERRCODE_FEATURE_NOT_SUPPORTED`.  See
+- **`tier1` carries the heartbeat path only**: the cross-node interconnect
+  carries LMON heartbeat and membership today.  Higher tiers (`tier2`+) are
+  not yet supported and cause the postmaster to refuse to start with
+  `ERRCODE_FEATURE_NOT_SUPPORTED`; cross-node GES / Cache Fusion / recovery
+  are scaffolded and likewise return `FEATURE_NOT_SUPPORTED`.  See
   [Configuration](configuration.md) for the GUC reference.
 - **Bash only**: `pgrac-init` / `pgrac-start` are bash scripts;
   they require a POSIX shell.  Windows is not currently supported.
-- **No multi-node bootstrap**: there is no built-in tool for
-  initialising N nodes simultaneously across hosts.  Each node
-  must be bootstrapped individually with the matching `--node-id`.
+- **No one-shot multi-node bootstrap**: there is no built-in tool for
+  initialising N nodes in a single command.  Each node is bootstrapped
+  individually with its matching `--node-id`, and topology changes require a
+  restart (`pgrac.conf` has no online reload).
 
 ## Reporting issues
 
-File issues at <https://github.com/sqlrush/linkdb/issues>.
+File issues at <https://github.com/sqlrush/pgrac/issues>.
