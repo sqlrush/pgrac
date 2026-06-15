@@ -1,0 +1,253 @@
+<svg viewBox="0 0 1200 620" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="pgrac cluster topology" preserveAspectRatio="xMidYMid meet">
+  <rect x="0" y="0" width="1200" height="620" fill="#0a0a0a"/>
+      <defs>
+        <marker id="tp-acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#5a9fd4"/>
+        </marker>
+        <marker id="tp-warm" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#c9a878"/>
+        </marker>
+        <marker id="tp-soft" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#7a7870"/>
+        </marker>
+        <linearGradient id="tp-ic" x1="0" x2="1">
+          <stop offset="0%"  stop-color="#5a9fd4" stop-opacity="0.06"/>
+          <stop offset="50%" stop-color="#5a9fd4" stop-opacity="0.18"/>
+          <stop offset="100%" stop-color="#5a9fd4" stop-opacity="0.06"/>
+        </linearGradient>
+        <linearGradient id="tp-ic-stroke" x1="0" x2="1">
+          <stop offset="0%"  stop-color="#5a9fd4" stop-opacity="0.25"/>
+          <stop offset="50%" stop-color="#5a9fd4" stop-opacity="0.55"/>
+          <stop offset="100%" stop-color="#5a9fd4" stop-opacity="0.25"/>
+        </linearGradient>
+        <radialGradient id="tp-glow" cx="0.5" cy="0.5">
+          <stop offset="0%"  stop-color="#5a9fd4" stop-opacity="0.18"/>
+          <stop offset="100%" stop-color="#5a9fd4" stop-opacity="0"/>
+        </radialGradient>
+      </defs>
+
+      <!-- Region eyebrows -->
+      <text x="90"  y="60" font-family="JetBrains Mono, monospace" font-size="10.5" fill="#7a7870" letter-spacing="0.18em">PRIMARY · 3 NODES</text>
+      <text x="880" y="60" font-family="JetBrains Mono, monospace" font-size="10.5" fill="#7a7870" letter-spacing="0.18em">STANDBY · ACTIVE DG</text>
+
+      <!-- Vertical region divider -->
+      <line x1="850" y1="80" x2="850" y2="392" stroke="rgba(255,255,255,0.10)" stroke-dasharray="2 5"/>
+
+      <!-- Cache fusion mesh arcs (above primaries) -->
+      <g fill="none">
+        <path d="M 190 116 Q 305 66 420 116" stroke="#5a9fd4" stroke-width="1.25" stroke-dasharray="4 3" marker-end="url(#tp-acc)" class="flow-arrow"/>
+        <path d="M 420 116 Q 535 66 650 116" stroke="#5a9fd4" stroke-width="1.25" stroke-dasharray="4 3" marker-end="url(#tp-acc)" class="flow-arrow" style="animation-delay:0.5s"/>
+        <path d="M 190 116 Q 420 32 650 116" stroke="#5a9fd4" stroke-width="1" stroke-dasharray="3 4" opacity="0.55" class="flow-arrow" style="animation-delay:1s"/>
+      </g>
+      <text x="420" y="40" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="#5a9fd4" letter-spacing="0.1em">CACHE FUSION · 5–10 μs</text>
+
+      <!-- Primaries -->
+      
+    <g transform="translate(90,110)">
+      <rect width="200" height="64" rx="4" fill="#1c1f24" stroke="#5a9fd4" stroke-width="1"/>
+      <rect x="0" y="0" width="3" height="64" fill="#5a9fd4"/>
+      <text x="14" y="22" font-family="JetBrains Mono, monospace" font-size="13" font-weight="500" fill="#f5f5f4">pgrac-1</text>
+      <text x="14" y="40" font-family="JetBrains Mono, monospace" font-size="10.5" fill="#b3b1a6">LMS · LMD · IC</text>
+      <g transform="translate(156,14)">
+        <rect width="32" height="14" rx="2" fill="rgba(255,255,255,0.04)" stroke="rgba(255,255,255,0.10)"/>
+        <text x="16" y="10.5" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" fill="#5a9fd4" letter-spacing="0.04em">MSTR</text>
+      </g>
+      <circle cx="188" cy="52" r="3" fill="#7fb069"><animate attributeName="opacity" values="0.35;1;0.35" dur="2.4s" repeatCount="indefinite"/></circle>
+    </g>
+    <g transform="translate(320,110)">
+      <rect width="200" height="64" rx="4" fill="#161616" stroke="rgba(255,255,255,0.18)" stroke-width="1"/>
+      <rect x="0" y="0" width="3" height="64" fill="#7a7870"/>
+      <text x="14" y="22" font-family="JetBrains Mono, monospace" font-size="13" font-weight="500" fill="#f5f5f4">pgrac-2</text>
+      <text x="14" y="40" font-family="JetBrains Mono, monospace" font-size="10.5" fill="#b3b1a6">LMS · LMD</text>
+      <g transform="translate(156,14)">
+        <rect width="32" height="14" rx="2" fill="rgba(255,255,255,0.04)" stroke="rgba(255,255,255,0.10)"/>
+        <text x="16" y="10.5" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" fill="#7a7870" letter-spacing="0.04em">PEER</text>
+      </g>
+      <circle cx="188" cy="52" r="3" fill="#7fb069"><animate attributeName="opacity" values="0.35;1;0.35" dur="2.6999999999999997s" repeatCount="indefinite"/></circle>
+    </g>
+    <g transform="translate(550,110)">
+      <rect width="200" height="64" rx="4" fill="#161616" stroke="rgba(255,255,255,0.18)" stroke-width="1"/>
+      <rect x="0" y="0" width="3" height="64" fill="#7a7870"/>
+      <text x="14" y="22" font-family="JetBrains Mono, monospace" font-size="13" font-weight="500" fill="#f5f5f4">pgrac-3</text>
+      <text x="14" y="40" font-family="JetBrains Mono, monospace" font-size="10.5" fill="#b3b1a6">LMS · LMD</text>
+      <g transform="translate(156,14)">
+        <rect width="32" height="14" rx="2" fill="rgba(255,255,255,0.04)" stroke="rgba(255,255,255,0.10)"/>
+        <text x="16" y="10.5" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" fill="#7a7870" letter-spacing="0.04em">PEER</text>
+      </g>
+      <circle cx="188" cy="52" r="3" fill="#7fb069"><animate attributeName="opacity" values="0.35;1;0.35" dur="3s" repeatCount="indefinite"/></circle>
+    </g>
+      <!-- Standbys -->
+      
+    <g transform="translate(880,110)">
+      <rect width="230" height="64" rx="4" fill="#161616" stroke="rgba(255,255,255,0.18)" stroke-width="1"/>
+      <rect x="0" y="0" width="3" height="64" fill="#7a7870"/>
+      <text x="14" y="22" font-family="JetBrains Mono, monospace" font-size="13" font-weight="500" fill="#f5f5f4">standby-1</text>
+      <text x="14" y="40" font-family="JetBrains Mono, monospace" font-size="10.5" fill="#b3b1a6">redo apply</text>
+      <g transform="translate(186,14)">
+        <rect width="32" height="14" rx="2" fill="rgba(255,255,255,0.04)" stroke="rgba(255,255,255,0.10)"/>
+        <text x="16" y="10.5" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" fill="#7a7870" letter-spacing="0.04em">PEER</text>
+      </g>
+      <circle cx="218" cy="52" r="3" fill="#7fb069"><animate attributeName="opacity" values="0.35;1;0.35" dur="3.3s" repeatCount="indefinite"/></circle>
+    </g>
+    <g transform="translate(880,196)">
+      <rect width="230" height="64" rx="4" fill="#161616" stroke="rgba(255,255,255,0.18)" stroke-width="1"/>
+      <rect x="0" y="0" width="3" height="64" fill="#7a7870"/>
+      <text x="14" y="22" font-family="JetBrains Mono, monospace" font-size="13" font-weight="500" fill="#f5f5f4">standby-2</text>
+      <text x="14" y="40" font-family="JetBrains Mono, monospace" font-size="10.5" fill="#b3b1a6">read-only</text>
+      <g transform="translate(186,14)">
+        <rect width="32" height="14" rx="2" fill="rgba(255,255,255,0.04)" stroke="rgba(255,255,255,0.10)"/>
+        <text x="16" y="10.5" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" fill="#7a7870" letter-spacing="0.04em">PEER</text>
+      </g>
+      <circle cx="218" cy="52" r="3" fill="#7fb069"><animate attributeName="opacity" values="0.35;1;0.35" dur="3.5999999999999996s" repeatCount="indefinite"/></circle>
+    </g>
+
+      <!-- Drop lines to interconnect from each primary -->
+      
+        <line x1="190" y1="174" x2="190" y2="230" stroke="rgba(255,255,255,0.18)" stroke-width="1"/>
+        <circle cx="190" cy="230" r="2.5" fill="#5a9fd4"/>
+      
+        <line x1="420" y1="174" x2="420" y2="230" stroke="rgba(255,255,255,0.18)" stroke-width="1"/>
+        <circle cx="420" cy="230" r="2.5" fill="#5a9fd4"/>
+      
+        <line x1="650" y1="174" x2="650" y2="230" stroke="rgba(255,255,255,0.18)" stroke-width="1"/>
+        <circle cx="650" cy="230" r="2.5" fill="#5a9fd4"/>
+      
+
+      <!-- Interconnect band -->
+      <g>
+        <rect x="60" y="230" width="700" height="36" rx="3" fill="url(#tp-ic)" stroke="url(#tp-ic-stroke)" stroke-width="1"/>
+        <text x="78" y="253" font-family="JetBrains Mono, monospace" font-size="11" fill="#f5f5f4" letter-spacing="0.1em">RDMA INTERCONNECT</text>
+        <text x="280" y="253" font-family="JetBrains Mono, monospace" font-size="10.5" fill="#b3b1a6">cache fusion · GES · sinval · global SCN</text>
+        <text x="744" y="253" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="10.5" fill="#5a9fd4">tier-3 · 5–10 μs</text>
+
+        <!-- moving fusion pulses inside band -->
+        <g>
+          <circle r="2" fill="#5a9fd4">
+            <animateMotion dur="3.2s" repeatCount="indefinite"
+              path="M 80 248 L 720 248"/>
+          </circle>
+          <circle r="2" fill="#7eb5e0">
+            <animateMotion dur="3.2s" begin="1s" repeatCount="indefinite"
+              path="M 720 248 L 80 248"/>
+          </circle>
+        </g>
+      </g>
+
+      <!-- Drop lines from interconnect to storage -->
+      
+        <line x1="190" y1="266" x2="190" y2="306" stroke="rgba(255,255,255,0.18)" stroke-width="1" stroke-dasharray="3 4" class="flow-arrow"/>
+      
+        <line x1="420" y1="266" x2="420" y2="306" stroke="rgba(255,255,255,0.18)" stroke-width="1" stroke-dasharray="3 4" class="flow-arrow"/>
+      
+        <line x1="650" y1="266" x2="650" y2="306" stroke="rgba(255,255,255,0.18)" stroke-width="1" stroke-dasharray="3 4" class="flow-arrow"/>
+      
+
+      <!-- Shared storage band -->
+      <g>
+        <rect x="60" y="306" width="700" height="76" rx="3" fill="#161616" stroke="rgba(255,255,255,0.10)"/>
+        <text x="78" y="328" font-family="JetBrains Mono, monospace" font-size="11" fill="#f5f5f4" letter-spacing="0.1em">SHARED STORAGE</text>
+        <text x="78" y="348" font-family="JetBrains Mono, monospace" font-size="10.5" fill="#b3b1a6">data files · WAL · per-instance undo · OCR · voting disk · control file</text>
+        <text x="78" y="366" font-family="JetBrains Mono, monospace" font-size="10" fill="#7a7870">single source of truth · accessed by all primary nodes</text>
+
+        <!-- disk stack glyph on right -->
+        <g transform="translate(620, 322)">
+          
+            <ellipse cx="0" cy="14" rx="16" ry="5" fill="#1c1c1c" stroke="rgba(255,255,255,0.18)"/>
+            <line x1="-16" y1="14" x2="-16" y2="30" stroke="rgba(255,255,255,0.18)"/>
+            <line x1="16" y1="14" x2="16" y2="30" stroke="rgba(255,255,255,0.18)"/>
+            <ellipse cx="0" cy="30" rx="16" ry="5" fill="#1c1c1c" stroke="rgba(255,255,255,0.18)"/>
+            <ellipse cx="0" cy="14" rx="6" ry="2" fill="#5a9fd4" opacity="0.4"/>
+          
+            <ellipse cx="38" cy="14" rx="16" ry="5" fill="#1c1c1c" stroke="rgba(255,255,255,0.18)"/>
+            <line x1="22" y1="14" x2="22" y2="30" stroke="rgba(255,255,255,0.18)"/>
+            <line x1="54" y1="14" x2="54" y2="30" stroke="rgba(255,255,255,0.18)"/>
+            <ellipse cx="38" cy="30" rx="16" ry="5" fill="#1c1c1c" stroke="rgba(255,255,255,0.18)"/>
+            <ellipse cx="38" cy="14" rx="6" ry="2" fill="#5a9fd4" opacity="0.4"/>
+          
+            <ellipse cx="76" cy="14" rx="16" ry="5" fill="#1c1c1c" stroke="rgba(255,255,255,0.18)"/>
+            <line x1="60" y1="14" x2="60" y2="30" stroke="rgba(255,255,255,0.18)"/>
+            <line x1="92" y1="14" x2="92" y2="30" stroke="rgba(255,255,255,0.18)"/>
+            <ellipse cx="76" cy="30" rx="16" ry="5" fill="#1c1c1c" stroke="rgba(255,255,255,0.18)"/>
+            <ellipse cx="76" cy="14" rx="6" ry="2" fill="#5a9fd4" opacity="0.4"/>
+          
+        </g>
+      </g>
+
+      <!-- Standby storage -->
+      <rect x="880" y="306" width="230" height="76" rx="3" fill="#161616" stroke="rgba(255,255,255,0.10)" stroke-dasharray="3 3"/>
+      <text x="894" y="328" font-family="JetBrains Mono, monospace" font-size="11" fill="#f5f5f4" letter-spacing="0.1em">STANDBY STORAGE</text>
+      <text x="894" y="348" font-family="JetBrains Mono, monospace" font-size="10.5" fill="#b3b1a6">replica volume · WAL · undo</text>
+      <text x="894" y="366" font-family="JetBrains Mono, monospace" font-size="10" fill="#7a7870">independent disk · async streaming</text>
+
+      <!-- Standby drop lines -->
+      
+        <line x1="995" y1="174" x2="995" y2="306" stroke="rgba(255,255,255,0.18)" stroke-width="1" stroke-dasharray="3 4"/>
+      
+        <line x1="995" y1="260" x2="995" y2="306" stroke="rgba(255,255,255,0.18)" stroke-width="1" stroke-dasharray="3 4"/>
+      
+
+      <!-- WAL streaming arrow primary->standby -->
+      <path d="M 760 142 C 810 142, 830 142, 876 142"
+            fill="none" stroke="#c9a878" stroke-width="1.25" stroke-dasharray="5 3" marker-end="url(#tp-warm)" class="flow-arrow"/>
+      <text x="820" y="130" text-anchor="middle"
+            font-family="JetBrains Mono, monospace" font-size="10.5" fill="#c9a878" letter-spacing="0.06em">REDO · &lt; 1s</text>
+
+      <!-- Client tier -->
+      <g>
+        <text x="90" y="432" font-family="JetBrains Mono, monospace" font-size="10.5" fill="#7a7870" letter-spacing="0.18em">CLIENTS · APPLICATION TIER</text>
+        <!-- SCAN router -->
+        <g transform="translate(90, 442)">
+          <rect width="180" height="42" rx="4" fill="#161616" stroke="rgba(255,255,255,0.18)"/>
+          <text x="14" y="18" font-family="JetBrains Mono, monospace" font-size="11" fill="#f5f5f4">SCAN listener</text>
+          <text x="14" y="33" font-family="JetBrains Mono, monospace" font-size="10" fill="#b3b1a6">VIP · TAF · FAN routing</text>
+        </g>
+        <!-- App boxes -->
+        
+          <g transform="translate(320, 442)">
+            <rect width="76" height="42" rx="4" fill="#161616" stroke="rgba(255,255,255,0.10)"/>
+            <text x="38" y="18" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10.5" fill="#f5f5f4">app-1</text>
+            <text x="38" y="32" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" fill="#7a7870">libpq</text>
+          </g>
+          <line x1="358" y1="442" x2="270" y2="463" stroke="rgba(255,255,255,0.10)" stroke-width="0.8"/>
+        
+          <g transform="translate(412, 442)">
+            <rect width="76" height="42" rx="4" fill="#161616" stroke="rgba(255,255,255,0.10)"/>
+            <text x="38" y="18" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10.5" fill="#f5f5f4">app-2</text>
+            <text x="38" y="32" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" fill="#7a7870">libpq</text>
+          </g>
+          <line x1="450" y1="442" x2="270" y2="463" stroke="rgba(255,255,255,0.10)" stroke-width="0.8"/>
+        
+          <g transform="translate(504, 442)">
+            <rect width="76" height="42" rx="4" fill="#161616" stroke="rgba(255,255,255,0.10)"/>
+            <text x="38" y="18" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10.5" fill="#f5f5f4">app-3</text>
+            <text x="38" y="32" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" fill="#7a7870">libpq</text>
+          </g>
+          <line x1="542" y1="442" x2="270" y2="463" stroke="rgba(255,255,255,0.10)" stroke-width="0.8"/>
+        
+          <g transform="translate(596, 442)">
+            <rect width="76" height="42" rx="4" fill="#161616" stroke="rgba(255,255,255,0.10)"/>
+            <text x="38" y="18" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10.5" fill="#f5f5f4">app-4</text>
+            <text x="38" y="32" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" fill="#7a7870">libpq</text>
+          </g>
+          <line x1="634" y1="442" x2="270" y2="463" stroke="rgba(255,255,255,0.10)" stroke-width="0.8"/>
+        
+
+        <!-- SCAN -> primary fan-out -->
+        
+          <path d="M 180 442 C 180 382, 190 254, 190 386"
+                fill="none" stroke="#5a9fd4" stroke-width="0.8" stroke-dasharray="2 4" opacity="0.45"/>
+        
+          <path d="M 180 442 C 180 382, 420 254, 420 386"
+                fill="none" stroke="#5a9fd4" stroke-width="0.8" stroke-dasharray="2 4" opacity="0.45"/>
+        
+          <path d="M 180 442 C 180 382, 650 254, 650 386"
+                fill="none" stroke="#5a9fd4" stroke-width="0.8" stroke-dasharray="2 4" opacity="0.45"/>
+        
+      </g>
+
+      <!-- Caption strip -->
+      <g transform="translate(60, 592)">
+        <text font-family="JetBrains Mono, monospace" font-size="10" fill="#7a7870" letter-spacing="0.14em">FIG · TOPOLOGY</text>
+        <text x="200" font-family="JetBrains Mono, monospace" font-size="10" fill="#7a7870">3 primary · 2 standby · 1 shared volume · RDMA fabric</text>
+      </g>
+    </svg>

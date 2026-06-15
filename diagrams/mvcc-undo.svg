@@ -1,0 +1,195 @@
+<svg viewBox="0 0 1200 560" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet" style="display:block;width:100%;height:auto;">
+<rect x="0" y="0" width="1200" height="560" fill="#0a0a0a"/>
+      
+    <rect x="20" y="20" width="1160" height="520" rx="4" fill="#171717" stroke="rgba(255,255,255,0.18)"/>
+    <text x="36" y="40" font-family="JetBrains Mono, monospace" font-size="10.5" fill="#7a7870" letter-spacing="0.18em">CLUSTER MVCC · DRIVEN BY GLOBAL SCN</text>
+    <text x="1164" y="40" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="10.5" fill="#7a7870">heap = data only · undo = history</text>
+    <line x1="36" y1="54" x2="1164" y2="54" stroke="rgba(255,255,255,0.10)"/>
+  
+      <!-- 3 nodes top -->
+      
+        <g transform="translate(100,90)">
+          <rect width="280" height="140" rx="4" fill="#1c1c1c" stroke="rgba(90,159,212,0.30)" stroke-width="1.1"/>
+          <rect width="280" height="3" fill="#5a9fd4"/>
+          <text x="16" y="26" font-family="JetBrains Mono, monospace" font-size="10.5" fill="#5a9fd4" letter-spacing="0.18em">NODE 1</text>
+          <text x="16" y="50" font-family="Inter, sans-serif" font-size="14" fill="#e8e6dc">backend · snapshot @ <tspan fill="#5a9fd4" font-weight="600">SCN 99 182</tspan></text>
+          <!-- heap row simplified -->
+          <g transform="translate(16,68)">
+            <rect width="248" height="22" rx="2" fill="rgba(255,255,255,0.04)"/>
+            <text x="8" y="15" font-family="JetBrains Mono, monospace" font-size="10" fill="#7a7870">heap</text>
+            <text x="80" y="15" font-family="JetBrains Mono, monospace" font-size="10" fill="#bfbcb0">id=42 · status=pending</text>
+            <text x="240" y="15" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="10" fill="#5a5a55">no xmin/xmax</text>
+          </g>
+          <g transform="translate(16,96)">
+            <rect width="248" height="32" rx="2" fill="rgba(90,159,212,0.10)" stroke="rgba(90,159,212,0.30)"/>
+            <text x="10" y="14" font-family="JetBrains Mono, monospace" font-size="10" fill="#5a9fd4" letter-spacing="0.18em">UNDO · NODE-LOCAL</text>
+            <text x="10" y="27" font-family="JetBrains Mono, monospace" font-size="10" fill="#bfbcb0">v3@98810 ← v2@97402 ← v1</text>
+          </g>
+        </g>
+      
+        <g transform="translate(440,90)">
+          <rect width="280" height="140" rx="4" fill="#1c1c1c" stroke="rgba(90,159,212,0.30)" stroke-width="1.1"/>
+          <rect width="280" height="3" fill="#5a9fd4"/>
+          <text x="16" y="26" font-family="JetBrains Mono, monospace" font-size="10.5" fill="#5a9fd4" letter-spacing="0.18em">NODE 2</text>
+          <text x="16" y="50" font-family="Inter, sans-serif" font-size="14" fill="#e8e6dc">backend · snapshot @ <tspan fill="#5a9fd4" font-weight="600">SCN 99 182</tspan></text>
+          <!-- heap row simplified -->
+          <g transform="translate(16,68)">
+            <rect width="248" height="22" rx="2" fill="rgba(255,255,255,0.04)"/>
+            <text x="8" y="15" font-family="JetBrains Mono, monospace" font-size="10" fill="#7a7870">heap</text>
+            <text x="80" y="15" font-family="JetBrains Mono, monospace" font-size="10" fill="#bfbcb0">id=42 · status=pending</text>
+            <text x="240" y="15" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="10" fill="#5a5a55">no xmin/xmax</text>
+          </g>
+          <g transform="translate(16,96)">
+            <rect width="248" height="32" rx="2" fill="rgba(90,159,212,0.10)" stroke="rgba(90,159,212,0.30)"/>
+            <text x="10" y="14" font-family="JetBrains Mono, monospace" font-size="10" fill="#5a9fd4" letter-spacing="0.18em">UNDO · NODE-LOCAL</text>
+            <text x="10" y="27" font-family="JetBrains Mono, monospace" font-size="10" fill="#bfbcb0">v3@98810 ← v2@97402 ← v1</text>
+          </g>
+        </g>
+      
+        <g transform="translate(780,90)">
+          <rect width="280" height="140" rx="4" fill="#1c1c1c" stroke="rgba(90,159,212,0.30)" stroke-width="1.1"/>
+          <rect width="280" height="3" fill="#5a9fd4"/>
+          <text x="16" y="26" font-family="JetBrains Mono, monospace" font-size="10.5" fill="#5a9fd4" letter-spacing="0.18em">NODE 3</text>
+          <text x="16" y="50" font-family="Inter, sans-serif" font-size="14" fill="#e8e6dc">backend · snapshot @ <tspan fill="#5a9fd4" font-weight="600">SCN 99 182</tspan></text>
+          <!-- heap row simplified -->
+          <g transform="translate(16,68)">
+            <rect width="248" height="22" rx="2" fill="rgba(255,255,255,0.04)"/>
+            <text x="8" y="15" font-family="JetBrains Mono, monospace" font-size="10" fill="#7a7870">heap</text>
+            <text x="80" y="15" font-family="JetBrains Mono, monospace" font-size="10" fill="#bfbcb0">id=42 · status=pending</text>
+            <text x="240" y="15" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="10" fill="#5a5a55">no xmin/xmax</text>
+          </g>
+          <g transform="translate(16,96)">
+            <rect width="248" height="32" rx="2" fill="rgba(90,159,212,0.10)" stroke="rgba(90,159,212,0.30)"/>
+            <text x="10" y="14" font-family="JetBrains Mono, monospace" font-size="10" fill="#5a9fd4" letter-spacing="0.18em">UNDO · NODE-LOCAL</text>
+            <text x="10" y="27" font-family="JetBrains Mono, monospace" font-size="10" fill="#bfbcb0">v3@98810 ← v2@97402 ← v1</text>
+          </g>
+        </g>
+      
+      <!-- consistency band -->
+      <g transform="translate(60,290)">
+        <defs>
+          <linearGradient id="mvcc-band" x1="0" x2="1">
+            <stop offset="0%" stop-color="#5a9fd4" stop-opacity="0.06"/>
+            <stop offset="50%" stop-color="#5a9fd4" stop-opacity="0.22"/>
+            <stop offset="100%" stop-color="#5a9fd4" stop-opacity="0.06"/>
+          </linearGradient>
+        </defs>
+        <rect width="1080" height="64" rx="4" fill="url(#mvcc-band)" stroke="rgba(90,159,212,0.30)"/>
+        <text x="20" y="22" font-family="JetBrains Mono, monospace" font-size="10" fill="#5a9fd4" letter-spacing="0.18em">GLOBAL VISIBILITY ARBITER · GLOBAL SCN</text>
+        <text x="20" y="44" font-family="JetBrains Mono, monospace" font-size="11" fill="#bfbcb0">rule: txn-commit-SCN ≤ snapshot-SCN ⇒ visible</text>
+        <text x="1060" y="40" text-anchor="end" font-family="Inter, sans-serif" font-size="22" font-weight="600" fill="#5a9fd4">SCN 99 182</text>
+      </g>
+      <!-- pulses from nodes to band -->
+      
+        <path d="M 240 230 L 240 290" fill="none" stroke="#5a9fd4" stroke-opacity="0.4" stroke-width="1.2" stroke-dasharray="3 4"/>
+        
+    <circle r="3" fill="#5a9fd4"><animateMotion dur="2.4s" repeatCount="indefinite" path="M 240 230 L 240 290"/></circle>
+  
+      
+        <path d="M 580 230 L 580 290" fill="none" stroke="#5a9fd4" stroke-opacity="0.4" stroke-width="1.2" stroke-dasharray="3 4"/>
+        
+    <circle r="3" fill="#5a9fd4"><animateMotion dur="2.4s" repeatCount="indefinite" path="M 580 230 L 580 290"/></circle>
+  
+      
+        <path d="M 920 230 L 920 290" fill="none" stroke="#5a9fd4" stroke-opacity="0.4" stroke-width="1.2" stroke-dasharray="3 4"/>
+        
+    <circle r="3" fill="#5a9fd4"><animateMotion dur="2.4s" repeatCount="indefinite" path="M 920 230 L 920 290"/></circle>
+  
+      
+
+      <!-- Undo timeline at bottom -->
+      <g transform="translate(80,400)">
+        <text x="0" y="-10" font-family="JetBrains Mono, monospace" font-size="10" fill="#7a7870" letter-spacing="0.18em">PER-NODE UNDO CHAINS</text>
+        
+          <g transform="translate(0,0)">
+            <text x="0" y="14" font-family="JetBrains Mono, monospace" font-size="10" fill="#7a7870">N1</text>
+            
+              <g transform="translate(36,0)">
+                <rect width="180" height="22" rx="2" fill="#1c1c1c" stroke="#5a9fd4"/>
+                <text x="10" y="15" font-family="JetBrains Mono, monospace" font-size="10" fill="#5a9fd4">v5@SCN 99182</text>
+              </g>
+            
+              <g transform="translate(236,0)">
+                <rect width="180" height="22" rx="2" fill="#1c1c1c" stroke="rgba(255,255,255,0.18)"/>
+                <text x="10" y="15" font-family="JetBrains Mono, monospace" font-size="10" fill="#bfbcb0">v4@SCN 97942</text>
+              </g>
+            
+              <g transform="translate(436,0)">
+                <rect width="180" height="22" rx="2" fill="#1c1c1c" stroke="rgba(255,255,255,0.18)"/>
+                <text x="10" y="15" font-family="JetBrains Mono, monospace" font-size="10" fill="#bfbcb0">v3@SCN 96702</text>
+              </g>
+            
+              <g transform="translate(636,0)">
+                <rect width="180" height="22" rx="2" fill="#1c1c1c" stroke="rgba(255,255,255,0.18)"/>
+                <text x="10" y="15" font-family="JetBrains Mono, monospace" font-size="10" fill="#bfbcb0">v2@SCN 95462</text>
+              </g>
+            
+              <g transform="translate(836,0)">
+                <rect width="180" height="22" rx="2" fill="#1c1c1c" stroke="rgba(255,255,255,0.18)"/>
+                <text x="10" y="15" font-family="JetBrains Mono, monospace" font-size="10" fill="#bfbcb0">v1@SCN 94222</text>
+              </g>
+            
+          </g>
+        
+          <g transform="translate(0,30)">
+            <text x="0" y="14" font-family="JetBrains Mono, monospace" font-size="10" fill="#7a7870">N2</text>
+            
+              <g transform="translate(36,0)">
+                <rect width="180" height="22" rx="2" fill="#1c1c1c" stroke="#5a9fd4"/>
+                <text x="10" y="15" font-family="JetBrains Mono, monospace" font-size="10" fill="#5a9fd4">v5@SCN 99182</text>
+              </g>
+            
+              <g transform="translate(236,0)">
+                <rect width="180" height="22" rx="2" fill="#1c1c1c" stroke="rgba(255,255,255,0.18)"/>
+                <text x="10" y="15" font-family="JetBrains Mono, monospace" font-size="10" fill="#bfbcb0">v4@SCN 97942</text>
+              </g>
+            
+              <g transform="translate(436,0)">
+                <rect width="180" height="22" rx="2" fill="#1c1c1c" stroke="rgba(255,255,255,0.18)"/>
+                <text x="10" y="15" font-family="JetBrains Mono, monospace" font-size="10" fill="#bfbcb0">v3@SCN 96702</text>
+              </g>
+            
+              <g transform="translate(636,0)">
+                <rect width="180" height="22" rx="2" fill="#1c1c1c" stroke="rgba(255,255,255,0.18)"/>
+                <text x="10" y="15" font-family="JetBrains Mono, monospace" font-size="10" fill="#bfbcb0">v2@SCN 95462</text>
+              </g>
+            
+              <g transform="translate(836,0)">
+                <rect width="180" height="22" rx="2" fill="#1c1c1c" stroke="rgba(255,255,255,0.18)"/>
+                <text x="10" y="15" font-family="JetBrains Mono, monospace" font-size="10" fill="#bfbcb0">v1@SCN 94222</text>
+              </g>
+            
+          </g>
+        
+          <g transform="translate(0,60)">
+            <text x="0" y="14" font-family="JetBrains Mono, monospace" font-size="10" fill="#7a7870">N3</text>
+            
+              <g transform="translate(36,0)">
+                <rect width="180" height="22" rx="2" fill="#1c1c1c" stroke="#5a9fd4"/>
+                <text x="10" y="15" font-family="JetBrains Mono, monospace" font-size="10" fill="#5a9fd4">v5@SCN 99182</text>
+              </g>
+            
+              <g transform="translate(236,0)">
+                <rect width="180" height="22" rx="2" fill="#1c1c1c" stroke="rgba(255,255,255,0.18)"/>
+                <text x="10" y="15" font-family="JetBrains Mono, monospace" font-size="10" fill="#bfbcb0">v4@SCN 97942</text>
+              </g>
+            
+              <g transform="translate(436,0)">
+                <rect width="180" height="22" rx="2" fill="#1c1c1c" stroke="rgba(255,255,255,0.18)"/>
+                <text x="10" y="15" font-family="JetBrains Mono, monospace" font-size="10" fill="#bfbcb0">v3@SCN 96702</text>
+              </g>
+            
+              <g transform="translate(636,0)">
+                <rect width="180" height="22" rx="2" fill="#1c1c1c" stroke="rgba(255,255,255,0.18)"/>
+                <text x="10" y="15" font-family="JetBrains Mono, monospace" font-size="10" fill="#bfbcb0">v2@SCN 95462</text>
+              </g>
+            
+              <g transform="translate(836,0)">
+                <rect width="180" height="22" rx="2" fill="#1c1c1c" stroke="rgba(255,255,255,0.18)"/>
+                <text x="10" y="15" font-family="JetBrains Mono, monospace" font-size="10" fill="#bfbcb0">v1@SCN 94222</text>
+              </g>
+            
+          </g>
+        
+      </g>
+    </svg>
