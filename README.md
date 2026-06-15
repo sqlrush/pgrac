@@ -1,37 +1,53 @@
-# linkdb
+# pgrac
 
-linkdb is a PostgreSQL 16.13 fork that adds cluster-aware features:
-shared-disk multi-node deployment, a cluster topology layer, an
-inter-node IPC abstraction, and the SQL surface (system views,
-GUCs, wait events, error codes) needed to operate them.  It targets
-the same problem space as Oracle Real Application Clusters.
+**I'm reimplementing Oracle RAC on PostgreSQL — in the open.**
 
-The disable-cluster build is binary-equivalent to upstream
-PostgreSQL 16.13 and passes the standard 219-test regression suite
-unchanged.
+PostgreSQL has never had a shared-disk, multi-active cluster (its HA is
+shared-nothing replication). pgrac brings the Oracle RAC model — many nodes,
+one shared database, Cache Fusion / SCN / GES — to PostgreSQL 16.13.
 
-## Status
+> ⚠️ **Early stage, built in public.**
+>
+> **Working now:** the cluster substrate — a TCP interconnect carrying a 1 Hz
+> LMON heartbeat (declared peers handshake and trade heartbeats; per-peer state
+> in `pg_cluster_ic_peers`), block-format extensions (SCN / ITL slots / a
+> dedicated undo tablespace, OID 9100), and multi-node `pgrac.conf` bootstrap.
+>
+> **Scaffolded, not yet active:** Cache Fusion, GES, cross-node recovery —
+> operations needing them return `ERRCODE_FEATURE_NOT_SUPPORTED`.
+>
+> **Sanity anchor:** the `--disable-cluster` build is binary-identical to
+> upstream PostgreSQL 16.13 and passes the full 219-test regression suite.
+>
+> ⭐ If "Postgres with RAC-style shared storage" is something you've wanted,
+> star the repo to follow the build.
 
-**Stage 2 Phase 2.A in progress.**  Stage 0 (cluster subsystem scaffolding --
-GUCs / shmem / IPC abstraction / topology / system views / wait events /
-pgrac-init bootstrap tools) is complete.  Stage 1 has shipped block
-format extensions (PageHeader pd_block_scn / ITL slot array / BufferDesc
-cluster fields), commit local_scn maintenance, walwriter BOC, WAL
-record xl_scn, WAL Page Header xlp_thread_id, and the dedicated undo
-tablespace (`pg_undo` OID 9100) atomic batch.  Stage 2 has shipped
-multi-node `pgrac.conf` activation and the Tier 1 (TCP) inter-node
-interconnect carrying the LMON heartbeat: every pair of declared peers
-establishes a full-duplex socket, exchanges a HELLO handshake, and
-trades 1 Hz heartbeats; runtime per-peer state is exposed via
-`pg_cluster_ic_peers`.  Higher-level cross-node functionality (GES /
-PCM / Cache Fusion / Reconfiguration / Recovery) is scaffolded but not
-yet active; operations that would require it return
-`ERRCODE_FEATURE_NOT_SUPPORTED`.
+**Project site:** **[pgrac.dev](https://pgrac.dev)** — architecture deep-dives,
+the full feature catalog, and a side-by-side comparison with Oracle RAC
+(coming online).
 
-Stage 1 OLTP performance regression vs vanilla PG 16.13 is verified by
-`scripts/perf/run-stage1-oltp-baseline.sh` (manual; ~4.5 hour `--full`
-run; pgbench TPC-B 27 combos across 3 scales × 3 modes × 3 client
-levels).  See pgrac private docs for measured baselines.
+## Architecture
+
+pgrac targets the full Oracle RAC model. Part of it runs today; much is still
+being built (see the status above) — these diagrams show the design.
+
+**Cluster topology** — shared storage, interconnect, Cache Fusion, Active DG standby:
+
+![cluster topology](docs/architecture/diagrams/topology.svg)
+
+**The stack** — which layers are stock PostgreSQL vs. pgrac additions:
+
+![the stack](docs/architecture/diagrams/stack.svg)
+
+**Cache Fusion** — the 3-way GRD protocol *(scaffolded today)*:
+
+![cache fusion protocol](docs/architecture/diagrams/cache-fusion.svg)
+
+**Cluster MVCC** — global-SCN visibility + per-node undo *(design)*:
+
+![cluster mvcc](docs/architecture/diagrams/mvcc-undo.svg)
+
+More diagrams and deep-dives at **[pgrac.dev](https://pgrac.dev)**.
 
 ## Documentation
 
@@ -46,54 +62,57 @@ User-facing manual:
 | Wait events reference | [docs/reference/wait-events.md](docs/reference/wait-events.md) |
 | Architecture overview | [docs/architecture/overview.md](docs/architecture/overview.md) |
 
-PostgreSQL upstream documentation lives under `doc/` and is
-shipped unchanged from the upstream tree.
+PostgreSQL upstream documentation lives under `doc/` and is shipped unchanged
+from the upstream tree.
 
 ## Quick start
 
 ```bash
-git clone https://github.com/sqlrush/linkdb.git
-cd linkdb
+git clone https://github.com/sqlrush/pgrac.git
+cd pgrac
 
-./configure --prefix=$HOME/linkdb-install \
+./configure --prefix=$HOME/pgrac-install \
             --enable-cluster --enable-tap-tests \
             --with-openssl --with-icu --with-lz4 --with-zstd
 make -j$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu)
 make install
 
-export PATH=$HOME/linkdb-install/bin:$PATH
+export PATH=$HOME/pgrac-install/bin:$PATH
 
-pgrac-init -D /tmp/linkdb-demo --node-id=0 --cluster-name=demo
-echo "port = 65433"                                  >> /tmp/linkdb-demo/postgresql.conf
-echo "unix_socket_directories = '/tmp'"              >> /tmp/linkdb-demo/postgresql.conf
-echo "listen_addresses = ''"                         >> /tmp/linkdb-demo/postgresql.conf
+pgrac-init -D /tmp/pgrac-demo --node-id=0 --cluster-name=demo
+echo "port = 65433"                                  >> /tmp/pgrac-demo/postgresql.conf
+echo "unix_socket_directories = '/tmp'"              >> /tmp/pgrac-demo/postgresql.conf
+echo "listen_addresses = ''"                         >> /tmp/pgrac-demo/postgresql.conf
 
-pgrac-start -D /tmp/linkdb-demo -l /tmp/linkdb-demo.log -w
+pgrac-start -D /tmp/pgrac-demo -l /tmp/pgrac-demo.log -w
 psql -h /tmp -p 65433 -d postgres -c 'SELECT * FROM pg_cluster_nodes;'
 ```
 
-See [docs/user-guide/bootstrap.md](docs/user-guide/bootstrap.md)
-for details.
+See [docs/user-guide/bootstrap.md](docs/user-guide/bootstrap.md) for details.
 
 ## Building from source
 
-The build follows the standard PostgreSQL `configure` + `make` +
-`make install` flow.  Two extra flags are linkdb-specific:
+The build follows the standard PostgreSQL `configure` + `make` + `make install`
+flow. Two extra flags are pgrac-specific:
 
 - `--enable-cluster` activates the cluster subsystem.
 - `--enable-tap-tests` enables the TAP test suites (Perl).
 
-See [docs/user-guide/install.md](docs/user-guide/install.md) for
-the complete dependency list and step-by-step instructions on
-macOS and Linux.
+See [docs/user-guide/install.md](docs/user-guide/install.md) for the complete
+dependency list and step-by-step instructions on macOS and Linux.
+
+## Contributing
+
+pgrac is built in public and early — testing, feedback, and patches all help.
+See [CONTRIBUTING.md](CONTRIBUTING.md) and the `good first issue` label.
 
 ## License
 
-PostgreSQL License (BSD-style).  See `LICENSE` and `COPYRIGHT`.
+PostgreSQL License (BSD-style). See `LICENSE` and `COPYRIGHT`.
 
 ## Reporting issues
 
-File issues at <https://github.com/sqlrush/linkdb/issues>.
+File issues at <https://github.com/sqlrush/pgrac/issues>.
 
 ## Upstream
 
