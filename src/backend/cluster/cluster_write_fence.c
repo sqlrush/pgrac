@@ -35,8 +35,21 @@
 #include "utils/timestamp.h"
 
 #include "cluster/cluster_epoch.h"		 /* cluster_epoch_get_current */
+#include "cluster/cluster_qvotec.h"		 /* ClusterVotingSlot (marker layout asserts) */
 #include "cluster/cluster_shmem.h"		 /* cluster_shmem_register_region */
-#include "cluster/cluster_write_fence.h" /* region + judge + wrapper */
+#include "cluster/cluster_write_fence.h" /* region + judge + wrapper + marker */
+
+/*
+ * spec-4.12 D1: pin the fence-marker on-disk layout against the voting slot, so a
+ * future change to either side fails to compile rather than silently corrupting
+ * the durable marker (the marker rides in _reserved1, protected by the slot CRC).
+ */
+StaticAssertDecl(offsetof(ClusterVotingSlot, _reserved1) == 128,
+				 "fence marker assumes voting slot _reserved1 at offset 128");
+StaticAssertDecl(sizeof(ClusterFenceMarker) == CLUSTER_FENCE_MARKER_BYTES,
+				 "ClusterFenceMarker must be exactly CLUSTER_FENCE_MARKER_BYTES");
+StaticAssertDecl(CLUSTER_FENCE_MARKER_BYTES <= sizeof(((ClusterVotingSlot *)0)->_reserved1),
+				 "fence marker must fit in the voting slot _reserved1 area");
 
 /*
  * GUC storage (registered by cluster_guc.c in D7).  Default OFF until the

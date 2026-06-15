@@ -61,9 +61,9 @@
  * shmem token and calls this.
  */
 static inline bool
-cluster_write_fence_decide(bool enforcement_on, bool region_attached,
-						   uint64 epoch_current, uint64 authorized_epoch, uint64 now_us,
-						   uint64 lease_expire_us, bool self_fenced)
+cluster_write_fence_decide(bool enforcement_on, bool region_attached, uint64 epoch_current,
+						   uint64 authorized_epoch, uint64 now_us, uint64 lease_expire_us,
+						   bool self_fenced)
 {
 	if (!enforcement_on)
 		return true; /* escape hatch: off / dev */
@@ -75,6 +75,59 @@ cluster_write_fence_decide(bool enforcement_on, bool region_attached,
 		return false; /* exact == (P0b / user 修正 3): a stale node must not write */
 	if (now_us >= lease_expire_us)
 		return false; /* lease expired: failed to refresh (partition) */
+	return true;
+}
+
+/*
+ * ClusterFenceMarker -- the durable fence marker (spec-4.12 D1).  Embedded in the
+ * voting slot's _reserved1[368] (offset 128; the slot CRC over bytes 0..507 already
+ * protects it, so no on-disk ABI / torn-write change).  Fixed 64 bytes
+ * (CLUSTER_FENCE_MARKER_BYTES) -- pinned by static asserts in cluster_qvotec.c.
+ *
+ *	magic == 0 (or != CLUSTER_FENCE_MARKER_MAGIC) means NO marker (no fence).
+ *	fence_epoch is the AUTHORITATIVE ordering key (monotonic -- epoch only
+ *	increases); fence_generation tie-breaks the same epoch.  fence_event_id is the
+ *	ReconfigEvent siphash -- IDENTITY ONLY, never used for max()/sort (it is a hash,
+ *	not monotonic; spec-4.12 P0b).  fenced_dead_bitmap carries the full multi-dead
+ *	set so a 3-node reconfig declaring 2 dead is complete (user 修正 4).
+ */
+#define CLUSTER_FENCE_MARKER_MAGIC 0x46454E43U /* 'FENC' */
+#define CLUSTER_FENCE_MARKER_VERSION 1U
+#define CLUSTER_FENCE_MARKER_BYTES 64
+#define CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES 16
+
+typedef struct ClusterFenceMarker {
+	uint32 magic;			 /* CLUSTER_FENCE_MARKER_MAGIC, or 0 = no marker */
+	uint32 version;			 /* CLUSTER_FENCE_MARKER_VERSION */
+	uint64 fence_epoch;		 /* AUTHORITATIVE ordering key (monotonic) */
+	uint64 fence_event_id;	 /* ReconfigEvent siphash -- identity only (P0b) */
+	uint64 fence_generation; /* cssd_dead_generation -- same-epoch tie-break */
+	int32 issuer_node_id;	 /* coordinator that issued this fence */
+	uint8 fenced_dead_bitmap[CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES];
+	uint8 _pad[12]; /* pad to exactly CLUSTER_FENCE_MARKER_BYTES */
+} ClusterFenceMarker;
+
+/*
+ * cluster_fence_marker_pack -- write a marker into a voting slot's _reserved1
+ *	bytes (the first CLUSTER_FENCE_MARKER_BYTES); the remaining reserved bytes are
+ *	left untouched (other future reserved uses coexist).
+ * cluster_fence_marker_unpack -- read a marker from _reserved1; returns false when
+ *	there is no valid marker (magic mismatch) and leaves *out zeroed.
+ */
+static inline void
+cluster_fence_marker_pack(uint8 *reserved1, const ClusterFenceMarker *m)
+{
+	memcpy(reserved1, m, sizeof(*m)); /* occupies _reserved1[0..63]; rest untouched */
+}
+
+static inline bool
+cluster_fence_marker_unpack(const uint8 *reserved1, ClusterFenceMarker *out)
+{
+	memcpy(out, reserved1, sizeof(*out));
+	if (out->magic != CLUSTER_FENCE_MARKER_MAGIC) {
+		memset(out, 0, sizeof(*out)); /* no valid marker -> leave *out zeroed */
+		return false;
+	}
 	return true;
 }
 
@@ -109,9 +162,9 @@ typedef struct ClusterWriteFenceShmem {
 	pg_atomic_uint64 lease_expire_at_us; /* qvotec-refreshed lease deadline */
 	pg_atomic_uint32 self_fenced;		 /* this node is in fenced_dead_bitmap */
 	uint8 fenced_dead_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
-	pg_atomic_uint64 fence_event_id;	 /* identity of the active fence (not ordered) */
-	pg_atomic_uint64 hot_gate_blocked;	 /* counter: hot-path fail-closed */
-	pg_atomic_uint64 durable_check_blocked; /* counter: recovery/rejoin direct-check fail */
+	pg_atomic_uint64 fence_event_id;		  /* identity of the active fence (not ordered) */
+	pg_atomic_uint64 hot_gate_blocked;		  /* counter: hot-path fail-closed */
+	pg_atomic_uint64 durable_check_blocked;	  /* counter: recovery/rejoin direct-check fail */
 	pg_atomic_uint64 minority_marker_ignored; /* counter: partial/minority marker rejected */
 } ClusterWriteFenceShmem;
 

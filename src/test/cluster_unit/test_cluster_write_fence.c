@@ -40,7 +40,7 @@ ExceptionalCondition(const char *conditionName, const char *fileName, int lineNu
 }
 
 /* Named-field helper so the truth table reads clearly. */
-#define DECIDE(enf, attached, ep, auth, now, expire, self)                                          \
+#define DECIDE(enf, attached, ep, auth, now, expire, self)                                         \
 	cluster_write_fence_decide((enf), (attached), (ep), (auth), (now), (expire), (self))
 
 /* A fully-authorized baseline (allowed): on, attached, epoch matches, lease valid, not fenced. */
@@ -90,10 +90,69 @@ UT_TEST(test_lease_just_valid_is_allowed)
 }
 
 
+/* ----------
+ * spec-4.12 D1: the durable fence marker pack/unpack into the voting slot's
+ * _reserved1 bytes (the CRC over 0..507 already protects it).
+ * ----------
+ */
+UT_TEST(test_marker_pack_unpack_roundtrip)
+{
+	uint8 reserved1[368];
+	ClusterFenceMarker in;
+	ClusterFenceMarker out;
+
+	memset(reserved1, 0xAB, sizeof(reserved1)); /* non-zero fill: catch over/under-copy */
+	memset(&in, 0, sizeof(in));
+	in.magic = CLUSTER_FENCE_MARKER_MAGIC;
+	in.version = CLUSTER_FENCE_MARKER_VERSION;
+	in.fence_epoch = UINT64CONST(0x1122334455667788);
+	in.fence_event_id = UINT64CONST(0xDEADBEEFCAFEBABE);
+	in.fence_generation = 7;
+	in.issuer_node_id = 3;
+	in.fenced_dead_bitmap[0] = 0x05; /* nodes 0 and 2 declared dead (multi-dead) */
+
+	cluster_fence_marker_pack(reserved1, &in);
+	UT_ASSERT(cluster_fence_marker_unpack(reserved1, &out));
+	UT_ASSERT(out.fence_epoch == in.fence_epoch);
+	UT_ASSERT(out.fence_event_id == in.fence_event_id);
+	UT_ASSERT(out.fence_generation == 7);
+	UT_ASSERT(out.issuer_node_id == 3);
+	UT_ASSERT(out.fenced_dead_bitmap[0] == 0x05);
+}
+
+UT_TEST(test_marker_magic_absent_is_no_marker)
+{
+	uint8 reserved1[368];
+	ClusterFenceMarker out;
+
+	memset(reserved1, 0, sizeof(reserved1)); /* zeroed reserved -> magic 0 -> no marker */
+	UT_ASSERT(!cluster_fence_marker_unpack(reserved1, &out));
+}
+
+UT_TEST(test_marker_pack_leaves_trailing_reserved_untouched)
+{
+	uint8 reserved1[368];
+	ClusterFenceMarker in;
+
+	memset(reserved1, 0xAB, sizeof(reserved1));
+	memset(&in, 0, sizeof(in));
+	in.magic = CLUSTER_FENCE_MARKER_MAGIC;
+	cluster_fence_marker_pack(reserved1, &in);
+	/* the marker occupies [0..63]; the rest of _reserved1 must be untouched. */
+	UT_ASSERT(reserved1[CLUSTER_FENCE_MARKER_BYTES] == 0xAB);
+	UT_ASSERT(reserved1[367] == 0xAB);
+}
+
+UT_TEST(test_marker_size_pinned)
+{
+	UT_ASSERT((int)sizeof(ClusterFenceMarker) == CLUSTER_FENCE_MARKER_BYTES);
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(11);
 	UT_RUN(test_enforcement_off_is_escape_hatch);
 	UT_RUN(test_baseline_authorized_is_allowed);
 	UT_RUN(test_detached_region_fails_closed);
@@ -101,6 +160,10 @@ main(void)
 	UT_RUN(test_stale_epoch_fails_closed_exact_compare);
 	UT_RUN(test_lease_expired_fails_closed);
 	UT_RUN(test_lease_just_valid_is_allowed);
+	UT_RUN(test_marker_pack_unpack_roundtrip);
+	UT_RUN(test_marker_magic_absent_is_no_marker);
+	UT_RUN(test_marker_pack_leaves_trailing_reserved_untouched);
+	UT_RUN(test_marker_size_pinned);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
