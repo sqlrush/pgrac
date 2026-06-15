@@ -146,8 +146,8 @@ ok($phase_val =~ /^(init|running|shutdown|reconfig)$/,
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'100',
-	'E1 pg_stat_cluster_wait_events returns 100 rows (spec-4.11 D5 +1 ClusterThreadRecovery)');
+	'102',
+	'E1 pg_stat_cluster_wait_events returns 102 rows (spec-4.12 D7 +2 write-fence events)');
 
 ok($node->safe_psql('postgres',
 		q{SELECT count(*) > 0 FROM pg_stat_cluster_wait_events WHERE type='Cluster: GES'})
@@ -159,7 +159,7 @@ ok($node->safe_psql('postgres',
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_gcluster_wait_events'),
-	'100', 'E4 pg_stat_gcluster_wait_events returns 100 rows (single-node, spec-4.11 D5 baseline)');
+	'102', 'E4 pg_stat_gcluster_wait_events returns 102 rows (single-node, spec-4.12 D7 baseline)');
 
 
 # ============================================================
@@ -368,8 +368,8 @@ ok($node->safe_psql('postgres',
 
 is($node->safe_psql('postgres',
 		q{SELECT string_agg(DISTINCT category, ',' ORDER BY category) FROM pg_cluster_state}),
-	'block_format,buffer_format,cluster_cssd,cluster_stats,conf,cr,diag,gcs,gcs_recovery,ges,grd,grd_recovery,guc,ic,inject,lck,lmd,lmon,lms,pcm,pgstat,phase,recovery,scn,shared_fs,shmem,sinval,tt_2pc,tt_recovery,tt_status,tt_status_hint,undo,undo_cleaner,visibility,wal_thread',
-	'O2 pg_cluster_state has all 35 categories (tt_recovery added in spec-4.8)');
+	'block_format,buffer_format,cluster_cssd,cluster_stats,conf,cr,diag,gcs,gcs_recovery,ges,grd,grd_recovery,guc,ic,inject,lck,lmd,lmon,lms,pcm,pgstat,phase,recovery,scn,shared_fs,shmem,sinval,tt_2pc,tt_recovery,tt_status,tt_status_hint,undo,undo_cleaner,visibility,wal_thread,write_fence',
+	'O2 pg_cluster_state has all 36 categories (write_fence added in spec-4.12)');
 
 is($node->safe_psql('postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE value IS NULL}),

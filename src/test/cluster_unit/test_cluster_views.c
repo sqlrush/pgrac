@@ -196,7 +196,7 @@ UT_TEST(test_cluster_wait_events_count_is_99)
 	 * enum in wait_event.h and CLUSTER_WAIT_EVENTS_COUNT must move
 	 * together, and this test number must be bumped in lockstep.
 	 */
-	UT_ASSERT_EQ(CLUSTER_WAIT_EVENTS_COUNT, 100);
+	UT_ASSERT_EQ(CLUSTER_WAIT_EVENTS_COUNT, 102);
 }
 
 

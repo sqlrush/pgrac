@@ -205,7 +205,7 @@ UT_TEST(test_cluster_wait_events_count_97)
 	 * spec-4.6 D4: 97 → 98 (+ 1 GRD shard remaster short-wait).
 	 * spec-4.7 D1: 98 → 99 (+ 1 GCS block RECOVERING short-wait).
 	 * spec-4.11 D5: 99 → 100 (+ 1 online thread recovery short-wait). */
-	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 100);
+	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 102);
 }
 
 

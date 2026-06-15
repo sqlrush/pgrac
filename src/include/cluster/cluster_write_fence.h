@@ -384,6 +384,12 @@ extern bool cluster_write_fence_verify_durable(uint64 required_epoch);
  */
 extern bool cluster_write_fence_startup_self_check(void);
 
+/* D7 observability counter accessors (cluster_debug 'write_fence' category). */
+extern uint64 cluster_write_fence_get_hot_gate_blocked(void);
+extern uint64 cluster_write_fence_get_durable_check_blocked(void);
+extern uint64 cluster_write_fence_get_minority_marker_ignored(void);
+extern uint64 cluster_write_fence_get_marker_write_failed(void);
+
 #endif /* !FRONTEND */
 
 #endif /* CLUSTER_WRITE_FENCE_H */

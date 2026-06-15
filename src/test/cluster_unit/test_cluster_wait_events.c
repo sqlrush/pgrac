@@ -215,12 +215,17 @@ UT_TEST(test_per_category_event_counts)
 				 5);
 	UT_ASSERT_EQ(
 		(uint32)WAIT_EVENT_SCN_ADVANCE_BROADCAST - (uint32)WAIT_EVENT_SCN_BOC_FLUSH_WAIT + 1, 4);
-	UT_ASSERT_EQ(
-		(uint32)WAIT_EVENT_RECONFIG_BARRIER_WAIT - (uint32)WAIT_EVENT_RECONFIG_GRD_REBUILD + 1, 5);
-	/* Recovery category: 5 (#86) + ClusterThreadRecovery (spec-4.11 D5) = 6.
-	 * Count the full range to the LAST event so future additions are caught (F12). */
-	UT_ASSERT_EQ(
-		(uint32)WAIT_EVENT_CLUSTER_THREAD_RECOVERY - (uint32)WAIT_EVENT_RECOVERY_WAL_FETCH + 1, 6);
+	/* Reconfig category: 5 (#14/#20) + ClusterGrdShardRemaster (spec-4.6 D4) +
+	 * ClusterWriteFenceMarkerWrite (spec-4.12 D4) = 7.  Count to the LAST event
+	 * (F12) so future additions are caught here. */
+	UT_ASSERT_EQ((uint32)WAIT_EVENT_CLUSTER_WRITE_FENCE_MARKER_WRITE
+					 - (uint32)WAIT_EVENT_RECONFIG_GRD_REBUILD + 1,
+				 7);
+	/* Recovery category: 5 (#86) + ClusterThreadRecovery (spec-4.11 D5) +
+	 * ClusterWriteFenceVerify (spec-4.12 D6) = 7.  Count to the LAST event (F12). */
+	UT_ASSERT_EQ((uint32)WAIT_EVENT_CLUSTER_WRITE_FENCE_VERIFY
+					 - (uint32)WAIT_EVENT_RECOVERY_WAL_FETCH + 1,
+				 7);
 	UT_ASSERT_EQ((uint32)WAIT_EVENT_SINVAL_INJECT_LOCAL_QUEUE
 					 - (uint32)WAIT_EVENT_SINVAL_BROADCAST_SEND + 1,
 				 3);

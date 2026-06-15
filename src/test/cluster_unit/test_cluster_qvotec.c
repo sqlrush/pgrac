@@ -56,6 +56,7 @@
 #include <stddef.h>
 
 #include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_write_fence.h" /* ClusterFenceMarker for D2/D4 stubs */
 
 #undef printf
 #undef fprintf
@@ -301,6 +302,35 @@ MemoryContextAllocZero(MemoryContext context pg_attribute_unused(), Size size)
 }
 int cluster_quorum_poll_interval_ms = 2000;
 int cluster_voting_disk_io_timeout_ms = 5000;
+
+/* spec-4.12 D2/D4 stubs: cluster_qvotec.o references the write-fence marker
+ * scan / token refresh / submit-mailbox helpers + the lease GUC; cluster_write_
+ * fence.o + cluster_guc.o are not linked here.  poll_pending returns "no pending
+ * submit" so the qvotec poll path is unchanged in this unit harness. */
+int cluster_write_fence_lease_ms = 6000;
+void cluster_write_fence_refresh_from_marker(const ClusterFenceMarker *m, uint64 lease_expire_us);
+void
+cluster_write_fence_refresh_from_marker(const ClusterFenceMarker *m pg_attribute_unused(),
+										uint64 lease_expire_us pg_attribute_unused())
+{}
+void cluster_write_fence_note_minority_marker(void);
+void
+cluster_write_fence_note_minority_marker(void)
+{}
+void cluster_write_fence_publish_qvotec_latch(struct Latch *latch);
+void
+cluster_write_fence_publish_qvotec_latch(struct Latch *latch pg_attribute_unused())
+{}
+bool cluster_write_fence_qvotec_poll_pending(ClusterFenceMarker *out);
+bool
+cluster_write_fence_qvotec_poll_pending(ClusterFenceMarker *out pg_attribute_unused())
+{
+	return false;
+}
+void cluster_write_fence_qvotec_complete(bool acked);
+void
+cluster_write_fence_qvotec_complete(bool acked pg_attribute_unused())
+{}
 void
 cluster_voting_disk_io_install_timeout_handler(void)
 {}

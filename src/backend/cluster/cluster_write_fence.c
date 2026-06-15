@@ -36,6 +36,7 @@
 #include "storage/latch.h" /* Latch, SetLatch (D4 latch-wake) */
 #include "storage/shmem.h"
 #include "utils/timestamp.h"
+#include "utils/wait_event.h" /* D4 marker-write + D6 verify wait events */
 
 #include "cluster/cluster_epoch.h"			/* cluster_epoch_get_current */
 #include "cluster/cluster_guc.h"			/* cluster_node_id, cluster_voting_disks */
@@ -57,12 +58,9 @@ StaticAssertDecl(CLUSTER_FENCE_MARKER_BYTES <= sizeof(((ClusterVotingSlot *)0)->
 				 "fence marker must fit in the voting slot _reserved1 area");
 
 /*
- * GUC storage (registered by cluster_guc.c in D7).  Default OFF until the
- * mechanism is fully wired (D2 lease refresh + D4 marker write); D7 flips the
- * registered default to ON for multi-node + shared-fs.
+ * GUC storage lives in cluster_guc.c (the project convention -- the DefineCustom*
+ * registration is there, D7); this file references them via the header externs.
  */
-int cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_OFF;
-int cluster_write_fence_lease_ms = 6000;
 
 static ClusterWriteFenceShmem *cluster_write_fence_shmem = NULL;
 
@@ -188,8 +186,9 @@ cluster_write_fence_read_durable_authority(ClusterFenceAuthority *out)
 	const char *p;
 
 	if (cluster_voting_disks == NULL || cluster_voting_disks[0] == '\0')
-		return false; /* no voting disks configured */
+		return false; /* no voting disks configured (no I/O -> no wait event) */
 
+	pgstat_report_wait_start(WAIT_EVENT_CLUSTER_WRITE_FENCE_VERIFY);
 	p = cluster_voting_disks;
 	while (*p && n_total < CLUSTER_MAX_VOTING_DISKS) {
 		const char *start = p;
@@ -246,6 +245,8 @@ cluster_write_fence_read_durable_authority(ClusterFenceAuthority *out)
 		}
 		n_total++;
 	}
+
+	pgstat_report_wait_end();
 
 	*out = cluster_fence_authority_decide(disk_markers, disk_has_marker, n_total);
 	return true;
@@ -395,6 +396,39 @@ cluster_write_fence_note_minority_marker(void)
 	pg_atomic_fetch_add_u64(&cluster_write_fence_shmem->minority_marker_ignored, 1);
 }
 
+/* spec-4.12 D7 observability counter accessors (L110-safe: 0 with no region). */
+uint64
+cluster_write_fence_get_hot_gate_blocked(void)
+{
+	return cluster_write_fence_shmem == NULL
+			   ? 0
+			   : pg_atomic_read_u64(&cluster_write_fence_shmem->hot_gate_blocked);
+}
+
+uint64
+cluster_write_fence_get_durable_check_blocked(void)
+{
+	return cluster_write_fence_shmem == NULL
+			   ? 0
+			   : pg_atomic_read_u64(&cluster_write_fence_shmem->durable_check_blocked);
+}
+
+uint64
+cluster_write_fence_get_minority_marker_ignored(void)
+{
+	return cluster_write_fence_shmem == NULL
+			   ? 0
+			   : pg_atomic_read_u64(&cluster_write_fence_shmem->minority_marker_ignored);
+}
+
+uint64
+cluster_write_fence_get_marker_write_failed(void)
+{
+	return cluster_write_fence_shmem == NULL
+			   ? 0
+			   : pg_atomic_read_u64(&cluster_write_fence_shmem->marker_write_failed);
+}
+
 /*
  * cluster_write_fence_submit_marker -- LMON (coordinator) side of the D4 handshake.
  *	Stages the marker, wakes qvotec, and synchronously waits (bounded by the lease)
@@ -424,16 +458,27 @@ cluster_write_fence_submit_marker(const ClusterFenceMarker *m)
 		SetLatch(qlatch);
 
 	/* bounded synchronous wait for qvotec to complete THIS exact request. */
-	deadline_us = (uint64)GetCurrentTimestamp() + (uint64)cluster_write_fence_lease_ms * 1000ULL;
-	for (;;) {
-		if (pg_atomic_read_u64(&cluster_write_fence_shmem->marker_completion_seq) == seq) {
-			pg_read_barrier();
-			return (ClusterFenceMarkerSubmitResult)pg_atomic_read_u32(
-				&cluster_write_fence_shmem->marker_result);
+	{
+		ClusterFenceMarkerSubmitResult result;
+
+		deadline_us
+			= (uint64)GetCurrentTimestamp() + (uint64)cluster_write_fence_lease_ms * 1000ULL;
+		pgstat_report_wait_start(WAIT_EVENT_CLUSTER_WRITE_FENCE_MARKER_WRITE);
+		for (;;) {
+			if (pg_atomic_read_u64(&cluster_write_fence_shmem->marker_completion_seq) == seq) {
+				pg_read_barrier();
+				result = (ClusterFenceMarkerSubmitResult)pg_atomic_read_u32(
+					&cluster_write_fence_shmem->marker_result);
+				break;
+			}
+			if ((uint64)GetCurrentTimestamp() >= deadline_us) {
+				result = CLUSTER_FENCE_MARKER_SUBMIT_TIMEOUT;
+				break;
+			}
+			pg_usleep(2 * 1000); /* 2 ms */
 		}
-		if ((uint64)GetCurrentTimestamp() >= deadline_us)
-			return CLUSTER_FENCE_MARKER_SUBMIT_TIMEOUT;
-		pg_usleep(2 * 1000); /* 2 ms */
+		pgstat_report_wait_end();
+		return result;
 	}
 }
 

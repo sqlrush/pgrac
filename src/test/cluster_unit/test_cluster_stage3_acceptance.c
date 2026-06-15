@@ -294,7 +294,7 @@ UT_TEST(test_stage3_wait_events_count_snapshot_97)
 	 * "==93 forever").  spec-4.6 D4: 97 → 98;  spec-4.7 D1: 98 → 99
 	 * (+ ClusterGCSBlockRecovering);  spec-4.11 D5: 99 → 100
 	 * (+ ClusterThreadRecovery). */
-	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 100);
+	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 102);
 }
 
 

@@ -40,6 +40,7 @@
 
 #include "cluster/cluster_block_recovery.h"	 /* spec-4.10 D1 online block recovery GUCs */
 #include "cluster/cluster_thread_recovery.h" /* spec-4.11 D1 online thread recovery GUCs */
+#include "cluster/cluster_write_fence.h"	 /* spec-4.12 D7 write-fence enforcement GUCs */
 #include "cluster/cluster_conf.h"			 /* cluster_conf_has_peers (spec-3.18 D2b latch) */
 #include "cluster/cluster_cr_cache.h"		 /* cluster_cr_cache_max_blocks (spec-3.10 D4) */
 #include "cluster/cluster_guc.h"
@@ -523,6 +524,23 @@ static const struct config_enum_entry cluster_thread_recovery_on_unrecoverable_o
 		{ "panic", CLUSTER_THREADREC_ACTION_PANIC, false },
 		{ NULL, 0, false } };
 
+/* spec-4.12 D7: cooperative write-fence GUC storage (referenced from
+ * cluster_write_fence.c via the header externs).  Defaults match the registered
+ * boot values below (off / 6000 ms). */
+int cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_OFF;
+int cluster_write_fence_lease_ms = 6000;
+
+/* spec-4.12 D7: cooperative write-fence enforcement mode.  Ships default OFF
+ * (opt-in): default-ON for a healthy steady-state cluster needs the baseline-
+ * marker subsystem (deferred to a 4.12b follow-up), without which an unfenced
+ * cluster would have no durable marker -> token never refreshes -> the D5 gate
+ * would fail every write closed.  "dev" is the single-node / test escape hatch. */
+static const struct config_enum_entry cluster_write_fence_enforcement_options[]
+	= { { "off", CLUSTER_WRITE_FENCE_ENFORCE_OFF, false },
+		{ "on", CLUSTER_WRITE_FENCE_ENFORCE_ON, false },
+		{ "dev", CLUSTER_WRITE_FENCE_ENFORCE_DEV, false },
+		{ NULL, 0, false } };
+
 
 /*
  * PGRAC: spec-2.38 D8 — 3 NEW GUC for SI Broadcaster skeleton.
@@ -954,6 +972,37 @@ cluster_init_guc(void)
 							 NULL,			 /* check_hook */
 							 NULL,			 /* assign_hook */
 							 NULL);			 /* show_hook */
+
+	/*
+	 * cluster.write_fence_enforcement -- spec-4.12 cooperative write-fence (split-
+	 * brain recovery guard).  ON makes every shared-storage write consult the local
+	 * write-fence token (stale epoch / expired lease / self-fenced -> 53R51 / PANIC).
+	 * Ships default OFF (opt-in): safe default-ON for a healthy steady-state cluster
+	 * needs the baseline-marker subsystem (4.12b follow-up).  PGC_POSTMASTER so the
+	 * mode is fixed for the postmaster lifetime.
+	 */
+	DefineCustomEnumVariable("cluster.write_fence_enforcement",
+							 gettext_noop("Cooperative write-fence enforcement mode."),
+							 gettext_noop("off (default) is a no-op; on rejects shared-storage "
+										  "writes from a stale / lease-expired / self-fenced node; "
+										  "dev is the single-node / test escape hatch."),
+							 &cluster_write_fence_enforcement, CLUSTER_WRITE_FENCE_ENFORCE_OFF,
+							 cluster_write_fence_enforcement_options, PGC_POSTMASTER, 0, NULL, NULL,
+							 NULL);
+
+	/*
+	 * cluster.write_fence_lease_ms -- spec-4.12 the local token's lease duration.
+	 * qvotec refreshes it every poll from the durable marker; once it expires (the
+	 * node failed to refresh = partition) the hot write path fails closed.  Default
+	 * 6000 ms ~= 3x the default qvotec poll interval.  SIGHUP-tunable.
+	 */
+	DefineCustomIntVariable(
+		"cluster.write_fence_lease_ms",
+		gettext_noop("Cooperative write-fence token lease duration (milliseconds)."),
+		gettext_noop("After this long without a qvotec refresh from the durable marker, the "
+					 "local write-fence token expires and shared-storage writes fail closed."),
+		&cluster_write_fence_lease_ms, 6000, 1000, 600000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
+		NULL);
 
 	/*
 	 * cluster.shared_data_dir -- shared data root for the cluster_fs

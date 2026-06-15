@@ -44,6 +44,7 @@
 
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_epoch.h"
+#include "cluster/cluster_write_fence.h" /* spec-4.12 D4 marker submit stubs */
 
 #undef printf
 #undef fprintf
@@ -319,6 +320,17 @@ cluster_gcs_block_on_epoch_advance(uint64 new_epoch pg_attribute_unused())
 void
 cluster_sinval_reset_all_on_reconfig(void)
 {}
+
+/* spec-4.12 D4 stubs: the coordinator's marker-before-publish gate references
+ * the enforcement GUC + the submit entry.  Enforcement OFF here so the gate is a
+ * no-op (reconfig behaves as pre-4.12 in this unit harness). */
+int cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_OFF;
+ClusterFenceMarkerSubmitResult cluster_write_fence_submit_marker(const ClusterFenceMarker *m);
+ClusterFenceMarkerSubmitResult
+cluster_write_fence_submit_marker(const ClusterFenceMarker *m pg_attribute_unused())
+{
+	return CLUSTER_FENCE_MARKER_SUBMIT_FAILED;
+}
 
 /* spec-3.1 D7 stub: cluster_reconfig_apply_epoch_bump_as_coordinator
  * calls cluster_tt_status_flush_all.  Fixture has no TT overlay shmem;

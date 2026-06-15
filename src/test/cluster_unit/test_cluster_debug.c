@@ -194,6 +194,40 @@ cluster_smgr_active_relation_count(void)
 }
 bool cluster_smgr_user_relations = false;
 
+/* spec-4.12 D7 stubs: dump_write_fence (cluster_debug.o) reads 4 counters, and
+ * cluster_startup_phase.o (linked here) references the rejoin self-fence gate.
+ * cluster_write_fence.o is not linked -- provide stubs returning 0 / false. */
+uint64 cluster_write_fence_get_hot_gate_blocked(void);
+uint64 cluster_write_fence_get_durable_check_blocked(void);
+uint64 cluster_write_fence_get_minority_marker_ignored(void);
+uint64 cluster_write_fence_get_marker_write_failed(void);
+bool cluster_write_fence_startup_self_check(void);
+uint64
+cluster_write_fence_get_hot_gate_blocked(void)
+{
+	return 0;
+}
+uint64
+cluster_write_fence_get_durable_check_blocked(void)
+{
+	return 0;
+}
+uint64
+cluster_write_fence_get_minority_marker_ignored(void)
+{
+	return 0;
+}
+uint64
+cluster_write_fence_get_marker_write_failed(void)
+{
+	return 0;
+}
+bool
+cluster_write_fence_startup_self_check(void)
+{
+	return false;
+}
+
 /* Stage 1.3: cluster_debug.c::dump_shmem now reads from the cluster
  * shmem region registry (region_count + total_bytes + per-region
  * iter).  cluster_shmem.o is not linked here; provide stubs that

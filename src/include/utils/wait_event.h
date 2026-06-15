@@ -382,8 +382,12 @@ typedef enum {
 	 * during failure-driven remaster.  Reconfig business class (NOT
 	 * BgProc — see that segment's contract). */
 	WAIT_EVENT_CLUSTER_GRD_SHARD_REMASTER,
+	/* spec-4.12 D4: the reconfig coordinator (LMON) synchronously waits for qvotec
+	 * to write + fdatasync the durable fence marker to a voting-disk majority
+	 * before publishing the reconfig event (core 8.A order). */
+	WAIT_EVENT_CLUSTER_WRITE_FENCE_MARKER_WRITE,
 
-	/* Cluster: Recovery (6 events) -- #86; +1 spec-4.11 D5 online thread recovery */
+	/* Cluster: Recovery (6 events) -- #86; +1 spec-4.11 D5; +1 spec-4.12 D6 */
 	WAIT_EVENT_RECOVERY_WAL_FETCH = PG_WAIT_CLUSTER_RECOVERY,
 	WAIT_EVENT_RECOVERY_KWAY_MERGE,
 	WAIT_EVENT_RECOVERY_APPLY_PER_THREAD,
@@ -392,14 +396,17 @@ typedef enum {
 	/* spec-4.11 D5 (#84): a survivor online-replaying a dead WAL thread's data
 	 * through to shared storage inside the reconfig freeze window. */
 	WAIT_EVENT_CLUSTER_THREAD_RECOVERY,
+	/* spec-4.12 D6: a recovery / rejoin / startup direct durable read of the
+	 * voting-disk fence markers to verify authority. */
+	WAIT_EVENT_CLUSTER_WRITE_FENCE_VERIFY,
 
 	/* Cluster: Sinval (6 events) -- subsystem #9; +3 NEW spec-2.39 D13 */
 	WAIT_EVENT_SINVAL_BROADCAST_SEND = PG_WAIT_CLUSTER_SINVAL,
 	WAIT_EVENT_SINVAL_BROADCAST_RECEIVE,
 	WAIT_EVENT_SINVAL_INJECT_LOCAL_QUEUE,
-	WAIT_EVENT_SINVAL_ACK_WAIT,		/* spec-2.39 D13:  enqueue_and_wait_ack WaitLatch */
-	WAIT_EVENT_SINVAL_ACK_SEND,		/* spec-2.39 D13:  LMON drain ack_outbound + send */
-	WAIT_EVENT_SINVAL_ACK_RECEIVE,	/* spec-2.39 D13:  IC handler ack envelope receive */
+	WAIT_EVENT_SINVAL_ACK_WAIT,	   /* spec-2.39 D13:  enqueue_and_wait_ack WaitLatch */
+	WAIT_EVENT_SINVAL_ACK_SEND,	   /* spec-2.39 D13:  LMON drain ack_outbound + send */
+	WAIT_EVENT_SINVAL_ACK_RECEIVE, /* spec-2.39 D13:  IC handler ack envelope receive */
 
 	/* Cluster: Interconnect (5 events + 6 spec-2.2 D8) -- AD-007 */
 	WAIT_EVENT_INTERCONNECT_RDMA_SEND = PG_WAIT_CLUSTER_INTERCONNECT,
@@ -441,8 +448,8 @@ typedef enum {
 	WAIT_EVENT_UNDO_TT_LOOKUP_REMOTE,
 	WAIT_EVENT_UNDO_SEGMENT_FETCH,
 	WAIT_EVENT_UNDO_RETENTION_WAIT,
-	WAIT_EVENT_CLUSTER_CR_CONSTRUCT, /* spec-3.9: own-instance CR block construction */
-	WAIT_EVENT_UNDO_TT_DURABLE_IO,	 /* spec-3.11: durable TT slot header I/O */
+	WAIT_EVENT_CLUSTER_CR_CONSTRUCT,	  /* spec-3.9: own-instance CR block construction */
+	WAIT_EVENT_UNDO_TT_DURABLE_IO,		  /* spec-3.11: durable TT slot header I/O */
 	WAIT_EVENT_CLUSTER_UNDO_BUF_FLUSH,	  /* spec-3.18 D7: undo buffer write-back I/O */
 	WAIT_EVENT_CLUSTER_UNDO_EXTENT_CLAIM, /* spec-3.18 D7: extent claim autoextend I/O */
 

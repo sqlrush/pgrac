@@ -97,8 +97,9 @@
 #include "cluster/cluster_qvotec.h" /* cluster_qvotec_shmem_register (spec-2.6 Sprint A Step 1) */
 #include "cluster/cluster_fence.h"	/* cluster_fence_shmem_register (spec-2.28 Sprint A Step 1) */
 #include "cluster/cluster_reconfig.h" /* cluster_reconfig_shmem_register (spec-2.29 Sprint A Step 1) */
-#include "cluster/cluster_lms.h"	  /* cluster_lms_shmem_register (spec-2.18 Sprint A Step 1) */
-#include "cluster/cluster_lmd.h"	  /* cluster_lmd_shmem_register (spec-2.19 Sprint A Step 1) */
+#include "cluster/cluster_write_fence.h" /* cluster_write_fence_shmem_register (spec-4.12 D7) */
+#include "cluster/cluster_lms.h" /* cluster_lms_shmem_register (spec-2.18 Sprint A Step 1) */
+#include "cluster/cluster_lmd.h" /* cluster_lmd_shmem_register (spec-2.19 Sprint A Step 1) */
 /* spec-2.7 hardening F1: cluster_smgr_shmem_register;intentionally no
  * trailing line-end comment so the longer storage/ path doesn't force
  * clang-format to realign every neighbour include above. */
@@ -643,6 +644,15 @@ cluster_init_shmem_module(void)
 	 */
 	if (cluster_shmem_lookup_region("pgrac cluster reconfig") == NULL)
 		cluster_reconfig_shmem_register();
+
+	/*
+	 * spec-4.12 D7: register the cooperative write-fence token region.  Holds the
+	 * local authorized_epoch + lease + self_fenced token (qvotec refreshes it from
+	 * the durable voting-disk marker) plus the LMON->qvotec marker-submit mailbox
+	 * and the observability counters.
+	 */
+	if (cluster_shmem_lookup_region("pgrac cluster write fence") == NULL)
+		cluster_write_fence_shmem_register();
 
 	/*
 	 * spec-2.18 Sprint A Step 1 D6/D7: register cluster_lms shmem region.

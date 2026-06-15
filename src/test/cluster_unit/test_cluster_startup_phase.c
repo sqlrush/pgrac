@@ -255,6 +255,14 @@ void
 cluster_shmem_register_region(const ClusterShmemRegion *region pg_attribute_unused())
 {}
 
+/* spec-4.12 D6 stub: cluster_startup_phase.o references the rejoin self-fence gate. */
+bool cluster_write_fence_startup_self_check(void);
+bool
+cluster_write_fence_startup_self_check(void)
+{
+	return false;
+}
+
 /* Spec-1.11 Sprint A stubs (cluster_startup_phase.o references). */
 int
 cluster_lmon_start(void)

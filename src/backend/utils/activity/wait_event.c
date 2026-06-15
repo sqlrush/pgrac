@@ -1116,6 +1116,9 @@ pgstat_get_wait_cluster_reconfig(WaitEventCluster w)
 	case WAIT_EVENT_CLUSTER_GRD_SHARD_REMASTER:
 		event_name = "ClusterGrdShardRemaster";
 		break;
+	case WAIT_EVENT_CLUSTER_WRITE_FENCE_MARKER_WRITE:
+		event_name = "ClusterWriteFenceMarkerWrite";
+		break;
 	default:
 		break;
 	}
@@ -1146,6 +1149,9 @@ pgstat_get_wait_cluster_recovery(WaitEventCluster w)
 		break;
 	case WAIT_EVENT_CLUSTER_THREAD_RECOVERY:
 		event_name = "ClusterThreadRecovery";
+		break;
+	case WAIT_EVENT_CLUSTER_WRITE_FENCE_VERIFY:
+		event_name = "ClusterWriteFenceVerify";
 		break;
 	default:
 		break;

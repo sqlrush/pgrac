@@ -137,14 +137,18 @@ static const uint32 cluster_wait_event_infos[CLUSTER_WAIT_EVENTS_COUNT] = {
 	WAIT_EVENT_RECONFIG_BARRIER_WAIT,
 	/* spec-4.6 D4: GRD shard remaster short-wait (Reconfig class). */
 	WAIT_EVENT_CLUSTER_GRD_SHARD_REMASTER,
+	/* spec-4.12 D4: coordinator wait for the durable fence-marker majority write. */
+	WAIT_EVENT_CLUSTER_WRITE_FENCE_MARKER_WRITE,
 
-	/* Cluster: Recovery (6 = 5 + 1 spec-4.11 D5 online thread recovery) */
+	/* Cluster: Recovery (7 = 5 + spec-4.11 D5 thread recovery + spec-4.12 D6 verify) */
 	WAIT_EVENT_RECOVERY_WAL_FETCH,
 	WAIT_EVENT_RECOVERY_KWAY_MERGE,
 	WAIT_EVENT_RECOVERY_APPLY_PER_THREAD,
 	WAIT_EVENT_RECOVERY_UNDO_REPLAY,
 	WAIT_EVENT_RECOVERY_PCM_STATE_RESTORE,
 	WAIT_EVENT_CLUSTER_THREAD_RECOVERY,
+	/* spec-4.12 D6: recovery/rejoin direct durable fence-marker verify read. */
+	WAIT_EVENT_CLUSTER_WRITE_FENCE_VERIFY,
 
 	/* Cluster: Sinval (6 = 3 spec-2.38 + 3 spec-2.39 D13) */
 	WAIT_EVENT_SINVAL_BROADCAST_SEND,

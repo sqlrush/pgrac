@@ -247,6 +247,12 @@ void
 cluster_shmem_register_region(const ClusterShmemRegion *r pg_attribute_unused())
 {}
 
+/* spec-4.12 D5 stub: cluster_smgr.o references the hot write-path fence gate. */
+void cluster_write_fence_reject_if_fenced(const char *op);
+void
+cluster_write_fence_reject_if_fenced(const char *op pg_attribute_unused())
+{}
+
 /* HTAB stubs. */
 HTAB *
 hash_create(const char *t pg_attribute_unused(), long n pg_attribute_unused(),

@@ -102,6 +102,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_recovery_merge.h"	 /* is_materialized (spec-4.5a D11) */
 #include "cluster/cluster_block_recovery.h"	 /* block-recovery counters (spec-4.10 D6) */
 #include "cluster/cluster_thread_recovery.h" /* online thread-recovery counters (spec-4.11 D5) */
+#include "cluster/cluster_write_fence.h"	 /* write-fence counters (spec-4.12 D7) */
 #include "cluster/cluster_remote_xact.h"	 /* remote outcome counters (spec-4.5a D11) */
 #include "cluster/cluster_ic.h"				 /* ClusterICOps_Active, ClusterICTier */
 #include "cluster/cluster_ic_tier1.h"		 /* listener metadata accessors (Hardening v1.0.1 F3) */
@@ -1973,6 +1974,24 @@ dump_wal_thread(ReturnSetInfo *rsinfo)
 	}
 }
 
+/*
+ * dump_write_fence -- spec-4.12 D7.  Emits 4 rows under category='write_fence':
+ *	the cooperative write-fence observability counters (L110-safe -- read 0 with no
+ *	region attached).
+ */
+static void
+dump_write_fence(ReturnSetInfo *rsinfo)
+{
+	emit_row(rsinfo, "write_fence", "hot_gate_blocked",
+			 fmt_int64((int64)cluster_write_fence_get_hot_gate_blocked()));
+	emit_row(rsinfo, "write_fence", "durable_check_blocked",
+			 fmt_int64((int64)cluster_write_fence_get_durable_check_blocked()));
+	emit_row(rsinfo, "write_fence", "minority_marker_ignored",
+			 fmt_int64((int64)cluster_write_fence_get_minority_marker_ignored()));
+	emit_row(rsinfo, "write_fence", "marker_write_failed",
+			 fmt_int64((int64)cluster_write_fence_get_marker_write_failed()));
+}
+
 #endif /* USE_PGRAC_CLUSTER */
 
 
@@ -2026,6 +2045,7 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		dump_undo(rsinfo);
 		dump_cr(rsinfo);
 		dump_wal_thread(rsinfo);
+		dump_write_fence(rsinfo);
 	}
 #else
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
