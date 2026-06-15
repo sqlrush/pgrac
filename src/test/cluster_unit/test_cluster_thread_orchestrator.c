@@ -158,11 +158,42 @@ UT_TEST(test_gate_decide_null_or_empty_is_false)
 		!cluster_thread_recovery_gate_decide(CLUSTER_THREADREC_SCOPE_APPLICABLE, some, some, 0));
 }
 
+/*
+ * spec-4.11 3b-4b Part 1: the L235 episode-epoch staleness guard.  The
+ * per-thread replay slot stamps the GRD recovery_episode_epoch it was launched
+ * under; the executor worker re-reads it and ABORTS (keeps the dead thread
+ * frozen) if the live episode has moved on.  PURE so the abort boundary is
+ * unit-pinned: it must NEVER mistake a moved-on episode for the same one (that
+ * would let a stale worker publish authority into a newer reconfig -- 8.A).
+ */
+UT_TEST(test_epoch_aborts_same_epoch_continues)
+{
+	/* Slot launched under the live episode -> proceed (no abort). */
+	UT_ASSERT(!cluster_thread_recovery_replay_epoch_aborts(7, 7));
+	UT_ASSERT(!cluster_thread_recovery_replay_epoch_aborts(0, 0));
+}
+
+UT_TEST(test_epoch_aborts_different_epoch_aborts)
+{
+	/* The live episode advanced past the slot's stamp -> ABORT (stay frozen). */
+	UT_ASSERT(cluster_thread_recovery_replay_epoch_aborts(7, 8));
+	/* A slot stamped ahead of the observed live epoch is equally suspect. */
+	UT_ASSERT(cluster_thread_recovery_replay_epoch_aborts(8, 7));
+}
+
+UT_TEST(test_epoch_aborts_unstamped_slot_aborts)
+{
+	/* An unstamped slot (epoch 0) under any real live episode is stale: it was
+	 * never launched for this episode, so it must NOT proceed. */
+	UT_ASSERT(cluster_thread_recovery_replay_epoch_aborts(0, 5));
+	UT_ASSERT(cluster_thread_recovery_replay_epoch_aborts(5, 0));
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(15);
 	UT_RUN(test_on_blocked_keep_frozen_default);
 	UT_RUN(test_on_blocked_panic_when_policy_panic);
 	UT_RUN(test_on_blocked_unknown_policy_is_keep_frozen);
@@ -175,6 +206,9 @@ main(void)
 	UT_RUN(test_gate_decide_in_scope_all_complete_unfreezes);
 	UT_RUN(test_gate_decide_partial_complete_stays_frozen);
 	UT_RUN(test_gate_decide_null_or_empty_is_false);
+	UT_RUN(test_epoch_aborts_same_epoch_continues);
+	UT_RUN(test_epoch_aborts_different_epoch_aborts);
+	UT_RUN(test_epoch_aborts_unstamped_slot_aborts);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

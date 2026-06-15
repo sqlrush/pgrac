@@ -67,7 +67,7 @@ cluster_thread_drive_test(PG_FUNCTION_ARGS)
 	ClusterThreadReplayStats stats;
 	ClusterThreadRecResult res;
 	const char *result_text;
-	char *out;
+	const char *out;
 
 	if (!superuser())
 		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
@@ -127,7 +127,7 @@ cluster_thread_validated_end_test(PG_FUNCTION_ARGS)
 	XLogRecPtr valid_end = InvalidXLogRecPtr;
 	ClusterThreadRecResult res;
 	const char *result_text;
-	char *out;
+	const char *out;
 
 	if (!superuser())
 		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),

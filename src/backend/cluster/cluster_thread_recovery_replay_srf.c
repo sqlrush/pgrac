@@ -103,7 +103,7 @@ cluster_thread_replay_test(PG_FUNCTION_ARGS)
 	ClusterThreadReplayStats stats;
 	ClusterThreadRecResult res;
 	const char *result_text;
-	char *out;
+	const char *out;
 
 	if (!superuser())
 		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),

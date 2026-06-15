@@ -12607,6 +12607,19 @@
   proargnames => '{dead_tid,scan_lower,validated_min}',
   prosrc => 'cluster_thread_validated_end_test' },
 
+# spec-4.11 D1 increment 3b-4b Part 1: the per-thread online replay-state shmem
+# slot round-trip (mark REPLAYING / read / set DONE / L235 epoch guard / restore
+# IDLE).  Superuser-only.
+{ oid => '8942',
+  descr => 'TEST-ONLY: online thread-recovery 3b-4b replay-state slot round-trip (spec-4.11)',
+  proname => 'cluster_thread_replay_slot_test',
+  proisstrict => 'f',
+  provolatile => 'v', proparallel => 'u',
+  prorettype => 'text',
+  proargtypes => 'int4',
+  proargnames => '{dead_tid}',
+  prosrc => 'cluster_thread_replay_slot_test' },
+
 # spec-4.10 D2: reconstruct one block via the online single-block recovery
 # orchestrator over an explicit WAL window, for the byte-for-byte differential
 # vs PG real crash-recovery redo.  Returns the reconstructed page as bytea, or

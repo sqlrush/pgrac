@@ -66,14 +66,67 @@
 #include "miscadmin.h"
 #include "utils/elog.h"
 
+#include "port/atomics.h" /* replay-slot atomics + barriers (3b-4b)      */
+
 #include "cluster/cluster_conf.h"			   /* node_count / has_peers (scope gate)        */
 #include "cluster/cluster_elog.h"			   /* ERRCODE_CLUSTER_THREAD_RECOVERY_BLOCKED     */
 #include "cluster/cluster_guc.h"			   /* GUCs: online flag + shared backend + policy */
 #include "cluster/cluster_recovery_merge.h"	   /* node-local authority publish (online)       */
+#include "cluster/cluster_recovery_plan.h"	   /* ClusterThreadReplaySlot + slot accessor     */
 #include "cluster/cluster_remote_xact.h"	   /* per-origin outcome store flush              */
 #include "cluster/cluster_thread_recovery.h"   /* engine / driver / pure gates                */
 #include "cluster/cluster_wal_state.h"		   /* slot read + registry skip-bound publish     */
 #include "cluster/storage/cluster_shared_fs.h" /* CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS         */
+
+/*
+ * Per-thread online replay-state helpers (spec-4.11 3b-4b).  The executor's
+ * bookkeeping over the recovery-plan shmem slot reached through the accessor;
+ * see cluster_thread_recovery.h for the contract.  OBSERVABILITY + episode
+ * coordination ONLY (the reader gate uses merged.authority, §2.4 Q4).
+ */
+bool
+cluster_thread_recovery_replay_mark_replaying(uint16 dead_tid, uint64 episode_epoch)
+{
+	ClusterThreadReplaySlot *slot = cluster_thread_recovery_replay_slot(dead_tid);
+
+	if (slot == NULL)
+		return false;
+	/* Publish the launch episode BEFORE REPLAYING so a worker that observes
+	 * REPLAYING also observes the epoch it was launched under (L235). */
+	pg_atomic_write_u64(&slot->episode_epoch, episode_epoch);
+	pg_write_barrier();
+	pg_atomic_write_u32(&slot->state, (uint32)CLUSTER_THREADREC_REPLAY_REPLAYING);
+	return true;
+}
+
+bool
+cluster_thread_recovery_replay_set_state(uint16 dead_tid, ClusterThreadRecReplayState state)
+{
+	ClusterThreadReplaySlot *slot = cluster_thread_recovery_replay_slot(dead_tid);
+
+	if (slot == NULL)
+		return false;
+	pg_atomic_write_u32(&slot->state, (uint32)state);
+	return true;
+}
+
+bool
+cluster_thread_recovery_replay_read(uint16 dead_tid, ClusterThreadRecReplayState *state_out,
+									uint64 *epoch_out)
+{
+	ClusterThreadReplaySlot *slot = cluster_thread_recovery_replay_slot(dead_tid);
+	uint32 st;
+
+	if (slot == NULL)
+		return false;
+	st = pg_atomic_read_u32(&slot->state);
+	pg_read_barrier();
+	if (state_out != NULL)
+		*state_out = (ClusterThreadRecReplayState)st;
+	if (epoch_out != NULL)
+		*epoch_out = pg_atomic_read_u64(&slot->episode_epoch);
+	return true;
+}
 
 /*
  * cluster_thread_recovery_replay_one_window -- the orchestrator core, window

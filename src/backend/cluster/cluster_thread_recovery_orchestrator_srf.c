@@ -53,6 +53,7 @@ PG_FUNCTION_INFO_V1(cluster_thread_replay_one_test);
 PG_FUNCTION_INFO_V1(cluster_thread_replay_one_auto_test);
 PG_FUNCTION_INFO_V1(cluster_thread_local_complete_test);
 PG_FUNCTION_INFO_V1(cluster_thread_gate_unfreeze_test);
+PG_FUNCTION_INFO_V1(cluster_thread_replay_slot_test);
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -80,7 +81,7 @@ threadrec_result_text(ClusterThreadRecResult res)
 static text *
 threadrec_summary(ClusterThreadRecResult res, const ClusterThreadReplayStats *stats)
 {
-	char *out = psprintf(
+	const char *out = psprintf(
 		"%s:" UINT64_FORMAT ":" UINT64_FORMAT ":" UINT64_FORMAT ":" UINT64_FORMAT ":%X/%X",
 		threadrec_result_text(res), stats->records_scanned, stats->blocks_applied,
 		stats->blocks_gated, stats->blocks_out_of_scope, LSN_FORMAT_ARGS(stats->recovered_through));
@@ -209,6 +210,73 @@ cluster_thread_gate_unfreeze_test(PG_FUNCTION_ARGS)
 		cluster_thread_recovery_gate_unfreeze(dead, (int)(sizeof(dead) / sizeof(dead[0]))));
 }
 
+/*
+ * cluster_thread_replay_slot_test -- exercise the per-thread online replay-state
+ * shmem slot round-trip (spec-4.11 3b-4b Part 1): mark REPLAYING (stamping a
+ * recognisable episode), read it back, write the terminal DONE, evaluate the
+ * L235 epoch-staleness guard, then restore IDLE.  Returns 'noslot' when dead_tid
+ * names no slot (a bad id / no shmem attached), else a ':'-delimited summary the
+ * cluster_tap parses:
+ *
+ *	    <st0>:<st1>:<ep1>:<st2>:<abort_same>:<abort_diff>
+ *
+ * where stN is a ClusterThreadRecReplayState int (idle 0 / replaying 1 / done 2 /
+ * blocked 3), ep1 is the episode stamped by mark_replaying, and the abort flags
+ * are the pure L235 guard for same/different live episodes.  TEST-ONLY,
+ * superuser-only.
+ */
+Datum
+cluster_thread_replay_slot_test(PG_FUNCTION_ARGS)
+{
+	int32 dead_tid;
+	uint16 tid;
+	ClusterThreadRecReplayState st0;
+	ClusterThreadRecReplayState st1;
+	ClusterThreadRecReplayState st2;
+	uint64 ep1 = 0;
+	const uint64 stamp = UINT64CONST(0xABCD);
+	bool abort_same;
+	bool abort_diff;
+	const char *out;
+
+	if (!superuser())
+		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						errmsg("cluster_thread_replay_slot_test is superuser-only")));
+
+	if (PG_ARGISNULL(0))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("dead_tid must not be NULL")));
+
+	dead_tid = PG_GETARG_INT32(0);
+	/* Out-of-uint16 ids fail closed in the accessor's range gate (-> noslot). */
+	if (dead_tid < 0 || dead_tid > PG_UINT16_MAX)
+		dead_tid = 0;
+	tid = (uint16)dead_tid;
+
+	/* No slot for this id -> nothing to round-trip (the accessor failed closed). */
+	if (!cluster_thread_recovery_replay_read(tid, &st0, NULL))
+		PG_RETURN_TEXT_P(cstring_to_text("noslot"));
+
+	cluster_thread_recovery_replay_mark_replaying(tid, stamp);
+	cluster_thread_recovery_replay_read(tid, &st1, &ep1);
+
+	cluster_thread_recovery_replay_set_state(tid, CLUSTER_THREADREC_REPLAY_DONE);
+	cluster_thread_recovery_replay_read(tid, &st2, NULL);
+
+	/* Evaluate the L235 guard against the epoch actually stamped and read back
+	 * from the slot (ep1), not a literal -- so the round-tripped value drives the
+	 * decision (and the comparison is not a compile-time constant fold). */
+	abort_same = cluster_thread_recovery_replay_epoch_aborts(ep1, stamp);
+	abort_diff = cluster_thread_recovery_replay_epoch_aborts(ep1, stamp + 1);
+
+	/* Restore IDLE so reruns are idempotent (Part 1 has no live consumer yet). */
+	cluster_thread_recovery_replay_set_state(tid, CLUSTER_THREADREC_REPLAY_IDLE);
+
+	out = psprintf("%d:%d:" UINT64_FORMAT ":%d:%d:%d", (int)st0, (int)st1, ep1, (int)st2,
+				   abort_same ? 1 : 0, abort_diff ? 1 : 0);
+	PG_RETURN_TEXT_P(cstring_to_text(out));
+}
+
 #else /* !USE_PGRAC_CLUSTER */
 
 Datum
@@ -237,6 +305,13 @@ cluster_thread_gate_unfreeze_test(PG_FUNCTION_ARGS pg_attribute_unused())
 {
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("cluster_thread_gate_unfreeze_test requires --enable-cluster")));
+}
+
+Datum
+cluster_thread_replay_slot_test(PG_FUNCTION_ARGS pg_attribute_unused())
+{
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cluster_thread_replay_slot_test requires --enable-cluster")));
 }
 
 #endif /* USE_PGRAC_CLUSTER */

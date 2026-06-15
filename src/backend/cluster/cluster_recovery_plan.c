@@ -47,6 +47,7 @@
 #include "cluster/cluster_recovery_worker.h" /* pool lives in this wrapper (spec-4.4 D5) */
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_thread_recovery.h" /* ClusterThreadRecReplayState (slot init) */
 #include "cluster/cluster_wal_thread.h"
 #include "lib/stringinfo.h"
 #include "port/atomics.h"
@@ -59,6 +60,10 @@ typedef struct ClusterRecoveryPlanShmem {
 	/* spec-4.4 D5 (round-1 P1-2): the worker pool shares this region;
 	 * the plan semantics and the ClusterRecoveryPlan ABI are untouched. */
 	ClusterRecoveryWorkerPool pool;
+	/* spec-4.11 3b-4b: per-dead-thread online replay state shares this
+	 * region too; indexed by thread id 1..CLUSTER_RECOVERY_PLAN_THREADS,
+	 * [0] unused (the plan/pool ABIs are untouched). */
+	ClusterThreadReplaySlot thread_replay[CLUSTER_RECOVERY_PLAN_THREADS + 1];
 } ClusterRecoveryPlanShmem;
 
 static ClusterRecoveryPlanShmem *cluster_recovery_plan_shmem = NULL;
@@ -85,6 +90,15 @@ cluster_recovery_plan_shmem_init(void)
 		for (slot = 0; slot < CLUSTER_RECOVERY_WORKER_MAX_SLOTS; slot++)
 			pg_atomic_init_u32(&cluster_recovery_plan_shmem->pool.slot_state[slot],
 							   CLUSTER_RECOVERY_WORKER_UNUSED);
+
+		/* spec-4.11 3b-4b: every replay slot starts IDLE / unstamped. */
+		memset(cluster_recovery_plan_shmem->thread_replay, 0,
+			   sizeof(cluster_recovery_plan_shmem->thread_replay));
+		for (slot = 0; slot <= CLUSTER_RECOVERY_PLAN_THREADS; slot++) {
+			pg_atomic_init_u32(&cluster_recovery_plan_shmem->thread_replay[slot].state,
+							   CLUSTER_THREADREC_REPLAY_IDLE);
+			pg_atomic_init_u64(&cluster_recovery_plan_shmem->thread_replay[slot].episode_epoch, 0);
+		}
 	}
 }
 
@@ -250,6 +264,22 @@ cluster_recovery_worker_pool_ptr(void)
 	if (cluster_recovery_plan_shmem == NULL)
 		return NULL;
 	return &cluster_recovery_plan_shmem->pool;
+}
+
+/*
+ * cluster_thread_recovery_replay_slot -- the per-dead-thread online replay slot
+ *	(spec-4.11 3b-4b), declared in cluster_recovery_plan.h.  Bounds-checked to
+ *	the real thread-id range so a bad id fails closed (NULL) and NEVER aliases
+ *	the unused slot 0.  Returns NULL when the region is not attached.
+ */
+ClusterThreadReplaySlot *
+cluster_thread_recovery_replay_slot(uint16 dead_tid)
+{
+	if (cluster_recovery_plan_shmem == NULL)
+		return NULL;
+	if (dead_tid < XLP_THREAD_ID_FIRST_REAL || dead_tid > CLUSTER_WAL_THREAD_MAX)
+		return NULL;
+	return &cluster_recovery_plan_shmem->thread_replay[dead_tid];
 }
 
 /*

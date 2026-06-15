@@ -321,6 +321,23 @@ cluster_thread_recovery_gate_decide(ClusterThreadRecScope scope, const uint64 *d
 }
 
 /*
+ * cluster_thread_recovery_replay_epoch_aborts -- the L235 episode-epoch
+ * staleness guard (spec-4.11 3b-4b).  The per-thread replay slot stamps the GRD
+ * recovery_episode_epoch it was launched under; the executor worker re-reads the
+ * LIVE episode and ABORTS (returns true -- keep the dead thread frozen, publish
+ * nothing) when the live episode no longer matches the stamp.  Returns true ==
+ * ABORT.  PURE so the boundary is unit-pinned: any inequality is suspect (a
+ * later live episode means a newer reconfig has superseded this worker; an
+ * unstamped slot epoch 0 was never launched for the live episode), and a stale
+ * worker must NEVER publish authority into a different episode (8.A).
+ */
+static inline bool
+cluster_thread_recovery_replay_epoch_aborts(uint64 slot_epoch, uint64 current_epoch)
+{
+	return slot_epoch != current_epoch;
+}
+
+/*
  * Online-replay ONE dead thread's WAL data through to shared storage
  * within the reconfig freeze window (spec-4.11 D2).  Implemented in a
  * later increment (the Q10-B apply matrix); declared here for the
@@ -353,6 +370,29 @@ extern bool cluster_thread_recovery_local_complete(uint16 dead_tid, XLogRecPtr r
  * a bad dead id maps to no origin and is treated as not-complete (frozen).
  */
 extern bool cluster_thread_recovery_gate_unfreeze(const uint64 *dead_bitmap, int nwords);
+
+/*
+ * Per-thread online replay-state helpers (spec-4.11 3b-4b).  Thin wrappers over
+ * the recovery-plan shmem slot (cluster_thread_recovery_replay_slot): the lmon
+ * launch path stamps the launch episode and marks REPLAYING; the per-episode
+ * executor worker writes the terminal DONE/BLOCKED and reads the episode for the
+ * L235 staleness guard.  All return false (and leave outputs untouched) when no
+ * slot is available -- no shmem attached, or a bad thread id.  This is
+ * OBSERVABILITY + episode coordination ONLY: the authoritative reader gate reads
+ * the node-local merged.authority, NOT these slots (§2.4 Q4 3-way authority).
+ *
+ *	mark_replaying stamps episode_epoch BEFORE state, so a worker that observes
+ *	REPLAYING also observes the epoch it was launched under (the L235 guard);
+ *	read pairs the barrier on the way out.  set_state writes the terminal verdict
+ *	(or resets to IDLE); it does NOT stamp an epoch (REPLAYING must come through
+ *	mark_replaying).
+ */
+extern bool cluster_thread_recovery_replay_mark_replaying(uint16 dead_tid, uint64 episode_epoch);
+extern bool cluster_thread_recovery_replay_set_state(uint16 dead_tid,
+													 ClusterThreadRecReplayState state);
+extern bool cluster_thread_recovery_replay_read(uint16 dead_tid,
+												ClusterThreadRecReplayState *state_out,
+												uint64 *epoch_out);
 
 /*
  * RMW replay engine (spec-4.11 D1 increment 3a).  Read each record of a

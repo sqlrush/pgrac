@@ -148,6 +148,25 @@ cluster_recovery_plan_candidate_set(ClusterRecoveryPlan *plan, uint16 tid)
 
 #ifndef FRONTEND
 
+#include "port/atomics.h"
+
+/*
+ * Per-dead-thread online replay slot (spec-4.11 3b-4b).  Bookkeeping for the
+ * online thread-recovery executor: the lmon launch path stamps episode_epoch
+ * (the GRD recovery_episode_epoch this attempt belongs to) and marks REPLAYING;
+ * the per-episode worker re-reads episode_epoch (the L235 staleness guard) and
+ * writes the terminal DONE/BLOCKED.  state holds a ClusterThreadRecReplayState
+ * (cluster_thread_recovery.h), stored raw so this header carries no dependency
+ * on that enum.  OBSERVABILITY + episode coordination ONLY: the authoritative
+ * reader gate reads the node-local merged.authority, NOT this slot (spec-4.11
+ * §2.4 Q4 3-way authority).  Rides in the "pgrac recovery plan" shmem region; a
+ * small per-thread mirror, no on-disk byte layout (L45 N/A).
+ */
+typedef struct ClusterThreadReplaySlot {
+	pg_atomic_uint32 state;			/* ClusterThreadRecReplayState (raw) */
+	pg_atomic_uint64 episode_epoch; /* GRD recovery_episode_epoch when REPLAYING */
+} ClusterThreadReplaySlot;
+
 /*
  * Backend API (cluster_recovery_plan.c).  All paths are no-ops when
  * cluster.wal_threads_dir is unset / the thread id is LEGACY.
@@ -166,6 +185,16 @@ extern bool cluster_recovery_plan_snapshot(ClusterRecoveryPlan *out);
 
 /* shmem region plumbing (cluster_shmem.c registry). */
 extern void cluster_recovery_plan_shmem_register(void);
+
+/*
+ * cluster_thread_recovery_replay_slot -- the per-dead-thread online replay slot
+ * for dead_tid, or NULL when no shmem is attached or dead_tid is outside the
+ * real range [XLP_THREAD_ID_FIRST_REAL, CLUSTER_WAL_THREAD_MAX] (the array rides
+ * in the recovery-plan region, indexed by thread id, [0] unused).  The
+ * orchestrator's state helpers (mark/read/set, spec-4.11 3b-4b) reach the slot
+ * only through this accessor.
+ */
+extern ClusterThreadReplaySlot *cluster_thread_recovery_replay_slot(uint16 dead_tid);
 
 #endif /* !FRONTEND */
 
