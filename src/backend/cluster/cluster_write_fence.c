@@ -31,6 +31,8 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "storage/ipc.h"   /* on_shmem_exit */
+#include "storage/latch.h" /* Latch, SetLatch (D4 latch-wake) */
 #include "storage/shmem.h"
 #include "utils/timestamp.h"
 
@@ -62,6 +64,14 @@ int cluster_write_fence_lease_ms = 6000;
 
 static ClusterWriteFenceShmem *cluster_write_fence_shmem = NULL;
 
+/*
+ * D4 qvotec-side in-flight tracking (qvotec is single-process, so file statics are
+ * safe).  last_processed advances only after a marker is fully written + acked, so
+ * a qvotec crash between poll and complete reprocesses the request (idempotent).
+ */
+static uint64 qvotec_inflight_marker_seq = 0;
+static uint64 qvotec_last_processed_marker_seq = 0;
+
 static Size
 cluster_write_fence_shmem_size(void)
 {
@@ -92,6 +102,16 @@ cluster_write_fence_shmem_init(void)
 		pg_atomic_init_u64(&cluster_write_fence_shmem->hot_gate_blocked, 0);
 		pg_atomic_init_u64(&cluster_write_fence_shmem->durable_check_blocked, 0);
 		pg_atomic_init_u64(&cluster_write_fence_shmem->minority_marker_ignored, 0);
+
+		/* D4 LMON->qvotec submit mailbox starts empty (request == completion). */
+		cluster_write_fence_shmem->qvotec_latch = NULL;
+		pg_atomic_init_u64(&cluster_write_fence_shmem->marker_request_seq, 0);
+		pg_atomic_init_u64(&cluster_write_fence_shmem->marker_completion_seq, 0);
+		pg_atomic_init_u32(&cluster_write_fence_shmem->marker_result,
+						   CLUSTER_FENCE_MARKER_SUBMIT_FAILED);
+		pg_atomic_init_u64(&cluster_write_fence_shmem->marker_write_failed, 0);
+		memset(&cluster_write_fence_shmem->pending_marker, 0,
+			   sizeof(cluster_write_fence_shmem->pending_marker));
 	}
 }
 
@@ -193,6 +213,116 @@ cluster_write_fence_note_minority_marker(void)
 	if (cluster_write_fence_shmem == NULL)
 		return;
 	pg_atomic_fetch_add_u64(&cluster_write_fence_shmem->minority_marker_ignored, 1);
+}
+
+/*
+ * cluster_write_fence_submit_marker -- LMON (coordinator) side of the D4 handshake.
+ *	Stages the marker, wakes qvotec, and synchronously waits (bounded by the lease)
+ *	for qvotec to write + fdatasync it to >= quorum-majority disks.  Returns ACK only
+ *	when durable on a majority; the caller publishes the reconfig event ONLY on ACK
+ *	(core 8.A order: marker durable BEFORE recovery).
+ */
+ClusterFenceMarkerSubmitResult
+cluster_write_fence_submit_marker(const ClusterFenceMarker *m)
+{
+	uint64 seq;
+	uint64 deadline_us;
+	Latch *qlatch;
+
+	if (cluster_write_fence_shmem == NULL)
+		return CLUSTER_FENCE_MARKER_SUBMIT_FAILED; /* region not attached (pre-D7) */
+
+	/* stage the marker, then publish the request (barrier between so qvotec never
+	 * reads a half-written marker). */
+	memcpy(&cluster_write_fence_shmem->pending_marker, m, sizeof(*m));
+	pg_write_barrier();
+	seq = pg_atomic_add_fetch_u64(&cluster_write_fence_shmem->marker_request_seq, 1);
+
+	/* latch-wake; a NULL latch (qvotec not running) -> we time out below = fail-closed. */
+	qlatch = cluster_write_fence_shmem->qvotec_latch;
+	if (qlatch != NULL)
+		SetLatch(qlatch);
+
+	/* bounded synchronous wait for qvotec to complete THIS exact request. */
+	deadline_us = (uint64)GetCurrentTimestamp() + (uint64)cluster_write_fence_lease_ms * 1000ULL;
+	for (;;) {
+		if (pg_atomic_read_u64(&cluster_write_fence_shmem->marker_completion_seq) == seq) {
+			pg_read_barrier();
+			return (ClusterFenceMarkerSubmitResult)pg_atomic_read_u32(
+				&cluster_write_fence_shmem->marker_result);
+		}
+		if ((uint64)GetCurrentTimestamp() >= deadline_us)
+			return CLUSTER_FENCE_MARKER_SUBMIT_TIMEOUT;
+		pg_usleep(2 * 1000); /* 2 ms */
+	}
+}
+
+/*
+ * cluster_write_fence_clear_qvotec_latch / _publish_qvotec_latch -- qvotec publishes
+ *	its MyLatch at startup so LMON can wake it; auto-cleared at proc_exit so a stale
+ *	pointer is never signalled (a NULL latch just makes LMON time out = fail-closed).
+ */
+static void
+cluster_write_fence_clear_qvotec_latch(int code, Datum arg)
+{
+	if (cluster_write_fence_shmem != NULL)
+		cluster_write_fence_shmem->qvotec_latch = NULL;
+}
+
+void
+cluster_write_fence_publish_qvotec_latch(struct Latch *latch)
+{
+	if (cluster_write_fence_shmem == NULL)
+		return;
+	cluster_write_fence_shmem->qvotec_latch = latch;
+	on_shmem_exit(cluster_write_fence_clear_qvotec_latch, (Datum)0);
+}
+
+/*
+ * cluster_write_fence_qvotec_poll_pending -- qvotec poll: a new submit pending?
+ *	Returns true + the staged marker (and marks it in-flight) when request_seq has
+ *	advanced past the last fully-processed request.
+ */
+bool
+cluster_write_fence_qvotec_poll_pending(ClusterFenceMarker *out)
+{
+	uint64 req;
+
+	if (cluster_write_fence_shmem == NULL)
+		return false;
+
+	req = pg_atomic_read_u64(&cluster_write_fence_shmem->marker_request_seq);
+	if (req == qvotec_last_processed_marker_seq)
+		return false; /* nothing new */
+
+	pg_read_barrier();
+	memcpy(out, &cluster_write_fence_shmem->pending_marker, sizeof(*out));
+	qvotec_inflight_marker_seq = req;
+	return true;
+}
+
+/*
+ * cluster_write_fence_qvotec_complete -- qvotec poll: publish the in-flight result
+ *	(acked = the marker reached >= quorum-majority durable disks) back to the waiting
+ *	LMON.  last_processed advances only here, so a crash before this point makes the
+ *	next poll reprocess the request (idempotent re-write).
+ */
+void
+cluster_write_fence_qvotec_complete(bool acked)
+{
+	if (cluster_write_fence_shmem == NULL)
+		return;
+
+	if (!acked)
+		pg_atomic_fetch_add_u64(&cluster_write_fence_shmem->marker_write_failed, 1);
+
+	pg_atomic_write_u32(&cluster_write_fence_shmem->marker_result,
+						acked ? CLUSTER_FENCE_MARKER_SUBMIT_ACK
+							  : CLUSTER_FENCE_MARKER_SUBMIT_FAILED);
+	pg_write_barrier();
+	pg_atomic_write_u64(&cluster_write_fence_shmem->marker_completion_seq,
+						qvotec_inflight_marker_seq);
+	qvotec_last_processed_marker_seq = qvotec_inflight_marker_seq;
 }
 
 #endif /* USE_PGRAC_CLUSTER */

@@ -267,6 +267,18 @@ extern int cluster_write_fence_enforcement;
 extern int cluster_write_fence_lease_ms;
 
 /*
+ * ClusterFenceMarkerSubmitResult -- outcome of cluster_write_fence_submit_marker
+ *	(D4).  ACK means qvotec wrote + fdatasync'd the marker to >= quorum-majority
+ *	voting disks; anything else is fail-closed (the coordinator must NOT publish the
+ *	reconfig event / start recovery).
+ */
+typedef enum ClusterFenceMarkerSubmitResult {
+	CLUSTER_FENCE_MARKER_SUBMIT_ACK = 0, /* >= majority disks durable */
+	CLUSTER_FENCE_MARKER_SUBMIT_FAILED,	 /* < majority durable, or region/qvotec absent */
+	CLUSTER_FENCE_MARKER_SUBMIT_TIMEOUT, /* qvotec did not complete within the bound */
+} ClusterFenceMarkerSubmitResult;
+
+/*
  * Local write-fence token (the "pgrac cluster write fence" shmem region, spec-4.12
  * D3).  qvotec refreshes it every poll from the durable voting-disk marker (D2);
  * the hot write paths read it via cluster_write_fence_allowed().
@@ -280,6 +292,20 @@ typedef struct ClusterWriteFenceShmem {
 	pg_atomic_uint64 hot_gate_blocked;		  /* counter: hot-path fail-closed */
 	pg_atomic_uint64 durable_check_blocked;	  /* counter: recovery/rejoin direct-check fail */
 	pg_atomic_uint64 minority_marker_ignored; /* counter: partial/minority marker rejected */
+
+	/*
+	 * D4 LMON->qvotec fence-marker submit mailbox.  Single producer = the
+	 * coordinator LMON (reconfig is serialized in the LMON tick + the submit is
+	 * synchronous), single consumer = qvotec (the sole voting-disk writer).  The
+	 * request_seq / completion_seq pair is the handshake; pending_marker is written
+	 * before request_seq is bumped (write barrier between).
+	 */
+	struct Latch *qvotec_latch;				/* qvotec publishes MyLatch (D4 latch-wake) */
+	pg_atomic_uint64 marker_request_seq;	/* LMON bumps to submit a request */
+	pg_atomic_uint64 marker_completion_seq; /* qvotec sets = request_seq when done */
+	pg_atomic_uint32 marker_result;			/* ClusterFenceMarkerSubmitResult */
+	pg_atomic_uint64 marker_write_failed;	/* counter: a submit did not reach majority */
+	ClusterFenceMarker pending_marker;		/* LMON stages here before bumping request_seq */
 } ClusterWriteFenceShmem;
 
 /* shmem region plumbing (ClusterShmemRegion 5-step). */
@@ -300,6 +326,26 @@ extern void cluster_write_fence_shmem_register(void);
 extern void cluster_write_fence_refresh_from_marker(const ClusterFenceMarker *m,
 													uint64 lease_expire_us);
 extern void cluster_write_fence_note_minority_marker(void);
+
+/*
+ * D4 cross-process fence-marker submit (core 8.A order).
+ *
+ * cluster_write_fence_submit_marker -- LMON (coordinator) side: stage the marker,
+ *	wake qvotec, and synchronously wait (bounded) for qvotec to write + fdatasync it
+ *	to >= quorum-majority disks.  Returns ACK only when the marker is durable on a
+ *	majority; the coordinator publishes the reconfig event ONLY on ACK.
+ * cluster_write_fence_publish_qvotec_latch -- qvotec startup: publish MyLatch so
+ *	LMON can wake it; auto-cleared at proc_exit.
+ * cluster_write_fence_qvotec_poll_pending -- qvotec poll: returns true + the marker
+ *	when a new submit is pending (and marks it in-flight).
+ * cluster_write_fence_qvotec_complete -- qvotec poll: publish the in-flight result
+ *	(acked = reached majority) back to the waiting LMON.
+ */
+extern ClusterFenceMarkerSubmitResult
+cluster_write_fence_submit_marker(const ClusterFenceMarker *m);
+extern void cluster_write_fence_publish_qvotec_latch(struct Latch *latch);
+extern bool cluster_write_fence_qvotec_poll_pending(ClusterFenceMarker *out);
+extern void cluster_write_fence_qvotec_complete(bool acked);
 
 /*
  * cluster_write_fence_allowed -- the hot-path wrapper: read the live epoch + the

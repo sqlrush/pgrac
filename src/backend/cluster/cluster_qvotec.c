@@ -601,6 +601,8 @@ qvotec_poll_once(void)
 	uint64 next_lease_expire;
 	uint64 heartbeat_timeout_us;
 	int i;
+	ClusterFenceMarker submit_marker;
+	bool have_submit;
 
 	now_us = (uint64)GetCurrentTimestamp();
 	next_lease_expire = now_us + (uint64)cluster_quorum_poll_interval_ms * 2 * 1000ULL;
@@ -611,10 +613,21 @@ qvotec_poll_once(void)
 	pg_atomic_write_u64(&QvotecShmem->last_poll_ts_us, now_us);
 	pg_atomic_write_u64(&QvotecShmem->lease_expire_at_us, next_lease_expire);
 
+	/*
+	 * spec-4.12 D4: pick up a pending fence-marker submit from LMON (latch-woke
+	 * us).  We embed it in THIS poll's self-slot write to every disk and ack
+	 * majority-durability after the write.  A failure on every early-return path
+	 * below still completes the in-flight request (fail-closed) so LMON does not
+	 * hang to its timeout.
+	 */
+	have_submit = cluster_write_fence_qvotec_poll_pending(&submit_marker);
+
 	if (qvotec_n_disks == 0) {
 		/* Single-node compat: no disks, no quorum to decide.  Hold
 		 * quorum_state at INITIALIZING so any explicit consumer that
 		 * does check it stays fail-closed (per Q4 v0.2 default). */
+		if (have_submit)
+			cluster_write_fence_qvotec_complete(false); /* no disk -> no majority */
 		return;
 	}
 
@@ -623,6 +636,8 @@ qvotec_poll_once(void)
 		 * Leave shmem at last-known state and skip the cycle.  Q7
 		 * startup validator (next commit) will reject this config
 		 * before we get here in production paths. */
+		if (have_submit)
+			cluster_write_fence_qvotec_complete(false); /* cannot author self slot */
 		return;
 	}
 
@@ -758,9 +773,16 @@ qvotec_poll_once(void)
 		 * marker from THIS node's own prior slot on THIS disk.  Copying disk j's
 		 * marker onto disk i would amplify a 1-of-N minority marker into a
 		 * quorum-majority = P0a revival; the per-disk input forbids it.
+		 *
+		 * spec-4.12 D4: a fresh marker submit from LMON overrides the preserve --
+		 * the coordinator legitimately writes ITS OWN issued marker to ALL its
+		 * disks (that is how the fence reaches quorum-majority; not amplification).
 		 */
 		memset(self_slot._reserved1, 0, sizeof(self_slot._reserved1));
-		cluster_fence_marker_preserve_per_disk(self_slot._reserved1, own_prior->_reserved1);
+		if (have_submit)
+			cluster_fence_marker_pack(self_slot._reserved1, &submit_marker);
+		else
+			cluster_fence_marker_preserve_per_disk(self_slot._reserved1, own_prior->_reserved1);
 
 		qvotec_slot_generation++;
 		self_slot.generation = qvotec_slot_generation;
@@ -822,6 +844,16 @@ qvotec_poll_once(void)
 			decision.quorum_state = CLUSTER_QVOTEC_QUORUM_LOST;
 		else
 			decision.quorum_state = CLUSTER_QVOTEC_QUORUM_UNCERTAIN;
+
+		/*
+		 * spec-4.12 D4: ack the in-flight marker submit.  The marker rode in the
+		 * self-slot write above, so the count of disks that accepted the write
+		 * (fdatasync'd) is exactly the marker's durable-disk count.  ACK only on
+		 * >= quorum-majority -- otherwise the coordinator fails closed and does
+		 * NOT publish the reconfig event (core 8.A order).
+		 */
+		if (have_submit)
+			cluster_write_fence_qvotec_complete(disks_ok_post_write >= quorum_size_post_write);
 	}
 
 	/* ---- 4. publish shmem ---- */
@@ -977,6 +1009,13 @@ ClusterQvotecMain(void)
 	qvotec_open_disks();
 	pg_atomic_write_u32(&QvotecShmem->disks_total_count, (uint32)qvotec_n_disks);
 	on_shmem_exit(qvotec_close_disks_atexit, (Datum)0);
+
+	/*
+	 * spec-4.12 D4: publish MyLatch so the reconfig coordinator (LMON) can wake us
+	 * for a synchronous fence-marker submit.  No-op until the write-fence region is
+	 * registered (D7); auto-cleared at proc_exit so a stale latch is never signalled.
+	 */
+	cluster_write_fence_publish_qvotec_latch(MyLatch);
 
 	/*
 	 * Hardening v0.4 P1.4: install per-I/O timeout handler for the

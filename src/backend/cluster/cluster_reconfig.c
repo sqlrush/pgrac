@@ -63,18 +63,19 @@
 #include "utils/timestamp.h"
 #include "utils/wait_event.h" /* WAIT_EVENT_CLUSTER_BGPROC_LMON_RECONFIG_TICK (D9) */
 
-#include "cluster/cluster_conf.h"	   /* cluster_conf_lookup_node */
-#include "cluster/cluster_cssd.h"	   /* cluster_cssd_get_peer_state, get_dead_generation */
-#include "cluster/cluster_elog.h"	   /* cluster_node_id */
-#include "cluster/cluster_epoch.h"	   /* advance + observe + set_changed_at_lsn */
-#include "cluster/cluster_gcs_block.h" /* spec-2.34 D4 — eager epoch wake hook */
-#include "cluster/cluster_sinval.h"	   /* spec-2.39 D14 — RESET-all reconfig hook */
-#include "cluster/cluster_tt_status.h" /* spec-3.1 D7 — TT status overlay flush hook */
-#include "cluster/cluster_guc.h"	   /* cluster_enabled */
-#include "cluster/cluster_inject.h"	   /* CLUSTER_INJECTION_POINT */
-#include "cluster/cluster_qvotec.h"	   /* cluster_qvotec_in_quorum */
-#include "cluster/cluster_shmem.h"	   /* cluster_shmem_register_region */
-#include "cluster/cluster_signal.h"	   /* cluster_reconfig_start_pending */
+#include "cluster/cluster_conf.h"		 /* cluster_conf_lookup_node */
+#include "cluster/cluster_cssd.h"		 /* cluster_cssd_get_peer_state, get_dead_generation */
+#include "cluster/cluster_elog.h"		 /* cluster_node_id */
+#include "cluster/cluster_epoch.h"		 /* advance + observe + set_changed_at_lsn */
+#include "cluster/cluster_gcs_block.h"	 /* spec-2.34 D4 — eager epoch wake hook */
+#include "cluster/cluster_sinval.h"		 /* spec-2.39 D14 — RESET-all reconfig hook */
+#include "cluster/cluster_tt_status.h"	 /* spec-3.1 D7 — TT status overlay flush hook */
+#include "cluster/cluster_guc.h"		 /* cluster_enabled */
+#include "cluster/cluster_inject.h"		 /* CLUSTER_INJECTION_POINT */
+#include "cluster/cluster_write_fence.h" /* spec-4.12 D4 — durable fence marker submit */
+#include "cluster/cluster_qvotec.h"		 /* cluster_qvotec_in_quorum */
+#include "cluster/cluster_shmem.h"		 /* cluster_shmem_register_region */
+#include "cluster/cluster_signal.h"		 /* cluster_reconfig_start_pending */
 
 
 /*
@@ -579,6 +580,42 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 	evt.applied_at = GetCurrentTimestamp();
 	evt.observer_role = CLUSTER_RECONFIG_OBSERVER_COORDINATOR;
 	evt.cssd_dead_generation = cssd_dead_generation;
+
+	/*
+	 * spec-4.12 D4 (core 8.A order):  when the write fence is enforced, the durable
+	 * fence marker MUST be on >= quorum-majority voting disks BEFORE we publish the
+	 * coordinator event (publishing is what starts recovery on the survivors).  We
+	 * hand the marker to qvotec (the sole voting-disk writer) and wait for a
+	 * quorum-majority ack.  If the ack does not come (write failure / qvotec down /
+	 * timeout) we FAIL CLOSED:  do NOT publish, do NOT start recovery.  The epoch is
+	 * already bumped (a safe frozen/write-fenced state -- stale tokens no longer
+	 * match), and the next LMON tick retries (last_event_id is only set by
+	 * publish_event, so a failed submit re-fires rather than dedup-skipping).
+	 *
+	 * Skipped entirely when enforcement is off/dev so a non-fenced cluster pays no
+	 * marker-write cost and reconfig behaves exactly as before (zero regression).
+	 */
+	if (cluster_write_fence_enforcement == CLUSTER_WRITE_FENCE_ENFORCE_ON) {
+		ClusterFenceMarker marker;
+
+		memset(&marker, 0, sizeof(marker));
+		marker.magic = CLUSTER_FENCE_MARKER_MAGIC;
+		marker.version = CLUSTER_FENCE_MARKER_VERSION;
+		marker.fence_epoch = new_epoch;
+		marker.fence_event_id = evt.event_id; /* identity only */
+		marker.fence_generation = cssd_dead_generation;
+		marker.issuer_node_id = coordinator_node_id;
+		memcpy(marker.fenced_dead_bitmap, dead_bitmap, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
+
+		if (cluster_write_fence_submit_marker(&marker) != CLUSTER_FENCE_MARKER_SUBMIT_ACK) {
+			ereport(LOG, (errmsg("cluster reconfig: fence marker did not reach a voting-disk "
+								 "majority for epoch %llu; not publishing reconfig event "
+								 "(write-fenced, will retry)",
+								 (unsigned long long)new_epoch)));
+			return; /* fail-closed: epoch bumped, event NOT published, recovery NOT started */
+		}
+	}
+
 	cluster_reconfig_publish_event(&evt);
 }
 
