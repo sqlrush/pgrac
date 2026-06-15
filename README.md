@@ -8,13 +8,20 @@ one shared database, Cache Fusion / SCN / GES — to PostgreSQL 16.13.
 
 > ⚠️ **Early stage, built in public.**
 >
-> **Working now:** the cluster substrate — a TCP interconnect carrying a 1 Hz
-> LMON heartbeat (declared peers handshake and trade heartbeats; per-peer state
-> in `pg_cluster_ic_peers`), block-format extensions (SCN / ITL slots / a
-> dedicated undo tablespace, OID 9100), and multi-node `pgrac.conf` bootstrap.
+> Per-feature status — working / scaffolded / planned — is tracked honestly at
+> **[pgrac.dev/features](https://pgrac.dev/features/)**. The short version:
 >
-> **Scaffolded, not yet active:** Cache Fusion, GES, cross-node recovery —
-> operations needing them return `ERRCODE_FEATURE_NOT_SUPPORTED`.
+> **Running today:** the cluster substrate (TCP interconnect + 1 Hz LMON
+> heartbeat, per-peer state in `pg_cluster_ic_peers`; SCN / ITL / dedicated-undo
+> block format; multi-node `pgrac.conf` bootstrap), plus working code paths for
+> Cache Fusion's 3-way block transfer, cross-node MVCC, the global SCN clock,
+> cluster catalog invalidation, and a cluster-aware storage manager. Honest
+> caveat: these run on real paths, but cross-node *behavioral* test coverage is
+> still being built.
+>
+> **In progress / planned:** full cross-node GES enqueue locking and crash
+> recovery (active); RDMA, Active Data Guard, rolling upgrade, FAN/TAF, and
+> backup/DR (designed, not built).
 >
 > **Sanity anchor:** the `--disable-cluster` build is binary-identical to
 > upstream PostgreSQL 16.13 and passes the full 219-test regression suite.
