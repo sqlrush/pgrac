@@ -46,6 +46,7 @@ OBJS = \
 	cluster_elog.o \
 	cluster_epoch.o \
 	cluster_fence.o \
+	cluster_write_fence.o \
 	cluster_ges.o \
 	cluster_ges_dedup.o \
 	cluster_ges_reply_wait.o \
