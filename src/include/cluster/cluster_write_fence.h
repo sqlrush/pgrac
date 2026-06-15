@@ -355,6 +355,15 @@ extern void cluster_write_fence_qvotec_complete(bool acked);
  */
 extern bool cluster_write_fence_allowed(void);
 
+/*
+ * cluster_write_fence_reject_if_fenced -- spec-4.12 D5 hot-path gate.  Allowed ->
+ *	return; fenced -> bump hot_gate_blocked and fail closed (CritSectionCount>0 ->
+ *	PANIC, else ERROR 53R51).  Every cooperative shared-storage write entry calls
+ *	this ONE helper so the CritSectionCount-aware gate is identical everywhere (L240).
+ *	op names the operation for the message ("write" / "extend" / ...).
+ */
+extern void cluster_write_fence_reject_if_fenced(const char *op);
+
 #endif /* !FRONTEND */
 
 #endif /* CLUSTER_WRITE_FENCE_H */

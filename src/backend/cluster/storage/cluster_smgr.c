@@ -63,6 +63,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_write_fence.h" /* spec-4.12 D5 — hot write-path fence gate */
 #include "cluster/storage/cluster_shared_fs.h"
 #include "cluster/storage/cluster_smgr.h"
 
@@ -359,6 +360,9 @@ cluster_smgr_create(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 
 	CLUSTER_INJECTION_POINT("cluster-smgr-create-top");
 
+	/* spec-4.12 D5 (L240): reject before any side effect if this node is fenced. */
+	cluster_write_fence_reject_if_fenced("create");
+
 	/*
 	 * Ensure the tablespace's per-database directory exists before we
 	 * try to create the relation file inside it.  Mirrors
@@ -426,6 +430,9 @@ cluster_smgr_unlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isR
 {
 	(void)isRedo;
 
+	/* spec-4.12 D5 (L240): reject before any handle close / physical unlink. */
+	cluster_write_fence_reject_if_fenced("unlink");
+
 	if (cluster_smgr_relations != NULL) {
 		ClusterSmgrRelationState *state;
 
@@ -470,6 +477,9 @@ cluster_smgr_extend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 	(void)skipFsync; /* PG handles fsync via the buffer manager */
 
+	/* spec-4.12 D5 (L240): reject before extending the underlying file. */
+	cluster_write_fence_reject_if_fenced("extend");
+
 	state = cluster_smgr_state_lookup(reln, true);
 	handle = cluster_smgr_ensure_handle(state, forknum);
 
@@ -494,6 +504,9 @@ cluster_smgr_zeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber block
 	int i;
 
 	(void)skipFsync;
+
+	/* spec-4.12 D5 (L240): reject before any zero-block write. */
+	cluster_write_fence_reject_if_fenced("zero-extend");
 
 	/*
 	 * mdzeroextend cannot be used as a fallback: it operates on PG's
@@ -555,6 +568,9 @@ cluster_smgr_write(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, 
 
 	(void)skipFsync;
 
+	/* spec-4.12 D5 (L240): reject before the shared-storage block write. */
+	cluster_write_fence_reject_if_fenced("write");
+
 	state = cluster_smgr_state_lookup(reln, true);
 	handle = cluster_smgr_ensure_handle(state, forknum);
 
@@ -609,6 +625,9 @@ cluster_smgr_truncate(SMgrRelation reln, ForkNumber forknum, BlockNumber old_blo
 	ClusterSharedFsHandle *handle;
 
 	(void)old_blocks; /* not needed at stage 1.2; useful for sync metadata */
+
+	/* spec-4.12 D5 (L240): reject before truncating the underlying file. */
+	cluster_write_fence_reject_if_fenced("truncate");
 
 	state = cluster_smgr_state_lookup(reln, true);
 	handle = cluster_smgr_ensure_handle(state, forknum);

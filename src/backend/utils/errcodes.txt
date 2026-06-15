@@ -489,6 +489,14 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 # future fence / backend fail-closed variants.
 53R50    E    ERRCODE_CLUSTER_QUORUM_LOST_BACKEND                            cluster_quorum_lost_backend
 
+# spec-4.12 D5 — cooperative write-fence hot-path reject.  A shared-storage
+# write (cluster_smgr create/unlink/extend/zeroextend/write/truncate) was
+# refused because this node failed the write-fence token: stale epoch /
+# expired lease / self-fenced.  Non-critical-section callers get this
+# catchable ERROR (recovery PG_TRY harness downgrades it to BLOCKED);
+# critical-section callers PANIC instead (cannot ERROR).
+53R51    E    ERRCODE_CLUSTER_WRITE_FENCED                                   cluster_write_fenced
+
 # spec-2.29 D8 — retry-safe backend abort for in-flight membership
 # reconfig / epoch transition.  53R60 is intentionally separate from
 # 53R40 commit-boundary quorum loss and 53R50 fence/quorum-loss backend

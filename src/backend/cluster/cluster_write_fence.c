@@ -31,6 +31,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "miscadmin.h"	   /* CritSectionCount */
 #include "storage/ipc.h"   /* on_shmem_exit */
 #include "storage/latch.h" /* Latch, SetLatch (D4 latch-wake) */
 #include "storage/shmem.h"
@@ -167,6 +168,41 @@ cluster_write_fence_allowed(void)
 
 	return cluster_write_fence_decide(enforcement_on, region_attached, epoch_current,
 									  authorized_epoch, now_us, lease_expire_us, self_fenced);
+}
+
+/*
+ * cluster_write_fence_reject_if_fenced -- spec-4.12 D5 hot-path gate.  The ONE
+ *	helper that every cooperative shared-storage write entry calls so they all
+ *	mirror the identical CritSectionCount-aware fail-closed action (L240 -- a single
+ *	helper cannot diverge entry-to-entry).  Allowed -> return.  Fenced -> bump the
+ *	counter, then PANIC inside a critical section (a half-done critical write cannot
+ *	be rolled back) or ERROR 53R51 otherwise (catchable; the recovery PG_TRY harness
+ *	downgrades it to BLOCKED).
+ */
+void
+cluster_write_fence_reject_if_fenced(const char *op)
+{
+	if (cluster_write_fence_allowed())
+		return; /* enforcement off, or the token proves this node's authority */
+
+	if (cluster_write_fence_shmem != NULL)
+		pg_atomic_fetch_add_u64(&cluster_write_fence_shmem->hot_gate_blocked, 1);
+
+	if (CritSectionCount > 0)
+		ereport(PANIC,
+				(errcode(ERRCODE_CLUSTER_WRITE_FENCED),
+				 errmsg("cluster shared-storage %s rejected by the write fence inside a "
+						"critical section",
+						op),
+				 errdetail("This node is stale / superseded / lease-expired / self-fenced; a "
+						   "critical-section write cannot be rolled back, so the node PANICs "
+						   "to fail closed.")));
+
+	ereport(ERROR,
+			(errcode(ERRCODE_CLUSTER_WRITE_FENCED),
+			 errmsg("cluster shared-storage %s rejected: this node is write-fenced", op),
+			 errhint("The node's cluster epoch is stale, its write-fence lease expired, or a "
+					 "membership reconfiguration declared this node dead (self-fenced).")));
 }
 
 /*
