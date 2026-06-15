@@ -194,7 +194,7 @@ UT_TEST(test_marker_node_is_fenced)
 UT_TEST(test_authority_unanimous)
 {
 	ClusterFenceMarker markers[3];
-	bool has[3] = { true, true, true };
+	const bool has[3] = { true, true, true };
 	ClusterFenceAuthority a;
 
 	markers[0] = mk_marker(5, 2, 0xAA, 1, 0x04);
@@ -212,7 +212,7 @@ UT_TEST(test_authority_majority_beats_minority_higher_epoch)
 	/* P0a: a minority higher-epoch marker (1 disk) must NOT win; the majority
 	 * (2 disks) lower-epoch tuple is authoritative. */
 	ClusterFenceMarker markers[3];
-	bool has[3] = { true, true, true };
+	const bool has[3] = { true, true, true };
 	ClusterFenceAuthority a;
 
 	markers[0] = mk_marker(5, 2, 0xAA, 1, 0x00);
@@ -229,7 +229,7 @@ UT_TEST(test_authority_single_disk_no_authority)
 	/* anti-P0a / R13: one disk carries a CRC-ok marker, the other two do not.
 	 * No quorum-majority -> NO authority, minority_seen counter fires. */
 	ClusterFenceMarker markers[3];
-	bool has[3] = { true, false, false };
+	const bool has[3] = { true, false, false };
 	ClusterFenceAuthority a;
 
 	markers[0] = mk_marker(9, 1, 0xCC, 0, 0x02);
@@ -243,7 +243,7 @@ UT_TEST(test_authority_single_disk_no_authority)
 UT_TEST(test_authority_no_markers)
 {
 	ClusterFenceMarker markers[3];
-	bool has[3] = { false, false, false };
+	const bool has[3] = { false, false, false };
 	ClusterFenceAuthority a;
 
 	memset(markers, 0, sizeof(markers));
@@ -257,7 +257,7 @@ UT_TEST(test_authority_generation_tiebreak)
 	/* same epoch, different generation: the tuple that reaches majority wins;
 	 * a higher-generation minority does not. */
 	ClusterFenceMarker markers[3];
-	bool has[3] = { true, true, true };
+	const bool has[3] = { true, true, true };
 	ClusterFenceAuthority a;
 
 	markers[0] = mk_marker(5, 2, 0xAA, 1, 0x00);
@@ -273,7 +273,7 @@ UT_TEST(test_authority_event_id_distinguishes_tuple)
 	/* two markers same epoch+gen but different event_id are DIFFERENT fences;
 	 * only the one on majority disks is authoritative. */
 	ClusterFenceMarker markers[3];
-	bool has[3] = { true, true, true };
+	const bool has[3] = { true, true, true };
 	ClusterFenceAuthority a;
 
 	markers[0] = mk_marker(5, 2, 0xAAAA, 1, 0x00);

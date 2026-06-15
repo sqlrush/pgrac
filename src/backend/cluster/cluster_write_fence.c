@@ -181,7 +181,10 @@ static bool
 cluster_write_fence_read_durable_authority(ClusterFenceAuthority *out)
 {
 	ClusterFenceMarker disk_markers[CLUSTER_MAX_VOTING_DISKS];
-	bool disk_has_marker[CLUSTER_MAX_VOTING_DISKS];
+	/* Zero-init: a disk slot never assigned (unreadable / skipped token) stays
+	 * has_marker=false, which is the correct fail-closed default and keeps the
+	 * authority quorum honest (it counts toward the configured total). */
+	bool disk_has_marker[CLUSTER_MAX_VOTING_DISKS] = { false };
 	int n_total = 0;
 	const char *p;
 
@@ -203,13 +206,23 @@ cluster_write_fence_read_durable_authority(ClusterFenceAuthority *out)
 		end = p;
 		if (*p == ',')
 			p++;
+		/* Trim leading / trailing whitespace.  Explicit-break form so a static
+		 * analyzer sees the loop can exit while end > start (a non-whitespace
+		 * tail), i.e. len is not provably zero. */
 		while (start < end && (*start == ' ' || *start == '\t'))
 			start++;
-		while (end > start && (end[-1] == ' ' || end[-1] == '\t'))
+		while (end > start) {
+			char tail = end[-1];
+
+			if (tail != ' ' && tail != '\t')
+				break;
 			end--;
+		}
+		if (start >= end)
+			continue; /* empty token (trailing / double comma): skip */
 		len = (size_t)(end - start);
-		if (len == 0 || len >= MAXPGPATH)
-			continue; /* empty/oversized token: skip without consuming a disk slot */
+		if (len >= MAXPGPATH)
+			continue; /* oversized token: skip without consuming a disk slot */
 
 		memcpy(path, start, len);
 		path[len] = '\0';
@@ -440,7 +453,6 @@ ClusterFenceMarkerSubmitResult
 cluster_write_fence_submit_marker(const ClusterFenceMarker *m)
 {
 	uint64 seq;
-	uint64 deadline_us;
 	Latch *qlatch;
 
 	if (cluster_write_fence_shmem == NULL)
@@ -460,9 +472,9 @@ cluster_write_fence_submit_marker(const ClusterFenceMarker *m)
 	/* bounded synchronous wait for qvotec to complete THIS exact request. */
 	{
 		ClusterFenceMarkerSubmitResult result;
-
-		deadline_us
+		uint64 deadline_us
 			= (uint64)GetCurrentTimestamp() + (uint64)cluster_write_fence_lease_ms * 1000ULL;
+
 		pgstat_report_wait_start(WAIT_EVENT_CLUSTER_WRITE_FENCE_MARKER_WRITE);
 		for (;;) {
 			if (pg_atomic_read_u64(&cluster_write_fence_shmem->marker_completion_seq) == seq) {
