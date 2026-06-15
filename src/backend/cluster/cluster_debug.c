@@ -99,21 +99,22 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "catalog/pg_control.h" /* DBState (spec-4.3 plan dump) */
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_recovery_worker.h"
-#include "cluster/cluster_recovery_merge.h" /* is_materialized (spec-4.5a D11) */
-#include "cluster/cluster_block_recovery.h" /* block-recovery counters (spec-4.10 D6) */
-#include "cluster/cluster_remote_xact.h"	/* remote outcome counters (spec-4.5a D11) */
-#include "cluster/cluster_ic.h"				/* ClusterICOps_Active, ClusterICTier */
-#include "cluster/cluster_ic_tier1.h"		/* listener metadata accessors (Hardening v1.0.1 F3) */
-#include "cluster/cluster_scn.h"			/* SCN typedef (stage 1.4) */
-#include "cluster/cluster_itl_slot.h"		/* CLUSTER_ITL_* constants (stage 1.5) */
-#include "cluster/cluster_buffer_desc.h"	/* BufferType / PcmState enums (stage 1.6) */
-#include "cluster/cluster_pcm_lock.h"		/* PCM state-machine API + grd helpers */
-#include "cluster/cluster_gcs.h"			/* GCS request protocol surface (spec-2.32 D8) */
-#include "cluster/cluster_gcs_block.h"		/* GCS block-ship data plane (spec-2.33 D10) */
-#include "cluster/cluster_sinval.h"			/* SI Broadcaster counter accessors (spec-2.38 D10) */
-#include "cluster/cluster_tt_status.h"		/* TT status overlay counter accessors (spec-3.1 D9) */
-#include "cluster/cluster_tt_status_hint.h" /* TT status hint counter accessors (spec-3.2 D8) */
-#include "cluster/cluster_startup_phase.h"	/* phase enum + accessors (stage 1.10) */
+#include "cluster/cluster_recovery_merge.h"	 /* is_materialized (spec-4.5a D11) */
+#include "cluster/cluster_block_recovery.h"	 /* block-recovery counters (spec-4.10 D6) */
+#include "cluster/cluster_thread_recovery.h" /* online thread-recovery counters (spec-4.11 D5) */
+#include "cluster/cluster_remote_xact.h"	 /* remote outcome counters (spec-4.5a D11) */
+#include "cluster/cluster_ic.h"				 /* ClusterICOps_Active, ClusterICTier */
+#include "cluster/cluster_ic_tier1.h"		 /* listener metadata accessors (Hardening v1.0.1 F3) */
+#include "cluster/cluster_scn.h"			 /* SCN typedef (stage 1.4) */
+#include "cluster/cluster_itl_slot.h"		 /* CLUSTER_ITL_* constants (stage 1.5) */
+#include "cluster/cluster_buffer_desc.h"	 /* BufferType / PcmState enums (stage 1.6) */
+#include "cluster/cluster_pcm_lock.h"		 /* PCM state-machine API + grd helpers */
+#include "cluster/cluster_gcs.h"			 /* GCS request protocol surface (spec-2.32 D8) */
+#include "cluster/cluster_gcs_block.h"		 /* GCS block-ship data plane (spec-2.33 D10) */
+#include "cluster/cluster_sinval.h"			 /* SI Broadcaster counter accessors (spec-2.38 D10) */
+#include "cluster/cluster_tt_status.h"		 /* TT status overlay counter accessors (spec-3.1 D9) */
+#include "cluster/cluster_tt_status_hint.h"	 /* TT status hint counter accessors (spec-3.2 D8) */
+#include "cluster/cluster_startup_phase.h"	 /* phase enum + accessors (stage 1.10) */
 #include "storage/bufpage.h"	   /* PG_PAGE_LAYOUT_VERSION, SizeOfPageHeaderData (stage 1.4) */
 #include "storage/buf_internals.h" /* BufferDesc layout (stage 1.6) */
 #include "cluster/cluster_pgstat.h"
@@ -1585,9 +1586,10 @@ verdict_csv(const ClusterRecoveryPlan *plan, ClusterRecoveryThreadVerdict want)
 
 /*
  * dump_recovery -- spec-3.16 D5 recovery observability (4 rows) +
- *	spec-4.3 D5 recovery plan surface (13 rows) + spec-4.4 D6 worker
- *	pool surface (8 rows) + spec-4.5a D11 merged-replay / remote-read
- *	surface (8 rows; 33 total).
+ *	spec-4.10 D6 single-block recovery (2 rows) + spec-4.11 D5 online
+ *	thread recovery (4 rows) + spec-4.3 D5 recovery plan surface (13
+ *	rows) + spec-4.4 D6 worker pool surface (8 rows) + spec-4.5a D11
+ *	merged-replay / remote-read surface (8 rows; 39 total).
  */
 static void
 dump_recovery(ReturnSetInfo *rsinfo)
@@ -1609,6 +1611,15 @@ dump_recovery(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_block_recovery_get_blocks_recovered()));
 	emit_row(rsinfo, "recovery", "block_recovery_failclosed",
 			 fmt_int64((int64)cluster_block_recovery_get_failclosed()));
+
+	/* spec-4.11 D5: online thread recovery (#84) outcomes. */
+	emit_row(rsinfo, "recovery", "thread_recovery_state", cluster_thread_recovery_state_name());
+	emit_row(rsinfo, "recovery", "thread_recovery_threads_recovered",
+			 fmt_int64((int64)cluster_thread_recovery_get_threads_recovered()));
+	emit_row(rsinfo, "recovery", "thread_recovery_replay_failclosed",
+			 fmt_int64((int64)cluster_thread_recovery_get_replay_failclosed()));
+	emit_row(rsinfo, "recovery", "thread_recovery_recovered_through_lsn",
+			 fmt_uint64_hex((uint64)cluster_thread_recovery_get_recovered_through()));
 
 	/* spec-4.3 D5: recovery plan (observational; '-' before a plan). */
 	have_plan = cluster_recovery_plan_snapshot(&plan);

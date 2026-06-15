@@ -168,6 +168,22 @@ typedef struct ClusterThreadReplaySlot {
 } ClusterThreadReplaySlot;
 
 /*
+ * Region-level cumulative online thread-recovery counters (spec-4.11 D5
+ * observability).  Share the "pgrac recovery plan" region (no new region, Q3)
+ * alongside the per-thread replay slots; surfaced by the recovery dump category
+ * (cluster_debug.c) and the trigger tests.  threads_recovered counts DONE
+ * outcomes, replay_failclosed counts BLOCKED (53RA4) outcomes, recovered_through
+ * is the last published recovered_through LSN (a high-watermark of online apply).
+ * The increment / read LOGIC lives in the orchestrator (cluster_thread_recovery.h
+ * count/get helpers); this only carries the bytes (mirrors the slot accessor).
+ */
+typedef struct ClusterThreadRecoveryCounters {
+	pg_atomic_uint64 threads_recovered;
+	pg_atomic_uint64 replay_failclosed;
+	pg_atomic_uint64 recovered_through; /* last published recovered_through LSN (raw) */
+} ClusterThreadRecoveryCounters;
+
+/*
  * Backend API (cluster_recovery_plan.c).  All paths are no-ops when
  * cluster.wal_threads_dir is unset / the thread id is LEGACY.
  */
@@ -195,6 +211,15 @@ extern void cluster_recovery_plan_shmem_register(void);
  * only through this accessor.
  */
 extern ClusterThreadReplaySlot *cluster_thread_recovery_replay_slot(uint16 dead_tid);
+
+/*
+ * cluster_thread_recovery_counters -- the region-level online thread-recovery
+ * counter block (spec-4.11 D5), or NULL when no shmem is attached (L110: the
+ * orchestrator getters then report 0 / InvalidXLogRecPtr -- the frozen-safe
+ * sentinel).  Exposes only the pointer (the increment/read logic lives in the
+ * orchestrator), mirroring the slot accessor + the worker-pool pointer.
+ */
+extern ClusterThreadRecoveryCounters *cluster_thread_recovery_counters(void);
 
 #endif /* !FRONTEND */
 

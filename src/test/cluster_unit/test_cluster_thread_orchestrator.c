@@ -269,10 +269,34 @@ UT_TEST(test_should_launch_stale_episode_relaunches)
 }
 
 
+/* ----------
+ * spec-4.11 D7 capability gate: scope_is_unsupported pins which scopes raise
+ * FEATURE_NOT_SUPPORTED (the hard-unsupported NO_SHARED_BACKEND / MULTI_SURVIVOR)
+ * vs the merely not-applicable scopes that must NEVER raise (the no-regression
+ * boundary -- the live FSM stays a no-op for those).
+ * ----------
+ */
+UT_TEST(test_scope_is_unsupported_true_for_hard_unsupported)
+{
+	UT_ASSERT(
+		cluster_thread_recovery_scope_is_unsupported(CLUSTER_THREADREC_SCOPE_NO_SHARED_BACKEND));
+	UT_ASSERT(cluster_thread_recovery_scope_is_unsupported(CLUSTER_THREADREC_SCOPE_MULTI_SURVIVOR));
+}
+
+UT_TEST(test_scope_is_unsupported_false_for_applicable_and_not_applicable)
+{
+	/* APPLICABLE proceeds; DISABLED / SINGLE_NODE fall back with no error -- the
+	 * gate must NEVER fire for these (it would crash a GUC-off / single-node FSM). */
+	UT_ASSERT(!cluster_thread_recovery_scope_is_unsupported(CLUSTER_THREADREC_SCOPE_APPLICABLE));
+	UT_ASSERT(!cluster_thread_recovery_scope_is_unsupported(CLUSTER_THREADREC_SCOPE_DISABLED));
+	UT_ASSERT(!cluster_thread_recovery_scope_is_unsupported(CLUSTER_THREADREC_SCOPE_SINGLE_NODE));
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(24);
 	UT_RUN(test_on_blocked_keep_frozen_default);
 	UT_RUN(test_on_blocked_panic_when_policy_panic);
 	UT_RUN(test_on_blocked_unknown_policy_is_keep_frozen);
@@ -295,6 +319,8 @@ main(void)
 	UT_RUN(test_should_launch_idle_slot_launches);
 	UT_RUN(test_should_launch_current_episode_is_idempotent);
 	UT_RUN(test_should_launch_stale_episode_relaunches);
+	UT_RUN(test_scope_is_unsupported_true_for_hard_unsupported);
+	UT_RUN(test_scope_is_unsupported_false_for_applicable_and_not_applicable);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

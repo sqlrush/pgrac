@@ -190,12 +190,13 @@ UT_TEST(test_cluster_wait_events_count_is_99)
 	 * + ClusterGCSBlockStarvationRetry) + 2 added by spec-4.1 D7
 	 * (ClusterWalThreadClaimRead/Write) + 1 added by spec-4.6 D4
 	 * (ClusterGrdShardRemaster) + 1 added by spec-4.7 D1
-	 * (ClusterGCSBlockRecovering).
+	 * (ClusterGCSBlockRecovering) + 1 added by spec-4.11 D5
+	 * (ClusterThreadRecovery).
 	 * If a future subsystem spec adds new cluster wait events, both the
 	 * enum in wait_event.h and CLUSTER_WAIT_EVENTS_COUNT must move
 	 * together, and this test number must be bumped in lockstep.
 	 */
-	UT_ASSERT_EQ(CLUSTER_WAIT_EVENTS_COUNT, 99);
+	UT_ASSERT_EQ(CLUSTER_WAIT_EVENTS_COUNT, 100);
 }
 
 

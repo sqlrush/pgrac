@@ -64,6 +64,9 @@ typedef struct ClusterRecoveryPlanShmem {
 	 * region too; indexed by thread id 1..CLUSTER_RECOVERY_PLAN_THREADS,
 	 * [0] unused (the plan/pool ABIs are untouched). */
 	ClusterThreadReplaySlot thread_replay[CLUSTER_RECOVERY_PLAN_THREADS + 1];
+	/* spec-4.11 D5: region-level cumulative online thread-recovery counters
+	 * (observability); shares the region, no new region (Q3). */
+	ClusterThreadRecoveryCounters thread_recovery_counters;
 } ClusterRecoveryPlanShmem;
 
 static ClusterRecoveryPlanShmem *cluster_recovery_plan_shmem = NULL;
@@ -99,6 +102,14 @@ cluster_recovery_plan_shmem_init(void)
 							   CLUSTER_THREADREC_REPLAY_IDLE);
 			pg_atomic_init_u64(&cluster_recovery_plan_shmem->thread_replay[slot].episode_epoch, 0);
 		}
+
+		/* spec-4.11 D5: cumulative counters start at zero. */
+		pg_atomic_init_u64(&cluster_recovery_plan_shmem->thread_recovery_counters.threads_recovered,
+						   0);
+		pg_atomic_init_u64(&cluster_recovery_plan_shmem->thread_recovery_counters.replay_failclosed,
+						   0);
+		pg_atomic_init_u64(&cluster_recovery_plan_shmem->thread_recovery_counters.recovered_through,
+						   0);
 	}
 }
 
@@ -280,6 +291,20 @@ cluster_thread_recovery_replay_slot(uint16 dead_tid)
 	if (dead_tid < XLP_THREAD_ID_FIRST_REAL || dead_tid > CLUSTER_WAL_THREAD_MAX)
 		return NULL;
 	return &cluster_recovery_plan_shmem->thread_replay[dead_tid];
+}
+
+/*
+ * cluster_thread_recovery_counters -- the region-level online thread-recovery
+ *	counter block (spec-4.11 D5), declared in cluster_recovery_plan.h.  Returns
+ *	NULL when the region is not attached (L110: the orchestrator getters then
+ *	report the frozen-safe sentinel 0 / InvalidXLogRecPtr).
+ */
+ClusterThreadRecoveryCounters *
+cluster_thread_recovery_counters(void)
+{
+	if (cluster_recovery_plan_shmem == NULL)
+		return NULL;
+	return &cluster_recovery_plan_shmem->thread_recovery_counters;
 }
 
 /*

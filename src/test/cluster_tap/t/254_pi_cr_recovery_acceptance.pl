@@ -122,7 +122,7 @@ is($node->safe_psql('postgres', 'SELECT 1'), '1', 'L0a single node alive');
 #   counts per category), not mere existence (L223).
 # ----------------------------------------------------------------------
 my %expect_cat = (
-	recovery     => 33,    # 4.3 plan + 4.5/4.7 merge/recover
+	recovery     => 39,    # 3.16(4)+4.10 block(2)+4.11 thread(4)+4.3 plan(13)+4.4 worker(8)+4.5/4.7 merge(8)
 	tt_recovery  => 8,     # 4.8 verdict counters
 	gcs_recovery => 8,     # 4.7 warm-recovery counters
 	cr           => 17,    # 3.10/3.21/3.22 CR path

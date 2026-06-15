@@ -58,6 +58,7 @@ PG_FUNCTION_INFO_V1(cluster_thread_recovery_worker_run_test);
 PG_FUNCTION_INFO_V1(cluster_thread_recovery_launch_test);
 PG_FUNCTION_INFO_V1(cluster_thread_replay_slot_state_test);
 PG_FUNCTION_INFO_V1(cluster_reconfig_inject_dead_node_test);
+PG_FUNCTION_INFO_V1(cluster_thread_capability_gate_test);
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -471,6 +472,48 @@ cluster_reconfig_inject_dead_node_test(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(true);
 }
 
+/*
+ * cluster_thread_capability_gate_test -- exercise the D7 capability gate (spec-4.11
+ * §D7).  scope >= 0 drives cluster_thread_recovery_capability_gate with an explicit
+ * ClusterThreadRecScope (0 APPLICABLE / 1 DISABLED / 2 SINGLE_NODE / 3
+ * NO_SHARED_BACKEND / 4 MULTI_SURVIVOR), so the TAP can assert FEATURE_NOT_SUPPORTED
+ * (SQLSTATE 0A000) for the hard-unsupported scopes deterministically on one machine
+ * (no real no-backend / >2-node cluster needed).  scope < 0 resolves the
+ * live-runtime scope first (cluster_thread_recovery_current_scope).  Returns
+ * 'ok:<scope_int>' when the gate does NOT raise (APPLICABLE / DISABLED /
+ * SINGLE_NODE); otherwise the gate ereports and this never returns.  TEST-ONLY,
+ * superuser-only.
+ */
+Datum
+cluster_thread_capability_gate_test(PG_FUNCTION_ARGS)
+{
+	int32 scope_arg;
+	ClusterThreadRecScope scope;
+
+	if (!superuser())
+		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						errmsg("cluster_thread_capability_gate_test is superuser-only")));
+
+	if (PG_ARGISNULL(0))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("scope must not be NULL")));
+
+	scope_arg = PG_GETARG_INT32(0);
+	if (scope_arg < 0)
+		scope = cluster_thread_recovery_current_scope();
+	else if (scope_arg > (int32)CLUSTER_THREADREC_SCOPE_MULTI_SURVIVOR)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("scope %d out of range [0, %d]", scope_arg,
+							   (int)CLUSTER_THREADREC_SCOPE_MULTI_SURVIVOR)));
+	else
+		scope = (ClusterThreadRecScope)scope_arg;
+
+	/* Raises FEATURE_NOT_SUPPORTED for NO_SHARED_BACKEND / MULTI_SURVIVOR. */
+	cluster_thread_recovery_capability_gate(scope);
+
+	PG_RETURN_TEXT_P(cstring_to_text(psprintf("ok:%d", (int)scope)));
+}
+
 #else /* !USE_PGRAC_CLUSTER */
 
 Datum
@@ -534,6 +577,13 @@ cluster_reconfig_inject_dead_node_test(PG_FUNCTION_ARGS pg_attribute_unused())
 {
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("cluster_reconfig_inject_dead_node_test requires --enable-cluster")));
+}
+
+Datum
+cluster_thread_capability_gate_test(PG_FUNCTION_ARGS pg_attribute_unused())
+{
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cluster_thread_capability_gate_test requires --enable-cluster")));
 }
 
 #endif /* USE_PGRAC_CLUSTER */

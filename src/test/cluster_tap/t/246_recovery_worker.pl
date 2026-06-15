@@ -19,7 +19,7 @@
 #      L5   cluster.recovery_workers_max=0 -> candidates present but
 #           zero spawn (pool idle)
 #      L6   no candidates (peer cleanly stopped) -> zero spawn
-#      L7   recovery category exposes 35 keys; worker keys read '-'
+#      L7   recovery category exposes 39 keys; worker keys read '-'
 #           on a flat node
 #
 #    Worker completion is polled via workers_done (deadline 15s); the
@@ -202,7 +202,7 @@ is(plankey($node0, 'worker_pool_state'), 'idle', 'L6 zero spawn without candidat
 # ============================================================
 is($node0->safe_psql('postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category = 'recovery'}),
-	'35', 'L7 recovery category: 6 + 13 + 8 + 8 keys');
+	'39', 'L7 recovery category: 6 + 4 thread-recovery + 13 + 8 + 8 keys');
 $node0->stop;
 
 my $flat = PgracClusterNode->new('recworker_flat');

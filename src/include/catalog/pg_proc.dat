@@ -12673,6 +12673,16 @@
   proargnames => '{dead_node}',
   prosrc => 'cluster_reconfig_inject_dead_node_test' },
 
+{ oid => '8947',
+  descr => 'TEST-ONLY: drive the online thread-recovery D7 capability gate (spec-4.11)',
+  proname => 'cluster_thread_capability_gate_test',
+  proisstrict => 'f',
+  provolatile => 'v', proparallel => 'u',
+  prorettype => 'text',
+  proargtypes => 'int4',
+  proargnames => '{scope}',
+  prosrc => 'cluster_thread_capability_gate_test' },
+
 # spec-4.10 D2: reconstruct one block via the online single-block recovery
 # orchestrator over an explicit WAL window, for the byte-for-byte differential
 # vs PG real crash-recovery redo.  Returns the reconstructed page as bytea, or

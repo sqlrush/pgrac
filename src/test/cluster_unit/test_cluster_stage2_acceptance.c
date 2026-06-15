@@ -215,8 +215,9 @@ UT_TEST(test_stage2_wait_events_count_snapshot_97)
 	/* spec-2.39 D13 ship value.  Future spec adding wait events MUST
 	 * update this snapshot (update-required contract per spec v0.2 F5
 	 * — current state, not "==93 forever").  spec-4.7 D1: 98 → 99
-	 * (+ ClusterGCSBlockRecovering). */
-	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 99);
+	 * (+ ClusterGCSBlockRecovering).  spec-4.11 D5: 99 → 100
+	 * (+ ClusterThreadRecovery). */
+	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 100);
 }
 
 

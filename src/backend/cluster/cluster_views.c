@@ -138,12 +138,13 @@ static const uint32 cluster_wait_event_infos[CLUSTER_WAIT_EVENTS_COUNT] = {
 	/* spec-4.6 D4: GRD shard remaster short-wait (Reconfig class). */
 	WAIT_EVENT_CLUSTER_GRD_SHARD_REMASTER,
 
-	/* Cluster: Recovery (5) */
+	/* Cluster: Recovery (6 = 5 + 1 spec-4.11 D5 online thread recovery) */
 	WAIT_EVENT_RECOVERY_WAL_FETCH,
 	WAIT_EVENT_RECOVERY_KWAY_MERGE,
 	WAIT_EVENT_RECOVERY_APPLY_PER_THREAD,
 	WAIT_EVENT_RECOVERY_UNDO_REPLAY,
 	WAIT_EVENT_RECOVERY_PCM_STATE_RESTORE,
+	WAIT_EVENT_CLUSTER_THREAD_RECOVERY,
 
 	/* Cluster: Sinval (6 = 3 spec-2.38 + 3 spec-2.39 D13) */
 	WAIT_EVENT_SINVAL_BROADCAST_SEND,

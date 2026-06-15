@@ -383,12 +383,15 @@ typedef enum {
 	 * BgProc — see that segment's contract). */
 	WAIT_EVENT_CLUSTER_GRD_SHARD_REMASTER,
 
-	/* Cluster: Recovery (5 events) -- #86 */
+	/* Cluster: Recovery (6 events) -- #86; +1 spec-4.11 D5 online thread recovery */
 	WAIT_EVENT_RECOVERY_WAL_FETCH = PG_WAIT_CLUSTER_RECOVERY,
 	WAIT_EVENT_RECOVERY_KWAY_MERGE,
 	WAIT_EVENT_RECOVERY_APPLY_PER_THREAD,
 	WAIT_EVENT_RECOVERY_UNDO_REPLAY,
 	WAIT_EVENT_RECOVERY_PCM_STATE_RESTORE,
+	/* spec-4.11 D5 (#84): a survivor online-replaying a dead WAL thread's data
+	 * through to shared storage inside the reconfig freeze window. */
+	WAIT_EVENT_CLUSTER_THREAD_RECOVERY,
 
 	/* Cluster: Sinval (6 events) -- subsystem #9; +3 NEW spec-2.39 D13 */
 	WAIT_EVENT_SINVAL_BROADCAST_SEND = PG_WAIT_CLUSTER_SINVAL,

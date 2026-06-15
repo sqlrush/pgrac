@@ -65,6 +65,8 @@
 #include "access/xlogdefs.h"
 #include "miscadmin.h"
 #include "utils/elog.h"
+#include "utils/errcodes.h"	  /* ERRCODE_FEATURE_NOT_SUPPORTED (D7 gate)     */
+#include "utils/wait_event.h" /* WAIT_EVENT_CLUSTER_THREAD_RECOVERY (D5)      */
 
 #include "port/atomics.h" /* replay-slot atomics + barriers (3b-4b)      */
 
@@ -129,6 +131,149 @@ cluster_thread_recovery_replay_read(uint16 dead_tid, ClusterThreadRecReplayState
 }
 
 /*
+ * D5 observability counters (spec-4.11 §D5).  Cumulative online thread-recovery
+ * outcomes over the region-level counter block; L110-safe -- with no shmem
+ * attached the writes are no-ops and the reads return the frozen-safe sentinel.
+ */
+void
+cluster_thread_recovery_count_done(XLogRecPtr recovered_through)
+{
+	ClusterThreadRecoveryCounters *c = cluster_thread_recovery_counters();
+	uint64 cur;
+
+	if (c == NULL)
+		return;
+	pg_atomic_fetch_add_u64(&c->threads_recovered, 1);
+	/* recovered_through is a high-watermark: reconfig episodes advance the LSN
+	 * monotonically, but guard against a stale-epoch retry regressing it. */
+	cur = pg_atomic_read_u64(&c->recovered_through);
+	if ((uint64)recovered_through > cur)
+		pg_atomic_write_u64(&c->recovered_through, (uint64)recovered_through);
+}
+
+void
+cluster_thread_recovery_count_blocked(void)
+{
+	ClusterThreadRecoveryCounters *c = cluster_thread_recovery_counters();
+
+	if (c == NULL)
+		return;
+	pg_atomic_fetch_add_u64(&c->replay_failclosed, 1);
+}
+
+uint64
+cluster_thread_recovery_get_threads_recovered(void)
+{
+	ClusterThreadRecoveryCounters *c = cluster_thread_recovery_counters();
+
+	return (c == NULL) ? 0 : pg_atomic_read_u64(&c->threads_recovered);
+}
+
+uint64
+cluster_thread_recovery_get_replay_failclosed(void)
+{
+	ClusterThreadRecoveryCounters *c = cluster_thread_recovery_counters();
+
+	return (c == NULL) ? 0 : pg_atomic_read_u64(&c->replay_failclosed);
+}
+
+XLogRecPtr
+cluster_thread_recovery_get_recovered_through(void)
+{
+	ClusterThreadRecoveryCounters *c = cluster_thread_recovery_counters();
+
+	return (c == NULL) ? InvalidXLogRecPtr : (XLogRecPtr)pg_atomic_read_u64(&c->recovered_through);
+}
+
+/*
+ * cluster_thread_recovery_state_name -- an aggregate state over the per-thread
+ *	replay slots for the recovery dump (spec-4.11 D5).  Precedence REPLAYING >
+ *	BLOCKED > DONE > IDLE so the most active concern shows; "-" when no shmem is
+ *	attached (L110 sentinel).
+ */
+const char *
+cluster_thread_recovery_state_name(void)
+{
+	bool any = false;
+	bool any_blocked = false;
+	bool any_done = false;
+	uint16 tid;
+
+	for (tid = XLP_THREAD_ID_FIRST_REAL; tid <= CLUSTER_RECOVERY_PLAN_THREADS; tid++) {
+		ClusterThreadReplaySlot *slot = cluster_thread_recovery_replay_slot(tid);
+		uint32 st;
+
+		if (slot == NULL)
+			continue; /* tid beyond the accessor range, or region not attached */
+		any = true;
+		st = pg_atomic_read_u32(&slot->state);
+		if (st == (uint32)CLUSTER_THREADREC_REPLAY_REPLAYING)
+			return "replaying";
+		if (st == (uint32)CLUSTER_THREADREC_REPLAY_BLOCKED)
+			any_blocked = true;
+		else if (st == (uint32)CLUSTER_THREADREC_REPLAY_DONE)
+			any_done = true;
+	}
+
+	if (!any)
+		return "-"; /* region not attached (L110 sentinel) */
+	if (any_blocked)
+		return "blocked";
+	if (any_done)
+		return "done";
+	return "idle";
+}
+
+/*
+ * cluster_thread_recovery_current_scope -- resolve the live-runtime D7 scope
+ *	(spec-4.11 §D7): the GUC, has_peers, a genuinely shared data backend, and the
+ *	2-node survivor count.  Mirrors replay_one's resolution so a capability probe
+ *	sees exactly what the launch path would decide.
+ */
+ClusterThreadRecScope
+cluster_thread_recovery_current_scope(void)
+{
+	bool shared_fs = (cluster_shared_storage_backend == CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS);
+	int survivors = cluster_conf_node_count() - 1;
+
+	return cluster_thread_recovery_decide_scope(cluster_online_thread_recovery,
+												cluster_conf_has_peers(), shared_fs, survivors);
+}
+
+/*
+ * cluster_thread_recovery_capability_gate -- the D7 FEATURE_NOT_SUPPORTED gate
+ *	(spec-4.11 §3, §D7).  For a hard-unsupported scope (no genuinely shared data
+ *	backend, or a >2-node multi-survivor cluster out of the v0.2 2-node scope)
+ *	raise FEATURE_NOT_SUPPORTED (mirror spec-4.5a's 53RA3 backend gate); any other
+ *	scope is a no-op -- APPLICABLE proceeds, DISABLED / SINGLE_NODE fall back to
+ *	PG-native / cold recovery with no error.  This is the EXPLICIT capability
+ *	surface (a probe / test consults it), NOT the live reconfig FSM: the FSM stays
+ *	a no-op for every non-applicable scope so a single-node / GUC-off / >2-node
+ *	reconfig never crashes (the t/249-252 no-regression line).  scope_is_unsupported
+ *	pins the branch so the gate NEVER fires for a merely not-applicable scope.
+ */
+void
+cluster_thread_recovery_capability_gate(ClusterThreadRecScope scope)
+{
+	if (!cluster_thread_recovery_scope_is_unsupported(scope))
+		return;
+
+	if (scope == CLUSTER_THREADREC_SCOPE_NO_SHARED_BACKEND)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("online thread recovery requires a shared data backend"),
+				 errhint("Set cluster.shared_storage_backend=cluster_fs, or let the dead node "
+						 "recover on cold restart.")));
+
+	/* CLUSTER_THREADREC_SCOPE_MULTI_SURVIVOR */
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("online thread recovery is not supported with more than one survivor"),
+			 errhint("Online thread recovery is limited to a 2-node cluster (a single survivor) "
+					 "in this release; the dead node recovers on cold restart.")));
+}
+
+/*
  * cluster_thread_recovery_replay_one_window -- the orchestrator core, window
  *		EXPLICIT (spec-4.11 3b-2).  Online-recover ONE dead thread over
  *		[scan_lower, scan_upper]: drive the combined data + visibility pass under
@@ -176,8 +321,10 @@ cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower
 	 * returns DONE / BLOCKED -- never throws a catchable ERROR (it demotes one),
 	 * only re-throws a FATAL/PANIC.
 	 */
+	pgstat_report_wait_start(WAIT_EVENT_CLUSTER_THREAD_RECOVERY);
 	drive_res
 		= cluster_thread_recovery_drive(dead_tid, scan_lower, scan_upper, &vis, &touched, stats);
+	pgstat_report_wait_end();
 
 	if (drive_res != CLUSTER_THREADREC_DONE) {
 		/*
@@ -262,6 +409,17 @@ cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower
 			result = CLUSTER_THREADREC_BLOCKED;
 		}
 	}
+
+	/*
+	 * D5 observability: record the outcome before applying the panic policy -- a
+	 * DONE bumps threads_recovered and advances the recovered_through watermark; a
+	 * BLOCKED bumps the failclosed (53RA4) counter.  stats->recovered_through is
+	 * the published boundary on DONE and 0 on BLOCKED (cleared above).
+	 */
+	if (result == CLUSTER_THREADREC_DONE)
+		cluster_thread_recovery_count_done(stats->recovered_through);
+	else
+		cluster_thread_recovery_count_blocked();
 
 	/*
 	 * on_unrecoverable policy (Q5): the default keep_frozen returns the BLOCKED

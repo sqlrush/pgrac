@@ -117,6 +117,26 @@ cluster_thread_recovery_decide_scope(bool guc_on, bool has_peers, bool shared_fs
 }
 
 /*
+ * cluster_thread_recovery_scope_is_unsupported -- the D7 capability-gate
+ * predicate (spec-4.11 §3, §D7).  A scope is hard-UNSUPPORTED (the operator
+ * asked for online thread recovery but this configuration cannot provide it ->
+ * FEATURE_NOT_SUPPORTED, mirror spec-4.5a's 53RA3) when there is no genuinely
+ * shared data backend (NO_SHARED_BACKEND) or the cluster has more than one
+ * survivor (MULTI_SURVIVOR, >2-node, out of the v0.2 2-node scope, Q9).  DISABLED
+ * (GUC off) and SINGLE_NODE (no peers -> PG-native crash recovery) are NOT
+ * unsupported -- they are ordinary not-applicable fall-throughs, no error.  PURE
+ * so the gate boundary is unit-pinned: it must NEVER raise FEATURE_NOT_SUPPORTED
+ * for a merely not-applicable scope (that would crash a single-node / GUC-off
+ * reconfig path -- the t/249-252 no-regression guarantee).
+ */
+static inline bool
+cluster_thread_recovery_scope_is_unsupported(ClusterThreadRecScope scope)
+{
+	return scope == CLUSTER_THREADREC_SCOPE_NO_SHARED_BACKEND
+		   || scope == CLUSTER_THREADREC_SCOPE_MULTI_SURVIVOR;
+}
+
+/*
  * What the orchestrator does on a FINAL BLOCKED (spec-4.11 §3, Q5 policy).
  * Maps the cluster.thread_recovery_on_unrecoverable GUC (a
  * ClusterThreadRecAction) to the action: keep_frozen returns the BLOCKED to the
@@ -213,6 +233,41 @@ typedef struct ClusterThreadReplayStats {
 /* GUC storage (defined in cluster_guc.c). */
 extern bool cluster_online_thread_recovery;
 extern int cluster_thread_recovery_on_unrecoverable;
+
+/*
+ * D7 capability gate (spec-4.11 §D7).  cluster_thread_recovery_capability_gate
+ * raises FEATURE_NOT_SUPPORTED (errcode 0A000, mirror spec-4.5a's 53RA3 backend
+ * gate) for a hard-unsupported scope (NO_SHARED_BACKEND / MULTI_SURVIVOR, per
+ * scope_is_unsupported) and is a no-op for APPLICABLE / DISABLED / SINGLE_NODE.
+ * It does NOT run in the live reconfig FSM (which stays a no-op fall-back to cold
+ * restart for any non-applicable scope -- no crash, no regression); it is the
+ * explicit capability surface a probe / test consults.  cluster_thread_recovery_
+ * current_scope resolves the live-runtime scope (the GUC + has_peers + shared
+ * backend + survivor count) for that probe.
+ */
+extern ClusterThreadRecScope cluster_thread_recovery_current_scope(void);
+extern void cluster_thread_recovery_capability_gate(ClusterThreadRecScope scope);
+
+/*
+ * D5 observability counters (spec-4.11 §D5).  Cumulative online thread-recovery
+ * outcomes, kept in the "pgrac recovery plan" shmem region (region-level atomics,
+ * not new region -- Q3) and surfaced by the recovery dump category.  _count_done
+ * records a successful DONE (bumps threads_recovered + advances the
+ * recovered_through high-watermark); _count_blocked records a fail-closed BLOCKED
+ * (53RA4).  Both are bumped from replay_one_window's terminal point, so the
+ * counters scope to a DRIVE-REACHED outcome: an early input-validation / window-
+ * derivation reject in replay_one(_window) returns BLOCKED without a drive and is
+ * NOT counted here (it never published authority either -- still 8.A-safe).  The
+ * getters are L110-safe: with no shmem attached they return 0 /
+ * InvalidXLogRecPtr.  _state_name returns an aggregate over the per-thread slots
+ * ("replaying" / "blocked" / "done" / "idle", or "-" when no shmem is attached).
+ */
+extern void cluster_thread_recovery_count_done(XLogRecPtr recovered_through);
+extern void cluster_thread_recovery_count_blocked(void);
+extern uint64 cluster_thread_recovery_get_threads_recovered(void);
+extern uint64 cluster_thread_recovery_get_replay_failclosed(void);
+extern XLogRecPtr cluster_thread_recovery_get_recovered_through(void);
+extern const char *cluster_thread_recovery_state_name(void);
 
 /*
  * Visibility context for the combined replay pass (spec-4.11 3b-2).  3a replayed

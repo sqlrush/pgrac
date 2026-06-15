@@ -72,7 +72,7 @@
 #           DROP TABLE commit (nrels > 0) -> merged recovery FATALs
 #           53RA3 rather than silently skipping the peer's drop;
 #           merged_recovery=off recovers A's own stream
-#      L14  dump surface: recovery category = 35 keys; remote outcome
+#      L14  dump surface: recovery category = 39 keys; remote outcome
 #           counters live
 #
 #    NB: this is a Perl TAP file -- never run clang-format on it.
@@ -557,7 +557,7 @@ ok(dumpkey($na, 'remote_authority_53ra') > 0,
 # L14: dump surface totals.
 is($na->safe_psql('postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category = 'recovery'}),
-	'35', 'L14 recovery category exposes 35 keys');
+	'39', 'L14 recovery category exposes 39 keys (spec-4.11 D5 +4 thread-recovery)');
 ok(dumpkey($na, 'remote_uba_resolved') > 0,
 	'L14 remote_uba_resolved > 0 (CR legs consumed materialized undo)');
 

@@ -196,7 +196,7 @@ UT_TEST(test_last_event_per_category_in_class)
 
 /* ----------
  * Per-category event counts match the design doc roster
- *  (GES 5, PCM 8, BufferShip 5, SCN 4, Reconfig 5, Recovery 5,
+ *  (GES 5, PCM 8, BufferShip 5, SCN 4, Reconfig 5, Recovery 6,
  *   Sinval 3, Interconnect 5, Undo 5, ADG 4, SharedFs 5 -- plus later
  *   subsystem classes, total tracked by CLUSTER_WAIT_EVENTS_COUNT).
  *
@@ -217,9 +217,11 @@ UT_TEST(test_per_category_event_counts)
 		(uint32)WAIT_EVENT_SCN_ADVANCE_BROADCAST - (uint32)WAIT_EVENT_SCN_BOC_FLUSH_WAIT + 1, 4);
 	UT_ASSERT_EQ(
 		(uint32)WAIT_EVENT_RECONFIG_BARRIER_WAIT - (uint32)WAIT_EVENT_RECONFIG_GRD_REBUILD + 1, 5);
-	UT_ASSERT_EQ((uint32)WAIT_EVENT_RECOVERY_PCM_STATE_RESTORE
+	/* Recovery category: 5 (#86) + ClusterThreadRecovery (spec-4.11 D5) = 6.
+	 * Count the full range to the LAST event so future additions are caught (F12). */
+	UT_ASSERT_EQ((uint32)WAIT_EVENT_CLUSTER_THREAD_RECOVERY
 					 - (uint32)WAIT_EVENT_RECOVERY_WAL_FETCH + 1,
-				 5);
+				 6);
 	UT_ASSERT_EQ((uint32)WAIT_EVENT_SINVAL_INJECT_LOCAL_QUEUE
 					 - (uint32)WAIT_EVENT_SINVAL_BROADCAST_SEND + 1,
 				 3);

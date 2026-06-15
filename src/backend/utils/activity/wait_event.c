@@ -1144,6 +1144,9 @@ pgstat_get_wait_cluster_recovery(WaitEventCluster w)
 	case WAIT_EVENT_RECOVERY_PCM_STATE_RESTORE:
 		event_name = "RecoveryPcmStateRestore";
 		break;
+	case WAIT_EVENT_CLUSTER_THREAD_RECOVERY:
+		event_name = "ClusterThreadRecovery";
+		break;
 	default:
 		break;
 	}

@@ -1073,6 +1073,27 @@ cluster_block_recovery_get_failclosed(void)
 {
 	return 0;
 }
+/* spec-4.11 D5 stubs: online thread-recovery counter accessors (dump_recovery rows). */
+const char *
+cluster_thread_recovery_state_name(void)
+{
+	return "stub";
+}
+uint64
+cluster_thread_recovery_get_threads_recovered(void)
+{
+	return 0;
+}
+uint64
+cluster_thread_recovery_get_replay_failclosed(void)
+{
+	return 0;
+}
+XLogRecPtr
+cluster_thread_recovery_get_recovered_through(void)
+{
+	return 0;
+}
 /* spec-3.16 D5 recovery counter accessor stubs (dump_recovery rows). */
 uint64
 cluster_vis_get_recovery_undo_redo_applies(void)

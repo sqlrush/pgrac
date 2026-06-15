@@ -252,8 +252,8 @@ like($stderr,
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	   '99',
-	   'L17 pg_stat_cluster_wait_events returns 99 rows (spec-4.6 +1 GRD shard remaster)');
+	   '100',
+	   'L17 pg_stat_cluster_wait_events returns 100 rows (spec-4.6 +1 GRD shard remaster)');
 
 
 # ----------

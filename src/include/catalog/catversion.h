@@ -636,7 +636,11 @@
  * observer) and cluster_reconfig_inject_dead_node_test (oid 8946, synthetic
  * reconfig inject) -- for the inject -> FSM -> launch -> fail-closed-frozen e2e.
  * Two pg_proc rows -> bump. */
-#define CATALOG_VERSION_NO 202606151
+/* spec-4.11 D1 increment 3b-4c (2026-06-15): D7 capability gate adds one
+ * TEST-ONLY entry -- cluster_thread_capability_gate_test (oid 8947) -- driving
+ * the FEATURE_NOT_SUPPORTED gate (no-shared-backend / >2-node) deterministically.
+ * One pg_proc row -> bump. */
+#define CATALOG_VERSION_NO 202606152
 
 /* spec-2.39 D10 (2026-05-21):  SI Broadcaster production activation —
  * DDL commit hook (AtEOXact_Inval + COMMIT PREPARED via cluster-aware
