@@ -287,6 +287,101 @@ cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch)
 													 NULL);
 }
 
+/*
+ * cluster_thread_recovery_local_complete -- the D3 unfreeze precondition
+ * (spec-4.11 3b-3): is dead_tid's WAL data online-recovered on THIS node?
+ *
+ *	Reads the NODE-LOCAL merged materialization authority (Q4 3-way authority,
+ *	R11): cluster_merged_instance_is_materialized() is the reader gate the
+ *	orchestrator publishes to on DONE (cluster_merged_authority_publish_online),
+ *	NOT the cluster-wide registry (which is a skip-bound, not a serve gate, and
+ *	mixing them would let a peer's self-recovery cut this node's authority).
+ *
+ *	required_lsn == InvalidXLogRecPtr asks only "materialized at all" (the
+ *	node-level question the reconfig FSM uses); a real required_lsn additionally
+ *	demands recovered_through >= it (the precise per-block check the
+ *	gcs_block phase gate makes with the block's PI watermark).
+ *
+ *	fail-closed (8.A): a thread id that names no origin, an unmaterialized
+ *	origin, or recovered_through short of required_lsn all return false -- the
+ *	resource stays frozen, never served as current.
+ */
+bool
+cluster_thread_recovery_local_complete(uint16 dead_tid, XLogRecPtr required_lsn)
+{
+	int origin = cluster_thread_recovery_origin_for_tid(dead_tid);
+
+	if (origin < 0)
+		return false; /* not a real thread id -> fail-closed (keep frozen) */
+
+	if (!cluster_merged_instance_is_materialized(origin))
+		return false; /* dead origin's merged WAL not materialized here */
+
+	if (XLogRecPtrIsInvalid(required_lsn))
+		return true; /* node-level: materialization suffices */
+
+	return cluster_merged_instance_recovered_through(origin) >= (uint64)required_lsn;
+}
+
+/*
+ * cluster_thread_recovery_gate_unfreeze -- the reconfig-FSM unfreeze gate
+ * (spec-4.11 D3, 3b-3).  See the header for the full contract.
+ *
+ *	Returns true == "STAY FROZEN": online thread recovery is in scope AND a dead
+ *	origin is not yet materialized here.  Returns false == "may unfreeze": out
+ *	of scope (so the existing spec-4.6/4.7 path is unchanged) or every dead
+ *	origin is complete.
+ *
+ *	Scope reuses the pure cluster_thread_recovery_decide_scope() so the gate
+ *	engages on EXACTLY the same conditions under which a replay would run: the
+ *	GUC is on (dev=off by default), a shared data backend exists, and the
+ *	cluster is 2-node (a single survivor = single replay owner).  Out of scope
+ *	-> false: never freeze waiting on a recovery that will not run.
+ */
+bool
+cluster_thread_recovery_gate_unfreeze(const uint64 *dead_bitmap, int nwords)
+{
+	ClusterThreadRecScope scope;
+	uint64 materialized[(CLUSTER_MAX_NODES + 63) / 64];
+	const int mwords = (CLUSTER_MAX_NODES + 63) / 64;
+	bool shared_fs;
+	int survivors;
+	int effective;
+	int i;
+
+	shared_fs = (cluster_shared_storage_backend == CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS);
+	survivors = cluster_conf_node_count() - 1;
+	scope = cluster_thread_recovery_decide_scope(cluster_online_thread_recovery,
+												 cluster_conf_has_peers(), shared_fs, survivors);
+
+	if (scope != CLUSTER_THREADREC_SCOPE_APPLICABLE)
+		return false; /* recovery not active -> do not gate (no regression) */
+
+	if (dead_bitmap == NULL || nwords <= 0)
+		return false; /* nothing to gate */
+
+	/*
+	 * Build the per-node materialized bitmap for THIS episode's dead origins:
+	 * node i (origin) <- dead_tid i + 1.  A bad id maps to no origin ->
+	 * local_complete returns false -> the bit stays clear -> gate_decide keeps
+	 * it frozen (fail-closed, 8.A).  The node-level question (InvalidXLogRecPtr)
+	 * asks only "materialized at all"; the per-block gcs_block phase gate carries
+	 * the precise recovered_through >= page_lsn check for individual blocks.
+	 */
+	memset(materialized, 0, sizeof(materialized));
+	for (i = 0; i < CLUSTER_MAX_NODES && (i / 64) < nwords; i++) {
+		if (((dead_bitmap[i / 64] >> (i % 64)) & UINT64CONST(1)) == 0)
+			continue;
+		if (cluster_thread_recovery_local_complete((uint16)(i + 1), InvalidXLogRecPtr))
+			materialized[i / 64] |= (UINT64CONST(1) << (i % 64));
+	}
+
+	/* Decide over the words covered by BOTH bitmaps (dead nodes live in
+	 * [0, CLUSTER_MAX_NODES), so any dead_bitmap words past mwords are 0). */
+	effective = (nwords < mwords) ? nwords : mwords;
+	return cluster_thread_recovery_gate_decide(scope, dead_bitmap, materialized, effective);
+}
+
 #else /* !USE_PGRAC_CLUSTER */
 
 /* Disable-cluster build: this file compiles to nothing. */

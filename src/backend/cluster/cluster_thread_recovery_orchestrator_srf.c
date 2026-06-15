@@ -51,6 +51,8 @@
 
 PG_FUNCTION_INFO_V1(cluster_thread_replay_one_test);
 PG_FUNCTION_INFO_V1(cluster_thread_replay_one_auto_test);
+PG_FUNCTION_INFO_V1(cluster_thread_local_complete_test);
+PG_FUNCTION_INFO_V1(cluster_thread_gate_unfreeze_test);
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -59,6 +61,7 @@ PG_FUNCTION_INFO_V1(cluster_thread_replay_one_auto_test);
 #include "utils/builtins.h"
 #include "utils/pg_lsn.h"
 
+#include "cluster/cluster_conf.h" /* CLUSTER_MAX_NODES (dead bitmap width) */
 #include "cluster/cluster_thread_recovery.h"
 
 static const char *
@@ -143,6 +146,69 @@ cluster_thread_replay_one_auto_test(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(threadrec_summary(res, &stats));
 }
 
+/*
+ * cluster_thread_local_complete_test -- exercise the D3 unfreeze precondition
+ * (spec-4.11 3b-3): does the node-local merged authority say dead_tid is
+ * online-recovered up to required_lsn?  The TAP publishes authority via
+ * cluster_thread_replay_one_test (on DONE) and then asserts this flips to true.
+ */
+Datum
+cluster_thread_local_complete_test(PG_FUNCTION_ARGS)
+{
+	int32 dead_tid;
+	XLogRecPtr required_lsn;
+
+	if (!superuser())
+		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						errmsg("cluster_thread_local_complete_test is superuser-only")));
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("dead_tid and required_lsn must not be NULL")));
+
+	dead_tid = PG_GETARG_INT32(0);
+	required_lsn = PG_GETARG_LSN(1);
+
+	/* Out-of-uint16 ids map to no origin -> fail-closed false. */
+	if (dead_tid < 0 || dead_tid > PG_UINT16_MAX)
+		dead_tid = 0;
+
+	PG_RETURN_BOOL(cluster_thread_recovery_local_complete((uint16)dead_tid, required_lsn));
+}
+
+/*
+ * cluster_thread_gate_unfreeze_test -- exercise the reconfig-FSM unfreeze gate
+ * predicate (spec-4.11 3b-3) with a controlled single-dead-node bitmap (node =
+ * dead_tid - 1).  Returns true == "stay frozen".  The TAP drives it across the
+ * GUC off/on and authority absent/present axes to prove the gate engages only
+ * in scope and lifts only once the dead origin is materialized.
+ */
+Datum
+cluster_thread_gate_unfreeze_test(PG_FUNCTION_ARGS)
+{
+	int32 dead_tid;
+	uint64 dead[(CLUSTER_MAX_NODES + 63) / 64];
+	int node;
+
+	if (!superuser())
+		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						errmsg("cluster_thread_gate_unfreeze_test is superuser-only")));
+
+	if (PG_ARGISNULL(0))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("dead_tid must not be NULL")));
+
+	dead_tid = PG_GETARG_INT32(0);
+
+	memset(dead, 0, sizeof(dead));
+	node = (int)dead_tid - 1;
+	if (node >= 0 && node < CLUSTER_MAX_NODES)
+		dead[node / 64] |= (UINT64CONST(1) << (node % 64));
+
+	PG_RETURN_BOOL(
+		cluster_thread_recovery_gate_unfreeze(dead, (int)(sizeof(dead) / sizeof(dead[0]))));
+}
+
 #else /* !USE_PGRAC_CLUSTER */
 
 Datum
@@ -157,6 +223,20 @@ cluster_thread_replay_one_auto_test(PG_FUNCTION_ARGS pg_attribute_unused())
 {
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("cluster_thread_replay_one_auto_test requires --enable-cluster")));
+}
+
+Datum
+cluster_thread_local_complete_test(PG_FUNCTION_ARGS pg_attribute_unused())
+{
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cluster_thread_local_complete_test requires --enable-cluster")));
+}
+
+Datum
+cluster_thread_gate_unfreeze_test(PG_FUNCTION_ARGS pg_attribute_unused())
+{
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cluster_thread_gate_unfreeze_test requires --enable-cluster")));
 }
 
 #endif /* USE_PGRAC_CLUSTER */

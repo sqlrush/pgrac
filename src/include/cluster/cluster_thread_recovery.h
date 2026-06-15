@@ -270,6 +270,57 @@ cluster_thread_recovery_should_rethrow(int elevel)
 }
 
 /*
+ * cluster_thread_recovery_origin_for_tid -- map a dead WAL thread id to its
+ * origin (cluster node id), or -1 (spec-4.11 §2.4).
+ *
+ *	spec-4.1 stamps thread_id = cluster.node_id + 1, so origin = dead_tid - 1.
+ *	An id outside the real range [XLP_THREAD_ID_FIRST_REAL,
+ *	CLUSTER_WAL_THREAD_MAX] (the legacy 0, a reserved/invalid sentinel, or an
+ *	out-of-range value) names no origin and returns -1.  The callers
+ *	(local_complete / gate_unfreeze) treat -1 as fail-closed -- a bad id keeps
+ *	the resource frozen, NEVER aliases to a valid node 0.  PURE so the bound is
+ *	unit-pinned (test_cluster_thread_orchestrator.c).
+ */
+static inline int
+cluster_thread_recovery_origin_for_tid(uint16 dead_tid)
+{
+	if (dead_tid < XLP_THREAD_ID_FIRST_REAL || dead_tid > CLUSTER_WAL_THREAD_MAX)
+		return -1;
+	return (int)dead_tid - 1;
+}
+
+/*
+ * cluster_thread_recovery_gate_decide -- the PURE unfreeze decision (spec-4.11
+ * D3, 3b-3).  Given the resolved scope and two per-node bitmaps over the same
+ * nwords words (LSB = node 0): dead = nodes that died this episode, materialized
+ * = dead origins whose WAL data is recovered HERE.  Returns true == STAY FROZEN:
+ * recovery is in scope AND some dead origin is NOT yet materialized
+ * (dead & ~materialized has a set bit).  Out of scope -> false (no gating, so the
+ * existing spec-4.6/4.7 path is unchanged).  fail-closed: a dead bit with no
+ * matching materialized bit counts as not-complete -> frozen; a NULL/empty input
+ * returns false (nothing to gate).  PURE so the corruption-critical decision is
+ * unit-pinned; the .c wrapper resolves the scope (decide_scope) and builds the
+ * materialized bitmap (local_complete per dead origin) from the live runtime.
+ */
+static inline bool
+cluster_thread_recovery_gate_decide(ClusterThreadRecScope scope, const uint64 *dead,
+									const uint64 *materialized, int nwords)
+{
+	int w;
+
+	if (scope != CLUSTER_THREADREC_SCOPE_APPLICABLE)
+		return false;
+	if (dead == NULL || materialized == NULL || nwords <= 0)
+		return false;
+
+	for (w = 0; w < nwords; w++) {
+		if ((dead[w] & ~materialized[w]) != 0)
+			return true; /* a dead origin not yet materialized -> stay frozen */
+	}
+	return false; /* every dead origin materialized -> ready to unfreeze */
+}
+
+/*
  * Online-replay ONE dead thread's WAL data through to shared storage
  * within the reconfig freeze window (spec-4.11 D2).  Implemented in a
  * later increment (the Q10-B apply matrix); declared here for the
@@ -279,12 +330,29 @@ extern ClusterThreadRecResult cluster_thread_recovery_replay_one(uint16 dead_tid
 																 uint64 episode_epoch);
 
 /*
- * Unfreeze precondition (spec-4.11 D3): has dead_tid been fully
- * online-recovered up to required_lsn from THIS node's local
- * materialization authority?  fail-closed on any doubt.  Implemented in a
- * later increment.
+ * Unfreeze precondition (spec-4.11 D3, 3b-3): has dead_tid been fully
+ * online-recovered up to required_lsn from THIS node's local materialization
+ * authority (cluster_merged_instance_is_materialized / _recovered_through,
+ * Q4 3-way authority -- NOT the cluster-wide registry, R11)?  required_lsn ==
+ * InvalidXLogRecPtr asks the node-level question (materialized at all); a real
+ * required_lsn additionally demands recovered_through >= it.  fail-closed: a
+ * bad thread id or any unmet condition returns false (keep frozen).
  */
 extern bool cluster_thread_recovery_local_complete(uint16 dead_tid, XLogRecPtr required_lsn);
+
+/*
+ * Reconfig-FSM unfreeze gate (spec-4.11 D3, 3b-3).  Given the episode's
+ * dead-node bitmap (GRD recovery_dead_bitmap words, LSB = node 0), returns
+ * true when the survivor must STAY frozen: online thread recovery is in scope
+ * (cluster.online_thread_recovery on + a shared data backend + 2-node) AND at
+ * least one dead origin's WAL data is not yet materialized here.  Returns false
+ * when recovery is out of scope (GUC off by default / no shared backend /
+ * >2-node) -- no gating, so the existing spec-4.6/4.7 unfreeze path is
+ * unchanged (no regression) -- or when every dead origin is complete (ready to
+ * unfreeze).  fail-closed: NULL/empty bitmap returns false (nothing to gate);
+ * a bad dead id maps to no origin and is treated as not-complete (frozen).
+ */
+extern bool cluster_thread_recovery_gate_unfreeze(const uint64 *dead_bitmap, int nwords);
 
 /*
  * RMW replay engine (spec-4.11 D1 increment 3a).  Read each record of a

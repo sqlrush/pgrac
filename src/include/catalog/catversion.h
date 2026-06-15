@@ -615,7 +615,11 @@
  * (oid 8938) -- drive the online thread-recovery orchestrator (combined data +
  * visibility pass + durability barrier + 3-way authority publish).  Two pg_proc
  * rows -> bump. */
-#define CATALOG_VERSION_NO 202606145
+/* spec-4.11 D1 increment 3b-3 (2026-06-15): pg_proc gains two TEST-ONLY entries
+ * cluster_thread_local_complete_test (oid 8939) + cluster_thread_gate_unfreeze_test
+ * (oid 8940) -- exercise the D3 unfreeze gate (node-local merged authority +
+ * reconfig-FSM predicate).  Two pg_proc rows -> bump. */
+#define CATALOG_VERSION_NO 202606146
 
 /* spec-2.39 D10 (2026-05-21):  SI Broadcaster production activation —
  * DDL commit hook (AtEOXact_Inval + COMMIT PREPARED via cluster-aware

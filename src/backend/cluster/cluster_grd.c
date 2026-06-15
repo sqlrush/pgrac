@@ -45,14 +45,15 @@
 #include "cluster/cluster_gcs_block.h"	  /* spec-4.7 D2 — block re-declare scan + send */
 #include "cluster/cluster_signal.h"
 #include "cluster/cluster_shmem.h"
-#include "cluster/cluster_cssd.h"	  /* spec-2.16 D8 newly-dead bitmap diff */
-#include "cluster/cluster_epoch.h"	  /* spec-4.6 D1 — accepted epoch reads */
-#include "cluster/cluster_reconfig.h" /* spec-4.6 D1 — reconfig event consume */
-#include "storage/procsignal.h"		  /* spec-4.6 D3 — redeclare broadcast */
-#include "storage/sinvaladt.h"		  /* spec-4.6 D3 — BackendIdGetProc */
-#include "utils/timestamp.h"		  /* spec-4.6 D1 — barrier deadline */
-#include "storage/proc.h"			  /* spec-2.17 D8 — MyProc->cluster_grd_bast_pending */
-#include "common/hashfn.h"			  /* hash_bytes_extended (spec-2.29 同款) */
+#include "cluster/cluster_cssd.h"			 /* spec-2.16 D8 newly-dead bitmap diff */
+#include "cluster/cluster_epoch.h"			 /* spec-4.6 D1 — accepted epoch reads */
+#include "cluster/cluster_reconfig.h"		 /* spec-4.6 D1 — reconfig event consume */
+#include "cluster/cluster_thread_recovery.h" /* spec-4.11 D3 — unfreeze gate */
+#include "storage/procsignal.h"				 /* spec-4.6 D3 — redeclare broadcast */
+#include "storage/sinvaladt.h"				 /* spec-4.6 D3 — BackendIdGetProc */
+#include "utils/timestamp.h"				 /* spec-4.6 D1 — barrier deadline */
+#include "storage/proc.h"					 /* spec-2.17 D8 — MyProc->cluster_grd_bast_pending */
+#include "common/hashfn.h"					 /* hash_bytes_extended (spec-2.29 同款) */
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/lock.h"
@@ -1523,6 +1524,32 @@ cluster_grd_recovery_lmon_tick(void)
 		if (all_done) {
 			uint32 swept;
 			uint32 unfrozen = 0;
+
+			/*
+			 * spec-4.11 D3 (3b-3) — the re-declare barrier restored the GES/GCS
+			 * block PROTOCOL state, but a dead origin's WAL DATA must be online-
+			 * replayed to shared storage before any survivor serves it; otherwise
+			 * P7 would unfreeze the shards (resuming GES grants) while the dead
+			 * thread's committed changes are still missing -> a survivor could act
+			 * on a stale resource (8.A).  Stay in WAIT_CLUSTER until every dead
+			 * origin's thread recovery is materialized on THIS node.  No timeout:
+			 * fail-closed (the per-block cluster_gcs_block_phase_for_tag gate
+			 * keeps the same posture for individual blocks; this gate additionally
+			 * holds the GES shards frozen).  Out of scope — online_thread_recovery
+			 * off (the default) / no shared backend / >2-node — the gate is a
+			 * no-op, so the spec-4.7 unfreeze path is unchanged (no regression).
+			 * REDECLARE_DONE was re-announced just above, so peers stay converged
+			 * while we wait for the replay (the live executor lands in 3b-4).
+			 */
+			if (cluster_thread_recovery_gate_unfreeze(dead, (CLUSTER_MAX_NODES + 63) / 64)) {
+				ereport(DEBUG1,
+						(errmsg_internal(
+							"cluster_grd_recovery: re-declare barrier passed but a dead origin's "
+							"thread recovery is not yet materialized; staying frozen "
+							"(epoch " UINT64_FORMAT ")",
+							episode_epoch)));
+				return;
+			}
 
 			/* P6 post-barrier global sweep (P0#3 + P0-1:  legal HERE and
 			 * coherent against the LOCKED episode epoch — holders rebound

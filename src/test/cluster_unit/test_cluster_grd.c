@@ -51,7 +51,8 @@
 #include "cluster/cluster_gcs.h"	   /* spec-4.7 D2 (L238) — cluster_gcs_lookup_master proto */
 #include "cluster/cluster_gcs_block.h" /* spec-4.7 D2 (L238) — block re-declare scan/send protos */
 #include "cluster/cluster_grd.h"
-#include "cluster/cluster_reconfig.h" /* spec-4.6 D1 — ReconfigEvent stub type */
+#include "cluster/cluster_reconfig.h"		 /* spec-4.6 D1 — ReconfigEvent stub type */
+#include "cluster/cluster_thread_recovery.h" /* spec-4.11 D3 (L238) — gate_unfreeze proto */
 #include "port/atomics.h"
 #include "storage/lock.h"
 #include "storage/s_lock.h"
@@ -300,6 +301,17 @@ void
 cluster_reconfig_get_last_event(ReconfigEvent *out)
 {
 	memset(out, 0, sizeof(*out));
+}
+
+/* spec-4.11 D3 stub:  cluster_grd.c's WAIT_CLUSTER->IDLE transition consults the
+ * thread-recovery unfreeze gate before P7.  These tests drive the GES/GRD
+ * remaster FSM, not online thread recovery, so the gate is out of scope -> no-op
+ * false (P7 unfreeze proceeds exactly as before the gate was added). */
+bool
+cluster_thread_recovery_gate_unfreeze(const uint64 *dead_bitmap pg_attribute_unused(),
+									  int nwords pg_attribute_unused())
+{
+	return false;
 }
 
 struct PGPROC *

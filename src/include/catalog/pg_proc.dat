@@ -12573,6 +12573,28 @@
   proargnames => '{dead_tid}',
   prosrc => 'cluster_thread_replay_one_auto_test' },
 
+# spec-4.11 D1 increment 3b-3: the D3 unfreeze gate.  local_complete reads the
+# node-local merged materialization authority; gate_unfreeze is the reconfig-FSM
+# predicate over a controlled single-dead-node bitmap.  Both superuser-only.
+{ oid => '8939',
+  descr => 'TEST-ONLY: online thread-recovery D3 local-complete authority gate (spec-4.11)',
+  proname => 'cluster_thread_local_complete_test',
+  proisstrict => 'f',
+  provolatile => 'v', proparallel => 'u',
+  prorettype => 'bool',
+  proargtypes => 'int4 pg_lsn',
+  proargnames => '{dead_tid,required_lsn}',
+  prosrc => 'cluster_thread_local_complete_test' },
+{ oid => '8940',
+  descr => 'TEST-ONLY: online thread-recovery D3 reconfig unfreeze gate (spec-4.11)',
+  proname => 'cluster_thread_gate_unfreeze_test',
+  proisstrict => 'f',
+  provolatile => 'v', proparallel => 'u',
+  prorettype => 'bool',
+  proargtypes => 'int4',
+  proargnames => '{dead_tid}',
+  prosrc => 'cluster_thread_gate_unfreeze_test' },
+
 # spec-4.10 D2: reconstruct one block via the online single-block recovery
 # orchestrator over an explicit WAL window, for the byte-for-byte differential
 # vs PG real crash-recovery redo.  Returns the reconstructed page as bytea, or

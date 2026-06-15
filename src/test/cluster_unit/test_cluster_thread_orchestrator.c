@@ -72,15 +72,109 @@ UT_TEST(test_on_blocked_default_enum_is_keep_frozen)
 	UT_ASSERT((int)CLUSTER_THREADREC_ONBLOCKED_PANIC != 0);
 }
 
+UT_TEST(test_origin_for_tid_real_ids)
+{
+	/* spec-4.1: thread_id = node_id + 1, so origin = dead_tid - 1 across the
+	 * whole real range [1, CLUSTER_WAL_THREAD_MAX]. */
+	UT_ASSERT_EQ(cluster_thread_recovery_origin_for_tid(1), 0);
+	UT_ASSERT_EQ(cluster_thread_recovery_origin_for_tid(2), 1);
+	UT_ASSERT_EQ(cluster_thread_recovery_origin_for_tid(CLUSTER_WAL_THREAD_MAX),
+				 (int)CLUSTER_WAL_THREAD_MAX - 1);
+}
+
+UT_TEST(test_origin_for_tid_legacy_zero_is_invalid)
+{
+	/* dead_tid 0 is the LEGACY (pre-activation) id, not a real thread; it must
+	 * NOT alias to a valid origin (would be node 0 = false-complete = 8.A). */
+	UT_ASSERT_EQ(cluster_thread_recovery_origin_for_tid(0), -1);
+}
+
+UT_TEST(test_origin_for_tid_out_of_range_is_invalid)
+{
+	/* Above the highest real thread id is fail-closed (-1), never a valid
+	 * node; 0xFFFF is the permanently-invalid sentinel. */
+	UT_ASSERT_EQ(cluster_thread_recovery_origin_for_tid(CLUSTER_WAL_THREAD_MAX + 1), -1);
+	UT_ASSERT_EQ(cluster_thread_recovery_origin_for_tid(0xFFFF), -1);
+}
+
+UT_TEST(test_gate_decide_out_of_scope_never_gates)
+{
+	/* Out of scope (GUC off / single node / no shared backend / >2-node) the
+	 * gate is a NO-OP regardless of the bitmaps -> false (no regression to the
+	 * existing spec-4.6/4.7 unfreeze path). */
+	uint64 dead[1] = { 0x2 };		  /* node 1 dead */
+	uint64 materialized[1] = { 0x0 }; /* nothing materialized */
+
+	UT_ASSERT(!cluster_thread_recovery_gate_decide(CLUSTER_THREADREC_SCOPE_DISABLED, dead,
+												   materialized, 1));
+	UT_ASSERT(!cluster_thread_recovery_gate_decide(CLUSTER_THREADREC_SCOPE_SINGLE_NODE, dead,
+												   materialized, 1));
+	UT_ASSERT(!cluster_thread_recovery_gate_decide(CLUSTER_THREADREC_SCOPE_NO_SHARED_BACKEND, dead,
+												   materialized, 1));
+	UT_ASSERT(!cluster_thread_recovery_gate_decide(CLUSTER_THREADREC_SCOPE_MULTI_SURVIVOR, dead,
+												   materialized, 1));
+}
+
+UT_TEST(test_gate_decide_in_scope_incomplete_stays_frozen)
+{
+	/* In scope + a dead origin not yet materialized -> STAY FROZEN (true). */
+	uint64 dead[1] = { 0x2 };		  /* node 1 dead */
+	uint64 materialized[1] = { 0x0 }; /* node 1 NOT materialized */
+
+	UT_ASSERT(cluster_thread_recovery_gate_decide(CLUSTER_THREADREC_SCOPE_APPLICABLE, dead,
+												  materialized, 1));
+}
+
+UT_TEST(test_gate_decide_in_scope_all_complete_unfreezes)
+{
+	/* In scope + every dead origin materialized -> may unfreeze (false). */
+	uint64 dead[1] = { 0x2 };		  /* node 1 dead */
+	uint64 materialized[1] = { 0x2 }; /* node 1 materialized */
+
+	UT_ASSERT(!cluster_thread_recovery_gate_decide(CLUSTER_THREADREC_SCOPE_APPLICABLE, dead,
+												   materialized, 1));
+}
+
+UT_TEST(test_gate_decide_partial_complete_stays_frozen)
+{
+	/* Two dead origins, only one materialized -> the OTHER keeps us frozen. */
+	uint64 dead[1] = { 0x3 };		  /* nodes 0 and 1 dead */
+	uint64 materialized[1] = { 0x1 }; /* only node 0 materialized */
+
+	UT_ASSERT(cluster_thread_recovery_gate_decide(CLUSTER_THREADREC_SCOPE_APPLICABLE, dead,
+												  materialized, 1));
+}
+
+UT_TEST(test_gate_decide_null_or_empty_is_false)
+{
+	/* fail-closed inputs: a NULL bitmap or zero words gate nothing (false). */
+	uint64 some[1] = { 0x2 };
+
+	UT_ASSERT(
+		!cluster_thread_recovery_gate_decide(CLUSTER_THREADREC_SCOPE_APPLICABLE, NULL, some, 1));
+	UT_ASSERT(
+		!cluster_thread_recovery_gate_decide(CLUSTER_THREADREC_SCOPE_APPLICABLE, some, NULL, 1));
+	UT_ASSERT(
+		!cluster_thread_recovery_gate_decide(CLUSTER_THREADREC_SCOPE_APPLICABLE, some, some, 0));
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(4);
+	UT_PLAN(12);
 	UT_RUN(test_on_blocked_keep_frozen_default);
 	UT_RUN(test_on_blocked_panic_when_policy_panic);
 	UT_RUN(test_on_blocked_unknown_policy_is_keep_frozen);
 	UT_RUN(test_on_blocked_default_enum_is_keep_frozen);
+	UT_RUN(test_origin_for_tid_real_ids);
+	UT_RUN(test_origin_for_tid_legacy_zero_is_invalid);
+	UT_RUN(test_origin_for_tid_out_of_range_is_invalid);
+	UT_RUN(test_gate_decide_out_of_scope_never_gates);
+	UT_RUN(test_gate_decide_in_scope_incomplete_stays_frozen);
+	UT_RUN(test_gate_decide_in_scope_all_complete_unfreezes);
+	UT_RUN(test_gate_decide_partial_complete_stays_frozen);
+	UT_RUN(test_gate_decide_null_or_empty_is_false);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
