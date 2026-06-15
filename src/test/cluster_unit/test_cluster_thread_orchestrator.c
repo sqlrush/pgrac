@@ -38,6 +38,18 @@
 
 UT_DEFINE_GLOBALS();
 
+/*
+ * libpgport's snprintf.c references ExceptionalCondition in a cassert build; this
+ * pure-inline test links libpgport for the unit harness but no backend object, so
+ * provide a local stub (mirrors test_cluster_thread_apply.c).  It must never fire.
+ */
+void
+ExceptionalCondition(const char *conditionName, const char *fileName, int lineNumber)
+{
+	printf("# unexpected Assert: %s at %s:%d\n", conditionName, fileName, lineNumber);
+	abort();
+}
+
 
 UT_TEST(test_on_blocked_keep_frozen_default)
 {
