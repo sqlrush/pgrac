@@ -619,7 +619,10 @@
  * cluster_thread_local_complete_test (oid 8939) + cluster_thread_gate_unfreeze_test
  * (oid 8940) -- exercise the D3 unfreeze gate (node-local merged authority +
  * reconfig-FSM predicate).  Two pg_proc rows -> bump. */
-#define CATALOG_VERSION_NO 202606146
+/* spec-4.11 D1 increment 3b-4a (2026-06-15): pg_proc gains one TEST-ONLY entry
+ * cluster_thread_validated_end_test (oid 8941) -- drives the D4 validated
+ * torn-tail boundary pass.  One pg_proc row -> bump. */
+#define CATALOG_VERSION_NO 202606147
 
 /* spec-2.39 D10 (2026-05-21):  SI Broadcaster production activation —
  * DDL commit hook (AtEOXact_Inval + COMMIT PREPARED via cluster-aware

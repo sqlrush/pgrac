@@ -245,6 +245,9 @@ cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch)
 {
 	ClusterThreadRecScope scope;
 	ClusterWalStateSlot slot;
+	XLogRecPtr lower;
+	XLogRecPtr validated_min;
+	XLogRecPtr scan_upper;
 	bool shared_fs;
 	int survivors;
 
@@ -270,11 +273,11 @@ cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch)
 		return CLUSTER_THREADREC_NOT_APPLICABLE;
 
 	/*
-	 * Basic window (spec-4.11 3b-2): lower = the dead thread's last checkpoint
-	 * redo (a sound, redo-idempotent replay start); upper = its observational
-	 * highest_lsn.  D4 (3b-4) replaces upper with the validated complete-record
-	 * boundary + torn-tail gate.  A slot read failure or an unusable window
-	 * (missing checkpoint history / nothing written / inverted) fails closed.
+	 * Window derivation: lower = the dead thread's last checkpoint redo (a sound,
+	 * redo-idempotent replay start); the registry's observational highest_lsn is
+	 * the durable-write watermark (validated_min), NOT the replay upper.  A slot
+	 * read failure or an unusable slot (missing checkpoint history / nothing
+	 * written / inverted) fails closed.
 	 */
 	if (cluster_wal_state_read_slot(dead_tid, &slot) != CLUSTER_WAL_SLOT_OK)
 		return CLUSTER_THREADREC_BLOCKED;
@@ -282,8 +285,22 @@ cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch)
 		|| slot.highest_lsn <= slot.checkpoint_redo_lsn)
 		return CLUSTER_THREADREC_BLOCKED;
 
-	return cluster_thread_recovery_replay_one_window(dead_tid, (XLogRecPtr)slot.checkpoint_redo_lsn,
-													 (XLogRecPtr)slot.highest_lsn, episode_epoch,
+	lower = (XLogRecPtr)slot.checkpoint_redo_lsn;
+	validated_min = (XLogRecPtr)slot.highest_lsn;
+
+	/*
+	 * D4 (spec-4.11 3b-4a): the replay upper is the VALIDATED torn-tail boundary
+	 * (last complete record decoded from lower), NOT the observational highest_lsn
+	 * (which can sit mid-record, or behind committed records written after the
+	 * watermark refresh).  validated_end fail-closes a decode that stops below
+	 * validated_min (mid-stream corruption, never a silent truncation of the dead
+	 * thread's committed WAL; 8.A).  BLOCKED here keeps the thread frozen.
+	 */
+	if (cluster_thread_recovery_validated_end(dead_tid, lower, validated_min, &scan_upper)
+		!= CLUSTER_THREADREC_DONE)
+		return CLUSTER_THREADREC_BLOCKED;
+
+	return cluster_thread_recovery_replay_one_window(dead_tid, lower, scan_upper, episode_epoch,
 													 NULL);
 }
 

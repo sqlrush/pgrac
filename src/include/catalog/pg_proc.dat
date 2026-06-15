@@ -12595,6 +12595,18 @@
   proargnames => '{dead_tid}',
   prosrc => 'cluster_thread_gate_unfreeze_test' },
 
+# spec-4.11 D1 increment 3b-4a: the D4 validated torn-tail boundary pass over a
+# dead thread's per-thread WAL.  Superuser-only.
+{ oid => '8941',
+  descr => 'TEST-ONLY: online thread-recovery D4 validated torn-tail boundary (spec-4.11)',
+  proname => 'cluster_thread_validated_end_test',
+  proisstrict => 'f',
+  provolatile => 'v', proparallel => 'u',
+  prorettype => 'text',
+  proargtypes => 'int4 pg_lsn pg_lsn',
+  proargnames => '{dead_tid,scan_lower,validated_min}',
+  prosrc => 'cluster_thread_validated_end_test' },
+
 # spec-4.10 D2: reconstruct one block via the online single-block recovery
 # orchestrator over an explicit WAL window, for the byte-for-byte differential
 # vs PG real crash-recovery redo.  Returns the reconstructed page as bytea, or

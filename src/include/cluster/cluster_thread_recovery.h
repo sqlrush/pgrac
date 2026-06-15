@@ -449,6 +449,21 @@ extern ClusterThreadRecResult cluster_thread_recovery_drive(uint16 dead_tid, XLo
 															ClusterThreadReplayStats *stats);
 
 /*
+ * VALIDATED-END boundary pass (spec-4.11 D4, 3b-4a).  Decode-only over the dead
+ * thread's per-thread WAL from scan_lower; on DONE *out_valid_end is the EndRecPtr
+ * of the last COMPLETE record -- the validated torn-tail boundary the replay must
+ * reach.  validated_min (the registry's durable highest_lsn, a safe lower bound)
+ * fail-closes a decode that stops below it (mid-stream corruption, not a torn
+ * tail; 8.A).  R13: a catchable ERROR -> BLOCKED, a FATAL/PANIC is re-thrown.
+ * This replaces replay_one's basic (observational highest_lsn) upper bound with a
+ * validated one; replay_one_window (the explicit-window TEST path) is unchanged.
+ */
+extern ClusterThreadRecResult cluster_thread_recovery_validated_end(uint16 dead_tid,
+																	XLogRecPtr scan_lower,
+																	XLogRecPtr validated_min,
+																	XLogRecPtr *out_valid_end);
+
+/*
  * ORCHESTRATOR core (spec-4.11 3b-2), window-EXPLICIT.  Online-recover ONE dead
  * thread over [scan_lower, scan_upper]: drive the combined data+visibility pass
  * under the R13 harness inside an episode-fenced online-writer scope; on DONE,

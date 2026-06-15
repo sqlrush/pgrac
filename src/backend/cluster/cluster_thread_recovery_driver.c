@@ -174,6 +174,72 @@ thread_wal_page_read(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLe
 }
 
 /*
+ * thread_wal_reader_make -- allocate a reader over the dead thread's per-thread
+ * WAL dir (<cluster.wal_threads_dir>/thread_<tid>), positioned by the caller.
+ *
+ *	Shared by drive_data_inner (3b-1) and validated_end_inner (D4, 3b-4a) so the
+ *	per-thread reader setup lives in one place.  Returns the reader (with *priv_out
+ *	set) or NULL on any fail-closed condition: a dead_tid that names no real slot,
+ *	an unset/oversize/missing per-thread dir, or an allocation failure.  On NULL
+ *	the private state is already freed; on success the CALLER owns both and must
+ *	close priv->seg_fd, XLogReaderFree(reader) and pfree(priv) on every exit.  The
+ *	reader is NOT positioned -- the caller runs XLogFindNextRecord.
+ */
+static XLogReaderState *
+thread_wal_reader_make(uint16 dead_tid, ThreadWalReadPrivate **priv_out)
+{
+	ThreadWalReadPrivate *priv;
+	XLogReaderState *reader;
+	struct stat dirstat;
+	int n;
+
+	*priv_out = NULL;
+
+	/* dead_tid must name a real thread slot. */
+	if (dead_tid < 1 || dead_tid > CLUSTER_WAL_STATE_SLOT_COUNT)
+		return NULL;
+	/* the per-thread WAL source must be configured. */
+	if (cluster_wal_threads_dir == NULL || cluster_wal_threads_dir[0] == '\0')
+		return NULL;
+
+	priv = (ThreadWalReadPrivate *)palloc0(sizeof(ThreadWalReadPrivate));
+	priv->seg_fd = -1;
+	n = snprintf(priv->dir, sizeof(priv->dir), "%s/thread_%u", cluster_wal_threads_dir,
+				 (unsigned)dead_tid);
+	if (n < 0 || n >= (int)sizeof(priv->dir)) {
+		pfree(priv);
+		return NULL; /* path overflow -> fail-closed */
+	}
+	if (stat(priv->dir, &dirstat) != 0 || !S_ISDIR(dirstat.st_mode)) {
+		ereport(DEBUG2,
+				(errmsg_internal("thread recovery: per-thread WAL dir \"%s\" absent -> BLOCKED",
+								 priv->dir)));
+		pfree(priv);
+		return NULL; /* missing source -> fail-closed */
+	}
+
+	reader = XLogReaderAllocate(wal_segment_size, priv->dir,
+								XL_ROUTINE(.page_read = thread_wal_page_read,
+										   .segment_open = thread_wal_segment_open,
+										   .segment_close = thread_wal_segment_close),
+								priv);
+	if (reader == NULL) {
+		pfree(priv);
+		return NULL;
+	}
+
+	/*
+	 * Single-node stand-in (L239): the local insertion timeline is the dead
+	 * thread's timeline on one machine; the genuine cross-node TLI is part of
+	 * the source contract, forward.
+	 */
+	reader->seg.ws_tli = GetWALInsertionTimeLine();
+
+	*priv_out = priv;
+	return reader;
+}
+
+/*
  * drive_data_inner -- build the dead thread's reader and drive the engine.
  *
  *	Returns BLOCKED (fail-closed) for every bad source / window (amend 4); a
@@ -192,12 +258,6 @@ drive_data_inner(uint16 dead_tid, XLogRecPtr scan_lower, XLogRecPtr scan_upper,
 	XLogReaderState *reader;
 	XLogRecPtr first_valid;
 	ClusterThreadRecResult res;
-	struct stat dirstat;
-	int n;
-
-	/* amend 4: dead_tid must name a real thread slot. */
-	if (dead_tid < 1 || dead_tid > CLUSTER_WAL_STATE_SLOT_COUNT)
-		return CLUSTER_THREADREC_BLOCKED;
 
 	/*
 	 * amend 3: basic window legality only -- NOT a claim that scan_upper is a
@@ -207,42 +267,10 @@ drive_data_inner(uint16 dead_tid, XLogRecPtr scan_lower, XLogRecPtr scan_upper,
 		|| scan_lower > scan_upper)
 		return CLUSTER_THREADREC_BLOCKED;
 
-	/* amend 4: the per-thread WAL source must be configured and present. */
-	if (cluster_wal_threads_dir == NULL || cluster_wal_threads_dir[0] == '\0')
+	/* amend 4: bad tid / unset / missing per-thread dir -> fail-closed. */
+	reader = thread_wal_reader_make(dead_tid, &priv);
+	if (reader == NULL)
 		return CLUSTER_THREADREC_BLOCKED;
-
-	priv = (ThreadWalReadPrivate *)palloc0(sizeof(ThreadWalReadPrivate));
-	priv->seg_fd = -1;
-	n = snprintf(priv->dir, sizeof(priv->dir), "%s/thread_%u", cluster_wal_threads_dir,
-				 (unsigned)dead_tid);
-	if (n < 0 || n >= (int)sizeof(priv->dir)) {
-		pfree(priv);
-		return CLUSTER_THREADREC_BLOCKED; /* path overflow -> fail-closed */
-	}
-	if (stat(priv->dir, &dirstat) != 0 || !S_ISDIR(dirstat.st_mode)) {
-		ereport(DEBUG2,
-				(errmsg_internal("thread recovery: per-thread WAL dir \"%s\" absent -> BLOCKED",
-								 priv->dir)));
-		pfree(priv);
-		return CLUSTER_THREADREC_BLOCKED; /* missing source -> fail-closed */
-	}
-
-	reader = XLogReaderAllocate(wal_segment_size, priv->dir,
-								XL_ROUTINE(.page_read = thread_wal_page_read,
-										   .segment_open = thread_wal_segment_open,
-										   .segment_close = thread_wal_segment_close),
-								priv);
-	if (reader == NULL) {
-		pfree(priv);
-		return CLUSTER_THREADREC_BLOCKED;
-	}
-
-	/*
-	 * Single-node stand-in (L239): the local insertion timeline is the dead
-	 * thread's timeline on one machine; the genuine cross-node TLI is part of
-	 * the source contract, forward.
-	 */
-	reader->seg.ws_tli = GetWALInsertionTimeLine();
 
 	/*
 	 * R13 proof site (3b-1): when this injection point is armed with an ERROR,
@@ -357,6 +385,132 @@ cluster_thread_recovery_drive_data(uint16 dead_tid, XLogRecPtr scan_lower, XLogR
 								   ClusterThreadReplayStats *stats)
 {
 	return cluster_thread_recovery_drive(dead_tid, scan_lower, scan_upper, NULL, NULL, stats);
+}
+
+/*
+ * validated_end_inner -- decode-only pass over the dead thread's per-thread WAL
+ * to find the VALIDATED torn-tail boundary (spec-4.11 D4, 3b-4a).
+ *
+ *	Mirrors the cold merged-recovery merge_compute_valid_end (recovery_merge.c)
+ *	over the thread driver's reader (the cold helper is static + bound to the
+ *	merge reader/dir, so the thread path gets its own pass; the cold code is
+ *	untouched, per the spec-4.11 "cold byte-for-byte unchanged" discipline).
+ *
+ *	From scan_lower, decode every record and track the EndRecPtr of the LAST
+ *	COMPLETE one (a torn / short tail just stops the decode -- the dead thread
+ *	may legitimately stop mid-record at the crash point).  The dead thread is
+ *	always a FOREIGN candidate, so both fail-closed checks apply (8.A):
+ *	  (a) no complete record decoded from scan_lower -> corruption at the start;
+ *	  (b) valid_end < validated_min (the registry's durable highest_lsn, a safe
+ *	      lower bound refreshed AFTER the bytes were written) -> the decode
+ *	      stopped BELOW the durable write end = mid-stream corruption, NOT a torn
+ *	      tail.  Treating that as a torn tail would silently drop the dead
+ *	      thread's committed WAL.
+ *	Either yields BLOCKED (result-returning, NOT the cold FATAL -- online R13);
+ *	a clean decode yields DONE with *out_valid_end set to the boundary the
+ *	replay pass must reach.
+ */
+static ClusterThreadRecResult
+validated_end_inner(uint16 dead_tid, XLogRecPtr scan_lower, XLogRecPtr validated_min,
+					XLogRecPtr *out_valid_end)
+{
+	ThreadWalReadPrivate *priv;
+	XLogReaderState *reader;
+	XLogRecPtr first_valid;
+	XLogRecPtr valid_end;
+	char *errm = NULL;
+
+	*out_valid_end = InvalidXLogRecPtr;
+
+	if (XLogRecPtrIsInvalid(scan_lower))
+		return CLUSTER_THREADREC_BLOCKED;
+
+	reader = thread_wal_reader_make(dead_tid, &priv);
+	if (reader == NULL)
+		return CLUSTER_THREADREC_BLOCKED;
+
+	first_valid = XLogFindNextRecord(reader, scan_lower);
+	if (XLogRecPtrIsInvalid(first_valid)) {
+		if (priv->seg_fd >= 0)
+			close(priv->seg_fd);
+		XLogReaderFree(reader);
+		pfree(priv);
+		return CLUSTER_THREADREC_BLOCKED; /* cannot position at lower -> fail-closed */
+	}
+
+	/*
+	 * Decode forward; valid_end tracks the last complete record's end (seeded to
+	 * the start, so "no complete record" leaves valid_end == first_valid).  A
+	 * NULL return (torn / short / decode error) ends the scan -- errm is not a
+	 * hard error here: a legitimate torn tail at the crash point is expected and
+	 * the (a)/(b) checks below catch a tail that is actually corruption.
+	 */
+	valid_end = first_valid;
+	while (XLogReadRecord(reader, &errm) != NULL)
+		valid_end = reader->EndRecPtr;
+
+	if (priv->seg_fd >= 0)
+		close(priv->seg_fd);
+	XLogReaderFree(reader);
+	pfree(priv);
+
+	/* (a) not one complete record / (b) stopped below the durable watermark. */
+	if (valid_end == first_valid
+		|| (!XLogRecPtrIsInvalid(validated_min) && valid_end < validated_min))
+		return CLUSTER_THREADREC_BLOCKED;
+
+	*out_valid_end = valid_end;
+	return CLUSTER_THREADREC_DONE;
+}
+
+/*
+ * cluster_thread_recovery_validated_end -- the public R13-guarded D4 boundary
+ *		pass (spec-4.11 3b-4a).
+ *
+ *	Returns DONE with *out_valid_end = the validated torn-tail boundary the
+ *	replay must reach, or BLOCKED (fail-closed: bad source, unpositionable,
+ *	corruption below the watermark, or a demoted catchable ERROR -- e.g. a real
+ *	I/O error opening a segment).  A FATAL/PANIC is re-thrown, never swallowed
+ *	(amend 1, same contract as cluster_thread_recovery_drive).  *out_valid_end is
+ *	always written (Invalid on BLOCKED).
+ *
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+ClusterThreadRecResult
+cluster_thread_recovery_validated_end(uint16 dead_tid, XLogRecPtr scan_lower,
+									  XLogRecPtr validated_min, XLogRecPtr *out_valid_end)
+{
+	volatile ClusterThreadRecResult res = CLUSTER_THREADREC_BLOCKED;
+	MemoryContext caller_ctx = CurrentMemoryContext;
+
+	*out_valid_end = InvalidXLogRecPtr;
+
+	PG_TRY();
+	{
+		res = validated_end_inner(dead_tid, scan_lower, validated_min, out_valid_end);
+	}
+	PG_CATCH();
+	{
+		ErrorData *edata;
+
+		MemoryContextSwitchTo(caller_ctx);
+		edata = CopyErrorData();
+
+		/* A FATAL/PANIC is never demoted -- re-throw it (amend 1). */
+		if (cluster_thread_recovery_should_rethrow(edata->elevel)) {
+			FreeErrorData(edata);
+			PG_RE_THROW();
+		}
+
+		/* A catchable ERROR -> result-returning BLOCKED; out stays Invalid. */
+		FlushErrorState();
+		FreeErrorData(edata);
+		*out_valid_end = InvalidXLogRecPtr;
+		res = CLUSTER_THREADREC_BLOCKED;
+	}
+	PG_END_TRY();
+
+	return res;
 }
 
 #else /* !USE_PGRAC_CLUSTER */
