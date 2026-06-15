@@ -131,6 +131,120 @@ cluster_fence_marker_unpack(const uint8 *reserved1, ClusterFenceMarker *out)
 	return true;
 }
 
+/*
+ * cluster_fence_marker_node_is_fenced -- is node_id set in a marker's
+ *	fenced_dead_bitmap?  Used to set self_fenced (U4 multi-dead).  Out-of-range
+ *	node ids never read past the bitmap (return false).
+ */
+static inline bool
+cluster_fence_marker_node_is_fenced(const uint8 *fenced_dead_bitmap, int node_id)
+{
+	if (node_id < 0 || node_id >= CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES * 8)
+		return false;
+	return (fenced_dead_bitmap[node_id / 8] & (1u << (node_id % 8))) != 0;
+}
+
+/*
+ * cluster_fence_marker_tuple_equal -- two markers name the SAME fence iff every
+ *	identity field matches (epoch + generation + event_id + issuer + dead bitmap).
+ *	magic / version / pad are layout, not identity.  Used for the quorum-majority
+ *	count (P0a): a disk only "agrees" when it carries the identical tuple.
+ */
+static inline bool
+cluster_fence_marker_tuple_equal(const ClusterFenceMarker *a, const ClusterFenceMarker *b)
+{
+	return a->fence_epoch == b->fence_epoch && a->fence_generation == b->fence_generation
+		   && a->fence_event_id == b->fence_event_id && a->issuer_node_id == b->issuer_node_id
+		   && memcmp(a->fenced_dead_bitmap, b->fenced_dead_bitmap,
+					 CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES)
+				  == 0;
+}
+
+/*
+ * ClusterFenceAuthority -- the result of cluster_fence_authority_decide: did the
+ *	per-disk markers reach a quorum-majority agreement on a single fence tuple?
+ */
+typedef struct ClusterFenceAuthority {
+	bool has_authority;		   /* a single tuple reached >= majority disks */
+	bool minority_seen;		   /* >=1 marker present but none reached majority */
+	int agree_disk_count;	   /* disks carrying the authoritative tuple */
+	ClusterFenceMarker marker; /* the authoritative tuple (valid iff has_authority) */
+} ClusterFenceAuthority;
+
+/*
+ * cluster_fence_authority_decide -- the PURE marker-authority selector (spec-4.12
+ *	D2, P0a + P0b).  disk_markers[i] is the best marker qvotec read on disk i (only
+ *	meaningful when disk_has_marker[i]).  A fence tuple is AUTHORITATIVE only when an
+ *	identical tuple appears on >= quorum-majority (n_disks/2+1) DISTINCT disks (P0a:
+ *	a CRC-ok minority / partial marker is NOT authority).  Among the tuples that DO
+ *	reach majority, the one with the highest fence_epoch wins, fence_generation
+ *	tie-breaks (P0b: order by epoch -- monotonic -- never by event_id, which is a
+ *	siphash).  No majority tuple -> no authority; minority_seen fires the counter.
+ */
+static inline ClusterFenceAuthority
+cluster_fence_authority_decide(const ClusterFenceMarker *disk_markers, const bool *disk_has_marker,
+							   int n_disks)
+{
+	ClusterFenceAuthority res;
+	int majority = n_disks / 2 + 1;
+	int best_i = -1;
+	int any_marker = 0;
+	int i, j;
+
+	memset(&res, 0, sizeof(res));
+
+	for (i = 0; i < n_disks; i++) {
+		int count = 0;
+
+		if (!disk_has_marker[i])
+			continue;
+		any_marker = 1;
+
+		for (j = 0; j < n_disks; j++)
+			if (disk_has_marker[j]
+				&& cluster_fence_marker_tuple_equal(&disk_markers[i], &disk_markers[j]))
+				count++;
+
+		if (count < majority)
+			continue; /* P0a: this tuple is a minority -> not authority */
+
+		/* Among majority-reaching tuples pick the highest epoch (gen tie-break). */
+		if (best_i < 0 || disk_markers[i].fence_epoch > disk_markers[best_i].fence_epoch
+			|| (disk_markers[i].fence_epoch == disk_markers[best_i].fence_epoch
+				&& disk_markers[i].fence_generation > disk_markers[best_i].fence_generation)) {
+			best_i = i;
+			res.agree_disk_count = count;
+		}
+	}
+
+	if (best_i >= 0) {
+		res.has_authority = true;
+		res.marker = disk_markers[best_i];
+	} else {
+		res.has_authority = false;
+		res.minority_seen = (any_marker != 0);
+	}
+	return res;
+}
+
+/*
+ * cluster_fence_marker_preserve_per_disk -- carry a marker forward from a node's
+ *	prior own-slot on ONE disk into the freshly-rebuilt self_slot about to be
+ *	written to that SAME disk (R13).  The input is a single disk's prior reserved
+ *	bytes, so a marker on disk i can never reach disk j: the per-disk signature is
+ *	the anti-amplification guarantee (a 1-of-N minority marker stays 1-of-N across
+ *	heartbeats, never promoted to quorum-majority = P0a revival).  No valid marker
+ *	on this disk -> leave new_reserved1 untouched (no marker carried).
+ */
+static inline void
+cluster_fence_marker_preserve_per_disk(uint8 *new_reserved1, const uint8 *prior_reserved1_same_disk)
+{
+	ClusterFenceMarker m;
+
+	if (cluster_fence_marker_unpack(prior_reserved1_same_disk, &m))
+		cluster_fence_marker_pack(new_reserved1, &m);
+}
+
 #ifndef FRONTEND
 
 #include "port/atomics.h"
@@ -170,6 +284,22 @@ typedef struct ClusterWriteFenceShmem {
 
 /* shmem region plumbing (ClusterShmemRegion 5-step). */
 extern void cluster_write_fence_shmem_register(void);
+
+/*
+ * cluster_write_fence_refresh_from_marker -- qvotec poll refresh (spec-4.12 D2,
+ *	ONLY qvotec calls it).  Publishes the authoritative fence tuple into the local
+ *	token: authorized_epoch + self_fenced (this node in fenced_dead_bitmap) +
+ *	event_id, then the lease LAST behind a write barrier.  The lease is invalidated
+ *	first so a concurrent hot-path reader that sees a stale epoch also sees an
+ *	expired lease (fail-closed); see the read-side order in cluster_write_fence.c.
+ * cluster_write_fence_note_minority_marker -- a CRC-ok marker was present but did
+ *	not reach quorum-majority (P0a) -> ignored; bump the observability counter.  The
+ *	token is left untouched so its lease ages out (fail-closed) if no authority
+ *	returns.
+ */
+extern void cluster_write_fence_refresh_from_marker(const ClusterFenceMarker *m,
+													uint64 lease_expire_us);
+extern void cluster_write_fence_note_minority_marker(void);
 
 /*
  * cluster_write_fence_allowed -- the hot-path wrapper: read the live epoch + the

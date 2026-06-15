@@ -87,11 +87,12 @@
 #include "utils/ps_status.h"
 #include "utils/timestamp.h"
 
-#include "cluster/cluster_elog.h"	/* CLUSTER_LOG (best-effort logging) */
-#include "cluster/cluster_guc.h"	/* cluster_enabled */
-#include "cluster/cluster_pgstat.h" /* cluster.qvotec.* counters */
-#include "cluster/cluster_shmem.h"	/* cluster_shmem_register_region */
-#include "utils/memutils.h"			/* TopMemoryContext */
+#include "cluster/cluster_elog.h"		 /* CLUSTER_LOG (best-effort logging) */
+#include "cluster/cluster_guc.h"		 /* cluster_enabled */
+#include "cluster/cluster_pgstat.h"		 /* cluster.qvotec.* counters */
+#include "cluster/cluster_shmem.h"		 /* cluster_shmem_register_region */
+#include "cluster/cluster_write_fence.h" /* spec-4.12 D2: fence marker scan + token refresh */
+#include "utils/memutils.h"				 /* TopMemoryContext */
 
 
 /* ============================================================
@@ -562,6 +563,34 @@ qvotec_clear_self_alive_on_clean_shutdown(void)
  * ============================================================ */
 #include "cluster/cluster_quorum_decision.h"
 
+/*
+ * qvotec_best_marker_on_disk (spec-4.12 D2) -- scan every node's slot on one disk
+ *	for a durable fence marker (in _reserved1, already CRC-validated by read_slot)
+ *	and return the highest-epoch one (fence_generation tie-break).  Returns false
+ *	when the disk carries no marker.  The poll feeds these per-disk best markers to
+ *	cluster_fence_authority_decide, which requires quorum-majority agreement (P0a).
+ */
+static bool
+qvotec_best_marker_on_disk(int disk, ClusterFenceMarker *out)
+{
+	bool found = false;
+	uint32 node;
+
+	for (node = 0; node < CLUSTER_MAX_NODES; node++) {
+		ClusterVotingSlot *cell = &qvotec_slot_matrix[disk * CLUSTER_MAX_NODES + node];
+		ClusterFenceMarker m;
+
+		if (!cluster_fence_marker_unpack(cell->_reserved1, &m))
+			continue;
+		if (!found || m.fence_epoch > out->fence_epoch
+			|| (m.fence_epoch == out->fence_epoch && m.fence_generation > out->fence_generation)) {
+			*out = m;
+			found = true;
+		}
+	}
+	return found;
+}
+
 static void
 qvotec_poll_once(void)
 {
@@ -643,6 +672,31 @@ qvotec_poll_once(void)
 		}
 	}
 
+	/*
+	 * spec-4.12 D2: scan the matrix we just read for the durable fence marker
+	 * and refresh the local write-fence token.  A tuple is authoritative only
+	 * when an identical marker appears on >= quorum-majority disks (P0a); order
+	 * by fence_epoch (monotonic) not event_id (P0b).  A minority / partial
+	 * marker is ignored (counter) and the token is left to age out (fail-closed).
+	 * This is independent of the node-quorum decision below.
+	 */
+	{
+		ClusterFenceMarker disk_markers[CLUSTER_MAX_VOTING_DISKS];
+		bool disk_has_marker[CLUSTER_MAX_VOTING_DISKS];
+		ClusterFenceAuthority authority;
+
+		for (i = 0; i < qvotec_n_disks; i++)
+			disk_has_marker[i] = qvotec_best_marker_on_disk(i, &disk_markers[i]);
+
+		authority = cluster_fence_authority_decide(disk_markers, disk_has_marker, qvotec_n_disks);
+		if (authority.has_authority) {
+			uint64 fence_lease_expire = now_us + (uint64)cluster_write_fence_lease_ms * 1000ULL;
+
+			cluster_write_fence_refresh_from_marker(&authority.marker, fence_lease_expire);
+		} else if (authority.minority_seen)
+			cluster_write_fence_note_minority_marker();
+	}
+
 	/* ---- 2. decide BEFORE writing self slot ---- */
 	(void)decide_quorum_view(qvotec_slot_matrix, io_states, (uint32)qvotec_n_disks,
 							 CLUSTER_MAX_NODES, (uint32)cluster_node_id, qvotec_self_incarnation,
@@ -694,6 +748,19 @@ qvotec_poll_once(void)
 
 	for (i = 0; i < qvotec_n_disks; i++) {
 		ClusterVotingDiskIoState wrc;
+		ClusterVotingSlot *own_prior = &qvotec_slot_matrix[i * CLUSTER_MAX_NODES + cluster_node_id];
+
+		/*
+		 * spec-4.12 D2 (R13): the heartbeat rebuilt self_slot with a zeroed
+		 * _reserved1, which would erase any fence marker this node previously
+		 * wrote.  Carry the marker forward -- but STRICTLY per-disk: re-zero
+		 * _reserved1 each iteration (no leak across disks) and preserve ONLY the
+		 * marker from THIS node's own prior slot on THIS disk.  Copying disk j's
+		 * marker onto disk i would amplify a 1-of-N minority marker into a
+		 * quorum-majority = P0a revival; the per-disk input forbids it.
+		 */
+		memset(self_slot._reserved1, 0, sizeof(self_slot._reserved1));
+		cluster_fence_marker_preserve_per_disk(self_slot._reserved1, own_prior->_reserved1);
 
 		qvotec_slot_generation++;
 		self_slot.generation = qvotec_slot_generation;
