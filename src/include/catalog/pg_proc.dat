@@ -12530,6 +12530,21 @@
   proargnames => '{scan_lower,scan_upper,seed_rel,seed_forknum,seed_blocknum,seed_page}',
   prosrc => 'cluster_thread_replay_test' },
 
+# spec-4.11 D1 increment 3b-1: drive the online thread-recovery DATA DRIVER over
+# a dead thread's per-thread WAL (<cluster.wal_threads_dir>/thread_<dead_tid>)
+# against shared storage, over an explicit window, under the R13 error-demotion
+# harness, publishing NO authority.  Returns a ':'-delimited summary
+# (result:records:applied:gated:out_of_scope:recovered_through).  Superuser-only.
+{ oid => '8936',
+  descr => 'TEST-ONLY: online thread-recovery data driver over a dead thread WAL (spec-4.11)',
+  proname => 'cluster_thread_drive_test',
+  proisstrict => 'f',
+  provolatile => 'v', proparallel => 'u',
+  prorettype => 'text',
+  proargtypes => 'int4 pg_lsn pg_lsn',
+  proargnames => '{dead_tid,scan_lower,scan_upper}',
+  prosrc => 'cluster_thread_drive_test' },
+
 # spec-4.10 D2: reconstruct one block via the online single-block recovery
 # orchestrator over an explicit WAL window, for the byte-for-byte differential
 # vs PG real crash-recovery redo.  Returns the reconstructed page as bytea, or

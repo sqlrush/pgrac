@@ -185,9 +185,26 @@ typedef struct ClusterThreadReplayStats {
 
 #ifndef FRONTEND
 
+#include "utils/elog.h" /* elevel constants for the R13 rethrow boundary */
+
 /* GUC storage (defined in cluster_guc.c). */
 extern bool cluster_online_thread_recovery;
 extern int cluster_thread_recovery_on_unrecoverable;
+
+/*
+ * R13 error-demotion boundary (spec-4.11 3b-1, amend 1).  The online driver
+ * runs the replay under PG_TRY/PG_CATCH and demotes a catchable ERROR to a
+ * result-returning BLOCKED so the recovery-apply worker survives.  But a
+ * FATAL/PANIC must NEVER be swallowed -- it is re-thrown, so a survivor crash
+ * the cold component intended can never masquerade as "recovery blocked".  PURE
+ * so the boundary is unit-pinned (the .c PG_CATCH copies the error data and
+ * calls this on edata->elevel).
+ */
+static inline bool
+cluster_thread_recovery_should_rethrow(int elevel)
+{
+	return elevel >= FATAL;
+}
 
 /*
  * Online-replay ONE dead thread's WAL data through to shared storage
@@ -240,6 +257,28 @@ cluster_thread_recovery_replay_stream(struct XLogReaderState *reader, XLogRecPtr
 extern ClusterThreadRecResult cluster_thread_recovery_replay_data(XLogRecPtr scan_lower,
 																  XLogRecPtr scan_upper,
 																  ClusterThreadReplayStats *stats);
+
+/*
+ * DATA DRIVER (spec-4.11 D1 increment 3b-1).  Turn a dead thread id into a
+ * driven replay: build a reader over <cluster.wal_threads_dir>/thread_<tid> and
+ * drive cluster_thread_recovery_replay_stream under an R13 error-demotion
+ * harness (a catchable ERROR -> BLOCKED + worker survives; a FATAL/PANIC is
+ * re-thrown, never swallowed).
+ *
+ * DATA ONLY (3b-1): publishes NO authority, does NO visibility pass, issues NO
+ * durability barrier, and has NO live FSM caller -- only the TEST SRF and the
+ * future replay_one orchestrator (3b-2).  A data-only DONE is therefore consumed
+ * by nobody and the thread stays frozen (8.A).
+ *
+ * scan_lower/scan_upper are the CALLER'S validated-durable-boundary contract
+ * (amend 3); this driver only checks basic legality.  Any bad source / window
+ * (dead_tid out of range, missing per-thread WAL dir, unpositionable reader,
+ * in-window read error) is BLOCKED, never a silent success (amend 4).
+ */
+extern ClusterThreadRecResult cluster_thread_recovery_drive_data(uint16 dead_tid,
+																 XLogRecPtr scan_lower,
+																 XLogRecPtr scan_upper,
+																 ClusterThreadReplayStats *stats);
 
 #endif /* !FRONTEND */
 

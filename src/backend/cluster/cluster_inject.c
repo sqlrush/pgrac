@@ -473,6 +473,19 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 *	  and hold in the SAME session.
 	 */
 	{ .name = "cluster-grd-redeclare-skip" },
+
+	/*
+	 * spec-4.11 D1 increment 3b-1 (1 NEW point).
+	 *
+	 *	cluster-thread-recovery-drive:
+	 *	  ERROR fault inside the online thread-recovery data driver
+	 *	  (cluster_thread_recovery_drive_data), after the dead thread's reader is
+	 *	  built but before any segment is opened.  Proves the R13 harness demotes
+	 *	  a catchable ERROR to a result-returning BLOCKED (the recovery-apply
+	 *	  worker survives), never swallowing a FATAL/PANIC.  Per-backend arm
+	 *	  (spec-0.27 §3.6): arm and drive in the SAME session.
+	 */
+	{ .name = "cluster-thread-recovery-drive" },
 };
 
 #define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_points)
