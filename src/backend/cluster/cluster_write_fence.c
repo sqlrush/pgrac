@@ -119,6 +119,9 @@ static const ClusterShmemRegion cluster_write_fence_region = {
 	.name = "pgrac cluster write fence",
 	.size_fn = cluster_write_fence_shmem_size,
 	.init_fn = cluster_write_fence_shmem_init,
+	.lwlock_count = 0, /* atomics-only token + mailbox; no LWLock */
+	.owner_subsys = "cluster_write_fence",
+	.reserved_flags = 0,
 };
 
 void
