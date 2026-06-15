@@ -358,6 +358,23 @@ cluster_thread_recovery_replay_stream_ex(XLogReaderState *reader, XLogRecPtr sca
 		 * never claims an unfinished record (8.A).
 		 */
 		st.recovered_through = reader->EndRecPtr;
+
+		/*
+		 * D4-aligned torn-tail tolerance (spec-4.11 3b-4c).  When scan_upper is a
+		 * VALIDATED complete-record boundary (cluster_thread_recovery_validated_end
+		 * returns the last complete record's EndRecPtr), a record ends EXACTLY at
+		 * it: stop HERE.  Reading the next record would hit the dead thread's
+		 * legitimate torn / partial tail -- the normal crash point validated_end
+		 * deliberately tolerates -- and fail closed (errormsg -> aborted), even
+		 * though the validated window applied cleanly.  recovered_through ==
+		 * scan_upper already proves the whole window was present, so this is sound.
+		 * When scan_upper falls MID-record (the explicit-window TEST path, where no
+		 * record ends exactly at it) this never fires and the straddle / clean-EOF
+		 * completeness check below still governs -- so the boundary semantics are
+		 * unchanged for that path.
+		 */
+		if (reader->EndRecPtr == scan_upper)
+			break;
 	}
 
 	if (stats)

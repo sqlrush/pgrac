@@ -488,13 +488,21 @@ cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch)
 	 * redo-idempotent replay start); the registry's observational highest_lsn is
 	 * the durable-write watermark (validated_min), NOT the replay upper.  A slot
 	 * read failure or an unusable slot (missing checkpoint history / nothing
-	 * written / inverted) fails closed.
+	 * written / inverted) fails closed.  A window-derivation BLOCKED is a real
+	 * fail-closed outcome of the live FSM path (the executor worker reaches it),
+	 * so it must bump the D5 failclosed counter too -- replay_one_window's own
+	 * counting is only reached once a window is derived (otherwise the most common
+	 * live fail-closed would be invisible in thread_recovery_replay_failclosed).
 	 */
-	if (cluster_wal_state_read_slot(dead_tid, &slot) != CLUSTER_WAL_SLOT_OK)
+	if (cluster_wal_state_read_slot(dead_tid, &slot) != CLUSTER_WAL_SLOT_OK) {
+		cluster_thread_recovery_count_blocked();
 		return CLUSTER_THREADREC_BLOCKED;
+	}
 	if (slot.checkpoint_redo_lsn == 0 || slot.highest_lsn == 0
-		|| slot.highest_lsn <= slot.checkpoint_redo_lsn)
+		|| slot.highest_lsn <= slot.checkpoint_redo_lsn) {
+		cluster_thread_recovery_count_blocked();
 		return CLUSTER_THREADREC_BLOCKED;
+	}
 
 	lower = (XLogRecPtr)slot.checkpoint_redo_lsn;
 	validated_min = (XLogRecPtr)slot.highest_lsn;
@@ -508,8 +516,10 @@ cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch)
 	 * thread's committed WAL; 8.A).  BLOCKED here keeps the thread frozen.
 	 */
 	if (cluster_thread_recovery_validated_end(dead_tid, lower, validated_min, &scan_upper)
-		!= CLUSTER_THREADREC_DONE)
+		!= CLUSTER_THREADREC_DONE) {
+		cluster_thread_recovery_count_blocked();
 		return CLUSTER_THREADREC_BLOCKED;
+	}
 
 	return cluster_thread_recovery_replay_one_window(dead_tid, lower, scan_upper, episode_epoch,
 													 NULL);

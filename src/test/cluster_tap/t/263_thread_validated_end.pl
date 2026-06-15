@@ -139,5 +139,27 @@ my $future =
 	is($rinv, 'blocked', 'L5 fail-closed: invalid scan_lower -> BLOCKED');
 }
 
+# ============================================================
+# L6 (spec-4.11 3b-4c P1 fix): feeding validated_end's own boundary straight into
+# replay_one_window must DONE.  validated_end TOLERATES the dead thread's
+# legitimate torn tail (the live insert / crash point past the last complete
+# record) and returns valid_end = that last complete record's end.  The replay
+# engine must therefore STOP at valid_end and not re-read into the torn tail and
+# fail closed.  Before the fix the engine read the record past scan_upper, hit the
+# torn live-tail (XLogReadRecord NULL+errormsg -> aborted), and returned BLOCKED --
+# so a clean validated window failed unless a CHECKPOINT straddle record happened
+# to sit just past it (the trick t/261 L4 / t/259 rely on).  This leg uses NO such
+# straddle: scan_upper IS the validated boundary.
+# ============================================================
+{
+	my ($res, $vend) = validated_end(1, $lo, $hi);
+	is($res, 'done', 'L6 setup: validated_end yields a complete-record boundary');
+	my $r = $node->safe_psql('postgres',
+		"SELECT cluster_thread_replay_one_test(1, '$lo', '$vend')");
+	my $tok = (split /:/, $r)[0];
+	is($tok, 'done',
+		'L6 torn-tail: replay_one_window reaches DONE at the validated boundary (no straddle record; 3b-4c P1)');
+}
+
 $node->stop;
 done_testing();

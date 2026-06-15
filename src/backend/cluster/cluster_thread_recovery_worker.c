@@ -175,6 +175,18 @@ cluster_thread_recovery_worker_main(Datum main_arg)
 
 	res = cluster_thread_recovery_worker_run((uint16)dead_tid);
 
+	/*
+	 * worker_run returned NORMALLY: it already wrote the terminal slot state (DONE
+	 * / BLOCKED) or DELIBERATELY left the slot REPLAYING for a superseding episode
+	 * (a stale-epoch abort -> NOT_APPLICABLE).  Disarm the abnormal-exit callback so
+	 * the clean exit below does NOT flip a deliberately-left REPLAYING slot to
+	 * BLOCKED (that would diverge from worker_run's contract -- and from the SRF
+	 * test core -- and would mis-record a superseded abort as a fail-closed).  The
+	 * callback's sole purpose is the ABNORMAL exit (a FATAL inside worker_run, which
+	 * never returns here): fail-closed the in-flight recovery to keep frozen (8.A).
+	 */
+	worker_armed = false;
+
 	ereport(LOG, (errmsg("online thread recovery: dead thread %d -> %s", dead_tid,
 						 res == CLUSTER_THREADREC_DONE
 							 ? "done"
