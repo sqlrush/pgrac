@@ -66,3 +66,4 @@ src/test/cluster_*/regression.out
 # spec-2.40 D14:  Stage 2 acceptance JSON report tmp/ artifacts.
 src/test/cluster_tap/tmp/
 tmp/
+codex_review/
