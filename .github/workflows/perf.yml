@@ -284,3 +284,110 @@ jobs:
           path: perf-2node-artifact/
           if-no-files-found: ignore
           retention-days: 60
+
+  perf-stage4-recovery:
+    name: Stage 4 recovery + write-fence perf baseline (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON((inputs.run_macos_perf && '["ubuntu-latest","macos-latest"]') || '["ubuntu-latest"]') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    continue-on-error: ${{ matrix.os == 'macos-latest' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            libreadline-dev zlib1g-dev libicu-dev \
+            liblz4-dev libzstd-dev libssl-dev libxml2-dev \
+            pkg-config libipc-run-perl
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install readline icu4c lz4 zstd openssl@3 libxml2 pkg-config || true
+          sudo cpan -i IPC::Run || true
+          {
+            echo "PKG_CONFIG_PATH=$(brew --prefix icu4c)/lib/pkgconfig:$(brew --prefix openssl@3)/lib/pkgconfig:$(brew --prefix lz4)/lib/pkgconfig:$(brew --prefix zstd)/lib/pkgconfig"
+            echo "LDFLAGS=-L$(brew --prefix readline)/lib -L$(brew --prefix zstd)/lib -L$(brew --prefix lz4)/lib -L$(brew --prefix openssl@3)/lib -L$(brew --prefix icu4c)/lib"
+            echo "CPPFLAGS=-I$(brew --prefix readline)/include -I$(brew --prefix zstd)/include -I$(brew --prefix lz4)/include -I$(brew --prefix openssl@3)/include -I$(brew --prefix icu4c)/include"
+          } >> $GITHUB_ENV
+
+      # spec-4.13 D0 clean-run contract: NON-cassert release builds (cassert is
+      # ~40% noise; closure-grade numbers require a release build).  --enable-tap-
+      # tests provides pg_regress + the PG TAP framework the Perl runners use; it
+      # does not add cassert (the postgres binary stays release).
+      - name: Configure + Build --disable-cluster (release baseline)
+        run: |
+          ./configure \
+            --prefix=$HOME/linkdb-disable-install \
+            --enable-tap-tests \
+            --with-openssl --with-icu --with-lz4 --with-zstd \
+            --disable-cluster
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            make -j$(getconf _NPROCESSORS_ONLN)
+          else
+            make -j$(sysctl -n hw.ncpu)
+          fi
+          make install
+          make distclean
+
+      - name: Configure + Build --enable-cluster (release candidate)
+        run: |
+          ./configure \
+            --prefix=$HOME/linkdb-install \
+            --enable-tap-tests \
+            --with-openssl --with-icu --with-lz4 --with-zstd \
+            --enable-cluster
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            make -j$(getconf _NPROCESSORS_ONLN)
+          else
+            make -j$(sysctl -n hw.ncpu)
+          fi
+          make install
+
+      - name: Run Stage 4 recovery baseline (--nodes=2 --bands=all, report-only)
+        run: |
+          export PGRAC_ENABLE_INSTALL=$HOME/linkdb-install
+          export PGRAC_DISABLE_INSTALL=$HOME/linkdb-disable-install
+          export PATH=$HOME/linkdb-install/bin:$PATH
+          # PG TAP framework needs the port-reservation dir + pg_regress path for
+          # ClusterPair / PgracClusterNode (mirrors the 2-node baseline job).
+          mkdir -p /tmp/pgrac-portlock
+          export PG_TEST_PORT_DIR=/tmp/pgrac-portlock
+          export PG_REGRESS="$(pwd)/src/test/regress/pg_regress"
+          rm -rf tmp_check
+          # Single-node bands + delegated 2-node steady (P0-1/P0-2) + block
+          # recovery latency (P0-5/6/7).  report-only (perf is never a hard gate,
+          # 规则 20.A); a 2-node leg that cannot sustain a clean OLTP workload is
+          # honestly recorded as UNAVAILABLE in the JSON, not faked.
+          scripts/perf/run-stage4-recovery-baseline.sh \
+            --tier="${PERF_TIER:-smoke}" \
+            --bands=all \
+            --nodes=2 \
+            --scale="${PERF_SCALE:-10}" \
+            --duration="${PERF_DURATION:-30}" \
+            || echo "::warning::stage4 perf driver exited non-zero (report-only)"
+          exit 0
+
+      - name: Collect Stage 4 perf artifacts
+        if: always()
+        run: |
+          mkdir -p perf-stage4-artifact
+          cp -R scripts/perf/results perf-stage4-artifact/results 2>/dev/null || true
+          cp -R log perf-stage4-artifact/log 2>/dev/null || true
+
+      - name: Upload Stage 4 perf artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-stage4-recovery-${{ matrix.os }}-${{ github.run_id }}
+          path: perf-stage4-artifact/
+          if-no-files-found: ignore
+          retention-days: 60
