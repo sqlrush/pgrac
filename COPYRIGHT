@@ -1,5 +1,11 @@
-PostgreSQL Database Management System
-(also known as Postgres, formerly known as Postgres95)
+pgrac — Oracle RAC-equivalent shared-disk clustering for PostgreSQL.
+
+The pgrac cluster subsystem is original work by WangYingJie
+<sqlrush@gmail.com>, built on top of and distributed together with the
+PostgreSQL Database Management System (also known as Postgres). pgrac is
+licensed under the PostgreSQL License — the same terms as PostgreSQL itself.
+
+Portions Copyright (c) 2024-2026, WangYingJie <sqlrush@gmail.com>
 
 Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
 

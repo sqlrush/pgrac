@@ -126,7 +126,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and the `good first issue` label.
 
 ## License
 
-PostgreSQL License (BSD-style). See `LICENSE` and `COPYRIGHT`.
+pgrac's cluster code is original work by WangYingJie <sqlrush@gmail.com>,
+licensed under the **PostgreSQL License** (BSD-style) — the same terms as
+PostgreSQL itself. See [`LICENSE`](LICENSE) and [`COPYRIGHT`](COPYRIGHT).
 
 ## Reporting issues
 
