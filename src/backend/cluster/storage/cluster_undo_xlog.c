@@ -1218,13 +1218,56 @@ cluster_undo_redo_segment_reuse(XLogReaderState *record)
 
 
 /*
+ * cluster_undo_redo_check_delta_base -- spec-4.8ab D4 redo-determinism guard.
+ *
+ *	A delta XLOG_UNDO_BLOCK_WRITE patches an EXISTING block image that the redo
+ *	caller just pre-read from the segment file.  Its correctness rests on the
+ *	own-thread LSN chain being intact:  a block's first WAL touch is always a
+ *	full image (a fresh-block FPI, or -- with full_page_writes on -- the first
+ *	post-checkpoint FPI), and the checkpoint-coverage boundary (spec-4.8ab D1)
+ *	guarantees a pre-redo dirty block was flushed.  So when a delta replays, its
+ *	base block ALWAYS carries a valid block_lsn (the redo stream is LSN-monotone
+ *	per block, base older-or-equal vs this record).  A base whose block_lsn is
+ *	INVALID (zero) means the required full-image base never reached disk -- the
+ *	FPI-before-delta / INIT-before-WRITE ordering was broken and patching it
+ *	would corrupt the block.  Fail-closed PANIC (8.A;  this is recovery, so a
+ *	hard stop, and a real runtime guard -- NOT Assert -- L214).
+ *
+ *	Determinism / idempotent re-apply (NOT gated here, documented):  block_lsn
+ *	is stamped = this record's own EndRecPtr and never travels in the WAL body,
+ *	so replaying the same stream yields a byte-identical block.  Re-applying a
+ *	delta onto a base already at a NEWER LSN (a partial-recovery restart re-
+ *	touched the block on disk) CONVERGES to the same final state -- every delta
+ *	rewrites fixed [hdr-prefix + record + slot] ranges in LSN order, so the last
+ *	writer per range wins.  old_block_lsn >= record_lsn is therefore a benign
+ *	idempotent re-apply, NOT a violation, and is deliberately NOT rejected.
+ */
+static inline void
+cluster_undo_redo_check_delta_base(const char *block_image, uint32 segment_id, uint32 block_no)
+{
+	XLogRecPtr base_lsn = ((const UndoBlockHeader *)block_image)->block_lsn;
+
+	if (XLogRecPtrIsInvalid(base_lsn))
+		ereport(
+			PANIC,
+			(errmsg("XLOG_UNDO_BLOCK_WRITE delta redo: base block %u of segment %u carries no "
+					"durable image (block_lsn invalid)",
+					block_no, segment_id),
+			 errhint("A delta requires a prior full-image base;  "
+					 "XLOG_UNDO_SEGMENT_INIT/REUSE and the post-checkpoint FPI must precede the "
+					 "delta in WAL.")));
+}
+
+
+/*
  * Replay XLOG_UNDO_BLOCK_WRITE (spec-3.18 D2a).
  *
  *   D2a ships always-FPI: the record carries a full BLCKSZ image.  Redo
  *   restores it wholesale into a data block (block_no >= 1) of the undo
  *   segment file and stamps block_lsn with this record's own end LSN (§2.6).
- *   Idempotent: re-replaying writes byte-identical bytes.  The 3-range delta
- *   form (has_fpi=0) lands in D2b -- fail closed here until then.
+ *   Idempotent: re-replaying writes byte-identical bytes (a full overwrite is
+ *   the determinism anchor;  spec-4.8ab D4).  The 3-range delta form (has_fpi=0)
+ *   lands in D2b -- fail closed here until then.
  *
  *   pg_undo/ files are outside PG's RelFileLocator namespace, so we open +
  *   pwrite + fsync directly.  SEGMENT_INIT/REUSE (which create the file)
@@ -1312,6 +1355,7 @@ cluster_undo_redo_block_write(XLogReaderState *record)
 								   "read %zd of %d bytes",
 								   rec->block_no, path, nread, BLCKSZ)));
 		}
+		cluster_undo_redo_check_delta_base(blockbuf.data, rec->segment_id, rec->block_no);
 		cluster_undo_apply_block_write_delta(blockbuf.data, rec, body, record->EndRecPtr);
 	}
 
@@ -1422,6 +1466,7 @@ cluster_undo_redo_block_write_multi(XLogReaderState *record)
 								   "read %zd of %d bytes",
 								   rec->block_no, path, nread, BLCKSZ)));
 		}
+		cluster_undo_redo_check_delta_base(blockbuf.data, rec->segment_id, rec->block_no);
 		cluster_undo_apply_block_write_multi_delta(blockbuf.data, rec, body, record->EndRecPtr);
 	}
 

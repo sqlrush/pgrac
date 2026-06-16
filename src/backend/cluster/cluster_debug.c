@@ -1534,9 +1534,13 @@ dump_gcs(ReturnSetInfo *rsinfo)
  *	4 smgr counters (the latter 7 added by the perf-merge undo
  *	instrumentation) + 5 durable TT slot counters (spec-3.11 D8) + 5 retention
  *	counters (spec-3.12 D5: horizon gauge / tt_slot_retain_skip /
- *	segment_retain_skip / retention_recycle / tt_retention_rollover).  Backs
- *	cluster_tap t/213 + t/214 + t/219 L2 + t/220 verification + perf class 7
- *	baseline tracking.
+ *	segment_retain_skip / retention_recycle / tt_retention_rollover) +
+ *	6 cleaner/reuse counters (spec-3.13 D6) +
+ *	4 checkpoint-writeback boundary counters (spec-4.8ab D7:
+ *	undo_buf_held_wal / undo_buf_held_evidence / undo_buf_boundary_violations /
+ *	undo_buf_remote_evidence_holds).  Backs
+ *	cluster_tap t/213 + t/214 + t/219 L2 + t/220 + t/270 verification + perf
+ *	class 7 baseline tracking.
  */
 /*
  * dbstate_text -- short token for a ControlFile DBState value
@@ -1882,6 +1886,17 @@ dump_undo(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_undo_segment_reuse_count()));
 	emit_row(rsinfo, "undo", "tt_slot_wrap_retired_count",
 			 fmt_int64((int64)cluster_tt_slot_wrap_retired_count()));
+
+	/* spec-4.8ab D7: 4 checkpoint-writeback boundary counters (grown into the
+	 * existing undo buffer pool region -- D0 finding-3, no new region). */
+	emit_row(rsinfo, "undo", "undo_buf_held_wal",
+			 fmt_int64((int64)cluster_undo_buf_get_writeback_held_wal_count()));
+	emit_row(rsinfo, "undo", "undo_buf_held_evidence",
+			 fmt_int64((int64)cluster_undo_buf_get_writeback_held_evidence_count()));
+	emit_row(rsinfo, "undo", "undo_buf_boundary_violations",
+			 fmt_int64((int64)cluster_undo_buf_get_boundary_violation_count()));
+	emit_row(rsinfo, "undo", "undo_buf_remote_evidence_holds",
+			 fmt_int64((int64)cluster_undo_buf_get_remote_evidence_hold_count()));
 }
 
 /*

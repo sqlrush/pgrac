@@ -240,6 +240,73 @@ UT_TEST(test_stage3_undo_block_write_delta_apply)
 }
 
 
+/* ===== spec-4.8ab D4 (L8) — redo determinism: idempotent re-apply converges =====
+ *
+ *	The redo-determinism contract (spec-4.8ab §0.4 / D4): replaying the same
+ *	XLOG_UNDO_BLOCK_WRITE stream yields a byte-identical block, AND re-applying a
+ *	delta sequence onto an already-NEWER base (a partial-recovery restart that
+ *	re-touched the block on disk) CONVERGES to the same final state -- every
+ *	delta rewrites fixed [hdr-prefix + record + slot] ranges in LSN order, so the
+ *	last writer per range wins.  This pins both halves so a future redo refactor
+ *	cannot silently break crash-during-checkpoint / crash-during-writeback
+ *	determinism.  (cluster_undo_apply_block_write_* are pure inlines.)
+ */
+UT_TEST(test_undo_4_8ab_redo_determinism_converges)
+{
+	char s0[BLCKSZ], forward[BLCKSZ], reapply[BLCKSZ], fpi_once[BLCKSZ], fpi_twice[BLCKSZ];
+	xl_undo_block_write d1, d2;
+	char body1[UNDO_BLOCK_HDR_PREFIX_LEN + 64 + sizeof(UndoSlotDirEntry)];
+	char body2[UNDO_BLOCK_HDR_PREFIX_LEN + 32 + sizeof(UndoSlotDirEntry)];
+
+	/* --- FPI half: applying the same full-page image twice is byte-identical --- */
+	memset(s0, 0xAB, BLCKSZ);
+	((UndoBlockHeader *)s0)->magic = PGRAC_UNDO_BLOCK_MAGIC;
+	cluster_undo_apply_block_write_fpi(s0, (XLogRecPtr)0xBEEF, fpi_once);
+	cluster_undo_apply_block_write_fpi(s0, (XLogRecPtr)0xBEEF, fpi_twice);
+	UT_ASSERT_EQ(memcmp(fpi_once, fpi_twice, BLCKSZ), 0); /* idempotent full overwrite */
+
+	/* --- delta half: build two non-overlapping deltas at increasing LSNs --- */
+	memset(s0, 0x11, BLCKSZ);
+	((UndoBlockHeader *)s0)->magic = PGRAC_UNDO_BLOCK_MAGIC;
+	((UndoBlockHeader *)s0)->block_lsn = (XLogRecPtr)0x100; /* valid base (D4 guard) */
+
+	memset(&d1, 0, sizeof(d1));
+	d1.has_fpi = 0;
+	d1.rec_off = 200;
+	d1.rec_len = 64;
+	d1.slot_off = 8000;
+	memset(body1, 0x22, UNDO_BLOCK_HDR_PREFIX_LEN);		 /* hdr prefix */
+	memset(body1 + UNDO_BLOCK_HDR_PREFIX_LEN, 0x33, 64); /* record */
+	memset(body1 + UNDO_BLOCK_HDR_PREFIX_LEN + 64, 0x44, sizeof(UndoSlotDirEntry));
+
+	memset(&d2, 0, sizeof(d2));
+	d2.has_fpi = 0;
+	d2.rec_off = 400;
+	d2.rec_len = 32;
+	d2.slot_off = 7000;
+	memset(body2, 0x77, UNDO_BLOCK_HDR_PREFIX_LEN);		 /* hdr prefix */
+	memset(body2 + UNDO_BLOCK_HDR_PREFIX_LEN, 0x55, 32); /* record */
+	memset(body2 + UNDO_BLOCK_HDR_PREFIX_LEN + 32, 0x66, sizeof(UndoSlotDirEntry));
+
+	/* Forward replay S0 -> (delta@0x200) -> (delta@0x300) = the true final state. */
+	memcpy(forward, s0, BLCKSZ);
+	cluster_undo_apply_block_write_delta(forward, &d1, body1, (XLogRecPtr)0x200);
+	cluster_undo_apply_block_write_delta(forward, &d2, body2, (XLogRecPtr)0x300);
+
+	/* Crash-during-recovery restart: re-apply the SAME stream onto the already-
+	 * final (newer-LSN) state.  Must converge byte-identically -- including the
+	 * block_lsn stamp (= last record's own LSN, never carried in the body). */
+	memcpy(reapply, forward, BLCKSZ);
+	cluster_undo_apply_block_write_delta(reapply, &d1, body1, (XLogRecPtr)0x200);
+	cluster_undo_apply_block_write_delta(reapply, &d2, body2, (XLogRecPtr)0x300);
+	UT_ASSERT_EQ(memcmp(reapply, forward, BLCKSZ), 0); /* idempotent convergence */
+	UT_ASSERT_EQ((long long)((UndoBlockHeader *)reapply)->block_lsn, (long long)0x300);
+
+	/* Sanity: the deltas actually changed the block (not a no-op convergence). */
+	UT_ASSERT_EQ(memcmp(forward, s0, BLCKSZ) != 0 ? 1 : 0, 1);
+}
+
+
 /* ===== L3 — 6 MVCC capability dump category names stable ===== */
 
 UT_TEST(test_stage3_capability_dump_category_names)
@@ -384,6 +451,7 @@ main(void)
 	UT_RUN(test_stage3_undo_block_write_wal_abi);
 	UT_RUN(test_stage3_undo_block_write_fpi_apply);
 	UT_RUN(test_stage3_undo_block_write_delta_apply);
+	UT_RUN(test_undo_4_8ab_redo_determinism_converges);
 	UT_RUN(test_stage3_capability_dump_category_names);
 	UT_RUN(test_stage3_sqlstate_mvcc_surface_encodable);
 	UT_RUN(test_stage3_wait_events_count_snapshot_97);

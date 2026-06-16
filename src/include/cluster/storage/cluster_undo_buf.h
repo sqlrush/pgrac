@@ -129,6 +129,50 @@ extern void cluster_undo_buf_invalidate_segment(uint32 segment_id, uint8 owner);
 extern bool cluster_undo_buf_writeback_allowed(void);
 
 /*
+ * spec-4.8ab D5 -- explicit checkpoint-writeback boundary verdict (three-state).
+ *	A NEW, per-block decision predicate distinct from the global write-back-mode
+ *	latch above (cluster_undo_buf_writeback_allowed, which answers "is the mode
+ *	on?").  This answers "may THIS dirty block be written back / evicted right
+ *	now?", and is consulted at the flush / eviction moment:
+ *	  CLUSTER_WB_OK            -- WAL durable AND no live evidence window
+ *	                              (or it is a checkpoint flush): write back, and
+ *	                              evict when not a checkpoint.
+ *	  CLUSTER_WB_HOLD_WAL      -- the block's XLOG_UNDO_BLOCK_WRITE is not durable
+ *	                              yet (block_lsn > flushed_lsn): hold.
+ *	  CLUSTER_WB_HOLD_EVIDENCE -- a non-checkpoint eviction would drop an undo
+ *	                              image still consumable by a reader / recovery:
+ *	                              flush is fine, eviction is held.
+ *	cluster_undo_buf_writeback_decide is PURE (LSN + flags, no globals) so the
+ *	three-state logic is unit-testable in isolation (mirrors the D1 predicates).
+ */
+typedef enum ClusterUndoWritebackVerdict {
+	CLUSTER_WB_OK,			  /* may write back (and evict if not checkpoint) */
+	CLUSTER_WB_HOLD_WAL,	  /* WAL not durable yet -> hold */
+	CLUSTER_WB_HOLD_EVIDENCE, /* live evidence window -> flush ok, evict held */
+} ClusterUndoWritebackVerdict;
+
+extern ClusterUndoWritebackVerdict cluster_undo_buf_writeback_decide(XLogRecPtr block_lsn,
+																	 XLogRecPtr flushed_lsn,
+																	 bool evidence_live,
+																	 bool is_checkpoint);
+
+/*
+ * spec-4.8ab D5 -- cluster.undo_writeback_boundary_check mode (two-layer model,
+ * §3.1).  This GUC controls ONLY the advisory / diagnostic layer (verdict
+ * accounting + an extra CI invariant check).  The hard corruption-path
+ * fail-closed (cluster_undo_boundary_violation: WAL-before-data / checkpoint-
+ * coverage / evidence-eviction) is UNCONDITIONAL and runs under every value,
+ * including off -- 8.A correctness is never gated by a GUC.  Registered in
+ * cluster_guc.c (DefineCustomEnumVariable).
+ */
+typedef enum ClusterUndoWritebackBoundaryCheck {
+	CLUSTER_UNDO_WB_CHECK_OFF,	  /* skip advisory verdict accounting (save hot-path cost) */
+	CLUSTER_UNDO_WB_CHECK_ON,	  /* default: verdict accounting + counters */
+	CLUSTER_UNDO_WB_CHECK_STRICT, /* + ERROR on a broken advisory invariant (CI/test) */
+} ClusterUndoWritebackBoundaryCheck;
+extern int cluster_undo_writeback_boundary_check;
+
+/*
  * spec-4.8ab D1 -- checkpoint-writeback boundary predicates + fail-closed
  * helper.  The two predicates are pure (LSN comparisons only) so the boundary
  * logic is unit-testable;  the violation helper fail-closes (8.A) and never
@@ -154,5 +198,17 @@ extern uint64 cluster_undo_buf_get_miss_count(void);
 extern uint64 cluster_undo_buf_get_writethrough_count(void);
 extern uint64 cluster_undo_buf_get_evict_count(void);
 extern uint64 cluster_undo_buf_get_writeback_count(void); /* spec-3.18 D7 */
+
+/*
+ * spec-4.8ab D7 -- checkpoint-writeback boundary observability.  These four
+ * counters are grown into the existing undo buffer pool region (NO new shmem
+ * region -- D0 finding-3), so there is no region-count baseline ripple.  When
+ * the pool is disabled (cluster.undo_buffers = 0) they read 0;  the boundary
+ * fail-closed guards themselves never depend on the counters.
+ */
+extern uint64 cluster_undo_buf_get_writeback_held_wal_count(void);
+extern uint64 cluster_undo_buf_get_writeback_held_evidence_count(void);
+extern uint64 cluster_undo_buf_get_boundary_violation_count(void);
+extern uint64 cluster_undo_buf_get_remote_evidence_hold_count(void); /* 4.8b D6 */
 
 #endif /* CLUSTER_UNDO_BUF_H */

@@ -796,6 +796,27 @@ cluster_undo_buf_get_writeback_count(void)
 {
 	return 0;
 }
+/* spec-4.8ab D7: checkpoint-writeback boundary counter stubs. */
+uint64
+cluster_undo_buf_get_writeback_held_wal_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_buf_get_writeback_held_evidence_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_buf_get_boundary_violation_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_buf_get_remote_evidence_hold_count(void)
+{
+	return 0;
+}
 uint64
 cluster_undo_block_write_count(void)
 {

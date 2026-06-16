@@ -74,6 +74,9 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 /* ----- GUC globals the pool reads ----- */
 int cluster_undo_buffers = 4; /* small pool for evict testing */
 bool cluster_undo_buffer_writeback = false;
+/* spec-4.8ab D5: advisory boundary-check mode (default ON);  the pool reads it
+ * via the header extern.  ON so the eviction path exercises verdict accounting. */
+int cluster_undo_writeback_boundary_check = CLUSTER_UNDO_WB_CHECK_ON;
 
 /*
  * spec-3.18 D7 -- flush_dirty_slot() calls pgstat_report_wait_start/_end for
@@ -528,9 +531,50 @@ UT_TEST(test_undo_buf_dirty_evict_flushes_before_reuse)
 	UT_ASSERT_EQ(cluster_undo_buf_get_writeback_count() >= 1 ? 1 : 0, 1);
 	UT_ASSERT_EQ((int)cluster_undo_buf_get_writeback_count(), smgr_fsync_write_calls);
 	UT_ASSERT_EQ(cluster_undo_buf_get_evict_count() >= 1 ? 1 : 0, 1);
+	/*
+	 * spec-4.8ab D5/D7:  the dirty-victim eviction accounted a write-back verdict
+	 * (advisory layer, GUC default ON).  The stub GetFlushRecPtr() returns a high
+	 * durable bound, so WAL-before-data holds -> the verdict is HOLD_EVIDENCE for
+	 * a non-checkpoint eviction of a dirty (live-evidence) block, and at least
+	 * one was counted.  No boundary VIOLATION fired (the flush made it durable).
+	 */
+	UT_ASSERT_EQ(cluster_undo_buf_get_writeback_held_evidence_count() >= 1 ? 1 : 0, 1);
+	UT_ASSERT_EQ((int)cluster_undo_buf_get_boundary_violation_count(), 0);
 	cluster_undo_buf_unpin(&pin);
 
 	cluster_undo_buffer_writeback = false; /* restore default for later tests */
+}
+
+
+/* ===== D5 (spec-4.8ab) — write-back boundary verdict, three-state (pure) =====
+ *
+ *	Locks the three-state decision predicate that the eviction / flush path
+ *	consults.  Distinct from the global write-back-mode latch
+ *	(cluster_undo_buf_writeback_allowed):  this answers "may THIS block be
+ *	written back / evicted right now?".  Pure (LSN + flags), so unit-testable.
+ */
+UT_TEST(test_undo_buf_writeback_verdict_three_state)
+{
+	XLogRecPtr flushed = 5000;
+
+	/* WAL durable + no live evidence -> OK (write back, evict if not ckpt). */
+	UT_ASSERT_EQ((int)cluster_undo_buf_writeback_decide(4999, flushed, false, false),
+				 (int)CLUSTER_WB_OK);
+	/* WAL durable + live evidence + NON-checkpoint eviction -> HOLD_EVIDENCE. */
+	UT_ASSERT_EQ((int)cluster_undo_buf_writeback_decide(4999, flushed, true, false),
+				 (int)CLUSTER_WB_HOLD_EVIDENCE);
+	/* WAL durable + live evidence + CHECKPOINT (flush-and-keep) -> OK: a
+	 * checkpoint flush is not blocked by the evidence window (it writes durable
+	 * but does not evict). */
+	UT_ASSERT_EQ((int)cluster_undo_buf_writeback_decide(4999, flushed, true, true),
+				 (int)CLUSTER_WB_OK);
+	/* WAL NOT durable (block_lsn > flushed) -> HOLD_WAL takes precedence over
+	 * the evidence clause regardless of is_checkpoint. */
+	UT_ASSERT_EQ((int)cluster_undo_buf_writeback_decide(5001, flushed, false, true),
+				 (int)CLUSTER_WB_HOLD_WAL);
+	/* Invalid block_lsn (no protecting WAL) -> HOLD_WAL (fail-closed, 8.A). */
+	UT_ASSERT_EQ((int)cluster_undo_buf_writeback_decide(InvalidXLogRecPtr, flushed, true, false),
+				 (int)CLUSTER_WB_HOLD_WAL);
 }
 
 
@@ -546,6 +590,7 @@ main(void)
 	UT_RUN(test_undo_buf_evicts_when_full);
 	UT_RUN(test_undo_boundary_wal_before_data);
 	UT_RUN(test_undo_boundary_checkpoint_coverage);
+	UT_RUN(test_undo_buf_writeback_verdict_three_state);
 	UT_RUN(test_undo_buf_dirty_evict_flushes_before_reuse);
 	UT_DONE();
 }

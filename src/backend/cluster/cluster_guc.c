@@ -92,6 +92,22 @@ int cluster_undo_buffers = 2048;
  * The check_hook is feedback-only (never rejects).
  */
 bool cluster_undo_buffer_writeback = true;
+
+/*
+ * spec-4.8ab D5: undo checkpoint-writeback boundary check mode (two-layer
+ * model, §3.1).  Backing variable for cluster.undo_writeback_boundary_check;
+ * read in cluster_undo_buf.c via the header extern.  DEFAULT ON -- but this GUC
+ * controls ONLY the advisory verdict-accounting layer.  The hard corruption
+ * fail-closed guards (cluster_undo_boundary_violation) are unconditional under
+ * every value (off included), so 8.A correctness is never gated by the GUC.
+ */
+int cluster_undo_writeback_boundary_check = CLUSTER_UNDO_WB_CHECK_ON;
+static const struct config_enum_entry cluster_undo_writeback_boundary_check_options[]
+	= { { "off", CLUSTER_UNDO_WB_CHECK_OFF, false },
+		{ "on", CLUSTER_UNDO_WB_CHECK_ON, false },
+		{ "strict", CLUSTER_UNDO_WB_CHECK_STRICT, false },
+		{ NULL, 0, false } };
+
 int cluster_grd_max_entries = 0;
 int cluster_ges_request_timeout_ms = 60000; /* spec-2.16 D12 + v0.5 P1.5 */
 
@@ -1149,6 +1165,26 @@ cluster_init_guc(void)
 					 "write-through (per-commit fsync to shared storage)."),
 		&cluster_undo_buffer_writeback, true, PGC_SIGHUP, 0,
 		cluster_undo_buffer_writeback_check_hook, NULL, NULL);
+
+	/*
+	 * spec-4.8ab D5: cluster.undo_writeback_boundary_check -- advisory layer of
+	 * the checkpoint-writeback boundary contract (two-layer model, §3.1).  This
+	 * GUC controls ONLY the advisory verdict accounting / extra CI invariant;
+	 * the hard corruption fail-closed (53R9N / PANIC on WAL-before-data /
+	 * checkpoint-coverage / evidence-eviction) is UNCONDITIONAL and is NOT gated
+	 * by this GUC (8.A is never downgradable -- off only saves the advisory
+	 * accounting cost, it does not disable the hard guards).  SIGHUP-tunable.
+	 */
+	DefineCustomEnumVariable(
+		"cluster.undo_writeback_boundary_check",
+		gettext_noop("Advisory layer of the undo checkpoint-writeback boundary contract."),
+		gettext_noop("off skips advisory verdict accounting (the hard fail-closed boundary guards "
+					 "still run); on (default) records HOLD_WAL / HOLD_EVIDENCE write-back verdict "
+					 "counters; strict additionally raises an ERROR on a broken advisory invariant "
+					 "for aggressive CI/test exposure.  This GUC never disables the hard 8.A "
+					 "boundary guards."),
+		&cluster_undo_writeback_boundary_check, CLUSTER_UNDO_WB_CHECK_ON,
+		cluster_undo_writeback_boundary_check_options, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	/*
 	 * spec-2.15:  cluster.grd_max_entries

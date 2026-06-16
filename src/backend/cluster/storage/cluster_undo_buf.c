@@ -63,6 +63,13 @@
 extern int cluster_undo_buffers;		   /* pool slot count;  0 = disabled */
 extern bool cluster_undo_buffer_writeback; /* D2b: write-back on (single-node only) */
 
+/*
+ * spec-4.8ab D5 -- advisory boundary-check mode (two-layer model, §3.1).
+ * Controls ONLY the advisory verdict accounting below;  the hard fail-closed
+ * guards are unconditional.  Default ON.  Defined + registered in cluster_guc.c.
+ */
+extern int cluster_undo_writeback_boundary_check;
+
 /* One pool slot.  BLCKSZ data lives in a parallel array (alignment). */
 typedef struct UndoBufSlot {
 	LWLock content_lock; /* SHARED reader / EXCLUSIVE writer */
@@ -86,6 +93,15 @@ typedef struct ClusterUndoBufPool {
 	pg_atomic_uint64 writethrough_count;
 	pg_atomic_uint64 evict_count;
 	pg_atomic_uint64 writeback_count; /* spec-3.18 D7: D2b write-back flushes */
+	/*
+	 * spec-4.8ab D7: checkpoint-writeback boundary observability.  Grown into
+	 * this existing region (D0 finding-3) -- no new shmem region, no t/020
+	 * region-count baseline ripple.
+	 */
+	pg_atomic_uint64 writeback_held_wal;	  /* D5: HOLD_WAL verdicts (WAL not durable) */
+	pg_atomic_uint64 writeback_held_evidence; /* D5: HOLD_EVIDENCE verdicts (evict deferred) */
+	pg_atomic_uint64 boundary_violations;	  /* D1/D5: fail-closed boundary-guard hits */
+	pg_atomic_uint64 remote_evidence_holds;	  /* 4.8b D6: peered write-through evidence holds */
 	/* UndoBufSlot slots[nslots] follows; char data[nslots * BLCKSZ] after. */
 } ClusterUndoBufPool;
 
@@ -123,6 +139,77 @@ bool
 cluster_undo_buf_writeback_allowed(void)
 {
 	return UndoBufPool != NULL && cluster_undo_buffer_writeback && !cluster_conf_has_peers();
+}
+
+
+/*
+ * cluster_undo_buf_writeback_decide -- spec-4.8ab D5 three-state boundary
+ *	verdict (PURE: LSN + flags, no globals -- unit-testable).  This is the
+ *	per-block decision predicate, distinct from the global write-back-mode latch
+ *	(cluster_undo_buf_writeback_allowed).  See the header for the contract.
+ *
+ *	  1. WAL-before-data first:  if the block's protecting WAL is not durable
+ *	     (block_lsn > flushed_lsn, or block_lsn invalid), it cannot be written
+ *	     back yet -> HOLD_WAL.  Reuses the D1 pure predicate so the two stay in
+ *	     lockstep.
+ *	  2. Evidence window:  a NON-checkpoint eviction must not drop an undo image
+ *	     still consumable by a reader / recovery -> HOLD_EVIDENCE.  A checkpoint
+ *	     flush is "flush-and-keep" (it writes durable but does not evict), so the
+ *	     evidence window does NOT block a checkpoint flush (is_checkpoint relaxes
+ *	     this clause, §2.1).
+ *	  3. Otherwise OK (write back, and evict when not a checkpoint).
+ */
+ClusterUndoWritebackVerdict
+cluster_undo_buf_writeback_decide(XLogRecPtr block_lsn, XLogRecPtr flushed_lsn, bool evidence_live,
+								  bool is_checkpoint)
+{
+	if (!cluster_undo_wal_before_data_holds(block_lsn, flushed_lsn))
+		return CLUSTER_WB_HOLD_WAL;
+	if (evidence_live && !is_checkpoint)
+		return CLUSTER_WB_HOLD_EVIDENCE;
+	return CLUSTER_WB_OK;
+}
+
+
+/*
+ * cluster_undo_buf_account_verdict -- spec-4.8ab D5 advisory accounting (the
+ *	GUC-controlled second layer, §3.1).  Computes the three-state verdict for a
+ *	dirty slot at the eviction / flush decision and records it for observability.
+ *	The caller has already decided to flush (a dirty victim is always flushed
+ *	WAL-before-data before its slot is reused);  this only CLASSIFIES the
+ *	write-back, it never gates correctness -- the hard fail-closed guards in
+ *	flush_dirty_slot / flush_all run unconditionally.
+ *
+ *	The caller must have checked cluster_undo_writeback_boundary_check != OFF so
+ *	the GetFlushRecPtr() durable-bound read is skipped on the off hot path.  A
+ *	dirty slot always carries a valid monotone protecting LSN (mark_dirty
+ *	enforces it);  under STRICT a dirty slot with an INVALID protecting LSN is a
+ *	broken advisory invariant -> ERROR (aggressive CI/test exposure).  This is
+ *	NOT the hard corruption path (that is cluster_undo_boundary_violation).
+ */
+static void
+cluster_undo_buf_account_verdict(XLogRecPtr block_lsn, bool is_checkpoint)
+{
+	ClusterUndoWritebackVerdict verdict;
+
+	verdict = cluster_undo_buf_writeback_decide(block_lsn, GetFlushRecPtr(NULL),
+												/* evidence_live = */ true, is_checkpoint);
+
+	switch (verdict) {
+	case CLUSTER_WB_HOLD_WAL:
+		pg_atomic_fetch_add_u64(&UndoBufPool->writeback_held_wal, 1);
+		if (cluster_undo_writeback_boundary_check == CLUSTER_UNDO_WB_CHECK_STRICT
+			&& XLogRecPtrIsInvalid(block_lsn))
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_UNDO_WRITEBACK_BOUNDARY_VIOLATION),
+							errmsg("strict undo writeback boundary check: dirty undo slot has no "
+								   "protecting WAL LSN")));
+		break;
+	case CLUSTER_WB_HOLD_EVIDENCE:
+		pg_atomic_fetch_add_u64(&UndoBufPool->writeback_held_evidence, 1);
+		break;
+	case CLUSTER_WB_OK:
+		break;
+	}
 }
 
 
@@ -182,6 +269,11 @@ cluster_undo_boundary_violation(const char *what, XLogRecPtr block_lsn, XLogRecP
 {
 	int elevel = (CritSectionCount > 0) ? PANIC : ERROR;
 
+	/* spec-4.8ab D7: record the fail-closed hit before raising (survives an
+	 * ERROR-level stop for observability;  a PANIC restarts shmem anyway). */
+	if (UndoBufPool != NULL)
+		pg_atomic_fetch_add_u64(&UndoBufPool->boundary_violations, 1);
+
 	ereport(elevel, (errcode(ERRCODE_CLUSTER_UNDO_WRITEBACK_BOUNDARY_VIOLATION),
 					 errmsg("cluster undo checkpoint-writeback boundary violation: %s", what),
 					 errdetail("undo block LSN %X/%X is past the durable/redo bound %X/%X",
@@ -233,7 +325,11 @@ cluster_undo_buf_shmem_init(void)
 	pg_atomic_init_u64(&UndoBufPool->miss_count, 0);
 	pg_atomic_init_u64(&UndoBufPool->writethrough_count, 0);
 	pg_atomic_init_u64(&UndoBufPool->evict_count, 0);
-	pg_atomic_init_u64(&UndoBufPool->writeback_count, 0); /* spec-3.18 D7 */
+	pg_atomic_init_u64(&UndoBufPool->writeback_count, 0);	 /* spec-3.18 D7 */
+	pg_atomic_init_u64(&UndoBufPool->writeback_held_wal, 0); /* spec-4.8ab D7 */
+	pg_atomic_init_u64(&UndoBufPool->writeback_held_evidence, 0);
+	pg_atomic_init_u64(&UndoBufPool->boundary_violations, 0);
+	pg_atomic_init_u64(&UndoBufPool->remote_evidence_holds, 0);
 
 	for (int i = 0; i < n; i++) {
 		UndoBufSlot *s = &UndoBufSlots[i];
@@ -516,9 +612,25 @@ cluster_undo_buf_pin(uint32 segment_id, uint8 owner, uint32 block_no, ClusterUnd
 			 * write-back is gated off -- a write-through victim is never dirty.
 			 */
 			UndoBufSlot *s = &UndoBufSlots[slotno];
+			XLogRecPtr victim_lsn = s->last_wal_lsn;
 
 			pg_atomic_fetch_add_u32(&s->pincount, 1);
 			LWLockRelease(&UndoBufPool->map_lock);
+
+			/*
+			 * spec-4.8ab D5: classify this dirty-victim write-back for
+			 * observability (advisory layer -- skipped on the off hot path so the
+			 * GetFlushRecPtr() durable-bound read costs nothing then).  A dirty
+			 * victim still carries an undo image not yet on disk, so its evidence
+			 * is live and a non-checkpoint eviction holds it until the flush below
+			 * makes it durable;  the verdict records HOLD_WAL / HOLD_EVIDENCE.
+			 * Done after the pin + map_lock release (the pin keeps the slot
+			 * stable, and we never hold map_lock across GetFlushRecPtr).  The hard
+			 * WAL-before-data guard is inside flush_dirty_slot, unconditional.
+			 */
+			if (cluster_undo_writeback_boundary_check != CLUSTER_UNDO_WB_CHECK_OFF)
+				cluster_undo_buf_account_verdict(victim_lsn, /* is_checkpoint = */ false);
+
 			PG_TRY();
 			{
 				flush_dirty_slot(slotno);
@@ -629,6 +741,22 @@ cluster_undo_buf_mark_dirty(const ClusterUndoBufPin *pin, XLogRecPtr wal_lsn)
 		s->dirty = false;
 		s->last_wal_lsn = wal_lsn; /* Invalid in D1 */
 		pg_atomic_fetch_add_u64(&UndoBufPool->writethrough_count, 1);
+
+		/*
+		 * spec-4.8ab D6 (4.8b contract-first) -- remote-undo evidence invariant.
+		 * Under a PEERED topology write-back is gated OFF (writeback_allowed()
+		 * returns false because cluster_conf_has_peers()), so every undo write is
+		 * write-through to shared storage and the block's undo evidence is durable
+		 * the instant it is written.  That is the conservative hold: the source
+		 * node NEVER async-releases an undo image a remote node might still need
+		 * (Q4 朝 hold).  We count these holds so the contract is observable;  the
+		 * real cross-node remote-undo READ stays fail-closed
+		 * (ERRCODE_CLUSTER_CR_CROSS_INSTANCE_UNSUPPORTED in cluster_cr.c) until
+		 * spec-5.57 ships it.  Distinguish the peered hold from a GUC-off /
+		 * pool-disabled write-through (which is local, not a remote hold).
+		 */
+		if (cluster_conf_has_peers())
+			pg_atomic_fetch_add_u64(&UndoBufPool->remote_evidence_holds, 1);
 		return;
 	}
 
@@ -806,4 +934,29 @@ uint64
 cluster_undo_buf_get_writeback_count(void)
 {
 	return UndoBufPool ? pg_atomic_read_u64(&UndoBufPool->writeback_count) : 0;
+}
+
+/* ----- spec-4.8ab D7: checkpoint-writeback boundary counters ----- */
+uint64
+cluster_undo_buf_get_writeback_held_wal_count(void)
+{
+	return UndoBufPool ? pg_atomic_read_u64(&UndoBufPool->writeback_held_wal) : 0;
+}
+
+uint64
+cluster_undo_buf_get_writeback_held_evidence_count(void)
+{
+	return UndoBufPool ? pg_atomic_read_u64(&UndoBufPool->writeback_held_evidence) : 0;
+}
+
+uint64
+cluster_undo_buf_get_boundary_violation_count(void)
+{
+	return UndoBufPool ? pg_atomic_read_u64(&UndoBufPool->boundary_violations) : 0;
+}
+
+uint64
+cluster_undo_buf_get_remote_evidence_hold_count(void)
+{
+	return UndoBufPool ? pg_atomic_read_u64(&UndoBufPool->remote_evidence_holds) : 0;
 }
