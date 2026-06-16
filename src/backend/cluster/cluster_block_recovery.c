@@ -52,6 +52,7 @@
 #include "access/xlogrecord.h"
 #include "access/xlogutils.h"
 #include "port/atomics.h"
+#include "portability/instr_time.h" /* PGRAC: spec-4.13 D4 LOG-only latency */
 #include "storage/bufpage.h"
 #include "storage/checksum.h"
 #include "storage/fd.h"
@@ -211,6 +212,9 @@ cluster_block_recovery_reconstruct(RelFileLocator rlocator, ForkNumber forknum,
 	bool have_base = false;
 	bool aborted = false;
 	XLogRecPtr target_lsn = InvalidXLogRecPtr;
+	/* PGRAC: spec-4.13 D4 LOG-only scan cost (no semantic effect). */
+	int64 records_scanned = 0;
+	int64 wal_bytes_scanned = 0;
 
 	if (XLogRecPtrIsInvalid(scan_lower) || XLogRecPtrIsInvalid(scan_upper)
 		|| scan_lower > scan_upper)
@@ -251,6 +255,10 @@ cluster_block_recovery_reconstruct(RelFileLocator rlocator, ForkNumber forknum,
 				aborted = true;
 			break;
 		}
+
+		/* PGRAC: spec-4.13 D4 scan cost (counted, never alters control flow). */
+		records_scanned++;
+		wal_bytes_scanned += record->xl_tot_len;
 
 		/*
 		 * Stop before applying any record that ENDS past the window: the
@@ -306,6 +314,13 @@ cluster_block_recovery_reconstruct(RelFileLocator rlocator, ForkNumber forknum,
 	XLogReaderFree(xlogreader);
 	pfree(private_data);
 
+	/* PGRAC: spec-4.13 D4 scan-cost observability (DEBUG1, no semantic effect). */
+	ereport(DEBUG1,
+			(errmsg_internal("online block recovery scan: rel=%u/%u/%u fork=%d block=%u "
+							 "records_scanned=" INT64_FORMAT " wal_bytes_scanned=" INT64_FORMAT,
+							 rlocator.spcOid, rlocator.dbOid, rlocator.relNumber, forknum, blocknum,
+							 records_scanned, wal_bytes_scanned)));
+
 	/* Fail closed on any uncertainty: never return a possibly-wrong page. */
 	if (aborted || !have_base)
 		return CLUSTER_BLKREC_UNRECOVERABLE;
@@ -334,6 +349,8 @@ cluster_block_recovery_on_read(struct SMgrRelationData *reln, ForkNumber forknum
 	XLogRecPtr lo;
 	XLogRecPtr hi;
 	PGAlignedBlock scratch;
+	instr_time rec_start; /* PGRAC: spec-4.13 D4 LOG-only latency */
+	instr_time rec_end;
 
 	if (!cluster_online_block_recovery)
 		return false;
@@ -359,11 +376,20 @@ cluster_block_recovery_on_read(struct SMgrRelationData *reln, ForkNumber forknum
 	if (!derive_window(&lo, &hi))
 		return false;
 
+	/* PGRAC: spec-4.13 D4 -- time the reconstruct+install (trigger->return). */
+	INSTR_TIME_SET_CURRENT(rec_start);
+
 	if (cluster_block_recovery_reconstruct(rlocator, forknum, blocknum, lo, hi, scratch.data)
 		!= CLUSTER_BLKREC_RECOVERED) {
 		/* attempted (passed all gates) but could not rebuild -> fail-closed */
 		if (cluster_block_recovery_shmem)
 			pg_atomic_fetch_add_u64(&cluster_block_recovery_shmem->recovery_failclosed, 1);
+		INSTR_TIME_SET_CURRENT(rec_end);
+		INSTR_TIME_SUBTRACT(rec_end, rec_start);
+		ereport(LOG, (errmsg("online block recovery: rel=%u/%u/%u fork=%d block=%u "
+							 "outcome=failclosed latency_us=" INT64_FORMAT,
+							 rlocator.spcOid, rlocator.dbOid, rlocator.relNumber, forknum, blocknum,
+							 INSTR_TIME_GET_MICROSEC(rec_end))));
 		return false;
 	}
 
@@ -386,6 +412,14 @@ cluster_block_recovery_on_read(struct SMgrRelationData *reln, ForkNumber forknum
 
 	if (cluster_block_recovery_shmem)
 		pg_atomic_fetch_add_u64(&cluster_block_recovery_shmem->blocks_recovered, 1);
+
+	/* PGRAC: spec-4.13 D4 -- emitted after the durable install completes. */
+	INSTR_TIME_SET_CURRENT(rec_end);
+	INSTR_TIME_SUBTRACT(rec_end, rec_start);
+	ereport(LOG, (errmsg("online block recovery: rel=%u/%u/%u fork=%d block=%u outcome=recovered "
+						 "latency_us=" INT64_FORMAT,
+						 rlocator.spcOid, rlocator.dbOid, rlocator.relNumber, forknum, blocknum,
+						 INSTR_TIME_GET_MICROSEC(rec_end))));
 	return true;
 }
 
