@@ -158,6 +158,16 @@ static const UBA InvalidUbaVal = InvalidUba_init;
  * §2.2).  NOT fsync'd (C10): durability comes from the WAL flush of whichever
  * record carries the delta; a crash before that flush leaves neither durable.
  *
+ * spec-4.8ab D3 durability-ordering contract:  the TT slot WAL is emitted
+ * BEFORE this byte-targeted write (cluster_tt_slot_durable_commit emits the 0x30
+ * first; the fold path inserts the commit-record delta first), and this write is
+ * NOT fsync'd.  So the commit_scn evidence is durable only via that WAL flush +
+ * redo re-stamp -- the on-disk block-0 bytes are never authoritative ahead of
+ * their WAL.  TT slots live in undo block 0, which is NOT poolable, so the
+ * checkpoint-writeback boundary (spec-4.8ab D1, cluster_undo_buf.c) does not
+ * cover them:  data blocks are flushed WAL-before-data by the pool, block 0 is
+ * WAL-redo-only here.  The two durability domains are disjoint by design.
+ *
  * spec-4.8 D7-A (P1#1): clearing first_undo_block here (and in durable_abort +
  * both redo APPLY paths) keeps the D7 physical-rollback invariant -- an ABORTED
  * slot carries a non-invalid chain head ONLY if XLOG_UNDO_TT_SLOT_SET_HEAD (0x90)

@@ -332,6 +332,18 @@ flush_dirty_slot(int slotno)
 	uint32 blk = 0;
 	bool need_write = false;
 
+	/*
+	 * spec-4.8ab D3:  the checkpoint-writeback boundary (D1) covers undo DATA
+	 * blocks only.  Block 0 (segment header + durable TT slots) is NOT poolable
+	 * (cluster_undo_buf_pin rejects block_no < FIRST_DATA_BLOCK), so it never
+	 * reaches this flush path -- its durability is a SEPARATE contract:  the TT
+	 * slot WAL (XLOG_UNDO_TT_SLOT_* / the folded commit-record delta) is emitted
+	 * before the slot's byte-targeted write, which is itself NOT fsync'd;  block
+	 * 0 becomes durable only via WAL redo re-stamp (cluster_tt_durable.c).  This
+	 * Assert pins that the pool only ever flushes data blocks.
+	 */
+	Assert(s->block_no >= CLUSTER_UNDO_BUF_FIRST_DATA_BLOCK);
+
 	LWLockAcquire(&s->content_lock, LW_EXCLUSIVE);
 	if (s->dirty) {
 		memcpy(localbuf.data, SLOT_DATA(slotno), BLCKSZ);
