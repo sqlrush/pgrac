@@ -522,8 +522,27 @@ cluster_undo_buf_pin(uint32 segment_id, uint8 owner, uint32 block_no, ClusterUnd
 		{
 			UndoBufSlot *s = &UndoBufSlots[slotno];
 
-			if (s->valid)
+			if (s->valid) {
+				/*
+				 * spec-4.8ab D2 evidence-preservation guard (8.A).  A valid slot
+				 * is about to be repurposed for a different block;  its own undo
+				 * image MUST already be durable.  The dirty-victim path above
+				 * flushes (WAL-before-data) and re-loops, so a slot reaching here
+				 * is clean -- if it were still dirty we would drop undo evidence
+				 * (an ITL slot's companion image / a CR pre-version) that is not
+				 * yet on disk, and a later reader / recovery would read a stale
+				 * block -> false-visible.  Fail-closed rather than evict it.  A
+				 * real runtime guard (L214), defensive over the structural
+				 * flush-re-loop -- mirrors cluster_undo_buf_invalidate_segment's
+				 * "must not drop a live slot" PANIC.
+				 */
+				if (s->dirty) {
+					LWLockRelease(&UndoBufPool->map_lock);
+					cluster_undo_boundary_violation("evidence eviction", s->last_wal_lsn,
+													InvalidXLogRecPtr);
+				}
 				pg_atomic_fetch_add_u64(&UndoBufPool->evict_count, 1);
+			}
 
 			s->segment_id = segment_id;
 			s->owner = owner;

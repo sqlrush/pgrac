@@ -208,6 +208,7 @@ volatile uint32 CritSectionCount = 0;
 /* ----- smgr stubs:  capture writes, replay reads with a per-block marker ----- */
 static int smgr_read_calls = 0;
 static int smgr_write_calls = 0;
+static int smgr_fsync_write_calls = 0; /* spec-4.8ab D2: write-back flush (do_fsync) */
 static bool smgr_last_write_fsync = true;
 static uint32 smgr_last_write_block = 0;
 static char smgr_last_write_byte0 = 0;
@@ -228,6 +229,8 @@ cluster_undo_smgr_write_block(uint32 segment_id pg_attribute_unused(),
 							  const char *buf, bool do_fsync)
 {
 	smgr_write_calls++;
+	if (do_fsync)
+		smgr_fsync_write_calls++;
 	smgr_last_write_fsync = do_fsync;
 	smgr_last_write_block = block_no;
 	smgr_last_write_byte0 = buf[0];
@@ -240,14 +243,16 @@ void
 XLogFlush(XLogRecPtr record pg_attribute_unused())
 {}
 
-/* GetFlushRecPtr stub: spec-4.8ab D1 flush_dirty_slot's WAL-before-data guard
- * calls it, but write-back is gated off in U1-U9 so the flush path never runs. */
+/* GetFlushRecPtr stub: flush_dirty_slot's WAL-before-data guard (spec-4.8ab D1)
+ * compares the block's protecting LSN against this durable bound.  The D2
+ * dirty-eviction test marks blocks with small LSNs, so return a high bound to
+ * model "WAL already durable" -- the guard passes and the flush proceeds. */
 XLogRecPtr
 GetFlushRecPtr(TimeLineID *insertTLI)
 {
 	if (insertTLI)
 		*insertTLI = 0;
-	return InvalidXLogRecPtr;
+	return (XLogRecPtr)UINT64CONST(0x7FFFFFFFFFFFFFFF);
 }
 
 /* GetRedoRecPtr stub: spec-4.8ab D1 flush_all's checkpoint-coverage re-scan
@@ -266,7 +271,7 @@ fresh_pool(void)
 		free(shmem_buf);
 		shmem_buf = NULL;
 	}
-	smgr_read_calls = smgr_write_calls = 0;
+	smgr_read_calls = smgr_write_calls = smgr_fsync_write_calls = 0;
 	smgr_last_write_fsync = true;
 	cluster_undo_buf_shmem_init();
 }
@@ -480,6 +485,55 @@ UT_TEST(test_undo_boundary_checkpoint_coverage)
 }
 
 
+/* ===== D2 (spec-4.8ab) — dirty undo evidence is durable before eviction =====
+ *
+ *	Locks in the evidence-preservation invariant: under write-back, a dirty undo
+ *	block's image MUST be flushed (WAL-before-data + fsync) before its pool slot
+ *	is reused for a different block.  Otherwise eviction would drop undo evidence
+ *	(an ITL companion image / a CR pre-version) not yet on disk -> false-visible.
+ */
+UT_TEST(test_undo_buf_dirty_evict_flushes_before_reuse)
+{
+	ClusterUndoBufPin pin;
+	char *img;
+
+	fresh_pool();						  /* cluster_undo_buffers = 4 */
+	cluster_undo_buffer_writeback = true; /* D2b write-back */
+	ClusterConfShmem = NULL;			  /* single-node -> write-back active */
+
+	/* Fill all 4 slots with DIRTY blocks (write-back buffers, no flush yet). */
+	for (uint32 b = 1; b <= 4; b++) {
+		img = cluster_undo_buf_pin(1, 0, b, CLUSTER_UNDO_BUF_EXCLUSIVE, &pin);
+		UT_ASSERT_NOT_NULL(img);
+		img[0] = (char)b;
+		cluster_undo_buf_mark_dirty(&pin, (XLogRecPtr)(100 + b)); /* monotone valid */
+		cluster_undo_buf_unpin(&pin);
+	}
+	UT_ASSERT_EQ((int)cluster_undo_buf_get_writethrough_count(),
+				 0);						 /* buffered, not write-through */
+	UT_ASSERT_EQ(smgr_fsync_write_calls, 0); /* nothing flushed yet */
+
+	/* A 5th distinct block forces eviction of a DIRTY victim: it MUST be
+	 * flushed + fsync'd before its slot is reused (the D2 invariant), and the
+	 * D2 reuse guard must NOT fire (the slot is clean after the flush). */
+	img = cluster_undo_buf_pin(1, 0, 99, CLUSTER_UNDO_BUF_EXCLUSIVE, &pin);
+	UT_ASSERT_NOT_NULL(img);
+	UT_ASSERT_EQ((int)(unsigned char)img[0], 99);
+	/*
+	 * At least one dirty victim was flushed before reuse (the clock sweep may
+	 * flush several -- over-flush is safe).  The invariant: EVERY write-back was
+	 * fsync'd (WAL-before-data + durable), so no dirty block's evidence was
+	 * dropped on eviction, and the D2 reuse guard never fired.
+	 */
+	UT_ASSERT_EQ(cluster_undo_buf_get_writeback_count() >= 1 ? 1 : 0, 1);
+	UT_ASSERT_EQ((int)cluster_undo_buf_get_writeback_count(), smgr_fsync_write_calls);
+	UT_ASSERT_EQ(cluster_undo_buf_get_evict_count() >= 1 ? 1 : 0, 1);
+	cluster_undo_buf_unpin(&pin);
+
+	cluster_undo_buffer_writeback = false; /* restore default for later tests */
+}
+
+
 int
 main(void)
 {
@@ -492,5 +546,6 @@ main(void)
 	UT_RUN(test_undo_buf_evicts_when_full);
 	UT_RUN(test_undo_boundary_wal_before_data);
 	UT_RUN(test_undo_boundary_checkpoint_coverage);
+	UT_RUN(test_undo_buf_dirty_evict_flushes_before_reuse);
 	UT_DONE();
 }

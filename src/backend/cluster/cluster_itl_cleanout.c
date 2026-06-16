@@ -138,6 +138,17 @@ cluster_itl_cleanout_lazy(Buffer buf, uint8 slot_idx, TransactionId expected_xid
 	 * though PG may still emit a hint FPI under checksums / wal_log_hints.
 	 * If the buffer is evicted before flush, the hint is lost; the next
 	 * reader will re-resolve via the TT status overlay.
+	 *
+	 * spec-4.8ab D2 evidence-preservation contract:  this ITL commit_scn stamp
+	 * is a HINT, not the authoritative commit evidence.  Losing it on eviction
+	 * (or a checkpoint racing this stamp) is SAFE -- the reader re-derives the
+	 * commit_scn from the authoritative evidence: the TT slot commit_scn plus
+	 * the undo image (UBA chain).  That authoritative evidence is preserved
+	 * across checkpoint write-back by the undo buffer pool, which (a) flushes a
+	 * dirty undo block WAL-before-data before reusing its slot and (b) keeps a
+	 * recyclable segment's slots un-droppable while pinned
+	 * (cluster_undo_buf.c).  So an ITL hint lost to eviction never produces a
+	 * false-visible result;  it only costs a one-time overlay re-resolve.
 	 */
 	MarkBufferDirtyHint(buf, true);
 
