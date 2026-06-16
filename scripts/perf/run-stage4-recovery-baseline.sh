@@ -316,6 +316,24 @@ run_cold_recovery() {
 	skip_recov "P0-11-cold" "cold recovery / k-way merge startup time needs crash-restart + run-sharedfs-bench.sh merged-recovery driver (D6, dedicated runner)"
 }
 
+# Real 2-node steady-state bands (P0-1 / P0-2) come from the ClusterPair Perl
+# runner — bash cannot drive ClusterPair.  Emits its own JSON artifact
+# (perf-stage4-2node-<TS>.json) alongside the single-node bands here.  Needs the
+# PG TAP perl env (PERL5LIB / PG_REGRESS / TESTDATADIR) in the environment; the
+# perf workflow sets that, as does a local invocation.
+run_2node_perl() {  # $1 = bands selector (all|steady|toggles)
+	local runner
+	runner="$(dirname "$0")/run-stage4-2node-steady.pl"
+	[ -f "$runner" ] || { log "WARN 2-node perl runner missing: $runner"; return 0; }
+	log "nodes=2: delegating $1 bands to run-stage4-2node-steady.pl (ClusterPair)"
+	PGRAC_ENABLE_INSTALL="$EN" perl "$runner" \
+		--enable-install="$EN" --results-dir="$RESULTS_DIR" \
+		--timestamp="$TS" --commit="$COMMIT" --scale="$SCALE" \
+		--duration="$DUR" --reps="$REPS" --bands="$1" >>"$RAW_LOG" 2>&1 \
+		|| log "WARN 2-node perl runner exited non-zero (see raw log)"
+	log "2-node JSON: $RESULTS_DIR/perf-stage4-2node-$TS.json"
+}
+
 # ---- provenance + dispatch --------------------------------------------------
 EN_BUILD=$(cassert_guard "$EN")
 DIS_BUILD=$(cassert_guard "$DIS")
@@ -324,17 +342,25 @@ OS=$(uname -s); ARCH=$(uname -m); CPU=$(uname -srm)
 
 log "spec-4.13 D1  tier=$TIER bands=$BANDS nodes=$NODES scale=$SCALE dur=${DUR}s reps=$REPS  commit=$COMMIT  $CPU"
 log "enable=$EN ($EN_BUILD)  disable=$DIS ($DIS_BUILD)"
-[ "$NODES" = 1 ] || log "WARN nodes=$NODES requested; D1 single-node only — 2-node steady (P0-1) + recovery bands route through ClusterPair/dedicated (D2+)"
-
+# Single-node bands always run here (they are single-node by construction); when
+# nodes=2 the real 2-node P0-1/P0-2 bands are additionally delegated to the
+# ClusterPair Perl runner (separate JSON artifact).
 case "$BANDS" in
 	all)     run_steady; run_toggles; run_fence; run_block_recovery; run_thread_recovery; run_cold_recovery ;;
 	steady)  run_steady ;;
 	toggles) run_toggles ;;
-	fence)   run_steady; run_fence ;;   # fence in-path tax references native steady baseline
+	fence)   run_steady; run_fence ;;   # fence in-path tax references cluster-on steady baseline
 	block)   run_block_recovery ;;
 	thread)  run_thread_recovery ;;
 	cold)    run_cold_recovery ;;
 esac
+
+if [ "$NODES" = 2 ]; then
+	case "$BANDS" in
+		all|steady|toggles) run_2node_perl "$BANDS" ;;
+		*) log "nodes=2 with bands=$BANDS: no 2-node delegation (single-node band)" ;;
+	esac
+fi
 
 # ---- emit JSON --------------------------------------------------------------
 # join objects passed as "$@" into indented comma-separated JSON lines
