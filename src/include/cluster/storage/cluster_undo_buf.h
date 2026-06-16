@@ -128,6 +128,26 @@ extern void cluster_undo_buf_invalidate_segment(uint32 segment_id, uint8 owner);
  */
 extern bool cluster_undo_buf_writeback_allowed(void);
 
+/*
+ * spec-4.8ab D1 -- checkpoint-writeback boundary predicates + fail-closed
+ * helper.  The two predicates are pure (LSN comparisons only) so the boundary
+ * logic is unit-testable;  the violation helper fail-closes (8.A) and never
+ * returns.  See cluster_undo_buf.c for the full contract.
+ *
+ *	wal_before_data_holds(block_lsn, flushed_lsn)
+ *	    true iff block_lsn is durable (<= flushed_lsn) -- safe to write back.
+ *	checkpoint_coverage_violation(block_lsn, checkpoint_redo)
+ *	    true iff a leftover dirty block is PRE-redo (lost on recovery).  NB:
+ *	    this is NOT "block_lsn > redo" -- a post-redo block is replayed.
+ *	boundary_violation(what, block_lsn, flushed_or_redo)
+ *	    fail-closed:  PANIC in a critical section, else ERROR 53R9N.
+ */
+extern bool cluster_undo_wal_before_data_holds(XLogRecPtr block_lsn, XLogRecPtr flushed_lsn);
+extern bool cluster_undo_checkpoint_coverage_violation(XLogRecPtr block_lsn,
+													   XLogRecPtr checkpoint_redo);
+extern void cluster_undo_boundary_violation(const char *what, XLogRecPtr block_lsn,
+											XLogRecPtr flushed_or_redo) pg_attribute_noreturn();
+
 /* ----- observability counters (dump_undo / pg_stat_cluster_undo) ----- */
 extern uint64 cluster_undo_buf_get_hit_count(void);
 extern uint64 cluster_undo_buf_get_miss_count(void);

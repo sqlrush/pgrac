@@ -122,6 +122,20 @@ void
 cluster_shmem_register_region(const ClusterShmemRegion *region pg_attribute_unused())
 {}
 
+/* spec-4.8ab D1 -- flush_dirty_slot / flush_all reference the injection skip
+ * API (CLUSTER_INJECTION_POINT macro + should_skip) for the L3a/L3b boundary
+ * tests;  U1-U9 never arm a point.  armed_count = 0 keeps the macro on its fast
+ * path (run is never called), and should_skip always reports "not armed". */
+int cluster_injection_armed_count = 0;
+void
+cluster_injection_run(const char *name pg_attribute_unused())
+{}
+bool
+cluster_injection_should_skip(const char *name pg_attribute_unused())
+{
+	return false;
+}
+
 /* ----- Size arithmetic (real ones overflow-check; stubs suffice here) ----- */
 Size
 add_size(Size s1, Size s2)
@@ -177,6 +191,19 @@ errhint(const char *fmt pg_attribute_unused(), ...)
 {
 	return 0;
 }
+int
+errdetail(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+/*
+ * spec-4.8ab D1 -- cluster_undo_boundary_violation() reads CritSectionCount to
+ * choose PANIC vs ERROR.  The U1-U9 tests never reach the fail-closed helper
+ * (write-back gated off / pure predicates), so a file-static fake resolves the
+ * link.  The boundary helper's fail-closed behaviour is covered by TAP injection.
+ */
+volatile uint32 CritSectionCount = 0;
 
 /* ----- smgr stubs:  capture writes, replay reads with a per-block marker ----- */
 static int smgr_read_calls = 0;
@@ -212,6 +239,24 @@ cluster_undo_smgr_write_block(uint32 segment_id pg_attribute_unused(),
 void
 XLogFlush(XLogRecPtr record pg_attribute_unused())
 {}
+
+/* GetFlushRecPtr stub: spec-4.8ab D1 flush_dirty_slot's WAL-before-data guard
+ * calls it, but write-back is gated off in U1-U9 so the flush path never runs. */
+XLogRecPtr
+GetFlushRecPtr(TimeLineID *insertTLI)
+{
+	if (insertTLI)
+		*insertTLI = 0;
+	return InvalidXLogRecPtr;
+}
+
+/* GetRedoRecPtr stub: spec-4.8ab D1 flush_all's checkpoint-coverage re-scan
+ * reads it, but U1-U9 never call flush_all so the value is unused. */
+XLogRecPtr
+GetRedoRecPtr(void)
+{
+	return InvalidXLogRecPtr;
+}
 
 /* Re-init the pool fresh for a test (forces a new malloc'd region). */
 static void
@@ -395,6 +440,46 @@ UT_TEST(test_undo_buf_invalidate_segment)
 }
 
 
+/* ===== D1 (spec-4.8ab) — WAL-before-data pure predicate ===== */
+UT_TEST(test_undo_boundary_wal_before_data)
+{
+	XLogRecPtr flushed = 5000;
+
+	/* WAL strictly below the durable bound -> safe to write the block back. */
+	UT_ASSERT_EQ((int)cluster_undo_wal_before_data_holds(4999, flushed), 1);
+	/* WAL exactly at the durable bound -> safe (block's WAL is durable). */
+	UT_ASSERT_EQ((int)cluster_undo_wal_before_data_holds(5000, flushed), 1);
+	/* WAL beyond the durable bound -> NOT safe: writing it would put an
+	 * undo block on disk whose protecting WAL is not durable (torn/lost). */
+	UT_ASSERT_EQ((int)cluster_undo_wal_before_data_holds(5001, flushed), 0);
+	/* Invalid block_lsn (no protecting WAL at all) -> fail-closed, NOT safe. */
+	UT_ASSERT_EQ((int)cluster_undo_wal_before_data_holds(InvalidXLogRecPtr, flushed), 0);
+}
+
+
+/* ===== D1 (spec-4.8ab) — checkpoint-coverage pure predicate =====
+ *
+ *	Pins the v0.3-amend discipline: the guard is NOT "block_lsn > redo".  Only a
+ *	PRE-redo dirty block left unflushed is a violation (recovery starts at redo
+ *	and never replays it);  a POST-redo dirty block is replayed from WAL and is
+ *	perfectly legal.
+ */
+UT_TEST(test_undo_boundary_checkpoint_coverage)
+{
+	XLogRecPtr redo = 5000;
+
+	/* PRE-redo dirty block left unflushed -> VIOLATION (lost on recovery). */
+	UT_ASSERT_EQ((int)cluster_undo_checkpoint_coverage_violation(4999, redo), 1);
+	/* AT the redo boundary -> NOT a violation (recovery replays from redo). */
+	UT_ASSERT_EQ((int)cluster_undo_checkpoint_coverage_violation(5000, redo), 0);
+	/* POST-redo dirty block -> NOT a violation (replayed from WAL).  This is
+	 * the exact case the guard must NOT flag (do not write block_lsn > redo). */
+	UT_ASSERT_EQ((int)cluster_undo_checkpoint_coverage_violation(5001, redo), 0);
+	/* Invalid block_lsn -> nothing durable to lose -> NOT a violation. */
+	UT_ASSERT_EQ((int)cluster_undo_checkpoint_coverage_violation(InvalidXLogRecPtr, redo), 0);
+}
+
+
 int
 main(void)
 {
@@ -405,5 +490,7 @@ main(void)
 	UT_RUN(test_undo_buf_miss_then_hit);
 	UT_RUN(test_undo_buf_write_through);
 	UT_RUN(test_undo_buf_evicts_when_full);
+	UT_RUN(test_undo_boundary_wal_before_data);
+	UT_RUN(test_undo_boundary_checkpoint_coverage);
 	UT_DONE();
 }

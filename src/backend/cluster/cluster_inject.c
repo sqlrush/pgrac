@@ -486,6 +486,21 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 *	  (spec-0.27 §3.6): arm and drive in the SAME session.
 	 */
 	{ .name = "cluster-thread-recovery-drive" },
+	/*
+	 * spec-4.8ab D1 (2 NEW points) — undo checkpoint-writeback boundary guards.
+	 *
+	 *	undo-force-wal-before-data-violation:
+	 *	  SKIP fault inside flush_dirty_slot.  When armed, the WAL-before-data
+	 *	  guard sees the block's protecting LSN one byte past the durable bound
+	 *	  and fail-closes (53R9N) -- proves the guard fires (L3a).
+	 *	undo-skip-checkpoint-flush-one:
+	 *	  SKIP fault inside cluster_undo_buf_flush_all.  When armed, exactly one
+	 *	  dirty block is left unflushed so the checkpoint-coverage re-scan detects
+	 *	  a PRE-redo escapee and fail-closes (53R9N) -- proves the coverage guard
+	 *	  fires (L3b).  Both one-shot (should_skip consumes the arm).
+	 */
+	{ .name = "undo-force-wal-before-data-violation" },
+	{ .name = "undo-skip-checkpoint-flush-one" },
 };
 
 #define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_points)

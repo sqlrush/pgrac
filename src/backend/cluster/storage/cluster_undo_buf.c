@@ -47,8 +47,9 @@
 
 #include "postgres.h"
 
-#include "access/xlog.h"		  /* XLogFlush — WAL-before-data on write-back (D2b) */
-#include "cluster/cluster_conf.h" /* cluster_conf_has_peers — single-node gate (D2b) */
+#include "access/xlog.h"			/* XLogFlush — WAL-before-data on write-back (D2b) */
+#include "cluster/cluster_conf.h"	/* cluster_conf_has_peers — single-node gate (D2b) */
+#include "cluster/cluster_inject.h" /* spec-4.8ab D1 boundary-guard injection points */
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/storage/cluster_undo_buf.h"
@@ -122,6 +123,70 @@ bool
 cluster_undo_buf_writeback_allowed(void)
 {
 	return UndoBufPool != NULL && cluster_undo_buffer_writeback && !cluster_conf_has_peers();
+}
+
+
+/*
+ * cluster_undo_wal_before_data_holds -- spec-4.8ab D1 WAL-before-data predicate.
+ *
+ *	True iff a dirty undo block protected by block_lsn is durable-safe to write
+ *	back:  its XLOG_UNDO_BLOCK_WRITE is durable (block_lsn <= flushed_lsn).  An
+ *	invalid block_lsn means the block carries no protecting WAL on disk, so
+ *	writing it back is never safe -> false (fail-closed, 8.A).  Pure (no globals)
+ *	so the durability comparison is unit-testable in isolation.
+ */
+bool
+cluster_undo_wal_before_data_holds(XLogRecPtr block_lsn, XLogRecPtr flushed_lsn)
+{
+	if (XLogRecPtrIsInvalid(block_lsn))
+		return false;
+	return block_lsn <= flushed_lsn;
+}
+
+
+/*
+ * cluster_undo_checkpoint_coverage_violation -- spec-4.8ab D1 checkpoint-
+ *	coverage predicate.  True iff a dirty undo block left unflushed at checkpoint
+ *	completion is a data-loss VIOLATION:  it is PRE-redo (block_lsn <
+ *	checkpoint_redo), so recovery starts at redo and never replays its WAL ->
+ *	lost.  A POST-redo dirty block (block_lsn >= redo) is replayed from WAL by
+ *	recovery and is legal, NOT a violation.
+ *
+ *	DISCIPLINE (spec-4.8ab v0.3 amend):  the guard is NOT "block_lsn > redo".
+ *	Writing it that way would falsely flag every legal post-redo dirty block.
+ *	An invalid block_lsn has nothing durable to lose -> not a violation.
+ */
+bool
+cluster_undo_checkpoint_coverage_violation(XLogRecPtr block_lsn, XLogRecPtr checkpoint_redo)
+{
+	if (XLogRecPtrIsInvalid(block_lsn))
+		return false;
+	return block_lsn < checkpoint_redo;
+}
+
+
+/*
+ * cluster_undo_boundary_violation -- spec-4.8ab D1 fail-closed on a detected
+ *	checkpoint-writeback boundary violation (8.A).  Never silent, never returns.
+ *
+ *	Inside a critical section a thrown ERROR would already promote to PANIC;  be
+ *	explicit so the log records a boundary violation rather than a generic "ERROR
+ *	inside critical section".  This is the HARD-corruption layer: it is NOT gated
+ *	by cluster.undo_writeback_boundary_check (that GUC only controls the advisory
+ *	layer -- see §3.1).  block_lsn is the offending undo block's protecting LSN;
+ *	flushed_or_redo is the durable-flush bound (WAL-before-data) or the checkpoint
+ *	redo point (checkpoint-coverage) it violated.
+ */
+void
+cluster_undo_boundary_violation(const char *what, XLogRecPtr block_lsn, XLogRecPtr flushed_or_redo)
+{
+	int elevel = (CritSectionCount > 0) ? PANIC : ERROR;
+
+	ereport(elevel, (errcode(ERRCODE_CLUSTER_UNDO_WRITEBACK_BOUNDARY_VIOLATION),
+					 errmsg("cluster undo checkpoint-writeback boundary violation: %s", what),
+					 errdetail("undo block LSN %X/%X is past the durable/redo bound %X/%X",
+							   LSN_FORMAT_ARGS(block_lsn), LSN_FORMAT_ARGS(flushed_or_redo))));
+	pg_unreachable();
 }
 
 
@@ -261,6 +326,7 @@ flush_dirty_slot(int slotno)
 	UndoBufSlot *s = &UndoBufSlots[slotno];
 	PGAlignedBlock localbuf;
 	XLogRecPtr flushed_lsn = InvalidXLogRecPtr;
+	XLogRecPtr durable_lsn;
 	uint32 seg = 0;
 	uint8 owner = 0;
 	uint32 blk = 0;
@@ -280,6 +346,32 @@ flush_dirty_slot(int slotno)
 		return;
 
 	XLogFlush(flushed_lsn); /* WAL-before-data (XLogFlush carries its own wait event) */
+
+	/*
+	 * spec-4.8ab D1:  explicit WAL-before-data boundary guard (8.A, a real
+	 * runtime check -- NOT Assert, L214).  After XLogFlush the block's protecting
+	 * LSN MUST be durable;  if GetFlushRecPtr() has not reached flushed_lsn the
+	 * durability ordering was broken (a missing / wrong XLogFlush), and writing
+	 * the block now would put an undo image on disk whose WAL is not durable ->
+	 * torn / lost on crash.  Fail-closed (53R9N) rather than write it.  This is
+	 * the hard-corruption layer (unconditional, not GUC-gated -- §3.1).
+	 */
+	durable_lsn = GetFlushRecPtr(NULL);
+
+	/*
+	 * spec-4.8ab D1 L3a injection: deterministically force a WAL-before-data
+	 * violation (pretend the durable bound is one byte below the block's
+	 * protecting LSN) so the guard below fail-closes.  One-shot.  The
+	 * INJECTION_POINT macro dispatches the armed SKIP (sets the pending flag);
+	 * should_skip then consumes it.
+	 */
+	CLUSTER_INJECTION_POINT("undo-force-wal-before-data-violation");
+	if (!XLogRecPtrIsInvalid(flushed_lsn)
+		&& cluster_injection_should_skip("undo-force-wal-before-data-violation"))
+		durable_lsn = flushed_lsn - 1;
+
+	if (!cluster_undo_wal_before_data_holds(flushed_lsn, durable_lsn))
+		cluster_undo_boundary_violation("write-back flush", flushed_lsn, durable_lsn);
 
 	/*
 	 * PGRAC (spec-3.18 D7): attribute the write-back data-file I/O (pwrite +
@@ -584,7 +676,6 @@ cluster_undo_buf_flush_all(bool is_checkpoint)
 	 * concurrent re-dirty after we clear sets dirty again -> next checkpoint
 	 * flushes it.
 	 */
-	(void)is_checkpoint;
 	for (int i = 0; i < UndoBufPool->nslots; i++) {
 		UndoBufSlot *s = &UndoBufSlots[i];
 		bool pinned = false;
@@ -598,6 +689,19 @@ cluster_undo_buf_flush_all(bool is_checkpoint)
 		if (!pinned)
 			continue;
 
+		/*
+		 * spec-4.8ab D1 L3b injection: deterministically skip flushing ONE
+		 * dirty block (leave it buffered-dirty) so the checkpoint-coverage
+		 * re-scan below detects a PRE-redo block that escaped the flush and
+		 * fail-closes.  One-shot.  The INJECTION_POINT macro dispatches the
+		 * armed SKIP (sets the pending flag);  should_skip then consumes it.
+		 */
+		CLUSTER_INJECTION_POINT("undo-skip-checkpoint-flush-one");
+		if (cluster_injection_should_skip("undo-skip-checkpoint-flush-one")) {
+			pg_atomic_fetch_sub_u32(&s->pincount, 1);
+			continue;
+		}
+
 		PG_TRY();
 		{
 			flush_dirty_slot(i);
@@ -607,6 +711,38 @@ cluster_undo_buf_flush_all(bool is_checkpoint)
 			pg_atomic_fetch_sub_u32(&s->pincount, 1);
 		}
 		PG_END_TRY();
+	}
+
+	/*
+	 * spec-4.8ab D1 checkpoint-coverage boundary guard (8.A).  At checkpoint
+	 * completion NO pre-redo dirty undo block may remain:  such a block escaped
+	 * the flush (a DELAY_CHKPT_START regression / injected skip) and would be
+	 * lost on recovery (redo starts at the redo point and never replays its
+	 * WAL).  A POST-redo dirty block is legal (a backend writing undo
+	 * concurrently;  redo replays it) and is NOT flagged -- the guard is
+	 * cluster_undo_checkpoint_coverage_violation, NOT block_lsn > redo (v0.3
+	 * amend).  Read last_wal_lsn under the content lock so the 64-bit LSN is
+	 * never torn (a torn low value could false-fire).  Once per checkpoint --
+	 * not a hot path.
+	 */
+	if (is_checkpoint) {
+		XLogRecPtr redo = GetRedoRecPtr();
+
+		for (int i = 0; i < UndoBufPool->nslots; i++) {
+			UndoBufSlot *s = &UndoBufSlots[i];
+			XLogRecPtr blk_lsn = InvalidXLogRecPtr;
+			bool dirty = false;
+
+			LWLockAcquire(&s->content_lock, LW_SHARED);
+			if (s->valid && s->dirty) {
+				dirty = true;
+				blk_lsn = s->last_wal_lsn;
+			}
+			LWLockRelease(&s->content_lock);
+
+			if (dirty && cluster_undo_checkpoint_coverage_violation(blk_lsn, redo))
+				cluster_undo_boundary_violation("checkpoint coverage", blk_lsn, redo);
+		}
 	}
 }
 

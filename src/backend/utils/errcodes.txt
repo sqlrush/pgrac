@@ -696,6 +696,17 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 53R9L    E    ERRCODE_CLUSTER_GCS_BLOCK_RESOURCE_RECOVERING                    cluster_gcs_block_resource_recovering
 53R9M    E    ERRCODE_CLUSTER_GCS_BLOCK_BEFORE_REDO_BOUNDARY                   cluster_gcs_block_before_redo_boundary
 
+# spec-4.8ab D1:  undo/TT/ITL checkpoint-writeback boundary contract.  A
+# detected boundary violation fail-closes here (8.A) — PANIC inside a critical
+# section, else this ERROR;  never silent.  The data-loss violations are
+# WAL-before-data (an undo block written back with block_lsn > the durable
+# flush LSN) and checkpoint-coverage (a PRE-redo dirty undo block left
+# unflushed at checkpoint completion — recovery starts at redo and would not
+# replay it).  NB: block_lsn > redo is NOT a violation (recovery replays a
+# post-redo block from WAL).  53R9H is already CROSS_NODE_WRITE_CONFLICT and
+# 53R9A..M are allocated, so N is the next free slot in the 53R9 family.
+53R9N    E    ERRCODE_CLUSTER_UNDO_WRITEBACK_BOUNDARY_VIOLATION                cluster_undo_writeback_boundary_violation
+
 # spec-4.1 D7:  per-thread WAL routing startup validation (53RA0+ opens
 # the Stage-4 WAL/recovery band; 53R70/71 belong to GES).  53RA0 fires
 # at postmaster startup when cluster.wal_threads_dir is configured but
