@@ -184,8 +184,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '125',
-   'L11 pg_stat_cluster_injections is 125 (spec-4.11 +1 cluster-thread-recovery-drive)');
+   '127',
+   'L11 pg_stat_cluster_injections is 127 (spec-4.8ab +2 undo boundary guards)');
 
 
 # ----------
