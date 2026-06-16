@@ -256,7 +256,8 @@ UT_TEST(test_undo_4_8ab_redo_determinism_converges)
 	char s0[BLCKSZ], forward[BLCKSZ], reapply[BLCKSZ], fpi_once[BLCKSZ], fpi_twice[BLCKSZ];
 	xl_undo_block_write d1, d2;
 	char body1[UNDO_BLOCK_HDR_PREFIX_LEN + 64 + sizeof(UndoSlotDirEntry)];
-	char body2[UNDO_BLOCK_HDR_PREFIX_LEN + 32 + sizeof(UndoSlotDirEntry)];
+	char body2[UNDO_BLOCK_HDR_PREFIX_LEN + 64
+			   + sizeof(UndoSlotDirEntry)]; /* fits both 32B + 64B records */
 
 	/* --- FPI half: applying the same full-page image twice is byte-identical --- */
 	memset(s0, 0xAB, BLCKSZ);
@@ -304,6 +305,26 @@ UT_TEST(test_undo_4_8ab_redo_determinism_converges)
 
 	/* Sanity: the deltas actually changed the block (not a no-op convergence). */
 	UT_ASSERT_EQ(memcmp(forward, s0, BLCKSZ) != 0 ? 1 : 0, 1);
+
+	/* OVERLAPPING ranges: d2's record [380,420) overlaps d1's [200,264)?  No --
+	 * make them genuinely overlap so the "last writer per range wins" claim is
+	 * pinned for the hard case too (each memcpy is a pure function of its body,
+	 * so the higher-LSN record's bytes win on re-apply regardless of overlap). */
+	d2.rec_off = 240; /* overlaps d1's record [200,264) on [240,264) */
+	d2.rec_len = 64;  /* [240,304) */
+	memset(body2, 0x77, UNDO_BLOCK_HDR_PREFIX_LEN);
+	memset(body2 + UNDO_BLOCK_HDR_PREFIX_LEN, 0x55, 64);
+	memset(body2 + UNDO_BLOCK_HDR_PREFIX_LEN + 64, 0x66, sizeof(UndoSlotDirEntry));
+
+	memcpy(forward, s0, BLCKSZ);
+	cluster_undo_apply_block_write_delta(forward, &d1, body1, (XLogRecPtr)0x200);
+	cluster_undo_apply_block_write_delta(forward, &d2, body2, (XLogRecPtr)0x300);
+	memcpy(reapply, forward, BLCKSZ);
+	cluster_undo_apply_block_write_delta(reapply, &d1, body1, (XLogRecPtr)0x200);
+	cluster_undo_apply_block_write_delta(reapply, &d2, body2, (XLogRecPtr)0x300);
+	UT_ASSERT_EQ(memcmp(reapply, forward, BLCKSZ), 0); /* overlapping convergence */
+	/* The overlap [240,264) is the higher-LSN (d2) record's 0x55, not d1's 0x33. */
+	UT_ASSERT_EQ((int)(unsigned char)forward[250], 0x55);
 }
 
 
