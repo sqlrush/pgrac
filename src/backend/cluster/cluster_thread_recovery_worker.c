@@ -54,6 +54,7 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "miscadmin.h"
+#include "portability/instr_time.h" /* PGRAC: spec-4.13 D5 LOG-only latency */
 #include "postmaster/bgworker.h"
 #include "storage/ipc.h"
 
@@ -107,6 +108,8 @@ cluster_thread_recovery_worker_run(uint16 dead_tid)
 	ClusterThreadRecReplayState state;
 	uint64 launch_epoch;
 	ClusterThreadRecResult res;
+	instr_time t_total_start; /* PGRAC: spec-4.13 D5 LOG-only total latency */
+	instr_time t_total_end;
 
 	/* The launch must have marked the slot REPLAYING; anything else means this
 	 * spawn raced a reset or a newer launch -> moot (do not touch the slot). */
@@ -122,7 +125,16 @@ cluster_thread_recovery_worker_run(uint16 dead_tid)
 													cluster_grd_redeclare_episode_epoch()))
 		return CLUSTER_THREADREC_NOT_APPLICABLE;
 
+	INSTR_TIME_SET_CURRENT(t_total_start); /* PGRAC: spec-4.13 D5 total latency start */
 	res = cluster_thread_recovery_replay_one(dead_tid, launch_epoch);
+	INSTR_TIME_SET_CURRENT(t_total_end);
+	INSTR_TIME_SUBTRACT(t_total_end, t_total_start);
+	ereport(LOG,
+			(errmsg("cluster thread recovery: tid=%u outcome=%s total_us=" INT64_FORMAT, dead_tid,
+					res == CLUSTER_THREADREC_DONE	   ? "DONE"
+					: res == CLUSTER_THREADREC_BLOCKED ? "BLOCKED"
+													   : "NOT_APPLICABLE",
+					INSTR_TIME_GET_MICROSEC(t_total_end))));
 
 	/* L235 AFTER: if the episode advanced DURING the replay, do not write the
 	 * terminal state -- the new episode owns the slot now.  Any authority

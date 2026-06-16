@@ -68,7 +68,8 @@
 #include "utils/errcodes.h"	  /* ERRCODE_FEATURE_NOT_SUPPORTED (D7 gate)     */
 #include "utils/wait_event.h" /* WAIT_EVENT_CLUSTER_THREAD_RECOVERY (D5)      */
 
-#include "port/atomics.h" /* replay-slot atomics + barriers (3b-4b)      */
+#include "port/atomics.h"			/* replay-slot atomics + barriers (3b-4b)      */
+#include "portability/instr_time.h" /* PGRAC: spec-4.13 D5 LOG-only latency        */
 
 #include "cluster/cluster_conf.h"			   /* node_count / has_peers (scope gate)        */
 #include "cluster/cluster_elog.h"			   /* ERRCODE_CLUSTER_THREAD_RECOVERY_BLOCKED     */
@@ -298,6 +299,12 @@ cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower
 	ClusterThreadRecResult drive_res;
 	ClusterThreadRecResult result;
 	MemoryContext caller_ctx = CurrentMemoryContext;
+	/* PGRAC: spec-4.13 D5 LOG-only phase timing (no semantic effect; the captures
+	 * never touch the 8.A authority-publish ordering below). */
+	instr_time tr_start;
+	instr_time tr_replay_end;
+	instr_time tr_publish_end;
+	instr_time tr_post_end;
 
 	if (stats == NULL)
 		stats = &local_stats;
@@ -322,10 +329,12 @@ cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower
 	 * returns DONE / BLOCKED -- never throws a catchable ERROR (it demotes one),
 	 * only re-throws a FATAL/PANIC.
 	 */
+	INSTR_TIME_SET_CURRENT(tr_start); /* PGRAC: spec-4.13 D5 replay-phase start */
 	pgstat_report_wait_start(WAIT_EVENT_CLUSTER_THREAD_RECOVERY);
 	drive_res
 		= cluster_thread_recovery_drive(dead_tid, scan_lower, scan_upper, &vis, &touched, stats);
 	pgstat_report_wait_end();
+	INSTR_TIME_SET_CURRENT(tr_replay_end); /* PGRAC: spec-4.13 D5 replay/visibility done */
 
 	if (drive_res != CLUSTER_THREADREC_DONE) {
 		/*
@@ -431,6 +440,8 @@ cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower
 		}
 	}
 
+	INSTR_TIME_SET_CURRENT(tr_publish_end); /* PGRAC: spec-4.13 D5 publish/barrier done */
+
 	/*
 	 * D5 observability: record the outcome before applying the panic policy -- a
 	 * DONE bumps threads_recovered and advances the recovered_through watermark; a
@@ -457,6 +468,29 @@ cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower
 				 errmsg("online thread recovery for dead thread %u could not complete", dead_tid),
 				 errhint("cluster.thread_recovery_on_unrecoverable=panic crashes the survivor; "
 						 "set it to keep_frozen to leave only that thread's resources frozen.")));
+
+	/*
+	 * PGRAC: spec-4.13 D5 -- one window-summary LOG (replay includes visibility,
+	 * which is interleaved in the combined engine and cannot be isolated without
+	 * refactoring the per-record loop; see the spec D2/Q7 note).  freeze is the
+	 * caller's (replay_one) concern; total comes from the worker.
+	 */
+	INSTR_TIME_SET_CURRENT(tr_post_end);
+	{
+		instr_time d_replay = tr_replay_end;
+		instr_time d_publish = tr_publish_end;
+		instr_time d_post = tr_post_end;
+
+		INSTR_TIME_SUBTRACT(d_replay, tr_start);
+		INSTR_TIME_SUBTRACT(d_publish, tr_replay_end);
+		INSTR_TIME_SUBTRACT(d_post, tr_publish_end);
+		ereport(LOG,
+				(errmsg("cluster thread recovery window: tid=%u outcome=%s replay_us=" INT64_FORMAT
+						" publish_us=" INT64_FORMAT " post_us=" INT64_FORMAT,
+						dead_tid, result == CLUSTER_THREADREC_DONE ? "DONE" : "BLOCKED",
+						INSTR_TIME_GET_MICROSEC(d_replay), INSTR_TIME_GET_MICROSEC(d_publish),
+						INSTR_TIME_GET_MICROSEC(d_post))));
+	}
 
 	return result;
 }
