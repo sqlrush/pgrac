@@ -302,15 +302,29 @@ run_fence() {
 	skip_recov "P0-4-qvotec" "qvotec tick refresh needs 2-node quorum harness (D3 ClusterPair); single-node has no authority marker"
 }
 
+# Block recovery latency (P0-5/6/7) is single-node and locally runnable: the
+# Perl runner triggers corrupt-block recovery and parses the D4 latency LOG.
+# Emits its own JSON artifact (perf-stage4-recovery-<TS>.json).
 run_block_recovery() {
-	skip_recov "P0-5-near-fpi" "block recovery latency needs D4 LOG-only trigger->return timing + t/257 corrupt-block driver (dedicated runner)"
-	skip_recov "P0-6-far-fpi"  "as P0-5; large WAL window variant (D4)"
-	skip_recov "P0-7-failclosed" "block recovery fail-closed latency; D4 (verify no page install, data_corrupted)"
+	local runner
+	runner="$(dirname "$0")/run-stage4-recovery-latency.pl"
+	[ -f "$runner" ] || { skip_recov "P0-5-near-fpi" "block recovery runner missing: $runner"; return 0; }
+	log "block recovery latency: delegating to run-stage4-recovery-latency.pl"
+	PGRAC_ENABLE_INSTALL="$EN" perl "$runner" \
+		--enable-install="$EN" --results-dir="$RESULTS_DIR" \
+		--timestamp="$TS" --commit="$COMMIT" --reps="$REPS" --bands=block \
+		>>"$RAW_LOG" 2>&1 \
+		|| log "WARN block recovery latency runner exited non-zero (see raw log)"
+	log "block recovery JSON: $RESULTS_DIR/perf-stage4-recovery-$TS.json"
 }
+# Thread recovery latency (P0-8/9/10): the D5 window/total LOG instrumentation is
+# in place, but a real DONE recovery needs a 2-node fixture with a dead thread's
+# data to replay (the single-node SRF only exercises BLOCKED/window timing).  The
+# DONE-leg latency is gated on the clean Linux CI 2-node path; SKIP locally.
 run_thread_recovery() {
-	skip_recov "P0-8-small"  "thread recovery freeze/replay/publish/post segments need D5 LOG/counter; visibility folded into replay (audit §5.2); SRF cluster_thread_replay_one_test driver"
-	skip_recov "P0-9-medlarge" "as P0-8; medium/large WAL window throughput (D5)"
-	skip_recov "P0-10-failclosed" "thread recovery fail-closed (injection cluster-thread-recovery-drive); keep-frozen, 0 authority (D5)"
+	skip_recov "P0-8-small"  "D5 window/total LOG in place; real DONE latency needs 2-node fixture (CI); single-node SRF only yields BLOCKED/window timing"
+	skip_recov "P0-9-medlarge" "as P0-8; medium/large WAL window DONE throughput needs 2-node CI"
+	skip_recov "P0-10-failclosed" "thread recovery fail-closed (injection cluster-thread-recovery-drive); keep-frozen, 0 authority (2-node CI)"
 }
 run_cold_recovery() {
 	skip_recov "P0-11-cold" "cold recovery / k-way merge startup time needs crash-restart + run-sharedfs-bench.sh merged-recovery driver (D6, dedicated runner)"
