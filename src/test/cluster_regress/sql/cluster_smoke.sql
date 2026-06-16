@@ -44,9 +44,9 @@ SELECT attname, format_type(atttypid, atttypmod)
 
 
 -- ----------
--- 3. Cluster wait events: 100 rows (anchored by
+-- 3. Cluster wait events: 102 rows (anchored by
 --    CLUSTER_WAIT_EVENTS_COUNT, spec-0.11 + StaticAssertDecl
---    in cluster_views.c; spec-4.11 D5 +1 ClusterThreadRecovery).
+--    in cluster_views.c; spec-4.12 D7 +2 write-fence events).
 -- ----------
 SELECT count(*) FROM pg_stat_cluster_wait_events;
 

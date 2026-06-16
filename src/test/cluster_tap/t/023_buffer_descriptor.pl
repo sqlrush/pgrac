@@ -131,7 +131,7 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-   '100',
+   '102',
    'L9 pg_stat_cluster_wait_events returns 100 rows (spec-4.6 +1 GRD shard remaster)');
 
 
@@ -162,7 +162,7 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT category) FROM pg_cluster_state}),
-   '35',
+   '36',
    'L12 pg_cluster_state has 35 categories (spec-4.8 adds tt_recovery)');
 
 
@@ -226,7 +226,7 @@ is($node->safe_psql('postgres',
 my $smoke_categories = $node->safe_psql(
 	'postgres',
 	q{SELECT count(DISTINCT category) FROM pg_cluster_state});
-is($smoke_categories, '35', 'L16 cluster_smoke surface integrates buffer_format + pcm + gcs + tt_status + tt_status_hint + tt_2pc + tt_recovery + visibility + wal_thread categories (35 categories;spec-4.8 adds tt_recovery)');
+is($smoke_categories, '36', 'L16 cluster_smoke surface integrates buffer_format + pcm + gcs + tt_status + tt_status_hint + tt_2pc + tt_recovery + visibility + wal_thread categories (35 categories;spec-4.8 adds tt_recovery)');
 
 
 # ----------

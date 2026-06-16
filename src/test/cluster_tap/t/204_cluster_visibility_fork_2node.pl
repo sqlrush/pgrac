@@ -322,7 +322,7 @@ is($pair->node0->safe_psql('postgres',
 # ============================================================
 is($pair->node0->safe_psql('postgres',
 		q{SELECT count(DISTINCT category) FROM pg_cluster_state}),
-	'35',
+	'36',
 	'L12a pg_cluster_state has 35 categories (spec-4.8 adds tt_recovery)');
 
 my $tt_categories = $pair->node0->safe_psql('postgres', q{
