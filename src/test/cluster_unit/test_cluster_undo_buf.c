@@ -578,6 +578,56 @@ UT_TEST(test_undo_buf_writeback_verdict_three_state)
 }
 
 
+/* ===== D6 (spec-4.8ab 4.8b) — remote-undo evidence hold under a peered topology =====
+ *
+ *	Contract-first invariant:  with peers, write-back is gated OFF, so every undo
+ *	write is write-through and its evidence is durable immediately -- the source
+ *	node never async-releases an undo image a remote node might still need (Q4
+ *	朝 hold).  Counted via remote_evidence_holds.  The real cross-node remote-undo
+ *	READ stays fail-closed (CROSS_INSTANCE_UNSUPPORTED in cluster_cr.c, covered by
+ *	t/223);  positive cross-node read is forward spec-5.57.
+ */
+UT_TEST(test_undo_buf_remote_evidence_hold_under_peers)
+{
+	ClusterConf conf_two_nodes;
+	ClusterUndoBufPin pin;
+	char *img;
+	uint64 holds_before;
+
+	fresh_pool();
+	cluster_undo_buffer_writeback = true; /* GUC on ... */
+	memset(&conf_two_nodes, 0, sizeof(conf_two_nodes));
+	conf_two_nodes.node_count = 2; /* ... but PEERED -> write-back gated off */
+	ClusterConfShmem = &conf_two_nodes;
+	UT_ASSERT_EQ((int)cluster_undo_buf_writeback_allowed(), 0);
+
+	/* A pinned data-block write under peers takes the write-through path and
+	 * records ONE remote-evidence hold (durable now, never async-released). */
+	holds_before = cluster_undo_buf_get_remote_evidence_hold_count();
+	img = cluster_undo_buf_pin(1, 0, 5, CLUSTER_UNDO_BUF_EXCLUSIVE, &pin);
+	UT_ASSERT_NOT_NULL(img);
+	img[0] = 0x5A;
+	cluster_undo_buf_mark_dirty(&pin, InvalidXLogRecPtr); /* write-through (peered) */
+	cluster_undo_buf_unpin(&pin);
+	UT_ASSERT_EQ((cluster_undo_buf_get_remote_evidence_hold_count() == holds_before + 1) ? 1 : 0,
+				 1);
+	UT_ASSERT_EQ((int)cluster_undo_buf_get_writethrough_count(), 1); /* write-through taken */
+
+	/* Single-node: the SAME write buffers (write-back) and records NO remote
+	 * hold -- the hold is peered-topology-only. */
+	ClusterConfShmem = NULL;
+	holds_before = cluster_undo_buf_get_remote_evidence_hold_count();
+	img = cluster_undo_buf_pin(1, 0, 6, CLUSTER_UNDO_BUF_EXCLUSIVE, &pin);
+	UT_ASSERT_NOT_NULL(img);
+	img[0] = 0x6B;
+	cluster_undo_buf_mark_dirty(&pin, (XLogRecPtr)500); /* write-back, valid LSN */
+	cluster_undo_buf_unpin(&pin);
+	UT_ASSERT_EQ((cluster_undo_buf_get_remote_evidence_hold_count() == holds_before) ? 1 : 0, 1);
+
+	cluster_undo_buffer_writeback = false; /* restore default for later tests */
+}
+
+
 int
 main(void)
 {
@@ -591,6 +641,7 @@ main(void)
 	UT_RUN(test_undo_boundary_wal_before_data);
 	UT_RUN(test_undo_boundary_checkpoint_coverage);
 	UT_RUN(test_undo_buf_writeback_verdict_three_state);
+	UT_RUN(test_undo_buf_remote_evidence_hold_under_peers);
 	UT_RUN(test_undo_buf_dirty_evict_flushes_before_reuse);
 	UT_DONE();
 }
