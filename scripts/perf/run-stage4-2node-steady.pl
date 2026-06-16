@@ -219,7 +219,18 @@ sub run_2node_bench {
     my $res = eval {
         $pair = PostgreSQL::Test::ClusterPair->new_pair(
             $cname, quorum_voting_disks => 1, extra_conf => $conf);
-        $pair->start_pair;
+        # Start each node with fail_ok so a boot failure (e.g. quorum strict-mode
+        # not coming up on a given runner) degrades to UNAVAILABLE instead of a
+        # TAP BAIL_OUT that exits the whole runner with no JSON (start_pair would
+        # BAIL_OUT on "pg_ctl start failed").
+        my $ok0 = $pair->node0->start(fail_ok => 1);
+        my $ok1 = $pair->node1->start(fail_ok => 1);
+        if (!$ok0 || !$ok1) {
+            return { ok => 0, reason => "2-node ClusterPair start failed (node0="
+                   . ($ok0 ? 1 : 0) . " node1=" . ($ok1 ? 1 : 0)
+                   . "; quorum strict-mode boot or runner env; log "
+                   . $pair->node0->logfile . ")" };
+        }
         sleep 2;   # let LMON / qvotec drain initial heartbeat
         bench_node($pair->node0, $label);
     };

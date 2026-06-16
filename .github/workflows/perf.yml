@@ -362,6 +362,11 @@ jobs:
           mkdir -p /tmp/pgrac-portlock
           export PG_TEST_PORT_DIR=/tmp/pgrac-portlock
           export PG_REGRESS="$(pwd)/src/test/regress/pg_regress"
+          # ABSOLUTE TESTDATADIR so PostgreSQL::Test::Utils::tempdir() yields
+          # absolute paths -- ClusterPair's quorum voting-disk files are opened by
+          # the postmaster (a different cwd), so a relative path FATALs at boot
+          # ("cluster.voting_disks: cannot open tmp_check/.../disk0").
+          export TESTDATADIR="$(pwd)/tmp_check"
           rm -rf tmp_check
           # Single-node bands + delegated 2-node steady (P0-1/P0-2) + block
           # recovery latency (P0-5/6/7).  report-only (perf is never a hard gate,
