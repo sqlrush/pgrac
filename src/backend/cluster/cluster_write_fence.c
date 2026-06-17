@@ -204,7 +204,8 @@ cluster_write_fence_allowed(void)
 	 * startup_self_check before the node serves, so a self-fenced node never gets
 	 * the grace.  After the latch, fall through to the strict pure judge.
 	 */
-	if (cluster_write_fence_grace_before_engage(enforcement_on, region_attached, fence_engaged))
+	if (cluster_write_fence_grace_before_engage(enforcement_on, region_attached, fence_engaged,
+												self_fenced))
 		return true;
 
 	/* TimestampTz is microseconds since 2000-01-01; the lease is in the same unit. */
@@ -465,6 +466,37 @@ cluster_write_fence_refresh_from_marker(const ClusterFenceMarker *m, uint64 leas
 
 	self_fenced = cluster_fence_marker_node_is_fenced(m->fenced_dead_bitmap, cluster_node_id);
 
+	/*
+	 * spec-4.12b Hardening v1.0.2 (self-fence grace race, P0 8.A).  If THIS authority
+	 * fences our own node, engage the one-way bring-up latch BEFORE mutating the token
+	 * (a single atomic store + barrier).  Otherwise the hot gate keeps granting the
+	 * bring-up grace (cluster_write_fence_grace_before_engage looks only at
+	 * fence_engaged) throughout the publish sequence below -- a window qvotec can be
+	 * descheduled inside (ms-scale), during which a concurrent backend write on this
+	 * already-fenced node would be wrongly ALLOWED (false-permit).  Engaging first
+	 * makes the gate fail closed for the entire publish.  The write barrier orders the
+	 * engage store ahead of the token mutations; paired with the read side reading
+	 * fence_engaged AFTER self_fenced (reverse order) in cluster_write_fence_allowed(),
+	 * a reader that observes the freshly-published self_fenced=1 is guaranteed to also
+	 * observe fence_engaged=1 (message-passing).  The barrier is necessary but relies
+	 * on that read-side ordering -- it is not sufficient on its own.
+	 *
+	 * ASYMMETRIC on purpose: a NON-self-fencing (baseline / normal) authority keeps
+	 * engaging LAST (after the lease is published, below).  Engaging a healthy node
+	 * early would leave fence_engaged=1 while the lease is still 0, briefly failing
+	 * its legitimate writes closed during bring-up.  Only the self-fence case pays the
+	 * early fail-closed cost, which is correct -- that node IS fenced.
+	 *
+	 * Residual (honest): this closes the descheduling (macro) window.  A bounded
+	 * lock-free propagation delay of this single fence_engaged store remains, in the
+	 * same accepted-risk class as the R4 lease window (cooperative fence; the hard
+	 * guarantee is the AD-013 external fence, not this cooperative gate).
+	 */
+	if (self_fenced) {
+		pg_atomic_write_u32(&cluster_write_fence_shmem->fence_engaged, 1);
+		pg_write_barrier();
+	}
+
 	/* 1. invalidate the lease so any concurrent reader fails closed mid-update. */
 	pg_atomic_write_u64(&cluster_write_fence_shmem->lease_expire_at_us, 0);
 	pg_write_barrier();
@@ -478,6 +510,18 @@ cluster_write_fence_refresh_from_marker(const ClusterFenceMarker *m, uint64 leas
 			   (size_t)CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES));
 	pg_write_barrier();
 
+	/*
+	 * spec-4.12b Hardening v1.0.2 invariant: a self-fencing authority MUST have
+	 * already engaged the bring-up latch (engage-first, above) before the lease is
+	 * published, so the hot gate cannot grant grace to a self-fenced node during or
+	 * after publish.  This Assert pins the engage-first ordering against a future
+	 * reorder regression -- it is an invariant check, NOT a runtime guard (the real
+	 * protection is the engage-first store + the !self_fenced grace guard).  Layer A
+	 * has no deterministic e2e (would need test-only catalog surface + a catversion
+	 * bump); see the Hardening v1.0.2 appendix for the construction-proof rationale.
+	 */
+	Assert(!self_fenced || pg_atomic_read_u32(&cluster_write_fence_shmem->fence_engaged) != 0);
+
 	/* 3. publish the lease LAST -- this is what makes the token usable. */
 	pg_atomic_write_u64(&cluster_write_fence_shmem->lease_expire_at_us, lease_expire_us);
 
@@ -490,7 +534,9 @@ cluster_write_fence_refresh_from_marker(const ClusterFenceMarker *m, uint64 leas
 	 * spec-4.12b D3: the first authority just latched.  Engage the one-way
 	 * bring-up latch AFTER the lease is published, so the hot gate ends its
 	 * bring-up grace only once a usable token exists.  Set unconditionally (it is
-	 * one-way -- a no-op once set).
+	 * one-way -- a no-op once set).  spec-4.12b Hardening v1.0.2: for a self-fencing
+	 * authority this is already engaged above (engage-first), so this is the no-op
+	 * path; only the NON-self-fence (healthy) authority first engages here.
 	 */
 	pg_atomic_write_u32(&cluster_write_fence_shmem->fence_engaged, 1);
 }

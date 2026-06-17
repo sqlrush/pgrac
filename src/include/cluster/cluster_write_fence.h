@@ -93,12 +93,20 @@ cluster_write_fence_decide(bool enforcement_on, bool region_attached, uint64 epo
  *	to the pure judge, which fails closed (L110).  PURE so the latch transition is
  *	unit-pinned; ONLY cluster_write_fence_allowed() (the hot gate) consults this --
  *	the direct durable checks (verify_durable / startup_self_check) never do (P1).
+ *
+ *	spec-4.12b Hardening v1.0.2 (self-fence grace race, defense-in-depth): a node
+ *	whose token already says self_fenced gets NO grace either -- it falls through to
+ *	the pure judge, which fails closed (self_fenced).  This is the SECOND layer behind
+ *	the engage-first publish order in cluster_write_fence_refresh_from_marker(): the
+ *	primary fix engages the latch before publishing a self-fencing token, so whenever
+ *	self_fenced is observable fence_engaged is already set; this !self_fenced guard
+ *	survives a future reorder regression of that publish path.
  */
 static inline bool
 cluster_write_fence_grace_before_engage(bool enforcement_on, bool region_attached,
-										bool fence_engaged)
+										bool fence_engaged, bool self_fenced)
 {
-	return enforcement_on && region_attached && !fence_engaged;
+	return enforcement_on && region_attached && !fence_engaged && !self_fenced;
 }
 
 /*

@@ -549,13 +549,20 @@ UT_TEST(test_lowest_live_node)
 UT_TEST(test_grace_before_engage)
 {
 	/* enforcement off -> no grace (the escape hatch lives in decide(), not here). */
-	UT_ASSERT(!cluster_write_fence_grace_before_engage(false, true, false));
-	/* enforcement on, region attached, NOT engaged -> grace (bring-up window). */
-	UT_ASSERT(cluster_write_fence_grace_before_engage(true, true, false));
+	UT_ASSERT(!cluster_write_fence_grace_before_engage(false, true, false, false));
+	/* enforcement on, region attached, NOT engaged, not self-fenced -> grace. */
+	UT_ASSERT(cluster_write_fence_grace_before_engage(true, true, false, false));
 	/* enforcement on, region attached, ENGAGED -> no grace (strict from here on). */
-	UT_ASSERT(!cluster_write_fence_grace_before_engage(true, true, true));
+	UT_ASSERT(!cluster_write_fence_grace_before_engage(true, true, true, false));
 	/* enforcement on, region DETACHED -> no grace (L110: fall through, fail closed). */
-	UT_ASSERT(!cluster_write_fence_grace_before_engage(true, false, false));
+	UT_ASSERT(!cluster_write_fence_grace_before_engage(true, false, false, false));
+	/*
+	 * spec-4.12b Hardening v1.0.2: enforcement on, attached, NOT engaged, but the
+	 * token already says self_fenced -> NO grace (defense-in-depth behind the
+	 * engage-first publish order).  Without the guard the bring-up grace would let a
+	 * self-fenced node write during the refresh publish window (8.A fail-open).
+	 */
+	UT_ASSERT(!cluster_write_fence_grace_before_engage(true, true, false, true));
 }
 
 int
