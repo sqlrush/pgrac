@@ -487,6 +487,9 @@ extern void cluster_write_fence_shmem_register(void);
 extern void cluster_write_fence_refresh_from_marker(const ClusterFenceMarker *m,
 													uint64 lease_expire_us);
 extern void cluster_write_fence_note_minority_marker(void);
+/* spec-4.12b D5: a baseline that would roll membership backward was rejected
+ * (refresh-side double-monotonic guard, or qvotec author-side P1-1 epoch regress). */
+extern void cluster_write_fence_note_baseline_stale(void);
 
 /*
  * D4 cross-process fence-marker submit (core 8.A order).

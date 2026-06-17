@@ -154,6 +154,19 @@ $n0->safe_psql('postgres', q{
 is($n0->safe_psql('postgres', q{SELECT count(*) FROM wf_survivor}),
 	'50', 'M3 survivor node0 (not in dead set) still writes (matrix: dead side fenced, survivor free)');
 
+# ----------
+# M4 (spec-4.12b D8 P2-L8 + D5/P1-1 net): the leader (node0 -- still lowest-live
+# after node1 is declared dead) actually AUTHORS baselines, so baseline_published
+# grows.  This pins the D2 author path (a wiring bug there could otherwise pass on
+# the residual lease alone) AND is the e2e net for the P1-1 epoch-regress guard: the
+# leader catches last_applied up and republishes the fence-epoch baseline rather
+# than masking the fence with a stale lower-epoch one.
+# ----------
+ok($n0->poll_query_until('postgres',
+		"SELECT (SELECT value::bigint FROM cluster_dump_state() "
+	  . "WHERE category = 'write_fence' AND key = 'baseline_published') > 0", 't'),
+	'M4 leader node0 actually authored baselines (baseline_published > 0; D2 path live)');
+
 # M2 (escape hatch) + lease-expired / stale-epoch columns: honest SKIP (L239).
 # enforcement off/dev no-op is unit-pinned (test_enforcement_off_is_escape_hatch)
 # + t/269 L6/L7; lease-expired / stale-epoch need a partition / epoch-skew window

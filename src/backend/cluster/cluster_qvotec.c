@@ -673,6 +673,8 @@ qvotec_poll_once(void)
 	ClusterFenceMarker baseline_marker; /* spec-4.12b D2 */
 	bool author_baseline = false;		/* spec-4.12b D2: wrote a baseline this cycle */
 	bool is_leader = false;				/* spec-4.12b D6: lowest-live baseline leader */
+	uint64 durable_authority_epoch = 0; /* spec-4.12b D5/P1-1: highest durable fence */
+	bool durable_has_authority = false; /* epoch observed on disk THIS poll */
 
 	now_us = (uint64)GetCurrentTimestamp();
 	next_lease_expire = now_us + (uint64)cluster_quorum_poll_interval_ms * 2 * 1000ULL;
@@ -778,6 +780,11 @@ qvotec_poll_once(void)
 			uint64 fence_lease_expire = now_us + (uint64)cluster_write_fence_lease_ms * 1000ULL;
 
 			cluster_write_fence_refresh_from_marker(&authority.marker, fence_lease_expire);
+			/* spec-4.12b D5/P1-1: remember the durable authority epoch this poll
+			 * observed, so the baseline author below never overwrites a
+			 * higher-epoch durable fence with a lower-epoch baseline. */
+			durable_authority_epoch = authority.marker.fence_epoch;
+			durable_has_authority = true;
 		} else if (authority.minority_seen)
 			cluster_write_fence_note_minority_marker();
 	}
@@ -844,12 +851,27 @@ qvotec_poll_once(void)
 	 * Gated on enforcement == ON (mirrors the reconfig fence-submit gate): when
 	 * OFF/DEV the hot gate is a no-op, so authoring a baseline buys nothing and we
 	 * keep the pre-4.12b steady-state behaviour (zero regression, no marker write).
+	 *
+	 * spec-4.12b D5/P1-1 (8.A): the membership tuple is built from last_applied
+	 * (cluster_reconfig.c publishes the event -- and thus advances last_applied --
+	 * only AFTER the coordinator's fence-marker submit ACKs).  In that
+	 * bump-before-publish window a leader whose last_applied still lags the just-
+	 * submitted fence would author a LOWER-epoch baseline and pack it over the SAME
+	 * self-slot that just received the (higher-epoch) fence marker -- erasing the
+	 * fence from disk before peers read it.  Guard fail-closed: if the would-be
+	 * baseline's epoch is BELOW the durable authority this very poll already
+	 * observed on disk, do NOT author it -- preserve the durable marker instead and
+	 * count it.  (The leader catches up the next poll once last_applied advances,
+	 * authoring a baseline tuple-identical to the fence.)
 	 */
 	is_leader = qvotec_self_is_membership_leader(decision.alive_bitmap);
 	if (!have_submit && cluster_write_fence_enforcement == CLUSTER_WRITE_FENCE_ENFORCE_ON
 		&& is_leader) {
 		qvotec_build_baseline_marker(&baseline_marker);
-		author_baseline = true;
+		if (durable_has_authority && baseline_marker.fence_epoch < durable_authority_epoch)
+			cluster_write_fence_note_baseline_stale(); /* fail-closed: would regress */
+		else
+			author_baseline = true;
 	}
 
 	for (i = 0; i < qvotec_n_disks; i++) {

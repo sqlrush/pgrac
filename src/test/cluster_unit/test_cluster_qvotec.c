@@ -345,6 +345,10 @@ void
 cluster_write_fence_note_baseline_published(bool is_leader pg_attribute_unused(),
 											bool published pg_attribute_unused())
 {}
+void cluster_write_fence_note_baseline_stale(void);
+void
+cluster_write_fence_note_baseline_stale(void)
+{}
 void
 cluster_reconfig_get_last_event(ReconfigEvent *out)
 {

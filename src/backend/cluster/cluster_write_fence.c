@@ -56,6 +56,11 @@ StaticAssertDecl(sizeof(ClusterFenceMarker) == CLUSTER_FENCE_MARKER_BYTES,
 				 "ClusterFenceMarker must be exactly CLUSTER_FENCE_MARKER_BYTES");
 StaticAssertDecl(CLUSTER_FENCE_MARKER_BYTES <= sizeof(((ClusterVotingSlot *)0)->_reserved1),
 				 "fence marker must fit in the voting slot _reserved1 area");
+/* spec-4.12b D5: the refresh guard copies/compares the marker dead bitmap against
+ * the shmem token's RECONFIG-width dead bitmap; pin them equal so a future width
+ * change to either constant fails to compile rather than over-reading (P2-4). */
+StaticAssertDecl(CLUSTER_RECONFIG_DEAD_BITMAP_BYTES == CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES,
+				 "reconfig and fence-marker dead bitmaps must be the same width");
 
 /*
  * GUC storage lives in cluster_guc.c (the project convention -- the DefineCustom*
@@ -365,6 +370,17 @@ cluster_write_fence_startup_self_check(void)
 		pg_atomic_write_u64(&cluster_write_fence_shmem->fence_event_id,
 							authority.marker.fence_event_id);
 		/*
+		 * Also publish the durable dead set so the FIRST refresh_from_marker runs
+		 * its dead-set-superset guard against the real latched set, not an empty one
+		 * (defense-in-depth in the sensitive rejoin window).  NOTE: this makes the
+		 * startup process a writer of the token in addition to qvotec; the refresh
+		 * guard's no-lock read is still safe because writes are monotone (epoch +
+		 * superset) and this only ever GROWS the latched dead set.
+		 */
+		memcpy(cluster_write_fence_shmem->fenced_dead_bitmap, authority.marker.fenced_dead_bitmap,
+			   Min(sizeof(cluster_write_fence_shmem->fenced_dead_bitmap),
+				   (size_t)CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES));
+		/*
 		 * spec-4.12b D3: a durably self-fenced node is authoritative state -- engage
 		 * the bring-up latch so the hot gate never grants this node the bring-up
 		 * grace (it must fail closed from the first instant, not be let through the
@@ -443,7 +459,7 @@ cluster_write_fence_refresh_from_marker(const ClusterFenceMarker *m, uint64 leas
 	memcpy(latched_dead, cluster_write_fence_shmem->fenced_dead_bitmap, sizeof(latched_dead));
 	if (!cluster_write_fence_authority_advances(m->fence_epoch, m->fenced_dead_bitmap,
 												latched_epoch, latched_dead)) {
-		pg_atomic_fetch_add_u64(&cluster_write_fence_shmem->baseline_stale_rejected, 1);
+		cluster_write_fence_note_baseline_stale();
 		return; /* stale / shrunk authority -> do not publish; token ages out (8.A) */
 	}
 
@@ -490,6 +506,21 @@ cluster_write_fence_note_minority_marker(void)
 	if (cluster_write_fence_shmem == NULL)
 		return;
 	pg_atomic_fetch_add_u64(&cluster_write_fence_shmem->minority_marker_ignored, 1);
+}
+
+/*
+ * cluster_write_fence_note_baseline_stale -- spec-4.12b D5.  A baseline that would
+ *	roll membership backward was rejected.  Two callers, same 8.A semantics: the
+ *	refresh guard (an authority whose epoch decreased or dead set shrank) and the
+ *	qvotec baseline author (P1-1: a would-be baseline whose epoch is below the
+ *	durable authority just observed -- never overwrite a higher-epoch fence).
+ */
+void
+cluster_write_fence_note_baseline_stale(void)
+{
+	if (cluster_write_fence_shmem == NULL)
+		return;
+	pg_atomic_fetch_add_u64(&cluster_write_fence_shmem->baseline_stale_rejected, 1);
 }
 
 /* spec-4.12 D7 observability counter accessors (L110-safe: 0 with no region). */
