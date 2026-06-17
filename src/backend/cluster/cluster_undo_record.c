@@ -169,6 +169,13 @@ typedef struct ClusterUndoRecordShared {
 	pg_atomic_uint64 record_segments_committed;
 	pg_atomic_uint64 record_seg_commit_skipped_inflight;
 
+	/* spec-4.12a Hardening v1.0.1 (P0 8.A): count carried-over residual extents
+	 * dropped by the under-lifecycle_lock revalidation because their segment is
+	 * no longer the active one (rolled away / sealed since the previous xact).
+	 * Proves the residual revalidation path fires (D-h1 TAP counter-delta) and
+	 * gives ops a signal of cross-backend rollover churn. */
+	pg_atomic_uint64 record_seg_residual_revalidate_drops;
+
 	/* P0 perf hardening (2026-05-31): per-commit (group) undo fsync.
 	 * Durability ordering unchanged (undo durable BEFORE commit visible), but
 	 * fsync granularity moved from per-record (inside cursor_lock) to per-xact
@@ -223,6 +230,14 @@ static SCN *cluster_undo_write_registry = NULL;
 /* This backend already registered first_undo_scn for the current top-xact
  * (idempotent guard; cleared in cluster_undo_record_xact_reset). */
 static bool cluster_undo_write_registered = false;
+
+/* spec-4.12a Hardening v1.0.1 (P0 8.A): this backend already revalidated its
+ * carried-over residual extent for the current top-xact.  The carried residual
+ * is only stale at the txn's first undo alloc (another backend may have rolled
+ * the segment away since the previous xact); after the one locked revalidation
+ * the extent is current-xact-owned and reused lock-free.  Cleared in
+ * cluster_undo_record_xact_reset. */
+static bool cluster_undo_residual_validated_this_xact = false;
 
 /* Per-backend state(D16 PREPARE guard support). */
 static bool cluster_undo_touched_in_xact = false;
@@ -485,6 +500,8 @@ cluster_undo_record_shmem_init(void)
 		/* spec-4.12a D1: record-segment drain counters. */
 		pg_atomic_init_u64(&UndoRecordShared->record_segments_committed, 0);
 		pg_atomic_init_u64(&UndoRecordShared->record_seg_commit_skipped_inflight, 0);
+		/* spec-4.12a Hardening v1.0.1: residual revalidation drop counter. */
+		pg_atomic_init_u64(&UndoRecordShared->record_seg_residual_revalidate_drops, 0);
 
 		/* P0 perf hardening: per-commit undo fsync counters. */
 		pg_atomic_init_u64(&UndoRecordShared->commit_fsync_count, 0);
@@ -633,6 +650,13 @@ void
 cluster_undo_record_xact_commit_release(void)
 {
 	cluster_undo_active_write_unregister();
+	/* spec-4.12a Hardening v1.0.1: re-arm residual revalidation for the next
+	 * top-xact.  xact_reset (which also clears this) runs only on PREPARE/ABORT,
+	 * so the commit path must re-arm it here -- otherwise a persistent connection
+	 * that commits and stays open would carry the flag set and SKIP revalidating
+	 * its residual on the next xact, reusing a possibly-rolled-away segment (the
+	 * very window this hardening closes). */
+	cluster_undo_residual_validated_this_xact = false;
 }
 
 /*
@@ -793,6 +817,16 @@ cluster_undo_record_seg_commit_skipped_inflight_count(void)
 	if (UndoRecordShared == NULL)
 		return 0;
 	return pg_atomic_read_u64(&UndoRecordShared->record_seg_commit_skipped_inflight);
+}
+
+/* spec-4.12a Hardening v1.0.1: residual extents dropped by the locked
+ * revalidation (segment no longer active -> would-be stale reuse averted). */
+uint64
+cluster_undo_record_seg_residual_revalidate_drop_count(void)
+{
+	if (UndoRecordShared == NULL)
+		return 0;
+	return pg_atomic_read_u64(&UndoRecordShared->record_seg_residual_revalidate_drops);
 }
 
 
@@ -1376,24 +1410,49 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 		/*
 		 * spec-3.18 D3.3 (Q2 hybrid): a residual extent carried over from a
 		 * previous transaction is reusable ONLY while its segment is still the
-		 * active one.  The active segment is never recycled (recycle requires
-		 * COMMITTED/RECYCLABLE state), so a residual whose segment_id still
-		 * equals active_segment_id can never point at a reborn segment -> safe.
-		 * Once the allocator rolled over (segment_id != active), the old segment
-		 * may be FULL / COMMITTED / RECYCLABLE / reborn, so drop the residual.
+		 * active one.  Once the allocator rolled over (segment_id != active), the
+		 * old segment may be FULL / sealed / COMMITTED / RECYCLABLE / reborn, so
+		 * the residual must be dropped and re-claimed.
 		 *
-		 * The active_segment_id read here is an INTENTIONALLY relaxed (unlocked)
-		 * hint.  A stale read cannot cause data loss: the worst case is reusing a
-		 * residual whose segment just rolled to FULL -- but those blocks are
-		 * already claimed by us (bitmap-marked) and a FULL segment is not yet
-		 * recyclable (retention horizon), so writing our own pre-claimed blocks
-		 * is still correct.  Block 0 / record writes never go through the stale
-		 * path uncrosschecked because the per-record write only touches our own
-		 * extent's claimed blocks.
+		 * spec-4.12a Hardening v1.0.1 (P0 8.A): this validation MUST run under
+		 * lifecycle_lock.  The pre-Hardening check read active_segment_id RELAXED
+		 * (unlocked); a stale read could approve reusing a residual whose segment
+		 * another backend already sealed + rolled away, and 4.12a can then drain
+		 * that segment ACTIVE -> COMMITTED while this txn still writes undo into it
+		 * (the residual writes carry a write_scn above the segment's stale seal, so
+		 * the drain gate wrongly judges it idle -> false reclaim of live undo).  The
+		 * rollover seals the old segment AND publishes active_segment_id under the
+		 * same lifecycle_lock, so acquiring it here makes active_segment_id the
+		 * authoritative truth source (cluster_undo_residual_reusable() then folds
+		 * in the "active segment is never sealed/rolled/recyclable" invariant --
+		 * no block-0 I/O needed).
+		 *
+		 * Validate ONCE per top-xact (the carried residual is only stale at the
+		 * first alloc; a within-xact freshly-claimed extent is claimed under this
+		 * same lock, so it is current-xact-owned and reused lock-free).  Only this
+		 * check needs the lock; the per-record writes below stay lock-free.
+		 * Soundness of validate-then-write-lock-free: if the residual is confirmed
+		 * active here, any later rollover seals it at an SCN >= this txn's
+		 * first_undo_scn (SCN is monotonic; the seal is taken after this point), so
+		 * seal >= boundary -> the drain gate retains it while this writer is
+		 * in-flight.
 		 */
-		if (ext->segment_id != CLUSTER_UNDO_EXTENT_NONE
-			&& ext->segment_id != UndoRecordShared->active_segment_id)
-			ext->segment_id = CLUSTER_UNDO_EXTENT_NONE; /* stale residual -> re-claim */
+		if (!cluster_undo_residual_validated_this_xact) {
+			if (ext->segment_id != CLUSTER_UNDO_EXTENT_NONE) {
+				bool reusable;
+
+				LWLockAcquire(&UndoRecordShared->lifecycle_lock.lock, LW_EXCLUSIVE);
+				reusable = cluster_undo_residual_reusable(ext->segment_id,
+														  UndoRecordShared->active_segment_id);
+				LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
+				if (!reusable) {
+					ext->segment_id = CLUSTER_UNDO_EXTENT_NONE; /* stale -> re-claim */
+					pg_atomic_fetch_add_u64(&UndoRecordShared->record_seg_residual_revalidate_drops,
+											1);
+				}
+			}
+			cluster_undo_residual_validated_this_xact = true;
+		}
 
 		for (;;) {
 			if (!cluster_undo_extent_exhausted(ext)
@@ -1806,6 +1865,9 @@ cluster_undo_record_xact_reset(void)
 	 * abort / PREPARE all reach here).  On PREPARE the prepared-xact guard (硬门
 	 * 6) keeps the undo alive past this point. */
 	cluster_undo_active_write_unregister();
+	/* spec-4.12a Hardening v1.0.1: re-arm residual revalidation for the next
+	 * top-xact (its carried residual must be re-checked under lifecycle_lock). */
+	cluster_undo_residual_validated_this_xact = false;
 	memset(cluster_undo_local_heads, 0, sizeof(cluster_undo_local_heads));
 	cluster_undo_local_head_count = 0;
 	cluster_undo_touched_seg_count = 0;

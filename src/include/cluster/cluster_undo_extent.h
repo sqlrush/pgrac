@@ -116,6 +116,33 @@ cluster_undo_extent_exhausted(const ClusterUndoExtent *ext)
 }
 
 /*
+ * cluster_undo_residual_reusable -- spec-4.12a Hardening v1.0.1 (P0 8.A): pure
+ *	predicate deciding whether a residual extent carried over from a previous
+ *	transaction may be reused.  Reusable iff it still holds an extent
+ *	(segment_id != NONE) AND its segment is still the instance's active record
+ *	segment.  The active record segment is never sealed / rolled away / recycled
+ *	(a rollover seals it and publishes a new active_segment_id under
+ *	lifecycle_lock; recycle requires COMMITTED/RECYCLABLE state; the cleaner
+ *	excludes the active segment), so equality with active_segment_id implies the
+ *	residual's segment is ACTIVE and unsealed -- a sealed/rolled/recycled segment
+ *	necessarily differs from active_segment_id and is dropped.
+ *
+ *	The CALLER MUST read active_segment_id under lifecycle_lock: the rollover
+ *	seals + publishes active_segment_id under that same lock, so the lock
+ *	acquire establishes the happens-before this predicate relies on.  A relaxed
+ *	(unlocked) read can be stale and wrongly approve reuse of a segment another
+ *	backend already sealed, which 4.12a can then drain ACTIVE -> COMMITTED while
+ *	this txn still writes undo into it (false reclaim of live undo).
+ *	cluster_unit testable.
+ */
+static inline bool
+cluster_undo_residual_reusable(uint32 residual_segment_id, uint32 active_segment_id)
+{
+	return residual_segment_id != CLUSTER_UNDO_EXTENT_NONE
+		   && residual_segment_id == active_segment_id;
+}
+
+/*
  * Advance the backend-local cursor to the next block of the extent (fresh).
  * Caller must have verified !cluster_undo_extent_exhausted() for the result
  * to be a valid block;  after the last block this parks cur_block one past the

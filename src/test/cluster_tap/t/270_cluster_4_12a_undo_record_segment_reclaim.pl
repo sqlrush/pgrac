@@ -504,4 +504,57 @@ sub common_conf
 	$ng->stop;
 }
 
+# ===========================================================================
+# L9 -- Hardening v1.0.1 (P0 8.A): a residual extent carried across a commit must
+#       be REVALIDATED under lifecycle_lock before reuse.  When another backend
+#       rolls the residual's segment away (sealing it) between this backend's
+#       transactions, the carried residual must be DROPPED + re-claimed, not
+#       stale-reused -- otherwise 4.12a can drain that now-sealed segment
+#       ACTIVE->COMMITTED while this txn still writes undo into it (false reclaim
+#       of live undo).  Pre-Hardening the reuse check read active_segment_id
+#       RELAXED (unlocked) and could approve a stale residual; the fix moves the
+#       check under lifecycle_lock (synchronizes with the rollover's seal +
+#       active publish).  Deterministic proof: the carried residual into a
+#       rolled-away segment is dropped, observed via the
+#       record_seg_residual_revalidate_drops counter delta.
+# ===========================================================================
+{
+	my $nh = PgracClusterNode->new('residual_revalidate');
+	$nh->init;
+	# extent_blocks > 1 so a single small INSERT leaves residual blocks the
+	# backend carries across the autocommit boundary (spec-3.18 D3.3).
+	$nh->append_conf('postgresql.conf',
+		common_conf(128, 'on') . "cluster.undo_extent_blocks = 8\n");
+	$nh->start;
+	$nh->safe_psql('postgres', 'CREATE TABLE t270 (id int)');
+
+	# Session B: a PERSISTENT connection.  Its small INSERT claims an extent in
+	# the current active segment S and leaves residual blocks, carried (backend-
+	# local) across this autocommit boundary.
+	my $b = $nh->background_psql('postgres', on_error_die => 1);
+	$b->query_safe('INSERT INTO t270 VALUES (1)');    # B parks a residual in S
+	my $drops_before = undo_counter($nh, 'record_seg_residual_revalidate_drops');
+
+	# Foreground A rolls the active segment S away: force_segment_end seals S on
+	# the next undo write and publishes a new active segment.  (A is a fresh
+	# short-lived backend with no residual of its own, so it never drops one.)
+	$nh->safe_psql('postgres', q{SELECT cluster_undo_test_force_segment_end()});
+	$nh->safe_psql('postgres', 'INSERT INTO t270 VALUES (2)');    # rolls S -> new_seg
+
+	# B's next transaction: the carried residual now points at the rolled-away
+	# (sealed) segment S.  The under-lifecycle_lock revalidation must drop it (S
+	# != active_segment_id) and re-claim a fresh extent in the new active segment.
+	$b->query_safe('INSERT INTO t270 VALUES (3)');
+	cmp_ok(undo_counter($nh, 'record_seg_residual_revalidate_drops'), '>', $drops_before,
+		'L9 a residual carried into a rolled-away segment is dropped under lifecycle_lock '
+		  . '(no stale reuse -> the sealed segment cannot be false-COMMITTED with live undo)');
+
+	# Data integrity: B re-claimed a fresh extent and all rows committed.
+	$b->quit;
+	is($nh->safe_psql('postgres', 'SELECT count(*) FROM t270 WHERE id IN (1,2,3)'),
+		'3', 'L9 all rows committed correctly after residual revalidation + re-claim');
+
+	$nh->stop;
+}
+
 done_testing();

@@ -160,6 +160,35 @@ UT_TEST(test_extent_fresh_block_init)
 }
 
 
+/*
+ * spec-4.12a Hardening v1.0.1 (P0 8.A): cluster_undo_residual_reusable -- a
+ * carried-over residual extent may be reused iff it still holds an extent AND
+ * its segment is still the active record segment.  The caller reads
+ * active_segment_id under lifecycle_lock; here we just pin the pure decision.
+ * A residual in a rolled-away (hence sealed) / recycled / reborn segment has
+ * segment_id != active_segment_id and must be dropped, so the cleaner cannot
+ * later false-COMMIT a segment this txn is still writing undo into.
+ */
+UT_TEST(test_residual_reusable_active_segment_only)
+{
+	/* held residual, still the active segment -> reusable. */
+	UT_ASSERT(cluster_undo_residual_reusable(5, 5));
+
+	/* held residual, segment rolled away (active moved on) -> drop. */
+	UT_ASSERT(!cluster_undo_residual_reusable(5, 6)); /* rolled forward */
+	UT_ASSERT(!cluster_undo_residual_reusable(9, 3)); /* reused low id */
+
+	/* no residual held (NONE sentinel) -> never reusable, regardless of active. */
+	UT_ASSERT(!cluster_undo_residual_reusable(CLUSTER_UNDO_EXTENT_NONE, 5));
+	UT_ASSERT(!cluster_undo_residual_reusable(CLUSTER_UNDO_EXTENT_NONE, CLUSTER_UNDO_EXTENT_NONE));
+
+	/* a sealed/rolled segment is, by the active-segment invariant, never equal to
+	 * active_segment_id -> the "!= active" branch covers the sealed/non-active
+	 * cases without reading on-disk state/seal (no block-0 I/O on the hot path). */
+	UT_ASSERT(!cluster_undo_residual_reusable(7, 8)); /* 7 sealed+rolled, active=8 */
+}
+
+
 int
 main(void)
 {
@@ -168,5 +197,6 @@ main(void)
 	UT_RUN(test_extent_boundary_clamp);
 	UT_RUN(test_extent_cursor_advance);
 	UT_RUN(test_extent_fresh_block_init);
+	UT_RUN(test_residual_reusable_active_segment_only); /* spec-4.12a Hardening v1.0.1 */
 	UT_DONE();
 }

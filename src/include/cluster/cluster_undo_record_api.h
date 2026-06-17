@@ -246,6 +246,8 @@ extern void cluster_undo_try_mark_record_segment_committed(uint32 segment_id, ui
 extern void cluster_undo_segment_advance_committed(uint32 segment_id);
 extern uint64 cluster_undo_record_segments_committed_count(void);
 extern uint64 cluster_undo_record_seg_commit_skipped_inflight_count(void);
+/* spec-4.12a Hardening v1.0.1: residual extents dropped by locked revalidation. */
+extern uint64 cluster_undo_record_seg_residual_revalidate_drop_count(void);
 
 #endif /* !FRONTEND */
 #endif /* CLUSTER_UNDO_RECORD_API_H */

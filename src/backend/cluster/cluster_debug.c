@@ -1840,6 +1840,10 @@ dump_undo(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_undo_record_segments_committed_count()));
 	emit_row(rsinfo, "undo", "record_seg_commit_skipped_inflight",
 			 fmt_int64((int64)cluster_undo_record_seg_commit_skipped_inflight_count()));
+	/* spec-4.12a Hardening v1.0.1: residual extents dropped by locked
+	 * revalidation (would-be stale reuse of a rolled-away/sealed segment). */
+	emit_row(rsinfo, "undo", "record_seg_residual_revalidate_drops",
+			 fmt_int64((int64)cluster_undo_record_seg_residual_revalidate_drop_count()));
 	/* P0 perf hardening: per-commit (group) undo fsync observability. */
 	emit_row(rsinfo, "undo", "commit_fsync_count",
 			 fmt_int64((int64)cluster_undo_commit_fsync_count()));
