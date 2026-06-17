@@ -1831,6 +1831,15 @@ dump_undo(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_undo_segment_create_fail_count()));
 	emit_row(rsinfo, "undo", "segment_hard_cap_fail_count",
 			 fmt_int64((int64)cluster_undo_segment_hard_cap_fail_count()));
+	/* spec-4.12a D5: record-segment ACTIVE->COMMITTED drain observability.
+	 *   record_segments_committed          : record segments drained to COMMITTED
+	 *                                         (the leak fix advancing them).
+	 *   record_seg_commit_skipped_inflight  : drain attempts a hard gate retained
+	 *                                         (proves the 8.A guard fires). */
+	emit_row(rsinfo, "undo", "record_segments_committed",
+			 fmt_int64((int64)cluster_undo_record_segments_committed_count()));
+	emit_row(rsinfo, "undo", "record_seg_commit_skipped_inflight",
+			 fmt_int64((int64)cluster_undo_record_seg_commit_skipped_inflight_count()));
 	/* P0 perf hardening: per-commit (group) undo fsync observability. */
 	emit_row(rsinfo, "undo", "commit_fsync_count",
 			 fmt_int64((int64)cluster_undo_commit_fsync_count()));

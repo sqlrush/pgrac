@@ -1311,6 +1311,19 @@ cluster_tt_slot_wrap_retired_count(void)
 	return 0;
 }
 
+/* spec-4.12a D5 record-segment drain counter stubs (dump_undo new rows;
+ * cluster_undo_record.o not linked into this test). */
+uint64
+cluster_undo_record_segments_committed_count(void)
+{
+	return 0;
+}
+uint64
+cluster_undo_record_seg_commit_skipped_inflight_count(void)
+{
+	return 0;
+}
+
 /* spec-3.13 D1 Undo Cleaner accessor stubs (dump_undo_cleaner references). */
 #include "cluster/cluster_undo_cleaner.h"
 UndoCleanerStatus
