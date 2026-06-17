@@ -2244,7 +2244,7 @@ cluster_undo_segment_advance_recyclable(uint32 segment_id, SCN horizon)
  *	(the helper never overwrites an existing seal); for a segment rolled away
  *	with the GUC off (never sealed) `now` is a safe conservative upper bound (a
  *	rolled-away non-active segment receives no further writes and every
- *	in-flight writer registered first_undo_scn <= now).  The active record / TT
+ *	in-flight writer's registered first_undo_scn is at or below now).  The active record / TT
  *	segment is excluded by the drain gate itself (guard 3).
  */
 void

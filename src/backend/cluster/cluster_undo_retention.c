@@ -165,8 +165,9 @@ cluster_undo_segment_recyclable(const struct UndoSegmentHeaderData *hdr, SCN hor
  *	  - guard 1: the segment's sealed upper bound (record_seal_upper_scn) must be
  *	    strictly below the oldest active-write boundary.  Each in-flight writer
  *	    registered first_undo_scn BEFORE claiming an extent in (hence sealing)
- *	    this segment, so boundary <= first_undo_scn <= seal whenever an in-flight
- *	    writer has undo here; strict '<' therefore retains exactly while such a
+ *	    this segment, so the boundary is at or below that first_undo value, which
+ *	    is at or below the seal, whenever an in-flight writer has undo here;
+ *	    strict '<' therefore retains exactly while such a
  *	    writer exists.  An unsealed/unknown upper bound (InvalidScn) cannot be
  *	    proven safe -> retain.  boundary.infinite (no in-flight writer) -> drain.
  */
