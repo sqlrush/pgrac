@@ -323,10 +323,245 @@ UT_TEST(test_preserve_per_disk_no_amplification)
 }
 
 
+/* ----------
+ * spec-4.12b D1: marker_kind is OBSERVABILITY ONLY -- it survives pack/unpack but
+ * is NEVER part of tuple identity (P0-1), and an old (4.12) reader sees it as the
+ * FENCE default (0).
+ * ----------
+ */
+UT_TEST(test_marker_kind_roundtrip)
+{
+	uint8 reserved1[368];
+	ClusterFenceMarker in;
+	ClusterFenceMarker out;
+	uint8 dead[CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES];
+
+	memset(dead, 0, sizeof(dead));
+	dead[0] = 0x06; /* nodes 1 and 2 */
+	cluster_fence_marker_build_baseline(&in, 8, dead, 3, 0xFEEDU, 1);
+	UT_ASSERT(in.marker_kind == CLUSTER_FENCE_MARKER_KIND_BASELINE);
+
+	memset(reserved1, 0xAB, sizeof(reserved1));
+	cluster_fence_marker_pack(reserved1, &in);
+	UT_ASSERT(cluster_fence_marker_unpack(reserved1, &out));
+	UT_ASSERT(out.marker_kind == CLUSTER_FENCE_MARKER_KIND_BASELINE);
+	UT_ASSERT(out.fence_epoch == 8);
+	UT_ASSERT(out.fence_generation == 3);
+	UT_ASSERT(out.issuer_node_id == 1);
+	UT_ASSERT(out.fenced_dead_bitmap[0] == 0x06);
+}
+
+UT_TEST(test_marker_kind_not_in_equality)
+{
+	/* P0-1: two markers identical in the 4.12 identity (epoch+gen+event_id+issuer+
+	 * dead) but DIFFERENT marker_kind must still compare equal -- kind is not part
+	 * of identity (else a baseline republish of a fence would split the quorum). */
+	ClusterFenceMarker fence = mk_marker(5, 2, 0xAA, 1, 0x04);
+	ClusterFenceMarker base = mk_marker(5, 2, 0xAA, 1, 0x04);
+
+	fence.marker_kind = CLUSTER_FENCE_MARKER_KIND_FENCE;
+	base.marker_kind = CLUSTER_FENCE_MARKER_KIND_BASELINE;
+	UT_ASSERT(cluster_fence_marker_tuple_equal(&fence, &base));
+}
+
+UT_TEST(test_marker_kind_old_reader_default_is_fence)
+{
+	/* mk_marker memsets to 0 -> marker_kind defaults to FENCE (an old 4.12 marker,
+	 * whose pad byte is 0, reads as FENCE). */
+	ClusterFenceMarker m = mk_marker(1, 1, 1, 0, 0x00);
+
+	UT_ASSERT(m.marker_kind == CLUSTER_FENCE_MARKER_KIND_FENCE);
+}
+
+/* ----------
+ * spec-4.12b D5: the PURE double-monotonic refresh guard (P0-2) -- epoch must not
+ * roll back AND the dead set must never shrink (never release a fenced node).
+ * ----------
+ */
+UT_TEST(test_dead_superset)
+{
+	uint8 a[CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES];
+	uint8 b[CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES];
+
+	memset(a, 0, sizeof(a));
+	memset(b, 0, sizeof(b));
+	UT_ASSERT(cluster_fence_dead_superset(a, b)); /* empty covers empty */
+
+	a[0] = 0x07;								   /* {0,1,2} */
+	b[0] = 0x03;								   /* {0,1} */
+	UT_ASSERT(cluster_fence_dead_superset(a, b));  /* {0,1,2} covers {0,1} */
+	UT_ASSERT(!cluster_fence_dead_superset(b, a)); /* {0,1} does NOT cover {0,1,2} */
+
+	b[0] = 0x07;
+	UT_ASSERT(cluster_fence_dead_superset(a, b)); /* equal -> superset */
+}
+
+UT_TEST(test_authority_advances_epoch_monotonic)
+{
+	uint8 dead[CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES];
+
+	memset(dead, 0, sizeof(dead));
+	/* epoch rolls back -> reject regardless of dead set. */
+	UT_ASSERT(!cluster_write_fence_authority_advances(4, dead, 5, dead));
+	/* epoch advances, dead unchanged -> advance. */
+	UT_ASSERT(cluster_write_fence_authority_advances(6, dead, 5, dead));
+	/* same epoch, dead unchanged (steady-state baseline republish) -> advance. */
+	UT_ASSERT(cluster_write_fence_authority_advances(5, dead, 5, dead));
+	/* first authority: latched (0, empty) -> always advances. */
+	UT_ASSERT(cluster_write_fence_authority_advances(5, dead, 0, dead));
+}
+
+UT_TEST(test_authority_advances_dead_superset_required)
+{
+	uint8 latched[CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES];
+	uint8 grown[CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES];
+	uint8 shrunk[CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES];
+
+	memset(latched, 0, sizeof(latched));
+	memset(grown, 0, sizeof(grown));
+	memset(shrunk, 0, sizeof(shrunk));
+	latched[0] = 0x01; /* node 0 fenced */
+	grown[0] = 0x03;   /* nodes 0,1 fenced (superset) */
+	shrunk[0] = 0x00;  /* node 0 released (NOT superset) */
+
+	/* same epoch, dead set grows -> advance. */
+	UT_ASSERT(cluster_write_fence_authority_advances(5, grown, 5, latched));
+	/* same epoch, dead set shrinks -> REJECT (8.A: would release fenced node 0). */
+	UT_ASSERT(!cluster_write_fence_authority_advances(5, shrunk, 5, latched));
+	/* HIGHER epoch but dead set shrinks -> still REJECT (the 8.A key boundary:
+	 * a higher epoch must NOT be allowed to silently release a fenced node). */
+	UT_ASSERT(!cluster_write_fence_authority_advances(6, shrunk, 5, latched));
+	/* higher epoch + grown dead -> advance (legitimate new fence). */
+	UT_ASSERT(cluster_write_fence_authority_advances(6, grown, 5, latched));
+}
+
+UT_TEST(test_build_baseline_fields)
+{
+	ClusterFenceMarker out;
+	uint8 dead[CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES];
+
+	memset(dead, 0, sizeof(dead));
+	dead[1] = 0x80; /* node 15 fenced */
+	cluster_fence_marker_build_baseline(&out, 12, dead, 4, 0xABCDU, 2);
+	UT_ASSERT(out.magic == CLUSTER_FENCE_MARKER_MAGIC);
+	UT_ASSERT(out.version == CLUSTER_FENCE_MARKER_VERSION);
+	UT_ASSERT(out.marker_kind == CLUSTER_FENCE_MARKER_KIND_BASELINE);
+	UT_ASSERT(out.fence_epoch == 12);
+	UT_ASSERT(out.fence_generation == 4);
+	UT_ASSERT(out.fence_event_id == 0xABCDU);
+	UT_ASSERT(out.issuer_node_id == 2);
+	UT_ASSERT(out.fenced_dead_bitmap[1] == 0x80);
+	UT_ASSERT(cluster_fence_marker_node_is_fenced(out.fenced_dead_bitmap, 15));
+}
+
+UT_TEST(test_baseline_tuple_identical_to_fence_same_issuer)
+{
+	/* spec-4.12b P1: a baseline built with issuer = coordinator_node_id is
+	 * tuple-IDENTICAL to the fence marker the coordinator issued for the same
+	 * membership (epoch+gen+event_id+issuer+dead all match; kind differs but kind
+	 * is NOT part of identity).  So the steady-state republish reinforces the fence
+	 * marker's quorum instead of forming a second, competing tuple. */
+	int32 coordinator = 2;
+	uint8 dead[CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES];
+	ClusterFenceMarker fence;
+	ClusterFenceMarker base;
+
+	memset(dead, 0, sizeof(dead));
+	dead[0] = 0x02; /* node 1 fenced by the reconfig */
+
+	/* the fence marker as cluster_reconfig.c builds it: issuer = coordinator. */
+	fence = mk_marker(7, 3, 0x99, coordinator, 0x02);
+
+	/* the baseline republish: issuer = last_applied.coordinator_node_id = same. */
+	cluster_fence_marker_build_baseline(&base, 7, dead, 3, 0x99, coordinator);
+
+	UT_ASSERT(cluster_fence_marker_tuple_equal(&fence, &base)); /* one tuple */
+	UT_ASSERT(base.marker_kind == CLUSTER_FENCE_MARKER_KIND_BASELINE);
+	UT_ASSERT(fence.marker_kind == CLUSTER_FENCE_MARKER_KIND_FENCE);
+}
+
+UT_TEST(test_baseline_pristine_issuer_is_sentinel_and_uniform)
+{
+	/* pristine baseline uses the fixed sentinel issuer so every node's pristine
+	 * baseline is the SAME tuple (reaches majority without depending on who wrote
+	 * it).  Two nodes building the pristine baseline produce equal tuples. */
+	uint8 empty[CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES];
+	ClusterFenceMarker a;
+	ClusterFenceMarker b;
+
+	memset(empty, 0, sizeof(empty));
+	cluster_fence_marker_build_baseline(&a, 0, empty, 0, 0, CLUSTER_FENCE_BASELINE_INITIAL_ISSUER);
+	cluster_fence_marker_build_baseline(&b, 0, empty, 0, 0, CLUSTER_FENCE_BASELINE_INITIAL_ISSUER);
+	UT_ASSERT(cluster_fence_marker_tuple_equal(&a, &b));
+	UT_ASSERT(a.issuer_node_id == CLUSTER_FENCE_BASELINE_INITIAL_ISSUER);
+}
+
+/* ----------
+ * spec-4.12b D2 (U5): the PURE deterministic-leader selector.  The baseline
+ * author is the lowest live node_id in the current alive_bitmap (same rule the
+ * reconfig coordinator uses, cluster_reconfig.c dead_bitmap_lowest_bit_set), so
+ * exactly one node authors the steady-state baseline -- no election, no second
+ * competing per-disk minority marker (R4).  qvotec_self_is_membership_leader()
+ * is just (this == cluster_node_id).
+ * ----------
+ */
+UT_TEST(test_lowest_live_node)
+{
+	uint8 alive[CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES];
+
+	/* empty alive view -> no leader (-1): nobody authors a baseline. */
+	memset(alive, 0, sizeof(alive));
+	UT_ASSERT(cluster_write_fence_lowest_live_node(alive) == -1);
+
+	/* single live node 0 -> leader 0. */
+	alive[0] = 0x01;
+	UT_ASSERT(cluster_write_fence_lowest_live_node(alive) == 0);
+
+	/* live {2,3} (self == 2 would be leader; self == 3 would NOT). */
+	memset(alive, 0, sizeof(alive));
+	alive[0] = 0x0C; /* bits 2,3 */
+	UT_ASSERT(cluster_write_fence_lowest_live_node(alive) == 2);
+
+	/* live {1,2,3} -> leader is the lowest, 1 (so node 2 is no longer leader:
+	 * alive_bitmap change re-selects the leader). */
+	alive[0] = 0x0E; /* bits 1,2,3 */
+	UT_ASSERT(cluster_write_fence_lowest_live_node(alive) == 1);
+
+	/* cross-byte: node 7 (byte0 bit7) + node 8 (byte1 bit0) -> lowest is 7. */
+	memset(alive, 0, sizeof(alive));
+	alive[0] = 0x80; /* node 7 */
+	alive[1] = 0x01; /* node 8 */
+	UT_ASSERT(cluster_write_fence_lowest_live_node(alive) == 7);
+
+	/* high-only: node 8 alone (byte1 bit0) -> leader 8 (scan walks past byte0). */
+	memset(alive, 0, sizeof(alive));
+	alive[1] = 0x80; /* node 15 */
+	UT_ASSERT(cluster_write_fence_lowest_live_node(alive) == 15);
+}
+
+/* ----------
+ * spec-4.12b D3 (Q3=A): the PURE bring-up grace predicate.  Before the hot gate
+ * latches its first authority, an enforcing+attached node grants a grace (the
+ * qvotec quorum gate covers no-quorum); after the latch it falls through to the
+ * strict judge.  A detached region NEVER gets the grace (L110 fail-closed).
+ * ----------
+ */
+UT_TEST(test_grace_before_engage)
+{
+	/* enforcement off -> no grace (the escape hatch lives in decide(), not here). */
+	UT_ASSERT(!cluster_write_fence_grace_before_engage(false, true, false));
+	/* enforcement on, region attached, NOT engaged -> grace (bring-up window). */
+	UT_ASSERT(cluster_write_fence_grace_before_engage(true, true, false));
+	/* enforcement on, region attached, ENGAGED -> no grace (strict from here on). */
+	UT_ASSERT(!cluster_write_fence_grace_before_engage(true, true, true));
+	/* enforcement on, region DETACHED -> no grace (L110: fall through, fail closed). */
+	UT_ASSERT(!cluster_write_fence_grace_before_engage(true, false, false));
+}
+
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(30);
 	UT_RUN(test_enforcement_off_is_escape_hatch);
 	UT_RUN(test_baseline_authorized_is_allowed);
 	UT_RUN(test_detached_region_fails_closed);
@@ -346,6 +581,17 @@ main(void)
 	UT_RUN(test_authority_generation_tiebreak);
 	UT_RUN(test_authority_event_id_distinguishes_tuple);
 	UT_RUN(test_preserve_per_disk_no_amplification);
+	UT_RUN(test_marker_kind_roundtrip);
+	UT_RUN(test_marker_kind_not_in_equality);
+	UT_RUN(test_marker_kind_old_reader_default_is_fence);
+	UT_RUN(test_dead_superset);
+	UT_RUN(test_authority_advances_epoch_monotonic);
+	UT_RUN(test_authority_advances_dead_superset_required);
+	UT_RUN(test_build_baseline_fields);
+	UT_RUN(test_baseline_tuple_identical_to_fence_same_issuer);
+	UT_RUN(test_baseline_pristine_issuer_is_sentinel_and_uniform);
+	UT_RUN(test_lowest_live_node);
+	UT_RUN(test_grace_before_engage);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

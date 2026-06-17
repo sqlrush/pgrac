@@ -56,6 +56,7 @@
 #include <stddef.h>
 
 #include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_reconfig.h"	 /* ReconfigEvent for spec-4.12b D2 stub */
 #include "cluster/cluster_write_fence.h" /* ClusterFenceMarker for D2/D4 stubs */
 
 #undef printf
@@ -331,6 +332,30 @@ void cluster_write_fence_qvotec_complete(bool acked);
 void
 cluster_write_fence_qvotec_complete(bool acked pg_attribute_unused())
 {}
+
+/* spec-4.12b D2/D4/D6 stubs: cluster_qvotec.o now references the enforcement GUC
+ * (D2 author gate), the applied-membership snapshot (D2 baseline build), the
+ * current-epoch upper-bound Assert (cassert), and the D6 baseline observability
+ * note.  cluster_write_fence.o / cluster_guc.o / cluster_reconfig.o / cluster_epoch.o
+ * are not linked here -- provide stubs.  enforcement OFF keeps the baseline-author
+ * branch disabled, so the poll path under test is unchanged. */
+int cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_OFF;
+void cluster_write_fence_note_baseline_published(bool is_leader, bool published);
+void
+cluster_write_fence_note_baseline_published(bool is_leader pg_attribute_unused(),
+											bool published pg_attribute_unused())
+{}
+void
+cluster_reconfig_get_last_event(ReconfigEvent *out)
+{
+	memset(out, 0, sizeof(*out)); /* pristine (event_id == 0): never applied */
+}
+uint64 cluster_epoch_get_current(void);
+uint64
+cluster_epoch_get_current(void)
+{
+	return 0;
+}
 void
 cluster_voting_disk_io_install_timeout_handler(void)
 {}

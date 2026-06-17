@@ -12,27 +12,31 @@
 #    (53R51 / PANIC); the recovery / rejoin paths re-verify the durable
 #    marker (Oracle-aligned authority check, full redo still applied).
 #
-#    Ships default OFF (opt-in): a safe default-ON for a healthy steady-
-#    state cluster needs the baseline-marker subsystem, deferred to a 4.12b
-#    follow-up; without it an unfenced cluster has no durable marker, the
-#    token never refreshes, and the gate would fail every write closed.
+#    spec-4.12b D4: enforcement now ships default ON.  A single node with
+#    no voting disks cannot fence (no shared storage, no quorum authority)
+#    and auto-degrades to a no-op at runtime (cluster_write_fence_enforcing()
+#    == false), so it stays writable out of the box; qvotec logs the degrade
+#    once at startup.  The baseline-marker subsystem (D2) is what makes the
+#    multi-node default-ON safe.
 #
 #    Test matrix (single-node; catalog / GUC / SRF / observability + the
-#    enforcement-off no-op functional path):
+#    single-node auto-degrade no-op functional path):
 #
 #      L1   cluster.write_fence_enforcement GUC registered (enum,
-#           default off, postmaster context)
+#           default ON -- spec-4.12b D4, postmaster context)
 #      L2   cluster.write_fence_lease_ms GUC default 6000ms (sighup)
 #      L3   the "pgrac cluster write fence" shmem region is registered
 #      L4   both write-fence wait events are registered
 #           (ClusterWriteFenceMarkerWrite + ClusterWriteFenceVerify)
-#      L5   the write_fence dump category exposes 4 counters, all 0 at
-#           a fresh start (no fence has fired)
-#      L6   enforcement=off (default) -> the hot gate is a no-op: a
-#           normal heap write/read round-trips (the fence never blocks
-#           an unfenced single node)
+#      L5   the write_fence dump category exposes 8 counters (4 spec-4.12 +
+#           4 spec-4.12b D6 baseline), all 0 at a fresh start (no fence fired)
+#      L6   default ON + no voting disks -> auto-degrade to a no-op: a
+#           normal heap write/read round-trips (the fence never blocks an
+#           unfenced single node)
 #      L7   after the normal write, the 4 counters are still 0 (the gate
-#           did not fire in off mode)
+#           did not fire in the auto-degraded single-node mode)
+#      L8   qvotec logged the single-node auto-degrade notice once at
+#           startup (spec-4.12b D4 LOG-once observability)
 #
 #    NOT reachable single-node (honest forward, mirrors 4.9/4.11):
 #      The fence FIRING scenarios from spec-4.12 §4.2 -- core 8.A marker-
@@ -71,13 +75,13 @@ $node->start;
 
 # ----------
 # L1: cluster.write_fence_enforcement GUC registered (enum / postmaster /
-# default off -- opt-in; safe default-ON needs the 4.12b baseline marker).
+# default ON -- spec-4.12b D4 flipped the default; single node auto-degrades).
 # ----------
 my $enf = $node->safe_psql('postgres',
 	q{SELECT setting, vartype, context FROM pg_settings
 	    WHERE name = 'cluster.write_fence_enforcement'});
-is($enf, 'off|enum|postmaster',
-   'L1 cluster.write_fence_enforcement registered (enum / postmaster / default off)');
+is($enf, 'on|enum|postmaster',
+   'L1 cluster.write_fence_enforcement registered (enum / postmaster / default on)');
 
 
 # ----------
@@ -111,23 +115,27 @@ is($waits, 'ClusterWriteFenceMarkerWrite,ClusterWriteFenceVerify',
 
 
 # ----------
-# L5: the write_fence dump category exposes 4 counters, all 0 at fresh
-# start (no fence has fired).
+# L5: the write_fence dump category exposes 8 counters (the 4 spec-4.12 plus
+# the 4 spec-4.12b D6 baseline-subsystem fields), all 0 at a fresh start.
+# (baseline_published / baseline_authority_age_us can only be exercised by a
+# multi-node cluster authoring a baseline -> D8 e2e on CI; single-node stays 0.)
 # ----------
 my $keys = $node->safe_psql('postgres',
 	q{SELECT string_agg(key, ',' ORDER BY key)
 	    FROM pg_cluster_state WHERE category = 'write_fence'});
 is($keys,
-   'durable_check_blocked,hot_gate_blocked,marker_write_failed,minority_marker_ignored',
-   'L5 write_fence dump category exposes the 4 counters');
+   'baseline_author_is_self,baseline_authority_age_us,baseline_published,'
+	   . 'baseline_stale_rejected,durable_check_blocked,hot_gate_blocked,'
+	   . 'marker_write_failed,minority_marker_ignored',
+   'L5 write_fence dump category exposes the 8 counters (4 spec-4.12 + 4 D6)');
 
 my $all_zero = $node->safe_psql('postgres',
 	q{SELECT bool_and(value = '0') FROM pg_cluster_state WHERE category = 'write_fence'});
-is($all_zero, 't', 'L5 all 4 write_fence counters are 0 at a fresh start');
+is($all_zero, 't', 'L5 all 8 write_fence counters are 0 at a fresh start');
 
 
 # ----------
-# L6: enforcement=off (default) -> the hot gate is a no-op.  A normal heap
+# L6: default ON + no voting disks -> auto-degrade to a no-op.  A normal heap
 # write + read round-trips: the fence never blocks an unfenced single node.
 # ----------
 $node->safe_psql('postgres',
@@ -136,24 +144,34 @@ $node->safe_psql('postgres',
 	q{INSERT INTO wf_smoke SELECT g, 'row' || g FROM generate_series(1, 500) g});
 my $cnt = $node->safe_psql('postgres', q{SELECT count(*) FROM wf_smoke});
 is($cnt, '500',
-   'L6 enforcement=off: cluster_smgr write/extend gate is a no-op (500 rows written + read)');
+   'L6 single-node auto-degrade: cluster_smgr write/extend gate is a no-op (500 rows)');
 
 # A truncate + re-extend exercises the truncate / extend gate entries too.
 $node->safe_psql('postgres', q{TRUNCATE wf_smoke});
 $node->safe_psql('postgres',
 	q{INSERT INTO wf_smoke SELECT g, 'r' || g FROM generate_series(1, 50) g});
 my $cnt2 = $node->safe_psql('postgres', q{SELECT count(*) FROM wf_smoke});
-is($cnt2, '50', 'L6 truncate + re-extend also pass the gate in off mode');
+is($cnt2, '50', 'L6 truncate + re-extend also pass the gate in auto-degraded mode');
 
 
 # ----------
 # L7: after the normal writes, the 4 counters are STILL 0 -- the gate did
-# not fire in off mode (no false-positive fencing of an unfenced node).
+# not fire (no false-positive fencing of an unfenced single node).
 # ----------
 my $still_zero = $node->safe_psql('postgres',
 	q{SELECT bool_and(value = '0') FROM pg_cluster_state WHERE category = 'write_fence'});
 is($still_zero, 't',
-   'L7 write_fence counters stay 0 after normal writes (gate did not fire in off mode)');
+   'L7 write_fence counters stay 0 after normal writes (gate did not fire)');
+
+
+# ----------
+# L8: spec-4.12b D4 -- qvotec logs the single-node auto-degrade notice once at
+# startup (enforcement=on but no voting disks -> write fence inactive).  This is
+# the observable proof that default-ON does not silently block a single node.
+# ----------
+ok($node->log_contains(
+	   qr/enforcement is on but no voting disks are configured; the write fence is inactive/),
+   'L8 qvotec logged the single-node auto-degrade notice (D4 LOG-once)');
 
 
 $node->stop;

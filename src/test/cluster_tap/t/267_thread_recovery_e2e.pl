@@ -33,7 +33,8 @@
 #    end to end -- a MECHANISM-COMPLETION demonstration, NOT a fully faithful
 #    fenced-dead-node scenario (a real death would fence node1 so it cannot race
 #    the survivor's shared-storage writes).  The faithful fenced-death happy-path is
-#    forward-linked.
+#    closed by L8 below (spec-4.12b D8): under enforcement default-ON the inject
+#    fences node1, and L8 proves node1's own cluster_smgr write then fails closed.
 #
 #    Anti-false-green pins (every leg fails if the path is skipped out of scope):
 #      L3  slot reaches DONE  -- only reachable if decide_scope was APPLICABLE
@@ -61,6 +62,8 @@
 #      L6   local_complete(thread_2) = true: the D3 unfreeze gate is now open.
 #      L7   idempotent: slot stays DONE across ticks (no re-launch / worker storm;
 #           should_launch skips a DONE slot at the current epoch).
+#      L8   (spec-4.12b D8) default-ON: the declared-dead but still-alive node1's
+#           own cluster_smgr write fails closed (53R51) -- closes the caveat.
 #
 # Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
@@ -222,6 +225,29 @@ for (1 .. 5) {
 	$stable = 0 if slot2() ne '2';
 }
 ok($stable, 'L7 idempotent: slot stays DONE across ticks (no re-launch / worker storm)');
+
+# ----------
+# L8 (spec-4.12b D8 L9): close the 4.11 faithful-fenced-death caveat.  With
+# enforcement default ON (4.12b D4), the inject above wrote a durable fence marker
+# declaring node1 dead (node1 is in the dead_bitmap at the bumped epoch).  node1 is
+# still ALIVE, so its OWN qvotec poll reads that marker, sets self_fenced, and every
+# cluster_smgr shared-storage write fails closed (53R51) -- node1 can no longer race
+# the survivor's writes.  We retry to absorb the poll/refresh latency; the loop
+# succeeds the moment node1's token observes the fence.
+# ----------
+my $fenced = 0;
+for (1 .. 40) {
+	my ($rc, $out, $err) = $n1->psql('postgres',
+		q{INSERT INTO n1_t SELECT g, g FROM generate_series(501, 700) g});
+	if ($rc != 0 && $err =~ /write[ -]?fenced|53R51|cluster shared-storage .* rejected/) {
+		$fenced = 1;
+		last;
+	}
+	usleep(250_000);
+}
+ok($fenced,
+	'L8 (4.12b D8) default-ON: declared-dead but alive node1 cluster_smgr write -> '
+	  . 'write-fenced 53R51 (closes the 4.11 faithful-fenced-death caveat)');
 
 $pair->stop_pair;
 done_testing();
