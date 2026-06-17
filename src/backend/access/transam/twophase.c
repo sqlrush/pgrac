@@ -710,6 +710,36 @@ GetPreparedTransactionList(GlobalTransaction *gxacts)
 	return num;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * GetNumberOfPreparedTransactions
+ *
+ * PGRAC (spec-4.12a D1): non-allocating count of prepared transactions
+ * currently tracked in TwoPhaseState (live + crash-recovered).  The cluster
+ * undo record-segment drain gate (硬门 6) uses it to retain ALL undo
+ * record-segment ACTIVE -> COMMITTED advances while any prepared xact is
+ * unresolved -- a prepared cluster-TT xact's undo may still be consumed by
+ * ROLLBACK PREPARED (spec-4.8 D7-A), and PostPrepare_ClusterTT has already
+ * dropped its backend-local active-write registry entry by then.  The
+ * GlobalTransaction is added at EndPrepare, BEFORE PostPrepare clears that
+ * entry, so a drain that observes the cleared entry also observes count >= 1
+ * (no handoff gap).  Read under TwoPhaseStateLock SHARED, like
+ * GetPreparedTransactionList; cheap because callers short-circuit when
+ * max_prepared_xacts == 0.
+ */
+int
+GetNumberOfPreparedTransactions(void)
+{
+	int num;
+
+	LWLockAcquire(TwoPhaseStateLock, LW_SHARED);
+	num = TwoPhaseState->numPrepXacts;
+	LWLockRelease(TwoPhaseStateLock);
+
+	return num;
+}
+#endif							/* USE_PGRAC_CLUSTER */
+
 
 /* Working status for pg_prepared_xact */
 typedef struct {

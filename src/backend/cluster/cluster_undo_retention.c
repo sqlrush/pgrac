@@ -140,3 +140,92 @@ cluster_undo_segment_recyclable(const struct UndoSegmentHeaderData *hdr, SCN hor
 
 	return scn_time_cmp(watermark, horizon) < 0;
 }
+
+
+/*
+ * cluster_undo_record_segment_drainable -- spec-4.12a D1.
+ *
+ *	Decide whether a record segment may advance SEGMENT_ACTIVE -> COMMITTED.
+ *	Pure: a function of the on-disk header plus the caller-supplied active-write
+ *	boundary, the unresolved-prepared flag, and the three excluded segment ids
+ *	(every shmem read is performed by the caller in cluster_undo_record.c).
+ *	Once COMMITTED, cluster_undo_segment_recyclable() above still gates the
+ *	actual reclaim under the retention horizon, so this is purely a liveness
+ *	(reclaim-eligibility) gate, never a reader-visibility gate.
+ *
+ *	Six 8.A hard gates (spec-4.12a §0), every one fail-closed toward "retain":
+ *	  - candidate state: only SEGMENT_ACTIVE (FULL is a flag, not a state, so a
+ *	    FULL-but-ACTIVE segment IS a candidate).  ALLOCATED / COMMITTED /
+ *	    RECYCLABLE / INVALID / NULL -> retain (硬门 4: unexpected state is safe).
+ *	  - guard 2: never the spec-3.4b fixed first segment (shared with the
+ *	    record write cursor's start; reclaiming it would corrupt the cursor).
+ *	  - guard 3: never the record cursor's or the TT cursor's current segment.
+ *	  - guard 6: any unresolved cluster-TT prepared xact -> retain ALL advances
+ *	    (its undo may still be consumed by ROLLBACK PREPARED; Q11-A minimal-safe).
+ *	  - guard 1: the segment's sealed upper bound (record_seal_upper_scn) must be
+ *	    strictly below the oldest active-write boundary.  Each in-flight writer
+ *	    registered first_undo_scn BEFORE claiming an extent in (hence sealing)
+ *	    this segment, so boundary <= first_undo_scn <= seal whenever an in-flight
+ *	    writer has undo here; strict '<' therefore retains exactly while such a
+ *	    writer exists.  An unsealed/unknown upper bound (InvalidScn) cannot be
+ *	    proven safe -> retain.  boundary.infinite (no in-flight writer) -> drain.
+ */
+bool
+cluster_undo_record_segment_drainable(const struct UndoSegmentHeaderData *hdr,
+									  ClusterUndoActiveBoundary boundary,
+									  bool any_unresolved_prepared, uint32 fixed_first_segment_id,
+									  uint32 active_record_segment_id, uint32 active_tt_segment_id,
+									  bool recovery_in_progress)
+{
+	SCN seal_upper_scn;
+
+	if (hdr == NULL)
+		return false;
+
+	/*
+	 * guard 0 (spec-4.12a D3, crash-recovery, 硬门 4): never drain while the
+	 * server is replaying WAL.  A crash empties the in-memory active-write
+	 * registry, so the caller's boundary degrades to {infinite}; that cannot
+	 * prove the absence of prepared / in-flight undo until
+	 * RecoverPreparedTransactions has rebuilt the protected-slot view.  Draining
+	 * during recovery is therefore never provably safe -> retain (fail-closed),
+	 * overriding every per-segment gate below.  This is the single auditable
+	 * recovery decision point; the imperative callers reach it only post-PM_RUN
+	 * (so it is also belt-and-suspenders), but the gate keeps the invariant
+	 * local and robust to future recovery-time callers.
+	 */
+	if (recovery_in_progress)
+		return false;
+
+	/* Only an ACTIVE record segment is a drain candidate (硬门 4). */
+	if (hdr->segment_state != SEGMENT_ACTIVE)
+		return false;
+
+	/* guard 2: the spec-3.4b fixed first segment is never drained. */
+	if (hdr->segment_id == fixed_first_segment_id)
+		return false;
+
+	/* guard 3: neither the record nor the TT cursor's current segment. */
+	if (hdr->segment_id == active_record_segment_id)
+		return false;
+	if (hdr->segment_id == active_tt_segment_id)
+		return false;
+
+	/* guard 6: conservatively retain all while any prepared xact is unresolved. */
+	if (any_unresolved_prepared)
+		return false;
+
+	/* guard 1 (in-flight): an unsealed/unknown upper bound cannot be proven
+	 * safe -> retain (fail-closed). */
+	seal_upper_scn = UndoSegmentHeader_record_seal_upper_scn(hdr);
+	if (!SCN_VALID(seal_upper_scn))
+		return false;
+
+	/* No in-flight writer at all -> every sealed segment drains (quiesce). */
+	if (boundary.infinite)
+		return true;
+
+	/* Strict '<': boundary == seal means an in-flight writer may have begun
+	 * exactly at the seal point -> retain (equality is not safe). */
+	return scn_time_cmp(seal_upper_scn, boundary.scn) < 0;
+}

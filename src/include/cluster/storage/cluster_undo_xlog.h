@@ -213,7 +213,12 @@ StaticAssertDecl(sizeof(xl_undo_tt_slot_set_head) == 32,
  *   header writes before the recycle transition are not all fsync-protected,
  *   so crash redo may legitimately see ALLOCATED / ACTIVE / COMMITTED even
  *   though the WAL recycle record proves the segment had reached COMMITTED
- *   at insert time.  A HIGHER disk generation means a later whole-segment
+ *   at insert time.  spec-4.12a relies on exactly this tolerance: a *record*
+ *   segment now also advances ACTIVE -> COMMITTED via a no-WAL direct header
+ *   write (cluster_undo_try_mark_record_segment_committed), identical in shape
+ *   to the TT-segment mark_committed, so its post-crash on-disk state is the
+ *   same set of not-newer values and needs no new redo opcode.  A HIGHER disk
+ *   generation means a later whole-segment
  *   reuse is already durable -> stale skip.  A LOWER disk generation is
  *   impossible once the preceding XLOG_UNDO_SEGMENT_REUSE has replayed ->
  *   corruption, PANIC (spec-3.13 v0.3 (2): no silent skip).

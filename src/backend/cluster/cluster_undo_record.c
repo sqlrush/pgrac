@@ -59,6 +59,7 @@
 #include <sys/stat.h>
 
 #include "miscadmin.h"
+#include "access/twophase.h" /* spec-4.12a D1: prepared-xact guard (硬门 6) */
 #include "access/xact.h"
 #include "port/atomics.h"
 #include "storage/fd.h"
@@ -81,6 +82,7 @@
 #include "cluster/cluster_undo_format.h"
 #include "cluster/cluster_undo_record.h"
 #include "cluster/cluster_undo_record_api.h"
+#include "cluster/cluster_undo_retention.h" /* spec-4.12a D1: drain gate + boundary */
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_undo_extent.h"	  /* spec-3.18 D3 per-txn extent */
@@ -159,6 +161,14 @@ typedef struct ClusterUndoRecordShared {
 	 * also bump this. */
 	pg_atomic_uint64 segment_retain_skip_count;
 
+	/* spec-4.12a D1: record-segment ACTIVE -> COMMITTED drain observability.
+	 *   record_segments_committed             : record segments advanced to
+	 *     COMMITTED by the rollover / cleaner drain gate (the leak fix).
+	 *   record_seg_commit_skipped_inflight    : drain attempts retained by a
+	 *     hard gate (proves the 8.A guard actually fires; D4 L4 asserts > 0). */
+	pg_atomic_uint64 record_segments_committed;
+	pg_atomic_uint64 record_seg_commit_skipped_inflight;
+
 	/* P0 perf hardening (2026-05-31): per-commit (group) undo fsync.
 	 * Durability ordering unchanged (undo durable BEFORE commit visible), but
 	 * fsync granularity moved from per-record (inside cursor_lock) to per-xact
@@ -185,10 +195,34 @@ typedef struct ClusterUndoRecordShared {
 	 * re-acquire cursor_lock 发布 NEW active.  禁止同时长期持有两锁
 	 * 做 I/O (但 lifecycle_lock 可持有期间 file create + fsync). */
 	LWLockPadded lifecycle_lock;
+	/* spec-4.12a D1: protects the active-write boundary registry (the
+	 * per-backend first_undo_scn slot array that lives immediately after this
+	 * struct in shmem).  Registration (write own slot) is once per top-xact;
+	 * boundary computation (scan all slots) runs at rollover / cleaner drain.
+	 * Lock order: lifecycle_lock -> registry_lock (the drain holds lifecycle_
+	 * lock first); registration holds registry_lock alone. */
+	LWLockPadded registry_lock;
 } ClusterUndoRecordShared;
 
 
 static ClusterUndoRecordShared *UndoRecordShared = NULL;
+
+/*
+ * spec-4.12a D1: active-write boundary registry.
+ *
+ *	cluster_undo_write_registry points at a MaxBackends-element SCN array that
+ *	lives immediately after ClusterUndoRecordShared in the same shmem region
+ *	(no NEW region -- spec Q6 / L254).  Slot [MyBackendId - 1] holds this
+ *	backend's current top-transaction first_undo_scn, or InvalidScn when it has
+ *	no in-flight undo.  The minimum over valid slots is the "oldest active-write
+ *	boundary"; a record segment sealed strictly below it has no in-flight
+ *	writer's undo and may drain (cluster_undo_record_segment_drainable).
+ */
+static SCN *cluster_undo_write_registry = NULL;
+
+/* This backend already registered first_undo_scn for the current top-xact
+ * (idempotent guard; cleared in cluster_undo_record_xact_reset). */
+static bool cluster_undo_write_registered = false;
 
 /* Per-backend state(D16 PREPARE guard support). */
 static bool cluster_undo_touched_in_xact = false;
@@ -393,7 +427,12 @@ cluster_undo_local_head_get(uint16 tt_slot_segment_id, uint16 tt_slot_offset)
 Size
 cluster_undo_record_shmem_size(void)
 {
-	return MAXALIGN(sizeof(ClusterUndoRecordShared));
+	Size sz = MAXALIGN(sizeof(ClusterUndoRecordShared));
+
+	/* spec-4.12a D1: per-backend active-write registry slots trail the struct
+	 * (GCS pattern).  Sized for MaxBackends; addressed by MyBackendId - 1. */
+	sz = add_size(sz, mul_size((Size)MaxBackends, sizeof(SCN)));
+	return sz;
 }
 
 
@@ -407,12 +446,16 @@ void
 cluster_undo_record_shmem_init(void)
 {
 	bool found;
+	char *base;
 
-	UndoRecordShared
-		= ShmemInitStruct("ClusterUndoRecordShared", cluster_undo_record_shmem_size(), &found);
+	base = ShmemInitStruct("ClusterUndoRecordShared", cluster_undo_record_shmem_size(), &found);
+	UndoRecordShared = (ClusterUndoRecordShared *)base;
+	/* spec-4.12a D1: registry slots immediately follow the struct. */
+	cluster_undo_write_registry = (SCN *)(base + MAXALIGN(sizeof(ClusterUndoRecordShared)));
 
 	if (!found) {
 		int tranche_id = LWLockNewTrancheId();
+		int i;
 
 		memset(UndoRecordShared, 0, sizeof(*UndoRecordShared));
 		UndoRecordShared->active_segment_id = 0;
@@ -439,6 +482,10 @@ cluster_undo_record_shmem_init(void)
 		pg_atomic_init_u64(&UndoRecordShared->segment_retain_skip_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->extent_claim_count, 0); /* spec-3.18 D3 */
 
+		/* spec-4.12a D1: record-segment drain counters. */
+		pg_atomic_init_u64(&UndoRecordShared->record_segments_committed, 0);
+		pg_atomic_init_u64(&UndoRecordShared->record_seg_commit_skipped_inflight, 0);
+
 		/* P0 perf hardening: per-commit undo fsync counters. */
 		pg_atomic_init_u64(&UndoRecordShared->commit_fsync_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->commit_fsync_segment_count, 0);
@@ -450,7 +497,14 @@ cluster_undo_record_shmem_init(void)
 
 		LWLockInitialize(&UndoRecordShared->cursor_lock.lock, tranche_id);
 		LWLockInitialize(&UndoRecordShared->lifecycle_lock.lock, tranche_id);
+		/* spec-4.12a D1: registry_lock shares the cursor tranche (no NEW
+		 * wait-event tranche name -> no wait-event baseline ripple). */
+		LWLockInitialize(&UndoRecordShared->registry_lock.lock, tranche_id);
 		LWLockRegisterTranche(tranche_id, "cluster_undo_record_cursor");
+
+		/* spec-4.12a D1: every active-write registry slot starts empty. */
+		for (i = 0; i < MaxBackends; i++)
+			cluster_undo_write_registry[i] = InvalidScn;
 	}
 }
 
@@ -463,9 +517,10 @@ static const ClusterShmemRegion cluster_undo_record_region = {
 	.size_fn = cluster_undo_record_shmem_size,
 	.init_fn = cluster_undo_record_shmem_init,
 	/* spec-3.8 D3: lwlock_count 1 → 2 (cursor_lock + lifecycle_lock).
-	 * lifecycle_lock 复用 cluster_undo_record_cursor region per
-	 * L206 5 步流程 — 不引入 NEW region. */
-	.lwlock_count = 2,
+	 * spec-4.12a D1: → 3 (+ registry_lock, same region/tranche — no NEW
+	 * region/tranche per L206/L254).  Informational; LWLocks are embedded in
+	 * the struct and initialized in shmem_init. */
+	.lwlock_count = 3,
 	.owner_subsys = "cluster_undo_record",
 	.reserved_flags = 0,
 };
@@ -474,6 +529,227 @@ void
 cluster_undo_record_shmem_register(void)
 {
 	cluster_shmem_register_region(&cluster_undo_record_region);
+}
+
+
+/* ============================================================
+ * spec-4.12a D1: active-write boundary registry + record-segment drain gate.
+ * ============================================================ */
+
+/*
+ * cluster_undo_active_write_register -- publish this top-transaction's
+ *	first_undo_scn so a record segment it writes into is retained until it
+ *	commits / aborts / prepares.
+ *
+ *	8.A ORDERING (R1c, spec-4.12a §3-2c): the caller invokes this BEFORE the
+ *	transaction's first undo record can become visible in any segment (before
+ *	the residual-extent reuse, the active_segment_id read, and the undo block
+ *	write in cluster_undo_record_alloc) and BEFORE advancing the SCN for that
+ *	record (first_undo_scn = cluster_scn_current() <= every write_scn it later
+ *	stamps).  The registry_lock release here happens-before the eventual seal's
+ *	registry_lock acquire (the segment can only seal after this writer's undo
+ *	has filled it), so the drain always sees this entry.  Idempotent per
+ *	top-xact via cluster_undo_write_registered.
+ */
+static void
+cluster_undo_active_write_register(SCN first_undo_scn)
+{
+	int idx;
+
+	if (cluster_undo_write_registered)
+		return; /* already registered this top-xact */
+	if (UndoRecordShared == NULL || cluster_undo_write_registry == NULL)
+		return;
+	if (!SCN_VALID(first_undo_scn))
+		return; /* nothing to bound */
+
+	idx = (int)MyBackendId - 1;
+	if (idx < 0 || idx >= MaxBackends)
+		return; /* non-backend writer (e.g. startup redo) does not register */
+
+	LWLockAcquire(&UndoRecordShared->registry_lock.lock, LW_EXCLUSIVE);
+	cluster_undo_write_registry[idx] = first_undo_scn;
+	LWLockRelease(&UndoRecordShared->registry_lock.lock);
+	cluster_undo_write_registered = true;
+}
+
+/*
+ * cluster_undo_active_write_unregister -- drop this backend's registry entry at
+ *	end of top-xact (commit / abort / PREPARE; all route through
+ *	cluster_undo_record_xact_reset).  On PREPARE the prepared-xact guard (硬门
+ *	6) takes over keeping the undo alive -- see cluster_undo_any_unresolved_
+ *	prepared(); the GlobalTransaction is already in TwoPhaseState (EndPrepare)
+ *	before PostPrepare_ClusterTT reaches here, so the handoff has no gap.
+ */
+static void
+cluster_undo_active_write_unregister(void)
+{
+	int idx;
+
+	if (!cluster_undo_write_registered)
+		return;
+	cluster_undo_write_registered = false;
+
+	if (UndoRecordShared == NULL || cluster_undo_write_registry == NULL)
+		return;
+	idx = (int)MyBackendId - 1;
+	if (idx < 0 || idx >= MaxBackends)
+		return;
+
+	LWLockAcquire(&UndoRecordShared->registry_lock.lock, LW_EXCLUSIVE);
+	cluster_undo_write_registry[idx] = InvalidScn;
+	LWLockRelease(&UndoRecordShared->registry_lock.lock);
+}
+
+/*
+ * cluster_undo_active_write_boundary -- the oldest active-write boundary: the
+ *	minimum first_undo_scn over all registered in-flight writers, or
+ *	{ infinite = true } when none is registered (quiesce).  Scans under
+ *	registry_lock SHARED.  Caller holds lifecycle_lock (drain path); the
+ *	lifecycle_lock -> registry_lock order is never inverted (registration takes
+ *	registry_lock alone).
+ */
+static ClusterUndoActiveBoundary
+cluster_undo_active_write_boundary(void)
+{
+	ClusterUndoActiveBoundary b;
+	int i;
+
+	b.infinite = true;
+	b.scn = InvalidScn;
+
+	if (UndoRecordShared == NULL || cluster_undo_write_registry == NULL)
+		return b; /* unreachable on the active drain path (caller guards). */
+
+	LWLockAcquire(&UndoRecordShared->registry_lock.lock, LW_SHARED);
+	for (i = 0; i < MaxBackends; i++) {
+		SCN s = cluster_undo_write_registry[i];
+
+		if (!SCN_VALID(s))
+			continue;
+		if (b.infinite || scn_time_cmp(s, b.scn) < 0) {
+			b.infinite = false;
+			b.scn = s;
+		}
+	}
+	LWLockRelease(&UndoRecordShared->registry_lock.lock);
+	return b;
+}
+
+/*
+ * cluster_undo_any_unresolved_prepared -- 硬门 6 signal: is there ANY unresolved
+ *	cluster-TT prepared transaction whose undo may still be consumed by ROLLBACK
+ *	PREPARED (spec-4.8 D7-A)?  Two sources, both sound across the EndPrepare ->
+ *	PostPrepare handoff:
+ *	  - TwoPhaseState (live + crash-recovered): the GlobalTransaction is added
+ *	    at EndPrepare, BEFORE PostPrepare_ClusterTT clears this backend's
+ *	    registry slot, so a drain that sees the slot cleared also sees the count
+ *	    >= 1.  Skipped entirely when 2PC is disabled (max_prepared_xacts == 0).
+ *	  - the spec-3.15 D6 protected-slot map (crash-recovered re-pins), checked
+ *	    first as a cheap belt-and-suspenders.
+ *	Conservative (counts non-cluster prepared xacts too): Q11-A minimal-safe.
+ */
+static bool
+cluster_undo_any_unresolved_prepared(void)
+{
+	if (cluster_tt_slot_protected_count() > 0)
+		return true;
+	if (max_prepared_xacts > 0 && GetNumberOfPreparedTransactions() > 0)
+		return true;
+	return false;
+}
+
+/*
+ * cluster_undo_try_mark_record_segment_committed -- spec-4.12a D1 (§2.1).
+ *
+ *	Attempt to advance record segment `seg` SEGMENT_ACTIVE -> COMMITTED under
+ *	the six 8.A hard gates (cluster_undo_record_segment_drainable).  Two call
+ *	sites:
+ *	  - record-cursor autoextend rollover (primary): seal_scn = current SCN,
+ *	    which is stamped as the segment's conservative upper bound the first
+ *	    time it is sealed;
+ *	  - the cleaner's skipped-ACTIVE fallback pass (D2): seal_scn = InvalidScn,
+ *	    re-evaluating an already-sealed segment (covers "in-flight at rollover,
+ *	    committed later", Q3-C).
+ *	Caller MUST hold lifecycle_lock (serializes the block-0 RMW against
+ *	rollover / extend / reuse), mirroring cluster_undo_tt_rollover_locked.
+ *
+ *	ONE header RMW: read block 0; stamp record_seal_upper_scn iff seal_scn is
+ *	valid and the slot is still unsealed; evaluate the drain gate; set COMMITTED
+ *	iff drainable; write back + fsync iff anything changed.  Every uncertainty
+ *	(read fail, identity mismatch, non-ACTIVE state, gate false) leaves the
+ *	segment ACTIVE -- fail-closed toward "retain" (硬门 1/4); the cleaner
+ *	re-evaluates next pass.  Best-effort write (no ereport): a failed COMMITTED
+ *	write just retains the segment for another pass.
+ */
+void
+cluster_undo_try_mark_record_segment_committed(uint32 seg, uint8 owner_instance, SCN seal_scn)
+{
+	PGAlignedBlock blockbuf;
+	UndoSegmentHeaderData *hdr;
+	bool dirty = false;
+
+	if (UndoRecordShared == NULL || seg == 0)
+		return;
+
+	if (!cluster_undo_smgr_read_block(seg, owner_instance, 0, blockbuf.data))
+		return; /* read fail -> retain (best-effort) */
+	if (!cluster_undo_segment_header_identity_ok(blockbuf.data, seg, owner_instance))
+		return; /* L212: identity, not template bytes -> retain */
+	hdr = (UndoSegmentHeaderData *)blockbuf.data;
+
+	/* Seal stamp (rollover path): persist the conservative upper bound the
+	 * first time this segment is sealed; never overwrite an existing seal. */
+	if (SCN_VALID(seal_scn) && !SCN_VALID(UndoSegmentHeader_record_seal_upper_scn(hdr))) {
+		UndoSegmentHeader_set_record_seal_upper_scn(hdr, seal_scn);
+		dirty = true;
+	}
+
+	if (hdr->segment_state == SEGMENT_ACTIVE) {
+		int node_id = (int)owner_instance - 1;
+		uint32 fixed_first = (uint32)node_id * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+		ClusterUndoActiveBoundary boundary = cluster_undo_active_write_boundary();
+		bool any_prepared = cluster_undo_any_unresolved_prepared();
+		uint32 active_rec = UndoRecordShared->active_segment_id;
+		uint32 active_tt = cluster_tt_slot_current_segment(node_id);
+		/* spec-4.12a D3 (硬门 4): a crash empties the in-memory active-write
+		 * registry, so the boundary degrades to {infinite} and cannot detect
+		 * prepared / in-flight undo until RecoverPreparedTransactions rebuilds
+		 * the protected-slot view.  Both call sites are unreachable during
+		 * recovery (backends do not allocate undo while replaying WAL; the undo
+		 * cleaner is only spawned at PM_RUN, which is post-recovery), but pass
+		 * the flag so the drain gate stays the single auditable fail-closed
+		 * recovery decision point. */
+		bool in_recovery = RecoveryInProgress();
+
+		if (cluster_undo_record_segment_drainable(hdr, boundary, any_prepared, fixed_first,
+												  active_rec, active_tt, in_recovery)) {
+			hdr->segment_state = SEGMENT_COMMITTED;
+			dirty = true;
+			pg_atomic_fetch_add_u64(&UndoRecordShared->record_segments_committed, 1);
+		} else {
+			pg_atomic_fetch_add_u64(&UndoRecordShared->record_seg_commit_skipped_inflight, 1);
+		}
+	}
+
+	if (dirty)
+		(void)cluster_undo_smgr_write_block(seg, owner_instance, 0, blockbuf.data, true);
+}
+
+uint64
+cluster_undo_record_segments_committed_count(void)
+{
+	if (UndoRecordShared == NULL)
+		return 0;
+	return pg_atomic_read_u64(&UndoRecordShared->record_segments_committed);
+}
+
+uint64
+cluster_undo_record_seg_commit_skipped_inflight_count(void)
+{
+	if (UndoRecordShared == NULL)
+		return 0;
+	return pg_atomic_read_u64(&UndoRecordShared->record_seg_commit_skipped_inflight);
 }
 
 
@@ -834,8 +1110,23 @@ claim_undo_extent(ClusterUndoExtent *ext, uint8 owner_instance, uint32 ensured_s
 		}
 		pg_atomic_fetch_add_u64(&UndoRecordShared->autoextend_count, 1);
 		pg_atomic_fetch_add_u64(&UndoRecordShared->segment_switch_count, 1);
-		if (old_seg != 0 && old_seg != new_seg)
+		if (old_seg != 0 && old_seg != new_seg) {
 			(void)cluster_undo_segment_mark_full(old_seg, owner_instance);
+
+			/*
+			 * spec-4.12a D1: the record cursor just rolled away from old_seg.
+			 * Seal it with the current SCN (a conservative upper bound on every
+			 * record it holds; every in-flight writer registered first_undo_scn
+			 * <= this) and try to advance it ACTIVE -> COMMITTED so the cleaner
+			 * can reclaim it -- the leak fix.  Held lifecycle_lock orders the
+			 * block-0 RMW.  GUC off = legacy leak behaviour (does not gate the
+			 * 8.A guard, only the optimization; see spec §2.3).  In-flight /
+			 * prepared segments stay ACTIVE and the cleaner re-evaluates (D2).
+			 */
+			if (cluster_undo_record_segment_commit_on_rollover)
+				cluster_undo_try_mark_record_segment_committed(old_seg, owner_instance,
+															   cluster_scn_current());
+		}
 		seg = new_seg;
 		needs_activation = true;
 		hw = 1; /* fresh segment: data blocks from 1 */
@@ -1012,6 +1303,16 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 			effective_prev_uba = prev_uba;
 	}
 	first_in_tx = UBA_is_invalid(effective_prev_uba);
+
+	/*
+	 * spec-4.12a D1 (R1c happens-before): register this top-transaction's
+	 * first_undo_scn in the active-write boundary registry BEFORE advancing the
+	 * SCN for this record and BEFORE the residual-extent reuse / undo block
+	 * write below.  first_undo_scn = current SCN <= every write_scn this xact
+	 * stamps, so any record segment sealed at >= this value is retained until
+	 * this writer resolves (8.A guard 1).  Idempotent per top-xact.
+	 */
+	cluster_undo_active_write_register(cluster_scn_current());
 
 	/* SCN stamp for write_scn (advance Lamport). */
 	current_scn = cluster_scn_advance();
@@ -1458,6 +1759,10 @@ cluster_undo_record_xact_reset(void)
 	}
 
 	cluster_undo_touched_in_xact = false;
+	/* spec-4.12a D1: drop this backend's active-write registry entry (commit /
+	 * abort / PREPARE all reach here).  On PREPARE the prepared-xact guard (硬门
+	 * 6) keeps the undo alive past this point. */
+	cluster_undo_active_write_unregister();
 	memset(cluster_undo_local_heads, 0, sizeof(cluster_undo_local_heads));
 	cluster_undo_local_head_count = 0;
 	cluster_undo_touched_seg_count = 0;
@@ -1877,6 +2182,41 @@ cluster_undo_segment_advance_recyclable(uint32 segment_id, SCN horizon)
 	LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
 
 	return result;
+}
+
+
+/*
+ * cluster_undo_segment_advance_committed -- spec-4.12a D2 (Q3-C cleaner
+ *	fallback, correctness-necessary).
+ *
+ *	Re-evaluate a rolled-away record segment for the ACTIVE -> COMMITTED drain.
+ *	The rollover-time attempt (cluster_undo_record_alloc) always runs while the
+ *	writing transaction is still in-flight, so it stamps the seal but RETAINS
+ *	the segment (guard 1); only after that writer commits / aborts can the
+ *	segment drain.  Nothing re-triggers the rollover path, so without this
+ *	cleaner pass the segment would stay SEGMENT_ACTIVE forever -- the spec-4.13
+ *	leak.  Acquires lifecycle_lock (mirrors cluster_undo_segment_advance_
+ *	recyclable) and calls the shared drain helper with seal_scn =
+ *	cluster_scn_current(): for an already-sealed segment the stamp is a no-op
+ *	(the helper never overwrites an existing seal); for a segment rolled away
+ *	with the GUC off (never sealed) `now` is a safe conservative upper bound (a
+ *	rolled-away non-active segment receives no further writes and every
+ *	in-flight writer registered first_undo_scn <= now).  The active record / TT
+ *	segment is excluded by the drain gate itself (guard 3).
+ */
+void
+cluster_undo_segment_advance_committed(uint32 segment_id)
+{
+	uint8 owner;
+
+	if (UndoRecordShared == NULL || cluster_node_id < 0)
+		return;
+
+	owner = (uint8)(cluster_node_id + 1);
+
+	LWLockAcquire(&UndoRecordShared->lifecycle_lock.lock, LW_EXCLUSIVE);
+	cluster_undo_try_mark_record_segment_committed(segment_id, owner, cluster_scn_current());
+	LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
 }
 
 

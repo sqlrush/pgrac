@@ -400,6 +400,18 @@ undo_cleaner_run_pass(void)
 					continue; /* absent / unreadable: retry next pass */
 				batch--;
 
+				/*
+				 * spec-4.12a D2 (Q3-C): a record segment that was in-flight when
+				 * the record cursor rolled away from it stays SEGMENT_ACTIVE
+				 * after its writers commit -- the rollover-time drain retained
+				 * it and nothing re-triggers that path.  Re-evaluate it here for
+				 * ACTIVE -> COMMITTED so the recyclable advance below can reclaim
+				 * it (the leak fix).  GUC off keeps the legacy lazy behaviour and
+				 * never gates the 8.A guard (spec §2.3).
+				 */
+				if (cluster_undo_record_segment_commit_on_rollover)
+					cluster_undo_segment_advance_committed(seg);
+
 				if (cluster_undo_segment_advance_recyclable(seg, horizon)
 					== CLUSTER_SEG_RECYCLE_ADVANCED)
 					stats.segments_marked_recyclable++;

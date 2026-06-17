@@ -223,5 +223,19 @@ extern uint32 cluster_undo_record_active_segment_id(void);
 extern ClusterUndoSegTryRecycle cluster_undo_segment_advance_recyclable(uint32 segment_id,
 																		SCN horizon);
 
+/*
+ * spec-4.12a D1: record-segment ACTIVE -> COMMITTED drain.  Called at the
+ * record-cursor rollover (seal_scn = current SCN, stamps the seal) and from the
+ * cleaner's skipped-ACTIVE fallback pass (seal_scn = InvalidScn, D2).  Caller
+ * MUST hold the undo lifecycle_lock.  See cluster_undo_record.c for the six 8.A
+ * hard gates.  Counter accessors back pg_cluster_state / TAP (D5).
+ */
+extern void cluster_undo_try_mark_record_segment_committed(uint32 segment_id, uint8 owner_instance,
+														   SCN seal_scn);
+/* spec-4.12a D2: cleaner-side fallback re-evaluation (acquires lifecycle_lock). */
+extern void cluster_undo_segment_advance_committed(uint32 segment_id);
+extern uint64 cluster_undo_record_segments_committed_count(void);
+extern uint64 cluster_undo_record_seg_commit_skipped_inflight_count(void);
+
 #endif /* !FRONTEND */
 #endif /* CLUSTER_UNDO_RECORD_API_H */

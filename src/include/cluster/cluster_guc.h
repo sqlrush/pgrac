@@ -374,6 +374,8 @@ extern int cluster_cssd_main_loop_interval_ms;
 extern int cluster_undo_cleaner_interval_ms;
 extern bool cluster_undo_cleaner_enabled;
 extern int cluster_undo_cleaner_batch_segments;
+/* spec-4.12a D1: record-segment ACTIVE -> COMMITTED drain on rollover (leak fix). */
+extern bool cluster_undo_record_segment_commit_on_rollover;
 extern int cluster_cssd_heartbeat_interval_ms;
 extern int cluster_cssd_dead_deadband_factor;
 

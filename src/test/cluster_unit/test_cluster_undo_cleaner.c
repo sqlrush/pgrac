@@ -113,6 +113,43 @@ UT_TEST(test_r5b_same_gen_illegal_state_is_corruption)
 }
 
 
+UT_TEST(test_d3_record_segment_drain_recycle_redo_coverage)
+{
+	/*
+	 * spec-4.12a D3 (硬门 4): confirm the EXISTING recycle redo decide table
+	 * already covers a *record* segment driven through the new
+	 * ACTIVE -> COMMITTED -> RECYCLABLE lifecycle, so 4.12a needs no new redo
+	 * logic.  The ACTIVE -> COMMITTED advance (cluster_undo_try_mark_record_
+	 * segment_committed) is a no-WAL direct header write, identical in shape to
+	 * the long-shipped TT-segment mark_committed -- so a crash may leave block 0
+	 * at ANY not-newer state (ALLOCATED if never sealed, ACTIVE if the COMMITTED
+	 * write was lost, COMMITTED if it reached disk) while the durable
+	 * XLOG_UNDO_SEGMENT_RECYCLE (old=COMMITTED, new=RECYCLABLE) replays.  Redo
+	 * must APPLY for every state <= new_state (deterministic convergence) and
+	 * fail-closed PANIC otherwise.  This pins that coverage for the 4.12a record
+	 * lifecycle (L250 real-path).
+	 */
+	xl_undo_segment_recycle rec = make_rec(7); /* old=COMMITTED, new=RECYCLABLE */
+
+	/* same generation, every not-newer on-disk state -> APPLY. */
+	UT_ASSERT_EQ((int)cluster_undo_segment_recycle_redo_decide(7, (uint8)SEGMENT_ALLOCATED, &rec),
+				 (int)CLUSTER_SEGRECYCLE_REDO_APPLY);
+	UT_ASSERT_EQ((int)cluster_undo_segment_recycle_redo_decide(7, (uint8)SEGMENT_ACTIVE, &rec),
+				 (int)CLUSTER_SEGRECYCLE_REDO_APPLY);
+	UT_ASSERT_EQ((int)cluster_undo_segment_recycle_redo_decide(7, (uint8)SEGMENT_COMMITTED, &rec),
+				 (int)CLUSTER_SEGRECYCLE_REDO_APPLY);
+	UT_ASSERT_EQ((int)cluster_undo_segment_recycle_redo_decide(7, (uint8)SEGMENT_RECYCLABLE, &rec),
+				 (int)CLUSTER_SEGRECYCLE_REDO_APPLY);
+
+	/* corruption sentinel -> fail-closed (BAD_STATE PANIC at redo). */
+	UT_ASSERT_EQ((int)cluster_undo_segment_recycle_redo_decide(7, (uint8)SEGMENT_INVALID, &rec),
+				 (int)CLUSTER_SEGRECYCLE_REDO_BAD_STATE);
+	/* a lower on-disk generation is impossible post-REUSE -> fail-closed. */
+	UT_ASSERT_EQ((int)cluster_undo_segment_recycle_redo_decide(6, (uint8)SEGMENT_COMMITTED, &rec),
+				 (int)CLUSTER_SEGRECYCLE_REDO_BAD_GENERATION);
+}
+
+
 /* ---- XLOG_UNDO_SEGMENT_REUSE (0x50) redo table (D4) ---- */
 
 static xl_undo_segment_reuse
@@ -172,6 +209,7 @@ main(void)
 	UT_RUN(test_r4_disk_gen_lower_is_corruption);
 	UT_RUN(test_r5_same_gen_earlier_states_apply);
 	UT_RUN(test_r5b_same_gen_illegal_state_is_corruption);
+	UT_RUN(test_d3_record_segment_drain_recycle_redo_coverage); /* spec-4.12a D3 */
 	UT_RUN(test_r6_reuse_fresh_or_torn_header_applies);
 	UT_RUN(test_r7_reuse_old_or_new_generation_applies_idempotent);
 	UT_RUN(test_r8_reuse_disk_newer_skips_stale);

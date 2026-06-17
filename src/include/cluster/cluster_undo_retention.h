@@ -78,4 +78,43 @@ struct UndoSegmentHeaderData;
 extern bool cluster_tt_slot_recyclable(uint8 cts_status, SCN commit_scn, SCN horizon);
 extern bool cluster_undo_segment_recyclable(const struct UndoSegmentHeaderData *hdr, SCN horizon);
 
+
+/*
+ * spec-4.12a D1: oldest active-write boundary.
+ *
+ *	The minimum first_undo_scn over all in-flight (uncommitted, unprepared)
+ *	undo writers, produced by cluster_undo_active_write_boundary() scanning the
+ *	active-write registry (cluster_undo_record.c).  `infinite == true` means no
+ *	in-flight writer is registered at all (quiesce): every sealed segment then
+ *	drains.  Modelled as a struct (not a sentinel SCN value) because the SCN
+ *	encoding layer forbids business code from minting a "max" SCN or comparing
+ *	SCNs with raw </==/>; only scn_time_cmp() is allowed (L4/L38).
+ */
+typedef struct ClusterUndoActiveBoundary {
+	bool infinite; /* true => no in-flight undo writer registered */
+	SCN scn;	   /* min in-flight first_undo_scn (valid iff !infinite) */
+} ClusterUndoActiveBoundary;
+
+/*
+ * cluster_undo_record_segment_drainable -- spec-4.12a D1/D3 pure ACTIVE ->
+ *	COMMITTED drain gate for a record segment.  Pure (no shmem / no lock / no
+ *	I/O): a function of the on-disk header plus the caller-supplied boundary,
+ *	prepared-xact flag, the three excluded segment ids, and the recovery flag,
+ *	so cluster_unit exercises every 8.A hard gate (test_cluster_retention).
+ *	Returns true ONLY when the segment may safely advance ACTIVE -> COMMITTED;
+ *	every uncertainty fails closed toward "retain".  See the .c for the gates.
+ *
+ *	recovery_in_progress (spec-4.12a D3, 硬门 4): true while the server is
+ *	replaying WAL.  After a crash the in-memory active-write registry is empty,
+ *	so the boundary degrades to {infinite} -- it cannot prove the absence of
+ *	prepared / in-flight undo until RecoverPreparedTransactions has rebuilt the
+ *	protected-slot view.  Draining during recovery is therefore never provably
+ *	safe -> retain (fail-closed).  See the .c for why this is the single
+ *	auditable recovery decision point.
+ */
+extern bool cluster_undo_record_segment_drainable(
+	const struct UndoSegmentHeaderData *hdr, ClusterUndoActiveBoundary boundary,
+	bool any_unresolved_prepared, uint32 fixed_first_segment_id, uint32 active_record_segment_id,
+	uint32 active_tt_segment_id, bool recovery_in_progress);
+
 #endif /* CLUSTER_UNDO_RETENTION_H */

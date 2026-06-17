@@ -233,6 +233,240 @@ UT_TEST(test_u10_segment_null_header_not_recyclable)
 }
 
 
+/* ===== spec-4.12a D1: cluster_undo_record_segment_drainable ===== *
+ *
+ * Pure ACTIVE -> COMMITTED drain gate for record segments.  The six 8.A
+ * hard gates (CLAUDE.md rule 8.A) all fail-closed toward "retain":
+ *   guard 1 (in-flight)  : seal upper_scn strictly below the active-write
+ *                          boundary; UNKNOWN seal / equality -> retain.
+ *   guard 2 (fixed_first): never the spec-3.4b fixed first segment.
+ *   guard 3 (active)     : never the record / TT cursor's current segment.
+ *   guard 6 (prepared)   : any unresolved cluster-TT prepared xact -> retain
+ *                          all (Q11-A minimal-safe).
+ *   plus: only SEGMENT_ACTIVE candidates; NULL header -> retain.
+ */
+
+/* Build an ACTIVE record segment header with id + sealed upper_scn. */
+static void
+init_record_seg(UndoSegmentHeaderData *hdr, uint32 segment_id, SCN seal_upper_scn)
+{
+	init_header(hdr, SEGMENT_ACTIVE);
+	hdr->segment_id = segment_id;
+	UndoSegmentHeader_set_record_seal_upper_scn(hdr, seal_upper_scn);
+}
+
+/* A boundary with one in-flight writer at first_undo_scn == v. */
+static ClusterUndoActiveBoundary
+bnd_finite(uint64 v)
+{
+	ClusterUndoActiveBoundary b = { .infinite = false, .scn = mk_scn(v) };
+
+	return b;
+}
+
+/* The "no in-flight writer" boundary. */
+static ClusterUndoActiveBoundary
+bnd_infinite(void)
+{
+	ClusterUndoActiveBoundary b = { .infinite = true, .scn = InvalidScn };
+
+	return b;
+}
+
+/* segment id space: pick ids well clear of the excluded ones below. */
+#define DRAIN_SEG 500
+#define DRAIN_FIXED_FIRST 1
+#define DRAIN_ACTIVE_REC 600
+#define DRAIN_ACTIVE_TT 700
+
+UT_TEST(test_d1_drainable_seal_below_boundary)
+{
+	UndoSegmentHeaderData hdr;
+
+	/* seal upper_scn (5) strictly below boundary (10) -> no in-flight writer
+	 * could have undo here -> drainable. */
+	init_record_seg(&hdr, DRAIN_SEG, mk_scn(5));
+	UT_ASSERT_EQ((int)cluster_undo_record_segment_drainable(&hdr, bnd_finite(10), false,
+															DRAIN_FIXED_FIRST, DRAIN_ACTIVE_REC,
+															DRAIN_ACTIVE_TT, false),
+				 1);
+}
+
+UT_TEST(test_d1_retain_seal_equal_boundary)
+{
+	UndoSegmentHeaderData hdr;
+
+	/* strict '<': seal == boundary -> an in-flight writer may have begun at the
+	 * seal point -> retain. */
+	init_record_seg(&hdr, DRAIN_SEG, mk_scn(10));
+	UT_ASSERT_EQ((int)cluster_undo_record_segment_drainable(&hdr, bnd_finite(10), false,
+															DRAIN_FIXED_FIRST, DRAIN_ACTIVE_REC,
+															DRAIN_ACTIVE_TT, false),
+				 0);
+}
+
+UT_TEST(test_d1_retain_seal_above_boundary)
+{
+	UndoSegmentHeaderData hdr;
+
+	init_record_seg(&hdr, DRAIN_SEG, mk_scn(20));
+	UT_ASSERT_EQ((int)cluster_undo_record_segment_drainable(&hdr, bnd_finite(10), false,
+															DRAIN_FIXED_FIRST, DRAIN_ACTIVE_REC,
+															DRAIN_ACTIVE_TT, false),
+				 0);
+}
+
+UT_TEST(test_d1_drainable_boundary_infinite)
+{
+	UndoSegmentHeaderData hdr;
+
+	/* No in-flight writer at all -> any sealed segment drains (quiesce path). */
+	init_record_seg(&hdr, DRAIN_SEG, mk_scn(99));
+	UT_ASSERT_EQ((int)cluster_undo_record_segment_drainable(&hdr, bnd_infinite(), false,
+															DRAIN_FIXED_FIRST, DRAIN_ACTIVE_REC,
+															DRAIN_ACTIVE_TT, false),
+				 1);
+}
+
+UT_TEST(test_d1_retain_unsealed_upper_scn)
+{
+	UndoSegmentHeaderData hdr;
+
+	/* guard 1/4: an unsealed (InvalidScn) upper bound cannot be proven safe,
+	 * even when no in-flight writer exists -> retain (fail-closed). */
+	init_record_seg(&hdr, DRAIN_SEG, InvalidScn);
+	UT_ASSERT_EQ((int)cluster_undo_record_segment_drainable(&hdr, bnd_infinite(), false,
+															DRAIN_FIXED_FIRST, DRAIN_ACTIVE_REC,
+															DRAIN_ACTIVE_TT, false),
+				 0);
+}
+
+UT_TEST(test_d1_retain_fixed_first)
+{
+	UndoSegmentHeaderData hdr;
+
+	/* guard 2: the fixed first segment is shared with the write cursor start. */
+	init_record_seg(&hdr, DRAIN_FIXED_FIRST, mk_scn(5));
+	UT_ASSERT_EQ((int)cluster_undo_record_segment_drainable(&hdr, bnd_infinite(), false,
+															DRAIN_FIXED_FIRST, DRAIN_ACTIVE_REC,
+															DRAIN_ACTIVE_TT, false),
+				 0);
+}
+
+UT_TEST(test_d1_retain_active_record_segment)
+{
+	UndoSegmentHeaderData hdr;
+
+	/* guard 3: the record cursor's current segment is still being written. */
+	init_record_seg(&hdr, DRAIN_ACTIVE_REC, mk_scn(5));
+	UT_ASSERT_EQ((int)cluster_undo_record_segment_drainable(&hdr, bnd_infinite(), false,
+															DRAIN_FIXED_FIRST, DRAIN_ACTIVE_REC,
+															DRAIN_ACTIVE_TT, false),
+				 0);
+}
+
+UT_TEST(test_d1_retain_active_tt_segment)
+{
+	UndoSegmentHeaderData hdr;
+
+	/* guard 3: the TT cursor's current segment is still in use. */
+	init_record_seg(&hdr, DRAIN_ACTIVE_TT, mk_scn(5));
+	UT_ASSERT_EQ((int)cluster_undo_record_segment_drainable(&hdr, bnd_infinite(), false,
+															DRAIN_FIXED_FIRST, DRAIN_ACTIVE_REC,
+															DRAIN_ACTIVE_TT, false),
+				 0);
+}
+
+UT_TEST(test_d1_retain_any_unresolved_prepared)
+{
+	UndoSegmentHeaderData hdr;
+
+	/* guard 6: an otherwise-drainable segment is retained while any unresolved
+	 * cluster-TT prepared xact exists (its undo may be consumed by ROLLBACK
+	 * PREPARED). */
+	init_record_seg(&hdr, DRAIN_SEG, mk_scn(5));
+	UT_ASSERT_EQ((int)cluster_undo_record_segment_drainable(&hdr, bnd_finite(10),
+															/* any_unresolved_prepared = */ true,
+															DRAIN_FIXED_FIRST, DRAIN_ACTIVE_REC,
+															DRAIN_ACTIVE_TT, false),
+				 0);
+}
+
+UT_TEST(test_d1_retain_non_active_states)
+{
+	UndoSegmentHeaderData hdr;
+
+	/* Only SEGMENT_ACTIVE is a candidate; every other state retains (硬门 4). */
+	init_record_seg(&hdr, DRAIN_SEG, mk_scn(5));
+
+	hdr.segment_state = SEGMENT_ALLOCATED;
+	UT_ASSERT_EQ((int)cluster_undo_record_segment_drainable(&hdr, bnd_infinite(), false,
+															DRAIN_FIXED_FIRST, DRAIN_ACTIVE_REC,
+															DRAIN_ACTIVE_TT, false),
+				 0);
+	hdr.segment_state = SEGMENT_COMMITTED;
+	UT_ASSERT_EQ((int)cluster_undo_record_segment_drainable(&hdr, bnd_infinite(), false,
+															DRAIN_FIXED_FIRST, DRAIN_ACTIVE_REC,
+															DRAIN_ACTIVE_TT, false),
+				 0);
+	hdr.segment_state = SEGMENT_RECYCLABLE;
+	UT_ASSERT_EQ((int)cluster_undo_record_segment_drainable(&hdr, bnd_infinite(), false,
+															DRAIN_FIXED_FIRST, DRAIN_ACTIVE_REC,
+															DRAIN_ACTIVE_TT, false),
+				 0);
+}
+
+UT_TEST(test_d1_drainable_full_but_active)
+{
+	UndoSegmentHeaderData hdr;
+
+	/* FULL is a flag, not a state: a FULL-but-ACTIVE sealed segment with no
+	 * in-flight writer is the common drain candidate. */
+	init_record_seg(&hdr, DRAIN_SEG, mk_scn(5));
+	hdr.segment_flags |= UNDO_SEGMENT_FLAG_FULL;
+	UT_ASSERT_EQ((int)cluster_undo_record_segment_drainable(&hdr, bnd_infinite(), false,
+															DRAIN_FIXED_FIRST, DRAIN_ACTIVE_REC,
+															DRAIN_ACTIVE_TT, false),
+				 1);
+}
+
+UT_TEST(test_d1_null_header_not_drainable)
+{
+	UT_ASSERT_EQ((int)cluster_undo_record_segment_drainable(NULL, bnd_infinite(), false,
+															DRAIN_FIXED_FIRST, DRAIN_ACTIVE_REC,
+															DRAIN_ACTIVE_TT, false),
+				 0);
+}
+
+UT_TEST(test_d3_retain_during_recovery)
+{
+	UndoSegmentHeaderData hdr;
+
+	/*
+	 * spec-4.12a D3 (硬门 4): recovery_in_progress is the single auditable
+	 * fail-closed recovery gate.  An otherwise fully drainable segment (sealed,
+	 * boundary infinite, no prepared xact, not fixed/active) drains only while
+	 * recovery is NOT in progress; during WAL replay the active-write registry
+	 * is empty, so the {infinite} boundary cannot prove the absence of prepared
+	 * / in-flight undo until RecoverPreparedTransactions rebuilds the
+	 * protected-slot view -- the gate must therefore retain (fail-closed),
+	 * overriding every other gate.
+	 */
+	init_record_seg(&hdr, DRAIN_SEG, mk_scn(5));
+
+	/* control: not in recovery -> the same segment is drainable. */
+	UT_ASSERT_EQ((int)cluster_undo_record_segment_drainable(&hdr, bnd_infinite(), false,
+															DRAIN_FIXED_FIRST, DRAIN_ACTIVE_REC,
+															DRAIN_ACTIVE_TT, false),
+				 1);
+	/* in recovery -> retain, even though every per-segment gate would pass. */
+	UT_ASSERT_EQ((int)cluster_undo_record_segment_drainable(&hdr, bnd_infinite(), false,
+															DRAIN_FIXED_FIRST, DRAIN_ACTIVE_REC,
+															DRAIN_ACTIVE_TT, true),
+				 0);
+}
+
+
 int
 main(void)
 {
@@ -250,6 +484,23 @@ main(void)
 	UT_RUN(test_u8_segment_invalid_horizon_recyclable);
 	UT_RUN(test_u10_segment_non_committed_state_never_recyclable);
 	UT_RUN(test_u10_segment_null_header_not_recyclable);
+
+	/* spec-4.12a D1: record-segment drain gate. */
+	UT_RUN(test_d1_drainable_seal_below_boundary);
+	UT_RUN(test_d1_retain_seal_equal_boundary);
+	UT_RUN(test_d1_retain_seal_above_boundary);
+	UT_RUN(test_d1_drainable_boundary_infinite);
+	UT_RUN(test_d1_retain_unsealed_upper_scn);
+	UT_RUN(test_d1_retain_fixed_first);
+	UT_RUN(test_d1_retain_active_record_segment);
+	UT_RUN(test_d1_retain_active_tt_segment);
+	UT_RUN(test_d1_retain_any_unresolved_prepared);
+	UT_RUN(test_d1_retain_non_active_states);
+	UT_RUN(test_d1_drainable_full_but_active);
+	UT_RUN(test_d1_null_header_not_drainable);
+
+	/* spec-4.12a D3: crash-recovery fail-closed gate (硬门 4). */
+	UT_RUN(test_d3_retain_during_recovery);
 
 	return ut_failed_count == 0 ? 0 : 1;
 }

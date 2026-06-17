@@ -362,6 +362,38 @@ UndoSegmentHeader_owner(const UndoSegmentHeaderData *hdr)
 
 
 /*
+ * spec-4.12a record_seal_upper_scn alias (Q10-A).
+ *
+ *   The retention-info slot oldest_active_scn (offset 64, 8 B) has been
+ *   declared-unused since spec-1.21 (never read or written).  spec-4.12a
+ *   repurposes it as record_seal_upper_scn: the conservative SCN upper bound
+ *   stamped into a record segment's header when the segment is SEALED (rolled
+ *   away by record-cursor autoextend).  It is the input to the ACTIVE ->
+ *   COMMITTED drain gate (cluster_undo_record_segment_drainable): every
+ *   in-flight undo writer registered its first_undo_scn BEFORE claiming an
+ *   extent in (hence before sealing) this segment, so a seal upper_scn strictly
+ *   below the oldest active-write boundary proves no in-flight writer can have
+ *   undo here.
+ *
+ *   No catversion: the on-disk offset/layout is unchanged, and an old segment
+ *   (or a never-sealed ACTIVE one) carries InvalidScn here, which the drain
+ *   gate reads as "unknown -> retain" (8.A fail-closed).  The accessors keep
+ *   the alias explicit at every call site so the dual meaning is auditable.
+ */
+static inline SCN
+UndoSegmentHeader_record_seal_upper_scn(const UndoSegmentHeaderData *hdr)
+{
+	return hdr->oldest_active_scn;
+}
+
+static inline void
+UndoSegmentHeader_set_record_seal_upper_scn(UndoSegmentHeaderData *hdr, SCN scn)
+{
+	hdr->oldest_active_scn = scn;
+}
+
+
+/*
  * spec-3.8 Fix #375:  pure-logic kernels extracted from cluster_undo_alloc.c
  * so cluster_unit behavioural tests can exercise the lifecycle invariants
  * without postgres shmem / file I/O.  The backend wrappers in alloc.c call

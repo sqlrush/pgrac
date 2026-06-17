@@ -205,6 +205,13 @@ int cluster_undo_cleaner_interval_ms = 30000;
 bool cluster_undo_cleaner_enabled = true;
 int cluster_undo_cleaner_batch_segments = 8;
 
+/* spec-4.12a D1: enable record-segment ACTIVE -> COMMITTED drain on rollover
+ * (the leak fix).  Default on; off reverts to the pre-4.12a leak behaviour for
+ * the L1 repro / emergency disable.  It gates only the optimization (the drain
+ * attempt), NOT the 8.A guard -- when off no ACTIVE -> COMMITTED advance runs,
+ * so it can never cause false reclaim (spec §2.3 / Q7). */
+bool cluster_undo_record_segment_commit_on_rollover = true;
+
 /* spec-2.5 D9: CSSD main-loop tick interval (ms). */
 int cluster_cssd_main_loop_interval_ms = 1000;
 /* spec-2.5 D9: CSSD heartbeat broadcast interval (ms). */
@@ -1643,6 +1650,12 @@ cluster_init_guc(void)
 		gettext_noop("Max own-instance undo segments scanned per cleaner pass."),
 		gettext_noop("Bounds per-pass tail latency (spec-3.13 R7)."),
 		&cluster_undo_cleaner_batch_segments, 8, 1, 256, PGC_SIGHUP, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable(
+		"cluster.undo_record_segment_commit_on_rollover",
+		gettext_noop("Advance a drained record undo segment ACTIVE -> COMMITTED on rollover."),
+		gettext_noop("off reverts to pre-4.12a behaviour where record segments were never "
+					 "reclaimed (the leak); gates only the optimization, never the 8.A guard."),
+		&cluster_undo_record_segment_commit_on_rollover, true, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	/* spec-2.5 D9: 3 NEW CSSD GUCs (PGC_POSTMASTER per spec §2.3 — applied
 	 * at postmaster init;hot-reload via SIGHUP not supported because

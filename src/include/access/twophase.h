@@ -62,4 +62,9 @@ extern void PrepareRedoRemove(TransactionId xid, bool giveWarning);
 extern void restoreTwoPhaseData(void);
 extern bool LookupGXact(const char *gid, XLogRecPtr prepare_end_lsn,
 						TimestampTz origin_prepare_timestamp);
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC (spec-4.12a D1): non-allocating prepared-xact count for the cluster
+ * undo record-segment drain gate (硬门 6). */
+extern int GetNumberOfPreparedTransactions(void);
+#endif
 #endif							/* TWOPHASE_H */
