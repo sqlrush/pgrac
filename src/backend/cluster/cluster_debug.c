@@ -2003,8 +2003,9 @@ dump_wal_thread(ReturnSetInfo *rsinfo)
 }
 
 /*
- * dump_write_fence -- spec-4.12 D7.  Emits 4 rows under category='write_fence':
- *	the cooperative write-fence observability counters (L110-safe -- read 0 with no
+ * dump_write_fence -- spec-4.12 D7 + spec-4.12b D6.  Emits 8 rows under
+ *	category='write_fence': the 4 spec-4.12 cooperative write-fence counters plus the
+ *	4 spec-4.12b baseline-subsystem observability fields (L110-safe -- read 0 with no
  *	region attached).
  */
 static void
@@ -2018,6 +2019,15 @@ dump_write_fence(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_write_fence_get_minority_marker_ignored()));
 	emit_row(rsinfo, "write_fence", "marker_write_failed",
 			 fmt_int64((int64)cluster_write_fence_get_marker_write_failed()));
+	/* spec-4.12b D6: baseline subsystem observability. */
+	emit_row(rsinfo, "write_fence", "baseline_published",
+			 fmt_int64((int64)cluster_write_fence_get_baseline_published()));
+	emit_row(rsinfo, "write_fence", "baseline_stale_rejected",
+			 fmt_int64((int64)cluster_write_fence_get_baseline_stale_rejected()));
+	emit_row(rsinfo, "write_fence", "baseline_author_is_self",
+			 fmt_int64((int64)(cluster_write_fence_get_baseline_author_is_self() ? 1 : 0)));
+	emit_row(rsinfo, "write_fence", "baseline_authority_age_us",
+			 fmt_int64((int64)cluster_write_fence_get_baseline_authority_age_us()));
 }
 
 #endif /* USE_PGRAC_CLUSTER */

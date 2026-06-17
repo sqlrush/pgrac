@@ -79,6 +79,29 @@ cluster_write_fence_decide(bool enforcement_on, bool region_attached, uint64 epo
 }
 
 /*
+ * cluster_write_fence_grace_before_engage -- spec-4.12b D3 (Q3=A) bring-up grace.
+ *	Returns true when the HOT write gate should short-circuit to ALLOWED because
+ *	the cluster is still in the boot -> first-authority window: enforcement is on,
+ *	the token region is attached, but no authority has ever latched (fence_engaged
+ *	== false).  This is not an unguarded fail-open window -- the qvotec quorum
+ *	backend gate (spec-2.6) already blocks writes when there is no quorum, so the
+ *	write-fence need not add a second hard-block before its first poll.  Once an
+ *	authority (or a durable self-fence) latches fence_engaged, the grace ends and
+ *	the hot gate enforces strictly via cluster_write_fence_decide.
+ *
+ *	A DETACHED region (region_attached == false) gets NO grace: it falls through
+ *	to the pure judge, which fails closed (L110).  PURE so the latch transition is
+ *	unit-pinned; ONLY cluster_write_fence_allowed() (the hot gate) consults this --
+ *	the direct durable checks (verify_durable / startup_self_check) never do (P1).
+ */
+static inline bool
+cluster_write_fence_grace_before_engage(bool enforcement_on, bool region_attached,
+										bool fence_engaged)
+{
+	return enforcement_on && region_attached && !fence_engaged;
+}
+
+/*
  * ClusterFenceMarker -- the durable fence marker (spec-4.12 D1).  Embedded in the
  * voting slot's _reserved1[368] (offset 128; the slot CRC over bytes 0..507 already
  * protects it, so no on-disk ABI / torn-write change).  Fixed 64 bytes
@@ -96,6 +119,30 @@ cluster_write_fence_decide(bool enforcement_on, bool region_attached, uint64 epo
 #define CLUSTER_FENCE_MARKER_BYTES 64
 #define CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES 16
 
+/*
+ * spec-4.12b D2/P1: the pristine (never-reconfigured) baseline's issuer.  A fixed
+ * sentinel (not a real node id) so EVERY node's pristine baseline is the SAME tuple
+ * -> trivially reaches quorum-majority.  For a reconfigured membership the baseline
+ * issuer is last_applied.coordinator_node_id (the SAME issuer the fence marker used,
+ * cluster_reconfig.c:607) so the baseline republish is tuple-identical to the fence
+ * marker -- one authoritative tuple per membership epoch, never a per-issuer split.
+ */
+#define CLUSTER_FENCE_BASELINE_INITIAL_ISSUER (-1)
+
+/*
+ * spec-4.12b D1: marker kind -- OBSERVABILITY ONLY.  It is NEVER a priority/sort
+ * key and NEVER part of tuple identity (cluster_fence_marker_tuple_equal); the
+ * authority ordering stays (fence_epoch, fence_generation) and the quorum-majority
+ * equality stays the full 4.12 identity (P0-1).  It occupies one of the marker's
+ * pad bytes, so the marker stays CLUSTER_FENCE_MARKER_BYTES.  An old (4.12) reader
+ * sees the byte as pad==0 == FENCE -- the safe default: it treats every marker as
+ * an authoritative membership marker regardless of kind.
+ */
+typedef enum ClusterFenceMarkerKind {
+	CLUSTER_FENCE_MARKER_KIND_FENCE = 0,	/* reconfig-issued fence (4.12 default) */
+	CLUSTER_FENCE_MARKER_KIND_BASELINE = 1, /* spec-4.12b steady-state membership republish */
+} ClusterFenceMarkerKind;
+
 typedef struct ClusterFenceMarker {
 	uint32 magic;			 /* CLUSTER_FENCE_MARKER_MAGIC, or 0 = no marker */
 	uint32 version;			 /* CLUSTER_FENCE_MARKER_VERSION */
@@ -104,7 +151,9 @@ typedef struct ClusterFenceMarker {
 	uint64 fence_generation; /* cssd_dead_generation -- same-epoch tie-break */
 	int32 issuer_node_id;	 /* coordinator that issued this fence */
 	uint8 fenced_dead_bitmap[CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES];
-	uint8 _pad[12]; /* pad to exactly CLUSTER_FENCE_MARKER_BYTES */
+	uint8 marker_kind; /* ClusterFenceMarkerKind (spec-4.12b D1); was _pad[0].
+							  * OBSERVABILITY ONLY -- not compared, not ordered (P0-1). */
+	uint8 _pad[11];	   /* pad to exactly CLUSTER_FENCE_MARKER_BYTES */
 } ClusterFenceMarker;
 
 /*
@@ -245,6 +294,103 @@ cluster_fence_marker_preserve_per_disk(uint8 *new_reserved1, const uint8 *prior_
 		cluster_fence_marker_pack(new_reserved1, &m);
 }
 
+/*
+ * cluster_fence_dead_superset -- does dead set a cover (is a superset of) dead set
+ *	b?  True iff every bit set in b is also set in a.  Used by the D5 refresh guard
+ *	(spec-4.12b P0-2): a new authority must never RELEASE an already-fenced node.
+ */
+static inline bool
+cluster_fence_dead_superset(const uint8 *a, const uint8 *b)
+{
+	int i;
+
+	for (i = 0; i < CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES; i++)
+		if ((b[i] & ~a[i]) != 0)
+			return false; /* a bit set in b is missing from a -> not a superset */
+	return true;
+}
+
+/*
+ * cluster_write_fence_authority_advances -- the PURE D5 double-monotonic guard
+ *	(spec-4.12b, P0-2).  A new authority marker may refresh the local token ONLY when
+ *	it does not roll membership backward:
+ *	  (1) epoch monotonic:   new_epoch >= latched_epoch, AND
+ *	  (2) dead-set superset: new_dead covers latched_dead (a same/higher-epoch marker
+ *	      with a SHRUNK dead set is rejected -- it would re-release a fenced node).
+ *	In Stage 4 the dead set only grows (Q5=C, no online rejoin); a shrink is an
+ *	unsupported uncontrolled rejoin -> rejected fail-closed (the token ages out and
+ *	writes fail closed rather than releasing a fenced node = 8.A).  The first
+ *	authority (latched_epoch==0, empty latched_dead) always advances.
+ */
+static inline bool
+cluster_write_fence_authority_advances(uint64 new_epoch, const uint8 *new_dead,
+									   uint64 latched_epoch, const uint8 *latched_dead)
+{
+	if (new_epoch < latched_epoch)
+		return false; /* epoch must not roll back */
+	return cluster_fence_dead_superset(new_dead, latched_dead);
+}
+
+/*
+ * cluster_fence_marker_build_baseline -- the PURE baseline builder (spec-4.12b D2).
+ *	Fill *out as a BASELINE-kind membership marker from the APPLIED membership tuple,
+ *	which the caller MUST read atomically from cluster_reconfig_get_last_event() (NOT
+ *	raw cluster_epoch_get_current() + a separately-read dead set; P0-3: the reconfig
+ *	coordinator bumps epoch before publishing the event, so current_epoch can be
+ *	ahead of the applied membership).
+ *
+ *	issuer_node_id is the STABLE membership issuer (P1), NOT the authoring node:
+ *	  - reconfigured membership -> last_applied.coordinator_node_id (same id the
+ *	    fence marker used -> the baseline republish is tuple-identical to the fence
+ *	    marker, so there is exactly one authoritative tuple per epoch; a leader
+ *	    handover never produces a second, competing tuple).
+ *	  - pristine membership (last_applied.event_id == 0) -> the fixed sentinel
+ *	    CLUSTER_FENCE_BASELINE_INITIAL_ISSUER, identical on every node.
+ *	"who authored it" is observability only (baseline_author_is_self), never identity.
+ */
+static inline void
+cluster_fence_marker_build_baseline(ClusterFenceMarker *out, uint64 applied_epoch,
+									const uint8 *applied_dead, uint64 applied_generation,
+									uint64 applied_event_id, int32 issuer_node_id)
+{
+	memset(out, 0, sizeof(*out));
+	out->magic = CLUSTER_FENCE_MARKER_MAGIC;
+	out->version = CLUSTER_FENCE_MARKER_VERSION;
+	out->fence_epoch = applied_epoch;
+	out->fence_event_id = applied_event_id;
+	out->fence_generation = applied_generation;
+	out->issuer_node_id = issuer_node_id;
+	memcpy(out->fenced_dead_bitmap, applied_dead, CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES);
+	out->marker_kind = CLUSTER_FENCE_MARKER_KIND_BASELINE;
+}
+
+/*
+ * cluster_write_fence_lowest_live_node -- the PURE deterministic baseline-author
+ *	leader selector (spec-4.12b D2, U5).  Returns the lowest node_id whose bit is
+ *	set in alive_bitmap, or -1 if none is live.  The lowest live node is the single
+ *	steady-state baseline author (Q1=A: no election); this is the SAME rule the
+ *	reconfig coordinator uses (cluster_reconfig.c dead_bitmap_lowest_bit_set over
+ *	the alive set), so the baseline author and the fence coordinator are the same
+ *	node and the baseline republish is tuple-identical to its fence marker (P1).
+ *	Bit convention matches cluster_fence_marker_node_is_fenced: node N -> byte N/8,
+ *	bit N%8.  alive_bitmap must be CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES wide (the
+ *	same 16-byte/128-node layout as the quorum decision's alive_bitmap).
+ */
+static inline int32
+cluster_write_fence_lowest_live_node(const uint8 *alive_bitmap)
+{
+	int i, j;
+
+	for (i = 0; i < CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES; i++) {
+		if (alive_bitmap[i] == 0)
+			continue;
+		for (j = 0; j < 8; j++)
+			if (alive_bitmap[i] & (uint8)(1u << j))
+				return (int32)(i * 8 + j);
+	}
+	return -1; /* no live node -> no baseline author this cycle */
+}
+
 #ifndef FRONTEND
 
 #include "port/atomics.h"
@@ -287,11 +433,26 @@ typedef struct ClusterWriteFenceShmem {
 	pg_atomic_uint64 authorized_epoch;	 /* fence_epoch from the durable majority marker */
 	pg_atomic_uint64 lease_expire_at_us; /* qvotec-refreshed lease deadline */
 	pg_atomic_uint32 self_fenced;		 /* this node is in fenced_dead_bitmap */
+	pg_atomic_uint32 fence_engaged;		 /* spec-4.12b D3: one-way bring-up latch -- set on
+										  * the first authority refresh OR durable self-fence.
+										  * Until set, the HOT gate grants a bring-up grace
+										  * (the qvotec quorum gate covers no-quorum); after
+										  * set, the hot gate is strictly fail-closed.  Scope
+										  * is the hot gate ONLY -- verify_durable /
+										  * startup_self_check never consult it (P1). */
 	uint8 fenced_dead_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
-	pg_atomic_uint64 fence_event_id;		  /* identity of the active fence (not ordered) */
-	pg_atomic_uint64 hot_gate_blocked;		  /* counter: hot-path fail-closed */
-	pg_atomic_uint64 durable_check_blocked;	  /* counter: recovery/rejoin direct-check fail */
-	pg_atomic_uint64 minority_marker_ignored; /* counter: partial/minority marker rejected */
+	pg_atomic_uint64 fence_event_id;			/* identity of the active fence (not ordered) */
+	pg_atomic_uint64 hot_gate_blocked;			/* counter: hot-path fail-closed */
+	pg_atomic_uint64 durable_check_blocked;		/* counter: recovery/rejoin direct-check fail */
+	pg_atomic_uint64 minority_marker_ignored;	/* counter: partial/minority marker rejected */
+	pg_atomic_uint64 baseline_stale_rejected;	/* spec-4.12b D5: refresh rejected (epoch
+											   * rollback or dead-set shrink, P0-2) */
+	pg_atomic_uint64 baseline_published;		/* spec-4.12b D6: poll cycles in which THIS
+											   * node authored a baseline (it is the leader) */
+	pg_atomic_uint32 baseline_author_is_self;	/* spec-4.12b D6: this node is currently the
+											   * lowest-live baseline-author leader (0/1) */
+	pg_atomic_uint64 last_authority_refresh_us; /* spec-4.12b D6: wall-clock of the last
+												 * successful token refresh (authority age) */
 
 	/*
 	 * D4 LMON->qvotec fence-marker submit mailbox.  Single producer = the
@@ -348,6 +509,14 @@ extern bool cluster_write_fence_qvotec_poll_pending(ClusterFenceMarker *out);
 extern void cluster_write_fence_qvotec_complete(bool acked);
 
 /*
+ * cluster_write_fence_enforcing -- spec-4.12b D4: is the fence ACTIVELY enforced
+ * (GUC == on AND voting disks configured)?  default-ON auto-degrades to a no-op on
+ * a single node / no-voting-disk deployment; the enforcement consumers gate on this
+ * (not the raw GUC) so single-node recovery is never blocked.
+ */
+extern bool cluster_write_fence_enforcing(void);
+
+/*
  * cluster_write_fence_allowed -- the hot-path wrapper: read the live epoch + the
  * shmem token and apply cluster_write_fence_decide.  PURE-read, no-throw,
  * critical-section-safe (no LWLock, no durable I/O); callers decide the
@@ -389,6 +558,16 @@ extern uint64 cluster_write_fence_get_hot_gate_blocked(void);
 extern uint64 cluster_write_fence_get_durable_check_blocked(void);
 extern uint64 cluster_write_fence_get_minority_marker_ignored(void);
 extern uint64 cluster_write_fence_get_marker_write_failed(void);
+extern uint64 cluster_write_fence_get_baseline_stale_rejected(void);
+extern bool cluster_write_fence_get_fence_engaged(void); /* spec-4.12b D3 latch state */
+/* spec-4.12b D6 baseline observability. */
+extern uint64 cluster_write_fence_get_baseline_published(void);
+extern bool cluster_write_fence_get_baseline_author_is_self(void);
+extern uint64 cluster_write_fence_get_baseline_authority_age_us(void);
+/* spec-4.12b D6: qvotec records, on each poll, whether this node is the baseline
+ * leader (is_leader -> baseline_author_is_self) and whether it actually authored a
+ * baseline this cycle (published -> bumps baseline_published). */
+extern void cluster_write_fence_note_baseline_published(bool is_leader, bool published);
 
 #endif /* !FRONTEND */
 

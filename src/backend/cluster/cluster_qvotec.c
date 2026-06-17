@@ -88,8 +88,10 @@
 #include "utils/timestamp.h"
 
 #include "cluster/cluster_elog.h"		 /* CLUSTER_LOG (best-effort logging) */
+#include "cluster/cluster_epoch.h"		 /* spec-4.12b D2/D5: current-epoch upper-bound Assert */
 #include "cluster/cluster_guc.h"		 /* cluster_enabled */
 #include "cluster/cluster_pgstat.h"		 /* cluster.qvotec.* counters */
+#include "cluster/cluster_reconfig.h"	 /* spec-4.12b D2: applied-membership snapshot */
 #include "cluster/cluster_shmem.h"		 /* cluster_shmem_register_region */
 #include "cluster/cluster_write_fence.h" /* spec-4.12 D2: fence marker scan + token refresh */
 #include "utils/memutils.h"				 /* TopMemoryContext */
@@ -591,6 +593,71 @@ qvotec_best_marker_on_disk(int disk, ClusterFenceMarker *out)
 	return found;
 }
 
+/*
+ * qvotec_self_is_membership_leader (spec-4.12b D2, Q1=A) -- is THIS node the
+ *	deterministic steady-state baseline author?  The author is the lowest live
+ *	node_id in the current quorum view's alive_bitmap (no election); a leader
+ *	change (a lower-id node joining, or this leader dying so the next-lowest takes
+ *	over) is implicit in the alive_bitmap the caller passes.  A node that does not
+ *	even see itself alive (its own bit unset) is never the leader -- the lowest
+ *	live id then differs from cluster_node_id and this returns false (R4: a
+ *	non-leader never authors its own per-disk minority baseline).
+ */
+static bool
+qvotec_self_is_membership_leader(const uint8 *alive_bitmap)
+{
+	return cluster_write_fence_lowest_live_node(alive_bitmap) == (int32)cluster_node_id;
+}
+
+/*
+ * qvotec_build_baseline_marker (spec-4.12b D2/D5(a), P0-3) -- build the
+ *	steady-state baseline marker the leader republishes every poll.  The
+ *	membership tuple (epoch, dead set, generation, event_id) is sourced ATOMICALLY
+ *	from the locally-APPLIED ReconfigEvent (cluster_reconfig_get_last_event() is a
+ *	shared-lock memcpy snapshot), NEVER from raw cluster_epoch_get_current() + a
+ *	separately-read dead set: the reconfig coordinator bumps the epoch BEFORE it
+ *	submits/publishes the fence marker (cluster_reconfig.c bump-before-publish
+ *	window), so current_epoch can be AHEAD of the applied membership.  A leader
+ *	that has not yet applied the newest reconfig therefore authors at its older
+ *	applied epoch, which loses to the coordinator's higher-epoch fence marker in
+ *	cluster_fence_authority_decide -- it can never MASK a real fence (8.A).
+ *
+ *	issuer = last_applied.coordinator_node_id (P1: the STABLE membership issuer,
+ *	the SAME id the fence marker carried), so the baseline republish is
+ *	tuple-identical to the fence marker for that membership -- one authoritative
+ *	tuple per epoch, never a competing per-author tuple.  A pristine
+ *	(never-reconfigured) membership uses the fixed sentinel issuer so every node's
+ *	pristine baseline is identical.
+ *
+ *	cluster_epoch_get_current() is used ONLY as an upper-bound Assert (the applied
+ *	epoch must never exceed the live epoch); it is never the source value.
+ */
+static void
+qvotec_build_baseline_marker(ClusterFenceMarker *out)
+{
+	ReconfigEvent applied;
+
+	cluster_reconfig_get_last_event(&applied);
+
+	if (applied.event_id == 0) {
+		/* pristine membership: initial epoch, empty dead set, sentinel issuer. */
+		uint8 empty_dead[CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES];
+
+		memset(empty_dead, 0, sizeof(empty_dead));
+		cluster_fence_marker_build_baseline(out, CLUSTER_EPOCH_INITIAL, empty_dead,
+											0 /* generation */, 0 /* event_id */,
+											CLUSTER_FENCE_BASELINE_INITIAL_ISSUER);
+	} else {
+		/* applied reconfig: republish its exact membership tuple + issuer. */
+		cluster_fence_marker_build_baseline(out, applied.new_epoch, applied.dead_bitmap,
+											applied.cssd_dead_generation, applied.event_id,
+											applied.coordinator_node_id);
+	}
+
+	/* P0-3 upper-bound: the applied epoch can never exceed the live epoch. */
+	Assert(out->fence_epoch <= cluster_epoch_get_current());
+}
+
 static void
 qvotec_poll_once(void)
 {
@@ -603,6 +670,9 @@ qvotec_poll_once(void)
 	int i;
 	ClusterFenceMarker submit_marker;
 	bool have_submit;
+	ClusterFenceMarker baseline_marker; /* spec-4.12b D2 */
+	bool author_baseline = false;		/* spec-4.12b D2: wrote a baseline this cycle */
+	bool is_leader = false;				/* spec-4.12b D6: lowest-live baseline leader */
 
 	now_us = (uint64)GetCurrentTimestamp();
 	next_lease_expire = now_us + (uint64)cluster_quorum_poll_interval_ms * 2 * 1000ULL;
@@ -761,6 +831,27 @@ qvotec_poll_once(void)
 	self_slot.current_epoch = pg_atomic_read_u64(&QvotecShmem->current_epoch_at_boot);
 	self_slot.flags = CLUSTER_VOTING_SLOT_FLAG_ALIVE;
 
+	/*
+	 * spec-4.12b D2: steady-state baseline author.  When there is no fresh LMON
+	 * submit and THIS node is the deterministic membership leader (lowest live
+	 * node_id in decide()'s alive_bitmap, computed above before any self-slot
+	 * write), author a BASELINE marker reflecting the locally-applied membership
+	 * and pack it to EVERY disk below -- exactly like the fence path, so the
+	 * leader's tuple reaches quorum-majority and refreshes every node's token next
+	 * poll.  A non-leader never authors a baseline (it would only ever land a
+	 * per-disk minority marker = R4); it keeps preserve_per_disk.
+	 *
+	 * Gated on enforcement == ON (mirrors the reconfig fence-submit gate): when
+	 * OFF/DEV the hot gate is a no-op, so authoring a baseline buys nothing and we
+	 * keep the pre-4.12b steady-state behaviour (zero regression, no marker write).
+	 */
+	is_leader = qvotec_self_is_membership_leader(decision.alive_bitmap);
+	if (!have_submit && cluster_write_fence_enforcement == CLUSTER_WRITE_FENCE_ENFORCE_ON
+		&& is_leader) {
+		qvotec_build_baseline_marker(&baseline_marker);
+		author_baseline = true;
+	}
+
 	for (i = 0; i < qvotec_n_disks; i++) {
 		ClusterVotingDiskIoState wrc;
 		ClusterVotingSlot *own_prior = &qvotec_slot_matrix[i * CLUSTER_MAX_NODES + cluster_node_id];
@@ -777,10 +868,16 @@ qvotec_poll_once(void)
 		 * spec-4.12 D4: a fresh marker submit from LMON overrides the preserve --
 		 * the coordinator legitimately writes ITS OWN issued marker to ALL its
 		 * disks (that is how the fence reaches quorum-majority; not amplification).
+		 *
+		 * spec-4.12b D2: the steady-state baseline (leader, no submit) is likewise
+		 * written to ALL disks -- it is this leader's own authoritative membership
+		 * tuple, not a cross-disk copy, so it reaches quorum-majority the same way.
 		 */
 		memset(self_slot._reserved1, 0, sizeof(self_slot._reserved1));
 		if (have_submit)
 			cluster_fence_marker_pack(self_slot._reserved1, &submit_marker);
+		else if (author_baseline)
+			cluster_fence_marker_pack(self_slot._reserved1, &baseline_marker);
 		else
 			cluster_fence_marker_preserve_per_disk(self_slot._reserved1, own_prior->_reserved1);
 
@@ -810,6 +907,13 @@ qvotec_poll_once(void)
 			cluster_pgstat_inc(qvotec_counter_disk_io_fail);
 		}
 	}
+
+	/*
+	 * spec-4.12b D6: record this poll's baseline-author observability -- the
+	 * current leadership (is_leader -> baseline_author_is_self) and whether this
+	 * cycle authored a baseline (author_baseline -> bumps baseline_published).
+	 */
+	cluster_write_fence_note_baseline_published(is_leader, author_baseline);
 
 	/*
 	 * Hardening v0.6 F1:  recompute BOTH disks_ok_count AND quorum_state
@@ -1009,6 +1113,22 @@ ClusterQvotecMain(void)
 	qvotec_open_disks();
 	pg_atomic_write_u32(&QvotecShmem->disks_total_count, (uint32)qvotec_n_disks);
 	on_shmem_exit(qvotec_close_disks_atexit, (Datum)0);
+
+	/*
+	 * spec-4.12b D4: with enforcement default ON, a single node / no-voting-disk
+	 * deployment cannot fence (no shared storage, no quorum authority) and would
+	 * otherwise wrongly block its own recovery; cluster_write_fence_enforcing()
+	 * auto-degrades it to a no-op at runtime.  Emit one LOG line here (qvotec is
+	 * postmaster-spawned exactly once) so the operator knows the fence is inactive
+	 * despite the on setting -- they must configure cluster.voting_disks to make it
+	 * effective.
+	 */
+	if (qvotec_n_disks == 0 && cluster_write_fence_enforcement == CLUSTER_WRITE_FENCE_ENFORCE_ON)
+		ereport(LOG, (errmsg("cluster write-fence: enforcement is on but no voting disks are "
+							 "configured; the write fence is inactive (single-node degraded mode)"),
+					  errhint("Set cluster.voting_disks to a shared-storage majority to make "
+							  "write-fence enforcement effective, or set "
+							  "cluster.write_fence_enforcement=dev to silence this notice.")));
 
 	/*
 	 * spec-4.12 D4: publish MyLatch so the reconfig coordinator (LMON) can wake us

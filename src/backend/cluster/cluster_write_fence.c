@@ -99,9 +99,14 @@ cluster_write_fence_shmem_init(void)
 		memset(cluster_write_fence_shmem->fenced_dead_bitmap, 0,
 			   sizeof(cluster_write_fence_shmem->fenced_dead_bitmap));
 		pg_atomic_init_u64(&cluster_write_fence_shmem->fence_event_id, 0);
+		pg_atomic_init_u32(&cluster_write_fence_shmem->fence_engaged, 0); /* D3: not latched */
 		pg_atomic_init_u64(&cluster_write_fence_shmem->hot_gate_blocked, 0);
 		pg_atomic_init_u64(&cluster_write_fence_shmem->durable_check_blocked, 0);
 		pg_atomic_init_u64(&cluster_write_fence_shmem->minority_marker_ignored, 0);
+		pg_atomic_init_u64(&cluster_write_fence_shmem->baseline_stale_rejected, 0);
+		pg_atomic_init_u64(&cluster_write_fence_shmem->baseline_published, 0); /* D6 */
+		pg_atomic_init_u32(&cluster_write_fence_shmem->baseline_author_is_self, 0);
+		pg_atomic_init_u64(&cluster_write_fence_shmem->last_authority_refresh_us, 0);
 
 		/* D4 LMON->qvotec submit mailbox starts empty (request == completion). */
 		cluster_write_fence_shmem->qvotec_latch = NULL;
@@ -131,6 +136,24 @@ cluster_write_fence_shmem_register(void)
 }
 
 /*
+ * cluster_write_fence_enforcing -- is the cooperative write-fence ACTIVELY enforced
+ *	right now?  True iff the GUC is ON *and* voting disks are configured (spec-4.12b
+ *	D4).  With default-ON, a single node / no-voting-disk deployment auto-degrades to
+ *	a no-op (equivalent to dev): there is no shared storage to fence and qvotec never
+ *	refreshes a token, so enforcing would wrongly fail single-node recovery closed
+ *	(verify_durable) with zero safety benefit.  Derived only from GUCs, which
+ *	propagate correctly across fork AND EXEC_BACKEND, so every backend agrees without
+ *	a postmaster-once mutation.  An explicit voting_disks misconfiguration (paths set
+ *	but unreadable) still fails closed via the durable-authority quorum below.
+ */
+bool
+cluster_write_fence_enforcing(void)
+{
+	return cluster_write_fence_enforcement == CLUSTER_WRITE_FENCE_ENFORCE_ON
+		   && cluster_voting_disks != NULL && cluster_voting_disks[0] != '\0';
+}
+
+/*
  * cluster_write_fence_allowed -- the hot-path wrapper (spec-4.12 D3).  Reads the
  *	live epoch + the shmem token and applies the PURE judge.  No LWLock, no durable
  *	I/O -- safe to call from a critical section (the caller decides the fail-closed
@@ -140,12 +163,13 @@ cluster_write_fence_shmem_register(void)
 bool
 cluster_write_fence_allowed(void)
 {
-	bool enforcement_on = (cluster_write_fence_enforcement == CLUSTER_WRITE_FENCE_ENFORCE_ON);
+	bool enforcement_on = cluster_write_fence_enforcing(); /* D4: ON + voting disks */
 	bool region_attached = (cluster_write_fence_shmem != NULL);
 	uint64 epoch_current = cluster_epoch_get_current();
 	uint64 authorized_epoch = 0;
 	uint64 lease_expire_us = 0;
 	bool self_fenced = false;
+	bool fence_engaged = false;
 	uint64 now_us;
 
 	if (region_attached) {
@@ -163,7 +187,20 @@ cluster_write_fence_allowed(void)
 		pg_read_barrier();
 		authorized_epoch = pg_atomic_read_u64(&cluster_write_fence_shmem->authorized_epoch);
 		self_fenced = (pg_atomic_read_u32(&cluster_write_fence_shmem->self_fenced) != 0);
+		/* D3 latch: a relaxed read is fine -- it is one-way, so the worst stale
+		 * read grants one extra grace cycle to an in-quorum bring-up node. */
+		fence_engaged = (pg_atomic_read_u32(&cluster_write_fence_shmem->fence_engaged) != 0);
 	}
+
+	/*
+	 * spec-4.12b D3 (Q3=A): before the first authority ever latches, do NOT
+	 * hard-block hot writes -- grant a bring-up grace (the qvotec quorum backend
+	 * gate covers no-quorum).  A durable self-fence latches fence_engaged via
+	 * startup_self_check before the node serves, so a self-fenced node never gets
+	 * the grace.  After the latch, fall through to the strict pure judge.
+	 */
+	if (cluster_write_fence_grace_before_engage(enforcement_on, region_attached, fence_engaged))
+		return true;
 
 	/* TimestampTz is microseconds since 2000-01-01; the lease is in the same unit. */
 	now_us = (uint64)GetCurrentTimestamp();
@@ -282,8 +319,8 @@ cluster_write_fence_verify_durable(uint64 required_epoch)
 {
 	ClusterFenceAuthority authority;
 
-	if (cluster_write_fence_enforcement != CLUSTER_WRITE_FENCE_ENFORCE_ON)
-		return true; /* not enforced: recovery proceeds as PG-native */
+	if (!cluster_write_fence_enforcing())
+		return true; /* not enforced (off / dev / single-node): PG-native recovery */
 
 	/* Enforcement ON but no durable majority marker for required_epoch -> fail
 	 * closed (no authority granted): missing disks / superseded epoch / no marker. */
@@ -311,8 +348,8 @@ cluster_write_fence_startup_self_check(void)
 {
 	ClusterFenceAuthority authority;
 
-	if (cluster_write_fence_enforcement != CLUSTER_WRITE_FENCE_ENFORCE_ON)
-		return false; /* not enforced */
+	if (!cluster_write_fence_enforcing())
+		return false; /* not enforced (off / dev / single-node) -> not fenced */
 
 	if (!cluster_write_fence_read_durable_authority(&authority) || !authority.has_authority)
 		return false; /* no durable majority marker -> not durably fenced */
@@ -327,6 +364,14 @@ cluster_write_fence_startup_self_check(void)
 							authority.marker.fence_epoch);
 		pg_atomic_write_u64(&cluster_write_fence_shmem->fence_event_id,
 							authority.marker.fence_event_id);
+		/*
+		 * spec-4.12b D3: a durably self-fenced node is authoritative state -- engage
+		 * the bring-up latch so the hot gate never grants this node the bring-up
+		 * grace (it must fail closed from the first instant, not be let through the
+		 * boot window).  P1: this only TIGHTENS the hot gate; this direct durable
+		 * check itself never consults the latch.
+		 */
+		pg_atomic_write_u32(&cluster_write_fence_shmem->fence_engaged, 1);
 	}
 	return true;
 }
@@ -371,14 +416,36 @@ cluster_write_fence_reject_if_fenced(const char *op)
  *	Publishes the authoritative fence tuple into the local token.  Lease-published-
  *	last protocol (see the read order above): invalidate lease -> write barrier ->
  *	epoch + self_fenced + event_id + bitmap -> write barrier -> publish lease.
+ *
+ *	spec-4.12b D5 (P0-2): a double-monotonic guard rejects an authority that would
+ *	roll membership backward (epoch decrease OR dead-set shrink) BEFORE publishing,
+ *	so a stale baseline that somehow reached quorum-majority can never re-release an
+ *	already-fenced node (8.A).  A rejected refresh leaves the token untouched -> its
+ *	lease ages out (fail-closed).
  */
 void
 cluster_write_fence_refresh_from_marker(const ClusterFenceMarker *m, uint64 lease_expire_us)
 {
 	bool self_fenced;
+	uint64 latched_epoch;
+	uint8 latched_dead[CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES];
 
 	if (cluster_write_fence_shmem == NULL)
 		return; /* region not attached: nothing to refresh (hot gate fails closed) */
+
+	/*
+	 * D5 double-monotonic guard.  qvotec is the sole writer of this token, so reading
+	 * the currently-latched authority needs no lock.  The first authority (latched
+	 * epoch 0, empty dead set) always advances; a same/higher epoch with a shrunk
+	 * dead set is rejected (would release a fenced node).
+	 */
+	latched_epoch = pg_atomic_read_u64(&cluster_write_fence_shmem->authorized_epoch);
+	memcpy(latched_dead, cluster_write_fence_shmem->fenced_dead_bitmap, sizeof(latched_dead));
+	if (!cluster_write_fence_authority_advances(m->fence_epoch, m->fenced_dead_bitmap,
+												latched_epoch, latched_dead)) {
+		pg_atomic_fetch_add_u64(&cluster_write_fence_shmem->baseline_stale_rejected, 1);
+		return; /* stale / shrunk authority -> do not publish; token ages out (8.A) */
+	}
 
 	self_fenced = cluster_fence_marker_node_is_fenced(m->fenced_dead_bitmap, cluster_node_id);
 
@@ -397,6 +464,19 @@ cluster_write_fence_refresh_from_marker(const ClusterFenceMarker *m, uint64 leas
 
 	/* 3. publish the lease LAST -- this is what makes the token usable. */
 	pg_atomic_write_u64(&cluster_write_fence_shmem->lease_expire_at_us, lease_expire_us);
+
+	/* spec-4.12b D6: record the refresh time so observability can derive the
+	 * authority age (now - last refresh). */
+	pg_atomic_write_u64(&cluster_write_fence_shmem->last_authority_refresh_us,
+						(uint64)GetCurrentTimestamp());
+
+	/*
+	 * spec-4.12b D3: the first authority just latched.  Engage the one-way
+	 * bring-up latch AFTER the lease is published, so the hot gate ends its
+	 * bring-up grace only once a usable token exists.  Set unconditionally (it is
+	 * one-way -- a no-op once set).
+	 */
+	pg_atomic_write_u32(&cluster_write_fence_shmem->fence_engaged, 1);
 }
 
 /*
@@ -443,6 +523,76 @@ cluster_write_fence_get_marker_write_failed(void)
 	return cluster_write_fence_shmem == NULL
 			   ? 0
 			   : pg_atomic_read_u64(&cluster_write_fence_shmem->marker_write_failed);
+}
+
+uint64
+cluster_write_fence_get_baseline_stale_rejected(void)
+{
+	return cluster_write_fence_shmem == NULL
+			   ? 0
+			   : pg_atomic_read_u64(&cluster_write_fence_shmem->baseline_stale_rejected);
+}
+
+/* spec-4.12b D3: has the bring-up latch engaged (first authority / self-fence seen)? */
+bool
+cluster_write_fence_get_fence_engaged(void)
+{
+	return cluster_write_fence_shmem != NULL
+		   && pg_atomic_read_u32(&cluster_write_fence_shmem->fence_engaged) != 0;
+}
+
+/* spec-4.12b D6: count of poll cycles in which this node authored a baseline. */
+uint64
+cluster_write_fence_get_baseline_published(void)
+{
+	return cluster_write_fence_shmem == NULL
+			   ? 0
+			   : pg_atomic_read_u64(&cluster_write_fence_shmem->baseline_published);
+}
+
+/* spec-4.12b D6: is this node currently the lowest-live baseline-author leader? */
+bool
+cluster_write_fence_get_baseline_author_is_self(void)
+{
+	return cluster_write_fence_shmem != NULL
+		   && pg_atomic_read_u32(&cluster_write_fence_shmem->baseline_author_is_self) != 0;
+}
+
+/*
+ * spec-4.12b D6: age (microseconds) of the last successful token refresh, i.e. how
+ * long since this node last saw a quorum-majority authority.  0 when no refresh has
+ * happened yet OR when the clock appears to run backwards (defensive; never negative).
+ */
+uint64
+cluster_write_fence_get_baseline_authority_age_us(void)
+{
+	uint64 last;
+	uint64 now;
+
+	if (cluster_write_fence_shmem == NULL)
+		return 0;
+	last = pg_atomic_read_u64(&cluster_write_fence_shmem->last_authority_refresh_us);
+	if (last == 0)
+		return 0; /* never refreshed */
+	now = (uint64)GetCurrentTimestamp();
+	return now > last ? now - last : 0;
+}
+
+/*
+ * cluster_write_fence_note_baseline_published -- spec-4.12b D6.  qvotec calls this
+ *	once per poll: is_leader records the current baseline-author leadership state
+ *	(observability); published is true on the cycles this node actually wrote a
+ *	baseline marker (it was leader, enforcing, and had no fresh fence submit), which
+ *	bumps the publish counter.  No-op when the region is not attached.
+ */
+void
+cluster_write_fence_note_baseline_published(bool is_leader, bool published)
+{
+	if (cluster_write_fence_shmem == NULL)
+		return;
+	pg_atomic_write_u32(&cluster_write_fence_shmem->baseline_author_is_self, is_leader ? 1 : 0);
+	if (published)
+		pg_atomic_fetch_add_u64(&cluster_write_fence_shmem->baseline_published, 1);
 }
 
 /*
