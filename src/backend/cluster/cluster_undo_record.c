@@ -602,6 +602,40 @@ cluster_undo_active_write_unregister(void)
 }
 
 /*
+ * cluster_undo_record_xact_commit_release -- spec-4.12a D6: release this
+ *	backend's active-write boundary slot at COMMIT.
+ *
+ *	The active-write boundary (cluster_undo_active_write_boundary) keeps a record
+ *	segment retained from the ACTIVE -> COMMITTED drain only while an in-flight
+ *	writer may still add undo to it.  Once this top-transaction COMMITs, its undo
+ *	is governed by the retention HORIZON instead (cluster_undo_segment_recyclable
+ *	still gates COMMITTED -> RECYCLABLE), so the boundary entry must drop here --
+ *	otherwise it pins the drain boundary for the life of the backend.
+ *
+ *	This is the missing commit-path release.  cluster_undo_record_xact_reset (the
+ *	full per-xact undo teardown) only runs on the PREPARE (PrepareTransaction) and
+ *	ABORT (CleanupTransaction) paths, NOT CommitTransaction -- so a short-lived
+ *	connection was saved only by backend exit, while a persistent (pooled)
+ *	connection that COMMITs and stays open kept its first transaction's
+ *	first_undo_scn registered forever (register is idempotent per top-xact), which
+ *	pinned the boundary and re-opened the spec-4.13 leak for every long-lived
+ *	connection.  Commit needs only the boundary release, not the fd-cache /
+ *	local-head teardown, so this is a dedicated minimal hook (avoids fd-cache
+ *	churn on the commit hot path).
+ *
+ *	8.A-safe: dropping the boundary only enables ACTIVE -> COMMITTED; the horizon
+ *	still gates the actual reclaim (COMMITTED -> RECYCLABLE), so a committed xact's
+ *	undo that an older snapshot still needs stays retained until the horizon
+ *	passes.  Mirrors the PREPARE handoff, where the boundary also drops and the
+ *	prepared-xact guard (硬门 6) takes over keeping the undo alive.
+ */
+void
+cluster_undo_record_xact_commit_release(void)
+{
+	cluster_undo_active_write_unregister();
+}
+
+/*
  * cluster_undo_active_write_boundary -- the oldest active-write boundary: the
  *	minimum first_undo_scn over all registered in-flight writers, or
  *	{ infinite = true } when none is registered (quiesce).  Scans under

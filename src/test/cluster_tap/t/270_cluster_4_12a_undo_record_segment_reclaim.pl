@@ -438,4 +438,70 @@ sub common_conf
 	$nf->stop;
 }
 
+# ===========================================================================
+# L8 -- 8.A x round-robin: an in-flight writer pins the active-write boundary,
+#       so every segment sealed at/after it must be RETAINED even while the
+#       round-robin cleaner sweeps the whole (large) inventory.  L4 proves the
+#       in-flight guard with a tiny inventory and L7 sweeps with no in-flight
+#       writer; this is the intersection -- a buggy sweep (e.g. mishandling the
+#       cursor wrap) could falsely reclaim a buried in-flight segment.  The
+#       drain gate is unchanged by the fairness fix, so the sweep must visit
+#       everything yet drain nothing while the writer is live, then drain the
+#       whole inventory once it commits (liveness resumes, no undo lost).
+# ===========================================================================
+{
+	my $ng = PgracClusterNode->new('roundrobin_inflight_8a');
+	$ng->init;
+	$ng->append_conf('postgresql.conf', common_conf(128, 'on'));
+	$ng->start;
+	$ng->safe_psql('postgres', 'CREATE TABLE t270 (id int)');
+
+	# Session A: an in-flight writer. Its INSERT undo pins the active-write
+	# boundary at its first_undo_scn until it commits, so NOTHING sealed after it
+	# may drain (Q2-A' conservative boundary).
+	my $a = $ng->background_psql('postgres', on_error_die => 1);
+	$a->query_safe('BEGIN');
+	$a->query_safe('INSERT INTO t270 VALUES (8888)');
+
+	# Large burst (>> batch window) so the round-robin cleaner sweeps the whole
+	# inventory across passes while A stays in-flight.
+	for my $i (1 .. 40)
+	{
+		$ng->safe_psql('postgres', q{SELECT cluster_undo_test_force_segment_end()});
+		$ng->safe_psql('postgres', "INSERT INTO t270 VALUES ($i)");
+	}
+	sleep 2;    # ~10 round-robin cleaner passes sweep the inventory
+	cmp_ok(active_segments($ng), '>', 8,
+		'L8 while the writer is in-flight the round-robin sweep RETAINS the inventory '
+		  . '(8.A in-flight guard holds across the full sweep; no false reclaim)');
+
+	note("L8 diag pre-commit: active=" . active_segments($ng)
+		  . " committed=" . undo_counter($ng, 'record_segments_committed')
+		  . " skip=" . undo_counter($ng, 'record_seg_commit_skipped_inflight')
+		  . " marked=" . undo_counter($ng, 'cleaner_segments_marked_recyclable'));
+
+	# A commits -> boundary infinite. Quiesce; the round-robin cleaner now drains
+	# the whole inventory (the in-flight segment was retained, not lost).
+	$a->query_safe('COMMIT');
+	$a->quit;
+	my $active_after = 99;
+	for (1 .. 15)
+	{
+		sleep 1;
+		$active_after = active_segments($ng);
+		last if $active_after <= 3;
+	}
+	note("L8 diag post-commit+quiesce: active=$active_after"
+		  . " committed=" . undo_counter($ng, 'record_segments_committed')
+		  . " skip=" . undo_counter($ng, 'record_seg_commit_skipped_inflight')
+		  . " marked=" . undo_counter($ng, 'cleaner_segments_marked_recyclable'));
+	cmp_ok($active_after, '<=', 3,
+		"L8 after the writer commits the round-robin cleaner drains the whole inventory "
+		  . "(liveness resumes; ACTIVE -> $active_after)");
+	is($ng->safe_psql('postgres', 'SELECT count(*) FROM t270 WHERE id = 8888'),
+		'1', 'L8 the in-flight writer commits correctly (its retained undo was never falsely reclaimed)');
+
+	$ng->stop;
+}
+
 done_testing();

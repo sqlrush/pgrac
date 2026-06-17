@@ -147,6 +147,16 @@ extern void cluster_undo_record_shmem_init(void);
  */
 extern void cluster_undo_record_xact_reset(void);
 
+/*
+ * cluster_undo_record_xact_commit_release -- spec-4.12a D6: release this
+ *	backend's active-write boundary slot at COMMIT (CommitTransaction hook).
+ *	The full xact_reset only runs on the PREPARE / ABORT paths, so without this
+ *	a persistent connection's committed transaction would pin the undo drain
+ *	boundary forever.  8.A-safe: only enables ACTIVE->COMMITTED; the retention
+ *	horizon still gates the actual reclaim.
+ */
+extern void cluster_undo_record_xact_commit_release(void);
+
 
 /*
  * cluster_undo_record_is_touched -- did current xact write any undo record?

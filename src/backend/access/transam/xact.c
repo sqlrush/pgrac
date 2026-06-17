@@ -2718,6 +2718,18 @@ CommitTransaction(void)
 	 */
 	s->state = TRANS_DEFAULT;
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC (spec-4.12a D6): release this backend's active-write undo boundary
+	 * at commit so a committed transaction's first_undo_scn stops pinning the
+	 * record-segment drain boundary.  The full cluster_undo_record_xact_reset()
+	 * runs only on the PREPARE (PrepareTransaction) and ABORT (CleanupTransaction)
+	 * paths -- a persistent (pooled) connection that commits and stays open would
+	 * otherwise keep its first transaction registered for the life of the backend
+	 * (re-opening the spec-4.13 undo-pool leak).  8.A-safe: only enables
+	 * ACTIVE->COMMITTED; the retention horizon still gates the actual reclaim. */
+	cluster_undo_record_xact_commit_release();
+#endif
+
 	RESUME_INTERRUPTS();
 }
 
