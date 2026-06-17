@@ -388,15 +388,38 @@ undo_cleaner_run_pass(void)
 			uint32 active_seg = cluster_undo_record_active_segment_id();
 			uint32 tt_seg = cluster_tt_slot_current_segment(cluster_node_id);
 			int batch = cluster_undo_cleaner_batch_segments;
+			uint32 inventory = cluster_undo_cleaner_scan_inventory(base, max_seg);
+			uint32 visited = 0;
 			uint32 seg;
 
-			for (seg = base; seg <= max_seg && batch > 0; seg++) {
-				if (seg == active_seg || seg == tt_seg)
+			Assert(undo_cleaner_state != NULL);
+
+			/*
+			 * spec-4.12a D4 (Finding C): round-robin sweep.  Resume from the
+			 * cursor the previous pass left off at (normalized into the current
+			 * window) rather than restarting at base every pass.  `batch` bounds
+			 * the real work per pass (R7); `visited < inventory` bounds the wrap
+			 * so a pass whose entire window is active/tt/unreadable segments
+			 * (which spend no batch) still terminates.  Without this the low ids
+			 * consumed the whole batch budget every pass and high-id ACTIVE
+			 * segments were never scanned -> never drained -> the pool grew to
+			 * the hard cap and never fell back even at quiesce (the leak).
+			 */
+			seg = cluster_undo_cleaner_scan_cursor_start(undo_cleaner_state->scan_resume_seg, base,
+														 max_seg);
+
+			while (batch > 0 && visited < inventory) {
+				uint32 cur = seg;
+
+				visited++;
+				seg = cluster_undo_cleaner_scan_cursor_next(cur, base, max_seg);
+
+				if (cur == active_seg || cur == tt_seg)
 					continue;
 
 				CHECK_FOR_INTERRUPTS();
 
-				if (!cluster_undo_segment_tt_header_scan_pass(seg, owner, horizon, &stats))
+				if (!cluster_undo_segment_tt_header_scan_pass(cur, owner, horizon, &stats))
 					continue; /* absent / unreadable: retry next pass */
 				batch--;
 
@@ -410,12 +433,19 @@ undo_cleaner_run_pass(void)
 				 * never gates the 8.A guard (spec §2.3).
 				 */
 				if (cluster_undo_record_segment_commit_on_rollover)
-					cluster_undo_segment_advance_committed(seg);
+					cluster_undo_segment_advance_committed(cur);
 
-				if (cluster_undo_segment_advance_recyclable(seg, horizon)
+				if (cluster_undo_segment_advance_recyclable(cur, horizon)
 					== CLUSTER_SEG_RECYCLE_ADVANCED)
 					stats.segments_marked_recyclable++;
 			}
+
+			/*
+			 * Persist where this pass stopped so the next pass resumes past it
+			 * (cleaner is the sole reader/writer of scan_resume_seg, so no lock
+			 * is needed; same-process happens-before across passes).
+			 */
+			undo_cleaner_state->scan_resume_seg = seg;
 		}
 	}
 

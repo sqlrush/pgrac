@@ -33,6 +33,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_undo_segment.h"
+#include "cluster/cluster_undo_cleaner.h" /* spec-4.12a D4: round-robin cursor helpers */
 #include "cluster/storage/cluster_undo_xlog.h"
 
 /* Drop PG's port.h printf -> pg_printf override; unit_test.h uses
@@ -200,6 +201,55 @@ UT_TEST(test_r9_reuse_disk_older_than_old_gen_is_corruption)
 }
 
 
+/*
+ * spec-4.12a D4 (Finding C): the round-robin scan-cursor arithmetic that lets
+ * the batch-bounded cleaner pass cover the whole inventory across passes.
+ * Boundaries: window size, out-of-range normalize to base, wrap, and a full
+ * sweep visiting every segment exactly once before repeating.
+ */
+UT_TEST(test_d4_scan_cursor_roundrobin)
+{
+	/* inventory = |[base, max_seg]|; empty when max_seg < base. */
+	UT_ASSERT_EQ((int)cluster_undo_cleaner_scan_inventory(1, 8), 8);
+	UT_ASSERT_EQ((int)cluster_undo_cleaner_scan_inventory(5, 5), 1);
+	UT_ASSERT_EQ((int)cluster_undo_cleaner_scan_inventory(5, 4), 0);
+
+	/* cursor_start: out-of-range (0 first-use, < base, > shrunken max) -> base;
+	 * in-range preserved (the round-robin resume point). */
+	UT_ASSERT_EQ((int)cluster_undo_cleaner_scan_cursor_start(0, 1, 8), 1);
+	UT_ASSERT_EQ((int)cluster_undo_cleaner_scan_cursor_start(3, 1, 8), 3);
+	UT_ASSERT_EQ((int)cluster_undo_cleaner_scan_cursor_start(8, 1, 8), 8);
+	UT_ASSERT_EQ((int)cluster_undo_cleaner_scan_cursor_start(9, 1, 8), 1);
+	UT_ASSERT_EQ((int)cluster_undo_cleaner_scan_cursor_start(2, 4, 8), 4);
+
+	/* cursor_next: +1, wrapping max_seg -> base. */
+	UT_ASSERT_EQ((int)cluster_undo_cleaner_scan_cursor_next(1, 1, 8), 2);
+	UT_ASSERT_EQ((int)cluster_undo_cleaner_scan_cursor_next(7, 1, 8), 8);
+	UT_ASSERT_EQ((int)cluster_undo_cleaner_scan_cursor_next(8, 1, 8), 1);
+
+	/*
+	 * Fairness invariant: cursor_next is a single cycle over [base, max_seg].
+	 * From any start it stays in range, returns to the start ONLY after exactly
+	 * `inventory` steps (no short cycle), and does close after `inventory` steps.
+	 * A single full-length cycle visits every segment exactly once before any
+	 * repeat -- so no segment is starved and none is double-scanned per sweep.
+	 */
+	{
+		uint32 base = 1, max_seg = 5, start = 3, cur = start;
+		uint32 inv = cluster_undo_cleaner_scan_inventory(base, max_seg);
+		uint32 steps;
+
+		for (steps = 1; steps <= inv; steps++) {
+			cur = cluster_undo_cleaner_scan_cursor_next(cur, base, max_seg);
+			UT_ASSERT(cur >= base && cur <= max_seg);
+			if (steps < inv)
+				UT_ASSERT_NE((int)cur, (int)start); /* no early return = no short cycle */
+		}
+		UT_ASSERT_EQ((int)cur, (int)start); /* full cycle closes after inventory steps */
+	}
+}
+
+
 int
 main(void)
 {
@@ -210,6 +260,7 @@ main(void)
 	UT_RUN(test_r5_same_gen_earlier_states_apply);
 	UT_RUN(test_r5b_same_gen_illegal_state_is_corruption);
 	UT_RUN(test_d3_record_segment_drain_recycle_redo_coverage); /* spec-4.12a D3 */
+	UT_RUN(test_d4_scan_cursor_roundrobin);						/* spec-4.12a D4 */
 	UT_RUN(test_r6_reuse_fresh_or_torn_header_applies);
 	UT_RUN(test_r7_reuse_old_or_new_generation_applies_idempotent);
 	UT_RUN(test_r8_reuse_disk_newer_skips_stale);

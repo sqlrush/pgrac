@@ -638,25 +638,34 @@ cluster_undo_active_write_boundary(void)
 
 /*
  * cluster_undo_any_unresolved_prepared -- 硬门 6 signal: is there ANY unresolved
- *	cluster-TT prepared transaction whose undo may still be consumed by ROLLBACK
- *	PREPARED (spec-4.8 D7-A)?  Two sources, both sound across the EndPrepare ->
- *	PostPrepare handoff:
- *	  - TwoPhaseState (live + crash-recovered): the GlobalTransaction is added
- *	    at EndPrepare, BEFORE PostPrepare_ClusterTT clears this backend's
- *	    registry slot, so a drain that sees the slot cleared also sees the count
- *	    >= 1.  Skipped entirely when 2PC is disabled (max_prepared_xacts == 0).
- *	  - the spec-3.15 D6 protected-slot map (crash-recovered re-pins), checked
- *	    first as a cheap belt-and-suspenders.
- *	Conservative (counts non-cluster prepared xacts too): Q11-A minimal-safe.
+ *	prepared transaction whose undo may still be consumed by ROLLBACK PREPARED
+ *	(spec-4.8 D7-A)?  Authoritative source = TwoPhaseState (numPrepXacts), which
+ *	holds BOTH live prepares and crash-recovered ones (RecoverPreparedTransactions
+ *	calls MarkAsPrepared -> numPrepXacts++ before replaying the 2PC records), and
+ *	is decremented exactly at FinishPreparedTransaction (COMMIT/ROLLBACK
+ *	PREPARED).  Sound across the EndPrepare -> PostPrepare handoff: the
+ *	GlobalTransaction is added at EndPrepare, BEFORE PostPrepare_ClusterTT clears
+ *	this backend's active-write registry slot, so a drain that observes the
+ *	cleared slot also observes count >= 1 (no gap).  Read under TwoPhaseStateLock
+ *	SHARED; short-circuited when 2PC is disabled.  Conservative (counts
+ *	non-cluster prepared xacts too): Q11-A minimal-safe.
+ *
+ *	NOT the spec-3.15 D6 protected-slot map: that pin has the wrong lifetime for
+ *	this gate.  twophase recover re-pins a crash-recovered xact's TT slot, but
+ *	the pin is released lazily (its slot stays protected until later recycled),
+ *	so cluster_tt_slot_protected_count() can stay > 0 AFTER the prepared xact has
+ *	resolved -- which would wedge the record-segment drain off permanently after
+ *	any crash-with-prepared, re-opening the spec-4.13 leak (observed: t/270 L6,
+ *	pg_prepared_xacts empty yet the drain kept retaining).  numPrepXacts releases
+ *	at resolution, so it is the correct unresolved-prepared signal.  The
+ *	recovery window before TwoPhaseState is rebuilt is covered by the D3
+ *	RecoveryInProgress gate in cluster_undo_record_segment_drainable (which
+ *	retains every drain while replaying WAL).
  */
 static bool
 cluster_undo_any_unresolved_prepared(void)
 {
-	if (cluster_tt_slot_protected_count() > 0)
-		return true;
-	if (max_prepared_xacts > 0 && GetNumberOfPreparedTransactions() > 0)
-		return true;
-	return false;
+	return max_prepared_xacts > 0 && GetNumberOfPreparedTransactions() > 0;
 }
 
 /*

@@ -124,7 +124,55 @@ typedef struct UndoCleanerSharedState {
 	uint64 segments_marked_recyclable;	  /* D3: COMMITTED -> RECYCLABLE transitions */
 	uint64 stale_active_skipped;		  /* HC6: ACTIVE entries skipped, never judged */
 	uint64 slots_wrap_retired;			  /* D5: shmem entries retired at TT_WRAP_MAX */
+
+	/*
+	 * spec-4.12a D4 (Finding C): round-robin segment-scan cursor.  The per-pass
+	 * scan is bounded to cluster.undo_cleaner_batch_segments readable headers
+	 * (R7); persisting where the last pass stopped lets successive passes resume
+	 * across the inventory so every segment is eventually visited, instead of
+	 * restarting at the first segment every pass (which let the low ids consume
+	 * the whole batch budget forever and starved high-id ACTIVE segments -- the
+	 * spec-4.13 leak).  Cleaner-process is the sole reader/writer; shmem-resident
+	 * is sufficient (no WAL / on-disk / catversion -- a restart re-derives it
+	 * from base).  0 (zero-init) is normalized to base on first use.
+	 */
+	uint32 scan_resume_seg;
 } UndoCleanerSharedState;
+
+
+/*
+ * spec-4.12a D4 (Finding C): pure round-robin scan-cursor arithmetic.  Kept
+ * pure so cluster_unit can exercise the wrap / normalize boundaries directly.
+ * These govern coverage fairness only -- the ACTIVE->COMMITTED 8.A drain gate
+ * (cluster_undo_record_segment_drainable) and RECYCLABLE-only reuse are
+ * unchanged.  The scan window is the segment-id range [base, max_seg] for this
+ * instance.
+ */
+
+/* Number of segments in the window [base, max_seg] (0 when the window is empty). */
+static inline uint32
+cluster_undo_cleaner_scan_inventory(uint32 base, uint32 max_seg)
+{
+	return (max_seg >= base) ? (max_seg - base + 1) : 0;
+}
+
+/*
+ * Normalize a persisted resume cursor into [base, max_seg].  An out-of-range
+ * cursor restarts at base: 0 on first use, or a value left of base / right of a
+ * shrunken max_seg.
+ */
+static inline uint32
+cluster_undo_cleaner_scan_cursor_start(uint32 resume, uint32 base, uint32 max_seg)
+{
+	return (resume < base || resume > max_seg) ? base : resume;
+}
+
+/* Advance the cursor one segment, wrapping from max_seg back to base. */
+static inline uint32
+cluster_undo_cleaner_scan_cursor_next(uint32 cur, uint32 base, uint32 max_seg)
+{
+	return (cur >= max_seg) ? base : cur + 1;
+}
 
 
 /*
