@@ -2382,7 +2382,7 @@ cluster_grd_entry_enqueue_or_grant(const ClusterResId *resid, const ClusterGrdHo
 		 * change of the SAME hold -- is the spec-5.2 path and self-excludes
 		 * in cluster_grd_entry_request_convert.)
 		 */
-		if (entry->holders[i].node_id == (int32)holder->node_id
+		if ((uint32)entry->holders[i].node_id == holder->node_id
 			&& entry->holders[i].procno == holder->procno)
 			continue;
 		if (conflict_holders_out != NULL && n_conflict < PGRAC_GRD_MAX_HOLDERS) {

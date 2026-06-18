@@ -1512,11 +1512,12 @@ cluster_ges_send_bast_targeted(const struct ClusterResId *resid, int requested_m
 			 * slot recycled between lookup and signal.
 			 */
 			uint32 target_procno = holders[i].holder.procno;
+			uint32 all_proc_count = ProcGlobal->allProcCount; /* read once (no TOCTOU) */
 			PGPROC *proc;
 			int target_pid;
 			int target_backendid;
 
-			if (target_procno >= ProcGlobal->allProcCount) {
+			if (target_procno >= all_proc_count) {
 				cluster_grd_inc_bast_stale_drop();
 				continue;
 			}
@@ -1524,7 +1525,7 @@ cluster_ges_send_bast_targeted(const struct ClusterResId *resid, int requested_m
 			target_pid = proc->pid;
 			target_backendid = proc->backendId;
 			if (!cluster_grd_bast_local_deliver_ok(
-					target_procno, (int)ProcGlobal->allProcCount, holders[i].holder.cluster_epoch,
+					target_procno, (int)all_proc_count, holders[i].holder.cluster_epoch,
 					cluster_epoch_get_current(), target_pid, target_backendid)) {
 				cluster_grd_inc_bast_stale_drop();
 				continue;
