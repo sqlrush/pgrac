@@ -42,6 +42,19 @@
 UT_DEFINE_GLOBALS();
 
 /*
+ * Assert() in cluster_ges_mode.c expands to ExceptionalCondition() in
+ * --enable-cassert builds; provide the stub so the pure layer links
+ * standalone.  Valid-input tests never trigger it.
+ */
+void
+ExceptionalCondition(const char *conditionName pg_attribute_unused(),
+					 const char *fileName pg_attribute_unused(),
+					 int lineNumber pg_attribute_unused())
+{
+	abort();
+}
+
+/*
  * Independent transcription of PG LockConflicts[] expressed as a
  * compatibility grid: expected_compat[held][wanted] == 1 when compatible.
  * Index 0 (NoLock) is unused.
@@ -193,11 +206,17 @@ UT_TEST(test_invalid_mode_fails_closed)
 	UT_ASSERT(ges_mode_is_valid(GES_MODE_FIRST));
 	UT_ASSERT(ges_mode_is_valid(GES_MODE_LAST));
 
-	/* conservative answers: incompatible / empty / lateral */
+#ifndef USE_ASSERT_CHECKING
+	/*
+	 * Conservative fail-closed answers for out-of-range input: incompatible
+	 * / empty / lateral.  Only observable in non-assert builds; with cassert
+	 * the Assert() in each function fires first (that is the debug guard).
+	 */
 	UT_ASSERT(!ges_modes_compatible(0, AccessShareLock));
 	UT_ASSERT(!ges_modes_compatible(AccessShareLock, GES_MODE_LAST + 1));
 	UT_ASSERT_EQ((int)ges_mode_compat_set(0), 0);
 	UT_ASSERT_EQ((int)ges_mode_convert_class(0, AccessShareLock), (int)GES_CONVERT_LATERAL);
+#endif
 }
 
 /* U9 -- canonical PG name parser (case-insensitive); unknown/DLM -> 0. */
