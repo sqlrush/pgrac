@@ -49,6 +49,7 @@ OBJS = \
 	cluster_write_fence.o \
 	cluster_ges.o \
 	cluster_ges_dedup.o \
+	cluster_ges_mode.o \
 	cluster_ges_reply_wait.o \
 	cluster_grd.o \
 	cluster_grd_outbound.o \

@@ -50,7 +50,8 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_recovery_worker test_cluster_recovery_merge test_cluster_remote_xact \
         test_cluster_block_apply test_cluster_thread_apply test_cluster_thread_replay \
         test_cluster_thread_driver test_cluster_thread_orchestrator \
-        test_cluster_write_fence test_cluster_stage4_acceptance
+        test_cluster_write_fence test_cluster_stage4_acceptance \
+        test_cluster_ges_mode
 
 # Path to the cluster_version object (no PG deps, safe to link standalone).
 CLUSTER_VERSION_O = $(top_builddir)/src/backend/cluster/cluster_version.o
@@ -113,7 +114,7 @@ CLUSTER_GCS_O = $(top_builddir)/src/backend/cluster/cluster_gcs.o
 # separate rules because they also link additional cluster_*.o
 # objects (the test files stub the PG backend symbols those
 # objects reference).
-SIMPLE_TESTS = $(filter-out test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf test_cluster_ic_mock test_cluster_inject test_cluster_pgstat test_cluster_debug test_cluster_shared_fs test_cluster_shared_fs_sharedfs test_cluster_smgr test_cluster_startup_phase test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_cssd test_cluster_qvotec test_cluster_voting_disk_io test_cluster_quorum_decision test_cluster_scn test_cluster_epoch test_cluster_fence test_cluster_reconfig test_cluster_ges test_cluster_grd test_cluster_lmd test_cluster_lock_acquire test_cluster_retention test_cluster_visibility_variants test_cluster_tt_2pc test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_block_apply test_cluster_thread_apply test_cluster_thread_replay test_cluster_thread_driver test_cluster_thread_orchestrator test_cluster_write_fence test_cluster_stage4_acceptance,$(TESTS))
+SIMPLE_TESTS = $(filter-out test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf test_cluster_ic_mock test_cluster_inject test_cluster_pgstat test_cluster_debug test_cluster_shared_fs test_cluster_shared_fs_sharedfs test_cluster_smgr test_cluster_startup_phase test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_cssd test_cluster_qvotec test_cluster_voting_disk_io test_cluster_quorum_decision test_cluster_scn test_cluster_epoch test_cluster_fence test_cluster_reconfig test_cluster_ges test_cluster_grd test_cluster_lmd test_cluster_lock_acquire test_cluster_retention test_cluster_visibility_variants test_cluster_tt_2pc test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_block_apply test_cluster_thread_apply test_cluster_thread_replay test_cluster_thread_driver test_cluster_thread_orchestrator test_cluster_write_fence test_cluster_stage4_acceptance test_cluster_ges_mode,$(TESTS))
 
 # spec-2.4 D16: test_cluster_epoch links cluster_epoch.o standalone.
 # cluster_epoch.c references ShmemInitStruct + cluster_shmem_register_region
@@ -124,6 +125,16 @@ test_cluster_epoch: test_cluster_epoch.c unit_test.h $(CLUSTER_VERSION_O) \
 		$(CLUSTER_EPOCH_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_EPOCH_O) \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-5.1a D6: test_cluster_ges_mode links cluster_ges_mode.o (pure layer:
+# const matrix + compat / convert-class / DLM-alias / PG-name helpers).
+# The pure layer has no PG-backend dependencies, so nothing is stubbed.
+CLUSTER_GES_MODE_O = $(top_builddir)/src/backend/cluster/cluster_ges_mode.o
+test_cluster_ges_mode: test_cluster_ges_mode.c unit_test.h $(CLUSTER_VERSION_O) \
+		$(CLUSTER_GES_MODE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_GES_MODE_O) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 # spec-3.12 D6: test_cluster_retention links cluster_undo_retention.o (the two
