@@ -302,10 +302,17 @@ sub gate
 # TAP, so the shard is the real coverage).
 # ===========================================================================
 {
+	# Honest evidence semantics (P2): this gate does NOT verify cold-merge
+	# content in t/274 -- it records a COVERAGE REFERENCE to the authoritative
+	# e2e t/248 (which asserts count+sum through the remote authority at t/248
+	# L1:506).  status=PASS means "the backing e2e is present AND runs in CI"
+	# (a removed/renamed t/248 trips it), NOT "t/274 verified the content".  The
+	# actual content verification is t/248's own pass in the stage4-wal shard.
 	my $t248 = "$FindBin::RealBin/248_shared_merged_recovery.pl";
-	gate('HG#2a-i', 'cold-merge materialized content (count+sum through remote authority)',
+	gate('HG#2a-i', 'cold-merge content — coverage reference to backing e2e t/248 (verified there, not in t/274)',
 		1, ((-e $t248) ? 'PASS' : 'FAIL'),
-		note => 'authoritative content e2e = t/248 (serialized cold-cluster merge); runs in CI nightly stage4-wal shard (range 242-248)');
+		evidence => 't/248 present + runs in nightly stage4-wal shard (range 242-248); content (count+sum through remote authority) asserted in t/248 L1:506',
+		verified_in => 't/248 (not t/274)');
 }
 
 

@@ -115,14 +115,16 @@ sub _besteffort_present
 }
 
 
-# ===== L1 — per-thread WAL routing: own-instance routes to its thread =====
+# ===== L1 — per-thread WAL routing: surface WIRED (present-check) =====
 # Single node owns thread for node_id 0;  the recovery dump surface carries the
-# routing state.  Present-check (routing advances only under multi-thread WAL).
+# routing state.  This is a WIRED present-check, NOT a mechanism-delta -- real
+# multi-thread WAL routing only advances with >1 thread (deep e2e t/242-244).
 {
 	my $present = _category_present('recovery');
-	is($present, 't', 'L1 per-thread WAL routing: recovery surface present');
+	is($present, 't', 'L1 per-thread WAL routing: recovery surface present (WIRED)');
 	$report->record_recovery_capability('L1_per_thread_wal_routing',
-		status => 'PASS', layer => 'hard');
+		status => (($present eq 't') ? 'PASS' : 'FAIL'), layer => 'best_effort',
+		reason => 'WIRED present-check; real multi-thread routing delta not exercised here (deep e2e t/242-244)');
 }
 
 # ===== L2-L6 — inherently cross-node recovery legs: best-effort SKIP =====
