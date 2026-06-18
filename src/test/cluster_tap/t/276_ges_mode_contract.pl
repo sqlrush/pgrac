@@ -8,8 +8,10 @@
 #      - the matrix SRF dumps all 64 cells with correct content,
 #      - the live self-check (cluster_ges_mode_matches_pg) confirms the
 #        frozen matrix agrees with the real DoLockModesConflict table,
-#      - the cluster.ges_mode_selfcheck GUC defaults to fatal and the node
-#        started cleanly (the startup self-check passed),
+#      - spec-5.1b D7: the cluster.ges_mode_selfcheck GUC was removed; the
+#        startup self-check is now unconditional + always FATAL, the node
+#        started cleanly (the unconditional check passed), and the GUC name
+#        is no longer recognised,
 #      - cluster_ges_mode_compat accepts only canonical PG names
 #        (case-insensitive) and fails closed on DLM aliases / unknown names.
 #
@@ -93,10 +95,16 @@ is($node->safe_psql('postgres', q{SELECT cluster_ges_mode_matches_pg()}),
 
 
 # ----------------------------------------------------------------------
-# L4 -- GUC default is fatal; node started cleanly (startup check passed).
+# L4 -- spec-5.1b D7: the cluster.ges_mode_selfcheck GUC was removed.  The
+# self-check is now unconditional + always FATAL; the node started cleanly
+# (we are querying it, so the unconditional check passed at startup), and the
+# GUC name is no longer recognised.
 # ----------------------------------------------------------------------
-is($node->safe_psql('postgres', q{SHOW cluster.ges_mode_selfcheck}),
-	'fatal', 'L4: cluster.ges_mode_selfcheck defaults to fatal');
+my ($l4ret, undef, $l4err)
+	= $node->psql('postgres', q{SHOW cluster.ges_mode_selfcheck});
+isnt($l4ret, 0, 'L4: cluster.ges_mode_selfcheck GUC removed (no longer recognized)');
+like($l4err, qr/unrecognized configuration parameter/,
+	'L4: SHOW of the removed GUC reports an unrecognized parameter');
 
 
 # ----------------------------------------------------------------------

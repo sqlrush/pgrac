@@ -256,7 +256,14 @@ typedef enum GesRejectReason {
 	GES_REJECT_REASON_LOCK_CONFLICT = 2,
 	GES_REJECT_REASON_EPOCH_MISMATCH = 3,
 	GES_REJECT_REASON_TIMEOUT = 4,
-	GES_REJECT_REASON_SHARD_FROZEN = 5 /* spec-4.6 D4: shard FROZEN/REBUILDING */
+	GES_REJECT_REASON_SHARD_FROZEN = 5, /* spec-4.6 D4: shard FROZEN/REBUILDING */
+	GES_REJECT_REASON_FEATURE_NOT_SUPPORTED = 6
+	/* spec-5.1b D3/D10: inbound opcode-2 cross-node CONVERT is not yet a
+	 * supported production path (the real backend trigger + convert wire
+	 * land in spec-5.2);  the master rejects with this reason and the
+	 * requester maps it to ERRCODE_FEATURE_NOT_SUPPORTED (0A000).  The
+	 * convert-specific GES_REJECT_REASON_ILLEGAL_CONVERT + 53R74 are
+	 * reserved for spec-5.2 (no live producer yet, so not registered). */
 } GesRejectReason;
 
 /* ClusterGrdHolderId 4-tuple typedef defined in cluster_grd.h (semantic

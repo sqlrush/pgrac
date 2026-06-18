@@ -2182,6 +2182,22 @@ cluster_grd_converts_full_count(void)
 {
 	return 0;
 }
+/* spec-5.1b D9 — convert state-machine counter stubs (dump_grd refs). */
+uint64
+cluster_grd_convert_granted_inplace_count(void)
+{
+	return 0;
+}
+uint64
+cluster_grd_convert_enqueued_count(void)
+{
+	return 0;
+}
+uint64
+cluster_grd_convert_illegal_count(void)
+{
+	return 0;
+}
 uint64
 cluster_grd_ngranted_promoted_count(void)
 {

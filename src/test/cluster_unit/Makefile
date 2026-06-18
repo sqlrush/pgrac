@@ -617,10 +617,14 @@ test_cluster_scn: test_cluster_scn.c unit_test.h \
 # + pg_atomic_*; test stubs all of these (union force-align for shmem
 # buffer per L105) and exercises the 2 handler stubs + 2 accessors real
 # behavior (T-ges-1 a/b/c/d/e).
+# spec-5.1b D1: cluster_ges.o now references ges_modes_compatible (frozen
+# matrix), so link the pure cluster_ges_mode.o (standalone-linkable, no new deps).
 test_cluster_ges: test_cluster_ges.c unit_test.h \
-		$(CLUSTER_VERSION_O) $(CLUSTER_GES_O)
+		$(CLUSTER_VERSION_O) $(CLUSTER_GES_O) $(CLUSTER_GES_MODE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_VERSION_O) $(CLUSTER_GES_O) -o $@
+		$(CLUSTER_VERSION_O) $(CLUSTER_GES_O) $(CLUSTER_GES_MODE_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 # spec-2.14 D11: test_cluster_grd links cluster_grd.o standalone.
 # cluster_grd.c references ShmemInitStruct + cluster_shmem_register_region
@@ -629,9 +633,9 @@ test_cluster_ges: test_cluster_ges.c unit_test.h \
 # encode/decode + hash distribution + sparse-node master mapping + 4-class
 # is_cluster_aware classifier (T-grd-1 a/b/c/d/e/f).
 test_cluster_grd: test_cluster_grd.c unit_test.h \
-		$(CLUSTER_VERSION_O) $(CLUSTER_GRD_O)
+		$(CLUSTER_VERSION_O) $(CLUSTER_GRD_O) $(CLUSTER_GES_MODE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_VERSION_O) $(CLUSTER_GRD_O) \
+		$(CLUSTER_VERSION_O) $(CLUSTER_GRD_O) $(CLUSTER_GES_MODE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 

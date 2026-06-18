@@ -130,15 +130,12 @@ extern ClusterGesMode ges_mode_from_pg_name(const char *name);
 
 #ifndef FRONTEND
 
-/* Backend layer: severity for the startup matrix-vs-PG self-check. */
-typedef enum ClusterGesModeSelfcheck {
-	GES_MODE_SELFCHECK_OFF = 0,
-	GES_MODE_SELFCHECK_WARN,
-	GES_MODE_SELFCHECK_FATAL
-} ClusterGesModeSelfcheck;
-
-extern int cluster_ges_mode_selfcheck; /* GUC: cluster.ges_mode_selfcheck */
-
+/*
+ * Backend layer: the startup matrix-vs-PG self-check.  spec-5.1b D7 removed
+ * the cluster.ges_mode_selfcheck GUC (and its off/warn/fatal tiers): now
+ * that the frozen matrix drives the live GRD grant decision, drift is a P0
+ * double-grant hazard, so the check is unconditional and always FATAL.
+ */
 extern void cluster_ges_mode_init(void);
 extern bool ges_mode_compat_matches_pg(void);
 

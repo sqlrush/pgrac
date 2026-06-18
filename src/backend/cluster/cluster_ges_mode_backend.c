@@ -4,9 +4,10 @@
  *	  GES enqueue lock-mode encoding -- backend layer.
  *
  *	  Backend-only pieces of the GES mode contract: the startup self-check
- *	  that compares the frozen matrix against PG's live DoLockModesConflict,
- *	  the cluster.ges_mode_selfcheck GUC variable, and the SQL functions
- *	  that expose the matrix and parser to observability / TAP.
+ *	  that compares the frozen matrix against PG's live DoLockModesConflict
+ *	  (spec-5.1b D7: unconditional + always FATAL; the cluster.ges_mode_
+ *	  selfcheck GUC was removed), and the SQL functions that expose the
+ *	  matrix and parser to observability / TAP.
  *
  *	    --disable-cluster: the SQL functions become stubs that raise
  *	    ERRCODE_FEATURE_NOT_SUPPORTED so their symbols still resolve.
@@ -42,9 +43,6 @@ PG_FUNCTION_INFO_V1(cluster_ges_mode_matches_pg);
 
 #include "cluster/cluster_ges_mode.h"
 
-/* GUC: cluster.ges_mode_selfcheck (enum off/warn/fatal; default fatal). */
-int cluster_ges_mode_selfcheck = GES_MODE_SELFCHECK_FATAL;
-
 #define CLUSTER_GES_MODE_MATRIX_NCOLS 5
 
 /*
@@ -71,11 +69,13 @@ ges_mode_compat_matches_pg(void)
 /*
  * cluster_ges_mode_init -- startup self-check of the frozen matrix.
  *
- *	Runs once at postmaster cluster init.  On any divergence from PG's
- *	live conflict table, fails closed per cluster.ges_mode_selfcheck:
- *	fatal refuses startup, warn logs and continues, off skips entirely.
- *	The check compares two compile-time const tables, so a divergence is
- *	deterministic; FATAL (not PANIC) cleanly refuses startup.
+ *	Runs once at postmaster cluster init.  spec-5.1b D7: now that the frozen
+ *	matrix drives the live GRD grant decision (D1), any drift from PG's
+ *	conflict table is a P0 double-grant hazard, so the check is
+ *	unconditional and always FATAL — the off/warn GUC tiers were removed
+ *	(there is no safe "continue anyway").  The check compares two
+ *	compile-time const tables, so a divergence is deterministic; FATAL (not
+ *	PANIC) cleanly refuses startup without a recovery loop.
  */
 void
 cluster_ges_mode_init(void)
@@ -83,27 +83,19 @@ cluster_ges_mode_init(void)
 	ClusterGesMode held;
 	ClusterGesMode wanted;
 
-	if (cluster_ges_mode_selfcheck == GES_MODE_SELFCHECK_OFF)
-		return;
-
 	for (held = GES_MODE_FIRST; held <= GES_MODE_LAST; held++) {
 		for (wanted = GES_MODE_FIRST; wanted <= GES_MODE_LAST; wanted++) {
 			bool ours = ges_modes_compatible(held, wanted);
 			bool pg = !DoLockModesConflict(
 				held, wanted); /* GES_MODE_OK: the contract self-check itself */
 
-			if (ours != pg) {
-				int elevel
-					= (cluster_ges_mode_selfcheck == GES_MODE_SELFCHECK_FATAL) ? FATAL : WARNING;
-
-				ereport(elevel, (errcode(ERRCODE_INTERNAL_ERROR),
-								 errmsg("GES mode compatibility matrix diverged from the lock "
-										"conflict table at held=%d wanted=%d",
-										held, wanted),
-								 errhint("This indicates a build inconsistency; rebuild after any "
-										 "change to the lock conflict table.")));
-				/* warn: keep scanning so all divergences are reported. */
-			}
+			if (ours != pg)
+				ereport(FATAL, (errcode(ERRCODE_INTERNAL_ERROR),
+								errmsg("GES mode compatibility matrix diverged from the lock "
+									   "conflict table at held=%d wanted=%d",
+									   held, wanted),
+								errhint("This indicates a build inconsistency; rebuild after any "
+										"change to the lock conflict table.")));
 		}
 	}
 }

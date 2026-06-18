@@ -963,6 +963,16 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 					 errmsg("cluster GES request carried a stale master generation"),
 					 errhint("The GRD master moved during reconfiguration; retry to route "
 							 "to the new master.")));
+		case CLUSTER_LOCK_ACQUIRE_FAIL_FEATURE_NOT_SUPPORTED:
+			/* PGRAC: spec-5.1b D3 — the master rejected an unsupported
+			 * request.  Currently the only producer is the cross-node
+			 * opcode-2 lock-conversion path, which is not yet a supported
+			 * production feature (the real backend trigger + convert wire
+			 * land in spec-5.2).  Not retryable. */
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cross-node lock conversion is not supported"),
+					 errhint("This GES feature is not yet available in this release.")));
 		case CLUSTER_LOCK_ACQUIRE_FAIL_DEADLOCK:
 			ereport(
 				ERROR,

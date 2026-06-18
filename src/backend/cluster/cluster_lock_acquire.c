@@ -325,6 +325,11 @@ cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req
 		/* Master-side recovery gate (the requester-side gate makes this
 		 * a narrow race window) — same 53R9I retry surface. */
 		return CLUSTER_LOCK_ACQUIRE_FAIL_SHARD_REMASTERING;
+	case GES_REJECT_REASON_FEATURE_NOT_SUPPORTED:
+		/* spec-5.1b D3 — master rejected an unsupported request (cross-node
+		 * convert; the real trigger + convert wire land in spec-5.2).  Not
+		 * retryable — surfaces as ERRCODE_FEATURE_NOT_SUPPORTED (0A000). */
+		return CLUSTER_LOCK_ACQUIRE_FAIL_FEATURE_NOT_SUPPORTED;
 	case GES_REJECT_REASON_LOCK_CONFLICT:
 	case GES_REJECT_REASON_NONE:
 	default:

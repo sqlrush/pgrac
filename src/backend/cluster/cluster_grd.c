@@ -34,7 +34,8 @@
 #include "postgres.h"
 
 #include "cluster/cluster_conf.h"
-#include "cluster/cluster_ges.h" /* GesRequestPayload / RELEASE cleanup payload */
+#include "cluster/cluster_ges.h"	  /* GesRequestPayload / RELEASE cleanup payload */
+#include "cluster/cluster_ges_mode.h" /* spec-5.1b D1: ges_modes_compatible (frozen matrix) */
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_grd_outbound.h" /* cluster_grd_outbound_enqueue_cleanup_release (D10) */
 #include "cluster/cluster_lmd.h"		  /* spec-2.24 D10 cleanup_*_count_inc */
@@ -131,11 +132,13 @@ typedef struct ClusterGrdWaiter {
 	TimestampTz wait_start;
 } ClusterGrdWaiter;
 
-typedef struct ClusterGrdConvert {
-	int32 node_id;
-	LOCKMODE current_mode;
-	LOCKMODE requested_mode;
-} ClusterGrdConvert;
+/*
+ * spec-5.1b D2 — ClusterGrdConvert was promoted to cluster_grd.h (full
+ * struct: locator (node,procno,current_mode) vs convert_request_id reply
+ * key) so the convert state machine + drain helper are a public,
+ * unit-testable surface.  The entry below embeds the converts[] array of
+ * the header type.
+ */
 
 struct ClusterGrdEntry {
 	ClusterResId resid; /* hash key (16B) */
@@ -266,6 +269,11 @@ cluster_grd_shmem_init(void)
 		pg_atomic_init_u64(&cluster_grd_state->waiters_full_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->converts_full_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->ngranted_promoted_count, 0);
+
+		/* spec-5.1b D9 — convert state-machine counters. */
+		pg_atomic_init_u64(&cluster_grd_state->convert_granted_inplace_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->convert_enqueued_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->convert_illegal_count, 0);
 
 		pg_atomic_init_u64(&cluster_grd_state->ges_work_queue_full_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->ges_cleanup_deferred_count, 0);
@@ -1641,9 +1649,8 @@ cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid,
 	for (i = 0; i < entry->ngranted; i++) {
 		if (((uint32)entry->holders[i].node_id != new_holder->node_id
 			 || entry->holders[i].procno != new_holder->procno)
-			&& DoLockModesConflict(
-				(LOCKMODE)lockmode,
-				entry->holders[i].mode)) { /* GES_MODE_OK: transitional until spec-5.1b */
+			&& !ges_modes_compatible(entry->holders[i].mode,
+									 (LOCKMODE)lockmode)) { /* spec-5.1b D1: frozen matrix */
 			SpinLockRelease(&entry->lock);
 			return CLUSTER_GRD_ENTRY_ERROR;
 		}
@@ -2303,9 +2310,11 @@ cluster_grd_entry_promote_waiter(ClusterGrdEntry *entry, const ClusterGrdHolderI
  *	ClusterGrdEntry body stays opaque (cluster_grd.h line 104
  *	forward-decl invariant).
  *
- *	Conflict judgement uses PG exported DoLockModesConflict — direct
- *	access to LockMethods[] / conflictTab[] internals is L138-prep
- *	abstraction-leak防御.
+ *	Conflict judgement uses the frozen 8x8 compatibility matrix via
+ *	ges_modes_compatible() (spec-5.1b D1).  Per the spec-5.1a contract
+ *	ges_modes_compatible(held, wanted) == !DoLockModesConflict(wanted,
+ *	held);  the startup self-check in cluster_ges_mode_backend.c guards
+ *	that equivalence against PG's live conflict table.
  * ============================================================ */
 
 ClusterGrdGrantAction
@@ -2336,9 +2345,13 @@ cluster_grd_entry_enqueue_or_grant(const ClusterResId *resid, const ClusterGrdHo
 	 *	  can later fan out a targeted BAST (HC18).
 	 */
 	for (int i = 0; i < entry->ngranted; i++) {
-		if (!DoLockModesConflict(
-				(LOCKMODE)lockmode,
-				entry->holders[i].mode)) /* GES_MODE_OK: transitional until spec-5.1b */
+		/*
+		 * spec-5.1b D1: frozen-matrix conflict check.  Contract (spec-5.1a
+		 * §2.2): ges_modes_compatible(held, wanted) == !DoLockModesConflict(
+		 * wanted, held);  matrix is symmetric (5.1a U3) so the canonical
+		 * (held, wanted) argument order is behaviourally identical.
+		 */
+		if (ges_modes_compatible(entry->holders[i].mode, (LOCKMODE)lockmode))
 			continue;
 		if (conflict_holders_out != NULL && n_conflict < PGRAC_GRD_MAX_HOLDERS) {
 			conflict_holders_out[n_conflict].holder.node_id = entry->holders[i].node_id;
@@ -2477,9 +2490,8 @@ cluster_grd_entry_release_and_pop_compatible_waiter(const ClusterResId *resid,
 			bool compatible = true;
 
 			for (int h = 0; h < entry->ngranted; h++) {
-				if (DoLockModesConflict(
-						entry->waiters[w].mode,
-						entry->holders[h].mode)) { /* GES_MODE_OK: transitional until spec-5.1b */
+				/* spec-5.1b D1: frozen-matrix conflict check. */
+				if (!ges_modes_compatible(entry->holders[h].mode, entry->waiters[w].mode)) {
 					compatible = false;
 					break;
 				}
@@ -2564,6 +2576,299 @@ cluster_grd_entry_generation(ClusterGrdEntry *entry)
 {
 	Assert(entry != NULL);
 	return entry->generation;
+}
+
+
+/* ============================================================
+ * spec-5.1b — GES lock-conversion (convert) state machine.
+ *
+ *	D4 partial-order decision + D5 convert-priority drain + anti-
+ *	starvation + D6 fail-closed invariants.  All raw mutators (caller
+ *	holds entry->lock, mirroring grant_holder).  LOGIC-only in spec-5.1b:
+ *	the live cross-node producer (opcode-2) is an explicit REJECT (D3);
+ *	the real backend convert trigger + wire/identity land in spec-5.2.
+ *
+ *	Holder identity for the convert locator is (node_id, procno,
+ *	current_mode) — the REDECLARE convention — and the convert's own slot
+ *	is self-excluded from the UPGRADE conflict scan, so a holder already
+ *	in a self-conflicting mode (SUE/SRE/E/AE) can still upgrade.
+ * ============================================================ */
+
+/* Locate the holder being converted by the (node,procno,mode) locator. */
+static int
+grd_find_holder_slot(ClusterGrdEntry *entry, int32 node_id, uint32 procno, LOCKMODE mode)
+{
+	for (int i = 0; i < entry->ngranted; i++) {
+		if (entry->holders[i].node_id == node_id && entry->holders[i].procno == procno
+			&& entry->holders[i].mode == mode)
+			return i;
+	}
+	return -1;
+}
+
+ClusterGrdConvertResult
+cluster_grd_entry_request_convert(ClusterGrdEntry *entry, const ClusterGrdConvert *req,
+								  bool *out_drain_hint)
+{
+	int hslot;
+	ClusterGesConvertClass klass;
+
+	Assert(entry != NULL && req != NULL);
+	Assert(cluster_grd_state != NULL);
+
+	if (out_drain_hint != NULL)
+		*out_drain_hint = false;
+
+	hslot = grd_find_holder_slot(entry, req->node_id, req->procno, req->current_mode);
+	if (hslot < 0) {
+		/*
+		 * The requester claims to hold (node,procno,current_mode) but the
+		 * GRD has no such holder — fail closed (53R74 mapping forward 5.2),
+		 * never fabricate a grant.
+		 */
+		pg_atomic_fetch_add_u64(&cluster_grd_state->convert_illegal_count, 1);
+		return CLUSTER_GRD_CONVERT_ILLEGAL;
+	}
+
+	klass = ges_mode_convert_class(entry->holders[hslot].mode, req->requested_mode);
+	switch (klass) {
+	case GES_CONVERT_SAME:
+		/* idempotent no-op. */
+		pg_atomic_fetch_add_u64(&cluster_grd_state->convert_granted_inplace_count, 1);
+		return CLUSTER_GRD_CONVERT_GRANTED_INPLACE;
+
+	case GES_CONVERT_DOWNGRADE:
+		/* compat-set widens → always grantable in place; signal drain so
+		 * the caller can re-evaluate blocked converts/waiters. */
+		entry->holders[hslot].mode = req->requested_mode;
+		entry->generation++;
+		if (out_drain_hint != NULL)
+			*out_drain_hint = true;
+		pg_atomic_fetch_add_u64(&cluster_grd_state->convert_granted_inplace_count, 1);
+		return CLUSTER_GRD_CONVERT_GRANTED_INPLACE;
+
+	case GES_CONVERT_UPGRADE:
+		/*
+		 * requested_mode must be compatible with every OTHER holder
+		 * (self-excluded by slot) before we may mutate in place; otherwise
+		 * enqueue with strict priority over new waiters (anti-starvation).
+		 */
+		for (int i = 0; i < entry->ngranted; i++) {
+			if (i == hslot)
+				continue;
+			if (!ges_modes_compatible(entry->holders[i].mode, req->requested_mode)) {
+				if (entry->nconverts >= PGRAC_GRD_MAX_CONVERTS) {
+					pg_atomic_fetch_add_u64(&cluster_grd_state->converts_full_count, 1);
+					return CLUSTER_GRD_CONVERT_QUEUE_FULL;
+				}
+				entry->converts[entry->nconverts++] = *req;
+				entry->generation++;
+				pg_atomic_fetch_add_u64(&cluster_grd_state->convert_enqueued_count, 1);
+				return CLUSTER_GRD_CONVERT_ENQUEUED;
+			}
+		}
+		entry->holders[hslot].mode = req->requested_mode;
+		entry->generation++;
+		pg_atomic_fetch_add_u64(&cluster_grd_state->convert_granted_inplace_count, 1);
+		return CLUSTER_GRD_CONVERT_GRANTED_INPLACE;
+
+	case GES_CONVERT_LATERAL:
+	default:
+		/* incomparable modes are not a conversion (two distinct locks); a
+		 * caller wanting both must take a fresh REQUEST. */
+		pg_atomic_fetch_add_u64(&cluster_grd_state->convert_illegal_count, 1);
+		return CLUSTER_GRD_CONVERT_ILLEGAL;
+	}
+}
+
+/* Remove convert slot c (swap-with-last compaction). */
+static void
+grd_convert_remove(ClusterGrdEntry *entry, int c)
+{
+	if (c < entry->nconverts - 1)
+		entry->converts[c] = entry->converts[entry->nconverts - 1];
+	memset(&entry->converts[entry->nconverts - 1], 0, sizeof(ClusterGrdConvert));
+	entry->nconverts--;
+	entry->generation++;
+}
+
+int
+cluster_grd_entry_drain_converts_then_waiters(ClusterGrdEntry *entry,
+											  ClusterGrdGrantIdentity *granted_out, int max_out)
+{
+	int n = 0;
+
+	Assert(entry != NULL && granted_out != NULL && max_out > 0);
+	Assert(cluster_grd_state != NULL);
+
+	/*
+	 * Phase 1 — grant every pending convert now compatible with the other
+	 * holders (self-excluded), in place.  Granting a convert changes a
+	 * holder mode, which may unblock an earlier-skipped convert, so we
+	 * restart the scan after each grant.  Each grant removes one queue
+	 * entry, so the loop is bounded.
+	 */
+	for (int c = 0; c < entry->nconverts && n < max_out;) {
+		ClusterGrdConvert *cv = &entry->converts[c];
+		int hslot = grd_find_holder_slot(entry, cv->node_id, cv->procno, cv->current_mode);
+		bool compatible = true;
+
+		if (hslot < 0) {
+			/* the holder being converted vanished (released / swept) — drop
+			 * the orphaned convert rather than block the queue forever. */
+			grd_convert_remove(entry, c);
+			continue; /* re-check slot c (now the swapped-in entry) */
+		}
+		for (int i = 0; i < entry->ngranted; i++) {
+			if (i == hslot)
+				continue;
+			if (!ges_modes_compatible(entry->holders[i].mode, cv->requested_mode)) {
+				compatible = false;
+				break;
+			}
+		}
+		if (!compatible) {
+			c++; /* still blocked — leave queued, try the next */
+			continue;
+		}
+
+		entry->holders[hslot].mode = cv->requested_mode;
+		granted_out[n].holder.node_id = (uint32)cv->node_id;
+		granted_out[n].holder.procno = cv->procno;
+		granted_out[n].holder.cluster_epoch = cv->cluster_epoch;
+		granted_out[n].holder.request_id = cv->convert_request_id;
+		granted_out[n].source_node_id = cv->source_node_id;
+		granted_out[n].request_opcode = GES_REQ_OPCODE_CONVERT;
+		granted_out[n].shard_master_generation = cv->shard_master_generation;
+		granted_out[n].mode = cv->requested_mode;
+		n++;
+		pg_atomic_fetch_add_u64(&cluster_grd_state->convert_granted_inplace_count, 1);
+		grd_convert_remove(entry, c);
+		c = 0; /* a holder mode changed — re-scan from the front */
+	}
+
+	/*
+	 * Phase 2 — pop ONE FIFO REQUEST waiter compatible with every holder
+	 * AND every still-pending convert target (anti-starvation: never grant
+	 * a waiter that would block a queued convert).
+	 */
+	if (n < max_out) {
+		for (int w = 0; w < entry->nwaiters; w++) {
+			bool ok = true;
+
+			for (int h = 0; h < entry->ngranted; h++) {
+				if (!ges_modes_compatible(entry->holders[h].mode, entry->waiters[w].mode)) {
+					ok = false;
+					break;
+				}
+			}
+			for (int cc = 0; ok && cc < entry->nconverts; cc++) {
+				if (!ges_modes_compatible(entry->converts[cc].requested_mode,
+										  entry->waiters[w].mode)) {
+					ok = false;
+					break;
+				}
+			}
+			if (!ok)
+				continue;
+
+			granted_out[n].holder.node_id = (uint32)entry->waiters[w].node_id;
+			granted_out[n].holder.procno = entry->waiters[w].procno;
+			granted_out[n].holder.cluster_epoch = entry->waiters[w].cluster_epoch;
+			granted_out[n].holder.request_id = entry->waiters[w].request_id;
+			granted_out[n].source_node_id = entry->waiters[w].source_node_id;
+			granted_out[n].request_opcode = entry->waiters[w].request_opcode;
+			granted_out[n].shard_master_generation = entry->waiters[w].shard_master_generation;
+			granted_out[n].mode = entry->waiters[w].mode;
+			n++;
+
+			if (entry->ngranted < PGRAC_GRD_MAX_HOLDERS) {
+				int hs = entry->ngranted++;
+
+				entry->holders[hs].node_id = entry->waiters[w].node_id;
+				entry->holders[hs].procno = entry->waiters[w].procno;
+				entry->holders[hs].cluster_epoch = entry->waiters[w].cluster_epoch;
+				entry->holders[hs].request_id = entry->waiters[w].request_id;
+				entry->holders[hs].mode = entry->waiters[w].mode;
+			}
+			if (w < entry->nwaiters - 1)
+				entry->waiters[w] = entry->waiters[entry->nwaiters - 1];
+			memset(&entry->waiters[entry->nwaiters - 1], 0, sizeof(ClusterGrdWaiter));
+			entry->nwaiters--;
+			entry->generation++;
+			break; /* one waiter per drain (multi-convert + 1 waiter, §1.2 D5) */
+		}
+	}
+	return n;
+}
+
+bool
+cluster_grd_entry_request_blocked_by_pending_convert(ClusterGrdEntry *entry, int wanted_mode)
+{
+	Assert(entry != NULL);
+	for (int c = 0; c < entry->nconverts; c++) {
+		if (!ges_modes_compatible(entry->converts[c].requested_mode, (LOCKMODE)wanted_mode))
+			return true;
+	}
+	return false;
+}
+
+int
+cluster_grd_entry_ngranted(ClusterGrdEntry *entry)
+{
+	Assert(entry != NULL);
+	return entry->ngranted;
+}
+
+int
+cluster_grd_entry_nconverts(ClusterGrdEntry *entry)
+{
+	Assert(entry != NULL);
+	return entry->nconverts;
+}
+
+bool
+cluster_grd_entry_holder_mode(ClusterGrdEntry *entry, int32 node_id, uint32 procno,
+							  LOCKMODE *out_mode)
+{
+	Assert(entry != NULL);
+	for (int i = 0; i < entry->ngranted; i++) {
+		if (entry->holders[i].node_id == node_id && entry->holders[i].procno == procno) {
+			if (out_mode != NULL)
+				*out_mode = entry->holders[i].mode;
+			return true;
+		}
+	}
+	return false;
+}
+
+uint64
+cluster_grd_convert_granted_inplace_count(void)
+{
+	Assert(cluster_grd_state != NULL);
+	return pg_atomic_read_u64(&cluster_grd_state->convert_granted_inplace_count);
+}
+
+uint64
+cluster_grd_convert_enqueued_count(void)
+{
+	Assert(cluster_grd_state != NULL);
+	return pg_atomic_read_u64(&cluster_grd_state->convert_enqueued_count);
+}
+
+uint64
+cluster_grd_convert_illegal_count(void)
+{
+	Assert(cluster_grd_state != NULL);
+	return pg_atomic_read_u64(&cluster_grd_state->convert_illegal_count);
+}
+
+uint64
+cluster_grd_convert_queue_full_count(void)
+{
+	/* convert queue-full reuses the existing converts_full_count (D9). */
+	Assert(cluster_grd_state != NULL);
+	return pg_atomic_read_u64(&cluster_grd_state->converts_full_count);
 }
 
 ClusterGrdEntryResult

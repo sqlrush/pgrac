@@ -50,6 +50,7 @@
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_gcs.h"	   /* spec-4.7 D2 (L238) — cluster_gcs_lookup_master proto */
 #include "cluster/cluster_gcs_block.h" /* spec-4.7 D2 (L238) — block re-declare scan/send protos */
+#include "cluster/cluster_ges_mode.h"  /* spec-5.1b — frozen matrix + convert classification */
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_reconfig.h"		 /* spec-4.6 D1 — ReconfigEvent stub type */
 #include "cluster/cluster_thread_recovery.h" /* spec-4.11 D3 (L238) — gate_unfreeze proto */
@@ -1387,13 +1388,452 @@ UT_TEST(test_grd_d2_redeclare_scan_completion_gate)
 }
 
 
+/* ============================================================
+ * spec-5.1b — GES grant/convert state machine (D11 unit suite U1-U11).
+ *
+ *	Convert-state-machine logic (D2/D4/D5/D6/D9) is LOGIC-only in
+ *	spec-5.1b (no live cross-node producer — opcode-2 is explicitly
+ *	FEATURE_NOT_SUPPORTED, see D3); these unit tests are the full
+ *	correctness coverage of the partial-order classification, convert-
+ *	priority drain, anti-starvation, self-exclusion, double-grant guard,
+ *	and queue-full fail-closed paths.  Lives in this binary (rule 6.A
+ *	low-risk deviation from the spec's test_cluster_grd_convert.c name)
+ *	to reuse the existing shmem-stub + fake-HTAB + ges_mode link harness.
+ * ============================================================ */
+
+/* request_opcode tags (mirror cluster_ges.h GES_REQ_OPCODE_*; not included
+ * here to avoid pulling the GES wire surface into the standalone binary). */
+#define UT_GES_OPCODE_REQUEST 1
+#define UT_GES_OPCODE_CONVERT 2
+
+static ClusterGrdEntry *
+convert_make_entry(int field1)
+{
+	LOCKTAG src;
+	ClusterResId resid;
+	ClusterGrdEntry *e = NULL;
+
+	memset(&src, 0, sizeof(src));
+	src.locktag_field1 = (uint32)field1;
+	src.locktag_type = LOCKTAG_RELATION;
+	src.locktag_lockmethodid = 1;
+	cluster_grd_resid_encode(&src, &resid);
+	(void)cluster_grd_entry_lookup_or_create(&resid, true, &e);
+	return e;
+}
+
+static void
+convert_reset(void)
+{
+	/*
+	 * The soft entry-cap counter (entry_current_count) lives in the shared
+	 * struct and is only zero-initialised on the first-ever shmem_init
+	 * (the fake ShmemInitStruct returns found=true thereafter), while
+	 * reset_fake_grd_htab() only clears the fake HTAB storage.  The convert
+	 * suite is not exercising the entry cap, so set a max far above the
+	 * total entries the suite ever creates to keep lookup_or_create out of
+	 * the FULL path.  At most ~2 entries are live per fake-HTAB reset, so
+	 * the 4-slot fake storage never overflows.
+	 */
+	reset_fake_grd_htab();
+	cluster_grd_max_entries = 1000000;
+	cluster_grd_shmem_init();
+}
+
+static void
+convert_teardown(void)
+{
+	cluster_grd_max_entries = 0;
+	reset_fake_grd_htab();
+}
+
+static void
+convert_grant(ClusterGrdEntry *e, int32 node, uint32 procno, uint64 reqid, LOCKMODE mode)
+{
+	ClusterGrdHolderId h;
+
+	memset(&h, 0, sizeof(h));
+	h.node_id = (uint32)node;
+	h.procno = procno;
+	h.cluster_epoch = 0;
+	h.request_id = reqid;
+	UT_ASSERT_EQ((int)cluster_grd_entry_grant_holder(e, &h, mode), (int)CLUSTER_GRD_ENTRY_OK);
+}
+
+static ClusterGrdConvert
+convert_req(int32 node, uint32 procno, LOCKMODE cur, LOCKMODE want, uint64 cvid)
+{
+	ClusterGrdConvert r;
+
+	memset(&r, 0, sizeof(r));
+	r.node_id = node;
+	r.source_node_id = node;
+	r.procno = procno;
+	r.cluster_epoch = 0;
+	r.current_mode = cur;
+	r.requested_mode = want;
+	r.convert_request_id = cvid;
+	r.shard_master_generation = 0;
+	r.request_opcode = UT_GES_OPCODE_CONVERT;
+	r.wait_start = 0;
+	return r;
+}
+
+/* U1 — the LIVE matrix-switch drives the grant path: for all 64 (held,
+ * wanted) pairs, the second cross-node request is GRANTED iff the frozen
+ * matrix says compatible, else ENQUEUED.  Plus independent anchors. */
+UT_TEST(test_convert_u1_grant_path_matrix_switch_all_pairs)
+{
+	int saved = cluster_node_id;
+	LOCKMODE held, wanted;
+
+	cluster_node_id = 0;
+	for (held = GES_MODE_FIRST; held <= GES_MODE_LAST; held++) {
+		for (wanted = GES_MODE_FIRST; wanted <= GES_MODE_LAST; wanted++) {
+			LOCKTAG src;
+			ClusterResId resid;
+			ClusterGrdHolderId h1, h2;
+			ClusterGrdGrantAction action;
+
+			convert_reset();
+			memset(&src, 0, sizeof(src));
+			src.locktag_field1 = (uint32)(1000 + held * 10 + wanted);
+			src.locktag_type = LOCKTAG_RELATION;
+			src.locktag_lockmethodid = 1;
+			cluster_grd_resid_encode(&src, &resid);
+
+			memset(&h1, 0, sizeof(h1));
+			h1.node_id = 1;
+			h1.procno = 100;
+			h1.request_id = 1;
+			action = cluster_grd_entry_enqueue_or_grant(&resid, &h1, 1, 1, 0, UT_GES_OPCODE_REQUEST,
+														held, NULL, NULL);
+			UT_ASSERT_EQ((int)action, (int)CLUSTER_GRD_GRANT_NOW);
+
+			memset(&h2, 0, sizeof(h2));
+			h2.node_id = 2;
+			h2.procno = 200;
+			h2.request_id = 2;
+			action = cluster_grd_entry_enqueue_or_grant(&resid, &h2, 2, 2, 0, UT_GES_OPCODE_REQUEST,
+														wanted, NULL, NULL);
+			if (ges_modes_compatible(held, wanted))
+				UT_ASSERT_EQ((int)action, (int)CLUSTER_GRD_GRANT_NOW);
+			else
+				UT_ASSERT_EQ((int)action, (int)CLUSTER_GRD_ENQUEUED_WAITER);
+		}
+	}
+	/* Independent anchors (not via ges_modes_compatible). */
+	UT_ASSERT(ges_modes_compatible(ShareLock, ShareLock));					/* S + S compatible */
+	UT_ASSERT(!ges_modes_compatible(ShareLock, ExclusiveLock));				/* S + X conflict */
+	UT_ASSERT(!ges_modes_compatible(AccessShareLock, AccessExclusiveLock)); /* AS + AE conflict */
+	cluster_node_id = saved;
+	convert_teardown();
+}
+
+/* U2 — SAME convert is an idempotent in-place no-op (no drain hint). */
+UT_TEST(test_convert_u2_same_is_noop)
+{
+	ClusterGrdEntry *e;
+	ClusterGrdConvert req;
+	bool drain = true; /* must be cleared to false */
+	LOCKMODE m = NoLock;
+
+	convert_reset();
+	e = convert_make_entry(2001);
+	convert_grant(e, 1, 100, 11, ShareLock);
+
+	req = convert_req(1, 100, ShareLock, ShareLock, 50);
+	UT_ASSERT_EQ((int)cluster_grd_entry_request_convert(e, &req, &drain),
+				 (int)CLUSTER_GRD_CONVERT_GRANTED_INPLACE);
+	UT_ASSERT_EQ(cluster_grd_entry_ngranted(e), 1);
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 0);
+	UT_ASSERT(cluster_grd_entry_holder_mode(e, 1, 100, &m));
+	UT_ASSERT_EQ((int)m, (int)ShareLock);
+	UT_ASSERT_EQ((int)drain, (int)false);
+	convert_teardown();
+}
+
+/* U3 — DOWNGRADE is always in-place and raises the drain hint. */
+UT_TEST(test_convert_u3_downgrade_inplace_drain_hint)
+{
+	ClusterGrdEntry *e;
+	ClusterGrdConvert req;
+	bool drain = false;
+	LOCKMODE m = NoLock;
+
+	convert_reset();
+	e = convert_make_entry(2002);
+	convert_grant(e, 1, 100, 11, ExclusiveLock);
+	convert_grant(e, 2, 200, 22, AccessShareLock); /* coexisting weaker holder */
+
+	req = convert_req(1, 100, ExclusiveLock, ShareLock, 51); /* X -> S */
+	UT_ASSERT_EQ((int)cluster_grd_entry_request_convert(e, &req, &drain),
+				 (int)CLUSTER_GRD_CONVERT_GRANTED_INPLACE);
+	UT_ASSERT_EQ((int)drain, (int)true);
+	UT_ASSERT(cluster_grd_entry_holder_mode(e, 1, 100, &m));
+	UT_ASSERT_EQ((int)m, (int)ShareLock);
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 0);
+	convert_teardown();
+}
+
+/* U4 — UPGRADE: in-place when compatible with the other holders, else
+ * enqueued (never silently granted). */
+UT_TEST(test_convert_u4_upgrade_inplace_or_enqueue)
+{
+	ClusterGrdEntry *e;
+	ClusterGrdConvert req;
+	bool drain = true;
+	LOCKMODE m = NoLock;
+
+	/* Case A: lone holder S upgrades to X -> in-place. */
+	convert_reset();
+	e = convert_make_entry(2003);
+	convert_grant(e, 1, 100, 11, ShareLock);
+	req = convert_req(1, 100, ShareLock, ExclusiveLock, 52);
+	UT_ASSERT_EQ((int)cluster_grd_entry_request_convert(e, &req, &drain),
+				 (int)CLUSTER_GRD_CONVERT_GRANTED_INPLACE);
+	UT_ASSERT_EQ((int)drain, (int)false);
+	UT_ASSERT(cluster_grd_entry_holder_mode(e, 1, 100, &m));
+	UT_ASSERT_EQ((int)m, (int)ExclusiveLock);
+	convert_teardown();
+
+	/* Case B: S upgrade to X conflicts with a remote S holder -> enqueue. */
+	convert_reset();
+	e = convert_make_entry(2004);
+	convert_grant(e, 1, 100, 11, ShareLock);
+	convert_grant(e, 2, 200, 22, ShareLock);
+	req = convert_req(1, 100, ShareLock, ExclusiveLock, 53);
+	UT_ASSERT_EQ((int)cluster_grd_entry_request_convert(e, &req, &drain),
+				 (int)CLUSTER_GRD_CONVERT_ENQUEUED);
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 1);
+	UT_ASSERT(cluster_grd_entry_holder_mode(e, 1, 100, &m));
+	UT_ASSERT_EQ((int)m, (int)ShareLock); /* unchanged: not silently upgraded */
+	convert_teardown();
+}
+
+/* U5 — LATERAL (incomparable) and missing-holder both fail closed ILLEGAL. */
+UT_TEST(test_convert_u5_lateral_and_no_holder_illegal)
+{
+	ClusterGrdEntry *e;
+	ClusterGrdConvert req;
+	bool drain = false;
+	LOCKMODE m = NoLock;
+
+	/* LATERAL: S <-> RowExclusive are incomparable (5.1a U6 canonical). */
+	convert_reset();
+	e = convert_make_entry(2005);
+	convert_grant(e, 1, 100, 11, ShareLock);
+	UT_ASSERT_EQ((int)ges_mode_convert_class(ShareLock, RowExclusiveLock),
+				 (int)GES_CONVERT_LATERAL);
+	req = convert_req(1, 100, ShareLock, RowExclusiveLock, 54);
+	UT_ASSERT_EQ((int)cluster_grd_entry_request_convert(e, &req, &drain),
+				 (int)CLUSTER_GRD_CONVERT_ILLEGAL);
+	UT_ASSERT(cluster_grd_entry_holder_mode(e, 1, 100, &m));
+	UT_ASSERT_EQ((int)m, (int)ShareLock); /* untouched */
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 0);
+	convert_teardown();
+
+	/* no holder matching the (node,procno,current_mode) locator -> ILLEGAL. */
+	convert_reset();
+	e = convert_make_entry(2006);
+	convert_grant(e, 1, 100, 11, ShareLock);
+	req = convert_req(9, 999, ShareLock, ExclusiveLock, 55); /* no such holder */
+	UT_ASSERT_EQ((int)cluster_grd_entry_request_convert(e, &req, &drain),
+				 (int)CLUSTER_GRD_CONVERT_ILLEGAL);
+	convert_teardown();
+}
+
+/* U6 — self-exclusion: a holder in a self-conflicting mode can still
+ * upgrade (its own slot must not be counted as a conflicting holder). */
+UT_TEST(test_convert_u6_self_exclusion)
+{
+	ClusterGrdEntry *e;
+	ClusterGrdConvert req;
+	bool drain = false;
+	LOCKMODE m = NoLock;
+
+	/* SUE upgrades to E (E self-conflicts).  Lone holder -> in-place. */
+	convert_reset();
+	e = convert_make_entry(2007);
+	convert_grant(e, 1, 100, 11, ShareUpdateExclusiveLock);
+	req = convert_req(1, 100, ShareUpdateExclusiveLock, ExclusiveLock, 56);
+	UT_ASSERT_EQ((int)cluster_grd_entry_request_convert(e, &req, &drain),
+				 (int)CLUSTER_GRD_CONVERT_GRANTED_INPLACE);
+	UT_ASSERT(cluster_grd_entry_holder_mode(e, 1, 100, &m));
+	UT_ASSERT_EQ((int)m, (int)ExclusiveLock);
+	convert_teardown();
+
+	/* E -> E is SAME (self-conflict short-circuited by SAME path). */
+	convert_reset();
+	e = convert_make_entry(2008);
+	convert_grant(e, 1, 100, 11, ExclusiveLock);
+	req = convert_req(1, 100, ExclusiveLock, ExclusiveLock, 57);
+	UT_ASSERT_EQ((int)cluster_grd_entry_request_convert(e, &req, &drain),
+				 (int)CLUSTER_GRD_CONVERT_GRANTED_INPLACE);
+	convert_teardown();
+}
+
+/* U7 — anti-starvation: with a pending convert, a new request that
+ * conflicts with the convert's target mode must be blocked (must wait);
+ * one compatible with the target is not blocked. */
+UT_TEST(test_convert_u7_new_request_blocked_by_pending_convert)
+{
+	ClusterGrdEntry *e;
+	ClusterGrdConvert req;
+	bool drain = false;
+
+	convert_reset();
+	e = convert_make_entry(2009);
+	convert_grant(e, 1, 100, 11, ShareLock);
+	convert_grant(e, 2, 200, 22, ShareLock);
+	req = convert_req(1, 100, ShareLock, ExclusiveLock, 58); /* enqueues (conflict) */
+	UT_ASSERT_EQ((int)cluster_grd_entry_request_convert(e, &req, &drain),
+				 (int)CLUSTER_GRD_CONVERT_ENQUEUED);
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 1);
+
+	/* pending convert wants X: a new S request conflicts with X -> blocked. */
+	UT_ASSERT(cluster_grd_entry_request_blocked_by_pending_convert(e, ShareLock));
+	/* AccessShare is compatible with X -> not blocked. */
+	UT_ASSERT(!cluster_grd_entry_request_blocked_by_pending_convert(e, AccessShareLock));
+	convert_teardown();
+}
+
+/* U8 — release drain order: pending convert is granted BEFORE a waiting
+ * REQUEST, and the multi-grant return carries both (opcode-tagged). */
+UT_TEST(test_convert_u8_drain_converts_before_waiters)
+{
+	ClusterGrdEntry *e;
+	ClusterGrdConvert req;
+	ClusterGrdHolderId h2, w3;
+	ClusterGrdGrantIdentity granted[PGRAC_GRD_MAX_CONVERTS_PUBLIC + 1];
+	bool drain = false;
+	int n;
+	LOCKMODE m = NoLock;
+
+	convert_reset();
+	e = convert_make_entry(2010);
+	convert_grant(e, 1, 100, 11, ShareLock); /* convert source holder */
+	convert_grant(e, 2, 200, 22, ShareLock); /* conflicts with the X convert */
+
+	req = convert_req(1, 100, ShareLock, ExclusiveLock, 59);
+	UT_ASSERT_EQ((int)cluster_grd_entry_request_convert(e, &req, &drain),
+				 (int)CLUSTER_GRD_CONVERT_ENQUEUED);
+
+	/* a pending REQUEST waiter for AccessShare (compatible with everything). */
+	memset(&w3, 0, sizeof(w3));
+	w3.node_id = 3;
+	w3.procno = 300;
+	w3.request_id = 33;
+	UT_ASSERT_EQ((int)cluster_grd_entry_add_waiter(e, &w3, AccessShareLock),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+
+	/* release the conflicting node-2 holder, then drain. */
+	memset(&h2, 0, sizeof(h2));
+	h2.node_id = 2;
+	h2.procno = 200;
+	h2.request_id = 22;
+	UT_ASSERT_EQ((int)cluster_grd_entry_release_holder(e, &h2), (int)CLUSTER_GRD_ENTRY_OK);
+
+	n = cluster_grd_entry_drain_converts_then_waiters(e, granted, lengthof(granted));
+	UT_ASSERT_EQ(n, 2);
+	/* convert first (opcode CONVERT, mode X), then the waiter (REQUEST, AS). */
+	UT_ASSERT_EQ((int)granted[0].request_opcode, UT_GES_OPCODE_CONVERT);
+	UT_ASSERT_EQ((int)granted[0].mode, (int)ExclusiveLock);
+	UT_ASSERT_EQ((int)granted[1].request_opcode, UT_GES_OPCODE_REQUEST);
+	UT_ASSERT_EQ((int)granted[1].mode, (int)AccessShareLock);
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 0);
+	UT_ASSERT(cluster_grd_entry_holder_mode(e, 1, 100, &m));
+	UT_ASSERT_EQ((int)m, (int)ExclusiveLock); /* converted in place */
+	convert_teardown();
+}
+
+/* U9 — convert queue full fails closed with QUEUE_FULL + counter bump. */
+UT_TEST(test_convert_u9_queue_full_fail_closed)
+{
+	ClusterGrdEntry *e;
+	bool drain = false;
+	uint64 before;
+	int i;
+
+	convert_reset();
+	e = convert_make_entry(2011);
+	convert_grant(e, 99, 999, 9, ShareLock); /* co-holder forcing RE conflict */
+	for (i = 0; i < PGRAC_GRD_MAX_CONVERTS_PUBLIC + 1; i++)
+		convert_grant(e, (int32)(i + 1), (uint32)((i + 1) * 100), (uint64)(i + 1), RowShareLock);
+
+	before = cluster_grd_convert_queue_full_count();
+	for (i = 0; i < PGRAC_GRD_MAX_CONVERTS_PUBLIC; i++) {
+		ClusterGrdConvert req = convert_req((int32)(i + 1), (uint32)((i + 1) * 100), RowShareLock,
+											RowExclusiveLock, (uint64)(100 + i));
+		UT_ASSERT_EQ((int)cluster_grd_entry_request_convert(e, &req, &drain),
+					 (int)CLUSTER_GRD_CONVERT_ENQUEUED);
+	}
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), PGRAC_GRD_MAX_CONVERTS_PUBLIC);
+
+	{
+		ClusterGrdConvert req = convert_req(9, 900, RowShareLock, RowExclusiveLock, 999);
+		UT_ASSERT_EQ((int)cluster_grd_entry_request_convert(e, &req, &drain),
+					 (int)CLUSTER_GRD_CONVERT_QUEUE_FULL);
+	}
+	UT_ASSERT_EQ(cluster_grd_convert_queue_full_count(), before + 1);
+	convert_teardown();
+}
+
+/* U10 — double-grant guard: a conflicting in-place upgrade is refused
+ * (enqueued), and a compatible one keeps the holder set conflict-free. */
+UT_TEST(test_convert_u10_double_grant_guard)
+{
+	ClusterGrdEntry *e;
+	ClusterGrdConvert req;
+	bool drain = false;
+	LOCKMODE m = NoLock;
+
+	/* S + RS: upgrade S->X conflicts with RS -> enqueue, no double grant. */
+	convert_reset();
+	e = convert_make_entry(2012);
+	convert_grant(e, 1, 100, 11, ShareLock);
+	convert_grant(e, 2, 200, 22, RowShareLock);
+	req = convert_req(1, 100, ShareLock, ExclusiveLock, 60);
+	UT_ASSERT_EQ((int)cluster_grd_entry_request_convert(e, &req, &drain),
+				 (int)CLUSTER_GRD_CONVERT_ENQUEUED);
+	UT_ASSERT(cluster_grd_entry_holder_mode(e, 1, 100, &m));
+	UT_ASSERT_EQ((int)m, (int)ShareLock);
+	convert_teardown();
+
+	/* S + AS: upgrade S->X is compatible with AS -> in-place granted. */
+	convert_reset();
+	e = convert_make_entry(2013);
+	convert_grant(e, 1, 100, 11, ShareLock);
+	convert_grant(e, 2, 200, 22, AccessShareLock);
+	req = convert_req(1, 100, ShareLock, ExclusiveLock, 61);
+	UT_ASSERT_EQ((int)cluster_grd_entry_request_convert(e, &req, &drain),
+				 (int)CLUSTER_GRD_CONVERT_GRANTED_INPLACE);
+	UT_ASSERT(cluster_grd_entry_holder_mode(e, 1, 100, &m));
+	UT_ASSERT_EQ((int)m, (int)ExclusiveLock);
+	UT_ASSERT(ges_modes_compatible(ExclusiveLock, AccessShareLock)); /* still conflict-free */
+	convert_teardown();
+}
+
+/* U11 — ClusterGrdConvert byte layout pinned (StaticAssert mirror + L45). */
+UT_TEST(test_convert_u11_struct_layout)
+{
+	UT_ASSERT_EQ((int)sizeof(ClusterGrdConvert), 64);
+	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, node_id), 0);
+	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, cluster_epoch), 16);
+	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, current_mode), 24);
+	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, requested_mode), 28);
+	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, convert_request_id), 32);
+	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, wait_start), 56);
+}
+
+
 int
 /* cppcheck-suppress constParameter
  * Reason: main() keeps the standard test harness signature used by the
  * other cluster_unit binaries; argv is intentionally unused. */
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(23);
+	UT_PLAN(34);
 
 	UT_RUN(test_grd_clusterresid_size_16);
 	UT_RUN(test_grd_resid_encode_decode_roundtrip);
@@ -1425,6 +1865,19 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_grd_lookup_master_gen_q3c_verbatim);
 	UT_RUN(test_grd_shard_phase_accessors);
 	UT_RUN(test_grd_d2_redeclare_scan_completion_gate);
+
+	/* spec-5.1b — GES grant/convert state machine (U1-U11). */
+	UT_RUN(test_convert_u1_grant_path_matrix_switch_all_pairs);
+	UT_RUN(test_convert_u2_same_is_noop);
+	UT_RUN(test_convert_u3_downgrade_inplace_drain_hint);
+	UT_RUN(test_convert_u4_upgrade_inplace_or_enqueue);
+	UT_RUN(test_convert_u5_lateral_and_no_holder_illegal);
+	UT_RUN(test_convert_u6_self_exclusion);
+	UT_RUN(test_convert_u7_new_request_blocked_by_pending_convert);
+	UT_RUN(test_convert_u8_drain_converts_before_waiters);
+	UT_RUN(test_convert_u9_queue_full_fail_closed);
+	UT_RUN(test_convert_u10_double_grant_guard);
+	UT_RUN(test_convert_u11_struct_layout);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

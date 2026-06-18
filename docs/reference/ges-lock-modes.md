@@ -67,8 +67,21 @@ SELECT cluster_ges_mode_compat('CR', 'EX');                       -- ERROR
 `cluster_ges_mode_matches_pg()` returns `true` when the matrix agrees with
 the server's lock conflict table.
 
-## Configuration
+## Lock conversion
 
-| Parameter | Default | Description |
-|---|---|---|
-| `cluster.ges_mode_selfcheck` | `fatal` | Severity when the matrix diverges from the server lock conflict table at startup: `fatal` refuses to start, `warn` logs and continues, `off` skips the check. Requires restart. |
+Cross-node *lock conversion* — changing the mode of an enqueue lock that is
+already held on a GES-managed resource — is **currently not supported**. A
+cross-node conversion request is rejected with
+`ERRCODE_FEATURE_NOT_SUPPORTED` (`0A000`) rather than being silently ignored.
+Ordinary lock acquisition, waiting, and release across nodes are unaffected.
+
+The `nconverts` column of `pg_cluster_grd_entries` reports the number of
+pending conversion requests queued on a resource; it is `0` in normal
+operation.
+
+## Startup self-check
+
+At startup the server verifies that its frozen GES compatibility matrix
+matches its lock conflict table. This check is automatic and mandatory: if
+the two ever diverge (which would indicate a build inconsistency) the server
+refuses to start. There is no configuration parameter for this check.

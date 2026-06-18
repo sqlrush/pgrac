@@ -22,10 +22,12 @@
 #    let a NEW raw call slip the gate in exactly the files spec-5.1b touches).
 #    Every legitimate call carries an inline /* GES_MODE_OK: <reason> */ on
 #    the same line; the gate skips only those lines (and genuine comments).
-#    Current exempt call sites:
+#    spec-5.1b D1/D8 migrated the transitional cluster_ges.c / cluster_grd.c
+#    grant-path call sites to ges_modes_compatible() and removed their
+#    annotations, so the ONLY remaining exempt call sites are:
 #      cluster_ges_mode_backend.c -- the frozen-vs-PG self-check itself
-#      cluster_ges.c / cluster_grd.c -- transitional; spec-5.1b migrates each
-#        to ges_modes_compatible() and removes its GES_MODE_OK annotation.
+#        (it must call DoLockModesConflict directly to verify the matrix).
+#    Any NEW bare DoLockModesConflict() in the grant path now fails the gate.
 #
 #-------------------------------------------------------------------------
 

@@ -106,7 +106,9 @@ cluster_init(void)
 
 	/*
 	 * spec-5.1a: verify the frozen GES mode-compat matrix against the live
-	 * lock conflict table (fails closed per cluster.ges_mode_selfcheck).
+	 * lock conflict table.  spec-5.1b D7: the matrix now drives the live GRD
+	 * grant decision, so this check is unconditional and always FATAL on
+	 * divergence (the off/warn cluster.ges_mode_selfcheck GUC was removed).
 	 */
 	cluster_ges_mode_init();
 }

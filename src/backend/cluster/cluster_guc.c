@@ -43,7 +43,6 @@
 #include "cluster/cluster_write_fence.h"	 /* spec-4.12 D7 write-fence enforcement GUCs */
 #include "cluster/cluster_conf.h"			 /* cluster_conf_has_peers (spec-3.18 D2b latch) */
 #include "cluster/cluster_cr_cache.h"		 /* cluster_cr_cache_max_blocks (spec-3.10 D4) */
-#include "cluster/cluster_ges_mode.h"		 /* spec-5.1a ges_mode_selfcheck GUC */
 #include "cluster/cluster_guc.h"
 #include "cluster/storage/cluster_undo_buf.h" /* cluster_undo_buf_writeback_allowed (spec-3.18 D1) */
 #include "cluster/cluster_ic.h"				  /* ClusterICTier enum values */
@@ -567,12 +566,13 @@ static const struct config_enum_entry cluster_write_fence_enforcement_options[]
 		{ "dev", CLUSTER_WRITE_FENCE_ENFORCE_DEV, false },
 		{ NULL, 0, false } };
 
-/* spec-5.1a: severity of the GES mode-matrix startup self-check. */
-static const struct config_enum_entry cluster_ges_mode_selfcheck_options[]
-	= { { "off", GES_MODE_SELFCHECK_OFF, false },
-		{ "warn", GES_MODE_SELFCHECK_WARN, false },
-		{ "fatal", GES_MODE_SELFCHECK_FATAL, false },
-		{ NULL, 0, false } };
+/*
+ * spec-5.1b D7: the cluster.ges_mode_selfcheck GUC (and its
+ * cluster_ges_mode_selfcheck_options off/warn/fatal table) was removed.
+ * The frozen matrix now drives the live GRD grant decision, so a drift is a
+ * P0 double-grant hazard with no safe "continue anyway" tier — the startup
+ * self-check is unconditional and always FATAL (cluster_ges_mode_init).
+ */
 
 
 /*
@@ -2523,17 +2523,12 @@ cluster_init_guc(void)
 		cluster_tt_status_hint_emit_mode_options, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	/*
-	 * cluster.ges_mode_selfcheck -- severity for the GES mode-matrix vs
-	 * lock-conflict-table startup self-check.  fatal (default) refuses
-	 * startup on divergence; warn logs and continues; off skips.
+	 * spec-5.1b D7: cluster.ges_mode_selfcheck was removed.  The frozen
+	 * matrix drives the live GRD grant decision, so the matrix-vs-lock-
+	 * conflict-table startup self-check is now unconditional and always
+	 * FATAL on divergence (cluster_ges_mode_init); there is no off/warn
+	 * tier because there is no safe way to continue past a drift.
 	 */
-	DefineCustomEnumVariable(
-		"cluster.ges_mode_selfcheck",
-		gettext_noop("Severity for the GES lock-mode compatibility matrix self-check."),
-		gettext_noop("fatal (default) refuses startup if the frozen matrix diverges from "
-					 "the lock conflict table; warn logs and continues; off skips the check."),
-		&cluster_ges_mode_selfcheck, GES_MODE_SELFCHECK_FATAL, cluster_ges_mode_selfcheck_options,
-		PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 #ifdef ENABLE_INJECTION
 	/*

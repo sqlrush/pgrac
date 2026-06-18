@@ -222,10 +222,8 @@ int cluster_pcm_grd_max_entries = -1;
  * (not linked here); cluster_guc.c references it via DefineCustomIntVariable. */
 int cluster_cr_cache_max_blocks = 64;
 
-/* spec-5.1a stub: cluster_ges_mode_selfcheck lives in
- * cluster_ges_mode_backend.c (not linked here); cluster_guc.c references it
- * via DefineCustomEnumVariable. */
-int cluster_ges_mode_selfcheck = 2;
+/* spec-5.1b D7: cluster_ges_mode_selfcheck GUC removed (cluster_guc.c no
+ * longer references it), so the stub definition is gone too. */
 
 void
 cluster_injection_run(const char *name pg_attribute_unused())

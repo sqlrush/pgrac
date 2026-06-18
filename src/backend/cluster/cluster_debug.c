@@ -876,6 +876,14 @@ dump_grd(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_grd_waiters_full_count()));
 	emit_row(rsinfo, "grd", "grd_converts_full_count",
 			 fmt_int64((int64)cluster_grd_converts_full_count()));
+	/* spec-5.1b D9 — convert state-machine verdict counters (queue-full
+	 * reuses grd_converts_full_count above). */
+	emit_row(rsinfo, "grd", "grd_convert_granted_inplace_count",
+			 fmt_int64((int64)cluster_grd_convert_granted_inplace_count()));
+	emit_row(rsinfo, "grd", "grd_convert_enqueued_count",
+			 fmt_int64((int64)cluster_grd_convert_enqueued_count()));
+	emit_row(rsinfo, "grd", "grd_convert_illegal_count",
+			 fmt_int64((int64)cluster_grd_convert_illegal_count()));
 	emit_row(rsinfo, "grd", "grd_ngranted_promoted_count",
 			 fmt_int64((int64)cluster_grd_ngranted_promoted_count()));
 	emit_row(rsinfo, "grd", "grd_ges_work_queue_full_count",

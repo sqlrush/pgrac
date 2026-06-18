@@ -103,7 +103,13 @@ typedef enum ClusterLockAcquireResult {
 	CLUSTER_LOCK_ACQUIRE_FAIL_SHARD_REMASTERING
 	= 18, /* shard FROZEN/REBUILDING past wait budget → 53R9I retry */
 	CLUSTER_LOCK_ACQUIRE_FAIL_STALE_GENERATION
-	= 19 /* stale epoch/master generation on the wire → 53R9J retry */
+	= 19, /* stale epoch/master generation on the wire → 53R9J retry */
+	/* spec-5.1b D3 — master rejected an unsupported request (currently the
+	 * cross-node opcode-2 convert path); caller maps to
+	 * ERRCODE_FEATURE_NOT_SUPPORTED (0A000).  The real backend convert
+	 * trigger lands in spec-5.2; this surface is the requester side of the
+	 * GES_REJECT_REASON_FEATURE_NOT_SUPPORTED reply. */
+	CLUSTER_LOCK_ACQUIRE_FAIL_FEATURE_NOT_SUPPORTED = 20
 } ClusterLockAcquireResult;
 
 

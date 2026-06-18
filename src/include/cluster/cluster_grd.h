@@ -66,6 +66,7 @@
 #ifndef FRONTEND
 
 #include "cluster/cluster_conf.h" /* CLUSTER_MAX_NODES (spec-4.6 D1 bitmap sizing) */
+#include "datatype/timestamp.h"	  /* TimestampTz (spec-5.1b ClusterGrdConvert) */
 #include "port/atomics.h"
 #include "storage/lock.h" /* LOCKTAG */
 
@@ -296,6 +297,14 @@ typedef struct ClusterGrdShared {
 	pg_atomic_uint64 block_path_failclosed_count;	   /* D4 GCS/PCM 53R9K (L12) */
 	pg_atomic_uint64 unaffected_holder_survived_count; /* L13 sweep-scope guard */
 	pg_atomic_uint64 stale_holder_swept_count;		   /* P6 post-barrier sweep (L15) */
+
+	/* spec-5.1b D9 — convert state-machine observability counters.
+	 * convert_queue_full reuses the existing converts_full_count above;
+	 * these three cover the in-place / enqueued / illegal verdicts.
+	 * Bumped by cluster_grd_entry_request_convert under entry->lock. */
+	pg_atomic_uint64 convert_granted_inplace_count;
+	pg_atomic_uint64 convert_enqueued_count;
+	pg_atomic_uint64 convert_illegal_count;
 } ClusterGrdShared;
 
 /* spec-2.17 D28b — extern atomic generation alloc helper(InitProcess hook). */
@@ -976,6 +985,130 @@ extern ClusterGrdGrantAction cluster_grd_entry_enqueue_or_grant(
 extern int cluster_grd_entry_release_and_pop_compatible_waiter(
 	const ClusterResId *resid, const ClusterGrdHolderId *holder,
 	ClusterGrdWaiterIdentity *granted_out, int max_out);
+
+
+/* ============================================================
+ * spec-5.1b — GES lock-conversion (convert) state machine.
+ *
+ *	Activates the convert-queue LOGIC consumed by spec-5.1a's frozen
+ *	compatibility matrix + partial-order classification.  In spec-5.1b
+ *	this state machine has NO live cross-node producer — the inbound
+ *	opcode-2 convert path is an explicit FEATURE_NOT_SUPPORTED reject
+ *	(D3), and the real backend convert trigger + wire/identity model are
+ *	co-designed with the first real consumer in spec-5.2 (TX row-lock
+ *	upgrade).  These entries provide the GRD-owned decision logic + a
+ *	multi-grant drain helper, exercised end-to-end by the cluster_unit
+ *	suite (U1-U11).
+ *
+ *	PG is an additive lock model (holding mode M then requesting M' adds a
+ *	new LOCALLOCK, lock.h), so there is no native lock conversion; the
+ *	holder being converted is located by (node_id, procno, current_mode) +
+ *	resid — the REDECLARE convention ("at most one grant per (resid,
+ *	mode)") — NOT by request_id.  convert_request_id is the convert's OWN
+ *	reply key, distinct from the old grant's id.
+ * ============================================================ */
+
+/* Per-entry convert-queue cap exposed for caller buffer sizing (mirrors
+ * the private cluster_grd.c PGRAC_GRD_MAX_CONVERTS). */
+#define PGRAC_GRD_MAX_CONVERTS_PUBLIC 8
+
+/*
+ * D2 — convert-queue entry.  In-memory shmem only (NOT a wire ABI; the
+ * convert wire encoding is forward-deferred to spec-5.2).  Populated by
+ * the cluster_unit harness / internal injection in spec-5.1b.
+ *
+ *	Identity split (review P0 / Q4=B): the holder being converted is
+ *	located by (node_id, procno, current_mode); convert_request_id is the
+ *	convert's own reply key (≠ the old grant request_id).
+ */
+typedef struct ClusterGrdConvert {
+	int32 node_id;					/* node holding the lock being converted */
+	int32 source_node_id;			/* node that initiated the convert (reply routing) */
+	uint32 procno;					/* PG ProcNumber of the holder */
+	uint64 cluster_epoch;			/* epoch at enqueue (stale-epoch sweep) */
+	LOCKMODE current_mode;			/* locator: (node,procno,current_mode)+resid */
+	LOCKMODE requested_mode;		/* target mode */
+	uint64 convert_request_id;		/* convert's own reply key (≠ old grant id) */
+	uint64 shard_master_generation; /* spec-2.27 dedup key carry */
+	uint32 request_opcode;			/* = GES_REQ_OPCODE_CONVERT */
+	TimestampTz wait_start;			/* enqueue timestamp (timeout / observability) */
+} ClusterGrdConvert;
+
+StaticAssertDecl(sizeof(ClusterGrdConvert) == 64, "ClusterGrdConvert layout pinned (spec-5.1b D2)");
+
+/*
+ * D4 — convert grant decision result.
+ *
+ *	GRANTED_INPLACE  SAME / DOWNGRADE / compatible UPGRADE — holder mode
+ *	                 mutated in place under entry->lock.
+ *	ENQUEUED         conflicting UPGRADE — queued, takes priority over new
+ *	                 waiters (anti-starvation).
+ *	ILLEGAL          LATERAL (incomparable) or no matching holder —
+ *	                 fail-closed (53R74 / SQLSTATE mapping forward 5.2).
+ *	QUEUE_FULL       convert queue exhausted (+ converts_full_count).
+ *	NOT_READY        GRD not initialised.
+ */
+typedef enum ClusterGrdConvertResult {
+	CLUSTER_GRD_CONVERT_GRANTED_INPLACE = 0,
+	CLUSTER_GRD_CONVERT_ENQUEUED = 1,
+	CLUSTER_GRD_CONVERT_ILLEGAL = 2,
+	CLUSTER_GRD_CONVERT_QUEUE_FULL = 3,
+	CLUSTER_GRD_CONVERT_NOT_READY = 4
+} ClusterGrdConvertResult;
+
+/*
+ * D5 — multi-grant identity returned by the drain helper.  opcode-tagged
+ * (REQUEST waiter vs CONVERT) so spec-5.2 can route each GES_REPLY GRANT
+ * to the correct reply path.
+ */
+typedef struct ClusterGrdGrantIdentity {
+	ClusterGrdHolderId holder;
+	int32 source_node_id;
+	uint32 request_opcode;			/* GES_REQ_OPCODE_REQUEST or _CONVERT */
+	uint64 shard_master_generation; /* dedup reply key carry */
+	LOCKMODE mode;					/* granted mode */
+} ClusterGrdGrantIdentity;
+
+/*
+ * D4 — request a convert against an existing holder (caller holds
+ * entry->lock; raw mutator like grant_holder).  out_drain_hint is set
+ * true on DOWNGRADE (strength relaxed → caller should drain the queue).
+ */
+extern ClusterGrdConvertResult cluster_grd_entry_request_convert(ClusterGrdEntry *entry,
+																 const ClusterGrdConvert *req,
+																 bool *out_drain_hint);
+
+/*
+ * D5 — convert-priority drain (caller holds entry->lock).  Grants every
+ * pending convert that is now compatible with the surviving holders
+ * (in-place, FIFO), THEN pops a single FIFO REQUEST waiter compatible
+ * with both the holders and every still-pending convert target.  Returns
+ * the number of identities written to granted_out (≤ max_out;  buffer
+ * should hold PGRAC_GRD_MAX_CONVERTS_PUBLIC + 1).
+ */
+extern int cluster_grd_entry_drain_converts_then_waiters(ClusterGrdEntry *entry,
+														 ClusterGrdGrantIdentity *granted_out,
+														 int max_out);
+
+/*
+ * D5 — anti-starvation predicate (caller holds entry->lock): true when a
+ * new request at wanted_mode must wait because some pending convert's
+ * target mode conflicts with it (granting it would starve the convert).
+ */
+extern bool cluster_grd_entry_request_blocked_by_pending_convert(ClusterGrdEntry *entry,
+																 int /* LOCKMODE */ wanted_mode);
+
+/* Inspection helpers (unit-test + observability; caller holds entry->lock). */
+extern int cluster_grd_entry_ngranted(ClusterGrdEntry *entry);
+extern int cluster_grd_entry_nconverts(ClusterGrdEntry *entry);
+extern bool cluster_grd_entry_holder_mode(ClusterGrdEntry *entry, int32 node_id, uint32 procno,
+										  LOCKMODE *out_mode);
+
+/* D9 — convert observability counter accessors. */
+extern uint64 cluster_grd_convert_granted_inplace_count(void);
+extern uint64 cluster_grd_convert_enqueued_count(void);
+extern uint64 cluster_grd_convert_illegal_count(void);
+extern uint64 cluster_grd_convert_queue_full_count(void);
 
 
 /*

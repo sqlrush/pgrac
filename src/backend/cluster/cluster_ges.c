@@ -35,6 +35,7 @@
 
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_ges.h"
+#include "cluster/cluster_ges_mode.h"		/* spec-5.1b D1: ges_modes_compatible (frozen matrix) */
 #include "cluster/cluster_ges_reply_wait.h" /* spec-2.23 D1 5-tuple wait HTAB */
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_grd_outbound.h"
@@ -746,13 +747,13 @@ cluster_ges_lmon_drain_work_queue(void)
 		memcpy(&resid, req->resid, sizeof(resid));
 
 		switch ((GesRequestOpcode)req->opcode) {
-		case GES_REQ_OPCODE_REQUEST:
-		case GES_REQ_OPCODE_CONVERT: {
+		case GES_REQ_OPCODE_REQUEST: {
 			/*
 				 * spec-2.23 D6 — GRD-owned conflict matrix + waiter queue.
 				 *
 				 *	enqueue_or_grant handles the entry lock, conflict scan
-				 *	via DoLockModesConflict, and either grants immediately
+				 *	via the frozen matrix (ges_modes_compatible, spec-5.1b D1),
+				 *	and either grants immediately
 				 *	or enqueues a waiter carrying the full reply identity
 				 *	(HC17/HC19).  conflict_holders[] surface is consumed by
 				 *	Step 5 D4 cluster_ges_send_bast_targeted (HC18 BAST
@@ -857,6 +858,37 @@ cluster_ges_lmon_drain_work_queue(void)
 														sizeof(reject));
 			}
 			/* CLUSTER_GRD_NOT_READY → silently retry on next drain tick. */
+			break;
+		}
+		case GES_REQ_OPCODE_CONVERT: {
+			/*
+			 * spec-5.1b D3 — cross-node lock conversion is not yet a
+			 * supported production path.  PG is an additive lock model with
+			 * no native convert; the real backend trigger + convert wire/
+			 * identity model are co-designed with the first real consumer
+			 * (spec-5.2 TX row-lock upgrade).  Until then an inbound
+			 * opcode-2 (e.g. from a future-version peer) is rejected
+			 * explicitly — NOT silently dropped (L341) — via the reply ring
+			 * with FEATURE_NOT_SUPPORTED.  Protocol rejection must never use
+			 * ereport on the LMS/receiving thread (it would break the
+			 * message loop, review-2 P1); the requesting backend maps the
+			 * reason to ERRCODE_FEATURE_NOT_SUPPORTED (0A000).
+			 */
+			GesReplyPayload reject;
+
+			memset(&reject, 0, sizeof(reject));
+			reject.opcode = GES_REPLY_OPCODE_REJECT;
+			reject.reply_for_opcode = req->opcode;
+			reject.reject_reason = GES_REJECT_REASON_FEATURE_NOT_SUPPORTED;
+			reject.holder_node_id = req->holder_node_id;
+			reject.holder_procno = req->holder_procno;
+			reject.holder_cluster_epoch_lo = req->holder_cluster_epoch_lo;
+			reject.holder_cluster_epoch_hi = req->holder_cluster_epoch_hi;
+			reject.holder_request_id_lo = req->holder_request_id_lo;
+			reject.holder_request_id_hi = req->holder_request_id_hi;
+			memcpy(reject.resid, req->resid, sizeof(reject.resid));
+			ges_record_dedup_reply_for_request((uint32)item.source_node_id, req, &reject);
+			cluster_grd_outbound_enqueue_lmon_reply(item.source_node_id, &reject, sizeof(reject));
 			break;
 		}
 		case GES_REQ_OPCODE_RELEASE: {
@@ -1413,8 +1445,9 @@ cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 /* ============================================================
  * spec-2.23 D4 — TARGETED BAST (HC18).
  *
- *	HC18:  filter holder_list through DoLockModesConflict so only
- *	holders whose mode actually conflicts receive a BAST advisory.
+ *	HC18:  filter holder_list through the frozen matrix (ges_modes_
+ *	compatible, spec-5.1b D1) so only holders whose mode actually
+ *	conflicts receive a BAST advisory.
  *	Peer broadcast fanout is strictly forbidden — non-holder peers
  *	would observe BAST with no matching cluster_grd_bast_pending slot
  *	and either silently drop or spam validation-fail counters.
@@ -1449,8 +1482,8 @@ cluster_ges_send_bast_targeted(const struct ClusterResId *resid, int requested_m
 		 * incompatible entries makes the routine idempotent under
 		 * concurrent release races.
 		 */
-		if (!DoLockModesConflict((LOCKMODE)requested_mode,
-								 held)) /* GES_MODE_OK: transitional until spec-5.1b */
+		/* spec-5.1b D1: frozen-matrix conflict check (see cluster_grd.c). */
+		if (ges_modes_compatible(held, (LOCKMODE)requested_mode))
 			continue;
 
 		if (holder_node == cluster_node_id) {
