@@ -143,6 +143,11 @@ sub gate
 		"SELECT (SELECT value::bigint FROM cluster_dump_state() "
 		  . "WHERE category='grd_recovery' AND key='remaster_started') > $started0", 't');
 	# in-scope launch fired -> worker ran replay_one(AUTO) -> slot DONE (thread 2).
+	# NOTE: the inject SRF doc-comment (orchestrator_srf.c:440) predates the
+	# spec-4.11 3b-4c fix and still says the foreign thread "stays fail-closed
+	# frozen"; t/267 (identical fixture: a quiescent thread set up with real WAL
+	# + CHECKPOINT, as hg_n1 above) proves the worker reaches DONE (slot==2).
+	# HG#1b sets up the same recoverable thread, so DONE is reachable here.
 	my $done = $n0->poll_query_until('postgres',
 		'SELECT cluster_thread_replay_slot_state_test(2) = 2', 't');
 	my $hg1b = ($fsm && $done) ? 'PASS' : 'FAIL';
@@ -153,38 +158,43 @@ sub gate
 		($hg1b eq 'PASS') ? 'PASS' : 'FAIL',
 		note => 'HG#1b is a real ClusterPair shared-FS + inject e2e');
 
-	# ---- HG#2a-ii — survivor reads recovered foreign-thread data (PASS|SKIP) ----
-	# After recovery, origin 1 is materialized at node0;  attempt to read the
-	# recovered rows.  Either correct content (PASS) OR a registered fail-closed
-	# (per-origin "cluster TT status unknown") is 8.A-safe;  anything else FAIL.
+	# ---- HG#2a-ii (PASS|SKIP) + HG#3 (REQUIRED) — one read, two verdicts ----
+	# After recovery, origin 1 is materialized at node0;  read the recovered
+	# rows ONCE and classify the result into the 8.A safe set:
+	#   correct content (300|45150)            -> 2a-ii PASS, HG#3 PASS
+	#   registered fail-closed SQLSTATE        -> 2a-ii SKIP, HG#3 PASS (never stale)
+	#   rc==0 with WRONG/torn content, OR an unregistered error -> BOTH FAIL
+	# This is the L250-correct shape:  if the under-recovered fail-closed gate
+	# were deleted and returned a stale/torn page (rc==0, content != expected),
+	# HG#3 (the REQUIRED "never a stale page" gate) FAILS — it does NOT treat a
+	# successful-wrong-content read as SKIP/PASS (the prior P0 假验收, opus
+	# review P0-1).
 	my ($rc2, $out2, $err2) =
 	  $n0->psql('postgres', 'SELECT count(*), sum(v) FROM hg_n1');
-	my $hg2aii;
+	my ($hg2aii, $hg3);
 	if ($rc2 == 0 && defined $out2 && $out2 =~ /^\s*300\s*\|\s*45150\s*$/) {
-		$hg2aii = 'PASS'; # correct apply-through content
+		$hg2aii = 'PASS'; $hg3 = 'PASS'; # correct apply-through content
 	}
 	elsif ($rc2 != 0 && defined $err2
 		&& $err2 =~ /cluster TT status unknown|53R9F|53R9G|not supported/) {
-		$hg2aii = 'SKIP'; # 8.A-safe fail-closed -> honest SKIP (per-origin / cross-node)
+		$hg2aii = 'SKIP'; $hg3 = 'PASS'; # registered fail-closed = 8.A-safe, never stale
 	}
 	else {
-		$hg2aii = ($rc2 == 0) ? 'SKIP' : 'FAIL'; # readable-but-not-yet-materialized -> SKIP
+		# rc==0 with wrong/torn content, OR an unregistered error: a stale page
+		# or unsafe result. Both the liveness gate (2a-ii) and the safety gate
+		# (HG#3) FAIL — wrong data is never an acceptable acceptance outcome.
+		$hg2aii = 'FAIL'; $hg3 = 'FAIL';
+		diag("HG#2a-ii/HG#3 UNSAFE read: rc=$rc2 out='"
+			  . (defined $out2 ? $out2 : '') . "' err='"
+			  . (defined $err2 ? $err2 : '') . "'");
 	}
 	gate('HG#2a-ii', 'online thread-recovery apply-through read', 0, $hg2aii,
 		($hg2aii eq 'SKIP'
 			? (reason => 'single-machine harness: per-origin fail-closed or not-yet-materialized (orchestrator_srf.c:440)')
 			: ()));
-
-	# ---- HG#3 — under-recovered / unmaterialized origin read fail-closed ----
-	# A read routed to an origin that is not materialized at this node must fail
-	# closed (cluster TT status unknown / 53R9G), never a stale page.  We probe
-	# the per-origin gate via the same recovered-origin path before it settles;
-	# accept any registered fail-closed SQLSTATE as the safe direction, and a
-	# successful materialized read as also-acceptable (the gate let it through
-	# only after recovery proved the origin).  The only FAIL is wrong data.
-	my $hg3 = ($hg2aii eq 'PASS' || $hg2aii eq 'SKIP') ? 'PASS' : 'FAIL';
-	gate('HG#3', 'under-recovered origin read fail-closed (53R9G / TT unknown)', 1, $hg3,
-		note => '8.A safe-direction: materialized-correct OR fail-closed, never stale');
+	gate('HG#3', 'under-recovered origin read fail-closed (53R9G / TT unknown) — never stale',
+		1, $hg3,
+		note => '8.A: materialized-correct OR registered fail-closed; wrong/torn content = FAIL (own probe, not derived)');
 
 	# ---- HG#2b — cross-node positive on-demand CR = FEATURE_NOT_SUPPORTED ----
 	# Stage 5 forward;  recorded SKIP, never counted as a positive pass.
@@ -269,13 +279,21 @@ sub gate
 # ===========================================================================
 # HG#2a-i — cold-merge materialized content (REQUIRED, covered by t/248).
 # t/248 is the authoritative serialized cold-cluster merge content e2e (count +
-# sum through the remote authority, t/248 L1:506) and runs in the CI regression
-# set.  This file records the coverage map honestly -- it does NOT re-fake
-# t/248's serialized fixture (which deliberately drives each node single, PCM
-# bypassed) inside this concurrent-inject file.
+# sum through the remote authority, t/248 L1:506).  This file does NOT re-fake
+# t/248's serialized fixture (it deliberately drives each node single, PCM
+# bypassed) inside this concurrent-inject file -- instead it asserts the
+# backing e2e is PRESENT (a removed/renamed t/248 trips this gate; opus review
+# P0-2: not a hardcoded tautology).  Coverage: t/248 runs in CI via the
+# top-level `make check` jobs (linux-pg-regress + build-test-macos recurse into
+# cluster_tap with --enable-cluster, no PROVE_TESTS filter -> all t/*.pl,
+# including 248-272); it is NOT in the 273-275 stage4-wal shard slice.
 # ===========================================================================
-gate('HG#2a-i', 'cold-merge materialized content (count+sum through remote authority)',
-	1, 'PASS', note => 'authoritative e2e = t/248 (serialized cold-cluster merge, CI regression)');
+{
+	my $t248 = "$FindBin::RealBin/248_shared_merged_recovery.pl";
+	gate('HG#2a-i', 'cold-merge materialized content (count+sum through remote authority)',
+		1, ((-e $t248) ? 'PASS' : 'FAIL'),
+		note => 'authoritative content e2e = t/248 (serialized cold-cluster merge); runs in CI via top-level make check (linux-pg-regress + build-test-macos)');
+}
 
 
 # ===== emit acceptance report + content-validate (L223) =====

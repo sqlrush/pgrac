@@ -189,9 +189,10 @@ UT_TEST(test_stage4_sqlstate_recovery_fence_surface_encodable)
 
 UT_TEST(test_stage4_wait_events_count_snapshot_102)
 {
-	/* spec-4.12b ship value.  update-required contract: a future spec adding
-	 * cluster wait events MUST bump this snapshot (and the dump/test baselines
-	 * that count them). */
+	/* Current Stage 4 surface value (the macro in cluster_views.h attributes
+	 * the latest bump to spec-4.12 D7).  update-required contract: a future
+	 * spec adding cluster wait events MUST bump this snapshot (and the dump/test
+	 * baselines that count them). */
 	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 102);
 }
 

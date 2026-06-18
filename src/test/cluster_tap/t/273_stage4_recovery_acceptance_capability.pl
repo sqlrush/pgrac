@@ -25,9 +25,11 @@
 #      L7   undo/TT recovery:          committed row survives a restart, undo
 #                                      crash decision surface present (deep:
 #                                      t/253) -- REAL single-node
-#      L8   checkpoint-writeback bnd:  the spec-4.8ab boundary guard is wired
-#                                      (undo_writeback_boundary_check enum
-#                                      active) -- REAL single-node
+#      L8   checkpoint-writeback bnd:  the spec-4.8ab boundary guard is WIRED
+#                                      (undo_writeback_boundary_check GUC
+#                                      registered + a guarded write succeeds);
+#                                      the 53R9N fail-closed delta is the deep
+#                                      e2e t/270, not exercised here
 #      L9   online block recovery:     block-recovery counter surface wired
 #                                      (recovery / block_recovery_blocks_recovered);
 #                                      deep corrupt-block counter-delta e2e is
@@ -44,7 +46,9 @@
 #    Primary fixture is a single cluster-enabled node (pg_ctl level, like
 #    t/226) so the bulk runs on this host;  the inherently cross-node legs
 #    (L2-L6) degrade to best-effort SKIP when only one node is present (their
-#    deep e2e is t/242-272, run for real in CI nightly stage4-wal shard).
+#    deep e2e is t/242-272, run for real in CI nightly: t/242-247 in the
+#    stage4-wal shard, t/248-272 via the top-level `make check` jobs which
+#    recurse into cluster_tap with --enable-cluster).
 #    Each REAL leg proves the path actually ran via a counter delta or a
 #    fail-closed SQLSTATE (L250) -- not a bare "present" check.  Smoke scope
 #    <= 3min.  Results accumulate into a Stage4AcceptanceReport JSON (D7).
@@ -86,15 +90,6 @@ $node->append_conf('postgresql.conf',
 $node->start;
 
 
-# Read a single cluster_debug counter (0 when absent).
-sub _counter
-{
-	my ($cat, $key) = @_;
-	return $node->safe_psql('postgres', qq{
-		SELECT COALESCE((SELECT value::bigint FROM pg_cluster_state
-			WHERE category='$cat' AND key='$key'), 0)});
-}
-
 # Does a dump category emit at least one row?  (boolean renders 't'/'f' without
 # an explicit ::text cast, which would render 'true'/'false'.)
 sub _category_present
@@ -102,20 +97,6 @@ sub _category_present
 	my ($cat) = @_;
 	return $node->safe_psql('postgres', qq{
 		SELECT (count(*) > 0) FROM pg_cluster_state WHERE category='$cat'});
-}
-
-# REAL capability assertion: run $sql, compare to $expect, record into report.
-sub _assert_capability
-{
-	my ($name, $sql, $expect, %opt) = @_;
-	my $got = $node->safe_psql('postgres', $sql);
-	my $pass = (defined $got && $got eq $expect);
-	is($got, $expect, $name);
-	$report->record_recovery_capability($name,
-		status => $pass ? 'PASS' : 'FAIL',
-		layer  => $opt{layer} // 'hard',
-		($opt{counter_delta} ? (counter_delta => $opt{counter_delta}) : ()));
-	return $pass;
 }
 
 # Best-effort SKIP leg for an inherently-cross-node capability: assert the
@@ -167,7 +148,9 @@ _besteffort_present('L6_gcs_pcm_warm_recovery','gcs_recovery', 't/251');
 		status => $pass ? 'PASS' : 'FAIL', layer => 'hard');
 }
 
-# ===== L8 — checkpoint-writeback boundary guard wired (spec-4.8ab, REAL) =====
+# ===== L8 — checkpoint-writeback boundary guard WIRED (spec-4.8ab) =====
+# WIRED/present check (not a mechanism-delta): the GUC is registered and a
+# guarded write succeeds. The 53R9N fail-closed delta is the deep e2e t/270.
 {
 	# The boundary guard is GUC-controlled (cluster.undo_writeback_boundary_check
 	# default on);  a normal write under the guard succeeds and the undo surface
@@ -184,7 +167,8 @@ _besteffort_present('L6_gcs_pcm_warm_recovery','gcs_recovery', 't/251');
 	$pass = $pass && (defined $cnt && $cnt eq '100');
 	ok($pass, "L8 checkpoint-writeback boundary guard wired (check=$guc, write ok)");
 	$report->record_recovery_capability('L8_checkpoint_writeback_boundary',
-		status => $pass ? 'PASS' : 'FAIL', layer => 'hard');
+		status => $pass ? 'PASS' : 'FAIL', layer => 'best_effort',
+		reason => 'WIRED check; 53R9N fail-closed delta is deep e2e t/270');
 }
 
 # ===== L9 — online block recovery: counter surface wired (deep e2e t/257) =====
