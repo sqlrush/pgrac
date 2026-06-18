@@ -123,6 +123,10 @@ extern const uint8 ges_mode_compat_matrix[GES_MODE_COUNT + 1][GES_MODE_COUNT + 1
 extern bool ges_modes_compatible(ClusterGesMode held, ClusterGesMode wanted);
 extern LOCKMASK ges_mode_compat_set(ClusterGesMode m);
 extern ClusterGesConvertClass ges_mode_convert_class(ClusterGesMode from, ClusterGesMode to);
+/* spec-5.1c D2: strongest downconvert target of `held` that unblocks `wanted`
+ * (NoLock when full release is required).  Pure; advisory (no live mid-txn
+ * downconvert for GES enqueue locks). */
+extern ClusterGesMode ges_mode_downconvert_target(ClusterGesMode held, ClusterGesMode wanted);
 extern ClusterGesDlmMode ges_mode_to_dlm(ClusterGesMode pgmode);
 extern const char *ges_dlm_mode_name(ClusterGesDlmMode dlm);
 extern const char *ges_mode_pg_name(ClusterGesMode m);

@@ -79,6 +79,28 @@ The `nconverts` column of `pg_cluster_grd_entries` reports the number of
 pending conversion requests queued on a resource; it is `0` in normal
 operation.
 
+## Blocking notifications
+
+When a request on one node conflicts with a lock held on another node, the
+holder is sent a *blocking notification*. This notification is **advisory**:
+the holder is informed that it is blocking another node, but it is **not**
+forced to release early — an enqueue lock is held until the holder's
+transaction ends, at which point the lock is released naturally and the
+waiting request proceeds. A holder never gives up a lock mid-transaction in
+response to a blocking notification.
+
+Blocking-notification activity is observable in the cluster state dump
+(`pg_cluster_state`, category `grd`):
+
+| Key | Meaning |
+|---|---|
+| `grd_bast_sent_count` | Blocking notifications sent to holders |
+| `grd_bast_received_count` | Blocking notifications received by this node's holders |
+| `grd_bast_ack_count` | Notifications acknowledged via the holder's natural release |
+| `grd_bast_stale_drop_count` | Notifications dropped because the target backend had already exited |
+
+These counters are `0` on a single node (no cross-node contention occurs).
+
 ## Startup self-check
 
 At startup the server verifies that its frozen GES compatibility matrix

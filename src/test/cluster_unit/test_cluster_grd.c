@@ -1874,13 +1874,256 @@ UT_TEST(test_convert_u11_struct_layout)
 }
 
 
+/* ============================================================
+ * spec-5.1c — BAST rewrite + self-conflict exclusion.
+ * ============================================================ */
+
+/* helper: build a resid from a tag id. */
+static void
+bast_resid(uint32 tagid, ClusterResId *resid)
+{
+	LOCKTAG src;
+
+	memset(&src, 0, sizeof(src));
+	src.locktag_field1 = tagid;
+	src.locktag_type = LOCKTAG_RELATION;
+	src.locktag_lockmethodid = 1;
+	cluster_grd_resid_encode(&src, resid);
+}
+
+/* helper: a holder identity. */
+static ClusterGrdHolderId
+bast_holder(int32 node, uint32 procno, uint64 reqid)
+{
+	ClusterGrdHolderId h;
+
+	memset(&h, 0, sizeof(h));
+	h.node_id = (uint32)node;
+	h.procno = procno;
+	h.request_id = reqid;
+	return h;
+}
+
+/* spec-5.1c U9a — same backend, different mode: own prior hold is NOT a
+ * conflict against itself; the request is granted (fix: cross-node
+ * self-deadlock).  Without the exclusion the master would enqueue/BAST the
+ * requester behind its own ShareLock slot. */
+UT_TEST(test_5_1c_u9a_self_conflict_excluded)
+{
+	int saved = cluster_node_id;
+	ClusterResId resid;
+	ClusterGrdHolderId h;
+	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	int n_conflict = -1;
+
+	cluster_node_id = 0;
+	convert_reset();
+	bast_resid(5100, &resid);
+
+	h = bast_holder(1, 100, 1); /* same backend grabs ShareLock */
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 1, 0, UT_GES_OPCODE_REQUEST,
+														 ShareLock, conflicts, &n_conflict),
+				 (int)CLUSTER_GRD_GRANT_NOW);
+
+	h = bast_holder(1, 100, 2); /* fresh request_id, conflicting ExclusiveLock */
+	n_conflict = -1;
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 2, 0, UT_GES_OPCODE_REQUEST,
+														 ExclusiveLock, conflicts, &n_conflict),
+				 (int)CLUSTER_GRD_GRANT_NOW);
+	UT_ASSERT_EQ(n_conflict, 0); /* self excluded -> no conflict holders */
+
+	cluster_node_id = saved;
+	convert_teardown();
+}
+
+/* spec-5.1c U9b — same backend + a different backend both conflict: only the
+ * other backend is reported as a conflict holder (and BAST'd). */
+UT_TEST(test_5_1c_u9b_self_plus_other_keeps_other)
+{
+	int saved = cluster_node_id;
+	ClusterResId resid;
+	ClusterGrdHolderId h;
+	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	int n_conflict = -1;
+
+	cluster_node_id = 0;
+	convert_reset();
+	bast_resid(5101, &resid);
+
+	h = bast_holder(1, 100, 1); /* self ShareLock */
+	(void)cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 1, 0, UT_GES_OPCODE_REQUEST, ShareLock,
+											 conflicts, &n_conflict);
+	h = bast_holder(2, 200, 2); /* other backend ShareLock (S+S compatible) */
+	(void)cluster_grd_entry_enqueue_or_grant(&resid, &h, 2, 2, 0, UT_GES_OPCODE_REQUEST, ShareLock,
+											 conflicts, &n_conflict);
+
+	h = bast_holder(1, 100, 3); /* self requests ExclusiveLock */
+	n_conflict = -1;
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 3, 0, UT_GES_OPCODE_REQUEST,
+														 ExclusiveLock, conflicts, &n_conflict),
+				 (int)CLUSTER_GRD_ENQUEUED_WAITER);
+	UT_ASSERT_EQ(n_conflict, 1); /* only the other backend */
+	UT_ASSERT_EQ((int)conflicts[0].holder.node_id, 2);
+	UT_ASSERT_EQ((int)conflicts[0].holder.procno, 200);
+
+	cluster_node_id = saved;
+	convert_teardown();
+}
+
+/* spec-5.1c U9c — different backend conflicts normally (self-exclusion does
+ * not over-fire on other backends). */
+UT_TEST(test_5_1c_u9c_different_backend_normal)
+{
+	int saved = cluster_node_id;
+	ClusterResId resid;
+	ClusterGrdHolderId h;
+	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	int n_conflict = -1;
+
+	cluster_node_id = 0;
+	convert_reset();
+	bast_resid(5102, &resid);
+
+	h = bast_holder(1, 100, 1); /* node 1 ShareLock */
+	(void)cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 1, 0, UT_GES_OPCODE_REQUEST, ShareLock,
+											 conflicts, &n_conflict);
+
+	h = bast_holder(2, 200, 2); /* node 2 requests ExclusiveLock -> conflict */
+	n_conflict = -1;
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 2, 2, 0, UT_GES_OPCODE_REQUEST,
+														 ExclusiveLock, conflicts, &n_conflict),
+				 (int)CLUSTER_GRD_ENQUEUED_WAITER);
+	UT_ASSERT_EQ(n_conflict, 1);
+	UT_ASSERT_EQ((int)conflicts[0].holder.node_id, 1);
+
+	cluster_node_id = saved;
+	convert_teardown();
+}
+
+/* spec-5.1c U5 — bast_consume drains the pending convert before a waiter
+ * (the spec-5.1b drain semantics through the BAST-side seam). */
+UT_TEST(test_5_1c_u5_bast_consume_drains)
+{
+	ClusterGrdEntry *e;
+	ClusterGrdConvert req;
+	ClusterGrdHolderId h2, w3, released;
+	ClusterGrdGrantIdentity granted[PGRAC_GRD_MAX_CONVERTS_PUBLIC + 1];
+	bool drain = false;
+	int n;
+	LOCKMODE m = NoLock;
+
+	convert_reset();
+	e = convert_make_entry(5103);
+	convert_grant(e, 1, 100, 11, ShareLock); /* convert source */
+	convert_grant(e, 2, 200, 22, ShareLock); /* conflicts the X convert */
+
+	req = convert_req(1, 100, ShareLock, ExclusiveLock, 70);
+	UT_ASSERT_EQ((int)cluster_grd_entry_request_convert(e, &req, &drain),
+				 (int)CLUSTER_GRD_CONVERT_ENQUEUED);
+
+	memset(&w3, 0, sizeof(w3));
+	w3.node_id = 3;
+	w3.procno = 300;
+	w3.request_id = 33;
+	UT_ASSERT_EQ((int)cluster_grd_entry_add_waiter(e, &w3, AccessShareLock),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+
+	memset(&h2, 0, sizeof(h2));
+	h2.node_id = 2;
+	h2.procno = 200;
+	h2.request_id = 22;
+	UT_ASSERT_EQ((int)cluster_grd_entry_release_holder(e, &h2), (int)CLUSTER_GRD_ENTRY_OK);
+
+	released = bast_holder(2, 200, 22);
+	n = cluster_grd_entry_bast_consume(e, &released, granted, lengthof(granted));
+	UT_ASSERT_EQ(n, 2);
+	UT_ASSERT_EQ((int)granted[0].request_opcode, UT_GES_OPCODE_CONVERT);
+	UT_ASSERT_EQ((int)granted[0].mode, (int)ExclusiveLock);
+	UT_ASSERT_EQ((int)granted[1].request_opcode, UT_GES_OPCODE_REQUEST);
+	UT_ASSERT_EQ((int)granted[1].mode, (int)AccessShareLock);
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 0);
+	UT_ASSERT(cluster_grd_entry_holder_mode(e, 1, 100, &m));
+	UT_ASSERT_EQ((int)m, (int)ExclusiveLock);
+	convert_teardown();
+}
+
+/* spec-5.1c U6 — bast_consume with nothing pending returns 0; NULL / zero-cap
+ * arguments fail closed to 0. */
+UT_TEST(test_5_1c_u6_bast_consume_empty_and_guards)
+{
+	ClusterGrdEntry *e;
+	ClusterGrdGrantIdentity granted[PGRAC_GRD_MAX_CONVERTS_PUBLIC + 1];
+
+	convert_reset();
+	e = convert_make_entry(5104);
+	convert_grant(e, 1, 100, 11, ShareLock); /* lone holder, no convert/waiter */
+
+	UT_ASSERT_EQ(cluster_grd_entry_bast_consume(e, NULL, granted, lengthof(granted)), 0);
+	UT_ASSERT_EQ(cluster_grd_entry_bast_consume(NULL, NULL, granted, lengthof(granted)), 0);
+	UT_ASSERT_EQ(cluster_grd_entry_bast_consume(e, NULL, NULL, 4), 0);
+	UT_ASSERT_EQ(cluster_grd_entry_bast_consume(e, NULL, granted, 0), 0);
+	convert_teardown();
+}
+
+/* spec-5.1c U10 — best-effort local delivery guard predicate (the "纯函数化"
+ * part Q9=B covers; the live SendProcSignal is e2e SKIP). */
+UT_TEST(test_5_1c_u10_bast_deliver_ok_predicate)
+{
+	/* pass: in-range procno, current epoch, live backend. */
+	UT_ASSERT(cluster_grd_bast_local_deliver_ok(5, 10, 7, 7, 1234, 3));
+	/* procno out of range / zero proc_count. */
+	UT_ASSERT(!cluster_grd_bast_local_deliver_ok(10, 10, 7, 7, 1234, 3));
+	UT_ASSERT(!cluster_grd_bast_local_deliver_ok(5, 0, 7, 7, 1234, 3));
+	/* stale (cross-epoch) holder. */
+	UT_ASSERT(!cluster_grd_bast_local_deliver_ok(5, 10, 6, 7, 1234, 3));
+	/* dead backend: pid 0 or InvalidBackendId (-1). */
+	UT_ASSERT(!cluster_grd_bast_local_deliver_ok(5, 10, 7, 7, 0, 3));
+	UT_ASSERT(!cluster_grd_bast_local_deliver_ok(5, 10, 7, 7, 1234, -1));
+}
+
+/* spec-5.1c U11 — regression: the live release_and_pop path keeps single-pop
+ * (granted[1]) semantics (spec-5.1c does not touch this signature). */
+UT_TEST(test_5_1c_u11_release_and_pop_unchanged)
+{
+	int saved = cluster_node_id;
+	ClusterResId resid;
+	ClusterGrdHolderId h, w;
+	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdWaiterIdentity granted[2];
+	int n_conflict = -1;
+
+	cluster_node_id = 0;
+	convert_reset();
+	bast_resid(5105, &resid);
+
+	h = bast_holder(1, 100, 1); /* node 1 ExclusiveLock */
+	(void)cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 1, 0, UT_GES_OPCODE_REQUEST,
+											 ExclusiveLock, conflicts, &n_conflict);
+	memset(&w, 0, sizeof(w)); /* node 2 RowShare waits (RS conflicts with X) */
+	w.node_id = 2;
+	w.procno = 200;
+	w.request_id = 2;
+	n_conflict = -1;
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &w, 2, 2, 0, UT_GES_OPCODE_REQUEST,
+														 RowShareLock, conflicts, &n_conflict),
+				 (int)CLUSTER_GRD_ENQUEUED_WAITER);
+
+	/* release the X holder -> exactly one compatible waiter popped. */
+	UT_ASSERT_EQ(
+		cluster_grd_entry_release_and_pop_compatible_waiter(&resid, &h, granted, lengthof(granted)),
+		1);
+	cluster_node_id = saved;
+	convert_teardown();
+}
+
+
 int
 /* cppcheck-suppress constParameter
  * Reason: main() keeps the standard test harness signature used by the
  * other cluster_unit binaries; argv is intentionally unused. */
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(35);
+	UT_PLAN(42);
 
 	UT_RUN(test_grd_clusterresid_size_16);
 	UT_RUN(test_grd_resid_encode_decode_roundtrip);
@@ -1926,6 +2169,15 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_convert_u10_double_grant_guard);
 	UT_RUN(test_convert_u11_struct_layout);
 	UT_RUN(test_convert_u12_sweep_on_holder_death);
+
+	/* spec-5.1c — BAST rewrite + LIVE self-conflict exclusion. */
+	UT_RUN(test_5_1c_u9a_self_conflict_excluded);
+	UT_RUN(test_5_1c_u9b_self_plus_other_keeps_other);
+	UT_RUN(test_5_1c_u9c_different_backend_normal);
+	UT_RUN(test_5_1c_u5_bast_consume_drains);
+	UT_RUN(test_5_1c_u6_bast_consume_empty_and_guards);
+	UT_RUN(test_5_1c_u10_bast_deliver_ok_predicate);
+	UT_RUN(test_5_1c_u11_release_and_pop_unchanged);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

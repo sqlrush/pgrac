@@ -155,6 +155,62 @@ ges_mode_convert_class(ClusterGesMode from, ClusterGesMode to)
 }
 
 /*
+ * ges_mode_downconvert_target -- strongest mode the holder could drop to
+ * that unblocks `wanted` (pure; spec-5.1c D2).
+ *
+ *	Returns the strongest M (smallest relaxation of `held`) such that:
+ *	  (1) ges_mode_convert_class(held, M) is SAME or DOWNGRADE (M is
+ *	      weaker-or-equal to held -- compat_set(M) is a superset of
+ *	      compat_set(held)); AND
+ *	  (2) ges_modes_compatible(M, wanted) (M no longer conflicts with the
+ *	      requested mode).
+ *	"Strongest" = the candidate whose compat_set is the smallest proper
+ *	subset reachable, i.e. give up as little strength as possible; ties
+ *	(incomparable minima) break by ascending mode number.  When no non-NoLock
+ *	M qualifies (the holder must fully release to admit `wanted`), returns
+ *	NoLock (0).
+ *
+ *	Out-of-range input fails closed to NoLock (conservative full release),
+ *	never elogs.  Advisory only: GES enqueue holders do NOT proactively
+ *	downconvert mid-transaction (Oracle async-BAST model); the target informs
+ *	the convert-drain logic (spec-5.1c D3) and the future Cache-Fusion
+ *	downconvert path.
+ */
+ClusterGesMode
+ges_mode_downconvert_target(ClusterGesMode held, ClusterGesMode wanted)
+{
+	ClusterGesMode best = NoLock;
+	LOCKMASK best_set = 0;
+	ClusterGesMode m;
+
+	Assert(ges_mode_is_valid(held));
+	Assert(ges_mode_is_valid(wanted));
+	if (!ges_mode_is_valid(held) || !ges_mode_is_valid(wanted))
+		return NoLock;
+
+	for (m = GES_MODE_FIRST; m <= GES_MODE_LAST; m++) {
+		ClusterGesConvertClass cls;
+		LOCKMASK m_set;
+
+		/* (1) M must be weaker-or-equal to held (SAME or DOWNGRADE). */
+		cls = ges_mode_convert_class(held, m);
+		if (cls != GES_CONVERT_SAME && cls != GES_CONVERT_DOWNGRADE)
+			continue;
+		/* (2) M must be compatible with wanted (it must unblock it). */
+		if (!ges_modes_compatible(m, wanted))
+			continue;
+		/* (3) keep the strongest candidate: a proper subset of the current
+		 * best's compat_set means m is strictly stronger. */
+		m_set = ges_mode_compat_set(m);
+		if (best == NoLock || ((m_set & best_set) == m_set && m_set != best_set)) {
+			best = m;
+			best_set = m_set;
+		}
+	}
+	return best;
+}
+
+/*
  * ges_mode_to_dlm -- approximate Oracle DLM alias for a PG mode (display).
  */
 ClusterGesDlmMode

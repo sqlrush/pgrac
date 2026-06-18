@@ -2368,6 +2368,23 @@ cluster_grd_entry_enqueue_or_grant(const ClusterResId *resid, const ClusterGrdHo
 		 */
 		if (ges_modes_compatible(entry->holders[i].mode, (LOCKMODE)lockmode))
 			continue;
+		/*
+		 * spec-5.1c D5: same-backend self-conflict exclusion.  Under PG's
+		 * additive lock model a backend holding this resid in one mode may
+		 * request a second, conflicting mode (a different LOCALLOCK that
+		 * re-enters the cluster gate, e.g. xact-advisory share then
+		 * exclusive).  The requester is not a conflict against its own prior
+		 * hold; without this the master would enqueue/BAST the request behind
+		 * the requester's own holder slot -> cross-node self-deadlock (the
+		 * holder waits on itself).  Identity is {node_id, procno}: the full
+		 * 4-tuple would carry a fresh request_id for the additive re-acquire
+		 * and never match.  (A real cross-node convert -- same backend, mode
+		 * change of the SAME hold -- is the spec-5.2 path and self-excludes
+		 * in cluster_grd_entry_request_convert.)
+		 */
+		if (entry->holders[i].node_id == (int32)holder->node_id
+			&& entry->holders[i].procno == holder->procno)
+			continue;
 		if (conflict_holders_out != NULL && n_conflict < PGRAC_GRD_MAX_HOLDERS) {
 			conflict_holders_out[n_conflict].holder.node_id = entry->holders[i].node_id;
 			conflict_holders_out[n_conflict].holder.procno = entry->holders[i].procno;
@@ -2817,6 +2834,35 @@ cluster_grd_entry_drain_converts_then_waiters(ClusterGrdEntry *entry,
 	return n;
 }
 
+/*
+ * cluster_grd_entry_bast_consume -- advance the pending convert queue then a
+ * waiter after a BAST-induced holder release/downgrade (spec-5.1c D3; caller
+ * holds entry->lock).
+ *
+ *	Thin named seam over cluster_grd_entry_drain_converts_then_waiters so the
+ *	first live convert producer (spec-5.2) has a single BAST-side entry point
+ *	to call.  Until spec-5.2 the convert queue is never populated in
+ *	production (cross-node CONVERT is rejected FEATURE_NOT_SUPPORTED), so this
+ *	is LOGIC exercised by cluster_unit only.  The live multi-grant release
+ *	path keeps the spec-5.1b release_and_pop(granted[1]) signature unchanged.
+ *
+ *	released_holder identifies the holder that gave way (informational: the
+ *	drain re-evaluates the full holder set against each pending convert /
+ *	waiter; spec-5.2 may use it to scope the re-evaluation).  Returns the
+ *	number of identities written to granted_out (<= max_out; buffer should
+ *	hold PGRAC_GRD_MAX_CONVERTS_PUBLIC + 1).
+ */
+int
+cluster_grd_entry_bast_consume(ClusterGrdEntry *entry, const ClusterGrdHolderId *released_holder,
+							   ClusterGrdGrantIdentity *granted_out, int max_out)
+{
+	(void)released_holder; /* informational; consumed by spec-5.2 */
+
+	if (entry == NULL || granted_out == NULL || max_out <= 0)
+		return 0;
+	return cluster_grd_entry_drain_converts_then_waiters(entry, granted_out, max_out);
+}
+
 bool
 cluster_grd_entry_request_blocked_by_pending_convert(ClusterGrdEntry *entry, int wanted_mode)
 {
@@ -3157,6 +3203,34 @@ cluster_grd_alloc_generation(void)
  *
  *   D12 6 BAST nofail counter inc + read helpers.
  * ============================================================ */
+
+/*
+ * cluster_grd_bast_local_deliver_ok -- pure best-effort delivery guard for a
+ * local BAST target (spec-5.1c D5).  Returns true when the master should send
+ * PROCSIG_CLUSTER_GES_BAST to the resolved backend.
+ *
+ *	Guards: (1) procno in range; (2) the holder's recorded cluster_epoch is
+ *	the current epoch (drops cross-epoch stale holders, mirroring the CANCEL
+ *	path); (3) the resolved slot has a live backend (pid != 0 and a valid
+ *	BackendId).  This is best-effort: it does NOT detect same-epoch procno
+ *	reuse (an exited holder whose slot a new backend now occupies) -- that is
+ *	acceptable because BAST only sets an advisory flag (no proactive release,
+ *	I85), so a spurious flag has no correctness effect.  No shmem access, so
+ *	it is unit-testable standalone (the caller resolves pid/BackendId via
+ *	GetPGProcByNumber and SendProcSignal re-checks pss_pid == pid).
+ */
+bool
+cluster_grd_bast_local_deliver_ok(uint32 procno, int proc_count, uint64 holder_epoch,
+								  uint64 current_epoch, int target_pid, int target_backendid)
+{
+	if (proc_count <= 0 || procno >= (uint32)proc_count)
+		return false; /* procno out of range */
+	if (holder_epoch != current_epoch)
+		return false; /* stale (cross-epoch) holder */
+	if (target_pid == 0 || target_backendid == InvalidBackendId)
+		return false; /* no live backend at this slot */
+	return true;
+}
 
 void
 cluster_grd_bast_handler(void)

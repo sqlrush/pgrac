@@ -308,6 +308,34 @@ void
 cluster_lms_wake_drain(void)
 {}
 
+/*
+ * spec-5.1c D1 stubs — cluster_ges_send_bast_targeted's local-delivery branch
+ * references these backend primitives.  This test never drives a live local
+ * holder (it does not call send_bast_targeted), so the stubs are inert and
+ * link-only: ProcGlobal is never dereferenced, and SendProcSignal /
+ * cluster_grd_bast_local_deliver_ok are never invoked.
+ */
+void *ProcGlobal = NULL;
+
+int SendProcSignal(int pid, int reason, int backendid);
+int
+SendProcSignal(int pid pg_attribute_unused(), int reason pg_attribute_unused(),
+			   int backendid pg_attribute_unused())
+{
+	return -1;
+}
+
+bool
+cluster_grd_bast_local_deliver_ok(uint32 procno pg_attribute_unused(),
+								  int proc_count pg_attribute_unused(),
+								  uint64 holder_epoch pg_attribute_unused(),
+								  uint64 current_epoch pg_attribute_unused(),
+								  int target_pid pg_attribute_unused(),
+								  int target_backendid pg_attribute_unused())
+{
+	return false;
+}
+
 /* spec-2.19 Sprint A Step 3 D8 L104 stubs:  cluster_lmd_is_ready (HC4
  * exact predicate) + cluster_lmd_submit_wait_edge (HC3 producer wake +
  * HC6 skeleton "no graph maintenance").  Called from cluster_ges.c
@@ -422,6 +450,11 @@ cluster_lmd_cross_node_victim_cancel_sent_count_inc(uint64 d pg_attribute_unused
 
 void
 cluster_grd_inc_bast_sent(void)
+{}
+
+/* spec-5.1c D1 — local BAST delivery bumps stale_drop on a guard miss. */
+void
+cluster_grd_inc_bast_stale_drop(void)
 {}
 
 /* spec-2.25 D14 R10 stub audit — native-lock probe 3 NEW symbols.

@@ -454,6 +454,16 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 		return;
 	}
 	case GES_REQ_OPCODE_BAST_ACK:
+		/*
+		 * spec-5.1c D4 -- BAST_ACK lifecycle.  Per the Oracle enqueue model
+		 * the acknowledgement rides on the holder's natural GES_RELEASE
+		 * (HC19, release-coupled; see the cluster_grd_bast_pending clear path
+		 * below), so the standalone GES_REQ_OPCODE_BAST_ACK packet is not
+		 * sent in this spec and the handler stays counter-only.  Promoting it
+		 * to a live standalone opcode is deferred to the first
+		 * downconvert-decoupled consumer (Cache-Fusion block downconvert /
+		 * spec-5.2 convert), which acks without a full release.
+		 */
 		cluster_grd_inc_bast_ack();
 		return;
 	case GES_REQ_OPCODE_CANCEL_PENDING: {
@@ -1489,14 +1499,41 @@ cluster_ges_send_bast_targeted(const struct ClusterResId *resid, int requested_m
 
 		if (holder_node == cluster_node_id) {
 			/*
-			 * Local holder.  Spec-2.17 ship has PROCSIG_CLUSTER_GES_BAST
-			 * wired but a procno→pid lookup requires the ProcArray;
-			 * skip the direct SendProcSignal for the v0.3 spec scope
-			 * and count the local advisory drop.  The natural
-			 * cluster_grd_bast_handler flag-set path remains usable
-			 * by tests via direct invocation.
+			 * spec-5.1c D1 -- local holder delivery.  spec-2.23 left this as
+			 * a counter-only no-op; complete it by mirroring the shipped +
+			 * tested CANCEL delivery (cluster_lmd_tarjan.c): bound the procno,
+			 * resolve the PGPROC, run the best-effort guard, then signal with
+			 * proc->backendId -- NOT procno (SendProcSignal indexes
+			 * psh_slot[backendId-1]; pgprocno is a 0-based allProcs index).
+			 * The spec-2.17 handler only SETS cluster_grd_bast_pending (I85,
+			 * never releases); the natural LockRelease carries the logical
+			 * BAST_ACK (HC19), and the holder bumps bast_received in its
+			 * handler.  SendProcSignal re-checks pss_pid == pid, covering a
+			 * slot recycled between lookup and signal.
 			 */
-			cluster_grd_inc_bast_sent();
+			uint32 target_procno = holders[i].holder.procno;
+			PGPROC *proc;
+			int target_pid;
+			int target_backendid;
+
+			if (target_procno >= ProcGlobal->allProcCount) {
+				cluster_grd_inc_bast_stale_drop();
+				continue;
+			}
+			proc = GetPGProcByNumber(target_procno);
+			target_pid = proc->pid;
+			target_backendid = proc->backendId;
+			if (!cluster_grd_bast_local_deliver_ok(
+					target_procno, (int)ProcGlobal->allProcCount, holders[i].holder.cluster_epoch,
+					cluster_epoch_get_current(), target_pid, target_backendid)) {
+				cluster_grd_inc_bast_stale_drop();
+				continue;
+			}
+			if (SendProcSignal(target_pid, PROCSIG_CLUSTER_GES_BAST, (BackendId)target_backendid)
+				== 0)
+				cluster_grd_inc_bast_sent();
+			else
+				cluster_grd_inc_bast_stale_drop();
 		} else {
 			GesRequestPayload bast;
 

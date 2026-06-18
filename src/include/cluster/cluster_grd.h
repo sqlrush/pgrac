@@ -336,7 +336,11 @@ extern int cluster_grd_sweep_local_stale_procnos(void);
 extern void cluster_grd_check_pending_interrupts(void);
 
 /* spec-2.17 D8 + D12 — BAST handler + 6 counter helpers(skeleton phase). */
-extern void cluster_grd_bast_handler(void);	  /* ProcessInterrupts hook */
+extern void cluster_grd_bast_handler(void); /* ProcessInterrupts hook */
+/* spec-5.1c D5: pure best-effort delivery guard for a local BAST target. */
+extern bool cluster_grd_bast_local_deliver_ok(uint32 procno, int proc_count, uint64 holder_epoch,
+											  uint64 current_epoch, int target_pid,
+											  int target_backendid);
 extern void cluster_grd_cancel_handler(void); /* ProcessInterrupts hook */
 extern void cluster_grd_inc_bast_sent(void);
 extern void cluster_grd_inc_bast_received(void);
@@ -1089,6 +1093,14 @@ extern ClusterGrdConvertResult cluster_grd_entry_request_convert(ClusterGrdEntry
 extern int cluster_grd_entry_drain_converts_then_waiters(ClusterGrdEntry *entry,
 														 ClusterGrdGrantIdentity *granted_out,
 														 int max_out);
+
+/*
+ * spec-5.1c D3 -- BAST-side named seam over the drain (caller holds
+ * entry->lock).  LOGIC until spec-5.2 wires a live convert producer.
+ */
+extern int cluster_grd_entry_bast_consume(ClusterGrdEntry *entry,
+										  const ClusterGrdHolderId *released_holder,
+										  ClusterGrdGrantIdentity *granted_out, int max_out);
 
 /*
  * D5 — anti-starvation predicate (caller holds entry->lock): true when a

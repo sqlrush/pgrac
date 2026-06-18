@@ -103,6 +103,38 @@ expected_convert_class(int from, int to)
 	return GES_CONVERT_LATERAL;
 }
 
+/*
+ * Independent reference for ges_mode_downconvert_target (spec-5.1c D2):
+ * strongest M that is SAME/DOWNGRADE of `held` and compatible with `wanted`,
+ * NoLock when none.  Computed from the independent expected_compat grid so a
+ * matrix-data error in either copy is caught (U1).
+ */
+static int
+expected_downconvert_target(int held, int wanted)
+{
+	int best = 0; /* NoLock */
+	LOCKMASK best_set = 0;
+	int m;
+
+	for (m = GES_MODE_FIRST; m <= GES_MODE_LAST; m++) {
+		ClusterGesConvertClass cls = expected_convert_class(held, m);
+
+		if (cls != GES_CONVERT_SAME && cls != GES_CONVERT_DOWNGRADE)
+			continue;
+		if (!expected_compat[m][wanted])
+			continue;
+		{
+			LOCKMASK m_set = expected_compat_set(m);
+
+			if (best == 0 || ((m_set & best_set) == m_set && m_set != best_set)) {
+				best = m;
+				best_set = m_set;
+			}
+		}
+	}
+	return best;
+}
+
 /* U1 -- mode space is exactly the 8 PG lock modes. */
 UT_TEST(test_mode_count_is_eight)
 {
@@ -236,10 +268,108 @@ UT_TEST(test_pg_name_parser)
 	UT_ASSERT_EQ((int)ges_mode_from_pg_name(""), 0);
 }
 
+/*
+ * spec-5.1c D2 -- ges_mode_downconvert_target tests (U1-U4 in spec terms).
+ */
+
+/* D2-U1 -- module result matches the independent reference over all 64 pairs. */
+UT_TEST(test_downconvert_target_all_pairs)
+{
+	int held, wanted;
+
+	for (held = GES_MODE_FIRST; held <= GES_MODE_LAST; held++)
+		for (wanted = GES_MODE_FIRST; wanted <= GES_MODE_LAST; wanted++)
+			UT_ASSERT_EQ((int)ges_mode_downconvert_target(held, wanted),
+						 expected_downconvert_target(held, wanted));
+}
+
+/* D2-U2 -- property check: result unblocks wanted, is <= held, and is maximal. */
+UT_TEST(test_downconvert_target_properties)
+{
+	int held, wanted, mp;
+
+	for (held = GES_MODE_FIRST; held <= GES_MODE_LAST; held++)
+		for (wanted = GES_MODE_FIRST; wanted <= GES_MODE_LAST; wanted++) {
+			int r = (int)ges_mode_downconvert_target(held, wanted);
+
+			if (r == NoLock) {
+				/* NoLock only when no mode is both <= held and compatible. */
+				for (mp = GES_MODE_FIRST; mp <= GES_MODE_LAST; mp++) {
+					ClusterGesConvertClass c = expected_convert_class(held, mp);
+
+					if ((c == GES_CONVERT_SAME || c == GES_CONVERT_DOWNGRADE)
+						&& expected_compat[mp][wanted])
+						UT_ASSERT(false); /* a valid candidate existed */
+				}
+				continue;
+			}
+
+			/* (1) r unblocks wanted; (2) r is SAME/DOWNGRADE of held. */
+			{
+				ClusterGesConvertClass cr = expected_convert_class(held, r);
+
+				UT_ASSERT(expected_compat[r][wanted]);
+				UT_ASSERT(cr == GES_CONVERT_SAME || cr == GES_CONVERT_DOWNGRADE);
+			}
+
+			/* (3) maximal: no candidate is strictly stronger than r. */
+			for (mp = GES_MODE_FIRST; mp <= GES_MODE_LAST; mp++) {
+				ClusterGesConvertClass c = expected_convert_class(held, mp);
+				LOCKMASK ms, rs;
+
+				if ((c != GES_CONVERT_SAME && c != GES_CONVERT_DOWNGRADE)
+					|| !expected_compat[mp][wanted])
+					continue;
+				ms = expected_compat_set(mp);
+				rs = expected_compat_set(r);
+				/* ms strict subset of rs would mean mp stronger than r. */
+				UT_ASSERT(!((ms & rs) == ms && ms != rs));
+			}
+		}
+}
+
+/* D2-U3 -- concrete boundary anchors. */
+UT_TEST(test_downconvert_target_boundaries)
+{
+	/* AE is compatible with nothing (not even AccessShare) -> full release. */
+	UT_ASSERT_EQ((int)ges_mode_downconvert_target(AccessExclusiveLock, AccessExclusiveLock),
+				 (int)NoLock);
+	/* E conflicts with itself, but AccessShare IS compatible with E, so the
+	 * holder downconverts E -> AccessShare rather than fully releasing. */
+	UT_ASSERT_EQ((int)ges_mode_downconvert_target(ExclusiveLock, ExclusiveLock),
+				 (int)AccessShareLock);
+
+	/* Holder S, requester RE conflict -> downconvert to RowShare (strongest
+	 * mode <= S that is compatible with RowExclusive). */
+	UT_ASSERT_EQ((int)ges_mode_downconvert_target(ShareLock, RowExclusiveLock), (int)RowShareLock);
+
+	/* Holder AE, requester AS -> downconvert to Exclusive (strongest mode
+	 * compatible with AccessShare). */
+	UT_ASSERT_EQ((int)ges_mode_downconvert_target(AccessExclusiveLock, AccessShareLock),
+				 (int)ExclusiveLock);
+
+	/* Already-compatible (no real BAST) -> SAME holder mode. */
+	UT_ASSERT_EQ((int)ges_mode_downconvert_target(AccessShareLock, AccessShareLock),
+				 (int)AccessShareLock);
+}
+
+/* D2-U4 -- out-of-range fails closed to NoLock (non-assert builds). */
+UT_TEST(test_downconvert_target_invalid)
+{
+#ifndef USE_ASSERT_CHECKING
+	UT_ASSERT_EQ((int)ges_mode_downconvert_target(0, AccessShareLock), (int)NoLock);
+	UT_ASSERT_EQ((int)ges_mode_downconvert_target(AccessShareLock, GES_MODE_LAST + 1), (int)NoLock);
+	UT_ASSERT_EQ((int)ges_mode_downconvert_target(GES_MODE_LAST + 1, GES_MODE_LAST + 1),
+				 (int)NoLock);
+#else
+	UT_ASSERT(true); /* cassert: Assert() is the guard; see U8 note. */
+#endif
+}
+
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(13);
 	UT_RUN(test_mode_count_is_eight);
 	UT_RUN(test_matrix_matches_expected_grid);
 	UT_RUN(test_matrix_symmetric);
@@ -249,6 +379,10 @@ main(void)
 	UT_RUN(test_dlm_alias_mapping);
 	UT_RUN(test_invalid_mode_fails_closed);
 	UT_RUN(test_pg_name_parser);
+	UT_RUN(test_downconvert_target_all_pairs);
+	UT_RUN(test_downconvert_target_properties);
+	UT_RUN(test_downconvert_target_boundaries);
+	UT_RUN(test_downconvert_target_invalid);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
