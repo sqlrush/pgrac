@@ -24,9 +24,8 @@
 #           (3-node) + t/272 (shared-FS matrix), run for real in CI nightly
 #
 #    Single-node primary fixture (the L1 surface is observable here);  the
-#    multi-node fence-firing matrix is t/271/t/272 (run in CI nightly via the
-#    top-level `make check` jobs, which recurse into cluster_tap with
-#    --enable-cluster -- ClusterPair/ClusterTriple do not bootstrap on a dev laptop:
+#    multi-node fence-firing matrix is the shipped t/271/t/272 (spec-4.12b D7/D8
+#    regression e2e -- ClusterPair/ClusterTriple do not bootstrap on a dev laptop:
 #    bare-prove initdb -X needs an absolute path + macOS shmmni=32).  L2 is
 #    NOT exercised (no hardware / no actor) -- it is recorded as FORWARD, never
 #    faked (matrix doc §6 R9 over-claim guard).

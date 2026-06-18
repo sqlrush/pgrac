@@ -46,9 +46,10 @@
 #    Primary fixture is a single cluster-enabled node (pg_ctl level, like
 #    t/226) so the bulk runs on this host;  the inherently cross-node legs
 #    (L2-L6) degrade to best-effort SKIP when only one node is present (their
-#    deep e2e is t/242-272, run for real in CI nightly: t/242-247 in the
-#    stage4-wal shard, t/248-272 via the top-level `make check` jobs which
-#    recurse into cluster_tap with --enable-cluster).
+#    deep e2e are the shipped Stage 4 regression tests t/242-272; the stage4-wal
+#    nightly shard runs t/242-248 + t/273-275, the rest are shipped e2e covered
+#    when included in a cluster_tap run -- top-level `make check` runs only the
+#    core PG regression, not cluster_tap TAP).
 #    Each REAL leg proves the path actually ran via a counter delta or a
 #    fail-closed SQLSTATE (L250) -- not a bare "present" check.  Smoke scope
 #    <= 3min.  Results accumulate into a Stage4AcceptanceReport JSON (D7).

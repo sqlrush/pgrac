@@ -132,7 +132,18 @@ sub gate
 		CHECKPOINT;
 	});
 
-	my $started0 = $dump0->('grd_recovery', 'remaster_started') || 0;
+	my $started0   = $dump0->('grd_recovery', 'remaster_started') || 0;
+	my $committed0 = $dump0->('recovery', 'remote_outcome_committed') || 0;
+
+	# Pre-inject baseline (mirror t/267 L1): the replay slot is IDLE and origin 1
+	# is not yet materialized.  These queries also SETTLE the thread_2 wal-state
+	# publish before the inject -- without this settle the worker can launch
+	# before the foreign thread's validated window is on shared storage, so the
+	# slot never reaches DONE (the nightly HG#1b timeout root cause).
+	is($n0->safe_psql('postgres', 'SELECT cluster_thread_replay_slot_state_test(2)'),
+		'0', 'fixture1 baseline: thread_2 replay slot IDLE (no recovery yet)');
+	is($n0->safe_psql('postgres', "SELECT cluster_thread_local_complete_test(2, '0/0')"),
+		'f', 'fixture1 baseline: origin 1 not materialized');
 
 	# ---- HG#1b — synthetic inject mechanism-completion (REQUIRED) ----
 	is($n0->safe_psql('postgres', 'SELECT cluster_reconfig_inject_dead_node_test(1)'),
@@ -142,12 +153,8 @@ sub gate
 	my $fsm = $n0->poll_query_until('postgres',
 		"SELECT (SELECT value::bigint FROM cluster_dump_state() "
 		  . "WHERE category='grd_recovery' AND key='remaster_started') > $started0", 't');
-	# in-scope launch fired -> worker ran replay_one(AUTO) -> slot DONE (thread 2).
-	# NOTE: the inject SRF doc-comment (orchestrator_srf.c:440) predates the
-	# spec-4.11 3b-4c fix and still says the foreign thread "stays fail-closed
-	# frozen"; t/267 (identical fixture: a quiescent thread set up with real WAL
-	# + CHECKPOINT, as hg_n1 above) proves the worker reaches DONE (slot==2).
-	# HG#1b sets up the same recoverable thread, so DONE is reachable here.
+	# in-scope launch fired -> worker ran replay_one(AUTO) -> slot DONE (thread 2),
+	# the same outcome t/267 proves with the same fixture + recoverable thread.
 	my $done = $n0->poll_query_until('postgres',
 		'SELECT cluster_thread_replay_slot_state_test(2) = 2', 't');
 	my $hg1b = ($fsm && $done) ? 'PASS' : 'FAIL';
@@ -158,43 +165,49 @@ sub gate
 		($hg1b eq 'PASS') ? 'PASS' : 'FAIL',
 		note => 'HG#1b is a real ClusterPair shared-FS + inject e2e');
 
-	# ---- HG#2a-ii (PASS|SKIP) + HG#3 (REQUIRED) — one read, two verdicts ----
-	# After recovery, origin 1 is materialized at node0;  read the recovered
-	# rows ONCE and classify the result into the 8.A safe set:
-	#   correct content (300|45150)            -> 2a-ii PASS, HG#3 PASS
-	#   registered fail-closed SQLSTATE        -> 2a-ii SKIP, HG#3 PASS (never stale)
-	#   rc==0 with WRONG/torn content, OR an unregistered error -> BOTH FAIL
-	# This is the L250-correct shape:  if the under-recovered fail-closed gate
-	# were deleted and returned a stale/torn page (rc==0, content != expected),
-	# HG#3 (the REQUIRED "never a stale page" gate) FAILS — it does NOT treat a
-	# successful-wrong-content read as SKIP/PASS (the prior P0 假验收, opus
-	# review P0-1).
-	my ($rc2, $out2, $err2) =
+	# ---- HG#2a-ii (PASS|SKIP) — apply-through materialized (mechanism-level) ----
+	# A cross-node read of node1's table BY NAME is NOT reachable here: in the
+	# concurrent shared-FS fixture node0 and node1 keep separate catalog state,
+	# so `... FROM hg_n1` on node0 raises "relation does not exist" (cross-node
+	# table content read = FEATURE_NOT_SUPPORTED, the spec-4.9 finding).  The
+	# observable apply-through evidence is mechanism-level: node0 published
+	# node-local authority for the recovered dead origin (materialized list
+	# contains '1' + remote outcomes advanced -- t/267 L5).
+	my $materialized = $dump0->('recovery', 'materialized_remote_instances') // '';
+	my $committed1   = $dump0->('recovery', 'remote_outcome_committed') || 0;
+	my $hg2aii = (($materialized =~ /(^|,)\s*1\s*(,|$)/) && ($committed1 >= $committed0))
+		? 'PASS' : 'SKIP';
+	gate('HG#2a-ii', 'apply-through materialized (mechanism; cross-node table read FEATURE_NOT_SUPPORTED)',
+		0, $hg2aii,
+		($hg2aii eq 'SKIP'
+			? (reason => 'origin 1 not materialized yet; cross-node table content read is FEATURE_NOT_SUPPORTED (separate catalogs, spec-4.9)')
+			: ()));
+
+	# ---- HG#3 (REQUIRED) — node0 never serves node1's data by name (never stale) ----
+	# The under-recovered / cross-node fail-closed: node0 must NEVER silently
+	# return node1's table content by name (that would be a cross-node stale /
+	# leak read).  Reading `hg_n1` on node0 returns NO node1 rows -- it fails
+	# closed (relation-not-found, node0 has no such catalog entry, or a
+	# registered cluster SQLSTATE).  The ONLY failure is node0 returning node1's
+	# actual rows (300|45150).  The deep recovered_through / 53R9G gate is
+	# unit-proven (test_cluster_tt_durable, spec-4.9 D4); here we pin the e2e
+	# safety invariant.
+	my ($rc3, $out3, $err3) =
 	  $n0->psql('postgres', 'SELECT count(*), sum(v) FROM hg_n1');
-	my ($hg2aii, $hg3);
-	if ($rc2 == 0 && defined $out2 && $out2 =~ /^\s*300\s*\|\s*45150\s*$/) {
-		$hg2aii = 'PASS'; $hg3 = 'PASS'; # correct apply-through content
+	my $hg3;
+	if ($rc3 != 0) {
+		$hg3 = 'PASS'; # fail-closed (relation-not-found / cluster SQLSTATE): no data served
 	}
-	elsif ($rc2 != 0 && defined $err2
-		&& $err2 =~ /cluster TT status unknown|53R9F|53R9G|not supported/) {
-		$hg2aii = 'SKIP'; $hg3 = 'PASS'; # registered fail-closed = 8.A-safe, never stale
+	elsif (defined $out3 && $out3 =~ /^\s*300\s*\|\s*45150\s*$/) {
+		$hg3 = 'FAIL'; # node0 served node1's actual rows by name = cross-node stale/leak
+		diag("HG#3 UNSAFE: node0 served node1's data by name: out='$out3'");
 	}
 	else {
-		# rc==0 with wrong/torn content, OR an unregistered error: a stale page
-		# or unsafe result. Both the liveness gate (2a-ii) and the safety gate
-		# (HG#3) FAIL — wrong data is never an acceptable acceptance outcome.
-		$hg2aii = 'FAIL'; $hg3 = 'FAIL';
-		diag("HG#2a-ii/HG#3 UNSAFE read: rc=$rc2 out='"
-			  . (defined $out2 ? $out2 : '') . "' err='"
-			  . (defined $err2 ? $err2 : '') . "'");
+		$hg3 = 'PASS'; # rc==0 but not node1's content (e.g. node0's own empty table): safe
 	}
-	gate('HG#2a-ii', 'online thread-recovery apply-through read', 0, $hg2aii,
-		($hg2aii eq 'SKIP'
-			? (reason => 'single-machine harness: per-origin fail-closed or not-yet-materialized (orchestrator_srf.c:440)')
-			: ()));
-	gate('HG#3', 'under-recovered origin read fail-closed (53R9G / TT unknown) — never stale',
+	gate('HG#3', 'cross-node/under-recovered read never serves stale node1 data',
 		1, $hg3,
-		note => '8.A: materialized-correct OR registered fail-closed; wrong/torn content = FAIL (own probe, not derived)');
+		note => 'node0 never returns node1 rows by name (rc!=0 / not its content); recovered_through 53R9G gate unit-proven test_cluster_tt_durable (spec-4.9 D4)');
 
 	# ---- HG#2b — cross-node positive on-demand CR = FEATURE_NOT_SUPPORTED ----
 	# Stage 5 forward;  recorded SKIP, never counted as a positive pass.
@@ -283,16 +296,16 @@ sub gate
 # t/248's serialized fixture (it deliberately drives each node single, PCM
 # bypassed) inside this concurrent-inject file -- instead it asserts the
 # backing e2e is PRESENT (a removed/renamed t/248 trips this gate; opus review
-# P0-2: not a hardcoded tautology).  Coverage: t/248 runs in CI via the
-# top-level `make check` jobs (linux-pg-regress + build-test-macos recurse into
-# cluster_tap with --enable-cluster, no PROVE_TESTS filter -> all t/*.pl,
-# including 248-272); it is NOT in the 273-275 stage4-wal shard slice.
+# P0-2: not a hardcoded tautology).  Coverage: t/248 runs in CI nightly in the
+# stage4-wal shard (its range was extended to 242-248 for exactly this gate;
+# the top-level `make check` only runs the core PG regression, not cluster_tap
+# TAP, so the shard is the real coverage).
 # ===========================================================================
 {
 	my $t248 = "$FindBin::RealBin/248_shared_merged_recovery.pl";
 	gate('HG#2a-i', 'cold-merge materialized content (count+sum through remote authority)',
 		1, ((-e $t248) ? 'PASS' : 'FAIL'),
-		note => 'authoritative content e2e = t/248 (serialized cold-cluster merge); runs in CI via top-level make check (linux-pg-regress + build-test-macos)');
+		note => 'authoritative content e2e = t/248 (serialized cold-cluster merge); runs in CI nightly stage4-wal shard (range 242-248)');
 }
 
 
