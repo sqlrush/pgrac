@@ -1406,6 +1406,12 @@ UT_TEST(test_grd_d2_redeclare_scan_completion_gate)
 #define UT_GES_OPCODE_REQUEST 1
 #define UT_GES_OPCODE_CONVERT 2
 
+/* Internal sweep entry point (extern in cluster_grd.c, not in the public
+ * header); declared locally so U12 can exercise the convert-queue sweep
+ * predicates (spec-5.1b §3 clause 14) directly. */
+extern int cluster_grd_entry_cleanup_guarded(ClusterGrdEntry *entry, int dead_procno,
+											 int32 dead_node_id);
+
 static ClusterGrdEntry *
 convert_make_entry(int field1)
 {
@@ -1814,6 +1820,47 @@ UT_TEST(test_convert_u10_double_grant_guard)
 	convert_teardown();
 }
 
+/* U12 — convert-queue sweep on holder death (spec-5.1b §3 clause 14): a
+ * pending convert is removed by BOTH the local-backend-death (dead_procno)
+ * and the remote-node-death (dead_node_id) predicates of the GRD cleanup
+ * sweep, exactly like holders/waiters. */
+UT_TEST(test_convert_u12_sweep_on_holder_death)
+{
+	ClusterGrdEntry *e;
+	ClusterGrdConvert req;
+	bool drain = false;
+	int saved = cluster_node_id;
+
+	/* local backend death: dead_procno path (this node hosts the holder). */
+	cluster_node_id = 1;
+	convert_reset();
+	e = convert_make_entry(2014);
+	convert_grant(e, 1, 100, 11, ShareLock);
+	convert_grant(e, 2, 200, 22, ShareLock);
+	req = convert_req(1, 100, ShareLock, ExclusiveLock, 70);
+	UT_ASSERT_EQ((int)cluster_grd_entry_request_convert(e, &req, &drain),
+				 (int)CLUSTER_GRD_CONVERT_ENQUEUED);
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 1);
+	(void)cluster_grd_entry_cleanup_guarded(e, /* dead_procno */ 100, /* dead_node_id */ -1);
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 0);
+	convert_teardown();
+
+	/* remote node death: dead_node_id path. */
+	cluster_node_id = 0;
+	convert_reset();
+	e = convert_make_entry(2015);
+	convert_grant(e, 1, 100, 11, ShareLock);
+	convert_grant(e, 2, 200, 22, ShareLock);
+	req = convert_req(1, 100, ShareLock, ExclusiveLock, 71);
+	UT_ASSERT_EQ((int)cluster_grd_entry_request_convert(e, &req, &drain),
+				 (int)CLUSTER_GRD_CONVERT_ENQUEUED);
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 1);
+	(void)cluster_grd_entry_cleanup_guarded(e, /* dead_procno */ -1, /* dead_node_id */ 1);
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 0);
+	cluster_node_id = saved;
+	convert_teardown();
+}
+
 /* U11 — ClusterGrdConvert byte layout pinned (StaticAssert mirror + L45). */
 UT_TEST(test_convert_u11_struct_layout)
 {
@@ -1833,7 +1880,7 @@ int
  * other cluster_unit binaries; argv is intentionally unused. */
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(34);
+	UT_PLAN(35);
 
 	UT_RUN(test_grd_clusterresid_size_16);
 	UT_RUN(test_grd_resid_encode_decode_roundtrip);
@@ -1878,6 +1925,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_convert_u9_queue_full_fail_closed);
 	UT_RUN(test_convert_u10_double_grant_guard);
 	UT_RUN(test_convert_u11_struct_layout);
+	UT_RUN(test_convert_u12_sweep_on_holder_death);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

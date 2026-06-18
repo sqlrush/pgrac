@@ -832,7 +832,8 @@ cluster_ges_lmon_drain_work_queue(void)
 				/*
 					 * spec-2.23 D4 / HC18 — targeted BAST.  conflict_holders
 					 * was captured under entry->lock in enqueue_or_grant;
-					 * send_bast_targeted re-verifies DoLockModesConflict at
+					 * send_bast_targeted re-verifies the conflict via the
+					 * frozen matrix (ges_modes_compatible, spec-5.1b D1) at
 					 * send time and skips entries that the concurrent
 					 * release path may have already cleared.
 					 */

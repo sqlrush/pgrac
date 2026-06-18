@@ -961,6 +961,21 @@ cluster_grd_cleanup_stale_epoch_scoped(uint64 current_epoch, const uint64 *affec
 			}
 			i++;
 		}
+		/* spec-5.1b §3 clause 14: convert queue entries are epoch-swept with
+		 * holders/waiters (the convert carries its enqueue cluster_epoch).
+		 * Latent in 5.1b (converts[] is production-empty until the spec-5.2
+		 * producer lands), kept complete for that producer. */
+		for (i = 0; i < entry->nconverts;) {
+			if (entry->converts[i].cluster_epoch < current_epoch) {
+				if (i < entry->nconverts - 1)
+					entry->converts[i] = entry->converts[entry->nconverts - 1];
+				memset(&entry->converts[entry->nconverts - 1], 0, sizeof(entry->converts[0]));
+				entry->nconverts--;
+				swept++;
+				continue;
+			}
+			i++;
+		}
 		SpinLockRelease(&entry->lock);
 	}
 
@@ -3394,6 +3409,15 @@ cluster_grd_entry_cleanup_guarded(ClusterGrdEntry *entry, int dead_procno, int32
 	for (int i = entry->nconverts - 1; i >= 0; i--) {
 		bool match = false;
 
+		/* spec-5.1b §3 clause 14: convert queue entries sweep with holders/
+		 * waiters — match the local-backend-death case symmetrically (the
+		 * convert locator carries (node_id, procno)).  Latent in 5.1b
+		 * (converts[] is production-empty: opcode-2 is rejected, no live
+		 * producer until spec-5.2), but keeps the sweep complete for the
+		 * 5.2 producer. */
+		if (dead_procno >= 0 && entry->converts[i].node_id == (int32)cluster_node_id
+			&& entry->converts[i].procno == (uint32)dead_procno)
+			match = true;
 		if (dead_node_id >= 0 && entry->converts[i].node_id == dead_node_id)
 			match = true;
 		if (!match)
