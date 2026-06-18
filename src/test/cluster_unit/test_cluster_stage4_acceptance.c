@@ -169,8 +169,7 @@ UT_TEST(test_stage4_recovery_dump_category_names)
 
 UT_TEST(test_stage4_sqlstate_recovery_fence_surface_encodable)
 {
-	UT_ASSERT_EQ((int)ERRCODE_CLUSTER_WRITE_FENCED,
-				 (int)MAKE_SQLSTATE('5', '3', 'R', '5', '1'));
+	UT_ASSERT_EQ((int)ERRCODE_CLUSTER_WRITE_FENCED, (int)MAKE_SQLSTATE('5', '3', 'R', '5', '1'));
 	UT_ASSERT_EQ((int)ERRCODE_CLUSTER_CR_CROSS_INSTANCE_UNSUPPORTED,
 				 (int)MAKE_SQLSTATE('5', '3', 'R', '9', 'G'));
 	UT_ASSERT_EQ((int)ERRCODE_CLUSTER_GCS_BLOCK_RESOURCE_RECOVERING,
@@ -225,10 +224,8 @@ UT_TEST(test_stage4_thread_recovery_scope_enum_complete)
 	UT_ASSERT_EQ((int)CLUSTER_THREADREC_SCOPE_APPLICABLE, 0);
 	UT_ASSERT(CLUSTER_THREADREC_SCOPE_DISABLED != CLUSTER_THREADREC_SCOPE_APPLICABLE);
 	UT_ASSERT(CLUSTER_THREADREC_SCOPE_SINGLE_NODE != CLUSTER_THREADREC_SCOPE_DISABLED);
-	UT_ASSERT(CLUSTER_THREADREC_SCOPE_NO_SHARED_BACKEND
-			  != CLUSTER_THREADREC_SCOPE_SINGLE_NODE);
-	UT_ASSERT(CLUSTER_THREADREC_SCOPE_MULTI_SURVIVOR
-			  != CLUSTER_THREADREC_SCOPE_NO_SHARED_BACKEND);
+	UT_ASSERT(CLUSTER_THREADREC_SCOPE_NO_SHARED_BACKEND != CLUSTER_THREADREC_SCOPE_SINGLE_NODE);
+	UT_ASSERT(CLUSTER_THREADREC_SCOPE_MULTI_SURVIVOR != CLUSTER_THREADREC_SCOPE_NO_SHARED_BACKEND);
 	/* contiguous 0..4 */
 	UT_ASSERT_EQ((int)CLUSTER_THREADREC_SCOPE_MULTI_SURVIVOR, 4);
 }
@@ -272,8 +269,7 @@ UT_TEST(test_stage4_dead_bitmap_bit_convention_roundtrip)
 	 * dead_bitmap_set_bit / orchestrator_srf.c inject).  Verify the lowest and
 	 * highest addressable nodes set+read back exactly one bit, with no aliasing
 	 * onto a neighbour. */
-	for (node = 0; node <= CLUSTER_MAX_NODES - 1; node += (CLUSTER_MAX_NODES - 1))
-	{
+	for (node = 0; node <= CLUSTER_MAX_NODES - 1; node += (CLUSTER_MAX_NODES - 1)) {
 		memset(bitmap, 0, sizeof(bitmap));
 		bitmap[node / 8] |= (uint8)(1u << (node % 8));
 
