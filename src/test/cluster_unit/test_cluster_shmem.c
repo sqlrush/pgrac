@@ -347,6 +347,10 @@ int cluster_pcm_grd_max_entries = 0;
  * global; cluster_cr_cache.o is not linked into this test, so stub it. */
 int cluster_cr_cache_max_blocks = 64;
 
+/* spec-5.1a stub: cluster_guc.o references the GES mode self-check GUC
+ * global; cluster_ges_mode_backend.o is not linked here, so stub it. */
+int cluster_ges_mode_selfcheck = 2;
+
 void
 cluster_pcm_lock_module_init(void)
 {}

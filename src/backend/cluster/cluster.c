@@ -40,8 +40,9 @@
 
 #include "cluster/cluster.h"
 #include "cluster/cluster_elog.h"
-#include "cluster/cluster_inject.h" /* CLUSTER_INJECTION_POINT (stage 0.30 sweep) */
-#include "cluster/cluster_shmem.h"	/* cluster_init_shmem_module (stage 1.3) */
+#include "cluster/cluster_ges_mode.h" /* cluster_ges_mode_init (spec-5.1a) */
+#include "cluster/cluster_inject.h"	  /* CLUSTER_INJECTION_POINT (stage 0.30 sweep) */
+#include "cluster/cluster_shmem.h"	  /* cluster_init_shmem_module (stage 1.3) */
 #include "utils/elog.h"
 
 
@@ -102,6 +103,12 @@ cluster_init(void)
 	 * Must run after cluster_init_guc and before cluster_request_shmem.
 	 */
 	cluster_init_shmem_module();
+
+	/*
+	 * spec-5.1a: verify the frozen GES mode-compat matrix against the live
+	 * lock conflict table (fails closed per cluster.ges_mode_selfcheck).
+	 */
+	cluster_ges_mode_init();
 }
 
 /*

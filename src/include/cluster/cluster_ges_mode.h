@@ -49,9 +49,9 @@
  */
 typedef LOCKMODE ClusterGesMode;
 
-#define GES_MODE_FIRST AccessShareLock		/* 1 */
-#define GES_MODE_LAST  AccessExclusiveLock	/* 8 */
-#define GES_MODE_COUNT MaxLockMode			/* 8 */
+#define GES_MODE_FIRST AccessShareLock	  /* 1 */
+#define GES_MODE_LAST AccessExclusiveLock /* 8 */
+#define GES_MODE_COUNT MaxLockMode		  /* 8 */
 
 StaticAssertDecl(GES_MODE_COUNT == 8, "GES mode space is the 8 PG lock modes");
 StaticAssertDecl(GES_MODE_FIRST == 1 && GES_MODE_LAST == 8,
@@ -62,7 +62,7 @@ StaticAssertDecl(GES_MODE_FIRST == 1 && GES_MODE_LAST == 8,
  * backend-only LOCKBIT_ON, redefined here so the pure layer needs only
  * storage/lockdefs.h and stays FRONTEND-safe).
  */
-#define GES_MODE_BIT(m) ((LOCKMASK) 1 << (m))
+#define GES_MODE_BIT(m) ((LOCKMASK)1 << (m))
 
 /*
  * ges_mode_is_valid -- range check for a GES enqueue mode (pure).
@@ -82,14 +82,13 @@ ges_mode_is_valid(ClusterGesMode m)
  *	ShareUpdateExclusiveLock / ExclusiveLock have no exact DLM peer), so
  *	a DLM alias is never a compatibility-decision input.
  */
-typedef enum ClusterGesDlmMode
-{
-	GES_DLM_NL = 0,				/* Null */
-	GES_DLM_CR,					/* Concurrent Read  (== SS) */
-	GES_DLM_CW,					/* Concurrent Write (== SX) */
-	GES_DLM_PR,					/* Protected Read   (== S) */
-	GES_DLM_PW,					/* Protected Write  (== SSX) */
-	GES_DLM_EX					/* Exclusive */
+typedef enum ClusterGesDlmMode {
+	GES_DLM_NL = 0, /* Null */
+	GES_DLM_CR,		/* Concurrent Read  (== SS) */
+	GES_DLM_CW,		/* Concurrent Write (== SX) */
+	GES_DLM_PR,		/* Protected Read   (== S) */
+	GES_DLM_PW,		/* Protected Write  (== SSX) */
+	GES_DLM_EX		/* Exclusive */
 } ClusterGesDlmMode;
 
 /*
@@ -99,12 +98,11 @@ typedef enum ClusterGesDlmMode
  *	conversion is classified by compatibility-set containment rather than
  *	a total strength rank.
  */
-typedef enum ClusterGesConvertClass
-{
-	GES_CONVERT_SAME = 0,		/* from == to */
-	GES_CONVERT_UPGRADE,		/* compat_set(to) strict subset of compat_set(from) */
-	GES_CONVERT_DOWNGRADE,		/* compat_set(to) strict superset of compat_set(from) */
-	GES_CONVERT_LATERAL			/* incomparable, or equal-strength distinct modes */
+typedef enum ClusterGesConvertClass {
+	GES_CONVERT_SAME = 0,  /* from == to */
+	GES_CONVERT_UPGRADE,   /* compat_set(to) strict subset of compat_set(from) */
+	GES_CONVERT_DOWNGRADE, /* compat_set(to) strict superset of compat_set(from) */
+	GES_CONVERT_LATERAL	   /* incomparable, or equal-strength distinct modes */
 } ClusterGesConvertClass;
 
 /*
@@ -128,8 +126,7 @@ extern ClusterGesMode ges_mode_from_pg_name(const char *name);
 #ifndef FRONTEND
 
 /* Backend layer: severity for the startup matrix-vs-PG self-check. */
-typedef enum ClusterGesModeSelfcheck
-{
+typedef enum ClusterGesModeSelfcheck {
 	GES_MODE_SELFCHECK_OFF = 0,
 	GES_MODE_SELFCHECK_WARN,
 	GES_MODE_SELFCHECK_FATAL

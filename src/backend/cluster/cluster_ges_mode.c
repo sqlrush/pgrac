@@ -29,7 +29,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_ges_mode.h"
-#include "port.h"				/* pg_strcasecmp */
+#include "port.h" /* pg_strcasecmp */
 
 /*
  * Frozen GES compatibility matrix (SSOT).
@@ -42,15 +42,15 @@
  *	          wanted: AS RS RE SUE S  SRE E  AE
  */
 const uint8 ges_mode_compat_matrix[GES_MODE_COUNT + 1][GES_MODE_COUNT + 1] = {
-	/* (unused 0) */ {0, 0, 0, 0, 0, 0, 0, 0, 0},
-	/* AccessShareLock		 */ {0, 1, 1, 1, 1, 1, 1, 1, 0},
-	/* RowShareLock			 */ {0, 1, 1, 1, 1, 1, 1, 0, 0},
-	/* RowExclusiveLock		 */ {0, 1, 1, 1, 1, 0, 0, 0, 0},
-	/* ShareUpdateExclusive	 */ {0, 1, 1, 1, 0, 0, 0, 0, 0},
-	/* ShareLock			 */ {0, 1, 1, 0, 0, 1, 0, 0, 0},
-	/* ShareRowExclusiveLock */ {0, 1, 1, 0, 0, 0, 0, 0, 0},
-	/* ExclusiveLock		 */ {0, 1, 0, 0, 0, 0, 0, 0, 0},
-	/* AccessExclusiveLock	 */ {0, 0, 0, 0, 0, 0, 0, 0, 0},
+	/* (unused 0) */ { 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+	/* AccessShareLock		 */ { 0, 1, 1, 1, 1, 1, 1, 1, 0 },
+	/* RowShareLock			 */ { 0, 1, 1, 1, 1, 1, 1, 0, 0 },
+	/* RowExclusiveLock		 */ { 0, 1, 1, 1, 1, 0, 0, 0, 0 },
+	/* ShareUpdateExclusive	 */ { 0, 1, 1, 1, 0, 0, 0, 0, 0 },
+	/* ShareLock			 */ { 0, 1, 1, 0, 0, 1, 0, 0, 0 },
+	/* ShareRowExclusiveLock */ { 0, 1, 1, 0, 0, 0, 0, 0, 0 },
+	/* ExclusiveLock		 */ { 0, 1, 0, 0, 0, 0, 0, 0, 0 },
+	/* AccessExclusiveLock	 */ { 0, 0, 0, 0, 0, 0, 0, 0, 0 },
 };
 
 /* Canonical PG lock-mode names, indexed by mode (1..8); 0 reserved. */
@@ -73,15 +73,15 @@ static const char *const ges_dlm_names[] = {
 
 /* PG mode -> approximate Oracle DLM alias (display only). */
 static const ClusterGesDlmMode ges_mode_dlm_map[GES_MODE_COUNT + 1] = {
-	GES_DLM_NL,					/* 0 reserved */
-	GES_DLM_CR,					/* AccessShareLock */
-	GES_DLM_CR,					/* RowShareLock */
-	GES_DLM_CW,					/* RowExclusiveLock */
-	GES_DLM_CW,					/* ShareUpdateExclusiveLock */
-	GES_DLM_PR,					/* ShareLock */
-	GES_DLM_PW,					/* ShareRowExclusiveLock */
-	GES_DLM_PW,					/* ExclusiveLock */
-	GES_DLM_EX,					/* AccessExclusiveLock */
+	GES_DLM_NL, /* 0 reserved */
+	GES_DLM_CR, /* AccessShareLock */
+	GES_DLM_CR, /* RowShareLock */
+	GES_DLM_CW, /* RowExclusiveLock */
+	GES_DLM_CW, /* ShareUpdateExclusiveLock */
+	GES_DLM_PR, /* ShareLock */
+	GES_DLM_PW, /* ShareRowExclusiveLock */
+	GES_DLM_PW, /* ExclusiveLock */
+	GES_DLM_EX, /* AccessExclusiveLock */
 };
 
 /*
@@ -107,7 +107,7 @@ ges_modes_compatible(ClusterGesMode held, ClusterGesMode wanted)
 LOCKMASK
 ges_mode_compat_set(ClusterGesMode m)
 {
-	LOCKMASK	mask = 0;
+	LOCKMASK mask = 0;
 	ClusterGesMode w;
 
 	Assert(ges_mode_is_valid(m));
@@ -129,8 +129,8 @@ ges_mode_compat_set(ClusterGesMode m)
 ClusterGesConvertClass
 ges_mode_convert_class(ClusterGesMode from, ClusterGesMode to)
 {
-	LOCKMASK	sf;
-	LOCKMASK	st;
+	LOCKMASK sf;
+	LOCKMASK st;
 
 	Assert(ges_mode_is_valid(from));
 	Assert(ges_mode_is_valid(to));
@@ -144,11 +144,11 @@ ges_mode_convert_class(ClusterGesMode from, ClusterGesMode to)
 	st = ges_mode_compat_set(to);
 
 	if (sf == st)
-		return GES_CONVERT_LATERAL;	/* equal-strength distinct modes */
+		return GES_CONVERT_LATERAL; /* equal-strength distinct modes */
 	if ((st & sf) == st)
-		return GES_CONVERT_UPGRADE;	/* compat_set(to) subset of compat_set(from) */
+		return GES_CONVERT_UPGRADE; /* compat_set(to) subset of compat_set(from) */
 	if ((sf & st) == sf)
-		return GES_CONVERT_DOWNGRADE;	/* compat_set(from) subset of compat_set(to) */
+		return GES_CONVERT_DOWNGRADE; /* compat_set(from) subset of compat_set(to) */
 	return GES_CONVERT_LATERAL;
 }
 

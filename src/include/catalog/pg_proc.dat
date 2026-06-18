@@ -12388,6 +12388,24 @@
   proargnames => '{pid,state,reason,started_at,ready_at,started_count,edge_submission_count,wake_count,idle_count,error_count}',
   prosrc => 'cluster_get_lmd_state' },
 
+# spec-5.1a (2026-06-18) -- GES lock-mode encoding + frozen 8x8 compat matrix.
+{ oid => '8948', descr => 'dump frozen GES 8x8 lock-mode compatibility matrix + DLM aliases',
+  proname => 'pg_cluster_ges_mode_matrix', prorows => '64',
+  proretset => 't', provolatile => 's', proparallel => 's',
+  prorettype => 'record', proargtypes => '',
+  proallargtypes => '{text,text,bool,text,text}',
+  proargmodes => '{o,o,o,o,o}',
+  proargnames => '{held,wanted,compatible,held_dlm,wanted_dlm}',
+  prosrc => 'pg_cluster_ges_mode_matrix' },
+{ oid => '8949', descr => 'GES compatibility of two canonical PG lock-mode names',
+  proname => 'cluster_ges_mode_compat', provolatile => 's', proparallel => 's',
+  prorettype => 'bool', proargtypes => 'text text',
+  prosrc => 'cluster_ges_mode_compat' },
+{ oid => '8950', descr => 'does the frozen GES matrix match the live lock conflict table',
+  proname => 'cluster_ges_mode_matches_pg', provolatile => 's', proparallel => 's',
+  prorettype => 'bool', proargtypes => '',
+  prosrc => 'cluster_ges_mode_matches_pg' },
+
 # spec-2.22 D16 (2026-05-15) -- pg_cluster_lmd_inject_wait_edge (oid 8924).
 #
 # **TEST-ONLY** SRF.  Bypasses GES path entirely and writes synthetic

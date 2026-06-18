@@ -142,6 +142,10 @@ jobs:
         if: steps.changes.outputs.code_changed == 'true'
         run: ./scripts/ci/check-scn-cmp-gate.sh
 
+      - name: Check GES mode gate (spec-5.1a)
+        if: steps.changes.outputs.code_changed == 'true'
+        run: ./scripts/ci/check-ges-mode-gate.sh
+
       - name: Check no CLOG overlay (spec-3.1 L176)
         if: steps.changes.outputs.code_changed == 'true'
         run: ./scripts/ci/check-no-clog-overlay.sh

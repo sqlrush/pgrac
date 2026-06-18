@@ -640,7 +640,7 @@
  * TEST-ONLY entry -- cluster_thread_capability_gate_test (oid 8947) -- driving
  * the FEATURE_NOT_SUPPORTED gate (no-shared-backend / >2-node) deterministically.
  * One pg_proc row -> bump. */
-#define CATALOG_VERSION_NO 202606152
+#define CATALOG_VERSION_NO 202606180
 
 /* spec-2.39 D10 (2026-05-21):  SI Broadcaster production activation —
  * DDL commit hook (AtEOXact_Inval + COMMIT PREPARED via cluster-aware
