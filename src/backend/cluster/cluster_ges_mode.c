@@ -5,9 +5,11 @@
  *
  *	  The frozen 8x8 compatibility matrix is the single source of truth;
  *	  ges_modes_compatible / ges_mode_compat_set / ges_mode_convert_class
- *	  all derive from it.  All functions here are pure and FRONTEND-safe:
- *	  out-of-range input asserts (debug) and fails closed to the
- *	  conservative answer, never calling ereport.  The live cross-check
+ *	  all derive from it.  All functions here are pure (no elog/shmem/
+ *	  DoLockModesConflict) and standalone-linkable: out-of-range input asserts
+ *	  (debug) and fails closed to the conservative answer, never calling
+ *	  ereport.  (The .c is compiled backend-side; only the header's constants
+ *	  + ges_mode_is_valid are frontend-includable.)  The live cross-check
  *	  against PG's DoLockModesConflict and the GUC-driven self-check live
  *	  in the backend layer (cluster_ges_mode_backend.c).
  *

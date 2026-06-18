@@ -1449,7 +1449,8 @@ cluster_ges_send_bast_targeted(const struct ClusterResId *resid, int requested_m
 		 * incompatible entries makes the routine idempotent under
 		 * concurrent release races.
 		 */
-		if (!DoLockModesConflict((LOCKMODE)requested_mode, held))
+		if (!DoLockModesConflict((LOCKMODE)requested_mode,
+								 held)) /* GES_MODE_OK: transitional until spec-5.1b */
 			continue;
 
 		if (holder_node == cluster_node_id) {

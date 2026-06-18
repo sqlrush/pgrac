@@ -61,7 +61,9 @@ ges_mode_compat_matches_pg(void)
 
 	for (held = GES_MODE_FIRST; held <= GES_MODE_LAST; held++)
 		for (wanted = GES_MODE_FIRST; wanted <= GES_MODE_LAST; wanted++)
-			if (ges_modes_compatible(held, wanted) != !DoLockModesConflict(held, wanted))
+			if (ges_modes_compatible(held, wanted)
+				!= !DoLockModesConflict(held,
+										wanted)) /* GES_MODE_OK: the contract self-check itself */
 				return false;
 	return true;
 }
@@ -87,7 +89,8 @@ cluster_ges_mode_init(void)
 	for (held = GES_MODE_FIRST; held <= GES_MODE_LAST; held++) {
 		for (wanted = GES_MODE_FIRST; wanted <= GES_MODE_LAST; wanted++) {
 			bool ours = ges_modes_compatible(held, wanted);
-			bool pg = !DoLockModesConflict(held, wanted);
+			bool pg = !DoLockModesConflict(
+				held, wanted); /* GES_MODE_OK: the contract self-check itself */
 
 			if (ours != pg) {
 				int elevel

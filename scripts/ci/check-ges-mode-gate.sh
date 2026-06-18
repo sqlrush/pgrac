@@ -18,17 +18,14 @@
 # Portions Copyright (c) 2026, pgrac contributors
 #
 # NOTES
-#    Match key is file + symbol + reason (never a line number, which would
-#    go stale on any edit).  Two exemption mechanisms:
-#
-#      - Whitelisted files (the contract's own home + transitional callers
-#        that spec-5.1b migrates to ges_modes_compatible):
-#          cluster_ges_mode_backend.c -- the frozen-vs-PG self-check itself
-#          cluster_ges.c              -- transitional; spec-5.1b migrates
-#          cluster_grd.c              -- transitional; spec-5.1b migrates
-#        spec-5.1b removes each transitional entry as it migrates.
-#
-#      - Lines annotated /* GES_MODE_OK: <reason> */ for one-off exceptions.
+#    Exemption is PER CALL SITE, not per file (a file-level whitelist would
+#    let a NEW raw call slip the gate in exactly the files spec-5.1b touches).
+#    Every legitimate call carries an inline /* GES_MODE_OK: <reason> */ on
+#    the same line; the gate skips only those lines (and genuine comments).
+#    Current exempt call sites:
+#      cluster_ges_mode_backend.c -- the frozen-vs-PG self-check itself
+#      cluster_ges.c / cluster_grd.c -- transitional; spec-5.1b migrates each
+#        to ges_modes_compatible() and removes its GES_MODE_OK annotation.
 #
 #-------------------------------------------------------------------------
 
@@ -39,23 +36,30 @@ cd "$ROOT"
 
 violations=0
 
-# Whitelisted files (by basename): the contract home + transitional callers.
-whitelist='cluster_ges_mode_backend\.c$|cluster_ges\.c$|cluster_grd\.c$'
-
-files=$(git ls-files 'src/backend/cluster/*.c' | grep -vE "$whitelist" || true)
+# No file-level exemptions: every cluster .c is scanned; legitimate calls are
+# exempted only by an inline /* GES_MODE_OK: <reason> */ on the call line.
+files=$(git ls-files 'src/backend/cluster/*.c' || true)
 
 for f in $files; do
-	# Match calls to DoLockModesConflict(.  Skip comment lines (leading
-	# '*') and lines annotated GES_MODE_OK.
-	# grep -n on a single file yields "LINENO:CONTENT"; skip genuine comment
-	# lines only: '*' followed by space/slash (block-comment continuation or
-	# '*/'), or a line starting with '/*' or '//'.  A pointer-deref statement
-	# like "*ptr = DoLockModesConflict(...)" starts with '*' + identifier and
-	# is NOT skipped.
-	matches=$(grep -nE 'DoLockModesConflict[ \t]*\(' "$f" \
-		| grep -v 'GES_MODE_OK' \
-		| grep -vE '^[0-9]+:[[:space:]]*(\*[[:space:]/]|/[*/])' \
-		|| true)
+	# A call is exempt if GES_MODE_OK appears on the call line OR within the
+	# next 2 lines (clang-format wraps a long call + its trailing annotation
+	# onto the call's continuation line, so the window must look forward).
+	# Genuine comment lines ('*'+space/slash continuation, or '/*' / '//') that
+	# merely mention DoLockModesConflict in prose are skipped; a pointer-deref
+	# statement like "*ptr = DoLockModesConflict(...)" is NOT a comment.
+	matches=$(awk '
+		function is_comment(s) { return s ~ /^[[:space:]]*(\*[[:space:]\/]|\/[*\/])/ }
+		{ L[NR] = $0 }
+		END {
+			for (i = 1; i <= NR; i++) {
+				if (L[i] ~ /DoLockModesConflict[ \t]*\(/ && !is_comment(L[i])) {
+					ok = 0
+					for (j = i; j <= i + 2 && j <= NR; j++)
+						if (L[j] ~ /GES_MODE_OK/) { ok = 1; break }
+					if (!ok) printf "%d:%s\n", i, L[i]
+				}
+			}
+		}' "$f")
 	if [ -n "$matches" ]; then
 		echo "ERROR: raw DoLockModesConflict() in $f:"
 		echo "$matches"

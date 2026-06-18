@@ -12,7 +12,11 @@
  *	  PCM block-lock states {N,S,X}.
  *
  *	  Two API layers:
- *	    - Pure layer (FRONTEND-safe, no elog/shmem): constants, the const
+ *	    - Pure layer (backend-pure: no elog/shmem/DoLockModesConflict, and
+ *	      standalone-linkable -- the cluster_unit test links it without the
+ *	      full backend; the header's constants + ges_mode_is_valid are also
+ *	      frontend-includable, but the functions are compiled backend-side):
+ *	      constants, the const
  *	      matrix, ges_mode_is_valid, ges_modes_compatible,
  *	      ges_mode_compat_set, ges_mode_convert_class, ges_mode_to_dlm,
  *	      ges_dlm_mode_name, ges_mode_pg_name, ges_mode_from_pg_name.
@@ -60,7 +64,7 @@ StaticAssertDecl(GES_MODE_FIRST == 1 && GES_MODE_LAST == 8,
 /*
  * GES_MODE_BIT -- single-mode bit for a LOCKMASK (same value as the
  * backend-only LOCKBIT_ON, redefined here so the pure layer needs only
- * storage/lockdefs.h and stays FRONTEND-safe).
+ * storage/lockdefs.h, not the heavy storage/lock.h).
  */
 #define GES_MODE_BIT(m) ((LOCKMASK)1 << (m))
 
@@ -114,7 +118,8 @@ typedef enum ClusterGesConvertClass {
  */
 extern const uint8 ges_mode_compat_matrix[GES_MODE_COUNT + 1][GES_MODE_COUNT + 1];
 
-/* Pure layer (FRONTEND-safe; out-of-range fails closed, never ereports). */
+/* Pure layer (backend-pure, no elog/shmem, standalone-linkable; out-of-range
+ * fails closed, never ereports). */
 extern bool ges_modes_compatible(ClusterGesMode held, ClusterGesMode wanted);
 extern LOCKMASK ges_mode_compat_set(ClusterGesMode m);
 extern ClusterGesConvertClass ges_mode_convert_class(ClusterGesMode from, ClusterGesMode to);

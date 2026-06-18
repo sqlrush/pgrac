@@ -1641,7 +1641,9 @@ cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid,
 	for (i = 0; i < entry->ngranted; i++) {
 		if (((uint32)entry->holders[i].node_id != new_holder->node_id
 			 || entry->holders[i].procno != new_holder->procno)
-			&& DoLockModesConflict((LOCKMODE)lockmode, entry->holders[i].mode)) {
+			&& DoLockModesConflict(
+				(LOCKMODE)lockmode,
+				entry->holders[i].mode)) { /* GES_MODE_OK: transitional until spec-5.1b */
 			SpinLockRelease(&entry->lock);
 			return CLUSTER_GRD_ENTRY_ERROR;
 		}
@@ -2334,7 +2336,9 @@ cluster_grd_entry_enqueue_or_grant(const ClusterResId *resid, const ClusterGrdHo
 	 *	  can later fan out a targeted BAST (HC18).
 	 */
 	for (int i = 0; i < entry->ngranted; i++) {
-		if (!DoLockModesConflict((LOCKMODE)lockmode, entry->holders[i].mode))
+		if (!DoLockModesConflict(
+				(LOCKMODE)lockmode,
+				entry->holders[i].mode)) /* GES_MODE_OK: transitional until spec-5.1b */
 			continue;
 		if (conflict_holders_out != NULL && n_conflict < PGRAC_GRD_MAX_HOLDERS) {
 			conflict_holders_out[n_conflict].holder.node_id = entry->holders[i].node_id;
@@ -2473,7 +2477,9 @@ cluster_grd_entry_release_and_pop_compatible_waiter(const ClusterResId *resid,
 			bool compatible = true;
 
 			for (int h = 0; h < entry->ngranted; h++) {
-				if (DoLockModesConflict(entry->waiters[w].mode, entry->holders[h].mode)) {
+				if (DoLockModesConflict(
+						entry->waiters[w].mode,
+						entry->holders[h].mode)) { /* GES_MODE_OK: transitional until spec-5.1b */
 					compatible = false;
 					break;
 				}
