@@ -225,13 +225,16 @@ jobs:
           # acceptance capability smoke (t/200) +
           # spec-3.17 Stage 3 MVCC capability cross-cutting smoke (t/226,
           # single-node, ~5s).
+          # spec-4.14 Stage 4 recovery capability cross-cutting smoke (t/273,
+          # single-node, ~3s; multi-node hard-gate t/274 + matrix t/275 run in
+          # nightly stage4-wal shard + make check).
           # t/202 perf smoke runs in nightly Stage 2 acceptance medium.
           # t/201 fault matrix NOT here (avoid fast-gate inject flake).
           # t/227 Stage 3 workload perf smoke runs pgbench (>30s) -> nightly.
           # Full cluster_tap suite + 2-node ClusterPair + heartbeat round-
           # trip + Stage 2/3 medium perf matrix tests run in nightly.yml.
           make -C src/test/cluster_tap check \
-            PROVE_TESTS="t/010_views.pl t/030_acceptance.pl t/050_shared_storage_initdb.pl t/200_stage2_acceptance_capability.pl t/226_stage3_mvcc_acceptance_capability.pl"
+            PROVE_TESTS="t/010_views.pl t/030_acceptance.pl t/050_shared_storage_initdb.pl t/200_stage2_acceptance_capability.pl t/226_stage3_mvcc_acceptance_capability.pl t/273_stage4_recovery_acceptance_capability.pl"
 
       - name: Upload regression diffs on failure
         if: failure()
