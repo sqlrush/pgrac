@@ -121,7 +121,7 @@ my $grd_c = slurp_src('src/backend/cluster/cluster_grd.c');
 # L3 -- D5 self-conflict exclusion is wired in the master conflict scan,
 # keyed by {node_id, procno} (NOT the full 4-tuple).
 like($grd_c,
-	qr/spec-5\.1c D5: same-backend self-conflict exclusion.*?holders\[i\]\.node_id == \(int32\) holder->node_id\s*&&\s*entry->holders\[i\]\.procno == holder->procno/s,
+	qr/spec-5\.1c D5: same-backend self-conflict exclusion.*?entry->holders\[i\]\.node_id == holder->node_id\s*&&\s*entry->holders\[i\]\.procno == holder->procno/s,
 	'L3: master conflict scan excludes the requester\'s own hold by {node_id, procno} (D5)');
 
 my $ges_c = slurp_src('src/backend/cluster/cluster_ges.c');
@@ -131,7 +131,7 @@ my $ges_c = slurp_src('src/backend/cluster/cluster_ges.c');
 like($ges_c, qr/spec-5\.1c D1 -- local holder delivery/,
 	'L4: local BAST branch is the spec-5.1c delivery (not the spec-2.23 no-op)');
 like($ges_c,
-	qr/cluster_grd_bast_local_deliver_ok\(.*?SendProcSignal\(target_pid, PROCSIG_CLUSTER_GES_BAST,\s*\(BackendId\) target_backendid\)/s,
+	qr/cluster_grd_bast_local_deliver_ok\(.*?SendProcSignal\(target_pid, PROCSIG_CLUSTER_GES_BAST,\s*\(BackendId\)\s*target_backendid\)/s,
 	'L4b: signal uses proc->backendId (NOT pgprocno) guarded by deliver-ok (D1, P0 fix)');
 
 # L5 -- D4: BAST_ACK stays release-coupled; opcode-5 handler counter-only.
