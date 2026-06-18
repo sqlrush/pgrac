@@ -47,11 +47,14 @@ files=$(git ls-files 'src/backend/cluster/*.c' | grep -vE "$whitelist" || true)
 for f in $files; do
 	# Match calls to DoLockModesConflict(.  Skip comment lines (leading
 	# '*') and lines annotated GES_MODE_OK.
-	# grep -n on a single file yields "LINENO:CONTENT"; skip block-comment
-	# lines (CONTENT starts with optional whitespace then '*' or '/*').
+	# grep -n on a single file yields "LINENO:CONTENT"; skip genuine comment
+	# lines only: '*' followed by space/slash (block-comment continuation or
+	# '*/'), or a line starting with '/*' or '//'.  A pointer-deref statement
+	# like "*ptr = DoLockModesConflict(...)" starts with '*' + identifier and
+	# is NOT skipped.
 	matches=$(grep -nE 'DoLockModesConflict[ \t]*\(' "$f" \
 		| grep -v 'GES_MODE_OK' \
-		| grep -vE '^[0-9]+:[[:space:]]*/?\*' \
+		| grep -vE '^[0-9]+:[[:space:]]*(\*[[:space:]/]|/[*/])' \
 		|| true)
 	if [ -n "$matches" ]; then
 		echo "ERROR: raw DoLockModesConflict() in $f:"
