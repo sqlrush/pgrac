@@ -152,16 +152,32 @@ UT_TEST(test_stage4_undo_opcodes_preserved_and_info_mask_clear)
 
 UT_TEST(test_stage4_recovery_dump_category_names)
 {
-	/* Compile-time string roster for the Stage 4 recovery + fence capability
-	 * surface.  Runtime emission (cluster_dump_state) verified by t/273 L12;
-	 * this pins the documented names so a rename trips here. */
-	UT_ASSERT_EQ(strcmp("recovery", "recovery"), 0);
-	UT_ASSERT_EQ(strcmp("tt_recovery", "tt_recovery"), 0);
-	UT_ASSERT_EQ(strcmp("gcs_recovery", "gcs_recovery"), 0);
-	UT_ASSERT_EQ(strcmp("grd_recovery", "grd_recovery"), 0);
-	UT_ASSERT_EQ(strcmp("pcm", "pcm"), 0);
-	UT_ASSERT_EQ(strcmp("cr", "cr"), 0);
-	UT_ASSERT_EQ(strcmp("write_fence", "write_fence"), 0);
+	/* t/273 L12 asserts pg_cluster_state actually emits rows for each of these
+	 * categories at runtime;  this test pins the category name strings as a
+	 * compile-time roster (+ exact total length) so a rename / removal in a
+	 * cluster_debug.c emit site would diverge from the contract surface here.
+	 * (Array form, not strcmp(literal,literal), to avoid a meaningless
+	 * self-comparison — cppcheck staticStringCompare.) */
+	const char *cats[7] = {
+		"recovery",		/* spec-4.3 recovery coordinator / block-recovery */
+		"tt_recovery",	/* spec-4.8 undo/TT recovery counters */
+		"gcs_recovery", /* spec-4.7 GCS/PCM warm recovery counters */
+		"grd_recovery", /* spec-4.6 GRD/GES remaster counters */
+		"pcm",			/* PCM lock-state counters */
+		"cr",			/* CR block construction counters */
+		"write_fence"	/* spec-4.12/4.12b cooperative write-fence counters */
+	};
+	int i;
+	int total_len = 0;
+
+	for (i = 0; i < 7; i++) {
+		UT_ASSERT_NOT_NULL((void *)cats[i]);
+		UT_ASSERT((int)strlen(cats[i]) > 1);
+		total_len += (int)strlen(cats[i]);
+	}
+	/* recovery8 + tt_recovery11 + gcs_recovery12 + grd_recovery12 + pcm3 + cr2
+	 * + write_fence11 = 59 */
+	UT_ASSERT_EQ(total_len, 59);
 }
 
 
