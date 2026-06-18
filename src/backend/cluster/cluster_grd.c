@@ -3227,8 +3227,11 @@ cluster_grd_bast_local_deliver_ok(uint32 procno, int proc_count, uint64 holder_e
 		return false; /* procno out of range */
 	if (holder_epoch != current_epoch)
 		return false; /* stale (cross-epoch) holder */
-	if (target_pid == 0 || target_backendid == InvalidBackendId)
-		return false; /* no live backend at this slot */
+	if (target_pid == 0 || target_backendid <= 0)
+		return false; /* no live backend (BackendId must be > 0:
+					   * SendProcSignal indexes psh_slot[backendId-1], and PG
+					   * assigns backendId only after startup -- a recycled slot
+					   * mid-startup has pid set but backendId still 0). */
 	return true;
 }
 

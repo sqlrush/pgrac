@@ -2076,9 +2076,12 @@ UT_TEST(test_5_1c_u10_bast_deliver_ok_predicate)
 	UT_ASSERT(!cluster_grd_bast_local_deliver_ok(5, 0, 7, 7, 1234, 3));
 	/* stale (cross-epoch) holder. */
 	UT_ASSERT(!cluster_grd_bast_local_deliver_ok(5, 10, 6, 7, 1234, 3));
-	/* dead backend: pid 0 or InvalidBackendId (-1). */
+	/* dead / not-yet-started backend: pid 0, InvalidBackendId (-1), or a
+	 * backendId of 0 (recycled slot mid-startup -- BackendId must be > 0,
+	 * else SendProcSignal would index psh_slot[-1]). */
 	UT_ASSERT(!cluster_grd_bast_local_deliver_ok(5, 10, 7, 7, 0, 3));
 	UT_ASSERT(!cluster_grd_bast_local_deliver_ok(5, 10, 7, 7, 1234, -1));
+	UT_ASSERT(!cluster_grd_bast_local_deliver_ok(5, 10, 7, 7, 1234, 0));
 }
 
 /* spec-5.1c U11 — regression: the live release_and_pop path keeps single-pop
