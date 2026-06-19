@@ -826,18 +826,19 @@ cluster_pcm_lock_master_take_x_after_transfer(BufferTag tag, XLogRecPtr page_lsn
 	if (entry == NULL)
 		ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY),
 						errmsg("cluster_pcm_lock_master_take_x_after_transfer: PCM GRD HTAB "
-							   "FULL (cap=%d)", pcm_grd_effective)));
+							   "FULL (cap=%d)",
+							   pcm_grd_effective)));
 
 	pcm_entry_lock_exclusive(entry);
-	pg_atomic_write_u32(&entry->master_state, (uint32) PCM_STATE_X);
+	pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_X);
 	entry->x_holder_node = cluster_node_id;
 	pg_atomic_write_u32(&entry->s_holders_bitmap, 0);
 	/* HC110: keep master_holder coherent with the X holder so subsequent
 	 * forward/ship decisions (and spec-5.2 D11 path-B detection of
 	 * master==holder==self) read the right holder identity. */
 	pcm_master_holder_set_node(entry, cluster_node_id);
-	if ((uint64) page_lsn > entry->pi_watermark_lsn)
-		entry->pi_watermark_lsn = (uint64) page_lsn;
+	if ((uint64)page_lsn > entry->pi_watermark_lsn)
+		entry->pi_watermark_lsn = (uint64)page_lsn;
 	LWLockRelease(&entry->entry_lock.lock);
 }
 
@@ -877,12 +878,12 @@ cluster_pcm_lock_master_grant_x_to(BufferTag tag, int32 requester_node, XLogRecP
 							   pcm_grd_effective)));
 
 	pcm_entry_lock_exclusive(entry);
-	pg_atomic_write_u32(&entry->master_state, (uint32) PCM_STATE_X);
+	pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_X);
 	entry->x_holder_node = requester_node;
 	pg_atomic_write_u32(&entry->s_holders_bitmap, 0);
 	pcm_master_holder_set_node(entry, requester_node);
-	if ((uint64) page_lsn > entry->pi_watermark_lsn)
-		entry->pi_watermark_lsn = (uint64) page_lsn;
+	if ((uint64)page_lsn > entry->pi_watermark_lsn)
+		entry->pi_watermark_lsn = (uint64)page_lsn;
 	LWLockRelease(&entry->entry_lock.lock);
 }
 

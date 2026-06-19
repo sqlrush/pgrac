@@ -136,11 +136,11 @@ typedef struct ClusterGcsBlockShared {
 	pg_atomic_uint64 epoch_invalidate_wake_count;
 	pg_atomic_uint64 stale_reply_drop_count;
 	/* PGRAC: spec-2.35 D12 — 7 NEW counters for CF 2-way protocol. */
-	pg_atomic_uint64 block_forward_sent_count;			 /* master→holder FORWARD emitted */
-	pg_atomic_uint64 block_forward_received_count;		 /* holder received FORWARD */
-	pg_atomic_uint64 block_from_holder_ship_count;		 /* holder→sender direct GRANTED ship */
-	pg_atomic_uint64 block_x_transfer_ship_count;		 /* spec-5.2 D11 path A X-transfer ship+release */
-	pg_atomic_uint64 block_x_self_ship_count;			 /* spec-5.2 D11 path B master==holder self-ship X */
+	pg_atomic_uint64 block_forward_sent_count;	   /* master→holder FORWARD emitted */
+	pg_atomic_uint64 block_forward_received_count; /* holder received FORWARD */
+	pg_atomic_uint64 block_from_holder_ship_count; /* holder→sender direct GRANTED ship */
+	pg_atomic_uint64 block_x_transfer_ship_count;  /* spec-5.2 D11 path A X-transfer ship+release */
+	pg_atomic_uint64 block_x_self_ship_count; /* spec-5.2 D11 path B master==holder self-ship X */
 	pg_atomic_uint64 block_forward_holder_evicted_count; /* holder evict race DENIED */
 	pg_atomic_uint64 s_holders_bitmap_redirect_count;	 /* master chose forward over fallback */
 	pg_atomic_uint64 master_holder_lifecycle_count;		 /* HC110 update events */
@@ -1824,7 +1824,7 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 			if (cluster_bufmgr_copy_block_for_gcs(req->tag, &page_lsn, block_buf)) {
 				XLogRecPtr drop_lsn = InvalidXLogRecPtr;
 
-				(void) cluster_bufmgr_drop_block_for_gcs_no_wire(req->tag, &drop_lsn);
+				(void)cluster_bufmgr_drop_block_for_gcs_no_wire(req->tag, &drop_lsn);
 				cluster_pcm_lock_master_grant_x_to(req->tag, req->sender_node, page_lsn);
 				status = GCS_BLOCK_REPLY_GRANTED;
 				block_payload = block_buf;
@@ -2480,7 +2480,7 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 								  : (uint8)GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER;
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_from_holder_ship_count, 1);
 
-					/*
+				/*
 					 * PGRAC: spec-5.2 D11 — X-transfer (writer-transfer-revoke).
 					 * The local master forwarded an N→X request with IsXTransfer
 					 * set: it needs X for a local writer while we (a REMOTE node)
@@ -2496,11 +2496,11 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 					 * to-the-invalidating-master deadlock.  The master records
 					 * itself as the new X holder on install.
 					 */
-					if (GcsBlockForwardPayloadIsXTransfer(fwd)
-						&& hdr->status == (uint8)GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER) {
-						XLogRecPtr drop_lsn = InvalidXLogRecPtr;
+				if (GcsBlockForwardPayloadIsXTransfer(fwd)
+					&& hdr->status == (uint8)GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER) {
+					XLogRecPtr drop_lsn = InvalidXLogRecPtr;
 
-						/*
+					/*
 						 * spec-5.2 D11 (BLOCKER A resolved): drop our local copy
 						 * with NO GCS release wire.  We run in the §3.5 IC-dispatch
 						 * (LMON) context, which has no backend slot
@@ -2522,9 +2522,9 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 						 * GRD state to transition — clearing the BufferDesc
 						 * pcm_state to N inside the helper is the full release.
 						 */
-						(void)cluster_bufmgr_drop_block_for_gcs_no_wire(fwd->tag, &drop_lsn);
-						pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_x_transfer_ship_count, 1);
-					}
+					(void)cluster_bufmgr_drop_block_for_gcs_no_wire(fwd->tag, &drop_lsn);
+					pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_x_transfer_ship_count, 1);
+				}
 			}
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_ship_bytes_total, GCS_BLOCK_DATA_SIZE);
 		}
