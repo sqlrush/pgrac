@@ -139,7 +139,8 @@ typedef struct ClusterGcsBlockShared {
 	pg_atomic_uint64 block_forward_sent_count;			 /* master→holder FORWARD emitted */
 	pg_atomic_uint64 block_forward_received_count;		 /* holder received FORWARD */
 	pg_atomic_uint64 block_from_holder_ship_count;		 /* holder→sender direct GRANTED ship */
-	pg_atomic_uint64 block_x_transfer_ship_count;		 /* spec-5.2 D11 X-transfer ship+release */
+	pg_atomic_uint64 block_x_transfer_ship_count;		 /* spec-5.2 D11 path A X-transfer ship+release */
+	pg_atomic_uint64 block_x_self_ship_count;			 /* spec-5.2 D11 path B master==holder self-ship X */
 	pg_atomic_uint64 block_forward_holder_evicted_count; /* holder evict race DENIED */
 	pg_atomic_uint64 s_holders_bitmap_redirect_count;	 /* master chose forward over fallback */
 	pg_atomic_uint64 master_holder_lifecycle_count;		 /* HC110 update events */
@@ -276,6 +277,7 @@ cluster_gcs_block_shmem_init(void)
 		pg_atomic_init_u64(&ClusterGcsBlock->block_forward_received_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->block_from_holder_ship_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->block_x_transfer_ship_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->block_x_self_ship_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->block_forward_holder_evicted_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->s_holders_bitmap_redirect_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->master_holder_lifecycle_count, 0);
@@ -1790,6 +1792,48 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 		PcmLockMode pre_state;
 		uint64 current_lsn;
 		int32 x_holder;
+
+		/*
+		 * PGRAC: spec-5.2 D11 path B — master==holder==self self-ship X to a
+		 * REMOTE requester (writer-transfer-revoke).  THIS node is both the GCS
+		 * master and the X holder; the requester wants X.  We ship our current
+		 * image and revoke our own X, then record the requester as the new X
+		 * holder.  Must run BEFORE the HG7 other-live-holder fail-closed below,
+		 * which counts self as an "other holder" and would DENY.  Single-phase:
+		 * reply GRANTED with the image; the requester installs + takes X off the
+		 * GRANTED reply with no post-install ACK (we switch ownership here).
+		 *
+		 * 8.A: copy image -> drop self copy NO-WIRE (XLogFlush + InvalidateBuffer;
+		 * we run in the §3.5 / LMON IC context with no backend slot, and as the
+		 * master there is no peer to notify) -> record requester as X holder.
+		 * Dropping self before recording the requester means there is never a
+		 * two-X window; the PI watermark advances to the shipped page_lsn.
+		 * Respects the spec-2.36 x-forward injection skip (test fallback).
+		 */
+		if (cluster_pcm_lock_query(req->tag) == PCM_LOCK_MODE_X
+			&& cluster_pcm_master_holder_node_by_tag(req->tag) == cluster_node_id
+			&& req->sender_node != cluster_node_id
+			&& !cluster_injection_should_skip("cluster-gcs-block-x-forward-master-side")) {
+			uint64 pathb_epoch = cluster_epoch_get_current();
+
+			if (req->epoch < pathb_epoch) {
+				gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_EPOCH_STALE,
+									 InvalidXLogRecPtr, NULL);
+				return;
+			}
+			if (cluster_bufmgr_copy_block_for_gcs(req->tag, &page_lsn, block_buf)) {
+				XLogRecPtr drop_lsn = InvalidXLogRecPtr;
+
+				(void) cluster_bufmgr_drop_block_for_gcs_no_wire(req->tag, &drop_lsn);
+				cluster_pcm_lock_master_grant_x_to(req->tag, req->sender_node, page_lsn);
+				status = GCS_BLOCK_REPLY_GRANTED;
+				block_payload = block_buf;
+				if (ClusterGcsBlock != NULL)
+					pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_x_self_ship_count, 1);
+				goto build_and_send_reply;
+			}
+			/* evict race — fall through to the normal HG7 / master flow. */
+		}
 
 		/*
 		 * PGRAC: spec-4.7a D4 / HG7 — bounded fail-closed for cross-node X

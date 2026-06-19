@@ -832,6 +832,55 @@ cluster_pcm_lock_master_take_x_after_transfer(BufferTag tag, XLogRecPtr page_lsn
 	pg_atomic_write_u32(&entry->master_state, (uint32) PCM_STATE_X);
 	entry->x_holder_node = cluster_node_id;
 	pg_atomic_write_u32(&entry->s_holders_bitmap, 0);
+	/* HC110: keep master_holder coherent with the X holder so subsequent
+	 * forward/ship decisions (and spec-5.2 D11 path-B detection of
+	 * master==holder==self) read the right holder identity. */
+	pcm_master_holder_set_node(entry, cluster_node_id);
+	if ((uint64) page_lsn > entry->pi_watermark_lsn)
+		entry->pi_watermark_lsn = (uint64) page_lsn;
+	LWLockRelease(&entry->entry_lock.lock);
+}
+
+/*
+ * PGRAC: spec-5.2 D11 path B — remote-master self-ship writer-transfer-revoke.
+ *
+ *	THIS node is BOTH the GCS master AND the X holder for the block, and a
+ *	REMOTE requester wants X.  We ship our current image to the requester and
+ *	revoke our own X (the caller dropped our local copy no-wire before calling
+ *	this — Rule 8.A no-stale-flush), then record the REQUESTER as the new X
+ *	holder on the authoritative master GRD entry: X held by `requester_node`,
+ *	no S holders, master_holder follows, PI watermark advanced to the shipped
+ *	page_lsn.  Single-phase (the requester installs the shipped image and takes
+ *	X off the GRANTED reply with no post-install ACK), so we switch ownership
+ *	here.  The previous holder (self) dropped its copy BEFORE this point, so
+ *	there is never a two-X window — at most a brief no-holder window, which is
+ *	safe.  Mirrors cluster_pcm_lock_master_take_x_after_transfer but the new X
+ *	holder is the remote requester rather than self.
+ */
+void
+cluster_pcm_lock_master_grant_x_to(BufferTag tag, int32 requester_node, XLogRecPtr page_lsn)
+{
+	struct GrdEntry *entry;
+
+	if (cluster_pcm_htab == NULL)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("PCM lock manager disabled (cluster.pcm_grd_max_entries=0)")));
+	if (requester_node < 0 || requester_node >= 32)
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("cluster_pcm_lock_master_grant_x_to: requester_node %d out of range",
+							   requester_node)));
+
+	entry = pcm_get_or_create_entry(tag);
+	if (entry == NULL)
+		ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY),
+						errmsg("cluster_pcm_lock_master_grant_x_to: PCM GRD HTAB FULL (cap=%d)",
+							   pcm_grd_effective)));
+
+	pcm_entry_lock_exclusive(entry);
+	pg_atomic_write_u32(&entry->master_state, (uint32) PCM_STATE_X);
+	entry->x_holder_node = requester_node;
+	pg_atomic_write_u32(&entry->s_holders_bitmap, 0);
+	pcm_master_holder_set_node(entry, requester_node);
 	if ((uint64) page_lsn > entry->pi_watermark_lsn)
 		entry->pi_watermark_lsn = (uint64) page_lsn;
 	LWLockRelease(&entry->entry_lock.lock);

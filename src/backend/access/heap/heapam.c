@@ -3234,8 +3234,15 @@ l1:
 		 */
 		if (cluster_heap_writer_wait_failclosed(relation, buffer, &tp, xwait, infomask))
 		{
-			/* remote lock-only holder terminal -> fall through to the
-			 * LOCKED_ONLY -> TM_Ok determination below. */
+			/*
+			 * Remote LOCK-ONLY holder terminal -> its row lock is released.
+			 * Mark the released xmax invalid so the TM_Ok determination below
+			 * sees an unlocked tuple and the delete's new xmax is a single xid,
+			 * not a node-local MultiXact a peer cannot read (AD-012).  Then fall
+			 * through to the LOCKED_ONLY / XMAX_INVALID -> TM_Ok path below.
+			 */
+			HeapTupleSetHintBits(tp.t_data, buffer, HEAP_XMAX_INVALID,
+								 InvalidTransactionId);
 		}
 		else
 #endif
@@ -4040,6 +4047,16 @@ l2:
 		 */
 		if (cluster_heap_writer_wait_failclosed(relation, buffer, &oldtup, xwait, infomask))
 		{
+			/*
+			 * Remote LOCK-ONLY holder is terminal -> its row lock is released.
+			 * Mark the released xmax invalid (mirrors native UpdateXmaxHintBits
+			 * for a gone lock-only locker) so compute_new_xmax_infomask below
+			 * treats the tuple as unlocked and does NOT fold the released remote
+			 * lock into a node-local MultiXact that a peer cannot read
+			 * (MultiXact ids alias across instances, like raw xids — AD-012).
+			 */
+			HeapTupleSetHintBits(oldtup.t_data, buffer, HEAP_XMAX_INVALID,
+								 InvalidTransactionId);
 			checked_lockers = true;
 			locker_remains = false;
 			can_continue = true;

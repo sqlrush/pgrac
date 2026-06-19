@@ -272,6 +272,11 @@ extern void cluster_pcm_lock_release_buffer_for_eviction(BufferDesc *buf, PcmLoc
 /* PGRAC: spec-5.2 D11 — local master records self as new X holder after a
  * writer-transfer (the remote holder shipped + released its X). */
 extern void cluster_pcm_lock_master_take_x_after_transfer(BufferTag tag, XLogRecPtr page_lsn);
+/* PGRAC: spec-5.2 D11 path B — master==holder==self ships its X image to a
+ * remote requester and records the requester as the new X holder (single-phase
+ * writer-transfer-revoke; caller drops self's copy no-wire before calling). */
+extern void cluster_pcm_lock_master_grant_x_to(BufferTag tag, int32 requester_node,
+											   XLogRecPtr page_lsn);
 
 /*
  * PGRAC: spec-2.35 D3 (HC110) — master_holder lookup for forward routing.
