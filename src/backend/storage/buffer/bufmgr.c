@@ -6429,24 +6429,39 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr *out_page_ls
 		page_lsn = PageGetLSN(page);
 	}
 
-	/*
-	 * Clear the cache-residency mode under the header lock so the
-	 * InvalidateBuffer eviction hook below sees PCM_STATE_N and skips the
-	 * remote-master release wire (see banner).  InvalidateBuffer itself
-	 * also clears this field after the (now skipped) hook.
-	 */
-	buf->pcm_state = (uint8) PCM_STATE_N;
-
 	UnlockBufHdr(buf, buf_state);
 	LWLockRelease(partition_lock);
 
 	if (out_page_lsn != NULL)
 		*out_page_lsn = page_lsn;
 
+	/*
+	 * WAL-before-share: the image already shipped to the new holder carries
+	 * page_lsn, so its WAL must be durable before that holder relies on it.
+	 * Flush WAL only -- never the (now stale) data page (Rule 8.A
+	 * no-stale-flush); InvalidateBuffer below discards the dirty buffer.
+	 */
 	if (was_dirty && !XLogRecPtrIsInvalid(page_lsn))
 		XLogFlush(page_lsn);
 
-	InvalidateBuffer(buf);
+	/*
+	 * InvalidateBuffer requires the buffer header spinlock held at ENTRY and
+	 * releases it internally (it Assert()s BM_LOCKED).  We dropped the header
+	 * lock for the (blocking) XLogFlush above, so re-lock and re-validate the
+	 * buffer still maps our tag; if it was evicted / reused meanwhile there is
+	 * nothing to drop.  Clear the cache-residency mode under this lock so
+	 * InvalidateBuffer's eviction hook sees PCM_STATE_N and skips the remote-
+	 * master release wire (the §3.5 LMON context has no backend slot to send
+	 * one -- BLOCKER A).
+	 */
+	buf_state = LockBufHdr(buf);
+	if (!BufferTagsEqual(&buf->tag, &tag) || (buf_state & BM_VALID) == 0)
+	{
+		UnlockBufHdr(buf, buf_state);
+		return false;
+	}
+	buf->pcm_state = (uint8) PCM_STATE_N;
+	InvalidateBuffer(buf);		/* releases the header spinlock */
 
 	return true;
 }
