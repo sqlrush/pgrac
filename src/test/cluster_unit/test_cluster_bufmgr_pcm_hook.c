@@ -347,6 +347,14 @@ cluster_gcs_send_block_request_and_wait(struct BufferDesc *buf pg_attribute_unus
 	abort();
 }
 
+/* spec-5.2 D2 sub-case B stub: local-master read-image forward unreachable. */
+bool
+cluster_gcs_local_master_read_image_and_wait(struct BufferDesc *buf pg_attribute_unused(),
+											 int32 holder_node pg_attribute_unused())
+{
+	abort();
+}
+
 /* spec-2.35 D3 stub for HC110 master_holder lifecycle counter bump. */
 void
 cluster_gcs_block_bump_master_holder_lifecycle(void)

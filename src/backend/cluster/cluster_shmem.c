@@ -87,6 +87,7 @@
 #include "cluster/cluster_tt_local.h"		 /* cluster_tt_local_shmem_register (spec-3.1 D5) */
 #include "cluster/cluster_tt_slot.h"		 /* cluster_tt_slot_shmem_register (spec-3.4b D3) */
 #include "cluster/cluster_tt_status_hint.h" /* cluster_tt_status_hint_shmem_register (spec-3.2 D3) */
+#include "cluster/cluster_tx_enqueue.h"		/* cluster_tx_enqueue_shmem_register (spec-5.2 D4/D6) */
 #include "cluster/cluster_subtrans.h"		/* cluster_subtrans_shmem_register (spec-3.5 D5) */
 #include "cluster/cluster_multixact.h"		/* cluster_multixact_shmem_register (spec-3.6 D2) */
 #include "cluster/cluster_undo_record_api.h" /* cluster_undo_record_shmem_register (spec-3.7 D5) */
@@ -457,6 +458,10 @@ cluster_init_shmem_module(void)
 	 */
 	if (cluster_shmem_lookup_region("pgrac cluster tt status hint outbound") == NULL)
 		cluster_tt_status_hint_shmem_register();
+
+	/* spec-5.2 D4/D6: cross-node TX enqueue completion-wait waiter table. */
+	if (cluster_shmem_lookup_region("pgrac cluster tx enqueue") == NULL)
+		cluster_tx_enqueue_shmem_register();
 
 	/*
 	 * PGRAC spec-3.5 D5:  register cluster_subtrans shmem (counter-only).

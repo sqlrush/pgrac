@@ -476,6 +476,10 @@ int cluster_gcs_block_retransmit_initial_backoff_ms = 100;
  * reverts to per-LockBuffer remote requests + X released on every unlock (the
  * spec-2.33 behavior) — an escape hatch if a stale-grant edge is ever found. */
 bool cluster_gcs_block_local_cache = true;
+/* spec-5.2 D4: cross-node TX enqueue completion wait.  On (default) makes a
+ * remote row-lock conflict block until the holder completes; off reverts to
+ * the spec-3.4d fail-closed (53R98) honest degradation. */
+bool cluster_tx_enqueue_wait_enabled = true;
 int cluster_gcs_block_dedup_max_entries = 1024;
 
 /*
@@ -2230,6 +2234,18 @@ cluster_init_guc(void)
 					 "round-trip storm.  Off reverts to the spec-2.33 per-acquire "
 					 "request behavior (escape hatch).  spec-4.7a D2.  PGC_SUSET."),
 		&cluster_gcs_block_local_cache, true, PGC_SUSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("cluster.tx_enqueue_wait",
+							 gettext_noop("Block on a remote row lock until the holder completes."),
+							 gettext_noop("When on (default), a backend that conflicts with a row "
+										  "lock held by a transaction on another node blocks in a "
+										  "cross-node TX enqueue completion wait until the holder "
+										  "commits/aborts (or cluster.ges_request_timeout_ms "
+										  "elapses), then re-judges.  Off reverts to the spec-3.4d "
+										  "fail-closed (SQLSTATE 53R98) honest degradation.  "
+										  "spec-5.2 D4.  PGC_SUSET."),
+							 &cluster_tx_enqueue_wait_enabled, true, PGC_SUSET, 0, NULL, NULL,
+							 NULL);
 
 	DefineCustomIntVariable(
 		"cluster.gcs_block_retransmit_initial_backoff_ms",

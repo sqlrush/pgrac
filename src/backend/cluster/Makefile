@@ -130,6 +130,7 @@ OBJS = \
 	cluster_tt_local.o \
 	cluster_tt_status.o \
 	cluster_tt_status_hint.o \
+	cluster_tx_enqueue.o \
 	cluster_subtrans.o \
 	cluster_multixact.o \
 	cluster_visibility_inject.o \

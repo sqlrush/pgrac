@@ -84,6 +84,7 @@
 #include "cluster/cluster_itl.h"		/* alloc_or_reuse_slot / stamp_active */
 #include "cluster/cluster_itl_slot.h"	/* CLUSTER_ITL_SLOT_UNALLOCATED */
 #include "cluster/cluster_tt_status.h" /* spec-3.14 D2b writer wait bridge */
+#include "cluster/cluster_tx_enqueue.h" /* spec-5.2 D4 cross-node TX enqueue wait */
 #include "cluster/cluster_visibility_resolve.h" /* spec-3.14 D5b surely-dead guard */
 #include "cluster/cluster_itl_touch.h"	/* xact-local touch list */
 #include "cluster/cluster_scn.h"		/* cluster_scn_advance / SCN */
@@ -5702,14 +5703,39 @@ l3:
 								switch (wait_policy)
 								{
 									case LockWaitBlock:
-										ereport(ERROR,
-												(errcode(ERRCODE_CLUSTER_REMOTE_ROW_LOCK_WAIT_NOT_SUPPORTED),
-												 errmsg("cannot wait for remote row lock held by transaction %u on node %u",
-														xwait, cref.origin_node_id),
-												 errhint("Cross-node block-wait is not supported in spec-3.4d;"
-														 " application should retry, use SKIP LOCKED, or wait for"
-														 " spec-5.2 GES TX to ship.")));
-										break;
+
+										/*
+										 * PGRAC: spec-5.2 D4 — cross-node TX
+										 * enqueue completion wait.  Block until
+										 * the remote holder commits/aborts (or
+										 * the finite timeout), then re-judge.
+										 * ckey is the holder's full 24B TT key
+										 * (origin_node_id = the HOLDER node);
+										 * never the generic resid encoder which
+										 * would key on the local node (G1).
+										 */
+										if (!cluster_tx_enqueue_wait_enabled)
+											ereport(ERROR,
+													(errcode(ERRCODE_CLUSTER_REMOTE_ROW_LOCK_WAIT_NOT_SUPPORTED),
+													 errmsg("cannot wait for remote row lock held by transaction %u on node %u",
+															xwait, cref.origin_node_id),
+													 errhint("cluster.tx_enqueue_wait is off; retry, use SKIP"
+															 " LOCKED, or enable it for cross-node TX waits.")));
+										{
+											ClusterTxwResult txw;
+
+											txw = cluster_tx_enqueue_wait(&ckey,
+																		  cluster_ges_request_timeout_ms);
+											if (txw == CLUSTER_TXW_TIMEOUT)
+												ereport(ERROR,
+														(errcode(ERRCODE_CLUSTER_GES_TIMEOUT),
+														 errmsg("timed out waiting for remote row lock held by transaction %u on node %u",
+																xwait, cref.origin_node_id),
+														 errhint("Holder did not complete within"
+																 " cluster.ges_request_timeout_ms; retry.")));
+										}
+										/* RESOLVED / DEAD_HOLDER → re-read xmax. */
+										goto l3;
 									case LockWaitSkip:
 										result = TM_WouldBlock;
 										LockBuffer(*buffer, BUFFER_LOCK_EXCLUSIVE);

@@ -399,6 +399,12 @@ void
 cluster_tt_status_hint_shmem_register(void)
 {}
 
+/* spec-5.2 D4/D6 stub: cluster_init_shmem_module also calls
+ * cluster_tx_enqueue_shmem_register. */
+void
+cluster_tx_enqueue_shmem_register(void)
+{}
+
 /* spec-3.2 D5b stub: cluster_init_shmem_module also calls
  * cluster_visibility_inject_shmem_register. */
 void

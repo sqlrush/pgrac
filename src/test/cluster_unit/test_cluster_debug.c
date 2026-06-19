@@ -593,6 +593,12 @@ cluster_gcs_get_lost_write_avoid_count(void)
 {
 	return 0;
 }
+/* spec-5.2 D2 stub: X-holder read-image ship counter accessor. */
+uint64
+cluster_gcs_get_cf_xheld_read_ship_count(void)
+{
+	return 0;
+}
 
 /* spec-4.7 D6 stubs: 8 NEW GCS/PCM warm-recovery counter accessors. */
 uint64
