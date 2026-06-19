@@ -11,7 +11,7 @@
 #
 # 14 surface:
 #   L1  catversion bump 202605450 → 202605460
-#   L2  pg_cluster_state sinval category has 15 keys (D8 +3 fanout + D9 +3 ack)
+#   L2  pg_cluster_state sinval category has 16 keys (D8 +3 fanout + D9 +3 ack + D1 applied)
 #   L3  3 NEW GUC defaults (sinval_ack_mode=peer_enqueued / timeout 5000 / slots 256)
 #   L4  pg_stat_cluster_wait_events count == 97 (spec-4.2 +2 registry I/O)
 #   L5  ClusterSinvalAckWait / ClusterSinvalAckSend / ClusterSinvalAckReceive visible
@@ -55,12 +55,12 @@ ok($pair->node0->safe_psql('postgres', q{SELECT count(*) FROM pg_cluster_shmem})
 	'L1 pg_cluster_shmem includes spec-2.39 ack regions (>=33; catversion 202605460)');
 
 # ============================================================
-# L2: pg_cluster_state sinval category has 15 keys.
+# L2: pg_cluster_state sinval category has 16 keys.
 # ============================================================
 is($pair->node0->safe_psql('postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='sinval'}),
-	'15',
-	'L2 sinval category has 15 keys (spec-2.39 D8 +3 fanout + D9 +3 ack)');
+	'16',
+	'L2 sinval category has 16 keys (spec-2.39 D8 +3 fanout + D9 +3 ack + spec-5.2 D1 smgr_inval_applied_count)');
 
 # ============================================================
 # L3: 3 NEW GUC defaults.

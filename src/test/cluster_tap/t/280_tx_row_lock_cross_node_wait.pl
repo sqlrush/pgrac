@@ -120,7 +120,21 @@ my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	'tx_row_wait',
 	quorum_voting_disks => 3,
 	shared_data         => 1,
-	extra_conf          => [ 'autovacuum = off', 'cluster.ges_request_timeout_ms = 30000' ]);
+	extra_conf          => [
+		'autovacuum = off',
+		'cluster.ges_request_timeout_ms = 30000',
+		# CI runners execute many shards in parallel; under CPU pressure a
+		# node's CSSD heartbeat can be starved past the default 3000ms
+		# misscount (1000ms interval x 3 deadband), so a perfectly healthy
+		# peer is falsely declared DEAD and the in-flight cross-node UPDATE is
+		# aborted by reconfiguration BEFORE it can block in the TX enqueue
+		# wait (observed: "peer 0 -> DEAD (elapsed 3707 ms > 3000 ms)").  Widen
+		# the misscount to 20s (2000ms x 10) so the lock-hold window survives
+		# scheduling jitter.  This test exercises the wait path, not CSSD death
+		# detection (covered by t/085 / the reconfig suite).
+		'cluster.cssd_heartbeat_interval_ms = 2000',
+		'cluster.cssd_dead_deadband_factor = 10',
+	]);
 $pair->start_pair;
 usleep(3_000_000);
 

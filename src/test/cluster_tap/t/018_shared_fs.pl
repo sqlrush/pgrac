@@ -142,8 +142,8 @@ is($node->safe_psql(
 		'postgres',
 		q{SELECT string_agg(key, ',' ORDER BY key) FROM pg_cluster_state
 		   WHERE category = 'shared_fs'}),
-	'active_backend,registered_backends,smgr_active_relations,smgr_user_relations',
-	'L10 pg_cluster_state.shared_fs has all 4 expected keys (1.1 + 1.2)');
+	'active_backend,registered_backends,smgr_active_relations,smgr_inval_bcast_sent_count,smgr_user_relations',
+	'L10 pg_cluster_state.shared_fs has all 5 expected keys (1.1 + 1.2 + spec-5.2 D1 smgr_inval_bcast_sent_count)');
 
 is($node->safe_psql(
 		'postgres',

@@ -98,19 +98,19 @@ is($pair->node0->safe_psql('postgres',
 
 
 # ============================================================
-# L4-L5: sinval category 9 keys + counters = 0.
+# L4-L5: sinval category 16 keys + counters = 0.
 # ============================================================
 is($pair->node0->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='sinval'}),
-   '15',
-   'L4 node0 pg_cluster_state.sinval category has 15 keys (spec-2.39 D8/D9 +6 counters)');
+   '16',
+   'L4 node0 pg_cluster_state.sinval category has 16 keys (spec-2.39 D8/D9 +6 + spec-5.2 D1 smgr_inval_applied_count)');
 
 is($pair->node1->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='sinval'}),
-   '15',
-   'L4 node1 pg_cluster_state.sinval category has 15 keys');
+   '16',
+   'L4 node1 pg_cluster_state.sinval category has 16 keys');
 
 for my $node ($pair->node0, $pair->node1)
 {
