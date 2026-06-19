@@ -475,6 +475,15 @@ cluster_gcs_local_master_read_image_and_wait(struct BufferDesc *buf pg_attribute
 	abort();
 }
 
+/* spec-5.2 D11 stub: same rationale — the pcm_lock unit fixtures never drive a
+ * local-master X-transfer, so abort if reached. */
+bool
+cluster_gcs_local_master_x_transfer_and_wait(struct BufferDesc *buf pg_attribute_unused(),
+											 int32 holder_node pg_attribute_unused())
+{
+	abort();
+}
+
 /* spec-2.35 D3 stub:  HC110 master_holder lifecycle counter bump invoked
  * from cluster_pcm_transition_apply helpers.  Standalone fixture has no
  * ClusterGcsBlockShared; vacuous no-op. */

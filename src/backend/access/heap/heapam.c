@@ -3004,54 +3004,79 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 	ckey.cluster_epoch = cref.cluster_epoch;
 	ckey.local_xid = xwait;
 
-	if (!cluster_tt_status_lookup_exact(&ckey, &cres) || !cres.authoritative
-		|| cres.status == CLUSTER_TT_STATUS_UNKNOWN)
-		ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-						errmsg("cluster TT status unknown for remote writer %u", xwait),
-						errhint("Remote commit_scn not yet propagated; retry or abort.")));
+	/*
+	 * PGRAC: spec-5.2 §3.2 C4 refine (user-approved 2026-06-19, Rule 8.A-safe).
+	 *
+	 * We already hold a VALID remote ITL ref here (cref.local_xid == xwait;
+	 * recycled / placeholder / local refs were excluded above), which is
+	 * durable on-page proof the remote holder still holds this row.  So any
+	 * NON-terminal TT status — IN_PROGRESS / SUBCOMMITTED, or even an
+	 * unresolved UNKNOWN / not-found / not-yet-authoritative result (the
+	 * holder's in-progress hint has not propagated to this node yet) — means
+	 * the holder is still running, so we WAIT for it to complete; we do not
+	 * fail closed on UNKNOWN once the ref itself is valid (the original frozen
+	 * C4 fail-closed-on-UNKNOWN was written for the pre-wait world and would
+	 * make the wait unreachable, since a live remote lock is UNKNOWN until its
+	 * hint propagates).  Only a confirmed authoritative-terminal status
+	 * (COMMITTED / ABORTED / CLEANED_OUT) lets the native path resume.  We
+	 * never decide visibility here, only block until the holder is terminal;
+	 * the dead-holder / never-propagated case is bounded by the finite wait
+	 * timeout (53R70).  The remote MultiXact branch up top stays fail-closed
+	 * (53R9H) — it only has a marker_origin, not a full TT key (F3 / Rule 8.A).
+	 *
+	 * When cluster.tx_enqueue_wait is off we keep the pre-5.2 honest codes:
+	 * 53R97 for an unresolved holder, 53R98 / 53R9H for a known in-progress
+	 * holder (lock-only / writer).
+	 */
+	{
+		bool		tt_found = cluster_tt_status_lookup_exact(&ckey, &cres);
+		bool		tt_resolved = tt_found && cres.authoritative;
+		bool		tt_terminal = tt_resolved
+			&& (cres.status == CLUSTER_TT_STATUS_COMMITTED
+				|| cres.status == CLUSTER_TT_STATUS_ABORTED
+				|| cres.status == CLUSTER_TT_STATUS_CLEANED_OUT);
 
-	if (cres.status == CLUSTER_TT_STATUS_IN_PROGRESS
-		|| cres.status == CLUSTER_TT_STATUS_SUBCOMMITTED) {
-		/*
-		 * PGRAC: spec-5.2 D5 — cross-node TX enqueue completion wait for a
-		 * remote writer.  Both lock-only and single-writer conflicts have a
-		 * full TT key here (ckey above), so they can wait.  The remote
-		 * MultiXact branch up top stays fail-closed (53R9H) — it only has a
-		 * marker_origin, not a full TT key (F3 / Rule 8.A).
-		 *
-		 * After the holder completes, restore the buffer content lock and
-		 * return; the caller's native XactLockTableWait on the now-terminal
-		 * remote xid is a no-op, and its post-wait recheck sees the new state.
-		 */
-		if (cluster_tx_enqueue_wait_enabled) {
-			ClusterTxwResult txw;
+		if (!tt_terminal) {
+			if (cluster_tx_enqueue_wait_enabled) {
+				ClusterTxwResult txw;
 
-			txw = cluster_tx_enqueue_wait(&ckey, cluster_ges_request_timeout_ms);
-			if (txw == CLUSTER_TXW_TIMEOUT) {
-				cluster_vis_bump_vis_conflict_failclosed_count();
-				ereport(ERROR,
-						(errcode(ERRCODE_CLUSTER_GES_TIMEOUT),
-						 errmsg("timed out waiting for remote writer %u on node %u",
-								xwait, cref.origin_node_id),
-						 errhint("Holder did not complete within"
-								 " cluster.ges_request_timeout_ms; retry.")));
+				txw = cluster_tx_enqueue_wait(&ckey, cluster_ges_request_timeout_ms);
+				if (txw == CLUSTER_TXW_TIMEOUT) {
+					cluster_vis_bump_vis_conflict_failclosed_count();
+					ereport(ERROR,
+							(errcode(ERRCODE_CLUSTER_GES_TIMEOUT),
+							 errmsg("timed out waiting for remote writer %u on node %u",
+									xwait, cref.origin_node_id),
+							 errhint("Holder did not complete within"
+									 " cluster.ges_request_timeout_ms; retry.")));
+				}
+				/*
+				 * Holder now terminal: restore the buffer content lock and
+				 * return; the caller's native XactLockTableWait on the
+				 * now-terminal remote xid is a no-op and its post-wait recheck
+				 * sees the new state.
+				 */
+				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+				return;
 			}
-			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
-			return;
-		}
 
-		/* cluster.tx_enqueue_wait off: honest fail-closed (spec-3.4d). */
-		cluster_vis_bump_vis_conflict_failclosed_count();
-		if (HEAP_XMAX_IS_LOCKED_ONLY(saved_infomask))
-			ereport(ERROR, (errcode(ERRCODE_CLUSTER_REMOTE_ROW_LOCK_WAIT_NOT_SUPPORTED),
-							errmsg("cannot wait for remote row lock held by transaction %u on node %u",
+			/* cluster.tx_enqueue_wait off: honest fail-closed (spec-3.4d). */
+			cluster_vis_bump_vis_conflict_failclosed_count();
+			if (!tt_resolved || cres.status == CLUSTER_TT_STATUS_UNKNOWN)
+				ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+								errmsg("cluster TT status unknown for remote writer %u", xwait),
+								errhint("Remote commit_scn not yet propagated; retry or abort.")));
+			if (HEAP_XMAX_IS_LOCKED_ONLY(saved_infomask))
+				ereport(ERROR, (errcode(ERRCODE_CLUSTER_REMOTE_ROW_LOCK_WAIT_NOT_SUPPORTED),
+								errmsg("cannot wait for remote row lock held by transaction %u on node %u",
+									   xwait, cref.origin_node_id),
+								errhint("cluster.tx_enqueue_wait is off; retry, use SKIP LOCKED, or "
+										"enable it for cross-node TX waits.")));
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
+							errmsg("cross-node write conflict: remote writer %u on node %u still running",
 								   xwait, cref.origin_node_id),
-							errhint("cluster.tx_enqueue_wait is off; retry, use SKIP LOCKED, or "
-									"enable it for cross-node TX waits.")));
-		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
-						errmsg("cross-node write conflict: remote writer %u on node %u still running",
-							   xwait, cref.origin_node_id),
-						errhint("cluster.tx_enqueue_wait is off; retry the transaction.")));
+							errhint("cluster.tx_enqueue_wait is off; retry the transaction.")));
+		}
 	}
 
 	/* Remote writer already terminal (committed/aborted): restore the buffer
@@ -5707,6 +5732,8 @@ l3:
 						ClusterTTStatusKey ckey;
 						ClusterTTStatusResult cres;
 						bool		tt_found;
+						bool		tt_resolved;
+						bool		tt_terminal;
 
 						memset(&ckey, 0, sizeof(ckey));
 						ckey.origin_node_id = cref.origin_node_id;
@@ -5715,79 +5742,93 @@ l3:
 						ckey.cluster_epoch = cref.cluster_epoch;
 						ckey.local_xid = xwait;
 
+						/*
+						 * PGRAC: spec-5.2 §3.2 C4 refine (user-approved
+						 * 2026-06-19, Rule 8.A-safe).  have_remote_ref is a
+						 * VALID remote lock-only ITL ref keyed on xwait
+						 * (cluster_itl_find_lock_tt_ref_by_xmax matches
+						 * slot->xid == xwait and rejects recycled/ambiguous
+						 * slots), i.e. durable on-page proof the remote holder
+						 * still holds this row lock.  So any NON-terminal TT
+						 * status — IN_PROGRESS / SUBCOMMITTED, or an unresolved
+						 * UNKNOWN / not-found / not-yet-authoritative result
+						 * (the holder's in-progress hint has not reached this
+						 * node yet) — means we must WAIT for the holder to
+						 * complete, never fail closed on UNKNOWN (the frozen C4
+						 * fail-closed-on-UNKNOWN was pre-wait-world and would
+						 * make the wait unreachable for a live remote lock).
+						 * Only a confirmed authoritative-terminal status
+						 * releases us to the native path.  We never decide
+						 * visibility here; dead-holder is bounded by the finite
+						 * wait timeout (53R70).  When cluster.tx_enqueue_wait is
+						 * off we keep the pre-5.2 honest codes (53R97 unresolved
+						 * / 53R98 known-in-progress).
+						 *
+						 * ckey is the holder's full 24B TT key (origin_node_id =
+						 * the HOLDER node); never the generic resid encoder
+						 * which would key on the local node (G1).
+						 */
 						tt_found = cluster_tt_status_lookup_exact(&ckey, &cres);
-						if (!tt_found || !cres.authoritative
-							|| cres.status == CLUSTER_TT_STATUS_UNKNOWN)
-							ereport(ERROR,
-									(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-									 errmsg("cluster TT status unknown for remote lock_xid %u",
-											xwait)));
+						tt_resolved = tt_found && cres.authoritative;
+						tt_terminal = tt_resolved
+							&& (cres.status == CLUSTER_TT_STATUS_COMMITTED
+								|| cres.status == CLUSTER_TT_STATUS_ABORTED
+								|| cres.status == CLUSTER_TT_STATUS_CLEANED_OUT);
 
-						switch (cres.status)
+						if (!tt_terminal)
 						{
-							case CLUSTER_TT_STATUS_IN_PROGRESS:
-							case CLUSTER_TT_STATUS_SUBCOMMITTED:
-								cluster_itl_bump_remote_row_lock_fail_closed_count();
-								switch (wait_policy)
-								{
-									case LockWaitBlock:
-
-										/*
-										 * PGRAC: spec-5.2 D4 — cross-node TX
-										 * enqueue completion wait.  Block until
-										 * the remote holder commits/aborts (or
-										 * the finite timeout), then re-judge.
-										 * ckey is the holder's full 24B TT key
-										 * (origin_node_id = the HOLDER node);
-										 * never the generic resid encoder which
-										 * would key on the local node (G1).
-										 */
-										if (!cluster_tx_enqueue_wait_enabled)
+							cluster_itl_bump_remote_row_lock_fail_closed_count();
+							switch (wait_policy)
+							{
+								case LockWaitBlock:
+									if (!cluster_tx_enqueue_wait_enabled)
+									{
+										/* off: honest fail-closed, pre-5.2 code by status. */
+										if (!tt_resolved
+											|| cres.status == CLUSTER_TT_STATUS_UNKNOWN)
 											ereport(ERROR,
-													(errcode(ERRCODE_CLUSTER_REMOTE_ROW_LOCK_WAIT_NOT_SUPPORTED),
-													 errmsg("cannot wait for remote row lock held by transaction %u on node %u",
-															xwait, cref.origin_node_id),
-													 errhint("cluster.tx_enqueue_wait is off; retry, use SKIP"
-															 " LOCKED, or enable it for cross-node TX waits.")));
-										{
-											ClusterTxwResult txw;
-
-											txw = cluster_tx_enqueue_wait(&ckey,
-																		  cluster_ges_request_timeout_ms);
-											if (txw == CLUSTER_TXW_TIMEOUT)
-												ereport(ERROR,
-														(errcode(ERRCODE_CLUSTER_GES_TIMEOUT),
-														 errmsg("timed out waiting for remote row lock held by transaction %u on node %u",
-																xwait, cref.origin_node_id),
-														 errhint("Holder did not complete within"
-																 " cluster.ges_request_timeout_ms; retry.")));
-										}
-										/* RESOLVED / DEAD_HOLDER → re-read xmax. */
-										goto l3;
-									case LockWaitSkip:
-										result = TM_WouldBlock;
-										LockBuffer(*buffer, BUFFER_LOCK_EXCLUSIVE);
-										goto failed;
-									case LockWaitError:
+													(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+													 errmsg("cluster TT status unknown for remote lock_xid %u",
+															xwait)));
 										ereport(ERROR,
-												(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
-												 errmsg("could not obtain lock on row in relation \"%s\"",
-														RelationGetRelationName(relation))));
-										break;
-								}
-								break;
-							case CLUSTER_TT_STATUS_COMMITTED:
-							case CLUSTER_TT_STATUS_ABORTED:
-							case CLUSTER_TT_STATUS_CLEANED_OUT:
-								/*
-								 * Lock released — fall through to native wait
-								 * path which will see xwait commit/abort.
-								 */
-								break;
-							case CLUSTER_TT_STATUS_UNKNOWN:
-								/* handled above */
-								break;
+												(errcode(ERRCODE_CLUSTER_REMOTE_ROW_LOCK_WAIT_NOT_SUPPORTED),
+												 errmsg("cannot wait for remote row lock held by transaction %u on node %u",
+														xwait, cref.origin_node_id),
+												 errhint("cluster.tx_enqueue_wait is off; retry, use SKIP"
+														 " LOCKED, or enable it for cross-node TX waits.")));
+									}
+									{
+										ClusterTxwResult txw;
+
+										txw = cluster_tx_enqueue_wait(&ckey,
+																	  cluster_ges_request_timeout_ms);
+										if (txw == CLUSTER_TXW_TIMEOUT)
+											ereport(ERROR,
+													(errcode(ERRCODE_CLUSTER_GES_TIMEOUT),
+													 errmsg("timed out waiting for remote row lock held by transaction %u on node %u",
+															xwait, cref.origin_node_id),
+													 errhint("Holder did not complete within"
+															 " cluster.ges_request_timeout_ms; retry.")));
+									}
+									/* RESOLVED / DEAD_HOLDER → re-read xmax. */
+									goto l3;
+								case LockWaitSkip:
+									result = TM_WouldBlock;
+									LockBuffer(*buffer, BUFFER_LOCK_EXCLUSIVE);
+									goto failed;
+								case LockWaitError:
+									ereport(ERROR,
+											(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+											 errmsg("could not obtain lock on row in relation \"%s\"",
+													RelationGetRelationName(relation))));
+									break;
+							}
 						}
+						/*
+						 * Holder terminal (committed/aborted/cleaned): fall
+						 * through to the native wait path, which sees xwait's
+						 * commit/abort and proceeds.
+						 */
 					}
 				}
 #endif

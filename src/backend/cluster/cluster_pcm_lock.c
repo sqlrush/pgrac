@@ -796,6 +796,48 @@ cluster_gcs_block_master_rebuild_from_redeclare(BufferTag tag, uint8 held_mode, 
 }
 
 
+/*
+ * PGRAC: spec-5.2 D11 — local-master record self as the new X holder after a
+ * writer-transfer (revoke).
+ *
+ *	THIS node is the GCS master for the block.  A remote node held it in X; we
+ *	(the master + the writing requester) forwarded an X-transfer request, the
+ *	holder shipped its current image AND released its own X (invalidating its
+ *	local copy so it can never flush a stale page — Rule 8.A no-stale-flush),
+ *	and we just installed the shipped bytes under content_lock EXCLUSIVE.  Now
+ *	make the authoritative master GRD entry reflect the new ownership:  X held
+ *	by self, no S holders, PI watermark advanced to the shipped page_lsn.
+ *
+ *	The old holder released BEFORE this point (its forward handler dropped its
+ *	copy before replying X_GRANTED_FROM_HOLDER), so there is never a window with
+ *	two X holders;  there is at most a brief no-holder window, which is safe.
+ *	Mirrors the X branch of cluster_gcs_block_master_rebuild_from_redeclare.
+ */
+void
+cluster_pcm_lock_master_take_x_after_transfer(BufferTag tag, XLogRecPtr page_lsn)
+{
+	struct GrdEntry *entry;
+
+	if (cluster_pcm_htab == NULL)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("PCM lock manager disabled (cluster.pcm_grd_max_entries=0)")));
+
+	entry = pcm_get_or_create_entry(tag);
+	if (entry == NULL)
+		ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY),
+						errmsg("cluster_pcm_lock_master_take_x_after_transfer: PCM GRD HTAB "
+							   "FULL (cap=%d)", pcm_grd_effective)));
+
+	pcm_entry_lock_exclusive(entry);
+	pg_atomic_write_u32(&entry->master_state, (uint32) PCM_STATE_X);
+	entry->x_holder_node = cluster_node_id;
+	pg_atomic_write_u32(&entry->s_holders_bitmap, 0);
+	if ((uint64) page_lsn > entry->pi_watermark_lsn)
+		entry->pi_watermark_lsn = (uint64) page_lsn;
+	LWLockRelease(&entry->entry_lock.lock);
+}
+
+
 /* ============================================================
  * PGRAC: spec-2.37 D2/D7/D8/D9 HC125-HC130 — PI watermark helpers.
  *
@@ -1609,6 +1651,24 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode)
 
 		if (master_state == PCM_LOCK_MODE_X && holder >= 0 && holder != cluster_node_id)
 			return cluster_gcs_local_master_read_image_and_wait(buf, holder);
+	} else /* mode == PCM_LOCK_MODE_X */
+	{
+		/*
+		 * PGRAC: spec-5.2 D11 — local-master writer-transfer (revoke).  master
+		 * == self but a REMOTE node holds the block in X, and a local writer
+		 * needs X.  The tag-only acquire below would bounded-fail-close (no
+		 * cross-node writer transfer; spec-4.7a D4 / cluster_pcm_lock_acquire).
+		 * Instead forward an X-transfer request to the holder: it ships its
+		 * current image (carrying the uncommitted ITL row-lock the writer must
+		 * wait on) and releases its X;  we install the bytes and take X durably.
+		 * The heap AM then sees the remote row lock and enters the cross-node TX
+		 * completion wait (spec-5.2 D4/D5).
+		 */
+		PcmLockMode master_state = cluster_pcm_lock_query(tag);
+		int32 holder = cluster_pcm_master_holder_node_by_tag(tag);
+
+		if (master_state == PCM_LOCK_MODE_X && holder >= 0 && holder != cluster_node_id)
+			return cluster_gcs_local_master_x_transfer_and_wait(buf, holder);
 	}
 
 	cluster_pcm_lock_acquire(tag, mode);

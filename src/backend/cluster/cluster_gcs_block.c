@@ -139,6 +139,7 @@ typedef struct ClusterGcsBlockShared {
 	pg_atomic_uint64 block_forward_sent_count;			 /* master→holder FORWARD emitted */
 	pg_atomic_uint64 block_forward_received_count;		 /* holder received FORWARD */
 	pg_atomic_uint64 block_from_holder_ship_count;		 /* holder→sender direct GRANTED ship */
+	pg_atomic_uint64 block_x_transfer_ship_count;		 /* spec-5.2 D11 X-transfer ship+release */
 	pg_atomic_uint64 block_forward_holder_evicted_count; /* holder evict race DENIED */
 	pg_atomic_uint64 s_holders_bitmap_redirect_count;	 /* master chose forward over fallback */
 	pg_atomic_uint64 master_holder_lifecycle_count;		 /* HC110 update events */
@@ -274,6 +275,7 @@ cluster_gcs_block_shmem_init(void)
 		pg_atomic_init_u64(&ClusterGcsBlock->block_forward_sent_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->block_forward_received_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->block_from_holder_ship_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->block_x_transfer_ship_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->block_forward_holder_evicted_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->s_holders_bitmap_redirect_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->master_holder_lifecycle_count, 0);
@@ -1248,6 +1250,150 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, int32 holder_node)
 						   (unsigned int)BufTagGetRelNumber(&tag), (unsigned int)tag.blockNum),
 					errhint("The X holder did not ship a current image in time; retry, or "
 							"inspect dump_gcs.cf_xheld_read_ship_count.")));
+	return true; /* unreachable */
+}
+
+
+/*
+ * PGRAC: spec-5.2 D11 — local-master writer-transfer (revoke) + wait.
+ *
+ *	When THIS node is the GCS master for a block that a REMOTE node holds in X,
+ *	and a LOCAL WRITER needs X (cross-node TX row-lock wait), the tag-only
+ *	acquire path cannot serve the write (no data plane, and the 3-way
+ *	writer-transfer needs a third-node master).  Here the master forwards an
+ *	N→X X-transfer request straight to the holder; the holder ships its CURRENT
+ *	image (carrying the uncommitted ITL row-lock the writer will wait on) AND
+ *	releases its own X (invalidating its local copy so it can never flush a
+ *	stale page).  This node installs the bytes under content_lock EXCLUSIVE and
+ *	records itself as the new X holder on the master GRD entry — a DURABLE X
+ *	grant (returns true).  The caller (bufmgr) then mirrors buf->pcm_state = X;
+ *	the heap AM sees the remote row lock and enters the cross-node TX completion
+ *	wait (spec-5.2 D4/D5).
+ *
+ *	Returns true (durable X).  Fails closed (ereport) if no X image can be
+ *	obtained — never a silent stale grant (Rule 8.A).  This is the write analog
+ *	of cluster_gcs_local_master_read_image_and_wait.
+ */
+bool
+cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, int32 holder_node)
+{
+	ClusterGcsBlockOutstandingSlot *slot;
+	uint64 request_id = 0;
+	BufferTag tag;
+	GcsBlockForwardPayload fwd;
+	bool got_reply = false;
+	bool installed = false;
+	XLogRecPtr installed_page_lsn = InvalidXLogRecPtr;
+
+	if (buf == NULL)
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("cluster_gcs_local_master_x_transfer_and_wait: NULL BufferDesc")));
+
+	tag = buf->tag;
+	cluster_gcs_block_dedup_register_backend_exit_hook();
+	slot = gcs_block_reserve_slot(tag, (uint8)PCM_TRANS_N_TO_X, cluster_node_id, &request_id);
+
+	PG_TRY();
+	{
+		ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
+		TimestampTz deadline;
+
+		LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+		slot->reply_received = false;
+		memset(&slot->reply_header, 0, sizeof(slot->reply_header));
+		memset(slot->reply_block_data, 0, sizeof(slot->reply_block_data));
+		slot->request_epoch = cluster_epoch_get_current();
+		slot->expected_master_node = cluster_node_id;
+		slot->stale = false;
+		LWLockRelease(&blk->lock.lock);
+
+		memset(&fwd, 0, sizeof(fwd));
+		fwd.request_id = request_id;
+		fwd.epoch = cluster_epoch_get_current();
+		fwd.tag = tag;
+		fwd.original_requester_node = cluster_node_id; /* reply returns to us */
+		fwd.requester_backend_id = (int32)MyBackendId;
+		fwd.master_node = cluster_node_id;
+		fwd.transition_id = (uint8)PCM_TRANS_N_TO_X;
+		GcsBlockForwardPayloadSetExpectedPiWatermarkLsn(&fwd,
+														cluster_pcm_lock_pi_watermark_query(tag));
+		GcsBlockForwardPayloadSetXTransfer(&fwd, true);
+
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_sent_count, 1);
+		if (!cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
+													  (uint32)holder_node, &fwd, sizeof(fwd)))
+			ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
+							errmsg("cluster_gcs_block: failed to enqueue X-transfer FORWARD "
+								   "to X holder %d",
+								   holder_node)));
+
+		deadline = GetCurrentTimestamp()
+				   + ((TimestampTz)cluster_gcs_reply_timeout_ms) * (TimestampTz)1000;
+
+		ConditionVariablePrepareToSleep(&slot->reply_cv);
+		for (;;) {
+			TimestampTz now;
+			long timeout_ms;
+			bool have_reply;
+
+			LWLockAcquire(&blk->lock.lock, LW_SHARED);
+			have_reply = slot->in_use && slot->reply_received;
+			LWLockRelease(&blk->lock.lock);
+			if (have_reply) {
+				got_reply = true;
+				break;
+			}
+			now = GetCurrentTimestamp();
+			if (now >= deadline)
+				break;
+			timeout_ms = (long)((deadline - now) / 1000);
+			if (timeout_ms <= 0)
+				timeout_ms = 1;
+			(void)ConditionVariableTimedSleep(&slot->reply_cv, timeout_ms,
+											  WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+		}
+		ConditionVariableCancelSleep();
+
+		if (got_reply
+			&& slot->reply_header.status == (uint8)GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER) {
+			uint32 expected = slot->reply_header.checksum;
+			uint32 got = gcs_block_compute_checksum(slot->reply_block_data);
+
+			if (expected == got) {
+				installed_page_lsn = (XLogRecPtr)slot->reply_header.page_lsn;
+				gcs_block_install_block(buf, slot->reply_block_data, installed_page_lsn);
+				installed = true;
+			} else {
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_checksum_fail_count, 1);
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		gcs_block_release_slot(slot);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	gcs_block_release_slot(slot);
+
+	if (installed) {
+		/* The holder shipped its current image and released its X; record self
+		 * as the new authoritative X holder (durable).  No master round-trip:
+		 * THIS node is the master. */
+		cluster_pcm_lock_master_take_x_after_transfer(tag, installed_page_lsn);
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_x_granted_from_holder_count, 1);
+		return true; /* durable X grant — bufmgr mirrors buf->pcm_state = X */
+	}
+
+	/* No X image obtained (timeout / holder evict / denial) — fail closed,
+	 * never a silent stale grant (Rule 8.A). */
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cluster_gcs_block: could not obtain X transfer from X holder %d "
+						   "for tag spc=%u db=%u relNumber=%u block=%u",
+						   holder_node, tag.spcOid, tag.dbOid,
+						   (unsigned int)BufTagGetRelNumber(&tag), (unsigned int)tag.blockNum),
+					errhint("The X holder did not ship a current image in time; retry.")));
 	return true; /* unreachable */
 }
 
@@ -2289,6 +2435,47 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 								  ? (uint8)GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER
 								  : (uint8)GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER;
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_from_holder_ship_count, 1);
+
+					/*
+					 * PGRAC: spec-5.2 D11 — X-transfer (writer-transfer-revoke).
+					 * The local master forwarded an N→X request with IsXTransfer
+					 * set: it needs X for a local writer while we (a REMOTE node)
+					 * hold X.  Unlike the 3-way path (master is a third node and
+					 * we retain X until the requester's post-install ACK reaches
+					 * the master), here the master IS the requester, so there is
+					 * no separate ACK round-trip — release our own X NOW.  The
+					 * current image is already captured in the reply buffer above,
+					 * so dropping our local copy cannot lose data;  invalidate it
+					 * so we can never flush a stale page (Rule 8.A no-stale-flush),
+					 * then apply the local X→N downgrade.  We drop locally only —
+					 * no round-trip back to the master — so there is no release-
+					 * to-the-invalidating-master deadlock.  The master records
+					 * itself as the new X holder on install.
+					 */
+					if (GcsBlockForwardPayloadIsXTransfer(fwd)
+						&& hdr->status == (uint8)GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER) {
+						XLogRecPtr drop_lsn = InvalidXLogRecPtr;
+
+						/*
+						 * ⚠️ spec-5.2 D11 BLOCKER A (WIP): this release path
+						 * currently RAISES inside the §3.5 IC-dispatch (LMON)
+						 * context.  apply_gcs_transition(X_TO_N_DOWNGRADE) →
+						 * transition_apply emits a GCS release wire (HC78
+						 * symmetrize) → gcs_reserve_slot needs a BackendId, which
+						 * LMON lacks (MyBackendId=-1) → ERROR → frame dropped (the
+						 * exact "release-to-the-invalidating-master round-trip"
+						 * hazard flagged in the INVALIDATE handler).  FIX (next):
+						 * make the holder X→N a NO-WIRE local buffer-drop +
+						 * local-only state→N (node1 is the master and already owns
+						 * the transfer, so node0 drops unilaterally — nobody to
+						 * notify).  Diagnosis confirmed the mechanism otherwise
+						 * works end-to-end (node1 reaches the D5 TX wait). */
+						if (cluster_bufmgr_invalidate_block_for_gcs(fwd->tag, PCM_LOCK_MODE_X,
+																	&drop_lsn))
+							(void)cluster_pcm_lock_apply_gcs_transition(
+								fwd->tag, PCM_TRANS_X_TO_N_DOWNGRADE, cluster_node_id);
+						pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_x_transfer_ship_count, 1);
+					}
 			}
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_ship_bytes_total, GCS_BLOCK_DATA_SIZE);
 		}

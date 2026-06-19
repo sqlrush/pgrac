@@ -269,6 +269,9 @@ extern bool cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode);
  */
 extern void cluster_pcm_lock_unlock_content_buffer(BufferDesc *buf, PcmLockMode mode);
 extern void cluster_pcm_lock_release_buffer_for_eviction(BufferDesc *buf, PcmLockMode mode);
+/* PGRAC: spec-5.2 D11 — local master records self as new X holder after a
+ * writer-transfer (the remote holder shipped + released its X). */
+extern void cluster_pcm_lock_master_take_x_after_transfer(BufferTag tag, XLogRecPtr page_lsn);
 
 /*
  * PGRAC: spec-2.35 D3 (HC110) — master_holder lookup for forward routing.

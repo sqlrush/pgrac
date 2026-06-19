@@ -355,6 +355,14 @@ cluster_gcs_local_master_read_image_and_wait(struct BufferDesc *buf pg_attribute
 	abort();
 }
 
+/* spec-5.2 D11 stub: local-master X-transfer forward unreachable in this unit. */
+bool
+cluster_gcs_local_master_x_transfer_and_wait(struct BufferDesc *buf pg_attribute_unused(),
+											 int32 holder_node pg_attribute_unused())
+{
+	abort();
+}
+
 /* spec-2.35 D3 stub for HC110 master_holder lifecycle counter bump. */
 void
 cluster_gcs_block_bump_master_holder_lifecycle(void)

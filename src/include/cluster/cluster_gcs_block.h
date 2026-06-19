@@ -569,6 +569,32 @@ GcsBlockForwardPayloadIsReadImage(const GcsBlockForwardPayload *p)
 	return p->reserved_0[0] != 0;
 }
 
+/* PGRAC: spec-5.2 D11 — X-transfer (writer-transfer-revoke) intent flag carried
+ * in reserved_0[1].
+ *
+ *	When THIS node is the GCS master for a block held in X by a REMOTE node and
+ *	a LOCAL writer needs X (cross-node TX row-lock wait), the master forwards an
+ *	N→X request to the holder with this flag set.  Unlike the 3-way
+ *	X_GRANTED_FROM_HOLDER path (master is a third node; holder retains its X
+ *	until the requester's post-install transition ACK reaches the master), the
+ *	2-node local-master case has no separate ACK round-trip — the master IS the
+ *	requester — so the holder must RELEASE its own X as it ships (invalidating
+ *	its local copy so it can never flush a stale page; Rule 8.A no-stale-flush).
+ *	The brief no-holder window is safe (no double-X);  the local master records
+ *	itself as the new x_holder on install.  Reuses the existing 64B forward wire
+ *	(no size change) — same reserved-byte-overlay pattern as read-image / HC127. */
+static inline void
+GcsBlockForwardPayloadSetXTransfer(GcsBlockForwardPayload *p, bool x_transfer)
+{
+	p->reserved_0[1] = x_transfer ? (uint8)1 : (uint8)0;
+}
+
+static inline bool
+GcsBlockForwardPayloadIsXTransfer(const GcsBlockForwardPayload *p)
+{
+	return p->reserved_0[1] != 0;
+}
+
 /* PGRAC: spec-5.2 D2 — pure master-side decision for an N→S read request
  * when the block is held in X.  Kept pure (no shmem / no I/O) so the gate
  * truth table is unit-tested standalone (U3). */
@@ -700,6 +726,8 @@ extern bool cluster_gcs_send_block_request_and_wait(BufferDesc *buf,
  * buf->pcm_state == N); fails closed (ereport) if no image is obtained.
  */
 extern bool cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, int32 holder_node);
+/* PGRAC: spec-5.2 D11 — local-master writer-transfer (revoke); durable X grant. */
+extern bool cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, int32 holder_node);
 
 /*
  * spec-4.7 D1 — GCS/PCM block resource recovery phase.
