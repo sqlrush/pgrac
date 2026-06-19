@@ -287,10 +287,80 @@ UT_TEST(test_gcs_block_tag_is_standard_buffer_tag_20b)
 }
 
 
+/* spec-5.2 D2 (U3): pure master-side decision for an X-held N→S read.
+ * node0 = holder/master in DIRECT, node1 = requester. */
+UT_TEST(test_xheld_read_ship_decision_truth_table)
+{
+	/* N→S read, block held X, master(0) is the resident holder → direct ship. */
+	UT_ASSERT_EQ(gcs_block_xheld_read_ship_decision((uint8)PCM_TRANS_N_TO_S, (int)PCM_LOCK_MODE_X,
+													0 /*holder*/, 1 /*requester*/, 0 /*master*/,
+													true /*resident*/),
+				 GCS_XHELD_READ_DIRECT_FROM_MASTER);
+
+	/* Holder(0) is a different node from the master(1) → forward to holder. */
+	UT_ASSERT_EQ(gcs_block_xheld_read_ship_decision((uint8)PCM_TRANS_N_TO_S, (int)PCM_LOCK_MODE_X,
+													0 /*holder*/, 1 /*requester*/,
+													1 /*master==requester*/, false),
+				 GCS_XHELD_READ_FORWARD_TO_HOLDER);
+
+	/* Master is the recorded holder but the buffer is NOT resident (evict
+	 * race) → fail-closed (never a silent stale read). */
+	UT_ASSERT_EQ(gcs_block_xheld_read_ship_decision((uint8)PCM_TRANS_N_TO_S, (int)PCM_LOCK_MODE_X,
+													0, 1, 0, false /*not resident*/),
+				 GCS_XHELD_READ_DENY);
+
+	/* Holder == requester (read-ship to self) → deny. */
+	UT_ASSERT_EQ(gcs_block_xheld_read_ship_decision((uint8)PCM_TRANS_N_TO_S, (int)PCM_LOCK_MODE_X,
+													1 /*holder==requester*/, 1, 0, true),
+				 GCS_XHELD_READ_DENY);
+
+	/* No valid holder → deny. */
+	UT_ASSERT_EQ(gcs_block_xheld_read_ship_decision((uint8)PCM_TRANS_N_TO_S, (int)PCM_LOCK_MODE_X,
+													-1 /*no holder*/, 1, 0, true),
+				 GCS_XHELD_READ_DENY);
+
+	/* Block held S (not X) → not applicable; the existing 2-way share path
+	 * handles it. */
+	UT_ASSERT_EQ(gcs_block_xheld_read_ship_decision((uint8)PCM_TRANS_N_TO_S, (int)PCM_LOCK_MODE_S,
+													0, 1, 0, true),
+				 GCS_XHELD_READ_NOT_APPLICABLE);
+
+	/* A write request (N→X) on an X-held block is never a read-image case. */
+	UT_ASSERT_EQ(gcs_block_xheld_read_ship_decision((uint8)PCM_TRANS_N_TO_X, (int)PCM_LOCK_MODE_X,
+													0, 1, 0, true),
+				 GCS_XHELD_READ_NOT_APPLICABLE);
+}
+
+
+/* spec-5.2 D2: read-image forward flag overlays reserved_0[0] without
+ * growing the 64B forward wire. */
+UT_TEST(test_forward_payload_read_image_flag_roundtrip)
+{
+	GcsBlockForwardPayload fwd;
+
+	memset(&fwd, 0, sizeof(fwd));
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsReadImage(&fwd) ? 1 : 0, 0);
+
+	GcsBlockForwardPayloadSetReadImage(&fwd, true);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsReadImage(&fwd) ? 1 : 0, 1);
+
+	GcsBlockForwardPayloadSetReadImage(&fwd, false);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsReadImage(&fwd) ? 1 : 0, 0);
+
+	/* Setting the flag must not perturb the HC127 watermark bytes. */
+	GcsBlockForwardPayloadSetExpectedPiWatermarkLsn(&fwd, (XLogRecPtr)0x1122334455667788ULL);
+	GcsBlockForwardPayloadSetReadImage(&fwd, true);
+	UT_ASSERT_EQ((long long)GcsBlockForwardPayloadGetExpectedPiWatermarkLsn(&fwd),
+				 (long long)0x1122334455667788ULL);
+
+	UT_ASSERT_EQ((int)sizeof(GcsBlockForwardPayload), 64);
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(17);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -306,6 +376,8 @@ main(void)
 	UT_RUN(test_gcs_block_data_size_equals_blcksz);
 	UT_RUN(test_gcs_block_msg_type_enum_extends_without_gap);
 	UT_RUN(test_gcs_block_tag_is_standard_buffer_tag_20b);
+	UT_RUN(test_xheld_read_ship_decision_truth_table);
+	UT_RUN(test_forward_payload_read_image_flag_roundtrip);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

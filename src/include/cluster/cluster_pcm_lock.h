@@ -227,8 +227,13 @@ extern void cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode);
  * cluster_gcs_send_block_request_and_wait (spec-2.33 D3).  Tag-only
  * cluster_pcm_lock_acquire fails closed in that case with an errhint
  * directing callers here.
+ *
+ * Returns true if a DURABLE PCM grant was recorded (caller mirrors ownership
+ * into buf->pcm_state).  Returns false for a spec-5.2 D2 one-shot READ_IMAGE:
+ * bytes were installed for this read only and the caller MUST leave
+ * buf->pcm_state == N so the next access re-fetches.
  */
-extern void cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode);
+extern bool cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode);
 
 /*
  * PGRAC: spec-2.35 D5 (HC111 + HC112) — bufmgr release hook bifurcation.

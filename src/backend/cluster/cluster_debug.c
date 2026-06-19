@@ -1431,6 +1431,9 @@ dump_gcs(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_gcs_get_lost_write_detected_count()));
 	emit_row(rsinfo, "gcs", "lost_write_avoid_count",
 			 fmt_int64((int64)cluster_gcs_get_lost_write_avoid_count()));
+	/* PGRAC: spec-5.2 D2 — X-holder read-image ship counter. */
+	emit_row(rsinfo, "gcs", "cf_xheld_read_ship_count",
+			 fmt_int64((int64)cluster_gcs_get_cf_xheld_read_ship_count()));
 
 	/* PGRAC: spec-4.7 D6 — 8 NEW counter rows for GCS/PCM warm recovery. */
 	emit_row(rsinfo, "gcs_recovery", "block_resources_recovering",

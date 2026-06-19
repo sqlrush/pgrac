@@ -1521,7 +1521,7 @@ cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode)
  *	install received block bytes into this buffer's content on GRANTED
  *	(HC84 PageSetLSN + memcpy under content_lock EXCLUSIVE).
  */
-void
+bool
 cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode)
 {
 	BufferTag tag;
@@ -1585,8 +1585,9 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode)
 		 * bytes into buf under content_lock EXCLUSIVE on GRANTED, or keep
 		 * the shared-storage page on GRANTED_STORAGE_FALLBACK (HC88).
 		 */
-		cluster_gcs_send_block_request_and_wait(buf, trans, master_node);
-		return; /* HC77: master applied transition */
+		/* spec-5.2 D2: returns false for a one-shot READ_IMAGE so the bufmgr
+		 * leaves buf->pcm_state == N (no durable ownership recorded). */
+		return cluster_gcs_send_block_request_and_wait(buf, trans, master_node);
 	}
 
 	/*
@@ -1595,8 +1596,23 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode)
 	 * branch in cluster_pcm_lock_acquire would otherwise fail-closed under
 	 * spec-2.33 D7 because it cannot reach the data plane without a
 	 * BufferDesc — but with master == self that branch is never taken).
+	 *
+	 * spec-5.2 D2 (sub-case B): when master == self but the block is held in X
+	 * by a REMOTE node, an N→S reader cannot be served by the tag-only acquire
+	 * (no data plane).  Forward a read-image request to the holder and install
+	 * the shipped current image for this read (non-durable — returns false so
+	 * the caller leaves buf->pcm_state == N).
 	 */
+	if (mode == PCM_LOCK_MODE_S) {
+		PcmLockMode master_state = cluster_pcm_lock_query(tag);
+		int32 holder = cluster_pcm_master_holder_node_by_tag(tag);
+
+		if (master_state == PCM_LOCK_MODE_X && holder >= 0 && holder != cluster_node_id)
+			return cluster_gcs_local_master_read_image_and_wait(buf, holder);
+	}
+
 	cluster_pcm_lock_acquire(tag, mode);
+	return true;
 }
 
 

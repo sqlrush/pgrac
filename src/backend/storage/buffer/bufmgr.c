@@ -4993,8 +4993,12 @@ LockBuffer(Buffer buffer, int mode)
 		}
 		else
 		{
-			cluster_pcm_lock_acquire_buffer(buf, pcm_mode);
-			pcm_acquired = true;
+			/* PGRAC: spec-5.2 D2 — a one-shot READ_IMAGE returns false (no
+			 * durable grant); pcm_acquired stays false so the ownership
+			 * mirror below is skipped and buf->pcm_state is left at N (the
+			 * next access re-fetches — a cached copy with no invalidation
+			 * path would go stale, Rule 8.A). */
+			pcm_acquired = cluster_pcm_lock_acquire_buffer(buf, pcm_mode);
 		}
 	}
 #endif

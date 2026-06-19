@@ -155,6 +155,9 @@ typedef struct ClusterGcsBlockShared {
 	pg_atomic_uint64 pi_watermark_retire_count;	 /* tag lifecycle + durable-confirm retire */
 	pg_atomic_uint64 lost_write_detected_count;	 /* master direct OR holder forward detect */
 	pg_atomic_uint64 lost_write_avoid_count;	 /* durable-confirm retire avoided false-pos */
+	/* PGRAC: spec-5.2 D2 — X-holder shipped a one-shot read image (current
+	 * block, holder kept X) for a cross-node N→S read. */
+	pg_atomic_uint64 cf_xheld_read_ship_count;
 	/* PGRAC: spec-4.7 D6 — GCS/PCM warm-recovery observability (dump category
 	 * 'gcs_recovery').  8 counters per spec §2.4. */
 	pg_atomic_uint64 recovery_block_resources_recovering; /* phase_for_tag → RECOVERING hits */
@@ -287,6 +290,8 @@ cluster_gcs_block_shmem_init(void)
 		pg_atomic_init_u64(&ClusterGcsBlock->pi_watermark_retire_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->lost_write_detected_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->lost_write_avoid_count, 0);
+		/* PGRAC: spec-5.2 D2 — X-holder read-image ship counter init. */
+		pg_atomic_init_u64(&ClusterGcsBlock->cf_xheld_read_ship_count, 0);
 		/* PGRAC: spec-4.7 D6 — 8 NEW warm-recovery counters init. */
 		pg_atomic_init_u64(&ClusterGcsBlock->recovery_block_resources_recovering, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->recovery_buffers_redeclared, 0);
@@ -681,7 +686,7 @@ cluster_gcs_block_redo_lsn_covered(int dead_origin, XLogRecPtr required_lsn)
 	return covered;
 }
 
-void
+bool
 cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition transition_id,
 										int master_node)
 {
@@ -691,6 +696,7 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 	BufferTag tag;
 	bool granted = false;
 	bool granted_storage_fallback = false;
+	bool read_image = false; /* spec-5.2 D2: one-shot read image, non-durable */
 	bool terminal_denied = false;
 	bool retransmit_warning_emitted = false;
 	uint8 final_status = GCS_BLOCK_REPLY_DENIED_INCOMPATIBLE;
@@ -918,6 +924,29 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 				granted = true;
 				break;
 			}
+			if (final_status == GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER) {
+				/*
+				 * PGRAC: spec-5.2 D2 — the X holder shipped its CURRENT image
+				 * for this one read.  Install the bytes (so this read sees the
+				 * holder's uncommitted ITL row-lock), but do NOT send a
+				 * transition-ack: we never register as an S holder, and the
+				 * caller leaves buf->pcm_state == N so the next access
+				 * re-fetches.  A cached copy with no invalidation path would go
+				 * stale once the holder writes again (Rule 8.A).
+				 */
+				uint32 expected = slot->reply_header.checksum;
+				uint32 got = gcs_block_compute_checksum(slot->reply_block_data);
+
+				if (expected != got) {
+					pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_checksum_fail_count, 1);
+					final_status = GCS_BLOCK_REPLY_DENIED_CHECKSUM_FAIL;
+					terminal_denied = true;
+					break;
+				}
+				gcs_block_install_block(buf, slot->reply_block_data, final_page_lsn);
+				read_image = true;
+				break;
+			}
 			if (final_status == GCS_BLOCK_REPLY_GRANTED_STORAGE_FALLBACK) {
 				granted_storage_fallback = true;
 				break;
@@ -1038,8 +1067,13 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 
 	gcs_block_release_slot(slot);
 
+	/* spec-5.2 D2: GRANTED / STORAGE_FALLBACK record durable ownership (the
+	 * caller mirrors PCM state); READ_IMAGE is a one-shot non-durable read so
+	 * the caller must leave buf->pcm_state == N. */
 	if (granted || granted_storage_fallback)
-		return;
+		return true;
+	if (read_image)
+		return false;
 
 	if (terminal_denied) {
 		switch ((GcsBlockReplyStatus)final_status) {
@@ -1079,6 +1113,142 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 			 errhint("Possible peer GCS unresponsiveness, network partition, or "
 					 "epoch reshuffle storm.  Inspect dump_gcs counters and "
 					 "consider raising cluster.gcs_block_retransmit_max_retries.")));
+}
+
+
+/*
+ * PGRAC: spec-5.2 D2 (sub-case B) — local-master read-image forward.
+ *
+ *	When THIS node is the GCS master for a block that a REMOTE node holds in
+ *	X, and a local reader needs an N→S image (e.g. to see an uncommitted ITL
+ *	row-lock before a cross-node TX wait), the tag-only acquire path cannot
+ *	serve the read (it has no data plane).  Here the master forwards a
+ *	read-image request straight to the holder and waits for the holder to
+ *	direct-ship the current image (status READ_IMAGE_FROM_XHOLDER).  The
+ *	holder keeps its X; this node installs the bytes for THIS read only and
+ *	never registers as an S holder (returns false so buf->pcm_state stays N).
+ *
+ *	Returns false (one-shot read image, non-durable).  Fails closed
+ *	(ereport) if no read image can be obtained — never a silent stale read
+ *	(Rule 8.A).
+ */
+bool
+cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, int32 holder_node)
+{
+	ClusterGcsBlockOutstandingSlot *slot;
+	uint64 request_id = 0;
+	BufferTag tag;
+	GcsBlockForwardPayload fwd;
+	bool got_reply = false;
+	bool installed = false;
+
+	if (buf == NULL)
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("cluster_gcs_local_master_read_image_and_wait: NULL BufferDesc")));
+
+	tag = buf->tag;
+	cluster_gcs_block_dedup_register_backend_exit_hook();
+	/* expected_master == self:  the holder's reply carries forwarding_master =
+	 * self, which the HC108 authorized chain validates against this slot. */
+	slot = gcs_block_reserve_slot(tag, (uint8)PCM_TRANS_N_TO_S, cluster_node_id, &request_id);
+
+	PG_TRY();
+	{
+		ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
+		TimestampTz deadline;
+
+		LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+		slot->reply_received = false;
+		memset(&slot->reply_header, 0, sizeof(slot->reply_header));
+		memset(slot->reply_block_data, 0, sizeof(slot->reply_block_data));
+		slot->request_epoch = cluster_epoch_get_current();
+		slot->expected_master_node = cluster_node_id;
+		slot->stale = false;
+		LWLockRelease(&blk->lock.lock);
+
+		memset(&fwd, 0, sizeof(fwd));
+		fwd.request_id = request_id;
+		fwd.epoch = cluster_epoch_get_current();
+		fwd.tag = tag;
+		fwd.original_requester_node = cluster_node_id; /* reply returns to us */
+		fwd.requester_backend_id = (int32)MyBackendId;
+		fwd.master_node = cluster_node_id;
+		fwd.transition_id = (uint8)PCM_TRANS_N_TO_S;
+		GcsBlockForwardPayloadSetExpectedPiWatermarkLsn(&fwd,
+														cluster_pcm_lock_pi_watermark_query(tag));
+		GcsBlockForwardPayloadSetReadImage(&fwd, true);
+
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_sent_count, 1);
+		if (!cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
+													  (uint32)holder_node, &fwd, sizeof(fwd)))
+			ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
+							errmsg("cluster_gcs_block: failed to enqueue read-image FORWARD "
+								   "to X holder %d",
+								   holder_node)));
+
+		deadline = GetCurrentTimestamp()
+				   + ((TimestampTz)cluster_gcs_reply_timeout_ms) * (TimestampTz)1000;
+
+		ConditionVariablePrepareToSleep(&slot->reply_cv);
+		for (;;) {
+			TimestampTz now;
+			long timeout_ms;
+			bool have_reply;
+
+			LWLockAcquire(&blk->lock.lock, LW_SHARED);
+			have_reply = slot->in_use && slot->reply_received;
+			LWLockRelease(&blk->lock.lock);
+			if (have_reply) {
+				got_reply = true;
+				break;
+			}
+			now = GetCurrentTimestamp();
+			if (now >= deadline)
+				break;
+			timeout_ms = (long)((deadline - now) / 1000);
+			if (timeout_ms <= 0)
+				timeout_ms = 1;
+			(void)ConditionVariableTimedSleep(&slot->reply_cv, timeout_ms,
+											  WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+		}
+		ConditionVariableCancelSleep();
+
+		if (got_reply
+			&& slot->reply_header.status == (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER) {
+			uint32 expected = slot->reply_header.checksum;
+			uint32 got = gcs_block_compute_checksum(slot->reply_block_data);
+
+			if (expected == got) {
+				gcs_block_install_block(buf, slot->reply_block_data,
+										(XLogRecPtr)slot->reply_header.page_lsn);
+				installed = true;
+			} else {
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_checksum_fail_count, 1);
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		gcs_block_release_slot(slot);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	gcs_block_release_slot(slot);
+
+	if (installed)
+		return false; /* one-shot read image — non-durable, leave pcm_state N */
+
+	/* No read image obtained (timeout / holder evict / denial) — fail closed,
+	 * never a silent stale read (Rule 8.A). */
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cluster_gcs_block: could not obtain read image from X holder %d "
+						   "for tag spc=%u db=%u relNumber=%u block=%u",
+						   holder_node, tag.spcOid, tag.dbOid,
+						   (unsigned int)BufTagGetRelNumber(&tag), (unsigned int)tag.blockNum),
+					errhint("The X holder did not ship a current image in time; retry, or "
+							"inspect dump_gcs.cf_xheld_read_ship_count.")));
+	return true; /* unreachable */
 }
 
 
@@ -1689,6 +1859,78 @@ x_path_skipped:
 		 * topology that would otherwise trigger forward. */
 		CLUSTER_INJECTION_POINT("cluster-gcs-block-forward-master-side");
 
+		/*
+		 * PGRAC: spec-5.2 D2 — X-held cross-node read.  An N→S read targeting
+		 * a block currently held in X still needs the holder's CURRENT image
+		 * (e.g. to see an uncommitted ITL row-lock before a cross-node TX
+		 * wait).  Ship a one-shot read image; the X holder is undisturbed (no
+		 * ownership transfer, no downgrade).  Cases we cannot serve safely
+		 * fall through to the pre-spec-5.2 fail-closed (Rule 8.A).
+		 */
+		{
+			GcsXheldReadShipDecision rd = gcs_block_xheld_read_ship_decision(
+				req->transition_id, (int)pre_state, holder_node, req->sender_node, cluster_node_id,
+				local_resident);
+
+			if (rd == GCS_XHELD_READ_DIRECT_FROM_MASTER
+				&& !cluster_injection_should_skip("cluster-gcs-block-forward-master-side")) {
+				/* Master holds X locally: copy + ship its own current image. */
+				if (cluster_bufmgr_copy_block_for_gcs(req->tag, &page_lsn, block_buf)) {
+					status = GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER;
+					block_payload = block_buf;
+					if (ClusterGcsBlock != NULL)
+						pg_atomic_fetch_add_u64(&ClusterGcsBlock->cf_xheld_read_ship_count, 1);
+					goto build_and_send_reply;
+				}
+				/* Evict race — fall through to the fail-closed master flow. */
+			} else if (rd == GCS_XHELD_READ_FORWARD_TO_HOLDER
+					   && !cluster_injection_should_skip("cluster-gcs-block-forward-master-side")) {
+				GcsBlockForwardPayload fwd;
+				uint64 current_epoch = cluster_epoch_get_current();
+
+				if (req->epoch < current_epoch) {
+					gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_EPOCH_STALE,
+										 InvalidXLogRecPtr, NULL);
+					return;
+				}
+
+				memset(&fwd, 0, sizeof(fwd));
+				fwd.request_id = req->request_id;
+				fwd.epoch = current_epoch;
+				fwd.tag = req->tag;
+				fwd.original_requester_node = req->sender_node;
+				fwd.requester_backend_id = req->requester_backend_id;
+				fwd.master_node = cluster_node_id;
+				fwd.transition_id = req->transition_id;
+				GcsBlockForwardPayloadSetExpectedPiWatermarkLsn(
+					&fwd, cluster_pcm_lock_pi_watermark_query(req->tag));
+				/* D2: tell the holder to ship a read image and keep its X. */
+				GcsBlockForwardPayloadSetReadImage(&fwd, true);
+
+				if (cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, holder_node, &fwd,
+											 sizeof(fwd))
+					== CLUSTER_IC_SEND_DONE) {
+					GcsBlockReplyHeader fwd_hdr;
+
+					pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_sent_count, 1);
+
+					memset(&fwd_hdr, 0, sizeof(fwd_hdr));
+					fwd_hdr.request_id = req->request_id;
+					fwd_hdr.requester_backend_id = req->requester_backend_id;
+					fwd_hdr.transition_id = req->transition_id;
+					fwd_hdr.sender_node = holder_node;
+					fwd_hdr.status = (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER;
+					GcsBlockReplyHeaderSetForwardingMasterNode(&fwd_hdr, cluster_node_id);
+					cluster_gcs_block_dedup_install_reply(
+						&key, GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER, &fwd_hdr, NULL);
+					return;
+				}
+				/* Forward send failed — fall through to the fail-closed flow. */
+			}
+			/* NOT_APPLICABLE / DENY → existing S-forward + master flow below
+			 * (X-held that we cannot serve stays fail-closed, unchanged). */
+		}
+
 		if (req->transition_id == PCM_TRANS_N_TO_S && pre_state == PCM_LOCK_MODE_S
 			&& !local_resident && holder_node >= 0
 			&& holder_node != cluster_node_id
@@ -1818,7 +2060,8 @@ build_and_send_reply: {
 	hdr->status = (uint8)status;
 	GcsBlockReplyHeaderSetForwardingMasterNode(hdr, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
 
-	if (status == GCS_BLOCK_REPLY_GRANTED && block_payload != NULL) {
+	if ((status == GCS_BLOCK_REPLY_GRANTED || status == GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER)
+		&& block_payload != NULL) {
 		memcpy(buf + sizeof(GcsBlockReplyHeader), block_payload, GCS_BLOCK_DATA_SIZE);
 		hdr->checksum = gcs_block_compute_checksum(block_payload);
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_ship_bytes_total, GCS_BLOCK_DATA_SIZE);
@@ -1826,8 +2069,11 @@ build_and_send_reply: {
 		hdr->checksum = gcs_block_compute_checksum(buf + sizeof(GcsBlockReplyHeader));
 	}
 
-	cluster_gcs_block_dedup_install_reply(&key, status, hdr,
-										  status == GCS_BLOCK_REPLY_GRANTED ? block_payload : NULL);
+	cluster_gcs_block_dedup_install_reply(
+		&key, status, hdr,
+		(status == GCS_BLOCK_REPLY_GRANTED || status == GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER)
+			? block_payload
+			: NULL);
 
 	/*
 		 * spec-2.34 D17 — drop-reply injection.  When active with SKIP,
@@ -1932,6 +2178,7 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 				if (fwd_master == slot->expected_master_node
 					&& (hdr->status == (uint8)GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER
+						|| hdr->status == (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_DENIED_LOST_WRITE))
 					authorized = true;
@@ -2029,11 +2276,20 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 		} else {
 			memcpy(buf + sizeof(GcsBlockReplyHeader), block_buf, GCS_BLOCK_DATA_SIZE);
 			hdr->checksum = gcs_block_compute_checksum(block_buf);
-			hdr->status = (fwd->transition_id == PCM_TRANS_N_TO_X
-						   || fwd->transition_id == PCM_TRANS_S_TO_X_UPGRADE)
-							  ? (uint8)GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER
-							  : (uint8)GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER;
-			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_from_holder_ship_count, 1);
+			if (GcsBlockForwardPayloadIsReadImage(fwd)) {
+				/* PGRAC: spec-5.2 D2 — read-image ship.  We (the X holder) keep
+				 * our X; the requester consumes this image for one read only and
+				 * never registers as an S holder.  No local state change here —
+				 * the holder forward handler never mutates its own PCM lock. */
+				hdr->status = (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER;
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->cf_xheld_read_ship_count, 1);
+			} else {
+				hdr->status = (fwd->transition_id == PCM_TRANS_N_TO_X
+							   || fwd->transition_id == PCM_TRANS_S_TO_X_UPGRADE)
+								  ? (uint8)GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER
+								  : (uint8)GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER;
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_from_holder_ship_count, 1);
+			}
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_ship_bytes_total, GCS_BLOCK_DATA_SIZE);
 		}
 	} else {
@@ -2667,6 +2923,17 @@ cluster_gcs_get_lost_write_avoid_count(void)
 {
 	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->lost_write_avoid_count) : 0;
 }
+
+uint64
+cluster_gcs_get_cf_xheld_read_ship_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->cf_xheld_read_ship_count) : 0;
+}
+
+/*
+ * PGRAC: spec-5.2 D2 — gcs_block_xheld_read_ship_decision() is a pure
+ * static-inline helper in cluster_gcs_block.h (unit-tested standalone, U3).
+ */
 
 /* PGRAC: spec-4.7 D6 — 8 warm-recovery observability accessors (dump category
  * 'gcs_recovery'). */

@@ -143,7 +143,7 @@ typedef enum GcsBlockReplyStatus {
 													 * S/X holder invalidate ACKs
 													 * within retransmit budget;
 													 * sender maps to 53R91. */
-	GCS_BLOCK_REPLY_DENIED_LOST_WRITE = 12			/* PGRAC: spec-2.37 D1 NEW;
+	GCS_BLOCK_REPLY_DENIED_LOST_WRITE = 12,			/* PGRAC: spec-2.37 D1 NEW;
 													 * master direct ship 自校 失败 OR
 													 * holder forward validate 失败:
 													 * shipped block.page_lsn <
@@ -156,6 +156,22 @@ typedef enum GcsBlockReplyStatus {
 													 * retried because lost-write is a
 													 * data integrity issue that must
 													 * surface, not be papered over. */
+	GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER = 13	/* PGRAC: spec-5.2 D2 NEW;
+													 * X-holder ships the CURRENT block
+													 * image for a one-shot cross-node
+													 * read (node1 must see node0's
+													 * uncommitted ITL row-lock bits) and
+													 * KEEPS its X — no ownership transfer,
+													 * no downgrade.  The requester
+													 * installs the bytes for this read
+													 * only, does NOT send a transition-ack
+													 * (never registers as an S holder),
+													 * and leaves buf->pcm_state == N so
+													 * the next access re-fetches (Rule
+													 * 8.A: a cached copy with no
+													 * invalidation path would go stale).
+													 * Reuses HC103 copy-ship + HC127
+													 * watermark. */
 } GcsBlockReplyStatus;
 
 /* ============================================================
@@ -534,6 +550,62 @@ GcsBlockForwardPayloadGetExpectedPiWatermarkLsn(const GcsBlockForwardPayload *p)
 	return (XLogRecPtr)v;
 }
 
+/* PGRAC: spec-5.2 D2 — read-image intent flag carried in reserved_0[0].
+ *
+ *	When the master forwards an N→S read request to a node that holds the
+ *	block in X, it sets this flag so the holder ships a one-shot read image
+ *	(status READ_IMAGE_FROM_XHOLDER) and KEEPS its X, instead of the
+ *	2-way-share GRANTED_FROM_HOLDER.  Reuses the existing 64B forward wire
+ *	(no size change) — same reserved-byte-overlay pattern as HC127. */
+static inline void
+GcsBlockForwardPayloadSetReadImage(GcsBlockForwardPayload *p, bool read_image)
+{
+	p->reserved_0[0] = read_image ? (uint8)1 : (uint8)0;
+}
+
+static inline bool
+GcsBlockForwardPayloadIsReadImage(const GcsBlockForwardPayload *p)
+{
+	return p->reserved_0[0] != 0;
+}
+
+/* PGRAC: spec-5.2 D2 — pure master-side decision for an N→S read request
+ * when the block is held in X.  Kept pure (no shmem / no I/O) so the gate
+ * truth table is unit-tested standalone (U3). */
+typedef enum GcsXheldReadShipDecision {
+	GCS_XHELD_READ_NOT_APPLICABLE = 0, /* not an X-held N→S read — existing logic */
+	GCS_XHELD_READ_DIRECT_FROM_MASTER, /* master itself holds X resident → ship its image */
+	GCS_XHELD_READ_FORWARD_TO_HOLDER,  /* a remote node holds X → forward read-image */
+	GCS_XHELD_READ_DENY				   /* cannot satisfy safely → fail-closed (unchanged) */
+} GcsXheldReadShipDecision;
+
+static inline GcsXheldReadShipDecision
+gcs_block_xheld_read_ship_decision(uint8 transition_id, int pre_state, int32 holder_node,
+								   int32 requester_node, int32 master_node, bool master_resident)
+{
+	/* Only plain cross-node reads (N→S) on an X-held block are in scope. */
+	if (transition_id != (uint8)PCM_TRANS_N_TO_S || pre_state != (int)PCM_LOCK_MODE_X)
+		return GCS_XHELD_READ_NOT_APPLICABLE;
+
+	/* A valid live holder must exist and it must not be the requester itself
+	 * (a node never read-ships to itself). */
+	if (holder_node < 0 || holder_node == requester_node)
+		return GCS_XHELD_READ_DENY;
+
+	/* The master holds X and the buffer is resident here → it can copy and
+	 * ship its own current image directly. */
+	if (holder_node == master_node && master_resident)
+		return GCS_XHELD_READ_DIRECT_FROM_MASTER;
+
+	/* A different live node holds X → forward a read-image request to it. */
+	if (holder_node != master_node)
+		return GCS_XHELD_READ_FORWARD_TO_HOLDER;
+
+	/* Master is recorded as holder but the buffer is not resident (evicted /
+	 * race) — cannot ship safely (Rule 8.A: never a silent stale read). */
+	return GCS_XHELD_READ_DENY;
+}
+
 /* Compile-time assertion that block size matches PG BLCKSZ.  HC80. */
 StaticAssertDecl(GCS_BLOCK_DATA_SIZE == BLCKSZ,
 				 "spec-2.33 D1 GCS_BLOCK_DATA_SIZE must equal BLCKSZ "
@@ -607,9 +679,27 @@ extern int cluster_bufmgr_redeclare_scan_chunk(int start_buf, int max_scan,
  *                "spec-2.34 retransmit"
  *    6. Release slot
  */
-extern void cluster_gcs_send_block_request_and_wait(BufferDesc *buf,
+/*
+ * Returns true if a DURABLE PCM grant was acquired (GRANTED / STORAGE_
+ * FALLBACK — the caller mirrors PCM ownership into buf->pcm_state).  Returns
+ * false for a spec-5.2 D2 one-shot READ_IMAGE: the bytes were installed for
+ * this read only, no S holder was registered, and the caller MUST leave
+ * buf->pcm_state == N so the next access re-fetches.  Terminal denials
+ * ereport(ERROR) and do not return.
+ */
+extern bool cluster_gcs_send_block_request_and_wait(BufferDesc *buf,
 													PcmLockTransition transition_id,
 													int master_node);
+
+/*
+ * spec-5.2 D2 (sub-case B) — local-master read-image forward.  Used by
+ * cluster_pcm_lock_acquire_buffer when THIS node is the GCS master for a
+ * block a REMOTE node holds in X and a local reader needs an N→S image.
+ * Forwards a read-image request to the holder and installs the shipped
+ * current image for one read.  Returns false (non-durable; caller leaves
+ * buf->pcm_state == N); fails closed (ereport) if no image is obtained.
+ */
+extern bool cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, int32 holder_node);
 
 /*
  * spec-4.7 D1 — GCS/PCM block resource recovery phase.
@@ -769,6 +859,9 @@ extern uint64 cluster_gcs_get_pi_watermark_advance_count(void);
 extern uint64 cluster_gcs_get_pi_watermark_retire_count(void);
 extern uint64 cluster_gcs_get_lost_write_detected_count(void);
 extern uint64 cluster_gcs_get_lost_write_avoid_count(void);
+
+/* PGRAC: spec-5.2 D2 — X-holder read-image ship counter accessor. */
+extern uint64 cluster_gcs_get_cf_xheld_read_ship_count(void);
 
 /* PGRAC: spec-4.7 D6 — 8 warm-recovery observability accessors. */
 extern uint64 cluster_gcs_get_recovery_block_resources_recovering(void);
