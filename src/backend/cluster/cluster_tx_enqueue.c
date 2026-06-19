@@ -215,39 +215,54 @@ cluster_tx_enqueue_wait(const ClusterTTStatusKey *holder_key, int effective_time
 
 	txw_slot_set(procno, holder_key);
 
-	for (;;) {
-		ClusterTTStatusResult cres;
-		bool found;
-		TimestampTz now;
-		long wait_ms;
+	/*
+	 * The loop calls CHECK_FOR_INTERRUPTS() (query cancel / SIGTERM) and other
+	 * code that can longjmp; wrap it so the waiter slot is ALWAYS released.
+	 * Otherwise `waiting` / active_waiters leak and a later wake scan matches a
+	 * stale slot (spurious-wake-safe, but a real resource leak).
+	 */
+	PG_TRY();
+	{
+		for (;;) {
+			ClusterTTStatusResult cres;
+			bool found;
+			TimestampTz now;
+			long wait_ms;
 
-		ResetLatch(MyLatch);
+			ResetLatch(MyLatch);
 
-		/* Re-check the holder's TT status (closes the register/wake race:
-		 * a terminal status published before we slept is seen here). */
-		found = cluster_tt_status_lookup_exact(holder_key, &cres);
-		if (found && cres.authoritative && txw_status_is_terminal(cres.status)) {
-			result = CLUSTER_TXW_RESOLVED;
-			break;
+			/* Re-check the holder's TT status (closes the register/wake race:
+			 * a terminal status published before we slept is seen here). */
+			found = cluster_tt_status_lookup_exact(holder_key, &cres);
+			if (found && cres.authoritative && txw_status_is_terminal(cres.status)) {
+				result = CLUSTER_TXW_RESOLVED;
+				break;
+			}
+
+			now = GetCurrentTimestamp();
+			if (now >= deadline) {
+				result = CLUSTER_TXW_TIMEOUT;
+				pg_atomic_fetch_add_u64(&ClusterTxw->timeout_count, 1);
+				break;
+			}
+
+			wait_ms = (long)((deadline - now) / 1000);
+			if (wait_ms <= 0)
+				wait_ms = 1;
+			if (wait_ms > CLUSTER_TXW_TICK_MS)
+				wait_ms = CLUSTER_TXW_TICK_MS;
+
+			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, wait_ms,
+							WAIT_EVENT_GES_TX_ENQUEUE_WAIT);
+			CHECK_FOR_INTERRUPTS();
 		}
-
-		now = GetCurrentTimestamp();
-		if (now >= deadline) {
-			result = CLUSTER_TXW_TIMEOUT;
-			pg_atomic_fetch_add_u64(&ClusterTxw->timeout_count, 1);
-			break;
-		}
-
-		wait_ms = (long)((deadline - now) / 1000);
-		if (wait_ms <= 0)
-			wait_ms = 1;
-		if (wait_ms > CLUSTER_TXW_TICK_MS)
-			wait_ms = CLUSTER_TXW_TICK_MS;
-
-		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, wait_ms,
-						WAIT_EVENT_GES_TX_ENQUEUE_WAIT);
-		CHECK_FOR_INTERRUPTS();
 	}
+	PG_CATCH();
+	{
+		txw_slot_clear(procno);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	txw_slot_clear(procno);
 	return result;

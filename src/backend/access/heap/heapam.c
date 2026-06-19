@@ -5694,6 +5694,19 @@ l3:
 		}
 		else if (require_sleep)
 		{
+#ifdef USE_PGRAC_CLUSTER
+			/*
+			 * PGRAC: spec-5.2 — set true when the C4 cross-node block below
+			 * resolves a REMOTE lock-only holder as terminal.  In that case the
+			 * native XactLockTableWait / UpdateXmaxHintBits must be SKIPPED:
+			 * they operate on the remote raw xid, which is meaningless in this
+			 * node's ProcArray/CLOG (raw xids alias across instances, AD-012)
+			 * and XactLockTableWait on it hangs (Blocker C — the same hole
+			 * fixed in heap_update/heap_delete).
+			 */
+			bool		cluster_remote_lockonly_terminal = false;
+#endif
+
 			/*
 			 * Acquire tuple lock to establish our priority for the tuple, or
 			 * die trying.  LockTuple will release us when we are next-in-line
@@ -5934,14 +5947,29 @@ l3:
 							}
 						}
 						/*
-						 * Holder terminal (committed/aborted/cleaned): fall
-						 * through to the native wait path, which sees xwait's
-						 * commit/abort and proceeds.
+						 * Holder terminal (committed/aborted/cleaned): the remote
+						 * lock-only holder is done and its row lock is released.
+						 * Do NOT fall through to native XactLockTableWait /
+						 * UpdateXmaxHintBits below — they operate on the remote raw
+						 * xid, which hangs/aliases on this node's ProcArray/CLOG
+						 * (Blocker C, same as heap_update/heap_delete).  Skip the
+						 * native wait; the post-wait recheck + HEAP_XMAX_INVALID
+						 * handling below treat the lock as released and proceed.
 						 */
+						cluster_remote_lockonly_terminal = true;
 					}
 				}
 #endif
 				/* wait for regular transaction to end, or die trying */
+#ifdef USE_PGRAC_CLUSTER
+				/*
+				 * spec-5.2: a terminal REMOTE lock-only holder is already done;
+				 * skip the native wait (XactLockTableWait on the remote raw xid
+				 * hangs/aliases — Blocker C).  The reacquire + recheck + hint-bit
+				 * handling below still run.
+				 */
+				if (!cluster_remote_lockonly_terminal)
+#endif
 				switch (wait_policy)
 				{
 					case LockWaitBlock:
@@ -5998,6 +6026,22 @@ l3:
 									 xwait))
 				goto l3;
 
+#ifdef USE_PGRAC_CLUSTER
+			if (cluster_remote_lockonly_terminal)
+			{
+				/*
+				 * spec-5.2: terminal REMOTE lock-only holder — its row lock is
+				 * released.  Mark the released xmax invalid (mirrors
+				 * UpdateXmaxHintBits for a gone lock-only locker) WITHOUT
+				 * consulting the remote raw xid's local CLOG/ProcArray, which is
+				 * meaningless for a foreign xid (AD-012).  The result-determination
+				 * below then sees HEAP_XMAX_INVALID / LOCKED_ONLY and yields TM_Ok.
+				 */
+				HeapTupleSetHintBits(tuple->t_data, *buffer, HEAP_XMAX_INVALID,
+									 InvalidTransactionId);
+			}
+			else
+#endif
 			if (!(infomask & HEAP_XMAX_IS_MULTI))
 			{
 				/*

@@ -1824,6 +1824,18 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 			if (cluster_bufmgr_copy_block_for_gcs(req->tag, &page_lsn, block_buf)) {
 				XLogRecPtr drop_lsn = InvalidXLogRecPtr;
 
+				/*
+				 * The image is already captured (copy_block_for_gcs succeeded
+				 * above) BEFORE this drop.  The drop's bool is intentionally
+				 * ignored: it returns false ONLY when the buffer is not validly
+				 * resident (BufTable miss / tag-mismatch / !BM_VALID), i.e. there
+				 * is no local copy left to stale-flush — exactly the safe
+				 * precondition for granting.  (A resident-but-pinned buffer does
+				 * not return false; it makes InvalidateBuffer wait — tracked
+				 * separately as the LMON pin-wait follow-up.)  So in every case
+				 * reachable here there is no stale copy when we hand X to the
+				 * requester.  Rule 8.A holds.
+				 */
 				(void)cluster_bufmgr_drop_block_for_gcs_no_wire(req->tag, &drop_lsn);
 				cluster_pcm_lock_master_grant_x_to(req->tag, req->sender_node, page_lsn);
 				status = GCS_BLOCK_REPLY_GRANTED;
@@ -2521,6 +2533,10 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 						 * for this tag (the master is node1), so there is no local
 						 * GRD state to transition — clearing the BufferDesc
 						 * pcm_state to N inside the helper is the full release.
+						 * The drop's bool is intentionally ignored: false = buffer
+						 * not validly resident (no stale copy); the image was
+						 * already shipped into the reply above (Rule 8.A; same
+						 * reasoning as the path-B drop site).
 						 */
 					(void)cluster_bufmgr_drop_block_for_gcs_no_wire(fwd->tag, &drop_lsn);
 					pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_x_transfer_ship_count, 1);

@@ -747,7 +747,12 @@ cluster_smgr_build_smgr_inval_msg(RelFileLocator rlocator, SharedInvalidationMes
 	 * and reconstruct it in inval.c's SHAREDINVALSMGR_ID apply path.
 	 */
 	out->sm.id = SHAREDINVALSMGR_ID;
-	out->sm.backend_hi = InvalidBackendId >> 16;
+	/* Shift through unsigned: InvalidBackendId is -1 and shifting a negative
+	 * value is UB (cppcheck shiftNegativeLHS).  ((uint32) -1) >> 16 == 0xffff,
+	 * which truncates into the int8 backend_hi as -1 — byte-identical to PG's
+	 * CacheInvalidateSmgr() and round-trips back to InvalidBackendId in the
+	 * SHAREDINVALSMGR_ID apply path. */
+	out->sm.backend_hi = ((uint32)InvalidBackendId) >> 16;
 	out->sm.backend_lo = InvalidBackendId & 0xffff;
 	out->sm.rlocator = rlocator;
 }
