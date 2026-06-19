@@ -56,13 +56,16 @@
 
 #include "commands/tablespace.h"
 #include "common/relpath.h"
+#include "miscadmin.h" /* spec-5.2 D1: CritSectionCount */
 #include "storage/md.h"
 #include "storage/shmem.h"
+#include "utils/errcodes.h" /* spec-5.2 D1: ERRCODE_CLUSTER_SINVAL_QUEUE_FULL */
 #include "utils/hsearch.h"
 
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_sinval.h"		 /* spec-5.2 D1: relsize inval broadcast */
 #include "cluster/cluster_write_fence.h" /* spec-4.12 D5 — hot write-path fence gate */
 #include "cluster/storage/cluster_shared_fs.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -133,6 +136,10 @@ static HTAB *cluster_smgr_relations = NULL;
  */
 typedef struct ClusterSmgrShmem {
 	pg_atomic_uint64 remote_invalidation_stub_call_count;
+	/* spec-5.2 D1: count of relsize SMGR invalidations actually broadcast
+	 * to peers (source side).  Distinct from the legacy hook-invocation
+	 * counter above, which advances even when no broadcast is emitted. */
+	pg_atomic_uint64 smgr_inval_bcast_sent_count;
 } ClusterSmgrShmem;
 
 static ClusterSmgrShmem *cluster_smgr_state = NULL;
@@ -727,26 +734,101 @@ cluster_smgr_remote_invalidation_inc(void)
 }
 
 
+/*
+ * spec-5.2 D1 (M2 relsize coherence) — pure helpers (unit-tested by U2).
+ */
+void
+cluster_smgr_build_smgr_inval_msg(RelFileLocator rlocator, SharedInvalidationMessage *out)
+{
+	/*
+	 * Mirror PG's CacheInvalidateSmgr() construction (inval.c).  Cluster
+	 * relations live on shared storage and are never temp, so the backend
+	 * component is InvalidBackendId — peers store the three packed bytes
+	 * and reconstruct it in inval.c's SHAREDINVALSMGR_ID apply path.
+	 */
+	out->sm.id = SHAREDINVALSMGR_ID;
+	out->sm.backend_hi = InvalidBackendId >> 16;
+	out->sm.backend_lo = InvalidBackendId & 0xffff;
+	out->sm.rlocator = rlocator;
+}
+
+ClusterSmgrInvalFullAction
+cluster_smgr_inval_full_action(bool in_crit_section)
+{
+	/*
+	 * H2 fail-closed:  a dropped relsize invalidation leaves the peer with
+	 * a stale-low smgr_cached_nblocks forever (8.A — it would read a
+	 * committed block as "does not exist").  Outside a critical section we
+	 * abort the extend (53R94);  inside one we cannot ereport(ERROR), so we
+	 * fall back to a coarse RESET-all broadcast.
+	 */
+	return in_crit_section ? CLUSTER_SMGR_INVAL_FULL_RESET_ALL : CLUSTER_SMGR_INVAL_FULL_ABORT;
+}
+
+static inline void
+cluster_smgr_inval_bcast_sent_inc(void)
+{
+	if (cluster_smgr_state == NULL)
+		return;
+	pg_atomic_fetch_add_u64(&cluster_smgr_state->smgr_inval_bcast_sent_count, 1);
+}
+
 void
 cluster_smgr_invalidate_relation(RelFileLocator rlocator, ForkNumber forknum)
 {
+	SharedInvalidationMessage msg;
+
 	/*
-	 * spec-2.7 Q1 v0.2:  pure cross-instance broadcast STUB.  No
-	 * local action -- PG smgr.c invalidates its own
-	 * smgr_cached_nblocks via existing extend / truncate internals;
-	 * cluster_smgr layer carries no relation-keyed cache to flush.
-	 *
-	 * spec-2.27 will replace this body with an SI Broadcaster send
-	 * for sinval message type SINVAL_SMGR_INVALIDATE_RELATION.
-	 *
-	 * Q3 v0.2:  no hot-path DEBUG2 ereport (errstart_cold short-
-	 * circuit costs ~100ns; per-block smgrextend in 1024-block
-	 * batches would amount to ~100us of pure noise).  Counter atomic
-	 * add only.
+	 * spec-5.2 D1 (was spec-2.7 pure STUB):  broadcast a PG-native
+	 * SHAREDINVALSMGR_ID invalidation so peers drop their stale
+	 * SMgrRelation (incl. smgr_cached_nblocks) and re-stat the shared file
+	 * on next smgrnblocks().  G2:  no new wire type — reuse PG's
+	 * SharedInvalSmgrMsg in the existing cluster sinval tail.  forknum is
+	 * irrelevant to the message: smgrcloserellocator() on the peer drops
+	 * every fork's cached size at once (matches CacheInvalidateSmgr).
 	 */
-	(void)rlocator;
 	(void)forknum;
 
+	/*
+	 * Only the cross-instance broadcast path is in scope here.  If the
+	 * outbound sinval queue is not attached (single node, bootstrap,
+	 * cluster disabled), there are no peers to tell — skip silently (the
+	 * legacy counter below still advances).  Distinguishing this from a
+	 * genuinely full queue is essential: a NULL outbound is benign, a full
+	 * one is the H2 fail-closed case.
+	 */
+	if (!cluster_sinval_is_active()) {
+		cluster_smgr_remote_invalidation_inc();
+		return;
+	}
+
+	cluster_smgr_build_smgr_inval_msg(rlocator, &msg);
+
+	if (cluster_sinval_enqueue_batch(&msg, 1))
+		cluster_smgr_inval_bcast_sent_inc();
+	else {
+		/*
+		 * H2 enqueue-full fail-closed — never silently continue (the peer
+		 * would stay stale-low and the relsize apply barrier would never
+		 * fire).  Policy depends on whether we may throw here.
+		 */
+		if (cluster_smgr_inval_full_action(CritSectionCount > 0)
+			== CLUSTER_SMGR_INVAL_FULL_RESET_ALL) {
+			/* In a critical section (e.g. inside the extend's WAL insert):
+			 * cannot ERROR.  Request a coarse RESET-all broadcast so peers
+			 * re-stat everything — correctness over precision. */
+			cluster_sinval_request_reset_all_broadcast();
+		} else {
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_SINVAL_QUEUE_FULL),
+							errmsg("cluster relsize invalidation queue full"),
+							errhint("Peers could not be told the relation grew; "
+									"raise cluster.sinval_broadcast_max_queue_size or "
+									"retry the operation.")));
+		}
+	}
+
+	/* Legacy hook-invocation counter (dump_smgr observability) — advances
+	 * on every call regardless of broadcast outcome. */
 	cluster_smgr_remote_invalidation_inc();
 }
 
@@ -811,6 +893,14 @@ cluster_smgr_get_remote_invalidation_stub_call_count(void)
 	return pg_atomic_read_u64(&cluster_smgr_state->remote_invalidation_stub_call_count);
 }
 
+uint64
+cluster_smgr_get_inval_bcast_sent_count(void)
+{
+	if (cluster_smgr_state == NULL)
+		return 0;
+	return pg_atomic_read_u64(&cluster_smgr_state->smgr_inval_bcast_sent_count);
+}
+
 
 /* ============================================================
  * spec-2.7 D6 hardening F1 (2026-05-09):  shmem region for the
@@ -832,8 +922,10 @@ cluster_smgr_shmem_init(void)
 
 	cluster_smgr_state = (ClusterSmgrShmem *)ShmemInitStruct("pgrac cluster smgr",
 															 cluster_smgr_shmem_size(), &found);
-	if (!found)
+	if (!found) {
 		pg_atomic_init_u64(&cluster_smgr_state->remote_invalidation_stub_call_count, 0);
+		pg_atomic_init_u64(&cluster_smgr_state->smgr_inval_bcast_sent_count, 0);
+	}
 }
 
 static const ClusterShmemRegion cluster_smgr_region = {

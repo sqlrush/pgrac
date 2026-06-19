@@ -216,6 +216,47 @@ before_shmem_exit(pg_on_exit_callback function pg_attribute_unused(),
 				  Datum arg pg_attribute_unused())
 {}
 
+/* ----------
+ * spec-5.2 D1 stubs:  cluster_smgr_invalidate_relation now broadcasts a
+ * PG-native SHAREDINVALSMGR_ID via cluster_sinval_enqueue_batch (no new
+ * wire, G2).  cluster_sinval.o is NOT linked into this standalone test
+ * (L342/L346), so we stub the outbound enqueue + reset-all request and
+ * capture the last batch the smgr hook tried to broadcast.
+ * ----------
+ */
+#include "storage/sinval.h"
+
+volatile uint32 CritSectionCount = 0;
+
+static SharedInvalidationMessage stub_sinval_last_msg;
+static int stub_sinval_last_n = -1;
+static int stub_sinval_enqueue_calls = 0;
+static bool stub_sinval_enqueue_result = true; /* test-controllable */
+static bool stub_sinval_active = true;		   /* test-controllable */
+static int stub_reset_all_requests = 0;
+
+bool
+cluster_sinval_is_active(void)
+{
+	return stub_sinval_active;
+}
+
+bool
+cluster_sinval_enqueue_batch(const SharedInvalidationMessage *msgs, int n)
+{
+	stub_sinval_enqueue_calls++;
+	stub_sinval_last_n = n;
+	if (n > 0 && msgs != NULL)
+		stub_sinval_last_msg = msgs[0];
+	return stub_sinval_enqueue_result;
+}
+
+void
+cluster_sinval_request_reset_all_broadcast(void)
+{
+	stub_reset_all_requests++;
+}
+
 /*
  * spec-2.7 hardening F1 (2026-05-09):  cluster_smgr now allocates
  * its cross-instance broadcast STUB counter in shmem via
@@ -231,7 +272,10 @@ before_shmem_exit(pg_on_exit_callback function pg_attribute_unused(),
  * bypass the registry/lifecycle layer entirely.
  */
 #define CLUSTER_SMGR_UT_SHMEM_BUFSZ 1024
-static char cluster_smgr_ut_shmem_buffer[CLUSTER_SMGR_UT_SHMEM_BUFSZ];
+/* 8-byte aligned: the struct holds pg_atomic_uint64 fields and ARM64 LSE
+ * atomics fault on a misaligned address.  A bare char[] only guarantees
+ * 1-byte alignment (it "worked by luck" until a relink shifted it). */
+static pg_attribute_aligned(8) char cluster_smgr_ut_shmem_buffer[CLUSTER_SMGR_UT_SHMEM_BUFSZ];
 void *
 ShmemInitStruct(const char *n pg_attribute_unused(), Size s pg_attribute_unused(), bool *foundPtr)
 {
@@ -520,20 +564,94 @@ UT_TEST(test_smgrsw_callback_signature_compiles)
  *	verify only the counter contract and the function-symbol surface.
  * ============================================================ */
 
-UT_TEST(test_invalidate_relation_is_pure_stub)
+/* spec-5.2 D1 (U2):  cluster_smgr_build_smgr_inval_msg builds a PG-native
+ * SHAREDINVALSMGR_ID message with backend == InvalidBackendId (cluster rels
+ * are never temp) and the exact rlocator.  Pure — no shmem, no broadcast. */
+UT_TEST(test_build_smgr_inval_msg_is_pg_native)
 {
 	RelFileLocator rl = { .spcOid = 1664, .dbOid = 5, .relNumber = 16385 };
-	uint64 before;
-	uint64 after;
+	SharedInvalidationMessage msg;
+	int backend;
 
-	before = cluster_smgr_get_remote_invalidation_stub_call_count();
+	memset(&msg, 0xAB, sizeof(msg)); /* poison to prove every field is set */
+	cluster_smgr_build_smgr_inval_msg(rl, &msg);
+
+	UT_ASSERT_EQ(msg.sm.id, SHAREDINVALSMGR_ID);
+
+	/* backend reconstructed from the three stored bytes == InvalidBackendId */
+	backend = ((int)msg.sm.backend_hi << 16) | (int)msg.sm.backend_lo;
+	UT_ASSERT_EQ(backend, InvalidBackendId);
+
+	UT_ASSERT_EQ(msg.sm.rlocator.spcOid, rl.spcOid);
+	UT_ASSERT_EQ(msg.sm.rlocator.dbOid, rl.dbOid);
+	UT_ASSERT_EQ(msg.sm.rlocator.relNumber, rl.relNumber);
+}
+
+/* spec-5.2 D1 (U2 / H2):  enqueue-full fail-closed policy — outside a
+ * critical section abort the extend (53R94); inside one fall back to a
+ * coarse RESET-all (cannot ereport(ERROR) in a critical section). */
+UT_TEST(test_inval_full_action_crit_vs_noncrit)
+{
+	UT_ASSERT_EQ(cluster_smgr_inval_full_action(false), CLUSTER_SMGR_INVAL_FULL_ABORT);
+	UT_ASSERT_EQ(cluster_smgr_inval_full_action(true), CLUSTER_SMGR_INVAL_FULL_RESET_ALL);
+}
+
+/* spec-5.2 D1 (U2):  the extend hook broadcasts exactly one PG-native SMGR
+ * inval for the relation and bumps the sent counter on success. */
+UT_TEST(test_invalidate_relation_broadcasts_smgr_inval)
+{
+	RelFileLocator rl = { .spcOid = 1664, .dbOid = 5, .relNumber = 16385 };
+	uint64 sent_before;
+	uint64 sent_after;
+
+	stub_sinval_enqueue_calls = 0;
+	stub_sinval_last_n = -1;
+	stub_sinval_enqueue_result = true;
+	stub_sinval_active = true;
+	stub_reset_all_requests = 0;
+
+	sent_before = cluster_smgr_get_inval_bcast_sent_count();
 	cluster_smgr_invalidate_relation(rl, MAIN_FORKNUM);
-	after = cluster_smgr_get_remote_invalidation_stub_call_count();
+	sent_after = cluster_smgr_get_inval_bcast_sent_count();
 
-	/* Counter advanced by exactly one;cluster_smgr_active_relation_count
-	 * unchanged because invalidate_relation has no local HTAB action. */
-	UT_ASSERT_EQ(after - before, 1);
+	/* Exactly one batch of one SHAREDINVALSMGR_ID message was broadcast. */
+	UT_ASSERT_EQ(stub_sinval_enqueue_calls, 1);
+	UT_ASSERT_EQ(stub_sinval_last_n, 1);
+	UT_ASSERT_EQ(stub_sinval_last_msg.sm.id, SHAREDINVALSMGR_ID);
+	UT_ASSERT_EQ(stub_sinval_last_msg.sm.rlocator.relNumber, rl.relNumber);
+
+	/* sent counter advanced by one;no RESET-all fallback on the happy path. */
+	UT_ASSERT_EQ(sent_after - sent_before, 1);
+	UT_ASSERT_EQ(stub_reset_all_requests, 0);
+
+	/* HTAB untouched — invalidate_relation has no local relation action. */
 	UT_ASSERT_EQ(cluster_smgr_active_relation_count(), 0);
+}
+
+/* spec-5.2 D1:  when the outbound sinval path is not attached (single node /
+ * bootstrap / cluster disabled) the hook must NOT broadcast and must NOT
+ * fail-closed — a NULL outbound is "no peers to tell", not backpressure. */
+UT_TEST(test_invalidate_relation_inactive_skips_broadcast)
+{
+	RelFileLocator rl = { .spcOid = 1664, .dbOid = 5, .relNumber = 16385 };
+	uint64 sent_before;
+	uint64 sent_after;
+
+	stub_sinval_enqueue_calls = 0;
+	stub_sinval_active = false; /* outbound not attached */
+	stub_sinval_enqueue_result = true;
+	stub_reset_all_requests = 0;
+
+	sent_before = cluster_smgr_get_inval_bcast_sent_count();
+	cluster_smgr_invalidate_relation(rl, MAIN_FORKNUM);
+	sent_after = cluster_smgr_get_inval_bcast_sent_count();
+
+	/* No enqueue attempt, no sent bump, no RESET-all — pure skip. */
+	UT_ASSERT_EQ(stub_sinval_enqueue_calls, 0);
+	UT_ASSERT_EQ(sent_after - sent_before, 0);
+	UT_ASSERT_EQ(stub_reset_all_requests, 0);
+
+	stub_sinval_active = true; /* restore for later tests */
 }
 
 
@@ -618,7 +736,7 @@ main(void)
 	 */
 	cluster_smgr_shmem_init();
 
-	UT_PLAN(11);
+	UT_PLAN(14);
 	UT_RUN(test_smgr_callbacks_linkable);
 	UT_RUN(test_which_for_temp_relation_returns_md);
 	UT_RUN(test_which_for_stub_backend_returns_md);
@@ -626,7 +744,10 @@ main(void)
 	UT_RUN(test_which_for_full_opt_in_returns_cluster);
 	UT_RUN(test_active_relation_count_pre_init);
 	UT_RUN(test_smgrsw_callback_signature_compiles);
-	UT_RUN(test_invalidate_relation_is_pure_stub);
+	UT_RUN(test_build_smgr_inval_msg_is_pg_native);
+	UT_RUN(test_inval_full_action_crit_vs_noncrit);
+	UT_RUN(test_invalidate_relation_broadcasts_smgr_inval);
+	UT_RUN(test_invalidate_relation_inactive_skips_broadcast);
 	UT_RUN(test_invalidate_relmap_takes_bool_shared);
 	UT_RUN(test_invalidate_unlink_pending_includes_local_close);
 	UT_RUN(test_remote_invalidation_counter_is_atomic_and_monotonic);

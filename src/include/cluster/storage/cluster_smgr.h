@@ -76,6 +76,7 @@
 #include "port/atomics.h"
 #include "storage/block.h"
 #include "storage/relfilelocator.h"
+#include "storage/sinval.h" /* spec-5.2 D1: SharedInvalidationMessage */
 #include "storage/smgr.h"
 
 
@@ -220,6 +221,47 @@ extern Size cluster_smgr_shmem_size(void);
 extern void cluster_smgr_shmem_init(void);
 extern void cluster_smgr_shmem_register(void);
 extern uint64 cluster_smgr_get_remote_invalidation_stub_call_count(void);
+
+/* ----------
+ * spec-5.2 D1 (relsize coherence, M2) — relation-extend invalidation
+ * broadcast helpers.  cluster_smgr_invalidate_relation() now constructs
+ * a PG-native SHAREDINVALSMGR_ID message (no new wire type, G2) and
+ * broadcasts it via cluster_sinval_enqueue_batch() so peers drop their
+ * stale SMgrRelation (incl. smgr_cached_nblocks) and re-stat the shared
+ * file on next smgrnblocks().  The two helpers below are pure and exist
+ * so the construction + enqueue-full policy are unit-testable in
+ * isolation (U2).
+ * ----------
+ */
+
+/*
+ * cluster_smgr_build_smgr_inval_msg — build a PG-native SHAREDINVALSMGR_ID
+ * invalidation message for a cluster relation.  Cluster relations live on
+ * shared storage and are never temp, so backend == InvalidBackendId.
+ * Mirrors PG's CacheInvalidateSmgr() message construction.
+ */
+extern void cluster_smgr_build_smgr_inval_msg(RelFileLocator rlocator,
+											  SharedInvalidationMessage *out);
+
+/*
+ * cluster_smgr_inval_full_action — enqueue-full fail-closed policy (H2).
+ * Never silently drop a relsize invalidation: outside a critical section
+ * the caller aborts the extend (ERRCODE_CLUSTER_SINVAL_QUEUE_FULL 53R94);
+ * inside a critical section it cannot ereport(ERROR), so it falls back to
+ * a coarse RESET-all broadcast (peers re-stat everything).
+ */
+typedef enum ClusterSmgrInvalFullAction {
+	CLUSTER_SMGR_INVAL_FULL_ABORT = 0, /* non-crit: ereport 53R94 */
+	CLUSTER_SMGR_INVAL_FULL_RESET_ALL  /* crit: RESET-all fallback */
+} ClusterSmgrInvalFullAction;
+
+extern ClusterSmgrInvalFullAction cluster_smgr_inval_full_action(bool in_crit_section);
+
+/*
+ * spec-5.2 D1/D9 — count of relsize invalidations successfully broadcast
+ * (source side).  Used by t/279 + dump_smgr observability.
+ */
+extern uint64 cluster_smgr_get_inval_bcast_sent_count(void);
 
 /*
  * Public smgrsw[] dispatch index reserved for cluster_smgr.  Used by

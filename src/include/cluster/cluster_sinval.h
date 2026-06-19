@@ -307,6 +307,28 @@ extern uint64 cluster_sinval_get_ack_timeout_count(void);
 extern uint64 cluster_sinval_get_ack_orphan_count(void);
 
 /*
+ * spec-5.2 D1 — relsize coherence apply barrier + crit-section RESET-all.
+ *
+ *   cluster_sinval_get_smgr_inval_applied_count():  count of
+ *   SHAREDINVALSMGR_ID messages drained into the local SI queue from peers
+ *   (G3 apply barrier — t/279 polls this before reading).
+ *
+ *   cluster_sinval_request_reset_all_broadcast():  enqueuer-side request for
+ *   a coarse RESET-all fanout, used by cluster_smgr_invalidate_relation()
+ *   when an outbound relsize inval cannot be enqueued inside a critical
+ *   section (H2 fail-closed, where ereport(ERROR) is not allowed).
+ */
+extern uint64 cluster_sinval_get_smgr_inval_applied_count(void);
+extern void cluster_sinval_request_reset_all_broadcast(void);
+
+/*
+ * spec-5.2 D1 — true when the outbound broadcast queue is attached in this
+ * process.  Lets fail-closed callers distinguish a full queue (false +
+ * active) from "no broadcast path here" (false + inactive).
+ */
+extern bool cluster_sinval_is_active(void);
+
+/*
  * spec-2.39 D2 — peer_enqueued ack/barrier blocking variant.
  *
  *   Used by AtEOXact_Inval(true) + COMMIT PREPARED production hook (D1).

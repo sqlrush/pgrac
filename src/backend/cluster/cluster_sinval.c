@@ -130,6 +130,12 @@ typedef struct ClusterSinvalShared {
 	pg_atomic_uint64 ack_received_count;
 	pg_atomic_uint64 ack_timeout_count;
 	pg_atomic_uint64 ack_orphan_count;
+	/* spec-5.2 D1 (G3):  count of SHAREDINVALSMGR_ID messages drained into
+	 * the local SI queue from peers.  This is the relsize apply barrier —
+	 * once it advances past a baseline, the next lock-acquire on the
+	 * relation drops the stale SMgrRelation and re-stats the shared file.
+	 * Distinct from broadcast_receive_count, which counts whole batches. */
+	pg_atomic_uint64 smgr_inval_applied_count;
 } ClusterSinvalShared;
 
 
@@ -214,6 +220,8 @@ cluster_sinval_outbound_shmem_init(void)
 		pg_atomic_init_u64(&ClusterSinval->ack_received_count, 0);
 		pg_atomic_init_u64(&ClusterSinval->ack_timeout_count, 0);
 		pg_atomic_init_u64(&ClusterSinval->ack_orphan_count, 0);
+		/* spec-5.2 D1:  relsize apply barrier counter. */
+		pg_atomic_init_u64(&ClusterSinval->smgr_inval_applied_count, 0);
 	} else {
 		if (!bootstrap_or_disabled)
 			ClusterSinvalOutbound = (ClusterSinvalQueue *)block;
@@ -655,6 +663,19 @@ cluster_sinval_drain_inbound_and_apply(void)
 		 * SInvalWriteLock and trigger reset broadcast internally. */
 		SendSharedInvalidMessages(local.msgs, local.nmsgs);
 		pg_atomic_fetch_add_u64(&ClusterSinval->inject_local_queue_count, 1);
+
+		/* spec-5.2 D1 (G3):  advance the relsize apply barrier for every
+		 * SHAREDINVALSMGR_ID message that just entered the local SI queue.
+		 * Backends pick these up on their next AcceptInvalidationMessages
+		 * (lock acquire) and re-stat the shared file. */
+		{
+			int i;
+
+			for (i = 0; i < local.nmsgs; i++)
+				if (local.msgs[i].id == SHAREDINVALSMGR_ID)
+					pg_atomic_fetch_add_u64(&ClusterSinval->smgr_inval_applied_count, 1);
+		}
+
 		drained++;
 	}
 }
@@ -893,6 +914,47 @@ uint64
 cluster_sinval_get_ack_orphan_count(void)
 {
 	return ClusterSinval ? pg_atomic_read_u64(&ClusterSinval->ack_orphan_count) : 0;
+}
+
+uint64
+cluster_sinval_get_smgr_inval_applied_count(void)
+{
+	return ClusterSinval ? pg_atomic_read_u64(&ClusterSinval->smgr_inval_applied_count) : 0;
+}
+
+/*
+ * spec-5.2 D1 — is the outbound broadcast path attached in this process?
+ *
+ *	cluster_sinval_enqueue_batch() returns false BOTH when the outbound
+ *	queue is genuinely full AND when it is simply not attached (single
+ *	node, bootstrap, cluster disabled).  Callers that must fail-closed on
+ *	a full queue (e.g. cluster_smgr_invalidate_relation, H2) use this
+ *	predicate first to tell the two apart — a NULL outbound is a benign
+ *	"no peers to tell", not a backpressure failure.
+ */
+bool
+cluster_sinval_is_active(void)
+{
+	return ClusterSinvalOutbound != NULL;
+}
+
+/*
+ * spec-5.2 D1 (H2):  public request for a coarse RESET-all broadcast.
+ *
+ *	Called by cluster_smgr_invalidate_relation() when an outbound relsize
+ *	invalidation cannot be enqueued (queue full) inside a critical section,
+ *	where ereport(ERROR) is not allowed.  Sets the enqueuer-side pending
+ *	flag and wakes LMON, which fans out the SINVAL_RESET_ALL_BROADCAST
+ *	sentinel (same mechanism the spec-2.39 ack path uses).  NULL-guarded so
+ *	pre-shmem / cluster-disabled call sites are safe no-ops.
+ */
+void
+cluster_sinval_request_reset_all_broadcast(void)
+{
+	if (ClusterSinval == NULL)
+		return;
+	pg_atomic_write_u32(&ClusterSinval->reset_all_broadcast_pending, 1);
+	cluster_lmon_wakeup();
 }
 
 
