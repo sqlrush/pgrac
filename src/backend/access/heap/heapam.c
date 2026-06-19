@@ -3012,18 +3012,46 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 
 	if (cres.status == CLUSTER_TT_STATUS_IN_PROGRESS
 		|| cres.status == CLUSTER_TT_STATUS_SUBCOMMITTED) {
+		/*
+		 * PGRAC: spec-5.2 D5 — cross-node TX enqueue completion wait for a
+		 * remote writer.  Both lock-only and single-writer conflicts have a
+		 * full TT key here (ckey above), so they can wait.  The remote
+		 * MultiXact branch up top stays fail-closed (53R9H) — it only has a
+		 * marker_origin, not a full TT key (F3 / Rule 8.A).
+		 *
+		 * After the holder completes, restore the buffer content lock and
+		 * return; the caller's native XactLockTableWait on the now-terminal
+		 * remote xid is a no-op, and its post-wait recheck sees the new state.
+		 */
+		if (cluster_tx_enqueue_wait_enabled) {
+			ClusterTxwResult txw;
+
+			txw = cluster_tx_enqueue_wait(&ckey, cluster_ges_request_timeout_ms);
+			if (txw == CLUSTER_TXW_TIMEOUT) {
+				cluster_vis_bump_vis_conflict_failclosed_count();
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_GES_TIMEOUT),
+						 errmsg("timed out waiting for remote writer %u on node %u",
+								xwait, cref.origin_node_id),
+						 errhint("Holder did not complete within"
+								 " cluster.ges_request_timeout_ms; retry.")));
+			}
+			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+			return;
+		}
+
+		/* cluster.tx_enqueue_wait off: honest fail-closed (spec-3.4d). */
 		cluster_vis_bump_vis_conflict_failclosed_count();
 		if (HEAP_XMAX_IS_LOCKED_ONLY(saved_infomask))
 			ereport(ERROR, (errcode(ERRCODE_CLUSTER_REMOTE_ROW_LOCK_WAIT_NOT_SUPPORTED),
 							errmsg("cannot wait for remote row lock held by transaction %u on node %u",
 								   xwait, cref.origin_node_id),
-							errhint("Cross-node block-wait is not supported in spec-3.4d; "
-									"application should retry, use SKIP LOCKED, or wait for "
-									"spec-5.2 GES TX to ship.")));
+							errhint("cluster.tx_enqueue_wait is off; retry, use SKIP LOCKED, or "
+									"enable it for cross-node TX waits.")));
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
 						errmsg("cross-node write conflict: remote writer %u on node %u still running",
 							   xwait, cref.origin_node_id),
-						errhint("Retry the transaction; cross-node write wait lands at Stage 5.2.")));
+						errhint("cluster.tx_enqueue_wait is off; retry the transaction.")));
 	}
 
 	/* Remote writer already terminal (committed/aborted): restore the buffer

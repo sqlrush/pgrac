@@ -69,6 +69,7 @@ typedef struct ClusterTxwWaitSlot {
 typedef struct ClusterTxwShmem {
 	LWLock lock; /* protects the slot scan / set / clear */
 	int nslots;
+	pg_atomic_uint32 active_waiters; /* >0 => a wake scan may be worthwhile */
 	pg_atomic_uint64 wait_count;
 	pg_atomic_uint64 wakeup_count;
 	pg_atomic_uint64 timeout_count;
@@ -131,6 +132,7 @@ cluster_tx_enqueue_shmem_init(void)
 
 		LWLockInitialize(&ClusterTxw->lock, LWTRANCHE_CLUSTER_TT_STATUS);
 		ClusterTxw->nslots = MaxBackends;
+		pg_atomic_init_u32(&ClusterTxw->active_waiters, 0);
 		pg_atomic_init_u64(&ClusterTxw->wait_count, 0);
 		pg_atomic_init_u64(&ClusterTxw->wakeup_count, 0);
 		pg_atomic_init_u64(&ClusterTxw->timeout_count, 0);
@@ -165,6 +167,8 @@ static void
 txw_slot_set(int procno, const ClusterTTStatusKey *holder_key)
 {
 	LWLockAcquire(&ClusterTxw->lock, LW_EXCLUSIVE);
+	if (ClusterTxw->slots[procno].waiting == 0)
+		pg_atomic_fetch_add_u32(&ClusterTxw->active_waiters, 1);
 	ClusterTxw->slots[procno].holder_key = *holder_key;
 	ClusterTxw->slots[procno].waiting = 1;
 	LWLockRelease(&ClusterTxw->lock);
@@ -174,6 +178,8 @@ static void
 txw_slot_clear(int procno)
 {
 	LWLockAcquire(&ClusterTxw->lock, LW_EXCLUSIVE);
+	if (ClusterTxw->slots[procno].waiting != 0)
+		pg_atomic_fetch_sub_u32(&ClusterTxw->active_waiters, 1);
 	ClusterTxw->slots[procno].waiting = 0;
 	LWLockRelease(&ClusterTxw->lock);
 }
@@ -254,6 +260,11 @@ cluster_txw_wake_waiters(const ClusterTTStatusKey *holder_key)
 	int nslots;
 
 	if (ClusterTxw == NULL || holder_key == NULL)
+		return;
+
+	/* Fast path: this runs on every terminal TT install (commit/abort hot
+	 * path) — skip the LWLock + scan entirely when nobody is waiting. */
+	if (pg_atomic_read_u32(&ClusterTxw->active_waiters) == 0)
 		return;
 
 	LWLockAcquire(&ClusterTxw->lock, LW_SHARED);
