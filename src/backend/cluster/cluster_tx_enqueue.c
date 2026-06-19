@@ -245,7 +245,7 @@ cluster_tx_enqueue_wait(const ClusterTTStatusKey *holder_key, int effective_time
 			wait_ms = CLUSTER_TXW_TICK_MS;
 
 		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, wait_ms,
-						WAIT_EVENT_GES_GRANT_WAIT);
+						WAIT_EVENT_GES_TX_ENQUEUE_WAIT);
 		CHECK_FOR_INTERRUPTS();
 	}
 

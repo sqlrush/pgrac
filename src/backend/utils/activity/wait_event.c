@@ -925,6 +925,9 @@ pgstat_get_wait_cluster_ges(WaitEventCluster w)
 	case WAIT_EVENT_GES_DEADLOCK_REASSEMBLY_WAIT:
 		event_name = "GesDeadlockReassemblyWait";
 		break;
+	case WAIT_EVENT_GES_TX_ENQUEUE_WAIT:
+		event_name = "GesTxEnqueueWait";
+		break;
 	default:
 		break;
 	}

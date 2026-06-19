@@ -115,6 +115,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_sinval.h"			 /* SI Broadcaster counter accessors (spec-2.38 D10) */
 #include "cluster/cluster_tt_status.h"		 /* TT status overlay counter accessors (spec-3.1 D9) */
 #include "cluster/cluster_tt_status_hint.h"	 /* TT status hint counter accessors (spec-3.2 D8) */
+#include "cluster/cluster_tx_enqueue.h"		 /* TX enqueue wait counters (spec-5.2 D4/D6) */
 #include "cluster/cluster_startup_phase.h"	 /* phase enum + accessors (stage 1.10) */
 #include "storage/bufpage.h"	   /* PG_PAGE_LAYOUT_VERSION, SizeOfPageHeaderData (stage 1.4) */
 #include "storage/buf_internals.h" /* BufferDesc layout (stage 1.6) */
@@ -1120,6 +1121,13 @@ dump_ges(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_ges_reply_late_drop_count()));
 	emit_row(rsinfo, "ges", "ges_release_ack_count",
 			 fmt_int64((int64)cluster_ges_release_ack_count()));
+	/* spec-5.2 D4/D6:  cross-node TX enqueue completion-wait counters. */
+	emit_row(rsinfo, "ges", "tx_enqueue_wait_count",
+			 fmt_int64((int64)cluster_txw_get_wait_count()));
+	emit_row(rsinfo, "ges", "tx_enqueue_wakeup_count",
+			 fmt_int64((int64)cluster_txw_get_wakeup_count()));
+	emit_row(rsinfo, "ges", "tx_enqueue_timeout_count",
+			 fmt_int64((int64)cluster_txw_get_timeout_count()));
 }
 
 
@@ -1161,6 +1169,9 @@ dump_shared_fs(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "shared_fs", "smgr_user_relations", fmt_bool(cluster_smgr_user_relations));
 	emit_row(rsinfo, "shared_fs", "smgr_active_relations",
 			 fmt_int32(cluster_smgr_active_relation_count()));
+	/* spec-5.2 D1:  relsize SMGR-inval broadcasts emitted (source side). */
+	emit_row(rsinfo, "shared_fs", "smgr_inval_bcast_sent_count",
+			 fmt_int64((int64)cluster_smgr_get_inval_bcast_sent_count()));
 }
 
 /*
@@ -1503,6 +1514,9 @@ dump_gcs(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_sinval_get_ack_timeout_count()));
 	emit_row(rsinfo, "sinval", "ack_orphan_count",
 			 fmt_int64((int64)cluster_sinval_get_ack_orphan_count()));
+	/* spec-5.2 D1 (G3):  relsize SMGR-inval apply barrier (peers re-stat). */
+	emit_row(rsinfo, "sinval", "smgr_inval_applied_count",
+			 fmt_int64((int64)cluster_sinval_get_smgr_inval_applied_count()));
 
 	/* spec-3.1 D9:  7 NEW counter rows for Undo TT status overlay. */
 	emit_row(rsinfo, "tt_status", "install_count",

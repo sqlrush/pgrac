@@ -298,6 +298,9 @@ typedef enum {
 	WAIT_EVENT_GES_DEADLOCK_PROBE_WAIT,
 	WAIT_EVENT_GES_CANCEL_DRAIN,
 	WAIT_EVENT_GES_DEADLOCK_REASSEMBLY_WAIT,
+	/* spec-5.2 D9:  cross-node TX enqueue completion wait (a backend blocked
+	 * on a row lock held by a transaction on another node). */
+	WAIT_EVENT_GES_TX_ENQUEUE_WAIT,
 
 	/* Cluster: PCM (14 events: base 6 + spec-2.30 2 + spec-2.31 1 +
 	 * spec-2.32 1 + spec-2.33 4) -- subsystem #6 */

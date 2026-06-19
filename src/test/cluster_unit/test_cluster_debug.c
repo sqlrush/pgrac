@@ -192,6 +192,12 @@ cluster_smgr_active_relation_count(void)
 {
 	return 0;
 }
+/* spec-5.2 D1 stub: relsize SMGR-inval broadcast-sent counter. */
+uint64
+cluster_smgr_get_inval_bcast_sent_count(void)
+{
+	return 0;
+}
 bool cluster_smgr_user_relations = false;
 
 /* spec-4.12 D7 + spec-4.12b D6 stubs: dump_write_fence (cluster_debug.o) reads 8
@@ -716,6 +722,12 @@ cluster_sinval_get_ack_timeout_count(void)
 }
 uint64
 cluster_sinval_get_ack_orphan_count(void)
+{
+	return 0;
+}
+/* spec-5.2 D1 stub: relsize SMGR-inval apply barrier counter. */
+uint64
+cluster_sinval_get_smgr_inval_applied_count(void)
 {
 	return 0;
 }
@@ -2607,6 +2619,22 @@ cluster_ges_reply_late_drop_count(void)
 }
 uint64
 cluster_ges_release_ack_count(void)
+{
+	return 0;
+}
+/* spec-5.2 D4/D6 stubs: TX enqueue completion-wait counters. */
+uint64
+cluster_txw_get_wait_count(void)
+{
+	return 0;
+}
+uint64
+cluster_txw_get_wakeup_count(void)
+{
+	return 0;
+}
+uint64
+cluster_txw_get_timeout_count(void)
 {
 	return 0;
 }
