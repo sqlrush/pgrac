@@ -65,15 +65,6 @@ sub bg_start_blocking
 	$h->query_until(qr/PGRAC_FIRED/, "\\echo PGRAC_FIRED\n$sql;\n");
 }
 
-# Non-blocking pump; returns everything accumulated on stdout since the last
-# query_until cleared it (i.e. the blocking statement's eventual result tag).
-sub bg_peek
-{
-	my ($h) = @_;
-	$h->{run}->pump_nb;
-	return $h->{stdout};
-}
-
 # Poll a node's pg_stat_activity until a backend running $qlike is in the
 # given wait_event (or timeout).  Returns 1 on match, 0 on timeout.
 sub wait_for_wait_event
@@ -93,14 +84,21 @@ sub wait_for_wait_event
 	return 0;
 }
 
-# Poll bg stdout until it matches $re (the blocked query finished), or timeout.
-sub wait_for_bg
+# Poll the committed row value until ctr == $want (or timeout).  This is the
+# authoritative signal that the blocked node1 UPDATE woke from the cross-node
+# TX enqueue wait, re-judged, applied (+1) and auto-committed with no lost
+# update -- read on an independent connection so it reflects committed state.
+# (The background psql's command tag is not reliably captured via pump_nb; the
+# committed value is the real end-to-end evidence.)  If node1 had hung in the
+# wait, ctr would never reach $want and this times out -> the leg fails.
+sub wait_for_ctr
 {
-	my ($h, $re, $secs) = @_;
+	my ($node, $want, $secs) = @_;
 	my $deadline = time() + $secs;
 	while (time() < $deadline)
 	{
-		return 1 if bg_peek($h) =~ $re;
+		my $v = $node->safe_psql('postgres', 'SELECT ctr FROM t WHERE id = 1');
+		return 1 if defined $v && $v eq $want;
 		usleep(200_000);
 	}
 	return 0;
@@ -164,8 +162,8 @@ cmp_ok(ges_int($pair->node1, 'tx_enqueue_wait_count'), '>', $waits_before,
 
 $h0->query_safe('COMMIT');    # release: node0 commits ctr=200
 
-ok(wait_for_bg($h1, qr/UPDATE 1/, 20),
-	'L6 node1 UPDATE wakes + completes after node0 commit (not a hang)');
+ok(wait_for_ctr($pair->node1, '101', 20),
+	'L6 node1 UPDATE wakes + completes after node0 commit (ctr reached 101, not a hang)');
 
 is($pair->node1->safe_psql('postgres', 'SELECT ctr FROM t WHERE id = 1'), '101',
 	'L6 final ctr = 101 (node1 applied onto committed 100 after node0 released)');
@@ -189,7 +187,8 @@ ok(wait_for_wait_event($pair->node1, '%ctr = ctr + 1%', 'GesTxEnqueueWait', 20),
 
 $g0->query_safe('ROLLBACK');
 
-ok(wait_for_bg($g1, qr/UPDATE 1/, 20), 'L7 node1 wakes after node0 ROLLBACK');
+ok(wait_for_ctr($pair->node1, '102', 20),
+	'L7 node1 wakes after node0 ROLLBACK (ctr reached 102)');
 is($pair->node1->safe_psql('postgres', 'SELECT ctr FROM t WHERE id = 1'), '102',
 	'L7 final ctr = 102 (node0 row lock released by abort; node1 applied onto 101)');
 

@@ -653,6 +653,11 @@ extern bool cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_pag
  * holder-side INVALIDATE handler.  XLogFlush+InvalidateBuffer. */
 extern bool cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode,
 													XLogRecPtr *out_page_lsn);
+/* PGRAC: spec-5.2 D11 (writer-transfer-revoke) — by-tag local buffer drop
+ * with NO GCS release wire, for the holder-side X-transfer branch running in
+ * the §3.5 IC-dispatch (LMON) context.  XLogFlush+InvalidateBuffer, with the
+ * cache-eviction release wire suppressed (clears pcm_state=N first). */
+extern bool cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr *out_page_lsn);
 
 /* PGRAC: spec-4.7 D2 (Q6-A' worker-centric) — bounded chunked scan of the
  * shared buffer pool that re-declares each locally-held S/X buffer.  The

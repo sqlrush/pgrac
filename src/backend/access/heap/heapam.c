@@ -2934,24 +2934,39 @@ xmax_infomask_changed(uint16 new_infomask, uint16 old_infomask)
  */
 #ifdef USE_PGRAC_CLUSTER
 /*
- * spec-3.14 D2b: cross-node writer wait fail-closed.
+ * spec-3.14 D2b + spec-5.2 §3.2 (C4/D11): cross-node writer/locker wait.
  *
  *	heap_delete / heap_update reach a native wait (XactLockTableWait /
  *	MultiXactIdWait) on a concurrent writer's xwait.  When that writer is
- *	a REMOTE in-progress transaction, the local wait is meaningless (the
- *	xid does not exist in this node's lock table) -- it would either spin
- *	via EvalPlanQual or wait forever.  Stage 3.14 fail-closes to 53R9H
- *	(retryable cross-node write conflict); the real cross-node wait lands
- *	at spec-5.2 GES TX.  Lock-only remote waiters keep the spec-3.4d
- *	53R98 bridge in heap_lock_tuple.
+ *	a REMOTE transaction, the local wait is meaningless (the xid does not
+ *	exist meaningfully in this node's lock table -- raw xids alias across
+ *	instances, AD-012 例外 9) -- native XactLockTableWait on it hangs.
  *
- *	Called with the buffer content lock held; on the no-conflict path the
- *	buffer lock is restored before returning (the native wait code resumes
- *	holding it).  TT lookup needs cluster LWLocks, so the buffer lock is
- *	dropped across the lookup (lock order) and the native code's
+ *	spec-5.2 replaces the spec-3.14 unconditional 53R9H with a real
+ *	cross-node completion wait (cluster_tx_enqueue_wait) and a typed
+ *	outcome.  Return value:
+ *
+ *	  false  -- NOT a cross-node conflict (no peer / no ITL ref / local
+ *	            locker).  The caller runs PG's native locker resolution
+ *	            unchanged (it is correct for a local xid).
+ *	  true   -- a REMOTE LOCK-ONLY holder is terminal (committed/aborted);
+ *	            the row lock is released and the row was not modified, so
+ *	            the caller MUST skip native locker resolution and may
+ *	            continue (can_continue).  Skipping is mandatory: native
+ *	            XactLockTableWait on the remote raw xid hangs (BLOCKER C).
+ *
+ *	A remote WRITER holder (committed/aborted UPDATE/DELETE), a remote
+ *	MultiXact, a wait timeout, or cluster.tx_enqueue_wait=off all raise
+ *	(ereport) inside -- they never return.  Cross-node writer-writer
+ *	chaining (TM_Updated against the remote new version) is forwarded.
+ *
+ *	Called with the buffer content lock held.  On the false (native)
+ *	return the lock is restored.  On the true return the lock is
+ *	reacquired EXCLUSIVE.  TT lookup needs cluster LWLocks, so the buffer
+ *	lock is dropped across the lookup (lock order) and the native code's
  *	xmax_infomask_changed recheck covers the window.
  */
-static void
+static bool
 cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple tup,
 									TransactionId xwait, uint16 saved_infomask)
 {
@@ -2959,9 +2974,10 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 	ClusterUndoTTSlotRef cref;
 	ClusterTTStatusKey ckey;
 	ClusterTTStatusResult cres;
+	bool		is_lock_only = HEAP_XMAX_IS_LOCKED_ONLY(saved_infomask);
 
 	if (!cluster_peer_mode_enabled() || !PageHasItl(page))
-		return;
+		return false;
 
 	if (saved_infomask & HEAP_XMAX_IS_MULTI) {
 		uint16		marker_origin = 0;
@@ -2974,13 +2990,13 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 								   xwait, marker_origin),
 							errhint("Retry the transaction; cross-node wait lands at Stage 5.2.")));
 		}
-		return; /* local multixact: native wait is correct */
+		return false; /* local multixact: native wait is correct */
 	}
 
-	if (HEAP_XMAX_IS_LOCKED_ONLY(saved_infomask)) {
+	if (is_lock_only) {
 		if (!cluster_itl_find_lock_tt_ref_by_xmax(page, xwait, &cref)
 			|| cref.tt_slot_id == 0 || (int32) cref.origin_node_id == cluster_node_id)
-			return; /* local / placeholder / no lock-only ITL: native wait is correct */
+			return false; /* local / placeholder / no lock-only ITL: native wait is correct */
 		if (cref.local_xid != xwait)
 			ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
 							errmsg("cluster TT slot recycled for remote lock_xid %u", xwait),
@@ -2988,7 +3004,7 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 	} else if (tup->t_data->t_itl_slot_idx == CLUSTER_ITL_SLOT_UNALLOCATED
 			   || !cluster_itl_get_tt_ref(page, tup->t_data->t_itl_slot_idx, &cref)
 			   || cref.tt_slot_id == 0 || (int32) cref.origin_node_id == cluster_node_id)
-		return; /* local / placeholder / not-this-xid: native wait is correct */
+		return false; /* local / placeholder / not-this-xid: native wait is correct */
 	else if (cref.local_xid != xwait)
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
 						errmsg("cluster TT slot recycled for remote writer %u", xwait),
@@ -3050,39 +3066,61 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 							 errhint("Holder did not complete within"
 									 " cluster.ges_request_timeout_ms; retry.")));
 				}
-				/*
-				 * Holder now terminal: restore the buffer content lock and
-				 * return; the caller's native XactLockTableWait on the
-				 * now-terminal remote xid is a no-op and its post-wait recheck
-				 * sees the new state.
-				 */
-				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
-				return;
+				/* Holder is now terminal; fall through to the terminal handler
+				 * below (which does NOT resume PG's native locker resolution on
+				 * the remote xid — see the banner there). */
 			}
-
-			/* cluster.tx_enqueue_wait off: honest fail-closed (spec-3.4d). */
-			cluster_vis_bump_vis_conflict_failclosed_count();
-			if (!tt_resolved || cres.status == CLUSTER_TT_STATUS_UNKNOWN)
-				ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
-								errmsg("cluster TT status unknown for remote writer %u", xwait),
-								errhint("Remote commit_scn not yet propagated; retry or abort.")));
-			if (HEAP_XMAX_IS_LOCKED_ONLY(saved_infomask))
-				ereport(ERROR, (errcode(ERRCODE_CLUSTER_REMOTE_ROW_LOCK_WAIT_NOT_SUPPORTED),
-								errmsg("cannot wait for remote row lock held by transaction %u on node %u",
+			else {
+				/* cluster.tx_enqueue_wait off: honest fail-closed (spec-3.4d). */
+				cluster_vis_bump_vis_conflict_failclosed_count();
+				if (!tt_resolved || cres.status == CLUSTER_TT_STATUS_UNKNOWN)
+					ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+									errmsg("cluster TT status unknown for remote writer %u", xwait),
+									errhint("Remote commit_scn not yet propagated; retry or abort.")));
+				if (is_lock_only)
+					ereport(ERROR, (errcode(ERRCODE_CLUSTER_REMOTE_ROW_LOCK_WAIT_NOT_SUPPORTED),
+									errmsg("cannot wait for remote row lock held by transaction %u on node %u",
+										   xwait, cref.origin_node_id),
+									errhint("cluster.tx_enqueue_wait is off; retry, use SKIP LOCKED, or "
+											"enable it for cross-node TX waits.")));
+				ereport(ERROR, (errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
+								errmsg("cross-node write conflict: remote writer %u on node %u still running",
 									   xwait, cref.origin_node_id),
-								errhint("cluster.tx_enqueue_wait is off; retry, use SKIP LOCKED, or "
-										"enable it for cross-node TX waits.")));
-			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
-							errmsg("cross-node write conflict: remote writer %u on node %u still running",
-								   xwait, cref.origin_node_id),
-							errhint("cluster.tx_enqueue_wait is off; retry the transaction.")));
+								errhint("cluster.tx_enqueue_wait is off; retry the transaction.")));
+			}
 		}
 	}
 
-	/* Remote writer already terminal (committed/aborted): restore the buffer
-	 * content lock; the native path's xmax_infomask_changed recheck handles
-	 * any change during the unlock window. */
+	/*
+	 * PGRAC: spec-5.2 §3.2 D11 (BLOCKER C — corrects the frozen spec's wrong
+	 * "the caller's native XactLockTableWait on the now-terminal remote xid is
+	 * a no-op" assumption).  The holder is now terminal (it already was, or the
+	 * wait above resolved it).  Reacquire the buffer content lock the caller
+	 * expects on return, then decide based on the conflict kind:
+	 *
+	 *   LOCK-ONLY holder (FOR UPDATE/SHARE), committed or aborted: the row was
+	 *   NOT modified and the lock is released -> return true so the caller
+	 *   SKIPS PG's native locker resolution.  Running native XactLockTableWait
+	 *   + UpdateXmaxHintBits on the remote raw xid is unsafe: raw xids alias
+	 *   across instances (AD-012 例外 9) so the local ProcArray/CLOG view of a
+	 *   remote xid is meaningless, and XactLockTableWait on a remote xid hangs
+	 *   (its TransactionIdIsInProgress loop never breaks).
+	 *
+	 *   WRITER holder (committed/aborted UPDATE/DELETE): the row version may
+	 *   have changed remotely; cross-node writer-writer chaining (surfacing
+	 *   TM_Updated / EvalPlanQual against the remote new version) is forwarded.
+	 *   Fail closed retryably (53R9H) instead of running the unsafe native path.
+	 */
 	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+	if (is_lock_only)
+		return true;
+
+	cluster_vis_bump_vis_conflict_failclosed_count();
+	ereport(ERROR, (errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
+					errmsg("cross-node write conflict: remote writer %u on node %u is terminal",
+						   xwait, cref.origin_node_id),
+					errhint("Cross-node writer-writer update chaining is not yet supported; "
+							"retry the transaction.")));
 }
 #endif /* USE_PGRAC_CLUSTER */
 
@@ -3186,11 +3224,21 @@ l1:
 		infomask = tp.t_data->t_infomask;
 
 #ifdef USE_PGRAC_CLUSTER
-		/* spec-3.14 D2b: a remote in-progress writer cannot be waited on
-		 * locally -> 53R9H before the native XactLockTableWait/MultiXactIdWait. */
-		cluster_heap_writer_wait_failclosed(relation, buffer, &tp, xwait, infomask);
+		/*
+		 * spec-5.2 §3.2 (C4/D11): cross-node locker/writer handling.  A true
+		 * return means a remote LOCK-ONLY holder is terminal (lock released);
+		 * skip PG's native locker resolution (XactLockTableWait on the remote
+		 * raw xid is unsafe and hangs) -- the HEAP_XMAX_IS_LOCKED_ONLY check
+		 * below then yields TM_Ok.  A false return means a local locker; the
+		 * native path is correct.  A remote writer / timeout / wait-off raises.
+		 */
+		if (cluster_heap_writer_wait_failclosed(relation, buffer, &tp, xwait, infomask))
+		{
+			/* remote lock-only holder terminal -> fall through to the
+			 * LOCKED_ONLY -> TM_Ok determination below. */
+		}
+		else
 #endif
-
 		/*
 		 * Sleep until concurrent transaction ends -- except when there's a
 		 * single locker and it's our own transaction.  Note we don't care
@@ -3982,10 +4030,22 @@ l2:
 		infomask = oldtup.t_data->t_infomask;
 
 #ifdef USE_PGRAC_CLUSTER
-		/* spec-3.14 D2b: remote in-progress writer -> 53R9H (see heap_delete). */
-		cluster_heap_writer_wait_failclosed(relation, buffer, &oldtup, xwait, infomask);
+		/*
+		 * spec-5.2 §3.2 (C4/D11): cross-node locker/writer handling.  A true
+		 * return means a remote LOCK-ONLY holder is terminal (lock released);
+		 * skip PG's native locker resolution -- XactLockTableWait /
+		 * UpdateXmaxHintBits on the remote raw xid is unsafe and hangs.  A
+		 * false return means a local locker; the native path below is correct.
+		 * A remote writer / timeout / wait-off raises inside.
+		 */
+		if (cluster_heap_writer_wait_failclosed(relation, buffer, &oldtup, xwait, infomask))
+		{
+			checked_lockers = true;
+			locker_remains = false;
+			can_continue = true;
+		}
+		else
 #endif
-
 		/*
 		 * Now we have to do something about the existing locker.  If it's a
 		 * multi, sleep on it; we might be awakened before it is completely

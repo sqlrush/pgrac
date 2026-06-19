@@ -2457,23 +2457,28 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 						XLogRecPtr drop_lsn = InvalidXLogRecPtr;
 
 						/*
-						 * ⚠️ spec-5.2 D11 BLOCKER A (WIP): this release path
-						 * currently RAISES inside the §3.5 IC-dispatch (LMON)
-						 * context.  apply_gcs_transition(X_TO_N_DOWNGRADE) →
-						 * transition_apply emits a GCS release wire (HC78
-						 * symmetrize) → gcs_reserve_slot needs a BackendId, which
-						 * LMON lacks (MyBackendId=-1) → ERROR → frame dropped (the
-						 * exact "release-to-the-invalidating-master round-trip"
-						 * hazard flagged in the INVALIDATE handler).  FIX (next):
-						 * make the holder X→N a NO-WIRE local buffer-drop +
-						 * local-only state→N (node1 is the master and already owns
-						 * the transfer, so node0 drops unilaterally — nobody to
-						 * notify).  Diagnosis confirmed the mechanism otherwise
-						 * works end-to-end (node1 reaches the D5 TX wait). */
-						if (cluster_bufmgr_invalidate_block_for_gcs(fwd->tag, PCM_LOCK_MODE_X,
-																	&drop_lsn))
-							(void)cluster_pcm_lock_apply_gcs_transition(
-								fwd->tag, PCM_TRANS_X_TO_N_DOWNGRADE, cluster_node_id);
+						 * spec-5.2 D11 (BLOCKER A resolved): drop our local copy
+						 * with NO GCS release wire.  We run in the §3.5 IC-dispatch
+						 * (LMON) context, which has no backend slot
+						 * (MyProcNumber/MyBackendId).  The ordinary eviction path
+						 * (cluster_bufmgr_invalidate_block_for_gcs →
+						 * InvalidateBuffer → cache-eviction hook →
+						 * cluster_pcm_lock_release_buffer_for_eviction(buf, X))
+						 * would, because our master is the REMOTE requester, send
+						 * an X→N release transition wire → gcs_reserve_slot →
+						 * ERROR in LMON → §3.5 frame drop → reply lost.  No wire is
+						 * correct: in path A the requester IS the local master, so
+						 * it already owns the transfer and records itself as the
+						 * new X holder on install;  we (the previous holder) drop
+						 * unilaterally — nobody to notify.  The image was already
+						 * shipped above, so dropping cannot lose data, and the
+						 * helper's XLogFlush + InvalidateBuffer preserves Rule 8.A
+						 * no-stale-flush.  node0 holds no authoritative GRD entry
+						 * for this tag (the master is node1), so there is no local
+						 * GRD state to transition — clearing the BufferDesc
+						 * pcm_state to N inside the helper is the full release.
+						 */
+						(void)cluster_bufmgr_drop_block_for_gcs_no_wire(fwd->tag, &drop_lsn);
 						pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_x_transfer_ship_count, 1);
 					}
 			}

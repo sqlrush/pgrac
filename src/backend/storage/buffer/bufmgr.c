@@ -6359,4 +6359,96 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 	return true;
 }
 
+/* ========================================================================
+ * PGRAC MODIFICATIONS by SqlRush — spec-5.2 D11 (writer-transfer-revoke).
+ *
+ *   cluster_bufmgr_drop_block_for_gcs_no_wire(tag, *out_page_lsn)
+ *   — by-tag local buffer drop with NO GCS release wire, called from the
+ *   holder-side X-transfer branch of the GCS forward handler, which runs
+ *   in the §3.5 IC-dispatch (LMON) context.
+ *
+ *   Identical to cluster_bufmgr_invalidate_block_for_gcs (partition lookup
+ *   → XLogFlush when dirty for HC123 lost-write safety → InvalidateBuffer)
+ *   with ONE difference: it clears the BufferDesc pcm_state to PCM_STATE_N
+ *   under the buffer-header lock BEFORE InvalidateBuffer runs.  That
+ *   pre-empts InvalidateBuffer's spec-2.35 D4 (HC112) cache-eviction hook,
+ *   whose guard is `buf->pcm_state != N`: for an X holder the hook would
+ *   call cluster_pcm_lock_release_buffer_for_eviction(buf, X) which, when
+ *   the master is a REMOTE node, sends an X→N release transition wire via
+ *   cluster_gcs_send_transition_and_wait → gcs_reserve_slot, which needs a
+ *   backend slot (MyProcNumber/MyBackendId).  LMON is an aux process with
+ *   no backend slot, so that wire raises ERROR and the §3.5 wrapper drops
+ *   the whole frame (the reply is never sent).
+ *
+ *   No wire is correct here: in the spec-5.2 path-A topology the REQUESTER
+ *   is the local master (it forwarded N→X with IsXTransfer to us, a remote
+ *   X holder), so it already owns the transfer and records itself as the
+ *   new X holder on install.  We (the previous holder) therefore drop our
+ *   copy unilaterally — there is no one to notify.  The current image was
+ *   already shipped in the reply before this call, so dropping cannot lose
+ *   data, and the XLogFlush + InvalidateBuffer pair preserves Rule 8.A
+ *   no-stale-flush.
+ * ======================================================================== */
+bool
+cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr *out_page_lsn)
+{
+	uint32		hashcode;
+	LWLock	   *partition_lock;
+	int			buf_id;
+	BufferDesc *buf;
+	uint32		buf_state;
+	XLogRecPtr	page_lsn = InvalidXLogRecPtr;
+	bool		was_dirty = false;
+
+	if (out_page_lsn != NULL)
+		*out_page_lsn = InvalidXLogRecPtr;
+
+	hashcode = BufTableHashCode(&tag);
+	partition_lock = BufMappingPartitionLock(hashcode);
+
+	LWLockAcquire(partition_lock, LW_SHARED);
+	buf_id = BufTableLookup(&tag, hashcode);
+	if (buf_id < 0)
+	{
+		LWLockRelease(partition_lock);
+		return false;
+	}
+	buf = GetBufferDescriptor(buf_id);
+
+	buf_state = LockBufHdr(buf);
+	if (!BufferTagsEqual(&buf->tag, &tag) || (buf_state & BM_VALID) == 0)
+	{
+		UnlockBufHdr(buf, buf_state);
+		LWLockRelease(partition_lock);
+		return false;
+	}
+	was_dirty = (buf_state & BM_DIRTY) != 0;
+	{
+		Page		page = (Page) BufHdrGetBlock(buf);
+
+		page_lsn = PageGetLSN(page);
+	}
+
+	/*
+	 * Clear the cache-residency mode under the header lock so the
+	 * InvalidateBuffer eviction hook below sees PCM_STATE_N and skips the
+	 * remote-master release wire (see banner).  InvalidateBuffer itself
+	 * also clears this field after the (now skipped) hook.
+	 */
+	buf->pcm_state = (uint8) PCM_STATE_N;
+
+	UnlockBufHdr(buf, buf_state);
+	LWLockRelease(partition_lock);
+
+	if (out_page_lsn != NULL)
+		*out_page_lsn = page_lsn;
+
+	if (was_dirty && !XLogRecPtrIsInvalid(page_lsn))
+		XLogFlush(page_lsn);
+
+	InvalidateBuffer(buf);
+
+	return true;
+}
+
 #endif							/* USE_PGRAC_CLUSTER */
