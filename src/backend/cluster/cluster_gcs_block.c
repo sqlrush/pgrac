@@ -3166,6 +3166,20 @@ cluster_gcs_get_cf_xheld_read_ship_count(void)
 	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->cf_xheld_read_ship_count) : 0;
 }
 
+/* PGRAC: spec-5.2 D11 path A — writer-transfer-revoke ship+release counter. */
+uint64
+cluster_gcs_get_block_x_transfer_ship_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->block_x_transfer_ship_count) : 0;
+}
+
+/* PGRAC: spec-5.2 D11 path B — master==holder self-ship X counter. */
+uint64
+cluster_gcs_get_block_x_self_ship_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->block_x_self_ship_count) : 0;
+}
+
 /*
  * PGRAC: spec-5.2 D2 — gcs_block_xheld_read_ship_decision() is a pure
  * static-inline helper in cluster_gcs_block.h (unit-tested standalone, U3).

@@ -605,6 +605,17 @@ cluster_gcs_get_cf_xheld_read_ship_count(void)
 {
 	return 0;
 }
+/* spec-5.2 D11 stubs: writer-transfer-revoke ship counter accessors (path A/B). */
+uint64
+cluster_gcs_get_block_x_transfer_ship_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_x_self_ship_count(void)
+{
+	return 0;
+}
 
 /* spec-4.7 D6 stubs: 8 NEW GCS/PCM warm-recovery counter accessors. */
 uint64

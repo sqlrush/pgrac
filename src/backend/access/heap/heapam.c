@@ -3236,10 +3236,24 @@ l1:
 		{
 			/*
 			 * Remote LOCK-ONLY holder terminal -> its row lock is released.
-			 * Mark the released xmax invalid so the TM_Ok determination below
-			 * sees an unlocked tuple and the delete's new xmax is a single xid,
-			 * not a node-local MultiXact a peer cannot read (AD-012).  Then fall
-			 * through to the LOCKED_ONLY / XMAX_INVALID -> TM_Ok path below.
+			 *
+			 * The helper dropped and reacquired the buffer content lock across
+			 * the wait, so re-validate against the pre-wait snapshot (as the
+			 * native locker path does) before acting: if another local writer
+			 * modified the tuple while we were blocked, restart from l1 to
+			 * re-run HeapTupleSatisfiesUpdate (else: lost update / delete of an
+			 * unvalidated version — Rule 8.A).
+			 */
+			if (xmax_infomask_changed(tp.t_data->t_infomask, infomask) ||
+				!TransactionIdEquals(HeapTupleHeaderGetRawXmax(tp.t_data), xwait))
+				goto l1;
+
+			/*
+			 * Unchanged: mark the released xmax invalid so the TM_Ok
+			 * determination below sees an unlocked tuple and the delete's new
+			 * xmax is a single xid, not a node-local MultiXact a peer cannot
+			 * read (AD-012).  Then fall through to the LOCKED_ONLY /
+			 * XMAX_INVALID -> TM_Ok path below.
 			 */
 			HeapTupleSetHintBits(tp.t_data, buffer, HEAP_XMAX_INVALID,
 								 InvalidTransactionId);
@@ -4049,11 +4063,29 @@ l2:
 		{
 			/*
 			 * Remote LOCK-ONLY holder is terminal -> its row lock is released.
-			 * Mark the released xmax invalid (mirrors native UpdateXmaxHintBits
-			 * for a gone lock-only locker) so compute_new_xmax_infomask below
-			 * treats the tuple as unlocked and does NOT fold the released remote
-			 * lock into a node-local MultiXact that a peer cannot read
-			 * (MultiXact ids alias across instances, like raw xids — AD-012).
+			 *
+			 * cluster_heap_writer_wait_failclosed dropped and reacquired the
+			 * buffer content lock across a multi-second wait, so the tuple may
+			 * have been modified meanwhile by another LOCAL writer that was
+			 * queued on the same remote holder (e.g. it woke first, updated the
+			 * row, and committed).  Re-validate the xmax/infomask against the
+			 * snapshot taken before the wait, exactly as the native locker path
+			 * does (xmax_infomask_changed / TransactionIdEquals -> goto l2); if
+			 * it changed, restart from l2 to re-run HeapTupleSatisfiesUpdate
+			 * (else: lost update / acting on an unvalidated version — Rule 8.A).
+			 */
+			if (xmax_infomask_changed(oldtup.t_data->t_infomask, infomask) ||
+				!TransactionIdEquals(HeapTupleHeaderGetRawXmax(oldtup.t_data),
+									 xwait))
+				goto l2;
+
+			/*
+			 * Unchanged: the released remote lock is gone.  Mark the released
+			 * xmax invalid (mirrors native UpdateXmaxHintBits for a gone
+			 * lock-only locker) so compute_new_xmax_infomask below treats the
+			 * tuple as unlocked and does NOT fold the released remote lock into
+			 * a node-local MultiXact that a peer cannot read (MultiXact ids
+			 * alias across instances, like raw xids — AD-012).
 			 */
 			HeapTupleSetHintBits(oldtup.t_data, buffer, HEAP_XMAX_INVALID,
 								 InvalidTransactionId);

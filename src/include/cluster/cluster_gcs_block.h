@@ -895,6 +895,10 @@ extern uint64 cluster_gcs_get_lost_write_avoid_count(void);
 
 /* PGRAC: spec-5.2 D2 — X-holder read-image ship counter accessor. */
 extern uint64 cluster_gcs_get_cf_xheld_read_ship_count(void);
+/* PGRAC: spec-5.2 D11 — writer-transfer-revoke ship counters (A: path-A
+ * forward-to-holder revoke; B: master==holder self-ship). */
+extern uint64 cluster_gcs_get_block_x_transfer_ship_count(void);
+extern uint64 cluster_gcs_get_block_x_self_ship_count(void);
 
 /* PGRAC: spec-4.7 D6 — 8 warm-recovery observability accessors. */
 extern uint64 cluster_gcs_get_recovery_block_resources_recovering(void);
