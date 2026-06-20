@@ -142,6 +142,15 @@ void
 MarkBufferDirty(Buffer buf pg_attribute_unused())
 {}
 
+/* spec-5.2 D11: cluster_itl.c's forward-write guard calls the bufmgr
+ * write-permission check (bufmgr.o, not linked here).  Stub to "permitted" so
+ * the pure ITL-reader/allocator fixture behaves exactly as pre-D11. */
+bool
+cluster_bufmgr_block_write_permitted(Buffer buf pg_attribute_unused())
+{
+	return true;
+}
+
 /* spec-4.5a G6: cluster_itl.c's slot-pin check calls the merged-recovery
  * materialized gate (cluster_recovery_merge.o, not linked here).  Stub to
  * "nothing materialized" so the allocator behaves exactly as pre-G6 in this
@@ -806,6 +815,47 @@ UT_TEST(test_t32_redo_recomputes_recycle_watermark)
 }
 
 
+/* spec-5.2 §3.5 D11: cluster_itl_page_has_active_slot — the holder-side defer
+ * trigger.  In-progress (ACTIVE / LOCK_ONLY_ACTIVE) => true; FREE and all
+ * terminal states => false. */
+UT_TEST(test_d11_page_has_active_slot_detects_active)
+{
+	Page page = build_itl_page();
+	int i;
+
+	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+		slot_at(page, (uint8)i)->flags = ITL_FLAG_FREE;
+	UT_ASSERT_EQ((int)cluster_itl_page_has_active_slot(page), 0);
+
+	/* terminal / cleanout states do not count as active */
+	slot_at(page, 1)->flags = ITL_FLAG_COMMITTED;
+	slot_at(page, 2)->flags = ITL_FLAG_ABORTED;
+	slot_at(page, 3)->flags = ITL_FLAG_NEEDS_CLEANOUT;
+	slot_at(page, 4)->flags = ITL_FLAG_LOCK_ONLY_COMMITTED;
+	slot_at(page, 5)->flags = ITL_FLAG_LOCK_ONLY_ABORTED;
+	UT_ASSERT_EQ((int)cluster_itl_page_has_active_slot(page), 0);
+
+	/* a data writer in progress => active */
+	slot_at(page, 6)->flags = ITL_FLAG_ACTIVE;
+	UT_ASSERT_EQ((int)cluster_itl_page_has_active_slot(page), 1);
+
+	/* reset; a row-lock holder in progress => active */
+	slot_at(page, 6)->flags = ITL_FLAG_FREE;
+	slot_at(page, 7)->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+	UT_ASSERT_EQ((int)cluster_itl_page_has_active_slot(page), 1);
+}
+
+UT_TEST(test_d11_page_has_active_slot_no_itl_is_false)
+{
+	static char no_itl[BLCKSZ];
+	PageHeader hdr = (PageHeader)no_itl;
+
+	memset(no_itl, 0, BLCKSZ);
+	hdr->pd_flags = 0; /* no PD_HAS_ITL */
+	hdr->pd_special = BLCKSZ;
+	UT_ASSERT_EQ((int)cluster_itl_page_has_active_slot((Page)no_itl), 0);
+}
+
 int
 main(void)
 {
@@ -842,6 +892,8 @@ main(void)
 	UT_RUN(test_t30_watermark_completed_data_contributes);
 	UT_RUN(test_t31_watermark_advance_monotone);
 	UT_RUN(test_t32_redo_recomputes_recycle_watermark);
+	UT_RUN(test_d11_page_has_active_slot_detects_active);
+	UT_RUN(test_d11_page_has_active_slot_no_itl_is_false);
 
 	return ut_failed_count == 0 ? 0 : 1;
 }

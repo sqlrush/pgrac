@@ -51,6 +51,7 @@
 #include "cluster/cluster_recovery_merge.h" /* spec-4.7 D5 — recovered_through redo gate */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
+#include "cluster/cluster_itl.h" /* spec-5.2 D11 — active-ITL writer-transfer guard */
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_pcm_lock.h"
@@ -948,6 +949,14 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 					break;
 				}
 				gcs_block_install_block(buf, slot->reply_block_data, final_page_lsn);
+				/* spec-5.2 §3.5 D11: a read-image returned for a WRITE request
+				 * (N->X / S->X) means the master/holder deferred the
+				 * writer-transfer because it still holds an uncommitted ITL
+				 * slot.  Mark the buffer so a write that does not first
+				 * re-acquire X fails closed in cluster_itl (Rule 8.A); a plain
+				 * read (N->S, D2) leaves pcm_state = N. */
+				if (transition_id == PCM_TRANS_N_TO_X || transition_id == PCM_TRANS_S_TO_X_UPGRADE)
+					buf->pcm_state = (uint8)PCM_STATE_READ_IMAGE;
 				read_image = true;
 				break;
 			}
@@ -1285,6 +1294,7 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, int32 holder_node)
 	GcsBlockForwardPayload fwd;
 	bool got_reply = false;
 	bool installed = false;
+	bool read_image = false; /* spec-5.2 D11 — holder deferred (active ITL) */
 	XLogRecPtr installed_page_lsn = InvalidXLogRecPtr;
 
 	if (buf == NULL)
@@ -1368,6 +1378,36 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, int32 holder_node)
 			} else {
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_checksum_fail_count, 1);
 			}
+		} else if (got_reply
+				   && slot->reply_header.status == (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER) {
+			/*
+			 * PGRAC: spec-5.2 §3.5 D11 — the holder DEFERRED the
+			 * X-transfer because it still has an uncommitted ITL slot on this
+			 * block (its own commit needs it).  It shipped a read-image and kept
+			 * its X.  Install the bytes (so the heap AM sees the holder's row
+			 * lock) and return NON-durable: pcm_state stays N, we do NOT record
+			 * ourselves as the X holder.  The caller's heap_update/heap_lock_tuple
+			 * sees the remote lock and enters the cross-node TX completion wait
+			 * (spec-5.2 D4/D5); when the wait helper reacquires the buffer content
+			 * lock (heapam.c) it re-runs this acquire — by then the holder is
+			 * terminal, so the X-transfer is granted (X_GRANTED_FROM_HOLDER) with
+			 * the committed image.  Rule 8.A: never a stale durable grant. */
+			uint32 expected = slot->reply_header.checksum;
+			uint32 got = gcs_block_compute_checksum(slot->reply_block_data);
+
+			if (expected == got) {
+				gcs_block_install_block(buf, slot->reply_block_data,
+										(XLogRecPtr)slot->reply_header.page_lsn);
+				/* spec-5.2 §3.5 D11: mark this buffer a deferred-writer
+				 * read-image so a write that does NOT first re-acquire X (the
+				 * non-contended-row case) fails closed in cluster_itl rather
+				 * than mutate a non-owned copy (Rule 8.A).  Cleared to N on
+				 * content-lock unlock / overwritten by X on re-acquire. */
+				buf->pcm_state = (uint8)PCM_STATE_READ_IMAGE;
+				read_image = true;
+			} else {
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_checksum_fail_count, 1);
+			}
 		}
 	}
 	PG_CATCH();
@@ -1387,6 +1427,12 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, int32 holder_node)
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_x_granted_from_holder_count, 1);
 		return true; /* durable X grant — bufmgr mirrors buf->pcm_state = X */
 	}
+
+	if (read_image)
+		/* spec-5.2 D11 deferral (active ITL): non-durable read-image installed;
+		 * leave buf->pcm_state == N so the caller falls back to the TX wait and
+		 * re-acquires X after the holder is terminal. */
+		return false;
 
 	/* No X image obtained (timeout / holder evict / denial) — fail closed,
 	 * never a silent stale grant (Rule 8.A). */
@@ -1822,27 +1868,53 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 				return;
 			}
 			if (cluster_bufmgr_copy_block_for_gcs(req->tag, &page_lsn, block_buf)) {
-				XLogRecPtr drop_lsn = InvalidXLogRecPtr;
-
 				/*
-				 * The image is already captured (copy_block_for_gcs succeeded
-				 * above) BEFORE this drop.  The drop's bool is intentionally
-				 * ignored: it returns false ONLY when the buffer is not validly
-				 * resident (BufTable miss / tag-mismatch / !BM_VALID), i.e. there
-				 * is no local copy left to stale-flush — exactly the safe
-				 * precondition for granting.  (A resident-but-pinned buffer does
-				 * not return false; it makes InvalidateBuffer wait — tracked
-				 * separately as the LMON pin-wait follow-up.)  So in every case
-				 * reachable here there is no stale copy when we hand X to the
-				 * requester.  Rule 8.A holds.
+				 * PGRAC: spec-5.2 §3.5 D11 — active-ITL hard boundary.  Even as master+holder,
+				 * if WE still have an uncommitted ITL slot on this block
+				 * (ITL_FLAG_ACTIVE / LOCK_ONLY_ACTIVE), our own commit's
+				 * itl_finish_stamp_page needs that in-memory slot.  Revoking our X
+				 * and no-wire dropping the block now would discard the state our
+				 * COMMIT must stamp -> the stamp assert trips on re-read (the P0-2
+				 * crash).  Defer: ship a read-image (keep our X, NO drop, NO
+				 * grant), so the remote requester sees our row lock, enters the
+				 * cross-node TX completion wait, and retries the transfer only
+				 * after we go terminal.  The requester's send_block_request_and_wait
+				 * already treats READ_IMAGE_FROM_XHOLDER as a non-durable one-shot
+				 * image (returns false; pcm_state stays N).  Rule 8.A: a GCS
+				 * ownership transfer must satisfy the holder's local commit
+				 * dependency, not just the bufmgr API contract.
 				 */
-				(void)cluster_bufmgr_drop_block_for_gcs_no_wire(req->tag, &drop_lsn);
-				cluster_pcm_lock_master_grant_x_to(req->tag, req->sender_node, page_lsn);
-				status = GCS_BLOCK_REPLY_GRANTED;
-				block_payload = block_buf;
-				if (ClusterGcsBlock != NULL)
-					pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_x_self_ship_count, 1);
-				goto build_and_send_reply;
+				if (cluster_itl_page_has_active_slot((Page)block_buf)) {
+					status = GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER;
+					block_payload = block_buf;
+					if (ClusterGcsBlock != NULL)
+						pg_atomic_fetch_add_u64(&ClusterGcsBlock->cf_xheld_read_ship_count, 1);
+					goto build_and_send_reply;
+				}
+
+				{
+					XLogRecPtr drop_lsn = InvalidXLogRecPtr;
+
+					/*
+					 * The image is already captured (copy_block_for_gcs succeeded
+					 * above) BEFORE this drop.  The drop's bool is intentionally
+					 * ignored: it returns false ONLY when the buffer is not validly
+					 * resident (BufTable miss / tag-mismatch / !BM_VALID), i.e.
+					 * there is no local copy left to stale-flush — exactly the safe
+					 * precondition for granting.  (A resident-but-pinned buffer does
+					 * not return false; it makes InvalidateBuffer wait — tracked
+					 * separately as the LMON pin-wait follow-up.)  So in every case
+					 * reachable here there is no stale copy when we hand X to the
+					 * requester.  Rule 8.A holds.
+					 */
+					(void)cluster_bufmgr_drop_block_for_gcs_no_wire(req->tag, &drop_lsn);
+					cluster_pcm_lock_master_grant_x_to(req->tag, req->sender_node, page_lsn);
+					status = GCS_BLOCK_REPLY_GRANTED;
+					block_payload = block_buf;
+					if (ClusterGcsBlock != NULL)
+						pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_x_self_ship_count, 1);
+					goto build_and_send_reply;
+				}
 			}
 			/* evict race — fall through to the normal HG7 / master flow. */
 		}
@@ -2478,11 +2550,36 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 		} else {
 			memcpy(buf + sizeof(GcsBlockReplyHeader), block_buf, GCS_BLOCK_DATA_SIZE);
 			hdr->checksum = gcs_block_compute_checksum(block_buf);
-			if (GcsBlockForwardPayloadIsReadImage(fwd)) {
-				/* PGRAC: spec-5.2 D2 — read-image ship.  We (the X holder) keep
-				 * our X; the requester consumes this image for one read only and
-				 * never registers as an S holder.  No local state change here —
-				 * the holder forward handler never mutates its own PCM lock. */
+			/*
+			 * PGRAC: spec-5.2 §3.5 D11
+			 * — active-ITL hard boundary for writer-transfer-revoke.  Ship a
+			 * read-image (keep our X, NO destructive drop) when EITHER this is a
+			 * plain cross-node read (D2 IsReadImage) OR it is an X-transfer but we
+			 * still hold an uncommitted ITL slot (ITL_FLAG_ACTIVE /
+			 * LOCK_ONLY_ACTIVE) on this block.  In the X-transfer case our own
+			 * commit's itl_finish_stamp_page still needs that in-memory slot;
+			 * no-wire dropping the block now would discard the state our COMMIT
+			 * must stamp, so the holder's COMMIT would re-read the pre-lock storage
+			 * image and trip the stamp assert (the P0-2 crash).  Deferring lets the
+			 * requesting writer install the image, see our row lock, enter the
+			 * cross-node TX completion wait (spec-5.2 D4/D5), and retry the
+			 * X-transfer only after we go terminal — at which point no active slot
+			 * remains and the destructive transfer is safe.  "Active ITL is the
+			 * hard boundary of writer-transfer; wait terminal first, then
+			 * transfer."  Rule 8.A: a GCS ownership transfer must satisfy the
+			 * holder's local commit dependency, not just the bufmgr API contract.
+			 */
+			if (GcsBlockForwardPayloadIsReadImage(fwd)
+				|| (GcsBlockForwardPayloadIsXTransfer(fwd)
+					&& (fwd->transition_id == PCM_TRANS_N_TO_X
+						|| fwd->transition_id == PCM_TRANS_S_TO_X_UPGRADE)
+					&& cluster_itl_page_has_active_slot((Page)block_buf))) {
+				/* Holder keeps its X; the requester consumes this image —
+				 * read-image (D2) reads once and never registers as an S holder,
+				 * X-transfer deferral (D11) sees the row lock and waits, retrying
+				 * the transfer once we are terminal.  No local state change: the
+				 * holder forward handler never mutates its own PCM lock and never
+				 * drops a block on which it still owns an active ITL slot. */
 				hdr->status = (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER;
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->cf_xheld_read_ship_count, 1);
 			} else {

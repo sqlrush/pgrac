@@ -659,6 +659,13 @@ extern bool cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode e
  * cache-eviction release wire suppressed (clears pcm_state=N first). */
 extern bool cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr *out_page_lsn);
 
+/* PGRAC: spec-5.2 §3.5 D11 (writer-transfer-revoke) — false
+ * ONLY when this buffer is a deferred-writer read-image of a remote-X-held
+ * block (pcm_state == PCM_STATE_READ_IMAGE); true otherwise.  The cluster_itl
+ * forward-write path fails closed (retryable) on false so a writer never
+ * mutates a non-owned copy (Rule 8.A multi-row fail-closed leg). */
+extern bool cluster_bufmgr_block_write_permitted(Buffer buffer);
+
 /* PGRAC: spec-4.7 D2 (Q6-A' worker-centric) — bounded chunked scan of the
  * shared buffer pool that re-declares each locally-held S/X buffer.  The
  * callback receives (tag, held_mode, page_lsn, arg) per qualifying buffer;

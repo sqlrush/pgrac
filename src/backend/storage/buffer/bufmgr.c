@@ -5040,6 +5040,20 @@ LockBuffer(Buffer buffer, int mode)
 	}
 
 #ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: spec-5.2 §3.5 D11 — the deferred-writer read-image marker
+	 * (PCM_STATE_READ_IMAGE) is transient: it lives only for the
+	 * install->write window under this content lock so the cluster_itl
+	 * forward-write guard can fail closed.  Clear it back to N on unlock,
+	 * BEFORE the residency/eviction bookkeeping below, so every other PCM
+	 * path treats the buffer as the unowned read-image it is.  A later
+	 * LockBuffer re-acquires (cluster_pcm_mode_covers(N, ...) is false),
+	 * getting real X once the remote holder is terminal.
+	 */
+	if (mode == BUFFER_LOCK_UNLOCK
+		&& buf->pcm_state == (uint8) PCM_STATE_READ_IMAGE)
+		buf->pcm_state = (uint8) PCM_STATE_N;
+
 	if (mode == BUFFER_LOCK_UNLOCK &&
 		cluster_pcm_is_active() &&
 		cluster_bufmgr_should_pcm_track(buf) &&
@@ -6464,6 +6478,38 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr *out_page_ls
 	InvalidateBuffer(buf);		/* releases the header spinlock */
 
 	return true;
+}
+
+/* ========================================================================
+ * PGRAC MODIFICATIONS by SqlRush — spec-5.2 §3.5 D11 (writer-transfer-revoke,
+ *   active-ITL hard boundary, multi-row fail-closed leg).
+ *
+ *   cluster_bufmgr_block_write_permitted(buffer)
+ *   — false ONLY when buffer's block is held by this backend as a DEFERRED
+ *   READ-IMAGE (pcm_state == PCM_STATE_READ_IMAGE): a remote node holds X and,
+ *   because it still has an uncommitted ITL slot, deferred its writer-transfer
+ *   (spec-5.2 §3.5 D11) and shipped us a read-image.  Every other state
+ *   permits the write: PCM_STATE_X (we own X), PCM_STATE_S (re-acquired to X
+ *   by LockBuffer before reaching here), and PCM_STATE_N (a freshly-extended /
+ *   storage-fallback / local-master block — legitimately writable without a
+ *   recorded X grant).  pcm_state != X is therefore NOT a valid "no write"
+ *   test; only the explicit READ_IMAGE marker is.
+ *
+ *   In the contended-row case the heap AM waits and re-acquires real X
+ *   (overwriting the marker) before writing, so it passes here; this catches
+ *   only the writer whose own target row was NOT contended (it never entered
+ *   the cross-node TX wait) and would otherwise mutate a non-owned read-image,
+ *   diverging from the holder's X copy — a silent lost-update (Rule 8.A).  The
+ *   cluster_itl forward-write allocation path fails closed (53R9H, retryable)
+ *   when this returns false.
+ * ======================================================================== */
+bool
+cluster_bufmgr_block_write_permitted(Buffer buffer)
+{
+	if (BufferIsLocal(buffer))
+		return true;			/* temp / local buffers are never CF-shared */
+	return ((PcmState) GetBufferDescriptor(buffer - 1)->pcm_state)
+		!= PCM_STATE_READ_IMAGE;
 }
 
 #endif							/* USE_PGRAC_CLUSTER */

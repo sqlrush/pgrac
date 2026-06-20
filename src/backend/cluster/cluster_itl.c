@@ -34,9 +34,10 @@
 #include "access/xact.h"		 /* GetCurrentTransactionNestLevel (spec-3.4a N9) */
 #include "storage/bufmgr.h"		 /* BufferGetPage, MarkBufferDirty (spec-3.4a D2) */
 #include "storage/bufpage.h"
-#include "access/multixact.h"	   /* MultiXactId / MultiXactIdIsValid */
-#include "cluster/cluster_epoch.h" /* cluster_epoch_get_current (spec-3.4b D7) */
-#include "cluster/cluster_guc.h"   /* cluster_enabled */
+#include "access/multixact.h"		   /* MultiXactId / MultiXactIdIsValid */
+#include "cluster/cluster_epoch.h"	   /* cluster_epoch_get_current (spec-3.4b D7) */
+#include "cluster/cluster_gcs_block.h" /* spec-5.2 D11 cluster_bufmgr_block_write_permitted */
+#include "cluster/cluster_guc.h"	   /* cluster_enabled */
 #include "cluster/cluster_itl.h"
 #include "cluster/cluster_itl_slot.h"
 #include "cluster/cluster_scn.h"
@@ -488,6 +489,32 @@ cluster_itl_slot_is_protected_foreign(const ClusterItlSlotData *slot)
 	return itl_origin_materialized_cache[o] == 1;
 }
 
+/*
+ * itl_require_block_x_for_write — spec-5.2 §3.5 D11 guard.
+ *
+ *	Allocating / stamping an ITL slot is the forward "I am about to write or
+ *	lock this block" step and requires PCM X ownership.  A cluster writer can
+ *	reach here holding only a DEFERRED READ-IMAGE (a remote node holds X and
+ *	deferred its writer-transfer because it still has an uncommitted ITL slot)
+ *	when the writer's OWN target row was not the contended one, so it never
+ *	entered the cross-node TX wait that would have reacquired X.  Mutating that
+ *	non-owned copy would diverge from the holder's X copy (silent lost-update,
+ *	Rule 8.A).  Fail closed retryably; the contended-row path waits in the heap
+ *	AM and reacquires X before reaching here, so it passes
+ *	cluster_bufmgr_block_write_permitted() (which returns true for every
+ *	pcm_state except the deferred-writer read-image marker).
+ */
+static void
+itl_require_block_x_for_write(Buffer buf)
+{
+	if (!cluster_bufmgr_block_write_permitted(buf))
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
+						errmsg("cannot write a block held in X by a remote node with an "
+							   "uncommitted transaction"),
+						errhint("Cross-node writer-transfer is deferred while the remote holder "
+								"still has an uncommitted ITL slot; retry the transaction.")));
+}
+
 bool
 cluster_itl_alloc_or_reuse_slot(Buffer buf, TransactionId top_xid, uint8 *out_slot_idx)
 {
@@ -505,6 +532,9 @@ cluster_itl_alloc_or_reuse_slot(Buffer buf, TransactionId top_xid, uint8 *out_sl
 
 	if (!PageHasItl(page))
 		return false;
+
+	/* spec-5.2 §3.5 D11: a forward ITL write requires X. */
+	itl_require_block_x_for_write(buf);
 
 	slots = ClusterPageGetItlSlots(page);
 	free_idx = -1;
@@ -561,6 +591,9 @@ cluster_itl_alloc_or_reuse_lock_slot(Buffer buf, TransactionId top_xid, uint8 *o
 
 	if (!PageHasItl(page))
 		return false;
+
+	/* spec-5.2 §3.5 D11: a forward ITL row-lock requires X. */
+	itl_require_block_x_for_write(buf);
 
 	slots = ClusterPageGetItlSlots(page);
 	free_idx = -1;
@@ -671,6 +704,9 @@ cluster_itl_stamp_multixact_marker(Buffer buf, MultiXactId multixact_id)
 	page = BufferGetPage(buf);
 	if (!PageHasItl(page))
 		return CLUSTER_ITL_SLOT_UNALLOCATED;
+
+	/* spec-5.2 §3.5 D11: a forward ITL marker write requires X. */
+	itl_require_block_x_for_write(buf);
 
 	slots = ClusterPageGetItlSlots(page);
 	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
@@ -1073,6 +1109,39 @@ cluster_itl_wal_block_first_slot_idx(const char *itl_block_start)
 }
 
 
+/*
+ * cluster_itl_page_has_active_slot (spec-5.2 §3.5 D11 — writer-transfer-revoke
+ *	"active-ITL hard boundary").  See cluster_itl.h for the full contract.
+ *
+ *	Scans the page's 8 ITL slots for any in a non-terminal active state:
+ *	ITL_FLAG_ACTIVE (data writer) or ITL_FLAG_LOCK_ONLY_ACTIVE (row-lock
+ *	holder).  Conservative by design: ANY active slot means the local X
+ *	holder has an uncommitted transaction whose commit still needs this
+ *	page's slot, so the block must not be destructively transferred away.
+ */
+bool
+cluster_itl_page_has_active_slot(Page page)
+{
+	const ClusterItlSlotData *slots;
+	uint8 i;
+
+	Assert(page != NULL);
+
+	if (!PageHasItl(page))
+		return false;
+	/* Defensive: a malformed special area cannot carry a valid slot array. */
+	if (PageGetSpecialSize(page) < CLUSTER_ITL_ARRAY_SIZE)
+		return false;
+
+	slots = ClusterPageGetItlSlots(page);
+	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		if (slots[i].flags == ITL_FLAG_ACTIVE || slots[i].flags == ITL_FLAG_LOCK_ONLY_ACTIVE)
+			return true;
+	}
+	return false;
+}
+
+
 #else /* !USE_PGRAC_CLUSTER */
 
 bool
@@ -1104,6 +1173,12 @@ bool
 cluster_itl_find_multixact_origin_by_xmax(Page page pg_attribute_unused(),
 										  MultiXactId multixact_id pg_attribute_unused(),
 										  uint16 *origin_node_id pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_itl_page_has_active_slot(Page page pg_attribute_unused())
 {
 	return false;
 }

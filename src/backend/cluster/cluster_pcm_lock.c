@@ -1860,6 +1860,23 @@ cluster_pcm_lock_release_buffer_for_eviction(BufferDesc *buf, PcmLockMode mode)
 	if (cluster_pcm_htab == NULL)
 		PCM_STUB_DISABLED_PATH;
 
+	/*
+	 * PGRAC: spec-5.2 §3.5 D11 — a deferred-writer read-image
+	 * (PCM_STATE_READ_IMAGE) holds NO PCM lock, so there is nothing to
+	 * release.  This can reach here when the transient marker leaks past a
+	 * content-lock release on transaction abort (LWLockReleaseAll bypasses the
+	 * LockBuffer(UNLOCK) clear hook) and the buffer is later evicted.  No-op
+	 * for any non-{S,X} mode so eviction never tries to release an unheld lock
+	 * -- on a LOCAL-master block whose remote peer holds X, the unconditional
+	 * cluster_pcm_lock_release(tag) below would otherwise raise a spurious
+	 * DATA_CORRUPTED ("cannot release X held by node M").  (The caller clears
+	 * buf->pcm_state to N after this returns, so the leaked marker is cleaned
+	 * up; a non-evicted leaked marker is harmless -- the next LockBuffer
+	 * re-acquires because cluster_pcm_mode_covers treats it as no-lock.)
+	 */
+	if (mode != PCM_LOCK_MODE_S && mode != PCM_LOCK_MODE_X)
+		return;
+
 	tag = buf->tag;
 	master_node = cluster_gcs_lookup_master(tag);
 

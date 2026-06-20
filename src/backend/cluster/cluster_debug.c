@@ -1234,6 +1234,10 @@ dump_buffer_format(ReturnSetInfo *rsinfo)
 	/* PGRAC: spec-2.31 D6 v0.5 — BufferType enum extended from 3 to 5
 	 * (added SCUR + XCUR for bufmgr content-lock PCM ownership). */
 	emit_row(rsinfo, "buffer_format", "buffer_type_count", "5");
+	/* PGRAC: 3 = the real PCM lock modes (N/S/X).  spec-5.2 §3.5 D11 added a
+	 * 4th PcmState value, PCM_STATE_READ_IMAGE, but it is a transient
+	 * BufferDesc.pcm_state marker (deferred-writer read-image), NOT a PCM lock
+	 * mode and never on the wire/GRD, so it is intentionally excluded here. */
 	emit_row(rsinfo, "buffer_format", "pcm_state_count", "3");
 }
 

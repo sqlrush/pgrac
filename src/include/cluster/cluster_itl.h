@@ -134,6 +134,36 @@ extern bool cluster_itl_find_multixact_origin_by_xmax(Page page, MultiXactId mul
 													  uint16 *origin_node_id);
 
 /*
+ * cluster_itl_page_has_active_slot (spec-5.2 §3.5 D11 — writer-transfer-revoke
+ * "active-ITL hard boundary"):
+ *
+ *	Returns true if `page` carries ANY ITL slot in a NON-terminal active
+ *	state: ITL_FLAG_ACTIVE (a data writer mid-transaction) or
+ *	ITL_FLAG_LOCK_ONLY_ACTIVE (a row-lock holder mid-transaction).  Such a
+ *	slot means the page's local X holder still has an uncommitted transaction
+ *	whose commit/abort finish (itl_finish_stamp_page) MUST stamp this exact
+ *	slot ACTIVE -> COMMITTED / LOCK_ONLY_ACTIVE -> LOCK_ONLY_COMMITTED on the
+ *	holder's in-memory page.
+ *
+ *	The D11 writer-transfer-revoke path uses this as a hard guard: a holder
+ *	MUST NOT destructively transfer / no-wire-drop a block while it still has
+ *	an active ITL slot, because the drop discards the page state its own
+ *	commit needs to stamp (Rule 8.A — a GCS ownership transfer must satisfy
+ *	the holder's local commit dependency, not just the bufmgr API contract).
+ *	Instead the holder ships a read-image (keeps its X), the requesting writer
+ *	sees the row lock and falls back to the cross-node TX completion wait
+ *	(spec-5.2 D4/D5), and the transfer is retried only after the holder is
+ *	terminal.  Terminal states (FREE / COMMITTED / ABORTED / NEEDS_CLEANOUT /
+ *	LOCK_ONLY_COMMITTED / LOCK_ONLY_ABORTED) carry no pending stamp, so they
+ *	do not block the transfer.
+ *
+ *	Index pages (no ITL) and malformed pages return false.  Pure / acquires
+ *	no lock (the caller passes a stable page image, e.g. the just-copied GCS
+ *	ship buffer).
+ */
+extern bool cluster_itl_page_has_active_slot(Page page);
+
+/*
  * cluster_itl_stamp_multixact_marker (spec-3.6 v0.3 D7b NEW):
  *	Stamp ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI marker slot for `multixact_id`
  *	on the page backing `buf`.  Reuses cluster_itl_alloc_or_reuse_lock_slot

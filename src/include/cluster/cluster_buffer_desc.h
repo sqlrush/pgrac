@@ -135,7 +135,25 @@ typedef enum {
 typedef enum {
 	PCM_STATE_N = 0, /* Null - no PCM lock (zero-init occupies) */
 	PCM_STATE_S = 1, /* Shared */
-	PCM_STATE_X = 2	 /* eXclusive */
+	PCM_STATE_X = 2, /* eXclusive */
+	/*
+	 * PGRAC: spec-5.2 §3.5 D11 (writer-transfer-revoke).
+	 * Transient BufferDesc.pcm_state marker (NOT a PCM lock mode, never
+	 * carried on the wire / GRD): this backend installed a remote X holder's
+	 * READ-IMAGE in response to its OWN write (N->X) request, because the
+	 * holder deferred the writer-transfer (it still has an uncommitted ITL
+	 * slot).  The backend holds NO PCM lock — for ownership, covering, the
+	 * re-declare scan, and eviction this state behaves exactly like
+	 * PCM_STATE_N (cluster_pcm_mode_covers + the scan already treat any
+	 * non-{S,X} value as "no lock", and the content-lock unlock hook clears
+	 * it back to N).  Its ONLY effect: the cluster_itl forward-write path
+	 * fails closed (53R9H, retryable) rather than mutate a non-owned copy
+	 * (Rule 8.A).  The contended-row writer waits in the heap AM and
+	 * re-acquires real X (overwriting this marker) before it ever writes;
+	 * only a writer whose own target row was NOT contended reaches the guard
+	 * with this marker still set.
+	 */
+	PCM_STATE_READ_IMAGE = 3
 } PcmState;
 
 
