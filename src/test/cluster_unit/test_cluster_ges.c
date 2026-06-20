@@ -551,26 +551,23 @@ cluster_lms_native_probe_schedule_grant(
  * references them; this harness exercises the dispatch/dedup paths, not the
  * convert decision, which is covered by test_cluster_grd). */
 bool
-cluster_lms_native_probe_wait_clear(const struct ClusterResId *resid pg_attribute_unused(),
-									int lockmode pg_attribute_unused(),
-									const struct ClusterGrdHolderId *requester pg_attribute_unused(),
-									int timeout_ms pg_attribute_unused())
+cluster_lms_native_probe_wait_clear(
+	const struct ClusterResId *resid pg_attribute_unused(), int lockmode pg_attribute_unused(),
+	const struct ClusterGrdHolderId *requester pg_attribute_unused(),
+	int timeout_ms pg_attribute_unused())
 {
 	return true;
 }
 
 ClusterGrdConvertResult
-cluster_grd_convert_or_enqueue(const struct ClusterResId *resid pg_attribute_unused(),
-							   int32 node_id pg_attribute_unused(),
-							   uint32 procno pg_attribute_unused(),
-							   uint64 cluster_epoch pg_attribute_unused(),
-							   int current_mode pg_attribute_unused(),
-							   int requested_mode pg_attribute_unused(),
-							   uint64 convert_request_id pg_attribute_unused(),
-							   int32 source_node_id pg_attribute_unused(),
-							   uint64 shard_master_generation pg_attribute_unused(),
-							   ClusterGrdConflictHolder *conflict_holders_out pg_attribute_unused(),
-							   int *n_conflict_out pg_attribute_unused())
+cluster_grd_convert_or_enqueue(
+	const struct ClusterResId *resid pg_attribute_unused(), int32 node_id pg_attribute_unused(),
+	uint32 procno pg_attribute_unused(), uint64 cluster_epoch pg_attribute_unused(),
+	int current_mode pg_attribute_unused(), int requested_mode pg_attribute_unused(),
+	uint64 convert_request_id pg_attribute_unused(), int32 source_node_id pg_attribute_unused(),
+	uint64 shard_master_generation pg_attribute_unused(),
+	ClusterGrdConflictHolder *conflict_holders_out pg_attribute_unused(),
+	int *n_conflict_out pg_attribute_unused())
 {
 	return CLUSTER_GRD_CONVERT_NOT_READY;
 }
@@ -586,7 +583,8 @@ cluster_grd_release_and_drain(const struct ClusterResId *resid pg_attribute_unus
 
 ClusterGrdEntryResult
 cluster_grd_rollback_convert(const struct ClusterResId *resid pg_attribute_unused(),
-							 int32 node_id pg_attribute_unused(), uint32 procno pg_attribute_unused(),
+							 int32 node_id pg_attribute_unused(),
+							 uint32 procno pg_attribute_unused(),
 							 int upgraded_mode pg_attribute_unused(),
 							 int old_mode pg_attribute_unused(),
 							 uint64 old_request_id pg_attribute_unused())

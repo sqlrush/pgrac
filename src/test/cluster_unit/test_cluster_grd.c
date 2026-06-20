@@ -2019,9 +2019,9 @@ UT_TEST(test_convert_5_3_u22_rollback_restores_mode_and_id)
 				 (int)CLUSTER_GRD_CONVERT_GRANTED_INPLACE);
 
 	/* rollback: restore (AccessExclusive,R_new) slot to (Share,R_old). */
-	UT_ASSERT_EQ((int)cluster_grd_entry_rollback_convert(e, 1, 100, AccessExclusiveLock, ShareLock,
-														 11),
-				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(
+		(int)cluster_grd_entry_rollback_convert(e, 1, 100, AccessExclusiveLock, ShareLock, 11),
+		(int)CLUSTER_GRD_ENTRY_OK);
 	UT_ASSERT(cluster_grd_entry_holder_mode(e, 1, 100, &m));
 	UT_ASSERT_EQ((int)m, (int)ShareLock); /* mode restored */
 
@@ -2036,9 +2036,9 @@ UT_TEST(test_convert_5_3_u22_rollback_restores_mode_and_id)
 	UT_ASSERT_EQ((int)cluster_grd_entry_release_holder(e, &h), (int)CLUSTER_GRD_ENTRY_OK);
 
 	/* rollback of a non-existent upgraded slot is a fail-closed no-op. */
-	UT_ASSERT_EQ((int)cluster_grd_entry_rollback_convert(e, 1, 100, AccessExclusiveLock, ShareLock,
-														 11),
-				 (int)CLUSTER_GRD_ENTRY_NOT_FOUND);
+	UT_ASSERT_EQ(
+		(int)cluster_grd_entry_rollback_convert(e, 1, 100, AccessExclusiveLock, ShareLock, 11),
+		(int)CLUSTER_GRD_ENTRY_NOT_FOUND);
 	convert_teardown();
 }
 
@@ -2136,9 +2136,9 @@ UT_TEST(test_convert_5_3_u23_rollback_cancels_queued_convert)
 	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 1);
 
 	/* requester times out -> rollback must DEQUEUE the pending convert. */
-	UT_ASSERT_EQ((int)cluster_grd_entry_rollback_convert(e, 1, 100, AccessExclusiveLock, ShareLock,
-														 11),
-				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(
+		(int)cluster_grd_entry_rollback_convert(e, 1, 100, AccessExclusiveLock, ShareLock, 11),
+		(int)CLUSTER_GRD_ENTRY_OK);
 	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 0);
 
 	/* the peer now releases -> the drain must NOT resurrect the cancelled
