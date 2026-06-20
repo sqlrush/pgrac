@@ -115,6 +115,12 @@ cluster_sq_alloc_segment(int64 boundary, bool is_called, int64 increment, int64 
 		gap = (uint64)first - (uint64)limit; /* first >= limit */
 	}
 
+	/* abs_inc is |increment| with increment != 0 above, so it is always
+	 * positive here; make the non-zero divisor explicit (defence in depth
+	 * + silences a static-analysis zero-division false positive). */
+	if (abs_inc == 0)
+		return CLUSTER_SQ_ALLOC_EXHAUSTED;
+
 	/* Additional values that fit after `first`, then clamp to want_count.
 	 * Compare against want_count-1 to avoid a (max_steps + 1) overflow. */
 	max_steps = gap / abs_inc;

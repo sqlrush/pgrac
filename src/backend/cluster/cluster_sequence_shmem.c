@@ -103,7 +103,7 @@ cluster_sequence_shmem_init(void)
 		pg_atomic_init_u64(&sq_state->cycle_rejected_count, 0);
 	}
 
-	MemSet(&hctl, 0, sizeof(hctl));
+	memset(&hctl, 0, sizeof(hctl));
 	hctl.keysize = sizeof(ClusterResId);
 	hctl.entrysize = sizeof(ClusterSeqInstanceCache);
 	sq_cache_htab
