@@ -336,6 +336,8 @@ typedef enum BuiltinTrancheIds {
 	 * per-slot content_lock (SHARED reader / EXCLUSIVE writer; mode fixed at
 	 * pin time — no in-place upgrade). */
 	LWTRANCHE_CLUSTER_UNDO_BUF,
+	/* PGRAC: spec-5.4 D1 — SQ sequence node-level instance cache region. */
+	LWTRANCHE_CLUSTER_SQ,
 #endif
 	LWTRANCHE_FIRST_USER_DEFINED
 } BuiltinTrancheIds;

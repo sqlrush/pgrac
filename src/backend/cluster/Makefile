@@ -102,6 +102,7 @@ OBJS = \
 	cluster_qvotec.o \
 	cluster_scn.o \
 	cluster_sequence.o \
+	cluster_sequence_shmem.o \
 	cluster_voting_disk_io.o \
 	cluster_shmem.o \
 	cluster_signal.o \

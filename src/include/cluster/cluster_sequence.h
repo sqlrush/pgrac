@@ -121,4 +121,66 @@ extern ClusterSqAllocStatus cluster_sq_alloc_segment(int64 boundary, bool is_cal
  */
 extern bool cluster_sq_cache_has_value(int64 local_next, int64 local_end, int64 increment);
 
+#ifndef FRONTEND
+
+#include "port/atomics.h"
+
+/*
+ * ClusterSeqInstanceCache -- per-sequence node-level (instance) cache entry.
+ *
+ *	Sits between the PG per-backend SeqTableData fast-path (unchanged) and
+ *	the per-sequence allocation authority.  When a backend's own cache is
+ *	exhausted it slices the next value from here under the SQ shmem lock;
+ *	when this entry is empty it triggers an SQ(X) enqueue refill.
+ *
+ *	The HTAB is keyed by the full ClusterResId, which already embeds the
+ *	generation (relfilenode) in field3 -- a DROP+CREATE therefore lands a
+ *	new key and never reuses a stale segment.  The generation field below
+ *	is kept for observability and defence-in-depth assertions.
+ */
+typedef struct ClusterSeqInstanceCache {
+	ClusterResId resid;		 /* HTAB key (must be first; HASH_BLOBS) */
+	uint32 generation;		 /* drop/recreate identity (== resid.field3) */
+	int64 local_next;		 /* next value this node may emit */
+	int64 local_end;		 /* segment end (inclusive; sign per increment) */
+	int64 increment;		 /* copy of seqincrement (sign = direction) */
+	bool refill_in_progress; /* a backend is refilling this entry */
+} ClusterSeqInstanceCache;
+
+/* D1 shmem region lifecycle (mirror cluster_ges_reply_wait_shmem_*). */
+extern Size cluster_sequence_shmem_size(void);
+extern void cluster_sequence_shmem_init(void);
+extern void cluster_sequence_shmem_register(void);
+
+/*
+ * D1 instance-cache primitives.  The caller need not hold any lock; each
+ * primitive takes the SQ shmem lock internally.
+ *
+ *	serve       slice the next value from the entry; returns true + *out_value
+ *	            on a hit, false when the entry is absent or empty (refill).
+ *	fill        install/replace the granted [seg_start, seg_end] segment.
+ *	invalidate  drop the entry (setval / ALTER strong invalidation).
+ */
+extern bool cluster_sq_instance_cache_serve(const ClusterResId *resid, int64 *out_value);
+extern void cluster_sq_instance_cache_fill(const ClusterResId *resid, uint32 generation,
+										   int64 increment, int64 seg_start, int64 seg_end);
+extern void cluster_sq_instance_cache_invalidate(const ClusterResId *resid);
+
+/* D9 counter accessors (observability) + bumps (SQ-internal call sites). */
+extern uint64 cluster_sq_refill_count(void);
+extern uint64 cluster_sq_refill_wait_count(void);
+extern uint64 cluster_sq_dup_guard_fail_count(void);
+extern uint64 cluster_sq_failover_fail_closed_count(void);
+extern uint64 cluster_sq_page_writeback_count(void);
+extern uint64 cluster_sq_cycle_rejected_count(void);
+
+extern void cluster_sq_bump_refill(void);
+extern void cluster_sq_bump_refill_wait(void);
+extern void cluster_sq_bump_dup_guard_fail(void);
+extern void cluster_sq_bump_failover_fail_closed(void);
+extern void cluster_sq_bump_page_writeback(void);
+extern void cluster_sq_bump_cycle_rejected(void);
+
+#endif /* !FRONTEND */
+
 #endif /* CLUSTER_SEQUENCE_H */

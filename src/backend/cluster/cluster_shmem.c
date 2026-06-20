@@ -66,6 +66,7 @@
 #include "cluster/cluster_lck.h"			/* cluster_lck_shmem_register (1.12 Sprint A) */
 #include "cluster/cluster_epoch.h"			/* cluster_epoch_shmem_register (2.4) */
 #include "cluster/cluster_scn.h"			/* cluster_scn_shmem_register (1.15) */
+#include "cluster/cluster_sequence.h"		/* cluster_sequence_shmem_register (spec-5.4 D1) */
 #include "cluster/cluster_ges.h"			/* cluster_ges_shmem_register (spec-2.13) */
 #include "cluster/cluster_ges_reply_wait.h" /* cluster_ges_reply_wait_shmem_register (spec-2.23 D1) */
 #include "cluster/cluster_grd.h"			/* cluster_grd_shmem_register (spec-2.14) */
@@ -712,6 +713,10 @@ cluster_init_shmem_module(void)
 
 	if (cluster_shmem_lookup_region("pgrac block recovery") == NULL)
 		cluster_block_recovery_shmem_register();
+
+	/* spec-5.4 D1: register SQ sequence instance cache + counters region. */
+	if (cluster_shmem_lookup_region("pgrac cluster sequence") == NULL)
+		cluster_sequence_shmem_register();
 }
 
 

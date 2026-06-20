@@ -236,6 +236,8 @@ static const char *const BuiltinTrancheNames[] = {
 	"ClusterUndoCleaner",
 	/* PGRAC LWTRANCHE_CLUSTER_UNDO_BUF: spec-3.18 D1 undo buffer pool map_lock */
 	"ClusterUndoBuf",
+	/* PGRAC LWTRANCHE_CLUSTER_SQ: spec-5.4 D1 SQ sequence instance cache */
+	"ClusterSq",
 #endif
 };
 
