@@ -5,11 +5,12 @@
 #    Runs the heavy parts that fast.yml intentionally skips, sharded for
 #    wallclock:
 #      - linux-pg-regress: PG 219 three-mode (own job, off the TAP path)
-#      - linux-cluster-tap: cluster_tap files split into 6 parallel shards
+#      - linux-cluster-tap: cluster_tap files split into 9 parallel shards
 #        (foundation-core / foundation-stage1 / stage2-ic-cssd / stage2-gcs /
-#        stage3-core / stage3-recent), with Stage 2/3 acceptance files kept in
-#        their dedicated medium jobs.  cluster_unit + cluster_regress run once
-#        on the foundation-core shard.
+#        stage3-core / stage3-recent / stage4-wal / stage4-hardgate /
+#        stage5-ges-locking), with Stage 2/3 acceptance files kept in their
+#        dedicated medium jobs.  cluster_unit + cluster_regress run once on the
+#        foundation-core shard.
 #      - build-test-macos: PG 219 + cluster_unit + cluster_regress + a curated
 #        cluster_tap SMOKE subset (the full cluster_tap on macOS was the
 #        wallclock bottleneck; Linux is the primary target)
@@ -121,7 +122,7 @@ jobs:
           retention-days: 14
 
   # ====================================================================
-  # Tier 2.1b — Linux cluster_tap (6 parallel shards)
+  # Tier 2.1b — Linux cluster_tap (9 parallel shards)
   # --------------------------------------------------------------------
   # Shards by leading test-file number.  Stage acceptance files are not
   # duplicated here:
@@ -146,7 +147,9 @@ jobs:
           - { name: stage2-gcs,        ranges: "100-118", unit: false, regress: false }
           - { name: stage3-core,       ranges: "203-225", unit: false, regress: false }
           - { name: stage3-recent,     ranges: "228-237", unit: false, regress: false }
-          - { name: stage4-wal,        ranges: "242-248 273-283", unit: false, regress: false }
+          - { name: stage4-wal,        ranges: "242-248 273 275", unit: false, regress: false }
+          - { name: stage4-hardgate,   ranges: "274-274", unit: false, regress: false }
+          - { name: stage5-ges-locking, ranges: "276-283", unit: false, regress: false }
     steps:
       - name: Checkout
         uses: actions/checkout@v4
