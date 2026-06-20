@@ -284,6 +284,11 @@ extern int cluster_ges_reply_wait_max_entries;
 extern int cluster_grd_remaster_wait_ms;
 extern int cluster_grd_rebuild_timeout_ms;
 
+/* spec-5.4 D8: SQ sequence lock tunables. */
+extern int cluster_sequence_default_cache;
+extern int cluster_sequence_cache_floor_optin;
+extern int cluster_sequence_refill_timeout_ms;
+
 /* spec-2.24 D11 NEW: LMD periodic cleanup sweep interval. */
 extern int cluster_lmd_cleanup_sweep_interval_ms;
 

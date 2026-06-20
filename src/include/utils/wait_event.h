@@ -565,6 +565,14 @@ typedef enum {
 	WAIT_EVENT_CLUSTER_BGPROC_UNDO_CLEANER_MAIN_LOOP,
 	/* spec-3.13 D6: cleaner durable-header segment scan I/O. */
 	WAIT_EVENT_CLUSTER_UNDO_CLEANER_SEGMENT_SCAN,
+	/*
+	 * spec-5.4 D9:  SQ sequence instance-cache refill.  A backend whose
+	 * node-level instance cache is empty sleeps here while it acquires the
+	 * SQ(X) enqueue and waits for the authority to grant the next segment
+	 * (and complete the cross-node boundary writeback) before nextval can
+	 * return.  Wake on grant arrival or refill timeout (53R70).
+	 */
+	WAIT_EVENT_CLUSTER_SQ_REFILL_WAIT,
 } WaitEventCluster;
 
 

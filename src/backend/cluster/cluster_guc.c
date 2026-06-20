@@ -119,6 +119,11 @@ int cluster_tm_convert_mode = CLUSTER_TM_CONVERT_MODE_CONVERT;
 int cluster_grd_remaster_wait_ms = 200;	   /* frozen-shard short wait before 53R9I */
 int cluster_grd_rebuild_timeout_ms = 5000; /* holder-rebuild barrier deadline */
 
+/* spec-5.4 D8 — SQ sequence lock tunables. */
+int cluster_sequence_default_cache = 100;	   /* CREATE-time CACHE injection default */
+int cluster_sequence_cache_floor_optin = 0;	   /* opt-in seqcache floor (0 = off) */
+int cluster_sequence_refill_timeout_ms = 30000; /* SQ refill wait before fail-closed */
+
 #ifdef ENABLE_INJECTION
 #define CLUSTER_SHMEM_MIN_REGIONS 41
 #else
@@ -2578,6 +2583,52 @@ cluster_init_guc(void)
 	 * FATAL on divergence (cluster_ges_mode_init); there is no off/warn
 	 * tier because there is no safe way to continue past a drift.
 	 */
+
+	/*
+	 * spec-5.4 D8 — SQ sequence lock tunables.
+	 *
+	 * sequence_default_cache is injected at CREATE SEQUENCE time when the
+	 * user did not write a CACHE clause (init_params can tell the two
+	 * apart); an explicit CACHE N is never overridden.  cache_floor_optin
+	 * is an opt-in safety net (0 = off) that lifts an existing tiny
+	 * seqcache at runtime without silently rewriting user semantics.
+	 * refill_timeout_ms bounds the SQ(X) refill wait before nextval fails
+	 * closed (reuses 53R70).
+	 */
+	DefineCustomIntVariable(
+		"cluster.sequence_default_cache",
+		gettext_noop("Default CACHE size injected into new sequences in cluster mode."),
+		gettext_noop("Applied only when CREATE SEQUENCE omits CACHE; an explicit CACHE N "
+					 "is stored unchanged.  Larger values mean fewer cross-node refills."),
+		&cluster_sequence_default_cache, 100, /* boot value */
+		1, 1000000000,						  /* min / max */
+		PGC_SUSET,							  /* superuser SET */
+		0,									  /* flags */
+		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.sequence_cache_floor_optin",
+		gettext_noop("Opt-in runtime floor for an existing sequence's CACHE size."),
+		gettext_noop("0 disables (default): the runtime strictly honours catalog seqcache, "
+					 "so an explicit CACHE 1 stays 1.  When > 0, sequences whose seqcache is "
+					 "below this value refill in floor-sized batches without rewriting the "
+					 "stored seqcache."),
+		&cluster_sequence_cache_floor_optin, 0, /* boot value */
+		0, 1000000000,							/* min / max */
+		PGC_SIGHUP,								/* reload */
+		0,										/* flags */
+		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.sequence_refill_timeout_ms",
+		gettext_noop("Maximum wait for an SQ sequence segment refill before failing closed."),
+		gettext_noop("Bounds the SQ(X) enqueue + authority grant + boundary writeback wait; "
+					 "on timeout nextval raises 53R70 rather than risk a duplicate value."),
+		&cluster_sequence_refill_timeout_ms, 30000, /* boot value */
+		1000, 600000,								/* min / max */
+		PGC_SIGHUP,									/* reload */
+		GUC_UNIT_MS,								/* flags */
+		NULL, NULL, NULL);
 
 #ifdef ENABLE_INJECTION
 	/*

@@ -756,6 +756,15 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 # page); the survivor is NOT crashed unless
 # cluster.thread_recovery_on_unrecoverable=panic.
 53RA4    E    ERRCODE_CLUSTER_THREAD_RECOVERY_BLOCKED                          cluster_thread_recovery_blocked
+# spec-5.4:  SQ sequence allocation could not be proven unique, so nextval
+# fails closed rather than risk a cross-node duplicate.  Fires when the
+# authority cannot durably confirm a segment (refill WAL unconfirmed), the
+# boundary writeback to a reachable node failed/was unreachable, the SQ
+# resource generation no longer matches (drop/recreate ABA), or a master
+# failover left the durable allocation boundary unrecoverable.  Distinct
+# from 53R70 (refill wait timeout): this is a stronger correctness signal,
+# not a transient timeout.
+53RA5    E    ERRCODE_CLUSTER_SEQUENCE_ALLOC_UNAVAILABLE                       cluster_sequence_alloc_unavailable
 
 Section: Class 54 - Program Limit Exceeded
 

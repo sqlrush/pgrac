@@ -1443,6 +1443,9 @@ pgstat_get_wait_cluster_bgproc(WaitEventCluster w)
 	case WAIT_EVENT_CLUSTER_NATIVE_PROBE_REPLY_WAIT:
 		event_name = "ClusterNativeProbeReplyWait";
 		break;
+	case WAIT_EVENT_CLUSTER_SQ_REFILL_WAIT:
+		event_name = "ClusterSqRefillWait";
+		break;
 	default:
 		break;
 	}
