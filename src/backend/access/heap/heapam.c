@@ -5932,8 +5932,24 @@ l3:
 													 errhint("Holder did not complete within"
 															 " cluster.ges_request_timeout_ms; retry.")));
 									}
-									/* RESOLVED / DEAD_HOLDER → re-read xmax. */
-									goto l3;
+									/*
+									 * RESOLVED: the remote lock-only holder is now
+									 * terminal.  Do NOT goto l3 — re-running
+									 * HeapTupleSatisfiesUpdate on the now-committed
+									 * REMOTE lock-only xmax misjudges it (the remote
+									 * raw xid's local CLOG/ProcArray view is
+									 * meaningless, AD-012) and can return TM_Updated
+									 * for a row that was only locked, tripping the
+									 * Assert at the result-determination below.
+									 * Instead break out to the terminal handler
+									 * (cluster_remote_lockonly_terminal = true →
+									 * skip native wait → reacquire content lock at
+									 * the shared LockBuffer below → post-wait recheck
+									 * → HEAP_XMAX_INVALID), exactly mirroring the
+									 * tt_terminal-on-first-check path and the
+									 * heap_update/heap_delete cross-node handling.
+									 */
+									break;
 								case LockWaitSkip:
 									result = TM_WouldBlock;
 									LockBuffer(*buffer, BUFFER_LOCK_EXCLUSIVE);
