@@ -3249,7 +3249,7 @@ cluster_grd_rollback_convert(const ClusterResId *resid, int32 node_id, uint32 pr
 
 	SpinLockAcquire(&entry->lock);
 	result = cluster_grd_entry_rollback_convert(entry, node_id, procno, upgraded_mode, old_mode,
-											   old_request_id);
+												old_request_id);
 	SpinLockRelease(&entry->lock);
 	cluster_grd_entry_release(entry);
 	return result;

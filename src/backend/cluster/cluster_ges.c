@@ -482,7 +482,7 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 	case GES_REQ_OPCODE_REQUEST:
 	case GES_REQ_OPCODE_CONVERT:
 	case GES_REQ_OPCODE_RELEASE:
-	case GES_REQ_OPCODE_REDECLARE:		   /* spec-4.6 D3 — same work_queue path */
+	case GES_REQ_OPCODE_REDECLARE:		  /* spec-4.6 D3 — same work_queue path */
 	case GES_REQ_OPCODE_CONVERT_ROLLBACK: /* spec-5.3 D6 — same work_queue path */
 		break;
 	case GES_REQ_OPCODE_DEADLOCK_PROBE:
@@ -977,8 +977,8 @@ cluster_ges_lmon_drain_work_queue(void)
 			if (item.source_node_id != (uint32)cluster_node_id
 				&& cluster_lms_native_probe_required(&resid, requested_mode)) {
 				if (!cluster_lms_native_probe_schedule_grant(&resid, requested_mode, &holder,
-															 (int32)item.source_node_id, req->opcode,
-															 generation))
+															 (int32)item.source_node_id,
+															 req->opcode, generation))
 					ges_dispatch_reject((int32)item.source_node_id, &holder, &resid, req->opcode,
 										GES_REJECT_REASON_WORK_QUEUE_FULL, generation);
 				/* else: GRANT/REJECT sent later by the LMS resolve path. */
@@ -1013,8 +1013,8 @@ cluster_ges_lmon_drain_work_queue(void)
 					 * the requester waits (ClusterGesConvertWait) for the
 					 * release drain to grant the convert. */
 					if (n_conflict > 0)
-						cluster_ges_send_bast_targeted(&resid, (int)requested_mode, conflict_holders,
-													   n_conflict);
+						cluster_ges_send_bast_targeted(&resid, (int)requested_mode,
+													   conflict_holders, n_conflict);
 					break;
 				case CLUSTER_GRD_CONVERT_ILLEGAL:
 					ges_dispatch_reject((int32)item.source_node_id, &holder, &resid, req->opcode,

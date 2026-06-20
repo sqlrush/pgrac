@@ -1139,11 +1139,12 @@ extern uint64 cluster_grd_convert_queue_full_count(void);
  * convert_request_id (§3.1a).  On ENQUEUED conflict_holders_out[] is filled
  * (BAST targets).  ILLEGAL → fail-closed (53R74).
  */
-extern ClusterGrdConvertResult cluster_grd_convert_or_enqueue(
-	const ClusterResId *resid, int32 node_id, uint32 procno, uint64 cluster_epoch,
-	LOCKMODE current_mode, LOCKMODE requested_mode, uint64 convert_request_id, int32 source_node_id,
-	uint64 shard_master_generation, ClusterGrdConflictHolder *conflict_holders_out,
-	int *n_conflict_out);
+extern ClusterGrdConvertResult
+cluster_grd_convert_or_enqueue(const ClusterResId *resid, int32 node_id, uint32 procno,
+							   uint64 cluster_epoch, LOCKMODE current_mode, LOCKMODE requested_mode,
+							   uint64 convert_request_id, int32 source_node_id,
+							   uint64 shard_master_generation,
+							   ClusterGrdConflictHolder *conflict_holders_out, int *n_conflict_out);
 
 /*
  * spec-5.3 §3.5 native-probe clear path: commit a convert whose old slot is
@@ -1151,10 +1152,11 @@ extern ClusterGrdConvertResult cluster_grd_convert_or_enqueue(
  * The master did not pre-mutate during the probe window, so this is the point
  * the upgrade actually takes effect after a CLEAR aggregate.
  */
-extern ClusterGrdConvertResult cluster_grd_convert_grant_by_backend(
-	const ClusterResId *resid, int32 node_id, uint32 procno, uint64 cluster_epoch,
-	LOCKMODE requested_mode, uint64 convert_request_id, int32 source_node_id,
-	uint64 shard_master_generation);
+extern ClusterGrdConvertResult
+cluster_grd_convert_grant_by_backend(const ClusterResId *resid, int32 node_id, uint32 procno,
+									 uint64 cluster_epoch, LOCKMODE requested_mode,
+									 uint64 convert_request_id, int32 source_node_id,
+									 uint64 shard_master_generation);
 
 /*
  * GES RELEASE live path: remove the holder then drain converts + one waiter

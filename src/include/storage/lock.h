@@ -463,8 +463,8 @@ typedef struct LOCALLOCK
 	 * re-register the weaker lock.  cluster_convert_old_request_id != 0
 	 * identifies a converted hold.  In-memory only.
 	 */
-	uint64		cluster_convert_old_request_id;	/* PGRAC: R_old (0 = not a convert) */
-	int			cluster_convert_old_mode;		/* PGRAC: pre-convert LOCKMODE */
+	uint64 cluster_convert_old_request_id; /* PGRAC: R_old (0 = not a convert) */
+	int cluster_convert_old_mode;		   /* PGRAC: pre-convert LOCKMODE */
 #endif
 } LOCALLOCK;
 

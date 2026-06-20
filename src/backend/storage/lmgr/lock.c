@@ -46,7 +46,7 @@
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_grd.h"
-#include "cluster/cluster_ges.h"			/* spec-5.3 — CONVERT_ROLLBACK send */
+#include "cluster/cluster_ges.h" /* spec-5.3 — CONVERT_ROLLBACK send */
 #include "cluster/cluster_native_lock_probe.h"
 #endif
 
@@ -764,23 +764,20 @@ pgrac_cluster_post_native_fail(ClusterLockAcquireResult sr)
 {
 	switch (sr) {
 	case CLUSTER_LOCK_ACQUIRE_FAIL_ILLEGAL_CONVERT:
-		ereport(ERROR,
-				(errcode(ERRCODE_CLUSTER_GES_ILLEGAL_LOCK_CONVERSION),
-				 errmsg("invalid cluster lock mode conversion"),
-				 errhint("The requested lock mode conversion is not a valid upgrade; "
-						 "release and re-acquire the lock instead.")));
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_GES_ILLEGAL_LOCK_CONVERSION),
+						errmsg("invalid cluster lock mode conversion"),
+						errhint("The requested lock mode conversion is not a valid upgrade; "
+								"release and re-acquire the lock instead.")));
 		break;
 	case CLUSTER_LOCK_ACQUIRE_FAIL_SHARD_REMASTERING:
-		ereport(ERROR,
-				(errcode(ERRCODE_CLUSTER_GRD_SHARD_REMASTERING),
-				 errmsg("GRD shard is being remastered after a node failure"),
-				 errhint("Retry the transaction.")));
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_GRD_SHARD_REMASTERING),
+						errmsg("GRD shard is being remastered after a node failure"),
+						errhint("Retry the transaction.")));
 		break;
 	case CLUSTER_LOCK_ACQUIRE_FAIL_STALE_GENERATION:
-		ereport(ERROR,
-				(errcode(ERRCODE_CLUSTER_GRD_STALE_MASTER_GENERATION),
-				 errmsg("cluster GES request carried a stale master generation"),
-				 errhint("The GRD master moved during reconfiguration; retry.")));
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_GRD_STALE_MASTER_GENERATION),
+						errmsg("cluster GES request carried a stale master generation"),
+						errhint("The GRD master moved during reconfiguration; retry.")));
 		break;
 	case CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT:
 		ereport(ERROR,
@@ -811,8 +808,8 @@ pgrac_cluster_post_native_fail(ClusterLockAcquireResult sr)
  */
 static void
 pgrac_cluster_post_native_register(LOCALLOCK *locallock, ClusterLockAcquireRequest *cluster_req,
-								   LOCALLOCK *cluster_lold, const LOCKTAG *locktag, LOCKMODE lockmode,
-								   bool sessionLock)
+								   LOCALLOCK *cluster_lold, const LOCKTAG *locktag,
+								   LOCKMODE lockmode, bool sessionLock)
 {
 	ClusterLockAcquireResult sr = cluster_lock_acquire_s5_promote(cluster_req);
 
@@ -1035,8 +1032,8 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 		{
 			LOCKMODE cluster_current_mode = NoLock;
 
-			cluster_req.op = cluster_lock_decide_op(&cluster_req, &cluster_current_mode,
-													&cluster_lold);
+			cluster_req.op
+				= cluster_lock_decide_op(&cluster_req, &cluster_current_mode, &cluster_lold);
 			cluster_req.current_mode = cluster_current_mode;
 		}
 
@@ -1088,18 +1085,16 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 			 * request (e.g. a cross-node down-convert, which stays
 			 * forward-deferred to the CF/PCM block layer per spec-5.3).
 			 * Not retryable. */
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("this cross-node lock operation is not supported"),
-					 errhint("This GES feature is not yet available in this release.")));
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("this cross-node lock operation is not supported"),
+							errhint("This GES feature is not yet available in this release.")));
 		case CLUSTER_LOCK_ACQUIRE_FAIL_ILLEGAL_CONVERT:
 			/* PGRAC: spec-5.3 D4 — the requested lock conversion is not a
 			 * valid partial-order upgrade (LATERAL / no matching holder). */
-			ereport(ERROR,
-					(errcode(ERRCODE_CLUSTER_GES_ILLEGAL_LOCK_CONVERSION),
-					 errmsg("invalid cluster lock mode conversion"),
-					 errhint("The requested lock mode conversion is not a valid upgrade; "
-							 "release and re-acquire the lock instead.")));
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_GES_ILLEGAL_LOCK_CONVERSION),
+							errmsg("invalid cluster lock mode conversion"),
+							errhint("The requested lock mode conversion is not a valid upgrade; "
+									"release and re-acquire the lock instead.")));
 		case CLUSTER_LOCK_ACQUIRE_FAIL_DEADLOCK:
 			ereport(
 				ERROR,
