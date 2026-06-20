@@ -3036,14 +3036,15 @@ cluster_grd_convert_or_enqueue(const ClusterResId *resid, int32 node_id, uint32 
 
 /*
  * cluster_grd_convert_grant_by_backend -- run the convert decision locating the
- *	OLD slot by (node_id, procno) ALONE (spec-5.3 §3.5 native-probe clear path).
+ *	OLD slot by the precise (node_id, procno, current_mode) (spec-5.3 §3.5
+ *	native-probe clear path).
  *
  *	Used by the LMS native-probe resolve path: when a convert needed a native-
  *	lock probe, the master did NOT pre-mutate the holder (it stayed at the old
  *	mode for the probe window — fail-safe / conservative).  On probe CLEAR this
- *	commits the convert.  The LMS slot does not carry the old mode, so the OLD
- *	slot is located by (node,procno) (a backend converts at most one lock per
- *	resource) and current_mode is derived from the found holder, then the 5.1b
+ *	commits the convert.  A backend may hold multiple cluster modes on one
+ *	resid, so the OLD slot is located by the precise REDECLARE locator
+ *	(node, procno, current_mode) carried in the LMS probe slot, then the 5.1b
  *	partial-order decision runs (GRANTED_INPLACE mutates + rebinds; ENQUEUED if
  *	a cluster conflict appeared during the probe; ILLEGAL if no such holder).
  */

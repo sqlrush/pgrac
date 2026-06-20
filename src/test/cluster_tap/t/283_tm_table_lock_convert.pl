@@ -235,7 +235,12 @@ $hn1->quit;
 
 
 # ----------
-# L5: illegal (LATERAL) convert -> 53R74.
+# L5: a LATERAL multi-mode hold is NOT a convert -- it stays a legal PG additive
+# hold.  SHARE UPDATE EXCLUSIVE then SHARE are incomparable (neither is a
+# partial-order upgrade of the other), so decide_op routes the SHARE as an
+# additive REQUEST (a second holder), NOT a convert.  It must succeed (no
+# 53R74) -- 53R74 is reserved for a genuinely illegal convert (a vanished /
+# cross-version holder), covered at the unit level (test_cluster_grd U16/U17).
 # ----------
 my ($rc5, $out5, $err5) = $pair->node0->psql(
 	'postgres', q{
@@ -243,8 +248,7 @@ my ($rc5, $out5, $err5) = $pair->node0->psql(
 	LOCK TABLE t IN SHARE UPDATE EXCLUSIVE MODE;
 	LOCK TABLE t IN SHARE MODE;
 	COMMIT;});
-ok($rc5 != 0 && $err5 =~ /53R74|not a valid upgrade|invalid cluster lock mode conversion/,
-	'L5 a LATERAL convert is rejected with 53R74 (illegal lock conversion)')
+is($rc5, 0, 'L5 a LATERAL multi-mode hold stays additive (legal PG semantics, no 53R74)')
 	or diag("L5 rc=$rc5 err=$err5");
 
 

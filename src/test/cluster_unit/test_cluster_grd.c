@@ -2408,7 +2408,7 @@ int
  * other cluster_unit binaries; argv is intentionally unused. */
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(42);
+	UT_PLAN(48); /* spec-5.3: +6 (U14/U15/U17/U18/U22/U23) over the prior 42 */
 
 	UT_RUN(test_grd_clusterresid_size_16);
 	UT_RUN(test_grd_resid_encode_decode_roundtrip);

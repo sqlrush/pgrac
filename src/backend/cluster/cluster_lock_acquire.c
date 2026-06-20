@@ -49,6 +49,7 @@
 
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_ges.h"
+#include "cluster/cluster_ges_mode.h" /* spec-5.3 D1 — ges_mode_convert_class for UPGRADE filter */
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h" /* spec-4.6 L11/L14 — redeclare-skip probe */
@@ -791,10 +792,22 @@ cluster_lock_decide_op(const ClusterLockAcquireRequest *req, LOCKMODE *current_m
 	while ((locallock = (LOCALLOCK *)hash_seq_search(&status)) != NULL) {
 		if (!locallock->cluster_registered || locallock->nLocks == 0)
 			continue;
-		if (locallock->tag.mode >= req->lockmode)
-			continue; /* not strictly weaker (== would short-circuit upstream) */
 		if (memcmp(&locallock->tag.lock, &req->locktag, sizeof(LOCKTAG)) != 0)
 			continue; /* different resource */
+		/*
+		 * Only a genuine partial-order UPGRADE is a convert (review): route by
+		 * the frozen-matrix convert class, NOT a numeric mode comparison.  A
+		 * held mode that is merely numerically weaker but LATERAL (incomparable)
+		 * to the requested mode — e.g. SHARE UPDATE EXCLUSIVE held, SHARE
+		 * requested — is a legitimate PG additive multi-mode hold, so it must
+		 * fall through to an additive REQUEST (a second holder), NOT be forced
+		 * into a convert that the master would reject 53R74.  Pick the strongest
+		 * UPGRADE-eligible held mode as the locator.
+		 */
+		if (ges_mode_convert_class((ClusterGesMode)locallock->tag.mode,
+								   (ClusterGesMode)req->lockmode)
+			!= GES_CONVERT_UPGRADE)
+			continue;
 		if (best == NULL || locallock->tag.mode > best_mode) {
 			best = locallock;
 			best_mode = locallock->tag.mode;

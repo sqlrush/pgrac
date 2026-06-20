@@ -660,9 +660,9 @@ test_cluster_lmd: test_cluster_lmd.c unit_test.h \
 # backend symbols locally and exercises S1-S7 individual step API + top-
 # level dispatch + HC1 fail-closed + I1 monotonic forward transition.
 test_cluster_lock_acquire: test_cluster_lock_acquire.c unit_test.h \
-		$(CLUSTER_VERSION_O) $(CLUSTER_LOCK_ACQUIRE_O)
+		$(CLUSTER_VERSION_O) $(CLUSTER_LOCK_ACQUIRE_O) $(CLUSTER_GES_MODE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_VERSION_O) $(CLUSTER_LOCK_ACQUIRE_O) \
+		$(CLUSTER_VERSION_O) $(CLUSTER_LOCK_ACQUIRE_O) $(CLUSTER_GES_MODE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
