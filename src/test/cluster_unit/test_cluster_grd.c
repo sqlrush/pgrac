@@ -2063,18 +2063,49 @@ UT_TEST(test_convert_5_3_u18_master_wrappers)
 	UT_ASSERT_EQ((int)m, (int)AccessExclusiveLock);
 	convert_teardown();
 
-	/* convert_grant_by_backend: derives current_mode from the (node,procno)
-	 * holder and upgrades it. */
+	/* convert_grant_by_backend (native-probe clear path): locates by the
+	 * PRECISE (node,procno,current_mode) and upgrades that slot. */
 	convert_reset();
 	convert_resid(5306, &resid);
 	e = convert_make_entry(5306);
 	convert_grant(e, 1, 100, 11, ShareLock);
-	UT_ASSERT_EQ((int)cluster_grd_convert_grant_by_backend(&resid, 1, 100, 0, AccessExclusiveLock,
-														   77, 1, 0),
+	UT_ASSERT_EQ((int)cluster_grd_convert_grant_by_backend(&resid, 1, 100, 0, ShareLock,
+														   AccessExclusiveLock, 77, 1, 0),
 				 (int)CLUSTER_GRD_CONVERT_GRANTED_INPLACE);
 	m = NoLock;
 	UT_ASSERT(cluster_grd_entry_holder_mode(e, 1, 100, &m));
 	UT_ASSERT_EQ((int)m, (int)AccessExclusiveLock);
+	convert_teardown();
+
+	/* MULTI-OLD-HOLDER (review): the same backend holds TWO cluster modes on
+	 * one resid (SHARE + SHARE UPDATE EXCLUSIVE — the latter is additive because
+	 * it is numerically weaker, so decide_op does not convert it).  A convert
+	 * whose current_mode matches NEITHER held slot must fail-closed ILLEGAL —
+	 * the precise (node,procno,current_mode) locator must NOT grab an arbitrary
+	 * (node,procno) holder (which the old (node,procno)-only derivation would,
+	 * upgrading the wrong slot -> wrong-mode grant + leak). */
+	convert_reset();
+	convert_resid(5308, &resid);
+	e = convert_make_entry(5308);
+	convert_grant(e, 1, 100, /* R_share */ 11, ShareLock);
+	convert_grant(e, 1, 100, /* R_suex  */ 12, ShareUpdateExclusiveLock);
+	/* current_mode = ExclusiveLock is held by NEITHER slot -> ILLEGAL. */
+	UT_ASSERT_EQ((int)cluster_grd_convert_grant_by_backend(&resid, 1, 100, 0, ExclusiveLock,
+														   AccessExclusiveLock, 77, 1, 0),
+				 (int)CLUSTER_GRD_CONVERT_ILLEGAL);
+	UT_ASSERT_EQ(cluster_grd_entry_ngranted(e), 2); /* both slots untouched */
+	{
+		ClusterGrdHolderId h;
+
+		memset(&h, 0, sizeof(h));
+		h.node_id = 1;
+		h.procno = 100;
+		h.cluster_epoch = 0;
+		h.request_id = 11; /* SHARE slot intact */
+		UT_ASSERT_EQ((int)cluster_grd_entry_release_holder(e, &h), (int)CLUSTER_GRD_ENTRY_OK);
+		h.request_id = 12; /* SUEX slot intact */
+		UT_ASSERT_EQ((int)cluster_grd_entry_release_holder(e, &h), (int)CLUSTER_GRD_ENTRY_OK);
+	}
 	convert_teardown();
 }
 

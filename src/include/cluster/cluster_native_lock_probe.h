@@ -164,10 +164,16 @@ extern void cluster_lms_native_probe_cleanup_on_backend_exit(int procno);
 extern bool cluster_lms_native_probe_wait_clear(const ClusterResId *resid, LOCKMODE lockmode,
 												const ClusterGrdHolderId *requester,
 												int timeout_ms);
+/* spec-5.3: convert_current_mode carries the REDECLARE locator current_mode for
+ * an async CONVERT (request_opcode == GES_REQ_OPCODE_CONVERT) so the resolve
+ * path locates the OLD holder precisely by (node, procno, current_mode) — a
+ * backend may hold multiple cluster modes on one resid.  NoLock (0) for
+ * REQUEST. */
 extern bool cluster_lms_native_probe_schedule_grant(const ClusterResId *resid, LOCKMODE lockmode,
 													const ClusterGrdHolderId *requester,
 													int32 source_node_id, uint32 request_opcode,
-													uint64 shard_master_generation);
+													uint64 shard_master_generation,
+													LOCKMODE convert_current_mode);
 
 /* ============================================================
  * GUC defaults — actual values bound in cluster_guc.c (D9).

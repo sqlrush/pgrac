@@ -3049,17 +3049,16 @@ cluster_grd_convert_or_enqueue(const ClusterResId *resid, int32 node_id, uint32 
  */
 ClusterGrdConvertResult
 cluster_grd_convert_grant_by_backend(const ClusterResId *resid, int32 node_id, uint32 procno,
-									 uint64 cluster_epoch, LOCKMODE requested_mode,
-									 uint64 convert_request_id, int32 source_node_id,
-									 uint64 shard_master_generation)
+									 uint64 cluster_epoch, LOCKMODE current_mode,
+									 LOCKMODE requested_mode, uint64 convert_request_id,
+									 int32 source_node_id, uint64 shard_master_generation)
 {
 	ClusterGrdEntry *entry = NULL;
 	ClusterGrdEntryResult lookup_result;
 	ClusterGrdConvert creq;
 	ClusterGrdConvertResult result;
-	LOCKMODE current_mode = NoLock;
 	bool drain_hint = false;
-	int hslot = -1;
+	int hslot;
 
 	Assert(resid != NULL);
 
@@ -3069,13 +3068,13 @@ cluster_grd_convert_grant_by_backend(const ClusterResId *resid, int32 node_id, u
 
 	SpinLockAcquire(&entry->lock);
 
-	for (int i = 0; i < entry->ngranted; i++) {
-		if (entry->holders[i].node_id == node_id && entry->holders[i].procno == procno) {
-			hslot = i;
-			current_mode = entry->holders[i].mode;
-			break;
-		}
-	}
+	/*
+	 * Precise REDECLARE locator (review): a backend may hold several cluster
+	 * modes on one resid, so match (node, procno, current_mode) exactly rather
+	 * than the first (node, procno) holder — otherwise the upgrade could land
+	 * on the wrong slot.
+	 */
+	hslot = grd_find_holder_slot(entry, node_id, procno, current_mode);
 	if (hslot < 0) {
 		SpinLockRelease(&entry->lock);
 		cluster_grd_entry_release(entry);

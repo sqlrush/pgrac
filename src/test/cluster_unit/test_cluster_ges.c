@@ -541,7 +541,8 @@ cluster_lms_native_probe_schedule_grant(
 	const struct ClusterResId *resid pg_attribute_unused(), int lockmode pg_attribute_unused(),
 	const struct ClusterGrdHolderId *requester pg_attribute_unused(),
 	int32 source_node_id pg_attribute_unused(), uint32 request_opcode pg_attribute_unused(),
-	uint64 shard_master_generation pg_attribute_unused())
+	uint64 shard_master_generation pg_attribute_unused(),
+	int convert_current_mode pg_attribute_unused())
 {
 	return false;
 }

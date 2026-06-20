@@ -1190,8 +1190,8 @@ post_lock:
 					 | (uint64)slot->shard_master_generation_lo;
 		ClusterGrdConvertResult cr = cluster_grd_convert_grant_by_backend(
 			&slot->resid, (int32)slot->requester.node_id, slot->requester.procno,
-			slot->requester.cluster_epoch, slot->lockmode, slot->requester.request_id,
-			slot->grant_source_node_id, gen);
+			slot->requester.cluster_epoch, (LOCKMODE)slot->convert_old_mode, slot->lockmode,
+			slot->requester.request_id, slot->grant_source_node_id, gen);
 
 		if (cr == CLUSTER_GRD_CONVERT_GRANTED_INPLACE)
 			native_probe_send_grant_reply(slot);
@@ -1356,7 +1356,8 @@ cluster_lms_native_probe_cleanup_on_backend_exit(int procno)
 bool
 cluster_lms_native_probe_schedule_grant(const ClusterResId *resid, LOCKMODE lockmode,
 										const ClusterGrdHolderId *requester, int32 source_node_id,
-										uint32 request_opcode, uint64 shard_master_generation)
+										uint32 request_opcode, uint64 shard_master_generation,
+										LOCKMODE convert_current_mode)
 {
 	LOCKTAG locktag;
 	uint32 slot_idx;
@@ -1377,6 +1378,8 @@ cluster_lms_native_probe_schedule_grant(const ClusterResId *resid, LOCKMODE lock
 	slot->grant_source_node_id = source_node_id;
 	slot->request_opcode = request_opcode;
 	slot->shard_master_generation_lo = (uint32)(shard_master_generation & 0xffffffffu);
+	/* spec-5.3 — precise REDECLARE locator for an async CONVERT commit. */
+	slot->convert_old_mode = (uint8)convert_current_mode;
 	slot->grant_on_clear = true;
 	cluster_lms_native_probe_dispatch(slot_idx);
 	cluster_lms_native_probe_aggregate_and_resolve(slot_idx);

@@ -174,7 +174,15 @@ typedef struct ClusterLmsNativeLockProbeSlot {
 	uint32 final_status;			   /* sync waiter result; 0 clear,3 timeout */
 	bool grant_on_clear;			   /* async remote-master grant completion */
 	bool final_ready;				   /* sync waiter completion flag */
-	bool _pad2[2];
+	/* spec-5.3 — for an async CONVERT (grant_on_clear + request_opcode ==
+	 * GES_REQ_OPCODE_CONVERT) this carries the REDECLARE locator's current_mode
+	 * so the resolve path locates the OLD holder by the precise (node, procno,
+	 * current_mode) — a backend may hold multiple cluster modes on one resid
+	 * (e.g. SHARE + SHARE UPDATE EXCLUSIVE), so (node, procno) alone is
+	 * ambiguous.  0 (NoLock) for non-convert opcodes.  Reuses padding — slot
+	 * size is unchanged. */
+	uint8 convert_old_mode;
+	bool _pad2[1];
 	/* spec-2.27 D5 / HC55 — per-slot LWLock serializes mutation of
 	 * expected/received bitmaps + aggregated_status_packed across the
 	 * six concurrent paths (wait_clear backend, recv_reply handler,

@@ -883,7 +883,8 @@ cluster_ges_lmon_drain_work_queue(void)
 				if (cluster_lms_native_probe_required(&resid, (LOCKMODE)req->lockmode)) {
 					if (!cluster_lms_native_probe_schedule_grant(
 							&resid, (LOCKMODE)req->lockmode, &holder, (int32)item.source_node_id,
-							req->opcode, ges_request_shard_master_generation(req))) {
+							req->opcode, ges_request_shard_master_generation(req),
+							/* REQUEST: no convert locator */ NoLock)) {
 						GesReplyPayload reject;
 
 						(void)cluster_grd_release_holder_by_id(&resid, &holder);
@@ -976,9 +977,9 @@ cluster_ges_lmon_drain_work_queue(void)
 			 */
 			if (item.source_node_id != (uint32)cluster_node_id
 				&& cluster_lms_native_probe_required(&resid, requested_mode)) {
-				if (!cluster_lms_native_probe_schedule_grant(&resid, requested_mode, &holder,
-															 (int32)item.source_node_id,
-															 req->opcode, generation))
+				if (!cluster_lms_native_probe_schedule_grant(
+						&resid, requested_mode, &holder, (int32)item.source_node_id, req->opcode,
+						generation, convert_old_mode))
 					ges_dispatch_reject((int32)item.source_node_id, &holder, &resid, req->opcode,
 										GES_REJECT_REASON_WORK_QUEUE_FULL, generation);
 				/* else: GRANT/REJECT sent later by the LMS resolve path. */

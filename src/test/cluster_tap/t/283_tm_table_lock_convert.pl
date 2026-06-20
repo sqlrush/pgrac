@@ -141,20 +141,24 @@ my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 $pair->start_pair;
 usleep(3_000_000);
 
-is($pair->node0->safe_psql('postgres', 'SELECT 1'), '1', 'L1 node0 alive');
-is($pair->node1->safe_psql('postgres', 'SELECT 1'), '1', 'L1 node1 alive');
-ok($pair->wait_for_peer_state(0, 1, 'connected', 30), 'L1 node0 sees node1 connected');
-ok($pair->wait_for_peer_state(1, 0, 'connected', 30), 'L1 node1 sees node0 connected');
-
+# Prerequisites: skip_all MUST precede any test output (no ok/is before this).
+my $alive0 = $pair->node0->safe_psql('postgres', 'SELECT 1');
+my $alive1 = $pair->node1->safe_psql('postgres', 'SELECT 1');
 $pair->node0->safe_psql('postgres', 'CREATE TABLE t (id int, ctr int)');
 $pair->node1->safe_psql('postgres', 'CREATE TABLE t (id int, ctr int)');
 my $p0 = $pair->node0->safe_psql('postgres', "SELECT pg_relation_filepath('t')");
 my $p1 = $pair->node1->safe_psql('postgres', "SELECT pg_relation_filepath('t')");
-if ($p0 ne $p1)
+if (($alive0 // '') ne '1' || ($alive1 // '') ne '1' || ($p0 // '') ne ($p1 // ''))
 {
 	$pair->stop_pair;
-	plan skip_all => "same-DDL relfilepath coincidence does not hold (n0=$p0 n1=$p1)";
+	plan skip_all =>
+	  "cluster pair prerequisites not met (alive0=$alive0 alive1=$alive1 n0=$p0 n1=$p1)";
 }
+
+is($alive0, '1', 'L1 node0 alive');
+is($alive1, '1', 'L1 node1 alive');
+ok($pair->wait_for_peer_state(0, 1, 'connected', 30), 'L1 node0 sees node1 connected');
+ok($pair->wait_for_peer_state(1, 0, 'connected', 30), 'L1 node1 sees node0 connected');
 
 is($pair->node0->safe_psql(
 		'postgres', qq{
