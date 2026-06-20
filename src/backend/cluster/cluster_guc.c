@@ -111,6 +111,10 @@ static const struct config_enum_entry cluster_undo_writeback_boundary_check_opti
 int cluster_grd_max_entries = 0;
 int cluster_ges_request_timeout_ms = 60000; /* spec-2.16 D12 + v0.5 P1.5 */
 
+/* spec-5.3 D10 — TM cross-node convert tunables. */
+int cluster_ges_convert_timeout_ms = 30000; /* finite convert wait before 53R70 */
+int cluster_tm_convert_mode = CLUSTER_TM_CONVERT_MODE_CONVERT;
+
 /* spec-4.6 D4/D1 — failure-driven remaster tunables. */
 int cluster_grd_remaster_wait_ms = 200;	   /* frozen-shard short wait before 53R9I */
 int cluster_grd_rebuild_timeout_ms = 5000; /* holder-rebuild barrier deadline */
@@ -568,6 +572,13 @@ static const struct config_enum_entry cluster_write_fence_enforcement_options[]
 	= { { "off", CLUSTER_WRITE_FENCE_ENFORCE_OFF, false },
 		{ "on", CLUSTER_WRITE_FENCE_ENFORCE_ON, false },
 		{ "dev", CLUSTER_WRITE_FENCE_ENFORCE_DEV, false },
+		{ NULL, 0, false } };
+
+/* spec-5.3 D10 — same-backend TM table-lock upgrade routing: Oracle DLM
+ * convert (default, Q1=A) vs PG additive double-hold escape hatch (Q1=B). */
+static const struct config_enum_entry cluster_tm_convert_mode_options[]
+	= { { "convert", CLUSTER_TM_CONVERT_MODE_CONVERT, false },
+		{ "additive", CLUSTER_TM_CONVERT_MODE_ADDITIVE, false },
 		{ NULL, 0, false } };
 
 /*
@@ -1305,6 +1316,28 @@ cluster_init_guc(void)
 					 "**never evict in-flight entries** (HC51 — eviction would re-introduce "
 					 "double-grant risk).  PGC_POSTMASTER — sized at startup."),
 		&cluster_ges_dedup_max_entries, 8192, 256, 1048576, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	/* spec-5.3 D10 — TM cross-node convert tunables. */
+	DefineCustomIntVariable(
+		"cluster.ges_convert_timeout_ms",
+		gettext_noop("Finite wait for a cross-node lock-conversion (convert) grant reply."),
+		gettext_noop("Range [1000, 600000] (1s - 10min).  Default 30000.  A same-backend TM "
+					 "table-lock upgrade (e.g. LOCK TABLE ... IN SHARE MODE then ALTER TABLE) "
+					 "that conflicts with another node's holder waits this long for the holder "
+					 "to release before failing closed with 53R70."),
+		&cluster_ges_convert_timeout_ms, 30000, 1000, 600000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
+		NULL);
+
+	DefineCustomEnumVariable(
+		"cluster.tm_convert_mode",
+		gettext_noop("How a same-backend TM table-lock upgrade is routed across nodes."),
+		gettext_noop("'convert' (default) performs an Oracle DLM-style in-place lock conversion "
+					 "(opcode-2 CONVERT;  the master upgrades the holder slot and rebinds its "
+					 "request id).  'additive' keeps the PG additive model (a second holder "
+					 "entry, self-excluded) as an escape hatch — no convert state machine, no "
+					 "release-ownership transfer."),
+		&cluster_tm_convert_mode, CLUSTER_TM_CONVERT_MODE_CONVERT, cluster_tm_convert_mode_options,
+		PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	/* spec-4.6 D4/D1 — failure-driven remaster tunables. */
 	DefineCustomIntVariable(

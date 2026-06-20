@@ -46,6 +46,7 @@
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_grd.h"
+#include "cluster/cluster_ges.h"			/* spec-5.3 — CONVERT_ROLLBACK send */
 #include "cluster/cluster_native_lock_probe.h"
 #endif
 
@@ -752,6 +753,105 @@ LockAcquire(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock, bool do
  * If locallockp isn't NULL, *locallockp receives a pointer to the LOCALLOCK
  * table entry if a lock is successfully acquired, or NULL if not.
  */
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * PGRAC: spec-5.3 — map a failed post-native S5 (convert or grant) result to
+ * the matching SQLSTATE and ereport(ERROR).  Shared by both LOCKACQUIRE_OK
+ * exit paths (fast-path + main).  Never returns.
+ */
+static void
+pgrac_cluster_post_native_fail(ClusterLockAcquireResult sr)
+{
+	switch (sr) {
+	case CLUSTER_LOCK_ACQUIRE_FAIL_ILLEGAL_CONVERT:
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_GES_ILLEGAL_LOCK_CONVERSION),
+				 errmsg("invalid cluster lock mode conversion"),
+				 errhint("The requested lock mode conversion is not a valid upgrade; "
+						 "release and re-acquire the lock instead.")));
+		break;
+	case CLUSTER_LOCK_ACQUIRE_FAIL_SHARD_REMASTERING:
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_GRD_SHARD_REMASTERING),
+				 errmsg("GRD shard is being remastered after a node failure"),
+				 errhint("Retry the transaction.")));
+		break;
+	case CLUSTER_LOCK_ACQUIRE_FAIL_STALE_GENERATION:
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_GRD_STALE_MASTER_GENERATION),
+				 errmsg("cluster GES request carried a stale master generation"),
+				 errhint("The GRD master moved during reconfiguration; retry.")));
+		break;
+	case CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT:
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_GES_TIMEOUT), errmsg("cluster lock conversion timed out"),
+				 errhint("Consider increasing cluster.ges_convert_timeout_ms.")));
+		break;
+	default:
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("cluster S5 promote failed (result=%d)", (int)sr)));
+		break;
+	}
+	pg_unreachable();
+}
+
+/*
+ * PGRAC: spec-5.3 §3.1a — post-native cluster registration + convert ownership
+ * transfer.  Runs at both LOCKACQUIRE_OK exit paths once the PG-native lock is
+ * held (T1).  Sends the opcode-2 CONVERT (or promotes the reservation for a
+ * plain REQUEST) via S5, then:
+ *   - REQUEST grant:  register L_new and bump the rebind-barrier count;
+ *   - CONVERT (OK_CONVERTED):  register L_new, record the backout markers
+ *     (old mode + R_old), and DE-REGISTER the weaker L_old — net-zero count.
+ * On failure it backs out: a convert sends a best-effort CONVERT_ROLLBACK (so a
+ * master that granted after a requester timeout cannot leave a false-grant) and
+ * keeps L_old registered;  a REQUEST cancels its reservation (S7).  Then it
+ * releases the PG-native lock and ereports the mapped SQLSTATE (never returns
+ * on failure).
+ */
+static void
+pgrac_cluster_post_native_register(LOCALLOCK *locallock, ClusterLockAcquireRequest *cluster_req,
+								   LOCALLOCK *cluster_lold, const LOCKTAG *locktag, LOCKMODE lockmode,
+								   bool sessionLock)
+{
+	ClusterLockAcquireResult sr = cluster_lock_acquire_s5_promote(cluster_req);
+
+	if (sr != CLUSTER_LOCK_ACQUIRE_OK_GRANTED && sr != CLUSTER_LOCK_ACQUIRE_OK_CONVERTED) {
+		if (cluster_req->op == CLUSTER_LOCK_OP_CONVERT) {
+			if (cluster_lold != NULL) {
+				ClusterGrdHolderId rb = cluster_req->holder;
+
+				rb.request_id = cluster_lold->cluster_request_id; /* R_old */
+				cluster_ges_send_convert_rollback(&cluster_req->resid, (uint32)lockmode,
+												  (uint32)cluster_req->current_mode, &rb,
+												  cluster_lold->cluster_request_id);
+			}
+		} else {
+			(void)cluster_lock_acquire_s7_cleanup(cluster_req); /* cancel reservation */
+		}
+		(void)LockRelease(locktag, lockmode, sessionLock);
+		pgrac_cluster_post_native_fail(sr); /* noreturn */
+	}
+
+	locallock->cluster_registered = true;
+	locallock->cluster_request_id = cluster_req->request_id;
+	memcpy(locallock->cluster_holder_raw, &cluster_req->holder,
+		   sizeof(locallock->cluster_holder_raw));
+
+	if (cluster_req->op == CLUSTER_LOCK_OP_CONVERT && cluster_lold != NULL) {
+		/* §3.1a T3 — ownership transfer L_old -> L_new (net-zero count). */
+		locallock->cluster_convert_old_request_id = cluster_lold->cluster_request_id;
+		locallock->cluster_convert_old_mode = cluster_lold->tag.mode;
+		cluster_lold->cluster_registered = false;
+		cluster_lold->cluster_request_id = 0;
+		memset(cluster_lold->cluster_holder_raw, 0, sizeof(cluster_lold->cluster_holder_raw));
+	} else {
+		/* PGRAC: spec-4.6 D3 — rebind-barrier scope count (fresh grant). */
+		pg_atomic_fetch_add_u32(&MyProc->cluster_grd_registered_count, 1);
+	}
+}
+#endif
+
 LockAcquireResult
 LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock, bool dontWait,
 					bool reportMemoryError, LOCALLOCK **locallockp)
@@ -776,6 +876,9 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 	 */
 	volatile bool cluster_need_s5 = false;
 	ClusterLockAcquireRequest cluster_req;
+	/* PGRAC: spec-5.3 §3.1a — the weaker LOCALLOCK being converted (L_old) so
+	 * the post-native registration can de-register it and rebind ownership. */
+	LOCALLOCK *cluster_lold = NULL;
 
 	memset(&cluster_req, 0, sizeof(cluster_req));
 
@@ -850,6 +953,9 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 		locallock->cluster_registered = false;
 		locallock->cluster_request_id = 0;
 		memset(locallock->cluster_holder_raw, 0, sizeof(locallock->cluster_holder_raw));
+		/* PGRAC: spec-5.3 §3.1a convert release-ownership markers. */
+		locallock->cluster_convert_old_request_id = 0;
+		locallock->cluster_convert_old_mode = 0;
 #endif
 	} else {
 		/* Make sure there will be room to remember the lock */
@@ -920,6 +1026,20 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 		cluster_req.sessionLock = sessionLock;
 		cluster_grd_resid_encode(locktag, &cluster_req.resid);
 
+		/*
+		 * PGRAC: spec-5.3 D1/§3.1a — decide REQUEST vs CONVERT.  A same-backend
+		 * upgrade of an already-held cluster-registered weaker lock on this
+		 * locktag is an Oracle DLM convert;  capture the locator mode + the
+		 * weaker LOCALLOCK (L_old) for the post-native ownership transfer.
+		 */
+		{
+			LOCKMODE cluster_current_mode = NoLock;
+
+			cluster_req.op = cluster_lock_decide_op(&cluster_req, &cluster_current_mode,
+													&cluster_lold);
+			cluster_req.current_mode = cluster_current_mode;
+		}
+
 		cluster_r = cluster_lock_acquire_seven_step(&cluster_req);
 
 		switch (cluster_r) {
@@ -965,14 +1085,21 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 							 "to the new master.")));
 		case CLUSTER_LOCK_ACQUIRE_FAIL_FEATURE_NOT_SUPPORTED:
 			/* PGRAC: spec-5.1b D3 — the master rejected an unsupported
-			 * request.  Currently the only producer is the cross-node
-			 * opcode-2 lock-conversion path, which is not yet a supported
-			 * production feature (the real backend trigger + convert wire
-			 * land in spec-5.2).  Not retryable. */
+			 * request (e.g. a cross-node down-convert, which stays
+			 * forward-deferred to the CF/PCM block layer per spec-5.3).
+			 * Not retryable. */
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("cross-node lock conversion is not supported"),
+					 errmsg("this cross-node lock operation is not supported"),
 					 errhint("This GES feature is not yet available in this release.")));
+		case CLUSTER_LOCK_ACQUIRE_FAIL_ILLEGAL_CONVERT:
+			/* PGRAC: spec-5.3 D4 — the requested lock conversion is not a
+			 * valid partial-order upgrade (LATERAL / no matching holder). */
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_GES_ILLEGAL_LOCK_CONVERSION),
+					 errmsg("invalid cluster lock mode conversion"),
+					 errhint("The requested lock mode conversion is not a valid upgrade; "
+							 "release and re-acquire the lock instead.")));
 		case CLUSTER_LOCK_ACQUIRE_FAIL_DEADLOCK:
 			ereport(
 				ERROR,
@@ -1062,22 +1189,9 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 			GrantLockLocal(locallock, owner);
 #ifdef USE_PGRAC_CLUSTER
 			/* PGRAC: post-native S5 promote — spec-2.21 D2 / D4 P2.3. */
-			if (cluster_need_s5) {
-				ClusterLockAcquireResult sr = cluster_lock_acquire_s5_promote(&cluster_req);
-				if (sr != CLUSTER_LOCK_ACQUIRE_OK_GRANTED
-					&& sr != CLUSTER_LOCK_ACQUIRE_OK_CONVERTED) {
-					PGRAC_CLUSTER_CLEANUP_PENDING_ACQUIRE();
-					(void)LockRelease(locktag, lockmode, sessionLock);
-					ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-									errmsg("cluster S5 promote failed (result=%d)", (int)sr)));
-				}
-				locallock->cluster_registered = true;
-				locallock->cluster_request_id = cluster_req.request_id;
-				memcpy(locallock->cluster_holder_raw, &cluster_req.holder,
-					   sizeof(locallock->cluster_holder_raw));
-				/* PGRAC: spec-4.6 D3 — rebind-barrier scope count. */
-				pg_atomic_fetch_add_u32(&MyProc->cluster_grd_registered_count, 1);
-			}
+			if (cluster_need_s5)
+				pgrac_cluster_post_native_register(locallock, &cluster_req, cluster_lold, locktag,
+												   lockmode, sessionLock);
 #endif
 			return LOCKACQUIRE_OK;
 		}
@@ -1271,22 +1385,11 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 	}
 
 #ifdef USE_PGRAC_CLUSTER
-	/* PGRAC: post-native S5 promote — spec-2.21 D2 / D4 P2.3. */
-	if (cluster_need_s5) {
-		ClusterLockAcquireResult sr = cluster_lock_acquire_s5_promote(&cluster_req);
-		if (sr != CLUSTER_LOCK_ACQUIRE_OK_GRANTED && sr != CLUSTER_LOCK_ACQUIRE_OK_CONVERTED) {
-			PGRAC_CLUSTER_CLEANUP_PENDING_ACQUIRE();
-			(void)LockRelease(locktag, lockmode, sessionLock);
-			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-							errmsg("cluster S5 promote failed (result=%d)", (int)sr)));
-		}
-		locallock->cluster_registered = true;
-		locallock->cluster_request_id = cluster_req.request_id;
-		memcpy(locallock->cluster_holder_raw, &cluster_req.holder,
-			   sizeof(locallock->cluster_holder_raw));
-		/* PGRAC: spec-4.6 D3 — rebind-barrier scope count. */
-		pg_atomic_fetch_add_u32(&MyProc->cluster_grd_registered_count, 1);
-	}
+	/* PGRAC: post-native S5 promote / convert ownership transfer (spec-2.21
+	 * D2 / D4 P2.3 + spec-5.3 §3.1a). */
+	if (cluster_need_s5)
+		pgrac_cluster_post_native_register(locallock, &cluster_req, cluster_lold, locktag, lockmode,
+										   sessionLock);
 #endif
 	return LOCKACQUIRE_OK;
 #undef PGRAC_CLUSTER_CLEANUP_PENDING_ACQUIRE
@@ -2112,19 +2215,64 @@ LockRelease(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 	 * Spec: spec-2.21-pg-lockacquire-integration-2node-smoke.md (D2)
 	 */
 	if (locallock->cluster_registered) {
-		ClusterLockReleaseRequest crel;
+		bool did_backout = false;
 
-		memset(&crel, 0, sizeof(crel));
-		crel.locktag = *locktag;
-		crel.lockmode = lockmode;
-		crel.sessionLock = sessionLock;
-		crel.request_id = locallock->cluster_request_id;
-		memcpy(&crel.holder, locallock->cluster_holder_raw, sizeof(crel.holder));
-		crel.cluster_registered = true;
-		cluster_lock_release(&crel);
+		/*
+		 * PGRAC: spec-5.3 §3.1a T4 — convert backout.  If this is a converted
+		 * (upgraded) hold whose pre-convert weaker lock (L_old) is STILL held
+		 * — a subtransaction acquired the upgrade then aborted, releasing this
+		 * lock while the parent keeps the weaker one (ReleaseLockIfHeld ->
+		 * LockRelease) — restore the master slot to (old_mode, R_old) and
+		 * re-register L_old.  A plain RELEASE deletes the holder and would
+		 * leave the still-held weaker lock as a false-grant.  L_old is found
+		 * by a direct HASH_FIND (no nested seq-scan).
+		 */
+		if (locallock->cluster_convert_old_request_id != 0) {
+			LOCALLOCKTAG oldtag;
+			LOCALLOCK *lold;
+
+			MemSet(&oldtag, 0, sizeof(oldtag));
+			oldtag.lock = *locktag;
+			oldtag.mode = locallock->cluster_convert_old_mode;
+			lold = (LOCALLOCK *)hash_search(LockMethodLocalHash, &oldtag, HASH_FIND, NULL);
+			if (lold != NULL && lold->nLocks > 0) {
+				ClusterResId resid;
+				ClusterGrdHolderId rb;
+
+				cluster_grd_resid_encode(locktag, &resid);
+				memcpy(&rb, locallock->cluster_holder_raw, sizeof(rb));
+				rb.request_id = locallock->cluster_convert_old_request_id; /* R_old */
+				cluster_ges_send_convert_rollback(&resid, (uint32)lockmode,
+												  (uint32)locallock->cluster_convert_old_mode, &rb,
+												  locallock->cluster_convert_old_request_id);
+				/* Re-register L_old as the sole cluster owner (net-zero count:
+				 * L_new -1 + L_old +1, so no decrement below). */
+				lold->cluster_registered = true;
+				lold->cluster_request_id = locallock->cluster_convert_old_request_id;
+				memcpy(lold->cluster_holder_raw, &rb, sizeof(lold->cluster_holder_raw));
+				lold->cluster_convert_old_request_id = 0;
+				lold->cluster_convert_old_mode = 0;
+				did_backout = true;
+			}
+		}
+
+		if (!did_backout) {
+			ClusterLockReleaseRequest crel;
+
+			memset(&crel, 0, sizeof(crel));
+			crel.locktag = *locktag;
+			crel.lockmode = lockmode;
+			crel.sessionLock = sessionLock;
+			crel.request_id = locallock->cluster_request_id;
+			memcpy(&crel.holder, locallock->cluster_holder_raw, sizeof(crel.holder));
+			crel.cluster_registered = true;
+			cluster_lock_release(&crel);
+			/* PGRAC: spec-4.6 D3 — rebind-barrier scope count. */
+			pg_atomic_fetch_sub_u32(&MyProc->cluster_grd_registered_count, 1);
+		}
 		locallock->cluster_registered = false;
-		/* PGRAC: spec-4.6 D3 — rebind-barrier scope count. */
-		pg_atomic_fetch_sub_u32(&MyProc->cluster_grd_registered_count, 1);
+		locallock->cluster_convert_old_request_id = 0;
+		locallock->cluster_convert_old_mode = 0;
 	}
 #endif
 

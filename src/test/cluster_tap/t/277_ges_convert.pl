@@ -100,9 +100,13 @@ is( $node->safe_psql('postgres', q{
 
 
 # ----------------------------------------------------------------------
-# L4 -- spec-5.1b D3: inbound opcode-2 CONVERT -> explicit FEATURE_NOT_SUPPORTED
-# reject mechanism is WIRED (source contract; no live producer in 5.1b, so the
-# cross-node convert e2e is not faked -- L341).
+# L4 -- spec-5.3 AMEND: the inbound opcode-2 CONVERT handler is now LIVE (the
+# 5.1b FEATURE_NOT_SUPPORTED placeholder was replaced by the real convert
+# decision when spec-5.3 activated the TM table-lock upgrade consumer).  The
+# real cross-node convert GRANT / conflict / 53R74 e2e lives in
+# t/283_tm_table_lock_convert.pl;  here we keep the source contract that the
+# handler drives the live state machine and fail-closes with 53R74 (NOT a
+# silent drop, NOT an ereport on the LMS/receiving thread -- L341).
 # ----------------------------------------------------------------------
 my $root = "$FindBin::RealBin/../../../..";
 
@@ -120,28 +124,28 @@ sub slurp_src
 my $ges_c = slurp_src('src/backend/cluster/cluster_ges.c');
 # A dedicated CONVERT handler block (split out of the REQUEST fallthrough).
 like($ges_c, qr/case GES_REQ_OPCODE_CONVERT: \{/,
-	'L4: inbound opcode-2 CONVERT has its own handler (split from REQUEST, D3)');
-# The handler constructs a FEATURE_NOT_SUPPORTED reject and sends it through
-# the reply ring (NOT an ereport on the LMS/receiving thread).
-like($ges_c, qr/reject\.reject_reason = GES_REJECT_REASON_FEATURE_NOT_SUPPORTED;/,
-	'L4: CONVERT handler builds a FEATURE_NOT_SUPPORTED reject');
-like($ges_c,
-	qr/GES_REJECT_REASON_FEATURE_NOT_SUPPORTED;.*?cluster_grd_outbound_enqueue_lmon_reply/s,
-	'L4: the reject is sent via the reply ring, not ereported on the LMS thread');
+	'L4: inbound opcode-2 CONVERT has its own handler (split from REQUEST)');
+# The handler drives the live 5.1b convert state machine (spec-5.3 D3).
+like($ges_c, qr/cluster_grd_convert_or_enqueue\(/,
+	'L4: CONVERT handler runs the live convert decision (cluster_grd_convert_or_enqueue)');
+# An illegal (LATERAL / no-holder) convert fail-closes via the reply ring with
+# the 53R74 reason -- NOT an ereport on the LMS/receiving thread (L341).
+like($ges_c, qr/GES_REJECT_REASON_ILLEGAL_CONVERT/,
+	'L4: CONVERT handler fail-closes an illegal convert with ILLEGAL_CONVERT (53R74)');
 
 my $la_c = slurp_src('src/backend/cluster/cluster_lock_acquire.c');
 like($la_c,
-	qr/case GES_REJECT_REASON_FEATURE_NOT_SUPPORTED:.*?CLUSTER_LOCK_ACQUIRE_FAIL_FEATURE_NOT_SUPPORTED/s,
-	'L4: requester maps the reason to the FEATURE_NOT_SUPPORTED result');
+	qr/case GES_REJECT_REASON_ILLEGAL_CONVERT:.*?CLUSTER_LOCK_ACQUIRE_FAIL_ILLEGAL_CONVERT/s,
+	'L4: requester maps ILLEGAL_CONVERT to the FAIL_ILLEGAL_CONVERT result');
 
 my $lock_c = slurp_src('src/backend/storage/lmgr/lock.c');
 like($lock_c,
-	qr/CLUSTER_LOCK_ACQUIRE_FAIL_FEATURE_NOT_SUPPORTED:.*?ERRCODE_FEATURE_NOT_SUPPORTED/s,
-	'L4: the FEATURE_NOT_SUPPORTED result raises ERRCODE_FEATURE_NOT_SUPPORTED (0A000)');
+	qr/CLUSTER_LOCK_ACQUIRE_FAIL_ILLEGAL_CONVERT:.*?ERRCODE_CLUSTER_GES_ILLEGAL_LOCK_CONVERSION/s,
+	'L4: the FAIL_ILLEGAL_CONVERT result raises 53R74');
 
-diag('spec-5.1b: cross-node convert GRANT e2e is forward-5.2 (no live backend '
-	  . 'trigger in 5.1b); convert state-machine LOGIC is unit-covered by '
-	  . 'test_cluster_grd U1-U11.');
+diag('spec-5.3: cross-node convert is now LIVE; the GRANT/conflict/53R74 e2e '
+	  . 'is t/283_tm_table_lock_convert.pl; GRD-level convert logic is unit-'
+	  . 'covered by test_cluster_grd (U1-U12 + spec-5.3 U14/U15/U17/U18/U22).');
 
 
 $node->stop;

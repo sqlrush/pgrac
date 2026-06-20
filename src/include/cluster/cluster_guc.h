@@ -261,6 +261,16 @@ extern int cluster_grd_max_entries;
 extern int cluster_ges_request_timeout_ms;
 extern int cluster_ges_effective_timeout_ms(int lock_timeout_ms);
 
+/* spec-5.3 D10 — TM cross-node convert tunables.
+ *   cluster.ges_convert_timeout_ms:  finite convert wait (1000..600000; 30000).
+ *   cluster.tm_convert_mode:  Oracle DLM convert (default) vs PG additive. */
+typedef enum ClusterTmConvertMode {
+	CLUSTER_TM_CONVERT_MODE_CONVERT = 0,
+	CLUSTER_TM_CONVERT_MODE_ADDITIVE = 1
+} ClusterTmConvertMode;
+extern int cluster_ges_convert_timeout_ms;
+extern int cluster_tm_convert_mode;
+
 /* spec-2.23 D11 NEW: coordinator REPORT collect timeout + reply wait cap. */
 extern int cluster_lmd_probe_collect_timeout_ms;
 extern int cluster_ges_reply_wait_max_entries;

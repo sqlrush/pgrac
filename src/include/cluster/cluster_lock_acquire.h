@@ -109,7 +109,11 @@ typedef enum ClusterLockAcquireResult {
 	 * ERRCODE_FEATURE_NOT_SUPPORTED (0A000).  The real backend convert
 	 * trigger lands in spec-5.2; this surface is the requester side of the
 	 * GES_REJECT_REASON_FEATURE_NOT_SUPPORTED reply. */
-	CLUSTER_LOCK_ACQUIRE_FAIL_FEATURE_NOT_SUPPORTED = 20
+	CLUSTER_LOCK_ACQUIRE_FAIL_FEATURE_NOT_SUPPORTED = 20,
+	/* spec-5.3 D4 — convert from→to is not a valid partial-order upgrade
+	 * (LATERAL / no matching holder); caller maps to
+	 * ERRCODE_CLUSTER_GES_ILLEGAL_LOCK_CONVERSION (53R74). */
+	CLUSTER_LOCK_ACQUIRE_FAIL_ILLEGAL_CONVERT = 21
 } ClusterLockAcquireResult;
 
 
@@ -123,6 +127,21 @@ typedef enum ClusterLockAcquireResult {
  *	HC4 exact predicate:caller 必走 cluster_lms_is_ready() helper +
  *	cluster_lmd_is_ready() helper;禁止 `state >= READY` 数值比较。
  */
+/*
+ * spec-5.3 D1 — REQUEST vs CONVERT operation for the cluster acquire path.
+ *
+ *	A same-backend upgrade of an already-held cluster-registered lock
+ *	(e.g. LOCK TABLE t IN SHARE MODE then ALTER TABLE t, which wants
+ *	AccessExclusive) is an Oracle DLM-style lock conversion rather than a
+ *	second additive grant.  cluster_lock_decide_op() picks CONVERT when a
+ *	strictly-weaker cluster_registered LOCALLOCK already exists for the same
+ *	locktag (and cluster.tm_convert_mode = 'convert'); otherwise REQUEST.
+ */
+typedef enum ClusterLockOp {
+	CLUSTER_LOCK_OP_REQUEST = 1,
+	CLUSTER_LOCK_OP_CONVERT = 2
+} ClusterLockOp;
+
 typedef struct ClusterLockAcquireRequest {
 	/* 16B canonical wire-encoded ResId (spec-2.14 ship). */
 	ClusterResId resid;
@@ -130,6 +149,11 @@ typedef struct ClusterLockAcquireRequest {
 	LOCKTAG locktag;
 	/* requested PG lock mode */
 	LOCKMODE lockmode;
+	/* spec-5.3 D1: REQUEST (default) or CONVERT (same-backend upgrade). */
+	ClusterLockOp op;
+	/* spec-5.3 D1: for CONVERT, the strongest already-held cluster-registered
+	 * mode on this locktag — the REDECLARE locator key sent to the master. */
+	LOCKMODE current_mode;
 	/* DEFAULT_LOCKMETHOD / SHORT_LOCKMETHOD / cluster-aware class */
 	int lockmethod_id;
 	/* true → S4 immediate ConditionalLock semantic (no wait) */
@@ -178,6 +202,25 @@ typedef struct ClusterLockReleaseRequest {
  */
 extern ClusterLockAcquireResult
 cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *req);
+
+
+/*
+ * spec-5.3 D1 — decide REQUEST vs CONVERT for the cluster acquire path.
+ *
+ *	REQUESTER-LOCAL detection: scans this backend's own LockMethodLocalHash
+ *	for a cluster_registered LOCALLOCK on the SAME locktag whose mode is
+ *	strictly weaker than req->lockmode.  This is topology-agnostic (works for
+ *	local- AND remote-master) — the requester cannot read a remote master's
+ *	GRD holders[].  Returns CLUSTER_LOCK_OP_CONVERT iff such a weaker hold
+ *	exists AND cluster.tm_convert_mode = 'convert'; *current_mode_out is the
+ *	strongest already-held cluster-registered mode (the locator key), and
+ *	*weaker_locallock_out is that LOCALLOCK (so the caller can de-register it
+ *	on a successful convert — §3.1a release-ownership).  Otherwise returns
+ *	CLUSTER_LOCK_OP_REQUEST.
+ */
+extern ClusterLockOp cluster_lock_decide_op(const ClusterLockAcquireRequest *req,
+											LOCKMODE *current_mode_out,
+											LOCALLOCK **weaker_locallock_out);
 
 
 /*

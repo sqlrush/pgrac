@@ -454,6 +454,17 @@ typedef struct LOCALLOCK
 	bool		cluster_registered;	/* PGRAC: true iff S5 promote success */
 	uint64		cluster_request_id;	/* PGRAC: from req.request_id */
 	uint8		cluster_holder_raw[24];	/* PGRAC: ClusterGrdHolderId byte-image */
+	/*
+	 * PGRAC: spec-5.3 §3.1a convert release-ownership markers.  Set on the
+	 * NEW (stronger-mode) LOCALLOCK when it became the cluster owner via a
+	 * convert;  remember the pre-convert weaker mode + request id so a later
+	 * backout (subxact abort releasing this lock while the weaker hold
+	 * survives) can send a CONVERT_ROLLBACK (restore, not delete) and
+	 * re-register the weaker lock.  cluster_convert_old_request_id != 0
+	 * identifies a converted hold.  In-memory only.
+	 */
+	uint64		cluster_convert_old_request_id;	/* PGRAC: R_old (0 = not a convert) */
+	int			cluster_convert_old_mode;		/* PGRAC: pre-convert LOCKMODE */
 #endif
 } LOCALLOCK;
 

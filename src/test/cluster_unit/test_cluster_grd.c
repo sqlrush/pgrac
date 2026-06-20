@@ -1875,6 +1875,211 @@ UT_TEST(test_convert_u11_struct_layout)
 
 
 /* ============================================================
+ * spec-5.3 — TM table-lock convert live consumer (GRD-level).
+ *
+ *	cluster_lock_decide_op (U13) needs LockMethodLocalHash + the cluster GUC
+ *	and is covered by the 2-node cluster_tap e2e;  the wire-ABI 64B layout is
+ *	compile-enforced by the StaticAssertDecl in cluster_ges.h.  These unit
+ *	tests cover the NEW 5.3 GRD-level behaviour: request_id rebind, the
+ *	locator-precision guard, release-and-drain ownership, the rollback helper,
+ *	and the master-side convert wrappers.
+ * ============================================================ */
+
+/* helper: resid matching convert_make_entry(field1). */
+static void
+convert_resid(int field1, ClusterResId *resid)
+{
+	LOCKTAG src;
+
+	memset(&src, 0, sizeof(src));
+	src.locktag_field1 = (uint32)field1;
+	src.locktag_type = LOCKTAG_RELATION;
+	src.locktag_lockmethodid = 1;
+	cluster_grd_resid_encode(&src, resid);
+}
+
+/* U14 — UPGRADE compatible (no other holder): mode upgraded AND the holder's
+ * request_id rebound to convert_request_id (§3.1a);  holder count unchanged.
+ * Rebind is verified by release_holder: the NEW id matches, the OLD does not. */
+UT_TEST(test_convert_5_3_u14_request_convert_rebinds_request_id)
+{
+	ClusterGrdEntry *e;
+	ClusterGrdConvert req;
+	ClusterGrdHolderId h;
+	bool drain = false;
+	LOCKMODE m = NoLock;
+
+	convert_reset();
+	e = convert_make_entry(5301);
+	convert_grant(e, 1, 100, /* R_old */ 11, ShareLock);
+
+	req = convert_req(1, 100, ShareLock, AccessExclusiveLock, /* R_new */ 77);
+	UT_ASSERT_EQ((int)cluster_grd_entry_request_convert(e, &req, &drain),
+				 (int)CLUSTER_GRD_CONVERT_GRANTED_INPLACE);
+	UT_ASSERT_EQ(cluster_grd_entry_ngranted(e), 1); /* count unchanged */
+	UT_ASSERT(cluster_grd_entry_holder_mode(e, 1, 100, &m));
+	UT_ASSERT_EQ((int)m, (int)AccessExclusiveLock); /* mode upgraded */
+
+	/* request_id rebound to R_new=77:  release by R_new matches, R_old fails. */
+	memset(&h, 0, sizeof(h));
+	h.node_id = 1;
+	h.procno = 100;
+	h.cluster_epoch = 0;
+	h.request_id = 11; /* R_old */
+	UT_ASSERT_EQ((int)cluster_grd_entry_release_holder(e, &h), (int)CLUSTER_GRD_ENTRY_NOT_FOUND);
+	h.request_id = 77; /* R_new */
+	UT_ASSERT_EQ((int)cluster_grd_entry_release_holder(e, &h), (int)CLUSTER_GRD_ENTRY_OK);
+	convert_teardown();
+}
+
+/* U17 — locator precision: a convert whose current_mode does not match any
+ * holder slot is ILLEGAL (fail-closed) and never mutates a different-mode slot
+ * of the same (node,procno). */
+UT_TEST(test_convert_5_3_u17_locator_current_mode_precision)
+{
+	ClusterGrdEntry *e;
+	ClusterGrdConvert req;
+	bool drain = false;
+	LOCKMODE m = NoLock;
+
+	convert_reset();
+	e = convert_make_entry(5302);
+	convert_grant(e, 1, 100, 11, ShareLock);
+
+	/* claim current_mode=ShareUpdateExclusiveLock — no such slot for (1,100). */
+	req = convert_req(1, 100, ShareUpdateExclusiveLock, AccessExclusiveLock, 77);
+	UT_ASSERT_EQ((int)cluster_grd_entry_request_convert(e, &req, &drain),
+				 (int)CLUSTER_GRD_CONVERT_ILLEGAL);
+	/* the real ShareLock slot is untouched. */
+	UT_ASSERT(cluster_grd_entry_holder_mode(e, 1, 100, &m));
+	UT_ASSERT_EQ((int)m, (int)ShareLock);
+	convert_teardown();
+}
+
+/* U15 (drain ownership) — a convert enqueued behind a conflicting cluster
+ * holder is granted (in place, rebound to R_new) by release_and_drain when the
+ * conflicting holder releases;  the returned identity is tagged CONVERT. */
+UT_TEST(test_convert_5_3_u15_release_and_drain_grants_convert)
+{
+	ClusterGrdEntry *e;
+	ClusterGrdConvert req;
+	ClusterGrdHolderId rel;
+	ClusterGrdGrantIdentity granted[PGRAC_GRD_MAX_CONVERTS_PUBLIC + 1];
+	ClusterResId resid;
+	bool drain = false;
+	int n;
+	LOCKMODE m = NoLock;
+
+	convert_reset();
+	convert_resid(5303, &resid);
+	e = convert_make_entry(5303);
+	convert_grant(e, 1, 100, 11, ShareLock); /* converting holder */
+	convert_grant(e, 2, 200, 22, ShareLock); /* conflicting peer holder */
+
+	/* node1 upgrades Share->AccessExclusive: conflicts with node2 -> enqueue. */
+	req = convert_req(1, 100, ShareLock, AccessExclusiveLock, 77);
+	UT_ASSERT_EQ((int)cluster_grd_entry_request_convert(e, &req, &drain),
+				 (int)CLUSTER_GRD_CONVERT_ENQUEUED);
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 1);
+
+	/* node2 releases -> drain grants the convert in place + rebinds. */
+	memset(&rel, 0, sizeof(rel));
+	rel.node_id = 2;
+	rel.procno = 200;
+	rel.cluster_epoch = 0;
+	rel.request_id = 22;
+	n = cluster_grd_release_and_drain(&resid, &rel, granted, lengthof(granted));
+	UT_ASSERT_EQ(n, 1);
+	UT_ASSERT_EQ((int)granted[0].request_opcode, (int)UT_GES_OPCODE_CONVERT);
+	UT_ASSERT_EQ((int)granted[0].holder.request_id, 77); /* R_new */
+	UT_ASSERT_EQ((int)granted[0].mode, (int)AccessExclusiveLock);
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 0);
+	UT_ASSERT(cluster_grd_entry_holder_mode(e, 1, 100, &m));
+	UT_ASSERT_EQ((int)m, (int)AccessExclusiveLock);
+	convert_teardown();
+}
+
+/* U22 — rollback helper restores BOTH the mode and the request_id of an
+ * upgraded slot (the strict inverse of a convert — NOT a delete). */
+UT_TEST(test_convert_5_3_u22_rollback_restores_mode_and_id)
+{
+	ClusterGrdEntry *e;
+	ClusterGrdConvert req;
+	ClusterGrdHolderId h;
+	bool drain = false;
+	LOCKMODE m = NoLock;
+
+	convert_reset();
+	e = convert_make_entry(5304);
+	convert_grant(e, 1, 100, /* R_old */ 11, ShareLock);
+
+	/* upgrade Share(R_old=11) -> AccessExclusive(R_new=77). */
+	req = convert_req(1, 100, ShareLock, AccessExclusiveLock, 77);
+	UT_ASSERT_EQ((int)cluster_grd_entry_request_convert(e, &req, &drain),
+				 (int)CLUSTER_GRD_CONVERT_GRANTED_INPLACE);
+
+	/* rollback: restore (AccessExclusive,R_new) slot to (Share,R_old). */
+	UT_ASSERT_EQ((int)cluster_grd_entry_rollback_convert(e, 1, 100, AccessExclusiveLock, ShareLock,
+														 11),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT(cluster_grd_entry_holder_mode(e, 1, 100, &m));
+	UT_ASSERT_EQ((int)m, (int)ShareLock); /* mode restored */
+
+	/* request_id restored to R_old=11. */
+	memset(&h, 0, sizeof(h));
+	h.node_id = 1;
+	h.procno = 100;
+	h.cluster_epoch = 0;
+	h.request_id = 77; /* R_new no longer matches */
+	UT_ASSERT_EQ((int)cluster_grd_entry_release_holder(e, &h), (int)CLUSTER_GRD_ENTRY_NOT_FOUND);
+	h.request_id = 11; /* R_old restored */
+	UT_ASSERT_EQ((int)cluster_grd_entry_release_holder(e, &h), (int)CLUSTER_GRD_ENTRY_OK);
+
+	/* rollback of a non-existent upgraded slot is a fail-closed no-op. */
+	UT_ASSERT_EQ((int)cluster_grd_entry_rollback_convert(e, 1, 100, AccessExclusiveLock, ShareLock,
+														 11),
+				 (int)CLUSTER_GRD_ENTRY_NOT_FOUND);
+	convert_teardown();
+}
+
+/* U18 — master-side convert wrappers: convert_or_enqueue grants a lone holder
+ * (mode + rebind) and convert_grant_by_backend commits a convert located by
+ * (node,procno) alone (native-probe clear path). */
+UT_TEST(test_convert_5_3_u18_master_wrappers)
+{
+	ClusterResId resid;
+	ClusterGrdEntry *e;
+	LOCKMODE m = NoLock;
+
+	/* convert_or_enqueue: single holder -> GRANTED_INPLACE + rebind. */
+	convert_reset();
+	convert_resid(5305, &resid);
+	e = convert_make_entry(5305);
+	convert_grant(e, 1, 100, 11, ShareLock);
+	UT_ASSERT_EQ((int)cluster_grd_convert_or_enqueue(&resid, 1, 100, 0, ShareLock,
+													 AccessExclusiveLock, 77, 1, 0, NULL, NULL),
+				 (int)CLUSTER_GRD_CONVERT_GRANTED_INPLACE);
+	UT_ASSERT(cluster_grd_entry_holder_mode(e, 1, 100, &m));
+	UT_ASSERT_EQ((int)m, (int)AccessExclusiveLock);
+	convert_teardown();
+
+	/* convert_grant_by_backend: derives current_mode from the (node,procno)
+	 * holder and upgrades it. */
+	convert_reset();
+	convert_resid(5306, &resid);
+	e = convert_make_entry(5306);
+	convert_grant(e, 1, 100, 11, ShareLock);
+	UT_ASSERT_EQ((int)cluster_grd_convert_grant_by_backend(&resid, 1, 100, 0, AccessExclusiveLock,
+														   77, 1, 0),
+				 (int)CLUSTER_GRD_CONVERT_GRANTED_INPLACE);
+	m = NoLock;
+	UT_ASSERT(cluster_grd_entry_holder_mode(e, 1, 100, &m));
+	UT_ASSERT_EQ((int)m, (int)AccessExclusiveLock);
+	convert_teardown();
+}
+
+
+/* ============================================================
  * spec-5.1c — BAST rewrite + self-conflict exclusion.
  * ============================================================ */
 
@@ -2172,6 +2377,13 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_convert_u10_double_grant_guard);
 	UT_RUN(test_convert_u11_struct_layout);
 	UT_RUN(test_convert_u12_sweep_on_holder_death);
+
+	/* spec-5.3 — TM convert live consumer (GRD-level). */
+	UT_RUN(test_convert_5_3_u14_request_convert_rebinds_request_id);
+	UT_RUN(test_convert_5_3_u17_locator_current_mode_precision);
+	UT_RUN(test_convert_5_3_u15_release_and_drain_grants_convert);
+	UT_RUN(test_convert_5_3_u22_rollback_restores_mode_and_id);
+	UT_RUN(test_convert_5_3_u18_master_wrappers);
 
 	/* spec-5.1c — BAST rewrite + LIVE self-conflict exclusion. */
 	UT_RUN(test_5_1c_u9a_self_conflict_excluded);

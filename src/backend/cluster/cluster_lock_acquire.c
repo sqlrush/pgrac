@@ -326,9 +326,11 @@ cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req
 		 * a narrow race window) — same 53R9I retry surface. */
 		return CLUSTER_LOCK_ACQUIRE_FAIL_SHARD_REMASTERING;
 	case GES_REJECT_REASON_FEATURE_NOT_SUPPORTED:
-		/* spec-5.1b D3 — master rejected an unsupported request (cross-node
-		 * convert; the real trigger + convert wire land in spec-5.2).  Not
-		 * retryable — surfaces as ERRCODE_FEATURE_NOT_SUPPORTED (0A000). */
+		/* spec-5.3 — the cross-node CONVERT path is now live (TM table-lock
+		 * upgrade), so FEATURE_NOT_SUPPORTED no longer covers it;  it remains
+		 * for genuinely unsupported sub-cases (e.g. cross-node down-convert,
+		 * deferred to the CF/PCM block layer).  Not retryable — surfaces as
+		 * ERRCODE_FEATURE_NOT_SUPPORTED (0A000). */
 		return CLUSTER_LOCK_ACQUIRE_FAIL_FEATURE_NOT_SUPPORTED;
 	case GES_REJECT_REASON_LOCK_CONFLICT:
 	case GES_REJECT_REASON_NONE:
@@ -354,6 +356,41 @@ cluster_lock_acquire_s5_promote_holder(const ClusterLockAcquireRequest *req)
 }
 
 /*
+ * spec-5.3 §3.1a — S5 convert (T2):  send opcode-2 CONVERT post-PG-native and
+ *	map the GRANT/REJECT.  No reservation to promote (the holder already
+ *	exists — it is mutated, not added).  On REJECT/timeout the master never
+ *	mutated, so no rollback is needed here;  the caller (lock.c) sends a
+ *	best-effort CONVERT_ROLLBACK to close the timeout-race window and keeps the
+ *	old weaker hold registered.
+ */
+static ClusterLockAcquireResult
+cluster_lock_acquire_s5_convert(const ClusterLockAcquireRequest *req)
+{
+	uint32 reject;
+
+	reject = cluster_ges_send_convert_and_wait(&req->resid, (uint32)req->lockmode,
+											   (uint32)req->current_mode, &req->holder,
+											   req->request_id, /* timeout = GUC default */ 0);
+	if (reject == GES_REJECT_REASON_NONE) {
+		pg_atomic_fetch_add_u64(&stub_s5_promote_count, 1);
+		return CLUSTER_LOCK_ACQUIRE_OK_CONVERTED;
+	}
+
+	switch ((GesRejectReason)reject) {
+	case GES_REJECT_REASON_ILLEGAL_CONVERT:
+		return CLUSTER_LOCK_ACQUIRE_FAIL_ILLEGAL_CONVERT;
+	case GES_REJECT_REASON_SHARD_FROZEN:
+		return CLUSTER_LOCK_ACQUIRE_FAIL_SHARD_REMASTERING;
+	case GES_REJECT_REASON_EPOCH_MISMATCH:
+		return CLUSTER_LOCK_ACQUIRE_FAIL_STALE_GENERATION;
+	case GES_REJECT_REASON_TIMEOUT:
+	case GES_REJECT_REASON_WORK_QUEUE_FULL:
+	default:
+		return CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+	}
+}
+
+/*
  * spec-2.21 D4 P2.3 — S5 promote with revalidate;失败 5-step backout.
  */
 ClusterLockAcquireResult
@@ -366,6 +403,11 @@ cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *req)
 
 	if (req == NULL)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+
+	/* spec-5.3 §3.1a — convert path mutates an existing holder (no
+	 * reservation to promote);  send the CONVERT wire at S5 (T2). */
+	if (req->op == CLUSTER_LOCK_OP_CONVERT)
+		return cluster_lock_acquire_s5_convert(req);
 
 	er = cluster_grd_revalidate_and_promote(&req->resid, &req->holder, self_node,
 											req->master_gen_snapshot);
@@ -552,6 +594,21 @@ cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *req)
 	}
 
 	/*
+	 * spec-5.3 §3.1a — CONVERT (same-backend upgrade) defers to PG-native
+	 * first (T1):  the holder already exists, so there is NO S3 reservation
+	 * (a reservation would add a second holder, not mutate the existing one).
+	 * Mint the convert reply key (R_new) + holder identity here, then return
+	 * NEED_PG_NATIVE_LOCK so lock.c runs the local PG-native LockAcquire and
+	 * then S5 (which sends the opcode-2 CONVERT — T2).
+	 */
+	if (req->op == CLUSTER_LOCK_OP_CONVERT) {
+		ClusterLockAcquireRequest *mut = (ClusterLockAcquireRequest *)req;
+
+		fill_request_holder(mut);
+		return CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK;
+	}
+
+	/*
 	 * S3 partition + reservation.  Returns:
 	 *   - NEED_PG_NATIVE_LOCK with local-fast-path: short-circuit success,
 	 *     caller does PG-native + S5 promote.
@@ -683,6 +740,71 @@ cluster_relation_is_persistent_or_unlogged(Oid relid)
 
 	ReleaseSysCache(tuple);
 	return eligible;
+}
+
+
+/*
+ * cluster_lock_decide_op — spec-5.3 D1: REQUEST vs CONVERT (requester-local).
+ *
+ *	Scans this backend's own LockMethodLocalHash for a cluster_registered
+ *	LOCALLOCK on the SAME locktag whose mode is strictly weaker than the
+ *	requested mode.  Detection is requester-local (NOT a GRD read): the GRD
+ *	entry lives at the resource's master, which may be remote, and the
+ *	requester only sends to it — it cannot inspect a remote holders[].  The
+ *	backend's own held-lock state is authoritative for "do I already hold a
+ *	weaker mode on this resource".  Returns CONVERT iff such a hold exists and
+ *	cluster.tm_convert_mode = 'convert';  *current_mode_out = the STRONGEST
+ *	already-held weaker cluster-registered mode (the REDECLARE locator key) and
+ *	*weaker_locallock_out = that LOCALLOCK (so the caller can de-register it on
+ *	a successful convert — §3.1a).
+ */
+ClusterLockOp
+cluster_lock_decide_op(const ClusterLockAcquireRequest *req, LOCKMODE *current_mode_out,
+					   LOCALLOCK **weaker_locallock_out)
+{
+	HTAB *locallocks;
+	HASH_SEQ_STATUS status;
+	LOCALLOCK *locallock;
+	LOCALLOCK *best = NULL;
+	LOCKMODE best_mode = NoLock;
+
+	if (current_mode_out != NULL)
+		*current_mode_out = NoLock;
+	if (weaker_locallock_out != NULL)
+		*weaker_locallock_out = NULL;
+
+	if (req == NULL)
+		return CLUSTER_LOCK_OP_REQUEST;
+	/* spec-5.3 Q1=B escape hatch — additive keeps the current REQUEST model. */
+	if (cluster_tm_convert_mode != CLUSTER_TM_CONVERT_MODE_CONVERT)
+		return CLUSTER_LOCK_OP_REQUEST;
+
+	locallocks = GetLockMethodLocalHash();
+	if (locallocks == NULL)
+		return CLUSTER_LOCK_OP_REQUEST;
+
+	hash_seq_init(&status, locallocks);
+	while ((locallock = (LOCALLOCK *)hash_seq_search(&status)) != NULL) {
+		if (!locallock->cluster_registered || locallock->nLocks == 0)
+			continue;
+		if (locallock->tag.mode >= req->lockmode)
+			continue; /* not strictly weaker (== would short-circuit upstream) */
+		if (memcmp(&locallock->tag.lock, &req->locktag, sizeof(LOCKTAG)) != 0)
+			continue; /* different resource */
+		if (best == NULL || locallock->tag.mode > best_mode) {
+			best = locallock;
+			best_mode = locallock->tag.mode;
+		}
+	}
+
+	if (best == NULL)
+		return CLUSTER_LOCK_OP_REQUEST;
+
+	if (current_mode_out != NULL)
+		*current_mode_out = best_mode;
+	if (weaker_locallock_out != NULL)
+		*weaker_locallock_out = best;
+	return CLUSTER_LOCK_OP_CONVERT;
 }
 
 

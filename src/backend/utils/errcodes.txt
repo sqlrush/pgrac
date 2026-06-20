@@ -518,6 +518,14 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 53R72    E    ERRCODE_CLUSTER_GES_DEADLOCK                                   cluster_ges_deadlock
 53R73    E    ERRCODE_CLUSTER_GES_CANCEL_PENDING                             cluster_ges_cancel_pending
 
+# spec-5.3 D4:  illegal GES lock conversion.  53R74 fires when the
+# opcode-2 CONVERT state machine (TM table-lock S->X upgrade, the first
+# live convert consumer) is asked for a non-partial-order conversion
+# (LATERAL / incomparable modes) or against a (node,procno,current_mode)
+# holder the master has no record of.  The master replies REJECT with
+# GES_REJECT_REASON_ILLEGAL_CONVERT and the requester maps it here.
+53R74    E    ERRCODE_CLUSTER_GES_ILLEGAL_LOCK_CONVERSION                    cluster_ges_illegal_lock_conversion
+
 # spec-2.20 D12 (v0.3 frozen):  LMS unavailable fail-closed (mirror 53R81).
 # Raised by spec-2.20 7-step caller-side gate when cluster.lms_enabled=on
 # but cluster_lms_is_ready() returns false (LMS state != READY).

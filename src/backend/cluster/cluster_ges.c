@@ -123,18 +123,6 @@ ges_record_dedup_reply_for_request(uint32 source_node_id, const GesRequestPayloa
 						   reply);
 }
 
-static void
-ges_record_dedup_reply_for_waiter(const ClusterGrdWaiterIdentity *waiter,
-								  const GesReplyPayload *reply)
-{
-	if (waiter == NULL)
-		return;
-	ges_record_dedup_reply((uint32)waiter->source_node_id, waiter->request_opcode,
-						   waiter->request_id, waiter->holder.cluster_epoch,
-						   waiter->shard_master_generation, reply);
-}
-
-
 /* ============================================================
  * Shmem region lifecycle (mirror cluster_scn pattern).
  * ============================================================ */
@@ -411,12 +399,15 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 	 * remote sender and must match env->source_node_id. */
 	payload_node_must_be_source
 		= (req->opcode != GES_REQ_OPCODE_BAST && req->opcode != GES_REQ_OPCODE_CANCEL_PENDING);
-	/* spec-4.6 D3:  opcode_max extended to REDECLARE_DONE (13).  Opcodes
-	 * 8-11 passing the coarse range check still fail closed in the
-	 * explicit switch below (dedicated-payload opcodes never reach this
-	 * handler legitimately — early dispatch above). */
+	/* spec-5.3 D6:  opcode_max extended to CONVERT_ROLLBACK (14) so the
+	 * post-commit convert backout request passes the coarse range check
+	 * (source = requester / target = this master, like CONVERT / RELEASE).
+	 * spec-4.6 D3 had extended it to REDECLARE_DONE (13).  Opcodes 8-11
+	 * passing the coarse range check still fail closed in the explicit
+	 * switch below (dedicated-payload opcodes never reach this handler
+	 * legitimately — early dispatch above). */
 	if (!ges_validate_inbound(env, req->holder_node_id, holder_epoch, req->opcode,
-							  GES_REQ_OPCODE_REQUEST, GES_REQ_OPCODE_REDECLARE_DONE,
+							  GES_REQ_OPCODE_REQUEST, GES_REQ_OPCODE_CONVERT_ROLLBACK,
 							  payload_node_must_be_source)) {
 		cluster_grd_inc_ges_inbound_validation_fail();
 		return;
@@ -491,7 +482,8 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 	case GES_REQ_OPCODE_REQUEST:
 	case GES_REQ_OPCODE_CONVERT:
 	case GES_REQ_OPCODE_RELEASE:
-	case GES_REQ_OPCODE_REDECLARE: /* spec-4.6 D3 — same work_queue path */
+	case GES_REQ_OPCODE_REDECLARE:		   /* spec-4.6 D3 — same work_queue path */
+	case GES_REQ_OPCODE_CONVERT_ROLLBACK: /* spec-5.3 D6 — same work_queue path */
 		break;
 	case GES_REQ_OPCODE_DEADLOCK_PROBE:
 	case GES_REQ_OPCODE_DEADLOCK_REPORT:
@@ -528,7 +520,8 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 	 *	REJECT_BUSY fail-closed.  MISS_REGISTERED -> proceed to enqueue.
 	 */
 	if (req->opcode == GES_REQ_OPCODE_REQUEST || req->opcode == GES_REQ_OPCODE_CONVERT
-		|| req->opcode == GES_REQ_OPCODE_RELEASE || req->opcode == GES_REQ_OPCODE_REDECLARE) {
+		|| req->opcode == GES_REQ_OPCODE_RELEASE || req->opcode == GES_REQ_OPCODE_REDECLARE
+		|| req->opcode == GES_REQ_OPCODE_CONVERT_ROLLBACK) {
 		ClusterGesDedupKey dkey;
 		uint8 dreply_buf[sizeof(GesReplyPayload)];
 		uint16 dreply_len = 0;
@@ -725,6 +718,84 @@ ges_send_grant_reply(int32 dest_node_id, const ClusterGrdHolderId *holder,
 	cluster_grd_outbound_enqueue_lmon_reply((uint32)dest_node_id, &reply, sizeof(reply));
 }
 
+/*
+ * spec-5.3 — wake a LOCAL waiter's reply-wait entry directly (no wire) when
+ * the master and the requesting backend share this node.  Mirrors the wake the
+ * reply handler performs for cross-node replies.  The convert path (and a
+ * local-master convert that was enqueued then drained) routes through here.
+ */
+static void
+ges_local_wake_reply(int32 source_node_id, uint64 request_id, uint64 cluster_epoch,
+					 uint32 request_opcode, uint32 reply_opcode, uint32 reject_reason)
+{
+	GesReplyWaitKey key;
+	GesReplyWaitEntry *entry;
+
+	memset(&key, 0, sizeof(key));
+	key.request_id = request_id;
+	key.source_node_id = source_node_id; /* the requesting backend's node (this node) */
+	key.dest_node_id = cluster_node_id;	 /* local master */
+	key.request_opcode = request_opcode;
+	key.cluster_epoch = cluster_epoch;
+
+	entry = cluster_ges_reply_wait_lookup(&key);
+	if (entry != NULL)
+		cluster_ges_reply_wait_wake(entry, reply_opcode, reject_reason);
+	/* else: no local waiter (already timed out / never inserted) — drop. */
+}
+
+/*
+ * spec-5.3 — route a GRANT for a drained identity (REQUEST waiter or CONVERT):
+ * a local source wakes its own reply-wait entry; a remote source gets a wire
+ * GES_REPLY GRANT + a recorded dedup reply (so a retransmit hits CACHED_REPLY).
+ */
+static void
+ges_dispatch_grant_identity(const ClusterGrdGrantIdentity *g, const ClusterResId *resid)
+{
+	if (g->source_node_id == cluster_node_id) {
+		ges_local_wake_reply(g->source_node_id, g->holder.request_id, g->holder.cluster_epoch,
+							 g->request_opcode, GES_REPLY_OPCODE_GRANT, GES_REJECT_REASON_NONE);
+	} else {
+		GesReplyPayload reply;
+
+		ges_send_grant_reply(g->source_node_id, &g->holder, resid, g->request_opcode, &reply);
+		ges_record_dedup_reply((uint32)g->source_node_id, g->request_opcode, g->holder.request_id,
+							   g->holder.cluster_epoch, g->shard_master_generation, &reply);
+	}
+}
+
+/*
+ * spec-5.3 — route a REJECT for a convert (local source → wake its reply-wait
+ * entry with the reject reason; remote source → wire GES_REPLY REJECT + dedup).
+ */
+static void
+ges_dispatch_reject(int32 source_node_id, const ClusterGrdHolderId *holder,
+					const ClusterResId *resid, uint32 reply_for_opcode, uint32 reject_reason,
+					uint64 shard_master_generation)
+{
+	if (source_node_id == cluster_node_id) {
+		ges_local_wake_reply(source_node_id, holder->request_id, holder->cluster_epoch,
+							 reply_for_opcode, GES_REPLY_OPCODE_REJECT, reject_reason);
+	} else {
+		GesReplyPayload reject;
+
+		memset(&reject, 0, sizeof(reject));
+		reject.opcode = GES_REPLY_OPCODE_REJECT;
+		reject.reply_for_opcode = reply_for_opcode;
+		reject.reject_reason = reject_reason;
+		reject.holder_node_id = (uint32)holder->node_id;
+		reject.holder_procno = holder->procno;
+		reject.holder_cluster_epoch_lo = (uint32)(holder->cluster_epoch & 0xffffffffu);
+		reject.holder_cluster_epoch_hi = (uint32)(holder->cluster_epoch >> 32);
+		reject.holder_request_id_lo = (uint32)(holder->request_id & 0xffffffffu);
+		reject.holder_request_id_hi = (uint32)(holder->request_id >> 32);
+		memcpy(reject.resid, resid, sizeof(reject.resid));
+		ges_record_dedup_reply((uint32)source_node_id, reply_for_opcode, holder->request_id,
+							   holder->cluster_epoch, shard_master_generation, &reject);
+		cluster_grd_outbound_enqueue_lmon_reply((uint32)source_node_id, &reject, sizeof(reject));
+	}
+}
+
 int
 cluster_ges_lmon_drain_work_queue(void)
 {
@@ -873,46 +944,126 @@ cluster_ges_lmon_drain_work_queue(void)
 		}
 		case GES_REQ_OPCODE_CONVERT: {
 			/*
-			 * spec-5.1b D3 — cross-node lock conversion is not yet a
-			 * supported production path.  PG is an additive lock model with
-			 * no native convert; the real backend trigger + convert wire/
-			 * identity model are co-designed with the first real consumer
-			 * (spec-5.2 TX row-lock upgrade).  Until then an inbound
-			 * opcode-2 (e.g. from a future-version peer) is rejected
-			 * explicitly — NOT silently dropped (L341) — via the reply ring
-			 * with FEATURE_NOT_SUPPORTED.  Protocol rejection must never use
-			 * ereport on the LMS/receiving thread (it would break the
-			 * message loop, review-2 P1); the requesting backend maps the
-			 * reason to ERRCODE_FEATURE_NOT_SUPPORTED (0A000).
+			 * spec-5.3 D3 / §3.2 / §3.5 — LIVE cross-node lock conversion (TM
+			 * table-lock S->X upgrade, the first real convert consumer).
+			 * Locates the OLD holder by (node,procno,current_mode) and runs the
+			 * 5.1b partial-order decision.  A LATERAL / no-holder conversion is
+			 * fail-closed 53R74 (NOT FEATURE_NOT_SUPPORTED) — protocol rejection
+			 * never uses ereport on this thread (review-2 P1); the requester
+			 * maps the reason.
 			 */
-			GesReplyPayload reject;
+			LOCKMODE requested_mode = (LOCKMODE)req->lockmode;
+			LOCKMODE convert_old_mode = (LOCKMODE)req->current_mode;
+			uint64 generation = ges_request_shard_master_generation(req);
 
-			memset(&reject, 0, sizeof(reject));
-			reject.opcode = GES_REPLY_OPCODE_REJECT;
-			reject.reply_for_opcode = req->opcode;
-			reject.reject_reason = GES_REJECT_REASON_FEATURE_NOT_SUPPORTED;
-			reject.holder_node_id = req->holder_node_id;
-			reject.holder_procno = req->holder_procno;
-			reject.holder_cluster_epoch_lo = req->holder_cluster_epoch_lo;
-			reject.holder_cluster_epoch_hi = req->holder_cluster_epoch_hi;
-			reject.holder_request_id_lo = req->holder_request_id_lo;
-			reject.holder_request_id_hi = req->holder_request_id_hi;
-			memcpy(reject.resid, req->resid, sizeof(reject.resid));
-			ges_record_dedup_reply_for_request((uint32)item.source_node_id, req, &reject);
-			cluster_grd_outbound_enqueue_lmon_reply(item.source_node_id, &reject, sizeof(reject));
+			/* spec-4.6 master-side shard recovery gate (mirror REQUEST). */
+			if (cluster_grd_shard_phase(cluster_grd_shard_for_resource(&resid))
+				!= GRD_SHARD_NORMAL) {
+				ges_dispatch_reject((int32)item.source_node_id, &holder, &resid, req->opcode,
+									GES_REJECT_REASON_SHARD_FROZEN, generation);
+				break;
+			}
+
+			/*
+			 * spec-5.3 §3.2 8A-2 — when the upgrade target needs a native-lock
+			 * probe (remote <SUEX native holders may conflict with the >=SUEX
+			 * target), the master must NOT pre-mutate.  Schedule the probe and
+			 * let the LMS resolve path COMMIT the convert on CLEAR (via
+			 * cluster_grd_convert_grant_by_backend), leaving the old holder
+			 * untouched on TIMEOUT (fail-closed, no false-grant).  Only for
+			 * REMOTE sources — a local-master requester already ran the
+			 * synchronous probe in cluster_ges_send_convert_and_wait.
+			 */
+			if (item.source_node_id != (uint32)cluster_node_id
+				&& cluster_lms_native_probe_required(&resid, requested_mode)) {
+				if (!cluster_lms_native_probe_schedule_grant(&resid, requested_mode, &holder,
+															 (int32)item.source_node_id, req->opcode,
+															 generation))
+					ges_dispatch_reject((int32)item.source_node_id, &holder, &resid, req->opcode,
+										GES_REJECT_REASON_WORK_QUEUE_FULL, generation);
+				/* else: GRANT/REJECT sent later by the LMS resolve path. */
+				break;
+			}
+
+			{
+				ClusterGrdConflictHolder conflict_holders[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+				int n_conflict = 0;
+				ClusterGrdConvertResult cr;
+
+				cr = cluster_grd_convert_or_enqueue(
+					&resid, (int32)holder.node_id, holder.procno, holder.cluster_epoch,
+					convert_old_mode, requested_mode, holder.request_id, (int32)item.source_node_id,
+					generation, conflict_holders, &n_conflict);
+
+				switch (cr) {
+				case CLUSTER_GRD_CONVERT_GRANTED_INPLACE: {
+					ClusterGrdGrantIdentity g;
+
+					memset(&g, 0, sizeof(g));
+					g.holder = holder; /* holder.request_id == convert_request_id (R_new) */
+					g.source_node_id = (int32)item.source_node_id;
+					g.request_opcode = req->opcode;
+					g.shard_master_generation = generation;
+					g.mode = requested_mode;
+					ges_dispatch_grant_identity(&g, &resid);
+					break;
+				}
+				case CLUSTER_GRD_CONVERT_ENQUEUED:
+					/* spec-5.3 D9 — advisory BAST to the conflicting holders;
+					 * the requester waits (ClusterGesConvertWait) for the
+					 * release drain to grant the convert. */
+					if (n_conflict > 0)
+						cluster_ges_send_bast_targeted(&resid, (int)requested_mode, conflict_holders,
+													   n_conflict);
+					break;
+				case CLUSTER_GRD_CONVERT_ILLEGAL:
+					ges_dispatch_reject((int32)item.source_node_id, &holder, &resid, req->opcode,
+										GES_REJECT_REASON_ILLEGAL_CONVERT, generation);
+					break;
+				case CLUSTER_GRD_CONVERT_QUEUE_FULL:
+					ges_dispatch_reject((int32)item.source_node_id, &holder, &resid, req->opcode,
+										GES_REJECT_REASON_WORK_QUEUE_FULL, generation);
+					break;
+				case CLUSTER_GRD_CONVERT_NOT_READY:
+				default:
+					/* GRD not ready — silently retry on the next drain tick. */
+					break;
+				}
+			}
+			break;
+		}
+		case GES_REQ_OPCODE_CONVERT_ROLLBACK: {
+			/*
+			 * spec-5.3 §3.1a T4 — restore a slot upgraded by a convert back to
+			 * its pre-convert (old_mode, R_old).  lockmode locates the upgraded
+			 * slot; current_mode = old_mode; holder.request_id = R_old.  Strict
+			 * inverse of the convert (NOT a release).  Idempotent: a no-op at
+			 * the master if it never mutated (e.g. the convert was rejected /
+			 * native-probe never cleared) — the requester sends this on any
+			 * post-OK_CONVERTED backout to close the false-grant window.
+			 */
+			(void)cluster_grd_rollback_convert(&resid, (int32)holder.node_id, holder.procno,
+											   (LOCKMODE)req->lockmode, (LOCKMODE)req->current_mode,
+											   holder.request_id);
+			{
+				GesReplyPayload reply;
+
+				ges_send_grant_reply((int32)item.source_node_id, &holder, &resid, req->opcode,
+									 &reply);
+				ges_record_dedup_reply_for_request((uint32)item.source_node_id, req, &reply);
+			}
 			break;
 		}
 		case GES_REQ_OPCODE_RELEASE: {
 			/*
-				 * spec-2.23 D6 — release_and_pop_compatible_waiter wakes
-				 * the first FIFO-compatible waiter (if any) and returns
-				 * its identity so we can send a GES_REPLY GRANT back.
+				 * spec-5.3 D3 — release_and_drain removes the holder then drains
+				 * the convert queue (priority over waiters) AND one FIFO waiter,
+				 * returning each granted identity tagged REQUEST or CONVERT.
 				 */
-			ClusterGrdWaiterIdentity granted[1];
+			ClusterGrdGrantIdentity granted[PGRAC_GRD_MAX_CONVERTS_PUBLIC + 1];
 			int n_granted;
 
-			n_granted = cluster_grd_entry_release_and_pop_compatible_waiter(
-				&resid, &holder, granted, lengthof(granted));
+			n_granted = cluster_grd_release_and_drain(&resid, &holder, granted, lengthof(granted));
 
 			/* Reply GRANT to the original releaser (acks the RELEASE). */
 			{
@@ -922,12 +1073,10 @@ cluster_ges_lmon_drain_work_queue(void)
 				ges_record_dedup_reply_for_request((uint32)item.source_node_id, req, &reply);
 			}
 
-			for (int i = 0; i < n_granted; i++) {
-				GesReplyPayload reply;
-				ges_send_grant_reply(granted[i].source_node_id, &granted[i].holder, &resid,
-									 granted[i].request_opcode, &reply);
-				ges_record_dedup_reply_for_waiter(&granted[i], &reply);
-			}
+			/* Route each drained grant — local source wakes its reply-wait
+			 * entry, remote source gets a wire GES_REPLY GRANT (§3.1a). */
+			for (int i = 0; i < n_granted; i++)
+				ges_dispatch_grant_identity(&granted[i], &resid);
 			break;
 		}
 		case GES_REQ_OPCODE_REDECLARE: {
@@ -1450,6 +1599,163 @@ cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 		cluster_ges_inc_release_ack();
 
 	return reject_reason;
+}
+
+
+/*
+ * spec-5.3 D2/D3 — send opcode-2 CONVERT and wait for the GRANT/REJECT.
+ *
+ *	A local-master convert runs the native-lock probe synchronously here
+ *	(mirroring the REQUEST fast path) then enqueues into the in-process work
+ *	queue;  a remote-master convert rides the wire and the master schedules the
+ *	probe.  Either way the requester blocks on WAIT_EVENT_GES_CONVERT_WAIT until
+ *	the convert is granted (immediately, or later when a conflicting holder
+ *	releases) or rejected.  The holder carries request_id = convert_request_id
+ *	(R_new);  current_mode is the REDECLARE locator for the OLD slot.
+ */
+uint32
+cluster_ges_send_convert_and_wait(const struct ClusterResId *resid, uint32 requested_mode,
+								  uint32 current_mode, const struct ClusterGrdHolderId *holder,
+								  uint64 convert_request_id, int timeout_ms)
+{
+	int32 master;
+	GesReplyWaitKey key;
+	GesReplyWaitEntry *entry;
+	GesRequestPayload req;
+	TimestampTz deadline;
+	uint64 epoch;
+	uint64 master_gen;
+	int effective_timeout_ms;
+	uint32 reject_reason;
+	bool local_master;
+
+	if (resid == NULL || holder == NULL)
+		return GES_REJECT_REASON_TIMEOUT;
+
+	master = cluster_grd_lookup_master(resid);
+	local_master = (master < 0 || master == cluster_node_id);
+	epoch = cluster_epoch_get_current();
+	master_gen = cluster_lms_get_shard_master_generation();
+	effective_timeout_ms = timeout_ms > 0 ? timeout_ms : cluster_ges_convert_timeout_ms;
+	deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), effective_timeout_ms);
+
+	/*
+	 * spec-5.3 §3.2 8A-2 — local-master native-lock probe.  The requester IS
+	 * the master, so it probes peers synchronously before committing the
+	 * convert (the master-side async schedule path is only for remote
+	 * requesters).  A conflict / timeout fails closed — no convert is sent.
+	 */
+	if (local_master && cluster_lms_native_probe_required(resid, (LOCKMODE)requested_mode)) {
+		if (!cluster_lms_native_probe_wait_clear(resid, (LOCKMODE)requested_mode, holder,
+												 effective_timeout_ms))
+			return GES_REJECT_REASON_TIMEOUT;
+	}
+
+	memset(&key, 0, sizeof(key));
+	key.request_id = convert_request_id;
+	key.source_node_id = cluster_node_id;
+	key.dest_node_id = local_master ? cluster_node_id : master;
+	key.request_opcode = GES_REQ_OPCODE_CONVERT;
+	key.cluster_epoch = epoch;
+
+	entry = cluster_ges_reply_wait_insert(&key, deadline);
+	if (entry == NULL)
+		return GES_REJECT_REASON_TIMEOUT;
+
+	memset(&req, 0, sizeof(req));
+	req.opcode = GES_REQ_OPCODE_CONVERT;
+	req.lockmode = requested_mode;
+	req.holder_node_id = (uint32)holder->node_id;
+	req.holder_procno = (uint32)holder->procno;
+	req.holder_cluster_epoch_lo = (uint32)(holder->cluster_epoch & 0xffffffffu);
+	req.holder_cluster_epoch_hi = (uint32)(holder->cluster_epoch >> 32);
+	req.holder_request_id_lo = (uint32)(convert_request_id & 0xffffffffu);
+	req.holder_request_id_hi = (uint32)(convert_request_id >> 32);
+	memcpy(req.resid, resid, sizeof(req.resid));
+	req.shard_master_generation_lo = (uint32)(master_gen & 0xffffffffu);
+	req.shard_master_generation_hi = (uint32)(master_gen >> 32);
+	req.current_mode = (uint8)current_mode;
+
+	if (local_master) {
+		/* Self-source: bypass the wire (the inbound validator drops
+		 * self-sourced frames);  the LMON drain processes it as master. */
+		if (!cluster_grd_work_queue_enqueue(cluster_node_id, &req, sizeof(req))) {
+			cluster_ges_reply_wait_delete(&key);
+			return GES_REJECT_REASON_WORK_QUEUE_FULL;
+		}
+	} else {
+		if (!cluster_grd_outbound_enqueue_backend_request((uint32)master, &req, sizeof(req))) {
+			cluster_ges_reply_wait_delete(&key);
+			return GES_REJECT_REASON_WORK_QUEUE_FULL;
+		}
+	}
+
+	ConditionVariablePrepareToSleep(&entry->cv);
+	while (!entry->ready) {
+		TimestampTz now = GetCurrentTimestamp();
+		long remaining_ms;
+
+		if (now >= deadline) {
+			cluster_ges_reply_wait_delete(&key);
+			ConditionVariableCancelSleep();
+			return GES_REJECT_REASON_TIMEOUT;
+		}
+		remaining_ms = (long)((deadline - now) / 1000);
+		if (remaining_ms <= 0)
+			remaining_ms = 1;
+		if (remaining_ms > 100)
+			remaining_ms = 100;
+		(void)ConditionVariableTimedSleep(&entry->cv, remaining_ms, WAIT_EVENT_GES_CONVERT_WAIT);
+	}
+	ConditionVariableCancelSleep();
+
+	reject_reason = entry->reject_reason;
+	cluster_ges_reply_wait_delete(&key);
+	return reject_reason;
+}
+
+/*
+ * spec-5.3 D2/D6 — send opcode-14 CONVERT_ROLLBACK (T4 post-commit backout).
+ *
+ *	Fire-and-forget / best-effort: restores the upgraded slot to (old_mode,
+ *	R_old).  Idempotent at the master (a no-op if the slot was never upgraded),
+ *	so it is safe to send on any post-OK_CONVERTED backout to close the
+ *	false-grant window without waiting for an ack.  upgraded_mode locates the
+ *	slot; old_request_id (R_old) + old_mode are the restore targets.
+ */
+void
+cluster_ges_send_convert_rollback(const struct ClusterResId *resid, uint32 upgraded_mode,
+								  uint32 old_mode, const struct ClusterGrdHolderId *holder,
+								  uint64 old_request_id)
+{
+	int32 master;
+	GesRequestPayload req;
+	uint64 master_gen;
+
+	if (resid == NULL || holder == NULL)
+		return;
+
+	master = cluster_grd_lookup_master(resid);
+	master_gen = cluster_lms_get_shard_master_generation();
+
+	memset(&req, 0, sizeof(req));
+	req.opcode = GES_REQ_OPCODE_CONVERT_ROLLBACK;
+	req.lockmode = upgraded_mode; /* locates the upgraded slot */
+	req.holder_node_id = (uint32)holder->node_id;
+	req.holder_procno = (uint32)holder->procno;
+	req.holder_cluster_epoch_lo = (uint32)(holder->cluster_epoch & 0xffffffffu);
+	req.holder_cluster_epoch_hi = (uint32)(holder->cluster_epoch >> 32);
+	req.holder_request_id_lo = (uint32)(old_request_id & 0xffffffffu); /* R_old restore target */
+	req.holder_request_id_hi = (uint32)(old_request_id >> 32);
+	memcpy(req.resid, resid, sizeof(req.resid));
+	req.shard_master_generation_lo = (uint32)(master_gen & 0xffffffffu);
+	req.shard_master_generation_hi = (uint32)(master_gen >> 32);
+	req.current_mode = (uint8)old_mode; /* restore target mode */
+
+	if (master < 0 || master == cluster_node_id)
+		(void)cluster_grd_work_queue_enqueue(cluster_node_id, &req, sizeof(req));
+	else
+		(void)cluster_grd_outbound_enqueue_backend_request((uint32)master, &req, sizeof(req));
 }
 
 

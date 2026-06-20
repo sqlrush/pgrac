@@ -1102,6 +1102,7 @@ cluster_lms_native_probe_aggregate_and_resolve(uint32 slot_idx)
 	bool need_send_grant = false;
 	bool need_send_reject = false;
 	bool need_release_holder = false;
+	bool need_convert_commit = false; /* spec-5.3 §3.5 — commit a CONVERT on clear */
 	uint32 reject_reason = 0;
 
 	Assert(cluster_lms_state != NULL);
@@ -1120,7 +1121,14 @@ cluster_lms_native_probe_aggregate_and_resolve(uint32 slot_idx)
 
 	if (slot->final_ready && slot->final_status == CLUSTER_NATIVE_PROBE_FINAL_TIMEOUT) {
 		if (slot->grant_on_clear) {
-			need_release_holder = true;
+			/*
+			 * spec-5.3 §3.2 — a CONVERT is NOT pre-mutated, so on timeout the
+			 * existing (weaker-mode) holder must stay (do NOT release it): the
+			 * requester keeps L_old and sends a best-effort CONVERT_ROLLBACK.
+			 * A plain REQUEST grant-on-clear had added a holder, which must be
+			 * released here.
+			 */
+			need_release_holder = (slot->request_opcode != GES_REQ_OPCODE_CONVERT);
 			need_send_reject = true;
 			need_release_after_timeout = true;
 			reject_reason = GES_REJECT_REASON_TIMEOUT;
@@ -1149,7 +1157,13 @@ cluster_lms_native_probe_aggregate_and_resolve(uint32 slot_idx)
 	}
 
 	if (slot->grant_on_clear) {
-		need_send_grant = true;
+		/* spec-5.3 §3.5 — a CONVERT commits its upgrade HERE (the holder was
+		 * not pre-mutated during the probe window);  a plain REQUEST just
+		 * sends the deferred grant. */
+		if (slot->request_opcode == GES_REQ_OPCODE_CONVERT)
+			need_convert_commit = true;
+		else
+			need_send_grant = true;
 		need_release_after_grant = true;
 	} else {
 		slot->final_status = (uint32)CLUSTER_NATIVE_LOCK_PROBE_CLEAR;
@@ -1160,6 +1174,25 @@ cluster_lms_native_probe_aggregate_and_resolve(uint32 slot_idx)
 post_lock:
 	if (need_release_holder)
 		(void)cluster_grd_release_holder_by_id(&slot->resid, &slot->requester);
+	if (need_convert_commit) {
+		/*
+		 * spec-5.3 §3.5 — the native probe cleared;  commit the convert now
+		 * (locate the OLD slot by node/procno, upgrade + rebind).  GRANTED ->
+		 * send the grant;  ILLEGAL (the holder vanished mid-probe) -> reject;
+		 * ENQUEUED (a cluster holder conflict appeared during the probe) ->
+		 * no reply now, the requester keeps waiting and the release drain
+		 * grants it.
+		 */
+		ClusterGrdConvertResult cr = cluster_grd_convert_grant_by_backend(
+			&slot->resid, (int32)slot->requester.node_id, slot->requester.procno,
+			slot->requester.cluster_epoch, slot->lockmode, slot->requester.request_id,
+			slot->grant_source_node_id, (uint64)slot->shard_master_generation_lo);
+
+		if (cr == CLUSTER_GRD_CONVERT_GRANTED_INPLACE)
+			native_probe_send_grant_reply(slot);
+		else if (cr == CLUSTER_GRD_CONVERT_ILLEGAL)
+			native_probe_send_reject_reply(slot, GES_REJECT_REASON_ILLEGAL_CONVERT);
+	}
 	if (need_send_reject)
 		native_probe_send_reject_reply(slot, reject_reason);
 	if (need_send_grant)

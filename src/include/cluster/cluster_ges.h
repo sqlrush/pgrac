@@ -242,7 +242,22 @@ typedef enum GesRequestOpcode {
 	 * remote holder → double grant.  No reply;  senders re-announce每
 	 * tick until their own P6 gate passes (lost-message tolerance).
 	 */
-	GES_REQ_OPCODE_REDECLARE_DONE = 13
+	GES_REQ_OPCODE_REDECLARE_DONE = 13,
+	/*
+	 * spec-5.3 D2 — post-commit convert backout (T4).  After a backend
+	 * upgraded an existing grant in place (opcode-2 CONVERT, master mutated
+	 * the holder slot to the stronger mode and rebound its request_id), a
+	 * local subtransaction rollback / cancel / ERROR may need to back the
+	 * upgrade out while keeping the original weaker grant.  A plain
+	 * GES_RELEASE deletes the holder slot (cluster_grd_entry_release_holder),
+	 * so it cannot restore the pre-convert (old_mode, old_request_id);  this
+	 * dedicated opcode carries old_request_id in holder_request_id and
+	 * old_mode in current_mode so the master can run the strict inverse of
+	 * the convert (cluster_grd_entry_rollback_convert) — restore, not delete.
+	 * Reuses the 64B GesRequestPayload (per-opcode field semantics differ;
+	 * lockmode locates the upgraded slot).
+	 */
+	GES_REQ_OPCODE_CONVERT_ROLLBACK = 14
 } GesRequestOpcode;
 
 typedef enum GesReplyOpcode {
@@ -257,13 +272,21 @@ typedef enum GesRejectReason {
 	GES_REJECT_REASON_EPOCH_MISMATCH = 3,
 	GES_REJECT_REASON_TIMEOUT = 4,
 	GES_REJECT_REASON_SHARD_FROZEN = 5, /* spec-4.6 D4: shard FROZEN/REBUILDING */
-	GES_REJECT_REASON_FEATURE_NOT_SUPPORTED = 6
-	/* spec-5.1b D3/D10: inbound opcode-2 cross-node CONVERT is not yet a
-	 * supported production path (the real backend trigger + convert wire
-	 * land in spec-5.2);  the master rejects with this reason and the
-	 * requester maps it to ERRCODE_FEATURE_NOT_SUPPORTED (0A000).  The
-	 * convert-specific GES_REJECT_REASON_ILLEGAL_CONVERT + 53R74 are
-	 * reserved for spec-5.2 (no live producer yet, so not registered). */
+	GES_REJECT_REASON_FEATURE_NOT_SUPPORTED = 6,
+	/*
+	 * spec-5.3 D4 — illegal lock conversion.  The opcode-2 CONVERT state
+	 * machine is now a live consumer (TM table-lock S->X upgrade).  This
+	 * reason is returned when the requested conversion is not a valid
+	 * partial-order upgrade (LATERAL / incomparable modes) or the requester
+	 * claims to hold a (node,procno,current_mode) slot the master has no
+	 * record of.  The requester maps it to
+	 * ERRCODE_CLUSTER_GES_ILLEGAL_LOCK_CONVERSION (53R74).
+	 *
+	 * GES_REJECT_REASON_FEATURE_NOT_SUPPORTED stays valid for genuinely
+	 * unsupported convert sub-cases (e.g. cross-node down-convert, which
+	 * remains forward-deferred to the CF/PCM block layer per spec-5.3 §3.4).
+	 */
+	GES_REJECT_REASON_ILLEGAL_CONVERT = 7
 } GesRejectReason;
 
 /* ClusterGrdHolderId 4-tuple typedef defined in cluster_grd.h (semantic
@@ -280,8 +303,27 @@ struct ClusterGrdHolderId;
  *     [ 8, 32)  holder_id       24 bytes   (ClusterGrdHolderId)
  *     [32, 48)  resid           16 bytes   (ClusterResId)
  *
- *   Total: 56 bytes (spec-2.27 D2 / HC49 ABI bump from 48B — adds
- *   shard_master_generation field for dedup HTAB 5-tuple key).  Aligned to 8.
+ *   Total: 64 bytes (spec-5.3 D2 ABI bump from 56B — adds current_mode at
+ *   offset 56; spec-2.27 D2 / HC49 had bumped 48B->56B for the
+ *   shard_master_generation dedup field).  Aligned to 8.
+ *
+ *   PGRAC: spec-5.3 D2 extends the 56B payload to 64B WITHOUT moving any
+ *   existing field: opcode/lockmode/holder/resid/shard_master_generation
+ *   keep their offsets so the generic inbound decode (cluster_ges_request_
+ *   handler cast at line ~400 + epoch read at offset 16-23 +
+ *   ges_validate_inbound) works UNCHANGED.  The new current_mode tail field
+ *   is read only by the CONVERT / CONVERT_ROLLBACK opcode arms.  Per-opcode
+ *   field semantics:
+ *     REQUEST/RELEASE/REDECLARE  current_mode unused (0)
+ *     CONVERT(2)                 lockmode=requested_mode,
+ *                                holder_request_id=convert_request_id (R_new),
+ *                                current_mode=old_mode (locates the OLD slot
+ *                                via the REDECLARE convention
+ *                                (node,procno,current_mode)+resid)
+ *     CONVERT_ROLLBACK(14)       lockmode=upgraded_mode (locates the upgraded
+ *                                slot), holder_request_id=R_old (restore
+ *                                target id), current_mode=old_mode (restore
+ *                                target mode)
  *
  *   shard_master_generation = (cluster_epoch << 32) | lms_restart_generation
  *   composite supplied by the calling backend at REQUEST/RELEASE send time.
@@ -307,10 +349,14 @@ typedef struct GesRequestPayload {
 	 * caller samples cluster_lms_get_shard_master_generation() at send time. */
 	uint32 shard_master_generation_lo;
 	uint32 shard_master_generation_hi;
+	/* spec-5.3 D2 — convert mode field at offset 56.  Semantics per opcode
+	 * (see the per-opcode layout note above); 0 for non-convert opcodes. */
+	uint8 current_mode;
+	uint8 _pad[7]; /* align the 64B payload to 8 */
 } GesRequestPayload;
 
-StaticAssertDecl(sizeof(GesRequestPayload) == 56,
-				 "GesRequestPayload wire ABI 56-byte lock (spec-2.27 D2 bump from 48B)");
+StaticAssertDecl(sizeof(GesRequestPayload) == 64,
+				 "GesRequestPayload wire ABI 64-byte lock (spec-5.3 D2 bump from 56B)");
 
 /*
  * GES reply payload (variant on GES_REPLY msg_type=5).
@@ -385,6 +431,28 @@ extern uint32 cluster_ges_send_release_and_wait(const struct ClusterResId *resid
 extern uint32 cluster_ges_send_redeclare_and_wait(const struct ClusterResId *resid, uint32 lockmode,
 												  const struct ClusterGrdHolderId *new_holder,
 												  uint64 request_id);
+
+/* spec-5.3 D2/D3 — send opcode-2 CONVERT (same-backend upgrade) to the
+ * resource's master (local master goes through the in-process work queue,
+ * remote master over the wire) and wait on WAIT_EVENT_GES_CONVERT_WAIT for
+ * the GRANT/REJECT.  The holder carries request_id = convert_request_id
+ * (R_new);  current_mode is the REDECLARE locator key for the OLD slot.
+ * Returns GES_REJECT_REASON_NONE on OK_CONVERTED, ILLEGAL_CONVERT on a
+ * non-partial-order conversion (→ 53R74), TIMEOUT on convert wait timeout. */
+extern uint32 cluster_ges_send_convert_and_wait(const struct ClusterResId *resid,
+												uint32 requested_mode, uint32 current_mode,
+												const struct ClusterGrdHolderId *holder,
+												uint64 convert_request_id, int timeout_ms);
+
+/* spec-5.3 D2/D6 — send opcode-14 CONVERT_ROLLBACK (T4 post-commit backout):
+ * restore the upgraded slot to (old_mode, old_request_id).  Idempotent /
+ * best-effort (a no-op at the master if it never mutated);  used by the
+ * acquire-path cleanup so a subxact rollback / cancel after OK_CONVERTED
+ * cannot leave a false-grant.  upgraded_mode locates the slot. */
+extern void cluster_ges_send_convert_rollback(const struct ClusterResId *resid,
+											  uint32 upgraded_mode, uint32 old_mode,
+											  const struct ClusterGrdHolderId *holder,
+											  uint64 old_request_id);
 
 
 /* ============================================================

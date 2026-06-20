@@ -375,6 +375,20 @@ cluster_ges_send_release_and_wait(const struct ClusterResId *resid pg_attribute_
 	return 0;
 }
 
+/* spec-5.3 — convert send + tm_convert_mode GUC (cluster_lock_acquire.c refs). */
+int cluster_tm_convert_mode = 0; /* CLUSTER_TM_CONVERT_MODE_CONVERT */
+
+uint32
+cluster_ges_send_convert_and_wait(const struct ClusterResId *resid pg_attribute_unused(),
+								  uint32 requested_mode pg_attribute_unused(),
+								  uint32 current_mode pg_attribute_unused(),
+								  const struct ClusterGrdHolderId *holder pg_attribute_unused(),
+								  uint64 convert_request_id pg_attribute_unused(),
+								  int timeout_ms pg_attribute_unused())
+{
+	return stub_ges_reject_reason;
+}
+
 
 /* ============================================================
  * Test cases.

@@ -2700,6 +2700,15 @@ cluster_grd_entry_request_convert(ClusterGrdEntry *entry, const ClusterGrdConver
 			}
 		}
 		entry->holders[hslot].mode = req->requested_mode;
+		/*
+		 * PGRAC: spec-5.3 §3.1a release-ownership — rebind the holder slot's
+		 * request_id to the convert's own reply key (R_new = convert_request_
+		 * id).  The requester then makes its new (stronger-mode) LOCALLOCK the
+		 * sole cluster owner and de-registers the old weaker LOCALLOCK locally,
+		 * so the eventual release matches this slot by R_new exactly once
+		 * (no holder leak / no early strong-lock release).
+		 */
+		entry->holders[hslot].request_id = req->convert_request_id;
 		entry->generation++;
 		pg_atomic_fetch_add_u64(&cluster_grd_state->convert_granted_inplace_count, 1);
 		return CLUSTER_GRD_CONVERT_GRANTED_INPLACE;
@@ -2765,6 +2774,9 @@ cluster_grd_entry_drain_converts_then_waiters(ClusterGrdEntry *entry,
 		}
 
 		entry->holders[hslot].mode = cv->requested_mode;
+		/* PGRAC: spec-5.3 §3.1a — rebind the granted holder slot to the
+		 * convert's reply key (R_new), mirroring the in-place UPGRADE path. */
+		entry->holders[hslot].request_id = cv->convert_request_id;
 		granted_out[n].holder.node_id = (uint32)cv->node_id;
 		granted_out[n].holder.procno = cv->procno;
 		granted_out[n].holder.cluster_epoch = cv->cluster_epoch;
@@ -2930,6 +2942,296 @@ cluster_grd_convert_queue_full_count(void)
 	/* convert queue-full reuses the existing converts_full_count (D9). */
 	Assert(cluster_grd_state != NULL);
 	return pg_atomic_read_u64(&cluster_grd_state->converts_full_count);
+}
+
+
+/* ============================================================
+ * spec-5.3 — master-side convert API (live consumer of the 5.1b state
+ *	machine).  These wrap the raw entry mutators with the lookup +
+ *	entry->lock dance, mirroring cluster_grd_entry_enqueue_or_grant, so the
+ *	GES work-queue drain (REQUEST/CONVERT) and the release drain stay
+ *	symmetric and the ClusterGrdEntry body stays opaque to cluster_ges.c.
+ * ============================================================ */
+
+/*
+ * cluster_grd_convert_or_enqueue -- master-side opcode-2 CONVERT entry point.
+ *
+ *	Locates the OLD holder slot by (node_id, procno, current_mode) + resid
+ *	(the REDECLARE locator) and runs the 5.1b partial-order convert decision.
+ *	On GRANTED_INPLACE the slot mode is upgraded and its request_id rebound to
+ *	convert_request_id (§3.1a).  On ENQUEUED the convert sits in the entry's
+ *	convert queue (priority over new waiters) and the conflicting holders are
+ *	snapshotted into conflict_holders_out so the caller can fan out an
+ *	advisory BAST.  ILLEGAL (LATERAL / no such holder) is fail-closed (53R74).
+ */
+ClusterGrdConvertResult
+cluster_grd_convert_or_enqueue(const ClusterResId *resid, int32 node_id, uint32 procno,
+							   uint64 cluster_epoch, LOCKMODE current_mode, LOCKMODE requested_mode,
+							   uint64 convert_request_id, int32 source_node_id,
+							   uint64 shard_master_generation,
+							   ClusterGrdConflictHolder *conflict_holders_out, int *n_conflict_out)
+{
+	ClusterGrdEntry *entry = NULL;
+	ClusterGrdEntryResult lookup_result;
+	ClusterGrdConvert creq;
+	ClusterGrdConvertResult result;
+	bool drain_hint = false;
+
+	Assert(resid != NULL);
+
+	if (n_conflict_out != NULL)
+		*n_conflict_out = 0;
+
+	lookup_result = cluster_grd_entry_lookup_or_create(resid, true, &entry);
+	if (lookup_result == CLUSTER_GRD_ENTRY_NOT_READY)
+		return CLUSTER_GRD_CONVERT_NOT_READY;
+	if (lookup_result != CLUSTER_GRD_ENTRY_OK || entry == NULL)
+		return CLUSTER_GRD_CONVERT_NOT_READY;
+
+	memset(&creq, 0, sizeof(creq));
+	creq.node_id = node_id;
+	creq.source_node_id = source_node_id;
+	creq.procno = procno;
+	creq.cluster_epoch = cluster_epoch;
+	creq.current_mode = current_mode;
+	creq.requested_mode = requested_mode;
+	creq.convert_request_id = convert_request_id;
+	creq.shard_master_generation = shard_master_generation;
+	creq.request_opcode = GES_REQ_OPCODE_CONVERT;
+	creq.wait_start = 0;
+
+	SpinLockAcquire(&entry->lock);
+	result = cluster_grd_entry_request_convert(entry, &creq, &drain_hint);
+
+	/*
+	 * Snapshot the conflicting holders under the entry lock so the caller can
+	 * emit a targeted advisory BAST (HC18 mirror).  Only meaningful when the
+	 * convert was enqueued (UPGRADE conflict).
+	 */
+	if (result == CLUSTER_GRD_CONVERT_ENQUEUED && conflict_holders_out != NULL) {
+		int nc = 0;
+
+		for (int i = 0; i < entry->ngranted && nc < PGRAC_GRD_MAX_HOLDERS; i++) {
+			if ((uint32)entry->holders[i].node_id == (uint32)node_id
+				&& entry->holders[i].procno == procno)
+				continue; /* spec-5.1c D5 self-exclude */
+			if (ges_modes_compatible(entry->holders[i].mode, requested_mode))
+				continue;
+			conflict_holders_out[nc].holder.node_id = entry->holders[i].node_id;
+			conflict_holders_out[nc].holder.procno = entry->holders[i].procno;
+			conflict_holders_out[nc].holder.cluster_epoch = entry->holders[i].cluster_epoch;
+			conflict_holders_out[nc].holder.request_id = entry->holders[i].request_id;
+			conflict_holders_out[nc].source_node_id = entry->holders[i].node_id;
+			conflict_holders_out[nc].held_mode = entry->holders[i].mode;
+			nc++;
+		}
+		if (n_conflict_out != NULL)
+			*n_conflict_out = nc;
+	}
+
+	SpinLockRelease(&entry->lock);
+	cluster_grd_entry_release(entry);
+	return result;
+}
+
+/*
+ * cluster_grd_convert_grant_by_backend -- run the convert decision locating the
+ *	OLD slot by (node_id, procno) ALONE (spec-5.3 §3.5 native-probe clear path).
+ *
+ *	Used by the LMS native-probe resolve path: when a convert needed a native-
+ *	lock probe, the master did NOT pre-mutate the holder (it stayed at the old
+ *	mode for the probe window — fail-safe / conservative).  On probe CLEAR this
+ *	commits the convert.  The LMS slot does not carry the old mode, so the OLD
+ *	slot is located by (node,procno) (a backend converts at most one lock per
+ *	resource) and current_mode is derived from the found holder, then the 5.1b
+ *	partial-order decision runs (GRANTED_INPLACE mutates + rebinds; ENQUEUED if
+ *	a cluster conflict appeared during the probe; ILLEGAL if no such holder).
+ */
+ClusterGrdConvertResult
+cluster_grd_convert_grant_by_backend(const ClusterResId *resid, int32 node_id, uint32 procno,
+									 uint64 cluster_epoch, LOCKMODE requested_mode,
+									 uint64 convert_request_id, int32 source_node_id,
+									 uint64 shard_master_generation)
+{
+	ClusterGrdEntry *entry = NULL;
+	ClusterGrdEntryResult lookup_result;
+	ClusterGrdConvert creq;
+	ClusterGrdConvertResult result;
+	LOCKMODE current_mode = NoLock;
+	bool drain_hint = false;
+	int hslot = -1;
+
+	Assert(resid != NULL);
+
+	lookup_result = cluster_grd_entry_lookup_or_create(resid, true, &entry);
+	if (lookup_result != CLUSTER_GRD_ENTRY_OK || entry == NULL)
+		return CLUSTER_GRD_CONVERT_NOT_READY;
+
+	SpinLockAcquire(&entry->lock);
+
+	for (int i = 0; i < entry->ngranted; i++) {
+		if (entry->holders[i].node_id == node_id && entry->holders[i].procno == procno) {
+			hslot = i;
+			current_mode = entry->holders[i].mode;
+			break;
+		}
+	}
+	if (hslot < 0) {
+		SpinLockRelease(&entry->lock);
+		cluster_grd_entry_release(entry);
+		pg_atomic_fetch_add_u64(&cluster_grd_state->convert_illegal_count, 1);
+		return CLUSTER_GRD_CONVERT_ILLEGAL;
+	}
+
+	memset(&creq, 0, sizeof(creq));
+	creq.node_id = node_id;
+	creq.source_node_id = source_node_id;
+	creq.procno = procno;
+	creq.cluster_epoch = cluster_epoch;
+	creq.current_mode = current_mode;
+	creq.requested_mode = requested_mode;
+	creq.convert_request_id = convert_request_id;
+	creq.shard_master_generation = shard_master_generation;
+	creq.request_opcode = GES_REQ_OPCODE_CONVERT;
+	creq.wait_start = 0;
+
+	result = cluster_grd_entry_request_convert(entry, &creq, &drain_hint);
+	SpinLockRelease(&entry->lock);
+	cluster_grd_entry_release(entry);
+	return result;
+}
+
+/*
+ * cluster_grd_release_and_drain -- remove a holder then drain the convert
+ *	queue and one waiter under a single entry lock (spec-5.3 D3 live release).
+ *
+ *	Replaces the spec-2.23 release_and_pop on the GES RELEASE path: after the
+ *	releasing holder is removed, every pending convert now compatible with the
+ *	surviving holders is granted in place (FIFO, priority over waiters), then a
+ *	single FIFO REQUEST waiter is popped.  Stale-epoch converts and waiters are
+ *	dropped first (spec-4.6 P0#3 window guard: a grant reply echoing a stale
+ *	tuple would be rejected and leak a zombie grant).  Returns the number of
+ *	granted identities (each tagged REQUEST or CONVERT) for the caller to route.
+ */
+int
+cluster_grd_release_and_drain(const ClusterResId *resid, const ClusterGrdHolderId *holder,
+							  ClusterGrdGrantIdentity *granted_out, int max_out)
+{
+	ClusterGrdEntry *entry = NULL;
+	ClusterGrdEntryResult lookup_result;
+	uint64 cur_epoch;
+	int n;
+
+	Assert(resid != NULL && holder != NULL);
+	Assert(granted_out != NULL && max_out > 0);
+
+	lookup_result = cluster_grd_entry_lookup_or_create(resid, false, &entry);
+	if (lookup_result != CLUSTER_GRD_ENTRY_OK || entry == NULL)
+		return 0;
+
+	SpinLockAcquire(&entry->lock);
+
+	/* (1) Remove the releasing holder by full 4-tuple match (if present). */
+	for (int i = 0; i < entry->ngranted; i++) {
+		if ((uint32)entry->holders[i].node_id == holder->node_id
+			&& entry->holders[i].procno == holder->procno
+			&& entry->holders[i].cluster_epoch == holder->cluster_epoch
+			&& entry->holders[i].request_id == holder->request_id) {
+			if (i < entry->ngranted - 1)
+				entry->holders[i] = entry->holders[entry->ngranted - 1];
+			memset(&entry->holders[entry->ngranted - 1], 0, sizeof(ClusterGrdHolder));
+			entry->ngranted--;
+			entry->generation++;
+			break;
+		}
+	}
+
+	/* (2) Drop stale-epoch converts and waiters before granting. */
+	cur_epoch = cluster_epoch_get_current();
+	for (int c = 0; c < entry->nconverts;) {
+		if (entry->converts[c].cluster_epoch < cur_epoch) {
+			grd_convert_remove(entry, c);
+			pg_atomic_fetch_add_u64(&cluster_grd_state->stale_request_drop_count, 1);
+			continue;
+		}
+		c++;
+	}
+	for (int w = 0; w < entry->nwaiters;) {
+		if (entry->waiters[w].cluster_epoch < cur_epoch) {
+			if (w < entry->nwaiters - 1)
+				entry->waiters[w] = entry->waiters[entry->nwaiters - 1];
+			memset(&entry->waiters[entry->nwaiters - 1], 0, sizeof(entry->waiters[0]));
+			entry->nwaiters--;
+			pg_atomic_fetch_add_u64(&cluster_grd_state->stale_request_drop_count, 1);
+			continue;
+		}
+		w++;
+	}
+
+	/* (3) Grant compatible converts then one waiter (5.1b drain). */
+	n = cluster_grd_entry_drain_converts_then_waiters(entry, granted_out, max_out);
+
+	SpinLockRelease(&entry->lock);
+	cluster_grd_entry_release(entry);
+	return n;
+}
+
+/*
+ * cluster_grd_entry_rollback_convert -- restore a slot upgraded by a convert
+ *	back to its pre-convert (old_mode, old_request_id) (spec-5.3 §3.1a T4;
+ *	caller holds entry->lock; raw mutator).
+ *
+ *	This is the STRICT INVERSE of the convert grant, NOT a release: a plain
+ *	cluster_grd_entry_release_holder would DELETE the holder, leaving the
+ *	master with no record of the still-held weaker lock (a false-grant for the
+ *	next requester).  Locates the upgraded slot by (node_id, procno,
+ *	upgraded_mode) and restores both its mode and request_id.  Returns OK if
+ *	the slot was found and restored, NOT_FOUND otherwise (idempotent on a
+ *	retransmitted / already-rolled-back rollback).
+ */
+ClusterGrdEntryResult
+cluster_grd_entry_rollback_convert(ClusterGrdEntry *entry, int32 node_id, uint32 procno,
+								   LOCKMODE upgraded_mode, LOCKMODE old_mode, uint64 old_request_id)
+{
+	int hslot;
+
+	Assert(entry != NULL);
+
+	hslot = grd_find_holder_slot(entry, node_id, procno, upgraded_mode);
+	if (hslot < 0)
+		return CLUSTER_GRD_ENTRY_NOT_FOUND;
+
+	entry->holders[hslot].mode = old_mode;
+	entry->holders[hslot].request_id = old_request_id;
+	entry->generation++;
+	return CLUSTER_GRD_ENTRY_OK;
+}
+
+/*
+ * cluster_grd_rollback_convert -- master-side opcode-14 CONVERT_ROLLBACK entry
+ *	point (lookup + entry->lock + restore).  Wraps
+ *	cluster_grd_entry_rollback_convert for the GES work-queue drain.
+ */
+ClusterGrdEntryResult
+cluster_grd_rollback_convert(const ClusterResId *resid, int32 node_id, uint32 procno,
+							 LOCKMODE upgraded_mode, LOCKMODE old_mode, uint64 old_request_id)
+{
+	ClusterGrdEntry *entry = NULL;
+	ClusterGrdEntryResult lookup_result;
+	ClusterGrdEntryResult result;
+
+	Assert(resid != NULL);
+
+	lookup_result = cluster_grd_entry_lookup_or_create(resid, false, &entry);
+	if (lookup_result != CLUSTER_GRD_ENTRY_OK || entry == NULL)
+		return CLUSTER_GRD_ENTRY_NOT_FOUND;
+
+	SpinLockAcquire(&entry->lock);
+	result = cluster_grd_entry_rollback_convert(entry, node_id, procno, upgraded_mode, old_mode,
+											   old_request_id);
+	SpinLockRelease(&entry->lock);
+	cluster_grd_entry_release(entry);
+	return result;
 }
 
 ClusterGrdEntryResult

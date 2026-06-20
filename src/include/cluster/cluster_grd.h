@@ -1123,6 +1123,65 @@ extern uint64 cluster_grd_convert_illegal_count(void);
 extern uint64 cluster_grd_convert_queue_full_count(void);
 
 
+/* ============================================================
+ * spec-5.3 — master-side convert / release-drain / rollback API.
+ *
+ *	Live consumers of the 5.1b convert state machine: each does the GRD
+ *	entry lookup + entry->lock dance so cluster_ges.c's work-queue drain
+ *	(REQUEST / CONVERT / CONVERT_ROLLBACK) and the GES RELEASE path stay
+ *	symmetric and the ClusterGrdEntry body stays opaque.
+ * ============================================================ */
+
+/*
+ * Master-side opcode-2 CONVERT: locate the OLD holder by (node_id, procno,
+ * current_mode) + resid and run the partial-order convert decision.  On
+ * GRANTED_INPLACE the slot is upgraded + request_id rebound to
+ * convert_request_id (§3.1a).  On ENQUEUED conflict_holders_out[] is filled
+ * (BAST targets).  ILLEGAL → fail-closed (53R74).
+ */
+extern ClusterGrdConvertResult cluster_grd_convert_or_enqueue(
+	const ClusterResId *resid, int32 node_id, uint32 procno, uint64 cluster_epoch,
+	LOCKMODE current_mode, LOCKMODE requested_mode, uint64 convert_request_id, int32 source_node_id,
+	uint64 shard_master_generation, ClusterGrdConflictHolder *conflict_holders_out,
+	int *n_conflict_out);
+
+/*
+ * spec-5.3 §3.5 native-probe clear path: commit a convert whose old slot is
+ * located by (node_id, procno) alone (current_mode derived from the holder).
+ * The master did not pre-mutate during the probe window, so this is the point
+ * the upgrade actually takes effect after a CLEAR aggregate.
+ */
+extern ClusterGrdConvertResult cluster_grd_convert_grant_by_backend(
+	const ClusterResId *resid, int32 node_id, uint32 procno, uint64 cluster_epoch,
+	LOCKMODE requested_mode, uint64 convert_request_id, int32 source_node_id,
+	uint64 shard_master_generation);
+
+/*
+ * GES RELEASE live path: remove the holder then drain converts + one waiter
+ * (stale-epoch entries dropped first).  Returns granted identities (each
+ * tagged REQUEST / CONVERT) for the caller to route via GES_REPLY GRANT.
+ */
+extern int cluster_grd_release_and_drain(const ClusterResId *resid,
+										 const ClusterGrdHolderId *holder,
+										 ClusterGrdGrantIdentity *granted_out, int max_out);
+
+/*
+ * opcode-14 CONVERT_ROLLBACK (§3.1a T4): strict inverse of the convert — locate
+ * the upgraded slot by (node_id, procno, upgraded_mode) and restore both its
+ * mode (→ old_mode) and request_id (→ old_request_id).  NOT a release (which
+ * would delete the holder and leave a false-grant).  Raw mutator variant takes
+ * the entry under the caller's lock; the wrapper does the lookup + lock.
+ */
+extern ClusterGrdEntryResult cluster_grd_entry_rollback_convert(ClusterGrdEntry *entry,
+																int32 node_id, uint32 procno,
+																LOCKMODE upgraded_mode,
+																LOCKMODE old_mode,
+																uint64 old_request_id);
+extern ClusterGrdEntryResult cluster_grd_rollback_convert(const ClusterResId *resid, int32 node_id,
+														  uint32 procno, LOCKMODE upgraded_mode,
+														  LOCKMODE old_mode, uint64 old_request_id);
+
+
 /*
  * CSSD DEAD cleanup entry point (Step 4 D11 + LMON tick polling D8).
  *
