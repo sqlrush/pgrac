@@ -120,8 +120,8 @@ int cluster_grd_remaster_wait_ms = 200;	   /* frozen-shard short wait before 53R
 int cluster_grd_rebuild_timeout_ms = 5000; /* holder-rebuild barrier deadline */
 
 /* spec-5.4 D8 — SQ sequence lock tunables. */
-int cluster_sequence_default_cache = 100;	   /* CREATE-time CACHE injection default */
-int cluster_sequence_cache_floor_optin = 0;	   /* opt-in seqcache floor (0 = off) */
+int cluster_sequence_default_cache = 100;		/* CREATE-time CACHE injection default */
+int cluster_sequence_cache_floor_optin = 0;		/* opt-in seqcache floor (0 = off) */
 int cluster_sequence_refill_timeout_ms = 30000; /* SQ refill wait before fail-closed */
 
 #ifdef ENABLE_INJECTION
