@@ -974,6 +974,10 @@ cluster_lms_native_probe_dispatch(uint32 slot_idx)
 	payload.lockmode = (uint32)slot->lockmode;
 	memcpy(payload.locktag_bytes, &slot->locktag, sizeof(LOCKTAG));
 	payload.probe_id = slot->probe_id;
+	/* spec-5.3 — carry the ORIGINAL requester so a peer that hosts it can
+	 * self-exclude its own holder (HC32a) instead of the LMS master. */
+	payload.requester_node_id = (uint32)slot->requester.node_id;
+	payload.requester_procno = slot->requester.procno;
 
 	/* Origin self-probe (HC32a):  short-circuit local function call. */
 	{

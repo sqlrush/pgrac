@@ -893,6 +893,11 @@ extern ClusterGrdEntryResult cluster_grd_release_holder_by_id(const ClusterResId
 extern ClusterGrdEntryResult cluster_grd_cancel_reservation_by_id(const ClusterResId *resid,
 																  const ClusterGrdHolderId *holder);
 
+/* spec-5.3 L11 — remove a queued REQUEST waiter by (node, procno, request_id);
+ * OK if removed, NOT_FOUND if already granted (timeout-vs-grant race). */
+extern ClusterGrdEntryResult cluster_grd_cancel_waiter_by_id(const ClusterResId *resid,
+															 const ClusterGrdHolderId *holder);
+
 /* ============================================================
  * spec-2.23 D6 — GRD-owned grant / waiter-pop API.
  *

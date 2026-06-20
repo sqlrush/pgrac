@@ -60,17 +60,43 @@
 #include "postgres.h"
 #include "datatype/timestamp.h"
 
-/* spec-2.27 D2 — 5-tuple dedup key. */
+/*
+ * spec-2.27 D2 — dedup key.
+ *
+ * PGRAC modifications by SqlRush (spec-5.3 hardening H?):
+ *	What changed:  added holder_procno (+ _pad0) — the key was a 5-tuple
+ *	  that omitted procno, but a GES request's identity is the documented
+ *	  4-tuple (node_id, procno, cluster_epoch, request_id) — see
+ *	  cluster_lock_acquire.c assign_request_identity.  request_id is a
+ *	  PER-BACKEND counter (each backend's first REQUEST is request_id=1),
+ *	  so two backends on the same origin node issuing their first REQUEST
+ *	  to the same master/opcode/epoch/generation produced the SAME 5-tuple
+ *	  key.  The later request was deduped against the earlier backend's
+ *	  cached reply (CACHED_REPLY) and never reached enqueue_or_grant, so no
+ *	  GRD holder was recorded for it — a Rule 8.A false-grant (the requester
+ *	  saw a "grant" reply that belonged to a different backend's request).
+ *	  Latent since spec-2.27; surfaced by spec-5.3's cross-node CONVERT,
+ *	  the first consumer that requires the prior REQUEST's holder to persist
+ *	  at the master so the convert locator (node,procno,current_mode) can
+ *	  find it.
+ *	Why:  procno is already carried on the wire (GesRequestPayload.holder_
+ *	  procno); folding it into the dedup key restores per-request uniqueness
+ *	  without changing request_id's per-backend semantics.  Local shmem HTAB
+ *	  key only — not a wire message; region is sized via sizeof() and grows
+ *	  automatically.
+ */
 typedef struct ClusterGesDedupKey {
 	uint32 origin_node_id;
 	uint32 opcode;
 	uint64 request_id;
 	uint64 cluster_epoch;
 	uint64 shard_master_generation;
+	uint32 holder_procno;
+	uint32 _pad0; /* HASH_BLOBS: keep padding deterministic (memset 0). */
 } ClusterGesDedupKey;
 
-StaticAssertDecl(sizeof(ClusterGesDedupKey) == 32,
-				 "ClusterGesDedupKey 32-byte HASH_BLOBS key (5-tuple wire ABI lock)");
+StaticAssertDecl(sizeof(ClusterGesDedupKey) == 40,
+				 "ClusterGesDedupKey 40-byte HASH_BLOBS key (6-tuple: +holder_procno)");
 
 /* Lookup status — explicit enum (HC51 / HC52);  never collapse states. */
 typedef enum ClusterGesDedupLookupStatus {

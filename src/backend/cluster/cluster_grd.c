@@ -4055,6 +4055,32 @@ cluster_grd_revalidate_and_promote(const ClusterResId *resid, const ClusterGrdHo
 		return CLUSTER_GRD_ENTRY_NOT_FOUND;
 
 	SpinLockAcquire(&entry->lock);
+
+	/*
+	 * spec-5.3 (L11) — local-master REQUEST path.  When this node masters the
+	 * resource, the holder was already registered authoritatively by
+	 * enqueue_or_grant / the release drain under the entry lock (cluster_ges.c
+	 * local-master branch), so there is NO reservation to promote — the
+	 * optimistic S3 reservation's gen_snapshot is stale (the entry mutated when
+	 * the holder/waiter was added).  Detect that path by an exact identity match
+	 * (node, procno, request_id) against the granted holders:  8.A-verify the
+	 * holder is present, drop the unused reservation, and succeed.  Calling
+	 * reservation_promote here would grant_holder a SECOND copy (blind add).
+	 * The remote-master path never has its holder pre-registered at the
+	 * requester GRD, so it falls through to the revalidate below unchanged.
+	 */
+	for (int i = 0; i < entry->ngranted; i++) {
+		if ((uint32)entry->holders[i].node_id == holder->node_id
+			&& entry->holders[i].procno == holder->procno
+			&& entry->holders[i].cluster_epoch == holder->cluster_epoch
+			&& entry->holders[i].request_id == holder->request_id) {
+			(void)cluster_grd_reservation_cancel(entry, holder);
+			SpinLockRelease(&entry->lock);
+			cluster_grd_entry_release(entry);
+			return CLUSTER_GRD_ENTRY_OK;
+		}
+	}
+
 	/*
 	 * P2.3 revalidate target = no incompatible state ascended after the
 	 * S3 snapshot.  reservation_create() bumps generation exactly once
@@ -4108,5 +4134,46 @@ cluster_grd_cancel_reservation_by_id(const ClusterResId *resid, const ClusterGrd
 	SpinLockAcquire(&entry->lock);
 	er = cluster_grd_reservation_cancel(entry, holder);
 	SpinLockRelease(&entry->lock);
+	return er;
+}
+
+/*
+ * cluster_grd_cancel_waiter_by_id -- remove a queued REQUEST waiter by its full
+ *	identity (node, procno, request_id).  spec-5.3 L11:  a local-master REQUEST
+ *	that blocked on a conflict and then timed out must drop its still-queued
+ *	waiter, else a later release drain could grant it to a requester that is
+ *	already gone (phantom strong-mode holder).  Returns OK if a waiter was
+ *	removed;  NOT_FOUND if none matched (the drain already granted it -> the
+ *	caller accepts the grant that raced the timeout).
+ */
+ClusterGrdEntryResult
+cluster_grd_cancel_waiter_by_id(const ClusterResId *resid, const ClusterGrdHolderId *holder)
+{
+	ClusterGrdEntry *entry = NULL;
+	ClusterGrdEntryResult er = CLUSTER_GRD_ENTRY_NOT_FOUND;
+
+	Assert(resid != NULL && holder != NULL);
+
+	if (cluster_grd_entry_lookup_or_create(resid, false, &entry) != CLUSTER_GRD_ENTRY_OK
+		|| entry == NULL)
+		return CLUSTER_GRD_ENTRY_NOT_FOUND;
+
+	SpinLockAcquire(&entry->lock);
+	for (int i = 0; i < entry->nwaiters; i++) {
+		if ((uint32)entry->waiters[i].node_id == holder->node_id
+			&& entry->waiters[i].procno == holder->procno
+			&& entry->waiters[i].cluster_epoch == holder->cluster_epoch
+			&& entry->waiters[i].request_id == holder->request_id) {
+			if (i < entry->nwaiters - 1)
+				entry->waiters[i] = entry->waiters[entry->nwaiters - 1];
+			memset(&entry->waiters[entry->nwaiters - 1], 0, sizeof(ClusterGrdWaiter));
+			entry->nwaiters--;
+			entry->generation++;
+			er = CLUSTER_GRD_ENTRY_OK;
+			break;
+		}
+	}
+	SpinLockRelease(&entry->lock);
+	cluster_grd_entry_release(entry);
 	return er;
 }

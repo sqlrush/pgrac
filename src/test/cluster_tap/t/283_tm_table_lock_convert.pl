@@ -120,6 +120,27 @@ sub convert_count
 	return $sum;
 }
 
+# Diagnostic: dump every per-node grd convert/relation counter + the
+# tm_convert_mode GUC, so a failing leg shows what the convert actually did
+# (granted vs enqueued vs illegal vs additive REQUEST) and on which node.
+sub diag_convert_state
+{
+	my ($pair, $label) = @_;
+	for my $i (0, 1)
+	{
+		my $node = $i == 0 ? $pair->node0 : $pair->node1;
+		my $mode = $node->safe_psql('postgres', 'SHOW cluster.tm_convert_mode');
+		my $rows = $node->safe_psql(
+			'postgres', q{
+			SELECT string_agg(key || '=' || value, ' ' ORDER BY key)
+			FROM pg_cluster_state
+			WHERE category = 'grd'
+			  AND (key LIKE 'grd_convert%' OR key = 'grd_relation_object_cluster_path'
+			       OR key LIKE 'grd_bast%')});
+		diag("  [$label] node$i tm_convert_mode=$mode | " . ($rows // '(no rows)'));
+	}
+}
+
 
 # ----------
 # L1: strict pair + shared data + same-DDL (same relfilenode) + counter baseline.
@@ -130,6 +151,10 @@ my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	shared_data         => 1,
 	extra_conf          => [
 		'autovacuum = off',
+		# The RELATION/OBJECT cluster lock gate (spec-2.25, the foundation of
+		# the TM convert) only runs when the GRD entry table is allocated
+		# (cluster.grd_max_entries > 0); ClusterPair leaves it at the default 0.
+		'cluster.grd_max_entries = 1024',
 		'cluster.ges_request_timeout_ms = 30000',
 		'cluster.ges_convert_timeout_ms = 30000',
 		# CI runners execute many shards in parallel; widen the CSSD misscount
@@ -174,14 +199,26 @@ is(convert_count($pair, 'grd_convert_granted_inplace_count'),
 # L2: single-holder convert (no peer conflict): SHARE then ACCESS EXCLUSIVE in
 # one txn -> OK_CONVERTED + grd_convert_granted_inplace_count increases.
 # ----------
+diag_convert_state($pair, 'L2 before');
 my $before = convert_count($pair, 'grd_convert_granted_inplace_count');
+my $enq_before = convert_count($pair, 'grd_convert_enqueued_count');
+my $ill_before = convert_count($pair, 'grd_convert_illegal_count');
+my $master = $pair->node0->safe_psql('postgres',
+	"SELECT value FROM pg_cluster_state WHERE category='grd' AND key='grd_relation_object_cluster_path'");
 $pair->node0->safe_psql(
 	'postgres', q{
 	BEGIN;
 	LOCK TABLE t IN SHARE MODE;
 	LOCK TABLE t IN ACCESS EXCLUSIVE MODE;
 	COMMIT;});
-ok(convert_count($pair, 'grd_convert_granted_inplace_count') > $before,
+diag_convert_state($pair, 'L2 after');
+my $after = convert_count($pair, 'grd_convert_granted_inplace_count');
+diag("  [L2] sum granted_inplace before=$before after=$after"
+	  . " | enqueued $enq_before->"
+	  . convert_count($pair, 'grd_convert_enqueued_count')
+	  . " | illegal $ill_before->"
+	  . convert_count($pair, 'grd_convert_illegal_count'));
+ok($after > $before,
 	'L2 same-backend SHARE -> ACCESS EXCLUSIVE upgrade is a live convert (count++)');
 
 
@@ -221,7 +258,13 @@ $hn1->query_safe('INSERT INTO t VALUES (4, 4)');    # node1 holds RowExclusive (
 
 my $hn0 = $pair->node0->background_psql('postgres', on_error_die => 1);
 $hn0->query_safe('BEGIN');
-$hn0->query_safe('LOCK TABLE t IN SHARE MODE');
+# node0's pre-upgrade hold must be COMPATIBLE with node1's native RowExclusive
+# (PG matrix: RowExclusive conflicts with Share but NOT ShareUpdateExclusive), so
+# that only the ACCESS EXCLUSIVE UPGRADE hits the native-probe conflict -- this is
+# the 8A-2 coexistence the leg exercises (spec-5.3 §3.2/§3.5).  SHARE here would
+# make the *initial* lock conflict with the remote RowExclusive and block before
+# the upgrade is ever attempted.
+$hn0->query_safe('LOCK TABLE t IN SHARE UPDATE EXCLUSIVE MODE');
 bg_start_blocking($hn0, 'LOCK TABLE t IN ACCESS EXCLUSIVE MODE');
 # It must NOT complete while node1's native RowExclusive is held.
 ok(!wait_for_query_done($pair->node0, '%ACCESS EXCLUSIVE%', 4),

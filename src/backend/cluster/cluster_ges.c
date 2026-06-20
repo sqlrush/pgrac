@@ -95,7 +95,7 @@ ges_request_uses_dedup(uint32 opcode)
 
 static void
 ges_record_dedup_reply(uint32 source_node_id, uint32 opcode, uint64 request_id,
-					   uint64 cluster_epoch, uint64 shard_master_generation,
+					   uint64 cluster_epoch, uint64 shard_master_generation, uint32 holder_procno,
 					   const GesReplyPayload *reply)
 {
 	ClusterGesDedupKey key;
@@ -109,6 +109,7 @@ ges_record_dedup_reply(uint32 source_node_id, uint32 opcode, uint64 request_id,
 	key.request_id = request_id;
 	key.cluster_epoch = cluster_epoch;
 	key.shard_master_generation = shard_master_generation;
+	key.holder_procno = holder_procno; /* spec-5.3 — per-request identity */
 	cluster_ges_dedup_record_reply(&key, (const uint8 *)reply, sizeof(*reply));
 }
 
@@ -120,7 +121,7 @@ ges_record_dedup_reply_for_request(uint32 source_node_id, const GesRequestPayloa
 		return;
 	ges_record_dedup_reply(source_node_id, req->opcode, ges_request_holder_request_id(req),
 						   ges_request_holder_epoch(req), ges_request_shard_master_generation(req),
-						   reply);
+						   req->holder_procno, reply);
 }
 
 /* ============================================================
@@ -536,6 +537,7 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 		dkey.request_id = holder_request_id;
 		dkey.cluster_epoch = holder_epoch;
 		dkey.shard_master_generation = ges_request_shard_master_generation(req);
+		dkey.holder_procno = req->holder_procno; /* spec-5.3 — per-request identity */
 
 		dstatus = cluster_ges_dedup_lookup_or_register(&dkey, dreply_buf, sizeof(dreply_buf),
 													   &dreply_len);
@@ -760,7 +762,8 @@ ges_dispatch_grant_identity(const ClusterGrdGrantIdentity *g, const ClusterResId
 
 		ges_send_grant_reply(g->source_node_id, &g->holder, resid, g->request_opcode, &reply);
 		ges_record_dedup_reply((uint32)g->source_node_id, g->request_opcode, g->holder.request_id,
-							   g->holder.cluster_epoch, g->shard_master_generation, &reply);
+							   g->holder.cluster_epoch, g->shard_master_generation,
+							   g->holder.procno, &reply);
 	}
 }
 
@@ -791,7 +794,8 @@ ges_dispatch_reject(int32 source_node_id, const ClusterGrdHolderId *holder,
 		reject.holder_request_id_hi = (uint32)(holder->request_id >> 32);
 		memcpy(reject.resid, resid, sizeof(reject.resid));
 		ges_record_dedup_reply((uint32)source_node_id, reply_for_opcode, holder->request_id,
-							   holder->cluster_epoch, shard_master_generation, &reject);
+							   holder->cluster_epoch, shard_master_generation, holder->procno,
+							   &reject);
 		cluster_grd_outbound_enqueue_lmon_reply((uint32)source_node_id, &reject, sizeof(reject));
 	}
 }
@@ -977,9 +981,10 @@ cluster_ges_lmon_drain_work_queue(void)
 			 */
 			if (item.source_node_id != (uint32)cluster_node_id
 				&& cluster_lms_native_probe_required(&resid, requested_mode)) {
-				if (!cluster_lms_native_probe_schedule_grant(
-						&resid, requested_mode, &holder, (int32)item.source_node_id, req->opcode,
-						generation, convert_old_mode))
+				bool sched = cluster_lms_native_probe_schedule_grant(
+					&resid, requested_mode, &holder, (int32)item.source_node_id, req->opcode,
+					generation, convert_old_mode);
+				if (!sched)
 					ges_dispatch_reject((int32)item.source_node_id, &holder, &resid, req->opcode,
 										GES_REJECT_REASON_WORK_QUEUE_FULL, generation);
 				/* else: GRANT/REJECT sent later by the LMS resolve path. */
@@ -1214,15 +1219,131 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 	master = cluster_grd_lookup_master(resid);
 
 	/*
-	 * Local-master fast path:  no cross-node IPC needed.  The LMS local
-	 * handle path runs entirely in-process (Step 4 D6 真激活 conflict
-	 * matrix + waiter queue).  Skeleton phase returns immediate grant so
-	 * the spec-2.21 caller can continue into the PG-native lock path.
+	 * spec-5.3 (L11) — local-master REQUEST cluster-holder gate + 完成等待.
+	 *
+	 *	The spec-2.21 MVP returned an immediate grant when this node masters the
+	 *	resource, skipping the GRD conflict decision entirely.  That fail-OPENs
+	 *	whenever the master node itself requests a lock that conflicts with a
+	 *	remote holder (e.g. node1 masters t and node0 holds SUEX while node1 asks
+	 *	for AccessExclusive):  the request "granted" with no GRD check, then S5
+	 *	revalidate saw the remote holder and errored (FAIL_INTERNAL) instead of
+	 *	blocking.  Mirror the remote-master drain:  run the authoritative
+	 *	enqueue_or_grant under the entry lock, and on conflict ENQUEUE a waiter
+	 *	and block until the release drain grants it (the same waiter -> holder +
+	 *	local-wake path the remote master already uses).  The holder is
+	 *	registered here (enqueue_or_grant / drain), so S5 promote auto-detects the
+	 *	already-registered holder and 8.A-verifies it instead of double-
+	 *	registering via reservation_promote.
 	 */
 	if (master < 0 || master == cluster_node_id) {
-		if (cluster_ges_state != NULL)
-			pg_atomic_fetch_add_u64(&cluster_ges_state->request_defer_count, 1);
-		return 0; /* GES_REJECT_NONE = grant OK (local-master MVP) */
+		ClusterGrdConflictHolder conflict_holders[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+		int n_conflict = 0;
+		ClusterGrdGrantAction action;
+		volatile bool timed_out = false; /* set in PG_TRY, read after — must be volatile */
+
+		master_gen = cluster_lms_get_shard_master_generation();
+		action = cluster_grd_entry_enqueue_or_grant(resid, holder, cluster_node_id, request_id,
+													master_gen, send_opcode, (int)lockmode,
+													conflict_holders, &n_conflict);
+
+		if (action == CLUSTER_GRD_GRANT_NOW) {
+			if (cluster_ges_state != NULL)
+				pg_atomic_fetch_add_u64(&cluster_ges_state->request_defer_count, 1);
+			return GES_REJECT_REASON_NONE; /* holder registered; S5 verify-only */
+		}
+		if (action != CLUSTER_GRD_ENQUEUED_WAITER) {
+			/* WAIT_QUEUE_FULL / NOT_READY / ILLEGAL — fail closed, never grant. */
+			return GES_REJECT_REASON_WORK_QUEUE_FULL;
+		}
+
+		/*
+		 * Conflict — a local waiter is queued.  Register a local reply-wait
+		 * entry (keyed so the release drain's local-wake finds it), advisory-
+		 * BAST the conflicting holders, then block until node0's release drain
+		 * grants this waiter and wakes us.  On timeout: fail closed, but cancel
+		 * the still-queued waiter first so a later drain cannot grant it to a
+		 * vanished requester (and accept a grant that raced the timeout).
+		 */
+		perpetual = (timeout_ms == -1) || (timeout_ms == 0 && cluster_ges_request_timeout_ms == -1);
+		if (perpetual)
+			deadline = 0;
+		else {
+			effective_timeout_ms = timeout_ms > 0 ? timeout_ms : cluster_ges_request_timeout_ms;
+			deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), effective_timeout_ms);
+		}
+
+		memset(&key, 0, sizeof(key));
+		key.request_id = request_id;
+		key.source_node_id = (uint32)cluster_node_id;
+		key.dest_node_id = (uint32)cluster_node_id; /* local master */
+		key.request_opcode = send_opcode;
+		key.cluster_epoch = holder->cluster_epoch;
+
+		entry = cluster_ges_reply_wait_insert(&key, deadline);
+		if (entry == NULL) {
+			(void)cluster_grd_cancel_waiter_by_id(resid, holder);
+			return GES_REJECT_REASON_TIMEOUT; /* fail closed */
+		}
+
+		if (n_conflict > 0)
+			cluster_ges_send_bast_targeted(resid, (int)lockmode, conflict_holders, n_conflict);
+
+		ConditionVariablePrepareToSleep(&entry->cv);
+		PG_TRY();
+		{
+			while (!entry->ready) {
+				int sleep_ms = 1000;
+
+				if (!perpetual) {
+					TimestampTz now = GetCurrentTimestamp();
+					long remaining_ms;
+
+					if (now >= deadline) {
+						timed_out = true;
+						break;
+					}
+					remaining_ms = (long)((deadline - now) / 1000);
+					if (remaining_ms <= 0)
+						remaining_ms = 1;
+					if (remaining_ms < sleep_ms)
+						sleep_ms = (int)remaining_ms;
+				}
+
+				(void)ConditionVariableTimedSleep(&entry->cv, sleep_ms,
+												  WAIT_EVENT_CLUSTER_GES_REPLY_WAIT);
+				CHECK_FOR_INTERRUPTS();
+			}
+		}
+		PG_CATCH();
+		{
+			/* Query cancel / SIGTERM longjmp'd out of the sleep:  drop the
+			 * still-queued waiter + reply-wait entry so a later release drain
+			 * cannot grant the lock to this now-departing requester (phantom
+			 * strong-mode holder). */
+			ConditionVariableCancelSleep();
+			cluster_ges_reply_wait_delete(&key);
+			(void)cluster_grd_cancel_waiter_by_id(resid, holder);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		ConditionVariableCancelSleep();
+
+		if (timed_out) {
+			cluster_ges_reply_wait_delete(&key);
+			/* Race: the drain may have granted between the deadline check and
+			 * here.  cancel_waiter removes a still-queued waiter (OK -> timeout)
+			 * or reports NOT_FOUND (already granted -> accept the grant). */
+			if (cluster_grd_cancel_waiter_by_id(resid, holder) == CLUSTER_GRD_ENTRY_OK)
+				return GES_REJECT_REASON_TIMEOUT; /* fail closed */
+			return GES_REJECT_REASON_NONE;		  /* grant won the race */
+		}
+
+		reject_reason = entry->reject_reason;
+		cluster_ges_reply_wait_delete(&key);
+		/* GRANT (reject_reason == NONE) -> holder registered by the drain; S5
+		 * verify-only.  A non-NONE reject means the drain consumed the waiter
+		 * with a rejection — fail closed with that reason. */
+		return reject_reason;
 	}
 
 	/*
@@ -1991,12 +2112,13 @@ cluster_ges_handle_native_lock_probe_request(const ClusterICEnvelope *env,
 	 * spec-2.25 Step 6 D5 — peer-side probe execution.
 	 *
 	 *	1. Deserialize LOCKTAG from wire bytes.
-	 *	2. Build remote requester identity for HC32a exclude_holder —
-	 *	   the requester lives on env->source_node_id (the LMS sender).
-	 *	   On this node, the requester's PGPROC is not present (different
-	 *	   node);  exclude_holder.node_id matches will therefore never
-	 *	   trigger local PGPROC skip — correct behavior (peer has no
-	 *	   PGPROC of the origin requester).
+	 *	2. Build the ORIGINAL requester identity for HC32a exclude_holder from
+	 *	   the probe payload (spec-5.3 fix).  The requester is NOT necessarily on
+	 *	   env->source_node_id (that is the LMS master/sender);  when the
+	 *	   requester is a NON-master peer, THIS node may host it, so the
+	 *	   exclude must use the requester's real (node_id, procno) to skip its
+	 *	   own holder — otherwise the requester self-conflicts (fatal to a
+	 *	   convert whose old lock conflicts with the upgrade).
 	 *	3. Run cluster_native_lock_probe_local under partition lock (HC30
 	 *	   子条 5 handled by D8 helper internally).
 	 *	4. Emit reply via cluster_grd_outbound_enqueue_lms_native_probe
@@ -2005,12 +2127,10 @@ cluster_ges_handle_native_lock_probe_request(const ClusterICEnvelope *env,
 	memcpy(&probe_tag, probe->locktag_bytes, sizeof(LOCKTAG));
 
 	memset(&remote_requester, 0, sizeof(remote_requester));
-	remote_requester.node_id = env->source_node_id;
-	/* procno / epoch / request_id of remote requester are not authoritative
-	 * here — peer node only uses node_id field of exclude_holder to skip
-	 * PGPROC at same-node + matching procno (impossible here because the
-	 * remote requester is not on this node).  Filling them with 0 keeps
-	 * the exclude_holder non-NULL contract (HC32a). */
+	remote_requester.node_id = probe->requester_node_id;
+	remote_requester.procno = probe->requester_procno;
+	/* epoch / request_id are not used by the local-scan self-exclusion (it
+	 * matches (node_id, procno) only — see cluster_native_lock_probe_pg_state). */
 
 	status
 		= cluster_native_lock_probe_local(&probe_tag, (LOCKMODE)probe->lockmode, &remote_requester);

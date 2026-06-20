@@ -567,10 +567,19 @@ typedef struct GesNativeLockProbePayload {
 	uint32 lockmode;		 /* [4,8)   PG LOCKMODE (1..8) */
 	uint8 locktag_bytes[16]; /* [8,24)  LOCKTAG byte-image (16B serialized) */
 	uint64 probe_id;		 /* [24,32) monotonic per-shard collector slot id */
+	/* spec-5.3 — the ORIGINAL requester's (node_id, procno).  The peer scan
+	 * must skip the requester's own holder (HC32a self-exclusion); without
+	 * this the peer fell back to env->source_node_id (the LMS master, NOT the
+	 * requester), so a requester on a NON-master peer could not exclude its own
+	 * lock and self-conflicted — invisible to REQUEST (a fresh requester holds
+	 * no conflicting lock; Share+Share is compatible) but fatal to CONVERT
+	 * (the requester holds a weaker lock that conflicts with the upgrade). */
+	uint32 requester_node_id; /* [32,36) original requester node */
+	uint32 requester_procno;  /* [36,40) original requester PGPROC index */
 } GesNativeLockProbePayload;
 
-StaticAssertDecl(sizeof(GesNativeLockProbePayload) == 32,
-				 "GesNativeLockProbePayload wire ABI 32-byte lock");
+StaticAssertDecl(sizeof(GesNativeLockProbePayload) == 40,
+				 "GesNativeLockProbePayload wire ABI 40-byte lock (spec-5.3: +requester id)");
 
 typedef struct GesNativeLockProbeReplyPayload {
 	uint32 opcode;		   /* = GES_REQ_OPCODE_NATIVE_LOCK_PROBE_REPLY (10) */

@@ -674,8 +674,22 @@ cluster_grd_release_holder_by_id(const struct ClusterResId *r pg_attribute_unuse
 	return CLUSTER_GRD_ENTRY_OK;
 }
 
+ClusterGrdEntryResult
+cluster_grd_cancel_waiter_by_id(const struct ClusterResId *r pg_attribute_unused(),
+								const struct ClusterGrdHolderId *h pg_attribute_unused())
+{
+	return CLUSTER_GRD_ENTRY_NOT_FOUND;
+}
+
 /* GUC + PG runtime stubs. */
 int cluster_ges_request_timeout_ms = 60000;
+
+/* CHECK_FOR_INTERRUPTS() in the local-master wait loop. */
+volatile sig_atomic_t InterruptPending = false;
+
+void
+ProcessInterrupts(void)
+{}
 
 bool
 DoLockModesConflict(int a pg_attribute_unused(), int b pg_attribute_unused())
@@ -971,8 +985,10 @@ UT_TEST(test_ges_native_lock_probe_opcode_enum_extension)
 	/* spec-2.25 D6:  opcode 9 + 10 ABI lock. */
 	UT_ASSERT_EQ((int)GES_REQ_OPCODE_NATIVE_LOCK_PROBE, 9);
 	UT_ASSERT_EQ((int)GES_REQ_OPCODE_NATIVE_LOCK_PROBE_REPLY, 10);
-	/* Payload size lock — wire ABI 32B. */
-	UT_ASSERT_EQ((int)sizeof(GesNativeLockProbePayload), 32);
+	/* Payload size lock.  spec-5.3 grew the probe REQUEST to 40B (+requester
+	 * node/procno identity, so the peer can exclude the original requester's own
+	 * sub-SUEX holds from the conflict scan);  the REPLY stays 32B. */
+	UT_ASSERT_EQ((int)sizeof(GesNativeLockProbePayload), 40);
 	UT_ASSERT_EQ((int)sizeof(GesNativeLockProbeReplyPayload), 32);
 }
 
