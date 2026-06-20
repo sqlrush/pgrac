@@ -691,6 +691,18 @@ void
 ProcessInterrupts(void)
 {}
 
+/* PG_TRY/PG_CATCH machinery referenced by the local-master conflict wait loop.
+ * The wait path is never exercised by these tests (no cross-node enqueue), so
+ * these only need to satisfy the standalone link. */
+sigjmp_buf *PG_exception_stack = NULL;
+ErrorContextCallback *error_context_stack = NULL;
+
+void
+pg_re_throw(void)
+{
+	abort();
+}
+
 bool
 DoLockModesConflict(int a pg_attribute_unused(), int b pg_attribute_unused())
 {
