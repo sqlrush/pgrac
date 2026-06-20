@@ -283,5 +283,37 @@ is($rc10, 0, 'L10 a converted lock is released cleanly (no leaked holder blocks 
 	or diag("L10 rc=$rc10 err=$err10");
 
 
+# ----------
+# L11 (review P0-2): a multi-level convert chain across nested subxacts must
+# unwind correctly.  node0: SUEX -> (sp1) SRE -> (sp2) AE; roll back sp2 then
+# sp1 -> node0 still holds SUEX.  The master must still show that hold: a peer
+# ACCESS EXCLUSIVE must BLOCK (if the chain backout wrongly deleted the master
+# slot while the weak SUEX hold survives, the peer would acquire immediately =
+# false-grant).
+# ----------
+my $hc = $pair->node0->background_psql('postgres', on_error_die => 1);
+$hc->query_safe('BEGIN');
+$hc->query_safe('LOCK TABLE t IN SHARE UPDATE EXCLUSIVE MODE');    # SUEX (parent)
+$hc->query_safe('SAVEPOINT sp1');
+$hc->query_safe('LOCK TABLE t IN SHARE ROW EXCLUSIVE MODE');       # convert SUEX -> SRE
+$hc->query_safe('SAVEPOINT sp2');
+$hc->query_safe('LOCK TABLE t IN ACCESS EXCLUSIVE MODE');          # convert SRE -> AE
+$hc->query_safe('ROLLBACK TO SAVEPOINT sp2');                      # back out AE -> SRE
+$hc->query_safe('ROLLBACK TO SAVEPOINT sp1');                      # back out SRE -> SUEX (node0 holds SUEX)
+
+my $hp = $pair->node1->background_psql('postgres', on_error_die => 1);
+$hp->query_safe('BEGIN');
+bg_start_blocking($hp, 'LOCK TABLE t IN ACCESS EXCLUSIVE MODE');
+ok(!wait_for_query_done($pair->node1, '%ACCESS EXCLUSIVE%', 5),
+	'L11 multi-level convert backout keeps the weak hold (peer AE blocks, no false-grant)');
+
+$hc->query_safe('ROLLBACK');    # node0 releases SUEX
+ok(wait_for_query_done($pair->node1, '%ACCESS EXCLUSIVE%', 25),
+	'L11 peer AE acquires after node0 releases the surviving weak hold');
+$hp->query_safe('COMMIT');
+$hp->quit;
+$hc->quit;
+
+
 $pair->stop_pair;
 done_testing();

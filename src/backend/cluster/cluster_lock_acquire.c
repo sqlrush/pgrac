@@ -778,6 +778,10 @@ cluster_lock_decide_op(const ClusterLockAcquireRequest *req, LOCKMODE *current_m
 	/* spec-5.3 Q1=B escape hatch — additive keeps the current REQUEST model. */
 	if (cluster_tm_convert_mode != CLUSTER_TM_CONVERT_MODE_CONVERT)
 		return CLUSTER_LOCK_OP_REQUEST;
+	/* Fast out (review P3-2): no cluster-registered locks held -> no weaker
+	 * hold to convert, so skip the LocalLockHash scan on the acquire hot path. */
+	if (MyProc == NULL || pg_atomic_read_u32(&MyProc->cluster_grd_registered_count) == 0)
+		return CLUSTER_LOCK_OP_REQUEST;
 
 	locallocks = GetLockMethodLocalHash();
 	if (locallocks == NULL)

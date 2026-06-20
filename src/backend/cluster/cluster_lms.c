@@ -1183,10 +1183,15 @@ post_lock:
 		 * no reply now, the requester keeps waiting and the release drain
 		 * grants it.
 		 */
+		/* P2-1: reconstruct the FULL shard_master_generation (epoch high half
+		 * + lo) so an ENQUEUED-then-drained convert records its dedup reply
+		 * under the same generation the requester retransmits with. */
+		uint64 gen = ((slot->requester.cluster_epoch & 0xffffffffu) << 32)
+					 | (uint64)slot->shard_master_generation_lo;
 		ClusterGrdConvertResult cr = cluster_grd_convert_grant_by_backend(
 			&slot->resid, (int32)slot->requester.node_id, slot->requester.procno,
 			slot->requester.cluster_epoch, slot->lockmode, slot->requester.request_id,
-			slot->grant_source_node_id, (uint64)slot->shard_master_generation_lo);
+			slot->grant_source_node_id, gen);
 
 		if (cr == CLUSTER_GRD_CONVERT_GRANTED_INPLACE)
 			native_probe_send_grant_reply(slot);

@@ -2078,6 +2078,52 @@ UT_TEST(test_convert_5_3_u18_master_wrappers)
 	convert_teardown();
 }
 
+/* U23 (review P0-1) — CONVERT_ROLLBACK must CANCEL a still-QUEUED convert, so a
+ * later release drain cannot resurrect it and grant a phantom strong mode to a
+ * requester that has already timed out / gone away (8.A false-grant + leak). */
+UT_TEST(test_convert_5_3_u23_rollback_cancels_queued_convert)
+{
+	ClusterGrdEntry *e;
+	ClusterGrdConvert req;
+	ClusterGrdHolderId rel;
+	ClusterGrdGrantIdentity granted[PGRAC_GRD_MAX_CONVERTS_PUBLIC + 1];
+	ClusterResId resid;
+	bool drain = false;
+	int n;
+	LOCKMODE m = NoLock;
+
+	convert_reset();
+	convert_resid(5307, &resid);
+	e = convert_make_entry(5307);
+	convert_grant(e, 1, 100, 11, ShareLock); /* converting holder */
+	convert_grant(e, 2, 200, 22, ShareLock); /* conflicting peer */
+
+	/* node1's upgrade conflicts with node2 -> ENQUEUED (still queued). */
+	req = convert_req(1, 100, ShareLock, AccessExclusiveLock, 77);
+	UT_ASSERT_EQ((int)cluster_grd_entry_request_convert(e, &req, &drain),
+				 (int)CLUSTER_GRD_CONVERT_ENQUEUED);
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 1);
+
+	/* requester times out -> rollback must DEQUEUE the pending convert. */
+	UT_ASSERT_EQ((int)cluster_grd_entry_rollback_convert(e, 1, 100, AccessExclusiveLock, ShareLock,
+														 11),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 0);
+
+	/* the peer now releases -> the drain must NOT resurrect the cancelled
+	 * convert (no phantom AccessExclusive holder). */
+	memset(&rel, 0, sizeof(rel));
+	rel.node_id = 2;
+	rel.procno = 200;
+	rel.cluster_epoch = 0;
+	rel.request_id = 22;
+	n = cluster_grd_release_and_drain(&resid, &rel, granted, lengthof(granted));
+	UT_ASSERT_EQ(n, 0); /* nothing granted */
+	UT_ASSERT(cluster_grd_entry_holder_mode(e, 1, 100, &m));
+	UT_ASSERT_EQ((int)m, (int)ShareLock); /* converter still at the weak mode */
+	convert_teardown();
+}
+
 
 /* ============================================================
  * spec-5.1c — BAST rewrite + self-conflict exclusion.
@@ -2384,6 +2430,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_convert_5_3_u15_release_and_drain_grants_convert);
 	UT_RUN(test_convert_5_3_u22_rollback_restores_mode_and_id);
 	UT_RUN(test_convert_5_3_u18_master_wrappers);
+	UT_RUN(test_convert_5_3_u23_rollback_cancels_queued_convert);
 
 	/* spec-5.1c — BAST rewrite + LIVE self-conflict exclusion. */
 	UT_RUN(test_5_1c_u9a_self_conflict_excluded);

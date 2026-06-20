@@ -3184,10 +3184,22 @@ cluster_grd_release_and_drain(const ClusterResId *resid, const ClusterGrdHolderI
  *	This is the STRICT INVERSE of the convert grant, NOT a release: a plain
  *	cluster_grd_entry_release_holder would DELETE the holder, leaving the
  *	master with no record of the still-held weaker lock (a false-grant for the
- *	next requester).  Locates the upgraded slot by (node_id, procno,
- *	upgraded_mode) and restores both its mode and request_id.  Returns OK if
- *	the slot was found and restored, NOT_FOUND otherwise (idempotent on a
- *	retransmitted / already-rolled-back rollback).
+ *	next requester).
+ *
+ *	The backout must handle BOTH stages of a convert (review P0-1):
+ *	  (1) the convert is still QUEUED (ENQUEUED behind a conflicting holder and
+ *	      not yet granted) -- the requester timed out before it was granted.  A
+ *	      pending entry sits in entry->converts[] (a backend has at most one
+ *	      pending convert per resource, so it is located by (node,procno)).  It
+ *	      MUST be removed, else a later release drain would grant it to a
+ *	      requester that is gone -> phantom strong-mode holder.
+ *	  (2) the convert was already GRANTED in place -- the upgraded holder slot
+ *	      (located by (node,procno,upgraded_mode)) is restored to (old_mode,
+ *	      old_request_id).
+ *
+ *	Returns OK if a pending convert was dequeued OR an upgraded slot was
+ *	restored;  NOT_FOUND otherwise (idempotent on a retransmit / already-rolled-
+ *	back rollback).
  */
 ClusterGrdEntryResult
 cluster_grd_entry_rollback_convert(ClusterGrdEntry *entry, int32 node_id, uint32 procno,
@@ -3197,6 +3209,15 @@ cluster_grd_entry_rollback_convert(ClusterGrdEntry *entry, int32 node_id, uint32
 
 	Assert(entry != NULL);
 
+	/* (1) Cancel a still-queued convert from this backend (P0-1). */
+	for (int c = 0; c < entry->nconverts; c++) {
+		if (entry->converts[c].node_id == node_id && entry->converts[c].procno == procno) {
+			grd_convert_remove(entry, c);
+			return CLUSTER_GRD_ENTRY_OK;
+		}
+	}
+
+	/* (2) Restore an already-granted in-place upgrade. */
 	hslot = grd_find_holder_slot(entry, node_id, procno, upgraded_mode);
 	if (hslot < 0)
 		return CLUSTER_GRD_ENTRY_NOT_FOUND;

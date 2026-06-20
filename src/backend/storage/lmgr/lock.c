@@ -2206,13 +2206,15 @@ LockRelease(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 	 * PGRAC: cluster release hook — exactly-once exit per HC9.
 	 *
 	 * nLocks just went from 1 -> 0 in this backend.  If the LOCALLOCK was
-	 * cluster_registered, dispatch S6 release + wait-edge cancel stub via
-	 * cluster_lock_release().  We clear cluster_registered before the call
-	 * is impossible since LOCALLOCK is about to be discarded after PG-
-	 * native release; the false-positive guard is the cluster_registered
-	 * flag itself (set only by S5 promote success).
+	 * cluster_registered, either back out a convert (spec-5.3 §3.1a T4 — a
+	 * converted hold released while its pre-convert weaker hold survives) or
+	 * dispatch the S6 release.  cluster_registered (and the spec-5.3 convert
+	 * markers) are cleared at the end of this block, after the decision; the
+	 * flag is set only by S5 promote success, so it is a sound exactly-once
+	 * guard.
 	 *
-	 * Spec: spec-2.21-pg-lockacquire-integration-2node-smoke.md (D2)
+	 * Spec: spec-2.21-pg-lockacquire-integration-2node-smoke.md (D2),
+	 *       spec-5.3-tm-table-lock-cross-node.md (§3.1a T4)
 	 */
 	if (locallock->cluster_registered) {
 		bool did_backout = false;
@@ -2246,12 +2248,21 @@ LockRelease(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 												  (uint32)locallock->cluster_convert_old_mode, &rb,
 												  locallock->cluster_convert_old_request_id);
 				/* Re-register L_old as the sole cluster owner (net-zero count:
-				 * L_new -1 + L_old +1, so no decrement below). */
+				 * L_new -1 + L_old +1, so no decrement below).
+				 *
+				 * PGRAC: spec-5.3 P0-2 — DO NOT clear L_old's OWN convert
+				 * markers.  In a multi-level convert chain (e.g. RE -> SRE ->
+				 * AE in nested subxacts) L_old (the SRE hold) may itself be a
+				 * convert from a still-weaker hold (RE);  its
+				 * cluster_convert_old_* fields carry that next-level-down link
+				 * and were never cleared on its de-registration.  Preserving
+				 * them lets a subsequent backout of L_old unwind one more level
+				 * (restore RE) instead of plain-deleting the master slot while
+				 * the weaker hold survives (a false-grant).  For a single-level
+				 * convert L_old's markers are already 0, so this is a no-op. */
 				lold->cluster_registered = true;
 				lold->cluster_request_id = locallock->cluster_convert_old_request_id;
 				memcpy(lold->cluster_holder_raw, &rb, sizeof(lold->cluster_holder_raw));
-				lold->cluster_convert_old_request_id = 0;
-				lold->cluster_convert_old_mode = 0;
 				did_backout = true;
 			}
 		}
