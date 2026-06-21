@@ -44,8 +44,7 @@ struct LOCALLOCK;
  * shmem region so any backend on the node can read them via pg_cluster_state
  * (cross-cluster aggregation is a forward enhancement, Q8).
  */
-typedef enum ClusterAdvisoryCounter
-{
+typedef enum ClusterAdvisoryCounter {
 	CLUSTER_ADVISORY_GLOBALIZE = 0,		  /* 0->1 edge entered the cluster path */
 	CLUSTER_ADVISORY_SESSION_RELEASE = 1, /* session-scoped holder drained */
 	CLUSTER_ADVISORY_TRY_GRANT = 2,		  /* NOWAIT request granted by master (S4;

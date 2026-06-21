@@ -2317,22 +2317,24 @@ UT_TEST(test_ul_grant_conditional_no_waiter_enqueued)
 	/* node2 try-locks ExclusiveLock (conflict) → CONFLICT_NOWAIT, entry untouched. */
 	h = bast_holder(2, 200, 2);
 	n_conflict = -1;
-	UT_ASSERT_EQ((int)cluster_grd_entry_grant_conditional(&resid, &h, 2, 2, 0, UT_GES_OPCODE_REQUEST,
-														  ExclusiveLock, conflicts, &n_conflict),
+	UT_ASSERT_EQ((int)cluster_grd_entry_grant_conditional(&resid, &h, 2, 2, 0,
+														  UT_GES_OPCODE_REQUEST, ExclusiveLock,
+														  conflicts, &n_conflict),
 				 (int)CLUSTER_GRD_CONFLICT_NOWAIT);
 	UT_ASSERT_EQ(cluster_grd_entry_ngranted(e), 1); /* node2 NOT added as a holder */
 
 	/* Release node1: zero compatible waiters pop (grant_conditional enqueued none). */
 	h = bast_holder(1, 100, 1);
 	popped = cluster_grd_entry_release_and_pop_compatible_waiter(&resid, &h, granted,
-																PGRAC_GRD_MAX_HOLDERS_PUBLIC);
+																 PGRAC_GRD_MAX_HOLDERS_PUBLIC);
 	UT_ASSERT_EQ(popped, 0);
 
 	/* node2 free now: conditional grant succeeds. */
 	h = bast_holder(2, 200, 3);
 	n_conflict = -1;
-	UT_ASSERT_EQ((int)cluster_grd_entry_grant_conditional(&resid, &h, 2, 3, 0, UT_GES_OPCODE_REQUEST,
-														  ExclusiveLock, conflicts, &n_conflict),
+	UT_ASSERT_EQ((int)cluster_grd_entry_grant_conditional(&resid, &h, 2, 3, 0,
+														  UT_GES_OPCODE_REQUEST, ExclusiveLock,
+														  conflicts, &n_conflict),
 				 (int)CLUSTER_GRD_GRANT_NOW);
 
 	cluster_node_id = saved;
@@ -2387,20 +2389,21 @@ UT_TEST(test_ul_advisory_mode_matrix_conditional)
 
 	/* node1 ShareLock → grant. */
 	h = bast_holder(1, 100, 1);
-	UT_ASSERT_EQ((int)cluster_grd_entry_grant_conditional(&resid, &h, 1, 1, 0, UT_GES_OPCODE_REQUEST,
-														  ShareLock, conflicts, &n_conflict),
+	UT_ASSERT_EQ((int)cluster_grd_entry_grant_conditional(
+					 &resid, &h, 1, 1, 0, UT_GES_OPCODE_REQUEST, ShareLock, conflicts, &n_conflict),
 				 (int)CLUSTER_GRD_GRANT_NOW);
 
 	/* node2 ShareLock — S/S compatible → conditional grant. */
 	h = bast_holder(2, 200, 2);
-	UT_ASSERT_EQ((int)cluster_grd_entry_grant_conditional(&resid, &h, 2, 2, 0, UT_GES_OPCODE_REQUEST,
-														  ShareLock, conflicts, &n_conflict),
+	UT_ASSERT_EQ((int)cluster_grd_entry_grant_conditional(
+					 &resid, &h, 2, 2, 0, UT_GES_OPCODE_REQUEST, ShareLock, conflicts, &n_conflict),
 				 (int)CLUSTER_GRD_GRANT_NOW);
 
 	/* node3 ExclusiveLock — S/X conflict → CONFLICT_NOWAIT (no waiter). */
 	h = bast_holder(3, 300, 3);
-	UT_ASSERT_EQ((int)cluster_grd_entry_grant_conditional(&resid, &h, 3, 3, 0, UT_GES_OPCODE_REQUEST,
-														  ExclusiveLock, conflicts, &n_conflict),
+	UT_ASSERT_EQ((int)cluster_grd_entry_grant_conditional(&resid, &h, 3, 3, 0,
+														  UT_GES_OPCODE_REQUEST, ExclusiveLock,
+														  conflicts, &n_conflict),
 				 (int)CLUSTER_GRD_CONFLICT_NOWAIT);
 
 	cluster_node_id = saved;

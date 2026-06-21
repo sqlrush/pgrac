@@ -13,7 +13,7 @@
  *
  *	  Links cluster_advisory.o; ShmemInitStruct + region register stubbed
  *	  (L105 union force-align).  Release-path / backend-exit drain behaviour
- *	  is exercised end-to-end by cluster_tap t/130_ul_advisory.pl.
+ *	  is exercised end-to-end by cluster_tap t/286_ul_advisory.pl.
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
@@ -68,15 +68,13 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 void *
 ShmemInitStruct(const char *name, Size size, bool *foundPtr)
 {
-	static union
-	{
+	static union {
 		uint64 force_align;
 		char data[256]; /* cluster_advisory_shmem_size() << 256B */
 	} adv_buf;
 	static bool adv_initialized = false;
 
-	if (name != NULL && strcmp(name, "pgrac cluster advisory") == 0)
-	{
+	if (name != NULL && strcmp(name, "pgrac cluster advisory") == 0) {
 		Assert(size <= sizeof(adv_buf.data)); /* catch shmem layout growth */
 		*foundPtr = adv_initialized;
 		adv_initialized = true;

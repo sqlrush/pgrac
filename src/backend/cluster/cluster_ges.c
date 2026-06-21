@@ -483,7 +483,7 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 		return;
 	}
 	case GES_REQ_OPCODE_REQUEST:
-	case GES_REQ_OPCODE_REQUEST_NOWAIT:	  /* spec-5.5 D5 — same work_queue path, conditional grant */
+	case GES_REQ_OPCODE_REQUEST_NOWAIT: /* spec-5.5 D5 — same work_queue path, conditional grant */
 	case GES_REQ_OPCODE_CONVERT:
 	case GES_REQ_OPCODE_RELEASE:
 	case GES_REQ_OPCODE_REDECLARE:		  /* spec-4.6 D3 — same work_queue path */
@@ -896,13 +896,13 @@ cluster_ges_lmon_drain_work_queue(void)
 
 			action = conditional
 						 ? cluster_grd_entry_grant_conditional(
-							 &resid, &holder, (int32)item.source_node_id, holder_request_id,
-							 ges_request_shard_master_generation(req), req->opcode,
-							 (int)req->lockmode, conflict_holders, &n_conflict)
+							   &resid, &holder, (int32)item.source_node_id, holder_request_id,
+							   ges_request_shard_master_generation(req), req->opcode,
+							   (int)req->lockmode, conflict_holders, &n_conflict)
 						 : cluster_grd_entry_enqueue_or_grant(
-							 &resid, &holder, (int32)item.source_node_id, holder_request_id,
-							 ges_request_shard_master_generation(req), req->opcode,
-							 (int)req->lockmode, conflict_holders, &n_conflict);
+							   &resid, &holder, (int32)item.source_node_id, holder_request_id,
+							   ges_request_shard_master_generation(req), req->opcode,
+							   (int)req->lockmode, conflict_holders, &n_conflict);
 
 			if (action == CLUSTER_GRD_GRANT_NOW) {
 				if (cluster_lms_native_probe_required(&resid, (LOCKMODE)req->lockmode)) {
@@ -1290,15 +1290,14 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 
 		master_gen = cluster_lms_get_shard_master_generation();
 		/* spec-5.5 D5 — local-master try-lock: conditional grant, never enqueue. */
-		action = conditional
-					 ? cluster_grd_entry_grant_conditional(resid, holder, cluster_node_id,
-														   request_id, master_gen, send_opcode,
-														   (int)lockmode, conflict_holders,
-														   &n_conflict)
-					 : cluster_grd_entry_enqueue_or_grant(resid, holder, cluster_node_id,
-														  request_id, master_gen, send_opcode,
-														  (int)lockmode, conflict_holders,
-														  &n_conflict);
+		action
+			= conditional
+				  ? cluster_grd_entry_grant_conditional(resid, holder, cluster_node_id, request_id,
+														master_gen, send_opcode, (int)lockmode,
+														conflict_holders, &n_conflict)
+				  : cluster_grd_entry_enqueue_or_grant(resid, holder, cluster_node_id, request_id,
+													   master_gen, send_opcode, (int)lockmode,
+													   conflict_holders, &n_conflict);
 
 		if (action == CLUSTER_GRD_GRANT_NOW) {
 			if (cluster_ges_state != NULL)

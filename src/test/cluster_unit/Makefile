@@ -682,7 +682,7 @@ test_cluster_lock_acquire: test_cluster_lock_acquire.c unit_test.h \
 # cluster_advisory.c references ShmemInitStruct + cluster_shmem_register_region
 # + pg_atomic_* ; the test stubs the shmem allocator (L105 union force-align)
 # and exercises the session-scope predicate + observability counters.  Release-
-# path / backend-exit drain behaviour is covered by cluster_tap t/130.
+# path / backend-exit drain behaviour is covered by cluster_tap t/286.
 CLUSTER_ADVISORY_O = $(top_builddir)/src/backend/cluster/cluster_advisory.o
 test_cluster_advisory: test_cluster_advisory.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_ADVISORY_O)

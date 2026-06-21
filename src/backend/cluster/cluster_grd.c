@@ -2342,10 +2342,10 @@ cluster_grd_entry_promote_waiter(ClusterGrdEntry *entry, const ClusterGrdHolderI
  * of an enqueued waiter.
  */
 static ClusterGrdGrantAction
-cluster_grd_entry_enqueue_or_grant_impl(const ClusterResId *resid,
-										const ClusterGrdHolderId *holder, int32 source_node_id,
-										uint64 request_id, uint64 shard_master_generation,
-										uint32 request_opcode, int lockmode,
+cluster_grd_entry_enqueue_or_grant_impl(const ClusterResId *resid, const ClusterGrdHolderId *holder,
+										int32 source_node_id, uint64 request_id,
+										uint64 shard_master_generation, uint32 request_opcode,
+										int lockmode,
 										ClusterGrdConflictHolder *conflict_holders_out,
 										int *n_conflict_out, bool conditional)
 {

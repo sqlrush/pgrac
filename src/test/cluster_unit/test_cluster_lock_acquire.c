@@ -390,12 +390,10 @@ cluster_ges_send_request_and_wait(const struct ClusterResId *resid pg_attribute_
 /* spec-5.5 D5 — NOWAIT send stub:  shares stub_ges_reject_reason so a test can
  * drive GRANT (NONE) / conflict (LOCK_CONFLICT) / unreachable (TIMEOUT). */
 uint32
-cluster_ges_send_request_nowait_and_wait(const struct ClusterResId *resid pg_attribute_unused(),
-										 uint32 lockmode pg_attribute_unused(),
-										 const struct ClusterGrdHolderId *holder
-											 pg_attribute_unused(),
-										 uint64 request_id pg_attribute_unused(),
-										 int timeout_ms pg_attribute_unused())
+cluster_ges_send_request_nowait_and_wait(
+	const struct ClusterResId *resid pg_attribute_unused(), uint32 lockmode pg_attribute_unused(),
+	const struct ClusterGrdHolderId *holder pg_attribute_unused(),
+	uint64 request_id pg_attribute_unused(), int timeout_ms pg_attribute_unused())
 {
 	return stub_ges_reject_reason;
 }
@@ -728,8 +726,8 @@ UT_TEST(test_ul_session_advisory_globalize_gate)
 	bool saved = cluster_advisory_lock_enabled;
 
 	memset(&adv, 0, sizeof(adv));
-	adv.locktag_field1 = 12345;				/* db oid */
-	adv.locktag_field2 = 42;				/* advisory key */
+	adv.locktag_field1 = 12345; /* db oid */
+	adv.locktag_field2 = 42;	/* advisory key */
 	adv.locktag_type = LOCKTAG_ADVISORY;
 	adv.locktag_lockmethodid = USER_LOCKMETHOD;
 
@@ -771,7 +769,7 @@ UT_TEST(test_ul_session_advisory_globalize_gate)
  *	on a BLOCKING request is a protocol violation -> FAIL_INTERNAL (never
  *	NOT_AVAIL).  The master-side "no waiter enqueued" half (T5) is covered by
  *	test_cluster_grd (real grant_conditional); retransmit idempotency (T6) by
- *	the e2e t/130.
+ *	the e2e t/286.
  * ============================================================ */
 UT_TEST(test_ul_try_lock_nowait_s4_reject_mapping)
 {

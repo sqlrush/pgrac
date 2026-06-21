@@ -38,8 +38,7 @@
  * spec-5.5 D8 — UL observability counters live in a dedicated lock-free shmem
  * region (mirror the cluster_ges defer-counter region: atomics only, no LWLock).
  */
-typedef struct ClusterAdvisorySharedState
-{
+typedef struct ClusterAdvisorySharedState {
 	pg_atomic_uint64 counters[CLUSTER_ADVISORY_COUNTER_COUNT];
 } ClusterAdvisorySharedState;
 
@@ -66,8 +65,7 @@ cluster_advisory_locallock_is_session_scoped(const LOCALLOCK *locallock)
 	if (locallock == NULL)
 		return false;
 
-	for (i = 0; i < locallock->numLockOwners; i++)
-	{
+	for (i = 0; i < locallock->numLockOwners; i++) {
 		if (locallock->lockOwners[i].owner == NULL)
 			return true;
 	}
@@ -92,8 +90,7 @@ cluster_advisory_shmem_init(void)
 
 	cluster_advisory_state
 		= ShmemInitStruct("pgrac cluster advisory", cluster_advisory_shmem_size(), &found);
-	if (!found)
-	{
+	if (!found) {
 		int i;
 
 		for (i = 0; i < CLUSTER_ADVISORY_COUNTER_COUNT; i++)
