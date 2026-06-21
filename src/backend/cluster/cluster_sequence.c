@@ -5,9 +5,9 @@
  *
  *	  See cluster_sequence.h for the layering rationale.  This file holds
  *	  ONLY the pure layer (no elog/shmem/lock; standalone-linkable); the
- *	  shmem instance cache, the GES(X) refill protocol, and the authority
- *	  with WAL-before-grant + boundary writeback live in cluster_sequence_*
- *	  backend files.
+ *	  shmem instance cache + node-local refill lock live in
+ *	  cluster_sequence_shmem.c, and the refill orchestration + shared-page
+ *	  advance live in commands/sequence.c (spec-5.4 v2.0 Q2-B, option B).
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group

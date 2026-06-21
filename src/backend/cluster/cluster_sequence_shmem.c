@@ -4,10 +4,11 @@
  *	  SQ sequence lock: per-node instance cache shmem region + counters.
  *
  *	  Holds the node-level instance cache (an HTAB keyed by ClusterResId,
- *	  guarded by a single LWLock) and the six SQ observability counters.
- *	  The pure allocation math lives in cluster_sequence.c; the GES(X)
- *	  refill protocol and the authority live in cluster_sequence_refill.c /
- *	  cluster_sequence_authority.c.
+ *	  guarded by a single LWLock + a refill CV) and the six SQ observability
+ *	  counters.  The pure allocation math lives in cluster_sequence.c; the
+ *	  node-local refill orchestration + the shared-page advance live in
+ *	  commands/sequence.c (spec-5.4 v2.0 Q2-B, option B: the shared sequence
+ *	  page is the cross-node boundary; no cross-node GES SQ enqueue).
  *
  *	  Lock granularity: a single region LWLock guards the whole instance
  *	  cache.  The cache is only touched on a per-backend-cache miss (once
@@ -34,8 +35,10 @@
 #include "cluster/cluster_sequence.h"
 #include "cluster/cluster_shmem.h"
 #include "miscadmin.h"
+#include "storage/condition_variable.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
+#include "utils/wait_event.h"
 
 /*
  * Maximum number of distinct sequences cached on one node.  Fixed for now
@@ -48,7 +51,8 @@
  * ClusterSeqShared -- the SQ region header: one LWLock + six counters.
  */
 typedef struct ClusterSeqShared {
-	LWLock lwlock; /* guards the instance cache HTAB */
+	LWLock lwlock;				 /* guards the instance cache HTAB */
+	ConditionVariable refill_cv; /* node-local refill serialisation (D3) */
 	pg_atomic_uint64 refill_count;
 	pg_atomic_uint64 refill_wait_count;
 	pg_atomic_uint64 dup_guard_fail_count;
@@ -95,6 +99,7 @@ cluster_sequence_shmem_init(void)
 
 	if (!IsUnderPostmaster) {
 		LWLockInitialize(&sq_state->lwlock, LWTRANCHE_CLUSTER_SQ);
+		ConditionVariableInit(&sq_state->refill_cv);
 		pg_atomic_init_u64(&sq_state->refill_count, 0);
 		pg_atomic_init_u64(&sq_state->refill_wait_count, 0);
 		pg_atomic_init_u64(&sq_state->dup_guard_fail_count, 0);
@@ -128,7 +133,7 @@ cluster_sequence_shmem_register(void)
  *	Returns true and stores the served value in *out_value when this node's
  *	instance cache for `resid` still holds an unconsumed value.  Returns
  *	false when the entry is absent or exhausted, in which case the caller
- *	must run the SQ(X) refill protocol.
+ *	must run the node-local refill protocol (begin_refill below).
  */
 bool
 cluster_sq_instance_cache_serve(const ClusterResId *resid, int64 *out_value)
@@ -145,7 +150,7 @@ cluster_sq_instance_cache_serve(const ClusterResId *resid, int64 *out_value)
 	LWLockAcquire(&sq_state->lwlock, LW_EXCLUSIVE);
 
 	entry = (ClusterSeqInstanceCache *)hash_search(sq_cache_htab, resid, HASH_FIND, NULL);
-	if (entry != NULL
+	if (entry != NULL && entry->has_segment
 		&& cluster_sq_cache_has_value(entry->local_next, entry->local_end, entry->increment)) {
 		*out_value = entry->local_next;
 		entry->local_next += entry->increment;
@@ -159,9 +164,9 @@ cluster_sq_instance_cache_serve(const ClusterResId *resid, int64 *out_value)
 /*
  * cluster_sq_instance_cache_fill -- install a granted segment.
  *
- *	Called after the refill protocol obtains [seg_start, seg_end] from the
- *	authority.  Replaces any existing segment for `resid` (the prior one is
- *	by contract fully consumed before a refill is triggered).
+ *	Called after the refill protocol advances the shared page and obtains
+ *	[seg_start, seg_end].  Replaces any existing segment for `resid` (the
+ *	prior one is by contract fully consumed before a refill is triggered).
  */
 void
 cluster_sq_instance_cache_fill(const ClusterResId *resid, uint32 generation, int64 increment,
@@ -191,6 +196,7 @@ cluster_sq_instance_cache_fill(const ClusterResId *resid, uint32 generation, int
 	entry->local_next = seg_start;
 	entry->local_end = seg_end;
 	entry->refill_in_progress = false;
+	entry->has_segment = true;
 
 	LWLockRelease(&sq_state->lwlock);
 }
@@ -198,8 +204,10 @@ cluster_sq_instance_cache_fill(const ClusterResId *resid, uint32 generation, int
 /*
  * cluster_sq_instance_cache_invalidate -- drop the cached segment.
  *
- *	Used by setval / ALTER SEQUENCE strong invalidation so a subsequent
- *	nextval refills from the authority rather than serving a stale value.
+ *	Used by setval / ALTER SEQUENCE invalidation so a subsequent nextval
+ *	refills from the (now updated) shared page rather than serving a stale
+ *	value.  This node's cache only; other nodes drain on their next refill
+ *	(spec §v2.0.5; full cross-node strong invalidation is forward).
  */
 void
 cluster_sq_instance_cache_invalidate(const ClusterResId *resid)
@@ -212,6 +220,133 @@ cluster_sq_instance_cache_invalidate(const ClusterResId *resid)
 	LWLockAcquire(&sq_state->lwlock, LW_EXCLUSIVE);
 	hash_search(sq_cache_htab, resid, HASH_REMOVE, NULL);
 	LWLockRelease(&sq_state->lwlock);
+}
+
+
+/* ============================================================
+ * D3 (v2.0 option B) node-local refill lock.
+ *
+ *	The instance-cache LWLock is a short-held spin guard: it must NOT be held
+ *	across the page advance (read_seq_tuple does buffer I/O, page X / CF round
+ *	trips, CHECK_FOR_INTERRUPTS).  So begin_refill claims under the lock by
+ *	flagging refill_in_progress, the caller runs the page advance lock-free,
+ *	and finish/abort re-take the lock to publish/clear.  refill_in_progress
+ *	serialises the node (one page advance per sequence at a time -> no
+ *	thundering-herd segment waste); the shared page X serialises cross-node.
+ * ============================================================ */
+
+ClusterSqRefillClaim
+cluster_sq_instance_cache_begin_refill(const ClusterResId *resid, uint32 generation,
+									   int64 increment, int64 *out_value)
+{
+	ClusterSeqInstanceCache *entry;
+	ClusterSqRefillClaim claim;
+	bool found;
+
+	Assert(resid != NULL);
+	Assert(out_value != NULL);
+	Assert(increment != 0);
+
+	if (sq_cache_htab == NULL)
+		return CLUSTER_SQ_REFILL_CLAIMED; /* shmem absent: caller serves directly */
+
+	LWLockAcquire(&sq_state->lwlock, LW_EXCLUSIVE);
+
+	entry = (ClusterSeqInstanceCache *)hash_search(sq_cache_htab, resid, HASH_FIND, NULL);
+	if (entry != NULL && entry->has_segment
+		&& cluster_sq_cache_has_value(entry->local_next, entry->local_end, entry->increment)) {
+		/* Live value available -> slice and return (no page touch). */
+		*out_value = entry->local_next;
+		entry->local_next += entry->increment;
+		claim = CLUSTER_SQ_REFILL_SERVED;
+	} else if (entry != NULL && entry->refill_in_progress) {
+		/* Another backend on this node is already advancing the page. */
+		claim = CLUSTER_SQ_REFILL_WAIT;
+	} else {
+		/*
+		 * Win the refill race: create (or reuse) the entry as a bare claim
+		 * (has_segment = false so no stale value is ever served while the
+		 * page advance is in flight) and flag refill_in_progress.  A cache
+		 * full HTAB degrades to "serve directly from the granted segment"
+		 * (entry == NULL) -- never to an incorrect value.
+		 */
+		entry
+			= (ClusterSeqInstanceCache *)hash_search(sq_cache_htab, resid, HASH_ENTER_NULL, &found);
+		if (entry == NULL) {
+			claim = CLUSTER_SQ_REFILL_CLAIMED; /* degraded: no node-level cache */
+		} else {
+			entry->generation = generation;
+			entry->increment = increment;
+			entry->local_next = 0;
+			entry->local_end = 0;
+			entry->has_segment = false;
+			entry->refill_in_progress = true;
+			claim = CLUSTER_SQ_REFILL_CLAIMED;
+		}
+	}
+
+	LWLockRelease(&sq_state->lwlock);
+	return claim;
+}
+
+void
+cluster_sq_instance_cache_finish_refill(const ClusterResId *resid, uint32 generation,
+										int64 increment, int64 seg_start, int64 seg_end)
+{
+	Assert(resid != NULL);
+
+	/* fill() installs the segment + clears refill_in_progress under the lock. */
+	cluster_sq_instance_cache_fill(resid, generation, increment, seg_start, seg_end);
+	cluster_sq_bump_refill();
+
+	/* Wake any backend waiting for this node's refill to complete. */
+	if (sq_state != NULL)
+		ConditionVariableBroadcast(&sq_state->refill_cv);
+}
+
+void
+cluster_sq_instance_cache_abort_refill(const ClusterResId *resid)
+{
+	Assert(resid != NULL);
+
+	if (sq_cache_htab != NULL) {
+		ClusterSeqInstanceCache *entry;
+
+		LWLockAcquire(&sq_state->lwlock, LW_EXCLUSIVE);
+		entry = (ClusterSeqInstanceCache *)hash_search(sq_cache_htab, resid, HASH_FIND, NULL);
+		if (entry != NULL)
+			entry->refill_in_progress = false;
+		LWLockRelease(&sq_state->lwlock);
+	}
+
+	/* Let a waiter retry the refill (this backend's page advance failed). */
+	if (sq_state != NULL)
+		ConditionVariableBroadcast(&sq_state->refill_cv);
+}
+
+/* ---- refill-wait CV (region-wide; ClusterSqRefillWait) --------------- */
+
+void
+cluster_sq_refill_prepare_wait(void)
+{
+	if (sq_state != NULL)
+		ConditionVariablePrepareToSleep(&sq_state->refill_cv);
+}
+
+void
+cluster_sq_refill_sleep(long timeout_ms)
+{
+	if (sq_state == NULL)
+		return;
+	cluster_sq_bump_refill_wait();
+	(void)ConditionVariableTimedSleep(&sq_state->refill_cv, timeout_ms,
+									  WAIT_EVENT_CLUSTER_SQ_REFILL_WAIT);
+}
+
+void
+cluster_sq_refill_cancel_wait(void)
+{
+	ConditionVariableCancelSleep();
 }
 
 

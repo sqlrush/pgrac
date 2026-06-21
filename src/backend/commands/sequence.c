@@ -42,8 +42,12 @@
 #include "storage/proc.h"
 #include "storage/smgr.h"
 #ifdef USE_PGRAC_CLUSTER
-#include "cluster/cluster_pcm_lock.h"  /* spec-5.2a D5 — clean-page X-transfer arm */
-#include "cluster/cluster_gcs_block.h" /* spec-5.2a D4 — backend eager flush */
+#include "cluster/cluster_pcm_lock.h"		 /* spec-5.2a D5 — clean-page X-transfer arm */
+#include "cluster/cluster_gcs_block.h"		 /* spec-5.2a D4 — backend eager flush */
+#include "cluster/cluster_guc.h"			 /* spec-5.4 — cluster.sequence_* GUCs */
+#include "cluster/cluster_sequence.h"		 /* spec-5.4 — SQ instance cache + refill */
+#include "cluster/storage/cluster_smgr.h"	 /* spec-5.4 — shared-storage activation gate */
+#include "utils/timestamp.h"				 /* spec-5.4 — refill-wait deadline */
 #endif
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -134,6 +138,234 @@ cluster_seq_flush_if_shared(Relation rel, Buffer buf)
 	{
 		cluster_bufmgr_flush_seq_page_to_storage(buf);
 	}
+}
+
+/*
+ * PGRAC: spec-5.4 (v2.0 Q2-B, option B) — cluster sequence disposition.
+ *
+ *	CLSQ_NATIVE       not a cluster-managed sequence (single node / no peers /
+ *	                  cluster off / a system or temp sequence) -> the PG-native
+ *	                  nextval path is correct and unchanged.
+ *	CLSQ_MANAGED      a user sequence on cluster shared storage in an active
+ *	                  multi-node cluster -> the shared page is the single
+ *	                  cross-node allocation boundary; *resid is filled.
+ *	CLSQ_UNSUPPORTED  a user sequence in an active multi-node cluster that is
+ *	                  NOT on shared storage -> cross-node uniqueness cannot be
+ *	                  guaranteed.  nextval fails closed (Rule 8.A); setval /
+ *	                  ALTER treat it like CLSQ_NATIVE (nothing is cached).
+ */
+typedef enum ClusterSqDisposition
+{
+	CLSQ_NATIVE,
+	CLSQ_MANAGED,
+	CLSQ_UNSUPPORTED,
+} ClusterSqDisposition;
+
+static ClusterSqDisposition
+cluster_sq_classify(Relation seqrel, ClusterResId *resid)
+{
+	/* Single node / no peers / cluster disabled -> PG-native (no cross-node). */
+	if (!cluster_pcm_is_active())
+		return CLSQ_NATIVE;
+
+	/* System catalog or temp sequence -> not cross-node shared -> PG-native. */
+	if (seqrel->rd_locator.relNumber < FirstNormalObjectId
+		|| RelationUsesLocalBuffers(seqrel))
+		return CLSQ_NATIVE;
+
+	/* User sequence in an active multi-node cluster: it must live on shared
+	 * storage so the single sequence page is the cross-node boundary. */
+	if (cluster_smgr_which_for(seqrel->rd_locator, InvalidBackendId) != 1)
+		return CLSQ_UNSUPPORTED;
+
+	if (resid != NULL)
+		cluster_sq_resid_encode(MyDatabaseId, RelationGetRelid(seqrel),
+								(uint32) seqrel->rd_locator.relNumber, resid);
+	return CLSQ_MANAGED;
+}
+
+/*
+ * PGRAC: spec-5.4 D3 — advance the shared sequence page by one batch.
+ *
+ *	Mirrors nextval_internal's WAL/page write but allocates a whole [start,
+ *	end] segment via the direction-aware authority math (cluster_sq_alloc_
+ *	segment) and always WAL-logs (so the page LSN advances into THIS node's
+ *	stream, making the eager flush satisfiable for a foreign-LSN page that a
+ *	peer's clean X-transfer installed — spec-5.2a).  read_seq_tuple takes the
+ *	page X (PCM/CF) which serialises the boundary advance cross-node, and arms
+ *	the clean-page X-transfer.  On EXHAUSTED the caller's nextval reports the
+ *	PG-native "reached maximum/minimum value" error.
+ */
+static void
+cluster_sq_refill_page(Relation seqrel, int64 incby, int64 minv, int64 maxv,
+					   int64 cache, int64 *out_start, int64 *out_end)
+{
+	Buffer		buf;
+	HeapTupleData seqtuple;
+	Form_pg_sequence_data seq;
+	Page		page;
+	int64		gstart,
+				gend,
+				gcount,
+				new_boundary;
+	ClusterSqAllocStatus st;
+
+	seq = read_seq_tuple(seqrel, &buf, &seqtuple);
+	page = BufferGetPage(buf);
+
+	st = cluster_sq_alloc_segment(seq->last_value, seq->is_called, incby, minv, maxv,
+								  cache, &gstart, &gend, &gcount, &new_boundary);
+	if (st == CLUSTER_SQ_ALLOC_EXHAUSTED)
+	{
+		UnlockReleaseBuffer(buf);
+		if (incby > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_SEQUENCE_GENERATOR_LIMIT_EXCEEDED),
+					 errmsg("nextval: reached maximum value of sequence \"%s\" (%lld)",
+							RelationGetRelationName(seqrel), (long long) maxv)));
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_SEQUENCE_GENERATOR_LIMIT_EXCEEDED),
+					 errmsg("nextval: reached minimum value of sequence \"%s\" (%lld)",
+							RelationGetRelationName(seqrel), (long long) minv)));
+	}
+
+	/* Acquire an xid outside the critical section so commit triggers a WAL
+	 * flush + syncrep wait (mirror nextval_internal). */
+	if (RelationNeedsWAL(seqrel))
+		GetTopTransactionId();
+
+	START_CRIT_SECTION();
+	MarkBufferDirty(buf);
+
+	if (RelationNeedsWAL(seqrel))
+	{
+		xl_seq_rec	xlrec;
+		XLogRecPtr	recptr;
+
+		XLogBeginInsert();
+		XLogRegisterBuffer(0, buf, REGBUF_WILL_INIT);
+
+		/* The whole granted segment is durable: WAL the boundary with
+		 * log_cnt = 0 so redo restores last_value = new_boundary and a
+		 * crash before consuming the segment is a gap, never a reissue. */
+		seq->last_value = new_boundary;
+		seq->is_called = true;
+		seq->log_cnt = 0;
+
+		xlrec.locator = seqrel->rd_locator;
+		XLogRegisterData((char *) &xlrec, sizeof(xl_seq_rec));
+		XLogRegisterData((char *) seqtuple.t_data, seqtuple.t_len);
+
+		recptr = XLogInsert(RM_SEQ_ID, XLOG_SEQ_LOG);
+		PageSetLSN(page, recptr);
+	}
+
+	seq->last_value = new_boundary;
+	seq->is_called = true;
+	seq->log_cnt = 0;
+
+	END_CRIT_SECTION();
+
+	/* WAL-before-grant + storage-current for the cross-node transfer. */
+	cluster_seq_flush_if_shared(seqrel, buf);
+	cluster_sq_bump_page_writeback(); /* boundary made durable + storage-visible */
+
+	UnlockReleaseBuffer(buf);
+
+	*out_start = gstart;
+	*out_end = gend;
+}
+
+/*
+ * PGRAC: spec-5.4 D3 — cluster nextval (a value from the node instance cache).
+ *
+ *	Three-tier: the per-backend SeqTableData fast-path (caller, unchanged) ->
+ *	the node instance cache (here) -> the shared sequence page.  begin_refill
+ *	atomically serves, claims a refill, or reports a peer refill; only the
+ *	claimant runs the (lock-free) page advance.  A bounded wait fails closed on
+ *	a stuck peer (Rule 8.A: error, never a possibly-duplicate value).
+ */
+static int64
+cluster_sq_nextval(Relation seqrel, const ClusterResId *resid,
+				   int64 incby, int64 minv, int64 maxv, int64 cache)
+{
+	int64		v = 0;
+	int64		gstart = 0,
+				gend = 0;
+	uint32		gen = resid->field3;
+	TimestampTz deadline;
+
+	if (cache < 1)
+		cache = 1;
+
+	deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+										   cluster_sequence_refill_timeout_ms);
+
+	cluster_sq_refill_prepare_wait();
+	for (;;)
+	{
+		ClusterSqRefillClaim claim;
+
+		claim = cluster_sq_instance_cache_begin_refill(resid, gen, incby, &v);
+		if (claim == CLUSTER_SQ_REFILL_SERVED)
+		{
+			cluster_sq_refill_cancel_wait();
+			return v;
+		}
+		if (claim == CLUSTER_SQ_REFILL_CLAIMED)
+			break;
+
+		/* CLUSTER_SQ_REFILL_WAIT: a peer is refilling this sequence. */
+		if (GetCurrentTimestamp() >= deadline)
+		{
+			cluster_sq_refill_cancel_wait();
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_GES_TIMEOUT),
+					 errmsg("timed out waiting for cluster sequence \"%s\" refill",
+							RelationGetRelationName(seqrel)),
+					 errhint("A peer backend's refill exceeded cluster.sequence_refill_timeout_ms.")));
+		}
+		cluster_sq_refill_sleep(100);
+	}
+	cluster_sq_refill_cancel_wait();
+
+	/* This backend won the refill: advance the shared page, then publish. */
+	PG_TRY();
+	{
+		cluster_sq_refill_page(seqrel, incby, minv, maxv, cache, &gstart, &gend);
+	}
+	PG_CATCH();
+	{
+		cluster_sq_instance_cache_abort_refill(resid);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	cluster_sq_instance_cache_finish_refill(resid, gen, incby, gstart, gend);
+
+	/* Serve the first value of the freshly granted segment (a racing peer may
+	 * have taken it already -> serve returns the next; if the cache is full and
+	 * dropped the segment, serve directly from the grant). */
+	if (!cluster_sq_instance_cache_serve(resid, &v))
+		v = gstart;
+	return v;
+}
+
+/*
+ * PGRAC: spec-5.4 D6 — strong-invalidate this node's instance cache for a
+ *	managed sequence after setval / ALTER changed the shared page.  Other nodes'
+ *	caches drain naturally (their next refill reads the new boundary); they only
+ *	ever emit values already durably granted to them, so this is 8.A-safe.  The
+ *	full cross-node strong broadcast is a forward (spec §v2.0.5).
+ */
+static void
+cluster_sq_invalidate_if_managed(Relation seqrel)
+{
+	ClusterResId resid;
+
+	if (cluster_sq_classify(seqrel, &resid) == CLSQ_MANAGED)
+		cluster_sq_instance_cache_invalidate(&resid);
 }
 #endif
 
@@ -639,6 +871,10 @@ AlterSequence(ParseState *pstate, AlterSeqStmt *stmt)
 
 	ObjectAddressSet(address, RelationRelationId, relid);
 
+#ifdef USE_PGRAC_CLUSTER
+	cluster_sq_invalidate_if_managed(seqrel); /* spec-5.4 D6 */
+#endif
+
 	table_close(rel, RowExclusiveLock);
 	relation_close(seqrel, NoLock);
 
@@ -793,6 +1029,64 @@ nextval_internal(Oid relid, bool check_permissions)
 	cache = pgsform->seqcache;
 	cycle = pgsform->seqcycle;
 	ReleaseSysCache(pgstuple);
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: spec-5.4 D5 — cluster sequence hook.  For a user sequence on
+	 * cluster shared storage the value comes from the per-node instance cache
+	 * (refilled from the shared page, the single cross-node boundary), not the
+	 * per-backend page refill below.  The :776 fast-path stays unchanged; a
+	 * cluster sequence simply keeps last == cached so it always re-enters here.
+	 * A non-shared user sequence in a multi-node cluster fails closed (8.A);
+	 * single-node / system / temp sequences fall through to PG-native.
+	 */
+	{
+		ClusterResId sq_resid;
+		ClusterSqDisposition sq_disp = cluster_sq_classify(seqrel, &sq_resid);
+
+		if (sq_disp == CLSQ_UNSUPPORTED)
+		{
+			cluster_sq_bump_dup_guard_fail();
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_SEQUENCE_ALLOC_UNAVAILABLE),
+					 errmsg("cannot guarantee cross-node uniqueness for sequence \"%s\" in cluster mode",
+							RelationGetRelationName(seqrel)),
+					 errdetail("The sequence is not on cluster shared storage."),
+					 errhint("Place user relations on cluster shared storage "
+							 "(cluster_smgr_user_relations) so the sequence page is the "
+							 "single cross-node allocation boundary.")));
+		}
+
+		if (sq_disp == CLSQ_MANAGED)
+		{
+			int64		sq_val;
+
+			/* Cluster CYCLE forward (spec §3.8 AL4): cross-node value reuse
+			 * conflicts with the uniqueness guarantee. */
+			if (cycle)
+			{
+				cluster_sq_bump_cycle_rejected();
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("CYCLE is not supported for cluster sequence \"%s\"",
+								RelationGetRelationName(seqrel)),
+						 errhint("Cross-node value reuse is not supported in this release; "
+								 "recreate the sequence with NO CYCLE.")));
+			}
+
+			sq_val = cluster_sq_nextval(seqrel, &sq_resid, incby, minv, maxv, cache);
+
+			elm->increment = incby;
+			elm->last = sq_val;
+			elm->cached = sq_val; /* keep last == cached: re-enter next time */
+			elm->last_valid = true;
+			last_used_seq = elm;
+
+			relation_close(seqrel, NoLock);
+			return sq_val;
+		}
+	}
+#endif
 
 	/* lock page' buffer and read tuple */
 	seq = read_seq_tuple(seqrel, &buf, &seqdatatuple);
@@ -1171,6 +1465,10 @@ do_setval(Oid relid, int64 next, bool iscalled)
 #endif
 
 	UnlockReleaseBuffer(buf);
+
+#ifdef USE_PGRAC_CLUSTER
+	cluster_sq_invalidate_if_managed(seqrel); /* spec-5.4 D6 */
+#endif
 
 	relation_close(seqrel, NoLock);
 }

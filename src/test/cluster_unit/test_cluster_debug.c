@@ -643,6 +643,39 @@ cluster_gcs_get_clean_page_xfer_third_party_denied_count(void)
 	return 0;
 }
 
+/* spec-5.4 D9 stubs: 6 SQ sequence counter accessors (cluster_sequence_shmem.o
+ * is not linked into this standalone unit). */
+uint64
+cluster_sq_refill_count(void)
+{
+	return 0;
+}
+uint64
+cluster_sq_refill_wait_count(void)
+{
+	return 0;
+}
+uint64
+cluster_sq_dup_guard_fail_count(void)
+{
+	return 0;
+}
+uint64
+cluster_sq_failover_fail_closed_count(void)
+{
+	return 0;
+}
+uint64
+cluster_sq_page_writeback_count(void)
+{
+	return 0;
+}
+uint64
+cluster_sq_cycle_rejected_count(void)
+{
+	return 0;
+}
+
 /* spec-4.7 D6 stubs: 8 NEW GCS/PCM warm-recovery counter accessors. */
 uint64
 cluster_gcs_get_recovery_block_resources_recovering(void)

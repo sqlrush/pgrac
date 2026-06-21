@@ -78,10 +78,11 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_scn.h"  /* cluster_scn_current (spec-1.15 D6) */
 #include "cluster/cluster_ges.h"  /* cluster_ges_{request,reply}_defer_count (spec-2.13 D4) */
 #include "cluster/cluster_ges_reply_wait.h" /* spec-2.23 D13 reply wait counters */
-#include "cluster/cluster_grd.h"	 /* cluster_grd_* observability accessors (spec-2.14 D6) */
-#include "cluster/cluster_lmd.h"	 /* cluster_lmd_* observability accessors (spec-2.19 D10) */
-#include "cluster/cluster_lms.h"	 /* cluster_lms_* observability accessors (spec-2.18 D10) */
-#include "cluster/cluster_tt_slot.h" /* spec-3.12 D5 retention counters */
+#include "cluster/cluster_grd.h"	  /* cluster_grd_* observability accessors (spec-2.14 D6) */
+#include "cluster/cluster_sequence.h" /* cluster_sq_* counters (spec-5.4 D9) */
+#include "cluster/cluster_lmd.h"	  /* cluster_lmd_* observability accessors (spec-2.19 D10) */
+#include "cluster/cluster_lms.h"	  /* cluster_lms_* observability accessors (spec-2.18 D10) */
+#include "cluster/cluster_tt_slot.h"  /* spec-3.12 D5 retention counters */
 #include "cluster/cluster_undo_record_api.h"  /* cluster_undo_* counter accessors (spec-3.7 D10) */
 #include "cluster/storage/cluster_undo_buf.h" /* spec-3.18 D7: undo buffer counters */
 #include "cluster/cluster_cr.h"				  /* cluster_cr_* counter accessors (spec-3.9 D8) */
@@ -1465,6 +1466,28 @@ dump_gcs(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_gcs_get_clean_page_xfer_stale_holder_recover_count()));
 	emit_row(rsinfo, "gcs", "clean_page_xfer_third_party_denied_count",
 			 fmt_int64((int64)cluster_gcs_get_clean_page_xfer_third_party_denied_count()));
+
+	/*
+	 * PGRAC: spec-5.4 D9 — 6 SQ sequence counter rows (v2.0 Q2-B option B).
+	 *	refill / refill_wait / cycle_rejected fire on the cluster nextval path;
+	 *	dup_guard_fail fires when the activation gate fails closed on a
+	 *	non-shared user sequence; page_writeback fires when a refill makes the
+	 *	shared-page boundary durable + storage-visible.  failover_fail_closed is
+	 *	RESERVED (Q2-B's shared page handles failover naturally; a Stage-6
+	 *	failover-continuity spec will consume it) — mirrors the spec-5.2a
+	 *	storage_fallback / stale_holder_recover reserved-counter precedent.
+	 */
+	emit_row(rsinfo, "sequence", "sq_refill_count", fmt_int64((int64)cluster_sq_refill_count()));
+	emit_row(rsinfo, "sequence", "sq_refill_wait_count",
+			 fmt_int64((int64)cluster_sq_refill_wait_count()));
+	emit_row(rsinfo, "sequence", "sq_dup_guard_fail_count",
+			 fmt_int64((int64)cluster_sq_dup_guard_fail_count()));
+	emit_row(rsinfo, "sequence", "sq_failover_fail_closed_count",
+			 fmt_int64((int64)cluster_sq_failover_fail_closed_count()));
+	emit_row(rsinfo, "sequence", "sq_page_writeback_count",
+			 fmt_int64((int64)cluster_sq_page_writeback_count()));
+	emit_row(rsinfo, "sequence", "sq_cycle_rejected_count",
+			 fmt_int64((int64)cluster_sq_cycle_rejected_count()));
 
 	/* PGRAC: spec-4.7 D6 — 8 NEW counter rows for GCS/PCM warm recovery. */
 	emit_row(rsinfo, "gcs_recovery", "block_resources_recovering",

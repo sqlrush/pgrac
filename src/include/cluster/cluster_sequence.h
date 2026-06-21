@@ -7,10 +7,13 @@
  *	  PostgreSQL sequences are 100% node-local (a single on-disk page per
  *	  sequence, a per-backend SeqTableData cache).  In a shared-storage
  *	  cluster that means two nodes can hand out the same nextval value.
- *	  The SQ ("sequence") enqueue serialises batch allocation against a
- *	  per-sequence authority so that each node only ever emits values from
- *	  a segment it has durably been granted.  SQ is a short-held X-only GES
- *	  enqueue (mutual exclusion), NOT a convert consumer.
+ *	  spec-5.4 v2.0 (Q2-B, option B): the single SHARED sequence page is the
+ *	  cross-node allocation boundary (kept coherent by the page X / PCM+CF and
+ *	  per-node WAL, spec-5.2 / 5.2a).  Each node adds a per-node instance cache
+ *	  refilled from that page under a node-local refill lock, so a backend only
+ *	  ever emits values from a segment durably advanced on the shared page.  The
+ *	  cross-node GES SQ enqueue (Oracle SQ) is a forward perf optimisation; this
+ *	  release serialises the node + shared page, NOT a cross-node enqueue.
  *
  *	  Two API layers:
  *	    - Pure layer (backend-pure: no elog/shmem/lock; standalone-linkable
@@ -18,10 +21,11 @@
  *	      cluster_sq_resid_encode, cluster_sq_alloc_segment,
  *	      cluster_sq_cache_has_value.  Out-of-range input asserts (debug)
  *	      and fails closed to the conservative answer; never ereports.
- *	    - Backend layer (#ifndef FRONTEND, in cluster_sequence_*.c): the
- *	      shmem instance cache, the GES(X) refill protocol, the authority
- *	      batch allocator with WAL-before-grant + boundary writeback, and
- *	      the fail-closed paths.  These may ereport.
+ *	    - Backend layer (#ifndef FRONTEND, in cluster_sequence_shmem.c): the
+ *	      shmem instance cache + node-local refill lock (begin/finish/abort +
+ *	      refill CV) and the six observability counters.  The refill
+ *	      orchestration + shared-page advance live in commands/sequence.c.
+ *	      These may ereport.
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
@@ -129,9 +133,13 @@ extern bool cluster_sq_cache_has_value(int64 local_next, int64 local_end, int64 
  * ClusterSeqInstanceCache -- per-sequence node-level (instance) cache entry.
  *
  *	Sits between the PG per-backend SeqTableData fast-path (unchanged) and
- *	the per-sequence allocation authority.  When a backend's own cache is
- *	exhausted it slices the next value from here under the SQ shmem lock;
- *	when this entry is empty it triggers an SQ(X) enqueue refill.
+ *	the shared sequence page (the cross-node durable allocation boundary).
+ *	When a backend's own cache is exhausted it slices the next value from
+ *	here under the SQ shmem lock; when this entry is empty exactly one
+ *	backend on the node refills it from the shared page (refill_in_progress
+ *	serialises the node; the shared page X / PCM+CF serialises cross-node).
+ *	spec-5.4 v2.0 (Q2-B, option B): node-local refill lock + shared page X,
+ *	no cross-node GES SQ(X) enqueue (forward; see spec §v2.0.1).
  *
  *	The HTAB is keyed by the full ClusterResId, which already embeds the
  *	generation (relfilenode) in field3 -- a DROP+CREATE therefore lands a
@@ -144,8 +152,24 @@ typedef struct ClusterSeqInstanceCache {
 	int64 local_next;		 /* next value this node may emit */
 	int64 local_end;		 /* segment end (inclusive; sign per increment) */
 	int64 increment;		 /* copy of seqincrement (sign = direction) */
-	bool refill_in_progress; /* a backend is refilling this entry */
+	bool refill_in_progress; /* a backend on this node is refilling */
+	bool has_segment;		 /* false = bare refill claim / no live segment */
 } ClusterSeqInstanceCache;
+
+/*
+ * ClusterSqRefillClaim -- outcome of cluster_sq_instance_cache_begin_refill.
+ *
+ *	SERVED   a value was sliced from a live segment (*out_value set); done.
+ *	CLAIMED  this backend won the refill race (refill_in_progress now set);
+ *	         it MUST run the page advance then finish_refill / abort_refill.
+ *	WAIT     another backend on this node is refilling the same sequence;
+ *	         the caller waits on the refill CV and retries.
+ */
+typedef enum ClusterSqRefillClaim {
+	CLUSTER_SQ_REFILL_SERVED = 0,
+	CLUSTER_SQ_REFILL_CLAIMED = 1,
+	CLUSTER_SQ_REFILL_WAIT = 2,
+} ClusterSqRefillClaim;
 
 /* D1 shmem region lifecycle (mirror cluster_ges_reply_wait_shmem_*). */
 extern Size cluster_sequence_shmem_size(void);
@@ -165,6 +189,33 @@ extern bool cluster_sq_instance_cache_serve(const ClusterResId *resid, int64 *ou
 extern void cluster_sq_instance_cache_fill(const ClusterResId *resid, uint32 generation,
 										   int64 increment, int64 seg_start, int64 seg_end);
 extern void cluster_sq_instance_cache_invalidate(const ClusterResId *resid);
+
+/*
+ * D3 (v2.0 option B) node-local refill lock.
+ *
+ *	begin_refill   atomically (under the SQ lock) serves a value, claims the
+ *	               refill, or reports another backend is refilling.
+ *	finish_refill  installs the freshly-advanced [seg_start, seg_end] segment,
+ *	               clears the in-progress flag, bumps refill_count, and wakes
+ *	               any waiter.
+ *	abort_refill   clears the in-progress flag + wakes waiters on an error
+ *	               path (page advance raised) so the next backend can retry.
+ *	The refill-wait CV helpers wrap the region-wide refill_cv with the
+ *	ClusterSqRefillWait wait event (caller owns the prepare / sleep / cancel
+ *	dance + its own deadline; see cluster_sq_refill_timeout for the bound).
+ */
+extern ClusterSqRefillClaim cluster_sq_instance_cache_begin_refill(const ClusterResId *resid,
+																   uint32 generation,
+																   int64 increment,
+																   int64 *out_value);
+extern void cluster_sq_instance_cache_finish_refill(const ClusterResId *resid, uint32 generation,
+													int64 increment, int64 seg_start,
+													int64 seg_end);
+extern void cluster_sq_instance_cache_abort_refill(const ClusterResId *resid);
+
+extern void cluster_sq_refill_prepare_wait(void);
+extern void cluster_sq_refill_sleep(long timeout_ms);
+extern void cluster_sq_refill_cancel_wait(void);
 
 /* D9 counter accessors (observability) + bumps (SQ-internal call sites). */
 extern uint64 cluster_sq_refill_count(void);
