@@ -460,7 +460,8 @@ cluster_gcs_send_transition_and_wait(BufferTag tag pg_attribute_unused(),
 bool
 cluster_gcs_send_block_request_and_wait(struct BufferDesc *buf pg_attribute_unused(),
 										PcmLockTransition trans pg_attribute_unused(),
-										int master_node pg_attribute_unused())
+										int master_node pg_attribute_unused(),
+										bool clean_eligible pg_attribute_unused())
 {
 	abort();
 }
@@ -479,7 +480,8 @@ cluster_gcs_local_master_read_image_and_wait(struct BufferDesc *buf pg_attribute
  * local-master X-transfer, so abort if reached. */
 bool
 cluster_gcs_local_master_x_transfer_and_wait(struct BufferDesc *buf pg_attribute_unused(),
-											 int32 holder_node pg_attribute_unused())
+											 int32 holder_node pg_attribute_unused(),
+											 bool clean_eligible pg_attribute_unused())
 {
 	abort();
 }
@@ -1243,10 +1245,40 @@ UT_TEST(test_pcm_d3_not_double_x)
 	}
 }
 
+/* spec-5.2a D2 (U1): clean-page X-transfer arm is one-shot.  arm(true) sets
+ * the backend-local flag; consume() reads-and-clears it (the acquire path
+ * calls consume() once so the eligibility can never leak into a SUBSEQUENT
+ * (heap) buffer access — inv ①/⑤, R3).  is_armed() is a non-destructive
+ * peek. */
+UT_TEST(test_clean_page_xfer_arm_is_one_shot)
+{
+	/* Default disarmed. */
+	cluster_pcm_clean_page_xfer_arm(false);
+	UT_ASSERT_EQ(cluster_pcm_clean_page_xfer_is_armed() ? 1 : 0, 0);
+	/* consume() on a disarmed flag returns false and stays disarmed. */
+	UT_ASSERT_EQ(cluster_pcm_clean_page_xfer_consume() ? 1 : 0, 0);
+
+	/* arm → peek true (non-destructive) → peek still true. */
+	cluster_pcm_clean_page_xfer_arm(true);
+	UT_ASSERT_EQ(cluster_pcm_clean_page_xfer_is_armed() ? 1 : 0, 1);
+	UT_ASSERT_EQ(cluster_pcm_clean_page_xfer_is_armed() ? 1 : 0, 1);
+
+	/* consume → returns true ONCE → flag now cleared (single-shot). */
+	UT_ASSERT_EQ(cluster_pcm_clean_page_xfer_consume() ? 1 : 0, 1);
+	UT_ASSERT_EQ(cluster_pcm_clean_page_xfer_is_armed() ? 1 : 0, 0);
+	/* A second consume sees no leak. */
+	UT_ASSERT_EQ(cluster_pcm_clean_page_xfer_consume() ? 1 : 0, 0);
+
+	/* Idempotent re-arm/disarm. */
+	cluster_pcm_clean_page_xfer_arm(true);
+	cluster_pcm_clean_page_xfer_arm(false);
+	UT_ASSERT_EQ(cluster_pcm_clean_page_xfer_is_armed() ? 1 : 0, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(38);
+	UT_PLAN(39);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
 	UT_RUN(test_pcm_lock_transition_enum_values_are_1_to_9);
@@ -1285,6 +1317,7 @@ main(void)
 	UT_RUN(test_pcm_d1_recovering_gate_fail_closed);
 	UT_RUN(test_pcm_d2_rebuild_from_redeclare);
 	UT_RUN(test_pcm_d3_not_double_x);
+	UT_RUN(test_clean_page_xfer_arm_is_one_shot);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

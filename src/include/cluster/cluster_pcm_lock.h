@@ -236,6 +236,23 @@ extern void cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode);
 extern bool cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode);
 
 /*
+ * PGRAC: spec-5.2a D2 — clean-page X-transfer arm (backend-local, one-shot).
+ *
+ *	cluster_pcm_clean_page_xfer_arm(true) marks the NEXT cluster PCM X acquire
+ *	(cluster_pcm_lock_acquire_buffer) as a clean-page transfer.  The acquire
+ *	path calls cluster_pcm_clean_page_xfer_consume() exactly once, which
+ *	read-and-clears the flag, so the eligibility can NEVER leak into a
+ *	subsequent (heap) buffer access (inv ①/⑤, R3).  The caller MUST have
+ *	proven the page is clean — no active ITL / MVCC state — before arming
+ *	(sequence refill knows this by relkind, spec-5.2a D5); the GCS holder
+ *	re-verifies independently (spec-5.2a D4).  is_armed() is a non-destructive
+ *	peek used by tests / assertions.
+ */
+extern void cluster_pcm_clean_page_xfer_arm(bool armed);
+extern bool cluster_pcm_clean_page_xfer_is_armed(void);
+extern bool cluster_pcm_clean_page_xfer_consume(void);
+
+/*
  * PGRAC: spec-2.35 D5 (HC111 + HC112) — bufmgr release hook bifurcation.
  *
  *	spec-2.31 D7 had a single cluster_pcm_lock_release_buffer() invoked

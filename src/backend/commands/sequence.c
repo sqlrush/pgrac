@@ -41,6 +41,10 @@
 #include "storage/lmgr.h"
 #include "storage/proc.h"
 #include "storage/smgr.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_pcm_lock.h"  /* spec-5.2a D5 — clean-page X-transfer arm */
+#include "cluster/cluster_gcs_block.h" /* spec-5.2a D4 — backend eager flush */
+#endif
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -110,6 +114,28 @@ static void init_params(ParseState *pstate, List *options, bool for_identity,
 						List **owned_by);
 static void do_setval(Oid relid, int64 next, bool iscalled);
 static void process_owned_by(Relation seqrel, List *owned_by, bool for_identity);
+
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * PGRAC: spec-5.2a D4 — flush a just-written cluster + shared-storage sequence
+ * page to shared storage from THIS backend (the caller still holds the X
+ * content lock on `buf`), so an eligible cross-node clean X-transfer in LMON
+ * only ever drops a storage-current page (the LMON drop path cannot FlushBuffer
+ * — its XLogFlush of a concurrently-inserted page fails).  Gated exactly on the
+ * cluster PCM-track condition so single-node / non-shared / non-cluster
+ * sequences keep PG-native behaviour.  Fails closed (ereport) on a write error
+ * via the underlying smgr path.
+ */
+static inline void
+cluster_seq_flush_if_shared(Relation rel, Buffer buf)
+{
+	if (cluster_pcm_is_active()
+		&& rel->rd_locator.relNumber >= FirstNormalObjectId)
+	{
+		cluster_bufmgr_flush_seq_page_to_storage(buf);
+	}
+}
+#endif
 
 
 /*
@@ -375,6 +401,72 @@ fill_seq_fork_with_data(Relation rel, HeapTuple tuple, ForkNumber forkNum)
 	sequence_magic *sm;
 	OffsetNumber offnum;
 
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: spec-5.2a D5a — shared-storage sequence DDL idempotency.
+	 *
+	 *	In a cluster with shared storage every node runs CREATE SEQUENCE on the
+	 *	same (deterministic) relfilenode, so a peer may have ALREADY initialized
+	 *	block 0 of this fork on the shared file.  PG-native ExtendBufferedRel
+	 *	would then append an ORPHAN block 1 (benign only because nextval always
+	 *	reads block 0; it trips the block-0 Assert on cassert).  Worse, blindly
+	 *	re-initializing the existing block 0 back to the START value would RESET
+	 *	a sequence a peer has already advanced -> duplicate numbers (Rule 8.A).
+	 *
+	 *	So this is "idempotent open-or-init", never blind re-init:
+	 *	  - fork empty                 -> fall through to the PG-native init.
+	 *	  - block 0 is a VALID seq page -> REUSE it untouched (the shared page is
+	 *	    the authoritative state; preserve any advanced last_value).
+	 *	  - block 0 exists but is NOT a valid seq page -> fail closed (never
+	 *	    overwrite, never extend a second block).
+	 *	This is a shared-storage DDL idempotency fix, NOT part of the CF
+	 *	ownership protocol.  Single-node / non-cluster / non-shared sequences
+	 *	fall through to the unchanged PG-native path below.  We take only a
+	 *	SHARE content lock (validation read; we never mutate the reused page) so
+	 *	CREATE does not force a writer-transfer.
+	 */
+	if (cluster_pcm_is_active()
+		&& rel->rd_rel->relkind == RELKIND_SEQUENCE
+		&& rel->rd_locator.relNumber >= FirstNormalObjectId
+		&& RelationGetNumberOfBlocksInFork(rel, forkNum) > 0)
+	{
+		bool		valid_seq_page = false;
+
+		buf = ReadBufferExtended(rel, forkNum, 0, RBM_NORMAL, NULL);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+
+		if (!PageIsNew(page)
+			&& PageGetSpecialSize(page) == MAXALIGN(sizeof(sequence_magic)))
+		{
+			sm = (sequence_magic *) PageGetSpecialPointer(page);
+			if (sm->magic == SEQ_MAGIC
+				&& PageGetMaxOffsetNumber(page) >= FirstOffsetNumber
+				&& ItemIdIsNormal(PageGetItemId(page, FirstOffsetNumber)))
+				valid_seq_page = true;
+		}
+
+		if (!valid_seq_page)
+		{
+			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+			ReleaseBuffer(buf);
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("cluster: sequence \"%s\" relfilenode already has a "
+							"non-sequence block 0 on shared storage",
+							RelationGetRelationName(rel)),
+					 errhint("A different relation may have reused this relfilenode; the "
+							 "shared storage is not catalog-aligned for this sequence.")));
+		}
+
+		/* Reuse the peer-initialized page untouched (no re-init, no second
+		 * block, no WAL) -- the shared page is the authoritative state. */
+		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+		ReleaseBuffer(buf);
+		return;
+	}
+#endif
+
 	/* Initialize first page of relation with special magic number */
 
 	buf = ExtendBufferedRel(BMR_REL(rel), forkNum, NULL,
@@ -436,6 +528,10 @@ fill_seq_fork_with_data(Relation rel, HeapTuple tuple, ForkNumber forkNum)
 	}
 
 	END_CRIT_SECTION();
+
+#ifdef USE_PGRAC_CLUSTER
+	cluster_seq_flush_if_shared(rel, buf);	/* spec-5.2a D4 — durable on shared storage */
+#endif
 
 	UnlockReleaseBuffer(buf);
 }
@@ -741,6 +837,24 @@ nextval_internal(Oid relid, bool check_permissions)
 		}
 	}
 
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: spec-5.2a D4 — on shared storage the sequence page may carry a
+	 * FOREIGN WAL LSN: it was installed from a peer's per-node WAL stream
+	 * (spec-4.1) by a cross-node clean X-transfer.  The eager flush below
+	 * (cluster_seq_flush_if_shared -> FlushBuffer -> XLogFlush(page_lsn))
+	 * cannot satisfy a foreign LSN from THIS node's WAL ("flush request not
+	 * satisfied").  Force this nextval to WAL-log so the page LSN advances into
+	 * the LOCAL stream, making the flush's WAL-before-data satisfiable and the
+	 * page durable + storage-current for the cross-node transfer / stale-holder
+	 * storage-fallback.  For CACHE > 1 this only fires on a refill (the per-
+	 * backend fast-path never reaches here), so the extra WAL is amortized.
+	 */
+	if (cluster_pcm_is_active()
+		&& seqrel->rd_locator.relNumber >= FirstNormalObjectId)
+		logit = true;
+#endif
+
 	while (fetch)				/* try to fetch cache [+ log ] numbers */
 	{
 		/*
@@ -866,6 +980,10 @@ nextval_internal(Oid relid, bool check_permissions)
 	seq->log_cnt = log;			/* how much is logged */
 
 	END_CRIT_SECTION();
+
+#ifdef USE_PGRAC_CLUSTER
+	cluster_seq_flush_if_shared(seqrel, buf);	/* spec-5.2a D4 */
+#endif
 
 	UnlockReleaseBuffer(buf);
 
@@ -1048,6 +1166,10 @@ do_setval(Oid relid, int64 next, bool iscalled)
 
 	END_CRIT_SECTION();
 
+#ifdef USE_PGRAC_CLUSTER
+	cluster_seq_flush_if_shared(seqrel, buf);	/* spec-5.2a D4 */
+#endif
+
 	UnlockReleaseBuffer(buf);
 
 	relation_close(seqrel, NoLock);
@@ -1213,6 +1335,30 @@ read_seq_tuple(Relation rel, Buffer *buf, HeapTuple seqdatatuple)
 	Form_pg_sequence_data seq;
 
 	*buf = ReadBuffer(rel, 0);
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: spec-5.2a D5 — arm the X LockBuffer below as a clean-page
+	 * X-transfer.  A sequence page carries no MVCC / ITL / visibility state, so
+	 * a cross-node X transfer of it can flush-data-before-drop and be served
+	 * from shared storage on stale-holder recovery (spec-5.2a D3/D4).  We arm in
+	 * read_seq_tuple — not only nextval_internal's refill — so EVERY sequence
+	 * page X write (nextval refill AND setval / restart) flushes the current
+	 * page to shared storage before any cross-node drop; the storage-fallback
+	 * stale-holder break (D3) reads the current value only because that
+	 * invariant holds for all sequence writes (Rule 8.A, inv③).  Gate exactly on
+	 * the cluster PCM-track condition (cluster active + a normal-object relfile
+	 * on shared storage, mirroring cluster_bufmgr_should_pcm_track) so the arm
+	 * is consumed by THIS LockBuffer's PCM acquire and can never leak into a
+	 * later heap access (one-shot, inv①/⑤).  nextval's per-backend cache
+	 * fast-path returns before reaching read_seq_tuple, so it is unaffected; a
+	 * non-cluster / single-node / non-shared sequence never arms (PG-native).
+	 */
+	if (cluster_pcm_is_active()
+		&& rel->rd_locator.relNumber >= FirstNormalObjectId)
+		cluster_pcm_clean_page_xfer_arm(true);
+#endif
+
 	LockBuffer(*buf, BUFFER_LOCK_EXCLUSIVE);
 
 	page = BufferGetPage(*buf);

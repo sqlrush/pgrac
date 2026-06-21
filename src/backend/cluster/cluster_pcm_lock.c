@@ -1603,6 +1603,39 @@ cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode)
 
 
 /*
+ * PGRAC: spec-5.2a D2 — clean-page X-transfer arm (backend-local, one-shot).
+ *
+ *	A single per-backend bool.  Set by cluster_pcm_clean_page_xfer_arm(true)
+ *	right before a deliberately-clean cluster PCM X acquire (sequence refill,
+ *	spec-5.2a D5).  cluster_pcm_lock_acquire_buffer consumes it exactly once
+ *	(read-and-clear) so it can never bleed into a later heap access (inv ①/⑤).
+ *	No shared memory, no locking — purely local to the requesting backend.
+ */
+static bool clean_page_xfer_armed = false;
+
+void
+cluster_pcm_clean_page_xfer_arm(bool armed)
+{
+	clean_page_xfer_armed = armed;
+}
+
+bool
+cluster_pcm_clean_page_xfer_is_armed(void)
+{
+	return clean_page_xfer_armed;
+}
+
+bool
+cluster_pcm_clean_page_xfer_consume(void)
+{
+	bool was_armed = clean_page_xfer_armed;
+
+	clean_page_xfer_armed = false;
+	return was_armed;
+}
+
+
+/*
  * PGRAC: spec-2.33 D7 — BufferDesc-aware PCM acquire.
  *
  *	Decision tree (§3.1):
@@ -1618,10 +1651,22 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode)
 {
 	BufferTag tag;
 	int master_node;
+	bool clean_eligible;
 
 	if (buf == NULL)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
 						errmsg("cluster_pcm_lock_acquire_buffer: NULL BufferDesc")));
+
+	/*
+	 * PGRAC: spec-5.2a D2 — consume the clean-page X-transfer arm exactly once
+	 * here (read-and-clear), BEFORE any fail-closed path below, so the
+	 * eligibility can never leak into a subsequent buffer access regardless of
+	 * the path taken or an error thrown (inv ①/⑤).  Only an X acquire can be a
+	 * clean-page transfer; an S read never arms, so consuming for S is a no-op
+	 * (the flag is already false in practice, but consume() is unconditional to
+	 * guarantee no leak).
+	 */
+	clean_eligible = cluster_pcm_clean_page_xfer_consume();
 
 	if (cluster_pcm_htab == NULL)
 		PCM_STUB_DISABLED_PATH;
@@ -1678,8 +1723,12 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode)
 		 * the shared-storage page on GRANTED_STORAGE_FALLBACK (HC88).
 		 */
 		/* spec-5.2 D2: returns false for a one-shot READ_IMAGE so the bufmgr
-		 * leaves buf->pcm_state == N (no durable ownership recorded). */
-		return cluster_gcs_send_block_request_and_wait(buf, trans, master_node);
+		 * leaves buf->pcm_state == N (no durable ownership recorded).
+		 * spec-5.2a D2/D3: carry clean-page eligibility (X only) so the remote
+		 * master takes the dedicated clean-page X-transfer path rather than the
+		 * conservative HG7 fail-closed DENY. */
+		return cluster_gcs_send_block_request_and_wait(buf, trans, master_node,
+													   clean_eligible && mode == PCM_LOCK_MODE_X);
 	}
 
 	/*
@@ -1718,7 +1767,7 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode)
 		int32 holder = cluster_pcm_master_holder_node_by_tag(tag);
 
 		if (master_state == PCM_LOCK_MODE_X && holder >= 0 && holder != cluster_node_id)
-			return cluster_gcs_local_master_x_transfer_and_wait(buf, holder);
+			return cluster_gcs_local_master_x_transfer_and_wait(buf, holder, clean_eligible);
 	}
 
 	cluster_pcm_lock_acquire(tag, mode);

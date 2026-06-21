@@ -161,6 +161,17 @@ typedef struct ClusterGcsBlockShared {
 	/* PGRAC: spec-5.2 D2 — X-holder shipped a one-shot read image (current
 	 * block, holder kept X) for a cross-node N→S read. */
 	pg_atomic_uint64 cf_xheld_read_ship_count;
+	/* PGRAC: spec-5.2a D6 — clean-page X-transfer enabler (5 counters). */
+	pg_atomic_uint64 clean_page_xfer_count; /* eligible clean X transfer completed */
+	/* RESERVED for Stage 6 (Q3 amended 2026-06-21 — storage-fallback removed as
+	 * unsound on non-cross-instance-coherent Stage-5 storage; these two stay 0
+	 * until a sound storage-fallback lands in Stage 6). */
+	pg_atomic_uint64 clean_page_xfer_storage_fallback_count;
+	pg_atomic_uint64
+		clean_page_xfer_fail_closed_count; /* eligible request fail-closed (53R9X), incl stale holder */
+	pg_atomic_uint64
+		clean_page_xfer_stale_holder_recover_count; /* RESERVED Stage 6 (was DENIED recover) */
+	pg_atomic_uint64 clean_page_xfer_third_party_denied_count; /* 3-node third-party master DENY */
 	/* PGRAC: spec-4.7 D6 — GCS/PCM warm-recovery observability (dump category
 	 * 'gcs_recovery').  8 counters per spec §2.4. */
 	pg_atomic_uint64 recovery_block_resources_recovering; /* phase_for_tag → RECOVERING hits */
@@ -297,6 +308,12 @@ cluster_gcs_block_shmem_init(void)
 		pg_atomic_init_u64(&ClusterGcsBlock->lost_write_avoid_count, 0);
 		/* PGRAC: spec-5.2 D2 — X-holder read-image ship counter init. */
 		pg_atomic_init_u64(&ClusterGcsBlock->cf_xheld_read_ship_count, 0);
+		/* PGRAC: spec-5.2a D6 — 5 NEW clean-page X-transfer counters init. */
+		pg_atomic_init_u64(&ClusterGcsBlock->clean_page_xfer_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->clean_page_xfer_storage_fallback_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->clean_page_xfer_fail_closed_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->clean_page_xfer_stale_holder_recover_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->clean_page_xfer_third_party_denied_count, 0);
 		/* PGRAC: spec-4.7 D6 — 8 NEW warm-recovery counters init. */
 		pg_atomic_init_u64(&ClusterGcsBlock->recovery_block_resources_recovering, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->recovery_buffers_redeclared, 0);
@@ -693,7 +710,7 @@ cluster_gcs_block_redo_lsn_covered(int dead_origin, XLogRecPtr required_lsn)
 
 bool
 cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition transition_id,
-										int master_node)
+										int master_node, bool clean_eligible)
 {
 	ClusterGcsBlockOutstandingSlot *slot;
 	uint64 request_id = 0;
@@ -795,6 +812,9 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 			payload.sender_node = cluster_node_id;
 			payload.requester_backend_id = (int32)MyBackendId; /* HC80 */
 			payload.transition_id = (uint8)transition_id;
+			/* spec-5.2a D1/D2: mark a deliberately-clean (sequence-refill) X
+			 * request so the master takes the clean-page X-transfer path. */
+			GcsBlockRequestPayloadSetCleanEligible(&payload, clean_eligible);
 
 			/* PGRAC: spec-2.34 HC100 — install the next attempt identity
 			 * and clear any previous reply in a single critical section.
@@ -930,6 +950,30 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 				break;
 			}
 			if (final_status == GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER) {
+				uint32 expected;
+				uint32 got;
+
+				/*
+				 * spec-5.2a D4 BUSY: for a clean (sequence) eligible request a
+				 * read-image reply means the master/holder (path-B) could not
+				 * cleanly relinquish (transient pin / re-dirty) and KEPT its X.
+				 * We must NOT install a non-owned read-image of a page we intend
+				 * to write (no seq write guard) and must NOT storage-fallback.
+				 * Fail closed RETRYABLE — the transaction retries; by then the
+				 * holder is unpinned and the transfer completes (Rule 8.A).
+				 */
+				if (clean_eligible) {
+					pg_atomic_fetch_add_u64(&ClusterGcsBlock->clean_page_xfer_fail_closed_count, 1);
+					ereport(ERROR,
+							(errcode(ERRCODE_CLUSTER_CLEAN_PAGE_XFER_UNAVAILABLE),
+							 errmsg("cluster_gcs_block: clean-page X-transfer master/holder "
+									"transiently busy for tag spc=%u db=%u relNumber=%u block=%u",
+									tag.spcOid, tag.dbOid, (unsigned int)BufTagGetRelNumber(&tag),
+									(unsigned int)tag.blockNum),
+							 errhint("The X holder could not relinquish a clean page (pinned or "
+									 "re-dirtied); retry the transaction.")));
+				}
+
 				/*
 				 * PGRAC: spec-5.2 D2 — the X holder shipped its CURRENT image
 				 * for this one read.  Install the bytes (so this read sees the
@@ -939,8 +983,8 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 				 * re-fetches.  A cached copy with no invalidation path would go
 				 * stale once the holder writes again (Rule 8.A).
 				 */
-				uint32 expected = slot->reply_header.checksum;
-				uint32 got = gcs_block_compute_checksum(slot->reply_block_data);
+				expected = slot->reply_header.checksum;
+				got = gcs_block_compute_checksum(slot->reply_block_data);
 
 				if (expected != got) {
 					pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_checksum_fail_count, 1);
@@ -1102,6 +1146,22 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 			break;
 		case GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER:
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_master_not_holder_count, 1);
+			if (clean_eligible) {
+				/* spec-5.2a D3 branch ⑤ — eligible clean-page terminal DENIED is
+				 * a ≥3-node third-party master fail-closed (the 2-node target
+				 * never reaches here).  Surface the dedicated retryable code so it
+				 * is distinguishable from the generic writer-transfer DENY. */
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->clean_page_xfer_fail_closed_count, 1);
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_CLEAN_PAGE_XFER_UNAVAILABLE),
+						 errmsg("cluster_gcs_block: clean-page X-transfer master is neither "
+								"requester nor holder (third-party master, >=3 nodes) for tag "
+								"spc=%u db=%u relNumber=%u block=%u",
+								tag.spcOid, tag.dbOid, (unsigned int)BufTagGetRelNumber(&tag),
+								(unsigned int)tag.blockNum),
+						 errhint("Clean-page X-transfer with a third-party master lands in a "
+								 "later spec; retry, or run the 2-node topology.")));
+			}
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							errmsg("cluster_gcs_block: master does not hold tag and state != N"),
 							errhint("Cross-node holder migration handling lands in spec-2.X+.")));
@@ -1286,7 +1346,8 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, int32 holder_node)
  *	of cluster_gcs_local_master_read_image_and_wait.
  */
 bool
-cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, int32 holder_node)
+cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, int32 holder_node,
+											 bool clean_eligible)
 {
 	ClusterGcsBlockOutstandingSlot *slot;
 	uint64 request_id = 0;
@@ -1295,6 +1356,7 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, int32 holder_node)
 	bool got_reply = false;
 	bool installed = false;
 	bool read_image = false; /* spec-5.2 D11 — holder deferred (active ITL) */
+	uint8 reply_status = (uint8)GCS_BLOCK_REPLY_DENIED_INCOMPATIBLE; /* spec-5.2a D3 */
 	XLogRecPtr installed_page_lsn = InvalidXLogRecPtr;
 
 	if (buf == NULL)
@@ -1330,6 +1392,11 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, int32 holder_node)
 		GcsBlockForwardPayloadSetExpectedPiWatermarkLsn(&fwd,
 														cluster_pcm_lock_pi_watermark_query(tag));
 		GcsBlockForwardPayloadSetXTransfer(&fwd, true);
+		/* spec-5.2a D1/D3: an eligible (clean sequence-page) X-transfer tells
+		 * the holder to flush the data page to shared storage before dropping
+		 * (flush-data-before-drop, D4) so a later storage-fallback reads the
+		 * current value, not a stale one (inv③). */
+		GcsBlockForwardPayloadSetCleanEligible(&fwd, clean_eligible);
 
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_sent_count, 1);
 		if (!cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
@@ -1366,21 +1433,55 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, int32 holder_node)
 		}
 		ConditionVariableCancelSleep();
 
+		/* spec-5.2a D3: capture the reply status before the slot is released so
+		 * the clean-page stale-holder break (below) can distinguish a holder
+		 * DENIED_MASTER_NOT_HOLDER (holder already dropped to N — durable on
+		 * storage, safe to storage-fallback) from a timeout (cannot prove
+		 * durable — must fail-closed). */
+		if (got_reply)
+			reply_status = slot->reply_header.status;
+
 		if (got_reply
 			&& slot->reply_header.status == (uint8)GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER) {
 			uint32 expected = slot->reply_header.checksum;
 			uint32 got = gcs_block_compute_checksum(slot->reply_block_data);
 
-			if (expected == got) {
+			/*
+			 * spec-5.2a D3 / L5 — FAITHFUL stale-holder injection.  The holder
+			 * has REALLY shipped its current image, (eager-)flushed it to shared
+			 * storage, and dropped its copy to N (drop_no_wire) before sending
+			 * this X_GRANTED reply.  Skipping the install here leaves the master
+			 * still recording the now-N holder (we never call
+			 * master_take_x_after_transfer), which is exactly the F0-4 / F0-7
+			 * stale-holder state (reachable in production via a checksum mismatch
+			 * or an interrupt in the post-ship/pre-install window).  The next
+			 * eligible request then forwards to the now-N holder, gets
+			 * DENIED_MASTER_NOT_HOLDER, and exercises the storage-fallback break.
+			 * One-shot (should_skip consumes the arm).
+			 */
+			CLUSTER_INJECTION_POINT("cluster-clean-xfer-stale-holder");
+			if (clean_eligible
+				&& cluster_injection_should_skip("cluster-clean-xfer-stale-holder")) {
+				/* leave installed = false: faithful stale holder created. */
+			} else if (expected == got) {
 				installed_page_lsn = (XLogRecPtr)slot->reply_header.page_lsn;
 				gcs_block_install_block(buf, slot->reply_block_data, installed_page_lsn);
 				installed = true;
 			} else {
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_checksum_fail_count, 1);
 			}
-		} else if (got_reply
+		} else if (got_reply && !clean_eligible
 				   && slot->reply_header.status == (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER) {
 			/*
+			 * spec-5.2a D4: for a clean (sequence) eligible request a read-image
+			 * reply means the holder could not cleanly relinquish (transient pin
+			 * / re-dirty) and KEPT its X.  We must NOT install a non-owned
+			 * read-image of a page we intend to write (no seq write guard) and
+			 * must NOT storage-fallback (the holder may hold a newer copy).
+			 * Skip the install here; the post-loop fail-closed retryable path
+			 * (clean_busy_retry) handles it.  The spec-5.2 §3.5 D11 install
+			 * below is for the heap active-ITL deferral only (!clean_eligible).
+			 *
 			 * PGRAC: spec-5.2 §3.5 D11 — the holder DEFERRED the
 			 * X-transfer because it still has an uncommitted ITL slot on this
 			 * block (its own commit needs it).  It shipped a read-image and kept
@@ -1425,6 +1526,8 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, int32 holder_node)
 		 * THIS node is the master. */
 		cluster_pcm_lock_master_take_x_after_transfer(tag, installed_page_lsn);
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_x_granted_from_holder_count, 1);
+		if (clean_eligible)
+			pg_atomic_fetch_add_u64(&ClusterGcsBlock->clean_page_xfer_count, 1);
 		return true; /* durable X grant — bufmgr mirrors buf->pcm_state = X */
 	}
 
@@ -1434,8 +1537,81 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, int32 holder_node)
 		 * re-acquires X after the holder is terminal. */
 		return false;
 
+	/*
+	 * PGRAC: spec-5.2a D4 — clean-page BUSY (holder kept X).  A clean eligible
+	 * request got a read-image reply: the holder could not relinquish (transient
+	 * pin / re-dirty) and still owns X.  Fail closed RETRYABLE — never storage-
+	 * fallback against a holder that may hold a newer copy, never write a
+	 * non-owned read-image.  The transaction retries; by then the holder is
+	 * unpinned and the transfer (or stale-holder recovery) completes (Rule 8.A).
+	 */
+	if (clean_eligible && got_reply
+		&& reply_status == (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER) {
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->clean_page_xfer_fail_closed_count, 1);
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CLEAN_PAGE_XFER_UNAVAILABLE),
+						errmsg("cluster_gcs_block: clean-page X-transfer holder %d transiently "
+							   "busy for tag spc=%u db=%u relNumber=%u block=%u",
+							   holder_node, tag.spcOid, tag.dbOid,
+							   (unsigned int)BufTagGetRelNumber(&tag), (unsigned int)tag.blockNum),
+						errhint("The X holder could not relinquish a clean page (pinned or "
+								"re-dirtied); retry the transaction.")));
+	}
+
+	/*
+	 * PGRAC: spec-5.2a D3 — clean-page stale-holder break (Q3=A, inv② / inv③).
+	 *
+	 *	The holder we forwarded to replied DENIED_MASTER_NOT_HOLDER: it is LIVE
+	 *	but no longer resident for this tag (it already dropped its copy to N).
+	 *	For a normal heap transfer this is a transient evict race the requester
+	 *	retransmits through — but for a clean (sequence) page that loops forever
+	 *	against an ex-holder the master still records (F0-4 / F0-7).  We break
+	 *	the loop here because a clean page is recoverable from shared storage:
+	 *
+	 *	  - 8.A storage currency: every cross-node X transfer of this (clean,
+	 *	    eligible) page used flush-data-before-drop (spec-5.2a D4) OR a normal
+	 *	    eviction FlushBuffer, so the shared data file reflects the current
+	 *	    value.  The holder being NOT resident means it already dropped, after
+	 *	    flushing.  (A timeout — got_reply == false — is NOT this case: we
+	 *	    cannot prove the holder dropped/flushed, so it falls through to the
+	 *	    fail-closed ereport below.  Rule 8.A.)
+	 *	  - 8.A single-X owner: record self as the new X holder (clearing the
+	 *	    stale holder) BEFORE returning; the ex-holder is already N.  No two-X
+	 *	    window.
+	 *	  - buf currency: the caller (ReadBuffer) populated buf from shared
+	 *	    storage and this node holds no stale cached copy of a page it does
+	 *	    not own (CF invalidation invariant), so buf reflects the current
+	 *	    value — the same contract the remote GRANTED_STORAGE_FALLBACK path
+	 *	    relies on.
+	 */
+	if (gcs_block_clean_xfer_should_stale_break(clean_eligible, got_reply, reply_status)) {
+		/*
+		 * PGRAC: spec-5.2a D3 — clean-page stale holder, FAIL CLOSED (Q3 amended
+		 * 2026-06-21).  The recorded holder is LIVE but no longer resident (it
+		 * dropped to N).  The frozen spec's Q3=A storage-fallback recovery is
+		 * NOT sound on Stage-5 shared storage: it is not cross-instance coherent
+		 * ("cross-instance cache invalidation ... not yet activated"), so a
+		 * recovering node's storage read returns its OWN stale view, reissuing
+		 * already-issued sequence values — a Rule 8.A duplicate-number violation
+		 * (proven by t/284 L5).  So we fail closed RETRYABLE rather than read a
+		 * stale page: the normal CF image-ship path self-heals once the holder's
+		 * buffer is resident again, and a genuinely-gone holder is a retry /
+		 * Stage-4 recovery concern.  A sound storage-fallback + cross-instance
+		 * cache invalidation land in Stage 6.
+		 */
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->clean_page_xfer_fail_closed_count, 1);
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CLEAN_PAGE_XFER_UNAVAILABLE),
+						errmsg("cluster_gcs_block: clean-page X-transfer holder %d is no longer "
+							   "resident (stale holder) for tag spc=%u db=%u relNumber=%u block=%u",
+							   holder_node, tag.spcOid, tag.dbOid,
+							   (unsigned int)BufTagGetRelNumber(&tag), (unsigned int)tag.blockNum),
+						errhint("The recorded holder dropped its copy and storage-fallback is not "
+								"cross-instance coherent on this stage; retry the transaction.")));
+	}
+
 	/* No X image obtained (timeout / holder evict / denial) — fail closed,
 	 * never a silent stale grant (Rule 8.A). */
+	if (clean_eligible)
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->clean_page_xfer_fail_closed_count, 1);
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("cluster_gcs_block: could not obtain X transfer from X holder %d "
 						   "for tag spc=%u db=%u relNumber=%u block=%u",
@@ -1896,6 +2072,17 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 					XLogRecPtr drop_lsn = InvalidXLogRecPtr;
 
 					/*
+					 * PGRAC: spec-5.2a D4 — a clean (sequence) eligible page has
+					 * no active ITL, so the master==holder self-ship is the same
+					 * as the existing path-B drop below: ship the image, grant X,
+					 * drop our copy no-wire.  No data flush in LMON — the backend
+					 * eager-flushed the page at write time (storage is current for
+					 * the stale-holder storage-fallback); drop_no_wire's XLogFlush
+					 * satisfies WAL-before-share.  Count a clean transfer. */
+					if (GcsBlockRequestPayloadIsCleanEligible(req) && ClusterGcsBlock != NULL)
+						pg_atomic_fetch_add_u64(&ClusterGcsBlock->clean_page_xfer_count, 1);
+
+					/*
 					 * The image is already captured (copy_block_for_gcs succeeded
 					 * above) BEFORE this drop.  The drop's bool is intentionally
 					 * ignored: it returns false ONLY when the buffer is not validly
@@ -1917,6 +2104,31 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 				}
 			}
 			/* evict race — fall through to the normal HG7 / master flow. */
+		}
+
+		/*
+		 * PGRAC: spec-5.2a D3 (branch ⑤) — eligible clean-page third-party
+		 * master fail-closed.  Inserted BEFORE the HG7 conservative DENY so an
+		 * eligible (sequence) request is not lumped into the generic
+		 * writer-transfer fail-closed.  In the 2-node target master ∈ {requester,
+		 * holder} always (path-B above handles master == holder; the local-master
+		 * acquire path handles master == requester), so this only fires with ≥3
+		 * nodes where a third live node holds X.  That case needs a two-phase
+		 * post-install ACK to avoid a stale window and is out of scope — fail
+		 * closed with a clean terminal DENIED so the requester maps it to 53R9X
+		 * (ERRCODE_CLUSTER_CLEAN_PAGE_XFER_UNAVAILABLE).  IDEMPOTENT / no-holder /
+		 * self-ship decisions fall through to the existing (already correct)
+		 * flow below.
+		 */
+		if (GcsBlockRequestPayloadIsCleanEligible(req)
+			&& gcs_block_clean_xfer_master_decision(cluster_pcm_master_holder_node_by_tag(req->tag),
+													req->sender_node, cluster_node_id)
+				   == GCS_CLEAN_XFER_THIRD_PARTY_DENY) {
+			pg_atomic_fetch_add_u64(&ClusterGcsBlock->clean_page_xfer_third_party_denied_count, 1);
+			pg_atomic_fetch_add_u64(&ClusterGcsBlock->clean_page_xfer_fail_closed_count, 1);
+			gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER,
+								 InvalidXLogRecPtr, NULL);
+			return;
 		}
 
 		/*
@@ -2635,8 +2847,20 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 						 * already shipped into the reply above (Rule 8.A; same
 						 * reasoning as the path-B drop site).
 						 */
+					/*
+					 * PGRAC: spec-5.2a D4 — a clean (sequence) eligible page has
+					 * no active ITL, so this is the same destructive writer-
+					 * transfer drop as the spec-5.2 D11 heap path: ship X and drop
+					 * our copy no-wire.  No data flush in LMON (the backend
+					 * eager-flushed the page to shared storage at write time, so
+					 * storage is already current for the stale-holder
+					 * storage-fallback); drop_no_wire's XLogFlush of the
+					 * already-flushed page_lsn satisfies WAL-before-share.  A
+					 * clean transfer increments clean_page_xfer_count too. */
 					(void)cluster_bufmgr_drop_block_for_gcs_no_wire(fwd->tag, &drop_lsn);
 					pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_x_transfer_ship_count, 1);
+					if (GcsBlockForwardPayloadIsCleanEligible(fwd))
+						pg_atomic_fetch_add_u64(&ClusterGcsBlock->clean_page_xfer_count, 1);
 				}
 			}
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_ship_bytes_total, GCS_BLOCK_DATA_SIZE);
@@ -3277,6 +3501,44 @@ uint64
 cluster_gcs_get_cf_xheld_read_ship_count(void)
 {
 	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->cf_xheld_read_ship_count) : 0;
+}
+
+/* PGRAC: spec-5.2a D6 — clean-page X-transfer enabler observability (5). */
+uint64
+cluster_gcs_get_clean_page_xfer_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->clean_page_xfer_count) : 0;
+}
+
+uint64
+cluster_gcs_get_clean_page_xfer_storage_fallback_count(void)
+{
+	return ClusterGcsBlock
+			   ? pg_atomic_read_u64(&ClusterGcsBlock->clean_page_xfer_storage_fallback_count)
+			   : 0;
+}
+
+uint64
+cluster_gcs_get_clean_page_xfer_fail_closed_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->clean_page_xfer_fail_closed_count)
+						   : 0;
+}
+
+uint64
+cluster_gcs_get_clean_page_xfer_stale_holder_recover_count(void)
+{
+	return ClusterGcsBlock
+			   ? pg_atomic_read_u64(&ClusterGcsBlock->clean_page_xfer_stale_holder_recover_count)
+			   : 0;
+}
+
+uint64
+cluster_gcs_get_clean_page_xfer_third_party_denied_count(void)
+{
+	return ClusterGcsBlock
+			   ? pg_atomic_read_u64(&ClusterGcsBlock->clean_page_xfer_third_party_denied_count)
+			   : 0;
 }
 
 /* PGRAC: spec-5.2 D11 path A — writer-transfer-revoke ship+release counter. */

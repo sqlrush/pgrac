@@ -6481,6 +6481,30 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr *out_page_ls
 }
 
 /* ========================================================================
+ * PGRAC MODIFICATIONS by SqlRush — spec-5.2a D4 (backend eager flush).
+ *
+ *   cluster_bufmgr_flush_seq_page_to_storage(buffer)
+ *   — flush a cluster sequence page to shared storage from the BACKEND that
+ *   just wrote it.  Caller holds a pin and the buffer content lock (any mode;
+ *   nextval/setval/init hold EXCLUSIVE).  FlushOneBuffer -> FlushBuffer does
+ *   XLogFlush(page_lsn) (WAL-before-data) + smgrwrite to shared storage, which
+ *   is safe HERE (unlike the LMON drop path) because the backend's own WAL
+ *   insert is complete and flushable.  After this the page is clean and
+ *   storage-current, so the cross-node clean X-transfer (which drops via the
+ *   spec-5.2 D11 drop_no_wire path in LMON) and the stale-holder
+ *   storage-fallback both read the current value.  Fails closed (ereport) on a
+ *   write/flush error via the underlying smgr path.
+ * ======================================================================== */
+void
+cluster_bufmgr_flush_seq_page_to_storage(Buffer buffer)
+{
+	Assert(BufferIsValid(buffer));
+	if (BufferIsLocal(buffer))
+		return;					/* temp/local buffers are never CF-shared */
+	FlushOneBuffer(buffer);
+}
+
+/* ========================================================================
  * PGRAC MODIFICATIONS by SqlRush — spec-5.2 §3.5 D11 (writer-transfer-revoke,
  *   active-ITL hard boundary, multi-row fail-closed leg).
  *

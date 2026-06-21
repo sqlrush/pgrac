@@ -616,6 +616,32 @@ cluster_gcs_get_block_x_self_ship_count(void)
 {
 	return 0;
 }
+/* spec-5.2a D6 stubs: 5 NEW clean-page X-transfer enabler counter accessors. */
+uint64
+cluster_gcs_get_clean_page_xfer_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_clean_page_xfer_storage_fallback_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_clean_page_xfer_fail_closed_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_clean_page_xfer_stale_holder_recover_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_clean_page_xfer_third_party_denied_count(void)
+{
+	return 0;
+}
 
 /* spec-4.7 D6 stubs: 8 NEW GCS/PCM warm-recovery counter accessors. */
 uint64

@@ -357,10 +357,137 @@ UT_TEST(test_forward_payload_read_image_flag_roundtrip)
 }
 
 
+/* spec-5.2a D1 (U2): clean-page X-transfer eligibility flag.  The request
+ * payload carries it in reserved_0[0] (free) and the forward payload in
+ * reserved_0[2] (v0.3 P0 FIX — reserved_0[0]/[1] are already the spec-5.2
+ * read-image / X-transfer flags, so the forward eligibility flag MUST NOT
+ * reuse them).  This test pins the roundtrip AND the three-way orthogonality:
+ * setting clean-eligible must never perturb read-image or X-transfer, and
+ * vice versa.  ABI stays 64B for both payloads. */
+UT_TEST(test_clean_page_xfer_eligible_flag_roundtrip_and_orthogonal)
+{
+	GcsBlockRequestPayload req;
+	GcsBlockForwardPayload fwd;
+
+	/* request-side roundtrip (reserved_0[0]). */
+	memset(&req, 0, sizeof(req));
+	UT_ASSERT_EQ(GcsBlockRequestPayloadIsCleanEligible(&req) ? 1 : 0, 0);
+	GcsBlockRequestPayloadSetCleanEligible(&req, true);
+	UT_ASSERT_EQ(GcsBlockRequestPayloadIsCleanEligible(&req) ? 1 : 0, 1);
+	GcsBlockRequestPayloadSetCleanEligible(&req, false);
+	UT_ASSERT_EQ(GcsBlockRequestPayloadIsCleanEligible(&req) ? 1 : 0, 0);
+
+	/* forward-side roundtrip (reserved_0[2]). */
+	memset(&fwd, 0, sizeof(fwd));
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsCleanEligible(&fwd) ? 1 : 0, 0);
+	GcsBlockForwardPayloadSetCleanEligible(&fwd, true);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsCleanEligible(&fwd) ? 1 : 0, 1);
+	GcsBlockForwardPayloadSetCleanEligible(&fwd, false);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsCleanEligible(&fwd) ? 1 : 0, 0);
+
+	/* Orthogonality: clean-eligible vs read-image[0] vs X-transfer[1]. */
+	memset(&fwd, 0, sizeof(fwd));
+	GcsBlockForwardPayloadSetReadImage(&fwd, true);
+	GcsBlockForwardPayloadSetXTransfer(&fwd, true);
+	GcsBlockForwardPayloadSetCleanEligible(&fwd, true);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsReadImage(&fwd) ? 1 : 0, 1);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsXTransfer(&fwd) ? 1 : 0, 1);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsCleanEligible(&fwd) ? 1 : 0, 1);
+
+	/* Clearing clean-eligible leaves read-image / X-transfer untouched. */
+	GcsBlockForwardPayloadSetCleanEligible(&fwd, false);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsReadImage(&fwd) ? 1 : 0, 1);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsXTransfer(&fwd) ? 1 : 0, 1);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsCleanEligible(&fwd) ? 1 : 0, 0);
+
+	/* Clearing read-image / X-transfer leaves clean-eligible untouched. */
+	GcsBlockForwardPayloadSetCleanEligible(&fwd, true);
+	GcsBlockForwardPayloadSetReadImage(&fwd, false);
+	GcsBlockForwardPayloadSetXTransfer(&fwd, false);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsReadImage(&fwd) ? 1 : 0, 0);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsXTransfer(&fwd) ? 1 : 0, 0);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsCleanEligible(&fwd) ? 1 : 0, 1);
+
+	/* Setting the forward clean flag must not perturb the HC127 watermark. */
+	GcsBlockForwardPayloadSetExpectedPiWatermarkLsn(&fwd, (XLogRecPtr)0x1122334455667788ULL);
+	GcsBlockForwardPayloadSetCleanEligible(&fwd, true);
+	UT_ASSERT_EQ((long long)GcsBlockForwardPayloadGetExpectedPiWatermarkLsn(&fwd),
+				 (long long)0x1122334455667788ULL);
+
+	/* Both payloads stay 64B. */
+	UT_ASSERT_EQ((int)sizeof(GcsBlockRequestPayload), 64);
+	UT_ASSERT_EQ((int)sizeof(GcsBlockForwardPayload), 64);
+}
+
+
+/* spec-5.2a D3 (U3): pure master-side clean-page X-transfer decision, all 5
+ * branches.  Master == self runs the handler; args are (x_holder, requester,
+ * master). */
+UT_TEST(test_clean_xfer_master_decision_5_branches)
+{
+	/* ① x_holder == requester → idempotent (already holds X). */
+	UT_ASSERT_EQ(gcs_block_clean_xfer_master_decision(1 /*holder*/, 1 /*req*/, 0 /*master*/),
+				 GCS_CLEAN_XFER_IDEMPOTENT);
+	/* ② no holder → storage-fallback. */
+	UT_ASSERT_EQ(gcs_block_clean_xfer_master_decision(-1, 1, 0), GCS_CLEAN_XFER_STORAGE_FALLBACK);
+	/* ③ x_holder == master(self) → path-B self-ship. */
+	UT_ASSERT_EQ(gcs_block_clean_xfer_master_decision(0 /*holder==master*/, 1, 0),
+				 GCS_CLEAN_XFER_SELF_SHIP);
+	/* ④ other live holder, master == requester → forward to holder. */
+	UT_ASSERT_EQ(gcs_block_clean_xfer_master_decision(2 /*other holder*/, 0 /*req==master*/, 0),
+				 GCS_CLEAN_XFER_FORWARD_TO_HOLDER);
+	/* ⑤ other live holder, master ∉ {req,holder} (3-node third party) → DENY. */
+	UT_ASSERT_EQ(gcs_block_clean_xfer_master_decision(2 /*holder*/, 1 /*req*/, 0 /*master*/),
+				 GCS_CLEAN_XFER_THIRD_PARTY_DENY);
+	/* idempotent wins even when requester would otherwise be a third party
+	 * (holder == requester is checked first). */
+	UT_ASSERT_EQ(gcs_block_clean_xfer_master_decision(1, 1, 2), GCS_CLEAN_XFER_IDEMPOTENT);
+}
+
+
+/* spec-5.2a D3 (U4): pure stale-holder-break predicate.  Only an eligible
+ * request that got a holder DENIED_MASTER_NOT_HOLDER reply breaks the loop via
+ * storage-fallback; a non-eligible reply, a timeout (no reply), or any other
+ * status does NOT (Rule 8.A: never storage-fallback unless the holder proved it
+ * dropped). */
+UT_TEST(test_clean_xfer_stale_break_predicate)
+{
+	/* eligible + got_reply + DENIED_MASTER_NOT_HOLDER → break. */
+	UT_ASSERT_EQ(gcs_block_clean_xfer_should_stale_break(
+					 true, true, (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER)
+					 ? 1
+					 : 0,
+				 1);
+	/* NOT eligible → never break (heap transient retransmit path). */
+	UT_ASSERT_EQ(gcs_block_clean_xfer_should_stale_break(
+					 false, true, (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER)
+					 ? 1
+					 : 0,
+				 0);
+	/* timeout (no reply) → never break (cannot prove holder dropped). */
+	UT_ASSERT_EQ(gcs_block_clean_xfer_should_stale_break(
+					 true, false, (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER)
+					 ? 1
+					 : 0,
+				 0);
+	/* a different reply (e.g. X_GRANTED / READ_IMAGE) → never break. */
+	UT_ASSERT_EQ(gcs_block_clean_xfer_should_stale_break(
+					 true, true, (uint8)GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER)
+					 ? 1
+					 : 0,
+				 0);
+	UT_ASSERT_EQ(gcs_block_clean_xfer_should_stale_break(
+					 true, true, (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER)
+					 ? 1
+					 : 0,
+				 0);
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(20);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -378,6 +505,9 @@ main(void)
 	UT_RUN(test_gcs_block_tag_is_standard_buffer_tag_20b);
 	UT_RUN(test_xheld_read_ship_decision_truth_table);
 	UT_RUN(test_forward_payload_read_image_flag_roundtrip);
+	UT_RUN(test_clean_page_xfer_eligible_flag_roundtrip_and_orthogonal);
+	UT_RUN(test_clean_xfer_master_decision_5_branches);
+	UT_RUN(test_clean_xfer_stale_break_predicate);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

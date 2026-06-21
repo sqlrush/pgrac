@@ -325,6 +325,18 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	{ .name = "cluster-gcs-block-forward-master-side" },
 	{ .name = "cluster-gcs-block-evict-holder-before-ship" },
 	/*
+	 * spec-5.2a D3 — FAITHFUL clean-page stale-holder injection.
+	 *
+	 *	cluster-clean-xfer-stale-holder:
+	 *	  Fires in local_master_x_transfer_and_wait on a clean-eligible
+	 *	  X_GRANTED reply, AFTER the holder has really shipped + (eager-)flushed
+	 *	  + dropped its copy to N.  SKIP makes the requester skip the install so
+	 *	  the master keeps recording the now-N holder -- the genuine F0-4 stale
+	 *	  state -- which the next eligible request recovers via the
+	 *	  storage-fallback break (L5).  One-shot (should_skip consumes).
+	 */
+	{ .name = "cluster-clean-xfer-stale-holder" },
+	/*
 	 * spec-2.36 D16 — CF 3-way protocol fault injection.
 	 *
 	 *	cluster-gcs-block-invalidate-drop-broadcast:

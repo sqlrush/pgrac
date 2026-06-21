@@ -342,7 +342,8 @@ cluster_gcs_send_transition_and_wait(BufferTag tag pg_attribute_unused(),
 bool
 cluster_gcs_send_block_request_and_wait(struct BufferDesc *buf pg_attribute_unused(),
 										PcmLockTransition trans pg_attribute_unused(),
-										int master_node pg_attribute_unused())
+										int master_node pg_attribute_unused(),
+										bool clean_eligible pg_attribute_unused())
 {
 	abort();
 }
@@ -358,7 +359,8 @@ cluster_gcs_local_master_read_image_and_wait(struct BufferDesc *buf pg_attribute
 /* spec-5.2 D11 stub: local-master X-transfer forward unreachable in this unit. */
 bool
 cluster_gcs_local_master_x_transfer_and_wait(struct BufferDesc *buf pg_attribute_unused(),
-											 int32 holder_node pg_attribute_unused())
+											 int32 holder_node pg_attribute_unused(),
+											 bool clean_eligible pg_attribute_unused())
 {
 	abort();
 }

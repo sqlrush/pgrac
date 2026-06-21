@@ -370,6 +370,31 @@ StaticAssertDecl(sizeof(GcsBlockRequestPayload) == 64,
 				 "requester_backend_id 4 + transition_id 1 + reserved 19;"
 				 " 64B = natural 8-aligned struct size)");
 
+/* PGRAC: spec-5.2a D1 — clean-page X-transfer eligibility flag carried in the
+ * REQUEST payload's reserved_0[0].
+ *
+ *	The REQUEST and FORWARD payloads are DISTINCT structs, so request[0] is
+ *	free even though forward[0] is the spec-5.2 read-image flag (the eligible
+ *	flag on the forward wire uses reserved_0[2] instead — see
+ *	GcsBlockForwardPayloadSetCleanEligible).  The requesting backend sets this
+ *	when its NEXT cluster PCM X acquire was deliberately armed for a clean
+ *	(no active ITL / MVCC) page — sequence refill, spec-5.2a D5 — so the GCS
+ *	master takes the dedicated clean-page X-transfer path (spec-5.2a D3)
+ *	instead of the conservative HG7 fail-closed DENY.  A normal heap request
+ *	leaves it 0 → existing conservative path unchanged (inv ①).  ABI stays
+ *	64B (reserved-byte overlay). */
+static inline void
+GcsBlockRequestPayloadSetCleanEligible(GcsBlockRequestPayload *p, bool eligible)
+{
+	p->reserved_0[0] = eligible ? (uint8)1 : (uint8)0;
+}
+
+static inline bool
+GcsBlockRequestPayloadIsCleanEligible(const GcsBlockRequestPayload *p)
+{
+	return p->reserved_0[0] != 0;
+}
+
 
 /* ============================================================
  * GcsBlockReplyHeader -- wire ABI for PGRAC_IC_MSG_GCS_BLOCK_REPLY
@@ -595,6 +620,32 @@ GcsBlockForwardPayloadIsXTransfer(const GcsBlockForwardPayload *p)
 	return p->reserved_0[1] != 0;
 }
 
+/* PGRAC: spec-5.2a D1 — clean-page X-transfer eligibility flag carried in the
+ * FORWARD payload's reserved_0[2].
+ *
+ *	v0.3 P0 FIX (reserved-byte collision):  reserved_0[0] is the spec-5.2 D2
+ *	read-image flag and reserved_0[1] is the spec-5.2 D11 X-transfer flag
+ *	(above).  The clean-page eligibility flag on the FORWARD wire therefore
+ *	MUST NOT reuse [0]/[1] — it uses reserved_0[2] (the [2..6] range is free;
+ *	reserved_0 is 7B at offset 57).  Set by the master when forwarding an
+ *	eligible (sequence-refill) N→X to the holder so the holder uses the
+ *	flush-data-before-drop path (spec-5.2a D4) rather than the no-data
+ *	drop_no_wire path: the shared data file must reflect the current value
+ *	after the drop so a later storage-fallback (stale-holder recovery) reads
+ *	the current page, not a stale one (inv③, F0-11).  A heap / non-eligible
+ *	forward leaves this 0 → existing behaviour unchanged (inv①). */
+static inline void
+GcsBlockForwardPayloadSetCleanEligible(GcsBlockForwardPayload *p, bool eligible)
+{
+	p->reserved_0[2] = eligible ? (uint8)1 : (uint8)0;
+}
+
+static inline bool
+GcsBlockForwardPayloadIsCleanEligible(const GcsBlockForwardPayload *p)
+{
+	return p->reserved_0[2] != 0;
+}
+
 /* PGRAC: spec-5.2 D2 — pure master-side decision for an N→S read request
  * when the block is held in X.  Kept pure (no shmem / no I/O) so the gate
  * truth table is unit-tested standalone (U3). */
@@ -632,6 +683,51 @@ gcs_block_xheld_read_ship_decision(uint8 transition_id, int pre_state, int32 hol
 	return GCS_XHELD_READ_DENY;
 }
 
+/* PGRAC: spec-5.2a D3 — pure master-side decision for an eligible clean-page
+ * (sequence) X request.  Kept pure (no shmem / no I/O) so the 5-branch truth
+ * table is unit-tested standalone (U3).  The handler runs ON the GCS master,
+ * so `master` == cluster_node_id; `requester` is req->sender_node; `x_holder`
+ * is the GRD-recorded X holder (or < 0 for none). */
+typedef enum GcsCleanXferDecision {
+	GCS_CLEAN_XFER_IDEMPOTENT = 0,	  /* x_holder == requester — already holds X */
+	GCS_CLEAN_XFER_STORAGE_FALLBACK,  /* no holder — grant + read storage */
+	GCS_CLEAN_XFER_SELF_SHIP,		  /* x_holder == master — path-B self-ship */
+	GCS_CLEAN_XFER_FORWARD_TO_HOLDER, /* x_holder is other live, master == requester */
+	GCS_CLEAN_XFER_THIRD_PARTY_DENY	  /* x_holder is other live, master ∉ {req,holder} (≥3 nodes) */
+} GcsCleanXferDecision;
+
+static inline GcsCleanXferDecision
+gcs_block_clean_xfer_master_decision(int32 x_holder, int32 requester, int32 master)
+{
+	if (x_holder == requester)
+		return GCS_CLEAN_XFER_IDEMPOTENT;
+	if (x_holder < 0)
+		return GCS_CLEAN_XFER_STORAGE_FALLBACK;
+	if (x_holder == master)
+		return GCS_CLEAN_XFER_SELF_SHIP;
+	if (master == requester)
+		return GCS_CLEAN_XFER_FORWARD_TO_HOLDER;
+	return GCS_CLEAN_XFER_THIRD_PARTY_DENY;
+}
+
+/* PGRAC: spec-5.2a D3 — pure stale-holder predicate (U4).  True when an
+ * eligible clean-page X-transfer got a holder DENIED_MASTER_NOT_HOLDER reply:
+ * the holder is LIVE but no longer resident (it dropped to N), yet the master
+ * still records it — the F0-4 stale-holder window.  Q3 amended 2026-06-21: the
+ * action is now FAIL CLOSED (53R9X retryable), NOT storage-fallback recovery —
+ * Stage-5 shared storage is not cross-instance coherent, so reading the page
+ * from storage on the recovering node returns a stale view and reissues
+ * sequence values (Rule 8.A violation, proven by t/284 L5).  The normal CF
+ * image-ship path self-heals; a sound storage-fallback lands in Stage 6.  A
+ * timeout (got_reply == false) is NOT this case (it cannot prove the holder
+ * dropped) and stays fail-closed via the generic path. */
+static inline bool
+gcs_block_clean_xfer_should_stale_break(bool clean_eligible, bool got_reply, uint8 reply_status)
+{
+	return clean_eligible && got_reply
+		   && reply_status == (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
+}
+
 /* Compile-time assertion that block size matches PG BLCKSZ.  HC80. */
 StaticAssertDecl(GCS_BLOCK_DATA_SIZE == BLCKSZ,
 				 "spec-2.33 D1 GCS_BLOCK_DATA_SIZE must equal BLCKSZ "
@@ -658,6 +754,18 @@ extern bool cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode e
  * the §3.5 IC-dispatch (LMON) context.  XLogFlush+InvalidateBuffer, with the
  * cache-eviction release wire suppressed (clears pcm_state=N first). */
 extern bool cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr *out_page_lsn);
+
+/* PGRAC: spec-5.2a D4 (backend eager flush) — flush a cluster sequence page to
+ * shared storage from the BACKEND that just wrote it.  Caller holds a pin and
+ * the buffer content lock (any mode; nextval/setval hold EXCLUSIVE).  Runs
+ * FlushOneBuffer -> FlushBuffer (XLogFlush(page_lsn) WAL-before-data + smgrwrite
+ * to shared storage), which is safe HERE because the backend's own WAL insert
+ * is complete and flushable.  After this returns the page is clean and
+ * storage-current, so a later cross-node clean X-transfer (LMON) only has to
+ * drop a clean page (drop_block_for_gcs_clean_only) and a stale-holder
+ * storage-fallback reads the current value.  Fails closed (ereport) on write
+ * error via the underlying smgr path. */
+extern void cluster_bufmgr_flush_seq_page_to_storage(Buffer buffer);
 
 /* PGRAC: spec-5.2 §3.5 D11 (writer-transfer-revoke) — false
  * ONLY when this buffer is a deferred-writer read-image of a remote-X-held
@@ -727,7 +835,7 @@ extern int cluster_bufmgr_redeclare_scan_chunk(int start_buf, int max_scan,
  */
 extern bool cluster_gcs_send_block_request_and_wait(BufferDesc *buf,
 													PcmLockTransition transition_id,
-													int master_node);
+													int master_node, bool clean_eligible);
 
 /*
  * spec-5.2 D2 (sub-case B) — local-master read-image forward.  Used by
@@ -738,8 +846,11 @@ extern bool cluster_gcs_send_block_request_and_wait(BufferDesc *buf,
  * buf->pcm_state == N); fails closed (ereport) if no image is obtained.
  */
 extern bool cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, int32 holder_node);
-/* PGRAC: spec-5.2 D11 — local-master writer-transfer (revoke); durable X grant. */
-extern bool cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, int32 holder_node);
+/* PGRAC: spec-5.2 D11 — local-master writer-transfer (revoke); durable X grant.
+ * spec-5.2a D2/D3: clean_eligible routes a clean (sequence) page through the
+ * flush-data-before-drop holder path + stale-holder storage-fallback recovery. */
+extern bool cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, int32 holder_node,
+														 bool clean_eligible);
 
 /*
  * spec-4.7 D1 — GCS/PCM block resource recovery phase.
@@ -902,6 +1013,12 @@ extern uint64 cluster_gcs_get_lost_write_avoid_count(void);
 
 /* PGRAC: spec-5.2 D2 — X-holder read-image ship counter accessor. */
 extern uint64 cluster_gcs_get_cf_xheld_read_ship_count(void);
+/* PGRAC: spec-5.2a D6 — clean-page X-transfer enabler counters (5). */
+extern uint64 cluster_gcs_get_clean_page_xfer_count(void);
+extern uint64 cluster_gcs_get_clean_page_xfer_storage_fallback_count(void);
+extern uint64 cluster_gcs_get_clean_page_xfer_fail_closed_count(void);
+extern uint64 cluster_gcs_get_clean_page_xfer_stale_holder_recover_count(void);
+extern uint64 cluster_gcs_get_clean_page_xfer_third_party_denied_count(void);
 /* PGRAC: spec-5.2 D11 — writer-transfer-revoke ship counters (A: path-A
  * forward-to-holder revoke; B: master==holder self-ship). */
 extern uint64 cluster_gcs_get_block_x_transfer_ship_count(void);
