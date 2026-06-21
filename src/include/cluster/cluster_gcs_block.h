@@ -693,7 +693,7 @@ typedef enum GcsCleanXferDecision {
 	GCS_CLEAN_XFER_STORAGE_FALLBACK,  /* no holder — grant + read storage */
 	GCS_CLEAN_XFER_SELF_SHIP,		  /* x_holder == master — path-B self-ship */
 	GCS_CLEAN_XFER_FORWARD_TO_HOLDER, /* x_holder is other live, master == requester */
-	GCS_CLEAN_XFER_THIRD_PARTY_DENY	  /* x_holder is other live, master ∉ {req,holder} (≥3 nodes) */
+	GCS_CLEAN_XFER_THIRD_PARTY_DENY /* x_holder is other live, master ∉ {req,holder} (≥3 nodes) */
 } GcsCleanXferDecision;
 
 static inline GcsCleanXferDecision
