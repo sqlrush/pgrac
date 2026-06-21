@@ -342,13 +342,15 @@ cluster_sq_nextval(Relation seqrel, const ClusterResId *resid,
 	}
 	PG_END_TRY();
 
-	cluster_sq_instance_cache_finish_refill(resid, gen, incby, gstart, gend);
-
-	/* Serve the first value of the freshly granted segment (a racing peer may
-	 * have taken it already -> serve returns the next; if the cache is full and
-	 * dropped the segment, serve directly from the grant). */
-	if (!cluster_sq_instance_cache_serve(resid, &v))
-		v = gstart;
+	/*
+	 * Atomically take the first granted value (gstart) for THIS backend and
+	 * publish only the remainder.  Publishing the whole segment and then
+	 * serving the first value back leaves a window (Rule 8.A): a peer woken by
+	 * the broadcast could serve gstart and the claimant then fall back to gstart
+	 * on an exhausted cache -- the same value from two same-node backends,
+	 * trivially reachable at CACHE 1 (single-value segment).
+	 */
+	cluster_sq_instance_cache_publish_and_take(resid, gen, incby, gstart, gend, &v);
 	return v;
 }
 

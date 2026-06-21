@@ -12,9 +12,12 @@
 #
 #    Ship gate (no SKIP, L77):
 #      L1  pair connected + same shared relfilenode + 6 SQ counters present.
-#      L2  concurrent cross-node nextval (CACHE 1, every value refills) -> NO
+#      L2  interleaved cross-node nextval (CACHE 1, every value refills) -> NO
 #          duplicate; sq_refill_count grows (8.A core).
-#      L3  batched cross-node nextval (CACHE 50) -> NO duplicate across 200
+#      L2c TRUE same-node concurrency: 4 parallel backends on node0 hammer a
+#          CACHE-1 sequence -> NO duplicate (the refill claimant vs same-node
+#          peers; the case L2/L3 sequential interleave cannot reach).
+#      L3  batched cross-node nextval (CACHE 50) -> NO duplicate across 400
 #          values AND the instance cache batches (refills << values).
 #      L4  crash/restart durable: a node0-only sequence is burned, CHECKPOINTed,
 #          node0 crashes (immediate) + restarts; nextval is strictly past the
@@ -41,6 +44,7 @@ use lib "$FindBin::RealBin/../../perl";
 use PostgreSQL::Test::ClusterPair;
 use Test::More;
 use Time::HiRes qw(usleep);
+use IPC::Run qw(start finish);
 
 # Sum a 'sequence'-category SQ counter across both nodes.
 sub sq_count
@@ -167,6 +171,30 @@ for my $k (@sq_keys)
 	$missing++ if ($present // 0) != 1;
 }
 is($missing, 0, 'L1: all 6 SQ sequence counters present in the cluster_state dump');
+
+# Launch $nproc psql sessions on ONE node in parallel, each pulling $per values
+# from $seq, and return (all_succeeded, @all_values).  Used by L2c for true
+# same-node concurrency (the sequential legs cannot race a refill claimant
+# against same-node peers).
+sub concurrent_same_node
+{
+	my ($node, $seq, $nproc, $per) = @_;
+	my (@h, @out);
+	for my $j (1 .. $nproc)
+	{
+		my $o = '';
+		push @out, \$o;
+		my @cmd = (
+			'psql', '-XAtq', '-d', $node->connstr('postgres'),
+			'-c', "SELECT nextval('$seq') FROM generate_series(1,$per)");
+		push @h, start(\@cmd, '>', $out[-1]);
+	}
+	my $allok = 1;
+	for my $hh (@h) { $allok = 0 unless finish($hh); }
+	my @vals;
+	for my $r (@out) { push @vals, grep { /^-?\d+$/ } split(/\n/, ${$r}); }
+	return ($allok, @vals);
+}
 
 # Read one scalar with bounded retry on the documented-retryable CF signal (a
 # cross-node SELECT last_value is a 5.2 CF read-image, more robust than the X
@@ -326,6 +354,28 @@ ok($crc != 0 && (($cerr // '') =~ /not supported/i || ($cerr // '') =~ /0A000/),
 my $cyc_after = sq_count($pair, 'sq_cycle_rejected_count');
 cmp_ok($cyc_after, '>', $cyc_before,
 	"L13: sq_cycle_rejected_count grew ($cyc_before -> $cyc_after)");
+
+# ----------
+# L2c (TRUE same-node concurrency): 4 backends on node0 hammer a CACHE-1 sequence
+#     in parallel, so EVERY nextval refills and the refill claimant races
+#     same-node peers woken by the refill broadcast -- the case the sequential
+#     L2/L3 legs cannot reach.  kseq is node0-ONLY (node1 never touches it, so
+#     node0 holds the page X from CREATE onward -> all refills local, no CF
+#     transfer -> reliable regardless of cumulative load).  A duplicate here = a
+#     claimant returned a value a same-node peer already served (Rule 8.A).  Note
+#     the publish-and-take fix makes claim+take atomic under one lock, so the
+#     window is closed by construction; this leg exercises the concurrent path.
+#     node0-only CREATE skews node0's relfilenode allocator, harmless here: the
+#     only later sequence is L4's dseq, which is itself node0-only-burned.
+# ----------
+$n0->safe_psql('postgres', 'CREATE SEQUENCE kseq CACHE 1');
+my ($l2c_ok, @kvals) = concurrent_same_node($n0, 'kseq', 4, 100);
+my %kseen;
+my @kdups = grep { $kseen{$_}++ } @kvals;
+ok($l2c_ok, 'L2c: 4 concurrent node0 backends (CACHE 1) all succeeded');
+is(scalar(@kvals), 400, "L2c: got @{[scalar @kvals]} values from 4x100 concurrent nextvals");
+is(scalar(@kdups), 0,
+	'L2c: 400 values from 4 concurrent same-node CACHE-1 backends are all UNIQUE -- 8.A no same-node duplicate');
 
 # ----------
 # L4 (FINAL leg -- crash settles the cluster, so no DDL after): crash/restart

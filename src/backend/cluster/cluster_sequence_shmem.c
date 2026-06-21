@@ -128,77 +128,67 @@ cluster_sequence_shmem_register(void)
  * ============================================================ */
 
 /*
- * cluster_sq_instance_cache_serve -- slice the next value from the cache.
+ * cluster_sq_instance_cache_publish_and_take -- the refill claimant atomically
+ *	takes the first granted value AND publishes the remainder, under a single
+ *	lock acquisition.
  *
- *	Returns true and stores the served value in *out_value when this node's
- *	instance cache for `resid` still holds an unconsumed value.  Returns
- *	false when the entry is absent or exhausted, in which case the caller
- *	must run the node-local refill protocol (begin_refill below).
+ *	The page advance grants [seg_start, seg_end] (seg_end == seg_start for a
+ *	single-value / CACHE 1 grant).  The claimant keeps seg_start for ITSELF
+ *	(*out_value, always set) and installs only the remainder
+ *	[seg_start + increment, seg_end] into the cache with refill_in_progress
+ *	cleared.  Doing the take + publish under one lock closes the window where a
+ *	peer backend, woken by the broadcast, serves seg_start before the claimant
+ *	does -- which at CACHE 1 (single-value segment) would leave the claimant
+ *	with an exhausted cache and a fall-back to seg_start too: the same value
+ *	from two same-node backends (Rule 8.A same-node duplicate).
+ *
+ *	A single-value grant publishes an empty (has_segment = false) entry so the
+ *	next begin_refill re-claims cleanly (and never reads seg_start + increment,
+ *	which could overflow at seqmax); a full HTAB drops the remainder (the
+ *	claimant still keeps seg_start).  Wakes any waiter and bumps refill_count.
  */
-bool
-cluster_sq_instance_cache_serve(const ClusterResId *resid, int64 *out_value)
+void
+cluster_sq_instance_cache_publish_and_take(const ClusterResId *resid, uint32 generation,
+										   int64 increment, int64 seg_start, int64 seg_end,
+										   int64 *out_value)
 {
-	ClusterSeqInstanceCache *entry;
-	bool served = false;
-
 	Assert(resid != NULL);
 	Assert(out_value != NULL);
 
-	if (sq_cache_htab == NULL)
-		return false;
+	*out_value = seg_start; /* the claimant's value; never published */
 
-	LWLockAcquire(&sq_state->lwlock, LW_EXCLUSIVE);
+	if (sq_cache_htab != NULL) {
+		ClusterSeqInstanceCache *entry;
+		bool found;
 
-	entry = (ClusterSeqInstanceCache *)hash_search(sq_cache_htab, resid, HASH_FIND, NULL);
-	if (entry != NULL && entry->has_segment
-		&& cluster_sq_cache_has_value(entry->local_next, entry->local_end, entry->increment)) {
-		*out_value = entry->local_next;
-		entry->local_next += entry->increment;
-		served = true;
-	}
-
-	LWLockRelease(&sq_state->lwlock);
-	return served;
-}
-
-/*
- * cluster_sq_instance_cache_fill -- install a granted segment.
- *
- *	Called after the refill protocol advances the shared page and obtains
- *	[seg_start, seg_end].  Replaces any existing segment for `resid` (the
- *	prior one is by contract fully consumed before a refill is triggered).
- */
-void
-cluster_sq_instance_cache_fill(const ClusterResId *resid, uint32 generation, int64 increment,
-							   int64 seg_start, int64 seg_end)
-{
-	ClusterSeqInstanceCache *entry;
-	bool found;
-
-	Assert(resid != NULL);
-
-	if (sq_cache_htab == NULL)
-		return;
-
-	LWLockAcquire(&sq_state->lwlock, LW_EXCLUSIVE);
-
-	entry = (ClusterSeqInstanceCache *)hash_search(sq_cache_htab, resid, HASH_ENTER_NULL, &found);
-	if (entry == NULL) {
-		/* Cache full: surplus sequences degrade to always-refill, never to
-		 * an incorrect value.  Drop on the floor and let the caller serve
-		 * directly from the freshly granted segment. */
+		LWLockAcquire(&sq_state->lwlock, LW_EXCLUSIVE);
+		entry
+			= (ClusterSeqInstanceCache *)hash_search(sq_cache_htab, resid, HASH_ENTER_NULL, &found);
+		if (entry != NULL) {
+			entry->generation = generation;
+			entry->increment = increment;
+			entry->refill_in_progress = false;
+			if (seg_end != seg_start) {
+				/* Multi-value grant: publish the remainder.  seg_start +
+				 * increment is the SECOND granted value, which is at or before
+				 * seg_end <= seqmax, so it never overflows. */
+				entry->local_next = seg_start + increment;
+				entry->local_end = seg_end;
+				entry->has_segment = true;
+			} else {
+				/* Single value: the claimant consumed it -> empty entry. */
+				entry->local_next = 0;
+				entry->local_end = 0;
+				entry->has_segment = false;
+			}
+		}
+		/* entry == NULL (HTAB full): remainder dropped; claimant keeps seg_start. */
 		LWLockRelease(&sq_state->lwlock);
-		return;
 	}
 
-	entry->generation = generation;
-	entry->increment = increment;
-	entry->local_next = seg_start;
-	entry->local_end = seg_end;
-	entry->refill_in_progress = false;
-	entry->has_segment = true;
-
-	LWLockRelease(&sq_state->lwlock);
+	cluster_sq_bump_refill();
+	if (sq_state != NULL)
+		ConditionVariableBroadcast(&sq_state->refill_cv);
 }
 
 /*
@@ -287,21 +277,6 @@ cluster_sq_instance_cache_begin_refill(const ClusterResId *resid, uint32 generat
 
 	LWLockRelease(&sq_state->lwlock);
 	return claim;
-}
-
-void
-cluster_sq_instance_cache_finish_refill(const ClusterResId *resid, uint32 generation,
-										int64 increment, int64 seg_start, int64 seg_end)
-{
-	Assert(resid != NULL);
-
-	/* fill() installs the segment + clears refill_in_progress under the lock. */
-	cluster_sq_instance_cache_fill(resid, generation, increment, seg_start, seg_end);
-	cluster_sq_bump_refill();
-
-	/* Wake any backend waiting for this node's refill to complete. */
-	if (sq_state != NULL)
-		ConditionVariableBroadcast(&sq_state->refill_cv);
 }
 
 void

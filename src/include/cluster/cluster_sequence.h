@@ -22,8 +22,8 @@
  *	      cluster_sq_cache_has_value.  Out-of-range input asserts (debug)
  *	      and fails closed to the conservative answer; never ereports.
  *	    - Backend layer (#ifndef FRONTEND, in cluster_sequence_shmem.c): the
- *	      shmem instance cache + node-local refill lock (begin/finish/abort +
- *	      refill CV) and the six observability counters.  The refill
+ *	      shmem instance cache + node-local refill lock (begin / publish_and_take
+ *	      / abort + refill CV) and the six observability counters.  The refill
  *	      orchestration + shared-page advance live in commands/sequence.c.
  *	      These may ereport.
  *
@@ -161,7 +161,7 @@ typedef struct ClusterSeqInstanceCache {
  *
  *	SERVED   a value was sliced from a live segment (*out_value set); done.
  *	CLAIMED  this backend won the refill race (refill_in_progress now set);
- *	         it MUST run the page advance then finish_refill / abort_refill.
+ *	         it MUST run the page advance then publish_and_take / abort_refill.
  *	WAIT     another backend on this node is refilling the same sequence;
  *	         the caller waits on the refill CV and retries.
  */
@@ -177,29 +177,22 @@ extern void cluster_sequence_shmem_init(void);
 extern void cluster_sequence_shmem_register(void);
 
 /*
- * D1 instance-cache primitives.  The caller need not hold any lock; each
- * primitive takes the SQ shmem lock internally.
- *
- *	serve       slice the next value from the entry; returns true + *out_value
- *	            on a hit, false when the entry is absent or empty (refill).
- *	fill        install/replace the granted [seg_start, seg_end] segment.
- *	invalidate  drop the entry (setval / ALTER strong invalidation).
+ * D1 instance-cache primitive: drop the entry (setval / ALTER invalidation).
+ * Takes the SQ shmem lock internally.
  */
-extern bool cluster_sq_instance_cache_serve(const ClusterResId *resid, int64 *out_value);
-extern void cluster_sq_instance_cache_fill(const ClusterResId *resid, uint32 generation,
-										   int64 increment, int64 seg_start, int64 seg_end);
 extern void cluster_sq_instance_cache_invalidate(const ClusterResId *resid);
 
 /*
  * D3 (v2.0 option B) node-local refill lock.
  *
- *	begin_refill   atomically (under the SQ lock) serves a value, claims the
- *	               refill, or reports another backend is refilling.
- *	finish_refill  installs the freshly-advanced [seg_start, seg_end] segment,
- *	               clears the in-progress flag, bumps refill_count, and wakes
- *	               any waiter.
- *	abort_refill   clears the in-progress flag + wakes waiters on an error
- *	               path (page advance raised) so the next backend can retry.
+ *	begin_refill      atomically (under the SQ lock) serves a value, claims the
+ *	                  refill, or reports another backend is refilling.
+ *	publish_and_take  the claimant atomically takes the first granted value and
+ *	                  publishes the remainder (one lock acquisition -> no peer
+ *	                  can serve the first value first; Rule 8.A), bumps
+ *	                  refill_count, and wakes any waiter.
+ *	abort_refill      clears the in-progress flag + wakes waiters on an error
+ *	                  path (page advance raised) so the next backend can retry.
  *	The refill-wait CV helpers wrap the region-wide refill_cv with the
  *	ClusterSqRefillWait wait event (caller owns the prepare / sleep / cancel
  *	dance + its own deadline; see cluster_sq_refill_timeout for the bound).
@@ -208,9 +201,9 @@ extern ClusterSqRefillClaim cluster_sq_instance_cache_begin_refill(const Cluster
 																   uint32 generation,
 																   int64 increment,
 																   int64 *out_value);
-extern void cluster_sq_instance_cache_finish_refill(const ClusterResId *resid, uint32 generation,
-													int64 increment, int64 seg_start,
-													int64 seg_end);
+extern void cluster_sq_instance_cache_publish_and_take(const ClusterResId *resid, uint32 generation,
+													   int64 increment, int64 seg_start,
+													   int64 seg_end, int64 *out_value);
 extern void cluster_sq_instance_cache_abort_refill(const ClusterResId *resid);
 
 extern void cluster_sq_refill_prepare_wait(void);
