@@ -97,6 +97,53 @@ sub wait_until_acquirable
 	return 0;
 }
 
+# Count backends on $node actively running a blocking pg_advisory_lock() acquire
+# (state='active').  Once the GES grant arrives, the statement completes and the
+# session goes idle, so the count drops to 0.
+sub n_blocked_advisory
+{
+	my ($node) = @_;
+	my $n = $node->safe_psql(
+		'postgres', q{
+		SELECT count(*) FROM pg_stat_activity
+		WHERE query LIKE '%pg_advisory_lock(%' AND state = 'active'
+		  AND pid <> pg_backend_pid()});
+	return defined $n ? int($n) : 0;
+}
+
+# spec-5.5 P0 regression guard: a blocking pg_advisory_lock() waiter MUST be
+# granted (woken) after the holder releases — including when the resource master
+# is the releasing node (local-master release must drain+wake, not just delete
+# the holder).  Driven for one key in BOTH directions: the key has exactly one
+# master, so node0-releases-while-node1-waits and node1-releases-while-node0-waits
+# deterministically cover the local-master AND remote-master release paths.
+sub blocking_grant_after_release
+{
+	my ($holder, $waiter, $key, $desc) = @_;
+
+	my $h = $holder->background_psql('postgres', on_error_die => 1);
+	$h->query_safe("SELECT pg_advisory_lock($key)");    # holder holds the key
+
+	my $w = $waiter->background_psql('postgres', on_error_die => 1);
+	# Bounded GES wait so a regression fails fast (detect window below is shorter).
+	$w->query_safe("SET cluster.ges_request_timeout_ms = '25s'");
+	# Fire the blocking acquire WITHOUT waiting (echo prints before the stmt blocks).
+	$w->query_until(qr/PGRAC_FIRED/, "\\echo PGRAC_FIRED\nSELECT pg_advisory_lock($key);\n");
+
+	my $blocked = 0;
+	for (1 .. 50) { if (n_blocked_advisory($waiter) >= 1) { $blocked = 1; last; } usleep(100_000); }
+	ok($blocked, "$desc: waiter blocks on held key $key");
+
+	$h->query_safe("SELECT pg_advisory_unlock($key)");    # release -> waiter MUST be woken
+
+	my $granted = 0;
+	for (1 .. 120) { if (n_blocked_advisory($waiter) == 0) { $granted = 1; last; } usleep(100_000); }
+	ok($granted, "$desc: blocking waiter GRANTED after release (no false 53R70 / hang)");
+
+	$w->quit;    # the waiter now holds $key; quitting releases it
+	$h->quit;
+}
+
 # ----------
 # L1: strict pair + shared data + advisory counter baseline.
 # ----------
@@ -299,6 +346,36 @@ like($err11, qr/cluster lock acquire timeout|53R70|not available/i,
 	'L11: ... with a finite-timeout 53R70 (bounded deadlock resolution)');
 $h11->query_safe("SELECT pg_advisory_unlock(73)");
 $h11->quit;
+
+# ----------
+# L12: blocking waiter is GRANTED after release (spec-5.5 P0 regression guard).
+#   Both directions of one key -> covers local-master AND remote-master release
+#   drain (the key has a single master; one direction releases on the master node,
+#   the other on a non-master node).  A pre-fix local-master release deleted the
+#   holder without draining the waiter -> the waiter would false-timeout 53R70.
+# ----------
+blocking_grant_after_release($n0, $n1, 131, 'L12a node0-release/node1-wait');
+blocking_grant_after_release($n1, $n0, 131, 'L12b node1-release/node0-wait');
+
+# ----------
+# L13: mixed session+xact owner on the SAME key (§3.2 L5).  One backend holds
+#   pg_advisory_lock (session) and pg_advisory_xact_lock (xact) on the same key:
+#   COMMIT releases the xact owner but the session owner survives (still held
+#   cross-node); backend exit drains the single GES holder once (no double
+#   release, correct session-scope label at the :2476 backend-exit path).
+# ----------
+my $hm = $n0->background_psql('postgres', on_error_die => 1);
+$hm->query_safe("SELECT pg_advisory_lock(151)");        # session owner
+$hm->query_safe("BEGIN");
+$hm->query_safe("SELECT pg_advisory_xact_lock(151)");    # xact owner, same key (mixed)
+is(try_lock($n1, 'pg_try_advisory_lock(151)'),
+	'f', 'L13: mixed session+xact owner held cross-node');
+$hm->query_safe("COMMIT");                               # xact owner released; session survives
+is(try_lock($n1, 'pg_try_advisory_lock(151)'),
+	'f', 'L13: still held after COMMIT (session owner outlives the xact)');
+$hm->quit;                                               # backend exit drains the session holder
+ok(wait_until_acquirable($n1, 'pg_try_advisory_lock(151)', 15),
+	'L13: released after backend exit (mixed-owner drain — single holder, no double release)');
 
 $pair->stop_pair;
 done_testing();

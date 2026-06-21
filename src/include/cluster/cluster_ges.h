@@ -445,6 +445,15 @@ extern uint32 cluster_ges_send_release_and_wait(const struct ClusterResId *resid
 												const struct ClusterGrdHolderId *holder,
 												uint64 request_id);
 
+/*
+ * spec-5.5 P0 — local-master normal-release drain.  When the resource master is
+ * this node, drain + grant + WAKE queued waiters (mirror of the remote
+ * GES_RELEASE handler);  release_and_drain removes the holder, so the caller
+ * must NOT also call cluster_grd_release_holder_by_id on this path.
+ */
+extern void cluster_ges_release_and_drain_local(const struct ClusterResId *resid,
+												const struct ClusterGrdHolderId *holder);
+
 /* spec-4.6 D3 — send GES_REDECLARE (NEW current-epoch holder) to the
  * resource's current master and wait for the GRANT/REJECT ack.  Returns
  * GES_REJECT_REASON_NONE (0) on ack;  non-zero reason on reject/timeout

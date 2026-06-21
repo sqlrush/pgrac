@@ -777,6 +777,39 @@ ges_dispatch_grant_identity(const ClusterGrdGrantIdentity *g, const ClusterResId
 }
 
 /*
+ * cluster_ges_release_and_drain_local -- spec-5.5 P0 fix.
+ *
+ *	Normal-release drain when the resource master is THIS node.  The GRD entry
+ *	(holder + any queued blocking waiters) lives locally, so the release must
+ *	remove the holder, drain the convert queue + one FIFO waiter, and WAKE each
+ *	granted identity — exactly what the remote GES_RELEASE handler does for a
+ *	remote master (cluster_ges_lmon_drain_work_queue, GES_REQ_OPCODE_RELEASE).
+ *	This is the single mirror of that drain pattern for the local-master path.
+ *
+ *	Without it, cluster_lock_acquire_s6_release's cluster_grd_release_holder_by_id
+ *	deletes the holder but never pops a waiter, so a cross-node blocking
+ *	pg_advisory_lock() (or any blocking enqueue) on a key mastered here would
+ *	false-timeout 53R70 — or hang when cluster.ges_request_timeout_ms = -1.
+ *	release_and_drain itself removes the holder, so the caller must NOT also call
+ *	release_holder_by_id on this path.
+ */
+void
+cluster_ges_release_and_drain_local(const struct ClusterResId *resid,
+									const struct ClusterGrdHolderId *holder)
+{
+	ClusterGrdGrantIdentity granted[PGRAC_GRD_MAX_CONVERTS_PUBLIC + 1];
+	int n_granted;
+	int i;
+
+	if (resid == NULL || holder == NULL)
+		return;
+
+	n_granted = cluster_grd_release_and_drain(resid, holder, granted, lengthof(granted));
+	for (i = 0; i < n_granted; i++)
+		ges_dispatch_grant_identity(&granted[i], resid);
+}
+
+/*
  * spec-5.3 — route a REJECT for a convert (local source → wake its reply-wait
  * entry with the reject reason; remote source → wire GES_REPLY REJECT + dedup).
  */

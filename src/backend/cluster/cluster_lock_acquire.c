@@ -460,10 +460,25 @@ cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *req)
 	if (req == NULL)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 
-	(void)cluster_grd_release_holder_by_id(&req->resid, &req->holder);
-
-	if (cluster_grd_lookup_master(&req->resid) != cluster_node_id) {
-		/* Remote master: send GES_RELEASE (bounded ACK wait). */
+	if (cluster_grd_lookup_master(&req->resid) == cluster_node_id) {
+		/*
+		 * PGRAC: spec-5.5 P0 — local master.  The GRD entry (holder + any queued
+		 * blocking waiters) lives on THIS node, so the release must drain + grant
+		 * + WAKE the waiters, exactly like the remote GES_RELEASE handler does for
+		 * a remote master.  release_and_drain itself removes the holder, so we do
+		 * NOT call cluster_grd_release_holder_by_id here (that deletes the holder
+		 * without popping a waiter -> a cross-node blocking pg_advisory_lock()
+		 * waiter mastered here would false-timeout 53R70 / hang on -1).
+		 */
+		cluster_ges_release_and_drain_local(&req->resid, &req->holder);
+	} else {
+		/*
+		 * Remote master: the holder + waiters live on the master.  Drop the
+		 * (no-op for remote-mastered resources) local holder view, then send
+		 * GES_RELEASE (bounded ACK wait);  the master's drain handler runs the
+		 * authoritative drain + wake.
+		 */
+		(void)cluster_grd_release_holder_by_id(&req->resid, &req->holder);
 		(void)cluster_ges_send_release_and_wait(&req->resid, &req->holder, req->request_id);
 	}
 

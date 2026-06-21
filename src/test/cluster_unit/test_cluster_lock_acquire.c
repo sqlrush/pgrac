@@ -406,6 +406,13 @@ cluster_ges_send_release_and_wait(const struct ClusterResId *resid pg_attribute_
 	return 0;
 }
 
+/* spec-5.5 P0 — local-master release drain (no-op in the standalone fixture;
+ * the real drain+wake is exercised by cluster_tap t/286). */
+void
+cluster_ges_release_and_drain_local(const struct ClusterResId *resid pg_attribute_unused(),
+									const struct ClusterGrdHolderId *holder pg_attribute_unused())
+{}
+
 /* spec-5.3 — convert send + tm_convert_mode GUC (cluster_lock_acquire.c refs). */
 int cluster_tm_convert_mode = 0; /* CLUSTER_TM_CONVERT_MODE_CONVERT */
 
