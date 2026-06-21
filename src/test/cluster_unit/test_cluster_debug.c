@@ -643,6 +643,14 @@ cluster_gcs_get_clean_page_xfer_third_party_denied_count(void)
 	return 0;
 }
 
+/* spec-5.5 D8 stub: UL advisory counter accessor (cluster_advisory.o is not
+ * linked into this standalone unit). */
+uint64
+cluster_advisory_counter_read(int which pg_attribute_unused())
+{
+	return 0;
+}
+
 /* spec-5.4 D9 stubs: 6 SQ sequence counter accessors (cluster_sequence_shmem.o
  * is not linked into this standalone unit). */
 uint64

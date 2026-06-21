@@ -47,6 +47,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_ges.h" /* spec-5.3 — CONVERT_ROLLBACK send */
+#include "cluster/cluster_advisory.h" /* spec-5.5 D2/D3 — session-scope label */
 #include "cluster/cluster_native_lock_probe.h"
 #endif
 
@@ -1002,6 +1003,17 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 		&& cluster_lock_should_globalize(locktag, lockmode, sessionLock)) {
 		ClusterLockAcquireResult cluster_r;
 
+		/*
+		 * PGRAC: spec-5.5 D4 / §3.4 C1 (L214 invariant-as-code) — the cluster
+		 * path (which sends the GES REQUEST) runs ONLY on the 0->1 LOCALLOCK
+		 * edge.  The nLocks > 0 reentrant case returned LOCKACQUIRE_ALREADY_*
+		 * above, so a re-entrant advisory lock bumps the local refcount without
+		 * a second REQUEST, and only the final 1->0 release (via the :2214 edge
+		 * hook) sends RELEASE.  If this ever fired with nLocks > 0 the node would
+		 * register a duplicate holder / double-grant — assert the edge here.
+		 */
+		Assert(locallock->nLocks == 0);
+
 		/* spec-2.25 D13 — observability:  count cluster gate hits for
 		 * RELATION + OBJECT branches.  ADVISORY skipped because spec-2.21
 		 * already covers it via different observability surface (the
@@ -1015,6 +1027,12 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 		 * pass for XactLockTable* paths. */
 		if (locktag->locktag_type == LOCKTAG_TRANSACTION)
 			cluster_grd_inc_transaction_cluster_path();
+		/* spec-5.5 D8 — UL globalize counter: advisory (session + xact)
+		 * crossed into the cluster path on its 0->1 LOCALLOCK edge (the
+		 * nLocks > 0 reentrant case returned above, so this fires once per
+		 * distinct holder, L214). */
+		if (locktag->locktag_type == LOCKTAG_ADVISORY)
+			cluster_advisory_counter_inc(CLUSTER_ADVISORY_GLOBALIZE);
 
 		cluster_req.locktag = *locktag;
 		cluster_req.lockmode = lockmode;
@@ -1052,11 +1070,32 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 			/* Legacy paths: cluster already granted — proceed as native. */
 			cluster_need_s5 = true;
 			break;
+		case CLUSTER_LOCK_ACQUIRE_NOT_AVAIL:
+			/*
+			 * PGRAC: spec-5.5 D5 — try-lock (dontWait) found a conflicting
+			 * remote holder.  The seven-step default-deny already cancelled the
+			 * S3 reservation (S7), and no PG-native lock was taken, so just drop
+			 * the local lock table entry and return LOCKACQUIRE_NOT_AVAIL.  This
+			 * is normal "lock busy" semantics (no ereport, not fail-closed):
+			 * pg_try_advisory_lock returns false.  cluster_need_s5 is still false
+			 * here, so the cleanup macro at the error labels is a no-op.
+			 */
+			if (locallock->nLocks == 0)
+				RemoveLocalLock(locallock);
+			if (locallockp)
+				*locallockp = NULL;
+			return LOCKACQUIRE_NOT_AVAIL;
 		case CLUSTER_LOCK_ACQUIRE_PENDING:
 			ereport(ERROR, (errcode(ERRCODE_LOCK_NOT_AVAILABLE),
 							errmsg("cluster lock acquire pending (spec-2.21 Step 4 not yet wired)"),
 							errhint("This path becomes async-wait in Step 4 D4/D8.")));
 		case CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE:
+			/* PGRAC: spec-5.5 D6/D8 — advisory cross-node mutual exclusion could
+			 * not be proven (LMS unavailable).  Count the fail-closed before
+			 * raising 53R80; never silently grant locally (that would let two
+			 * nodes hold the same advisory key — the feature-078 §209 hole). */
+			if (locktag->locktag_type == LOCKTAG_ADVISORY)
+				cluster_advisory_counter_inc(CLUSTER_ADVISORY_FAILCLOSED);
 			ereport(ERROR, (errcode(ERRCODE_CLUSTER_LMS_UNAVAILABLE),
 							errmsg("cluster LMS not ready, fail-closed (spec-2.21 HC1)"),
 							errhint("Wait for cluster_lms_is_ready() == LMS_READY before acquiring "
@@ -2473,7 +2512,17 @@ LockReleaseAll(LOCKMETHODID lockmethodid, bool allLocks)
 			memset(&crel, 0, sizeof(crel));
 			crel.locktag = locallock->tag.lock;
 			crel.lockmode = locallock->tag.mode;
-			crel.sessionLock = false; /* LockReleaseAll path is xact-level */
+			/*
+			 * PGRAC: spec-5.5 D2 — derive the real scope instead of hardcoding
+			 * xact-level.  This path runs for allLocks=true (backend exit /
+			 * DISCARD ALL), which is the ONLY drain that reaches the cluster
+			 * hook for a session-scoped advisory holder (the allLocks=false
+			 * xact-end path keeps session-owned locallocks alive above).  A
+			 * session-owned locallock here must release as session-scoped so
+			 * the UL session-release counter and any scope-sensitive consumer
+			 * see the truth (§3.2 L5 / F0-11).
+			 */
+			crel.sessionLock = cluster_advisory_locallock_is_session_scoped(locallock);
 			crel.request_id = locallock->cluster_request_id;
 			memcpy(&crel.holder, locallock->cluster_holder_raw, sizeof(crel.holder));
 			crel.cluster_registered = true;

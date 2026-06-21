@@ -80,6 +80,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_ges_reply_wait.h" /* spec-2.23 D13 reply wait counters */
 #include "cluster/cluster_grd.h"	  /* cluster_grd_* observability accessors (spec-2.14 D6) */
 #include "cluster/cluster_sequence.h" /* cluster_sq_* counters (spec-5.4 D9) */
+#include "cluster/cluster_advisory.h" /* cluster_advisory_* counters (spec-5.5 D8) */
 #include "cluster/cluster_lmd.h"	  /* cluster_lmd_* observability accessors (spec-2.19 D10) */
 #include "cluster/cluster_lms.h"	  /* cluster_lms_* observability accessors (spec-2.18 D10) */
 #include "cluster/cluster_tt_slot.h"  /* spec-3.12 D5 retention counters */
@@ -1083,6 +1084,31 @@ dump_lmd(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_lmd_cross_node_victim_cancel_sent_count_get()));
 }
 
+
+/*
+ * dump_advisory -- spec-5.5 D8 UL user lock (cross-node advisory) observability.
+ *
+ *	Emits 5 rows under category='advisory':
+ *	  - advisory_globalize_count:       0->1 edges that entered the cluster path
+ *	  - advisory_session_release_count: session-scoped holders drained
+ *	  - advisory_try_grant_count:       NOWAIT conditional grants (S4 path)
+ *	  - advisory_try_notavail_count:    NOWAIT returned false (conflict)
+ *	  - advisory_failclosed_count:      mutual exclusion unprovable -> 53R80
+ */
+static void
+dump_advisory(ReturnSetInfo *rsinfo)
+{
+	emit_row(rsinfo, "advisory", "advisory_globalize_count",
+			 fmt_int64((int64)cluster_advisory_counter_read(CLUSTER_ADVISORY_GLOBALIZE)));
+	emit_row(rsinfo, "advisory", "advisory_session_release_count",
+			 fmt_int64((int64)cluster_advisory_counter_read(CLUSTER_ADVISORY_SESSION_RELEASE)));
+	emit_row(rsinfo, "advisory", "advisory_try_grant_count",
+			 fmt_int64((int64)cluster_advisory_counter_read(CLUSTER_ADVISORY_TRY_GRANT)));
+	emit_row(rsinfo, "advisory", "advisory_try_notavail_count",
+			 fmt_int64((int64)cluster_advisory_counter_read(CLUSTER_ADVISORY_TRY_NOTAVAIL)));
+	emit_row(rsinfo, "advisory", "advisory_failclosed_count",
+			 fmt_int64((int64)cluster_advisory_counter_read(CLUSTER_ADVISORY_FAILCLOSED)));
+}
 
 /*
  * dump_ges -- spec-2.13 D4 GES protocol skeleton observability.
@@ -2144,6 +2170,7 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		dump_recovery(rsinfo);
 		dump_scn(rsinfo);
 		dump_ges(rsinfo);
+		dump_advisory(rsinfo);
 		dump_grd(rsinfo);
 		dump_grd_recovery(rsinfo);
 		dump_lmd(rsinfo);

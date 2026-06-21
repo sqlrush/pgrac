@@ -45,6 +45,8 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_advisory.h"
+#include "cluster/cluster_ges.h" /* GES_REJECT_REASON_* for U6 */
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_lock_acquire.h"
 #include "miscadmin.h"
@@ -153,6 +155,24 @@ struct PGPROC *MyProc = NULL;
 
 int cluster_node_id = 0;
 bool cluster_local_fast_path_enabled = true;
+
+/* spec-5.5 D7 — cluster.advisory_lock_enabled gate GUC (default on).  The real
+ * backend gets this from cluster_guc.o; the standalone fixture stubs it so the
+ * inline cluster_lock_should_globalize() advisory branch is exercised. */
+bool cluster_advisory_lock_enabled = true;
+
+/* spec-5.5 D8 — UL counter stubs:  cluster_lock_release() bumps the session-
+ * release counter, but this fixture links neither the advisory shmem region nor
+ * cluster_advisory.o.  The real counter behaviour is covered by
+ * test_cluster_advisory; here they are inert no-ops. */
+void
+cluster_advisory_counter_inc(ClusterAdvisoryCounter which pg_attribute_unused())
+{}
+uint64
+cluster_advisory_counter_read(ClusterAdvisoryCounter which pg_attribute_unused())
+{
+	return 0;
+}
 
 int64
 GetCurrentTimestamp(void)
@@ -367,6 +387,19 @@ cluster_ges_send_request_and_wait(const struct ClusterResId *resid pg_attribute_
 	return stub_ges_reject_reason;
 }
 
+/* spec-5.5 D5 — NOWAIT send stub:  shares stub_ges_reject_reason so a test can
+ * drive GRANT (NONE) / conflict (LOCK_CONFLICT) / unreachable (TIMEOUT). */
+uint32
+cluster_ges_send_request_nowait_and_wait(const struct ClusterResId *resid pg_attribute_unused(),
+										 uint32 lockmode pg_attribute_unused(),
+										 const struct ClusterGrdHolderId *holder
+											 pg_attribute_unused(),
+										 uint64 request_id pg_attribute_unused(),
+										 int timeout_ms pg_attribute_unused())
+{
+	return stub_ges_reject_reason;
+}
+
 uint32
 cluster_ges_send_release_and_wait(const struct ClusterResId *resid pg_attribute_unused(),
 								  const struct ClusterGrdHolderId *holder pg_attribute_unused(),
@@ -514,13 +547,16 @@ UT_TEST(test_7step_top_level_monotonic_forward_no_cleanup_on_success)
 	cluster_lms_enabled = true;
 
 	/*
-	 * S4's dontwait timeout is still visible at the individual step
-	 * level; top-level cannot reach S4 until spec-2.21 wires S3
-	 * reservation completion.
+	 * spec-5.5 D5 — S4 dontwait now sends a conditional GES REQUEST_NOWAIT
+	 * instead of the spec-2.21 blanket FAIL_TIMEOUT short-circuit.  With the
+	 * default GES stub returning GRANT (reject_reason 0), S4 reports
+	 * NEED_PG_NATIVE_LOCK (the caller takes the PG-native lock — no S7 cleanup).
+	 * The conflict (NOT_AVAIL) and unreachable (FAIL_TIMEOUT) mappings are
+	 * exercised by test_ul_try_lock_nowait_s4_reject_mapping.
 	 */
 	req.dontwait = true;
 	r = cluster_lock_acquire_s4_remote_request_wait(&req);
-	UT_ASSERT_EQ((int)r, (int)CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT);
+	UT_ASSERT_EQ((int)r, (int)CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK);
 	UT_ASSERT_EQ(cluster_lock_acquire_s7_cleanup_count(), pre_s7);
 }
 
@@ -675,13 +711,119 @@ UT_TEST(test_7step_transaction_locktag_release_path_safe)
 }
 
 
+/* ============================================================
+ * spec-5.5 U1 — session-scoped advisory cross-node gate (D1 + D7).
+ *
+ *	The core feature-078 gap:  session-scoped pg_advisory_lock(key)
+ *	(sessionLock=true) was short-circuited native by HC11, so two nodes
+ *	never blocked each other.  D1 lifts LOCKTAG_ADVISORY ahead of the
+ *	HC11 short-circuit, gated by cluster.advisory_lock_enabled (D7).
+ *	xact-scoped advisory (sessionLock=false) was already cross-node
+ *	(spec-2.21) and must stay so; other session locks stay native.
+ * ============================================================ */
+UT_TEST(test_ul_session_advisory_globalize_gate)
+{
+	LOCKTAG adv;
+	LOCKTAG rel;
+	bool saved = cluster_advisory_lock_enabled;
+
+	memset(&adv, 0, sizeof(adv));
+	adv.locktag_field1 = 12345;				/* db oid */
+	adv.locktag_field2 = 42;				/* advisory key */
+	adv.locktag_type = LOCKTAG_ADVISORY;
+	adv.locktag_lockmethodid = USER_LOCKMETHOD;
+
+	cluster_advisory_lock_enabled = true;
+	/* Core gap fix: session-scoped advisory (sessionLock=true) globalizes. */
+	UT_ASSERT_EQ(cluster_lock_should_globalize(&adv, ExclusiveLock, true), true);
+	UT_ASSERT_EQ(cluster_lock_should_globalize(&adv, ShareLock, true), true);
+	/* xact-scoped advisory (sessionLock=false) still globalizes (spec-2.21). */
+	UT_ASSERT_EQ(cluster_lock_should_globalize(&adv, ExclusiveLock, false), true);
+	UT_ASSERT_EQ(cluster_lock_should_globalize(&adv, ShareLock, false), true);
+
+	/* GUC off = forensic/test-only unsafe single-node downgrade (Q6/R3):
+	 * advisory routes PG-native both session- and xact-scoped. */
+	cluster_advisory_lock_enabled = false;
+	UT_ASSERT_EQ(cluster_lock_should_globalize(&adv, ExclusiveLock, true), false);
+	UT_ASSERT_EQ(cluster_lock_should_globalize(&adv, ExclusiveLock, false), false);
+
+	/* Other session locks stay native regardless of the advisory GUC (R2):
+	 * a session-scoped RELATION lock must not globalize. */
+	cluster_advisory_lock_enabled = true;
+	memset(&rel, 0, sizeof(rel));
+	rel.locktag_field1 = 1;
+	rel.locktag_field2 = FirstNormalObjectId + 1;
+	rel.locktag_type = LOCKTAG_RELATION;
+	rel.locktag_lockmethodid = 1;
+	UT_ASSERT_EQ(cluster_lock_should_globalize(&rel, AccessExclusiveLock, true), false);
+
+	cluster_advisory_lock_enabled = saved;
+}
+
+
+/* ============================================================
+ * spec-5.5 U6 — try-lock (NOWAIT) S4 reject mapping (D5).
+ *
+ *	The requester half of the conditional-grant contract:  a dontwait acquire
+ *	sends GES REQUEST_NOWAIT, and the master's verdict maps to a result code.
+ *	GRANT -> NEED_PG_NATIVE_LOCK; LOCK_CONFLICT -> NOT_AVAIL (false, not ERROR);
+ *	a wire TIMEOUT (unreachable master) stays fail-closed; and a LOCK_CONFLICT
+ *	on a BLOCKING request is a protocol violation -> FAIL_INTERNAL (never
+ *	NOT_AVAIL).  The master-side "no waiter enqueued" half (T5) is covered by
+ *	test_cluster_grd (real grant_conditional); retransmit idempotency (T6) by
+ *	the e2e t/130.
+ * ============================================================ */
+UT_TEST(test_ul_try_lock_nowait_s4_reject_mapping)
+{
+	ClusterLockAcquireRequest req;
+	int saved_node = cluster_node_id;
+	uint32 saved_reject = stub_ges_reject_reason;
+	ClusterLockAcquireResult r;
+
+	cluster_node_id = 0;
+	memset(&req, 0, sizeof(req));
+	req.locktag.locktag_field1 = 12345;
+	req.locktag.locktag_field2 = 42;
+	req.locktag.locktag_type = LOCKTAG_ADVISORY;
+	req.locktag.locktag_lockmethodid = USER_LOCKMETHOD;
+	req.lockmode = ExclusiveLock;
+
+	/* dontwait + master GRANT (free) → NEED_PG_NATIVE_LOCK (caller takes PG lock). */
+	req.dontwait = true;
+	stub_ges_reject_reason = GES_REJECT_REASON_NONE;
+	r = cluster_lock_acquire_s4_remote_request_wait(&req);
+	UT_ASSERT_EQ((int)r, (int)CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK);
+
+	/* dontwait + master REJECT LOCK_CONFLICT → NOT_AVAIL (false, NOT ERROR). */
+	stub_ges_reject_reason = GES_REJECT_REASON_LOCK_CONFLICT;
+	r = cluster_lock_acquire_s4_remote_request_wait(&req);
+	UT_ASSERT_EQ((int)r, (int)CLUSTER_LOCK_ACQUIRE_NOT_AVAIL);
+
+	/* dontwait + wire TIMEOUT (unreachable master) → FAIL_TIMEOUT (fail-closed,
+	 * mutual exclusion unprovable; NOT a silent false). */
+	stub_ges_reject_reason = GES_REJECT_REASON_TIMEOUT;
+	r = cluster_lock_acquire_s4_remote_request_wait(&req);
+	UT_ASSERT_EQ((int)r, (int)CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT);
+
+	/* BLOCKING + LOCK_CONFLICT is a protocol violation (blocking conflicts
+	 * enqueue a waiter, never REJECT) → FAIL_INTERNAL, never NOT_AVAIL. */
+	req.dontwait = false;
+	stub_ges_reject_reason = GES_REJECT_REASON_LOCK_CONFLICT;
+	r = cluster_lock_acquire_s4_remote_request_wait(&req);
+	UT_ASSERT_EQ((int)r, (int)CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
+
+	stub_ges_reject_reason = saved_reject;
+	cluster_node_id = saved_node;
+}
+
+
 UT_DEFINE_GLOBALS();
 
 
 int
 main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 {
-	UT_PLAN(9);
+	UT_PLAN(11);
 
 	UT_RUN(test_7step_api_surface_linkable_and_initial_counters_zero);
 	UT_RUN(test_7step_s1_hc1_fail_closed);
@@ -692,6 +834,8 @@ main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 	UT_RUN(test_7step_transaction_should_globalize_gate);
 	UT_RUN(test_7step_transaction_locktag_path_routes_through_cluster);
 	UT_RUN(test_7step_transaction_locktag_release_path_safe);
+	UT_RUN(test_ul_session_advisory_globalize_gate);
+	UT_RUN(test_ul_try_lock_nowait_s4_reject_mapping);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

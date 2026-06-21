@@ -453,6 +453,15 @@ bool cluster_lock_acquire_cluster_path = true;
 bool cluster_local_fast_path_enabled = true;
 
 /*
+ * spec-5.5 D7:cluster.advisory_lock_enabled — master switch for cross-node
+ * advisory (user) lock globalization.  Default true.  When false, both
+ * session- and xact-scoped pg_advisory_lock* route PG-native (single-node
+ * semantics):  this is a forensic/test-only UNSAFE downgrade that silently
+ * disables cross-node advisory mutual exclusion (Q6/§3.3 R3).  PGC_SUSET.
+ */
+bool cluster_advisory_lock_enabled = true;
+
+/*
  * spec-2.22 D9:cluster.lmd_max_wait_edges cap.  Default 1024.
  * PGC_POSTMASTER — postmaster restart required to resize HTAB.
  */
@@ -2195,6 +2204,20 @@ cluster_init_guc(void)
 										  "testing.  PGC_SIGHUP."),
 							 &cluster_local_fast_path_enabled, true, PGC_SIGHUP, 0, NULL, NULL,
 							 NULL);
+
+	/* spec-5.5 D7:cross-node advisory (user) lock master switch. */
+	DefineCustomBoolVariable(
+		"cluster.advisory_lock_enabled",
+		gettext_noop("Enable cross-node globalization of advisory (user) locks."),
+		gettext_noop("When true (default), session- and xact-scoped "
+					 "pg_advisory_lock* acquire cross-node mutual exclusion via "
+					 "the GES enqueue substrate.  When false, advisory locks route "
+					 "PG-native (single-node semantics) — a forensic/test-only "
+					 "UNSAFE downgrade that SILENTLY disables cross-node advisory "
+					 "mutual exclusion.  Multi-node deployments that rely on "
+					 "advisory locks for application coordination MUST NOT disable "
+					 "this.  PGC_SUSET."),
+		&cluster_advisory_lock_enabled, true, PGC_SUSET, 0, NULL, NULL, NULL);
 
 	/* spec-2.22 D9:LMD wait-edge cap GUC. */
 	DefineCustomIntVariable(

@@ -257,7 +257,18 @@ typedef enum GesRequestOpcode {
 	 * Reuses the 64B GesRequestPayload (per-opcode field semantics differ;
 	 * lockmode locates the upgraded slot).
 	 */
-	GES_REQ_OPCODE_CONVERT_ROLLBACK = 14
+	GES_REQ_OPCODE_CONVERT_ROLLBACK = 14,
+	/*
+	 * spec-5.5 D5 (Q11) — conditional (NOWAIT) acquire for try-locks
+	 * (pg_try_advisory_lock).  Same 64B GesRequestPayload + REQUEST field
+	 * semantics; the ONLY behavioural difference is at the master: a conflict
+	 * is rejected immediately with GES_REJECT_REASON_LOCK_CONFLICT and does
+	 * NOT enqueue a waiter or fan out a BAST (non-enqueuing conditional grant).
+	 * 15 is the next free opcode (1-14 all used); the payload ABI is unchanged,
+	 * so no catversion bump.  Shares the REQUEST dedup / reply-wait path so a
+	 * lost reply retransmits idempotently (§3.5 T6).
+	 */
+	GES_REQ_OPCODE_REQUEST_NOWAIT = 15
 } GesRequestOpcode;
 
 typedef enum GesReplyOpcode {
@@ -419,6 +430,16 @@ struct ClusterResId;
 extern uint32 cluster_ges_send_request_and_wait(const struct ClusterResId *resid, uint32 lockmode,
 												const struct ClusterGrdHolderId *holder,
 												uint64 request_id, int timeout_ms);
+
+/*
+ * spec-5.5 D5 — conditional (NOWAIT) acquire for try-locks.  Returns
+ * GES_REJECT_REASON_NONE (granted) / GES_REJECT_REASON_LOCK_CONFLICT (held
+ * elsewhere -> caller maps NOT_AVAIL) / other reject reasons (fail-closed).
+ */
+extern uint32 cluster_ges_send_request_nowait_and_wait(const struct ClusterResId *resid,
+													   uint32 lockmode,
+													   const struct ClusterGrdHolderId *holder,
+													   uint64 request_id, int timeout_ms);
 
 extern uint32 cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 												const struct ClusterGrdHolderId *holder,

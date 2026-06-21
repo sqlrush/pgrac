@@ -90,7 +90,8 @@ static inline bool
 ges_request_uses_dedup(uint32 opcode)
 {
 	return opcode == GES_REQ_OPCODE_REQUEST || opcode == GES_REQ_OPCODE_CONVERT
-		   || opcode == GES_REQ_OPCODE_RELEASE;
+		   || opcode == GES_REQ_OPCODE_RELEASE
+		   || opcode == GES_REQ_OPCODE_REQUEST_NOWAIT; /* spec-5.5 D5 — idempotent retransmit */
 }
 
 static void
@@ -403,12 +404,13 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 	/* spec-5.3 D6:  opcode_max extended to CONVERT_ROLLBACK (14) so the
 	 * post-commit convert backout request passes the coarse range check
 	 * (source = requester / target = this master, like CONVERT / RELEASE).
-	 * spec-4.6 D3 had extended it to REDECLARE_DONE (13).  Opcodes 8-11
-	 * passing the coarse range check still fail closed in the explicit
-	 * switch below (dedicated-payload opcodes never reach this handler
+	 * spec-4.6 D3 had extended it to REDECLARE_DONE (13).  spec-5.5 D5 extends
+	 * it once more to REQUEST_NOWAIT (15) for the try-lock conditional request.
+	 * Opcodes 8-11 passing the coarse range check still fail closed in the
+	 * explicit switch below (dedicated-payload opcodes never reach this handler
 	 * legitimately — early dispatch above). */
 	if (!ges_validate_inbound(env, req->holder_node_id, holder_epoch, req->opcode,
-							  GES_REQ_OPCODE_REQUEST, GES_REQ_OPCODE_CONVERT_ROLLBACK,
+							  GES_REQ_OPCODE_REQUEST, GES_REQ_OPCODE_REQUEST_NOWAIT,
 							  payload_node_must_be_source)) {
 		cluster_grd_inc_ges_inbound_validation_fail();
 		return;
@@ -481,6 +483,7 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 		return;
 	}
 	case GES_REQ_OPCODE_REQUEST:
+	case GES_REQ_OPCODE_REQUEST_NOWAIT:	  /* spec-5.5 D5 — same work_queue path, conditional grant */
 	case GES_REQ_OPCODE_CONVERT:
 	case GES_REQ_OPCODE_RELEASE:
 	case GES_REQ_OPCODE_REDECLARE:		  /* spec-4.6 D3 — same work_queue path */
@@ -522,7 +525,13 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 	 */
 	if (req->opcode == GES_REQ_OPCODE_REQUEST || req->opcode == GES_REQ_OPCODE_CONVERT
 		|| req->opcode == GES_REQ_OPCODE_RELEASE || req->opcode == GES_REQ_OPCODE_REDECLARE
-		|| req->opcode == GES_REQ_OPCODE_CONVERT_ROLLBACK) {
+		|| req->opcode == GES_REQ_OPCODE_CONVERT_ROLLBACK
+		|| req->opcode == GES_REQ_OPCODE_REQUEST_NOWAIT) {
+		/* spec-5.5 D5 / §3.5 T6 — NOWAIT joins the dedup pre-lookup so a lost
+		 * GRANT/REJECT reply retransmits idempotently:  the retransmit hits
+		 * CACHED_REPLY (dkey.opcode == 15 distinguishes it from a blocking
+		 * REQUEST) and resends the original verdict instead of re-deciding
+		 * (which could see the requester's own just-built holder). */
 		ClusterGesDedupKey dkey;
 		uint8 dreply_buf[sizeof(GesReplyPayload)];
 		uint16 dreply_len = 0;
@@ -832,7 +841,8 @@ cluster_ges_lmon_drain_work_queue(void)
 		memcpy(&resid, req->resid, sizeof(resid));
 
 		switch ((GesRequestOpcode)req->opcode) {
-		case GES_REQ_OPCODE_REQUEST: {
+		case GES_REQ_OPCODE_REQUEST:
+		case GES_REQ_OPCODE_REQUEST_NOWAIT: {
 			/*
 				 * spec-2.23 D6 — GRD-owned conflict matrix + waiter queue.
 				 *
@@ -843,7 +853,13 @@ cluster_ges_lmon_drain_work_queue(void)
 				 *	(HC17/HC19).  conflict_holders[] surface is consumed by
 				 *	Step 5 D4 cluster_ges_send_bast_targeted (HC18 BAST
 				 *	target filter).
+				 *
+				 *	spec-5.5 D5 — REQUEST_NOWAIT (try-lock) takes the conditional
+				 *	variant grant_conditional:  a conflict returns
+				 *	CLUSTER_GRD_CONFLICT_NOWAIT (REJECT LOCK_CONFLICT, no waiter,
+				 *	no BAST) instead of enqueuing.  The grant path is identical.
 				 */
+			bool conditional = (req->opcode == GES_REQ_OPCODE_REQUEST_NOWAIT);
 			ClusterGrdConflictHolder conflict_holders[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
 			int n_conflict = 0;
 			ClusterGrdGrantAction action;
@@ -878,10 +894,15 @@ cluster_ges_lmon_drain_work_queue(void)
 				break;
 			}
 
-			action = cluster_grd_entry_enqueue_or_grant(
-				&resid, &holder, (int32)item.source_node_id, holder_request_id,
-				ges_request_shard_master_generation(req), req->opcode, (int)req->lockmode,
-				conflict_holders, &n_conflict);
+			action = conditional
+						 ? cluster_grd_entry_grant_conditional(
+							 &resid, &holder, (int32)item.source_node_id, holder_request_id,
+							 ges_request_shard_master_generation(req), req->opcode,
+							 (int)req->lockmode, conflict_holders, &n_conflict)
+						 : cluster_grd_entry_enqueue_or_grant(
+							 &resid, &holder, (int32)item.source_node_id, holder_request_id,
+							 ges_request_shard_master_generation(req), req->opcode,
+							 (int)req->lockmode, conflict_holders, &n_conflict);
 
 			if (action == CLUSTER_GRD_GRANT_NOW) {
 				if (cluster_lms_native_probe_required(&resid, (LOCKMODE)req->lockmode)) {
@@ -926,6 +947,31 @@ cluster_ges_lmon_drain_work_queue(void)
 				if (n_conflict > 0)
 					cluster_ges_send_bast_targeted(&resid, (int)req->lockmode, conflict_holders,
 												   n_conflict);
+			} else if (action == CLUSTER_GRD_CONFLICT_NOWAIT) {
+				/*
+				 * spec-5.5 D5 / T5 — try-lock conflict.  REJECT LOCK_CONFLICT
+				 * immediately:  no waiter was enqueued and no BAST is sent (the
+				 * key behavioural difference from a blocking REQUEST conflict).
+				 * The requester maps LOCK_CONFLICT -> LOCKACQUIRE_NOT_AVAIL
+				 * (pg_try_advisory_lock returns false).  Record the reply so a
+				 * retransmitted NOWAIT hits CACHED_REPLY (§3.5 T6 idempotent).
+				 */
+				GesReplyPayload reject;
+
+				memset(&reject, 0, sizeof(reject));
+				reject.opcode = GES_REPLY_OPCODE_REJECT;
+				reject.reply_for_opcode = req->opcode;
+				reject.reject_reason = GES_REJECT_REASON_LOCK_CONFLICT;
+				reject.holder_node_id = req->holder_node_id;
+				reject.holder_procno = req->holder_procno;
+				reject.holder_cluster_epoch_lo = req->holder_cluster_epoch_lo;
+				reject.holder_cluster_epoch_hi = req->holder_cluster_epoch_hi;
+				reject.holder_request_id_lo = req->holder_request_id_lo;
+				reject.holder_request_id_hi = req->holder_request_id_hi;
+				memcpy(reject.resid, req->resid, sizeof(reject.resid));
+				ges_record_dedup_reply_for_request((uint32)item.source_node_id, req, &reject);
+				cluster_grd_outbound_enqueue_lmon_reply(item.source_node_id, &reject,
+														sizeof(reject));
 			} else if (action == CLUSTER_GRD_WAIT_QUEUE_FULL) {
 				GesReplyPayload reject;
 
@@ -1239,18 +1285,33 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 		ClusterGrdConflictHolder conflict_holders[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
 		int n_conflict = 0;
 		ClusterGrdGrantAction action;
+		bool conditional = (send_opcode == GES_REQ_OPCODE_REQUEST_NOWAIT);
 		volatile bool timed_out = false; /* set in PG_TRY, read after — must be volatile */
 
 		master_gen = cluster_lms_get_shard_master_generation();
-		action = cluster_grd_entry_enqueue_or_grant(resid, holder, cluster_node_id, request_id,
-													master_gen, send_opcode, (int)lockmode,
-													conflict_holders, &n_conflict);
+		/* spec-5.5 D5 — local-master try-lock: conditional grant, never enqueue. */
+		action = conditional
+					 ? cluster_grd_entry_grant_conditional(resid, holder, cluster_node_id,
+														   request_id, master_gen, send_opcode,
+														   (int)lockmode, conflict_holders,
+														   &n_conflict)
+					 : cluster_grd_entry_enqueue_or_grant(resid, holder, cluster_node_id,
+														  request_id, master_gen, send_opcode,
+														  (int)lockmode, conflict_holders,
+														  &n_conflict);
 
 		if (action == CLUSTER_GRD_GRANT_NOW) {
 			if (cluster_ges_state != NULL)
 				pg_atomic_fetch_add_u64(&cluster_ges_state->request_defer_count, 1);
 			return GES_REJECT_REASON_NONE; /* holder registered; S5 verify-only */
 		}
+		/*
+		 * spec-5.5 D5 — local-master try-lock conflict:  return LOCK_CONFLICT
+		 * immediately (no waiter was queued, no BAST), the requester maps it to
+		 * NOT_AVAIL (false).  Reached only when conditional == true.
+		 */
+		if (action == CLUSTER_GRD_CONFLICT_NOWAIT)
+			return GES_REJECT_REASON_LOCK_CONFLICT;
 		if (action != CLUSTER_GRD_ENQUEUED_WAITER) {
 			/* WAIT_QUEUE_FULL / NOT_READY / ILLEGAL — fail closed, never grant. */
 			return GES_REJECT_REASON_WORK_QUEUE_FULL;
@@ -1519,6 +1580,24 @@ cluster_ges_send_request_and_wait(const struct ClusterResId *resid, uint32 lockm
 {
 	return ges_send_request_opcode_and_wait(resid, lockmode, holder, request_id, timeout_ms,
 											GES_REQ_OPCODE_REQUEST);
+}
+
+/*
+ * spec-5.5 D5 — conditional (NOWAIT) request for try-locks (pg_try_advisory_lock).
+ *
+ *	The master runs a non-enqueuing conditional grant:  GES_REJECT_REASON_NONE
+ *	on grant, GES_REJECT_REASON_LOCK_CONFLICT on conflict (no waiter enqueued,
+ *	no BAST).  timeout_ms bounds the wire round-trip (retransmit on a lost reply,
+ *	dedup-idempotent per §3.5 T6) — it is NOT a lock wait, since the master
+ *	replies immediately whether the lock is free or held.
+ */
+uint32
+cluster_ges_send_request_nowait_and_wait(const struct ClusterResId *resid, uint32 lockmode,
+										 const struct ClusterGrdHolderId *holder, uint64 request_id,
+										 int timeout_ms)
+{
+	return ges_send_request_opcode_and_wait(resid, lockmode, holder, request_id, timeout_ms,
+											GES_REQ_OPCODE_REQUEST_NOWAIT);
 }
 
 /*

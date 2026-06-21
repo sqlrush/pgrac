@@ -658,6 +658,21 @@ cluster_grd_entry_enqueue_or_grant(const struct ClusterResId *r pg_attribute_unu
 		*nout = 0;
 	return CLUSTER_GRD_GRANT_NOW;
 }
+/* spec-5.5 D5 — conditional (NOWAIT) variant stub (mirror: grant, no conflict). */
+ClusterGrdGrantAction
+cluster_grd_entry_grant_conditional(const struct ClusterResId *r pg_attribute_unused(),
+									const struct ClusterGrdHolderId *h pg_attribute_unused(),
+									int32 src pg_attribute_unused(),
+									uint64 req_id pg_attribute_unused(),
+									uint64 shard_master_generation pg_attribute_unused(),
+									uint32 op pg_attribute_unused(), int mode pg_attribute_unused(),
+									struct ClusterGrdConflictHolder *out pg_attribute_unused(),
+									int *nout pg_attribute_unused())
+{
+	if (nout != NULL)
+		*nout = 0;
+	return CLUSTER_GRD_GRANT_NOW;
+}
 int
 cluster_grd_entry_release_and_pop_compatible_waiter(
 	const struct ClusterResId *r pg_attribute_unused(),

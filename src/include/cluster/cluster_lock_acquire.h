@@ -113,7 +113,14 @@ typedef enum ClusterLockAcquireResult {
 	/* spec-5.3 D4 — convert from→to is not a valid partial-order upgrade
 	 * (LATERAL / no matching holder); caller maps to
 	 * ERRCODE_CLUSTER_GES_ILLEGAL_LOCK_CONVERSION (53R74). */
-	CLUSTER_LOCK_ACQUIRE_FAIL_ILLEGAL_CONVERT = 21
+	CLUSTER_LOCK_ACQUIRE_FAIL_ILLEGAL_CONVERT = 21,
+	/* spec-5.5 D5 — try-lock (dontwait) found a conflicting holder via a
+	 * conditional GES REQUEST_NOWAIT.  This is NOT a fail-closed condition:
+	 * the caller (lock.c) maps it to LOCKACQUIRE_NOT_AVAIL so
+	 * pg_try_advisory_lock returns false (not ERROR).  Distinct from
+	 * FAIL_TIMEOUT (blocking-wait expiry) and FAIL_LMS_UNAVAILABLE
+	 * (mutual exclusion unprovable -> 53R80). */
+	CLUSTER_LOCK_ACQUIRE_NOT_AVAIL = 22
 } ClusterLockAcquireResult;
 
 
@@ -309,13 +316,23 @@ cluster_lock_should_globalize(const LOCKTAG *locktag, LOCKMODE lockmode, bool se
 {
 	if (locktag == NULL)
 		return false;
+
+	/*
+	 * spec-5.5 D1:  advisory (user) locks globalize cross-node for BOTH
+	 * session- and xact-scoped acquires, gated by cluster.advisory_lock_enabled.
+	 * Lifted ahead of the HC11 sessionLock short-circuit because session-scoped
+	 * pg_advisory_lock(key) is the most common advisory form and was previously
+	 * stranded native (feature-078 cross-node mutual-exclusion gap).  No mode
+	 * filter:  advisory S and X are independent locks (no convert).  Other
+	 * session locks (RELATION / OBJECT session-scope) stay native (HC11 below).
+	 */
+	if (locktag->locktag_type == LOCKTAG_ADVISORY)
+		return cluster_advisory_lock_enabled;
+
 	if (sessionLock)
-		return false; /* HC11: session advisory stays native */
+		return false; /* HC11: non-advisory session locks stay native */
 
 	switch (locktag->locktag_type) {
-	case LOCKTAG_ADVISORY:
-		return true; /* spec-2.21 ship — no mode filter */
-
 	case LOCKTAG_RELATION:
 		/* HC23 OLTP fast-path:  AccessShare / RowShare / RowExclusive go
 			 * PG-native.  ShareUpdateExclusiveLock (=5) is the lowest mode

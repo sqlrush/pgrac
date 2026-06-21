@@ -39,6 +39,7 @@ include $(top_builddir)/src/Makefile.global
 ifeq ($(enable_pgrac_cluster), yes)
 OBJS = \
 	cluster.o \
+	cluster_advisory.o \
 	cluster_conf.o \
 	cluster_cssd.o \
 	cluster_debug.o \

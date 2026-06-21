@@ -958,6 +958,11 @@ typedef enum ClusterGrdGrantAction {
 	CLUSTER_GRD_ENQUEUED_WAITER = 1,
 	CLUSTER_GRD_WAIT_QUEUE_FULL = 2,
 	CLUSTER_GRD_NOT_READY = 3,
+	/* spec-5.5 D5 — conditional (NOWAIT) acquire saw a conflict.  Returned
+	 * ONLY by cluster_grd_entry_grant_conditional (try-lock path):  the entry
+	 * was NOT mutated (no waiter enqueued, no holder added) so the caller
+	 * rejects with GES_REJECT_REASON_LOCK_CONFLICT without a BAST. */
+	CLUSTER_GRD_CONFLICT_NOWAIT = 4,
 } ClusterGrdGrantAction;
 
 /*
@@ -974,6 +979,21 @@ typedef enum ClusterGrdGrantAction {
  *	entries (16).  *n_conflict_out is 0 on GRANT_NOW.
  */
 extern ClusterGrdGrantAction cluster_grd_entry_enqueue_or_grant(
+	const ClusterResId *resid, const ClusterGrdHolderId *holder, int32 source_node_id,
+	uint64 request_id, uint64 shard_master_generation, uint32 request_opcode,
+	int /* LOCKMODE */ lockmode, ClusterGrdConflictHolder *conflict_holders_out,
+	int *n_conflict_out);
+
+/*
+ * spec-5.5 D5 — conditional (NOWAIT) variant of the above for try-locks.
+ *
+ *	Runs the identical conflict scan + same-backend self-exclusion + no-conflict
+ *	grant as cluster_grd_entry_enqueue_or_grant (single source of truth), but on
+ *	conflict returns CLUSTER_GRD_CONFLICT_NOWAIT WITHOUT enqueuing a waiter.  The
+ *	conflict_holders_out / n_conflict_out snapshot is NOT filled (no BAST is sent
+ *	on the conditional path).  Same signature for call-site symmetry.
+ */
+extern ClusterGrdGrantAction cluster_grd_entry_grant_conditional(
 	const ClusterResId *resid, const ClusterGrdHolderId *holder, int32 source_node_id,
 	uint64 request_id, uint64 shard_master_generation, uint32 request_opcode,
 	int /* LOCKMODE */ lockmode, ClusterGrdConflictHolder *conflict_holders_out,

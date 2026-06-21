@@ -47,6 +47,7 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_advisory.h" /* spec-5.5 D8 — UL counters */
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_ges_mode.h" /* spec-5.3 D1 — ges_mode_convert_class for UPGRADE filter */
@@ -285,25 +286,39 @@ ClusterLockAcquireResult
 cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req)
 {
 	uint32 reject;
+	bool dontwait;
+	bool is_advisory;
 
 	ensure_counter_initialized();
 
 	if (req == NULL)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 
-	if (req->dontwait)
-		return CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT; /* ConditionalLock semantic */
+	dontwait = req->dontwait;
+	is_advisory = (req->locktag.locktag_type == LOCKTAG_ADVISORY);
 
 	pg_atomic_fetch_add_u64(&stub_s4_remote_count, 1);
 
 	/*
-	 * Remote-master send-and-wait (real wire since spec-2.23/2.27).
+	 * spec-5.5 D5 — try-lock (dontwait) sends a conditional GES REQUEST_NOWAIT
+	 * (real wire) instead of the spec-2.21 blanket FAIL_TIMEOUT short-circuit.
+	 * The master grants if the resource is free, else REJECTs LOCK_CONFLICT
+	 * immediately (no waiter enqueued, no BAST).  Blocking acquires take the
+	 * enqueue-and-wait path.  Both use the real wire since spec-2.23/2.27.
 	 */
-	reject = cluster_ges_send_request_and_wait(&req->resid, (uint32)req->lockmode, &req->holder,
-											   req->request_id,
-											   /* timeout_ms */ 0);
-	if (reject == GES_REJECT_REASON_NONE)
+	if (dontwait)
+		reject = cluster_ges_send_request_nowait_and_wait(&req->resid, (uint32)req->lockmode,
+														  &req->holder, req->request_id,
+														  /* timeout_ms */ 0);
+	else
+		reject = cluster_ges_send_request_and_wait(&req->resid, (uint32)req->lockmode, &req->holder,
+												   req->request_id,
+												   /* timeout_ms */ 0);
+	if (reject == GES_REJECT_REASON_NONE) {
+		if (dontwait && is_advisory)
+			cluster_advisory_counter_inc(CLUSTER_ADVISORY_TRY_GRANT);
 		return CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK;
+	}
 
 	/*
 	 * spec-4.6 D4 — map the REAL GesRejectReason enum.  The previous
@@ -313,6 +328,21 @@ cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req
 	 * the remaster work landed).
 	 */
 	switch ((GesRejectReason)reject) {
+	case GES_REJECT_REASON_LOCK_CONFLICT:
+		/*
+		 * spec-5.5 D5 — only the conditional (NOWAIT) path produces a
+		 * LOCK_CONFLICT reject; a blocking REQUEST conflict enqueues a waiter
+		 * and never REJECTs.  Map the try-lock conflict to NOT_AVAIL (caller
+		 * returns false — normal "lock busy", NOT fail-closed §3.5 T3).  A
+		 * LOCK_CONFLICT on a blocking request is a protocol violation -> fail
+		 * closed (FAIL_INTERNAL).
+		 */
+		if (dontwait) {
+			if (is_advisory)
+				cluster_advisory_counter_inc(CLUSTER_ADVISORY_TRY_NOTAVAIL);
+			return CLUSTER_LOCK_ACQUIRE_NOT_AVAIL;
+		}
+		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 	case GES_REJECT_REASON_WORK_QUEUE_FULL:
 		/* Transient master-side capacity — retryable timeout surface. */
 		return CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
@@ -333,11 +363,8 @@ cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req
 		 * deferred to the CF/PCM block layer).  Not retryable — surfaces as
 		 * ERRCODE_FEATURE_NOT_SUPPORTED (0A000). */
 		return CLUSTER_LOCK_ACQUIRE_FAIL_FEATURE_NOT_SUPPORTED;
-	case GES_REJECT_REASON_LOCK_CONFLICT:
 	case GES_REJECT_REASON_NONE:
 	default:
-		/* LOCK_CONFLICT on a REQUEST is anomalous (conflicts enqueue a
-		 * waiter, they do not REJECT) — fail closed. */
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 	}
 }
@@ -459,6 +486,12 @@ cluster_lock_release(const ClusterLockReleaseRequest *req)
 
 	if (req == NULL || !req->cluster_registered)
 		return;
+
+	/* spec-5.5 D8 — UL session-release counter:  a session-scoped advisory
+	 * holder is being drained (per-key unlock / unlock_all via the :2214 edge
+	 * hook, or backend-exit via the LockReleaseAll drain). */
+	if (req->sessionLock && req->locktag.locktag_type == LOCKTAG_ADVISORY)
+		cluster_advisory_counter_inc(CLUSTER_ADVISORY_SESSION_RELEASE);
 
 	memset(&internal, 0, sizeof(internal));
 	internal.locktag = req->locktag;
@@ -775,6 +808,18 @@ cluster_lock_decide_op(const ClusterLockAcquireRequest *req, LOCKMODE *current_m
 		*weaker_locallock_out = NULL;
 
 	if (req == NULL)
+		return CLUSTER_LOCK_OP_REQUEST;
+	/*
+	 * spec-5.5 §3.8 MO2 / Q10 — advisory (user) locks NEVER convert.  PG treats
+	 * advisory ShareLock and ExclusiveLock on the same key as independent
+	 * additive holds (a session may hold both), so acquiring a stronger advisory
+	 * mode while holding a weaker one on the same key is a second independent
+	 * holder (REQUEST), not an upgrade.  Routing it through the blocking GES
+	 * convert (S5 cluster_ges_send_convert_and_wait) would also break
+	 * pg_try_advisory_lock's non-blocking contract — a try-lock must return
+	 * true/false immediately, never enqueue a waiter and wait.
+	 */
+	if (req->locktag.locktag_type == LOCKTAG_ADVISORY)
 		return CLUSTER_LOCK_OP_REQUEST;
 	/* spec-5.3 Q1=B escape hatch — additive keeps the current REQUEST model. */
 	if (cluster_tm_convert_mode != CLUSTER_TM_CONVERT_MODE_CONVERT)

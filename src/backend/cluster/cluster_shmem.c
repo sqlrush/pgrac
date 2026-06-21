@@ -68,6 +68,7 @@
 #include "cluster/cluster_scn.h"			/* cluster_scn_shmem_register (1.15) */
 #include "cluster/cluster_sequence.h"		/* cluster_sequence_shmem_register (spec-5.4 D1) */
 #include "cluster/cluster_ges.h"			/* cluster_ges_shmem_register (spec-2.13) */
+#include "cluster/cluster_advisory.h"		/* cluster_advisory_shmem_register (spec-5.5 D8) */
 #include "cluster/cluster_ges_reply_wait.h" /* cluster_ges_reply_wait_shmem_register (spec-2.23 D1) */
 #include "cluster/cluster_grd.h"			/* cluster_grd_shmem_register (spec-2.14) */
 #include "cluster/cluster_grd_pending.h"	/* cluster_grd_pending_shmem_register (spec-2.16 D3) */
@@ -571,6 +572,11 @@ cluster_init_shmem_module(void)
 	 * skeleton; 2 atomic uint64 defer counters; lock-free per Q4.1). */
 	if (cluster_shmem_lookup_region("pgrac cluster ges") == NULL)
 		cluster_ges_shmem_register();
+
+	/* spec-5.5 D8: register cluster_advisory shmem region (UL observability
+	 * counters; 5 atomic uint64; lock-free). */
+	if (cluster_shmem_lookup_region("pgrac cluster advisory") == NULL)
+		cluster_advisory_shmem_register();
 
 	/* spec-2.23 D1: register cluster_ges_reply_wait shmem region
 	 * (cross-node reply correlation HTAB; 5-tuple key HC17;

@@ -611,6 +611,20 @@ extern bool cluster_lock_acquire_cluster_path;
 extern bool cluster_local_fast_path_enabled;
 
 /*
+ * cluster.advisory_lock_enabled (spec-5.5 D7).
+ *
+ *	context: PGC_SUSET
+ *	default: true
+ *
+ *	Master switch for cross-node advisory (user) lock globalization.  When
+ *	false, both session- and xact-scoped pg_advisory_lock* route PG-native
+ *	(single-node semantics) — a forensic/test-only UNSAFE downgrade that
+ *	silently disables cross-node advisory mutual exclusion.  Read by the
+ *	inline cluster_lock_should_globalize() advisory branch.
+ */
+extern bool cluster_advisory_lock_enabled;
+
+/*
  * cluster.lmd_max_wait_edges (spec-2.22 D9).
  *
  *	context: PGC_POSTMASTER

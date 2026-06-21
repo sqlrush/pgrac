@@ -467,6 +467,13 @@ void
 cluster_sequence_shmem_register(void)
 {}
 
+/* spec-5.5 D8 stub: cluster_init_shmem_module also calls
+ * cluster_advisory_shmem_register (cluster_advisory.c); the unit harness does
+ * not link that object, so provide a no-op. */
+void
+cluster_advisory_shmem_register(void)
+{}
+
 /* spec-3.4e D6 stub: cluster_init_shmem_module also calls
  * cluster_lock_path_shmem_register (cluster_itl.c).  cluster_unit
  * test binary doesn't link cluster_itl.o;  provide no-op stub. */

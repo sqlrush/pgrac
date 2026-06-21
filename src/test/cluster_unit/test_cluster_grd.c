@@ -2282,6 +2282,131 @@ UT_TEST(test_5_1c_u9c_different_backend_normal)
 	convert_teardown();
 }
 
+/* spec-5.5 U6/T5 — conditional (NOWAIT) grant never enqueues a waiter.
+ *
+ *	cluster_grd_entry_grant_conditional grants when the resource is free and,
+ *	on conflict, returns CLUSTER_GRD_CONFLICT_NOWAIT WITHOUT touching the entry
+ *	(no waiter enqueued, holder count unchanged) — the master-side correctness
+ *	behind pg_try_advisory_lock returning false.  We prove "no waiter" by
+ *	contrast: releasing the holder pops 0 compatible waiters (a blocking
+ *	enqueue_or_grant would have left one to grant). */
+UT_TEST(test_ul_grant_conditional_no_waiter_enqueued)
+{
+	int saved = cluster_node_id;
+	ClusterResId resid;
+	ClusterGrdHolderId h;
+	ClusterGrdEntry *e = NULL;
+	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdWaiterIdentity granted[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	int n_conflict = -1;
+	int popped;
+
+	cluster_node_id = 0;
+	convert_reset();
+	bast_resid(5150, &resid);
+
+	/* node1 holds ExclusiveLock. */
+	h = bast_holder(1, 100, 1);
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 1, 0, UT_GES_OPCODE_REQUEST,
+														 ExclusiveLock, conflicts, &n_conflict),
+				 (int)CLUSTER_GRD_GRANT_NOW);
+	UT_ASSERT_EQ((int)cluster_grd_entry_lookup_or_create(&resid, false, &e),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_ngranted(e), 1);
+
+	/* node2 try-locks ExclusiveLock (conflict) → CONFLICT_NOWAIT, entry untouched. */
+	h = bast_holder(2, 200, 2);
+	n_conflict = -1;
+	UT_ASSERT_EQ((int)cluster_grd_entry_grant_conditional(&resid, &h, 2, 2, 0, UT_GES_OPCODE_REQUEST,
+														  ExclusiveLock, conflicts, &n_conflict),
+				 (int)CLUSTER_GRD_CONFLICT_NOWAIT);
+	UT_ASSERT_EQ(cluster_grd_entry_ngranted(e), 1); /* node2 NOT added as a holder */
+
+	/* Release node1: zero compatible waiters pop (grant_conditional enqueued none). */
+	h = bast_holder(1, 100, 1);
+	popped = cluster_grd_entry_release_and_pop_compatible_waiter(&resid, &h, granted,
+																PGRAC_GRD_MAX_HOLDERS_PUBLIC);
+	UT_ASSERT_EQ(popped, 0);
+
+	/* node2 free now: conditional grant succeeds. */
+	h = bast_holder(2, 200, 3);
+	n_conflict = -1;
+	UT_ASSERT_EQ((int)cluster_grd_entry_grant_conditional(&resid, &h, 2, 3, 0, UT_GES_OPCODE_REQUEST,
+														  ExclusiveLock, conflicts, &n_conflict),
+				 (int)CLUSTER_GRD_GRANT_NOW);
+
+	cluster_node_id = saved;
+	convert_teardown();
+}
+
+/* spec-5.5 U2 — advisory resid encoding:  the same (db,key) advisory lock maps
+ * to a stable resid, distinct keys never collide, and because the encode is
+ * lockmode-independent the S and X holds of one key share a resid (the same
+ * cross-node mutual-exclusion domain — X excludes S on the same key). */
+UT_TEST(test_ul_advisory_resid_encoding)
+{
+	LOCKTAG a;
+	LOCKTAG b;
+	ClusterResId ra;
+	ClusterResId ra2;
+	ClusterResId rb;
+
+	memset(&a, 0, sizeof(a));
+	a.locktag_field1 = 12345; /* db */
+	a.locktag_field2 = 42;	  /* advisory key */
+	a.locktag_field4 = 1;	  /* int8 advisory type */
+	a.locktag_type = LOCKTAG_ADVISORY;
+	a.locktag_lockmethodid = USER_LOCKMETHOD;
+
+	cluster_grd_resid_encode(&a, &ra);
+	cluster_grd_resid_encode(&a, &ra2);
+	/* deterministic + lockmode-independent → S and X of this key share resid. */
+	UT_ASSERT_EQ(memcmp(&ra, &ra2, sizeof(ClusterResId)), 0);
+
+	/* a different advisory key must not collide. */
+	b = a;
+	b.locktag_field2 = 43;
+	cluster_grd_resid_encode(&b, &rb);
+	UT_ASSERT(memcmp(&ra, &rb, sizeof(ClusterResId)) != 0);
+}
+
+/* spec-5.5 U4 — advisory mode matrix via the conditional (try-lock) path:
+ * S/S compatible (both granted), S/X conflict (CONFLICT_NOWAIT).  X/X conflict
+ * is pinned by test_ul_grant_conditional_no_waiter_enqueued. */
+UT_TEST(test_ul_advisory_mode_matrix_conditional)
+{
+	int saved = cluster_node_id;
+	ClusterResId resid;
+	ClusterGrdHolderId h;
+	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	int n_conflict = -1;
+
+	cluster_node_id = 0;
+	convert_reset();
+	bast_resid(5160, &resid);
+
+	/* node1 ShareLock → grant. */
+	h = bast_holder(1, 100, 1);
+	UT_ASSERT_EQ((int)cluster_grd_entry_grant_conditional(&resid, &h, 1, 1, 0, UT_GES_OPCODE_REQUEST,
+														  ShareLock, conflicts, &n_conflict),
+				 (int)CLUSTER_GRD_GRANT_NOW);
+
+	/* node2 ShareLock — S/S compatible → conditional grant. */
+	h = bast_holder(2, 200, 2);
+	UT_ASSERT_EQ((int)cluster_grd_entry_grant_conditional(&resid, &h, 2, 2, 0, UT_GES_OPCODE_REQUEST,
+														  ShareLock, conflicts, &n_conflict),
+				 (int)CLUSTER_GRD_GRANT_NOW);
+
+	/* node3 ExclusiveLock — S/X conflict → CONFLICT_NOWAIT (no waiter). */
+	h = bast_holder(3, 300, 3);
+	UT_ASSERT_EQ((int)cluster_grd_entry_grant_conditional(&resid, &h, 3, 3, 0, UT_GES_OPCODE_REQUEST,
+														  ExclusiveLock, conflicts, &n_conflict),
+				 (int)CLUSTER_GRD_CONFLICT_NOWAIT);
+
+	cluster_node_id = saved;
+	convert_teardown();
+}
+
 /* spec-5.1c U5 — bast_consume drains the pending convert before a waiter
  * (the spec-5.1b drain semantics through the BAST-side seam). */
 UT_TEST(test_5_1c_u5_bast_consume_drains)
@@ -2408,7 +2533,7 @@ int
  * other cluster_unit binaries; argv is intentionally unused. */
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(48); /* spec-5.3: +6 (U14/U15/U17/U18/U22/U23) over the prior 42 */
+	UT_PLAN(51); /* spec-5.3: +6 over the prior 42; spec-5.5: +3 (grant_conditional/resid/mode) */
 
 	UT_RUN(test_grd_clusterresid_size_16);
 	UT_RUN(test_grd_resid_encode_decode_roundtrip);
@@ -2467,6 +2592,9 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_5_1c_u9a_self_conflict_excluded);
 	UT_RUN(test_5_1c_u9b_self_plus_other_keeps_other);
 	UT_RUN(test_5_1c_u9c_different_backend_normal);
+	UT_RUN(test_ul_grant_conditional_no_waiter_enqueued);
+	UT_RUN(test_ul_advisory_resid_encoding);
+	UT_RUN(test_ul_advisory_mode_matrix_conditional);
 	UT_RUN(test_5_1c_u5_bast_consume_drains);
 	UT_RUN(test_5_1c_u6_bast_consume_empty_and_guards);
 	UT_RUN(test_5_1c_u10_bast_deliver_ok_predicate);

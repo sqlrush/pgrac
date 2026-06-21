@@ -2332,12 +2332,22 @@ cluster_grd_entry_promote_waiter(ClusterGrdEntry *entry, const ClusterGrdHolderI
  *	that equivalence against PG's live conflict table.
  * ============================================================ */
 
-ClusterGrdGrantAction
-cluster_grd_entry_enqueue_or_grant(const ClusterResId *resid, const ClusterGrdHolderId *holder,
-								   int32 source_node_id, uint64 request_id,
-								   uint64 shard_master_generation, uint32 request_opcode,
-								   int lockmode, ClusterGrdConflictHolder *conflict_holders_out,
-								   int *n_conflict_out)
+/*
+ * spec-5.5 D5 — shared implementation for the blocking (enqueue_or_grant) and
+ * conditional (grant_conditional) grant paths.  Keeping ONE conflict scan +
+ * self-exclusion + no-conflict grant body means the try-lock path can never
+ * diverge from the blocking path's hard-won correctness (spec-5.1c D5 self-
+ * conflict exclusion, L364).  The only difference is at the conflict branch:
+ * conditional callers get CLUSTER_GRD_CONFLICT_NOWAIT (entry untouched) instead
+ * of an enqueued waiter.
+ */
+static ClusterGrdGrantAction
+cluster_grd_entry_enqueue_or_grant_impl(const ClusterResId *resid,
+										const ClusterGrdHolderId *holder, int32 source_node_id,
+										uint64 request_id, uint64 shard_master_generation,
+										uint32 request_opcode, int lockmode,
+										ClusterGrdConflictHolder *conflict_holders_out,
+										int *n_conflict_out, bool conditional)
 {
 	ClusterGrdEntry *entry = NULL;
 	ClusterGrdEntryResult lookup_result;
@@ -2421,6 +2431,19 @@ cluster_grd_entry_enqueue_or_grant(const ClusterResId *resid, const ClusterGrdHo
 	}
 
 	/*
+	 * spec-5.5 D5 — conditional (NOWAIT) path: a conflict means the try-lock
+	 * fails immediately.  Do NOT enqueue a waiter and do NOT touch the entry;
+	 * the caller rejects with LOCK_CONFLICT and sends no BAST (T5).  The
+	 * conflict_holders_out snapshot was populated by step (1) above but the
+	 * conditional caller does not consume it.
+	 */
+	if (conditional) {
+		SpinLockRelease(&entry->lock);
+		cluster_grd_entry_release(entry);
+		return CLUSTER_GRD_CONFLICT_NOWAIT;
+	}
+
+	/*
 	 * (3) Conflict → enqueue waiter with full reply identity (HC17/HC19).
 	 *	  HC12 family 53R71 fail-closed when waiter slot exhausted.
 	 */
@@ -2446,6 +2469,37 @@ cluster_grd_entry_enqueue_or_grant(const ClusterResId *resid, const ClusterGrdHo
 	SpinLockRelease(&entry->lock);
 	cluster_grd_entry_release(entry);
 	return CLUSTER_GRD_ENQUEUED_WAITER;
+}
+
+/*
+ * spec-5.5 D5 — blocking grant-or-enqueue (the original public entry point).
+ */
+ClusterGrdGrantAction
+cluster_grd_entry_enqueue_or_grant(const ClusterResId *resid, const ClusterGrdHolderId *holder,
+								   int32 source_node_id, uint64 request_id,
+								   uint64 shard_master_generation, uint32 request_opcode,
+								   int lockmode, ClusterGrdConflictHolder *conflict_holders_out,
+								   int *n_conflict_out)
+{
+	return cluster_grd_entry_enqueue_or_grant_impl(
+		resid, holder, source_node_id, request_id, shard_master_generation, request_opcode,
+		lockmode, conflict_holders_out, n_conflict_out, /* conditional */ false);
+}
+
+/*
+ * spec-5.5 D5 — conditional (NOWAIT) grant for try-locks:  grant if no conflict,
+ * else CLUSTER_GRD_CONFLICT_NOWAIT (no waiter enqueued).
+ */
+ClusterGrdGrantAction
+cluster_grd_entry_grant_conditional(const ClusterResId *resid, const ClusterGrdHolderId *holder,
+									int32 source_node_id, uint64 request_id,
+									uint64 shard_master_generation, uint32 request_opcode,
+									int lockmode, ClusterGrdConflictHolder *conflict_holders_out,
+									int *n_conflict_out)
+{
+	return cluster_grd_entry_enqueue_or_grant_impl(
+		resid, holder, source_node_id, request_id, shard_master_generation, request_opcode,
+		lockmode, conflict_holders_out, n_conflict_out, /* conditional */ true);
 }
 
 int
