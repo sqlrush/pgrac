@@ -34,6 +34,7 @@
 
 #include "cluster/cluster_advisory.h"
 #include "cluster/cluster_grd.h"
+#include "port/atomics.h"
 #include "storage/lock.h"
 
 #ifdef vprintf
@@ -62,23 +63,21 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 }
 
 /*
- * ShmemInitStruct stub — L105 union force-align (8-byte alignment for the
- * pg_atomic_uint64 counters inside ClusterAdvisorySharedState).
+ * ShmemInitStruct stub — a static pg_atomic_uint64 array is naturally 8-byte
+ * aligned and is the exact ClusterAdvisorySharedState layout (counters[]), so
+ * it backs the region without a force-align union.
  */
 void *
 ShmemInitStruct(const char *name, Size size, bool *foundPtr)
 {
-	static union {
-		uint64 force_align;
-		char data[256]; /* cluster_advisory_shmem_size() << 256B */
-	} adv_buf;
-	static bool adv_initialized = false;
-
 	if (name != NULL && strcmp(name, "pgrac cluster advisory") == 0) {
-		Assert(size <= sizeof(adv_buf.data)); /* catch shmem layout growth */
+		static pg_atomic_uint64 adv_buf[CLUSTER_ADVISORY_COUNTER_COUNT];
+		static bool adv_initialized = false;
+
+		Assert(size <= sizeof(adv_buf)); /* catch shmem layout growth */
 		*foundPtr = adv_initialized;
 		adv_initialized = true;
-		return adv_buf.data;
+		return adv_buf;
 	}
 
 	*foundPtr = true;
