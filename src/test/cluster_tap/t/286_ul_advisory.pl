@@ -125,10 +125,13 @@ sub blocking_grant_after_release
 	$h->query_safe("SELECT pg_advisory_lock($key)");    # holder holds the key
 
 	my $w = $waiter->background_psql('postgres', on_error_die => 1);
-	# Bounded GES wait so a regression fails fast (detect window below is shorter).
+	# Bounded GES wait so a regression fails (rather than hanging the whole suite).
 	$w->query_safe("SET cluster.ges_request_timeout_ms = '25s'");
-	# Fire the blocking acquire WITHOUT waiting (echo prints before the stmt blocks).
-	$w->query_until(qr/PGRAC_FIRED/, "\\echo PGRAC_FIRED\nSELECT pg_advisory_lock($key);\n");
+	# Fire the blocking acquire + a TRAILING marker WITHOUT waiting for the grant:
+	# the leading \echo returns immediately, the SELECT blocks, and PGRAC_GRANTED is
+	# queued so psql only prints it once the SELECT returns (i.e. once granted).
+	$w->query_until(qr/PGRAC_FIRED/,
+		"\\echo PGRAC_FIRED\nSELECT pg_advisory_lock($key);\n\\echo PGRAC_GRANTED\n");
 
 	my $blocked = 0;
 	for (1 .. 50) { if (n_blocked_advisory($waiter) >= 1) { $blocked = 1; last; } usleep(100_000); }
@@ -136,11 +139,21 @@ sub blocking_grant_after_release
 
 	$h->query_safe("SELECT pg_advisory_unlock($key)");    # release -> waiter MUST be woken
 
-	my $granted = 0;
-	for (1 .. 120) { if (n_blocked_advisory($waiter) == 0) { $granted = 1; last; } usleep(100_000); }
-	ok($granted, "$desc: blocking waiter GRANTED after release (no false 53R70 / hang)");
+	# Wait for the acquire to complete by consuming the queued marker.  This both
+	# proves the grant (PGRAC_GRANTED only prints after the blocking SELECT returns)
+	# AND re-syncs the psql stream (consumes the SELECT's own output) so the unlock
+	# below reads its OWN result.  A stranded waiter never prints it -> the SET'd
+	# 25s GES timeout ERRORs the acquire (on_error_die) -> this fails, not hangs.
+	$w->query_until(qr/PGRAC_GRANTED/, "");
+	ok(1, "$desc: blocking waiter GRANTED after release (no false 53R70 / hang)");
 
-	$w->quit;    # the waiter now holds $key; quitting releases it
+	# Prove the waiter actually HELD the lock: a granted waiter unlocks 't'.  This
+	# distinguishes a real grant from a statement ERROR / session exit (which would
+	# also clear pg_stat_activity to inactive).
+	is($w->query_safe("SELECT pg_advisory_unlock($key)"),
+		't', "$desc: waiter actually held the lock (unlock returns t)");
+
+	$w->quit;
 	$h->quit;
 }
 

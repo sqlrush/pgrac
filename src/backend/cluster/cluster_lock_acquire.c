@@ -455,20 +455,33 @@ cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *req)
 ClusterLockAcquireResult
 cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *req)
 {
+	int32 master;
+
 	ensure_counter_initialized();
 
 	if (req == NULL)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 
-	if (cluster_grd_lookup_master(&req->resid) == cluster_node_id) {
+	/*
+	 * PGRAC: spec-5.5 P0 — route the release the SAME way the acquire/send path
+	 * routed the request (ges_send_request_opcode_and_wait treats
+	 * master < 0 || master == cluster_node_id as local-master).  Keeping the two
+	 * conditions identical is the invariant:  whatever acquire enqueued as a
+	 * LOCAL waiter (including the master-map-not-yet-initialized master < 0
+	 * fallback) must be drained+woken LOCALLY on release.  A bare == self check
+	 * would, under master < 0, fall to the remote branch and only delete the
+	 * holder — re-stranding the waiter (the exact bug this spec fixes).
+	 */
+	master = cluster_grd_lookup_master(&req->resid);
+	if (master < 0 || master == cluster_node_id) {
 		/*
-		 * PGRAC: spec-5.5 P0 — local master.  The GRD entry (holder + any queued
-		 * blocking waiters) lives on THIS node, so the release must drain + grant
-		 * + WAKE the waiters, exactly like the remote GES_RELEASE handler does for
-		 * a remote master.  release_and_drain itself removes the holder, so we do
-		 * NOT call cluster_grd_release_holder_by_id here (that deletes the holder
-		 * without popping a waiter -> a cross-node blocking pg_advisory_lock()
-		 * waiter mastered here would false-timeout 53R70 / hang on -1).
+		 * Local master.  The GRD entry (holder + any queued blocking waiters)
+		 * lives on THIS node, so the release must drain + grant + WAKE the
+		 * waiters, exactly like the remote GES_RELEASE handler does for a remote
+		 * master.  release_and_drain itself removes the holder, so we do NOT call
+		 * cluster_grd_release_holder_by_id here (that deletes the holder without
+		 * popping a waiter -> a cross-node blocking pg_advisory_lock() waiter
+		 * mastered here would false-timeout 53R70 / hang on -1).
 		 */
 		cluster_ges_release_and_drain_local(&req->resid, &req->holder);
 	} else {
