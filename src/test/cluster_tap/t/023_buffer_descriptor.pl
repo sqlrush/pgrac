@@ -56,7 +56,7 @@ my $has_visibility_inject =
 	  q{SELECT count(*) FROM pg_cluster_shmem
 	     WHERE name = 'pgrac cluster visibility inject'}) eq '1';
 # +1 for the unconditional "pgrac cluster sequence" region (spec-5.4 SQ shmem foundation).
-  my $expected_region_count = $has_visibility_inject ? '52' : '51';
+  my $expected_region_count = $has_visibility_inject ? '53' : '52';
 
 
 # ----------
@@ -163,8 +163,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT category) FROM pg_cluster_state}),
-   '37',
-   'L12 pg_cluster_state has 37 categories (spec-5.4 adds sequence)');
+   '38',
+   'L12 pg_cluster_state has 38 categories (spec-5.5 adds advisory)');
 
 
 # ----------
@@ -227,7 +227,7 @@ is($node->safe_psql('postgres',
 my $smoke_categories = $node->safe_psql(
 	'postgres',
 	q{SELECT count(DISTINCT category) FROM pg_cluster_state});
-is($smoke_categories, '37', 'L16 cluster_smoke surface integrates buffer_format + pcm + gcs + tt_status + tt_status_hint + tt_2pc + tt_recovery + visibility + wal_thread categories (37 categories;spec-5.4 adds sequence)');
+is($smoke_categories, '38', 'L16 cluster_smoke surface integrates buffer_format + pcm + gcs + tt_status + tt_status_hint + tt_2pc + tt_recovery + visibility + wal_thread categories (38 categories;spec-5.5 adds advisory)');
 
 
 # ----------
