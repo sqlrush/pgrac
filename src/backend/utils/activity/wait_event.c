@@ -1446,6 +1446,9 @@ pgstat_get_wait_cluster_bgproc(WaitEventCluster w)
 	case WAIT_EVENT_CLUSTER_SQ_REFILL_WAIT:
 		event_name = "ClusterSqRefillWait";
 		break;
+	case WAIT_EVENT_CLUSTER_CF_ENQUEUE:
+		event_name = "ClusterCfEnqueueWait";
+		break;
 	default:
 		break;
 	}

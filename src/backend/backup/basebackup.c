@@ -340,7 +340,22 @@ perform_base_backup(basebackup_options *opt, bbsink *sink)
 						sendtblspclinks, &manifest, NULL);
 
 				/* ... and pg_control after everything else. */
+#ifdef USE_PGRAC_CLUSTER
+
+				/*
+				 * PGRAC: spec-5.6 Dc6.  In shared-authority mode
+				 * global/pg_control is a symlink to the single shared authority;
+				 * stat() (follow the link) so the tar entry is the resolved
+				 * regular 8 KB control file -- a plain backup that restores to a
+				 * normal per-node pg_control (an attaching node re-symlinks it at
+				 * startup).  lstat() would emit a broken symlink entry.  For a
+				 * non-symlink (single-node) control file stat() == lstat(), so
+				 * this is a no-op there.
+				 */
+				if (stat(XLOG_CONTROL_FILE, &statbuf) != 0)
+#else
 				if (lstat(XLOG_CONTROL_FILE, &statbuf) != 0)
+#endif
 					ereport(ERROR,
 							(errcode_for_file_access(),
 							 errmsg("could not stat file \"%s\": %m",

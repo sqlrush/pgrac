@@ -146,6 +146,15 @@ cluster_pgstat_get_count(void)
 	return 0;
 }
 
+/* spec-5.6 Dc4: dump_cf reads the CF counters; cluster_cf_stats.o is not
+ * linked into this dump test, so a trivial stub satisfies the link. */
+uint64
+cluster_cf_counter_read(int which)
+{
+	(void) which;
+	return 0;
+}
+
 bool
 cluster_pgstat_get_at(int idx pg_attribute_unused(), const char **name_out pg_attribute_unused(),
 					  uint64 *value_out pg_attribute_unused())

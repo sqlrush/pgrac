@@ -1274,7 +1274,7 @@ cluster_ges_reply_defer_count(void)
 static uint32
 ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmode,
 								 const struct ClusterGrdHolderId *holder, uint64 request_id,
-								 int timeout_ms, uint32 send_opcode)
+								 int timeout_ms, uint32 wait_event, uint32 send_opcode)
 {
 	int32 master;
 	GesReplyWaitKey key;
@@ -1291,6 +1291,8 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 	bool perpetual;
 	bool warned_starvation;
 	bool debug1_starvation_fired;
+	/* spec-5.6 Dc4b: caller-supplied wait-event label (0 = GES default). */
+	uint32 wait_ev = (wait_event != 0) ? wait_event : WAIT_EVENT_CLUSTER_GES_REPLY_WAIT;
 
 	if (resid == NULL || holder == NULL)
 		return GES_REJECT_REASON_TIMEOUT;
@@ -1402,8 +1404,7 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 						sleep_ms = (int)remaining_ms;
 				}
 
-				(void)ConditionVariableTimedSleep(&entry->cv, sleep_ms,
-												  WAIT_EVENT_CLUSTER_GES_REPLY_WAIT);
+				(void)ConditionVariableTimedSleep(&entry->cv, sleep_ms, wait_ev);
 				CHECK_FOR_INTERRUPTS();
 			}
 		}
@@ -1536,7 +1537,7 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 				sleep_ms = (int)remaining_ms;
 		}
 
-		if (ConditionVariableTimedSleep(&entry->cv, sleep_ms, WAIT_EVENT_CLUSTER_GES_REPLY_WAIT)) {
+		if (ConditionVariableTimedSleep(&entry->cv, sleep_ms, wait_ev)) {
 			/* CV signaled — re-check loop predicate. */
 			continue;
 		}
@@ -1608,10 +1609,10 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 uint32
 cluster_ges_send_request_and_wait(const struct ClusterResId *resid, uint32 lockmode,
 								  const struct ClusterGrdHolderId *holder, uint64 request_id,
-								  int timeout_ms)
+								  int timeout_ms, uint32 wait_event)
 {
 	return ges_send_request_opcode_and_wait(resid, lockmode, holder, request_id, timeout_ms,
-											GES_REQ_OPCODE_REQUEST);
+											wait_event, GES_REQ_OPCODE_REQUEST);
 }
 
 /*
@@ -1626,10 +1627,10 @@ cluster_ges_send_request_and_wait(const struct ClusterResId *resid, uint32 lockm
 uint32
 cluster_ges_send_request_nowait_and_wait(const struct ClusterResId *resid, uint32 lockmode,
 										 const struct ClusterGrdHolderId *holder, uint64 request_id,
-										 int timeout_ms)
+										 int timeout_ms, uint32 wait_event)
 {
 	return ges_send_request_opcode_and_wait(resid, lockmode, holder, request_id, timeout_ms,
-											GES_REQ_OPCODE_REQUEST_NOWAIT);
+											wait_event, GES_REQ_OPCODE_REQUEST_NOWAIT);
 }
 
 /*
@@ -1645,6 +1646,7 @@ cluster_ges_send_redeclare_and_wait(const struct ClusterResId *resid, uint32 loc
 {
 	return ges_send_request_opcode_and_wait(resid, lockmode, new_holder, request_id,
 											/* timeout_ms = GUC default */ 0,
+											/* wait_event = GES default */ 0,
 											GES_REQ_OPCODE_REDECLARE);
 }
 

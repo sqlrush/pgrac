@@ -263,6 +263,14 @@ extern const ClusterSharedFsOps cluster_shared_fs_local_ops;
 extern const ClusterSharedFsOps cluster_shared_fs_sharedfs_ops;
 
 /*
+ * Length of the shared-storage uuid recorded in the cross-node sentinel:
+ * 32 lowercase hex characters plus a NUL.  Public so other cluster modules
+ * (e.g. the spec-5.6 CF storage-contract record) can size matching buffers
+ * without duplicating the literal.
+ */
+#define CLUSTER_SHARED_UUID_LEN 33
+
+/*
  * Stage 4.5a D2: cross-node shared-root sentinel (shared_fs backend).
  *
  *	cluster_shared_fs_sentinel_attach records cluster.node_id in the
@@ -273,9 +281,16 @@ extern const ClusterSharedFsOps cluster_shared_fs_sharedfs_ops;
  *	a participant; the merged-recovery capability gate uses it to refuse
  *	to merge a crashed peer that never wrote to this shared root.  A
  *	missing/corrupt sentinel returns false (fail-closed).
+ *
+ *	cluster_shared_fs_get_storage_uuid copies the recorded storage uuid
+ *	into `out` (writes "" when the sentinel is absent/corrupt or
+ *	cluster.shared_data_dir is unset).  The spec-5.6 CF storage contract
+ *	binds its cross-node verification to this identity so a storage swap
+ *	invalidates the recorded verification (fail-closed).
  */
 extern void cluster_shared_fs_sentinel_attach(void);
 extern bool cluster_shared_fs_sentinel_has_participant(int node_id);
+extern void cluster_shared_fs_get_storage_uuid(char *out, size_t outlen);
 
 
 #endif /* CLUSTER_SHARED_FS_H */

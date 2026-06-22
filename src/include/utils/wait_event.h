@@ -573,6 +573,13 @@ typedef enum {
 	 * return.  Wake on grant arrival or refill timeout (53R70).
 	 */
 	WAIT_EVENT_CLUSTER_SQ_REFILL_WAIT,
+	/*
+	 * spec-5.6 Dc4b:  CF (control-file) enqueue wait.  A backend (checkpointer
+	 * during a steady-state checkpoint, or a strong-consistency reader) sleeps
+	 * here while acquiring the singleton CF X/S lock over GES, bounded by
+	 * cluster.cf_enqueue_timeout_ms.  Wake on grant arrival or timeout (53R70).
+	 */
+	WAIT_EVENT_CLUSTER_CF_ENQUEUE,
 } WaitEventCluster;
 
 

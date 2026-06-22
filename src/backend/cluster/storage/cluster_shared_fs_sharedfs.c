@@ -445,12 +445,14 @@ cluster_shared_fs_sharedfs_unlink(RelFileLocator rlocator, ForkNumber forknum)
 #define PGRAC_SHARED_CONTROL_MAGIC 0x50475343 /* 'PGSC' */
 #define PGRAC_SHARED_CONTROL_VERSION 1
 #define PGRAC_SHARED_CONTROL_FILE "pgrac_shared.control"
-#define PGRAC_SHARED_UUID_LEN 33 /* 32 hex chars + NUL */
+/* storage_uuid is 32 hex chars + NUL; the length lives in the public header
+ * (CLUSTER_SHARED_UUID_LEN) so the spec-5.6 CF contract can size matching
+ * buffers without duplicating the literal. */
 
 typedef struct PgracSharedControl {
 	uint32 magic;
 	uint32 layout_version;
-	char storage_uuid[PGRAC_SHARED_UUID_LEN];
+	char storage_uuid[CLUSTER_SHARED_UUID_LEN];
 	char _pad[3];
 	uint32 participant_count;
 	int32 participant_node_ids[CLUSTER_MAX_NODES];
@@ -649,6 +651,41 @@ cluster_shared_fs_sentinel_has_participant(int node_id)
 	CloseTransientFile(fd);
 	pfree(path);
 	return found;
+}
+
+/*
+ * cluster_shared_fs_get_storage_uuid -- copy the recorded shared-storage uuid
+ *	into `out`.  Writes "" when cluster.shared_data_dir is unset or the
+ *	sentinel is missing/corrupt, so callers treat an unknown identity as
+ *	"cannot bind" (fail-closed).  Read-only, no shmem dependency: usable from
+ *	the startup process before cluster shmem is fully up, mirroring
+ *	cluster_shared_fs_sentinel_has_participant.
+ */
+void
+cluster_shared_fs_get_storage_uuid(char *out, size_t outlen)
+{
+	char *path;
+	int fd;
+	PgracSharedControl ctl;
+	const char *reason = NULL;
+
+	if (out == NULL || outlen == 0)
+		return;
+	out[0] = '\0';
+
+	if (cluster_shared_data_dir == NULL || cluster_shared_data_dir[0] == '\0')
+		return;
+
+	path = cluster_shared_fs_sentinel_path();
+	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+	if (fd < 0) {
+		pfree(path);
+		return;
+	}
+	if (cluster_shared_fs_sentinel_read(fd, &ctl, &reason))
+		strlcpy(out, ctl.storage_uuid, outlen);
+	CloseTransientFile(fd);
+	pfree(path);
 }
 
 

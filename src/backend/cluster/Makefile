@@ -40,6 +40,11 @@ ifeq ($(enable_pgrac_cluster), yes)
 OBJS = \
 	cluster.o \
 	cluster_advisory.o \
+	cluster_cf_authority.o \
+	cluster_cf_enqueue.o \
+	cluster_cf_phase2.o \
+	cluster_cf_stats.o \
+	cluster_cf_storage.o \
 	cluster_conf.o \
 	cluster_cssd.o \
 	cluster_debug.o \

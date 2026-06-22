@@ -385,6 +385,31 @@ main(int argc, char *argv[])
 	/* Check that data directory matches our server version */
 	CheckDataVersion();
 
+#ifdef USE_PGRAC_CLUSTER
+
+	/*
+	 * PGRAC: spec-5.6 Dc3.  In a pgrac cluster the control file is a symlink to
+	 * the single shared authority under cluster.shared_data_dir; pg_resetwal
+	 * would rewrite it in place and corrupt the cluster-wide authority every
+	 * node reads.  Detect the cluster (global/pg_control is a symlink) and
+	 * refuse, fail-closed -- frontend, so no SQLSTATE, just an error + exit.  A
+	 * per-node (non-symlink) control file is the normal single-node case and
+	 * proceeds unchanged.
+	 */
+	{
+		struct stat clstat;
+
+		if (lstat(XLOG_CONTROL_FILE, &clstat) == 0 && S_ISLNK(clstat.st_mode))
+		{
+			pg_log_error("\"%s\" is a symlink to a shared pg_control authority (pgrac cluster mode)",
+						 XLOG_CONTROL_FILE);
+			pg_log_error_hint("pg_resetwal would corrupt the cluster-wide control-file authority; "
+							  "run it only on a single-node deployment with a regular global/pg_control.");
+			exit(1);
+		}
+	}
+#endif
+
 	/*
 	 * Check for a postmaster lock file --- if there is one, refuse to
 	 * proceed, on grounds we might be interfering with a live installation.

@@ -175,6 +175,16 @@ typedef struct ClusterLockAcquireRequest {
 	uint64 master_gen_snapshot;
 	/* spec-2.17 P2.2 deterministic 4-tuple — DESC = newer = youngest victim. */
 	uint64 caller_local_start_ts_ms;
+	/*
+	 * spec-5.6 Dc4b: per-acquire GES wait override.  Both default to 0, which
+	 * the GES layer reads as "use the cluster-wide defaults"
+	 * (cluster.ges_request_timeout_ms and WAIT_EVENT_CLUSTER_GES_REPLY_WAIT), so
+	 * the TM/UL paths that zero-init the request are unchanged.  CF sets these to
+	 * cluster.cf_enqueue_timeout_ms and WAIT_EVENT_CLUSTER_CF_ENQUEUE so its
+	 * acquire wait is bounded and observable as ClusterCfEnqueueWait.
+	 */
+	int timeout_ms;
+	uint32 wait_event;
 } ClusterLockAcquireRequest;
 
 /*

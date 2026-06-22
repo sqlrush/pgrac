@@ -427,9 +427,15 @@ StaticAssertDecl(sizeof(GesReplyPayload) == 52,
  *	远端 master pipeline 推 spec-2.23 BAST 配套 ship。
  */
 struct ClusterResId;
+/*
+ * spec-5.6 Dc4b: wait_event lets a caller label the acquire wait (0 = the
+ * default WAIT_EVENT_CLUSTER_GES_REPLY_WAIT).  CF passes
+ * WAIT_EVENT_CLUSTER_CF_ENQUEUE; TM/UL pass 0.
+ */
 extern uint32 cluster_ges_send_request_and_wait(const struct ClusterResId *resid, uint32 lockmode,
 												const struct ClusterGrdHolderId *holder,
-												uint64 request_id, int timeout_ms);
+												uint64 request_id, int timeout_ms,
+												uint32 wait_event);
 
 /*
  * spec-5.5 D5 — conditional (NOWAIT) acquire for try-locks.  Returns
@@ -439,7 +445,8 @@ extern uint32 cluster_ges_send_request_and_wait(const struct ClusterResId *resid
 extern uint32 cluster_ges_send_request_nowait_and_wait(const struct ClusterResId *resid,
 													   uint32 lockmode,
 													   const struct ClusterGrdHolderId *holder,
-													   uint64 request_id, int timeout_ms);
+													   uint64 request_id, int timeout_ms,
+													   uint32 wait_event);
 
 extern uint32 cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 												const struct ClusterGrdHolderId *holder,

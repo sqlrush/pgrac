@@ -309,11 +309,11 @@ cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req
 	if (dontwait)
 		reject = cluster_ges_send_request_nowait_and_wait(&req->resid, (uint32)req->lockmode,
 														  &req->holder, req->request_id,
-														  /* timeout_ms */ 0);
+														  req->timeout_ms, req->wait_event);
 	else
 		reject = cluster_ges_send_request_and_wait(&req->resid, (uint32)req->lockmode, &req->holder,
 												   req->request_id,
-												   /* timeout_ms */ 0);
+												   req->timeout_ms, req->wait_event);
 	if (reject == GES_REJECT_REASON_NONE) {
 		if (dontwait && is_advisory)
 			cluster_advisory_counter_inc(CLUSTER_ADVISORY_TRY_GRANT);

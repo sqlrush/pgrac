@@ -176,6 +176,7 @@
  * CreateSharedMemoryAndSemaphores() returns; see PGRAC MODIFICATIONS
  * banner above for the HC1 rationale.
  */
+#include "cluster/cluster_cf_storage.h" /* cluster_cf_startup_prepare (spec-5.6 Da3) */
 #include "cluster/cluster_fence.h" /* cluster_fence_postmaster_check (spec-2.28 D6) */
 #include "cluster/cluster_guc.h"   /* cluster_enabled (spec-1.11 Sprint B) */
 #include "cluster/cluster_lmd.h"   /* cluster_lmd_mark_child_exit (spec-2.19 D12 hardening) */
@@ -1080,6 +1081,22 @@ PostmasterMain(int argc, char *argv[])
 	 * process any libraries that should be preloaded at postmaster start
 	 */
 	process_shared_preload_libraries();
+
+#ifdef USE_PGRAC_CLUSTER
+
+	/*
+	 * PGRAC: spec-5.6 Da3.  Now that the cluster GUCs are registered (the
+	 * custom cluster.* variables are bound by cluster_init_guc() inside
+	 * process_shared_preload_libraries above), migrate this node's
+	 * global/pg_control into the single shared authority under
+	 * cluster.shared_data_dir and replace the local path with a symlink to it
+	 * -- when cluster.controlfile_shared_authority is on -- failing closed
+	 * (FATAL) on a per-node, foreign, or torn control file.  This runs once in
+	 * the postmaster, before the startup process is forked and writes the
+	 * control file.  A no-op unless the authority is enabled (default off).
+	 */
+	cluster_cf_startup_prepare(DataDir);
+#endif
 
 	/*
 	 * Initialize SSL library, if specified.

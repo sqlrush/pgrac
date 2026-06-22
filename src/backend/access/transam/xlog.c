@@ -171,6 +171,12 @@
 #include "cluster/cluster_wal_state.h" /* PGRAC: checkpoint redo / fpw sticky (spec-4.5) */
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_tt_durable.h" /* PGRAC: spec-4.8 D1 crash-left ACTIVE resolution */
+#include "cluster/cluster_cf_authority.h" /* PGRAC: spec-5.6 shared pg_control authority write */
+#include "cluster/cluster_cf_enqueue.h" /* PGRAC: spec-5.6 CF X write-permission gate */
+#include "cluster/cluster_cf_phase2.h" /* PGRAC: spec-5.6 T6 cross-node verify */
+#include "cluster/cluster_cf_storage.h" /* PGRAC: spec-5.6 bootstrap authority window */
+#include "cluster/cluster_guc.h" /* PGRAC: spec-5.6 cluster_controlfile_shared_authority */
+#include "cluster/cluster_lms.h" /* PGRAC: spec-5.6 GES-ready boundary for CF X */
 #endif
 
 extern uint32 bootstrap_data_checksum_version;
@@ -4290,8 +4296,100 @@ ReadControlFile(void)
 static void
 UpdateControlFile(void)
 {
+#ifdef USE_PGRAC_CLUSTER
+
+	/*
+	 * PGRAC: spec-5.6 Db3 + increment (ii).  In shared-authority mode the
+	 * control file is the single shared authority under cluster.shared_data_dir;
+	 * write it via durable_rename + .bak (torn-safe atomic replacement) instead
+	 * of the stock in-place overwrite.  This is the single chokepoint for every
+	 * authority write, so the write-permission classification lives here:
+	 *
+	 *	- write permitted (the caller holds CF X on the GES-ready path, or is the
+	 *	  bootstrap single-node authority during owner recovery) -> write it;
+	 *	- join read-only (this attaching node recovers while a live peer owns the
+	 *	  authority) -> skip this recovery-progress write rather than clobber the
+	 *	  owner's (ARCH DECISION #5) -- a documented skip, not a silent fallback;
+	 *	- otherwise -> an unserialized write to the cluster-wide recovery root,
+	 *	  which is a correctness hazard (§3.1 A2 / §3.5 O2): fail closed loudly
+	 *	  (规则 8.A).  This also covers the out-of-scope standby/PITR restartpoint
+	 *	  writer (§1.3), which has neither CF X nor the window.  PANIC because
+	 *	  some callers (CreateCheckPoint) run inside a critical section.
+	 *
+	 * This whole branch is inert unless the authority is explicitly enabled
+	 * (default off), so the stock per-node path below is unchanged for normal
+	 * builds.
+	 */
+	if (cluster_controlfile_shared_authority)
+	{
+		if (cluster_cf_write_permitted())
+			cluster_cf_authority_write(ControlFile);
+		else if (cluster_cf_write_skip())
+		{
+			/*
+			 * Bring-up authority-write skip (process-local, tightly scoped): a
+			 * join node's recovery writes (startup process) or the bring-up
+			 * end-of-recovery checkpoint (checkpointer) -- the live peer owns the
+			 * authority, so do not write it.  This is NOT the node-wide shmem
+			 * join flag, so a lingering flag can never silently skip a
+			 * steady-state write from another path (that hits the else -> PANIC).
+			 */
+		}
+		else
+			ereport(PANIC,
+					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+					 errmsg("shared control-file authority write attempted without CF X or a bring-up write-skip"),
+					 errhint("A serialized writer (CF X) or the bootstrap authority window is required; this node is not the authority owner and is not in a bring-up window.")));
+		return;
+	}
+#endif
 	update_controlfile(DataDir, ControlFile, true);
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * cluster_cf_bak_checkpoint_recoverable -- spec-5.6 Dc2 strict .bak gate.
+ *
+ *	Decide whether the checkpoint recorded in a .bak control image can still
+ *	be replayed from on this node: the WAL segment holding its redo start must
+ *	exist under pg_wal.  Returns false (fail-closed) for an invalid redo
+ *	pointer or a missing segment, so cluster_cf_authority_read() never trusts a
+ *	CRC-valid-but-stale .bak whose WAL has already been recycled (spec §3.9 T3).
+ *
+ *	Defined here in xlog.c, where the WAL segment naming and size live;
+ *	declared in cluster_cf_authority.h and stubbed by the cluster_unit
+ *	authority/storage tests (which have no pg_wal).
+ */
+bool
+cluster_cf_bak_checkpoint_recoverable(const ControlFileData *bak)
+{
+	XLogRecPtr	redo;
+	XLogSegNo	segno;
+	char		path[MAXPGPATH];
+	struct stat statbuf;
+
+	if (bak == NULL)
+		return false;
+
+	redo = bak->checkPointCopy.redo;
+	if (XLogRecPtrIsInvalid(redo))
+		return false;
+
+	/*
+	 * Without a known segment size we cannot locate the WAL, so we cannot
+	 * prove the checkpoint is reachable -- fail closed rather than risk a
+	 * divide-by-zero in XLByteToSeg on an uninitialised wal_segment_size.
+	 */
+	if (wal_segment_size <= 0)
+		return false;
+
+	XLByteToSeg(redo, segno, wal_segment_size);
+	XLogFilePath(path, bak->checkPointCopy.ThisTimeLineID, segno,
+				 wal_segment_size);
+
+	return stat(path, &statbuf) == 0 && S_ISREG(statbuf.st_mode);
+}
+#endif
 
 /*
  * Returns the unique system identifier from control file.
@@ -5186,6 +5284,32 @@ StartupXLOG(void)
 		   CurrentResourceOwner == AuxProcessResourceOwner);
 	CurrentResourceOwner = AuxProcessResourceOwner;
 
+#ifdef USE_PGRAC_CLUSTER
+
+	/*
+	 * PGRAC: spec-5.6 increment (iii) T6 Phase-2.  Before the bootstrap role
+	 * gate reads the storage contract, a multi-node node that has not yet
+	 * cross-node-verified this storage runs the nonce+ack rendezvous against a
+	 * peer and persists CROSSNODE_VERIFIED on success.  No-op when the authority
+	 * is off, the cluster is single-node, or the contract is already verified.
+	 * Never throws: on failure it leaves the contract unverified so the role
+	 * gate below fails closed rather than risk a split-brain authority write.
+	 */
+	cluster_cf_phase2_verify_or_fail(DataDir);
+
+	/*
+	 * PGRAC: spec-5.6 Db5.  Recovery below writes the shared control-file
+	 * authority before GES is ready, so (in authority mode) open the
+	 * bootstrap single-node-authority window now -- after the control file
+	 * has been read (postmaster, B1, no lock) and the cluster startup
+	 * sequence was kicked off, but before the first authority write.  A
+	 * single-node cluster opens it trivially; a multi-node cluster fails
+	 * closed until the storage is cross-node verified (split-brain guard).
+	 * No-op unless cluster.controlfile_shared_authority is on.
+	 */
+	cluster_cf_enter_bootstrap_window_or_fail();
+#endif
+
 	/*
 	 * Check that contents look valid.
 	 */
@@ -5983,6 +6107,22 @@ StartupXLOG(void)
 	 */
 	if (promoted)
 		RequestCheckpoint(CHECKPOINT_FORCE);
+
+#ifdef USE_PGRAC_CLUSTER
+
+	/*
+	 * PGRAC MODIFICATIONS (spec-5.6 increment (iv) / ARCH DECISION #4): recovery
+	 * is complete and the startup process has performed its last shared-authority
+	 * control-file write (the RECOVERY_STATE_DONE update above; the promotion
+	 * checkpoint at hand is delegated to the checkpointer, which takes CF X).
+	 * Close the bootstrap single-node-authority window so every subsequent
+	 * control-file write goes through real CF X serialization -- steady-state
+	 * writes must never rely on the bootstrap flag (规则 8.A; the latent gap was
+	 * that the window, once opened, was never cleared).  A no-op when the
+	 * authority is off or the window was never opened (a join read-only node).
+	 */
+	cluster_cf_set_bootstrap_authority(false);
+#endif
 }
 
 /*
@@ -6658,6 +6798,9 @@ CreateCheckPoint(int flags)
 	int			nvxids;
 	int			oldXLogAllowed = 0;
 	XLogRecPtr	slotsMinReqLSN;
+#ifdef USE_PGRAC_CLUSTER
+	bool		cf_x_taken = false; /* PGRAC: spec-5.6 Dc1 — held CF X to release */
+#endif
 
 	/*
 	 * An end-of-recovery checkpoint is really a shutdown checkpoint, just
@@ -6689,6 +6832,90 @@ CreateCheckPoint(int flags)
 	 * checkpoint is needed.
 	 */
 	SyncPreCheckpoint();
+
+#ifdef USE_PGRAC_CLUSTER
+
+	/*
+	 * PGRAC: spec-5.6 Dc1.  In shared-authority mode a steady-state checkpoint
+	 * (run by the checkpointer, not the startup process, so it is not covered
+	 * by the bootstrap window) serializes its control-file writes cluster-wide
+	 * by holding CF X across the whole checkpoint -- taken here, BEFORE the
+	 * critical section (规则16: no GES lock inside a critical section; lock
+	 * order CF X -> ControlFileLock), released at every exit below.  Under CF
+	 * X we refresh the in-memory control file from the shared authority so this
+	 * checkpoint does not clobber a peer's concurrent update (§3.4 R4).  No-op
+	 * unless the authority is enabled; skipped during the bootstrap window
+	 * (which already permits the write and runs before GES is ready).
+	 */
+	if (cluster_controlfile_shared_authority && !cluster_cf_in_bootstrap_window())
+	{
+		/*
+		 * A multi-node node still in its JOIN_READONLY bring-up window (Phase-2
+		 * proved a peer alive; the end-of-recovery checkpoint runs in the
+		 * checkpointer before GES is ready) must NOT take CF X: GES is a phase-4/
+		 * post-PM_RUN process, so CF X cannot be granted yet, and a join node
+		 * must not write the shared authority anyway (the chokepoint skips the
+		 * write).  Once GES is available the join role is cleared, so from then
+		 * on EVERY checkpoint takes CF X -- this is a bounded bring-up window,
+		 * never a steady-state CF-X bypass.  GES is "available" when lms is off
+		 * (CF X = OK_NATIVE) or lms has reached READY.
+		 */
+		bool		ges_available = !cluster_lms_enabled || cluster_lms_is_ready();
+
+		/*
+		 * The join role is cleared (transition to steady-state CF X) only on a
+		 * NON-end-of-recovery checkpoint: an end-of-recovery checkpoint runs
+		 * while the startup process is still finishing recovery and relies on
+		 * the join flag to skip its own remaining authority writes -- clearing
+		 * it here would make the startup process's next write hit the chokepoint
+		 * with neither CF X nor the join flag (PANIC).  After StartupXLOG
+		 * returns, only steady-state (non-EOR) checkpoints run, so clearing then
+		 * is race-free.
+		 */
+		bool		eor = (flags & CHECKPOINT_END_OF_RECOVERY) != 0;
+		bool		bringup_skip = cluster_cf_join_readonly() && (!ges_available || eor);
+
+		/*
+		 * Scope the chokepoint write-skip to THIS checkpoint only: true for a
+		 * bring-up skip-checkpoint, false for every steady-state checkpoint (so
+		 * the checkpointer never carries a stale skip into steady state).
+		 */
+		cluster_cf_set_write_skip(bringup_skip);
+
+		if (bringup_skip)
+		{
+			/*
+			 * Bring-up (GES not ready, or the end-of-recovery checkpoint): skip
+			 * CF X.  The checkpoint's UpdateControlFile writes are skipped at the
+			 * chokepoint via the per-checkpoint write-skip just set, so the
+			 * shared authority is untouched; the node-wide join flag stays set
+			 * (cleared below once steady-state).
+			 */
+		}
+		else
+		{
+			if (cluster_cf_join_readonly())
+				cluster_cf_set_join_readonly(false);	/* steady-state: back to CF X */
+
+			if (!cluster_cf_lock(ExclusiveLock))
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						 errmsg("could not acquire the cluster control-file lock for a checkpoint")));
+			cf_x_taken = true;
+
+			LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+			if (!cluster_cf_authority_read(ControlFile))
+			{
+				LWLockRelease(ControlFileLock);
+				cluster_cf_unlock(ExclusiveLock);
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						 errmsg("shared control-file authority is unreadable before checkpoint")));
+			}
+			LWLockRelease(ControlFileLock);
+		}
+	}
+#endif
 
 	/*
 	 * Use a critical section to force system panic if we have trouble.
@@ -6742,6 +6969,11 @@ CreateCheckPoint(int flags)
 		{
 			WALInsertLockRelease();
 			END_CRIT_SECTION();
+#ifdef USE_PGRAC_CLUSTER
+			/* PGRAC: spec-5.6 Dc1 — release CF X on the idle-skip exit. */
+			if (cf_x_taken)
+				cluster_cf_unlock(ExclusiveLock);
+#endif
 			ereport(DEBUG1,
 					(errmsg_internal("checkpoint skipped because system is idle")));
 			return;
@@ -7107,6 +7339,12 @@ CreateCheckPoint(int flags)
 									 CheckpointStats.ckpt_segs_added,
 									 CheckpointStats.ckpt_segs_removed,
 									 CheckpointStats.ckpt_segs_recycled);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: spec-5.6 Dc1 — release the CF X held across the checkpoint. */
+	if (cf_x_taken)
+		cluster_cf_unlock(ExclusiveLock);
+#endif
 }
 
 /*

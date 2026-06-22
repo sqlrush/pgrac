@@ -842,6 +842,7 @@ Section: Class 58 - System Error (pgrac extension)
 58R10    E    ERRCODE_CLUSTER_CATALOG_INCONSISTENT                           cluster_catalog_inconsistent
 58R11    E    ERRCODE_CLUSTER_SINVAL_INCONSISTENT                            cluster_sinval_inconsistent
 58R12    E    ERRCODE_CLUSTER_RECOVERY_FAILED                                cluster_recovery_failed
+58R13    E    ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE              cluster_controlfile_authority_unavailable
 
 Section: Class 72 - Snapshot Failure
 # (class borrowed from Oracle)

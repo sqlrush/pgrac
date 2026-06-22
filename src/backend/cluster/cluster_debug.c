@@ -71,6 +71,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "cluster/cluster_cf_stats.h" /* CF counters (spec-5.6 Dc4) */
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_elog.h" /* cluster_phase */
 #include "cluster/cluster_diag.h" /* cluster_diag_status (spec-1.13 D12) */
@@ -1363,6 +1364,27 @@ dump_pcm(ReturnSetInfo *rsinfo)
  *	block_storage_fallback_count + block_master_not_holder_count +
  *	block_wal_flush_before_ship_count + block_ship_bytes_total.
  * ============================================================ */
+/* ============================================================
+ * spec-5.6 Dc4: CF (shared control-file authority) observability.
+ *	Exposes the five cluster_cf_stats counters under category 'cf' so the
+ *	cluster_tap CF tests can assert CF X was taken (serialization proof),
+ *	fail-closed events, single-node-authority windows, and .bak fallbacks.
+ * ============================================================ */
+static void
+dump_cf(ReturnSetInfo *rsinfo)
+{
+	emit_row(rsinfo, "cf", "cf_x_acquire",
+			 fmt_int64((int64) cluster_cf_counter_read(CLUSTER_CF_X_ACQUIRE)));
+	emit_row(rsinfo, "cf", "cf_s_acquire",
+			 fmt_int64((int64) cluster_cf_counter_read(CLUSTER_CF_S_ACQUIRE)));
+	emit_row(rsinfo, "cf", "cf_failclosed",
+			 fmt_int64((int64) cluster_cf_counter_read(CLUSTER_CF_FAILCLOSED)));
+	emit_row(rsinfo, "cf", "cf_single_node_authority",
+			 fmt_int64((int64) cluster_cf_counter_read(CLUSTER_CF_SINGLE_NODE_AUTHORITY)));
+	emit_row(rsinfo, "cf", "cf_bak_fallback",
+			 fmt_int64((int64) cluster_cf_counter_read(CLUSTER_CF_BAK_FALLBACK)));
+}
+
 static void
 dump_gcs(ReturnSetInfo *rsinfo)
 {
@@ -2158,6 +2180,7 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		dump_buffer_format(rsinfo);
 		dump_pcm(rsinfo);
 		dump_gcs(rsinfo);
+		dump_cf(rsinfo);
 		dump_phase(rsinfo);
 		dump_lmon(rsinfo);
 		dump_lck(rsinfo);

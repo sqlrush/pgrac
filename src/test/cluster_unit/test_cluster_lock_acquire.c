@@ -382,7 +382,8 @@ cluster_ges_send_request_and_wait(const struct ClusterResId *resid pg_attribute_
 								  uint32 lockmode pg_attribute_unused(),
 								  const struct ClusterGrdHolderId *holder pg_attribute_unused(),
 								  uint64 request_id pg_attribute_unused(),
-								  int timeout_ms pg_attribute_unused())
+								  int timeout_ms pg_attribute_unused(),
+								  uint32 wait_event pg_attribute_unused())
 {
 	return stub_ges_reject_reason;
 }
@@ -393,7 +394,8 @@ uint32
 cluster_ges_send_request_nowait_and_wait(
 	const struct ClusterResId *resid pg_attribute_unused(), uint32 lockmode pg_attribute_unused(),
 	const struct ClusterGrdHolderId *holder pg_attribute_unused(),
-	uint64 request_id pg_attribute_unused(), int timeout_ms pg_attribute_unused())
+	uint64 request_id pg_attribute_unused(), int timeout_ms pg_attribute_unused(),
+	uint32 wait_event pg_attribute_unused())
 {
 	return stub_ges_reject_reason;
 }

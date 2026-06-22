@@ -79,6 +79,14 @@ int cluster_shared_storage_backend = CLUSTER_SHARED_FS_BACKEND_STUB;
 char *cluster_shared_data_dir = NULL;
 /* spec-4.5a D2: optional external-preset shared-storage uuid (sentinel). */
 char *cluster_shared_storage_uuid = NULL;
+/*
+ * spec-5.6 Da3: opt-in switch for the shared pg_control authority.  Default
+ * off (Hardening v1.0.1): a node only migrates its global/pg_control into the
+ * shared authority + symlink, and enforces the startup gate, when this is on.
+ * Off keeps the stock per-node pg_control path so existing shared-data
+ * (shared-nothing-simulation) clusters are unaffected.
+ */
+bool cluster_controlfile_shared_authority = false;
 bool cluster_smgr_user_relations = false;
 int cluster_shmem_max_regions = 64;
 
@@ -110,6 +118,7 @@ static const struct config_enum_entry cluster_undo_writeback_boundary_check_opti
 
 int cluster_grd_max_entries = 0;
 int cluster_ges_request_timeout_ms = 60000; /* spec-2.16 D12 + v0.5 P1.5 */
+int cluster_cf_enqueue_timeout_ms = 30000;	/* spec-5.6 Dc4b — CF X/S grant wait */
 
 /* spec-5.3 D10 — TM cross-node convert tunables. */
 int cluster_ges_convert_timeout_ms = 30000; /* finite convert wait before 53R70 */
@@ -1092,6 +1101,23 @@ cluster_init_guc(void)
 		NULL);						   /* show_hook */
 
 	/*
+	 * cluster.controlfile_shared_authority -- spec-5.6 Da3 opt-in switch for
+	 * the shared pg_control authority.  Default off (Hardening v1.0.1): when
+	 * on, this node's global/pg_control is migrated into the single shared
+	 * authority under shared_data_dir and replaced by a symlink, and startup
+	 * fail-closes if the local path is not that symlink or the identity does
+	 * not match.  Off keeps the stock per-node control file.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.controlfile_shared_authority",
+		gettext_noop("Use a single shared pg_control authority under cluster.shared_data_dir."),
+		gettext_noop("When on, this node migrates global/pg_control into the shared "
+					 "authority and symlinks to it, failing closed on a per-node or "
+					 "foreign control file.  Off keeps the stock per-node pg_control."),
+		&cluster_controlfile_shared_authority, false, PGC_POSTMASTER, 0,
+		NULL, NULL, NULL);
+
+	/*
 	 * cluster.shared_storage_uuid -- optional external-preset identity for
 	 * the shared root (spec-4.5a D2).  When set, every node must agree on
 	 * it and it is matched against the value recorded in the shared-root
@@ -1307,6 +1333,23 @@ cluster_init_guc(void)
 					 "retransmitted;  attempts to set -1 with retransmit=0 are rejected."),
 		&cluster_ges_request_timeout_ms, 60000, -1, 600000, PGC_USERSET, GUC_UNIT_MS,
 		cluster_ges_request_timeout_ms_check_hook, NULL, NULL);
+
+	/*
+	 * spec-5.6 Dc4b — CF (control-file) enqueue timeout.  Bounds the wait for a
+	 * CF X/S grant before fail-closed (53R70).  Always finite (no 0/-1 special
+	 * cases): a hung checkpoint waiting forever on CF would stall the cluster,
+	 * so the CF acquire path passes this value straight through as the GES
+	 * per-acquire timeout.
+	 */
+	DefineCustomIntVariable(
+		"cluster.cf_enqueue_timeout_ms",
+		gettext_noop("Timeout for acquiring the shared control-file (CF) enqueue (ms)."),
+		gettext_noop("Range [1000, 600000].  Default 30000 (30s).  A checkpoint or "
+					 "strong-consistency control-file read waits this long for the "
+					 "cross-node CF X/S grant before failing closed (53R70).  Only "
+					 "meaningful when cluster.controlfile_shared_authority is on."),
+		&cluster_cf_enqueue_timeout_ms, 30000, 1000, 600000, PGC_SIGHUP, GUC_UNIT_MS,
+		NULL, NULL, NULL);
 
 	/* spec-2.27 D4 NEW — GES retransmit + dedup HTAB tunables (HC51..HC53). */
 	DefineCustomIntVariable(

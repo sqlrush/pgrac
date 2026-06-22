@@ -322,8 +322,8 @@ is($pair->node0->safe_psql('postgres',
 # ============================================================
 is($pair->node0->safe_psql('postgres',
 		q{SELECT count(DISTINCT category) FROM pg_cluster_state}),
-	'38',
-	'L12a pg_cluster_state has 38 categories (spec-5.5 adds advisory)');
+	'39',
+	'L12a pg_cluster_state has 39 categories (spec-5.6 adds cf)');
 
 my $tt_categories = $pair->node0->safe_psql('postgres', q{
 	SELECT string_agg(c, ',' ORDER BY c)

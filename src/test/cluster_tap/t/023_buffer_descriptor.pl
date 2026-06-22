@@ -55,8 +55,9 @@ my $has_visibility_inject =
 	  'postgres',
 	  q{SELECT count(*) FROM pg_cluster_shmem
 	     WHERE name = 'pgrac cluster visibility inject'}) eq '1';
-# +1 for the unconditional "pgrac cluster sequence" region (spec-5.4 SQ shmem foundation).
-  my $expected_region_count = $has_visibility_inject ? '53' : '52';
+# +1 for the unconditional "pgrac cluster sequence" region (spec-5.4 SQ shmem foundation)
+# and +1 for the unconditional "pgrac cluster cf stats" region (spec-5.6 Dc4 CF counters).
+  my $expected_region_count = $has_visibility_inject ? '54' : '53';
 
 
 # ----------
@@ -163,8 +164,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT category) FROM pg_cluster_state}),
-   '38',
-   'L12 pg_cluster_state has 38 categories (spec-5.5 adds advisory)');
+   '39',
+   'L12 pg_cluster_state has 39 categories (spec-5.6 adds cf)');
 
 
 # ----------
@@ -227,7 +228,7 @@ is($node->safe_psql('postgres',
 my $smoke_categories = $node->safe_psql(
 	'postgres',
 	q{SELECT count(DISTINCT category) FROM pg_cluster_state});
-is($smoke_categories, '38', 'L16 cluster_smoke surface integrates buffer_format + pcm + gcs + tt_status + tt_status_hint + tt_2pc + tt_recovery + visibility + wal_thread categories (38 categories;spec-5.5 adds advisory)');
+is($smoke_categories, '39', 'L16 cluster_smoke surface integrates buffer_format + pcm + gcs + tt_status + tt_status_hint + tt_2pc + tt_recovery + visibility + wal_thread categories (39 categories;spec-5.6 adds cf)');
 
 
 # ----------

@@ -192,6 +192,13 @@ extern int cluster_shared_storage_backend;
  */
 extern char *cluster_shared_data_dir;
 
+/*
+ * cluster.controlfile_shared_authority -- spec-5.6 Da3 opt-in for the shared
+ * pg_control authority (default off, Hardening v1.0.1).
+ *	context: PGC_POSTMASTER.
+ */
+extern bool cluster_controlfile_shared_authority;
+
 
 /*
  * cluster_shared_storage_uuid -- optional external-preset identity for the
@@ -260,6 +267,10 @@ extern int cluster_grd_max_entries;
  * effective_timeout helper.  range [1, 600000];  default 60000. */
 extern int cluster_ges_request_timeout_ms;
 extern int cluster_ges_effective_timeout_ms(int lock_timeout_ms);
+
+/* spec-5.6 Dc4b:  cluster.cf_enqueue_timeout_ms.  range [1000, 600000];
+ * default 30000.  CF X/S grant wait before fail-closed (53R70). */
+extern int cluster_cf_enqueue_timeout_ms;
 
 /* spec-5.3 D10 — TM cross-node convert tunables.
  *   cluster.ges_convert_timeout_ms:  finite convert wait (1000..600000; 30000).
