@@ -55,14 +55,10 @@
  * TAP).  All writes are torn-safe (tmp + fsync + durable_rename + dir-fsync);
  * all reads return false when the file is absent/short/CRC-bad.
  */
-extern bool cluster_cf_phase2_write_probe(const char *shared_dir, int self_id,
-										  uint64 nonce);
-extern bool cluster_cf_phase2_read_probe(const char *shared_dir, int peer_id,
-										 uint64 *out_nonce);
-extern bool cluster_cf_phase2_write_ack(const char *shared_dir, int peer_id,
-										uint64 echo_nonce);
-extern bool cluster_cf_phase2_read_ack(const char *shared_dir, int self_id,
-									   uint64 *out_echo);
+extern bool cluster_cf_phase2_write_probe(const char *shared_dir, int self_id, uint64 nonce);
+extern bool cluster_cf_phase2_read_probe(const char *shared_dir, int peer_id, uint64 *out_nonce);
+extern bool cluster_cf_phase2_write_ack(const char *shared_dir, int peer_id, uint64 echo_nonce);
+extern bool cluster_cf_phase2_read_ack(const char *shared_dir, int self_id, uint64 *out_echo);
 
 /*
  * cluster_cf_phase2_rendezvous -- run the symmetric nonce+ack handshake from
@@ -73,8 +69,8 @@ extern bool cluster_cf_phase2_read_ack(const char *shared_dir, int self_id,
  * decides the fail-closed action.  `nonce` is a caller-supplied fresh nonce
  * (so the loop body stays free of randomness for deterministic resume).
  */
-extern bool cluster_cf_phase2_rendezvous(const char *shared_dir, int self_id,
-										 int peer_id, uint64 nonce, int timeout_ms);
+extern bool cluster_cf_phase2_rendezvous(const char *shared_dir, int self_id, int peer_id,
+										 uint64 nonce, int timeout_ms);
 
 /*
  * cluster_cf_phase2_verify_or_fail -- backend entry called from StartupXLOG
@@ -101,4 +97,4 @@ extern void cluster_cf_phase2_verify_or_fail(const char *pgdata);
  */
 extern bool cluster_cf_phase2_peer_verified(void);
 
-#endif							/* CLUSTER_CF_PHASE2_H */
+#endif /* CLUSTER_CF_PHASE2_H */

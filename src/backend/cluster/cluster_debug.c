@@ -1374,15 +1374,15 @@ static void
 dump_cf(ReturnSetInfo *rsinfo)
 {
 	emit_row(rsinfo, "cf", "cf_x_acquire",
-			 fmt_int64((int64) cluster_cf_counter_read(CLUSTER_CF_X_ACQUIRE)));
+			 fmt_int64((int64)cluster_cf_counter_read(CLUSTER_CF_X_ACQUIRE)));
 	emit_row(rsinfo, "cf", "cf_s_acquire",
-			 fmt_int64((int64) cluster_cf_counter_read(CLUSTER_CF_S_ACQUIRE)));
+			 fmt_int64((int64)cluster_cf_counter_read(CLUSTER_CF_S_ACQUIRE)));
 	emit_row(rsinfo, "cf", "cf_failclosed",
-			 fmt_int64((int64) cluster_cf_counter_read(CLUSTER_CF_FAILCLOSED)));
+			 fmt_int64((int64)cluster_cf_counter_read(CLUSTER_CF_FAILCLOSED)));
 	emit_row(rsinfo, "cf", "cf_single_node_authority",
-			 fmt_int64((int64) cluster_cf_counter_read(CLUSTER_CF_SINGLE_NODE_AUTHORITY)));
+			 fmt_int64((int64)cluster_cf_counter_read(CLUSTER_CF_SINGLE_NODE_AUTHORITY)));
 	emit_row(rsinfo, "cf", "cf_bak_fallback",
-			 fmt_int64((int64) cluster_cf_counter_read(CLUSTER_CF_BAK_FALLBACK)));
+			 fmt_int64((int64)cluster_cf_counter_read(CLUSTER_CF_BAK_FALLBACK)));
 }
 
 static void

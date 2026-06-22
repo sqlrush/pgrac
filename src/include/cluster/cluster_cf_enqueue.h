@@ -38,9 +38,9 @@
 #ifndef CLUSTER_CF_ENQUEUE_H
 #define CLUSTER_CF_ENQUEUE_H
 
-#include "cluster/cluster_grd.h"	/* ClusterResId */
-#include "cluster/cluster_sequence.h"	/* CLUSTER_SQ_RESID_TYPE (collision check) */
-#include "storage/lock.h"			/* LOCKTAG_LAST_TYPE, LOCKMODE */
+#include "cluster/cluster_grd.h"	  /* ClusterResId */
+#include "cluster/cluster_sequence.h" /* CLUSTER_SQ_RESID_TYPE (collision check) */
+#include "storage/lock.h"			  /* LOCKTAG_LAST_TYPE, LOCKMODE */
 
 /*
  * CLUSTER_CF_RESID_TYPE -- CF resource-id namespace marker.  Must be above
@@ -146,4 +146,4 @@ extern bool cluster_cf_join_readonly(void);
 extern void cluster_cf_set_write_skip(bool on);
 extern bool cluster_cf_write_skip(void);
 
-#endif							/* CLUSTER_CF_ENQUEUE_H */
+#endif /* CLUSTER_CF_ENQUEUE_H */

@@ -56,16 +56,16 @@ ExceptionalCondition(const char *conditionName, const char *fileName, int lineNu
 /* ---- GES substrate stubs (settable outcomes) ---- */
 static ClusterLockAcquireResult g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 static ClusterLockAcquireResult g_s5_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
-static int	g_s6_count = 0;
+static int g_s6_count = 0;
 static uint8 g_s6_last_resid_type = 0;
 /* spec-5.6 Dc4b: capture what cluster_cf_lock threaded into the request. */
-static int	g_last_timeout_ms = -999;
+static int g_last_timeout_ms = -999;
 static uint32 g_last_wait_event = 0xFFFFFFFFu;
 
 ClusterLockAcquireResult
 cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *req)
 {
-	ClusterLockAcquireRequest *mut = (ClusterLockAcquireRequest *) req;
+	ClusterLockAcquireRequest *mut = (ClusterLockAcquireRequest *)req;
 
 	/* spec-5.6 Dc4b: record the CF acquire's timeout + wait-event override. */
 	g_last_timeout_ms = req->timeout_ms;
@@ -81,7 +81,7 @@ cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *req)
 ClusterLockAcquireResult
 cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *req)
 {
-	(void) req;
+	(void)req;
 	return g_s5_result;
 }
 
@@ -108,8 +108,16 @@ int cluster_cf_enqueue_timeout_ms = 30000;
  * shmem flag (cluster_cf_stats.o, not linked here).  A stateful stub keeps the
  * set->get behaviour the write-permission test exercises. */
 static bool g_join_ro = false;
-void cluster_cf_stats_set_join_readonly(bool on) { g_join_ro = on; }
-bool cluster_cf_stats_get_join_readonly(void) { return g_join_ro; }
+void
+cluster_cf_stats_set_join_readonly(bool on)
+{
+	g_join_ro = on;
+}
+bool
+cluster_cf_stats_get_join_readonly(void)
+{
+	return g_join_ro;
+}
 
 TimestampTz
 GetCurrentTimestamp(void)
@@ -148,12 +156,12 @@ UT_TEST(test_lock_grant_then_release)
 	g_s6_last_resid_type = 0;
 
 	UT_ASSERT(cluster_cf_lock(ExclusiveLock));
-	UT_ASSERT(cluster_cf_held(ExclusiveLock));	/* held while locked */
+	UT_ASSERT(cluster_cf_held(ExclusiveLock)); /* held while locked */
 	cluster_cf_unlock(ExclusiveLock);
-	UT_ASSERT(!cluster_cf_held(ExclusiveLock));	/* released */
+	UT_ASSERT(!cluster_cf_held(ExclusiveLock)); /* released */
 
-	UT_ASSERT_EQ(g_s6_count, 1);				/* exactly one release */
-	UT_ASSERT_EQ(g_s6_last_resid_type, 0xF1);	/* of the CF resid, not a locktag */
+	UT_ASSERT_EQ(g_s6_count, 1);			  /* exactly one release */
+	UT_ASSERT_EQ(g_s6_last_resid_type, 0xF1); /* of the CF resid, not a locktag */
 }
 
 /* ======================================================================
@@ -188,7 +196,7 @@ UT_TEST(test_held_and_write_permitted)
 	UT_ASSERT(!cluster_cf_join_readonly());
 	cluster_cf_set_join_readonly(true);
 	UT_ASSERT(cluster_cf_join_readonly());
-	UT_ASSERT(!cluster_cf_write_permitted());	/* join != write permission */
+	UT_ASSERT(!cluster_cf_write_permitted()); /* join != write permission */
 	cluster_cf_set_join_readonly(false);
 	UT_ASSERT(!cluster_cf_join_readonly());
 
@@ -200,7 +208,7 @@ UT_TEST(test_held_and_write_permitted)
 	UT_ASSERT(!cluster_cf_write_skip());
 	cluster_cf_set_write_skip(true);
 	UT_ASSERT(cluster_cf_write_skip());
-	UT_ASSERT(!cluster_cf_write_permitted());	/* write-skip != write permission */
+	UT_ASSERT(!cluster_cf_write_permitted()); /* write-skip != write permission */
 	cluster_cf_set_write_skip(false);
 	UT_ASSERT(!cluster_cf_write_skip());
 }
@@ -216,7 +224,7 @@ UT_TEST(test_lock_native_no_release)
 	UT_ASSERT(cluster_cf_lock(ShareLock));
 	cluster_cf_unlock(ShareLock);
 
-	UT_ASSERT_EQ(g_s6_count, 0);				/* uncoordinated -> no S6 */
+	UT_ASSERT_EQ(g_s6_count, 0); /* uncoordinated -> no S6 */
 }
 
 /* ======================================================================
@@ -228,7 +236,7 @@ UT_TEST(test_lock_failclosed_timeout)
 	g_s6_count = 0;
 
 	UT_ASSERT(!cluster_cf_lock(ExclusiveLock));
-	cluster_cf_unlock(ExclusiveLock);			/* not held -> no-op */
+	cluster_cf_unlock(ExclusiveLock); /* not held -> no-op */
 
 	UT_ASSERT_EQ(g_s6_count, 0);
 }
@@ -243,10 +251,10 @@ UT_TEST(test_lock_s5_fail)
 	g_s6_count = 0;
 
 	UT_ASSERT(!cluster_cf_lock(ExclusiveLock));
-	cluster_cf_unlock(ExclusiveLock);			/* not held -> no-op */
+	cluster_cf_unlock(ExclusiveLock); /* not held -> no-op */
 	UT_ASSERT_EQ(g_s6_count, 0);
 
-	g_s5_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;	/* reset */
+	g_s5_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED; /* reset */
 }
 
 /* ======================================================================
@@ -275,7 +283,7 @@ UT_TEST(test_lock_timeout_and_wait_event)
 
 	/* CF threads the GUC timeout + its own wait-event label into the request */
 	UT_ASSERT_EQ(g_last_timeout_ms, cluster_cf_enqueue_timeout_ms);
-	UT_ASSERT_EQ(g_last_wait_event, (uint32) WAIT_EVENT_CLUSTER_CF_ENQUEUE);
+	UT_ASSERT_EQ(g_last_wait_event, (uint32)WAIT_EVENT_CLUSTER_CF_ENQUEUE);
 }
 
 int

@@ -45,19 +45,18 @@
  * ClusterCfPhase2Record -- on-disk probe/ack file layout.  `nonce` carries the
  * prober's fresh nonce in a probe and the echoed nonce in an ack.
  */
-#define CLUSTER_CF_PHASE2_MAGIC		0x43465032	/* 'CFP2' */
-#define CLUSTER_CF_PHASE2_VERSION	1
+#define CLUSTER_CF_PHASE2_MAGIC 0x43465032 /* 'CFP2' */
+#define CLUSTER_CF_PHASE2_VERSION 1
 
-typedef struct ClusterCfPhase2Record
-{
-	uint32		magic;
-	uint32		version;
-	uint64		nonce;
-	pg_crc32c	crc;			/* over [0, offsetof(crc)) */
+typedef struct ClusterCfPhase2Record {
+	uint32 magic;
+	uint32 version;
+	uint64 nonce;
+	pg_crc32c crc; /* over [0, offsetof(crc)) */
 } ClusterCfPhase2Record;
 
 /* Poll interval while waiting for the peer's probe/ack to appear. */
-#define CLUSTER_CF_PHASE2_POLL_US 100000	/* 100 ms */
+#define CLUSTER_CF_PHASE2_POLL_US 100000 /* 100 ms */
 
 /*
  * ensure_p2_dir -- create <shared_dir>/global/pgrac_cf_p2 if absent.  The
@@ -66,13 +65,12 @@ typedef struct ClusterCfPhase2Record
 static void
 ensure_p2_dir(const char *shared_dir)
 {
-	char		dir[MAXPGPATH];
+	char dir[MAXPGPATH];
 
 	snprintf(dir, sizeof(dir), "%s/%s", shared_dir, CLUSTER_CF_PHASE2_DIR);
 	if (mkdir(dir, pg_dir_create_mode) != 0 && errno != EEXIST)
-		ereport(LOG,
-				(errcode_for_file_access(),
-				 errmsg("cluster cf phase-2: could not create \"%s\": %m", dir)));
+		ereport(LOG, (errcode_for_file_access(),
+					  errmsg("cluster cf phase-2: could not create \"%s\": %m", dir)));
 }
 
 /*
@@ -84,9 +82,9 @@ static bool
 write_record(const char *shared_dir, const char *rel, uint64 nonce)
 {
 	ClusterCfPhase2Record rec;
-	char		path[MAXPGPATH];
-	char		tmp[MAXPGPATH];
-	int			fd;
+	char path[MAXPGPATH];
+	char tmp[MAXPGPATH];
+	int fd;
 
 	memset(&rec, 0, sizeof(rec));
 	rec.magic = CLUSTER_CF_PHASE2_MAGIC;
@@ -102,16 +100,14 @@ write_record(const char *shared_dir, const char *rel, uint64 nonce)
 	fd = OpenTransientFile(tmp, O_RDWR | O_CREAT | O_TRUNC | PG_BINARY);
 	if (fd < 0)
 		return false;
-	if (write(fd, &rec, sizeof(rec)) != (int) sizeof(rec) || pg_fsync(fd) != 0)
-	{
+	if (write(fd, &rec, sizeof(rec)) != (int)sizeof(rec) || pg_fsync(fd) != 0) {
 		CloseTransientFile(fd);
 		unlink(tmp);
 		return false;
 	}
 	CloseTransientFile(fd);
 
-	if (durable_rename(tmp, path, LOG) != 0)
-	{
+	if (durable_rename(tmp, path, LOG) != 0) {
 		unlink(tmp);
 		return false;
 	}
@@ -126,10 +122,10 @@ static bool
 read_record(const char *shared_dir, const char *rel, uint64 *out_nonce)
 {
 	ClusterCfPhase2Record rec;
-	char		path[MAXPGPATH];
-	pg_crc32c	crc;
-	int			fd;
-	int			n;
+	char path[MAXPGPATH];
+	pg_crc32c crc;
+	int fd;
+	int n;
 
 	snprintf(path, sizeof(path), "%s/%s", shared_dir, rel);
 	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
@@ -137,9 +133,8 @@ read_record(const char *shared_dir, const char *rel, uint64 *out_nonce)
 		return false;
 	n = read(fd, &rec, sizeof(rec));
 	CloseTransientFile(fd);
-	if (n != (int) sizeof(rec) ||
-		rec.magic != CLUSTER_CF_PHASE2_MAGIC ||
-		rec.version != CLUSTER_CF_PHASE2_VERSION)
+	if (n != (int)sizeof(rec) || rec.magic != CLUSTER_CF_PHASE2_MAGIC
+		|| rec.version != CLUSTER_CF_PHASE2_VERSION)
 		return false;
 
 	INIT_CRC32C(crc);
@@ -155,7 +150,7 @@ read_record(const char *shared_dir, const char *rel, uint64 *out_nonce)
 bool
 cluster_cf_phase2_write_probe(const char *shared_dir, int self_id, uint64 nonce)
 {
-	char		rel[MAXPGPATH];
+	char rel[MAXPGPATH];
 
 	snprintf(rel, sizeof(rel), "%s/probe.%d", CLUSTER_CF_PHASE2_DIR, self_id);
 	return write_record(shared_dir, rel, nonce);
@@ -164,7 +159,7 @@ cluster_cf_phase2_write_probe(const char *shared_dir, int self_id, uint64 nonce)
 bool
 cluster_cf_phase2_read_probe(const char *shared_dir, int peer_id, uint64 *out_nonce)
 {
-	char		rel[MAXPGPATH];
+	char rel[MAXPGPATH];
 
 	snprintf(rel, sizeof(rel), "%s/probe.%d", CLUSTER_CF_PHASE2_DIR, peer_id);
 	return read_record(shared_dir, rel, out_nonce);
@@ -173,7 +168,7 @@ cluster_cf_phase2_read_probe(const char *shared_dir, int peer_id, uint64 *out_no
 bool
 cluster_cf_phase2_write_ack(const char *shared_dir, int peer_id, uint64 echo_nonce)
 {
-	char		rel[MAXPGPATH];
+	char rel[MAXPGPATH];
 
 	/* ack.<peer_id> = "this node's ack of peer_id's probe", echoing its nonce. */
 	snprintf(rel, sizeof(rel), "%s/ack.%d", CLUSTER_CF_PHASE2_DIR, peer_id);
@@ -183,7 +178,7 @@ cluster_cf_phase2_write_ack(const char *shared_dir, int peer_id, uint64 echo_non
 bool
 cluster_cf_phase2_read_ack(const char *shared_dir, int self_id, uint64 *out_echo)
 {
-	char		rel[MAXPGPATH];
+	char rel[MAXPGPATH];
 
 	/* ack.<self_id> = "the peer's ack of my probe"; out_echo must equal my nonce. */
 	snprintf(rel, sizeof(rel), "%s/ack.%d", CLUSTER_CF_PHASE2_DIR, self_id);
@@ -194,12 +189,12 @@ cluster_cf_phase2_read_ack(const char *shared_dir, int self_id, uint64 *out_echo
  * cluster_cf_phase2_rendezvous -- symmetric nonce+ack handshake (see header).
  */
 bool
-cluster_cf_phase2_rendezvous(const char *shared_dir, int self_id, int peer_id,
-							 uint64 nonce, int timeout_ms)
+cluster_cf_phase2_rendezvous(const char *shared_dir, int self_id, int peer_id, uint64 nonce,
+							 int timeout_ms)
 {
 	TimestampTz deadline;
-	bool		acked_peer = false;
-	bool		my_ack_ok = false;
+	bool acked_peer = false;
+	bool my_ack_ok = false;
 
 	if (shared_dir == NULL || shared_dir[0] == '\0')
 		return false;
@@ -212,34 +207,30 @@ cluster_cf_phase2_rendezvous(const char *shared_dir, int self_id, int peer_id,
 
 	deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), timeout_ms);
 
-	for (;;)
-	{
+	for (;;) {
 		/* Direction peer->self: I can see the peer's probe -> ack it. */
-		if (!acked_peer)
-		{
-			uint64		peer_nonce;
+		if (!acked_peer) {
+			uint64 peer_nonce;
 
-			if (cluster_cf_phase2_read_probe(shared_dir, peer_id, &peer_nonce))
-			{
+			if (cluster_cf_phase2_read_probe(shared_dir, peer_id, &peer_nonce)) {
 				if (cluster_cf_phase2_write_ack(shared_dir, peer_id, peer_nonce))
 					acked_peer = true;
 			}
 		}
 
 		/* Direction self->peer: the peer acked my probe and I can see the ack. */
-		if (!my_ack_ok)
-		{
-			uint64		echo;
+		if (!my_ack_ok) {
+			uint64 echo;
 
 			if (cluster_cf_phase2_read_ack(shared_dir, self_id, &echo) && echo == nonce)
 				my_ack_ok = true;
 		}
 
 		if (acked_peer && my_ack_ok)
-			return true;			/* both directions verified */
+			return true; /* both directions verified */
 
 		if (GetCurrentTimestamp() >= deadline)
-			return false;			/* no peer / no cross-node visibility */
+			return false; /* no peer / no cross-node visibility */
 
 		CHECK_FOR_INTERRUPTS();
 		pg_usleep(CLUSTER_CF_PHASE2_POLL_US);
@@ -254,10 +245,9 @@ cluster_cf_phase2_rendezvous(const char *shared_dir, int self_id, int peer_id,
 static int
 find_peer_node(void)
 {
-	int			id;
+	int id;
 
-	for (id = 0; id < CLUSTER_MAX_NODES; id++)
-	{
+	for (id = 0; id < CLUSTER_MAX_NODES; id++) {
 		if (id == cluster_node_id)
 			continue;
 		if (cluster_conf_lookup_node(id) != NULL)
@@ -286,14 +276,14 @@ cluster_cf_phase2_peer_verified(void)
 void
 cluster_cf_phase2_verify_or_fail(const char *pgdata)
 {
-	int			peer_id;
-	uint64		nonce;
-	uint8		raw[8];
+	int peer_id;
+	uint64 nonce;
+	uint8 raw[8];
 
 	if (!cluster_controlfile_shared_authority)
 		return;
 	if (!cluster_enabled || cluster_conf_node_count() <= 1)
-		return;					/* single-node: no cross-node contract needed */
+		return; /* single-node: no cross-node contract needed */
 
 	/*
 	 * Always run a FRESH rendezvous on a multi-node bootstrap (do not short-
@@ -305,10 +295,10 @@ cluster_cf_phase2_verify_or_fail(const char *pgdata)
 	 */
 	peer_id = find_peer_node();
 	if (peer_id < 0)
-		return;					/* no peer configured -> gate fails closed */
+		return; /* no peer configured -> gate fails closed */
 
 	if (!pg_strong_random(raw, sizeof(raw)))
-		return;					/* no fresh nonce -> leave unverified */
+		return; /* no fresh nonce -> leave unverified */
 	memcpy(&nonce, raw, sizeof(nonce));
 
 	/*
@@ -319,9 +309,8 @@ cluster_cf_phase2_verify_or_fail(const char *pgdata)
 	 * rename visibility, times out and leaves the contract unverified (the
 	 * role gate then fails closed -- never a false CROSSNODE_VERIFIED).
 	 */
-	if (cluster_cf_phase2_rendezvous(cluster_shared_data_dir, cluster_node_id,
-									 peer_id, nonce, cluster_cf_enqueue_timeout_ms))
-	{
+	if (cluster_cf_phase2_rendezvous(cluster_shared_data_dir, cluster_node_id, peer_id, nonce,
+									 cluster_cf_enqueue_timeout_ms)) {
 		/*
 		 * Peer alive + storage cross-node verified this run.  Record the
 		 * contract (bound to the storage uuid) and flag peer-verified so the
@@ -329,9 +318,10 @@ cluster_cf_phase2_verify_or_fail(const char *pgdata)
 		 * during recovery; steady-state writes go through CF X after PM_RUN).
 		 */
 		cf_phase2_peer_verified = true;
-		(void) cluster_cf_contract_persist(pgdata, CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED);
-		ereport(LOG,
-				(errmsg("cluster cf phase-2: cross-node storage rename contract verified with node %d",
-						peer_id)));
+		(void)cluster_cf_contract_persist(pgdata, CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED);
+		ereport(
+			LOG,
+			(errmsg("cluster cf phase-2: cross-node storage rename contract verified with node %d",
+					peer_id)));
 	}
 }

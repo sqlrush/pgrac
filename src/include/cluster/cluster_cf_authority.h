@@ -46,7 +46,7 @@
  * is a fixed, well-known path that backend ReadControlFile and frontend
  * pg_controldata open transparently (spec §3.9 T1).
  */
-#define CLUSTER_CF_REL_PATH		"global/pg_control"
+#define CLUSTER_CF_REL_PATH "global/pg_control"
 #define CLUSTER_CF_BAK_REL_PATH "global/pg_control.bak"
 #define CLUSTER_CF_TMP_REL_PATH "global/pg_control.tmp"
 #define CLUSTER_CF_BAK_TMP_REL_PATH "global/pg_control.bak.tmp"
@@ -64,8 +64,7 @@
  *	INVALID_IDENTITY	CRC is fine but system_identifier differs from the
  *					expected one (symlink points at a foreign cluster).
  */
-typedef enum ClusterCfValidity
-{
+typedef enum ClusterCfValidity {
 	CLUSTER_CF_VALID = 0,
 	CLUSTER_CF_INVALID_SHORT,
 	CLUSTER_CF_INVALID_CRC,
@@ -83,8 +82,7 @@ typedef enum ClusterCfValidity
  *	FAILCLOSED		neither image can be trusted -> caller must raise a
  *					FATAL/ERROR rather than proceed (spec §3.1 A3).
  */
-typedef enum ClusterCfReadSource
-{
+typedef enum ClusterCfReadSource {
 	CLUSTER_CF_SOURCE_PRIMARY = 0,
 	CLUSTER_CF_SOURCE_BAK,
 	CLUSTER_CF_SOURCE_FAILCLOSED
@@ -115,8 +113,7 @@ extern const char *cluster_cf_bak_path(void);
 extern ClusterCfValidity cluster_cf_classify_buffer(const char *buf, size_t len,
 													uint64 expected_sysid);
 extern ClusterCfReadSource cluster_cf_decide_source(ClusterCfValidity primary,
-													ClusterCfValidity bak,
-													bool bak_strict_ok);
+													ClusterCfValidity bak, bool bak_strict_ok);
 
 /*
  * cluster_cf_bak_strict_ok: strict (non-CRC-only) acceptance of a .bak image
@@ -126,8 +123,7 @@ extern ClusterCfReadSource cluster_cf_decide_source(ClusterCfValidity primary,
  * true.  Recoverability is computed by the (impure) probe below and passed
  * in, keeping this decision unit-testable in isolation.
  */
-extern bool cluster_cf_bak_strict_ok(const ControlFileData *bak,
-									 uint64 expected_sysid,
+extern bool cluster_cf_bak_strict_ok(const ControlFileData *bak, uint64 expected_sysid,
 									 bool checkpoint_recoverable);
 
 /*
@@ -158,4 +154,4 @@ extern bool cluster_cf_authority_read(ControlFileData *out);
  */
 extern void cluster_cf_authority_write(const ControlFileData *cf);
 
-#endif							/* CLUSTER_CF_AUTHORITY_H */
+#endif /* CLUSTER_CF_AUTHORITY_H */

@@ -56,8 +56,7 @@
 static bool
 build_path(char *dst, size_t dstlen, const char *relpath)
 {
-	if (cluster_shared_data_dir == NULL || cluster_shared_data_dir[0] == '\0')
-	{
+	if (cluster_shared_data_dir == NULL || cluster_shared_data_dir[0] == '\0') {
 		if (dstlen > 0)
 			dst[0] = '\0';
 		return false;
@@ -101,7 +100,7 @@ ClusterCfValidity
 cluster_cf_classify_buffer(const char *buf, size_t len, uint64 expected_sysid)
 {
 	ControlFileData cf;
-	pg_crc32c	crc;
+	pg_crc32c crc;
 
 	if (buf == NULL || len < sizeof(ControlFileData))
 		return CLUSTER_CF_INVALID_SHORT;
@@ -115,8 +114,7 @@ cluster_cf_classify_buffer(const char *buf, size_t len, uint64 expected_sysid)
 		return CLUSTER_CF_INVALID_CRC;
 
 	/* Foreign byte order: version is a nonzero multiple of 65536. */
-	if (cf.pg_control_version % 65536 == 0 &&
-		cf.pg_control_version / 65536 != 0)
+	if (cf.pg_control_version % 65536 == 0 && cf.pg_control_version / 65536 != 0)
 		return CLUSTER_CF_INVALID_BYTE_ORDER;
 
 	if (expected_sysid != 0 && cf.system_identifier != expected_sysid)
@@ -134,8 +132,7 @@ cluster_cf_classify_buffer(const char *buf, size_t len, uint64 expected_sysid)
  *	corrupt primary (spec §3.9 T3).  Otherwise fail-closed.
  */
 ClusterCfReadSource
-cluster_cf_decide_source(ClusterCfValidity primary, ClusterCfValidity bak,
-						 bool bak_strict_ok)
+cluster_cf_decide_source(ClusterCfValidity primary, ClusterCfValidity bak, bool bak_strict_ok)
 {
 	if (primary == CLUSTER_CF_VALID)
 		return CLUSTER_CF_SOURCE_PRIMARY;
@@ -174,8 +171,8 @@ cluster_cf_bak_strict_ok(const ControlFileData *bak, uint64 expected_sysid,
 static ClusterCfValidity
 read_image(const char *path, char *image)
 {
-	int			fd;
-	int			r;
+	int fd;
+	int r;
 
 	if (path == NULL)
 		return CLUSTER_CF_INVALID_SHORT;
@@ -187,7 +184,7 @@ read_image(const char *path, char *image)
 	r = read(fd, image, sizeof(ControlFileData));
 	CloseTransientFile(fd);
 
-	if (r != (int) sizeof(ControlFileData))
+	if (r != (int)sizeof(ControlFileData))
 		return CLUSTER_CF_INVALID_SHORT;
 
 	return cluster_cf_classify_buffer(image, sizeof(ControlFileData), 0);
@@ -203,16 +200,15 @@ read_image(const char *path, char *image)
 bool
 cluster_cf_authority_read(ControlFileData *out)
 {
-	char		primary_img[sizeof(ControlFileData)];
-	char		bak_img[sizeof(ControlFileData)];
+	char primary_img[sizeof(ControlFileData)];
+	char bak_img[sizeof(ControlFileData)];
 	ClusterCfValidity pv;
 	ClusterCfValidity bv;
-	bool		bak_strict_ok;
+	bool bak_strict_ok;
 	ClusterCfReadSource src;
 
 	pv = read_image(cluster_cf_shared_path(), primary_img);
-	if (pv == CLUSTER_CF_VALID)
-	{
+	if (pv == CLUSTER_CF_VALID) {
 		memcpy(out, primary_img, sizeof(ControlFileData));
 		return true;
 	}
@@ -230,29 +226,26 @@ cluster_cf_authority_read(ControlFileData *out)
 	 * is skipped here (0); the symlink/migrate gates already reject a foreign
 	 * authority at startup (§3.2 M3).
 	 */
-	if (bv == CLUSTER_CF_VALID)
-	{
+	if (bv == CLUSTER_CF_VALID) {
 		ControlFileData bak_cf;
 
 		memcpy(&bak_cf, bak_img, sizeof(ControlFileData));
-		bak_strict_ok = cluster_cf_bak_strict_ok(&bak_cf, 0,
-												  cluster_cf_bak_checkpoint_recoverable(&bak_cf));
-	}
-	else
+		bak_strict_ok
+			= cluster_cf_bak_strict_ok(&bak_cf, 0, cluster_cf_bak_checkpoint_recoverable(&bak_cf));
+	} else
 		bak_strict_ok = false;
 
 	src = cluster_cf_decide_source(pv, bv, bak_strict_ok);
-	switch (src)
-	{
-		case CLUSTER_CF_SOURCE_PRIMARY:
-			memcpy(out, primary_img, sizeof(ControlFileData));
-			return true;
-		case CLUSTER_CF_SOURCE_BAK:
-			cluster_cf_counter_inc(CLUSTER_CF_BAK_FALLBACK);
-			memcpy(out, bak_img, sizeof(ControlFileData));
-			return true;
-		case CLUSTER_CF_SOURCE_FAILCLOSED:
-			break;
+	switch (src) {
+	case CLUSTER_CF_SOURCE_PRIMARY:
+		memcpy(out, primary_img, sizeof(ControlFileData));
+		return true;
+	case CLUSTER_CF_SOURCE_BAK:
+		cluster_cf_counter_inc(CLUSTER_CF_BAK_FALLBACK);
+		memcpy(out, bak_img, sizeof(ControlFileData));
+		return true;
+	case CLUSTER_CF_SOURCE_FAILCLOSED:
+		break;
 	}
 	return false;
 }
@@ -265,39 +258,28 @@ cluster_cf_authority_read(ControlFileData *out)
 static void
 write_durable(const char *tmp, const char *final, const char *buf)
 {
-	int			fd;
+	int fd;
 
 	fd = OpenTransientFile(tmp, O_RDWR | O_CREAT | O_TRUNC | PG_BINARY);
 	if (fd < 0)
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("could not open file \"%s\": %m", tmp)));
+		ereport(PANIC, (errcode_for_file_access(), errmsg("could not open file \"%s\": %m", tmp)));
 
 	errno = 0;
-	if (write(fd, buf, PG_CONTROL_FILE_SIZE) != PG_CONTROL_FILE_SIZE)
-	{
+	if (write(fd, buf, PG_CONTROL_FILE_SIZE) != PG_CONTROL_FILE_SIZE) {
 		if (errno == 0)
 			errno = ENOSPC;
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("could not write file \"%s\": %m", tmp)));
+		ereport(PANIC, (errcode_for_file_access(), errmsg("could not write file \"%s\": %m", tmp)));
 	}
 
 	if (pg_fsync(fd) != 0)
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("could not fsync file \"%s\": %m", tmp)));
+		ereport(PANIC, (errcode_for_file_access(), errmsg("could not fsync file \"%s\": %m", tmp)));
 
 	if (CloseTransientFile(fd) != 0)
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("could not close file \"%s\": %m", tmp)));
+		ereport(PANIC, (errcode_for_file_access(), errmsg("could not close file \"%s\": %m", tmp)));
 
 	if (durable_rename(tmp, final, PANIC) != 0)
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("could not rename file \"%s\" to \"%s\": %m",
-						tmp, final)));
+		ereport(PANIC, (errcode_for_file_access(),
+						errmsg("could not rename file \"%s\" to \"%s\": %m", tmp, final)));
 }
 
 /*
@@ -308,18 +290,18 @@ write_durable(const char *tmp, const char *final, const char *buf)
 static void
 roll_primary_to_bak(const char *primary, const char *bak, const char *baktmp)
 {
-	char		buf[PG_CONTROL_FILE_SIZE];
-	int			fd;
-	int			r;
+	char buf[PG_CONTROL_FILE_SIZE];
+	int fd;
+	int r;
 
 	fd = OpenTransientFile(primary, O_RDONLY | PG_BINARY);
 	if (fd < 0)
-		return;					/* first write: no prior primary to preserve */
+		return; /* first write: no prior primary to preserve */
 
 	r = read(fd, buf, PG_CONTROL_FILE_SIZE);
 	CloseTransientFile(fd);
 	if (r != PG_CONTROL_FILE_SIZE)
-		return;					/* short/odd primary: don't manufacture a .bak */
+		return; /* short/odd primary: don't manufacture a .bak */
 
 	write_durable(baktmp, bak, buf);
 }
@@ -332,24 +314,23 @@ roll_primary_to_bak(const char *primary, const char *bak, const char *baktmp)
 void
 cluster_cf_authority_write(const ControlFileData *cf)
 {
-	char		buffer[PG_CONTROL_FILE_SIZE];
-	char		primary[MAXPGPATH];
-	char		bak[MAXPGPATH];
-	char		tmp[MAXPGPATH];
-	char		baktmp[MAXPGPATH];
+	char buffer[PG_CONTROL_FILE_SIZE];
+	char primary[MAXPGPATH];
+	char bak[MAXPGPATH];
+	char tmp[MAXPGPATH];
+	char baktmp[MAXPGPATH];
 	ControlFileData local;
 
-	if (!build_path(primary, sizeof(primary), CLUSTER_CF_REL_PATH) ||
-		!build_path(bak, sizeof(bak), CLUSTER_CF_BAK_REL_PATH) ||
-		!build_path(tmp, sizeof(tmp), CLUSTER_CF_TMP_REL_PATH) ||
-		!build_path(baktmp, sizeof(baktmp), CLUSTER_CF_BAK_TMP_REL_PATH))
-		ereport(PANIC,
-				(errmsg("cluster shared_data_dir is not configured")));
+	if (!build_path(primary, sizeof(primary), CLUSTER_CF_REL_PATH)
+		|| !build_path(bak, sizeof(bak), CLUSTER_CF_BAK_REL_PATH)
+		|| !build_path(tmp, sizeof(tmp), CLUSTER_CF_TMP_REL_PATH)
+		|| !build_path(baktmp, sizeof(baktmp), CLUSTER_CF_BAK_TMP_REL_PATH))
+		ereport(PANIC, (errmsg("cluster shared_data_dir is not configured")));
 
 	/* Recompute CRC over a private copy (cf is const). */
 	memcpy(&local, cf, sizeof(local));
 	INIT_CRC32C(local.crc);
-	COMP_CRC32C(local.crc, (char *) &local, offsetof(ControlFileData, crc));
+	COMP_CRC32C(local.crc, (char *)&local, offsetof(ControlFileData, crc));
 	FIN_CRC32C(local.crc);
 
 	/* Zero-pad to the full on-disk size, as update_controlfile does. */

@@ -1114,8 +1114,7 @@ cluster_init_guc(void)
 		gettext_noop("When on, this node migrates global/pg_control into the shared "
 					 "authority and symlinks to it, failing closed on a per-node or "
 					 "foreign control file.  Off keeps the stock per-node pg_control."),
-		&cluster_controlfile_shared_authority, false, PGC_POSTMASTER, 0,
-		NULL, NULL, NULL);
+		&cluster_controlfile_shared_authority, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	/*
 	 * cluster.shared_storage_uuid -- optional external-preset identity for
@@ -1348,8 +1347,8 @@ cluster_init_guc(void)
 					 "strong-consistency control-file read waits this long for the "
 					 "cross-node CF X/S grant before failing closed (53R70).  Only "
 					 "meaningful when cluster.controlfile_shared_authority is on."),
-		&cluster_cf_enqueue_timeout_ms, 30000, 1000, 600000, PGC_SIGHUP, GUC_UNIT_MS,
-		NULL, NULL, NULL);
+		&cluster_cf_enqueue_timeout_ms, 30000, 1000, 600000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
+		NULL);
 
 	/* spec-2.27 D4 NEW — GES retransmit + dedup HTAB tunables (HC51..HC53). */
 	DefineCustomIntVariable(

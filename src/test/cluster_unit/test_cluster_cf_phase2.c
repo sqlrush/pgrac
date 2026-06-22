@@ -56,13 +56,13 @@
 UT_DEFINE_GLOBALS();
 
 /* ---- globals phase2.o references (verify_or_fail path; not exercised here) ---- */
-int			cluster_node_id = 0;
-bool		cluster_enabled = false;
-char	   *cluster_shared_data_dir = NULL;
-bool		cluster_controlfile_shared_authority = false;
-int			cluster_cf_enqueue_timeout_ms = 30000;
+int cluster_node_id = 0;
+bool cluster_enabled = false;
+char *cluster_shared_data_dir = NULL;
+bool cluster_controlfile_shared_authority = false;
+int cluster_cf_enqueue_timeout_ms = 30000;
 volatile sig_atomic_t InterruptPending = 0;
-int			pg_dir_create_mode = 0700;
+int pg_dir_create_mode = 0700;
 
 /* ---- Assert + ereport + fd.c stubs (same pattern as the storage test) ---- */
 void
@@ -75,27 +75,71 @@ ExceptionalCondition(const char *conditionName, const char *fileName, int lineNu
 bool
 errstart(int elevel, const char *domain pg_attribute_unused())
 {
-	if (elevel >= ERROR)
-	{
+	if (elevel >= ERROR) {
 		printf("# unexpected ereport(elevel=%d) -- aborting\n", elevel);
 		abort();
 	}
 	return false;
 }
 
-bool errstart_cold(int elevel, const char *domain) { return errstart(elevel, domain); }
-void errfinish(const char *f pg_attribute_unused(), int l pg_attribute_unused(), const char *fn pg_attribute_unused()) {}
-int errcode(int c pg_attribute_unused()) { return 0; }
-int errcode_for_file_access(void) { return 0; }
-int errmsg(const char *fmt pg_attribute_unused(),...) { return 0; }
-int errmsg_internal(const char *fmt pg_attribute_unused(),...) { return 0; }
-int errdetail(const char *fmt pg_attribute_unused(),...) { return 0; }
-int errhint(const char *fmt pg_attribute_unused(),...) { return 0; }
-void ProcessInterrupts(void) {}
+bool
+errstart_cold(int elevel, const char *domain)
+{
+	return errstart(elevel, domain);
+}
+void
+errfinish(const char *f pg_attribute_unused(), int l pg_attribute_unused(),
+		  const char *fn pg_attribute_unused())
+{}
+int
+errcode(int c pg_attribute_unused())
+{
+	return 0;
+}
+int
+errcode_for_file_access(void)
+{
+	return 0;
+}
+int
+errmsg(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+int
+errmsg_internal(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+int
+errdetail(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+int
+errhint(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+void
+ProcessInterrupts(void)
+{}
 
-int OpenTransientFile(const char *fileName, int fileFlags) { return open(fileName, fileFlags, 0600); }
-int CloseTransientFile(int fd) { return close(fd); }
-int pg_fsync(int fd) { return fsync(fd); }
+int
+OpenTransientFile(const char *fileName, int fileFlags)
+{
+	return open(fileName, fileFlags, 0600);
+}
+int
+CloseTransientFile(int fd)
+{
+	return close(fd);
+}
+int
+pg_fsync(int fd)
+{
+	return fsync(fd);
+}
 int
 durable_rename(const char *o, const char *n, int e pg_attribute_unused())
 {
@@ -104,7 +148,11 @@ durable_rename(const char *o, const char *n, int e pg_attribute_unused())
 
 /* GetCurrentTimestamp stub: a fixed value so the rendezvous deadline math is
  * deterministic (timeout_ms=0 -> deadline == now -> immediate timeout). */
-TimestampTz GetCurrentTimestamp(void) { return 1; }
+TimestampTz
+GetCurrentTimestamp(void)
+{
+	return 1;
+}
 
 /* contract persist/load: not reached by these tests (only verify_or_fail uses
  * them); stub to satisfy the link without pulling in cluster_cf_storage.o. */
@@ -121,8 +169,16 @@ cluster_cf_contract_load(const char *p pg_attribute_unused())
 }
 
 /* find_peer_node() deps (verify_or_fail path; not exercised). */
-const void *cluster_conf_lookup_node(int32 id pg_attribute_unused()) { return NULL; }
-int cluster_conf_node_count(void) { return 1; }
+const void *
+cluster_conf_lookup_node(int32 id pg_attribute_unused())
+{
+	return NULL;
+}
+int
+cluster_conf_node_count(void)
+{
+	return 1;
+}
 
 /* pg_strong_random is only used by verify_or_fail (not exercised); a local stub
  * resolves the link without dragging OpenSSL into this standalone unit. */
@@ -139,25 +195,22 @@ static char shared_root[MAXPGPATH];
 static void
 make_shared_root(void)
 {
-	char		tmpl[MAXPGPATH];
-	char		sub[MAXPGPATH];
+	char tmpl[MAXPGPATH];
+	char sub[MAXPGPATH];
 
 	snprintf(tmpl, sizeof(tmpl), "/tmp/pgrac_cf_p2_XXXXXX");
-	if (mkdtemp(tmpl) == NULL)
-	{
+	if (mkdtemp(tmpl) == NULL) {
 		printf("# mkdtemp failed: %s\n", strerror(errno));
 		abort();
 	}
 	strlcpy(shared_root, tmpl, sizeof(shared_root));
 	snprintf(sub, sizeof(sub), "%s/global", shared_root);
-	if (mkdir(sub, 0700) != 0 && errno != EEXIST)
-	{
+	if (mkdir(sub, 0700) != 0 && errno != EEXIST) {
 		printf("# mkdir global failed: %s\n", strerror(errno));
 		abort();
 	}
 	snprintf(sub, sizeof(sub), "%s/%s", shared_root, CLUSTER_CF_PHASE2_DIR);
-	if (mkdir(sub, 0700) != 0 && errno != EEXIST)
-	{
+	if (mkdir(sub, 0700) != 0 && errno != EEXIST) {
 		printf("# mkdir p2 failed: %s\n", strerror(errno));
 		abort();
 	}
@@ -168,7 +221,7 @@ make_shared_root(void)
  * ====================================================================== */
 UT_TEST(test_probe_ack_roundtrip)
 {
-	uint64		got;
+	uint64 got;
 
 	make_shared_root();
 
@@ -188,13 +241,13 @@ UT_TEST(test_probe_ack_roundtrip)
 
 	/* a corrupt (truncated) probe reads as false */
 	{
-		char		path[MAXPGPATH];
-		int			fd;
-		char		junk[4] = {1, 2, 3, 4};
+		char path[MAXPGPATH];
+		int fd;
+		char junk[4] = { 1, 2, 3, 4 };
 
 		snprintf(path, sizeof(path), "%s/%s/probe.0", shared_root, CLUSTER_CF_PHASE2_DIR);
 		fd = open(path, O_RDWR | O_TRUNC, 0600);
-		if (fd < 0 || write(fd, junk, sizeof(junk)) != (ssize_t) sizeof(junk))
+		if (fd < 0 || write(fd, junk, sizeof(junk)) != (ssize_t)sizeof(junk))
 			abort();
 		close(fd);
 		UT_ASSERT(!cluster_cf_phase2_read_probe(shared_root, 0, &got));
@@ -217,15 +270,15 @@ UT_TEST(test_rendezvous_success)
 	UT_ASSERT(cluster_cf_phase2_write_probe(shared_root, 1, UINT64CONST(0xAAAA0001BBBB0002)));
 	UT_ASSERT(cluster_cf_phase2_write_ack(shared_root, 0, UINT64CONST(0xCCCC0003DDDD0004)));
 
-	UT_ASSERT(cluster_cf_phase2_rendezvous(shared_root, 0, 1,
-										   UINT64CONST(0xCCCC0003DDDD0004), 60000));
+	UT_ASSERT(
+		cluster_cf_phase2_rendezvous(shared_root, 0, 1, UINT64CONST(0xCCCC0003DDDD0004), 60000));
 
 	/* and it really wrote my probe + the peer's ack */
 	{
-		uint64		n;
+		uint64 n;
 
 		UT_ASSERT(cluster_cf_phase2_read_probe(shared_root, 0, &n));
-		UT_ASSERT(cluster_cf_phase2_read_ack(shared_root, 1, &n));	/* ack.1 echoes peer nonce */
+		UT_ASSERT(cluster_cf_phase2_read_ack(shared_root, 1, &n)); /* ack.1 echoes peer nonce */
 		UT_ASSERT_EQ(n, UINT64CONST(0xAAAA0001BBBB0002));
 	}
 }

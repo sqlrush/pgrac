@@ -36,13 +36,12 @@
  * spec-5.6 Dc4 -- CF shared-authority observability counters.  Each has at
  * least one call site (DoD); they are pure observability and never gate logic.
  */
-typedef enum ClusterCfCounter
-{
-	CLUSTER_CF_X_ACQUIRE = 0,			/* CF X granted (write authority) */
-	CLUSTER_CF_S_ACQUIRE = 1,			/* CF S granted (strong-consistency read) */
-	CLUSTER_CF_FAILCLOSED = 2,			/* CF lock unprovable -> caller fails closed */
-	CLUSTER_CF_SINGLE_NODE_AUTHORITY = 3,	/* bootstrap single-node authority window opened */
-	CLUSTER_CF_BAK_FALLBACK = 4,		/* authority read fell back to a valid .bak */
+typedef enum ClusterCfCounter {
+	CLUSTER_CF_X_ACQUIRE = 0,			  /* CF X granted (write authority) */
+	CLUSTER_CF_S_ACQUIRE = 1,			  /* CF S granted (strong-consistency read) */
+	CLUSTER_CF_FAILCLOSED = 2,			  /* CF lock unprovable -> caller fails closed */
+	CLUSTER_CF_SINGLE_NODE_AUTHORITY = 3, /* bootstrap single-node authority window opened */
+	CLUSTER_CF_BAK_FALLBACK = 4,		  /* authority read fell back to a valid .bak */
 	CLUSTER_CF_COUNTER_COUNT = 5
 } ClusterCfCounter;
 
@@ -70,4 +69,4 @@ extern uint64 cluster_cf_counter_read(ClusterCfCounter which);
 extern void cluster_cf_stats_set_join_readonly(bool on);
 extern bool cluster_cf_stats_get_join_readonly(void);
 
-#endif							/* CLUSTER_CF_STATS_H */
+#endif /* CLUSTER_CF_STATS_H */

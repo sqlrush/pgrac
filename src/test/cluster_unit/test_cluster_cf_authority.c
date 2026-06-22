@@ -72,7 +72,7 @@ UT_DEFINE_GLOBALS();
  * Globals read by cluster_cf_authority.o.
  * ----------
  */
-char	   *cluster_shared_data_dir = NULL;
+char *cluster_shared_data_dir = NULL;
 
 /* ----------
  * Assert + ereport machinery.  ereport(ERROR/FATAL) must not return, so the
@@ -90,8 +90,7 @@ ExceptionalCondition(const char *conditionName, const char *fileName, int lineNu
 bool
 errstart(int elevel, const char *domain pg_attribute_unused())
 {
-	if (elevel >= ERROR)
-	{
+	if (elevel >= ERROR) {
 		printf("# unexpected ereport(elevel=%d) -- aborting\n", elevel);
 		abort();
 	}
@@ -109,12 +108,36 @@ errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_un
 		  const char *funcname pg_attribute_unused())
 {}
 
-int errcode(int sqlerrcode pg_attribute_unused()) { return 0; }
-int errcode_for_file_access(void) { return 0; }
-int errmsg(const char *fmt pg_attribute_unused(),...) { return 0; }
-int errmsg_internal(const char *fmt pg_attribute_unused(),...) { return 0; }
-int errdetail(const char *fmt pg_attribute_unused(),...) { return 0; }
-int errhint(const char *fmt pg_attribute_unused(),...) { return 0; }
+int
+errcode(int sqlerrcode pg_attribute_unused())
+{
+	return 0;
+}
+int
+errcode_for_file_access(void)
+{
+	return 0;
+}
+int
+errmsg(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+int
+errmsg_internal(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+int
+errdetail(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+int
+errhint(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
 
 /* ----------
  * Functional fd.c stubs: map straight onto the kernel.
@@ -184,12 +207,11 @@ static char shared_root[MAXPGPATH];
 static void
 setup_shared_root(void)
 {
-	char		tmpl[MAXPGPATH];
-	char		globaldir[MAXPGPATH];
+	char tmpl[MAXPGPATH];
+	char globaldir[MAXPGPATH];
 
 	strlcpy(tmpl, "/tmp/pgrac_cf_authority_XXXXXX", sizeof(tmpl));
-	if (mkdtemp(tmpl) == NULL)
-	{
+	if (mkdtemp(tmpl) == NULL) {
 		printf("# mkdtemp failed: %s\n", strerror(errno));
 		abort();
 	}
@@ -197,8 +219,7 @@ setup_shared_root(void)
 	cluster_shared_data_dir = shared_root;
 
 	snprintf(globaldir, sizeof(globaldir), "%s/global", shared_root);
-	if (mkdir(globaldir, 0700) != 0 && errno != EEXIST)
-	{
+	if (mkdir(globaldir, 0700) != 0 && errno != EEXIST) {
 		printf("# mkdir global failed: %s\n", strerror(errno));
 		abort();
 	}
@@ -220,7 +241,7 @@ static void
 finalize_crc(ControlFileData *cf)
 {
 	INIT_CRC32C(cf->crc);
-	COMP_CRC32C(cf->crc, (char *) cf, offsetof(ControlFileData, crc));
+	COMP_CRC32C(cf->crc, (char *)cf, offsetof(ControlFileData, crc));
 	FIN_CRC32C(cf->crc);
 }
 
@@ -228,22 +249,19 @@ finalize_crc(ControlFileData *cf)
 static void
 flip_byte(const char *path, off_t off)
 {
-	int			fd = open(path, O_RDWR);
+	int fd = open(path, O_RDWR);
 	unsigned char b;
 
-	if (fd < 0)
-	{
+	if (fd < 0) {
 		printf("# flip_byte open %s failed: %s\n", path, strerror(errno));
 		abort();
 	}
-	if (pread(fd, &b, 1, off) != 1)
-	{
+	if (pread(fd, &b, 1, off) != 1) {
 		printf("# flip_byte pread failed\n");
 		abort();
 	}
 	b ^= 0xFF;
-	if (pwrite(fd, &b, 1, off) != 1)
-	{
+	if (pwrite(fd, &b, 1, off) != 1) {
 		printf("# flip_byte pwrite failed\n");
 		abort();
 	}
@@ -255,8 +273,8 @@ flip_byte(const char *path, off_t off)
  * ====================================================================== */
 UT_TEST(test_paths)
 {
-	char		expect_primary[MAXPGPATH];
-	char		expect_bak[MAXPGPATH];
+	char expect_primary[MAXPGPATH];
+	char expect_bak[MAXPGPATH];
 
 	snprintf(expect_primary, sizeof(expect_primary), "%s/global/pg_control", shared_root);
 	snprintf(expect_bak, sizeof(expect_bak), "%s/global/pg_control.bak", shared_root);
@@ -276,30 +294,26 @@ UT_TEST(test_classify_buffer)
 	finalize_crc(&cf);
 
 	/* good image, no identity expectation */
-	UT_ASSERT_EQ(cluster_cf_classify_buffer((char *) &cf, sizeof(cf), 0),
-				 CLUSTER_CF_VALID);
+	UT_ASSERT_EQ(cluster_cf_classify_buffer((char *)&cf, sizeof(cf), 0), CLUSTER_CF_VALID);
 	/* good image, matching identity */
-	UT_ASSERT_EQ(cluster_cf_classify_buffer((char *) &cf, sizeof(cf),
-											0xABCDEF0123456789ULL),
+	UT_ASSERT_EQ(cluster_cf_classify_buffer((char *)&cf, sizeof(cf), 0xABCDEF0123456789ULL),
 				 CLUSTER_CF_VALID);
 	/* good CRC but foreign identity */
-	UT_ASSERT_EQ(cluster_cf_classify_buffer((char *) &cf, sizeof(cf),
-											0x1111111111111111ULL),
+	UT_ASSERT_EQ(cluster_cf_classify_buffer((char *)&cf, sizeof(cf), 0x1111111111111111ULL),
 				 CLUSTER_CF_INVALID_IDENTITY);
 	/* short buffer */
-	UT_ASSERT_EQ(cluster_cf_classify_buffer((char *) &cf, sizeof(cf) - 1, 0),
+	UT_ASSERT_EQ(cluster_cf_classify_buffer((char *)&cf, sizeof(cf) - 1, 0),
 				 CLUSTER_CF_INVALID_SHORT);
 
 	/* torn CRC */
-	((char *) &cf)[4] ^= 0xFF;
-	UT_ASSERT_EQ(cluster_cf_classify_buffer((char *) &cf, sizeof(cf), 0),
-				 CLUSTER_CF_INVALID_CRC);
+	((char *)&cf)[4] ^= 0xFF;
+	UT_ASSERT_EQ(cluster_cf_classify_buffer((char *)&cf, sizeof(cf), 0), CLUSTER_CF_INVALID_CRC);
 
 	/* foreign byte order: version a nonzero multiple of 65536 */
 	build_cf(&cf, 1);
 	cf.pg_control_version = 65536;
 	finalize_crc(&cf);
-	UT_ASSERT_EQ(cluster_cf_classify_buffer((char *) &cf, sizeof(cf), 0),
+	UT_ASSERT_EQ(cluster_cf_classify_buffer((char *)&cf, sizeof(cf), 0),
 				 CLUSTER_CF_INVALID_BYTE_ORDER);
 }
 
@@ -309,25 +323,21 @@ UT_TEST(test_classify_buffer)
 UT_TEST(test_decide_source)
 {
 	/* primary valid always wins */
-	UT_ASSERT_EQ(cluster_cf_decide_source(CLUSTER_CF_VALID,
-										  CLUSTER_CF_INVALID_CRC, false),
+	UT_ASSERT_EQ(cluster_cf_decide_source(CLUSTER_CF_VALID, CLUSTER_CF_INVALID_CRC, false),
 				 CLUSTER_CF_SOURCE_PRIMARY);
 	/* primary bad, bak valid AND strict-ok -> use bak */
-	UT_ASSERT_EQ(cluster_cf_decide_source(CLUSTER_CF_INVALID_CRC,
-										  CLUSTER_CF_VALID, true),
+	UT_ASSERT_EQ(cluster_cf_decide_source(CLUSTER_CF_INVALID_CRC, CLUSTER_CF_VALID, true),
 				 CLUSTER_CF_SOURCE_BAK);
 	/* primary bad, bak CRC-valid but strict NOT ok -> fail closed */
-	UT_ASSERT_EQ(cluster_cf_decide_source(CLUSTER_CF_INVALID_CRC,
-										  CLUSTER_CF_VALID, false),
+	UT_ASSERT_EQ(cluster_cf_decide_source(CLUSTER_CF_INVALID_CRC, CLUSTER_CF_VALID, false),
 				 CLUSTER_CF_SOURCE_FAILCLOSED);
 	/* primary bad, bak also bad -> fail closed */
-	UT_ASSERT_EQ(cluster_cf_decide_source(CLUSTER_CF_INVALID_CRC,
-										  CLUSTER_CF_INVALID_CRC, true),
+	UT_ASSERT_EQ(cluster_cf_decide_source(CLUSTER_CF_INVALID_CRC, CLUSTER_CF_INVALID_CRC, true),
 				 CLUSTER_CF_SOURCE_FAILCLOSED);
 	/* identity mismatch on primary is never silently trusted */
-	UT_ASSERT_EQ(cluster_cf_decide_source(CLUSTER_CF_INVALID_IDENTITY,
-										  CLUSTER_CF_INVALID_IDENTITY, true),
-				 CLUSTER_CF_SOURCE_FAILCLOSED);
+	UT_ASSERT_EQ(
+		cluster_cf_decide_source(CLUSTER_CF_INVALID_IDENTITY, CLUSTER_CF_INVALID_IDENTITY, true),
+		CLUSTER_CF_SOURCE_FAILCLOSED);
 }
 
 /* ======================================================================
@@ -433,7 +443,7 @@ UT_TEST(test_bak_fallback_unrecoverable)
 	build_cf(&v1, 0x5555000055550000ULL);
 	cluster_cf_authority_write(&v1);
 	build_cf(&v2, 0x6666000066660000ULL);
-	cluster_cf_authority_write(&v2);	/* rolls v1 into .bak */
+	cluster_cf_authority_write(&v2); /* rolls v1 into .bak */
 
 	/* corrupt the primary; the .bak (v1) is CRC-valid but its checkpoint is
 	 * declared unreachable -> the read must fail-closed, not return v1. */
@@ -443,7 +453,7 @@ UT_TEST(test_bak_fallback_unrecoverable)
 	memset(&out, 0xEE, sizeof(out));
 	UT_ASSERT(!cluster_cf_authority_read(&out));
 
-	stub_recoverable = true;			/* restore for any later test */
+	stub_recoverable = true; /* restore for any later test */
 }
 
 int

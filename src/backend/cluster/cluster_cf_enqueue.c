@@ -43,11 +43,10 @@
  * release must not run S6 against a phantom holder.  There is one slot per
  * mode (X / S); CF is not reentrant within a backend for a given mode.
  */
-typedef struct CfHoldState
-{
-	bool		held;
-	bool		coordinated;
-	ClusterLockAcquireRequest req;	/* resid + holder + request_id for release */
+typedef struct CfHoldState {
+	bool held;
+	bool coordinated;
+	ClusterLockAcquireRequest req; /* resid + holder + request_id for release */
 } CfHoldState;
 
 static CfHoldState cf_hold_x;
@@ -117,67 +116,63 @@ cluster_cf_lock(LOCKMODE mode)
 	cluster_cf_resid_encode(&req.resid);
 	/* locktag left zeroed: not LOCKTAG_ADVISORY, so normal blocking semantics. */
 	req.lockmode = mode;
-	req.op = CLUSTER_LOCK_OP_REQUEST;	/* CF never converts (X/S independent) */
+	req.op = CLUSTER_LOCK_OP_REQUEST; /* CF never converts (X/S independent) */
 	req.current_mode = NoLock;
 	req.lockmethod_id = DEFAULT_LOCKMETHOD;
-	req.dontwait = false;				/* block until granted or timeout */
+	req.dontwait = false; /* block until granted or timeout */
 	req.sessionLock = false;
-	req.caller_local_start_ts_ms = (uint64) (GetCurrentTimestamp() / 1000);
+	req.caller_local_start_ts_ms = (uint64)(GetCurrentTimestamp() / 1000);
 	/* spec-5.6 Dc4b: bound the CF acquire wait and label it ClusterCfEnqueueWait. */
 	req.timeout_ms = cluster_cf_enqueue_timeout_ms;
 	req.wait_event = WAIT_EVENT_CLUSTER_CF_ENQUEUE;
 
 	r = cluster_lock_acquire_seven_step(&req);
 
-	switch (r)
-	{
-		case CLUSTER_LOCK_ACQUIRE_OK_NATIVE:
+	switch (r) {
+	case CLUSTER_LOCK_ACQUIRE_OK_NATIVE:
 
-			/*
+		/*
 			 * Cluster/LMS layer inactive (single-node or gate off): no cross-
 			 * node coordination is needed and nothing was registered in the
 			 * GRD.  Treat as held but uncoordinated so release is a no-op.
 			 */
-			slot->held = true;
-			slot->coordinated = false;
-			slot->req = req;
-			cluster_cf_counter_inc(mode == ExclusiveLock ? CLUSTER_CF_X_ACQUIRE
-								   : CLUSTER_CF_S_ACQUIRE);
-			return true;
+		slot->held = true;
+		slot->coordinated = false;
+		slot->req = req;
+		cluster_cf_counter_inc(mode == ExclusiveLock ? CLUSTER_CF_X_ACQUIRE : CLUSTER_CF_S_ACQUIRE);
+		return true;
 
-		case CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK:
-		case CLUSTER_LOCK_ACQUIRE_OK_GRANTED:
-		case CLUSTER_LOCK_ACQUIRE_OK_CONVERTED:
+	case CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK:
+	case CLUSTER_LOCK_ACQUIRE_OK_GRANTED:
+	case CLUSTER_LOCK_ACQUIRE_OK_CONVERTED:
 
-			/*
+		/*
 			 * Granted at the cluster level.  CF has no PG-native heavyweight
 			 * lock to take, so run the S5 promote directly to turn the S3
 			 * reservation into a registered GRD holder (cross-node conflict
 			 * visibility).  S5 failure cancels the reservation (S7) and we
 			 * fail closed.
 			 */
-			if (cluster_lock_acquire_s5_promote(&req) != CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
-			{
-				cluster_cf_counter_inc(CLUSTER_CF_FAILCLOSED);
-				return false;
-			}
-			slot->held = true;
-			slot->coordinated = true;
-			slot->req = req;			/* holder + request_id for the release */
-			cluster_cf_counter_inc(mode == ExclusiveLock ? CLUSTER_CF_X_ACQUIRE
-								   : CLUSTER_CF_S_ACQUIRE);
-			return true;
+		if (cluster_lock_acquire_s5_promote(&req) != CLUSTER_LOCK_ACQUIRE_OK_GRANTED) {
+			cluster_cf_counter_inc(CLUSTER_CF_FAILCLOSED);
+			return false;
+		}
+		slot->held = true;
+		slot->coordinated = true;
+		slot->req = req; /* holder + request_id for the release */
+		cluster_cf_counter_inc(mode == ExclusiveLock ? CLUSTER_CF_X_ACQUIRE : CLUSTER_CF_S_ACQUIRE);
+		return true;
 
-		default:
+	default:
 
-			/*
+		/*
 			 * NOT_AVAIL (try conflict; CF blocks so this is unexpected),
 			 * timeout, LMS-unavailable, deadlock, internal, etc.  The lock
 			 * could not be proven held: fail closed.  The caller raises the
 			 * appropriate FATAL/ERROR (CF correctness, spec §3.1 A3).
 			 */
-			cluster_cf_counter_inc(CLUSTER_CF_FAILCLOSED);
-			return false;
+		cluster_cf_counter_inc(CLUSTER_CF_FAILCLOSED);
+		return false;
 	}
 }
 
@@ -199,7 +194,7 @@ cluster_cf_unlock(LOCKMODE mode)
 	 * re-derives the resid from a PG LOCKTAG that CF does not have.
 	 */
 	if (slot->coordinated)
-		(void) cluster_lock_acquire_s6_release(&slot->req);
+		(void)cluster_lock_acquire_s6_release(&slot->req);
 
 	slot->held = false;
 	slot->coordinated = false;

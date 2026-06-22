@@ -64,8 +64,7 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 void *
 ShmemInitStruct(const char *name, Size size, bool *foundPtr)
 {
-	if (name != NULL && strcmp(name, "pgrac cluster cf stats") == 0)
-	{
+	if (name != NULL && strcmp(name, "pgrac cluster cf stats") == 0) {
 		/* counters[] (uint64) + the join_readonly uint32 flag; one extra
 		 * pg_atomic_uint64 slot covers the uint32 + padding, 8-byte aligned. */
 		static pg_atomic_uint64 cf_buf[CLUSTER_CF_COUNTER_COUNT + 1];
@@ -94,7 +93,7 @@ UT_TEST(test_cf_counters_null_safe_before_init)
 	/* Before cluster_cf_stats_shmem_init(), the state pointer is NULL; inc is
 	 * a no-op and read returns 0 rather than dereferencing NULL. */
 	cluster_cf_counter_inc(CLUSTER_CF_X_ACQUIRE);
-	UT_ASSERT_EQ((int) cluster_cf_counter_read(CLUSTER_CF_X_ACQUIRE), 0);
+	UT_ASSERT_EQ((int)cluster_cf_counter_read(CLUSTER_CF_X_ACQUIRE), 0);
 }
 
 
@@ -106,24 +105,24 @@ UT_TEST(test_cf_counters_inc_read_bounds)
 	cluster_cf_stats_shmem_init();
 
 	/* All counters start at zero. */
-	UT_ASSERT_EQ((int) cluster_cf_counter_read(CLUSTER_CF_X_ACQUIRE), 0);
-	UT_ASSERT_EQ((int) cluster_cf_counter_read(CLUSTER_CF_BAK_FALLBACK), 0);
+	UT_ASSERT_EQ((int)cluster_cf_counter_read(CLUSTER_CF_X_ACQUIRE), 0);
+	UT_ASSERT_EQ((int)cluster_cf_counter_read(CLUSTER_CF_BAK_FALLBACK), 0);
 
 	/* Independent accumulation per counter. */
 	cluster_cf_counter_inc(CLUSTER_CF_X_ACQUIRE);
 	cluster_cf_counter_inc(CLUSTER_CF_X_ACQUIRE);
 	cluster_cf_counter_inc(CLUSTER_CF_S_ACQUIRE);
 	cluster_cf_counter_inc(CLUSTER_CF_FAILCLOSED);
-	UT_ASSERT_EQ((int) cluster_cf_counter_read(CLUSTER_CF_X_ACQUIRE), 2);
-	UT_ASSERT_EQ((int) cluster_cf_counter_read(CLUSTER_CF_S_ACQUIRE), 1);
-	UT_ASSERT_EQ((int) cluster_cf_counter_read(CLUSTER_CF_FAILCLOSED), 1);
+	UT_ASSERT_EQ((int)cluster_cf_counter_read(CLUSTER_CF_X_ACQUIRE), 2);
+	UT_ASSERT_EQ((int)cluster_cf_counter_read(CLUSTER_CF_S_ACQUIRE), 1);
+	UT_ASSERT_EQ((int)cluster_cf_counter_read(CLUSTER_CF_FAILCLOSED), 1);
 	/* Untouched counters stay zero. */
-	UT_ASSERT_EQ((int) cluster_cf_counter_read(CLUSTER_CF_SINGLE_NODE_AUTHORITY), 0);
-	UT_ASSERT_EQ((int) cluster_cf_counter_read(CLUSTER_CF_BAK_FALLBACK), 0);
+	UT_ASSERT_EQ((int)cluster_cf_counter_read(CLUSTER_CF_SINGLE_NODE_AUTHORITY), 0);
+	UT_ASSERT_EQ((int)cluster_cf_counter_read(CLUSTER_CF_BAK_FALLBACK), 0);
 
 	/* Out-of-range index is a no-op / zero (bounds guard). */
 	cluster_cf_counter_inc(CLUSTER_CF_COUNTER_COUNT);
-	UT_ASSERT_EQ((int) cluster_cf_counter_read(CLUSTER_CF_COUNTER_COUNT), 0);
+	UT_ASSERT_EQ((int)cluster_cf_counter_read(CLUSTER_CF_COUNTER_COUNT), 0);
 }
 
 

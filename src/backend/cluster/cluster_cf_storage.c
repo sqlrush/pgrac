@@ -64,17 +64,16 @@ static const char cf_probe_nonce[] = "PGRAC_CF_RENAME_PROBE_v1";
  * and forces re-verification (fail-closed).  CRC-protected; a torn or corrupt
  * record reads as UNVERIFIED.
  */
-#define CLUSTER_CF_CONTRACT_MAGIC	0x43464354	/* 'CFCT' */
+#define CLUSTER_CF_CONTRACT_MAGIC 0x43464354 /* 'CFCT' */
 #define CLUSTER_CF_CONTRACT_VERSION 1
 
-typedef struct ClusterCfContractRecord
-{
-	uint32		magic;
-	uint32		version;
-	char		storage_uuid[CLUSTER_SHARED_UUID_LEN];
-	char		_pad[3];		/* keep `state` 4-byte aligned */
-	uint32		state;			/* a ClusterCfContractState value */
-	pg_crc32c	crc;			/* over [0, offsetof(crc)) */
+typedef struct ClusterCfContractRecord {
+	uint32 magic;
+	uint32 version;
+	char storage_uuid[CLUSTER_SHARED_UUID_LEN];
+	char _pad[3];  /* keep `state` 4-byte aligned */
+	uint32 state;  /* a ClusterCfContractState value */
+	pg_crc32c crc; /* over [0, offsetof(crc)) */
 } ClusterCfContractRecord;
 
 /*
@@ -85,19 +84,18 @@ typedef struct ClusterCfContractRecord
  *	anything else fails closed with a specific reason (spec §3.1 A3 / Q6).
  */
 ClusterCfStartupVerdict
-cluster_cf_startup_verdict(ClusterCfSymlinkStatus link_status,
-						   bool authority_readable, bool identity_ok)
+cluster_cf_startup_verdict(ClusterCfSymlinkStatus link_status, bool authority_readable,
+						   bool identity_ok)
 {
-	switch (link_status)
-	{
-		case CLUSTER_CF_SYMLINK_OK:
-			break;
-		case CLUSTER_CF_SYMLINK_MISSING:
-			return CLUSTER_CF_STARTUP_FATAL_MISSING;
-		case CLUSTER_CF_SYMLINK_NOT_SYMLINK:
-			return CLUSTER_CF_STARTUP_FATAL_NOT_SYMLINK;
-		case CLUSTER_CF_SYMLINK_WRONG_TARGET:
-			return CLUSTER_CF_STARTUP_FATAL_WRONG_TARGET;
+	switch (link_status) {
+	case CLUSTER_CF_SYMLINK_OK:
+		break;
+	case CLUSTER_CF_SYMLINK_MISSING:
+		return CLUSTER_CF_STARTUP_FATAL_MISSING;
+	case CLUSTER_CF_SYMLINK_NOT_SYMLINK:
+		return CLUSTER_CF_STARTUP_FATAL_NOT_SYMLINK;
+	case CLUSTER_CF_SYMLINK_WRONG_TARGET:
+		return CLUSTER_CF_STARTUP_FATAL_WRONG_TARGET;
 	}
 
 	if (!authority_readable)
@@ -147,15 +145,15 @@ bool
 cluster_cf_contract_persist(const char *pgdata, ClusterCfContractState state)
 {
 	ClusterCfContractRecord rec;
-	char		path[MAXPGPATH];
-	char		tmp[MAXPGPATH];
-	int			fd;
+	char path[MAXPGPATH];
+	char tmp[MAXPGPATH];
+	int fd;
 
 	memset(&rec, 0, sizeof(rec));
 	rec.magic = CLUSTER_CF_CONTRACT_MAGIC;
 	rec.version = CLUSTER_CF_CONTRACT_VERSION;
 	cluster_shared_fs_get_storage_uuid(rec.storage_uuid, sizeof(rec.storage_uuid));
-	rec.state = (uint32) state;
+	rec.state = (uint32)state;
 	INIT_CRC32C(rec.crc);
 	COMP_CRC32C(rec.crc, &rec, offsetof(ClusterCfContractRecord, crc));
 	FIN_CRC32C(rec.crc);
@@ -166,9 +164,7 @@ cluster_cf_contract_persist(const char *pgdata, ClusterCfContractState state)
 	fd = OpenTransientFile(tmp, O_RDWR | O_CREAT | O_TRUNC | PG_BINARY);
 	if (fd < 0)
 		return false;
-	if (write(fd, &rec, sizeof(rec)) != (int) sizeof(rec) ||
-		pg_fsync(fd) != 0)
-	{
+	if (write(fd, &rec, sizeof(rec)) != (int)sizeof(rec) || pg_fsync(fd) != 0) {
 		CloseTransientFile(fd);
 		unlink(tmp);
 		return false;
@@ -176,8 +172,7 @@ cluster_cf_contract_persist(const char *pgdata, ClusterCfContractState state)
 	CloseTransientFile(fd);
 
 	/* durable_rename (LOG elevel) fsyncs the dir and returns -1 on failure. */
-	if (durable_rename(tmp, path, LOG) != 0)
-	{
+	if (durable_rename(tmp, path, LOG) != 0) {
 		unlink(tmp);
 		return false;
 	}
@@ -191,33 +186,32 @@ ClusterCfContractState
 cluster_cf_contract_load(const char *pgdata)
 {
 	ClusterCfContractRecord rec;
-	char		path[MAXPGPATH];
-	char		current_uuid[CLUSTER_SHARED_UUID_LEN];
-	pg_crc32c	crc;
-	int			fd;
-	int			n;
+	char path[MAXPGPATH];
+	char current_uuid[CLUSTER_SHARED_UUID_LEN];
+	pg_crc32c crc;
+	int fd;
+	int n;
 
 	snprintf(path, sizeof(path), "%s/%s", pgdata, CLUSTER_CF_CONTRACT_REL_PATH);
 
 	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
 	if (fd < 0)
-		return CLUSTER_CF_CONTRACT_UNVERIFIED;	/* no record: never verified */
+		return CLUSTER_CF_CONTRACT_UNVERIFIED; /* no record: never verified */
 	n = read(fd, &rec, sizeof(rec));
 	CloseTransientFile(fd);
-	if (n != (int) sizeof(rec) ||
-		rec.magic != CLUSTER_CF_CONTRACT_MAGIC ||
-		rec.version != CLUSTER_CF_CONTRACT_VERSION)
+	if (n != (int)sizeof(rec) || rec.magic != CLUSTER_CF_CONTRACT_MAGIC
+		|| rec.version != CLUSTER_CF_CONTRACT_VERSION)
 		return CLUSTER_CF_CONTRACT_UNVERIFIED;
 
 	INIT_CRC32C(crc);
 	COMP_CRC32C(crc, &rec, offsetof(ClusterCfContractRecord, crc));
 	FIN_CRC32C(crc);
 	if (crc != rec.crc)
-		return CLUSTER_CF_CONTRACT_UNVERIFIED;	/* torn/corrupt: fail closed */
+		return CLUSTER_CF_CONTRACT_UNVERIFIED; /* torn/corrupt: fail closed */
 
 	cluster_shared_fs_get_storage_uuid(current_uuid, sizeof(current_uuid));
 	return cluster_cf_contract_resolve(rec.storage_uuid, current_uuid,
-									   (ClusterCfContractState) rec.state);
+									   (ClusterCfContractState)rec.state);
 }
 
 /*
@@ -277,34 +271,33 @@ cluster_cf_bootstrap_role(bool multi_node, ClusterCfLiveness liveness,
 	if (!multi_node)
 		return CLUSTER_CF_ROLE_OWNER;
 
-	switch (liveness)
-	{
-		case CLUSTER_CF_LIVENESS_SOLE:
+	switch (liveness) {
+	case CLUSTER_CF_LIVENESS_SOLE:
 
-			/*
+		/*
 			 * Sole live node of a multi-node cluster: it may take authority and
 			 * write during its own recovery, but only after the storage has
 			 * been cross-node verified (B5) -- otherwise a peer that reattaches
 			 * might not see these writes (split-brain hazard).
 			 */
-			return (contract == CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED)
-				? CLUSTER_CF_ROLE_OWNER : CLUSTER_CF_ROLE_FAILCLOSED;
+		return (contract == CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED) ? CLUSTER_CF_ROLE_OWNER
+																	: CLUSTER_CF_ROLE_FAILCLOSED;
 
-		case CLUSTER_CF_LIVENESS_PEER_ALIVE:
+	case CLUSTER_CF_LIVENESS_PEER_ALIVE:
 
-			/*
+		/*
 			 * A live peer owns the authority.  This node attaches read-only and
 			 * must not write the shared authority during recovery -- but only if
 			 * it has proven (cross-node verified) it can actually see the peer's
 			 * authority writes; otherwise it cannot trust what it reads.
 			 */
-			return (contract == CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED)
-				? CLUSTER_CF_ROLE_JOIN_READONLY : CLUSTER_CF_ROLE_FAILCLOSED;
+		return (contract == CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED) ? CLUSTER_CF_ROLE_JOIN_READONLY
+																	: CLUSTER_CF_ROLE_FAILCLOSED;
 
-		case CLUSTER_CF_LIVENESS_UNKNOWN:
-		default:
-			/* Cannot tell who is live -> no safe role -> fail closed. */
-			return CLUSTER_CF_ROLE_FAILCLOSED;
+	case CLUSTER_CF_LIVENESS_UNKNOWN:
+	default:
+		/* Cannot tell who is live -> no safe role -> fail closed. */
+		return CLUSTER_CF_ROLE_FAILCLOSED;
 	}
 }
 
@@ -325,10 +318,10 @@ cluster_cf_bootstrap_authority_gate(bool multi_node, ClusterCfContractState cont
 void
 cluster_cf_enter_bootstrap_window_or_fail(void)
 {
-	bool		multi_node;
+	bool multi_node;
 
 	if (!cluster_controlfile_shared_authority)
-		return;					/* authority off: stock per-node path */
+		return; /* authority off: stock per-node path */
 
 	/*
 	 * The shared authority lives on storage that must give a torn-safe,
@@ -337,10 +330,11 @@ cluster_cf_enter_bootstrap_window_or_fail(void)
 	 * established separately and gates the multi-node path below.
 	 */
 	if (!cluster_cf_storage_probe_local())
-		ereport(FATAL,
-				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
-				 errmsg("shared storage under cluster.shared_data_dir does not honour the durable rename contract"),
-				 errhint("Use a shared filesystem that provides atomic rename + directory fsync, or turn cluster.controlfile_shared_authority off.")));
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("shared storage under cluster.shared_data_dir does not honour the "
+							   "durable rename contract"),
+						errhint("Use a shared filesystem that provides atomic rename + directory "
+								"fsync, or turn cluster.controlfile_shared_authority off.")));
 
 	/*
 	 * A single-node cluster (or cluster.enabled off) is trivially the sole
@@ -348,8 +342,7 @@ cluster_cf_enter_bootstrap_window_or_fail(void)
 	 * bootstrap window without needing CSSD to prove sole-liveness.
 	 */
 	multi_node = cluster_enabled && cluster_conf_node_count() > 1;
-	if (!multi_node)
-	{
+	if (!multi_node) {
 		/* Single-node cluster: trivially the sole authority owner. */
 		cluster_cf_counter_inc(CLUSTER_CF_SINGLE_NODE_AUTHORITY);
 		cluster_cf_set_bootstrap_authority(true);
@@ -369,8 +362,7 @@ cluster_cf_enter_bootstrap_window_or_fail(void)
 	 *
 	 * Spec: spec-5.6-cf-enqueue-shared-controlfile-authority.md
 	 */
-	if (cluster_cf_phase2_peer_verified())
-	{
+	if (cluster_cf_phase2_peer_verified()) {
 		/*
 		 * Mark the node-wide shmem join flag (so the checkpointer's
 		 * CreateCheckPoint skips CF X for the end-of-recovery checkpoint) AND
@@ -384,12 +376,13 @@ cluster_cf_enter_bootstrap_window_or_fail(void)
 		return;
 	}
 
-	ereport(FATAL,
-			(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
-			 errmsg("cannot establish bootstrap shared control-file authority on a multi-node cluster"),
-			 errhint("Phase-2 cross-node rename verification with a live peer is required; "
-					 "a sole-survivor authority write needs an early-fencing oracle (not yet "
-					 "supported in this release) and fails closed.")));
+	ereport(
+		FATAL,
+		(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+		 errmsg("cannot establish bootstrap shared control-file authority on a multi-node cluster"),
+		 errhint("Phase-2 cross-node rename verification with a live peer is required; "
+				 "a sole-survivor authority write needs an early-fencing oracle (not yet "
+				 "supported in this release) and fails closed.")));
 }
 
 /*
@@ -399,8 +392,8 @@ ClusterCfSymlinkStatus
 cluster_cf_symlink_status(const char *local_path, const char *expected_target)
 {
 	struct stat st;
-	char		linkbuf[MAXPGPATH];
-	ssize_t		n;
+	char linkbuf[MAXPGPATH];
+	ssize_t n;
 
 	if (lstat(local_path, &st) != 0)
 		return CLUSTER_CF_SYMLINK_MISSING;
@@ -429,46 +422,40 @@ cluster_cf_symlink_status(const char *local_path, const char *expected_target)
 bool
 cluster_cf_storage_probe_local(void)
 {
-	char		tmp[MAXPGPATH];
-	char		final[MAXPGPATH];
-	char		readback[sizeof(cf_probe_nonce)];
-	int			fd;
-	int			pid = (int) getpid();
+	char tmp[MAXPGPATH];
+	char final[MAXPGPATH];
+	char readback[sizeof(cf_probe_nonce)];
+	int fd;
+	int pid = (int)getpid();
 
 	if (cluster_shared_data_dir == NULL)
 		return false;
 
-	snprintf(tmp, sizeof(tmp), "%s/global/pgrac_cf_probe.%d.tmp",
-			 cluster_shared_data_dir, pid);
-	snprintf(final, sizeof(final), "%s/global/pgrac_cf_probe.%d",
-			 cluster_shared_data_dir, pid);
+	snprintf(tmp, sizeof(tmp), "%s/global/pgrac_cf_probe.%d.tmp", cluster_shared_data_dir, pid);
+	snprintf(final, sizeof(final), "%s/global/pgrac_cf_probe.%d", cluster_shared_data_dir, pid);
 
 	fd = OpenTransientFile(tmp, O_RDWR | O_CREAT | O_TRUNC | PG_BINARY);
 	if (fd < 0)
 		return false;
-	if (write(fd, cf_probe_nonce, sizeof(cf_probe_nonce)) != (int) sizeof(cf_probe_nonce) ||
-		pg_fsync(fd) != 0)
-	{
+	if (write(fd, cf_probe_nonce, sizeof(cf_probe_nonce)) != (int)sizeof(cf_probe_nonce)
+		|| pg_fsync(fd) != 0) {
 		CloseTransientFile(fd);
 		unlink(tmp);
 		return false;
 	}
 	CloseTransientFile(fd);
 
-	if (durable_rename(tmp, final, LOG) != 0)
-	{
+	if (durable_rename(tmp, final, LOG) != 0) {
 		unlink(tmp);
 		return false;
 	}
 
 	fd = OpenTransientFile(final, O_RDONLY | PG_BINARY);
-	if (fd < 0)
-	{
+	if (fd < 0) {
 		unlink(final);
 		return false;
 	}
-	if (read(fd, readback, sizeof(readback)) != (int) sizeof(readback))
-	{
+	if (read(fd, readback, sizeof(readback)) != (int)sizeof(readback)) {
 		CloseTransientFile(fd);
 		unlink(final);
 		return false;
@@ -486,18 +473,17 @@ cluster_cf_storage_probe_local(void)
 static bool
 read_local_controlfile(const char *path, ControlFileData *out)
 {
-	int			fd;
-	int			r;
+	int fd;
+	int r;
 
 	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
 	if (fd < 0)
 		return false;
 	r = read(fd, out, sizeof(ControlFileData));
 	CloseTransientFile(fd);
-	if (r != (int) sizeof(ControlFileData))
+	if (r != (int)sizeof(ControlFileData))
 		return false;
-	return cluster_cf_classify_buffer((char *) out, sizeof(ControlFileData), 0)
-		== CLUSTER_CF_VALID;
+	return cluster_cf_classify_buffer((char *)out, sizeof(ControlFileData), 0) == CLUSTER_CF_VALID;
 }
 
 /*
@@ -507,19 +493,18 @@ read_local_controlfile(const char *path, ControlFileData *out)
 bool
 cluster_cf_migrate_and_link(const char *local_pgdata)
 {
-	char		local_path[MAXPGPATH];
+	char local_path[MAXPGPATH];
 	const char *shared;
 	ClusterCfSymlinkStatus st;
 	ControlFileData local_cf;
 	ControlFileData shared_cf;
-	bool		have_local;
+	bool have_local;
 
 	shared = cluster_cf_shared_path();
 	if (shared == NULL)
 		return false;
 
-	snprintf(local_path, sizeof(local_path), "%s/%s",
-			 local_pgdata, CLUSTER_CF_LOCAL_REL);
+	snprintf(local_path, sizeof(local_path), "%s/%s", local_pgdata, CLUSTER_CF_LOCAL_REL);
 
 	/* Already the correct symlink: nothing to do (idempotent). */
 	st = cluster_cf_symlink_status(local_path, shared);
@@ -529,23 +514,20 @@ cluster_cf_migrate_and_link(const char *local_pgdata)
 	have_local = read_local_controlfile(local_path, &local_cf);
 
 	/* Bootstrap the shared authority from the local control file if needed. */
-	if (!cluster_cf_authority_read(&shared_cf))
-	{
+	if (!cluster_cf_authority_read(&shared_cf)) {
 		if (!have_local)
-			return false;		/* no source to migrate from -> fail-closed */
+			return false; /* no source to migrate from -> fail-closed */
 		cluster_cf_authority_write(&local_cf);
 		if (!cluster_cf_authority_read(&shared_cf))
 			return false;
 	}
 
 	/* A real per-node file must agree with the shared authority's identity. */
-	if (have_local &&
-		local_cf.system_identifier != shared_cf.system_identifier)
-		return false;			/* foreign authority -> fail-closed */
+	if (have_local && local_cf.system_identifier != shared_cf.system_identifier)
+		return false; /* foreign authority -> fail-closed */
 
 	/* Replace whatever sits at local_path with a symlink to the authority. */
-	if (st != CLUSTER_CF_SYMLINK_MISSING)
-	{
+	if (st != CLUSTER_CF_SYMLINK_MISSING) {
 		if (unlink(local_path) != 0)
 			return false;
 	}
@@ -561,21 +543,20 @@ cluster_cf_migrate_and_link(const char *local_pgdata)
 static const char *
 startup_verdict_detail(ClusterCfStartupVerdict v)
 {
-	switch (v)
-	{
-		case CLUSTER_CF_STARTUP_OK:
-			return "ok";
-		case CLUSTER_CF_STARTUP_FATAL_MISSING:
-			return "the local control path does not exist";
-		case CLUSTER_CF_STARTUP_FATAL_NOT_SYMLINK:
-			return "the local control path is a per-node regular file, "
-				"not a symlink to the shared authority";
-		case CLUSTER_CF_STARTUP_FATAL_WRONG_TARGET:
-			return "the local control symlink points at a different authority";
-		case CLUSTER_CF_STARTUP_FATAL_UNREADABLE:
-			return "the shared authority is unreadable or torn";
-		case CLUSTER_CF_STARTUP_FATAL_IDENTITY:
-			return "the shared authority has a foreign system identifier";
+	switch (v) {
+	case CLUSTER_CF_STARTUP_OK:
+		return "ok";
+	case CLUSTER_CF_STARTUP_FATAL_MISSING:
+		return "the local control path does not exist";
+	case CLUSTER_CF_STARTUP_FATAL_NOT_SYMLINK:
+		return "the local control path is a per-node regular file, "
+			   "not a symlink to the shared authority";
+	case CLUSTER_CF_STARTUP_FATAL_WRONG_TARGET:
+		return "the local control symlink points at a different authority";
+	case CLUSTER_CF_STARTUP_FATAL_UNREADABLE:
+		return "the shared authority is unreadable or torn";
+	case CLUSTER_CF_STARTUP_FATAL_IDENTITY:
+		return "the shared authority has a foreign system identifier";
 	}
 	return "unknown";
 }
@@ -586,28 +567,30 @@ startup_verdict_detail(ClusterCfStartupVerdict v)
 void
 cluster_cf_startup_prepare(const char *pgdata)
 {
-	char		local_path[MAXPGPATH];
+	char local_path[MAXPGPATH];
 	const char *shared;
 	ClusterCfSymlinkStatus st;
 	ControlFileData cf;
-	bool		readable;
+	bool readable;
 	ClusterCfStartupVerdict v;
 
 	if (!cluster_controlfile_shared_authority)
-		return;					/* off: stock per-node pg_control */
+		return; /* off: stock per-node pg_control */
 
 	if (cluster_shared_data_dir == NULL || cluster_shared_data_dir[0] == '\0')
-		ereport(FATAL,
-				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
-				 errmsg("cluster.controlfile_shared_authority is on but cluster.shared_data_dir is not set"),
-				 errhint("Set cluster.shared_data_dir to the shared mount, or turn cluster.controlfile_shared_authority off.")));
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("cluster.controlfile_shared_authority is on but "
+							   "cluster.shared_data_dir is not set"),
+						errhint("Set cluster.shared_data_dir to the shared mount, or turn "
+								"cluster.controlfile_shared_authority off.")));
 
 	/* Establish the shared authority + symlink for this node (idempotent). */
 	if (!cluster_cf_migrate_and_link(pgdata))
-		ereport(FATAL,
-				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
-				 errmsg("could not migrate global/pg_control into the shared authority under \"%s\"",
-						cluster_shared_data_dir)));
+		ereport(
+			FATAL,
+			(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+			 errmsg("could not migrate global/pg_control into the shared authority under \"%s\"",
+					cluster_shared_data_dir)));
 
 	/* Verify and fail-closed on any mismatch (spec §3.1 A3 / Q6 / DoD-5). */
 	shared = cluster_cf_shared_path();
@@ -624,11 +607,12 @@ cluster_cf_startup_prepare(const char *pgdata)
 	 */
 	v = cluster_cf_startup_verdict(st, readable, readable);
 	if (v != CLUSTER_CF_STARTUP_OK)
-		ereport(FATAL,
-				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
-				 errmsg("shared pg_control authority check failed at startup"),
-				 errdetail("%s.", startup_verdict_detail(v)),
-				 errhint("Every node must point at the same shared authority \"%s\"; "
-						 "turn cluster.controlfile_shared_authority off for a single-node deployment.",
-						 shared)));
+		ereport(
+			FATAL,
+			(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+			 errmsg("shared pg_control authority check failed at startup"),
+			 errdetail("%s.", startup_verdict_detail(v)),
+			 errhint("Every node must point at the same shared authority \"%s\"; "
+					 "turn cluster.controlfile_shared_authority off for a single-node deployment.",
+					 shared)));
 }

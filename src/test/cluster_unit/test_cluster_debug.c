@@ -151,7 +151,7 @@ cluster_pgstat_get_count(void)
 uint64
 cluster_cf_counter_read(int which)
 {
-	(void) which;
+	(void)which;
 	return 0;
 }
 

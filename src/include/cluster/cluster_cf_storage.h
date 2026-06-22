@@ -56,8 +56,7 @@
  *						visibility NOT yet proven.
  *	CROSSNODE_VERIFIED	Phase-2 nonce+ack with a peer succeeded.
  */
-typedef enum ClusterCfContractState
-{
+typedef enum ClusterCfContractState {
 	CLUSTER_CF_CONTRACT_UNVERIFIED = 0,
 	CLUSTER_CF_CONTRACT_LOCAL_PROBED,
 	CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED
@@ -73,8 +72,7 @@ typedef enum ClusterCfContractState
  *	SOLE		CSSD READY, in quorum, zero alive peers: this is the only node.
  *	PEER_ALIVE	CSSD READY, in quorum, at least one alive peer.
  */
-typedef enum ClusterCfLiveness
-{
+typedef enum ClusterCfLiveness {
 	CLUSTER_CF_LIVENESS_UNKNOWN = 0,
 	CLUSTER_CF_LIVENESS_SOLE,
 	CLUSTER_CF_LIVENESS_PEER_ALIVE
@@ -94,8 +92,7 @@ typedef enum ClusterCfLiveness
  *					multi-node node that has never cross-node-verified the
  *					storage) -> the caller raises FATAL.
  */
-typedef enum ClusterCfBootstrapRole
-{
+typedef enum ClusterCfBootstrapRole {
 	CLUSTER_CF_ROLE_OWNER = 0,
 	CLUSTER_CF_ROLE_JOIN_READONLY,
 	CLUSTER_CF_ROLE_FAILCLOSED
@@ -110,8 +107,7 @@ typedef enum ClusterCfBootstrapRole
  *					in cluster mode is a split-brain hazard (Da3 fail-closes).
  *	WRONG_TARGET	a symlink, but to some other path (foreign authority).
  */
-typedef enum ClusterCfSymlinkStatus
-{
+typedef enum ClusterCfSymlinkStatus {
 	CLUSTER_CF_SYMLINK_OK = 0,
 	CLUSTER_CF_SYMLINK_MISSING,
 	CLUSTER_CF_SYMLINK_NOT_SYMLINK,
@@ -125,19 +121,18 @@ typedef enum ClusterCfSymlinkStatus
  * fail-closed reason.  Only meaningful when the authority feature is enabled
  * (cluster.controlfile_shared_authority = on); off -> PG-native, no gate.
  */
-typedef enum ClusterCfStartupVerdict
-{
+typedef enum ClusterCfStartupVerdict {
 	CLUSTER_CF_STARTUP_OK = 0,
-	CLUSTER_CF_STARTUP_FATAL_MISSING,		/* no control path at all */
-	CLUSTER_CF_STARTUP_FATAL_NOT_SYMLINK,	/* per-node local file (DoD-5) */
-	CLUSTER_CF_STARTUP_FATAL_WRONG_TARGET,	/* symlink to a foreign authority */
-	CLUSTER_CF_STARTUP_FATAL_UNREADABLE,	/* authority torn/corrupt/unreadable */
-	CLUSTER_CF_STARTUP_FATAL_IDENTITY		/* authority readable, foreign sysid */
+	CLUSTER_CF_STARTUP_FATAL_MISSING,	   /* no control path at all */
+	CLUSTER_CF_STARTUP_FATAL_NOT_SYMLINK,  /* per-node local file (DoD-5) */
+	CLUSTER_CF_STARTUP_FATAL_WRONG_TARGET, /* symlink to a foreign authority */
+	CLUSTER_CF_STARTUP_FATAL_UNREADABLE,   /* authority torn/corrupt/unreadable */
+	CLUSTER_CF_STARTUP_FATAL_IDENTITY	   /* authority readable, foreign sysid */
 } ClusterCfStartupVerdict;
 
 extern ClusterCfStartupVerdict cluster_cf_startup_verdict(ClusterCfSymlinkStatus link_status,
-														 bool authority_readable,
-														 bool identity_ok);
+														  bool authority_readable,
+														  bool identity_ok);
 
 /*
  * cluster_cf_storage_write_allowed -- pure §3.3 B5 write-gate.
@@ -149,8 +144,7 @@ extern ClusterCfStartupVerdict cluster_cf_startup_verdict(ClusterCfSymlinkStatus
  *	shared authority even if it believes it is the sole live node, because
  *	the write might not be visible to a peer that later reattaches.
  */
-extern bool cluster_cf_storage_write_allowed(ClusterCfContractState state,
-											 bool multi_node);
+extern bool cluster_cf_storage_write_allowed(ClusterCfContractState state, bool multi_node);
 
 /*
  * cluster_cf_contract_resolve -- pure identity-bound resolution of a persisted
@@ -176,8 +170,7 @@ extern ClusterCfContractState cluster_cf_contract_resolve(const char *persisted_
  * without ereport, so a caller (Phase-2) can fail closed -- an unrecorded
  * verification simply re-runs on the next start.
  */
-extern bool cluster_cf_contract_persist(const char *pgdata,
-										ClusterCfContractState state);
+extern bool cluster_cf_contract_persist(const char *pgdata, ClusterCfContractState state);
 
 /*
  * cluster_cf_contract_load -- read $pgdata/global/pgrac_cf_contract and resolve
@@ -214,8 +207,7 @@ extern ClusterCfLiveness cluster_cf_assess_liveness(void);
  * storage was cross-node verified (so it can trust what it reads), and
  * FAILCLOSED otherwise (liveness unknown, or never cross-node verified).
  */
-extern ClusterCfBootstrapRole cluster_cf_bootstrap_role(bool multi_node,
-														ClusterCfLiveness liveness,
+extern ClusterCfBootstrapRole cluster_cf_bootstrap_role(bool multi_node, ClusterCfLiveness liveness,
 														ClusterCfContractState contract);
 
 /*
@@ -226,8 +218,7 @@ extern ClusterCfBootstrapRole cluster_cf_bootstrap_role(bool multi_node,
  * multi-node cluster that has never cross-node-verified the storage returns
  * false even if it believes it is the sole live node.
  */
-extern bool cluster_cf_bootstrap_authority_gate(bool multi_node,
-												ClusterCfContractState contract);
+extern bool cluster_cf_bootstrap_authority_gate(bool multi_node, ClusterCfContractState contract);
 
 /*
  * cluster_cf_enter_bootstrap_window_or_fail -- spec §3.3 B2/B3 bootstrap
@@ -281,4 +272,4 @@ extern bool cluster_cf_migrate_and_link(const char *local_pgdata);
  */
 extern void cluster_cf_startup_prepare(const char *pgdata);
 
-#endif							/* CLUSTER_CF_STORAGE_H */
+#endif /* CLUSTER_CF_STORAGE_H */
