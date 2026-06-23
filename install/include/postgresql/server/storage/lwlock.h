@@ -1,0 +1,352 @@
+/*-------------------------------------------------------------------------
+ *
+ * lwlock.h
+ *	  Lightweight lock manager
+ *
+ *
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ * src/include/storage/lwlock.h
+ *
+ *-------------------------------------------------------------------------
+ */
+#ifndef LWLOCK_H
+#define LWLOCK_H
+
+#ifdef FRONTEND
+#error "lwlock.h may not be included from frontend code"
+#endif
+
+#include "port/atomics.h"
+#include "storage/proclist_types.h"
+
+struct PGPROC;
+
+/* what state of the wait process is a backend in */
+typedef enum LWLockWaitState {
+	LW_WS_NOT_WAITING,	  /* not currently waiting / woken up */
+	LW_WS_WAITING,		  /* currently waiting */
+	LW_WS_PENDING_WAKEUP, /* removed from waitlist, but not yet
+								 * signalled */
+} LWLockWaitState;
+
+/*
+ * Code outside of lwlock.c should not manipulate the contents of this
+ * structure directly, but we have to declare it here to allow LWLocks to be
+ * incorporated into other data structures.
+ */
+typedef struct LWLock {
+	uint16 tranche;			/* tranche ID */
+	pg_atomic_uint32 state; /* state of exclusive/nonexclusive lockers */
+	proclist_head waiters;	/* list of waiting PGPROCs */
+#ifdef LOCK_DEBUG
+	pg_atomic_uint32 nwaiters; /* number of waiters */
+	struct PGPROC *owner;	   /* last exclusive owner of the lock */
+#endif
+} LWLock;
+
+/*
+ * In most cases, it's desirable to force each tranche of LWLocks to be aligned
+ * on a cache line boundary and make the array stride a power of 2.  This saves
+ * a few cycles in indexing, but more importantly ensures that individual
+ * LWLocks don't cross cache line boundaries.  This reduces cache contention
+ * problems, especially on AMD Opterons.  In some cases, it's useful to add
+ * even more padding so that each LWLock takes up an entire cache line; this is
+ * useful, for example, in the main LWLock array, where the overall number of
+ * locks is small but some are heavily contended.
+ */
+#define LWLOCK_PADDED_SIZE PG_CACHE_LINE_SIZE
+
+StaticAssertDecl(sizeof(LWLock) <= LWLOCK_PADDED_SIZE, "Miscalculated LWLock padding");
+
+/* LWLock, padded to a full cache line size */
+typedef union LWLockPadded {
+	LWLock lock;
+	char pad[LWLOCK_PADDED_SIZE];
+} LWLockPadded;
+
+extern PGDLLIMPORT LWLockPadded *MainLWLockArray;
+
+/* struct for storing named tranche information */
+typedef struct NamedLWLockTranche {
+	int trancheId;
+	char *trancheName;
+} NamedLWLockTranche;
+
+extern PGDLLIMPORT NamedLWLockTranche *NamedLWLockTrancheArray;
+extern PGDLLIMPORT int NamedLWLockTrancheRequests;
+
+/* Names for fixed lwlocks */
+#include "storage/lwlocknames.h"
+
+/*
+ * It's a bit odd to declare NUM_BUFFER_PARTITIONS and NUM_LOCK_PARTITIONS
+ * here, but we need them to figure out offsets within MainLWLockArray, and
+ * having this file include lock.h or bufmgr.h would be backwards.
+ */
+
+/* Number of partitions of the shared buffer mapping hashtable */
+#define NUM_BUFFER_PARTITIONS 128
+
+/* Number of partitions the shared lock tables are divided into */
+#define LOG2_NUM_LOCK_PARTITIONS 4
+#define NUM_LOCK_PARTITIONS (1 << LOG2_NUM_LOCK_PARTITIONS)
+
+/* Number of partitions the shared predicate lock tables are divided into */
+#define LOG2_NUM_PREDICATELOCK_PARTITIONS 4
+#define NUM_PREDICATELOCK_PARTITIONS (1 << LOG2_NUM_PREDICATELOCK_PARTITIONS)
+
+/* Offsets for various chunks of preallocated lwlocks. */
+#define BUFFER_MAPPING_LWLOCK_OFFSET NUM_INDIVIDUAL_LWLOCKS
+#define LOCK_MANAGER_LWLOCK_OFFSET (BUFFER_MAPPING_LWLOCK_OFFSET + NUM_BUFFER_PARTITIONS)
+#define PREDICATELOCK_MANAGER_LWLOCK_OFFSET (LOCK_MANAGER_LWLOCK_OFFSET + NUM_LOCK_PARTITIONS)
+#define NUM_FIXED_LWLOCKS (PREDICATELOCK_MANAGER_LWLOCK_OFFSET + NUM_PREDICATELOCK_PARTITIONS)
+
+typedef enum LWLockMode {
+	LW_EXCLUSIVE,
+	LW_SHARED,
+	LW_WAIT_UNTIL_FREE /* A special mode used in PGPROC->lwWaitMode,
+								 * when waiting for lock to become free. Not
+								 * to be used as LWLockAcquire argument */
+} LWLockMode;
+
+
+#ifdef LOCK_DEBUG
+extern PGDLLIMPORT bool Trace_lwlocks;
+#endif
+
+extern bool LWLockAcquire(LWLock *lock, LWLockMode mode);
+extern bool LWLockConditionalAcquire(LWLock *lock, LWLockMode mode);
+extern bool LWLockAcquireOrWait(LWLock *lock, LWLockMode mode);
+extern void LWLockRelease(LWLock *lock);
+extern void LWLockReleaseClearVar(LWLock *lock, uint64 *valptr, uint64 val);
+extern void LWLockReleaseAll(void);
+extern void ForEachLWLockHeldByMe(void (*callback)(LWLock *, LWLockMode, void *), void *context);
+extern bool LWLockHeldByMe(LWLock *lock);
+extern bool LWLockAnyHeldByMe(LWLock *lock, int nlocks, size_t stride);
+extern bool LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode);
+
+extern bool LWLockWaitForVar(LWLock *lock, uint64 *valptr, uint64 oldval, uint64 *newval);
+extern void LWLockUpdateVar(LWLock *lock, uint64 *valptr, uint64 val);
+
+extern Size LWLockShmemSize(void);
+extern void CreateLWLocks(void);
+extern void InitLWLockAccess(void);
+
+extern const char *GetLWLockIdentifier(uint32 classId, uint16 eventId);
+
+/*
+ * Extensions (or core code) can obtain an LWLocks by calling
+ * RequestNamedLWLockTranche() during postmaster startup.  Subsequently,
+ * call GetNamedLWLockTranche() to obtain a pointer to an array containing
+ * the number of LWLocks requested.
+ */
+extern void RequestNamedLWLockTranche(const char *tranche_name, int num_lwlocks);
+extern LWLockPadded *GetNamedLWLockTranche(const char *tranche_name);
+
+/*
+ * There is another, more flexible method of obtaining lwlocks. First, call
+ * LWLockNewTrancheId just once to obtain a tranche ID; this allocates from
+ * a shared counter.  Next, each individual process using the tranche should
+ * call LWLockRegisterTranche() to associate that tranche ID with a name.
+ * Finally, LWLockInitialize should be called just once per lwlock, passing
+ * the tranche ID as an argument.
+ *
+ * It may seem strange that each process using the tranche must register it
+ * separately, but dynamic shared memory segments aren't guaranteed to be
+ * mapped at the same address in all coordinating backends, so storing the
+ * registration in the main shared memory segment wouldn't work for that case.
+ */
+extern int LWLockNewTrancheId(void);
+extern void LWLockRegisterTranche(int tranche_id, const char *tranche_name);
+extern void LWLockInitialize(LWLock *lock, int tranche_id);
+
+/*
+ * Every tranche ID less than NUM_INDIVIDUAL_LWLOCKS is reserved; also,
+ * we reserve additional tranche IDs for builtin tranches not included in
+ * the set of individual LWLocks.  A call to LWLockNewTrancheId will never
+ * return a value less than LWTRANCHE_FIRST_USER_DEFINED.
+ */
+typedef enum BuiltinTrancheIds {
+	LWTRANCHE_XACT_BUFFER = NUM_INDIVIDUAL_LWLOCKS,
+	LWTRANCHE_COMMITTS_BUFFER,
+	LWTRANCHE_SUBTRANS_BUFFER,
+	LWTRANCHE_MULTIXACTOFFSET_BUFFER,
+	LWTRANCHE_MULTIXACTMEMBER_BUFFER,
+	LWTRANCHE_NOTIFY_BUFFER,
+	LWTRANCHE_SERIAL_BUFFER,
+	LWTRANCHE_WAL_INSERT,
+	LWTRANCHE_BUFFER_CONTENT,
+	LWTRANCHE_REPLICATION_ORIGIN_STATE,
+	LWTRANCHE_REPLICATION_SLOT_IO,
+	LWTRANCHE_LOCK_FASTPATH,
+	LWTRANCHE_BUFFER_MAPPING,
+	LWTRANCHE_LOCK_MANAGER,
+	LWTRANCHE_PREDICATE_LOCK_MANAGER,
+	LWTRANCHE_PARALLEL_HASH_JOIN,
+	LWTRANCHE_PARALLEL_QUERY_DSA,
+	LWTRANCHE_PER_SESSION_DSA,
+	LWTRANCHE_PER_SESSION_RECORD_TYPE,
+	LWTRANCHE_PER_SESSION_RECORD_TYPMOD,
+	LWTRANCHE_SHARED_TUPLESTORE,
+	LWTRANCHE_SHARED_TIDBITMAP,
+	LWTRANCHE_PARALLEL_APPEND,
+	LWTRANCHE_PER_XACT_PREDICATE_LIST,
+	LWTRANCHE_PGSTATS_DSA,
+	LWTRANCHE_PGSTATS_HASH,
+	LWTRANCHE_PGSTATS_DATA,
+	LWTRANCHE_LAUNCHER_DSA,
+	LWTRANCHE_LAUNCHER_HASH,
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC (stage 1.6 hardening): dedicated tranche for BufferDesc.pcm_lock
+	 * (added at offset 104 in cluster mode).  Independent tranche makes
+	 * lock trace / pg_stat_activity wait-event distinguish content_lock
+	 * from pcm_lock; complements the bufmgr.c:AssertNotCatalogBufferLock
+	 * runtime guard that prevents reverse-deref misidentification.
+	 *
+	 * Spec: spec-stage1-codex-fixes.md §1.2 Deliverable 5 + spec-1.6 §11
+	 */
+	LWTRANCHE_BUFFER_PCM_LOCK,
+	/*
+	 * PGRAC (stage 1.10.1 hardening): dedicated tranche for the
+	 * ClusterPhaseSharedState lwlock that guards postmaster startup
+	 * phase state in shmem (current_phase / phase_start_times[] /
+	 * phase_history[] ring).  Migrated from process-local static
+	 * globals to fix EXEC_BACKEND/Windows children seeing pre_init
+	 * stale state after re-exec.
+	 *
+	 * Spec: spec-1.10.1-postmaster-phase-hardening.md F1
+	 */
+	LWTRANCHE_CLUSTER_STARTUP_PHASE,
+	/*
+	 * PGRAC (stage 1.11 Sprint A): dedicated tranche for
+	 * ClusterLmonSharedState lwlock that guards LMON shmem state
+	 * (status enum + pid + spawned_at + ready_at + last_liveness_tick_at +
+	 * main_loop_iters + shutdown_requested).  Single writer at runtime
+	 * is the LMON aux process; postmaster also writes shutdown_requested
+	 * during pmdie reverse path.
+	 *
+	 * Spec: spec-1.11-lmon-skeleton.md Sprint A D1+D2
+	 */
+	LWTRANCHE_CLUSTER_LMON,
+	/*
+	 * PGRAC (stage 1.12 Sprint A): dedicated tranche for
+	 * ClusterLckSharedState lwlock — same pattern as LMON.
+	 *
+	 * Spec: spec-1.12-lck-skeleton.md Sprint A D1+D2
+	 */
+	LWTRANCHE_CLUSTER_LCK,
+	/*
+	 * PGRAC (stage 1.13 Sprint A): dedicated tranche for
+	 * ClusterDiagSharedState lwlock — same pattern as LMON / LCK.
+	 *
+	 * Spec: spec-1.13-diag-skeleton.md Sprint A D1+D2
+	 */
+	LWTRANCHE_CLUSTER_DIAG,
+	/*
+	 * PGRAC (stage 1.14 Sprint A): dedicated tranche for
+	 * ClusterStatsSharedState lwlock — same pattern as LMON / LCK / DIAG.
+	 *
+	 * Spec: spec-1.14-cluster-stats-skeleton.md Sprint A D1+D2
+	 */
+	LWTRANCHE_CLUSTER_STATS,
+	/* PGRAC (stage 1.15): SCN encoding layer; cluster_scn_state lwlock. */
+	LWTRANCHE_CLUSTER_SCN,
+	/* PGRAC (stage 2.5): CSSD aux process lifecycle lwlock (spec-2.5 D7). */
+	LWTRANCHE_CLUSTER_CSSD,
+	/* PGRAC (spec-2.28 Sprint A Step 1): ClusterFenceShmem lwlock guards
+	 * last_freeze_at_us / last_thaw_at_us / self_fence_requested_at_us +
+	 * 3 lifetime counters.  Single-tranche per region (Q3 LMON-mediated
+	 * broadcast — only LMON acquires for write, postmaster_check + view
+	 * SRF are read-only paths). */
+	LWTRANCHE_CLUSTER_FENCE,
+	/* PGRAC (spec-2.29 Sprint A Step 1): ClusterReconfigState lwlock
+	 * guards last_applied event publish path.  Per L23 compound-atomic
+	 * lesson — apply_counter inc + last_applied write share critical
+	 * section so concurrent SRF reads see consistent snapshot. */
+	LWTRANCHE_CLUSTER_RECONFIG,
+	/* PGRAC (spec-2.18 Sprint A Step 1): ClusterLmsSharedState lwlock
+	 * guards non-atomic LMS fields (pid / spawned_at / ready_at /
+	 * stopped_at / shutdown_requested).  lms_state itself is atomic
+	 * for HC4 single ownership lock-free read on the LMON hot path
+	 * (cluster_lms_owns_grant). */
+	LWTRANCHE_CLUSTER_LMS,
+	/* PGRAC (spec-2.19 Sprint A Step 1): ClusterLmdSharedState lwlock
+	 * guards non-atomic LMD fields (pid / spawned_at / ready_at /
+	 * stopped_at / shutdown_requested).  lmd_state itself is atomic
+	 * for HC4 exact-predicate readiness check on the caller-side
+	 * ownership gate (cluster_lmd_is_ready). */
+	LWTRANCHE_CLUSTER_LMD,
+	/* PGRAC (spec-2.22 D5): ClusterLmdGraphShared lwlock guards the
+	 * wait-for graph hash table (waiter/blocker edges) + atomic
+	 * generation counter.  Separate tranche from CLUSTER_LMD because
+	 * the graph subsystem has a different contention profile (high
+	 * frequency add/remove during cluster lock acquire/release vs
+	 * low-frequency daemon-state mutations under LMD lwlock). */
+	LWTRANCHE_CLUSTER_LMD_GRAPH,
+	/* PGRAC (spec-2.23 D1): ClusterGesReplyWaitShared lwlock guards the
+	 * cross-node GES reply wait HTAB (5-tuple key: request_id,
+	 * source_node, dest_node, request_opcode, cluster_epoch).  Backends
+	 * insert on send_request_and_wait; reply handler looks up + wakes;
+	 * timeout sweep deletes stale entries.  HC17 invariant — late reply
+	 * after entry deletion is silently dropped + counter++. */
+	LWTRANCHE_CLUSTER_GES_REPLY_WAIT,
+	/* PGRAC (spec-2.30 D4): per-entry LWLockPadded on each GrdEntry slot in
+	 * the cluster_pcm_grd HTAB.  Guards transition mutation (master_state
+	 * CAS + holder bitmap update + master_holder).  HC57 invariant:  every
+	 * transition_apply MUST hold EXCLUSIVE;  HC61 forbids upgrade to a
+	 * per-shard / global lock granularity. */
+	LWTRANCHE_CLUSTER_PCM,
+	/* PGRAC (spec-2.32 D2): per-backend outstanding-request block lock in
+	 * cluster_gcs.c.  Guards reservation/release of MAX_OUTSTANDING_REQUESTS_PER_BACKEND
+	 * slots; per-backend granularity keeps contention surface tiny. */
+	LWTRANCHE_CLUSTER_GCS,
+	/* PGRAC (spec-2.33 D3): per-backend outstanding-block-request block lock in
+	 * cluster_gcs_block.c.  Same per-backend granularity as spec-2.32 control
+	 * plane; separate tranche so observability can distinguish data-plane
+	 * (block ship) contention from control-plane (transition request) contention. */
+	LWTRANCHE_CLUSTER_GCS_BLOCK,
+	/* PGRAC (spec-2.34 D2): master-side dedup HTAB partition + counter lock.
+	 * Guards GcsBlockDedupEntry slot allocation / lookup / install / TTL sweep
+	 * (HC90/HC91/HC92/HC93).  LMON-owned region; backend producers (GCS_BLOCK_
+	 * REQUEST handler context) acquire briefly during lookup_or_register +
+	 * install_reply.  Separate tranche from CLUSTER_GCS_BLOCK so DBA can see
+	 * data-plane reliability path contention distinctly. */
+	LWTRANCHE_CLUSTER_GCS_BLOCK_DEDUP,
+	/* PGRAC (spec-2.38 D2): SI Broadcaster outbound + inbound ring buffer
+	 * lock.  Both queues share this tranche.  Outbound uses LWLockAcquire
+	 * EXCLUSIVE in backend context (cluster_sinval_enqueue_batch).  Inbound
+	 * uses LWLockConditionalAcquire only from the IC handler (HC133
+	 * nonblocking constraint) and LWLockAcquire EXCLUSIVE only from the
+	 * SI Broadcaster aux process drain path. */
+	LWTRANCHE_CLUSTER_SINVAL,
+	/* PGRAC: spec-3.1 D2 — Undo TT status overlay HTAB (single-partition;
+	 * EXCLUSIVE for install/flush, SHARED for lookup_exact). */
+	LWTRANCHE_CLUSTER_TT_STATUS,
+	/* PGRAC: spec-3.4b D3 — per-undo-segment TT slot allocator LWLock array.
+	 * One LWLock per segment guards alloc / free / wrap mutations of the
+	 * 48-entry TT slot array embedded in UndoSegmentHeader. */
+	LWTRANCHE_CLUSTER_TT_SLOT,
+	/* PGRAC: spec-3.13 Undo Cleaner aux process state region. */
+	LWTRANCHE_CLUSTER_UNDO_CLEANER,
+	/* PGRAC: spec-3.18 D1 — undo block buffer pool.  Two sub-uses share this
+	 * tranche:  a single pool map_lock (slot lookup / allocate / evict) and a
+	 * per-slot content_lock (SHARED reader / EXCLUSIVE writer; mode fixed at
+	 * pin time — no in-place upgrade). */
+	LWTRANCHE_CLUSTER_UNDO_BUF,
+	/* PGRAC: spec-5.4 D1 — SQ sequence node-level instance cache region. */
+	LWTRANCHE_CLUSTER_SQ,
+#endif
+	LWTRANCHE_FIRST_USER_DEFINED
+} BuiltinTrancheIds;
+
+/*
+ * Prior to PostgreSQL 9.4, we used an enum type called LWLockId to refer
+ * to LWLocks.  New code should instead use LWLock *.  However, for the
+ * convenience of third-party code, we include the following typedef.
+ */
+typedef LWLock *LWLockId;
+
+#endif /* LWLOCK_H */

@@ -1,0 +1,236 @@
+#!/bin/bash
+#-------------------------------------------------------------------------
+#
+# pgrac-start -- start a pgrac cluster node
+#
+# Stage 0.20 stub: a thin wrapper around pg_ctl start.  The added
+# value over plain pg_ctl is preflight: we verify PGDATA is a real PG
+# data directory, that postgresql.conf declares a cluster.node_id,
+# and -- if pgrac.conf is present -- that the [node.<id>] section
+# matches.  All preflight failures are reported with hints pointing
+# at pgrac-init.
+#
+# Author: SqlRush <sqlrush@gmail.com>
+# Portions Copyright (c) 2026, pgrac contributors
+#
+# Spec: specs/spec-0.20-init-tools.md
+#
+#-------------------------------------------------------------------------
+set -euo pipefail
+
+PROGNAME="pgrac-start"
+PGRAC_VERSION="0.1.0-stage0.20"
+
+# ---- defaults ---------------------------------------------------------
+PGDATA_OPT=""
+PG_CTL_PASSTHROUGH=()
+
+# ---- helpers ----------------------------------------------------------
+
+die() {
+    echo "$PROGNAME: $*" 1>&2
+    exit 1
+}
+
+usage() {
+    cat <<EOF
+$PROGNAME starts a pgrac cluster node.
+
+Usage:
+  $PROGNAME [OPTION]...
+
+Options:
+  -D, --pgdata=DIRECTORY     pgrac data directory (also from PGDATA env)
+  -l, --log=FILENAME         write server log to FILENAME (passed to pg_ctl)
+  -w, --wait                 wait for server start (default; passed to pg_ctl)
+  -W, --no-wait              do not wait for server start
+  -t, --timeout=SECS         seconds to wait when -w is in effect
+  -o, --options=OPTS         pass OPTS to the postgres backend (pg_ctl -o)
+  -V, --version              output version information, then exit
+  -?, --help                 show this help, then exit
+
+Preflight checks performed before pg_ctl start:
+  - PGDATA exists and contains PG_VERSION
+  - postgresql.conf declares cluster.node_id
+  - pgrac.conf [node.<id>] (if present) matches cluster.node_id
+
+Use pgrac-init -D PGDATA to bootstrap a new data directory.
+Report bugs to <https://github.com/sqlrush/pgrac/issues>.
+EOF
+}
+
+version() {
+    echo "$PROGNAME (pgrac) $PGRAC_VERSION"
+}
+
+locate_pg_tool() {
+    local tool="$1"
+    local env_var="$2"
+    local override="${!env_var:-}"
+    if [ -n "$override" ]; then
+        if [ -x "$override" ]; then
+            echo "$override"
+            return 0
+        fi
+        die "$env_var=$override is not executable"
+    fi
+    local sibling
+    sibling="$(dirname "$(realpath "$0")")/$tool"
+    if [ -x "$sibling" ]; then
+        echo "$sibling"
+        return 0
+    fi
+    if command -v "$tool" >/dev/null 2>&1; then
+        command -v "$tool"
+        return 0
+    fi
+    die "$tool not found (set $env_var or adjust PATH)"
+}
+
+# Read cluster.node_id from postgresql.conf.  Returns the value (or
+# empty string if not set / commented out).
+read_cluster_node_id() {
+    local conf="$1"
+    local pattern='^[[:space:]]*cluster\.node_id[[:space:]]*='
+    grep -E "$pattern" "$conf" 2>/dev/null | tail -1 \
+        | sed -E 's/^[[:space:]]*cluster\.node_id[[:space:]]*=[[:space:]]*//; s/[[:space:]]*#.*$//; s/[[:space:]]*$//'
+}
+
+# Read the first [node.N] section header in pgrac.conf and return N.
+# Empty if no [node.*] section is present.
+read_pgrac_conf_node_id() {
+    local conf="$1"
+    grep -E '^[[:space:]]*\[node\.[0-9]+\]' "$conf" 2>/dev/null | head -1 \
+        | sed -E 's/^[[:space:]]*\[node\.([0-9]+)\].*$/\1/'
+}
+
+# ---- argument parsing -------------------------------------------------
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -D)
+            shift
+            [ $# -gt 0 ] || die "option -D requires an argument"
+            PGDATA_OPT="$1"
+            ;;
+        -D*)
+            PGDATA_OPT="${1#-D}"
+            ;;
+        --pgdata)
+            shift
+            [ $# -gt 0 ] || die "option --pgdata requires an argument"
+            PGDATA_OPT="$1"
+            ;;
+        --pgdata=*)
+            PGDATA_OPT="${1#*=}"
+            ;;
+        -l|--log)
+            shift
+            [ $# -gt 0 ] || die "option -l requires an argument"
+            PG_CTL_PASSTHROUGH+=("-l" "$1")
+            ;;
+        -l*)
+            PG_CTL_PASSTHROUGH+=("-l" "${1#-l}")
+            ;;
+        --log=*)
+            PG_CTL_PASSTHROUGH+=("-l" "${1#*=}")
+            ;;
+        -w|--wait)
+            PG_CTL_PASSTHROUGH+=("-w")
+            ;;
+        -W|--no-wait)
+            PG_CTL_PASSTHROUGH+=("-W")
+            ;;
+        -t|--timeout)
+            shift
+            [ $# -gt 0 ] || die "option -t requires an argument"
+            PG_CTL_PASSTHROUGH+=("-t" "$1")
+            ;;
+        --timeout=*)
+            PG_CTL_PASSTHROUGH+=("-t" "${1#*=}")
+            ;;
+        -o)
+            shift
+            [ $# -gt 0 ] || die "option -o requires an argument"
+            PG_CTL_PASSTHROUGH+=("-o" "$1")
+            ;;
+        -o*)
+            PG_CTL_PASSTHROUGH+=("-o" "${1#-o}")
+            ;;
+        --options=*)
+            PG_CTL_PASSTHROUGH+=("-o" "${1#*=}")
+            ;;
+        -V|--version)
+            version
+            exit 0
+            ;;
+        -\?|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "$PROGNAME: invalid option \"$1\"" 1>&2
+            echo "Try \"$PROGNAME --help\" for more information." 1>&2
+            exit 1
+            ;;
+        *)
+            die "unexpected positional argument \"$1\""
+            ;;
+    esac
+    shift
+done
+
+# Anything after `--` is also passed through to pg_ctl unchanged.
+while [ $# -gt 0 ]; do
+    PG_CTL_PASSTHROUGH+=("$1")
+    shift
+done
+
+# Resolve PGDATA.
+TARGET_PGDATA="${PGDATA_OPT:-${PGDATA:-}}"
+[ -n "$TARGET_PGDATA" ] || die "no data directory specified (use -D or set PGDATA)"
+
+# ---- preflight checks -------------------------------------------------
+
+[ -d "$TARGET_PGDATA" ] \
+    || die "PGDATA \"$TARGET_PGDATA\" does not exist (run \"pgrac-init -D '$TARGET_PGDATA'\" first)"
+
+[ -f "$TARGET_PGDATA/PG_VERSION" ] \
+    || die "PGDATA \"$TARGET_PGDATA\" is not a PG data directory (PG_VERSION missing)"
+
+PG_CONF="$TARGET_PGDATA/postgresql.conf"
+PGRAC_CONF="$TARGET_PGDATA/pgrac.conf"
+
+[ -f "$PG_CONF" ] || die "$PG_CONF missing"
+
+CLUSTER_NODE_ID=$(read_cluster_node_id "$PG_CONF")
+if [ -z "$CLUSTER_NODE_ID" ]; then
+    cat 1>&2 <<EOF
+$PROGNAME: $PG_CONF does not declare cluster.node_id.
+$PROGNAME: pgrac requires this GUC to be set.  Either run
+$PROGNAME:   pgrac-init -D "$TARGET_PGDATA" --force
+$PROGNAME: or edit $PG_CONF manually.
+EOF
+    exit 1
+fi
+
+if [ -f "$PGRAC_CONF" ]; then
+    PGRAC_FIRST_NODE_ID=$(read_pgrac_conf_node_id "$PGRAC_CONF")
+    if [ -n "$PGRAC_FIRST_NODE_ID" ] && [ "$PGRAC_FIRST_NODE_ID" != "$CLUSTER_NODE_ID" ]; then
+        echo "$PROGNAME: WARNING: $PGRAC_CONF first [node.$PGRAC_FIRST_NODE_ID]" \
+             "does not match postgresql.conf cluster.node_id=$CLUSTER_NODE_ID" 1>&2
+        echo "$PROGNAME: WARNING: postmaster will FATAL on startup unless cluster.node_id" \
+             "appears as a [node.N] in pgrac.conf.  Run pgrac-init --force to fix." 1>&2
+    fi
+fi
+
+# ---- exec pg_ctl ------------------------------------------------------
+
+PG_CTL=$(locate_pg_tool pg_ctl PG_CTL)
+
+echo "$PROGNAME: starting cluster (cluster.node_id=$CLUSTER_NODE_ID, PGDATA=\"$TARGET_PGDATA\")"
+exec "$PG_CTL" -D "$TARGET_PGDATA" start "${PG_CTL_PASSTHROUGH[@]}"
