@@ -15,7 +15,7 @@
  *	       cross-node) that proves POSIX rename gives the cross-node
  *	       visibility the authority depends on, plus the pure write-gate
  *	       that forbids a single-node-authority write until that contract
- *	       is satisfied (spec §3.3 B5 / §3.9 T6).
+ *	       is satisfied.
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
@@ -42,7 +42,7 @@
  * It is a REAL local file (only global/pg_control is symlinked to the shared
  * authority): each node trusts its own cross-node verification, which avoids a
  * shared-directory chicken-and-egg during bootstrap (the sole survivor reads
- * its own record).  See ARCH DECISION (Grow-from-single-node) and §3.3 B5.
+ * its own record).  See the Grow-from-single-node design.
  */
 #define CLUSTER_CF_CONTRACT_REL_PATH "global/pgrac_cf_contract"
 
@@ -65,7 +65,7 @@ typedef enum ClusterCfContractState {
 /*
  * ClusterCfLiveness -- tri-state assessment of who else is live, used to pick a
  * node's bootstrap authority role.  Distinguishing PEER_ALIVE from UNKNOWN
- * matters (规则 8.A): a count that reads 0 because CSSD shmem is absent must
+ * matters: a count that reads 0 because CSSD shmem is absent must
  * never be taken as "I am the only node".
  *
  *	UNKNOWN		CSSD not READY or not in quorum: liveness cannot be judged.
@@ -80,7 +80,7 @@ typedef enum ClusterCfLiveness {
 
 /*
  * ClusterCfBootstrapRole -- a node's role for control-file authority during the
- * pre-GES bootstrap/recovery window (ARCH DECISION Grow-from-single-node, §3.3).
+ * pre-GES bootstrap/recovery window.
  *
  *	OWNER			open the bootstrap window; this node may write the shared
  *					authority (single-node cluster, or the verified sole-live
@@ -124,18 +124,34 @@ typedef enum ClusterCfSymlinkStatus {
 typedef enum ClusterCfStartupVerdict {
 	CLUSTER_CF_STARTUP_OK = 0,
 	CLUSTER_CF_STARTUP_FATAL_MISSING,	   /* no control path at all */
-	CLUSTER_CF_STARTUP_FATAL_NOT_SYMLINK,  /* per-node local file (DoD-5) */
+	CLUSTER_CF_STARTUP_FATAL_NOT_SYMLINK,  /* per-node local file */
 	CLUSTER_CF_STARTUP_FATAL_WRONG_TARGET, /* symlink to a foreign authority */
 	CLUSTER_CF_STARTUP_FATAL_UNREADABLE,   /* authority torn/corrupt/unreadable */
 	CLUSTER_CF_STARTUP_FATAL_IDENTITY	   /* authority readable, foreign sysid */
 } ClusterCfStartupVerdict;
+
+/*
+ * ClusterCfIdentityVerdict -- result of the per-node identity-anchor gate run
+ * on EVERY start of a node whose global/pg_control is symlinked to the shared
+ * authority.  After migration the local control file is the symlink itself, so
+ * identity can only come from the per-node anchor recorded at migration; a
+ * foreign-but-valid authority swapped in at the same shared path must be
+ * rejected here.  Spec: spec-5.6-cf-enqueue-shared-controlfile-authority.md
+ */
+typedef enum ClusterCfIdentityVerdict {
+	CLUSTER_CF_IDENTITY_OK = 0,
+	CLUSTER_CF_IDENTITY_FATAL_NO_ANCHOR, /* no anchor recorded for this node */
+	CLUSTER_CF_IDENTITY_FATAL_CRC,		 /* anchor torn/corrupt */
+	CLUSTER_CF_IDENTITY_FATAL_STORAGE,	 /* shared storage identity changed */
+	CLUSTER_CF_IDENTITY_FATAL_SYSID		 /* authority sysid != bound sysid */
+} ClusterCfIdentityVerdict;
 
 extern ClusterCfStartupVerdict cluster_cf_startup_verdict(ClusterCfSymlinkStatus link_status,
 														  bool authority_readable,
 														  bool identity_ok);
 
 /*
- * cluster_cf_storage_write_allowed -- pure §3.3 B5 write-gate.
+ * cluster_cf_storage_write_allowed -- pure write-gate.
  *
  *	A single-node-authority write (taken when GES is not yet ready, e.g.
  *	recovery) is allowed only when this is a single-node cluster OR the
@@ -148,7 +164,7 @@ extern bool cluster_cf_storage_write_allowed(ClusterCfContractState state, bool 
 
 /*
  * cluster_cf_contract_resolve -- pure identity-bound resolution of a persisted
- * contract record (spec ARCH DECISION DoD#3, §3.3 B5).
+ * contract record.
  *
  *	A persisted CROSSNODE_VERIFIED is trustworthy only if it is still bound to
  *	the current shared-storage identity.  Returns CROSSNODE_VERIFIED iff the
@@ -164,31 +180,62 @@ extern ClusterCfContractState cluster_cf_contract_resolve(const char *persisted_
 														  ClusterCfContractState persisted_state);
 
 /*
- * cluster_cf_contract_persist -- atomically record `state` and the current
- * shared-storage uuid into $pgdata/global/pgrac_cf_contract (CRC-protected,
- * write-tmp + fsync + durable_rename).  Returns false on any I/O failure
- * without ereport, so a caller (Phase-2) can fail closed -- an unrecorded
- * verification simply re-runs on the next start.
+ * cluster_cf_contract_persist -- atomically record `state`, the current
+ * shared-storage uuid, AND the node's bound authority `system_identifier` into
+ * $pgdata/global/pgrac_cf_contract (CRC-protected, write-tmp + fsync +
+ * durable_rename).  Written once at migration (this is the per-node identity
+ * anchor).  Returns false on any I/O failure without ereport.
  */
-extern bool cluster_cf_contract_persist(const char *pgdata, ClusterCfContractState state);
+extern bool cluster_cf_contract_persist(const char *pgdata, ClusterCfContractState state,
+										uint64 authority_sysid);
+
+/*
+ * cluster_cf_contract_update_state -- update ONLY the state of an existing
+ * anchor, preserving the bound authority system_identifier and storage uuid.
+ * Returns false when there is no valid anchor to update (the identity is set at
+ * migration and must never be fabricated here).  Phase-2 uses this to record
+ * CROSSNODE_VERIFIED without disturbing the identity anchor.
+ */
+extern bool cluster_cf_contract_update_state(const char *pgdata, ClusterCfContractState state);
 
 /*
  * cluster_cf_contract_load -- read $pgdata/global/pgrac_cf_contract and resolve
- * it against the current shared-storage identity.  A missing, short, or
- * CRC-failing record reads as UNVERIFIED (fail-closed; never throws).  This is
- * what the bootstrap window-gate consults instead of a hardcoded contract
- * state.
+ * its STATE against the current shared-storage identity.  A missing, short, or
+ * CRC-failing record reads as UNVERIFIED (fail-closed; never throws).
  */
 extern ClusterCfContractState cluster_cf_contract_load(const char *pgdata);
 
 /*
- * cluster_cf_verify_sole_liveness_or_fail -- spec §3.3 B4 positive proof that
+ * cluster_cf_contract_identity_resolve -- pure per-node identity verdict.  A
+ * present, CRC-valid anchor whose bound system_identifier equals `shared_sysid`
+ * (and whose storage uuid matches when both sides advertise one) is OK; every
+ * other case (no anchor, torn anchor, storage swapped, or a foreign sysid) is a
+ * specific FATAL reason.  The storage-uuid binding is enforced only when both
+ * the anchor and the current storage carry a non-empty uuid.
+ */
+extern ClusterCfIdentityVerdict cluster_cf_contract_identity_resolve(bool present, bool crc_ok,
+																	 const char *anchor_uuid,
+																	 uint64 anchor_sysid,
+																	 const char *current_uuid,
+																	 uint64 shared_sysid);
+
+/*
+ * cluster_cf_contract_identity_check -- read this node's anchor and verify the
+ * shared authority it is symlinked to still carries the bound identity.  This
+ * is the real startup gate: it is the only proof a migrated node (whose local
+ * control file is the symlink itself) is reading its own cluster's authority.
+ */
+extern ClusterCfIdentityVerdict cluster_cf_contract_identity_check(const char *pgdata,
+																   uint64 shared_sysid);
+
+/*
+ * cluster_cf_verify_sole_liveness_or_fail -- positive proof that
  * this is the only live node, safe to take single-node authority before GES
  * is ready.  Requires ALL of: CSSD status == READY, qvotec in quorum, and
  * zero alive peers.  Any not-ready / uncertain condition returns false
  * (fail-closed).  CSSD READY is checked first so a zero alive-peer count is
  * only trusted once CSSD shmem + membership are actually up -- never infer
- * sole-liveness from a count that reads 0 because the shmem is absent (F0-26).
+ * sole-liveness from a count that reads 0 because the shmem is absent.
  */
 extern bool cluster_cf_verify_sole_liveness_or_fail(void);
 
@@ -211,7 +258,7 @@ extern ClusterCfBootstrapRole cluster_cf_bootstrap_role(bool multi_node, Cluster
 														ClusterCfContractState contract);
 
 /*
- * cluster_cf_bootstrap_authority_gate -- spec §3.3 B3/B5 write gate for the
+ * cluster_cf_bootstrap_authority_gate -- write gate for the
  * bootstrap single-node-authority window: returns true only when sole-liveness
  * is proven (B4) AND the storage contract permits a single-node-authority
  * write (single-node cluster, or cross-node rename visibility verified).  A
@@ -221,7 +268,7 @@ extern ClusterCfBootstrapRole cluster_cf_bootstrap_role(bool multi_node, Cluster
 extern bool cluster_cf_bootstrap_authority_gate(bool multi_node, ClusterCfContractState contract);
 
 /*
- * cluster_cf_enter_bootstrap_window_or_fail -- spec §3.3 B2/B3 bootstrap
+ * cluster_cf_enter_bootstrap_window_or_fail -- bootstrap
  * entry, called once from the startup process before its first authority
  * write (control-file writes during recovery happen before GES is ready).
  *

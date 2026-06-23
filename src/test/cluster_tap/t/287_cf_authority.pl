@@ -27,11 +27,15 @@
 #          authority file stays a valid 8 KB control file.
 #      L4  fail-closed gate: a node with controlfile_shared_authority = on
 #          but no cluster.shared_data_dir refuses to start (FATAL 58R13).
+#      L5  first-migration identity gate: a freshly-initdb'd node (foreign
+#          system_identifier) pointed at an existing authority fails closed.
+#      L6  per-node identity anchor (P0): an already-migrated node whose shared
+#          authority is replaced, at the same path, by a foreign-but-valid
+#          control file fails closed (the anchor catches the foreign sysid).
+#      L7  per-node identity anchor (P0): a migrated node whose anchor is
+#          missing fails closed (never re-trusts the symlink target blindly).
 #
-#    The two-node "same inode" + concurrent-checkpoint legs (and the
-#    fail-closed identity/tamper legs) land once the cross-node Phase-2
-#    storage verification is wired -- a multi-node authority bootstrap
-#    fails closed until then.
+#    The two-node "same inode" + concurrent-checkpoint legs are t/288/t/289.
 #
 # Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
@@ -142,6 +146,58 @@ ok(!$fret, "L5: a node with a foreign system_identifier fails to attach to the a
 my $flog = PostgreSQL::Test::Utils::slurp_file($foreign->logfile);
 like($flog, qr/could not migrate global\/pg_control|foreign|authority/i,
 	"L5: the failure is the fail-closed identity/migration gate (DoD-5)");
+
+# ---- L6: P0 identity anchor -- an ALREADY-MIGRATED node (local path is a
+#         symlink, no independent local sysid left) whose shared authority is
+#         replaced, AT THE SAME PATH, by another VALID control file with a
+#         different system_identifier must fail closed.  The per-node anchor
+#         recorded at migration is the only proof the node is reading its own
+#         cluster's control file; a same-path storage swap to a foreign-but-
+#         valid authority must be rejected, not silently accepted.
+my $anchor = $node->data_dir . "/global/pgrac_cf_contract";
+ok(-f $anchor, "L6: the migrated node recorded a per-node identity anchor");
+
+# $foreign initdb'd a valid control file with a different system_identifier and
+# never migrated (its start failed at L5), so its global/pg_control is a plain
+# foreign-but-valid image.  Drop it onto the shared authority's primary path.
+require File::Copy;
+File::Copy::copy($foreign->data_dir . "/global/pg_control", $authority)
+	or die "copy foreign authority: $!";
+
+my $sret = $node->start(fail_ok => 1);
+ok(!$sret,
+	"L6: the migrated node refuses to start on a foreign authority swapped in at the same path");
+my $slog = PostgreSQL::Test::Utils::slurp_file($node->logfile);
+like($slog, qr/identity check failed|different system identifier|foreign control file/i,
+	"L6: the failure is the per-node identity gate (foreign sysid, not a blind accept)");
+
+# ---- L7: P0 identity anchor -- a migrated node (local path is a symlink) whose
+#         per-node anchor is MISSING must fail closed, never "re-trust" whatever
+#         authority the symlink currently resolves to.  Uses its own fresh shared
+#         root so it is independent of L6.
+my $shared7 = PostgreSQL::Test::Utils::tempdir();
+make_path("$shared7/global");
+my $n7 = PostgreSQL::Test::Cluster->new('cf_auth_noanchor');
+$n7->init;
+$n7->append_conf(
+	'postgresql.conf', qq{
+cluster.enabled = off
+cluster.lms_enabled = off
+cluster.shared_data_dir = '$shared7'
+cluster.controlfile_shared_authority = on
+});
+$n7->start;    # migrates: writes the anchor + replaces the local path with a symlink
+ok(-l($n7->data_dir . "/global/pg_control"),
+	"L7: the node migrated (local control path is a symlink)");
+$n7->stop;
+
+unlink($n7->data_dir . "/global/pgrac_cf_contract")
+	or die "unlink anchor: $!";
+my $r7 = $n7->start(fail_ok => 1);
+ok(!$r7, "L7: a migrated node with no identity anchor fails to start");
+my $l7 = PostgreSQL::Test::Utils::slurp_file($n7->logfile);
+like($l7, qr/no identity anchor|identity check failed/i,
+	"L7: the failure is the missing-anchor identity gate (no blind re-trust)");
 
 done_testing();
 

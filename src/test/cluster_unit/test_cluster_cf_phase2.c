@@ -154,11 +154,11 @@ GetCurrentTimestamp(void)
 	return 1;
 }
 
-/* contract persist/load: not reached by these tests (only verify_or_fail uses
- * them); stub to satisfy the link without pulling in cluster_cf_storage.o. */
+/* contract update_state/load: not reached by these tests (only verify_or_fail
+ * uses them); stub to satisfy the link without pulling in cluster_cf_storage.o. */
 bool
-cluster_cf_contract_persist(const char *p pg_attribute_unused(),
-							ClusterCfContractState s pg_attribute_unused())
+cluster_cf_contract_update_state(const char *p pg_attribute_unused(),
+								 ClusterCfContractState s pg_attribute_unused())
 {
 	return true;
 }

@@ -21,7 +21,7 @@
  *
  * NOTES
  *	  This is a pgrac-original file (no derivation from PostgreSQL).
- *	  Spec: spec-5.6-cf-enqueue-shared-controlfile-authority.md (§3.9 T6)
+ *	  Spec: spec-5.6-cf-enqueue-shared-controlfile-authority.md
  *
  *-------------------------------------------------------------------------
  */
@@ -312,13 +312,14 @@ cluster_cf_phase2_verify_or_fail(const char *pgdata)
 	if (cluster_cf_phase2_rendezvous(cluster_shared_data_dir, cluster_node_id, peer_id, nonce,
 									 cluster_cf_enqueue_timeout_ms)) {
 		/*
-		 * Peer alive + storage cross-node verified this run.  Record the
-		 * contract (bound to the storage uuid) and flag peer-verified so the
+		 * Peer alive + storage cross-node verified this run.  Update only the
+		 * contract STATE (preserving the identity anchor written at migration --
+		 * never re-bind the authority sysid here) and flag peer-verified so the
 		 * role gate grants JOIN_READONLY (read the authority, never write it
 		 * during recovery; steady-state writes go through CF X after PM_RUN).
 		 */
 		cf_phase2_peer_verified = true;
-		(void)cluster_cf_contract_persist(pgdata, CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED);
+		(void)cluster_cf_contract_update_state(pgdata, CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED);
 		ereport(
 			LOG,
 			(errmsg("cluster cf phase-2: cross-node storage rename contract verified with node %d",

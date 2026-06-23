@@ -7,7 +7,7 @@
  *	  Covers migration of a per-node control file into the shared
  *	  authority plus a node-local symlink, classification of what a
  *	  node's local control path actually is, the Phase-1 local rename
- *	  probe, and the pure §3.3 B5 write-gate.  Phase-2 cross-node nonce+
+ *	  probe, and the pure write-gate.  Phase-2 cross-node nonce+
  *	  ack verification (which needs the interconnect and a live peer) is
  *	  layered on by the bootstrap path (Db5) and exercised by t/289.
  *
@@ -65,11 +65,12 @@ static const char cf_probe_nonce[] = "PGRAC_CF_RENAME_PROBE_v1";
  * record reads as UNVERIFIED.
  */
 #define CLUSTER_CF_CONTRACT_MAGIC 0x43464354 /* 'CFCT' */
-#define CLUSTER_CF_CONTRACT_VERSION 1
+#define CLUSTER_CF_CONTRACT_VERSION 2
 
 typedef struct ClusterCfContractRecord {
 	uint32 magic;
 	uint32 version;
+	uint64 authority_system_identifier; /* v2: this node's bound authority sysid */
 	char storage_uuid[CLUSTER_SHARED_UUID_LEN];
 	char _pad[3];  /* keep `state` 4-byte aligned */
 	uint32 state;  /* a ClusterCfContractState value */
@@ -81,7 +82,7 @@ typedef struct ClusterCfContractRecord {
  *
  *	A node in authority mode must reach the shared authority through a
  *	symlink that points at it AND read a valid, identity-matched image;
- *	anything else fails closed with a specific reason (spec §3.1 A3 / Q6).
+ *	anything else fails closed with a specific reason.
  */
 ClusterCfStartupVerdict
 cluster_cf_startup_verdict(ClusterCfSymlinkStatus link_status, bool authority_readable,
@@ -106,7 +107,7 @@ cluster_cf_startup_verdict(ClusterCfSymlinkStatus link_status, bool authority_re
 }
 
 /*
- * cluster_cf_storage_write_allowed -- pure §3.3 B5 write-gate.
+ * cluster_cf_storage_write_allowed -- pure write-gate.
  */
 bool
 cluster_cf_storage_write_allowed(ClusterCfContractState state, bool multi_node)
@@ -129,7 +130,7 @@ cluster_cf_contract_resolve(const char *persisted_uuid, const char *current_uuid
 	/* No persisted record (or it recorded no identity) -> never verified. */
 	if (persisted_uuid == NULL || persisted_uuid[0] == '\0')
 		return CLUSTER_CF_CONTRACT_UNVERIFIED;
-	/* Bound to a different storage (swap/re-attach) -> re-verify (DoD#3). */
+	/* Bound to a different storage (swap/re-attach) -> re-verify. */
 	if (strcmp(persisted_uuid, current_uuid) != 0)
 		return CLUSTER_CF_CONTRACT_UNVERIFIED;
 	/* Same storage: trust only a recorded CROSSNODE_VERIFIED, nothing weaker. */
@@ -139,24 +140,50 @@ cluster_cf_contract_resolve(const char *persisted_uuid, const char *current_uuid
 }
 
 /*
- * cluster_cf_contract_persist -- atomically record the contract (see header).
+ * read_contract_record -- read + structurally validate the per-node anchor.
+ * Returns true (with *crc_ok set) for a current-version record with the right
+ * magic; false when the file is absent/short/foreign-format (no usable anchor).
  */
-bool
-cluster_cf_contract_persist(const char *pgdata, ClusterCfContractState state)
+static bool
+read_contract_record(const char *pgdata, ClusterCfContractRecord *rec, bool *crc_ok)
 {
-	ClusterCfContractRecord rec;
+	char path[MAXPGPATH];
+	pg_crc32c crc;
+	int fd;
+	int n;
+
+	*crc_ok = false;
+	snprintf(path, sizeof(path), "%s/%s", pgdata, CLUSTER_CF_CONTRACT_REL_PATH);
+	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+	if (fd < 0)
+		return false;
+	n = read(fd, rec, sizeof(*rec));
+	CloseTransientFile(fd);
+	if (n != (int)sizeof(*rec) || rec->magic != CLUSTER_CF_CONTRACT_MAGIC
+		|| rec->version != CLUSTER_CF_CONTRACT_VERSION)
+		return false;
+
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, rec, offsetof(ClusterCfContractRecord, crc));
+	FIN_CRC32C(crc);
+	*crc_ok = (crc == rec->crc);
+	return true;
+}
+
+/*
+ * write_contract_record -- (re)compute the CRC and atomically write the anchor
+ * (write-tmp + fsync + durable_rename).  Returns false on any I/O failure.
+ */
+static bool
+write_contract_record(const char *pgdata, ClusterCfContractRecord *rec)
+{
 	char path[MAXPGPATH];
 	char tmp[MAXPGPATH];
 	int fd;
 
-	memset(&rec, 0, sizeof(rec));
-	rec.magic = CLUSTER_CF_CONTRACT_MAGIC;
-	rec.version = CLUSTER_CF_CONTRACT_VERSION;
-	cluster_shared_fs_get_storage_uuid(rec.storage_uuid, sizeof(rec.storage_uuid));
-	rec.state = (uint32)state;
-	INIT_CRC32C(rec.crc);
-	COMP_CRC32C(rec.crc, &rec, offsetof(ClusterCfContractRecord, crc));
-	FIN_CRC32C(rec.crc);
+	INIT_CRC32C(rec->crc);
+	COMP_CRC32C(rec->crc, rec, offsetof(ClusterCfContractRecord, crc));
+	FIN_CRC32C(rec->crc);
 
 	snprintf(path, sizeof(path), "%s/%s", pgdata, CLUSTER_CF_CONTRACT_REL_PATH);
 	snprintf(tmp, sizeof(tmp), "%s/%s.tmp", pgdata, CLUSTER_CF_CONTRACT_REL_PATH);
@@ -164,7 +191,7 @@ cluster_cf_contract_persist(const char *pgdata, ClusterCfContractState state)
 	fd = OpenTransientFile(tmp, O_RDWR | O_CREAT | O_TRUNC | PG_BINARY);
 	if (fd < 0)
 		return false;
-	if (write(fd, &rec, sizeof(rec)) != (int)sizeof(rec) || pg_fsync(fd) != 0) {
+	if (write(fd, rec, sizeof(*rec)) != (int)sizeof(*rec) || pg_fsync(fd) != 0) {
 		CloseTransientFile(fd);
 		unlink(tmp);
 		return false;
@@ -180,38 +207,105 @@ cluster_cf_contract_persist(const char *pgdata, ClusterCfContractState state)
 }
 
 /*
- * cluster_cf_contract_load -- read + identity-resolve the contract (see header).
+ * cluster_cf_contract_persist -- atomically record the contract + the node's
+ * bound authority system_identifier (see header).
+ */
+bool
+cluster_cf_contract_persist(const char *pgdata, ClusterCfContractState state,
+							uint64 authority_sysid)
+{
+	ClusterCfContractRecord rec;
+
+	memset(&rec, 0, sizeof(rec));
+	rec.magic = CLUSTER_CF_CONTRACT_MAGIC;
+	rec.version = CLUSTER_CF_CONTRACT_VERSION;
+	rec.authority_system_identifier = authority_sysid;
+	cluster_shared_fs_get_storage_uuid(rec.storage_uuid, sizeof(rec.storage_uuid));
+	rec.state = (uint32)state;
+	return write_contract_record(pgdata, &rec);
+}
+
+/*
+ * cluster_cf_contract_update_state -- update ONLY the state of an existing
+ * anchor, preserving the bound authority system_identifier and storage uuid
+ * (see header).  Fails (false) when there is no valid anchor to update: the
+ * identity is established at migration and must never be fabricated here.
+ */
+bool
+cluster_cf_contract_update_state(const char *pgdata, ClusterCfContractState state)
+{
+	ClusterCfContractRecord rec;
+	bool crc_ok;
+
+	if (!read_contract_record(pgdata, &rec, &crc_ok) || !crc_ok)
+		return false;
+	rec.state = (uint32)state;
+	return write_contract_record(pgdata, &rec);
+}
+
+/*
+ * cluster_cf_contract_load -- read the anchor and resolve its STATE against the
+ * current shared-storage identity (see header).  Missing/torn -> UNVERIFIED.
  */
 ClusterCfContractState
 cluster_cf_contract_load(const char *pgdata)
 {
 	ClusterCfContractRecord rec;
-	char path[MAXPGPATH];
 	char current_uuid[CLUSTER_SHARED_UUID_LEN];
-	pg_crc32c crc;
-	int fd;
-	int n;
+	bool crc_ok;
 
-	snprintf(path, sizeof(path), "%s/%s", pgdata, CLUSTER_CF_CONTRACT_REL_PATH);
-
-	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
-	if (fd < 0)
-		return CLUSTER_CF_CONTRACT_UNVERIFIED; /* no record: never verified */
-	n = read(fd, &rec, sizeof(rec));
-	CloseTransientFile(fd);
-	if (n != (int)sizeof(rec) || rec.magic != CLUSTER_CF_CONTRACT_MAGIC
-		|| rec.version != CLUSTER_CF_CONTRACT_VERSION)
+	if (!read_contract_record(pgdata, &rec, &crc_ok) || !crc_ok)
 		return CLUSTER_CF_CONTRACT_UNVERIFIED;
-
-	INIT_CRC32C(crc);
-	COMP_CRC32C(crc, &rec, offsetof(ClusterCfContractRecord, crc));
-	FIN_CRC32C(crc);
-	if (crc != rec.crc)
-		return CLUSTER_CF_CONTRACT_UNVERIFIED; /* torn/corrupt: fail closed */
-
 	cluster_shared_fs_get_storage_uuid(current_uuid, sizeof(current_uuid));
 	return cluster_cf_contract_resolve(rec.storage_uuid, current_uuid,
 									   (ClusterCfContractState)rec.state);
+}
+
+/*
+ * cluster_cf_contract_identity_resolve -- pure per-node identity verdict (see
+ * header).  Storage-uuid binding is enforced only when both sides advertise a
+ * uuid (the sentinel is optional); the bound authority system_identifier MUST
+ * always match the authority being read.
+ */
+ClusterCfIdentityVerdict
+cluster_cf_contract_identity_resolve(bool present, bool crc_ok, const char *anchor_uuid,
+									 uint64 anchor_sysid, const char *current_uuid,
+									 uint64 shared_sysid)
+{
+	if (!present)
+		return CLUSTER_CF_IDENTITY_FATAL_NO_ANCHOR;
+	if (!crc_ok)
+		return CLUSTER_CF_IDENTITY_FATAL_CRC;
+	if (anchor_uuid != NULL && anchor_uuid[0] != '\0' && current_uuid != NULL
+		&& current_uuid[0] != '\0' && strcmp(anchor_uuid, current_uuid) != 0)
+		return CLUSTER_CF_IDENTITY_FATAL_STORAGE;
+	if (anchor_sysid != shared_sysid)
+		return CLUSTER_CF_IDENTITY_FATAL_SYSID;
+	return CLUSTER_CF_IDENTITY_OK;
+}
+
+/*
+ * cluster_cf_contract_identity_check -- read this node's anchor and verify the
+ * shared authority it is symlinked to still has the bound identity (see
+ * header).  This is the real startup gate: with no independent local sysid
+ * after migration, the anchor is the only proof a node is reading its own
+ * cluster's control file and not a foreign one swapped in at the same path.
+ */
+ClusterCfIdentityVerdict
+cluster_cf_contract_identity_check(const char *pgdata, uint64 shared_sysid)
+{
+	ClusterCfContractRecord rec;
+	char current_uuid[CLUSTER_SHARED_UUID_LEN];
+	bool present;
+	bool crc_ok;
+
+	present = read_contract_record(pgdata, &rec, &crc_ok);
+	if (!present)
+		return cluster_cf_contract_identity_resolve(false, false, NULL, 0, NULL, shared_sysid);
+	cluster_shared_fs_get_storage_uuid(current_uuid, sizeof(current_uuid));
+	return cluster_cf_contract_identity_resolve(true, crc_ok, rec.storage_uuid,
+												rec.authority_system_identifier, current_uuid,
+												shared_sysid);
 }
 
 /*
@@ -221,7 +315,7 @@ ClusterCfLiveness
 cluster_cf_assess_liveness(void)
 {
 	/*
-	 * Order matters (F0-26): require CSSD READY first.  A zero alive-peer
+	 * Order matters: require CSSD READY first.  A zero alive-peer
 	 * count is only meaningful once CSSD shmem + membership are up; checked
 	 * before that, the count helpers return 0 for "shmem absent", which would
 	 * falsely read as "I am the only node".
@@ -242,7 +336,7 @@ cluster_cf_assess_liveness(void)
 	/*
 	 * Claiming sole-liveness authorizes a single-node-authority WRITE, so it
 	 * must rule out a partition in which a peer is alive but unreachable: that
-	 * requires quorum (§3.3 B4).  Without quorum, a zero alive-peer count is
+	 * requires quorum.  Without quorum, a zero alive-peer count is
 	 * not trustworthy -> UNKNOWN (fail-closed for the owner path).
 	 */
 	if (!cluster_qvotec_in_quorum())
@@ -251,7 +345,7 @@ cluster_cf_assess_liveness(void)
 }
 
 /*
- * cluster_cf_verify_sole_liveness_or_fail -- spec §3.3 B4 positive proof, the
+ * cluster_cf_verify_sole_liveness_or_fail -- positive proof, the
  * boolean "== SOLE" view of the liveness assessment.
  */
 bool
@@ -302,7 +396,7 @@ cluster_cf_bootstrap_role(bool multi_node, ClusterCfLiveness liveness,
 }
 
 /*
- * cluster_cf_bootstrap_authority_gate -- spec §3.3 B3/B5 write gate.
+ * cluster_cf_bootstrap_authority_gate -- write gate.
  */
 bool
 cluster_cf_bootstrap_authority_gate(bool multi_node, ClusterCfContractState contract)
@@ -313,7 +407,7 @@ cluster_cf_bootstrap_authority_gate(bool multi_node, ClusterCfContractState cont
 }
 
 /*
- * cluster_cf_enter_bootstrap_window_or_fail -- spec §3.3 B2/B3 bootstrap entry.
+ * cluster_cf_enter_bootstrap_window_or_fail -- bootstrap entry.
  */
 void
 cluster_cf_enter_bootstrap_window_or_fail(void)
@@ -498,7 +592,6 @@ cluster_cf_migrate_and_link(const char *local_pgdata)
 	ClusterCfSymlinkStatus st;
 	ControlFileData local_cf;
 	ControlFileData shared_cf;
-	bool have_local;
 
 	shared = cluster_cf_shared_path();
 	if (shared == NULL)
@@ -506,34 +599,55 @@ cluster_cf_migrate_and_link(const char *local_pgdata)
 
 	snprintf(local_path, sizeof(local_path), "%s/%s", local_pgdata, CLUSTER_CF_LOCAL_REL);
 
-	/* Already the correct symlink: nothing to do (idempotent). */
+	/* Already the correct symlink: the startup identity gate verifies it. */
 	st = cluster_cf_symlink_status(local_path, shared);
 	if (st == CLUSTER_CF_SYMLINK_OK)
 		return true;
 
-	have_local = read_local_controlfile(local_path, &local_cf);
-
-	/* Bootstrap the shared authority from the local control file if needed. */
-	if (!cluster_cf_authority_read(&shared_cf)) {
-		if (!have_local)
-			return false; /* no source to migrate from -> fail-closed */
-		cluster_cf_authority_write(&local_cf);
-		if (!cluster_cf_authority_read(&shared_cf))
+	if (st == CLUSTER_CF_SYMLINK_NOT_SYMLINK) {
+		/*
+		 * A genuine per-node regular control file: this is the FIRST migration
+		 * (or the node that bootstraps the shared authority).  Bind the node's
+		 * identity anchor to the authority's system_identifier BEFORE pointing
+		 * the local path at it, so every later start can prove it is reading its
+		 * own cluster's authority.
+		 */
+		if (!read_local_controlfile(local_path, &local_cf))
 			return false;
+		if (!cluster_cf_authority_read(&shared_cf)) {
+			cluster_cf_authority_write(&local_cf);
+			if (!cluster_cf_authority_read(&shared_cf))
+				return false;
+		}
+		if (local_cf.system_identifier != shared_cf.system_identifier)
+			return false; /* foreign authority -> fail-closed */
+		if (!cluster_cf_contract_persist(local_pgdata, CLUSTER_CF_CONTRACT_LOCAL_PROBED,
+										 shared_cf.system_identifier))
+			return false; /* could not record the identity anchor -> fail-closed */
+		if (unlink(local_path) != 0)
+			return false;
+		if (symlink(shared, local_path) != 0)
+			return false;
+		return true;
 	}
 
-	/* A real per-node file must agree with the shared authority's identity. */
-	if (have_local && local_cf.system_identifier != shared_cf.system_identifier)
-		return false; /* foreign authority -> fail-closed */
-
-	/* Replace whatever sits at local_path with a symlink to the authority. */
+	/*
+	 * WRONG_TARGET or MISSING: an already-provisioned node whose symlink points
+	 * elsewhere or is gone.  Re-link ONLY if the per-node anchor proves the
+	 * current shared authority is this node's own cluster -- never blindly
+	 * re-trust whatever authority now sits at the configured path.
+	 */
+	if (!cluster_cf_authority_read(&shared_cf))
+		return false;
+	if (cluster_cf_contract_identity_check(local_pgdata, shared_cf.system_identifier)
+		!= CLUSTER_CF_IDENTITY_OK)
+		return false;
 	if (st != CLUSTER_CF_SYMLINK_MISSING) {
 		if (unlink(local_path) != 0)
 			return false;
 	}
 	if (symlink(shared, local_path) != 0)
 		return false;
-
 	return true;
 }
 
@@ -562,6 +676,29 @@ startup_verdict_detail(ClusterCfStartupVerdict v)
 }
 
 /*
+ * identity_verdict_detail -- human-readable reason for an identity-gate fail.
+ */
+static const char *
+identity_verdict_detail(ClusterCfIdentityVerdict v)
+{
+	switch (v) {
+	case CLUSTER_CF_IDENTITY_OK:
+		return "ok";
+	case CLUSTER_CF_IDENTITY_FATAL_NO_ANCHOR:
+		return "this node has no identity anchor for the shared authority "
+			   "(global/pgrac_cf_contract is missing or unrecognized)";
+	case CLUSTER_CF_IDENTITY_FATAL_CRC:
+		return "the node's identity anchor is torn or corrupt";
+	case CLUSTER_CF_IDENTITY_FATAL_STORAGE:
+		return "the shared storage identity changed since this node was bound to it";
+	case CLUSTER_CF_IDENTITY_FATAL_SYSID:
+		return "the shared authority has a different system identifier than the "
+			   "one this node was bound to (foreign control file)";
+	}
+	return "unknown";
+}
+
+/*
  * cluster_cf_startup_prepare -- Da3 startup hook (see header).
  */
 void
@@ -573,6 +710,7 @@ cluster_cf_startup_prepare(const char *pgdata)
 	ControlFileData cf;
 	bool readable;
 	ClusterCfStartupVerdict v;
+	ClusterCfIdentityVerdict idv;
 
 	if (!cluster_controlfile_shared_authority)
 		return; /* off: stock per-node pg_control */
@@ -592,20 +730,18 @@ cluster_cf_startup_prepare(const char *pgdata)
 			 errmsg("could not migrate global/pg_control into the shared authority under \"%s\"",
 					cluster_shared_data_dir)));
 
-	/* Verify and fail-closed on any mismatch (spec §3.1 A3 / Q6 / DoD-5). */
+	/* Verify and fail-closed on any mismatch. */
 	shared = cluster_cf_shared_path();
 	snprintf(local_path, sizeof(local_path), "%s/%s", pgdata, CLUSTER_CF_LOCAL_REL);
 	st = cluster_cf_symlink_status(local_path, shared);
 	readable = cluster_cf_authority_read(&cf);
 
 	/*
-	 * identity_ok is wired to readable here: a symlink repointed at a foreign
-	 * authority is already caught as WRONG_TARGET above, and migrate verified
-	 * the local-vs-shared system_identifier.  The verdict's IDENTITY branch is
-	 * proven by unit test and used when a recorded expected identity is
-	 * threaded in by the bootstrap path.
+	 * Structural verdict: the local path must be a symlink to the current
+	 * shared authority and that authority must be readable.  Identity is the
+	 * separate anchor check below, so identity_ok is passed true here.
 	 */
-	v = cluster_cf_startup_verdict(st, readable, readable);
+	v = cluster_cf_startup_verdict(st, readable, true);
 	if (v != CLUSTER_CF_STARTUP_OK)
 		ereport(
 			FATAL,
@@ -615,4 +751,21 @@ cluster_cf_startup_prepare(const char *pgdata)
 			 errhint("Every node must point at the same shared authority \"%s\"; "
 					 "turn cluster.controlfile_shared_authority off for a single-node deployment.",
 					 shared)));
+
+	/*
+	 * Identity gate.  After migration the local control file IS the symlink to
+	 * the shared authority, so there is no independent local system_identifier
+	 * to compare; the per-node anchor recorded at migration is the only proof
+	 * this node is reading its own cluster's authority and not a foreign but
+	 * valid one swapped in at the same shared path.  Fail closed on any
+	 * mismatch -- a missing anchor included.
+	 */
+	idv = cluster_cf_contract_identity_check(pgdata, cf.system_identifier);
+	if (idv != CLUSTER_CF_IDENTITY_OK)
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("shared pg_control authority identity check failed at startup"),
+						errdetail("%s.", identity_verdict_detail(idv)),
+						errhint("This node is not bound to the shared authority at \"%s\"; it "
+								"must only attach to the cluster it was provisioned with.",
+								shared)));
 }

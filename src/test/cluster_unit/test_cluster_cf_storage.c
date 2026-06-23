@@ -492,7 +492,8 @@ UT_TEST(test_contract_persist_load)
 	UT_ASSERT_EQ(cluster_cf_contract_load(pgdata), CLUSTER_CF_CONTRACT_UNVERIFIED);
 
 	/* persist VERIFIED bound to the current uuid -> load resolves VERIFIED */
-	UT_ASSERT(cluster_cf_contract_persist(pgdata, CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED));
+	UT_ASSERT(
+		cluster_cf_contract_persist(pgdata, CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED, 0xABCDEF12));
 	UT_ASSERT_EQ(cluster_cf_contract_load(pgdata), CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED);
 
 	/* storage identity changes under us -> binding breaks -> UNVERIFIED (DoD#3) */
@@ -512,8 +513,85 @@ UT_TEST(test_contract_persist_load)
 	UT_ASSERT_EQ(cluster_cf_contract_load(pgdata), CLUSTER_CF_CONTRACT_UNVERIFIED);
 
 	/* persisting only LOCAL_PROBED never resolves to VERIFIED */
-	UT_ASSERT(cluster_cf_contract_persist(pgdata, CLUSTER_CF_CONTRACT_LOCAL_PROBED));
+	UT_ASSERT(cluster_cf_contract_persist(pgdata, CLUSTER_CF_CONTRACT_LOCAL_PROBED, 0xABCDEF12));
 	UT_ASSERT_EQ(cluster_cf_contract_load(pgdata), CLUSTER_CF_CONTRACT_UNVERIFIED);
+}
+
+/* ======================================================================
+ * Per-node identity anchor gate (P0 patch: a migrated node must verify the
+ * shared authority's system_identifier against the anchor it was bound to, so
+ * a foreign-but-valid authority swapped in at the same path is rejected).
+ * ====================================================================== */
+UT_TEST(test_contract_identity_resolve)
+{
+	/* no anchor -> NO_ANCHOR (a migrated node with no anchor must fail closed) */
+	UT_ASSERT_EQ(cluster_cf_contract_identity_resolve(false, false, NULL, 0, NULL, 100),
+				 CLUSTER_CF_IDENTITY_FATAL_NO_ANCHOR);
+	/* present but bad CRC -> CRC (never trust a torn anchor) */
+	UT_ASSERT_EQ(cluster_cf_contract_identity_resolve(true, false, "u", 100, "u", 100),
+				 CLUSTER_CF_IDENTITY_FATAL_CRC);
+	/* both uuids present + mismatch -> STORAGE (storage swapped under us) */
+	UT_ASSERT_EQ(cluster_cf_contract_identity_resolve(true, true, "uA", 100, "uB", 100),
+				 CLUSTER_CF_IDENTITY_FATAL_STORAGE);
+	/* authority sysid != bound sysid -> SYSID (foreign control file) */
+	UT_ASSERT_EQ(cluster_cf_contract_identity_resolve(true, true, "u", 100, "u", 200),
+				 CLUSTER_CF_IDENTITY_FATAL_SYSID);
+	/* matching uuid + sysid -> OK */
+	UT_ASSERT_EQ(cluster_cf_contract_identity_resolve(true, true, "u", 100, "u", 100),
+				 CLUSTER_CF_IDENTITY_OK);
+	/* no sentinel either side -> uuid binding skipped, sysid decides -> OK */
+	UT_ASSERT_EQ(cluster_cf_contract_identity_resolve(true, true, "", 100, "", 100),
+				 CLUSTER_CF_IDENTITY_OK);
+	/* one side lacks a uuid -> binding skipped (lenient), sysid still enforced */
+	UT_ASSERT_EQ(cluster_cf_contract_identity_resolve(true, true, "uA", 100, "", 200),
+				 CLUSTER_CF_IDENTITY_FATAL_SYSID);
+}
+
+UT_TEST(test_contract_identity_check)
+{
+	char pgdata[MAXPGPATH];
+	char file[MAXPGPATH];
+	int fd;
+	char junk[8] = { 0 };
+
+	make_tempdir(pgdata, sizeof(pgdata), "cfident");
+	strlcpy(g_storage_uuid, "00112233445566778899aabbccddeeff", sizeof(g_storage_uuid));
+
+	/* no anchor file yet -> NO_ANCHOR (P0: a symlinked node with no anchor fails closed) */
+	UT_ASSERT_EQ(cluster_cf_contract_identity_check(pgdata, 12345),
+				 CLUSTER_CF_IDENTITY_FATAL_NO_ANCHOR);
+
+	/* bind the anchor to sysid 12345 (as migration does) */
+	UT_ASSERT(cluster_cf_contract_persist(pgdata, CLUSTER_CF_CONTRACT_LOCAL_PROBED, 12345));
+
+	/* same authority sysid -> OK */
+	UT_ASSERT_EQ(cluster_cf_contract_identity_check(pgdata, 12345), CLUSTER_CF_IDENTITY_OK);
+
+	/* P0 CORE: a foreign-but-valid authority (different sysid) at the same path -> FATAL */
+	UT_ASSERT_EQ(cluster_cf_contract_identity_check(pgdata, 99999),
+				 CLUSTER_CF_IDENTITY_FATAL_SYSID);
+
+	/* storage swapped under us (uuid changes) -> STORAGE FATAL */
+	strlcpy(g_storage_uuid, "ffffffffffffffffffffffffffffffff", sizeof(g_storage_uuid));
+	UT_ASSERT_EQ(cluster_cf_contract_identity_check(pgdata, 12345),
+				 CLUSTER_CF_IDENTITY_FATAL_STORAGE);
+	strlcpy(g_storage_uuid, "00112233445566778899aabbccddeeff", sizeof(g_storage_uuid));
+
+	/* Phase-2 update_state preserves the sysid anchor (must not re-bind identity) */
+	UT_ASSERT(cluster_cf_contract_update_state(pgdata, CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED));
+	UT_ASSERT_EQ(cluster_cf_contract_identity_check(pgdata, 12345), CLUSTER_CF_IDENTITY_OK);
+	UT_ASSERT_EQ(cluster_cf_contract_load(pgdata), CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED);
+
+	/* a torn anchor -> CRC FATAL (never silently trusted) */
+	snprintf(file, sizeof(file), "%s/%s", pgdata, CLUSTER_CF_CONTRACT_REL_PATH);
+	fd = open(file, O_WRONLY, 0600);
+	if (fd < 0 || pwrite(fd, junk, sizeof(junk), 16) != (ssize_t)sizeof(junk))
+		abort();
+	close(fd);
+	UT_ASSERT_EQ(cluster_cf_contract_identity_check(pgdata, 12345), CLUSTER_CF_IDENTITY_FATAL_CRC);
+
+	/* update_state refuses to fabricate identity when no valid anchor exists */
+	UT_ASSERT(!cluster_cf_contract_update_state(pgdata, CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED));
 }
 
 /* ======================================================================
@@ -594,6 +672,8 @@ main(void)
 	UT_RUN(test_bootstrap_gate);
 	UT_RUN(test_contract_resolve);
 	UT_RUN(test_contract_persist_load);
+	UT_RUN(test_contract_identity_resolve);
+	UT_RUN(test_contract_identity_check);
 	UT_RUN(test_assess_liveness);
 	UT_RUN(test_bootstrap_role);
 	UT_DONE();
