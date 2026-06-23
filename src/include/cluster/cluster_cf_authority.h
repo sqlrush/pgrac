@@ -8,7 +8,7 @@
  *	  In a pgrac cluster the control file is migrated from a per-node
  *	  $PGDATA/global/pg_control into one shared authority living under
  *	  cluster.shared_data_dir; every node's local path becomes a symlink
- *	  to it (see Da2).  This module owns that shared authority file: it
+ *	  to it.  This module owns that shared authority file: it
  *	  reads it (primary, then a strictly-validated .bak fallback) and
  *	  writes it atomically so a reader never observes a torn image.
  *
@@ -30,7 +30,7 @@
  *
  * NOTES
  *	  This is a pgrac-original file (no derivation from PostgreSQL).
- *	  Spec: spec-5.6-cf-enqueue-shared-controlfile-authority.md (Da1)
+ *	  Spec: spec-5.6-cf-enqueue-shared-controlfile-authority.md
  *
  *-------------------------------------------------------------------------
  */

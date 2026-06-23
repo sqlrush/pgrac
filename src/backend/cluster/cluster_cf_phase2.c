@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * cluster_cf_phase2.c
- *	  Cross-node storage rename-contract verification (spec-5.6 T6 Phase-2).
+ *	  Cross-node storage rename-contract verification (spec-5.6 Phase-2).
  *
  *	  Symmetric nonce+ack rendezvous over the shared storage (see the header
  *	  for the protocol).  The probe/ack files are written with the exact

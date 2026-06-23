@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * cluster_cf_phase2.h
- *	  Cross-node storage rename-contract verification (spec-5.6 T6 Phase-2).
+ *	  Cross-node storage rename-contract verification (spec-5.6 Phase-2).
  *
  *	  The shared pg_control authority is written with durable_rename; that
  *	  is torn-safe for a same-node reader, but a peer only sees the new

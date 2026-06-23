@@ -2,9 +2,9 @@
  *
  * cluster_cf_enqueue.c
  *	  CF (control file) cluster enqueue over the spec-5.3 GES substrate
- *	  (spec-5.6 Db1/Db2).
+ *	  (spec-5.6).
  *
- *	  Db1 (this stage): the singleton CF resource-id encoder.  Db2 adds the
+ *	  (this stage): the singleton CF resource-id encoder.  It adds the
  *	  cluster_cf_lock/unlock acquire/release wrappers that build a
  *	  ClusterLockAcquireRequest for the CF resid and drive the GES seven-
  *	  step state machine.
@@ -21,7 +21,7 @@
  *
  * NOTES
  *	  This is a pgrac-original file (no derivation from PostgreSQL).
- *	  Spec: spec-5.6-cf-enqueue-shared-controlfile-authority.md (Db1/Db2)
+ *	  Spec: spec-5.6-cf-enqueue-shared-controlfile-authority.md
  *
  *-------------------------------------------------------------------------
  */
@@ -53,7 +53,7 @@ static CfHoldState cf_hold_x;
 static CfHoldState cf_hold_s;
 
 /*
- * spec-5.6 Db5: set while this process is the bootstrap single-node authority
+ * spec-5.6: set while this process is the bootstrap single-node authority
  * (sole-liveness + storage contract proven, GES not yet ready).  Lets the
  * write path proceed without a held CF X during early recovery.
  */

@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * cluster_cf_stats.c
- *	  CF (control file) shared-authority observability counters (spec-5.6 Dc4).
+ *	  CF (control file) shared-authority observability counters (spec-5.6).
  *
  *	  Five lock-free shmem counters bumped from the CF modules (X/S acquire and
  *	  fail-closed in the enqueue path, single-node authority in the storage
@@ -21,7 +21,7 @@
  *
  * NOTES
  *	  This is a pgrac-original file (no derivation from PostgreSQL).
- *	  Spec: spec-5.6-cf-enqueue-shared-controlfile-authority.md (Dc4)
+ *	  Spec: spec-5.6-cf-enqueue-shared-controlfile-authority.md
  *
  *-------------------------------------------------------------------------
  */
@@ -33,7 +33,7 @@
 #include "storage/shmem.h"
 
 /*
- * spec-5.6 Dc4 -- CF observability counters live in a dedicated lock-free
+ * spec-5.6 -- CF observability counters live in a dedicated lock-free
  * shmem region (mirror cluster_advisory: atomics only, no LWLock).
  */
 typedef struct ClusterCfStatsSharedState {

@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * cluster_cf_authority.c
- *	  Shared pg_control single-authority file (spec-5.6 Da1).
+ *	  Shared pg_control single-authority file (spec-5.6).
  *
  *	  Owns the one shared control file that backs every node's
  *	  $PGDATA/global/pg_control symlink under cluster.shared_data_dir.
@@ -32,7 +32,7 @@
  *
  * NOTES
  *	  This is a pgrac-original file (no derivation from PostgreSQL).
- *	  Spec: spec-5.6-cf-enqueue-shared-controlfile-authority.md (Da1)
+ *	  Spec: spec-5.6-cf-enqueue-shared-controlfile-authority.md
  *
  *-------------------------------------------------------------------------
  */

@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * cluster_cf_stats.h
- *	  CF (control file) shared-authority observability counters (spec-5.6 Dc4).
+ *	  CF (control file) shared-authority observability counters (spec-5.6).
  *
  *	  A small, dependency-light owner for the five CF shared-authority
  *	  counters so that every CF module (authority read, storage bootstrap,
@@ -23,7 +23,7 @@
  *
  * NOTES
  *	  This is a pgrac-original file (no derivation from PostgreSQL).
- *	  Spec: spec-5.6-cf-enqueue-shared-controlfile-authority.md (Dc4)
+ *	  Spec: spec-5.6-cf-enqueue-shared-controlfile-authority.md
  *
  *-------------------------------------------------------------------------
  */
@@ -33,7 +33,7 @@
 #include "c.h"
 
 /*
- * spec-5.6 Dc4 -- CF shared-authority observability counters.  Each has at
+ * spec-5.6 -- CF shared-authority observability counters.  Each has at
  * least one call site (DoD); they are pure observability and never gate logic.
  */
 typedef enum ClusterCfCounter {

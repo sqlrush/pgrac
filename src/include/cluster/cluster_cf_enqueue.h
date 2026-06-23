@@ -3,7 +3,7 @@
  * cluster_cf_enqueue.h
  *	  CF (control file) cluster enqueue: a singleton, whole-file S/X lock
  *	  on the shared pg_control authority, routed through the spec-5.3 GES
- *	  substrate (spec-5.6 Db1/Db2).
+ *	  substrate (spec-5.6).
  *
  *	  Like the SQ resid (spec-5.4), CF uses a dedicated high resid type
  *	  byte so its enqueue lives in its own namespace, distinct from any PG
@@ -31,7 +31,7 @@
  *
  * NOTES
  *	  This is a pgrac-original file (no derivation from PostgreSQL).
- *	  Spec: spec-5.6-cf-enqueue-shared-controlfile-authority.md (Db1/Db2)
+ *	  Spec: spec-5.6-cf-enqueue-shared-controlfile-authority.md
  *
  *-------------------------------------------------------------------------
  */
@@ -85,21 +85,21 @@ extern void cluster_cf_unlock(LOCKMODE mode);
 /*
  * cluster_cf_held -- true if this backend currently holds the CF lock in the
  * given mode.  Used by the write path to Assert the caller-level CF X is held
- * before an authority write (spec-5.6 Db3).
+ * before an authority write (spec-5.6).
  */
 extern bool cluster_cf_held(LOCKMODE mode);
 
 /*
  * cluster_cf_write_permitted -- true if a shared-authority control-file write
  * is currently allowed: this backend holds CF X (the normal GES-ready path),
- * OR (spec-5.6 Db5) the bootstrap single-node-authority window is active
+ * OR (spec-5.6) the bootstrap single-node-authority window is active
  * (sole-liveness proven and the storage rename-contract satisfied before GES
  * is ready).  Asserted in UpdateControlFile when the authority is enabled.
  */
 extern bool cluster_cf_write_permitted(void);
 
 /*
- * cluster_cf_set_bootstrap_authority -- spec-5.6 Db5.  Mark/clear the
+ * cluster_cf_set_bootstrap_authority -- spec-5.6.  Mark/clear the
  * bootstrap single-node-authority write window for this process.  When set,
  * cluster_cf_write_permitted() returns true without a held CF X (GES is not
  * yet ready during early recovery); the caller is responsible for having
