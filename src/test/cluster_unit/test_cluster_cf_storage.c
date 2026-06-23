@@ -677,7 +677,7 @@ UT_TEST(test_bootstrap_role)
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(13);
 	UT_RUN(test_write_allowed);
 	UT_RUN(test_symlink_status);
 	UT_RUN(test_probe_local);
