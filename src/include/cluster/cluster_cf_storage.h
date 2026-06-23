@@ -2,7 +2,7 @@
  *
  * cluster_cf_storage.h
  *	  Establish and verify the shared pg_control authority on a node and
- *	  on the underlying shared storage (spec-5.6 Da2 / T6).
+ *	  on the underlying shared storage (spec-5.6).
  *
  *	  Three concerns live here, separate from the authority file I/O in
  *	  cluster_cf_authority.c:
@@ -29,7 +29,7 @@
  *
  * NOTES
  *	  This is a pgrac-original file (no derivation from PostgreSQL).
- *	  Spec: spec-5.6-cf-enqueue-shared-controlfile-authority.md (Da2, T6)
+ *	  Spec: spec-5.6-cf-enqueue-shared-controlfile-authority.md
  *
  *-------------------------------------------------------------------------
  */
@@ -104,7 +104,7 @@ typedef enum ClusterCfBootstrapRole {
  *	OK				a symlink pointing at the expected shared authority.
  *	MISSING			the path does not exist.
  *	NOT_SYMLINK		a regular file -> a per-node local control file, which
- *					in cluster mode is a split-brain hazard (Da3 fail-closes).
+ *					in cluster mode is a split-brain hazard.
  *	WRONG_TARGET	a symlink, but to some other path (foreign authority).
  */
 typedef enum ClusterCfSymlinkStatus {
@@ -115,7 +115,7 @@ typedef enum ClusterCfSymlinkStatus {
 } ClusterCfSymlinkStatus;
 
 /*
- * ClusterCfStartupVerdict -- pure result of the Da3 startup gate: given how a
+ * ClusterCfStartupVerdict -- pure result of the startup gate: given how a
  * node's local control path classifies and whether the shared authority it
  * points at is readable and identity-matched, decide OK vs the specific
  * fail-closed reason.  Only meaningful when the authority feature is enabled
@@ -171,7 +171,7 @@ extern bool cluster_cf_storage_write_allowed(ClusterCfContractState state, bool 
  *	current storage uuid is known (non-empty), the persisted record names the
  *	same uuid, and the persisted state is exactly CROSSNODE_VERIFIED; every
  *	other case (no current identity, no record, a different uuid, or a weaker
- *	persisted state) resolves to UNVERIFIED so the B5 gate fails closed.  This
+ *	persisted state) resolves to UNVERIFIED so the gate fails closed.  This
  *	deliberately collapses the load result to {VERIFIED, UNVERIFIED}: a bare
  *	LOCAL_PROBED never unblocks a multi-node authority write.
  */
@@ -208,10 +208,11 @@ extern ClusterCfContractState cluster_cf_contract_load(const char *pgdata);
 /*
  * cluster_cf_contract_identity_resolve -- pure per-node identity verdict.  A
  * present, CRC-valid anchor whose bound system_identifier equals `shared_sysid`
- * (and whose storage uuid matches when both sides advertise one) is OK; every
- * other case (no anchor, torn anchor, storage swapped, or a foreign sysid) is a
- * specific FATAL reason.  The storage-uuid binding is enforced only when both
- * the anchor and the current storage carry a non-empty uuid.
+ * is OK; every other case (no anchor, torn anchor, storage swapped, or a foreign
+ * sysid) is a specific FATAL reason.  Once the anchor was bound to a storage uuid
+ * the current storage MUST advertise the same one -- an empty current uuid then
+ * fails closed (the sentinel is missing/corrupt).  A node bound without a uuid
+ * (no sentinel at migration) stays sysid-only.
  */
 extern ClusterCfIdentityVerdict cluster_cf_contract_identity_resolve(bool present, bool crc_ok,
 																	 const char *anchor_uuid,
@@ -260,7 +261,7 @@ extern ClusterCfBootstrapRole cluster_cf_bootstrap_role(bool multi_node, Cluster
 /*
  * cluster_cf_bootstrap_authority_gate -- write gate for the
  * bootstrap single-node-authority window: returns true only when sole-liveness
- * is proven (B4) AND the storage contract permits a single-node-authority
+ * is proven AND the storage contract permits a single-node-authority
  * write (single-node cluster, or cross-node rename visibility verified).  A
  * multi-node cluster that has never cross-node-verified the storage returns
  * false even if it believes it is the sole live node.
@@ -275,7 +276,7 @@ extern bool cluster_cf_bootstrap_authority_gate(bool multi_node, ClusterCfContra
  *	A no-op when the authority is off.  For a single-node cluster (or with
  *	cluster.enabled off) this node is trivially the sole authority, so the
  *	Phase-1 storage rename probe is run and the bootstrap write window is
- *	opened.  For a multi-node cluster it defers to the B3/B5 gate, which
+ *	opened.  For a multi-node cluster it defers to the gate, which
  *	fails closed until the storage has been cross-node verified (Phase-2);
  *	a failure raises FATAL rather than risk a split-brain control-file
  *	write.  Steady-state writes after startup use CF X instead.
@@ -309,7 +310,7 @@ extern bool cluster_cf_storage_probe_local(void);
 extern bool cluster_cf_migrate_and_link(const char *local_pgdata);
 
 /*
- * cluster_cf_startup_prepare -- Da3 startup hook, called once from the
+ * cluster_cf_startup_prepare -- startup hook, called once from the
  * postmaster before LocalProcessControlFile.  A no-op when
  * cluster.controlfile_shared_authority is off.  When on: migrate this node's
  * global/pg_control into the shared authority and symlink to it, then verify

@@ -2,14 +2,14 @@
  *
  * cluster_cf_storage.c
  *	  Establish and verify the shared pg_control authority on a node and
- *	  on the underlying shared storage (spec-5.6 Da2 / T6).
+ *	  on the underlying shared storage (spec-5.6).
  *
  *	  Covers migration of a per-node control file into the shared
  *	  authority plus a node-local symlink, classification of what a
  *	  node's local control path actually is, the Phase-1 local rename
  *	  probe, and the pure write-gate.  Phase-2 cross-node nonce+
  *	  ack verification (which needs the interconnect and a live peer) is
- *	  layered on by the bootstrap path (Db5) and exercised by t/289.
+ *	  layered on by the bootstrap path and exercised by t/289.
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
@@ -23,7 +23,7 @@
  *
  * NOTES
  *	  This is a pgrac-original file (no derivation from PostgreSQL).
- *	  Spec: spec-5.6-cf-enqueue-shared-controlfile-authority.md (Da2/T6)
+ *	  Spec: spec-5.6-cf-enqueue-shared-controlfile-authority.md
  *
  *-------------------------------------------------------------------------
  */
@@ -78,7 +78,7 @@ typedef struct ClusterCfContractRecord {
 } ClusterCfContractRecord;
 
 /*
- * cluster_cf_startup_verdict -- pure Da3 startup-gate decision.
+ * cluster_cf_startup_verdict -- pure startup-gate decision.
  *
  *	A node in authority mode must reach the shared authority through a
  *	symlink that points at it AND read a valid, identity-matched image;
@@ -263,9 +263,12 @@ cluster_cf_contract_load(const char *pgdata)
 
 /*
  * cluster_cf_contract_identity_resolve -- pure per-node identity verdict (see
- * header).  Storage-uuid binding is enforced only when both sides advertise a
- * uuid (the sentinel is optional); the bound authority system_identifier MUST
- * always match the authority being read.
+ * header).  Once a node was bound to a storage that advertised a uuid, the
+ * current storage must still advertise the SAME one: an empty current uuid means
+ * the shared-storage sentinel is missing/corrupt (or a sentinel-less snapshot
+ * was mounted) and cannot confirm identity -> fail closed.  A node bound without
+ * a uuid (no sentinel at migration) stays sysid-only.  The bound authority
+ * system_identifier MUST always match the authority being read.
  */
 ClusterCfIdentityVerdict
 cluster_cf_contract_identity_resolve(bool present, bool crc_ok, const char *anchor_uuid,
@@ -276,9 +279,12 @@ cluster_cf_contract_identity_resolve(bool present, bool crc_ok, const char *anch
 		return CLUSTER_CF_IDENTITY_FATAL_NO_ANCHOR;
 	if (!crc_ok)
 		return CLUSTER_CF_IDENTITY_FATAL_CRC;
-	if (anchor_uuid != NULL && anchor_uuid[0] != '\0' && current_uuid != NULL
-		&& current_uuid[0] != '\0' && strcmp(anchor_uuid, current_uuid) != 0)
-		return CLUSTER_CF_IDENTITY_FATAL_STORAGE;
+	if (anchor_uuid != NULL && anchor_uuid[0] != '\0') {
+		/* Bound to a uuid: the current storage must advertise the same one. */
+		if (current_uuid == NULL || current_uuid[0] == '\0'
+			|| strcmp(anchor_uuid, current_uuid) != 0)
+			return CLUSTER_CF_IDENTITY_FATAL_STORAGE;
+	}
 	if (anchor_sysid != shared_sysid)
 		return CLUSTER_CF_IDENTITY_FATAL_SYSID;
 	return CLUSTER_CF_IDENTITY_OK;
@@ -371,7 +377,7 @@ cluster_cf_bootstrap_role(bool multi_node, ClusterCfLiveness liveness,
 		/*
 			 * Sole live node of a multi-node cluster: it may take authority and
 			 * write during its own recovery, but only after the storage has
-			 * been cross-node verified (B5) -- otherwise a peer that reattaches
+			 * been cross-node verified -- otherwise a peer that reattaches
 			 * might not see these writes (split-brain hazard).
 			 */
 		return (contract == CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED) ? CLUSTER_CF_ROLE_OWNER
@@ -699,7 +705,7 @@ identity_verdict_detail(ClusterCfIdentityVerdict v)
 }
 
 /*
- * cluster_cf_startup_prepare -- Da3 startup hook (see header).
+ * cluster_cf_startup_prepare -- startup hook (see header).
  */
 void
 cluster_cf_startup_prepare(const char *pgdata)

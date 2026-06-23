@@ -542,8 +542,16 @@ UT_TEST(test_contract_identity_resolve)
 	/* no sentinel either side -> uuid binding skipped, sysid decides -> OK */
 	UT_ASSERT_EQ(cluster_cf_contract_identity_resolve(true, true, "", 100, "", 100),
 				 CLUSTER_CF_IDENTITY_OK);
-	/* one side lacks a uuid -> binding skipped (lenient), sysid still enforced */
-	UT_ASSERT_EQ(cluster_cf_contract_identity_resolve(true, true, "uA", 100, "", 200),
+	/* P1/P2 fix: anchor was bound to a uuid but the current storage advertises
+	 * none (sentinel lost/corrupt, or a sentinel-less same-sysid snapshot) ->
+	 * STORAGE, even with a matching sysid -- never a sysid-only pass. */
+	UT_ASSERT_EQ(cluster_cf_contract_identity_resolve(true, true, "uA", 100, "", 100),
+				 CLUSTER_CF_IDENTITY_FATAL_STORAGE);
+	/* anchor bound WITHOUT a uuid (no sentinel at migration) stays sysid-only,
+	 * even if a sentinel later appears. */
+	UT_ASSERT_EQ(cluster_cf_contract_identity_resolve(true, true, "", 100, "uB", 100),
+				 CLUSTER_CF_IDENTITY_OK);
+	UT_ASSERT_EQ(cluster_cf_contract_identity_resolve(true, true, "", 100, "uB", 200),
 				 CLUSTER_CF_IDENTITY_FATAL_SYSID);
 }
 
@@ -573,6 +581,13 @@ UT_TEST(test_contract_identity_check)
 
 	/* storage swapped under us (uuid changes) -> STORAGE FATAL */
 	strlcpy(g_storage_uuid, "ffffffffffffffffffffffffffffffff", sizeof(g_storage_uuid));
+	UT_ASSERT_EQ(cluster_cf_contract_identity_check(pgdata, 12345),
+				 CLUSTER_CF_IDENTITY_FATAL_STORAGE);
+
+	/* P1/P2 fix: the anchor was bound to a uuid but the current storage now
+	 * advertises none (sentinel missing/corrupt, or a sentinel-less same-sysid
+	 * snapshot) -> STORAGE, NOT a sysid-only pass even though the sysid matches. */
+	g_storage_uuid[0] = '\0';
 	UT_ASSERT_EQ(cluster_cf_contract_identity_check(pgdata, 12345),
 				 CLUSTER_CF_IDENTITY_FATAL_STORAGE);
 	strlcpy(g_storage_uuid, "00112233445566778899aabbccddeeff", sizeof(g_storage_uuid));
