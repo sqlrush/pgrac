@@ -610,6 +610,117 @@ UT_TEST(test_contract_identity_check)
 }
 
 /* ======================================================================
+ * One-time storage-uuid stamp: make the dormant uuid binding live (fill the
+ * anchor's storage uuid once after the sentinel is attached, then the
+ * same-sysid storage-swap check engages).  Spec: spec-5.6 Hardening v1.0.5.
+ * ====================================================================== */
+UT_TEST(test_contract_bind_decide)
+{
+	/* no anchor / torn anchor -> never fabricate an identity */
+	UT_ASSERT_EQ(cluster_cf_contract_bind_decide(false, false, NULL, "uA"),
+				 CLUSTER_CF_BIND_SKIP_NO_ANCHOR);
+	UT_ASSERT_EQ(cluster_cf_contract_bind_decide(true, false, "", "uA"),
+				 CLUSTER_CF_BIND_SKIP_NO_ANCHOR);
+	/* anchor already bound -> immutable, never overwrite (even if current differs) */
+	UT_ASSERT_EQ(cluster_cf_contract_bind_decide(true, true, "uA", "uB"),
+				 CLUSTER_CF_BIND_NOOP_ALREADY);
+	UT_ASSERT_EQ(cluster_cf_contract_bind_decide(true, true, "uA", "uA"),
+				 CLUSTER_CF_BIND_NOOP_ALREADY);
+	/* anchor empty + current unknown -> stay sysid-only (sentinel not ready) */
+	UT_ASSERT_EQ(cluster_cf_contract_bind_decide(true, true, "", ""), CLUSTER_CF_BIND_SKIP_NO_UUID);
+	UT_ASSERT_EQ(cluster_cf_contract_bind_decide(true, true, NULL, NULL),
+				 CLUSTER_CF_BIND_SKIP_NO_UUID);
+	/* anchor empty + current present -> FILL (trust on first use) */
+	UT_ASSERT_EQ(cluster_cf_contract_bind_decide(true, true, "", "uA"), CLUSTER_CF_BIND_FILL);
+	UT_ASSERT_EQ(cluster_cf_contract_bind_decide(true, true, NULL, "uA"), CLUSTER_CF_BIND_FILL);
+}
+
+UT_TEST(test_bind_storage_uuid)
+{
+	char pgdata[MAXPGPATH];
+	char pgdata2[MAXPGPATH];
+	char pgdata3[MAXPGPATH];
+	char pgdata4[MAXPGPATH];
+
+	make_tempdir(pgdata, sizeof(pgdata), "cfbind");
+
+	/* no anchor yet -> bind is a no-op, never fabricates one */
+	strlcpy(g_storage_uuid, "uA", sizeof(g_storage_uuid));
+	UT_ASSERT(!cluster_cf_contract_bind_storage_uuid(pgdata));
+	UT_ASSERT_EQ(cluster_cf_contract_identity_check(pgdata, 777),
+				 CLUSTER_CF_IDENTITY_FATAL_NO_ANCHOR);
+
+	/* migration persists the anchor while the sentinel is not yet attached, so the
+	 * anchor records an EMPTY storage uuid -- this is the dormant state we fix */
+	g_storage_uuid[0] = '\0';
+	UT_ASSERT(cluster_cf_contract_persist(pgdata, CLUSTER_CF_CONTRACT_LOCAL_PROBED, 777));
+
+	/* dormant: a same-sysid storage swap is NOT caught yet (uuid unbound) */
+	strlcpy(g_storage_uuid, "uA", sizeof(g_storage_uuid));
+	UT_ASSERT_EQ(cluster_cf_contract_identity_check(pgdata, 777), CLUSTER_CF_IDENTITY_OK);
+	strlcpy(g_storage_uuid, "uB", sizeof(g_storage_uuid));
+	UT_ASSERT_EQ(cluster_cf_contract_identity_check(pgdata, 777), CLUSTER_CF_IDENTITY_OK);
+
+	/* bind once against current = uA -> FILL */
+	strlcpy(g_storage_uuid, "uA", sizeof(g_storage_uuid));
+	UT_ASSERT(cluster_cf_contract_bind_storage_uuid(pgdata));
+
+	/* uuid gate is now LIVE: same storage OK, different same-sysid storage FATAL */
+	UT_ASSERT_EQ(cluster_cf_contract_identity_check(pgdata, 777), CLUSTER_CF_IDENTITY_OK);
+	strlcpy(g_storage_uuid, "uB", sizeof(g_storage_uuid));
+	UT_ASSERT_EQ(cluster_cf_contract_identity_check(pgdata, 777),
+				 CLUSTER_CF_IDENTITY_FATAL_STORAGE);
+
+	/* the bound sysid is preserved by the fill (a foreign sysid is still FATAL_SYSID) */
+	strlcpy(g_storage_uuid, "uA", sizeof(g_storage_uuid));
+	UT_ASSERT_EQ(cluster_cf_contract_identity_check(pgdata, 99999),
+				 CLUSTER_CF_IDENTITY_FATAL_SYSID);
+
+	/* idempotent + immutable: a second bind never overwrites the bound uuid */
+	strlcpy(g_storage_uuid, "uB", sizeof(g_storage_uuid));
+	UT_ASSERT(!cluster_cf_contract_bind_storage_uuid(pgdata));
+	strlcpy(g_storage_uuid, "uA", sizeof(g_storage_uuid));
+	UT_ASSERT_EQ(cluster_cf_contract_identity_check(pgdata, 777), CLUSTER_CF_IDENTITY_OK);
+
+	/* the persisted STATE survives the fill: a CROSSNODE_VERIFIED anchor written
+	 * with an empty uuid loads UNVERIFIED (uuid unbound); after the fill it
+	 * resolves VERIFIED, proving the RMW kept the state while filling the uuid */
+	make_tempdir(pgdata2, sizeof(pgdata2), "cfbind2");
+	g_storage_uuid[0] = '\0';
+	UT_ASSERT(cluster_cf_contract_persist(pgdata2, CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED, 888));
+	strlcpy(g_storage_uuid, "uC", sizeof(g_storage_uuid));
+	UT_ASSERT_EQ(cluster_cf_contract_load(pgdata2), CLUSTER_CF_CONTRACT_UNVERIFIED);
+	UT_ASSERT(cluster_cf_contract_bind_storage_uuid(pgdata2));
+	UT_ASSERT_EQ(cluster_cf_contract_load(pgdata2), CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED);
+
+	/* SKIP_NO_UUID: empty anchor + no current uuid -> no-op, anchor stays unbound
+	 * (a sentinel uuid appearing later must not retro-FATAL a sysid-only node) */
+	make_tempdir(pgdata3, sizeof(pgdata3), "cfbind3");
+	g_storage_uuid[0] = '\0';
+	UT_ASSERT(cluster_cf_contract_persist(pgdata3, CLUSTER_CF_CONTRACT_LOCAL_PROBED, 555));
+	UT_ASSERT(!cluster_cf_contract_bind_storage_uuid(pgdata3));
+	strlcpy(g_storage_uuid, "uD", sizeof(g_storage_uuid));
+	UT_ASSERT_EQ(cluster_cf_contract_identity_check(pgdata3, 555), CLUSTER_CF_IDENTITY_OK);
+
+	/* the once-entry gates on cluster.controlfile_shared_authority */
+	make_tempdir(pgdata4, sizeof(pgdata4), "cfbind4");
+	g_storage_uuid[0] = '\0';
+	UT_ASSERT(cluster_cf_contract_persist(pgdata4, CLUSTER_CF_CONTRACT_LOCAL_PROBED, 444));
+	strlcpy(g_storage_uuid, "uE", sizeof(g_storage_uuid));
+	cluster_controlfile_shared_authority = false;
+	cluster_cf_bind_storage_uuid_once(pgdata4); /* gated off -> no fill */
+	strlcpy(g_storage_uuid, "uF", sizeof(g_storage_uuid));
+	UT_ASSERT_EQ(cluster_cf_contract_identity_check(pgdata4, 444), CLUSTER_CF_IDENTITY_OK);
+	cluster_controlfile_shared_authority = true;
+	strlcpy(g_storage_uuid, "uE", sizeof(g_storage_uuid));
+	cluster_cf_bind_storage_uuid_once(pgdata4); /* gated on -> FILL */
+	strlcpy(g_storage_uuid, "uF", sizeof(g_storage_uuid));
+	UT_ASSERT_EQ(cluster_cf_contract_identity_check(pgdata4, 444),
+				 CLUSTER_CF_IDENTITY_FATAL_STORAGE);
+	cluster_controlfile_shared_authority = false; /* reset for later tests */
+}
+
+/* ======================================================================
  * Tri-state liveness assessment (Increment ii)
  * ====================================================================== */
 UT_TEST(test_assess_liveness)
@@ -677,7 +788,7 @@ UT_TEST(test_bootstrap_role)
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(15);
 	UT_RUN(test_write_allowed);
 	UT_RUN(test_symlink_status);
 	UT_RUN(test_probe_local);
@@ -689,6 +800,8 @@ main(void)
 	UT_RUN(test_contract_persist_load);
 	UT_RUN(test_contract_identity_resolve);
 	UT_RUN(test_contract_identity_check);
+	UT_RUN(test_contract_bind_decide);
+	UT_RUN(test_bind_storage_uuid);
 	UT_RUN(test_assess_liveness);
 	UT_RUN(test_bootstrap_role);
 	UT_DONE();

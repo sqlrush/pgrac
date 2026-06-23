@@ -43,7 +43,7 @@
  *
  * PGRAC MODIFICATIONS
  *	  Modified by: SqlRush <sqlrush@gmail.com>
- *	  Stages:       0.13, 0.14, 1.10
+ *	  Stages:       0.13, 0.14, 1.10, 5.6
  *
  *	  Added a comment in PostmasterMain explaining where pgrac cluster
  *	  initialization happens.  Call sites live in miscinit.c because PG
@@ -66,6 +66,13 @@
  *	    2026-05-03).  The call site here is in PostmasterMain only;
  *	    cluster_run_startup_sequence() also Asserts !IsUnderPostmaster
  *	    as a defense in depth.
+ *
+ *	  Stage 5.6 — shared control-file authority: cluster_cf_startup_prepare()
+ *	    migrates/symlinks the shared authority before LocalProcessControlFile,
+ *	    and cluster_cf_bind_storage_uuid_once() binds this node's identity
+ *	    anchor to the shared-storage uuid once after the sentinel is attached
+ *	    (right after CreateSharedMemoryAndSemaphores()).  Both are
+ *	    PostmasterMain-only (postmaster-once).
  *
  *	  Related design:
  *	    docs/cluster-guc-design.md v1.1 §2 (GUC entry-point policy)
@@ -1158,6 +1165,19 @@ PostmasterMain(int argc, char *argv[])
 	 * clean up dead IPC objects if the postmaster crashes and is restarted.
 	 */
 	CreateSharedMemoryAndSemaphores();
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: spec-5.6 — bind this node's control-file authority identity
+	 * anchor to the shared-storage uuid on first use.  The shared-storage
+	 * sentinel was attached inside CreateSharedMemoryAndSemaphores() above, so
+	 * the storage uuid is readable now (it was not at migration time in
+	 * cluster_cf_startup_prepare(), so the anchor recorded an empty uuid).
+	 * PostmasterMain-only -> postmaster-once; a no-op unless
+	 * cluster.controlfile_shared_authority is on.
+	 */
+	cluster_cf_bind_storage_uuid_once(DataDir);
+#endif
 
 	/*
 	 * Estimate number of openable files.  This must happen after setting up

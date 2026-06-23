@@ -230,6 +230,57 @@ extern ClusterCfIdentityVerdict cluster_cf_contract_identity_check(const char *p
 																   uint64 shared_sysid);
 
 /*
+ * ClusterCfBindAction -- pure decision for the one-time storage-uuid stamp that
+ * makes the identity anchor's storage-uuid binding go live.
+ *
+ *	FILL			anchor has no uuid and the current storage advertises one
+ *					-> fill it once (trust on first use).
+ *	NOOP_ALREADY	anchor already carries a uuid -> immutable, never overwrite
+ *					(a differing current uuid is a STORAGE fault caught by the
+ *					identity gate, not silently re-stamped here).
+ *	SKIP_NO_UUID	anchor has no uuid and neither does the current storage
+ *					(sentinel not yet attached/readable) -> stay sysid-only.
+ *	SKIP_NO_ANCHOR	no anchor, or a torn one -> never fabricate an identity.
+ */
+typedef enum ClusterCfBindAction {
+	CLUSTER_CF_BIND_FILL = 0,
+	CLUSTER_CF_BIND_NOOP_ALREADY,
+	CLUSTER_CF_BIND_SKIP_NO_UUID,
+	CLUSTER_CF_BIND_SKIP_NO_ANCHOR
+} ClusterCfBindAction;
+
+/*
+ * cluster_cf_contract_bind_decide -- pure decision (see ClusterCfBindAction).
+ * The storage-uuid binding is trust-on-first-use: an empty anchor uuid may be
+ * filled once from the current storage, but a non-empty anchor uuid is treated
+ * as immutable here.
+ */
+extern ClusterCfBindAction cluster_cf_contract_bind_decide(bool present, bool crc_ok,
+														   const char *anchor_uuid,
+														   const char *current_uuid);
+
+/*
+ * cluster_cf_contract_bind_storage_uuid -- read this node's anchor and, if it
+ * was recorded without a storage uuid (migration ran before the sentinel was
+ * attached) while the current storage now advertises one, fill the anchor's
+ * uuid once (RMW preserving the bound sysid + state, then CRC + durable_rename).
+ * Returns true iff a fill was written; false for every no-op (no/torn anchor,
+ * already bound, or no current uuid).  Never creates an anchor and never
+ * overwrites a bound uuid.
+ */
+extern bool cluster_cf_contract_bind_storage_uuid(const char *pgdata);
+
+/*
+ * cluster_cf_bind_storage_uuid_once -- postmaster-once entry, called once from
+ * PostmasterMain after CreateSharedMemoryAndSemaphores() (the shared-storage
+ * sentinel is attached there, so the storage uuid is first readable).  A no-op
+ * when cluster.controlfile_shared_authority is off; otherwise it fills this
+ * node's identity anchor with the storage uuid on first use so the same-sysid
+ * storage-swap check goes live.  Best-effort: logs once on a successful bind.
+ */
+extern void cluster_cf_bind_storage_uuid_once(const char *pgdata);
+
+/*
  * cluster_cf_verify_sole_liveness_or_fail -- positive proof that
  * this is the only live node, safe to take single-node authority before GES
  * is ready.  Requires ALL of: CSSD status == READY, qvotec in quorum, and

@@ -315,6 +315,69 @@ cluster_cf_contract_identity_check(const char *pgdata, uint64 shared_sysid)
 }
 
 /*
+ * cluster_cf_contract_bind_decide -- pure decision (see header).
+ */
+ClusterCfBindAction
+cluster_cf_contract_bind_decide(bool present, bool crc_ok, const char *anchor_uuid,
+								const char *current_uuid)
+{
+	if (!present || !crc_ok)
+		return CLUSTER_CF_BIND_SKIP_NO_ANCHOR;
+	if (anchor_uuid != NULL && anchor_uuid[0] != '\0')
+		return CLUSTER_CF_BIND_NOOP_ALREADY;
+	if (current_uuid == NULL || current_uuid[0] == '\0')
+		return CLUSTER_CF_BIND_SKIP_NO_UUID;
+	return CLUSTER_CF_BIND_FILL;
+}
+
+/*
+ * cluster_cf_contract_bind_storage_uuid -- fill the anchor's storage uuid once
+ * (see header).  Only a FILL decision writes; every other case is a no-op so a
+ * missing/torn anchor is never fabricated and a bound uuid is never overwritten.
+ */
+bool
+cluster_cf_contract_bind_storage_uuid(const char *pgdata)
+{
+	ClusterCfContractRecord rec;
+	char current_uuid[CLUSTER_SHARED_UUID_LEN];
+	bool present;
+	bool crc_ok = false;
+
+	present = read_contract_record(pgdata, &rec, &crc_ok);
+	cluster_shared_fs_get_storage_uuid(current_uuid, sizeof(current_uuid));
+	if (cluster_cf_contract_bind_decide(present, crc_ok, present ? rec.storage_uuid : NULL,
+										current_uuid)
+		!= CLUSTER_CF_BIND_FILL)
+		return false;
+
+	/*
+	 * Fill the uuid in place; write_contract_record recomputes the CRC.  The
+	 * bound system_identifier and the contract state are left exactly as read,
+	 * so the identity anchor and any cross-node verification are preserved.
+	 */
+	strlcpy(rec.storage_uuid, current_uuid, sizeof(rec.storage_uuid));
+	return write_contract_record(pgdata, &rec);
+}
+
+/*
+ * cluster_cf_bind_storage_uuid_once -- postmaster-once entry (see header).
+ */
+void
+cluster_cf_bind_storage_uuid_once(const char *pgdata)
+{
+	if (!cluster_controlfile_shared_authority)
+		return;
+	if (cluster_cf_contract_bind_storage_uuid(pgdata)) {
+		char uuid[CLUSTER_SHARED_UUID_LEN];
+
+		cluster_shared_fs_get_storage_uuid(uuid, sizeof(uuid));
+		ereport(LOG, (errmsg("cluster: bound control-file authority anchor to "
+							 "shared-storage uuid %s",
+							 uuid)));
+	}
+}
+
+/*
  * cluster_cf_assess_liveness -- tri-state liveness (see header).
  */
 ClusterCfLiveness

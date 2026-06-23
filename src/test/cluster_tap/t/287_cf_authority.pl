@@ -34,6 +34,13 @@
 #          control file fails closed (the anchor catches the foreign sysid).
 #      L7  per-node identity anchor (P0): a migrated node whose anchor is
 #          missing fails closed (never re-trusts the symlink target blindly).
+#      L8  storage-uuid identity: a migrated, uuid-bound node whose shared
+#          storage is swapped for a different one carrying the SAME
+#          system_identifier but a different storage uuid (sentinel) fails
+#          closed -- the same-sysid swap is caught only because the anchor's
+#          storage-uuid binding is filled live on first use after attach.
+#      L9  no false-FATAL: a plain restart on the unchanged storage starts
+#          cleanly once that storage-uuid binding is live.
 #
 #    The two-node "same inode" + concurrent-checkpoint legs are t/288/t/289.
 #
@@ -198,6 +205,73 @@ ok(!$r7, "L7: a migrated node with no identity anchor fails to start");
 my $l7 = PostgreSQL::Test::Utils::slurp_file($n7->logfile);
 like($l7, qr/no identity anchor|identity check failed/i,
 	"L7: the failure is the missing-anchor identity gate (no blind re-trust)");
+
+# ---- L8/L9: storage-uuid identity binding goes live.  The storage uuid lives
+#         in the shared sentinel (pgrac_shared.control), not in pg_control; it is
+#         bound into the per-node anchor once, after the sentinel is attached.
+#         A node whose storage is swapped for a DIFFERENT physical storage that
+#         carries the SAME control-file authority (same system_identifier) but a
+#         different storage uuid must fail closed -- and a plain restart on the
+#         unchanged storage must NOT false-FATAL now that the uuid gate is live.
+my $shared8 = PostgreSQL::Test::Utils::tempdir();
+make_path("$shared8/global");
+my $n8 = PostgreSQL::Test::Cluster->new('cf_auth_uuidswap');
+$n8->init;
+$n8->append_conf(
+	'postgresql.conf', qq{
+cluster.enabled = off
+cluster.lms_enabled = off
+cluster.shared_data_dir = '$shared8'
+cluster.shared_storage_backend = cluster_fs
+cluster.node_id = 0
+cluster.controlfile_shared_authority = on
+});
+$n8->start;    # migrates, then binds the anchor to the storage uuid after attach
+$n8->stop;
+
+my $anchor8 = $n8->data_dir . "/global/pgrac_cf_contract";
+ok(-f $anchor8, "L8: the node recorded a per-node identity anchor");
+
+# L9: a restart on the UNCHANGED storage must start cleanly (anchor uuid ==
+# current uuid); the now-live uuid gate must not false-FATAL a legitimate start.
+my $r9 = $n8->start(fail_ok => 1);
+ok($r9, "L9: a restart on the same storage starts cleanly (no false uuid FATAL)");
+$n8->stop if $r9;
+
+# Build a foreign storage: a throwaway node on a SEPARATE root generates its own
+# random storage uuid in <root>/pgrac_shared.control.
+my $shared8b = PostgreSQL::Test::Utils::tempdir();
+make_path("$shared8b/global");
+my $n8b = PostgreSQL::Test::Cluster->new('cf_auth_uuidswap_src');
+$n8b->init;
+$n8b->append_conf(
+	'postgresql.conf', qq{
+cluster.enabled = off
+cluster.lms_enabled = off
+cluster.shared_data_dir = '$shared8b'
+cluster.shared_storage_backend = cluster_fs
+cluster.node_id = 0
+cluster.controlfile_shared_authority = on
+});
+$n8b->start;
+$n8b->stop;
+
+# Swap ONLY the sentinel under $shared8 for the foreign one (a different, valid,
+# non-empty storage uuid), leaving $shared8/global/pg_control (same
+# system_identifier) untouched -- so this exercises the storage-uuid mismatch
+# path, not the missing/empty-uuid path.
+my $sentinel  = "$shared8/pgrac_shared.control";
+my $sentinelb = "$shared8b/pgrac_shared.control";
+ok(-f $sentinelb && -s $sentinelb > 0,
+	"L8: the foreign storage generated a non-empty sentinel (different uuid)");
+require File::Copy;
+File::Copy::copy($sentinelb, $sentinel) or die "swap sentinel: $!";
+
+my $r8 = $n8->start(fail_ok => 1);
+ok(!$r8, "L8: a same-sysid storage swap (different storage uuid) fails closed");
+my $l8 = PostgreSQL::Test::Utils::slurp_file($n8->logfile);
+like($l8, qr/storage identity changed|identity check failed/i,
+	"L8: the failure is the storage-uuid identity gate (not a blind accept)");
 
 done_testing();
 
