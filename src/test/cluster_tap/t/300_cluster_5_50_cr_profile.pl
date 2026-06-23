@@ -52,6 +52,9 @@
 #	  spec-5.50 M1/M4); this test asserts COUNTER behaviour, which is
 #	  release/debug-invariant.
 #
+#	  Author: SqlRush <sqlrush@gmail.com>
+#	  Portions Copyright (c) 2026, pgrac contributors
+#
 #	  Spec: spec-5.50-cr-read-path-profile.md (FROZEN v1.0 + errata 1)
 #
 #-------------------------------------------------------------------------
