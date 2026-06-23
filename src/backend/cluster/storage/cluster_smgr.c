@@ -887,6 +887,12 @@ cluster_smgr_invalidate_unlink_pending(RelFileLocator rlocator)
 	 */
 	cluster_smgr_close_handle_for_rlocator(rlocator);
 	cluster_smgr_remote_invalidation_inc();
+	/*
+	 * spec-5.51 D5: the shared CR pool lifecycle epoch is bumped in
+	 * smgrdounlinkall (smgr.c) for ANY relfilenode unlink — not here, because
+	 * this hook only fires for cluster_smgr-routed relations, which is too
+	 * narrow for the CR pool (it caches images for md.c relations too).
+	 */
 }
 
 

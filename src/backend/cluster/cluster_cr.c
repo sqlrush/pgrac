@@ -48,8 +48,9 @@
 #include "cluster/cluster_cr.h"
 #include "cluster/cluster_cr_apply.h"
 #include "cluster/cluster_cr_cache.h"
-#include "cluster/cluster_conf.h" /* spec-3.24 D1: cluster_conf_has_peers */
-#include "cluster/cluster_guc.h"  /* cluster_cr_chain_walk_max_steps, cluster_node_id */
+#include "cluster/cluster_cr_pool.h" /* spec-5.51 D4: shared L2 CR pool */
+#include "cluster/cluster_conf.h"	 /* spec-3.24 D1: cluster_conf_has_peers */
+#include "cluster/cluster_guc.h"	 /* cluster_cr_chain_walk_max_steps, cluster_node_id */
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_itl.h"
 #include "cluster/cluster_recovery_merge.h" /* PGRAC: spec-4.5a is_materialized */
@@ -834,23 +835,50 @@ const char *
 cluster_cr_lookup_or_construct(Buffer buf, SCN read_scn)
 {
 	/*
-	 * spec-3.10 D3: probe the backend-local CR cache; on a hit serve the
-	 * immutable cached image (no construction).  On a miss, reserve a victim
-	 * slot, construct the full-block CR directly into it (two-phase: a throwing
-	 * construction never commits the slot), then commit + return.  Disabled
-	 * (max_blocks == 0): lookup always misses, victim_slot returns the fallback
-	 * buffer, so this degrades to plain construction.
+	 * spec-3.10 D3 + spec-5.51 D4: two-level CR cache.
+	 *
+	 *  L1 = backend-local cache (cluster_cr_cache.c).  L2 = per-instance shared
+	 *  CR pool (cluster_cr_pool.c), behind L1, consulted on an L1 miss.  L2 is
+	 *  disabled by default (cluster_cr_pool_current_epoch() == 0); when disabled
+	 *  this degrades EXACTLY to the spec-3.10 L1-only path (zero behavior
+	 *  change).
+	 *
+	 *  Lifecycle epoch gate (spec-5.51 §3.4/§3.5, all returning paths checked):
+	 *   - entry: capture start_epoch; if it changed since this backend last saw
+	 *     it, reset L1 (a DROP/TRUNCATE/sinval since the last call may have left
+	 *     stale-epoch L1 entries).
+	 *   - L1 hit: recheck the epoch before returning; if it advanced mid-lookup,
+	 *     reset L1 and fall through to reconstruct (never return a stale L1 hit).
+	 *   - construct/publish: two-phase, construction OUTSIDE the L2 lock; an
+	 *     ereport aborts the L2 reservation (PG_CATCH).
+	 *   - commit: recheck the epoch; if it advanced during construction, serve
+	 *     the (correct, just-built) image to the caller but skip caching it in
+	 *     L1 (serve-but-skip-cache) so no stale-epoch entry persists.
 	 */
 	ClusterCRCacheKey key = cr_build_cache_key(buf, read_scn);
+	static uint64 cr_last_seen_pool_epoch = 0; /* backend-local */
+	uint64 start_epoch;
 	const char *hit;
 	char *slot;
 	bool evicted = false;
 
+	start_epoch = cluster_cr_pool_current_epoch(); /* 0 when L2 disabled */
+	if (start_epoch != 0 && start_epoch != cr_last_seen_pool_epoch) {
+		cluster_cr_cache_reset(); /* spec-5.51 D4: L1 epoch-flush on lifecycle bump */
+		cr_last_seen_pool_epoch = start_epoch;
+	}
+
 	hit = cluster_cr_cache_lookup(&key);
 	if (hit != NULL) {
-		if (CRShared != NULL)
-			pg_atomic_fetch_add_u64(&CRShared->cr_cache_hit_count, 1);
-		return hit;
+		/* spec-5.51: recheck epoch before returning the L1 hit. */
+		if (start_epoch == 0 || cluster_cr_pool_current_epoch() == start_epoch) {
+			if (CRShared != NULL)
+				pg_atomic_fetch_add_u64(&CRShared->cr_cache_hit_count, 1);
+			return hit;
+		}
+		/* epoch advanced mid-lookup: the L1 hit may be stale -> drop + rebuild */
+		cluster_cr_cache_reset();
+		start_epoch = cr_last_seen_pool_epoch = cluster_cr_pool_current_epoch();
 	}
 	if (CRShared != NULL)
 		pg_atomic_fetch_add_u64(&CRShared->cr_cache_miss_count, 1);
@@ -859,9 +887,49 @@ cluster_cr_lookup_or_construct(Buffer buf, SCN read_scn)
 	if (evicted && CRShared != NULL)
 		pg_atomic_fetch_add_u64(&CRShared->cr_cache_evict_count, 1);
 
-	/* Construct INTO the reserved slot.  ereports on failure with the slot
-	 * left uncommitted (invalid -> never served). */
-	(void)cluster_cr_construct_block_into(buf, read_scn, slot);
+	/* spec-5.51 D4: L2 probe (copy-out into the L1 victim slot).  On an L2 hit,
+	 * the image is now in L1; commit + return. */
+	if (start_epoch != 0 && cluster_cr_pool_lookup_copy(&key, slot)) {
+		cluster_cr_cache_commit_slot();
+		if (CRShared != NULL)
+			pg_atomic_fetch_add_u64(&CRShared->cr_cache_install_count, 1);
+		return slot;
+	}
+
+	/* L1+L2 miss: construct.  Two-phase L2 insert with construction outside the
+	 * L2 lock; an ereport mid-construction must release the L2 reservation. */
+	{
+		ClusterCRPoolHandle ph;
+		bool reserved = false;
+
+		if (start_epoch != 0)
+			reserved = cluster_cr_pool_reserve(&key, &ph);
+
+		if (reserved) {
+			PG_TRY();
+			{
+				(void)cluster_cr_construct_block_into(buf, read_scn, slot);
+				cluster_cr_pool_publish(&ph, slot);
+				reserved = false;
+			}
+			PG_CATCH();
+			{
+				cluster_cr_pool_abort(&ph);
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
+		} else {
+			/* L2 disabled / no reservation: bare construct (spec-3.10 path). */
+			(void)cluster_cr_construct_block_into(buf, read_scn, slot);
+		}
+	}
+
+	/* spec-5.51 §3.4: commit-time epoch recheck.  If a lifecycle bump happened
+	 * during construction, serve the freshly-built (correct) image but do NOT
+	 * commit it to L1 (the L1 slot stays invalid -> not served to later
+	 * lookups), so no stale-epoch entry persists. */
+	if (start_epoch != 0 && cluster_cr_pool_current_epoch() != start_epoch)
+		return slot;
 
 	cluster_cr_cache_commit_slot();
 	if (CRShared != NULL)
