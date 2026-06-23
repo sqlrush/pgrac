@@ -44,7 +44,7 @@
  * backup, joined under cluster.shared_data_dir.  The primary keeps the
  * stock "global/pg_control" relative name so the per-node symlink target
  * is a fixed, well-known path that backend ReadControlFile and frontend
- * pg_controldata open transparently (spec §3.9 T1).
+ * pg_controldata open transparently.
  */
 #define CLUSTER_CF_REL_PATH "global/pg_control"
 #define CLUSTER_CF_BAK_REL_PATH "global/pg_control.bak"
@@ -80,7 +80,7 @@ typedef enum ClusterCfValidity {
  *					AND passed the strict (non-CRC-only) acceptance check;
  *					use it (a corruption-recovery path, not the hot path).
  *	FAILCLOSED		neither image can be trusted -> caller must raise a
- *					FATAL/ERROR rather than proceed (spec §3.1 A3).
+ *					FATAL/ERROR rather than proceed.
  */
 typedef enum ClusterCfReadSource {
 	CLUSTER_CF_SOURCE_PRIMARY = 0,
@@ -108,7 +108,7 @@ extern const char *cluster_cf_bak_path(void);
  * cluster_cf_decide_source: given the primary and .bak classifications plus
  * whether the .bak passed the strict acceptance check, decide which source
  * to trust.  A .bak that is merely CRC-valid but failed the strict check is
- * never used (it could be CRC-correct yet stale/unreplayable, spec §3.9 T3).
+ * never used (it could be CRC-correct yet stale/unreplayable).
  */
 extern ClusterCfValidity cluster_cf_classify_buffer(const char *buf, size_t len,
 													uint64 expected_sysid);
@@ -117,7 +117,7 @@ extern ClusterCfReadSource cluster_cf_decide_source(ClusterCfValidity primary,
 
 /*
  * cluster_cf_bak_strict_ok: strict (non-CRC-only) acceptance of a .bak image
- * before it is trusted as a corruption-recovery fallback (spec §3.9 T3).
+ * before it is trusted as a corruption-recovery fallback.
  * Pure: true iff `bak` is non-NULL, its system_identifier matches
  * `expected_sysid` when that is non-zero, and `checkpoint_recoverable` is
  * true.  Recoverability is computed by the (impure) probe below and passed

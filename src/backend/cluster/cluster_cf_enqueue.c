@@ -169,7 +169,7 @@ cluster_cf_lock(LOCKMODE mode)
 			 * NOT_AVAIL (try conflict; CF blocks so this is unexpected),
 			 * timeout, LMS-unavailable, deadlock, internal, etc.  The lock
 			 * could not be proven held: fail closed.  The caller raises the
-			 * appropriate FATAL/ERROR (CF correctness, spec §3.1 A3).
+			 * appropriate FATAL/ERROR (CF correctness).
 			 */
 		cluster_cf_counter_inc(CLUSTER_CF_FAILCLOSED);
 		return false;

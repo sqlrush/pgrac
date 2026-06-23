@@ -18,7 +18,7 @@
  *
  *	  Cross-node freshness of a renamed image is NOT guaranteed by POSIX
  *	  rename alone and is established separately by the storage
- *	  rename-contract probe (spec §3.9 T6, Da2).
+ *	  rename-contract probe.
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
@@ -129,7 +129,7 @@ cluster_cf_classify_buffer(const char *buf, size_t len, uint64 expected_sysid)
  *	A valid primary always wins.  The .bak is used only when it is valid
  *	AND passed the strict acceptance check (bak_strict_ok): a .bak that is
  *	merely CRC-valid but stale/unreplayable must not silently override a
- *	corrupt primary (spec §3.9 T3).  Otherwise fail-closed.
+ *	corrupt primary.  Otherwise fail-closed.
  */
 ClusterCfReadSource
 cluster_cf_decide_source(ClusterCfValidity primary, ClusterCfValidity bak, bool bak_strict_ok)
@@ -145,7 +145,7 @@ cluster_cf_decide_source(ClusterCfValidity primary, ClusterCfValidity bak, bool 
  * cluster_cf_bak_strict_ok -- strict (non-CRC-only) .bak acceptance (Dc2).
  *
  *	The caller has already classified the .bak as structurally VALID; this
- *	adds the spec §3.9 T3 conditions a corruption-recovery fallback must also
+ *	adds the conditions a corruption-recovery fallback must also
  *	satisfy: a matching system_identifier (when an expected one is known) and
  *	a checkpoint that is still recoverable.  A .bak that is merely CRC-correct
  *	but stale, foreign, or whose WAL is gone is rejected -- silently replaying
@@ -220,11 +220,11 @@ cluster_cf_authority_read(ControlFileData *out)
 	 * the .bak is taken only when it is structurally valid AND its checkpoint
 	 * is still recoverable (the redo WAL segment exists).  A .bak that is
 	 * merely CRC-correct but stale/unreplayable is rejected so recovery never
-	 * silently restarts from an unreachable checkpoint (spec §3.9 T3).  No
+	 * silently restarts from an unreachable checkpoint.  No
 	 * independent expected identity exists at this layer -- the primary, the
 	 * only same-storage reference, is the corrupt image -- so the identity leg
 	 * is skipped here (0); the symlink/migrate gates already reject a foreign
-	 * authority at startup (§3.2 M3).
+	 * authority at startup.
 	 */
 	if (bv == CLUSTER_CF_VALID) {
 		ControlFileData bak_cf;

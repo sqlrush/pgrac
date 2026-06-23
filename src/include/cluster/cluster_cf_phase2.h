@@ -22,7 +22,7 @@
  *	       peer's write back).
  *
  *	  When both directions verify, the node persists CROSSNODE_VERIFIED
- *	  (bound to the storage uuid) so the multi-node bootstrap gate (§3.3 B5)
+ *	  (bound to the storage uuid) so the multi-node bootstrap gate
  *	  may proceed.  On timeout (no peer, or storage that does not give
  *	  cross-node rename visibility) it returns false and the gate fails
  *	  closed.
@@ -39,7 +39,7 @@
  *
  * NOTES
  *	  This is a pgrac-original file (no derivation from PostgreSQL).
- *	  Spec: spec-5.6-cf-enqueue-shared-controlfile-authority.md (§3.9 T6)
+ *	  Spec: spec-5.6-cf-enqueue-shared-controlfile-authority.md
  *
  *-------------------------------------------------------------------------
  */

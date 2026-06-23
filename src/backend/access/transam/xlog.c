@@ -4309,11 +4309,11 @@ UpdateControlFile(void)
 	 *	  bootstrap single-node authority during owner recovery) -> write it;
 	 *	- join read-only (this attaching node recovers while a live peer owns the
 	 *	  authority) -> skip this recovery-progress write rather than clobber the
-	 *	  owner's (ARCH DECISION #5) -- a documented skip, not a silent fallback;
+	 *	  owner's -- a documented skip, not a silent fallback;
 	 *	- otherwise -> an unserialized write to the cluster-wide recovery root,
-	 *	  which is a correctness hazard (§3.1 A2 / §3.5 O2): fail closed loudly
-	 *	  (规则 8.A).  This also covers the out-of-scope standby/PITR restartpoint
-	 *	  writer (§1.3), which has neither CF X nor the window.  PANIC because
+	 *	  which is a correctness hazard: fail closed loudly
+	 *	  .  This also covers the out-of-scope standby/PITR restartpoint
+	 *	  writer, which has neither CF X nor the window.  PANIC because
 	 *	  some callers (CreateCheckPoint) run inside a critical section.
 	 *
 	 * This whole branch is inert unless the authority is explicitly enabled
@@ -4354,7 +4354,7 @@ UpdateControlFile(void)
  *	be replayed from on this node: the WAL segment holding its redo start must
  *	exist under pg_wal.  Returns false (fail-closed) for an invalid redo
  *	pointer or a missing segment, so cluster_cf_authority_read() never trusts a
- *	CRC-valid-but-stale .bak whose WAL has already been recycled (spec §3.9 T3).
+ *	CRC-valid-but-stale .bak whose WAL has already been recycled.
  *
  *	Defined here in xlog.c, where the WAL segment naming and size live;
  *	declared in cluster_cf_authority.h and stubbed by the cluster_unit
@@ -6054,7 +6054,7 @@ StartupXLOG(void)
 	 * still TT_SLOT_ACTIVE belongs to a transaction that was in flight at crash;
 	 * resolve each to TT_SLOT_ABORTED unless its owning xact committed or is a
 	 * resurrected prepared xact, so cluster visibility never treats an
-	 * in-flight-at-crash transaction as committed (规则 8.A).  Runs once here in
+	 * in-flight-at-crash transaction as committed .  Runs once here in
 	 * the startup process, before backends are allowed to connect.  No-op unless
 	 * cluster.enabled + cluster.tt_recovery_resolve_active.
 	 */
@@ -6111,13 +6111,13 @@ StartupXLOG(void)
 #ifdef USE_PGRAC_CLUSTER
 
 	/*
-	 * PGRAC MODIFICATIONS (spec-5.6 increment (iv) / ARCH DECISION #4): recovery
+	 * PGRAC MODIFICATIONS (spec-5.6 increment (iv)): recovery
 	 * is complete and the startup process has performed its last shared-authority
 	 * control-file write (the RECOVERY_STATE_DONE update above; the promotion
 	 * checkpoint at hand is delegated to the checkpointer, which takes CF X).
 	 * Close the bootstrap single-node-authority window so every subsequent
 	 * control-file write goes through real CF X serialization -- steady-state
-	 * writes must never rely on the bootstrap flag (规则 8.A; the latent gap was
+	 * writes must never rely on the bootstrap flag (the latent gap was
 	 * that the window, once opened, was never cleared).  A no-op when the
 	 * authority is off or the window was never opened (a join read-only node).
 	 */
@@ -6840,10 +6840,10 @@ CreateCheckPoint(int flags)
 	 * (run by the checkpointer, not the startup process, so it is not covered
 	 * by the bootstrap window) serializes its control-file writes cluster-wide
 	 * by holding CF X across the whole checkpoint -- taken here, BEFORE the
-	 * critical section (规则16: no GES lock inside a critical section; lock
+	 * critical section (no GES lock inside a critical section; lock
 	 * order CF X -> ControlFileLock), released at every exit below.  Under CF
 	 * X we refresh the in-memory control file from the shared authority so this
-	 * checkpoint does not clobber a peer's concurrent update (§3.4 R4).  No-op
+	 * checkpoint does not clobber a peer's concurrent update.  No-op
 	 * unless the authority is enabled; skipped during the bootstrap window
 	 * (which already permits the write and runs before GES is ready).
 	 */

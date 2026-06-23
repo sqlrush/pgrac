@@ -9,10 +9,10 @@
  *	  byte so its enqueue lives in its own namespace, distinct from any PG
  *	  LockTagType.  The GES request/grant path only hashes the 16-byte
  *	  resid for shard/master routing and never decodes it back to a real
- *	  LOCKTAG, so a synthetic high type value is safe (spec §0.4 F0-15).
+ *	  LOCKTAG, so a synthetic high type value is safe.
  *	  Unlike SQ (which shipped option B), CF genuinely enqueues through GES
  *	  because pg_control is not buffer-managed and cannot ride a shared
- *	  page (spec §0.4 F0-18) -- this is the faithful Oracle CF enqueue.
+ *	  page -- this is the faithful Oracle CF enqueue.
  *
  *	  CF is a singleton: one whole-file lock, all resid fields zero.  X
  *	  serializes writers; S gives a strong-consistency reader mutual
@@ -85,7 +85,7 @@ extern void cluster_cf_unlock(LOCKMODE mode);
 /*
  * cluster_cf_held -- true if this backend currently holds the CF lock in the
  * given mode.  Used by the write path to Assert the caller-level CF X is held
- * before an authority write (spec-5.6 Db3 / §3.5 O2).
+ * before an authority write (spec-5.6 Db3).
  */
 extern bool cluster_cf_held(LOCKMODE mode);
 
@@ -120,10 +120,10 @@ extern bool cluster_cf_in_bootstrap_window(void);
  * (ii).  Mark this process as an attaching (join) node whose recovery runs
  * while a live peer owns the shared authority.  A join node must NOT write the
  * shared authority: its recovery-progress control-file writes are deliberately
- * skipped (not clobbering writes, ARCH DECISION #5).  This is a POSITIVE signal,
+ * skipped (not clobbering writes).  This is a POSITIVE signal,
  * distinct from "write permission unexpectedly absent" (which is a bug and
  * fails closed), so the write path never silently drops a write it should have
- * made (规则 8.A: no silent fallback).
+ * made (no silent fallback).
  */
 extern void cluster_cf_set_join_readonly(bool on);
 extern bool cluster_cf_join_readonly(void);
