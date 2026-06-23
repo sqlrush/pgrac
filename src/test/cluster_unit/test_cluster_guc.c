@@ -224,6 +224,12 @@ int cluster_injection_armed_count = 0;
  */
 int cluster_pcm_grd_max_entries = -1;
 
+/* spec-5.51 stub: CR pool GUC storage lives in cluster_cr_pool.c, which is not
+ * linked into this standalone test;  cluster_guc.c references the externs via
+ * DefineCustomBool/IntVariable, so provide link-only stubs (mirror real defaults). */
+bool cluster_shared_cr_pool_enabled = false;
+int cluster_shared_cr_pool_size_blocks = 0;
+
 /* spec-3.10 stub: cluster_cr_cache_max_blocks lives in cluster_cr_cache.c
  * (not linked here); cluster_guc.c references it via DefineCustomIntVariable. */
 int cluster_cr_cache_max_blocks = 64;

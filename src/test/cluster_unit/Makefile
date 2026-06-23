@@ -43,7 +43,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_itl_cleanout test_cluster_visibility_inject test_cluster_itl_cleanout_perf \
         test_cluster_heap_lock_tuple test_cluster_perf_gates \
         test_cluster_subtrans test_cluster_multixact test_cluster_undo_format \
-        test_cluster_undo_record test_cluster_undo_lifecycle test_cluster_cr test_cluster_cr_cache test_cluster_tt_durable \
+        test_cluster_undo_record test_cluster_undo_lifecycle test_cluster_cr test_cluster_cr_cache test_cluster_cr_pool test_cluster_tt_durable \
         test_cluster_retention test_cluster_undo_cleaner test_cluster_visibility_variants test_cluster_tt_2pc \
         test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_undo_extent \
         test_cluster_wal_thread test_cluster_wal_state test_cluster_recovery_plan \
@@ -1392,5 +1392,16 @@ test_cluster_cr_cache: test_cluster_cr_cache.c unit_test.h \
 		$(CLUSTER_CR_CACHE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_CR_CACHE_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-5.51: test_cluster_cr_pool — shared CR buffer pool substrate
+# (cluster_cr_pool.o + cluster_cr_cache.o for canonical key_equal) with
+# malloc-backed shmem + no-op LWLock stubs.
+CLUSTER_CR_POOL_O = $(top_builddir)/src/backend/cluster/cluster_cr_pool.o
+test_cluster_cr_pool: test_cluster_cr_pool.c unit_test.h \
+		$(CLUSTER_CR_POOL_O) $(CLUSTER_CR_CACHE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_CR_POOL_O) $(CLUSTER_CR_CACHE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@

@@ -95,6 +95,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_undo_record_api.h"  /* cluster_undo_* counter accessors (spec-3.7 D10) */
 #include "cluster/storage/cluster_undo_buf.h" /* spec-3.18 D7: undo buffer counters */
 #include "cluster/cluster_cr.h"				  /* cluster_cr_* counter accessors (spec-3.9 D8) */
+#include "cluster/cluster_cr_pool.h"		  /* cluster_cr_pool_* counters (spec-5.51 D9) */
 #include "cluster/cluster_wal_state.h"		  /* wal_state registry dump (spec-4.2 D5) */
 #include "cluster/cluster_wal_thread.h"		  /* wal_thread dump accessors (spec-4.1 D7) */
 #include "cluster/cluster_tt_durable.h"		  /* cluster_tt_durable_* counters (spec-3.11 D8) */
@@ -2240,6 +2241,20 @@ dump_cr(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_cr_xmax_invalid_or_ambiguous_count()));
 	emit_row(rsinfo, "cr", "cr_xmax_scan_unavail_or_no_proof_count",
 			 fmt_int64((int64)cluster_cr_xmax_scan_unavail_or_no_proof_count()));
+	/* spec-5.51 D9: dedicated shared CR buffer pool (L2) counters.  All 0 when
+	 * the pool is disabled (cluster.shared_cr_pool_size_blocks == 0). */
+	emit_row(rsinfo, "cr_pool", "current_epoch", fmt_int64((int64)cluster_cr_pool_current_epoch()));
+	emit_row(rsinfo, "cr_pool", "live_entries", fmt_int64((int64)cluster_cr_pool_live_entries()));
+	emit_row(rsinfo, "cr_pool", "hit_count", fmt_int64((int64)cluster_cr_pool_hit_count()));
+	emit_row(rsinfo, "cr_pool", "miss_count", fmt_int64((int64)cluster_cr_pool_miss_count()));
+	emit_row(rsinfo, "cr_pool", "reserve_count", fmt_int64((int64)cluster_cr_pool_reserve_count()));
+	emit_row(rsinfo, "cr_pool", "publish_count", fmt_int64((int64)cluster_cr_pool_publish_count()));
+	emit_row(rsinfo, "cr_pool", "abort_count", fmt_int64((int64)cluster_cr_pool_abort_count()));
+	emit_row(rsinfo, "cr_pool", "evict_count", fmt_int64((int64)cluster_cr_pool_evict_count()));
+	emit_row(rsinfo, "cr_pool", "epoch_bump_count",
+			 fmt_int64((int64)cluster_cr_pool_epoch_bump_count()));
+	emit_row(rsinfo, "cr_pool", "publish_stale_release_count",
+			 fmt_int64((int64)cluster_cr_pool_publish_stale_release_count()));
 }
 
 

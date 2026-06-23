@@ -223,6 +223,69 @@ uint64 cluster_write_fence_get_baseline_published(void);
 bool cluster_write_fence_get_baseline_author_is_self(void);
 uint64 cluster_write_fence_get_baseline_authority_age_us(void);
 bool cluster_write_fence_startup_self_check(void);
+/* spec-5.51 dump_cr_pool stubs: cluster_debug.c's dump_cr_pool reads the CR pool
+ * counters, but this standalone binary does not link cluster_cr_pool.o. */
+uint64 cluster_cr_pool_current_epoch(void);
+uint64 cluster_cr_pool_hit_count(void);
+uint64 cluster_cr_pool_miss_count(void);
+uint64 cluster_cr_pool_reserve_count(void);
+uint64 cluster_cr_pool_publish_count(void);
+uint64 cluster_cr_pool_abort_count(void);
+uint64 cluster_cr_pool_evict_count(void);
+uint64 cluster_cr_pool_epoch_bump_count(void);
+uint64 cluster_cr_pool_publish_stale_release_count(void);
+int cluster_cr_pool_live_entries(void);
+uint64
+cluster_cr_pool_current_epoch(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_pool_hit_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_pool_miss_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_pool_reserve_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_pool_publish_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_pool_abort_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_pool_evict_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_pool_epoch_bump_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_pool_publish_stale_release_count(void)
+{
+	return 0;
+}
+int
+cluster_cr_pool_live_entries(void)
+{
+	return 0;
+}
+
 /* spec-5.7 dump_hw stubs: cluster_debug.c's dump_hw reads the HW counters, but
  * this standalone binary does not link cluster_hw_shmem.o. */
 uint64 cluster_hw_alloc_count(void);

@@ -405,6 +405,19 @@ void
 cluster_tt_status_hint_shmem_register(void)
 {}
 
+/* spec-5.51 stub: cluster_init_shmem_module / RequestAddinShmemSpace path also
+ * registers the dedicated CR pool region + its LWLock tranche (cluster_cr_pool.c
+ * is not linked into this standalone test).  The GUC storage sizes the region,
+ * so stub those too (mirror real defaults). */
+bool cluster_shared_cr_pool_enabled = false;
+int cluster_shared_cr_pool_size_blocks = 0;
+void
+cluster_cr_pool_shmem_register(void)
+{}
+void
+cluster_cr_pool_request_lwlocks(void)
+{}
+
 /* spec-5.2 D4/D6 stub: cluster_init_shmem_module also calls
  * cluster_tx_enqueue_shmem_register. */
 void

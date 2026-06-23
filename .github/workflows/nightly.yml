@@ -149,7 +149,7 @@ jobs:
           - { name: stage3-recent,     ranges: "228-237", unit: false, regress: false }
           - { name: stage4-wal,        ranges: "242-248 273 275", unit: false, regress: false }
           - { name: stage4-hardgate,   ranges: "274-274", unit: false, regress: false }
-          - { name: stage5-ges-locking, ranges: "276-300 302", unit: false, regress: false }
+          - { name: stage5-ges-locking, ranges: "276-300 302 303", unit: false, regress: false }
     steps:
       - name: Checkout
         uses: actions/checkout@v4
