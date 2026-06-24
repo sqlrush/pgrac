@@ -457,7 +457,7 @@ hw_snapshot_capture_and_write(ClusterHwSnapshotKind kind, XLogRecPtr snapshot_ls
 {
 	ClusterHwSnapshotEntry *entries;
 	HASH_SEQ_STATUS seq;
-	ClusterHwEntry *e;
+	const ClusterHwEntry *e;
 	uint32 n = 0;
 	uint32 self;
 
@@ -619,7 +619,7 @@ cluster_hw_reply_slot_wait(uint64 request_id, long timeout_ms, HwAllocReply *out
 	deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), timeout_ms);
 
 	for (;;) {
-		ClusterHwReplyEntry *entry;
+		const ClusterHwReplyEntry *entry;
 		bool ready = false;
 		long ms;
 		TimestampTz now;

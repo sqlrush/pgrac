@@ -60,7 +60,7 @@ static bool probe_held = false;
 Datum
 cluster_ts_acquire_probe(PG_FUNCTION_ARGS)
 {
-	char *mode_s;
+	const char *mode_s;
 	char *kind_s;
 	char *key_s;
 	bool do_hold;

@@ -303,7 +303,7 @@ ok(defined $postgres_bin && -x $postgres_bin,
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-	'128', 'M1 128 injection points (spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2 undo boundary guards; was 125)');
+	'129', 'M1 129 injection points (spec-5.7 D6 +1 ko-peer-skip-ack; spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2 undo boundary guards)');
 
 is($node->safe_psql('postgres',
 		q{SELECT string_agg(name, ',' ORDER BY name) FROM pg_stat_cluster_injections WHERE name LIKE 'cluster-init-%'}),
@@ -333,8 +333,8 @@ ok( $node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT key) FROM pg_cluster_state
 		   WHERE category='inject' AND (key LIKE '%.fault_type' OR key LIKE '%.hits')}
-	) eq '256',
-	'M5 inject category has 128×2 = 256 sub-keys (.fault_type + .hits; spec-4.8ab +2 points)');
+	) eq '258',
+	'M5 inject category has 129×2 = 258 sub-keys (.fault_type + .hits; spec-5.7 D6 +1 ko-peer-skip-ack)');
 
 is($node->get_cluster_state_value('inject', 'armed_count'),
 	'0', 'M6 inject.armed_count starts at 0 in fresh backend');
@@ -368,8 +368,8 @@ ok($node->safe_psql('postgres',
 
 is($node->safe_psql('postgres',
 		q{SELECT string_agg(DISTINCT category, ',' ORDER BY category) FROM pg_cluster_state}),
-	'advisory,block_format,buffer_format,cf,cluster_cssd,cluster_stats,conf,cr,diag,gcs,gcs_recovery,ges,grd,grd_recovery,guc,ic,inject,lck,lmd,lmon,lms,pcm,pgstat,phase,recovery,scn,sequence,shared_fs,shmem,sinval,tt_2pc,tt_recovery,tt_status,tt_status_hint,undo,undo_cleaner,visibility,wal_thread,write_fence',
-	'O2 pg_cluster_state has all 39 categories (cf added in spec-5.6)');
+	'advisory,block_format,buffer_format,cf,cluster_cssd,cluster_stats,conf,cr,diag,dl,gcs,gcs_recovery,ges,grd,grd_recovery,guc,hw,ic,inject,ir,ko,lck,lmd,lmon,lms,pcm,pgstat,phase,recovery,scn,sequence,shared_fs,shmem,sinval,ts,tt_2pc,tt_recovery,tt_status,tt_status_hint,undo,undo_cleaner,visibility,wal_thread,write_fence',
+	'O2 pg_cluster_state has all 44 categories (spec-5.7 adds hw + dl + ir + ts + ko)');
 
 is($node->safe_psql('postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE value IS NULL}),

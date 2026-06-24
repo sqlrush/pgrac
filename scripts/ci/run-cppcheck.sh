@@ -144,6 +144,12 @@ SHAREDFS_SUPP=(
   # Assert(region != NULL); region->name pattern that triggers the
   # PG-Assert false positive (PG's Assert is non-trapping to cppcheck).
   --suppress=nullPointerRedundantCheck:src/backend/cluster/cluster_shmem.c
+  # Reason: same Assert(ptr != NULL); ptr->field defensive pattern as
+  # cluster_shmem.c above -- PG Assert is non-trapping to cppcheck, so it
+  # flags the post-Assert null check as redundant in these cluster files.
+  --suppress=nullPointerRedundantCheck:src/backend/cluster/cluster_dl_lock.c
+  --suppress=nullPointerRedundantCheck:src/backend/cluster/cluster_hw_snapshot.c
+  --suppress=nullPointerRedundantCheck:src/backend/cluster/cluster_ts_lock.c
   # Reason: spec-2.3 D1 cluster_ic_envelope.h uses pg_attribute_packed()
   # macro from c.h to honor spec-2.0 §4 frozen offsets (uint64 epoch at
   # offset 12 / scn at offset 20 are non-8-aligned naturally; without

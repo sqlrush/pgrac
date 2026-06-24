@@ -7191,8 +7191,10 @@ CreateCheckPoint(int flags)
 	 * No-op unless the HW authority is active (multi-node + shared storage).
 	 * Must be outside the critical section below -- it does durable file I/O.
 	 */
+#ifdef USE_PGRAC_CLUSTER
 	if (cluster_hw_authority_active())
 		cluster_hw_snapshot_checkpoint_write(checkPoint.redo);
+#endif
 
 	START_CRIT_SECTION();
 

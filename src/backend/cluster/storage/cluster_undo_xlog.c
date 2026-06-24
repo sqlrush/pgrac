@@ -237,14 +237,14 @@ cluster_hw_emit_reserve(RelFileLocator rloc, ForkNumber fork, BlockNumber new_hw
 static void
 cluster_hw_redo_reserve(XLogReaderState *record)
 {
-	xl_hw_reserve *rec;
+	const xl_hw_reserve *rec;
 	RelFileLocator rloc;
 	ClusterResId resid;
 
 	if (XLogRecGetDataLen(record) != sizeof(*rec))
 		ereport(PANIC,
 				(errmsg("invalid XLOG_HW_RESERVE record length: %u", XLogRecGetDataLen(record))));
-	rec = (xl_hw_reserve *)XLogRecGetData(record);
+	rec = (const xl_hw_reserve *)XLogRecGetData(record);
 
 	rloc.dbOid = rec->dbOid;
 	rloc.relNumber = rec->relNumber;

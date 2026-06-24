@@ -238,13 +238,13 @@ hw_wal_reader_free(XLogReaderState *reader, HwWalReadPrivate *priv)
 static void
 hw_apply_reserve_record(XLogReaderState *record)
 {
-	xl_hw_reserve *rec;
+	const xl_hw_reserve *rec;
 	RelFileLocator rloc;
 	ClusterResId resid;
 
 	if (XLogRecGetDataLen(record) != sizeof(*rec))
 		return; /* malformed: skip (the boundary scan validated record framing) */
-	rec = (xl_hw_reserve *)XLogRecGetData(record);
+	rec = (const xl_hw_reserve *)XLogRecGetData(record);
 
 	rloc.spcOid = rec->spcOid;
 	rloc.dbOid = rec->dbOid;
@@ -284,8 +284,8 @@ hw_scan_reserve_tail(uint16 dead_tid, XLogRecPtr lower, XLogRecPtr upper)
 	}
 
 	for (;;) {
-		char *errmsg = NULL;
-		XLogRecord *record = XLogReadRecord(reader, &errmsg);
+		char *errormsg = NULL;
+		const XLogRecord *record = XLogReadRecord(reader, &errormsg);
 
 		if (record == NULL)
 			break; /* clean end-of-stream or read error -- checked against upper below */
