@@ -67,6 +67,11 @@
 #include "cluster/cluster_epoch.h"			/* cluster_epoch_shmem_register (2.4) */
 #include "cluster/cluster_scn.h"			/* cluster_scn_shmem_register (1.15) */
 #include "cluster/cluster_sequence.h"		/* cluster_sequence_shmem_register (spec-5.4 D1) */
+#include "cluster/cluster_hw.h"				/* cluster_hw_shmem_register (spec-5.7 D1) */
+#include "cluster/cluster_dl.h"				/* cluster_dl_shmem_register (spec-5.7 D4) */
+#include "cluster/cluster_ir.h"				/* cluster_ir_shmem_register (spec-5.7 D8) */
+#include "cluster/cluster_ts.h"				/* cluster_ts_shmem_register (spec-5.7 D5) */
+#include "cluster/cluster_ko.h"				/* cluster_ko_shmem_register (spec-5.7 D6) */
 #include "cluster/cluster_ges.h"			/* cluster_ges_shmem_register (spec-2.13) */
 #include "cluster/cluster_advisory.h"		/* cluster_advisory_shmem_register (spec-5.5 D8) */
 #include "cluster/cluster_cf_stats.h"		/* cluster_cf_stats_shmem_register (spec-5.6 Dc4) */
@@ -729,6 +734,26 @@ cluster_init_shmem_module(void)
 	/* spec-5.4 D1: register SQ sequence instance cache + counters region. */
 	if (cluster_shmem_lookup_region("pgrac cluster sequence") == NULL)
 		cluster_sequence_shmem_register();
+
+	/* spec-5.7 D1: register HW relation-extend block-number authority region. */
+	if (cluster_shmem_lookup_region("pgrac cluster hw") == NULL)
+		cluster_hw_shmem_register();
+
+	/* spec-5.7 D4: register DL bulk-load lease counters region. */
+	if (cluster_shmem_lookup_region("pgrac cluster dl") == NULL)
+		cluster_dl_shmem_register();
+
+	/* spec-5.7 D8: register IR instance-recovery owner counters region. */
+	if (cluster_shmem_lookup_region("pgrac cluster ir") == NULL)
+		cluster_ir_shmem_register();
+
+	/* spec-5.7 D5: register TT tablespace-DDL lock counters region. */
+	if (cluster_shmem_lookup_region("pgrac cluster ts") == NULL)
+		cluster_ts_shmem_register();
+
+	/* spec-5.7 D6: register KO object-reuse flush counters + inbound ring region. */
+	if (cluster_shmem_lookup_region("pgrac cluster ko") == NULL)
+		cluster_ko_shmem_register();
 }
 
 

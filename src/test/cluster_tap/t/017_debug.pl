@@ -63,8 +63,8 @@ is( $node->safe_psql(
 		'postgres',
 		q{SELECT string_agg(DISTINCT category, ',' ORDER BY category)
 		    FROM pg_cluster_state}),
-	'advisory,block_format,buffer_format,cf,cluster_cssd,cluster_stats,conf,cr,diag,gcs,gcs_recovery,ges,grd,grd_recovery,guc,ic,inject,lck,lmd,lmon,lms,pcm,pgstat,phase,recovery,scn,sequence,shared_fs,shmem,sinval,tt_2pc,tt_recovery,tt_status,tt_status_hint,undo,undo_cleaner,visibility,wal_thread,write_fence',
-	'all 39 categories appear (spec-5.6 adds cf;L122 alphabetic verify)');
+	'advisory,block_format,buffer_format,cf,cluster_cssd,cluster_stats,conf,cr,diag,dl,gcs,gcs_recovery,ges,grd,grd_recovery,guc,hw,ic,inject,ir,ko,lck,lmd,lmon,lms,pcm,pgstat,phase,recovery,scn,sequence,shared_fs,shmem,sinval,ts,tt_2pc,tt_recovery,tt_status,tt_status_hint,undo,undo_cleaner,visibility,wal_thread,write_fence',
+	'all 44 categories appear (spec-5.7 adds hw + dl + ir + ts + ko;L122 alphabetic verify)');
 
 
 # ----------
@@ -123,15 +123,15 @@ is( $node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='inject' AND key LIKE '%.fault_type'}),
-	'128',
-	'all 128 injection points have a .fault_type entry under inject category (spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2)');
+	'129',
+	'all 129 injection points have a .fault_type entry under inject category (spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2)');
 
 is( $node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='inject' AND key LIKE '%.hits'}),
-	'128',
-	'all 128 injection points have a .hits entry under inject category (spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2)');
+	'129',
+	'all 129 injection points have a .hits entry under inject category (spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2)');
 
 
 # ----------

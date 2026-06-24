@@ -513,6 +513,16 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 */
 	{ .name = "undo-force-wal-before-data-violation" },
 	{ .name = "undo-skip-checkpoint-flush-one" },
+
+	/* spec-5.7 D6 (1 NEW point) — KO object-reuse flush barrier fail-closed.
+	 *
+	 *	ko-peer-skip-ack:
+	 *	  SKIP fault inside cluster_ko_drain_inbound_and_apply on the PEER.
+	 *	  When armed, the peer still flushes + drops the relfilenode's buffers
+	 *	  but does NOT send the KO_FLUSH_ACK, so the dropping node's barrier
+	 *	  times out and fails closed (53RAA) -- proves the apply-after-drop
+	 *	  fail-closed path deterministically (t/297 L2). */
+	{ .name = "cluster-ko-peer-skip-ack" },
 };
 
 #define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_points)

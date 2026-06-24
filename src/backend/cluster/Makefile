@@ -85,7 +85,23 @@ OBJS = \
 	cluster_thread_recovery_orchestrator_srf.o \
 	cluster_thread_recovery_worker.o \
 	cluster_remote_xact.o \
+	cluster_dl.o \
+	cluster_dl_lock.o \
+	cluster_ir.o \
+	cluster_ir_lock.o \
+	cluster_ir_srf.o \
+	cluster_ts.o \
+	cluster_ts_lock.o \
+	cluster_ts_srf.o \
+	cluster_ko.o \
+	cluster_ko_lock.o \
+	cluster_ko_srf.o \
 	cluster_guc.o \
+	cluster_hw.o \
+	cluster_hw_shmem.o \
+	cluster_hw_ic.o \
+	cluster_hw_remaster.o \
+	cluster_hw_snapshot.o \
 	cluster_ic.o \
 	cluster_ic_chunk.o \
 	cluster_ic_envelope.o \

@@ -183,7 +183,22 @@ typedef enum ClusterICMsgType {
 		   * clients + LMON (the P5 chunked scan runs in the LMON reconfig tick).
 		   * recv-time envelope version reject (P1#5) is centralized in
 		   * cluster_ic_envelope.c. */
-	/* values 22..255 available for future sub-spec; never reuse 0..21 */
+	,
+	PGRAC_IC_MSG_HW_ALLOC = 22,		  /* PGRAC: spec-5.7a D1 — HW relation-extend block-range
+		   * request (HwAllocRequest fixed payload).  A backend holding HW(X) sends it
+		   * to the resid's GES master; the master advances the authority HWM and
+		   * flushes an HW_RESERVE record (HW_SEED on first sight) before replying. */
+	PGRAC_IC_MSG_HW_ALLOC_REPLY = 23, /* PGRAC: spec-5.7a D1 — HW block-range reply
+		   * (HwAllocReply: first_block + granted + status), master -> the originating
+		   * backend, correlated by request_id. */
+	PGRAC_IC_MSG_KO_FLUSH = 24,		  /* PGRAC: spec-5.7 D6 — KO object-reuse flush request
+		   * (KoFlushHeader: relfilenode + fork + first_block + batch_id).  The dropping
+		   * node fanouts it to every alive peer before physically removing/truncating the
+		   * relfilenode; the peer drops the buffers and replies KO_FLUSH_ACK. */
+	PGRAC_IC_MSG_KO_FLUSH_ACK = 25	  /* PGRAC: spec-5.7 D6 — KO apply-after-drop ACK
+		   * (KoFlushAckHeader: batch_id + acker_node + status), peer -> the dropping node,
+		   * sent ONLY after the peer has really dropped the relfilenode's buffers. */
+	/* values 26..255 available for future sub-spec; never reuse 0..25 */
 } ClusterICMsgType;
 
 

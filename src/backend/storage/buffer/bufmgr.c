@@ -56,6 +56,8 @@
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_guc.h"		/* spec-4.7a D2 — cluster_gcs_block_local_cache */
 #include "cluster/cluster_block_recovery.h" /* spec-4.10 D1 — online block recovery */
+#include "cluster/cluster_conf.h"			/* spec-5.7 HW — cluster_conf_node_count */
+#include "cluster/cluster_hw.h"				/* spec-5.7 HW — relation-extend authority */
 
 /*
  * PGRAC (spec-4.10 D1): ignore_checksum_failure is defined in bufpage.c with
@@ -1967,6 +1969,48 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	IOContext	io_context = IOContextForStrategy(strategy);
 	instr_time	io_start;
 
+#ifdef USE_PGRAC_CLUSTER
+	/*----------
+	 * PGRAC MODIFICATIONS — spec-5.7 HW (relation-extend block-number authority).
+	 *
+	 * The PG-native extend below sources the block number from the local file
+	 * size (first_block = smgrnblocks).  In a multi-node cluster that is unsafe:
+	 * two nodes can read the same stale-low size (non-coherent storage, L368)
+	 * and allocate the same block range -> silent corruption.  For a GLOBALIZE
+	 * relation the range comes from the cluster authority (cluster_hw_allocate
+	 * under HW(X)) instead.
+	 *
+	 * Scope (only the genuinely racy case is globalized; everything else stays
+	 * PG-native):
+	 *   - fork == MAIN_FORKNUM only.  FSM/VM forks use positional extend-to (a
+	 *     block addresses a fixed heap range) and are page-coordinated by Cache
+	 *     Fusion, so the sequential authority does not apply to them.
+	 *   - multi-node only (cluster_conf_node_count() > 1); a single node has no
+	 *     cross-node coherence problem (and avoids a per-extend WAL flush).
+	 *   - live backend extends only (bmr.rel != NULL && !RecoveryInProgress());
+	 *     recovery redo replays deterministic block numbers from WAL and rebuilds
+	 *     the authority via HW_RESERVE redo.
+	 * An unlogged relation in a multi-node cluster classifies FAIL_CLOSED and is
+	 * rejected here (53RA6), before any buffer/lock work.
+	 *----------
+	 */
+	ClusterHwClass hwc = CLUSTER_HW_NATIVE_LOCAL;
+	HwLock		hwlk;
+	ClusterResId hw_resid;
+
+	if (cluster_relation_extend_lock_enabled && bmr.rel != NULL && cluster_node_id >= 0
+		&& fork == MAIN_FORKNUM && cluster_conf_node_count() > 1 && !RecoveryInProgress())
+	{
+		hwc = cluster_hw_classify_persistence(bmr.rel->rd_rel->relpersistence, true);
+		if (hwc == CLUSTER_HW_FAIL_CLOSED)
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
+					 errmsg("unlogged relation \"%s\" cannot be safely extended in a multi-node cluster",
+							RelationGetRelationName(bmr.rel)),
+					 errhint("Unlogged relations have no WAL authority to coordinate cross-node extension.")));
+	}
+#endif
+
 	LimitAdditionalPins(&extend_by);
 
 	/*
@@ -2003,6 +2047,39 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	 * Note that another backend might have extended the relation by the time
 	 * we get the lock.
 	 */
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * §3.1a M1a lock order: HW(X) (cross-node) BEFORE LockRelationForExtension
+	 * (local), so a backend never holds the local extension lock while waiting
+	 * cross-node.  DL (the bulk-load lease, spec-5.7 D4) is already held by the
+	 * caller above when this is a bulk load.  HW is held only across the
+	 * allocate; it is a synthetic resid (not auto-released by LockReleaseAll),
+	 * so the brief window relies on reconfig-revoke (AD-013) + backend-exit
+	 * cleanup as the backstop on an error path, mirroring CF (spec-5.6).
+	 */
+	if (hwc == CLUSTER_HW_GLOBALIZE)
+	{
+		cluster_hw_resid_encode(RelationGetSmgr(bmr.rel)->smgr_rlocator.locator, fork, &hw_resid);
+		if (!cluster_hw_lock(&hw_resid, &hwlk))
+		{
+			/* release the victim buffers pinned above (the extension lock is not
+			 * held yet) before failing closed, symmetric with the allocate-fail
+			 * path below (review P2). */
+			for (uint32 i = 0; i < extend_by; i++)
+			{
+				BufferDesc *buf_hdr = GetBufferDescriptor(buffers[i] - 1);
+
+				StrategyFreeBuffer(buf_hdr);
+				UnpinBuffer(buf_hdr);
+			}
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
+					 errmsg("could not acquire the cluster relation-extend lock for \"%s\"",
+							RelationGetRelationName(bmr.rel))));
+		}
+	}
+#endif
+
 	if (!(flags & EB_SKIP_EXTENSION_LOCK))
 	{
 		LockRelationForExtension(bmr.rel, ExclusiveLock);
@@ -2017,6 +2094,71 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	if (flags & EB_CLEAR_SIZE_CACHE)
 		bmr.smgr->smgr_cached_nblocks[fork] = InvalidBlockNumber;
 
+#ifdef USE_PGRAC_CLUSTER
+	if (hwc == CLUSTER_HW_GLOBALIZE)
+	{
+		uint32		hw_granted = 0;
+		BlockNumber seed_nblocks;
+
+		/*
+		 * §3.1c Q14/Q17 establishment seed: a FORCED re-stat of the fork's real
+		 * size (invalidate the smgr_cached_nblocks cache first so smgrnblocks
+		 * re-stats the shared file, not a stale cache).  We hold HW(X), so the
+		 * size is quiescent (no concurrent authority extend) and -- on cluster_fs
+		 * -- the shared file's EOF is physically coherent (Q14).  The master uses
+		 * this ONLY at first establishment, to own a relation whose first blocks
+		 * were created by a non-authority path (private build, sequence create)
+		 * from its true EOF; for an established resid the master ignores it and
+		 * the authority counter is the sole source (FileSize never read again).
+		 */
+		bmr.smgr->smgr_cached_nblocks[fork] = InvalidBlockNumber;
+		seed_nblocks = smgrnblocks(bmr.smgr, fork);
+
+		/*
+		 * The block range is the cluster authority's, not the file size.  HW(X)
+		 * is released right after the allocate: the granted ranges are disjoint
+		 * across nodes, so smgrzeroextend of distinct ranges is safe without it
+		 * held.  The authority may grant fewer blocks than requested; release
+		 * the surplus victim buffers (mirroring the extend_upto path below).
+		 */
+		first_block = cluster_hw_allocate(RelationGetSmgr(bmr.rel)->smgr_rlocator.locator, fork,
+										  extend_by, seed_nblocks, &hw_granted);
+		cluster_hw_unlock(&hwlk);
+
+		if (first_block == InvalidBlockNumber || hw_granted == 0)
+		{
+			/* fail closed: release the extension lock + all victim buffers, then
+			 * raise 53RA6 (we are outside any critical section). */
+			if (!(flags & EB_SKIP_EXTENSION_LOCK))
+				UnlockRelationForExtension(bmr.rel, ExclusiveLock);
+			for (uint32 i = 0; i < extend_by; i++)
+			{
+				BufferDesc *buf_hdr = GetBufferDescriptor(buffers[i] - 1);
+
+				StrategyFreeBuffer(buf_hdr);
+				UnpinBuffer(buf_hdr);
+			}
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
+					 errmsg("cluster relation-extend authority unavailable for \"%s\"",
+							RelationGetRelationName(bmr.rel)),
+					 errhint("The HW_ALLOC round trip to the resource master could not be proven; retry.")));
+		}
+
+		if (hw_granted < extend_by)
+		{
+			for (uint32 i = hw_granted; i < extend_by; i++)
+			{
+				BufferDesc *buf_hdr = GetBufferDescriptor(buffers[i] - 1);
+
+				StrategyFreeBuffer(buf_hdr);
+				UnpinBuffer(buf_hdr);
+			}
+			extend_by = hw_granted;
+		}
+	}
+	else
+#endif
 	first_block = smgrnblocks(bmr.smgr, fork);
 
 	/*

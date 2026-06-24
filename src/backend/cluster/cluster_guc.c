@@ -471,6 +471,17 @@ bool cluster_local_fast_path_enabled = true;
 bool cluster_advisory_lock_enabled = true;
 
 /*
+ * spec-5.7 HW: gate the cluster relation-extend block-number authority.  on =
+ * permanent shared relations are extended through the cluster authority (HW(X) +
+ * HW_ALLOC).  off = forensic/test-only UNSAFE downgrade: extends fall back to
+ * the PG-native local FileSize path, which silently corrupts in a multi-node
+ * cluster (two nodes can allocate the same block range).  PGC_SUSET.
+ */
+bool cluster_relation_extend_lock_enabled = true;
+bool cluster_tablespace_ddl_lock_enabled = true; /* spec-5.7 TT */
+bool cluster_object_reuse_flush_enabled = true;	 /* spec-5.7 KO */
+
+/*
  * spec-2.22 D9:cluster.lmd_max_wait_edges cap.  Default 1024.
  * PGC_POSTMASTER — postmaster restart required to resize HTAB.
  */
@@ -1761,6 +1772,39 @@ cluster_init_guc(void)
 		gettext_noop("off reverts to pre-4.12a behaviour where record segments were never "
 					 "reclaimed (the leak); gates only the optimization, never the 8.A guard."),
 		&cluster_undo_record_segment_commit_on_rollover, true, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	/* spec-5.7 HW: cluster relation-extend block-number authority gate. */
+	DefineCustomBoolVariable(
+		"cluster.relation_extend_lock_enabled",
+		gettext_noop(
+			"Extend permanent shared relations through the cluster block-number authority."),
+		gettext_noop(
+			"off is a forensic/test-only UNSAFE downgrade: extends revert to the PG-native "
+			"local FileSize path, which silently corrupts in a multi-node cluster."),
+		&cluster_relation_extend_lock_enabled, true, PGC_SUSET, 0, NULL, NULL, NULL);
+
+	/* spec-5.7 TT (§3.3): cross-node mutex around CREATE/DROP/ALTER/RENAME
+	 * TABLESPACE + the placement-DDL TT(S) in-use guard. */
+	DefineCustomBoolVariable(
+		"cluster.tablespace_ddl_lock_enabled",
+		gettext_noop("Serialise tablespace DDL (CREATE/DROP/ALTER/RENAME) across the cluster."),
+		gettext_noop(
+			"off reverts to the PG-native local-only catalog locks, which do not coordinate "
+			"concurrent tablespace DDL between nodes."),
+		&cluster_tablespace_ddl_lock_enabled, true, PGC_SUSET, 0, NULL, NULL, NULL);
+
+	/* spec-5.7 KO (§3.5): cross-node object-reuse flush barrier before a
+	 * relation's storage is physically removed/truncated (DROP/TRUNCATE/VACUUM
+	 * truncation). */
+	DefineCustomBoolVariable(
+		"cluster.object_reuse_flush_enabled",
+		gettext_noop(
+			"Flush a relation's buffers on every peer before its storage is removed or truncated."),
+		gettext_noop(
+			"off skips the cross-node flush barrier: a peer's stale dirty buffers could be written "
+			"back after the file is unlinked, recreating the file or corrupting a reused "
+			"relfilenode in a multi-node cluster."),
+		&cluster_object_reuse_flush_enabled, true, PGC_SUSET, 0, NULL, NULL, NULL);
 
 	/* spec-2.5 D9: 3 NEW CSSD GUCs (PGC_POSTMASTER per spec §2.3 — applied
 	 * at postmaster init;hot-reload via SIGHUP not supported because

@@ -53,6 +53,7 @@
 #include "cluster/cluster_ges_mode.h" /* spec-5.3 D1 — ges_mode_convert_class for UPGRADE filter */
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_ir.h" /* spec-5.7 D8 — CLUSTER_IR_RESID_TYPE (freeze-gate bypass belt) */
 #include "cluster/cluster_inject.h" /* spec-4.6 L11/L14 — redeclare-skip probe */
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_lms.h"
@@ -634,7 +635,20 @@ cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *req)
 	{
 		uint32 gate_shard = cluster_grd_shard_for_resource(&req->resid);
 
-		if (cluster_grd_shard_phase(gate_shard) != GRD_SHARD_NORMAL) {
+		/*
+		 * spec-5.7 D8 (IR-M5) fresh-epoch bypass: an IR instance-recovery acquire
+		 * runs inside the freeze window (the recovery worker takes IR(X) while its
+		 * shard is still REBUILDING, and P7->NORMAL is itself gated on that recovery
+		 * finishing).  A (dead_node, NEW_epoch) IR resid is brand new this episode,
+		 * so there is NO holder set being rebuilt for it -- the freeze gate's only
+		 * purpose (not granting against a half-rebuilt holder set) is vacuous.  Skip
+		 * the phase check for it (flag + resid-type belt); the normal grant/conflict
+		 * path below is unchanged, so cross-survivor mutual exclusion still holds.
+		 */
+		bool ir_bootstrap_bypass
+			= (req->recovery_bootstrap && req->resid.type == CLUSTER_IR_RESID_TYPE);
+
+		if (!ir_bootstrap_bypass && cluster_grd_shard_phase(gate_shard) != GRD_SHARD_NORMAL) {
 			TimestampTz gate_deadline;
 
 			if (req->dontwait)

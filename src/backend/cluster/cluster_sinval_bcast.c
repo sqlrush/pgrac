@@ -30,6 +30,7 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_ko.h" /* cluster_ko_drain_inbound_and_apply (spec-5.7 D6) */
 #include "cluster/cluster_sinval.h"
 #include "cluster/cluster_sinval_bcast.h"
 #include "libpq/pqsignal.h"
@@ -38,16 +39,21 @@
 #include "postmaster/interrupt.h"
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
+#include "storage/condition_variable.h"
+#include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lmgr.h"
+#include "storage/lwlock.h"
 #include "storage/proc.h"
 #include "storage/procsignal.h"
 #include "storage/smgr.h"
 #include "tcop/tcopprot.h"
 #include "utils/elog.h"
+#include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
+#include "utils/resowner.h"
 #include "utils/wait_event.h"
 
 
@@ -65,6 +71,7 @@ void
 SinvalBcastMain(void)
 {
 	sigjmp_buf local_sigjmp_buf;
+	MemoryContext sinval_bcast_context;
 
 	Assert(IsUnderPostmaster);
 
@@ -91,14 +98,51 @@ SinvalBcastMain(void)
 	cluster_sinval_register_proc_latch(MyLatch);
 	before_shmem_exit(SinvalBcastBeforeShmemExit, (Datum)0);
 
-	/* Error context for unexpected ereport ERROR — log and continue.
-	 * Skeleton scope: minimal error handling (no buffer/lock/smgr cleanup
-	 * because aux process performs no DB-level transactions; just ring
-	 * buffer + IC send/recv).  Hardening can add full PG aux error
-	 * scaffolding when DDL hook lands in spec-2.39. */
+	/*
+	 * Work in a dedicated, reset-able memory context so a single drain cycle's
+	 * allocations (e.g. the per-relation array FlushRelationsAllBuffers palloc's
+	 * for the KO peer-apply drain) cannot accumulate in TopMemoryContext.  Modeled
+	 * on bgwriter.c.
+	 */
+	sinval_bcast_context
+		= AllocSetContextCreate(TopMemoryContext, "SI Broadcaster", ALLOCSET_DEFAULT_SIZES);
+	MemoryContextSwitchTo(sinval_bcast_context);
+
+	/*
+	 * Error recovery: log and continue.  The KO peer-apply drain (spec-5.7 D6)
+	 * touches the buffer pool (FlushRelationsAllBuffers / DropRelationsAllBuffers),
+	 * so a failed flush can leave buffer pins / LWLocks held; release them with the
+	 * bgwriter-style aux cleanup subset rather than the original skeleton's
+	 * log-only handler.  A dropped KO request leaves the dropping node to time out
+	 * and fail closed (53RAA), which is the correct fail-closed behavior.
+	 */
 	if (sigsetjmp(local_sigjmp_buf, 1) != 0) {
+		/* Since not using PG_TRY, must reset error stack by hand */
+		error_context_stack = NULL;
+
+		/* Prevent interrupts while cleaning up */
+		HOLD_INTERRUPTS();
+
 		EmitErrorReport();
+
+		/*
+		 * Minimal subset of AbortTransaction() -- this aux runs no transactions
+		 * but, via the KO drain, holds LWLocks, buffer pins, and smgr/file handles.
+		 */
+		LWLockReleaseAll();
+		ConditionVariableCancelSleep();
+		UnlockBuffers();
+		ReleaseAuxProcessResources(false);
+		AtEOXact_Buffers(false);
+		AtEOXact_SMgr();
+		AtEOXact_Files(false);
+		AtEOXact_HashTables(false);
+
+		MemoryContextSwitchTo(sinval_bcast_context);
 		FlushErrorState();
+		MemoryContextResetAndDeleteChildren(sinval_bcast_context);
+
+		RESUME_INTERRUPTS();
 	}
 	PG_exception_stack = &local_sigjmp_buf;
 	(void)local_sigjmp_buf;
@@ -114,15 +158,20 @@ SinvalBcastMain(void)
 			ProcessConfigFile(PGC_SIGHUP);
 		}
 
+		/* Bound per-cycle allocations (the KO drain palloc's). */
+		MemoryContextReset(sinval_bcast_context);
+
 		/*
 		 * HC136 main loop drain pattern (reuse spec-1.11 LMON):
 		 *   (1) inbound overflow → SIResetAll fail-safe
 		 *   (2) inbound → SendSharedInvalidMessages
+		 *   (3) spec-5.7 D6: KO inbound → flush + drop relfilenode buffers, then ACK
 		 *
-		 * Outbound fanout is drained by LMON, not this process.
+		 * Outbound fanout (sinval + KO ACK) is drained by LMON, not this process.
 		 */
 		cluster_sinval_apply_inbound_overflow_reset_if_pending();
 		cluster_sinval_drain_inbound_and_apply();
+		cluster_ko_drain_inbound_and_apply();
 
 		rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 					   cluster_sinval_broadcast_batch_timeout_ms, WAIT_EVENT_SINVAL_BROADCAST_SEND);

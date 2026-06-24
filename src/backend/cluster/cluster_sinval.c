@@ -1247,7 +1247,7 @@ match_batch:
 /* ============================================================
  * spec-2.39 D2:  enqueue_and_wait_ack public API (production caller).
  * ============================================================ */
-static uint32
+uint32
 cluster_sinval_compute_alive_peer_mask(void)
 {
 	uint32 mask = 0;
@@ -1263,6 +1263,135 @@ cluster_sinval_compute_alive_peer_mask(void)
 		mask |= (1u << n);
 	}
 	return mask;
+}
+
+/* ============================================================
+ * spec-5.7 D6 (KO-B2):  ack_wait correlation infra reuse.
+ *
+ *   KO reuses ONLY the ack_wait correlation framework (this shared HTAB +
+ *   the monotone batch_id allocator + the alive-peer mask + the WaitLatch
+ *   loop), NOT the generic peer_enqueued semantics of
+ *   cluster_sinval_enqueue_and_wait_ack (§3.6 KO-B2).  KO drives the same
+ *   correlation entries with its OWN message (PGRAC_IC_MSG_KO_FLUSH) and its
+ *   OWN apply-after-drop ACK timing: a peer records its bit (via
+ *   cluster_sinval_ack_wait_record, called from the KO_FLUSH_ACK handler)
+ *   only after it has really dropped the relfilenode's buffers.  These
+ *   helpers are additive -- they do not change any existing sinval behavior.
+ *
+ *   batch_id uniqueness:  KO and sinval share next_batch_id, so a KO entry and
+ *   a sinval entry never collide in the HTAB.
+ * ============================================================ */
+
+/* Allocate a globally-unique batch id from the shared monotone allocator. */
+uint64
+cluster_sinval_ack_wait_alloc_batch_id(void)
+{
+	if (ClusterSinval == NULL)
+		return 0;
+	return pg_atomic_fetch_add_u64(&ClusterSinval->next_batch_id, 1);
+}
+
+/*
+ * Insert an ack_wait entry keyed by batch_id, owned by the CURRENT backend
+ * (its procLatch is signalled on completion), waiting for the alive_mask peers
+ * until deadline_us.  Returns false if the HTAB is full (caller fails closed).
+ */
+bool
+cluster_sinval_ack_wait_begin(uint64 batch_id, uint32 alive_mask, TimestampTz deadline_us)
+{
+	ClusterSinvalAckWaitEntry *entry;
+	bool found;
+
+	if (ClusterSinval == NULL || ClusterSinvalAckWaitHTAB == NULL)
+		return false;
+
+	LWLockAcquire(ClusterSinvalAckWaitLock, LW_EXCLUSIVE);
+	entry = (ClusterSinvalAckWaitEntry *)hash_search(ClusterSinvalAckWaitHTAB, &batch_id,
+													 HASH_ENTER_NULL, &found);
+	if (entry == NULL) {
+		LWLockRelease(ClusterSinvalAckWaitLock);
+		return false;
+	}
+	entry->enqueuer_pgprocno = MyProc->pgprocno;
+	entry->alive_peer_mask = alive_mask;
+	entry->ack_received_mask = 0;
+	entry->deadline_us = deadline_us;
+	entry->status = SINVAL_ACK_DONE;
+	entry->completion_signaled = 0;
+	LWLockRelease(ClusterSinvalAckWaitLock);
+	return true;
+}
+
+/*
+ * Record an ACK from acker_node for batch_id: set its bit and, when all alive
+ * peers have ACK'd, wake the waiting enqueuer.  A no-op if the entry is gone
+ * (already completed / timed out / removed) or acker_node is not in the entry's
+ * alive mask.  Unlike the generic sinval ACK handler this bumps no sinval
+ * counters -- the KO ACK handler owns KO's own observability.
+ */
+void
+cluster_sinval_ack_wait_record(uint64 batch_id, int32 acker_node)
+{
+	ClusterSinvalAckWaitEntry *entry;
+	bool found;
+	uint32 acker_bit;
+	int32 enqueuer_pgprocno = -1;
+
+	if (ClusterSinval == NULL || ClusterSinvalAckWaitHTAB == NULL)
+		return;
+	if (acker_node < 0 || acker_node >= CLUSTER_MAX_NODES)
+		return;
+	acker_bit = (1u << acker_node);
+
+	LWLockAcquire(ClusterSinvalAckWaitLock, LW_EXCLUSIVE);
+	entry = (ClusterSinvalAckWaitEntry *)hash_search(ClusterSinvalAckWaitHTAB, &batch_id, HASH_FIND,
+													 &found);
+	if (found && (entry->alive_peer_mask & acker_bit) != 0) {
+		entry->ack_received_mask |= acker_bit;
+		if ((entry->ack_received_mask & entry->alive_peer_mask) == entry->alive_peer_mask
+			&& entry->completion_signaled == 0) {
+			entry->completion_signaled = 1;
+			enqueuer_pgprocno = entry->enqueuer_pgprocno;
+		}
+	}
+	LWLockRelease(ClusterSinvalAckWaitLock);
+
+	if (enqueuer_pgprocno >= 0)
+		SetLatch(&GetPGProcByNumber(enqueuer_pgprocno)->procLatch);
+}
+
+/* True when every alive peer has ACK'd for batch_id. */
+bool
+cluster_sinval_ack_wait_is_complete(uint64 batch_id)
+{
+	ClusterSinvalAckWaitEntry *entry;
+	bool found;
+	bool complete = false;
+
+	if (ClusterSinval == NULL || ClusterSinvalAckWaitHTAB == NULL)
+		return false;
+
+	LWLockAcquire(ClusterSinvalAckWaitLock, LW_SHARED);
+	entry = (ClusterSinvalAckWaitEntry *)hash_search(ClusterSinvalAckWaitHTAB, &batch_id, HASH_FIND,
+													 &found);
+	if (found)
+		complete = (entry->ack_received_mask & entry->alive_peer_mask) == entry->alive_peer_mask;
+	LWLockRelease(ClusterSinvalAckWaitLock);
+	return complete;
+}
+
+/* Remove the ack_wait entry for batch_id (cleanup after completion / timeout). */
+void
+cluster_sinval_ack_wait_remove(uint64 batch_id)
+{
+	bool found;
+
+	if (ClusterSinval == NULL || ClusterSinvalAckWaitHTAB == NULL)
+		return;
+
+	LWLockAcquire(ClusterSinvalAckWaitLock, LW_EXCLUSIVE);
+	(void)hash_search(ClusterSinvalAckWaitHTAB, &batch_id, HASH_REMOVE, &found);
+	LWLockRelease(ClusterSinvalAckWaitLock);
 }
 
 ClusterSinvalAckResult

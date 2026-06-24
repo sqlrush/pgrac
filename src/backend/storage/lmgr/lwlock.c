@@ -238,6 +238,8 @@ static const char *const BuiltinTrancheNames[] = {
 	"ClusterUndoBuf",
 	/* PGRAC LWTRANCHE_CLUSTER_SQ: spec-5.4 D1 SQ sequence instance cache */
 	"ClusterSq",
+	/* PGRAC LWTRANCHE_CLUSTER_HW: spec-5.7 D1 HW relation-extend authority */
+	"ClusterHw",
 #endif
 };
 

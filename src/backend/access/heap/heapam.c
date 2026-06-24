@@ -82,6 +82,7 @@
 #include "cluster/cluster_mode.h"		/* cluster_storage_mode_enabled / cluster_peer_mode_enabled */
 #include "cluster/cluster_guc.h"		/* cluster_enabled */
 #include "cluster/cluster_itl.h"		/* alloc_or_reuse_slot / stamp_active */
+#include "cluster/cluster_dl.h"	/* spec-5.7 DL bulk-load lease */
 #include "cluster/cluster_itl_slot.h"	/* CLUSTER_ITL_SLOT_UNALLOCATED */
 #include "cluster/cluster_tt_status.h" /* spec-3.14 D2b writer wait bridge */
 #include "cluster/cluster_tx_enqueue.h" /* spec-5.2 D4 cross-node TX enqueue wait */
@@ -1913,6 +1914,14 @@ GetBulkInsertState(void)
 	bistate->next_free = InvalidBlockNumber;
 	bistate->last_free = InvalidBlockNumber;
 	bistate->already_extended_by = 0;
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: GetBulkInsertState uses palloc (not palloc0) and explicitly inits
+	 * every field, so the cluster DL lease handle must be cleared here too --
+	 * otherwise it holds garbage and the DL bulk-load lease hook (spec-5.7 §3.2)
+	 * mis-reads it as an already-held lease (skipping coordination) and the
+	 * release path would dl_unlock a wild pointer. */
+	bistate->cluster_dl = NULL;
+#endif
 	return bistate;
 }
 
@@ -1922,6 +1931,10 @@ GetBulkInsertState(void)
 void
 FreeBulkInsertState(BulkInsertState bistate)
 {
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: spec-5.7 §3.2 DL -- release the bulk-load lease this state held. */
+	cluster_dl_bulk_release(bistate);
+#endif
 	if (bistate->current_buf != InvalidBuffer)
 		ReleaseBuffer(bistate->current_buf);
 	FreeAccessStrategy(bistate->strategy);
@@ -1990,6 +2003,17 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 		   RelationGetNumberOfAttributes(relation));
 
 	AssertHasSnapshotForToast(relation);
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: spec-5.7 §3.2 DL-M1/M2.  A bulk path (CTAS / REFRESH MATVIEW) passes
+	 * a BulkInsertState; acquire the per-relation DL(X) lease BEFORE any extend so
+	 * the lock order is DL(X) -> HW(X) (inside RelationGetBufferForTuple's extend)
+	 * -> LockRelationForExtension.  No-op for a regular insert (bistate == NULL ->
+	 * HW alone) or after the lease is already held.
+	 */
+	cluster_dl_bulk_acquire(relation, bistate);
+#endif
 
 	/*
 	 * Fill in tuple header fields and toast the tuple if necessary.
@@ -2430,6 +2454,13 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 	Assert(!(options & HEAP_INSERT_NO_LOGICAL));
 
 	AssertHasSnapshotForToast(relation);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: spec-5.7 §3.2 DL-M1/M2 -- acquire the per-relation DL(X) bulk-load
+	 * lease before any extend (the COPY batch path), so DL(X) -> HW(X) -> local.
+	 * No-op without a BulkInsertState or once the lease is held. */
+	cluster_dl_bulk_acquire(relation, bistate);
+#endif
 
 	needwal = RelationNeedsWAL(relation);
 	saveFreeSpace = RelationGetTargetPageFreeSpace(relation,

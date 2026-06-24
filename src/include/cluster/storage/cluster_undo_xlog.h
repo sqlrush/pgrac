@@ -37,7 +37,10 @@
 #define CLUSTER_UNDO_XLOG_H
 
 #include "access/xlogreader.h"
+#include "common/relpath.h" /* ForkNumber (spec-5.7 HW records) */
 #include "lib/stringinfo.h"
+#include "storage/block.h"			/* BlockNumber (spec-5.7 HW records) */
+#include "storage/relfilelocator.h" /* RelFileLocator (spec-5.7 HW records) */
 
 #include "cluster/cluster_itl_slot.h" /* UBA (spec-4.8 D7-A xl_undo_tt_slot_set_head) */
 #include "cluster/cluster_scn.h"	  /* SCN typedef (spec-3.11 D3 xl_undo_tt_slot_commit) */
@@ -67,6 +70,10 @@
 #define XLOG_UNDO_TT_SLOT_SET_HEAD                                                                 \
 	0x90 /* spec-4.8 D7-A: durably set TTSlot.first_undo_block (undo-chain head) from the 2PC       \
 		  * record at ROLLBACK PREPARED, so D7 physical rollback can walk it after crash-restart */
+/* spec-5.7a D1 (§3.1a M1c; amend #3): HW relation-extend authority durable record.
+ * amend #3 removed HW_SEED (authority owns from block 0; HW_RESERVE is the only
+ * HWM source).  0xA0 is therefore free again. */
+#define XLOG_HW_RESERVE 0xB0 /* per-batch HWM advance, flushed before the master replies */
 
 StaticAssertDecl((XLOG_UNDO_SEGMENT_INIT & XLR_INFO_MASK) == 0,
 				 "cluster undo WAL opcodes must leave XLR_INFO_MASK bits clear");
@@ -81,6 +88,8 @@ StaticAssertDecl((XLOG_UNDO_TT_SLOT_ABORT & XLR_INFO_MASK) == 0,
 StaticAssertDecl((XLOG_UNDO_BLOCK_WRITE & XLR_INFO_MASK) == 0,
 				 "cluster undo WAL opcodes must leave XLR_INFO_MASK bits clear");
 StaticAssertDecl((XLOG_UNDO_TT_SLOT_SET_HEAD & XLR_INFO_MASK) == 0,
+				 "cluster undo WAL opcodes must leave XLR_INFO_MASK bits clear");
+StaticAssertDecl((XLOG_HW_RESERVE & XLR_INFO_MASK) == 0,
 				 "cluster undo WAL opcodes must leave XLR_INFO_MASK bits clear");
 
 
@@ -125,6 +134,29 @@ StaticAssertDecl(sizeof(xl_cluster_undo_segment_init) == 12,
 StaticAssertDecl(offsetof(xl_cluster_undo_segment_init, segment_id) == 8,
 				 "xl_cluster_undo_segment_init.segment_id must be at offset 8 "
 				 "(uint32 8-byte alignment slot; Hardening v1.0.4 P2-1)");
+
+/*
+ * On-disk WAL payload for XLOG_HW_RESERVE (spec-5.7a D1, §3.1a M1c).
+ *
+ *   A durable HWM advance.  The master writes + XLogFlush's this BEFORE it
+ *   replies a block range, so the advanced HWM is durable before any block is
+ *   used (a master crash between the advance and the flush loses the volatile
+ *   shmem HWM and the unflushed record, but the reply never went out, so the
+ *   range is never used -- no block is ever used without a durable reservation).
+ *   new_hwm is the next-free block after the batch; granted is the batch size
+ *   (observability).  Redo / remaster rebuild raises the authority HWM to
+ *   new_hwm (monotone).  24-byte fixed record, no page image.
+ */
+typedef struct xl_hw_reserve {
+	uint32 dbOid;	  /* offset 0 */
+	uint32 relNumber; /* offset 4 */
+	uint32 spcOid;	  /* offset 8 */
+	uint32 fork;	  /* offset 12 */
+	uint32 new_hwm;	  /* offset 16; BlockNumber after the advance */
+	uint32 granted;	  /* offset 20; blocks granted in this batch */
+} xl_hw_reserve;
+
+StaticAssertDecl(sizeof(xl_hw_reserve) == 24, "xl_hw_reserve WAL ABI lock (spec-5.7a §3.1a M1c)");
 
 
 /*
@@ -502,6 +534,12 @@ extern XLogRecPtr cluster_undo_emit_segment_recycle(uint8 instance, uint32 segme
 extern XLogRecPtr cluster_undo_emit_segment_reuse(uint8 instance, uint32 segment_id,
 												  uint32 old_generation, uint32 new_generation,
 												  const char *fresh_header_image);
+
+/* spec-5.7a D1: emit the HW authority HWM-advance record.  Caller XLogFlush(lsn)
+ * before replying the granted range (durable reservation before use; amend #3:
+ * the only HWM source, authority owns each (rel,fork) from block 0). */
+extern XLogRecPtr cluster_hw_emit_reserve(RelFileLocator rloc, ForkNumber fork, BlockNumber new_hwm,
+										  uint32 granted);
 
 /*
  * cluster_undo_emit_block_write (spec-3.18 D2)

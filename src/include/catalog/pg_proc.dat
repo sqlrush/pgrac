@@ -12714,4 +12714,61 @@
   proargnames => '{rel,forknum,blocknum,scan_lower,scan_upper}',
   prosrc => 'cluster_block_recovery_reconstruct_test' },
 
+# spec-5.7 D8: TEST-ONLY mechanism-level driver for the IR(X) recovery-owner
+# GES acquire (t/295).  acquire_probe drives the real cluster_ir_recovery_acquire
+# and raises 53RA9 on a non-owner claim, exactly as the recovery worker mutation
+# gate does; release_probe drops a held claim.  Superuser-only.
+{ oid => '8951',
+  descr => 'TEST-ONLY: drive the IR(X) recovery-owner GES acquire (spec-5.7 D8)',
+  proname => 'cluster_ir_acquire_probe',
+  proisstrict => 'f',
+  provolatile => 'v', proparallel => 'u',
+  prorettype => 'text',
+  proargtypes => 'int4 int8 bool',
+  proargnames => '{dead_node,epoch_offset,do_hold}',
+  prosrc => 'cluster_ir_acquire_probe' },
+
+{ oid => '8952',
+  descr => 'TEST-ONLY: release a held IR(X) recovery-owner probe claim (spec-5.7 D8)',
+  proname => 'cluster_ir_release_probe',
+  provolatile => 'v', proparallel => 'u',
+  prorettype => 'bool',
+  proargtypes => '',
+  prosrc => 'cluster_ir_release_probe' },
+
+# spec-5.7 D5: TEST-ONLY mechanism driver for the TT (tablespace-DDL) GES
+# acquire (t/296).  acquire_probe drives the real TT(X)/TT(S) acquire and raises
+# 53RA8 on a conflict, as the tablespace.c DDL hooks do; release_probe drops a
+# held claim.  Superuser-only.
+{ oid => '8953',
+  descr => 'TEST-ONLY: drive the TT tablespace-DDL GES acquire (spec-5.7 D5)',
+  proname => 'cluster_ts_acquire_probe',
+  proisstrict => 'f',
+  provolatile => 'v', proparallel => 'u',
+  prorettype => 'text',
+  proargtypes => 'text text text bool',
+  proargnames => '{mode,kind,key,do_hold}',
+  prosrc => 'cluster_ts_acquire_probe' },
+
+{ oid => '8954',
+  descr => 'TEST-ONLY: release a held TT tablespace-DDL probe claim (spec-5.7 D5)',
+  proname => 'cluster_ts_release_probe',
+  provolatile => 'v', proparallel => 'u',
+  prorettype => 'bool',
+  proargtypes => '',
+  prosrc => 'cluster_ts_release_probe' },
+
+# spec-5.7 D6:  TEST-ONLY driver for the KO object-reuse flush barrier --
+# fanouts a real KO_FLUSH to every alive peer and waits for the apply-after-drop
+# ACK; raises 53RAA when a peer does not ACK.  Superuser-only.
+{ oid => '8955',
+  descr => 'TEST-ONLY: drive the KO object-reuse flush barrier (spec-5.7 D6)',
+  proname => 'cluster_ko_flush_probe',
+  proisstrict => 'f',
+  provolatile => 'v', proparallel => 'u',
+  prorettype => 'text',
+  proargtypes => 'oid oid oid',
+  proargnames => '{spc,db,rel}',
+  prosrc => 'cluster_ko_flush_probe' },
+
 ]

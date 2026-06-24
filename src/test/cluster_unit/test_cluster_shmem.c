@@ -481,6 +481,41 @@ void
 cluster_cf_stats_shmem_register(void)
 {}
 
+/* spec-5.7 D1 stub: cluster_init_shmem_module also calls
+ * cluster_hw_shmem_register (cluster_hw_shmem.c); the unit harness does
+ * not link that object, so provide a no-op. */
+void
+cluster_hw_shmem_register(void)
+{}
+
+/* spec-5.7 D4 stub: cluster_init_shmem_module also calls
+ * cluster_dl_shmem_register (cluster_dl.c); the unit harness does not link
+ * that object, so provide a no-op. */
+void
+cluster_dl_shmem_register(void)
+{}
+
+/* spec-5.7 D8 stub: cluster_init_shmem_module also calls
+ * cluster_ir_shmem_register (cluster_ir_lock.c); the unit harness does not link
+ * that object, so provide a no-op. */
+void
+cluster_ir_shmem_register(void)
+{}
+
+/* spec-5.7 D5 stub: cluster_init_shmem_module also calls
+ * cluster_ts_shmem_register (cluster_ts_lock.c); the unit harness does not link
+ * that object, so provide a no-op. */
+void
+cluster_ts_shmem_register(void)
+{}
+
+/* spec-5.7 D6 stub: cluster_init_shmem_module also calls
+ * cluster_ko_shmem_register (cluster_ko_lock.c); the unit harness does not link
+ * that object, so provide a no-op. */
+void
+cluster_ko_shmem_register(void)
+{}
+
 /* spec-3.4e D6 stub: cluster_init_shmem_module also calls
  * cluster_lock_path_shmem_register (cluster_itl.c).  cluster_unit
  * test binary doesn't link cluster_itl.o;  provide no-op stub. */

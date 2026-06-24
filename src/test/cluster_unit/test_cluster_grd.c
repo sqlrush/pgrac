@@ -325,6 +325,21 @@ cluster_thread_recovery_launch_workers(const uint64 *dead pg_attribute_unused(),
 									   uint64 episode_epoch pg_attribute_unused())
 {}
 
+/* spec-5.7 D3 S5d stubs:  cluster_grd.c's WAIT_CLUSTER tick now also launches the
+ * HW authority rebuild worker and consults its unfreeze gate before P7.  These
+ * tests drive the GES/GRD remaster FSM, not the HW authority, so both are out of
+ * scope -> no-op (launch registers nothing; gate returns false so P7 proceeds). */
+void
+cluster_hw_remaster_launch_workers(const uint64 *dead pg_attribute_unused(),
+								   int nwords pg_attribute_unused(),
+								   uint64 episode_epoch pg_attribute_unused())
+{}
+bool
+cluster_hw_remaster_gate_unfreeze(void)
+{
+	return false;
+}
+
 struct PGPROC *
 BackendIdGetProc(int backendID pg_attribute_unused())
 {

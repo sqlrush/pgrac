@@ -43,6 +43,7 @@
 #include "access/xloginsert.h"
 #include "access/xlogreader.h"
 #include "access/xlogutils.h"
+#include "cluster/cluster_hw.h"					/* spec-5.7 D1 HW authority apply/encode */
 #include "cluster/cluster_tt_status.h"			/* spec-3.16 D5 recovery counters */
 #include "cluster/cluster_tt_durable.h"			/* spec-3.11: redo decision predicate */
 #include "cluster/cluster_undo_segment.h"		/* UNDO_SEGMENT_SIZE_BYTES */
@@ -192,6 +193,64 @@ cluster_undo_emit_segment_init(uint8 instance, uint32 segment_id, const char *pa
 	lsn = XLogInsert(RM_CLUSTER_UNDO_ID, XLOG_UNDO_SEGMENT_INIT);
 
 	return lsn;
+}
+
+
+/*
+ * cluster_hw_emit_reserve (spec-5.7a D1, §3.1a M1c)
+ *
+ *   Emit a durable HWM advance.  The master XLogFlush(returned lsn) BEFORE it
+ *   replies the granted range, so no block is ever used without a durable
+ *   reservation.  24-byte delta, no page image.
+ */
+XLogRecPtr
+cluster_hw_emit_reserve(RelFileLocator rloc, ForkNumber fork, BlockNumber new_hwm, uint32 granted)
+{
+	xl_hw_reserve rec;
+	XLogRecPtr lsn;
+
+	memset(&rec, 0, sizeof(rec));
+	rec.dbOid = (uint32)rloc.dbOid;
+	rec.relNumber = (uint32)rloc.relNumber;
+	rec.spcOid = (uint32)rloc.spcOid;
+	rec.fork = (uint32)fork;
+	rec.new_hwm = (uint32)new_hwm;
+	rec.granted = granted;
+
+	XLogBeginInsert();
+	XLogRegisterData((char *)&rec, sizeof(rec));
+	lsn = XLogInsert(RM_CLUSTER_UNDO_ID, XLOG_HW_RESERVE);
+
+	return lsn;
+}
+
+/*
+ * cluster_hw_redo_reserve (spec-5.7a D1, §3.1a M1e; amend #3)
+ *
+ *   Rebuild the in-memory HW authority HWM from WAL.  Raises the (rel,fork)
+ *   authority entry to at least the recorded high-water mark (monotone,
+ *   create-if-absent via cluster_hw_apply_hwm), so a crash / remaster
+ *   reconstructs the authority from HW_RESERVE alone (new relations are owned
+ *   from block 0; there is no HW_SEED).  No file/page I/O -- the authority is a
+ *   runtime shmem table, not on-disk state.
+ */
+static void
+cluster_hw_redo_reserve(XLogReaderState *record)
+{
+	xl_hw_reserve *rec;
+	RelFileLocator rloc;
+	ClusterResId resid;
+
+	if (XLogRecGetDataLen(record) != sizeof(*rec))
+		ereport(PANIC,
+				(errmsg("invalid XLOG_HW_RESERVE record length: %u", XLogRecGetDataLen(record))));
+	rec = (xl_hw_reserve *)XLogRecGetData(record);
+
+	rloc.dbOid = rec->dbOid;
+	rloc.relNumber = rec->relNumber;
+	rloc.spcOid = rec->spcOid;
+	cluster_hw_resid_encode(rloc, (ForkNumber)rec->fork, &resid);
+	cluster_hw_apply_hwm(&resid, (BlockNumber)rec->new_hwm);
 }
 
 
@@ -1547,6 +1606,9 @@ cluster_undo_redo(XLogReaderState *record)
 		break;
 	case XLOG_UNDO_TT_SLOT_SET_HEAD:
 		cluster_undo_redo_tt_slot_set_head(record);
+		break;
+	case XLOG_HW_RESERVE:
+		cluster_hw_redo_reserve(record);
 		break;
 	default:
 		ereport(PANIC, (errmsg("cluster_undo_redo: unknown op code %u", info)));

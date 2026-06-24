@@ -38,12 +38,13 @@
 #include "cluster/cluster_ges_mode.h" /* spec-5.1b D1: ges_modes_compatible (frozen matrix) */
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_grd_outbound.h" /* cluster_grd_outbound_enqueue_cleanup_release (D10) */
-#include "cluster/cluster_lmd.h"		  /* spec-2.24 D10 cleanup_*_count_inc */
-#include "cluster/cluster_guc.h"		  /* cluster_node_id, cluster_grd_max_entries */
-#include "cluster/cluster_lms.h"		  /* spec-4.6 D2 — Q3-C wire routing token */
-#include "cluster/cluster_pcm_lock.h"	  /* spec-2.36 HC124 pending_x node-dead cleanup */
-#include "cluster/cluster_gcs.h"		  /* spec-4.7 D2 — cluster_gcs_lookup_master */
-#include "cluster/cluster_gcs_block.h"	  /* spec-4.7 D2 — block re-declare scan + send */
+#include "cluster/cluster_hw_remaster.h" /* spec-5.7 D3 S5d — HW authority rebuild launch + gate */
+#include "cluster/cluster_lmd.h"		 /* spec-2.24 D10 cleanup_*_count_inc */
+#include "cluster/cluster_guc.h"		 /* cluster_node_id, cluster_grd_max_entries */
+#include "cluster/cluster_lms.h"		 /* spec-4.6 D2 — Q3-C wire routing token */
+#include "cluster/cluster_pcm_lock.h"	 /* spec-2.36 HC124 pending_x node-dead cleanup */
+#include "cluster/cluster_gcs.h"		 /* spec-4.7 D2 — cluster_gcs_lookup_master */
+#include "cluster/cluster_gcs_block.h"	 /* spec-4.7 D2 — block re-declare scan + send */
 #include "cluster/cluster_signal.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_cssd.h"			 /* spec-2.16 D8 newly-dead bitmap diff */
@@ -1533,6 +1534,17 @@ cluster_grd_recovery_lmon_tick(void)
 		cluster_thread_recovery_launch_workers(dead, (CLUSTER_MAX_NODES + 63) / 64, episode_epoch);
 
 		/*
+		 * spec-5.7 D3 S5d (§3.1b R4/R9) — launch one per-episode HW authority
+		 * rebuild worker for each dead origin whose shards this survivor adopted.
+		 * Independent of online_thread_recovery (the HW authority is default-on):
+		 * a NO-OP unless the HW authority is engaged (multi-node + shared storage),
+		 * idempotent per tick.  Off the LMON tick because the dead master's
+		 * HW_RESERVE WAL-tail scan can be large; the P7 gate below holds the
+		 * adopted shards frozen until each rebuild marks them.
+		 */
+		cluster_hw_remaster_launch_workers(dead, (CLUSTER_MAX_NODES + 63) / 64, episode_epoch);
+
+		/*
 		 * P6 cluster gate (P0#3):  EVERY survivor (declared ∧ not dead in
 		 * this episode) must have announced its local barrier for the
 		 * LOCKED episode epoch.  No timeout:  fail-closed — affected
@@ -1581,6 +1593,25 @@ cluster_grd_recovery_lmon_tick(void)
 							"thread recovery is not yet materialized; staying frozen "
 							"(epoch " UINT64_FORMAT ")",
 							episode_epoch)));
+				return;
+			}
+
+			/*
+			 * spec-5.7 D3 S5d (§3.1b R4/R9) — HW authority rebuild gate.  Hold the
+			 * shards frozen until every adopted shard this node masters has its HWM
+			 * rebuilt from the dead master's snapshot+tail (hw_rebuilt_generation ==
+			 * master_generation).  Otherwise P7 would set the shard NORMAL while its
+			 * HWM is unknown, and a first HW_ALLOC could auto-create at block 0 over
+			 * an already-allocated range (R9, 8.A).  A NO-OP when the HW authority is
+			 * inactive, so the spec-4.6/4.7 unfreeze path is unchanged.
+			 */
+			if (cluster_hw_remaster_gate_unfreeze()) {
+				ereport(
+					DEBUG1,
+					(errmsg_internal(
+						"cluster_grd_recovery: re-declare barrier passed but an adopted shard's "
+						"HW authority is not yet rebuilt; staying frozen (epoch " UINT64_FORMAT ")",
+						episode_epoch)));
 				return;
 			}
 

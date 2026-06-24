@@ -53,6 +53,12 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_write_fence test_cluster_stage4_acceptance \
         test_cluster_ges_mode \
         test_cluster_sequence \
+        test_cluster_hw \
+        test_cluster_dl \
+        test_cluster_ir \
+        test_cluster_ts \
+        test_cluster_ko \
+        test_cluster_hw_snapshot \
         test_cluster_cf_authority \
         test_cluster_cf_storage \
         test_cluster_cf_enqueue \
@@ -120,7 +126,7 @@ CLUSTER_GCS_O = $(top_builddir)/src/backend/cluster/cluster_gcs.o
 # separate rules because they also link additional cluster_*.o
 # objects (the test files stub the PG backend symbols those
 # objects reference).
-SIMPLE_TESTS = $(filter-out test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf test_cluster_ic_mock test_cluster_inject test_cluster_pgstat test_cluster_debug test_cluster_shared_fs test_cluster_shared_fs_sharedfs test_cluster_smgr test_cluster_startup_phase test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_cssd test_cluster_qvotec test_cluster_voting_disk_io test_cluster_quorum_decision test_cluster_scn test_cluster_epoch test_cluster_fence test_cluster_reconfig test_cluster_ges test_cluster_grd test_cluster_lmd test_cluster_lock_acquire test_cluster_advisory test_cluster_retention test_cluster_visibility_variants test_cluster_tt_2pc test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_block_apply test_cluster_thread_apply test_cluster_thread_replay test_cluster_thread_driver test_cluster_thread_orchestrator test_cluster_write_fence test_cluster_stage4_acceptance test_cluster_ges_mode test_cluster_sequence test_cluster_cf_authority test_cluster_cf_storage test_cluster_cf_enqueue test_cluster_cf_phase2 test_cluster_cf_stats,$(TESTS))
+SIMPLE_TESTS = $(filter-out test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf test_cluster_ic_mock test_cluster_inject test_cluster_pgstat test_cluster_debug test_cluster_shared_fs test_cluster_shared_fs_sharedfs test_cluster_smgr test_cluster_startup_phase test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_cssd test_cluster_qvotec test_cluster_voting_disk_io test_cluster_quorum_decision test_cluster_scn test_cluster_epoch test_cluster_fence test_cluster_reconfig test_cluster_ges test_cluster_grd test_cluster_lmd test_cluster_lock_acquire test_cluster_advisory test_cluster_retention test_cluster_visibility_variants test_cluster_tt_2pc test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_block_apply test_cluster_thread_apply test_cluster_thread_replay test_cluster_thread_driver test_cluster_thread_orchestrator test_cluster_write_fence test_cluster_stage4_acceptance test_cluster_ges_mode test_cluster_sequence test_cluster_hw test_cluster_dl test_cluster_ir test_cluster_ts test_cluster_ko test_cluster_hw_snapshot test_cluster_cf_authority test_cluster_cf_storage test_cluster_cf_enqueue test_cluster_cf_phase2 test_cluster_cf_stats,$(TESTS))
 
 # spec-2.4 D16: test_cluster_epoch links cluster_epoch.o standalone.
 # cluster_epoch.c references ShmemInitStruct + cluster_shmem_register_region
@@ -152,6 +158,72 @@ test_cluster_sequence: test_cluster_sequence.c unit_test.h $(CLUSTER_VERSION_O) 
 		$(CLUSTER_SEQUENCE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_SEQUENCE_O) \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-5.7a D1: test_cluster_hw links cluster_hw.o (pure layer: HW resid
+# encoding + three-state extend classifier + master-side batch allocator
+# math).  The pure layer has no PG-backend dependencies, so nothing is
+# stubbed beyond the Assert ExceptionalCondition hook.
+CLUSTER_HW_O = $(top_builddir)/src/backend/cluster/cluster_hw.o
+test_cluster_hw: test_cluster_hw.c unit_test.h $(CLUSTER_VERSION_O) \
+		$(CLUSTER_HW_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_HW_O) \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-5.7 D4: test_cluster_dl links cluster_dl.o (pure DL resid encoder) +
+# cluster_hw.o (cluster_hw_resid_encode, for the DL-vs-HW distinctness test).
+CLUSTER_DL_O = $(top_builddir)/src/backend/cluster/cluster_dl.o
+test_cluster_dl: test_cluster_dl.c unit_test.h $(CLUSTER_VERSION_O) \
+		$(CLUSTER_DL_O) $(CLUSTER_HW_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_DL_O) $(CLUSTER_HW_O) \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-5.7 D8: test_cluster_ir links cluster_ir.o (pure IR resid encoder +
+# bootstrap predicate) + cluster_dl.o + cluster_hw.o (resid encoders, for the
+# IR-vs-DL/HW namespace-distinctness tests).  The pure layer has no PG-backend
+# dependencies, so nothing is stubbed beyond the Assert ExceptionalCondition hook.
+CLUSTER_IR_O = $(top_builddir)/src/backend/cluster/cluster_ir.o
+test_cluster_ir: test_cluster_ir.c unit_test.h $(CLUSTER_VERSION_O) \
+		$(CLUSTER_IR_O) $(CLUSTER_DL_O) $(CLUSTER_HW_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_IR_O) $(CLUSTER_DL_O) $(CLUSTER_HW_O) \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-5.7 D5: test_cluster_ts links cluster_ts.o (pure TT resid encoders) +
+# cluster_ir.o/cluster_dl.o/cluster_hw.o (resid encoders, for the TT-vs-others
+# namespace-distinctness test).  Pure layer, no PG-backend deps beyond the Assert
+# hook.
+CLUSTER_TS_O = $(top_builddir)/src/backend/cluster/cluster_ts.o
+test_cluster_ts: test_cluster_ts.c unit_test.h $(CLUSTER_VERSION_O) \
+		$(CLUSTER_TS_O) $(CLUSTER_IR_O) $(CLUSTER_DL_O) $(CLUSTER_HW_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_TS_O) $(CLUSTER_IR_O) $(CLUSTER_DL_O) $(CLUSTER_HW_O) \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-5.7 D6: test_cluster_ko links cluster_ko.o (pure KO resid encoder) +
+# cluster_dl.o/cluster_ir.o/cluster_hw.o (resid encoders, for the KO-vs-others
+# namespace-distinctness test).  Pure layer, no PG-backend deps beyond the Assert
+# hook.
+CLUSTER_KO_O = $(top_builddir)/src/backend/cluster/cluster_ko.o
+test_cluster_ko: test_cluster_ko.c unit_test.h $(CLUSTER_VERSION_O) \
+		$(CLUSTER_KO_O) $(CLUSTER_DL_O) $(CLUSTER_IR_O) $(CLUSTER_HW_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_KO_O) $(CLUSTER_DL_O) $(CLUSTER_IR_O) $(CLUSTER_HW_O) \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-5.7 D3 S1: test_cluster_hw_snapshot links cluster_hw_snapshot.o (the HW
+# authority durable-snapshot envelope: serialize / deserialize+validate /
+# identity / generation-supersede).  CRC32C comes from libpgport; the pure
+# layer has no PG-backend dependencies, so nothing is stubbed beyond the
+# Assert ExceptionalCondition hook.  The durable file round trip (temp +
+# durable_rename) is added to this binary with D3 S3.
+CLUSTER_HW_SNAPSHOT_O = $(top_builddir)/src/backend/cluster/cluster_hw_snapshot.o
+test_cluster_hw_snapshot: test_cluster_hw_snapshot.c unit_test.h $(CLUSTER_VERSION_O) \
+		$(CLUSTER_HW_SNAPSHOT_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_HW_SNAPSHOT_O) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 # spec-5.6 Da1: test_cluster_cf_authority links cluster_cf_authority.o and

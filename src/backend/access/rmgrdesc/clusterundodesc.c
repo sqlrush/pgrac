@@ -106,6 +106,14 @@ cluster_undo_desc(StringInfo buf, XLogReaderState *record)
 						 xlrec->xid);
 		break;
 	}
+	case XLOG_HW_RESERVE: {
+		xl_hw_reserve *xlrec = (xl_hw_reserve *)payload;
+
+		appendStringInfo(buf, "db %u rel %u spc %u fork %u new_hwm %u granted %u", xlrec->dbOid,
+						 xlrec->relNumber, xlrec->spcOid, xlrec->fork, xlrec->new_hwm,
+						 xlrec->granted);
+		break;
+	}
 	default:
 		appendStringInfo(buf, "unknown op %u", info);
 		break;
@@ -133,6 +141,8 @@ cluster_undo_identify(uint8 info)
 		return "UNDO_BLOCK_WRITE_MULTI";
 	case XLOG_UNDO_TT_SLOT_SET_HEAD:
 		return "UNDO_TT_SLOT_SET_HEAD";
+	case XLOG_HW_RESERVE:
+		return "HW_RESERVE";
 	default:
 		return NULL;
 	}

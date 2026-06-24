@@ -68,9 +68,10 @@
 #define CLUSTER_SINVAL_H
 
 #include "c.h"
-#include "miscadmin.h"		 /* B_SINVAL_BCAST */
-#include "storage/sinval.h"	 /* SharedInvalidationMessage */
-#include "access/xlogdefs.h" /* XLogRecPtr */
+#include "miscadmin.h"			/* B_SINVAL_BCAST */
+#include "storage/sinval.h"		/* SharedInvalidationMessage */
+#include "access/xlogdefs.h"	/* XLogRecPtr */
+#include "datatype/timestamp.h" /* TimestampTz (spec-5.7 D6 ack_wait helpers) */
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -387,6 +388,24 @@ extern void cluster_sinval_reset_all_on_reconfig(void);
  */
 extern Size cluster_sinval_ack_wait_shmem_size(void);
 extern void cluster_sinval_ack_wait_shmem_init(void);
+
+/*
+ * spec-5.7 D6 (KO-B2) — ack_wait correlation infra reuse for KO.
+ *
+ *   KO (cluster_ko_lock.c) reuses ONLY this correlation framework (the shared
+ *   ack_wait HTAB + the monotone batch_id allocator + the alive-peer mask + the
+ *   WaitLatch loop), NOT the generic peer_enqueued semantics of
+ *   cluster_sinval_enqueue_and_wait_ack.  KO drives the entries with its own
+ *   PGRAC_IC_MSG_KO_FLUSH message and apply-after-drop ACK timing (§3.6).  These
+ *   are additive helpers; they do not change any existing sinval behavior.
+ */
+extern uint32 cluster_sinval_compute_alive_peer_mask(void);
+extern uint64 cluster_sinval_ack_wait_alloc_batch_id(void);
+extern bool cluster_sinval_ack_wait_begin(uint64 batch_id, uint32 alive_mask,
+										  TimestampTz deadline_us);
+extern void cluster_sinval_ack_wait_record(uint64 batch_id, int32 acker_node);
+extern bool cluster_sinval_ack_wait_is_complete(uint64 batch_id);
+extern void cluster_sinval_ack_wait_remove(uint64 batch_id);
 
 /*
  * spec-2.39 D5 — ack_outbound shmem region size / init.

@@ -48,6 +48,14 @@ typedef struct BulkInsertStateData
 	BlockNumber next_free;
 	BlockNumber last_free;
 	uint32		already_extended_by;
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: spec-5.7 §3.2 DL bulk-load lease.  Opaque (DlLock *) held across
+	 * the bulk load and released at FreeBulkInsertState; NULL = no lease.  Void *
+	 * so this core header stays decoupled from cluster_dl.h.
+	 */
+	void	   *cluster_dl;
+#endif
 } BulkInsertStateData;
 
 

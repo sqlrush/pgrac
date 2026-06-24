@@ -338,6 +338,8 @@ typedef enum BuiltinTrancheIds {
 	LWTRANCHE_CLUSTER_UNDO_BUF,
 	/* PGRAC: spec-5.4 D1 — SQ sequence node-level instance cache region. */
 	LWTRANCHE_CLUSTER_SQ,
+	/* PGRAC: spec-5.7 D1 — HW relation-extend block-number authority region. */
+	LWTRANCHE_CLUSTER_HW,
 #endif
 	LWTRANCHE_FIRST_USER_DEFINED
 } BuiltinTrancheIds;

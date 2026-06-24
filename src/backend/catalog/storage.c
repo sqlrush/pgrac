@@ -14,6 +14,16 @@
  *	  Some of this code used to be in storage/smgr/smgr.c, and the
  *	  function names still reflect that.
  *
+ * PGRAC MODIFICATIONS
+ *	  spec-5.7 D6 (KO object-reuse flush, §3.5/§3.6): before a relation's
+ *	  storage is physically removed (RelationDropStorage -> commit-time
+ *	  mdunlink) or truncated (RelationTruncate -> smgrtruncate), run the
+ *	  cross-node object-reuse flush barrier so every alive peer drops the
+ *	  relfilenode's buffers first.  Both hooks fire PRE-COMMIT, under the
+ *	  relation's cross-node AccessExclusiveLock, where ereport(ERROR 53RAA)
+ *	  can still abort the statement (the DROP's physical mdunlink itself is
+ *	  post-commit and could not fail-closed there).  See cluster_ko.h.
+ *
  *-------------------------------------------------------------------------
  */
 
@@ -27,6 +37,9 @@
 #include "access/xlogutils.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_ko.h" /* PGRAC: spec-5.7 D6 object-reuse flush barrier */
+#endif
 #include "miscadmin.h"
 #include "storage/freespace.h"
 #include "storage/smgr.h"
@@ -206,6 +219,19 @@ RelationDropStorage(Relation rel)
 {
 	PendingRelDelete *pending;
 
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: spec-5.7 D6 (KO).  Before scheduling the relfilenode's file for
+	 * deletion at commit, make every alive peer flush + drop its buffers for
+	 * this relfilenode so a later writeback cannot recreate the unlinked file
+	 * or scribble into a reused relfilenode (8.A).  Fires pre-commit, under the
+	 * relation's cross-node AccessExclusiveLock; ereport(ERROR 53RAA) on a
+	 * barrier failure aborts the statement (the relfilenode survives intact).
+	 * No-op for temp relations / single-node / when the barrier is disabled.
+	 */
+	cluster_ko_flush_and_wait_ack(rel->rd_locator, rel->rd_rel->relpersistence);
+#endif
+
 	/* Add the relation to the list of stuff to delete at commit */
 	pending = (PendingRelDelete *)
 		MemoryContextAlloc(TopMemoryContext, sizeof(PendingRelDelete));
@@ -294,6 +320,20 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 	BlockNumber blocks[MAX_FORKNUM];
 	int			nforks = 0;
 	SMgrRelation reln;
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: spec-5.7 D6 (KO).  Before shrinking the relfilenode's file, make
+	 * every alive peer flush + drop its buffers for this relfilenode so a stale
+	 * writeback of a truncated-away page cannot re-extend the file or disagree
+	 * with the cluster block-number authority (8.A).  The peer drops ALL of the
+	 * relfilenode's buffers (over-drop is safe: the relation survives, so peers
+	 * just re-read the surviving pages).  Fires pre-commit, under the relation's
+	 * cross-node AccessExclusiveLock; ereport(ERROR 53RAA) on failure aborts the
+	 * truncation.  No-op for temp relations / single-node / when disabled.
+	 */
+	cluster_ko_flush_and_wait_ack(rel->rd_locator, rel->rd_rel->relpersistence);
+#endif
 
 	/*
 	 * Make sure smgr_targblock etc aren't pointing somewhere past new end.

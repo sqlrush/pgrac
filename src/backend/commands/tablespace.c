@@ -84,6 +84,9 @@
 #include "catalog/objectaccess.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_tablespace.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_ts.h" /* PGRAC: spec-5.7 TT (§3.3) tablespace-DDL lock */
+#endif
 #include "commands/comment.h"
 #include "commands/seclabel.h"
 #include "commands/tablecmds.h"
@@ -317,6 +320,18 @@ CreateTableSpace(CreateTableSpaceStmt *stmt)
 		elog(WARNING, "tablespaces created by regression test cases should have names starting with \"regress_\"");
 #endif
 
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC MODIFICATIONS (spec-5.7 TT, §3.3 TT-M1): take the cross-node TT(X) DDL
+	 * mutex on the tablespace NAME hash before the duplicate-name check, so two
+	 * nodes creating the same-named tablespace serialise.  At CREATE time the OID
+	 * is not yet assigned (each node would get a different one), so a name-based
+	 * resid -- not an OID resid -- is what catches the cross-node collision (R14).
+	 * Held to top-xact end; a conflicting peer fails closed 53RA8.
+	 */
+	cluster_ts_ddl_lock_x_name(stmt->tablespacename);
+#endif
+
 	/*
 	 * Check that there is no other tablespace by this name.  (The unique
 	 * index would catch this anyway, but might as well give a friendlier
@@ -476,6 +491,14 @@ DropTableSpace(DropTableSpaceStmt *stmt)
 				 errmsg("pg_undo cannot be dropped"),
 				 errhint("pg_undo is a hard-coded system tablespace managed by "
 						 "the cluster runtime.")));
+
+	/*
+	 * PGRAC MODIFICATIONS (spec-5.7 TT, §3.3 TT-M1): take the cross-node TT(X) DDL
+	 * mutex on this tablespace OID before the destructive drop, so two nodes cannot
+	 * drop it concurrently, and a placement DDL holding TT(S) on it (TT-M2) blocks
+	 * this drop.  Held to top-xact end; a conflicting peer fails closed 53RA8.
+	 */
+	cluster_ts_ddl_lock_x_oid(tablespaceoid);
 #endif
 
 	/* Must be tablespace owner */
@@ -1010,6 +1033,16 @@ RenameTableSpace(const char *oldname, const char *newname)
 				 errmsg("pg_undo cannot be altered"),
 				 errhint("pg_undo is a hard-coded system tablespace and "
 						 "cannot be renamed.")));
+
+	/*
+	 * PGRAC MODIFICATIONS (spec-5.7 TT, §3.3 TT-M1): RENAME mutates an EXISTING
+	 * object, so it ALSO takes the cross-node TT(X) DDL mutex on the OLD OID --
+	 * before the new-name lock below -- so it serialises with a concurrent DROP /
+	 * ALTER of the same tablespace (which key on the OID).  OID-first keeps the
+	 * lock order consistent with DROP/ALTER (and NOWAIT means no deadlock anyway).
+	 * The new-name hash lock below additionally serialises same-new-name RENAMEs.
+	 */
+	cluster_ts_ddl_lock_x_oid(tspId);
 #endif
 
 	/* Must be owner */
@@ -1030,6 +1063,17 @@ RenameTableSpace(const char *oldname, const char *newname)
 #ifdef ENFORCE_REGRESSION_TEST_NAME_RESTRICTIONS
 	if (strncmp(newname, "regress_", 8) != 0)
 		elog(WARNING, "tablespaces created by regression test cases should have names starting with \"regress_\"");
+#endif
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC MODIFICATIONS (spec-5.7 TT, §3.3 TT-M1): RENAME is a NAME-based DDL --
+	 * take the cross-node TT(X) DDL mutex on the NEW name hash before the
+	 * duplicate-name check, so two nodes renaming different tablespaces to the same
+	 * new name serialise (R14, same reason as CREATE).  Held to top-xact end; a
+	 * conflicting peer fails closed 53RA8.
+	 */
+	cluster_ts_ddl_lock_x_name(newname);
 #endif
 
 	/* Make sure the new name doesn't exist */
@@ -1109,6 +1153,14 @@ AlterTableSpaceOptions(AlterTableSpaceOptionsStmt *stmt)
 				 errmsg("pg_undo cannot be altered"),
 				 errhint("pg_undo is managed by the cluster runtime; "
 						 "Stage 1.22 does not support modifying its options.")));
+
+	/*
+	 * PGRAC MODIFICATIONS (spec-5.7 TT, §3.3 TT-M1): ALTER acts on an EXISTING
+	 * object -- take the cross-node TT(X) DDL mutex on its OID before mutating its
+	 * catalog options, so it serialises with a concurrent DROP of the same
+	 * tablespace.  Held to top-xact end; a conflicting peer fails closed 53RA8.
+	 */
+	cluster_ts_ddl_lock_x_oid(tablespaceoid);
 #endif
 
 	/* Must be owner of the existing object */

@@ -59,6 +59,7 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_recovery_worker.h"  /* PGRAC: worker entry (spec-4.4) */
 #include "cluster/cluster_thread_recovery.h" /* PGRAC: worker entry (spec-4.11) */
+#include "cluster/cluster_hw_remaster.h"		 /* PGRAC: HW remaster worker entry (spec-5.7) */
 #endif
 #include "storage/dsm.h"
 #include "storage/ipc.h"
@@ -178,6 +179,10 @@ static const struct
 	/* PGRAC: online thread-recovery executor (spec-4.11 3b-4b). */
 	{
 		"cluster_thread_recovery_worker_main", cluster_thread_recovery_worker_main
+	},
+	/* PGRAC: HW relation-extend authority online-remaster rebuild (spec-5.7 S5/S7). */
+	{
+		"cluster_hw_remaster_worker_main", cluster_hw_remaster_worker_main
 	},
 #endif
 };

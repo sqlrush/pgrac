@@ -46,6 +46,9 @@
 #include "catalog/pg_statistic_ext.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_trigger.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_ts.h" /* PGRAC: spec-5.7 TT (§3.3) placement TT(S) guard */
+#endif
 #include "catalog/pg_type.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
@@ -795,6 +798,18 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	if (stmt->tablespacename)
 	{
 		tablespaceId = get_tablespace_oid(stmt->tablespacename, false);
+
+#ifdef USE_PGRAC_CLUSTER
+		/*
+		 * PGRAC MODIFICATIONS (spec-5.7 TT, §3.3 TT-M2): a relation being placed
+		 * INTO an explicit tablespace takes the cross-node TT(S) in-use guard on
+		 * it, so a concurrent DROP TABLESPACE (TT(X)) on another node is held off
+		 * until this CREATE commits.  Placement DDL only -- never the normal DML
+		 * read/write path.  Held to top-xact end.
+		 */
+		if (OidIsValid(tablespaceId) && tablespaceId != GLOBALTABLESPACE_OID)
+			cluster_ts_placement_lock_s(tablespaceId);
+#endif
 
 		if (partitioned && tablespaceId == MyDatabaseTableSpace)
 			ereport(ERROR,
@@ -14803,6 +14818,18 @@ ATExecSetTableSpace(Oid tableOid, Oid newTableSpace, LOCKMODE lockmode)
 		return;
 	}
 
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC MODIFICATIONS (spec-5.7 TT, §3.3 TT-M2): ALTER ... SET TABLESPACE is a
+	 * placement DDL -- take the cross-node TT(S) in-use guard on the DESTINATION
+	 * tablespace so a concurrent DROP TABLESPACE (TT(X)) on another node is held
+	 * off until this move commits.  The move is confirmed (CheckRelationTableSpace-
+	 * Move returned true) at this point.  Held to top-xact end.
+	 */
+	if (OidIsValid(newTableSpace) && newTableSpace != GLOBALTABLESPACE_OID)
+		cluster_ts_placement_lock_s(newTableSpace);
+#endif
+
 	reltoastrelid = rel->rd_rel->reltoastrelid;
 	/* Fetch the list of indexes on toast relation if necessary */
 	if (OidIsValid(reltoastrelid))
@@ -14889,6 +14916,19 @@ ATExecSetTableSpaceNoStorage(Relation rel, Oid newTableSpace)
 								  0);
 		return;
 	}
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC MODIFICATIONS (spec-5.7 TT, §3.3 TT-M2): the catalog-only SET
+	 * TABLESPACE for a partitioned relation (no physical storage) also takes the
+	 * cross-node TT(S) placement guard on the destination tablespace, so a
+	 * concurrent DROP TABLESPACE (TT(X)) on another node is held off until this
+	 * ALTER commits -- otherwise the partitioned relation's reltablespace could
+	 * be left pointing at a just-dropped tablespace.  Held to top-xact end.
+	 */
+	if (OidIsValid(newTableSpace) && newTableSpace != GLOBALTABLESPACE_OID)
+		cluster_ts_placement_lock_s(newTableSpace);
+#endif
 
 	/* Update can be done, so change reltablespace */
 	SetRelationTableSpace(rel, newTableSpace, InvalidOid);

@@ -80,6 +80,11 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_ges.h"  /* cluster_ges_{request,reply}_defer_count (spec-2.13 D4) */
 #include "cluster/cluster_ges_reply_wait.h" /* spec-2.23 D13 reply wait counters */
 #include "cluster/cluster_grd.h"	  /* cluster_grd_* observability accessors (spec-2.14 D6) */
+#include "cluster/cluster_hw.h"		  /* HW relation-extend authority counters (spec-5.7 §3.1c) */
+#include "cluster/cluster_dl.h"		  /* DL bulk-load lease counters (spec-5.7 D4) */
+#include "cluster/cluster_ir.h"		  /* IR instance-recovery owner counters (spec-5.7 D8) */
+#include "cluster/cluster_ts.h"		  /* TT tablespace-DDL lock counters (spec-5.7 D5) */
+#include "cluster/cluster_ko.h"		  /* KO object-reuse flush counters (spec-5.7 D6) */
 #include "cluster/cluster_sequence.h" /* cluster_sq_* counters (spec-5.4 D9) */
 #include "cluster/cluster_advisory.h" /* cluster_advisory_* counters (spec-5.5 D8) */
 #include "cluster/cluster_lmd.h"	  /* cluster_lmd_* observability accessors (spec-2.19 D10) */
@@ -2146,6 +2151,102 @@ dump_write_fence(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_write_fence_get_baseline_authority_age_us()));
 }
 
+/*
+ * dump_hw -- spec-5.7 HW (relation-extend) authority observability.  The
+ * counters surface the first-sight establishment (§3.1c) and the online-remaster
+ * HW rebuild (§3.1b R4/R9): remaster_done / remaster_blocked make the survivor's
+ * HW authority rebuild after a master death directly observable (S7), and
+ * not_ready / failclosed surface the 53RA6 fail-closed serve gate.
+ */
+static void
+dump_hw(ReturnSetInfo *rsinfo)
+{
+	emit_row(rsinfo, "hw", "alloc_count", fmt_int64((int64)cluster_hw_alloc_count()));
+	emit_row(rsinfo, "hw", "authority_create_count",
+			 fmt_int64((int64)cluster_hw_authority_create_count()));
+	emit_row(rsinfo, "hw", "reserve_wal_count", fmt_int64((int64)cluster_hw_reserve_wal_count()));
+	emit_row(rsinfo, "hw", "rebuild_count", fmt_int64((int64)cluster_hw_rebuild_count()));
+	emit_row(rsinfo, "hw", "failclosed_count", fmt_int64((int64)cluster_hw_failclosed_count()));
+	emit_row(rsinfo, "hw", "not_ready_count", fmt_int64((int64)cluster_hw_not_ready_count()));
+	emit_row(rsinfo, "hw", "remaster_done_count",
+			 fmt_int64((int64)cluster_hw_remaster_done_count()));
+	emit_row(rsinfo, "hw", "remaster_blocked_count",
+			 fmt_int64((int64)cluster_hw_remaster_blocked_count()));
+}
+
+/*
+ * dump_dl -- spec-5.7 §3.2 DL (bulk-load lease) observability.  lease_count is
+ * the faithful proof that a bulk load took the real cross-node DL(X) GES lease;
+ * native_count counts uncoordinated proceeds; failclosed_count counts 53RA7;
+ * release_count counts coordinated leases released (incl. the xact-end backstop
+ * for an aborted bulk load -- lease_count > release_count for long = a leak).
+ */
+static void
+dump_dl(ReturnSetInfo *rsinfo)
+{
+	emit_row(rsinfo, "dl", "lease_count", fmt_int64((int64)cluster_dl_lease_count()));
+	emit_row(rsinfo, "dl", "native_count", fmt_int64((int64)cluster_dl_native_count()));
+	emit_row(rsinfo, "dl", "failclosed_count", fmt_int64((int64)cluster_dl_failclosed_count()));
+	emit_row(rsinfo, "dl", "release_count", fmt_int64((int64)cluster_dl_release_count()));
+}
+
+/*
+ * dump_ir -- spec-5.7 §3.4 IR (instance-recovery owner) observability.
+ * owner_count is the faithful proof that a survivor took the real GES-enforced
+ * IR(X) recovery-owner lock before its destructive thread-recovery apply;
+ * conflict_count counts the 53RA9 non-owner fail-closed path (a survivor whose
+ * alive-set view diverged and lost the IR(X) claim); native_count counts the
+ * single-node / no-competitor proceeds; release_count counts owner claims
+ * released after the apply.
+ */
+static void
+dump_ir(ReturnSetInfo *rsinfo)
+{
+	emit_row(rsinfo, "ir", "owner_count", fmt_int64((int64)cluster_ir_owner_count()));
+	emit_row(rsinfo, "ir", "native_count", fmt_int64((int64)cluster_ir_native_count()));
+	emit_row(rsinfo, "ir", "conflict_count", fmt_int64((int64)cluster_ir_conflict_count()));
+	emit_row(rsinfo, "ir", "release_count", fmt_int64((int64)cluster_ir_release_count()));
+}
+
+/*
+ * dump_ts -- spec-5.7 §3.3 TT (tablespace-DDL) lock observability.  x_count is
+ * the cross-node DDL mutex (CREATE/DROP/ALTER/RENAME TABLESPACE) grants; s_count
+ * the placement-DDL in-use guard grants; native_count the single-node proceeds;
+ * failclosed_count the 53RA8 conflict fail-closed (a peer held a conflicting
+ * TT(X)/TT(S)).
+ */
+static void
+dump_ts(ReturnSetInfo *rsinfo)
+{
+	emit_row(rsinfo, "ts", "x_count", fmt_int64((int64)cluster_ts_x_count()));
+	emit_row(rsinfo, "ts", "s_count", fmt_int64((int64)cluster_ts_s_count()));
+	emit_row(rsinfo, "ts", "native_count", fmt_int64((int64)cluster_ts_native_count()));
+	emit_row(rsinfo, "ts", "failclosed_count", fmt_int64((int64)cluster_ts_failclosed_count()));
+}
+
+/*
+ * dump_ko -- spec-5.7 §3.5/§3.6 KO (object-reuse flush) barrier observability.
+ * flush_count is barriers initiated by a dropping node; ack_received_count the
+ * per-peer apply-after-drop DONE ACKs recorded; failclosed_count the 53RAA
+ * fail-closed (a peer did not flush in time / KO(X) unavailable); native_count
+ * the no-op cases (single-node / no alive peer / private relation);
+ * lockfail_count the best-effort KO(X) acquires that failed (the barrier still
+ * ran -- KO(X) is auxiliary serialisation, not the correctness gate);
+ * peer_apply_count the local flush+drop applied + ACK'd as a peer;
+ * inbound_full_count the KO inbound ring overflows (peer dropped a request).
+ */
+static void
+dump_ko(ReturnSetInfo *rsinfo)
+{
+	emit_row(rsinfo, "ko", "flush_count", fmt_int64((int64)cluster_ko_flush_count()));
+	emit_row(rsinfo, "ko", "ack_received_count", fmt_int64((int64)cluster_ko_ack_received_count()));
+	emit_row(rsinfo, "ko", "failclosed_count", fmt_int64((int64)cluster_ko_failclosed_count()));
+	emit_row(rsinfo, "ko", "native_count", fmt_int64((int64)cluster_ko_native_count()));
+	emit_row(rsinfo, "ko", "lockfail_count", fmt_int64((int64)cluster_ko_lockfail_count()));
+	emit_row(rsinfo, "ko", "peer_apply_count", fmt_int64((int64)cluster_ko_peer_apply_count()));
+	emit_row(rsinfo, "ko", "inbound_full_count", fmt_int64((int64)cluster_ko_inbound_full_count()));
+}
+
 #endif /* USE_PGRAC_CLUSTER */
 
 
@@ -2202,6 +2303,11 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		dump_cr(rsinfo);
 		dump_wal_thread(rsinfo);
 		dump_write_fence(rsinfo);
+		dump_hw(rsinfo);
+		dump_dl(rsinfo);
+		dump_ir(rsinfo);
+		dump_ts(rsinfo);
+		dump_ko(rsinfo);
 	}
 #else
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

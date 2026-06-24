@@ -37,6 +37,14 @@
 #include "storage/predicate.h"
 #include "storage/smgr.h"
 
+#ifdef USE_PGRAC_CLUSTER
+#include "access/xlog.h"			 /* RecoveryInProgress */
+#include "cluster/cluster_conf.h"	 /* cluster_conf_node_count */
+#include "cluster/cluster_guc.h"	 /* cluster_node_id, cluster_relation_extend_lock_enabled */
+#include "cluster/cluster_hw.h"		 /* spec-5.7 §3.1c Q16 — HW authority for hash split */
+#include "utils/rel.h"				 /* RelationGetSmgr */
+#endif
+
 static bool _hash_alloc_buckets(Relation rel, BlockNumber firstblock,
 								uint32 nblocks);
 static void _hash_splitbucket(Relation rel, Buffer metabuf,
@@ -1004,6 +1012,81 @@ _hash_alloc_buckets(Relation rel, BlockNumber firstblock, uint32 nblocks)
 	 */
 	if (lastblock < firstblock || lastblock == InvalidBlockNumber)
 		return false;
+
+#ifdef USE_PGRAC_CLUSTER
+
+	/*
+	 * spec-5.7 §3.1c Q16 (v1.4 amend): in a multi-node cluster a committed
+	 * shared hash index split must claim its splitpoint block range from the HW
+	 * authority, not by a direct smgrextend.  _hash_alloc_buckets is reached from
+	 * _hash_expandtable on an already-committed, peer-visible index, so two nodes
+	 * splitting it would otherwise each compute the same start block and double-
+	 * write (the one MAIN-fork bypass on a committed shared relation, §3.1c group
+	 * B).  Claim [firstblock, lastblock] under HW(X) and verify the authority
+	 * grants EXACTLY that range; ANY disagreement fails closed (53RA6) -- we never
+	 * write to a different physical block than the authority sanctioned.
+	 */
+	if (cluster_relation_extend_lock_enabled && cluster_node_id >= 0
+		&& cluster_conf_node_count() > 1 && !RecoveryInProgress())
+	{
+		ClusterHwClass hwc = cluster_hw_classify_persistence(rel->rd_rel->relpersistence, true);
+
+		if (hwc == CLUSTER_HW_FAIL_CLOSED)
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
+					 errmsg("unlogged hash index \"%s\" cannot be safely split in a multi-node "
+							"cluster",
+							RelationGetRelationName(rel)),
+					 errhint("Unlogged relations have no WAL authority to coordinate cross-node "
+							 "extension.")));
+
+		if (hwc == CLUSTER_HW_GLOBALIZE)
+		{
+			ClusterResId hw_resid;
+			HwLock		hwlk;
+			BlockNumber granted_first;
+			BlockNumber seed_nblocks;
+			uint32		hw_granted = 0;
+
+			cluster_hw_resid_encode(RelationGetSmgr(rel)->smgr_rlocator.locator, MAIN_FORKNUM,
+									&hw_resid);
+			if (!cluster_hw_lock(&hw_resid, &hwlk))
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
+						 errmsg("could not acquire the cluster relation-extend lock for hash index "
+								"\"%s\"",
+								RelationGetRelationName(rel))));
+
+			/* §3.1c Q14 establishment seed: forced re-stat under HW(X). */
+			RelationGetSmgr(rel)->smgr_cached_nblocks[MAIN_FORKNUM] = InvalidBlockNumber;
+			seed_nblocks = smgrnblocks(RelationGetSmgr(rel), MAIN_FORKNUM);
+
+			granted_first = cluster_hw_allocate(RelationGetSmgr(rel)->smgr_rlocator.locator,
+												MAIN_FORKNUM, nblocks, seed_nblocks, &hw_granted);
+			cluster_hw_unlock(&hwlk);
+
+			/*
+			 * The authority must grant EXACTLY the hash-computed splitpoint range
+			 * [firstblock, lastblock].  A short grant, a failure, or a different
+			 * start means the index size and the authority are out of sync -> fail
+			 * closed rather than write a zero page to a block the authority did not
+			 * sanction (Q16, 8.A).
+			 */
+			if (granted_first == InvalidBlockNumber || hw_granted != nblocks
+				|| granted_first != firstblock)
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
+						 errmsg("cluster relation-extend authority disagrees with the hash index "
+								"\"%s\" split range",
+								RelationGetRelationName(rel)),
+						 errdetail("Expected first block %u for %u blocks; the authority granted "
+								   "first %u for %u.",
+								   firstblock, nblocks, granted_first, hw_granted),
+						 errhint("The hash index size and the cluster authority are out of sync; "
+								 "this split fails closed to avoid a duplicate physical block.")));
+		}
+	}
+#endif
 
 	page = (Page) zerobuf.data;
 

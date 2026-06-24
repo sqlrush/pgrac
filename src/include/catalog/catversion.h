@@ -640,7 +640,21 @@
  * TEST-ONLY entry -- cluster_thread_capability_gate_test (oid 8947) -- driving
  * the FEATURE_NOT_SUPPORTED gate (no-shared-backend / >2-node) deterministically.
  * One pg_proc row -> bump. */
-#define CATALOG_VERSION_NO 202606180
+/* spec-5.7 D8 (2026-06-24): IR (instance-recovery owner) adds two TEST-ONLY
+ * entries -- cluster_ir_acquire_probe (oid 8951) + cluster_ir_release_probe (oid
+ * 8952) -- the mechanism-level driver for the real GES IR(X) acquire + 53RA9
+ * non-owner fail-closed (t/295).  Two pg_proc rows -> bump. */
+/* spec-5.7 D5 (2026-06-24): TT (tablespace-DDL) adds two TEST-ONLY entries --
+ * cluster_ts_acquire_probe (oid 8953) + cluster_ts_release_probe (oid 8954) --
+ * the mechanism driver for the real GES TT(X)/TT(S) acquire + 53RA8 conflict
+ * fail-closed (t/296).  Two pg_proc rows -> bump. */
+/* spec-5.7 D6 (2026-06-24): KO (object-reuse flush) adds SQLSTATE 53RAA, the
+ * "pgrac cluster ko" shmem region, the pg_cluster_state "ko" dump category, the
+ * cluster-ko-peer-skip-ack injection point, and one TEST-ONLY entry --
+ * cluster_ko_flush_probe (oid 8955), the mechanism driver for the real KO
+ * fanout + apply-after-drop ACK + 53RAA fail-closed (t/297).  One pg_proc row
+ * -> bump. */
+#define CATALOG_VERSION_NO 202606242
 
 /* spec-2.39 D10 (2026-05-21):  SI Broadcaster production activation —
  * DDL commit hook (AtEOXact_Inval + COMMIT PREPARED via cluster-aware

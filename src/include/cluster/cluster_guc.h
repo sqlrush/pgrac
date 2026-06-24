@@ -634,6 +634,9 @@ extern bool cluster_local_fast_path_enabled;
  *	inline cluster_lock_should_globalize() advisory branch.
  */
 extern bool cluster_advisory_lock_enabled;
+extern bool cluster_relation_extend_lock_enabled; /* spec-5.7 HW */
+extern bool cluster_tablespace_ddl_lock_enabled;  /* spec-5.7 TT */
+extern bool cluster_object_reuse_flush_enabled;	  /* spec-5.7 KO */
 
 /*
  * cluster.lmd_max_wait_edges (spec-2.22 D9).

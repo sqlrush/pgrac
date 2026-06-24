@@ -67,6 +67,8 @@
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_reconfig.h" /* cluster_reconfig_lmon_tick (spec-2.29 Step 2 D3) */
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_hw.h" /* cluster_hw_register_ic_msg_types (spec-5.7 D1) */
+#include "cluster/cluster_ko.h" /* cluster_ko_register_ic_msg_types (spec-5.7 D6) */
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_chunk.h" /* cluster_ic_chunk_scan_reassembly_timeouts (2.4) */
@@ -369,6 +371,32 @@ cluster_lmon_shmem_init(void)
 		if (!tt_status_hint_registered) {
 			cluster_tt_status_hint_register_msg_type();
 			tt_status_hint_registered = true;
+		}
+	}
+
+	/* spec-5.7a D1:  register PGRAC_IC_MSG_HW_ALLOC (22) + HW_ALLOC_REPLY (23)
+	 * for the HW relation-extend block-number authority round trip.  Backends
+	 * produce HW_ALLOC (enqueued to the LMON outbound ring + drained); LMON
+	 * produces HW_ALLOC_REPLY (master inbound handler replies directly). */
+	{
+		static bool hw_alloc_registered = false;
+
+		if (!hw_alloc_registered) {
+			cluster_hw_register_ic_msg_types();
+			hw_alloc_registered = true;
+		}
+	}
+
+	/* spec-5.7 D6:  register PGRAC_IC_MSG_KO_FLUSH (24) + KO_FLUSH_ACK (25) for
+	 * the object-reuse flush barrier.  A dropping backend enqueues KO_FLUSH to
+	 * each alive peer (LMON sends); the peer's SI Broadcaster aux enqueues
+	 * KO_FLUSH_ACK after dropping the buffers (LMON sends). */
+	{
+		static bool ko_flush_registered = false;
+
+		if (!ko_flush_registered) {
+			cluster_ko_register_ic_msg_types();
+			ko_flush_registered = true;
 		}
 	}
 }

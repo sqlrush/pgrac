@@ -1449,6 +1449,12 @@ pgstat_get_wait_cluster_bgproc(WaitEventCluster w)
 	case WAIT_EVENT_CLUSTER_CF_ENQUEUE:
 		event_name = "ClusterCfEnqueueWait";
 		break;
+	case WAIT_EVENT_CLUSTER_REL_EXTEND_WAIT:
+		event_name = "ClusterRelExtendWait";
+		break;
+	case WAIT_EVENT_CLUSTER_OBJECT_FLUSH_WAIT:
+		event_name = "ClusterObjectFlushWait";
+		break;
 	default:
 		break;
 	}

@@ -580,6 +580,19 @@ typedef enum {
 	 * cluster.cf_enqueue_timeout_ms.  Wake on grant arrival or timeout (53R70).
 	 */
 	WAIT_EVENT_CLUSTER_CF_ENQUEUE,
+	/*
+	 * spec-5.7 D6/D12:  HW (relation-extend) authority wait.  A backend extending
+	 * a GLOBALIZE relation sleeps here while acquiring HW(X) / awaiting the
+	 * HW_ALLOC block-range reply from the resid's GES master (hot-path authority).
+	 */
+	WAIT_EVENT_CLUSTER_REL_EXTEND_WAIT,
+	/*
+	 * spec-5.7 D6/D12:  KO (object-reuse flush) barrier wait.  A backend dropping
+	 * or truncating a relation sleeps here while every alive peer flushes + drops
+	 * the relfilenode's buffers and ACKs (apply-after-drop), bounded by
+	 * cluster.sinval_ack_timeout_ms.  Wake on all ACKs or timeout (53RAA).
+	 */
+	WAIT_EVENT_CLUSTER_OBJECT_FLUSH_WAIT,
 } WaitEventCluster;
 
 

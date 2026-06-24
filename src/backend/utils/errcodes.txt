@@ -775,6 +775,41 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 # not a transient timeout.
 53RA5    E    ERRCODE_CLUSTER_SEQUENCE_ALLOC_UNAVAILABLE                       cluster_sequence_alloc_unavailable
 
+# spec-5.7 HW (relation extend): the cluster block-number authority could not
+# hand out a block range -- the HW(X) enqueue / HW_ALLOC round trip could not be
+# proven (master unreachable / IC timeout / authority HTAB full), or an unlogged
+# relation was extended in a multi-node cluster (no WAL authority to rebuild the
+# HWM).  Fail closed: never a silent local FileSize extend that could re-allocate
+# a block another node already owns (rule 8.A).
+53RA6    E    ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE                      cluster_relation_extend_unavailable
+
+# spec-5.7 DL: the cross-node bulk-load lease (DL(X), §3.2) could not be granted
+# -- a peer holds it, or the GES round trip timed out / failed.  Fail closed
+# rather than bulk-load a relation without the cross-node coordination lease.
+53RA7    E    ERRCODE_CLUSTER_BULK_LOAD_LEASE_UNAVAILABLE                      cluster_bulk_load_lease_unavailable
+
+# spec-5.7 TT (§3.3): the cross-node tablespace-DDL lock (TT(X)/TT(S)) could not
+# be granted -- a peer is running conflicting tablespace DDL, or a placement DDL
+# holds TT(S) against a concurrent DROP, or the GES round trip failed.  Fail
+# closed rather than run tablespace DDL without the cross-node mutex.
+53RA8    E    ERRCODE_CLUSTER_TABLESPACE_LOCK_CONFLICT                         cluster_tablespace_lock_conflict
+
+# spec-5.7 IR (§3.4): a survivor tried to run the destructive part of a dead
+# node's instance recovery but is NOT the GES-enforced recovery owner -- a peer
+# holds IR(X) on (dead_node, episode_epoch).  Fail closed rather than let two
+# survivors whose alive-set views diverge both mutate the same dead resource
+# (non-idempotent double apply, 8.A).
+53RA9    E    ERRCODE_CLUSTER_RECOVERY_OWNER_CONFLICT                          cluster_recovery_owner_conflict
+
+# spec-5.7 KO (§3.5): a relation's storage is about to be physically removed or
+# truncated (DROP / TRUNCATE / VACUUM truncation) but the cross-node object-reuse
+# flush barrier could not confirm that every alive peer dropped the relfilenode's
+# buffers (a peer did not ACK / timed out / is unreachable, or the flush mode was
+# disabled).  Fail closed rather than unlink the file while a peer still holds
+# dirty buffers that a later writeback would scribble into the file or a reused
+# relfilenode (stale writeback, 8.A).
+53RAA    E    ERRCODE_CLUSTER_OBJECT_FLUSH_UNAVAILABLE                         cluster_object_flush_unavailable
+
 Section: Class 54 - Program Limit Exceeded
 
 # this is for wired-in limits, not resource exhaustion problems (class borrowed from DB2)

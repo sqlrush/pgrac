@@ -132,6 +132,7 @@
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: spec-4.1 own-stream strict thread-id for crash recovery. */
 #include "cluster/cluster_guc.h" /* PGRAC: spec-4.5a cluster_wal_threads_dir */
+#include "cluster/cluster_hw_snapshot.h" /* PGRAC: spec-5.7 D3 HW authority recovery load */
 #include "cluster/cluster_remote_xact.h" /* PGRAC: spec-4.5a G5 */
 #include "cluster/cluster_tt_status.h" /* PGRAC: spec-4.5a D11 merged counters */
 #include "cluster/cluster_recovery_plan.h"
@@ -1890,6 +1891,17 @@ PerformWalRecovery(void)
 				(errmsg("cluster recovery: own stream was merged-recovered through %X/%X; "
 						"own shared-block records at or below that point will be skipped",
 						LSN_FORMAT_ARGS((XLogRecPtr) cluster_recovery_own_merge_bound))));
+
+	/*
+	 * PGRAC (spec-5.7 D3 §3.1b R3/R6): load this node's HW relation-extend
+	 * authority snapshot into the authority table BEFORE redo replays the
+	 * HW_RESERVE tail on top, so the rebuilt HWM = max(snapshot, tail) and a
+	 * surviving extender's already-replied reservation is never re-handed (no
+	 * double-allocation).  A missing snapshot rebuilds from the WAL tail alone;
+	 * a present-but-corrupt / foreign one FATALs (R6).  Self-gates to a no-op
+	 * unless the HW authority is active (multi-node + shared storage).
+	 */
+	cluster_hw_snapshot_recovery_load();
 #endif
 
 	/*

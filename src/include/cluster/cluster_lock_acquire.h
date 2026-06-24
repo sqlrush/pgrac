@@ -167,6 +167,17 @@ typedef struct ClusterLockAcquireRequest {
 	bool dontwait;
 	/* spec-2.21 D1: HC11 session advisory stays native (skip cluster path). */
 	bool sessionLock;
+	/*
+	 * spec-5.7 D8 (IR-M5): bypass the requester-side shard-freeze gate for a
+	 * fresh-epoch recovery acquire.  Set ONLY by the IR instance-recovery acquire
+	 * (cluster_ir_lock.c) for a (dead_node, NEW_epoch) resid, which is brand new
+	 * this episode and therefore has no holder set being rebuilt -- so the freeze
+	 * gate's sole purpose (not granting against a half-rebuilt holder set) is
+	 * vacuous for it.  Lets the recovery worker take IR(X) while its shard is still
+	 * REBUILDING without deadlocking against the P7 unfreeze it gates.  Defaults to
+	 * false (zero-init), so every other acquire path is unchanged.
+	 */
+	bool recovery_bootstrap;
 	/* spec-2.21 D1: S3 reservation pin / S5 promote / S6 release identity. */
 	ClusterGrdHolderId holder;
 	/* spec-2.21 D1: per-acquire monotonic id; LOCALLOCK exactly-once key. */

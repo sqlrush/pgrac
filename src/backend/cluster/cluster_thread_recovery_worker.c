@@ -61,6 +61,7 @@
 #include "cluster/cluster_conf.h"			   /* node_count / has_peers / CLUSTER_MAX_NODES */
 #include "cluster/cluster_grd.h"			   /* live recovery episode epoch (L235)        */
 #include "cluster/cluster_guc.h"			   /* cluster_online_thread_recovery (scope)    */
+#include "cluster/cluster_ir.h"				   /* spec-5.7 D8 — IR(X) recovery-owner gate    */
 #include "cluster/cluster_thread_recovery.h"   /* slot helpers + replay_one + gates          */
 #include "cluster/storage/cluster_shared_fs.h" /* shared backend (scope)                    */
 
@@ -108,7 +109,9 @@ cluster_thread_recovery_worker_run(uint16 dead_tid)
 	ClusterThreadRecReplayState state;
 	uint64 launch_epoch;
 	ClusterThreadRecResult res;
-	instr_time t_total_start; /* PGRAC: spec-4.13 D5 LOG-only total latency */
+	ClusterIrLock ir_lock;			/* spec-5.7 D8 — held IR(X) recovery-owner claim */
+	ClusterIrAcquireOutcome ir_out; /* spec-5.7 D8 — recovery-owner competition result */
+	instr_time t_total_start;		/* PGRAC: spec-4.13 D5 LOG-only total latency */
 	instr_time t_total_end;
 
 	/* The launch must have marked the slot REPLAYING; anything else means this
@@ -125,10 +128,58 @@ cluster_thread_recovery_worker_run(uint16 dead_tid)
 													cluster_grd_redeclare_episode_epoch()))
 		return CLUSTER_THREADREC_NOT_APPLICABLE;
 
+	/*
+	 * spec-5.7 D8 (IR-M1/M3/M5): gate the destructive apply behind the GES-enforced
+	 * recovery-owner lock IR(X) on (dead_node, launch_epoch).  Only the IR(X) holder
+	 * mutates the dead resource; a survivor whose alive-set view diverged and that
+	 * does NOT hold IR(X) fails closed (53RA9) and never runs replay_one -- so two
+	 * survivors can never both apply the non-idempotent physical recovery of the
+	 * same dead node (8.A).  The acquire honours the bootstrap phase (epoch
+	 * accepted, fresh-epoch freeze-gate bypass) and never blocks, so it cannot stall
+	 * the remaster it depends on.  NATIVE (single node / no competitor) proceeds
+	 * under the existing min(survivor)+epoch authority.  spec-4.1: thread_id =
+	 * node_id + 1, so the dead node id is dead_tid - 1.
+	 */
+	ir_out = cluster_ir_recovery_acquire((int32)dead_tid - 1, launch_epoch, &ir_lock);
+	if (ir_out == CLUSTER_IR_NOT_OWNER)
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_RECOVERY_OWNER_CONFLICT),
+				 errmsg("not the instance-recovery owner for dead thread %u (episode " UINT64_FORMAT
+						")",
+						dead_tid, launch_epoch),
+				 errhint("Another survivor holds the recovery-owner lock; this node keeps the dead "
+						 "thread frozen until that survivor materializes it.")));
+	if (ir_out == CLUSTER_IR_NOT_READY)
+		/* Bootstrap unmet (epoch advanced / ownership unprovable): do not mutate
+		 * this tick; leave the slot for the live episode (keep frozen, 8.A). */
+		return CLUSTER_THREADREC_NOT_APPLICABLE;
+
+	/* OWNER (holds IR(X)) or NATIVE (no competitor) -> run the destructive apply.
+	 * replay_one re-throws a FATAL/PANIC (cluster_thread_recovery_should_rethrow);
+	 * release IR(X) on that path too before it propagates, so a held coordinated
+	 * lock is never abandoned (this worker is a BGWORKER_SHMEM_ACCESS process that
+	 * does NOT run InitPostgres, so the postinit.c GRD cleanup-on-exit hook is not
+	 * registered for it -- the IR resid would otherwise leak until the reconfig
+	 * stale-epoch sweep.  IR-M2 makes the leak benign -- a new episode is a new
+	 * resid -- but releasing here is the correct, leak-free discipline). */
 	INSTR_TIME_SET_CURRENT(t_total_start); /* PGRAC: spec-4.13 D5 total latency start */
-	res = cluster_thread_recovery_replay_one(dead_tid, launch_epoch);
+	PG_TRY();
+	{
+		res = cluster_thread_recovery_replay_one(dead_tid, launch_epoch);
+	}
+	PG_CATCH();
+	{
+		cluster_ir_recovery_release(&ir_lock);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 	INSTR_TIME_SET_CURRENT(t_total_end);
 	INSTR_TIME_SUBTRACT(t_total_end, t_total_start);
+
+	/* The destructive apply (and replay_one's authority publish on DONE) is
+	 * complete -> release IR(X) (a no-op when the outcome was NATIVE). */
+	cluster_ir_recovery_release(&ir_lock);
+
 	ereport(LOG,
 			(errmsg("cluster thread recovery: tid=%u outcome=%s total_us=" INT64_FORMAT, dead_tid,
 					res == CLUSTER_THREADREC_DONE	   ? "DONE"

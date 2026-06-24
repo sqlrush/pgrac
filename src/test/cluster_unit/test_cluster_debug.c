@@ -222,6 +222,179 @@ uint64 cluster_write_fence_get_baseline_published(void);
 bool cluster_write_fence_get_baseline_author_is_self(void);
 uint64 cluster_write_fence_get_baseline_authority_age_us(void);
 bool cluster_write_fence_startup_self_check(void);
+/* spec-5.7 dump_hw stubs: cluster_debug.c's dump_hw reads the HW counters, but
+ * this standalone binary does not link cluster_hw_shmem.o. */
+uint64 cluster_hw_alloc_count(void);
+uint64 cluster_hw_authority_create_count(void);
+uint64 cluster_hw_reserve_wal_count(void);
+uint64 cluster_hw_rebuild_count(void);
+uint64 cluster_hw_failclosed_count(void);
+uint64 cluster_hw_not_ready_count(void);
+uint64 cluster_hw_remaster_done_count(void);
+uint64 cluster_hw_remaster_blocked_count(void);
+uint64
+cluster_hw_alloc_count(void)
+{
+	return 0;
+}
+uint64
+cluster_hw_authority_create_count(void)
+{
+	return 0;
+}
+uint64
+cluster_hw_reserve_wal_count(void)
+{
+	return 0;
+}
+uint64
+cluster_hw_rebuild_count(void)
+{
+	return 0;
+}
+uint64
+cluster_hw_failclosed_count(void)
+{
+	return 0;
+}
+uint64
+cluster_hw_not_ready_count(void)
+{
+	return 0;
+}
+uint64
+cluster_hw_remaster_done_count(void)
+{
+	return 0;
+}
+uint64
+cluster_hw_remaster_blocked_count(void)
+{
+	return 0;
+}
+
+/* spec-5.7 D4 dump_dl stubs (cluster_dl.c not linked in this binary). */
+uint64 cluster_dl_lease_count(void);
+uint64 cluster_dl_native_count(void);
+uint64 cluster_dl_failclosed_count(void);
+uint64 cluster_dl_release_count(void);
+uint64
+cluster_dl_lease_count(void)
+{
+	return 0;
+}
+uint64
+cluster_dl_native_count(void)
+{
+	return 0;
+}
+uint64
+cluster_dl_failclosed_count(void)
+{
+	return 0;
+}
+uint64
+cluster_dl_release_count(void)
+{
+	return 0;
+}
+
+/* spec-5.7 D8 dump_ir stubs (cluster_ir_lock.c not linked in this binary). */
+uint64 cluster_ir_owner_count(void);
+uint64 cluster_ir_native_count(void);
+uint64 cluster_ir_conflict_count(void);
+uint64 cluster_ir_release_count(void);
+uint64
+cluster_ir_owner_count(void)
+{
+	return 0;
+}
+uint64
+cluster_ir_native_count(void)
+{
+	return 0;
+}
+uint64
+cluster_ir_conflict_count(void)
+{
+	return 0;
+}
+uint64
+cluster_ir_release_count(void)
+{
+	return 0;
+}
+
+/* spec-5.7 D5 dump_ts stubs (cluster_ts_lock.c not linked in this binary). */
+uint64 cluster_ts_x_count(void);
+uint64 cluster_ts_s_count(void);
+uint64 cluster_ts_native_count(void);
+uint64 cluster_ts_failclosed_count(void);
+uint64
+cluster_ts_x_count(void)
+{
+	return 0;
+}
+uint64
+cluster_ts_s_count(void)
+{
+	return 0;
+}
+uint64
+cluster_ts_native_count(void)
+{
+	return 0;
+}
+uint64
+cluster_ts_failclosed_count(void)
+{
+	return 0;
+}
+
+/* spec-5.7 D6 dump_ko stubs (cluster_ko_lock.c not linked in this binary). */
+uint64 cluster_ko_flush_count(void);
+uint64 cluster_ko_ack_received_count(void);
+uint64 cluster_ko_failclosed_count(void);
+uint64 cluster_ko_native_count(void);
+uint64 cluster_ko_lockfail_count(void);
+uint64 cluster_ko_peer_apply_count(void);
+uint64 cluster_ko_inbound_full_count(void);
+uint64
+cluster_ko_flush_count(void)
+{
+	return 0;
+}
+uint64
+cluster_ko_lockfail_count(void)
+{
+	return 0;
+}
+uint64
+cluster_ko_ack_received_count(void)
+{
+	return 0;
+}
+uint64
+cluster_ko_failclosed_count(void)
+{
+	return 0;
+}
+uint64
+cluster_ko_native_count(void)
+{
+	return 0;
+}
+uint64
+cluster_ko_peer_apply_count(void)
+{
+	return 0;
+}
+uint64
+cluster_ko_inbound_full_count(void)
+{
+	return 0;
+}
+
 uint64
 cluster_write_fence_get_hot_gate_blocked(void)
 {

@@ -176,6 +176,7 @@
 #include "cluster/cluster_cf_phase2.h" /* PGRAC: spec-5.6 T6 cross-node verify */
 #include "cluster/cluster_cf_storage.h" /* PGRAC: spec-5.6 bootstrap authority window */
 #include "cluster/cluster_guc.h" /* PGRAC: spec-5.6 cluster_controlfile_shared_authority */
+#include "cluster/cluster_hw_snapshot.h" /* PGRAC: spec-5.7 D3 HW authority checkpoint snapshot */
 #include "cluster/cluster_lms.h" /* PGRAC: spec-5.6 GES-ready boundary for CF X */
 #endif
 
@@ -7180,6 +7181,18 @@ CreateCheckPoint(int flags)
 	 */
 	if (!shutdown && XLogStandbyInfoActive())
 		LogStandbySnapshot();
+
+	/*
+	 * PGRAC (spec-5.7 D3 §3.1b R1/R2): persist this node's HW relation-extend
+	 * authority HWMs as a per-master snapshot bound to this checkpoint
+	 * (snapshot_lsn = checkPoint.redo).  Written before the checkpoint record so
+	 * a completed checkpoint always has a durable snapshot; recovery loads it
+	 * and replays the HW_RESERVE WAL tail on top (rebuild = max(snapshot, tail)).
+	 * No-op unless the HW authority is active (multi-node + shared storage).
+	 * Must be outside the critical section below -- it does durable file I/O.
+	 */
+	if (cluster_hw_authority_active())
+		cluster_hw_snapshot_checkpoint_write(checkPoint.redo);
 
 	START_CRIT_SECTION();
 
