@@ -163,6 +163,9 @@ sub _diag_counter_delta
 my $node_off = PostgreSQL::Test::Cluster->new('stage2_perf_off');
 $node_off->init;
 $node_off->append_conf('postgresql.conf', "shared_buffers = 128MB\n");
+# This fixture is the PG baseline:  make it a true cluster_enabled=off
+# node so the spec-5.7 relation-extend engage gate never engages.
+$node_off->append_conf('postgresql.conf', "cluster.enabled = off\n");
 $node_off->start;
 
 # Initialize pgbench (small scale for smoke).
@@ -263,6 +266,10 @@ SKIP: {
 # scripts/perf/run-stage2-cluster-baseline.sh tier=medium。
 my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	'stage2_perf_pair',
+	# spec-5.7 §3.1d.10: the ClusterPair half runs true 2-node DDL / lock
+	# contention; with GRD default non-zero it needs real quorum (voting
+	# disks) for GES mastership.  node_off above stays a pure PG baseline.
+	quorum_voting_disks => 3,
 	extra_conf => [
 		'autovacuum = off',
 

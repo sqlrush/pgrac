@@ -49,6 +49,7 @@
 #include "cluster/cluster_ges.h" /* GES_REJECT_REASON_* for U6 */
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_lock_acquire.h"
+#include "cluster/cluster_native_lock_probe.h" /* spec-5.3 same-lock-group helper */
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/lock.h"
@@ -824,13 +825,82 @@ UT_TEST(test_ul_try_lock_nowait_s4_reject_mapping)
 }
 
 
+/*
+ * spec-5.3 — native-probe PG parallel lock-group exemption helper.  Pure
+ * pointer/flag logic (no shmem deref), so it is driven directly with distinct
+ * dummy group-leader PGPROC addresses.  Mirrors PG LockCheckConflicts.
+ */
+UT_TEST(test_native_probe_same_lock_group_exempt)
+{
+	char slotA;
+	char slotB;
+	const struct PGPROC *leaderA = (const struct PGPROC *)&slotA;
+	const struct PGPROC *leaderB = (const struct PGPROC *)&slotB;
+
+	/* a. same lock group + normal relation lock -> exempt (skip conflict). */
+	UT_ASSERT(cluster_native_lock_probe_same_group_exempt((uint8)LOCKTAG_RELATION, true, leaderA,
+														  leaderA));
+
+	/* b. different lock group -> NOT exempt (keep conflict). */
+	UT_ASSERT(!cluster_native_lock_probe_same_group_exempt((uint8)LOCKTAG_RELATION, true, leaderA,
+														   leaderB));
+
+	/* c. LOCKTAG_RELATION_EXTEND + same group -> NOT exempt (PG exception). */
+	UT_ASSERT(!cluster_native_lock_probe_same_group_exempt((uint8)LOCKTAG_RELATION_EXTEND, true,
+														   leaderA, leaderA));
+
+	/* d. requester not local -> NOT exempt. */
+	UT_ASSERT(!cluster_native_lock_probe_same_group_exempt((uint8)LOCKTAG_RELATION, false, leaderA,
+														   leaderA));
+
+	/* e. missing requester/holder group leader -> NOT exempt. */
+	UT_ASSERT(
+		!cluster_native_lock_probe_same_group_exempt((uint8)LOCKTAG_RELATION, true, NULL, leaderA));
+	UT_ASSERT(
+		!cluster_native_lock_probe_same_group_exempt((uint8)LOCKTAG_RELATION, true, leaderA, NULL));
+
+	/* f. non-parallel backends are each their own leader (distinct addrs) ->
+	 * keep conflict;  proves we do not over-exclude unrelated backends. */
+	UT_ASSERT(!cluster_native_lock_probe_same_group_exempt((uint8)LOCKTAG_RELATION, true, leaderA,
+														   leaderB));
+}
+
+
+/*
+ * spec-5.3 D1 — S5-promote NOT_FOUND benign exemption is strictly narrowed to
+ * {LOCKTAG_TRANSACTION, ShareLock, CLUSTER_GRD_ENTRY_NOT_FOUND} (the
+ * XactLockTableWait waiter whose awaited txn finished).  Everything else stays
+ * a failure.
+ */
+UT_TEST(test_s5_not_found_benign_narrow)
+{
+	/* a. transaction + ShareLock + NOT_FOUND -> benign success. */
+	UT_ASSERT(cluster_lock_acquire_s5_not_found_is_benign((uint8)LOCKTAG_TRANSACTION, ShareLock,
+														  CLUSTER_GRD_ENTRY_NOT_FOUND));
+
+	/* b. transaction + ExclusiveLock holder + NOT_FOUND -> NOT benign (P0). */
+	UT_ASSERT(!cluster_lock_acquire_s5_not_found_is_benign(
+		(uint8)LOCKTAG_TRANSACTION, ExclusiveLock, CLUSTER_GRD_ENTRY_NOT_FOUND));
+
+	/* c. non-transaction lock + NOT_FOUND -> NOT benign. */
+	UT_ASSERT(!cluster_lock_acquire_s5_not_found_is_benign((uint8)LOCKTAG_RELATION, ShareLock,
+														   CLUSTER_GRD_ENTRY_NOT_FOUND));
+
+	/* d. transaction + ShareLock + other GRD error -> NOT benign. */
+	UT_ASSERT(!cluster_lock_acquire_s5_not_found_is_benign((uint8)LOCKTAG_TRANSACTION, ShareLock,
+														   CLUSTER_GRD_ENTRY_FULL));
+	UT_ASSERT(!cluster_lock_acquire_s5_not_found_is_benign((uint8)LOCKTAG_TRANSACTION, ShareLock,
+														   CLUSTER_GRD_ENTRY_OK));
+}
+
+
 UT_DEFINE_GLOBALS();
 
 
 int
 main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 {
-	UT_PLAN(11);
+	UT_PLAN(13);
 
 	UT_RUN(test_7step_api_surface_linkable_and_initial_counters_zero);
 	UT_RUN(test_7step_s1_hc1_fail_closed);
@@ -843,6 +913,8 @@ main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 	UT_RUN(test_7step_transaction_locktag_release_path_safe);
 	UT_RUN(test_ul_session_advisory_globalize_gate);
 	UT_RUN(test_ul_try_lock_nowait_s4_reject_mapping);
+	UT_RUN(test_native_probe_same_lock_group_exempt);
+	UT_RUN(test_s5_not_found_benign_narrow);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

@@ -67,13 +67,14 @@ my $has_visibility_inject =
 # +1 for the unconditional "pgrac cluster sequence" region (spec-5.4 SQ
 # instance-cache shmem foundation; sorts between scn and sinval ack outbound)
 # and +1 for the unconditional "pgrac cluster cf stats" region (spec-5.6 Dc4).
-# +4 for the unconditional spec-5.7 enqueue-class counter regions: "pgrac
-# cluster dl" (D4, sorts between diag and durable), "pgrac cluster hw" (D1) and
-# "pgrac cluster ir" (D8, both sort between grd work queue and lck), and "pgrac
-# cluster ts" (D5, sorts between subtrans state and tt local seq).
-my $expected_region_count = $has_visibility_inject ? '58' : '57';
+# +5 for the unconditional spec-5.7 enqueue-class counter regions: "pgrac
+# cluster dl" (D4, sorts between diag and durable), "pgrac cluster hw" (D1),
+# "pgrac cluster ir" (D8) and "pgrac cluster ko" (D6/D7, both sort between grd
+# work queue and lck), and "pgrac cluster ts" (D5, sorts between subtrans state
+# and tt local seq).
+my $expected_region_count = $has_visibility_inject ? '59' : '58';
 my $expected_regions =
-  'pgrac block recovery,pgrac cluster advisory,pgrac cluster cf stats,pgrac cluster conf,pgrac cluster control,pgrac cluster cr counters,pgrac cluster cssd,pgrac cluster diag,pgrac cluster dl,pgrac cluster durable tt counters,pgrac cluster epoch,pgrac cluster fence,pgrac cluster gcs,pgrac cluster gcs block,pgrac cluster gcs block dedup,pgrac cluster ges,pgrac cluster ges dedup,pgrac cluster ges reply wait,pgrac cluster grd,pgrac cluster grd outbound,pgrac cluster grd pending,pgrac cluster grd work queue,pgrac cluster hw,pgrac cluster ir,pgrac cluster lck,pgrac cluster lmd,pgrac cluster lmd graph,pgrac cluster lmon,pgrac cluster lms,pgrac cluster lock-path counters,pgrac cluster multixact overlay,pgrac cluster pcm grd,pgrac cluster qvotec,pgrac cluster reconfig,pgrac cluster scn,pgrac cluster sequence,pgrac cluster sinval ack outbound,pgrac cluster sinval ack wait,pgrac cluster sinval inbound,pgrac cluster sinval outbound,pgrac cluster smgr,pgrac cluster startup phase,pgrac cluster stats,pgrac cluster subtrans state,pgrac cluster ts,pgrac cluster tt local seq,pgrac cluster tt slot allocator,pgrac cluster tt status hint outbound,pgrac cluster tt status overlay,pgrac cluster tx enqueue,pgrac cluster undo cleaner,pgrac cluster undo record cursor';
+  'pgrac block recovery,pgrac cluster advisory,pgrac cluster cf stats,pgrac cluster conf,pgrac cluster control,pgrac cluster cr counters,pgrac cluster cssd,pgrac cluster diag,pgrac cluster dl,pgrac cluster durable tt counters,pgrac cluster epoch,pgrac cluster fence,pgrac cluster gcs,pgrac cluster gcs block,pgrac cluster gcs block dedup,pgrac cluster ges,pgrac cluster ges dedup,pgrac cluster ges reply wait,pgrac cluster grd,pgrac cluster grd outbound,pgrac cluster grd pending,pgrac cluster grd work queue,pgrac cluster hw,pgrac cluster ir,pgrac cluster ko,pgrac cluster lck,pgrac cluster lmd,pgrac cluster lmd graph,pgrac cluster lmon,pgrac cluster lms,pgrac cluster lock-path counters,pgrac cluster multixact overlay,pgrac cluster pcm grd,pgrac cluster qvotec,pgrac cluster reconfig,pgrac cluster scn,pgrac cluster sequence,pgrac cluster sinval ack outbound,pgrac cluster sinval ack wait,pgrac cluster sinval inbound,pgrac cluster sinval outbound,pgrac cluster smgr,pgrac cluster startup phase,pgrac cluster stats,pgrac cluster subtrans state,pgrac cluster ts,pgrac cluster tt local seq,pgrac cluster tt slot allocator,pgrac cluster tt status hint outbound,pgrac cluster tt status overlay,pgrac cluster tx enqueue,pgrac cluster undo cleaner,pgrac cluster undo record cursor';
 $expected_regions .= ',pgrac cluster visibility inject'
   if $has_visibility_inject;
 # spec-4.12 D7: cooperative write-fence region;  always registered.  Sorts after
@@ -234,8 +235,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '128',
-   'L15 total injection registry size is 128 (spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2 undo boundary guards)');
+   '129',
+   'L15 total injection registry size is 129 (spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2 undo boundary guards; spec-5.7 +1 cluster-ko-peer-skip-ack)');
 
 
 # ----------

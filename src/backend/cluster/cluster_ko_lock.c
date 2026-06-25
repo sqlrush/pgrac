@@ -48,6 +48,7 @@
 #include "catalog/pg_class.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_epoch.h"
+#include "cluster/cluster_extend_gate.h"
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_guc.h"
@@ -380,7 +381,17 @@ cluster_ko_flush_and_wait_ack(RelFileLocator rloc, char relpersistence)
 		return;
 	if (relpersistence == RELPERSISTENCE_TEMP)
 		return;
-	if (cluster_node_id < 0 || cluster_conf_node_count() <= 1 || RecoveryInProgress())
+	if (cluster_node_id < 0 || RecoveryInProgress())
+		return;
+	/*
+	 * Engage from runtime liveness, not the static configured node count
+	 * (spec-5.7 §3.1d).  wait_for_lms = false: the flush barrier rides on sinval
+	 * (not LMS) and has its own alive-peer gate below, so KO never blocks a
+	 * DROP/TRUNCATE on LMS warming up.  With no alive peer (NATIVE) there are no
+	 * remote buffers to flush -> skip.  COORDINATE / FAIL_CLOSED both fall through
+	 * to the barrier, which self-gates on the peer-ACK requirement.
+	 */
+	if (cluster_extend_liveness_engage(false) == CLUSTER_EXTEND_ENGAGE_NATIVE)
 		return;
 
 	/*

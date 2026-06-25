@@ -58,6 +58,7 @@
 #include "cluster/cluster_block_recovery.h" /* spec-4.10 D1 — online block recovery */
 #include "cluster/cluster_conf.h"			/* spec-5.7 HW — cluster_conf_node_count */
 #include "cluster/cluster_hw.h"				/* spec-5.7 HW — relation-extend authority */
+#include "cluster/cluster_extend_gate.h" /* spec-5.7 §3.1d — liveness engage gate */
 
 /*
  * PGRAC (spec-4.10 D1): ignore_checksum_failure is defined in bufpage.c with
@@ -1985,8 +1986,12 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	 *   - fork == MAIN_FORKNUM only.  FSM/VM forks use positional extend-to (a
 	 *     block addresses a fixed heap range) and are page-coordinated by Cache
 	 *     Fusion, so the sequential authority does not apply to them.
-	 *   - multi-node only (cluster_conf_node_count() > 1); a single node has no
-	 *     cross-node coherence problem (and avoids a per-extend WAL flush).
+	 *   - runtime-multi-node only (cluster_extend_liveness_engage, spec-5.7
+	 *     §3.1d): engage the authority only when a peer is actually alive and the
+	 *     GES/LMS substrate is ready.  A single-alive / degraded / single-node-
+	 *     compat node extends PG-natively (no cross-node coherence problem, and
+	 *     avoids a per-extend WAL flush) instead of fail-closing on the static
+	 *     configured node count.
 	 *   - live backend extends only (bmr.rel != NULL && !RecoveryInProgress());
 	 *     recovery redo replays deterministic block numbers from WAL and rebuilds
 	 *     the authority via HW_RESERVE redo.
@@ -1999,15 +2004,44 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	ClusterResId hw_resid;
 
 	if (cluster_relation_extend_lock_enabled && bmr.rel != NULL && cluster_node_id >= 0
-		&& fork == MAIN_FORKNUM && cluster_conf_node_count() > 1 && !RecoveryInProgress())
+		&& fork == MAIN_FORKNUM && !RecoveryInProgress()
+		&& bmr.rel->rd_rel->relpersistence != RELPERSISTENCE_TEMP)
 	{
-		hwc = cluster_hw_classify_persistence(bmr.rel->rd_rel->relpersistence, true);
-		if (hwc == CLUSTER_HW_FAIL_CLOSED)
+		/*
+		 * Decide whether to engage the cross-node authority from runtime
+		 * liveness, not the static configured node count (spec-5.7 §3.1d, v1.5
+		 * amend).  HW passes wait_for_lms = true so a DML waits out a brief LMS
+		 * warmup instead of failing.  Temp relations are excluded above (always
+		 * PG-local).
+		 */
+		ClusterExtendEngage engage = cluster_extend_liveness_engage(true);
+
+		if (engage == CLUSTER_EXTEND_ENGAGE_FAIL_CLOSED)
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
-					 errmsg("unlogged relation \"%s\" cannot be safely extended in a multi-node cluster",
+					 errmsg("could not acquire the cluster relation-extend lock for \"%s\"",
 							RelationGetRelationName(bmr.rel)),
-					 errhint("Unlogged relations have no WAL authority to coordinate cross-node extension.")));
+					 errdetail("The cluster coordination substrate is not ready and an alive peer could not be ruled out.")));
+
+		if (engage == CLUSTER_EXTEND_ENGAGE_COORDINATE)
+		{
+			/*
+			 * A peer is alive and the substrate is ready: a permanent relation is
+			 * GLOBALIZE (authority-owned from block 0); an unlogged relation has no
+			 * WAL authority and cannot be coordinated -> fail closed.
+			 */
+			hwc = cluster_hw_classify_persistence(bmr.rel->rd_rel->relpersistence, true);
+			if (hwc == CLUSTER_HW_FAIL_CLOSED)
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
+						 errmsg("unlogged relation \"%s\" cannot be safely extended in a multi-node cluster",
+								RelationGetRelationName(bmr.rel)),
+						 errhint("Unlogged relations have no WAL authority to coordinate cross-node extension.")));
+		}
+		/*
+		 * engage == NATIVE: no alive peer to coordinate with -> hwc stays
+		 * CLUSTER_HW_NATIVE_LOCAL and the relation extends PG-natively.
+		 */
 	}
 #endif
 

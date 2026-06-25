@@ -322,6 +322,22 @@ cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req
 	}
 
 	/*
+	 * spec-5.7 Direction B — dead-master native-safe abort.  The requester's
+	 * wait loop proved the target master is CSSD-DEAD and no alive peer remains
+	 * (is_sole_native), so the acquire completes on the PG-native path.  Map to
+	 * OK_NATIVE (NOT NEED_PG_NATIVE_LOCK): the seven-step dispatcher then runs
+	 * S7 to cancel the S3 reservation, and lock.c takes the PG-native lock with
+	 * cluster_registered = false.  Using NEED_PG_NATIVE_LOCK would instead run
+	 * S5 promote -> register a cluster holder whose 1->0 release would re-send a
+	 * GES_RELEASE to the now-dead master (cluster_grd_lookup_master still maps
+	 * the resid there — Direction B does not touch mastership) and re-hang.
+	 * OK_NATIVE leaves no cluster holder, so the release is native too — the
+	 * same end-state as the lock.c gate-time SOLE->native short-circuit.
+	 */
+	if (reject == GES_REJECT_REASON_MASTER_DEAD_NATIVE)
+		return CLUSTER_LOCK_ACQUIRE_OK_NATIVE;
+
+	/*
 	 * spec-4.6 D4 — map the REAL GesRejectReason enum.  The previous
 	 * mapping used spec-2.21-era placeholder values (1/2/3) that no
 	 * longer matched the enum:  a dead-master timeout (TIMEOUT=4)
@@ -442,6 +458,17 @@ cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *req)
 											req->master_gen_snapshot);
 	if (er != CLUSTER_GRD_ENTRY_OK) {
 		(void)cluster_lock_acquire_s7_cleanup(req);
+		/*
+		 * PGRAC: spec-5.3 D1 — a LOCKTAG_TRANSACTION ShareLock waiter
+		 * (XactLockTableWait) that finds the GRD entry gone at S5 promote means
+		 * the awaited transaction already finished (its PG-native ShareLock was
+		 * granted only after the holder released).  The wait is satisfied, so
+		 * this is a benign success, NOT an internal error.  Strictly narrowed by
+		 * the helper to {LOCKTAG_TRANSACTION, ShareLock, NOT_FOUND}.
+		 */
+		if (cluster_lock_acquire_s5_not_found_is_benign((uint8)req->locktag.locktag_type,
+														req->lockmode, er))
+			return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 	}
 

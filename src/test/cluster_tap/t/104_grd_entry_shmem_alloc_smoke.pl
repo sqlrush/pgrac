@@ -53,6 +53,12 @@ use PgracClusterNode;
 my $node = PgracClusterNode->new('main');
 $node->init;
 $node->append_conf('postgresql.conf', "cluster.node_id = 0\n");
+# This test explicitly covers the zero-capacity / NOT_READY GRD skeleton path.
+# cluster.grd_max_entries now defaults to 1024 (spec-5.7 §3.1d engage-gate
+# work), so the L2 zero-capacity coverage must request 0 explicitly rather than
+# rely on the old implicit default.  (L3 below appends =16 and restarts; the
+# last value in postgresql.conf wins, so the explicit 0 here does not affect it.)
+$node->append_conf('postgresql.conf', "cluster.grd_max_entries = 0\n");
 $node->start;
 
 is($node->safe_psql('postgres', 'SELECT 1'), '1',
@@ -60,12 +66,12 @@ is($node->safe_psql('postgres', 'SELECT 1'), '1',
 
 
 # ----------
-# L2: cluster.grd_max_entries=0 (default) — sentinel NOT_READY 对外显化
+# L2: cluster.grd_max_entries=0 (explicit) — sentinel NOT_READY 对外显化
 #     pg_cluster_grd_entries empty + grd_allocated_bytes=0.
 # ----------
 is($node->safe_psql('postgres', 'SHOW cluster.grd_max_entries'),
    '0',
-   'L2a cluster.grd_max_entries default 0');
+   'L2a cluster.grd_max_entries explicit 0 (zero-capacity coverage)');
 
 is($node->safe_psql('postgres',
 		'SELECT count(*)::int FROM pg_cluster_grd_entries'),

@@ -53,6 +53,7 @@ use Time::HiRes qw(usleep);
 # ============================================================
 my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	'visibility_variants',
+	quorum_voting_disks => 3,
 	extra_conf => [
 		'autovacuum = off',
 		'cluster.pcm_grd_max_entries = 0',

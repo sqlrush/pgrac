@@ -49,6 +49,8 @@
 #include "cluster/cluster_qvotec.h" /* cluster_qvotec_in_quorum */
 #include "cluster/cluster_conf.h"	/* cluster_conf_lookup_node */
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_cssd.h"		 /* spec-5.7 Direction B — peer DEAD state */
+#include "cluster/cluster_extend_gate.h" /* spec-5.7 Direction B — SOLE reclassify */
 #include "storage/condition_variable.h"
 #include "storage/proc.h"		/* MyProc->cluster_grd_bast_pending (D5) */
 #include "storage/procarray.h"	/* ProcSignalReason dispatch helper */
@@ -1519,6 +1521,38 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 	while (!entry->ready) {
 		int sleep_ms;
 		long remaining_ms;
+
+		/*
+		 * spec-5.7 Direction B — dead-master native-safe abort.
+		 *
+		 *	If the target master has been declared CLUSTER_CSSD_PEER_DEAD by
+		 *	CSSD while we wait, the in-flight remote REQUEST can never be
+		 *	answered.  Re-classify liveness: only when no alive peer remains
+		 *	(cluster_extend_liveness_is_sole_native() — the same SOLE->native
+		 *	boundary the lock.c gate uses) is it safe to abandon the wait and
+		 *	take the PG-native lock, because with zero alive peers no node can
+		 *	hold or have been granted a conflicting lock.  The reclassify guard
+		 *	is self-protecting: if any peer is still alive (it might hold a grant
+		 *	the dead master handed out), is_sole_native() is false and we keep
+		 *	the existing timeout path.  SUSPECTED is NOT treated as DEAD, and a
+		 *	non-NATIVE reclassify never relaxes the timeout.
+		 *
+		 *	We delete the reply-wait entry and return a LOCAL-ONLY sentinel; S4
+		 *	maps it to OK_NATIVE so the dispatcher cancels the S3 reservation and
+		 *	the lock is taken natively with no cluster holder (the later release
+		 *	is native too — it never re-contacts the dead master).
+		 */
+		if (cluster_cssd_get_peer_state(master) == CLUSTER_CSSD_PEER_DEAD
+			&& cluster_extend_liveness_is_sole_native()) {
+			cluster_ges_reply_wait_delete(&key);
+			ConditionVariableCancelSleep();
+			ereport(LOG,
+					(errmsg_internal("cluster GES: master node %d declared DEAD during lock wait"
+									 " and no alive peer remains; taking PG-native lock"
+									 " (request_id=" UINT64_FORMAT ")",
+									 master, request_id)));
+			return GES_REJECT_REASON_MASTER_DEAD_NATIVE;
+		}
 
 		if (perpetual) {
 			sleep_ms = backoff_ms;

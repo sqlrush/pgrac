@@ -46,6 +46,7 @@ use lib "$FindBin::RealBin/../lib";
 
 use File::Basename;
 use File::Spec;
+use Time::HiRes qw(usleep);
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::ClusterPair;
 use PostgreSQL::Test::Utils;
@@ -88,16 +89,38 @@ sub active_relation_count
 {
 	my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 		'pgrac090a',
+		# spec-5.7 §3.1d: the relation-extend (HW) gate engages cross-node
+		# coordination from runtime liveness whenever a peer is alive.  This
+		# test does real DML/extends on a live 2-node pair, so it must provide a
+		# legal coordination substrate -- voting disks (quorum) + a non-zero GRD
+		# -- exactly like the other live 2-node tests (t/279/t/283/t/292-t/297).
+		# Without it the HW gate correctly fail-closes (53RA6); that is not what
+		# this test verifies.  The subject remains the smgr invalidation
+		# broadcast; here we just exercise it on a properly-coordinated pair.
+		quorum_voting_disks => 3,
 		extra_conf => [
 			'cluster.shared_storage_backend = local',
 			'cluster.smgr_user_relations = on',
-			# This is a spec-2.7 smgr_cluster test.  Keep later Cache
-			# Fusion PCM/GCS hooks out of the 10k INSERT path so this TAP
-			# continues to verify only smgr invalidation behavior.
+			# Keep later Cache Fusion PCM/GCS hooks out of the 10k INSERT path so
+			# this TAP continues to verify only smgr invalidation behavior.
 			'cluster.pcm_grd_max_entries = 0',
+			'cluster.grd_max_entries = 1024',
+			'cluster.cssd_heartbeat_interval_ms = 2000',
+			'cluster.cssd_dead_deadband_factor = 10',
 			'log_min_messages = debug3',
 		]);
 	$pair->start_pair;
+
+	# Wait for the cluster coordination substrate to be ready before any
+	# DML/extend: bidirectional IC peer CONNECTED (CSSD heartbeats established),
+	# then a short settle for CSSD READY + quorum + LMS warmup.  Without this the
+	# first extend can race CSSD startup and the HW gate reads UNKNOWN ->
+	# fail-closed.  Mirrors the readiness wait used by t/279 / t/292.
+	$pair->wait_for_peer_state(0, 1, 'connected', 30)
+	  or BAIL_OUT('node0 did not observe peer 1 connected');
+	$pair->wait_for_peer_state(1, 0, 'connected', 30)
+	  or BAIL_OUT('node1 did not observe peer 0 connected');
+	usleep(3_000_000);
 
 	# L1 -- both postmasters live + accept SQL.
 	is($pair->node0->safe_psql('postgres', 'SELECT 1'), '1',
@@ -276,13 +299,21 @@ sub active_relation_count
 # L10 -- cluster.enabled = off mode: counter stays zero, gate verify.
 # ============================================================
 {
-	# Use a single-node cluster (ClusterPair's mutual peer config still
-	# fine -- the gate is `if (cluster_enabled)`, not peer-count-driven).
+	# This block verifies the smgr invalidation hooks short-circuit when the
+	# cluster is disabled.  The smgr hooks are gated by cluster_enabled, but the
+	# spec-5.7 HW relation-extend gate (bufmgr.c) is gated independently by
+	# cluster.relation_extend_lock_enabled + cluster_node_id >= 0.  ClusterPair
+	# still assigns node ids 0/1, so with the cluster otherwise off the HW gate
+	# would engage and fail-closed (no coordination substrate) on the t_off
+	# extend.  Disable the extend-lock GUC too so this "cluster fully disabled"
+	# scenario is consistent and the DML extends PG-natively; the smgr counter
+	# assertion (the actual subject) is unaffected.
 	my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 		'pgrac090b',
 		extra_conf => [
 			'cluster.shared_storage_backend = local',
 			'cluster.smgr_user_relations = off',
+			'cluster.relation_extend_lock_enabled = off',
 		]);
 
 	# Override cluster.enabled = off on BOTH nodes -- exercises the

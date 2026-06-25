@@ -83,6 +83,9 @@ sub wait_hint_delta
 # ============================================================
 my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	'visibility_fork',
+	# spec-5.7 §3.1d.10: 2-node DML now coordinates relation-extend (HW)
+	# via GES; quorum master election requires shared voting disks.
+	quorum_voting_disks => 3,
 	extra_conf => [
 		'autovacuum = off',
 		# spec-3.2 D11: keep PCM out of the visibility-fork TAP so
@@ -322,8 +325,8 @@ is($pair->node0->safe_psql('postgres',
 # ============================================================
 is($pair->node0->safe_psql('postgres',
 		q{SELECT count(DISTINCT category) FROM pg_cluster_state}),
-	'39',
-	'L12a pg_cluster_state has 39 categories (spec-5.6 adds cf)');
+	'44',
+	'L12a pg_cluster_state has 44 categories (spec-5.7 adds hw/dl/ts/ir/ko)');
 
 my $tt_categories = $pair->node0->safe_psql('postgres', q{
 	SELECT string_agg(c, ',' ORDER BY c)

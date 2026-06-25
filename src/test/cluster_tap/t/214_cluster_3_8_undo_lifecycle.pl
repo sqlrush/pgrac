@@ -48,6 +48,7 @@ use Time::HiRes qw(usleep);
 
 my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	'spec_3_8_undo_lifecycle',
+	quorum_voting_disks => 3,
 	extra_conf => [
 		'autovacuum = off',
 		'cluster.pcm_grd_max_entries = 0',

@@ -89,6 +89,7 @@ sub wait_hint_delta
 # ============================================================
 my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	'visibility_scn',
+	quorum_voting_disks => 3,
 	extra_conf => [
 		'autovacuum = off',
 		'cluster.pcm_grd_max_entries = 0',	# L175 fixture isolation
@@ -295,8 +296,8 @@ ok(defined($exported) && length($exported) > 0,
 # ============================================================
 is($pair->node0->safe_psql('postgres',
 		q{SELECT count(DISTINCT category) FROM pg_cluster_state}),
-	'39',
-	'L14a pg_cluster_state has 39 categories (spec-5.6 adds cf)');
+	'44',
+	'L14a pg_cluster_state has 44 categories (spec-5.7 adds hw/dl/ts/ir/ko)');
 
 is($pair->node0->safe_psql('postgres',
 		q{SELECT count(*) FROM pg_cluster_state

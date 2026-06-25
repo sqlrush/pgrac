@@ -1150,6 +1150,98 @@ UT_TEST(test_grd_transaction_cleanup_on_node_dead_removes_entry)
 	reset_fake_grd_htab();
 }
 
+UT_TEST(test_grd_release_and_drain_reclaims_empty_entry)
+{
+	/* spec-5.3 — release/drain reclaims a GRD entry once it is completely empty
+	 * (no holders/waiters/converts/reservations) so LOCKTAG_TRANSACTION churn no
+	 * longer fills the HTAB.  A still-occupied entry must NOT be removed. */
+	int saved_node = cluster_node_id;
+	LOCKTAG src;
+	ClusterResId resid;
+	ClusterGrdEntry *entry = NULL;
+	ClusterGrdHolderId h1, h2;
+	ClusterGrdGrantIdentity granted[8];
+	int i;
+
+	reset_fake_grd_htab();
+	cluster_grd_max_entries = 8;
+	cluster_node_id = 0;
+
+	memset(&src, 0, sizeof(src));
+	src.locktag_field1 = 7777;
+	src.locktag_type = LOCKTAG_TRANSACTION;
+	src.locktag_lockmethodid = 1;
+	cluster_grd_resid_encode(&src, &resid);
+	cluster_grd_shmem_init();
+
+	/* case 1: single holder; release reclaims the now-empty entry. */
+	UT_ASSERT_EQ((int)cluster_grd_entry_lookup_or_create(&resid, true, &entry),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	memset(&h1, 0, sizeof(h1));
+	h1.node_id = 0;
+	h1.procno = 11;
+	h1.cluster_epoch = 1;
+	h1.request_id = 100;
+	UT_ASSERT_EQ((int)cluster_grd_entry_grant_holder(entry, &h1, ExclusiveLock),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 1);
+	(void)cluster_grd_release_and_drain(&resid, &h1, granted, lengthof(granted));
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0); /* empty -> reclaimed */
+
+	/* case 2: two holders; releasing one keeps the entry (still occupied). */
+	UT_ASSERT_EQ((int)cluster_grd_entry_lookup_or_create(&resid, true, &entry),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	memset(&h1, 0, sizeof(h1));
+	h1.node_id = 0;
+	h1.procno = 11;
+	h1.cluster_epoch = 1;
+	h1.request_id = 100;
+	memset(&h2, 0, sizeof(h2));
+	h2.node_id = 0;
+	h2.procno = 12;
+	h2.cluster_epoch = 1;
+	h2.request_id = 101;
+	UT_ASSERT_EQ((int)cluster_grd_entry_grant_holder(entry, &h1, AccessShareLock),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ((int)cluster_grd_entry_grant_holder(entry, &h2, AccessShareLock),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 1);
+	(void)cluster_grd_release_and_drain(&resid, &h1, granted, lengthof(granted));
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 1); /* h2 still holds -> NOT reclaimed */
+	(void)cluster_grd_release_and_drain(&resid, &h2, granted, lengthof(granted));
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0); /* now empty -> reclaimed */
+
+	/* case 3: TX churn — 100 unique-xid entries created+released under cap=8;
+	 * without per-release reclaim this would hit FAIL_RESERVATION_FULL. */
+	for (i = 0; i < 100; i++) {
+		LOCKTAG s2;
+		ClusterResId r2;
+		ClusterGrdEntry *e2 = NULL;
+		ClusterGrdHolderId hx;
+
+		memset(&s2, 0, sizeof(s2));
+		s2.locktag_field1 = (uint32)(20000 + i); /* unique xid per iteration */
+		s2.locktag_type = LOCKTAG_TRANSACTION;
+		s2.locktag_lockmethodid = 1;
+		cluster_grd_resid_encode(&s2, &r2);
+		UT_ASSERT_EQ((int)cluster_grd_entry_lookup_or_create(&r2, true, &e2),
+					 (int)CLUSTER_GRD_ENTRY_OK);
+		memset(&hx, 0, sizeof(hx));
+		hx.node_id = 0;
+		hx.procno = 13;
+		hx.cluster_epoch = 1;
+		hx.request_id = (uint64)(200 + i);
+		UT_ASSERT_EQ((int)cluster_grd_entry_grant_holder(e2, &hx, ExclusiveLock),
+					 (int)CLUSTER_GRD_ENTRY_OK);
+		(void)cluster_grd_release_and_drain(&r2, &hx, granted, lengthof(granted));
+	}
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0); /* no accumulation */
+
+	cluster_grd_max_entries = 0;
+	cluster_node_id = saved_node;
+	reset_fake_grd_htab();
+}
+
 UT_TEST(test_grd_entry_existing_hit_survives_soft_cap)
 {
 	LOCKTAG src;
@@ -2551,7 +2643,7 @@ int
  * other cluster_unit binaries; argv is intentionally unused. */
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(51); /* spec-5.3: +6 over the prior 42; spec-5.5: +3 (grant_conditional/resid/mode) */
+	UT_PLAN(52); /* spec-5.3: +6 over the prior 42; spec-5.5: +3; +1 release reclaim */
 
 	UT_RUN(test_grd_clusterresid_size_16);
 	UT_RUN(test_grd_resid_encode_decode_roundtrip);
@@ -2572,6 +2664,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_grd_resid_encode_transaction_roundtrip);
 	UT_RUN(test_grd_resid_encode_transaction_invalid_node_fail_closed);
 	UT_RUN(test_grd_transaction_cleanup_on_node_dead_removes_entry);
+	UT_RUN(test_grd_release_and_drain_reclaims_empty_entry);
 
 	UT_RUN(test_grd_entry_existing_hit_survives_soft_cap);
 

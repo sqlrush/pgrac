@@ -37,6 +37,7 @@ use Time::HiRes qw(time sleep);
 
 my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	'sinval_ddl_prop',
+	quorum_voting_disks => 3,
 	extra_conf => [ 'autovacuum = off' ]);
 $pair->start_pair;
 sleep 3;

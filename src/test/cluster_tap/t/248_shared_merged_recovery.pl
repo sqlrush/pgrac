@@ -256,6 +256,7 @@ sub wait_postmaster_gone
 # cross-node coupling the merge actually consumes.
 # ----------------------------------------------------------------
 my $pair = PostgreSQL::Test::ClusterPair->new_pair('sharedmerge',
+	quorum_voting_disks => 3,
 	wal_threads_root => 1,
 	shared_data      => 1,
 	extra_conf       => [

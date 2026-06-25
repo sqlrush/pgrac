@@ -123,6 +123,39 @@ extern ClusterNativeLockProbeReply
 cluster_native_lock_probe_pg_state(const LOCKTAG *locktag, LOCKMODE lockmode,
 								   const ClusterGrdHolderId *exclude_holder);
 
+struct PGPROC;
+
+/*
+ * cluster_native_lock_probe_same_group_exempt -- spec-5.3 parallel lock-group
+ *	exemption for the native-lock probe, mirroring PG LockCheckConflicts
+ *	(src/backend/storage/lmgr/lock.c).
+ *
+ *	A holder in the SAME PG parallel lock group as the requester is NOT a real
+ *	conflict — PG grants such a request via lock-group sharing.  Returns true
+ *	iff the holder must be treated as NON-conflicting on lock-group grounds.
+ *
+ *	Pure helper:  the caller resolves the two group-leader PGPROCs (a leader is
+ *	proc->lockGroupLeader ?: proc) under the appropriate partition / fpInfo lock
+ *	and passes them here.  Boundaries are exactly PG's:
+ *	  - LOCKTAG_RELATION_EXTEND never group-exempts (PG conflicts within a group).
+ *	  - Only a LOCAL requester can share a node-local lock group with a local
+ *	    holder, so requester_is_local must be true.
+ *	  - Same group iff the two group-leader PGPROCs are pointer-equal.
+ */
+static inline bool
+cluster_native_lock_probe_same_group_exempt(uint8 locktag_type, bool requester_is_local,
+											const struct PGPROC *requester_leader,
+											const struct PGPROC *holder_leader)
+{
+	if (locktag_type == LOCKTAG_RELATION_EXTEND)
+		return false;
+	if (!requester_is_local)
+		return false;
+	if (requester_leader == NULL || holder_leader == NULL)
+		return false;
+	return requester_leader == holder_leader;
+}
+
 extern bool cluster_lms_native_probe_required(const ClusterResId *resid, LOCKMODE lockmode);
 
 /* ============================================================

@@ -126,6 +126,7 @@ $node->stop;
 # ============================================================
 {
 	my $pair = PostgreSQL::Test::ClusterPair->new_pair('merged247',
+		quorum_voting_disks => 3,
 		wal_threads_root => 1,
 		shared_data      => 1,
 		extra_conf       => [

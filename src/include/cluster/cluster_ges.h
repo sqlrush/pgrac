@@ -297,7 +297,22 @@ typedef enum GesRejectReason {
 	 * unsupported convert sub-cases (e.g. cross-node down-convert, which
 	 * remains forward-deferred to the CF/PCM block layer per spec-5.3 §3.4).
 	 */
-	GES_REJECT_REASON_ILLEGAL_CONVERT = 7
+	GES_REJECT_REASON_ILLEGAL_CONVERT = 7,
+	/*
+	 * spec-5.7 Direction B — LOCAL-ONLY internal result (never placed on the
+	 * wire, never produced by a master reply).  Returned by the requester's own
+	 * REQUEST wait loop when the target master is declared CLUSTER_CSSD_PEER_DEAD
+	 * *and* a second liveness reclassify proves no alive peer remains
+	 * (cluster_extend_liveness_is_sole_native()).  In that state the in-flight
+	 * remote REQUEST can never be answered and no peer can hold a conflicting
+	 * lock, so the acquire is safe to complete on the PG-native path.  S4 maps
+	 * this to CLUSTER_LOCK_ACQUIRE_OK_NATIVE (the dispatcher then cancels the S3
+	 * reservation via S7 and the lock is taken natively with no cluster holder,
+	 * so the later 1->0 release is also native — it never re-contacts the dead
+	 * master).  Value 8 is out of the wire-used 0..7 range; the GesReplyPayload
+	 * reject_reason field is unchanged (no catversion / wire ABI change).
+	 */
+	GES_REJECT_REASON_MASTER_DEAD_NATIVE = 8
 } GesRejectReason;
 
 /* ClusterGrdHolderId 4-tuple typedef defined in cluster_grd.h (semantic

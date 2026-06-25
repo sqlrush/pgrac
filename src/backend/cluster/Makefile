@@ -51,6 +51,7 @@ OBJS = \
 	cluster_diag.o \
 	cluster_elog.o \
 	cluster_epoch.o \
+	cluster_extend_gate.o \
 	cluster_fence.o \
 	cluster_write_fence.o \
 	cluster_ges.o \

@@ -1497,6 +1497,23 @@ LmonMain(void)
 			cluster_reconfig_lmon_tick();
 			/* spec-4.6 D1:  GRD recovery sequence (see main-loop site). */
 			cluster_grd_recovery_lmon_tick();
+
+			/*
+			 * PGRAC: spec-5.3 — drain the GRD work queue in the stub /
+			 * non-TIER_1 path too.  The TIER_1 loop drains it every tick (see
+			 * the TIER_1 branch above), but a single-node / stub-interconnect
+			 * deployment runs THIS loop and would otherwise never process a
+			 * self-mastered, self-enqueued frame (local-master CONVERT /
+			 * CONVERT_ROLLBACK).  Without this, such a convert sits in the queue
+			 * and the requester times out 53R70 even though it IS the master.
+			 * Mutually exclusive with the TIER_1 branch, so there is no
+			 * double-drain.  Local grants wake the requester's CV directly
+			 * (ges_local_wake_reply); no remote outbound send is required here,
+			 * so the outbound drain is intentionally NOT hoisted (a stub
+			 * single node has no peers to send to).
+			 */
+			cluster_ges_lmon_drain_work_queue();
+
 			cluster_sinval_drain_outbound_and_broadcast();
 			cluster_sinval_drain_ack_outbound_and_send();
 			cluster_sinval_broadcast_reset_all();

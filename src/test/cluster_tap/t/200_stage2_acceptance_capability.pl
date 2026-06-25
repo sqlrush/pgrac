@@ -46,6 +46,7 @@ use Time::HiRes qw(sleep time);
 # Pair fixture for L1/L2/L4/L5/L6/L8/L9/L11/L12/L13 (~85% of blocks).
 my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	'stage2_accept_cap',
+	quorum_voting_disks => 3,
 	extra_conf => [ 'autovacuum = off' ]);
 $pair->start_pair;
 sleep 3;

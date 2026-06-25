@@ -317,6 +317,41 @@ cluster_lock_acquire_s7_cleanup(const ClusterLockAcquireRequest *req);
 
 
 /*
+ * cluster_lock_acquire_s5_not_found_is_benign -- spec-5.3 D1.
+ *
+ *	The ONE S5-promote NOT_FOUND case that is a benign success rather than an
+ *	internal error:  a LOCKTAG_TRANSACTION ShareLock is XactLockTableWait — a
+ *	waiter blocking on another transaction to finish.  S5 promote runs AFTER the
+ *	PG-native LockAcquire has been granted, and a native ShareLock(xid) is
+ *	granted ONLY once the holder's ExclusiveLock(xid) is released, i.e. the
+ *	awaited transaction has finished.  At that point the GRD entry has been
+ *	removed by the holder's release (or evicted under capacity), so
+ *	cluster_grd_revalidate_and_promote returns CLUSTER_GRD_ENTRY_NOT_FOUND.  The
+ *	wait is genuinely satisfied — benign success.
+ *
+ *	Intentionally NARROW — must NOT generalize:
+ *	  - any er other than NOT_FOUND      -> not benign (a real failure).
+ *	  - any locktag != LOCKTAG_TRANSACTION -> not benign.
+ *	  - any mode != ShareLock            -> not benign.  In particular the
+ *	    ExclusiveLock holder's promote registers the txn owner so cross-node
+ *	    waiters can route to it (HC40); treating a holder NOT_FOUND as success
+ *	    would drop cross-node wait visibility (P0).
+ */
+static inline bool
+cluster_lock_acquire_s5_not_found_is_benign(uint8 locktag_type, LOCKMODE lockmode,
+											ClusterGrdEntryResult er)
+{
+	if (er != CLUSTER_GRD_ENTRY_NOT_FOUND)
+		return false;
+	if (locktag_type != LOCKTAG_TRANSACTION)
+		return false;
+	if (lockmode != ShareLock)
+		return false;
+	return true;
+}
+
+
+/*
  * spec-2.21 D1 + spec-2.25 D1:cluster_lock_should_globalize — PG hot-path
  *	gate predicate.  Returns true iff this lock should enter the cluster
  *	7-step state machine instead of PG-native LockAcquire only.

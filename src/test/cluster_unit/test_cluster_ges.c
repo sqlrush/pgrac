@@ -55,6 +55,8 @@
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_grd_work_queue.h"
 #include "cluster/cluster_ic_envelope.h"
+#include "cluster/cluster_cssd.h"		 /* spec-5.7 Direction B stub — peer state */
+#include "cluster/cluster_extend_gate.h" /* spec-5.7 Direction B stub — sole-native */
 #include "port/atomics.h"
 
 /* Drop PG's port.h printf -> pg_printf override; unit_test.h uses
@@ -215,6 +217,25 @@ bool
 cluster_qvotec_in_quorum(void)
 {
 	return true; /* default in-quorum so validation step 4 passes */
+}
+
+/*
+ * spec-5.7 Direction B link stubs — the REQUEST wait loop now consults CSSD
+ * peer state + the liveness reclassify.  Default to "master alive / not
+ * sole-native" so the dead-master native-safe abort is never taken in these
+ * standalone GES tests (which exercise the steady-state grant/reject/retransmit
+ * paths); the abort branch itself is covered by the extend-gate + TAP suites.
+ */
+ClusterCssdPeerState
+cluster_cssd_get_peer_state(int32 peer_id pg_attribute_unused())
+{
+	return CLUSTER_CSSD_PEER_ALIVE;
+}
+
+bool
+cluster_extend_liveness_is_sole_native(void)
+{
+	return false;
 }
 
 uint64

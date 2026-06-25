@@ -49,6 +49,7 @@
 #include "cluster/cluster_ges.h" /* spec-5.3 — CONVERT_ROLLBACK send */
 #include "cluster/cluster_advisory.h" /* spec-5.5 D2/D3 — session-scope label */
 #include "cluster/cluster_native_lock_probe.h"
+#include "cluster/cluster_extend_gate.h" /* spec-5.7 §3.1d — SOLE->native gate */
 #endif
 
 #include "access/transam.h"
@@ -996,11 +997,27 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 	 * path.  FAIL_LMS_UNAVAILABLE / FAIL_* paths ereport here per spec-2.21
 	 * §3.3 error propagation table.
 	 *
-	 * Spec: spec-2.21-pg-lockacquire-integration-2node-smoke.md (D2)
+	 * PGRAC: spec-5.7 §3.1d (Option A) — SOLE->native short-circuit.  When the
+	 * runtime liveness proves no alive peer can fork the authority (SOLE, or the
+	 * approved no-fencing single-node-compat carve-out), there is nothing to
+	 * coordinate, so we skip globalization and take the PG-native lock.  This is
+	 * the same SOLE->native boundary already enforced for the HW/DL/KO extend
+	 * classes, reused here so a single-alive / declared-but-dead-peer cluster
+	 * does not REQUEST a master node that is not alive and time out (t/066).
+	 * The predicate is evaluated only for globalize-eligible locks (after
+	 * should_globalize, short-circuit) and only acts on the NATIVE result;
+	 * PEER_ALIVE / LMS-warming / fenced-no-quorum keep the existing path.  The
+	 * skip is acquire/release-symmetric: cluster_registered stays false, so the
+	 * 1->0 release hook never sends a spurious GES_RELEASE even if liveness
+	 * later flips to PEER_ALIVE.
+	 *
+	 * Spec: spec-2.21-pg-lockacquire-integration-2node-smoke.md (D2),
+	 *       spec-5.7-misc-enqueue-classes.md (§3.1d)
 	 */
 #ifdef USE_PGRAC_CLUSTER
 	if (cluster_enabled && cluster_lock_acquire_cluster_path && cluster_grd_max_entries > 0
-		&& cluster_lock_should_globalize(locktag, lockmode, sessionLock)) {
+		&& cluster_lock_should_globalize(locktag, lockmode, sessionLock)
+		&& !cluster_extend_liveness_is_sole_native()) {
 		ClusterLockAcquireResult cluster_r;
 
 		/*
@@ -3377,6 +3394,8 @@ cluster_native_lock_probe_pg_state(const LOCKTAG *locktag, LOCKMODE lockmode,
 	bool saw_holder = false;
 	bool saw_waiter = false;
 	int self_node_id;
+	bool requester_is_local;
+	PGPROC *requester_leader = NULL;
 
 	Assert(locktag != NULL);
 	Assert(exclude_holder != NULL);
@@ -3384,6 +3403,22 @@ cluster_native_lock_probe_pg_state(const LOCKTAG *locktag, LOCKMODE lockmode,
 		return CLUSTER_NATIVE_LOCK_PROBE_HOLDER_CONFLICT;	/* fail closed */
 
 	self_node_id = cluster_node_id;
+
+	/*
+	 * PGRAC: spec-5.3 — resolve the requester's PG lock-group leader so a
+	 * holder in the SAME parallel lock group is not counted as a conflict
+	 * (mirror LockCheckConflicts).  Lock groups are node-local, so this only
+	 * applies when the requester is local;  the requester is the blocked
+	 * backend identified by procno, whose lockGroupLeader is stable while it
+	 * waits.  A leader is proc->lockGroupLeader ?: proc.
+	 */
+	requester_is_local = ((uint32) self_node_id == exclude_holder->node_id);
+	if (requester_is_local && exclude_holder->procno < (uint32) ProcGlobal->allProcCount)
+	{
+		PGPROC	   *rp = &ProcGlobal->allProcs[exclude_holder->procno];
+
+		requester_leader = (rp->lockGroupLeader != NULL) ? rp->lockGroupLeader : rp;
+	}
 
 	lockmethodid = locktag->locktag_lockmethodid;
 	if (lockmethodid <= 0 || lockmethodid >= lengthof(LockMethods))
@@ -3414,6 +3449,13 @@ cluster_native_lock_probe_pg_state(const LOCKTAG *locktag, LOCKMODE lockmode,
 			 * PGPROC index in allProcs — equal to i here. */
 			if ((uint32) self_node_id == exclude_holder->node_id
 				&& (uint32) i == exclude_holder->procno)
+				continue;
+
+			/* PGRAC: spec-5.3 — skip a holder in the requester's own PG
+			 * parallel lock group (a leader is proc->lockGroupLeader ?: proc). */
+			if (cluster_native_lock_probe_same_group_exempt(
+					(uint8) locktag->locktag_type, requester_is_local, requester_leader,
+					proc->lockGroupLeader != NULL ? proc->lockGroupLeader : proc))
 				continue;
 
 			LWLockAcquire(&proc->fpInfoLock, LW_SHARED);
@@ -3472,6 +3514,13 @@ cluster_native_lock_probe_pg_state(const LOCKTAG *locktag, LOCKMODE lockmode,
 		/* HC32a self-exclusion */
 		if ((uint32) self_node_id == exclude_holder->node_id
 			&& (uint32) proc->pgprocno == exclude_holder->procno)
+			continue;
+
+		/* PGRAC: spec-5.3 — skip a holder in the requester's own PG parallel
+		 * lock group (uses proclock->groupLeader, exactly as LockCheckConflicts). */
+		if (cluster_native_lock_probe_same_group_exempt((uint8) locktag->locktag_type,
+														requester_is_local, requester_leader,
+														proclock->groupLeader))
 			continue;
 
 		if ((conflictMask & proclock->holdMask) != 0) {

@@ -116,7 +116,7 @@ static const struct config_enum_entry cluster_undo_writeback_boundary_check_opti
 		{ "strict", CLUSTER_UNDO_WB_CHECK_STRICT, false },
 		{ NULL, 0, false } };
 
-int cluster_grd_max_entries = 0;
+int cluster_grd_max_entries = 1024;
 int cluster_ges_request_timeout_ms = 60000; /* spec-2.16 D12 + v0.5 P1.5 */
 int cluster_cf_enqueue_timeout_ms = 30000;	/* spec-5.6 Dc4b — CF X/S grant wait */
 
@@ -1273,9 +1273,13 @@ cluster_init_guc(void)
 	/*
 	 * spec-2.15:  cluster.grd_max_entries
 	 *
-	 *  Maximum number of cluster_grd entry table slots.  Default 0 — entry
-	 *  HTAB not allocated; cluster_grd_entry_lookup_or_create() returns
-	 *  CLUSTER_GRD_ENTRY_NOT_READY sentinel.  Non-zero enables ShmemInitHash
+	 *  Maximum number of cluster_grd entry table slots.  Default 1024 (spec-5.7
+	 *  §3.1d: the GES substrate now has real relation-extend / lock callers, so a
+	 *  cluster-enabled node must be able to coordinate out of the box -- the
+	 *  spec-2.15 "flip when caller-side integration lands" note).  An explicit 0
+	 *  selects skeleton mode: entry HTAB not allocated;
+	 *  cluster_grd_entry_lookup_or_create() returns CLUSTER_GRD_ENTRY_NOT_READY
+	 *  sentinel.  Non-zero enables ShmemInitHash
 	 *  allocation;  v0.4 P1.1:  PG dynahash HASH_PARTITION=4096 forces
 	 *  nbuckets >= 4096, so the effective init_max_size used internally is
 	 *  Max(GUC, 4096) and shmem reservation comes from
@@ -1288,14 +1292,16 @@ cluster_init_guc(void)
 	 */
 	DefineCustomIntVariable("cluster.grd_max_entries",
 							gettext_noop("Maximum number of cluster_grd entry table slots."),
-							gettext_noop("Default 0 means skeleton mode: entry HTAB not allocated, "
+							gettext_noop("Default 1024 allocates the entry table so a cluster node "
+										 "can coordinate out of the box.  An explicit 0 selects "
+										 "skeleton mode: entry HTAB not allocated, "
 										 "cluster_grd_entry_lookup_or_create() returns NOT_READY. "
-										 "Non-zero allocates the entry table.  Note PG dynahash "
+										 "Note PG dynahash "
 										 "HASH_PARTITION=4096 forces internal nbuckets >= 4096, "
 										 "so even GUC=16 reserves ~3-5MB shmem via "
 										 "hash_estimate_size(Max(GUC, 4096), entry_size). "
 										 "Production 推荐 NBuffers × 2 (spec-2.16+ caller-side)."),
-							&cluster_grd_max_entries, 0, 0, 1048576,
+							&cluster_grd_max_entries, 1024, 0, 1048576,
 							PGC_POSTMASTER, /* ShmemInitHash size fixed at init */
 							0,				/* flags */
 							NULL,			/* check_hook */

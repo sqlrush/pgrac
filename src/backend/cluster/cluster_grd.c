@@ -3186,6 +3186,10 @@ cluster_grd_convert_grant_by_backend(const ClusterResId *resid, int32 node_id, u
 	return result;
 }
 
+/* spec-5.3 — forward decl for the post-release empty-entry reclaim (definition
+ * lives further down with the D10 cleanup primitives). */
+static bool cluster_grd_hashremove_if_still_empty(const ClusterResId *resid);
+
 /*
  * cluster_grd_release_and_drain -- remove a holder then drain the convert
  *	queue and one waiter under a single entry lock (spec-5.3 D3 live release).
@@ -3258,6 +3262,21 @@ cluster_grd_release_and_drain(const ClusterResId *resid, const ClusterGrdHolderI
 
 	SpinLockRelease(&entry->lock);
 	cluster_grd_entry_release(entry);
+
+	/*
+	 * PGRAC: spec-5.3 — reclaim the entry if this release left it completely
+	 * empty (no holders/waiters/converts/reservations).  cluster_grd_entry_release
+	 * is a documented no-op and the D8 periodic sweep is not wired, so without
+	 * this a long-lived backend never frees GRD HTAB slots for finished lock
+	 * resources — most visibly LOCKTAG_TRANSACTION, where every write txn has a
+	 * unique xid (unique entry) and the HTAB fills (53R71 FAIL_RESERVATION_FULL).
+	 * The helper re-acquires the shard partition lock, re-looks up by resid, and
+	 * HASH_REMOVEs at-most-once ONLY when all occupancy counters are 0 — so a
+	 * concurrent S3 reservation (nreservations > 0) or a freshly granted waiter
+	 * (ngranted > 0) is safe (no-op).  Done after the spinlock is dropped to keep
+	 * the partition-lock-then-entry-spinlock order.
+	 */
+	(void)cluster_grd_hashremove_if_still_empty(resid);
 	return n;
 }
 

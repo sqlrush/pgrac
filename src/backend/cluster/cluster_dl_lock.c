@@ -27,6 +27,7 @@
 #include "access/xlog.h" /* RecoveryInProgress */
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_dl.h"
+#include "cluster/cluster_extend_gate.h"
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_hw.h" /* cluster_hw_classify_persistence */
@@ -262,14 +263,22 @@ cluster_dl_bulk_acquire(struct RelationData *rel, struct BulkInsertStateData *bi
 	 * native decision) -- subsequent batches/rows skip the GES round trip. */
 	if (bistate->cluster_dl != NULL)
 		return;
-	/* Same gate as the HW extend authority: coordination only matters in a live,
-	 * multi-node cluster with the relation-extend coordination enabled. */
-	if (!cluster_relation_extend_lock_enabled || cluster_node_id < 0
-		|| cluster_conf_node_count() <= 1 || RecoveryInProgress())
+	/* Same gate as the HW extend authority: coordination only matters in a live
+	 * cluster with the relation-extend coordination enabled. */
+	if (!cluster_relation_extend_lock_enabled || cluster_node_id < 0 || RecoveryInProgress())
 		return;
 	/* Only GLOBALIZE relations are cross-node extended; temp / unlogged are
 	 * handled (or fail-closed) by HW at the extend, so DL stays out of their way. */
 	if (cluster_hw_classify_persistence(rel->rd_rel->relpersistence, true) != CLUSTER_HW_GLOBALIZE)
+		return;
+	/*
+	 * Engage from runtime liveness, not the static configured node count
+	 * (spec-5.7 §3.1d).  wait_for_lms = false: DL must never block a bulk load on
+	 * the coordination layer warming up -- dl_lock fails open to a native lease
+	 * and HW still gates correctness at each extend.  When no peer is alive
+	 * (NATIVE) there is nothing to coordinate, so skip the lease entirely.
+	 */
+	if (cluster_extend_liveness_engage(false) == CLUSTER_EXTEND_ENGAGE_NATIVE)
 		return;
 
 	cluster_dl_resid_encode(RelationGetSmgr(rel)->smgr_rlocator.locator, &resid);
