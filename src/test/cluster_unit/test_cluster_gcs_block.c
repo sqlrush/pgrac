@@ -348,9 +348,9 @@ UT_TEST(test_forward_payload_read_image_flag_roundtrip)
 	UT_ASSERT_EQ(GcsBlockForwardPayloadIsReadImage(&fwd) ? 1 : 0, 0);
 
 	/* Setting the flag must not perturb the HC127 watermark bytes. */
-	GcsBlockForwardPayloadSetExpectedPiWatermarkLsn(&fwd, (XLogRecPtr)0x1122334455667788ULL);
+	GcsBlockForwardPayloadSetExpectedPiWatermarkScn(&fwd, (SCN)0x1122334455667788ULL);
 	GcsBlockForwardPayloadSetReadImage(&fwd, true);
-	UT_ASSERT_EQ((long long)GcsBlockForwardPayloadGetExpectedPiWatermarkLsn(&fwd),
+	UT_ASSERT_EQ((long long)GcsBlockForwardPayloadGetExpectedPiWatermarkScn(&fwd),
 				 (long long)0x1122334455667788ULL);
 
 	UT_ASSERT_EQ((int)sizeof(GcsBlockForwardPayload), 64);
@@ -409,9 +409,9 @@ UT_TEST(test_clean_page_xfer_eligible_flag_roundtrip_and_orthogonal)
 	UT_ASSERT_EQ(GcsBlockForwardPayloadIsCleanEligible(&fwd) ? 1 : 0, 1);
 
 	/* Setting the forward clean flag must not perturb the HC127 watermark. */
-	GcsBlockForwardPayloadSetExpectedPiWatermarkLsn(&fwd, (XLogRecPtr)0x1122334455667788ULL);
+	GcsBlockForwardPayloadSetExpectedPiWatermarkScn(&fwd, (SCN)0x1122334455667788ULL);
 	GcsBlockForwardPayloadSetCleanEligible(&fwd, true);
-	UT_ASSERT_EQ((long long)GcsBlockForwardPayloadGetExpectedPiWatermarkLsn(&fwd),
+	UT_ASSERT_EQ((long long)GcsBlockForwardPayloadGetExpectedPiWatermarkScn(&fwd),
 				 (long long)0x1122334455667788ULL);
 
 	/* Both payloads stay 64B. */

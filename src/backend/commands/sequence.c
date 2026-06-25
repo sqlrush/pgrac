@@ -47,6 +47,8 @@
 #include "cluster/cluster_guc.h"			 /* spec-5.4 — cluster.sequence_* GUCs */
 #include "cluster/cluster_sequence.h"		 /* spec-5.4 — SQ instance cache + refill */
 #include "cluster/storage/cluster_smgr.h"	 /* spec-5.4 — shared-storage activation gate */
+#include "cluster/cluster_mode.h"			 /* spec-2.41 D4 — cluster_storage_mode_enabled */
+#include "cluster/cluster_scn.h"				 /* spec-2.41 D4 — cluster_scn_advance / SCN */
 #include "utils/timestamp.h"				 /* spec-5.4 — refill-wait deadline */
 #endif
 #include "utils/acl.h"
@@ -141,6 +143,37 @@ cluster_seq_flush_if_shared(Relation rel, Buffer buf)
 }
 
 /*
+ * PGRAC: spec-2.41 D4 — compute the pd_block_scn stamp for a sequence write.
+ *
+ *	Returns a fresh global SCN (cluster_scn_advance) when this node is in
+ *	cluster STORAGE mode and the sequence is a pcm-tracked user relation
+ *	(relNumber >= FirstNormalObjectId) — exactly the page population the
+ *	spec-2.37/2.41 lost-write detector tracks.  Otherwise returns InvalidScn.
+ *
+ *	The gate is cluster_storage_mode_enabled() (cluster.enabled + a valid
+ *	cluster.node_id) and is peers-INDEPENDENT, matching the heap ITL
+ *	pd_block_scn stamp (cluster_mode.h: page-version metadata gates on storage
+ *	mode, not on cluster_conf_has_peers()).  Gating on peers instead would (a)
+ *	leave tracked sequence pages at InvalidScn during any no-peer window, so a
+ *	later cross-node ship trips the detector's "tracked-but-InvalidScn" anomaly
+ *	(spec-2.41 §2.6 branch 2), and (b) make heap and sequence stamping
+ *	inconsistent.  Storage-mode gating guarantees a valid node_id, so
+ *	cluster_scn_advance() never ereports here; it is nonetheless called by the
+ *	producers OUTSIDE the critical section (Rule 16).
+ *
+ *	Returned as uint64 (not the SCN typedef) so callers store it straight into
+ *	xl_seq_rec.write_scn; SCN is uint64 so the round-trip is exact.
+ */
+static uint64
+cluster_sq_compute_write_scn(Relation seqrel)
+{
+	if (cluster_storage_mode_enabled()
+		&& seqrel->rd_locator.relNumber >= FirstNormalObjectId)
+		return (uint64) cluster_scn_advance();
+	return (uint64) InvalidScn;
+}
+
+/*
  * PGRAC: spec-5.4 (v2.0 Q2-B, option B) — cluster sequence disposition.
  *
  *	CLSQ_NATIVE       not a cluster-managed sequence (single node / no peers /
@@ -209,6 +242,7 @@ cluster_sq_refill_page(Relation seqrel, int64 incby, int64 minv, int64 maxv,
 				gcount,
 				new_boundary;
 	ClusterSqAllocStatus st;
+	uint64		cluster_write_scn;	/* spec-2.41 D4 — pd_block_scn stamp */
 
 	seq = read_seq_tuple(seqrel, &buf, &seqtuple);
 	page = BufferGetPage(buf);
@@ -235,6 +269,11 @@ cluster_sq_refill_page(Relation seqrel, int64 incby, int64 minv, int64 maxv,
 	if (RelationNeedsWAL(seqrel))
 		GetTopTransactionId();
 
+	/* PGRAC: spec-2.41 D4 — version the refilled page.  A managed sequence is
+	 * always cluster-storage + tracked, so this returns a valid SCN.  Taken
+	 * OUTSIDE the critical section (cluster_scn_advance(), Rule 16). */
+	cluster_write_scn = cluster_sq_compute_write_scn(seqrel);
+
 	START_CRIT_SECTION();
 	MarkBufferDirty(buf);
 
@@ -253,7 +292,13 @@ cluster_sq_refill_page(Relation seqrel, int64 incby, int64 minv, int64 maxv,
 		seq->is_called = true;
 		seq->log_cnt = 0;
 
+		MemSet(&xlrec, 0, sizeof(xlrec));	/* spec-2.41 D4 — zero the 4B alignment hole so it never reaches WAL */
 		xlrec.locator = seqrel->rd_locator;
+		xlrec.write_scn = cluster_write_scn;	/* spec-2.41 D4 P1-A */
+		/* Stamp the page with the SAME SCN carried in the WAL record so redo
+		 * restores an identical pd_block_scn (spec-2.41 §2.2/§2.4). */
+		if (SCN_VALID(cluster_write_scn))
+			((PageHeader) page)->pd_block_scn = (SCN) cluster_write_scn;
 		XLogRegisterData((char *) &xlrec, sizeof(xl_seq_rec));
 		XLogRegisterData((char *) seqtuple.t_data, seqtuple.t_len);
 
@@ -634,6 +679,7 @@ fill_seq_fork_with_data(Relation rel, HeapTuple tuple, ForkNumber forkNum)
 	Page		page;
 	sequence_magic *sm;
 	OffsetNumber offnum;
+	uint64		cluster_write_scn = 0;	/* spec-2.41 D4 — pd_block_scn (InvalidScn on non-cluster) */
 
 #ifdef USE_PGRAC_CLUSTER
 	/*
@@ -733,6 +779,12 @@ fill_seq_fork_with_data(Relation rel, HeapTuple tuple, ForkNumber forkNum)
 	if (RelationNeedsWAL(rel))
 		GetTopTransactionId();
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: spec-2.41 D4 — version the freshly initialised page (CREATE /
+	 * init producer).  Outside the critical section (Rule 16). */
+	cluster_write_scn = cluster_sq_compute_write_scn(rel);
+#endif
+
 	START_CRIT_SECTION();
 
 	MarkBufferDirty(buf);
@@ -751,7 +803,13 @@ fill_seq_fork_with_data(Relation rel, HeapTuple tuple, ForkNumber forkNum)
 		XLogBeginInsert();
 		XLogRegisterBuffer(0, buf, REGBUF_WILL_INIT);
 
+		MemSet(&xlrec, 0, sizeof(xlrec));	/* spec-2.41 D4 — zero the 4B alignment hole so it never reaches WAL */
 		xlrec.locator = rel->rd_locator;
+		xlrec.write_scn = cluster_write_scn;	/* spec-2.41 D4 P1-A */
+#ifdef USE_PGRAC_CLUSTER
+		if (SCN_VALID(cluster_write_scn))
+			((PageHeader) page)->pd_block_scn = (SCN) cluster_write_scn;
+#endif
 
 		XLogRegisterData((char *) &xlrec, sizeof(xl_seq_rec));
 		XLogRegisterData((char *) tuple->t_data, tuple->t_len);
@@ -988,6 +1046,7 @@ nextval_internal(Oid relid, bool check_permissions)
 				rescnt = 0;
 	bool		cycle;
 	bool		logit = false;
+	uint64		cluster_write_scn = 0;	/* spec-2.41 D4 — pd_block_scn (InvalidScn on non-cluster) */
 
 	/* open and lock sequence */
 	init_sequence(relid, &elm, &seqrel);
@@ -1226,6 +1285,14 @@ nextval_internal(Oid relid, bool check_permissions)
 	if (logit && RelationNeedsWAL(seqrel))
 		GetTopTransactionId();
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: spec-2.41 D4 — version the page only when this nextval emits a
+	 * WAL record (logit); a cached fetch does not change the durable page, so
+	 * its pd_block_scn must not advance.  Outside the critical section. */
+	if (logit && RelationNeedsWAL(seqrel))
+		cluster_write_scn = cluster_sq_compute_write_scn(seqrel);
+#endif
+
 	/* ready to change the on-disk (or really, in-buffer) tuple */
 	START_CRIT_SECTION();
 
@@ -1260,7 +1327,13 @@ nextval_internal(Oid relid, bool check_permissions)
 		seq->is_called = true;
 		seq->log_cnt = 0;
 
+		MemSet(&xlrec, 0, sizeof(xlrec));	/* spec-2.41 D4 — zero the 4B alignment hole so it never reaches WAL */
 		xlrec.locator = seqrel->rd_locator;
+		xlrec.write_scn = cluster_write_scn;	/* spec-2.41 D4 P1-A */
+#ifdef USE_PGRAC_CLUSTER
+		if (SCN_VALID(cluster_write_scn))
+			((PageHeader) page)->pd_block_scn = (SCN) cluster_write_scn;
+#endif
 
 		XLogRegisterData((char *) &xlrec, sizeof(xl_seq_rec));
 		XLogRegisterData((char *) seqdatatuple.t_data, seqdatatuple.t_len);
@@ -1379,6 +1452,7 @@ do_setval(Oid relid, int64 next, bool iscalled)
 	Form_pg_sequence pgsform;
 	int64		maxv,
 				minv;
+	uint64		cluster_write_scn = 0;	/* spec-2.41 D4 — pd_block_scn (InvalidScn on non-cluster) */
 
 	/* open and lock sequence */
 	init_sequence(relid, &elm, &seqrel);
@@ -1432,6 +1506,12 @@ do_setval(Oid relid, int64 next, bool iscalled)
 	if (RelationNeedsWAL(seqrel))
 		GetTopTransactionId();
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: spec-2.41 D4 — version the page on setval (a tracked sequence
+	 * page write).  Outside the critical section (Rule 16). */
+	cluster_write_scn = cluster_sq_compute_write_scn(seqrel);
+#endif
+
 	/* ready to change the on-disk (or really, in-buffer) tuple */
 	START_CRIT_SECTION();
 
@@ -1448,10 +1528,17 @@ do_setval(Oid relid, int64 next, bool iscalled)
 		XLogRecPtr	recptr;
 		Page		page = BufferGetPage(buf);
 
+		MemSet(&xlrec, 0, sizeof(xlrec));	/* spec-2.41 D4 — zero the 4B alignment hole so it never reaches WAL */
+		xlrec.locator = seqrel->rd_locator;
+		xlrec.write_scn = cluster_write_scn;	/* spec-2.41 D4 P1-A */
+#ifdef USE_PGRAC_CLUSTER
+		if (SCN_VALID(cluster_write_scn))
+			((PageHeader) page)->pd_block_scn = (SCN) cluster_write_scn;
+#endif
+
 		XLogBeginInsert();
 		XLogRegisterBuffer(0, buf, REGBUF_WILL_INIT);
 
-		xlrec.locator = seqrel->rd_locator;
 		XLogRegisterData((char *) &xlrec, sizeof(xl_seq_rec));
 		XLogRegisterData((char *) seqdatatuple.t_data, seqdatatuple.t_len);
 
@@ -2334,6 +2421,17 @@ seq_redo(XLogReaderState *record)
 	if (PageAddItem(localpage, (Item) item, itemsz,
 					FirstOffsetNumber, false, false) == InvalidOffsetNumber)
 		elog(PANIC, "seq_redo: failed to add item to page");
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: spec-2.41 D4 — restore pd_block_scn from the WAL-recorded
+	 * write_scn (the HISTORICAL stamp), not a replay-time current SCN.
+	 * PageInit above cleared it to InvalidScn; XLOG_SEQ_LOG is REGBUF_WILL_INIT
+	 * (no FPI), so this re-stamp is the only thing that keeps the cross-node
+	 * page version durable across crash recovery (§2.4 / G7).  Set
+	 * unconditionally: write_scn is InvalidScn for non-tracked sequences, which
+	 * matches PageInit's cleared value. */
+	((PageHeader) localpage)->pd_block_scn = (SCN) xlrec->write_scn;
+#endif
 
 	PageSetLSN(localpage, lsn);
 

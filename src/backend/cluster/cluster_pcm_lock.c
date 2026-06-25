@@ -224,7 +224,20 @@ struct GrdEntry {
 	 *
 	 *	Inserted between pending_x_since_lsn and wait_cv to keep entry_lock
 	 *	must-stay-last (LWLockPadded PG_CACHE_LINE_SIZE alignment). */
-	uint64 pi_watermark_lsn;   /*  8B [104, 112) spec-2.37 D2 HC125+HC126 */
+	uint64 pi_watermark_lsn; /*  8B [104, 112) spec-2.37 D2 HC125+HC126 */
+	/* PGRAC: spec-2.41 D2 (§2.8 Option A) NEW — dual watermark.
+	 *
+	 *	pi_watermark_scn:	max(observed pd_block_scn) for this tag — the
+	 *						lost-write DETECTOR's cross-node version authority
+	 *						(global Lamport SCN, AD-008; comparable across
+	 *						per-node WAL streams, unlike page_lsn).  Read ONLY
+	 *						via cluster_pcm_lock_pi_watermark_scn_query.
+	 *	pi_watermark_lsn (above):  RETAINED — the spec-4.7 D5 redo-coverage
+	 *						serve-gate's per-stream replay-position (LSN).  Read
+	 *						ONLY via cluster_pcm_lock_pi_watermark_lsn_query.
+	 *	The two are ORTHOGONAL (§2.8.1): detector never reads lsn, serve-gate
+	 *	never reads scn.  Both monotone-max, both cleared together on retire. */
+	SCN pi_watermark_scn;	   /*  8B [112, 120) spec-2.41 D2 §2.8 Option A */
 	ConditionVariable wait_cv; /* spec-2.31 D1 v0.4 incompatible state wait */
 	LWLockPadded entry_lock;   /*128B PG_CACHE_LINE_SIZE — must stay last */
 };
@@ -246,12 +259,14 @@ struct GrdEntry {
  *	expected constant on this build platform, so silent layout drift
  *	(e.g. a future struct change in a dependency) cannot slip past CI.
  */
-StaticAssertDecl(sizeof(struct GrdEntry) == 256,
-				 "spec-2.37 D2 GrdEntry size 248 → 256 (added pi_watermark_lsn 8B for HC125 "
-				 "+ HC126 single max-historical PI watermark);  spec-2.36 baseline was 248B; "
-				 "field inserted between pending_x_since_lsn and wait_cv to keep entry_lock "
-				 "LWLockPadded must-stay-last invariant;  amend this constant with Hardening "
-				 "appendix if a different platform produces a different size");
+StaticAssertDecl(sizeof(struct GrdEntry) == 264,
+				 "spec-2.41 D2 §2.8 Option A GrdEntry size 256 → 264 (added pi_watermark_scn "
+				 "8B dual watermark for the lost-write detector; pi_watermark_lsn retained for "
+				 "the spec-4.7 D5 redo-coverage serve-gate);  spec-2.37 baseline was 256B (had "
+				 "pi_watermark_lsn 8B for HC125/HC126);  field inserted after pi_watermark_lsn "
+				 "and before wait_cv to keep entry_lock LWLockPadded must-stay-last invariant;  "
+				 "amend this constant with Hardening appendix if a different platform produces a "
+				 "different size");
 
 
 /*
@@ -721,7 +736,8 @@ cluster_pcm_lock_clear_pending_x_for_node(int32 dead_node)
  */
 bool
 cluster_gcs_block_master_rebuild_from_redeclare(BufferTag tag, uint8 held_mode, XLogRecPtr page_lsn,
-												int32 source_node, uint64 cluster_epoch)
+												SCN page_scn, int32 source_node,
+												uint64 cluster_epoch)
 {
 	struct GrdEntry *entry;
 	uint32 holder_bit;
@@ -787,9 +803,19 @@ cluster_gcs_block_master_rebuild_from_redeclare(BufferTag tag, uint8 held_mode, 
 			pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_S);
 	}
 
-	/* PI watermark: monotone max (spec-2.37 lost-write source + D5 required_lsn). */
+	/* spec-2.41 D3 — advance BOTH watermarks from the survivor re-declare,
+	 * monotone max.  page_lsn feeds the spec-4.7 D5 redo-coverage serve-gate's
+	 * required_lsn (per-stream replay position);  page_scn feeds the lost-write
+	 * detector's cross-node SCN watermark.  The REDECLARE wire now carries both
+	 * (page_lsn@28 + page_scn@52, checksum-covered). */
 	if ((uint64)page_lsn > entry->pi_watermark_lsn)
 		entry->pi_watermark_lsn = (uint64)page_lsn;
+	/* monotone-max by local_scn (scn_time_cmp order); a raw SCN compare would be
+	 * node_id-dominated — see cluster_scn.h + gcs_block_lost_write_verdict. */
+	if (SCN_VALID(page_scn)
+		&& scn_local(page_scn)
+			   > scn_local(entry->pi_watermark_scn)) /* SCN_CMP_OK: scn_time_cmp via scn_local */
+		entry->pi_watermark_scn = page_scn;
 
 	LWLockRelease(&entry->entry_lock.lock);
 	return true; /* holder recorded */
@@ -814,7 +840,7 @@ cluster_gcs_block_master_rebuild_from_redeclare(BufferTag tag, uint8 held_mode, 
  *	Mirrors the X branch of cluster_gcs_block_master_rebuild_from_redeclare.
  */
 void
-cluster_pcm_lock_master_take_x_after_transfer(BufferTag tag, XLogRecPtr page_lsn)
+cluster_pcm_lock_master_take_x_after_transfer(BufferTag tag, XLogRecPtr page_lsn, SCN page_scn)
 {
 	struct GrdEntry *entry;
 
@@ -837,8 +863,18 @@ cluster_pcm_lock_master_take_x_after_transfer(BufferTag tag, XLogRecPtr page_lsn
 	 * forward/ship decisions (and spec-5.2 D11 path-B detection of
 	 * master==holder==self) read the right holder identity. */
 	pcm_master_holder_set_node(entry, cluster_node_id);
+	/* spec-2.41 D2 (§2.8.1) — local-page source advances BOTH watermarks
+	 * monotonically: lsn for the redo-coverage serve-gate, scn for the
+	 * lost-write detector.  page_scn comes from the installed page's
+	 * pd_block_scn (InvalidScn-safe). */
 	if ((uint64)page_lsn > entry->pi_watermark_lsn)
 		entry->pi_watermark_lsn = (uint64)page_lsn;
+	/* monotone-max by local_scn (scn_time_cmp order); a raw SCN compare would be
+	 * node_id-dominated — see cluster_scn.h + gcs_block_lost_write_verdict. */
+	if (SCN_VALID(page_scn)
+		&& scn_local(page_scn)
+			   > scn_local(entry->pi_watermark_scn)) /* SCN_CMP_OK: scn_time_cmp via scn_local */
+		entry->pi_watermark_scn = page_scn;
 	LWLockRelease(&entry->entry_lock.lock);
 }
 
@@ -859,7 +895,8 @@ cluster_pcm_lock_master_take_x_after_transfer(BufferTag tag, XLogRecPtr page_lsn
  *	holder is the remote requester rather than self.
  */
 void
-cluster_pcm_lock_master_grant_x_to(BufferTag tag, int32 requester_node, XLogRecPtr page_lsn)
+cluster_pcm_lock_master_grant_x_to(BufferTag tag, int32 requester_node, XLogRecPtr page_lsn,
+								   SCN page_scn)
 {
 	struct GrdEntry *entry;
 
@@ -882,8 +919,16 @@ cluster_pcm_lock_master_grant_x_to(BufferTag tag, int32 requester_node, XLogRecP
 	entry->x_holder_node = requester_node;
 	pg_atomic_write_u32(&entry->s_holders_bitmap, 0);
 	pcm_master_holder_set_node(entry, requester_node);
+	/* spec-2.41 D2 (§2.8.1) — local-page source advances BOTH watermarks (lsn
+	 * for redo-coverage, scn for the detector) from the shipped page. */
 	if ((uint64)page_lsn > entry->pi_watermark_lsn)
 		entry->pi_watermark_lsn = (uint64)page_lsn;
+	/* monotone-max by local_scn (scn_time_cmp order); a raw SCN compare would be
+	 * node_id-dominated — see cluster_scn.h + gcs_block_lost_write_verdict. */
+	if (SCN_VALID(page_scn)
+		&& scn_local(page_scn)
+			   > scn_local(entry->pi_watermark_scn)) /* SCN_CMP_OK: scn_time_cmp via scn_local */
+		entry->pi_watermark_scn = page_scn;
 	LWLockRelease(&entry->entry_lock.lock);
 }
 
@@ -917,8 +962,16 @@ cluster_pcm_lock_master_grant_x_to(BufferTag tag, int32 requester_node, XLogRecP
  *				up; production retire path is exclusively D8 lifecycle.
  * ============================================================ */
 
+/*
+ * PGRAC: spec-2.41 D2 §2.8.1 — LSN watermark (redo-coverage serve-gate ONLY).
+ *	Renamed from the old unitless cluster_pcm_lock_pi_watermark_advance so no
+ *	caller can advance "the watermark" without choosing the LSN unit.  The
+ *	per-stream page_lsn fed here is consumed solely by the spec-4.7 D5
+ *	serve-gate (cluster_gcs_block_redo_lsn_covered); the lost-write detector
+ *	uses the SCN variant below.
+ */
 void
-cluster_pcm_lock_pi_watermark_advance(BufferTag tag, XLogRecPtr page_lsn)
+cluster_pcm_lock_pi_watermark_lsn_advance(BufferTag tag, XLogRecPtr page_lsn)
 {
 	struct GrdEntry *entry;
 	bool found;
@@ -942,8 +995,38 @@ cluster_pcm_lock_pi_watermark_advance(BufferTag tag, XLogRecPtr page_lsn)
 	LWLockRelease(&ClusterPcm->htab_lock.lock);
 }
 
+/*
+ * PGRAC: spec-2.41 D2 §2.8.1 — SCN watermark (lost-write detector ONLY).
+ *	Monotone-max of the cross-node pd_block_scn observed for this tag; the
+ *	detector compares a shipped page's pd_block_scn against this (§2.6).  Fed
+ *	by the local-page sources today; the ack/redeclare wire sources feed it
+ *	once D3 carries pd_block_scn on the wire.
+ */
+void
+cluster_pcm_lock_pi_watermark_scn_advance(BufferTag tag, SCN page_scn)
+{
+	struct GrdEntry *entry;
+	bool found;
+
+	if (cluster_pcm_htab == NULL || !SCN_VALID(page_scn))
+		return;
+
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &tag, HASH_FIND, &found);
+	if (found && entry != NULL) {
+		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+		/* monotone-max by local_scn (scn_time_cmp order); page_scn already
+		 * SCN_VALID-checked above. */
+		if (scn_local(page_scn)
+			> scn_local(entry->pi_watermark_scn)) /* SCN_CMP_OK: scn_time_cmp via scn_local */
+			entry->pi_watermark_scn = page_scn;
+		LWLockRelease(&entry->entry_lock.lock);
+	}
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+}
+
 XLogRecPtr
-cluster_pcm_lock_pi_watermark_query(BufferTag tag)
+cluster_pcm_lock_pi_watermark_lsn_query(BufferTag tag)
 {
 	struct GrdEntry *entry;
 	bool found;
@@ -961,6 +1044,25 @@ cluster_pcm_lock_pi_watermark_query(BufferTag tag)
 	return lsn;
 }
 
+SCN
+cluster_pcm_lock_pi_watermark_scn_query(BufferTag tag)
+{
+	struct GrdEntry *entry;
+	bool found;
+	SCN scn = InvalidScn;
+
+	if (cluster_pcm_htab == NULL)
+		return InvalidScn;
+
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &tag, HASH_FIND, &found);
+	if (found && entry != NULL)
+		scn = entry->pi_watermark_scn;
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+
+	return scn;
+}
+
 void
 cluster_pcm_lock_pi_watermark_retire_for_tag(BufferTag tag)
 {
@@ -975,6 +1077,7 @@ cluster_pcm_lock_pi_watermark_retire_for_tag(BufferTag tag)
 	if (found && entry != NULL) {
 		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
 		entry->pi_watermark_lsn = InvalidXLogRecPtr;
+		entry->pi_watermark_scn = InvalidScn; /* spec-2.41 D2/D6 — clear BOTH watermarks */
 		pg_atomic_write_u32(&entry->pi_holders_bitmap, 0);
 		LWLockRelease(&entry->entry_lock.lock);
 	}
@@ -1000,8 +1103,11 @@ cluster_pcm_lock_pi_watermark_retire_for_relation_fork(Oid db_oid, RelFileNumber
 			continue;
 		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
 		if (entry->pi_watermark_lsn != InvalidXLogRecPtr
+			|| entry->pi_watermark_scn
+				   != InvalidScn /* spec-2.41 D3 — SCN-only source must also clear */
 			|| pg_atomic_read_u32(&entry->pi_holders_bitmap) != 0) {
 			entry->pi_watermark_lsn = InvalidXLogRecPtr;
+			entry->pi_watermark_scn = InvalidScn; /* spec-2.41 D2/D6 — clear BOTH watermarks */
 			pg_atomic_write_u32(&entry->pi_holders_bitmap, 0);
 			cleared++;
 		}
@@ -1034,8 +1140,11 @@ cluster_pcm_lock_pi_watermark_retire_for_truncate_range(Oid db_oid, RelFileNumbe
 			continue;
 		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
 		if (entry->pi_watermark_lsn != InvalidXLogRecPtr
+			|| entry->pi_watermark_scn
+				   != InvalidScn /* spec-2.41 D3 — SCN-only source must also clear */
 			|| pg_atomic_read_u32(&entry->pi_holders_bitmap) != 0) {
 			entry->pi_watermark_lsn = InvalidXLogRecPtr;
+			entry->pi_watermark_scn = InvalidScn; /* spec-2.41 D2/D6 — clear BOTH watermarks */
 			pg_atomic_write_u32(&entry->pi_holders_bitmap, 0);
 			cleared++;
 		}
@@ -1068,6 +1177,7 @@ cluster_pcm_lock_pi_watermark_retire_if_durable(BufferTag tag, XLogRecPtr writte
 		if ((uint64)written_page_lsn >= entry->pi_watermark_lsn
 			&& entry->pi_watermark_lsn != InvalidXLogRecPtr) {
 			entry->pi_watermark_lsn = InvalidXLogRecPtr;
+			entry->pi_watermark_scn = InvalidScn; /* spec-2.41 D2/D6 — clear BOTH watermarks */
 			pg_atomic_write_u32(&entry->pi_holders_bitmap, 0);
 			retired = true;
 		}
@@ -2359,6 +2469,7 @@ pcm_get_or_create_entry(BufferTag tag)
 		entry->pending_x_since_lsn = 0;
 		/* PGRAC: spec-2.37 D2 HC125+HC126 — PI watermark single field default 0. */
 		entry->pi_watermark_lsn = InvalidXLogRecPtr;
+		entry->pi_watermark_scn = InvalidScn;	/* spec-2.41 D2 — SCN watermark default */
 		ConditionVariableInit(&entry->wait_cv); /* PGRAC: spec-2.31 D1 v0.4 */
 		LWLockInitialize(&entry->entry_lock.lock, LWTRANCHE_CLUSTER_PCM);
 	}

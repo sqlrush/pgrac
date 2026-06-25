@@ -143,17 +143,17 @@ typedef enum GcsBlockReplyStatus {
 													 * S/X holder invalidate ACKs
 													 * within retransmit budget;
 													 * sender maps to 53R91. */
-	GCS_BLOCK_REPLY_DENIED_LOST_WRITE = 12,			/* PGRAC: spec-2.37 D1 NEW;
-													 * master direct ship 自校 失败 OR
-													 * holder forward validate 失败:
-													 * shipped block.page_lsn <
-													 * GrdEntry.pi_watermark_lsn
-													 * (master) 或
-													 * GcsBlockForwardPayload.
-													 * expected_pi_watermark_lsn
-													 * (holder).  sender maps to 53R93
-													 * terminal denial (HC131) — not
-													 * retried because lost-write is a
+	GCS_BLOCK_REPLY_DENIED_LOST_WRITE = 12,			/* PGRAC: spec-2.37 D1 / spec-2.41 D1;
+													 * master direct ship self-check OR
+													 * holder forward validate fail-closed
+													 * via gcs_block_lost_write_verdict():
+													 * shipped page pd_block_scn STALE
+													 * (< pi_watermark_scn) or ANOMALY
+													 * (tracked block, pd_block_scn
+													 * InvalidScn).  Cross-node version is
+													 * the global SCN, NOT page_lsn (§0).
+													 * sender maps to 53R93 terminal denial
+													 * — not retried because lost-write is a
 													 * data integrity issue that must
 													 * surface, not be papered over. */
 	GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER = 13	/* PGRAC: spec-5.2 D2 NEW;
@@ -218,10 +218,14 @@ typedef struct GcsBlockInvalidatePayload {
  *     2 = already_invalidated (race: buffer not resident)
  *
  *   Layout (64B fixed; same offsets as request payload to keep header
- *   parsing symmetric through checksum; spec-2.37 reinterprets the first
- *   8 bytes after checksum as the holder page_lsn so the master can advance
- *   the authoritative PI watermark after a successful invalidate ACK):
- *     [ 52,  60) page_lsn_bytes[8]      -- little-endian XLogRecPtr
+ *   parsing symmetric through checksum).  spec-2.37 carried the holder
+ *   page_lsn here; spec-2.41 D3 REINTERPRETS the same 8B slot as the holder
+ *   page's pd_block_scn (the cross-node version) so the master advances the
+ *   lost-write detector's SCN watermark after a successful invalidate ACK.
+ *   The slot is covered by the ACK checksum (all-bytes-except-checksum), so
+ *   the reinterpretation is checksum-neutral.  Mixed-version incompatible —
+ *   gated by the spec-2.41 catversion/protocol bump (D8):
+ *     [ 52,  60) page_scn_bytes[8]      -- little-endian SCN (was page_lsn)
  *     [ 60,  64) reserved_1[4]          -- pad to 64B
  * ============================================================ */
 typedef struct GcsBlockInvalidateAckPayload {
@@ -232,45 +236,45 @@ typedef struct GcsBlockInvalidateAckPayload {
 	uint8 ack_status;		 /*  1B [ 40,  41) 0/1/2 */
 	uint8 reserved_0[7];	 /*  7B [ 41,  48) */
 	uint32 checksum;		 /*  4B [ 48,  52) HC83 CRC32C */
-	uint8 page_lsn_bytes[8]; /*  8B [ 52,  60) HC126 spec-2.37 */
+	uint8 page_scn_bytes[8]; /*  8B [ 52,  60) spec-2.41 D3 (was page_lsn_bytes) */
 	uint8 reserved_1[4];	 /*  4B [ 60,  64) */
 } GcsBlockInvalidateAckPayload;
 
 StaticAssertDecl(sizeof(GcsBlockInvalidateAckPayload) == 64,
-				 "spec-2.36 D1 / spec-2.37 D7 GcsBlockInvalidateAckPayload wire ABI 64B");
+				 "spec-2.36 D1 / spec-2.41 D3 GcsBlockInvalidateAckPayload wire ABI 64B");
 
-StaticAssertDecl(offsetof(GcsBlockInvalidateAckPayload, page_lsn_bytes) == 52,
-				 "spec-2.37 D7 HC126 — invalidate ACK page_lsn_bytes[8] must land at offset 52");
+StaticAssertDecl(offsetof(GcsBlockInvalidateAckPayload, page_scn_bytes) == 52,
+				 "spec-2.41 D3 — invalidate ACK page_scn_bytes[8] must land at offset 52");
 
 static inline void
-GcsBlockInvalidateAckPayloadSetPageLsn(GcsBlockInvalidateAckPayload *p, XLogRecPtr lsn)
+GcsBlockInvalidateAckPayloadSetPageScn(GcsBlockInvalidateAckPayload *p, SCN scn)
 {
-	uint64 v = (uint64)lsn;
+	uint64 v = (uint64)scn;
 
-	p->page_lsn_bytes[0] = (uint8)(v & 0xff);
-	p->page_lsn_bytes[1] = (uint8)((v >> 8) & 0xff);
-	p->page_lsn_bytes[2] = (uint8)((v >> 16) & 0xff);
-	p->page_lsn_bytes[3] = (uint8)((v >> 24) & 0xff);
-	p->page_lsn_bytes[4] = (uint8)((v >> 32) & 0xff);
-	p->page_lsn_bytes[5] = (uint8)((v >> 40) & 0xff);
-	p->page_lsn_bytes[6] = (uint8)((v >> 48) & 0xff);
-	p->page_lsn_bytes[7] = (uint8)((v >> 56) & 0xff);
+	p->page_scn_bytes[0] = (uint8)(v & 0xff);
+	p->page_scn_bytes[1] = (uint8)((v >> 8) & 0xff);
+	p->page_scn_bytes[2] = (uint8)((v >> 16) & 0xff);
+	p->page_scn_bytes[3] = (uint8)((v >> 24) & 0xff);
+	p->page_scn_bytes[4] = (uint8)((v >> 32) & 0xff);
+	p->page_scn_bytes[5] = (uint8)((v >> 40) & 0xff);
+	p->page_scn_bytes[6] = (uint8)((v >> 48) & 0xff);
+	p->page_scn_bytes[7] = (uint8)((v >> 56) & 0xff);
 }
 
-static inline XLogRecPtr
-GcsBlockInvalidateAckPayloadGetPageLsn(const GcsBlockInvalidateAckPayload *p)
+static inline SCN
+GcsBlockInvalidateAckPayloadGetPageScn(const GcsBlockInvalidateAckPayload *p)
 {
 	uint64 v = 0;
 
-	v |= (uint64)p->page_lsn_bytes[0];
-	v |= (uint64)p->page_lsn_bytes[1] << 8;
-	v |= (uint64)p->page_lsn_bytes[2] << 16;
-	v |= (uint64)p->page_lsn_bytes[3] << 24;
-	v |= (uint64)p->page_lsn_bytes[4] << 32;
-	v |= (uint64)p->page_lsn_bytes[5] << 40;
-	v |= (uint64)p->page_lsn_bytes[6] << 48;
-	v |= (uint64)p->page_lsn_bytes[7] << 56;
-	return (XLogRecPtr)v;
+	v |= (uint64)p->page_scn_bytes[0];
+	v |= (uint64)p->page_scn_bytes[1] << 8;
+	v |= (uint64)p->page_scn_bytes[2] << 16;
+	v |= (uint64)p->page_scn_bytes[3] << 24;
+	v |= (uint64)p->page_scn_bytes[4] << 32;
+	v |= (uint64)p->page_scn_bytes[5] << 40;
+	v |= (uint64)p->page_scn_bytes[6] << 48;
+	v |= (uint64)p->page_scn_bytes[7] << 56;
+	return (SCN)v;
 }
 
 
@@ -284,27 +288,38 @@ GcsBlockInvalidateAckPayloadGetPageLsn(const GcsBlockInvalidateAckPayload *p)
  *   view (holder bitmap / mode / PI watermark — D3).  Fire-and-forget
  *   announce (no ACK):  the master is authoritative once rebuilt and a lost
  *   announce just leaves a holder unrecorded (re-sent next tick until the
- *   barrier completes).  64B fixed;  checksum at offset 48 (request/ack
- *   convention) covers [0,48) which includes the page_lsn (so a corrupted
- *   holder page_lsn cannot poison the rebuilt PI watermark / lost-write
- *   required_lsn).  cluster_epoch is the episode epoch (L235 coherence gate;
- *   the master drops a re-declare whose epoch != its accepted episode epoch).
+ *   barrier completes).  64B fixed.  cluster_epoch is the episode epoch (L235
+ *   coherence gate; the master drops a re-declare whose epoch != its accepted
+ *   episode epoch).
+ *
+ *   DUAL version carriers (spec-2.41 D3): page_lsn_bytes@28 keeps the
+ *   per-stream replay position for the spec-4.7 D5 redo-coverage serve-gate
+ *   (required_lsn); page_scn_bytes@52 (carved from the old reserved_1) carries
+ *   the cross-node pd_block_scn for the lost-write detector's SCN watermark.
+ *   The rebuild advances BOTH.  Because page_scn@52 falls AFTER checksum@48,
+ *   the checksum was extended to all-bytes-except-checksum (D3 mandatory) so a
+ *   corrupted holder page_lsn OR page_scn cannot poison the rebuilt watermarks.
  * ============================================================ */
 typedef struct GcsBlockRedeclarePayload {
 	uint64 cluster_epoch;	 /*  8B [  0,   8) episode epoch (L235) */
 	BufferTag tag;			 /* 20B [  8,  28) PG-fact */
-	uint8 page_lsn_bytes[8]; /*  8B [ 28,  36) LE XLogRecPtr (PI watermark + required_lsn) */
+	uint8 page_lsn_bytes[8]; /*  8B [ 28,  36) LE XLogRecPtr (redo-coverage required_lsn) */
 	int32 holder_node_id;	 /*  4B [ 36,  40) = sender node */
 	uint8 held_mode;		 /*  1B [ 40,  41) PcmState: PCM_STATE_S / PCM_STATE_X */
 	uint8 reserved_0[7];	 /*  7B [ 41,  48) */
 	uint32 checksum;		 /*  4B [ 48,  52) */
-	uint8 reserved_1[12];	 /* 12B [ 52,  64) pad to 64B */
+	uint8 page_scn_bytes[8]; /*  8B [ 52,  60) spec-2.41 D3 LE SCN (detector watermark) */
+	uint8 reserved_1[4];	 /*  4B [ 60,  64) pad to 64B */
 } GcsBlockRedeclarePayload;
 
 StaticAssertDecl(sizeof(GcsBlockRedeclarePayload) == 64,
-				 "spec-4.7 D2 GcsBlockRedeclarePayload wire ABI 64B");
+				 "spec-4.7 D2 / spec-2.41 D3 GcsBlockRedeclarePayload wire ABI 64B");
+StaticAssertDecl(offsetof(GcsBlockRedeclarePayload, page_lsn_bytes) == 28,
+				 "spec-4.7 D2 GcsBlockRedeclarePayload page_lsn_bytes must land at offset 28");
 StaticAssertDecl(offsetof(GcsBlockRedeclarePayload, checksum) == 48,
 				 "spec-4.7 D2 GcsBlockRedeclarePayload checksum must land at offset 48");
+StaticAssertDecl(offsetof(GcsBlockRedeclarePayload, page_scn_bytes) == 52,
+				 "spec-2.41 D3 GcsBlockRedeclarePayload page_scn_bytes must land at offset 52");
 
 static inline void
 GcsBlockRedeclarePayloadSetPageLsn(GcsBlockRedeclarePayload *p, XLogRecPtr lsn)
@@ -335,6 +350,39 @@ GcsBlockRedeclarePayloadGetPageLsn(const GcsBlockRedeclarePayload *p)
 	v |= (uint64)p->page_lsn_bytes[6] << 48;
 	v |= (uint64)p->page_lsn_bytes[7] << 56;
 	return (XLogRecPtr)v;
+}
+
+/* PGRAC: spec-2.41 D3 — REDECLARE page_scn carrier (@52, detector watermark).
+ * Distinct unit from page_lsn@28 (redo-coverage); the rebuild advances both. */
+static inline void
+GcsBlockRedeclarePayloadSetPageScn(GcsBlockRedeclarePayload *p, SCN scn)
+{
+	uint64 v = (uint64)scn;
+
+	p->page_scn_bytes[0] = (uint8)(v & 0xff);
+	p->page_scn_bytes[1] = (uint8)((v >> 8) & 0xff);
+	p->page_scn_bytes[2] = (uint8)((v >> 16) & 0xff);
+	p->page_scn_bytes[3] = (uint8)((v >> 24) & 0xff);
+	p->page_scn_bytes[4] = (uint8)((v >> 32) & 0xff);
+	p->page_scn_bytes[5] = (uint8)((v >> 40) & 0xff);
+	p->page_scn_bytes[6] = (uint8)((v >> 48) & 0xff);
+	p->page_scn_bytes[7] = (uint8)((v >> 56) & 0xff);
+}
+
+static inline SCN
+GcsBlockRedeclarePayloadGetPageScn(const GcsBlockRedeclarePayload *p)
+{
+	uint64 v = 0;
+
+	v |= (uint64)p->page_scn_bytes[0];
+	v |= (uint64)p->page_scn_bytes[1] << 8;
+	v |= (uint64)p->page_scn_bytes[2] << 16;
+	v |= (uint64)p->page_scn_bytes[3] << 24;
+	v |= (uint64)p->page_scn_bytes[4] << 32;
+	v |= (uint64)p->page_scn_bytes[5] << 40;
+	v |= (uint64)p->page_scn_bytes[6] << 48;
+	v |= (uint64)p->page_scn_bytes[7] << 56;
+	return (SCN)v;
 }
 
 
@@ -505,18 +553,22 @@ GcsBlockReplyHeaderSetForwardingMasterNode(GcsBlockReplyHeader *hdr, int32 node_
  *	                                      (holder copies into reply.
  *	                                      forwarding_master_node)
  *	  [ 48,  49) transition_id         -- PcmLockTransition (1..9)
- *	  [ 49,  57) expected_pi_watermark_lsn_bytes[8] -- spec-2.37 D3 HC127
- *	                                      little-endian uint64;  master stamps
- *	                                      pi_watermark_lsn(tag) so holder can
- *	                                      validate copied page_lsn >= expected
- *	                                      before shipping;  0 = no PI history
+ *	  [ 49,  57) expected_pi_watermark_scn_bytes[8] -- spec-2.41 D1/D3
+ *	                                      little-endian SCN (was page_lsn under
+ *	                                      spec-2.37 HC127).  Master stamps
+ *	                                      pi_watermark_scn(tag) so the holder can
+ *	                                      validate the shipped page pd_block_scn
+ *	                                      via gcs_block_lost_write_verdict()
+ *	                                      before shipping;  InvalidScn = not
+ *	                                      SCN-tracked.  Mixed-version incompatible
+ *	                                      → gated by the spec-2.41 catversion bump.
  *	  [ 57,  64) reserved_0[7]         -- pad + future fields
  *
  *	HC109 pattern (same as GcsBlockReplyHeader.forwarding_master_node_bytes):
- *	use uint8[8] + memcpy helpers to encode uint64 little-endian; never
- *	declare `uint64 expected_pi_watermark_lsn` directly because struct
- *	padding rules would silently expand sizeof past 64B (codereview F1 P0
- *	defense pattern from spec-2.35).
+ *	use uint8[8] + memcpy helpers to encode the value little-endian; never
+ *	declare `SCN expected_pi_watermark_scn` directly because struct padding
+ *	rules would silently expand sizeof past 64B (codereview F1 P0 defense
+ *	pattern from spec-2.35).
  * ============================================================ */
 typedef struct GcsBlockForwardPayload {
 	uint64 request_id;						  /*  8B [  0,   8) */
@@ -526,53 +578,100 @@ typedef struct GcsBlockForwardPayload {
 	int32 requester_backend_id;				  /*  4B [ 40,  44) */
 	int32 master_node;						  /*  4B [ 44,  48) */
 	uint8 transition_id;					  /*  1B [ 48,  49) */
-	uint8 expected_pi_watermark_lsn_bytes[8]; /*  8B [ 49,  57) HC127 spec-2.37 D3 */
+	uint8 expected_pi_watermark_scn_bytes[8]; /*  8B [ 49,  57) spec-2.41 D1/D3 (was lsn) */
 	uint8 reserved_0[7];					  /*  7B [ 57,  64) */
 } GcsBlockForwardPayload;
 
 StaticAssertDecl(sizeof(GcsBlockForwardPayload) == 64,
-				 "spec-2.35 D2 / spec-2.37 D3 GcsBlockForwardPayload wire ABI 64B "
-				 "(spec-2.35: request_id 8 + epoch 8 + tag 20 + original_requester_node 4 + "
+				 "spec-2.35 D2 / spec-2.41 D1 GcsBlockForwardPayload wire ABI 64B "
+				 "(request_id 8 + epoch 8 + tag 20 + original_requester_node 4 + "
 				 "requester_backend_id 4 + master_node 4 + transition_id 1 + "
-				 "reserved 15;  spec-2.37 重解读 reserved 前 8B → "
-				 "expected_pi_watermark_lsn_bytes[8] @ offset 49 + reserved_0[7] @ offset 57;  "
-				 "sizeof 64B 不变 — same HC109 pattern as forwarding_master_node_bytes[4])");
+				 "expected_pi_watermark_scn_bytes[8] @ offset 49 + reserved_0[7] @ offset 57;  "
+				 "sizeof 64B unchanged — same HC109 pattern as forwarding_master_node_bytes[4])");
 
-StaticAssertDecl(offsetof(GcsBlockForwardPayload, expected_pi_watermark_lsn_bytes) == 49,
-				 "spec-2.37 D3 HC127 — expected_pi_watermark_lsn_bytes[8] must land at "
+StaticAssertDecl(offsetof(GcsBlockForwardPayload, expected_pi_watermark_scn_bytes) == 49,
+				 "spec-2.41 D1 — expected_pi_watermark_scn_bytes[8] must land at "
 				 "offset 49 immediately after transition_id byte at offset 48");
 
-/* PGRAC: spec-2.37 D3 HC127 — uint64 little-endian helpers (mirror spec-2.35
- * HC109 helper pattern for forwarding_master_node_bytes[4]). */
+/* PGRAC: spec-2.41 D1/D3 — little-endian SCN helpers (the @49 carrier now holds
+ * the detector's expected pi_watermark_scn, NOT a page_lsn). */
 static inline void
-GcsBlockForwardPayloadSetExpectedPiWatermarkLsn(GcsBlockForwardPayload *p, XLogRecPtr lsn)
+GcsBlockForwardPayloadSetExpectedPiWatermarkScn(GcsBlockForwardPayload *p, SCN scn)
 {
-	uint64 v = (uint64)lsn;
+	uint64 v = (uint64)scn;
 
-	p->expected_pi_watermark_lsn_bytes[0] = (uint8)(v & 0xff);
-	p->expected_pi_watermark_lsn_bytes[1] = (uint8)((v >> 8) & 0xff);
-	p->expected_pi_watermark_lsn_bytes[2] = (uint8)((v >> 16) & 0xff);
-	p->expected_pi_watermark_lsn_bytes[3] = (uint8)((v >> 24) & 0xff);
-	p->expected_pi_watermark_lsn_bytes[4] = (uint8)((v >> 32) & 0xff);
-	p->expected_pi_watermark_lsn_bytes[5] = (uint8)((v >> 40) & 0xff);
-	p->expected_pi_watermark_lsn_bytes[6] = (uint8)((v >> 48) & 0xff);
-	p->expected_pi_watermark_lsn_bytes[7] = (uint8)((v >> 56) & 0xff);
+	p->expected_pi_watermark_scn_bytes[0] = (uint8)(v & 0xff);
+	p->expected_pi_watermark_scn_bytes[1] = (uint8)((v >> 8) & 0xff);
+	p->expected_pi_watermark_scn_bytes[2] = (uint8)((v >> 16) & 0xff);
+	p->expected_pi_watermark_scn_bytes[3] = (uint8)((v >> 24) & 0xff);
+	p->expected_pi_watermark_scn_bytes[4] = (uint8)((v >> 32) & 0xff);
+	p->expected_pi_watermark_scn_bytes[5] = (uint8)((v >> 40) & 0xff);
+	p->expected_pi_watermark_scn_bytes[6] = (uint8)((v >> 48) & 0xff);
+	p->expected_pi_watermark_scn_bytes[7] = (uint8)((v >> 56) & 0xff);
 }
 
-static inline XLogRecPtr
-GcsBlockForwardPayloadGetExpectedPiWatermarkLsn(const GcsBlockForwardPayload *p)
+static inline SCN
+GcsBlockForwardPayloadGetExpectedPiWatermarkScn(const GcsBlockForwardPayload *p)
 {
 	uint64 v = 0;
 
-	v |= (uint64)p->expected_pi_watermark_lsn_bytes[0];
-	v |= (uint64)p->expected_pi_watermark_lsn_bytes[1] << 8;
-	v |= (uint64)p->expected_pi_watermark_lsn_bytes[2] << 16;
-	v |= (uint64)p->expected_pi_watermark_lsn_bytes[3] << 24;
-	v |= (uint64)p->expected_pi_watermark_lsn_bytes[4] << 32;
-	v |= (uint64)p->expected_pi_watermark_lsn_bytes[5] << 40;
-	v |= (uint64)p->expected_pi_watermark_lsn_bytes[6] << 48;
-	v |= (uint64)p->expected_pi_watermark_lsn_bytes[7] << 56;
-	return (XLogRecPtr)v;
+	v |= (uint64)p->expected_pi_watermark_scn_bytes[0];
+	v |= (uint64)p->expected_pi_watermark_scn_bytes[1] << 8;
+	v |= (uint64)p->expected_pi_watermark_scn_bytes[2] << 16;
+	v |= (uint64)p->expected_pi_watermark_scn_bytes[3] << 24;
+	v |= (uint64)p->expected_pi_watermark_scn_bytes[4] << 32;
+	v |= (uint64)p->expected_pi_watermark_scn_bytes[5] << 40;
+	v |= (uint64)p->expected_pi_watermark_scn_bytes[6] << 48;
+	v |= (uint64)p->expected_pi_watermark_scn_bytes[7] << 56;
+	return (SCN)v;
+}
+
+/* PGRAC: spec-2.41 D1 — pure lost-write verdict (the detector's SCN decision).
+ *
+ *	Compares a master's expected pi_watermark_scn(tag) against a shipped page's
+ *	pd_block_scn (§2.6 three-branch).  Pure (no shmem / no locks) so the
+ *	master-direct and holder-forward detectors share ONE decision and the unit
+ *	tests can exercise every branch directly. */
+typedef enum GcsLostWriteVerdict {
+	GCS_LOST_WRITE_SKIP,		 /* expected InvalidScn: block not SCN-tracked (no fire) */
+	GCS_LOST_WRITE_PASS,		 /* shipped >= expected: current version */
+	GCS_LOST_WRITE_FAIL_STALE,	 /* both valid, shipped < expected: stale page */
+	GCS_LOST_WRITE_FAIL_ANOMALY, /* expected valid, shipped InvalidScn: tracked-but-unstamped */
+} GcsLostWriteVerdict;
+
+/*
+ * The single SCN lost-write decision shared by the master-direct and
+ * holder-forward detectors (§2.6 three-branch).  `expected_scn` is the
+ * master's pi_watermark_scn(tag);  `shipped_scn` is the pd_block_scn of the
+ * page about to be shipped.  Cross-node version order is the global Lamport
+ * SCN (AD-008), NEVER page_lsn (per-node WAL position; §0).  static inline so
+ * it is pure (no shmem / no locks), inlinable in both detector paths, and
+ * unit-testable from the header-only test binary.
+ *
+ *	expected InvalidScn                 -> SKIP    (block not SCN-tracked; no fire)
+ *	expected valid, shipped InvalidScn  -> ANOMALY (tracked block ships an
+ *	                                                 unstamped page — never PASS)
+ *	both valid, shipped < expected      -> STALE   (true lost write)
+ *	shipped >= expected                 -> PASS    (current)
+ */
+static inline GcsLostWriteVerdict
+gcs_block_lost_write_verdict(SCN expected_scn, SCN shipped_scn)
+{
+	if (!SCN_VALID(expected_scn))
+		return GCS_LOST_WRITE_SKIP;
+	if (!SCN_VALID(shipped_scn))
+		return GCS_LOST_WRITE_FAIL_ANOMALY;
+	/* Compare by local_scn (the Lamport time order) — this IS scn_time_cmp's
+	 * "only local_scn matters" contract.  A raw uint64 compare would be wrong:
+	 * the SCN encodes node_id in the high 8 bits (cluster_scn.h), so raw `<`
+	 * would let a higher-node_id watermark falsely flag a lower-node_id node's
+	 * newer write as stale (the very cross-stream false-fire spec-2.41 fixes).
+	 * scn_local() is extracted inline so the verdict stays pure / header-only
+	 * testable; both operands are valid SCNs here (branches above). */
+	if (scn_local(shipped_scn)
+		< scn_local(expected_scn)) /* SCN_CMP_OK: scn_time_cmp via scn_local */
+		return GCS_LOST_WRITE_FAIL_STALE;
+	return GCS_LOST_WRITE_PASS;
 }
 
 /* PGRAC: spec-5.2 D2 — read-image intent flag carried in reserved_0[0].
@@ -748,7 +847,7 @@ extern bool cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_pag
 /* PGRAC: spec-2.36 D4 (HC118 / HC123) — by-tag invalidate wrapper for
  * holder-side INVALIDATE handler.  XLogFlush+InvalidateBuffer. */
 extern bool cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode,
-													XLogRecPtr *out_page_lsn);
+													XLogRecPtr *out_page_lsn, SCN *out_page_scn);
 /* PGRAC: spec-5.2 D11 (writer-transfer-revoke) — by-tag local buffer drop
  * with NO GCS release wire, for the holder-side X-transfer branch running in
  * the §3.5 IC-dispatch (LMON) context.  XLogFlush+InvalidateBuffer, with the
@@ -781,7 +880,7 @@ extern bool cluster_bufmgr_block_write_permitted(Buffer buffer);
  * once the whole pool has been scanned) so the LMON reconfig tick can drive
  * it in bounded chunks without blocking the heartbeat. */
 typedef void (*ClusterGcsRedeclareCallback)(BufferTag tag, uint8 held_mode, XLogRecPtr page_lsn,
-											void *arg);
+											SCN page_scn, void *arg); /* spec-2.41 D3 +page_scn */
 extern int cluster_bufmgr_redeclare_scan_chunk(int start_buf, int max_scan,
 											   ClusterGcsRedeclareCallback cb, void *arg);
 
@@ -896,7 +995,7 @@ extern bool cluster_gcs_block_redo_lsn_covered(int dead_origin, XLogRecPtr requi
  *		cluster_gcs_block_master_rebuild_from_redeclare (cluster_pcm_lock.c).
  */
 extern void cluster_gcs_block_send_redeclare(BufferTag tag, uint8 held_mode, XLogRecPtr page_lsn,
-											 uint64 cluster_epoch, int master_node);
+											 SCN page_scn, uint64 cluster_epoch, int master_node);
 extern void cluster_gcs_handle_block_redeclare_envelope(const struct ClusterICEnvelope *env,
 														const void *payload);
 
@@ -1010,6 +1109,11 @@ extern uint64 cluster_gcs_get_pi_watermark_advance_count(void);
 extern uint64 cluster_gcs_get_pi_watermark_retire_count(void);
 extern uint64 cluster_gcs_get_lost_write_detected_count(void);
 extern uint64 cluster_gcs_get_lost_write_avoid_count(void);
+/* PGRAC: spec-2.41 D7 — SCN detector + redo-coverage observability accessors. */
+extern uint64 cluster_gcs_get_lost_write_invalidscn_failclosed_count(void);
+extern uint64 cluster_gcs_get_lost_write_not_scn_tracked_skip_count(void);
+extern uint64 cluster_gcs_get_redo_coverage_required_lsn_zero_count(void);
+extern uint64 cluster_gcs_get_redo_coverage_gate_block_count(void);
 
 /* PGRAC: spec-5.2 D2 — X-holder read-image ship counter accessor. */
 extern uint64 cluster_gcs_get_cf_xheld_read_ship_count(void);

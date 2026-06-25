@@ -6446,6 +6446,7 @@ cluster_bufmgr_redeclare_scan_chunk(int start_buf, int max_scan,
 		BufferTag	tag;
 		LWLock	   *content_lock;
 		XLogRecPtr	page_lsn;
+		SCN			page_scn;	/* spec-2.41 D3 — re-declare SCN carrier */
 
 		buf_state = LockBufHdr(buf);
 		mode = buf->pcm_state;
@@ -6464,26 +6465,33 @@ cluster_bufmgr_redeclare_scan_chunk(int start_buf, int max_scan,
 		content_lock = BufferDescriptorGetContentLock(buf);
 		LWLockAcquire(content_lock, LW_SHARED);
 		page_lsn = PageGetLSN((Page) BufHdrGetBlock(buf));
+		/* PGRAC: spec-2.41 D3 — also read pd_block_scn so the re-declare carries
+		 * the cross-node version for the detector's SCN watermark (alongside
+		 * page_lsn for the redo-coverage required_lsn). */
+		page_scn = ((PageHeader) BufHdrGetBlock(buf))->pd_block_scn;
 		LWLockRelease(content_lock);
 
 		cluster_bufmgr_unpin_for_gcs(buf);
 
 		/* P1#2: only re-declare a buffer with a valid pd_lsn. */
 		if (!XLogRecPtrIsInvalid(page_lsn))
-			cb(tag, mode, page_lsn, arg);
+			cb(tag, mode, page_lsn, page_scn, arg);
 	}
 
 	return end;
 }
 
 /* ========================================================================
- * PGRAC MODIFICATIONS by SqlRush — spec-2.36 D4 (HC118 / HC123).
+ * PGRAC MODIFICATIONS by SqlRush — spec-2.36 D4 (HC118 / HC123) +
+ *   spec-2.41 D3 (*out_page_scn).
  *
- *   cluster_bufmgr_invalidate_block_for_gcs(tag, expected_mode, *out_page_lsn)
- *   — by-tag invalidate wrapper called from the holder-side invalidate
- *   handler in cluster_gcs_block.c.  InvalidateBuffer is a static helper
- *   inside this file (bufmgr.c), so the cluster/ subdirectory cannot
- *   call it directly;  this wrapper exposes a controlled entrypoint:
+ *   cluster_bufmgr_invalidate_block_for_gcs(tag, expected_mode, *out_page_lsn,
+ *   *out_page_scn) — by-tag invalidate wrapper called from the holder-side
+ *   invalidate handler in cluster_gcs_block.c.  InvalidateBuffer is a static
+ *   helper inside this file (bufmgr.c), so the cluster/ subdirectory cannot
+ *   call it directly;  this wrapper exposes a controlled entrypoint.
+ *   spec-2.41 D3 also returns the dropping page's pd_block_scn (*out_page_scn)
+ *   so the invalidate ACK can carry the cross-node version:
  *
  *     1. Partition lookup by tag.
  *     2. Header lock + tag recheck + BM_VALID gate.
@@ -6495,7 +6503,7 @@ cluster_bufmgr_redeclare_scan_chunk(int start_buf, int max_scan,
  * ======================================================================== */
 bool
 cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode,
-										XLogRecPtr *out_page_lsn)
+										XLogRecPtr *out_page_lsn, SCN *out_page_scn)
 {
 	uint32		hashcode;
 	LWLock	   *partition_lock;
@@ -6503,12 +6511,15 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 	BufferDesc *buf;
 	uint32		buf_state;
 	XLogRecPtr	page_lsn = InvalidXLogRecPtr;
+	SCN			page_scn = InvalidScn;	/* PGRAC: spec-2.41 D3 — page version for the ACK SCN carrier */
 	bool		was_dirty = false;
 
 	(void) expected_mode;
 
 	if (out_page_lsn != NULL)
 		*out_page_lsn = InvalidXLogRecPtr;
+	if (out_page_scn != NULL)
+		*out_page_scn = InvalidScn;
 
 	hashcode = BufTableHashCode(&tag);
 	partition_lock = BufMappingPartitionLock(hashcode);
@@ -6523,6 +6534,9 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 	buf = GetBufferDescriptor(buf_id);
 
 	buf_state = LockBufHdr(buf);
+	/* Re-verify tag under the header lock to defend against a tag-rewrite race
+	 * between the partition-lock lookup and the raw pin (copy_block_for_gcs
+	 * convention). */
 	if (!BufferTagsEqual(&buf->tag, &tag) || (buf_state & BM_VALID) == 0)
 	{
 		UnlockBufHdr(buf, buf_state);
@@ -6530,16 +6544,38 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 		return false;
 	}
 	was_dirty = (buf_state & BM_DIRTY) != 0;
+
+	/*
+	 * PGRAC: spec-2.41 D3 — read page_lsn AND pd_block_scn under content_lock
+	 * SHARED, not the buffer-header spinlock.  The page-header CONTENTS
+	 * (including pd_block_scn) are protected by the content lock, NOT by the
+	 * buffer-header spinlock; reading them under the header lock alone could
+	 * race a concurrent content_lock-EXCLUSIVE writer and tear the 8-byte SCN.
+	 * Since the ACK page_scn is now a correctness watermark source for the
+	 * lost-write detector, raw-pin the buffer under the header lock (so it
+	 * cannot be replaced after we drop the header lock), release the partition
+	 * lock, then snapshot both values in a single content_lock SHARED hold —
+	 * the same raw-pin / content-lock pattern used by
+	 * cluster_bufmgr_copy_block_for_gcs and cluster_bufmgr_redeclare_scan_chunk.
+	 * The pin keeps the buffer identity stable, so the pre-pin tag match holds.
+	 */
+	cluster_bufmgr_pin_for_gcs_locked(buf, buf_state);	/* raw-pin + unlock header */
+	LWLockRelease(partition_lock);
 	{
+		LWLock	   *content_lock = BufferDescriptorGetContentLock(buf);
 		Page		page = (Page) BufHdrGetBlock(buf);
 
+		LWLockAcquire(content_lock, LW_SHARED);
 		page_lsn = PageGetLSN(page);
+		page_scn = ((PageHeader) page)->pd_block_scn;
+		LWLockRelease(content_lock);
 	}
-	UnlockBufHdr(buf, buf_state);
-	LWLockRelease(partition_lock);
+	cluster_bufmgr_unpin_for_gcs(buf);
 
 	if (out_page_lsn != NULL)
 		*out_page_lsn = page_lsn;
+	if (out_page_scn != NULL)
+		*out_page_scn = page_scn;
 
 	if (was_dirty && !XLogRecPtrIsInvalid(page_lsn))
 		XLogFlush(page_lsn);

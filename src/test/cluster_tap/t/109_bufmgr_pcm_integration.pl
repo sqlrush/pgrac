@@ -152,8 +152,15 @@ $node->stop;
 # ============================================================
 my $node_off = PgracClusterNode->new('bufmgr_pcm_disabled');
 $node_off->init;
+# spec-5.7 §3.1d: the relation-extend (HW) gate keys on
+# cluster.relation_extend_lock_enabled + node_id >= 0, independent of
+# cluster.enabled.  With cluster.enabled=off the CSSD is not running, so the
+# heap_t INSERT below would engage the HW gate and fail closed.  This section
+# tests the PCM Layer-2 disabled surface, not HW, so disable the HW gate too.
 $node_off->append_conf('postgresql.conf',
-	"cluster.node_id = 0\n" . "cluster.enabled = off\n");
+	"cluster.node_id = 0\n"
+	  . "cluster.enabled = off\n"
+	  . "cluster.relation_extend_lock_enabled = off\n");
 $node_off->start;
 
 $node_off->safe_psql('postgres', q{

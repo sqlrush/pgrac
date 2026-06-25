@@ -1166,24 +1166,29 @@ UT_TEST(test_pcm_d2_rebuild_from_redeclare)
 	reset_fake_pcm_runtime(4);
 	fake_cssd_dead_node = -1;
 
-	/* node 2 re-declares X on tagx with page_lsn 0x5000. */
-	cluster_gcs_block_master_rebuild_from_redeclare(tagx, (uint8)PCM_STATE_X, (XLogRecPtr)0x5000, 2,
-													7);
+	/* node 2 re-declares X on tagx with page_lsn 0x5000 + page_scn 0x5500
+	 * (spec-2.41 D3 dual carrier). */
+	cluster_gcs_block_master_rebuild_from_redeclare(tagx, (uint8)PCM_STATE_X, (XLogRecPtr)0x5000,
+													(SCN)0x5500, 2, 7);
 	/* The rebuilt master view records node 2 as the (live) X holder. */
 	UT_ASSERT(cluster_pcm_master_other_live_holder_exists(tagx, 3));
 	UT_ASSERT(!cluster_pcm_master_other_live_holder_exists(tagx, 2));
-	UT_ASSERT_EQ((uint64)cluster_pcm_lock_pi_watermark_query(tagx), (uint64)0x5000);
+	UT_ASSERT_EQ((uint64)cluster_pcm_lock_pi_watermark_lsn_query(tagx), (uint64)0x5000);
+	/* spec-2.41 D3 — the SCN watermark is advanced from page_scn (orthogonal). */
+	UT_ASSERT_EQ((uint64)cluster_pcm_lock_pi_watermark_scn_query(tagx), (uint64)0x5500);
 
-	/* node 1 re-declares S on tags with a higher page_lsn — watermark = max. */
-	cluster_gcs_block_master_rebuild_from_redeclare(tags, (uint8)PCM_STATE_S, (XLogRecPtr)0x9000, 1,
-													7);
+	/* node 1 re-declares S on tags with higher lsn+scn — both watermarks = max. */
+	cluster_gcs_block_master_rebuild_from_redeclare(tags, (uint8)PCM_STATE_S, (XLogRecPtr)0x9000,
+													(SCN)0x9900, 1, 7);
 	UT_ASSERT(cluster_pcm_master_other_live_holder_exists(tags, 0));
-	UT_ASSERT_EQ((uint64)cluster_pcm_lock_pi_watermark_query(tags), (uint64)0x9000);
+	UT_ASSERT_EQ((uint64)cluster_pcm_lock_pi_watermark_lsn_query(tags), (uint64)0x9000);
+	UT_ASSERT_EQ((uint64)cluster_pcm_lock_pi_watermark_scn_query(tags), (uint64)0x9900);
 
-	/* A stale lower-LSN re-declare must NOT regress the watermark. */
-	cluster_gcs_block_master_rebuild_from_redeclare(tags, (uint8)PCM_STATE_S, (XLogRecPtr)0x100, 3,
-													7);
-	UT_ASSERT_EQ((uint64)cluster_pcm_lock_pi_watermark_query(tags), (uint64)0x9000);
+	/* A stale lower lsn+scn re-declare must NOT regress either watermark. */
+	cluster_gcs_block_master_rebuild_from_redeclare(tags, (uint8)PCM_STATE_S, (XLogRecPtr)0x100,
+													(SCN)0x150, 3, 7);
+	UT_ASSERT_EQ((uint64)cluster_pcm_lock_pi_watermark_lsn_query(tags), (uint64)0x9000);
+	UT_ASSERT_EQ((uint64)cluster_pcm_lock_pi_watermark_scn_query(tags), (uint64)0x9900);
 }
 
 /*
@@ -1200,11 +1205,11 @@ UT_TEST(test_pcm_d3_not_double_x)
 	reset_fake_pcm_runtime(4);
 	fake_cssd_dead_node = -1;
 
-	cluster_gcs_block_master_rebuild_from_redeclare(tag, (uint8)PCM_STATE_X, (XLogRecPtr)0x4000, 2,
-													7);
+	cluster_gcs_block_master_rebuild_from_redeclare(tag, (uint8)PCM_STATE_X, (XLogRecPtr)0x4000,
+													(SCN)0x4400, 2, 7);
 	/* Conflicting X from a DIFFERENT node — must be rejected. */
-	cluster_gcs_block_master_rebuild_from_redeclare(tag, (uint8)PCM_STATE_X, (XLogRecPtr)0x4000, 3,
-													7);
+	cluster_gcs_block_master_rebuild_from_redeclare(tag, (uint8)PCM_STATE_X, (XLogRecPtr)0x4000,
+													(SCN)0x4400, 3, 7);
 
 	/* x_holder stays node 2 (not 3):  node 2 self-excluded → false;  any other
 	 * sender sees node 2 as the live X holder.  Had the conflicting node-3 X
@@ -1212,9 +1217,10 @@ UT_TEST(test_pcm_d3_not_double_x)
 	UT_ASSERT(!cluster_pcm_master_other_live_holder_exists(tag, 2));
 	UT_ASSERT(cluster_pcm_master_other_live_holder_exists(tag, 3));
 
-	/* Same node re-declaring X is idempotent (not a conflict). */
-	UT_ASSERT(cluster_gcs_block_master_rebuild_from_redeclare(tag, (uint8)PCM_STATE_X,
-															  (XLogRecPtr)0x4000, 2, 7));
+	/* Same node re-declaring X is idempotent (not a conflict).  spec-2.41 D3:
+	 * carries page_scn alongside page_lsn (value irrelevant to this invariant). */
+	UT_ASSERT(cluster_gcs_block_master_rebuild_from_redeclare(
+		tag, (uint8)PCM_STATE_X, (XLogRecPtr)0x4000, (SCN)0x4400, 2, 7));
 	UT_ASSERT(!cluster_pcm_master_other_live_holder_exists(tag, 2));
 	UT_ASSERT(cluster_pcm_master_other_live_holder_exists(tag, 3));
 
@@ -1228,20 +1234,20 @@ UT_TEST(test_pcm_d3_not_double_x)
 
 		/* X-held then S from a DIFFERENT node → reject (was: silently dropped,
 		 * returned true). */
-		UT_ASSERT(cluster_gcs_block_master_rebuild_from_redeclare(tagxs, (uint8)PCM_STATE_X,
-																  (XLogRecPtr)0x10, 2, 7));
-		UT_ASSERT(!cluster_gcs_block_master_rebuild_from_redeclare(tagxs, (uint8)PCM_STATE_S,
-																   (XLogRecPtr)0x10, 1, 7));
+		UT_ASSERT(cluster_gcs_block_master_rebuild_from_redeclare(
+			tagxs, (uint8)PCM_STATE_X, (XLogRecPtr)0x10, (SCN)0x20, 2, 7));
+		UT_ASSERT(!cluster_gcs_block_master_rebuild_from_redeclare(
+			tagxs, (uint8)PCM_STATE_S, (XLogRecPtr)0x10, (SCN)0x20, 1, 7));
 		/* still X by node 2 (S not merged). */
 		UT_ASSERT(cluster_pcm_master_other_live_holder_exists(tagxs, 3));
 		UT_ASSERT(!cluster_pcm_master_other_live_holder_exists(tagxs, 2));
 
 		/* S-held by node 1 then X from a DIFFERENT node → reject (X-over-live-S
 		 * = never reconstruct a double grant; was: silently overwrote S). */
-		UT_ASSERT(cluster_gcs_block_master_rebuild_from_redeclare(tagsx, (uint8)PCM_STATE_S,
-																  (XLogRecPtr)0x10, 1, 7));
-		UT_ASSERT(!cluster_gcs_block_master_rebuild_from_redeclare(tagsx, (uint8)PCM_STATE_X,
-																   (XLogRecPtr)0x10, 2, 7));
+		UT_ASSERT(cluster_gcs_block_master_rebuild_from_redeclare(
+			tagsx, (uint8)PCM_STATE_S, (XLogRecPtr)0x10, (SCN)0x20, 1, 7));
+		UT_ASSERT(!cluster_gcs_block_master_rebuild_from_redeclare(
+			tagsx, (uint8)PCM_STATE_X, (XLogRecPtr)0x10, (SCN)0x20, 2, 7));
 	}
 }
 

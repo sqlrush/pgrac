@@ -7,7 +7,7 @@
 #	  any wire send (HC72), so wire path coverage is effectively limited
 #	  to SQL-visible surface invariants:
 #
-#	  L1  fresh cluster startup:  pg_cluster_state.gcs has 56 keys
+#	  L1  fresh cluster startup:  pg_cluster_state.gcs has 58 keys
 #	  L2  api_state = "active" after postmaster phase 1 init
 #	  L3  WAIT_EVENT_GCS_REPLY_WAIT registered in pg_stat_cluster_wait_events
 #	  L4  CLUSTER_WAIT_EVENTS_COUNT == 88 (spec-2.36 +2 reliability events)
@@ -65,12 +65,12 @@ $node->append_conf('postgresql.conf', "cluster.node_id = 0\n");
 $node->start;
 
 
-# L1 — pg_cluster_state.gcs surface has 56 keys.
+# L1 — pg_cluster_state.gcs surface has 58 keys.
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '56',
-   'L1 pg_cluster_state.gcs category has 56 keys (spec-2.37 D12)');
+   '58',
+   'L1 pg_cluster_state.gcs category has 58 keys (spec-2.37 D12)');
 
 
 # L2 — api_state = "active" after postmaster phase 1 init.
@@ -144,8 +144,15 @@ $node->stop;
 # ============================================================
 my $node_off = PgracClusterNode->new('gcs_loopback_disabled');
 $node_off->init;
+# spec-5.7 §3.1d: the relation-extend (HW) gate keys on
+# cluster.relation_extend_lock_enabled + node_id >= 0, independent of
+# cluster.enabled.  With cluster.enabled=off the CSSD is not running, so the
+# heap_t INSERT below would engage the HW gate and fail closed.  This section
+# tests the GCS-loopback disabled surface, not HW, so disable the HW gate too.
 $node_off->append_conf('postgresql.conf',
-	"cluster.node_id = 0\n" . "cluster.enabled = off\n");
+	"cluster.node_id = 0\n"
+	  . "cluster.enabled = off\n"
+	  . "cluster.relation_extend_lock_enabled = off\n");
 $node_off->start;
 
 $node_off->safe_psql('postgres', q{

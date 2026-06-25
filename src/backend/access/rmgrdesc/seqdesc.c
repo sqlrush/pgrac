@@ -25,9 +25,11 @@ seq_desc(StringInfo buf, XLogReaderState *record)
 	xl_seq_rec *xlrec = (xl_seq_rec *) rec;
 
 	if (info == XLOG_SEQ_LOG)
-		appendStringInfo(buf, "rel %u/%u/%u",
+		/* PGRAC: spec-2.41 D4 — emit write_scn so pg_waldump can cross-check
+		 * the recorded pd_block_scn against the page after crash recovery. */
+		appendStringInfo(buf, "rel %u/%u/%u write_scn " UINT64_FORMAT,
 						 xlrec->locator.spcOid, xlrec->locator.dbOid,
-						 xlrec->locator.relNumber);
+						 xlrec->locator.relNumber, xlrec->write_scn);
 }
 
 const char *

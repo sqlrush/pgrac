@@ -53,6 +53,7 @@
 #include "c.h"
 #include "cluster/cluster_buffer_desc.h" /* PcmState (1.6), INVALID_NODE_ID */
 #include "cluster/cluster_conf.h"		 /* cluster_conf_has_peers */
+#include "cluster/cluster_scn.h"		 /* spec-2.41 D2 — SCN dual watermark */
 #include "storage/buf_internals.h"		 /* BufferTag */
 
 #ifdef USE_PGRAC_CLUSTER
@@ -288,12 +289,13 @@ extern void cluster_pcm_lock_unlock_content_buffer(BufferDesc *buf, PcmLockMode 
 extern void cluster_pcm_lock_release_buffer_for_eviction(BufferDesc *buf, PcmLockMode mode);
 /* PGRAC: spec-5.2 D11 — local master records self as new X holder after a
  * writer-transfer (the remote holder shipped + released its X). */
-extern void cluster_pcm_lock_master_take_x_after_transfer(BufferTag tag, XLogRecPtr page_lsn);
+extern void cluster_pcm_lock_master_take_x_after_transfer(BufferTag tag, XLogRecPtr page_lsn,
+														  SCN page_scn);
 /* PGRAC: spec-5.2 D11 path B — master==holder==self ships its X image to a
  * remote requester and records the requester as the new X holder (single-phase
  * writer-transfer-revoke; caller drops self's copy no-wire before calling). */
 extern void cluster_pcm_lock_master_grant_x_to(BufferTag tag, int32 requester_node,
-											   XLogRecPtr page_lsn);
+											   XLogRecPtr page_lsn, SCN page_scn);
 
 /*
  * PGRAC: spec-2.35 D3 (HC110) — master_holder lookup for forward routing.
@@ -436,7 +438,8 @@ extern bool cluster_pcm_master_other_live_holder_exists(BufferTag tag, int32 sen
  * declarers = protocol anomaly → fail-closed) + the not-double-X invariant.
  * source_node must equal the declared holder_node_id (the sender). */
 extern bool cluster_gcs_block_master_rebuild_from_redeclare(BufferTag tag, uint8 held_mode,
-															XLogRecPtr page_lsn, int32 source_node,
+															XLogRecPtr page_lsn, SCN page_scn,
+															int32 source_node,
 															uint64 cluster_epoch);
 
 /*
@@ -461,15 +464,18 @@ cluster_pcm_mode_covers(PcmLockMode have, PcmLockMode want)
 
 /* ============================================================
  * PGRAC: spec-2.37 D2/D7/D8/D9 HC125-HC130 — PI watermark API.
+ *   spec-2.41 D2 §2.8.1: split into a DUAL API (no unitless name).
  *
- *   pi_watermark_advance: D7 caller-side advance — caller (GCS/invalidate
- *     handler) has already obtained the downgrading holder's page_lsn via
- *     cluster_bufmgr_invalidate_block_for_gcs(..., &page_lsn) and now
- *     records max-historical watermark on the master.  Monotone — never
- *     regress.  Single field max model.
- *   pi_watermark_query:   master direct ship + forward path use this to
- *     populate GcsBlockForwardPayload.expected_pi_watermark_lsn_bytes[8]
- *     and master-direct DENIED_LOST_WRITE check.
+ *   pi_watermark_lsn_advance / _lsn_query:  the per-stream replay-position
+ *     (XLogRecPtr) watermark.  Consumed ONLY by the spec-4.7 D5 redo-coverage
+ *     serve-gate (cluster_gcs_block_redo_lsn_covered -> required_lsn).
+ *     Monotone — never regress.  Fed by holder page_lsn on downgrade/transfer.
+ *   pi_watermark_scn_advance / _scn_query:  the cross-node version (SCN,
+ *     AD-008) watermark.  Consumed ONLY by the lost-write detector (§2.6).
+ *     Fed by the local-page sources (take_x/grant_x) today; the ack/redeclare
+ *     wire sources feed it once D3 carries pd_block_scn on the wire (D3-PENDING).
+ *   The two are ORTHOGONAL: detector never reads lsn, serve-gate never reads
+ *     scn.  retire/reset clears BOTH.
  *   pi_watermark_retire_for_tag:        single-tag retire (test fixture).
  *   pi_watermark_retire_for_relation_fork:  D8 — relation drop / relfilenode
  *     change sweep (db, relNumber, fork) range.
@@ -487,8 +493,18 @@ cluster_pcm_mode_covers(PcmLockMode have, PcmLockMode want)
  * ============================================================ */
 #include "storage/relfilelocator.h" /* RelFileNumber */
 #include "common/relpath.h"			/* ForkNumber */
-extern void cluster_pcm_lock_pi_watermark_advance(BufferTag tag, XLogRecPtr page_lsn);
-extern XLogRecPtr cluster_pcm_lock_pi_watermark_query(BufferTag tag);
+/*
+ * PGRAC: spec-2.41 D2 §2.8.1 — DUAL watermark API (no unitless name).
+ *	*_lsn_*  serves ONLY the spec-4.7 D5 redo-coverage serve-gate (per-stream
+ *	         replay position).  *_scn_*  serves ONLY the lost-write detector
+ *	         (cross-node version, AD-008 SCN).  Callers must pick the unit
+ *	         deliberately; the old unitless cluster_pcm_lock_pi_watermark_query
+ *	         / _advance are removed so a reader can never mix the two.
+ */
+extern void cluster_pcm_lock_pi_watermark_lsn_advance(BufferTag tag, XLogRecPtr page_lsn);
+extern XLogRecPtr cluster_pcm_lock_pi_watermark_lsn_query(BufferTag tag);
+extern void cluster_pcm_lock_pi_watermark_scn_advance(BufferTag tag, SCN page_scn);
+extern SCN cluster_pcm_lock_pi_watermark_scn_query(BufferTag tag);
 extern void cluster_pcm_lock_pi_watermark_retire_for_tag(BufferTag tag);
 extern uint64 cluster_pcm_lock_pi_watermark_retire_for_relation_fork(Oid db_oid,
 																	 RelFileNumber rel_number,

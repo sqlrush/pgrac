@@ -298,7 +298,15 @@ SKIP: {
 # restart, not reload.
 # ----------
 $node->stop;
-$node->append_conf('postgresql.conf', "cluster.enabled = off\n");
+# spec-5.7 §3.1d: the relation-extend (HW) gate keys on
+# cluster.relation_extend_lock_enabled + node_id >= 0, independent of
+# cluster.enabled.  With cluster.enabled=off the CSSD is not running, so the
+# L11b INSERT below would engage the HW gate and fail closed (liveness UNKNOWN
+# -> cannot prove sole-native).  This section exercises the BOC/walwriter
+# disabled surface, not HW cross-node coordination, so disable the independent
+# HW gate explicitly alongside cluster.enabled.
+$node->append_conf('postgresql.conf',
+	"cluster.enabled = off\ncluster.relation_extend_lock_enabled = off\n");
 $node->start;
 
 my $sweeps_off_t0 = counter('scn_boc_sweep_count');

@@ -1220,12 +1220,12 @@ static uint64 grd_block_redeclare_epoch = 0;
 static bool grd_block_redeclare_done = false;
 
 static void
-grd_block_redeclare_cb(BufferTag tag, uint8 held_mode, XLogRecPtr page_lsn, void *arg)
+grd_block_redeclare_cb(BufferTag tag, uint8 held_mode, XLogRecPtr page_lsn, SCN page_scn, void *arg)
 {
 	uint64 episode_epoch = *(const uint64 *)arg;
 	int master = cluster_gcs_lookup_master(tag);
 
-	cluster_gcs_block_send_redeclare(tag, held_mode, page_lsn, episode_epoch, master);
+	cluster_gcs_block_send_redeclare(tag, held_mode, page_lsn, page_scn, episode_epoch, master);
 }
 
 /* Non-static (exposed via cluster_grd.h) so the unit test can drive the scan

@@ -147,6 +147,15 @@ $node_gate->stop;
 
 # spec-2.25 D15 L13-L18: cluster_lock_should_globalize extension regression.
 # Re-enable cluster gate to validate RELATION + OBJECT branches.
+#
+# spec-5.7 §3.1d (Option A) reclassification:  this is a single-node cluster with
+# no alive peer and no fencing, so the lock.c gate evaluates
+# cluster_extend_liveness_is_sole_native() = true and short-circuits
+# globalize-eligible locks to the PG-native path.  The should_globalize predicate
+# is unchanged (unit coverage: test_cluster_lock_acquire.c); what changed is that
+# single-node no longer *engages* the cluster path, so the RELATION/OBJECT counter
+# stays flat for L13/L17/L18 (was: counter advances).  L14-L16 already expected
+# "unchanged".  Cross-node globalize engage + counter advance is 2-node coverage.
 $node_gate->append_conf('postgresql.conf',
 	"cluster.lock_acquire_cluster_path = on\n");
 $node_gate->start;
@@ -160,8 +169,9 @@ sub _grd_path_count
 		   WHERE category='grd' AND key='grd_relation_object_cluster_path_count'});
 }
 
-# L13: DDL CREATE INDEX (ShareUpdateExclusiveLock on user table) → gate true,
-#      RELATION cluster path counter increments.
+# L13: DDL CREATE INDEX (ShareUpdateExclusiveLock on user table).  SUEX RELATION
+#      is globalize-eligible, but single-node sole-native takes the PG-native
+#      lock, so the RELATION cluster path counter is unchanged (Option A).
 my $pre_l13 = _grd_path_count();
 $node_gate->safe_psql('postgres', q{
 	CREATE TABLE pgrac_l13_t (id int);
@@ -170,8 +180,8 @@ $node_gate->safe_psql('postgres', q{
 	CREATE INDEX CONCURRENTLY pgrac_l13_idx ON pgrac_l13_t(id);
 });
 my $post_l13 = _grd_path_count();
-cmp_ok($post_l13, '>', $pre_l13,
-	'L13 CREATE INDEX CONCURRENTLY (SUEX on user table) — gate true, counter advances');
+is($post_l13, $pre_l13,
+	'L13 CREATE INDEX CONCURRENTLY (SUEX on user table) — Option A sole-native: PG-native lock, RELATION cluster path counter unchanged');
 
 # L14: SELECT (AccessShareLock) — mode < SUEX → gate false, counter unchanged.
 my $pre_l14 = _grd_path_count();
@@ -206,33 +216,42 @@ my ($pre_l16, $post_l16) = split /\n/, $l16_counts;
 is($post_l16, $pre_l16,
 	'L16 TEMP relation ACCESS EXCLUSIVE — HC25 temp skip, counter unchanged');
 
-# L17: unlogged + ALTER (SUEX) — relpersistence='u' → routed (HC25 unlogged
-# still goes cluster per shared-disk semantic).  Counter increments.
+# L17: unlogged + ALTER (SUEX) — relpersistence='u' is globalize-eligible (HC25
+# unlogged still cluster per shared-disk semantic), but single-node sole-native
+# takes the PG-native lock, so the counter is unchanged (Option A).
 my $pre_l17 = _grd_path_count();
 $node_gate->safe_psql('postgres', q{
 	CREATE UNLOGGED TABLE pgrac_l17_unlog (id int);
 	ALTER TABLE pgrac_l17_unlog ADD COLUMN val text;
 });
 my $post_l17 = _grd_path_count();
-cmp_ok($post_l17, '>', $pre_l17,
-	'L17 UNLOGGED table ALTER — HC25 unlogged routes cluster, counter advances');
+is($post_l17, $pre_l17,
+	'L17 UNLOGGED table ALTER — Option A sole-native: HC25 unlogged eligible but PG-native, counter unchanged');
 
 # L18: DROP TYPE on user-created composite type (OBJECT path).  objoid is
 # user-range and mode is AccessExclusiveLock → HC26+HC27 branches → gate
-# returns true; counter increments.
+# returns true, but single-node sole-native takes the PG-native lock, so the
+# counter is unchanged (Option A).
 my $pre_l18 = _grd_path_count();
 $node_gate->safe_psql('postgres', q{
 	CREATE TYPE pgrac_l18_t AS (a int, b text);
 	DROP TYPE pgrac_l18_t;
 });
 my $post_l18 = _grd_path_count();
-cmp_ok($post_l18, '>', $pre_l18,
-	'L18 CREATE/DROP TYPE (OBJECT user oid + AccessExclusive) — gate true, counter advances');
+is($post_l18, $pre_l18,
+	'L18 CREATE/DROP TYPE (OBJECT user oid + AccessExclusive) — Option A sole-native: PG-native lock, OBJECT cluster path counter unchanged');
 
 # ============================================================
 # spec-2.26 D9 L19-L21:  LOCKTAG_TRANSACTION cluster gate regression
 # (HC39 ShareLock/ExclusiveLock + HC46 PG XactLockTable* auto-routing
 #  + HC48 top-level release via LockReleaseAll vs subxact XactLockTableDelete).
+#
+# spec-5.7 §3.1d (Option A):  these run single-node sole-native, so the TRANSACTION
+# globalize-eligible locks (ShareLock/ExclusiveLock) take the PG-native path and
+# the TRANSACTION cluster path counter stays flat.  The should_globalize gate for
+# LOCKTAG_TRANSACTION is unit-covered (test_7step_transaction_should_globalize_gate
+# in test_cluster_lock_acquire.c).  Cross-node engage + counter advance is 2-node
+# coverage.
 #
 # Helper to read the new spec-2.26 transaction counter; mirrors
 # _grd_path_count which reads relation_object_cluster_path_count.
@@ -248,6 +267,8 @@ sub _grd_transaction_count
 # L19: top-level COMMIT — main xid TRANSACTION lock auto-acquired by
 # AssignTransactionId / XactLockTableInsert (ExclusiveLock owner take);
 # release via LockReleaseAll at xact end (HC48 — NOT XactLockTableDelete).
+# Single-node sole-native takes the PG-native lock, so the TRANSACTION counter
+# is unchanged (Option A).
 my $pre_l19 = _grd_transaction_count();
 $node_gate->safe_psql('postgres', q{
 	BEGIN;
@@ -256,13 +277,14 @@ $node_gate->safe_psql('postgres', q{
 	COMMIT;
 });
 my $post_l19 = _grd_transaction_count();
-cmp_ok($post_l19, '>', $pre_l19,
-	'L19 top-level write xact (BEGIN/INSERT/COMMIT) — XactLockTableInsert auto-acquires TRANSACTION lock, counter advances');
+is($post_l19, $pre_l19,
+	'L19 top-level write xact (BEGIN/INSERT/COMMIT) — Option A sole-native: XactLockTableInsert auto-acquires PG-native TRANSACTION lock, counter unchanged');
 
 # L20: true concurrent waiter — backend B waits on backend A's row-locking
-# xact, which drives XactLockTableWait(ShareLock) on A's xid.  Backend B
-# first assigns its own xid so the counter snapshot excludes B's owner
-# ExclusiveLock; the later increment belongs to the wait path.
+# xact, which drives XactLockTableWait(ShareLock) on A's xid.  The "waiter is
+# blocked on transactionid lock" assertion below still holds (the lock is taken,
+# just natively); under Option A sole-native the wait path does not engage the
+# cluster gate, so the TRANSACTION counter stays unchanged.
 my $holder = $node_gate->background_psql('postgres', timeout => 30);
 my $waiter = $node_gate->background_psql('postgres', timeout => 30, on_error_stop => 0);
 
@@ -299,8 +321,8 @@ ok($node_gate->poll_query_until(
    'L20 waiter backend is blocked on transactionid lock (XactLockTableWait path)');
 
 my $post_l20 = _grd_transaction_count();
-cmp_ok($post_l20, '>', $pre_l20,
-	'L20 concurrent row-lock waiter — XactLockTableWait ShareLock routes through TRANSACTION gate');
+is($post_l20, $pre_l20,
+	'L20 concurrent row-lock waiter — Option A sole-native: XactLockTableWait routes PG-native, TRANSACTION counter unchanged');
 
 $holder->query_safe(q{COMMIT;});
 $waiter->query_until(qr/l20_waiter_done/, q{});
@@ -309,7 +331,9 @@ $holder->quit;
 
 # L21: subtransaction rollback path — top-level xid is assigned before the
 # snapshot; the SAVEPOINT write assigns a subxid and ROLLBACK TO SAVEPOINT
-# exercises the XactLockTableDelete(subxid) release path.
+# exercises the XactLockTableDelete(subxid) release path.  Single-node
+# sole-native takes the PG-native lock, so the TRANSACTION counter is
+# unchanged (Option A).
 my $pre_l21 = _grd_transaction_count();
 $node_gate->safe_psql('postgres', q{
 	BEGIN;
@@ -320,8 +344,8 @@ $node_gate->safe_psql('postgres', q{
 	COMMIT;
 });
 my $post_l21 = _grd_transaction_count();
-cmp_ok($post_l21, '>', $pre_l21,
-	'L21 SAVEPOINT rollback — subxid TRANSACTION lock acquired and released via XactLockTableDelete');
+is($post_l21, $pre_l21,
+	'L21 SAVEPOINT rollback — Option A sole-native: subxid PG-native TRANSACTION lock acquired/released via XactLockTableDelete, counter unchanged');
 
 $node_gate->safe_psql('postgres', q{DROP TABLE IF EXISTS pgrac_l19_t});
 

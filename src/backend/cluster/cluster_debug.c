@@ -1500,6 +1500,11 @@ dump_gcs(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_gcs_get_lost_write_detected_count()));
 	emit_row(rsinfo, "gcs", "lost_write_avoid_count",
 			 fmt_int64((int64)cluster_gcs_get_lost_write_avoid_count()));
+	/* PGRAC: spec-2.41 D7 — SCN detector branch breakdown (§2.6). */
+	emit_row(rsinfo, "gcs", "lost_write_invalidscn_failclosed_count",
+			 fmt_int64((int64)cluster_gcs_get_lost_write_invalidscn_failclosed_count()));
+	emit_row(rsinfo, "gcs", "lost_write_not_scn_tracked_skip_count",
+			 fmt_int64((int64)cluster_gcs_get_lost_write_not_scn_tracked_skip_count()));
 	/* PGRAC: spec-5.2 D2 — X-holder read-image ship counter. */
 	emit_row(rsinfo, "gcs", "cf_xheld_read_ship_count",
 			 fmt_int64((int64)cluster_gcs_get_cf_xheld_read_ship_count()));
@@ -1553,6 +1558,13 @@ dump_gcs(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_gcs_get_recovery_redo_boundary_waits()));
 	emit_row(rsinfo, "gcs_recovery", "redo_boundary_reached",
 			 fmt_int64((int64)cluster_gcs_get_recovery_redo_boundary_reached()));
+	/* PGRAC: spec-2.41 D7 — redo-coverage serve-gate observability (§2.8 guard).
+	 * required_lsn_zero_count must stay 0 except real cold blocks; a spike means
+	 * the SCN migration wrongly zeroed the LSN watermark feeding the serve-gate. */
+	emit_row(rsinfo, "gcs_recovery", "redo_coverage_required_lsn_zero_count",
+			 fmt_int64((int64)cluster_gcs_get_redo_coverage_required_lsn_zero_count()));
+	emit_row(rsinfo, "gcs_recovery", "redo_coverage_gate_block_count",
+			 fmt_int64((int64)cluster_gcs_get_redo_coverage_gate_block_count()));
 	emit_row(rsinfo, "gcs_recovery", "stale_block_drop",
 			 fmt_int64((int64)cluster_gcs_get_recovery_stale_block_drop()));
 	emit_row(rsinfo, "gcs_recovery", "ambiguous_owner_failclosed",

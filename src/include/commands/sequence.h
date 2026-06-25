@@ -48,6 +48,26 @@ typedef FormData_pg_sequence_data *Form_pg_sequence_data;
 typedef struct xl_seq_rec
 {
 	RelFileLocator locator;
+	/*
+	 * PGRAC: spec-2.41 D4 — pd_block_scn carried for redo persistence.
+	 *
+	 *	The sequence page's pd_block_scn (a cluster SCN, == uint64) at the
+	 *	moment this record was emitted.  XLOG_SEQ_LOG registers the buffer
+	 *	REGBUF_WILL_INIT, so seq_redo PageInit-rebuilds the page (clearing
+	 *	pd_block_scn) instead of restoring a full-page image; without this
+	 *	field the stamp would be lost on crash recovery.  seq_redo restores
+	 *	PageHeader.pd_block_scn from THIS recorded value (the historical
+	 *	write_scn), never a replay-time current SCN.  InvalidScn (0) on
+	 *	non-cluster / non-tracked sequences.  Declared uint64 (not the SCN
+	 *	typedef) to keep this frontend-visible WAL struct free of cluster
+	 *	header dependencies — it is decoded by pg_waldump via seqdesc.c.
+	 *
+	 *	NB: the 8-byte field follows the 12-byte RelFileLocator, leaving a
+	 *	4-byte alignment hole before it; seq_redo locates the trailing tuple
+	 *	via sizeof(xl_seq_rec) (never a literal offset), so the hole is
+	 *	redo-safe.
+	 */
+	uint64		write_scn;
 	/* SEQUENCE TUPLE DATA FOLLOWS AT THE END */
 } xl_seq_rec;
 

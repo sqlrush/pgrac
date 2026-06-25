@@ -162,8 +162,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '128',
-   'L6a pg_stat_cluster_injections has 128 entries (spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2 undo boundary guards)');
+   '130',
+   'L6a pg_stat_cluster_injections has 130 entries (spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2 undo boundary guards; spec-5.7 +1 cluster-ko-peer-skip-ack; spec-2.41 +1 cluster-gcs-block-stale-ship)');
 
 is($node->safe_psql(
 		'postgres',
@@ -189,8 +189,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT category) FROM pg_cluster_state}),
-   '39',
-   'L7b pg_cluster_state has 39 distinct categories (spec-5.6 adds cf)');
+   '44',
+   'L7b pg_cluster_state has 44 distinct categories (spec-5.7 adds dl + hw + ir + ko + ts enqueue counters)');
 
 
 # ----------
@@ -209,7 +209,7 @@ is($node->safe_psql(
 my $smoke_categories = $node->safe_psql(
 	'postgres',
 	q{SELECT count(DISTINCT category) FROM pg_cluster_state});
-is($smoke_categories, '39', 'L9 cluster_smoke surface integrates pcm + gcs + tt_status + tt_status_hint + tt_2pc + tt_recovery + undo_record + visibility + wal_thread categories (39 categories;spec-5.6 adds cf)');
+is($smoke_categories, '44', 'L9 cluster_smoke surface integrates pcm + gcs + tt_status + tt_status_hint + tt_2pc + tt_recovery + undo_record + visibility + wal_thread + dl + hw + ir + ko + ts categories (44 categories;spec-5.7 adds enqueue counters)');
 
 
 # ----------

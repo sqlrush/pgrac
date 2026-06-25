@@ -781,6 +781,27 @@ cluster_gcs_get_lost_write_avoid_count(void)
 {
 	return 0;
 }
+/* spec-2.41 D7 stubs: SCN detector + redo-coverage observability accessors. */
+uint64
+cluster_gcs_get_lost_write_invalidscn_failclosed_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_lost_write_not_scn_tracked_skip_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_redo_coverage_required_lsn_zero_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_redo_coverage_gate_block_count(void)
+{
+	return 0;
+}
 /* spec-5.2 D2 stub: X-holder read-image ship counter accessor. */
 uint64
 cluster_gcs_get_cf_xheld_read_ship_count(void)

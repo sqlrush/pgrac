@@ -154,7 +154,8 @@ UT_TEST(test_invalidate_ack_payload_field_offsets)
 	UT_ASSERT_EQ((int)offsetof(GcsBlockInvalidateAckPayload, sender_node), 36);
 	UT_ASSERT_EQ((int)offsetof(GcsBlockInvalidateAckPayload, ack_status), 40);
 	UT_ASSERT_EQ((int)offsetof(GcsBlockInvalidateAckPayload, checksum), 48);
-	UT_ASSERT_EQ((int)offsetof(GcsBlockInvalidateAckPayload, page_lsn_bytes), 52);
+	/* spec-2.41 D3 — @52 carrier reinterpreted from page_lsn_bytes to page_scn_bytes. */
+	UT_ASSERT_EQ((int)offsetof(GcsBlockInvalidateAckPayload, page_scn_bytes), 52);
 }
 
 
@@ -267,8 +268,10 @@ UT_TEST(test_s_holders_bitmap_query_prototype_linkable)
 
 UT_TEST(test_bufmgr_invalidate_block_for_gcs_prototype_linkable)
 {
-	/* HC118 + HC123 — by-tag invalidate helper in bufmgr.c. */
-	bool (*fp)(BufferTag, PcmLockMode, XLogRecPtr *) = &cluster_bufmgr_invalidate_block_for_gcs;
+	/* HC118 + HC123 — by-tag invalidate helper in bufmgr.c.  spec-2.41 D3 added
+	 * the *out_page_scn out-param (ACK SCN carrier source). */
+	bool (*fp)(BufferTag, PcmLockMode, XLogRecPtr *, SCN *)
+		= &cluster_bufmgr_invalidate_block_for_gcs;
 
 	UT_ASSERT(fp != NULL);
 }

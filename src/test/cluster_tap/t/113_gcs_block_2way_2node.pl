@@ -9,7 +9,7 @@
 #
 #	  L1  ClusterPair startup baseline (both postmasters healthy)
 #	  L2  fresh baseline: 7 NEW counters all 0 + catversion >= 202605420
-#	  L3  pg_cluster_state.gcs category has 56 keys (31 spec-2.34 + 7 spec-2.35)
+#	  L3  pg_cluster_state.gcs category has 58 keys (31 spec-2.34 + 7 spec-2.35)
 #	  L4  cross-node forward path:  node A read first → master_holder = A;
 #	       force same tag on node B via test-only injection → master
 #	       chooses forward path → A direct-ships to B → block_forward_sent
@@ -108,18 +108,18 @@ for my $node ($pair->node0, $pair->node1)
 
 
 # ============================================================
-# L3: pg_cluster_state.gcs has 56 keys (31 spec-2.34 + 7 spec-2.35).
+# L3: pg_cluster_state.gcs has 58 keys (31 spec-2.34 + 7 spec-2.35).
 # ============================================================
 is($pair->node0->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '56',
-   'L3 node0 pg_cluster_state.gcs category has 56 keys');
+   '58',
+   'L3 node0 pg_cluster_state.gcs category has 58 keys');
 is($pair->node1->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '56',
-   'L3 node1 pg_cluster_state.gcs category has 56 keys');
+   '58',
+   'L3 node1 pg_cluster_state.gcs category has 58 keys');
 
 
 # ============================================================

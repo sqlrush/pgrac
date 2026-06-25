@@ -212,19 +212,22 @@ SKIP: {
 
 # ----------
 # Lobs (D6/observability): no 'gcs_recovery' dump category yet (D6 flips:
-#     8 counters: block_resources_recovering / buffers_redeclared /
+#     8 warm-recovery counters: block_resources_recovering / buffers_redeclared /
 #     block_state_rebuilt / redo_boundary_waits / redo_boundary_reached /
-#     stale_block_drop / ambiguous_owner_failclosed /
-#     before_boundary_failclosed).
+#     stale_block_drop / ambiguous_owner_failclosed / before_boundary_failclosed).
+#     spec-2.41 D7 adds 2 redo-coverage serve-gate counters to the same category
+#     (redo_coverage_required_lsn_zero_count / redo_coverage_gate_block_count) → 10.
 # ----------
 is($triple->node0->safe_psql('postgres',
 		q{SELECT count(*) FROM cluster_dump_state()
 		    WHERE category = 'gcs_recovery'}),
-	'8',
-	'Lobs (D6 flipped): gcs_recovery dump category exposes 8 warm-recovery '
-	. 'counters (block_resources_recovering / buffers_redeclared / '
+	'10',
+	'Lobs (D6 flipped + spec-2.41 D7): gcs_recovery dump category exposes 10 '
+	. 'counters — 8 warm-recovery (block_resources_recovering / buffers_redeclared / '
 	. 'block_state_rebuilt / redo_boundary_waits / redo_boundary_reached / '
-	. 'stale_block_drop / ambiguous_owner_failclosed / before_boundary_failclosed)');
+	. 'stale_block_drop / ambiguous_owner_failclosed / before_boundary_failclosed) '
+	. '+ 2 redo-coverage serve-gate (redo_coverage_required_lsn_zero_count / '
+	. 'redo_coverage_gate_block_count)');
 
 
 $triple->stop_triple;

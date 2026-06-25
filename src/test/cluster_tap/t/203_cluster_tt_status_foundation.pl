@@ -70,16 +70,34 @@ sub tt_int
 # ============================================================
 my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	'tt_status_foundation',
+	# spec-5.7 §3.1d: a true 2-node cluster has alive peers, so Option A does not
+	# short-circuit the lock gate to native; L2's write-xact TRANSACTION lock
+	# globalizes and needs a coordinated GES master.  Provide quorum voting disks
+	# + GRD capacity (+ readiness wait below) so coordination succeeds instead of
+	# timing out.  A true 2-node TT-status foundation must coordinate cross-node
+	# locks rather than fall back to native/skeleton.
+	quorum_voting_disks => 3,
 	extra_conf => [
 		'autovacuum = off',
 		# spec-3.1 D10: keep PCM out of the foundation TAP so a short
 		# HC116 invalidate timeout cannot mask the TT status signal
 		# (L175 fixture-scope GUC isolation).
 		'cluster.pcm_grd_max_entries = 0',
+		# spec-5.7 §3.1d: GES GRD capacity for the globalized TRANSACTION lock
+		# (explicit; matches the post-spec-5.7 default).
+		'cluster.grd_max_entries = 1024',
 	]);
 $pair->start_pair;
 
 usleep(2_000_000);
+
+# spec-5.7 §3.1d readiness gate: ensure both peers see each other connected
+# before the first globalized lock, so the GES master is electable (reuses the
+# t/246 voting + readiness pattern).
+$pair->wait_for_peer_state(0, 1, 'connected', 30)
+  or die "node0 did not see node1 connected";
+$pair->wait_for_peer_state(1, 0, 'connected', 30)
+  or die "node1 did not see node0 connected";
 
 is($pair->node0->safe_psql('postgres', 'SELECT 1'),
 	'1', 'L1 node0 postmaster alive');

@@ -130,8 +130,8 @@ for my $i (0 .. 2)
 
 	is($node->safe_psql('postgres',
 			q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-		'56',
-		"L4 node$i pg_cluster_state.gcs has 56 keys");
+		'58',
+		"L4 node$i pg_cluster_state.gcs has 58 keys");
 }
 
 

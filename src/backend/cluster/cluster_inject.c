@@ -365,6 +365,23 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	{ .name = "cluster-gcs-block-x-forward-master-side" },
 	{ .name = "cluster-gcs-block-starvation-force-denied" },
 	/*
+	 * spec-2.41 D5 / P1-C — SCN lost-write detector behavioral trigger.
+	 *
+	 *	cluster-gcs-block-stale-ship:
+	 *	  Fires before gcs_block_lost_write_verdict() on BOTH ship paths —
+	 *	  master-direct and holder-forward.  In a real 2-node cluster the
+	 *	  master-direct detector is bypassed (self-ship / read-image goto),
+	 *	  so the holder-forward path is the reachable twin that validates a
+	 *	  cross-node transfer.  SKIP forces the SHIPPED page's pd_block_scn
+	 *	  to InvalidScn while the expected pi_watermark_scn is VALID — §2.6
+	 *	  branch 2 (a tracked block shipping an unstamped page = ANOMALY) —
+	 *	  so the ship fails closed DENIED_LOST_WRITE, the requester
+	 *	  ereport(53R93), and lost_write_invalidscn_failclosed_count grows.
+	 *	  One-shot (should_skip consumes).  Anticipated by spec-2.37
+	 *	  (deferred behavioral trigger), activated here for spec-2.41 §6 D.
+	 */
+	{ .name = "cluster-gcs-block-stale-ship" },
+	/*
 	 * spec-2.38 D14 — SI Broadcaster fault injection.
 	 *
 	 *	cluster-sinval-broadcast-drop-send:

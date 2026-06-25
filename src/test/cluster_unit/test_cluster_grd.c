@@ -275,6 +275,7 @@ void
 cluster_gcs_block_send_redeclare(BufferTag tag pg_attribute_unused(),
 								 uint8 held_mode pg_attribute_unused(),
 								 XLogRecPtr page_lsn pg_attribute_unused(),
+								 SCN page_scn pg_attribute_unused(),
 								 uint64 cluster_epoch pg_attribute_unused(),
 								 int master_node pg_attribute_unused())
 {}

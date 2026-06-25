@@ -68,7 +68,7 @@ my $has_visibility_inject =
 	  q{SELECT count(*) FROM pg_cluster_shmem
 	     WHERE name = 'pgrac cluster visibility inject'}) eq '1';
 # +1 for the unconditional "pgrac cluster sequence" region (spec-5.4 SQ shmem foundation).
-  my $expected_region_count = $has_visibility_inject ? '54' : '53';
+  my $expected_region_count = $has_visibility_inject ? '59' : '58';
 
 
 # ----------
@@ -201,8 +201,8 @@ SKIP: {
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '128',
-   'L12a pg_stat_cluster_injections is 128 (spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2 undo boundary guards)');
+   '130',
+   'L12a pg_stat_cluster_injections is 130 (spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2 undo boundary guards; spec-5.7 +1 cluster-ko-peer-skip-ack; spec-2.41 +1 cluster-gcs-block-stale-ship)');
 
 is($node->safe_psql(
 		'postgres',

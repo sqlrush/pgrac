@@ -85,6 +85,12 @@ sub target_page
 
 my $pair = PostgreSQL::Test::ClusterPair->new_pair('recworker',
 	wal_threads_root => 1,
+	# spec-5.7 §3.1d: a true 2-node cluster has alive peers, so Option A does not
+	# short-circuit the lock gate to native; the setup write-xact below
+	# globalizes its TRANSACTION lock and needs a coordinated GES master.
+	# Provide quorum voting disks (+ readiness wait below) so coordination
+	# succeeds instead of timing out.
+	quorum_voting_disks => 3,
 	extra_conf => [
 		'autovacuum = off',
 		'cluster.recovery_stale_active_ms = 5000',
@@ -96,6 +102,14 @@ my $node0 = $pair->node0;
 my $node1 = $pair->node1;
 
 $pair->start_pair;
+
+# spec-5.7 §3.1d readiness gate: ensure both peers see each other connected
+# before the first globalized lock, so the GES master is electable.
+select(undef, undef, undef, 3);
+$pair->wait_for_peer_state(0, 1, 'connected', 30)
+  or die "node0 did not see node1 connected";
+$pair->wait_for_peer_state(1, 0, 'connected', 30)
+  or die "node1 did not see node0 connected";
 
 # Generate some WAL on node1 so its latest segment is partially
 # written (the realistic healthy-crash shape), then let the stats

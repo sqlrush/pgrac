@@ -158,6 +158,18 @@ typedef struct ClusterGcsBlockShared {
 	pg_atomic_uint64 pi_watermark_retire_count;	 /* tag lifecycle + durable-confirm retire */
 	pg_atomic_uint64 lost_write_detected_count;	 /* master direct OR holder forward detect */
 	pg_atomic_uint64 lost_write_avoid_count;	 /* durable-confirm retire avoided false-pos */
+	/* PGRAC: spec-2.41 D7 — SCN lost-write detector + redo-coverage observability.
+	 * Pure counters (no behavior change): the verdict still maps STALE+ANOMALY to
+	 * DENIED_LOST_WRITE and bumps lost_write_detected_count;  these break that down
+	 * by §2.6 branch and surface the redo-coverage serve-gate (§2.8 regression
+	 * guard — redo_coverage_required_lsn_zero_count must stay 0 except real cold). */
+	pg_atomic_uint64
+		lost_write_invalidscn_failclosed_count; /* §2.6 b2: tracked block, shipped InvalidScn */
+	pg_atomic_uint64
+		lost_write_not_scn_tracked_skip_count; /* §2.6 b1: expected InvalidScn → skip */
+	pg_atomic_uint64
+		redo_coverage_required_lsn_zero_count;		 /* serve-gate required_lsn==0 (cold/degrade) */
+	pg_atomic_uint64 redo_coverage_gate_block_count; /* serve-gate not-covered (block) */
 	/* PGRAC: spec-5.2 D2 — X-holder shipped a one-shot read image (current
 	 * block, holder kept X) for a cross-node N→S read. */
 	pg_atomic_uint64 cf_xheld_read_ship_count;
@@ -306,6 +318,11 @@ cluster_gcs_block_shmem_init(void)
 		pg_atomic_init_u64(&ClusterGcsBlock->pi_watermark_retire_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->lost_write_detected_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->lost_write_avoid_count, 0);
+		/* PGRAC: spec-2.41 D7 — 4 NEW SCN detector + redo-coverage counters init. */
+		pg_atomic_init_u64(&ClusterGcsBlock->lost_write_invalidscn_failclosed_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->lost_write_not_scn_tracked_skip_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->redo_coverage_required_lsn_zero_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->redo_coverage_gate_block_count, 0);
 		/* PGRAC: spec-5.2 D2 — X-holder read-image ship counter init. */
 		pg_atomic_init_u64(&ClusterGcsBlock->cf_xheld_read_ship_count, 0);
 		/* PGRAC: spec-5.2a D6 — 5 NEW clean-page X-transfer counters init. */
@@ -483,9 +500,11 @@ gcs_block_compute_invalidate_ack_checksum(const GcsBlockInvalidateAckPayload *ac
 	size_t checksum_off = offsetof(GcsBlockInvalidateAckPayload, checksum);
 	size_t i;
 
-	/* spec-2.37 D7: ACK carries page_lsn_bytes after checksum.  Hash every
-	 * payload byte except the checksum field itself so stale or corrupted
-	 * holder page_lsn cannot advance the master PI watermark. */
+	/* spec-2.37 D7 / spec-2.41 D3: ACK carries page_scn_bytes after checksum.
+	 * Hash every payload byte except the checksum field itself so a stale or
+	 * corrupted holder page_scn cannot advance the master detector SCN
+	 * watermark (the @52 carrier is covered by this all-bytes-except-checksum
+	 * hash). */
 	for (i = 0; i < sizeof(GcsBlockInvalidateAckPayload); i++) {
 		if (i >= checksum_off && i < checksum_off + sizeof(uint32))
 			continue;
@@ -495,21 +514,29 @@ gcs_block_compute_invalidate_ack_checksum(const GcsBlockInvalidateAckPayload *ac
 }
 
 /*
- * spec-4.7 D2 — checksum over the GcsBlockRedeclarePayload bytes before the
- * checksum field [0,48), which includes the page_lsn (so a corrupted holder
- * page_lsn cannot poison the rebuilt PI watermark / lost-write required_lsn).
+ * spec-4.7 D2 / spec-2.41 D3 — checksum over ALL GcsBlockRedeclarePayload bytes
+ * EXCEPT the checksum field itself.  spec-4.7 originally covered only [0,48)
+ * (page_lsn@28); spec-2.41 D3 adds page_scn@52 AFTER the checksum, so the
+ * coverage was widened to all-bytes-except-checksum (the same pattern as the
+ * invalidate ACK) — otherwise a corrupted holder page_scn could poison the
+ * rebuilt detector SCN watermark (D3 mandatory; §4.3 P1-3 poison vector).
  */
 static uint32
 gcs_block_compute_redeclare_checksum(const GcsBlockRedeclarePayload *p)
 {
 	const char *bytes = (const char *)p;
 	uint32 c = 0;
+	size_t checksum_off = offsetof(GcsBlockRedeclarePayload, checksum);
 	size_t i;
 
-	for (i = 0; i < offsetof(GcsBlockRedeclarePayload, checksum); i++)
+	for (i = 0; i < sizeof(GcsBlockRedeclarePayload); i++) {
+		if (i >= checksum_off && i < checksum_off + sizeof(uint32))
+			continue;
 		c = (c * 31u) + (uint8)bytes[i];
+	}
 	return c;
 }
+
 
 /*
  * HC84:  install received block bytes into the requester's buffer under
@@ -665,7 +692,9 @@ cluster_gcs_block_phase_for_tag(BufferTag tag)
 		return GCS_BLOCK_RECOVERING;
 	}
 	if (!cluster_gcs_block_redo_lsn_covered(static_master,
-											cluster_pcm_lock_pi_watermark_query(tag))) {
+											/* spec-2.41 §2.8 — redo-coverage uses the LSN watermark
+											 * (per-stream replay position), NOT the detector SCN. */
+											cluster_pcm_lock_pi_watermark_lsn_query(tag))) {
 		/* materialized but a survivor observed a higher page_lsn than redo
 		 * reached → lost-write boundary → fail-closed (53R9M class). */
 		if (ClusterGcsBlock != NULL)
@@ -695,16 +724,26 @@ bool
 cluster_gcs_block_redo_lsn_covered(int dead_origin, XLogRecPtr required_lsn)
 {
 	bool covered;
+	bool required_lsn_zero = XLogRecPtrIsInvalid(required_lsn);
 
-	if (XLogRecPtrIsInvalid(required_lsn))
+	if (required_lsn_zero)
 		covered = true;
 	else
 		covered = cluster_merged_instance_recovered_through(dead_origin) >= (uint64)required_lsn;
 
-	if (ClusterGcsBlock != NULL)
+	if (ClusterGcsBlock != NULL) {
 		pg_atomic_fetch_add_u64(covered ? &ClusterGcsBlock->recovery_redo_boundary_reached
 										: &ClusterGcsBlock->recovery_redo_boundary_waits,
 								1);
+		/* spec-2.41 D7 (§2.8 regression guard) — required_lsn==0 means the LSN
+		 * watermark feeding this serve-gate was absent (real cold block OR, if it
+		 * spikes, the SCN migration wrongly zeroed the lsn watermark).  The
+		 * block-count tracks how often the gate fail-closed (not covered). */
+		if (required_lsn_zero)
+			pg_atomic_fetch_add_u64(&ClusterGcsBlock->redo_coverage_required_lsn_zero_count, 1);
+		if (!covered)
+			pg_atomic_fetch_add_u64(&ClusterGcsBlock->redo_coverage_gate_block_count, 1);
+	}
 	return covered;
 }
 
@@ -1078,15 +1117,21 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 									errmsg("cluster_gcs_block: lost write detected on tag "
 										   "spc=%u db=%u rel=%u block=%u",
 										   tag.spcOid, tag.dbOid, tag.relNumber, tag.blockNum),
-									errhint("Shipped block.page_lsn is below the master "
-											"pi_watermark_lsn.  Inspect dump_gcs."
+									errhint("Shipped block.pd_block_scn is below the master "
+											"pi_watermark_scn (or the tracked block shipped an "
+											"unstamped page).  Inspect dump_gcs."
 											"lost_write_detected_count and cluster_pcm_grd "
-											"to identify the stale source.  HC131.")));
+											"to identify the stale source.  spec-2.41 D1.")));
 				} else {
 					/* WARN action: do NOT error.  This diagnostic mode intentionally
-					 * lets the caller proceed with the existing/storage-fallback block;
-					 * only safe for staging.  Avoid terminal_denied, otherwise the
-					 * post-loop switch raises a generic FEATURE_NOT_SUPPORTED. */
+					 * lets the caller proceed with the existing/storage-fallback block —
+					 * which may be STALE.  Asymmetry (spec-2.41 review): unlike the
+					 * holder-forward D5 WARN terminal (which ships no page and still
+					 * fail-closes), this master-direct / storage-fallback WARN can serve
+					 * a possibly-stale image — a staging-only, pre-existing diagnostic
+					 * risk, never the production default.  Avoid terminal_denied,
+					 * otherwise the post-loop switch raises a generic
+					 * FEATURE_NOT_SUPPORTED. */
 					ereport(WARNING, (errmsg("cluster_gcs_block: lost write detected on tag "
 											 "spc=%u db=%u rel=%u block=%u (action=warn)",
 											 tag.spcOid, tag.dbOid, tag.relNumber, tag.blockNum)));
@@ -1247,8 +1292,8 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, int32 holder_node)
 		fwd.requester_backend_id = (int32)MyBackendId;
 		fwd.master_node = cluster_node_id;
 		fwd.transition_id = (uint8)PCM_TRANS_N_TO_S;
-		GcsBlockForwardPayloadSetExpectedPiWatermarkLsn(&fwd,
-														cluster_pcm_lock_pi_watermark_query(tag));
+		GcsBlockForwardPayloadSetExpectedPiWatermarkScn(
+			&fwd, cluster_pcm_lock_pi_watermark_scn_query(tag));
 		GcsBlockForwardPayloadSetReadImage(&fwd, true);
 
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_sent_count, 1);
@@ -1389,8 +1434,8 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, int32 holder_node,
 		fwd.requester_backend_id = (int32)MyBackendId;
 		fwd.master_node = cluster_node_id;
 		fwd.transition_id = (uint8)PCM_TRANS_N_TO_X;
-		GcsBlockForwardPayloadSetExpectedPiWatermarkLsn(&fwd,
-														cluster_pcm_lock_pi_watermark_query(tag));
+		GcsBlockForwardPayloadSetExpectedPiWatermarkScn(
+			&fwd, cluster_pcm_lock_pi_watermark_scn_query(tag));
 		GcsBlockForwardPayloadSetXTransfer(&fwd, true);
 		/* spec-5.2a D1/D3: an eligible (clean sequence-page) X-transfer tells
 		 * the holder to flush the data page to shared storage before dropping
@@ -1523,8 +1568,11 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, int32 holder_node,
 	if (installed) {
 		/* The holder shipped its current image and released its X; record self
 		 * as the new authoritative X holder (durable).  No master round-trip:
-		 * THIS node is the master. */
-		cluster_pcm_lock_master_take_x_after_transfer(tag, installed_page_lsn);
+		 * THIS node is the master.  spec-2.41 D2 — also advance the detector's
+		 * SCN watermark from the installed image's pd_block_scn (local-page
+		 * source; bytes are slot->reply_block_data). */
+		cluster_pcm_lock_master_take_x_after_transfer(
+			tag, installed_page_lsn, (SCN)((PageHeader)slot->reply_block_data)->pd_block_scn);
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_x_granted_from_holder_count, 1);
 		if (clean_eligible)
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->clean_page_xfer_count, 1);
@@ -1555,6 +1603,42 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, int32 holder_node,
 							   (unsigned int)BufTagGetRelNumber(&tag), (unsigned int)tag.blockNum),
 						errhint("The X holder could not relinquish a clean page (pinned or "
 								"re-dirtied); retry the transaction.")));
+	}
+
+	/*
+	 * PGRAC: spec-2.41 D5 — terminal lost-write from the holder-forward detector.
+	 *
+	 *	The holder ran gcs_block_lost_write_verdict() on its copied page and
+	 *	replied DENIED_LOST_WRITE (the shipped pd_block_scn is below the master
+	 *	pi_watermark_scn, or a tracked block shipped an unstamped page; §2.6).
+	 *	This is a TERMINAL data-integrity event — NOT the transient "holder did
+	 *	not ship in time" fail-closed below — so map it to the precise 53R93
+	 *	instead of the retryable FEATURE_NOT_SUPPORTED.  Mirrors the master-direct
+	 *	requester handling (the master-side ship detector twin);
+	 *	cluster.gcs_block_lost_write_action selects ERROR (production, default) or
+	 *	WARNING (staging diagnostic — then still fail-closed below, since the
+	 *	holder shipped no page; on THIS holder-forward path no stale image is
+	 *	granted, Rule 8.A.  Path-specific, NOT a blanket guarantee: the
+	 *	master-direct / storage-fallback WARN terminal instead proceeds with a
+	 *	possibly-stale storage-fallback block — a staging-only diagnostic risk).
+	 */
+	if (got_reply && reply_status == (uint8)GCS_BLOCK_REPLY_DENIED_LOST_WRITE) {
+		if (cluster_gcs_block_lost_write_action == 0 /* ERROR */)
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_LOST_WRITE_DETECTED),
+					 errmsg("cluster_gcs_block: lost write detected on tag "
+							"spc=%u db=%u relNumber=%u block=%u",
+							tag.spcOid, tag.dbOid, (unsigned int)BufTagGetRelNumber(&tag),
+							(unsigned int)tag.blockNum),
+					 errhint("The holder-forward shipped block.pd_block_scn is below the "
+							 "master pi_watermark_scn (or a tracked block shipped an "
+							 "unstamped page).  Inspect dump_gcs.lost_write_detected_count "
+							 "and cluster_pcm_grd to find the stale source.  spec-2.41 D5.")));
+		else
+			ereport(WARNING, (errmsg("cluster_gcs_block: lost write detected on tag "
+									 "spc=%u db=%u relNumber=%u block=%u (action=warn)",
+									 tag.spcOid, tag.dbOid, (unsigned int)BufTagGetRelNumber(&tag),
+									 (unsigned int)tag.blockNum)));
 	}
 
 	/*
@@ -1929,10 +2013,11 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 			fwd.requester_backend_id = req->requester_backend_id;
 			fwd.master_node = cluster_node_id;
 			fwd.transition_id = req->transition_id;
-			/* PGRAC: spec-2.37 D3 HC127 — stamp expected pi_watermark_lsn so
-			 * holder can validate copied page_lsn >= expected before ship. */
-			GcsBlockForwardPayloadSetExpectedPiWatermarkLsn(
-				&fwd, cluster_pcm_lock_pi_watermark_query(req->tag));
+			/* PGRAC: spec-2.37 D3 HC127 (spec-2.41 SCN migration) — stamp
+			 * expected pi_watermark_scn so the holder can validate the copied
+			 * page's pd_block_scn before ship. */
+			GcsBlockForwardPayloadSetExpectedPiWatermarkScn(
+				&fwd, cluster_pcm_lock_pi_watermark_scn_query(req->tag));
 
 			if (cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, holder_node, &fwd,
 										 sizeof(fwd))
@@ -2095,7 +2180,10 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 					 * requester.  Rule 8.A holds.
 					 */
 					(void)cluster_bufmgr_drop_block_for_gcs_no_wire(req->tag, &drop_lsn);
-					cluster_pcm_lock_master_grant_x_to(req->tag, req->sender_node, page_lsn);
+					/* spec-2.41 D2 — advance detector SCN watermark from the
+					 * shipped page's pd_block_scn (local-page source = block_buf). */
+					cluster_pcm_lock_master_grant_x_to(req->tag, req->sender_node, page_lsn,
+													   (SCN)((PageHeader)block_buf)->pd_block_scn);
 					status = GCS_BLOCK_REPLY_GRANTED;
 					block_payload = block_buf;
 					if (ClusterGcsBlock != NULL)
@@ -2208,9 +2296,10 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 				fwd.requester_backend_id = req->requester_backend_id;
 				fwd.master_node = cluster_node_id;
 				fwd.transition_id = req->transition_id;
-				/* PGRAC: spec-2.37 D3 HC127 — stamp expected pi_watermark_lsn. */
-				GcsBlockForwardPayloadSetExpectedPiWatermarkLsn(
-					&fwd, cluster_pcm_lock_pi_watermark_query(req->tag));
+				/* PGRAC: spec-2.37 D3 HC127 (spec-2.41 SCN migration) — stamp
+				 * expected pi_watermark_scn. */
+				GcsBlockForwardPayloadSetExpectedPiWatermarkScn(
+					&fwd, cluster_pcm_lock_pi_watermark_scn_query(req->tag));
 
 				if (cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, x_holder, &fwd,
 											 sizeof(fwd))
@@ -2388,8 +2477,8 @@ x_path_skipped:
 				fwd.requester_backend_id = req->requester_backend_id;
 				fwd.master_node = cluster_node_id;
 				fwd.transition_id = req->transition_id;
-				GcsBlockForwardPayloadSetExpectedPiWatermarkLsn(
-					&fwd, cluster_pcm_lock_pi_watermark_query(req->tag));
+				GcsBlockForwardPayloadSetExpectedPiWatermarkScn(
+					&fwd, cluster_pcm_lock_pi_watermark_scn_query(req->tag));
 				/* D2: tell the holder to ship a read image and keep its X. */
 				GcsBlockForwardPayloadSetReadImage(&fwd, true);
 
@@ -2448,10 +2537,11 @@ x_path_skipped:
 			fwd.requester_backend_id = req->requester_backend_id;
 			fwd.master_node = cluster_node_id;
 			fwd.transition_id = req->transition_id;
-			/* PGRAC: spec-2.37 D3 HC127 — stamp expected pi_watermark_lsn so
-			 * holder can validate copied page_lsn >= expected before ship. */
-			GcsBlockForwardPayloadSetExpectedPiWatermarkLsn(
-				&fwd, cluster_pcm_lock_pi_watermark_query(req->tag));
+			/* PGRAC: spec-2.37 D3 HC127 (spec-2.41 SCN migration) — stamp
+			 * expected pi_watermark_scn so the holder can validate the copied
+			 * page's pd_block_scn before ship. */
+			GcsBlockForwardPayloadSetExpectedPiWatermarkScn(
+				&fwd, cluster_pcm_lock_pi_watermark_scn_query(req->tag));
 
 			if (cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, holder_node, &fwd,
 										 sizeof(fwd))
@@ -2490,31 +2580,44 @@ x_path_skipped:
 	if (req->transition_id == PCM_TRANS_N_TO_X || req->transition_id == PCM_TRANS_S_TO_X_UPGRADE)
 		cluster_pcm_lock_clear_pending_x(req->tag);
 
-	/* PGRAC: spec-2.37 D4 HC128 NEW — master direct ship 自校 lost-write.
+	/* PGRAC: spec-2.41 D1 — master-direct ship self-checks lost-write via SCN.
 	 *
-	 *	If master is about to GRANT a block (status == GRANTED), verify that
-	 *	page_lsn >= pi_watermark_lsn(tag) before sending it on the wire.
-	 *	Failure means master itself was shipping a stale block (rare but
-	 *	indicates upstream WAL replay lag / split-brain scenario) — fail loud
-	 *	with DENIED_LOST_WRITE so sender ereport(53R93) HC131.
-	 *
-	 *	Why master self-check (not relying on sender): sender has no view of
-	 *	master's authoritative pi_watermark_lsn; only master can know.  HC128. */
+	 *	If the master is about to GRANT a block, compare the SHIPPED page's
+	 *	pd_block_scn against the master's authoritative pi_watermark_scn(tag)
+	 *	through gcs_block_lost_write_verdict() (§2.6).  STALE (shipped < expected)
+	 *	and ANOMALY (tracked block, shipped InvalidScn) both fail-closed with
+	 *	DENIED_LOST_WRITE so the sender ereport(53R93).  SKIP (not SCN-tracked)
+	 *	and PASS ship normally.  Cross-node version order is the global SCN, NOT
+	 *	page_lsn (per-node WAL position; spec-2.41 §0) — the old page_lsn check is
+	 *	removed.  Master self-check (not sender): only the master holds the
+	 *	authoritative watermark. */
 	if (status == GCS_BLOCK_REPLY_GRANTED) {
-		/* spec-2.37 D15 inject — force page_lsn=0 to simulate stale source. */
+		SCN expected_scn = cluster_pcm_lock_pi_watermark_scn_query(req->tag);
+		SCN shipped_scn
+			= (block_payload != NULL) ? ((PageHeader)block_payload)->pd_block_scn : InvalidScn;
+		GcsLostWriteVerdict verdict;
+
+		/* spec-2.41 D15/P1-C inject — force the SHIPPED pd_block_scn to InvalidScn
+		 * to simulate a tracked-but-unstamped (anomaly) source; with a valid
+		 * watermark this drives the fail-closed path.  (Was: force page_lsn=0.) */
 		CLUSTER_INJECTION_POINT("cluster-gcs-block-stale-ship");
 		if (cluster_injection_should_skip("cluster-gcs-block-stale-ship"))
+			shipped_scn = InvalidScn;
+
+		verdict = gcs_block_lost_write_verdict(expected_scn, shipped_scn);
+		if (verdict == GCS_LOST_WRITE_SKIP) {
+			/* spec-2.41 D7 observability — block not SCN-tracked (no fire). */
+			if (ClusterGcsBlock != NULL)
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->lost_write_not_scn_tracked_skip_count, 1);
+		} else if (verdict == GCS_LOST_WRITE_FAIL_STALE || verdict == GCS_LOST_WRITE_FAIL_ANOMALY) {
+			status = GCS_BLOCK_REPLY_DENIED_LOST_WRITE;
 			page_lsn = InvalidXLogRecPtr;
-
-		{
-			XLogRecPtr expected = cluster_pcm_lock_pi_watermark_query(req->tag);
-
-			if (!XLogRecPtrIsInvalid(expected) && (uint64)page_lsn < (uint64)expected) {
-				status = GCS_BLOCK_REPLY_DENIED_LOST_WRITE;
-				page_lsn = InvalidXLogRecPtr;
-				block_payload = NULL;
-				if (ClusterGcsBlock != NULL)
-					pg_atomic_fetch_add_u64(&ClusterGcsBlock->lost_write_detected_count, 1);
+			block_payload = NULL;
+			if (ClusterGcsBlock != NULL) {
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->lost_write_detected_count, 1);
+				if (verdict == GCS_LOST_WRITE_FAIL_ANOMALY)
+					pg_atomic_fetch_add_u64(
+						&ClusterGcsBlock->lost_write_invalidscn_failclosed_count, 1);
 			}
 		}
 	}
@@ -2748,18 +2851,44 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	GcsBlockReplyHeaderSetForwardingMasterNode(hdr, fwd->master_node);
 
 	if (holder_ship_ok) {
-		/* PGRAC: spec-2.37 D5 HC128 NEW — holder forward path validate
-		 * lost-write.  Master has stamped expected_pi_watermark_lsn into
-		 * the forward payload (HC127); after copying the block bytes,
-		 * verify copied page_lsn >= expected.  Failure → reply
-		 * DENIED_LOST_WRITE so sender ereport(53R93) HC131. */
-		XLogRecPtr expected = GcsBlockForwardPayloadGetExpectedPiWatermarkLsn(fwd);
+		/* PGRAC: spec-2.41 D1 — holder-forward path validates lost-write via SCN.
+		 * The master stamped expected_pi_watermark_scn into the forward payload
+		 * (@49); after copying the block bytes, compare the copied page's
+		 * pd_block_scn against it through gcs_block_lost_write_verdict() (§2.6).
+		 * STALE / ANOMALY → reply DENIED_LOST_WRITE so the sender ereport(53R93).
+		 * page_lsn is no longer the detector quantity (per-node WAL position is
+		 * not cross-node comparable; §0). */
+		SCN expected_scn = GcsBlockForwardPayloadGetExpectedPiWatermarkScn(fwd);
+		SCN shipped_scn = ((PageHeader)block_buf)->pd_block_scn;
+		GcsLostWriteVerdict verdict;
 
-		if (!XLogRecPtrIsInvalid(expected) && (uint64)page_lsn < (uint64)expected) {
+		/* spec-2.41 D5/P1-C inject — force the SHIPPED pd_block_scn to InvalidScn
+		 * to simulate a tracked-but-unstamped (anomaly) source.  This is the
+		 * REACHABLE detector twin of the master-direct inject (:2559): in a real
+		 * 2-node cluster every master-side ship of a held block bypasses the
+		 * master-direct detector (spec-5.2/5.2a self-ship + read-image goto), so a
+		 * cross-node transfer is validated HERE on the holder-forward path.  With a
+		 * valid master pi_watermark_scn carried in the forward payload, forcing the
+		 * shipped page InvalidScn drives the fail-closed ANOMALY path → the original
+		 * requester ereport(53R93).  One-shot (should_skip consumes). */
+		CLUSTER_INJECTION_POINT("cluster-gcs-block-stale-ship");
+		if (cluster_injection_should_skip("cluster-gcs-block-stale-ship"))
+			shipped_scn = InvalidScn;
+
+		verdict = gcs_block_lost_write_verdict(expected_scn, shipped_scn);
+
+		if (verdict == GCS_LOST_WRITE_FAIL_STALE || verdict == GCS_LOST_WRITE_FAIL_ANOMALY) {
 			hdr->checksum = gcs_block_compute_checksum(buf + sizeof(GcsBlockReplyHeader));
 			hdr->status = (uint8)GCS_BLOCK_REPLY_DENIED_LOST_WRITE;
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->lost_write_detected_count, 1);
+			/* spec-2.41 D7 observability — break out the §2.6 anomaly branch. */
+			if (verdict == GCS_LOST_WRITE_FAIL_ANOMALY)
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->lost_write_invalidscn_failclosed_count,
+										1);
 		} else {
+			/* spec-2.41 D7 observability — SKIP = block not SCN-tracked (still ships). */
+			if (verdict == GCS_LOST_WRITE_SKIP)
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->lost_write_not_scn_tracked_skip_count, 1);
 			memcpy(buf + sizeof(GcsBlockReplyHeader), block_buf, GCS_BLOCK_DATA_SIZE);
 			hdr->checksum = gcs_block_compute_checksum(block_buf);
 			/*
@@ -3020,7 +3149,7 @@ gcs_block_broadcast_invalidate_and_wait(const GcsBlockRequestPayload *req, uint3
  *	replies ACK msg_type 18 to master.
  * ============================================================ */
 extern bool cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode,
-													XLogRecPtr *out_page_lsn);
+													XLogRecPtr *out_page_lsn, SCN *out_page_scn);
 
 static void
 cluster_gcs_handle_block_invalidate_envelope(const ClusterICEnvelope *env, const void *payload)
@@ -3029,7 +3158,8 @@ cluster_gcs_handle_block_invalidate_envelope(const ClusterICEnvelope *env, const
 	GcsBlockInvalidateAckPayload ack;
 	PcmLockMode pre_state;
 	XLogRecPtr page_lsn = InvalidXLogRecPtr;
-	uint8 ack_status = 0; /* OK */
+	SCN page_scn = InvalidScn; /* spec-2.41 D3 — ACK SCN carrier */
+	uint8 ack_status = 0;	   /* OK */
 	uint64 current_epoch;
 
 	/* D16 inject — stall ack for timeout testing. */
@@ -3065,14 +3195,15 @@ cluster_gcs_handle_block_invalidate_envelope(const ClusterICEnvelope *env, const
 	 * Stage 6) lands, this X branch goes live and must be hardened against the
 	 * release-to-the-invalidating-master round-trip (codereview P2-1).
 	 */
-	if (cluster_bufmgr_invalidate_block_for_gcs(inv->tag, pre_state, &page_lsn)) {
+	if (cluster_bufmgr_invalidate_block_for_gcs(inv->tag, pre_state, &page_lsn, &page_scn)) {
 		PcmLockTransition trans = (pre_state == PCM_LOCK_MODE_X) ? PCM_TRANS_X_TO_N_DOWNGRADE
 																 : PCM_TRANS_S_TO_N_INVALIDATE;
 		(void)cluster_pcm_lock_apply_gcs_transition(inv->tag, trans, cluster_node_id);
 
-		/* spec-2.37 D7: page_lsn is carried back in the ACK and applied by
-		 * the master-side ACK handler.  Do not advance the holder-local HTAB:
-		 * the master GrdEntry is the authoritative PI watermark owner. */
+		/* spec-2.41 D3: the dropping page's pd_block_scn is carried back in the
+		 * ACK (replacing the spec-2.37 page_lsn carrier) and applied to the
+		 * master's detector SCN watermark by the ACK handler.  Do not advance
+		 * the holder-local HTAB: the master GrdEntry is the authoritative owner. */
 	} else {
 		ack_status = 2; /* race: not resident */
 	}
@@ -3084,7 +3215,7 @@ send_ack:
 	ack.tag = inv->tag;
 	ack.sender_node = cluster_node_id;
 	ack.ack_status = ack_status;
-	GcsBlockInvalidateAckPayloadSetPageLsn(&ack, page_lsn);
+	GcsBlockInvalidateAckPayloadSetPageScn(&ack, page_scn); /* spec-2.41 D3 — SCN carrier @52 */
 	ack.checksum = gcs_block_compute_invalidate_ack_checksum(&ack);
 
 	(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK, inv->master_node, &ack,
@@ -3107,7 +3238,7 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 	uint64 current_req_id;
 	uint64 expected_epoch;
 	uint32 expected_bm;
-	XLogRecPtr ack_page_lsn = InvalidXLogRecPtr;
+	SCN ack_page_scn = InvalidScn; /* spec-2.41 D3 — ACK now carries pd_block_scn */
 	BufferTag ack_tag = { 0 };
 	bool valid = false;
 
@@ -3149,7 +3280,7 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 	}
 
 	if (ack->ack_status == 0) {
-		ack_page_lsn = GcsBlockInvalidateAckPayloadGetPageLsn(ack);
+		ack_page_scn = GcsBlockInvalidateAckPayloadGetPageScn(ack);
 		ack_tag = ack->tag;
 	}
 
@@ -3160,8 +3291,13 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 	LWLockRelease(&ClusterGcsBlock->invalidate_broadcast_lock.lock);
 
 	if (valid) {
-		if (!XLogRecPtrIsInvalid(ack_page_lsn)) {
-			cluster_pcm_lock_pi_watermark_advance(ack_tag, ack_page_lsn);
+		if (SCN_VALID(ack_page_scn)) {
+			/* spec-2.41 D3 — the invalidate-ACK now carries the dropping page's
+			 * pd_block_scn (@52, reinterpreted from the spec-2.37 page_lsn slot);
+			 * advance the detector's SCN watermark.  The redo-coverage LSN
+			 * watermark is NOT fed from the ACK: recovery rebuilds it from the
+			 * REDECLARE wire (§2.8.2; the F-ACK test at D9 proves this is safe). */
+			cluster_pcm_lock_pi_watermark_scn_advance(ack_tag, ack_page_scn);
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->pi_watermark_advance_count, 1);
 		}
 		ConditionVariableBroadcast(&ClusterGcsBlock->invalidate_broadcast_cv);
@@ -3194,7 +3330,7 @@ static const ClusterICMsgTypeInfo gcs_block_invalidate_ack_info = {
  *	master state rebuilds locally — D3 lazy rebuild), so skip master == self.
  */
 void
-cluster_gcs_block_send_redeclare(BufferTag tag, uint8 held_mode, XLogRecPtr page_lsn,
+cluster_gcs_block_send_redeclare(BufferTag tag, uint8 held_mode, XLogRecPtr page_lsn, SCN page_scn,
 								 uint64 cluster_epoch, int master_node)
 {
 	GcsBlockRedeclarePayload p;
@@ -3205,7 +3341,8 @@ cluster_gcs_block_send_redeclare(BufferTag tag, uint8 held_mode, XLogRecPtr page
 	memset(&p, 0, sizeof(p));
 	p.cluster_epoch = cluster_epoch;
 	p.tag = tag;
-	GcsBlockRedeclarePayloadSetPageLsn(&p, page_lsn);
+	GcsBlockRedeclarePayloadSetPageLsn(&p, page_lsn); /* redo-coverage required_lsn */
+	GcsBlockRedeclarePayloadSetPageScn(&p, page_scn); /* spec-2.41 D3 — detector SCN */
 	p.holder_node_id = cluster_node_id;
 	p.held_mode = held_mode;
 	p.checksum = gcs_block_compute_redeclare_checksum(&p);
@@ -3259,9 +3396,9 @@ cluster_gcs_handle_block_redeclare_envelope(const ClusterICEnvelope *env, const 
 		return;
 	}
 
-	if (cluster_gcs_block_master_rebuild_from_redeclare(p->tag, p->held_mode,
-														GcsBlockRedeclarePayloadGetPageLsn(p),
-														p->holder_node_id, p->cluster_epoch))
+	if (cluster_gcs_block_master_rebuild_from_redeclare(
+			p->tag, p->held_mode, GcsBlockRedeclarePayloadGetPageLsn(p),
+			GcsBlockRedeclarePayloadGetPageScn(p), p->holder_node_id, p->cluster_epoch))
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->recovery_block_state_rebuilt, 1);
 	else
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->recovery_ambiguous_owner_failclosed, 1);
@@ -3495,6 +3632,38 @@ uint64
 cluster_gcs_get_lost_write_avoid_count(void)
 {
 	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->lost_write_avoid_count) : 0;
+}
+
+/* PGRAC: spec-2.41 D7 — SCN detector + redo-coverage observability accessors. */
+uint64
+cluster_gcs_get_lost_write_invalidscn_failclosed_count(void)
+{
+	return ClusterGcsBlock
+			   ? pg_atomic_read_u64(&ClusterGcsBlock->lost_write_invalidscn_failclosed_count)
+			   : 0;
+}
+
+uint64
+cluster_gcs_get_lost_write_not_scn_tracked_skip_count(void)
+{
+	return ClusterGcsBlock
+			   ? pg_atomic_read_u64(&ClusterGcsBlock->lost_write_not_scn_tracked_skip_count)
+			   : 0;
+}
+
+uint64
+cluster_gcs_get_redo_coverage_required_lsn_zero_count(void)
+{
+	return ClusterGcsBlock
+			   ? pg_atomic_read_u64(&ClusterGcsBlock->redo_coverage_required_lsn_zero_count)
+			   : 0;
+}
+
+uint64
+cluster_gcs_get_redo_coverage_gate_block_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->redo_coverage_gate_block_count)
+						   : 0;
 }
 
 uint64

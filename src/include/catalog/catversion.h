@@ -654,7 +654,19 @@
  * cluster_ko_flush_probe (oid 8955), the mechanism driver for the real KO
  * fanout + apply-after-drop ACK + 53RAA fail-closed (t/297).  One pg_proc row
  * -> bump. */
-#define CATALOG_VERSION_NO 202606242
+/* spec-2.41 D8 (2026-06-25): SCN lost-write detector — single bump for the
+ * full mixed-version incompatibility set:
+ *   - GrdEntry sizeof 256 -> 264 (added pi_watermark_scn 8B; D2 §2.8 Option A);
+ *   - GcsBlockForwardPayload @49 reinterpreted page_lsn -> pi_watermark_scn (D1);
+ *   - GcsBlockInvalidateAckPayload @52 reinterpreted page_lsn -> page_scn (D3);
+ *   - GcsBlockRedeclarePayload adds page_scn@52 + redeclare checksum widened to
+ *     all-bytes-except-checksum (D3);
+ *   - xl_seq_rec WAL record adds SCN write_scn (sequence pd_block_scn redo; D4);
+ *   - pg_cluster_state dump gains 4 counters (gcs +2 / gcs_recovery +2; D7).
+ * No pg_proc / catalog row change, but the WAL + cross-node wire + shmem ABI
+ * are mutually incompatible across the bump, so a single catversion step gates
+ * mixed-version rolling (consistent with the existing epoch/version gates). */
+#define CATALOG_VERSION_NO 202606250
 
 /* spec-2.39 D10 (2026-05-21):  SI Broadcaster production activation —
  * DDL commit hook (AtEOXact_Inval + COMMIT PREPARED via cluster-aware
