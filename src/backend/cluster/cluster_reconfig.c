@@ -63,19 +63,20 @@
 #include "utils/timestamp.h"
 #include "utils/wait_event.h" /* WAIT_EVENT_CLUSTER_BGPROC_LMON_RECONFIG_TICK (D9) */
 
-#include "cluster/cluster_conf.h"		 /* cluster_conf_lookup_node */
-#include "cluster/cluster_cssd.h"		 /* cluster_cssd_get_peer_state, get_dead_generation */
-#include "cluster/cluster_elog.h"		 /* cluster_node_id */
-#include "cluster/cluster_epoch.h"		 /* advance + observe + set_changed_at_lsn */
-#include "cluster/cluster_gcs_block.h"	 /* spec-2.34 D4 — eager epoch wake hook */
-#include "cluster/cluster_sinval.h"		 /* spec-2.39 D14 — RESET-all reconfig hook */
-#include "cluster/cluster_tt_status.h"	 /* spec-3.1 D7 — TT status overlay flush hook */
-#include "cluster/cluster_guc.h"		 /* cluster_enabled */
-#include "cluster/cluster_inject.h"		 /* CLUSTER_INJECTION_POINT */
-#include "cluster/cluster_write_fence.h" /* spec-4.12 D4 — durable fence marker submit */
-#include "cluster/cluster_qvotec.h"		 /* cluster_qvotec_in_quorum */
-#include "cluster/cluster_shmem.h"		 /* cluster_shmem_register_region */
-#include "cluster/cluster_signal.h"		 /* cluster_reconfig_start_pending */
+#include "cluster/cluster_conf.h"		   /* cluster_conf_lookup_node */
+#include "cluster/cluster_cssd.h"		   /* cluster_cssd_get_peer_state, get_dead_generation */
+#include "cluster/cluster_elog.h"		   /* cluster_node_id */
+#include "cluster/cluster_epoch.h"		   /* advance + observe + set_changed_at_lsn */
+#include "cluster/cluster_gcs_block.h"	   /* spec-2.34 D4 — eager epoch wake hook */
+#include "cluster/cluster_sinval.h"		   /* spec-2.39 D14 — RESET-all reconfig hook */
+#include "cluster/cluster_tt_status.h"	   /* spec-3.1 D7 — TT status overlay flush hook */
+#include "cluster/cluster_guc.h"		   /* cluster_enabled */
+#include "cluster/cluster_inject.h"		   /* CLUSTER_INJECTION_POINT */
+#include "cluster/cluster_write_fence.h"   /* spec-4.12 D4 — durable fence marker submit */
+#include "cluster/cluster_qvotec.h"		   /* cluster_qvotec_in_quorum */
+#include "cluster/cluster_shmem.h"		   /* cluster_shmem_register_region */
+#include "cluster/cluster_signal.h"		   /* cluster_reconfig_start_pending */
+#include "cluster/cluster_touched_peers.h" /* spec-5.14 D4 — touched ∩ dead dispatch */
 
 
 /*
@@ -95,6 +96,10 @@
 StaticAssertDecl(sizeof(ReconfigEvent) <= 96, "ReconfigEvent must fit within 96 bytes");
 StaticAssertDecl(sizeof(ReconfigEvent) >= 64,
 				 "ReconfigEvent must be at least 64 bytes (defensive — fields enumerated)");
+
+/* spec-5.14 D6 — the per-kind counter array must cover every touch class. */
+StaticAssertDecl(CLUSTER_RECONFIG_TOUCH_KIND_COUNT == CLUSTER_TOUCH_KIND_COUNT,
+				 "reconfig touched-kind counter array must match ClusterTouchKind count");
 
 
 /*
@@ -132,6 +137,12 @@ cluster_reconfig_shmem_init(void)
 		pg_atomic_init_u64(&ReconfigShmem->apply_counter, 0);
 		pg_atomic_init_u64(&ReconfigShmem->dedup_skip_counter, 0);
 		pg_atomic_init_u64(&ReconfigShmem->procsig_broadcast_count, 0);
+		/* spec-5.14 D6 — touched_peers observability counters. */
+		pg_atomic_init_u64(&ReconfigShmem->touched_abort_count, 0);
+		pg_atomic_init_u64(&ReconfigShmem->touched_stamp_count, 0);
+		for (int k = 0; k < CLUSTER_RECONFIG_TOUCH_KIND_COUNT; k++)
+			pg_atomic_init_u64(&ReconfigShmem->touched_stamp_by_kind[k], 0);
+		pg_atomic_init_u64(&ReconfigShmem->clean_leave_rejected_count, 0);
 		/* last_applied left zeroed by memset — event_id=0 =
 		 * CLUSTER_RECONFIG_OBSERVER_NONE = never-applied sentinel. */
 	}
@@ -249,6 +260,74 @@ cluster_reconfig_get_procsig_broadcast_count(void)
 	if (ReconfigShmem == NULL)
 		return 0;
 	return pg_atomic_read_u64(&ReconfigShmem->procsig_broadcast_count);
+}
+
+
+/* ============================================================
+ * spec-5.14 D6 — touched_peers observability counter mutators + getters.
+ *
+ *	  Called from the hot cross-node ingress path (note_touched_stamp,
+ *	  via cluster_touched_peers_stamp) and the D4 dispatch
+ *	  (note_touched_abort / note_clean_leave_rejected).  All atomic, no
+ *	  lock, never ereport (L213).
+ * ============================================================
+ */
+void
+cluster_reconfig_note_touched_stamp(int kind)
+{
+	if (ReconfigShmem == NULL)
+		return;
+	pg_atomic_fetch_add_u64(&ReconfigShmem->touched_stamp_count, 1);
+	if (kind >= 0 && kind < CLUSTER_RECONFIG_TOUCH_KIND_COUNT)
+		pg_atomic_fetch_add_u64(&ReconfigShmem->touched_stamp_by_kind[kind], 1);
+}
+
+uint64
+cluster_reconfig_note_touched_abort(void)
+{
+	if (ReconfigShmem == NULL)
+		return 1; /* pretend non-zero so caller skips the LOG-once */
+	return pg_atomic_fetch_add_u64(&ReconfigShmem->touched_abort_count, 1);
+}
+
+void
+cluster_reconfig_note_clean_leave_rejected(void)
+{
+	if (ReconfigShmem == NULL)
+		return;
+	pg_atomic_fetch_add_u64(&ReconfigShmem->clean_leave_rejected_count, 1);
+}
+
+uint64
+cluster_reconfig_get_touched_abort_count(void)
+{
+	if (ReconfigShmem == NULL)
+		return 0;
+	return pg_atomic_read_u64(&ReconfigShmem->touched_abort_count);
+}
+
+uint64
+cluster_reconfig_get_touched_stamp_count(void)
+{
+	if (ReconfigShmem == NULL)
+		return 0;
+	return pg_atomic_read_u64(&ReconfigShmem->touched_stamp_count);
+}
+
+uint64
+cluster_reconfig_get_touched_stamp_by_kind(int kind)
+{
+	if (ReconfigShmem == NULL || kind < 0 || kind >= CLUSTER_RECONFIG_TOUCH_KIND_COUNT)
+		return 0;
+	return pg_atomic_read_u64(&ReconfigShmem->touched_stamp_by_kind[kind]);
+}
+
+uint64
+cluster_reconfig_get_clean_leave_rejected_count(void)
+{
+	if (ReconfigShmem == NULL)
+		return 0;
+	return pg_atomic_read_u64(&ReconfigShmem->clean_leave_rejected_count);
 }
 
 
@@ -432,13 +511,19 @@ cluster_reconfig_lmon_tick(void)
 		return;
 	}
 
-	/* P1.3 (a) + I7:  EVERY in_quorum survivor (NOT just coordinator)
-	 * broadcasts PROCSIG_CLUSTER_RECONFIG_START to its local backends. */
-	cluster_reconfig_broadcast_local_procsig();
-
 	/* P1.3 (b) + I7:  ONLY the deterministic coordinator advances epoch
 	 * and publishes coordinator-role event.  Non-coordinator survivors
-	 * publish observer-role event for local observability. */
+	 * publish observer-role event for local observability.
+	 *
+	 * spec-5.14 (ordering fix):  publish last_applied BEFORE broadcasting the
+	 * PROCSIG below.  The spec-2.29 writable abort path (53R60) never reads
+	 * last_applied, but the spec-5.14 read-side touched abort does (it needs
+	 * reconfig_kind + dead_bitmap).  If a survivor's idle backend processed the
+	 * PROCSIG before the event was published, it would read a stale
+	 * (reconfig_kind=NONE) last_applied, see touched=false, absorb, and clear
+	 * its pending flag — missing the touched abort.  Publishing first closes
+	 * that race; the broadcast only signals local backends (no cross-node
+	 * protocol change). */
 	if (self_id == coordinator) {
 		cluster_reconfig_apply_epoch_bump_as_coordinator(dead_bitmap, coordinator,
 														 cssd_dead_generation);
@@ -454,8 +539,28 @@ cluster_reconfig_lmon_tick(void)
 		evt.applied_at = GetCurrentTimestamp();
 		evt.observer_role = CLUSTER_RECONFIG_OBSERVER_SURVIVOR;
 		evt.cssd_dead_generation = cssd_dead_generation;
+		/* spec-5.14 D3: the only membership-change trigger today is a CSSD
+		 * DEAD edge (dead_bitmap non-empty) → fail-stop.  CLEAN_LEAVE has no
+		 * producer until spec-5.13. */
+		evt.reconfig_kind = RECONFIG_KIND_FAIL_STOP;
 		cluster_reconfig_publish_event(&evt);
 	}
+
+	/* P1.3 (a) + I7:  EVERY in_quorum survivor (NOT just coordinator)
+	 * broadcasts PROCSIG_CLUSTER_RECONFIG_START to its local backends — AFTER
+	 * the event is published above so the touched check reads a consistent
+	 * last_applied (spec-5.14 ordering fix).
+	 *
+	 * review P1-A: broadcast ONLY if the event was actually published.  The
+	 * coordinator's apply_epoch_bump can fail-close (fence marker did not reach
+	 * a voting-disk majority) and return WITHOUT publishing — last_applied then
+	 * still carries the prior event_id.  Broadcasting in that case would make
+	 * survivors process the PROCSIG against a stale (reconfig_kind=NONE)
+	 * last_applied, absorb the touched abort, and clear their pending flag
+	 * (INV-TP2 miss).  The survivor path above always publishes, so this gate
+	 * lets it through; the next LMON tick re-fires the failed coordinator. */
+	if (cluster_reconfig_get_last_event_id() == event_id)
+		cluster_reconfig_broadcast_local_procsig();
 }
 
 
@@ -580,6 +685,8 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 	evt.applied_at = GetCurrentTimestamp();
 	evt.observer_role = CLUSTER_RECONFIG_OBSERVER_COORDINATOR;
 	evt.cssd_dead_generation = cssd_dead_generation;
+	/* spec-5.14 D3: CSSD DEAD edge → fail-stop (see survivor path note). */
+	evt.reconfig_kind = RECONFIG_KIND_FAIL_STOP;
 
 	/*
 	 * spec-4.12 D4 (core 8.A order):  when the write fence is enforced, the durable
@@ -643,9 +750,30 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
  *	    - 53R50 ERRCODE_CLUSTER_QUORUM_LOST_BACKEND  — not in_quorum
  *	    - 53R60 ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS — in_quorum + epoch changed
  */
+ClusterReconfigVerdict
+cluster_reconfig_classify_verdict(bool touched, bool has_top_xid, bool in_quorum)
+{
+	/* touched (read OR write): abort; lost quorum escalates to terminal. */
+	if (touched)
+		return in_quorum ? RECONFIG_VERDICT_ABORT_TOUCHED : RECONFIG_VERDICT_ABORT_QUORUM;
+
+	/* non-touched read-only: absorb (INV-TP5).  Even on lost quorum a
+	 * read-only tx is not aborted here — the spec-2.28 fence path owns that. */
+	if (!has_top_xid)
+		return RECONFIG_VERDICT_ABSORB;
+
+	/* non-touched writable: 53R60 normally, 53R50 if quorum was lost. */
+	return in_quorum ? RECONFIG_VERDICT_ABORT_RECONFIG : RECONFIG_VERDICT_ABORT_QUORUM;
+}
+
+
 void
 cluster_reconfig_check_pending_in_proc_interrupts(void)
 {
+	ReconfigEvent ev;
+	bool touched;
+	ClusterReconfigVerdict verdict;
+
 	if (!cluster_enabled)
 		return;
 
@@ -660,23 +788,73 @@ cluster_reconfig_check_pending_in_proc_interrupts(void)
 	if (!IsTransactionState())
 		return;
 
-	/* Q5 A': reconfig abort is write-path only.  Match the spec-2.6
-	 * CommitTransaction guard: a transaction with no top-level xid has
-	 * not performed durable writes yet, so read-only work absorbs the
-	 * signal instead of surfacing 53R60. */
-	if (!TransactionIdIsValid(GetTopTransactionIdIfAny()))
+	cluster_reconfig_get_last_event(&ev); /* shared-lock copy */
+
+	/*
+	 * spec-5.14 D4 — fold any exited parallel workers' touches into this
+	 * leader's bitmap (Q7) before deciding, then test touched ∩ dead.  A
+	 * touched transaction (read OR write) aborts, breaking the no-top-xid
+	 * read-only absorb below and closing the read-side 8.A hole (INV-TP2);
+	 * a non-touched transaction keeps the unchanged spec-2.29 behaviour so an
+	 * innocent local-only read-only transaction is never killed (INV-TP5).
+	 */
+	cluster_touched_peers_merge_active_parallel_workers();
+	touched = (ev.reconfig_kind != RECONFIG_KIND_NONE)
+			  && cluster_touched_peers_intersects(ev.dead_bitmap);
+
+	/*
+	 * Defensive: CLEAN_LEAVE has no producer until spec-5.13.  A touched
+	 * CLEAN_LEAVE here is unexpected — tally + WARN, then handle it
+	 * conservatively as a fail-stop (rule 8: explicit, not silent).
+	 */
+	if (touched && ev.reconfig_kind == RECONFIG_KIND_CLEAN_LEAVE) {
+		cluster_reconfig_note_clean_leave_rejected();
+		ereport(WARNING, (errmsg("cluster reconfig: unexpected CLEAN_LEAVE kind during transition; "
+								 "handling conservatively as fail-stop")));
+	}
+
+	/* diag (default off): dump this tx's touched-set hex on any touched abort. */
+	if (touched && cluster_touched_peers_trace) {
+		char hexbuf[24];
+
+		cluster_touched_peers_self_hex(hexbuf, sizeof(hexbuf));
+		ereport(LOG, (errmsg("cluster fail-stop touched-set (low 64 nodes): %s", hexbuf)));
+	}
+
+	verdict = cluster_reconfig_classify_verdict(
+		touched, TransactionIdIsValid(GetTopTransactionIdIfAny()), cluster_qvotec_in_quorum());
+
+	switch (verdict) {
+	case RECONFIG_VERDICT_ABSORB:
 		return;
 
-	if (!cluster_qvotec_in_quorum())
+	case RECONFIG_VERDICT_ABORT_TOUCHED:
+		/* L213: LOG once per cold start, not per aborted backend. */
+		if (cluster_reconfig_note_touched_abort() == 0)
+			ereport(LOG, (errmsg("cluster fail-stop: aborting in-flight transactions that "
+								 "consumed volatile state from a failed cluster member")));
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_RECONFIG_ABORT), /* 40R01, Class 40 retry-safe */
+						errmsg("transaction aborted: cluster member fail-stop during "
+							   "reconfiguration"),
+						errdetail("this transaction read or held volatile state from a node that "
+								  "fail-stopped"),
+						errhint("retry the transaction;affected resources will be remastered")));
+		break;
+
+	case RECONFIG_VERDICT_ABORT_QUORUM:
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_QUORUM_LOST_BACKEND),
 						errmsg("transaction aborted: cluster quorum lost during reconfig"),
 						errhint("the cluster lost majority quorum;all uncommitted writes "
 								"have been rolled back;retry after quorum recovery")));
+		break;
 
-	ereport(ERROR, (errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
-					errmsg("transaction aborted: cluster reconfiguration in progress"),
-					errhint("cluster membership changed during your transaction;"
-							" the transaction was aborted before commit;retry is safe")));
+	case RECONFIG_VERDICT_ABORT_RECONFIG:
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+						errmsg("transaction aborted: cluster reconfiguration in progress"),
+						errhint("cluster membership changed during your transaction;"
+								" the transaction was aborted before commit;retry is safe")));
+		break;
+	}
 }
 
 
@@ -711,6 +889,22 @@ reconfig_observer_role_to_string(int32 role)
 }
 
 
+/* spec-5.14 D6 — render ReconfigEvent.reconfig_kind for the SRF view. */
+static const char *
+reconfig_kind_to_string(uint8 kind)
+{
+	switch (kind) {
+	case RECONFIG_KIND_FAIL_STOP:
+		return "fail_stop";
+	case RECONFIG_KIND_CLEAN_LEAVE:
+		return "clean_leave";
+	case RECONFIG_KIND_NONE:
+	default:
+		return "none";
+	}
+}
+
+
 static text *
 reconfig_dead_bitmap_to_hex_text(const uint8 *bmp)
 {
@@ -732,8 +926,8 @@ cluster_get_reconfig_state(PG_FUNCTION_ARGS)
 {
 	ReturnSetInfo *rsinfo;
 	ReconfigEvent evt;
-	Datum values[9];
-	bool nulls[9];
+	Datum values[10];
+	bool nulls[10];
 
 	InitMaterializedSRF(fcinfo, 0);
 	rsinfo = (ReturnSetInfo *)fcinfo->resultinfo;
@@ -760,6 +954,8 @@ cluster_get_reconfig_state(PG_FUNCTION_ARGS)
 		= PointerGetDatum(cstring_to_text(reconfig_observer_role_to_string(evt.observer_role)));
 	values[7] = Int64GetDatum((int64)evt.event_seq);
 	values[8] = Int64GetDatum((int64)evt.cssd_dead_generation);
+	/* spec-5.14 D6 — fail-stop vs clean-leave membership-event kind. */
+	values[9] = PointerGetDatum(cstring_to_text(reconfig_kind_to_string(evt.reconfig_kind)));
 
 	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	return (Datum)0;

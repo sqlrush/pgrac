@@ -53,6 +53,7 @@
 
 #include "access/transam.h" /* spec-5.8 D1c — InvalidTransactionId for the GetTopTransactionIdIfAny stub */
 #include "cluster/cluster_ges.h"
+#include "cluster/cluster_touched_peers.h" /* spec-5.14 D2 stamp stub */
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_grd_work_queue.h"
@@ -1037,6 +1038,15 @@ UT_TEST(test_ges_lmon_drain_work_queue_symbol_linkable)
 
 
 UT_DEFINE_GLOBALS();
+
+/* spec-5.14 D2: link-only stub.  This test exercises the GES enqueue logic,
+ * not the touched_peers bitmap (covered by test_cluster_touched_peers + TAP). */
+bool
+cluster_touched_peers_stamp(int32 node_id pg_attribute_unused(),
+							ClusterTouchKind kind pg_attribute_unused())
+{
+	return false;
+}
 
 
 /* spec-2.17 Step 2 — NEW T-ges-3 opcode + payload size invariant. */

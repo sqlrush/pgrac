@@ -48,7 +48,8 @@
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_native_lock_probe.h" /* spec-2.25 D5 — probe protocol handlers */
 #include "cluster/cluster_grd_work_queue.h"
-#include "cluster/cluster_guc.h" /* cluster_node_id + cluster_ges_request_timeout_ms */
+#include "cluster/cluster_guc.h"		   /* cluster_node_id + cluster_ges_request_timeout_ms */
+#include "cluster/cluster_touched_peers.h" /* spec-5.14 D2 class 1 */
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h" /* spec-5.8 D8 — cluster_ic_send_envelope (REPORT send-back) */
 #include "cluster/cluster_qvotec.h" /* cluster_qvotec_in_quorum */
@@ -1452,6 +1453,16 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 		return GES_REJECT_REASON_TIMEOUT;
 
 	master = cluster_grd_lookup_master(resid);
+
+	/*
+	 * spec-5.14 D2 class 1: when a remote node masters this resource, this
+	 * request depends on that master's GES coordination — stamp it
+	 * (conservative belt, INV-TP1).  "No master yet" (-1) and a local/self
+	 * master are not stamped (the stamp self-guards on self; the >= 0 guard
+	 * avoids poisoning on the -1 sentinel).
+	 */
+	if (master >= 0 && master != cluster_node_id)
+		cluster_touched_peers_stamp(master, CLUSTER_TOUCH_GES_LOCK);
 
 	/*
 	 * spec-5.3 (L11) — local-master REQUEST cluster-holder gate + 完成等待.

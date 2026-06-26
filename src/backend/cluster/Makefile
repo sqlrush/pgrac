@@ -103,6 +103,7 @@ OBJS = \
 	cluster_hang_policy.o \
 	cluster_hang_resolve.o \
 	cluster_hang_resolve_policy.o \
+	cluster_touched_peers.o \
 	cluster_hw.o \
 	cluster_hw_shmem.o \
 	cluster_hw_ic.o \

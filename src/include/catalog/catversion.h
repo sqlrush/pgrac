@@ -695,7 +695,11 @@
  * (which landed at 202606270); bump to 202606280 for the combined wire ABI. */
 /* spec-5.12 (2026-06-27): Hang Manager disposition adds two pg_proc entries
  * (pg_cluster_hang_victims SRF + pg_cluster_hang_resolve); bump to 202606290. */
-#define CATALOG_VERSION_NO 202606290
+/* spec-5.14 (2026-06-27): pg_cluster_reconfig_state SRF gains a 10th column
+ * reconfig_kind (text); cluster_get_reconfig_state pg_proc row (oid 8920) +
+ * the system_views.sql view updated.  Rebased on top of 5.12 (202606290);
+ * bump to 202606300. */
+#define CATALOG_VERSION_NO 202606300
 
 /* spec-2.39 D10 (2026-05-21):  SI Broadcaster production activation —
  * DDL commit hook (AtEOXact_Inval + COMMIT PREPARED via cluster-aware

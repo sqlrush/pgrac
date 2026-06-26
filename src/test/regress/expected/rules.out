@@ -1413,8 +1413,9 @@ pg_cluster_reconfig_state| SELECT event_id,
     applied_at,
     observer_role,
     event_seq,
-    cssd_dead_generation
-   FROM cluster_get_reconfig_state() cluster_get_reconfig_state(event_id, coordinator_node_id, old_epoch, new_epoch, dead_bitmap, applied_at, observer_role, event_seq, cssd_dead_generation);
+    cssd_dead_generation,
+    reconfig_kind
+   FROM cluster_get_reconfig_state() cluster_get_reconfig_state(event_id, coordinator_node_id, old_epoch, new_epoch, dead_bitmap, applied_at, observer_role, event_seq, cssd_dead_generation, reconfig_kind);
 pg_cluster_shmem| SELECT name,
     size_bytes,
     lwlock_count,

@@ -56,6 +56,7 @@
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_touched_peers.h" /* spec-5.14 D2 class 2 */
 #include "common/hashfn.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
@@ -560,6 +561,22 @@ gcs_block_install_block(BufferDesc *buf, const char *block_data, XLogRecPtr page
 }
 
 
+/*
+ * spec-5.14 D2 (class 2) — this backend just installed a Cache Fusion / GCS
+ * block image shipped by one or two remote peers (the direct sender, and a
+ * forwarding holder when the master forwarded a holder's image).  Record the
+ * dependency so a fail-stop of any of them aborts this transaction (INV-TP2).
+ * Read-only; never changes the block protocol.
+ */
+static inline void
+gcs_block_stamp_touched(int32 sender_node, int32 forwarding_master)
+{
+	cluster_touched_peers_stamp(sender_node, CLUSTER_TOUCH_GCS_BLOCK);
+	if (forwarding_master != GCS_BLOCK_REPLY_NO_FORWARDING_MASTER)
+		cluster_touched_peers_stamp(forwarding_master, CLUSTER_TOUCH_GCS_BLOCK);
+}
+
+
 /* ============================================================
  * Sender API (D3).
  * ============================================================ */
@@ -966,6 +983,9 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 					break;
 				}
 				gcs_block_install_block(buf, slot->reply_block_data, final_page_lsn);
+				/* spec-5.14 D2 class 2: depend on the sender (+ forwarding holder). */
+				gcs_block_stamp_touched((int32)slot->reply_header.sender_node,
+										final_forwarding_master);
 				if (final_status == GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER
 					|| final_status == GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER) {
 					/*
@@ -1032,6 +1052,9 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 					break;
 				}
 				gcs_block_install_block(buf, slot->reply_block_data, final_page_lsn);
+				/* spec-5.14 D2 class 2: depend on the X holder that shipped this image. */
+				gcs_block_stamp_touched((int32)slot->reply_header.sender_node,
+										final_forwarding_master);
 				/* spec-5.2 §3.5 D11: a read-image returned for a WRITE request
 				 * (N->X / S->X) means the master/holder deferred the
 				 * writer-transfer because it still holds an uncommitted ITL
@@ -1339,6 +1362,9 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, int32 holder_node)
 			if (expected == got) {
 				gcs_block_install_block(buf, slot->reply_block_data,
 										(XLogRecPtr)slot->reply_header.page_lsn);
+				/* spec-5.14 D2 class 2: this node (local master) consumed the
+				 * remote holder's volatile image. */
+				gcs_block_stamp_touched(holder_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
 				installed = true;
 			} else {
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_checksum_fail_count, 1);
@@ -1511,6 +1537,8 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, int32 holder_node,
 			} else if (expected == got) {
 				installed_page_lsn = (XLogRecPtr)slot->reply_header.page_lsn;
 				gcs_block_install_block(buf, slot->reply_block_data, installed_page_lsn);
+				/* spec-5.14 D2 class 2: consumed the remote holder's X image. */
+				gcs_block_stamp_touched(holder_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
 				installed = true;
 			} else {
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_checksum_fail_count, 1);
@@ -1544,6 +1572,8 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, int32 holder_node,
 			if (expected == got) {
 				gcs_block_install_block(buf, slot->reply_block_data,
 										(XLogRecPtr)slot->reply_header.page_lsn);
+				/* spec-5.14 D2 class 2: consumed the remote holder's deferred-writer image. */
+				gcs_block_stamp_touched(holder_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
 				/* spec-5.2 §3.5 D11: mark this buffer a deferred-writer
 				 * read-image so a write that does NOT first re-acquire X (the
 				 * non-contended-row case) fails closed in cluster_itl rather

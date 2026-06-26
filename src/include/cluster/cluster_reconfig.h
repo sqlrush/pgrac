@@ -68,6 +68,14 @@
  */
 #define CLUSTER_RECONFIG_DEAD_BITMAP_BYTES 16
 
+/*
+ * spec-5.14 D6 — number of touched_peers ingress classes (mirrors
+ * CLUSTER_TOUCH_KIND_COUNT in cluster_touched_peers.h; kept as a plain
+ * macro here to avoid a header dependency, with a StaticAssert in
+ * cluster_reconfig.c enforcing the two stay equal).
+ */
+#define CLUSTER_RECONFIG_TOUCH_KIND_COUNT 5
+
 
 /*
  * Observer role recorded in ReconfigEvent.observer_role:
@@ -78,6 +86,46 @@
 #define CLUSTER_RECONFIG_OBSERVER_NONE 0
 #define CLUSTER_RECONFIG_OBSERVER_COORDINATOR 1
 #define CLUSTER_RECONFIG_OBSERVER_SURVIVOR 2
+
+
+/*
+ * spec-5.14 D3 — reconfig kind: fail-stop (a member crashed / partitioned,
+ * its volatile state may be lost / torn) vs clean leave (a member is leaving
+ * gracefully after flushing).  These have different safety rules; this spec
+ * implements only the fail-stop branch.  CLEAN_LEAVE is reserved for
+ * spec-5.13 — it currently has no producer and the D4 dispatch treats it
+ * defensively (conservative fail-stop handling + a LOG WARNING).
+ */
+typedef enum ClusterReconfigKind {
+	RECONFIG_KIND_NONE = 0,		  /* never-applied / initial */
+	RECONFIG_KIND_FAIL_STOP = 1,  /* CSSD DEAD edge — this spec, live */
+	RECONFIG_KIND_CLEAN_LEAVE = 2 /* reserved (spec-5.13); no producer yet */
+} ClusterReconfigKind;
+
+
+/*
+ * spec-5.14 D4 — the four possible outcomes of the ProcessInterrupts reconfig
+ * dispatch, factored out of the ereport mechanism so the decision matrix
+ * (§3.2) is a pure, unit-testable function (U8).
+ */
+typedef enum ClusterReconfigVerdict {
+	RECONFIG_VERDICT_ABSORB = 0,	 /* no abort (idle / non-touched read-only) */
+	RECONFIG_VERDICT_ABORT_TOUCHED,	 /* touched ∩ dead, in quorum → 40R01 */
+	RECONFIG_VERDICT_ABORT_RECONFIG, /* non-touched writable, in quorum → 53R60 */
+	RECONFIG_VERDICT_ABORT_QUORUM	 /* lost quorum (touched or writable) → 53R50 */
+} ClusterReconfigVerdict;
+
+/*
+ * Pure decision matrix (no side effects).  touched = the tx consumed volatile
+ * state from a fail-stopped member; has_top_xid = a durable write xid is
+ * assigned; in_quorum = this node still holds quorum.
+ *   - touched (read OR write)        → ABORT_TOUCHED (or ABORT_QUORUM if lost)
+ *   - non-touched read-only          → ABSORB (INV-TP5; even if quorum lost,
+ *                                       handled by the spec-2.28 fence path)
+ *   - non-touched writable           → ABORT_RECONFIG (or ABORT_QUORUM if lost)
+ */
+extern ClusterReconfigVerdict cluster_reconfig_classify_verdict(bool touched, bool has_top_xid,
+																bool in_quorum);
 
 
 /*
@@ -126,6 +174,10 @@ typedef struct ReconfigEvent {
 
 	uint64 event_seq;			 /* per-process monotonic apply counter */
 	uint64 cssd_dead_generation; /* P1.2 — snapshot at apply time */
+
+	uint8 reconfig_kind; /* spec-5.14 D3: ClusterReconfigKind (shmem-only,
+								  * never on the wire; CLEAN_LEAVE reserved) */
+	uint8 _pad2[7];
 } ReconfigEvent;
 
 
@@ -142,6 +194,13 @@ typedef struct ClusterReconfigState {
 	pg_atomic_uint64 apply_counter;			  /* total events observed */
 	pg_atomic_uint64 dedup_skip_counter;	  /* duplicate event_id skipped */
 	pg_atomic_uint64 procsig_broadcast_count; /* PROCSIG broadcast tally */
+
+	/* spec-5.14 D6 — touched_peers fail-stop observability (Q8 A': these
+	 * live in this existing region; the region count is unchanged). */
+	pg_atomic_uint64 touched_abort_count; /* tx aborted 40R01 (touched ∩ dead) */
+	pg_atomic_uint64 touched_stamp_count; /* total cross-node ingress stamps */
+	pg_atomic_uint64 touched_stamp_by_kind[CLUSTER_RECONFIG_TOUCH_KIND_COUNT];
+	pg_atomic_uint64 clean_leave_rejected_count; /* defensive CLEAN_LEAVE hits */
 } ClusterReconfigState;
 
 
@@ -254,6 +313,28 @@ cluster_reconfig_compute_event_id(const uint8 dead_bitmap[CLUSTER_RECONFIG_DEAD_
 extern uint64 cluster_reconfig_get_apply_counter(void);
 extern uint64 cluster_reconfig_get_dedup_skip_counter(void);
 extern uint64 cluster_reconfig_get_procsig_broadcast_count(void);
+
+
+/* ============================================================
+ * spec-5.14 D6 — touched_peers fail-stop observability counters.
+ *
+ *	  These live in the existing ClusterReconfigState region (Q8 A':
+ *	  region count unchanged).  The note_* mutators are called from the
+ *	  hot cross-node ingress path (stamp) and the D4 dispatch (abort /
+ *	  clean-leave reject); they are atomic and never ereport (L213).
+ *	  The `kind` argument of note_touched_stamp is a ClusterTouchKind
+ *	  (passed as int to avoid a header dependency on
+ *	  cluster_touched_peers.h).
+ * ============================================================
+ */
+extern void cluster_reconfig_note_touched_stamp(int kind);
+extern uint64 cluster_reconfig_note_touched_abort(void); /* returns prior count (LOG-once gate) */
+extern void cluster_reconfig_note_clean_leave_rejected(void);
+
+extern uint64 cluster_reconfig_get_touched_abort_count(void);
+extern uint64 cluster_reconfig_get_touched_stamp_count(void);
+extern uint64 cluster_reconfig_get_touched_stamp_by_kind(int kind);
+extern uint64 cluster_reconfig_get_clean_leave_rejected_count(void);
 
 
 #endif /* CLUSTER_RECONFIG_H */

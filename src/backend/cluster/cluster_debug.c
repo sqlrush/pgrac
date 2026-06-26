@@ -113,6 +113,8 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_recovery_worker.h"
 #include "cluster/cluster_recovery_merge.h"	 /* is_materialized (spec-4.5a D11) */
+#include "cluster/cluster_reconfig.h"		 /* spec-5.14 D6 touched counters */
+#include "cluster/cluster_touched_peers.h"	 /* spec-5.14 D6 self_touched_hex */
 #include "cluster/cluster_block_recovery.h"	 /* block-recovery counters (spec-4.10 D6) */
 #include "cluster/cluster_thread_recovery.h" /* online thread-recovery counters (spec-4.11 D5) */
 #include "cluster/cluster_write_fence.h"	 /* write-fence counters (spec-4.12 D7) */
@@ -1311,6 +1313,40 @@ dump_advisory(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_advisory_counter_read(CLUSTER_ADVISORY_TRY_NOTAVAIL)));
 	emit_row(rsinfo, "advisory", "advisory_failclosed_count",
 			 fmt_int64((int64)cluster_advisory_counter_read(CLUSTER_ADVISORY_FAILCLOSED)));
+}
+
+/*
+ * dump_reconfig_touched -- spec-5.14 D6 touched_peers fail-stop observability.
+ *
+ *	Emits the touched_peers counters (in the existing ClusterReconfigState
+ *	region) + this backend's own touched bitmap (low 64 nodes) under
+ *	category='reconfig_touched'.
+ */
+static void
+dump_reconfig_touched(ReturnSetInfo *rsinfo)
+{
+	char hexbuf[24];
+
+	emit_row(rsinfo, "reconfig_touched", "abort_count",
+			 fmt_int64((int64)cluster_reconfig_get_touched_abort_count()));
+	emit_row(rsinfo, "reconfig_touched", "stamp_count",
+			 fmt_int64((int64)cluster_reconfig_get_touched_stamp_count()));
+	emit_row(rsinfo, "reconfig_touched", "stamp_ges",
+			 fmt_int64((int64)cluster_reconfig_get_touched_stamp_by_kind(CLUSTER_TOUCH_GES_LOCK)));
+	emit_row(rsinfo, "reconfig_touched", "stamp_gcs_block",
+			 fmt_int64((int64)cluster_reconfig_get_touched_stamp_by_kind(CLUSTER_TOUCH_GCS_BLOCK)));
+	emit_row(rsinfo, "reconfig_touched", "stamp_scn",
+			 fmt_int64((int64)cluster_reconfig_get_touched_stamp_by_kind(CLUSTER_TOUCH_SCN)));
+	emit_row(
+		rsinfo, "reconfig_touched", "stamp_vis",
+		fmt_int64((int64)cluster_reconfig_get_touched_stamp_by_kind(CLUSTER_TOUCH_VISIBILITY)));
+	emit_row(rsinfo, "reconfig_touched", "stamp_sinval",
+			 fmt_int64((int64)cluster_reconfig_get_touched_stamp_by_kind(CLUSTER_TOUCH_SINVAL)));
+	emit_row(rsinfo, "reconfig_touched", "clean_leave_rejected",
+			 fmt_int64((int64)cluster_reconfig_get_clean_leave_rejected_count()));
+
+	cluster_touched_peers_self_hex(hexbuf, sizeof(hexbuf));
+	emit_row(rsinfo, "reconfig_touched", "self_touched_hex", hexbuf);
 }
 
 /*
@@ -2551,6 +2587,7 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		dump_visibility(rsinfo);
 		dump_tt_2pc(rsinfo);
 		dump_recovery(rsinfo);
+		dump_reconfig_touched(rsinfo); /* spec-5.14 D6 */
 		dump_scn(rsinfo);
 		dump_ges(rsinfo);
 		dump_advisory(rsinfo);

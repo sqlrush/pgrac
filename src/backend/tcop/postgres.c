@@ -3076,6 +3076,11 @@ ProcessInterrupts(void)
 	 *	fence takes priority because freeze is the explicit quorum-loss
 	 *	gate;reconfig comes second to catch the membership-change abort
 	 *	case where epoch advanced but quorum did not collapse.
+	 *
+	 *	spec-5.14 (D4):  this same hook now also aborts a touched READ-ONLY
+	 *	transaction (one that consumed volatile state from a fail-stopped
+	 *	member) with 40R01, breaking the no-top-xid read-only absorb above.
+	 *	The decision logic lives entirely in the cluster module.
 	 */
 	cluster_reconfig_check_pending_in_proc_interrupts();
 

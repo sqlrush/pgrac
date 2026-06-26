@@ -18,7 +18,8 @@
 -- is TAP-tested in t/099_reconfig_actor.pl (Step 5 D13).
 --
 -- ----------
--- Block 1: pg_cluster_reconfig_state view exists with 9 columns.
+-- Block 1: pg_cluster_reconfig_state view exists with 10 columns
+-- (spec-5.14 added reconfig_kind).
 -- ----------
 SELECT count(*) AS column_count
   FROM information_schema.columns
@@ -40,7 +41,8 @@ SELECT event_id,
        applied_at IS NULL AS applied_at_null,
        observer_role,
        event_seq,
-       cssd_dead_generation
+       cssd_dead_generation,
+       reconfig_kind
   FROM pg_cluster_reconfig_state;
 
 -- ----------

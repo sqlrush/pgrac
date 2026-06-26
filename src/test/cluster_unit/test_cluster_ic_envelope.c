@@ -47,7 +47,8 @@
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_ic_envelope.h"
-#include "cluster/cluster_scn.h" /* SCN typedef + stubbed observe/current */
+#include "cluster/cluster_touched_peers.h" /* spec-5.14 D2 stamp stub */
+#include "cluster/cluster_scn.h"		   /* SCN typedef + stubbed observe/current */
 
 /*
  * postgres.h transitively pulls in port.h which redirects printf etc.
@@ -563,6 +564,14 @@ UT_TEST(test_u9_memcpy_wire_roundtrip)
 
 
 UT_DEFINE_GLOBALS();
+
+/* spec-5.14 D2: link-only stub (touched_peers covered elsewhere). */
+bool
+cluster_touched_peers_stamp(int32 node_id pg_attribute_unused(),
+							ClusterTouchKind kind pg_attribute_unused())
+{
+	return false;
+}
 
 /* ============================================================
  * U20: spec-2.3 hardening v1.0.1 F2 (L69 inbound-identity-binding).

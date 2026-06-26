@@ -43,6 +43,7 @@
 #include "cluster/cluster_subtrans.h"		/* SUBCOMMITTED parent follow */
 #include "cluster/cluster_tt_durable.h"		/* spec-4.8 D2 remote_active_failclosed counter */
 #include "cluster/cluster_tt_status.h"		/* lookup_exact / Key / Result */
+#include "cluster/cluster_touched_peers.h"	/* spec-5.14 D2 class 4 */
 #include "cluster/cluster_visibility_resolve.h"
 #include "cluster/cluster_wal_state.h" /* CLUSTER_WAL_STATE_SLOT_COUNT */
 
@@ -158,6 +159,16 @@ classify_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRecPtr 
 		out->evidence = CLUSTER_VIS_EVIDENCE_LOCAL;
 		return;
 	}
+
+	/*
+	 * spec-5.14 D2 class 4: past the self-check this is a genuine remote-origin
+	 * ITL ref — the visibility verdict (whether via resolve_from_remote_ref or
+	 * the STALE wrap-checked remote authority below) now depends on that peer's
+	 * volatile TT / undo state.  Stamp conservatively so a fail-stop of the
+	 * origin aborts this transaction (INV-TP1/TP2).  Read-only; resolve logic
+	 * unchanged.
+	 */
+	cluster_touched_peers_stamp((int32)ref->origin_node_id, CLUSTER_TOUCH_VISIBILITY);
 
 	if (ref->local_xid != raw_xid) {
 		/*

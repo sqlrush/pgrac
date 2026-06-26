@@ -153,6 +153,11 @@ errhint(const char *f pg_attribute_unused(), ...)
 	return 0;
 }
 int
+errdetail(const char *f pg_attribute_unused(), ...) /* spec-5.14 D4 40R01 detail */
+{
+	return 0;
+}
+int
 errcode(int s pg_attribute_unused())
 {
 	return 0;
@@ -166,6 +171,7 @@ errcode(int s pg_attribute_unused())
 
 bool cluster_enabled = false;
 int cluster_node_id = 0;
+bool cluster_touched_peers_trace = false; /* spec-5.14 D4/D6 diag GUC stub */
 volatile sig_atomic_t cluster_reconfig_start_pending = 0;
 volatile sig_atomic_t InterruptPending = 0;
 
@@ -382,9 +388,10 @@ UT_TEST(test_reconfig_event_sizeof_bounds)
 	UT_ASSERT(sizeof(ReconfigEvent) >= 64);
 	UT_ASSERT(sizeof(ReconfigEvent) <= 96);
 
-	/* Field-level sanity:  expect exactly 80 bytes on 64-bit ABI
-	 * with natural alignment (8+4+4 + 8+8+16 + 8+4+4 + 8+8 = 80). */
-	UT_ASSERT_EQ(sizeof(ReconfigEvent), 80);
+	/* Field-level sanity:  expect exactly 88 bytes on 64-bit ABI with
+	 * natural alignment (8+4+4 + 8+8+16 + 8+4+4 + 8+8 = 80, plus spec-5.14's
+	 * reconfig_kind uint8 + _pad2[7] = 8 -> 88). */
+	UT_ASSERT_EQ(sizeof(ReconfigEvent), 88);
 }
 
 
@@ -997,13 +1004,80 @@ UT_TEST(test_reconfig_check_pending_in_tx_in_quorum_53R60_errors)
 
 
 /* ============================================================
+ * spec-5.14 U6 — reconfig_kind field round-trip + enum boundary.
+ * ============================================================ */
+UT_TEST(test_reconfig_kind_field_roundtrip)
+{
+	ReconfigEvent evt;
+	ReconfigEvent got;
+
+	/* enum constants are the on-the-wire-free shmem contract. */
+	UT_ASSERT_EQ((int)RECONFIG_KIND_NONE, 0);
+	UT_ASSERT_EQ((int)RECONFIG_KIND_FAIL_STOP, 1);
+	UT_ASSERT_EQ((int)RECONFIG_KIND_CLEAN_LEAVE, 2);
+
+	cluster_reconfig_shmem_init();
+
+	memset(&evt, 0, sizeof(evt));
+	evt.event_id = 999;
+	evt.reconfig_kind = RECONFIG_KIND_FAIL_STOP;
+	cluster_reconfig_publish_event(&evt);
+
+	cluster_reconfig_get_last_event(&got);
+	UT_ASSERT_EQ((int)got.reconfig_kind, (int)RECONFIG_KIND_FAIL_STOP);
+
+	/* CLEAN_LEAVE field also round-trips (defensive D4 path reachability). */
+	memset(&evt, 0, sizeof(evt));
+	evt.event_id = 1000;
+	evt.reconfig_kind = RECONFIG_KIND_CLEAN_LEAVE;
+	cluster_reconfig_publish_event(&evt);
+	cluster_reconfig_get_last_event(&got);
+	UT_ASSERT_EQ((int)got.reconfig_kind, (int)RECONFIG_KIND_CLEAN_LEAVE);
+}
+
+
+/* ============================================================
+ * spec-5.14 U8 — classify_verdict decision matrix (§3.2), pure.
+ *	4 quadrants (read/write × touched/non-touched) × quorum.
+ * ============================================================ */
+UT_TEST(test_reconfig_classify_verdict_matrix)
+{
+	/* touched (read OR write) + in quorum -> 40R01 (ABORT_TOUCHED) */
+	UT_ASSERT_EQ((int)cluster_reconfig_classify_verdict(true, false, true),
+				 (int)RECONFIG_VERDICT_ABORT_TOUCHED);
+	UT_ASSERT_EQ((int)cluster_reconfig_classify_verdict(true, true, true),
+				 (int)RECONFIG_VERDICT_ABORT_TOUCHED);
+
+	/* touched + lost quorum -> 53R50 (ABORT_QUORUM, terminal) */
+	UT_ASSERT_EQ((int)cluster_reconfig_classify_verdict(true, false, false),
+				 (int)RECONFIG_VERDICT_ABORT_QUORUM);
+	UT_ASSERT_EQ((int)cluster_reconfig_classify_verdict(true, true, false),
+				 (int)RECONFIG_VERDICT_ABORT_QUORUM);
+
+	/* non-touched read-only -> ABSORB (INV-TP5), regardless of quorum */
+	UT_ASSERT_EQ((int)cluster_reconfig_classify_verdict(false, false, true),
+				 (int)RECONFIG_VERDICT_ABSORB);
+	UT_ASSERT_EQ((int)cluster_reconfig_classify_verdict(false, false, false),
+				 (int)RECONFIG_VERDICT_ABSORB);
+
+	/* non-touched writable + in quorum -> 53R60 (ABORT_RECONFIG) */
+	UT_ASSERT_EQ((int)cluster_reconfig_classify_verdict(false, true, true),
+				 (int)RECONFIG_VERDICT_ABORT_RECONFIG);
+
+	/* non-touched writable + lost quorum -> 53R50 (ABORT_QUORUM) */
+	UT_ASSERT_EQ((int)cluster_reconfig_classify_verdict(false, true, false),
+				 (int)RECONFIG_VERDICT_ABORT_QUORUM);
+}
+
+
+/* ============================================================
  * Main — register + run all tests.
  * ============================================================ */
 
 int
 main(void)
 {
-	UT_PLAN(31);
+	UT_PLAN(33);
 
 	/* T-reconfig-1 */
 	UT_RUN(test_reconfig_dead_bitmap_bytes_eq_16);
@@ -1049,6 +1123,10 @@ main(void)
 	UT_RUN(test_reconfig_check_pending_read_only_xact_absorbs);
 	UT_RUN(test_reconfig_check_pending_in_tx_quorum_lost_errors);
 	UT_RUN(test_reconfig_check_pending_in_tx_in_quorum_53R60_errors);
+
+	/* spec-5.14 — reconfig_kind round-trip (U6) + verdict matrix (U8). */
+	UT_RUN(test_reconfig_kind_field_roundtrip);
+	UT_RUN(test_reconfig_classify_verdict_matrix);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

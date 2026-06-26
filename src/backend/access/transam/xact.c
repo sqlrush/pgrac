@@ -153,6 +153,7 @@
 #include "cluster/cluster_tt_2pc.h"	 /* PGRAC: spec-3.15 PREPARE record */
 #include "cluster/cluster_subtrans.h"  /* PGRAC: spec-3.5 D7 subxact lifecycle hook */
 #include "cluster/cluster_undo_record_api.h"  /* PGRAC: spec-3.7 D16 PREPARE guard */
+#include "cluster/cluster_touched_peers.h"	  /* PGRAC: spec-5.14 D1 per-tx reset */
 #include "cluster/storage/cluster_undo_xlog.h" /* PGRAC: spec-3.18 D4.1 TT fold redo stamp */
 #endif
 #endif
@@ -2383,6 +2384,13 @@ StartTransaction(void)
 	AtStart_Cache();
 	AfterTriggerBeginXact();
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC (spec-5.14 D1):  start each transaction with an empty
+	 * touched_peers bitmap so a prior transaction's cross-node ingress
+	 * never leaks into this transaction's fail-stop abort decision. */
+	cluster_touched_peers_reset();
+#endif
+
 	/*
 	 * done with start processing, set current transaction state to "in
 	 * progress"
@@ -3060,6 +3068,8 @@ PrepareTransaction(void)
 	/* PGRAC (spec-3.7 D16):  reset per-backend undo touched flag at
 	 * end of xact (commit path).  Backend reuse → next xact starts fresh. */
 	cluster_undo_record_xact_reset();
+	/* PGRAC (spec-5.14 D1):  clear the touched_peers bitmap on commit. */
+	cluster_touched_peers_reset();
 #endif
 
 	RESUME_INTERRUPTS();
@@ -3282,6 +3292,8 @@ CleanupTransaction(void)
 	/* PGRAC (spec-3.7 D16):  reset per-backend undo touched flag at
 	 * end of xact (abort path).  Backend reuse → next xact starts fresh. */
 	cluster_undo_record_xact_reset();
+	/* PGRAC (spec-5.14 D1):  clear the touched_peers bitmap on abort/cleanup. */
+	cluster_touched_peers_reset();
 #endif
 
 	CurrentResourceOwner = NULL;	/* and resource owner */

@@ -524,6 +524,9 @@ bool cluster_advisory_lock_enabled = true;
 bool cluster_relation_extend_lock_enabled = true;
 bool cluster_tablespace_ddl_lock_enabled = true; /* spec-5.7 TT */
 bool cluster_object_reuse_flush_enabled = true;	 /* spec-5.7 KO */
+/* spec-5.14 D6: diag-only; when on, each touched fail-stop abort LOGs the
+ * aborting transaction's touched-set hex (false-positive investigation). */
+bool cluster_touched_peers_trace = false;
 
 /*
  * spec-2.22 D9:cluster.lmd_max_wait_edges cap.  Default 1024.
@@ -2017,6 +2020,17 @@ cluster_init_guc(void)
 			"off is a forensic/test-only UNSAFE downgrade: extends revert to the PG-native "
 			"local FileSize path, which silently corrupts in a multi-node cluster."),
 		&cluster_relation_extend_lock_enabled, true, PGC_SUSET, 0, NULL, NULL, NULL);
+
+	/* spec-5.14 D6: diag-only trace of touched fail-stop aborts. */
+	DefineCustomBoolVariable(
+		"cluster.touched_peers_trace",
+		gettext_noop("Log the touched-peers set of each transaction aborted by a "
+					 "fail-stop reconfiguration."),
+		gettext_noop("Diagnostic only (default off): when on, every touched fail-stop "
+					 "abort emits a LOG line with the aborting transaction's touched "
+					 "node bitmap, to investigate unexpected (false-positive) aborts. "
+					 "Has no effect on the abort decision itself."),
+		&cluster_touched_peers_trace, false, PGC_SUSET, 0, NULL, NULL, NULL);
 
 	/* spec-5.7 TT (§3.3): cross-node mutex around CREATE/DROP/ALTER/RENAME
 	 * TABLESPACE + the placement-DDL TT(S) in-use guard. */

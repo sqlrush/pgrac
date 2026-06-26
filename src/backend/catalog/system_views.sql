@@ -1595,7 +1595,8 @@ CREATE VIEW pg_cluster_reconfig_state AS
            applied_at,
            observer_role,
            event_seq,
-           cssd_dead_generation
+           cssd_dead_generation,
+           reconfig_kind
       FROM cluster_get_reconfig_state();
 
 REVOKE ALL ON pg_cluster_reconfig_state FROM PUBLIC;

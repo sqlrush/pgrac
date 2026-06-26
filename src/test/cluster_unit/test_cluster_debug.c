@@ -46,6 +46,8 @@
 #include "cluster/cluster_debug.h"
 #include "cluster/cluster_hang.h"		  /* spec-5.11: ClusterHangDumpData for dump_hang stubs */
 #include "cluster/cluster_hang_resolve.h" /* spec-5.12: ClusterHangResolveCounters for dump stubs */
+#include "cluster/cluster_reconfig.h"	  /* spec-5.14 D6 touched getter stubs */
+#include "cluster/cluster_touched_peers.h" /* spec-5.14 D6 self_hex stub */
 
 #undef printf
 #undef fprintf
@@ -2792,6 +2794,35 @@ cluster_grd_pending_count(void)
 
 
 UT_DEFINE_GLOBALS();
+
+/* spec-5.14 D6: link-only stubs for the touched_peers counters/hex that
+ * dump_reconfig_touched emits.  The real getters live in cluster_reconfig.o
+ * (not linked here); their behaviour is covered by cluster_tap t/307. */
+uint64
+cluster_reconfig_get_touched_abort_count(void)
+{
+	return 0;
+}
+uint64
+cluster_reconfig_get_touched_stamp_count(void)
+{
+	return 0;
+}
+uint64
+cluster_reconfig_get_touched_stamp_by_kind(int kind pg_attribute_unused())
+{
+	return 0;
+}
+uint64
+cluster_reconfig_get_clean_leave_rejected_count(void)
+{
+	return 0;
+}
+void
+cluster_touched_peers_self_hex(char *buf, Size buflen)
+{
+	snprintf(buf, buflen, "0x0000000000000000");
+}
 
 
 /* ============================================================

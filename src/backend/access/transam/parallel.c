@@ -45,6 +45,13 @@
 #include "utils/snapmgr.h"
 #include "utils/typcache.h"
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC (spec-5.14 D1b): parallel workers OR-merge their per-tx touched_peers
+ * snapshot to the leader via a private TOC slot array (Q7 exit-before-failstop
+ * coverage). */
+#include "cluster/cluster_touched_peers.h"
+#endif
+
 /*
  * We don't want to waste a lot of memory on an error queue which, most of
  * the time, will process only a handful of small messages.  However, it is
@@ -77,6 +84,12 @@
 #define PARALLEL_KEY_RELMAPPER_STATE		UINT64CONST(0xFFFFFFFFFFFF000D)
 #define PARALLEL_KEY_UNCOMMITTEDENUMS		UINT64CONST(0xFFFFFFFFFFFF000E)
 #define PARALLEL_KEY_CLIENTCONNINFO			UINT64CONST(0xFFFFFFFFFFFF000F)
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC (spec-5.14 D1b): private key (NOT exported in parallel.h) for the
+ * per-worker touched_peers snapshot array.  nworkers entries; each worker
+ * writes its own slot on exit, the leader OR-merges them at the D4 check. */
+#define PARALLEL_KEY_CLUSTER_TOUCHED_PEERS	UINT64CONST(0xFFFFFFFFFFFF0010)
+#endif
 
 /* Fixed-size parallel state. */
 typedef struct FixedParallelState
@@ -291,6 +304,14 @@ InitializeParallelDSM(ParallelContext *pcxt)
 		/* If you add more chunks here, you probably need to add keys. */
 		shm_toc_estimate_keys(&pcxt->estimator, 12);
 
+#ifdef USE_PGRAC_CLUSTER
+		/* PGRAC (spec-5.14 D1b): one touched_peers snapshot per worker. */
+		shm_toc_estimate_chunk(&pcxt->estimator,
+							   mul_size(sizeof(ClusterTouchedPeersSnapshot),
+										pcxt->nworkers));
+		shm_toc_estimate_keys(&pcxt->estimator, 1);
+#endif
+
 		/* Estimate space need for error queues. */
 		StaticAssertStmt(BUFFERALIGN(PARALLEL_ERROR_QUEUE_SIZE) ==
 						 PARALLEL_ERROR_QUEUE_SIZE,
@@ -447,6 +468,24 @@ InitializeParallelDSM(ParallelContext *pcxt)
 		SerializeClientConnectionInfo(clientconninfolen, clientconninfospace);
 		shm_toc_insert(pcxt->toc, PARALLEL_KEY_CLIENTCONNINFO,
 					   clientconninfospace);
+
+#ifdef USE_PGRAC_CLUSTER
+		/* PGRAC (spec-5.14 D1b): zeroed per-worker touched_peers snapshot
+		 * array.  Workers write their own slot on exit; register the leader-
+		 * side pointer so the D4 ProcessInterrupts check can OR-merge them. */
+		{
+			Size		touchedlen = mul_size(sizeof(ClusterTouchedPeersSnapshot),
+											  pcxt->nworkers);
+			ClusterTouchedPeersSnapshot *touchedspace;
+
+			touchedspace = shm_toc_allocate(pcxt->toc, touchedlen);
+			memset(touchedspace, 0, touchedlen);
+			shm_toc_insert(pcxt->toc, PARALLEL_KEY_CLUSTER_TOUCHED_PEERS,
+						   touchedspace);
+			cluster_touched_peers_register_parallel_slots(touchedspace,
+														  pcxt->nworkers);
+		}
+#endif
 
 		/* Allocate space for worker information. */
 		pcxt->worker = palloc0(sizeof(ParallelWorkerInfo) * pcxt->nworkers);
@@ -961,6 +1000,45 @@ DestroyParallelContext(ParallelContext *pcxt)
 	 * from AtEOXact_Parallel or AtEOSubXact_Parallel.
 	 */
 	dlist_delete(&pcxt->node);
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC (spec-5.14 D1b): before the DSM backing the worker touched_peers
+	 * slots is freed below, fold those workers' touches into the leader's own
+	 * bitmap so the cross-node dependency survives for the rest of the leader's
+	 * transaction (a fail-stop after this point must still abort the leader).
+	 * Then drop the registration so the D4 check never reads freed memory.
+	 *
+	 * Review P1-B: a worker that is being killed here (error_mqh still
+	 * attached -> it never sent its clean-exit 'X', e.g. early Gather
+	 * termination via LIMIT) may have consumed a peer's volatile state without
+	 * reaching its export point.  We cannot know which peers, so fail-closed:
+	 * poison the leader's bitmap (over-abort is liveness only; a missed touch
+	 * would be false-visible).
+	 */
+	if (pcxt->toc != NULL)
+	{
+		ClusterTouchedPeersSnapshot *touchedslots =
+			shm_toc_lookup(pcxt->toc, PARALLEL_KEY_CLUSTER_TOUCHED_PEERS, true);
+
+		if (touchedslots != NULL)
+		{
+			cluster_touched_peers_merge_active_parallel_workers();
+			if (pcxt->worker != NULL)
+			{
+				for (i = 0; i < pcxt->nworkers_launched; ++i)
+				{
+					if (pcxt->worker[i].error_mqh != NULL)
+					{
+						cluster_touched_peers_mark_uncertain();
+						break;
+					}
+				}
+			}
+			cluster_touched_peers_unregister_parallel_slots(touchedslots);
+		}
+	}
+#endif
 
 	/* Kill each worker in turn, and forget their error queues. */
 	if (pcxt->worker != NULL)
@@ -1561,6 +1639,20 @@ ParallelWorkerMain(Datum main_arg)
 	 * Time to do the real work: invoke the caller-supplied code.
 	 */
 	entrypt(seg, toc);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC (spec-5.14 D1b): publish this worker's touched_peers (accumulated
+	 * during entrypt) into its DSM slot so the leader can OR-merge it even if
+	 * this worker exits before a fail-stop (Q7).  Done before any transaction
+	 * teardown so the bitmap still reflects the worker's cross-node ingress. */
+	{
+		ClusterTouchedPeersSnapshot *touchedslots =
+			shm_toc_lookup(toc, PARALLEL_KEY_CLUSTER_TOUCHED_PEERS, true);
+
+		if (touchedslots != NULL)
+			cluster_touched_peers_export_to_dsm(&touchedslots[ParallelWorkerNumber]);
+	}
+#endif
 
 	/* Must exit parallel mode to pop active snapshot. */
 	ExitParallelMode();

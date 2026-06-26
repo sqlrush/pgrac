@@ -48,8 +48,9 @@
 #include "cluster/cluster_conf.h"  /* cluster_conf_lookup_node (F2 L69) */
 #include "cluster/cluster_epoch.h" /* cluster_epoch_get_current (spec-2.4 D1) */
 #include "cluster/cluster_ic_envelope.h"
-#include "cluster/cluster_ic_tier1.h" /* peer_stats counters (spec-2.4 D10) */
-#include "cluster/cluster_scn.h"	  /* cluster_scn_observe / current (spec-2.4 D4) */
+#include "cluster/cluster_ic_tier1.h"	   /* peer_stats counters (spec-2.4 D10) */
+#include "cluster/cluster_scn.h"		   /* cluster_scn_observe / current (spec-2.4 D4) */
+#include "cluster/cluster_touched_peers.h" /* spec-5.14 D2 class 3 */
 
 
 /* ============================================================
@@ -307,6 +308,10 @@ cluster_ic_envelope_observe_scn(const ClusterICEnvelope *env, int32 source_node_
 
 	if (after > before) {
 		cluster_ic_tier1_bump_lamport_advance(source_node_id);
+		/* spec-5.14 D2 class 3: our SCN clock advanced from this peer's
+		 * observe — record the cross-node SCN dependency (conservative belt;
+		 * usually runs in LMON, where the stamp is inert and harmless). */
+		cluster_touched_peers_stamp(source_node_id, CLUSTER_TOUCH_SCN);
 		return true;
 	}
 	return false;

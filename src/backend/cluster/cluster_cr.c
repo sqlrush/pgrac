@@ -56,6 +56,7 @@
 #include "cluster/cluster_itl.h"
 #include "cluster/cluster_recovery_merge.h" /* PGRAC: spec-4.5a is_materialized */
 #include "cluster/cluster_remote_xact.h" /* PGRAC: spec-4.5a G5 outcome */ /* spec-3.21: cluster_itl_get_tt_ref (xmax overlay key) */
+#include "cluster/cluster_touched_peers.h" /* PGRAC: spec-5.14 D2 class 4 */
 #include "cluster/cluster_itl_slot.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_tt_durable.h"			/* spec-3.11 D6: watermark by-xid resolve */
@@ -1493,6 +1494,10 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 				return CLUSTER_CR_NOT_APPLICABLE;
 			remote_materialized = true;
 			remote_origin = tuple_origin;
+			/* spec-5.14 D2 class 4: this CR verdict consumes the remote origin's
+			 * volatile xact outcome (via cluster_remote_outcome_durable_checked
+			 * below) — stamp so a fail-stop of that origin aborts this tx. */
+			cluster_touched_peers_stamp(remote_origin, CLUSTER_TOUCH_VISIBILITY);
 		}
 	}
 

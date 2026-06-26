@@ -56,6 +56,7 @@
 #include "cluster/cluster_conf.h" /* CLUSTER_MAX_NODES */
 #include "cluster/cluster_ic.h"	  /* ClusterICOps type for stub */
 #include "cluster/cluster_ic_envelope.h"
+#include "cluster/cluster_touched_peers.h" /* spec-5.14 D2 stamp stub */
 #include "cluster/cluster_ic_router.h"
 
 #undef printf
@@ -730,6 +731,14 @@ UT_TEST(test_t_fanout_7_enum_4_states_distinct)
 }
 
 UT_DEFINE_GLOBALS();
+
+/* spec-5.14 D2: link-only stub (touched_peers covered elsewhere). */
+bool
+cluster_touched_peers_stamp(int32 node_id pg_attribute_unused(),
+							ClusterTouchKind kind pg_attribute_unused())
+{
+	return false;
+}
 
 int
 main(void)

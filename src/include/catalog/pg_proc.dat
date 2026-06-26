@@ -12341,9 +12341,9 @@
   proname => 'cluster_get_reconfig_state', prorows => '1',
   proretset => 't', provolatile => 'v', proparallel => 'r',
   prorettype => 'record', proargtypes => '',
-  proallargtypes => '{int8,int4,int8,int8,text,timestamptz,text,int8,int8}',
-  proargmodes => '{o,o,o,o,o,o,o,o,o}',
-  proargnames => '{event_id,coordinator_node_id,old_epoch,new_epoch,dead_bitmap,applied_at,observer_role,event_seq,cssd_dead_generation}',
+  proallargtypes => '{int8,int4,int8,int8,text,timestamptz,text,int8,int8,text}',
+  proargmodes => '{o,o,o,o,o,o,o,o,o,o}',
+  proargnames => '{event_id,coordinator_node_id,old_epoch,new_epoch,dead_bitmap,applied_at,observer_role,event_seq,cssd_dead_generation,reconfig_kind}',
   prosrc => 'cluster_get_reconfig_state' },
 
 # spec-2.14 D7 (2026-05-13) -- pg_cluster_grd_shards SRF (oid 8921).

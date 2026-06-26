@@ -55,6 +55,7 @@
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_sinval.h"
+#include "cluster/cluster_touched_peers.h" /* spec-5.14 D2 class 5 */
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/latch.h"
@@ -612,6 +613,11 @@ cluster_sinval_drain_outbound_and_broadcast(void)
 			switch (per_peer[peer]) {
 			case CLUSTER_IC_FANOUT_DONE:
 				sent_any = true;
+				/* spec-5.14 D2 class 5 (conservative belt): record the cross-node
+				 * sinval send.  Runs in LMON (no user transaction), so this is
+				 * effectively a counter-only signal; the genuine fail-stop
+				 * dependencies are the backend-context classes 1/2/4. */
+				cluster_touched_peers_stamp(peer, CLUSTER_TOUCH_SINVAL);
 				break;
 			case CLUSTER_IC_FANOUT_WOULD_BLOCK:
 				pg_atomic_fetch_add_u64(&ClusterSinval->fanout_would_block_count, 1);

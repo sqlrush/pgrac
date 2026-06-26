@@ -657,6 +657,7 @@ extern bool cluster_advisory_lock_enabled;
 extern bool cluster_relation_extend_lock_enabled; /* spec-5.7 HW */
 extern bool cluster_tablespace_ddl_lock_enabled;  /* spec-5.7 TT */
 extern bool cluster_object_reuse_flush_enabled;	  /* spec-5.7 KO */
+extern bool cluster_touched_peers_trace;		  /* spec-5.14 D6 diag */
 
 /*
  * cluster.lmd_max_wait_edges (spec-2.22 D9).
