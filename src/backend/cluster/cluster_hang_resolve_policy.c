@@ -65,7 +65,7 @@ cluster_hang_victim_score(const ClusterHangVictim *v, double w_age, double w_rol
 	int n_locks = (v->n_locks_held > 0) ? v->n_locks_held : 0;
 	int n_blocked = (v->n_blocked > 0) ? v->n_blocked : 0;
 
-	return w_age * log(1.0 + age_s) + w_rollback * (-log(1.0 + (double)n_locks))
+	return w_age * log1p(age_s) + w_rollback * (-log1p((double)n_locks))
 		   + w_blockers * (double)n_blocked;
 }
 
@@ -404,7 +404,8 @@ cluster_hang_confirm_end_round(ClusterHangConfirmMap *map)
 bool
 cluster_hang_confirm_ready(const ClusterHangConfirmEntry *e, int confirm_rounds)
 {
-	return e != NULL && e->consecutive_rounds >= confirm_rounds;
+	/* Caller must pass a non-NULL entry (e.g. guard touch()'s result first). */
+	return e->consecutive_rounds >= confirm_rounds;
 }
 
 /*

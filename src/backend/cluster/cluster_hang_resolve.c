@@ -496,7 +496,9 @@ hang_resolve_round(void)
 
 			if (c->v.skip == HANG_VICTIM_OK) {
 				e = cluster_hang_confirm_touch(map, c->v.pid, c->v.backendId);
-				confirmed = cluster_hang_confirm_ready(e, cluster_hang_resolution_confirm_rounds);
+				confirmed
+					= (e != NULL)
+					  && cluster_hang_confirm_ready(e, cluster_hang_resolution_confirm_rounds);
 			}
 
 			gate = cluster_hang_gate_decide(true, c->in_wfg, c->v.skip, confirmed);
@@ -555,8 +557,12 @@ hang_resolve_round(void)
 			{
 				ClusterHangConfirmEntry *e
 					= cluster_hang_confirm_touch(map, c->v.pid, c->v.backendId);
-				ClusterHangActionTier tier = cluster_hang_confirm_decide_tier(
-					e, now, cluster_hang_resolution_soft_timeout_ms);
+				ClusterHangActionTier tier;
+
+				if (e == NULL)
+					continue; /* confirm map full (rare); skip this round */
+				tier = cluster_hang_confirm_decide_tier(e, now,
+														cluster_hang_resolution_soft_timeout_ms);
 
 				if (tier == HANG_ACTION_NONE)
 					continue; /* still inside the anti-thrash grace window */
@@ -606,7 +612,8 @@ hang_resolve_round(void)
 				ctr->degraded_to_timeout++;
 				ctr->last_victim_pid = s->pid;
 				ctr->last_action = (uint8)HANG_ACTION_DEGRADE;
-				cluster_hang_confirm_record_action(e, HANG_ACTION_DEGRADE, now);
+				if (e != NULL)
+					cluster_hang_confirm_record_action(e, HANG_ACTION_DEGRADE, now);
 				acted = true; /* degrade is "acted" for alerting purposes */
 			} else {
 				int sig = cluster_hang_tier_signal(s->tier);
@@ -619,7 +626,8 @@ hang_resolve_round(void)
 					ctr->victims_selected++;
 					ctr->last_victim_pid = s->pid;
 					ctr->last_action = (uint8)s->tier;
-					cluster_hang_confirm_record_action(e, s->tier, now);
+					if (e != NULL)
+						cluster_hang_confirm_record_action(e, s->tier, now);
 					acted = true;
 				} else {
 					/* signal helper rejected the target / kill failed: record

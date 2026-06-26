@@ -300,7 +300,9 @@ UT_TEST(test_confirm_state_machine)
 	/* round 1: first sighting -> 1 consecutive round */
 	cluster_hang_confirm_begin_round(&map);
 	e = cluster_hang_confirm_touch(&map, 111, 7);
-	UT_ASSERT_NOT_NULL(e);
+	UT_ASSERT(e != NULL);
+	if (e == NULL)
+		return; /* guard the subsequent derefs (map cannot be full here) */
 	UT_ASSERT_EQ(e->consecutive_rounds, 1);
 	UT_ASSERT(!cluster_hang_confirm_ready(e, 2));
 	UT_ASSERT(cluster_hang_confirm_ready(e, 1));
@@ -401,6 +403,7 @@ UT_TEST(test_root_blocker_ascent)
 	trunc = false;
 	root = cluster_hang_root_blocker_pid(&store, 0, 100, &trunc);
 	UT_ASSERT(trunc);
+	UT_ASSERT(root > 0); /* still returns the last blocker pid seen */
 
 	/* depth limit cuts a long chain short */
 	memset(&store, 0, sizeof(store));
@@ -411,6 +414,7 @@ UT_TEST(test_root_blocker_ascent)
 	trunc = false;
 	root = cluster_hang_root_blocker_pid(&store, 0, 1, &trunc);
 	UT_ASSERT(trunc);
+	UT_ASSERT(root > 0); /* truncated walk still returns a real blocker pid */
 }
 
 
