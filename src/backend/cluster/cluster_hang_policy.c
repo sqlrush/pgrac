@@ -244,27 +244,45 @@ cluster_hang_store_consider(ClusterHangSampleStore *store, const ClusterHangSamp
 
 
 /*
- * cluster_hang_store_publish
+ * cluster_hang_store_publish_locked
  *
- *	Atomically replace the shared store with a completed round under the
- *	DIAG LWLock (LW_EXCLUSIVE), advancing sample_epoch.  O(n) copy with no
- *	nested locks (n <= CLUSTER_HANG_MAX_SAMPLES, DIAG-only writer).
+ *	Replace the shared store with a completed round, advancing sample_epoch.
+ *	The CALLER must already hold the DIAG LWLock in LW_EXCLUSIVE mode -- this
+ *	lets the round publish be folded into the same critical section as the
+ *	aggregate/counter update so a reader never observes a torn round (new
+ *	store + stale aggregates).  O(n) copy, no nested locks
+ *	(n <= CLUSTER_HANG_MAX_SAMPLES, DIAG-only writer).
  */
 void
-cluster_hang_store_publish(ClusterHangSampleStore *shared, LWLock *lock,
-						   const ClusterHangSampleStore *round)
+cluster_hang_store_publish_locked(ClusterHangSampleStore *shared,
+								  const ClusterHangSampleStore *round)
 {
 	int n = round->n_samples;
 
 	if (n > CLUSTER_HANG_MAX_SAMPLES)
 		n = CLUSTER_HANG_MAX_SAMPLES;
 
-	LWLockAcquire(lock, LW_EXCLUSIVE);
 	shared->n_samples = n;
 	shared->truncated = round->truncated;
 	if (n > 0)
 		memcpy(shared->slots, round->slots, sizeof(ClusterHangSampleSlot) * n);
 	shared->sample_epoch++;
+}
+
+/*
+ * cluster_hang_store_publish
+ *
+ *	Lock-taking convenience wrapper around cluster_hang_store_publish_locked:
+ *	acquires the DIAG LWLock (LW_EXCLUSIVE), publishes, releases.  Used by
+ *	callers that publish the store in isolation; the sampling round itself
+ *	uses the _locked variant under a single shared critical section.
+ */
+void
+cluster_hang_store_publish(ClusterHangSampleStore *shared, LWLock *lock,
+						   const ClusterHangSampleStore *round)
+{
+	LWLockAcquire(lock, LW_EXCLUSIVE);
+	cluster_hang_store_publish_locked(shared, round);
 	LWLockRelease(lock);
 }
 

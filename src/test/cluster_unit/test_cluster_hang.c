@@ -340,13 +340,53 @@ UT_TEST(test_store_consistent_snapshot)
 
 
 /* ============================================================
+ * U11 — publish_locked: caller-holds-lock variant (F2 / Hardening v1.2)
+ *
+ *	The sampling round must publish the store and the aggregate/counter
+ *	fields in ONE exclusive section so readers never observe a torn round
+ *	(new store + old aggregates).  publish_locked takes no lock argument:
+ *	it assumes the caller already holds the DIAG LWLock, letting the round
+ *	publish be folded into the same critical section as the aggregates.
+ * ============================================================ */
+
+UT_TEST(test_store_publish_locked)
+{
+	ClusterHangSampleStore shared;
+	ClusterHangSampleStore round;
+	ClusterHangSampleSlot s;
+
+	memset(&shared, 0, sizeof(shared));
+
+	cluster_hang_store_reset(&round);
+	s = make_slot(200, 90000000);
+	cluster_hang_store_consider(&round, &s, 8);
+	round.truncated = false;
+
+	/* publish_locked copies the round and bumps the epoch, no lock taken */
+	cluster_hang_store_publish_locked(&shared, &round);
+	UT_ASSERT_EQ((int)shared.sample_epoch, 1);
+	UT_ASSERT_EQ(shared.n_samples, 1);
+	UT_ASSERT_EQ(shared.slots[0].pid, 200);
+
+	/* a second publish advances the epoch monotonically */
+	cluster_hang_store_publish_locked(&shared, &round);
+	UT_ASSERT_EQ((int)shared.sample_epoch, 2);
+
+	/* the lock-taking wrapper is still equivalent (same copy + bump) */
+	cluster_hang_store_publish_locked(&shared, &round);
+	UT_ASSERT_EQ((int)shared.sample_epoch, 3);
+	UT_ASSERT_EQ(shared.n_samples, 1);
+}
+
+
+/* ============================================================
  * Test runner
  * ============================================================ */
 
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(11);
 	UT_RUN(test_threshold_boundary);
 	UT_RUN(test_wait_source_tag);
 	UT_RUN(test_wait_is_idle_class);
@@ -357,6 +397,7 @@ main(void)
 	UT_RUN(test_v1_forward_fields_false);
 	UT_RUN(test_topn_truncation);
 	UT_RUN(test_store_consistent_snapshot);
+	UT_RUN(test_store_publish_locked);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -18,8 +18,12 @@
 #          wait state; proc_signal_dump_count increments
 #      L4  the idle-in-transaction lock HOLDER is NOT counted as a hang
 #          waiter (only the blocked waiter is)
-#      L6  cluster.hang_manager_enabled = off stops sampling
+#      L6  cluster.hang_manager_enabled = off stops sampling; the hang
+#          category freezes with cumulative counters retained (not zeroed)
 #      L7  the `hang` category is present in pg_cluster_state
+#      L9  cluster.hang_dump_enabled = off does NOT suppress the
+#          pg_cluster_state hang category; it only freezes the dumps_emitted
+#          accounting + the long-wait LOG-once (Hardening v1.2 / F3)
 #
 #    Forward-marked (NOT run here, honestly deferred — see body):
 #      L5  confirmed-deadlock-waiter exclusion: shipped spec-5.8 exposes
@@ -208,7 +212,34 @@ is(scalar(@hits), 1,
 
 
 # ----------
-# L6: disabling the manager stops sampling.
+# L9 (Hardening v1.2): cluster.hang_dump_enabled=off does NOT suppress the
+# pg_cluster_state hang category -- it only freezes the dumps_emitted /
+# last_dump_emitted_at accounting and the long-wait LOG-once.  The on-demand
+# diagnostic view stays available (sampling itself is gated by
+# hang_manager_enabled, not by this knob).
+# ----------
+$node->safe_psql('postgres', "ALTER SYSTEM SET cluster.hang_dump_enabled = off");
+$node->reload;
+usleep(1_500_000);	  # let the off setting take effect + a round pass
+my $dumps_off1 = hang_val('hang_dumps_emitted');
+usleep(1_500_000);	  # several more sampling rounds with dump_enabled=off
+my $dumps_off2 = hang_val('hang_dumps_emitted');
+is(hang_val('hang_dump_enabled'), 'f', 'L9 hang_dump_enabled reflects off');
+is(hang_val('hang_available'), 't',
+   'L9 pg_cluster_state hang category still present when dump_enabled=off');
+cmp_ok(hang_row_match('^hang_sample[0-9]+_pid$', $bpid), '>=', '1',
+	   'L9 per-row hang sample for B still visible when dump_enabled=off');
+is($dumps_off1, $dumps_off2,
+   'L9 hang_dumps_emitted frozen while dump_enabled=off (accounting suppressed)');
+# restore dump accounting before the manager-off test
+$node->safe_psql('postgres', "ALTER SYSTEM SET cluster.hang_dump_enabled = on");
+$node->reload;
+
+
+# ----------
+# L6: disabling the manager stops sampling; the hang category then freezes at
+# the last sampled state (cumulative counters retained, NOT zeroed -- Hardening
+# v1.2 / F3 contract).
 # ----------
 $node->safe_psql('postgres', "ALTER SYSTEM SET cluster.hang_manager_enabled = off");
 $node->reload;
@@ -220,6 +251,10 @@ is($taken_off1, $taken_off2,
    'L6 hang_manager_enabled=off stops sampling (samples_taken frozen)');
 is(hang_val('hang_manager_enabled'), 'f',
    'L6 hang category reflects disabled state');
+cmp_ok(hang_val('hang_samples_taken'), '>', '0',
+	   'L6 cumulative samples_taken retained (frozen, not zeroed) when manager off');
+is(hang_val('hang_available'), 't',
+   'L6 hang category still present (frozen) when manager off');
 
 
 # Clean up the blocked sessions.

@@ -1749,8 +1749,9 @@ cluster_init_guc(void)
 	DefineCustomBoolVariable(
 		"cluster.hang_manager_enabled",
 		gettext_noop("Enables the DIAG-hosted Hang Manager long-wait sampler."),
-		gettext_noop("When off, DIAG skips long-wait sampling entirely and the "
-					 "hang category reports zeroed counters (spec-5.11)."),
+		gettext_noop("When off, DIAG skips long-wait sampling entirely; the hang "
+					 "category then freezes at the last sampled state and keeps "
+					 "its cumulative counters (not zeroed) (spec-5.11)."),
 		&cluster_hang_manager_enabled, true, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
@@ -1773,9 +1774,11 @@ cluster_init_guc(void)
 
 	DefineCustomBoolVariable(
 		"cluster.hang_dump_enabled",
-		gettext_noop("Enables Hang Manager dump to pg_cluster_state / server log."),
-		gettext_noop("When off, sampling still runs but the hang category dump "
-					 "and long-wait LOG-once are suppressed (spec-5.11)."),
+		gettext_noop("Enables Hang Manager long-wait LOG-once and dump accounting."),
+		gettext_noop("When off, sampling still runs and pg_cluster_state still "
+					 "reports the hang category; only the long-wait LOG-once and "
+					 "the dumps_emitted / last_dump_emitted_at accounting are "
+					 "suppressed (spec-5.11)."),
 		&cluster_hang_dump_enabled, true, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	DefineCustomIntVariable(

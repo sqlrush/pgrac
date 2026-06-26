@@ -231,6 +231,9 @@ extern void cluster_hang_store_consider(ClusterHangSampleStore *store,
 /* Consistent-snapshot store ops (use the DIAG LWLock passed in). */
 extern void cluster_hang_store_publish(ClusterHangSampleStore *shared, LWLock *lock,
 									   const ClusterHangSampleStore *round);
+/* Caller-holds-lock variant: fold publish into the round's exclusive section. */
+extern void cluster_hang_store_publish_locked(ClusterHangSampleStore *shared,
+											  const ClusterHangSampleStore *round);
 extern int cluster_hang_store_snapshot(const ClusterHangSampleStore *shared, LWLock *lock,
 									   ClusterHangSampleStore *out);
 

@@ -54,6 +54,7 @@
 #include "storage/procarray.h"
 #include "storage/procsignal.h"
 #include "utils/backend_status.h"
+#include "utils/memutils.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
@@ -72,6 +73,16 @@ volatile sig_atomic_t cluster_hang_dump_pending = false;
  * ~8 KiB stack frame / per-round allocation.
  */
 static ClusterHangSampleStore hang_round;
+
+/*
+ * Per-round scratch context.  GetLockStatusData() (and other helpers) palloc
+ * into CurrentMemoryContext every round; DIAG is a long-lived aux process
+ * whose main loop never resets a context, so without a dedicated context the
+ * round's allocations would accumulate in a long-lived parent and leak (the
+ * bgwriter / checkpointer / walwriter aux processes solve this the same way).
+ * Created lazily on first round, reset at the end of every round.
+ */
+static MemoryContext hang_sample_context = NULL;
 
 /*
  * DIAG-local LOG-once suppression set (§3.1b).  Not shared memory: DIAG is
@@ -471,11 +482,15 @@ hang_do_sample_round(ClusterDiagSharedState *st)
 
 	hang_log_once_end_round();
 
-	/* Publish the round into the shared store (bumps sample_epoch). */
-	cluster_hang_store_publish(&st->hang_store, &st->lwlock, &hang_round);
-
-	/* Aggregates + counters in one short LW_EXCLUSIVE section. */
+	/*
+	 * Publish the round + aggregates + counters in ONE short LW_EXCLUSIVE
+	 * section so a concurrent reader (cluster_hang_get_dump_data) never sees a
+	 * torn round: a new sample store + bumped epoch paired with stale
+	 * aggregates/counters.  publish_locked advances sample_epoch under the
+	 * lock we already hold.
+	 */
 	LWLockAcquire(&st->lwlock, LW_EXCLUSIVE);
+	cluster_hang_store_publish_locked(&st->hang_store, &hang_round);
 	st->last_sample_at = now;
 	st->long_wait_count = long_wait_count;
 	st->longest_wait_us = longest_wait_us;
@@ -496,10 +511,21 @@ void
 cluster_hang_sample_once(void)
 {
 	ClusterDiagSharedState *st = cluster_diag_get_shared_state();
-	MemoryContext oldcxt = CurrentMemoryContext;
+	MemoryContext oldcxt;
 
 	if (st == NULL)
 		return;
+
+	/*
+	 * Run the round in a dedicated context (created once) and reset it on the
+	 * way out so the per-round palloc'd snapshots (GetLockStatusData et al.)
+	 * never accumulate in a long-lived parent.  Both the normal and the
+	 * fail-OPEN error path fall through to the switch-back + reset below.
+	 */
+	if (hang_sample_context == NULL)
+		hang_sample_context
+			= AllocSetContextCreate(TopMemoryContext, "ClusterHangSample", ALLOCSET_DEFAULT_SIZES);
+	oldcxt = MemoryContextSwitchTo(hang_sample_context);
 
 	/*
 	 * fail-OPEN (§1.4 / §3.2): a diagnostic round must never crash DIAG.
@@ -521,6 +547,10 @@ cluster_hang_sample_once(void)
 		LWLockRelease(&st->lwlock);
 	}
 	PG_END_TRY();
+
+	/* Restore the caller's context and free this round's allocations. */
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextReset(hang_sample_context);
 }
 
 
