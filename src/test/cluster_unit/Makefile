@@ -38,7 +38,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_startup_phase test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_cssd test_cluster_qvotec test_cluster_voting_disk_io test_cluster_quorum_decision \
         test_cluster_xlog test_cluster_tt_slot test_cluster_undo_segment \
         test_cluster_epoch test_cluster_fence test_cluster_reconfig \
-        test_cluster_ges test_cluster_grd test_cluster_lmd test_cluster_lock_acquire test_cluster_advisory \
+        test_cluster_ges test_cluster_grd test_cluster_lmd test_cluster_lmd_graph test_cluster_lmd_wait_state test_cluster_lmd_probe_collector test_cluster_lock_acquire test_cluster_advisory \
         test_cluster_tt_slot_allocator test_cluster_itl_reader_real_triple \
         test_cluster_itl_cleanout test_cluster_visibility_inject test_cluster_itl_cleanout_perf \
         test_cluster_heap_lock_tuple test_cluster_perf_gates \
@@ -114,6 +114,9 @@ CLUSTER_SCN_O = $(top_builddir)/src/backend/cluster/cluster_scn.o
 CLUSTER_GES_O = $(top_builddir)/src/backend/cluster/cluster_ges.o
 CLUSTER_GRD_O = $(top_builddir)/src/backend/cluster/cluster_grd.o
 CLUSTER_LMD_O = $(top_builddir)/src/backend/cluster/cluster_lmd.o
+CLUSTER_LMD_GRAPH_O = $(top_builddir)/src/backend/cluster/cluster_lmd_graph.o
+CLUSTER_LMD_WAIT_STATE_O = $(top_builddir)/src/backend/cluster/cluster_lmd_wait_state.o
+CLUSTER_LMD_PROBE_COLLECTOR_O = $(top_builddir)/src/backend/cluster/cluster_lmd_probe_collector.o
 CLUSTER_LOCK_ACQUIRE_O = $(top_builddir)/src/backend/cluster/cluster_lock_acquire.o
 # spec-2.30 D9: test_cluster_pcm_lock links cluster_pcm_lock.o to exercise
 # the transition validator + counter accessors standalone (20 PG-runtime
@@ -127,7 +130,7 @@ CLUSTER_GCS_O = $(top_builddir)/src/backend/cluster/cluster_gcs.o
 # separate rules because they also link additional cluster_*.o
 # objects (the test files stub the PG backend symbols those
 # objects reference).
-SIMPLE_TESTS = $(filter-out test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf test_cluster_ic_mock test_cluster_inject test_cluster_pgstat test_cluster_debug test_cluster_shared_fs test_cluster_shared_fs_sharedfs test_cluster_smgr test_cluster_startup_phase test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_cssd test_cluster_qvotec test_cluster_voting_disk_io test_cluster_quorum_decision test_cluster_scn test_cluster_epoch test_cluster_fence test_cluster_reconfig test_cluster_ges test_cluster_grd test_cluster_lmd test_cluster_lock_acquire test_cluster_advisory test_cluster_retention test_cluster_visibility_variants test_cluster_tt_2pc test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_block_apply test_cluster_thread_apply test_cluster_thread_replay test_cluster_thread_driver test_cluster_thread_orchestrator test_cluster_write_fence test_cluster_stage4_acceptance test_cluster_ges_mode test_cluster_sequence test_cluster_hw test_cluster_dl test_cluster_extend_gate test_cluster_ir test_cluster_ts test_cluster_ko test_cluster_hw_snapshot test_cluster_cf_authority test_cluster_cf_storage test_cluster_cf_enqueue test_cluster_cf_phase2 test_cluster_cf_stats,$(TESTS))
+SIMPLE_TESTS = $(filter-out test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf test_cluster_ic_mock test_cluster_inject test_cluster_pgstat test_cluster_debug test_cluster_shared_fs test_cluster_shared_fs_sharedfs test_cluster_smgr test_cluster_startup_phase test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_cssd test_cluster_qvotec test_cluster_voting_disk_io test_cluster_quorum_decision test_cluster_scn test_cluster_epoch test_cluster_fence test_cluster_reconfig test_cluster_ges test_cluster_grd test_cluster_lmd test_cluster_lmd_graph test_cluster_lmd_wait_state test_cluster_lmd_probe_collector test_cluster_lock_acquire test_cluster_advisory test_cluster_retention test_cluster_visibility_variants test_cluster_tt_2pc test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_block_apply test_cluster_thread_apply test_cluster_thread_replay test_cluster_thread_driver test_cluster_thread_orchestrator test_cluster_write_fence test_cluster_stage4_acceptance test_cluster_ges_mode test_cluster_sequence test_cluster_hw test_cluster_dl test_cluster_extend_gate test_cluster_ir test_cluster_ts test_cluster_ko test_cluster_hw_snapshot test_cluster_cf_authority test_cluster_cf_storage test_cluster_cf_enqueue test_cluster_cf_phase2 test_cluster_cf_stats,$(TESTS))
 
 # spec-2.4 D16: test_cluster_epoch links cluster_epoch.o standalone.
 # cluster_epoch.c references ShmemInitStruct + cluster_shmem_register_region
@@ -808,6 +811,42 @@ test_cluster_lmd: test_cluster_lmd.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_LMD_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_LMD_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-5.8 D1a: test_cluster_lmd_graph links cluster_lmd_graph.o standalone.
+# cluster_lmd_graph.c references ShmemInitStruct + ShmemInitHash + hash_search
+# + hash_seq_* + LWLock + pg_atomic_* + add_size + hash_estimate_size; the test
+# stubs all of these (a faithful fake HTAB keyed on infoP->keysize) and pins
+# the multi-edge schema: same waiter + multiple distinct blockers keeps every
+# edge, remove-by-waiter deletes all of them.
+test_cluster_lmd_graph: test_cluster_lmd_graph.c unit_test.h \
+		$(CLUSTER_VERSION_O) $(CLUSTER_LMD_GRAPH_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_LMD_GRAPH_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-5.8 D1d: test_cluster_lmd_wait_state links cluster_lmd_wait_state.o
+# standalone.  The wait-state object depends only on pg_atomic (libpgport);
+# the test exercises publish / clear / read / reset + wait_seq ABA on a
+# ClusterLmdProcWaitState directly (no PGPROC / shmem needed).
+test_cluster_lmd_wait_state: test_cluster_lmd_wait_state.c unit_test.h \
+		$(CLUSTER_VERSION_O) $(CLUSTER_LMD_WAIT_STATE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_LMD_WAIT_STATE_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-5.8 D8: test_cluster_lmd_probe_collector links cluster_lmd_probe_collector.o
+# standalone.  The shmem REPORT collector depends on ShmemInitStruct + LWLock +
+# pg_atomic + a member-admit helper; the test stubs all of these (fake region +
+# faithful local member_admit copy) and pins the complete / duplicate / stale /
+# unexpected / overflow / multi-node / reset contract (Rule 8.A).
+test_cluster_lmd_probe_collector: test_cluster_lmd_probe_collector.c unit_test.h \
+		$(CLUSTER_VERSION_O) $(CLUSTER_LMD_PROBE_COLLECTOR_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_LMD_PROBE_COLLECTOR_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 

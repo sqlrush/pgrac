@@ -312,7 +312,21 @@ typedef enum GesRejectReason {
 	 * master).  Value 8 is out of the wire-used 0..7 range; the GesReplyPayload
 	 * reject_reason field is unchanged (no catversion / wire ABI change).
 	 */
-	GES_REJECT_REASON_MASTER_DEAD_NATIVE = 8
+	GES_REJECT_REASON_MASTER_DEAD_NATIVE = 8,
+	/*
+	 * spec-5.8 D8 — this backend was chosen as a cross-node deadlock victim by
+	 * the LMD coordinator while blocked in a GES reply wait.  Generated LOCALLY
+	 * (the PROCSIG_CLUSTER_GES_CANCEL handler set cluster_ges_cancel_pending);
+	 * NEVER travels on the wire in a GesReplyPayload.  The GES wait loops break
+	 * on the flag and return this reason; cluster_lock_acquire maps it to
+	 * CLUSTER_LOCK_ACQUIRE_FAIL_DEADLOCK -> 40P01.  This is the spec-2.22 "check
+	 * point (b)" (in-wait-loop victim honoring) that was forward-linked and is
+	 * activated here so a confirmed cross-node deadlock actually cancels its
+	 * victim instead of waiting out the finite timeout.  Value 9 (8 taken by
+	 * spec-5.7's MASTER_DEAD_NATIVE on the post-5.7 rebase); also out of the
+	 * wire-used 0..7 range, local-only, no wire ABI change.
+	 */
+	GES_REJECT_REASON_DEADLOCK_VICTIM = 9
 } GesRejectReason;
 
 /* ClusterGrdHolderId 4-tuple typedef defined in cluster_grd.h (semantic
@@ -378,11 +392,23 @@ typedef struct GesRequestPayload {
 	/* spec-5.3 D2 — convert mode field at offset 56.  Semantics per opcode
 	 * (see the per-opcode layout note above); 0 for non-convert opcodes. */
 	uint8 current_mode;
-	uint8 _pad[7]; /* align the 64B payload to 8 */
+	/* spec-5.8 D1c — waiter xid carried in the former tail padding (size-
+	 * stable at 64B): the waiting backend's GetTopTransactionIdIfAny() at
+	 * REQUEST / CONVERT send, read by the master to stamp the WFG waiter
+	 * vertex (TX-edge resolution).  InvalidTransactionId (0) for non-waiter
+	 * opcodes (RELEASE / REDECLARE) and pre-write waiters. */
+	uint8 _pad0[3]; /* keep waiter_xid 4-byte aligned at offset 60 */
+	uint32 waiter_xid;
+	/* spec-5.8 D1e — the waiter's D1d wait-state publish sequence, sampled at
+	 * REQUEST / CONVERT send so the master stamps it on the WFG waiter vertex
+	 * and the cross-node cancel echoes it for D5 ABA revalidate.  0 for
+	 * non-waiter opcodes. */
+	uint64 wait_seq;
 } GesRequestPayload;
 
-StaticAssertDecl(sizeof(GesRequestPayload) == 64,
-				 "GesRequestPayload wire ABI 64-byte lock (spec-5.3 D2 bump from 56B)");
+StaticAssertDecl(sizeof(GesRequestPayload) == 72,
+				 "GesRequestPayload wire ABI 72-byte lock (spec-5.3 D2 56->64; spec-5.8 D1c "
+				 "waiter_xid in tail pad; spec-5.8 D1e +8 wait_seq -> 72)");
 
 /*
  * GES reply payload (variant on GES_REPLY msg_type=5).
@@ -543,7 +569,8 @@ extern void cluster_ges_send_bast_targeted(const struct ClusterResId *resid,
  *	(reserved pool + cleanup dirty-list nofail).
  */
 extern void cluster_ges_send_cancel_pending(int32 victim_node_id,
-											const struct ClusterGrdHolderId *victim_target);
+											const struct ClusterGrdHolderId *victim_target,
+											uint64 wait_seq);
 
 
 /* ============================================================

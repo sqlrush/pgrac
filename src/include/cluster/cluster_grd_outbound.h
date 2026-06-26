@@ -97,9 +97,19 @@ typedef enum ClusterGrdOutboundOrigin {
 #define PGRAC_GES_REPLY_DIRTY_BUDGET 64
 #define PGRAC_GES_CLEANUP_DIRTY_BUDGET 64
 
-/* Max payload bytes per ring slot.  GES_REQUEST payload = 56B, GES_REPLY payload = 52B
- * (cluster_ges.h);  pad to 64B for cache-line alignment + forward compat. */
-#define PGRAC_GES_OUTBOUND_PAYLOAD_MAX 64
+/*
+ * Max payload bytes per ring slot.  This MUST be >= the largest wire payload
+ * that traverses the ring — GesRequestPayload (the biggest at 72B after the
+ * spec-5.8 D1c waiter_xid + D1e wait_seq growth), GesReplyPayload (52B),
+ * ClusterGrdConvert / the LMD cancel image (72B), and the native-lock probe
+ * payloads (≤40B).  spec-5.8 D8 fix: D1e grew GesRequestPayload 56->64->72 but
+ * left this at 64, so a 72B cross-node GES REQUEST was rejected by ring_push
+ * (payload_len > MAX) and never sent — every cross-node lock then timed out.
+ * A StaticAssertDecl in cluster_grd_outbound.c now couples this to
+ * sizeof(GesRequestPayload) so a future payload growth that forgets this slot
+ * fails at COMPILE time instead of going latent until a 2-node run.
+ */
+#define PGRAC_GES_OUTBOUND_PAYLOAD_MAX 72
 
 /*
  * Ring slot — fixed 64B payload + envelope metadata.
@@ -120,8 +130,9 @@ typedef struct ClusterGrdOutboundSlot {
 	uint8 payload[PGRAC_GES_OUTBOUND_PAYLOAD_MAX];
 } ClusterGrdOutboundSlot;
 
-StaticAssertDecl(sizeof(ClusterGrdOutboundSlot) == 72,
-				 "ClusterGrdOutboundSlot ABI lock (8 metadata + 64 payload)");
+StaticAssertDecl(sizeof(ClusterGrdOutboundSlot) == 80,
+				 "ClusterGrdOutboundSlot ABI lock (8 metadata + 72 payload, spec-5.8 D8 — "
+				 "payload grown 64->72 to hold the D1e GesRequestPayload)");
 
 /* Shmem lifecycle */
 extern Size cluster_grd_outbound_shmem_size(void);

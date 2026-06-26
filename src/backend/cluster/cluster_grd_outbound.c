@@ -48,6 +48,22 @@
 #include "utils/elog.h"
 
 
+/*
+ * spec-5.8 D8 — couple the ring slot payload capacity to the largest wire
+ * payload that traverses it.  GesRequestPayload is the biggest (72B after the
+ * D1c/D1e growth) and is what cluster_grd_outbound_enqueue_backend_request
+ * sends on the cross-node GES request path.  If a future change grows a ring
+ * payload past PGRAC_GES_OUTBOUND_PAYLOAD_MAX this fails at compile time —
+ * preventing a recurrence of the D1e miss where the payload grew 64->72 but
+ * this slot stayed 64, so ring_push silently rejected every cross-node GES
+ * REQUEST (latent until a 2-node run).
+ */
+StaticAssertDecl(PGRAC_GES_OUTBOUND_PAYLOAD_MAX >= sizeof(GesRequestPayload),
+				 "GES outbound ring slot must hold a full GesRequestPayload");
+StaticAssertDecl(PGRAC_GES_OUTBOUND_PAYLOAD_MAX >= sizeof(GesReplyPayload),
+				 "GES outbound ring slot must hold a full GesReplyPayload");
+
+
 /* ============================================================
  * Shmem layout — fixed compile-time capacity per I54 (a)(b).
  *

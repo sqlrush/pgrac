@@ -341,7 +341,6 @@ extern void cluster_grd_bast_handler(void); /* ProcessInterrupts hook */
 extern bool cluster_grd_bast_local_deliver_ok(uint32 procno, int proc_count, uint64 holder_epoch,
 											  uint64 current_epoch, int target_pid,
 											  int target_backendid);
-extern void cluster_grd_cancel_handler(void); /* ProcessInterrupts hook */
 extern void cluster_grd_inc_bast_sent(void);
 extern void cluster_grd_inc_bast_received(void);
 extern void cluster_grd_inc_bast_ack(void);
@@ -733,6 +732,18 @@ typedef struct ClusterGrdHolderId {
 StaticAssertDecl(sizeof(ClusterGrdHolderId) == 24, "ClusterGrdHolderId 4-tuple ABI 24-byte lock");
 
 /*
+ * spec-5.8 D1c/D1e — waiter deadlock metadata threaded from the waiting
+ * backend's D1d wait-state into the master-side WFG vertex.  Neither field is
+ * part of the waiter identity (the 4-tuple ClusterGrdHolderId is);  they are
+ * carried so a TX edge can resolve holder=(node,xid) and so D5 can ABA-match
+ * the victim's wait_seq.  Both may be zero / InvalidTransactionId.
+ */
+typedef struct ClusterGrdWaiterMeta {
+	TransactionId xid;
+	uint64 wait_seq;
+} ClusterGrdWaiterMeta;
+
+/*
  * 4 cap counter + 5 nofail counter (Q12 v0.6).
  *
  *   cap counter (4):  holders_full / waiters_full / converts_full /
@@ -985,6 +996,19 @@ extern ClusterGrdGrantAction cluster_grd_entry_enqueue_or_grant(
 	int *n_conflict_out);
 
 /*
+ * spec-5.8 D1c/D1e — waiter-metadata variant.  Identical to the above but
+ * stamps the enqueued waiter's deadlock metadata (xid for TX-edge resolution,
+ * wait_seq for D5 ABA revalidate) onto the master-side WFG vertex.  The plain
+ * entry point forwards here with a zero meta.  Both meta fields are metadata,
+ * never part of the waiter identity.
+ */
+extern ClusterGrdGrantAction cluster_grd_entry_enqueue_or_grant_meta(
+	const ClusterResId *resid, const ClusterGrdHolderId *holder, int32 source_node_id,
+	uint64 request_id, ClusterGrdWaiterMeta meta, uint64 shard_master_generation,
+	uint32 request_opcode, int /* LOCKMODE */ lockmode,
+	ClusterGrdConflictHolder *conflict_holders_out, int *n_conflict_out);
+
+/*
  * spec-5.5 D5 — conditional (NOWAIT) variant of the above for try-locks.
  *
  *	Runs the identical conflict scan + same-backend self-exclusion + no-conflict
@@ -998,6 +1022,15 @@ extern ClusterGrdGrantAction cluster_grd_entry_grant_conditional(
 	uint64 request_id, uint64 shard_master_generation, uint32 request_opcode,
 	int /* LOCKMODE */ lockmode, ClusterGrdConflictHolder *conflict_holders_out,
 	int *n_conflict_out);
+
+/* spec-5.8 D1c/D1e — waiter-metadata variant of the conditional (NOWAIT) grant.
+ * The NOWAIT path enqueues no waiter, so meta is carried only for call-site
+ * symmetry; the plain entry point forwards here with a zero meta. */
+extern ClusterGrdGrantAction cluster_grd_entry_grant_conditional_meta(
+	const ClusterResId *resid, const ClusterGrdHolderId *holder, int32 source_node_id,
+	uint64 request_id, ClusterGrdWaiterMeta meta, uint64 shard_master_generation,
+	uint32 request_opcode, int /* LOCKMODE */ lockmode,
+	ClusterGrdConflictHolder *conflict_holders_out, int *n_conflict_out);
 
 /*
  * Release a holder + pop the first FIFO-compatible waiter.
@@ -1060,10 +1093,13 @@ typedef struct ClusterGrdConvert {
 	uint64 convert_request_id;		/* convert's own reply key (≠ old grant id) */
 	uint64 shard_master_generation; /* spec-2.27 dedup key carry */
 	uint32 request_opcode;			/* = GES_REQ_OPCODE_CONVERT */
+	TransactionId waiter_xid;		/* spec-5.8 D1c — converter's xid (former pad slot) */
 	TimestampTz wait_start;			/* enqueue timestamp (timeout / observability) */
+	uint64 wait_seq;				/* spec-5.8 D1e — converter's D1d wait-state seq */
 } ClusterGrdConvert;
 
-StaticAssertDecl(sizeof(ClusterGrdConvert) == 64, "ClusterGrdConvert layout pinned (spec-5.1b D2)");
+StaticAssertDecl(sizeof(ClusterGrdConvert) == 72,
+				 "ClusterGrdConvert layout pinned (spec-5.1b D2 64B; spec-5.8 D1e +8 wait_seq)");
 
 /*
  * D4 — convert grant decision result.
@@ -1170,6 +1206,15 @@ cluster_grd_convert_or_enqueue(const ClusterResId *resid, int32 node_id, uint32 
 							   uint64 convert_request_id, int32 source_node_id,
 							   uint64 shard_master_generation,
 							   ClusterGrdConflictHolder *conflict_holders_out, int *n_conflict_out);
+
+/* spec-5.8 D1c/D1e — waiter-metadata variant.  Stamps the enqueued convert's
+ * xid + wait_seq onto its master-side WFG convert-waiter vertex.  The plain
+ * entry point forwards here with a zero meta. */
+extern ClusterGrdConvertResult cluster_grd_convert_or_enqueue_meta(
+	const ClusterResId *resid, int32 node_id, uint32 procno, uint64 cluster_epoch,
+	LOCKMODE current_mode, LOCKMODE requested_mode, uint64 convert_request_id, int32 source_node_id,
+	uint64 shard_master_generation, ClusterGrdWaiterMeta meta,
+	ClusterGrdConflictHolder *conflict_holders_out, int *n_conflict_out);
 
 /*
  * spec-5.3 §3.5 native-probe clear path: commit a convert located by the

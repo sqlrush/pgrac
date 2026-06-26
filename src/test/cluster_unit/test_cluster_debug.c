@@ -2960,6 +2960,48 @@ cluster_lmd_cleanup_skip_other_owner_count_get(void)
 {
 	return 0;
 }
+/* spec-5.8 D6 stub audit — 3 NEW coordinator confirm / reconfig-gate counters. */
+uint64
+cluster_lmd_deadlock_confirmed_count_get(void)
+{
+	return 0;
+}
+uint64
+cluster_lmd_confirm_unconfirmed_count_get(void)
+{
+	return 0;
+}
+uint64
+cluster_lmd_reconfig_discard_count_get(void)
+{
+	return 0;
+}
+/* spec-5.8 D8 stub audit — 5 NEW shmem REPORT-collector counters. */
+uint64
+cluster_lmd_probe_report_enqueue_count_get(void)
+{
+	return 0;
+}
+uint64
+cluster_lmd_probe_drop_stale_count_get(void)
+{
+	return 0;
+}
+uint64
+cluster_lmd_probe_drop_duplicate_count_get(void)
+{
+	return 0;
+}
+uint64
+cluster_lmd_probe_queue_full_count_get(void)
+{
+	return 0;
+}
+uint64
+cluster_lmd_probe_partial_report_count_get(void)
+{
+	return 0;
+}
 uint64
 cluster_grd_cleanup_skip_stale_cancel_count(void)
 {

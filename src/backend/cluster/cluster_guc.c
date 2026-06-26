@@ -494,6 +494,19 @@ int cluster_lmd_max_wait_edges = 1024;
 int cluster_lmd_scan_interval_ms = 1000;
 
 /*
+ * spec-5.8 D3 — coordinator-driven cross-node deadlock detection controls.
+ *
+ *	deadlock_detection_enabled gates the whole coordinator scan; the two
+ *	interval GUCs tune the scan period and the two-round confirm delay.  The
+ *	confirm round is the Rule 8.A transient filter: a cross-node cycle is
+ *	cancelled only if observed identically (same members, same per-node graph
+ *	generations, same cycle) in both rounds.
+ */
+bool cluster_lmd_deadlock_detection_enabled = true;
+int cluster_lmd_global_dd_interval_ms = 2000;
+int cluster_lmd_deadlock_confirm_interval_ms = 500;
+
+/*
  * PGRAC: spec-2.33 D8 — cluster.gcs_reply_timeout_ms (HC85).
  * Default 5000ms.  PGC_SUSET — superusers and test fixtures may tune;
  * unprivileged users may not perturb the Cache Fusion hot path.
@@ -2329,6 +2342,30 @@ cluster_init_guc(void)
 					 "detection at higher CPU.  CV wake on edge submission "
 					 "also triggers scan out-of-band.  PGC_SIGHUP."),
 		&cluster_lmd_scan_interval_ms, 1000, 50, 60000, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	/* spec-5.8 D3 — coordinator-driven cross-node deadlock detection. */
+	DefineCustomBoolVariable(
+		"cluster.deadlock_detection_enabled",
+		gettext_noop("Enable coordinator-driven cross-node deadlock detection."),
+		gettext_noop("When off, only the per-node local Tarjan scan runs and "
+					 "cross-node deadlocks rely on the finite GES / TX enqueue "
+					 "timeouts.  PGC_SIGHUP."),
+		&cluster_lmd_deadlock_detection_enabled, true, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.global_dd_interval_ms",
+		gettext_noop("Coordinator cross-node deadlock scan period (ms)."),
+		gettext_noop("Only the HC16 lowest-active node runs the cross-node scan, "
+					 "at this period.  PGC_SIGHUP."),
+		&cluster_lmd_global_dd_interval_ms, 2000, 100, 600000, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.deadlock_confirm_interval_ms",
+		gettext_noop("Delay between the two coordinator deadlock-confirm rounds (ms)."),
+		gettext_noop("A cross-node cycle is cancelled only if observed identically "
+					 "in both rounds separated by this delay (Rule 8.A transient "
+					 "filter).  PGC_SIGHUP."),
+		&cluster_lmd_deadlock_confirm_interval_ms, 500, 50, 60000, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	/*
 	 * PGRAC: spec-2.33 D8 — cluster.gcs_reply_timeout_ms (HC85).

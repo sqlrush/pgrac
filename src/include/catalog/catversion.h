@@ -666,7 +666,28 @@
  * No pg_proc / catalog row change, but the WAL + cross-node wire + shmem ABI
  * are mutually incompatible across the bump, so a single catversion step gates
  * mixed-version rolling (consistent with the existing epoch/version gates). */
-#define CATALOG_VERSION_NO 202606250
+/* spec-5.8 D1c (2026-06-23):  GesRequestPayload repurposes 4 bytes of its tail
+ * padding for waiter_xid (size-stable at 64B) -- the waiting backend's
+ * GetTopTransactionIdIfAny() at REQUEST/CONVERT send, read by the master to
+ * stamp the deadlock wait-for-graph waiter vertex.  Wire semantics change
+ * (formerly must-be-zero) -> catversion bump (Stage 5 enforces a uniform
+ * catversion; no rolling upgrade). */
+/* spec-5.8 D1e (2026-06-23):  wait_seq growth-wave.  GesRequestPayload 64->72
+ * (+ wait_seq), ClusterLmdVertex 40->48, ClusterLmdWaitEdge 96->112,
+ * ClusterGrdConvert 64->72, ClusterLmdCancelItem 72->80.  The waiter's D1d
+ * wait-state publish seq rides the GES wire + the cross-node CANCEL payload so
+ * the victim node's D5 revalidate can ABA-match it.  Wire ABI size change ->
+ * catversion bump. */
+/* spec-5.8 D3 (2026-06-23):  pg_cluster_lmd_remove_wait_edges (oid 8956) —
+ * test/diagnostic-only SRF companion to the D16 injector.  D1a's multi-edge
+ * graph key removed the old redirect-to-overwrite cycle-break trick, so TAP
+ * 109 needs a real waiter-edge remover.  pg_proc.dat gets one row.  (oid 8951
+ * moved to 8956 on the post-5.7 rebase — 5.7's cluster_ir_acquire_probe owns
+ * 8951.)  catversion bump. */
+/* spec-5.8 rebase onto shipped 5.7 + 5.50 (2026-06-26): single combined bump
+ * above 5.7's 202606250 — 5.8's GES wire / LMD shmem ABI + the relocated SRF
+ * stack on top of 5.7's enqueue classes + spec-2.41 lost-write ABI. */
+#define CATALOG_VERSION_NO 202606260
 
 /* spec-2.39 D10 (2026-05-21):  SI Broadcaster production activation —
  * DDL commit hook (AtEOXact_Inval + COMMIT PREPARED via cluster-aware

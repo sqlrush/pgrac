@@ -127,6 +127,8 @@ typedef struct ClusterGrdWaiter {
 	uint32 procno;					/* PG ProcNumber of the waiting backend */
 	uint64 cluster_epoch;			/* epoch at waiter enqueue time */
 	uint64 request_id;				/* per-backend monotonic id (for 5-tuple reply key) */
+	TransactionId waiter_xid;		/* spec-5.8 D1c — waiter's xid for the WFG vertex */
+	uint64 wait_seq;				/* spec-5.8 D1e — waiter's D1d wait-state seq */
 	uint64 shard_master_generation; /* spec-2.27 dedup key carry */
 	uint32 request_opcode;			/* GesRequestOpcode of the queued request */
 	LOCKMODE mode;
@@ -167,6 +169,224 @@ struct ClusterGrdEntry {
 		LOCKMODE mode;
 	} reservations[PGRAC_GRD_MAX_HOLDERS];
 };
+
+
+/* ============================================================
+ * spec-5.8 D1b — master-side wait-for-graph (WFG) edge authority.
+ *
+ *	The GRD master holds the authoritative holder/waiter state for every
+ *	cluster resource, so it is the only place that can build a deadlock
+ *	wait-for graph whose edges follow the CURRENT holders (spec-5.8 §3.1
+ *	E1/E2).  A waiter is blocked by exactly the granted holders whose mode
+ *	conflicts with its wanted mode; a backend never blocks on its own hold
+ *	(same-backend self-exclusion, mirroring the enqueue conflict scan).  Each
+ *	such (waiter, blocker) pair is one WFG edge in the LMD graph (multi-edge
+ *	keyed on both 4-tuples per spec-5.8 D1a).
+ *
+ *	Lock discipline (CLAUDE.md 规则 16):  the GRD entry is guarded by a
+ *	spinlock (entry->lock) while the LMD wait-for graph is LWLock-protected,
+ *	and an LWLock must never be acquired under a spinlock.  So the edge set is
+ *	rebuilt in two steps — grd_wfg_snapshot_locked() copies the holder /
+ *	waiter / convert identities under entry->lock, then grd_wfg_resync_entry()
+ *	applies them to the graph AFTER the spinlock is released.  This is the same
+ *	collect-under-lock / act-after-unlock pattern the targeted BAST path
+ *	already uses (conflict_holders_out).
+ *
+ *	D1b registers edges on the 4-tuple identity only (vertex xid is
+ *	InvalidTransactionId); the waiter xid carry + persistence is spec-5.8 D1c.
+ *	Edge registration is best-effort: a full WFG table must never fail a lock
+ *	request (the finite request timeout still backstops).  No cancellation
+ *	fires until the spec-5.8 D3 two-round gate + D5 wait-state revalidate are
+ *	wired, so a transiently stale/leaked edge cannot mis-cancel a live
+ *	transaction in this deliverable.
+ * ============================================================ */
+
+typedef struct GrdWfgHolderSnap {
+	int32 node_id;
+	uint32 procno;
+	uint64 cluster_epoch;
+	uint64 request_id;
+	LOCKMODE mode;
+} GrdWfgHolderSnap;
+
+typedef struct GrdWfgWaiterSnap {
+	int32 node_id;
+	uint32 procno;
+	uint64 cluster_epoch;
+	uint64 request_id;		  /* REQUEST waiter id, or convert_request_id for a convert */
+	TransactionId waiter_xid; /* spec-5.8 D1c — xid stamped on the WFG vertex */
+	uint64 wait_seq;		  /* spec-5.8 D1e — wait_seq stamped on the WFG vertex */
+	LOCKMODE mode;			  /* wanted mode (requested_mode for a convert) */
+} GrdWfgWaiterSnap;
+
+typedef struct GrdWfgSnapshot {
+	int n_holders;
+	GrdWfgHolderSnap holders[PGRAC_GRD_MAX_HOLDERS];
+	int n_waiters; /* queued REQUEST waiters + pending converts */
+	GrdWfgWaiterSnap waiters[PGRAC_GRD_MAX_WAITERS + PGRAC_GRD_MAX_CONVERTS];
+} GrdWfgSnapshot;
+
+/* Build an LMD vertex from a 4-tuple identity + sort-metadata xid + wait_seq
+ * (spec-5.8 D1c/D1e).  xid / wait_seq are sort/revalidate metadata, never part
+ * of the identity; GES-holder blockers carry 0 (only waiters carry real
+ * metadata, threaded from the GES request / convert at enqueue time). */
+static void
+grd_wfg_make_vertex(int32 node_id, uint32 procno, uint64 cluster_epoch, uint64 request_id,
+					TransactionId xid, uint64 wait_seq, ClusterLmdVertex *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->node_id = node_id;
+	out->procno = procno;
+	out->cluster_epoch = cluster_epoch;
+	out->request_id = request_id;
+	out->xid = xid;
+	out->local_start_ts_ms = 0;
+	out->wait_seq = wait_seq;
+}
+
+/* Caller holds entry->lock.  Copy holders + queued waiters + pending converts
+ * into *snap (identities + modes only — no LMD graph lock taken here). */
+static void
+grd_wfg_snapshot_locked(const ClusterGrdEntry *entry, GrdWfgSnapshot *snap)
+{
+	int i;
+
+	snap->n_holders = 0;
+	for (i = 0; i < entry->ngranted && snap->n_holders < PGRAC_GRD_MAX_HOLDERS; i++) {
+		GrdWfgHolderSnap *h = &snap->holders[snap->n_holders++];
+
+		h->node_id = entry->holders[i].node_id;
+		h->procno = entry->holders[i].procno;
+		h->cluster_epoch = entry->holders[i].cluster_epoch;
+		h->request_id = entry->holders[i].request_id;
+		h->mode = entry->holders[i].mode;
+	}
+
+	snap->n_waiters = 0;
+	for (i = 0;
+		 i < entry->nwaiters && snap->n_waiters < PGRAC_GRD_MAX_WAITERS + PGRAC_GRD_MAX_CONVERTS;
+		 i++) {
+		GrdWfgWaiterSnap *w = &snap->waiters[snap->n_waiters++];
+
+		w->node_id = entry->waiters[i].node_id;
+		w->procno = entry->waiters[i].procno;
+		w->cluster_epoch = entry->waiters[i].cluster_epoch;
+		w->request_id = entry->waiters[i].request_id;
+		w->waiter_xid = entry->waiters[i].waiter_xid;
+		w->wait_seq = entry->waiters[i].wait_seq;
+		w->mode = entry->waiters[i].mode;
+	}
+	for (i = 0;
+		 i < entry->nconverts && snap->n_waiters < PGRAC_GRD_MAX_WAITERS + PGRAC_GRD_MAX_CONVERTS;
+		 i++) {
+		GrdWfgWaiterSnap *w = &snap->waiters[snap->n_waiters++];
+
+		/* A pending convert blocks on its requested (target) mode; its vertex
+		 * id uses the convert's own reply key (convert_request_id). */
+		w->node_id = entry->converts[i].node_id;
+		w->procno = entry->converts[i].procno;
+		w->cluster_epoch = entry->converts[i].cluster_epoch;
+		w->request_id = entry->converts[i].convert_request_id;
+		w->waiter_xid = entry->converts[i].waiter_xid;
+		w->wait_seq = entry->converts[i].wait_seq;
+		w->mode = entry->converts[i].requested_mode;
+	}
+}
+
+/* Refresh one waiter's WFG edges against a holder snapshot (spec-5.8 D1b
+ * refresh_waiter_edges primitive — runs AFTER entry->lock is released; the
+ * snapshot is the holder set as of the locked instant).  Removes every prior
+ * edge of the waiter, then submits one edge per current conflicting holder. */
+static void
+grd_wfg_refresh_waiter_edges(const GrdWfgSnapshot *snap, const GrdWfgWaiterSnap *w)
+{
+	ClusterLmdVertex waiter_v;
+	int i;
+
+	grd_wfg_make_vertex(w->node_id, w->procno, w->cluster_epoch, w->request_id, w->waiter_xid,
+						w->wait_seq, &waiter_v);
+	cluster_lmd_cancel_wait_edge_real(&waiter_v); /* clear stale edges first */
+
+	for (i = 0; i < snap->n_holders; i++) {
+		ClusterLmdVertex blocker_v;
+
+		/* spec-5.1c D5 self-exclusion: a backend never blocks on its own hold. */
+		if (snap->holders[i].node_id == w->node_id && snap->holders[i].procno == w->procno)
+			continue;
+		/* Only conflicting holders block the waiter (frozen 8x8 matrix). */
+		if (ges_modes_compatible(snap->holders[i].mode, w->mode))
+			continue;
+		grd_wfg_make_vertex(snap->holders[i].node_id, snap->holders[i].procno,
+							snap->holders[i].cluster_epoch, snap->holders[i].request_id,
+							InvalidTransactionId, 0, &blocker_v);
+		(void)cluster_lmd_submit_wait_edge_real(&waiter_v, &blocker_v, w->request_id);
+	}
+}
+
+/* spec-5.8 D1b — re-sync the WFG edge set for one resource after a master-side
+ * holder/waiter mutation.  `departed` lists waiters that LEFT the queue
+ * (granted / cancelled) so their edges are removed even if the entry emptied
+ * and was reclaimed; every still-queued waiter + pending convert is then
+ * refreshed against the current holders.  Best-effort: the submit/cancel calls
+ * self-gate (no-op) when the LMD graph is unavailable. */
+static void
+grd_wfg_resync_entry(const ClusterResId *resid, const ClusterGrdHolderId *departed, int n_departed)
+{
+	ClusterGrdEntry *entry = NULL;
+	GrdWfgSnapshot snap;
+	int i;
+
+	/* (1) Remove edges of waiters that left the queue (identity-only; works
+	 *	   even if the entry was reclaimed when it emptied). */
+	for (i = 0; i < n_departed; i++) {
+		ClusterLmdVertex v;
+
+		grd_wfg_make_vertex((int32)departed[i].node_id, departed[i].procno,
+							departed[i].cluster_epoch, departed[i].request_id, InvalidTransactionId,
+							0, &v);
+		cluster_lmd_cancel_wait_edge_real(&v);
+	}
+
+	/* (2) Snapshot the current entry state under entry->lock, then refresh
+	 *	   every still-queued waiter / convert after releasing the spinlock. */
+	if (cluster_grd_entry_lookup_or_create(resid, false, &entry) != CLUSTER_GRD_ENTRY_OK
+		|| entry == NULL)
+		return; /* entry gone (emptied) — nothing left to refresh */
+
+	SpinLockAcquire(&entry->lock);
+	grd_wfg_snapshot_locked(entry, &snap);
+	SpinLockRelease(&entry->lock);
+	cluster_grd_entry_release(entry);
+
+	for (i = 0; i < snap.n_waiters; i++)
+		grd_wfg_refresh_waiter_edges(&snap, &snap.waiters[i]);
+}
+
+/* Resync after a release/drain that granted `n` identities (now departed from
+ * the wait queue). */
+static void
+grd_wfg_resync_after_grants(const ClusterResId *resid, const ClusterGrdGrantIdentity *granted,
+							int n)
+{
+	ClusterGrdHolderId departed[PGRAC_GRD_MAX_WAITERS + PGRAC_GRD_MAX_CONVERTS];
+	int i, nd = 0;
+
+	for (i = 0; i < n && nd < (int)lengthof(departed); i++)
+		departed[nd++] = granted[i].holder;
+	grd_wfg_resync_entry(resid, departed, nd);
+}
+
+/* Resync after a release-and-pop that granted `n` REQUEST waiters. */
+static void
+grd_wfg_resync_after_pops(const ClusterResId *resid, const ClusterGrdWaiterIdentity *granted, int n)
+{
+	ClusterGrdHolderId departed[PGRAC_GRD_MAX_WAITERS];
+	int i, nd = 0;
+
+	for (i = 0; i < n && nd < (int)lengthof(departed); i++)
+		departed[nd++] = granted[i].holder;
+	grd_wfg_resync_entry(resid, departed, nd);
+}
 
 
 /* ============================================================
@@ -2378,7 +2598,8 @@ cluster_grd_entry_enqueue_or_grant_impl(const ClusterResId *resid, const Cluster
 										uint64 shard_master_generation, uint32 request_opcode,
 										int lockmode,
 										ClusterGrdConflictHolder *conflict_holders_out,
-										int *n_conflict_out, bool conditional)
+										int *n_conflict_out, ClusterGrdWaiterMeta meta,
+										bool conditional)
 {
 	ClusterGrdEntry *entry = NULL;
 	ClusterGrdEntryResult lookup_result;
@@ -2491,6 +2712,8 @@ cluster_grd_entry_enqueue_or_grant_impl(const ClusterResId *resid, const Cluster
 	entry->waiters[slot].procno = holder->procno;
 	entry->waiters[slot].cluster_epoch = holder->cluster_epoch;
 	entry->waiters[slot].request_id = request_id;
+	entry->waiters[slot].waiter_xid = meta.xid;	   /* spec-5.8 D1c */
+	entry->waiters[slot].wait_seq = meta.wait_seq; /* spec-5.8 D1e */
 	entry->waiters[slot].shard_master_generation = shard_master_generation;
 	entry->waiters[slot].request_opcode = request_opcode;
 	entry->waiters[slot].mode = (LOCKMODE)lockmode;
@@ -2512,9 +2735,12 @@ cluster_grd_entry_enqueue_or_grant(const ClusterResId *resid, const ClusterGrdHo
 								   int lockmode, ClusterGrdConflictHolder *conflict_holders_out,
 								   int *n_conflict_out)
 {
-	return cluster_grd_entry_enqueue_or_grant_impl(
-		resid, holder, source_node_id, request_id, shard_master_generation, request_opcode,
-		lockmode, conflict_holders_out, n_conflict_out, /* conditional */ false);
+	/* spec-5.8 D1c/D1e — plain entry forwards with a zero waiter meta. */
+	ClusterGrdWaiterMeta meta = { InvalidTransactionId, 0 };
+
+	return cluster_grd_entry_enqueue_or_grant_meta(resid, holder, source_node_id, request_id, meta,
+												   shard_master_generation, request_opcode,
+												   lockmode, conflict_holders_out, n_conflict_out);
 }
 
 /*
@@ -2528,9 +2754,53 @@ cluster_grd_entry_grant_conditional(const ClusterResId *resid, const ClusterGrdH
 									int lockmode, ClusterGrdConflictHolder *conflict_holders_out,
 									int *n_conflict_out)
 {
-	return cluster_grd_entry_enqueue_or_grant_impl(
+	/* spec-5.8 D1c/D1e — plain entry forwards with a zero waiter meta. */
+	ClusterGrdWaiterMeta meta = { InvalidTransactionId, 0 };
+
+	return cluster_grd_entry_grant_conditional_meta(resid, holder, source_node_id, request_id, meta,
+													shard_master_generation, request_opcode,
+													lockmode, conflict_holders_out, n_conflict_out);
+}
+
+/*
+ * spec-5.8 D1c/D1e — waiter-metadata variants.  Stamp the enqueued waiter's
+ * xid + wait_seq onto its master-side WFG vertex (via enqueue_or_grant_impl)
+ * for TX-edge resolution + D5 ABA revalidate; the resync then (re)builds the
+ * WFG edges off the released lock.
+ */
+ClusterGrdGrantAction
+cluster_grd_entry_enqueue_or_grant_meta(const ClusterResId *resid, const ClusterGrdHolderId *holder,
+										int32 source_node_id, uint64 request_id,
+										ClusterGrdWaiterMeta meta, uint64 shard_master_generation,
+										uint32 request_opcode, int lockmode,
+										ClusterGrdConflictHolder *conflict_holders_out,
+										int *n_conflict_out)
+{
+	ClusterGrdGrantAction act = cluster_grd_entry_enqueue_or_grant_impl(
 		resid, holder, source_node_id, request_id, shard_master_generation, request_opcode,
-		lockmode, conflict_holders_out, n_conflict_out, /* conditional */ true);
+		lockmode, conflict_holders_out, n_conflict_out, meta, /* conditional */ false);
+
+	/* spec-5.8 D1b — register/refresh master-side WFG edges (lock released). */
+	grd_wfg_resync_entry(resid, NULL, 0);
+	return act;
+}
+
+ClusterGrdGrantAction
+cluster_grd_entry_grant_conditional_meta(const ClusterResId *resid,
+										 const ClusterGrdHolderId *holder, int32 source_node_id,
+										 uint64 request_id, ClusterGrdWaiterMeta meta,
+										 uint64 shard_master_generation, uint32 request_opcode,
+										 int lockmode,
+										 ClusterGrdConflictHolder *conflict_holders_out,
+										 int *n_conflict_out)
+{
+	ClusterGrdGrantAction act = cluster_grd_entry_enqueue_or_grant_impl(
+		resid, holder, source_node_id, request_id, shard_master_generation, request_opcode,
+		lockmode, conflict_holders_out, n_conflict_out, meta, /* conditional */ true);
+
+	/* spec-5.8 D1b — a NOWAIT grant may add a holder; refresh queued waiters. */
+	grd_wfg_resync_entry(resid, NULL, 0);
+	return act;
 }
 
 int
@@ -2654,6 +2924,8 @@ cluster_grd_entry_release_and_pop_compatible_waiter(const ClusterResId *resid,
 
 	SpinLockRelease(&entry->lock);
 	cluster_grd_entry_release(entry);
+	/* spec-5.8 D1b — popped waiters left the queue; refresh the rest. */
+	grd_wfg_resync_after_pops(resid, granted_out, popped);
 	return popped;
 }
 
@@ -3056,6 +3328,28 @@ cluster_grd_convert_or_enqueue(const ClusterResId *resid, int32 node_id, uint32 
 							   uint64 shard_master_generation,
 							   ClusterGrdConflictHolder *conflict_holders_out, int *n_conflict_out)
 {
+	/* spec-5.8 D1c/D1e — plain entry forwards with a zero waiter meta. */
+	ClusterGrdWaiterMeta meta = { InvalidTransactionId, 0 };
+
+	return cluster_grd_convert_or_enqueue_meta(
+		resid, node_id, procno, cluster_epoch, current_mode, requested_mode, convert_request_id,
+		source_node_id, shard_master_generation, meta, conflict_holders_out, n_conflict_out);
+}
+
+/*
+ * spec-5.8 D1c/D1e — waiter-metadata variant.  Stamps the converter's xid +
+ * wait_seq onto the pending convert (ClusterGrdConvert) so its master-side WFG
+ * convert-waiter vertex carries the real metadata.
+ */
+ClusterGrdConvertResult
+cluster_grd_convert_or_enqueue_meta(const ClusterResId *resid, int32 node_id, uint32 procno,
+									uint64 cluster_epoch, LOCKMODE current_mode,
+									LOCKMODE requested_mode, uint64 convert_request_id,
+									int32 source_node_id, uint64 shard_master_generation,
+									ClusterGrdWaiterMeta meta,
+									ClusterGrdConflictHolder *conflict_holders_out,
+									int *n_conflict_out)
+{
 	ClusterGrdEntry *entry = NULL;
 	ClusterGrdEntryResult lookup_result;
 	ClusterGrdConvert creq;
@@ -3083,6 +3377,8 @@ cluster_grd_convert_or_enqueue(const ClusterResId *resid, int32 node_id, uint32 
 	creq.convert_request_id = convert_request_id;
 	creq.shard_master_generation = shard_master_generation;
 	creq.request_opcode = GES_REQ_OPCODE_CONVERT;
+	creq.waiter_xid = meta.xid;	   /* spec-5.8 D1c */
+	creq.wait_seq = meta.wait_seq; /* spec-5.8 D1e */
 	creq.wait_start = 0;
 
 	SpinLockAcquire(&entry->lock);
@@ -3116,6 +3412,9 @@ cluster_grd_convert_or_enqueue(const ClusterResId *resid, int32 node_id, uint32 
 
 	SpinLockRelease(&entry->lock);
 	cluster_grd_entry_release(entry);
+	/* spec-5.8 D1b — enqueued convert registers its edges; in-place grant
+	 * changed a holder mode, so queued waiters are refreshed. */
+	grd_wfg_resync_entry(resid, NULL, 0);
 	return result;
 }
 
@@ -3183,6 +3482,8 @@ cluster_grd_convert_grant_by_backend(const ClusterResId *resid, int32 node_id, u
 	result = cluster_grd_entry_request_convert(entry, &creq, &drain_hint);
 	SpinLockRelease(&entry->lock);
 	cluster_grd_entry_release(entry);
+	/* spec-5.8 D1b — native-probe convert grant changed a holder mode. */
+	grd_wfg_resync_entry(resid, NULL, 0);
 	return result;
 }
 
@@ -3262,6 +3563,12 @@ cluster_grd_release_and_drain(const ClusterResId *resid, const ClusterGrdHolderI
 
 	SpinLockRelease(&entry->lock);
 	cluster_grd_entry_release(entry);
+
+	/* spec-5.8 D1b — granted waiters/converts departed; holders changed.
+	 * Runs BEFORE the spec-5.3 empty-entry reclaim below: resync re-looks-up
+	 * the entry by resid to refresh WFG edges, so it must see the entry before
+	 * the reclaim may HASH_REMOVE it. */
+	grd_wfg_resync_after_grants(resid, granted_out, n);
 
 	/*
 	 * PGRAC: spec-5.3 — reclaim the entry if this release left it completely
@@ -3356,6 +3663,9 @@ cluster_grd_rollback_convert(const ClusterResId *resid, int32 node_id, uint32 pr
 												old_request_id);
 	SpinLockRelease(&entry->lock);
 	cluster_grd_entry_release(entry);
+	/* spec-5.8 D1b — convert rolled back (holder mode restored / queued convert
+	 * cancelled); refresh queued waiters against the current holders. */
+	grd_wfg_resync_entry(resid, NULL, 0);
 	return result;
 }
 
@@ -3625,8 +3935,11 @@ cluster_grd_alloc_generation(void)
  *   naturally 等 canonical LockRelease/LockReleaseAll 自然路径 → LOCALLOCK
  *   refcount 0 → 7-step state machine release path 补发 GES_RELEASE.
  *
- *   D8 cluster_grd_cancel_handler — ProcessInterrupts hook for
- *   PROCSIG_CLUSTER_GES_CANCEL.  本 step skeleton — 真激活 Step 6.
+ *   spec-5.8 D8:  the PROCSIG_CLUSTER_GES_CANCEL pending flag
+ *   (cluster_ges_cancel_pending) is NOT handled from ProcessInterrupts — it
+ *   is owned by the caller-side lock-acquire check points (seven-step entry +
+ *   the GES wait loops), which observe it after CHECK_FOR_INTERRUPTS and turn
+ *   it into FAIL_DEADLOCK.  See cluster_grd_check_pending_interrupts.
  *
  *   D12 6 BAST nofail counter inc + read helpers.
  * ============================================================ */
@@ -3673,15 +3986,6 @@ cluster_grd_bast_handler(void)
 }
 
 void
-cluster_grd_cancel_handler(void)
-{
-	/* Checkpoint-safe placeholder.  The signal path is now correct
-	 * (signal handler → pending flag → ProcessInterrupts → here), but
-	 * wait-abort semantics are still owned by the caller-side activation
-	 * step.  Do not pretend to cancel a GRD wait from this skeleton. */
-}
-
-void
 cluster_grd_check_pending_interrupts(void)
 {
 	if (cluster_ges_bast_pending) {
@@ -3689,10 +3993,18 @@ cluster_grd_check_pending_interrupts(void)
 		cluster_grd_bast_handler();
 	}
 
-	if (cluster_ges_cancel_pending) {
-		cluster_ges_cancel_pending = false;
-		cluster_grd_cancel_handler();
-	}
+	/*
+	 * spec-5.8 D8 — deliberately do NOT consume cluster_ges_cancel_pending
+	 * here.  The deadlock-victim cancel flag is owned by the caller-side
+	 * lock-acquire check points: (a) cluster_lock_acquire_seven_step entry and
+	 * (b) the GES reply/convert wait loops in cluster_ges.c.  This function
+	 * runs from ProcessInterrupts on every CHECK_FOR_INTERRUPTS();  resetting
+	 * the flag here would eat it before the wait loop's post-sleep re-check
+	 * observes it, so the victim would sleep through its own cancellation and
+	 * never break out (the deadlock would only "resolve" via the request
+	 * timeout backstop).  The flag must survive CFI and reach the wait loop
+	 * that turns it into FAIL_DEADLOCK -> 40P01.
+	 */
 
 	/* spec-4.6 D3 — cooperative holder rebind.  Clear-then-work (a new
 	 * broadcast re-arms the flag);  the walker is no-throw and acks the
@@ -4220,6 +4532,8 @@ cluster_grd_release_holder_by_id(const ClusterResId *resid, const ClusterGrdHold
 	SpinLockAcquire(&entry->lock);
 	er = cluster_grd_entry_release_holder(entry, holder);
 	SpinLockRelease(&entry->lock);
+	/* spec-5.8 D1b — holder removed; refresh queued waiters' edges. */
+	grd_wfg_resync_entry(resid, NULL, 0);
 	return er;
 }
 
@@ -4279,5 +4593,7 @@ cluster_grd_cancel_waiter_by_id(const ClusterResId *resid, const ClusterGrdHolde
 	}
 	SpinLockRelease(&entry->lock);
 	cluster_grd_entry_release(entry);
+	/* spec-5.8 D1b — the cancelled waiter left the queue; remove its edges. */
+	grd_wfg_resync_entry(resid, holder, 1);
 	return er;
 }

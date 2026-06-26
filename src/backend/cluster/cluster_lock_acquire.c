@@ -56,6 +56,7 @@
 #include "cluster/cluster_ir.h" /* spec-5.7 D8 — CLUSTER_IR_RESID_TYPE (freeze-gate bypass belt) */
 #include "cluster/cluster_inject.h" /* spec-4.6 L11/L14 — redeclare-skip probe */
 #include "cluster/cluster_lmd.h"
+#include "cluster/cluster_lmd_wait_state.h" /* spec-5.8 D1d — per-proc wait-state */
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_native_lock_probe.h"
@@ -307,14 +308,43 @@ cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req
 	 * immediately (no waiter enqueued, no BAST).  Blocking acquires take the
 	 * enqueue-and-wait path.  Both use the real wire since spec-2.23/2.27.
 	 */
-	if (dontwait)
+	if (dontwait) {
+		/* NOWAIT never enqueues a waiter (immediate grant-or-reject) — it
+		 * cannot participate in a deadlock, so no wait-state is published. */
 		reject = cluster_ges_send_request_nowait_and_wait(&req->resid, (uint32)req->lockmode,
 														  &req->holder, req->request_id,
 														  req->timeout_ms, req->wait_event);
-	else
-		reject
-			= cluster_ges_send_request_and_wait(&req->resid, (uint32)req->lockmode, &req->holder,
-												req->request_id, req->timeout_ms, req->wait_event);
+	} else {
+		/*
+		 * spec-5.8 D1d — publish the cluster wait-state around the blocking
+		 * GES wait so the LMD resolver can confirm this backend is still
+		 * waiting before cancelling it as a deadlock victim.  The PG_TRY
+		 * clears it on the cancel/ERROR longjmp;  the trailing clear covers
+		 * grant / reject / timeout.  request_id + epoch match the master-side
+		 * waiter edge (spec-5.8 D1b/D1e).
+		 */
+		ClusterLmdProcWaitState *ws = (MyProc != NULL) ? &MyProc->cluster_lmd_wait : NULL;
+
+		if (ws != NULL)
+			(void)cluster_lmd_wait_state_publish(ws, CLUSTER_LMD_WAIT_GES, req->request_id,
+												 cluster_epoch_get_current(),
+												 GetTopTransactionIdIfAny());
+		PG_TRY();
+		{
+			reject = cluster_ges_send_request_and_wait(&req->resid, (uint32)req->lockmode,
+													   &req->holder, req->request_id,
+													   req->timeout_ms, req->wait_event);
+		}
+		PG_CATCH();
+		{
+			if (ws != NULL)
+				cluster_lmd_wait_state_clear(ws);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		if (ws != NULL)
+			cluster_lmd_wait_state_clear(ws);
+	}
 	if (reject == GES_REJECT_REASON_NONE) {
 		if (dontwait && is_advisory)
 			cluster_advisory_counter_inc(CLUSTER_ADVISORY_TRY_GRANT);
@@ -380,6 +410,11 @@ cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req
 		 * deferred to the CF/PCM block layer).  Not retryable — surfaces as
 		 * ERRCODE_FEATURE_NOT_SUPPORTED (0A000). */
 		return CLUSTER_LOCK_ACQUIRE_FAIL_FEATURE_NOT_SUPPORTED;
+	case GES_REJECT_REASON_DEADLOCK_VICTIM:
+		/* spec-5.8 D8 — the LMD coordinator cancelled this backend as a
+		 * confirmed cross-node deadlock victim while it blocked in the GES
+		 * wait.  Fail closed as a deadlock → lock.c ereports 40P01. */
+		return CLUSTER_LOCK_ACQUIRE_FAIL_DEADLOCK;
 	case GES_REJECT_REASON_NONE:
 	default:
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
@@ -412,10 +447,31 @@ static ClusterLockAcquireResult
 cluster_lock_acquire_s5_convert(const ClusterLockAcquireRequest *req)
 {
 	uint32 reject;
+	/* spec-5.8 D1d — a cross-node CONVERT (S->X upgrade) blocks and can
+	 * deadlock; publish/clear the wait-state around it like the S4 request
+	 * wait so the resolver can revalidate the victim. */
+	ClusterLmdProcWaitState *ws = (MyProc != NULL) ? &MyProc->cluster_lmd_wait : NULL;
 
-	reject = cluster_ges_send_convert_and_wait(&req->resid, (uint32)req->lockmode,
-											   (uint32)req->current_mode, &req->holder,
-											   req->request_id, /* timeout = GUC default */ 0);
+	if (ws != NULL)
+		(void)cluster_lmd_wait_state_publish(ws, CLUSTER_LMD_WAIT_GES, req->request_id,
+											 cluster_epoch_get_current(),
+											 GetTopTransactionIdIfAny());
+	PG_TRY();
+	{
+		reject = cluster_ges_send_convert_and_wait(&req->resid, (uint32)req->lockmode,
+												   (uint32)req->current_mode, &req->holder,
+												   req->request_id, /* timeout = GUC default */ 0);
+	}
+	PG_CATCH();
+	{
+		if (ws != NULL)
+			cluster_lmd_wait_state_clear(ws);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (ws != NULL)
+		cluster_lmd_wait_state_clear(ws);
+
 	if (reject == GES_REJECT_REASON_NONE) {
 		pg_atomic_fetch_add_u64(&stub_s5_promote_count, 1);
 		return CLUSTER_LOCK_ACQUIRE_OK_CONVERTED;
@@ -428,6 +484,9 @@ cluster_lock_acquire_s5_convert(const ClusterLockAcquireRequest *req)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_SHARD_REMASTERING;
 	case GES_REJECT_REASON_EPOCH_MISMATCH:
 		return CLUSTER_LOCK_ACQUIRE_FAIL_STALE_GENERATION;
+	case GES_REJECT_REASON_DEADLOCK_VICTIM:
+		/* spec-5.8 D8 — converter cancelled as a cross-node deadlock victim. */
+		return CLUSTER_LOCK_ACQUIRE_FAIL_DEADLOCK;
 	case GES_REJECT_REASON_TIMEOUT:
 	case GES_REJECT_REASON_WORK_QUEUE_FULL:
 	default:

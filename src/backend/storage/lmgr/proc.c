@@ -287,6 +287,10 @@ InitProcGlobal(void)
 		pg_atomic_init_u64(&(proc->cluster_grd_redeclare_acked), 0);
 		pg_atomic_init_u64(&(proc->cluster_grd_redeclare_acked_epoch), 0);
 		pg_atomic_init_u32(&(proc->cluster_grd_registered_count), 0);
+#ifdef USE_PGRAC_CLUSTER
+		/* PGRAC: spec-5.8 D1d — per-proc cluster wait-state record. */
+		cluster_lmd_wait_state_init(&(proc->cluster_lmd_wait));
+#endif
 	}
 
 	/*
@@ -499,6 +503,10 @@ InitProcess(void)
 		pg_atomic_write_u64(&MyProc->cluster_grd_redeclare_acked_epoch,
 							cluster_grd_redeclare_episode_epoch());
 		pg_atomic_write_u32(&MyProc->cluster_grd_registered_count, 0);
+		/* spec-5.8 D1d — clear any wait-state left active by a predecessor
+		 * that reused this proc slot;  wait_seq is preserved (monotonic ABA
+		 * guard), so a stale victim tuple can never re-match. */
+		cluster_lmd_wait_state_reset(&MyProc->cluster_lmd_wait);
 	}
 #endif
 }

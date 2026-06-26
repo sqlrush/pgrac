@@ -42,6 +42,8 @@
  */
 #include "postgres.h"
 
+#include "access/transam.h"
+#include "cluster/cluster_conf.h" /* CLUSTER_MAX_NODES (D4 member admission) */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_shmem.h"
@@ -57,14 +59,34 @@
  * HTAB key — full vertex identity.  Sort metadata is deliberately excluded.
  * ============================================================ */
 
-typedef struct LmdEdgeKey {
+/*
+ * spec-5.8 D1a — multi-edge key.  spec-2.22 keyed the graph on the waiter
+ * 4-tuple alone, so a waiter blocked by several holders kept only the last
+ * edge written (overwrite at HASH_FIND below).  Once master-side edge
+ * authority (spec-5.8 D1b) registers a waiter against every conflicting
+ * holder, that overwrite would drop the very edges a cross-node cycle is
+ * built from.  The key is widened to (waiter 4-tuple, blocker 4-tuple) so
+ * each (waiter, blocker) pair is a distinct entry, and remove-by-waiter
+ * deletes every blocker edge of a waiter.  The Tarjan layer already builds
+ * a multi-out-edge adjacency list (cluster_lmd_tarjan.c), so no consumer
+ * change is required.
+ */
+typedef struct LmdVertexKey {
 	int32 node_id;
 	uint32 procno;
 	uint64 cluster_epoch;
 	uint64 request_id;
+} LmdVertexKey;
+
+StaticAssertDecl(sizeof(LmdVertexKey) == 24, "LmdVertexKey identity 4-tuple 24-byte lock");
+
+typedef struct LmdEdgeKey {
+	LmdVertexKey waiter;
+	LmdVertexKey blocker;
 } LmdEdgeKey;
 
-StaticAssertDecl(sizeof(LmdEdgeKey) == 24, "LmdEdgeKey HTAB key ABI 24-byte lock");
+StaticAssertDecl(sizeof(LmdEdgeKey) == 48,
+				 "LmdEdgeKey HTAB key ABI 48-byte lock (waiter+blocker 4-tuples, spec-5.8 D1a)");
 
 typedef struct LmdEdgeEntry {
 	LmdEdgeKey key; /* HTAB key — must be first field */
@@ -98,7 +120,11 @@ typedef struct ClusterLmdGraphShared {
 	pg_atomic_uint64 cleanup_on_backend_exit_count;
 	pg_atomic_uint64 cleanup_lmd_sweep_count;
 	pg_atomic_uint64 cleanup_skip_other_owner_count;
-	int max_edges; /* snapshot of cluster.lmd_max_wait_edges at init */
+	/* spec-5.8 D6 counters — coordinator two-round confirm + reconfig gate. */
+	pg_atomic_uint64 deadlock_confirmed_count;	/* two-round confirm succeeded */
+	pg_atomic_uint64 confirm_unconfirmed_count; /* round-1 cycle NOT confirmed by round 2 */
+	pg_atomic_uint64 reconfig_discard_count;	/* confirm spanned a reconfig (D4b) */
+	int max_edges;								/* snapshot of cluster.lmd_max_wait_edges at init */
 } ClusterLmdGraphShared;
 
 static ClusterLmdGraphShared *cluster_lmd_graph_state = NULL;
@@ -109,7 +135,10 @@ static HTAB *cluster_lmd_graph_htab = NULL;
  * Forward declarations.
  * ============================================================ */
 
-static void make_key(const ClusterLmdVertex *waiter, LmdEdgeKey *out);
+static void fill_vertex_key(const ClusterLmdVertex *v, LmdVertexKey *out);
+static void make_key(const ClusterLmdVertex *waiter, const ClusterLmdVertex *blocker,
+					 LmdEdgeKey *out);
+static bool key_waiter_matches(const LmdEdgeKey *key, const ClusterLmdVertex *waiter);
 
 
 /* ============================================================
@@ -167,6 +196,10 @@ cluster_lmd_graph_shmem_init(void)
 		pg_atomic_init_u64(&cluster_lmd_graph_state->cleanup_on_backend_exit_count, 0);
 		pg_atomic_init_u64(&cluster_lmd_graph_state->cleanup_lmd_sweep_count, 0);
 		pg_atomic_init_u64(&cluster_lmd_graph_state->cleanup_skip_other_owner_count, 0);
+		/* spec-5.8 D6 init. */
+		pg_atomic_init_u64(&cluster_lmd_graph_state->deadlock_confirmed_count, 0);
+		pg_atomic_init_u64(&cluster_lmd_graph_state->confirm_unconfirmed_count, 0);
+		pg_atomic_init_u64(&cluster_lmd_graph_state->reconfig_discard_count, 0);
 		cluster_lmd_graph_state->max_edges = max_edges;
 	}
 
@@ -183,13 +216,29 @@ cluster_lmd_graph_shmem_init(void)
  * ============================================================ */
 
 static void
-make_key(const ClusterLmdVertex *v, LmdEdgeKey *out)
+fill_vertex_key(const ClusterLmdVertex *v, LmdVertexKey *out)
 {
-	memset(out, 0, sizeof(*out)); /* clear padding for HTAB binary compare */
 	out->node_id = v->node_id;
 	out->procno = v->procno;
 	out->cluster_epoch = v->cluster_epoch;
 	out->request_id = v->request_id;
+}
+
+static void
+make_key(const ClusterLmdVertex *waiter, const ClusterLmdVertex *blocker, LmdEdgeKey *out)
+{
+	memset(out, 0, sizeof(*out)); /* clear padding for HTAB binary compare */
+	fill_vertex_key(waiter, &out->waiter);
+	fill_vertex_key(blocker, &out->blocker);
+}
+
+/* True iff the key's waiter half equals the given vertex's 4-tuple identity. */
+static bool
+key_waiter_matches(const LmdEdgeKey *key, const ClusterLmdVertex *waiter)
+{
+	return key->waiter.node_id == waiter->node_id && key->waiter.procno == waiter->procno
+		   && key->waiter.cluster_epoch == waiter->cluster_epoch
+		   && key->waiter.request_id == waiter->request_id;
 }
 
 bool
@@ -211,7 +260,7 @@ cluster_lmd_graph_add_edge(const ClusterLmdWaitEdge *edge)
 		&& edge->waiter.request_id == edge->blocker.request_id)
 		return false;
 
-	make_key(&edge->waiter, &key);
+	make_key(&edge->waiter, &edge->blocker, &key);
 
 	LWLockAcquire(&cluster_lmd_graph_state->lwlock, LW_EXCLUSIVE);
 
@@ -249,41 +298,96 @@ cluster_lmd_graph_add_edge(const ClusterLmdWaitEdge *edge)
 bool
 cluster_lmd_graph_has_waiter(const ClusterLmdVertex *waiter)
 {
-	LmdEdgeKey key;
-	LmdEdgeEntry *entry;
+	HASH_SEQ_STATUS scan;
+	LmdEdgeEntry *e;
+	bool found = false;
 
 	Assert(waiter != NULL);
 	if (cluster_lmd_graph_state == NULL || cluster_lmd_graph_htab == NULL)
 		return false;
 
-	make_key(waiter, &key);
-
+	/*
+	 * spec-5.8 D1a — multi-edge: a waiter may have many blocker edges, and
+	 * the key now includes the blocker, so a single keyed probe cannot
+	 * answer "is this waiter present" without a blocker.  Scan for any edge
+	 * whose waiter half matches.  Only the legacy spec-2.24 resolver uses
+	 * this;  spec-5.8 D5 replaces it with per-proc wait-state revalidation.
+	 */
 	LWLockAcquire(&cluster_lmd_graph_state->lwlock, LW_SHARED);
-	entry = (LmdEdgeEntry *)hash_search(cluster_lmd_graph_htab, &key, HASH_FIND, NULL);
+	hash_seq_init(&scan, cluster_lmd_graph_htab);
+	while ((e = (LmdEdgeEntry *)hash_seq_search(&scan)) != NULL) {
+		if (key_waiter_matches(&e->key, waiter)) {
+			found = true;
+			hash_seq_term(&scan);
+			break;
+		}
+	}
 	LWLockRelease(&cluster_lmd_graph_state->lwlock);
-	return entry != NULL;
+	return found;
 }
+
+/*
+ * spec-5.8 D1a — remove every blocker edge of a waiter.
+ *
+ *	Multi-edge keys include the blocker, so a single keyed HASH_REMOVE no
+ *	longer removes all of a waiter's edges.  Collect the matching full keys
+ *	in a bounded batch, then HASH_REMOVE each — the removes run after the
+ *	scan ends, never deleting during an active hash_seq_search (dynahash
+ *	only sanctions deleting the just-returned element, and a collect-then-
+ *	remove is robust against either rule and against the standalone fake
+ *	HTAB).  A waiter is blocked by at most the holders of one resource, so
+ *	the batch normally drains in one pass;  the outer loop is defensive for
+ *	the generic graph.  Held EXCLUSIVE across the whole operation so a
+ *	waiter's edges are removed atomically.
+ */
+#define LMD_REMOVE_BATCH 32
 
 bool
 cluster_lmd_graph_remove_edge_by_waiter(const ClusterLmdVertex *waiter)
 {
-	LmdEdgeKey key;
-	bool found;
+	bool removed_any = false;
 
 	Assert(waiter != NULL);
 	if (cluster_lmd_graph_state == NULL || cluster_lmd_graph_htab == NULL)
 		return false;
 
-	make_key(waiter, &key);
-
 	LWLockAcquire(&cluster_lmd_graph_state->lwlock, LW_EXCLUSIVE);
-	(void)hash_search(cluster_lmd_graph_htab, &key, HASH_REMOVE, &found);
-	if (found) {
-		pg_atomic_fetch_sub_u64(&cluster_lmd_graph_state->edge_count, 1);
-		pg_atomic_fetch_add_u64(&cluster_lmd_graph_state->generation, 1);
+	for (;;) {
+		HASH_SEQ_STATUS scan;
+		LmdEdgeEntry *e;
+		LmdEdgeKey batch[LMD_REMOVE_BATCH];
+		int nbatch = 0;
+		bool more = false;
+		int i;
+
+		hash_seq_init(&scan, cluster_lmd_graph_htab);
+		while ((e = (LmdEdgeEntry *)hash_seq_search(&scan)) != NULL) {
+			if (!key_waiter_matches(&e->key, waiter))
+				continue;
+			if (nbatch == LMD_REMOVE_BATCH) {
+				more = true; /* more matches remain for a later pass */
+				hash_seq_term(&scan);
+				break;
+			}
+			batch[nbatch++] = e->key;
+		}
+
+		for (i = 0; i < nbatch; i++) {
+			bool found;
+
+			(void)hash_search(cluster_lmd_graph_htab, &batch[i], HASH_REMOVE, &found);
+			if (found) {
+				pg_atomic_fetch_sub_u64(&cluster_lmd_graph_state->edge_count, 1);
+				pg_atomic_fetch_add_u64(&cluster_lmd_graph_state->generation, 1);
+				removed_any = true;
+			}
+		}
+
+		if (!more)
+			break;
 	}
 	LWLockRelease(&cluster_lmd_graph_state->lwlock);
-	return found;
+	return removed_any;
 }
 
 int
@@ -484,6 +588,10 @@ DEFINE_GET_INC(cross_node_cancel_queue_full_count)
 DEFINE_GET_INC(cleanup_on_backend_exit_count)
 DEFINE_GET_INC(cleanup_lmd_sweep_count)
 DEFINE_GET_INC(cleanup_skip_other_owner_count)
+/* spec-5.8 D6. */
+DEFINE_GET_INC(deadlock_confirmed_count)
+DEFINE_GET_INC(confirm_unconfirmed_count)
+DEFINE_GET_INC(reconfig_discard_count)
 
 #undef DEFINE_GET_INC
 
@@ -515,6 +623,106 @@ cluster_lmd_cancel_wait_edge_real(const ClusterLmdVertex *waiter)
 	if (waiter == NULL)
 		return;
 	(void)cluster_lmd_graph_remove_edge_by_waiter(waiter);
+}
+
+/*
+ * spec-5.8 D2 (T2) — resolve cross-node TX holder placeholders in place.
+ *
+ *	A cross-node TX (row-lock) wait edge is registered knowing the holder
+ *	only by its transaction identity (origin node + xid, taken from the TT
+ *	status key);  the holder backend's procno is never on the wire, so the
+ *	blocker vertex is stamped with CLUSTER_LMD_TX_HOLDER_PROCNO and the
+ *	holder's xid.  The coordinator union holds every node's waiter vertices,
+ *	each carrying its real identity 4-tuple and its (node, xid).  This pass
+ *	rewrites each placeholder blocker to the full identity of the waiter
+ *	vertex that owns the same (node, valid xid) — i.e. the holder transaction
+ *	is itself a waiter elsewhere — so the dedup in scan_snapshot unifies the
+ *	blocker with that waiter and Tarjan can close the cross-node cycle.
+ *
+ *	Rule 8.A — never fabricate an edge:
+ *	  - A placeholder is rewritten ONLY on an exact (node match + equal valid
+ *	    xid) against a real waiter vertex (procno != sentinel).  xid is unique
+ *	    only within a node, so the node must match;  an Invalid xid is never a
+ *	    match (TransactionIdEquals would otherwise treat Invalid == Invalid).
+ *	  - An unmatched placeholder is left untouched.  It is a pure sink — only
+ *	    ever a blocker, never a waiter — so it has no out-edge and can never
+ *	    sit on a cycle.  find_vertex_index ignores xid, so two unresolved
+ *	    placeholders on the same (node, epoch) may merge into one sink, but a
+ *	    sink cannot create a false cycle;  and the sentinel procno can never
+ *	    equal a real backend procno (< MaxBackends), so a placeholder never
+ *	    merges with a real vertex.
+ *	A missed resolution only loses a detection (a finite timeout backstops);
+ *	it never invents one.
+ */
+void
+cluster_lmd_resolve_tx_placeholders(ClusterLmdWaitEdge *edges, int nedges)
+{
+	int e;
+
+	if (edges == NULL || nedges <= 0)
+		return;
+
+	for (e = 0; e < nedges; e++) {
+		ClusterLmdVertex *blocker = &edges[e].blocker;
+		int w;
+
+		if (blocker->procno != CLUSTER_LMD_TX_HOLDER_PROCNO)
+			continue; /* not a TX placeholder — a real GES/master edge */
+		if (!TransactionIdIsValid(blocker->xid))
+			continue; /* no holder xid to resolve against (8.A) */
+
+		/* Find the real waiter vertex that IS this holder transaction. */
+		for (w = 0; w < nedges; w++) {
+			const ClusterLmdVertex *cand = &edges[w].waiter;
+
+			if (cand->procno == CLUSTER_LMD_TX_HOLDER_PROCNO)
+				continue; /* a placeholder is never a real waiter */
+			if (cand->node_id == blocker->node_id && TransactionIdEquals(cand->xid, blocker->xid)) {
+				/* Rewrite to the full waiter identity so the vertex dedup in
+				 * scan_snapshot unifies this blocker with that waiter. */
+				*blocker = *cand;
+				break;
+			}
+		}
+	}
+}
+
+/*
+ * spec-5.8 D4 — coordinator REPORT-collector member admission (pure).
+ *
+ *	Returns ADMIT only when node_id is in the expected (probed) set AND has not
+ *	already reported (received bit clear).  An out-of-range id or an id outside
+ *	the expected set is DROP_UNEXPECTED;  an already-received id is
+ *	DROP_DUPLICATE.  Bitmaps are uint64 lo/hi pairs over node_id 0..127.  This
+ *	is the Rule 8.A guard against a duplicate REPORT inflating n_received and
+ *	masking a genuinely missing node.
+ */
+ClusterLmdProbeAdmit
+cluster_lmd_probe_member_admit(uint64 expected_lo, uint64 expected_hi, uint64 received_lo,
+							   uint64 received_hi, int32 node_id)
+{
+	uint64 bit;
+	uint64 expected_word;
+	uint64 received_word;
+
+	if (node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return CLUSTER_LMD_PROBE_DROP_UNEXPECTED;
+
+	if (node_id < 64) {
+		bit = UINT64CONST(1) << node_id;
+		expected_word = expected_lo;
+		received_word = received_lo;
+	} else {
+		bit = UINT64CONST(1) << (node_id - 64);
+		expected_word = expected_hi;
+		received_word = received_hi;
+	}
+
+	if (!(expected_word & bit))
+		return CLUSTER_LMD_PROBE_DROP_UNEXPECTED;
+	if (received_word & bit)
+		return CLUSTER_LMD_PROBE_DROP_DUPLICATE;
+	return CLUSTER_LMD_PROBE_ADMIT;
 }
 
 /* D16 — test-only injection. */

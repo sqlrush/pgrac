@@ -115,8 +115,10 @@ OBJS = \
 	cluster_native_lock_probe.o \
 	cluster_lmd.o \
 	cluster_lmd_graph.o \
+	cluster_lmd_probe_collector.o \
 	cluster_lmd_srf.o \
 	cluster_lmd_tarjan.o \
+	cluster_lmd_wait_state.o \
 	cluster_lmon.o \
 	cluster_lms.o \
 	cluster_pcm_lock.o \

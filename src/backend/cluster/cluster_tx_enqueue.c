@@ -37,6 +37,7 @@
  */
 #include "postgres.h"
 
+#include "access/xact.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/ipc.h"
@@ -47,7 +48,10 @@
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_lmd.h"
+#include "cluster/cluster_lmd_wait_state.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_tx_enqueue.h"
@@ -190,6 +194,8 @@ cluster_tx_enqueue_wait(const ClusterTTStatusKey *holder_key, int effective_time
 	int procno;
 	TimestampTz deadline;
 	ClusterTxwResult result = CLUSTER_TXW_TIMEOUT;
+	ClusterLmdVertex tx_wfg_waiter;
+	bool tx_wfg_registered = false;
 
 	Assert(holder_key != NULL);
 
@@ -214,6 +220,48 @@ cluster_tx_enqueue_wait(const ClusterTTStatusKey *holder_key, int effective_time
 	deadline = GetCurrentTimestamp() + (TimestampTz)effective_timeout_ms * 1000;
 
 	txw_slot_set(procno, holder_key);
+
+	/*
+	 * spec-5.8 D1d — publish the cluster wait-state so the LMD deadlock
+	 * resolver can revalidate this backend is still genuinely waiting before
+	 * it cancels it as a victim.  A TX wait carries no GES request id; the
+	 * monotonic wait_seq plus procno + waiter xid identify the wait.
+	 *
+	 * spec-5.8 D2 (T1) — register a wait-for edge for the global deadlock
+	 * detector.  The holder is known only by its transaction (origin node +
+	 * xid from the TT status key); its backend procno is not carried, so the
+	 * blocker is a placeholder (CLUSTER_LMD_TX_HOLDER_PROCNO) that the
+	 * coordinator resolves by (node, xid) against the holder's own waiter
+	 * vertex (T2).  Best-effort: a full edge table only loses a detection (the
+	 * finite timeout backstops), so it never fails the wait (Rule 8.A).
+	 */
+	{
+		uint64 wait_epoch = cluster_epoch_get_current();
+		TransactionId my_xid = GetTopTransactionIdIfAny();
+		uint64 wait_seq;
+		ClusterLmdVertex blocker;
+
+		wait_seq = cluster_lmd_wait_state_publish(&MyProc->cluster_lmd_wait, CLUSTER_LMD_WAIT_TX, 0,
+												  wait_epoch, my_xid);
+
+		memset(&tx_wfg_waiter, 0, sizeof(tx_wfg_waiter));
+		tx_wfg_waiter.node_id = cluster_node_id;
+		tx_wfg_waiter.procno = (uint32)procno;
+		tx_wfg_waiter.cluster_epoch = wait_epoch;
+		tx_wfg_waiter.request_id = 0;
+		tx_wfg_waiter.xid = my_xid;
+		tx_wfg_waiter.wait_seq = wait_seq;
+
+		memset(&blocker, 0, sizeof(blocker));
+		blocker.node_id = holder_key->origin_node_id;
+		blocker.procno = CLUSTER_LMD_TX_HOLDER_PROCNO;
+		blocker.cluster_epoch = holder_key->cluster_epoch;
+		blocker.request_id = 0;
+		blocker.xid = holder_key->local_xid;
+
+		(void)cluster_lmd_submit_wait_edge_real(&tx_wfg_waiter, &blocker, 0);
+		tx_wfg_registered = true;
+	}
 
 	/*
 	 * The loop calls CHECK_FOR_INTERRUPTS() (query cancel / SIGTERM) and other
@@ -260,11 +308,17 @@ cluster_tx_enqueue_wait(const ClusterTTStatusKey *holder_key, int effective_time
 	PG_CATCH();
 	{
 		txw_slot_clear(procno);
+		cluster_lmd_wait_state_clear(&MyProc->cluster_lmd_wait);
+		if (tx_wfg_registered)
+			cluster_lmd_cancel_wait_edge_real(&tx_wfg_waiter);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 
 	txw_slot_clear(procno);
+	cluster_lmd_wait_state_clear(&MyProc->cluster_lmd_wait);
+	if (tx_wfg_registered)
+		cluster_lmd_cancel_wait_edge_real(&tx_wfg_waiter);
 	return result;
 }
 

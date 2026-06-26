@@ -88,8 +88,9 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_sequence.h" /* cluster_sq_* counters (spec-5.4 D9) */
 #include "cluster/cluster_advisory.h" /* cluster_advisory_* counters (spec-5.5 D8) */
 #include "cluster/cluster_lmd.h"	  /* cluster_lmd_* observability accessors (spec-2.19 D10) */
-#include "cluster/cluster_lms.h"	  /* cluster_lms_* observability accessors (spec-2.18 D10) */
-#include "cluster/cluster_tt_slot.h"  /* spec-3.12 D5 retention counters */
+#include "cluster/cluster_lmd_probe_collector.h" /* spec-5.8 D8 — probe collector counters */
+#include "cluster/cluster_lms.h"	 /* cluster_lms_* observability accessors (spec-2.18 D10) */
+#include "cluster/cluster_tt_slot.h" /* spec-3.12 D5 retention counters */
 #include "cluster/cluster_undo_record_api.h"  /* cluster_undo_* counter accessors (spec-3.7 D10) */
 #include "cluster/storage/cluster_undo_buf.h" /* spec-3.18 D7: undo buffer counters */
 #include "cluster/cluster_cr.h"				  /* cluster_cr_* counter accessors (spec-3.9 D8) */
@@ -1028,12 +1029,12 @@ dump_lms(ReturnSetInfo *rsinfo)
 /*
  * dump_lmd -- spec-2.19 Sprint A Step 4 D10.
  *
- *	Emits 16 rows under category='lmd' (spec-2.19 daemon state/counters +
- *	spec-2.22 graph/Tarjan counters)
- *	corresponding to the LMD skeleton observability surface (HC2 4-state
- *	semantic split via state column + 6 counters per §0 Q8;
- *	add_edge / remove_edge / cycle_detected / victim_selected 分项 counter
- *	推 spec-2.20+ 真激活 Tarjan).
+ *	Emits 32 rows under category='lmd' (spec-2.19 daemon state/counters +
+ *	spec-2.22 graph/Tarjan + spec-2.23 probe + spec-2.24 cancel/cleanup +
+ *	spec-5.8 D6 two-round-confirm/reconfig-gate + spec-5.8 D8 shmem
+ *	REPORT-collector counters)
+ *	corresponding to the LMD observability surface (HC2 4-state
+ *	semantic split via state column + 6 counters per §0 Q8).
  *
  *	**L122 alphabetic order**:'lmd' sorts BEFORE 'lmon' in
  *	pg_cluster_state ORDER BY category(ASCII `d` 0x64 < `o` 0x6F).
@@ -1088,6 +1089,24 @@ dump_lmd(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_lmd_cross_node_cancel_received_count_get()));
 	emit_row(rsinfo, "lmd", "cross_node_victim_cancel_sent_count",
 			 fmt_int64((int64)cluster_lmd_cross_node_victim_cancel_sent_count_get()));
+	/* spec-5.8 D6 — 3 NEW coordinator two-round confirm + reconfig-gate counters. */
+	emit_row(rsinfo, "lmd", "deadlock_confirmed_count",
+			 fmt_int64((int64)cluster_lmd_deadlock_confirmed_count_get()));
+	emit_row(rsinfo, "lmd", "confirm_unconfirmed_count",
+			 fmt_int64((int64)cluster_lmd_confirm_unconfirmed_count_get()));
+	emit_row(rsinfo, "lmd", "reconfig_discard_count",
+			 fmt_int64((int64)cluster_lmd_reconfig_discard_count_get()));
+	/* spec-5.8 D8 — 5 NEW shmem REPORT-collector counters (LMON->LMD hand-off). */
+	emit_row(rsinfo, "lmd", "probe_report_enqueue_count",
+			 fmt_int64((int64)cluster_lmd_probe_report_enqueue_count_get()));
+	emit_row(rsinfo, "lmd", "probe_drop_stale_count",
+			 fmt_int64((int64)cluster_lmd_probe_drop_stale_count_get()));
+	emit_row(rsinfo, "lmd", "probe_drop_duplicate_count",
+			 fmt_int64((int64)cluster_lmd_probe_drop_duplicate_count_get()));
+	emit_row(rsinfo, "lmd", "probe_queue_full_count",
+			 fmt_int64((int64)cluster_lmd_probe_queue_full_count_get()));
+	emit_row(rsinfo, "lmd", "probe_partial_report_count",
+			 fmt_int64((int64)cluster_lmd_probe_partial_report_count_get()));
 }
 
 

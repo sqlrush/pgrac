@@ -48,12 +48,15 @@
 #include "postgres.h"
 
 #include <signal.h>
+#include <stdlib.h> /* spec-5.8 D8 — malloc/free for the palloc/pfree stubs */
 #include <string.h>
 
+#include "access/transam.h" /* spec-5.8 D1c — InvalidTransactionId for the GetTopTransactionIdIfAny stub */
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_grd_work_queue.h"
+#include "cluster/cluster_ic.h" /* spec-5.8 D8 — ClusterICSendResult for the send-envelope stub */
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_cssd.h"		 /* spec-5.7 Direction B stub — peer state */
 #include "cluster/cluster_extend_gate.h" /* spec-5.7 Direction B stub — sole-native */
@@ -270,6 +273,14 @@ cluster_grd_shard_phase(uint32 shard_id pg_attribute_unused())
 	return GRD_SHARD_NORMAL;
 }
 
+/* spec-5.8 D1c stub:  cluster_ges.c REQUEST/CONVERT send fills the wire
+ * waiter_xid from the backend's xid; the standalone fixture has no xact. */
+TransactionId
+GetTopTransactionIdIfAny(void)
+{
+	return InvalidTransactionId;
+}
+
 /* spec-4.6 P0#3 stub:  REDECLARE_DONE handler records peer barrier
  * completion.  Standalone fixture has no recovery shmem; no-op. */
 void
@@ -445,6 +456,33 @@ cluster_grd_outbound_enqueue_backend_request(uint32 d pg_attribute_unused(),
 	return true;
 }
 
+/* spec-5.8 D8 — REPORT send-back deps newly referenced by cluster_ges.o.  The
+ * standalone harness does not exercise the deadlock probe path (TAP 109 / the
+ * 2-node TAP do); these only resolve at link time. */
+int cluster_lmd_max_wait_edges = 1024;
+
+/* spec-5.8 D8 — victim cancel flag referenced by the GES wait loops. */
+volatile sig_atomic_t cluster_ges_cancel_pending = false;
+
+ClusterICSendResult
+cluster_ic_send_envelope(uint8 mt pg_attribute_unused(), int32 dest pg_attribute_unused(),
+						 const void *p pg_attribute_unused(), uint32 len pg_attribute_unused())
+{
+	return CLUSTER_IC_SEND_DONE;
+}
+
+void *
+palloc(Size sz)
+{
+	return malloc(sz);
+}
+
+void
+pfree(void *p)
+{
+	free(p);
+}
+
 /* spec-2.24 D14 stub audit. */
 void
 cluster_grd_outbound_enqueue_lmd_cancel(uint32 d pg_attribute_unused(),
@@ -593,6 +631,21 @@ cluster_grd_convert_or_enqueue(
 	return CLUSTER_GRD_CONVERT_NOT_READY;
 }
 
+/* spec-5.8 D1c/D1e — waiter-metadata variant stub. */
+ClusterGrdConvertResult
+cluster_grd_convert_or_enqueue_meta(
+	const struct ClusterResId *resid pg_attribute_unused(), int32 node_id pg_attribute_unused(),
+	uint32 procno pg_attribute_unused(), uint64 cluster_epoch pg_attribute_unused(),
+	int current_mode pg_attribute_unused(), int requested_mode pg_attribute_unused(),
+	uint64 convert_request_id pg_attribute_unused(), int32 source_node_id pg_attribute_unused(),
+	uint64 shard_master_generation pg_attribute_unused(),
+	ClusterGrdWaiterMeta meta pg_attribute_unused(),
+	ClusterGrdConflictHolder *conflict_holders_out pg_attribute_unused(),
+	int *n_conflict_out pg_attribute_unused())
+{
+	return CLUSTER_GRD_CONVERT_NOT_READY;
+}
+
 int
 cluster_grd_release_and_drain(const struct ClusterResId *resid pg_attribute_unused(),
 							  const struct ClusterGrdHolderId *holder pg_attribute_unused(),
@@ -689,6 +742,33 @@ cluster_grd_entry_grant_conditional(const struct ClusterResId *r pg_attribute_un
 									uint32 op pg_attribute_unused(), int mode pg_attribute_unused(),
 									struct ClusterGrdConflictHolder *out pg_attribute_unused(),
 									int *nout pg_attribute_unused())
+{
+	if (nout != NULL)
+		*nout = 0;
+	return CLUSTER_GRD_GRANT_NOW;
+}
+/* spec-5.8 D1c/D1e — waiter-metadata variant stubs. */
+ClusterGrdGrantAction
+cluster_grd_entry_enqueue_or_grant_meta(
+	const struct ClusterResId *r pg_attribute_unused(),
+	const struct ClusterGrdHolderId *h pg_attribute_unused(), int32 src pg_attribute_unused(),
+	uint64 req_id pg_attribute_unused(), ClusterGrdWaiterMeta meta pg_attribute_unused(),
+	uint64 shard_master_generation pg_attribute_unused(), uint32 op pg_attribute_unused(),
+	int mode pg_attribute_unused(), struct ClusterGrdConflictHolder *out pg_attribute_unused(),
+	int *nout pg_attribute_unused())
+{
+	if (nout != NULL)
+		*nout = 0;
+	return CLUSTER_GRD_GRANT_NOW;
+}
+ClusterGrdGrantAction
+cluster_grd_entry_grant_conditional_meta(
+	const struct ClusterResId *r pg_attribute_unused(),
+	const struct ClusterGrdHolderId *h pg_attribute_unused(), int32 src pg_attribute_unused(),
+	uint64 req_id pg_attribute_unused(), ClusterGrdWaiterMeta meta pg_attribute_unused(),
+	uint64 shard_master_generation pg_attribute_unused(), uint32 op pg_attribute_unused(),
+	int mode pg_attribute_unused(), struct ClusterGrdConflictHolder *out pg_attribute_unused(),
+	int *nout pg_attribute_unused())
 {
 	if (nout != NULL)
 		*nout = 0;

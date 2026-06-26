@@ -664,6 +664,24 @@ extern int cluster_lmd_scan_interval_ms;
 
 
 /*
+ * cluster.deadlock_detection_enabled / global_dd_interval_ms /
+ * deadlock_confirm_interval_ms (spec-5.8 D3 — coordinator-driven cross-node
+ * deadlock detection).
+ *
+ *	deadlock_detection_enabled (bool, default on, PGC_SIGHUP): master gate
+ *	  for the coordinator cross-node scan.  Off => only the per-node local
+ *	  Tarjan scan runs; cross-node deadlocks rely on finite enqueue timeouts.
+ *	global_dd_interval_ms (default 2000, PGC_SIGHUP): coordinator scan period
+ *	  (only the HC16 lowest-active node runs it).
+ *	deadlock_confirm_interval_ms (default 500, PGC_SIGHUP): delay between the
+ *	  two coordinator confirm rounds (Rule 8.A transient filter).
+ */
+extern bool cluster_lmd_deadlock_detection_enabled;
+extern int cluster_lmd_global_dd_interval_ms;
+extern int cluster_lmd_deadlock_confirm_interval_ms;
+
+
+/*
  * cluster.gcs_reply_timeout_ms (spec-2.33 D8; HC85).
  *
  *	type: int   context: PGC_SUSET

@@ -12428,6 +12428,25 @@
   proargnames => '{waiter_node,waiter_procno,waiter_request_id,blocker_node,blocker_procno,blocker_request_id}',
   prosrc => 'pg_cluster_lmd_inject_wait_edge' },
 
+# spec-5.8 D3 (2026-06-23) -- pg_cluster_lmd_remove_wait_edges (oid 8956).
+#
+# **TEST/DIAGNOSTIC-ONLY** SRF, companion to the D16 injector above.
+# spec-5.8 D1a widened the LMD graph key to (waiter, blocker), so a waiter
+# blocked by several holders keeps several edges and the old "redirect to
+# overwrite" trick can no longer break a synthetic cycle.  This removes every
+# edge whose waiter half matches the given 4-tuple (synthetic epoch=1), via
+# the shipped cluster_lmd_graph_remove_edge_by_waiter.  Not a user-facing API
+# (superuser-only; pg_cluster_lmd_* prefix signals test-only).
+#
+# Returns: boolean -- true if at least one edge was removed.
+{ oid => '8956', descr => 'TEST-ONLY: remove synthetic LMD wait edges by waiter (spec-5.8 D3)',
+  proname => 'pg_cluster_lmd_remove_wait_edges',
+  provolatile => 'v', proparallel => 'r',
+  prorettype => 'bool',
+  proargtypes => 'int4 int4 int8',
+  proargnames => '{waiter_node,waiter_procno,waiter_request_id}',
+  prosrc => 'pg_cluster_lmd_remove_wait_edges' },
+
 # spec-3.2 D5b (2026-05-22) -- test-only visibility fork injection
 # functions.  These are SQL-visible so TAP can drive a real
 # HeapTupleSatisfiesMVCC cluster-path miss and assert 53R97.  Production

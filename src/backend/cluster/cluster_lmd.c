@@ -80,11 +80,14 @@
 
 #include <signal.h>
 
+#include "cluster/cluster_conf.h"
+#include "cluster/cluster_cssd.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_lmd.h"
+#include "cluster/cluster_lmd_probe_collector.h"
 #include "cluster/cluster_shmem.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
@@ -326,7 +329,11 @@ cluster_lmd_dispatch_cancel_item(const ClusterLmdCancelItem *item)
 		return;
 	}
 
-	cluster_lmd_signal_local_victim(req->holder_procno, victim_request_id, victim_epoch);
+	/* The cross-node received-cancel counter is bumped by the receive handler;
+	 * here we only dispatch.  D5 revalidate inside signal_local_victim decides
+	 * whether the cancel is actually delivered. */
+	(void)cluster_lmd_signal_local_victim(req->holder_procno, victim_request_id, victim_epoch,
+										  req->wait_seq);
 }
 
 void
@@ -410,6 +417,8 @@ cluster_lmd_shmem_register(void)
 	cluster_shmem_register_region(&cluster_lmd_region);
 	/* spec-2.22 D5:also register the wait-for graph region. */
 	cluster_shmem_register_region(&cluster_lmd_graph_region);
+	/* spec-5.8 D8:  the cross-node REPORT collector (LMON->LMD shmem hand-off). */
+	cluster_lmd_probe_collector_shmem_register();
 }
 
 ClusterLmdSharedState *
@@ -721,6 +730,85 @@ cluster_lmd_cancel_wait_edge(void)
 }
 
 
+/*
+ * spec-5.8 D3b — HC16 coordinator election.
+ *
+ *	The cross-node deadlock scan is driven by exactly one node: the lowest
+ *	node_id that is currently alive.  Liveness comes directly from CSSD
+ *	per-peer heartbeat state — the same alive/dead set the reconfig
+ *	coordinator is computed from (spec-2.29: min(alive - dead)) — so the
+ *	election is reconfig-aware (a dead lower node drops out and the next
+ *	lowest survivor takes over) and also works on a healthy, never-
+ *	reconfigured cluster.
+ *
+ *	Fail-closed on membership uncertainty (user directive): if ANY peer is
+ *	SUSPECTED (heartbeat in flux, neither clearly ALIVE nor DEAD) return false
+ *	so NO node runs the scan this tick — better to miss a tick (the finite
+ *	enqueue timeouts backstop) than to risk two coordinators or the wrong one
+ *	while CSSD views disagree.  A DEAD lower peer is excluded (it cannot run
+ *	the scan), so the lowest survivor becomes coordinator without double
+ *	driving.
+ */
+static bool
+lmd_is_deadlock_coordinator(void)
+{
+	int32 self = cluster_node_id;
+	int total;
+	int32 lowest_alive;
+
+	if (self < 0)
+		return false; /* not a configured cluster node */
+
+	total = cluster_conf_node_count();
+	lowest_alive = self; /* self is alive by definition — it is running this */
+
+	for (int32 i = 0; i < total; i++) {
+		ClusterCssdPeerState st;
+
+		if (i == self)
+			continue;
+		st = cluster_cssd_get_peer_state(i);
+		if (st == CLUSTER_CSSD_PEER_SUSPECTED)
+			return false; /* membership in flux — fail-closed, skip this tick */
+		if (st == CLUSTER_CSSD_PEER_ALIVE && i < lowest_alive)
+			lowest_alive = i;
+		/* CLUSTER_CSSD_PEER_DEAD peers are excluded from the alive set. */
+	}
+
+	return lowest_alive == self;
+}
+
+/*
+ * spec-5.8 D3b — coordinator cross-node deadlock scan tick.
+ *
+ *	Called once per LmdMain iteration.  Gated by
+ *	cluster.deadlock_detection_enabled, the HC16 election, and the
+ *	cluster.global_dd_interval_ms cadence (coarser than the local scan
+ *	period).  The scan itself is two-round + revalidate gated (spec-5.8 D3a),
+ *	so reaching it never risks a single-round false cancel.
+ */
+static TimestampTz lmd_last_coord_scan = 0;
+
+static void
+cluster_lmd_run_coordinator_tick(void)
+{
+	TimestampTz now;
+
+	if (!cluster_lmd_deadlock_detection_enabled)
+		return;
+	if (!lmd_is_deadlock_coordinator())
+		return;
+
+	now = GetCurrentTimestamp();
+	if (lmd_last_coord_scan != 0
+		&& !TimestampDifferenceExceeds(lmd_last_coord_scan, now, cluster_lmd_global_dd_interval_ms))
+		return; /* not yet time for the next coordinator scan */
+
+	lmd_last_coord_scan = now;
+	cluster_lmd_tarjan_run_coordinator_scan(0); /* 0 → cluster.lmd_probe_collect_timeout_ms */
+}
+
+
 /* ============================================================
  * LMD main entry.
  *
@@ -823,6 +911,9 @@ LmdMain(void)
 			cluster_lmd_drain_cancel_queue();
 			/* spec-2.24 D8 — periodic safety net cleanup sweep. */
 			cluster_lmd_run_periodic_cleanup_sweep();
+			/* spec-5.8 D3b — coordinator cross-node deadlock scan (HC16-gated,
+			 * global_dd_interval cadence, two-round + revalidate). */
+			cluster_lmd_run_coordinator_tick();
 		}
 
 		if (current_submission_count > seen_submission_count) {

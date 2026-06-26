@@ -46,7 +46,7 @@
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_grd.h"
-#include "cluster/cluster_ges.h" /* spec-5.3 — CONVERT_ROLLBACK send */
+#include "cluster/cluster_ges.h"	  /* spec-5.3 — CONVERT_ROLLBACK send */
 #include "cluster/cluster_advisory.h" /* spec-5.5 D2/D3 — session-scope label */
 #include "cluster/cluster_native_lock_probe.h"
 #include "cluster/cluster_extend_gate.h" /* spec-5.7 §3.1d — SOLE->native gate */
@@ -1035,8 +1035,7 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 		 * RELATION + OBJECT branches.  ADVISORY skipped because spec-2.21
 		 * already covers it via different observability surface (the
 		 * counter is named "relation_object" specifically). */
-		if (locktag->locktag_type == LOCKTAG_RELATION
-			|| locktag->locktag_type == LOCKTAG_OBJECT)
+		if (locktag->locktag_type == LOCKTAG_RELATION || locktag->locktag_type == LOCKTAG_OBJECT)
 			cluster_grd_inc_relation_object_cluster_path();
 		/* spec-2.26 D3 / D5 — TRANSACTION cluster gate hit counter
 		 * (HC39 / HC47).  Mutually exclusive with relation_object above
@@ -1123,19 +1122,17 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 					 errhint("Consider increasing cluster.ges_request_timeout_ms.")));
 		case CLUSTER_LOCK_ACQUIRE_FAIL_SHARD_REMASTERING:
 			/* PGRAC: spec-4.6 D4 — shard frozen by failure-driven remaster. */
-			ereport(ERROR,
-					(errcode(ERRCODE_CLUSTER_GRD_SHARD_REMASTERING),
-					 errmsg("GRD shard is being remastered after a node failure"),
-					 errhint("Retry the transaction; the shard reopens once the holder "
-							 "rebuild completes (cluster.grd_remaster_wait_ms bounds the "
-							 "in-line wait).")));
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_GRD_SHARD_REMASTERING),
+							errmsg("GRD shard is being remastered after a node failure"),
+							errhint("Retry the transaction; the shard reopens once the holder "
+									"rebuild completes (cluster.grd_remaster_wait_ms bounds the "
+									"in-line wait).")));
 		case CLUSTER_LOCK_ACQUIRE_FAIL_STALE_GENERATION:
 			/* PGRAC: spec-4.6 D4 — stale routing generation / epoch. */
-			ereport(ERROR,
-					(errcode(ERRCODE_CLUSTER_GRD_STALE_MASTER_GENERATION),
-					 errmsg("cluster GES request carried a stale master generation"),
-					 errhint("The GRD master moved during reconfiguration; retry to route "
-							 "to the new master.")));
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_GRD_STALE_MASTER_GENERATION),
+							errmsg("cluster GES request carried a stale master generation"),
+							errhint("The GRD master moved during reconfiguration; retry to route "
+									"to the new master.")));
 		case CLUSTER_LOCK_ACQUIRE_FAIL_FEATURE_NOT_SUPPORTED:
 			/* PGRAC: spec-5.1b D3 — the master rejected an unsupported
 			 * request (e.g. a cross-node down-convert, which stays
@@ -1152,11 +1149,15 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 							errhint("The requested lock mode conversion is not a valid upgrade; "
 									"release and re-acquire the lock instead.")));
 		case CLUSTER_LOCK_ACQUIRE_FAIL_DEADLOCK:
-			ereport(
-				ERROR,
-				(errcode(ERRCODE_T_R_DEADLOCK_DETECTED),
-				 errmsg("cluster deadlock pending detection"),
-				 errhint("Real cross-node deadlock detection lands in spec-2.22 (LMD Tarjan).")));
+			/* PGRAC (spec-5.8): this backend was chosen as the victim of a
+			 * confirmed cross-node deadlock by the LMD coordinator (two-round
+			 * union Tarjan + per-proc wait-state revalidate) and signalled to
+			 * cancel.  SQLSTATE 40P01 matches PG-native deadlocks so existing
+			 * retry logic applies unchanged. */
+			ereport(ERROR, (errcode(ERRCODE_T_R_DEADLOCK_DETECTED), errmsg("deadlock detected"),
+							errdetail("A cross-node deadlock was detected by the cluster deadlock "
+									  "detector and this transaction was chosen as the victim."),
+							errhint("Retry the transaction.")));
 		case CLUSTER_LOCK_ACQUIRE_FAIL_LMD_WAIT_EDGE_FULL:
 			/* spec-2.22 D11 — HC12 fail-closed wait edge cap. */
 			ereport(
@@ -3400,7 +3401,7 @@ cluster_native_lock_probe_pg_state(const LOCKTAG *locktag, LOCKMODE lockmode,
 	Assert(locktag != NULL);
 	Assert(exclude_holder != NULL);
 	if (exclude_holder == NULL)
-		return CLUSTER_NATIVE_LOCK_PROBE_HOLDER_CONFLICT;	/* fail closed */
+		return CLUSTER_NATIVE_LOCK_PROBE_HOLDER_CONFLICT; /* fail closed */
 
 	self_node_id = cluster_node_id;
 
@@ -3422,7 +3423,7 @@ cluster_native_lock_probe_pg_state(const LOCKTAG *locktag, LOCKMODE lockmode,
 
 	lockmethodid = locktag->locktag_lockmethodid;
 	if (lockmethodid <= 0 || lockmethodid >= lengthof(LockMethods))
-		return CLUSTER_NATIVE_LOCK_PROBE_HOLDER_CONFLICT;	/* fail closed */
+		return CLUSTER_NATIVE_LOCK_PROBE_HOLDER_CONFLICT; /* fail closed */
 	lockMethodTable = LockMethods[lockmethodid];
 	if (lockMethodTable == NULL)
 		return CLUSTER_NATIVE_LOCK_PROBE_HOLDER_CONFLICT;
@@ -3435,8 +3436,7 @@ cluster_native_lock_probe_pg_state(const LOCKTAG *locktag, LOCKMODE lockmode,
 
 	/* HC30 #3:  relation fast-path PGPROC fpRelId bitmap scan (only when
 	 * conflict is possible against fast-path low modes). */
-	if (ConflictsWithRelationFastPath(locktag, lockmode))
-	{
+	if (ConflictsWithRelationFastPath(locktag, lockmode)) {
 		int i;
 		Oid relid = locktag->locktag_field2;
 
@@ -3447,8 +3447,8 @@ cluster_native_lock_probe_pg_state(const LOCKTAG *locktag, LOCKMODE lockmode,
 			/* HC32a self-exclusion:  skip locks held by the originating
 			 * backend identified by (node_id, procno).  procno is the
 			 * PGPROC index in allProcs — equal to i here. */
-			if ((uint32) self_node_id == exclude_holder->node_id
-				&& (uint32) i == exclude_holder->procno)
+			if ((uint32)self_node_id == exclude_holder->node_id
+				&& (uint32)i == exclude_holder->procno)
 				continue;
 
 			/* PGRAC: spec-5.3 — skip a holder in the requester's own PG
@@ -3476,7 +3476,7 @@ cluster_native_lock_probe_pg_state(const LOCKTAG *locktag, LOCKMODE lockmode,
 				lockmask <<= FAST_PATH_LOCKNUMBER_OFFSET;
 
 				if ((lockmask & conflictMask) != 0) {
-					saw_holder = true;	/* fast-path holder is a holder */
+					saw_holder = true; /* fast-path holder is a holder */
 					break;
 				}
 			}
@@ -3494,8 +3494,8 @@ cluster_native_lock_probe_pg_state(const LOCKTAG *locktag, LOCKMODE lockmode,
 	 * partition lock (HC30 子条 5 — hold throughout). */
 	LWLockAcquire(partitionLock, LW_SHARED);
 
-	lock = (LOCK *) hash_search_with_hash_value(LockMethodLockHash, locktag, hashcode,
-												HASH_FIND, NULL);
+	lock = (LOCK *)hash_search_with_hash_value(LockMethodLockHash, locktag, hashcode, HASH_FIND,
+											   NULL);
 	if (lock == NULL) {
 		/* No shared LOCK object → no holders, no waiters in shared table.
 		 * Fast-path was scanned above. */
@@ -3512,8 +3512,8 @@ cluster_native_lock_probe_pg_state(const LOCKTAG *locktag, LOCKMODE lockmode,
 		proc = proclock->tag.myProc;
 
 		/* HC32a self-exclusion */
-		if ((uint32) self_node_id == exclude_holder->node_id
-			&& (uint32) proc->pgprocno == exclude_holder->procno)
+		if ((uint32)self_node_id == exclude_holder->node_id
+			&& (uint32)proc->pgprocno == exclude_holder->procno)
 			continue;
 
 		/* PGRAC: spec-5.3 — skip a holder in the requester's own PG parallel
@@ -3525,7 +3525,7 @@ cluster_native_lock_probe_pg_state(const LOCKTAG *locktag, LOCKMODE lockmode,
 
 		if ((conflictMask & proclock->holdMask) != 0) {
 			saw_holder = true;
-			break;	/* HC31 short-circuit */
+			break; /* HC31 short-circuit */
 		}
 	}
 
@@ -3543,8 +3543,8 @@ cluster_native_lock_probe_pg_state(const LOCKTAG *locktag, LOCKMODE lockmode,
 			waiter = dlist_container(PGPROC, links, waiter_iter.cur);
 
 			/* HC32a self-exclusion */
-			if ((uint32) self_node_id == exclude_holder->node_id
-				&& (uint32) waiter->pgprocno == exclude_holder->procno)
+			if ((uint32)self_node_id == exclude_holder->node_id
+				&& (uint32)waiter->pgprocno == exclude_holder->procno)
 				continue;
 
 			waiter_mode_mask = LOCKBIT_ON(waiter->waitLockMode);

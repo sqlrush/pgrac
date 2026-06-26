@@ -16,6 +16,7 @@
 
 #include "access/clog.h"
 #include "access/xlogdefs.h"
+#include "cluster/cluster_lmd_wait_state.h" /* PGRAC: spec-5.8 D1d ClusterLmdProcWaitState */
 #include "lib/ilist.h"
 #include "storage/latch.h"
 #include "storage/lock.h"
@@ -358,6 +359,15 @@ struct PGPROC {
 	 * torn-read-safe).
 	 */
 	pg_atomic_uint64 cluster_read_scn_atomic;
+
+	/*
+	 * spec-5.8 D1d — per-proc cluster wait-state.  This backend publishes it
+	 * before a cross-node GES/TX wait and clears it on every exit;  the LMD
+	 * deadlock resolver reads it cross-process to confirm a chosen victim is
+	 * still genuinely waiting before cancelling it.  See
+	 * cluster/cluster_lmd_wait_state.h.
+	 */
+	ClusterLmdProcWaitState cluster_lmd_wait;
 };
 
 /* NOTE: "typedef struct PGPROC PGPROC" appears in storage/lock.h. */

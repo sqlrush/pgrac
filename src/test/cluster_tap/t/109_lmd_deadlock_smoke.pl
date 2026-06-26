@@ -79,11 +79,28 @@ sub wait_counter_gt {
 		qq{SELECT (SELECT value::bigint FROM pg_cluster_state WHERE category = 'lmd' AND key = '$key') > $before});
 }
 
-# Helper: update an existing waiter edge to a unique sink so prior cycles do
-# not pollute later scenarios.  There is no SQL remove helper in this spec.
+# Helper: truly remove every wait edge of a waiter (spec-5.8 D3 remove SRF).
+#
+# spec-5.8 D1a widened the graph key to (waiter, blocker), so the old trick of
+# re-injecting the same waiter against a unique sink no longer OVERWRITES the
+# cyclic edge — it just ADDS another edge and the cycle survives.  The
+# pg_cluster_lmd_remove_wait_edges SRF deletes all of a waiter's edges, which
+# is what actually breaks a synthetic cycle now.
 sub break_edge {
-	my ($n, $wproc, $wreq, $sink) = @_;
-	inject_edge($n, 0, $wproc, $wreq, 0, $sink, 900000 + $sink);
+	my ($n, $wproc, $wreq, $unused_sink) = @_;
+	return $n->safe_psql(
+		'postgres',
+		qq{SELECT pg_cluster_lmd_remove_wait_edges(0, $wproc, $wreq)});
+}
+
+# Helper: wait until a counter stops at a value across a scan tick — used to
+# prove a NON-event (no cycle / no cancel) deterministically rather than racing.
+sub wait_one_scan_tick {
+	my ($n) = @_;
+	my $before = read_counter($n, 'tarjan_scan_count');
+	$n->poll_query_until(
+		'postgres',
+		qq{SELECT (SELECT value::bigint FROM pg_cluster_state WHERE category = 'lmd' AND key = 'tarjan_scan_count') > $before});
 }
 
 
@@ -135,28 +152,40 @@ break_edge($node, 800, 8001, 10005);
 break_edge($node, 900, 9001, 10006);
 
 
-# L5 — victim cancel sent.  Victim selected by youngest sort tuple;
-# since we don't tightly control local_start_ts_ms via SRF, just verify
-# counter increment by reading before/after.  Note:  victim cancel only
-# fires when victim.node_id == self (0 here), so all injected edges with
-# node_id=0 qualify.
-my $cancels_before = read_counter($node, 'victim_cancel_sent_count');
+# L5 — synthetic cycle is DETECTED but the victim is NOT cancelled.
+#
+# spec-5.8 D5 tightened cluster_lmd_signal_local_victim: it now revalidates the
+# chosen victim against its live per-proc wait-state (D1d) and cancels only a
+# backend genuinely still waiting on the same (request_id, cluster_epoch,
+# wait_seq).  An injected synthetic victim (procno 1100/1200 — not a real
+# blocked backend) has no published wait-state, so the revalidate correctly
+# REFUSES the cancel and bumps revalidate_fail_count instead.  This is the
+# Rule 8.A guarantee — never cancel a backend that is not actually waiting.
+# Real victim cancellation, with a live cross-node waiter, is verified by the
+# D8 2-node TAP (no synthetic injection).
+my $cycles_before_L5 = read_counter($node, 'cycle_detected_count');
+my $cancels_before_L5 = read_counter($node, 'victim_cancel_sent_count');
+my $reval_fail_before_L5 = read_counter($node, 'revalidate_fail_count');
 inject_edge($node, 0, 1100, 11001, 0, 1200, 12001);
 inject_edge($node, 0, 1200, 12001, 0, 1100, 11001);
-ok(wait_counter_gt($node, 'victim_cancel_sent_count', $cancels_before),
-   'L5 scan observed victim cancel counter advance');
-my $cancels_after = read_counter($node, 'victim_cancel_sent_count');
-ok($cancels_after > $cancels_before,
-   "L5 victim_cancel_sent_count incremented ($cancels_before → $cancels_after)");
+ok(wait_counter_gt($node, 'cycle_detected_count', $cycles_before_L5),
+   'L5 synthetic cycle detected (cycle_detected_count advanced)');
+# The cycle is detected every scan tick; let one more tick run so the victim
+# revalidate path has certainly executed, then assert it did NOT cancel.
+wait_one_scan_tick($node);
+is(read_counter($node, 'victim_cancel_sent_count'), $cancels_before_L5,
+   'L5 synthetic victim NOT cancelled — no live wait-state (D5 revalidate, Rule 8.A)');
+ok(read_counter($node, 'revalidate_fail_count') > $reval_fail_before_L5,
+   'L5 D5 revalidate recorded the refusal (revalidate_fail_count advanced)');
 break_edge($node, 1100, 11001, 10007);
 break_edge($node, 1200, 12001, 10008);
 
 
-# L6/L7 — would-be cycle redirected before it ever becomes live.  The previous
-# version briefly created 1300→1400 + 1400→1300 and then broke both edges, which
-# let macOS CI legitimately scan the transient live cycle between inject and
-# break.  Keep the graph acyclic at every intermediate step so this remains a
-# deterministic "no false cancel" boundary check rather than a scheduler race.
+# L6/L7 — a would-be cycle that is broken before it ever becomes live.  Inject
+# 1300→1400, truly remove 1300's edge (D3 remove SRF), THEN inject 1400→1300.
+# The graph is acyclic at every intermediate step (1300 has no out-edge once
+# removed), so a scan that interleaves can never observe a live cycle — this is
+# a deterministic "no false cancel" boundary check, not a scheduler race.
 my $cycles_before_L6 = read_counter($node, 'cycle_detected_count');
 my $cancels_before_L6 = read_counter($node, 'victim_cancel_sent_count');
 inject_edge($node, 0, 1300, 13001, 0, 1400, 14001);
@@ -238,6 +267,37 @@ my $cross_pending = $node->safe_psql('postgres', q{
 	WHERE category = 'lmd' AND key = 'cross_node_victim_pending_count'
 });
 is($cross_pending, '0', 'L16 cross_node_victim_pending_count stays at 0 single-node');
+
+# ----------
+# spec-5.8 D6 — L17-L19: the three new coordinator two-round / reconfig-gate
+# counters surface in dump_lmd and start at 0.  In single-node mode the
+# coordinator scan returns early (no peers), so none of them ever advance here;
+# their real increments are exercised by the D8 2-node cross-node TAP.
+# ----------
+my $d6_keys = $node->safe_psql('postgres', q{
+	SELECT key
+	FROM cluster_dump_state()
+	WHERE category = 'lmd'
+	  AND key IN ('deadlock_confirmed_count', 'confirm_unconfirmed_count',
+				  'reconfig_discard_count')
+	ORDER BY key
+});
+is($d6_keys, "confirm_unconfirmed_count\ndeadlock_confirmed_count\nreconfig_discard_count",
+   'L17 dump_lmd exposes the 3 spec-5.8 D6 counters');
+
+my $d6_sum = $node->safe_psql('postgres', q{
+	SELECT coalesce(sum(value::bigint), -1)
+	FROM cluster_dump_state()
+	WHERE category = 'lmd'
+	  AND key IN ('deadlock_confirmed_count', 'confirm_unconfirmed_count',
+				  'reconfig_discard_count')
+});
+is($d6_sum, '0', 'L18 spec-5.8 D6 counters all start at 0 (single-node: coordinator scan no-op)');
+
+# L19: total lmd category row count is now 32 (24 + 3 D6 + 5 D8), matching dump_lmd.
+my $lmd_total = $node->safe_psql('postgres',
+	q{SELECT count(*) FROM pg_cluster_state WHERE category = 'lmd'});
+is($lmd_total, '32', 'L19 dump_lmd emits 32 rows under category=lmd (incl. 3 spec-5.8 D6 + 5 D8)');
 
 
 $node->stop;

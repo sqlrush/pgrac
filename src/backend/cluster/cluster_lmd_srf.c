@@ -205,4 +205,56 @@ pg_cluster_lmd_inject_wait_edge(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(ok);
 }
 
+
+/*
+ * pg_cluster_lmd_remove_wait_edges -- spec-5.8 D3 TEST/DIAGNOSTIC-ONLY
+ * remover.
+ *
+ *	Removes EVERY wait edge whose waiter half matches the given 4-tuple
+ *	(node, procno, cluster_epoch=1, request_id), mirroring the synthetic
+ *	identity that pg_cluster_lmd_inject_wait_edge writes.  This exists because
+ *	spec-5.8 D1a widened the graph key to (waiter, blocker), so a waiter
+ *	blocked by several holders now keeps several edges and there is no longer
+ *	any "redirect to overwrite" trick to break a synthetic cycle — a test must
+ *	be able to truly delete a waiter's edges.  Wraps the already-shipped
+ *	cluster_lmd_graph_remove_edge_by_waiter (unit-tested in
+ *	test_cluster_lmd_graph U1b/U1c).
+ *
+ *	This is NOT a user-facing API: it is an LMD diagnostic / test hook only
+ *	(superuser-only; name prefix pg_cluster_lmd_* signals test-only, like the
+ *	injector).  Returns boolean: true if at least one edge was removed.
+ */
+/*
+ * NB: PG_FUNCTION_INFO_V1(pg_cluster_lmd_remove_wait_edges) is emitted in
+ * cluster_ic.c (always-linked file), so pg_proc.dat resolves the symbol in
+ * both --enable-cluster and --disable-cluster builds.
+ */
+Datum
+pg_cluster_lmd_remove_wait_edges(PG_FUNCTION_ARGS)
+{
+	int32 w_node = PG_GETARG_INT32(0);
+	int32 w_procno = PG_GETARG_INT32(1);
+	int64 w_request_id = PG_GETARG_INT64(2);
+	ClusterLmdVertex waiter;
+	bool removed;
+
+	if (!superuser())
+		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						errmsg("pg_cluster_lmd_remove_wait_edges is restricted to superusers"),
+						errhint("Test/diagnostic-only edge remover; not a user-facing API.")));
+
+	memset(&waiter, 0, sizeof(waiter));
+	waiter.node_id = w_node;
+	waiter.procno = (uint32)w_procno;
+	waiter.request_id = (uint64)w_request_id;
+	waiter.cluster_epoch = 1; /* mirror the injector's synthetic epoch */
+
+	ereport(LOG, (errmsg("pg_cluster_lmd_remove_wait_edges: TEST-ONLY removal "
+						 "waiter=(%d,%u," INT64_FORMAT ")",
+						 w_node, (uint32)w_procno, w_request_id)));
+
+	removed = cluster_lmd_graph_remove_edge_by_waiter(&waiter);
+	PG_RETURN_BOOL(removed);
+}
+
 #endif /* USE_PGRAC_CLUSTER */

@@ -332,10 +332,17 @@ typedef struct ClusterLmdVertex {
 	/* Sort metadata (A4 victim selection only;not part of identity). */
 	TransactionId xid; /* may be InvalidTransactionId — advisory lock OK */
 	int64 local_start_ts_ms;
+	/* spec-5.8 D1e — the waiter's D1d wait-state publish sequence, stamped
+	 * here at edge submit time and carried with the WFG edge to the
+	 * coordinator;  the cross-node cancel echoes it back so the victim node's
+	 * D5 revalidate can ABA-match it against the live wait-state (shmem only,
+	 * never the identity key). */
+	uint64 wait_seq;
 } ClusterLmdVertex;
 
-StaticAssertDecl(sizeof(ClusterLmdVertex) == 40,
-				 "ClusterLmdVertex ABI 40-byte lock (4+4+8+8 identity + 4+8 metadata + 4 pad)");
+StaticAssertDecl(sizeof(ClusterLmdVertex) == 48,
+				 "ClusterLmdVertex ABI 48-byte lock (4+4+8+8 identity + 4+8 metadata + 4 pad + "
+				 "8 wait_seq, spec-5.8 D1e)");
 
 typedef struct ClusterLmdWaitEdge {
 	ClusterLmdVertex waiter;  /* this backend stuck waiting on S4 */
@@ -344,8 +351,23 @@ typedef struct ClusterLmdWaitEdge {
 	uint64 request_id;		  /* matches ClusterLockAcquireRequest.request_id */
 } ClusterLmdWaitEdge;
 
-StaticAssertDecl(sizeof(ClusterLmdWaitEdge) == 96,
-				 "ClusterLmdWaitEdge ABI 96-byte lock (40 + 40 + 8 + 8)");
+StaticAssertDecl(
+	sizeof(ClusterLmdWaitEdge) == 112,
+	"ClusterLmdWaitEdge ABI 112-byte lock (48 + 48 + 8 + 8, spec-5.8 D1e vertex grow)");
+
+/*
+ * spec-5.8 D2 — TX (row-lock) wait-edge holder placeholder.
+ *
+ *	A cross-node TX wait edge knows the holder only by its transaction
+ *	identity (origin node + xid, from the TT status key);  the holder
+ *	backend's procno is never carried on the wire.  The blocker vertex is
+ *	therefore stamped with this sentinel procno (plus the holder's xid), and
+ *	the coordinator rewrites it to the holder's real waiter vertex by
+ *	(node, xid) before running Tarjan (cluster_lmd_resolve_tx_placeholders).
+ *	A real backend procno is always < MaxBackends, so the sentinel can never
+ *	collide with one — an unresolved placeholder stays a pure sink vertex.
+ */
+#define CLUSTER_LMD_TX_HOLDER_PROCNO 0xFFFFFFFFu
 
 
 /*
@@ -359,6 +381,40 @@ extern bool cluster_lmd_submit_wait_edge_real(const ClusterLmdVertex *waiter,
 											  const ClusterLmdVertex *blocker, uint64 request_id);
 
 extern void cluster_lmd_cancel_wait_edge_real(const ClusterLmdVertex *waiter);
+
+/*
+ * spec-5.8 D2 (T2) — resolve TX holder placeholders on an edge array, in
+ * place, before Tarjan vertex dedup.  Rewrites every blocker whose procno is
+ * CLUSTER_LMD_TX_HOLDER_PROCNO to the full identity of the waiter vertex that
+ * owns the same (node, valid xid) — i.e. the holder transaction is itself a
+ * waiter elsewhere — so Tarjan can close the cross-node cycle through it.  An
+ * unmatched / Invalid-xid placeholder is left untouched (a pure sink, never
+ * part of a cycle), so a missed resolution only loses a detection, never
+ * fabricates one (Rule 8.A).
+ */
+extern void cluster_lmd_resolve_tx_placeholders(ClusterLmdWaitEdge *edges, int nedges);
+
+/*
+ * spec-5.8 D4 — coordinator REPORT-collector member admission.
+ *
+ *	The coordinator collects one DEADLOCK_REPORT per peer it probed.  A peer's
+ *	REPORT is admitted only when the responder is in the expected (probed) set
+ *	AND has not already reported in this round — indexing by responding_node_id
+ *	with this guard prevents a duplicate / retransmitted REPORT from one node
+ *	from masking a genuinely missing node (which would let the union look
+ *	"complete" while a cross-node cycle through the missing node is invisible).
+ *	A report from an unexpected node (stale / replayed probe_id) is dropped.
+ *	Both bitmaps are uint64 lo/hi pairs over node_id 0..127 (CLUSTER_MAX_NODES).
+ */
+typedef enum ClusterLmdProbeAdmit {
+	CLUSTER_LMD_PROBE_ADMIT = 0,		   /* in expected set, first report */
+	CLUSTER_LMD_PROBE_DROP_UNEXPECTED = 1, /* not a probed peer / out of range */
+	CLUSTER_LMD_PROBE_DROP_DUPLICATE = 2,  /* already reported this round */
+} ClusterLmdProbeAdmit;
+
+extern ClusterLmdProbeAdmit cluster_lmd_probe_member_admit(uint64 expected_lo, uint64 expected_hi,
+														   uint64 received_lo, uint64 received_hi,
+														   int32 node_id);
 
 /*
  * Manual SQL trigger for Tarjan scan (admin / TAP test hook).
@@ -392,11 +448,10 @@ extern void cluster_lmd_cross_node_victim_pending_count_inc(uint64 delta);
 extern void cluster_lmd_probe_broadcast_count_inc(uint64 delta);
 extern void cluster_lmd_probe_partial_count_inc(uint64 delta);
 
-/* spec-2.23 D8 — coordinator scan + REPORT collector entry points. */
-struct GesDeadlockReportHeader;
+/* spec-2.23 D8 — coordinator scan entry point.  The REPORT collector moved to
+ * shared memory in spec-5.8 D8 — see cluster_lmd_probe_collector.h for
+ * cluster_lmd_probe_collect_receive (LMON) + arm/drain (LMD). */
 extern void cluster_lmd_tarjan_run_coordinator_scan(int collect_timeout_ms);
-extern bool cluster_lmd_probe_collect_receive(const struct GesDeadlockReportHeader *report,
-											  Size report_len);
 
 /* ============================================================
  * spec-2.24 D2 — LMD-owned cancel queue (HC23).
@@ -412,7 +467,9 @@ extern bool cluster_lmd_probe_collect_receive(const struct GesDeadlockReportHead
  * ============================================================ */
 
 #define CLUSTER_LMD_CANCEL_QUEUE_DEPTH 256
-#define CLUSTER_LMD_CANCEL_PAYLOAD_BYTES 64
+/* spec-5.8 D1e — holds a full GesRequestPayload image, which grew 64 -> 72
+ * when waiter_xid (D1c) + wait_seq (D1e) were added. */
+#define CLUSTER_LMD_CANCEL_PAYLOAD_BYTES 72
 
 typedef struct ClusterLmdCancelItem {
 	uint32 source_node_id; /* sender of GES_REQ_OPCODE_CANCEL_PENDING */
@@ -421,7 +478,8 @@ typedef struct ClusterLmdCancelItem {
 	uint8 payload[CLUSTER_LMD_CANCEL_PAYLOAD_BYTES];
 } ClusterLmdCancelItem;
 
-StaticAssertDecl(sizeof(ClusterLmdCancelItem) == 72, "ClusterLmdCancelItem 72-byte lock");
+StaticAssertDecl(sizeof(ClusterLmdCancelItem) == 80,
+				 "ClusterLmdCancelItem 80-byte lock (72B GesRequestPayload image, spec-5.8 D1e)");
 
 extern Size cluster_lmd_cancel_queue_shmem_size(void);
 extern void cluster_lmd_cancel_queue_shmem_init(void);
@@ -447,6 +505,14 @@ extern void cluster_lmd_cross_node_cancel_queue_full_count_inc(uint64 delta);
 extern void cluster_lmd_cleanup_on_backend_exit_count_inc(uint64 delta);
 extern void cluster_lmd_cleanup_lmd_sweep_count_inc(uint64 delta);
 extern void cluster_lmd_cleanup_skip_other_owner_count_inc(uint64 delta);
+
+/* spec-5.8 D6 — coordinator two-round confirm + reconfig-gate counters. */
+extern uint64 cluster_lmd_deadlock_confirmed_count_get(void);
+extern uint64 cluster_lmd_confirm_unconfirmed_count_get(void);
+extern uint64 cluster_lmd_reconfig_discard_count_get(void);
+extern void cluster_lmd_deadlock_confirmed_count_inc(uint64 delta);
+extern void cluster_lmd_confirm_unconfirmed_count_inc(uint64 delta);
+extern void cluster_lmd_reconfig_discard_count_inc(uint64 delta);
 
 /* D16 test-only injection helper (also surfaced via SQL SRF). */
 extern bool cluster_lmd_inject_wait_edge(const ClusterLmdVertex *waiter,
@@ -477,7 +543,14 @@ extern void cluster_lmd_tarjan_run_local_scan(void);
 
 /* spec-2.22 D8 — victim signal helper (defined in cluster_lmd_tarjan.c
  * Step 6;forward-declared so Step 4 build links). */
-extern void cluster_lmd_signal_local_victim(uint32 procno, uint64 request_id, uint64 cluster_epoch);
+/*
+ * Returns true iff the cancel was actually delivered (PROCSIG sent).  D5
+ * wait-state revalidation may refuse a victim that is no longer waiting, in
+ * which case it returns false and bumps revalidate_fail_count — callers must
+ * count victim_cancel_sent only on a true return.
+ */
+extern bool cluster_lmd_signal_local_victim(uint32 procno, uint64 request_id, uint64 cluster_epoch,
+											uint64 wait_seq);
 
 /*
  * shmem region helpers — registered by cluster_init_shmem_module()

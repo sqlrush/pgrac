@@ -23,12 +23,23 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_ges.h" /* GesRequestPayload (spec-5.8 D8 coupling assert) */
 #include "cluster/cluster_grd_work_queue.h"
 #include "cluster/cluster_shmem.h"
 #include "miscadmin.h" /* IsBootstrapProcessingMode */
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "utils/elog.h"
+
+/*
+ * spec-5.8 D8 — couple the work-item payload buffer to the largest wire payload
+ * the master enqueues here (GesRequestPayload, 72B after D1c/D1e).  A future
+ * payload growth that forgets this buffer fails at compile time instead of
+ * making the master reject every cross-node REQUEST with WORK_QUEUE_FULL
+ * (latent until a 2-node run, as the D1e miss was).
+ */
+StaticAssertDecl(sizeof(((ClusterGrdWorkItem *)0)->payload) >= sizeof(GesRequestPayload),
+				 "GES work-item payload buffer must hold a full GesRequestPayload");
 
 
 typedef struct ClusterGrdWorkQueueShared {

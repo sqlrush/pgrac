@@ -33,19 +33,23 @@
  */
 #include "postgres.h"
 
+#include "access/xact.h" /* spec-5.8 D1c — GetTopTransactionIdIfAny for waiter_xid */
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_ges_mode.h"		/* spec-5.1b D1: ges_modes_compatible (frozen matrix) */
 #include "cluster/cluster_ges_reply_wait.h" /* spec-2.23 D1 5-tuple wait HTAB */
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_grd_outbound.h"
-#include "cluster/cluster_lmd.h"	   /* + spec-2.23 D8 probe collector receive */
-#include "cluster/cluster_ges_dedup.h" /* spec-2.27 D2 / D3 — retransmit dedup */
+#include "cluster/cluster_lmd.h"				 /* cluster_lmd_is_ready */
+#include "cluster/cluster_lmd_probe_collector.h" /* spec-5.8 D8 — shmem REPORT collect_receive */
+#include "cluster/cluster_signal.h"				 /* spec-5.8 D8 — cluster_ges_cancel_pending */
+#include "cluster/cluster_ges_dedup.h"			 /* spec-2.27 D2 / D3 — retransmit dedup */
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_native_lock_probe.h" /* spec-2.25 D5 — probe protocol handlers */
 #include "cluster/cluster_grd_work_queue.h"
 #include "cluster/cluster_guc.h" /* cluster_node_id + cluster_ges_request_timeout_ms */
 #include "cluster/cluster_ic_envelope.h"
+#include "cluster/cluster_ic_router.h" /* spec-5.8 D8 — cluster_ic_send_envelope (REPORT send-back) */
 #include "cluster/cluster_qvotec.h" /* cluster_qvotec_in_quorum */
 #include "cluster/cluster_conf.h"	/* cluster_conf_lookup_node */
 #include "cluster/cluster_shmem.h"
@@ -73,6 +77,18 @@ static inline uint64
 ges_request_holder_epoch(const GesRequestPayload *req)
 {
 	return ((uint64)req->holder_cluster_epoch_lo) | (((uint64)req->holder_cluster_epoch_hi) << 32);
+}
+
+/*
+ * spec-5.8 D1e — the backend's currently-published D1d wait-state sequence
+ * (0 if no PGPROC).  Sampled at REQUEST / CONVERT send so the master can stamp
+ * it onto the WFG waiter vertex;  the D1d publish in cluster_lock_acquire.c
+ * always precedes the send, so this reads THIS wait's seq.
+ */
+static inline uint64
+ges_local_wait_seq(void)
+{
+	return (MyProc != NULL) ? pg_atomic_read_u64(&MyProc->cluster_lmd_wait.wait_seq) : 0;
 }
 
 static inline uint64
@@ -265,8 +281,6 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 	 * so a short PROBE frame cannot be misparsed as holder metadata.
 	 */
 	if (opcode == GES_REQ_OPCODE_DEADLOCK_PROBE) {
-		char report_buf[sizeof(GesDeadlockReportHeader)];
-		Size report_len = sizeof(report_buf);
 		const GesDeadlockProbePayload *probe;
 		uint64 accepted_epoch;
 
@@ -283,7 +297,58 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 			return;
 		}
 		if (cluster_lmd_is_ready()) {
-			(void)cluster_ges_deadlock_probe_handler(probe, report_buf, &report_len);
+			/*
+			 * spec-5.8 D8 — build this node's local wait-for REPORT and SEND it
+			 * back to the coordinator (this runs in the LMON dispatch context,
+			 * which is the registered CLUSTER_IC_PRODUCER_LMON producer for
+			 * GES_REQUEST, mirroring the sinval ACK-from-recv pattern).  spec-
+			 * 2.23 shipped the handler/format but never wired the send, and the
+			 * 64-byte GES outbound ring slot cannot carry a 112-byte edge, so
+			 * the REPORT goes directly via cluster_ic_send_envelope (≤16MB).
+			 *
+			 * The buffer is sized to the graph's own capacity
+			 * (cluster.lmd_max_wait_edges), which the local graph can never
+			 * exceed, so the REPORT always carries the COMPLETE local graph —
+			 * no truncation.  The defensive IC-ceiling clamp below is therefore
+			 * unreachable in practice (65536 edges = 7.3 MB < 16 MB); if it ever
+			 * fired, a shorter REPORT is fail-safe (fewer edges can only MISS a
+			 * cycle, never invent one — the victim is still gated by two-round
+			 * confirm + D5 revalidate) and is logged, never silent.
+			 */
+			int cap_edges = cluster_lmd_max_wait_edges;
+			Size buflen;
+			char *report_buf;
+			Size report_len;
+
+			if (cap_edges < 64)
+				cap_edges = 64;
+			if (cap_edges > 65536)
+				cap_edges = 65536;
+			while (cap_edges > 0
+				   && sizeof(GesDeadlockReportHeader) + (Size)cap_edges * sizeof(ClusterLmdWaitEdge)
+						  > PGRAC_IC_PAYLOAD_MAX) {
+				cap_edges /= 2;
+				ereport(LOG, (errmsg("cluster LMD REPORT clamped to %d edges to fit the IC payload "
+									 "ceiling (partial, fail-safe)",
+									 cap_edges)));
+			}
+
+			buflen = sizeof(GesDeadlockReportHeader) + (Size)cap_edges * sizeof(ClusterLmdWaitEdge);
+			report_buf = palloc(buflen);
+			report_len = buflen;
+
+			if (cluster_ges_deadlock_probe_handler(probe, report_buf, &report_len) == 0) {
+				/*
+				 * Best-effort send (Rule 8.A / req 6):  a transport failure or a
+				 * dropped REPORT simply means the coordinator collects fewer
+				 * edges this round → fewer cycles → no cancel.  It can never
+				 * cause a false cancel, so the result is ignored.
+				 */
+				(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GES_REQUEST,
+											   (int32)probe->coordinator_node_id, report_buf,
+											   (uint32)report_len);
+			}
+			pfree(report_buf);
 			return;
 		}
 		cluster_grd_inc_deadlock_probe_drop();
@@ -930,12 +995,14 @@ cluster_ges_lmon_drain_work_queue(void)
 			}
 
 			action = conditional
-						 ? cluster_grd_entry_grant_conditional(
+						 ? cluster_grd_entry_grant_conditional_meta(
 							   &resid, &holder, (int32)item.source_node_id, holder_request_id,
+							   (ClusterGrdWaiterMeta){ req->waiter_xid, req->wait_seq },
 							   ges_request_shard_master_generation(req), req->opcode,
 							   (int)req->lockmode, conflict_holders, &n_conflict)
-						 : cluster_grd_entry_enqueue_or_grant(
+						 : cluster_grd_entry_enqueue_or_grant_meta(
 							   &resid, &holder, (int32)item.source_node_id, holder_request_id,
+							   (ClusterGrdWaiterMeta){ req->waiter_xid, req->wait_seq },
 							   ges_request_shard_master_generation(req), req->opcode,
 							   (int)req->lockmode, conflict_holders, &n_conflict);
 
@@ -1077,10 +1144,11 @@ cluster_ges_lmon_drain_work_queue(void)
 				int n_conflict = 0;
 				ClusterGrdConvertResult cr;
 
-				cr = cluster_grd_convert_or_enqueue(
+				cr = cluster_grd_convert_or_enqueue_meta(
 					&resid, (int32)holder.node_id, holder.procno, holder.cluster_epoch,
 					convert_old_mode, requested_mode, holder.request_id, (int32)item.source_node_id,
-					generation, conflict_holders, &n_conflict);
+					generation, (ClusterGrdWaiterMeta){ req->waiter_xid, req->wait_seq },
+					conflict_holders, &n_conflict);
 
 				switch (cr) {
 				case CLUSTER_GRD_CONVERT_GRANTED_INPLACE: {
@@ -1329,12 +1397,14 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 		/* spec-5.5 D5 — local-master try-lock: conditional grant, never enqueue. */
 		action
 			= conditional
-				  ? cluster_grd_entry_grant_conditional(resid, holder, cluster_node_id, request_id,
-														master_gen, send_opcode, (int)lockmode,
-														conflict_holders, &n_conflict)
-				  : cluster_grd_entry_enqueue_or_grant(resid, holder, cluster_node_id, request_id,
-													   master_gen, send_opcode, (int)lockmode,
-													   conflict_holders, &n_conflict);
+				  ? cluster_grd_entry_grant_conditional_meta(
+						resid, holder, cluster_node_id, request_id,
+						(ClusterGrdWaiterMeta){ GetTopTransactionIdIfAny(), ges_local_wait_seq() },
+						master_gen, send_opcode, (int)lockmode, conflict_holders, &n_conflict)
+				  : cluster_grd_entry_enqueue_or_grant_meta(
+						resid, holder, cluster_node_id, request_id,
+						(ClusterGrdWaiterMeta){ GetTopTransactionIdIfAny(), ges_local_wait_seq() },
+						master_gen, send_opcode, (int)lockmode, conflict_holders, &n_conflict);
 
 		if (action == CLUSTER_GRD_GRANT_NOW) {
 			if (cluster_ges_state != NULL)
@@ -1391,6 +1461,14 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 			while (!entry->ready) {
 				int sleep_ms = 1000;
 
+				/* spec-5.8 D8 — the LMD coordinator chose this backend as a
+				 * cross-node deadlock victim (PROCSIG set cluster_ges_cancel_
+				 * pending).  Break out of the wait; the flag stays set and is
+				 * honored after PG_END_TRY (returning from inside PG_TRY would
+				 * corrupt the exception stack). */
+				if (cluster_ges_cancel_pending)
+					break;
+
 				if (!perpetual) {
 					TimestampTz now = GetCurrentTimestamp();
 					long remaining_ms;
@@ -1423,6 +1501,16 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 		}
 		PG_END_TRY();
 		ConditionVariableCancelSleep();
+
+		/* spec-5.8 D8 — deadlock victim (flag set mid-wait):  drop the queued
+		 * waiter + reply-wait entry and fail closed as a deadlock so lock.c
+		 * ereports 40P01. */
+		if (cluster_ges_cancel_pending) {
+			cluster_ges_cancel_pending = false;
+			cluster_ges_reply_wait_delete(&key);
+			(void)cluster_grd_cancel_waiter_by_id(resid, holder);
+			return GES_REJECT_REASON_DEADLOCK_VICTIM;
+		}
 
 		if (timed_out) {
 			cluster_ges_reply_wait_delete(&key);
@@ -1502,6 +1590,10 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 	 * dedup key at receiver). */
 	req.shard_master_generation_lo = (uint32)(master_gen & 0xffffffffu);
 	req.shard_master_generation_hi = (uint32)(master_gen >> 32);
+	/* spec-5.8 D1c/D1e — carry this backend's xid + D1d wait_seq so the master
+	 * can stamp the WFG waiter vertex (0 / Invalid for read-only / pre-write). */
+	req.waiter_xid = (uint32)GetTopTransactionIdIfAny();
+	req.wait_seq = ges_local_wait_seq();
 
 	if (!cluster_grd_outbound_enqueue_backend_request((uint32)master, &req, sizeof(req))) {
 		/* Outbound ring full — fail closed.  Caller may retry. */
@@ -1552,6 +1644,17 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 									 " (request_id=" UINT64_FORMAT ")",
 									 master, request_id)));
 			return GES_REJECT_REASON_MASTER_DEAD_NATIVE;
+		}
+		/* spec-5.8 D8 — cross-node deadlock victim (PROCSIG set the flag mid
+		 * wait): drop the reply-wait entry and fail closed as a deadlock so
+		 * lock.c ereports 40P01 instead of waiting out the finite timeout.
+		 * (rebase: coexists with spec-5.7's dead-master-native abort above;
+		 * independent guards.) */
+		if (cluster_ges_cancel_pending) {
+			cluster_ges_cancel_pending = false;
+			cluster_ges_reply_wait_delete(&key);
+			ConditionVariableCancelSleep();
+			return GES_REJECT_REASON_DEADLOCK_VICTIM;
 		}
 
 		if (perpetual) {
@@ -1795,6 +1898,16 @@ cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 			int sleep_ms;
 			long remaining_ms;
 
+			/* spec-5.8 D8 — cross-node deadlock victim chosen while blocked in
+			 * this CONVERT wait: fail closed as a deadlock (40P01) rather than
+			 * waiting out the finite timeout. */
+			if (cluster_ges_cancel_pending) {
+				cluster_ges_cancel_pending = false;
+				cluster_ges_reply_wait_delete(&key);
+				ConditionVariableCancelSleep();
+				return GES_REJECT_REASON_DEADLOCK_VICTIM;
+			}
+
 			if (perpetual) {
 				sleep_ms = backoff_ms;
 			} else {
@@ -1944,6 +2057,9 @@ cluster_ges_send_convert_and_wait(const struct ClusterResId *resid, uint32 reque
 	req.shard_master_generation_lo = (uint32)(master_gen & 0xffffffffu);
 	req.shard_master_generation_hi = (uint32)(master_gen >> 32);
 	req.current_mode = (uint8)current_mode;
+	/* spec-5.8 D1c/D1e — converter's xid + D1d wait_seq for the WFG vertex. */
+	req.waiter_xid = (uint32)GetTopTransactionIdIfAny();
+	req.wait_seq = ges_local_wait_seq();
 
 	if (local_master) {
 		/* Self-source: bypass the wire (the inbound validator drops
@@ -1963,6 +2079,15 @@ cluster_ges_send_convert_and_wait(const struct ClusterResId *resid, uint32 reque
 	while (!entry->ready) {
 		TimestampTz now = GetCurrentTimestamp();
 		long remaining_ms;
+
+		/* spec-5.8 D8 — cross-node deadlock victim chosen while blocked in this
+		 * CONVERT wait: fail closed as a deadlock (40P01). */
+		if (cluster_ges_cancel_pending) {
+			cluster_ges_cancel_pending = false;
+			cluster_ges_reply_wait_delete(&key);
+			ConditionVariableCancelSleep();
+			return GES_REJECT_REASON_DEADLOCK_VICTIM;
+		}
 
 		if (now >= deadline) {
 			cluster_ges_reply_wait_delete(&key);
@@ -2143,7 +2268,7 @@ cluster_ges_send_bast_targeted(const struct ClusterResId *resid, int requested_m
  * ============================================================ */
 void
 cluster_ges_send_cancel_pending(int32 victim_node_id,
-								const struct ClusterGrdHolderId *victim_target)
+								const struct ClusterGrdHolderId *victim_target, uint64 wait_seq)
 {
 	GesRequestPayload payload;
 
@@ -2159,7 +2284,9 @@ cluster_ges_send_cancel_pending(int32 victim_node_id,
 	payload.holder_cluster_epoch_hi = (uint32)(victim_target->cluster_epoch >> 32);
 	payload.holder_request_id_lo = (uint32)(victim_target->request_id & 0xffffffffu);
 	payload.holder_request_id_hi = (uint32)(victim_target->request_id >> 32);
-	/* resid not used for CANCEL — left zero */
+	/* spec-5.8 D1e — echo the victim's wait_seq so its node's D5 revalidate can
+	 * ABA-match it against the live D1d wait-state.  resid stays zero. */
+	payload.wait_seq = wait_seq;
 
 	cluster_grd_outbound_enqueue_lmd_cancel((uint32)victim_node_id, &payload, sizeof(payload));
 	cluster_lmd_cross_node_victim_cancel_sent_count_inc(1);

@@ -51,7 +51,9 @@
 #include "cluster/cluster_gcs.h"	   /* spec-4.7 D2 (L238) — cluster_gcs_lookup_master proto */
 #include "cluster/cluster_gcs_block.h" /* spec-4.7 D2 (L238) — block re-declare scan/send protos */
 #include "cluster/cluster_ges_mode.h"  /* spec-5.1b — frozen matrix + convert classification */
+#include "access/transam.h"			   /* spec-5.8 D1c — InvalidTransactionId */
 #include "cluster/cluster_grd.h"
+#include "cluster/cluster_lmd.h"			 /* spec-5.8 D1b — WFG vertex + submit/cancel edge */
 #include "cluster/cluster_reconfig.h"		 /* spec-4.6 D1 — ReconfigEvent stub type */
 #include "cluster/cluster_thread_recovery.h" /* spec-4.11 D3 (L238) — gate_unfreeze proto */
 #include "port/atomics.h"
@@ -559,6 +561,148 @@ cluster_lmd_cleanup_skip_other_owner_count_inc(uint64 d pg_attribute_unused())
 uint64
 cluster_pcm_lock_clear_pending_x_for_node(int32 dead_node pg_attribute_unused())
 {
+	return 0;
+}
+
+/* ============================================================
+ * spec-5.8 D1b — faithful fake of the LMD wait-for graph edge API.
+ *
+ *	cluster_grd.c (D1b) registers master-side wait edges by calling
+ *	cluster_lmd_submit_wait_edge_real / cluster_lmd_cancel_wait_edge_real.
+ *	The standalone harness does NOT link cluster_lmd_graph.o, so these two
+ *	functions are provided here as a faithful in-memory model that mirrors
+ *	the real graph's multi-edge semantics (spec-5.8 D1a): submit adds a
+ *	distinct (waiter,blocker) edge keyed on the 4-tuple identities (idempotent
+ *	per pair, self-edge rejected), and cancel removes EVERY edge of a waiter.
+ *	U2 asserts the master-side edge set after each GRD mutation against this
+ *	model (the real-graph 2-node e2e is the D8 TAP test).
+ * ============================================================ */
+#define UT_WFG_MAX 256
+
+typedef struct UtWfgEdge {
+	ClusterLmdVertex waiter;
+	ClusterLmdVertex blocker;
+} UtWfgEdge;
+
+static UtWfgEdge ut_wfg[UT_WFG_MAX];
+static int ut_wfg_n = 0;
+
+static void
+ut_wfg_reset(void)
+{
+	ut_wfg_n = 0;
+	memset(ut_wfg, 0, sizeof(ut_wfg));
+}
+
+/* True iff two vertices share the same 4-tuple identity (xid/start_ts are
+ * sort metadata, not identity — mirror cluster_lmd_graph.c key compare). */
+static bool
+ut_vtx_eq(const ClusterLmdVertex *a, const ClusterLmdVertex *b)
+{
+	return a->node_id == b->node_id && a->procno == b->procno
+		   && a->cluster_epoch == b->cluster_epoch && a->request_id == b->request_id;
+}
+
+bool
+cluster_lmd_submit_wait_edge_real(const ClusterLmdVertex *waiter, const ClusterLmdVertex *blocker,
+								  uint64 request_id pg_attribute_unused())
+{
+	int i;
+
+	if (waiter == NULL || blocker == NULL)
+		return false;
+	if (ut_vtx_eq(waiter, blocker)) /* self-edge rejected (graph defensive) */
+		return false;
+	for (i = 0; i < ut_wfg_n; i++) {
+		if (ut_vtx_eq(&ut_wfg[i].waiter, waiter) && ut_vtx_eq(&ut_wfg[i].blocker, blocker))
+			return true; /* idempotent per (waiter,blocker) pair */
+	}
+	if (ut_wfg_n >= UT_WFG_MAX)
+		return false;
+	ut_wfg[ut_wfg_n].waiter = *waiter;
+	ut_wfg[ut_wfg_n].blocker = *blocker;
+	ut_wfg_n++;
+	return true;
+}
+
+void
+cluster_lmd_cancel_wait_edge_real(const ClusterLmdVertex *waiter)
+{
+	int i;
+
+	if (waiter == NULL)
+		return;
+	for (i = 0; i < ut_wfg_n;) {
+		if (ut_vtx_eq(&ut_wfg[i].waiter, waiter)) {
+			if (i < ut_wfg_n - 1)
+				ut_wfg[i] = ut_wfg[ut_wfg_n - 1];
+			memset(&ut_wfg[ut_wfg_n - 1], 0, sizeof(UtWfgEdge));
+			ut_wfg_n--;
+			continue; /* re-check the swapped-in edge */
+		}
+		i++;
+	}
+}
+
+/* Count the blocker edges currently registered for a waiter 4-tuple. */
+static int
+ut_wfg_count_waiter(int32 node, uint32 procno, uint64 epoch, uint64 rid)
+{
+	int i, n = 0;
+
+	for (i = 0; i < ut_wfg_n; i++) {
+		if (ut_wfg[i].waiter.node_id == node && ut_wfg[i].waiter.procno == procno
+			&& ut_wfg[i].waiter.cluster_epoch == epoch && ut_wfg[i].waiter.request_id == rid)
+			n++;
+	}
+	return n;
+}
+
+/* True iff a (waiter 4-tuple -> blocker 4-tuple) edge is registered. */
+static bool
+ut_wfg_has_edge(int32 wn, uint32 wp, uint64 we, uint64 wr, int32 bn, uint32 bp, uint64 be,
+				uint64 br)
+{
+	int i;
+
+	for (i = 0; i < ut_wfg_n; i++) {
+		if (ut_wfg[i].waiter.node_id == wn && ut_wfg[i].waiter.procno == wp
+			&& ut_wfg[i].waiter.cluster_epoch == we && ut_wfg[i].waiter.request_id == wr
+			&& ut_wfg[i].blocker.node_id == bn && ut_wfg[i].blocker.procno == bp
+			&& ut_wfg[i].blocker.cluster_epoch == be && ut_wfg[i].blocker.request_id == br)
+			return true;
+	}
+	return false;
+}
+
+/* spec-5.8 D1c — the xid stamped on a waiter's vertex (Invalid if no such
+ * waiter).  All of a waiter's edges carry the same vertex, so the first match
+ * wins. */
+static TransactionId
+ut_wfg_waiter_xid(int32 node, uint32 procno, uint64 epoch, uint64 rid)
+{
+	int i;
+
+	for (i = 0; i < ut_wfg_n; i++) {
+		if (ut_wfg[i].waiter.node_id == node && ut_wfg[i].waiter.procno == procno
+			&& ut_wfg[i].waiter.cluster_epoch == epoch && ut_wfg[i].waiter.request_id == rid)
+			return ut_wfg[i].waiter.xid;
+	}
+	return InvalidTransactionId;
+}
+
+/* spec-5.8 D1e — the wait_seq stamped on a waiter's vertex (0 if no such
+ * waiter). */
+static uint64
+ut_wfg_waiter_wait_seq(int32 node, uint32 procno, uint64 epoch, uint64 rid)
+{
+	int i;
+
+	for (i = 0; i < ut_wfg_n; i++) {
+		if (ut_wfg[i].waiter.node_id == node && ut_wfg[i].waiter.procno == procno
+			&& ut_wfg[i].waiter.cluster_epoch == epoch && ut_wfg[i].waiter.request_id == rid)
+			return ut_wfg[i].waiter.wait_seq;
+	}
 	return 0;
 }
 
@@ -1969,16 +2113,20 @@ UT_TEST(test_convert_u12_sweep_on_holder_death)
 	convert_teardown();
 }
 
-/* U11 — ClusterGrdConvert byte layout pinned (StaticAssert mirror + L45). */
+/* U11 — ClusterGrdConvert byte layout pinned (StaticAssert mirror + L45).
+ * spec-5.8 D1c added waiter_xid in the former pad @52 (size-stable); D1e
+ * appended wait_seq @64 (64 -> 72). */
 UT_TEST(test_convert_u11_struct_layout)
 {
-	UT_ASSERT_EQ((int)sizeof(ClusterGrdConvert), 64);
+	UT_ASSERT_EQ((int)sizeof(ClusterGrdConvert), 72);
 	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, node_id), 0);
 	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, cluster_epoch), 16);
 	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, current_mode), 24);
 	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, requested_mode), 28);
 	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, convert_request_id), 32);
+	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, waiter_xid), 52);
 	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, wait_start), 56);
+	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, wait_seq), 64);
 }
 
 
@@ -2638,13 +2786,336 @@ UT_TEST(test_5_1c_u11_release_and_pop_unchanged)
 }
 
 
+/* ============================================================
+ * spec-5.8 D1b U2 — master-side WFG edge authority (cluster_grd.c registers
+ *	wait edges from the GRD master wrappers against the LMD wait-for graph).
+ *	Edges use the 4-tuple identity (node, procno, epoch, request_id); xid is
+ *	InvalidTransactionId until D1c.  Asserts run against the faithful fake WFG
+ *	above (real-graph 2-node e2e = D8 TAP).
+ * ============================================================ */
+
+/* U2a — REQUEST enqueue registers the waiter against EVERY current conflicting
+ * holder (multi-blocker, no drop — spec-5.8 D1a multi-edge + D1b authority). */
+UT_TEST(test_5_8_d1b_u2a_enqueue_registers_multi_blocker)
+{
+	int saved = cluster_node_id;
+	ClusterResId resid;
+	ClusterGrdHolderId h;
+	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	int nc = -1;
+
+	cluster_node_id = 0;
+	convert_reset();
+	ut_wfg_reset();
+	bast_resid(5800, &resid);
+
+	/* Two compatible S holders on distinct backends. */
+	h = bast_holder(1, 100, 1);
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 1, 0, UT_GES_OPCODE_REQUEST,
+														 ShareLock, conflicts, &nc),
+				 (int)CLUSTER_GRD_GRANT_NOW);
+	h = bast_holder(2, 200, 2);
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 2, 2, 0, UT_GES_OPCODE_REQUEST,
+														 ShareLock, conflicts, &nc),
+				 (int)CLUSTER_GRD_GRANT_NOW);
+
+	/* An X requester conflicts with BOTH S holders -> enqueued with 2 edges. */
+	h = bast_holder(3, 300, 3);
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 3, 3, 0, UT_GES_OPCODE_REQUEST,
+														 ExclusiveLock, conflicts, &nc),
+				 (int)CLUSTER_GRD_ENQUEUED_WAITER);
+
+	UT_ASSERT_EQ(ut_wfg_count_waiter(3, 300, 0, 3), 2);
+	UT_ASSERT(ut_wfg_has_edge(3, 300, 0, 3, 1, 100, 0, 1));
+	UT_ASSERT(ut_wfg_has_edge(3, 300, 0, 3, 2, 200, 0, 2));
+
+	cluster_node_id = saved;
+	convert_teardown();
+}
+
+/* U2b — edges follow the CURRENT holders, not the enqueue-time snapshot
+ * (spec-5.8 §3.1 E2): when a holder releases and a queued waiter is promoted,
+ * the granted waiter's edges are removed and the remaining waiter is re-pointed
+ * at the NEW holder — never left stale on the departed one. */
+UT_TEST(test_5_8_d1b_u2b_refresh_follows_current_holders)
+{
+	int saved = cluster_node_id;
+	ClusterResId resid;
+	ClusterGrdHolderId h;
+	ClusterGrdGrantIdentity granted[PGRAC_GRD_MAX_CONVERTS_PUBLIC + 2];
+	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	int nc = -1;
+	int n;
+
+	cluster_node_id = 0;
+	convert_reset();
+	ut_wfg_reset();
+	bast_resid(5801, &resid);
+
+	/* holder1 X; two X waiters both blocked by holder1. */
+	h = bast_holder(1, 100, 1);
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 1, 0, UT_GES_OPCODE_REQUEST,
+														 ExclusiveLock, conflicts, &nc),
+				 (int)CLUSTER_GRD_GRANT_NOW);
+	h = bast_holder(2, 200, 2);
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 2, 2, 0, UT_GES_OPCODE_REQUEST,
+														 ExclusiveLock, conflicts, &nc),
+				 (int)CLUSTER_GRD_ENQUEUED_WAITER);
+	h = bast_holder(3, 300, 3);
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 3, 3, 0, UT_GES_OPCODE_REQUEST,
+														 ExclusiveLock, conflicts, &nc),
+				 (int)CLUSTER_GRD_ENQUEUED_WAITER);
+	UT_ASSERT_EQ(ut_wfg_count_waiter(2, 200, 0, 2), 1);
+	UT_ASSERT(ut_wfg_has_edge(2, 200, 0, 2, 1, 100, 0, 1));
+	UT_ASSERT_EQ(ut_wfg_count_waiter(3, 300, 0, 3), 1);
+	UT_ASSERT(ut_wfg_has_edge(3, 300, 0, 3, 1, 100, 0, 1));
+
+	/* Release holder1: drain pops one FIFO waiter (w2) -> it becomes the X
+	 * holder.  w2's edges are removed (granted); w3 is re-pointed at w2. */
+	h = bast_holder(1, 100, 1);
+	n = cluster_grd_release_and_drain(&resid, &h, granted, lengthof(granted));
+	UT_ASSERT_EQ(n, 1);
+
+	UT_ASSERT_EQ(ut_wfg_count_waiter(2, 200, 0, 2), 0);		 /* w2 granted -> edges gone */
+	UT_ASSERT_EQ(ut_wfg_count_waiter(3, 300, 0, 3), 1);		 /* w3 still blocked */
+	UT_ASSERT(ut_wfg_has_edge(3, 300, 0, 3, 2, 200, 0, 2));	 /* -> NEW holder w2 */
+	UT_ASSERT(!ut_wfg_has_edge(3, 300, 0, 3, 1, 100, 0, 1)); /* stale edge cleared */
+
+	cluster_node_id = saved;
+	convert_teardown();
+}
+
+/* U2c — CONVERT enqueue registers the convert-waiter against the conflicting
+ * holders, identified by (node, procno, epoch, convert_request_id); the
+ * converting backend's own hold is self-excluded (not a blocker). */
+UT_TEST(test_5_8_d1b_u2c_convert_enqueue_registers_edge)
+{
+	int saved = cluster_node_id;
+	ClusterResId resid;
+	ClusterGrdHolderId h;
+	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	int nc = -1;
+
+	cluster_node_id = 0;
+	convert_reset();
+	ut_wfg_reset();
+	bast_resid(5802, &resid);
+
+	h = bast_holder(1, 100, 1);
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 1, 0, UT_GES_OPCODE_REQUEST,
+														 ShareLock, conflicts, &nc),
+				 (int)CLUSTER_GRD_GRANT_NOW);
+	h = bast_holder(2, 200, 2);
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 2, 2, 0, UT_GES_OPCODE_REQUEST,
+														 ShareLock, conflicts, &nc),
+				 (int)CLUSTER_GRD_GRANT_NOW);
+
+	/* node1/procno100 converts S->X (convert_request_id 10); blocked by the
+	 * node2 S holder (the node1 S hold self-excludes). */
+	nc = -1;
+	UT_ASSERT_EQ((int)cluster_grd_convert_or_enqueue(&resid, 1, 100, 0, ShareLock, ExclusiveLock,
+													 10, 1, 0, conflicts, &nc),
+				 (int)CLUSTER_GRD_CONVERT_ENQUEUED);
+
+	UT_ASSERT_EQ(ut_wfg_count_waiter(1, 100, 0, 10), 1);
+	UT_ASSERT(ut_wfg_has_edge(1, 100, 0, 10, 2, 200, 0, 2));
+
+	cluster_node_id = saved;
+	convert_teardown();
+}
+
+/* U2d — cancelling a queued REQUEST waiter (timeout) removes its edges. */
+UT_TEST(test_5_8_d1b_u2d_cancel_removes_waiter_edges)
+{
+	int saved = cluster_node_id;
+	ClusterResId resid;
+	ClusterGrdHolderId h;
+	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	int nc = -1;
+
+	cluster_node_id = 0;
+	convert_reset();
+	ut_wfg_reset();
+	bast_resid(5803, &resid);
+
+	h = bast_holder(1, 100, 1);
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 1, 0, UT_GES_OPCODE_REQUEST,
+														 ExclusiveLock, conflicts, &nc),
+				 (int)CLUSTER_GRD_GRANT_NOW);
+	h = bast_holder(2, 200, 2);
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 2, 2, 0, UT_GES_OPCODE_REQUEST,
+														 ExclusiveLock, conflicts, &nc),
+				 (int)CLUSTER_GRD_ENQUEUED_WAITER);
+	UT_ASSERT_EQ(ut_wfg_count_waiter(2, 200, 0, 2), 1);
+
+	h = bast_holder(2, 200, 2);
+	UT_ASSERT_EQ((int)cluster_grd_cancel_waiter_by_id(&resid, &h), (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(ut_wfg_count_waiter(2, 200, 0, 2), 0);
+
+	cluster_node_id = saved;
+	convert_teardown();
+}
+
+
+/* ============================================================
+ * spec-5.8 D1c U3 — the master-side WFG vertex carries the real waiter xid
+ *	(passed at enqueue/convert), not InvalidTransactionId.  D1b stamped the
+ *	4-tuple identity with xid=Invalid; D1c threads the waiter's xid through so
+ *	a later TX edge can resolve holder=(node,xid) to a waiting backend.
+ * ============================================================ */
+
+/* U3a — an enqueued REQUEST waiter's vertex carries the xid passed in the
+ * waiter meta. */
+UT_TEST(test_5_8_d1c_u3a_request_waiter_carries_xid)
+{
+	int saved = cluster_node_id;
+	ClusterResId resid;
+	ClusterGrdHolderId h;
+	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	int nc = -1;
+
+	cluster_node_id = 0;
+	convert_reset();
+	ut_wfg_reset();
+	bast_resid(5810, &resid);
+
+	h = bast_holder(1, 100, 1);
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant_meta(
+					 &resid, &h, 1, 1, (ClusterGrdWaiterMeta){ (TransactionId)0, 0 }, 0,
+					 UT_GES_OPCODE_REQUEST, ExclusiveLock, conflicts, &nc),
+				 (int)CLUSTER_GRD_GRANT_NOW);
+	h = bast_holder(2, 200, 2);
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant_meta(
+					 &resid, &h, 2, 2, (ClusterGrdWaiterMeta){ (TransactionId)12345, 0 }, 0,
+					 UT_GES_OPCODE_REQUEST, ExclusiveLock, conflicts, &nc),
+				 (int)CLUSTER_GRD_ENQUEUED_WAITER);
+
+	UT_ASSERT_EQ(ut_wfg_count_waiter(2, 200, 0, 2), 1);
+	UT_ASSERT_EQ((int)ut_wfg_waiter_xid(2, 200, 0, 2), 12345);
+
+	cluster_node_id = saved;
+	convert_teardown();
+}
+
+/* U3b — an enqueued convert's convert-waiter vertex carries the xid passed in
+ * the waiter meta. */
+UT_TEST(test_5_8_d1c_u3b_convert_waiter_carries_xid)
+{
+	int saved = cluster_node_id;
+	ClusterResId resid;
+	ClusterGrdHolderId h;
+	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	int nc = -1;
+
+	cluster_node_id = 0;
+	convert_reset();
+	ut_wfg_reset();
+	bast_resid(5811, &resid);
+
+	h = bast_holder(1, 100, 1);
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant_meta(
+					 &resid, &h, 1, 1, (ClusterGrdWaiterMeta){ (TransactionId)0, 0 }, 0,
+					 UT_GES_OPCODE_REQUEST, ShareLock, conflicts, &nc),
+				 (int)CLUSTER_GRD_GRANT_NOW);
+	h = bast_holder(2, 200, 2);
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant_meta(
+					 &resid, &h, 2, 2, (ClusterGrdWaiterMeta){ (TransactionId)0, 0 }, 0,
+					 UT_GES_OPCODE_REQUEST, ShareLock, conflicts, &nc),
+				 (int)CLUSTER_GRD_GRANT_NOW);
+
+	nc = -1;
+	UT_ASSERT_EQ((int)cluster_grd_convert_or_enqueue_meta(
+					 &resid, 1, 100, 0, ShareLock, ExclusiveLock, 10, 1, 0,
+					 (ClusterGrdWaiterMeta){ (TransactionId)67890, 0 }, conflicts, &nc),
+				 (int)CLUSTER_GRD_CONVERT_ENQUEUED);
+
+	UT_ASSERT_EQ(ut_wfg_count_waiter(1, 100, 0, 10), 1);
+	UT_ASSERT_EQ((int)ut_wfg_waiter_xid(1, 100, 0, 10), 67890);
+
+	cluster_node_id = saved;
+	convert_teardown();
+}
+
+/* U4a — spec-5.8 D1e: an enqueued REQUEST waiter's vertex carries the wait_seq
+ * passed in the waiter meta (the D5 ABA-revalidate basis). */
+UT_TEST(test_5_8_d1e_u4a_request_waiter_carries_wait_seq)
+{
+	int saved = cluster_node_id;
+	ClusterResId resid;
+	ClusterGrdHolderId h;
+	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	int nc = -1;
+
+	cluster_node_id = 0;
+	convert_reset();
+	ut_wfg_reset();
+	bast_resid(5820, &resid);
+
+	h = bast_holder(1, 100, 1);
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant_meta(
+					 &resid, &h, 1, 1, (ClusterGrdWaiterMeta){ (TransactionId)0, 0 }, 0,
+					 UT_GES_OPCODE_REQUEST, ExclusiveLock, conflicts, &nc),
+				 (int)CLUSTER_GRD_GRANT_NOW);
+	h = bast_holder(2, 200, 2);
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant_meta(
+					 &resid, &h, 2, 2, (ClusterGrdWaiterMeta){ (TransactionId)0, 777 }, 0,
+					 UT_GES_OPCODE_REQUEST, ExclusiveLock, conflicts, &nc),
+				 (int)CLUSTER_GRD_ENQUEUED_WAITER);
+
+	UT_ASSERT_EQ(ut_wfg_count_waiter(2, 200, 0, 2), 1);
+	UT_ASSERT(ut_wfg_waiter_wait_seq(2, 200, 0, 2) == 777);
+
+	cluster_node_id = saved;
+	convert_teardown();
+}
+
+/* U4b — spec-5.8 D1e: an enqueued convert's vertex carries the wait_seq. */
+UT_TEST(test_5_8_d1e_u4b_convert_waiter_carries_wait_seq)
+{
+	int saved = cluster_node_id;
+	ClusterResId resid;
+	ClusterGrdHolderId h;
+	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	int nc = -1;
+
+	cluster_node_id = 0;
+	convert_reset();
+	ut_wfg_reset();
+	bast_resid(5821, &resid);
+
+	h = bast_holder(1, 100, 1);
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant_meta(
+					 &resid, &h, 1, 1, (ClusterGrdWaiterMeta){ (TransactionId)0, 0 }, 0,
+					 UT_GES_OPCODE_REQUEST, ShareLock, conflicts, &nc),
+				 (int)CLUSTER_GRD_GRANT_NOW);
+	h = bast_holder(2, 200, 2);
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant_meta(
+					 &resid, &h, 2, 2, (ClusterGrdWaiterMeta){ (TransactionId)0, 0 }, 0,
+					 UT_GES_OPCODE_REQUEST, ShareLock, conflicts, &nc),
+				 (int)CLUSTER_GRD_GRANT_NOW);
+
+	nc = -1;
+	UT_ASSERT_EQ((int)cluster_grd_convert_or_enqueue_meta(
+					 &resid, 1, 100, 0, ShareLock, ExclusiveLock, 10, 1, 0,
+					 (ClusterGrdWaiterMeta){ (TransactionId)0, 888 }, conflicts, &nc),
+				 (int)CLUSTER_GRD_CONVERT_ENQUEUED);
+
+	UT_ASSERT_EQ(ut_wfg_count_waiter(1, 100, 0, 10), 1);
+	UT_ASSERT(ut_wfg_waiter_wait_seq(1, 100, 0, 10) == 888);
+
+	cluster_node_id = saved;
+	convert_teardown();
+}
+
+
 int
 /* cppcheck-suppress constParameter
  * Reason: main() keeps the standard test harness signature used by the
  * other cluster_unit binaries; argv is intentionally unused. */
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(52); /* spec-5.3: +6 over the prior 42; spec-5.5: +3; +1 release reclaim */
+	UT_PLAN(
+		60); /* prior 42; spec-5.3:+6; 5.5:+3; +1 release reclaim; 5.8 D1b:+4 (U2a-d); D1c:+2 (U3a-b); D1e:+2 (U4a-b) */
 
 	UT_RUN(test_grd_clusterresid_size_16);
 	UT_RUN(test_grd_resid_encode_decode_roundtrip);
@@ -2711,6 +3182,20 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_5_1c_u6_bast_consume_empty_and_guards);
 	UT_RUN(test_5_1c_u10_bast_deliver_ok_predicate);
 	UT_RUN(test_5_1c_u11_release_and_pop_unchanged);
+
+	/* spec-5.8 D1b — master-side WFG edge authority (U2a-d). */
+	UT_RUN(test_5_8_d1b_u2a_enqueue_registers_multi_blocker);
+	UT_RUN(test_5_8_d1b_u2b_refresh_follows_current_holders);
+	UT_RUN(test_5_8_d1b_u2c_convert_enqueue_registers_edge);
+	UT_RUN(test_5_8_d1b_u2d_cancel_removes_waiter_edges);
+
+	/* spec-5.8 D1c — waiter xid threaded into the WFG vertex (U3a-b). */
+	UT_RUN(test_5_8_d1c_u3a_request_waiter_carries_xid);
+	UT_RUN(test_5_8_d1c_u3b_convert_waiter_carries_xid);
+
+	/* spec-5.8 D1e — waiter wait_seq threaded into the WFG vertex (U4a-b). */
+	UT_RUN(test_5_8_d1e_u4a_request_waiter_carries_wait_seq);
+	UT_RUN(test_5_8_d1e_u4b_convert_waiter_carries_wait_seq);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

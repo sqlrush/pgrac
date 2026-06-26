@@ -82,10 +82,11 @@ PG_FUNCTION_INFO_V1(cluster_get_ic_peers);
  * disable-mode stub body is at the bottom of this file.
  */
 PG_FUNCTION_INFO_V1(cluster_get_ic_msg_types);
-PG_FUNCTION_INFO_V1(cluster_get_grd_shards);		  /* spec-2.14 D7 */
-PG_FUNCTION_INFO_V1(cluster_get_grd_entries);		  /* spec-2.15 D6 */
-PG_FUNCTION_INFO_V1(cluster_get_lmd_state);			  /* spec-2.19 D11 */
-PG_FUNCTION_INFO_V1(pg_cluster_lmd_inject_wait_edge); /* spec-2.22 D16 */
+PG_FUNCTION_INFO_V1(cluster_get_grd_shards);		   /* spec-2.14 D7 */
+PG_FUNCTION_INFO_V1(cluster_get_grd_entries);		   /* spec-2.15 D6 */
+PG_FUNCTION_INFO_V1(cluster_get_lmd_state);			   /* spec-2.19 D11 */
+PG_FUNCTION_INFO_V1(pg_cluster_lmd_inject_wait_edge);  /* spec-2.22 D16 */
+PG_FUNCTION_INFO_V1(pg_cluster_lmd_remove_wait_edges); /* spec-5.8 D3 */
 
 /*
  * spec-2.5 D15 -- cluster_get_cssd_peers SRF.  Body lives in
@@ -1284,6 +1285,17 @@ pg_cluster_lmd_inject_wait_edge(PG_FUNCTION_ARGS pg_attribute_unused())
 {
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("pg_cluster_lmd_inject_wait_edge requires --enable-cluster")));
+	PG_RETURN_NULL();
+}
+
+/*
+ * spec-5.8 D3 -- pg_cluster_lmd_remove_wait_edges disable-cluster stub.
+ */
+Datum
+pg_cluster_lmd_remove_wait_edges(PG_FUNCTION_ARGS pg_attribute_unused())
+{
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("pg_cluster_lmd_remove_wait_edges requires --enable-cluster")));
 	PG_RETURN_NULL();
 }
 

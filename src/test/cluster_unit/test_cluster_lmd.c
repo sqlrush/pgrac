@@ -376,10 +376,12 @@ void
 cluster_lmd_cleanup_skip_other_owner_count_inc(uint64 d pg_attribute_unused())
 {}
 int cluster_lmd_cleanup_sweep_interval_ms = 5000;
-void
+bool
 cluster_lmd_signal_local_victim(uint32 a pg_attribute_unused(), uint64 b pg_attribute_unused(),
-								uint64 c pg_attribute_unused())
-{}
+								uint64 c pg_attribute_unused(), uint64 d pg_attribute_unused())
+{
+	return false;
+}
 void
 cluster_lmd_cross_node_cancel_queue_full_count_inc(uint64 d pg_attribute_unused())
 {}
@@ -395,6 +397,35 @@ s_lock(volatile slock_t *l pg_attribute_unused(), const char *f pg_attribute_unu
 {
 	return 0;
 }
+
+/* spec-5.8 D3b — symbols newly referenced by cluster_lmd.o (HC16 coordinator
+ * election + coordinator tick).  The standalone harness never runs LmdMain or
+ * the coordinator tick, so these only need to resolve at link time. */
+int cluster_node_id = 0;
+bool cluster_lmd_deadlock_detection_enabled = true;
+int cluster_lmd_global_dd_interval_ms = 2000;
+
+int
+cluster_conf_node_count(void)
+{
+	return 1;
+}
+
+int
+cluster_cssd_get_peer_state(int32 peer_id pg_attribute_unused())
+{
+	return 0; /* CLUSTER_CSSD_PEER_ALIVE */
+}
+
+void
+cluster_lmd_tarjan_run_coordinator_scan(int collect_timeout_ms pg_attribute_unused())
+{}
+
+/* spec-5.8 D8 — probe collector shmem region register (called from
+ * cluster_lmd_shmem_register); standalone harness never attaches it. */
+void
+cluster_lmd_probe_collector_shmem_register(void)
+{}
 
 
 /* ============================================================

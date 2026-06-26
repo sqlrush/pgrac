@@ -48,6 +48,7 @@
 #include "cluster/cluster_advisory.h"
 #include "cluster/cluster_ges.h" /* GES_REJECT_REASON_* for U6 */
 #include "cluster/cluster_lmd.h"
+#include "cluster/cluster_lmd_wait_state.h"
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_native_lock_probe.h" /* spec-5.3 same-lock-group helper */
 #include "miscadmin.h"
@@ -128,6 +129,35 @@ cluster_lmd_submit_wait_edge_real(const ClusterLmdVertex *waiter pg_attribute_un
 {
 	return true;
 }
+
+/*
+ * spec-5.8 D1d — per-proc wait-state stubs.  MyProc is NULL in this
+ * standalone harness, so the S4/S5 wiring never invokes these;  the symbols
+ * (and the PG_TRY error-stack globals the wiring introduces) only need to
+ * resolve for the link.
+ */
+sigjmp_buf *PG_exception_stack = NULL;
+ErrorContextCallback *error_context_stack = NULL;
+
+void
+pg_re_throw(void)
+{
+	abort(); /* never reached — the stub wait never throws */
+}
+
+uint64
+cluster_lmd_wait_state_publish(ClusterLmdProcWaitState *ws pg_attribute_unused(),
+							   uint8 kind pg_attribute_unused(),
+							   uint64 request_id pg_attribute_unused(),
+							   uint64 cluster_epoch pg_attribute_unused(),
+							   TransactionId xid pg_attribute_unused())
+{
+	return 0;
+}
+
+void
+cluster_lmd_wait_state_clear(ClusterLmdProcWaitState *ws pg_attribute_unused())
+{}
 
 /* spec-2.17 — sig_atomic_t cancel flag (cluster_signal.o not linked). */
 #include <signal.h>
