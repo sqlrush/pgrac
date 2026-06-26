@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 #-------------------------------------------------------------------------
 #
-# 305_cluster_5_53_cr_key_reuse.pl
+# 306_cluster_5_53_cr_key_reuse.pl
 #	  spec-5.53 D8 — CR key identity contract + safe relfilenode-reuse, real
 #	  server e2e (single cluster-enabled node, cross-backend, mirror of the
 #	  spec-5.51 t/303 fixture).
@@ -38,7 +38,7 @@
 # Portions Copyright (c) 2026, pgrac contributors
 #
 # IDENTIFICATION
-#	  src/test/cluster_tap/t/305_cluster_5_53_cr_key_reuse.pl
+#	  src/test/cluster_tap/t/306_cluster_5_53_cr_key_reuse.pl
 #
 #-------------------------------------------------------------------------
 
