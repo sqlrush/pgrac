@@ -217,7 +217,7 @@ cluster_touched_peers_register_parallel_slots(ClusterTouchedPeersSnapshot *slots
 
 
 void
-cluster_touched_peers_unregister_parallel_slots(ClusterTouchedPeersSnapshot *slots)
+cluster_touched_peers_unregister_parallel_slots(const ClusterTouchedPeersSnapshot *slots)
 {
 	int i;
 
@@ -331,7 +331,7 @@ cluster_touched_peers_register_parallel_slots(
 
 void
 cluster_touched_peers_unregister_parallel_slots(
-	ClusterTouchedPeersSnapshot *slots pg_attribute_unused())
+	const ClusterTouchedPeersSnapshot *slots pg_attribute_unused())
 {}
 
 void

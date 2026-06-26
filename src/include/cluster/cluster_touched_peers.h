@@ -135,7 +135,8 @@ extern void cluster_touched_peers_merge_from_dsm(const ClusterTouchedPeersSnapsh
  * registration table fail-closes to poison. */
 extern void cluster_touched_peers_register_parallel_slots(ClusterTouchedPeersSnapshot *slots,
 														  int nworkers);
-extern void cluster_touched_peers_unregister_parallel_slots(ClusterTouchedPeersSnapshot *slots);
+extern void
+cluster_touched_peers_unregister_parallel_slots(const ClusterTouchedPeersSnapshot *slots);
 extern void cluster_touched_peers_merge_active_parallel_workers(void);
 
 /* Fail-closed poison (no stamp counted): used when a parallel worker was

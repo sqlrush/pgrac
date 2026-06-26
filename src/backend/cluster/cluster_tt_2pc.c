@@ -64,7 +64,10 @@ void
 AtPrepare_ClusterTT(void)
 {
 	ClusterTT2PCBinding bindings[CLUSTER_TT_2PC_MAX_BINDINGS + 1];
-	UBA heads[CLUSTER_TT_2PC_MAX_BINDINGS + 1];
+	/* PGRAC: zero-init (only heads[0..nbindings-1] is filled+read; the
+	 * defensive {0} silences a cppcheck uninitvar surfaced by spec-5.14's
+	 * new cluster_touched_peers.c in the same scan dir). */
+	UBA heads[CLUSTER_TT_2PC_MAX_BINDINGS + 1] = { 0 };
 	ClusterTT2PCSubLink sublinks[CLUSTER_TT_2PC_MAX_SUBLINKS + 1];
 	uint16 nbindings;
 	uint32 nsublinks;
