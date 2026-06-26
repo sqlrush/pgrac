@@ -124,6 +124,20 @@ DefineCustomEnumVariable(const char *name pg_attribute_unused(),
 	/* Stub: real impl in src/backend/utils/misc/guc.c (stage 0.18) */
 }
 
+/* spec-5.12 D6: cluster_guc.c now registers real (double) GUCs too. */
+void
+DefineCustomRealVariable(
+	const char *name pg_attribute_unused(), const char *short_desc pg_attribute_unused(),
+	const char *long_desc pg_attribute_unused(), double *valueAddr pg_attribute_unused(),
+	double bootValue pg_attribute_unused(), double minValue pg_attribute_unused(),
+	double maxValue pg_attribute_unused(), GucContext context pg_attribute_unused(),
+	int flags pg_attribute_unused(), GucRealCheckHook check_hook pg_attribute_unused(),
+	GucRealAssignHook assign_hook pg_attribute_unused(),
+	GucShowHook show_hook pg_attribute_unused())
+{
+	/* Stub: real impl in src/backend/utils/misc/guc.c */
+}
+
 void
 DefineCustomStringVariable(
 	const char *name pg_attribute_unused(), const char *short_desc pg_attribute_unused(),

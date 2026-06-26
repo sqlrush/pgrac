@@ -44,7 +44,8 @@
 #include "postgres.h"
 
 #include "cluster/cluster_debug.h"
-#include "cluster/cluster_hang.h" /* spec-5.11: ClusterHangDumpData for dump_hang stubs */
+#include "cluster/cluster_hang.h"		  /* spec-5.11: ClusterHangDumpData for dump_hang stubs */
+#include "cluster/cluster_hang_resolve.h" /* spec-5.12: ClusterHangResolveCounters for dump stubs */
 
 #undef printf
 #undef fprintf
@@ -2202,6 +2203,24 @@ cluster_hang_wait_source_str(uint8 s pg_attribute_unused())
 }
 const char *
 cluster_hang_quality_str(uint8 q pg_attribute_unused())
+{
+	return "(stub)";
+}
+
+/* spec-5.12 D8: dump_hang now also reads the disposition counters / mode. */
+int cluster_hang_resolution_mode = 0;
+void
+cluster_hang_resolve_get_counters(ClusterHangResolveCounters *out)
+{
+	memset(out, 0, sizeof(*out));
+}
+const char *
+cluster_hang_resolve_mode_str(int mode pg_attribute_unused())
+{
+	return "(stub)";
+}
+const char *
+cluster_hang_action_tier_str(int tier pg_attribute_unused())
 {
 	return "(stub)";
 }

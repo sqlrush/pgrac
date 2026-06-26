@@ -12457,6 +12457,28 @@
   proargnames => '{pid}',
   prosrc => 'pg_cluster_hang_dump' },
 
+# spec-5.12 D7 (2026-06-27) -- Hang Manager disposition SQL surface.
+# pg_cluster_hang_victims(): advisory SRF of the current actionable root
+# blockers + victim score + recommended action.  Carries other backends'
+# pid/xid, so it is gated like pg_stat_activity (pg_read_all_stats members /
+# superuser see all rows; others see only victims owned by their own role).
+{ oid => '8958', descr => 'advisory list of cluster hang victims + scores',
+  proname => 'pg_cluster_hang_victims', prorows => '64',
+  proretset => 't', provolatile => 'v', proparallel => 'r',
+  prorettype => 'record', proargtypes => '',
+  proallargtypes => '{int4,int4,xid,int8,int4,float8,text,text}',
+  proargmodes => '{o,o,o,o,o,o,o,o}',
+  proargnames => '{victim_pid,backend_id,xid,wait_age_ms,n_blocked,score,skip_reason,recommended_action}',
+  prosrc => 'pg_cluster_hang_victims' },
+
+# pg_cluster_hang_resolve(pid): manually dispose of one hang victim, subject
+# to the same fail-CLOSED gate as the periodic loop.  Superuser-only.
+{ oid => '8959', descr => 'manually resolve (terminate) a cluster hang victim',
+  proname => 'pg_cluster_hang_resolve', provolatile => 'v',
+  prorettype => 'bool', proargtypes => 'int4',
+  proargnames => '{pid}',
+  prosrc => 'pg_cluster_hang_resolve' },
+
 # spec-3.2 D5b (2026-05-22) -- test-only visibility fork injection
 # functions.  These are SQL-visible so TAP can drive a real
 # HeapTupleSatisfiesMVCC cluster-path miss and assert 53R97.  Production

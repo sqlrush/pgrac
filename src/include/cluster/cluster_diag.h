@@ -108,7 +108,8 @@
 
 #include "datatype/timestamp.h"
 #include "storage/lwlock.h"
-#include "cluster/cluster_hang.h" /* spec-5.11 D1b: embedded ClusterHangSampleStore */
+#include "cluster/cluster_hang.h"		  /* spec-5.11 D1b: embedded ClusterHangSampleStore */
+#include "cluster/cluster_hang_resolve.h" /* spec-5.12 D5/D8: disposition counters + confirm map */
 
 
 /*
@@ -169,6 +170,16 @@ typedef struct ClusterDiagSharedState {
 	 * DIAG, read by backends running dump_hang.
 	 */
 	ClusterHangSampleStore hang_store;
+
+	/*
+	 * spec-5.12 D5/D8 — Hang Manager disposition state.  Embedded directly
+	 * (same Q13-A rationale: the region size grows, the region count does
+	 * not).  Single writer = DIAG; guarded by the lwlock above.  The confirm
+	 * map carries the per-victim-identity cross-round confirmation /
+	 * anti-thrash / tier-escalation state; the counters are cumulative.
+	 */
+	ClusterHangResolveCounters hang_resolve_counters;
+	ClusterHangConfirmMap hang_confirm_map;
 } ClusterDiagSharedState;
 
 

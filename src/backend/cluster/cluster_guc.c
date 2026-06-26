@@ -48,6 +48,7 @@
 #include "cluster/cluster_cr_pool.h"		 /* cluster_shared_cr_pool_* (spec-5.51 D8) */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_hang.h"			  /* CLUSTER_HANG_MAX_SAMPLES (spec-5.11 D7) */
+#include "cluster/cluster_hang_resolve.h"	  /* HANG_RESOLVE_* + disposition GUCs (spec-5.12 D6) */
 #include "cluster/storage/cluster_undo_buf.h" /* cluster_undo_buf_writeback_allowed (spec-3.18 D1) */
 #include "cluster/cluster_ic.h"				  /* ClusterICTier enum values */
 #include "cluster/cluster_inject.h"			  /* cluster_injection_assign_hook (stage 0.27) */
@@ -240,6 +241,23 @@ int cluster_hang_threshold_ms = 60000;
 bool cluster_hang_dump_enabled = true;
 int cluster_hang_max_chain_depth = 100;
 int cluster_hang_max_sampled = 64;
+
+/* spec-5.12 D6: Hang Manager disposition GUCs.  Default mode = advisory
+ * (evaluate + recommend, never act); enforce is explicit opt-in (spec §8 Q4).
+ * priority / cpu are NOT weights — PG exposes no such signal (spec §8 Q7). */
+int cluster_hang_resolution_mode = HANG_RESOLVE_ADVISORY;
+int cluster_hang_resolution_confirm_rounds = 2;
+int cluster_hang_resolution_soft_timeout_ms = 5000;
+int cluster_hang_resolution_max_per_round = 1;
+double cluster_hang_victim_w_age = 0.5;
+double cluster_hang_victim_w_rollback = 0.3;
+double cluster_hang_victim_w_blockers = 0.2;
+
+static const struct config_enum_entry cluster_hang_resolution_mode_options[]
+	= { { "off", HANG_RESOLVE_OFF, false },
+		{ "advisory", HANG_RESOLVE_ADVISORY, false },
+		{ "enforce", HANG_RESOLVE_ENFORCE, false },
+		{ NULL, 0, false } };
 
 /* spec-1.14 D8: cluster.cluster_stats_main_loop_interval (mirror). */
 int cluster_cluster_stats_main_loop_interval = 1000;
@@ -1797,6 +1815,71 @@ cluster_init_guc(void)
 					 "(CLUSTER_HANG_MAX_SAMPLES = 64) (spec-5.11)."),
 		&cluster_hang_max_sampled, 64, 1, CLUSTER_HANG_MAX_SAMPLES, PGC_SIGHUP, 0, NULL, NULL,
 		NULL);
+
+	/*
+	 * spec-5.12 D6 -- Hang Manager disposition GUCs.  The DIAG main loop, right
+	 * after sampling, evaluates the spec-5.11 actionable samples and (in
+	 * enforce mode) disposes of the root blocker via a cancel -> terminate
+	 * ladder.  Factory default is advisory (dry-run): evaluate + recommend but
+	 * never cancel/terminate, so operators can observe recommendation quality
+	 * before granting enforce.  All PGC_SIGHUP (no on-disk / ABI effect).
+	 */
+	DefineCustomEnumVariable(
+		"cluster.hang_resolution_mode",
+		gettext_noop("Hang Manager disposition mode (off / advisory / enforce)."),
+		gettext_noop("off: do not evaluate disposition (spec-5.11 diagnostics still run). "
+					 "advisory (default): evaluate + record recommendations and counters "
+					 "but never cancel or terminate (dry-run). enforce: actually dispose "
+					 "of the root blocker via a cancel -> terminate ladder (spec-5.12)."),
+		&cluster_hang_resolution_mode, HANG_RESOLVE_ADVISORY, cluster_hang_resolution_mode_options,
+		PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.hang_resolution_confirm_rounds",
+		gettext_noop("Consecutive rounds a victim identity must stay an actionable "
+					 "long-wait before disposition (hysteresis)."),
+		gettext_noop("Guards against disposing on a transient spike; the identity must "
+					 "remain a COMPLETE long-wait root blocker for this many consecutive "
+					 "sampling rounds before any signal is sent (spec-5.12 D5)."),
+		&cluster_hang_resolution_confirm_rounds, 2, 1, 100, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.hang_resolution_soft_timeout_ms",
+		gettext_noop("Grace period between disposition tiers (cancel -> terminate -> degrade)."),
+		gettext_noop("Tier escalation is cross-round and non-blocking: a victim still "
+					 "hanging this long after the previous tier escalates to the next "
+					 "tier on a later sampling round (DIAG never sleeps, spec-5.12 §2.3)."),
+		&cluster_hang_resolution_soft_timeout_ms, 5000, 100, 600000, PGC_SIGHUP, GUC_UNIT_MS, NULL,
+		NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.hang_resolution_max_per_round",
+		gettext_noop("Maximum number of victims disposed per evaluation round."),
+		gettext_noop("Rate-limits disposition so a burst of false hangs cannot cause a "
+					 "cascade of cancels/terminates in a single round (spec-5.12)."),
+		&cluster_hang_resolution_max_per_round, 1, 1, CLUSTER_HANG_MAX_SAMPLES, PGC_SIGHUP, 0, NULL,
+		NULL, NULL);
+
+	DefineCustomRealVariable(
+		"cluster.hang_victim_w_age", gettext_noop("Victim score weight for transaction age."),
+		gettext_noop("Higher weight prefers disposing the oldest transaction (spec-5.12 §2.2). "
+					 "There are deliberately no priority / cpu weights: PG exposes no "
+					 "per-session priority or per-backend CPU accounting (spec §8 Q7)."),
+		&cluster_hang_victim_w_age, 0.5, 0.0, 1000.0, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	DefineCustomRealVariable(
+		"cluster.hang_victim_w_rollback",
+		gettext_noop("Victim score weight for rollback cost (proxied by held lock count)."),
+		gettext_noop("Higher weight prefers disposing the cheaper-to-roll-back victim, "
+					 "i.e. the one holding fewer locks (spec-5.12 §2.2)."),
+		&cluster_hang_victim_w_rollback, 0.3, 0.0, 1000.0, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	DefineCustomRealVariable(
+		"cluster.hang_victim_w_blockers",
+		gettext_noop("Victim score weight for root-ness (number of waiters blocked)."),
+		gettext_noop("Higher weight prefers disposing the victim that unblocks the most "
+					 "waiters (spec-5.12 §2.2)."),
+		&cluster_hang_victim_w_blockers, 0.2, 0.0, 1000.0, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	/*
 	 * spec-2.2 D7 (2026-05-07) -- Tier 1 TCP transport tuning GUCs.

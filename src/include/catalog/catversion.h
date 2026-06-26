@@ -693,7 +693,9 @@
  * CANCEL_ACK (17) + dedicated GesCancelWaitPayload (64B) / GesCancelAckPayload
  * (48B) + per-proc ClusterCancelToken in PGPROC.  Rebased on top of 5.10/5.11
  * (which landed at 202606270); bump to 202606280 for the combined wire ABI. */
-#define CATALOG_VERSION_NO 202606280
+/* spec-5.12 (2026-06-27): Hang Manager disposition adds two pg_proc entries
+ * (pg_cluster_hang_victims SRF + pg_cluster_hang_resolve); bump to 202606290. */
+#define CATALOG_VERSION_NO 202606290
 
 /* spec-2.39 D10 (2026-05-21):  SI Broadcaster production activation —
  * DDL commit hook (AtEOXact_Inval + COMMIT PREPARED via cluster-aware

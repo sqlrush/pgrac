@@ -73,12 +73,13 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 
 #include "cluster/cluster_cf_stats.h" /* CF counters (spec-5.6 Dc4) */
 #include "cluster/cluster_conf.h"
-#include "cluster/cluster_elog.h" /* cluster_phase */
-#include "cluster/cluster_diag.h" /* cluster_diag_status (spec-1.13 D12) */
-#include "cluster/cluster_hang.h" /* Hang Manager dump (spec-5.11 D4) */
-#include "cluster/cluster_lck.h"  /* cluster_lck_status (spec-1.12 D12) */
-#include "cluster/cluster_scn.h"  /* cluster_scn_current (spec-1.15 D6) */
-#include "cluster/cluster_ges.h"  /* cluster_ges_{request,reply}_defer_count (spec-2.13 D4) */
+#include "cluster/cluster_elog.h"		  /* cluster_phase */
+#include "cluster/cluster_diag.h"		  /* cluster_diag_status (spec-1.13 D12) */
+#include "cluster/cluster_hang.h"		  /* Hang Manager dump (spec-5.11 D4) */
+#include "cluster/cluster_hang_resolve.h" /* Hang Manager disposition dump (spec-5.12 D8) */
+#include "cluster/cluster_lck.h"		  /* cluster_lck_status (spec-1.12 D12) */
+#include "cluster/cluster_scn.h"		  /* cluster_scn_current (spec-1.15 D6) */
+#include "cluster/cluster_ges.h" /* cluster_ges_{request,reply}_defer_count (spec-2.13 D4) */
 #include "cluster/cluster_ges_reply_wait.h" /* spec-2.23 D13 reply wait counters */
 #include "cluster/cluster_grd.h"	  /* cluster_grd_* observability accessors (spec-2.14 D6) */
 #include "cluster/cluster_hw.h"		  /* HW relation-extend authority counters (spec-5.7 §3.1c) */
@@ -649,6 +650,43 @@ dump_hang(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_lmd_deadlock_confirmed_count_get()));
 	emit_row(rsinfo, "hang", "hang_cycle_detected_count",
 			 fmt_int64((int64)cluster_lmd_cycle_detected_count_get()));
+
+	/*
+	 * spec-5.12 D8 — Hang Manager disposition state + cumulative counters.
+	 * Appended to the same `hang` category (no new category); the mode comes
+	 * from the GUC, the rest from a consistent copy of the DIAG region.
+	 */
+	{
+		ClusterHangResolveCounters rc;
+
+		cluster_hang_resolve_get_counters(&rc);
+		emit_row(rsinfo, "hang", "hang_resolution_mode",
+				 cluster_hang_resolve_mode_str(cluster_hang_resolution_mode));
+		emit_row(rsinfo, "hang", "hang_resolve_evaluations",
+				 fmt_int64((int64)rc.resolve_evaluations));
+		emit_row(rsinfo, "hang", "hang_victims_selected", fmt_int64((int64)rc.victims_selected));
+		emit_row(rsinfo, "hang", "hang_soft_cancels_issued",
+				 fmt_int64((int64)rc.soft_cancels_issued));
+		emit_row(rsinfo, "hang", "hang_terminates_issued", fmt_int64((int64)rc.terminates_issued));
+		emit_row(rsinfo, "hang", "hang_resolved_confirmed",
+				 fmt_int64((int64)rc.resolved_confirmed));
+		emit_row(rsinfo, "hang", "hang_resolution_failed", fmt_int64((int64)rc.resolution_failed));
+		emit_row(rsinfo, "hang", "hang_hard_skipped", fmt_int64((int64)rc.hard_skipped));
+		emit_row(rsinfo, "hang", "hang_non_actionable_skipped",
+				 fmt_int64((int64)rc.non_actionable_skipped));
+		emit_row(rsinfo, "hang", "hang_over_excluded", fmt_int64((int64)rc.over_excluded));
+		emit_row(rsinfo, "hang", "hang_aba_revalidate_failed",
+				 fmt_int64((int64)rc.aba_revalidate_failed));
+		emit_row(rsinfo, "hang", "hang_not_confirmed_yet", fmt_int64((int64)rc.not_confirmed_yet));
+		emit_row(rsinfo, "hang", "hang_no_safe_victim", fmt_int64((int64)rc.no_safe_victim));
+		emit_row(rsinfo, "hang", "hang_degraded_to_timeout",
+				 fmt_int64((int64)rc.degraded_to_timeout));
+		emit_row(rsinfo, "hang", "hang_advisory_recommendations",
+				 fmt_int64((int64)rc.advisory_recommendations));
+		emit_row(rsinfo, "hang", "hang_resolve_last_victim_pid", fmt_int32(rc.last_victim_pid));
+		emit_row(rsinfo, "hang", "hang_resolve_last_action",
+				 cluster_hang_action_tier_str(rc.last_action));
+	}
 
 	/* Per-row long-wait samples (real shmem backing). */
 	for (i = 0; i < data.store.n_samples; i++) {

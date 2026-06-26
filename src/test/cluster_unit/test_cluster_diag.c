@@ -270,6 +270,12 @@ void
 cluster_hang_sample_once(void)
 {}
 
+/* spec-5.12 D1: DiagMain now also evaluates disposition after sampling. */
+int cluster_hang_resolution_mode = 0; /* HANG_RESOLVE_OFF */
+void
+cluster_hang_resolve_once(void)
+{}
+
 
 UT_DEFINE_GLOBALS();
 
@@ -293,12 +299,16 @@ UT_TEST(test_diag_shared_state_size_bounded)
 {
 	/*
 	 * spec-5.11 D1b embeds the bounded ClusterHangSampleStore (64 fixed-size
-	 * slots) directly in this struct (Q13-A: no new shmem region), so the
-	 * size grew from ~80 bytes to a few KiB.  Keep an upper bound to still
-	 * catch accidental bloat, sized to the embedded store + headroom.
+	 * slots); spec-5.12 D5/D8 then append the disposition counters + the
+	 * per-victim-identity confirmation map (still no new shmem region, Q13-A).
+	 * The confirm map is now the tail field; the store precedes the spec-5.12
+	 * fields.  Keep an upper bound to still catch accidental bloat.
 	 */
-	UT_ASSERT(sizeof(ClusterHangSampleStore)
-			  == sizeof(ClusterDiagSharedState) - offsetof(ClusterDiagSharedState, hang_store));
+	UT_ASSERT(sizeof(ClusterHangConfirmMap)
+			  == sizeof(ClusterDiagSharedState)
+					 - offsetof(ClusterDiagSharedState, hang_confirm_map));
+	UT_ASSERT(offsetof(ClusterDiagSharedState, hang_resolve_counters)
+			  >= offsetof(ClusterDiagSharedState, hang_store) + sizeof(ClusterHangSampleStore));
 	UT_ASSERT(sizeof(ClusterDiagSharedState) < 16384);
 }
 

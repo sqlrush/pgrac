@@ -109,6 +109,21 @@ DefineCustomEnumVariable(const char *name pg_attribute_unused(),
 	/* Stub for unit-test linking; real impl lives in PG backend. */
 }
 
+/* spec-5.12 D6: cluster_guc.c is the first cluster module to register real
+ * (double) GUCs (the Hang Manager victim-score weights); stub it too. */
+void
+DefineCustomRealVariable(
+	const char *name pg_attribute_unused(), const char *short_desc pg_attribute_unused(),
+	const char *long_desc pg_attribute_unused(), double *valueAddr pg_attribute_unused(),
+	double bootValue pg_attribute_unused(), double minValue pg_attribute_unused(),
+	double maxValue pg_attribute_unused(), GucContext context pg_attribute_unused(),
+	int flags pg_attribute_unused(), GucRealCheckHook check_hook pg_attribute_unused(),
+	GucRealAssignHook assign_hook pg_attribute_unused(),
+	GucShowHook show_hook pg_attribute_unused())
+{
+	/* Stub for unit-test linking; real impl lives in PG backend. */
+}
+
 void
 DefineCustomStringVariable(
 	const char *name pg_attribute_unused(), const char *short_desc pg_attribute_unused(),

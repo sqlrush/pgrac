@@ -390,6 +390,15 @@ extern bool cluster_hang_dump_enabled;
 extern int cluster_hang_max_chain_depth;
 extern int cluster_hang_max_sampled;
 
+/* spec-5.12 D6: Hang Manager disposition GUCs (all PGC_SIGHUP). */
+extern int cluster_hang_resolution_mode; /* ClusterHangResolveMode */
+extern int cluster_hang_resolution_confirm_rounds;
+extern int cluster_hang_resolution_soft_timeout_ms;
+extern int cluster_hang_resolution_max_per_round;
+extern double cluster_hang_victim_w_age;
+extern double cluster_hang_victim_w_rollback;
+extern double cluster_hang_victim_w_blockers;
+
 
 /*
  * cluster.cluster_stats_main_loop_interval (spec-1.14 D8): same

@@ -518,8 +518,20 @@ DiagMain(void)
 		 * unchanged.  cluster_hang_sample_once() is fail-OPEN — it never
 		 * throws (internal PG_TRY backstop).
 		 */
-		if (cluster_hang_manager_enabled && cluster_hang_sample_due(GetCurrentTimestamp()))
+		if (cluster_hang_manager_enabled && cluster_hang_sample_due(GetCurrentTimestamp())) {
 			cluster_hang_sample_once();
+
+			/*
+			 * spec-5.12 D1 — Hang Manager disposition tick.  Immediately after
+			 * sampling, in the SAME process and loop (no cross-process
+			 * publish/read window, spec §3.2 L339), evaluate the just-published
+			 * actionable samples and, in enforce mode, dispose of the root
+			 * blocker.  off mode short-circuits cheaply; the call is
+			 * fail-CLOSED and never throws (internal PG_TRY backstop).
+			 */
+			if (cluster_hang_resolution_mode != HANG_RESOLVE_OFF)
+				cluster_hang_resolve_once();
+		}
 
 		/* Sprint B inject: main-loop-iter (test mid-loop fault). */
 		CLUSTER_INJECTION_POINT("cluster-diag-main-loop-iter");
