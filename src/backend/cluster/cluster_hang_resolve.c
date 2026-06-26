@@ -104,8 +104,13 @@ hang_holdmask_conflicts(LOCKMASK holdMask, LOCKMODE waitLockMode)
 	int m;
 
 	for (m = 1; m < MAX_LOCKMODES; m++) {
-		if ((holdMask & LOCKBIT_ON(m)) && DoLockModesConflict(m, waitLockMode))
+		if ((holdMask & LOCKBIT_ON(m)) && DoLockModesConflict(m, waitLockMode)) {
+			/* GES_MODE_OK: PG heavyweight-lock conflict (a victim's granted
+			 * holdMask vs a waiter's waitLockMode from GetLockStatusData), NOT
+			 * a GES cluster-lock mode decision; DoLockModesConflict is the
+			 * correct PG primitive here (mirrors spec-5.11 hang_find_hard_blocker). */
 			return true;
+		}
 	}
 	return false;
 }
