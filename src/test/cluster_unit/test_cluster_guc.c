@@ -234,6 +234,19 @@ int cluster_shared_cr_pool_size_blocks = 0;
  * (not linked here); cluster_guc.c references it via DefineCustomIntVariable. */
 int cluster_cr_cache_max_blocks = 64;
 
+/*
+ * spec-5.51 + spec-5.52 backing-var stubs (standalone cluster_guc unit test,
+ * held 5.51/5.52 stack).  cluster_guc.c registers GUCs whose backing vars live
+ * in cluster_cr_pool.c (spec-5.51) and cluster_cr_admit.c (spec-5.52 D8),
+ * neither of which is linked into this PG-free unit binary; provide local
+ * storage so cluster_guc.o links standalone.  Link-only: this test never calls
+ * cluster_init_guc(), so the values are never read.  NOT a substrate / shmem /
+ * ClusterCRShared / production-semantics change -- pure test linkage.
+ */
+int cluster_cr_pool_admission_policy = 0;			/* spec-5.52 D8 (0 == admit_all) */
+int cluster_cr_pool_admit_relation_backend_cap = 0; /* spec-5.52 D8 */
+int cluster_cr_pool_admit_pressure_ratio = 0;		/* spec-5.52 D8 */
+
 /* spec-5.1b D7: cluster_ges_mode_selfcheck GUC removed (cluster_guc.c no
  * longer references it), so the stub definition is gone too. */
 

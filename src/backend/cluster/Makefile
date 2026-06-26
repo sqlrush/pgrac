@@ -151,6 +151,8 @@ OBJS = \
 	cluster_cr_apply.o \
 	cluster_cr_cache.o \
 	cluster_cr_pool.o \
+	cluster_cr_admit.o \
+	cluster_cr_admit_stat.o \
 	cluster_cr_srf.o \
 	cluster_tt_slot.o \
 	cluster_tt_2pc.o \

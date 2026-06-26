@@ -43,7 +43,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_itl_cleanout test_cluster_visibility_inject test_cluster_itl_cleanout_perf \
         test_cluster_heap_lock_tuple test_cluster_perf_gates \
         test_cluster_subtrans test_cluster_multixact test_cluster_undo_format \
-        test_cluster_undo_record test_cluster_undo_lifecycle test_cluster_cr test_cluster_cr_cache test_cluster_cr_pool test_cluster_tt_durable \
+        test_cluster_undo_record test_cluster_undo_lifecycle test_cluster_cr test_cluster_cr_cache test_cluster_cr_pool test_cluster_cr_admit test_cluster_cr_admit_stat test_cluster_tt_durable \
         test_cluster_retention test_cluster_undo_cleaner test_cluster_visibility_variants test_cluster_tt_2pc \
         test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_undo_extent \
         test_cluster_wal_thread test_cluster_wal_state test_cluster_recovery_plan \
@@ -1403,5 +1403,29 @@ test_cluster_cr_pool: test_cluster_cr_pool.c unit_test.h \
 		$(CLUSTER_CR_POOL_O) $(CLUSTER_CR_CACHE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_CR_POOL_O) $(CLUSTER_CR_CACHE_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-5.52: test_cluster_cr_admit — backend-local admission predicate +
+# scan-kind marker lifecycle + page-identity churn detector + per-backend
+# relcap throttle + clock-pressure gauge (cluster_cr_admit.o).  Stubs
+# ParallelWorkerNumber + the spec-5.51 evict/hit counter accessors (read only
+# by the pressure gauge); no shmem / LWLock (all admission state is backend-local).
+CLUSTER_CR_ADMIT_O = $(top_builddir)/src/backend/cluster/cluster_cr_admit.o
+test_cluster_cr_admit: test_cluster_cr_admit.c unit_test.h \
+		$(CLUSTER_CR_ADMIT_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_CR_ADMIT_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-5.52 D9: test_cluster_cr_admit_stat — independent admission reason
+# counter shmem region (cluster_cr_admit_stat.o) with malloc-backed
+# ShmemInitStruct + no-op region-register stubs.
+CLUSTER_CR_ADMIT_STAT_O = $(top_builddir)/src/backend/cluster/cluster_cr_admit_stat.o
+test_cluster_cr_admit_stat: test_cluster_cr_admit_stat.c unit_test.h \
+		$(CLUSTER_CR_ADMIT_STAT_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_CR_ADMIT_STAT_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@

@@ -577,6 +577,21 @@ void
 cluster_tt_durable_shmem_register(void)
 {}
 
+/*
+ * spec-5.52 D9 stub: cluster_init_shmem_module also registers the independent
+ * admission reason-counter region (cluster_cr_admit_stat.c is not linked into
+ * this standalone test); cluster_guc.o references the spec-5.52 D8 admission GUC
+ * vars.  Link-only no-op stubs.  (The spec-5.51 cr_pool region register funcs +
+ * shared_cr_pool_* GUC vars are already stubbed above next to the cr_pool region
+ * stub.)  NOT a substrate / shmem-layout / ClusterCRShared change.
+ */
+void
+cluster_cr_admit_shmem_register(void)
+{}
+int cluster_cr_pool_admission_policy = 0;			/* spec-5.52 D8 */
+int cluster_cr_pool_admit_relation_backend_cap = 0; /* spec-5.52 D8 */
+int cluster_cr_pool_admit_pressure_ratio = 0;		/* spec-5.52 D8 */
+
 /* Spec-2.5 Sprint A stub: same for CSSD. */
 void
 cluster_cssd_shmem_register(void)

@@ -131,6 +131,22 @@ cluster_injection_get_count(void)
 	return 0;
 }
 
+#include "cluster/cluster_cr_pool.h"  /* spec-5.51 counter prototypes */
+#include "cluster/cluster_cr_admit.h" /* spec-5.52 D9 counter prototype */
+
+/*
+ * spec-5.52 D9 stub (standalone cluster_debug unit test).  cluster_debug.o reads
+ * the admission reason counter for its pg_cluster_state "cr_pool" rows but
+ * cluster_cr_admit_stat.o is not linked here.  Link-only no-op stub.  (The
+ * spec-5.51 cr_pool counter stubs are defined below next to the dump_cr_pool
+ * stub block.)  NOT a substrate / ClusterCRShared change.
+ */
+uint64
+cluster_cr_admit_stat_count(ClusterCRAdmitReason reason pg_attribute_unused())
+{
+	return 0;
+}
+
 bool
 cluster_injection_get_state_at(int idx pg_attribute_unused(),
 							   const char **name_out pg_attribute_unused(),

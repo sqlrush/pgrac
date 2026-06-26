@@ -101,6 +101,7 @@
 #include "cluster/cluster_undo_record_api.h" /* cluster_undo_record_shmem_register (spec-3.7 D5) */
 #include "cluster/cluster_cr.h"				 /* cluster_cr_shmem_register (spec-3.9 D2) */
 #include "cluster/cluster_cr_pool.h"		 /* cluster_cr_pool_shmem_register (spec-5.51 D1) */
+#include "cluster/cluster_cr_admit.h"		 /* cluster_cr_admit_shmem_register (spec-5.52 D9) */
 #include "cluster/cluster_tt_durable.h"		 /* cluster_tt_durable_shmem_register (spec-3.11 D7) */
 #include "cluster/cluster_visibility_inject.h" /* cluster_visibility_inject_shmem_register (spec-3.2 D5b) */
 #include "cluster/cluster_itl.h"			   /* cluster_lock_path_shmem_register (spec-3.4e D6) */
@@ -501,6 +502,12 @@ cluster_init_shmem_module(void)
 	 * shmem-region-count baseline is deterministic; size_fn returns 0 (zero
 	 * bytes) when cluster.shared_cr_pool_size_blocks == 0 (the default). */
 	cluster_cr_pool_shmem_register();
+
+	/* spec-5.52 D9: independent admission reason-counter region (7 atomic
+	 * counters, 0 LWLock).  Separate from ClusterCRShared so the held 5.51
+	 * substrate layout is untouched.  Always registered (region count is
+	 * deterministic); a few uint64s of shared memory. */
+	cluster_cr_admit_shmem_register();
 
 	/*
 	 * PGRAC spec-3.11 D7:  register durable TT slot counters shmem region

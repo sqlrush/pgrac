@@ -42,6 +42,7 @@
 #include "cluster/cluster_thread_recovery.h" /* spec-4.11 D1 online thread recovery GUCs */
 #include "cluster/cluster_write_fence.h"	 /* spec-4.12 D7 write-fence enforcement GUCs */
 #include "cluster/cluster_conf.h"			 /* cluster_conf_has_peers (spec-3.18 D2b latch) */
+#include "cluster/cluster_cr_admit.h"		 /* cluster_cr_pool_admit* (spec-5.52 D8) */
 #include "cluster/cluster_cr_cache.h"		 /* cluster_cr_cache_max_blocks (spec-3.10 D4) */
 #include "cluster/cluster_grd.h"			 /* spec-5.10 starvation-protection shared flag */
 #include "cluster/cluster_cr_pool.h"		 /* cluster_shared_cr_pool_* (spec-5.51 D8) */
@@ -2333,6 +2334,54 @@ cluster_init_guc(void)
 			"sizing formula are determined by spec-5.50 profile evidence; do not set "
 			"size > 0 for perf claims without it. Each block costs 8 KB of shared memory."),
 		&cluster_shared_cr_pool_size_blocks, 0, 0, 262144, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	/* spec-5.52 D8: shared CR pool admission policy (backend-local, advisory).
+	 * All PGC_SIGHUP: the admission state is backend-local with no shmem layout
+	 * dependency, so the policy + thresholds are runtime-tunable.  Defaults
+	 * (admit_all / cap 0 / pressure 0) reproduce spec-5.51 v1 when the pool is
+	 * enabled and spec-3.10 when it is not -- zero behavior change.  Admission is
+	 * a pure membership heuristic and never affects the served image (8.A). */
+	{
+		static const struct config_enum_entry cluster_cr_pool_admission_policy_options[]
+			= { { "admit_all", CR_ADMIT_ALL, false },
+				{ "no_admit", CR_ADMIT_NO_ADMIT, false },
+				{ "scan_resistant", CR_ADMIT_SCAN_RESISTANT, false },
+				{ NULL, 0, false } };
+
+		DefineCustomEnumVariable(
+			"cluster.cr_pool_admission_policy",
+			gettext_noop("Insert-side admission policy for the shared CR buffer pool."),
+			gettext_noop("Spec-5.52. Default admit_all = spec-5.51 v1 populate-on-construct. "
+						 "no_admit stops inserting NEW images but is NOT a pool disable: already "
+						 "pooled entries are still served (the true pool on/off is "
+						 "shared_cr_pool_size_blocks/enabled, orthogonal to this GUC). "
+						 "scan_resistant bypasses bulk/parallel/volatile/over-cap/under-pressure "
+						 "candidates so one-shot scans cannot evict cross-backend hot CR images. "
+						 "Membership-only: never affects which image is served (8.A)."),
+			&cluster_cr_pool_admission_policy, CR_ADMIT_ALL,
+			cluster_cr_pool_admission_policy_options, PGC_SIGHUP, 0, NULL, NULL, NULL);
+	}
+
+	DefineCustomIntVariable(
+		"cluster.cr_pool_admit_relation_backend_cap",
+		gettext_noop("Per-backend cap on CR pool admits for a single relation (0 disables)."),
+		gettext_noop("Spec-5.52 D5. Default 0 (disabled). Under scan_resistant, limits how many "
+					 "CR images THIS backend admits into the shared pool for one relation -- a "
+					 "per-backend anti-monopoly throttle. NOT a global pool-occupancy cap (a "
+					 "backend cannot observe global occupancy; the true global cap is forward "
+					 "5.52 v2/5.58). Advisory; only affects hit/miss."),
+		&cluster_cr_pool_admit_relation_backend_cap, 0, 0, 1048576, PGC_SIGHUP, 0, NULL, NULL,
+		NULL);
+
+	DefineCustomIntVariable(
+		"cluster.cr_pool_admit_pressure_ratio",
+		gettext_noop("CR pool evict:hit pressure threshold (percent) for admission throttling (0 "
+					 "disables)."),
+		gettext_noop("Spec-5.52 D6. Default 0 (disabled). Under scan_resistant, when the recent "
+					 "shared-pool evict:hit ratio reaches this percent, admission is decimated "
+					 "(negative feedback) so a thrashing pool can stabilize. Advisory; only "
+					 "affects hit/miss. The threshold is pending spec-5.58 calibration."),
+		&cluster_cr_pool_admit_pressure_ratio, 0, 0, 100000, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
 		"cluster.boc_sweep_interval_ms",

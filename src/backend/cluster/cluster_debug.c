@@ -96,6 +96,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/storage/cluster_undo_buf.h" /* spec-3.18 D7: undo buffer counters */
 #include "cluster/cluster_cr.h"				  /* cluster_cr_* counter accessors (spec-3.9 D8) */
 #include "cluster/cluster_cr_pool.h"		  /* cluster_cr_pool_* counters (spec-5.51 D9) */
+#include "cluster/cluster_cr_admit.h"		  /* cluster_cr_admit_stat_* counters (spec-5.52 D9) */
 #include "cluster/cluster_wal_state.h"		  /* wal_state registry dump (spec-4.2 D5) */
 #include "cluster/cluster_wal_thread.h"		  /* wal_thread dump accessors (spec-4.1 D7) */
 #include "cluster/cluster_tt_durable.h"		  /* cluster_tt_durable_* counters (spec-3.11 D8) */
@@ -2255,6 +2256,24 @@ dump_cr(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_cr_pool_epoch_bump_count()));
 	emit_row(rsinfo, "cr_pool", "publish_stale_release_count",
 			 fmt_int64((int64)cluster_cr_pool_publish_stale_release_count()));
+
+	/* spec-5.52 D9: admission reason counters (independent region; advisory). */
+	emit_row(rsinfo, "cr_pool", "admit_count",
+			 fmt_int64((int64)cluster_cr_admit_stat_count(CR_ADMIT_REASON_ADMITTED)));
+	emit_row(rsinfo, "cr_pool", "admit_reject_no_admit",
+			 fmt_int64((int64)cluster_cr_admit_stat_count(CR_ADMIT_REASON_NO_ADMIT)));
+	emit_row(rsinfo, "cr_pool", "admit_reject_bulk",
+			 fmt_int64((int64)cluster_cr_admit_stat_count(CR_ADMIT_REASON_REJECT_BULK)));
+	emit_row(rsinfo, "cr_pool", "admit_reject_parallel",
+			 fmt_int64((int64)cluster_cr_admit_stat_count(CR_ADMIT_REASON_REJECT_PARALLEL)));
+	emit_row(rsinfo, "cr_pool", "admit_reject_nonmain_fork",
+			 fmt_int64((int64)cluster_cr_admit_stat_count(CR_ADMIT_REASON_REJECT_NONMAIN_FORK)));
+	emit_row(rsinfo, "cr_pool", "admit_reject_volatile",
+			 fmt_int64((int64)cluster_cr_admit_stat_count(CR_ADMIT_REASON_REJECT_VOLATILE)));
+	emit_row(rsinfo, "cr_pool", "admit_reject_relcap",
+			 fmt_int64((int64)cluster_cr_admit_stat_count(CR_ADMIT_REASON_REJECT_RELCAP)));
+	emit_row(rsinfo, "cr_pool", "admit_reject_pressure",
+			 fmt_int64((int64)cluster_cr_admit_stat_count(CR_ADMIT_REASON_REJECT_PRESSURE)));
 }
 
 

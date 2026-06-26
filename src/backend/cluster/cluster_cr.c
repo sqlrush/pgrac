@@ -46,6 +46,7 @@
 #include "utils/wait_event.h"
 
 #include "cluster/cluster_cr.h"
+#include "cluster/cluster_cr_admit.h" /* spec-5.52 D2: insert-side admission gate */
 #include "cluster/cluster_cr_apply.h"
 #include "cluster/cluster_cr_cache.h"
 #include "cluster/cluster_cr_pool.h" /* spec-5.51 D4: shared L2 CR pool */
@@ -902,14 +903,32 @@ cluster_cr_lookup_or_construct(Buffer buf, SCN read_scn)
 		ClusterCRPoolHandle ph;
 		bool reserved = false;
 
-		if (start_epoch != 0)
-			reserved = cluster_cr_pool_reserve(&key, &ph);
+		/*
+		 * spec-5.52 D2: insert-side admission gate.  Only reserve+publish into
+		 * L2 when the admission predicate admits this image; a reject bypasses
+		 * the pool and falls through to the bare-construct else branch (F0-2),
+		 * serving the SAME correct image (INV-A1).  admit_all (the default) ->
+		 * always admit == spec-5.51 v1 (zero behavior change).  The predicate is
+		 * advisory only and never affects the served image.
+		 *
+		 * NB (stacked WIP): this hooks the spec-5.51 held seam (b04920003c) and
+		 * MUST be re-grounded after 5.51 rebases onto the real main.
+		 */
+		if (start_epoch != 0) {
+			ClusterCRAdmitCtx actx = { .scan_kind = cluster_cr_admit_current_scan_kind() };
+
+			if (cluster_cr_pool_admit(&key, &actx))
+				reserved = cluster_cr_pool_reserve(&key, &ph);
+			/* spec-5.52 D9: record the admission decision (advisory counter). */
+			cluster_cr_admit_stat_bump(cluster_cr_admit_last_reason());
+		}
 
 		if (reserved) {
 			PG_TRY();
 			{
 				(void)cluster_cr_construct_block_into(buf, read_scn, slot);
 				cluster_cr_pool_publish(&ph, slot);
+				cluster_cr_admit_note_published(&key); /* spec-5.52 D5: relcap */
 				/* publish consumed the reservation;  the PG_CATCH only runs on
 				 * an exception before this point, so no post-block abort check
 				 * is needed (no dead `reserved = false` here). */

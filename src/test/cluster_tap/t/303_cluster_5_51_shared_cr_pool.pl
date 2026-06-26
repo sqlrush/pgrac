@@ -24,8 +24,8 @@
 #	  the SAME CR key (otherwise the first reader to touch a page mutates its
 #	  pd_lsn and the keys diverge per backend — spec-5.50 t/300 L2 finding).
 #
-#	  L1   pool ON (enabled + size>0): GUCs visible, cr_pool category has 10
-#	       rows, current_epoch >= 1.
+#	  L1   pool ON (enabled + size>0): GUCs visible, cr_pool category has 18
+#	       rows (10 pool + 8 spec-5.52 admission), current_epoch >= 1.
 #	  L2   cross-backend L2 HIT: readers A and B share read_scn (PROVEN).  A
 #	       re-reads a post-snapshot modified block -> CR construct -> publish to
 #	       the shared pool; B reads the same block under the SAME read_scn -> L2
@@ -133,7 +133,7 @@ my $open_rr_reader = sub {
 
 	is( $node->safe_psql('postgres',
 			q{SELECT count(*) FROM pg_cluster_state WHERE category='cr_pool'}),
-		'10', 'L1e cr_pool category has 10 rows');
+		'18', 'L1e cr_pool category has 18 rows (10 pool + 8 spec-5.52 admission)');
 
 	ok($pool->('current_epoch') >= 1, 'L1f current_epoch >= 1 (pool enabled)');
 }
