@@ -43,7 +43,6 @@
 #include "cluster/cluster_write_fence.h"	 /* spec-4.12 D7 write-fence enforcement GUCs */
 #include "cluster/cluster_conf.h"			 /* cluster_conf_has_peers (spec-3.18 D2b latch) */
 #include "cluster/cluster_cr_cache.h"		 /* cluster_cr_cache_max_blocks (spec-3.10 D4) */
-#include "cluster/cluster_cr_pool.h"		 /* cluster_shared_cr_pool_* (spec-5.51 D8) */
 #include "cluster/cluster_guc.h"
 #include "cluster/storage/cluster_undo_buf.h" /* cluster_undo_buf_writeback_allowed (spec-3.18 D1) */
 #include "cluster/cluster_ic.h"				  /* ClusterICTier enum values */
@@ -2181,30 +2180,6 @@ cluster_init_guc(void)
 					 "the undo chains. 0 disables caching (every CR is reconstructed; useful for "
 					 "perf A/B and as a fallback). Each block costs 8 KB of backend-local memory."),
 		&cluster_cr_cache_max_blocks, 64, 0, 4096, PGC_USERSET, 0, NULL, NULL, NULL);
-
-	/* spec-5.51 D8: dedicated shared (L2) CR buffer pool.  Both PGC_POSTMASTER:
-	 * the pool size and on/off are fixed at shmem reservation.  Default off /
-	 * size 0 = true zero memory (the region is registered but claims 0 bytes),
-	 * so the spec-3.10 L1-only path is unchanged.  Real default size + sizing
-	 * formula are bound to spec-5.50 profile evidence (not decided here). */
-	DefineCustomBoolVariable(
-		"cluster.shared_cr_pool_enabled",
-		gettext_noop("Enable the dedicated shared (cross-backend) CR buffer pool (L2)."),
-		gettext_noop("Spec-5.51. Default off. Master switch for the per-instance shared CR "
-					 "block pool layered behind the backend-local L1 cache. PGC_POSTMASTER: "
-					 "requires a restart. shared_cr_pool_size_blocks == 0 also disables it."),
-		&cluster_shared_cr_pool_enabled, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
-
-	DefineCustomIntVariable(
-		"cluster.shared_cr_pool_size_blocks",
-		gettext_noop("Shared CR buffer pool capacity in 8 KB blocks (0 = disabled / zero memory)."),
-		gettext_noop(
-			"Spec-5.51. Default 0 (true zero memory; the region is registered but "
-			"reserves 0 bytes). PGC_POSTMASTER: requires a restart. Rounded down to a "
-			"multiple of the partition count. The recommended non-zero default and "
-			"sizing formula are determined by spec-5.50 profile evidence; do not set "
-			"size > 0 for perf claims without it. Each block costs 8 KB of shared memory."),
-		&cluster_shared_cr_pool_size_blocks, 0, 0, 262144, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
 		"cluster.boc_sweep_interval_ms",

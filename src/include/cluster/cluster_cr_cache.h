@@ -74,15 +74,6 @@ typedef struct ClusterCRCacheKey {
 } ClusterCRCacheKey;
 
 /*
- * cluster_cr_cache_key_equal -- canonical CR cache key equality (spec-5.51 D6).
- *   Field-wise compare (RelFileLocatorEquals + scalar fields); NEVER memcmp the
- *   struct (padding bytes are not part of identity).  Exported so the shared CR
- *   pool (cluster_cr_pool.c, spec-5.51) and the backend-local cache share ONE
- *   equality definition and cannot drift.
- */
-extern bool cluster_cr_cache_key_equal(const ClusterCRCacheKey *a, const ClusterCRCacheKey *b);
-
-/*
  * cluster_cr_cache_lookup -- probe.  Returns the cached CR page (immutable;
  *   valid until the next cluster_cr_cache_* call in this backend) or NULL on a
  *   miss / when caching is disabled.

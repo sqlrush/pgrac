@@ -63,7 +63,6 @@
 #include "storage/md.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_guc.h"		/* PGRAC: cluster_enabled */
-#include "cluster/cluster_cr_pool.h"			/* PGRAC: spec-5.51 CR pool epoch bump */
 #include "cluster/storage/cluster_smgr.h"		/* PGRAC: smgrsw[1] + spec-2.7 hooks */
 #endif
 #include "storage/smgr.h"
@@ -571,18 +570,6 @@ smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo)
 			if (rels[i]->smgr_which == CLUSTER_SMGR_SMGRSW_INDEX)
 				cluster_smgr_invalidate_unlink_pending(rlocators[i].locator);
 		}
-
-		/*
-		 * PGRAC: spec-5.51 D5 — bump the shared CR pool lifecycle epoch on ANY
-		 * relfilenode unlink (DROP / TRUNCATE / VACUUM FULL / CLUSTER all reach
-		 * here for the freed relfilenode).  This is intentionally OUTSIDE the
-		 * CLUSTER_SMGR_SMGRSW_INDEX filter above: the CR pool caches CR images
-		 * for ALL relations (md.c-routed included), so a relfilenode reuse after
-		 * a non-cluster_smgr drop must still invalidate the pool or a later
-		 * relation reusing the relfilenumber could false-hit a stale image (rule
-		 * 8.A).  O(1) atomic; a no-op when the pool is disabled.
-		 */
-		cluster_cr_pool_bump_epoch();
 	}
 #endif
 

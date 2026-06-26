@@ -57,15 +57,8 @@ static int cr_cache_last_victim = -1;  /* slot reserved by victim_slot */
 static char *cr_cache_fallback = NULL; /* disabled-mode single buffer */
 
 
-/*
- * cluster_cr_cache_key_equal -- canonical CR cache key equality (spec-5.51 D6).
- *
- * PGRAC: promoted from the former file-local cr_key_eq so the shared CR pool
- * (cluster_cr_pool.c) reuses the SAME field-wise compare.  Field-wise (never
- * memcmp): ClusterCRCacheKey has alignment padding that is not part of identity.
- */
-bool
-cluster_cr_cache_key_equal(const ClusterCRCacheKey *a, const ClusterCRCacheKey *b)
+static bool
+cr_key_eq(const ClusterCRCacheKey *a, const ClusterCRCacheKey *b)
 {
 	return RelFileLocatorEquals(a->rlocator, b->rlocator) && a->forknum == b->forknum
 		   && a->blockno == b->blockno && a->read_scn == b->read_scn
@@ -140,7 +133,7 @@ cluster_cr_cache_lookup(const ClusterCRCacheKey *key)
 
 	cr_cache_ensure();
 	for (i = 0; i < cr_cache_capacity; i++) {
-		if (cr_cache[i].valid && cluster_cr_cache_key_equal(&cr_cache[i].key, key)) {
+		if (cr_cache[i].valid && cr_key_eq(&cr_cache[i].key, key)) {
 			cr_cache[i].ref = true; /* second chance */
 			return cr_cache[i].page;
 		}
