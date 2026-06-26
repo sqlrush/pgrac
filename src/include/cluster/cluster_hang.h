@@ -45,6 +45,8 @@
 #ifndef CLUSTER_HANG_H
 #define CLUSTER_HANG_H
 
+#include <signal.h> /* sig_atomic_t (cluster_hang_dump_pending) */
+
 #include "datatype/timestamp.h"
 #include "storage/lwlock.h"
 
@@ -229,7 +231,7 @@ extern void cluster_hang_store_consider(ClusterHangSampleStore *store,
 /* Consistent-snapshot store ops (use the DIAG LWLock passed in). */
 extern void cluster_hang_store_publish(ClusterHangSampleStore *shared, LWLock *lock,
 									   const ClusterHangSampleStore *round);
-extern int cluster_hang_store_snapshot(ClusterHangSampleStore *shared, LWLock *lock,
+extern int cluster_hang_store_snapshot(const ClusterHangSampleStore *shared, LWLock *lock,
 									   ClusterHangSampleStore *out);
 
 /* Distill a working node into a publishable slot. */

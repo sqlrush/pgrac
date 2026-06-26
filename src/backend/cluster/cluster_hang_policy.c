@@ -278,7 +278,7 @@ cluster_hang_store_publish(ClusterHangSampleStore *shared, LWLock *lock,
  *	half-written round.
  */
 int
-cluster_hang_store_snapshot(ClusterHangSampleStore *shared, LWLock *lock,
+cluster_hang_store_snapshot(const ClusterHangSampleStore *shared, LWLock *lock,
 							ClusterHangSampleStore *out)
 {
 	int n;

@@ -628,7 +628,7 @@ Datum
 pg_cluster_hang_dump(PG_FUNCTION_ARGS)
 {
 	int pid = PG_GETARG_INT32(0);
-	PGPROC *proc;
+	const PGPROC *proc;
 	BackendId backendId = InvalidBackendId;
 
 	proc = BackendPidGetProc(pid);
