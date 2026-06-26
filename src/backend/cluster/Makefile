@@ -101,7 +101,6 @@ OBJS = \
 	cluster_guc.o \
 	cluster_hang.o \
 	cluster_hang_policy.o \
-	cluster_hang_srf.o \
 	cluster_hw.o \
 	cluster_hw_shmem.o \
 	cluster_hw_ic.o \
@@ -191,7 +190,7 @@ else
 # lives in cluster_debug.c which is always linked).
 OBJS = cluster_conf.o cluster_debug.o cluster_ic.o cluster_inject.o cluster_undo_srf.o \
 	cluster_cr_srf.o cluster_block_apply_srf.o cluster_block_recovery_srf.o cluster_thread_recovery_apply_srf.o cluster_thread_recovery_replay_srf.o cluster_thread_recovery_driver_srf.o cluster_thread_recovery_orchestrator_srf.o cluster_pgstat.o cluster_scn.o cluster_views.o cluster_ges_mode_backend.o \
-	cluster_ir_srf.o cluster_ts_srf.o cluster_ko_srf.o cluster_hang_srf.o
+	cluster_ir_srf.o cluster_ts_srf.o cluster_ko_srf.o
 endif
 
 include $(top_srcdir)/src/backend/common.mk
