@@ -460,7 +460,9 @@ extern void cluster_lmd_tarjan_run_coordinator_scan(int collect_timeout_ms);
  * CANCEL_ACK handler with the echoed cancel_id + GesCancelAckStatus.
  */
 extern void cluster_lmd_pending_cancel_tick(void);
-extern void cluster_lmd_pending_cancel_on_ack(uint64 cancel_id, uint8 ack_status);
+extern void cluster_lmd_pending_cancel_on_ack(uint64 cancel_id, uint8 ack_status,
+											  const ClusterLmdVertex *ack_victim,
+											  int32 source_node_id);
 
 /*
  * spec-5.9 D5 — victim-side awaiting-ack tick.  Runs on EVERY node each LMD
@@ -569,6 +571,7 @@ extern uint64 cluster_lmd_cancel_exhausted_timeout_count_get(void);
 extern uint64 cluster_lmd_cancel_no_safe_victim_count_get(void);
 extern uint64 cluster_lmd_cleanup_orphan_edge_swept_count_get(void);
 extern uint64 cluster_lmd_reconfig_cancel_discarded_count_get(void);
+extern uint64 cluster_lmd_cancel_ack_mismatch_count_get(void);
 extern void cluster_lmd_victim_protected_skip_count_inc(uint64 delta);
 extern void cluster_lmd_victim_repeat_avoided_count_inc(uint64 delta);
 extern void cluster_lmd_cancel_token_installed_count_inc(uint64 delta);
@@ -582,6 +585,7 @@ extern void cluster_lmd_cancel_exhausted_timeout_count_inc(uint64 delta);
 extern void cluster_lmd_cancel_no_safe_victim_count_inc(uint64 delta);
 extern void cluster_lmd_cleanup_orphan_edge_swept_count_inc(uint64 delta);
 extern void cluster_lmd_reconfig_cancel_discarded_count_inc(uint64 delta);
+extern void cluster_lmd_cancel_ack_mismatch_count_inc(uint64 delta);
 
 /* D16 test-only injection helper (also surfaced via SQL SRF). */
 extern bool cluster_lmd_inject_wait_edge(const ClusterLmdVertex *waiter,

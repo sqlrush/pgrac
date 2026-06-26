@@ -2283,7 +2283,7 @@ UT_TEST(test_convert_5_3_u22_rollback_restores_mode_and_id)
 
 	/* rollback: restore (AccessExclusive,R_new) slot to (Share,R_old). */
 	UT_ASSERT_EQ(
-		(int)cluster_grd_entry_rollback_convert(e, 1, 100, AccessExclusiveLock, ShareLock, 11),
+		(int)cluster_grd_entry_rollback_convert(e, 1, 100, AccessExclusiveLock, ShareLock, 11, 77),
 		(int)CLUSTER_GRD_ENTRY_OK);
 	UT_ASSERT(cluster_grd_entry_holder_mode(e, 1, 100, &m));
 	UT_ASSERT_EQ((int)m, (int)ShareLock); /* mode restored */
@@ -2300,7 +2300,7 @@ UT_TEST(test_convert_5_3_u22_rollback_restores_mode_and_id)
 
 	/* rollback of a non-existent upgraded slot is a fail-closed no-op. */
 	UT_ASSERT_EQ(
-		(int)cluster_grd_entry_rollback_convert(e, 1, 100, AccessExclusiveLock, ShareLock, 11),
+		(int)cluster_grd_entry_rollback_convert(e, 1, 100, AccessExclusiveLock, ShareLock, 11, 77),
 		(int)CLUSTER_GRD_ENTRY_NOT_FOUND);
 	convert_teardown();
 }
@@ -2400,7 +2400,7 @@ UT_TEST(test_convert_5_3_u23_rollback_cancels_queued_convert)
 
 	/* requester times out -> rollback must DEQUEUE the pending convert. */
 	UT_ASSERT_EQ(
-		(int)cluster_grd_entry_rollback_convert(e, 1, 100, AccessExclusiveLock, ShareLock, 11),
+		(int)cluster_grd_entry_rollback_convert(e, 1, 100, AccessExclusiveLock, ShareLock, 11, 77),
 		(int)CLUSTER_GRD_ENTRY_OK);
 	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 0);
 
@@ -2415,6 +2415,95 @@ UT_TEST(test_convert_5_3_u23_rollback_cancels_queued_convert)
 	UT_ASSERT_EQ(n, 0); /* nothing granted */
 	UT_ASSERT(cluster_grd_entry_holder_mode(e, 1, 100, &m));
 	UT_ASSERT_EQ((int)m, (int)ShareLock); /* converter still at the weak mode */
+	convert_teardown();
+}
+
+
+/* spec-5.9 Hardening v1.0.1 (P1#2) — the convert backout + cancel primitives
+ * must be ABA-safe under (node,procno) slot reuse.  A stale rollback / cancel
+ * carrying an OLD convert_request_id or wait_seq must NOT evict a re-queued
+ * convert (stage-1) nor demote a re-upgraded holder (stage-2 false-grant); only
+ * the EXACT id / wait_seq acts.  Covers the wait_seq-exact convert dequeue
+ * (cluster_grd_cancel_convert_by_id) the deadlock-victim cleanup now uses plus
+ * the convert_request_id guard on cluster_grd_entry_rollback_convert. */
+UT_TEST(test_convert_5_9_rollback_cancel_aba_guard)
+{
+	ClusterGrdEntry *e;
+	ClusterGrdConvert req;
+	ClusterGrdHolderId h;
+	ClusterResId resid;
+	bool drain = false;
+	LOCKMODE m = NoLock;
+
+	/* ---- stage-1 (queued convert): a wrong convert_request_id must NOT dequeue
+	 * the live convert; the exact id does. ---- */
+	convert_reset();
+	convert_resid(5901, &resid);
+	e = convert_make_entry(5901);
+	convert_grant(e, 1, 100, 11, ShareLock); /* converting holder */
+	convert_grant(e, 2, 200, 22, ShareLock); /* conflicting peer -> ENQUEUED */
+	req = convert_req(1, 100, ShareLock, AccessExclusiveLock, 77);
+	UT_ASSERT_EQ((int)cluster_grd_entry_request_convert(e, &req, &drain),
+				 (int)CLUSTER_GRD_CONVERT_ENQUEUED);
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 1);
+
+	UT_ASSERT_EQ((int)cluster_grd_entry_rollback_convert(e, 1, 100, AccessExclusiveLock, ShareLock,
+														 11, 999 /* stale id */),
+				 (int)CLUSTER_GRD_ENTRY_NOT_FOUND);
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 1); /* NOT dequeued (ABA-safe) */
+
+	UT_ASSERT_EQ((int)cluster_grd_entry_rollback_convert(e, 1, 100, AccessExclusiveLock, ShareLock,
+														 11, 77 /* exact id */),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 0);
+	convert_teardown();
+
+	/* ---- cluster_grd_cancel_convert_by_id wait_seq ABA: the queued convert has
+	 * wait_seq=0, so a wrong wait_seq is rejected; the exact one dequeues. ---- */
+	convert_reset();
+	convert_resid(5902, &resid);
+	e = convert_make_entry(5902);
+	convert_grant(e, 1, 100, 11, ShareLock);
+	convert_grant(e, 2, 200, 22, ShareLock);
+	req = convert_req(1, 100, ShareLock, AccessExclusiveLock, 77);
+	UT_ASSERT_EQ((int)cluster_grd_entry_request_convert(e, &req, &drain),
+				 (int)CLUSTER_GRD_CONVERT_ENQUEUED);
+	memset(&h, 0, sizeof(h));
+	h.node_id = 1;
+	h.procno = 100;
+	h.cluster_epoch = 0;
+	h.request_id = 77; /* convert_request_id */
+	UT_ASSERT_EQ((int)cluster_grd_cancel_convert_by_id(&resid, &h, 99 /* wrong wait_seq */),
+				 (int)CLUSTER_GRD_ENTRY_NOT_FOUND);
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 1); /* NOT dequeued (ABA-safe) */
+	UT_ASSERT_EQ((int)cluster_grd_cancel_convert_by_id(&resid, &h, 0 /* exact wait_seq */),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 0);
+	convert_teardown();
+
+	/* ---- stage-2 (granted slot): a wrong convert_request_id must NOT demote a
+	 * re-upgraded holder (false-grant guard); the exact id restores it. ---- */
+	convert_reset();
+	convert_resid(5903, &resid);
+	e = convert_make_entry(5903);
+	convert_grant(e, 1, 100, 11, ShareLock);
+	req = convert_req(1, 100, ShareLock, AccessExclusiveLock, 77);
+	UT_ASSERT_EQ((int)cluster_grd_entry_request_convert(e, &req, &drain),
+				 (int)CLUSTER_GRD_CONVERT_GRANTED_INPLACE);
+	UT_ASSERT(cluster_grd_entry_holder_mode(e, 1, 100, &m));
+	UT_ASSERT_EQ((int)m, (int)AccessExclusiveLock); /* upgraded */
+
+	UT_ASSERT_EQ((int)cluster_grd_entry_rollback_convert(e, 1, 100, AccessExclusiveLock, ShareLock,
+														 11, 999 /* stale id */),
+				 (int)CLUSTER_GRD_ENTRY_NOT_FOUND);
+	UT_ASSERT(cluster_grd_entry_holder_mode(e, 1, 100, &m));
+	UT_ASSERT_EQ((int)m, (int)AccessExclusiveLock); /* still upgraded (no false-grant) */
+
+	UT_ASSERT_EQ((int)cluster_grd_entry_rollback_convert(e, 1, 100, AccessExclusiveLock, ShareLock,
+														 11, 77 /* exact id */),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT(cluster_grd_entry_holder_mode(e, 1, 100, &m));
+	UT_ASSERT_EQ((int)m, (int)ShareLock); /* restored */
 	convert_teardown();
 }
 
@@ -3122,7 +3211,7 @@ int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
 	UT_PLAN(
-		60); /* prior 42; spec-5.3:+6; 5.5:+3; +1 release reclaim; 5.8 D1b:+4 (U2a-d); D1c:+2 (U3a-b); D1e:+2 (U4a-b) */
+		61); /* prior 42; spec-5.3:+6; 5.5:+3; +1 release reclaim; 5.8 D1b:+4 (U2a-d); D1c:+2 (U3a-b); D1e:+2 (U4a-b); 5.9 Hardening:+1 (convert ABA) */
 
 	UT_RUN(test_grd_clusterresid_size_16);
 	UT_RUN(test_grd_resid_encode_decode_roundtrip);
@@ -3177,6 +3266,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_convert_5_3_u22_rollback_restores_mode_and_id);
 	UT_RUN(test_convert_5_3_u18_master_wrappers);
 	UT_RUN(test_convert_5_3_u23_rollback_cancels_queued_convert);
+	UT_RUN(test_convert_5_9_rollback_cancel_aba_guard);
 
 	/* spec-5.1c — BAST rewrite + LIVE self-conflict exclusion. */
 	UT_RUN(test_5_1c_u9a_self_conflict_excluded);

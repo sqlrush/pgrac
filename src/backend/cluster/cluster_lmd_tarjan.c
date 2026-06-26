@@ -1042,12 +1042,34 @@ lmd_pending_cancel_degrade(LmdPendingCancel *p, bool protected_victim)
 
 /* React to a CANCEL_ACK (called from the spec-5.9 D5 GES handler). */
 void
-cluster_lmd_pending_cancel_on_ack(uint64 cancel_id, uint8 ack_status)
+cluster_lmd_pending_cancel_on_ack(uint64 cancel_id, uint8 ack_status,
+								  const ClusterLmdVertex *ack_victim, int32 source_node_id)
 {
 	LmdPendingCancel *p = lmd_pending_cancel_find_by_cancel_id(cancel_id);
 
 	if (p == NULL)
 		return; /* stale / already cleared (idempotent) */
+
+	/*
+	 * PGRAC: spec-5.9 Hardening v1.0.1 (P1#1) — cancel_id is a process-local
+	 * monotonic counter that REPEATS after an LMD restart, so a late or misrouted
+	 * CANCEL_ACK could resolve to an unrelated pending entry and wrongly clear /
+	 * escalate the live victim.  The ACK echoes the victim's full identity +
+	 * wait_seq, so cross-check it (and require the ACK source to be the victim's
+	 * own node) and DROP any mismatch.  Defense-in-depth: the per-proc cancel
+	 * token's own identity match (P0#1) is what actually aborts a backend, so a
+	 * mismatch here is a robustness hazard (delayed resolve / spurious escalate),
+	 * not a false-kill — but cheap to eliminate since the data is on the wire.
+	 */
+	if (ack_victim != NULL
+		&& (p->victim.node_id != ack_victim->node_id || p->victim.procno != ack_victim->procno
+			|| p->victim.cluster_epoch != ack_victim->cluster_epoch
+			|| p->victim.request_id != ack_victim->request_id
+			|| p->victim.wait_seq != ack_victim->wait_seq
+			|| (source_node_id >= 0 && p->victim.node_id != source_node_id))) {
+		cluster_lmd_cancel_ack_mismatch_count_inc(1);
+		return;
+	}
 
 	switch (ack_status) {
 	case GES_CANCEL_ACK_CONSUMED:

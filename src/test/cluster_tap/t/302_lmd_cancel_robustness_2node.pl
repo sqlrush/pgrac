@@ -217,9 +217,10 @@ is( $pair->node0->safe_psql(
 		SELECT count(*) FROM pg_cluster_state
 		WHERE category = 'lmd'
 		  AND key IN ('cancel_token_installed_count','cancel_consumed_count',
-		              'cancel_ack_received_count','cancel_no_safe_victim_count')}),
-	'4',
-	'L1 spec-5.9 cancel-robustness counters present in dump_lmd');
+		              'cancel_ack_received_count','cancel_no_safe_victim_count',
+		              'cancel_ack_mismatch_count')}),
+	'5',
+	'L1 spec-5.9 cancel-robustness counters present in dump_lmd (incl. Hardening v1.0.1 cancel_ack_mismatch)');
 
 # Place two tables on different GRD masters -> a genuine cross-node deadlock.
 my ($tA, $tB);
@@ -317,6 +318,20 @@ my $ack_after = lmd_count($pair, 'cancel_ack_received_count');
 ok( $ack_after >= $ack_before,
 	"L7 cancel_ack_received_count did not regress ($ack_before -> $ack_after; "
 	  . "wire ACK fires for a remote victim, marker-observe for a local one)");
+
+# L7b (spec-5.9 Hardening v1.0.1 P1#1): every CANCEL_ACK in a healthy deadlock
+# resolve echoes the victim identity + wait_seq the coordinator issued, so NONE
+# may be dropped as a mismatch.  A non-zero count means the on_ack cross-check is
+# rejecting legitimate ACKs (regression).  Checked on both nodes (the coordinator
+# owns the pending-cancel table; the other reports a trivially-zero counter).
+for my $hn (($pair->node0, $pair->node1))
+{
+	my $mm = $hn->safe_psql('postgres',
+		q{SELECT value FROM pg_cluster_state
+		   WHERE category = 'lmd' AND key = 'cancel_ack_mismatch_count'});
+	is($mm, '0',
+		'L7b cancel_ack_mismatch_count = 0 (no legitimate CANCEL_ACK dropped by P1#1 guard)');
+}
 
 
 # ----------

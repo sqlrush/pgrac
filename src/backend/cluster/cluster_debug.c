@@ -1233,6 +1233,9 @@ dump_lmd(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_lmd_cleanup_orphan_edge_swept_count_get()));
 	emit_row(rsinfo, "lmd", "reconfig_cancel_discarded_count",
 			 fmt_int64((int64)cluster_lmd_reconfig_cancel_discarded_count_get()));
+	/* spec-5.9 Hardening v1.0.1 (P1#1) — CANCEL_ACK victim/wait_seq mismatch drop. */
+	emit_row(rsinfo, "lmd", "cancel_ack_mismatch_count",
+			 fmt_int64((int64)cluster_lmd_cancel_ack_mismatch_count_get()));
 	/* spec-5.8 D8 — 5 NEW shmem REPORT-collector counters (LMON->LMD hand-off). */
 	emit_row(rsinfo, "lmd", "probe_report_enqueue_count",
 			 fmt_int64((int64)cluster_lmd_probe_report_enqueue_count_get()));

@@ -1335,14 +1335,14 @@ extern int cluster_grd_release_and_drain(const ClusterResId *resid,
  * would delete the holder and leave a false-grant).  Raw mutator variant takes
  * the entry under the caller's lock; the wrapper does the lookup + lock.
  */
-extern ClusterGrdEntryResult cluster_grd_entry_rollback_convert(ClusterGrdEntry *entry,
-																int32 node_id, uint32 procno,
-																LOCKMODE upgraded_mode,
-																LOCKMODE old_mode,
-																uint64 old_request_id);
+extern ClusterGrdEntryResult
+cluster_grd_entry_rollback_convert(ClusterGrdEntry *entry, int32 node_id, uint32 procno,
+								   LOCKMODE upgraded_mode, LOCKMODE old_mode, uint64 old_request_id,
+								   uint64 convert_request_id);
 extern ClusterGrdEntryResult cluster_grd_rollback_convert(const ClusterResId *resid, int32 node_id,
 														  uint32 procno, LOCKMODE upgraded_mode,
-														  LOCKMODE old_mode, uint64 old_request_id);
+														  LOCKMODE old_mode, uint64 old_request_id,
+														  uint64 convert_request_id);
 
 
 /*

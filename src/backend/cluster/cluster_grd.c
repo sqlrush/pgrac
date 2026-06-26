@@ -4348,15 +4348,26 @@ cluster_grd_release_and_drain(const ClusterResId *resid, const ClusterGrdHolderI
  */
 ClusterGrdEntryResult
 cluster_grd_entry_rollback_convert(ClusterGrdEntry *entry, int32 node_id, uint32 procno,
-								   LOCKMODE upgraded_mode, LOCKMODE old_mode, uint64 old_request_id)
+								   LOCKMODE upgraded_mode, LOCKMODE old_mode, uint64 old_request_id,
+								   uint64 convert_request_id)
 {
 	int hslot;
 
 	Assert(entry != NULL);
 
-	/* (1) Cancel a still-queued convert from this backend (P0-1). */
+	/*
+	 * (1) Cancel a still-queued convert from this backend (P0-1).
+	 *
+	 * PGRAC: spec-5.9 Hardening v1.0.1 (P1#2) — when convert_request_id is
+	 * provided (!= 0) match it too, so a LATE rollback cannot evict a re-issued
+	 * convert that reused this (node, procno) slot under a fresh request_id
+	 * (ABA-safe).  A zero id falls back to the spec-5.3 (node, procno) match for
+	 * callers that do not carry the convert's own reply key.
+	 */
 	for (int c = 0; c < entry->nconverts; c++) {
-		if (entry->converts[c].node_id == node_id && entry->converts[c].procno == procno) {
+		if (entry->converts[c].node_id == node_id && entry->converts[c].procno == procno
+			&& (convert_request_id == 0
+				|| entry->converts[c].convert_request_id == convert_request_id)) {
 			grd_convert_remove(entry, c);
 			return CLUSTER_GRD_ENTRY_OK;
 		}
@@ -4365,6 +4376,15 @@ cluster_grd_entry_rollback_convert(ClusterGrdEntry *entry, int32 node_id, uint32
 	/* (2) Restore an already-granted in-place upgrade. */
 	hslot = grd_find_holder_slot(entry, node_id, procno, upgraded_mode);
 	if (hslot < 0)
+		return CLUSTER_GRD_ENTRY_NOT_FOUND;
+	/*
+	 * PGRAC: spec-5.9 Hardening v1.0.1 (P1#2) — verify the granted slot is the
+	 * very convert we are rolling back (its request_id == convert_request_id)
+	 * before downgrading it, so a late rollback cannot demote a re-issued convert
+	 * that re-upgraded to the same mode (ABA false-grant).  A zero id keeps the
+	 * spec-5.3 mode-only match.
+	 */
+	if (convert_request_id != 0 && entry->holders[hslot].request_id != convert_request_id)
 		return CLUSTER_GRD_ENTRY_NOT_FOUND;
 
 	entry->holders[hslot].mode = old_mode;
@@ -4380,7 +4400,8 @@ cluster_grd_entry_rollback_convert(ClusterGrdEntry *entry, int32 node_id, uint32
  */
 ClusterGrdEntryResult
 cluster_grd_rollback_convert(const ClusterResId *resid, int32 node_id, uint32 procno,
-							 LOCKMODE upgraded_mode, LOCKMODE old_mode, uint64 old_request_id)
+							 LOCKMODE upgraded_mode, LOCKMODE old_mode, uint64 old_request_id,
+							 uint64 convert_request_id)
 {
 	ClusterGrdEntry *entry = NULL;
 	ClusterGrdEntryResult lookup_result;
@@ -4394,7 +4415,7 @@ cluster_grd_rollback_convert(const ClusterResId *resid, int32 node_id, uint32 pr
 
 	SpinLockAcquire(&entry->lock);
 	result = cluster_grd_entry_rollback_convert(entry, node_id, procno, upgraded_mode, old_mode,
-												old_request_id);
+												old_request_id, convert_request_id);
 	SpinLockRelease(&entry->lock);
 	cluster_grd_entry_release(entry);
 	/* spec-5.8 D1b — convert rolled back (holder mode restored / queued convert

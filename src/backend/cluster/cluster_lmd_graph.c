@@ -138,6 +138,11 @@ typedef struct ClusterLmdGraphShared {
 	pg_atomic_uint64 cancel_no_safe_victim_count;	   /* all HARD-skip -> degrade */
 	pg_atomic_uint64 cleanup_orphan_edge_swept_count;  /* orphan master-side edge GC'd */
 	pg_atomic_uint64 reconfig_cancel_discarded_count;  /* in-flight cancel dropped on reconfig */
+	/* PGRAC: spec-5.9 Hardening v1.0.1 (P1#1) — a CANCEL_ACK whose echoed victim
+	 * identity + wait_seq did not match the pending-cancel entry the cancel_id
+	 * resolved to (stale cancel_id after an LMD restart / misrouted ACK); dropped,
+	 * never honored, so it cannot wrongly clear / escalate the live victim. */
+	pg_atomic_uint64 cancel_ack_mismatch_count;
 	int max_edges; /* snapshot of cluster.lmd_max_wait_edges at init */
 } ClusterLmdGraphShared;
 
@@ -228,6 +233,7 @@ cluster_lmd_graph_shmem_init(void)
 		pg_atomic_init_u64(&cluster_lmd_graph_state->cancel_no_safe_victim_count, 0);
 		pg_atomic_init_u64(&cluster_lmd_graph_state->cleanup_orphan_edge_swept_count, 0);
 		pg_atomic_init_u64(&cluster_lmd_graph_state->reconfig_cancel_discarded_count, 0);
+		pg_atomic_init_u64(&cluster_lmd_graph_state->cancel_ack_mismatch_count, 0);
 		cluster_lmd_graph_state->max_edges = max_edges;
 	}
 
@@ -634,6 +640,7 @@ DEFINE_GET_INC(cancel_exhausted_timeout_count)
 DEFINE_GET_INC(cancel_no_safe_victim_count)
 DEFINE_GET_INC(cleanup_orphan_edge_swept_count)
 DEFINE_GET_INC(reconfig_cancel_discarded_count)
+DEFINE_GET_INC(cancel_ack_mismatch_count)
 
 #undef DEFINE_GET_INC
 

@@ -1282,7 +1282,8 @@ cluster_ges_lmon_drain_work_queue(void)
 			 */
 			(void)cluster_grd_rollback_convert(&resid, (int32)holder.node_id, holder.procno,
 											   (LOCKMODE)req->lockmode, (LOCKMODE)req->current_mode,
-											   holder.request_id);
+											   holder.request_id,
+											   req->wait_seq /* convert_request_id */);
 			{
 				GesReplyPayload reply;
 
@@ -2185,6 +2186,29 @@ cluster_ges_send_convert_and_wait(const struct ClusterResId *resid, uint32 reque
 		if (cluster_cancel_token_consume()) {
 			cluster_ges_reply_wait_delete(&key);
 			ConditionVariableCancelSleep();
+
+			/*
+			 * PGRAC: spec-5.9 Hardening v1.0.1 (P1#2) — drop our queued CONVERT
+			 * on the master with the wait_seq-exact D4 primitive, mirroring the
+			 * REQUEST victim path above (which sends a KIND_REQUEST CANCEL_WAIT).
+			 * Without this the convert's master-side queued entry + WFG edge leak
+			 * until revalidate, and only lock.c's best-effort CONVERT_ROLLBACK
+			 * cleans it.  cluster_grd_cancel_convert_by_id matches the convert by
+			 * (node, procno, epoch, convert_request_id, wait_seq), so a stale or
+			 * re-issued convert under the same procno is never mismatched (ABA-
+			 * safe).  A deadlock-victim convert is NEVER granted (it blocked
+			 * here), so only converts[] is touched — never a granted holder.
+			 */
+			{
+				ClusterGrdHolderId cancel_holder = *holder;
+
+				cancel_holder.request_id = convert_request_id;
+				if (local_master)
+					(void)cluster_grd_cancel_convert_by_id(resid, &cancel_holder, req.wait_seq);
+				else
+					cluster_ges_send_cancel_wait(master, resid, &cancel_holder, req.wait_seq, 0,
+												 GES_CANCEL_WAIT_KIND_CONVERT);
+			}
 			return GES_REJECT_REASON_DEADLOCK_VICTIM;
 		}
 
@@ -2219,7 +2243,7 @@ cluster_ges_send_convert_and_wait(const struct ClusterResId *resid, uint32 reque
 void
 cluster_ges_send_convert_rollback(const struct ClusterResId *resid, uint32 upgraded_mode,
 								  uint32 old_mode, const struct ClusterGrdHolderId *holder,
-								  uint64 old_request_id)
+								  uint64 old_request_id, uint64 convert_request_id)
 {
 	int32 master;
 	GesRequestPayload req;
@@ -2244,6 +2268,14 @@ cluster_ges_send_convert_rollback(const struct ClusterResId *resid, uint32 upgra
 	req.shard_master_generation_lo = (uint32)(master_gen & 0xffffffffu);
 	req.shard_master_generation_hi = (uint32)(master_gen >> 32);
 	req.current_mode = (uint8)old_mode; /* restore target mode */
+	/*
+	 * PGRAC: spec-5.9 Hardening v1.0.1 (P1#2) — carry the queued convert's OWN
+	 * reply key in the wait_seq slot.  The master's stage-1 dequeue then matches
+	 * (node, procno, convert_request_id) instead of (node, procno) alone, so a
+	 * late rollback can no longer evict a re-issued convert under the same procno
+	 * (ABA-safe).  Ignored by the stage-2 granted-slot restore (located by mode).
+	 */
+	req.wait_seq = convert_request_id;
 
 	if (master < 0 || master == cluster_node_id)
 		(void)cluster_grd_work_queue_enqueue(cluster_node_id, &req, sizeof(req));

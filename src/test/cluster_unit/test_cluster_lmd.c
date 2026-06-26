@@ -412,7 +412,9 @@ void
 cluster_lmd_pending_cancel_tick(void)
 {}
 void
-cluster_lmd_pending_cancel_on_ack(uint64 c pg_attribute_unused(), uint8 s pg_attribute_unused())
+cluster_lmd_pending_cancel_on_ack(uint64 c pg_attribute_unused(), uint8 s pg_attribute_unused(),
+								  const ClusterLmdVertex *v pg_attribute_unused(),
+								  int32 src pg_attribute_unused())
 {}
 void
 cluster_lmd_cross_node_cancel_queue_full_count_inc(uint64 d pg_attribute_unused())

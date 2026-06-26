@@ -417,8 +417,20 @@ cluster_lmd_dispatch_cancel_item(const ClusterLmdCancelItem *item)
 	memcpy(&opcode, item->payload, sizeof(opcode));
 	if (opcode == GES_REQ_OPCODE_CANCEL_ACK) {
 		const GesCancelAckPayload *ack = (const GesCancelAckPayload *)item->payload;
+		ClusterLmdVertex ack_victim;
 
-		cluster_lmd_pending_cancel_on_ack(ack->cancel_id, (uint8)ack->ack_status);
+		/* spec-5.9 Hardening v1.0.1 (P1#1) — carry the ACK's echoed victim
+		 * identity + wait_seq so on_ack can reject a stale/misrouted ACK that the
+		 * bare cancel_id would otherwise correlate to an unrelated pending cancel
+		 * after an LMD restart. */
+		memset(&ack_victim, 0, sizeof(ack_victim));
+		ack_victim.node_id = (int32)ack->victim_node_id;
+		ack_victim.procno = ack->victim_procno;
+		ack_victim.cluster_epoch = ack->victim_cluster_epoch;
+		ack_victim.request_id = ack->victim_request_id;
+		ack_victim.wait_seq = ack->wait_seq;
+		cluster_lmd_pending_cancel_on_ack(ack->cancel_id, (uint8)ack->ack_status, &ack_victim,
+										  (int32)item->source_node_id);
 		return;
 	}
 

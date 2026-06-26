@@ -670,7 +670,8 @@ cluster_grd_rollback_convert(const struct ClusterResId *resid pg_attribute_unuse
 							 uint32 procno pg_attribute_unused(),
 							 int upgraded_mode pg_attribute_unused(),
 							 int old_mode pg_attribute_unused(),
-							 uint64 old_request_id pg_attribute_unused())
+							 uint64 old_request_id pg_attribute_unused(),
+							 uint64 convert_request_id pg_attribute_unused())
 {
 	return CLUSTER_GRD_ENTRY_NOT_FOUND;
 }

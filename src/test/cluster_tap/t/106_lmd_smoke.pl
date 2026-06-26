@@ -188,8 +188,8 @@ is($cat_order, 'lck,lmd,lmon,lms',
 # ----------
 my $lmd_rows = $node->safe_psql('postgres',
 	q{SELECT count(*) FROM pg_cluster_state WHERE category='lmd'});
-is($lmd_rows, '45',
-   "L8 dump_lmd emits 45 rows under category='lmd' (daemon + graph/Tarjan/probe + spec-2.24 cancel/cleanup + spec-5.8 D6 confirm/reconfig + D8 shmem collector + spec-5.9 D10 victim-policy/cancel-robustness surface)");
+is($lmd_rows, '46',
+   "L8 dump_lmd emits 46 rows under category='lmd' (daemon + graph/Tarjan/probe + spec-2.24 cancel/cleanup + spec-5.8 D6 confirm/reconfig + D8 shmem collector + spec-5.9 D10 victim-policy/cancel-robustness surface + Hardening v1.0.1 cancel_ack_mismatch)");
 
 
 # ----------

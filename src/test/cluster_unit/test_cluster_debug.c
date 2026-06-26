@@ -3171,6 +3171,12 @@ cluster_lmd_reconfig_cancel_discarded_count_get(void)
 {
 	return 0;
 }
+/* spec-5.9 Hardening v1.0.1 (P1#1) stub — CANCEL_ACK victim/wait_seq mismatch. */
+uint64
+cluster_lmd_cancel_ack_mismatch_count_get(void)
+{
+	return 0;
+}
 /* spec-5.8 D8 stub audit — 5 NEW shmem REPORT-collector counters. */
 uint64
 cluster_lmd_probe_report_enqueue_count_get(void)

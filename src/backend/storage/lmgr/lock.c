@@ -821,9 +821,13 @@ pgrac_cluster_post_native_register(LOCALLOCK *locallock, ClusterLockAcquireReque
 				ClusterGrdHolderId rb = cluster_req->holder;
 
 				rb.request_id = cluster_lold->cluster_request_id; /* R_old */
+				/* PGRAC: spec-5.9 Hardening v1.0.1 (P1#2) — pass the convert's OWN
+				 * request_id so the master's stage-1 dequeue is ABA-safe against a
+				 * re-issued convert under the same procno. */
 				cluster_ges_send_convert_rollback(&cluster_req->resid, (uint32)lockmode,
 												  (uint32)cluster_req->current_mode, &rb,
-												  cluster_lold->cluster_request_id);
+												  cluster_lold->cluster_request_id,
+												  cluster_req->request_id);
 			}
 		} else {
 			(void)cluster_lock_acquire_s7_cleanup(cluster_req); /* cancel reservation */
@@ -2296,9 +2300,13 @@ LockRelease(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 				cluster_grd_resid_encode(locktag, &resid);
 				memcpy(&rb, locallock->cluster_holder_raw, sizeof(rb));
 				rb.request_id = locallock->cluster_convert_old_request_id; /* R_old */
+				/* PGRAC: spec-5.9 Hardening v1.0.1 (P1#2) — the granted convert's
+				 * request_id guards the stage-2 slot restore against an ABA
+				 * re-upgrade to the same mode. */
 				cluster_ges_send_convert_rollback(&resid, (uint32)lockmode,
 												  (uint32)locallock->cluster_convert_old_mode, &rb,
-												  locallock->cluster_convert_old_request_id);
+												  locallock->cluster_convert_old_request_id,
+												  locallock->cluster_request_id);
 				/* Re-register L_old as the sole cluster owner (net-zero count:
 				 * L_new -1 + L_old +1, so no decrement below).
 				 *

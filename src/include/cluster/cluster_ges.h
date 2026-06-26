@@ -571,7 +571,7 @@ extern uint32 cluster_ges_send_convert_and_wait(const struct ClusterResId *resid
 extern void cluster_ges_send_convert_rollback(const struct ClusterResId *resid,
 											  uint32 upgraded_mode, uint32 old_mode,
 											  const struct ClusterGrdHolderId *holder,
-											  uint64 old_request_id);
+											  uint64 old_request_id, uint64 convert_request_id);
 
 
 /* ============================================================
