@@ -169,7 +169,7 @@ is($cat_order, 'lck,lmd,lmon,lms',
 
 
 # ----------
-# L8:  dump_lmd contributes 32 rows under category='lmd' in
+# L8:  dump_lmd contributes 45 rows under category='lmd' in
 # pg_cluster_state:
 #   - spec-2.19 daemon state surface: state + ready_at_us + 5 counters
 #   - spec-2.22 graph/Tarjan surface: 9 graph/deadlock rows
@@ -179,11 +179,17 @@ is($cat_order, 'lck,lmd,lmon,lms',
 #   - spec-5.8 D8: 5 rows (probe_report_enqueue / probe_drop_stale /
 #     probe_drop_duplicate / probe_queue_full / probe_partial_report —
 #     the shmem LMON->LMD REPORT collector)
+#   - spec-5.9 D10: 13 rows (victim_protected_skip / victim_repeat_avoided /
+#     cancel_token_installed / cancel_consumed / cancel_stale_cleared /
+#     cancel_wait_stale_rejected / cancel_ack_received / cancel_retransmit /
+#     cancel_escalated_alternate / cancel_exhausted_timeout /
+#     cancel_no_safe_victim / cleanup_orphan_edge_swept /
+#     reconfig_cancel_discarded — the victim-policy + cancel-robustness surface)
 # ----------
 my $lmd_rows = $node->safe_psql('postgres',
 	q{SELECT count(*) FROM pg_cluster_state WHERE category='lmd'});
-is($lmd_rows, '32',
-   "L8 dump_lmd emits 32 rows under category='lmd' (daemon + graph/Tarjan/probe + spec-2.24 cancel/cleanup + spec-5.8 D6 confirm/reconfig + D8 shmem collector surface)");
+is($lmd_rows, '45',
+   "L8 dump_lmd emits 45 rows under category='lmd' (daemon + graph/Tarjan/probe + spec-2.24 cancel/cleanup + spec-5.8 D6 confirm/reconfig + D8 shmem collector + spec-5.9 D10 victim-policy/cancel-robustness surface)");
 
 
 # ----------

@@ -294,10 +294,12 @@ my $d6_sum = $node->safe_psql('postgres', q{
 });
 is($d6_sum, '0', 'L18 spec-5.8 D6 counters all start at 0 (single-node: coordinator scan no-op)');
 
-# L19: total lmd category row count is now 32 (24 + 3 D6 + 5 D8), matching dump_lmd.
+# L19: total lmd category row count is now 45 (24 + 3 D6 + 5 D8 + 13 spec-5.9 D10),
+# matching dump_lmd.
 my $lmd_total = $node->safe_psql('postgres',
 	q{SELECT count(*) FROM pg_cluster_state WHERE category = 'lmd'});
-is($lmd_total, '32', 'L19 dump_lmd emits 32 rows under category=lmd (incl. 3 spec-5.8 D6 + 5 D8)');
+is($lmd_total, '45',
+	'L19 dump_lmd emits 45 rows under category=lmd (incl. 3 spec-5.8 D6 + 5 D8 + 13 spec-5.9 D10)');
 
 
 $node->stop;
