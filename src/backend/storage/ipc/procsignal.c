@@ -54,6 +54,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_signal.h" /* PGRAC: cluster handlers (spec-2.28 D3 dispatches via wrappers) */
+#include "cluster/cluster_hang.h"	/* PGRAC: hang-dump handler (spec-5.11 D5) */
 #endif
 #include "storage/shmem.h"
 #include "storage/smgr.h"
@@ -709,6 +710,9 @@ procsignal_sigusr1_handler(SIGNAL_ARGS)
 	/* spec-4.6 D3 — cooperative holder rebind dispatch. */
 	if (CheckProcSignal(PROCSIG_CLUSTER_GRD_REDECLARE))
 		cluster_handle_grd_redeclare_interrupt();
+	/* spec-5.11 D5 — backend-local hang/wait self-dump request. */
+	if (CheckProcSignal(PROCSIG_CLUSTER_HANG_DUMP))
+		cluster_handle_hang_dump_interrupt();
 #endif
 
 	SetLatch(MyLatch);

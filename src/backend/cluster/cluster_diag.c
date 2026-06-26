@@ -57,6 +57,7 @@
 #include "utils/wait_event.h" /* WAIT_EVENT_CLUSTER_BGPROC_DIAG_MAIN_LOOP (1.11 Sprint B) */
 
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_hang.h" /* spec-5.11 D1: long-wait sampling tick */
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_diag.h"
 #include "cluster/cluster_shmem.h"
@@ -252,6 +253,22 @@ cluster_diag_status(void)
 	result = cluster_diag_state->status;
 	LWLockRelease(&cluster_diag_state->lwlock);
 	return result;
+}
+
+
+/*
+ * spec-5.11 D1/D1b — expose the DIAG shared state to the Hang Manager
+ * module (cluster_hang.c writes the hang aggregate fields + sample store)
+ * and to dump_hang (cluster_debug.c reads them).  Returns NULL before the
+ * region is attached; callers take cluster_diag_state->lwlock themselves
+ * around the spec-5.11 hang fields.  The status / lifecycle fields remain
+ * DIAG-single-writer (HC2); the hang fields are written only by DIAG's
+ * sampler, except last_dump_emitted_at which dump_hang advances.
+ */
+ClusterDiagSharedState *
+cluster_diag_get_shared_state(void)
+{
+	return cluster_diag_state;
 }
 
 
@@ -491,6 +508,18 @@ DiagMain(void)
 			break;
 
 		diag_advance_liveness_tick();
+
+		/*
+		 * spec-5.11 D1 — Hang Manager long-wait sampling tick.  DIAG fulfils
+		 * the hang-dump duty HC3/HC6 deliberately deferred.  The sampler is
+		 * gated on cluster.hang_manager_enabled and a due-check against
+		 * cluster.hang_sample_interval_ms; the WaitLatch timeout stays at the
+		 * DIAG main-loop interval so the liveness cadence (HC6 / t/063) is
+		 * unchanged.  cluster_hang_sample_once() is fail-OPEN — it never
+		 * throws (internal PG_TRY backstop).
+		 */
+		if (cluster_hang_manager_enabled && cluster_hang_sample_due(GetCurrentTimestamp()))
+			cluster_hang_sample_once();
 
 		/* Sprint B inject: main-loop-iter (test mid-loop fault). */
 		CLUSTER_INJECTION_POINT("cluster-diag-main-loop-iter");

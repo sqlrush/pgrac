@@ -44,6 +44,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_debug.h"
+#include "cluster/cluster_hang.h" /* spec-5.11: ClusterHangDumpData for dump_hang stubs */
 
 #undef printf
 #undef fprintf
@@ -2099,6 +2100,33 @@ cluster_diag_status_to_string(int s pg_attribute_unused())
 {
 	return "(stub)";
 }
+
+/*
+ * spec-5.11: dump_hang dependencies.  The Hang Manager runtime + GUCs live in
+ * cluster_hang.c / cluster_guc.c; here we only need them to resolve at link
+ * time (dump_hang short-circuits on an unavailable DIAG region).
+ */
+bool cluster_hang_manager_enabled = false;
+bool cluster_hang_dump_enabled = false;
+int cluster_hang_threshold_ms = 60000;
+int cluster_hang_sample_interval_ms = 10000;
+int cluster_hang_max_sampled = 64;
+void
+cluster_hang_get_dump_data(ClusterHangDumpData *out)
+{
+	out->available = false;
+}
+const char *
+cluster_hang_wait_source_str(uint8 s pg_attribute_unused())
+{
+	return "(stub)";
+}
+const char *
+cluster_hang_quality_str(uint8 q pg_attribute_unused())
+{
+	return "(stub)";
+}
+
 pid_t
 cluster_diag_pid(void)
 {

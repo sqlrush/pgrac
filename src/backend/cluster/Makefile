@@ -98,6 +98,8 @@ OBJS = \
 	cluster_ko_lock.o \
 	cluster_ko_srf.o \
 	cluster_guc.o \
+	cluster_hang.o \
+	cluster_hang_policy.o \
 	cluster_hw.o \
 	cluster_hw_shmem.o \
 	cluster_hw_ic.o \

@@ -75,6 +75,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_elog.h" /* cluster_phase */
 #include "cluster/cluster_diag.h" /* cluster_diag_status (spec-1.13 D12) */
+#include "cluster/cluster_hang.h" /* Hang Manager dump (spec-5.11 D4) */
 #include "cluster/cluster_lck.h"  /* cluster_lck_status (spec-1.12 D12) */
 #include "cluster/cluster_scn.h"  /* cluster_scn_current (spec-1.15 D6) */
 #include "cluster/cluster_ges.h"  /* cluster_ges_{request,reply}_defer_count (spec-2.13 D4) */
@@ -571,6 +572,104 @@ dump_diag(ReturnSetInfo *rsinfo)
 
 	iters = cluster_diag_main_loop_iters();
 	emit_row(rsinfo, "diag", "diag_main_loop_iters", fmt_int64(iters));
+}
+
+
+/*
+ * dump_hang -- spec-5.11 Hang Manager diagnostics.
+ *
+ *	Emits the aggregate sampling state + cumulative counters, the spec-5.8
+ *	aggregate deadlock context (D6 reader: cluster-wide, the only per-proc
+ *	confirmed-deadlock signal shipped 5.8 exposes), and one group of per-row
+ *	keys per long-wait sample.  All of it comes from a single consistent
+ *	snapshot copied under the DIAG LWLock (cluster_hang_get_dump_data), so
+ *	the rows have real shmem backing — never a hollow dump (spec §2.1b / R4).
+ */
+static void
+dump_hang(ReturnSetInfo *rsinfo)
+{
+	ClusterHangDumpData data;
+	int i;
+
+	cluster_hang_get_dump_data(&data);
+
+	emit_row(rsinfo, "hang", "hang_manager_enabled", fmt_bool(cluster_hang_manager_enabled));
+	emit_row(rsinfo, "hang", "hang_dump_enabled", fmt_bool(cluster_hang_dump_enabled));
+	emit_row(rsinfo, "hang", "hang_threshold_ms", fmt_int32(cluster_hang_threshold_ms));
+	emit_row(rsinfo, "hang", "hang_sample_interval_ms", fmt_int32(cluster_hang_sample_interval_ms));
+	emit_row(rsinfo, "hang", "hang_max_sampled", fmt_int32(cluster_hang_max_sampled));
+
+	if (!data.available) {
+		/* DIAG region not attached (e.g. cluster disabled): zeroed view. */
+		emit_row(rsinfo, "hang", "hang_available", fmt_bool(false));
+		return;
+	}
+	emit_row(rsinfo, "hang", "hang_available", fmt_bool(true));
+
+	emit_row(rsinfo, "hang", "hang_sample_epoch", fmt_int64((int64)data.store.sample_epoch));
+	emit_row(rsinfo, "hang", "hang_last_sample_at",
+			 data.last_sample_at == 0 ? "(unset)"
+									  : pstrdup(timestamptz_to_str(data.last_sample_at)));
+	emit_row(rsinfo, "hang", "hang_last_dump_emitted_at",
+			 data.last_dump_emitted_at == 0
+				 ? "(unset)"
+				 : pstrdup(timestamptz_to_str(data.last_dump_emitted_at)));
+	emit_row(rsinfo, "hang", "hang_long_wait_count", fmt_int64(data.long_wait_count));
+	emit_row(rsinfo, "hang", "hang_longest_wait_us", fmt_int64(data.longest_wait_us));
+	emit_row(rsinfo, "hang", "hang_truncated", fmt_bool(data.store.truncated));
+	emit_row(rsinfo, "hang", "hang_n_samples", fmt_int32(data.store.n_samples));
+
+	/* Cumulative counters (D8). */
+	emit_row(rsinfo, "hang", "hang_samples_taken", fmt_int64((int64)data.counters.samples_taken));
+	emit_row(rsinfo, "hang", "hang_long_waits_seen",
+			 fmt_int64((int64)data.counters.long_waits_seen));
+	emit_row(rsinfo, "hang", "hang_dumps_emitted", fmt_int64((int64)data.counters.dumps_emitted));
+	emit_row(rsinfo, "hang", "hang_incomplete_sample_count",
+			 fmt_int64((int64)data.counters.incomplete_samples));
+	emit_row(rsinfo, "hang", "hang_excluded_deadlock_count",
+			 fmt_int64((int64)data.counters.excluded_deadlock));
+	emit_row(rsinfo, "hang", "hang_excluded_idle_count",
+			 fmt_int64((int64)data.counters.excluded_idle));
+	emit_row(rsinfo, "hang", "hang_excluded_bgworker_count",
+			 fmt_int64((int64)data.counters.excluded_bgworker));
+	emit_row(rsinfo, "hang", "hang_proc_signal_dump_count",
+			 fmt_int64((int64)data.counters.proc_signal_dumps));
+	emit_row(rsinfo, "hang", "hang_error_count", fmt_int64((int64)data.counters.error_count));
+
+	/*
+	 * spec-5.11 D6 — spec-5.8 reader: aggregate cluster-wide deadlock context.
+	 * The shipped 5.8 surface exposes deadlock confirmation only as these
+	 * aggregate counters (not a per-proc confirmed-cycle flag), so per-sample
+	 * in_confirmed_deadlock stays false; the live per-proc exclusion is
+	 * forward to a 5.9 per-proc victim/confirmed signal (D0 re-ground).
+	 */
+	emit_row(rsinfo, "hang", "hang_deadlock_confirmed_count",
+			 fmt_int64((int64)cluster_lmd_deadlock_confirmed_count_get()));
+	emit_row(rsinfo, "hang", "hang_cycle_detected_count",
+			 fmt_int64((int64)cluster_lmd_cycle_detected_count_get()));
+
+	/* Per-row long-wait samples (real shmem backing). */
+	for (i = 0; i < data.store.n_samples; i++) {
+		const ClusterHangSampleSlot *s = &data.store.slots[i];
+
+		emit_row(rsinfo, "hang", psprintf("hang_sample%d_pid", i), fmt_int32(s->pid));
+		emit_row(rsinfo, "hang", psprintf("hang_sample%d_wait_event", i),
+				 s->wait_event[0] ? pstrdup(s->wait_event) : "(none)");
+		emit_row(rsinfo, "hang", psprintf("hang_sample%d_wait_ms", i),
+				 fmt_int64(s->duration_us / 1000));
+		emit_row(rsinfo, "hang", psprintf("hang_sample%d_duration_kind", i),
+				 s->duration_kind == HANG_DUR_TRUE ? "true" : "approx");
+		emit_row(rsinfo, "hang", psprintf("hang_sample%d_source", i),
+				 cluster_hang_wait_source_str(s->source));
+		emit_row(rsinfo, "hang", psprintf("hang_sample%d_quality", i),
+				 cluster_hang_quality_str(s->quality));
+		emit_row(rsinfo, "hang", psprintf("hang_sample%d_blocker_pid", i),
+				 fmt_int32(s->blocker_pid));
+		emit_row(rsinfo, "hang", psprintf("hang_sample%d_blocker_remote_node", i),
+				 fmt_int32(s->blocker_remote_node));
+		emit_row(rsinfo, "hang", psprintf("hang_sample%d_in_confirmed_deadlock", i),
+				 fmt_bool(s->in_confirmed_deadlock));
+	}
 }
 
 
@@ -2326,6 +2425,7 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		dump_lmon(rsinfo);
 		dump_lck(rsinfo);
 		dump_diag(rsinfo);
+		dump_hang(rsinfo);
 		dump_cluster_stats(rsinfo);
 		dump_cluster_cssd(rsinfo);
 		dump_undo_cleaner(rsinfo);

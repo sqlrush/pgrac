@@ -108,6 +108,7 @@
 
 #include "datatype/timestamp.h"
 #include "storage/lwlock.h"
+#include "cluster/cluster_hang.h" /* spec-5.11 D1b: embedded ClusterHangSampleStore */
 
 
 /*
@@ -147,6 +148,27 @@ typedef struct ClusterDiagSharedState {
 	TimestampTz last_liveness_tick_at; /* HC6: local liveness tick — NOT inter-node heartbeat */
 	int64 main_loop_iters;			   /* monotone counter; observable proof of liveness */
 	bool shutdown_requested;		   /* postmaster sets; DIAG main loop polls + exits */
+
+	/*
+	 * spec-5.11 D1 — Hang Manager aggregate state (fulfils the
+	 * last_*_at fields HC6 deliberately left out until the hang-dump duty
+	 * landed).  Single writer = DIAG; guarded by the lwlock above.
+	 */
+	TimestampTz last_sample_at;		  /* last completed long-wait sampling round */
+	TimestampTz last_dump_emitted_at; /* last hang dump written to view / log */
+	int64 long_wait_count;			  /* long-waits seen in the latest round */
+	int64 longest_wait_us;			  /* longest wait seen in the latest round */
+
+	/* spec-5.11 D8 — cumulative Hang Manager counters (guarded by lwlock). */
+	ClusterHangCounters hang_counters;
+
+	/*
+	 * spec-5.11 D1b — bounded shared per-row sample store (Q13-A).  Embedded
+	 * directly so cluster_diag_shmem_size()/_init() grow/zero it for free and
+	 * the region count is unchanged.  Guarded by the lwlock above; written by
+	 * DIAG, read by backends running dump_hang.
+	 */
+	ClusterHangSampleStore hang_store;
 } ClusterDiagSharedState;
 
 
@@ -191,6 +213,13 @@ extern void cluster_diag_request_shutdown(void);
  *	completes the 6-key view with the missing 5 accessors below.
  */
 extern ClusterDiagStatus cluster_diag_status(void);
+
+/*
+ * spec-5.11 D1/D1b — DIAG shared-state handle for the Hang Manager module
+ * and dump_hang.  Returns NULL until the region is attached.
+ */
+extern ClusterDiagSharedState *cluster_diag_get_shared_state(void);
+
 extern pid_t cluster_diag_pid(void);
 extern TimestampTz cluster_diag_spawned_at(void);
 extern TimestampTz cluster_diag_ready_at(void);

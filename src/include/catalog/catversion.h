@@ -687,7 +687,9 @@
 /* spec-5.8 rebase onto shipped 5.7 + 5.50 (2026-06-26): single combined bump
  * above 5.7's 202606250 — 5.8's GES wire / LMD shmem ABI + the relocated SRF
  * stack on top of 5.7's enqueue classes + spec-2.41 lost-write ABI. */
-#define CATALOG_VERSION_NO 202606260
+/* spec-5.11 D5 (2026-06-26): pg_cluster_hang_dump(int4) pg_proc row (oid 8957)
+ * + REVOKE; new ProcSignalReason PROCSIG_CLUSTER_HANG_DUMP.  catversion bump. */
+#define CATALOG_VERSION_NO 202606270
 
 /* spec-2.39 D10 (2026-05-21):  SI Broadcaster production activation —
  * DDL commit hook (AtEOXact_Inval + COMMIT PREPARED via cluster-aware

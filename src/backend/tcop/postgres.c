@@ -82,6 +82,7 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_fence.h" /* spec-2.28 D4 cluster_fence_check_interrupts */
 #include "cluster/cluster_grd.h"   /* spec-2.17 BAST/CANCEL pending dispatch */
+#include "cluster/cluster_hang.h"  /* spec-5.11 D5 hang-dump pending dispatch */
 #include "cluster/cluster_reconfig.h" /* spec-2.29 D4 cluster_reconfig_check_pending_in_proc_interrupts */
 #endif
 
@@ -3086,6 +3087,13 @@ ProcessInterrupts(void)
 	 * ProcessInterrupts critical-section guard has passed.
 	 */
 	cluster_grd_check_pending_interrupts();
+
+	/*
+	 * PGRAC: spec-5.11 D5 — backend-local hang/wait self-dump.  The
+	 * ProcSignal handler only sets cluster_hang_dump_pending; the actual
+	 * logging runs here in normal backend context.
+	 */
+	cluster_hang_check_pending_interrupt();
 #endif
 
 	if (CheckClientConnectionPending) {

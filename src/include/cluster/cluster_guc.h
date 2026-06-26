@@ -379,6 +379,17 @@ extern int cluster_lck_main_loop_interval;
  */
 extern int cluster_diag_main_loop_interval;
 
+/*
+ * spec-5.11 D7: Hang Manager (DIAG-hosted long-wait sampler) GUCs.  All
+ * PGC_SIGHUP — the DIAG main loop re-reads them on the next tick.
+ */
+extern bool cluster_hang_manager_enabled;
+extern int cluster_hang_sample_interval_ms;
+extern int cluster_hang_threshold_ms;
+extern bool cluster_hang_dump_enabled;
+extern int cluster_hang_max_chain_depth;
+extern int cluster_hang_max_sampled;
+
 
 /*
  * cluster.cluster_stats_main_loop_interval (spec-1.14 D8): same
@@ -679,6 +690,18 @@ extern int cluster_lmd_scan_interval_ms;
 extern bool cluster_lmd_deadlock_detection_enabled;
 extern int cluster_lmd_global_dd_interval_ms;
 extern int cluster_lmd_deadlock_confirm_interval_ms;
+
+/*
+ * spec-5.9 D10 — deadlock victim policy + cancel robustness GUCs.
+ *	cancel_ack_timeout_ms (default 1000): coordinator retransmit threshold for a
+ *	  cross-node cancel with no CANCEL_ACK.
+ *	cancel_max_retransmit (default 3): bounded retransmits before alternate-
+ *	  victim escalation (0 = 5.8 fire-and-forget).
+ *	victim_repeat_window_ms (default 5000): anti-thrash recent-victim window.
+ */
+extern int cluster_cancel_ack_timeout_ms;
+extern int cluster_cancel_max_retransmit;
+extern int cluster_victim_repeat_window_ms;
 
 
 /*

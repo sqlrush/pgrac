@@ -255,6 +255,21 @@ ResetLatch(struct Latch *latch pg_attribute_unused())
 #include "miscadmin.h"
 BackendType MyBackendType = B_INVALID;
 
+/*
+ * spec-5.11: DiagMain now drives the Hang Manager sampling tick.  Stub the
+ * three referenced symbols — runtime DiagMain is not exercised here, this is
+ * still an address-only / pure-function test.
+ */
+bool cluster_hang_manager_enabled = false;
+bool
+cluster_hang_sample_due(TimestampTz now pg_attribute_unused())
+{
+	return false;
+}
+void
+cluster_hang_sample_once(void)
+{}
+
 
 UT_DEFINE_GLOBALS();
 
@@ -274,10 +289,17 @@ UT_TEST(test_diag_status_enum_values_frozen)
 }
 
 
-UT_TEST(test_diag_shared_state_size_under_4kb)
+UT_TEST(test_diag_shared_state_size_bounded)
 {
-	/* Catch accidental field bloat early (typical size ~80 bytes). */
-	UT_ASSERT(sizeof(ClusterDiagSharedState) < 4096);
+	/*
+	 * spec-5.11 D1b embeds the bounded ClusterHangSampleStore (64 fixed-size
+	 * slots) directly in this struct (Q13-A: no new shmem region), so the
+	 * size grew from ~80 bytes to a few KiB.  Keep an upper bound to still
+	 * catch accidental bloat, sized to the embedded store + headroom.
+	 */
+	UT_ASSERT(sizeof(ClusterHangSampleStore)
+			  == sizeof(ClusterDiagSharedState) - offsetof(ClusterDiagSharedState, hang_store));
+	UT_ASSERT(sizeof(ClusterDiagSharedState) < 16384);
 }
 
 
@@ -328,7 +350,7 @@ main(void)
 {
 	UT_PLAN(5);
 	UT_RUN(test_diag_status_enum_values_frozen);
-	UT_RUN(test_diag_shared_state_size_under_4kb);
+	UT_RUN(test_diag_shared_state_size_bounded);
 	UT_RUN(test_diag_status_to_string_lookup);
 	UT_RUN(test_diag_status_unknown_returns_unknown);
 	UT_RUN(test_diag_public_symbols_linkable);

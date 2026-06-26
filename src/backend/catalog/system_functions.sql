@@ -716,6 +716,11 @@ REVOKE EXECUTE ON FUNCTION pg_ls_dir(text,boolean,boolean) FROM public;
 
 REVOKE EXECUTE ON FUNCTION pg_log_backend_memory_contexts(integer) FROM PUBLIC;
 
+-- spec-5.11 D5: Hang Manager backend-local self-dump (superuser-only by
+-- default; unbounded calls would flood the server log, like the memory
+-- context dump above).
+REVOKE EXECUTE ON FUNCTION pg_cluster_hang_dump(integer) FROM PUBLIC;
+
 REVOKE EXECUTE ON FUNCTION pg_ls_logicalsnapdir() FROM PUBLIC;
 
 REVOKE EXECUTE ON FUNCTION pg_ls_logicalmapdir() FROM PUBLIC;

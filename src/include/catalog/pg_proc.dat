@@ -12447,6 +12447,16 @@
   proargnames => '{waiter_node,waiter_procno,waiter_request_id}',
   prosrc => 'pg_cluster_lmd_remove_wait_edges' },
 
+# spec-5.11 D5 (2026-06-26) -- Hang Manager backend-local self-dump.
+# Asks the backend with the given pid to log its own cluster wait / hang
+# state to the server log.  Superuser-only by default (REVOKE in
+# system_views.sql); mirrors pg_log_backend_memory_contexts.
+{ oid => '8957', descr => 'ask a backend to log its own cluster hang/wait state',
+  proname => 'pg_cluster_hang_dump', provolatile => 'v',
+  prorettype => 'bool', proargtypes => 'int4',
+  proargnames => '{pid}',
+  prosrc => 'pg_cluster_hang_dump' },
+
 # spec-3.2 D5b (2026-05-22) -- test-only visibility fork injection
 # functions.  These are SQL-visible so TAP can drive a real
 # HeapTupleSatisfiesMVCC cluster-path miss and assert 53R97.  Production

@@ -45,6 +45,7 @@
 #include "cluster/cluster_cr_cache.h"		 /* cluster_cr_cache_max_blocks (spec-3.10 D4) */
 #include "cluster/cluster_grd.h"			 /* spec-5.10 starvation-protection shared flag */
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_hang.h"			  /* CLUSTER_HANG_MAX_SAMPLES (spec-5.11 D7) */
 #include "cluster/storage/cluster_undo_buf.h" /* cluster_undo_buf_writeback_allowed (spec-3.18 D1) */
 #include "cluster/cluster_ic.h"				  /* ClusterICTier enum values */
 #include "cluster/cluster_inject.h"			  /* cluster_injection_assign_hook (stage 0.27) */
@@ -229,6 +230,14 @@ int cluster_lck_main_loop_interval = 1000;
 
 /* spec-1.13 D8: cluster.diag_main_loop_interval (mirror). */
 int cluster_diag_main_loop_interval = 1000;
+
+/* spec-5.11 D7: Hang Manager (DIAG-hosted long-wait sampler) GUCs. */
+bool cluster_hang_manager_enabled = true;
+int cluster_hang_sample_interval_ms = 10000;
+int cluster_hang_threshold_ms = 60000;
+bool cluster_hang_dump_enabled = true;
+int cluster_hang_max_chain_depth = 100;
+int cluster_hang_max_sampled = 64;
 
 /* spec-1.14 D8: cluster.cluster_stats_main_loop_interval (mirror). */
 int cluster_cluster_stats_main_loop_interval = 1000;
@@ -1711,6 +1720,62 @@ cluster_init_guc(void)
 					 "diagnostic / hang dump / etc. land in Stage 2+), so any "
 					 "value in range is functionally equivalent at this stage."),
 		&cluster_diag_main_loop_interval, 1000, 100, 60000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
+		NULL);
+
+	/*
+	 * spec-5.11 D7 -- Hang Manager GUCs.  The DIAG main loop hosts the
+	 * long-wait sampler (it fulfils the hang-dump duty HC3/HC6 deferred);
+	 * these PGC_SIGHUP knobs gate it.  cluster.hang_max_sampled must not
+	 * exceed CLUSTER_HANG_MAX_SAMPLES (the shared store is fixed-size); the
+	 * GUC max is pinned to that constant.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.hang_manager_enabled",
+		gettext_noop("Enables the DIAG-hosted Hang Manager long-wait sampler."),
+		gettext_noop("When off, DIAG skips long-wait sampling entirely and the "
+					 "hang category reports zeroed counters (spec-5.11)."),
+		&cluster_hang_manager_enabled, true, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.hang_sample_interval_ms",
+		gettext_noop("Interval between Hang Manager long-wait sampling rounds."),
+		gettext_noop("DIAG samples no more often than this; the effective "
+					 "cadence is also bounded below by cluster.diag_main_loop_"
+					 "interval (spec-5.11 D1)."),
+		&cluster_hang_sample_interval_ms, 10000, 100, 600000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
+		NULL);
+
+	DefineCustomIntVariable(
+		"cluster.hang_threshold_ms",
+		gettext_noop("Wait duration at/over which a backend is reported as a hang."),
+		gettext_noop("A backend waiting on a resource at least this long (and "
+					 "not excluded as idle / bgworker / confirmed-deadlock) is "
+					 "recorded as a long-wait sample (spec-5.11)."),
+		&cluster_hang_threshold_ms, 60000, 1000, 86400000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
+		NULL);
+
+	DefineCustomBoolVariable(
+		"cluster.hang_dump_enabled",
+		gettext_noop("Enables Hang Manager dump to pg_cluster_state / server log."),
+		gettext_noop("When off, sampling still runs but the hang category dump "
+					 "and long-wait LOG-once are suppressed (spec-5.11)."),
+		&cluster_hang_dump_enabled, true, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.hang_max_chain_depth",
+		gettext_noop("Maximum wait-chain depth the Hang Manager walks before stopping."),
+		gettext_noop("Bounds the wait-chain skeleton walk against a runaway / "
+					 "cyclic chain (spec-5.11; full chain analysis is feature-054)."),
+		&cluster_hang_max_chain_depth, 100, 1, 10000, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.hang_max_sampled",
+		gettext_noop("Maximum long-wait samples kept per round (top-N by duration)."),
+		gettext_noop("Bounds the per-round shared sample store; excess long-waits "
+					 "are dropped (longest kept) and the dump marks the round "
+					 "truncated.  Cannot exceed the fixed store capacity "
+					 "(CLUSTER_HANG_MAX_SAMPLES = 64) (spec-5.11)."),
+		&cluster_hang_max_sampled, 64, 1, CLUSTER_HANG_MAX_SAMPLES, PGC_SIGHUP, 0, NULL, NULL,
 		NULL);
 
 	/*

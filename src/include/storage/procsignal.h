@@ -95,6 +95,7 @@ typedef enum
 	PROCSIG_CLUSTER_GES_BAST,		/* spec-2.17 Q8: BAST advisory notify */
 	PROCSIG_CLUSTER_GES_CANCEL,		/* spec-2.17 Q9: CANCEL wait/grant */
 	PROCSIG_CLUSTER_GRD_REDECLARE,	/* spec-4.6 D3: cooperative holder rebind */
+	PROCSIG_CLUSTER_HANG_DUMP,		/* spec-5.11 D5: ask backend to log its hang/wait state */
 #endif
 
 	NUM_PROCSIGNALS				/* Must be last! */
