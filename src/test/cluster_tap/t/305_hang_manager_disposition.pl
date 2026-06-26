@@ -245,8 +245,10 @@ while (time() < $bdl)
 	usleep(200_000);
 }
 ok($b_unblocked, 'L2 waiter B unblocked after the root blocker was terminated');
-$hb->quit if defined $hb;
-# A's session handle is dead now; drop the reference so END does not touch it.
+# B's lock-wait left the psql mid-statement; quitting it can die on some
+# platforms, so eval-wrap (cleanup must never fail the test).
+eval { $hb->quit; } if defined $hb;
+# A was terminated: its connection is gone, so do not ->quit the dead handle.
 $ha = undef;
 
 
@@ -264,8 +266,8 @@ is($node->safe_psql('postgres', "SELECT count(*) FROM pg_stat_activity WHERE pid
 is($node->safe_psql('postgres',
 	"SELECT count(*) FROM pg_cluster_hang_victims() WHERE victim_pid = $lonely_pid"),
    '0', 'L3 a holder that blocks nobody is not even a victim candidate');
-$h_lonely->query_safe('ROLLBACK');
-$h_lonely->quit;
+eval { $h_lonely->query_safe('ROLLBACK'); };
+eval { $h_lonely->quit; };
 
 
 # ----------
@@ -295,8 +297,17 @@ while (time() < $ddl)
 ok($deadlock_seen, 'L4 PG deadlock.c detected and broke the local deadlock');
 is(hang_val('hang_terminates_issued'), $term_pre_dl,
    'L4 hang manager issued NO terminate for the deadlock (deadlock.c owns it)');
-$d1->quit;
-$d2->quit;
+# Robust cleanup: the deadlock left one session aborted and one still holding
+# locks; ->quit on such a psql handle can die on some platforms (the client may
+# have exited on the async error), so eval-wrap both, then externally terminate
+# any backend still holding the deadlock tables so later tests are unaffected.
+eval { $d1->quit; };
+eval { $d2->quit; };
+$node->safe_psql('postgres', q{
+	SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+	WHERE pid <> pg_backend_pid()
+	  AND query ~ 'LOCK TABLE hangt2? '
+	  AND state LIKE 'idle in transaction%'});
 
 
 # ----------
@@ -340,8 +351,10 @@ is($node->safe_psql('postgres', "SELECT count(*) FROM pg_stat_activity WHERE pid
    '1', 'L6 the waiter on a 2PC-held lock is NOT terminated (fail-CLOSED)');
 is(hang_val('hang_terminates_issued'), $term_pre_2pc,
    'L6 no terminate issued for an undisposable (no live backend) blocker');
+# Release the 2PC lock FIRST so the blocked waiter unblocks, THEN quit it
+# (quitting a still-blocked psql would hang); eval-wrap the quit defensively.
 $node->safe_psql('postgres', "ROLLBACK PREPARED 'hang5_12_2pc'");
-$w2pc->quit;
+eval { $w2pc->quit; };
 
 
 $node->stop;
