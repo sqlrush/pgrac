@@ -614,38 +614,3 @@ cluster_hang_dump_self_to_log(void)
 		LWLockRelease(&st->lwlock);
 	}
 }
-
-
-/*
- * pg_cluster_hang_dump(pid) — ask the backend with the given pid to log its
- * own cluster wait / hang state.  Mirrors pg_log_backend_memory_contexts:
- * superuser-only by default (REVOKE in system_views.sql), WARNING (not
- * ERROR) on a vanished pid so a loop-through-resultset does not abort.
- */
-PG_FUNCTION_INFO_V1(pg_cluster_hang_dump);
-
-Datum
-pg_cluster_hang_dump(PG_FUNCTION_ARGS)
-{
-	int pid = PG_GETARG_INT32(0);
-	const PGPROC *proc;
-	BackendId backendId = InvalidBackendId;
-
-	proc = BackendPidGetProc(pid);
-	if (proc != NULL)
-		backendId = proc->backendId;
-	else
-		proc = AuxiliaryPidGetProc(pid);
-
-	if (proc == NULL) {
-		ereport(WARNING, (errmsg("PID %d is not a PostgreSQL server process", pid)));
-		PG_RETURN_BOOL(false);
-	}
-
-	if (SendProcSignal(pid, PROCSIG_CLUSTER_HANG_DUMP, backendId) < 0) {
-		ereport(WARNING, (errmsg("could not send hang-dump signal to process %d: %m", pid)));
-		PG_RETURN_BOOL(false);
-	}
-
-	PG_RETURN_BOOL(true);
-}
