@@ -2481,6 +2481,28 @@ cluster_grd_converts_full_count(void)
 {
 	return 0;
 }
+/* spec-5.10 D7 — GES lock-starvation counter stubs (dump_grd refs). */
+uint64
+cluster_grd_starvation_boost_count(void)
+{
+	return 0;
+}
+uint64
+cluster_grd_starvation_barrier_enqueued_count(void)
+{
+	return 0;
+}
+uint64
+cluster_grd_starvation_barrier_publish_fail_count(void)
+{
+	return 0;
+}
+uint64
+cluster_grd_starvation_max_skip_observed(void)
+{
+	return 0;
+}
+
 /* spec-5.1b D9 — convert state-machine counter stubs (dump_grd refs). */
 uint64
 cluster_grd_convert_granted_inplace_count(void)

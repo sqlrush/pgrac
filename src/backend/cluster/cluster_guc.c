@@ -43,6 +43,7 @@
 #include "cluster/cluster_write_fence.h"	 /* spec-4.12 D7 write-fence enforcement GUCs */
 #include "cluster/cluster_conf.h"			 /* cluster_conf_has_peers (spec-3.18 D2b latch) */
 #include "cluster/cluster_cr_cache.h"		 /* cluster_cr_cache_max_blocks (spec-3.10 D4) */
+#include "cluster/cluster_grd.h"			 /* spec-5.10 starvation-protection shared flag */
 #include "cluster/cluster_guc.h"
 #include "cluster/storage/cluster_undo_buf.h" /* cluster_undo_buf_writeback_allowed (spec-3.18 D1) */
 #include "cluster/cluster_ic.h"				  /* ClusterICTier enum values */
@@ -117,8 +118,22 @@ static const struct config_enum_entry cluster_undo_writeback_boundary_check_opti
 		{ NULL, 0, false } };
 
 int cluster_grd_max_entries = 1024;
-int cluster_ges_request_timeout_ms = 60000; /* spec-2.16 D12 + v0.5 P1.5 */
-int cluster_cf_enqueue_timeout_ms = 30000;	/* spec-5.6 Dc4b — CF X/S grant wait */
+int cluster_ges_request_timeout_ms = 60000;	   /* spec-2.16 D12 + v0.5 P1.5 */
+int cluster_cf_enqueue_timeout_ms = 30000;	   /* spec-5.6 Dc4b — CF X/S grant wait */
+int cluster_ges_starvation_max_skips = 8;	   /* spec-5.10 — boost after N skips */
+bool cluster_ges_starvation_protection = true; /* spec-5.10 — fairness on/off */
+
+/*
+ * spec-5.10 P1#1 — assign-hook for cluster.ges_starvation_protection.  Flips
+ * the cluster-global shared flag only (a single atomic write is assign-hook
+ * safe); the boosted-state sweep that clears already-barriered waiters runs in
+ * the LMON cluster context (cluster_grd_clear_all_boosted), never here.
+ */
+static void
+cluster_ges_starvation_protection_assign_hook(bool newval, void *extra pg_attribute_unused())
+{
+	cluster_grd_set_starvation_protection(newval);
+}
 
 /* spec-5.3 D10 — TM cross-node convert tunables. */
 int cluster_ges_convert_timeout_ms = 30000; /* finite convert wait before 53R70 */
@@ -1320,6 +1335,39 @@ cluster_init_guc(void)
 							NULL,			/* check_hook */
 							NULL,			/* assign_hook */
 							NULL);			/* show_hook */
+
+	/*
+	 * spec-5.10:  cluster.ges_starvation_max_skips — bounded fairness threshold
+	 * for GES enqueue lock-starvation protection.  A waiter jumped this many
+	 * times by holder-compatible grants/converts is boosted to head-of-line; a
+	 * later conflicting jumper is held behind it.  0 disables boosting (skips
+	 * are still counted for observability).  Default 8 (CF HC117 magnitude).
+	 */
+	DefineCustomIntVariable(
+		"cluster.ges_starvation_max_skips",
+		gettext_noop("Skip count after which a starved GES waiter is boosted to head-of-line."),
+		gettext_noop("A queued waiter jumped this many times by holder-compatible grants is "
+					 "boosted; a later conflicting jumper is held behind it.  0 disables boosting "
+					 "(skips are still counted for observability).  Default 8."),
+		&cluster_ges_starvation_max_skips, 8, 0, 1000000, PGC_SUSET, 0, NULL, NULL, NULL);
+
+	/*
+	 * spec-5.10:  cluster.ges_starvation_protection — master switch for GES
+	 * enqueue lock-starvation fairness.  Default on (mirrors spec-4.12b's
+	 * default-on fence posture).  Turning it off flips a cluster-global shared
+	 * flag so the next grant decision falls straight back to spec-5.1b; the LMON
+	 * sweep then clears already-boosted waiters + retracts FAIRNESS_BARRIER
+	 * edges (clean escape, P1#1).  PGC_SIGHUP — a cluster-global runtime toggle.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.ges_starvation_protection",
+		gettext_noop("Enables GES enqueue lock-starvation fairness protection."),
+		gettext_noop("On (default) boosts starved waiters to head-of-line and holds conflicting "
+					 "jumpers behind them; off falls back to spec-5.1b compatible-with-holder "
+					 "granting.  The off transition flips a cluster-global shared flag and the "
+					 "LMON sweep clears already-boosted waiters."),
+		&cluster_ges_starvation_protection, true, PGC_SIGHUP, 0, NULL,
+		cluster_ges_starvation_protection_assign_hook, NULL);
 
 	/*
 	 * Stage 1.7: cluster.pcm_grd_max_entries

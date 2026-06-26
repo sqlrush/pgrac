@@ -305,6 +305,22 @@ typedef struct ClusterGrdShared {
 	pg_atomic_uint64 convert_granted_inplace_count;
 	pg_atomic_uint64 convert_enqueued_count;
 	pg_atomic_uint64 convert_illegal_count;
+
+	/*
+	 * spec-5.10 — GES enqueue lock-starvation fairness.
+	 *
+	 *	starvation_protection_enabled is the cluster-global runtime toggle
+	 *	(1 = on, default).  The GES grant decision reads it directly so a
+	 *	`cluster.ges_starvation_protection = off` SIGHUP takes effect on the
+	 *	next grant without waiting for the LMON sweep that clears already-boosted
+	 *	waiters (spec-5.10 §2.3 / §3.7 / P1#1).  The four counters are
+	 *	observability only (dump_grd; D7).
+	 */
+	pg_atomic_uint32 starvation_protection_enabled;
+	pg_atomic_uint64 starvation_boost_count;				/* waiters boosted to HOL */
+	pg_atomic_uint64 starvation_barrier_enqueued_count;		/* jumpers held behind a boost */
+	pg_atomic_uint64 starvation_barrier_publish_fail_count; /* edge publish/revalidate fail */
+	pg_atomic_uint64 starvation_max_skip_observed;			/* high-water skip_count seen */
 } ClusterGrdShared;
 
 /* spec-2.17 D28b — extern atomic generation alloc helper(InitProcess hook). */
@@ -1033,6 +1049,37 @@ extern ClusterGrdGrantAction cluster_grd_entry_grant_conditional_meta(
 	ClusterGrdConflictHolder *conflict_holders_out, int *n_conflict_out);
 
 /*
+ * spec-5.10 D7 — GES enqueue lock-starvation fairness GUCs.  max_skips is the
+ * bounded jump count after which a starved waiter is boosted to head-of-line
+ * (cluster.ges_starvation_max_skips; <= 0 disables boosting).  Defined in
+ * cluster_guc.c (backend) / stubbed in the cluster_unit harness.
+ */
+extern int cluster_ges_starvation_max_skips;
+
+/* spec-5.10 — cluster-global starvation-protection toggle (shared flag). */
+extern bool cluster_grd_starvation_protection_enabled(void);
+extern void cluster_grd_set_starvation_protection(bool enabled);
+
+/* spec-5.10 D7 — starvation-fairness observability counters. */
+extern uint64 cluster_grd_starvation_boost_count(void);
+extern uint64 cluster_grd_starvation_barrier_enqueued_count(void);
+extern uint64 cluster_grd_starvation_barrier_publish_fail_count(void);
+extern uint64 cluster_grd_starvation_max_skip_observed(void);
+
+/* spec-5.10 D8 — boosted-state sweeps (LMON context; runtime-off + node-dead). */
+extern uint32 cluster_grd_clear_all_boosted(void);
+extern uint32 cluster_grd_clear_boosted_for_node(int32 dead_node);
+
+/*
+ * spec-5.10 D6 — read a queued REQUEST waiter's enqueue-fairness state
+ * (skip_count / boosted / fair_queue_seq) by its 4-tuple identity.  Returns
+ * true iff a matching waiter exists.  Out parameters may be NULL.  Read-only.
+ */
+extern bool cluster_grd_entry_describe_waiter(const ClusterResId *resid,
+											  const ClusterGrdHolderId *id, uint32 *out_skip_count,
+											  bool *out_boosted, uint64 *out_fair_queue_seq);
+
+/*
  * Release a holder + pop the first FIFO-compatible waiter.
  *
  *	Returns the number of waiters granted (0 if none compatible).
@@ -1096,10 +1143,20 @@ typedef struct ClusterGrdConvert {
 	TransactionId waiter_xid;		/* spec-5.8 D1c — converter's xid (former pad slot) */
 	TimestampTz wait_start;			/* enqueue timestamp (timeout / observability) */
 	uint64 wait_seq;				/* spec-5.8 D1e — converter's D1d wait-state seq */
+	/*
+	 * spec-5.10 D1 — GES enqueue lock-starvation fairness state, mirroring the
+	 * private ClusterGrdWaiter fields.  Master-local + shmem-only (NEVER on the
+	 * wire); fair_queue_seq is the ordering key, not a wait identity (Q12 / L5;
+	 * the canonical wait identity is waiter_xid + wait_seq above, spec-5.8).
+	 */
+	uint64 fair_queue_seq; /* master-local monotonic order (D4) */
+	uint32 skip_count;	   /* scan-on-grant jump count (D2) */
+	bool boosted;		   /* head-of-line boosted (D2) */
 } ClusterGrdConvert;
 
-StaticAssertDecl(sizeof(ClusterGrdConvert) == 72,
-				 "ClusterGrdConvert layout pinned (spec-5.1b D2 64B; spec-5.8 D1e +8 wait_seq)");
+StaticAssertDecl(sizeof(ClusterGrdConvert) == 88,
+				 "ClusterGrdConvert layout pinned (spec-5.1b D2 64B; spec-5.8 D1e +8 wait_seq; "
+				 "spec-5.10 +16 fair_queue_seq/skip_count/boosted)");
 
 /*
  * D4 — convert grant decision result.

@@ -235,6 +235,9 @@ cluster_cssd_get_peer_state(int32 peer_id pg_attribute_unused())
  * regression test sets 1 and drives a tiny fake HTAB path. */
 int cluster_grd_max_entries = 0;
 
+/* spec-5.10 — GES starvation-fairness GUC stub (cluster_grd.o references it). */
+int cluster_ges_starvation_max_skips = 8;
+
 /* spec-4.6 D2 stub:  cluster_grd_lookup_master_gen forwards the LMS
  * wire routing token verbatim (Q3-C).  Settable so the unit test can
  * assert verbatim pass-through. */
@@ -2115,10 +2118,11 @@ UT_TEST(test_convert_u12_sweep_on_holder_death)
 
 /* U11 — ClusterGrdConvert byte layout pinned (StaticAssert mirror + L45).
  * spec-5.8 D1c added waiter_xid in the former pad @52 (size-stable); D1e
- * appended wait_seq @64 (64 -> 72). */
+ * appended wait_seq @64 (64 -> 72); spec-5.10 D1 appended the fairness state
+ * fair_queue_seq @72 / skip_count @80 / boosted @84 (72 -> 88). */
 UT_TEST(test_convert_u11_struct_layout)
 {
-	UT_ASSERT_EQ((int)sizeof(ClusterGrdConvert), 72);
+	UT_ASSERT_EQ((int)sizeof(ClusterGrdConvert), 88);
 	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, node_id), 0);
 	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, cluster_epoch), 16);
 	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, current_mode), 24);
@@ -2127,6 +2131,9 @@ UT_TEST(test_convert_u11_struct_layout)
 	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, waiter_xid), 52);
 	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, wait_start), 56);
 	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, wait_seq), 64);
+	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, fair_queue_seq), 72); /* spec-5.10 */
+	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, skip_count), 80);		/* spec-5.10 */
+	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, boosted), 84);		/* spec-5.10 */
 }
 
 

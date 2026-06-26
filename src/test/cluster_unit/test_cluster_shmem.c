@@ -332,6 +332,12 @@ cluster_injection_assign_hook(const char *newval pg_attribute_unused(),
 							  void *extra pg_attribute_unused())
 {}
 
+/* spec-5.10 — cluster_guc.o's ges_starvation_protection assign-hook flips the
+ * GRD shared flag; cluster_grd.o is not linked here, so stub it. */
+void
+cluster_grd_set_starvation_protection(bool enabled pg_attribute_unused())
+{}
+
 /*
  * Stage 1.7 stubs: cluster_pcm_lock.c (where cluster_pcm_grd_max_entries
  * lives and cluster_pcm_lock_module_init is defined) is not linked into

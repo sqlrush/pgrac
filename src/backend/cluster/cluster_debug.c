@@ -942,6 +942,15 @@ dump_grd(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_grd_deadlock_probe_collision_drop_count()));
 	emit_row(rsinfo, "grd", "grd_deadlock_chunk_oo_buffer_overflow_count",
 			 fmt_int64((int64)cluster_grd_deadlock_chunk_oo_buffer_overflow_count()));
+	/* spec-5.10 D7 — GES enqueue lock-starvation fairness counters. */
+	emit_row(rsinfo, "grd", "grd_starvation_boost_count",
+			 fmt_int64((int64)cluster_grd_starvation_boost_count()));
+	emit_row(rsinfo, "grd", "grd_starvation_barrier_enqueued_count",
+			 fmt_int64((int64)cluster_grd_starvation_barrier_enqueued_count()));
+	emit_row(rsinfo, "grd", "grd_starvation_barrier_publish_fail_count",
+			 fmt_int64((int64)cluster_grd_starvation_barrier_publish_fail_count()));
+	emit_row(rsinfo, "grd", "grd_starvation_max_skip_observed",
+			 fmt_int64((int64)cluster_grd_starvation_max_skip_observed()));
 }
 
 /* ============================================================

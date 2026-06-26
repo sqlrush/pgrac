@@ -133,6 +133,16 @@ typedef struct ClusterGrdWaiter {
 	uint32 request_opcode;			/* GesRequestOpcode of the queued request */
 	LOCKMODE mode;
 	TimestampTz wait_start;
+	/*
+	 * spec-5.10 D1 — GES enqueue lock-starvation fairness state.  Master-local
+	 * and shmem-only (NEVER on the wire);  fair_queue_seq is a per-entry
+	 * monotonic ordering key (D4, minted at enqueue/barrier time, 0 until
+	 * minted) and is NOT a wait identity / cancel token — the canonical wait
+	 * identity (waiter_xid + wait_seq) above is spec-5.8-owned (Q12 / L5).
+	 */
+	uint64 fair_queue_seq; /* master-local monotonic order (D4) */
+	uint32 skip_count;	   /* scan-on-grant jump count (D2) */
+	bool boosted;		   /* head-of-line boosted once skip_count >= max_skips (D2) */
 } ClusterGrdWaiter;
 
 /*
@@ -168,6 +178,13 @@ struct ClusterGrdEntry {
 		ClusterGrdHolderId id;
 		LOCKMODE mode;
 	} reservations[PGRAC_GRD_MAX_HOLDERS];
+	/*
+	 * spec-5.10 D4 — master-local monotonic mint source for waiter/convert
+	 * fair_queue_seq ordering (entry->lock protected; 0 means "nothing minted
+	 * yet").  Minted ONLY when a request actually enqueues / is barriered
+	 * (P1c) — never for a grant or a scan-on-grant pass.
+	 */
+	uint64 fair_queue_next;
 };
 
 
@@ -217,6 +234,11 @@ typedef struct GrdWfgWaiterSnap {
 	TransactionId waiter_xid; /* spec-5.8 D1c — xid stamped on the WFG vertex */
 	uint64 wait_seq;		  /* spec-5.8 D1e — wait_seq stamped on the WFG vertex */
 	LOCKMODE mode;			  /* wanted mode (requested_mode for a convert) */
+	/* spec-5.10 D5 — fairness state carried so refresh can RE-EMIT the
+	 * FAIRNESS_BARRIER edge (R -> earlier boosted conflicting waiter) on every
+	 * resync, mirroring the grant-time / serve-time derivation. */
+	bool boosted;		   /* this waiter is boosted to head-of-line */
+	uint64 fair_queue_seq; /* master-local order (barrier "earlier-than" test) */
 } GrdWfgWaiterSnap;
 
 typedef struct GrdWfgSnapshot {
@@ -225,6 +247,12 @@ typedef struct GrdWfgSnapshot {
 	int n_waiters; /* queued REQUEST waiters + pending converts */
 	GrdWfgWaiterSnap waiters[PGRAC_GRD_MAX_WAITERS + PGRAC_GRD_MAX_CONVERTS];
 } GrdWfgSnapshot;
+
+/* spec-5.10 D4 — wrap-safe fair_queue_seq order (defined with the other
+ * starvation helpers below; forward-declared here because the spec-5.8 WFG
+ * refresh re-emits the FAIRNESS_BARRIER edge and needs the "earlier-than"
+ * test). */
+static inline bool grd_fair_seq_precedes(uint64 a, uint64 b);
 
 /* Build an LMD vertex from a 4-tuple identity + sort-metadata xid + wait_seq
  * (spec-5.8 D1c/D1e).  xid / wait_seq are sort/revalidate metadata, never part
@@ -275,6 +303,8 @@ grd_wfg_snapshot_locked(const ClusterGrdEntry *entry, GrdWfgSnapshot *snap)
 		w->waiter_xid = entry->waiters[i].waiter_xid;
 		w->wait_seq = entry->waiters[i].wait_seq;
 		w->mode = entry->waiters[i].mode;
+		w->boosted = entry->waiters[i].boosted;				  /* spec-5.10 D5 */
+		w->fair_queue_seq = entry->waiters[i].fair_queue_seq; /* spec-5.10 D5 */
 	}
 	for (i = 0;
 		 i < entry->nconverts && snap->n_waiters < PGRAC_GRD_MAX_WAITERS + PGRAC_GRD_MAX_CONVERTS;
@@ -290,6 +320,8 @@ grd_wfg_snapshot_locked(const ClusterGrdEntry *entry, GrdWfgSnapshot *snap)
 		w->waiter_xid = entry->converts[i].waiter_xid;
 		w->wait_seq = entry->converts[i].wait_seq;
 		w->mode = entry->converts[i].requested_mode;
+		w->boosted = entry->converts[i].boosted;			   /* spec-5.10 D5 */
+		w->fair_queue_seq = entry->converts[i].fair_queue_seq; /* spec-5.10 D5 */
 	}
 }
 
@@ -320,6 +352,45 @@ grd_wfg_refresh_waiter_edges(const GrdWfgSnapshot *snap, const GrdWfgWaiterSnap 
 							snap->holders[i].cluster_epoch, snap->holders[i].request_id,
 							InvalidTransactionId, 0, &blocker_v);
 		(void)cluster_lmd_submit_wait_edge_real(&waiter_v, &blocker_v, w->request_id);
+	}
+
+	/*
+	 * spec-5.10 D5 — re-emit the FAIRNESS_BARRIER edge so it survives this
+	 * resync.  A barriered request R is held behind the earliest boosted
+	 * conflicting waiter W (the same derivation as the grant-time / serve-time
+	 * barrier, run here on the snapshot).  W is a spec-5.8-owned canonical
+	 * vertex built from the snapshot (P0#3 — never fabricated).  Without this
+	 * re-emit the cancel above would drop the edge and a barrier deadlock would
+	 * be missed (R2: edge-visible-before-block holds across every refresh).
+	 */
+	if (cluster_grd_starvation_protection_enabled()) {
+		int best = -1;
+
+		for (i = 0; i < snap->n_waiters; i++) {
+			const GrdWfgWaiterSnap *cand = &snap->waiters[i];
+
+			if (!cand->boosted)
+				continue;
+			if (cand->node_id == w->node_id && cand->procno == w->procno
+				&& cand->cluster_epoch == w->cluster_epoch && cand->request_id == w->request_id)
+				continue; /* a waiter never barriers itself */
+			if (ges_modes_compatible(cand->mode, w->mode))
+				continue; /* no conflict -> does not block R */
+			if (!grd_fair_seq_precedes(cand->fair_queue_seq, w->fair_queue_seq))
+				continue; /* W must be EARLIER than R */
+			if (best < 0
+				|| grd_fair_seq_precedes(cand->fair_queue_seq, snap->waiters[best].fair_queue_seq))
+				best = i;
+		}
+		if (best >= 0) {
+			ClusterLmdVertex blocker_v;
+
+			grd_wfg_make_vertex(snap->waiters[best].node_id, snap->waiters[best].procno,
+								snap->waiters[best].cluster_epoch, snap->waiters[best].request_id,
+								snap->waiters[best].waiter_xid, snap->waiters[best].wait_seq,
+								&blocker_v);
+			(void)cluster_lmd_submit_wait_edge_real(&waiter_v, &blocker_v, w->request_id);
+		}
 	}
 }
 
@@ -495,6 +566,13 @@ cluster_grd_shmem_init(void)
 		pg_atomic_init_u64(&cluster_grd_state->convert_granted_inplace_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->convert_enqueued_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->convert_illegal_count, 0);
+
+		/* spec-5.10 — lock-starvation fairness: protection on by default. */
+		pg_atomic_init_u32(&cluster_grd_state->starvation_protection_enabled, 1);
+		pg_atomic_init_u64(&cluster_grd_state->starvation_boost_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->starvation_barrier_enqueued_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->starvation_barrier_publish_fail_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->starvation_max_skip_observed, 0);
 
 		pg_atomic_init_u64(&cluster_grd_state->ges_work_queue_full_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->ges_cleanup_deferred_count, 0);
@@ -2583,6 +2661,414 @@ cluster_grd_entry_promote_waiter(ClusterGrdEntry *entry, const ClusterGrdHolderI
  *	that equivalence against PG's live conflict table.
  * ============================================================ */
 
+/* ============================================================
+ * spec-5.10 — GES enqueue lock-starvation fairness.
+ *
+ *	GES object-lock enqueue grants on "compatible-with-holder" alone, with no
+ *	request-vs-waiter fairness:  a steady stream of compatible S requests can
+ *	starve a queued X waiter (and a convert flood can starve a plain waiter).
+ *	spec-5.10 adds bounded fairness at the GRD master — the single queue
+ *	authority (AD-013) — entirely master-local: scan-on-grant charges every
+ *	jumped earlier conflicting waiter one skip; at a bounded skip count the
+ *	waiter is boosted to head-of-line; a later compatible jumper that conflicts
+ *	with a boosted waiter is held behind it (D2 grant barrier).  All fairness
+ *	state is shmem-only and never on the wire (Q12 / L5).
+ * ============================================================ */
+
+/*
+ * spec-5.10 — read the cluster-global starvation-protection toggle.  Returns
+ * true when bounded fairness is active.  Safe to call before shmem init (the
+ * GES grant path always runs after it, but defensive NULL -> "on" keeps the
+ * conservative default).
+ */
+bool
+cluster_grd_starvation_protection_enabled(void)
+{
+	if (cluster_grd_state == NULL)
+		return true;
+	return pg_atomic_read_u32(&cluster_grd_state->starvation_protection_enabled) != 0;
+}
+
+/*
+ * spec-5.10 D7 — flip the cluster-global starvation-protection toggle.  Only
+ * flips the shared flag (so a new grant decision reads it immediately and falls
+ * back to spec-5.1b);  clearing already-boosted waiters + retracting barrier
+ * edges is the LMON-context sweep (D8), NOT done here (P1#1 — never touch the
+ * shared GRD/LMD graph from a GUC assign-hook).
+ */
+void
+cluster_grd_set_starvation_protection(bool enabled)
+{
+	if (cluster_grd_state == NULL)
+		return;
+	pg_atomic_write_u32(&cluster_grd_state->starvation_protection_enabled, enabled ? 1 : 0);
+}
+
+/* spec-5.10 D7 — starvation-fairness observability counter accessors. */
+uint64
+cluster_grd_starvation_boost_count(void)
+{
+	return cluster_grd_state ? pg_atomic_read_u64(&cluster_grd_state->starvation_boost_count) : 0;
+}
+
+uint64
+cluster_grd_starvation_barrier_enqueued_count(void)
+{
+	return cluster_grd_state
+			   ? pg_atomic_read_u64(&cluster_grd_state->starvation_barrier_enqueued_count)
+			   : 0;
+}
+
+uint64
+cluster_grd_starvation_barrier_publish_fail_count(void)
+{
+	return cluster_grd_state
+			   ? pg_atomic_read_u64(&cluster_grd_state->starvation_barrier_publish_fail_count)
+			   : 0;
+}
+
+uint64
+cluster_grd_starvation_max_skip_observed(void)
+{
+	return cluster_grd_state ? pg_atomic_read_u64(&cluster_grd_state->starvation_max_skip_observed)
+							 : 0;
+}
+
+/*
+ * spec-5.10 D8 — clear boosted state across every GRD entry (runtime-off clean
+ * escape).  Runs in the LMON cluster context (NOT a GUC assign-hook, P1#1):
+ * under each entry->lock it clears every waiter / convert boosted flag, then —
+ * after releasing the spinlock — refreshes that entry's WFG edges so the now-
+ * dissolved FAIRNESS_BARRIER edges are retracted (the refresh re-derives the
+ * barrier set, which is now empty).  Barriered waiters are no longer held back
+ * and are served by the next release/drain (with protection off the serve-side
+ * barrier is already a no-op).  Returns the number of boosted flags cleared.
+ */
+uint32
+cluster_grd_clear_all_boosted(void)
+{
+	HASH_SEQ_STATUS status;
+	ClusterGrdEntry *entry;
+	uint32 cleared = 0;
+
+	if (cluster_grd_entry_htab == NULL)
+		return 0;
+
+	hash_seq_init(&status, cluster_grd_entry_htab);
+	while ((entry = (ClusterGrdEntry *)hash_seq_search(&status)) != NULL) {
+		GrdWfgSnapshot snap;
+		bool changed = false;
+		int i;
+
+		SpinLockAcquire(&entry->lock);
+		for (i = 0; i < entry->nwaiters; i++) {
+			if (entry->waiters[i].boosted) {
+				entry->waiters[i].boosted = false;
+				cleared++;
+				changed = true;
+			}
+		}
+		for (i = 0; i < entry->nconverts; i++) {
+			if (entry->converts[i].boosted) {
+				entry->converts[i].boosted = false;
+				changed = true;
+			}
+		}
+		if (changed)
+			entry->generation++;
+		grd_wfg_snapshot_locked(entry, &snap);
+		SpinLockRelease(&entry->lock);
+
+		if (changed) {
+			for (i = 0; i < snap.n_waiters; i++)
+				grd_wfg_refresh_waiter_edges(&snap, &snap.waiters[i]);
+		}
+	}
+	return cleared;
+}
+
+/*
+ * spec-5.10 D8 — clear boosted state contributed by a dead / fenced / reconfig-
+ * out node (LMON node-dead path).  A boosted waiter on a departed node must not
+ * keep barriering live requests behind a vertex that no longer exists; clearing
+ * its boost dissolves those barriers (the dead node's queue entries are removed
+ * by the existing dead-node sweep).  Same lock discipline as
+ * cluster_grd_clear_all_boosted.  Returns the number of boosted flags cleared.
+ */
+uint32
+cluster_grd_clear_boosted_for_node(int32 dead_node)
+{
+	HASH_SEQ_STATUS status;
+	ClusterGrdEntry *entry;
+	uint32 cleared = 0;
+
+	if (cluster_grd_entry_htab == NULL)
+		return 0;
+
+	hash_seq_init(&status, cluster_grd_entry_htab);
+	while ((entry = (ClusterGrdEntry *)hash_seq_search(&status)) != NULL) {
+		GrdWfgSnapshot snap;
+		bool changed = false;
+		int i;
+
+		SpinLockAcquire(&entry->lock);
+		for (i = 0; i < entry->nwaiters; i++) {
+			if (entry->waiters[i].boosted && entry->waiters[i].node_id == dead_node) {
+				entry->waiters[i].boosted = false;
+				cleared++;
+				changed = true;
+			}
+		}
+		for (i = 0; i < entry->nconverts; i++) {
+			if (entry->converts[i].boosted && entry->converts[i].node_id == dead_node) {
+				entry->converts[i].boosted = false;
+				changed = true;
+			}
+		}
+		if (changed)
+			entry->generation++;
+		grd_wfg_snapshot_locked(entry, &snap);
+		SpinLockRelease(&entry->lock);
+
+		if (changed) {
+			for (i = 0; i < snap.n_waiters; i++)
+				grd_wfg_refresh_waiter_edges(&snap, &snap.waiters[i]);
+		}
+	}
+	return cleared;
+}
+
+/*
+ * spec-5.10 D4 — mint the next master-local fair-queue order for a waiter /
+ * convert that is about to enqueue.  Strictly monotonic per entry (the small
+ * uint64 wrap is handled wrap-safely by grd_fair_seq_precedes).  Caller holds
+ * entry->lock.  0 is reserved for "not yet minted".
+ */
+static uint64
+grd_mint_fair_queue_seq(ClusterGrdEntry *entry)
+{
+	entry->fair_queue_next += 1;
+	return entry->fair_queue_next;
+}
+
+/*
+ * spec-5.10 D4 — wrap-safe "did a precede b" for fair_queue_seq ordering.
+ * Mirrors PG's TransactionIdPrecedes / LSN-style modular compare so the rare
+ * uint64 wrap never inverts the serve order.  0 (unminted) precedes everything.
+ */
+static inline bool
+grd_fair_seq_precedes(uint64 a, uint64 b)
+{
+	return (int64)(a - b) < 0;
+}
+
+/*
+ * spec-5.10 D2 — scan-on-grant skip accounting.  A holder-compatible request
+ * that is about to be granted "jumps" every already-queued waiter whose wanted
+ * mode conflicts with it (a compatible waiter is not delayed by the grant and
+ * is not charged).  Every queued waiter is by construction earlier than this
+ * brand-new request, so no explicit ordering test is needed here.  Counting
+ * only — Rule 8.A:  this never blocks or alters the grant.  Caller holds
+ * entry->lock.
+ */
+static void
+grd_starvation_account_skip_on_grant(ClusterGrdEntry *entry, LOCKMODE granted_mode)
+{
+	int i;
+
+	int max_skips = cluster_ges_starvation_max_skips;
+
+	for (i = 0; i < entry->nwaiters; i++) {
+		/* Compatible waiter -> the grant does not delay it -> no skip. */
+		if (ges_modes_compatible(entry->waiters[i].mode, granted_mode))
+			continue;
+		if (entry->waiters[i].skip_count < UINT32_MAX)
+			entry->waiters[i].skip_count++;
+		/* Observability high-water (D7). */
+		if (cluster_grd_state != NULL
+			&& entry->waiters[i].skip_count
+				   > pg_atomic_read_u64(&cluster_grd_state->starvation_max_skip_observed))
+			pg_atomic_write_u64(&cluster_grd_state->starvation_max_skip_observed,
+								entry->waiters[i].skip_count);
+		/*
+		 * Bounded fairness: once the waiter has been jumped max_skips times it
+		 * is boosted to head-of-line (max_skips <= 0 disables boosting; the
+		 * waiter still accrues skips for observability).
+		 */
+		if (max_skips > 0 && entry->waiters[i].skip_count >= (uint32)max_skips
+			&& !entry->waiters[i].boosted) {
+			entry->waiters[i].boosted = true;
+			if (cluster_grd_state != NULL)
+				pg_atomic_fetch_add_u64(&cluster_grd_state->starvation_boost_count, 1);
+		}
+	}
+}
+
+/*
+ * spec-5.10 D2 — does a holder-compatible requester R conflict with any
+ * CURRENT non-self holder?  Mirrors the conflict scan in enqueue_or_grant_impl
+ * (frozen 8x8 matrix + spec-5.1c self-exclusion) but without populating the
+ * BAST snapshot.  Used to revalidate a barrier candidate after the edge-publish
+ * spinlock gap and on the failed-barrier fallback (never grant a request that
+ * conflicts with a holder — Rule 8.A).  Caller holds entry->lock.
+ */
+static bool
+grd_scan_holder_conflict(const ClusterGrdEntry *entry, uint32 node_id, uint32 procno, LOCKMODE mode)
+{
+	int i;
+
+	for (i = 0; i < entry->ngranted; i++) {
+		if (ges_modes_compatible(entry->holders[i].mode, mode))
+			continue;
+		if ((uint32)entry->holders[i].node_id == node_id && entry->holders[i].procno == procno)
+			continue; /* spec-5.1c self-exclusion */
+		return true;
+	}
+	return false;
+}
+
+/*
+ * spec-5.10 D2/D5 — find the boosted queued waiter that a would-be-granted
+ * request of `mode` must be held behind: the earliest (min fair_queue_seq)
+ * boosted waiter whose wanted mode conflicts with `mode`.  exclude_seq > 0
+ * restricts the search to waiters strictly EARLIER than that seq (used when the
+ * requester is itself queued — serve-side / refresh); exclude_seq == 0 means
+ * the requester is not yet queued (grant-time) so every boosted waiter counts.
+ * Returns the waiter index, or -1 if no such waiter exists.  Caller holds
+ * entry->lock.
+ */
+static int
+grd_find_earliest_boosted_conflicting_waiter(const ClusterGrdEntry *entry, LOCKMODE mode,
+											 uint64 exclude_seq)
+{
+	int i, best = -1;
+
+	for (i = 0; i < entry->nwaiters; i++) {
+		if (!entry->waiters[i].boosted)
+			continue;
+		if (ges_modes_compatible(entry->waiters[i].mode, mode))
+			continue; /* no conflict -> does not block the requester */
+		if (exclude_seq != 0
+			&& !grd_fair_seq_precedes(entry->waiters[i].fair_queue_seq, exclude_seq))
+			continue; /* not earlier than the requester */
+		if (best < 0
+			|| grd_fair_seq_precedes(entry->waiters[i].fair_queue_seq,
+									 entry->waiters[best].fair_queue_seq))
+			best = i;
+	}
+	return best;
+}
+
+/*
+ * spec-5.10 D5 — build the spec-5.8-owned canonical WFG vertex for a queued
+ * waiter so a FAIRNESS_BARRIER edge can point at it WITHOUT fabricating a
+ * vertex (P0#3).  Reuses grd_wfg_make_vertex with the waiter's persisted
+ * canonical wait identity (waiter_xid + wait_seq, spec-5.8 D1c/D1e).  Caller
+ * holds entry->lock.
+ */
+static void
+grd_capture_waiter_vertex(const ClusterGrdEntry *entry, int idx, ClusterLmdVertex *out)
+{
+	grd_wfg_make_vertex(entry->waiters[idx].node_id, entry->waiters[idx].procno,
+						entry->waiters[idx].cluster_epoch, entry->waiters[idx].request_id,
+						entry->waiters[idx].waiter_xid, entry->waiters[idx].wait_seq, out);
+}
+
+/*
+ * spec-5.10 — is queued waiter `widx` barriered behind an earlier boosted
+ * conflicting waiter?  Serve-side mirror of the grant-time barrier test: the
+ * drain must not promote a waiter while a boosted waiter it conflicts with is
+ * still ahead of it.  Caller holds entry->lock.
+ */
+static bool
+grd_waiter_is_barriered(const ClusterGrdEntry *entry, int widx)
+{
+	if (!cluster_grd_starvation_protection_enabled())
+		return false;
+	return grd_find_earliest_boosted_conflicting_waiter(entry, entry->waiters[widx].mode,
+														entry->waiters[widx].fair_queue_seq)
+		   >= 0;
+}
+
+/*
+ * spec-5.10 — fill one waiter slot with full reply identity + spec-5.8
+ * canonical wait identity + fresh spec-5.10 fairness state (fair_queue_seq
+ * minted here, P1c).  Shared by the plain enqueue path and the barrier enqueue
+ * so the two can never drift.  Returns the slot index, or -1 if the waiter
+ * queue is full (caller fails closed).  Caller holds entry->lock.
+ */
+static int
+grd_enqueue_waiter_locked(ClusterGrdEntry *entry, const ClusterGrdHolderId *holder,
+						  int32 source_node_id, uint64 request_id, uint64 shard_master_generation,
+						  uint32 request_opcode, LOCKMODE lockmode, ClusterGrdWaiterMeta meta)
+{
+	int slot;
+
+	if (entry->nwaiters >= PGRAC_GRD_MAX_WAITERS)
+		return -1;
+
+	slot = entry->nwaiters++;
+	entry->waiters[slot].node_id = (int32)holder->node_id;
+	entry->waiters[slot].source_node_id = source_node_id;
+	entry->waiters[slot].procno = holder->procno;
+	entry->waiters[slot].cluster_epoch = holder->cluster_epoch;
+	entry->waiters[slot].request_id = request_id;
+	entry->waiters[slot].waiter_xid = meta.xid;	   /* spec-5.8 D1c */
+	entry->waiters[slot].wait_seq = meta.wait_seq; /* spec-5.8 D1e */
+	entry->waiters[slot].shard_master_generation = shard_master_generation;
+	entry->waiters[slot].request_opcode = request_opcode;
+	entry->waiters[slot].mode = lockmode;
+	entry->waiters[slot].wait_start = 0;
+	entry->waiters[slot].fair_queue_seq = grd_mint_fair_queue_seq(entry); /* spec-5.10 D4 */
+	entry->waiters[slot].skip_count = 0;								  /* spec-5.10 D2 */
+	entry->waiters[slot].boosted = false;								  /* spec-5.10 D2 */
+	entry->generation++;
+	return slot;
+}
+
+/*
+ * spec-5.10 D6 — observability accessor: report a queued waiter's fairness
+ * state (skip_count / boosted / fair_queue_seq) by its 4-tuple identity.
+ * Returns true iff a matching queued REQUEST waiter exists.  Read-only;
+ * acquires entry->lock for a consistent snapshot.  Used by the cluster_unit
+ * suite and (D7) the dump/observability surface.
+ */
+bool
+cluster_grd_entry_describe_waiter(const ClusterResId *resid, const ClusterGrdHolderId *id,
+								  uint32 *out_skip_count, bool *out_boosted,
+								  uint64 *out_fair_queue_seq)
+{
+	ClusterGrdEntry *entry = NULL;
+	bool found = false;
+	int i;
+
+	if (resid == NULL || id == NULL)
+		return false;
+	if (cluster_grd_entry_lookup_or_create(resid, false, &entry) != CLUSTER_GRD_ENTRY_OK
+		|| entry == NULL)
+		return false;
+
+	SpinLockAcquire(&entry->lock);
+	for (i = 0; i < entry->nwaiters; i++) {
+		if ((uint32)entry->waiters[i].node_id == id->node_id
+			&& entry->waiters[i].procno == id->procno
+			&& entry->waiters[i].cluster_epoch == id->cluster_epoch
+			&& entry->waiters[i].request_id == id->request_id) {
+			if (out_skip_count != NULL)
+				*out_skip_count = entry->waiters[i].skip_count;
+			if (out_boosted != NULL)
+				*out_boosted = entry->waiters[i].boosted;
+			if (out_fair_queue_seq != NULL)
+				*out_fair_queue_seq = entry->waiters[i].fair_queue_seq;
+			found = true;
+			break;
+		}
+	}
+	SpinLockRelease(&entry->lock);
+	cluster_grd_entry_release(entry);
+	return found;
+}
+
 /*
  * spec-5.5 D5 — shared implementation for the blocking (enqueue_or_grant) and
  * conditional (grant_conditional) grant paths.  Keeping ONE conflict scan +
@@ -2670,6 +3156,127 @@ cluster_grd_entry_enqueue_or_grant_impl(const ClusterResId *resid, const Cluster
 			cluster_grd_inc_ges_work_queue_full();
 			return CLUSTER_GRD_WAIT_QUEUE_FULL;
 		}
+		/*
+		 * spec-5.10 D2 — scan-on-grant.  This holder-compatible request is about
+		 * to be granted and thereby "jumps" every already-queued waiter whose
+		 * wanted mode conflicts with it;  charge each such earlier waiter one
+		 * skip (counting only — the grant is never blocked here, Rule 8.A).
+		 * Gated on the cluster-global toggle: when starvation protection is off
+		 * the grant path is the unmodified spec-5.1b fast path (Q9 / P1#1).
+		 */
+		if (cluster_grd_starvation_protection_enabled()) {
+			int wi;
+
+			grd_starvation_account_skip_on_grant(entry, (LOCKMODE)lockmode);
+
+			/*
+			 * spec-5.10 D2/D5 — grant barrier.  If an EARLIER boosted waiter
+			 * conflicts with this would-be-granted request, hold the request
+			 * behind it (the FAIRNESS_BARRIER) instead of letting it jump.  A
+			 * request that conflicts with a HOLDER never reaches here, so the
+			 * conflict matrix is never bypassed (Rule 8.A — no false grant).
+			 */
+			wi = grd_find_earliest_boosted_conflicting_waiter(entry, (LOCKMODE)lockmode, 0);
+			if (wi >= 0) {
+				ClusterLmdVertex w_vertex, r_vertex;
+				bool published;
+
+				/* NOWAIT jumper cannot enqueue -> try-lock fails (P0#1-r3). */
+				if (conditional) {
+					SpinLockRelease(&entry->lock);
+					cluster_grd_entry_release(entry);
+					return CLUSTER_GRD_CONFLICT_NOWAIT;
+				}
+
+				/*
+				 * Two-phase FAIRNESS_BARRIER edge publish (P0#2-r3 lock order):
+				 * capture the requester's vertex + the boosted waiter's
+				 * spec-5.8-owned canonical vertex (P0#3 — never fabricated)
+				 * under entry->lock, release the spinlock (the LMD graph is
+				 * LWLock-protected and must never be touched under a spinlock),
+				 * publish R -> W, then re-acquire + revalidate.  The edge is
+				 * visible BEFORE R blocks (edge-visible-before-block, R2); the
+				 * pre-enqueue edge is tentative and only feeds the spec-5.8
+				 * two-round confirm (P1#2).
+				 */
+				grd_capture_waiter_vertex(entry, wi, &w_vertex);
+				grd_wfg_make_vertex((int32)holder->node_id, holder->procno, holder->cluster_epoch,
+									request_id, meta.xid, meta.wait_seq, &r_vertex);
+				SpinLockRelease(&entry->lock);
+
+				published = cluster_lmd_submit_wait_edge_real(&r_vertex, &w_vertex, request_id);
+
+				SpinLockAcquire(&entry->lock);
+				/*
+				 * Revalidate after the gap.  Block only if the edge published,
+				 * the requester still does not conflict with any holder, and an
+				 * earlier boosted conflicting waiter still exists.  Otherwise
+				 * retract the tentative edge and fall back to the spec-5.1b
+				 * decision (Rule 8.A — fail closed to the safe path).
+				 */
+				if (published
+					&& !grd_scan_holder_conflict(entry, holder->node_id, holder->procno,
+												 (LOCKMODE)lockmode)
+					&& grd_find_earliest_boosted_conflicting_waiter(entry, (LOCKMODE)lockmode, 0)
+						   >= 0) {
+					if (grd_enqueue_waiter_locked(entry, holder, source_node_id, request_id,
+												  shard_master_generation, request_opcode,
+												  (LOCKMODE)lockmode, meta)
+						< 0) {
+						SpinLockRelease(&entry->lock);
+						cluster_lmd_cancel_wait_edge_real(&r_vertex);
+						cluster_grd_entry_release(entry);
+						cluster_grd_inc_ges_work_queue_full();
+						return CLUSTER_GRD_WAIT_QUEUE_FULL;
+					}
+					pg_atomic_fetch_add_u64(&cluster_grd_state->starvation_barrier_enqueued_count,
+											1);
+					SpinLockRelease(&entry->lock);
+					cluster_grd_entry_release(entry);
+					return CLUSTER_GRD_ENQUEUED_WAITER;
+				}
+
+				/* Barrier withdrawn (publish/revalidate failed): retract the
+				 * tentative edge outside the spinlock, then re-decide against
+				 * the CURRENT holders (never false-grant). */
+				SpinLockRelease(&entry->lock);
+				if (published)
+					cluster_lmd_cancel_wait_edge_real(&r_vertex);
+				else
+					pg_atomic_fetch_add_u64(
+						&cluster_grd_state->starvation_barrier_publish_fail_count, 1);
+				SpinLockAcquire(&entry->lock);
+				if (grd_scan_holder_conflict(entry, holder->node_id, holder->procno,
+											 (LOCKMODE)lockmode)) {
+					if (conditional) {
+						SpinLockRelease(&entry->lock);
+						cluster_grd_entry_release(entry);
+						return CLUSTER_GRD_CONFLICT_NOWAIT;
+					}
+					if (grd_enqueue_waiter_locked(entry, holder, source_node_id, request_id,
+												  shard_master_generation, request_opcode,
+												  (LOCKMODE)lockmode, meta)
+						< 0) {
+						SpinLockRelease(&entry->lock);
+						cluster_grd_entry_release(entry);
+						cluster_grd_inc_ges_work_queue_full();
+						return CLUSTER_GRD_WAIT_QUEUE_FULL;
+					}
+					SpinLockRelease(&entry->lock);
+					cluster_grd_entry_release(entry);
+					return CLUSTER_GRD_ENQUEUED_WAITER;
+				}
+				/* No conflict remains -> fall through and grant below. */
+			}
+		}
+		/* Re-check the holder cap (the barrier path may have released the
+		 * spinlock); never overflow holders[] (Rule 8.A). */
+		if (entry->ngranted >= PGRAC_GRD_MAX_HOLDERS) {
+			SpinLockRelease(&entry->lock);
+			cluster_grd_entry_release(entry);
+			cluster_grd_inc_ges_work_queue_full();
+			return CLUSTER_GRD_WAIT_QUEUE_FULL;
+		}
 		slot = entry->ngranted++;
 		entry->holders[slot].node_id = (int32)holder->node_id;
 		entry->holders[slot].procno = holder->procno;
@@ -2699,26 +3306,14 @@ cluster_grd_entry_enqueue_or_grant_impl(const ClusterResId *resid, const Cluster
 	 * (3) Conflict → enqueue waiter with full reply identity (HC17/HC19).
 	 *	  HC12 family 53R71 fail-closed when waiter slot exhausted.
 	 */
-	if (entry->nwaiters >= PGRAC_GRD_MAX_WAITERS) {
+	if (grd_enqueue_waiter_locked(entry, holder, source_node_id, request_id,
+								  shard_master_generation, request_opcode, (LOCKMODE)lockmode, meta)
+		< 0) {
 		SpinLockRelease(&entry->lock);
 		cluster_grd_entry_release(entry);
 		cluster_grd_inc_ges_work_queue_full();
 		return CLUSTER_GRD_WAIT_QUEUE_FULL;
 	}
-
-	slot = entry->nwaiters++;
-	entry->waiters[slot].node_id = (int32)holder->node_id;
-	entry->waiters[slot].source_node_id = source_node_id;
-	entry->waiters[slot].procno = holder->procno;
-	entry->waiters[slot].cluster_epoch = holder->cluster_epoch;
-	entry->waiters[slot].request_id = request_id;
-	entry->waiters[slot].waiter_xid = meta.xid;	   /* spec-5.8 D1c */
-	entry->waiters[slot].wait_seq = meta.wait_seq; /* spec-5.8 D1e */
-	entry->waiters[slot].shard_master_generation = shard_master_generation;
-	entry->waiters[slot].request_opcode = request_opcode;
-	entry->waiters[slot].mode = (LOCKMODE)lockmode;
-	entry->waiters[slot].wait_start = 0;
-	entry->generation++;
 
 	SpinLockRelease(&entry->lock);
 	cluster_grd_entry_release(entry);
@@ -3068,6 +3663,14 @@ cluster_grd_entry_request_convert(ClusterGrdEntry *entry, const ClusterGrdConver
 		entry->holders[hslot].request_id = req->convert_request_id;
 		entry->generation++;
 		pg_atomic_fetch_add_u64(&cluster_grd_state->convert_granted_inplace_count, 1);
+		/*
+		 * spec-5.10 D3 — convert-side scan-on-grant: granting this convert in
+		 * place raised a holder to requested_mode, "jumping" every queued waiter
+		 * that conflicts with the new mode;  charge each a skip (and boost at the
+		 * threshold) so a convert flood cannot silently starve a plain waiter.
+		 */
+		if (cluster_grd_starvation_protection_enabled())
+			grd_starvation_account_skip_on_grant(entry, req->requested_mode);
 		return CLUSTER_GRD_CONVERT_GRANTED_INPLACE;
 
 	case GES_CONVERT_LATERAL:
@@ -3095,9 +3698,86 @@ cluster_grd_entry_drain_converts_then_waiters(ClusterGrdEntry *entry,
 											  ClusterGrdGrantIdentity *granted_out, int max_out)
 {
 	int n = 0;
+	bool served_waiter = false;
 
 	Assert(entry != NULL && granted_out != NULL && max_out > 0);
 	Assert(cluster_grd_state != NULL);
+
+	/*
+	 * spec-5.10 D3 — convert capping (narrowed, P1c-r2).  Before granting any
+	 * convert in place, if a BOOSTED waiter is already compatible with every
+	 * holder and is held back ONLY by the convert priority (its mode conflicts
+	 * with a pending convert's target), serve it FIRST so a convert flood cannot
+	 * starve it.  This consumes the drain's single waiter slot (Phase 2 below is
+	 * then skipped), so the granted_out budget is unchanged.  A boosted waiter
+	 * still blocked by a HOLDER is NOT un-capped (the convert is not paused,
+	 * U13); convert partial-order correctness (5.1b) is untouched — the
+	 * conflicting convert simply stays queued one more round.
+	 */
+	if (n < max_out && cluster_grd_starvation_protection_enabled() && entry->nconverts > 0) {
+		int chosen = -1;
+
+		for (int w = 0; w < entry->nwaiters; w++) {
+			bool holder_ok = true;
+			bool convert_blocked = false;
+
+			if (!entry->waiters[w].boosted)
+				continue;
+			for (int h = 0; h < entry->ngranted; h++) {
+				if (!ges_modes_compatible(entry->holders[h].mode, entry->waiters[w].mode)) {
+					holder_ok = false;
+					break;
+				}
+			}
+			if (!holder_ok)
+				continue; /* still blocked by a holder -> do NOT pause the convert */
+			if (grd_waiter_is_barriered(entry, w))
+				continue; /* held behind an earlier boosted waiter */
+			for (int cc = 0; cc < entry->nconverts; cc++) {
+				if (!ges_modes_compatible(entry->converts[cc].requested_mode,
+										  entry->waiters[w].mode)) {
+					convert_blocked = true;
+					break;
+				}
+			}
+			if (!convert_blocked)
+				continue; /* not held by a convert -> Phase 2 serves it normally */
+			if (chosen < 0
+				|| grd_fair_seq_precedes(entry->waiters[w].fair_queue_seq,
+										 entry->waiters[chosen].fair_queue_seq))
+				chosen = w;
+		}
+
+		if (chosen >= 0) {
+			int w = chosen;
+
+			granted_out[n].holder.node_id = (uint32)entry->waiters[w].node_id;
+			granted_out[n].holder.procno = entry->waiters[w].procno;
+			granted_out[n].holder.cluster_epoch = entry->waiters[w].cluster_epoch;
+			granted_out[n].holder.request_id = entry->waiters[w].request_id;
+			granted_out[n].source_node_id = entry->waiters[w].source_node_id;
+			granted_out[n].request_opcode = entry->waiters[w].request_opcode;
+			granted_out[n].shard_master_generation = entry->waiters[w].shard_master_generation;
+			granted_out[n].mode = entry->waiters[w].mode;
+			n++;
+			served_waiter = true;
+
+			if (entry->ngranted < PGRAC_GRD_MAX_HOLDERS) {
+				int hs = entry->ngranted++;
+
+				entry->holders[hs].node_id = entry->waiters[w].node_id;
+				entry->holders[hs].procno = entry->waiters[w].procno;
+				entry->holders[hs].cluster_epoch = entry->waiters[w].cluster_epoch;
+				entry->holders[hs].request_id = entry->waiters[w].request_id;
+				entry->holders[hs].mode = entry->waiters[w].mode;
+			}
+			if (w < entry->nwaiters - 1)
+				entry->waiters[w] = entry->waiters[entry->nwaiters - 1];
+			memset(&entry->waiters[entry->nwaiters - 1], 0, sizeof(ClusterGrdWaiter));
+			entry->nwaiters--;
+			entry->generation++;
+		}
+	}
 
 	/*
 	 * Phase 1 — grant every pending convert now compatible with the other
@@ -3144,6 +3824,10 @@ cluster_grd_entry_drain_converts_then_waiters(ClusterGrdEntry *entry,
 		granted_out[n].mode = cv->requested_mode;
 		n++;
 		pg_atomic_fetch_add_u64(&cluster_grd_state->convert_granted_inplace_count, 1);
+		/* spec-5.10 D3 — convert-side scan-on-grant: the in-place grant raised a
+		 * holder to requested_mode, jumping every conflicting waiter. */
+		if (cluster_grd_starvation_protection_enabled())
+			grd_starvation_account_skip_on_grant(entry, cv->requested_mode);
 		grd_convert_remove(entry, c);
 		c = 0; /* a holder mode changed — re-scan from the front */
 	}
@@ -3153,7 +3837,18 @@ cluster_grd_entry_drain_converts_then_waiters(ClusterGrdEntry *entry,
 	 * AND every still-pending convert target (anti-starvation: never grant
 	 * a waiter that would block a queued convert).
 	 */
-	if (n < max_out) {
+	if (n < max_out && !served_waiter) {
+		int chosen = -1;
+
+		/*
+		 * spec-5.10 D4 (P1a) — choose the waiter to promote by MIN fair_queue_seq
+		 * among those compatible with every holder + pending convert AND not held
+		 * behind an earlier boosted conflicting waiter (serve-side barrier).
+		 * Array order is unreliable after swap-remove, so an explicit min-seq scan
+		 * replaces the spec-5.1b "first compatible" pick; with starvation
+		 * protection off grd_waiter_is_barriered() is always false and the choice
+		 * degrades to the lowest-seq compatible waiter.
+		 */
 		for (int w = 0; w < entry->nwaiters; w++) {
 			bool ok = true;
 
@@ -3172,6 +3867,16 @@ cluster_grd_entry_drain_converts_then_waiters(ClusterGrdEntry *entry,
 			}
 			if (!ok)
 				continue;
+			if (grd_waiter_is_barriered(entry, w))
+				continue; /* spec-5.10 — held behind a boosted conflicting waiter */
+			if (chosen < 0
+				|| grd_fair_seq_precedes(entry->waiters[w].fair_queue_seq,
+										 entry->waiters[chosen].fair_queue_seq))
+				chosen = w;
+		}
+
+		if (chosen >= 0) {
+			int w = chosen;
 
 			granted_out[n].holder.node_id = (uint32)entry->waiters[w].node_id;
 			granted_out[n].holder.procno = entry->waiters[w].procno;
@@ -3197,7 +3902,6 @@ cluster_grd_entry_drain_converts_then_waiters(ClusterGrdEntry *entry,
 			memset(&entry->waiters[entry->nwaiters - 1], 0, sizeof(ClusterGrdWaiter));
 			entry->nwaiters--;
 			entry->generation++;
-			break; /* one waiter per drain (multi-convert + 1 waiter, §1.2 D5) */
 		}
 	}
 	return n;
@@ -3892,8 +4596,12 @@ cluster_grd_lmon_tick_dead_sweep(void)
 
 	newly_dead = current_dead_bitmap & ~cluster_grd_last_dead_bitmap;
 	for (peer_id = 0; peer_id < 64; peer_id++) {
-		if (newly_dead & ((uint64)1 << peer_id))
+		if (newly_dead & ((uint64)1 << peer_id)) {
 			cluster_grd_cleanup_on_node_dead((int32)peer_id);
+			/* spec-5.10 D8 — a dead node's boosted waiter must not keep
+			 * barriering live requests behind a vertex that no longer exists. */
+			(void)cluster_grd_clear_boosted_for_node((int32)peer_id);
+		}
 	}
 
 	/* Commit AFTER sweep — crash-safe idempotent;  reboot reconstructs. */
