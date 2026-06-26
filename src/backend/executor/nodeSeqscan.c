@@ -10,6 +10,22 @@
  * IDENTIFICATION
  *	  src/backend/executor/nodeSeqscan.c
  *
+ * PGRAC MODIFICATIONS
+ *	  Author: SqlRush <sqlrush@gmail.com>
+ *
+ *	  Wired the shared CR pool admission scan-kind hint (spec-5.52 D3) into the
+ *	  serial sequential-scan fetch path (under USE_PGRAC_CLUSTER).  For the
+ *	  duration of each table_scan_getnextslot() call SeqNext() tags the
+ *	  backend-local CR admission scan kind as CR_SCAN_BULK, so any consistent-
+ *	  read image constructed while satisfying visibility during a bulk seqscan is
+ *	  bypassed by the scan_resistant admission policy (one-shot bulk pages must
+ *	  not evict hot cross-backend CR images).  The marker is armed only under the
+ *	  opt-in cluster.cr_pool_admission_policy = scan_resistant so the default
+ *	  (admit_all) hot path pays no PG_TRY / marker overhead, and is restored on
+ *	  every exit path (including error via PG_FINALLY).  Parallel workers are
+ *	  recognised intrinsically (IsParallelWorker), so only the serial case needs
+ *	  the marker.  Spec: spec-5.52-cr-cache-admission-policy.md.
+ *
  *-------------------------------------------------------------------------
  */
 /*
@@ -32,6 +48,10 @@
 #include "executor/execdebug.h"
 #include "executor/nodeSeqscan.h"
 #include "utils/rel.h"
+
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_cr_admit.h"	/* PGRAC: spec-5.52 D3 scan-kind marker */
+#endif
 
 static TupleTableSlot *SeqNext(SeqScanState *node);
 
@@ -77,6 +97,39 @@ SeqNext(SeqScanState *node)
 	/*
 	 * get the next tuple from the table
 	 */
+#ifdef USE_PGRAC_CLUSTER
+
+	/*
+	 * PGRAC spec-5.52 D3: tag the CR admission scan kind as BULK for the
+	 * duration of this serial sequential fetch so the shared CR pool admission
+	 * gate (scan_resistant policy) bypasses one-shot bulk-scan pages instead of
+	 * evicting hot cross-backend CR images.  A CR image, when needed, is
+	 * constructed inside table_scan_getnextslot() while satisfying visibility,
+	 * so the marker must cover exactly that call.  Armed only under the opt-in
+	 * scan_resistant policy (default admit_all stays free of PG_TRY overhead);
+	 * restored on every path, including error.
+	 */
+	if (cluster_cr_pool_admission_policy == CR_ADMIT_SCAN_RESISTANT)
+	{
+		ClusterCRScanKind prev = cluster_cr_admit_set_scan_kind(CR_SCAN_BULK);
+		bool		got = false;
+
+		PG_TRY();
+		{
+			got = table_scan_getnextslot(scandesc, direction, slot);
+		}
+		PG_FINALLY();
+		{
+			cluster_cr_admit_restore_scan_kind(prev);
+		}
+		PG_END_TRY();
+
+		if (got)
+			return slot;
+		return NULL;
+	}
+#endif
+
 	if (table_scan_getnextslot(scandesc, direction, slot))
 		return slot;
 	return NULL;

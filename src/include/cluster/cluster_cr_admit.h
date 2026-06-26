@@ -131,11 +131,16 @@ extern ClusterCRAdmitReason cluster_cr_admit_last_reason(void);
 
 /*
  * scan-kind marker lifecycle (spec-5.52 D3).  set() returns the previous value
- *   for restore (nested scans); the scan executor calls set() at node init and
- *   restore() at node shutdown.  reset() forces POINT and MUST be called at
- *   transaction/portal abort (AtEOXact hook) so an ereport between set/restore
- *   cannot leak BULK into the next statement.  current() folds in
- *   IsParallelWorker() (parallel workers report PARALLEL without the marker).
+ *   for restore (nested scans).  The serial sequential-scan executor
+ *   (nodeSeqscan.c SeqNext, under USE_PGRAC_CLUSTER) wraps each
+ *   table_scan_getnextslot() fetch with set(BULK) / restore(prev) -- a
+ *   per-fetch guarded marker, armed only under the scan_resistant policy and
+ *   restored on every path including error via PG_FINALLY, so the marker covers
+ *   exactly the CR construct that the fetch may trigger and never leaks across
+ *   fetches or statements.  reset() forces POINT as a defensive belt (e.g. an
+ *   AtEOXact hook) should any path ever set() without a matching restore().
+ *   current() folds in IsParallelWorker() (parallel workers report PARALLEL
+ *   intrinsically, without needing the marker).
  */
 extern ClusterCRScanKind cluster_cr_admit_set_scan_kind(ClusterCRScanKind kind);
 extern void cluster_cr_admit_restore_scan_kind(ClusterCRScanKind prev);
