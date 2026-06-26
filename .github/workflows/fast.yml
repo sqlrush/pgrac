@@ -153,11 +153,22 @@ jobs:
       - name: Lint commit message
         if: github.event_name == 'pull_request'
         run: |
-          msg=$(git log -1 --pretty=%s)
-          if ! [[ "$msg" =~ ^(feat|fix|docs|refactor|test|chore|perf|ci|spec|style)(\([^\)]+\))?:\ .+ ]]; then
-            echo "::error::commit subject does not match conventional pattern: '$msg'"
-            exit 1
-          fi
+          # Lint the PR's real commits (base..head), NOT the synthetic merge
+          # commit GitHub generates for pull_request events.  git log -1 on a
+          # PR checkout points at "Merge <sha> into <sha>", which never matches
+          # the conventional pattern and made this gate a false-red on every PR.
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          pat='^(feat|fix|docs|refactor|test|chore|perf|ci|spec|style)(\([^)]+\))?: .+'
+          fail=0
+          for sha in $(git rev-list "$base".."$head"); do
+            msg=$(git log -1 --pretty=%s "$sha")
+            if ! [[ "$msg" =~ $pat ]]; then
+              echo "::error::commit $sha subject does not match conventional pattern: '$msg'"
+              fail=1
+            fi
+          done
+          exit $fail
 
 
   # ====================================================================
