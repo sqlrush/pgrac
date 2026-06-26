@@ -53,7 +53,7 @@ my $has_visibility_inject =
 	  q{SELECT count(*) FROM pg_cluster_shmem
 	     WHERE name = 'pgrac cluster visibility inject'}) eq '1';
 # +1 for the unconditional "pgrac cluster sequence" region (spec-5.4 SQ shmem foundation).
-  my $expected_region_count = $has_visibility_inject ? '59' : '58';
+  my $expected_region_count = $has_visibility_inject ? '60' : '59';
 
 
 # ----------

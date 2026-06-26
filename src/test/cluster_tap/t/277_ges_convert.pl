@@ -126,8 +126,10 @@ my $ges_c = slurp_src('src/backend/cluster/cluster_ges.c');
 like($ges_c, qr/case GES_REQ_OPCODE_CONVERT: \{/,
 	'L4: inbound opcode-2 CONVERT has its own handler (split from REQUEST)');
 # The handler drives the live 5.1b convert state machine (spec-5.3 D3).
-like($ges_c, qr/cluster_grd_convert_or_enqueue\(/,
-	'L4: CONVERT handler runs the live convert decision (cluster_grd_convert_or_enqueue)');
+# spec-5.8 D1e renamed the call to the _meta variant (carries waiter
+# xid + wait_seq for the deadlock WFG vertex); match either form.
+like($ges_c, qr/cluster_grd_convert_or_enqueue(?:_meta)?\(/,
+	'L4: CONVERT handler runs the live convert decision (cluster_grd_convert_or_enqueue_meta)');
 # An illegal (LATERAL / no-holder) convert fail-closes via the reply ring with
 # the 53R74 reason -- NOT an ereport on the LMS/receiving thread (L341).
 like($ges_c, qr/GES_REJECT_REASON_ILLEGAL_CONVERT/,
