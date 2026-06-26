@@ -542,6 +542,14 @@ void
 cluster_grd_lmon_tick_dead_sweep(void)
 {}
 
+/* spec-5.10 fix-forward — cluster_lmon.c calls the runtime-off starvation sweep. */
+uint32 cluster_grd_lmon_tick_starvation_sweep(void);
+uint32
+cluster_grd_lmon_tick_starvation_sweep(void)
+{
+	return 0;
+}
+
 /* spec-4.6 D1 L104 stub:  cluster_lmon.c calls cluster_grd_recovery_
  * lmon_tick() after reconfig_lmon_tick (P0-P7 recovery sequence).
  * Standalone fixture doesn't link cluster_grd.o;  vacuous stub. */

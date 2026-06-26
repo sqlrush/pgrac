@@ -317,6 +317,13 @@ typedef struct ClusterGrdShared {
 	 *	observability only (dump_grd; D7).
 	 */
 	pg_atomic_uint32 starvation_protection_enabled;
+	/*
+	 * spec-5.10 fix-forward — runtime-off sweep request.  The protection
+	 * assign-hook sets this when the toggle goes OFF; the LMON tick test-and-
+	 * clears it and runs cluster_grd_clear_all_boosted in the cluster context
+	 * (P1#1: never sweep the shared GRD/LMD graph from a GUC assign-hook).
+	 */
+	pg_atomic_uint32 starvation_sweep_pending;
 	pg_atomic_uint64 starvation_boost_count;				/* waiters boosted to HOL */
 	pg_atomic_uint64 starvation_barrier_enqueued_count;		/* jumpers held behind a boost */
 	pg_atomic_uint64 starvation_barrier_publish_fail_count; /* edge publish/revalidate fail */
@@ -1084,6 +1091,8 @@ extern uint64 cluster_grd_starvation_max_skip_observed(void);
 /* spec-5.10 D8 — boosted-state sweeps (LMON context; runtime-off + node-dead). */
 extern uint32 cluster_grd_clear_all_boosted(void);
 extern uint32 cluster_grd_clear_boosted_for_node(int32 dead_node);
+/* spec-5.10 fix-forward — LMON-tick runtime-off sweep (test-and-clear pending). */
+extern uint32 cluster_grd_lmon_tick_starvation_sweep(void);
 
 /*
  * spec-5.10 D6 — read a queued REQUEST waiter's enqueue-fairness state
@@ -1163,10 +1172,18 @@ typedef struct ClusterGrdConvert {
 	 * private ClusterGrdWaiter fields.  Master-local + shmem-only (NEVER on the
 	 * wire); fair_queue_seq is the ordering key, not a wait identity (Q12 / L5;
 	 * the canonical wait identity is waiter_xid + wait_seq above, spec-5.8).
+	 *
+	 * RESERVED for the converts-as-victim direction (forward).  spec-5.10's
+	 * convert handling (D3) only protects a boosted *waiter* from a convert
+	 * flood (drain Phase-0 cap); it does NOT mint/boost these convert fields,
+	 * so a pending convert starved by holder-compatible requests is not yet
+	 * protected (a pre-existing spec-5.1b behaviour, not a 5.10 regression).
+	 * The snapshot copies these so a future direction can make a boosted
+	 * convert a barrier target without an ABI change.
 	 */
-	uint64 fair_queue_seq; /* master-local monotonic order (D4) */
-	uint32 skip_count;	   /* scan-on-grant jump count (D2) */
-	bool boosted;		   /* head-of-line boosted (D2) */
+	uint64 fair_queue_seq; /* master-local monotonic order (D4; convert: reserved) */
+	uint32 skip_count;	   /* scan-on-grant jump count (D2; convert: reserved) */
+	bool boosted;		   /* head-of-line boosted (D2; convert: reserved) */
 } ClusterGrdConvert;
 
 StaticAssertDecl(sizeof(ClusterGrdConvert) == 88,

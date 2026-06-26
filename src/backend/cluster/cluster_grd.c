@@ -569,6 +569,7 @@ cluster_grd_shmem_init(void)
 
 		/* spec-5.10 — lock-starvation fairness: protection on by default. */
 		pg_atomic_init_u32(&cluster_grd_state->starvation_protection_enabled, 1);
+		pg_atomic_init_u32(&cluster_grd_state->starvation_sweep_pending, 0);
 		pg_atomic_init_u64(&cluster_grd_state->starvation_boost_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->starvation_barrier_enqueued_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->starvation_barrier_publish_fail_count, 0);
@@ -2702,6 +2703,35 @@ cluster_grd_set_starvation_protection(bool enabled)
 	if (cluster_grd_state == NULL)
 		return;
 	pg_atomic_write_u32(&cluster_grd_state->starvation_protection_enabled, enabled ? 1 : 0);
+	/*
+	 * spec-5.10 fix-forward (P1#1) — when protection is turned OFF, request the
+	 * LMON-context sweep that clears already-boosted waiters + retracts the
+	 * FAIRNESS_BARRIER edges so the disable is a clean escape rather than
+	 * leaving stale boost/edge state to age out on the next unrelated drain.
+	 * Only flip the request flag here (a single atomic write is assign-hook
+	 * safe); the actual sweep runs in cluster_grd_lmon_tick_starvation_sweep.
+	 */
+	if (!enabled)
+		pg_atomic_write_u32(&cluster_grd_state->starvation_sweep_pending, 1);
+}
+
+/*
+ * spec-5.10 fix-forward — LMON-context runtime-off sweep.  Test-and-clear the
+ * pending flag and, if protection is (still) off, clear every boosted waiter +
+ * retract barrier edges across all GRD entries.  Returns the number of boosted
+ * flags cleared (0 if no sweep was pending).  Called from the LMON tick.
+ */
+uint32
+cluster_grd_lmon_tick_starvation_sweep(void)
+{
+	if (cluster_grd_state == NULL)
+		return 0;
+	if (pg_atomic_exchange_u32(&cluster_grd_state->starvation_sweep_pending, 0) == 0)
+		return 0;
+	/* A concurrent re-enable wins: nothing to sweep if protection came back on. */
+	if (cluster_grd_starvation_protection_enabled())
+		return 0;
+	return cluster_grd_clear_all_boosted();
 }
 
 /* spec-5.10 D7 — starvation-fairness observability counter accessors. */
@@ -4597,10 +4627,19 @@ cluster_grd_lmon_tick_dead_sweep(void)
 	newly_dead = current_dead_bitmap & ~cluster_grd_last_dead_bitmap;
 	for (peer_id = 0; peer_id < 64; peer_id++) {
 		if (newly_dead & ((uint64)1 << peer_id)) {
-			cluster_grd_cleanup_on_node_dead((int32)peer_id);
-			/* spec-5.10 D8 — a dead node's boosted waiter must not keep
-			 * barriering live requests behind a vertex that no longer exists. */
+			/*
+			 * spec-5.10 D8 (fix-forward order) — clear the dead node's boosted
+			 * flags BEFORE the cleanup removes its queue slots.  Run first, the
+			 * sweep finds the dead boosted W still queued, clears it, and the
+			 * WFG refresh re-derives every live waiter without that boost — so a
+			 * live request held behind the dead W is un-barriered and its stale
+			 * R->W edge is retracted.  If cleanup ran first the dead W would
+			 * already be gone, the sweep would find nothing, and the live waiter
+			 * would stay barriered behind a vertex that no longer exists until
+			 * an unrelated resync.
+			 */
 			(void)cluster_grd_clear_boosted_for_node((int32)peer_id);
+			cluster_grd_cleanup_on_node_dead((int32)peer_id);
 		}
 	}
 

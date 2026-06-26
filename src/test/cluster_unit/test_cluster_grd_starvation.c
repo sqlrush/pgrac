@@ -1726,13 +1726,101 @@ UT_TEST(test_starv_u21_layout_and_identity_ownership)
 	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, boosted), 84);
 }
 
+/* U22 — runtime-off LMON sweep wiring (fix-forward): turning protection off sets
+ * the sweep-pending flag, and the LMON-tick sweep then clears boosted +
+ * retracts the FAIRNESS_BARRIER edges (the sweep is now reachable from a
+ * production path, not only the direct U19 helper call). */
+UT_TEST(test_starv_u22_runtime_off_lmon_sweep)
+{
+	int saved = cluster_node_id;
+	int saved_skips = cluster_ges_starvation_max_skips;
+	ClusterResId resid;
+	ClusterGrdHolderId w;
+	bool boosted = false;
+
+	cluster_node_id = 0;
+	cluster_ges_starvation_max_skips = 1;
+	starv_reset();
+	starv_resid(5122, &resid);
+
+	UT_ASSERT_EQ((int)starv_request(&resid, 1, 100, 1, ShareLock), (int)CLUSTER_GRD_GRANT_NOW);
+	UT_ASSERT_EQ((int)starv_request(&resid, 2, 200, 2, ExclusiveLock),
+				 (int)CLUSTER_GRD_ENQUEUED_WAITER);
+	UT_ASSERT_EQ((int)starv_request(&resid, 3, 300, 3, ShareLock),
+				 (int)CLUSTER_GRD_ENQUEUED_WAITER);
+	w = starv_holder(2, 200, 2);
+	UT_ASSERT(cluster_grd_entry_describe_waiter(&resid, &w, NULL, &boosted, NULL));
+	UT_ASSERT_EQ((int)boosted, 1);
+	UT_ASSERT(ut_wfg_has_edge(3, 300, 0, 3, 2, 200, 0, 2));
+
+	/* Protection on + no request pending -> LMON sweep tick is a no-op. */
+	UT_ASSERT_EQ((int)cluster_grd_lmon_tick_starvation_sweep(), 0);
+
+	/* Turn protection OFF -> sets sweep-pending; the LMON tick then clears the
+	 * boost + retracts the barrier edge (clean escape). */
+	cluster_grd_set_starvation_protection(false);
+	UT_ASSERT_EQ((int)cluster_grd_lmon_tick_starvation_sweep(), 1);
+	UT_ASSERT(cluster_grd_entry_describe_waiter(&resid, &w, NULL, &boosted, NULL));
+	UT_ASSERT_EQ((int)boosted, 0);
+	UT_ASSERT(!ut_wfg_has_edge(3, 300, 0, 3, 2, 200, 0, 2));
+
+	/* Pending consumed -> a second tick is a no-op. */
+	UT_ASSERT_EQ((int)cluster_grd_lmon_tick_starvation_sweep(), 0);
+
+	cluster_grd_set_starvation_protection(true);
+	cluster_ges_starvation_max_skips = saved_skips;
+	cluster_node_id = saved;
+	starv_teardown();
+}
+
+/* U23 — node-dead sweep un-barriers live waiters (fix-forward order): clearing a
+ * dead node's boosted W (before its slots are removed by the cleanup) re-derives
+ * every live waiter without that boost, so a live request held behind the dead W
+ * is un-barriered and its stale R->W edge is retracted. */
+UT_TEST(test_starv_u23_node_dead_unbarriers_live_waiter)
+{
+	int saved = cluster_node_id;
+	int saved_skips = cluster_ges_starvation_max_skips;
+	ClusterResId resid;
+	ClusterGrdHolderId w;
+	bool boosted = false;
+
+	cluster_node_id = 0;
+	cluster_ges_starvation_max_skips = 1;
+	starv_reset();
+	starv_resid(5123, &resid);
+
+	/* Holder on node1; boosted X waiter W on node2; live S jumper R on node3
+	 * barriered behind W. */
+	UT_ASSERT_EQ((int)starv_request(&resid, 1, 100, 1, ShareLock), (int)CLUSTER_GRD_GRANT_NOW);
+	UT_ASSERT_EQ((int)starv_request(&resid, 2, 200, 2, ExclusiveLock),
+				 (int)CLUSTER_GRD_ENQUEUED_WAITER);
+	UT_ASSERT_EQ((int)starv_request(&resid, 3, 300, 3, ShareLock),
+				 (int)CLUSTER_GRD_ENQUEUED_WAITER);
+	w = starv_holder(2, 200, 2);
+	UT_ASSERT(cluster_grd_entry_describe_waiter(&resid, &w, NULL, &boosted, NULL));
+	UT_ASSERT_EQ((int)boosted, 1);
+	UT_ASSERT(ut_wfg_has_edge(3, 300, 0, 3, 2, 200, 0, 2)); /* R barriered behind W */
+
+	/* node2 (W's node) dies: clear its boost FIRST (the fix-forward order) ->
+	 * W's boost cleared, live R re-derived without the barrier, R->W retracted. */
+	UT_ASSERT_EQ((int)cluster_grd_clear_boosted_for_node(2), 1);
+	UT_ASSERT(cluster_grd_entry_describe_waiter(&resid, &w, NULL, &boosted, NULL));
+	UT_ASSERT_EQ((int)boosted, 0);
+	UT_ASSERT(!ut_wfg_has_edge(3, 300, 0, 3, 2, 200, 0, 2));
+
+	cluster_ges_starvation_max_skips = saved_skips;
+	cluster_node_id = saved;
+	starv_teardown();
+}
+
 
 int
 /* cppcheck-suppress constParameter
  * Reason: main() keeps the standard test harness signature; argv unused. */
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(21);
+	UT_PLAN(23);
 
 	UT_RUN(test_starv_u1_scan_on_grant_counts_skips);
 	UT_RUN(test_starv_u2_boost_at_threshold);
@@ -1755,6 +1843,8 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_starv_u19_sweep_clears_boost_and_edges);
 	UT_RUN(test_starv_u20_max_skips_zero_disables_boost);
 	UT_RUN(test_starv_u21_layout_and_identity_ownership);
+	UT_RUN(test_starv_u22_runtime_off_lmon_sweep);
+	UT_RUN(test_starv_u23_node_dead_unbarriers_live_waiter);
 
 	return ut_failed_count == 0 ? 0 : 1;
 }
