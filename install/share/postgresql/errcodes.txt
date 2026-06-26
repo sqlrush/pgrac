@@ -1,0 +1,913 @@
+#
+# errcodes.txt
+#      PostgreSQL error codes
+#
+# Copyright (c) 2003-2023, PostgreSQL Global Development Group
+#
+# This list serves as the basis for generating source files containing error
+# codes. It is kept in a common format to make sure all these source files have
+# the same contents.
+# The files generated from this one are:
+#
+#   src/include/utils/errcodes.h
+#      macros defining errcode constants to be used in the rest of the source
+#
+#   src/pl/plpgsql/src/plerrcodes.h
+#      a list of PL/pgSQL condition names and their SQLSTATE codes
+#
+#   src/pl/tcl/pltclerrcodes.h
+#      the same, for PL/Tcl
+#
+#   doc/src/sgml/errcodes-table.sgml
+#      a SGML table of error codes for inclusion in the documentation
+#
+# The format of this file is one error code per line, with the following
+# whitespace-separated fields:
+#
+#      sqlstate    E/W/S    errcode_macro_name    spec_name
+#
+# where sqlstate is a five-character string following the SQLSTATE conventions,
+# the second field indicates if the code means an error, a warning or success,
+# errcode_macro_name is the C macro name starting with ERRCODE that will be put
+# in errcodes.h, and spec_name is a lowercase, underscore-separated name that
+# will be used as the PL/pgSQL condition name and will also be included in the
+# SGML list. The last field is optional, if not present the PL/pgSQL condition
+# and the SGML entry will not be generated.
+#
+# Empty lines and lines starting with a hash are comments.
+#
+# There are also special lines in the format of:
+#
+#      Section: section description
+#
+# that is, lines starting with the string "Section:". They are used to delimit
+# error classes as defined in the SQL spec, and are necessary for SGML output.
+#
+#
+#      SQLSTATE codes for errors.
+#
+# The SQL99 code set is rather impoverished, especially in the area of
+# syntactical and semantic errors.  We have borrowed codes from IBM's DB2
+# and invented our own codes to develop a useful code set.
+#
+# When adding a new code, make sure it is placed in the most appropriate
+# class (the first two characters of the code value identify the class).
+# The listing is organized by class to make this prominent.
+#
+# Each class should have a generic '000' subclass.  However,
+# the generic '000' subclass code should be used for an error only
+# when there is not a more-specific subclass code defined.
+#
+# The SQL spec requires that all the elements of a SQLSTATE code be
+# either digits or upper-case ASCII characters.
+#
+# Classes that begin with 0-4 or A-H are defined by the
+# standard. Within such a class, subclass values defined by the
+# standard must begin with 0-4 or A-H. To define a new error code,
+# ensure that it is either in an "implementation-defined class" (it
+# begins with 5-9 or I-Z), or its subclass falls outside the range of
+# error codes that could be present in future versions of the
+# standard (i.e. the subclass value begins with 5-9 or I-Z).
+#
+# The convention is that new error codes defined by PostgreSQL in a
+# class defined by the standard have a subclass value that begins
+# with 'P'. In addition, error codes defined by PostgreSQL clients
+# (such as ecpg) have a class value that begins with 'Y'.
+#
+# PGRAC MODIFICATIONS
+#   Modified by: SqlRush <sqlrush@gmail.com>
+#   Stage:        0.12
+#
+#   Added 45 cluster error codes spanning 8 PG classes (08, 40, 53,
+#   55, 57, 58, 72, XX).  All pgrac codes use the 'R' subclass
+#   character (third position of the SQLSTATE), which is reserved
+#   here as the pgrac namespace and never conflicts with the standard
+#   ('0'-'4', 'A'-'H'), with PG-defined codes ('P' subclass), or with
+#   PG client codes ('Y' class).
+#
+#   Each PG class containing pgrac codes is followed by a separate
+#   "(pgrac extension)" sub-section so that the SGML doc generator
+#   groups pgrac codes immediately after the matching PG class.
+#
+#   Stage 0.12 only registers the codes; ereport() call sites land in
+#   the spec for each owning subsystem (Stage 1+).
+#
+#   Related design:
+#     docs/error-codes-design.md v1.1 §3 / §7.3
+#     specs/spec-0.12-error-codes-framework.md
+
+Section: Class 00 - Successful Completion
+
+00000    S    ERRCODE_SUCCESSFUL_COMPLETION                                  successful_completion
+
+Section: Class 01 - Warning
+
+# do not use this class for failure conditions
+01000    W    ERRCODE_WARNING                                                warning
+0100C    W    ERRCODE_WARNING_DYNAMIC_RESULT_SETS_RETURNED                   dynamic_result_sets_returned
+01008    W    ERRCODE_WARNING_IMPLICIT_ZERO_BIT_PADDING                      implicit_zero_bit_padding
+01003    W    ERRCODE_WARNING_NULL_VALUE_ELIMINATED_IN_SET_FUNCTION          null_value_eliminated_in_set_function
+01007    W    ERRCODE_WARNING_PRIVILEGE_NOT_GRANTED                          privilege_not_granted
+01006    W    ERRCODE_WARNING_PRIVILEGE_NOT_REVOKED                          privilege_not_revoked
+01004    W    ERRCODE_WARNING_STRING_DATA_RIGHT_TRUNCATION                   string_data_right_truncation
+01P01    W    ERRCODE_WARNING_DEPRECATED_FEATURE                             deprecated_feature
+
+Section: Class 02 - No Data (this is also a warning class per the SQL standard)
+
+# do not use this class for failure conditions
+02000    W    ERRCODE_NO_DATA                                                no_data
+02001    W    ERRCODE_NO_ADDITIONAL_DYNAMIC_RESULT_SETS_RETURNED             no_additional_dynamic_result_sets_returned
+
+Section: Class 03 - SQL Statement Not Yet Complete
+
+03000    E    ERRCODE_SQL_STATEMENT_NOT_YET_COMPLETE                         sql_statement_not_yet_complete
+
+Section: Class 08 - Connection Exception
+
+08000    E    ERRCODE_CONNECTION_EXCEPTION                                   connection_exception
+08003    E    ERRCODE_CONNECTION_DOES_NOT_EXIST                              connection_does_not_exist
+08006    E    ERRCODE_CONNECTION_FAILURE                                     connection_failure
+08001    E    ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION            sqlclient_unable_to_establish_sqlconnection
+08004    E    ERRCODE_SQLSERVER_REJECTED_ESTABLISHMENT_OF_SQLCONNECTION      sqlserver_rejected_establishment_of_sqlconnection
+08007    E    ERRCODE_TRANSACTION_RESOLUTION_UNKNOWN                         transaction_resolution_unknown
+08P01    E    ERRCODE_PROTOCOL_VIOLATION                                     protocol_violation
+
+Section: Class 08 - Connection Exception (pgrac extension)
+
+08R01    E    ERRCODE_CLUSTER_NODE_UNREACHABLE                               cluster_node_unreachable
+08R02    E    ERRCODE_CLUSTER_NODE_EVICTED                                   cluster_node_evicted
+08R03    E    ERRCODE_CLUSTER_JOIN_FAILED                                    cluster_join_failed
+08R04    E    ERRCODE_CLUSTER_INTERCONNECT_LOST                              cluster_interconnect_lost
+08R05    E    ERRCODE_CLUSTER_PROTOCOL_VERSION_MISMATCH                      cluster_protocol_version_mismatch
+
+Section: Class 09 - Triggered Action Exception
+
+09000    E    ERRCODE_TRIGGERED_ACTION_EXCEPTION                             triggered_action_exception
+
+Section: Class 0A - Feature Not Supported
+
+0A000    E    ERRCODE_FEATURE_NOT_SUPPORTED                                  feature_not_supported
+
+Section: Class 0B - Invalid Transaction Initiation
+
+0B000    E    ERRCODE_INVALID_TRANSACTION_INITIATION                         invalid_transaction_initiation
+
+Section: Class 0F - Locator Exception
+
+0F000    E    ERRCODE_LOCATOR_EXCEPTION                                      locator_exception
+0F001    E    ERRCODE_L_E_INVALID_SPECIFICATION                              invalid_locator_specification
+
+Section: Class 0L - Invalid Grantor
+
+0L000    E    ERRCODE_INVALID_GRANTOR                                        invalid_grantor
+0LP01    E    ERRCODE_INVALID_GRANT_OPERATION                                invalid_grant_operation
+
+Section: Class 0P - Invalid Role Specification
+
+0P000    E    ERRCODE_INVALID_ROLE_SPECIFICATION                             invalid_role_specification
+
+Section: Class 0Z - Diagnostics Exception
+
+0Z000    E    ERRCODE_DIAGNOSTICS_EXCEPTION                                  diagnostics_exception
+0Z002    E    ERRCODE_STACKED_DIAGNOSTICS_ACCESSED_WITHOUT_ACTIVE_HANDLER    stacked_diagnostics_accessed_without_active_handler
+
+Section: Class 20 - Case Not Found
+
+20000    E    ERRCODE_CASE_NOT_FOUND                                         case_not_found
+
+Section: Class 21 - Cardinality Violation
+
+# this means something returned the wrong number of rows
+21000    E    ERRCODE_CARDINALITY_VIOLATION                                  cardinality_violation
+
+Section: Class 22 - Data Exception
+
+22000    E    ERRCODE_DATA_EXCEPTION                                         data_exception
+2202E    E    ERRCODE_ARRAY_ELEMENT_ERROR
+# SQL99's actual definition of "array element error" is subscript error
+2202E    E    ERRCODE_ARRAY_SUBSCRIPT_ERROR                                  array_subscript_error
+22021    E    ERRCODE_CHARACTER_NOT_IN_REPERTOIRE                            character_not_in_repertoire
+22008    E    ERRCODE_DATETIME_FIELD_OVERFLOW                                datetime_field_overflow
+22008    E    ERRCODE_DATETIME_VALUE_OUT_OF_RANGE
+22012    E    ERRCODE_DIVISION_BY_ZERO                                       division_by_zero
+22005    E    ERRCODE_ERROR_IN_ASSIGNMENT                                    error_in_assignment
+2200B    E    ERRCODE_ESCAPE_CHARACTER_CONFLICT                              escape_character_conflict
+22022    E    ERRCODE_INDICATOR_OVERFLOW                                     indicator_overflow
+22015    E    ERRCODE_INTERVAL_FIELD_OVERFLOW                                interval_field_overflow
+2201E    E    ERRCODE_INVALID_ARGUMENT_FOR_LOG                               invalid_argument_for_logarithm
+22014    E    ERRCODE_INVALID_ARGUMENT_FOR_NTILE                             invalid_argument_for_ntile_function
+22016    E    ERRCODE_INVALID_ARGUMENT_FOR_NTH_VALUE                         invalid_argument_for_nth_value_function
+2201F    E    ERRCODE_INVALID_ARGUMENT_FOR_POWER_FUNCTION                    invalid_argument_for_power_function
+2201G    E    ERRCODE_INVALID_ARGUMENT_FOR_WIDTH_BUCKET_FUNCTION             invalid_argument_for_width_bucket_function
+22018    E    ERRCODE_INVALID_CHARACTER_VALUE_FOR_CAST                       invalid_character_value_for_cast
+22007    E    ERRCODE_INVALID_DATETIME_FORMAT                                invalid_datetime_format
+22019    E    ERRCODE_INVALID_ESCAPE_CHARACTER                               invalid_escape_character
+2200D    E    ERRCODE_INVALID_ESCAPE_OCTET                                   invalid_escape_octet
+22025    E    ERRCODE_INVALID_ESCAPE_SEQUENCE                                invalid_escape_sequence
+22P06    E    ERRCODE_NONSTANDARD_USE_OF_ESCAPE_CHARACTER                    nonstandard_use_of_escape_character
+22010    E    ERRCODE_INVALID_INDICATOR_PARAMETER_VALUE                      invalid_indicator_parameter_value
+22023    E    ERRCODE_INVALID_PARAMETER_VALUE                                invalid_parameter_value
+22013    E    ERRCODE_INVALID_PRECEDING_OR_FOLLOWING_SIZE                    invalid_preceding_or_following_size
+2201B    E    ERRCODE_INVALID_REGULAR_EXPRESSION                             invalid_regular_expression
+2201W    E    ERRCODE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE                      invalid_row_count_in_limit_clause
+2201X    E    ERRCODE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE              invalid_row_count_in_result_offset_clause
+2202H    E    ERRCODE_INVALID_TABLESAMPLE_ARGUMENT                           invalid_tablesample_argument
+2202G    E    ERRCODE_INVALID_TABLESAMPLE_REPEAT                             invalid_tablesample_repeat
+22009    E    ERRCODE_INVALID_TIME_ZONE_DISPLACEMENT_VALUE                   invalid_time_zone_displacement_value
+2200C    E    ERRCODE_INVALID_USE_OF_ESCAPE_CHARACTER                        invalid_use_of_escape_character
+2200G    E    ERRCODE_MOST_SPECIFIC_TYPE_MISMATCH                            most_specific_type_mismatch
+22004    E    ERRCODE_NULL_VALUE_NOT_ALLOWED                                 null_value_not_allowed
+22002    E    ERRCODE_NULL_VALUE_NO_INDICATOR_PARAMETER                      null_value_no_indicator_parameter
+22003    E    ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE                             numeric_value_out_of_range
+2200H    E    ERRCODE_SEQUENCE_GENERATOR_LIMIT_EXCEEDED                      sequence_generator_limit_exceeded
+22026    E    ERRCODE_STRING_DATA_LENGTH_MISMATCH                            string_data_length_mismatch
+22001    E    ERRCODE_STRING_DATA_RIGHT_TRUNCATION                           string_data_right_truncation
+22011    E    ERRCODE_SUBSTRING_ERROR                                        substring_error
+22027    E    ERRCODE_TRIM_ERROR                                             trim_error
+22024    E    ERRCODE_UNTERMINATED_C_STRING                                  unterminated_c_string
+2200F    E    ERRCODE_ZERO_LENGTH_CHARACTER_STRING                           zero_length_character_string
+22P01    E    ERRCODE_FLOATING_POINT_EXCEPTION                               floating_point_exception
+22P02    E    ERRCODE_INVALID_TEXT_REPRESENTATION                            invalid_text_representation
+22P03    E    ERRCODE_INVALID_BINARY_REPRESENTATION                          invalid_binary_representation
+22P04    E    ERRCODE_BAD_COPY_FILE_FORMAT                                   bad_copy_file_format
+22P05    E    ERRCODE_UNTRANSLATABLE_CHARACTER                               untranslatable_character
+2200L    E    ERRCODE_NOT_AN_XML_DOCUMENT                                    not_an_xml_document
+2200M    E    ERRCODE_INVALID_XML_DOCUMENT                                   invalid_xml_document
+2200N    E    ERRCODE_INVALID_XML_CONTENT                                    invalid_xml_content
+2200S    E    ERRCODE_INVALID_XML_COMMENT                                    invalid_xml_comment
+2200T    E    ERRCODE_INVALID_XML_PROCESSING_INSTRUCTION                     invalid_xml_processing_instruction
+22030    E    ERRCODE_DUPLICATE_JSON_OBJECT_KEY_VALUE                        duplicate_json_object_key_value
+22031    E    ERRCODE_INVALID_ARGUMENT_FOR_SQL_JSON_DATETIME_FUNCTION        invalid_argument_for_sql_json_datetime_function
+22032    E    ERRCODE_INVALID_JSON_TEXT                                      invalid_json_text
+22033    E    ERRCODE_INVALID_SQL_JSON_SUBSCRIPT                             invalid_sql_json_subscript
+22034    E    ERRCODE_MORE_THAN_ONE_SQL_JSON_ITEM                            more_than_one_sql_json_item
+22035    E    ERRCODE_NO_SQL_JSON_ITEM                                       no_sql_json_item
+22036    E    ERRCODE_NON_NUMERIC_SQL_JSON_ITEM                              non_numeric_sql_json_item
+22037    E    ERRCODE_NON_UNIQUE_KEYS_IN_A_JSON_OBJECT                       non_unique_keys_in_a_json_object
+22038    E    ERRCODE_SINGLETON_SQL_JSON_ITEM_REQUIRED                       singleton_sql_json_item_required
+22039    E    ERRCODE_SQL_JSON_ARRAY_NOT_FOUND                               sql_json_array_not_found
+2203A    E    ERRCODE_SQL_JSON_MEMBER_NOT_FOUND                              sql_json_member_not_found
+2203B    E    ERRCODE_SQL_JSON_NUMBER_NOT_FOUND                              sql_json_number_not_found
+2203C    E    ERRCODE_SQL_JSON_OBJECT_NOT_FOUND                              sql_json_object_not_found
+2203D    E    ERRCODE_TOO_MANY_JSON_ARRAY_ELEMENTS                           too_many_json_array_elements
+2203E    E    ERRCODE_TOO_MANY_JSON_OBJECT_MEMBERS                           too_many_json_object_members
+2203F    E    ERRCODE_SQL_JSON_SCALAR_REQUIRED                               sql_json_scalar_required
+2203G    E    ERRCODE_SQL_JSON_ITEM_CANNOT_BE_CAST_TO_TARGET_TYPE            sql_json_item_cannot_be_cast_to_target_type
+
+Section: Class 23 - Integrity Constraint Violation
+
+23000    E    ERRCODE_INTEGRITY_CONSTRAINT_VIOLATION                         integrity_constraint_violation
+23001    E    ERRCODE_RESTRICT_VIOLATION                                     restrict_violation
+23502    E    ERRCODE_NOT_NULL_VIOLATION                                     not_null_violation
+23503    E    ERRCODE_FOREIGN_KEY_VIOLATION                                  foreign_key_violation
+23505    E    ERRCODE_UNIQUE_VIOLATION                                       unique_violation
+23514    E    ERRCODE_CHECK_VIOLATION                                        check_violation
+23P01    E    ERRCODE_EXCLUSION_VIOLATION                                    exclusion_violation
+
+Section: Class 24 - Invalid Cursor State
+
+24000    E    ERRCODE_INVALID_CURSOR_STATE                                   invalid_cursor_state
+
+Section: Class 25 - Invalid Transaction State
+
+25000    E    ERRCODE_INVALID_TRANSACTION_STATE                              invalid_transaction_state
+25001    E    ERRCODE_ACTIVE_SQL_TRANSACTION                                 active_sql_transaction
+25002    E    ERRCODE_BRANCH_TRANSACTION_ALREADY_ACTIVE                      branch_transaction_already_active
+25008    E    ERRCODE_HELD_CURSOR_REQUIRES_SAME_ISOLATION_LEVEL              held_cursor_requires_same_isolation_level
+25003    E    ERRCODE_INAPPROPRIATE_ACCESS_MODE_FOR_BRANCH_TRANSACTION       inappropriate_access_mode_for_branch_transaction
+25004    E    ERRCODE_INAPPROPRIATE_ISOLATION_LEVEL_FOR_BRANCH_TRANSACTION   inappropriate_isolation_level_for_branch_transaction
+25005    E    ERRCODE_NO_ACTIVE_SQL_TRANSACTION_FOR_BRANCH_TRANSACTION       no_active_sql_transaction_for_branch_transaction
+25006    E    ERRCODE_READ_ONLY_SQL_TRANSACTION                              read_only_sql_transaction
+25007    E    ERRCODE_SCHEMA_AND_DATA_STATEMENT_MIXING_NOT_SUPPORTED         schema_and_data_statement_mixing_not_supported
+25P01    E    ERRCODE_NO_ACTIVE_SQL_TRANSACTION                              no_active_sql_transaction
+25P02    E    ERRCODE_IN_FAILED_SQL_TRANSACTION                              in_failed_sql_transaction
+25P03    E    ERRCODE_IDLE_IN_TRANSACTION_SESSION_TIMEOUT                    idle_in_transaction_session_timeout
+
+Section: Class 26 - Invalid SQL Statement Name
+
+# (we take this to mean prepared statements
+26000    E    ERRCODE_INVALID_SQL_STATEMENT_NAME                             invalid_sql_statement_name
+
+Section: Class 27 - Triggered Data Change Violation
+
+27000    E    ERRCODE_TRIGGERED_DATA_CHANGE_VIOLATION                        triggered_data_change_violation
+
+Section: Class 28 - Invalid Authorization Specification
+
+28000    E    ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION                    invalid_authorization_specification
+28P01    E    ERRCODE_INVALID_PASSWORD                                       invalid_password
+
+Section: Class 2B - Dependent Privilege Descriptors Still Exist
+
+2B000    E    ERRCODE_DEPENDENT_PRIVILEGE_DESCRIPTORS_STILL_EXIST            dependent_privilege_descriptors_still_exist
+2BP01    E    ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST                          dependent_objects_still_exist
+
+Section: Class 2D - Invalid Transaction Termination
+
+2D000    E    ERRCODE_INVALID_TRANSACTION_TERMINATION                        invalid_transaction_termination
+
+Section: Class 2F - SQL Routine Exception
+
+2F000    E    ERRCODE_SQL_ROUTINE_EXCEPTION                                  sql_routine_exception
+2F005    E    ERRCODE_S_R_E_FUNCTION_EXECUTED_NO_RETURN_STATEMENT            function_executed_no_return_statement
+2F002    E    ERRCODE_S_R_E_MODIFYING_SQL_DATA_NOT_PERMITTED                 modifying_sql_data_not_permitted
+2F003    E    ERRCODE_S_R_E_PROHIBITED_SQL_STATEMENT_ATTEMPTED               prohibited_sql_statement_attempted
+2F004    E    ERRCODE_S_R_E_READING_SQL_DATA_NOT_PERMITTED                   reading_sql_data_not_permitted
+
+Section: Class 34 - Invalid Cursor Name
+
+34000    E    ERRCODE_INVALID_CURSOR_NAME                                    invalid_cursor_name
+
+Section: Class 38 - External Routine Exception
+
+38000    E    ERRCODE_EXTERNAL_ROUTINE_EXCEPTION                             external_routine_exception
+38001    E    ERRCODE_E_R_E_CONTAINING_SQL_NOT_PERMITTED                     containing_sql_not_permitted
+38002    E    ERRCODE_E_R_E_MODIFYING_SQL_DATA_NOT_PERMITTED                 modifying_sql_data_not_permitted
+38003    E    ERRCODE_E_R_E_PROHIBITED_SQL_STATEMENT_ATTEMPTED               prohibited_sql_statement_attempted
+38004    E    ERRCODE_E_R_E_READING_SQL_DATA_NOT_PERMITTED                   reading_sql_data_not_permitted
+
+Section: Class 39 - External Routine Invocation Exception
+
+39000    E    ERRCODE_EXTERNAL_ROUTINE_INVOCATION_EXCEPTION                  external_routine_invocation_exception
+39001    E    ERRCODE_E_R_I_E_INVALID_SQLSTATE_RETURNED                      invalid_sqlstate_returned
+39004    E    ERRCODE_E_R_I_E_NULL_VALUE_NOT_ALLOWED                         null_value_not_allowed
+39P01    E    ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED                      trigger_protocol_violated
+39P02    E    ERRCODE_E_R_I_E_SRF_PROTOCOL_VIOLATED                          srf_protocol_violated
+39P03    E    ERRCODE_E_R_I_E_EVENT_TRIGGER_PROTOCOL_VIOLATED                event_trigger_protocol_violated
+
+Section: Class 3B - Savepoint Exception
+
+3B000    E    ERRCODE_SAVEPOINT_EXCEPTION                                    savepoint_exception
+3B001    E    ERRCODE_S_E_INVALID_SPECIFICATION                              invalid_savepoint_specification
+
+Section: Class 3D - Invalid Catalog Name
+
+3D000    E    ERRCODE_INVALID_CATALOG_NAME                                   invalid_catalog_name
+
+Section: Class 3F - Invalid Schema Name
+
+3F000    E    ERRCODE_INVALID_SCHEMA_NAME                                    invalid_schema_name
+
+Section: Class 40 - Transaction Rollback
+
+40000    E    ERRCODE_TRANSACTION_ROLLBACK                                   transaction_rollback
+40002    E    ERRCODE_T_R_INTEGRITY_CONSTRAINT_VIOLATION                     transaction_integrity_constraint_violation
+40001    E    ERRCODE_T_R_SERIALIZATION_FAILURE                              serialization_failure
+40003    E    ERRCODE_T_R_STATEMENT_COMPLETION_UNKNOWN                       statement_completion_unknown
+40P01    E    ERRCODE_T_R_DEADLOCK_DETECTED                                  deadlock_detected
+
+Section: Class 40 - Transaction Rollback (pgrac extension)
+
+40R01    E    ERRCODE_CLUSTER_RECONFIG_ABORT                                 cluster_reconfig_abort
+40R02    E    ERRCODE_CLUSTER_ISOLATION_FAILED                               cluster_isolation_failed
+40R03    E    ERRCODE_CLUSTER_CACHE_FUSION_RETRY                             cluster_cache_fusion_retry
+40R04    E    ERRCODE_CLUSTER_PI_INVALIDATED_RETRY                           cluster_pi_invalidated_retry
+
+Section: Class 42 - Syntax Error or Access Rule Violation
+
+42000    E    ERRCODE_SYNTAX_ERROR_OR_ACCESS_RULE_VIOLATION                  syntax_error_or_access_rule_violation
+# never use the above; use one of these two if no specific code exists:
+42601    E    ERRCODE_SYNTAX_ERROR                                           syntax_error
+42501    E    ERRCODE_INSUFFICIENT_PRIVILEGE                                 insufficient_privilege
+42846    E    ERRCODE_CANNOT_COERCE                                          cannot_coerce
+42803    E    ERRCODE_GROUPING_ERROR                                         grouping_error
+42P20    E    ERRCODE_WINDOWING_ERROR                                        windowing_error
+42P19    E    ERRCODE_INVALID_RECURSION                                      invalid_recursion
+42830    E    ERRCODE_INVALID_FOREIGN_KEY                                    invalid_foreign_key
+42602    E    ERRCODE_INVALID_NAME                                           invalid_name
+42622    E    ERRCODE_NAME_TOO_LONG                                          name_too_long
+42939    E    ERRCODE_RESERVED_NAME                                          reserved_name
+42804    E    ERRCODE_DATATYPE_MISMATCH                                      datatype_mismatch
+42P18    E    ERRCODE_INDETERMINATE_DATATYPE                                 indeterminate_datatype
+42P21    E    ERRCODE_COLLATION_MISMATCH                                     collation_mismatch
+42P22    E    ERRCODE_INDETERMINATE_COLLATION                                indeterminate_collation
+42809    E    ERRCODE_WRONG_OBJECT_TYPE                                      wrong_object_type
+428C9    E    ERRCODE_GENERATED_ALWAYS                                       generated_always
+
+# Note: for ERRCODE purposes, we divide namable objects into these categories:
+# databases, schemas, prepared statements, cursors, tables, columns,
+# functions (including operators), and all else (lumped as "objects").
+# (The first four categories are mandated by the existence of separate
+# SQLSTATE classes for them in the spec; in this file, however, we group
+# the ERRCODE names with all the rest under class 42.)  Parameters are
+# sort-of-named objects and get their own ERRCODE.
+#
+# The same breakdown is used for "duplicate" and "ambiguous" complaints,
+# as well as complaints associated with incorrect declarations.
+
+42703    E    ERRCODE_UNDEFINED_COLUMN                                       undefined_column
+34000    E    ERRCODE_UNDEFINED_CURSOR
+3D000    E    ERRCODE_UNDEFINED_DATABASE
+42883    E    ERRCODE_UNDEFINED_FUNCTION                                     undefined_function
+26000    E    ERRCODE_UNDEFINED_PSTATEMENT
+3F000    E    ERRCODE_UNDEFINED_SCHEMA
+42P01    E    ERRCODE_UNDEFINED_TABLE                                        undefined_table
+42P02    E    ERRCODE_UNDEFINED_PARAMETER                                    undefined_parameter
+42704    E    ERRCODE_UNDEFINED_OBJECT                                       undefined_object
+42701    E    ERRCODE_DUPLICATE_COLUMN                                       duplicate_column
+42P03    E    ERRCODE_DUPLICATE_CURSOR                                       duplicate_cursor
+42P04    E    ERRCODE_DUPLICATE_DATABASE                                     duplicate_database
+42723    E    ERRCODE_DUPLICATE_FUNCTION                                     duplicate_function
+42P05    E    ERRCODE_DUPLICATE_PSTATEMENT                                   duplicate_prepared_statement
+42P06    E    ERRCODE_DUPLICATE_SCHEMA                                       duplicate_schema
+42P07    E    ERRCODE_DUPLICATE_TABLE                                        duplicate_table
+42712    E    ERRCODE_DUPLICATE_ALIAS                                        duplicate_alias
+42710    E    ERRCODE_DUPLICATE_OBJECT                                       duplicate_object
+42702    E    ERRCODE_AMBIGUOUS_COLUMN                                       ambiguous_column
+42725    E    ERRCODE_AMBIGUOUS_FUNCTION                                     ambiguous_function
+42P08    E    ERRCODE_AMBIGUOUS_PARAMETER                                    ambiguous_parameter
+42P09    E    ERRCODE_AMBIGUOUS_ALIAS                                        ambiguous_alias
+42P10    E    ERRCODE_INVALID_COLUMN_REFERENCE                               invalid_column_reference
+42611    E    ERRCODE_INVALID_COLUMN_DEFINITION                              invalid_column_definition
+42P11    E    ERRCODE_INVALID_CURSOR_DEFINITION                              invalid_cursor_definition
+42P12    E    ERRCODE_INVALID_DATABASE_DEFINITION                            invalid_database_definition
+42P13    E    ERRCODE_INVALID_FUNCTION_DEFINITION                            invalid_function_definition
+42P14    E    ERRCODE_INVALID_PSTATEMENT_DEFINITION                          invalid_prepared_statement_definition
+42P15    E    ERRCODE_INVALID_SCHEMA_DEFINITION                              invalid_schema_definition
+42P16    E    ERRCODE_INVALID_TABLE_DEFINITION                               invalid_table_definition
+42P17    E    ERRCODE_INVALID_OBJECT_DEFINITION                              invalid_object_definition
+
+Section: Class 44 - WITH CHECK OPTION Violation
+
+44000    E    ERRCODE_WITH_CHECK_OPTION_VIOLATION                            with_check_option_violation
+
+Section: Class 53 - Insufficient Resources
+
+# (PostgreSQL-specific error class)
+53000    E    ERRCODE_INSUFFICIENT_RESOURCES                                 insufficient_resources
+53100    E    ERRCODE_DISK_FULL                                              disk_full
+53200    E    ERRCODE_OUT_OF_MEMORY                                          out_of_memory
+53300    E    ERRCODE_TOO_MANY_CONNECTIONS                                   too_many_connections
+53400    E    ERRCODE_CONFIGURATION_LIMIT_EXCEEDED                           configuration_limit_exceeded
+
+Section: Class 53 - Insufficient Resources (pgrac extension)
+
+53R01    E    ERRCODE_CLUSTER_LMS_QUEUE_FULL                                 cluster_lms_queue_full
+53R02    E    ERRCODE_CLUSTER_GRD_FULL                                       cluster_grd_full
+53R03    E    ERRCODE_CLUSTER_UNDO_EXHAUSTED                                 cluster_undo_exhausted
+53R04    E    ERRCODE_CLUSTER_PI_CHAIN_FULL                                  cluster_pi_chain_full
+53R05    E    ERRCODE_CLUSTER_CR_CHAIN_FULL                                  cluster_cr_chain_full
+53R06    E    ERRCODE_CLUSTER_RECOVERY_WORKERS_EXHAUSTED                     cluster_recovery_workers_exhausted
+53R07    E    ERRCODE_CLUSTER_RECONFIG_QUORUM_LOST                           cluster_reconfig_quorum_lost
+53R08    E    ERRCODE_CLUSTER_PHASE_TRANSITION_TIMEOUT                       cluster_phase_transition_timeout
+53R09    E    ERRCODE_CLUSTER_PHASE_PRECONDITION_FAILED                      cluster_phase_precondition_failed
+53R0A    E    ERRCODE_CLUSTER_LMON_SPAWN_FAILED                              cluster_lmon_spawn_failed
+53R0B    E    ERRCODE_CLUSTER_LMON_NOT_READY                                 cluster_lmon_not_ready
+53R0C    E    ERRCODE_CLUSTER_LCK_SPAWN_FAILED                               cluster_lck_spawn_failed
+53R0D    E    ERRCODE_CLUSTER_LCK_NOT_READY                                  cluster_lck_not_ready
+53R0E    E    ERRCODE_CLUSTER_DIAG_SPAWN_FAILED                              cluster_diag_spawn_failed
+53R0F    E    ERRCODE_CLUSTER_DIAG_NOT_READY                                 cluster_diag_not_ready
+53R10    E    ERRCODE_CLUSTER_STATS_SPAWN_FAILED                             cluster_stats_spawn_failed
+53R11    E    ERRCODE_CLUSTER_STATS_NOT_READY                                cluster_stats_not_ready
+53R12    E    ERRCODE_CLUSTER_SCN_WRAPAROUND_PANIC                           cluster_scn_wraparound_panic
+53R20    E    ERRCODE_CLUSTER_IC_STALE_EPOCH_DROP                            cluster_ic_stale_epoch_drop
+53R21    E    ERRCODE_CLUSTER_IC_CHUNK_REASSEMBLY_TIMEOUT                    cluster_ic_chunk_reassembly_timeout
+53R30    E    ERRCODE_CLUSTER_CSSD_SPAWN_FAILED                              cluster_cssd_spawn_failed
+53R31    E    ERRCODE_CLUSTER_CSSD_NOT_READY                                 cluster_cssd_not_ready
+53R32    E    ERRCODE_CLUSTER_CSSD_PEER_SUSPECTED                            cluster_cssd_peer_suspected
+53R33    E    ERRCODE_CLUSTER_CSSD_PEER_DEAD                                 cluster_cssd_peer_dead
+
+# spec-2.6 Sprint A Step 3 D13 hoisted forward — voting disk quorum
+# 4 NEW SQLSTATE under 53R namespace (53R40-43).  53 = INSUFFICIENT
+# RESOURCES PG-defined class;R = pgrac extension subclass;40-49 =
+# quorum / fail-closed (NEW). 53R40 NOT alias to 40001 SerializationFailure
+# per Q5 v0.2 — client retry pattern is fundamentally different.
+53R40    E    ERRCODE_CLUSTER_QUORUM_LOST                                    cluster_quorum_lost
+53R41    E    ERRCODE_CLUSTER_QUORUM_UNCERTAIN                               cluster_quorum_uncertain
+53R42    E    ERRCODE_CLUSTER_VOTING_DISK_IO_FAILURE                         cluster_voting_disk_io_failure
+53R43    E    ERRCODE_CLUSTER_NODE_ID_COLLISION                              cluster_node_id_collision
+53R44    E    ERRCODE_CLUSTER_QVOTEC_SPAWN_FAILED                            cluster_qvotec_spawn_failed
+53R45    E    ERRCODE_CLUSTER_QVOTEC_NOT_READY                               cluster_qvotec_not_ready
+
+# spec-2.28 Sprint A Step 2 D4 (D8 partial) — fence-lite in-flight tx
+# abort path.  53R50 ≠ 53R40 by design (Q4 user approve):  53R40 is
+# CommitTransaction commit-gate path (spec-2.6 v0.14.1+); 53R50 is
+# ProcessInterrupts in-flight ProcSignal abort path (spec-2.28 §3.7
+# C4 read-clear-then-decide).  Distinct error codes let log analysis +
+# client retry logic distinguish "tx start blocked at commit" vs "tx
+# aborted mid-flight by fence broadcast".  53R51-59 reserved for
+# future fence / backend fail-closed variants.
+53R50    E    ERRCODE_CLUSTER_QUORUM_LOST_BACKEND                            cluster_quorum_lost_backend
+
+# spec-4.12 D5 — cooperative write-fence hot-path reject.  A shared-storage
+# write (cluster_smgr create/unlink/extend/zeroextend/write/truncate) was
+# refused because this node failed the write-fence token: stale epoch /
+# expired lease / self-fenced.  Non-critical-section callers get this
+# catchable ERROR (recovery PG_TRY harness downgrades it to BLOCKED);
+# critical-section callers PANIC instead (cannot ERROR).
+53R51    E    ERRCODE_CLUSTER_WRITE_FENCED                                   cluster_write_fenced
+
+# spec-2.29 D8 — retry-safe backend abort for in-flight membership
+# reconfig / epoch transition.  53R60 is intentionally separate from
+# 53R40 commit-boundary quorum loss and 53R50 fence/quorum-loss backend
+# abort so clients can pick distinct retry policy.
+53R60    E    ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS                           cluster_reconfig_in_progress
+
+# spec-2.16 D14:  GES cross-node grant timeout / pending HTAB full
+# 53R70 fires when backend wait exceeds cluster.ges_request_timeout_ms
+# (v0.5 P1.5 effective_timeout helper).  53R71 fires when pending HTAB
+# capacity is reached (spec-2.16 v0.4 P1.7 caller-side).
+53R70    E    ERRCODE_CLUSTER_GES_TIMEOUT                                    cluster_ges_timeout
+53R71    E    ERRCODE_CLUSTER_GES_PENDING_FULL                               cluster_ges_pending_full
+
+# spec-2.17 D29:  cross-node deadlock + pending CANCEL semantics
+# 53R72 fires when cross-node deadlock detector selects this backend as
+# victim (P2.2 deterministic age-based tuple).  53R73 fires when backend
+#退出 WaitOnLock 时 reservation 已 insert 但 holder 未 promote(P1.4 v0.6 —
+# pending vs granted CANCEL 路径独立)。
+53R72    E    ERRCODE_CLUSTER_GES_DEADLOCK                                   cluster_ges_deadlock
+53R73    E    ERRCODE_CLUSTER_GES_CANCEL_PENDING                             cluster_ges_cancel_pending
+
+# spec-5.3 D4:  illegal GES lock conversion.  53R74 fires when the
+# opcode-2 CONVERT state machine (TM table-lock S->X upgrade, the first
+# live convert consumer) is asked for a non-partial-order conversion
+# (LATERAL / incomparable modes) or against a (node,procno,current_mode)
+# holder the master has no record of.  The master replies REJECT with
+# GES_REJECT_REASON_ILLEGAL_CONVERT and the requester maps it here.
+53R74    E    ERRCODE_CLUSTER_GES_ILLEGAL_LOCK_CONVERSION                    cluster_ges_illegal_lock_conversion
+
+# spec-2.20 D12 (v0.3 frozen):  LMS unavailable fail-closed (mirror 53R81).
+# Raised by spec-2.20 7-step caller-side gate when cluster.lms_enabled=on
+# but cluster_lms_is_ready() returns false (LMS state != READY).
+# Caller naturally retries / rolls back (PG canonical retry pattern).
+53R80    E    ERRCODE_CLUSTER_LMS_UNAVAILABLE                                cluster_lms_unavailable
+
+# spec-2.19 D12:  LMD unavailable fail-closed (HC1 / v0.2 P1.3)
+# 53R81 fires when backend caller-side deadlock detection path needs LMD
+# ownership (cluster.lmd_enabled = on) but cluster_lmd_is_ready() returns
+# false — i.e. LMD state is NOT_STARTED / STARTING / DRAINING / STOPPED /
+# CRASHED.  enabled=off → caller-side legacy path (PGC_POSTMASTER restart
+# only).  Backend recovers via natural retry / rollback (类 spec-2.16 53R70
+# cluster_ges_timeout pattern;L116 / L120 family).
+53R81    E    ERRCODE_CLUSTER_LMD_UNAVAILABLE                                cluster_lmd_unavailable
+
+# spec-2.22 D11 (HC12 fail-closed):  LMD wait-for graph edge table full.
+# Caller submitting wait edge sees false return from
+# cluster_lmd_submit_wait_edge_real() — wait edges invisible to PG-native
+# deadlock detector,so falling back to PG local deadlock_timeout would be
+# blind wait (severely disallowed,esp. once cluster.ges_request_timeout_ms
+# = -1 spec-2.26 ships).  Caller走 S7 cleanup + ereport(53R82).
+53R82    E    ERRCODE_CLUSTER_LMD_WAIT_EDGE_FULL                             cluster_lmd_wait_edge_full
+
+# spec-2.25 D10 (HC32 fail-closed):  per-node native-lock probe retry budget
+# exhausted before all peer nodes responded CLEAR.  LMS aggregates probe replies
+# (3-state CLEAR/HOLDER_CONFLICT/WAITER_CONFLICT) over N-1 peers;  any non-CLEAR
+# or timeout defers grant and retries every cluster.lms_native_lock_probe_retry_interval_ms.
+# Cumulative retry_count >= cluster.lms_native_lock_probe_retry_budget (default
+# 60 ≈ 30s) → caller ereport(53R83);  client retries the failing DDL or aborts.
+53R83    E    ERRCODE_CLUSTER_NATIVE_LOCK_PROBE_TIMEOUT                       cluster_native_lock_probe_timeout
+
+# spec-2.34 D9 (HC98):  GCS block reliability hardening retransmit budget
+# exhaustion.  Sender exhausts cluster.gcs_block_retransmit_max_retries
+# (default 4 retries, 100/200/400/800 ms exponential backoff) without a
+# valid reply → caller ereport(53R90).  Distinct from ERRCODE_QUERY_CANCELED
+# so ops can distinguish GCS reliability failure from backend cancellation.
+53R90    E    ERRCODE_CLUSTER_GCS_BLOCK_RETRANSMIT_EXHAUSTED                  cluster_gcs_block_retransmit_exhausted
+
+# spec-2.36 D8 (HC116):  GCS block 3-way invalidate broadcast ack collection
+# timeout.  Master could not collect INVALIDATE_ACK msg_type 18 from all S/X
+# holders enumerated from s_holders_bitmap within retransmit budget;  master
+# replies DENIED_INVALIDATE_TIMEOUT to original X requester;  sender backend
+# maps reply status 11 to ereport(53R91).
+53R91    E    ERRCODE_CLUSTER_GCS_BLOCK_INVALIDATE_TIMEOUT                    cluster_gcs_block_invalidate_timeout
+
+# spec-2.36 D8 (HC117):  reader starvation guard retry budget exhaustion.
+# Reader backend sees DENIED_PENDING_X (HC117 S barrier) and exponential-
+# backoffs per cluster.gcs_block_starvation_max_retries (default 8 retries,
+# 100 × 2^attempt ms);  budget exhausted → ereport(53R92) so reader's
+# upper-layer transaction can retry or abort.
+53R92    E    ERRCODE_CLUSTER_GCS_BLOCK_STARVATION_EXHAUSTED                  cluster_gcs_block_starvation_exhausted
+
+# spec-2.37 D11 (HC129/HC131):  PI watermark + lost-write detection.
+# Master direct ship 自校 OR holder forward validate 发现 shipped block.
+# page_lsn < GrdEntry.pi_watermark_lsn (master) 或 GcsBlockForwardPayload.
+# expected_pi_watermark_lsn (holder),reply.status = DENIED_LOST_WRITE = 12.
+# Sender HC131 仅映射:无论 master 自校 OR holder 校 失败,sender 收到该
+# status → ereport(53R93) terminal denial.  Lost-write 是 data integrity
+# issue,不 retry 掩盖;business 必须重新读 or 上层 retry whole statement.
+53R93    E    ERRCODE_CLUSTER_LOST_WRITE_DETECTED                             cluster_lost_write_detected
+
+# spec-2.38 D8 (HC134):  SI Broadcaster outbound queue full fail-closed.
+# Caller of cluster_sinval_enqueue_batch() receives false return (queue at
+# capacity);  spec-2.39 production DDL hook path will ereport(53R94) to
+# abort the DDL transaction.  Inbound queue full takes a different fail-
+# safe path (SIResetAll on SI Broadcaster aux process), not 53R94.
+53R94    E    ERRCODE_CLUSTER_SINVAL_QUEUE_FULL                                cluster_sinval_queue_full
+
+# PGRAC spec-2.39 D11:  ERRCODE_CLUSTER_SINVAL_ACK_TIMEOUT — DDL commit hook
+# called cluster_sinval_enqueue_and_wait_ack and one or more declared+CSSD-
+# ALIVE peers未 ACK within cluster.sinval_ack_timeout_ms (default 5s).  WARN
+# path only (DDL already committed locally + WAL flushed, no rollback).
+# Sender bumps ack_timeout_count;DBA monitors via pg_stat_cluster_counters.
+53R95    E    ERRCODE_CLUSTER_SINVAL_ACK_TIMEOUT                               cluster_sinval_ack_timeout
+
+# spec-3.1 D6 evict fail defensive (placeholder; not currently reachable).
+53R96    E    ERRCODE_CLUSTER_TT_OVERLAY_FULL                                  cluster_tt_overlay_full
+
+# spec-3.2 D5 — HeapTupleSatisfiesMVCC cluster path lookup miss.  Caller
+# decides retry / abort.  L177 fail-fast no wait policy enforces this is
+# raised synchronously without waiting on wire propagation.
+53R97    E    ERRCODE_CLUSTER_TT_STATUS_UNKNOWN                                cluster_tt_status_unknown
+
+# spec-3.4d Q1 (v0.2 F1+F3 P0):  heap_lock_tuple / HeapTupleSatisfiesUpdate
+# detects remote ACTIVE row lock (via raw_xmax ITL scan + exact-key TT
+# lookup) and caller's wait_policy == LockWaitBlock.  Cross-node block-wait
+# is not supported in spec-3.4d; errhint forward-links to spec-5.2 GES TX.
+# LockWaitSkip -> TM_WouldBlock (no ERROR);  LockWaitError -> existing
+# ERRCODE_LOCK_NOT_AVAILABLE.  L199 NEW lesson — remote ACTIVE must fail
+# closed, never silent PG-native fallback.
+53R98    E    ERRCODE_CLUSTER_REMOTE_ROW_LOCK_WAIT_NOT_SUPPORTED               cluster_remote_row_lock_wait_not_supported
+53R9H    E    ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT                        cluster_cross_node_write_conflict
+
+# spec-3.4d Q5 (v0.2 F4 P1):  heap_lock_tuple peer mode + final xmax (after
+# compute_new_xmax_infomask) is a MultiXact.  MULTIXACT cross-node row lock
+# support is deferred to spec-3.5+.  cluster_multixact_lock_reject_count
+# counter is incremented.
+53R99    E    ERRCODE_CLUSTER_MULTIXACT_LOCK_NOT_SUPPORTED                     cluster_multixact_lock_not_supported
+
+# spec-3.4d Q5 (v0.2 F7 P1):  heap_lock_tuple peer mode cannot allocate ITL
+# slot (8 slot shared with data ITL is full).  Distinct from 53R94
+# cluster_sinval_queue_full (sinval semantics).  cluster_itl_overflow_lock_count
+# counter is incremented.  Raise INITRANS or wait for spec-3.5+ split capacity.
+53R9A    E    ERRCODE_CLUSTER_ITL_SLOT_OVERFLOW                                cluster_itl_slot_overflow
+
+# spec-3.5 HW1 P0 fail-closed guard:  PREPARE TRANSACTION 不允许 carry
+# active cluster SUBTRANS state.  本 spec 不实现 COMMIT PREPARED final
+# emit;  允许 prepare 后会留 cross-node `SUBCOMMITTED → parent unknown`
+# correctness bug.  errhint forward-link 独立 2PC spec.
+53R9B    E    ERRCODE_PREPARE_TRANSACTION_WITH_CLUSTER_SUBTRANS_STATE          prepare_transaction_with_cluster_subtrans_state
+
+# spec-3.6 v0.3:  reader sees remote MultiXact xmax but cluster overlay
+# lookup miss / overflow / authoritative UNKNOWN.  Per L199 cross-node
+# fall-through → fail-closed (NOT PG-native SLRU fallback).  errhint
+# directs caller retry after origin re-emit;  on-demand re-emit 推
+# spec-3.6b/3.7.  IN_PROGRESS authoritative state NOT in this class
+# (per OBS-1 truth table:  走 VISIBLE 路径).
+53R9C    E    ERRCODE_CLUSTER_MULTIXACT_MEMBER_OVERLAY_MISS                    cluster_multixact_member_overlay_miss
+
+# spec-3.7 v0.3 D10:  cluster undo record allocator failure (multi-branch
+# triggers per §3.2 + Q9):  segment exhaustion / oversize payload / UBA
+# decode fail / segment_id out of range / block_num exceeds segment_size_blocks
+# / undo block slot-dir index 越界 / undo block durable flush failure.  DML
+# 4 op emit must ereport BEFORE START_CRIT_SECTION (per §3.3 I1 + I3 invariants).
+53R9D    E    ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA                          cluster_undo_record_invalid_uba
+
+# spec-3.8 v0.3 D10:  autoextend hard cap reached (区别 53R9D record-level
+# fail).  Trigger:  cluster_undo_segment_extend_or_create() detects pool
+# size >= cluster.undo_segments_max_per_instance (default 256 = encoding
+# limit).  errhint:  "Increase cluster.undo_segments_max_per_instance up
+# to 256, or wait for spec-3.12 cleaner to recycle COMMITTED segments".
+# Counter cluster_undo_segment_hard_cap_fail_count bump.
+53R9E    E    ERRCODE_CLUSTER_UNDO_SEGMENTS_HARD_CAP_REACHED                   cluster_undo_segments_hard_cap_reached
+
+# spec-3.9 D6:  own-instance CR block construction cannot reconstruct the
+# snapshot-visible version at read_scn because the undo chain reaches a
+# recycled / retention-exceeded segment.  Aligned with Oracle ORA-01555
+# "snapshot too old".  Raised by cluster_cr_construct_block() chain walker;
+# counter cluster_cr_snapshot_too_old_count bump.  NEVER silent-fail to
+# tuple invisible (spec-3.9 I-fail-1).
+53R9F    E    ERRCODE_CLUSTER_CR_SNAPSHOT_TOO_OLD                              cluster_cr_snapshot_too_old
+
+# spec-3.9 D6:  CR chain walker encountered a cross-instance UBA
+# (record.origin_node_id != local node).  spec-3.9 supports own-instance
+# CR only; cross-instance CR is Stage 4 (Cache Fusion CR coordinator).
+# counter cluster_cr_cross_instance_unsupported_count bump.
+53R9G    E    ERRCODE_CLUSTER_CR_CROSS_INSTANCE_UNSUPPORTED                    cluster_cr_cross_instance_unsupported
+
+# spec-4.6 D4:  request landed on a GRD shard that is FROZEN/REBUILDING
+# during failure-driven remaster and the short wait
+# (cluster.grd_remaster_wait_ms) expired, or the holder-rebuild barrier
+# failed/timed out (fail-closed; the shard is never half-opened).
+# Application retry semantics like serialization_failure.
+53R9I    E    ERRCODE_CLUSTER_GRD_SHARD_REMASTERING                            cluster_grd_shard_remastering
+
+# spec-4.6 D4:  request/reply carried a stale routing generation (old
+# epoch / old master after a remaster).  Dropped + retried against the
+# current master; never served by the dead/old master.
+53R9J    E    ERRCODE_CLUSTER_GRD_STALE_MASTER_GENERATION                      cluster_grd_stale_master_generation
+
+# spec-4.6 D4 / L12:  block-level (GCS/PCM) access to a remastered shard
+# before Stage-4.7 block-state rebuild exists.  The GES logical-lock
+# layer is rebuilt by 4.6, but PCM/dirty-block state is NOT; fail-closed
+# instead of serving stale block state through the new master map.
+53R9K    E    ERRCODE_CLUSTER_GCS_BLOCK_PATH_NOT_REBUILT                       cluster_gcs_block_path_not_rebuilt
+
+# spec-4.7 D1/D4:  GCS/PCM block-protocol warm recovery.  53R9K (above)
+# is narrowed (spec-4.7 P1#4) to the legacy/permanent "no recovery path"
+# guard;  the normal failure-driven recovery path now flows
+# 53R9L (RECOVERING: survivor re-declare / master rebuild in progress)
+# -> 53R9M (redo boundary not yet reached: the dead instance's merged WAL
+# has not been recovered to a consistent point, so serving the block
+# would risk a stale shared page) -> NORMAL.  Both are retryable
+# (ERRCODE_T_R_* family);  the request path fail-closes with the exact
+# code per state (P1#4 — never "53R9K OR 53R9L").
+53R9L    E    ERRCODE_CLUSTER_GCS_BLOCK_RESOURCE_RECOVERING                    cluster_gcs_block_resource_recovering
+53R9M    E    ERRCODE_CLUSTER_GCS_BLOCK_BEFORE_REDO_BOUNDARY                   cluster_gcs_block_before_redo_boundary
+
+# spec-4.8ab D1:  undo/TT/ITL checkpoint-writeback boundary contract.  A
+# detected boundary violation fail-closes here (8.A) — PANIC inside a critical
+# section, else this ERROR;  never silent.  The data-loss violations are
+# WAL-before-data (an undo block written back with block_lsn > the durable
+# flush LSN) and checkpoint-coverage (a PRE-redo dirty undo block left
+# unflushed at checkpoint completion — recovery starts at redo and would not
+# replay it).  NB: block_lsn > redo is NOT a violation (recovery replays a
+# post-redo block from WAL).  53R9H is already CROSS_NODE_WRITE_CONFLICT and
+# 53R9A..M are allocated, so N is the next free slot in the 53R9 family.
+53R9N    E    ERRCODE_CLUSTER_UNDO_WRITEBACK_BOUNDARY_VIOLATION                cluster_undo_writeback_boundary_violation
+
+# spec-5.2a D6:  clean-page X-transfer enabler terminal fail-closed.  A clean
+# (sequence) page X-transfer could not complete safely and there is no proven-
+# safe fallback:  a 3-node third-party master clean transfer (out of the 2-node
+# narrow scope), or the X holder transiently could not relinquish a clean page
+# (pinned / re-dirtied) so it kept its X.  Retryable — the requester retries the
+# transaction (Rule 8.A:  never an optimistic grant, never a stale read).  53R9N
+# is the previous slot; X is chosen by spec to mark the clean-X-transfer band.
+53R9X    E    ERRCODE_CLUSTER_CLEAN_PAGE_XFER_UNAVAILABLE                      cluster_clean_page_xfer_unavailable
+
+# spec-4.1 D7:  per-thread WAL routing startup validation (53RA0+ opens
+# the Stage-4 WAL/recovery band; 53R70/71 belong to GES).  53RA0 fires
+# at postmaster startup when cluster.wal_threads_dir is configured but
+# the configuration is contradictory (cluster.enabled=off, or
+# cluster.node_id unset), the thread directory is missing, or
+# $PGDATA/pg_wal does not resolve to <wal_threads_dir>/thread_<id> for
+# this node (mis-linked symlink / wrong mount).  Fail-closed: startup is
+# refused; never a silent fallback to the flat pg_wal layout.
+53RA0    E    ERRCODE_CLUSTER_WAL_THREAD_ROUTING_MISMATCH                      cluster_wal_thread_routing_mismatch
+
+# spec-4.1 D7:  the thread claim file (pgrac_thread.claim, written once
+# on first validated startup) guards a thread directory against a
+# DIFFERENT node writing into it.  53RA1 fires at postmaster startup
+# when the claim belongs to another node_id / thread_id, is corrupt
+# (bad magic / version / CRC), or cannot be created (O_EXCL or fsync
+# failure).  Never auto-rebuilt: operator confirms ownership and removes
+# the file manually (errhint carries the procedure).
+53RA1    E    ERRCODE_CLUSTER_WAL_THREAD_CLAIM_CONFLICT                        cluster_wal_thread_claim_conflict
+
+# spec-4.2 D5:  ClusterWalState registry (pgrac_wal_state on the shared
+# WAL root) I/O or corruption failure.  Fires at postmaster startup when
+# the registry header cannot be created/validated or the own slot ACTIVE
+# publish fails (startup-grade fail-closed), and at clean shutdown when
+# the STOPPED publish fails.  Periodic cluster_stats refreshes are
+# best-effort and never raise this (LOG-once + counter instead).
+53RA2    E    ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE                             cluster_wal_state_io_failure
+# spec-4.5:  merged k-way SCN recovery refused (cold-crash engage gate;
+# plan UNKNOWN, stream not OK, missing checkpoint_redo_lsn, fpw history,
+# or an unclassifiable foreign record).  Fail-closed -- never silently
+# fall back to single-stream recovery (would skip a peer's committed WAL).
+53RA3    E    ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED                          cluster_merged_recovery_blocked
+# spec-4.11:  online single-thread recovery refused.  A survivor cannot
+# safely online-replay a dead thread's WAL data to shared storage within
+# the reconfig freeze window (missing WAL segment, indeterminate target
+# LSN, full_page_writes was off, insufficient checkpoint history,
+# incomplete undo/TT authority, a cross-node merge contradiction, or an
+# rmgr not in the online apply matrix).  Result-returning fail-closed:
+# the dead thread's resources stay frozen (never serve a possibly stale
+# page); the survivor is NOT crashed unless
+# cluster.thread_recovery_on_unrecoverable=panic.
+53RA4    E    ERRCODE_CLUSTER_THREAD_RECOVERY_BLOCKED                          cluster_thread_recovery_blocked
+# spec-5.4:  SQ sequence allocation could not be proven unique, so nextval
+# fails closed rather than risk a cross-node duplicate.  Fires when the
+# authority cannot durably confirm a segment (refill WAL unconfirmed), the
+# boundary writeback to a reachable node failed/was unreachable, the SQ
+# resource generation no longer matches (drop/recreate ABA), or a master
+# failover left the durable allocation boundary unrecoverable.  Distinct
+# from 53R70 (refill wait timeout): this is a stronger correctness signal,
+# not a transient timeout.
+53RA5    E    ERRCODE_CLUSTER_SEQUENCE_ALLOC_UNAVAILABLE                       cluster_sequence_alloc_unavailable
+
+Section: Class 54 - Program Limit Exceeded
+
+# this is for wired-in limits, not resource exhaustion problems (class borrowed from DB2)
+54000    E    ERRCODE_PROGRAM_LIMIT_EXCEEDED                                 program_limit_exceeded
+54001    E    ERRCODE_STATEMENT_TOO_COMPLEX                                  statement_too_complex
+54011    E    ERRCODE_TOO_MANY_COLUMNS                                       too_many_columns
+54023    E    ERRCODE_TOO_MANY_ARGUMENTS                                     too_many_arguments
+
+Section: Class 55 - Object Not In Prerequisite State
+
+# (class borrowed from DB2)
+55000    E    ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE                       object_not_in_prerequisite_state
+55006    E    ERRCODE_OBJECT_IN_USE                                          object_in_use
+55P02    E    ERRCODE_CANT_CHANGE_RUNTIME_PARAM                              cant_change_runtime_param
+55P03    E    ERRCODE_LOCK_NOT_AVAILABLE                                     lock_not_available
+55P04    E    ERRCODE_UNSAFE_NEW_ENUM_VALUE_USAGE                            unsafe_new_enum_value_usage
+
+Section: Class 55 - Object Not In Prerequisite State (pgrac extension)
+
+55R01    E    ERRCODE_CLUSTER_PCM_STATE_INVALID                              cluster_pcm_state_invalid
+55R02    E    ERRCODE_CLUSTER_BUFFER_PIN_CONFLICT                            cluster_buffer_pin_conflict
+55R03    E    ERRCODE_CLUSTER_LOCK_STARVATION                                cluster_lock_starvation
+55R04    E    ERRCODE_CLUSTER_BUFFER_INVALIDATED                             cluster_buffer_invalidated
+55R05    E    ERRCODE_CLUSTER_MASTER_CHANGED                                 cluster_master_changed
+55R06    E    ERRCODE_CLUSTER_BLOCK_MISSING_TEMPORARY                        cluster_block_missing_temporary
+
+Section: Class 57 - Operator Intervention
+
+# (class borrowed from DB2)
+57000    E    ERRCODE_OPERATOR_INTERVENTION                                  operator_intervention
+57014    E    ERRCODE_QUERY_CANCELED                                         query_canceled
+57P01    E    ERRCODE_ADMIN_SHUTDOWN                                         admin_shutdown
+57P02    E    ERRCODE_CRASH_SHUTDOWN                                         crash_shutdown
+57P03    E    ERRCODE_CANNOT_CONNECT_NOW                                     cannot_connect_now
+57P04    E    ERRCODE_DATABASE_DROPPED                                       database_dropped
+57P05    E    ERRCODE_IDLE_SESSION_TIMEOUT                                   idle_session_timeout
+
+Section: Class 57 - Operator Intervention (pgrac extension)
+
+57R02    E    ERRCODE_CLUSTER_FENCE_TRIGGERED                                cluster_fence_triggered
+57R03    E    ERRCODE_CLUSTER_ADMIN_SHUTDOWN                                 cluster_admin_shutdown
+57R04    E    ERRCODE_CLUSTER_NODE_DRAIN                                     cluster_node_drain
+57R05    E    ERRCODE_CLUSTER_QUIESCE_ACTIVE                                 cluster_quiesce_active
+57R06    E    ERRCODE_CLUSTER_ADG_APPLY_LAG_EXCESSIVE                        cluster_adg_apply_lag_excessive
+
+Section: Class 58 - System Error (errors external to PostgreSQL itself)
+
+# (class borrowed from DB2)
+58000    E    ERRCODE_SYSTEM_ERROR                                           system_error
+58030    E    ERRCODE_IO_ERROR                                               io_error
+58P01    E    ERRCODE_UNDEFINED_FILE                                         undefined_file
+58P02    E    ERRCODE_DUPLICATE_FILE                                         duplicate_file
+
+Section: Class 58 - System Error (pgrac extension)
+
+58R01    E    ERRCODE_CLUSTER_SHARED_STORAGE_FAILED                          cluster_shared_storage_failed
+58R02    E    ERRCODE_CLUSTER_HEARTBEAT_LOST                                 cluster_heartbeat_lost
+58R03    E    ERRCODE_CLUSTER_INTERCONNECT_CORRUPTED                         cluster_interconnect_corrupted
+58R04    E    ERRCODE_CLUSTER_MASTER_UNAVAILABLE                             cluster_master_unavailable
+58R05    E    ERRCODE_CLUSTER_SCN_DRIFT_EXCESSIVE                            cluster_scn_drift_excessive
+58R06    E    ERRCODE_CLUSTER_SCN_UNDERFLOW                                  cluster_scn_underflow
+58R07    E    ERRCODE_CLUSTER_GRD_INCONSISTENT                               cluster_grd_inconsistent
+58R08    E    ERRCODE_CLUSTER_TOPOLOGY_INVALID                               cluster_topology_invalid
+58R09    E    ERRCODE_CLUSTER_TT_INCONSISTENT                                cluster_tt_inconsistent
+58R10    E    ERRCODE_CLUSTER_CATALOG_INCONSISTENT                           cluster_catalog_inconsistent
+58R11    E    ERRCODE_CLUSTER_SINVAL_INCONSISTENT                            cluster_sinval_inconsistent
+58R12    E    ERRCODE_CLUSTER_RECOVERY_FAILED                                cluster_recovery_failed
+58R13    E    ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE              cluster_controlfile_authority_unavailable
+
+Section: Class 72 - Snapshot Failure
+# (class borrowed from Oracle)
+72000    E    ERRCODE_SNAPSHOT_TOO_OLD                                       snapshot_too_old
+
+Section: Class 72 - Snapshot Failure (pgrac extension)
+
+72R01    E    ERRCODE_CLUSTER_SNAPSHOT_TOO_OLD                               cluster_snapshot_too_old
+72R02    E    ERRCODE_CLUSTER_SNAPSHOT_UNAVAILABLE                           cluster_snapshot_unavailable
+
+Section: Class F0 - Configuration File Error
+
+# (PostgreSQL-specific error class)
+F0000    E    ERRCODE_CONFIG_FILE_ERROR                                      config_file_error
+F0001    E    ERRCODE_LOCK_FILE_EXISTS                                       lock_file_exists
+
+Section: Class HV - Foreign Data Wrapper Error (SQL/MED)
+
+# (SQL/MED-specific error class)
+HV000    E    ERRCODE_FDW_ERROR                                              fdw_error
+HV005    E    ERRCODE_FDW_COLUMN_NAME_NOT_FOUND                              fdw_column_name_not_found
+HV002    E    ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED                     fdw_dynamic_parameter_value_needed
+HV010    E    ERRCODE_FDW_FUNCTION_SEQUENCE_ERROR                            fdw_function_sequence_error
+HV021    E    ERRCODE_FDW_INCONSISTENT_DESCRIPTOR_INFORMATION                fdw_inconsistent_descriptor_information
+HV024    E    ERRCODE_FDW_INVALID_ATTRIBUTE_VALUE                            fdw_invalid_attribute_value
+HV007    E    ERRCODE_FDW_INVALID_COLUMN_NAME                                fdw_invalid_column_name
+HV008    E    ERRCODE_FDW_INVALID_COLUMN_NUMBER                              fdw_invalid_column_number
+HV004    E    ERRCODE_FDW_INVALID_DATA_TYPE                                  fdw_invalid_data_type
+HV006    E    ERRCODE_FDW_INVALID_DATA_TYPE_DESCRIPTORS                      fdw_invalid_data_type_descriptors
+HV091    E    ERRCODE_FDW_INVALID_DESCRIPTOR_FIELD_IDENTIFIER                fdw_invalid_descriptor_field_identifier
+HV00B    E    ERRCODE_FDW_INVALID_HANDLE                                     fdw_invalid_handle
+HV00C    E    ERRCODE_FDW_INVALID_OPTION_INDEX                               fdw_invalid_option_index
+HV00D    E    ERRCODE_FDW_INVALID_OPTION_NAME                                fdw_invalid_option_name
+HV090    E    ERRCODE_FDW_INVALID_STRING_LENGTH_OR_BUFFER_LENGTH             fdw_invalid_string_length_or_buffer_length
+HV00A    E    ERRCODE_FDW_INVALID_STRING_FORMAT                              fdw_invalid_string_format
+HV009    E    ERRCODE_FDW_INVALID_USE_OF_NULL_POINTER                        fdw_invalid_use_of_null_pointer
+HV014    E    ERRCODE_FDW_TOO_MANY_HANDLES                                   fdw_too_many_handles
+HV001    E    ERRCODE_FDW_OUT_OF_MEMORY                                      fdw_out_of_memory
+HV00P    E    ERRCODE_FDW_NO_SCHEMAS                                         fdw_no_schemas
+HV00J    E    ERRCODE_FDW_OPTION_NAME_NOT_FOUND                              fdw_option_name_not_found
+HV00K    E    ERRCODE_FDW_REPLY_HANDLE                                       fdw_reply_handle
+HV00Q    E    ERRCODE_FDW_SCHEMA_NOT_FOUND                                   fdw_schema_not_found
+HV00R    E    ERRCODE_FDW_TABLE_NOT_FOUND                                    fdw_table_not_found
+HV00L    E    ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION                         fdw_unable_to_create_execution
+HV00M    E    ERRCODE_FDW_UNABLE_TO_CREATE_REPLY                             fdw_unable_to_create_reply
+HV00N    E    ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION                     fdw_unable_to_establish_connection
+
+Section: Class P0 - PL/pgSQL Error
+
+# (PostgreSQL-specific error class)
+P0000    E    ERRCODE_PLPGSQL_ERROR                                          plpgsql_error
+P0001    E    ERRCODE_RAISE_EXCEPTION                                        raise_exception
+P0002    E    ERRCODE_NO_DATA_FOUND                                          no_data_found
+P0003    E    ERRCODE_TOO_MANY_ROWS                                          too_many_rows
+P0004    E    ERRCODE_ASSERT_FAILURE                                         assert_failure
+
+Section: Class XX - Internal Error
+
+# this is for "can't-happen" conditions and software bugs (PostgreSQL-specific error class)
+XX000    E    ERRCODE_INTERNAL_ERROR                                         internal_error
+XX001    E    ERRCODE_DATA_CORRUPTED                                         data_corrupted
+XX002    E    ERRCODE_INDEX_CORRUPTED                                        index_corrupted
+
+Section: Class XX - Internal Error (pgrac extension)
+
+XXR01    E    ERRCODE_CLUSTER_ASSERTION_FAILURE                              cluster_assertion_failure
+XXR02    E    ERRCODE_CLUSTER_UNEXPECTED_STATE                               cluster_unexpected_state
+XXR03    E    ERRCODE_CLUSTER_RELMAPPER_CONFLICT                             cluster_relmapper_conflict
