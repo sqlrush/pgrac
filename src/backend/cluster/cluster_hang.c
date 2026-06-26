@@ -223,6 +223,9 @@ hang_find_hard_blocker(const LockData *lockData, int wait_idx, int *blocker_pid,
 		for (m = 1; m < MAX_LOCKMODES; m++) {
 			if ((holder->holdMask & LOCKBIT_ON(m))
 				&& DoLockModesConflict(waiter->waitLockMode, m)) {
+				/* GES_MODE_OK: local heavyweight-lock conflict (pg_locks
+				 * hard-blocker detection), not a GES cluster-lock mode
+				 * decision; DoLockModesConflict is the correct PG primitive. */
 				*blocker_pid = holder->pid;
 				*blocker_backendId = holder->backend;
 				return true;
