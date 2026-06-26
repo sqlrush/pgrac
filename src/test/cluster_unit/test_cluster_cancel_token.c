@@ -43,6 +43,7 @@
  */
 #include "postgres.h"
 
+#include <signal.h>
 #include <string.h>
 
 #include "cluster/cluster_cancel_token.h"

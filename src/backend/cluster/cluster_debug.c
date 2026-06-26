@@ -2483,3 +2483,23 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 
 	return (Datum)0;
 }
+
+
+#ifndef USE_PGRAC_CLUSTER
+/*
+ * spec-5.9 fix-forward — pg_cluster_hang_dump (spec-5.11) is declared in
+ * pg_proc.dat, but its definition lives in cluster_hang.c, which is NOT part of
+ * the --disable-cluster minimal OBJS, leaving fmgrtab with an undefined
+ * reference and breaking the --disable-cluster build.  cluster_debug.o IS in
+ * the minimal OBJS, so provide the standard disabled stub here.  Under
+ * --enable-cluster this block is skipped and cluster_hang.c owns the symbol.
+ */
+PG_FUNCTION_INFO_V1(pg_cluster_hang_dump);
+Datum
+pg_cluster_hang_dump(PG_FUNCTION_ARGS)
+{
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("pg_cluster_hang_dump requires --enable-cluster")));
+	return (Datum)0;
+}
+#endif /* !USE_PGRAC_CLUSTER */
