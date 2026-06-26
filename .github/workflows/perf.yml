@@ -144,6 +144,24 @@ jobs:
           scripts/perf/run-quadrant-matrix.sh \
             | tee "scripts/perf/results/quadrant-matrix-${{ github.run_id }}.md"
 
+      # spec-5.50 D1: CR read-path profile (SELECT-heavy / long-snapshot /
+      # parallel-scan).  Build-invariant counter deltas + cross-backend
+      # redundancy (= construct_delta / distinct_cr_keys, NOT distinct_blocks);
+      # absolute wall is cassert-inflated trend only (perf.yml is all-cassert,
+      # §15.1).  warn-only (perf is never a hard gate, 规则 20.A).  Perf tier,
+      # NOT fast-gate / nightly correctness shard (spec-5.50 Q9 / L91).
+      - name: CR read-path profile (warn-only, Linux)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: |
+          mkdir -p scripts/perf/results
+          INSTALL_PREFIX=$HOME/linkdb-install \
+          scripts/perf/run-cr-profile.sh --axis all \
+            --rows "${CR_PROFILE_ROWS:-3000}" \
+            --readers "${CR_PROFILE_READERS:-4}" \
+            --out "scripts/perf/results/cr-profile-${{ github.run_id }}.csv" \
+            | tee "scripts/perf/results/cr-profile-${{ github.run_id }}.log"
+
       - name: Collect perf artifacts
         if: always()
         run: |
