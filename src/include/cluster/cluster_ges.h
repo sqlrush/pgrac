@@ -268,8 +268,49 @@ typedef enum GesRequestOpcode {
 	 * so no catversion bump.  Shares the REQUEST dedup / reply-wait path so a
 	 * lost reply retransmits idempotently (§3.5 T6).
 	 */
-	GES_REQ_OPCODE_REQUEST_NOWAIT = 15
+	GES_REQ_OPCODE_REQUEST_NOWAIT = 15,
+	/*
+	 * spec-5.9 D4 — CANCEL_WAIT: a deadlock victim (or the coordinator on its
+	 * behalf) tells the resource master to remove the victim's queued waiter /
+	 * convert by its exact identity + spec-5.8 wait_seq, so a stale /
+	 * retransmitted cancel cannot dequeue a since-reused identity (Rule 8.A
+	 * P0#2).  Carries its OWN dedicated 64B payload (GesCancelWaitPayload),
+	 * early-dispatched like DEADLOCK_PROBE — never the generic GesRequestPayload
+	 * path, never the work_queue.  16 is the next free opcode; the new wire
+	 * payload bumps catversion.
+	 */
+	GES_REQ_OPCODE_CANCEL_WAIT = 16,
+	/*
+	 * spec-5.9 D5 — CANCEL_ACK: the victim node tells the coordinator the
+	 * outcome of a cross-node cancel (correlated by cancel_id), so the
+	 * coordinator stops retransmitting / escalates instead of silently waiting
+	 * out the timeout.  Dedicated 48B payload, early-dispatched.  17 is the next
+	 * free opcode.
+	 */
+	GES_REQ_OPCODE_CANCEL_ACK = 17
 } GesRequestOpcode;
+
+/* spec-5.9 D4 — which queue the CANCEL_WAIT targets on the master. */
+typedef enum GesCancelWaitKind {
+	GES_CANCEL_WAIT_KIND_REQUEST = 0, /* waiters[]  (cancel_waiter_by_id_seq) */
+	GES_CANCEL_WAIT_KIND_CONVERT = 1, /* converts[] (cancel_convert_by_id) */
+} GesCancelWaitKind;
+
+/*
+ * spec-5.9 D5 — CANCEL_ACK outcome (the coordinator's pending-cancel table
+ * reacts per state).  CONSUMED is the only one that clears a pending entry
+ * (the victim truly matched + aborted); INSTALLED keeps it pending awaiting
+ * CONSUMED; NOT_WAITING clears + re-probes; STALE_EPOCH/PROTECTED route to
+ * reconfig-discard / escalation; QUEUE_BUSY triggers a backoff retransmit.
+ */
+typedef enum GesCancelAckStatus {
+	GES_CANCEL_ACK_INSTALLED = 0,
+	GES_CANCEL_ACK_CONSUMED = 1,
+	GES_CANCEL_ACK_NOT_WAITING = 2,
+	GES_CANCEL_ACK_STALE_EPOCH = 3,
+	GES_CANCEL_ACK_QUEUE_BUSY = 4,
+	GES_CANCEL_ACK_PROTECTED = 5,
+} GesCancelAckStatus;
 
 typedef enum GesReplyOpcode {
 	GES_REPLY_OPCODE_GRANT = 1,
@@ -570,7 +611,25 @@ extern void cluster_ges_send_bast_targeted(const struct ClusterResId *resid,
  */
 extern void cluster_ges_send_cancel_pending(int32 victim_node_id,
 											const struct ClusterGrdHolderId *victim_target,
-											uint64 wait_seq);
+											uint64 wait_seq, uint64 cancel_id);
+
+/*
+ * spec-5.9 D4 — tell a REMOTE resource master to dequeue the victim's queued
+ * waiter (kind == GES_CANCEL_WAIT_KIND_REQUEST) or convert (..._CONVERT) by its
+ * exact identity + wait_seq.  Reliable outbound origin (loss => leaked WFG
+ * edge).  Local-master victims call the GRD primitives directly.
+ */
+extern void cluster_ges_send_cancel_wait(int32 master_node_id, const struct ClusterResId *resid,
+										 const struct ClusterGrdHolderId *waiter, uint64 wait_seq,
+										 uint64 cancel_id, uint8 kind);
+
+/*
+ * spec-5.9 D5 — report a cross-node cancel outcome back to the coordinator
+ * (ack_status is a GesCancelAckStatus).  Reliable outbound origin.
+ */
+extern void cluster_ges_send_cancel_ack(int32 coordinator_node_id,
+										const struct ClusterGrdHolderId *victim, uint64 wait_seq,
+										uint64 cancel_id, uint8 ack_status);
 
 
 /* ============================================================
@@ -592,6 +651,45 @@ typedef struct GesDeadlockProbePayload {
 
 StaticAssertDecl(sizeof(GesDeadlockProbePayload) == 24,
 				 "GesDeadlockProbePayload wire ABI 24-byte lock");
+
+/*
+ * spec-5.9 D4 — CANCEL_WAIT dedicated payload (64B, fits the 72B outbound ring
+ * slot so no ring growth).  waiter_* is the victim's identity 4-tuple; the
+ * master matches it AND wait_seq exactly (ABA guard).  For kind == CONVERT,
+ * waiter_request_id carries the convert_request_id.  cancel_id correlates the
+ * spec-5.9 D5 CANCEL_ACK.
+ */
+typedef struct GesCancelWaitPayload {
+	uint32 opcode; /* = GES_REQ_OPCODE_CANCEL_WAIT (16) */
+	uint32 kind;   /* GesCancelWaitKind */
+	uint32 waiter_node_id;
+	uint32 waiter_procno;
+	uint64 waiter_cluster_epoch;
+	uint64 waiter_request_id; /* request_id, or convert_request_id (CONVERT) */
+	uint64 wait_seq;		  /* spec-5.8 wait_seq — exact match */
+	uint64 cancel_id;		  /* coordinator correlation id */
+	uint32 resid[4];		  /* ClusterResId byte image (16B) */
+} GesCancelWaitPayload;
+
+StaticAssertDecl(sizeof(GesCancelWaitPayload) == 64, "GesCancelWaitPayload wire ABI 64-byte lock");
+
+/*
+ * spec-5.9 D5 — CANCEL_ACK dedicated payload (48B).  victim_* + wait_seq +
+ * cancel_id echo the cancel the coordinator issued so its pending-cancel table
+ * can correlate the outcome; ack_status is a GesCancelAckStatus.
+ */
+typedef struct GesCancelAckPayload {
+	uint32 opcode;	   /* = GES_REQ_OPCODE_CANCEL_ACK (17) */
+	uint32 ack_status; /* GesCancelAckStatus */
+	uint32 victim_node_id;
+	uint32 victim_procno;
+	uint64 victim_cluster_epoch;
+	uint64 victim_request_id;
+	uint64 wait_seq;
+	uint64 cancel_id;
+} GesCancelAckPayload;
+
+StaticAssertDecl(sizeof(GesCancelAckPayload) == 48, "GesCancelAckPayload wire ABI 48-byte lock");
 
 /*
  * Header for variable-length REPORT.  Followed by nedges *

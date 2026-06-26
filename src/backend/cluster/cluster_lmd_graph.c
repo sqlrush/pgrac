@@ -124,7 +124,21 @@ typedef struct ClusterLmdGraphShared {
 	pg_atomic_uint64 deadlock_confirmed_count;	/* two-round confirm succeeded */
 	pg_atomic_uint64 confirm_unconfirmed_count; /* round-1 cycle NOT confirmed by round 2 */
 	pg_atomic_uint64 reconfig_discard_count;	/* confirm spanned a reconfig (D4b) */
-	int max_edges;								/* snapshot of cluster.lmd_max_wait_edges at init */
+	/* spec-5.9 D10 — victim policy + cancel robustness counters. */
+	pg_atomic_uint64 victim_protected_skip_count;	   /* HARD-skip victim -> ACK(PROTECTED) */
+	pg_atomic_uint64 victim_repeat_avoided_count;	   /* anti-thrash chose an alternate */
+	pg_atomic_uint64 cancel_token_installed_count;	   /* per-proc cancel token installed */
+	pg_atomic_uint64 cancel_consumed_count;			   /* backend matched + honored cancel */
+	pg_atomic_uint64 cancel_stale_cleared_count;	   /* stale token cleared, no 40P01 */
+	pg_atomic_uint64 cancel_wait_stale_rejected_count; /* CANCEL_WAIT wait_seq mismatch */
+	pg_atomic_uint64 cancel_ack_received_count;		   /* CANCEL_ACK received by coordinator */
+	pg_atomic_uint64 cancel_retransmit_count;		   /* bounded cancel retransmit */
+	pg_atomic_uint64 cancel_escalated_alternate_count; /* escalated to alternate victim */
+	pg_atomic_uint64 cancel_exhausted_timeout_count;   /* cancellable exhausted -> timeout */
+	pg_atomic_uint64 cancel_no_safe_victim_count;	   /* all HARD-skip -> degrade */
+	pg_atomic_uint64 cleanup_orphan_edge_swept_count;  /* orphan master-side edge GC'd */
+	pg_atomic_uint64 reconfig_cancel_discarded_count;  /* in-flight cancel dropped on reconfig */
+	int max_edges; /* snapshot of cluster.lmd_max_wait_edges at init */
 } ClusterLmdGraphShared;
 
 static ClusterLmdGraphShared *cluster_lmd_graph_state = NULL;
@@ -200,6 +214,20 @@ cluster_lmd_graph_shmem_init(void)
 		pg_atomic_init_u64(&cluster_lmd_graph_state->deadlock_confirmed_count, 0);
 		pg_atomic_init_u64(&cluster_lmd_graph_state->confirm_unconfirmed_count, 0);
 		pg_atomic_init_u64(&cluster_lmd_graph_state->reconfig_discard_count, 0);
+		/* spec-5.9 D10 init. */
+		pg_atomic_init_u64(&cluster_lmd_graph_state->victim_protected_skip_count, 0);
+		pg_atomic_init_u64(&cluster_lmd_graph_state->victim_repeat_avoided_count, 0);
+		pg_atomic_init_u64(&cluster_lmd_graph_state->cancel_token_installed_count, 0);
+		pg_atomic_init_u64(&cluster_lmd_graph_state->cancel_consumed_count, 0);
+		pg_atomic_init_u64(&cluster_lmd_graph_state->cancel_stale_cleared_count, 0);
+		pg_atomic_init_u64(&cluster_lmd_graph_state->cancel_wait_stale_rejected_count, 0);
+		pg_atomic_init_u64(&cluster_lmd_graph_state->cancel_ack_received_count, 0);
+		pg_atomic_init_u64(&cluster_lmd_graph_state->cancel_retransmit_count, 0);
+		pg_atomic_init_u64(&cluster_lmd_graph_state->cancel_escalated_alternate_count, 0);
+		pg_atomic_init_u64(&cluster_lmd_graph_state->cancel_exhausted_timeout_count, 0);
+		pg_atomic_init_u64(&cluster_lmd_graph_state->cancel_no_safe_victim_count, 0);
+		pg_atomic_init_u64(&cluster_lmd_graph_state->cleanup_orphan_edge_swept_count, 0);
+		pg_atomic_init_u64(&cluster_lmd_graph_state->reconfig_cancel_discarded_count, 0);
 		cluster_lmd_graph_state->max_edges = max_edges;
 	}
 
@@ -592,6 +620,20 @@ DEFINE_GET_INC(cleanup_skip_other_owner_count)
 DEFINE_GET_INC(deadlock_confirmed_count)
 DEFINE_GET_INC(confirm_unconfirmed_count)
 DEFINE_GET_INC(reconfig_discard_count)
+/* spec-5.9 D10 — victim policy + cancel robustness. */
+DEFINE_GET_INC(victim_protected_skip_count)
+DEFINE_GET_INC(victim_repeat_avoided_count)
+DEFINE_GET_INC(cancel_token_installed_count)
+DEFINE_GET_INC(cancel_consumed_count)
+DEFINE_GET_INC(cancel_stale_cleared_count)
+DEFINE_GET_INC(cancel_wait_stale_rejected_count)
+DEFINE_GET_INC(cancel_ack_received_count)
+DEFINE_GET_INC(cancel_retransmit_count)
+DEFINE_GET_INC(cancel_escalated_alternate_count)
+DEFINE_GET_INC(cancel_exhausted_timeout_count)
+DEFINE_GET_INC(cancel_no_safe_victim_count)
+DEFINE_GET_INC(cleanup_orphan_edge_swept_count)
+DEFINE_GET_INC(reconfig_cancel_discarded_count)
 
 #undef DEFINE_GET_INC
 

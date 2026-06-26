@@ -531,6 +531,21 @@ int cluster_lmd_global_dd_interval_ms = 2000;
 int cluster_lmd_deadlock_confirm_interval_ms = 500;
 
 /*
+ * PGRAC: spec-5.9 D10 — deadlock victim policy + cancel robustness knobs.
+ *
+ *	cancel_ack_timeout_ms (default 1000, < global_dd_interval_ms 2000): the
+ *	coordinator retransmits a cross-node cancel if no CANCEL_ACK arrives within
+ *	this window.  cancel_max_retransmit (default 3): bounded retransmit attempts
+ *	before escalating to an alternate victim;  0 disables retransmit (~= 5.8
+ *	fire-and-forget).  victim_repeat_window_ms (default 5000): anti-thrash
+ *	window — a victim 4-tuple chosen within this window that re-deadlocks is a
+ *	livelock symptom, so the coordinator prefers an alternate.
+ */
+int cluster_cancel_ack_timeout_ms = 1000;
+int cluster_cancel_max_retransmit = 3;
+int cluster_victim_repeat_window_ms = 5000;
+
+/*
  * PGRAC: spec-2.33 D8 — cluster.gcs_reply_timeout_ms (HC85).
  * Default 5000ms.  PGC_SUSET — superusers and test fixtures may tune;
  * unprivileged users may not perturb the Cache Fusion hot path.
@@ -2479,6 +2494,31 @@ cluster_init_guc(void)
 					 "in both rounds separated by this delay (Rule 8.A transient "
 					 "filter).  PGC_SIGHUP."),
 		&cluster_lmd_deadlock_confirm_interval_ms, 500, 50, 60000, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	/* PGRAC: spec-5.9 D10 — victim policy + cancel robustness GUCs.  PGC_SUSET
+	 * so unprivileged users cannot perturb cross-node deadlock resolution. */
+	DefineCustomIntVariable(
+		"cluster.cancel_ack_timeout_ms",
+		gettext_noop(
+			"Coordinator wait for a cross-node deadlock CANCEL_ACK before retransmit (ms)."),
+		gettext_noop("Should stay below cluster.global_dd_interval_ms.  PGC_SUSET."),
+		&cluster_cancel_ack_timeout_ms, 1000, 50, 60000, PGC_SUSET, GUC_UNIT_MS, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.cancel_max_retransmit",
+		gettext_noop("Bounded cross-node deadlock cancel retransmit attempts before escalation."),
+		gettext_noop("0 disables retransmit (5.8 fire-and-forget).  Exhaustion escalates to an "
+					 "alternate victim, then a finite-timeout fallback (never a force-kill).  "
+					 "PGC_SUSET."),
+		&cluster_cancel_max_retransmit, 3, 0, 100, PGC_SUSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.victim_repeat_window_ms",
+		gettext_noop("Anti-thrash window for repeated deadlock victim selection (ms)."),
+		gettext_noop("A victim re-selected within this window prefers an alternate to avoid "
+					 "livelock (advisory — falls back to youngest if none exists).  PGC_SUSET."),
+		&cluster_victim_repeat_window_ms, 5000, 0, 600000, PGC_SUSET, GUC_UNIT_MS, NULL, NULL,
+		NULL);
 
 	/*
 	 * PGRAC: spec-2.33 D8 — cluster.gcs_reply_timeout_ms (HC85).

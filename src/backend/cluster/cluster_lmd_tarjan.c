@@ -42,6 +42,7 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_cancel_token.h" /* spec-5.9 D3 install token */
 #include "cluster/cluster_conf.h"		  /* CLUSTER_MAX_NODES + active peers */
 #include "cluster/cluster_epoch.h"		  /* cluster_epoch_get_current */
 #include "cluster/cluster_ges.h"		  /* GesDeadlockProbePayload / Report */
@@ -353,18 +354,84 @@ cluster_lmd_tarjan_scan_snapshot(const ClusterLmdWaitEdge *edges, int nedges,
 }
 
 
+/* ============================================================
+ * spec-5.9 D1 — victim exclude set helpers.
+ *
+ *	Match identity = the canonical GES/GRD 4-tuple (node_id, procno,
+ *	cluster_epoch, request_id);  wait_seq / xid are deliberately excluded from
+ *	the key (a re-queued waiter with a fresh wait_seq under the same 4-tuple is
+ *	the same logical backend and stays excluded for this resolution round).
+ * ============================================================ */
+
 void
-cluster_lmd_tarjan_pick_victim(const ClusterLmdVertex *cycle_vertices, int nvertices,
-							   ClusterLmdVertex *out_victim)
+cluster_lmd_victim_exclude_init(LmdVictimExcludeSet *set)
 {
-	int best = 0;
+	if (set != NULL)
+		set->count = 0;
+}
+
+bool
+cluster_lmd_victim_exclude_contains(const LmdVictimExcludeSet *set, const ClusterLmdVertex *v)
+{
+	if (set == NULL || v == NULL)
+		return false;
+	for (int i = 0; i < set->count; i++) {
+		const LmdVictimExcludeItem *it = &set->items[i];
+
+		if (it->node_id == v->node_id && it->procno == v->procno
+			&& it->cluster_epoch == v->cluster_epoch && it->request_id == v->request_id)
+			return true;
+	}
+	return false;
+}
+
+/* Returns false only when the set is full (bounded at the max cycle size);  a
+ * duplicate add is idempotent and returns true. */
+bool
+cluster_lmd_victim_exclude_add(LmdVictimExcludeSet *set, const ClusterLmdVertex *v)
+{
+	LmdVictimExcludeItem *it;
+
+	if (set == NULL || v == NULL)
+		return false;
+	if (cluster_lmd_victim_exclude_contains(set, v))
+		return true;
+	if (set->count >= CLUSTER_LMD_VICTIM_EXCLUDE_MAX)
+		return false;
+	it = &set->items[set->count++];
+	it->node_id = v->node_id;
+	it->procno = v->procno;
+	it->cluster_epoch = v->cluster_epoch;
+	it->request_id = v->request_id;
+	return true;
+}
+
+
+/*
+ * spec-5.9 D1 — exclude-aware youngest victim.  Strict refinement of the 2.24
+ * deterministic core: skips any cycle vertex in *exclude, then picks the
+ * youngest of the rest.  Returns false (writes nothing) when every cycle
+ * vertex is excluded — the D7 escalation has run out of cancellable victims and
+ * the coordinator must degrade to a finite timeout, never force-kill.  A NULL
+ * exclude behaves exactly like the pre-5.9 unconditional youngest pick.
+ */
+bool
+cluster_lmd_tarjan_pick_victim(const ClusterLmdVertex *cycle_vertices, int nvertices,
+							   const LmdVictimExcludeSet *exclude, ClusterLmdVertex *out_victim)
+{
+	int best = -1;
 
 	Assert(nvertices > 0 && out_victim != NULL);
-	for (int i = 1; i < nvertices; i++) {
-		if (vertex_youngest_first_cmp(&cycle_vertices[i], &cycle_vertices[best]) < 0)
+	for (int i = 0; i < nvertices; i++) {
+		if (cluster_lmd_victim_exclude_contains(exclude, &cycle_vertices[i]))
+			continue;
+		if (best < 0 || vertex_youngest_first_cmp(&cycle_vertices[i], &cycle_vertices[best]) < 0)
 			best = i;
 	}
+	if (best < 0)
+		return false;
 	*out_victim = cycle_vertices[best];
+	return true;
 }
 
 
@@ -455,6 +522,22 @@ get_self_node_id(void)
 	return self_node_id_cache;
 }
 
+/*
+ * spec-5.9 D3/D6 — coordinator-local cancel correlation id.  Minted once per
+ * issued cancel and threaded through the token / CANCEL_WAIT / CANCEL_ACK so
+ * the coordinator can correlate a reply to its pending-cancel entry.  A plain
+ * monotonic counter in the LMD process is sufficient: the coordinator only
+ * matches ACKs against its OWN pending table, and reconfig epoch-scoping (D9)
+ * discards anything in flight across a coordinator drift.
+ */
+static uint64 cancel_id_seq;
+
+static inline uint64
+lmd_next_cancel_id(void)
+{
+	return ++cancel_id_seq;
+}
+
 void
 cluster_lmd_tarjan_run_local_scan(void)
 {
@@ -505,7 +588,10 @@ cluster_lmd_tarjan_run_local_scan(void)
 		ClusterLmdVertex victim;
 		int scc_end = n_cycle_v; /* MVP — single big cycle */
 
-		cluster_lmd_tarjan_pick_victim(&cycle_vertices[idx], scc_end - idx, &victim);
+		/* spec-5.9 D1 — NULL exclude: 2.24 unconditional youngest pick (always
+		 * succeeds for a non-empty cycle). */
+		if (!cluster_lmd_tarjan_pick_victim(&cycle_vertices[idx], scc_end - idx, NULL, &victim))
+			break;
 
 		if (cluster_lmd_tarjan_revalidate(&cycle_vertices[idx], scc_end - idx, gen_at_snapshot)) {
 			if (victim.node_id == self_node) {
@@ -513,7 +599,8 @@ cluster_lmd_tarjan_run_local_scan(void)
 				 * it against the live per-proc wait-state and returns true only
 				 * if it actually sent the cancel.  Count only real cancels. */
 				if (cluster_lmd_signal_local_victim(victim.procno, victim.request_id,
-													victim.cluster_epoch, victim.wait_seq))
+													victim.cluster_epoch, victim.wait_seq,
+													lmd_next_cancel_id()))
 					cluster_lmd_victim_cancel_sent_count_inc(1);
 			} else {
 				/* Cross-node victim — production forwarding 推 spec-2.23. */
@@ -577,6 +664,12 @@ typedef struct LmdCoordRound {
 	uint64 member_hi;  /* bitmap of participating node_id 64..127 */
 	uint64 cycle_hash; /* order-independent hash of cycle vertex identities */
 	int member_count;  /* popcount(member) — observability */
+	/* spec-5.9 D2/D7 — bounded copy of the confirmed cycle's vertices so the
+	 * post-confirm coordinator can apply anti-thrash + alternate-victim
+	 * escalation without re-running the probe (cap is the max cycle we will
+	 * escalate over; a larger cycle still cancels its youngest victim). */
+	ClusterLmdVertex cycle_vertices[CLUSTER_LMD_VICTIM_EXCLUDE_MAX];
+	int n_cycle_vertices;
 } LmdCoordRound;
 
 /*
@@ -765,9 +858,14 @@ lmd_coordinator_probe_round(int32 self_node, const int32 *peers, int n_peers,
 	n_cycle_v = cluster_lmd_tarjan_scan_snapshot(union_edges, n_union, cycle_vertices, n_union * 2,
 												 &cycle_count);
 
-	if (cycle_count > 0) {
+	if (cycle_count > 0
+		&& cluster_lmd_tarjan_pick_victim(cycle_vertices, n_cycle_v, NULL, &out->victim)) {
 		out->has_cycle = true;
-		cluster_lmd_tarjan_pick_victim(cycle_vertices, n_cycle_v, &out->victim);
+		/* spec-5.9 D2/D7 — retain a bounded copy of the cycle vertices for the
+		 * post-confirm anti-thrash + escalation logic. */
+		out->n_cycle_vertices = Min(n_cycle_v, CLUSTER_LMD_VICTIM_EXCLUDE_MAX);
+		memcpy(out->cycle_vertices, cycle_vertices,
+			   sizeof(ClusterLmdVertex) * out->n_cycle_vertices);
 		for (int i = 0; i < n_cycle_v; i++)
 			out->cycle_hash += lmd_vertex_identity_hash(&cycle_vertices[i]);
 	}
@@ -775,6 +873,304 @@ lmd_coordinator_probe_round(int32 self_node, const int32 *peers, int n_peers,
 	pfree(cycle_vertices);
 	pfree(union_edges);
 	cluster_lmd_probe_reset();
+}
+
+/* ============================================================
+ * spec-5.9 D6 — coordinator pending-cancel table (LMD-process-local).
+ *
+ *	Created when the coordinator confirms a deadlock and issues a cancel; the
+ *	LMD tick (cluster_lmd_pending_cancel_tick) drives it to completion.  A LOCAL
+ *	victim's outcome is read from its per-proc consume marker (same node); a
+ *	REMOTE victim's outcome arrives as a CANCEL_ACK (D5) via on_ack().  No ACK
+ *	within cancel_ack_timeout_ms (or an ACK(QUEUE_BUSY)) under an unchanged epoch
+ *	-> bounded retransmit; attempts exhausted (or ACK(PROTECTED)) -> degrade to
+ *	the finite GES timeout (Rule 8.A — NEVER force-kill; spec-5.9 D7 inserts the
+ *	smarter alternate-victim escalation ahead of this fallback).  Process-local +
+ *	epoch-scoped: on coordinator drift / reconfig the new coordinator starts
+ *	empty and re-detects (RC1/RC3).
+ * ============================================================ */
+#define CLUSTER_LMD_PENDING_CANCEL_MAX 64
+
+typedef struct LmdPendingCancel {
+	bool active;
+	ClusterLmdVertex victim; /* 4-tuple + wait_seq */
+	uint64 cancel_id;
+	uint64 cluster_epoch; /* epoch at issue (D9 guard) */
+	bool local;			  /* victim on the coordinator's own node */
+	int attempts;
+	TimestampTz next_deadline; /* retransmit (remote) / give-up (local) deadline */
+	/* spec-5.9 D7 escalation context. */
+	uint64 cycle_hash;			/* round-2 fingerprint — re-confirm gate (8.A) */
+	bool escalating;			/* current victim failed; awaiting a scan re-pick */
+	TimestampTz escal_deadline; /* if the cycle is not re-confirmed by here, degrade */
+	ClusterLmdVertex cycle_vertices[CLUSTER_LMD_VICTIM_EXCLUDE_MAX];
+	int n_cycle_vertices;
+	LmdVictimExcludeSet exclude; /* victims already tried (PROTECTED / unresponsive) */
+} LmdPendingCancel;
+
+static LmdPendingCancel lmd_pending_cancels[CLUSTER_LMD_PENDING_CANCEL_MAX];
+
+static LmdPendingCancel *
+lmd_pending_cancel_find_by_cancel_id(uint64 cancel_id)
+{
+	for (int i = 0; i < CLUSTER_LMD_PENDING_CANCEL_MAX; i++)
+		if (lmd_pending_cancels[i].active && lmd_pending_cancels[i].cancel_id == cancel_id)
+			return &lmd_pending_cancels[i];
+	return NULL;
+}
+
+/*
+ * Record a pending cancel after the coordinator issued it.  Returns false when
+ * the table is full — the caller keeps the cancel fire-and-forget and the
+ * finite GES timeout still breaks the deadlock (degraded, never wrong).
+ */
+static LmdPendingCancel *
+lmd_pending_cancel_add(const ClusterLmdVertex *victim, uint64 cancel_id, uint64 epoch, bool local,
+					   uint64 cycle_hash, const ClusterLmdVertex *cycle, int n_cycle)
+{
+	LmdPendingCancel *p = NULL;
+	int n;
+
+	for (int i = 0; i < CLUSTER_LMD_PENDING_CANCEL_MAX; i++) {
+		if (!lmd_pending_cancels[i].active) {
+			p = &lmd_pending_cancels[i];
+			break;
+		}
+	}
+	if (p == NULL)
+		return NULL;
+
+	memset(p, 0, sizeof(*p));
+	p->active = true;
+	p->victim = *victim;
+	p->cancel_id = cancel_id;
+	p->cluster_epoch = epoch;
+	p->local = local;
+	p->attempts = 0;
+	p->next_deadline
+		= TimestampTzPlusMilliseconds(GetCurrentTimestamp(), cluster_cancel_ack_timeout_ms);
+	p->cycle_hash = cycle_hash;
+	p->escalating = false;
+	n = Min(n_cycle, CLUSTER_LMD_VICTIM_EXCLUDE_MAX);
+	if (cycle != NULL && n > 0) {
+		memcpy(p->cycle_vertices, cycle, sizeof(ClusterLmdVertex) * n);
+		p->n_cycle_vertices = n;
+	}
+	/* exclude accumulates FAILED victims (added by mark_escalating); the current
+	 * target is not excluded until it actually fails. */
+	cluster_lmd_victim_exclude_init(&p->exclude);
+	return p;
+}
+
+/*
+ * Find the active pending entry for a cycle (matched by the two-round
+ * fingerprint).  The coordinator scan uses it both to AVOID re-issuing a
+ * duplicate cancel while one is in flight, and — when it is escalating — to
+ * re-pick an alternate victim only because the SAME cycle was just re-confirmed
+ * (Rule 8.A: never escalate onto a cycle that has since self-resolved).
+ */
+static LmdPendingCancel *
+lmd_pending_cancel_find_active_by_cycle(uint64 cycle_hash)
+{
+	if (cycle_hash == 0)
+		return NULL;
+	for (int i = 0; i < CLUSTER_LMD_PENDING_CANCEL_MAX; i++) {
+		if (lmd_pending_cancels[i].active && lmd_pending_cancels[i].cycle_hash == cycle_hash)
+			return &lmd_pending_cancels[i];
+	}
+	return NULL;
+}
+
+/* Re-issue an escalating entry against a fresh alternate victim. */
+static void
+lmd_pending_cancel_reissue(LmdPendingCancel *p, const ClusterLmdVertex *victim, uint64 cancel_id,
+						   uint64 epoch, bool local)
+{
+	p->victim = *victim;
+	p->cancel_id = cancel_id;
+	p->cluster_epoch = epoch;
+	p->local = local;
+	p->attempts = 0;
+	p->escalating = false;
+	p->next_deadline
+		= TimestampTzPlusMilliseconds(GetCurrentTimestamp(), cluster_cancel_ack_timeout_ms);
+}
+
+/*
+ * spec-5.9 D7 — mark a pending cancel for escalation: its current victim could
+ * not be cancelled (HARD-skip PROTECTED, or retransmits/marker exhausted), so
+ * exclude it and wait for the next coordinator scan to re-confirm the SAME
+ * cycle and re-pick an alternate.  If the cycle is not re-confirmed by
+ * escal_deadline (it self-resolved or the coordinator drifted), the tick
+ * degrades to the finite GES timeout (8.A — never force-kill).
+ */
+static void
+lmd_pending_cancel_mark_escalating(LmdPendingCancel *p)
+{
+	(void)cluster_lmd_victim_exclude_add(&p->exclude, &p->victim);
+	p->escalating = true;
+	/* allow a couple of coordinator scan periods for the re-confirm. */
+	p->escal_deadline
+		= TimestampTzPlusMilliseconds(GetCurrentTimestamp(), 3 * cluster_lmd_global_dd_interval_ms);
+}
+
+/*
+ * spec-5.9 D6/D7 — resolve a pending cancel that cannot proceed with its
+ * current victim (retransmits exhausted, or the victim is HARD-skip PROTECTED).
+ * D6 ships the 8.A-safe fallback only: clear the entry + bump the exhausted /
+ * no-safe-victim counter + LOG-once and let the finite GES timeout break the
+ * deadlock.  spec-5.9 D7 replaces this body's first half with an alternate-
+ * victim escalation (re-confirm + pick next cancellable) ahead of the degrade.
+ */
+static void
+lmd_pending_cancel_degrade(LmdPendingCancel *p, bool protected_victim)
+{
+	if (protected_victim)
+		cluster_lmd_cancel_no_safe_victim_count_inc(1);
+	else
+		cluster_lmd_cancel_exhausted_timeout_count_inc(1);
+
+	ereport(
+		LOG,
+		(errmsg("cluster LMD cross-node deadlock cancel could not complete for victim node=%d "
+				"procno=%u request_id=" UINT64_FORMAT " (%s); degrading to the finite GES "
+				"timeout (no force-kill, Rule 8.A)",
+				p->victim.node_id, p->victim.procno, p->victim.request_id,
+				protected_victim ? "victim is unsafe-to-cancel" : "cancel retransmits exhausted")));
+	p->active = false;
+}
+
+/* React to a CANCEL_ACK (called from the spec-5.9 D5 GES handler). */
+void
+cluster_lmd_pending_cancel_on_ack(uint64 cancel_id, uint8 ack_status)
+{
+	LmdPendingCancel *p = lmd_pending_cancel_find_by_cancel_id(cancel_id);
+
+	if (p == NULL)
+		return; /* stale / already cleared (idempotent) */
+
+	switch (ack_status) {
+	case GES_CANCEL_ACK_CONSUMED:
+		/* The victim matched the token and is aborting — done. */
+		p->active = false;
+		break;
+	case GES_CANCEL_ACK_NOT_WAITING:
+	case GES_CANCEL_ACK_STALE_EPOCH:
+		/* Victim already left the wait / epoch drifted — clear; the next
+			 * scan re-detects if the deadlock truly persists (C4 re-probe). */
+		p->active = false;
+		break;
+	case GES_CANCEL_ACK_QUEUE_BUSY:
+		/* The victim node's cancel queue was full — retransmit next tick. */
+		p->next_deadline = GetCurrentTimestamp();
+		break;
+	case GES_CANCEL_ACK_PROTECTED:
+		/* HARD-skip (unsafe-to-cancel) victim — exclude it and escalate to an
+			 * alternate on the next re-confirming scan (D7); never force-kill. */
+		lmd_pending_cancel_mark_escalating(p);
+		break;
+	case GES_CANCEL_ACK_INSTALLED:
+	default:
+		/* Token installed; keep the entry pending awaiting CONSUMED. */
+		break;
+	}
+}
+
+/* Observe a LOCAL victim's consume marker (same node — no wire ACK). */
+static void
+lmd_pending_cancel_check_local(LmdPendingCancel *p)
+{
+	PGPROC *target;
+	ClusterCancelMarker m;
+	uint64 marker_cancel_id = 0;
+	uint64 marker_seq = 0;
+
+	if (p->victim.procno >= (uint32)ProcGlobal->allProcCount)
+		return;
+	target = &ProcGlobal->allProcs[p->victim.procno];
+	m = cluster_cancel_token_take_marker(target, &marker_cancel_id, &marker_seq);
+
+	if (m != CLUSTER_CANCEL_MARKER_NONE && marker_cancel_id == p->cancel_id) {
+		if (m == CLUSTER_CANCEL_MARKER_PROTECTED)
+			/* HARD-skip victim refused — escalate to an alternate (D7). */
+			lmd_pending_cancel_mark_escalating(p);
+		else
+			/* CONSUMED => aborting; STALE_CLEARED => left the wait (re-detect). */
+			p->active = false;
+		return;
+	}
+
+	/* No matching marker yet — give the backend until the deadline, then escalate
+	 * to an alternate (the victim is not consuming the local signal). */
+	if (GetCurrentTimestamp() >= p->next_deadline)
+		lmd_pending_cancel_mark_escalating(p);
+}
+
+/* Retransmit a remote victim's cancel (idempotent — same cancel_id + wait_seq). */
+static void
+lmd_pending_cancel_retransmit(LmdPendingCancel *p)
+{
+	ClusterGrdHolderId victim_target;
+
+	victim_target.node_id = (uint32)p->victim.node_id;
+	victim_target.procno = p->victim.procno;
+	victim_target.cluster_epoch = p->victim.cluster_epoch;
+	victim_target.request_id = p->victim.request_id;
+	cluster_ges_send_cancel_pending(p->victim.node_id, &victim_target, p->victim.wait_seq,
+									p->cancel_id);
+	cluster_lmd_cancel_retransmit_count_inc(1);
+}
+
+/*
+ * LMD tick — advance every pending cancel.  Called once per LMD loop iteration
+ * (only meaningful on the coordinator; non-coordinators never add entries).
+ */
+void
+cluster_lmd_pending_cancel_tick(void)
+{
+	TimestampTz now = GetCurrentTimestamp();
+	uint64 cur_epoch = cluster_epoch_get_current();
+
+	for (int i = 0; i < CLUSTER_LMD_PENDING_CANCEL_MAX; i++) {
+		LmdPendingCancel *p = &lmd_pending_cancels[i];
+
+		if (!p->active)
+			continue;
+
+		/* spec-5.9 D9 — epoch drift: discard in-flight, do NOT blind-retransmit
+		 * across a reconfig (the next scan re-detects under the new epoch). */
+		if (p->cluster_epoch != cur_epoch) {
+			p->active = false;
+			cluster_lmd_reconfig_cancel_discarded_count_inc(1);
+			continue;
+		}
+
+		/* spec-5.9 D7 — an escalating entry waits for the next coordinator scan to
+		 * re-confirm the SAME cycle and re-pick an alternate.  If no re-confirm
+		 * arrives by the deadline (the cycle self-resolved, or the coordinator
+		 * drifted), degrade to the finite GES timeout. */
+		if (p->escalating) {
+			if (now >= p->escal_deadline)
+				lmd_pending_cancel_degrade(p, false);
+			continue;
+		}
+
+		if (p->local) {
+			lmd_pending_cancel_check_local(p);
+			continue;
+		}
+
+		/* Remote victim: await CANCEL_ACK; on deadline, retransmit or escalate. */
+		if (now < p->next_deadline)
+			continue;
+		if (p->attempts < cluster_cancel_max_retransmit) {
+			lmd_pending_cancel_retransmit(p);
+			p->attempts++;
+			p->next_deadline = TimestampTzPlusMilliseconds(now, cluster_cancel_ack_timeout_ms);
+		} else {
+			lmd_pending_cancel_mark_escalating(p);
+		}
+	}
 }
 
 /*
@@ -800,6 +1196,7 @@ cluster_lmd_tarjan_run_coordinator_scan(int collect_timeout_ms)
 	int confirm_ms;
 	ClusterLmdVertex victim;
 	uint64 scan_epoch;
+	uint64 cancel_id;
 
 	if (collect_timeout_ms <= 0)
 		collect_timeout_ms = cluster_lmd_probe_collect_timeout_ms;
@@ -892,28 +1289,101 @@ cluster_lmd_tarjan_run_coordinator_scan(int collect_timeout_ms)
 	 * by the D5 per-proc wait-state revalidate at the victim's home node
 	 * (local: signal_local_victim; remote: the receiver's drain dispatch).
 	 */
-	victim = round2.victim;
-	if (victim.node_id == self_node) {
-		/* Count only a real cancel — D5 revalidate may refuse a victim that is
-		 * no longer waiting (Rule 8.A). */
-		if (cluster_lmd_signal_local_victim(victim.procno, victim.request_id, victim.cluster_epoch,
-											victim.wait_seq))
-			cluster_lmd_victim_cancel_sent_count_inc(1);
-	} else {
-		ClusterGrdHolderId victim_target;
+	victim = round2.victim; /* deterministic youngest */
 
-		victim_target.node_id = (uint32)victim.node_id;
-		victim_target.procno = victim.procno;
-		victim_target.cluster_epoch = victim.cluster_epoch;
-		victim_target.request_id = victim.request_id;
+	/*
+	 * spec-5.9 D6/D7 — pending-cancel coordination for this confirmed cycle:
+	 *  - if a cancel for THIS exact cycle is already in flight (active, not
+	 *    escalating), do nothing this scan — let it complete (no double-issue);
+	 *  - if a pending entry is ESCALATING (its prior victim could not be
+	 *    cancelled: HARD-skip PROTECTED / unresponsive), re-pick an alternate
+	 *    excluding the failed victims.  The re-pick is safe precisely because the
+	 *    two-round confirm just re-proved the SAME cycle (cycle_hash) still
+	 *    exists (Rule 8.A — never escalate onto a self-resolved cycle);
+	 *  - spec-5.9 D2 anti-thrash additionally excludes the youngest if it was
+	 *    re-selected within victim_repeat_window_ms (livelock symptom).
+	 * If every cycle member is excluded -> no safe victim -> degrade to the
+	 * finite GES timeout (Rule 8.A — never force-kill).
+	 */
+	{
+		LmdPendingCancel *esc = lmd_pending_cancel_find_active_by_cycle(round2.cycle_hash);
+		LmdVictimExcludeSet exclude;
+		ClusterLmdVertex picked;
+		bool thrash;
+		bool changed;
 
-		/* spec-5.8 D1e — echo the victim's wait_seq for the remote node's D5
-		 * ABA revalidate. */
-		cluster_ges_send_cancel_pending(victim.node_id, &victim_target, victim.wait_seq);
-		ereport(LOG, (errmsg("cluster LMD cross-node deadlock confirmed (victim node=%d procno=%u "
-							 "request_id=" UINT64_FORMAT "); cancel forwarded via "
-							 "CLUSTER_GRD_OUTBOUND_LMD_CANCEL",
-							 victim.node_id, victim.procno, victim.request_id)));
+		if (esc != NULL && !esc->escalating)
+			return; /* a cancel for this cycle is in flight — let it complete */
+
+		cluster_lmd_victim_exclude_init(&exclude);
+		if (esc != NULL)
+			memcpy(&exclude, &esc->exclude, sizeof(exclude));
+		thrash = (esc == NULL && round2.n_cycle_vertices > 1
+				  && cluster_lmd_recent_victim_is_thrashing(&victim));
+		if (thrash)
+			(void)cluster_lmd_victim_exclude_add(&exclude, &victim);
+
+		if (!cluster_lmd_tarjan_pick_victim(round2.cycle_vertices, round2.n_cycle_vertices,
+											&exclude, &picked)) {
+			cluster_lmd_cancel_no_safe_victim_count_inc(1);
+			ereport(LOG,
+					(errmsg("cluster LMD cross-node deadlock has no cancellable victim (all "
+							"unsafe-to-cancel / exhausted); degrading to the finite GES timeout "
+							"(no force-kill, Rule 8.A)")));
+			if (esc != NULL)
+				esc->active = false;
+			return;
+		}
+
+		changed = (picked.node_id != victim.node_id || picked.procno != victim.procno
+				   || picked.cluster_epoch != victim.cluster_epoch
+				   || picked.request_id != victim.request_id);
+		if (esc != NULL && changed)
+			cluster_lmd_cancel_escalated_alternate_count_inc(1);
+		else if (thrash && changed)
+			cluster_lmd_victim_repeat_avoided_count_inc(1);
+		victim = picked;
+		cluster_lmd_recent_victim_record(&victim);
+
+		/* One cancel_id per issued cancel, threaded through the token / CANCEL_
+		 * WAIT / CANCEL_ACK for correlation (spec-5.9 D3/D5). */
+		cancel_id = lmd_next_cancel_id();
+
+		if (victim.node_id == self_node) {
+			/* Count only a real cancel — D5 revalidate may refuse a victim that
+			 * is no longer waiting (Rule 8.A). */
+			if (cluster_lmd_signal_local_victim(victim.procno, victim.request_id,
+												victim.cluster_epoch, victim.wait_seq, cancel_id)) {
+				cluster_lmd_victim_cancel_sent_count_inc(1);
+				if (esc != NULL)
+					lmd_pending_cancel_reissue(esc, &victim, cancel_id, scan_epoch, true);
+				else
+					(void)lmd_pending_cancel_add(&victim, cancel_id, scan_epoch, true,
+												 round2.cycle_hash, round2.cycle_vertices,
+												 round2.n_cycle_vertices);
+			}
+		} else {
+			ClusterGrdHolderId victim_target;
+
+			victim_target.node_id = (uint32)victim.node_id;
+			victim_target.procno = victim.procno;
+			victim_target.cluster_epoch = victim.cluster_epoch;
+			victim_target.request_id = victim.request_id;
+
+			/* spec-5.8 D1e — echo wait_seq for the remote node's D5 ABA
+			 * revalidate; spec-5.9 D5 — carry cancel_id for the CANCEL_ACK. */
+			cluster_ges_send_cancel_pending(victim.node_id, &victim_target, victim.wait_seq,
+											cancel_id);
+			if (esc != NULL)
+				lmd_pending_cancel_reissue(esc, &victim, cancel_id, scan_epoch, false);
+			else
+				(void)lmd_pending_cancel_add(&victim, cancel_id, scan_epoch, false,
+											 round2.cycle_hash, round2.cycle_vertices,
+											 round2.n_cycle_vertices);
+			ereport(LOG, (errmsg("cluster LMD cross-node deadlock confirmed (victim node=%d "
+								 "procno=%u request_id=" UINT64_FORMAT "); cancel forwarded",
+								 victim.node_id, victim.procno, victim.request_id)));
+		}
 	}
 }
 
@@ -935,7 +1405,7 @@ cluster_lmd_tarjan_run_coordinator_scan(int collect_timeout_ms)
  */
 bool
 cluster_lmd_signal_local_victim(uint32 procno, uint64 request_id, uint64 cluster_epoch,
-								uint64 wait_seq)
+								uint64 wait_seq, uint64 cancel_id)
 {
 	PGPROC *target;
 	pid_t target_pid;
@@ -987,9 +1457,21 @@ cluster_lmd_signal_local_victim(uint32 procno, uint64 request_id, uint64 cluster
 		return false;
 	}
 
+	/*
+	 * spec-5.9 D3 — install the per-proc cancel token BEFORE the signal, with a
+	 * write barrier so the token is visible to the victim by the time it sees
+	 * the signal flag.  The backend honors the cancel only if the token still
+	 * matches its live wait-state (request_id + cluster_epoch + wait_seq), so a
+	 * signal that races a grant/timeout + slot reuse cannot kill the wrong
+	 * transaction (Rule 8.A P0#1).  The handler stays flag-only (async-safe).
+	 */
+	cluster_cancel_token_install(target, request_id, cluster_epoch, wait_seq, cancel_id);
+	pg_write_barrier();
+
 	(void)SendProcSignal(target_pid, PROCSIG_CLUSTER_GES_CANCEL, target_backendid);
-	ereport(DEBUG1, (errmsg("cluster LMD sent PROCSIG_CLUSTER_GES_CANCEL to "
-							"procno=%u pid=%d backendid=%d (deadlock victim)",
-							procno, (int)target_pid, target_backendid)));
+	ereport(DEBUG1,
+			(errmsg("cluster LMD sent PROCSIG_CLUSTER_GES_CANCEL to "
+					"procno=%u pid=%d backendid=%d cancel_id=" UINT64_FORMAT " (deadlock victim)",
+					procno, (int)target_pid, target_backendid, cancel_id)));
 	return true;
 }

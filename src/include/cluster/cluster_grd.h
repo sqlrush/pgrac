@@ -925,6 +925,21 @@ extern ClusterGrdEntryResult cluster_grd_cancel_reservation_by_id(const ClusterR
 extern ClusterGrdEntryResult cluster_grd_cancel_waiter_by_id(const ClusterResId *resid,
 															 const ClusterGrdHolderId *holder);
 
+/*
+ * spec-5.9 D4 — wait_seq-exact dequeue primitives for the CANCEL_WAIT path.
+ * cancel_waiter_by_id_seq removes a queued REQUEST waiter only when its 4-tuple
+ * AND spec-5.8 wait_seq match (ABA guard against slot reuse);
+ * cancel_convert_by_id is the new convert-queue equivalent (key = node_id,
+ * procno, cluster_epoch, convert_request_id, wait_seq).  Both return NOT_FOUND
+ * on any mismatch and touch only waiters[]/converts[], never a granted holder.
+ */
+extern ClusterGrdEntryResult cluster_grd_cancel_waiter_by_id_seq(const ClusterResId *resid,
+																 const ClusterGrdHolderId *holder,
+																 uint64 wait_seq);
+extern ClusterGrdEntryResult cluster_grd_cancel_convert_by_id(const ClusterResId *resid,
+															  const ClusterGrdHolderId *holder,
+															  uint64 wait_seq);
+
 /* ============================================================
  * spec-2.23 D6 — GRD-owned grant / waiter-pop API.
  *

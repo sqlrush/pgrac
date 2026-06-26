@@ -42,6 +42,7 @@
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_lmd.h"				 /* cluster_lmd_is_ready */
 #include "cluster/cluster_lmd_probe_collector.h" /* spec-5.8 D8 — shmem REPORT collect_receive */
+#include "cluster/cluster_cancel_token.h"		 /* spec-5.9 D3 cluster_cancel_token_consume */
 #include "cluster/cluster_signal.h"				 /* spec-5.8 D8 — cluster_ges_cancel_pending */
 #include "cluster/cluster_ges_dedup.h"			 /* spec-2.27 D2 / D3 — retransmit dedup */
 #include "cluster/cluster_lms.h"
@@ -354,6 +355,68 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 		cluster_grd_inc_deadlock_probe_drop();
 		return;
 	}
+	if (opcode == GES_REQ_OPCODE_CANCEL_WAIT) {
+		const GesCancelWaitPayload *cw;
+		ClusterResId resid;
+		ClusterGrdHolderId waiter;
+		ClusterGrdEntryResult er;
+
+		/*
+		 * spec-5.9 D4 — dedicated 64B payload, early-dispatched so it never hits
+		 * the generic GesRequestPayload cast.  No payload-node validation: the
+		 * frame names a WAITER (the victim), which can live on a node different
+		 * from both this resource master and the sender (the coordinator may
+		 * retransmit on the victim's behalf).  Correctness rests on the
+		 * wait_seq-exact match inside the primitive — a wrong-master / stale frame
+		 * simply finds no matching waiter and returns NOT_FOUND (fail-safe; the
+		 * IC layer already authenticated the sender envelope).
+		 */
+		if (env->payload_length != sizeof(GesCancelWaitPayload)) {
+			cluster_grd_inc_ges_inbound_validation_fail();
+			return;
+		}
+		cw = (const GesCancelWaitPayload *)payload;
+
+		memcpy(&resid, cw->resid, sizeof(resid));
+		waiter.node_id = cw->waiter_node_id;
+		waiter.procno = cw->waiter_procno;
+		waiter.cluster_epoch = cw->waiter_cluster_epoch;
+		waiter.request_id = cw->waiter_request_id;
+
+		if (cw->kind == GES_CANCEL_WAIT_KIND_CONVERT)
+			er = cluster_grd_cancel_convert_by_id(&resid, &waiter, cw->wait_seq);
+		else
+			er = cluster_grd_cancel_waiter_by_id_seq(&resid, &waiter, cw->wait_seq);
+
+		/* NOT_FOUND => the named waiter is gone or its wait_seq no longer matches
+		 * (stale / retransmitted CANCEL_WAIT after slot reuse) — never dequeue a
+		 * since-reused identity (Rule 8.A P0#2). */
+		if (er != CLUSTER_GRD_ENTRY_OK)
+			cluster_lmd_cancel_wait_stale_rejected_count_inc(1);
+
+		/* spec-5.9 D5 — the correlated CANCEL_ACK back to the sender lands here
+		 * (cancel_id is carried on the wire for that purpose). */
+		return;
+	}
+	if (opcode == GES_REQ_OPCODE_CANCEL_ACK) {
+		const GesCancelAckPayload *ack;
+
+		if (env->payload_length != sizeof(GesCancelAckPayload)) {
+			cluster_grd_inc_ges_inbound_validation_fail();
+			return;
+		}
+		ack = (const GesCancelAckPayload *)payload;
+		cluster_lmd_cancel_ack_received_count_inc(1);
+		/*
+		 * spec-5.9 D6 — this runs in the LMON dispatch context, but the
+		 * coordinator's pending-cancel table is owned by the LMD process.  Route
+		 * the ACK to LMD through the LMD-owned cancel queue (the same hand-off
+		 * CANCEL_PENDING uses); LMD's drain reacts per ack_status.  Loss here only
+		 * costs the coordinator one extra retransmit / the finite timeout.
+		 */
+		(void)cluster_lmd_cancel_queue_enqueue(env->source_node_id, ack, sizeof(*ack));
+		return;
+	}
 	if (opcode == GES_REQ_OPCODE_DEADLOCK_REPORT) {
 		const GesDeadlockReportHeader *report;
 		uint64 accepted_epoch;
@@ -545,8 +608,26 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 		}
 		if (cluster_lmd_cancel_queue_enqueue(env->source_node_id, req, sizeof(*req)))
 			cluster_lmd_cross_node_cancel_received_count_inc(1);
-		else
+		else {
+			/*
+			 * spec-5.9 D5 C2 — the LMD cancel queue is full and the dispatch path
+			 * (which would otherwise ACK) is unreachable here, so the handler
+			 * itself replies QUEUE_BUSY.  The coordinator backs off + retransmits
+			 * instead of silently losing the cancel (F0-8).
+			 */
+			ClusterGrdHolderId victim;
+			uint64 cancel_id = ((uint64)req->resid[0]) | (((uint64)req->resid[1]) << 32);
+
 			cluster_lmd_cross_node_cancel_queue_full_count_inc(1);
+			victim.node_id = req->holder_node_id;
+			victim.procno = req->holder_procno;
+			victim.cluster_epoch = ((uint64)req->holder_cluster_epoch_lo)
+								   | (((uint64)req->holder_cluster_epoch_hi) << 32);
+			victim.request_id
+				= ((uint64)req->holder_request_id_lo) | (((uint64)req->holder_request_id_hi) << 32);
+			cluster_ges_send_cancel_ack((int32)env->source_node_id, &victim, req->wait_seq,
+										cancel_id, GES_CANCEL_ACK_QUEUE_BUSY);
+		}
 		return;
 	}
 	case GES_REQ_OPCODE_REQUEST:
@@ -561,6 +642,8 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 	case GES_REQ_OPCODE_NATIVE_LOCK_PROBE:
 	case GES_REQ_OPCODE_NATIVE_LOCK_PROBE_REPLY:
 	case GES_REQ_OPCODE_PRIORITY_BOOST:
+	case GES_REQ_OPCODE_CANCEL_WAIT:	/* spec-5.9 D4 — early-dispatched above */
+	case GES_REQ_OPCODE_CANCEL_ACK:		/* spec-5.9 D5 — early-dispatched above */
 	case GES_REQ_OPCODE_REDECLARE_DONE: /* handled + returned above */
 		/*
 			 * spec-2.25 D6:  these opcodes use dedicated payload structs +
@@ -1392,6 +1475,10 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 		ClusterGrdGrantAction action;
 		bool conditional = (send_opcode == GES_REQ_OPCODE_REQUEST_NOWAIT);
 		volatile bool timed_out = false; /* set in PG_TRY, read after — must be volatile */
+		/* spec-5.9 D3 — set in PG_TRY when a matching cancel token is consumed;
+		 * read after PG_END_TRY (returning from inside PG_TRY corrupts the
+		 * exception stack).  Volatile for the same reason as timed_out. */
+		volatile bool is_victim = false;
 
 		master_gen = cluster_lms_get_shard_master_generation();
 		/* spec-5.5 D5 — local-master try-lock: conditional grant, never enqueue. */
@@ -1461,13 +1548,19 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 			while (!entry->ready) {
 				int sleep_ms = 1000;
 
-				/* spec-5.8 D8 — the LMD coordinator chose this backend as a
-				 * cross-node deadlock victim (PROCSIG set cluster_ges_cancel_
-				 * pending).  Break out of the wait; the flag stays set and is
-				 * honored after PG_END_TRY (returning from inside PG_TRY would
-				 * corrupt the exception stack). */
-				if (cluster_ges_cancel_pending)
+				/* spec-5.9 D3 — the LMD coordinator chose this backend as a
+				 * cross-node deadlock victim.  Honor the cancel ONLY when the
+				 * installed token matches this backend's live wait-state; a
+				 * stale/late signal is cleared by consume() and we keep waiting
+				 * (Rule 8.A P0#1 — never break the wait for a cancel we are not
+				 * the subject of, which would mis-treat a non-grant as granted).
+				 * On a match, remember it and break; the honor (return) happens
+				 * after PG_END_TRY (returning from inside PG_TRY would corrupt the
+				 * exception stack). */
+				if (cluster_cancel_token_consume()) {
+					is_victim = true;
 					break;
+				}
 
 				if (!perpetual) {
 					TimestampTz now = GetCurrentTimestamp();
@@ -1502,11 +1595,10 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 		PG_END_TRY();
 		ConditionVariableCancelSleep();
 
-		/* spec-5.8 D8 — deadlock victim (flag set mid-wait):  drop the queued
-		 * waiter + reply-wait entry and fail closed as a deadlock so lock.c
-		 * ereports 40P01. */
-		if (cluster_ges_cancel_pending) {
-			cluster_ges_cancel_pending = false;
+		/* spec-5.9 D3 — deadlock victim (matching token consumed mid-wait): drop
+		 * the queued waiter + reply-wait entry and fail closed as a deadlock so
+		 * lock.c ereports 40P01. */
+		if (is_victim) {
 			cluster_ges_reply_wait_delete(&key);
 			(void)cluster_grd_cancel_waiter_by_id(resid, holder);
 			return GES_REJECT_REASON_DEADLOCK_VICTIM;
@@ -1645,15 +1737,22 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 									 master, request_id)));
 			return GES_REJECT_REASON_MASTER_DEAD_NATIVE;
 		}
-		/* spec-5.8 D8 — cross-node deadlock victim (PROCSIG set the flag mid
-		 * wait): drop the reply-wait entry and fail closed as a deadlock so
-		 * lock.c ereports 40P01 instead of waiting out the finite timeout.
-		 * (rebase: coexists with spec-5.7's dead-master-native abort above;
-		 * independent guards.) */
-		if (cluster_ges_cancel_pending) {
-			cluster_ges_cancel_pending = false;
+		/* spec-5.9 D3 — cross-node deadlock victim: honor the cancel ONLY when the
+		 * installed token matches this backend's live wait-state (a stale/late
+		 * signal is cleared and we keep waiting, Rule 8.A P0#1).  Match -> drop
+		 * the reply-wait entry + fail closed as a deadlock so lock.c ereports
+		 * 40P01 instead of waiting out the finite timeout.  (rebase: coexists
+		 * with spec-5.7's dead-master-native abort above; independent guards.) */
+		if (cluster_cancel_token_consume()) {
 			cluster_ges_reply_wait_delete(&key);
 			ConditionVariableCancelSleep();
+			/* spec-5.9 D8 — drop our queued waiter on the REMOTE master (this is
+			 * the remote-master wait loop; the victim's abort LockReleaseAll
+			 * releases held locks, not a queued GES waiter — without this the
+			 * master-side waiter + WFG edge leak until the master's revalidate
+			 * filters them).  wait_seq-exact, so a stale frame is rejected. */
+			cluster_ges_send_cancel_wait(master, resid, holder, ges_local_wait_seq(), 0,
+										 GES_CANCEL_WAIT_KIND_REQUEST);
 			return GES_REJECT_REASON_DEADLOCK_VICTIM;
 		}
 
@@ -1898,11 +1997,11 @@ cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 			int sleep_ms;
 			long remaining_ms;
 
-			/* spec-5.8 D8 — cross-node deadlock victim chosen while blocked in
-			 * this CONVERT wait: fail closed as a deadlock (40P01) rather than
-			 * waiting out the finite timeout. */
-			if (cluster_ges_cancel_pending) {
-				cluster_ges_cancel_pending = false;
+			/* spec-5.9 D3 — cross-node deadlock victim chosen while blocked in
+			 * this CONVERT wait: honor only on a matching token (8.A P0#1), then
+			 * fail closed as a deadlock (40P01) rather than waiting out the
+			 * finite timeout. */
+			if (cluster_cancel_token_consume()) {
 				cluster_ges_reply_wait_delete(&key);
 				ConditionVariableCancelSleep();
 				return GES_REJECT_REASON_DEADLOCK_VICTIM;
@@ -2080,10 +2179,10 @@ cluster_ges_send_convert_and_wait(const struct ClusterResId *resid, uint32 reque
 		TimestampTz now = GetCurrentTimestamp();
 		long remaining_ms;
 
-		/* spec-5.8 D8 — cross-node deadlock victim chosen while blocked in this
-		 * CONVERT wait: fail closed as a deadlock (40P01). */
-		if (cluster_ges_cancel_pending) {
-			cluster_ges_cancel_pending = false;
+		/* spec-5.9 D3 — cross-node deadlock victim chosen while blocked in this
+		 * CONVERT wait: honor only on a matching token (8.A P0#1), then fail
+		 * closed as a deadlock (40P01). */
+		if (cluster_cancel_token_consume()) {
 			cluster_ges_reply_wait_delete(&key);
 			ConditionVariableCancelSleep();
 			return GES_REJECT_REASON_DEADLOCK_VICTIM;
@@ -2268,7 +2367,8 @@ cluster_ges_send_bast_targeted(const struct ClusterResId *resid, int requested_m
  * ============================================================ */
 void
 cluster_ges_send_cancel_pending(int32 victim_node_id,
-								const struct ClusterGrdHolderId *victim_target, uint64 wait_seq)
+								const struct ClusterGrdHolderId *victim_target, uint64 wait_seq,
+								uint64 cancel_id)
 {
 	GesRequestPayload payload;
 
@@ -2285,11 +2385,83 @@ cluster_ges_send_cancel_pending(int32 victim_node_id,
 	payload.holder_request_id_lo = (uint32)(victim_target->request_id & 0xffffffffu);
 	payload.holder_request_id_hi = (uint32)(victim_target->request_id >> 32);
 	/* spec-5.8 D1e — echo the victim's wait_seq so its node's D5 revalidate can
-	 * ABA-match it against the live D1d wait-state.  resid stays zero. */
+	 * ABA-match it against the live D1d wait-state. */
 	payload.wait_seq = wait_seq;
+	/* spec-5.9 D5 — CANCEL_PENDING does not use resid (it targets a holder
+	 * 4-tuple, not a resource), so pack the coordinator's cancel_id into the
+	 * unused resid[0..1] for the victim node to echo back in the CANCEL_ACK (no
+	 * payload growth, no extra catversion). */
+	payload.resid[0] = (uint32)(cancel_id & 0xffffffffu);
+	payload.resid[1] = (uint32)(cancel_id >> 32);
 
 	cluster_grd_outbound_enqueue_lmd_cancel((uint32)victim_node_id, &payload, sizeof(payload));
 	cluster_lmd_cross_node_victim_cancel_sent_count_inc(1);
+}
+
+
+/* ============================================================
+ * spec-5.9 D4 — CANCEL_WAIT sender (remote-master waiter dequeue).
+ *
+ *	A deadlock victim whose resource master is a REMOTE node tells that master
+ *	to remove its queued waiter / convert by exact identity + wait_seq.  Routes
+ *	through the reliable CLUSTER_GRD_OUTBOUND_LMD_CANCEL origin (loss => a leaked
+ *	master-side WFG edge, so it must not silently drop).  The 64B payload fits
+ *	the 72B outbound ring slot.  Local-master victims call
+ *	cluster_grd_cancel_waiter_by_id_seq / _convert_by_id directly instead.
+ * ============================================================ */
+void
+cluster_ges_send_cancel_wait(int32 master_node_id, const ClusterResId *resid,
+							 const struct ClusterGrdHolderId *waiter, uint64 wait_seq,
+							 uint64 cancel_id, uint8 kind)
+{
+	GesCancelWaitPayload payload;
+
+	if (resid == NULL || waiter == NULL || master_node_id < 0)
+		return;
+
+	memset(&payload, 0, sizeof(payload));
+	payload.opcode = GES_REQ_OPCODE_CANCEL_WAIT;
+	payload.kind = kind;
+	payload.waiter_node_id = (uint32)waiter->node_id;
+	payload.waiter_procno = waiter->procno;
+	payload.waiter_cluster_epoch = waiter->cluster_epoch;
+	payload.waiter_request_id = waiter->request_id;
+	payload.wait_seq = wait_seq;
+	payload.cancel_id = cancel_id;
+	memcpy(payload.resid, resid, sizeof(payload.resid));
+
+	cluster_grd_outbound_enqueue_lmd_cancel((uint32)master_node_id, &payload, sizeof(payload));
+}
+
+
+/* ============================================================
+ * spec-5.9 D5 — CANCEL_ACK sender (victim node -> coordinator).
+ *
+ *	Reports the outcome of a cross-node cancel so the coordinator's pending-
+ *	cancel table can react (clear / retransmit / escalate) instead of waiting
+ *	out a timeout.  Reliable outbound origin (a lost ACK only costs the
+ *	coordinator one timeout + retransmit, never a wrong cancel).  48B payload.
+ * ============================================================ */
+void
+cluster_ges_send_cancel_ack(int32 coordinator_node_id, const struct ClusterGrdHolderId *victim,
+							uint64 wait_seq, uint64 cancel_id, uint8 ack_status)
+{
+	GesCancelAckPayload payload;
+
+	if (victim == NULL || coordinator_node_id < 0)
+		return;
+
+	memset(&payload, 0, sizeof(payload));
+	payload.opcode = GES_REQ_OPCODE_CANCEL_ACK;
+	payload.ack_status = ack_status;
+	payload.victim_node_id = (uint32)victim->node_id;
+	payload.victim_procno = victim->procno;
+	payload.victim_cluster_epoch = victim->cluster_epoch;
+	payload.victim_request_id = victim->request_id;
+	payload.wait_seq = wait_seq;
+	payload.cancel_id = cancel_id;
+
+	cluster_grd_outbound_enqueue_lmd_cancel((uint32)coordinator_node_id, &payload, sizeof(payload));
 }
 
 

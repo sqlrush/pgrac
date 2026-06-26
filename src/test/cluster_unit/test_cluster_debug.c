@@ -3026,6 +3026,72 @@ cluster_lmd_reconfig_discard_count_get(void)
 {
 	return 0;
 }
+/* spec-5.9 D10 stub — 13 NEW victim-policy + cancel-robustness counters. */
+uint64
+cluster_lmd_victim_protected_skip_count_get(void)
+{
+	return 0;
+}
+uint64
+cluster_lmd_victim_repeat_avoided_count_get(void)
+{
+	return 0;
+}
+uint64
+cluster_lmd_cancel_token_installed_count_get(void)
+{
+	return 0;
+}
+uint64
+cluster_lmd_cancel_consumed_count_get(void)
+{
+	return 0;
+}
+uint64
+cluster_lmd_cancel_stale_cleared_count_get(void)
+{
+	return 0;
+}
+uint64
+cluster_lmd_cancel_wait_stale_rejected_count_get(void)
+{
+	return 0;
+}
+uint64
+cluster_lmd_cancel_ack_received_count_get(void)
+{
+	return 0;
+}
+uint64
+cluster_lmd_cancel_retransmit_count_get(void)
+{
+	return 0;
+}
+uint64
+cluster_lmd_cancel_escalated_alternate_count_get(void)
+{
+	return 0;
+}
+uint64
+cluster_lmd_cancel_exhausted_timeout_count_get(void)
+{
+	return 0;
+}
+uint64
+cluster_lmd_cancel_no_safe_victim_count_get(void)
+{
+	return 0;
+}
+uint64
+cluster_lmd_cleanup_orphan_edge_swept_count_get(void)
+{
+	return 0;
+}
+uint64
+cluster_lmd_reconfig_cancel_discarded_count_get(void)
+{
+	return 0;
+}
 /* spec-5.8 D8 stub audit — 5 NEW shmem REPORT-collector counters. */
 uint64
 cluster_lmd_probe_report_enqueue_count_get(void)

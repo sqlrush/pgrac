@@ -290,6 +290,8 @@ InitProcGlobal(void)
 #ifdef USE_PGRAC_CLUSTER
 		/* PGRAC: spec-5.8 D1d — per-proc cluster wait-state record. */
 		cluster_lmd_wait_state_init(&(proc->cluster_lmd_wait));
+		/* PGRAC: spec-5.9 D3 — per-proc deadlock-cancel token. */
+		cluster_cancel_token_init(&(proc->cluster_cancel_token));
 #endif
 	}
 
@@ -507,6 +509,10 @@ InitProcess(void)
 		 * that reused this proc slot;  wait_seq is preserved (monotonic ABA
 		 * guard), so a stale victim tuple can never re-match. */
 		cluster_lmd_wait_state_reset(&MyProc->cluster_lmd_wait);
+		/* spec-5.9 D3 — drop any cancel token/marker left by a predecessor that
+		 * reused this proc slot (the matched-consume already refuses it, but a
+		 * clean reset removes the stale state outright). */
+		cluster_cancel_token_reset(&MyProc->cluster_cancel_token);
 	}
 #endif
 }

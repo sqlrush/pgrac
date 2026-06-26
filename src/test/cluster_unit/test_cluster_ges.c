@@ -281,6 +281,15 @@ GetTopTransactionIdIfAny(void)
 	return InvalidTransactionId;
 }
 
+/* spec-5.9 D3 stub:  the GES wait loops consume a per-proc cancel token; the
+ * token match logic is covered by test_cluster_cancel_token.  Here the fixture
+ * never installs one, so consume always reports "no cancel". */
+bool
+cluster_cancel_token_consume(void)
+{
+	return false;
+}
+
 /* spec-4.6 P0#3 stub:  REDECLARE_DONE handler records peer barrier
  * completion.  Standalone fixture has no recovery shmem; no-op. */
 void
@@ -796,6 +805,32 @@ cluster_grd_cancel_waiter_by_id(const struct ClusterResId *r pg_attribute_unused
 {
 	return CLUSTER_GRD_ENTRY_NOT_FOUND;
 }
+
+/* spec-5.9 D4 stubs — the CANCEL_WAIT handler dequeues via these; the real
+ * dequeue is covered by test_cluster_grd / the 2-node TAP. */
+ClusterGrdEntryResult
+cluster_grd_cancel_waiter_by_id_seq(const struct ClusterResId *r pg_attribute_unused(),
+									const struct ClusterGrdHolderId *h pg_attribute_unused(),
+									uint64 ws pg_attribute_unused())
+{
+	return CLUSTER_GRD_ENTRY_NOT_FOUND;
+}
+
+ClusterGrdEntryResult
+cluster_grd_cancel_convert_by_id(const struct ClusterResId *r pg_attribute_unused(),
+								 const struct ClusterGrdHolderId *h pg_attribute_unused(),
+								 uint64 ws pg_attribute_unused())
+{
+	return CLUSTER_GRD_ENTRY_NOT_FOUND;
+}
+
+void
+cluster_lmd_cancel_wait_stale_rejected_count_inc(uint64 d pg_attribute_unused())
+{}
+
+void
+cluster_lmd_cancel_ack_received_count_inc(uint64 d pg_attribute_unused())
+{}
 
 /* GUC + PG runtime stubs. */
 int cluster_ges_request_timeout_ms = 60000;

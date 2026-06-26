@@ -60,14 +60,15 @@
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_native_lock_probe.h"
-#include "cluster/cluster_signal.h" /* cluster_ges_cancel_pending sig_atomic_t */
-#include "storage/latch.h"			/* spec-4.6 D4 — freeze-gate WaitLatch */
-#include "storage/lock.h"			/* spec-4.6 D3 — LOCALLOCK + GetLockMethodLocalHash */
-#include "utils/hsearch.h"			/* spec-4.6 D3 — hash_seq over LocalLockHash */
-#include "utils/wait_event.h"		/* spec-4.6 D4 — ClusterGrdShardRemaster */
-#include "access/htup_details.h"	/* GETSTRUCT */
-#include "access/xact.h"			/* GetTopTransactionIdIfAny */
-#include "catalog/pg_class.h"		/* Form_pg_class for HC25 relpersistence */
+#include "cluster/cluster_cancel_token.h" /* spec-5.9 D3 cluster_cancel_token_consume */
+#include "cluster/cluster_signal.h"		  /* cluster_ges_cancel_pending sig_atomic_t */
+#include "storage/latch.h"				  /* spec-4.6 D4 — freeze-gate WaitLatch */
+#include "storage/lock.h"				  /* spec-4.6 D3 — LOCALLOCK + GetLockMethodLocalHash */
+#include "utils/hsearch.h"				  /* spec-4.6 D3 — hash_seq over LocalLockHash */
+#include "utils/wait_event.h"			  /* spec-4.6 D4 — ClusterGrdShardRemaster */
+#include "access/htup_details.h"		  /* GETSTRUCT */
+#include "access/xact.h"				  /* GetTopTransactionIdIfAny */
+#include "catalog/pg_class.h"			  /* Form_pg_class for HC25 relpersistence */
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/lwlock.h"
@@ -678,18 +679,18 @@ cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *req)
 	ClusterLockAcquireResult r;
 
 	/*
-	 * spec-2.22 D8 — cancel flag check point (a):  seven-step top dispatch
-	 * loop entry.  PROCSIG_CLUSTER_GES_CANCEL handler set this sig_atomic_t
-	 * (L118-safe);if set,we are the deadlock victim selected by LMD
-	 * coordinator.  Reset flag,run S7 cleanup,return FAIL_DEADLOCK so
-	 * outer caller (lock.c) ereports 40P01 after cleanup.
+	 * spec-2.22 D8 / spec-5.9 D3 — cancel check point (a): seven-step top
+	 * dispatch entry.  cluster_cancel_token_consume() honors the cancel ONLY
+	 * when the installed token matches this backend's live wait-state; at the
+	 * loop top the backend is not yet waiting, so a stale / late signal (e.g.
+	 * one that raced a prior grant + slot reuse) is cleared without raising
+	 * 40P01 (Rule 8.A P0#1 — never kill the wrong transaction).  Honor => run S7
+	 * cleanup, return FAIL_DEADLOCK so lock.c ereports 40P01 after cleanup.
 	 *
-	 *	HC14 + L118 — never ereport in ProcessInterrupts handler;cleanup
-	 *	→ S7 → outer caller ereport.  P-new-2 check point (b) = future
-	 *	`cluster_ges_send_request_and_wait` real wait loop推 spec-2.23.
+	 *	HC14 + L118 — never ereport in the ProcessInterrupts handler; cleanup
+	 *	→ S7 → outer caller ereport.
 	 */
-	if (cluster_ges_cancel_pending) {
-		cluster_ges_cancel_pending = false;
+	if (cluster_cancel_token_consume()) {
 		(void)cluster_lock_acquire_s7_cleanup(req);
 		return CLUSTER_LOCK_ACQUIRE_FAIL_DEADLOCK;
 	}

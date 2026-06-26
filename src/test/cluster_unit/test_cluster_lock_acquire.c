@@ -163,6 +163,15 @@ cluster_lmd_wait_state_clear(ClusterLmdProcWaitState *ws pg_attribute_unused())
 #include <signal.h>
 volatile sig_atomic_t cluster_ges_cancel_pending = 0;
 
+/* spec-5.9 D3 — seven-step now consumes a per-proc cancel token (match logic
+ * covered by test_cluster_cancel_token).  The fixture installs none, so the
+ * seven-step top check sees "no cancel". */
+bool
+cluster_cancel_token_consume(void)
+{
+	return false;
+}
+
 /* PG-runtime xact stub — advisory locks have no xid. */
 #include "access/xact.h"
 TransactionId

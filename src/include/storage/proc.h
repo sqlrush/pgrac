@@ -17,6 +17,7 @@
 #include "access/clog.h"
 #include "access/xlogdefs.h"
 #include "cluster/cluster_lmd_wait_state.h" /* PGRAC: spec-5.8 D1d ClusterLmdProcWaitState */
+#include "cluster/cluster_cancel_token.h"	/* PGRAC: spec-5.9 D3 ClusterCancelToken */
 #include "lib/ilist.h"
 #include "storage/latch.h"
 #include "storage/lock.h"
@@ -368,6 +369,15 @@ struct PGPROC {
 	 * cluster/cluster_lmd_wait_state.h.
 	 */
 	ClusterLmdProcWaitState cluster_lmd_wait;
+
+	/*
+	 * spec-5.9 D3 — per-proc deadlock-cancel token.  The victim-node LMD
+	 * installs an identity-matched cancel here (then SendProcSignal); the owning
+	 * backend honors it only when it matches its live cluster_lmd_wait, so a
+	 * stale/retransmitted signal after slot reuse cannot kill the wrong
+	 * transaction (Rule 8.A).  See cluster/cluster_cancel_token.h.
+	 */
+	ClusterCancelToken cluster_cancel_token;
 };
 
 /* NOTE: "typedef struct PGPROC PGPROC" appears in storage/lock.h. */

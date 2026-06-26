@@ -453,6 +453,22 @@ extern void cluster_lmd_probe_partial_count_inc(uint64 delta);
  * cluster_lmd_probe_collect_receive (LMON) + arm/drain (LMD). */
 extern void cluster_lmd_tarjan_run_coordinator_scan(int collect_timeout_ms);
 
+/*
+ * spec-5.9 D6 — coordinator pending-cancel table.  tick() advances every
+ * in-flight cancel (local marker observe / remote retransmit / degrade) and is
+ * called once per LMD loop iteration; on_ack() is called from the D5 GES
+ * CANCEL_ACK handler with the echoed cancel_id + GesCancelAckStatus.
+ */
+extern void cluster_lmd_pending_cancel_tick(void);
+extern void cluster_lmd_pending_cancel_on_ack(uint64 cancel_id, uint8 ack_status);
+
+/*
+ * spec-5.9 D5 — victim-side awaiting-ack tick.  Runs on EVERY node each LMD
+ * iteration: for each cancel token this node installed for a remote coordinator,
+ * observe the backend's consume marker and send the correlated CANCEL_ACK back.
+ */
+extern void cluster_lmd_victim_ack_tick(void);
+
 /* ============================================================
  * spec-2.24 D2 — LMD-owned cancel queue (HC23).
  *
@@ -514,6 +530,59 @@ extern void cluster_lmd_deadlock_confirmed_count_inc(uint64 delta);
 extern void cluster_lmd_confirm_unconfirmed_count_inc(uint64 delta);
 extern void cluster_lmd_reconfig_discard_count_inc(uint64 delta);
 
+/* ============================================================
+ * spec-5.9 D2 — anti-thrash recent-victim ring (coordinator-local).
+ *
+ *	The deadlock coordinator runs single-threaded inside the LMD aux process,
+ *	so the ring is plain LMD-process-local state (no shmem, no lock).  On
+ *	coordinator drift (HC16) the new coordinator's LMD starts with an empty
+ *	ring — advisory only, so a cold start merely forgoes one thrash-avoidance
+ *	(RC3 stateless takeover, never a correctness issue).
+ *
+ *	is_thrashing(v): true iff v's 4-tuple was recorded as a chosen victim
+ *	within cluster.victim_repeat_window_ms — a livelock symptom (the same young
+ *	txn keeps being re-selected and re-deadlocking).  record(v): note v as
+ *	just-chosen.  Both advisory: when set, the coordinator tries an
+ *	exclude-based alternate but falls back to the youngest if none exists
+ *	(deadlock must always resolve > anti-thrash).
+ * ============================================================ */
+#define CLUSTER_LMD_RECENT_VICTIM_DEPTH 16
+
+extern bool cluster_lmd_recent_victim_is_thrashing(const ClusterLmdVertex *victim);
+extern void cluster_lmd_recent_victim_record(const ClusterLmdVertex *victim);
+extern void cluster_lmd_recent_victim_ring_reset(void); /* test hook */
+
+/* ============================================================
+ * spec-5.9 D10 — robustness counters (added up-front so D1-D9 code can
+ * reference them in one shmem-size change;  dumped via cluster_debug 'lmd').
+ * ============================================================ */
+extern uint64 cluster_lmd_victim_protected_skip_count_get(void);
+extern uint64 cluster_lmd_victim_repeat_avoided_count_get(void);
+extern uint64 cluster_lmd_cancel_token_installed_count_get(void);
+extern uint64 cluster_lmd_cancel_consumed_count_get(void);
+extern uint64 cluster_lmd_cancel_stale_cleared_count_get(void);
+extern uint64 cluster_lmd_cancel_wait_stale_rejected_count_get(void);
+extern uint64 cluster_lmd_cancel_ack_received_count_get(void);
+extern uint64 cluster_lmd_cancel_retransmit_count_get(void);
+extern uint64 cluster_lmd_cancel_escalated_alternate_count_get(void);
+extern uint64 cluster_lmd_cancel_exhausted_timeout_count_get(void);
+extern uint64 cluster_lmd_cancel_no_safe_victim_count_get(void);
+extern uint64 cluster_lmd_cleanup_orphan_edge_swept_count_get(void);
+extern uint64 cluster_lmd_reconfig_cancel_discarded_count_get(void);
+extern void cluster_lmd_victim_protected_skip_count_inc(uint64 delta);
+extern void cluster_lmd_victim_repeat_avoided_count_inc(uint64 delta);
+extern void cluster_lmd_cancel_token_installed_count_inc(uint64 delta);
+extern void cluster_lmd_cancel_consumed_count_inc(uint64 delta);
+extern void cluster_lmd_cancel_stale_cleared_count_inc(uint64 delta);
+extern void cluster_lmd_cancel_wait_stale_rejected_count_inc(uint64 delta);
+extern void cluster_lmd_cancel_ack_received_count_inc(uint64 delta);
+extern void cluster_lmd_cancel_retransmit_count_inc(uint64 delta);
+extern void cluster_lmd_cancel_escalated_alternate_count_inc(uint64 delta);
+extern void cluster_lmd_cancel_exhausted_timeout_count_inc(uint64 delta);
+extern void cluster_lmd_cancel_no_safe_victim_count_inc(uint64 delta);
+extern void cluster_lmd_cleanup_orphan_edge_swept_count_inc(uint64 delta);
+extern void cluster_lmd_reconfig_cancel_discarded_count_inc(uint64 delta);
+
 /* D16 test-only injection helper (also surfaced via SQL SRF). */
 extern bool cluster_lmd_inject_wait_edge(const ClusterLmdVertex *waiter,
 										 const ClusterLmdVertex *blocker);
@@ -535,7 +604,43 @@ extern int cluster_lmd_graph_snapshot_copy(ClusterLmdWaitEdge *out_buf, int max_
 extern int cluster_lmd_tarjan_scan_snapshot(const ClusterLmdWaitEdge *edges, int nedges,
 											ClusterLmdVertex *out_cycle_vertices,
 											int max_cycle_vertices, int *out_cycle_count);
-extern void cluster_lmd_tarjan_pick_victim(const ClusterLmdVertex *cycle_vertices, int nvertices,
+/*
+ * spec-5.9 D1 — victim exclude set + exclude-aware pick_victim.
+ *
+ *	pick_victim keeps its 2.24 youngest deterministic core (same cycle vertex
+ *	set + same exclude set -> same victim, Rule 8.A) but skips any vertex whose
+ *	canonical 4-tuple identity is in *exclude.  Returns true and writes
+ *	*out_victim when a non-excluded youngest victim exists;  returns false when
+ *	every cycle vertex is excluded (D7 alternate exhausted -> coordinator must
+ *	degrade to a finite-timeout, never force-kill).  exclude == NULL behaves
+ *	exactly like the 2.24 unconditional youngest pick (always true for n > 0).
+ *
+ *	Identity = the GES/GRD 4-tuple (node_id, procno, cluster_epoch,
+ *	request_id);  wait_seq / xid are sort+ABA metadata, never part of the
+ *	exclude key (a re-queued waiter with a fresh wait_seq under the same
+ *	4-tuple is the same logical backend and stays excluded this round).
+ */
+#define CLUSTER_LMD_VICTIM_EXCLUDE_MAX 32
+
+typedef struct LmdVictimExcludeItem {
+	int32 node_id;
+	uint32 procno;
+	uint64 cluster_epoch;
+	uint64 request_id;
+} LmdVictimExcludeItem;
+
+typedef struct LmdVictimExcludeSet {
+	int count;
+	LmdVictimExcludeItem items[CLUSTER_LMD_VICTIM_EXCLUDE_MAX];
+} LmdVictimExcludeSet;
+
+extern void cluster_lmd_victim_exclude_init(LmdVictimExcludeSet *set);
+extern bool cluster_lmd_victim_exclude_add(LmdVictimExcludeSet *set, const ClusterLmdVertex *v);
+extern bool cluster_lmd_victim_exclude_contains(const LmdVictimExcludeSet *set,
+												const ClusterLmdVertex *v);
+
+extern bool cluster_lmd_tarjan_pick_victim(const ClusterLmdVertex *cycle_vertices, int nvertices,
+										   const LmdVictimExcludeSet *exclude,
 										   ClusterLmdVertex *out_victim);
 extern bool cluster_lmd_tarjan_revalidate(const ClusterLmdVertex *cycle_vertices, int nvertices,
 										  uint64 snapshot_generation);
@@ -550,7 +655,7 @@ extern void cluster_lmd_tarjan_run_local_scan(void);
  * count victim_cancel_sent only on a true return.
  */
 extern bool cluster_lmd_signal_local_victim(uint32 procno, uint64 request_id, uint64 cluster_epoch,
-											uint64 wait_seq);
+											uint64 wait_seq, uint64 cancel_id);
 
 /*
  * shmem region helpers — registered by cluster_init_shmem_module()

@@ -689,7 +689,11 @@
  * stack on top of 5.7's enqueue classes + spec-2.41 lost-write ABI. */
 /* spec-5.11 D5 (2026-06-26): pg_cluster_hang_dump(int4) pg_proc row (oid 8957)
  * + REVOKE; new ProcSignalReason PROCSIG_CLUSTER_HANG_DUMP.  catversion bump. */
-#define CATALOG_VERSION_NO 202606270
+/* spec-5.9 (2026-06-26): new GES wire opcodes GES_REQ_OPCODE_CANCEL_WAIT (16) +
+ * CANCEL_ACK (17) + dedicated GesCancelWaitPayload (64B) / GesCancelAckPayload
+ * (48B) + per-proc ClusterCancelToken in PGPROC.  Rebased on top of 5.10/5.11
+ * (which landed at 202606270); bump to 202606280 for the combined wire ABI. */
+#define CATALOG_VERSION_NO 202606280
 
 /* spec-2.39 D10 (2026-05-21):  SI Broadcaster production activation —
  * DDL commit hook (AtEOXact_Inval + COMMIT PREPARED via cluster-aware

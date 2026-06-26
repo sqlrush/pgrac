@@ -5272,8 +5272,24 @@ cluster_grd_cancel_reservation_by_id(const ClusterResId *resid, const ClusterGrd
  *	removed;  NOT_FOUND if none matched (the drain already granted it -> the
  *	caller accepts the grant that raced the timeout).
  */
-ClusterGrdEntryResult
-cluster_grd_cancel_waiter_by_id(const ClusterResId *resid, const ClusterGrdHolderId *holder)
+/*
+ * spec-5.9 D4 — shared REQUEST-waiter dequeue core.  When match_wait_seq is
+ * true the queued waiter's spec-5.8 wait_seq must ALSO equal wait_seq, so a
+ * stale / retransmitted CANCEL_WAIT that names a since-reused identity (same
+ * 4-tuple, fresh wait_seq) is rejected as NOT_FOUND rather than dequeuing the
+ * new waiter (Rule 8.A P0#2 ABA guard).  Touches only waiters[] — never
+ * holders[] (the spec-2.24 P0#2 distinction: a victim's holder lock is dropped
+ * by its own abort LockReleaseAll, never by this waiter-dequeue path).
+ *
+ *	Edge resync: the WFG edge key is the waiter 4-tuple (wait_seq is NOT part of
+ *	it), so on a wait_seq MISMATCH we must NOT resync — that would tear down the
+ *	reused waiter's edges.  The 4-tuple-only path (match_wait_seq == false, used
+ *	by a backend cancelling its OWN current waiter on abort) keeps the original
+ *	always-resync belt-and-suspenders behavior.
+ */
+static ClusterGrdEntryResult
+grd_cancel_waiter_impl(const ClusterResId *resid, const ClusterGrdHolderId *holder, uint64 wait_seq,
+					   bool match_wait_seq)
 {
 	ClusterGrdEntry *entry = NULL;
 	ClusterGrdEntryResult er = CLUSTER_GRD_ENTRY_NOT_FOUND;
@@ -5289,7 +5305,8 @@ cluster_grd_cancel_waiter_by_id(const ClusterResId *resid, const ClusterGrdHolde
 		if ((uint32)entry->waiters[i].node_id == holder->node_id
 			&& entry->waiters[i].procno == holder->procno
 			&& entry->waiters[i].cluster_epoch == holder->cluster_epoch
-			&& entry->waiters[i].request_id == holder->request_id) {
+			&& entry->waiters[i].request_id == holder->request_id
+			&& (!match_wait_seq || entry->waiters[i].wait_seq == wait_seq)) {
 			if (i < entry->nwaiters - 1)
 				entry->waiters[i] = entry->waiters[entry->nwaiters - 1];
 			memset(&entry->waiters[entry->nwaiters - 1], 0, sizeof(ClusterGrdWaiter));
@@ -5302,6 +5319,68 @@ cluster_grd_cancel_waiter_by_id(const ClusterResId *resid, const ClusterGrdHolde
 	SpinLockRelease(&entry->lock);
 	cluster_grd_entry_release(entry);
 	/* spec-5.8 D1b — the cancelled waiter left the queue; remove its edges. */
-	grd_wfg_resync_entry(resid, holder, 1);
+	if (er == CLUSTER_GRD_ENTRY_OK || !match_wait_seq)
+		grd_wfg_resync_entry(resid, holder, 1);
+	return er;
+}
+
+ClusterGrdEntryResult
+cluster_grd_cancel_waiter_by_id(const ClusterResId *resid, const ClusterGrdHolderId *holder)
+{
+	return grd_cancel_waiter_impl(resid, holder, 0, false);
+}
+
+/*
+ * spec-5.9 D4 — wait_seq-exact REQUEST-waiter dequeue (the CANCEL_WAIT path).
+ * NOT_FOUND when no waiter matches the 4-tuple AND wait_seq (caller bumps
+ * cancel_wait_stale_rejected on a stale CANCEL_WAIT).
+ */
+ClusterGrdEntryResult
+cluster_grd_cancel_waiter_by_id_seq(const ClusterResId *resid, const ClusterGrdHolderId *holder,
+									uint64 wait_seq)
+{
+	return grd_cancel_waiter_impl(resid, holder, wait_seq, true);
+}
+
+/*
+ * spec-5.9 D4 — wait_seq-exact CONVERT dequeue (new primitive; the convert
+ * queue had no cancel-by-id before).  A convert is a waiter on its
+ * requested_mode whose WFG vertex id is convert_request_id, so the caller
+ * passes holder->request_id = convert_request_id.  Matches (node_id, procno,
+ * cluster_epoch, convert_request_id, wait_seq) and removes from converts[] only
+ * — never a granted holder.  NOT_FOUND on any mismatch (ABA-safe like the
+ * waiter variant).
+ */
+ClusterGrdEntryResult
+cluster_grd_cancel_convert_by_id(const ClusterResId *resid, const ClusterGrdHolderId *holder,
+								 uint64 wait_seq)
+{
+	ClusterGrdEntry *entry = NULL;
+	ClusterGrdEntryResult er = CLUSTER_GRD_ENTRY_NOT_FOUND;
+
+	Assert(resid != NULL && holder != NULL);
+
+	if (cluster_grd_entry_lookup_or_create(resid, false, &entry) != CLUSTER_GRD_ENTRY_OK
+		|| entry == NULL)
+		return CLUSTER_GRD_ENTRY_NOT_FOUND;
+
+	SpinLockAcquire(&entry->lock);
+	for (int i = 0; i < entry->nconverts; i++) {
+		if ((uint32)entry->converts[i].node_id == holder->node_id
+			&& entry->converts[i].procno == holder->procno
+			&& entry->converts[i].cluster_epoch == holder->cluster_epoch
+			&& entry->converts[i].convert_request_id == holder->request_id
+			&& entry->converts[i].wait_seq == wait_seq) {
+			grd_convert_remove(entry, i);
+			er = CLUSTER_GRD_ENTRY_OK;
+			break;
+		}
+	}
+	SpinLockRelease(&entry->lock);
+	cluster_grd_entry_release(entry);
+	/* The departed convert's WFG vertex id is convert_request_id (== holder->
+	 * request_id), so resync removes exactly its edges.  Skip on mismatch. */
+	if (er == CLUSTER_GRD_ENTRY_OK)
+		grd_wfg_resync_entry(resid, holder, 1);
 	return er;
 }

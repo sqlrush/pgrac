@@ -1204,6 +1204,33 @@ dump_lmd(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_lmd_confirm_unconfirmed_count_get()));
 	emit_row(rsinfo, "lmd", "reconfig_discard_count",
 			 fmt_int64((int64)cluster_lmd_reconfig_discard_count_get()));
+	/* spec-5.9 D10 — 13 NEW victim-policy + cancel-robustness counters. */
+	emit_row(rsinfo, "lmd", "victim_protected_skip_count",
+			 fmt_int64((int64)cluster_lmd_victim_protected_skip_count_get()));
+	emit_row(rsinfo, "lmd", "victim_repeat_avoided_count",
+			 fmt_int64((int64)cluster_lmd_victim_repeat_avoided_count_get()));
+	emit_row(rsinfo, "lmd", "cancel_token_installed_count",
+			 fmt_int64((int64)cluster_lmd_cancel_token_installed_count_get()));
+	emit_row(rsinfo, "lmd", "cancel_consumed_count",
+			 fmt_int64((int64)cluster_lmd_cancel_consumed_count_get()));
+	emit_row(rsinfo, "lmd", "cancel_stale_cleared_count",
+			 fmt_int64((int64)cluster_lmd_cancel_stale_cleared_count_get()));
+	emit_row(rsinfo, "lmd", "cancel_wait_stale_rejected_count",
+			 fmt_int64((int64)cluster_lmd_cancel_wait_stale_rejected_count_get()));
+	emit_row(rsinfo, "lmd", "cancel_ack_received_count",
+			 fmt_int64((int64)cluster_lmd_cancel_ack_received_count_get()));
+	emit_row(rsinfo, "lmd", "cancel_retransmit_count",
+			 fmt_int64((int64)cluster_lmd_cancel_retransmit_count_get()));
+	emit_row(rsinfo, "lmd", "cancel_escalated_alternate_count",
+			 fmt_int64((int64)cluster_lmd_cancel_escalated_alternate_count_get()));
+	emit_row(rsinfo, "lmd", "cancel_exhausted_timeout_count",
+			 fmt_int64((int64)cluster_lmd_cancel_exhausted_timeout_count_get()));
+	emit_row(rsinfo, "lmd", "cancel_no_safe_victim_count",
+			 fmt_int64((int64)cluster_lmd_cancel_no_safe_victim_count_get()));
+	emit_row(rsinfo, "lmd", "cleanup_orphan_edge_swept_count",
+			 fmt_int64((int64)cluster_lmd_cleanup_orphan_edge_swept_count_get()));
+	emit_row(rsinfo, "lmd", "reconfig_cancel_discarded_count",
+			 fmt_int64((int64)cluster_lmd_reconfig_cancel_discarded_count_get()));
 	/* spec-5.8 D8 — 5 NEW shmem REPORT-collector counters (LMON->LMD hand-off). */
 	emit_row(rsinfo, "lmd", "probe_report_enqueue_count",
 			 fmt_int64((int64)cluster_lmd_probe_report_enqueue_count_get()));

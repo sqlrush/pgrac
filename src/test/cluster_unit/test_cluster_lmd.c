@@ -66,6 +66,8 @@
 #include <signal.h>
 #include <string.h>
 
+#include "cluster/cluster_cancel_token.h" /* spec-5.9 D5 — victim-ack tick deps */
+#include "cluster/cluster_ges.h"
 #include "cluster/cluster_lmd.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
@@ -239,6 +241,28 @@ bool cluster_lmd_enabled = true;
 int cluster_lmd_scan_interval_ms = 1000;
 int cluster_lmd_max_wait_edges = 1024;
 
+/* spec-5.9 D2 — anti-thrash window GUC stub (read by the recent-victim ring). */
+int cluster_victim_repeat_window_ms = 5000;
+
+/* spec-5.9 D5 — victim-ack tick deps (the tick is never invoked in unit tests;
+ * stubbed so cluster_lmd.o links). */
+int cluster_cancel_ack_timeout_ms = 1000;
+struct PROC_HDR;
+struct PROC_HDR *ProcGlobal = NULL;
+ClusterCancelMarker
+cluster_cancel_token_take_marker(struct PGPROC *p pg_attribute_unused(),
+								 uint64 *out_cancel_id pg_attribute_unused(),
+								 uint64 *out_seq pg_attribute_unused())
+{
+	return CLUSTER_CANCEL_MARKER_NONE;
+}
+void
+cluster_ges_send_cancel_ack(int32 c pg_attribute_unused(),
+							const struct ClusterGrdHolderId *v pg_attribute_unused(),
+							uint64 w pg_attribute_unused(), uint64 id pg_attribute_unused(),
+							uint8 s pg_attribute_unused())
+{}
+
 /* spec-2.22 D2/D3/D5 — LMD graph + Tarjan symbols pulled by cluster_lmd.o
  * (LmdMain calls Tarjan scan; shmem region registry references graph
  * shmem helpers).  Stub them out — TAP 109 covers real behavior.
@@ -378,10 +402,18 @@ cluster_lmd_cleanup_skip_other_owner_count_inc(uint64 d pg_attribute_unused())
 int cluster_lmd_cleanup_sweep_interval_ms = 5000;
 bool
 cluster_lmd_signal_local_victim(uint32 a pg_attribute_unused(), uint64 b pg_attribute_unused(),
-								uint64 c pg_attribute_unused(), uint64 d pg_attribute_unused())
+								uint64 c pg_attribute_unused(), uint64 d pg_attribute_unused(),
+								uint64 e pg_attribute_unused())
 {
 	return false;
 }
+/* spec-5.9 D6 — pending-cancel table lives in cluster_lmd_tarjan.o; stubbed. */
+void
+cluster_lmd_pending_cancel_tick(void)
+{}
+void
+cluster_lmd_pending_cancel_on_ack(uint64 c pg_attribute_unused(), uint8 s pg_attribute_unused())
+{}
 void
 cluster_lmd_cross_node_cancel_queue_full_count_inc(uint64 d pg_attribute_unused())
 {}
@@ -722,13 +754,63 @@ UT_TEST(test_lmd_state_to_string_and_alphabetic_position)
 }
 
 
+/*
+ * spec-5.9 D2 (U3) — anti-thrash recent-victim ring.
+ *
+ *	Records a chosen victim and confirms is_thrashing() reports it within the
+ *	window, a never-recorded victim is not thrashing, the window=0 disable, and
+ *	the test-hook reset clears the ring.  GetCurrentTimestamp() advances by 1us
+ *	per call in this harness, so a freshly recorded victim is always inside any
+ *	positive window.
+ */
+UT_TEST(test_lmd_anti_thrash_recent_victim_ring)
+{
+	ClusterLmdVertex a;
+	ClusterLmdVertex b;
+
+	cluster_lmd_recent_victim_ring_reset();
+	memset(&a, 0, sizeof(a));
+	a.node_id = 1;
+	a.procno = 7;
+	a.cluster_epoch = 3;
+	a.request_id = 42;
+	a.wait_seq = 99; /* not part of the ring identity */
+	memset(&b, 0, sizeof(b));
+	b.node_id = 1;
+	b.procno = 8; /* different procno -> different identity */
+	b.cluster_epoch = 3;
+	b.request_id = 43;
+
+	/* Nothing recorded yet -> not thrashing. */
+	UT_ASSERT(!cluster_lmd_recent_victim_is_thrashing(&a));
+
+	/* Record a -> a thrashes (within window), b still does not. */
+	cluster_lmd_recent_victim_record(&a);
+	UT_ASSERT(cluster_lmd_recent_victim_is_thrashing(&a));
+	UT_ASSERT(!cluster_lmd_recent_victim_is_thrashing(&b));
+
+	/* A different wait_seq under the same 4-tuple is the same logical victim. */
+	a.wait_seq = 12345;
+	UT_ASSERT(cluster_lmd_recent_victim_is_thrashing(&a));
+
+	/* window <= 0 disables anti-thrash advisory. */
+	cluster_victim_repeat_window_ms = 0;
+	UT_ASSERT(!cluster_lmd_recent_victim_is_thrashing(&a));
+	cluster_victim_repeat_window_ms = 5000;
+
+	/* Reset clears the ring. */
+	cluster_lmd_recent_victim_ring_reset();
+	UT_ASSERT(!cluster_lmd_recent_victim_is_thrashing(&a));
+}
+
+
 UT_DEFINE_GLOBALS();
 
 
 int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(9);
+	UT_PLAN(10);
 
 	UT_RUN(test_lmd_auxproc_and_backend_type_surface);
 	UT_RUN(test_lmd_shmem_size_init_idempotent);
@@ -739,6 +821,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_lmd_submit_wait_edge_inc_counter_and_broadcast);
 	UT_RUN(test_lmd_enabled_guc_default_true);
 	UT_RUN(test_lmd_state_to_string_and_alphabetic_position);
+	UT_RUN(test_lmd_anti_thrash_recent_victim_ring);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

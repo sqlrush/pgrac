@@ -80,6 +80,7 @@
 
 #include <signal.h>
 
+#include "cluster/cluster_cancel_token.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_cssd.h"
 #include "cluster/cluster_epoch.h"
@@ -297,6 +298,100 @@ cluster_lmd_cancel_queue_enqueue(uint32 source_node_id, const void *payload, uin
 	return ok;
 }
 
+/* ============================================================
+ * spec-5.9 D5/D6 — victim-side awaiting-ack table (node-local).
+ *
+ *	A node that installs a cancel token for a REMOTE coordinator records the
+ *	victim here; the LMD tick (cluster_lmd_victim_ack_tick) observes the
+ *	backend's consume marker and sends the correlated CANCEL_ACK back so the
+ *	coordinator clears its pending entry instead of waiting out the timeout
+ *	(and, crucially, learns the victim was handled before it might escalate to
+ *	an alternate).  Runs on EVERY node (any node can host a victim).
+ * ============================================================ */
+#define CLUSTER_LMD_VICTIM_ACK_MAX 64
+
+typedef struct LmdVictimAck {
+	bool active;
+	uint32 procno;
+	ClusterGrdHolderId victim; /* 4-tuple for the ACK payload */
+	uint64 wait_seq;
+	uint64 cancel_id;
+	int32 coordinator_node;
+	TimestampTz deadline;
+} LmdVictimAck;
+
+static LmdVictimAck lmd_victim_acks[CLUSTER_LMD_VICTIM_ACK_MAX];
+
+static void
+lmd_victim_ack_add(uint32 procno, const ClusterGrdHolderId *victim, uint64 wait_seq,
+				   uint64 cancel_id, int32 coordinator_node)
+{
+	for (int i = 0; i < CLUSTER_LMD_VICTIM_ACK_MAX; i++) {
+		if (!lmd_victim_acks[i].active) {
+			lmd_victim_acks[i].active = true;
+			lmd_victim_acks[i].procno = procno;
+			lmd_victim_acks[i].victim = *victim;
+			lmd_victim_acks[i].wait_seq = wait_seq;
+			lmd_victim_acks[i].cancel_id = cancel_id;
+			lmd_victim_acks[i].coordinator_node = coordinator_node;
+			lmd_victim_acks[i].deadline = TimestampTzPlusMilliseconds(
+				GetCurrentTimestamp(), 3 * cluster_cancel_ack_timeout_ms);
+			return;
+		}
+	}
+	/* Table full — drop; the coordinator's retransmit + finite timeout backstop. */
+}
+
+void
+cluster_lmd_victim_ack_tick(void)
+{
+	TimestampTz now = GetCurrentTimestamp();
+
+	for (int i = 0; i < CLUSTER_LMD_VICTIM_ACK_MAX; i++) {
+		LmdVictimAck *a = &lmd_victim_acks[i];
+		ClusterCancelMarker m;
+		uint64 mc = 0;
+		uint64 ms = 0;
+		PGPROC *target;
+		uint8 status;
+
+		if (!a->active)
+			continue;
+		if (a->procno >= (uint32)ProcGlobal->allProcCount) {
+			a->active = false;
+			continue;
+		}
+		target = &ProcGlobal->allProcs[a->procno];
+		m = cluster_cancel_token_take_marker(target, &mc, &ms);
+
+		if (m != CLUSTER_CANCEL_MARKER_NONE && mc == a->cancel_id) {
+			switch (m) {
+			case CLUSTER_CANCEL_MARKER_CONSUMED:
+				status = GES_CANCEL_ACK_CONSUMED;
+				break;
+			case CLUSTER_CANCEL_MARKER_PROTECTED:
+				status = GES_CANCEL_ACK_PROTECTED;
+				break;
+			default: /* STALE_CLEARED */
+				status = GES_CANCEL_ACK_NOT_WAITING;
+				break;
+			}
+			cluster_ges_send_cancel_ack(a->coordinator_node, &a->victim, a->wait_seq, a->cancel_id,
+										status);
+			a->active = false;
+			continue;
+		}
+
+		/* No marker by the deadline — the backend never consumed (it had already
+		 * moved on).  Tell the coordinator NOT_WAITING so it stops waiting. */
+		if (now >= a->deadline) {
+			cluster_ges_send_cancel_ack(a->coordinator_node, &a->victim, a->wait_seq, a->cancel_id,
+										GES_CANCEL_ACK_NOT_WAITING);
+			a->active = false;
+		}
+	}
+}
+
 /*
  * spec-2.24 D5 — LMD cancel queue dispatch (HC24 stale procno 防御).
  *
@@ -311,6 +406,21 @@ cluster_lmd_dispatch_cancel_item(const ClusterLmdCancelItem *item)
 	uint64 victim_epoch;
 	uint64 victim_request_id;
 	uint64 current_epoch;
+	uint32 opcode;
+
+	/*
+	 * spec-5.9 D5/D6 — the LMD cancel queue now also carries CANCEL_ACK frames
+	 * (routed from the LMON GES handler so the LMD process, which owns the
+	 * coordinator pending-cancel table, can react).  Branch on the opcode in the
+	 * first 4 payload bytes.
+	 */
+	memcpy(&opcode, item->payload, sizeof(opcode));
+	if (opcode == GES_REQ_OPCODE_CANCEL_ACK) {
+		const GesCancelAckPayload *ack = (const GesCancelAckPayload *)item->payload;
+
+		cluster_lmd_pending_cancel_on_ack(ack->cancel_id, (uint8)ack->ack_status);
+		return;
+	}
 
 	victim_epoch
 		= ((uint64)req->holder_cluster_epoch_lo) | (((uint64)req->holder_cluster_epoch_hi) << 32);
@@ -331,9 +441,33 @@ cluster_lmd_dispatch_cancel_item(const ClusterLmdCancelItem *item)
 
 	/* The cross-node received-cancel counter is bumped by the receive handler;
 	 * here we only dispatch.  D5 revalidate inside signal_local_victim decides
-	 * whether the cancel is actually delivered. */
-	(void)cluster_lmd_signal_local_victim(req->holder_procno, victim_request_id, victim_epoch,
-										  req->wait_seq);
+	 * whether the cancel is actually delivered.  spec-5.9 D5 — the coordinator's
+	 * cancel_id rides CANCEL_PENDING's unused resid[0..1]; carry it onto the
+	 * installed token so the marker -> CANCEL_ACK bridge can correlate it. */
+	{
+		uint64 cancel_id = ((uint64)req->resid[0]) | (((uint64)req->resid[1]) << 32);
+		ClusterGrdHolderId victim;
+
+		victim.node_id = req->holder_node_id;
+		victim.procno = req->holder_procno;
+		victim.cluster_epoch = victim_epoch;
+		victim.request_id = victim_request_id;
+
+		if (cluster_lmd_signal_local_victim(req->holder_procno, victim_request_id, victim_epoch,
+											req->wait_seq, cancel_id)) {
+			/* spec-5.9 D5 — token installed; observe its consume marker and ACK
+			 * the coordinator (the CANCEL_PENDING sender) when the backend
+			 * resolves it (CONSUMED / PROTECTED / NOT_WAITING). */
+			lmd_victim_ack_add(req->holder_procno, &victim, req->wait_seq, cancel_id,
+							   (int32)item->source_node_id);
+		} else {
+			/* Revalidate refused: the victim is no longer waiting on this exact
+			 * request — tell the coordinator NOT_WAITING immediately so it stops
+			 * waiting / does not escalate. */
+			cluster_ges_send_cancel_ack((int32)item->source_node_id, &victim, req->wait_seq,
+										cancel_id, GES_CANCEL_ACK_NOT_WAITING);
+		}
+	}
 }
 
 void
@@ -385,6 +519,85 @@ cluster_lmd_run_periodic_cleanup_sweep(void)
 	swept = cluster_grd_sweep_local_stale_procnos();
 	if (swept > 0)
 		cluster_lmd_cleanup_lmd_sweep_count_inc((uint64)swept);
+}
+
+/* ============================================================
+ * spec-5.9 D2 — anti-thrash recent-victim ring (LMD-process-local).
+ *
+ *	The deadlock coordinator runs single-threaded inside this LMD aux process,
+ *	so the ring is plain process-local state — no shmem, no lock.  On
+ *	coordinator drift (HC16) the new node's LMD starts with an empty ring (RC3
+ *	stateless takeover), which merely forgoes one thrash-avoidance.  Bounded
+ *	clock-replacement ring keyed on the victim 4-tuple + chosen timestamp.
+ * ============================================================ */
+typedef struct LmdRecentVictim {
+	bool valid;
+	int32 node_id;
+	uint32 procno;
+	uint64 cluster_epoch;
+	uint64 request_id;
+	TimestampTz chosen_ts;
+} LmdRecentVictim;
+
+static LmdRecentVictim lmd_recent_victims[CLUSTER_LMD_RECENT_VICTIM_DEPTH];
+static int lmd_recent_victim_next = 0; /* clock hand */
+
+static inline bool
+lmd_recent_victim_same(const LmdRecentVictim *r, const ClusterLmdVertex *v)
+{
+	return r->valid && r->node_id == v->node_id && r->procno == v->procno
+		   && r->cluster_epoch == v->cluster_epoch && r->request_id == v->request_id;
+}
+
+/*
+ * True iff *victim's 4-tuple was recorded as a chosen victim within
+ * cluster.victim_repeat_window_ms (a livelock symptom).  Advisory: the
+ * coordinator uses this only to prefer an alternate, never to skip resolving a
+ * deadlock.  window <= 0 disables anti-thrash.
+ */
+bool
+cluster_lmd_recent_victim_is_thrashing(const ClusterLmdVertex *victim)
+{
+	TimestampTz now;
+	int window_ms = cluster_victim_repeat_window_ms;
+
+	if (victim == NULL || window_ms <= 0)
+		return false;
+	now = GetCurrentTimestamp();
+	for (int i = 0; i < CLUSTER_LMD_RECENT_VICTIM_DEPTH; i++) {
+		const LmdRecentVictim *r = &lmd_recent_victims[i];
+
+		if (!lmd_recent_victim_same(r, victim))
+			continue;
+		if (!TimestampDifferenceExceeds(r->chosen_ts, now, window_ms))
+			return true; /* chosen within the window */
+	}
+	return false;
+}
+
+/* Note *victim as just chosen for cancel (clock-replacement insert). */
+void
+cluster_lmd_recent_victim_record(const ClusterLmdVertex *victim)
+{
+	LmdRecentVictim *slot;
+
+	if (victim == NULL)
+		return;
+	slot = &lmd_recent_victims[lmd_recent_victim_next];
+	slot->valid = true;
+	slot->node_id = victim->node_id;
+	slot->procno = victim->procno;
+	slot->cluster_epoch = victim->cluster_epoch;
+	slot->request_id = victim->request_id;
+	slot->chosen_ts = GetCurrentTimestamp();
+	lmd_recent_victim_next = (lmd_recent_victim_next + 1) % CLUSTER_LMD_RECENT_VICTIM_DEPTH;
+}
+
+void
+cluster_lmd_recent_victim_ring_reset(void)
+{
+	memset(lmd_recent_victims, 0, sizeof(lmd_recent_victims));
+	lmd_recent_victim_next = 0;
 }
 
 bool
@@ -799,6 +1012,15 @@ cluster_lmd_run_coordinator_tick(void)
 	if (!lmd_is_deadlock_coordinator())
 		return;
 
+	/*
+	 * spec-5.9 D6 — advance in-flight cancels every coordinator iteration (more
+	 * responsive than the throttled scan): observe local consume markers,
+	 * retransmit remote cancels on ACK timeout, degrade on exhaustion.  On a
+	 * coordinator drift this node stops being coordinator (returns above) and its
+	 * pending entries go inert -> the finite GES timeout backstops them.
+	 */
+	cluster_lmd_pending_cancel_tick();
+
 	now = GetCurrentTimestamp();
 	if (lmd_last_coord_scan != 0
 		&& !TimestampDifferenceExceeds(lmd_last_coord_scan, now, cluster_lmd_global_dd_interval_ms))
@@ -909,6 +1131,9 @@ LmdMain(void)
 			cluster_lmd_tarjan_run_local_scan();
 			/* spec-2.24 D5 — drain cancel queue. */
 			cluster_lmd_drain_cancel_queue();
+			/* spec-5.9 D5 — victim-side: observe consume markers + ACK the
+			 * coordinator (runs on every node — any node can host a victim). */
+			cluster_lmd_victim_ack_tick();
 			/* spec-2.24 D8 — periodic safety net cleanup sweep. */
 			cluster_lmd_run_periodic_cleanup_sweep();
 			/* spec-5.8 D3b — coordinator cross-node deadlock scan (HC16-gated,

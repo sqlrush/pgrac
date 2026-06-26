@@ -40,6 +40,7 @@ ifeq ($(enable_pgrac_cluster), yes)
 OBJS = \
 	cluster.o \
 	cluster_advisory.o \
+	cluster_cancel_token.o \
 	cluster_cf_authority.o \
 	cluster_cf_enqueue.o \
 	cluster_cf_phase2.o \
