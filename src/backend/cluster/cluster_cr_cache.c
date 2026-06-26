@@ -44,8 +44,12 @@ int cluster_cr_cache_max_blocks = 64;
 
 typedef struct ClusterCRCacheEntry {
 	ClusterCRCacheKey key;
-	bool valid; /* false until commit / after eviction reserve */
-	bool ref;	/* clock second-chance bit */
+	uint64 pool_epoch; /* spec-5.53 D2c: lifecycle epoch stamped at reserve; the
+						* L1 fence serves an entry only at the current epoch, so a
+						* relfilenode-reuse (epoch bump) forces a MISS even on an
+						* exact key match (L1+L2 same fence). */
+	bool valid;		   /* false until commit / after eviction reserve */
+	bool ref;		   /* clock second-chance bit */
 	char page[BLCKSZ];
 } ClusterCRCacheEntry;
 
@@ -131,25 +135,66 @@ cr_cache_pick_victim(bool *evicted)
 
 
 const char *
-cluster_cr_cache_lookup(const ClusterCRCacheKey *key)
+cluster_cr_cache_lookup(const ClusterCRCacheKey *key, uint64 cur_epoch, int *out_miss_reason)
 {
 	int i;
+	int reason = CR_CACHE_MISS_NONE;
 
+	if (out_miss_reason != NULL)
+		*out_miss_reason = CR_CACHE_MISS_NONE;
 	if (key == NULL)
 		return NULL;
 
 	cr_cache_ensure();
 	for (i = 0; i < cr_cache_capacity; i++) {
-		if (cr_cache[i].valid && cluster_cr_cache_key_equal(&cr_cache[i].key, key)) {
-			cr_cache[i].ref = true; /* second chance */
-			return cr_cache[i].page;
+		ClusterCRCacheEntry *e = &cr_cache[i];
+
+		if (!e->valid)
+			continue;
+
+		if (cluster_cr_cache_key_equal(&e->key, key)) {
+			/*
+			 * spec-5.53 D2c: per-entry lifecycle-epoch fence.  An exact key
+			 * match whose stamped epoch is not the current epoch is a stale
+			 * image from before a relfilenode lifecycle event (DROP / TRUNCATE /
+			 * relfilenode reuse / sinval).  Do NOT serve it (rule 8.A: never a
+			 * stale hit); report it so the caller can count the fence firing.
+			 * The stale entry is left for the clock to evict (its key can only be
+			 * re-hit at the matching epoch, which can no longer occur).
+			 */
+			if (e->pool_epoch != cur_epoch) {
+				if (out_miss_reason != NULL)
+					*out_miss_reason = CR_CACHE_MISS_EPOCH;
+				return NULL; /* epoch is the most-specific reason; stop here */
+			}
+			e->ref = true; /* second chance */
+			return e->page;
+		}
+
+		/*
+		 * spec-5.53 D5: over-miss near-miss classification.  L1 is a linear scan,
+		 * so this is reliable (unlike the segmented L2 pool).  Same physical
+		 * block address (locator+fork+block) but a churned page version or a
+		 * diverged snapshot — a hit-rate miss, not a reuse hazard.  Keep the
+		 * most-specific bucket (base_lsn over key); an exact-key stale-epoch match
+		 * found later still wins (it returns immediately above).
+		 */
+		if (reason != CR_CACHE_MISS_BASE_LSN && RelFileLocatorEquals(e->key.rlocator, key->rlocator)
+			&& e->key.forknum == key->forknum && e->key.blockno == key->blockno) {
+			if (e->key.read_scn == key->read_scn && e->key.base_page_lsn != key->base_page_lsn)
+				reason = CR_CACHE_MISS_BASE_LSN; /* churned page version (F0-14) */
+			else if (e->key.read_scn != key->read_scn && reason == CR_CACHE_MISS_NONE)
+				reason = CR_CACHE_MISS_KEY; /* diverged read_scn (F0-16) */
 		}
 	}
+
+	if (out_miss_reason != NULL)
+		*out_miss_reason = reason;
 	return NULL;
 }
 
 char *
-cluster_cr_cache_victim_slot(const ClusterCRCacheKey *key, bool *evicted)
+cluster_cr_cache_victim_slot(const ClusterCRCacheKey *key, uint64 cur_epoch, bool *evicted)
 {
 	int idx;
 	bool ev = false;
@@ -173,6 +218,7 @@ cluster_cr_cache_victim_slot(const ClusterCRCacheKey *key, bool *evicted)
 	cr_cache[idx].valid = false;
 	cr_cache[idx].ref = false;
 	cr_cache[idx].key = (key != NULL) ? *key : cr_cache[idx].key;
+	cr_cache[idx].pool_epoch = cur_epoch; /* spec-5.53 D2c: stamp the fence epoch */
 	cr_cache_last_victim = idx;
 
 	if (evicted != NULL)

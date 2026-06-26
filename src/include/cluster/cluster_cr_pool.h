@@ -6,8 +6,13 @@
  *	  A per-instance, cross-backend shared-memory pool of full-block CR images,
  *	  layered as L2 behind the backend-local L1 cache (cluster_cr_cache.c,
  *	  spec-3.10).  Physically separate from shared_buffers (no pollution).  Keyed
- *	  by the SAME self-validating ClusterCRCacheKey as L1 (compared via the
- *	  canonical cluster_cr_cache_key_equal helper; key evolution = spec-5.53).
+ *	  by the SAME exact-identity ClusterCRCacheKey as L1 (compared via the
+ *	  canonical cluster_cr_cache_key_equal helper; identity contract SSOT =
+ *	  spec-5.53 §3.1).  NB: the key is an exact identity, NOT "self-validating":
+ *	  safety against relfilenode (Oid) reuse is the provably-complete pool_epoch
+ *	  bump floor (property 4 below + spec-5.53 D2b), not an intrinsic property of
+ *	  the key — there is no binding-point-independent token at the CR layer
+ *	  (spec-5.53 §0.6 / D0 = RED).
  *
  *	  Five safety properties that distinguish a SHARED CR cache from the
  *	  backend-local L1 (spec-5.51 §3, all 8.A):
@@ -147,6 +152,23 @@ extern uint64 cluster_cr_pool_abort_count(void);
 extern uint64 cluster_cr_pool_evict_count(void);
 extern uint64 cluster_cr_pool_epoch_bump_count(void);
 extern uint64 cluster_cr_pool_publish_stale_release_count(void);
+
+/* ---- identity/reuse-fence mismatch diagnostics (spec-5.53 D5) ---- */
+extern uint64 cluster_cr_pool_key_mismatch_count(void);
+extern uint64 cluster_cr_pool_epoch_mismatch_count(void);
+extern uint64 cluster_cr_pool_generation_mismatch_count(void);
+extern uint64 cluster_cr_pool_base_lsn_mismatch_count(void);
+extern uint64 cluster_cr_pool_locator_reuse_reject_count(void);
+
+/* Record an L1-detected (cluster_cr_cache.c, linear-scan = reliable) mismatch
+ * into the shared pool counters so all five dump together (spec-5.53 D5):
+ *   _l1_epoch_mismatch  -- per-entry epoch fence rejected a stale exact-key entry
+ *   _base_lsn_mismatch  -- MISS attributed to a churned page version (F0-14)
+ *   _key_mismatch       -- MISS attributed to a diverged read_scn (F0-16)
+ * All no-op when the pool is disabled. */
+extern void cluster_cr_pool_note_l1_epoch_mismatch(void);
+extern void cluster_cr_pool_note_base_lsn_mismatch(void);
+extern void cluster_cr_pool_note_key_mismatch(void);
 
 /* ---- test/diagnostic ---- */
 extern int cluster_cr_pool_live_entries(void);

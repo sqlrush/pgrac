@@ -2283,6 +2283,23 @@ dump_cr(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_cr_xmax_invalid_or_ambiguous_count()));
 	emit_row(rsinfo, "cr", "cr_xmax_scan_unavail_or_no_proof_count",
 			 fmt_int64((int64)cluster_cr_xmax_scan_unavail_or_no_proof_count()));
+	/*
+	 * spec-5.53 D5: CR key-identity / reuse-fence mismatch diagnostics (5 rows;
+	 * the L1+L2 epoch fence + ABA + over-miss near-miss buckets).  All 0 when the
+	 * pool is disabled.  locator_reuse_reject is the catalog-incarnation belt's
+	 * 8.A safety-gate observable and stays 0 in this build (D0 = RED → floor-only;
+	 * relfilenode-reuse MISSes are attributed to cr_epoch_mismatch_count).
+	 */
+	emit_row(rsinfo, "cr", "cr_key_mismatch_count",
+			 fmt_int64((int64)cluster_cr_pool_key_mismatch_count()));
+	emit_row(rsinfo, "cr", "cr_epoch_mismatch_count",
+			 fmt_int64((int64)cluster_cr_pool_epoch_mismatch_count()));
+	emit_row(rsinfo, "cr", "cr_generation_mismatch_count",
+			 fmt_int64((int64)cluster_cr_pool_generation_mismatch_count()));
+	emit_row(rsinfo, "cr", "cr_base_lsn_mismatch_count",
+			 fmt_int64((int64)cluster_cr_pool_base_lsn_mismatch_count()));
+	emit_row(rsinfo, "cr", "cr_locator_reuse_reject_count",
+			 fmt_int64((int64)cluster_cr_pool_locator_reuse_reject_count()));
 	/* spec-5.51 D9: dedicated shared CR buffer pool (L2) counters.  All 0 when
 	 * the pool is disabled (cluster.shared_cr_pool_size_blocks == 0). */
 	emit_row(rsinfo, "cr_pool", "current_epoch", fmt_int64((int64)cluster_cr_pool_current_epoch()));

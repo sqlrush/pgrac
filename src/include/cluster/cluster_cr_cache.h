@@ -60,10 +60,47 @@
 extern int cluster_cr_cache_max_blocks;
 
 /*
- * ClusterCRCacheKey -- backend-local CR image identity (spec-3.10 Q1/Q6).
- *   NO base_block_scn: pd_block_scn is not bumped by HOT-prune, so it is both
- *   redundant (page_lsn bumps whenever it does) and unsafe-if-sole.  Build with
- *   the helper so padding bytes are zeroed before compare.
+ * ClusterCRCacheKey -- CR image identity contract / SSOT (spec-5.53 §3.1 D1;
+ * over-hit P0 命门).  This is the ONE definition of "two CR lookups address the
+ * same image"; L1 (cluster_cr_cache.c) and L2 (cluster_cr_pool.c) both key on it
+ * and compare via cluster_cr_cache_key_equal().
+ *
+ *   field             necessity (drop it ⇒ the over-hit reverse-example)   ~Oracle
+ *   rlocator.spcOid   diff tablespace, same relNumber ⇒ different file       DBA tbsp
+ *   rlocator.dbOid    diff database,   same relNumber ⇒ different object      DBA file#
+ *   rlocator.relNumber diff relation ⇒ different data (Oid CAN be reused      DBA object
+ *                      ⇒ paired with the reuse fence, see below)
+ *   forknum           main/fsm/vm/init are different physical files           block class
+ *   blockno           per-block image                                         DBA block#
+ *   read_scn          diff snapshot ⇒ diff visible version (even if the       SCN
+ *                      physical image bytes coincide)
+ *   base_page_lsn     live page physical-version guard: every WAL-logged       block version
+ *                      change (HOT-prune / VACUUM relayout / hint-bit) bumps
+ *                      pd_lsn ⇒ a relayout forces a MISS, never a stale hit
+ *
+ *   Joint sufficiency: the five fields uniquely determine the own-instance CR
+ *   image (5.50 §17.5 S-1 GREEN: base_page_lsn churn is a MISS, not a stale hit;
+ *   read_scn blocks cross-snapshot leakage).
+ *
+ *   FORBIDDEN (would re-open over-hit; §3.1 / §1.3 "永不做"):
+ *     - block-only key: drops read_scn (cross-snapshot leak) + base_page_lsn
+ *       (relayout over-hit).
+ *     - base_block_scn: pd_block_scn is NOT bumped by HOT-prune, so it is both
+ *       redundant (page_lsn bumps whenever it does) and unsafe-if-sole.
+ *
+ *   relfilenode reuse (relNumber = Oid, 32-bit, REUSABLE — catalog.c
+ *   GetNewRelFileNumber collides only against LIVE files; and same-relid rewrite
+ *   swaps the physical relNumber: TRUNCATE → RelationSetNewRelfilenumber,
+ *   CLUSTER/VACUUM FULL → swap_relation_files) means relNumber alone cannot fence
+ *   a stale image.  Safety against reuse is NOT in the key: it is the
+ *   provably-complete pool_epoch bump floor (spec-5.53 D2b — every relfilenode
+ *   unlink bumps the lifecycle epoch at the smgrdounlinkall chokepoint).  NB:
+ *   there is NO binding-point-independent self-validating token at the CR layer
+ *   (a catalog-coupled storage-incarnation belt was D0-gated and found infeasible
+ *   under the CR content-lock contract; see spec-5.53 §0.6 / D0 = RED).
+ *
+ *   Build with cr_build_cache_key (memset-0) so padding bytes are zeroed, and
+ *   compare with cluster_cr_cache_key_equal (field-wise, never memcmp).
  */
 typedef struct ClusterCRCacheKey {
 	RelFileLocator rlocator; /* spc / db / rel */
@@ -72,6 +109,23 @@ typedef struct ClusterCRCacheKey {
 	SCN read_scn;			  /* target snapshot */
 	XLogRecPtr base_page_lsn; /* live page version guard */
 } ClusterCRCacheKey;
+
+/*
+ * spec-5.53 D1: lock the identity contract's field SET.  base_page_lsn is the
+ * last identity field; if a sixth field is appended (or the trailing layout
+ * grows) sizeof() exceeds its end offset and this fires — re-review the §3.1
+ * identity contract (and every over-hit reverse-example above) before changing
+ * the CR key.  The per-field type widths are asserted too: a narrower read_scn /
+ * base_page_lsn / locator would silently weaken a discriminator.
+ */
+StaticAssertDecl(sizeof(ClusterCRCacheKey)
+					 == offsetof(ClusterCRCacheKey, base_page_lsn) + sizeof(XLogRecPtr),
+				 "ClusterCRCacheKey gained a trailing field / padding: re-review the "
+				 "spec-5.53 §3.1 identity contract before changing the CR cache key.");
+StaticAssertDecl(sizeof(((ClusterCRCacheKey *)0)->read_scn) == sizeof(SCN)
+					 && sizeof(((ClusterCRCacheKey *)0)->base_page_lsn) == sizeof(XLogRecPtr)
+					 && sizeof(((ClusterCRCacheKey *)0)->rlocator) == sizeof(RelFileLocator),
+				 "ClusterCRCacheKey identity field width changed: re-review spec-5.53 §3.1.");
 
 /*
  * cluster_cr_cache_key_equal -- canonical CR cache key equality (spec-5.51 D6).
@@ -83,20 +137,45 @@ typedef struct ClusterCRCacheKey {
 extern bool cluster_cr_cache_key_equal(const ClusterCRCacheKey *a, const ClusterCRCacheKey *b);
 
 /*
- * cluster_cr_cache_lookup -- probe.  Returns the cached CR page (immutable;
- *   valid until the next cluster_cr_cache_* call in this backend) or NULL on a
- *   miss / when caching is disabled.
+ * cluster_cr_cache_lookup miss-reason classification (spec-5.53 D5).  On a miss
+ * the linear L1 scan records the MOST-SPECIFIC near-miss so a MISS is
+ * attributable (feeds the over-miss / SCN-range value analysis and the reuse
+ * fence health, §2.4): EPOCH (exact key, stale lifecycle epoch — the L1 reuse
+ * fence) > BASE_LSN (same block + read_scn, churned page version, F0-14) > KEY
+ * (same block, diverged read_scn, F0-16) > NONE.  NONE on a hit or a no-near
+ * match.
  */
-extern const char *cluster_cr_cache_lookup(const ClusterCRCacheKey *key);
+#define CR_CACHE_MISS_NONE 0
+#define CR_CACHE_MISS_EPOCH 1
+#define CR_CACHE_MISS_BASE_LSN 2
+#define CR_CACHE_MISS_KEY 3
+
+/*
+ * cluster_cr_cache_lookup -- probe under the per-entry lifecycle-epoch fence
+ *   (spec-5.53 D2c, the L1 half of "L1+L2 same fence").  Returns the cached CR
+ *   page (immutable; valid until the next cluster_cr_cache_* call in this
+ *   backend) ONLY when an entry's key matches AND its stamped pool_epoch equals
+ *   `cur_epoch`; otherwise NULL (miss / disabled / stale epoch).  An exact-key
+ *   match whose stamped epoch is older than `cur_epoch` (a DROP/TRUNCATE/
+ *   relfilenode reuse/sinval since the image was cached) is NOT served (rule
+ *   8.A: never a stale hit).  *out_miss_reason (may be NULL) classifies a miss
+ *   per CR_CACHE_MISS_* so the caller can bump the matching mismatch counter.
+ *   Pass cur_epoch == 0 (L2 disabled) to make the epoch fence a no-op (entries
+ *   stamped 0; pure exact-key, spec-3.10 behavior).
+ */
+extern const char *cluster_cr_cache_lookup(const ClusterCRCacheKey *key, uint64 cur_epoch,
+										   int *out_miss_reason);
 
 /*
  * cluster_cr_cache_victim_slot -- reserve a BLCKSZ slot for `key` to construct
- *   into.  Clock-evicts a victim if at capacity (*evicted set true iff a valid
- *   entry was displaced).  The slot is left INVALID until commit, so a throwing
- *   construction never leaves a half-built entry servable.  When disabled,
- *   returns the backend-local fallback buffer and sets *evicted = false.
+ *   into, stamping it with `cur_epoch` (spec-5.53 D2c).  Clock-evicts a victim
+ *   if at capacity (*evicted set true iff a valid entry was displaced).  The
+ *   slot is left INVALID until commit, so a throwing construction never leaves a
+ *   half-built entry servable.  When disabled, returns the backend-local
+ *   fallback buffer and sets *evicted = false.
  */
-extern char *cluster_cr_cache_victim_slot(const ClusterCRCacheKey *key, bool *evicted);
+extern char *cluster_cr_cache_victim_slot(const ClusterCRCacheKey *key, uint64 cur_epoch,
+										  bool *evicted);
 
 /*
  * cluster_cr_cache_commit_slot -- mark the slot reserved by the last

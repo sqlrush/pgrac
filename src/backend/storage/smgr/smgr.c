@@ -64,6 +64,7 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_guc.h"		/* PGRAC: cluster_enabled */
 #include "cluster/cluster_cr_pool.h"			/* PGRAC: spec-5.51 CR pool epoch bump */
+#include "cluster/cluster_inject.h"			/* PGRAC: spec-5.53 D2b skip-bump fault */
 #include "cluster/storage/cluster_smgr.h"		/* PGRAC: smgrsw[1] + spec-2.7 hooks */
 #endif
 #include "storage/smgr.h"
@@ -573,16 +574,31 @@ smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo)
 		}
 
 		/*
-		 * PGRAC: spec-5.51 D5 — bump the shared CR pool lifecycle epoch on ANY
-		 * relfilenode unlink (DROP / TRUNCATE / VACUUM FULL / CLUSTER all reach
-		 * here for the freed relfilenode).  This is intentionally OUTSIDE the
-		 * CLUSTER_SMGR_SMGRSW_INDEX filter above: the CR pool caches CR images
-		 * for ALL relations (md.c-routed included), so a relfilenode reuse after
-		 * a non-cluster_smgr drop must still invalidate the pool or a later
-		 * relation reusing the relfilenumber could false-hit a stale image (rule
-		 * 8.A).  O(1) atomic; a no-op when the pool is disabled.
+		 * PGRAC: spec-5.51 D5 / spec-5.53 D2b — bump the shared CR pool lifecycle
+		 * epoch on ANY relfilenode unlink.  This is the PROVABLY-COMPLETE reuse
+		 * floor: relNumber=Oid is reusable, so a stale CR image keyed by a freed
+		 * relNumber must be fenced before that number can be re-allocated (rule
+		 * 8.A; F0-10).  Completeness rests on a single chokepoint: every physical
+		 * relfilenode unlink funnels through smgrdounlinkall, and the bump is here,
+		 * UNCONDITIONAL (only cluster_enabled-gated; intentionally OUTSIDE the
+		 * CLUSTER_SMGR_SMGRSW_INDEX filter above — the spec-5.51 H1 regression was
+		 * exactly a narrow gate that missed md.c heaps).  smgrdounlinkall's callers
+		 * cover every relfilenode-free path:
+		 *   - catalog/storage.c smgrDoPendingDeletes   (commit: DROP, TRUNCATE old
+		 *     relfilenode via RelationSetNewRelfilenumber, CLUSTER/VACUUM FULL old
+		 *     via swap_relation_files — all register pendingDeletes)
+		 *   - utils/cache/relcache.c                    (RelationSetNewRelfilenumber)
+		 *   - storage/smgr/md.c                         (redo replay of unlink)
+		 * A new relation can only re-use a relNumber after the old file is unlinked
+		 * (GetNewRelFileNumber's access(F_OK) collision), i.e. strictly AFTER this
+		 * bump — so reuse is always fenced.  O(1) atomic; a no-op when the pool is
+		 * disabled.  spec-5.53 D2b fault-inject: when armed, skip the bump for ONE
+		 * unlink to prove the bump is load-bearing (a "missed bump" leaves the
+		 * epoch un-advanced — the regression is observable in cr_pool_epoch).
 		 */
-		cluster_cr_pool_bump_epoch();
+		CLUSTER_INJECTION_POINT("cluster-cr-skip-epoch-bump");
+		if (!cluster_injection_should_skip("cluster-cr-skip-epoch-bump"))
+			cluster_cr_pool_bump_epoch();
 	}
 #endif
 

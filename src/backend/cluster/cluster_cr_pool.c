@@ -82,6 +82,19 @@ typedef struct ClusterCRPoolShared {
 	pg_atomic_uint64 evict_count;
 	pg_atomic_uint64 epoch_bump_count;
 	pg_atomic_uint64 publish_stale_release_count;
+	/*
+	 * spec-5.53 D5: identity/reuse-fence mismatch diagnostics (dumped under the
+	 * 'cr' category).  key/epoch/base_lsn are most-specific near-miss buckets set
+	 * on a lookup miss; generation is the publish-side ABA; locator_reuse_reject
+	 * is the catalog-incarnation belt's 8.A safety-gate observable and stays 0 in
+	 * this build (D0 = RED → floor-only; the floor attributes relfilenode-reuse
+	 * MISSes to epoch_mismatch, spec-5.53 §3.2).
+	 */
+	pg_atomic_uint64 key_mismatch_count;
+	pg_atomic_uint64 epoch_mismatch_count;
+	pg_atomic_uint64 generation_mismatch_count;
+	pg_atomic_uint64 base_lsn_mismatch_count;
+	pg_atomic_uint64 locator_reuse_reject_count;
 	ClusterCRPoolSlot slots[FLEXIBLE_ARRAY_MEMBER];
 } ClusterCRPoolShared;
 
@@ -214,6 +227,11 @@ cluster_cr_pool_shmem_init(void)
 		pg_atomic_init_u64(&CRPool->evict_count, 0);
 		pg_atomic_init_u64(&CRPool->epoch_bump_count, 0);
 		pg_atomic_init_u64(&CRPool->publish_stale_release_count, 0);
+		pg_atomic_init_u64(&CRPool->key_mismatch_count, 0);
+		pg_atomic_init_u64(&CRPool->epoch_mismatch_count, 0);
+		pg_atomic_init_u64(&CRPool->generation_mismatch_count, 0);
+		pg_atomic_init_u64(&CRPool->base_lsn_mismatch_count, 0);
+		pg_atomic_init_u64(&CRPool->locator_reuse_reject_count, 0);
 		for (i = 0; i < n; i++) {
 			memset(&CRPool->slots[i].key, 0, sizeof(ClusterCRCacheKey));
 			CRPool->slots[i].state = CRPOOL_FREE;
@@ -271,6 +289,7 @@ cluster_cr_pool_lookup_copy(const ClusterCRCacheKey *key, char *dst)
 	int lo, hi, i;
 	uint64 cur;
 	bool hit = false;
+	bool near_epoch = false; /* spec-5.53 D5: exact-key slot at a stale epoch */
 
 	if (CRPool == NULL || key == NULL || dst == NULL)
 		return false;
@@ -279,23 +298,50 @@ cluster_cr_pool_lookup_copy(const ClusterCRCacheKey *key, char *dst)
 	seg = cr_pool_seg_of(key);
 	cr_pool_seg_range(seg, &lo, &hi);
 
+	/*
+	 * spec-5.53 D5: while scanning for the exact hit, note an exact-key slot that
+	 * is at a STALE epoch (the L2 reuse fence firing across backends).  This is
+	 * reliable: an exact key hashes to this same segment.  The over-miss
+	 * near-miss buckets (base_lsn / key) are classified at L1 instead, where the
+	 * scan is linear — at L2 a churned/diverged key hashes to a DIFFERENT segment
+	 * (cr_pool_seg_of mixes read_scn + base_page_lsn) so a near-match here is not
+	 * reliably visible.
+	 */
 	LWLockAcquire(cr_pool_seg_lock(seg), LW_SHARED);
 	for (i = lo; i < hi; i++) {
 		ClusterCRPoolSlot *s = &CRPool->slots[i];
 
-		/* Exact-key + epoch match (8.A no-false-hit).  Never serve RESERVED. */
-		if (s->state == CRPOOL_VALID && s->pool_epoch == cur
-			&& cluster_cr_cache_key_equal(&s->key, key)) {
-			pg_atomic_write_u32(&s->ref, 1); /* second chance */
-			memcpy(dst, s->page, BLCKSZ);	 /* copy-out WHILE locked */
-			hit = true;
-			break;
+		if (s->state != CRPOOL_VALID)
+			continue; /* never serve / classify FREE or RESERVED */
+
+		/* Exact-key + epoch match (8.A no-false-hit). */
+		if (cluster_cr_cache_key_equal(&s->key, key)) {
+			if (s->pool_epoch == cur) {
+				pg_atomic_write_u32(&s->ref, 1); /* second chance */
+				memcpy(dst, s->page, BLCKSZ);	 /* copy-out WHILE locked */
+				hit = true;
+				break;
+			}
+			/* full key match, stale epoch: a relfilenode lifecycle event (DROP /
+			 * TRUNCATE / reuse / sinval) happened since install — the epoch fence
+			 * forces a MISS (rule 8.A: never a stale hit).  Keep scanning: after a
+			 * reuse the segment can hold BOTH this stale slot AND a fresh
+			 * current-epoch slot for the same key, and the current one must hit. */
+			near_epoch = true;
+			continue;
 		}
 	}
 	LWLockRelease(cr_pool_seg_lock(seg));
 
-	pg_atomic_fetch_add_u64(hit ? &CRPool->hit_count : &CRPool->miss_count, 1);
-	return hit;
+	if (hit) {
+		pg_atomic_fetch_add_u64(&CRPool->hit_count, 1);
+		return true;
+	}
+
+	pg_atomic_fetch_add_u64(&CRPool->miss_count, 1);
+	if (near_epoch)
+		pg_atomic_fetch_add_u64(&CRPool->epoch_mismatch_count, 1);
+	return false;
 }
 
 /* ============================================================
@@ -404,10 +450,15 @@ cluster_cr_pool_publish(const ClusterCRPoolHandle *h, const char *page)
 	s = &CRPool->slots[h->slot_idx];
 
 	/* Generation mismatch: the slot was recycled by someone else since reserve.
-	 * Do not touch it (it is now theirs). */
+	 * Do not touch it (it is now theirs).  spec-5.53 D5: count the ABA case
+	 * (generation moved) distinctly so two-phase-insert contention is observable. */
 	if (s->state != CRPOOL_RESERVED || s->generation != h->generation
 		|| !cluster_cr_cache_key_equal(&s->key, &h->key)) {
+		bool aba = (s->generation != h->generation);
+
 		LWLockRelease(cr_pool_seg_lock(h->seg));
+		if (aba)
+			pg_atomic_fetch_add_u64(&CRPool->generation_mismatch_count, 1);
 		return;
 	}
 
@@ -471,6 +522,47 @@ CR_POOL_COUNTER_ACCESSOR(cluster_cr_pool_abort_count, abort_count)
 CR_POOL_COUNTER_ACCESSOR(cluster_cr_pool_evict_count, evict_count)
 CR_POOL_COUNTER_ACCESSOR(cluster_cr_pool_epoch_bump_count, epoch_bump_count)
 CR_POOL_COUNTER_ACCESSOR(cluster_cr_pool_publish_stale_release_count, publish_stale_release_count)
+/* spec-5.53 D5: identity/reuse-fence mismatch diagnostics. */
+CR_POOL_COUNTER_ACCESSOR(cluster_cr_pool_key_mismatch_count, key_mismatch_count)
+CR_POOL_COUNTER_ACCESSOR(cluster_cr_pool_epoch_mismatch_count, epoch_mismatch_count)
+CR_POOL_COUNTER_ACCESSOR(cluster_cr_pool_generation_mismatch_count, generation_mismatch_count)
+CR_POOL_COUNTER_ACCESSOR(cluster_cr_pool_base_lsn_mismatch_count, base_lsn_mismatch_count)
+CR_POOL_COUNTER_ACCESSOR(cluster_cr_pool_locator_reuse_reject_count, locator_reuse_reject_count)
+
+/*
+ * cluster_cr_pool_note_l1_epoch_mismatch -- the backend-local L1 fence
+ * (cluster_cr_cache.c) rejected an exact-key entry whose stamped epoch was stale
+ * (spec-5.53 D2c).  Fold it into the SAME epoch_mismatch counter as the L2
+ * per-slot fence so "L1+L2 same fence" reports one number.  No-op when the pool
+ * is disabled (epoch is 0, so the L1 fence never rejects).
+ */
+void
+cluster_cr_pool_note_l1_epoch_mismatch(void)
+{
+	if (CRPool != NULL)
+		pg_atomic_fetch_add_u64(&CRPool->epoch_mismatch_count, 1);
+}
+
+/*
+ * cluster_cr_pool_note_base_lsn_mismatch / _key_mismatch -- the backend-local L1
+ * scan (cluster_cr_cache.c, reliable because it is linear) attributed a MISS to
+ * a churned page version (base_lsn) or a diverged snapshot (read_scn).  Recorded
+ * in the pool region so all five mismatch diagnostics dump together (spec-5.53
+ * D5).  No-op when the pool is disabled.
+ */
+void
+cluster_cr_pool_note_base_lsn_mismatch(void)
+{
+	if (CRPool != NULL)
+		pg_atomic_fetch_add_u64(&CRPool->base_lsn_mismatch_count, 1);
+}
+
+void
+cluster_cr_pool_note_key_mismatch(void)
+{
+	if (CRPool != NULL)
+		pg_atomic_fetch_add_u64(&CRPool->key_mismatch_count, 1);
+}
 
 int
 cluster_cr_pool_live_entries(void)

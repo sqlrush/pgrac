@@ -440,6 +440,16 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	{ .name = "cr_construct_delay_us" },
 
 	/*
+	 * spec-5.53 D2b — provably-complete relfilenode-reuse epoch floor (1 entry).
+	 * SKIP-style: when armed, smgrdounlinkall skips the CR pool lifecycle epoch
+	 * bump for ONE relfilenode unlink, simulating a "missed bump" regression
+	 * (cf. the spec-5.51 H1 narrow-gate miss).  The fault-inject test then proves
+	 * the bump is the load-bearing floor: with it skipped, a real DROP does NOT
+	 * advance cr_pool_epoch (the regression is observable / caught).
+	 */
+	{ .name = "cluster-cr-skip-epoch-bump" },
+
+	/*
 	 * spec-4.1 D7 — per-thread WAL routing (2 NEW points).
 	 *
 	 *	cluster-wal-thread-validate-pre:

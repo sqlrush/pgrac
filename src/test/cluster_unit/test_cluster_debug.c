@@ -251,6 +251,11 @@ uint64 cluster_cr_pool_abort_count(void);
 uint64 cluster_cr_pool_evict_count(void);
 uint64 cluster_cr_pool_epoch_bump_count(void);
 uint64 cluster_cr_pool_publish_stale_release_count(void);
+uint64 cluster_cr_pool_key_mismatch_count(void);
+uint64 cluster_cr_pool_epoch_mismatch_count(void);
+uint64 cluster_cr_pool_generation_mismatch_count(void);
+uint64 cluster_cr_pool_base_lsn_mismatch_count(void);
+uint64 cluster_cr_pool_locator_reuse_reject_count(void);
 int cluster_cr_pool_live_entries(void);
 uint64
 cluster_cr_pool_current_epoch(void)
@@ -294,6 +299,31 @@ cluster_cr_pool_epoch_bump_count(void)
 }
 uint64
 cluster_cr_pool_publish_stale_release_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_pool_key_mismatch_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_pool_epoch_mismatch_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_pool_generation_mismatch_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_pool_base_lsn_mismatch_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_pool_locator_reuse_reject_count(void)
 {
 	return 0;
 }

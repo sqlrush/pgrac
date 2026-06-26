@@ -365,10 +365,117 @@ UT_TEST(test_counters_hit_miss)
 }
 
 
+UT_TEST(test_relfilenode_reuse_floor)
+{
+	/*
+	 * spec-5.53 U5/U8 (8.A core, D2b floor): the relfilenode-reuse over-hit
+	 * (F0-10).  relNumber=Oid is reusable: rel A (relNumber R) is cached, A is
+	 * DROPped (epoch bump), then a NEW rel B reuses relNumber R.  Even in the
+	 * WORST case — B's block coincides on the exact same key (block/read_scn/
+	 * base_page_lsn) as A's cached image — the lifecycle-epoch floor must force a
+	 * MISS (never serve A's stale image for B).  This is the floor working under
+	 * a normal bump (the provably-complete bump at smgrdounlinkall); the
+	 * relfilenode-reuse MISS is attributed to epoch_mismatch (D0=RED floor-only,
+	 * §3.2: locator_reuse_reject is the belt's counter and stays 0).
+	 */
+	ClusterCRCacheKey ka = mk_key(42, 0, (SCN)50, (XLogRecPtr)10); /* rel A, relNumber 42 */
+	char dst[BLCKSZ];
+	uint64 epoch0, reject0;
+
+	pool_init(64);
+	pool_install(&ka, 0xAA); /* A's CR image cached */
+	UT_ASSERT_EQ((int)cluster_cr_pool_lookup_copy(&ka, dst), 1);
+	UT_ASSERT_EQ((int)(unsigned char)dst[0], 0xAA);
+
+	epoch0 = cluster_cr_pool_epoch_mismatch_count();
+	reject0 = cluster_cr_pool_locator_reuse_reject_count();
+
+	/* DROP A -> relfilenode 42 unlinked -> the provably-complete floor bump. */
+	cluster_cr_pool_bump_epoch();
+
+	/*
+	 * rel B reuses relNumber 42 and (worst case) hits the identical key.  The
+	 * epoch floor forces a MISS: A's image is never served for B (rule 8.A).
+	 */
+	memset(dst, 0xEE, BLCKSZ); /* poison: a stale hit would overwrite this */
+	UT_ASSERT_EQ((int)cluster_cr_pool_lookup_copy(&ka, dst), 0); /* MISS, not A's image */
+	UT_ASSERT_EQ((int)(unsigned char)dst[0], 0xEE);				 /* dst untouched */
+
+	/* the reuse MISS was attributed to the epoch floor, and the belt counter
+	 * (catalog-incarnation, D0=RED → absent) stayed 0. */
+	UT_ASSERT_EQ((int)(cluster_cr_pool_epoch_mismatch_count() == epoch0 + 1), 1);
+	UT_ASSERT_EQ((int)(cluster_cr_pool_locator_reuse_reject_count() == reject0), 1);
+
+	/* B can now cache its OWN image at the new epoch and hit it. */
+	pool_install(&ka, 0xBB);
+	UT_ASSERT_EQ((int)cluster_cr_pool_lookup_copy(&ka, dst), 1);
+	UT_ASSERT_EQ((int)(unsigned char)dst[0], 0xBB); /* B's image, never A's */
+}
+
+UT_TEST(test_mismatch_generation_counter)
+{
+	/* spec-5.53 D5/U12: the publish-side ABA (generation moved) bumps
+	 * generation_mismatch (distinct from the epoch-stale release). */
+	ClusterCRCacheKey k = mk_key(100, 0, (SCN)50, (XLogRecPtr)10);
+	ClusterCRPoolHandle h1, h2;
+	char page[BLCKSZ];
+	uint64 gen0;
+
+	pool_init(16); /* per_seg == 1 -> same slot reused */
+	UT_ASSERT_EQ((int)cluster_cr_pool_reserve(&k, &h1), 1);
+	cluster_cr_pool_abort(&h1);								/* gen++ */
+	UT_ASSERT_EQ((int)cluster_cr_pool_reserve(&k, &h2), 1); /* SAME slot, newer gen */
+
+	gen0 = cluster_cr_pool_generation_mismatch_count();
+	memset(page, 0, BLCKSZ);
+	page[0] = (char)0xA1;
+	cluster_cr_pool_publish(&h1, page); /* stale gen on RESERVED slot -> ABA reject */
+	UT_ASSERT_EQ((int)(cluster_cr_pool_generation_mismatch_count() == gen0 + 1), 1);
+}
+
+UT_TEST(test_mismatch_counters_all_five)
+{
+	/*
+	 * spec-5.53 D5/U15: all five mismatch diagnostics increment accurately, and
+	 * locator_reuse_reject (the catalog-incarnation belt observable) stays 0 in
+	 * this D0=RED floor-only build.  L1-detected near-misses (key / base_lsn /
+	 * epoch) record into the shared pool counters via the note helpers (the
+	 * classification itself is covered by test_cluster_cr_cache.c); L2 epoch and
+	 * publish-ABA are exercised by the dedicated tests above.
+	 */
+	uint64 k0, e0, b0, g0, r0;
+	ClusterCRCacheKey k = mk_key(100, 0, (SCN)50, (XLogRecPtr)10);
+	char dst[BLCKSZ];
+
+	pool_init(64);
+	k0 = cluster_cr_pool_key_mismatch_count();
+	e0 = cluster_cr_pool_epoch_mismatch_count();
+	b0 = cluster_cr_pool_base_lsn_mismatch_count();
+	g0 = cluster_cr_pool_generation_mismatch_count();
+	r0 = cluster_cr_pool_locator_reuse_reject_count();
+
+	cluster_cr_pool_note_key_mismatch();
+	cluster_cr_pool_note_base_lsn_mismatch();
+	cluster_cr_pool_note_l1_epoch_mismatch();
+
+	/* L2 epoch fence: install, bump, lookup stale -> epoch_mismatch (a 2nd one) */
+	pool_install(&k, 0x33);
+	cluster_cr_pool_bump_epoch();
+	UT_ASSERT_EQ((int)cluster_cr_pool_lookup_copy(&k, dst), 0);
+
+	UT_ASSERT_EQ((int)(cluster_cr_pool_key_mismatch_count() == k0 + 1), 1);
+	UT_ASSERT_EQ((int)(cluster_cr_pool_epoch_mismatch_count() == e0 + 2), 1); /* L1 note + L2 */
+	UT_ASSERT_EQ((int)(cluster_cr_pool_base_lsn_mismatch_count() == b0 + 1), 1);
+	UT_ASSERT_EQ((int)(cluster_cr_pool_generation_mismatch_count() == g0), 1); /* untouched here */
+	/* locator_reuse_reject is the belt observable: never bumped in floor-only. */
+	UT_ASSERT_EQ((int)(cluster_cr_pool_locator_reuse_reject_count() == r0), 1);
+	UT_ASSERT_EQ((int)(cluster_cr_pool_locator_reuse_reject_count() == 0), 1);
+}
+
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(12);
+	UT_PLAN(15);
 
 	UT_RUN(test_disabled_zero_memory);
 	UT_RUN(test_install_then_hit_copy_out);
@@ -382,6 +489,9 @@ main(int argc, char **argv)
 	UT_RUN(test_publish_epoch_stale_releases);
 	UT_RUN(test_clock_eviction_at_capacity);
 	UT_RUN(test_counters_hit_miss);
+	UT_RUN(test_relfilenode_reuse_floor);
+	UT_RUN(test_mismatch_generation_counter);
+	UT_RUN(test_mismatch_counters_all_five);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

@@ -832,6 +832,45 @@ cr_build_cache_key(Buffer buf, SCN read_scn)
 	return key;
 }
 
+/*
+ * spec-5.53 D3 — MISS-forcing rules (the eight categories; rule 8.A: any one
+ * uncertain → MISS → reconstruct, never a stale hit).  Every category below maps
+ * to a concrete mechanism already present on this path and an observable
+ * counter; the set is exhaustive (no relfilenode lifecycle / page version /
+ * snapshot / slot-reuse case can over-hit):
+ *
+ *   trigger                              mechanism                         counter
+ *   1 DROP → different relid reuse       pool_epoch bump (D2b floor)       epoch_mismatch
+ *   2 TRUNCATE (same relid, new          old relfilenode unlink → bump     epoch_mismatch
+ *     relfilenode)
+ *   3 VACUUM FULL / CLUSTER (same        swap → old unlink → bump          epoch_mismatch
+ *     relid, swapped relfilenode)
+ *   4 page rewrite (HOT-prune /          base_page_lsn in key → key differs base_lsn_mismatch
+ *     VACUUM relayout)
+ *   5 base_page_lsn churn (hint bit /    base_page_lsn in key → key differs base_lsn_mismatch
+ *     neighbour-row change)
+ *   6 different read_scn (new snapshot)  read_scn in key → key differs      key_mismatch
+ *   7 slot reuse / hash collision        field-wise key_equal + slot gen    key/generation_mismatch
+ *   8 belt source unavailable / uncertain fail-closed MISS (D0=RED: no belt; epoch_mismatch
+ *                                        the epoch floor is the fence)
+ *
+ * INV-K2 (fail-closed): if any signal is unavailable / inconsistent / uncertain,
+ * MISS and reconstruct (cluster_cr_construct_block_into, spec-3.9) — a CR cache
+ * may ALWAYS miss safely; it must NEVER false-hit.
+ *
+ * spec-5.53 D4 — ABA / lifecycle combination invariant.  A served image must
+ * pass ALL of these independent guards; any single one failing forces a MISS, so
+ * no single mechanism is load-bearing alone (defence in depth):
+ *   (a) field-wise key_equal               (canonical, never memcmp; F0-6)
+ *   (b) pool_epoch == current              (D2b floor; L1 per-entry + L2 per-slot
+ *                                           = "L1+L2 same fence", D2c)
+ *   (c) slot.generation == handle.generation  (two-phase publish ABA; F0-21)
+ *   (d) commit-time epoch recheck          (serve-but-don't-cache if epoch moved
+ *                                           during construction; spec-5.51 §3.4)
+ * (D0=RED → there is no catalog-incarnation belt; correctness rests on the
+ * provably-complete bump completeness of (b), honestly NOT a self-validating
+ * token — see cluster_cr_cache.h / spec-5.53 §3.2.)
+ */
 const char *
 cluster_cr_lookup_or_construct(Buffer buf, SCN read_scn)
 {
@@ -857,34 +896,55 @@ cluster_cr_lookup_or_construct(Buffer buf, SCN read_scn)
 	 *     L1 (serve-but-skip-cache) so no stale-epoch entry persists.
 	 */
 	ClusterCRCacheKey key = cr_build_cache_key(buf, read_scn);
-	static uint64 cr_last_seen_pool_epoch = 0; /* backend-local */
 	uint64 start_epoch;
 	const char *hit;
 	char *slot;
 	bool evicted = false;
+	int miss_reason = CR_CACHE_MISS_NONE;
 
 	start_epoch = cluster_cr_pool_current_epoch(); /* 0 when L2 disabled */
-	if (start_epoch != 0 && start_epoch != cr_last_seen_pool_epoch) {
-		cluster_cr_cache_reset(); /* spec-5.51 D4: L1 epoch-flush on lifecycle bump */
-		cr_last_seen_pool_epoch = start_epoch;
-	}
 
-	hit = cluster_cr_cache_lookup(&key);
+	/*
+	 * spec-5.53 D2c: per-entry L1 lifecycle-epoch fence ("L1+L2 same fence").
+	 * cluster_cr_cache_lookup serves an entry only when its stamped epoch ==
+	 * start_epoch; a stale-epoch exact-key match is reported and counted, never
+	 * served (rule 8.A: a relfilenode reuse can never serve a stale image).  This
+	 * replaces the spec-5.51 D4 coarse whole-L1 flush with a finer per-entry
+	 * reject (stale entries clock-evict lazily), mirroring the L2 per-slot epoch
+	 * gate.  spec-5.53 D5: the linear L1 scan also attributes a miss to a churned
+	 * page version / diverged snapshot for the over-miss diagnostics.
+	 */
+	hit = cluster_cr_cache_lookup(&key, start_epoch, &miss_reason);
+	switch (miss_reason) {
+	case CR_CACHE_MISS_EPOCH:
+		cluster_cr_pool_note_l1_epoch_mismatch(); /* L1 reuse fence fired */
+		break;
+	case CR_CACHE_MISS_BASE_LSN:
+		cluster_cr_pool_note_base_lsn_mismatch();
+		break;
+	case CR_CACHE_MISS_KEY:
+		cluster_cr_pool_note_key_mismatch();
+		break;
+	default:
+		break;
+	}
 	if (hit != NULL) {
-		/* spec-5.51: recheck epoch before returning the L1 hit. */
+		/* spec-5.51 §3.4: recheck the epoch for the within-call race (a bump
+		 * between the lookup and here makes the start_epoch-stamped entry stale). */
 		if (start_epoch == 0 || cluster_cr_pool_current_epoch() == start_epoch) {
 			if (CRShared != NULL)
 				pg_atomic_fetch_add_u64(&CRShared->cr_cache_hit_count, 1);
 			return hit;
 		}
-		/* epoch advanced mid-lookup: the L1 hit may be stale -> drop + rebuild */
-		cluster_cr_cache_reset();
-		start_epoch = cr_last_seen_pool_epoch = cluster_cr_pool_current_epoch();
+		/* epoch advanced mid-lookup: drop this now-stale hit and rebuild at the
+		 * new epoch (the entry keeps its old stamp, so it can never be re-served). */
+		cluster_cr_pool_note_l1_epoch_mismatch();
+		start_epoch = cluster_cr_pool_current_epoch();
 	}
 	if (CRShared != NULL)
 		pg_atomic_fetch_add_u64(&CRShared->cr_cache_miss_count, 1);
 
-	slot = cluster_cr_cache_victim_slot(&key, &evicted);
+	slot = cluster_cr_cache_victim_slot(&key, start_epoch, &evicted);
 	if (evicted && CRShared != NULL)
 		pg_atomic_fetch_add_u64(&CRShared->cr_cache_evict_count, 1);
 
