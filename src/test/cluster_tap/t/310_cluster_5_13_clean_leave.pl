@@ -219,11 +219,12 @@ $pair->stop_pair;
 
 
 # ----------
-# L11 MIXED-MODE (F6): node0 clean_leave_enabled=off, node1=on.  node1's leave
-# is accepted locally but a disabled survivor replies LEAVE_DRAIN_NAK to the
-# announce, so node1 cleanly ABORTS (back to idle) — NEVER commits, NEVER
-# escalates.  (A synchronous rejected:peers_not_all_enabled would need a
-# backend<->LMON preflight handshake; v1 catches it via the announce-NAK.)
+# L11 MIXED-MODE (F6 preflight, D13b): node0 clean_leave_enabled=off, node1=on.
+# node1's request drives the drain inline; the disabled survivor replies
+# LEAVE_DRAIN_NAK(disabled) to the announce, caught in the pre-quiesce NAK wait
+# BEFORE any destructive step, so the request returns the spec's synchronous
+# reason rejected:peers_not_all_enabled (Hardening v1.0.1 P2) — NEVER commits,
+# NEVER escalates, ends back at idle.
 # ----------
 my $mixed = PostgreSQL::Test::ClusterPair->new_pair(
 	'clean_leave_mixed',
@@ -243,9 +244,10 @@ usleep(3_000_000);
 ok($mixed->wait_for_peer_state(1, 0, 'connected', 30), 'L11 mixed pair connected');
 
 my $mreq = $mixed->node1->safe_psql('postgres', 'SELECT pg_cluster_clean_leave_request()');
-# v1: the leave is accepted locally; the disabled-survivor NAK aborts it async.
-ok($mreq eq 'accepted' || $mreq =~ /^rejected:/,
-	"L11 node1 request accepted-or-rejected (got: $mreq)");
+# Hardening v1.0.1 (P2): the F6 preflight surfaces the disabled-survivor NAK as
+# the spec's synchronous reject code, not the bare accepted-then-async-abort.
+is($mreq, 'rejected:peers_not_all_enabled',
+	"L11 node1 request rejected:peers_not_all_enabled (F6 preflight; got: $mreq)");
 # It must end back at idle (clean abort) and NEVER reach committed.
 ok(poll_until($mixed->node1,
 		q{SELECT phase = 'idle' FROM pg_cluster_clean_leave_state}, 't', 40,

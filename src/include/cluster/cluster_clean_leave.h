@@ -167,6 +167,28 @@ typedef struct ClusterLeaveState {
 	pg_atomic_uint64 serve_gate_fail_closed_count;
 
 	/*
+	 * Hardening v1.0.1 fields.
+	 *   nak_reason (P2): the ClusterLeaveNakReason of the latest survivor NAK, so
+	 *     the request can map a DISABLED NAK to rejected:peers_not_all_enabled
+	 *     (F6 preflight, D13b) rather than the bare ACCEPTED-then-async-abort.
+	 *   commit_point_observed (P1-1, leaving node): the leaving node has observed
+	 *     the commit (epoch advanced, dead_gen unchanged); past this point the
+	 *     leave can NOT be un-committed, so the barrier deadline must NOT escalate.
+	 *   committed_durable_confirmed (P1-1, leaving node): the coordinator has told
+	 *     us (LEAVE_COMMITTED) that the COMMITTED marker is majority-durable; only
+	 *     then does the leaving node reach COMMITTED ("may exit") — the §2.5 /
+	 *     P1-V0.7 exit gate (durable truth-source must exist before departure).
+	 *   committed_marker_durable (P1-1, coordinator): this coordinator's COMMITTED
+	 *     marker reached a voting-disk majority.  Until set, cl_survivor_tick keeps
+	 *     retrying the marker write (never 3-then-give-up) and does NOT release the
+	 *     leave-tracking slot.
+	 */
+	pg_atomic_uint32 nak_reason;
+	pg_atomic_uint32 commit_point_observed;
+	pg_atomic_uint32 committed_durable_confirmed;
+	pg_atomic_uint32 committed_marker_durable;
+
+	/*
 	 * Voting-disk leave-marker submit mailbox (§2.5 two-phase commit) — a
 	 * local single-producer/single-consumer handshake mirroring the spec-4.12
 	 * fence-marker mailbox.  Producer = this node's driver/LMON staging a marker;
@@ -198,8 +220,10 @@ typedef struct ClusterLeaveState {
 /* LEAVE_DRAIN_NAK reasons (why a survivor refuses the clean leave). */
 typedef enum ClusterLeaveNakReason {
 	CLUSTER_LEAVE_NAK_NONE = 0,
-	CLUSTER_LEAVE_NAK_DISABLED = 1,		/* survivor clean_leave_enabled = off */
-	CLUSTER_LEAVE_NAK_NOT_IN_QUORUM = 2 /* survivor not in quorum (cannot commit) */
+	CLUSTER_LEAVE_NAK_DISABLED = 1,			/* survivor clean_leave_enabled = off */
+	CLUSTER_LEAVE_NAK_NOT_IN_QUORUM = 2,	/* survivor not in quorum (cannot commit) */
+	CLUSTER_LEAVE_NAK_LEAVE_IN_PROGRESS = 3 /* survivor already tracking a different leave
+											 * (single-leave-at-a-time, Hardening v1.0.1) */
 } ClusterLeaveNakReason;
 
 /*

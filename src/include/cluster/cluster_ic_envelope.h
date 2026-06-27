@@ -213,14 +213,20 @@ typedef enum ClusterICMsgType {
 		   * (ClusterLeaveAckPayload, nak=1): refuse the clean leave (peer disabled /
 		   * not in quorum).  Leaving node CLUSTER_LEAVE_ABORTED (clean abort, no
 		   * escalate, no epoch bump) on any NAK (§3.4). */
-	PGRAC_IC_MSG_LEAVE_COMMIT_READY = 29	/* PGRAC: spec-5.13 D6 — leaving node ->
+	PGRAC_IC_MSG_LEAVE_COMMIT_READY = 29,	/* PGRAC: spec-5.13 D6 — leaving node ->
 		   * survivor coordinator (ClusterLeaveAnnouncePayload, preflight=0): "I have
 		   * drained + every survivor acked; bump the leave epoch now".  The leaving
 		   * node self-drives the drain but the survivor coordinator owns the epoch
 		   * bump (Q6-A); this is the readiness handoff that triggers the coordinator's
 		   * two-phase commit.  Idempotent (re-sent each tick until the CLEAN_LEAVE
 		   * commit is observed; the coordinator ignores it once clean_departed). */
-	/* values 30..255 available for future sub-spec; never reuse 0..29 */
+	PGRAC_IC_MSG_LEAVE_COMMITTED = 30		/* PGRAC: spec-5.13 Hardening v1.0.1 (P1-V0.7) —
+		   * survivor coordinator -> leaving node (ClusterLeaveAnnouncePayload, preflight=0):
+		   * "the COMMITTED marker is majority-durable; the durable truth-source exists,
+		   * you may exit".  Gates the leaving node's BARRIER_WAIT -> COMMITTED transition
+		   * so it never departs before the marker is durable (§2.5 exit gate); re-sent
+		   * each tick while the leaver is alive (idempotent; best-effort delivery). */
+	/* values 31..255 available for future sub-spec; never reuse 0..30 */
 } ClusterICMsgType;
 
 

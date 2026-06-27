@@ -115,6 +115,11 @@ cluster_clean_leave_shmem_init(void)
 		pg_atomic_init_u32(&cl_state->commit_ready_received, 0);
 		pg_atomic_init_u32(&cl_state->announce_sent, 0);
 		pg_atomic_init_u64(&cl_state->serve_gate_fail_closed_count, 0);
+		/* Hardening v1.0.1 (P2 / P1-1). */
+		pg_atomic_init_u32(&cl_state->nak_reason, (uint32)CLUSTER_LEAVE_NAK_NONE);
+		pg_atomic_init_u32(&cl_state->commit_point_observed, 0);
+		pg_atomic_init_u32(&cl_state->committed_durable_confirmed, 0);
+		pg_atomic_init_u32(&cl_state->committed_marker_durable, 0);
 		/* §2.5 leave-marker submit mailbox. */
 		cl_state->qvotec_latch = NULL;
 		pg_atomic_init_u64(&cl_state->marker_request_seq, 0);
@@ -373,17 +378,50 @@ cl_announce_handler(const ClusterICEnvelope *env, const void *payload)
 	}
 
 	/*
-	 * Real announce: enter leave-aware reconfig (record the leaving node +
-	 * bound epoch; CL-I4 fail-closed-until-drained applies from here).  The
-	 * readiness ACK is sent later from the LMON tick (D6) AFTER dropping refs —
-	 * NOT here (that would be a premature ready-to-commit).  Reset the survivor /
-	 * coordinator latches for this fresh leave.
+	 * Hardening v1.0.1 (P1-3, single-leave-at-a-time): the survivor state is a
+	 * single slot (one leave tracked).  If we are ALREADY tracking a DIFFERENT,
+	 * uncommitted leave, do NOT overwrite leaving_node_id — that would silently
+	 * drop the first leave's serve-gate protection (its still-unflushed blocks
+	 * could then be served stale from storage = false-visible, 8.A).  Reject the
+	 * second leave with a NAK so its leaving node clean-aborts and retries later;
+	 * the wire handler ENFORCES the invariant the struct comment only documented.
+	 * A re-announce of the SAME leave is idempotent (fall through, keep baseline).
 	 */
 	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
-	cl_state->leaving_node_id = leaving;
-	cl_state->leave_epoch = p->leave_epoch;
-	pg_atomic_write_u32(&cl_state->survivor_acked, 0);
-	pg_atomic_write_u32(&cl_state->commit_ready_received, 0);
+	if (cl_state->leaving_node_id != -1 && cl_state->leaving_node_id != leaving) {
+		LWLockRelease(&cl_state->lock);
+		cluster_clean_leave_ic_send_ack(env->source_node_id, leaving, p->leave_epoch, true,
+										(uint8)CLUSTER_LEAVE_NAK_LEAVE_IN_PROGRESS);
+		ereport(LOG,
+				(errmsg("cluster clean-leave: node %d announced a leave while node %d's leave is "
+						"in progress; NAK (single-leave-at-a-time)",
+						leaving, cl_state->leaving_node_id)));
+		return;
+	}
+
+	/*
+	 * Real announce: enter leave-aware reconfig (record the leaving node + bound
+	 * epoch; CL-I4 fail-closed-until-drained applies from here).  The readiness
+	 * ACK is sent later from the LMON tick (D6) AFTER dropping refs — NOT here.
+	 * Only capture state on the FIRST announce of this leave (idempotent re-
+	 * announce keeps the original baseline dead_gen).
+	 */
+	if (cl_state->leaving_node_id != leaving) {
+		cl_state->leaving_node_id = leaving;
+		cl_state->leave_epoch = p->leave_epoch;
+		/*
+		 * Hardening v1.0.1 (P1-2, CL-I3 commit-handoff coherence): snapshot THIS
+		 * survivor's CSSD dead_generation when it starts tracking the leave.  The
+		 * coordinator re-checks it at the commit point so a real death intruding
+		 * between BARRIER_WAIT and the epoch bump (dead_gen bumped, but the death's
+		 * fail-stop epoch not yet advanced — invisible to the epoch-only guard)
+		 * fails the commit closed instead of committing on a stale membership view.
+		 */
+		cl_state->leave_baseline_dead_gen = cluster_cssd_get_dead_generation();
+		pg_atomic_write_u32(&cl_state->survivor_acked, 0);
+		pg_atomic_write_u32(&cl_state->commit_ready_received, 0);
+		pg_atomic_write_u32(&cl_state->committed_marker_durable, 0);
+	}
 	LWLockRelease(&cl_state->lock);
 }
 
@@ -412,6 +450,51 @@ cl_commit_ready_handler(const ClusterICEnvelope *env, const void *payload)
 }
 
 /*
+ * cl_committed_handler -- leaving node side (Hardening v1.0.1, P1-V0.7 exit gate):
+ * the survivor coordinator has made the COMMITTED marker majority-durable and
+ * signals that the durable truth-source now exists, so this leaving node may
+ * proceed to COMMITTED and exit.  Only acted on if it is about OUR leave; idem-
+ * potent (the coordinator re-sends each tick until we are gone).
+ */
+static void
+cl_committed_handler(const ClusterICEnvelope *env, const void *payload)
+{
+	const ClusterLeaveAnnouncePayload *p = (const ClusterLeaveAnnouncePayload *)payload;
+
+	(void)env;
+	if (!cluster_enabled || cl_state == NULL)
+		return;
+	if (!cluster_clean_leave_announce_payload_valid(p))
+		return;
+	if (p->leaving_node_id != cluster_node_id)
+		return; /* only the leaving node consumes its own COMMITTED confirmation */
+
+	pg_atomic_write_u32(&cl_state->committed_durable_confirmed, 1);
+}
+
+/*
+ * cl_send_committed -- coordinator -> leaving node: "COMMITTED marker majority-
+ * durable; you may exit" (Hardening v1.0.1).  Point-to-point, re-sent each tick
+ * while the leaver is alive (best-effort; the leaving node's gate is idempotent).
+ */
+static void
+cl_send_committed(int32 leaving, uint64 leave_epoch)
+{
+	ClusterLeaveAnnouncePayload p;
+
+	memset(&p, 0, sizeof(p));
+	p.magic = CLUSTER_CLEAN_LEAVE_IC_MAGIC;
+	p.version = CLUSTER_CLEAN_LEAVE_IC_VERSION;
+	p.leaving_node_id = leaving;
+	p.preflight = 0;
+	p.leave_epoch = leave_epoch;
+	p.cssd_dead_generation = cluster_cssd_get_dead_generation();
+	cluster_clean_leave_announce_compute_crc(&p);
+
+	(void)cluster_ic_send_envelope(PGRAC_IC_MSG_LEAVE_COMMITTED, leaving, &p, (uint32)sizeof(p));
+}
+
+/*
  * cl_ack_handler -- leaving node side: consume a LEAVE_DRAIN_ACK / _NAK.
  *	env->msg_type is the authoritative ACK-vs-NAK routing (envelope CRC-
  *	protected).  Only acted on if the message is about OUR leave.
@@ -433,7 +516,10 @@ cl_ack_handler(const ClusterICEnvelope *env, const void *payload)
 
 	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
 	if (is_nak) {
-		/* any NAK → clean ABORTED (driven by the driver/LMON tick). */
+		/* any NAK → clean ABORTED (driven by the driver/LMON tick).  Record the
+		 * reason (Hardening v1.0.1 P2) so the request can map a DISABLED NAK to
+		 * rejected:peers_not_all_enabled (F6 preflight) rather than bare ACCEPTED. */
+		pg_atomic_write_u32(&cl_state->nak_reason, (uint32)p->nak_reason);
 		pg_atomic_write_u32(&cl_state->nak_received, 1);
 	} else if (p->survivor_node_id >= 0
 			   && p->survivor_node_id < CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES * 8) {
@@ -473,11 +559,19 @@ cluster_clean_leave_register_ic_msg_types(void)
 		.broadcast_ok = false, /* point-to-point to the coordinator */
 		.handler = cl_commit_ready_handler,
 	};
+	const ClusterICMsgTypeInfo committed_info = {
+		.msg_type = PGRAC_IC_MSG_LEAVE_COMMITTED,
+		.name = "leave_committed",
+		.allowed_producer_mask = CLUSTER_IC_PRODUCER_LMON,
+		.broadcast_ok = false, /* point-to-point back to the leaving node */
+		.handler = cl_committed_handler,
+	};
 
 	cluster_ic_register_msg_type(&announce_info);
 	cluster_ic_register_msg_type(&ack_info);
 	cluster_ic_register_msg_type(&nak_info);
 	cluster_ic_register_msg_type(&commit_ready_info);
+	cluster_ic_register_msg_type(&committed_info);
 }
 
 void
@@ -905,6 +999,16 @@ cluster_clean_leave_request(void)
 		return CLUSTER_LEAVE_REQ_REJECTED_DISABLED;
 	if (pg_atomic_read_u32(&cl_state->phase) != CLUSTER_LEAVE_IDLE)
 		return CLUSTER_LEAVE_REQ_REJECTED_IN_PROGRESS;
+	/*
+	 * Hardening v1.0.1 (P1-3, single-leave-at-a-time, request side): this node may
+	 * already be tracking ANOTHER node's in-progress leave as a survivor (phase
+	 * stays IDLE in that role, so the check above does not catch it).  Starting our
+	 * own leave here would overwrite that tracking and drop the other leave's
+	 * serve-gate protection (8.A).  Reject locally; the announce handler is the
+	 * second enforcement point for the race where our announce races another's.
+	 */
+	if (cl_state->leaving_node_id != -1 && cl_state->leaving_node_id != cluster_node_id)
+		return CLUSTER_LEAVE_REQ_REJECTED_IN_PROGRESS;
 	if (!cluster_qvotec_in_quorum())
 		return CLUSTER_LEAVE_REQ_REJECTED_NOT_IN_QUORUM;
 	coordinator = cl_compute_coordinator(cluster_node_id);
@@ -923,7 +1027,11 @@ cluster_clean_leave_request(void)
 		= (uint64)GetCurrentTimestamp() + (uint64)cluster_clean_leave_drain_timeout_ms * 1000ULL;
 	memset(cl_state->ack_bitmap, 0, sizeof(cl_state->ack_bitmap));
 	pg_atomic_write_u32(&cl_state->nak_received, 0);
+	pg_atomic_write_u32(&cl_state->nak_reason, (uint32)CLUSTER_LEAVE_NAK_NONE);
 	pg_atomic_write_u32(&cl_state->announce_sent, 0); /* LMON broadcasts the announce */
+	pg_atomic_write_u32(&cl_state->commit_point_observed, 0);
+	pg_atomic_write_u32(&cl_state->committed_durable_confirmed, 0);
+	pg_atomic_write_u32(&cl_state->committed_marker_durable, 0);
 	LWLockRelease(&cl_state->lock);
 	cl_set_phase(CLUSTER_LEAVE_REQUESTED);
 
@@ -941,6 +1049,28 @@ cluster_clean_leave_request(void)
 	}
 
 	cluster_clean_leave_drive_drain();
+
+	/*
+	 * Hardening v1.0.1 (P2 / F6 preflight, D13b): drive_drain runs INLINE in this
+	 * backend and clean-aborts BEFORE any destructive step on a survivor NAK
+	 * (nothing drained), leaving nak_received set (cl_clean_abort ends in IDLE, so
+	 * we key on nak_received, not the phase).  Surface that as the spec's
+	 * synchronous reject code instead of the bare ACCEPTED: a DISABLED NAK
+	 * (mixed-mode) → rejected:peers_not_all_enabled; a NOT_IN_QUORUM NAK →
+	 * rejected:not_in_quorum.  An escalate (real death/deadline) sets no NAK and
+	 * still returns ACCEPTED — the node leaves via fail-stop, honoring the intent.
+	 */
+	if (pg_atomic_read_u32(&cl_state->nak_received)) {
+		ClusterLeaveNakReason reason
+			= (ClusterLeaveNakReason)pg_atomic_read_u32(&cl_state->nak_reason);
+
+		if (reason == CLUSTER_LEAVE_NAK_NOT_IN_QUORUM)
+			return CLUSTER_LEAVE_REQ_REJECTED_NOT_IN_QUORUM;
+		if (reason == CLUSTER_LEAVE_NAK_LEAVE_IN_PROGRESS)
+			return CLUSTER_LEAVE_REQ_REJECTED_IN_PROGRESS; /* another leave is committing (P1-3) */
+		/* DISABLED (or an unspecified refusal): a survivor is not enabled. */
+		return CLUSTER_LEAVE_REQ_REJECTED_PEERS_NOT_ENABLED;
+	}
 	return CLUSTER_LEAVE_REQ_ACCEPTED;
 }
 
@@ -966,14 +1096,23 @@ cluster_clean_leave_drive_drain(void)
 
 	baseline_epoch = cl_state->leave_epoch;
 
-	/* Wait briefly for an early NAK (a disabled survivor) before quiescing, so a
-	 * mixed-mode leave aborts cleanly before any drain side effect (F6 layer 2).
-	 * The LMON broadcasts the announce concurrently (it is LMON-only); the NAK is
-	 * typically already pending by here (it arrived while the REQUESTED marker
-	 * write blocked), but allow up to ~1s for the announce round-trip. */
-	for (i = 0; i < 100; i++) { /* ~1s */
+	/*
+	 * F6 preflight (Hardening v1.0.1, P2): wait until the LMON has actually
+	 * broadcast the announce AND every alive survivor has replied — either a NAK
+	 * (a disabled / not-in-quorum survivor) or the readiness ACK from all of them
+	 * — BEFORE any destructive drain step.  The announce is LMON-driven (IC sends
+	 * are LMON-only), so its dispatch can lag a tick behind this backend; gating on
+	 * announce_sent + the replies (not a fixed sleep) makes the mixed-mode reject
+	 * deterministic, so the request can return the spec's synchronous
+	 * rejected:peers_not_all_enabled (D13b).  Bounded (~5s, a few LMON ticks) so a
+	 * silently-slow survivor falls through to the drain (a late NAK is still caught
+	 * by the BARRIER_WAIT async abort); a NAK here is a clean abort, no drain.
+	 */
+	for (i = 0; i < 500; i++) { /* up to ~5s */
 		if (pg_atomic_read_u32(&cl_state->nak_received))
 			break;
+		if (pg_atomic_read_u32(&cl_state->announce_sent) && cl_all_survivors_acked(cluster_node_id))
+			break; /* announce out + all alive survivors ready; no refusal */
 		pg_usleep(10 * 1000);
 	}
 	if (pg_atomic_read_u32(&cl_state->nak_received)) {
@@ -1079,15 +1218,31 @@ cl_leaving_barrier_tick(void)
 	 */
 	if (cluster_epoch_get_current() > baseline_epoch) {
 		if (cluster_cssd_get_dead_generation() == cl_state->leave_baseline_dead_gen) {
+			/*
+			 * Commit point observed (our clean-leave epoch was published; no real
+			 * death intruded).  The leave can no longer be un-committed, so from
+			 * here the barrier deadline must NOT escalate (Hardening v1.0.1 P1-1).
+			 */
+			pg_atomic_write_u32(&cl_state->commit_point_observed, 1);
 			LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
 			cl_state->leave_epoch = cluster_epoch_get_current(); /* the committed epoch E */
 			LWLockRelease(&cl_state->lock);
-			cl_set_phase(CLUSTER_LEAVE_COMMITTED);
-			CLUSTER_INJECTION_POINT("cluster-clean-leave-barrier-complete");
-			ereport(LOG,
-					(errmsg("cluster clean-leave: committed at epoch %llu; this node has drained "
-							"and may exit",
-							(unsigned long long)cl_state->leave_epoch)));
+
+			/*
+			 * P1-V0.7 exit gate: reach COMMITTED ("may exit") ONLY after the
+			 * coordinator confirms the COMMITTED marker is majority-durable
+			 * (LEAVE_COMMITTED).  Until then stay in BARRIER_WAIT and re-tick — the
+			 * durable truth-source must exist before this node departs, else a
+			 * survivor restart could not rebuild the clean-departed fact.
+			 */
+			if (pg_atomic_read_u32(&cl_state->committed_durable_confirmed)) {
+				cl_set_phase(CLUSTER_LEAVE_COMMITTED);
+				CLUSTER_INJECTION_POINT("cluster-clean-leave-barrier-complete");
+				ereport(LOG,
+						(errmsg("cluster clean-leave: committed at epoch %llu + COMMITTED marker "
+								"majority-durable; this node has drained and may exit",
+								(unsigned long long)cl_state->leave_epoch)));
+			}
 		} else {
 			cl_escalate(); /* a real death changed the version mid-leave (CL-I3) */
 		}
@@ -1100,8 +1255,11 @@ cl_leaving_barrier_tick(void)
 		return;
 	}
 
-	/* 3. fail-closed deadline. */
-	if ((uint64)GetCurrentTimestamp() > cl_state->barrier_deadline_us) {
+	/* 3. fail-closed deadline — ONLY before the commit point (P1-1: a committed
+	 * leave is never un-committed; post-commit we wait for the durable marker,
+	 * bounded by disk health, and never escalate). */
+	if (!pg_atomic_read_u32(&cl_state->commit_point_observed)
+		&& (uint64)GetCurrentTimestamp() > cl_state->barrier_deadline_us) {
 		cl_escalate();
 		return;
 	}
@@ -1122,15 +1280,31 @@ cl_coordinator_commit(int32 leaving)
 	uint64 baseline_epoch = cl_state->leave_epoch;
 	uint64 new_epoch;
 	ClusterLeaveIntentMarker m;
-	int attempt;
 
 	/* CL-I3 pre-check: refuse to commit a clean leave on a version a real death
 	 * already bumped — the leaving node will then observe a non-CLEAN_LEAVE event
 	 * and escalate.  This is a cheap early-out; the authoritative guard is the
 	 * guarded CAS inside apply_clean_leave_as_coordinator below, which closes the
 	 * check-then-bump TOCTOU at >=3 nodes. */
-	if (cluster_epoch_get_current() != baseline_epoch)
+	/*
+	 * CL-I3 commit-handoff coherence (epoch AND dead_gen): refuse to commit if a
+	 * real death intruded since this survivor started tracking the leave — either
+	 * the death's fail-stop already bumped the epoch, OR (the >=3-node window,
+	 * Hardening v1.0.1 P1-2) CSSD bumped its dead_generation but the fail-stop
+	 * epoch has NOT yet advanced, which an epoch-only check (and the guarded CAS
+	 * below) would miss and commit on a stale membership view.  Uses the same
+	 * unit-tested version_coherent helper as drive_drain so the dead_gen-aware
+	 * coherence holds through the commit handoff; the leaving node then observes
+	 * the eventual foreign event and escalates.
+	 */
+	if (!cluster_clean_leave_version_coherent(baseline_epoch, cluster_epoch_get_current(),
+											  cl_state->leave_baseline_dead_gen,
+											  cluster_cssd_get_dead_generation())) {
+		ereport(LOG, (errmsg("cluster clean-leave: version moved (epoch or dead_generation) before "
+							 "committing node %d; not committing (escalate to fail-stop, CL-I3)",
+							 leaving)));
 		return;
+	}
 
 	/* (1) COMMITTING(E) marker (coordinator's own slot, before the bump; NOT a
 	 * trust basis).  Not durable -> do not commit. */
@@ -1155,22 +1329,28 @@ cl_coordinator_commit(int32 leaving)
 		return; /* CL-I3: stale baseline (or cluster disabled / bad id) */
 	}
 
-	/* (3) COMMITTED(E) marker (after the bump; the ONLY rebuild trust basis).
-	 * Post-commit it MUST become durable — retry; the leave is already committed
-	 * (epoch bumped), so we never revert.  If every retry fails, LOG: the restart
-	 * rebuild simply falls back to fail-stop for this node (a safe no-op since it
-	 * already drained, §2.5 crash window). */
+	/*
+	 * (3) COMMITTED(E) marker (after the bump; the ONLY rebuild trust basis).
+	 * Post-commit it MUST become majority-durable — the durable truth-source must
+	 * exist BEFORE the leaving node departs (P1-V0.7 exit gate; §2.5).  Try once
+	 * here.  If it reaches majority, mark durable + tell the leaving node it may
+	 * exit (LEAVE_COMMITTED).  If NOT, do not give up: committed_marker_durable
+	 * stays 0, cl_survivor_tick retries the marker every tick, and the leaving
+	 * node stays in BARRIER_WAIT (no LEAVE_COMMITTED) until it is durable — it
+	 * never departs without a durable truth-source.  The leave is already
+	 * committed (epoch bumped); we never revert.
+	 */
 	cl_build_marker(&m, CLUSTER_LEAVE_MARKER_PHASE_COMMITTED, leaving, new_epoch);
-	for (attempt = 0; attempt < 3; attempt++) {
-		if (cluster_clean_leave_submit_marker(&m) == CLUSTER_LEAVE_MARKER_SUBMIT_ACK)
-			break;
+	if (cluster_clean_leave_submit_marker(&m) == CLUSTER_LEAVE_MARKER_SUBMIT_ACK) {
+		pg_atomic_write_u32(&cl_state->committed_marker_durable, 1);
+		cl_send_committed(leaving, new_epoch);
+	} else {
+		ereport(
+			LOG,
+			(errmsg("cluster clean-leave: committed node %d at epoch %llu but the COMMITTED "
+					"marker is not yet majority-durable; retrying each tick (leaving node waits)",
+					leaving, (unsigned long long)new_epoch)));
 	}
-	if (attempt == 3)
-		ereport(WARNING,
-				(errmsg("cluster clean-leave: COMMITTED marker for node %d did not reach a "
-						"voting-disk majority after %d attempts; the leave is committed (epoch "
-						"%llu) but a survivor restart will fall back to fail-stop for this node",
-						leaving, attempt, (unsigned long long)new_epoch)));
 
 	ereport(LOG, (errmsg("cluster clean-leave: committed departure of node %d at epoch %llu",
 						 leaving, (unsigned long long)new_epoch)));
@@ -1222,6 +1402,32 @@ cl_survivor_tick(int32 leaving)
 		&& !cluster_reconfig_is_clean_departed(leaving))
 		cl_coordinator_commit(leaving);
 
+	/*
+	 * 2a (Hardening v1.0.1, P1-V0.7 exit gate): after the commit, the coordinator
+	 * must drive the COMMITTED marker to majority-durability — never give up.  If
+	 * the first attempt in cl_coordinator_commit did not reach majority, retry it
+	 * here every tick until it does; once durable, tell the leaving node it may
+	 * exit (LEAVE_COMMITTED), re-sending each tick while the leaver is alive (best-
+	 * effort delivery, idempotent gate).  Until durable the leaving node stays in
+	 * BARRIER_WAIT and never departs without a durable truth-source.
+	 */
+	if (coordinator == cluster_node_id && cluster_reconfig_is_clean_departed(leaving)) {
+		uint64 committed_epoch = cluster_reconfig_get_clean_departed_epoch(leaving);
+
+		if (!pg_atomic_read_u32(&cl_state->committed_marker_durable)) {
+			ClusterLeaveIntentMarker cm;
+
+			cl_build_marker(&cm, CLUSTER_LEAVE_MARKER_PHASE_COMMITTED, leaving, committed_epoch);
+			if (cluster_clean_leave_submit_marker(&cm) == CLUSTER_LEAVE_MARKER_SUBMIT_ACK)
+				pg_atomic_write_u32(&cl_state->committed_marker_durable, 1);
+		}
+		/* Re-send LEAVE_COMMITTED every tick once durable until the leaver is gone
+		 * (best-effort IC): the leaving node will not depart until it receives one,
+		 * and step 3 holds the slot until it is CSSD-dead, so delivery is assured. */
+		if (pg_atomic_read_u32(&cl_state->committed_marker_durable))
+			cl_send_committed(leaving, committed_epoch);
+	}
+
 	/* 2b. EVERY survivor (not just the coordinator) must observe the CLEAN_LEAVE
 	 * commit and, before recording the node clean_departed, invalidate its own
 	 * cached copies of the leaving node's blocks (CL-I5 happens-before: once
@@ -1240,10 +1446,15 @@ cl_survivor_tick(int32 leaving)
 		}
 	}
 
-	/* 3. once the leave is committed (clean_departed), this survivor is done with
-	 * it — return its local leave state to idle (clean_departed persists in the
-	 * reconfig region and suppresses the node's later CSSD DEAD, CL-I13). */
-	if (cluster_reconfig_is_clean_departed(leaving)) {
+	/* 3. release the local leave-tracking slot only once the leave is committed
+	 * (clean_departed) AND the leaving node has actually departed (CSSD DEAD).
+	 * Holding it until departure (a) lets the coordinator keep re-sending
+	 * LEAVE_COMMITTED until the leaver is gone (assured delivery, P1-1), and (b)
+	 * serializes leaves (a second leave is NAK'd until this one fully departs,
+	 * single-leave-at-a-time, P1-3).  clean_departed persists in the reconfig
+	 * region and suppresses the node's CSSD DEAD from a spurious fail-stop (CL-I13). */
+	if (cluster_reconfig_is_clean_departed(leaving)
+		&& cluster_cssd_get_peer_state(leaving) == CLUSTER_CSSD_PEER_DEAD) {
 		LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
 		if (cl_state->leaving_node_id == leaving) {
 			cl_state->leaving_node_id = -1;
