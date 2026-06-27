@@ -1029,20 +1029,25 @@ cluster_cr_lookup_or_construct(Buffer buf, SCN read_scn)
 		pg_atomic_fetch_add_u64(&CRShared->cr_cache_evict_count, 1);
 
 	/* spec-5.51 D4: L2 probe (copy-out into the L1 victim slot).  On an L2 hit,
-	 * the image is now in L1; commit + return.  spec-5.56 ③: lookup_copy serves
-	 * only under the composite fence, so a hit proves the locator is registered;
-	 * stamp the L1 entry with the locator's CURRENT gen (fresh) so the L1 fence is
-	 * coherent with L2 (a later per-relation unlink then MISSes both). */
-	if (start_epoch != 0 && cluster_cr_pool_lookup_copy(&key, slot)) {
+	 * the image is now in L1; commit + return.  spec-5.56 ③ + P1-fix: lookup_copy
+	 * returns the per-relation gen the copied bytes are valid for, CAPTURED UNDER
+	 * THE POOL LOCK at copy time.  Stamp the L1 entry with THAT matched gen — NOT a
+	 * fresh re-read of the current gen.  A racing unlink between the L2 copy and
+	 * this commit advances the locator's current gen; re-reading it would brand the
+	 * stale gen-N bytes with gen N+1, and a later L1 lookup at N+1 would pass the
+	 * composite fence and serve a stale-lifecycle page (8.A false-visible).
+	 * Stamping with the matched gen is self-fencing: any unlink past it (gen
+	 * advances) makes the L1 entry MISS, so the stale page is never served. */
+	{
 		uint64 hit_gen = 0;
 
-		if (cluster_cr_pool_rel_generation_enabled())
-			(void)cluster_cr_pool_rel_generation(key.rlocator, &hit_gen);
-		cluster_cr_cache_commit_slot_gen(hit_gen);
-		if (CRShared != NULL)
-			pg_atomic_fetch_add_u64(&CRShared->cr_cache_install_count, 1);
-		cr_note_retention_if_advanced(read_scn); /* spec-5.56 D2: observe only */
-		return slot;
+		if (start_epoch != 0 && cluster_cr_pool_lookup_copy_gen(&key, slot, &hit_gen)) {
+			cluster_cr_cache_commit_slot_gen(hit_gen);
+			if (CRShared != NULL)
+				pg_atomic_fetch_add_u64(&CRShared->cr_cache_install_count, 1);
+			cr_note_retention_if_advanced(read_scn); /* spec-5.56 D2: observe only */
+			return slot;
+		}
 	}
 
 	/* L1+L2 miss: construct.  Two-phase L2 insert with construction outside the

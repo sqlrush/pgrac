@@ -122,6 +122,20 @@ extern void cluster_cr_pool_request_lwlocks(void);
 extern bool cluster_cr_pool_lookup_copy(const ClusterCRCacheKey *key, char *dst);
 
 /*
+ * cluster_cr_pool_lookup_copy_gen -- spec-5.56 P1-fix: like cluster_cr_pool_lookup_
+ *   copy but ALSO outputs *out_rel_gen = the per-relation generation the copied
+ *   bytes are valid for, CAPTURED UNDER THE POOL LOCK at the moment the composite
+ *   fence matched.  The caller MUST stamp the L1 entry with this value (never a
+ *   fresh re-read of the locator's current gen): a racing unlink between the L2
+ *   copy and the L1 commit would otherwise let the caller brand stale gen-N bytes
+ *   with gen N+1, bypassing the composite fence (stale L1 hit, 8.A).  *out_rel_gen
+ *   = 0 when the gen table is disabled (epoch-only) or on a miss.
+ *   cluster_cr_pool_lookup_copy() is the out_rel_gen == NULL wrapper.
+ */
+extern bool cluster_cr_pool_lookup_copy_gen(const ClusterCRCacheKey *key, char *dst,
+											uint64 *out_rel_gen);
+
+/*
  * cluster_cr_pool_reserve -- reserve a victim slot for `key` (RESERVED, clock
  *   eviction skips RESERVED).  Returns true and fills *out when a slot was
  *   reserved; false (handle.valid=false) when disabled or no victim.  The caller

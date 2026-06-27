@@ -612,11 +612,25 @@ cr_relgen_slot_current(const ClusterCRPoolSlot *s)
 bool
 cluster_cr_pool_lookup_copy(const ClusterCRCacheKey *key, char *dst)
 {
+	/* spec-5.51 callers that do not need the matched per-relation generation. */
+	return cluster_cr_pool_lookup_copy_gen(key, dst, NULL);
+}
+
+bool
+cluster_cr_pool_lookup_copy_gen(const ClusterCRCacheKey *key, char *dst, uint64 *out_rel_gen)
+{
 	int seg;
 	int lo, hi, i;
 	uint64 cur;
+	uint64 matched_rel_gen = 0; /* spec-5.56 P1-fix: the rel_gen the copied bytes
+								 * are valid for, captured UNDER the pool lock at copy
+								 * time — NOT a fresh re-read the caller could observe
+								 * after a racing unlink advanced the gen. */
 	bool hit = false;
 	bool near_epoch = false; /* spec-5.53 D5: exact-key slot at a stale epoch */
+
+	if (out_rel_gen != NULL)
+		*out_rel_gen = 0;
 
 	if (CRPool == NULL || key == NULL || dst == NULL)
 		return false;
@@ -651,6 +665,14 @@ cluster_cr_pool_lookup_copy(const ClusterCRCacheKey *key, char *dst)
 			if (s->pool_epoch == cur && cr_relgen_slot_current(s)) {
 				pg_atomic_write_u32(&s->ref, 1); /* second chance */
 				memcpy(dst, s->page, BLCKSZ);	 /* copy-out WHILE locked */
+				/* spec-5.56 P1-fix: capture the slot's rel_gen HERE, under the pool
+				 * lock, after cr_relgen_slot_current proved it == current.  The
+				 * caller MUST stamp the L1 entry with THIS value, never a fresh
+				 * re-read: a racing unlink between this copy and the caller's L1
+				 * commit would otherwise let the caller brand these gen-N bytes with
+				 * gen N+1 (composite-fence bypass -> stale L1 hit).  0 when the gen
+				 * table is disabled (epoch-only L1 stamp, spec-5.53 equivalence). */
+				matched_rel_gen = (CRRelGen != NULL) ? s->rel_gen : 0;
 				hit = true;
 				break;
 			}
@@ -667,6 +689,8 @@ cluster_cr_pool_lookup_copy(const ClusterCRCacheKey *key, char *dst)
 	LWLockRelease(cr_pool_seg_lock(seg));
 
 	if (hit) {
+		if (out_rel_gen != NULL)
+			*out_rel_gen = matched_rel_gen;
 		pg_atomic_fetch_add_u64(&CRPool->hit_count, 1);
 		return true;
 	}

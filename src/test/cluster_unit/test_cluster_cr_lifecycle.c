@@ -534,10 +534,63 @@ UT_TEST(test_u4b_full_locator_no_false_share)
 	UT_ASSERT_EQ((int)cluster_cr_pool_lookup_copy(&b, dst), 0); /* dbOid=6 invalidated */
 }
 
+/* U17 (P1-fix, 8.A: L2-hit -> L1-commit interleaving): an unlink that races
+ * between the L2 copy-out and the L1 commit must NOT let the copied bytes be
+ * branded with the post-unlink gen.  lookup_copy_gen returns the gen the bytes
+ * matched under the pool lock; the caller stamps L1 with THAT, so a later L1
+ * lookup at the advanced gen MISSes (the stale page is never served).  The
+ * reverse leg proves the fence is load-bearing: had we stamped the re-read
+ * (post-unlink) gen, the stale bytes WOULD have hit. */
+UT_TEST(test_u17_l2hit_to_l1_commit_race)
+{
+	ClusterCRCacheKey k = mk_key(1663, 5, 17001, 0, (SCN)50, (XLogRecPtr)10);
+	char dst[BLCKSZ];
+	char *slot;
+	bool ev = false;
+	uint64 matched = 0, cur = 0;
+
+	lifecycle_init(256, 256);
+	UT_ASSERT_EQ((int)l2_install(&k, 0x17), 1); /* L2 image at gen 1 */
+
+	/* L2-hit copy-out returns the matched gen (1), captured under the pool lock. */
+	UT_ASSERT_EQ((int)cluster_cr_pool_lookup_copy_gen(&k, dst, &matched), 1);
+	UT_ASSERT_EQ((int)(matched == 1), 1);
+
+	/* mirror cluster_cr.c L2-hit path: reserve an L1 victim + copy the bytes in. */
+	slot = cluster_cr_cache_victim_slot(&k, cluster_cr_pool_current_epoch(), &ev);
+	memcpy(slot, dst, BLCKSZ);
+
+	/* === the race: a concurrent unlink bumps the gen AFTER the copy. === */
+	cluster_cr_pool_unlink_locator(k.rlocator); /* gen 1 -> 2 */
+	(void)cluster_cr_pool_rel_generation(k.rlocator, &cur);
+	UT_ASSERT_EQ((int)(cur == 2), 1);
+
+	/* FIX: commit L1 with the MATCHED gen (1), not the re-read current gen (2). */
+	cluster_cr_cache_commit_slot_gen(matched);
+	/* later L1 lookup at current gen (2) MUST MISS the stale gen-1 bytes. */
+	UT_ASSERT_EQ(
+		(int)(cluster_cr_cache_lookup_fenced(&k, cluster_cr_pool_current_epoch(), cur, NULL)
+			  == NULL),
+		1);
+
+	/* reverse (single-entry, fresh cache): stamping the buggy re-read gen (2)
+	 * WOULD serve the stale bytes — proves the matched-gen stamp is what fences
+	 * the race (L1 lookup stops at the first key match, so this needs its own
+	 * cache state). */
+	cluster_cr_cache_reset();
+	slot = cluster_cr_cache_victim_slot(&k, cluster_cr_pool_current_epoch(), &ev);
+	memcpy(slot, dst, BLCKSZ);
+	cluster_cr_cache_commit_slot_gen(cur); /* buggy stamp = post-unlink gen 2 */
+	UT_ASSERT_EQ(
+		(int)(cluster_cr_cache_lookup_fenced(&k, cluster_cr_pool_current_epoch(), cur, NULL)
+			  != NULL),
+		1);
+}
+
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(16);
+	UT_PLAN(17);
 
 	UT_RUN(test_u1_c1_floor_global_epoch);
 	UT_RUN(test_u2_c2_floor_same_relid_rewrite);
@@ -555,6 +608,7 @@ main(int argc, char **argv)
 	UT_RUN(test_u14b_composite_fence_recheck);
 	UT_RUN(test_u15_counters);
 	UT_RUN(test_u16_pool_disabled);
+	UT_RUN(test_u17_l2hit_to_l1_commit_race);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;
