@@ -1313,6 +1313,16 @@ pg_backend_memory_contexts| SELECT name,
     free_chunks,
     used_bytes
    FROM pg_get_backend_memory_contexts() pg_get_backend_memory_contexts(name, ident, parent, level, total_bytes, total_nblocks, free_bytes, free_chunks, used_bytes);
+pg_cluster_clean_leave_state| SELECT phase,
+    leaving_node_id,
+    leave_epoch,
+    ges_drained_count,
+    gcs_flushed_count,
+    shards_remastered,
+    survivor_ack_count,
+    barrier_deadline,
+    escalate_count
+   FROM cluster_get_clean_leave_state() cluster_get_clean_leave_state(phase, leaving_node_id, leave_epoch, ges_drained_count, gcs_flushed_count, shards_remastered, survivor_ack_count, barrier_deadline, escalate_count);
 pg_cluster_cssd_peers| SELECT node_id,
     state,
     last_heartbeat_send_at,
