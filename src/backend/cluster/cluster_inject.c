@@ -156,6 +156,9 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	{ .name = "cluster-startup-phase-4-enter" },
 	{ .name = "cluster-startup-phase-4-exit" },
 	{ .name = "cluster-startup-phase-4-fail" },
+	/* spec-5.8 Hardening v1.0.1 — FC1 acting-gate test seam: drop one responder
+	 * bit in the coordinator probe round to synthesise a partial member set. */
+	{ .name = "cluster-lmd-force-partial-round" },
 	/* Stage 1.11 Sprint B (spec-1.11 D10) — 6 LMON lifecycle injects. */
 	{ .name = "cluster-lmon-pre-spawn" },
 	{ .name = "cluster-lmon-post-spawn" },

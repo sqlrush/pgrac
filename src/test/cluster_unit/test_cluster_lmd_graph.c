@@ -640,11 +640,56 @@ UT_TEST(test_probe_admit_hi_word_independent)
 				 (int)CLUSTER_LMD_PROBE_DROP_UNEXPECTED);
 }
 
+/*
+ * spec-5.8 Hardening v1.0.1 — FC1 acting gate completeness (cluster_lmd_probe_
+ * round_complete).  A round is COMPLETE only on an exact member-set match;
+ * received ⊊ expected is partial and must NOT be confirmed/cancelled.
+ */
+UT_TEST(test_probe_round_complete_exact_match)
+{
+	/* expected = received = {1,2,3} -> complete (would proceed to Tarjan). */
+	uint64 exp_lo = MEMBIT_LO(1) | MEMBIT_LO(2) | MEMBIT_LO(3);
+
+	UT_ASSERT_EQ((int)cluster_lmd_probe_round_complete(exp_lo, 0, exp_lo, 0), 1);
+	/* hi-word participant included in both -> still complete. */
+	UT_ASSERT_EQ(
+		(int)cluster_lmd_probe_round_complete(exp_lo, MEMBIT_HI(70), exp_lo, MEMBIT_HI(70)), 1);
+}
+
+UT_TEST(test_probe_round_incomplete_partial_subset)
+{
+	/* expected = {1,2,3}; received = {1,2} (node 3 silent) -> INCOMPLETE.
+	 * This is the FC1 fail-closed case: the partial union is discarded. */
+	uint64 exp_lo = MEMBIT_LO(1) | MEMBIT_LO(2) | MEMBIT_LO(3);
+	uint64 rcv_lo = MEMBIT_LO(1) | MEMBIT_LO(2);
+
+	UT_ASSERT_EQ((int)cluster_lmd_probe_round_complete(exp_lo, 0, rcv_lo, 0), 0);
+	/* a hi-word expected peer (node 70) that did not report -> incomplete. */
+	UT_ASSERT_EQ((int)cluster_lmd_probe_round_complete(exp_lo, MEMBIT_HI(70), exp_lo, 0), 0);
+	/* empty received against a non-empty expected -> incomplete. */
+	UT_ASSERT_EQ((int)cluster_lmd_probe_round_complete(exp_lo, 0, 0, 0), 0);
+}
+
+UT_TEST(test_probe_round_two_identical_partial_subsets_never_complete)
+{
+	/*
+	 * The reviewer's worst case: two confirm rounds observe the SAME partial
+	 * subset (node 3 silent both times).  Each round is independently judged
+	 * incomplete, so the two-round driver can never confirm/cancel from them —
+	 * a stable partial subset must NOT be mistaken for a confirmed deadlock.
+	 */
+	uint64 exp_lo = MEMBIT_LO(1) | MEMBIT_LO(2) | MEMBIT_LO(3);
+	uint64 rcv_lo = MEMBIT_LO(1) | MEMBIT_LO(2); /* same subset both rounds */
+
+	UT_ASSERT_EQ((int)cluster_lmd_probe_round_complete(exp_lo, 0, rcv_lo, 0), 0); /* round 1 */
+	UT_ASSERT_EQ((int)cluster_lmd_probe_round_complete(exp_lo, 0, rcv_lo, 0), 0); /* round 2 */
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(17);
 	UT_RUN(test_multi_blocker_edges_not_overwritten);
 	UT_RUN(test_remove_by_waiter_removes_all_blocker_edges);
 	UT_RUN(test_distinct_waiters_isolated);
@@ -659,6 +704,9 @@ main(void)
 	UT_RUN(test_probe_admit_unexpected_node_dropped);
 	UT_RUN(test_probe_admit_out_of_range_dropped);
 	UT_RUN(test_probe_admit_hi_word_independent);
+	UT_RUN(test_probe_round_complete_exact_match);
+	UT_RUN(test_probe_round_incomplete_partial_subset);
+	UT_RUN(test_probe_round_two_identical_partial_subsets_never_complete);
 	UT_DONE();
 	return 0;
 }

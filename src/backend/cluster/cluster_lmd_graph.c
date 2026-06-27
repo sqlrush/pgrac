@@ -124,6 +124,10 @@ typedef struct ClusterLmdGraphShared {
 	pg_atomic_uint64 deadlock_confirmed_count;	/* two-round confirm succeeded */
 	pg_atomic_uint64 confirm_unconfirmed_count; /* round-1 cycle NOT confirmed by round 2 */
 	pg_atomic_uint64 reconfig_discard_count;	/* confirm spanned a reconfig (D4b) */
+	/* spec-5.8 Hardening v1.0.1 — FC1 acting gate: a probe round's received
+	 * member set was not the full expected (CSSD-alive) set, so the partial
+	 * cross-node union was discarded before Tarjan (never confirm/cancel). */
+	pg_atomic_uint64 member_incomplete_count;
 	/* spec-5.9 D10 — victim policy + cancel robustness counters. */
 	pg_atomic_uint64 victim_protected_skip_count;	   /* HARD-skip victim -> ACK(PROTECTED) */
 	pg_atomic_uint64 victim_repeat_avoided_count;	   /* anti-thrash chose an alternate */
@@ -219,6 +223,8 @@ cluster_lmd_graph_shmem_init(void)
 		pg_atomic_init_u64(&cluster_lmd_graph_state->deadlock_confirmed_count, 0);
 		pg_atomic_init_u64(&cluster_lmd_graph_state->confirm_unconfirmed_count, 0);
 		pg_atomic_init_u64(&cluster_lmd_graph_state->reconfig_discard_count, 0);
+		/* spec-5.8 Hardening v1.0.1 — FC1 acting gate init. */
+		pg_atomic_init_u64(&cluster_lmd_graph_state->member_incomplete_count, 0);
 		/* spec-5.9 D10 init. */
 		pg_atomic_init_u64(&cluster_lmd_graph_state->victim_protected_skip_count, 0);
 		pg_atomic_init_u64(&cluster_lmd_graph_state->victim_repeat_avoided_count, 0);
@@ -626,6 +632,8 @@ DEFINE_GET_INC(cleanup_skip_other_owner_count)
 DEFINE_GET_INC(deadlock_confirmed_count)
 DEFINE_GET_INC(confirm_unconfirmed_count)
 DEFINE_GET_INC(reconfig_discard_count)
+/* spec-5.8 Hardening v1.0.1 — FC1 acting gate. */
+DEFINE_GET_INC(member_incomplete_count)
 /* spec-5.9 D10 — victim policy + cancel robustness. */
 DEFINE_GET_INC(victim_protected_skip_count)
 DEFINE_GET_INC(victim_repeat_avoided_count)
@@ -772,6 +780,30 @@ cluster_lmd_probe_member_admit(uint64 expected_lo, uint64 expected_hi, uint64 re
 	if (received_word & bit)
 		return CLUSTER_LMD_PROBE_DROP_DUPLICATE;
 	return CLUSTER_LMD_PROBE_ADMIT;
+}
+
+/*
+ * spec-5.8 Hardening v1.0.1 — FC1 probe-round completeness (pure).
+ *
+ *	A coordinator probe round is COMPLETE iff every expected responder (the
+ *	CSSD-alive peers snapshotted when the probe was armed) actually reported.
+ *	Returns true only on an EXACT member-set match (§2.4 D4a / §3.5 FC1).
+ *
+ *	cluster_lmd_probe_member_admit already keeps received ⊆ expected (it drops
+ *	reports from unexpected nodes and de-dups duplicates), so equality here is
+ *	equivalent to "received ⊇ expected", i.e. nobody expected is missing.  A
+ *	received ⊊ expected round is PARTIAL: the cross-node union is missing a
+ *	peer's edges, so a cycle derived from it could cancel a victim whose true
+ *	blocker lives on a node we never heard from — the two-round driver MUST
+ *	discard such a round (never confirm / cancel) and re-collect next scan.
+ *	This errs only toward NOT cancelling (a real deadlock is re-detected once
+ *	the member set is complete), never toward a false victim (Rule 8.A).
+ */
+bool
+cluster_lmd_probe_round_complete(uint64 expected_lo, uint64 expected_hi, uint64 received_lo,
+								 uint64 received_hi)
+{
+	return expected_lo == received_lo && expected_hi == received_hi;
 }
 
 /* D16 — test-only injection. */

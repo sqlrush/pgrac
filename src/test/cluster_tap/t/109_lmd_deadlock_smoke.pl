@@ -298,8 +298,8 @@ is($d6_sum, '0', 'L18 spec-5.8 D6 counters all start at 0 (single-node: coordina
 # matching dump_lmd.
 my $lmd_total = $node->safe_psql('postgres',
 	q{SELECT count(*) FROM pg_cluster_state WHERE category = 'lmd'});
-is($lmd_total, '46',
-	'L19 dump_lmd emits 46 rows under category=lmd (incl. 3 spec-5.8 D6 + 5 D8 + 13 spec-5.9 D10 + 1 Hardening v1.0.1 cancel_ack_mismatch)');
+is($lmd_total, '47',
+	'L19 dump_lmd emits 47 rows under category=lmd (incl. 3 spec-5.8 D6 + 5 D8 + 13 spec-5.9 D10 + 1 Hardening v1.0.1 cancel_ack_mismatch + 1 spec-5.8 Hardening v1.0.1 member_incomplete_count)');
 
 
 $node->stop;

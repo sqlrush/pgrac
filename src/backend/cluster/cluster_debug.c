@@ -1181,10 +1181,11 @@ dump_lms(ReturnSetInfo *rsinfo)
 /*
  * dump_lmd -- spec-2.19 Sprint A Step 4 D10.
  *
- *	Emits 32 rows under category='lmd' (spec-2.19 daemon state/counters +
+ *	Emits 47 rows under category='lmd' (spec-2.19 daemon state/counters +
  *	spec-2.22 graph/Tarjan + spec-2.23 probe + spec-2.24 cancel/cleanup +
- *	spec-5.8 D6 two-round-confirm/reconfig-gate + spec-5.8 D8 shmem
- *	REPORT-collector counters)
+ *	spec-5.8 D6 two-round-confirm/reconfig-gate + spec-5.8 Hardening v1.0.1
+ *	FC1 member_incomplete_count + spec-5.8 D8 shmem REPORT-collector
+ *	counters + spec-5.9 victim-policy/cancel-robustness)
  *	corresponding to the LMD observability surface (HC2 4-state
  *	semantic split via state column + 6 counters per §0 Q8).
  *
@@ -1248,6 +1249,10 @@ dump_lmd(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_lmd_confirm_unconfirmed_count_get()));
 	emit_row(rsinfo, "lmd", "reconfig_discard_count",
 			 fmt_int64((int64)cluster_lmd_reconfig_discard_count_get()));
+	/* spec-5.8 Hardening v1.0.1 — FC1 acting gate (partial member set -> round
+	 * discarded before Tarjan; never confirm / cancel). */
+	emit_row(rsinfo, "lmd", "member_incomplete_count",
+			 fmt_int64((int64)cluster_lmd_member_incomplete_count_get()));
 	/* spec-5.9 D10 — 13 NEW victim-policy + cancel-robustness counters. */
 	emit_row(rsinfo, "lmd", "victim_protected_skip_count",
 			 fmt_int64((int64)cluster_lmd_victim_protected_skip_count_get()));

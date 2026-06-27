@@ -44,8 +44,10 @@
 
 #include "cluster/cluster_cancel_token.h" /* spec-5.9 D3 install token */
 #include "cluster/cluster_conf.h"		  /* CLUSTER_MAX_NODES + active peers */
+#include "cluster/cluster_cssd.h"		  /* spec-5.8 H1.0.1 FC1: CSSD-alive expected set */
 #include "cluster/cluster_epoch.h"		  /* cluster_epoch_get_current */
 #include "cluster/cluster_ges.h"		  /* GesDeadlockProbePayload / Report */
+#include "cluster/cluster_inject.h"		  /* spec-5.8 H1.0.1 FC1: force-partial test seam */
 #include "cluster/cluster_grd.h"		  /* spec-2.24 ClusterGrdHolderId */
 #include "cluster/cluster_grd_outbound.h" /* cluster_grd_outbound_enqueue_backend_request */
 #include "cluster/cluster_guc.h"
@@ -838,6 +840,46 @@ lmd_coordinator_probe_round(int32 self_node, const int32 *peers, int n_peers,
 		return;
 	}
 
+	/*
+	 * spec-5.8 Hardening v1.0.1 — test seam (cluster-lmd-force-partial-round):
+	 * drop one responder bit to deterministically synthesise a partial round
+	 * (an expected, CSSD-alive peer that did not report within the deadline is
+	 * timing-dependent and cannot be reproduced reliably in an e2e).  The real
+	 * collector / report machinery still ran; only the "this peer is missing"
+	 * condition is injected, so the FC1 gate below exercises the genuine path.
+	 * CLUSTER_INJECTION_POINT fires the dispatch (re-arming the one-shot SKIP
+	 * flag) every round, so an armed point makes EVERY coordinator round look
+	 * partial (mirrors the smgr cluster-cr-skip-epoch-bump arm/probe pattern).
+	 */
+	CLUSTER_INJECTION_POINT("cluster-lmd-force-partial-round");
+	if (cluster_injection_should_skip("cluster-lmd-force-partial-round")) {
+		if (drain.member_lo != 0)
+			drain.member_lo &= (drain.member_lo - 1); /* clear lowest set bit */
+		else if (drain.member_hi != 0)
+			drain.member_hi &= (drain.member_hi - 1);
+	}
+
+	/*
+	 * spec-5.8 Hardening v1.0.1 — FC1 acting gate (§2.4 D4a / §3.5 FC1).  The
+	 * expected set is the CSSD-alive peers snapshotted when this probe was
+	 * armed; received is the set that actually reported within the collect
+	 * deadline (admission keeps received ⊆ expected).  received ⊊ expected
+	 * means a peer was slow / silent / left inside the window, so the cross-node
+	 * union is PARTIAL — a cycle derived from it could cancel a victim whose
+	 * true blocker lives on a node we never heard from.  Discard the round
+	 * (never confirm / cancel from a partial union); the next scan re-collects
+	 * once the member set is complete.  This errs only toward NOT cancelling
+	 * (a real deadlock is re-detected), never toward a false victim (Rule 8.A).
+	 * The gate fires BEFORE Tarjan, so whether a cycle exists is irrelevant.
+	 */
+	if (!cluster_lmd_probe_round_complete(expected_lo, expected_hi, drain.member_lo,
+										  drain.member_hi)) {
+		cluster_lmd_member_incomplete_count_inc(1);
+		pfree(union_edges);
+		cluster_lmd_probe_reset();
+		return; /* out->has_cycle stays false (memset at entry) */
+	}
+
 	/* Record the responders into the round fingerprint member set. */
 	for (int32 nid = 0; nid < CLUSTER_MAX_NODES; nid++) {
 		uint64 bit = (nid < 64) ? (drain.member_lo & (UINT64CONST(1) << nid))
@@ -1229,19 +1271,31 @@ cluster_lmd_tarjan_run_coordinator_scan(int collect_timeout_ms)
 	 * cancel — we re-check this before cancelling and discard on change. */
 	scan_epoch = cluster_epoch_get_current();
 
-	/* Build the peer list (skip self).  cluster_conf doesn't expose per-index
-	 * node lookup, so iterate node_id range 0..total-1 (spec-2.x convention). */
+	/*
+	 * Build the peer list = the CSSD-alive declared peers (spec-5.8 Hardening
+	 * v1.0.1 — FC1 expected set), snapshotted here at scan start and reused for
+	 * both confirm rounds.  This set is BOTH the probe broadcast target and the
+	 * FC1 "expected responder" set (§2.4 D4a): a declared peer that is CSSD-DEAD
+	 * is excluded, so it is not "missing" and does not wedge FC1 fail-closed
+	 * forever (using all-configured peers here would turn one long-down node
+	 * into a permanent liveness regression).  FC1 then only fires for a peer
+	 * that is CSSD-ALIVE yet silent within the collect deadline.  Self is
+	 * excluded from the bitmap (matching the old skip-self loop); shmem-NULL /
+	 * single-node returns an all-zero bitmap -> n_peers == 0 -> early return.
+	 */
 	{
-		int total = cluster_conf_node_count();
+		uint8 alive[CLUSTER_CSSD_PEER_ALIVE_BITMAP_BYTES];
 
-		for (int i = 0; i < total && n_peers < CLUSTER_MAX_NODES; i++) {
+		cluster_cssd_get_declared_alive_bitmap(alive);
+		for (int i = 0; i < CLUSTER_MAX_NODES && n_peers < CLUSTER_MAX_NODES; i++) {
 			if (i == self_node)
 				continue;
-			peers[n_peers++] = i;
+			if (alive[i / 8] & (1u << (i % 8)))
+				peers[n_peers++] = i;
 		}
 	}
 	if (n_peers == 0)
-		return; /* Single-node mode — no cross-node deadlock possible. */
+		return; /* Single-node / no CSSD-alive peer — no cross-node deadlock. */
 
 	/* Round 1 — candidate only; NEVER cancel on a single observation (8.A). */
 	lmd_coordinator_probe_round(self_node, peers, n_peers, collect_timeout_ms, &round1);

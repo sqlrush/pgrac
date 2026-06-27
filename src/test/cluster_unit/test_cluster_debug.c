@@ -3185,6 +3185,12 @@ cluster_lmd_reconfig_discard_count_get(void)
 {
 	return 0;
 }
+/* spec-5.8 Hardening v1.0.1 stub — FC1 acting-gate counter. */
+uint64
+cluster_lmd_member_incomplete_count_get(void)
+{
+	return 0;
+}
 /* spec-5.9 D10 stub — 13 NEW victim-policy + cancel-robustness counters. */
 uint64
 cluster_lmd_victim_protected_skip_count_get(void)

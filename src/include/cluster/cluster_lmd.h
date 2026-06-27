@@ -417,6 +417,15 @@ extern ClusterLmdProbeAdmit cluster_lmd_probe_member_admit(uint64 expected_lo, u
 														   int32 node_id);
 
 /*
+ * spec-5.8 Hardening v1.0.1 — FC1 probe-round completeness (pure).  True iff
+ * the received responder set EXACTLY equals the expected (CSSD-alive) set; a
+ * received ⊊ expected round is partial and must be discarded before Tarjan
+ * (never confirm / cancel — Rule 8.A).
+ */
+extern bool cluster_lmd_probe_round_complete(uint64 expected_lo, uint64 expected_hi,
+											 uint64 received_lo, uint64 received_hi);
+
+/*
  * Manual SQL trigger for Tarjan scan (admin / TAP test hook).
  *	Runs one local scan + revalidate cycle synchronously.
  */
@@ -531,6 +540,11 @@ extern uint64 cluster_lmd_reconfig_discard_count_get(void);
 extern void cluster_lmd_deadlock_confirmed_count_inc(uint64 delta);
 extern void cluster_lmd_confirm_unconfirmed_count_inc(uint64 delta);
 extern void cluster_lmd_reconfig_discard_count_inc(uint64 delta);
+
+/* spec-5.8 Hardening v1.0.1 — FC1 acting-gate counter (partial member set ->
+ * round discarded before Tarjan; never confirm / cancel). */
+extern uint64 cluster_lmd_member_incomplete_count_get(void);
+extern void cluster_lmd_member_incomplete_count_inc(uint64 delta);
 
 /* ============================================================
  * spec-5.9 D2 — anti-thrash recent-victim ring (coordinator-local).
