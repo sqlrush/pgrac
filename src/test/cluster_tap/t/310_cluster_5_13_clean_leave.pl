@@ -281,10 +281,13 @@ my $esc = PostgreSQL::Test::ClusterPair->new_pair(
 # Arm the sleep inject on node1 via the GUC (the injection registry is
 # process-local, so a SQL cluster_inject_fault would only arm the calling
 # backend; the GUC arms EVERY node1 backend at startup, including the future
-# request backend).  Pauses node1's drive_drain at ges-drained for 30s so we can
-# SIGKILL it mid-drain, before it sends LEAVE_COMMIT_READY.
+# request backend).  Pause at the FIRST destructive step (quiesce-pre) — not
+# ges-drained — so a fast 2-node leave is held LONG before it can reach
+# BARRIER_WAIT / commit; otherwise node1 can commit in well under a second and
+# become clean_departed, in which case its later death is correctly suppressed
+# by CL-I13 (no fail-stop) and this escalate scenario never occurs.
 $esc->node1->append_conf('postgresql.conf',
-	"cluster.injection_points = 'cluster-clean-leave-ges-drained:sleep:30000000'");
+	"cluster.injection_points = 'cluster-clean-leave-quiesce-pre:sleep:30000000'");
 $esc->start_pair;
 usleep(3_000_000);
 ok($esc->wait_for_peer_state(0, 1, 'connected', 30), 'L8 escalate pair connected');
@@ -297,11 +300,23 @@ my $reqh = IPC::Run::start(
 		'-c', 'SELECT pg_cluster_clean_leave_request()' ],
 	\$in, \$out, \$err);
 
-# Wait until node1 is actually paused mid-drain (phase past quiescing), then kill.
-my $paused = poll_until($esc->node1,
-	q{SELECT phase IN ('ges_draining','gcs_flushing','quiescing','requested')
-	    FROM pg_cluster_clean_leave_state}, 't', 20, 'L8 node1 paused mid-drain');
-ok($paused, 'L8 node1 is mid-drain (paused at ges-drained inject)');
+# Wait until node1 is genuinely mid-leave: node0 (the survivor) is tracking
+# node1's leave (its real announce arrived) and node1 is in a pre-drain leave
+# phase, held by the quiesce-pre inject.
+my $paused = poll_until($esc->node0,
+	q{SELECT leaving_node_id = 1 FROM pg_cluster_clean_leave_state}, 't', 25,
+	'L8 node0 tracking node1 leave');
+ok($paused, 'L8 node1 is mid-leave (node0 tracking, paused at quiesce-pre inject)');
+
+# Precondition for THIS escalate scenario (death BEFORE commit): node1 must NOT
+# have committed its leave yet — if it had, node0 would have clean-departed it and
+# its death would be correctly suppressed by CL-I13 (no fail-stop).  Assert the
+# precondition explicitly so a too-fast leave fails HERE with a clear message,
+# not later as a misleading fail-stop timeout.
+is($esc->node0->safe_psql('postgres',
+		q{SELECT reconfig_kind FROM pg_cluster_reconfig_state}),
+	'none',
+	'L8 node1 has NOT committed before the kill (death-before-commit precondition)');
 
 # L8b REFUSE-WRITES (CL-I1/§3.1): while node1 is mid-leave, a brand-new writable
 # transaction (a connection that did NOT exist when the one-shot quiesce fired)
