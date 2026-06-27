@@ -1195,6 +1195,8 @@ cluster_clean_leave_drive_drain(void)
 	 * silently-slow survivor falls through to the drain (a late NAK is still caught
 	 * by the BARRIER_WAIT async abort); a NAK here is a clean abort, no drain.
 	 */
+	ereport(LOG, (errmsg("DEBUG-L8: node %d drive_drain entry (phase=REQUESTED, baseline_epoch=" UINT64_FORMAT ")",
+						 cluster_node_id, baseline_epoch)));
 	for (i = 0; i < 500; i++) { /* up to ~5s */
 		if (pg_atomic_read_u32(&cl_state->nak_received))
 			break;
@@ -1202,6 +1204,11 @@ cluster_clean_leave_drive_drain(void)
 			break; /* announce out + all alive survivors ready; no refusal */
 		pg_usleep(10 * 1000);
 	}
+	ereport(LOG, (errmsg("DEBUG-L8: node %d opening-wait exit i=%d announce_sent=%u all_acked=%d nak=%u",
+						 cluster_node_id, i,
+						 pg_atomic_read_u32(&cl_state->announce_sent),
+						 cl_all_survivors_acked(cluster_node_id) ? 1 : 0,
+						 pg_atomic_read_u32(&cl_state->nak_received))));
 	if (pg_atomic_read_u32(&cl_state->nak_received)) {
 		cl_clean_abort();
 		return;
@@ -1226,7 +1233,9 @@ cluster_clean_leave_drive_drain(void)
 		cl_escalate();
 		return;
 	}
+	ereport(LOG, (errmsg("DEBUG-L8: node %d about to hit quiesce-pre injection point", cluster_node_id)));
 	CLUSTER_INJECTION_POINT("cluster-clean-leave-quiesce-pre");
+	ereport(LOG, (errmsg("DEBUG-L8: node %d passed quiesce-pre injection point", cluster_node_id)));
 	cl_broadcast_quiesce_local();
 	cl_set_phase(CLUSTER_LEAVE_QUIESCING);
 
