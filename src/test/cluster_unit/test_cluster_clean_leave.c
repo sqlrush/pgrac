@@ -76,8 +76,10 @@ UT_DEFINE_GLOBALS();
 
 UT_TEST(test_struct_layout)
 {
-	/* shmem state fits the reserved budget (StaticAssert mirror, §2.1) */
-	UT_ASSERT(sizeof(ClusterLeaveState) <= 256);
+	/* shmem state fits the reserved budget (StaticAssert mirror, §2.1; the §2.5
+	 * marker mailbox + Hardening v1.0.1/v1.0.2 fields put it past the original
+	 * 256B budget, so the bound is 512 — same as the production StaticAssertDecl). */
+	UT_ASSERT(sizeof(ClusterLeaveState) <= 512);
 	/* durable marker fits one 512B voting-disk slot (§2.5) */
 	UT_ASSERT(sizeof(ClusterLeaveIntentMarker) <= 512);
 

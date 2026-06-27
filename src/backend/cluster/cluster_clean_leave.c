@@ -120,6 +120,10 @@ cluster_clean_leave_shmem_init(void)
 		pg_atomic_init_u32(&cl_state->commit_point_observed, 0);
 		pg_atomic_init_u32(&cl_state->committed_durable_confirmed, 0);
 		pg_atomic_init_u32(&cl_state->committed_marker_durable, 0);
+		/* Hardening v1.0.2 (P1 preflight / P2 nonce). */
+		pg_atomic_init_u64(&cl_state->leave_attempt_nonce, 0);
+		pg_atomic_init_u32(&cl_state->preflight_pending, 0);
+		pg_atomic_init_u32(&cl_state->preflight_sent, 0);
 		/* §2.5 leave-marker submit mailbox. */
 		cl_state->qvotec_latch = NULL;
 		pg_atomic_init_u64(&cl_state->marker_request_seq, 0);
@@ -247,10 +251,12 @@ cluster_clean_leave_node_refuses_writes(void)
 void
 cluster_clean_leave_survivor_ack(int32 leaving_node_id, uint64 leave_epoch)
 {
-	if (!cluster_enabled)
+	if (!cluster_enabled || cl_state == NULL)
 		return;
-	cluster_clean_leave_ic_send_ack(leaving_node_id, leaving_node_id, leave_epoch, /*nak*/ false,
-									(uint8)CLUSTER_LEAVE_NAK_NONE);
+	/* echo the tracked attempt's nonce so the leaver binds this ACK to it (P2). */
+	cluster_clean_leave_ic_send_ack(leaving_node_id, leaving_node_id, leave_epoch,
+									pg_atomic_read_u64(&cl_state->leave_attempt_nonce),
+									/*nak*/ false, (uint8)CLUSTER_LEAVE_NAK_NONE);
 }
 
 
@@ -363,17 +369,23 @@ cl_announce_handler(const ClusterICEnvelope *env, const void *payload)
 	}
 	leaving = p->leaving_node_id;
 
-	/* Disabled survivor: fail-closed reply NAK(disabled), never silent. */
+	/* Disabled survivor: fail-closed reply NAK(disabled), never silent.  Echoes
+	 * the announce nonce (P2) and is reachable on BOTH the preflight probe and the
+	 * real announce — so a disabled survivor is caught at layer-1 preflight before
+	 * any side effect (P1). */
 	if (!cluster_clean_leave_enabled) {
-		cluster_clean_leave_ic_send_ack(env->source_node_id, leaving, p->leave_epoch, true,
-										(uint8)CLUSTER_LEAVE_NAK_DISABLED);
+		cluster_clean_leave_ic_send_ack(env->source_node_id, leaving, p->leave_epoch,
+										p->leave_nonce, true, (uint8)CLUSTER_LEAVE_NAK_DISABLED);
 		return;
 	}
 
-	/* preflight probe: we are enabled → ACK (enablement only, no state change). */
+	/* preflight probe (F6 layer-1): we are enabled → ACK (enablement only, NO state
+	 * change, NO GRD/PCM cleanup).  This is the side-effect-free half of the
+	 * two-layer mixed-mode defense — the leaver gathers these ACKs before it ever
+	 * enters REQUESTED / broadcasts the real announce. */
 	if (p->preflight) {
-		cluster_clean_leave_ic_send_ack(env->source_node_id, leaving, p->leave_epoch, false,
-										(uint8)CLUSTER_LEAVE_NAK_NONE);
+		cluster_clean_leave_ic_send_ack(env->source_node_id, leaving, p->leave_epoch,
+										p->leave_nonce, false, (uint8)CLUSTER_LEAVE_NAK_NONE);
 		return;
 	}
 
@@ -390,7 +402,8 @@ cl_announce_handler(const ClusterICEnvelope *env, const void *payload)
 	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
 	if (cl_state->leaving_node_id != -1 && cl_state->leaving_node_id != leaving) {
 		LWLockRelease(&cl_state->lock);
-		cluster_clean_leave_ic_send_ack(env->source_node_id, leaving, p->leave_epoch, true,
+		cluster_clean_leave_ic_send_ack(env->source_node_id, leaving, p->leave_epoch,
+										p->leave_nonce, true,
 										(uint8)CLUSTER_LEAVE_NAK_LEAVE_IN_PROGRESS);
 		ereport(LOG,
 				(errmsg("cluster clean-leave: node %d announced a leave while node %d's leave is "
@@ -409,6 +422,10 @@ cl_announce_handler(const ClusterICEnvelope *env, const void *payload)
 	if (cl_state->leaving_node_id != leaving) {
 		cl_state->leaving_node_id = leaving;
 		cl_state->leave_epoch = p->leave_epoch;
+		/* Hardening v1.0.2 (P2): bind this survivor to the announced attempt's
+		 * nonce so a stale ACK/READY/COMMITTED from a prior same-epoch attempt is
+		 * dropped by the control-message handlers. */
+		pg_atomic_write_u64(&cl_state->leave_attempt_nonce, p->leave_nonce);
 		/*
 		 * Hardening v1.0.1 (P1-2, CL-I3 commit-handoff coherence): snapshot THIS
 		 * survivor's CSSD dead_generation when it starts tracking the leave.  The
@@ -445,6 +462,11 @@ cl_commit_ready_handler(const ClusterICEnvelope *env, const void *payload)
 	/* must be about the leave we are tracking as a survivor. */
 	if (cl_state->leaving_node_id != p->leaving_node_id)
 		return;
+	/* Hardening v1.0.2 (P2): bind to THIS attempt — drop a stale/delayed READY
+	 * from a prior same-epoch attempt (nonce) or a different epoch. */
+	if (p->leave_nonce != pg_atomic_read_u64(&cl_state->leave_attempt_nonce)
+		|| p->leave_epoch != cl_state->leave_epoch)
+		return;
 
 	pg_atomic_write_u32(&cl_state->commit_ready_received, 1);
 }
@@ -468,6 +490,13 @@ cl_committed_handler(const ClusterICEnvelope *env, const void *payload)
 		return;
 	if (p->leaving_node_id != cluster_node_id)
 		return; /* only the leaving node consumes its own COMMITTED confirmation */
+	/* Hardening v1.0.2 (P2): bind to THIS attempt — a stale LEAVE_COMMITTED from a
+	 * prior same-epoch attempt must not prematurely confirm the current one.  Only
+	 * meaningful once we are the leaver actively awaiting confirmation. */
+	if (p->leave_nonce != pg_atomic_read_u64(&cl_state->leave_attempt_nonce))
+		return;
+	if (cl_state->leaving_node_id != cluster_node_id)
+		return; /* we are not currently leaving */
 
 	pg_atomic_write_u32(&cl_state->committed_durable_confirmed, 1);
 }
@@ -489,6 +518,7 @@ cl_send_committed(int32 leaving, uint64 leave_epoch)
 	p.preflight = 0;
 	p.leave_epoch = leave_epoch;
 	p.cssd_dead_generation = cluster_cssd_get_dead_generation();
+	p.leave_nonce = pg_atomic_read_u64(&cl_state->leave_attempt_nonce); /* P2: bind to attempt */
 	cluster_clean_leave_announce_compute_crc(&p);
 
 	(void)cluster_ic_send_envelope(PGRAC_IC_MSG_LEAVE_COMMITTED, leaving, &p, (uint32)sizeof(p));
@@ -511,6 +541,12 @@ cl_ack_handler(const ClusterICEnvelope *env, const void *payload)
 		return;
 	if (p->leaving_node_id != cluster_node_id)
 		return; /* not about our leave */
+	/* Hardening v1.0.2 (P2): bind to THIS attempt's nonce — a stale ACK/NAK from a
+	 * prior preflight or drain (same baseline epoch) must not fill our tally.  The
+	 * leaver sets leave_attempt_nonce before both the preflight and the real
+	 * announce, so both layers' replies are checked against the current value. */
+	if (p->leave_nonce != pg_atomic_read_u64(&cl_state->leave_attempt_nonce))
+		return;
 
 	is_nak = (env->msg_type == PGRAC_IC_MSG_LEAVE_DRAIN_NAK);
 
@@ -575,7 +611,7 @@ cluster_clean_leave_register_ic_msg_types(void)
 }
 
 void
-cluster_clean_leave_ic_broadcast_announce(uint64 leave_epoch, bool preflight)
+cluster_clean_leave_ic_broadcast_announce(uint64 leave_epoch, uint64 leave_nonce, bool preflight)
 {
 	ClusterLeaveAnnouncePayload p;
 	ClusterICFanoutResult per_peer[CLUSTER_MAX_NODES];
@@ -587,6 +623,7 @@ cluster_clean_leave_ic_broadcast_announce(uint64 leave_epoch, bool preflight)
 	p.preflight = preflight ? 1 : 0;
 	p.leave_epoch = leave_epoch;
 	p.cssd_dead_generation = cluster_cssd_get_dead_generation();
+	p.leave_nonce = leave_nonce;
 	cluster_clean_leave_announce_compute_crc(&p);
 
 	cluster_ic_send_envelope_fanout(PGRAC_IC_MSG_CLEAN_LEAVE_ANNOUNCE, &p, (uint32)sizeof(p),
@@ -595,7 +632,7 @@ cluster_clean_leave_ic_broadcast_announce(uint64 leave_epoch, bool preflight)
 
 void
 cluster_clean_leave_ic_send_ack(int32 dest_node_id, int32 leaving_node_id, uint64 leave_epoch,
-								bool nak, uint8 nak_reason)
+								uint64 leave_nonce, bool nak, uint8 nak_reason)
 {
 	ClusterLeaveAckPayload p;
 
@@ -605,6 +642,7 @@ cluster_clean_leave_ic_send_ack(int32 dest_node_id, int32 leaving_node_id, uint6
 	p.survivor_node_id = cluster_node_id;
 	p.leaving_node_id = leaving_node_id;
 	p.leave_epoch = leave_epoch;
+	p.leave_nonce = leave_nonce;
 	p.nak = nak ? 1 : 0;
 	p.nak_reason = nak ? nak_reason : (uint8)CLUSTER_LEAVE_NAK_NONE;
 	cluster_clean_leave_ack_compute_crc(&p);
@@ -924,6 +962,7 @@ cl_send_commit_ready(int32 coordinator, uint64 baseline_epoch)
 	p.preflight = 0;
 	p.leave_epoch = baseline_epoch;
 	p.cssd_dead_generation = cluster_cssd_get_dead_generation();
+	p.leave_nonce = pg_atomic_read_u64(&cl_state->leave_attempt_nonce); /* P2: bind to attempt */
 	cluster_clean_leave_announce_compute_crc(&p);
 
 	(void)cluster_ic_send_envelope(PGRAC_IC_MSG_LEAVE_COMMIT_READY, coordinator, &p,
@@ -1016,6 +1055,54 @@ cluster_clean_leave_request(void)
 		return CLUSTER_LEAVE_REQ_NOOP_NO_PEER;
 
 	CLUSTER_INJECTION_POINT("cluster-clean-leave-request");
+
+	/*
+	 * F6 layer-1 TRUE preflight (Hardening v1.0.2, P1): BEFORE entering REQUESTED
+	 * or touching any survivor's state, probe every survivor's enablement with a
+	 * side-effect-free preflight=true announce.  Survivors only ACK/NAK — NO state
+	 * change, NO GRD/PCM cleanup (§3.4 two-layer defense); a disabled survivor
+	 * NAKs.  We proceed only when every alive survivor preflight-ACKs, so a
+	 * mixed-mode request triggers NO survivor side effect.  (v1.0.1 only made the
+	 * real-announce NAK synchronous, but by then an enabled survivor had already
+	 * dropped its GRD/PCM refs to the still-alive leaver — 8.A at >=3 nodes.)  IC
+	 * sends are LMON-only, so this is a backend<->LMON handshake: stage the probe,
+	 * the LMON broadcasts it, we wait for the replies, then proceed or reject.
+	 */
+	{
+		uint64 nonce = (uint64)GetCurrentTimestamp();
+		int i;
+
+		LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
+		pg_atomic_write_u64(&cl_state->leave_attempt_nonce, nonce);
+		memset(cl_state->ack_bitmap, 0, sizeof(cl_state->ack_bitmap));
+		pg_atomic_write_u32(&cl_state->nak_received, 0);
+		pg_atomic_write_u32(&cl_state->nak_reason, (uint32)CLUSTER_LEAVE_NAK_NONE);
+		pg_atomic_write_u32(&cl_state->preflight_sent, 0);
+		pg_atomic_write_u32(&cl_state->preflight_pending, 1);
+		LWLockRelease(&cl_state->lock);
+
+		for (i = 0; i < 500; i++) { /* up to ~5s — a few LMON ticks */
+			if (pg_atomic_read_u32(&cl_state->nak_received))
+				break;
+			if (pg_atomic_read_u32(&cl_state->preflight_sent)
+				&& cl_all_survivors_acked(cluster_node_id))
+				break; /* probe out + every alive survivor is enabled */
+			pg_usleep(10 * 1000);
+		}
+		pg_atomic_write_u32(&cl_state->preflight_pending, 0);
+
+		if (pg_atomic_read_u32(&cl_state->nak_received)) {
+			ClusterLeaveNakReason reason
+				= (ClusterLeaveNakReason)pg_atomic_read_u32(&cl_state->nak_reason);
+
+			/* fail-closed BEFORE any state / marker / survivor side effect. */
+			if (reason == CLUSTER_LEAVE_NAK_NOT_IN_QUORUM)
+				return CLUSTER_LEAVE_REQ_REJECTED_NOT_IN_QUORUM;
+			if (reason == CLUSTER_LEAVE_NAK_LEAVE_IN_PROGRESS)
+				return CLUSTER_LEAVE_REQ_REJECTED_IN_PROGRESS;
+			return CLUSTER_LEAVE_REQ_REJECTED_PEERS_NOT_ENABLED;
+		}
+	}
 
 	baseline_epoch = cluster_epoch_get_current();
 
@@ -1480,6 +1567,20 @@ cluster_clean_leave_lmon_tick(void)
 	if (cl_state == NULL || !cluster_enabled)
 		return;
 
+	/*
+	 * Hardening v1.0.2 (P1, F6 layer-1 preflight): the request backend staged a
+	 * side-effect-free preflight probe (IC sends are LMON-only).  Broadcast it once
+	 * here, BEFORE the leaving_node_id check below — during the preflight the
+	 * leaver has NOT yet entered REQUESTED, so leaving_node_id is still -1.
+	 */
+	if (pg_atomic_read_u32(&cl_state->preflight_pending) == 1
+		&& pg_atomic_read_u32(&cl_state->preflight_sent) == 0) {
+		cluster_clean_leave_ic_broadcast_announce(
+			0 /* leave_epoch=0 for a probe */, pg_atomic_read_u64(&cl_state->leave_attempt_nonce),
+			/*preflight*/ true);
+		pg_atomic_write_u32(&cl_state->preflight_sent, 1);
+	}
+
 	leaving = cl_state->leaving_node_id;
 	if (leaving < 0)
 		return; /* no leave in progress */
@@ -1496,7 +1597,9 @@ cluster_clean_leave_lmon_tick(void)
 		 */
 		if (phase >= CLUSTER_LEAVE_REQUESTED && phase <= CLUSTER_LEAVE_BARRIER_WAIT
 			&& pg_atomic_read_u32(&cl_state->announce_sent) == 0) {
-			cluster_clean_leave_ic_broadcast_announce(cl_state->leave_epoch, /*preflight*/ false);
+			cluster_clean_leave_ic_broadcast_announce(
+				cl_state->leave_epoch, pg_atomic_read_u64(&cl_state->leave_attempt_nonce),
+				/*preflight*/ false);
 			pg_atomic_write_u32(&cl_state->announce_sent, 1);
 		}
 

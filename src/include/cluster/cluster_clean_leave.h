@@ -189,6 +189,22 @@ typedef struct ClusterLeaveState {
 	pg_atomic_uint32 committed_marker_durable;
 
 	/*
+	 * Hardening v1.0.2 fields.
+	 *   leave_attempt_nonce (P2): the nonce of the current leave attempt — set by
+	 *     the leaver at request, and by a survivor from the announce it accepted.
+	 *     Every control-message handler checks the payload nonce against it so a
+	 *     stale/delayed frame from a prior same-epoch attempt is dropped.
+	 *   preflight_pending / preflight_sent (P1, F6 layer-1 true preflight): the
+	 *     request backend stages a side-effect-free preflight=true probe; the LMON
+	 *     (IC sends are LMON-only) broadcasts it once and sets preflight_sent.  The
+	 *     request proceeds to REQUESTED only when every alive survivor preflight-
+	 *     ACKs (no NAK), so a mixed-mode request triggers NO survivor side effect.
+	 */
+	pg_atomic_uint64 leave_attempt_nonce;
+	pg_atomic_uint32 preflight_pending;
+	pg_atomic_uint32 preflight_sent;
+
+	/*
 	 * Voting-disk leave-marker submit mailbox (§2.5 two-phase commit) — a
 	 * local single-producer/single-consumer handshake mirroring the spec-4.12
 	 * fence-marker mailbox.  Producer = this node's driver/LMON staging a marker;
@@ -215,7 +231,9 @@ typedef struct ClusterLeaveState {
  *	message being acted on as a clean-leave command (8.A defense-in-depth).
  * ============================================================ */
 #define CLUSTER_CLEAN_LEAVE_IC_MAGIC 0x504C4943 /* "PLIC" — pgrac leave IC */
-#define CLUSTER_CLEAN_LEAVE_IC_VERSION 1
+/* v2 (Hardening v1.0.2): payloads carry leave_nonce; a mixed-version cluster
+ * fails closed (version mismatch dropped) rather than misparsing the wider frame. */
+#define CLUSTER_CLEAN_LEAVE_IC_VERSION 2
 
 /* LEAVE_DRAIN_NAK reasons (why a survivor refuses the clean leave). */
 typedef enum ClusterLeaveNakReason {
@@ -241,7 +259,11 @@ typedef struct ClusterLeaveAnnouncePayload {
 	uint8 _pad1[3];
 	uint64 leave_epoch;			 /* 0 until bound (preflight / pre-commit) */
 	uint64 cssd_dead_generation; /* version-coherence cross-check (CL-I3) */
-	uint32 crc;					 /* CRC32C over [magic..cssd_dead_generation] */
+	uint64 leave_nonce;			 /* Hardening v1.0.2 (P2): per-attempt nonce binding every
+						 * control message to THIS leave attempt (distinguishes a
+						 * same-epoch abort/retry; envelope epoch-drop only blocks
+						 * cross-membership-epoch frames). */
+	uint32 crc;					 /* CRC32C over [magic..leave_nonce] */
 } ClusterLeaveAnnouncePayload;
 
 /*
@@ -257,8 +279,10 @@ typedef struct ClusterLeaveAckPayload {
 	int32 survivor_node_id;
 	int32 leaving_node_id;
 	uint64 leave_epoch;
-	uint8 nak;		  /* 0 = ACK, 1 = NAK */
-	uint8 nak_reason; /* ClusterLeaveNakReason when nak=1 */
+	uint64 leave_nonce; /* Hardening v1.0.2 (P2): echoes the announce nonce so the
+						 * leaver drops a stale ACK/NAK from a prior attempt. */
+	uint8 nak;			/* 0 = ACK, 1 = NAK */
+	uint8 nak_reason;	/* ClusterLeaveNakReason when nak=1 */
 	uint8 _pad1[2];
 	uint32 crc; /* CRC32C over [magic..nak_reason] */
 } ClusterLeaveAckPayload;
@@ -390,9 +414,11 @@ extern void cluster_clean_leave_register_ic_msg_types(void);
 
 /* IC send helpers (D8).  broadcast_announce fans the announce/preflight out to
  * every survivor; send_ack is the survivor's per-peer ACK/NAK reply. */
-extern void cluster_clean_leave_ic_broadcast_announce(uint64 leave_epoch, bool preflight);
+extern void cluster_clean_leave_ic_broadcast_announce(uint64 leave_epoch, uint64 leave_nonce,
+													  bool preflight);
 extern void cluster_clean_leave_ic_send_ack(int32 dest_node_id, int32 leaving_node_id,
-											uint64 leave_epoch, bool nak, uint8 nak_reason);
+											uint64 leave_epoch, uint64 leave_nonce, bool nak,
+											uint8 nak_reason);
 
 /* ProcSignal quiesce integration (D7) — three-step enumerated (L100/L118). */
 extern void cluster_clean_leave_handle_quiesce_interrupt(void);
