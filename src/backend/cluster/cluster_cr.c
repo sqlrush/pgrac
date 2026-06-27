@@ -360,7 +360,21 @@ cr_walk_chain(char *scratch_page, UBA start_uba, SCN read_scn,
 
 		/* Own-instance, or a merged-materialized remote instance whose undo
 		 * lives in the local pg_undo/instance_<origin> tree (spec-4.5a D8).
-		 * Anything else stays the spec-3.9 fail-closed. */
+		 * Anything else stays the spec-3.9 fail-closed.
+		 *
+		 * spec-5.56 C4 (reconfig contract, §3.3): this carve-out is ALSO the
+		 * fail-closed boundary that keeps the THIRD origin class — runtime warm
+		 * remote (not own, not merged-materialized) — OUT of the CR pool: it never
+		 * constructs (ERROR below) so it never caches.  The two pool-eligible
+		 * classes are reconfig-INVARIANT and need NO membership/remaster
+		 * invalidation: (①) own-instance pages/undo are unchanged by reconfig; (②)
+		 * merged-materialized remote undo is durable in the local tree with a
+		 * reconfig-invariant merge_recovered_lsn authority, and an origin rejoin's
+		 * NEW writes are new versions => new key => MISS (already fenced by C1/key).
+		 * read_scn is a GLOBAL SCN (AD-008), not a membership epoch (INV-C2).  The
+		 * runtime-warm-remote class's reconfig/remaster invalidation is forwarded to
+		 * spec-5.57 (where construct stops fail-closing it); until then this ERROR
+		 * is the C4 class-③ guard (INV-C3), not a silent assumption. */
 		if (hdr->origin_node_id != (uint16)cluster_node_id
 			&& !cluster_merged_instance_is_materialized((int)hdr->origin_node_id))
 			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CR_CROSS_INSTANCE_UNSUPPORTED),
@@ -844,6 +858,30 @@ cr_build_cache_key(Buffer buf, SCN read_scn)
 }
 
 /*
+ * cr_note_retention_if_advanced -- spec-5.56 D2 (C3): PURE OBSERVATION on a
+ * cache hit.  Reads the EXISTING undo retention horizon (no pin, no extension)
+ * and, if it has advanced PAST this served image's read_scn, bumps the
+ * retention_horizon_advance_noted counter.  This does NOT affect serving: the
+ * materialized image is a key pure function (AD-006 / INV-R1), so recycling the
+ * source undo never rewrites the already-materialized bytes — the image stays the
+ * correct as-of-read_scn page.  The counter only quantifies that the §3.2
+ * retention-recycle scenario really occurs (it is naturally near-unreachable
+ * because an active reader@X pins the horizon <= X, INV-R2; U5 forces it via the
+ * retention-off / forced-advance leg, F0-13b).  Cheap: a bool guard first, then
+ * one atomic read only when retention is on. */
+static inline void
+cr_note_retention_if_advanced(SCN read_scn)
+{
+	SCN horizon;
+
+	if (!cluster_undo_retention_horizon_enabled)
+		return; /* retention off: nothing to compare (no hot-path cost) */
+	horizon = cluster_undo_retention_horizon();
+	if (SCN_VALID(horizon) && scn_time_cmp(horizon, read_scn) > 0)
+		cluster_cr_pool_note_retention_horizon_advance();
+}
+
+/*
  * spec-5.53 D3 — MISS-forcing rules (the eight categories; rule 8.A: any one
  * uncertain → MISS → reconstruct, never a stale hit).  Every category below maps
  * to a concrete mechanism already present on this path and an observable
@@ -908,12 +946,22 @@ cluster_cr_lookup_or_construct(Buffer buf, SCN read_scn)
 	 */
 	ClusterCRCacheKey key = cr_build_cache_key(buf, read_scn);
 	uint64 start_epoch;
+	uint64 start_rel_gen = 0; /* spec-5.56 D4: per-relation gen captured for ①/②;
+							   * 0 = gen table disabled / locator unregistered */
+	uint64 install_gen = 0;	  /* spec-5.56 D4: gen to stamp the constructed image */
+	bool skip_cache = false;  /* spec-5.56 D4: gen-table full => serve-but-skip-cache */
 	const char *hit;
 	char *slot;
 	bool evicted = false;
 	int miss_reason = CR_CACHE_MISS_NONE;
 
 	start_epoch = cluster_cr_pool_current_epoch(); /* 0 when L2 disabled */
+	/* spec-5.56 D4: capture the locator's current per-relation generation for the
+	 * composite {pool_epoch, rel_gen} fence (P1-c).  0 when the gen table is
+	 * disabled or the locator is unregistered (then the fence is epoch-only and a
+	 * registered entry, which always has gen >= 1, simply MISSes). */
+	if (cluster_cr_pool_rel_generation_enabled())
+		(void)cluster_cr_pool_rel_generation(key.rlocator, &start_rel_gen);
 
 	/*
 	 * spec-5.53 D2c: per-entry L1 lifecycle-epoch fence ("L1+L2 same fence").
@@ -925,10 +973,11 @@ cluster_cr_lookup_or_construct(Buffer buf, SCN read_scn)
 	 * gate.  spec-5.53 D5: the linear L1 scan also attributes a miss to a churned
 	 * page version / diverged snapshot for the over-miss diagnostics.
 	 */
-	hit = cluster_cr_cache_lookup(&key, start_epoch, &miss_reason);
+	/* spec-5.56 ①: L1 lookup under the COMPOSITE fence (epoch + start_rel_gen). */
+	hit = cluster_cr_cache_lookup_fenced(&key, start_epoch, start_rel_gen, &miss_reason);
 	switch (miss_reason) {
 	case CR_CACHE_MISS_EPOCH:
-		cluster_cr_pool_note_l1_epoch_mismatch(); /* L1 reuse fence fired */
+		cluster_cr_pool_note_l1_epoch_mismatch(); /* L1 lifecycle fence fired */
 		break;
 	case CR_CACHE_MISS_BASE_LSN:
 		cluster_cr_pool_note_base_lsn_mismatch();
@@ -940,17 +989,37 @@ cluster_cr_lookup_or_construct(Buffer buf, SCN read_scn)
 		break;
 	}
 	if (hit != NULL) {
-		/* spec-5.51 §3.4: recheck the epoch for the within-call race (a bump
-		 * between the lookup and here makes the start_epoch-stamped entry stale). */
-		if (start_epoch == 0 || cluster_cr_pool_current_epoch() == start_epoch) {
+		/* spec-5.51 §3.4 + spec-5.56 ②: recheck the COMPOSITE fence for the
+		 * within-call race (a global epoch bump OR a per-relation gen bump between
+		 * the lookup and here makes the {start_epoch, start_rel_gen}-stamped entry
+		 * stale).  start_epoch == 0 means the pool is disabled (no fence). */
+		bool stale = false;
+
+		if (start_epoch != 0) {
+			if (cluster_cr_pool_current_epoch() != start_epoch) {
+				stale = true;
+			} else if (cluster_cr_pool_rel_generation_enabled()) {
+				uint64 cur_gen = 0;
+
+				(void)cluster_cr_pool_rel_generation(key.rlocator, &cur_gen);
+				if (cur_gen != start_rel_gen)
+					stale = true;
+			}
+		}
+		if (!stale) {
 			if (CRShared != NULL)
 				pg_atomic_fetch_add_u64(&CRShared->cr_cache_hit_count, 1);
+			cr_note_retention_if_advanced(read_scn); /* spec-5.56 D2: observe only */
 			return hit;
 		}
-		/* epoch advanced mid-lookup: drop this now-stale hit and rebuild at the
-		 * new epoch (the entry keeps its old stamp, so it can never be re-served). */
+		/* lifecycle event advanced mid-lookup: drop this now-stale hit and rebuild
+		 * at the new (epoch, rel_gen) (the entry keeps its old stamp, so it can
+		 * never be re-served). */
 		cluster_cr_pool_note_l1_epoch_mismatch();
 		start_epoch = cluster_cr_pool_current_epoch();
+		start_rel_gen = 0;
+		if (cluster_cr_pool_rel_generation_enabled())
+			(void)cluster_cr_pool_rel_generation(key.rlocator, &start_rel_gen);
 	}
 	if (CRShared != NULL)
 		pg_atomic_fetch_add_u64(&CRShared->cr_cache_miss_count, 1);
@@ -960,11 +1029,19 @@ cluster_cr_lookup_or_construct(Buffer buf, SCN read_scn)
 		pg_atomic_fetch_add_u64(&CRShared->cr_cache_evict_count, 1);
 
 	/* spec-5.51 D4: L2 probe (copy-out into the L1 victim slot).  On an L2 hit,
-	 * the image is now in L1; commit + return. */
+	 * the image is now in L1; commit + return.  spec-5.56 ③: lookup_copy serves
+	 * only under the composite fence, so a hit proves the locator is registered;
+	 * stamp the L1 entry with the locator's CURRENT gen (fresh) so the L1 fence is
+	 * coherent with L2 (a later per-relation unlink then MISSes both). */
 	if (start_epoch != 0 && cluster_cr_pool_lookup_copy(&key, slot)) {
-		cluster_cr_cache_commit_slot();
+		uint64 hit_gen = 0;
+
+		if (cluster_cr_pool_rel_generation_enabled())
+			(void)cluster_cr_pool_rel_generation(key.rlocator, &hit_gen);
+		cluster_cr_cache_commit_slot_gen(hit_gen);
 		if (CRShared != NULL)
 			pg_atomic_fetch_add_u64(&CRShared->cr_cache_install_count, 1);
+		cr_note_retention_if_advanced(read_scn); /* spec-5.56 D2: observe only */
 		return slot;
 	}
 
@@ -975,21 +1052,35 @@ cluster_cr_lookup_or_construct(Buffer buf, SCN read_scn)
 		bool reserved = false;
 
 		/*
+		 * spec-5.56 D4 / INV-G3 (register-at-install): register the locator in the
+		 * per-relation generation table BEFORE caching into L1 OR L2, so ANY cached
+		 * entry's locator is tracked and a later unlink fences it (the global epoch
+		 * does NOT bump for a tracked unlink in GO mode).  Covers BOTH the L2
+		 * reserve below AND the bare-construct L1 commit (the admission-reject /
+		 * L2-disabled path still commits to L1).  A register failure (gen table
+		 * full) -> serve-but-skip-cache: construct and return the correct image
+		 * WITHOUT caching it in L1 or L2 (so the untracked locator has no entry and
+		 * its unlink is a safe no-op, P2-d′; rel_gen_table_overflow++ in register).
+		 * Disabled -> install_gen stays 0 (epoch-only fence; spec-5.53 behavior).
+		 */
+		if (start_epoch != 0 && cluster_cr_pool_rel_generation_enabled()) {
+			if (!cluster_cr_pool_register_locator(key.rlocator, &install_gen))
+				skip_cache = true;
+		}
+
+		/*
 		 * spec-5.52 D2: insert-side admission gate.  Only reserve+publish into
 		 * L2 when the admission predicate admits this image; a reject bypasses
 		 * the pool and falls through to the bare-construct else branch (F0-2),
 		 * serving the SAME correct image (INV-A1).  admit_all (the default) ->
 		 * always admit == spec-5.51 v1 (zero behavior change).  The predicate is
 		 * advisory only and never affects the served image.
-		 *
-		 * NB (stacked WIP): this hooks the spec-5.51 held seam (b04920003c) and
-		 * MUST be re-grounded after 5.51 rebases onto the real main.
 		 */
-		if (start_epoch != 0) {
+		if (!skip_cache && start_epoch != 0) {
 			ClusterCRAdmitCtx actx = { .scan_kind = cluster_cr_admit_current_scan_kind() };
 
 			if (cluster_cr_pool_admit(&key, &actx))
-				reserved = cluster_cr_pool_reserve(&key, &ph);
+				reserved = cluster_cr_pool_reserve_gen(&key, install_gen, &ph);
 			/* spec-5.52 D9: record the admission decision (advisory counter). */
 			cluster_cr_admit_stat_bump(cluster_cr_admit_last_reason());
 		}
@@ -1011,19 +1102,39 @@ cluster_cr_lookup_or_construct(Buffer buf, SCN read_scn)
 			}
 			PG_END_TRY();
 		} else {
-			/* L2 disabled / no reservation: bare construct (spec-3.10 path). */
+			/* L2 disabled / admission reject / skip-cache: bare construct
+			 * (spec-3.10 path).  Still committed to L1 below unless skip_cache. */
 			(void)cluster_cr_construct_block_into(buf, read_scn, slot);
 		}
 	}
 
-	/* spec-5.51 §3.4: commit-time epoch recheck.  If a lifecycle bump happened
-	 * during construction, serve the freshly-built (correct) image but do NOT
-	 * commit it to L1 (the L1 slot stays invalid -> not served to later
-	 * lookups), so no stale-epoch entry persists. */
-	if (start_epoch != 0 && cluster_cr_pool_current_epoch() != start_epoch)
+	/* spec-5.56 D4: gen table full -> serve-but-skip-cache.  The freshly-built
+	 * image is correct; just do NOT cache it (no L1 commit) so the untracked
+	 * locator keeps zero entries (INV-G3) and its later unlink is a safe no-op. */
+	if (skip_cache)
 		return slot;
 
-	cluster_cr_cache_commit_slot();
+	/* spec-5.51 §3.4 + spec-5.56 ④: commit-time COMPOSITE recheck.  If a lifecycle
+	 * event happened during construction — the global epoch advanced (coarse) OR
+	 * this relation's per-relation generation advanced (a per-relation unlink in GO
+	 * mode, compared against install_gen per P2-e′ so a first-registration is not
+	 * falsely skipped) — serve the freshly-built (correct) image but do NOT commit
+	 * it to L1 (the slot stays invalid -> not served later), so no stale entry
+	 * persists. */
+	if (start_epoch != 0) {
+		bool gen_moved = false;
+
+		if (cluster_cr_pool_rel_generation_enabled()) {
+			uint64 cur_gen = 0;
+
+			(void)cluster_cr_pool_rel_generation(key.rlocator, &cur_gen);
+			gen_moved = (cur_gen != install_gen);
+		}
+		if (cluster_cr_pool_current_epoch() != start_epoch || gen_moved)
+			return slot;
+	}
+
+	cluster_cr_cache_commit_slot_gen(install_gen);
 	if (CRShared != NULL)
 		pg_atomic_fetch_add_u64(&CRShared->cr_cache_install_count, 1);
 	return slot;

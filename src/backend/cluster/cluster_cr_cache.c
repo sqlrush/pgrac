@@ -48,6 +48,14 @@ typedef struct ClusterCRCacheEntry {
 						* L1 fence serves an entry only at the current epoch, so a
 						* relfilenode-reuse (epoch bump) forces a MISS even on an
 						* exact key match (L1+L2 same fence). */
+	uint64 rel_gen;	   /* spec-5.56 D4: per-relation lifecycle generation stamped
+						* at commit (the second half of the composite {pool_epoch,
+						* rel_gen} fence, P1-c).  0 = no per-rel fence (gen table
+						* disabled => epoch-only, spec-5.53 equivalence).  When the
+						* gen table is enabled this is the locator's generation at
+						* install; a per-relation unlink bumps the locator's gen so
+						* this stale entry MISSes WITHOUT a global epoch bump (the
+						* whole point of Part B: unrelated relations stay warm). */
 	bool valid;		   /* false until commit / after eviction reserve */
 	bool ref;		   /* clock second-chance bit */
 	char page[BLCKSZ];
@@ -137,6 +145,16 @@ cr_cache_pick_victim(bool *evicted)
 const char *
 cluster_cr_cache_lookup(const ClusterCRCacheKey *key, uint64 cur_epoch, int *out_miss_reason)
 {
+	/* spec-5.56: epoch-only fence (cur_rel_gen == 0 == "no per-rel fence").  This
+	 * preserves the spec-3.10/5.53 behavior for callers that do not (or cannot)
+	 * consult the per-relation generation table (cluster_unit substrate tests). */
+	return cluster_cr_cache_lookup_fenced(key, cur_epoch, 0, out_miss_reason);
+}
+
+const char *
+cluster_cr_cache_lookup_fenced(const ClusterCRCacheKey *key, uint64 cur_epoch, uint64 cur_rel_gen,
+							   int *out_miss_reason)
+{
 	int i;
 	int reason = CR_CACHE_MISS_NONE;
 
@@ -154,18 +172,23 @@ cluster_cr_cache_lookup(const ClusterCRCacheKey *key, uint64 cur_epoch, int *out
 
 		if (cluster_cr_cache_key_equal(&e->key, key)) {
 			/*
-			 * spec-5.53 D2c: per-entry lifecycle-epoch fence.  An exact key
-			 * match whose stamped epoch is not the current epoch is a stale
-			 * image from before a relfilenode lifecycle event (DROP / TRUNCATE /
-			 * relfilenode reuse / sinval).  Do NOT serve it (rule 8.A: never a
-			 * stale hit); report it so the caller can count the fence firing.
-			 * The stale entry is left for the clock to evict (its key can only be
-			 * re-hit at the matching epoch, which can no longer occur).
+			 * spec-5.53 D2c + spec-5.56 D4: per-entry COMPOSITE lifecycle fence
+			 * {pool_epoch, rel_gen} (P1-c).  An exact key match whose stamped
+			 * GLOBAL epoch is stale (a coarse DROP/TRUNCATE/sinval since install)
+			 * OR whose stamped PER-RELATION generation no longer matches the
+			 * locator's current generation (a fine-grained per-relation unlink in
+			 * GO mode, which does NOT bump the global epoch) is a stale image from
+			 * before a lifecycle event.  Do NOT serve it (rule 8.A: never a stale
+			 * hit); report it so the caller can count the fence firing.  The stale
+			 * entry is left for the clock to evict (its (epoch, rel_gen) pair can
+			 * only be re-hit at values that can no longer occur).  cur_rel_gen == 0
+			 * (gen table disabled / locator unregistered) makes the rel_gen half a
+			 * no-op (entries stamped 0 ⇒ epoch-only, spec-5.53 equivalence).
 			 */
-			if (e->pool_epoch != cur_epoch) {
+			if (e->pool_epoch != cur_epoch || e->rel_gen != cur_rel_gen) {
 				if (out_miss_reason != NULL)
 					*out_miss_reason = CR_CACHE_MISS_EPOCH;
-				return NULL; /* epoch is the most-specific reason; stop here */
+				return NULL; /* lifecycle fence (epoch | rel_gen): stop here */
 			}
 			e->ref = true; /* second chance */
 			return e->page;
@@ -219,6 +242,9 @@ cluster_cr_cache_victim_slot(const ClusterCRCacheKey *key, uint64 cur_epoch, boo
 	cr_cache[idx].ref = false;
 	cr_cache[idx].key = (key != NULL) ? *key : cr_cache[idx].key;
 	cr_cache[idx].pool_epoch = cur_epoch; /* spec-5.53 D2c: stamp the fence epoch */
+	cr_cache[idx].rel_gen = 0;			  /* spec-5.56 D4: provisional; commit re-stamps
+										   * the authoritative install gen.  The slot is
+										   * INVALID until commit so this 0 is never served. */
 	cr_cache_last_victim = idx;
 
 	if (evicted != NULL)
@@ -229,7 +255,24 @@ cluster_cr_cache_victim_slot(const ClusterCRCacheKey *key, uint64 cur_epoch, boo
 void
 cluster_cr_cache_commit_slot(void)
 {
+	/* spec-5.56: epoch-only callers commit with rel_gen == 0 (no per-rel fence). */
+	cluster_cr_cache_commit_slot_gen(0);
+}
+
+void
+cluster_cr_cache_commit_slot_gen(uint64 rel_gen)
+{
 	if (cr_cache_last_victim >= 0 && cr_cache_last_victim < cr_cache_capacity) {
+		/*
+		 * spec-5.56 D4: stamp the AUTHORITATIVE per-relation generation (the
+		 * install_gen the caller obtained from cluster_cr_pool_register_locator,
+		 * or the gen the L2 hit matched).  This is stamped at commit, not at
+		 * victim_slot reserve, because the install gen is known only after the
+		 * locator is registered (P2-e′: a first-registration locator's install_gen
+		 * is 1 while the captured start_rel_gen was 0 — comparing the entry against
+		 * the install_gen at commit-recheck avoids falsely skipping the first cache).
+		 */
+		cr_cache[cr_cache_last_victim].rel_gen = rel_gen;
 		cr_cache[cr_cache_last_victim].valid = true;
 		/*
 		 * ref stays FALSE on install: an image becomes "referenced" only when

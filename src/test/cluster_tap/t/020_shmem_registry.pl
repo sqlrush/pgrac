@@ -18,7 +18,7 @@
 #      - Per-region rollup keys (region.<name>.bytes / .owner) appear
 #        for both registered regions.
 #      - cluster.shmem_max_regions GUC is int / postmaster context /
-#        default 64 / range [40, 256].  The legal lower bound is the
+#        default 80 / range [40, 256].  The legal lower bound is the
 #        historical minimum; L18 separately verifies that setting the GUC
 #        to the current region count admits all registered regions.
 #      - Lowering cluster.shmem_max_regions to the current baseline
@@ -80,11 +80,14 @@ my $has_visibility_inject =
 # +1 for the unconditional "pgrac cluster cr admit stats" region (spec-5.52 D9;
 # independent admission reason counters, always registered; sorts between
 # "control" and "cr counters").
-# spec-5.13 D2: +1 for the "pgrac cluster clean_leave" region (always registered;
-# sorts between "cf stats" and "conf").
-my $expected_region_count = $has_visibility_inject ? '64' : '63';
+# spec-5.13 D2: +1 for the "pgrac cluster clean_leave" region (sorts between
+# "cf stats" and "conf").  spec-5.54 D5: +1 "pgrac cluster cr tuple stats".
+# spec-5.56 D4: +1 "pgrac cluster cr relgen" (per-relation lifecycle generation
+# table, always registered, 0 bytes when disabled; sorts between "cr pool" and
+# "cr tuple stats").
+my $expected_region_count = $has_visibility_inject ? '65' : '64';
 my $expected_regions =
-  'pgrac block recovery,pgrac cluster advisory,pgrac cluster cf stats,pgrac cluster clean_leave,pgrac cluster conf,pgrac cluster control,pgrac cluster cr admit stats,pgrac cluster cr counters,pgrac cluster cr pool,pgrac cluster cr tuple stats,pgrac cluster cssd,pgrac cluster diag,pgrac cluster dl,pgrac cluster durable tt counters,pgrac cluster epoch,pgrac cluster fence,pgrac cluster gcs,pgrac cluster gcs block,pgrac cluster gcs block dedup,pgrac cluster ges,pgrac cluster ges dedup,pgrac cluster ges reply wait,pgrac cluster grd,pgrac cluster grd outbound,pgrac cluster grd pending,pgrac cluster grd work queue,pgrac cluster hw,pgrac cluster ir,pgrac cluster ko,pgrac cluster lck,pgrac cluster lmd,pgrac cluster lmd graph,pgrac cluster lmd probe,pgrac cluster lmon,pgrac cluster lms,pgrac cluster lock-path counters,pgrac cluster multixact overlay,pgrac cluster pcm grd,pgrac cluster qvotec,pgrac cluster reconfig,pgrac cluster scn,pgrac cluster sequence,pgrac cluster sinval ack outbound,pgrac cluster sinval ack wait,pgrac cluster sinval inbound,pgrac cluster sinval outbound,pgrac cluster smgr,pgrac cluster startup phase,pgrac cluster stats,pgrac cluster subtrans state,pgrac cluster ts,pgrac cluster tt local seq,pgrac cluster tt slot allocator,pgrac cluster tt status hint outbound,pgrac cluster tt status overlay,pgrac cluster tx enqueue,pgrac cluster undo cleaner,pgrac cluster undo record cursor';
+  'pgrac block recovery,pgrac cluster advisory,pgrac cluster cf stats,pgrac cluster clean_leave,pgrac cluster conf,pgrac cluster control,pgrac cluster cr admit stats,pgrac cluster cr counters,pgrac cluster cr pool,pgrac cluster cr relgen,pgrac cluster cr tuple stats,pgrac cluster cssd,pgrac cluster diag,pgrac cluster dl,pgrac cluster durable tt counters,pgrac cluster epoch,pgrac cluster fence,pgrac cluster gcs,pgrac cluster gcs block,pgrac cluster gcs block dedup,pgrac cluster ges,pgrac cluster ges dedup,pgrac cluster ges reply wait,pgrac cluster grd,pgrac cluster grd outbound,pgrac cluster grd pending,pgrac cluster grd work queue,pgrac cluster hw,pgrac cluster ir,pgrac cluster ko,pgrac cluster lck,pgrac cluster lmd,pgrac cluster lmd graph,pgrac cluster lmd probe,pgrac cluster lmon,pgrac cluster lms,pgrac cluster lock-path counters,pgrac cluster multixact overlay,pgrac cluster pcm grd,pgrac cluster qvotec,pgrac cluster reconfig,pgrac cluster scn,pgrac cluster sequence,pgrac cluster sinval ack outbound,pgrac cluster sinval ack wait,pgrac cluster sinval inbound,pgrac cluster sinval outbound,pgrac cluster smgr,pgrac cluster startup phase,pgrac cluster stats,pgrac cluster subtrans state,pgrac cluster ts,pgrac cluster tt local seq,pgrac cluster tt slot allocator,pgrac cluster tt status hint outbound,pgrac cluster tt status overlay,pgrac cluster tx enqueue,pgrac cluster undo cleaner,pgrac cluster undo record cursor';
 $expected_regions .= ',pgrac cluster visibility inject'
   if $has_visibility_inject;
 # spec-4.12 D7: cooperative write-fence region;  always registered.  Sorts after
@@ -221,14 +224,14 @@ like($node->safe_psql(
 	  FROM pg_settings
 	 WHERE name = 'cluster.shmem_max_regions'
 }),
-   qr/^integer\|postmaster\|64\|(40|41)\|256$/,
-   'L12 cluster.shmem_max_regions retains the historical legal range');
+   qr/^integer\|postmaster\|80\|(40|41)\|256$/,
+   'L12 cluster.shmem_max_regions default 80 (spec-5.56: 64 -> 80 for cr relgen region)');
 
 is($node->safe_psql(
 		'postgres',
 		q{SELECT value FROM pg_cluster_state
 		   WHERE category = 'guc' AND key = 'cluster.shmem_max_regions'}),
-   '64',
+   '80',
    'L13 pg_cluster_state.guc.cluster.shmem_max_regions reflects live GUC');
 
 

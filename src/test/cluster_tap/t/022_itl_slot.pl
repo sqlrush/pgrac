@@ -69,8 +69,9 @@ my $has_visibility_inject =
 	     WHERE name = 'pgrac cluster visibility inject'}) eq '1';
 # +1 for the unconditional "pgrac cluster sequence" region (spec-5.4 SQ shmem foundation)
 # and +1 for the unconditional "pgrac cluster cr admit stats" region (spec-5.52 D9;
+# and +1 for the unconditional "pgrac cluster cr relgen" region (spec-5.56 D4;
 # full enumerated region list + count lives in t/020).
-  my $expected_region_count = $has_visibility_inject ? '64' : '63';
+  my $expected_region_count = $has_visibility_inject ? '65' : '64'; # +1 clean_leave +1 cr relgen +1 cr tuple stats
 
 
 # ----------

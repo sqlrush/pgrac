@@ -425,6 +425,7 @@ cluster_tt_status_hint_shmem_register(void)
  * so stub those too (mirror real defaults). */
 bool cluster_shared_cr_pool_enabled = false;
 int cluster_shared_cr_pool_size_blocks = 0;
+int cluster_cr_pool_rel_generation_slots = 0; /* spec-5.56 D4 link-only stub */
 void
 cluster_cr_pool_shmem_register(void)
 {}
@@ -946,13 +947,13 @@ UT_TEST(test_cluster_shmem_iter_regions_returns_false_when_uninit)
 UT_TEST(test_cluster_shmem_max_regions_default_value)
 {
 	/*
-	 * The boot-value of cluster.shmem_max_regions is 64 (spec-1.3
-	 * §2.2 / cluster_guc.c static initializer).  Unit test links
-	 * cluster_guc.o but never calls cluster_init_guc, so the C
-	 * global retains its static-initializer default.
+	 * The boot-value of cluster.shmem_max_regions is 80 (spec-5.56 raised it
+	 * 64 -> 80 for the per-relation CR generation region; cluster_guc.c static
+	 * initializer).  Unit test links cluster_guc.o but never calls
+	 * cluster_init_guc, so the C global retains its static-initializer default.
 	 */
 	extern int cluster_shmem_max_regions;
-	UT_ASSERT_EQ(cluster_shmem_max_regions, 64);
+	UT_ASSERT_EQ(cluster_shmem_max_regions, 80);
 }
 
 

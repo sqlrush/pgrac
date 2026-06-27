@@ -23,7 +23,7 @@
  *	        MAKE_SQLSTATE macro
  *	    L7  GUC enum + bound snapshot:  cluster.sinval_ack_mode (2 valid
  *	        values) + cluster.gcs_block_lost_write_action (2 valid
- *	        values) + cluster.shmem_max_regions (boot_val=64 /
+ *	        values) + cluster.shmem_max_regions (boot_val=80 /
  *	        min_val=33 / max_val=256;  v0.3 P2 minor — 防 future spec
  *	        误降 min_val 破坏 region 注册兼容性)
  *	    L8  PGRAC_IC_MSG_RESERVED_0 == 0 sentinel (spec-2.0 wire 起点)
@@ -247,9 +247,10 @@ UT_TEST(test_stage2_guc_enum_snapshot)
 	UT_ASSERT_EQ((int)CLUSTER_SINVAL_ACK_MODE_NONE, 0);
 	UT_ASSERT_EQ((int)CLUSTER_SINVAL_ACK_MODE_PEER_ENQUEUED, 1);
 
-	/* cluster_shmem_max_regions:  default 64 (boot_val);  test process
-	 * loads default since no postgresql.conf wired in this unit binary. */
-	UT_ASSERT_EQ(cluster_shmem_max_regions, 64);
+	/* cluster_shmem_max_regions:  default 80 (boot_val; spec-5.56 raised 64 -> 80
+	 * for the cr relgen region);  test process loads default since no
+	 * postgresql.conf wired in this unit binary. */
+	UT_ASSERT_EQ(cluster_shmem_max_regions, 80);
 	/* boot_val/min_val/max_val GUC contract is enforced at registration
 	 * site in cluster_guc.c (DefineCustomIntVariable args 64/35/256);
 	 * this test pins the boot_val.  min_val/max_val 是 GUC infra constant,
@@ -265,8 +266,8 @@ UT_TEST(test_stage2_ic_msg_reserved_0_sentinel)
 }
 
 
-/* Stubs for cluster_shmem_max_regions extern */
-int cluster_shmem_max_regions = 64;
+/* Stubs for cluster_shmem_max_regions extern (spec-5.56: default 80) */
+int cluster_shmem_max_regions = 80;
 
 
 int

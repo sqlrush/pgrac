@@ -93,7 +93,7 @@ char *cluster_shared_storage_uuid = NULL;
  */
 bool cluster_controlfile_shared_authority = false;
 bool cluster_smgr_user_relations = false;
-int cluster_shmem_max_regions = 64;
+int cluster_shmem_max_regions = 80; /* spec-5.56: 64 -> 80 (cr relgen region; restore margin) */
 
 /* spec-3.18 D1: undo block buffer pool slot count (0 = disabled). */
 int cluster_undo_buffers = 2048;
@@ -1304,9 +1304,11 @@ cluster_init_guc(void)
 
 	/*
 	 * cluster.shmem_max_regions (spec-1.3): capacity of the cluster shmem
-	 * region registry.  Default 64 covers the stage 1.3 baseline plus the
-	 * reserved regions planned in cluster-shmem-design.md §3.2 with a wide
-	 * safety margin.  Range [40, 256] in production builds -- 40 is the
+	 * region registry.  Default 80 (spec-5.56: raised 64 -> 80 when the
+	 * per-relation CR generation region took the live count to 65 with the
+	 * visibility-inject region compiled in; restores a wide safety margin) covers
+	 * the current baseline plus the reserved regions planned in
+	 * cluster-shmem-design.md §3.2.  Range [40, 256] in production builds -- 40 is the
 	 * minimum to fit the spec-3.6 baseline after adding the MultiXact
 	 * overlay region on top of spec-3.5's SUBTRANS state region.  Test
 	 * injection builds use 41 because the visibility-inject shmem region is
@@ -1332,7 +1334,7 @@ cluster_init_guc(void)
 										 "registers one region.  Raise if FATAL on startup with "
 										 "errcode 53400 \"cluster shmem registry capacity "
 										 "exceeded\"."),
-							&cluster_shmem_max_regions, 64, CLUSTER_SHMEM_MIN_REGIONS, 256,
+							&cluster_shmem_max_regions, 80, CLUSTER_SHMEM_MIN_REGIONS, 256,
 							PGC_POSTMASTER, /* registry array is palloc'd once at init */
 							0,				/* flags */
 							NULL,			/* check_hook */
@@ -2489,6 +2491,27 @@ cluster_init_guc(void)
 			"sizing formula are determined by spec-5.50 profile evidence; do not set "
 			"size > 0 for perf claims without it. Each block costs 8 KB of shared memory."),
 		&cluster_shared_cr_pool_size_blocks, 0, 0, 262144, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	/* spec-5.56 D4: per-relation lifecycle generation table (Part B; value-gated).
+	 * PGC_POSTMASTER: the table size + its own shmem region are fixed at
+	 * reservation time.  Default 0 = disabled => the smgrdounlinkall lifecycle bump
+	 * stays the spec-5.53 unconditional GLOBAL epoch bump (coarse, whole-pool
+	 * flush; zero behavior change).  > 0 enables fine-grained per-relation
+	 * invalidation: a DROP/TRUNCATE bumps only the dropped relation's generation,
+	 * so unrelated warm CR images survive (spec-5.56 D0 measured a 100% coarse
+	 * blast radius per unrelated DDL).  Size it >= the pool's distinct-locator
+	 * working set; on overflow an install serves-but-skips-cache (observable via
+	 * cr_rel_gen_table_overflow_count).  Meaningless without the pool enabled. */
+	DefineCustomIntVariable(
+		"cluster.cr_pool_rel_generation_slots",
+		gettext_noop("Per-relation CR lifecycle generation table size (0 = disabled; coarse)."),
+		gettext_noop(
+			"Spec-5.56 Part B. Default 0 (disabled => the coarse global-epoch bump, "
+			"spec-5.53 behavior). PGC_POSTMASTER: requires a restart, own shmem region. "
+			"> 0 enables fine-grained per-relation CR invalidation so an unrelated DROP / "
+			"TRUNCATE does not flush the whole shared CR pool. Rounded down to a multiple "
+			"of the partition count; size it >= the pool's distinct-relation working set."),
+		&cluster_cr_pool_rel_generation_slots, 0, 0, 262144, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	/* spec-5.52 D8: shared CR pool admission policy (backend-local, advisory).
 	 * All PGC_SIGHUP: the admission state is backend-local with no shmem layout

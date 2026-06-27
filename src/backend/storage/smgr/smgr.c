@@ -598,7 +598,33 @@ smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo)
 		 */
 		CLUSTER_INJECTION_POINT("cluster-cr-skip-epoch-bump");
 		if (!cluster_injection_should_skip("cluster-cr-skip-epoch-bump"))
-			cluster_cr_pool_bump_epoch();
+		{
+			/*
+			 * PGRAC: spec-5.56 D4 — fine-grained per-relation invalidation (GO
+			 * mode).  When the per-relation generation table is enabled, bump ONLY
+			 * each dropped relation's generation (over ALL nrels — covers md.c-
+			 * routed heaps, NON-filtered, so completeness equals the coarse floor at
+			 * THIS same chokepoint, INV-G1).  tracked -> gen++ (only that relation's
+			 * CR images are fenced; unrelated warm images survive, the measured 100%
+			 * coarse blast radius is avoided); untracked -> no-op (INV-G3 guarantees
+			 * no L1/L2 entry).  The global epoch does NOT advance for a tracked
+			 * unlink — tracked-locator correctness rests on this loop's completeness
+			 * (INV-G1, ship-blocking), NOT on the global backstop.
+			 *
+			 * When the gen table is disabled (default), fall back to the spec-5.53
+			 * UNCONDITIONAL global epoch bump (coarse whole-pool flush): zero
+			 * behavior change.  The skip-bump fault injection above suppresses BOTH
+			 * paths for one unlink, so a "missed bump" regression stays observable
+			 * (spec-5.53 D2b / spec-5.56 U12).
+			 */
+			if (cluster_cr_pool_rel_generation_enabled())
+			{
+				for (i = 0; i < nrels; i++)
+					cluster_cr_pool_unlink_locator(rlocators[i].locator);
+			}
+			else
+				cluster_cr_pool_bump_epoch();
+		}
 	}
 #endif
 

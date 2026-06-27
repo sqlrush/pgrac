@@ -102,10 +102,10 @@ my $open_rr_reader = sub {
 	is($node->safe_psql('postgres', 'SELECT 1'), '1', 'L1a node alive');
 
 	# spec-3.9/3.10/3.22 cr rows (17) + spec-5.53 D5 five mismatch counters +
-	# spec-5.54 D5 eight tuple-fast-path outcome counters.
+	# spec-5.54 D5 eight tuple counters + spec-5.56 D5 five lifecycle counters.
 	is( $node->safe_psql('postgres',
 			q{SELECT count(*) FROM pg_cluster_state WHERE category='cr'}),
-		'30', 'L1b cr category has 30 rows (17 + 5 spec-5.53 mismatch + 8 spec-5.54 tuple)');
+		'35', 'L1b cr category has 35 rows (17 + 5 spec-5.53 + 8 spec-5.54 + 5 spec-5.56)');
 
 	for my $k (qw(cr_key_mismatch_count cr_epoch_mismatch_count
 		cr_generation_mismatch_count cr_base_lsn_mismatch_count

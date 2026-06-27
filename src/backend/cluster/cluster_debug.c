@@ -2289,8 +2289,10 @@ dump_undo(ReturnSetInfo *rsinfo)
 /*
  * dump_cr -- spec-3.9 D8 own-instance CR counter observability.
  *
- *	Emits 9 rows under category='cr' for the cluster_cr counters.  Backs
- *	cluster_tap t/215 L2/L3/L7 verification + perf class 9 baseline.
+ *	Emits 35 rows under category='cr' (9 spec-3.9 own-instance CR + 4 spec-3.10
+ *	L1 cache + 4 spec-3.22 xmax + 5 spec-5.53 identity/reuse-fence mismatch +
+ *	8 spec-5.54 tuple-fast-path + 5 spec-5.56 lifecycle) plus the 'cr_pool'
+ *	(spec-5.51) and admission (spec-5.52) rows.  Backs cluster_tap t/215 + t/309.
  */
 static void
 dump_cr(ReturnSetInfo *rsinfo)
@@ -2363,6 +2365,26 @@ dump_cr(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_cr_tuple_stat_count(CR_TUPLE_OUTCOME_FALLBACK_CROSS_BLOCK)));
 	emit_row(rsinfo, "cr", "cr_tuple_fallback_uncertain_count",
 			 fmt_int64((int64)cluster_cr_tuple_stat_count(CR_TUPLE_OUTCOME_FALLBACK_UNCERTAIN)));
+	/*
+	 * spec-5.56 D5: CR pool lifecycle / invalidation counters (5 rows; folded into
+	 * the 'cr' category, no new region — 5.53 mismatch-counter precedent).  All 0
+	 * when the pool / gen table is disabled.  global_epoch_fallback_bump = coarse
+	 * fallback frequency; rel_gen_bump = fine-grained per-relation bumps (Part B
+	 * GO, the L373 "hot block survives unrelated DDL" witness); rel_gen_table_
+	 * overflow = install serve-but-skip-cache (capacity / NO-GO signal);
+	 * retention_horizon_advance_noted = C3 observation (image survived a horizon
+	 * advance, still correct); reconfig_intra_survived = C4 unit/injection evidence.
+	 */
+	emit_row(rsinfo, "cr", "cr_global_epoch_fallback_bump_count",
+			 fmt_int64((int64)cluster_cr_pool_global_epoch_fallback_bump_count()));
+	emit_row(rsinfo, "cr", "cr_rel_gen_bump_count",
+			 fmt_int64((int64)cluster_cr_pool_rel_gen_bump_count()));
+	emit_row(rsinfo, "cr", "cr_rel_gen_table_overflow_count",
+			 fmt_int64((int64)cluster_cr_pool_rel_gen_table_overflow_count()));
+	emit_row(rsinfo, "cr", "cr_retention_horizon_advance_noted_count",
+			 fmt_int64((int64)cluster_cr_pool_retention_horizon_advance_noted_count()));
+	emit_row(rsinfo, "cr", "cr_reconfig_intra_survived_count",
+			 fmt_int64((int64)cluster_cr_pool_reconfig_intra_survived_count()));
 	/* spec-5.51 D9: dedicated shared CR buffer pool (L2) counters.  All 0 when
 	 * the pool is disabled (cluster.shared_cr_pool_size_blocks == 0). */
 	emit_row(rsinfo, "cr_pool", "current_epoch", fmt_int64((int64)cluster_cr_pool_current_epoch()));

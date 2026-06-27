@@ -78,8 +78,8 @@ my $val = sub {
 
 	is( $node0->safe_psql('postgres',
 			q{SELECT count(*) FROM pg_cluster_state WHERE category='cr'}),
-		'30',
-		'L1d cr category has 30 rows (9 + 4 cache + 4 spec-3.22 xmax + 5 spec-5.53 mismatch + 8 spec-5.54 tuple)');
+		'35',
+		'L1d cr category has 35 rows (9 + 4 cache + 4 xmax + 5 spec-5.53 mismatch + 8 spec-5.54 tuple + 5 spec-5.56 lifecycle)');
 }
 
 

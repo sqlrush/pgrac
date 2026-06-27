@@ -167,6 +167,19 @@ extern const char *cluster_cr_cache_lookup(const ClusterCRCacheKey *key, uint64 
 										   int *out_miss_reason);
 
 /*
+ * cluster_cr_cache_lookup_fenced -- spec-5.56 D4: lookup under the COMPOSITE
+ *   lifecycle fence {pool_epoch, rel_gen} (P1-c).  Identical to
+ *   cluster_cr_cache_lookup but ALSO requires the entry's stamped per-relation
+ *   generation to equal `cur_rel_gen` (the locator's current generation, which
+ *   the caller reads from the per-relation generation table).  cur_rel_gen == 0
+ *   makes the rel_gen half a no-op (gen table disabled / locator unregistered =>
+ *   epoch-only, spec-5.53 equivalence).  cluster_cr_cache_lookup() is the
+ *   cur_rel_gen == 0 wrapper.
+ */
+extern const char *cluster_cr_cache_lookup_fenced(const ClusterCRCacheKey *key, uint64 cur_epoch,
+												  uint64 cur_rel_gen, int *out_miss_reason);
+
+/*
  * cluster_cr_cache_victim_slot -- reserve a BLCKSZ slot for `key` to construct
  *   into, stamping it with `cur_epoch` (spec-5.53 D2c).  Clock-evicts a victim
  *   if at capacity (*evicted set true iff a valid entry was displaced).  The
@@ -182,6 +195,15 @@ extern char *cluster_cr_cache_victim_slot(const ClusterCRCacheKey *key, uint64 c
  *   victim_slot() call valid + referenced.  No-op when disabled.
  */
 extern void cluster_cr_cache_commit_slot(void);
+
+/*
+ * cluster_cr_cache_commit_slot_gen -- spec-5.56 D4: mark the reserved slot valid
+ *   AND stamp it with the authoritative per-relation generation `rel_gen` (the
+ *   install_gen from cluster_cr_pool_register_locator on the construct path, or
+ *   the generation an L2 hit matched).  cluster_cr_cache_commit_slot() is the
+ *   rel_gen == 0 wrapper (epoch-only).  No-op when disabled.
+ */
+extern void cluster_cr_cache_commit_slot_gen(uint64 rel_gen);
 
 /*
  * cluster_cr_cache_reset -- drop all entries (GUC change / capacity resize /

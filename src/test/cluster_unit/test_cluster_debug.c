@@ -267,6 +267,11 @@ uint64 cluster_cr_pool_epoch_mismatch_count(void);
 uint64 cluster_cr_pool_generation_mismatch_count(void);
 uint64 cluster_cr_pool_base_lsn_mismatch_count(void);
 uint64 cluster_cr_pool_locator_reuse_reject_count(void);
+uint64 cluster_cr_pool_global_epoch_fallback_bump_count(void);
+uint64 cluster_cr_pool_rel_gen_bump_count(void);
+uint64 cluster_cr_pool_rel_gen_table_overflow_count(void);
+uint64 cluster_cr_pool_retention_horizon_advance_noted_count(void);
+uint64 cluster_cr_pool_reconfig_intra_survived_count(void);
 int cluster_cr_pool_live_entries(void);
 uint64
 cluster_cr_pool_current_epoch(void)
@@ -335,6 +340,31 @@ cluster_cr_pool_base_lsn_mismatch_count(void)
 }
 uint64
 cluster_cr_pool_locator_reuse_reject_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_pool_global_epoch_fallback_bump_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_pool_rel_gen_bump_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_pool_rel_gen_table_overflow_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_pool_retention_horizon_advance_noted_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_pool_reconfig_intra_survived_count(void)
 {
 	return 0;
 }
@@ -567,7 +597,7 @@ cluster_write_fence_startup_self_check(void)
  * shmem region registry (region_count + total_bytes + per-region
  * iter).  cluster_shmem.o is not linked here; provide stubs that
  * mimic an empty registry. */
-int cluster_shmem_max_regions = 64;
+int cluster_shmem_max_regions = 80; /* spec-5.56: default raised 64 -> 80 */
 int
 cluster_shmem_get_region_count(void)
 {

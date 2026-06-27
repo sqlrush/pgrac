@@ -375,6 +375,17 @@ is($node->safe_psql('postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE value IS NULL}),
 	'0', 'O3 no NULL values in pg_cluster_state (NOT NULL contract)');
 
+# spec-5.56 D8: lifecycle counter existence + default GUC (Part B off by default).
+is($node->safe_psql('postgres',
+		q{SELECT count(*) FROM pg_cluster_state WHERE category='cr'
+		   AND key IN ('cr_global_epoch_fallback_bump_count','cr_rel_gen_bump_count',
+		               'cr_rel_gen_table_overflow_count','cr_retention_horizon_advance_noted_count',
+		               'cr_reconfig_intra_survived_count')}),
+	'5', 'O3a all 5 spec-5.56 CR lifecycle counters present in the cr category');
+is($node->safe_psql('postgres',
+		q{SELECT setting FROM pg_settings WHERE name='cluster.cr_pool_rel_generation_slots'}),
+	'0', 'O3b cluster.cr_pool_rel_generation_slots defaults to 0 (coarse; zero regression)');
+
 is($node->safe_psql('postgres',
 		q{SELECT string_agg(format_type(atttypid, atttypmod), ',' ORDER BY attnum)
 		    FROM pg_attribute
