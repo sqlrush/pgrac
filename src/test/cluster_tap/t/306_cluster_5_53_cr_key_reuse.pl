@@ -10,7 +10,7 @@
 #	  spec-5.53 DELTAS:
 #
 #	  L1  the five spec-5.53 mismatch diagnostics are dumped under the 'cr'
-#	      category (cr now has 22 rows = 17 + 5), and locator_reuse_reject is the
+#	      category (cr now has 30 rows = 17 + 5 + 8 spec-5.54), and locator_reuse_reject is the
 #	      catalog-incarnation belt observable that stays 0 (D0 = RED → floor-only).
 #	  L2  relfilenode-reuse floor (8.A core): readers share a read_scn; A
 #	      publishes a CR image; a lifecycle event (DROP) bumps the pool epoch; a
@@ -101,10 +101,11 @@ my $open_rr_reader = sub {
 {
 	is($node->safe_psql('postgres', 'SELECT 1'), '1', 'L1a node alive');
 
-	# spec-3.9/3.10/3.22 cr rows (17) + spec-5.53 D5 five mismatch counters.
+	# spec-3.9/3.10/3.22 cr rows (17) + spec-5.53 D5 five mismatch counters +
+	# spec-5.54 D5 eight tuple-fast-path outcome counters.
 	is( $node->safe_psql('postgres',
 			q{SELECT count(*) FROM pg_cluster_state WHERE category='cr'}),
-		'22', 'L1b cr category has 22 rows (17 + 5 spec-5.53 mismatch)');
+		'30', 'L1b cr category has 30 rows (17 + 5 spec-5.53 mismatch + 8 spec-5.54 tuple)');
 
 	for my $k (qw(cr_key_mismatch_count cr_epoch_mismatch_count
 		cr_generation_mismatch_count cr_base_lsn_mismatch_count

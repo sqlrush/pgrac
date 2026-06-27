@@ -374,6 +374,9 @@ bool cluster_cr_mvcc_gate = true;
  */
 bool cluster_cr_gate_no_peer_fastpath = true;
 
+/* spec-5.54 D5: tuple-level / verdict-only CR read fast path, default OFF. */
+bool cluster_cr_tuple_level_fastpath = false;
+
 /*
  * cluster.tt_durable_lookup (spec-3.11 D7).  When on (default), visibility / CR
  * resolve commit_scn from the durable undo-segment-header TT slot on overlay
@@ -2373,6 +2376,22 @@ cluster_init_guc(void)
 					 "and clean-CI Dfp stop gate proved equivalence; set off as a "
 					 "diagnostic escape hatch."),
 		&cluster_cr_gate_no_peer_fastpath, true, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"cluster.cr_tuple_level_fastpath",
+		gettext_noop("Use the tuple-level / verdict-only CR read fast path for a "
+					 "single-candidate-chain block (compute-only; default off)."),
+		gettext_noop("Spec-5.54. DEFAULT OFF. When on, a post-read_scn tuple whose "
+					 "block has exactly one candidate transaction (nchains==1) and is "
+					 "own-instance has its visibility verdict computed by reconstructing "
+					 "ONLY the queried offnum on a backend-local scratch (single-chain "
+					 "target-offnum walk), instead of materializing + caching the whole "
+					 "read_scn block image. The verdict is bit-equivalent to the "
+					 "full-block path or it fail-safe falls back to it; no tuple bytes "
+					 "are emitted and no cross-backend cache is built. Default off "
+					 "pending spec-5.58 differential-equivalence + perf validation; set "
+					 "on only as a measurement / opt-in escape hatch."),
+		&cluster_cr_tuple_level_fastpath, false, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
 		"cluster.tt_durable_lookup",

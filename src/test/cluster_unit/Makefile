@@ -43,7 +43,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_itl_cleanout test_cluster_visibility_inject test_cluster_itl_cleanout_perf \
         test_cluster_heap_lock_tuple test_cluster_perf_gates \
         test_cluster_subtrans test_cluster_multixact test_cluster_undo_format \
-        test_cluster_undo_record test_cluster_undo_lifecycle test_cluster_cr test_cluster_cr_cache test_cluster_cr_key test_cluster_cr_pool test_cluster_cr_admit test_cluster_cr_admit_stat test_cluster_tt_durable \
+        test_cluster_undo_record test_cluster_undo_lifecycle test_cluster_cr test_cluster_cr_cache test_cluster_cr_key test_cluster_cr_pool test_cluster_cr_admit test_cluster_cr_admit_stat test_cluster_cr_tuple test_cluster_cr_tuple_stat test_cluster_tt_durable \
         test_cluster_retention test_cluster_undo_cleaner test_cluster_visibility_variants test_cluster_tt_2pc \
         test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_undo_extent \
         test_cluster_wal_thread test_cluster_wal_state test_cluster_recovery_plan \
@@ -1467,5 +1467,28 @@ test_cluster_cr_admit_stat: test_cluster_cr_admit_stat.c unit_test.h \
 		$(CLUSTER_CR_ADMIT_STAT_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_CR_ADMIT_STAT_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-5.54 D5: test_cluster_cr_tuple_stat — independent tuple-level CR fast-path
+# outcome counter shmem region (cluster_cr_tuple_stat.o) with malloc-backed
+# ShmemInitStruct + no-op region-register stubs.
+CLUSTER_CR_TUPLE_STAT_O = $(top_builddir)/src/backend/cluster/cluster_cr_tuple_stat.o
+test_cluster_cr_tuple_stat: test_cluster_cr_tuple_stat.c unit_test.h \
+		$(CLUSTER_CR_TUPLE_STAT_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_CR_TUPLE_STAT_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-5.54 D7: test_cluster_cr_tuple — D1 static eligibility predicate + D2
+# TargetTupleCrState per-record transitions on a synthetic ITL page.  Links
+# cluster_cr_tuple.o + cluster_cr_apply.o; stubs scn_time_cmp + the walk-driver
+# heavy deps (undo reader / verdict-on-image) the per-record logic does not use.
+CLUSTER_CR_TUPLE_O = $(top_builddir)/src/backend/cluster/cluster_cr_tuple.o
+test_cluster_cr_tuple: test_cluster_cr_tuple.c unit_test.h \
+		$(CLUSTER_CR_TUPLE_O) $(CLUSTER_CR_APPLY_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_CR_TUPLE_O) $(CLUSTER_CR_APPLY_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@

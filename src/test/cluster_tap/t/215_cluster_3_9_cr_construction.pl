@@ -7,7 +7,7 @@
 #	  L1  ClusterPair up + GUC cluster.cr_chain_walk_max_steps default 4096
 #	      + cluster.cr_mvcc_gate default on + 53R9F/53R9G registered + the
 #	      4 CR injection points present in pg_stat_cluster_injections
-#	  L2  pg_cluster_state cr category has 22 rows (9 cluster_cr counters +
+#	  L2  pg_cluster_state cr category has 30 rows (9 cluster_cr counters +
 #	      4 spec-3.10 CR cache counters + 4 spec-3.22 xmax resolve buckets +
 #	      5 spec-5.53 key/reuse-fence mismatch diagnostics)
 #	  L3  cluster_cr_test_construct on a real ITL heap block succeeds
@@ -94,8 +94,8 @@ my $node0 = $pair->node0;
 # ----------
 my $cr_rows = $node0->safe_psql('postgres',
 	q{SELECT count(*) FROM pg_cluster_state WHERE category='cr'});
-is($cr_rows, '22',
-	'L2 cr category has 22 counter rows (9 + 4 spec-3.10 cache + 4 spec-3.22 xmax + 5 spec-5.53 mismatch)');
+is($cr_rows, '30',
+	'L2 cr category has 30 counter rows (9 + 4 spec-3.10 cache + 4 spec-3.22 xmax + 5 spec-5.53 mismatch + 8 spec-5.54 tuple)');
 
 
 # ----------

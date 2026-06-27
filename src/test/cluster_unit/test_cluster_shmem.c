@@ -602,6 +602,11 @@ cluster_tt_durable_shmem_register(void)
 void
 cluster_cr_admit_shmem_register(void)
 {}
+/* spec-5.54 D5: tuple-level CR fast-path outcome counter region register.
+ * Link-only no-op stub (independent region; not a substrate change). */
+void
+cluster_cr_tuple_stat_shmem_register(void)
+{}
 int cluster_cr_pool_admission_policy = 0;			/* spec-5.52 D8 */
 int cluster_cr_pool_admit_relation_backend_cap = 0; /* spec-5.52 D8 */
 int cluster_cr_pool_admit_pressure_ratio = 0;		/* spec-5.52 D8 */

@@ -49,9 +49,10 @@
 #include "cluster/cluster_cr_admit.h" /* spec-5.52 D2: insert-side admission gate */
 #include "cluster/cluster_cr_apply.h"
 #include "cluster/cluster_cr_cache.h"
-#include "cluster/cluster_cr_pool.h" /* spec-5.51 D4: shared L2 CR pool */
-#include "cluster/cluster_conf.h"	 /* spec-3.24 D1: cluster_conf_has_peers */
-#include "cluster/cluster_guc.h"	 /* cluster_cr_chain_walk_max_steps, cluster_node_id */
+#include "cluster/cluster_cr_pool.h"  /* spec-5.51 D4: shared L2 CR pool */
+#include "cluster/cluster_cr_tuple.h" /* spec-5.54: tuple-level / verdict-only fast path */
+#include "cluster/cluster_conf.h"	  /* spec-3.24 D1: cluster_conf_has_peers */
+#include "cluster/cluster_guc.h"	  /* cluster_cr_chain_walk_max_steps, cluster_node_id */
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_itl.h"
 #include "cluster/cluster_recovery_merge.h" /* PGRAC: spec-4.5a is_materialized */
@@ -120,6 +121,15 @@ static ClusterCRShared *CRShared = NULL;
  */
 static char *cr_scratch = NULL;
 static bool cr_in_progress = false;
+
+/*
+ * spec-5.54 D2: a SEPARATE backend-local scratch page for the tuple-level
+ * verdict-only fast path, distinct from cr_scratch so the fast path never shares
+ * (and never has to reset) the full-block construct slot or its cr_in_progress
+ * guard (Q5 / U18).  The fast path does not call cluster_cr_construct_block, so
+ * the two scratch slots are never live simultaneously.
+ */
+static char *cr_tuple_scratch = NULL;
 
 
 /* ============================================================
@@ -1427,6 +1437,22 @@ cluster_cr_no_peer_fastpath_eligible(Snapshot snapshot)
 		snapshot->cluster_snapshot_session_local != 0, fastpath_any_materialized);
 }
 
+/*
+ * cluster_cr_verdict_on_image -- decide the per-tuple visibility verdict of the
+ * queried offnum on a reconstructed read_scn CR image (spec-3.9/3.21/3.22 logic,
+ * extracted in spec-5.54 D4 so the full-block gate AND the tuple-level fast path
+ * run the IDENTICAL verdict on their respective images -> INV-T1 bit-equivalence
+ * by construction).  `slot` is the LIVE ITL slot of the queried tuple (drives the
+ * tier-2 + live-slot shortcuts), NOT a scratch slot.  Returns DECIDED + out_visible,
+ * FAILCLOSED (materialized-remote INDOUBT only), or ereports the precise SQLSTATE
+ * on an own-instance unresolvable deleter (I-fail-1).  No CR construct here (the
+ * caller already built cr_page), so it is reentrancy-safe for the fast path.
+ */
+static ClusterCrVerdict cluster_cr_verdict_on_image(const char *cr_page, OffsetNumber offnum,
+													const ClusterItlSlotData *slot,
+													Snapshot snapshot, bool remote_materialized,
+													int32 remote_origin, bool *out_visible);
+
 ClusterCrVerdict
 cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool *out_visible)
 {
@@ -1436,8 +1462,6 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 	uint8 itl_idx;
 	const ClusterItlSlotData *slot;
 	const char *cr_page;
-	HeapTupleData cr_htup;
-	ClusterVisibilityDecision decision;
 	bool remote_materialized = false;
 	int32 remote_origin = -1;
 
@@ -1577,9 +1601,51 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 	 * the queried tuple's live `slot` (already resolved above) still drives the
 	 * tier-2 + xmin-side checks.
 	 */
-	cr_page = cluster_cr_lookup_or_construct(buffer, snapshot->read_scn);
+	/*
+	 * spec-5.54 D3: tuple-level / verdict-only fast path (GUC, default off).  The
+	 * 3-tier gate + live-xmin guard above have already fired; before materializing
+	 * the whole read_scn block, try reconstructing ONLY the queried offnum from the
+	 * single candidate chain and run the IDENTICAL verdict.  A DECIDED result is
+	 * bit-equivalent to full-block (INV-T1); eligibility-false / NOT_APPLICABLE
+	 * falls through to the authoritative full-block path below (fail-safe, INV-T2).
+	 * Own-instance only: materialized-remote is excluded by eligibility, so the
+	 * fast path is skipped for it and the full-block path keeps its 4.5a handling.
+	 */
+	if (cluster_cr_tuple_level_fastpath && !remote_materialized) {
+		ClusterCRCandidateChain fp_chains[CLUSTER_ITL_INITRANS_DEFAULT];
+		int fp_nchains;
+		ClusterCRTupleOutcome fp_reason = CR_TUPLE_OUTCOME_FALLBACK_UNCERTAIN;
 
-	if (!cluster_cr_remap_tuple(cr_page, ItemPointerGetOffsetNumber(&htup->t_self), &cr_htup)) {
+		fp_nchains
+			= cluster_cr_collect_candidate_chains(ClusterPageGetItlSlots(page), snapshot->read_scn,
+												  fp_chains, CLUSTER_ITL_INITRANS_DEFAULT);
+		if (cluster_cr_tuple_eligible(buffer, htup, snapshot, slot, fp_nchains, &fp_reason)) {
+			ClusterCrVerdict fp_v
+				= cluster_cr_tuple_verdict(buffer, htup, snapshot, out_visible, &fp_reason);
+
+			cluster_cr_tuple_stat_bump(fp_reason);
+			if (fp_v != CLUSTER_CR_NOT_APPLICABLE)
+				return fp_v; /* DECIDED -> bit-equivalent to full-block (INV-T1) */
+		} else {
+			cluster_cr_tuple_stat_bump(fp_reason);
+		}
+		/* not eligible / NOT_APPLICABLE -> fall through to authoritative full-block */
+	}
+
+	cr_page = cluster_cr_lookup_or_construct(buffer, snapshot->read_scn);
+	return cluster_cr_verdict_on_image(cr_page, ItemPointerGetOffsetNumber(&htup->t_self), slot,
+									   snapshot, remote_materialized, remote_origin, out_visible);
+}
+
+static ClusterCrVerdict
+cluster_cr_verdict_on_image(const char *cr_page, OffsetNumber offnum,
+							const ClusterItlSlotData *slot, Snapshot snapshot,
+							bool remote_materialized, int32 remote_origin, bool *out_visible)
+{
+	HeapTupleData cr_htup;
+	ClusterVisibilityDecision decision;
+
+	if (!cluster_cr_remap_tuple(cr_page, offnum, &cr_htup)) {
 		/* CR-removed (inverse-INSERT made it LP_UNUSED): the row did not
 		 * exist at read_scn -> invisible. */
 		*out_visible = false;
@@ -1831,4 +1897,173 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 	}
 
 	pg_unreachable(); /* every verdict branch above returns or ereports */
+}
+
+/*
+ * cluster_cr_tuple_eligible -- spec-5.54 D1 Buffer wrapper over the pure static
+ * predicate.  Resolves the queried offnum + the tuple's undo origin from the live
+ * buffer + slot, then defers to cluster_cr_tuple_eligible_page.  Precondition
+ * (gate-enforced): the 3-tier gate already proved slot->undo_segment_head valid.
+ */
+bool
+cluster_cr_tuple_eligible(Buffer buf, HeapTuple htup, Snapshot snapshot,
+						  const ClusterItlSlotData *slot, int nchains,
+						  ClusterCRTupleOutcome *reason)
+{
+	Page page = BufferGetPage(buf);
+	OffsetNumber off = ItemPointerGetOffsetNumber(&htup->t_self);
+	int32 tuple_origin = (int32)uba_origin_node_id(slot->undo_segment_head);
+
+	return cluster_cr_tuple_eligible_page(page, off, snapshot->read_scn, nchains, tuple_origin,
+										  cluster_node_id, reason);
+}
+
+/*
+ * cluster_cr_tuple_verdict -- spec-5.54 D2/D4 single-chain target-offnum verdict.
+ *
+ * Reconstructs ONLY the queried offnum on the separate backend-local fast scratch
+ * by walking the single candidate chain (TargetTupleCrState contract), then runs
+ * the IDENTICAL cluster_cr_verdict_on_image the full-block gate runs -> a DECIDED
+ * verdict is bit-equivalent to full-block (INV-T1).  Any walk uncertainty
+ * (foreign identity / no space / malformed / missing undo / cliff / cross-instance)
+ * returns NOT_APPLICABLE so the caller defers to the authoritative full-block path
+ * (INV-T2/T3); the fast path never guesses and never fail-closes from its narrower
+ * view (full-block re-walks the same single chain and produces the precise
+ * SQLSTATE for a genuine terminal).
+ *
+ * I-lock invariants are inherited from the full-block path: the caller holds the
+ * content lock, we only read live-page bytes + the undo chain into the scratch,
+ * no buffer lock / no WAL / no dirty (spec-3.9 I-lock-1/2/4).
+ */
+ClusterCrVerdict
+cluster_cr_tuple_verdict(Buffer buf, HeapTuple htup, Snapshot snapshot, bool *out_visible,
+						 ClusterCRTupleOutcome *out_reason)
+{
+	Page live_page = BufferGetPage(buf);
+	OffsetNumber offnum = ItemPointerGetOffsetNumber(&htup->t_self);
+	ClusterCRCandidateChain chains[CLUSTER_ITL_INITRANS_DEFAULT];
+	int nchains;
+	TransactionId candidate_xid;
+	const ClusterItlSlotData *live_slot;
+	uint8 itl_idx;
+	UBA uba;
+	uint32 steps = 0;
+	uint32 max_steps = (uint32)cluster_cr_chain_walk_max_steps;
+	PGAlignedBlock record_buf;
+	RelFileLocator cur_locator;
+	ForkNumber cur_fork;
+	BlockNumber cur_block;
+	ClusterCRTupleOutcome reason = CR_TUPLE_OUTCOME_VERDICT;
+
+	/*
+	 * Re-collect the single candidate chain (cheap O(ITL)); eligibility already
+	 * proved nchains==1 + own-instance + watermark, but re-derive the chain head +
+	 * candidate xid here and fail-safe to full-block if anything changed.
+	 */
+	nchains
+		= cluster_cr_collect_candidate_chains(ClusterPageGetItlSlots(live_page), snapshot->read_scn,
+											  chains, CLUSTER_ITL_INITRANS_DEFAULT);
+	if (nchains != 1) {
+		if (out_reason != NULL)
+			*out_reason = CR_TUPLE_OUTCOME_FALLBACK_MULTICHAIN;
+		return CLUSTER_CR_NOT_APPLICABLE;
+	}
+	candidate_xid = chains[0].xid;
+
+	/* The queried tuple's LIVE ITL slot drives cluster_cr_verdict_on_image's
+	 * tier-2 / live-slot shortcuts (the same slot the gate resolved). */
+	itl_idx = htup->t_data->t_itl_slot_idx;
+	if (itl_idx == CLUSTER_ITL_SLOT_UNALLOCATED || itl_idx >= CLUSTER_ITL_INITRANS_DEFAULT) {
+		if (out_reason != NULL)
+			*out_reason = CR_TUPLE_OUTCOME_FALLBACK_UNCERTAIN;
+		return CLUSTER_CR_NOT_APPLICABLE;
+	}
+	live_slot = &ClusterPageGetItlSlots(live_page)[itl_idx];
+
+	/* Materialize the target on the SEPARATE fast scratch (never cr_scratch). */
+	if (cr_tuple_scratch == NULL)
+		cr_tuple_scratch = MemoryContextAllocZero(TopMemoryContext, BLCKSZ);
+	memcpy(cr_tuple_scratch, live_page, BLCKSZ);
+
+	BufferGetTag(buf, &cur_locator, &cur_fork, &cur_block);
+
+	/* prune-before (target only): mirror full-block prune-first restricted to the
+	 * queried offnum (F0-25). */
+	cluster_cr_tuple_prune_target(cr_tuple_scratch, offnum, candidate_xid);
+
+	uba = chains[0].undo_segment_head;
+	while (!UBA_is_invalid(uba)) {
+		const UndoRecordHeader *hdr;
+		size_t len;
+		uint32 seg;
+		uint32 blk;
+		uint16 tt_off;
+		uint16 row_off;
+
+		if (++steps > max_steps) {
+			reason = CR_TUPLE_OUTCOME_FALLBACK_CLIFF; /* full-block re-walk -> data_corrupted */
+			goto fallback;
+		}
+		if (!uba_decode(uba, &seg, &blk, &tt_off, &row_off)) {
+			reason = CR_TUPLE_OUTCOME_FALLBACK_UNCERTAIN;
+			goto fallback;
+		}
+		len = cluster_undo_get_record(uba, record_buf.data, sizeof(record_buf.data));
+		if (len < sizeof(UndoRecordHeader)) {
+			reason = CR_TUPLE_OUTCOME_FALLBACK_UNCERTAIN; /* missing/short undo -> full-block */
+			goto fallback;
+		}
+		hdr = (const UndoRecordHeader *)record_buf.data;
+
+		if (hdr->origin_node_id != (uint16)cluster_node_id
+			&& !cluster_merged_instance_is_materialized((int)hdr->origin_node_id)) {
+			reason = CR_TUPLE_OUTCOME_FALLBACK_CROSS_BLOCK; /* cross-instance UBA -> full-block */
+			goto fallback;
+		}
+
+		/* I-chain-1: normal SCN stop -> read_scn reached (clean chain end). */
+		if (scn_time_cmp(hdr->write_scn, snapshot->read_scn) <= 0)
+			break;
+
+		if (!RelFileNumberIsValid(hdr->target_locator.relNumber)) {
+			reason = CR_TUPLE_OUTCOME_FALLBACK_UNCERTAIN;
+			goto fallback;
+		}
+
+		/* spec-3.20 D3.A (F8) block-scope filter: skip-apply records for other
+		 * relations/forks/blocks but KEEP walking prev_uba. */
+		if (!RelFileLocatorEquals(hdr->target_locator, cur_locator) || hdr->target_fork != cur_fork
+			|| hdr->target_block != cur_block) {
+			uba = hdr->prev_uba;
+			continue;
+		}
+
+		if (cluster_cr_tuple_apply_record(cr_tuple_scratch, offnum, record_buf.data, len, &reason)
+			== CR_TUPLE_APPLY_FALLBACK)
+			goto fallback;
+
+		/* per-step target prune (mirror full-block per-step whole-page prune). */
+		cluster_cr_tuple_prune_target(cr_tuple_scratch, offnum, candidate_xid);
+		uba = hdr->prev_uba;
+	}
+
+	/* prune-after (target only). */
+	cluster_cr_tuple_prune_target(cr_tuple_scratch, offnum, candidate_xid);
+
+	/*
+	 * Run the IDENTICAL verdict the full-block gate runs.  Own-instance only (the
+	 * fast path is never eligible for a materialized-remote tuple), so pass
+	 * remote_materialized=false; an own-instance unresolvable deleter ereports the
+	 * same SQLSTATE the full-block path would (authoritative).
+	 */
+	if (out_reason != NULL)
+		*out_reason = CR_TUPLE_OUTCOME_VERDICT;
+	return cluster_cr_verdict_on_image(cr_tuple_scratch, offnum, live_slot, snapshot,
+									   /*remote_materialized*/ false, /*remote_origin*/ -1,
+									   out_visible);
+
+fallback:
+	if (out_reason != NULL)
+		*out_reason = reason;
+	return CLUSTER_CR_NOT_APPLICABLE;
 }

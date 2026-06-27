@@ -136,6 +136,7 @@ cluster_injection_get_count(void)
 
 #include "cluster/cluster_cr_pool.h"  /* spec-5.51 counter prototypes */
 #include "cluster/cluster_cr_admit.h" /* spec-5.52 D9 counter prototype */
+#include "cluster/cluster_cr_tuple.h" /* spec-5.54 D5 counter prototype */
 
 /*
  * spec-5.52 D9 stub (standalone cluster_debug unit test).  cluster_debug.o reads
@@ -146,6 +147,14 @@ cluster_injection_get_count(void)
  */
 uint64
 cluster_cr_admit_stat_count(ClusterCRAdmitReason reason pg_attribute_unused())
+{
+	return 0;
+}
+
+/* spec-5.54 D5: tuple-level CR fast-path outcome counter accessor.  Link-only
+ * stub (the dump reads it; this test exercises only that the row is emitted). */
+uint64
+cluster_cr_tuple_stat_count(ClusterCRTupleOutcome outcome pg_attribute_unused())
 {
 	return 0;
 }

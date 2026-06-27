@@ -549,6 +549,10 @@ extern bool cluster_cr_mvcc_gate;
  * stop gate proved equivalence); CR-specific single-node tests pin it off. */
 extern bool cluster_cr_gate_no_peer_fastpath;
 
+/* spec-5.54 D5: tuple-level / verdict-only CR read fast path master switch
+ * (default OFF, PGC_USERSET).  Read by the cluster_cr.c gate. */
+extern bool cluster_cr_tuple_level_fastpath;
+
 /* cluster.tt_durable_lookup (spec-3.11 D7): durable TT slot read-side resolve
  * on overlay miss / watermark gate (default on; PGC_USERSET). */
 extern bool cluster_tt_durable_lookup;

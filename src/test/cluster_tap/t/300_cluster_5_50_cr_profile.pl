@@ -6,7 +6,7 @@
 #	  read-path profile: REAL own-instance CR path (not by-construction,
 #	  L341), producing the value-gate + soundness-gate evidence for the
 #	  Stage 5.5 CR Read-Path Performance band.  measure-only: this test reads
-#	  the 22 cr counters (pg_cluster_state category='cr'; 17 + 5 spec-5.53) and asserts
+#	  the 30 cr counters (pg_cluster_state category='cr'; 17 + 5 spec-5.53 + 8 spec-5.54) and asserts
 #	  real CR work; it changes NO product code, NO catalog (catversion frozen).
 #
 #	  Own-instance only: a single cluster-enabled node (allow_single_node) with
@@ -27,7 +27,7 @@
 #
 #	  L1   fixture up; real own-instance CR; cr_construct_count AND
 #	       cr_chain_walk_steps_sum both rise (REAL undo chain, not empty-chain
-#	       page copy — resolves F0-11); 22 cr rows (17 + 5 spec-5.53 mismatch).
+#	       page copy — resolves F0-11); 30 cr rows (17 + 5 spec-5.53 + 8 spec-5.54).
 #	  L2   axis A SELECT-heavy: N independent readers share read_scn (proven),
 #	       writer modifies every block; distinct_cr_keys D measured + stability
 #	       confirmed; cross-backend redundancy = total_construct/D ~= N.
@@ -126,7 +126,7 @@ my $open_rr_reader = sub {
 
 	is( $node->safe_psql('postgres',
 			q{SELECT count(*) FROM pg_cluster_state WHERE category='cr'}),
-		'22', 'L1b cr category has 22 counters (17 + 5 spec-5.53 mismatch)');
+		'30', 'L1b cr category has 30 counters (17 + 5 spec-5.53 mismatch + 8 spec-5.54 tuple)');
 
 	$node->safe_psql('postgres',
 		'CREATE TABLE t_l1 (id int, v int); INSERT INTO t_l1 VALUES (1, 100);');

@@ -55,7 +55,7 @@ my $has_visibility_inject =
 # +1 for the unconditional "pgrac cluster sequence" region (spec-5.4 SQ shmem foundation)
 # and +1 for the unconditional "pgrac cluster cr admit stats" region (spec-5.52 D9;
 # full enumerated region list + count lives in t/020).
-  my $expected_region_count = $has_visibility_inject ? '62' : '61';
+  my $expected_region_count = $has_visibility_inject ? '63' : '62'; # +1 spec-5.54 cr tuple stats
 
 
 # ----------

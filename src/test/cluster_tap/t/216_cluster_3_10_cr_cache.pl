@@ -5,8 +5,8 @@
 #	  spec-3.10 D9 — CR block cache + full-block CR behavioral TAP.
 #
 #	  L1   ClusterPair up + GUC cluster.cr_cache_max_blocks default 64 +
-#	       cr category has 22 rows (9 spec-3.9 + 4 spec-3.10 cache + 4 spec-3.22 xmax
-#	       + 5 spec-5.53 mismatch)
+#	       cr category has 30 rows (9 spec-3.9 + 4 spec-3.10 cache + 4 spec-3.22 xmax
+#	       + 5 spec-5.53 mismatch + 8 spec-5.54 tuple)
 #	  L2   cache HIT e2e: A's RR snapshot re-reads a post-snapshot-modified
 #	       block twice → cr_cache_hit_count++ (2nd read served from cache),
 #	       cr_cache_miss_count++ + cr_cache_install_count++ (1st read built it)
@@ -78,7 +78,8 @@ my $val = sub {
 
 	is( $node0->safe_psql('postgres',
 			q{SELECT count(*) FROM pg_cluster_state WHERE category='cr'}),
-		'22', 'L1d cr category has 22 rows (9 + 4 cache + 4 spec-3.22 xmax + 5 spec-5.53 mismatch)');
+		'30',
+		'L1d cr category has 30 rows (9 + 4 cache + 4 spec-3.22 xmax + 5 spec-5.53 mismatch + 8 spec-5.54 tuple)');
 }
 
 

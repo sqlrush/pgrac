@@ -98,6 +98,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_cr.h"				  /* cluster_cr_* counter accessors (spec-3.9 D8) */
 #include "cluster/cluster_cr_pool.h"		  /* cluster_cr_pool_* counters (spec-5.51 D9) */
 #include "cluster/cluster_cr_admit.h"		  /* cluster_cr_admit_stat_* counters (spec-5.52 D9) */
+#include "cluster/cluster_cr_tuple.h"		  /* cluster_cr_tuple_stat_* counters (spec-5.54 D5) */
 #include "cluster/cluster_wal_state.h"		  /* wal_state registry dump (spec-4.2 D5) */
 #include "cluster/cluster_wal_thread.h"		  /* wal_thread dump accessors (spec-4.1 D7) */
 #include "cluster/cluster_tt_durable.h"		  /* cluster_tt_durable_* counters (spec-3.11 D8) */
@@ -2343,6 +2344,25 @@ dump_cr(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_cr_pool_base_lsn_mismatch_count()));
 	emit_row(rsinfo, "cr", "cr_locator_reuse_reject_count",
 			 fmt_int64((int64)cluster_cr_pool_locator_reuse_reject_count()));
+	/* spec-5.54 D5: tuple-level / verdict-only fast-path outcome counters
+	 * (independent region; advisory, never feed a verdict).  1 verdict + 7
+	 * fallback reasons; all 0 when cluster.cr_tuple_level_fastpath is off. */
+	emit_row(rsinfo, "cr", "cr_tuple_verdict_count",
+			 fmt_int64((int64)cluster_cr_tuple_stat_count(CR_TUPLE_OUTCOME_VERDICT)));
+	emit_row(rsinfo, "cr", "cr_tuple_fallback_remote_count",
+			 fmt_int64((int64)cluster_cr_tuple_stat_count(CR_TUPLE_OUTCOME_FALLBACK_REMOTE)));
+	emit_row(rsinfo, "cr", "cr_tuple_fallback_recycle_wm_count",
+			 fmt_int64((int64)cluster_cr_tuple_stat_count(CR_TUPLE_OUTCOME_FALLBACK_RECYCLE_WM)));
+	emit_row(rsinfo, "cr", "cr_tuple_fallback_multichain_count",
+			 fmt_int64((int64)cluster_cr_tuple_stat_count(CR_TUPLE_OUTCOME_FALLBACK_MULTICHAIN)));
+	emit_row(rsinfo, "cr", "cr_tuple_fallback_cliff_count",
+			 fmt_int64((int64)cluster_cr_tuple_stat_count(CR_TUPLE_OUTCOME_FALLBACK_CLIFF)));
+	emit_row(rsinfo, "cr", "cr_tuple_fallback_identity_count",
+			 fmt_int64((int64)cluster_cr_tuple_stat_count(CR_TUPLE_OUTCOME_FALLBACK_IDENTITY)));
+	emit_row(rsinfo, "cr", "cr_tuple_fallback_cross_block_count",
+			 fmt_int64((int64)cluster_cr_tuple_stat_count(CR_TUPLE_OUTCOME_FALLBACK_CROSS_BLOCK)));
+	emit_row(rsinfo, "cr", "cr_tuple_fallback_uncertain_count",
+			 fmt_int64((int64)cluster_cr_tuple_stat_count(CR_TUPLE_OUTCOME_FALLBACK_UNCERTAIN)));
 	/* spec-5.51 D9: dedicated shared CR buffer pool (L2) counters.  All 0 when
 	 * the pool is disabled (cluster.shared_cr_pool_size_blocks == 0). */
 	emit_row(rsinfo, "cr_pool", "current_epoch", fmt_int64((int64)cluster_cr_pool_current_epoch()));

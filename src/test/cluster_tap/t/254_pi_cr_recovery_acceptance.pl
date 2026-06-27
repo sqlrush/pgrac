@@ -125,7 +125,7 @@ my %expect_cat = (
 	recovery     => 39,    # 3.16(4)+4.10 block(2)+4.11 thread(4)+4.3 plan(13)+4.4 worker(8)+4.5/4.7 merge(8)
 	tt_recovery  => 8,     # 4.8 verdict counters
 	gcs_recovery => 10,    # 4.7 warm-recovery(8) + spec-2.41 D7 redo-coverage serve-gate(2)
-	cr           => 17,    # 3.10/3.21/3.22 CR path
+	cr           => 30,    # 3.10/3.21/3.22 CR path(17) + 5.53 mismatch(5) + 5.54 tuple(8)
 	pcm          => 20,    # 2.37 PI watermark + lock state
 );
 for my $cat (sort keys %expect_cat)
