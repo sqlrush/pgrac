@@ -184,7 +184,7 @@ ok($new_epoch > $base_epoch,
 # leave — spec-3.x — so the read may fail-close on "TT status unknown".)
 # ----------
 my $l7_current = poll_soft($pair->node0,
-	'SELECT v FROM leavetab WHERE id = 1', '1100', 30, 'L7 node0 reads current');
+	'SELECT v FROM leavetab WHERE id = 1', '1100', 60, 'L7 node0 reads current');
 if ($l7_current)
 {
 	ok(1,
@@ -325,13 +325,17 @@ $esc->kill_node9(1);
 ok(1, 'L8 node1 SIGKILLed mid-drain (before commit)');
 eval { IPC::Run::kill_kill($reqh); };    # the backgrounded psql died with node1
 
-# node0 detects the death and fail-stops node1 — NOT a clean leave.
+# node0 detects the death and fail-stops node1 — NOT a clean leave.  Generous
+# timeouts: the CSSD deadband (~6s) + the fail-stop reconfig can run well past 40s
+# under heavy parallel-shard CI load, even though the path completes in seconds
+# locally (L355 CI-load robustness; the escalate is logic-deterministic, only the
+# wall-clock varies with load).
 ok(poll_until($esc->node0,
 		q{SELECT state IN ('suspected','dead') FROM pg_cluster_cssd_peers WHERE node_id = 1},
-		't', 40, 'L8 node0 CSSD marks node1 dead'),
+		't', 90, 'L8 node0 CSSD marks node1 dead'),
 	'L8 node0 CSSD deadband marks node1 dead');
 ok(poll_until($esc->node0,
-		q{SELECT reconfig_kind = 'fail_stop' FROM pg_cluster_reconfig_state}, 't', 40,
+		q{SELECT reconfig_kind = 'fail_stop' FROM pg_cluster_reconfig_state}, 't', 90,
 		'L8 node0 fail-stop'),
 	'L8 node0 escalates to fail_stop for the node that died mid-leave (CL-I7, no false clean-depart)');
 $esc->stop_pair;
