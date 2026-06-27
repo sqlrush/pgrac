@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 #-------------------------------------------------------------------------
 #
-# 309_cluster_5_56_cr_lifecycle.pl
+# 311_cluster_5_56_cr_lifecycle.pl
 #	  spec-5.56 D7 — CR pool lifecycle / invalidation contract, real-server e2e
 #	  (single node).  The CR pool is PER-INSTANCE shmem, so cross-BACKEND sharing
 #	  on one node is the correct topology (cross-INSTANCE CR fail-closes by design,
@@ -40,7 +40,7 @@
 # Portions Copyright (c) 2026, pgrac contributors
 #
 # IDENTIFICATION
-#	  src/test/cluster_tap/t/309_cluster_5_56_cr_lifecycle.pl
+#	  src/test/cluster_tap/t/311_cluster_5_56_cr_lifecycle.pl
 #
 #-------------------------------------------------------------------------
 

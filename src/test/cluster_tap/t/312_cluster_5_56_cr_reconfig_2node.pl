@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 #-------------------------------------------------------------------------
 #
-# 310_cluster_5_56_cr_reconfig_2node.pl
+# 312_cluster_5_56_cr_reconfig_2node.pl
 #	  spec-5.56 D7 L3 — CR pool lifecycle contract C4 (reconfig), 2-node e2e.
 #
 #	  C4 claim (§3.3): a membership reconfig (node leave/fail-stop, GRD/PCM
@@ -29,7 +29,7 @@
 # Portions Copyright (c) 2026, pgrac contributors
 #
 # IDENTIFICATION
-#	  src/test/cluster_tap/t/310_cluster_5_56_cr_reconfig_2node.pl
+#	  src/test/cluster_tap/t/312_cluster_5_56_cr_reconfig_2node.pl
 #
 #-------------------------------------------------------------------------
 

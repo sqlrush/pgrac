@@ -2292,7 +2292,7 @@ dump_undo(ReturnSetInfo *rsinfo)
  *	Emits 35 rows under category='cr' (9 spec-3.9 own-instance CR + 4 spec-3.10
  *	L1 cache + 4 spec-3.22 xmax + 5 spec-5.53 identity/reuse-fence mismatch +
  *	8 spec-5.54 tuple-fast-path + 5 spec-5.56 lifecycle) plus the 'cr_pool'
- *	(spec-5.51) and admission (spec-5.52) rows.  Backs cluster_tap t/215 + t/309.
+ *	(spec-5.51) and admission (spec-5.52) rows.  Backs cluster_tap t/215 + t/311.
  */
 static void
 dump_cr(ReturnSetInfo *rsinfo)
