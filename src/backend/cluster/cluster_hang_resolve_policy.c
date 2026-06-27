@@ -445,6 +445,33 @@ cluster_hang_confirm_record_action(ClusterHangConfirmEntry *e, ClusterHangAction
 	e->last_action_at = now;
 }
 
+/*
+ * cluster_hang_confirm_count_resolved -- count identities we previously acted
+ * on that have disappeared this round.
+ *
+ *	An entry that is in_use, was NOT seen this round, and carries a prior
+ *	disposition (last_action_tier != NONE) means a victim we cancelled or
+ *	terminated is gone -> the disposition worked.  Pure read; the runtime adds
+ *	the result to resolved_confirmed under the DIAG lock, after begin_round() /
+ *	touch() and before end_round() evicts the unseen entries.  Both the normal
+ *	and the empty-sample round call it, so a successful terminate that clears
+ *	every sample is still counted (Hardening v1.1 F4).
+ */
+int
+cluster_hang_confirm_count_resolved(const ClusterHangConfirmMap *map)
+{
+	int resolved = 0;
+	int i;
+
+	for (i = 0; i < CLUSTER_HANG_CONFIRM_MAX; i++) {
+		const ClusterHangConfirmEntry *e = &map->entries[i];
+
+		if (e->in_use && !e->seen_this_round && e->last_action_tier != HANG_ACTION_NONE)
+			resolved++;
+	}
+	return resolved;
+}
+
 
 /* ============================================================
  * String helpers (dumps + logs)

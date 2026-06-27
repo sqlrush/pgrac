@@ -245,6 +245,17 @@ while (time() < $bdl)
 	usleep(200_000);
 }
 ok($b_unblocked, 'L2 waiter B unblocked after the root blocker was terminated');
+# spec §4.2 L2 ④: once the terminated victim is gone, a later resolve round
+# confirms the disposition worked -> resolved_confirmed increments.  This also
+# exercises the empty-sample success path (Hardening v1.1 F4): when the
+# terminate clears every sample, the count must still move.
+my $rc_deadline = time() + 20;
+while (time() < $rc_deadline && hang_val('hang_resolved_confirmed') eq '0')
+{
+	usleep(200_000);
+}
+cmp_ok(hang_val('hang_resolved_confirmed'), '>=', '1',
+	'L2 resolved_confirmed incremented after the victim was disposed (F4)');
 # B's lock-wait left the psql mid-statement; quitting it can die on some
 # platforms, so eval-wrap (cleanup must never fail the test).
 eval { $hb->quit; } if defined $hb;
@@ -355,6 +366,82 @@ is(hang_val('hang_terminates_issued'), $term_pre_2pc,
 # (quitting a still-blocked psql would hang); eval-wrap the quit defensively.
 $node->safe_psql('postgres', "ROLLBACK PREPARED 'hang5_12_2pc'");
 eval { $w2pc->quit; };
+
+
+# ----------
+# L10: fail-CLOSED on an unprovable (truncated) root chain (Hardening v1.1 F3).
+#
+# With cluster.hang_max_chain_depth = 1 a 3-deep wait chain
+#     W -> M1 -> M2 -> R(idle-in-tx root holder)
+# truncates when ascending from the deepest waiter W (reaching the root needs
+# two sampled hops), so the ascent lands on the mid-chain waiter M2.  M2 is
+# itself a blocked waiter, NOT the root cause — disposing it is wrong.  The fix
+# skips the truncated candidate (unprovable_root_skipped++) while the true root
+# R is still found cleanly from the shallower waiters, so R may be a victim but
+# the mid-chain M2 must NEVER be.  advisory mode: observe only, signal nothing.
+# ----------
+$node->safe_psql('postgres', 'ALTER SYSTEM SET cluster.hang_resolution_mode = advisory');
+$node->safe_psql('postgres', 'ALTER SYSTEM SET cluster.hang_max_chain_depth = 1');
+$node->reload;
+$node->safe_psql('postgres',
+	'CREATE TABLE hangt_r (i int); CREATE TABLE hangt_m2 (i int); CREATE TABLE hangt_m1 (i int)');
+
+my $unprov_before = hang_val('hang_unprovable_root_skipped');
+
+# R: idle-in-tx root holder of hangt_r (never waits -> not sampled).
+my $hr = $node->background_psql('postgres', on_error_die => 1);
+$hr->query_safe('BEGIN');
+$hr->query_safe('LOCK TABLE hangt_r IN ACCESS EXCLUSIVE MODE');
+
+# M2: holds hangt_m2, then blocks waiting on hangt_r (blocked by R).
+my $hm2 = $node->background_psql('postgres', on_error_die => 1);
+$hm2->query_safe('BEGIN');
+$hm2->query_safe('LOCK TABLE hangt_m2 IN ACCESS EXCLUSIVE MODE');
+my $m2pid = $hm2->query_safe('SELECT pg_backend_pid()');
+bg_start_blocking($hm2, 'LOCK TABLE hangt_r IN ACCESS EXCLUSIVE MODE');
+ok(wait_for_lock_wait('%hangt_r%', 20), 'L10 M2 blocks waiting on the root R');
+
+# M1: holds hangt_m1, then blocks waiting on hangt_m2 (blocked by M2).
+my $hm1 = $node->background_psql('postgres', on_error_die => 1);
+$hm1->query_safe('BEGIN');
+$hm1->query_safe('LOCK TABLE hangt_m1 IN ACCESS EXCLUSIVE MODE');
+bg_start_blocking($hm1, 'LOCK TABLE hangt_m2 IN ACCESS EXCLUSIVE MODE');
+ok(wait_for_lock_wait('%hangt_m2%', 20), 'L10 M1 blocks waiting on M2');
+
+# W: deepest waiter, blocks waiting on hangt_m1 (blocked by M1).  Needs its own
+# transaction block — a bare LOCK TABLE in autocommit is a no-op warning.
+my $hw = $node->background_psql('postgres', on_error_die => 1);
+$hw->query_safe('BEGIN');
+bg_start_blocking($hw, 'LOCK TABLE hangt_m1 IN ACCESS EXCLUSIVE MODE');
+ok(wait_for_lock_wait('%hangt_m1%', 20), 'L10 deepest waiter W blocks on M1');
+
+# Once the chain is sampled, ascending from W truncates at depth 1 and the
+# mid-chain candidate is dropped fail-CLOSED.
+my $u_deadline = time() + 25;
+while (time() < $u_deadline
+	&& hang_val('hang_unprovable_root_skipped') eq $unprov_before)
+{
+	usleep(200_000);
+}
+cmp_ok(hang_val('hang_unprovable_root_skipped'), '>', $unprov_before,
+	'L10 truncated root chain skipped fail-CLOSED (unprovable_root_skipped++)');
+
+# the mid-chain waiter M2 must NEVER be advertised as a victim (only a cleanly
+# provable root would be) — proves we did not pick a mid-chain victim.
+is($node->safe_psql('postgres',
+		"SELECT count(*) FROM pg_cluster_hang_victims() WHERE victim_pid = $m2pid"),
+	'0', 'L10 mid-chain waiter M2 is never recommended as a victim');
+
+# cleanup: terminate the chain backends, then eval-wrap the handle quits
+# (a still-blocked psql quit can die — must never fail the test).
+$node->safe_psql('postgres',
+	"SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+	 WHERE pid <> pg_backend_pid()
+	   AND (query LIKE '%hangt_r%' OR query LIKE '%hangt_m2%' OR query LIKE '%hangt_m1%')");
+eval { $hr->quit; };
+eval { $hm2->quit; };
+eval { $hm1->quit; };
+eval { $hw->quit; };
 
 
 $node->stop;

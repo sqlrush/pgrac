@@ -66,6 +66,7 @@ PG_FUNCTION_INFO_V1(pg_cluster_hang_resolve);
 #include "utils/acl.h"
 #include "utils/backend_status.h"
 #include "utils/builtins.h"
+#include "utils/memutils.h"
 #include "utils/timestamp.h"
 
 #include "cluster/cluster_diag.h"
@@ -76,11 +77,26 @@ PG_FUNCTION_INFO_V1(pg_cluster_hang_resolve);
 #include "cluster/cluster_lmd_wait_state.h"
 
 /*
+ * HangBlockEdge — one concrete "victim granted-holds a conflicting lock that a
+ * waiter is blocked on" edge, captured at gather time so the at-signal-time
+ * G-ABA re-validate can confirm THIS edge still holds (the original hang is
+ * provably still present), not merely that the victim still blocks some other —
+ * possibly healthy, possibly brand-new — waiter (spec §3.2 G-ABA ①②;
+ * Hardening v1.1 F2).
+ */
+typedef struct HangBlockEdge {
+	bool valid;		 /* a representative blocking edge was captured */
+	int waiter_pid;	 /* a backend blocked on locktag by the victim's granted lock */
+	LOCKTAG locktag; /* the object the victim holds and the waiter waits on */
+} HangBlockEdge;
+
+/*
  * HangCandidate — one root-blocker candidate, gathered read-only from the
  * fresh pgstat + lock snapshots (no DIAG lock held during gathering).
  */
 typedef struct HangCandidate {
 	ClusterHangVictim v; /* pid / backendId / xid / ages / counts / score / skip */
+	HangBlockEdge edge;	 /* representative blocking edge for G-ABA re-validate (F2) */
 	bool in_wfg;		 /* representative waiter is in the 5.8 WFG (over-exclude) */
 	bool valid;			 /* a live backend was found for this pid */
 } HangCandidate;
@@ -127,11 +143,14 @@ hang_holdmask_conflicts(LOCKMASK holdMask, LOCKMODE waitLockMode)
  */
 static void
 hang_victim_lock_facts(const LockData *lockData, int victim_pid, int *n_locks_held,
-					   bool *is_lock_blocker)
+					   bool *is_lock_blocker, HangBlockEdge *edge)
 {
 	int held = 0;
 	bool blocker = false;
 	int i;
+
+	if (edge != NULL)
+		edge->valid = false;
 
 	for (i = 0; i < lockData->nelements; i++) {
 		const LockInstanceData *li = &lockData->locks[i];
@@ -150,6 +169,13 @@ hang_victim_lock_facts(const LockData *lockData, int victim_pid, int *n_locks_he
 				continue;
 			if (hang_holdmask_conflicts(li->holdMask, w->waitLockMode)) {
 				blocker = true;
+				/* capture the first such edge as the representative one used by
+				 * the G-ABA re-validate (spec §3.2 ①②, Hardening v1.1 F2) */
+				if (edge != NULL && !edge->valid) {
+					edge->valid = true;
+					edge->waiter_pid = w->pid;
+					edge->locktag = w->locktag;
+				}
 				break;
 			}
 		}
@@ -299,7 +325,7 @@ hang_gather_candidate(HangCandidate *c, int victim_pid, int n_blocked, int64 wai
 			c->v.xact_age_us = now - be->st_xact_start_timestamp;
 	}
 
-	hang_victim_lock_facts(lockData, victim_pid, &n_locks, &is_lock_blocker);
+	hang_victim_lock_facts(lockData, victim_pid, &n_locks, &is_lock_blocker, &c->edge);
 	c->v.n_locks_held = n_locks;
 
 	/*
@@ -328,13 +354,14 @@ hang_gather_candidate(HangCandidate *c, int victim_pid, int n_blocked, int64 wai
 static int
 hang_collect_candidates(const ClusterHangSampleStore *snap, const LockData *lockData,
 						TimestampTz now, HangCandidate *out, int max_out, uint64 *n_non_actionable,
-						uint64 *n_over_excluded)
+						uint64 *n_over_excluded, uint64 *n_unprovable_root)
 {
 	int n_cand = 0;
 	int i;
 
 	*n_non_actionable = 0;
 	*n_over_excluded = 0;
+	*n_unprovable_root = 0;
 
 	for (i = 0; i < snap->n_samples; i++) {
 		const ClusterHangSampleSlot *slot = &snap->slots[i];
@@ -358,6 +385,15 @@ hang_collect_candidates(const ClusterHangSampleStore *snap, const LockData *lock
 		root_pid = cluster_hang_root_blocker_pid(snap, i, cluster_hang_max_chain_depth, &trunc);
 		if (root_pid < 0)
 			continue;
+		if (trunc) {
+			/* the ascent was cut short (cycle / depth bound) so the returned pid
+			 * is a mid-chain waiter, not a provable root.  fail-CLOSED: skip it
+			 * rather than dispose a backend we cannot prove is the root cause
+			 * (the true root is still reachable cleanly from its immediate
+			 * downstream waiter's own sample).  Hardening v1.1 F3. */
+			(*n_unprovable_root)++;
+			continue;
+		}
 
 		/* dedup: a root blocking several waiters appears once, n_blocked aggregates */
 		for (k = 0; k < n_cand; k++) {
@@ -392,19 +428,55 @@ hang_collect_candidates(const ClusterHangSampleStore *snap, const LockData *lock
  * ============================================================ */
 
 /*
- * hang_revalidate_victim -- re-confirm, against a FRESH snapshot, that the
- * victim is still the same identity and still a lock blocker.  Guards the
- * tiny window between candidate gathering and the actual signal: the victim
- * may have released its lock / exited / had its pid reused.  fail-CLOSED:
- * any mismatch returns false and the caller never signals (spec §3.2 G-ABA).
+ * hang_edge_still_blocking -- does the captured (waiter, locktag) edge still
+ * describe a live block by the victim in the fresh lock snapshot?
+ *
+ *	True iff the victim still granted-holds a lock on edge->locktag whose mode
+ *	conflicts with the SAME waiter still waiting on that SAME locktag.  This is
+ *	the spec §3.2 G-ABA ①② check: the ORIGINAL hang is provably still present,
+ *	not merely that the victim happens to block some unrelated (perhaps healthy,
+ *	perhaps brand-new) waiter now.  Without this the disposition could terminate
+ *	a backend whose original hang already self-resolved (Hardening v1.1 F2).
  */
 static bool
-hang_revalidate_victim(int pid, int backendId)
+hang_edge_still_blocking(const LockData *lockData, int victim_pid, const HangBlockEdge *edge)
+{
+	LOCKMASK victim_hold = 0;
+	LOCKMODE waiter_wait = NoLock;
+	int i;
+
+	if (edge == NULL || !edge->valid)
+		return false; /* no edge captured -> cannot prove the hang -> fail-CLOSED */
+
+	for (i = 0; i < lockData->nelements; i++) {
+		const LockInstanceData *li = &lockData->locks[i];
+
+		if (!hang_locktag_eq(&li->locktag, &edge->locktag))
+			continue;
+		if (li->pid == victim_pid)
+			victim_hold |= li->holdMask; /* ② victim still granted-holds on this object */
+		else if (li->pid == edge->waiter_pid && li->waitLockMode != NoLock)
+			waiter_wait = li->waitLockMode; /* ① same waiter still waits on this object */
+	}
+
+	if (victim_hold == 0 || waiter_wait == NoLock)
+		return false;
+	return hang_holdmask_conflicts(victim_hold, waiter_wait);
+}
+
+/*
+ * hang_revalidate_victim -- re-confirm, against a FRESH snapshot, that the
+ * victim is still the same identity AND the specific blocking edge that justified
+ * disposing it still holds.  Guards the window between candidate gathering and
+ * the actual signal: the victim may have released that lock / exited / had its
+ * pid reused, or the original waiter may have given up.  fail-CLOSED: any
+ * mismatch returns false and the caller never signals (spec §3.2 G-ABA ①②③).
+ */
+static bool
+hang_revalidate_victim(int pid, int backendId, const HangBlockEdge *edge)
 {
 	LockData *lockData;
 	LocalPgBackendStatus *lb;
-	int n_locks = 0;
-	bool is_lock_blocker = false;
 
 	if (BackendPidGetProc(pid) == NULL)
 		return false;
@@ -412,11 +484,12 @@ hang_revalidate_victim(int pid, int backendId)
 	pgstat_clear_backend_activity_snapshot();
 	lb = hang_local_beentry_by_pid(pid);
 	if (lb == NULL || lb->backend_id != backendId || lb->backendStatus.st_backendType != B_BACKEND)
-		return false; /* identity drifted / pid reused */
+		return false; /* ③ identity drifted / pid reused */
 
 	lockData = GetLockStatusData();
-	hang_victim_lock_facts(lockData, pid, &n_locks, &is_lock_blocker);
-	return is_lock_blocker;
+	/* ①②: the captured blocking edge must still hold -- the original hang is
+	 * provably still present, not merely that the victim blocks something else */
+	return hang_edge_still_blocking(lockData, pid, edge);
 }
 
 
@@ -430,6 +503,7 @@ typedef struct HangSelected {
 	int pid;
 	int backendId;
 	ClusterHangActionTier tier; /* the tier decided this round (never NONE) */
+	HangBlockEdge edge;			/* the candidate's representative blocking edge (G-ABA, F2) */
 } HangSelected;
 
 /* throttle the honest-degrade / no-safe-victim operator alert to LOG-once */
@@ -449,6 +523,7 @@ hang_resolve_round(void)
 	int n_pass = 0;
 	uint64 n_non_actionable = 0;
 	uint64 n_over_excluded = 0;
+	uint64 n_unprovable_root = 0;
 	bool any_hard_skip = false;
 	bool enforce = cluster_hang_mode_dispatches(cluster_hang_resolution_mode);
 	TimestampTz now = GetCurrentTimestamp();
@@ -461,10 +536,15 @@ hang_resolve_round(void)
 	cluster_hang_store_snapshot(&diag->hang_store, &diag->lwlock, &snap);
 	if (snap.n_samples == 0) {
 		/* nothing to do, but still account the evaluation + clear stale confirm
-		 * state so a vanished victim's streak does not linger */
+		 * state so a vanished victim's streak does not linger.  This is also the
+		 * common SUCCESS path: a terminate that cleared every sample leaves the
+		 * acted-on identity gone here, so count it as resolved before evicting
+		 * it (else resolved_confirmed under-counts the success case, F4). */
 		LWLockAcquire(&diag->lwlock, LW_EXCLUSIVE);
 		diag->hang_resolve_counters.resolve_evaluations++;
 		cluster_hang_confirm_begin_round(&diag->hang_confirm_map);
+		diag->hang_resolve_counters.resolved_confirmed
+			+= (uint64)cluster_hang_confirm_count_resolved(&diag->hang_confirm_map);
 		cluster_hang_confirm_end_round(&diag->hang_confirm_map);
 		LWLockRelease(&diag->lwlock);
 		hang_degrade_alerted = false;
@@ -474,7 +554,7 @@ hang_resolve_round(void)
 	pgstat_clear_backend_activity_snapshot();
 	lockData = GetLockStatusData();
 	n_cand = hang_collect_candidates(&snap, lockData, now, cands, CLUSTER_HANG_MAX_SAMPLES,
-									 &n_non_actionable, &n_over_excluded);
+									 &n_non_actionable, &n_over_excluded, &n_unprovable_root);
 
 	/* decision phase under the DIAG lock (confirm map + counters are shared) */
 	LWLockAcquire(&diag->lwlock, LW_EXCLUSIVE);
@@ -485,6 +565,7 @@ hang_resolve_round(void)
 		ctr->resolve_evaluations++;
 		ctr->non_actionable_skipped += n_non_actionable;
 		ctr->over_excluded += n_over_excluded;
+		ctr->unprovable_root_skipped += n_unprovable_root;
 
 		cluster_hang_confirm_begin_round(map);
 
@@ -512,13 +593,9 @@ hang_resolve_round(void)
 		}
 
 		/* resolved_confirmed: an identity we previously acted on is gone this
-		 * round (not touched) -> the disposition worked */
-		for (i = 0; i < CLUSTER_HANG_CONFIRM_MAX; i++) {
-			ClusterHangConfirmEntry *e = &map->entries[i];
-
-			if (e->in_use && !e->seen_this_round && e->last_action_tier != HANG_ACTION_NONE)
-				ctr->resolved_confirmed++;
-		}
+		 * round (not touched) -> the disposition worked.  Shared helper so the
+		 * empty-sample path counts it identically (F4). */
+		ctr->resolved_confirmed += (uint64)cluster_hang_confirm_count_resolved(map);
 		cluster_hang_confirm_end_round(map);
 
 		/* deterministic order: best victim first, then rate-limit per round */
@@ -569,6 +646,7 @@ hang_resolve_round(void)
 				selected[n_sel].pid = c->v.pid;
 				selected[n_sel].backendId = c->v.backendId;
 				selected[n_sel].tier = tier;
+				selected[n_sel].edge = c->edge;
 				n_sel++;
 			}
 		}
@@ -598,7 +676,7 @@ hang_resolve_round(void)
 	for (i = 0; i < n_sel; i++) {
 		HangSelected *s = &selected[i];
 		bool acted = false;
-		bool aba_ok = hang_revalidate_victim(s->pid, s->backendId);
+		bool aba_ok = hang_revalidate_victim(s->pid, s->backendId, &s->edge);
 
 		LWLockAcquire(&diag->lwlock, LW_EXCLUSIVE);
 		{
@@ -655,7 +733,25 @@ hang_resolve_round(void)
 void
 cluster_hang_resolve_once(void)
 {
-	/* fail-CLOSED + never-throw: a disposition fault must never crash DIAG */
+	/*
+	 * Run the round in a dedicated context (created once) and reset it on the
+	 * way out so the per-round palloc'd snapshots (GetLockStatusData in the
+	 * round body AND in the at-signal-time re-validate) never accumulate in the
+	 * long-lived DIAG main-loop context.  The sampler (cluster_hang_sample_once)
+	 * does the same, but it has already switched back to the main-loop context
+	 * by the time DiagMain calls us, so the resolver needs its own (the bgwriter
+	 * / checkpointer aux processes solve this identically).  Hardening v1.1 F1.
+	 *
+	 * fail-CLOSED + never-throw: a disposition fault must never crash DIAG.
+	 */
+	static MemoryContext hang_resolve_context = NULL;
+	MemoryContext oldcxt;
+
+	if (hang_resolve_context == NULL)
+		hang_resolve_context
+			= AllocSetContextCreate(TopMemoryContext, "ClusterHangResolve", ALLOCSET_DEFAULT_SIZES);
+	oldcxt = MemoryContextSwitchTo(hang_resolve_context);
+
 	PG_TRY();
 	{
 		hang_resolve_round();
@@ -664,6 +760,7 @@ cluster_hang_resolve_once(void)
 	{
 		ClusterDiagSharedState *diag = cluster_diag_get_shared_state();
 
+		MemoryContextSwitchTo(oldcxt);
 		if (diag != NULL) {
 			LWLockAcquire(&diag->lwlock, LW_EXCLUSIVE);
 			diag->hang_resolve_counters.resolution_failed++;
@@ -672,6 +769,10 @@ cluster_hang_resolve_once(void)
 		FlushErrorState();
 	}
 	PG_END_TRY();
+
+	/* restore the caller's context and free this round's allocations */
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextReset(hang_resolve_context);
 }
 
 
@@ -716,7 +817,10 @@ cluster_hang_resolve_pid(int pid)
 		wproc = BackendPidGetProc(slot->pid);
 		if (wproc != NULL && cluster_lmd_pid_in_wfg(wproc->pgprocno))
 			continue;
-		if (cluster_hang_root_blocker_pid(&snap, i, cluster_hang_max_chain_depth, &trunc) == pid) {
+		/* require a provable root: a truncated/cyclic ascent that merely lands on
+		 * pid does not make it the root cause (fail-CLOSED, Hardening v1.1 F3) */
+		if (cluster_hang_root_blocker_pid(&snap, i, cluster_hang_max_chain_depth, &trunc) == pid
+			&& !trunc) {
 			is_root_of_actionable = true;
 			break;
 		}
@@ -728,8 +832,9 @@ cluster_hang_resolve_pid(int pid)
 	if (!c.valid || c.v.skip != HANG_VICTIM_OK)
 		return false; /* not a live regular backend / HARD-skip / not a lock holder */
 
-	/* G-ABA at the instant of signalling, then terminate */
-	if (!hang_revalidate_victim(pid, c.v.backendId))
+	/* G-ABA at the instant of signalling (re-validate the captured blocking
+	 * edge still holds), then terminate */
+	if (!hang_revalidate_victim(pid, c.v.backendId, &c.edge))
 		return false;
 	if (!cluster_hang_signal_victim(pid, SIGTERM))
 		return false;
@@ -787,6 +892,7 @@ pg_cluster_hang_victims(PG_FUNCTION_ARGS)
 	int n_cand = 0;
 	uint64 dummy_a = 0;
 	uint64 dummy_o = 0;
+	uint64 dummy_u = 0;
 	bool privileged = has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_STATS);
 	TimestampTz now = GetCurrentTimestamp();
 	int i;
@@ -801,7 +907,7 @@ pg_cluster_hang_victims(PG_FUNCTION_ARGS)
 	pgstat_clear_backend_activity_snapshot();
 	lockData = GetLockStatusData();
 	n_cand = hang_collect_candidates(&snap, lockData, now, cands, CLUSTER_HANG_MAX_SAMPLES,
-									 &dummy_a, &dummy_o);
+									 &dummy_a, &dummy_o, &dummy_u);
 
 	for (i = 0; i < n_cand; i++) {
 		HangCandidate *c = &cands[i];

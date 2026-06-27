@@ -164,10 +164,11 @@ typedef struct ClusterHangResolveCounters {
 	uint64 hard_skipped;		   /* HARD-skip never-kill class hit */
 	uint64 non_actionable_skipped; /* G-actionable rejected (remote/approx/in-deadlock) */
 	uint64 over_excluded;		   /* COMPLETE but in 5.8 WFG (v1 unreachable, forward GES-class) */
-	uint64 aba_revalidate_failed;  /* pre-signal re-validate: identity drifted -> never act */
-	uint64 not_confirmed_yet;	   /* below confirm_rounds */
-	uint64 no_safe_victim;		   /* all candidates HARD-skip -> degrade */
-	uint64 degraded_to_timeout;	   /* Tier-3 honest-degrade */
+	uint64 unprovable_root_skipped; /* truncated/cyclic root ascent -> skip (F3) */
+	uint64 aba_revalidate_failed;	/* pre-signal re-validate: edge/identity drifted -> never act */
+	uint64 not_confirmed_yet;		/* below confirm_rounds */
+	uint64 no_safe_victim;			/* all candidates HARD-skip -> degrade */
+	uint64 degraded_to_timeout;		/* Tier-3 honest-degrade */
 	uint64 advisory_recommendations; /* advisory-mode recommendations recorded */
 	/* last-action observability (not counters; written under the DIAG lock) */
 	int last_victim_pid; /* pid of the most recently disposed victim, 0 = none */
@@ -263,6 +264,13 @@ extern ClusterHangActionTier cluster_hang_confirm_decide_tier(const ClusterHangC
 															  TimestampTz now, int soft_timeout_ms);
 extern void cluster_hang_confirm_record_action(ClusterHangConfirmEntry *e,
 											   ClusterHangActionTier tier, TimestampTz now);
+/* Count identities that were previously acted on (last_action_tier != NONE) but
+ * are no longer seen this round -> the disposition worked.  Must be called after
+ * begin_round()/touch() and before end_round() (which evicts the unseen entries).
+ * Pure; the caller adds the result to resolved_confirmed under the DIAG lock
+ * (Hardening v1.1 F4: both the normal and the empty-sample round use this so a
+ * successful terminate that clears all samples is still counted). */
+extern int cluster_hang_confirm_count_resolved(const ClusterHangConfirmMap *map);
 
 
 /* ============================================================

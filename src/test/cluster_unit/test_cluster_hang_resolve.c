@@ -479,13 +479,63 @@ UT_TEST(test_over_exclude_gate)
 
 
 /* ============================================================
+ * U11 — resolved-confirmed accounting (Hardening v1.1 F4)
+ *
+ * cluster_hang_confirm_count_resolved() counts identities that were acted on
+ * in a prior round (last_action_tier != NONE) but are not seen this round, so
+ * the same number is added to resolved_confirmed on BOTH the normal and the
+ * empty-sample round — a successful terminate that clears every sample (the
+ * common success path) is no longer under-counted.
+ * ============================================================ */
+
+UT_TEST(test_confirm_count_resolved)
+{
+	ClusterHangConfirmMap map;
+	ClusterHangConfirmEntry *e;
+	const TimestampTz t0 = 1000000000LL;
+
+	memset(&map, 0, sizeof(map));
+
+	/* round 1: an identity is seen and terminated */
+	cluster_hang_confirm_begin_round(&map);
+	e = cluster_hang_confirm_touch(&map, 111, 7);
+	UT_ASSERT(e != NULL);
+	if (e == NULL)
+		return;
+	cluster_hang_confirm_record_action(e, HANG_ACTION_TERMINATE, t0);
+	/* still seen this round -> nothing resolved yet */
+	UT_ASSERT_EQ(cluster_hang_confirm_count_resolved(&map), 0);
+	cluster_hang_confirm_end_round(&map);
+
+	/* round 2 (empty-sample path simulation): identity NOT touched this round.
+	 * It was acted on (TERMINATE) and is now gone -> exactly one resolved. */
+	cluster_hang_confirm_begin_round(&map);
+	UT_ASSERT_EQ(cluster_hang_confirm_count_resolved(&map), 1);
+	cluster_hang_confirm_end_round(&map);
+
+	/* round 3: the entry was evicted by end_round -> no longer counted */
+	cluster_hang_confirm_begin_round(&map);
+	UT_ASSERT_EQ(cluster_hang_confirm_count_resolved(&map), 0);
+
+	/* an identity seen but NEVER acted on (last_action_tier == NONE) is not a
+	 * resolution even when it later disappears: touch a fresh one, end, re-begin */
+	e = cluster_hang_confirm_touch(&map, 222, 9);
+	UT_ASSERT(e != NULL);
+	cluster_hang_confirm_end_round(&map);
+	cluster_hang_confirm_begin_round(&map);
+	UT_ASSERT_EQ(cluster_hang_confirm_count_resolved(&map), 0);
+	cluster_hang_confirm_end_round(&map);
+}
+
+
+/* ============================================================
  * Test runner
  * ============================================================ */
 
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(11);
 	UT_RUN(test_victim_score_cmp);
 	UT_RUN(test_victim_score_monotonic);
 	UT_RUN(test_victim_skip_reason);
@@ -496,6 +546,7 @@ main(void)
 	UT_RUN(test_root_blocker_ascent);
 	UT_RUN(test_counter_note_gate_reject);
 	UT_RUN(test_over_exclude_gate);
+	UT_RUN(test_confirm_count_resolved);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

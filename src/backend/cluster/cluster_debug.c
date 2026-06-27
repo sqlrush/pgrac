@@ -677,6 +677,8 @@ dump_hang(ReturnSetInfo *rsinfo)
 		emit_row(rsinfo, "hang", "hang_non_actionable_skipped",
 				 fmt_int64((int64)rc.non_actionable_skipped));
 		emit_row(rsinfo, "hang", "hang_over_excluded", fmt_int64((int64)rc.over_excluded));
+		emit_row(rsinfo, "hang", "hang_unprovable_root_skipped",
+				 fmt_int64((int64)rc.unprovable_root_skipped));
 		emit_row(rsinfo, "hang", "hang_aba_revalidate_failed",
 				 fmt_int64((int64)rc.aba_revalidate_failed));
 		emit_row(rsinfo, "hang", "hang_not_confirmed_yet", fmt_int64((int64)rc.not_confirmed_yet));
