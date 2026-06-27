@@ -370,6 +370,7 @@ UT_TEST(test_root_blocker_ascent)
 	ClusterHangSampleStore store;
 	bool trunc;
 	int root;
+	int dw; /* direct-downstream waiter the root blocks (Hardening v1.2) */
 
 	memset(&store, 0, sizeof(store));
 
@@ -379,21 +380,28 @@ UT_TEST(test_root_blocker_ascent)
 	store.n_samples = 2;
 
 	trunc = true;
-	root = cluster_hang_root_blocker_pid(&store, 0, 100, &trunc);
+	dw = -1;
+	root = cluster_hang_root_blocker_pid(&store, 0, 100, &trunc, &dw);
 	UT_ASSERT_EQ(root, 300);
 	UT_ASSERT(!trunc);
+	/* the root 300 directly blocks 200 (the chain node below it), not the leaf 100 */
+	UT_ASSERT_EQ(dw, 200);
 
-	/* direct: blocker not in store -> that blocker is the root */
+	/* direct: blocker not in store -> that blocker is the root, blocks 200 directly */
 	trunc = true;
-	root = cluster_hang_root_blocker_pid(&store, 1, 100, &trunc);
+	dw = -1;
+	root = cluster_hang_root_blocker_pid(&store, 1, 100, &trunc, &dw);
 	UT_ASSERT_EQ(root, 300);
 	UT_ASSERT(!trunc);
+	UT_ASSERT_EQ(dw, 200);
 
-	/* no blocker -> -1 */
+	/* no blocker -> -1, direct waiter -1 */
 	set_slot(&store, 2, 400, -1);
 	store.n_samples = 3;
-	root = cluster_hang_root_blocker_pid(&store, 2, 100, &trunc);
+	dw = 999;
+	root = cluster_hang_root_blocker_pid(&store, 2, 100, &trunc, &dw);
 	UT_ASSERT_EQ(root, -1);
+	UT_ASSERT_EQ(dw, -1);
 
 	/* cycle: 100 -> 200 -> 100 (defensive; actionable already excludes deadlock) */
 	memset(&store, 0, sizeof(store));
@@ -401,7 +409,8 @@ UT_TEST(test_root_blocker_ascent)
 	set_slot(&store, 1, 200, 100);
 	store.n_samples = 2;
 	trunc = false;
-	root = cluster_hang_root_blocker_pid(&store, 0, 100, &trunc);
+	dw = -1;
+	root = cluster_hang_root_blocker_pid(&store, 0, 100, &trunc, &dw);
 	UT_ASSERT(trunc);
 	UT_ASSERT(root > 0); /* still returns the last blocker pid seen */
 
@@ -412,7 +421,8 @@ UT_TEST(test_root_blocker_ascent)
 	set_slot(&store, 2, 300, 400);
 	store.n_samples = 3;
 	trunc = false;
-	root = cluster_hang_root_blocker_pid(&store, 0, 1, &trunc);
+	dw = -1;
+	root = cluster_hang_root_blocker_pid(&store, 0, 1, &trunc, &dw);
 	UT_ASSERT(trunc);
 	UT_ASSERT(root > 0); /* truncated walk still returns a real blocker pid */
 }

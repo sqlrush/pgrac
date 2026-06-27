@@ -77,17 +77,22 @@ PG_FUNCTION_INFO_V1(pg_cluster_hang_resolve);
 #include "cluster/cluster_lmd_wait_state.h"
 
 /*
- * HangBlockEdge — one concrete "victim granted-holds a conflicting lock that a
- * waiter is blocked on" edge, captured at gather time so the at-signal-time
- * G-ABA re-validate can confirm THIS edge still holds (the original hang is
- * provably still present), not merely that the victim still blocks some other —
- * possibly healthy, possibly brand-new — waiter (spec §3.2 G-ABA ①②;
- * Hardening v1.1 F2).
+ * HangBlockEdge — the concrete "victim granted-holds a conflicting lock that
+ * the sampled chain's direct-downstream waiter is blocked on" edge, captured at
+ * gather time so the at-signal-time G-ABA re-validate can confirm THIS hang is
+ * provably still present, not merely that the victim still blocks some other —
+ * possibly healthy, possibly brand-new — waiter (spec §3.2 G-ABA ①②③).
+ *
+ *	The waiter is the chain node the root directly blocks (threaded from the
+ *	root-blocker ascent, Hardening v1.2), not an arbitrary co-waiter the root
+ *	also happens to block; and it carries the waiter's BackendId so a re-used pid
+ *	(a new backend waiting on the same locktag) cannot satisfy the re-validate.
  */
 typedef struct HangBlockEdge {
-	bool valid;		 /* a representative blocking edge was captured */
-	int waiter_pid;	 /* a backend blocked on locktag by the victim's granted lock */
-	LOCKTAG locktag; /* the object the victim holds and the waiter waits on */
+	bool valid;					/* the chain blocking edge was captured */
+	int waiter_pid;				/* the sampled chain waiter the victim directly blocks */
+	BackendId waiter_backendId; /* its BackendId (pid-reuse ABA guard, Hardening v1.2) */
+	LOCKTAG locktag;			/* the object the victim holds and the waiter waits on */
 } HangBlockEdge;
 
 /*
@@ -131,58 +136,74 @@ hang_holdmask_conflicts(LOCKMASK holdMask, LOCKMODE waitLockMode)
 	return false;
 }
 
-/*
- * hang_victim_lock_facts -- count granted locks the victim holds and decide
- * whether it is actually blocking a waiter (G-lock-holder).
- *
- *	is_lock_blocker is true when the victim holds a granted lock on some
- *	locktag that another backend is waiting on with a conflicting mode.  This
- *	is identity-by-blocking, not identity-by-xid: an idle-in-tx
- *	"BEGIN; LOCK TABLE t;" holder with NO xid is correctly recognised as a
- *	blocker (spec v0.3 P1#1).  n_locks_held proxies rollback cost.
- */
-static void
-hang_victim_lock_facts(const LockData *lockData, int victim_pid, int *n_locks_held,
-					   bool *is_lock_blocker, HangBlockEdge *edge)
+/* Count granted locks the victim holds -- a rollback-cost proxy for the score. */
+static int
+hang_victim_n_locks_held(const LockData *lockData, int victim_pid)
 {
 	int held = 0;
-	bool blocker = false;
 	int i;
-
-	if (edge != NULL)
-		edge->valid = false;
 
 	for (i = 0; i < lockData->nelements; i++) {
 		const LockInstanceData *li = &lockData->locks[i];
+
+		if (li->pid == victim_pid && li->holdMask != 0)
+			held++;
+	}
+	return held;
+}
+
+/*
+ * hang_capture_chain_edge -- capture the blocking edge that justified disposing
+ * this root: the lock the sampled chain's DIRECT-downstream waiter
+ * (direct_waiter_pid, threaded from the root ascent) is blocked on, which the
+ * root granted-holds with a conflicting mode.
+ *
+ *	Records the waiter's pid + BackendId + locktag so the at-signal-time re-
+ *	validate re-proves THIS hang (spec §3.2 ①②③), not an arbitrary co-waiter the
+ *	root also happens to block (Hardening v1.2 F2-bind) and not a re-used pid
+ *	(BackendId guard).  Returns true (and fills *edge) iff that edge exists in
+ *	the snapshot.  A non-blocking idle-in-tx "BEGIN; LOCK TABLE t;" holder with
+ *	NO xid is still recognised — the gate is identity-by-blocking, not by xid
+ *	(spec v0.3 P1#1).  fail-CLOSED: if the chain edge cannot be confirmed (torn
+ *	snapshot / chain moved) the candidate is not a valid victim.
+ */
+static bool
+hang_capture_chain_edge(const LockData *lockData, int root_pid, int direct_waiter_pid,
+						HangBlockEdge *edge)
+{
+	int i;
+
+	edge->valid = false;
+	if (direct_waiter_pid <= 0)
+		return false;
+
+	for (i = 0; i < lockData->nelements; i++) {
+		const LockInstanceData *w = &lockData->locks[i];
+		LOCKMASK root_hold = 0;
 		int j;
 
-		if (li->pid != victim_pid || li->holdMask == 0)
+		/* the single lock the direct-downstream waiter is blocked on */
+		if (w->pid != direct_waiter_pid || w->waitLockMode == NoLock)
 			continue;
-		held++;
 
+		/* does the root granted-hold a conflicting lock on the SAME object? */
 		for (j = 0; j < lockData->nelements; j++) {
-			const LockInstanceData *w = &lockData->locks[j];
+			const LockInstanceData *h = &lockData->locks[j];
 
-			if (j == i || w->pid == victim_pid || w->waitLockMode == NoLock)
-				continue;
-			if (!hang_locktag_eq(&li->locktag, &w->locktag))
-				continue;
-			if (hang_holdmask_conflicts(li->holdMask, w->waitLockMode)) {
-				blocker = true;
-				/* capture the first such edge as the representative one used by
-				 * the G-ABA re-validate (spec §3.2 ①②, Hardening v1.1 F2) */
-				if (edge != NULL && !edge->valid) {
-					edge->valid = true;
-					edge->waiter_pid = w->pid;
-					edge->locktag = w->locktag;
-				}
-				break;
-			}
+			if (h->pid == root_pid && hang_locktag_eq(&h->locktag, &w->locktag))
+				root_hold |= h->holdMask;
 		}
+		if (root_hold != 0 && hang_holdmask_conflicts(root_hold, w->waitLockMode)) {
+			edge->valid = true;
+			edge->waiter_pid = direct_waiter_pid;
+			edge->waiter_backendId = w->backend;
+			edge->locktag = w->locktag;
+			return true;
+		}
+		/* waiter is blocked here but not (provably) by the root -> fail-CLOSED */
+		return false;
 	}
-
-	*n_locks_held = held;
-	*is_lock_blocker = blocker;
+	return false;
 }
 
 
@@ -295,14 +316,13 @@ cluster_hang_signal_victim(int pid, int sig)
  * the caller (aggregated from the actionable waiters this root blocks).
  */
 static void
-hang_gather_candidate(HangCandidate *c, int victim_pid, int n_blocked, int64 wait_age_us,
-					  const LockData *lockData, TimestampTz now)
+hang_gather_candidate(HangCandidate *c, int victim_pid, int direct_waiter_pid, int n_blocked,
+					  int64 wait_age_us, const LockData *lockData, TimestampTz now)
 {
 	PGPROC *proc;
 	LocalPgBackendStatus *lb;
 	int backend_type = B_BACKEND;
 	bool is_lock_blocker = false;
-	int n_locks = 0;
 
 	memset(c, 0, sizeof(*c));
 	c->v.pid = victim_pid;
@@ -325,8 +345,10 @@ hang_gather_candidate(HangCandidate *c, int victim_pid, int n_blocked, int64 wai
 			c->v.xact_age_us = now - be->st_xact_start_timestamp;
 	}
 
-	hang_victim_lock_facts(lockData, victim_pid, &n_locks, &is_lock_blocker, &c->edge);
-	c->v.n_locks_held = n_locks;
+	c->v.n_locks_held = hang_victim_n_locks_held(lockData, victim_pid);
+	/* G-lock-holder is now bound to the sampled chain's direct waiter, not any
+	 * co-waiter: the victim must currently block THAT waiter (Hardening v1.2) */
+	is_lock_blocker = hang_capture_chain_edge(lockData, victim_pid, direct_waiter_pid, &c->edge);
 
 	/*
 	 * HARD-skip + lock-holder classification.  is_recovery uses the
@@ -368,6 +390,7 @@ hang_collect_candidates(const ClusterHangSampleStore *snap, const LockData *lock
 		PGPROC *wproc;
 		bool trunc = false;
 		int root_pid;
+		int direct_waiter = -1;
 		int k;
 
 		if (!cluster_hang_sample_actionable(slot)) {
@@ -382,7 +405,8 @@ hang_collect_candidates(const ClusterHangSampleStore *snap, const LockData *lock
 			continue;
 		}
 
-		root_pid = cluster_hang_root_blocker_pid(snap, i, cluster_hang_max_chain_depth, &trunc);
+		root_pid = cluster_hang_root_blocker_pid(snap, i, cluster_hang_max_chain_depth, &trunc,
+												 &direct_waiter);
 		if (root_pid < 0)
 			continue;
 		if (trunc) {
@@ -414,7 +438,8 @@ hang_collect_candidates(const ClusterHangSampleStore *snap, const LockData *lock
 		if (n_cand >= max_out)
 			continue; /* bounded; excess roots dropped (rare) */
 
-		hang_gather_candidate(&out[n_cand], root_pid, 1, slot->duration_us, lockData, now);
+		hang_gather_candidate(&out[n_cand], root_pid, direct_waiter, 1, slot->duration_us, lockData,
+							  now);
 		if (out[n_cand].valid)
 			n_cand++;
 	}
@@ -455,8 +480,9 @@ hang_edge_still_blocking(const LockData *lockData, int victim_pid, const HangBlo
 			continue;
 		if (li->pid == victim_pid)
 			victim_hold |= li->holdMask; /* ② victim still granted-holds on this object */
-		else if (li->pid == edge->waiter_pid && li->waitLockMode != NoLock)
-			waiter_wait = li->waitLockMode; /* ① same waiter still waits on this object */
+		else if (li->pid == edge->waiter_pid && li->backend == edge->waiter_backendId
+				 && li->waitLockMode != NoLock)
+			waiter_wait = li->waitLockMode; /* ① SAME waiter (pid+BackendId) still waits */
 	}
 
 	if (victim_hold == 0 || waiter_wait == NoLock)
@@ -796,6 +822,7 @@ cluster_hang_resolve_pid(int pid)
 	LockData *lockData;
 	TimestampTz now = GetCurrentTimestamp();
 	bool is_root_of_actionable = false;
+	int direct_waiter = -1;
 	HangCandidate c;
 	int i;
 
@@ -811,6 +838,7 @@ cluster_hang_resolve_pid(int pid)
 		const ClusterHangSampleSlot *slot = &snap.slots[i];
 		PGPROC *wproc;
 		bool trunc = false;
+		int dw = -1;
 
 		if (!cluster_hang_sample_actionable(slot))
 			continue;
@@ -819,16 +847,18 @@ cluster_hang_resolve_pid(int pid)
 			continue;
 		/* require a provable root: a truncated/cyclic ascent that merely lands on
 		 * pid does not make it the root cause (fail-CLOSED, Hardening v1.1 F3) */
-		if (cluster_hang_root_blocker_pid(&snap, i, cluster_hang_max_chain_depth, &trunc) == pid
+		if (cluster_hang_root_blocker_pid(&snap, i, cluster_hang_max_chain_depth, &trunc, &dw)
+				== pid
 			&& !trunc) {
 			is_root_of_actionable = true;
+			direct_waiter = dw; /* bind the G-ABA edge to this sampled chain (v1.2) */
 			break;
 		}
 	}
 	if (!is_root_of_actionable)
 		return false;
 
-	hang_gather_candidate(&c, pid, 1, 0, lockData, now);
+	hang_gather_candidate(&c, pid, direct_waiter, 1, 0, lockData, now);
 	if (!c.valid || c.v.skip != HANG_VICTIM_OK)
 		return false; /* not a live regular backend / HARD-skip / not a lock holder */
 

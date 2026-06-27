@@ -243,11 +243,12 @@ extern bool cluster_hang_mode_dispatches(ClusterHangResolveMode mode); /* enforc
 /* root-first ascent over a sample-store snapshot: from start_slot follow
  * blocker_pid while the blocker is itself a sampled long-waiter, stopping at
  * the first blocker that is NOT a sampled waiter (the idle-in-tx root holder)
- * and returning its pid.  Cycle-guarded + depth-bounded; sets *truncated when
- * a cycle or the depth limit cut the walk short.  Returns -1 if the start
- * slot has no blocker. */
+ * and returning its pid.  *direct_waiter_pid (if non-NULL) returns the pid of
+ * the sampled waiter the root directly blocks (the chain edge for G-ABA, -1 if
+ * no root).  Cycle-guarded + depth-bounded; sets *truncated when a cycle or the
+ * depth limit cut the walk short.  Returns -1 if the start slot has no blocker. */
 extern int cluster_hang_root_blocker_pid(const ClusterHangSampleStore *store, int start_slot,
-										 int max_depth, bool *truncated);
+										 int max_depth, bool *truncated, int *direct_waiter_pid);
 
 /* confirmation / hysteresis state machine (operates on a plain map; the
  * runtime points it at the embedded DIAG-region map under the lock). */

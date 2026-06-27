@@ -256,6 +256,12 @@ cluster_hang_mode_dispatches(ClusterHangResolveMode mode)
  *	(the idle-in-tx root holder that does not wait), returning its pid.
  *	Killing the root unblocks the whole chain; killing a waiter is pointless.
  *
+ *	*direct_waiter_pid (when non-NULL) returns the pid of the sampled waiter the
+ *	returned root DIRECTLY blocks (the chain node immediately below the root) --
+ *	the disposition uses it to bind the G-ABA re-validate edge to THIS sampled
+ *	hang rather than to an arbitrary co-waiter the root also happens to block
+ *	(Hardening v1.2).  Set to -1 when no root is returned.
+ *
  *	Cycle-guarded (actionable already excludes confirmed deadlocks, but a
  *	torn snapshot could still show a cycle) and depth-bounded.  Sets
  *	*truncated when a cycle or the max_depth limit cut the walk short, and
@@ -264,7 +270,7 @@ cluster_hang_mode_dispatches(ClusterHangResolveMode mode)
  */
 int
 cluster_hang_root_blocker_pid(const ClusterHangSampleStore *store, int start_slot, int max_depth,
-							  bool *truncated)
+							  bool *truncated, int *direct_waiter_pid)
 {
 	int visited[CLUSTER_HANG_MAX_SAMPLES];
 	int n_visited = 0;
@@ -273,6 +279,8 @@ cluster_hang_root_blocker_pid(const ClusterHangSampleStore *store, int start_slo
 
 	if (truncated)
 		*truncated = false;
+	if (direct_waiter_pid)
+		*direct_waiter_pid = -1;
 	if (store == NULL || start_slot < 0 || start_slot >= store->n_samples)
 		return -1;
 
@@ -292,13 +300,19 @@ cluster_hang_root_blocker_pid(const ClusterHangSampleStore *store, int start_slo
 				break;
 			}
 		}
-		if (next < 0)
+		/* cur is the node directly blocked by bp -> the chain edge waiter */
+		if (next < 0) {
+			if (direct_waiter_pid)
+				*direct_waiter_pid = store->slots[cur].pid;
 			return bp; /* blocker is not sampled -> idle root holder */
+		}
 
 		/* must ascend one more hop -- enforce the depth bound */
 		if (depth >= max_depth) {
 			if (truncated)
 				*truncated = true;
+			if (direct_waiter_pid)
+				*direct_waiter_pid = store->slots[cur].pid;
 			return bp;
 		}
 
@@ -306,12 +320,16 @@ cluster_hang_root_blocker_pid(const ClusterHangSampleStore *store, int start_slo
 		if (next == start_slot) {
 			if (truncated)
 				*truncated = true;
+			if (direct_waiter_pid)
+				*direct_waiter_pid = store->slots[cur].pid;
 			return bp;
 		}
 		for (k = 0; k < n_visited; k++) {
 			if (visited[k] == next) {
 				if (truncated)
 					*truncated = true;
+				if (direct_waiter_pid)
+					*direct_waiter_pid = store->slots[cur].pid;
 				return bp;
 			}
 		}

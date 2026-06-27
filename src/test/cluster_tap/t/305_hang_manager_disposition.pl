@@ -369,6 +369,52 @@ eval { $w2pc->quit; };
 
 
 # ----------
+# L11: a root blocking MULTIPLE actionable waiters is genuinely disposed — the
+# G-ABA edge bound to the sampled chain (Hardening v1.2) must NOT over-reject a
+# real multi-waiter root; terminating it unblocks every waiter.
+# ----------
+$node->safe_psql('postgres', "ALTER SYSTEM SET cluster.hang_resolution_mode = enforce");
+$node->reload;
+$node->safe_psql('postgres', 'CREATE TABLE hangt_a (i int); CREATE TABLE hangt_b (i int)');
+
+# R: one idle-in-tx holder of BOTH tables -> blocks two unrelated waiters.
+my $hr2 = $node->background_psql('postgres', on_error_die => 1);
+$hr2->query_safe('BEGIN');
+$hr2->query_safe('LOCK TABLE hangt_a IN ACCESS EXCLUSIVE MODE');
+$hr2->query_safe('LOCK TABLE hangt_b IN ACCESS EXCLUSIVE MODE');
+my $r2pid = $hr2->query_safe('SELECT pg_backend_pid()');
+
+my $hwa = $node->background_psql('postgres', on_error_die => 1);
+my $wapid = $hwa->query_safe('SELECT pg_backend_pid()');
+bg_start_blocking($hwa, 'BEGIN; LOCK TABLE hangt_a IN ACCESS EXCLUSIVE MODE');
+my $hwb = $node->background_psql('postgres', on_error_die => 1);
+my $wbpid = $hwb->query_safe('SELECT pg_backend_pid()');
+bg_start_blocking($hwb, 'BEGIN; LOCK TABLE hangt_b IN ACCESS EXCLUSIVE MODE');
+ok(wait_for_lock_wait('%hangt_a%', 20), 'L11 waiter A blocks on the multi-lock root');
+ok(wait_for_lock_wait('%hangt_b%', 20), 'L11 waiter B blocks on the multi-lock root');
+
+ok(wait_for_gone($r2pid, 40),
+	'L11 multi-waiter root really TERMINATED (chain-bound edge did not over-reject)');
+# both waiters must unblock once the shared root is gone
+my $mw_dl = time() + 20;
+my ($a_ok, $b_ok) = (0, 0);
+while (time() < $mw_dl && !($a_ok && $b_ok))
+{
+	my $wa = $node->safe_psql('postgres',
+		"SELECT coalesce(wait_event_type,'') FROM pg_stat_activity WHERE pid = $wapid");
+	my $wb = $node->safe_psql('postgres',
+		"SELECT coalesce(wait_event_type,'') FROM pg_stat_activity WHERE pid = $wbpid");
+	$a_ok = 1 if !defined $wa || $wa ne 'Lock';
+	$b_ok = 1 if !defined $wb || $wb ne 'Lock';
+	usleep(200_000);
+}
+ok($a_ok && $b_ok, 'L11 both waiters unblocked after the multi-waiter root was terminated');
+eval { $hwa->quit; };
+eval { $hwb->quit; };
+$hr2 = undef;    # terminated; do not quit the dead handle
+
+
+# ----------
 # L10: fail-CLOSED on an unprovable (truncated) root chain (Hardening v1.1 F3).
 #
 # With cluster.hang_max_chain_depth = 1 a 3-deep wait chain
