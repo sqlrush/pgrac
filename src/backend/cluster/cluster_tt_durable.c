@@ -400,11 +400,13 @@ cluster_tt_slot_durable_lookup(uint32 segment_id, uint16 slot_offset, Transactio
 
 
 ClusterTTDurableResolve
-cluster_tt_slot_durable_resolve_by_xid(TransactionId xid, uint32 expected_wrap, SCN *commit_scn)
+cluster_tt_slot_durable_resolve_by_xid(TransactionId xid, uint32 expected_wrap, SCN *commit_scn,
+									   uint16 *out_seg, uint16 *out_slot, uint16 *out_wrap)
 {
-	/* spec-3.22 own-instance entry; the origin-qualified scan backs it. */
+	/* spec-3.22 own-instance entry; the origin-qualified scan backs it.
+	 * spec-5.55 D1: forward the optional match-identity out params. */
 	return cluster_tt_slot_durable_resolve_by_xid_origin(cluster_node_id, xid, expected_wrap,
-														 commit_scn);
+														 commit_scn, out_seg, out_slot, out_wrap);
 }
 
 
@@ -544,7 +546,8 @@ cluster_tt_recovery_classify_revert(bool is_delete_record, bool record_xid_abort
  */
 ClusterTTDurableResolve
 cluster_tt_slot_durable_resolve_by_xid_origin(int origin_node, TransactionId xid,
-											  uint32 expected_wrap, SCN *commit_scn)
+											  uint32 expected_wrap, SCN *commit_scn,
+											  uint16 *out_seg, uint16 *out_slot, uint16 *out_wrap)
 {
 	int node;
 	uint8 owner;
@@ -556,6 +559,11 @@ cluster_tt_slot_durable_resolve_by_xid_origin(int origin_node, TransactionId xid
 	bool match_has_valid_scn = false;
 	bool scan_complete = true;
 	SCN found = InvalidScn;
+	/* spec-5.55 D1: identity of the resolved match (only meaningful on RESOLVED_SCN,
+	 * which the classifier guarantees is exactly one valid-scn match). */
+	uint16 matched_seg = 0;
+	uint16 matched_slot = 0;
+	uint16 matched_wrap = 0;
 	ClusterTTDurableResolve result;
 
 	if (commit_scn == NULL)
@@ -620,6 +628,15 @@ cluster_tt_slot_durable_resolve_by_xid_origin(int origin_node, TransactionId xid
 				if (SCN_VALID(s->commit_scn)) {
 					match_has_valid_scn = true;
 					found = s->commit_scn;
+					/* spec-5.55 D1: capture the match identity.  segment_id is
+					 * bounded by CLUSTER_MAX_NODES * CLUSTER_UNDO_SEGS_PER_INSTANCE
+					 * = 32768 < UINT16_MAX (cluster_undo_alloc.h), so the uint16
+					 * cast never truncates.  On >1 matches the classifier returns
+					 * AMBIGUOUS_WRAP and these are NOT reported (out_* untouched
+					 * unless RESOLVED_SCN). */
+					matched_seg = (uint16)segment_id;
+					matched_slot = i;
+					matched_wrap = s->wrap;
 				}
 			}
 		}
@@ -627,8 +644,15 @@ cluster_tt_slot_durable_resolve_by_xid_origin(int origin_node, TransactionId xid
 	cluster_tt_durable_io_wait_end();
 
 	result = cluster_tt_durable_classify(xid_matches, match_has_valid_scn, scan_complete);
-	if (result == CLUSTER_TT_DURABLE_RESOLVED_SCN)
+	if (result == CLUSTER_TT_DURABLE_RESOLVED_SCN) {
 		*commit_scn = found;
+		if (out_seg != NULL)
+			*out_seg = matched_seg;
+		if (out_slot != NULL)
+			*out_slot = matched_slot;
+		if (out_wrap != NULL)
+			*out_wrap = matched_wrap;
+	}
 	return result;
 }
 
@@ -641,7 +665,8 @@ cluster_tt_slot_durable_lookup_by_xid(TransactionId xid, SCN *commit_scn)
 	 * (true IFF exactly one resolved match; every other enum -> false).  The
 	 * xmax-side gate (spec-3.22) consumes the enum directly via resolve_by_xid.
 	 */
-	return cluster_tt_slot_durable_resolve_by_xid(xid, CLUSTER_TT_WRAP_ANY, commit_scn)
+	return cluster_tt_slot_durable_resolve_by_xid(xid, CLUSTER_TT_WRAP_ANY, commit_scn, NULL, NULL,
+												  NULL)
 		   == CLUSTER_TT_DURABLE_RESOLVED_SCN;
 }
 

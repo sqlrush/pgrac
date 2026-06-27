@@ -482,7 +482,8 @@ UT_TEST(test_resolve_zero_match_recycled)
 	memset(g_canned_block, 0, sizeof(g_canned_block));
 	/* slot recycled to a DIFFERENT owner xid -> 0 matches for the target. */
 	seed_block_slot(5, TT_SLOT_COMMITTED, 999, scn_encode(1, 50));
-	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, CLUSTER_TT_WRAP_ANY, &got),
+	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, CLUSTER_TT_WRAP_ANY, &got, NULL,
+															 NULL, NULL),
 				 (int)CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH);
 	UT_ASSERT_EQ((int)SCN_VALID(got), 0); /* commit_scn cleared on non-RESOLVED */
 }
@@ -494,9 +495,41 @@ UT_TEST(test_resolve_one_valid_resolved)
 	g_unreadable_existing_segment = 0;
 	memset(g_canned_block, 0, sizeof(g_canned_block));
 	seed_block_slot(3, TT_SLOT_COMMITTED, 12345, scn_encode(1, 77));
-	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, CLUSTER_TT_WRAP_ANY, &got),
+	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, CLUSTER_TT_WRAP_ANY, &got, NULL,
+															 NULL, NULL),
 				 (int)CLUSTER_TT_DURABLE_RESOLVED_SCN);
 	UT_ASSERT_EQ((int)(scn_local(got)), 77);
+}
+/* spec-5.55 D1/U1: RESOLVED_SCN also reports the matched durable slot identity
+ * (out_seg/out_slot/out_wrap) for the shared resolver cache position hint; NULL
+ * out params (legacy callers) resolve unchanged. */
+UT_TEST(test_resolve_reports_matched_identity)
+{
+	SCN got = InvalidScn;
+	uint16 seg = 0xffff;
+	uint16 slot = 0xffff;
+	uint16 wrap = 0xffff;
+
+	cluster_node_id = 0;
+	g_unreadable_existing_segment = 0;
+	memset(g_canned_block, 0, sizeof(g_canned_block));
+	seed_block_slot(5, TT_SLOT_COMMITTED, 12345, scn_encode(1, 77));
+	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, CLUSTER_TT_WRAP_ANY, &got, &seg,
+															 &slot, &wrap),
+				 (int)CLUSTER_TT_DURABLE_RESOLVED_SCN);
+	UT_ASSERT_EQ((int)seg, 1);	/* g_canned_block answers for segment_id 1 */
+	UT_ASSERT_EQ((int)slot, 5); /* the seeded slot offset */
+	UT_ASSERT_EQ((int)wrap, 0); /* seeded wrap default */
+
+	/* a 0-match (RECYCLED) leaves the out params untouched (only set on RESOLVED). */
+	seg = slot = wrap = 0xffff;
+	memset(g_canned_block, 0, sizeof(g_canned_block));
+	seed_block_slot(5, TT_SLOT_COMMITTED, 999, scn_encode(1, 50)); /* different xid */
+	got = InvalidScn;
+	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, CLUSTER_TT_WRAP_ANY, &got, &seg,
+															 &slot, &wrap),
+				 (int)CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH);
+	UT_ASSERT_EQ((int)seg, 0xffff); /* untouched on non-RESOLVED */
 }
 UT_TEST(test_resolve_xid_match_invalid_scn_not_recycled)
 {
@@ -509,7 +542,8 @@ UT_TEST(test_resolve_xid_match_invalid_scn_not_recycled)
 	g_unreadable_existing_segment = 0;
 	memset(g_canned_block, 0, sizeof(g_canned_block));
 	seed_block_slot(7, TT_SLOT_COMMITTED, 12345, InvalidScn);
-	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, CLUSTER_TT_WRAP_ANY, &got),
+	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, CLUSTER_TT_WRAP_ANY, &got, NULL,
+															 NULL, NULL),
 				 (int)CLUSTER_TT_DURABLE_XID_MATCH_INVALID_SCN);
 	UT_ASSERT_EQ((int)SCN_VALID(got), 0);
 }
@@ -522,7 +556,8 @@ UT_TEST(test_resolve_two_match_ambiguous)
 	memset(g_canned_block, 0, sizeof(g_canned_block));
 	seed_block_slot(3, TT_SLOT_COMMITTED, 12345, scn_encode(1, 77));
 	seed_block_slot(9, TT_SLOT_COMMITTED, 12345, scn_encode(1, 88));
-	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, CLUSTER_TT_WRAP_ANY, &got),
+	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, CLUSTER_TT_WRAP_ANY, &got, NULL,
+															 NULL, NULL),
 				 (int)CLUSTER_TT_DURABLE_AMBIGUOUS_WRAP);
 }
 UT_TEST(test_resolve_node_degraded_unavailable)
@@ -532,7 +567,8 @@ UT_TEST(test_resolve_node_degraded_unavailable)
 	/* single-node degraded: NO durable scan possible -> SCAN_UNAVAILABLE,
 	 * never a 0-match (which would false-prove "recycled below horizon"). */
 	cluster_node_id = -1;
-	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, CLUSTER_TT_WRAP_ANY, &got),
+	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, CLUSTER_TT_WRAP_ANY, &got, NULL,
+															 NULL, NULL),
 				 (int)CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE);
 	cluster_node_id = 0; /* restore for later tests */
 }
@@ -546,7 +582,8 @@ UT_TEST(test_resolve_unreadable_existing_segment_unavailable)
 	cluster_node_id = 0;
 	memset(g_canned_block, 0, sizeof(g_canned_block));
 	g_unreadable_existing_segment = 2;
-	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, CLUSTER_TT_WRAP_ANY, &got),
+	UT_ASSERT_EQ((int)cluster_tt_slot_durable_resolve_by_xid(12345, CLUSTER_TT_WRAP_ANY, &got, NULL,
+															 NULL, NULL),
 				 (int)CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE);
 	g_unreadable_existing_segment = 0; /* restore */
 }
@@ -857,7 +894,7 @@ UT_TEST(test_revert_delete_identity_mismatch_failclosed)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(56);
+	UT_PLAN(57);
 
 	UT_RUN(test_layout_sizes);
 
@@ -889,6 +926,7 @@ main(int argc, char **argv)
 	UT_RUN(test_classify_incomplete_scan_is_unavailable);
 	UT_RUN(test_resolve_zero_match_recycled);
 	UT_RUN(test_resolve_one_valid_resolved);
+	UT_RUN(test_resolve_reports_matched_identity);
 	UT_RUN(test_resolve_xid_match_invalid_scn_not_recycled);
 	UT_RUN(test_resolve_two_match_ambiguous);
 	UT_RUN(test_resolve_node_degraded_unavailable);

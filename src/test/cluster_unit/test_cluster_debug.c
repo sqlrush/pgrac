@@ -374,6 +374,82 @@ cluster_cr_pool_live_entries(void)
 	return 0;
 }
 
+/* spec-5.55 dump resolver_cache stubs: cluster_debug.c's dump reads the shared
+ * resolver cache counters, but this standalone binary does not link
+ * cluster_resolver_cache.o. */
+uint64 cluster_resolver_cache_lookup_count(void);
+uint64 cluster_resolver_cache_key_present_count(void);
+uint64 cluster_resolver_cache_epoch_miss_count(void);
+uint64 cluster_resolver_cache_hit_count(void);
+uint64 cluster_resolver_cache_revalidate_miss_count(void);
+uint64 cluster_resolver_cache_acceptance_pass_count(void);
+uint64 cluster_resolver_cache_acceptance_failclosed_count(void);
+uint64 cluster_resolver_cache_install_count(void);
+uint64 cluster_resolver_cache_evict_count(void);
+uint64 cluster_resolver_cache_nonown_skip_count(void);
+uint64 cluster_resolver_cache_nonterminal_skip_count(void);
+int cluster_resolver_cache_live_entries(void);
+uint64
+cluster_resolver_cache_lookup_count(void)
+{
+	return 0;
+}
+uint64
+cluster_resolver_cache_key_present_count(void)
+{
+	return 0;
+}
+uint64
+cluster_resolver_cache_epoch_miss_count(void)
+{
+	return 0;
+}
+uint64
+cluster_resolver_cache_hit_count(void)
+{
+	return 0;
+}
+uint64
+cluster_resolver_cache_revalidate_miss_count(void)
+{
+	return 0;
+}
+uint64
+cluster_resolver_cache_acceptance_pass_count(void)
+{
+	return 0;
+}
+uint64
+cluster_resolver_cache_acceptance_failclosed_count(void)
+{
+	return 0;
+}
+uint64
+cluster_resolver_cache_install_count(void)
+{
+	return 0;
+}
+uint64
+cluster_resolver_cache_evict_count(void)
+{
+	return 0;
+}
+uint64
+cluster_resolver_cache_nonown_skip_count(void)
+{
+	return 0;
+}
+uint64
+cluster_resolver_cache_nonterminal_skip_count(void)
+{
+	return 0;
+}
+int
+cluster_resolver_cache_live_entries(void)
+{
+	return 0;
+}
+
 /* spec-5.7 dump_hw stubs: cluster_debug.c's dump_hw reads the HW counters, but
  * this standalone binary does not link cluster_hw_shmem.o. */
 uint64 cluster_hw_alloc_count(void);

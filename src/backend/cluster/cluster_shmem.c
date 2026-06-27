@@ -103,8 +103,9 @@
 #include "cluster/cluster_cr.h"				 /* cluster_cr_shmem_register (spec-3.9 D2) */
 #include "cluster/cluster_cr_pool.h"		 /* cluster_cr_pool_shmem_register (spec-5.51 D1) */
 #include "cluster/cluster_cr_admit.h"		 /* cluster_cr_admit_shmem_register (spec-5.52 D9) */
-#include "cluster/cluster_cr_tuple.h"	/* cluster_cr_tuple_stat_shmem_register (spec-5.54 D5) */
-#include "cluster/cluster_tt_durable.h" /* cluster_tt_durable_shmem_register (spec-3.11 D7) */
+#include "cluster/cluster_cr_tuple.h" /* cluster_cr_tuple_stat_shmem_register (spec-5.54 D5) */
+#include "cluster/cluster_resolver_cache.h" /* cluster_resolver_cache_shmem_register (spec-5.55 D3) */
+#include "cluster/cluster_tt_durable.h"		/* cluster_tt_durable_shmem_register (spec-3.11 D7) */
 #include "cluster/cluster_visibility_inject.h" /* cluster_visibility_inject_shmem_register (spec-3.2 D5b) */
 #include "cluster/cluster_itl.h"			   /* cluster_lock_path_shmem_register (spec-3.4e D6) */
 #include "cluster/cluster_qvotec.h" /* cluster_qvotec_shmem_register (spec-2.6 Sprint A Step 1) */
@@ -517,6 +518,11 @@ cluster_init_shmem_module(void)
 	 * registered so the shmem-region-count baseline is deterministic. */
 	cluster_cr_tuple_stat_shmem_register();
 
+	/* spec-5.55 D3: shared resolver cache (CR Source 3 by-xid search-shortcut
+	 * memo).  Always registered (deterministic region count); size_fn returns 0
+	 * unless cluster.resolver_cache_measure is on with entries > 0. */
+	cluster_resolver_cache_shmem_register();
+
 	/*
 	 * PGRAC spec-3.11 D7:  register durable TT slot counters shmem region
 	 * (commit / lookup hit-miss / by-xid scan / redo apply; 5 atomic
@@ -830,7 +836,8 @@ cluster_request_shmem(void)
 	 * without re-triggering RequestNamedLWLockTranche.
 	 */
 	cluster_grd_request_lwlocks();
-	cluster_cr_pool_request_lwlocks(); /* spec-5.51: CR pool named LWLock tranche */
+	cluster_cr_pool_request_lwlocks();		  /* spec-5.51: CR pool named LWLock tranche */
+	cluster_resolver_cache_request_lwlocks(); /* spec-5.55: resolver cache LWLock tranche */
 	cluster_ges_dedup_shmem_request();
 
 	/*
