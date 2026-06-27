@@ -292,7 +292,7 @@ cluster_remote_outcome_durable_checked(int origin_node, TransactionId xid, SCN *
 	 */
 	if (!outcome_wrap_valid
 		|| cluster_tt_slot_durable_resolve_by_xid_origin(origin_node, xid, (uint32)outcome_wrap,
-														 &durable_scn)
+														 &durable_scn, NULL, NULL, NULL)
 			   != CLUSTER_TT_DURABLE_RESOLVED_SCN
 		|| durable_scn != outcome_scn) {
 		if (RemoteXactShared != NULL)

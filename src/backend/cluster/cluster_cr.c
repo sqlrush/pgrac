@@ -60,6 +60,7 @@
 #include "cluster/cluster_touched_peers.h" /* PGRAC: spec-5.14 D2 class 4 */
 #include "cluster/cluster_itl_slot.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_resolver_cache.h"		/* spec-5.55 D0: by-xid scan measure hook */
 #include "cluster/cluster_tt_durable.h"			/* spec-3.11 D6: watermark by-xid resolve */
 #include "cluster/cluster_tt_slot.h"			/* spec-3.22: retention_off_recycle_count */
 #include "cluster/cluster_undo_retention.h"		/* spec-3.22: retention horizon proof */
@@ -1323,6 +1324,36 @@ cluster_cr_count_xmax_scan_unavail_or_no_proof(void)
 }
 
 /*
+ * cluster_cr_accept_resolved_scn -- spec-4.8 D3 acceptance gate for a Source 3
+ *	by-xid RESOLVED match, extracted (spec-5.55 D6) so the fresh-scan path AND a
+ *	shared-resolver-cache memo hit run the PHYSICALLY SAME gate (gate (3),
+ *	verdict-equivalent by construction -- they cannot drift).
+ *
+ *	The durable scan runs WRAP_ANY (a recycled scratch ITL slot carries no
+ *	binding wrap), so a single COMMITTED match cannot tell a genuine commit from a
+ *	2^32-wrapped raw-xid collision.  When retention is unreliable AND the match is
+ *	below the CURRENT horizon it is wrap-suspect -> fail closed (规则 8.A: a wrong
+ *	deleter scn would false-hide a live row); the existing
+ *	wrap_generation_disambiguated observability is bumped.  The reliability proof
+ *	is the EXACT sticky condition (horizon enabled AND no retention-off recycle
+ *	this incarnation), not an abstraction -- losing the sticky leg would re-trust
+ *	a retention-off-window recycle.  Returns true to ACCEPT (RESOLVED).
+ */
+static bool
+cluster_cr_accept_resolved_scn(SCN scn)
+{
+	bool retention_reliable = cluster_undo_retention_horizon_enabled
+							  && cluster_tt_slot_retention_off_recycle_count() == 0;
+
+	if (cluster_tt_recovery_wrap_suspect(CLUSTER_TT_WRAP_ANY, scn, cluster_undo_retention_horizon(),
+										 retention_reliable)) {
+		cluster_tt_recovery_count_wrap_generation_disambiguated();
+		return false; /* suspect -> fail closed */
+	}
+	return true;
+}
+
+/*
  * cluster_cr_resolve_xmax_commit_scn -- resolve the EXACT commit_scn of a
  * committed own-instance deleter (cr_xmax) recorded on a CR image, for the
  * spec-3.21 xmax-side visibility decision.  Returns true + *out_scn on success.
@@ -1347,6 +1378,11 @@ cluster_cr_resolve_xmax_commit_scn(const char *cr_page, uint8 itl_idx, Transacti
 {
 	Page page = (Page)cr_page; /* read-only ITL access on the scratch image */
 	uint32 expected_wrap = CLUSTER_TT_WRAP_ANY;
+	/* spec-5.55 D1: Source 3 RESOLVED also reports the matched durable slot
+	 * identity, cached as a position hint by the shared resolver cache (D5). */
+	uint16 resolved_seg = 0;
+	uint16 resolved_slot = 0;
+	uint16 resolved_wrap = 0;
 
 	*out_scn = InvalidScn;
 
@@ -1398,32 +1434,60 @@ cluster_cr_resolve_xmax_commit_scn(const char *cr_page, uint8 itl_idx, Transacti
 	}
 
 	/*
+	 * spec-5.55 D6: shared resolver cache search-shortcut.  In TRUST mode a memo
+	 * hit re-validates the single hint slot in O(1) (gate (1)+(2)+(4)) and runs the
+	 * PHYSICALLY SAME acceptance gate the fresh scan runs (gate (3)), resolving
+	 * WITHOUT the O(segments) scan below -- verdict-equivalent by construction.  In
+	 * MEASURE/off mode the authoritative scan still runs (measure still records the
+	 * would-hit counters).  origin == own node (Source 3 is own-instance, gate (5)).
+	 */
+	{
+		SCN hint_scn = InvalidScn;
+
+		if (cluster_resolver_cache_probe((uint16)cluster_node_id, cr_xmax, &hint_scn)) {
+			bool accepted = cluster_cr_accept_resolved_scn(hint_scn);
+
+			cluster_resolver_cache_count_acceptance(accepted);
+			if (cluster_resolver_cache_trust()) {
+				if (!accepted) {
+					*out_scn = InvalidScn; /* same fail-closed as the fresh-scan branch */
+					return CLUSTER_CR_XMAX_INVALID_OR_AMBIGUOUS;
+				}
+				*out_scn = hint_scn; /* gate (1): durable re-read, verdict-equivalent */
+				return CLUSTER_CR_XMAX_RESOLVED_SCN;
+			}
+			/* MEASURE: never trust the hint -- fall through to the authoritative scan. */
+		}
+	}
+
+	/*
 	 * Source 3: durable TT by exact xid (survives ITL slot recycle).  spec-3.22:
 	 * consume the finer-grained resolve enum so a 0-match (RECYCLED_ZERO_MATCH ->
 	 * provably below horizon, IF the gate's retention proof holds) is no longer
 	 * conflated with a delayed-cleanout / wrap / unreadable miss (all fail closed).
 	 */
-	switch (cluster_tt_slot_durable_resolve_by_xid(cr_xmax, expected_wrap, out_scn)) {
+	switch (cluster_tt_slot_durable_resolve_by_xid(cr_xmax, expected_wrap, out_scn, &resolved_seg,
+												   &resolved_slot, &resolved_wrap)) {
 	case CLUSTER_TT_DURABLE_RESOLVED_SCN:
 		/*
-		 * spec-4.8 D3 (task#90): the durable scan above ran WRAP_ANY (a
-		 * recycled scratch ITL slot carries no binding wrap here), so a single
-		 * COMMITTED match cannot tell a genuine commit from a 2^32-wrapped
-		 * raw-xid collision.  When retention is unreliable AND the match is
-		 * below the horizon it is wrap-suspect -> fail closed (narrowed
-		 * AMBIGUOUS_WRAP), never resolve to its commit_scn (规则 8.A: a wrong
-		 * deleter scn would false-hide a live row).  With retention reliable a
-		 * below-horizon collision's slot is already recycled (0-match), so a
-		 * below-horizon 1-match is a legit recycle-lag commit -> trusted.
+		 * spec-4.8 D3 acceptance (now the shared cluster_cr_accept_resolved_scn
+		 * helper, spec-5.55 D6, gate (3)): the durable scan ran WRAP_ANY so a
+		 * single COMMITTED match below the horizon with unreliable retention is
+		 * wrap-suspect -> fail closed (规则 8.A: a wrong deleter scn would false-
+		 * hide a live row).  A memo hit above ran the SAME helper.
 		 */
-		if (cluster_tt_recovery_wrap_suspect(
-				expected_wrap, *out_scn, cluster_undo_retention_horizon(),
-				cluster_undo_retention_horizon_enabled
-					&& cluster_tt_slot_retention_off_recycle_count() == 0)) {
+		if (!cluster_cr_accept_resolved_scn(*out_scn)) {
 			*out_scn = InvalidScn;
-			cluster_tt_recovery_count_wrap_generation_disambiguated();
 			return CLUSTER_CR_XMAX_INVALID_OR_AMBIGUOUS;
 		}
+		/*
+		 * spec-5.55 D5: cache the matched {seg,slot,wrap} position hint (own-
+		 * instance gate (5) + COMMITTED gate (6) + acceptance-passed) so a peer
+		 * backend can re-validate it in O(1) instead of re-scanning every segment.
+		 * No-op unless the memo region is live.
+		 */
+		cluster_resolver_cache_install((uint16)cluster_node_id, cr_xmax, resolved_seg,
+									   resolved_slot, resolved_wrap, *out_scn);
 		return CLUSTER_CR_XMAX_RESOLVED_SCN; /* *out_scn set by the resolve */
 	case CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH:
 		*out_scn = InvalidScn;

@@ -46,6 +46,7 @@
 #include "cluster/cluster_cr_cache.h"		 /* cluster_cr_cache_max_blocks (spec-3.10 D4) */
 #include "cluster/cluster_grd.h"			 /* spec-5.10 starvation-protection shared flag */
 #include "cluster/cluster_cr_pool.h"		 /* cluster_shared_cr_pool_* (spec-5.51 D8) */
+#include "cluster/cluster_resolver_cache.h"	 /* cluster_shared_resolver_cache_* (spec-5.55 D7) */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_hang.h"			  /* CLUSTER_HANG_MAX_SAMPLES (spec-5.11 D7) */
 #include "cluster/cluster_hang_resolve.h"	  /* HANG_RESOLVE_* + disposition GUCs (spec-5.12 D6) */
@@ -2590,6 +2591,46 @@ cluster_init_guc(void)
 					 "(negative feedback) so a thrashing pool can stabilize. Advisory; only "
 					 "affects hit/miss. The threshold is pending spec-5.58 calibration."),
 		&cluster_cr_pool_admit_pressure_ratio, 0, 0, 100000, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	/* spec-5.55 D7: shared resolver cache (CR Source 3 by-xid search-shortcut
+	 * memo).  Both PGC_POSTMASTER: the entry count + measure switch are final at
+	 * shmem reservation.  Default entries 0 / measure off = true zero memory (the
+	 * region is registered but reserves 0 bytes), so the spec-3.22 by-xid path is
+	 * byte-identical.  v1 ships in MEASURE mode only (the value gate, §0.6): it
+	 * always re-runs the authoritative scan and never trusts the hint -- the
+	 * trust path (flip-on) is gated on measured redundancy + re-probe hit rate. */
+	DefineCustomBoolVariable(
+		"cluster.resolver_cache_enabled",
+		gettext_noop("Enable spec-5.55 shared resolver cache TRUST mode (skip the by-xid scan on a "
+					 "re-validated + accepted hint)."),
+		gettext_noop("Spec-5.55. Default off. When on (with resolver_cache_entries > 0), a CR "
+					 "Source 3 by-xid resolution that hits the shared memo re-validates the hint "
+					 "slot in O(1) and re-runs the SAME wrap_suspect acceptance as a fresh scan, "
+					 "resolving WITHOUT the O(segments) scan (verdict-equivalent by construction). "
+					 "The recommended non-zero default is bound to the §0.6 value gate evidence "
+					 "(spec-5.58). PGC_POSTMASTER: requires a restart."),
+		&cluster_resolver_cache_enabled, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"cluster.resolver_cache_measure",
+		gettext_noop("Enable spec-5.55 shared resolver cache MEASURE mode (value gate, no trust)."),
+		gettext_noop("Spec-5.55 §0.6. Default off. When on (with resolver_cache_entries > 0), CR "
+					 "Source 3 records whether its own-instance by-xid scan result was already "
+					 "memoized by a peer backend and whether an O(1) re-validation + acceptance "
+					 "would have passed -- the cross-backend redundancy + re-probe hit rate that "
+					 "gate the trust path.  Never changes a visibility verdict (the authoritative "
+					 "scan always runs).  Orthogonal to resolver_cache_enabled.  PGC_POSTMASTER."),
+		&cluster_resolver_cache_measure, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.resolver_cache_entries",
+		gettext_noop("Shared resolver cache hint-slot count (0 = disabled / zero memory)."),
+		gettext_noop("Spec-5.55 D3/D7. Default 0 (true zero memory; the region is registered but "
+					 "reserves 0 bytes).  PGC_POSTMASTER: requires a restart.  The recommended "
+					 "non-zero default + sizing are bound to the §0.6 measure-leg value gate "
+					 "evidence (spec-5.58); resolver_cache_measure must also be on to allocate. "
+					 "Each hint slot costs a few dozen bytes of shared memory."),
+		&cluster_shared_resolver_cache_entries, 0, 0, 1048576, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
 		"cluster.boc_sweep_interval_ms",

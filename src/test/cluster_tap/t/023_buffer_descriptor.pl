@@ -61,7 +61,7 @@ my $has_visibility_inject =
 # admission reason counters; +1 "pgrac cluster clean_leave" (spec-5.13); +1
 # "pgrac cluster cr relgen" (spec-5.56 D4); +1 "pgrac cluster cr tuple stats"
 # (spec-5.54 D5); full list + count lives in t/020).
-  my $expected_region_count = $has_visibility_inject ? '65' : '64';
+  my $expected_region_count = $has_visibility_inject ? '66' : '65'; # spec-5.55 +1 resolver cache
 
 
 # ----------
@@ -168,8 +168,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT category) FROM pg_cluster_state}),
-   '48',
-   'L12 pg_cluster_state has 48 categories (spec-5.11 adds hang; spec-5.51 adds cr_pool; spec-5.14 adds reconfig_touched; spec-5.15 adds reconfig_join)');
+   '49',
+   'L12 pg_cluster_state has 49 categories (spec-5.11 adds hang; spec-5.51 adds cr_pool; spec-5.14 adds reconfig_touched; spec-5.15 adds reconfig_join; spec-5.55 adds resolver_cache)');
 
 
 # ----------
@@ -232,7 +232,7 @@ is($node->safe_psql('postgres',
 my $smoke_categories = $node->safe_psql(
 	'postgres',
 	q{SELECT count(DISTINCT category) FROM pg_cluster_state});
-is($smoke_categories, '48', 'L16 cluster_smoke surface integrates buffer_format + pcm + gcs + tt_status + tt_status_hint + tt_2pc + tt_recovery + visibility + wal_thread + dl + hw + ir + ko + ts categories (48 categories;spec-5.11 adds hang;spec-5.51 adds cr_pool;spec-5.14 adds reconfig_touched;spec-5.15 adds reconfig_join)');
+is($smoke_categories, '49', 'L16 cluster_smoke surface integrates buffer_format + pcm + gcs + tt_status + tt_status_hint + tt_2pc + tt_recovery + visibility + wal_thread + dl + hw + ir + ko + ts categories (49 categories;spec-5.11 adds hang;spec-5.51 adds cr_pool;spec-5.14 adds reconfig_touched;spec-5.15 adds reconfig_join; spec-5.55 adds resolver_cache)');
 
 
 # ----------

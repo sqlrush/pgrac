@@ -246,6 +246,12 @@ bool cluster_shared_cr_pool_enabled = false;
 int cluster_shared_cr_pool_size_blocks = 0;
 int cluster_cr_pool_rel_generation_slots = 0; /* spec-5.56 D4 link-only stub */
 
+/* spec-5.55 stub: resolver cache GUC storage lives in cluster_resolver_cache.c
+ * (not linked here); cluster_guc.c references the externs via DefineCustom*. */
+bool cluster_resolver_cache_enabled = false;
+bool cluster_resolver_cache_measure = false;
+int cluster_shared_resolver_cache_entries = 0;
+
 /* spec-3.10 stub: cluster_cr_cache_max_blocks lives in cluster_cr_cache.c
  * (not linked here); cluster_guc.c references it via DefineCustomIntVariable. */
 int cluster_cr_cache_max_blocks = 64;

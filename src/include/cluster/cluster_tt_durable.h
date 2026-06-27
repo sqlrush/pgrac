@@ -173,10 +173,10 @@ extern void cluster_tt_slot_durable_set_head(uint32 segment_id, uint16 slot_offs
  */
 extern bool cluster_tt_slot_durable_lookup(uint32 segment_id, uint16 slot_offset, TransactionId xid,
 										   uint32 expected_wrap, SCN *commit_scn);
-extern ClusterTTDurableResolve cluster_tt_slot_durable_resolve_by_xid_origin(int origin_node,
-																			 TransactionId xid,
-																			 uint32 expected_wrap,
-																			 SCN *commit_scn);
+extern ClusterTTDurableResolve
+cluster_tt_slot_durable_resolve_by_xid_origin(int origin_node, TransactionId xid,
+											  uint32 expected_wrap, SCN *commit_scn,
+											  uint16 *out_seg, uint16 *out_slot, uint16 *out_wrap);
 
 /*
  * cluster_tt_slot_durable_lookup_by_xid -- scan the local node's undo segment
@@ -203,9 +203,17 @@ extern bool cluster_tt_slot_durable_lookup_by_xid(TransactionId xid, SCN *commit
  *	node (SCAN_UNAVAILABLE) from a genuine 0-match, so the xmax gate can only treat
  *	a 0-match as proof-of-below-horizon after a complete scan.  Sets *commit_scn on
  *	RESOLVED_SCN, else InvalidScn.
+ *
+ *	spec-5.55 D1: optional out_seg/out_slot/out_wrap report the matched durable TT
+ *	slot identity (held at the match point) on RESOLVED_SCN -- the shared resolver
+ *	cache caches this {seg,slot,wrap} as a SEARCH position hint so a peer backend
+ *	can re-validate the slot in O(1) instead of re-running the O(segments) scan.
+ *	NULL = legacy callers; the resolve/classify verdict and the TTSlot on-disk ABI
+ *	are unchanged (no catversion bump).
  */
 extern ClusterTTDurableResolve
-cluster_tt_slot_durable_resolve_by_xid(TransactionId xid, uint32 expected_wrap, SCN *commit_scn);
+cluster_tt_slot_durable_resolve_by_xid(TransactionId xid, uint32 expected_wrap, SCN *commit_scn,
+									   uint16 *out_seg, uint16 *out_slot, uint16 *out_wrap);
 
 
 /*

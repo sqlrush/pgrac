@@ -433,6 +433,19 @@ void
 cluster_cr_pool_request_lwlocks(void)
 {}
 
+/* spec-5.55 stub: cluster_init_shmem_module also registers the shared resolver
+ * cache region + its LWLock tranche (cluster_resolver_cache.c is not linked into
+ * this standalone test).  The GUC storage gates the region, so stub those too. */
+bool cluster_resolver_cache_enabled = false;
+bool cluster_resolver_cache_measure = false;
+int cluster_shared_resolver_cache_entries = 0;
+void
+cluster_resolver_cache_shmem_register(void)
+{}
+void
+cluster_resolver_cache_request_lwlocks(void)
+{}
+
 /* spec-5.2 D4/D6 stub: cluster_init_shmem_module also calls
  * cluster_tx_enqueue_shmem_register. */
 void

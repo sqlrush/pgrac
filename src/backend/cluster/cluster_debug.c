@@ -99,6 +99,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_cr_pool.h"		  /* cluster_cr_pool_* counters (spec-5.51 D9) */
 #include "cluster/cluster_cr_admit.h"		  /* cluster_cr_admit_stat_* counters (spec-5.52 D9) */
 #include "cluster/cluster_cr_tuple.h"		  /* cluster_cr_tuple_stat_* counters (spec-5.54 D5) */
+#include "cluster/cluster_resolver_cache.h"	  /* cluster_resolver_cache_* counters (spec-5.55 D8) */
 #include "cluster/cluster_wal_state.h"		  /* wal_state registry dump (spec-4.2 D5) */
 #include "cluster/cluster_wal_thread.h"		  /* wal_thread dump accessors (spec-4.1 D7) */
 #include "cluster/cluster_tt_durable.h"		  /* cluster_tt_durable_* counters (spec-3.11 D8) */
@@ -2436,6 +2437,34 @@ dump_cr(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_cr_admit_stat_count(CR_ADMIT_REASON_REJECT_RELCAP)));
 	emit_row(rsinfo, "cr_pool", "admit_reject_pressure",
 			 fmt_int64((int64)cluster_cr_admit_stat_count(CR_ADMIT_REASON_REJECT_PRESSURE)));
+
+	/* spec-5.55 D8: shared resolver cache (CR Source 3 by-xid search-shortcut)
+	 * counters.  All 0 unless resolver_cache_enabled / _measure is on.  These feed
+	 * the §0.6 value gate: redundancy = key_present / lookup, re-probe hit rate =
+	 * hit / key_present, acceptance pass rate = acceptance_pass / hit. */
+	emit_row(rsinfo, "resolver_cache", "lookup",
+			 fmt_int64((int64)cluster_resolver_cache_lookup_count()));
+	emit_row(rsinfo, "resolver_cache", "key_present",
+			 fmt_int64((int64)cluster_resolver_cache_key_present_count()));
+	emit_row(rsinfo, "resolver_cache", "epoch_miss",
+			 fmt_int64((int64)cluster_resolver_cache_epoch_miss_count()));
+	emit_row(rsinfo, "resolver_cache", "hit", fmt_int64((int64)cluster_resolver_cache_hit_count()));
+	emit_row(rsinfo, "resolver_cache", "revalidate_miss",
+			 fmt_int64((int64)cluster_resolver_cache_revalidate_miss_count()));
+	emit_row(rsinfo, "resolver_cache", "acceptance_pass",
+			 fmt_int64((int64)cluster_resolver_cache_acceptance_pass_count()));
+	emit_row(rsinfo, "resolver_cache", "acceptance_failclosed",
+			 fmt_int64((int64)cluster_resolver_cache_acceptance_failclosed_count()));
+	emit_row(rsinfo, "resolver_cache", "install",
+			 fmt_int64((int64)cluster_resolver_cache_install_count()));
+	emit_row(rsinfo, "resolver_cache", "evict",
+			 fmt_int64((int64)cluster_resolver_cache_evict_count()));
+	emit_row(rsinfo, "resolver_cache", "nonown_skip",
+			 fmt_int64((int64)cluster_resolver_cache_nonown_skip_count()));
+	emit_row(rsinfo, "resolver_cache", "nonterminal_skip",
+			 fmt_int64((int64)cluster_resolver_cache_nonterminal_skip_count()));
+	emit_row(rsinfo, "resolver_cache", "live_entries",
+			 fmt_int64((int64)cluster_resolver_cache_live_entries()));
 }
 
 
