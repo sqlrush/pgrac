@@ -80,9 +80,11 @@ my $has_visibility_inject =
 # +1 for the unconditional "pgrac cluster cr admit stats" region (spec-5.52 D9;
 # independent admission reason counters, always registered; sorts between
 # "control" and "cr counters").
-my $expected_region_count = $has_visibility_inject ? '63' : '62'; # +1 spec-5.54 cr tuple stats
+# spec-5.13 D2: +1 for the "pgrac cluster clean_leave" region (always registered;
+# sorts between "cf stats" and "conf").
+my $expected_region_count = $has_visibility_inject ? '64' : '63';
 my $expected_regions =
-  'pgrac block recovery,pgrac cluster advisory,pgrac cluster cf stats,pgrac cluster conf,pgrac cluster control,pgrac cluster cr admit stats,pgrac cluster cr counters,pgrac cluster cr pool,pgrac cluster cr tuple stats,pgrac cluster cssd,pgrac cluster diag,pgrac cluster dl,pgrac cluster durable tt counters,pgrac cluster epoch,pgrac cluster fence,pgrac cluster gcs,pgrac cluster gcs block,pgrac cluster gcs block dedup,pgrac cluster ges,pgrac cluster ges dedup,pgrac cluster ges reply wait,pgrac cluster grd,pgrac cluster grd outbound,pgrac cluster grd pending,pgrac cluster grd work queue,pgrac cluster hw,pgrac cluster ir,pgrac cluster ko,pgrac cluster lck,pgrac cluster lmd,pgrac cluster lmd graph,pgrac cluster lmd probe,pgrac cluster lmon,pgrac cluster lms,pgrac cluster lock-path counters,pgrac cluster multixact overlay,pgrac cluster pcm grd,pgrac cluster qvotec,pgrac cluster reconfig,pgrac cluster scn,pgrac cluster sequence,pgrac cluster sinval ack outbound,pgrac cluster sinval ack wait,pgrac cluster sinval inbound,pgrac cluster sinval outbound,pgrac cluster smgr,pgrac cluster startup phase,pgrac cluster stats,pgrac cluster subtrans state,pgrac cluster ts,pgrac cluster tt local seq,pgrac cluster tt slot allocator,pgrac cluster tt status hint outbound,pgrac cluster tt status overlay,pgrac cluster tx enqueue,pgrac cluster undo cleaner,pgrac cluster undo record cursor';
+  'pgrac block recovery,pgrac cluster advisory,pgrac cluster cf stats,pgrac cluster clean_leave,pgrac cluster conf,pgrac cluster control,pgrac cluster cr admit stats,pgrac cluster cr counters,pgrac cluster cr pool,pgrac cluster cr tuple stats,pgrac cluster cssd,pgrac cluster diag,pgrac cluster dl,pgrac cluster durable tt counters,pgrac cluster epoch,pgrac cluster fence,pgrac cluster gcs,pgrac cluster gcs block,pgrac cluster gcs block dedup,pgrac cluster ges,pgrac cluster ges dedup,pgrac cluster ges reply wait,pgrac cluster grd,pgrac cluster grd outbound,pgrac cluster grd pending,pgrac cluster grd work queue,pgrac cluster hw,pgrac cluster ir,pgrac cluster ko,pgrac cluster lck,pgrac cluster lmd,pgrac cluster lmd graph,pgrac cluster lmd probe,pgrac cluster lmon,pgrac cluster lms,pgrac cluster lock-path counters,pgrac cluster multixact overlay,pgrac cluster pcm grd,pgrac cluster qvotec,pgrac cluster reconfig,pgrac cluster scn,pgrac cluster sequence,pgrac cluster sinval ack outbound,pgrac cluster sinval ack wait,pgrac cluster sinval inbound,pgrac cluster sinval outbound,pgrac cluster smgr,pgrac cluster startup phase,pgrac cluster stats,pgrac cluster subtrans state,pgrac cluster ts,pgrac cluster tt local seq,pgrac cluster tt slot allocator,pgrac cluster tt status hint outbound,pgrac cluster tt status overlay,pgrac cluster tx enqueue,pgrac cluster undo cleaner,pgrac cluster undo record cursor';
 $expected_regions .= ',pgrac cluster visibility inject'
   if $has_visibility_inject;
 # spec-4.12 D7: cooperative write-fence region;  always registered.  Sorts after
@@ -243,8 +245,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '132',
-   'L15 total injection registry size is 130 (spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2 undo boundary guards; spec-5.7 +1 cluster-ko-peer-skip-ack; spec-2.41 +1 cluster-gcs-block-stale-ship)');
+   '138',
+   'L15 total injection registry size is 138 (spec-5.13 +6 cluster-clean-leave-*; spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2 undo boundary guards; spec-5.7 +1 cluster-ko-peer-skip-ack; spec-2.41 +1 cluster-gcs-block-stale-ship)');
 
 
 # ----------

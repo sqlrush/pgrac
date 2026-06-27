@@ -195,10 +195,32 @@ typedef enum ClusterICMsgType {
 		   * (KoFlushHeader: relfilenode + fork + first_block + batch_id).  The dropping
 		   * node fanouts it to every alive peer before physically removing/truncating the
 		   * relfilenode; the peer drops the buffers and replies KO_FLUSH_ACK. */
-	PGRAC_IC_MSG_KO_FLUSH_ACK = 25	  /* PGRAC: spec-5.7 D6 — KO apply-after-drop ACK
+	PGRAC_IC_MSG_KO_FLUSH_ACK = 25,	  /* PGRAC: spec-5.7 D6 — KO apply-after-drop ACK
 		   * (KoFlushAckHeader: batch_id + acker_node + status), peer -> the dropping node,
 		   * sent ONLY after the peer has really dropped the relfilenode's buffers. */
-	/* values 26..255 available for future sub-spec; never reuse 0..25 */
+	PGRAC_IC_MSG_CLEAN_LEAVE_ANNOUNCE = 26, /* PGRAC: spec-5.13 D8 — leaving node ->
+		   * survivors (ClusterLeaveAnnouncePayload: leaving_node + leave_epoch +
+		   * preflight flag).  preflight=1 probes peer clean_leave_enabled; preflight=0
+		   * is the real "I am leaving" announce that enters survivors into leave-aware
+		   * reconfig.  Consumed in the membership layer (NOT gated by clean_leave_enabled
+		   * GUC) so a disabled survivor still replies LEAVE_DRAIN_NAK rather than going
+		   * silent (§3.4 mixed-mode). */
+	PGRAC_IC_MSG_LEAVE_DRAIN_ACK = 27,		/* PGRAC: spec-5.13 D8 — survivor -> leaving node
+		   * (ClusterLeaveAckPayload, nak=0): "dropped all refs to the leaving node +
+		   * accepted remaster handoff + ready-to-commit".  PRE-epoch readiness ACK
+		   * (does NOT wait for / include cache invalidate — §3.1 F1 non-cycle). */
+	PGRAC_IC_MSG_LEAVE_DRAIN_NAK = 28,		/* PGRAC: spec-5.13 D8 — survivor -> leaving node
+		   * (ClusterLeaveAckPayload, nak=1): refuse the clean leave (peer disabled /
+		   * not in quorum).  Leaving node CLUSTER_LEAVE_ABORTED (clean abort, no
+		   * escalate, no epoch bump) on any NAK (§3.4). */
+	PGRAC_IC_MSG_LEAVE_COMMIT_READY = 29	/* PGRAC: spec-5.13 D6 — leaving node ->
+		   * survivor coordinator (ClusterLeaveAnnouncePayload, preflight=0): "I have
+		   * drained + every survivor acked; bump the leave epoch now".  The leaving
+		   * node self-drives the drain but the survivor coordinator owns the epoch
+		   * bump (Q6-A); this is the readiness handoff that triggers the coordinator's
+		   * two-phase commit.  Idempotent (re-sent each tick until the CLEAN_LEAVE
+		   * commit is observed; the coordinator ignores it once clean_departed). */
+	/* values 30..255 available for future sub-spec; never reuse 0..29 */
 } ClusterICMsgType;
 
 

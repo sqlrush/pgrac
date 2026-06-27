@@ -84,6 +84,7 @@
 #include "cluster/cluster_grd.h"   /* spec-2.17 BAST/CANCEL pending dispatch */
 #include "cluster/cluster_hang.h"  /* spec-5.11 D5 hang-dump pending dispatch */
 #include "cluster/cluster_reconfig.h" /* spec-2.29 D4 cluster_reconfig_check_pending_in_proc_interrupts */
+#include "cluster/cluster_clean_leave.h" /* spec-5.13 D7 cluster_clean_leave_check_pending_in_proc_interrupts */
 #endif
 
 /* ----------------
@@ -3099,6 +3100,13 @@ ProcessInterrupts(void)
 	 * logging runs here in normal backend context.
 	 */
 	cluster_hang_check_pending_interrupt();
+
+	/*
+	 * PGRAC: spec-5.13 D7 — clean-leave quiesce.  The ProcSignal handler only
+	 * sets cluster_clean_leave_quiesce_pending; the writable-only abort (53R62)
+	 * decision runs here in normal backend context (CL-I6).
+	 */
+	cluster_clean_leave_check_pending_in_proc_interrupts();
 #endif
 
 	if (CheckClientConnectionPending) {

@@ -81,6 +81,14 @@ extern uint64 cluster_epoch_get_changed_at_lsn(void);
 extern void cluster_epoch_advance_for_reconfig(uint64 *old_out, uint64 *new_out);
 
 /*
+ * spec-5.13 D3 (CL-I3):  Guarded coordinator advance — bump to baseline+1 only
+ *	  if the current epoch still equals baseline (single CAS, no retry).  Returns
+ *	  true iff it advanced; false means a concurrent reconfig (real death) already
+ *	  moved the epoch, so a clean leave must escalate instead of committing stale.
+ */
+extern bool cluster_epoch_advance_for_reconfig_if_baseline(uint64 baseline, uint64 *new_out);
+
+/*
  * spec-2.29 D18:  Coordinator-only setter for epoch_changed_at_lsn.
  *
  *	  Atomic pg_atomic_write_u64 — caller passes GetXLogInsertRecPtr()

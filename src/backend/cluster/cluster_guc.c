@@ -259,6 +259,11 @@ static const struct config_enum_entry cluster_hang_resolution_mode_options[]
 		{ "enforce", HANG_RESOLVE_ENFORCE, false },
 		{ NULL, 0, false } };
 
+/* spec-5.13 D11: clean leave reconfiguration opt-in (default OFF, 5.6 paradigm)
+ * + drain deadline.  OFF = byte-identical to today (no clean-leave path). */
+bool cluster_clean_leave_enabled = false;
+int cluster_clean_leave_drain_timeout_ms = 30000;
+
 /* spec-1.14 D8: cluster.cluster_stats_main_loop_interval (mirror). */
 int cluster_cluster_stats_main_loop_interval = 1000;
 
@@ -285,7 +290,7 @@ int cluster_cssd_dead_deadband_factor = 3;
 char *cluster_voting_disks = NULL; /* CSV path list, default empty */
 int cluster_quorum_poll_interval_ms = 2000;
 int cluster_voting_disk_io_timeout_ms = 5000;
-int cluster_voting_disk_size_bytes = 65536;
+int cluster_voting_disk_size_bytes = 131072; /* spec-5.13: 2 regions × 128 × 512 */
 
 /* spec-2.28 Sprint A Step 1 D7: 4 fence-lite GUCs (Q8 user approve). */
 bool cluster_self_fence_enabled = true;	   /* default fail-safe */
@@ -1077,6 +1082,33 @@ cluster_init_guc(void)
 		"cluster.merged_recovery", gettext_noop("Enable cold-crash k-way SCN merged recovery."),
 		gettext_noop("Off keeps single-stream recovery (this node's own thread only)."),
 		&cluster_merged_recovery, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	/*
+	 * cluster.clean_leave_enabled -- opt-in cooperative clean-leave
+	 * reconfiguration (spec-5.13).  Default OFF (5.6 opt-in paradigm): a
+	 * surviving node only drains-and-leaves on plan when this is on cluster-
+	 * wide.  Off keeps today's behaviour byte-identical (no clean-leave path;
+	 * a departure is handled as a crash via fail-stop reconfig).
+	 */
+	DefineCustomBoolVariable(
+		"cluster.clean_leave_enabled",
+		gettext_noop("Enable cooperative clean-leave reconfiguration."),
+		gettext_noop("Off treats a node departure as a crash (fail-stop reconfig)."),
+		&cluster_clean_leave_enabled, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	/*
+	 * cluster.clean_leave_drain_timeout_ms -- fail-closed deadline for a clean
+	 * leave's cooperative drain (spec-5.13 Q9).  If the drain + all-survivor
+	 * barrier do not complete within this window the leave escalates to fail-
+	 * stop (clean leave never weakens fail-stop safety, CL-I7).  Aligns with
+	 * the feature-082 30s reconfig barrier.
+	 */
+	DefineCustomIntVariable(
+		"cluster.clean_leave_drain_timeout_ms",
+		gettext_noop("Fail-closed deadline for a clean leave's cooperative drain."),
+		gettext_noop("If the drain + barrier exceed this, the leave escalates to fail-stop."),
+		&cluster_clean_leave_drain_timeout_ms, 30000, 1000, 600000, PGC_POSTMASTER, GUC_UNIT_MS,
+		NULL, NULL, NULL);
 
 	/*
 	 * cluster.recovery_merge_wait_timeout -- how long the merge
@@ -2146,18 +2178,22 @@ cluster_init_guc(void)
 							GUC_UNIT_MS, NULL, NULL, NULL);
 
 	/*
-	 * cluster.voting_disk_size_bytes (spec-2.6 D12).  Voting disk file
-	 * size — pre-allocated by qvotec on first boot.  Each instance owns
-	 * one 512-byte slot at offset (node_id × sizeof(ClusterVotingSlot)).
-	 * Default 65536 bytes = 128 instances × 512.  Range [4096, 1048576].
+	 * cluster.voting_disk_size_bytes (spec-2.6 D12; spec-5.13 doubled).
+	 * Voting disk file size — pre-allocated on first boot.  Two 512-byte
+	 * regions per instance: region 1 = the voting slot at offset
+	 * (node_id × 512); region 2 = the clean-leave marker at offset
+	 * ((CLUSTER_MAX_NODES + node_id) × 512).  Default 131072 bytes =
+	 * 2 × 128 × 512.  Range [4096, 1048576].
 	 */
 	DefineCustomIntVariable("cluster.voting_disk_size_bytes",
 							gettext_noop("Voting disk file size in bytes."),
-							gettext_noop("Pre-allocated voting disk size (spec-2.6 D12).  Each "
-										 "instance owns one 512-byte slot at offset (node_id "
-										 "× 512).  Default 65536 = 128 instance slots.  Range "
-										 "[4096, 1048576] bytes; must be a multiple of 512."),
-							&cluster_voting_disk_size_bytes, 65536, 4096, 1048576, PGC_POSTMASTER,
+							gettext_noop("Pre-allocated voting disk size (spec-2.6 D12; spec-5.13 "
+										 "doubled for the clean-leave marker region).  Each "
+										 "instance owns a 512-byte voting slot at offset "
+										 "(node_id × 512) plus a 512-byte leave-marker slot at "
+										 "((128 + node_id) × 512).  Default 131072 = 2 × 128 "
+										 "slots.  Range [4096, 1048576] bytes; multiple of 512."),
+							&cluster_voting_disk_size_bytes, 131072, 4096, 1048576, PGC_POSTMASTER,
 							GUC_UNIT_BYTE, NULL, NULL, NULL);
 
 	/* spec-2.28 Sprint A Step 1 D7: 4 fence-lite GUCs (Q8 user approve). */

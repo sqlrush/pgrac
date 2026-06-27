@@ -40,6 +40,7 @@
 
 #include "access/xlog.h"
 #include "access/xlogdefs.h"
+#include "cluster/cluster_clean_leave.h" /* spec-5.13 S6 — CL-I5 serve gate */
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_cssd.h" /* spec-4.6 D4 — dead-master block-path guard */
 #include "cluster/cluster_epoch.h"
@@ -1191,6 +1192,25 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 	PG_END_TRY();
 
 	gcs_block_release_slot(slot);
+
+	/*
+	 * spec-5.13 S6 (CL-I5 serve-gate): a cooperative leave in progress may have
+	 * remastered a leaving node's shard to this survivor BEFORE the leaving node
+	 * flushed its dirty/X image to shared storage.  In that window the new master
+	 * holds no copy → a storage fallback would read the PRE-flush stale image
+	 * (false-visible, 8.A).  Withhold the fallback (retryable 53R62) until the
+	 * leave commits (flush + this survivor's cache invalidate).  `granted` (a
+	 * cache-fusion ship that carried the holder's current image) is unaffected —
+	 * only the storage fallback is gated.
+	 */
+	if (granted_storage_fallback && !cluster_clean_leave_block_serve_gate_allows())
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_CLEAN_LEAVE_IN_PROGRESS),
+				 errmsg("cluster_gcs_block: storage fallback withheld during a cooperative cluster "
+						"leave for tag spc=%u db=%u rel=%u block=%u",
+						tag.spcOid, tag.dbOid, tag.relNumber, tag.blockNum),
+				 errhint("a node is leaving the cluster and may not yet have flushed this block; "
+						 "retry after the leave commits — retry is safe")));
 
 	/* spec-5.2 D2: GRANTED / STORAGE_FALLBACK record durable ownership (the
 	 * caller mirrors PCM state); READ_IMAGE is a one-shot non-durable read so
@@ -3885,6 +3905,53 @@ cluster_gcs_block_on_epoch_advance(uint64 new_epoch)
 		}
 		LWLockRelease(&blk->lock.lock);
 	}
+}
+
+
+/* ============================================================
+ * PGRAC MODIFICATIONS by SqlRush — spec-5.13 D5 (clean-leave GCS data-plane
+ * drain: leaving-node flush orchestration + survivor cache invalidate).
+ * ============================================================ */
+
+/*
+ * cluster_gcs_block_clean_leave_flush_all_dirty -- leaving node: force every
+ * dirty block it holds X on to shared storage and release that X.
+ *
+ *	Thin orchestration over the bufmgr-owned seam (FlushBuffer is a bufmgr
+ *	private static, so the scan + flush + release-X lives in bufmgr.c).  Runs
+ *	in the leaving node's own backend/checkpointer (CL-I9 / L367), NEVER in
+ *	LMON.  After this returns the leaving node holds no in-memory current for
+ *	any block (CL-I5).  The S5 driver records the returned count and, on a flush
+ *	error (which fail-closes via ereport from the bufmgr seam), goes
+ *	ABORTED_ESCALATE rather than assume a half-completed drain (Rule 8.B).
+ */
+uint32
+cluster_gcs_block_clean_leave_flush_all_dirty(void)
+{
+	return cluster_bufmgr_flush_and_release_x_for_leave();
+}
+
+/*
+ * cluster_gcs_block_clean_leave_invalidate_for -- survivor: invalidate stale
+ * cache of a leaving node's blocks once the leave epoch is observed.
+ *
+ *	POST-epoch, automatic, no second-round ACK (§3.1/§3.2 non-cycle proof):
+ *	the survivor observes the cluster epoch reach the leave epoch and then
+ *	invalidates.  The leaving node held X (exclusive) on every dirty block it
+ *	flushed, so NO survivor holds a conflicting current copy; the only resident
+ *	buffers a survivor can have for those tags are (a) blocks it held S on
+ *	(still storage-current — no invalidate needed) or (b) stale / PI images
+ *	(routed to storage on access).  Reusing on_epoch_advance — which marks the
+ *	outstanding block-request slots whose request_epoch < new_epoch stale and
+ *	wakes them — is therefore sufficient; no resident-buffer sweep is required.
+ *	This invalidate is the happens-before boundary that must complete before
+ *	any post-epoch storage read (CL-I5).
+ */
+void
+cluster_gcs_block_clean_leave_invalidate_for(int32 leaving_node, uint64 new_epoch)
+{
+	(void)leaving_node; /* X-exclusivity makes a per-node resident sweep unnecessary */
+	cluster_gcs_block_on_epoch_advance(new_epoch);
 }
 
 

@@ -55,6 +55,7 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_signal.h" /* PGRAC: cluster handlers (spec-2.28 D3 dispatches via wrappers) */
 #include "cluster/cluster_hang.h"	/* PGRAC: hang-dump handler (spec-5.11 D5) */
+#include "cluster/cluster_clean_leave.h" /* PGRAC: clean-leave quiesce handler (spec-5.13 D7) */
 #endif
 #include "storage/shmem.h"
 #include "storage/smgr.h"
@@ -713,6 +714,9 @@ procsignal_sigusr1_handler(SIGNAL_ARGS)
 	/* spec-5.11 D5 — backend-local hang/wait self-dump request. */
 	if (CheckProcSignal(PROCSIG_CLUSTER_HANG_DUMP))
 		cluster_handle_hang_dump_interrupt();
+	/* spec-5.13 D7 — leaving-node quiesce request (writable backends abort). */
+	if (CheckProcSignal(PROCSIG_CLUSTER_CLEAN_LEAVE_QUIESCE))
+		cluster_clean_leave_handle_quiesce_interrupt();
 #endif
 
 	SetLatch(MyLatch);

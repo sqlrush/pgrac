@@ -383,6 +383,10 @@ extern int cluster_diag_main_loop_interval;
  * spec-5.11 D7: Hang Manager (DIAG-hosted long-wait sampler) GUCs.  All
  * PGC_SIGHUP — the DIAG main loop re-reads them on the next tick.
  */
+/* spec-5.13 D11: clean-leave reconfiguration opt-in + drain deadline. */
+extern bool cluster_clean_leave_enabled;
+extern int cluster_clean_leave_drain_timeout_ms;
+
 extern bool cluster_hang_manager_enabled;
 extern int cluster_hang_sample_interval_ms;
 extern int cluster_hang_threshold_ms;
@@ -431,7 +435,7 @@ extern int cluster_cssd_dead_deadband_factor;
  *   cluster.voting_disks               -- CSV path list (default empty)
  *   cluster.quorum_poll_interval_ms    -- 500..30000, default 2000
  *   cluster.voting_disk_io_timeout_ms  -- 500..60000, default 5000
- *   cluster.voting_disk_size_bytes     -- 4096..1048576, default 65536
+ *   cluster.voting_disk_size_bytes     -- 4096..1048576, default 131072
  *
  * All PGC_POSTMASTER.  Per Q4 v0.2 lease semantics, backend
  * in_quorum() check uses 2 × quorum_poll_interval_ms as the lease

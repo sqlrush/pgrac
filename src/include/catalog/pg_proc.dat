@@ -12479,6 +12479,29 @@
   proargnames => '{pid}',
   prosrc => 'pg_cluster_hang_resolve' },
 
+# spec-5.13 D13 -- pg_cluster_clean_leave_state SRF (oid 8960).  Always-1-row
+# clean-leave drain progress (phase / leaving_node_id / leave_epoch /
+# ges_drained_count / gcs_flushed_count / shards_remastered / survivor_ack_count
+# / barrier_deadline / escalate_count).  Idle surfaces as phase='idle',
+# leaving_node_id=-1, barrier_deadline NULL.  cluster.enabled=off returns 0 rows.
+{ oid => '8960', descr => 'show cluster clean-leave drain state (spec-5.13)',
+  proname => 'cluster_get_clean_leave_state', prorows => '1',
+  proretset => 't', provolatile => 'v', proparallel => 'r',
+  prorettype => 'record', proargtypes => '',
+  proallargtypes => '{text,int4,int8,int8,int8,int8,int4,timestamptz,int8}',
+  proargmodes => '{o,o,o,o,o,o,o,o,o}',
+  proargnames => '{phase,leaving_node_id,leave_epoch,ges_drained_count,gcs_flushed_count,shards_remastered,survivor_ack_count,barrier_deadline,escalate_count}',
+  prosrc => 'cluster_get_clean_leave_state' },
+
+# spec-5.13 D13b -- pg_cluster_clean_leave_request(): operator entry asking THIS
+# node to leave the cluster cooperatively.  Mutating -> superuser-only (C
+# superuser() gate + REVOKE EXECUTE FROM PUBLIC).  Returns a behaviour-matrix
+# text: accepted / rejected:<reason> / noop:<reason>.
+{ oid => '8961', descr => 'request a cooperative clean leave of this cluster node',
+  proname => 'pg_cluster_clean_leave_request', provolatile => 'v',
+  prorettype => 'text', proargtypes => '',
+  prosrc => 'pg_cluster_clean_leave_request' },
+
 # spec-3.2 D5b (2026-05-22) -- test-only visibility fork injection
 # functions.  These are SQL-visible so TAP can drive a real
 # HeapTupleSatisfiesMVCC cluster-path miss and assert 53R97.  Production

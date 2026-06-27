@@ -87,6 +87,7 @@
 #include "utils/ps_status.h"
 #include "utils/timestamp.h"
 
+#include "cluster/cluster_clean_leave.h" /* spec-5.13 §2.5: leave-marker submit + rebuild */
 #include "cluster/cluster_elog.h"		 /* CLUSTER_LOG (best-effort logging) */
 #include "cluster/cluster_epoch.h"		 /* spec-4.12b D2/D5: current-epoch upper-bound Assert */
 #include "cluster/cluster_guc.h"		 /* cluster_enabled */
@@ -670,6 +671,9 @@ qvotec_poll_once(void)
 	int i;
 	ClusterFenceMarker submit_marker;
 	bool have_submit;
+	uint8 leave_marker_slot[CLUSTER_VOTING_SLOT_BYTES]; /* spec-5.13 §2.5 staged marker */
+	bool have_leave_submit;
+	uint32 leave_disks_ok = 0;
 	ClusterFenceMarker baseline_marker; /* spec-4.12b D2 */
 	bool author_baseline = false;		/* spec-4.12b D2: wrote a baseline this cycle */
 	bool is_leader = false;				/* spec-4.12b D6: lowest-live baseline leader */
@@ -694,12 +698,19 @@ qvotec_poll_once(void)
 	 */
 	have_submit = cluster_write_fence_qvotec_poll_pending(&submit_marker);
 
+	/* spec-5.13 §2.5: pick up a pending clean-leave marker submit too.  It is
+	 * written into THIS node's own leave-slot on every disk in the same write
+	 * loop below and acked majority-durable, exactly like the fence marker. */
+	have_leave_submit = cluster_clean_leave_qvotec_poll_pending(leave_marker_slot);
+
 	if (qvotec_n_disks == 0) {
 		/* Single-node compat: no disks, no quorum to decide.  Hold
 		 * quorum_state at INITIALIZING so any explicit consumer that
 		 * does check it stays fail-closed (per Q4 v0.2 default). */
 		if (have_submit)
 			cluster_write_fence_qvotec_complete(false); /* no disk -> no majority */
+		if (have_leave_submit)
+			cluster_clean_leave_qvotec_complete(false); /* no disk -> no majority */
 		return;
 	}
 
@@ -710,6 +721,8 @@ qvotec_poll_once(void)
 		 * before we get here in production paths. */
 		if (have_submit)
 			cluster_write_fence_qvotec_complete(false); /* cannot author self slot */
+		if (have_leave_submit)
+			cluster_clean_leave_qvotec_complete(false); /* cannot author self slot */
 		return;
 	}
 
@@ -928,6 +941,19 @@ qvotec_poll_once(void)
 			io_states[i] = CLUSTER_VOTING_DISK_IO_FAILED;
 			cluster_pgstat_inc(qvotec_counter_disk_io_fail);
 		}
+
+		/*
+		 * spec-5.13 §2.5: write the staged clean-leave marker to THIS node's
+		 * own leave-slot (region 2) on this disk, in the same loop.  Count the
+		 * disks that accepted it for the majority-durable ack below.  This is
+		 * independent of the voting-slot write above (a separate offset); a
+		 * voting-slot write failure does not by itself fail the marker write.
+		 */
+		if (have_leave_submit
+			&& cluster_voting_disk_write_leave_slot(qvotec_fds[i], (uint32)cluster_node_id,
+													leave_marker_slot)
+				   == CLUSTER_VOTING_DISK_IO_OK)
+			leave_disks_ok++;
 	}
 
 	/*
@@ -980,6 +1006,15 @@ qvotec_poll_once(void)
 		 */
 		if (have_submit)
 			cluster_write_fence_qvotec_complete(disks_ok_post_write >= quorum_size_post_write);
+
+		/*
+		 * spec-5.13 §2.5: ack the clean-leave marker submit.  Uses the marker's
+		 * own per-disk write tally (leave_disks_ok), not the voting-slot tally,
+		 * since the two writes are at independent offsets.  ACK only on >=
+		 * quorum-majority; otherwise the driver fails closed (no false durable).
+		 */
+		if (have_leave_submit)
+			cluster_clean_leave_qvotec_complete(leave_disks_ok >= quorum_size_post_write);
 	}
 
 	/* ---- 4. publish shmem ---- */
@@ -1158,6 +1193,18 @@ ClusterQvotecMain(void)
 	 * registered (D7); auto-cleared at proc_exit so a stale latch is never signalled.
 	 */
 	cluster_write_fence_publish_qvotec_latch(MyLatch);
+
+	/*
+	 * spec-5.13 D2/§2.5: publish MyLatch for the clean-leave marker submit
+	 * handshake too (the leaving node's REQUESTED + the coordinator's
+	 * COMMITTING/COMMITTED writes ride qvotec the same way the fence marker
+	 * does), then rebuild clean-departed state from any durable COMMITTED
+	 * leave-marker on disk — a node that left cleanly before this postmaster
+	 * started must not be re-treated as a crash (CL-I13 / P1-V0.7 restart leg).
+	 * Runs once, postmaster-spawned, after the disks are open.
+	 */
+	cluster_clean_leave_publish_qvotec_latch(MyLatch);
+	cluster_clean_leave_rebuild_from_disks(qvotec_fds, qvotec_n_disks);
 
 	/*
 	 * Hardening v0.4 P1.4: install per-I/O timeout handler for the

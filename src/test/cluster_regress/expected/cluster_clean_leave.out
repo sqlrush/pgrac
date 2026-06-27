@@ -1,0 +1,79 @@
+-- ============================================================
+-- cluster_clean_leave -- pgrac spec-5.13 cooperative clean-leave surface.
+--
+--	Author: SqlRush <sqlrush@gmail.com>
+--	Portions Copyright (c) 2026, pgrac contributors
+-- ============================================================
+-- spec-5.13 D17: cooperative clean-leave catalog smoke (cluster_regress).
+--
+--   Verifies the catalog surface added by spec-5.13:
+--     - pg_cluster_clean_leave_state view (9 columns, always-1-row when
+--       cluster.enabled=on; idle = phase 'idle', leaving_node_id -1,
+--       barrier_deadline NULL)
+--     - pg_cluster_clean_leave_request() operator UDF: with
+--       cluster.clean_leave_enabled=off (the regress default) it returns
+--       'rejected:feature_disabled' (behaviour matrix)
+--     - the mutating UDF REVOKEd from PUBLIC (L7 defense-in-depth)
+--
+-- The cooperative leave runtime (drain -> cross-node commit -> survivor
+-- serve-gate, 53R62 quiesce) + the 6 cluster-clean-leave-* inject points
+-- (which register lazily on first hit, so they are not visible in this
+-- single-node never-leaves instance) are exercised in
+-- t/308_cluster_5_13_clean_leave.pl.
+-- ----------
+-- Block 1: pg_cluster_clean_leave_state view exists with 9 columns.
+-- ----------
+SELECT count(*) AS column_count
+  FROM information_schema.columns
+ WHERE table_name = 'pg_cluster_clean_leave_state';
+ column_count 
+--------------
+            9
+(1 row)
+
+-- ----------
+-- Block 2: always-1-row contract (cluster.enabled=on); idle state.
+-- ----------
+SELECT count(*) AS row_count
+  FROM pg_cluster_clean_leave_state;
+ row_count 
+-----------
+         1
+(1 row)
+
+SELECT phase,
+       leaving_node_id,
+       leave_epoch,
+       ges_drained_count,
+       gcs_flushed_count,
+       shards_remastered,
+       survivor_ack_count,
+       barrier_deadline IS NULL AS barrier_deadline_null,
+       escalate_count
+  FROM pg_cluster_clean_leave_state;
+ phase | leaving_node_id | leave_epoch | ges_drained_count | gcs_flushed_count | shards_remastered | survivor_ack_count | barrier_deadline_null | escalate_count 
+-------+-----------------+-------------+-------------------+-------------------+-------------------+--------------------+-----------------------+----------------
+ idle  |              -1 |           0 |                 0 |                 0 |                 0 |                  0 | t                     |              0
+(1 row)
+
+-- ----------
+-- Block 3: operator UDF behaviour matrix — clean_leave_enabled=off (default)
+-- returns 'rejected:feature_disabled'.
+-- ----------
+SELECT pg_cluster_clean_leave_request() AS request_result;
+      request_result       
+---------------------------
+ rejected:feature_disabled
+(1 row)
+
+-- ----------
+-- Block 4: the mutating UDF is REVOKEd from PUBLIC (defense-in-depth on top of
+-- the C superuser() gate, L7) — PUBLIC cannot EXECUTE it.
+-- ----------
+SELECT has_function_privilege('public', 'pg_cluster_clean_leave_request()', 'EXECUTE')
+         AS public_can_execute_request;
+ public_can_execute_request 
+----------------------------
+ f
+(1 row)
+

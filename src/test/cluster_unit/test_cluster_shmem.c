@@ -723,6 +723,16 @@ void
 cluster_reconfig_shmem_register(void)
 {}
 
+/* spec-5.13 D2 stub: cluster_clean_leave shmem region (real impl in
+ * cluster_clean_leave.c).  cluster_shmem.c::cluster_init_shmem_module()
+ * calls cluster_clean_leave_shmem_register to register the "pgrac cluster
+ * clean_leave" region; standalone unit test doesn't link
+ * cluster_clean_leave.o. */
+void cluster_clean_leave_shmem_register(void);
+void
+cluster_clean_leave_shmem_register(void)
+{}
+
 /* spec-4.12 D7 stub: cluster write-fence token region. */
 void cluster_write_fence_shmem_register(void);
 void

@@ -56,6 +56,8 @@
 #include "port/atomics.h"
 #include "storage/lwlock.h"
 
+#include "cluster/cluster_conf.h" /* CLUSTER_MAX_NODES (spec-5.13 clean_departed_epoch) */
+
 
 /*
  * 128-bit bitmap holding declared peers' DEAD state.  Sized for
@@ -200,7 +202,24 @@ typedef struct ClusterReconfigState {
 	pg_atomic_uint64 touched_abort_count; /* tx aborted 40R01 (touched ∩ dead) */
 	pg_atomic_uint64 touched_stamp_count; /* total cross-node ingress stamps */
 	pg_atomic_uint64 touched_stamp_by_kind[CLUSTER_RECONFIG_TOUCH_KIND_COUNT];
-	pg_atomic_uint64 clean_leave_rejected_count; /* defensive CLEAN_LEAVE hits */
+	pg_atomic_uint64 clean_leave_rejected_count;	/* defensive (unexpected) CLEAN_LEAVE hits */
+	pg_atomic_uint64 clean_leave_drain_grace_count; /* spec-5.13 S6 CL-I12 drain-grace continues */
+
+	/*
+	 * spec-5.13 D3 (CL-I13) — clean-departed suppression.  A node that left
+	 * cleanly (a CLEAN_LEAVE reconfig committed naming it) stops heart-beating
+	 * once it exits.  Without suppression cluster_reconfig_lmon_tick would treat
+	 * that CSSD DEAD as a crash → a SECOND, spurious fail-stop reconfig (and a
+	 * spurious 40R01 of any drain-grace survivor tx whose touched_peers still
+	 * names it).  These are set when a survivor observes the CLEAN_LEAVE commit,
+	 * and rebuilt at startup from the durable §2.5 COMMITTED marker (the epoch
+	 * is NOT durable, so the marker is also the epoch-floor recovery source —
+	 * P1-V0.7).  effective_dead = cssd_dead & ~clean_departed_bitmap.  Guarded
+	 * by `lock` (set EXCLUSIVE, read SHARED in the lmon_tick masking).
+	 */
+	uint8 clean_departed_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	uint64 clean_departed_epoch[CLUSTER_MAX_NODES]; /* per-node leave epoch; 0 = not departed */
+	pg_atomic_uint64 clean_departed_count; /* lifetime departures recorded (observability) */
 } ClusterReconfigState;
 
 
@@ -330,11 +349,56 @@ extern uint64 cluster_reconfig_get_procsig_broadcast_count(void);
 extern void cluster_reconfig_note_touched_stamp(int kind);
 extern uint64 cluster_reconfig_note_touched_abort(void); /* returns prior count (LOG-once gate) */
 extern void cluster_reconfig_note_clean_leave_rejected(void);
+/* spec-5.13 S6 (CL-I12) — a touched survivor tx was allowed to continue under a
+ * CLEAN_LEAVE reconfig (drain-grace) instead of being aborted 40R01 (fail-stop).
+ * returns the prior count (LOG-once gate). */
+extern uint64 cluster_reconfig_note_clean_leave_drain_grace(void);
 
 extern uint64 cluster_reconfig_get_touched_abort_count(void);
 extern uint64 cluster_reconfig_get_touched_stamp_count(void);
 extern uint64 cluster_reconfig_get_touched_stamp_by_kind(int kind);
 extern uint64 cluster_reconfig_get_clean_leave_rejected_count(void);
+extern uint64 cluster_reconfig_get_clean_leave_drain_grace_count(void);
+
+
+/* ============================================================
+ * spec-5.13 D3 (CL-I13) — clean-departed suppression + epoch-floor recovery.
+ *
+ *	record: mark node_id as cleanly departed at leave_epoch (a survivor that
+ *	  observed the CLEAN_LEAVE commit, or the startup rebuild from a durable
+ *	  COMMITTED §2.5 marker).  Sets the bitmap bit + per-node epoch.  When
+ *	  raise_epoch_floor is true (startup rebuild path, P1-V0.7) it also raises
+ *	  the local cluster epoch floor to >= leave_epoch — the epoch is not durable,
+ *	  so the marker is the only proof the cluster reached that epoch; this path
+ *	  is exempt from the IC OBSERVE_MAX_JUMP bound (it is startup recovery, not a
+ *	  hostile envelope).
+ *	clear: spec-5.15 rejoin (incarnation bump) or operator removes the entry so
+ *	  the node can rejoin as a live member.
+ * ============================================================ */
+extern void cluster_reconfig_record_clean_departed(int32 node_id, uint64 leave_epoch,
+												   bool raise_epoch_floor);
+extern void cluster_reconfig_clear_clean_departed(int32 node_id);
+extern bool cluster_reconfig_is_clean_departed(int32 node_id);
+extern uint64 cluster_reconfig_get_clean_departed_epoch(int32 node_id);
+extern uint64 cluster_reconfig_get_clean_departed_count(void);
+
+/*
+ * spec-5.13 D3 — coordinator publishes the CLEAN_LEAVE reconfig event (the
+ * commit point of the §3.1 two-phase commit): bump the membership epoch and
+ * publish reconfig_kind=CLEAN_LEAVE with dead_bitmap = {leaving_node_id}, then
+ * record the node clean-departed at the new epoch.  Mirrors
+ * cluster_reconfig_apply_epoch_bump_as_coordinator but for the cooperative
+ * leave kind (no write-fence marker — the leaving node drained voluntarily; the
+ * durable record is the §2.5 leave-intent marker, bracketed around this call by
+ * the driver).  Returns the new epoch E (the driver stamps it into the COMMITTED
+ * marker).  The driver writes the COMMITTING marker BEFORE this call and the
+ * COMMITTED marker AFTER it (durable-commit ordering, §2.5).  `baseline_epoch`
+ * is the epoch the leave committed against; the bump is a guarded CAS that
+ * fails closed (returns 0, no commit) if a concurrent reconfig already moved
+ * the epoch off the baseline (CL-I3, safe at any node count).
+ */
+extern uint64 cluster_reconfig_apply_clean_leave_as_coordinator(int32 leaving_node_id,
+																uint64 baseline_epoch);
 
 
 #endif /* CLUSTER_RECONFIG_H */

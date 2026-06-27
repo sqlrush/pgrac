@@ -154,6 +154,7 @@
 #include "cluster/cluster_subtrans.h"  /* PGRAC: spec-3.5 D7 subxact lifecycle hook */
 #include "cluster/cluster_undo_record_api.h"  /* PGRAC: spec-3.7 D16 PREPARE guard */
 #include "cluster/cluster_touched_peers.h"	  /* PGRAC: spec-5.14 D1 per-tx reset */
+#include "cluster/cluster_clean_leave.h"		  /* PGRAC: spec-5.13 §3.1 refuse-writes gate */
 #include "cluster/storage/cluster_undo_xlog.h" /* PGRAC: spec-3.18 D4.1 TT fold redo stamp */
 #endif
 #endif
@@ -725,6 +726,35 @@ AssignTransactionId(TransactionState s)
 	 */
 	if (IsInParallelMode() || IsParallelWorker())
 		elog(ERROR, "cannot assign XIDs during a parallel operation");
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC MODIFICATIONS (spec-5.13 §3.1, refuse-new-writes gate)
+	 *
+	 * What changed: reject the very first write of a transaction when THIS
+	 * node has an active clean leave in progress.
+	 *
+	 * Why: a clean leave snapshots, force-logs and flushes this node's dirty
+	 * pages to shared storage, then hands current ownership to a survivor.  A
+	 * writable transaction that begins after that flush would dirty a block
+	 * the leave already accounted for; the survivor could then read it stale
+	 * from storage (false-visible) or it could be lost entirely if the node
+	 * exits before a checkpoint (clean_departed masks the node, so there is no
+	 * crash recovery for it).  Both are rule 8.A correctness violations, so we
+	 * fail-closed at xid assignment — before any block is dirtied — rather than
+	 * leaving the gate to operator discipline.  Read-only transactions never
+	 * assign an xid and so are unaffected (matching §3.1: only writers abort).
+	 * The leaving node's own drain backend force-logs and flushes but performs
+	 * no heap write, so it does not assign an xid here and never self-blocks.
+	 */
+	if (cluster_clean_leave_node_refuses_writes())
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_CLEAN_LEAVE_IN_PROGRESS),
+				 errmsg("cannot start a writable transaction:"
+						" this node is leaving the cluster"),
+				 errhint("reconnect to a surviving node and retry;"
+						 " the retry is safe")));
+#endif
 
 	/*
 	 * Ensure parent(s) have XIDs, so that a child always has an XID later
@@ -2519,6 +2549,25 @@ CommitTransaction(void)
 					 errhint("check pg_cluster_quorum_state.in_quorum and"
 							 " pg_cluster_voting_disks for disk health")));
 	}
+
+	/*
+	 * PGRAC: spec-5.13 §3.1 commit-boundary backstop for the refuse-writes
+	 * gate.  AssignTransactionId already rejects writers that START during a
+	 * clean leave; this catches a writer that acquired its xid just before the
+	 * leave began and is only now reaching commit, after the leave snapshotted
+	 * and flushed.  Letting it commit would make a write durable that the
+	 * survivor's storage view does not reflect (false-visible / lost commit,
+	 * 8.A), so fail-closed here too.  Same retryable 53R62 as the early reject.
+	 */
+	if (cluster_enabled
+		&& TransactionIdIsValid(GetTopTransactionIdIfAny())
+		&& cluster_clean_leave_node_refuses_writes())
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_CLEAN_LEAVE_IN_PROGRESS),
+				 errmsg("cannot commit a writable transaction:"
+						" this node is leaving the cluster"),
+				 errhint("reconnect to a surviving node and retry;"
+						 " the retry is safe")));
 #endif
 
 	/*

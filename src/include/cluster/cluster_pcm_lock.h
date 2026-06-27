@@ -412,6 +412,18 @@ extern void cluster_pcm_lock_clear_pending_x(BufferTag tag);
 extern int32 cluster_pcm_lock_query_pending_x_requester(BufferTag tag);
 extern uint64 cluster_pcm_lock_clear_pending_x_for_node(int32 dead_node);
 
+/* PGRAC: spec-5.13 D5 (clean-leave PCM release) — a leaving node clears its
+ * OWN holder records (X / S / PI) from the local PCM directory after the GCS
+ * flush seam has persisted all dirty X blocks (CL-I5).  Demotes an entry's
+ * master_state to N when no X/S holder remains.  Mirrors clear_pending_x_for_
+ * node's locking.  Returns the count of entries mutated. */
+extern uint64 cluster_pcm_lock_clean_leave_release_all_self(uint64 leave_epoch);
+
+/* PGRAC: spec-5.13 D5 (CL-I2 proof) — read-only scan: returns true iff no local
+ * PCM entry still records the leaving node as X holder or in the S / PI holder
+ * bitmaps.  Used by cluster_clean_leave_verify_no_leftover after drain. */
+extern bool cluster_pcm_lock_clean_leave_verify_no_leftover(int32 leaving_node);
+
 /* PGRAC: spec-2.36 D2/D3 — master broadcast invalidate needs raw bitmap
  * read.  Returns 0 if entry not present (treated as "no holders"). */
 extern uint32 cluster_pcm_lock_query_s_holders_bitmap(BufferTag tag);

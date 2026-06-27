@@ -500,6 +500,12 @@ hash_seq_search(HASH_SEQ_STATUS *status pg_attribute_unused())
 	return fake_grd_htab_entries.data[fake_grd_htab_seq_index++];
 }
 
+/* spec-5.13 S3/D4 stub: cluster_grd_clean_leave_verify_no_leftover (in
+ * cluster_grd.o) early-terminates via hash_seq_term; fake harness no-op. */
+void
+hash_seq_term(HASH_SEQ_STATUS *status pg_attribute_unused())
+{}
+
 Size
 hash_estimate_size(long num_entries pg_attribute_unused(), Size entrysize pg_attribute_unused())
 {

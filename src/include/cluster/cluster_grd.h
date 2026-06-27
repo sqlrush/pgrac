@@ -1359,6 +1359,16 @@ extern ClusterGrdEntryResult cluster_grd_rollback_convert(const ClusterResId *re
 extern void cluster_grd_cleanup_on_node_dead(int32 dead_node_id);
 
 /*
+ * spec-5.13 D4 — clean-leave cooperative GES drain (a planned, proactive dual
+ * of the failure path; reuses remaster + cleanup_on_node_dead).  drain_self
+ * returns the number of master shards moved off the leaving node;
+ * verify_no_leftover is the CL-I2 read-only proof (no leaving holder/waiter/
+ * convert in any entry + no shard still mastered by the leaving node).
+ */
+extern uint32 cluster_grd_clean_leave_drain_self(int32 leaving_node, uint64 leave_epoch);
+extern bool cluster_grd_clean_leave_verify_no_leftover(int32 leaving_node);
+
+/*
  * LMON tick poll — newly-dead bitmap diff per spec-2.16 v0.5 P1.2 + I51.
  *
  *   Called from cluster_lmon_main_tick body BEFORE reconfig_lmon_tick

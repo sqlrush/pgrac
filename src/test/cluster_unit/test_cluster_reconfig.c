@@ -88,7 +88,9 @@ UT_DEFINE_GLOBALS();
  * ============================================================ */
 
 #include "storage/shmem.h"
-static char reconfig_shmem_storage[256] __attribute__((aligned(64)));
+/* spec-5.13 D3 grew ClusterReconfigState with clean_departed_epoch[CLUSTER_MAX_NODES]
+ * (1 KiB) + clean_departed_bitmap + counter; bump the mock backing store to fit. */
+static char reconfig_shmem_storage[2048] __attribute__((aligned(64)));
 static char epoch_shmem_storage[64] __attribute__((aligned(64)));
 static bool reconfig_init_done = false;
 static bool epoch_init_done = false;

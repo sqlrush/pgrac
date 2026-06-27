@@ -873,6 +873,14 @@ extern void cluster_bufmgr_flush_seq_page_to_storage(Buffer buffer);
  * mutates a non-owned copy (Rule 8.A multi-row fail-closed leg). */
 extern bool cluster_bufmgr_block_write_permitted(Buffer buffer);
 
+/* PGRAC: spec-5.13 D5b (clean-leave GCS flush seam) — a leaving node force-
+ * persists every dirty block it holds X on to shared storage and releases that
+ * X (pcm_state X -> N).  FlushBuffer is a bufmgr private static, so this seam
+ * lives in bufmgr.c.  Runs in the leaving node's own backend/checkpointer
+ * (CL-I9), never LMON.  Fail-closed (ereport) on write error.  Returns the
+ * count of blocks flushed + X-released (CL-I5 / §0.3 命门). */
+extern uint32 cluster_bufmgr_flush_and_release_x_for_leave(void);
+
 /* PGRAC: spec-4.7 D2 (Q6-A' worker-centric) — bounded chunked scan of the
  * shared buffer pool that re-declares each locally-held S/X buffer.  The
  * callback receives (tag, held_mode, page_lsn, arg) per qualifying buffer;
@@ -1161,6 +1169,18 @@ extern void cluster_gcs_block_bump_master_holder_lifecycle(void);
  *	reply timeout safety net.
  * ============================================================ */
 extern void cluster_gcs_block_on_epoch_advance(uint64 new_epoch);
+
+
+/* ============================================================
+ * spec-5.13 D5 — clean-leave GCS data-plane drain.
+ *
+ *	flush_all_dirty: leaving node, thin orchestration over the bufmgr D5b
+ *	seam (runs in the leaving node's backend/checkpointer, CL-I9).
+ *	invalidate_for: survivor, POST-epoch cache invalidate of the leaving
+ *	node's blocks (reuses on_epoch_advance; CL-I5 happens-before boundary).
+ * ============================================================ */
+extern uint32 cluster_gcs_block_clean_leave_flush_all_dirty(void);
+extern void cluster_gcs_block_clean_leave_invalidate_for(int32 leaving_node, uint64 new_epoch);
 
 
 /* ============================================================

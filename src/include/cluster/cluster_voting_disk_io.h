@@ -57,6 +57,7 @@
 #ifndef CLUSTER_VOTING_DISK_IO_H
 #define CLUSTER_VOTING_DISK_IO_H
 
+#include "cluster/cluster_conf.h"	/* CLUSTER_MAX_NODES (leave-marker region) */
 #include "cluster/cluster_qvotec.h" /* ClusterVotingSlot, ClusterVotingDiskIoState */
 #include "port/pg_crc32c.h"
 
@@ -69,6 +70,22 @@
  */
 #define CLUSTER_VOTING_SLOT_BYTES 512
 #define CLUSTER_VOTING_SLOT_OFFSET(node_id) ((off_t)(node_id) * CLUSTER_VOTING_SLOT_BYTES)
+
+/*
+ * spec-5.13 D2/§2.5 — clean-leave-intent marker region.  A SECOND 512-byte
+ * slot per node, laid out immediately after the CLUSTER_MAX_NODES voting slots
+ * (region 1 = [0, CLUSTER_MAX_NODES*512), region 2 = leave markers).  Each node
+ * writes ONLY its own leave-slot (qvotec sole-writer invariant); a marker
+ * reaches a quorum-majority because qvotec replicates that one slot to every
+ * disk, exactly like the fence marker.  The voting disk file therefore doubles
+ * to 2 × CLUSTER_MAX_NODES × 512 bytes (cluster.voting_disk_size_bytes default
+ * bumped to match).  The marker payload (ClusterLeaveIntentMarker) carries its
+ * own magic/version/CRC, validated by the clean-leave policy layer — this layer
+ * is payload-agnostic and just does aligned 512-byte raw slot I/O at the offset.
+ */
+#define CLUSTER_VOTING_LEAVE_SLOT_OFFSET(node_id)                                                  \
+	((off_t)(CLUSTER_MAX_NODES + (node_id)) * CLUSTER_VOTING_SLOT_BYTES)
+#define CLUSTER_VOTING_FILE_BYTES_MIN ((off_t)2 * CLUSTER_MAX_NODES * CLUSTER_VOTING_SLOT_BYTES)
 
 
 /*
@@ -163,6 +180,27 @@ extern ClusterVotingDiskIoState cluster_voting_disk_format(int fd, uint32 max_no
  * 4-byte crc32c field).
  */
 extern pg_crc32c cluster_voting_disk_compute_crc32c(const ClusterVotingSlot *slot);
+
+
+/*
+ * spec-5.13 D2 — raw 512-byte leave-slot R/W in the leave-marker region.
+ *
+ *	These are payload-agnostic: the caller (cluster_clean_leave.c) packs a
+ *	ClusterLeaveIntentMarker into the first sizeof(marker) bytes of a 512-byte
+ *	buffer (rest zeroed) and owns the marker's magic/version/CRC.  This layer
+ *	just does an aligned pread/pwrite at CLUSTER_VOTING_LEAVE_SLOT_OFFSET(node_id)
+ *	with the same per-I/O timeout discipline as the voting-slot path.
+ *
+ *	read: returns OK + 512 bytes into out_slot512 (an unwritten/zeroed slot is
+ *	OK but its bytes are zero → the caller's magic check rejects it as "no
+ *	marker"); FAILED on short read / EOF (file not yet doubled) / I/O error.
+ *	write: pwrite + fdatasync; FAILED on error.  out_slot512 / in_slot512 must
+ *	point to at least CLUSTER_VOTING_SLOT_BYTES of storage.
+ */
+extern ClusterVotingDiskIoState cluster_voting_disk_read_leave_slot(int fd, uint32 node_id,
+																	void *out_slot512);
+extern ClusterVotingDiskIoState cluster_voting_disk_write_leave_slot(int fd, uint32 node_id,
+																	 const void *in_slot512);
 
 #endif /* USE_PGRAC_CLUSTER */
 

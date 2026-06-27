@@ -553,6 +553,20 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 *	  times out and fails closed (53RAA) -- proves the apply-after-drop
 	 *	  fail-closed path deterministically (t/297 L2). */
 	{ .name = "cluster-ko-peer-skip-ack" },
+	/*
+	 * spec-5.13 D12 (6 NEW points) — cooperative clean-leave driver FSM.  These
+	 * register the points so they are armable (cluster_inject_fault) + visible in
+	 * pg_stat_cluster_injections.  A :sleep on -ges-drained / -gcs-flushed pauses
+	 * the leaving node mid-drain (t/308 L8 escalate: SIGKILL while paused, before
+	 * COMMIT_READY, so the survivor fail-stops the node instead of clean-departing
+	 * it).  -escalate-to-failstop fires in cl_escalate.
+	 */
+	{ .name = "cluster-clean-leave-request" },
+	{ .name = "cluster-clean-leave-quiesce-pre" },
+	{ .name = "cluster-clean-leave-ges-drained" },
+	{ .name = "cluster-clean-leave-gcs-flushed" },
+	{ .name = "cluster-clean-leave-barrier-complete" },
+	{ .name = "cluster-clean-leave-escalate-to-failstop" },
 };
 
 #define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_points)

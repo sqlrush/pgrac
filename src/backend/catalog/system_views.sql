@@ -1602,6 +1602,34 @@ CREATE VIEW pg_cluster_reconfig_state AS
 REVOKE ALL ON pg_cluster_reconfig_state FROM PUBLIC;
 GRANT SELECT ON pg_cluster_reconfig_state TO PUBLIC;
 
+-- PGRAC: pg_cluster_clean_leave_state (spec-5.13 D13).
+--   Always-1-row view exposing this node's cooperative-leave drain progress:
+--   phase (idle/requested/quiescing/ges_draining/gcs_flushing/barrier_wait/
+--   committed/aborted/aborted_escalate), leaving_node_id (-1 when idle),
+--   leave_epoch, ges_drained_count, gcs_flushed_count, shards_remastered,
+--   survivor_ack_count, barrier_deadline (NULL when idle), escalate_count.
+--   Backed by cluster_get_clean_leave_state (OID 8960); read-only → public.
+--   cluster.enabled=off path returns 0 rows.
+CREATE VIEW pg_cluster_clean_leave_state AS
+    SELECT phase,
+           leaving_node_id,
+           leave_epoch,
+           ges_drained_count,
+           gcs_flushed_count,
+           shards_remastered,
+           survivor_ack_count,
+           barrier_deadline,
+           escalate_count
+      FROM cluster_get_clean_leave_state();
+
+REVOKE ALL ON pg_cluster_clean_leave_state FROM PUBLIC;
+GRANT SELECT ON pg_cluster_clean_leave_state TO PUBLIC;
+
+-- PGRAC: pg_cluster_clean_leave_request() is a mutating operator entry (asks
+-- this node to leave the cluster).  Superuser-only (the C body also gates on
+-- superuser()); REVOKE EXECUTE FROM PUBLIC for defense-in-depth (L7).
+REVOKE ALL ON FUNCTION pg_cluster_clean_leave_request() FROM PUBLIC;
+
 -- PGRAC: pg_cluster_ic_msg_types (spec-2.3 D8; 2026-05-08).
 --   Lists every IC message type registered in the process-local
 --   dispatch_table[] under cluster_ic_router.c.  Diagnostic /

@@ -272,6 +272,13 @@ cluster_voting_disk_write_slot(int fd pg_attribute_unused(),
 {
 	return CLUSTER_VOTING_DISK_IO_NOT_TRIED;
 }
+ClusterVotingDiskIoState
+cluster_voting_disk_write_leave_slot(int fd pg_attribute_unused(),
+									 uint32 node_id pg_attribute_unused(),
+									 const void *in_slot512 pg_attribute_unused())
+{
+	return CLUSTER_VOTING_DISK_IO_NOT_TRIED;
+}
 ClusterQvotecQuorumState
 decide_quorum_view(const ClusterVotingSlot *slots pg_attribute_unused(),
 				   const ClusterVotingDiskIoState *io_states pg_attribute_unused(),
@@ -331,6 +338,30 @@ cluster_write_fence_qvotec_poll_pending(ClusterFenceMarker *out pg_attribute_unu
 void cluster_write_fence_qvotec_complete(bool acked);
 void
 cluster_write_fence_qvotec_complete(bool acked pg_attribute_unused())
+{}
+
+/* spec-5.13 §2.5 stubs: cluster_qvotec.o now also references the clean-leave
+ * marker submit handshake + startup rebuild; cluster_clean_leave.o is not linked
+ * here.  poll_pending returns "no pending submit" so the qvotec poll path under
+ * test is unchanged; rebuild is a no-op. */
+void cluster_clean_leave_publish_qvotec_latch(struct Latch *latch);
+void
+cluster_clean_leave_publish_qvotec_latch(struct Latch *latch pg_attribute_unused())
+{}
+bool cluster_clean_leave_qvotec_poll_pending(void *out_slot512);
+bool
+cluster_clean_leave_qvotec_poll_pending(void *out_slot512 pg_attribute_unused())
+{
+	return false;
+}
+void cluster_clean_leave_qvotec_complete(bool acked);
+void
+cluster_clean_leave_qvotec_complete(bool acked pg_attribute_unused())
+{}
+void cluster_clean_leave_rebuild_from_disks(const int *fds, int n_disks);
+void
+cluster_clean_leave_rebuild_from_disks(const int *fds pg_attribute_unused(),
+									   int n_disks pg_attribute_unused())
 {}
 
 /* spec-4.12b D2/D4/D6 stubs: cluster_qvotec.o now references the enforcement GUC

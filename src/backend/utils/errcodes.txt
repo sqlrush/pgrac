@@ -502,6 +502,10 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 # 53R40 commit-boundary quorum loss and 53R50 fence/quorum-loss backend
 # abort so clients can pick distinct retry policy.
 53R60    E    ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS                           cluster_reconfig_in_progress
+# spec-5.13 D9 — writable backend on the LEAVING node aborted during a
+# cooperative clean leave.  Separate from 53R60 (any node hit by another's
+# death): 53R62 retry must reconnect to a survivor, this node is departing.
+53R62    E    ERRCODE_CLUSTER_CLEAN_LEAVE_IN_PROGRESS                        cluster_clean_leave_in_progress
 
 # spec-2.16 D14:  GES cross-node grant timeout / pending HTAB full
 # 53R70 fires when backend wait exceeds cluster.ges_request_timeout_ms

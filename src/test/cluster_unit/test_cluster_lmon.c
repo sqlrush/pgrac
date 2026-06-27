@@ -404,6 +404,18 @@ void
 cluster_ko_register_ic_msg_types(void)
 {}
 
+/* spec-5.13 D8 stub:  cluster_lmon_shmem_init registers the CLEAN_LEAVE IC msg
+ * types, but this standalone unit binary does not link cluster_clean_leave.o. */
+void
+cluster_clean_leave_register_ic_msg_types(void)
+{}
+
+/* spec-5.13 D6 stub:  the LMON tick calls the clean-leave orchestration; this
+ * standalone unit binary does not link cluster_clean_leave.o. */
+void
+cluster_clean_leave_lmon_tick(void)
+{}
+
 /* spec-2.2 D5 LMON drive references cluster_conf_lookup_node + cluster_node_id. */
 const struct ClusterNodeInfo *
 cluster_conf_lookup_node(int32 node_id pg_attribute_unused())

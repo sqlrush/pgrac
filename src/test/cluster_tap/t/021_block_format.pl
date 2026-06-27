@@ -55,7 +55,7 @@ my $has_visibility_inject =
 # +1 for the unconditional "pgrac cluster sequence" region (spec-5.4 SQ shmem foundation)
 # and +1 for the unconditional "pgrac cluster cr admit stats" region (spec-5.52 D9;
 # full enumerated region list + count lives in t/020).
-  my $expected_region_count = $has_visibility_inject ? '63' : '62'; # +1 spec-5.54 cr tuple stats
+  my $expected_region_count = $has_visibility_inject ? '64' : '63';
 
 
 # ----------
@@ -187,8 +187,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '132',
-   'L11 pg_stat_cluster_injections is 130 (spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2 undo boundary guards; spec-5.7 +1 cluster-ko-peer-skip-ack; spec-2.41 +1 cluster-gcs-block-stale-ship)');
+   '138',
+   'L11 pg_stat_cluster_injections is 138 (spec-5.13 +6 cluster-clean-leave-*) (spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2 undo boundary guards; spec-5.7 +1 cluster-ko-peer-skip-ack; spec-2.41 +1 cluster-gcs-block-stale-ship)');
 
 
 # ----------

@@ -81,7 +81,9 @@ sub new_triple
 			my $path = "$disk_dir/disk$i";
 			open(my $fh, '>', $path) or die "open $path: $!";
 			binmode $fh;
-			print $fh ("\0" x (128 * 512));
+			# PGRAC spec-5.13: two 512-byte regions per node (voting slot +
+			# clean-leave marker), so 2 * 128 slots = 128 KiB.
+			print $fh ("\0" x (2 * 128 * 512));
 			close $fh;
 			push @voting_disk_paths, $path;
 		}

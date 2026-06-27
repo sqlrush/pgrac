@@ -717,6 +717,119 @@ cluster_pcm_lock_clear_pending_x_for_node(int32 dead_node)
 }
 
 
+/* ========================================================================
+ * PGRAC MODIFICATIONS by SqlRush — spec-5.13 D5 (clean-leave PCM release).
+ *
+ *   cluster_pcm_lock_clean_leave_release_all_self(leave_epoch) -> uint64
+ *   — a leaving node clears its OWN holder records from the local PCM directory
+ *   (entries this node masters): drop its X holdership, its S residency bit,
+ *   and its PI residency bit on every entry.  Called AFTER the GCS flush +
+ *   release-X seam has persisted every dirty X block to shared storage (CL-I5),
+ *   so dropping the directory X record can never strand an unflushed current
+ *   image.  The survivor side drops node_id == leaving from entries it masters
+ *   as part of §3.2 step 2 (spec-5.13 S6).
+ *
+ *   Locking mirrors cluster_pcm_lock_clear_pending_x_for_node: htab_lock SHARED
+ *   over the scan + per-entry entry_lock EXCLUSIVE for the mutation (HC57).  An
+ *   entry left with no X holder and no S holders is demoted to master_state N.
+ *   leave_epoch is logged only by the S5 driver — the release is unconditional
+ *   once drain reaches this phase.  Returns the count of entries mutated.
+ * ======================================================================== */
+uint64
+cluster_pcm_lock_clean_leave_release_all_self(uint64 leave_epoch)
+{
+	HASH_SEQ_STATUS scan;
+	struct GrdEntry *entry;
+	uint64 released = 0;
+	uint32 self_bit;
+
+	(void)leave_epoch; /* logged by the S5 driver; release is unconditional here */
+
+	/* PCM holder bitmaps are 32-bit (one bit per node id 0..31). */
+	if (cluster_pcm_htab == NULL || cluster_node_id < 0 || cluster_node_id >= 32)
+		return 0;
+
+	self_bit = (uint32)1u << (uint32)cluster_node_id;
+
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+	hash_seq_init(&scan, cluster_pcm_htab);
+	while ((entry = (struct GrdEntry *)hash_seq_search(&scan)) != NULL) {
+		bool changed = false;
+
+		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+
+		if (entry->x_holder_node == cluster_node_id) {
+			entry->x_holder_node = -1;
+			changed = true;
+		}
+		if ((pg_atomic_read_u32(&entry->s_holders_bitmap) & self_bit) != 0) {
+			pg_atomic_fetch_and_u32(&entry->s_holders_bitmap, ~self_bit);
+			changed = true;
+		}
+		if ((pg_atomic_read_u32(&entry->pi_holders_bitmap) & self_bit) != 0) {
+			pg_atomic_fetch_and_u32(&entry->pi_holders_bitmap, ~self_bit);
+			changed = true;
+		}
+
+		/* No X holder and no S holders left -> the block is unheld; demote the
+		 * mastered state to N (shared storage becomes the sole authority). */
+		if (entry->x_holder_node < 0 && pg_atomic_read_u32(&entry->s_holders_bitmap) == 0)
+			pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_N);
+
+		LWLockRelease(&entry->entry_lock.lock);
+
+		if (changed)
+			released++;
+	}
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+
+	return released;
+}
+
+
+/* ========================================================================
+ * cluster_pcm_lock_clean_leave_verify_no_leftover(leaving_node) -> bool —
+ * spec-5.13 D5 (CL-I2 proof).  Read-only scan of the local PCM directory:
+ * returns true iff no entry still records `leaving_node` as the X holder or in
+ * the S / PI holder bitmaps.  A leftover PCM record for a departed node is a
+ * cross-node double-grant hazard (rule 8.A), so the clean-leave acceptance gate
+ * asserts this is empty after the leaving node's release + the survivor's drop.
+ * ======================================================================== */
+bool
+cluster_pcm_lock_clean_leave_verify_no_leftover(int32 leaving_node)
+{
+	HASH_SEQ_STATUS scan;
+	struct GrdEntry *entry;
+	uint32 leaving_bit;
+	bool clean = true;
+
+	/* PCM holder bitmaps are 32-bit (one bit per node id 0..31). */
+	if (cluster_pcm_htab == NULL || leaving_node < 0 || leaving_node >= 32)
+		return true;
+
+	leaving_bit = (uint32)1u << (uint32)leaving_node;
+
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+	hash_seq_init(&scan, cluster_pcm_htab);
+	while ((entry = (struct GrdEntry *)hash_seq_search(&scan)) != NULL) {
+		LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
+		if (entry->x_holder_node == leaving_node
+			|| (pg_atomic_read_u32(&entry->s_holders_bitmap) & leaving_bit) != 0
+			|| (pg_atomic_read_u32(&entry->pi_holders_bitmap) & leaving_bit) != 0)
+			clean = false;
+		LWLockRelease(&entry->entry_lock.lock);
+
+		if (!clean) {
+			hash_seq_term(&scan);
+			break;
+		}
+	}
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+
+	return clean;
+}
+
+
 /*
  * cluster_gcs_block_master_rebuild_from_redeclare -- spec-4.7 D2/D3.
  *

@@ -4553,6 +4553,98 @@ cluster_grd_cleanup_on_node_dead(int32 dead_node_id)
 }
 
 /*
+ * cluster_grd_clean_leave_drain_self -- spec-5.13 D4 cooperative GES drain.
+ *
+ *	The planned, cooperative dual of the failure path: a LIVE node leaving on
+ *	purpose proactively (1) remasters the shards it owns to survivors and (2)
+ *	releases every GES grant/waiter/convert it holds.  Both reuse the proven
+ *	failure-driven primitives, invoked proactively rather than on a CSSD DEAD
+ *	edge: cluster_grd_master_map_remaster() recomputes the survivor master map
+ *	with the leaving node removed, and cluster_grd_cleanup_on_node_dead()
+ *	enqueues a RELEASE to each master (HC25-26 at-most-once) and clears the
+ *	local holder/waiter/convert slots.  Run on the leaving node (RELEASE to
+ *	masters + clear self); survivors run the same primitives from their own
+ *	reconfig path.  After this + the existing REDECLARE all-survivor barrier no
+ *	GRD state references the leaving node (CL-I2; see verify below).  Returns
+ *	the number of master shards moved off the leaving node.
+ */
+uint32
+cluster_grd_clean_leave_drain_self(int32 leaving_node, uint64 leave_epoch)
+{
+	uint64 leave_bitmap[(CLUSTER_MAX_NODES + 63) / 64];
+	uint32 moved;
+
+	if (leaving_node < 0 || leaving_node >= CLUSTER_MAX_NODES)
+		return 0;
+
+	/* 1. move the shards this node masters to survivors (deterministic recompute) */
+	memset(leave_bitmap, 0, sizeof(leave_bitmap));
+	leave_bitmap[leaving_node >> 6] |= (UINT64CONST(1) << (leaving_node & 63));
+	moved = cluster_grd_master_map_remaster(leave_bitmap, leave_epoch);
+
+	/* 2. release every GES grant/waiter/convert held by the leaving node */
+	cluster_grd_cleanup_on_node_dead(leaving_node);
+
+	return moved;
+}
+
+/*
+ * cluster_grd_clean_leave_verify_no_leftover -- spec-5.13 D4 CL-I2 proof.
+ *
+ *	Read-only scan: returns true iff no GRD entry holds a holder / waiter /
+ *	convert for the leaving node AND no shard is still mastered by it.  Used as
+ *	the acceptance/assertion gate after drain + REDECLARE barrier (a leftover
+ *	leaving holder would be a cross-node double-grant hazard, rule 8.A).
+ */
+bool
+cluster_grd_clean_leave_verify_no_leftover(int32 leaving_node)
+{
+	HASH_SEQ_STATUS status;
+	ClusterGrdEntry *entry;
+	uint32 i;
+
+	if (leaving_node < 0 || leaving_node >= CLUSTER_MAX_NODES)
+		return true;
+
+	/* no shard may still be mastered by the leaving node */
+	if (cluster_grd_state != NULL
+		&& pg_atomic_read_u32(&cluster_grd_state->master_map_initialized) != 0) {
+		for (i = 0; i < PGRAC_GRD_SHARD_COUNT; i++) {
+			if ((int32)pg_atomic_read_u32(&cluster_grd_state->master[i]) == leaving_node)
+				return false;
+		}
+	}
+
+	if (cluster_grd_entry_htab == NULL)
+		return true;
+
+	hash_seq_init(&status, cluster_grd_entry_htab);
+	while ((entry = (ClusterGrdEntry *)hash_seq_search(&status)) != NULL) {
+		int k;
+
+		for (k = 0; k < entry->ngranted; k++) {
+			if (entry->holders[k].node_id == leaving_node) {
+				hash_seq_term(&status);
+				return false;
+			}
+		}
+		for (k = 0; k < entry->nwaiters; k++) {
+			if (entry->waiters[k].node_id == leaving_node) {
+				hash_seq_term(&status);
+				return false;
+			}
+		}
+		for (k = 0; k < entry->nconverts; k++) {
+			if (entry->converts[k].node_id == leaving_node) {
+				hash_seq_term(&status);
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+/*
  * spec-2.16 Step 4 D11:  stale-epoch sweep — independent rule per I48.
  *   Filters by holder.cluster_epoch < current_epoch.  Triggered post-
  *   reconfig epoch bump (LMON tick S2;  I47).

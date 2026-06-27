@@ -396,6 +396,86 @@ cluster_voting_disk_format(int fd, uint32 max_nodes, uint32 disk_index)
 			return rc;
 	}
 
+	/*
+	 * spec-5.13 D2/§2.5 — the clean-leave marker region (region 2, at
+	 * CLUSTER_VOTING_LEAVE_SLOT_OFFSET) is intentionally NOT seeded here.
+	 * An unwritten leave-slot reads back as EOF (file not yet doubled) or
+	 * zeros, both of which the clean-leave policy layer rejects as "no
+	 * marker" (magic mismatch) — the correct fail-closed empty state.  The
+	 * region is materialised lazily: qvotec's first leave-marker write
+	 * pwrites past the voting region, extending the file, and external file
+	 * provisioning honours the doubled cluster.voting_disk_size_bytes
+	 * default.  Seeding here would only turn would-be-EOF reads of the
+	 * voting region's tail into sparse-hole zero reads.
+	 */
+
+	return CLUSTER_VOTING_DISK_IO_OK;
+}
+
+
+/* ============================================================
+ * cluster_voting_disk_read_leave_slot / _write_leave_slot — spec-5.13 D2.
+ *
+ *	Raw 512-byte slot I/O in the clean-leave marker region (region 2), at
+ *	offset CLUSTER_VOTING_LEAVE_SLOT_OFFSET(node_id).  Payload-agnostic: the
+ *	caller marshals the ClusterLeaveIntentMarker and owns its integrity check.
+ *	Same SIGALRM per-I/O timeout discipline as the voting-slot path.
+ * ============================================================ */
+
+ClusterVotingDiskIoState
+cluster_voting_disk_read_leave_slot(int fd, uint32 node_id, void *out_slot512)
+{
+	/* 512-byte aligned buffer for O_DIRECT compatibility. */
+	char aligned[CLUSTER_VOTING_SLOT_BYTES] __attribute__((aligned(512)));
+	ssize_t nread;
+
+	if (fd < 0)
+		return CLUSTER_VOTING_DISK_IO_NOT_TRIED;
+	if (out_slot512 == NULL || node_id >= CLUSTER_MAX_NODES)
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+
+	memset(aligned, 0, sizeof(aligned));
+
+	voting_disk_io_arm_timeout();
+	nread
+		= pread(fd, aligned, CLUSTER_VOTING_SLOT_BYTES, CLUSTER_VOTING_LEAVE_SLOT_OFFSET(node_id));
+	voting_disk_io_disarm_timeout();
+	if (nread != CLUSTER_VOTING_SLOT_BYTES) {
+		/* Short read / EOF (file not yet doubled) / EIO / SIGALRM timeout —
+		 * fail-closed; the caller treats this as "no trustworthy marker". */
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+	}
+
+	memcpy(out_slot512, aligned, CLUSTER_VOTING_SLOT_BYTES);
+	return CLUSTER_VOTING_DISK_IO_OK;
+}
+
+ClusterVotingDiskIoState
+cluster_voting_disk_write_leave_slot(int fd, uint32 node_id, const void *in_slot512)
+{
+	/* 512-byte aligned buffer for O_DIRECT compatibility. */
+	char aligned[CLUSTER_VOTING_SLOT_BYTES] __attribute__((aligned(512)));
+	ssize_t nwritten;
+
+	if (fd < 0)
+		return CLUSTER_VOTING_DISK_IO_NOT_TRIED;
+	if (in_slot512 == NULL || node_id >= CLUSTER_MAX_NODES)
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+
+	memcpy(aligned, in_slot512, CLUSTER_VOTING_SLOT_BYTES);
+
+	voting_disk_io_arm_timeout();
+	nwritten
+		= pwrite(fd, aligned, CLUSTER_VOTING_SLOT_BYTES, CLUSTER_VOTING_LEAVE_SLOT_OFFSET(node_id));
+	if (nwritten != CLUSTER_VOTING_SLOT_BYTES) {
+		voting_disk_io_disarm_timeout();
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+	}
+	if (fdatasync(fd) != 0) {
+		voting_disk_io_disarm_timeout();
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+	}
+	voting_disk_io_disarm_timeout();
 	return CLUSTER_VOTING_DISK_IO_OK;
 }
 

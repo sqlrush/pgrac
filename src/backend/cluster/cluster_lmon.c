@@ -55,6 +55,7 @@
 #include "utils/ps_status.h"
 #include "utils/timestamp.h"
 
+#include "cluster/cluster_clean_leave.h" /* cluster_clean_leave_register_ic_msg_types (spec-5.13 D8) */
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_cssd.h"	   /* cluster_cssd_outbound_slots (spec-2.5 D2.6) */
 #include "cluster/cluster_fence.h"	   /* cluster_fence_lmon_tick (spec-2.28 D5) */
@@ -397,6 +398,20 @@ cluster_lmon_shmem_init(void)
 		if (!ko_flush_registered) {
 			cluster_ko_register_ic_msg_types();
 			ko_flush_registered = true;
+		}
+	}
+
+	/* spec-5.13 D8: register PGRAC_IC_MSG_CLEAN_LEAVE_ANNOUNCE (26) +
+	 * LEAVE_DRAIN_ACK (27) + LEAVE_DRAIN_NAK (28) for cooperative clean-leave
+	 * reconfiguration.  The leaving node's LMON broadcasts the announce; each
+	 * survivor's LMON replies ACK (ready-to-commit) or NAK (disabled / not in
+	 * quorum). */
+	{
+		static bool clean_leave_registered = false;
+
+		if (!clean_leave_registered) {
+			cluster_clean_leave_register_ic_msg_types();
+			clean_leave_registered = true;
 		}
 	}
 }
@@ -952,6 +967,11 @@ LmonMain(void)
 			cluster_grd_outbound_lmon_drain_send();
 			cluster_lms_native_probe_retry_tick();
 
+			/* spec-5.13 D6: clean-leave orchestration runs BEFORE the reconfig
+			 * tick (same ordering as the dead-sweep) so a cleanly-departed node
+			 * is recorded before reconfig builds its dead set (CL-I13). */
+			cluster_clean_leave_lmon_tick();
+
 			cluster_reconfig_lmon_tick();
 
 			/*
@@ -1498,6 +1518,9 @@ LmonMain(void)
 			cluster_grd_lmon_tick_dead_sweep();
 			/* spec-5.10 fix-forward — runtime-off starvation sweep. */
 			(void)cluster_grd_lmon_tick_starvation_sweep();
+
+			/* spec-5.13 D6: clean-leave orchestration before the reconfig tick. */
+			cluster_clean_leave_lmon_tick();
 
 			cluster_reconfig_lmon_tick();
 			/* spec-4.6 D1:  GRD recovery sequence (see main-loop site). */

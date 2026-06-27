@@ -245,6 +245,8 @@ typedef enum BuiltinTrancheIds {
 	 * Spec: spec-1.13-diag-skeleton.md Sprint A D1+D2
 	 */
 	LWTRANCHE_CLUSTER_DIAG,
+	/* spec-5.13: guards the clean-leave ClusterLeaveState shmem block. */
+	LWTRANCHE_CLUSTER_CLEAN_LEAVE,
 	/*
 	 * PGRAC (stage 1.14 Sprint A): dedicated tranche for
 	 * ClusterStatsSharedState lwlock — same pattern as LMON / LCK / DIAG.

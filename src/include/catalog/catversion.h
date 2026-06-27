@@ -699,7 +699,11 @@
  * reconfig_kind (text); cluster_get_reconfig_state pg_proc row (oid 8920) +
  * the system_views.sql view updated.  Rebased on top of 5.12 (202606290);
  * bump to 202606300. */
-#define CATALOG_VERSION_NO 202606300
+
+/* spec-5.13 (2026-06-27): clean-leave catalog surface — cluster_get_clean_leave_state
+ * SRF (oid 8960) + pg_cluster_clean_leave_state view + pg_cluster_clean_leave_request
+ * operator UDF (oid 8961).  Bump 202606300 -> 202606310. */
+#define CATALOG_VERSION_NO 202606310
 
 /* spec-2.39 D10 (2026-05-21):  SI Broadcaster production activation —
  * DDL commit hook (AtEOXact_Inval + COMMIT PREPARED via cluster-aware

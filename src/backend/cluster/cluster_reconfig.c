@@ -143,6 +143,10 @@ cluster_reconfig_shmem_init(void)
 		for (int k = 0; k < CLUSTER_RECONFIG_TOUCH_KIND_COUNT; k++)
 			pg_atomic_init_u64(&ReconfigShmem->touched_stamp_by_kind[k], 0);
 		pg_atomic_init_u64(&ReconfigShmem->clean_leave_rejected_count, 0);
+		pg_atomic_init_u64(&ReconfigShmem->clean_leave_drain_grace_count, 0);
+		/* spec-5.13 D3 — clean_departed_bitmap + clean_departed_epoch[] left
+		 * zeroed by memset (no node departed); init the lifetime counter. */
+		pg_atomic_init_u64(&ReconfigShmem->clean_departed_count, 0);
 		/* last_applied left zeroed by memset — event_id=0 =
 		 * CLUSTER_RECONFIG_OBSERVER_NONE = never-applied sentinel. */
 	}
@@ -299,6 +303,14 @@ cluster_reconfig_note_clean_leave_rejected(void)
 }
 
 uint64
+cluster_reconfig_note_clean_leave_drain_grace(void)
+{
+	if (ReconfigShmem == NULL)
+		return 1; /* pretend non-zero so the caller skips the LOG-once */
+	return pg_atomic_fetch_add_u64(&ReconfigShmem->clean_leave_drain_grace_count, 1);
+}
+
+uint64
 cluster_reconfig_get_touched_abort_count(void)
 {
 	if (ReconfigShmem == NULL)
@@ -328,6 +340,14 @@ cluster_reconfig_get_clean_leave_rejected_count(void)
 	if (ReconfigShmem == NULL)
 		return 0;
 	return pg_atomic_read_u64(&ReconfigShmem->clean_leave_rejected_count);
+}
+
+uint64
+cluster_reconfig_get_clean_leave_drain_grace_count(void)
+{
+	if (ReconfigShmem == NULL)
+		return 0;
+	return pg_atomic_read_u64(&ReconfigShmem->clean_leave_drain_grace_count);
 }
 
 
@@ -418,6 +438,113 @@ cluster_reconfig_get_last_event_id(void)
 
 
 /* ============================================================
+ * spec-5.13 D3 (CL-I13) — clean-departed bitmap record / clear / query.
+ *
+ *	A node enters clean_departed_bitmap when a CLEAN_LEAVE reconfig commits
+ *	naming it (survivor observe), or at startup rebuilt from a durable §2.5
+ *	COMMITTED marker.  cluster_reconfig_lmon_tick masks it out of the dead set
+ *	so its later CSSD DEAD never re-triggers fail-stop (the spurious second
+ *	reconfig of R18 / 40R01 of a drain-grace tx).  Mutations take `lock`
+ *	EXCLUSIVE; the lmon_tick masking reads under SHARED.
+ * ============================================================
+ */
+
+static inline bool
+clean_departed_test_bit_locked(const uint8 *bmp, int i)
+{
+	if (i < 0 || i >= CLUSTER_RECONFIG_DEAD_BITMAP_BYTES * 8)
+		return false;
+	return (bmp[i / 8] & (uint8)(1u << (i % 8))) != 0;
+}
+
+void
+cluster_reconfig_record_clean_departed(int32 node_id, uint64 leave_epoch, bool raise_epoch_floor)
+{
+	bool newly_set = false;
+
+	if (ReconfigShmem == NULL)
+		return;
+	if (node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return;
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	if (!clean_departed_test_bit_locked(ReconfigShmem->clean_departed_bitmap, node_id)) {
+		dead_bitmap_set_bit(ReconfigShmem->clean_departed_bitmap, node_id);
+		newly_set = true;
+	}
+	/* Always record the latest leave epoch (a re-departure raises it). */
+	if (leave_epoch > ReconfigShmem->clean_departed_epoch[node_id])
+		ReconfigShmem->clean_departed_epoch[node_id] = leave_epoch;
+	LWLockRelease(&ReconfigShmem->lock);
+
+	if (newly_set)
+		pg_atomic_fetch_add_u64(&ReconfigShmem->clean_departed_count, 1);
+
+	/*
+	 * P1-V0.7 epoch-floor recovery: the membership epoch is not durable, so a
+	 * durable COMMITTED marker is the only proof the cluster reached
+	 * leave_epoch.  Raise the local floor (max-merge, monotone, never retreats)
+	 * — exempt from OBSERVE_MAX_JUMP since this is startup recovery, not a
+	 * hostile inbound envelope.  Done outside the reconfig lock (epoch is its
+	 * own shmem with its own CAS).
+	 */
+	if (raise_epoch_floor && leave_epoch > 0)
+		(void)cluster_epoch_observe_remote(leave_epoch);
+}
+
+void
+cluster_reconfig_clear_clean_departed(int32 node_id)
+{
+	if (ReconfigShmem == NULL)
+		return;
+	if (node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return;
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	if (clean_departed_test_bit_locked(ReconfigShmem->clean_departed_bitmap, node_id))
+		ReconfigShmem->clean_departed_bitmap[node_id / 8] &= (uint8) ~(1u << (node_id % 8));
+	ReconfigShmem->clean_departed_epoch[node_id] = 0;
+	LWLockRelease(&ReconfigShmem->lock);
+}
+
+bool
+cluster_reconfig_is_clean_departed(int32 node_id)
+{
+	bool departed;
+
+	if (ReconfigShmem == NULL || node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	departed = clean_departed_test_bit_locked(ReconfigShmem->clean_departed_bitmap, node_id);
+	LWLockRelease(&ReconfigShmem->lock);
+	return departed;
+}
+
+uint64
+cluster_reconfig_get_clean_departed_epoch(int32 node_id)
+{
+	uint64 epoch;
+
+	if (ReconfigShmem == NULL || node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return 0;
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	epoch = ReconfigShmem->clean_departed_epoch[node_id];
+	LWLockRelease(&ReconfigShmem->lock);
+	return epoch;
+}
+
+uint64
+cluster_reconfig_get_clean_departed_count(void)
+{
+	if (ReconfigShmem == NULL)
+		return 0;
+	return pg_atomic_read_u64(&ReconfigShmem->clean_departed_count);
+}
+
+
+/* ============================================================
  * Step 2 D2 — cluster_reconfig_lmon_tick body.
  *
  *	  Stateless deterministic per Q6 C.  Runs every LMON tick (~100ms).
@@ -485,7 +612,27 @@ cluster_reconfig_lmon_tick(void)
 			dead_bitmap_set_bit(alive_set, i);
 	}
 
-	/* No peer death → no reconfig event. */
+	/*
+	 * spec-5.13 D3 (CL-I13) — effective_dead = cssd_dead & ~clean_departed.
+	 * A cleanly-departed node (a CLEAN_LEAVE reconfig committed naming it, then
+	 * it exited) stops heart-beating and shows up CSSD DEAD here.  Masking it
+	 * out suppresses the spurious SECOND fail-stop reconfig (and the spurious
+	 * 40R01 of a drain-grace survivor tx whose touched_peers still names it,
+	 * R18).  A node only enters clean_departed AFTER its leave committed, so its
+	 * leftover is provably zero (CL-I2) and its death is a no-op — safe to
+	 * ignore.  A pre-commit heartbeat stop is NOT in clean_departed yet → still
+	 * escalates to fail-stop (CL-I7).  Read the mask under SHARED.
+	 */
+	if (ReconfigShmem != NULL) {
+		int b;
+
+		LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+		for (b = 0; b < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; b++)
+			dead_bitmap[b] &= (uint8)~ReconfigShmem->clean_departed_bitmap[b];
+		LWLockRelease(&ReconfigShmem->lock);
+	}
+
+	/* No (effective) peer death → no reconfig event. */
 	if (dead_bitmap_is_zero(dead_bitmap))
 		return;
 
@@ -728,6 +875,91 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 
 
 /*
+ * spec-5.13 D3 — cluster_reconfig_apply_clean_leave_as_coordinator.
+ *
+ *	The commit point of the §3.1 two-phase clean-leave commit, run on the
+ *	survivor coordinator (min node id, Q6-A).  Bumps the membership epoch and
+ *	publishes a CLEAN_LEAVE reconfig event naming the leaving node in
+ *	dead_bitmap, then records it clean-departed at the new epoch so the lmon_tick
+ *	mask suppresses its later CSSD DEAD (CL-I13).  Mirrors
+ *	apply_epoch_bump_as_coordinator's epoch-advance side effects (eager GCS wake
+ *	+ sinval reset + TT overlay flush) so survivors invalidate stale leaving-node
+ *	cache at epoch advance (CL-I5 happens-before).  No write-fence marker: the
+ *	leaving node drained cooperatively (nothing to fence); the durable record is
+ *	the §2.5 leave-intent marker, written by the driver BEFORE (COMMITTING) and
+ *	AFTER (COMMITTED) this call.  PROCSIG broadcast is intentionally NOT done
+ *	here — the touched drain-grace dispatch (CL-I12) + serve-gate are wired in
+ *	spec-5.13 S6; the driver/LMON owns any survivor-side wake.  Returns the new
+ *	epoch E (the driver stamps it into the COMMITTED marker).
+ */
+uint64
+cluster_reconfig_apply_clean_leave_as_coordinator(int32 leaving_node_id, uint64 baseline_epoch)
+{
+	uint64 old_epoch, new_epoch;
+	XLogRecPtr lsn;
+	uint8 dead_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
+	uint64 cssd_dead_generation;
+	ReconfigEvent evt;
+
+	if (!cluster_enabled || ReconfigShmem == NULL)
+		return 0;
+	if (leaving_node_id < 0 || leaving_node_id >= CLUSTER_MAX_NODES)
+		return 0;
+
+	/* inject points for the clean-leave path are D12 (spec-5.13 S7). */
+
+	dead_bitmap_set_bit(dead_bitmap, leaving_node_id);
+	cssd_dead_generation = cluster_cssd_get_dead_generation();
+
+	/*
+	 * CL-I3 guarded advance: bump to baseline+1 ONLY if the epoch is still the
+	 * baseline the leave committed against.  At >=3 nodes a third node's death
+	 * could bump the epoch between the driver's pre-check and here; an
+	 * unconditional CAS-loop would then stack the clean-leave on top of that
+	 * death's view (a stale-baseline commit, CL-I3 violation).  The single
+	 * compare_exchange fails closed in that case — return 0 so the driver does
+	 * NOT write the COMMITTED marker; the leaving node observes the foreign
+	 * event and escalates to fail-stop.  At 2 nodes this is exactly equivalent
+	 * to the old unconditional bump (no third party can move the epoch).
+	 */
+	old_epoch = baseline_epoch;
+	if (!cluster_epoch_advance_for_reconfig_if_baseline(baseline_epoch, &new_epoch))
+		return 0;
+	lsn = GetXLogInsertRecPtr();
+	cluster_epoch_set_changed_at_lsn((uint64)lsn);
+
+	/*
+	 * Same epoch-advance side effects as the fail-stop coordinator path: wake
+	 * GCS block-shipping slots, RESET sinval, flush the TT status overlay.  On
+	 * each survivor these run when it observes the new epoch; on the coordinator
+	 * they run here.  This is what invalidates stale leaving-node cache so the
+	 * post-epoch storage read returns the just-flushed current (CL-I5).
+	 */
+	cluster_gcs_block_on_epoch_advance(new_epoch);
+	cluster_sinval_reset_all_on_reconfig();
+	cluster_tt_status_flush_all((uint32)new_epoch);
+
+	memset(&evt, 0, sizeof(evt));
+	evt.event_id = cluster_reconfig_compute_event_id(dead_bitmap, cssd_dead_generation);
+	evt.coordinator_node_id = cluster_node_id;
+	evt.old_epoch = old_epoch;
+	evt.new_epoch = new_epoch;
+	memcpy(evt.dead_bitmap, dead_bitmap, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
+	evt.applied_at = GetCurrentTimestamp();
+	evt.observer_role = CLUSTER_RECONFIG_OBSERVER_COORDINATOR;
+	evt.cssd_dead_generation = cssd_dead_generation;
+	evt.reconfig_kind = RECONFIG_KIND_CLEAN_LEAVE;
+	cluster_reconfig_publish_event(&evt);
+
+	/* CL-I13: record clean-departed at E so the lmon_tick mask suppresses the
+	 * node's later CSSD DEAD (no epoch-floor raise — the epoch is live here). */
+	cluster_reconfig_record_clean_departed(leaving_node_id, new_epoch, false);
+
+	return new_epoch;
+}
+
+
+/*
  * Step 2 D4 — cluster_reconfig_check_pending_in_proc_interrupts.
  *
  *	  Called from tcop/postgres.c::ProcessInterrupts after
@@ -803,14 +1035,26 @@ cluster_reconfig_check_pending_in_proc_interrupts(void)
 			  && cluster_touched_peers_intersects(ev.dead_bitmap);
 
 	/*
-	 * Defensive: CLEAN_LEAVE has no producer until spec-5.13.  A touched
-	 * CLEAN_LEAVE here is unexpected — tally + WARN, then handle it
-	 * conservatively as a fail-stop (rule 8: explicit, not silent).
+	 * spec-5.13 S6 (CL-I12) — touched-tx drain-grace dispatch by reconfig_kind.
+	 * FAIL_STOP: the departed member's volatile state may be torn/lost, so a
+	 * survivor tx that touched it MUST abort (40R01, the classify_verdict path
+	 * below).  CLEAN_LEAVE: the leaving member flushed all its dirty blocks to
+	 * shared storage before the commit, so the data is PRESERVED — a touched
+	 * survivor tx is NOT aborted; it continues (drain-grace).  Its reads of any
+	 * leaving-node block are gated by the CL-I5 serve-gate
+	 * (cluster_clean_leave_block_serve_gate_allows in the GCS block-serve path):
+	 * fail-closed (53R62 retry) until the leave commits + the cache invalidates,
+	 * then it reads the just-flushed current.  This is the spec-5.14 Q1=B
+	 * consumer contract: FAIL_STOP → abort (data lost); CLEAN_LEAVE →
+	 * wait-then-continue (data preserved).
 	 */
 	if (touched && ev.reconfig_kind == RECONFIG_KIND_CLEAN_LEAVE) {
-		cluster_reconfig_note_clean_leave_rejected();
-		ereport(WARNING, (errmsg("cluster reconfig: unexpected CLEAN_LEAVE kind during transition; "
-								 "handling conservatively as fail-stop")));
+		if (cluster_reconfig_note_clean_leave_drain_grace() == 0)
+			ereport(LOG,
+					(errmsg("cluster clean-leave: in-flight transactions that touched the "
+							"leaving node continue under drain-grace (data preserved); reads of "
+							"leaving-node blocks are serve-gated until the leave commits")));
+		return; /* ABSORB — drain-grace, NOT 40R01 */
 	}
 
 	/* diag (default off): dump this tx's touched-set hex on any touched abort. */

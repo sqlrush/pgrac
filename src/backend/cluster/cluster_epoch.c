@@ -165,6 +165,45 @@ cluster_epoch_advance_for_reconfig(uint64 *old_out, uint64 *new_out)
 	*new_out = old_val + 1;
 }
 
+/*
+ * spec-5.13 D3 (CL-I3): cluster_epoch_advance_for_reconfig_if_baseline
+ *
+ *	  Guarded variant of the coordinator advance: bump the epoch to
+ *	  baseline+1 ONLY if the current epoch still equals `baseline`.
+ *	  Single compare_exchange (no retry loop): a CAS failure here means
+ *	  some OTHER reconfig (a real death) already moved the epoch off the
+ *	  baseline the clean-leave committed against, so the leave must NOT
+ *	  commit on a stale view — return false and let the leaving node
+ *	  observe the foreign event and escalate to fail-stop (CL-I3).  This
+ *	  closes the check-then-bump TOCTOU in cl_coordinator_commit that is
+ *	  benign at 2 nodes (no third party can bump) but unsafe at >=3.
+ *
+ *	  Returns true iff the epoch advanced (current was baseline); on true,
+ *	  *new_out = baseline + 1.  On false the epoch is left untouched.
+ */
+bool
+cluster_epoch_advance_for_reconfig_if_baseline(uint64 baseline, uint64 *new_out)
+{
+	uint64 expected = baseline;
+
+	Assert(new_out != NULL);
+
+	if (cluster_epoch_state == NULL) {
+		*new_out = CLUSTER_EPOCH_INITIAL;
+		return false;
+	}
+
+	if (pg_atomic_compare_exchange_u64(&cluster_epoch_state->current_epoch, &expected,
+									   baseline + 1)) {
+		*new_out = baseline + 1;
+		return true;
+	}
+
+	/* `expected` now holds the racing current epoch; leave it untouched. */
+	*new_out = expected;
+	return false;
+}
+
 void
 cluster_epoch_set_changed_at_lsn(uint64 lsn)
 {
@@ -257,6 +296,15 @@ cluster_epoch_advance_for_reconfig(uint64 *old_out, uint64 *new_out)
 		*old_out = CLUSTER_EPOCH_INITIAL;
 	if (new_out != NULL)
 		*new_out = CLUSTER_EPOCH_INITIAL;
+}
+
+bool
+cluster_epoch_advance_for_reconfig_if_baseline(uint64 baseline pg_attribute_unused(),
+											   uint64 *new_out)
+{
+	if (new_out != NULL)
+		*new_out = CLUSTER_EPOCH_INITIAL;
+	return false;
 }
 
 void

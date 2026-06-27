@@ -6717,6 +6717,97 @@ cluster_bufmgr_flush_seq_page_to_storage(Buffer buffer)
 }
 
 /* ========================================================================
+ * PGRAC MODIFICATIONS by SqlRush — spec-5.13 D5b (clean-leave GCS flush seam).
+ *
+ *   cluster_bufmgr_flush_and_release_x_for_leave(void) -> uint32
+ *   — a leaving node, while still alive, force-persists every dirty block it
+ *   holds X on to shared storage and then releases that X (cache-residency
+ *   pcm_state X -> N).  After this returns the leaving node holds NO in-memory
+ *   current for any block: shared storage is the sole authority, so a survivor
+ *   can read the current image from storage once it has invalidated its stale
+ *   cache (CL-I5 / §0.3 命门 — the only sound way to bypass the Stage-6 cross-
+ *   instance cache-coherence wall, because no in-memory current remains
+ *   anywhere).
+ *
+ *   FlushBuffer is a bufmgr private static (cluster code cannot call it), so
+ *   this seam MUST live in bufmgr.c.  It is the persist-and-confirm sibling of
+ *   cluster_bufmgr_copy_block_for_gcs (which is copy-only, never persists).
+ *
+ *   Pin discipline mirrors FlushDatabaseBuffers / FlushRelationBuffers exactly
+ *   (CL-I9 — runs in the leaving node's own backend/checkpointer with a valid
+ *   CurrentResourceOwner, NEVER in the LMON aux process, where XLogFlush /
+ *   FlushBuffer are not legal):
+ *     - ResourceOwnerEnlargeBuffers once before the loop;
+ *     - per buffer: ReservePrivateRefCountEntry + LockBufHdr; select
+ *       VALID & DIRTY & pcm_state == PCM_STATE_X.  No unlocked precheck — the
+ *       X residency bit is mutable; the leaving node is quiesced so no
+ *       concurrent X-acquire races, but we lock every header for an 8.A-safe
+ *       read regardless;
+ *     - PinBuffer_Locked (releases the header spinlock) -> content_lock SHARED
+ *       -> FlushBuffer (does its own XLogFlush(page_lsn) for BM_PERMANENT +
+ *       smgrwrite to shared storage) -> content_lock release;
+ *     - release X ONLY after the flush succeeds: re-LockBufHdr (the pin keeps
+ *       the descriptor valid across the brief unlocked window, so no tag re-
+ *       validate is needed — a pinned buffer is never reused), set pcm_state =
+ *       PCM_STATE_N, UnlockBufHdr, then UnpinBuffer.
+ *
+ *   Fail-closed (Rule 8.A / 8.B): a write/flush error makes FlushBuffer
+ *   ereport(ERROR); the ResourceOwner unwinds the pin + content lock and
+ *   pcm_state stays X — the block keeps its X grant and is NEVER falsely
+ *   advertised as flushed.  The S5 driver wraps this in PG_TRY/CATCH and goes
+ *   ABORTED_ESCALATE rather than assume a half-completed drain succeeded.
+ *   Clean (non-dirty) X blocks are intentionally left here: their storage image
+ *   is already current; the PCM directory holder record is cleared separately
+ *   by cluster_pcm_lock_clean_leave_release_all_self.  Over-flush is harmless.
+ *   Returns the count of blocks flushed + X-released.
+ * ======================================================================== */
+uint32
+cluster_bufmgr_flush_and_release_x_for_leave(void)
+{
+	uint32		flushed = 0;
+	int			i;
+
+	/* CL-I9: must run with a real ResourceOwner (backend/checkpointer). */
+	Assert(CurrentResourceOwner != NULL);
+
+	/* Make sure we can handle the pin inside the loop (as FlushDatabaseBuffers). */
+	ResourceOwnerEnlargeBuffers(CurrentResourceOwner);
+
+	for (i = 0; i < NBuffers; i++)
+	{
+		BufferDesc *bufHdr = GetBufferDescriptor(i);
+		uint32		buf_state;
+
+		ReservePrivateRefCountEntry();
+
+		buf_state = LockBufHdr(bufHdr);
+		if ((buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY) &&
+			(PcmState) bufHdr->pcm_state == PCM_STATE_X)
+		{
+			PinBuffer_Locked(bufHdr);	/* releases the header spinlock */
+			LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_SHARED);
+			FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+			LWLockRelease(BufferDescriptorGetContentLock(bufHdr));
+
+			/*
+			 * Release X only now that the block is durable + current on shared
+			 * storage.  The pin held it valid across the unlocked window above.
+			 */
+			buf_state = LockBufHdr(bufHdr);
+			bufHdr->pcm_state = (uint8) PCM_STATE_N;
+			UnlockBufHdr(bufHdr, buf_state);
+
+			UnpinBuffer(bufHdr);
+			flushed++;
+		}
+		else
+			UnlockBufHdr(bufHdr, buf_state);
+	}
+
+	return flushed;
+}
+
+/* ========================================================================
  * PGRAC MODIFICATIONS by SqlRush — spec-5.2 §3.5 D11 (writer-transfer-revoke,
  *   active-ITL hard boundary, multi-row fail-closed leg).
  *
