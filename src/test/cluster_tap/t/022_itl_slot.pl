@@ -141,7 +141,7 @@ SKIP: {
 	});
 
 	# L7: PIVOT A -- after first INSERT pd_lower = 36 (32 + 4-byte ItemId);
-	# pd_special = 7808 (BLCKSZ - 384 ITL); pd_upper = 7776 (one tuple).
+	# pd_special = 7800 (BLCKSZ - 392 ITL special); pd_upper = 7776 (one tuple).
 	# This is fundamentally different from the pre-PIVOT layout where
 	# pd_lower would be 420.
 
@@ -149,8 +149,8 @@ SKIP: {
 			'postgres', q{
 		SELECT lower::text || ',' || special::text || ',' || version::text
 		  FROM page_header(get_raw_page('t1', 0))}),
-	   '36,7808,5',
-	   'L7 PIVOT A heap page: lower=36, special=7808, version=5 (ITL in special area, not after header)');
+	   '36,7800,5',
+	   'L7 PIVOT A heap page: lower=36, special=7800, version=5 (ITL in special area, not after header)');
 
 	# L8: ITL slot array at special area (offset 7808-8191) is 384 zero bytes.
 	is($node->safe_psql(
@@ -361,14 +361,14 @@ SKIP: {
 	   '36',
 	   'L19 PIVOT A heap page after first INSERT: pd_lower = 36 (NOT 420)');
 
-	# L20: heap page PageGetSpecialSize = 384 (= CLUSTER_ITL_ARRAY_SIZE).
+	# L20: heap page PageGetSpecialSize = 392 (= CLUSTER_ITL_SPECIAL_SIZE, spec-3.10 §v0.5).
 	is($node->safe_psql(
 			'postgres', q{
 		SELECT (pagesize - special)
 		  FROM page_header(get_raw_page('pivot_a_heap', 0))
 	}),
-	   '384',
-	   'L20 PIVOT A heap page PageGetSpecialSize = 384 (CLUSTER_ITL_ARRAY_SIZE)');
+	   '392',
+	   'L20 PIVOT A heap page PageGetSpecialSize = 392 (CLUSTER_ITL_SPECIAL_SIZE, spec-3.10 v0.5 recycle watermark)');
 
 	# L21: heap page PageGetMaxOffsetNumber = 1 (one INSERT'd tuple).
 	is($node->safe_psql(

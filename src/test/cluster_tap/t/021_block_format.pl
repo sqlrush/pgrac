@@ -136,13 +136,13 @@ SKIP: {
 	# L6: heap PageInit (1.4) -> heap PageInitHeapPage (1.5 PIVOT A).
 	# Stage 1.5 reserves 384B ITL array in PG special area at page tail,
 	# so pd_lower = 32 + 4 (first ItemId) = 36 (not 420 like pre-PIVOT).
-	# pagesize = 8192; layout version = 5; pd_special = 7808.
+	# pagesize = 8192; layout version = 5; pd_special = 7800.
 	is($node->safe_psql(
 			'postgres', q{
 		SELECT lower::text || ',' || pagesize::text || ',' || version::text || ',' || special::text
 		  FROM page_header(get_raw_page('t1', 0))}),
-	   '36,8192,5,7808',
-	   'L6 heap page first INSERT (PIVOT A): lower=36, pagesize=8192, version=5, special=7808 (ITL in special area)');
+	   '36,8192,5,7800',
+	   'L6 heap page first INSERT (PIVOT A): lower=36, pagesize=8192, version=5, special=7800 (ITL in special area)');
 
 	# L7: btree index PageInit -- root page version = 5.
 	$node->safe_psql('postgres', q{
