@@ -1,4 +1,4 @@
-# 315_cluster_5_13_clean_leave_preflight_failclosed.pl
+# 316_cluster_5_13_clean_leave_preflight_failclosed.pl
 #
 # spec-5.13 clean-leave reconfiguration — Hardening v1.0.3 (P1).
 #
@@ -28,7 +28,7 @@
 # Author: SqlRush <sqlrush@gmail.com>
 #
 # IDENTIFICATION
-#     src/test/cluster_tap/t/315_cluster_5_13_clean_leave_preflight_failclosed.pl
+#     src/test/cluster_tap/t/316_cluster_5_13_clean_leave_preflight_failclosed.pl
 
 use strict;
 use warnings;
