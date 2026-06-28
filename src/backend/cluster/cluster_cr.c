@@ -1324,33 +1324,51 @@ cluster_cr_count_xmax_scan_unavail_or_no_proof(void)
 }
 
 /*
- * cluster_cr_accept_resolved_scn -- spec-4.8 D3 acceptance gate for a Source 3
- *	by-xid RESOLVED match, extracted (spec-5.55 D6) so the fresh-scan path AND a
- *	shared-resolver-cache memo hit run the PHYSICALLY SAME gate (gate (3),
- *	verdict-equivalent by construction -- they cannot drift).
+ * cluster_cr_resolved_scn_is_acceptable -- spec-4.8 D3 acceptance PREDICATE for a
+ *	Source 3 by-xid RESOLVED match: the pure verdict, with NO observability side
+ *	effect.  Extracted (spec-5.55 D6) so the fresh-scan path AND a shared-resolver-
+ *	cache memo hit reach the SAME verdict (gate (3), verdict-equivalent by
+ *	construction -- they cannot drift).
  *
  *	The durable scan runs WRAP_ANY (a recycled scratch ITL slot carries no
  *	binding wrap), so a single COMMITTED match cannot tell a genuine commit from a
  *	2^32-wrapped raw-xid collision.  When retention is unreliable AND the match is
- *	below the CURRENT horizon it is wrap-suspect -> fail closed (规则 8.A: a wrong
- *	deleter scn would false-hide a live row); the existing
- *	wrap_generation_disambiguated observability is bumped.  The reliability proof
- *	is the EXACT sticky condition (horizon enabled AND no retention-off recycle
- *	this incarnation), not an abstraction -- losing the sticky leg would re-trust
- *	a retention-off-window recycle.  Returns true to ACCEPT (RESOLVED).
+ *	below the CURRENT horizon it is wrap-suspect -> NOT acceptable (规则 8.A: a
+ *	wrong deleter scn would false-hide a live row).  The reliability proof is the
+ *	EXACT sticky condition (horizon enabled AND no retention-off recycle this
+ *	incarnation), not an abstraction -- losing the sticky leg would re-trust a
+ *	retention-off-window recycle.  Returns true to ACCEPT (RESOLVED).
  */
 static bool
-cluster_cr_accept_resolved_scn(SCN scn)
+cluster_cr_resolved_scn_is_acceptable(SCN scn)
 {
 	bool retention_reliable = cluster_undo_retention_horizon_enabled
 							  && cluster_tt_slot_retention_off_recycle_count() == 0;
 
-	if (cluster_tt_recovery_wrap_suspect(CLUSTER_TT_WRAP_ANY, scn, cluster_undo_retention_horizon(),
-										 retention_reliable)) {
-		cluster_tt_recovery_count_wrap_generation_disambiguated();
-		return false; /* suspect -> fail closed */
-	}
-	return true;
+	return !cluster_tt_recovery_wrap_suspect(CLUSTER_TT_WRAP_ANY, scn,
+											 cluster_undo_retention_horizon(), retention_reliable);
+}
+
+/*
+ * cluster_cr_accept_resolved_scn -- the AUTHORITATIVE acceptance gate: the pure
+ *	predicate above PLUS the existing wrap_generation_disambiguated observability
+ *	bump on a fail-closed verdict.  Used by the fresh-scan path and the TRUST-mode
+ *	memo hit -- both AUTHORITATIVE resolutions, so each bumps the base counter
+ *	exactly once.
+ *
+ *	The MEASURE-mode memo probe (spec-5.55 Hardening v1.1, finding #1) must NOT use
+ *	this wrapper: it is a non-authoritative shadow measurement that still falls
+ *	through to the authoritative scan, so bumping here would DOUBLE-count the base
+ *	wrap_generation_disambiguated counter on a wrap-suspect hit -- it calls the
+ *	pure predicate instead.  Returns true to ACCEPT (RESOLVED).
+ */
+static bool
+cluster_cr_accept_resolved_scn(SCN scn)
+{
+	if (cluster_cr_resolved_scn_is_acceptable(scn))
+		return true;
+	cluster_tt_recovery_count_wrap_generation_disambiguated();
+	return false; /* suspect -> fail closed */
 }
 
 /*
@@ -1445,10 +1463,30 @@ cluster_cr_resolve_xmax_commit_scn(const char *cr_page, uint8 itl_idx, Transacti
 		SCN hint_scn = InvalidScn;
 
 		if (cluster_resolver_cache_probe((uint16)cluster_node_id, cr_xmax, &hint_scn)) {
-			bool accepted = cluster_cr_accept_resolved_scn(hint_scn);
-
-			cluster_resolver_cache_count_acceptance(accepted);
 			if (cluster_resolver_cache_trust()) {
+				/*
+				 * TRUST: the memo hit IS the authoritative resolution (no fresh
+				 * scan follows), so it runs the side-effecting acceptance gate --
+				 * byte-identical to the fresh-scan path (gate (3)); its
+				 * wrap_generation_disambiguated bump replaces the fresh-scan bump.
+				 */
+				bool accepted = cluster_cr_accept_resolved_scn(hint_scn);
+
+				/*
+				 * spec-5.55 Hardening v1.1 (finding #2): the memo-path fail-closed
+				 * branch is a defensive 2^32-wrap guard the natural MVCC workload
+				 * cannot reach (a resolved deleter is always recent -> scn >=
+				 * horizon -> never suspect).  This injection forces it closed so a
+				 * TAP test proves the branch routes (count_acceptance(false) ->
+				 * INVALID_OR_AMBIGUOUS) and the 8.A invariant still holds.  It does
+				 * NOT bump the base wrap_generation_disambiguated counter (no real
+				 * wrap occurred).  Disarmed in production -> byte-identical.
+				 */
+				if (accepted
+					&& cluster_cr_injection_armed("cluster-cr-resolver-memo-suspect", NULL))
+					accepted = false;
+
+				cluster_resolver_cache_count_acceptance(accepted);
 				if (!accepted) {
 					*out_scn = InvalidScn; /* same fail-closed as the fresh-scan branch */
 					return CLUSTER_CR_XMAX_INVALID_OR_AMBIGUOUS;
@@ -1456,7 +1494,19 @@ cluster_cr_resolve_xmax_commit_scn(const char *cr_page, uint8 itl_idx, Transacti
 				*out_scn = hint_scn; /* gate (1): durable re-read, verdict-equivalent */
 				return CLUSTER_CR_XMAX_RESOLVED_SCN;
 			}
-			/* MEASURE: never trust the hint -- fall through to the authoritative scan. */
+
+			/*
+			 * MEASURE (spec-5.55 Hardening v1.1, finding #1): record the would-hit
+			 * acceptance outcome with the PURE predicate, NOT the side-effecting
+			 * gate.  This shadow probe falls through to the authoritative scan
+			 * below, which bumps wrap_generation_disambiguated itself; using the
+			 * wrapper here would double-count that base TT counter on a wrap-suspect
+			 * hit.  The verdict is identical (the wrapper is predicate + side
+			 * effect), so the resolver-cache acceptance counters stay accurate.
+			 */
+			cluster_resolver_cache_count_acceptance(
+				cluster_cr_resolved_scn_is_acceptable(hint_scn));
+			/* never trust the hint -- fall through to the authoritative scan. */
 		}
 	}
 

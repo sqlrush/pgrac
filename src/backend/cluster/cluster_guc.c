@@ -2598,8 +2598,9 @@ cluster_init_guc(void)
 		gettext_noop("Spec-5.55 D3/D7. Default 0 (true zero memory; the region is registered but "
 					 "reserves 0 bytes).  PGC_POSTMASTER: requires a restart.  The recommended "
 					 "non-zero default + sizing are bound to the §0.6 measure-leg value gate "
-					 "evidence (spec-5.58); resolver_cache_measure must also be on to allocate. "
-					 "Each hint slot costs a few dozen bytes of shared memory."),
+					 "evidence (spec-5.58); either resolver_cache_enabled or "
+					 "resolver_cache_measure must be on for this to allocate.  Each hint slot "
+					 "costs a few dozen bytes of shared memory."),
 		&cluster_shared_resolver_cache_entries, 0, 0, 1048576, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	DefineCustomIntVariable(

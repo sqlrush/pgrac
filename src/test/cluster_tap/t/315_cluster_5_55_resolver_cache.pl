@@ -17,15 +17,21 @@
 #	  L1  TRUST mode: the balance invariant holds (NO false-visible from a memo
 #	      hit) AND the memo actually fires (resolver_cache.hit > 0 -- the O(segments)
 #	      scan was really skipped) on cross-backend redundant resolutions.
-#	  L2  retention-off soundness: with retention unreliable (sticky), the acceptance
-#	      gate (gate 3) is exercised on the memo path; the invariant STILL holds --
-#	      the gate, run identically on a memo hit and a fresh scan, keeps it sound.
+#	  L2  retention-off soundness: with retention unreliable, the same acceptance
+#	      gate (gate 3) runs on the memo path; the invariant STILL holds -- the gate,
+#	      run identically on a memo hit and a fresh scan, keeps it sound.
 #	  L3  GUC off control: SAME workload, entries=0 -> byte-identical; the invariant
 #	      holds and every resolver_cache counter stays 0 (the memo is truly off).
 #	  L4  MEASURE mode (§0.6 value gate): the authoritative scan always runs and the
 #	      hint is never trusted; the counters quantify the cross-backend redundancy
 #	      (key_present / lookup) and re-probe hit rate (hit / key_present) that gate
 #	      the trust path -- NO-GO is a legitimate outcome, measured here.
+#	  L5  gate (3) fail-closed BRANCH coverage (Hardening v1.1, finding #2): the
+#	      fail-closed branch is a defensive 2^32-wrap guard the natural workload
+#	      cannot reach (acceptance_failclosed stays 0 even in L2), so an injection
+#	      forces a TRUST memo hit's acceptance closed -> acceptance_failclosed climbs
+#	      AND the 8.A balance invariant still holds (the verdict LOGIC itself is
+#	      unit-tested via the pure cluster_tt_recovery_wrap_suspect gate).
 #
 #	  Author: SqlRush <sqlrush@gmail.com>
 #	  Spec: spec-5.55-shared-resolver-cache.md (FROZEN v1.0)
@@ -94,9 +100,15 @@ my $tpcb_fn = q{
 
 sub _write_script
 {
-	my ($node) = @_;
-	my $script = $node->basedir . '/s555_tpcb.sql';
+	my ($node, $arm) = @_;
+	my $script = $node->basedir . '/s555_tpcb' . ($arm ? '_armed' : '') . '.sql';
 	open(my $fh, '>', $script) or die $!;
+	# Injection armed state is PER-BACKEND (static registry), so each pgbench
+	# worker must arm its OWN backend -- arm inside the script (idempotent; the
+	# arm is non-transactional so it survives the 53R9F abort it provokes).
+	print $fh
+		"SELECT cluster_inject_fault('cluster-cr-resolver-memo-suspect','skip',0);\n"
+	  if $arm;
 	print $fh "\\set aid random(1, 100000 * :scale)\n"
 		. "\\set bid random(1, 1 * :scale)\n"      # ONE hot branch row -> recycle pressure
 		. "\\set tid random(1, 10 * :scale)\n"
@@ -139,9 +151,9 @@ my $tolerated =
 
 sub _run_tpcb
 {
-	my ($node, $secs) = @_;
+	my ($node, $secs, $arm) = @_;
 	$secs //= $seconds;
-	my $script = _write_script($node);
+	my $script = _write_script($node, $arm);
 	my ($out, $err);
 	$node->run_log(
 		[ 'pgbench', '-n', '-f', $script, '-c', $clients, '-j', $jobs, '-T', $secs,
@@ -248,5 +260,44 @@ diag("L4 §0.6 value gate: lookup=$m_lookup key_present=$m_kp (redundancy=$redun
 	. "hit=$m_hit (re-probe hit rate=$hit_rate) "
 	. "acceptance_pass=" . _rc($meas, 'acceptance_pass'));
 $meas->stop;
+
+# ----------------------------------------------------------------------------
+# L5: gate (3) memo-path fail-closed BRANCH coverage (spec-5.55 Hardening v1.1,
+# finding #2).  The fail-closed branch is a defensive 2^32-xid-wrap guard the
+# natural MVCC workload cannot reach: a resolved deleter is always recent, so its
+# commit_scn is at/above the retention horizon -> never wrap-suspect; and if the
+# horizon ever advanced past an old entry, no reader would need that pre-delete
+# version, so it is never re-probed.  Empirically acceptance_failclosed stays 0
+# even with retention off (L2).  So the verdict LOGIC is unit-tested (the pure
+# cluster_tt_recovery_wrap_suspect gate, test_cluster_tt_durable.c), and HERE an
+# injection forces a TRUST-mode memo hit's acceptance closed to prove the BRANCH
+# routes correctly (acceptance_failclosed climbs -> INVALID_OR_AMBIGUOUS / 53R9F)
+# AND the 8.A balance invariant STILL holds (a fail-closed memo hit aborts the
+# read, never false-visible).
+# ----------------------------------------------------------------------------
+my $inj = _new_node('s555_inject', 'on', 'off', 8192);
+_init_pgbench($inj, 'L5');
+# Warm the shared (per-instance) memo with no injection: hits occur across the 8
+# backends and all naturally accept (recent deleters are never wrap-suspect).
+_run_tpcb($inj, $seconds);
+my $fc_before = _rc($inj, 'acceptance_failclosed');
+is($fc_before, 0,
+	'L5: natural acceptance_failclosed is 0 -- recent deleters are never wrap-suspect');
+# Now run a workload whose pgbench script arms the injection in EACH worker's own
+# backend (arming is per-backend): every TRUST-mode memo hit those workers take
+# against the warm shared memo is forced to fail closed (gate 3 branch).  A 53R9F
+# read aborts that client, so the run drains quickly -- but each memo hit it took
+# first bumped acceptance_failclosed.
+my @bad_inj = _unexpected_lines(_run_tpcb($inj, $seconds, 1));
+is(scalar @bad_inj, 0,
+	'L5 (inject): only 53R9F-class CR-unresolved tolerated, no unexpected errors')
+  or diag("unexpected:\n" . join("\n", @bad_inj));
+my $fc_after = _rc($inj, 'acceptance_failclosed');
+cmp_ok($fc_after, '>', $fc_before,
+	"L5: the memo-path acceptance fail-closed branch fired (acceptance_failclosed "
+	. "$fc_before -> $fc_after) -- gate (3) routes (规则 8.A)");
+is(_invariant($inj), 't',
+	'L5: invariant STILL holds under forced memo-path fail-closed -- no false-visible (规则 8.A)');
+$inj->stop;
 
 done_testing();

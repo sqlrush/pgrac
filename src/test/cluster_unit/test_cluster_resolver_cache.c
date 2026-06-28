@@ -12,8 +12,12 @@
  *	  (4) xid_epoch fence (a hint installed at epoch E is an epoch_miss in E+1),
  *	  (5) own-instance install gate, plus the counter taxonomy, eviction, the
  *	  trust predicate and the entries==0 zero-memory no-op.  gate (3) (the
- *	  acceptance same-segment rerun) lives in cluster_cr.c and is covered e2e by
- *	  the cluster_tap test (horizon-advance -> memo-hit fail-closed).  The
+ *	  acceptance same-segment rerun) lives in cluster_cr.c (caller side), so it is
+ *	  split across two homes: its VERDICT LOGIC is the pure
+ *	  cluster_tt_recovery_wrap_suspect gate, unit-tested by
+ *	  test_cluster_tt_durable.c (the test_wrap_suspect_* matrix); its memo-path
+ *	  fail-closed BRANCH is exercised by the cluster_tap test (315 L5, injection-
+ *	  driven -- the natural workload cannot reach a wrap-suspect memo hit).  The
  *	  16-byte key / 8-byte-aligned slot StaticAsserts are enforced at
  *	  cluster_resolver_cache.o compile time.
  *
