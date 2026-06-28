@@ -155,6 +155,7 @@
 #include "cluster/cluster_undo_record_api.h"  /* PGRAC: spec-3.7 D16 PREPARE guard */
 #include "cluster/cluster_touched_peers.h"	  /* PGRAC: spec-5.14 D1 per-tx reset */
 #include "cluster/cluster_clean_leave.h"		  /* PGRAC: spec-5.13 §3.1 refuse-writes gate */
+#include "cluster/cluster_reconfig.h"			  /* PGRAC: spec-5.15 §2.4 joiner write gate */
 #include "cluster/storage/cluster_undo_xlog.h" /* PGRAC: spec-3.18 D4.1 TT fold redo stamp */
 #endif
 #endif
@@ -754,6 +755,34 @@ AssignTransactionId(TransactionState s)
 						" this node is leaving the cluster"),
 				 errhint("reconnect to a surviving node and retry;"
 						 " the retry is safe")));
+
+	/*
+	 * PGRAC MODIFICATIONS (spec-5.15 §2.4 / INV-J9, node-local joiner write gate)
+	 *
+	 * What changed: while THIS node is itself a joiner that has not yet been
+	 * published MEMBER, refuse the first write of any transaction — current AND
+	 * future backends — so nothing commits against an un-converged membership
+	 * view (the per-process spec-2.28 freeze cannot cover a backend that connects
+	 * after the freeze broadcast; the shared gate does).  53R60 is retry-safe (the
+	 * write succeeds once the join commits); 53R61 is FATAL (the join was rejected
+	 * or timed out — the node must restart with a fresh incarnation, INV-J1/J4).
+	 */
+	{
+		ClusterJoinGateVerdict jv = cluster_reconfig_self_join_gate_verdict();
+
+		if (jv == CLUSTER_JOIN_GATE_BLOCK_53R60)
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+					 errmsg("cannot start a writable transaction:"
+							" this node is joining the cluster"),
+					 errhint("the join is in progress; retry shortly")));
+		else if (jv == CLUSTER_JOIN_GATE_BLOCK_53R61)
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_JOIN_REJECTED_STALE),
+					 errmsg("cannot start a writable transaction:"
+							" this node's cluster join was rejected or did not converge"),
+					 errhint("restart this node so it presents a fresh cluster incarnation")));
+	}
 #endif
 
 	/*

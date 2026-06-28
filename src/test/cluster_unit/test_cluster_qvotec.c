@@ -279,6 +279,16 @@ cluster_voting_disk_write_leave_slot(int fd pg_attribute_unused(),
 {
 	return CLUSTER_VOTING_DISK_IO_NOT_TRIED;
 }
+/* spec-5.15 D4: qvotec poll writes the join-commit marker to region 3. */
+ClusterVotingDiskIoState cluster_voting_disk_write_join_slot(int fd, uint32 node_id,
+															 const void *in_slot512);
+ClusterVotingDiskIoState
+cluster_voting_disk_write_join_slot(int fd pg_attribute_unused(),
+									uint32 node_id pg_attribute_unused(),
+									const void *in_slot512 pg_attribute_unused())
+{
+	return CLUSTER_VOTING_DISK_IO_NOT_TRIED;
+}
 ClusterQvotecQuorumState
 decide_quorum_view(const ClusterVotingSlot *slots pg_attribute_unused(),
 				   const ClusterVotingDiskIoState *io_states pg_attribute_unused(),
@@ -384,6 +394,60 @@ void
 cluster_reconfig_get_last_event(ReconfigEvent *out)
 {
 	memset(out, 0, sizeof(*out)); /* pristine (event_id == 0): never applied */
+}
+/* spec-5.15 D1/D4: qvotec poll publishes observed slots into the reconfig region
+ * and mediates the join-commit marker handshake; stub all the reconfig symbols
+ * qvotec.o now references (cluster_reconfig.o is not linked into this test). */
+void cluster_reconfig_record_observed_slot(int32 node_id, uint64 incarnation, uint64 generation,
+										   uint64 epoch);
+void
+cluster_reconfig_record_observed_slot(int32 node_id pg_attribute_unused(),
+									  uint64 incarnation pg_attribute_unused(),
+									  uint64 generation pg_attribute_unused(),
+									  uint64 epoch pg_attribute_unused())
+{}
+bool cluster_reconfig_join_qvotec_poll_pending(int32 *out_target_node, void *out_slot512);
+bool
+cluster_reconfig_join_qvotec_poll_pending(int32 *out_target_node,
+										  void *out_slot512 pg_attribute_unused())
+{
+	if (out_target_node != NULL)
+		*out_target_node = -1;
+	return false;
+}
+void cluster_reconfig_join_qvotec_complete(bool acked);
+void
+cluster_reconfig_join_qvotec_complete(bool acked pg_attribute_unused())
+{}
+void cluster_reconfig_publish_join_qvotec_latch(struct Latch *latch);
+void
+cluster_reconfig_publish_join_qvotec_latch(struct Latch *latch pg_attribute_unused())
+{}
+void cluster_membership_seed_last_admitted_from_voting_disk(const int *fds, int n_disks);
+void
+cluster_membership_seed_last_admitted_from_voting_disk(const int *fds pg_attribute_unused(),
+													   int n_disks pg_attribute_unused())
+{}
+#include "cluster/cluster_membership.h" /* ClusterJoinCommitMarker (D5 self-admit) */
+bool cluster_join_marker_is_committed_basis(const ClusterJoinCommitMarker *m, int32 expected_node);
+bool
+cluster_join_marker_is_committed_basis(const ClusterJoinCommitMarker *m pg_attribute_unused(),
+									   int32 expected_node pg_attribute_unused())
+{
+	return false;
+}
+void cluster_reconfig_note_self_admitted(uint64 admitted_epoch);
+void
+cluster_reconfig_note_self_admitted(uint64 admitted_epoch pg_attribute_unused())
+{}
+ClusterVotingDiskIoState cluster_voting_disk_read_join_slot(int fd, uint32 node_id,
+															void *out_slot512);
+ClusterVotingDiskIoState
+cluster_voting_disk_read_join_slot(int fd pg_attribute_unused(),
+								   uint32 node_id pg_attribute_unused(),
+								   void *out_slot512 pg_attribute_unused())
+{
+	return CLUSTER_VOTING_DISK_IO_FAILED;
 }
 uint64 cluster_epoch_get_current(void);
 uint64

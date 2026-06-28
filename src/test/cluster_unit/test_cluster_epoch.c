@@ -164,13 +164,36 @@ UT_TEST(test_t6_layout_64_byte_cache_line)
 	UT_ASSERT_EQ((int)cluster_epoch_shmem_size(), 64);
 }
 
+UT_TEST(test_t7_adopt_admitted_unbounded_monotonic)
+{
+	/* spec-5.15 §2.7: cluster_epoch_adopt_admitted is the quorum-authenticated
+	 * join-admission path -- it may jump > CLUSTER_EPOCH_OBSERVE_MAX_JUMP (16),
+	 * unlike the bounded observe_remote, and is monotonic (never retreats). */
+	test_shmem_initialized = false;
+	memset(test_epoch_shmem_storage, 0, sizeof(test_epoch_shmem_storage));
+	cluster_epoch_shmem_init();
+	UT_ASSERT_EQ((int)cluster_epoch_get_current(), (int)CLUSTER_EPOCH_INITIAL);
+
+	/* a long-absent rejoiner adopts epoch 100 (a > 16 jump from 0). */
+	cluster_epoch_adopt_admitted(100);
+	UT_ASSERT_EQ((int)cluster_epoch_get_current(), 100);
+
+	/* a lower adopt is ignored (monotonic). */
+	cluster_epoch_adopt_admitted(50);
+	UT_ASSERT_EQ((int)cluster_epoch_get_current(), 100);
+
+	/* a higher adopt advances. */
+	cluster_epoch_adopt_admitted(200);
+	UT_ASSERT_EQ((int)cluster_epoch_get_current(), 200);
+}
+
 
 UT_DEFINE_GLOBALS();
 
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(7);
 
 	UT_RUN(test_t1_shmem_size_64);
 	UT_RUN(test_t2_get_current_before_init_returns_zero);
@@ -178,6 +201,7 @@ main(void)
 	UT_RUN(test_t4_repeated_init_idempotent);
 	UT_RUN(test_t5_no_setter_api_exported);
 	UT_RUN(test_t6_layout_64_byte_cache_line);
+	UT_RUN(test_t7_adopt_admitted_unbounded_monotonic);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

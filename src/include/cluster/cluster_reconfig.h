@@ -56,7 +56,10 @@
 #include "port/atomics.h"
 #include "storage/lwlock.h"
 
-#include "cluster/cluster_conf.h" /* CLUSTER_MAX_NODES (spec-5.13 clean_departed_epoch) */
+#include "cluster/cluster_conf.h"		/* CLUSTER_MAX_NODES (spec-5.13 clean_departed_epoch) */
+#include "cluster/cluster_membership.h" /* ClusterMembershipTable (spec-5.15 D2 SSOT) */
+
+struct Latch; /* spec-5.15 D4 — join-marker qvotec mailbox latch (pointer only) */
 
 
 /*
@@ -99,9 +102,17 @@
  * defensively (conservative fail-stop handling + a LOG WARNING).
  */
 typedef enum ClusterReconfigKind {
-	RECONFIG_KIND_NONE = 0,		  /* never-applied / initial */
-	RECONFIG_KIND_FAIL_STOP = 1,  /* CSSD DEAD edge — this spec, live */
-	RECONFIG_KIND_CLEAN_LEAVE = 2 /* reserved (spec-5.13); no producer yet */
+	RECONFIG_KIND_NONE = 0,		   /* never-applied / initial */
+	RECONFIG_KIND_FAIL_STOP = 1,   /* CSSD DEAD edge — spec-5.14, live */
+	RECONFIG_KIND_CLEAN_LEAVE = 2, /* cooperative leave — spec-5.13 */
+	/*
+	 * spec-5.15 D3 (INV-J11) — single discriminator, append-only.  Online
+	 * declared-node join is two-phase: JOIN_PENDING (Phase 1, joiner JOINING)
+	 * then JOIN_COMMITTED (Phase 2, joiner MEMBER).  The affected set for these
+	 * is carried in join_bitmap (leave kinds keep dead_bitmap).
+	 */
+	RECONFIG_KIND_JOIN_PENDING = 3,
+	RECONFIG_KIND_JOIN_COMMITTED = 4
 } ClusterReconfigKind;
 
 
@@ -180,6 +191,15 @@ typedef struct ReconfigEvent {
 	uint8 reconfig_kind; /* spec-5.14 D3: ClusterReconfigKind (shmem-only,
 								  * never on the wire; CLEAN_LEAVE reserved) */
 	uint8 _pad2[7];
+
+	/*
+	 * spec-5.15 D3 — join-edge affected set.  Leave kinds (FAIL_STOP /
+	 * CLEAN_LEAVE) carry their set in dead_bitmap and leave this empty; join
+	 * kinds (JOIN_PENDING / JOIN_COMMITTED) carry the admitted joiner(s) here
+	 * and leave dead_bitmap empty.  Append-only field; bumps sizeof from 88 to
+	 * 104 (StaticAssert bound widened to 112 below).
+	 */
+	uint8 join_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
 } ReconfigEvent;
 
 
@@ -220,6 +240,94 @@ typedef struct ClusterReconfigState {
 	uint8 clean_departed_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
 	uint64 clean_departed_epoch[CLUSTER_MAX_NODES]; /* per-node leave epoch; 0 = not departed */
 	pg_atomic_uint64 clean_departed_count; /* lifetime departures recorded (observability) */
+
+	/*
+	 * spec-5.15 D2 — online-join membership SSOT.  The decision table (the
+	 * last_admitted_incarnation[] monotonic floor + per-node membership_state[])
+	 * lives here so every backend shares one membership view; cluster_membership.c
+	 * attaches to &this->membership at shmem init and mutates it under `lock`
+	 * (INV-J7 floor / INV-J8 decision SSOT).
+	 */
+	ClusterMembershipTable membership;
+
+	/*
+	 * spec-5.15 D4 — pending-join set: declared peers currently in the
+	 * JOIN_PENDING window (Phase-1 publish .. Phase-2 commit).  Set/cleared by the
+	 * coordinator under `lock`.
+	 */
+	uint8 pending_join_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+
+	/*
+	 * spec-5.15 D5 (INV-J9) — node-local joiner write gate.  1 = this node may
+	 * write (steady-state / admitted member, the default); 0 = this node is a
+	 * joiner that has NOT yet been published MEMBER, so every backend (current AND
+	 * future) fail-closed 53R60 at the xact/commit write entry.  A joiner sets it
+	 * to 0 at the start of its join lifecycle and back to 1 only AFTER the
+	 * JOIN_COMMITTED publish reaches it (epoch adopted from the durable marker AND
+	 * local membership_state==MEMBER observed) — never right after the marker is
+	 * durable (P1-r5 half-publish guard).  Initialized to 1 in shmem_init.
+	 */
+	uint8 self_join_admitted;
+
+	/*
+	 * spec-5.15 D5 — joiner gate failure latch + deadline.  self_join_failed=1
+	 * means this node's join was definitively rejected (stale incarnation) or
+	 * timed out: writable backends then get 53R61 FATAL (restart with a fresh
+	 * incarnation) instead of the transient 53R60.  self_join_deadline_us is the
+	 * convergence/commit deadline set when the gate closes (joiner self-tick).
+	 */
+	uint8 self_join_failed;
+	uint64 self_join_deadline_us;
+
+	/*
+	 * spec-5.15 D6 — online-join observability counters (lifetime; no lock,
+	 * atomic).  join_pending: JOIN_PENDING phases published; join_apply: members
+	 * committed (JOIN_COMMITTED); join_reject: candidates the commit-time vet
+	 * rejected; join_timeout: joins that failed closed on convergence timeout;
+	 * clean_departed_cleared: rejoin clears of a clean_departed suppression.
+	 */
+	pg_atomic_uint64 join_pending_count;
+	pg_atomic_uint64 join_apply_count;
+	pg_atomic_uint64 join_reject_count;
+	pg_atomic_uint64 join_timeout_count;
+	pg_atomic_uint64 clean_departed_cleared_count;
+
+	/*
+	 * spec-5.15 D1 — per declared node, the freshest voting-slot incarnation +
+	 * generation qvotec observed across disks (published each qvotec poll via
+	 * cluster_reconfig_record_observed_slot; qvotec is the sole voting-disk
+	 * reader, hence the natural publisher).  LMON reads these to detect/vet a
+	 * join edge from shmem with no disk read in the tick.  pg_atomic so qvotec
+	 * publishes lock-free from its process; generation == 0 means no valid slot
+	 * was observed (the node is absent / not ready).
+	 */
+	pg_atomic_uint64 observed_incarnation[CLUSTER_MAX_NODES];
+	pg_atomic_uint64 observed_generation[CLUSTER_MAX_NODES];
+
+	/*
+	 * spec-5.15 D4 — per declared node, the membership epoch qvotec last observed
+	 * in that node's voting slot (published alongside the incarnation).  The
+	 * coordinator reads these to test §3.3 convergence: a JOIN_PENDING commits
+	 * (Phase-2) only once every existing MEMBER survivor's observed epoch has
+	 * caught up to the JOIN_PENDING new_epoch.
+	 */
+	pg_atomic_uint64 observed_epoch[CLUSTER_MAX_NODES];
+
+	/*
+	 * spec-5.15 D4 — join-commit-marker submit mailbox (§2.6).  The coordinator
+	 * stages a marker for the joiner (join_marker_target_node_id), bumps
+	 * join_marker_request_seq, wakes qvotec via join_qvotec_latch, and waits
+	 * (bounded) for its own qvotec — the sole voting-disk writer — to write the
+	 * marker to the joiner's region-3 slot on a quorum-majority of disks.  Mirrors
+	 * the spec-4.12 fence / spec-5.13 leave mailbox.  Single producer (coordinator
+	 * driver/LMON) + single consumer (qvotec).
+	 */
+	struct Latch *join_qvotec_latch;
+	pg_atomic_uint64 join_marker_request_seq;
+	pg_atomic_uint64 join_marker_completion_seq;
+	pg_atomic_uint32 join_marker_result; /* ClusterJoinMarkerSubmitResult */
+	int32 join_marker_target_node_id;	 /* region-3 slot to write (the joiner N) */
+	ClusterJoinCommitMarker join_pending_marker;
 } ClusterReconfigState;
 
 
@@ -316,6 +424,111 @@ extern void cluster_reconfig_publish_event(const ReconfigEvent *evt);
 extern uint64
 cluster_reconfig_compute_event_id(const uint8 dead_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES],
 								  uint64 cssd_dead_generation);
+
+/*
+ * spec-5.15 D1 — compute the join-edge bitmap (declared peers that went from a
+ * non-member state to fresh-ALIVE with an incarnation above the admitted floor).
+ * Caller holds the reconfig LWLock.  Returns the number of bits set.
+ */
+extern int
+cluster_reconfig_compute_join_bitmap(uint8 join_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES]);
+
+/*
+ * spec-5.15 D3 (INV-J11) — kind-aware event_id.  FAIL_STOP / CLEAN_LEAVE use the
+ * legacy hash (byte-compatible with the 2.29 death path + the 5.13 leave marker
+ * binding); JOIN_PENDING / JOIN_COMMITTED fold kind || join_bitmap ||
+ * joiner_incarnations || cssd_dead_generation; NONE -> 0.
+ */
+extern uint64 cluster_reconfig_compute_event_id_v2(
+	uint8 reconfig_kind, const uint8 dead_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES],
+	const uint8 join_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES],
+	const uint64 joiner_incarnations[CLUSTER_MAX_NODES], uint64 cssd_dead_generation);
+
+/*
+ * spec-5.15 D1/D4 — qvotec publishes the freshest observed voting-slot
+ * incarnation + generation + membership epoch per node (it is the sole disk
+ * reader); LMON reads them to detect/vet a join edge and to test §3.3
+ * convergence.  get returns true iff a valid slot (generation > 0) was observed;
+ * out-params always written (0 when absent).
+ */
+extern void cluster_reconfig_record_observed_slot(int32 node_id, uint64 incarnation,
+												  uint64 generation, uint64 epoch);
+extern bool cluster_reconfig_get_observed_slot(int32 node_id, uint64 *incarnation,
+											   uint64 *generation);
+extern uint64 cluster_reconfig_get_observed_epoch(int32 node_id);
+
+/* ============================================================
+ * spec-5.15 D4 — two-phase online-join publication + §2.6 marker handshake.
+ * ============================================================
+ */
+
+/*
+ * Phase 1 (coordinator): bump the epoch, publish a JOIN_PENDING event naming the
+ * joiners in join_bitmap, set their membership_state to JOINING + the
+ * pending_join_bitmap, and write a durable PREPARE marker for each.  joiner_
+ * incarnations[N] is the incarnation each joiner presented (folded into the
+ * event_id).  Broadcast of PROCSIG is done by the caller (tick), after publish.
+ */
+extern void cluster_reconfig_apply_join_as_coordinator(
+	const uint8 join_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES], int32 coordinator_node_id,
+	const uint64 joiner_incarnations[CLUSTER_MAX_NODES]);
+
+/*
+ * Phase 2 (coordinator): strict order (P1-r5) — ① write the COMMITTED marker
+ * majority-durable (the commit point) → ② publish (bump JOIN_COMMITTED epoch +
+ * set membership_state[node]=MEMBER + record_admitted + clear pending + clear
+ * clean_departed[node]).  Returns true iff the COMMITTED marker reached a disk
+ * majority and the publish ran; false (no state change) on marker failure (the
+ * joiner stays JOINING, the next tick retries / eventually times out).
+ */
+extern bool cluster_reconfig_commit_member(int32 node_id, uint64 admitted_incarnation);
+
+/*
+ * §2.6 join-commit-marker submit (coordinator→qvotec handshake).  Stage a marker
+ * for target_node, wake qvotec, and block (bounded) until qvotec has written it
+ * to target_node's region-3 slot on a quorum-majority of disks (ACK) or failed /
+ * timed out.  qvotec_poll_pending / _complete are the qvotec side (sole writer);
+ * publish_join_qvotec_latch lets the coordinator wake qvotec.
+ */
+extern ClusterJoinMarkerSubmitResult
+cluster_reconfig_submit_join_marker(int32 target_node, const ClusterJoinCommitMarker *m);
+extern bool cluster_reconfig_join_qvotec_poll_pending(int32 *out_target_node, void *out_slot512);
+extern void cluster_reconfig_join_qvotec_complete(bool acked);
+extern void cluster_reconfig_publish_join_qvotec_latch(struct Latch *latch);
+
+/* ============================================================
+ * spec-5.15 D5 — joiner-side write gate + admission (INV-J9 / §2.4 / §2.7).
+ * ============================================================
+ */
+
+/*
+ * Node-local write-gate verdict, read at the xact/commit write entry (covers
+ * current AND future backends — INV-J9): ALLOW (steady / admitted); BLOCK_53R60
+ * (this node is a joiner not yet admitted; retry-safe); BLOCK_53R61 (the join was
+ * rejected / timed out; FATAL, the node must restart with a fresh incarnation).
+ */
+typedef enum ClusterJoinGateVerdict {
+	CLUSTER_JOIN_GATE_ALLOW = 0,
+	CLUSTER_JOIN_GATE_BLOCK_53R60,
+	CLUSTER_JOIN_GATE_BLOCK_53R61
+} ClusterJoinGateVerdict;
+
+extern ClusterJoinGateVerdict cluster_reconfig_self_join_gate_verdict(void);
+
+/* spec-5.15 D6 — online-join observability counter accessors. */
+extern uint64 cluster_reconfig_get_join_pending_count(void);
+extern uint64 cluster_reconfig_get_join_apply_count(void);
+extern uint64 cluster_reconfig_get_join_reject_count(void);
+extern uint64 cluster_reconfig_get_join_timeout_count(void);
+extern uint64 cluster_reconfig_get_clean_departed_cleared_count(void);
+
+/*
+ * qvotec calls this when it has read this node's own §2.6 COMMITTED join marker
+ * (admitted_incarnation == self's incarnation) on a quorum-majority of disks:
+ * adopt the admitted epoch (may jump >16) AND set self MEMBER, THEN open the
+ * write gate (gate-open guard = adopt && state==MEMBER — P1-r5 half-publish).
+ */
+extern void cluster_reconfig_note_self_admitted(uint64 admitted_epoch);
 
 
 /* ============================================================

@@ -674,6 +674,10 @@ qvotec_poll_once(void)
 	uint8 leave_marker_slot[CLUSTER_VOTING_SLOT_BYTES]; /* spec-5.13 §2.5 staged marker */
 	bool have_leave_submit;
 	uint32 leave_disks_ok = 0;
+	uint8 join_marker_slot[CLUSTER_VOTING_SLOT_BYTES]; /* spec-5.15 §2.6 staged marker */
+	bool have_join_submit;
+	int32 join_target_node = -1; /* region-3 slot to write (the joiner N) */
+	uint32 join_disks_ok = 0;
 	ClusterFenceMarker baseline_marker; /* spec-4.12b D2 */
 	bool author_baseline = false;		/* spec-4.12b D2: wrote a baseline this cycle */
 	bool is_leader = false;				/* spec-4.12b D6: lowest-live baseline leader */
@@ -703,6 +707,13 @@ qvotec_poll_once(void)
 	 * loop below and acked majority-durable, exactly like the fence marker. */
 	have_leave_submit = cluster_clean_leave_qvotec_poll_pending(leave_marker_slot);
 
+	/* spec-5.15 §2.6: pick up a pending join-commit marker submit too.  Unlike the
+	 * leave marker (this node's own slot) it is written to the JOINER's region-3
+	 * slot (join_target_node) on every disk in the same write loop below and acked
+	 * majority-durable. */
+	have_join_submit
+		= cluster_reconfig_join_qvotec_poll_pending(&join_target_node, join_marker_slot);
+
 	if (qvotec_n_disks == 0) {
 		/* Single-node compat: no disks, no quorum to decide.  Hold
 		 * quorum_state at INITIALIZING so any explicit consumer that
@@ -711,6 +722,8 @@ qvotec_poll_once(void)
 			cluster_write_fence_qvotec_complete(false); /* no disk -> no majority */
 		if (have_leave_submit)
 			cluster_clean_leave_qvotec_complete(false); /* no disk -> no majority */
+		if (have_join_submit)
+			cluster_reconfig_join_qvotec_complete(false); /* no disk -> no majority */
 		return;
 	}
 
@@ -723,6 +736,8 @@ qvotec_poll_once(void)
 			cluster_write_fence_qvotec_complete(false); /* cannot author self slot */
 		if (have_leave_submit)
 			cluster_clean_leave_qvotec_complete(false); /* cannot author self slot */
+		if (have_join_submit)
+			cluster_reconfig_join_qvotec_complete(false); /* cannot author self slot */
 		return;
 	}
 
@@ -770,6 +785,74 @@ qvotec_poll_once(void)
 				memset(cell, 0, sizeof(*cell));
 			}
 		}
+	}
+
+	/*
+	 * spec-5.15 D1: publish the freshest observed slot (incarnation + generation)
+	 * per declared node from the matrix we just read into the reconfig region, so
+	 * LMON can detect/vet join candidates from shmem (no disk read in the tick).
+	 * For each node take the slot with the highest generation across disks
+	 * (newest-valid; read_slot already zeroed torn/CRC-bad cells, so generation
+	 * > 0 means a valid slot).  qvotec is the sole voting-disk reader, so it is
+	 * the natural publisher.
+	 */
+	{
+		uint32 node;
+
+		for (node = 0; node < CLUSTER_MAX_NODES; node++) {
+			uint64 best_gen = 0;
+			uint64 best_incarnation = 0;
+			uint64 best_epoch = 0;
+
+			for (i = 0; i < qvotec_n_disks; i++) {
+				ClusterVotingSlot *cell = &qvotec_slot_matrix[i * CLUSTER_MAX_NODES + node];
+
+				if (cell->generation > best_gen && cell->node_id == node) {
+					best_gen = cell->generation;
+					best_incarnation = cell->incarnation;
+					best_epoch = cell->current_epoch;
+				}
+			}
+			cluster_reconfig_record_observed_slot((int32)node, best_incarnation, best_gen,
+												  best_epoch);
+		}
+	}
+
+	/*
+	 * spec-5.15 D5: detect THIS node's own admission — a §2.6 COMMITTED join
+	 * marker in region-3 slot self, with admitted_incarnation == our incarnation,
+	 * on a quorum-majority of disks.  note_self_admitted then adopts the admitted
+	 * epoch + sets self MEMBER + opens the joiner write gate (one extra slot read
+	 * per disk; qvotec already has the fds open).
+	 */
+	if (cluster_node_id >= 0 && cluster_node_id < CLUSTER_MAX_NODES) {
+		uint32 self_agree = 0;
+		uint64 self_admitted_epoch = 0;
+		uint32 majority = ((uint32)qvotec_n_disks / 2u) + 1u;
+		int d;
+
+		for (d = 0; d < qvotec_n_disks; d++) {
+			union {
+				uint8 bytes[CLUSTER_VOTING_SLOT_BYTES];
+				uint64 _align;
+			} jslot;
+			ClusterJoinCommitMarker m;
+
+			if (cluster_voting_disk_read_join_slot(qvotec_fds[d], (uint32)cluster_node_id,
+												   jslot.bytes)
+				!= CLUSTER_VOTING_DISK_IO_OK)
+				continue;
+			memcpy(&m, jslot.bytes, sizeof(m));
+			if (!cluster_join_marker_is_committed_basis(&m, cluster_node_id))
+				continue;
+			if (m.admitted_incarnation != qvotec_self_incarnation)
+				continue; /* a stale prior-incarnation admission — not us */
+			self_agree++;
+			if (m.admitted_epoch > self_admitted_epoch)
+				self_admitted_epoch = m.admitted_epoch;
+		}
+		if (self_agree >= majority)
+			cluster_reconfig_note_self_admitted(self_admitted_epoch);
 	}
 
 	/*
@@ -848,7 +931,16 @@ qvotec_poll_once(void)
 	self_slot.node_id = (uint32)cluster_node_id;
 	self_slot.incarnation = qvotec_self_incarnation;
 	self_slot.heartbeat_ts_us = now_us;
-	self_slot.current_epoch = pg_atomic_read_u64(&QvotecShmem->current_epoch_at_boot);
+	/*
+	 * spec-5.15: publish the LIVE membership epoch (was current_epoch_at_boot,
+	 * which is initialized to 0 and never updated -> every slot carried epoch 0,
+	 * leaving the spec-2.0 R10 boot-epoch recovery dormant and an online rejoiner
+	 * unable to learn the cluster epoch from the durable disk).  A rejoiner reads
+	 * this to catch up (joiner_self_tick) so its IC frames are not stale-dropped
+	 * (the anti-stale envelope guard, spec-2.4) before it can be detected ALIVE
+	 * and admitted.  The incarnation vet + COMMITTED marker still gate MEMBER.
+	 */
+	self_slot.current_epoch = cluster_epoch_get_current();
 	self_slot.flags = CLUSTER_VOTING_SLOT_FLAG_ALIVE;
 
 	/*
@@ -954,6 +1046,18 @@ qvotec_poll_once(void)
 													leave_marker_slot)
 				   == CLUSTER_VOTING_DISK_IO_OK)
 			leave_disks_ok++;
+
+		/*
+		 * spec-5.15 §2.6: write the staged join-commit marker to the JOINER's
+		 * region-3 slot (join_target_node, NOT this node's own slot) on this disk,
+		 * in the same loop.  Count the disks that accepted it for the majority-
+		 * durable ack below; independent of the voting-slot / leave-slot writes.
+		 */
+		if (have_join_submit && join_target_node >= 0
+			&& cluster_voting_disk_write_join_slot(qvotec_fds[i], (uint32)join_target_node,
+												   join_marker_slot)
+				   == CLUSTER_VOTING_DISK_IO_OK)
+			join_disks_ok++;
 	}
 
 	/*
@@ -1015,6 +1119,10 @@ qvotec_poll_once(void)
 		 */
 		if (have_leave_submit)
 			cluster_clean_leave_qvotec_complete(leave_disks_ok >= quorum_size_post_write);
+
+		/* spec-5.15 §2.6: ack the join-commit marker majority-durable. */
+		if (have_join_submit)
+			cluster_reconfig_join_qvotec_complete(join_disks_ok >= quorum_size_post_write);
 	}
 
 	/* ---- 4. publish shmem ---- */
@@ -1205,6 +1313,17 @@ ClusterQvotecMain(void)
 	 */
 	cluster_clean_leave_publish_qvotec_latch(MyLatch);
 	cluster_clean_leave_rebuild_from_disks(qvotec_fds, qvotec_n_disks);
+
+	/*
+	 * spec-5.15 D4: publish the join-marker latch + seed last_admitted from the
+	 * durable COMMITTED region-3 join markers (INV-J7 — a restart must not zero
+	 * the floor and re-open the gate to a stale incarnation).  The seed MUST run
+	 * AFTER cluster_clean_leave_rebuild_from_disks so its RC-5 supersede
+	 * correction can clear clean_departed[N] for a node that rejoined after a
+	 * clean leave (else the rebuild's re-set would mask N's later fail-stop).
+	 */
+	cluster_reconfig_publish_join_qvotec_latch(MyLatch);
+	cluster_membership_seed_last_admitted_from_voting_disk(qvotec_fds, qvotec_n_disks);
 
 	/*
 	 * Hardening v0.4 P1.4: install per-I/O timeout handler for the

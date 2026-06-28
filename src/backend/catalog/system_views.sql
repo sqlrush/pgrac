@@ -1602,6 +1602,25 @@ CREATE VIEW pg_cluster_reconfig_state AS
 REVOKE ALL ON pg_cluster_reconfig_state FROM PUBLIC;
 GRANT SELECT ON pg_cluster_reconfig_state TO PUBLIC;
 
+-- PGRAC: pg_cluster_membership (spec-5.15 D6; 2026-06-28).
+--   One row per declared node: node_id, declared, membership state
+--   (absent/dead/joining/member/rejected — the decision SSOT, INV-J8),
+--   presented_incarnation (the freshest voting-slot incarnation qvotec
+--   observed), last_admitted_incarnation (the monotonic floor, INV-J1),
+--   admitted_epoch (the membership epoch observed for the node).  Backed by
+--   cluster_get_membership (OID 8962).  cluster.enabled=off returns 0 rows.
+CREATE VIEW pg_cluster_membership AS
+    SELECT node_id,
+           declared,
+           state,
+           presented_incarnation,
+           last_admitted_incarnation,
+           admitted_epoch
+      FROM cluster_get_membership();
+
+REVOKE ALL ON pg_cluster_membership FROM PUBLIC;
+GRANT SELECT ON pg_cluster_membership TO PUBLIC;
+
 -- PGRAC: pg_cluster_clean_leave_state (spec-5.13 D13).
 --   Always-1-row view exposing this node's cooperative-leave drain progress:
 --   phase (idle/requested/quiescing/ges_draining/gcs_flushing/barrier_wait/

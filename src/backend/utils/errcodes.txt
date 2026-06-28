@@ -502,6 +502,11 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 # 53R40 commit-boundary quorum loss and 53R50 fence/quorum-loss backend
 # abort so clients can pick distinct retry policy.
 53R60    E    ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS                           cluster_reconfig_in_progress
+# spec-5.15 D8 — a declared node's online JOIN was rejected (stale incarnation)
+# or did not converge within the deadline.  FATAL, non-retry (distinct from the
+# transient 53R60 join-window block): the node must restart so it presents a
+# fresh cluster incarnation (INV-J1).
+53R61    E    ERRCODE_CLUSTER_JOIN_REJECTED_STALE                            cluster_join_rejected_stale
 # spec-5.13 D9 — writable backend on the LEAVING node aborted during a
 # cooperative clean leave.  Separate from 53R60 (any node hit by another's
 # death): 53R62 retry must reconnect to a survivor, this node is departing.

@@ -12345,6 +12345,20 @@
   proargmodes => '{o,o,o,o,o,o,o,o,o,o}',
   proargnames => '{event_id,coordinator_node_id,old_epoch,new_epoch,dead_bitmap,applied_at,observer_role,event_seq,cssd_dead_generation,reconfig_kind}',
   prosrc => 'cluster_get_reconfig_state' },
+# spec-5.15 D6 (2026-06-28) -- pg_cluster_membership SRF (oid 8962).
+# One row per declared node: node_id / declared / membership state (the
+# decision SSOT, INV-J8) / presented_incarnation (freshest observed voting-slot
+# incarnation) / last_admitted_incarnation (monotonic floor, INV-J1) /
+# admitted_epoch.  cluster.enabled=off returns 0 rows.
+{ oid => '8962', descr => 'show online-join membership state (spec-5.15)',
+  proname => 'cluster_get_membership', prorows => '16',
+  proretset => 't', provolatile => 'v', proparallel => 'r',
+  prorettype => 'record', proargtypes => '',
+  proallargtypes => '{int4,bool,text,int8,int8,int8}',
+  proargmodes => '{o,o,o,o,o,o}',
+  proargnames => '{node_id,declared,state,presented_incarnation,last_admitted_incarnation,admitted_epoch}',
+  prosrc => 'cluster_get_membership' },
+
 
 # spec-2.14 D7 (2026-05-13) -- pg_cluster_grd_shards SRF (oid 8921).
 # Returns 4096 rows describing GRD shard → master_node_id routing and

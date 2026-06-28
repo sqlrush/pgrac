@@ -1399,6 +1399,13 @@ pg_cluster_lmd| SELECT pid,
     idle_count,
     error_count
    FROM cluster_get_lmd_state() cluster_get_lmd_state(pid, state, reason, started_at, ready_at, started_count, edge_submission_count, wake_count, idle_count, error_count);
+pg_cluster_membership| SELECT node_id,
+    declared,
+    state,
+    presented_incarnation,
+    last_admitted_incarnation,
+    admitted_epoch
+   FROM cluster_get_membership() cluster_get_membership(node_id, declared, state, presented_incarnation, last_admitted_incarnation, admitted_epoch);
 pg_cluster_nodes| SELECT node_id,
     hostname,
     interconnect_addr,

@@ -290,7 +290,14 @@ int cluster_cssd_dead_deadband_factor = 3;
 char *cluster_voting_disks = NULL; /* CSV path list, default empty */
 int cluster_quorum_poll_interval_ms = 2000;
 int cluster_voting_disk_io_timeout_ms = 5000;
-int cluster_voting_disk_size_bytes = 131072; /* spec-5.13: 2 regions × 128 × 512 */
+int cluster_voting_disk_size_bytes = 196608; /* spec-5.15: 3 regions × 128 × 512 */
+
+/* spec-5.15 D7 — online declared-node join.  Default off (capability opt-in;
+ * fail-closed-safe via INV-J8 — a DEAD node is never auto-readmitted when off).
+ * Registered in cluster_guc.c init (PGC_POSTMASTER). */
+bool cluster_online_join = false;
+/* spec-5.15 D7 — join convergence / commit deadline (PGC_SIGHUP). */
+int cluster_join_convergence_timeout_ms = 30000;
 
 /* spec-2.28 Sprint A Step 1 D7: 4 fence-lite GUCs (Q8 user approve). */
 bool cluster_self_fence_enabled = true;	   /* default fail-safe */
@@ -2180,23 +2187,46 @@ cluster_init_guc(void)
 							GUC_UNIT_MS, NULL, NULL, NULL);
 
 	/*
-	 * cluster.voting_disk_size_bytes (spec-2.6 D12; spec-5.13 doubled).
-	 * Voting disk file size — pre-allocated on first boot.  Two 512-byte
-	 * regions per instance: region 1 = the voting slot at offset
-	 * (node_id × 512); region 2 = the clean-leave marker at offset
-	 * ((CLUSTER_MAX_NODES + node_id) × 512).  Default 131072 bytes =
-	 * 2 × 128 × 512.  Range [4096, 1048576].
+	 * cluster.voting_disk_size_bytes (spec-2.6 D12; spec-5.13 doubled;
+	 * spec-5.15 tripled).  Voting disk file size — pre-allocated on first
+	 * boot.  Three 512-byte regions per instance: region 1 = the voting slot
+	 * at offset (node_id × 512); region 2 = the clean-leave marker at offset
+	 * ((CLUSTER_MAX_NODES + node_id) × 512); region 3 = the join-commit marker
+	 * at offset ((2 × CLUSTER_MAX_NODES + node_id) × 512).  Default 196608
+	 * bytes = 3 × 128 × 512.  Range [4096, 1048576].
 	 */
 	DefineCustomIntVariable("cluster.voting_disk_size_bytes",
 							gettext_noop("Voting disk file size in bytes."),
 							gettext_noop("Pre-allocated voting disk size (spec-2.6 D12; spec-5.13 "
-										 "doubled for the clean-leave marker region).  Each "
+										 "doubled for the clean-leave marker region; spec-5.15 "
+										 "tripled for the join-commit marker region).  Each "
 										 "instance owns a 512-byte voting slot at offset "
-										 "(node_id × 512) plus a 512-byte leave-marker slot at "
-										 "((128 + node_id) × 512).  Default 131072 = 2 × 128 "
+										 "(node_id × 512), a 512-byte leave-marker slot at "
+										 "((128 + node_id) × 512), and a 512-byte join-marker slot "
+										 "at ((256 + node_id) × 512).  Default 196608 = 3 × 128 "
 										 "slots.  Range [4096, 1048576] bytes; multiple of 512."),
-							&cluster_voting_disk_size_bytes, 131072, 4096, 1048576, PGC_POSTMASTER,
+							&cluster_voting_disk_size_bytes, 196608, 4096, 1048576, PGC_POSTMASTER,
 							GUC_UNIT_BYTE, NULL, NULL, NULL);
+
+	/* spec-5.15 D7 — online declared-node join (Q7/Q8). */
+	DefineCustomBoolVariable("cluster.online_join",
+							 gettext_noop("Allow a declared node to join/rejoin live membership "
+										  "online (without a full cluster restart)."),
+							 gettext_noop("Capability opt-in (default off, fail-closed-safe: a "
+										  "DEAD node is never auto-readmitted while off).  On: a "
+										  "declared node that comes back from down/absent is "
+										  "vetted (monotonic incarnation guard) and published into "
+										  "membership via a two-phase epoch-converged reconfig."),
+							 &cluster_online_join, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("cluster.join_convergence_timeout_ms",
+							gettext_noop("Deadline for an online join to converge + commit."),
+							gettext_noop("If a joining node is not published MEMBER within this "
+										 "bound it fails closed (53R61, restart with a fresh "
+										 "incarnation) rather than half-admitting.  Range "
+										 "[5000, 120000] ms."),
+							&cluster_join_convergence_timeout_ms, 30000, 5000, 120000, PGC_SIGHUP,
+							GUC_UNIT_MS, NULL, NULL, NULL);
 
 	/* spec-2.28 Sprint A Step 1 D7: 4 fence-lite GUCs (Q8 user approve). */
 

@@ -1819,6 +1819,17 @@ cluster_ic_tier1_close_peer(int32 peer_id, const char *reason)
 		if (Tier1Shmem->peers[peer_id].state != (int32)CLUSTER_IC_PEER_REJECTED)
 			Tier1Shmem->peers[peer_id].state = (int32)CLUSTER_IC_PEER_DOWN;
 		Tier1Shmem->peers[peer_id].reconnect_count++;
+		/*
+		 * spec-5.15: reset the liveness baseline on close so a RECONNECTING peer
+		 * (e.g. a node that restarted and is rejoining online) gets a FULL
+		 * heartbeat-liveness window from its next connect, not an immediate
+		 * "heartbeat liveness timeout" judged against the stale pre-close
+		 * timestamp (the LMON check at cluster_lmon.c skips while last==0).
+		 * Without this a restarted peer's connection is torn down before it can
+		 * send its first heartbeat, so it is never re-detected ALIVE — which
+		 * deadlocks online rejoin.
+		 */
+		Tier1Shmem->peers[peer_id].last_heartbeat_recv_at = 0;
 	}
 
 	/*

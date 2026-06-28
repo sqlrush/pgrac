@@ -1358,6 +1358,25 @@ dump_reconfig_touched(ReturnSetInfo *rsinfo)
 }
 
 /*
+ * dump_reconfig_join -- spec-5.15 D6 online-join observability.  5 lifetime
+ * counters under category='reconfig_join'.
+ */
+static void
+dump_reconfig_join(ReturnSetInfo *rsinfo)
+{
+	emit_row(rsinfo, "reconfig_join", "join_pending_count",
+			 fmt_int64((int64)cluster_reconfig_get_join_pending_count()));
+	emit_row(rsinfo, "reconfig_join", "join_apply_count",
+			 fmt_int64((int64)cluster_reconfig_get_join_apply_count()));
+	emit_row(rsinfo, "reconfig_join", "join_reject_count",
+			 fmt_int64((int64)cluster_reconfig_get_join_reject_count()));
+	emit_row(rsinfo, "reconfig_join", "join_timeout_count",
+			 fmt_int64((int64)cluster_reconfig_get_join_timeout_count()));
+	emit_row(rsinfo, "reconfig_join", "clean_departed_cleared_count",
+			 fmt_int64((int64)cluster_reconfig_get_clean_departed_cleared_count()));
+}
+
+/*
  * dump_ges -- spec-2.13 D4 GES protocol skeleton observability.
  *
  *	Emits 2 rows under category='ges':
@@ -2637,6 +2656,7 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		dump_tt_2pc(rsinfo);
 		dump_recovery(rsinfo);
 		dump_reconfig_touched(rsinfo); /* spec-5.14 D6 */
+		dump_reconfig_join(rsinfo);	   /* spec-5.15 D6 */
 		dump_scn(rsinfo);
 		dump_ges(rsinfo);
 		dump_advisory(rsinfo);

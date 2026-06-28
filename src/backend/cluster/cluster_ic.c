@@ -115,6 +115,12 @@ PG_FUNCTION_INFO_V1(cluster_get_fence_state);
  */
 PG_FUNCTION_INFO_V1(cluster_get_reconfig_state);
 
+/*
+ * spec-5.15 D6 -- cluster_get_membership SRF symbol.  Body in cluster_reconfig.c
+ * for --enable-cluster; disable-cluster stub at file end.
+ */
+PG_FUNCTION_INFO_V1(cluster_get_membership);
+
 #ifndef USE_PGRAC_CLUSTER
 /*
  * spec-3.2 D5b -- visibility-fork injection SQL symbols.  The real
@@ -1355,6 +1361,17 @@ cluster_get_reconfig_state(PG_FUNCTION_ARGS pg_attribute_unused())
 {
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("cluster_get_reconfig_state requires --enable-cluster")));
+	PG_RETURN_NULL();
+}
+
+/*
+ * spec-5.15 D6 -- cluster_get_membership disable-cluster stub.
+ */
+Datum
+cluster_get_membership(PG_FUNCTION_ARGS pg_attribute_unused())
+{
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cluster_get_membership requires --enable-cluster")));
 	PG_RETURN_NULL();
 }
 

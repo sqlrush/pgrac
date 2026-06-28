@@ -445,6 +445,8 @@ extern char *cluster_voting_disks;
 extern int cluster_quorum_poll_interval_ms;
 extern int cluster_voting_disk_io_timeout_ms;
 extern int cluster_voting_disk_size_bytes;
+extern bool cluster_online_join;				/* spec-5.15 D7 */
+extern int cluster_join_convergence_timeout_ms; /* spec-5.15 D7 */
 
 /*
  * spec-2.2 D7 -- Tier 1 TCP transport tuning (PGC_POSTMASTER).

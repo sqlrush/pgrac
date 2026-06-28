@@ -479,4 +479,60 @@ cluster_voting_disk_write_leave_slot(int fd, uint32 node_id, const void *in_slot
 	return CLUSTER_VOTING_DISK_IO_OK;
 }
 
+/* ============================================================
+ * spec-5.15 D4 — raw 512-byte join-commit-marker slot R/W (region 3), at
+ * CLUSTER_VOTING_JOIN_SLOT_OFFSET(node_id).  Mirrors the leave-slot path.
+ * ============================================================ */
+
+ClusterVotingDiskIoState
+cluster_voting_disk_read_join_slot(int fd, uint32 node_id, void *out_slot512)
+{
+	char aligned[CLUSTER_VOTING_SLOT_BYTES] __attribute__((aligned(512)));
+	ssize_t nread;
+
+	if (fd < 0)
+		return CLUSTER_VOTING_DISK_IO_NOT_TRIED;
+	if (out_slot512 == NULL || node_id >= CLUSTER_MAX_NODES)
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+
+	memset(aligned, 0, sizeof(aligned));
+
+	voting_disk_io_arm_timeout();
+	nread = pread(fd, aligned, CLUSTER_VOTING_SLOT_BYTES, CLUSTER_VOTING_JOIN_SLOT_OFFSET(node_id));
+	voting_disk_io_disarm_timeout();
+	if (nread != CLUSTER_VOTING_SLOT_BYTES)
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+
+	memcpy(out_slot512, aligned, CLUSTER_VOTING_SLOT_BYTES);
+	return CLUSTER_VOTING_DISK_IO_OK;
+}
+
+ClusterVotingDiskIoState
+cluster_voting_disk_write_join_slot(int fd, uint32 node_id, const void *in_slot512)
+{
+	char aligned[CLUSTER_VOTING_SLOT_BYTES] __attribute__((aligned(512)));
+	ssize_t nwritten;
+
+	if (fd < 0)
+		return CLUSTER_VOTING_DISK_IO_NOT_TRIED;
+	if (in_slot512 == NULL || node_id >= CLUSTER_MAX_NODES)
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+
+	memcpy(aligned, in_slot512, CLUSTER_VOTING_SLOT_BYTES);
+
+	voting_disk_io_arm_timeout();
+	nwritten
+		= pwrite(fd, aligned, CLUSTER_VOTING_SLOT_BYTES, CLUSTER_VOTING_JOIN_SLOT_OFFSET(node_id));
+	if (nwritten != CLUSTER_VOTING_SLOT_BYTES) {
+		voting_disk_io_disarm_timeout();
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+	}
+	if (fdatasync(fd) != 0) {
+		voting_disk_io_disarm_timeout();
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+	}
+	voting_disk_io_disarm_timeout();
+	return CLUSTER_VOTING_DISK_IO_OK;
+}
+
 #endif /* USE_PGRAC_CLUSTER */

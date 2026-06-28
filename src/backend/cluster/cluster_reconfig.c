@@ -63,20 +63,23 @@
 #include "utils/timestamp.h"
 #include "utils/wait_event.h" /* WAIT_EVENT_CLUSTER_BGPROC_LMON_RECONFIG_TICK (D9) */
 
-#include "cluster/cluster_conf.h"		   /* cluster_conf_lookup_node */
-#include "cluster/cluster_cssd.h"		   /* cluster_cssd_get_peer_state, get_dead_generation */
-#include "cluster/cluster_elog.h"		   /* cluster_node_id */
-#include "cluster/cluster_epoch.h"		   /* advance + observe + set_changed_at_lsn */
-#include "cluster/cluster_gcs_block.h"	   /* spec-2.34 D4 — eager epoch wake hook */
-#include "cluster/cluster_sinval.h"		   /* spec-2.39 D14 — RESET-all reconfig hook */
-#include "cluster/cluster_tt_status.h"	   /* spec-3.1 D7 — TT status overlay flush hook */
-#include "cluster/cluster_guc.h"		   /* cluster_enabled */
-#include "cluster/cluster_inject.h"		   /* CLUSTER_INJECTION_POINT */
-#include "cluster/cluster_write_fence.h"   /* spec-4.12 D4 — durable fence marker submit */
-#include "cluster/cluster_qvotec.h"		   /* cluster_qvotec_in_quorum */
-#include "cluster/cluster_shmem.h"		   /* cluster_shmem_register_region */
-#include "cluster/cluster_signal.h"		   /* cluster_reconfig_start_pending */
-#include "cluster/cluster_touched_peers.h" /* spec-5.14 D4 — touched ∩ dead dispatch */
+#include "cluster/cluster_conf.h"			/* cluster_conf_lookup_node */
+#include "cluster/cluster_cssd.h"			/* cluster_cssd_get_peer_state, get_dead_generation */
+#include "cluster/cluster_elog.h"			/* cluster_node_id */
+#include "cluster/cluster_epoch.h"			/* advance + observe + set_changed_at_lsn */
+#include "cluster/cluster_gcs_block.h"		/* spec-2.34 D4 — eager epoch wake hook */
+#include "cluster/cluster_sinval.h"			/* spec-2.39 D14 — RESET-all reconfig hook */
+#include "cluster/cluster_tt_status.h"		/* spec-3.1 D7 — TT status overlay flush hook */
+#include "storage/ipc.h"					/* on_shmem_exit (spec-5.15 D4 latch clear) */
+#include "storage/latch.h"					/* Latch / SetLatch (spec-5.15 D4 marker mailbox) */
+#include "cluster/cluster_guc.h"			/* cluster_enabled, cluster_online_join */
+#include "cluster/cluster_inject.h"			/* CLUSTER_INJECTION_POINT */
+#include "cluster/cluster_voting_disk_io.h" /* spec-5.15 D4 — region-3 join-marker slot I/O */
+#include "cluster/cluster_write_fence.h"	/* spec-4.12 D4 — durable fence marker submit */
+#include "cluster/cluster_qvotec.h"			/* cluster_qvotec_in_quorum */
+#include "cluster/cluster_shmem.h"			/* cluster_shmem_register_region */
+#include "cluster/cluster_signal.h"			/* cluster_reconfig_start_pending */
+#include "cluster/cluster_touched_peers.h"	/* spec-5.14 D4 — touched ∩ dead dispatch */
 
 
 /*
@@ -93,7 +96,8 @@
  *	    + 8 event_seq + 8 cssd_dead_generation = 80 bytes exactly.
  *	  Allow up to 96 bytes for future field append without bump.
  */
-StaticAssertDecl(sizeof(ReconfigEvent) <= 96, "ReconfigEvent must fit within 96 bytes");
+/* spec-5.15 D3 widened 96 -> 112: join_bitmap[16] grows ReconfigEvent 88 -> 104. */
+StaticAssertDecl(sizeof(ReconfigEvent) <= 112, "ReconfigEvent must fit within 112 bytes");
 StaticAssertDecl(sizeof(ReconfigEvent) >= 64,
 				 "ReconfigEvent must be at least 64 bytes (defensive — fields enumerated)");
 
@@ -149,7 +153,42 @@ cluster_reconfig_shmem_init(void)
 		pg_atomic_init_u64(&ReconfigShmem->clean_departed_count, 0);
 		/* last_applied left zeroed by memset — event_id=0 =
 		 * CLUSTER_RECONFIG_OBSERVER_NONE = never-applied sentinel. */
+
+		/* spec-5.15 D2/D5 — membership table + pending_join_bitmap left zeroed by
+		 * memset (all nodes CLUSTER_MEMBER_ABSENT, no pending join).  Open the
+		 * joiner write gate by default: a steady-state / non-joining node may
+		 * write; a joiner explicitly closes it in its D5 startup. */
+		ReconfigShmem->self_join_admitted = 1;
+
+		/* spec-5.15 D1/D4 — no slot observed yet (generation 0 = absent/not ready). */
+		for (int n = 0; n < CLUSTER_MAX_NODES; n++) {
+			pg_atomic_init_u64(&ReconfigShmem->observed_incarnation[n], 0);
+			pg_atomic_init_u64(&ReconfigShmem->observed_generation[n], 0);
+			pg_atomic_init_u64(&ReconfigShmem->observed_epoch[n], 0);
+		}
+
+		/* spec-5.15 D4 — join-marker submit mailbox (latch published by qvotec). */
+		ReconfigShmem->join_qvotec_latch = NULL;
+		pg_atomic_init_u64(&ReconfigShmem->join_marker_request_seq, 0);
+		pg_atomic_init_u64(&ReconfigShmem->join_marker_completion_seq, 0);
+		pg_atomic_init_u32(&ReconfigShmem->join_marker_result, CLUSTER_JOIN_MARKER_SUBMIT_FAILED);
+		ReconfigShmem->join_marker_target_node_id = -1;
+		/* join_pending_marker left zeroed by memset. */
+
+		/* spec-5.15 D6 — online-join observability counters. */
+		pg_atomic_init_u64(&ReconfigShmem->join_pending_count, 0);
+		pg_atomic_init_u64(&ReconfigShmem->join_apply_count, 0);
+		pg_atomic_init_u64(&ReconfigShmem->join_reject_count, 0);
+		pg_atomic_init_u64(&ReconfigShmem->join_timeout_count, 0);
+		pg_atomic_init_u64(&ReconfigShmem->clean_departed_cleared_count, 0);
 	}
+
+	/*
+	 * spec-5.15 D2 — every backend points the cluster_membership accessors at the
+	 * shared table in this region (outside the !found block: EXEC_BACKEND children
+	 * re-attach their process-local pointer to the inherited shmem).
+	 */
+	cluster_membership_attach(&ReconfigShmem->membership);
 }
 
 
@@ -370,6 +409,14 @@ dead_bitmap_set_bit(uint8 *bmp, int i)
 
 
 static inline bool
+dead_bitmap_test_bit(const uint8 *bmp, int i)
+{
+	Assert(i >= 0 && i < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES * 8);
+	return (bmp[i / 8] & (uint8)(1u << (i % 8))) != 0;
+}
+
+
+static inline bool
 dead_bitmap_is_zero(const uint8 *bmp)
 {
 	int i;
@@ -414,6 +461,174 @@ cluster_reconfig_compute_event_id(const uint8 dead_bitmap[CLUSTER_RECONFIG_DEAD_
 	memcpy(hash_input, dead_bitmap, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
 	memcpy(hash_input + CLUSTER_RECONFIG_DEAD_BITMAP_BYTES, &cssd_dead_generation, sizeof(uint64));
 	return hash_bytes_extended(hash_input, sizeof(hash_input), 0);
+}
+
+
+/*
+ * spec-5.15 D3 (INV-J11) — kind-aware event_id, folding the discriminator for
+ * the kinds that need it.
+ *
+ *	FAIL_STOP / CLEAN_LEAVE  -> the LEGACY cluster_reconfig_compute_event_id over
+ *	    (dead_bitmap, cssd_dead_generation).  This is byte-identical to the 2.29
+ *	    death path AND to what shipped spec-5.13 binds into the durable leave
+ *	    marker (RC-1, verified against linkdb: cluster_clean_leave.c binds the
+ *	    legacy id — folding CLEAN_LEAVE would break that binding).  FAIL_STOP and
+ *	    CLEAN_LEAVE never share a (dead_bitmap, cssd_dead_generation): each
+ *	    death / leave episode advances cssd_dead_generation, which is the actual
+ *	    non-collision basis (NOT a folded kind byte).
+ *	JOIN_PENDING / JOIN_COMMITTED -> FOLD kind || join_bitmap ||
+ *	    joiner_incarnations || cssd_dead_generation.  Join events have an empty
+ *	    dead_bitmap, so the legacy hash would collide across the two phases and
+ *	    across distinct joins (R12); folding the kind distinguishes PENDING from
+ *	    COMMITTED and the incarnations distinguish distinct joiner sets.
+ *	NONE -> 0 (the never-applied sentinel; not a real event).
+ */
+uint64
+cluster_reconfig_compute_event_id_v2(uint8 reconfig_kind,
+									 const uint8 dead_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES],
+									 const uint8 join_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES],
+									 const uint64 joiner_incarnations[CLUSTER_MAX_NODES],
+									 uint64 cssd_dead_generation)
+{
+	uint8 hash_input[1 + CLUSTER_RECONFIG_DEAD_BITMAP_BYTES + sizeof(uint64) * CLUSTER_MAX_NODES
+					 + sizeof(uint64)];
+	Size off = 0;
+
+	switch (reconfig_kind) {
+	case RECONFIG_KIND_NONE:
+		return 0; /* sentinel — not a real event */
+
+	case RECONFIG_KIND_FAIL_STOP:
+	case RECONFIG_KIND_CLEAN_LEAVE:
+		return cluster_reconfig_compute_event_id(dead_bitmap, cssd_dead_generation);
+
+	case RECONFIG_KIND_JOIN_PENDING:
+	case RECONFIG_KIND_JOIN_COMMITTED:
+	default:
+		Assert(join_bitmap != NULL && joiner_incarnations != NULL);
+		hash_input[off++] = reconfig_kind;
+		memcpy(hash_input + off, join_bitmap, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
+		off += CLUSTER_RECONFIG_DEAD_BITMAP_BYTES;
+		memcpy(hash_input + off, joiner_incarnations, sizeof(uint64) * CLUSTER_MAX_NODES);
+		off += sizeof(uint64) * CLUSTER_MAX_NODES;
+		memcpy(hash_input + off, &cssd_dead_generation, sizeof(uint64));
+		off += sizeof(uint64);
+		return hash_bytes_extended(hash_input, off, 0);
+	}
+}
+
+
+/*
+ * spec-5.15 D1 — cluster_reconfig_compute_join_bitmap.
+ *
+ *	Compute the set of declared peers that transitioned from a non-member state
+ *	(DEAD / ABSENT) into a fresh-ALIVE state since the last applied reconfig (the
+ *	"join edge"), mirroring the death-edge computation in the tick.  A bit i is
+ *	set iff ALL hold:
+ *	  - cluster_conf_lookup_node(i) != NULL          (declared-peer filter)
+ *	  - cluster_membership_get_state(i) is DEAD/ABSENT (not currently a member)
+ *	  - cluster_cssd_get_peer_state(i) == ALIVE      (now heart-beating)
+ *	  - the peer's observed voting-slot incarnation is strictly greater than
+ *	    last_admitted_incarnation[i]                 (freshness, anti-stale: a
+ *	    stale rejoin never even raises a join edge; the coordinator vet (D4) is
+ *	    the authoritative gate that issues REJECT_STALE on the TOCTOU window)
+ *
+ *	Pure w.r.t. shmem reads (uses the qvotec-published observed slot, not a disk
+ *	read).  Caller holds the reconfig LWLock (membership_state reads).  Returns
+ *	the number of join-edge bits set.
+ */
+int
+cluster_reconfig_compute_join_bitmap(uint8 join_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES])
+{
+	int i;
+	int count = 0;
+
+	memset(join_bitmap, 0, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
+
+	if (ReconfigShmem == NULL)
+		return 0;
+
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		ClusterMembershipState ms;
+		uint64 observed_incarnation = 0;
+		uint64 observed_generation = 0;
+
+		if (i == cluster_node_id)
+			continue; /* self is never a join candidate */
+		if (cluster_conf_lookup_node(i) == NULL)
+			continue; /* declared-peer filter */
+
+		ms = cluster_membership_get_state(i);
+		if (ms != CLUSTER_MEMBER_DEAD && ms != CLUSTER_MEMBER_ABSENT)
+			continue; /* already a member / mid-join (JOINING) — not a new edge */
+
+		if (cluster_cssd_get_peer_state(i) != CLUSTER_CSSD_PEER_ALIVE)
+			continue; /* not heart-beating yet */
+
+		if (!cluster_reconfig_get_observed_slot(i, &observed_incarnation, &observed_generation))
+			continue; /* no valid published slot — not ready */
+		if (observed_incarnation <= cluster_membership_get_last_admitted_incarnation(i))
+			continue; /* stale incarnation (INV-J1 pre-filter); vet REJECTs at commit */
+
+		dead_bitmap_set_bit(join_bitmap, i);
+		count++;
+	}
+
+	return count;
+}
+
+
+/*
+ * spec-5.15 D1 — qvotec publishes the freshest observed voting-slot incarnation
+ * + generation per node here each poll (it is the sole disk reader).  pg_atomic
+ * write so qvotec, a different process, publishes lock-free.  NULL-safe / range-
+ * checked.
+ */
+void
+cluster_reconfig_record_observed_slot(int32 node_id, uint64 incarnation, uint64 generation,
+									  uint64 epoch)
+{
+	if (ReconfigShmem == NULL || node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return;
+	pg_atomic_write_u64(&ReconfigShmem->observed_incarnation[node_id], incarnation);
+	pg_atomic_write_u64(&ReconfigShmem->observed_generation[node_id], generation);
+	pg_atomic_write_u64(&ReconfigShmem->observed_epoch[node_id], epoch);
+}
+
+uint64
+cluster_reconfig_get_observed_epoch(int32 node_id)
+{
+	if (ReconfigShmem == NULL || node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return 0;
+	return pg_atomic_read_u64(&ReconfigShmem->observed_epoch[node_id]);
+}
+
+
+/*
+ * spec-5.15 D1 — read the freshest observed voting-slot incarnation + generation
+ * for node_id.  Returns true iff a valid slot was observed (generation > 0);
+ * out-params always written (0 when absent).  Used by the join-edge detector and
+ * the coordinator vet.
+ */
+bool
+cluster_reconfig_get_observed_slot(int32 node_id, uint64 *incarnation, uint64 *generation)
+{
+	uint64 gen;
+
+	if (incarnation != NULL)
+		*incarnation = 0;
+	if (generation != NULL)
+		*generation = 0;
+
+	if (ReconfigShmem == NULL || node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	gen = pg_atomic_read_u64(&ReconfigShmem->observed_generation[node_id]);
+	if (incarnation != NULL)
+		*incarnation = pg_atomic_read_u64(&ReconfigShmem->observed_incarnation[node_id]);
+	if (generation != NULL)
+		*generation = gen;
+	return gen > 0;
 }
 
 
@@ -543,6 +758,290 @@ cluster_reconfig_get_clean_departed_count(void)
 	return pg_atomic_read_u64(&ReconfigShmem->clean_departed_count);
 }
 
+/* spec-5.15 D6 — online-join observability counter accessors. */
+uint64
+cluster_reconfig_get_join_pending_count(void)
+{
+	return ReconfigShmem == NULL ? 0 : pg_atomic_read_u64(&ReconfigShmem->join_pending_count);
+}
+uint64
+cluster_reconfig_get_join_apply_count(void)
+{
+	return ReconfigShmem == NULL ? 0 : pg_atomic_read_u64(&ReconfigShmem->join_apply_count);
+}
+uint64
+cluster_reconfig_get_join_reject_count(void)
+{
+	return ReconfigShmem == NULL ? 0 : pg_atomic_read_u64(&ReconfigShmem->join_reject_count);
+}
+uint64
+cluster_reconfig_get_join_timeout_count(void)
+{
+	return ReconfigShmem == NULL ? 0 : pg_atomic_read_u64(&ReconfigShmem->join_timeout_count);
+}
+uint64
+cluster_reconfig_get_clean_departed_cleared_count(void)
+{
+	return ReconfigShmem == NULL ? 0
+								 : pg_atomic_read_u64(&ReconfigShmem->clean_departed_cleared_count);
+}
+
+
+/*
+ * spec-5.15 D4 §3.3 — has the JOIN_PENDING converged?  Every existing MEMBER
+ * survivor (other than self and the joiner) must have observed the coordinator's
+ * current membership epoch (the joiner is NOT in the convergence set — INV-J12 —
+ * it adopts from the COMMITTED marker, breaking the commit<-converge<-adopt
+ * cycle).  At 2 nodes the only MEMBER survivor is self, so this is trivially true
+ * and Phase-2 follows on the next tick.
+ */
+static bool
+cluster_reconfig_join_converged(int joiner)
+{
+	uint64 target_epoch = cluster_epoch_get_current();
+	int i;
+
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		if (i == cluster_node_id || i == joiner)
+			continue;
+		if (cluster_conf_lookup_node(i) == NULL)
+			continue;
+		if (!cluster_membership_is_member(i))
+			continue; /* not a member -> not in the convergence set */
+		if (cluster_reconfig_get_observed_epoch(i) < target_epoch)
+			return false; /* this MEMBER survivor has not caught up */
+	}
+	return true;
+}
+
+/*
+ * spec-5.15 D4 — coordinator-side join driver (called from the tick when
+ * online_join is on and self is the min-MEMBER coordinator).  Phase-1: fresh
+ * join edges -> apply_join_as_coordinator (JOIN_PENDING).  Phase-2: pending joins
+ * whose convergence is met -> re-vet (TOCTOU, INV-J1) -> commit_member.
+ */
+static void
+cluster_reconfig_drive_joins(int coordinator)
+{
+	uint8 join_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	uint8 pending_snapshot[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	uint64 joiner_incarnations[CLUSTER_MAX_NODES];
+	int n_join;
+	int i;
+
+	if (ReconfigShmem == NULL)
+		return;
+
+	/* Phase-1 detection + a snapshot of the current pending set, under the lock
+	 * (compute_join_bitmap reads membership_state). */
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	n_join = cluster_reconfig_compute_join_bitmap(join_bitmap);
+	memcpy(pending_snapshot, ReconfigShmem->pending_join_bitmap, sizeof(pending_snapshot));
+	LWLockRelease(&ReconfigShmem->lock);
+
+	if (n_join > 0) {
+		memset(joiner_incarnations, 0, sizeof(joiner_incarnations));
+		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+			if (!dead_bitmap_test_bit(join_bitmap, i))
+				continue;
+			(void)cluster_reconfig_get_observed_slot(i, &joiner_incarnations[i], NULL);
+		}
+		cluster_reconfig_apply_join_as_coordinator(join_bitmap, coordinator, joiner_incarnations);
+		/* enter the JOIN_PENDING transition fail-closed on every local backend. */
+		cluster_reconfig_broadcast_local_procsig();
+	}
+
+	/* Phase-2: commit pending joins that have converged.  The just-added Phase-1
+	 * joiner is NOT in pending_snapshot (set after the snapshot), so it commits on
+	 * a later tick — the intended two-phase, two-tick bracket. */
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		uint64 admitted_incarnation = 0;
+		uint64 admitted_generation = 0;
+
+		if (!dead_bitmap_test_bit(pending_snapshot, i))
+			continue;
+		if (!cluster_reconfig_join_converged(i))
+			continue;
+		if (!cluster_reconfig_get_observed_slot(i, &admitted_incarnation, &admitted_generation))
+			continue; /* no valid slot now -> wait */
+		/* authoritative re-vet at the commit point (TOCTOU, INV-J1): stale /
+		 * not-ready / out-of-quorum -> skip (the joiner times out -> REJECT). */
+		if (cluster_membership_vet_joiner(i, admitted_incarnation, admitted_generation)
+			!= CLUSTER_JOIN_ACCEPT) {
+			pg_atomic_fetch_add_u64(&ReconfigShmem->join_reject_count, 1);
+			continue;
+		}
+		(void)cluster_reconfig_commit_member(i, admitted_incarnation);
+	}
+}
+
+
+/* ============================================================
+ * spec-5.15 D5 — joiner-side write gate + admission.
+ * ============================================================
+ */
+
+ClusterJoinGateVerdict
+cluster_reconfig_self_join_gate_verdict(void)
+{
+	if (ReconfigShmem == NULL)
+		return CLUSTER_JOIN_GATE_ALLOW;
+	/* single-byte reads — naturally atomic; this is a hot xact-entry check. */
+	if (ReconfigShmem->self_join_failed)
+		return CLUSTER_JOIN_GATE_BLOCK_53R61;
+	if (!ReconfigShmem->self_join_admitted)
+		return CLUSTER_JOIN_GATE_BLOCK_53R60;
+	return CLUSTER_JOIN_GATE_ALLOW;
+}
+
+void
+cluster_reconfig_note_self_admitted(uint64 admitted_epoch)
+{
+	if (ReconfigShmem == NULL)
+		return;
+	if (cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES)
+		return;
+
+	/*
+	 * P1-r5 strict order: adopt the admitted epoch (quorum-authenticated, may
+	 * jump >16 — INV-J12) AND set self MEMBER BEFORE opening the write gate
+	 * (gate-open guard = adopt && state==MEMBER; never open right after the
+	 * COMMITTED marker is durable but before the publish reached self).
+	 */
+	cluster_epoch_adopt_admitted(admitted_epoch);
+	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_MEMBER);
+	ReconfigShmem->self_join_admitted = 1;
+	ReconfigShmem->self_join_failed = 0;
+	ReconfigShmem->self_join_deadline_us = 0;
+	LWLockRelease(&ReconfigShmem->lock);
+}
+
+/*
+ * Is the cluster already running (so a freshly-booted node is REJOINING, not
+ * bootstrapping — §3.4)?  Signal: a declared peer observed at a committed epoch
+ * > CLUSTER_EPOCH_INITIAL.  A node only becomes absent after the survivors
+ * noticed and reconfigured (which advances the epoch), so by the time it reboots
+ * its peers are past epoch 0; a cold bootstrap has every node at epoch 0.
+ */
+static bool
+cluster_reconfig_cluster_already_running(void)
+{
+	int i;
+
+	if (ReconfigShmem == NULL)
+		return false;
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		if (i == cluster_node_id)
+			continue;
+		if (cluster_conf_lookup_node(i) == NULL)
+			continue;
+		if (cluster_reconfig_get_observed_epoch(i) > CLUSTER_EPOCH_INITIAL)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * spec-5.15 D5 — joiner self-tick (runs on every node each LMON tick).
+ *
+ *	One-time boot decision: within an early startup window, if online_join is on
+ *	and the cluster is already running, this node is a rejoiner — close the write
+ *	gate (53R60) and start the join (the coordinator drives it from the other
+ *	side).  Once admitted, qvotec's note_self_admitted opens the gate; if the join
+ *	does not converge within join_convergence_timeout_ms, latch self_join_failed
+ *	(53R61, restart with a fresh incarnation — INV-J4 never half-admit).  A cold
+ *	bootstrap observes no running peer within the grace and leaves the gate open
+ *	(boot-time membership formation is NOT gated by online_join).
+ */
+static uint64 joiner_lmon_boot_time_us = 0;
+static bool joiner_gate_decided = false;
+
+static void
+cluster_reconfig_joiner_self_tick(void)
+{
+	uint64 now_us;
+	uint64 decide_grace_us;
+
+	if (ReconfigShmem == NULL || !cluster_online_join)
+		return;
+	if (cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES)
+		return;
+
+	now_us = (uint64)GetCurrentTimestamp();
+	if (joiner_lmon_boot_time_us == 0)
+		joiner_lmon_boot_time_us = now_us;
+	/* enough for qvotec to have published at least one poll's observed epochs. */
+	decide_grace_us = Max((uint64)cluster_quorum_poll_interval_ms * 5 * 1000ULL, 2000ULL * 1000ULL);
+
+	/*
+	 * Catch up to the cluster epoch observed on the durable voting disk (quorum-
+	 * authenticated — qvotec is the sole CRC-checked slot writer) so a rejoiner
+	 * that booted at CLUSTER_EPOCH_INITIAL can COMMUNICATE.  The IC envelope drops
+	 * a frame whose epoch is BELOW the receiver's (anti-stale, spec-2.4): until a
+	 * rejoiner reaches the cluster epoch, its own CSSD heartbeats are stale-dropped
+	 * by the survivors, so it is never seen ALIVE → never detected → never
+	 * admitted (a join deadlock).  Adopting the max observed in-quorum peer epoch
+	 * bridges that gap WITHOUT bypassing admission: the incarnation vet (INV-J1) +
+	 * the §2.6 COMMITTED marker still gate MEMBER; this only unblocks the
+	 * transport.  Runs every tick so the joiner tracks the cluster while joining.
+	 */
+	{
+		uint64 self_epoch = cluster_epoch_get_current();
+		uint64 max_peer_epoch = self_epoch;
+		int i;
+
+		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+			uint64 pe;
+
+			if (i == cluster_node_id || cluster_conf_lookup_node(i) == NULL)
+				continue;
+			pe = cluster_reconfig_get_observed_epoch(i);
+			if (pe > max_peer_epoch)
+				max_peer_epoch = pe;
+		}
+		if (max_peer_epoch > self_epoch)
+			cluster_epoch_adopt_admitted(max_peer_epoch);
+	}
+
+	if (!joiner_gate_decided) {
+		if (cluster_reconfig_cluster_already_running()) {
+			joiner_gate_decided = true;
+			LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+			ReconfigShmem->self_join_admitted = 0;
+			ReconfigShmem->self_join_failed = 0;
+			ReconfigShmem->self_join_deadline_us
+				= now_us + (uint64)cluster_join_convergence_timeout_ms * 1000ULL;
+			cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_JOINING);
+			LWLockRelease(&ReconfigShmem->lock);
+			ereport(LOG,
+					(errmsg("cluster membership: node %d joining a running cluster — write gate "
+							"closed (53R60) pending admission",
+							cluster_node_id)));
+		} else if (now_us - joiner_lmon_boot_time_us > decide_grace_us) {
+			/* no running peer observed in the early window -> cold bootstrap. */
+			joiner_gate_decided = true;
+		}
+		return;
+	}
+
+	/* Gate decided.  If closed + not yet admitted, fail closed on timeout (53R61);
+	 * note_self_admitted opens the gate directly when self's COMMITTED marker is
+	 * observed. */
+	if (!ReconfigShmem->self_join_admitted && !ReconfigShmem->self_join_failed
+		&& ReconfigShmem->self_join_deadline_us != 0
+		&& now_us >= ReconfigShmem->self_join_deadline_us) {
+		LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+		ReconfigShmem->self_join_failed = 1;
+		cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_REJECTED);
+		LWLockRelease(&ReconfigShmem->lock);
+		pg_atomic_fetch_add_u64(&ReconfigShmem->join_timeout_count, 1);
+		ereport(LOG, (errmsg("cluster membership: node %d join did not converge within %d ms — "
+							 "writes now 53R61 (restart with a fresh incarnation)",
+							 cluster_node_id, cluster_join_convergence_timeout_ms)));
+	}
+}
+
 
 /* ============================================================
  * Step 2 D2 — cluster_reconfig_lmon_tick body.
@@ -588,126 +1087,178 @@ cluster_reconfig_lmon_tick(void)
 		return; /* defensive: bad self id, cannot participate */
 
 	/*
-	 * §3.1 + F11: build dead_bitmap and alive_set using CSSD peer_state,
-	 * filtering out un-declared peers.  Self is added to alive_set only
-	 * if self is declared in cluster.conf (sanity guard) and in_quorum.
+	 * §3.1 + F11: build the raw CSSD DEAD bitmap, filtering out un-declared
+	 * peers.  Self is alive by construction (it is running this tick, in
+	 * quorum).  Lock-free snapshot — the membership-state maintenance and the
+	 * survivor-set build below run under the reconfig lock.
 	 */
-	if (cluster_conf_lookup_node(self_id) != NULL)
-		dead_bitmap_set_bit(alive_set, self_id);
-	else
+	if (cluster_conf_lookup_node(self_id) == NULL)
 		return; /* self un-declared — must not be coordinator */
 
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
-		ClusterCssdPeerState state;
-
 		if (i == self_id)
 			continue;
 		if (cluster_conf_lookup_node(i) == NULL)
 			continue; /* F11: skip un-declared peer */
 
-		state = cluster_cssd_get_peer_state(i);
-		if (state == CLUSTER_CSSD_PEER_DEAD)
+		if (cluster_cssd_get_peer_state(i) == CLUSTER_CSSD_PEER_DEAD)
 			dead_bitmap_set_bit(dead_bitmap, i);
-		else /* ALIVE or SUSPECTED counts as alive for survivor set */
-			dead_bitmap_set_bit(alive_set, i);
 	}
 
 	/*
-	 * spec-5.13 D3 (CL-I13) — effective_dead = cssd_dead & ~clean_departed.
-	 * A cleanly-departed node (a CLEAN_LEAVE reconfig committed naming it, then
-	 * it exited) stops heart-beating and shows up CSSD DEAD here.  Masking it
-	 * out suppresses the spurious SECOND fail-stop reconfig (and the spurious
-	 * 40R01 of a drain-grace survivor tx whose touched_peers still names it,
-	 * R18).  A node only enters clean_departed AFTER its leave committed, so its
-	 * leftover is provably zero (CL-I2) and its death is a no-op — safe to
-	 * ignore.  A pre-commit heartbeat stop is NOT in clean_departed yet → still
-	 * escalates to fail-stop (CL-I7).  Read the mask under SHARED.
+	 * spec-5.15 D5 — joiner self-tick: decide (once, in the early boot window) if
+	 * THIS node is rejoining a running cluster and close its write gate; latch
+	 * 53R61 on convergence timeout.  Runs before the membership maintenance so the
+	 * self-state below reflects the gate.
+	 */
+	cluster_reconfig_joiner_self_tick();
+
+	/*
+	 * spec-5.15 D1 (INV-J8): the membership-state table — NOT raw CSSD — is the
+	 * decision SSOT for the survivor / coordinator set.  Maintain it and build
+	 * alive_set from it, under EXCLUSIVE (we mutate membership_state):
+	 *   self                         -> MEMBER (running + in quorum)
+	 *   peer CSSD DEAD               -> DEAD   (a member that died; demote)
+	 *   peer CSSD alive + state ABSENT -> MEMBER (bootstrap join, §3.4: a
+	 *       never-seen declared node forming the initial membership; NOT gated
+	 *       by online_join, which gates only runtime readmission)
+	 *   peer CSSD alive + state DEAD -> stays DEAD (a recovered node is NOT
+	 *       auto-readmitted — a JOIN_COMMITTED reconfig (D4) is the only
+	 *       DEAD->MEMBER path; this is the §3.4 online_join=off isolation + the
+	 *       P1c fix that closes "CSSD ALIVE silently counts as a member")
+	 *   peer CSSD alive + JOINING/MEMBER -> unchanged
+	 *
+	 * Then apply spec-5.13 CL-I13 effective_dead = cssd_dead & ~clean_departed
+	 * (a cleanly-departed member stops heart-beating and shows up CSSD DEAD;
+	 * masking it out suppresses the spurious SECOND fail-stop reconfig).  Folded
+	 * into the same EXCLUSIVE section (was a separate SHARED read pre-5.15).
+	 *
+	 * When the region is absent (cluster off / pre-postmaster) fall back to the
+	 * pre-5.15 raw-CSSD survivor set so the degraded path is unchanged.
 	 */
 	if (ReconfigShmem != NULL) {
 		int b;
 
-		LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+		LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+
+		/* self-state follows the joiner gate (D5): MEMBER when admitted / steady,
+		 * JOINING while this node is itself a joiner whose gate is closed. */
+		if (ReconfigShmem->self_join_admitted && !ReconfigShmem->self_join_failed)
+			cluster_membership_set_state(self_id, CLUSTER_MEMBER_MEMBER);
+		else
+			cluster_membership_set_state(self_id, CLUSTER_MEMBER_JOINING);
+
+		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+			ClusterMembershipState ms;
+
+			if (i == self_id)
+				continue;
+			if (cluster_conf_lookup_node(i) == NULL)
+				continue;
+
+			ms = cluster_membership_get_state(i);
+			if (dead_bitmap_test_bit(dead_bitmap, i))
+				cluster_membership_set_state(i, CLUSTER_MEMBER_DEAD);
+			else if (ms == CLUSTER_MEMBER_ABSENT)
+				cluster_membership_set_state(i, CLUSTER_MEMBER_MEMBER);
+			/* else DEAD stays DEAD (no auto-readmit); JOINING/MEMBER unchanged */
+		}
+
+		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+			if (cluster_conf_lookup_node(i) == NULL)
+				continue;
+			if (cluster_membership_is_member(i))
+				dead_bitmap_set_bit(alive_set, i);
+		}
+
 		for (b = 0; b < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; b++)
 			dead_bitmap[b] &= (uint8)~ReconfigShmem->clean_departed_bitmap[b];
+
 		LWLockRelease(&ReconfigShmem->lock);
+	} else {
+		dead_bitmap_set_bit(alive_set, self_id);
+		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+			if (i == self_id)
+				continue;
+			if (cluster_conf_lookup_node(i) == NULL)
+				continue;
+			if (!dead_bitmap_test_bit(dead_bitmap, i))
+				dead_bitmap_set_bit(alive_set, i);
+		}
 	}
 
-	/* No (effective) peer death → no reconfig event. */
-	if (dead_bitmap_is_zero(dead_bitmap))
-		return;
-
-	/* survivor_set is alive_set (alive_set never overlaps dead_bitmap
-	 * by construction:  alive_set adds ALIVE/SUSPECTED, dead_bitmap
-	 * adds DEAD, and CSSD state is mutually exclusive). */
+	/*
+	 * survivor_set / coordinator = the min MEMBER survivor (INV-J8; alive_set is
+	 * the MEMBER set built above).  Computed before the death/join dispatch since
+	 * both directions use it.
+	 */
 	coordinator = dead_bitmap_lowest_bit_set(alive_set);
 	if (coordinator < 0)
 		return; /* total cluster failure;fail-closed already via QVOTEC */
 
-	CLUSTER_INJECTION_POINT("cluster-reconfig-decide-coordinator");
+	/*
+	 * §3.5 ordering: handle the leave/death edge FIRST (it shrinks the MEMBER set,
+	 * stabilizing the survivor base), THEN the join edge.  Each is an independent
+	 * ReconfigEvent; neither early-returns past the other.
+	 */
+	if (!dead_bitmap_is_zero(dead_bitmap)) {
+		CLUSTER_INJECTION_POINT("cluster-reconfig-decide-coordinator");
 
-	/* §3.2 P1.2: event_id from dead_bitmap + dead_generation snapshot. */
-	cssd_dead_generation = cluster_cssd_get_dead_generation();
-	event_id = cluster_reconfig_compute_event_id(dead_bitmap, cssd_dead_generation);
+		/* §3.2 P1.2: event_id from dead_bitmap + dead_generation snapshot. */
+		cssd_dead_generation = cluster_cssd_get_dead_generation();
+		event_id = cluster_reconfig_compute_event_id(dead_bitmap, cssd_dead_generation);
 
-	/* Dedup against last_applied.  Same dead_bitmap within one DEAD
-	 * episode → same dead_gen → same event_id → skip.  Rejoin-then-
-	 * redeath bumps dead_gen → different event_id → re-fire. */
-	if (event_id == cluster_reconfig_get_last_event_id()) {
-		if (ReconfigShmem != NULL)
-			pg_atomic_fetch_add_u64(&ReconfigShmem->dedup_skip_counter, 1);
-		return;
+		/* Dedup against last_applied.  Same dead_bitmap within one DEAD episode →
+		 * same dead_gen → same event_id → skip.  Rejoin-then-redeath bumps
+		 * dead_gen → different event_id → re-fire. */
+		if (event_id == cluster_reconfig_get_last_event_id()) {
+			if (ReconfigShmem != NULL)
+				pg_atomic_fetch_add_u64(&ReconfigShmem->dedup_skip_counter, 1);
+		} else {
+			/*
+			 * P1.3 (b) + I7: ONLY the deterministic coordinator advances epoch +
+			 * publishes coordinator-role; non-coordinator survivors publish
+			 * observer-role for local observability.  spec-5.14 ordering: publish
+			 * last_applied BEFORE broadcasting the PROCSIG (the read-side touched
+			 * abort reads reconfig_kind + dead_bitmap from last_applied).
+			 */
+			if (self_id == coordinator) {
+				cluster_reconfig_apply_epoch_bump_as_coordinator(dead_bitmap, coordinator,
+																 cssd_dead_generation);
+			} else {
+				ReconfigEvent evt;
+
+				memset(&evt, 0, sizeof(evt));
+				evt.event_id = event_id;
+				evt.coordinator_node_id = coordinator;
+				evt.old_epoch = cluster_epoch_get_current();
+				evt.new_epoch = evt.old_epoch; /* survivor not yet observed via piggyback */
+				memcpy(evt.dead_bitmap, dead_bitmap, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
+				evt.applied_at = GetCurrentTimestamp();
+				evt.observer_role = CLUSTER_RECONFIG_OBSERVER_SURVIVOR;
+				evt.cssd_dead_generation = cssd_dead_generation;
+				evt.reconfig_kind = RECONFIG_KIND_FAIL_STOP;
+				cluster_reconfig_publish_event(&evt);
+			}
+
+			/*
+			 * P1.3 (a) + I7: EVERY in_quorum survivor broadcasts PROCSIG — AFTER
+			 * publish (spec-5.14 ordering), and ONLY if the event was actually
+			 * published (review P1-A: a coordinator fence-marker fail-close does
+			 * not publish; the next tick re-fires).
+			 */
+			if (cluster_reconfig_get_last_event_id() == event_id)
+				cluster_reconfig_broadcast_local_procsig();
+		}
 	}
 
-	/* P1.3 (b) + I7:  ONLY the deterministic coordinator advances epoch
-	 * and publishes coordinator-role event.  Non-coordinator survivors
-	 * publish observer-role event for local observability.
-	 *
-	 * spec-5.14 (ordering fix):  publish last_applied BEFORE broadcasting the
-	 * PROCSIG below.  The spec-2.29 writable abort path (53R60) never reads
-	 * last_applied, but the spec-5.14 read-side touched abort does (it needs
-	 * reconfig_kind + dead_bitmap).  If a survivor's idle backend processed the
-	 * PROCSIG before the event was published, it would read a stale
-	 * (reconfig_kind=NONE) last_applied, see touched=false, absorb, and clear
-	 * its pending flag — missing the touched abort.  Publishing first closes
-	 * that race; the broadcast only signals local backends (no cross-node
-	 * protocol change). */
-	if (self_id == coordinator) {
-		cluster_reconfig_apply_epoch_bump_as_coordinator(dead_bitmap, coordinator,
-														 cssd_dead_generation);
-	} else {
-		ReconfigEvent evt;
-
-		memset(&evt, 0, sizeof(evt));
-		evt.event_id = event_id;
-		evt.coordinator_node_id = coordinator;
-		evt.old_epoch = cluster_epoch_get_current();
-		evt.new_epoch = evt.old_epoch; /* survivor not yet observed via piggyback */
-		memcpy(evt.dead_bitmap, dead_bitmap, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
-		evt.applied_at = GetCurrentTimestamp();
-		evt.observer_role = CLUSTER_RECONFIG_OBSERVER_SURVIVOR;
-		evt.cssd_dead_generation = cssd_dead_generation;
-		/* spec-5.14 D3: the only membership-change trigger today is a CSSD
-		 * DEAD edge (dead_bitmap non-empty) → fail-stop.  CLEAN_LEAVE has no
-		 * producer until spec-5.13. */
-		evt.reconfig_kind = RECONFIG_KIND_FAIL_STOP;
-		cluster_reconfig_publish_event(&evt);
-	}
-
-	/* P1.3 (a) + I7:  EVERY in_quorum survivor (NOT just coordinator)
-	 * broadcasts PROCSIG_CLUSTER_RECONFIG_START to its local backends — AFTER
-	 * the event is published above so the touched check reads a consistent
-	 * last_applied (spec-5.14 ordering fix).
-	 *
-	 * review P1-A: broadcast ONLY if the event was actually published.  The
-	 * coordinator's apply_epoch_bump can fail-close (fence marker did not reach
-	 * a voting-disk majority) and return WITHOUT publishing — last_applied then
-	 * still carries the prior event_id.  Broadcasting in that case would make
-	 * survivors process the PROCSIG against a stale (reconfig_kind=NONE)
-	 * last_applied, absorb the touched abort, and clear their pending flag
-	 * (INV-TP2 miss).  The survivor path above always publishes, so this gate
-	 * lets it through; the next LMON tick re-fires the failed coordinator. */
-	if (cluster_reconfig_get_last_event_id() == event_id)
-		cluster_reconfig_broadcast_local_procsig();
+	/*
+	 * §3.5 join edge (spec-5.15 D4): online declared-node readmission, driven by
+	 * the coordinator.  Runs whether or not there was a death this tick; gated by
+	 * online_join (off = no runtime readmit, §3.4 fail-closed-safe via INV-J8).
+	 */
+	if (cluster_online_join && self_id == coordinator)
+		cluster_reconfig_drive_joins(coordinator);
 }
 
 
@@ -959,6 +1510,364 @@ cluster_reconfig_apply_clean_leave_as_coordinator(int32 leaving_node_id, uint64 
 }
 
 
+/* ============================================================
+ * spec-5.15 D4 — §2.6 join-commit-marker qvotec handshake.
+ *
+ *	Mirrors the spec-4.12 fence / spec-5.13 leave mailbox: the coordinator stages
+ *	a marker for the joiner, wakes qvotec, and blocks (bounded) until qvotec — the
+ *	sole voting-disk writer — has written it to the joiner's region-3 slot on a
+ *	quorum-majority of disks.  Unlike the leave marker (written to the writer's
+ *	OWN slot), the join marker is written to the JOINER's slot (so each joiner's
+ *	admit record persists independently of how many joins the coordinator drives).
+ * ============================================================
+ */
+
+static uint64 join_qvotec_inflight_marker_seq = 0;
+static uint64 join_qvotec_last_processed_marker_seq = 0;
+
+ClusterJoinMarkerSubmitResult
+cluster_reconfig_submit_join_marker(int32 target_node, const ClusterJoinCommitMarker *m)
+{
+	uint64 seq;
+	struct Latch *qlatch;
+	uint64 deadline_us;
+	int wait_ms;
+
+	if (ReconfigShmem == NULL || m == NULL)
+		return CLUSTER_JOIN_MARKER_SUBMIT_FAILED;
+	if (target_node < 0 || target_node >= CLUSTER_MAX_NODES)
+		return CLUSTER_JOIN_MARKER_SUBMIT_FAILED;
+
+	/* Stage target + marker, then publish the request (write barrier between so
+	 * qvotec never reads a half-written mailbox). */
+	ReconfigShmem->join_marker_target_node_id = target_node;
+	ReconfigShmem->join_pending_marker = *m;
+	pg_write_barrier();
+	seq = pg_atomic_add_fetch_u64(&ReconfigShmem->join_marker_request_seq, 1);
+
+	qlatch = ReconfigShmem->join_qvotec_latch;
+	if (qlatch != NULL)
+		SetLatch(qlatch);
+
+	wait_ms = cluster_quorum_poll_interval_ms * 3 + 2000;
+	deadline_us = (uint64)GetCurrentTimestamp() + (uint64)wait_ms * 1000ULL;
+	pgstat_report_wait_start(WAIT_EVENT_RECONFIG_JOIN_CONVERGENCE);
+	for (;;) {
+		if (pg_atomic_read_u64(&ReconfigShmem->join_marker_completion_seq) == seq) {
+			pgstat_report_wait_end();
+			pg_read_barrier();
+			return (ClusterJoinMarkerSubmitResult)pg_atomic_read_u32(
+				&ReconfigShmem->join_marker_result);
+		}
+		if ((uint64)GetCurrentTimestamp() >= deadline_us) {
+			pgstat_report_wait_end();
+			return CLUSTER_JOIN_MARKER_SUBMIT_TIMEOUT;
+		}
+		pg_usleep(2 * 1000); /* 2 ms */
+	}
+}
+
+bool
+cluster_reconfig_join_qvotec_poll_pending(int32 *out_target_node, void *out_slot512)
+{
+	uint64 req;
+
+	if (ReconfigShmem == NULL || out_slot512 == NULL || out_target_node == NULL)
+		return false;
+
+	req = pg_atomic_read_u64(&ReconfigShmem->join_marker_request_seq);
+	if (req == join_qvotec_last_processed_marker_seq)
+		return false; /* nothing new */
+
+	pg_read_barrier();
+	*out_target_node = ReconfigShmem->join_marker_target_node_id;
+	memset(out_slot512, 0, CLUSTER_VOTING_SLOT_BYTES);
+	memcpy(out_slot512, &ReconfigShmem->join_pending_marker,
+		   sizeof(ReconfigShmem->join_pending_marker));
+	join_qvotec_inflight_marker_seq = req;
+	return true;
+}
+
+void
+cluster_reconfig_join_qvotec_complete(bool acked)
+{
+	if (ReconfigShmem == NULL)
+		return;
+
+	pg_atomic_write_u32(&ReconfigShmem->join_marker_result,
+						acked ? CLUSTER_JOIN_MARKER_SUBMIT_ACK : CLUSTER_JOIN_MARKER_SUBMIT_FAILED);
+	pg_write_barrier();
+	pg_atomic_write_u64(&ReconfigShmem->join_marker_completion_seq,
+						join_qvotec_inflight_marker_seq);
+	join_qvotec_last_processed_marker_seq = join_qvotec_inflight_marker_seq;
+}
+
+static void
+join_clear_qvotec_latch(int code, Datum arg)
+{
+	if (ReconfigShmem != NULL)
+		ReconfigShmem->join_qvotec_latch = NULL;
+}
+
+void
+cluster_reconfig_publish_join_qvotec_latch(struct Latch *latch)
+{
+	if (ReconfigShmem == NULL)
+		return;
+	ReconfigShmem->join_qvotec_latch = latch;
+	on_shmem_exit(join_clear_qvotec_latch, (Datum)0);
+}
+
+
+/*
+ * spec-5.15 D2/D4 — cluster_membership_seed_last_admitted_from_voting_disk.
+ *
+ *	Startup bring-up (INV-J7): scan region 3, and for each declared node N with a
+ *	struct-valid COMMITTED join marker (node_id == slot) on a quorum-majority of
+ *	disks, seed last_admitted[N] from the marker's admitted_incarnation — so a
+ *	restart does not zero the floor and re-open the gate to a stale incarnation.
+ *	The trust gate is phase==COMMITTED + majority + crc, NEVER an epoch compare.
+ *
+ *	Also resolves RC-5 / INV-J10 across restart: 5.13's leave-marker rebuild (run
+ *	earlier in startup) may have re-set clean_departed[N] from the still-COMMITTED
+ *	leave marker of a node that has since rejoined.  If this node's COMMITTED join
+ *	marker is newer than that leave (admitted_epoch > clean_departed_epoch[N]),
+ *	clear clean_departed[N] so N's later real fail-stop is not masked.  MUST run
+ *	AFTER the leave rebuild (see the startup wiring).
+ */
+void
+cluster_membership_seed_last_admitted_from_voting_disk(const int *fds, int n_disks)
+{
+	int s;
+	uint32 majority;
+
+	if (ReconfigShmem == NULL || fds == NULL || n_disks <= 0)
+		return;
+
+	majority = ((uint32)n_disks / 2u) + 1u;
+
+	for (s = 0; s < CLUSTER_MAX_NODES; s++) {
+		union {
+			uint8 bytes[CLUSTER_VOTING_SLOT_BYTES];
+			uint64 _align;
+		} slot;
+		ClusterJoinCommitMarker m;
+		uint64 best_incarnation = 0;
+		uint64 best_admitted_epoch = 0;
+		uint32 agree = 0;
+		int d;
+
+		if (cluster_conf_lookup_node(s) == NULL)
+			continue;
+
+		for (d = 0; d < n_disks; d++) {
+			if (cluster_voting_disk_read_join_slot(fds[d], (uint32)s, slot.bytes)
+				!= CLUSTER_VOTING_DISK_IO_OK)
+				continue;
+			memcpy(&m, slot.bytes, sizeof(m));
+
+			if (!cluster_join_marker_is_committed_basis(&m, s))
+				continue;
+			agree++;
+			if (m.admitted_incarnation > best_incarnation)
+				best_incarnation = m.admitted_incarnation;
+			if (m.admitted_epoch > best_admitted_epoch)
+				best_admitted_epoch = m.admitted_epoch;
+		}
+
+		if (agree >= majority && best_incarnation > 0) {
+			LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+			cluster_membership_record_admitted(s, best_incarnation);
+			LWLockRelease(&ReconfigShmem->lock);
+
+			/* RC-5 / INV-J10 durable supersede: a rejoin newer than the leave
+			 * clears clean_departed[N] so a survivor restart does not keep
+			 * masking N's later real fail-stop. */
+			if (cluster_reconfig_is_clean_departed(s)
+				&& best_admitted_epoch > cluster_reconfig_get_clean_departed_epoch(s))
+				cluster_reconfig_clear_clean_departed(s);
+
+			ereport(LOG,
+					(errmsg("cluster membership: seeded last_admitted[%d]=%llu from %u/%d durable "
+							"COMMITTED join marker(s)",
+							s, (unsigned long long)best_incarnation, agree, n_disks)));
+		}
+	}
+}
+
+
+/* ============================================================
+ * spec-5.15 D4 — two-phase online-join publication.
+ * ============================================================
+ */
+
+void
+cluster_reconfig_apply_join_as_coordinator(
+	const uint8 join_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES], int32 coordinator_node_id,
+	const uint64 joiner_incarnations[CLUSTER_MAX_NODES])
+{
+	uint64 old_epoch, new_epoch;
+	XLogRecPtr lsn;
+	uint64 cssd_dead_generation;
+	uint8 empty_dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
+	ReconfigEvent evt;
+	int i;
+
+	if (!cluster_enabled || ReconfigShmem == NULL)
+		return;
+
+	CLUSTER_INJECTION_POINT("cluster-reconfig-join-pending-pre");
+
+	cssd_dead_generation = cluster_cssd_get_dead_generation();
+
+	/* Phase-1 epoch bump (regular advance new=old+1) + the same epoch side
+	 * effects as the other coordinator paths. */
+	cluster_epoch_advance_for_reconfig(&old_epoch, &new_epoch);
+	lsn = GetXLogInsertRecPtr();
+	cluster_epoch_set_changed_at_lsn((uint64)lsn);
+	cluster_gcs_block_on_epoch_advance(new_epoch);
+	cluster_sinval_reset_all_on_reconfig();
+	cluster_tt_status_flush_all((uint32)new_epoch);
+
+	/* Mark joiners JOINING + pending (candidates, NOT members yet — INV-J2). */
+	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		if (!dead_bitmap_test_bit(join_bitmap, i))
+			continue;
+		cluster_membership_set_state(i, CLUSTER_MEMBER_JOINING);
+		dead_bitmap_set_bit(ReconfigShmem->pending_join_bitmap, i);
+	}
+	LWLockRelease(&ReconfigShmem->lock);
+
+	/* Durable PREPARE marker per joiner (records the presented incarnation; does
+	 * NOT seed — only COMMITTED is a basis).  Best-effort: PREPARE failure does
+	 * not block the JOIN_PENDING publish (the COMMITTED marker in Phase-2 is the
+	 * commit point that must be majority-durable). */
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		ClusterJoinCommitMarker m;
+
+		if (!dead_bitmap_test_bit(join_bitmap, i))
+			continue;
+		memset(&m, 0, sizeof(m));
+		m.magic = CLUSTER_JCMK_MAGIC;
+		m.version = CLUSTER_JCMK_VERSION;
+		m.node_id = i;
+		m.phase = CLUSTER_JCMK_PHASE_PREPARE;
+		m.admitted_incarnation = joiner_incarnations[i];
+		m.generation = joiner_incarnations[i]; /* monotonic per node (read-newest intent) */
+		m.admitted_epoch = new_epoch;
+		cluster_join_marker_compute_crc(&m);
+		(void)cluster_reconfig_submit_join_marker(i, &m);
+	}
+
+	memset(&evt, 0, sizeof(evt));
+	evt.event_id
+		= cluster_reconfig_compute_event_id_v2(RECONFIG_KIND_JOIN_PENDING, empty_dead, join_bitmap,
+											   joiner_incarnations, cssd_dead_generation);
+	evt.coordinator_node_id = coordinator_node_id;
+	evt.old_epoch = old_epoch;
+	evt.new_epoch = new_epoch;
+	memcpy(evt.join_bitmap, join_bitmap, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
+	evt.applied_at = GetCurrentTimestamp();
+	evt.observer_role = CLUSTER_RECONFIG_OBSERVER_COORDINATOR;
+	evt.cssd_dead_generation = cssd_dead_generation;
+	evt.reconfig_kind = RECONFIG_KIND_JOIN_PENDING;
+	cluster_reconfig_publish_event(&evt);
+	pg_atomic_fetch_add_u64(&ReconfigShmem->join_pending_count, 1);
+}
+
+bool
+cluster_reconfig_commit_member(int32 node_id, uint64 admitted_incarnation)
+{
+	ClusterJoinCommitMarker m;
+	uint64 old_epoch, new_epoch;
+	XLogRecPtr lsn;
+	ReconfigEvent evt;
+	uint8 jb[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
+	uint8 empty_dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
+	uint64 incs[CLUSTER_MAX_NODES];
+
+	if (!cluster_enabled || ReconfigShmem == NULL)
+		return false;
+	if (node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	CLUSTER_INJECTION_POINT("cluster-reconfig-join-commit-pre");
+
+	/*
+	 * ① COMMITTED marker majority-durable = the commit point (P1-r5).  Written
+	 * BEFORE the publish; if it does not reach a disk majority we FAIL CLOSED —
+	 * no publish, no MEMBER, no gate-open; the joiner stays JOINING and the next
+	 * tick retries (or times out joiner-side -> REJECT).
+	 */
+	memset(&m, 0, sizeof(m));
+	m.magic = CLUSTER_JCMK_MAGIC;
+	m.version = CLUSTER_JCMK_VERSION;
+	m.node_id = node_id;
+	m.phase = CLUSTER_JCMK_PHASE_COMMITTED;
+	m.admitted_incarnation = admitted_incarnation;
+	m.generation = admitted_incarnation;
+	m.admitted_epoch = cluster_epoch_get_current() + 1; /* the epoch we publish below */
+	m.supersedes_leave_epoch = cluster_reconfig_get_clean_departed_epoch(node_id);
+	cluster_join_marker_compute_crc(&m);
+
+	if (cluster_reconfig_submit_join_marker(node_id, &m) != CLUSTER_JOIN_MARKER_SUBMIT_ACK) {
+		ereport(LOG,
+				(errmsg("cluster membership: COMMITTED join marker for node %d did not reach a "
+						"voting-disk majority; not committing (will retry)",
+						node_id)));
+		return false;
+	}
+
+	CLUSTER_INJECTION_POINT("cluster-reconfig-join-commit-marker-durable");
+
+	/*
+	 * ② publish: bump JOIN_COMMITTED epoch + state MEMBER + last_admitted + clear
+	 * pending + clear clean_departed[node] (INV-J10).  Strict order — the publish
+	 * (epoch + state MEMBER) precedes the joiner opening its write gate (D5).
+	 */
+	cluster_epoch_advance_for_reconfig(&old_epoch, &new_epoch);
+	lsn = GetXLogInsertRecPtr();
+	cluster_epoch_set_changed_at_lsn((uint64)lsn);
+	cluster_gcs_block_on_epoch_advance(new_epoch);
+	cluster_sinval_reset_all_on_reconfig();
+	cluster_tt_status_flush_all((uint32)new_epoch);
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	cluster_membership_set_state(node_id, CLUSTER_MEMBER_MEMBER);
+	cluster_membership_record_admitted(node_id, admitted_incarnation);
+	ReconfigShmem->pending_join_bitmap[node_id / 8] &= (uint8) ~(1u << (node_id % 8));
+	LWLockRelease(&ReconfigShmem->lock);
+
+	/* INV-J10: clear the in-shmem clean_departed suppression so a clean-left node
+	 * that just rejoined has its later real fail-stop honored again (the durable
+	 * supersede across restart is resolved by the seed, RC-5). */
+	if (cluster_reconfig_is_clean_departed(node_id))
+		pg_atomic_fetch_add_u64(&ReconfigShmem->clean_departed_cleared_count, 1);
+	cluster_reconfig_clear_clean_departed(node_id);
+
+	dead_bitmap_set_bit(jb, node_id);
+	memset(incs, 0, sizeof(incs));
+	incs[node_id] = admitted_incarnation;
+
+	memset(&evt, 0, sizeof(evt));
+	evt.event_id = cluster_reconfig_compute_event_id_v2(
+		RECONFIG_KIND_JOIN_COMMITTED, empty_dead, jb, incs, cluster_cssd_get_dead_generation());
+	evt.coordinator_node_id = cluster_node_id;
+	evt.old_epoch = old_epoch;
+	evt.new_epoch = new_epoch;
+	memcpy(evt.join_bitmap, jb, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
+	evt.applied_at = GetCurrentTimestamp();
+	evt.observer_role = CLUSTER_RECONFIG_OBSERVER_COORDINATOR;
+	evt.cssd_dead_generation = cluster_cssd_get_dead_generation();
+	evt.reconfig_kind = RECONFIG_KIND_JOIN_COMMITTED;
+	cluster_reconfig_publish_event(&evt);
+	pg_atomic_fetch_add_u64(&ReconfigShmem->join_apply_count, 1);
+
+	return true;
+}
+
+
 /*
  * Step 2 D4 — cluster_reconfig_check_pending_in_proc_interrupts.
  *
@@ -1142,9 +2051,33 @@ reconfig_kind_to_string(uint8 kind)
 		return "fail_stop";
 	case RECONFIG_KIND_CLEAN_LEAVE:
 		return "clean_leave";
+	case RECONFIG_KIND_JOIN_PENDING:
+		return "join_pending"; /* spec-5.15 D6 */
+	case RECONFIG_KIND_JOIN_COMMITTED:
+		return "join_committed"; /* spec-5.15 D6 */
 	case RECONFIG_KIND_NONE:
 	default:
 		return "none";
+	}
+}
+
+/* spec-5.15 D6 — render ClusterMembershipState for pg_cluster_membership. */
+static const char *
+membership_state_to_string(ClusterMembershipState st)
+{
+	switch (st) {
+	case CLUSTER_MEMBER_ABSENT:
+		return "absent";
+	case CLUSTER_MEMBER_DEAD:
+		return "dead";
+	case CLUSTER_MEMBER_JOINING:
+		return "joining";
+	case CLUSTER_MEMBER_MEMBER:
+		return "member";
+	case CLUSTER_MEMBER_REJECTED:
+		return "rejected";
+	default:
+		return "unknown";
 	}
 }
 
@@ -1206,6 +2139,47 @@ cluster_get_reconfig_state(PG_FUNCTION_ARGS)
 }
 
 
+/*
+ * spec-5.15 D6 — pg_cluster_membership SRF.  One row per declared node showing
+ * the decision-SSOT membership state + the incarnation floor / observed values.
+ */
+Datum
+cluster_get_membership(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo;
+	int i;
+
+	InitMaterializedSRF(fcinfo, 0);
+	rsinfo = (ReturnSetInfo *)fcinfo->resultinfo;
+
+	if (!cluster_enabled)
+		return (Datum)0; /* disabled — 0 rows */
+
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		Datum values[6];
+		bool nulls[6];
+		uint64 presented = 0;
+
+		if (cluster_conf_lookup_node(i) == NULL)
+			continue; /* only declared nodes */
+
+		(void)cluster_reconfig_get_observed_slot(i, &presented, NULL);
+
+		memset(nulls, false, sizeof(nulls));
+		values[0] = Int32GetDatum(i);
+		values[1] = BoolGetDatum(true); /* declared (only declared rows emitted) */
+		values[2] = PointerGetDatum(
+			cstring_to_text(membership_state_to_string(cluster_membership_get_state(i))));
+		values[3] = Int64GetDatum((int64)presented);
+		values[4] = Int64GetDatum((int64)cluster_membership_get_last_admitted_incarnation(i));
+		values[5] = Int64GetDatum((int64)cluster_reconfig_get_observed_epoch(i));
+
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	return (Datum)0;
+}
+
+
 #else /* !USE_PGRAC_CLUSTER */
 
 /*
@@ -1257,5 +2231,127 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 void
 cluster_reconfig_check_pending_in_proc_interrupts(void)
 {}
+
+int
+cluster_reconfig_compute_join_bitmap(uint8 join_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES])
+{
+	if (join_bitmap != NULL)
+		memset(join_bitmap, 0, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
+	return 0;
+}
+
+uint64
+cluster_reconfig_compute_event_id_v2(
+	uint8 reconfig_kind pg_attribute_unused(),
+	const uint8 dead_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] pg_attribute_unused(),
+	const uint8 join_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] pg_attribute_unused(),
+	const uint64 joiner_incarnations[CLUSTER_MAX_NODES] pg_attribute_unused(),
+	uint64 cssd_dead_generation pg_attribute_unused())
+{
+	return 0;
+}
+
+void
+cluster_reconfig_record_observed_slot(int32 node_id pg_attribute_unused(),
+									  uint64 incarnation pg_attribute_unused(),
+									  uint64 generation pg_attribute_unused(),
+									  uint64 epoch pg_attribute_unused())
+{}
+
+bool
+cluster_reconfig_get_observed_slot(int32 node_id pg_attribute_unused(), uint64 *incarnation,
+								   uint64 *generation)
+{
+	if (incarnation != NULL)
+		*incarnation = 0;
+	if (generation != NULL)
+		*generation = 0;
+	return false;
+}
+
+uint64
+cluster_reconfig_get_observed_epoch(int32 node_id pg_attribute_unused())
+{
+	return 0;
+}
+
+ClusterJoinMarkerSubmitResult
+cluster_reconfig_submit_join_marker(int32 target_node pg_attribute_unused(),
+									const ClusterJoinCommitMarker *m pg_attribute_unused())
+{
+	return CLUSTER_JOIN_MARKER_SUBMIT_FAILED;
+}
+
+bool
+cluster_reconfig_join_qvotec_poll_pending(int32 *out_target_node,
+										  void *out_slot512 pg_attribute_unused())
+{
+	if (out_target_node != NULL)
+		*out_target_node = -1;
+	return false;
+}
+
+void
+cluster_reconfig_join_qvotec_complete(bool acked pg_attribute_unused())
+{}
+
+void
+cluster_reconfig_publish_join_qvotec_latch(struct Latch *latch pg_attribute_unused())
+{}
+
+void
+cluster_membership_seed_last_admitted_from_voting_disk(const int *fds pg_attribute_unused(),
+													   int n_disks pg_attribute_unused())
+{}
+
+void
+cluster_reconfig_apply_join_as_coordinator(
+	const uint8 join_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] pg_attribute_unused(),
+	int32 coordinator_node_id pg_attribute_unused(),
+	const uint64 joiner_incarnations[CLUSTER_MAX_NODES] pg_attribute_unused())
+{}
+
+bool
+cluster_reconfig_commit_member(int32 node_id pg_attribute_unused(),
+							   uint64 admitted_incarnation pg_attribute_unused())
+{
+	return false;
+}
+
+ClusterJoinGateVerdict
+cluster_reconfig_self_join_gate_verdict(void)
+{
+	return CLUSTER_JOIN_GATE_ALLOW;
+}
+
+void
+cluster_reconfig_note_self_admitted(uint64 admitted_epoch pg_attribute_unused())
+{}
+
+uint64
+cluster_reconfig_get_join_pending_count(void)
+{
+	return 0;
+}
+uint64
+cluster_reconfig_get_join_apply_count(void)
+{
+	return 0;
+}
+uint64
+cluster_reconfig_get_join_reject_count(void)
+{
+	return 0;
+}
+uint64
+cluster_reconfig_get_join_timeout_count(void)
+{
+	return 0;
+}
+uint64
+cluster_reconfig_get_clean_departed_cleared_count(void)
+{
+	return 0;
+}
 
 #endif /* USE_PGRAC_CLUSTER */

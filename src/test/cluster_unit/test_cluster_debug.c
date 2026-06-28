@@ -2857,6 +2857,32 @@ cluster_reconfig_get_clean_leave_rejected_count(void)
 {
 	return 0;
 }
+/* spec-5.15 D6 — online-join counter stubs (dump_reconfig_join). */
+uint64
+cluster_reconfig_get_join_pending_count(void)
+{
+	return 0;
+}
+uint64
+cluster_reconfig_get_join_apply_count(void)
+{
+	return 0;
+}
+uint64
+cluster_reconfig_get_join_reject_count(void)
+{
+	return 0;
+}
+uint64
+cluster_reconfig_get_join_timeout_count(void)
+{
+	return 0;
+}
+uint64
+cluster_reconfig_get_clean_departed_cleared_count(void)
+{
+	return 0;
+}
 void
 cluster_touched_peers_self_hex(char *buf, Size buflen)
 {

@@ -85,7 +85,22 @@
  */
 #define CLUSTER_VOTING_LEAVE_SLOT_OFFSET(node_id)                                                  \
 	((off_t)(CLUSTER_MAX_NODES + (node_id)) * CLUSTER_VOTING_SLOT_BYTES)
-#define CLUSTER_VOTING_FILE_BYTES_MIN ((off_t)2 * CLUSTER_MAX_NODES * CLUSTER_VOTING_SLOT_BYTES)
+
+/*
+ * spec-5.15 D4/§2.6 — join-commit-marker region (region 3).  A THIRD 512-byte
+ * slot per node, laid out immediately after the leave-marker region (region 1 =
+ * voting slots, region 2 = leave markers, region 3 = join-commit markers).  The
+ * coordinator writes the JOINER's join-slot (offset = joiner node_id) — unlike
+ * the leave region where each node writes its own slot — so a join marker reaches
+ * a quorum-majority because the coordinator's qvotec replicates that one slot to
+ * every disk.  The voting disk file therefore grows to 3 × CLUSTER_MAX_NODES ×
+ * 512 (cluster.voting_disk_size_bytes default bumped to match).  Payload =
+ * ClusterJoinCommitMarker (magic 'JCMK'); this layer is payload-agnostic and does
+ * aligned 512-byte raw slot I/O at the offset.
+ */
+#define CLUSTER_VOTING_JOIN_SLOT_OFFSET(node_id)                                                   \
+	((off_t)(2 * CLUSTER_MAX_NODES + (node_id)) * CLUSTER_VOTING_SLOT_BYTES)
+#define CLUSTER_VOTING_FILE_BYTES_MIN ((off_t)3 * CLUSTER_MAX_NODES * CLUSTER_VOTING_SLOT_BYTES)
 
 
 /*
@@ -201,6 +216,19 @@ extern ClusterVotingDiskIoState cluster_voting_disk_read_leave_slot(int fd, uint
 																	void *out_slot512);
 extern ClusterVotingDiskIoState cluster_voting_disk_write_leave_slot(int fd, uint32 node_id,
 																	 const void *in_slot512);
+
+/*
+ * spec-5.15 D4 — raw 512-byte join-commit-marker slot R/W in region 3, at
+ * CLUSTER_VOTING_JOIN_SLOT_OFFSET(node_id).  Payload-agnostic (the caller marshals
+ * a ClusterJoinCommitMarker and owns its magic/version/CRC); same per-I/O timeout
+ * discipline as the leave-slot path.  read returns OK + 512 bytes (a zeroed slot
+ * is OK — the caller's magic check rejects it); FAILED on short read / EOF (file
+ * not yet tripled) / I/O error.
+ */
+extern ClusterVotingDiskIoState cluster_voting_disk_read_join_slot(int fd, uint32 node_id,
+																   void *out_slot512);
+extern ClusterVotingDiskIoState cluster_voting_disk_write_join_slot(int fd, uint32 node_id,
+																	const void *in_slot512);
 
 #endif /* USE_PGRAC_CLUSTER */
 

@@ -121,6 +121,13 @@ extern void cluster_epoch_set_changed_at_lsn(uint64 lsn);
 extern bool cluster_epoch_observe_remote(uint64 remote_epoch);
 
 /*
+ * spec-5.15 D5/§2.7 — join-admission epoch adoption (quorum-authenticated; may
+ * jump > CLUSTER_EPOCH_OBSERVE_MAX_JUMP, monotonic, never retreats).  Called only
+ * after reading a §2.6 COMMITTED join-commit marker.
+ */
+extern void cluster_epoch_adopt_admitted(uint64 admitted_epoch);
+
+/*
  * spec-2.29 D18b:  Maximum permitted epoch jump per single envelope.
  *
  *	  envelope receive path rejects (DROP_NO_CLOSE +

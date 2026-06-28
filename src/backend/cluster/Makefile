@@ -130,6 +130,7 @@ OBJS = \
 	cluster_lmd_wait_state.o \
 	cluster_lmon.o \
 	cluster_lms.o \
+	cluster_membership.o \
 	cluster_pcm_lock.o \
 	cluster_pgstat.o \
 	cluster_quorum_decision.o \

@@ -89,8 +89,12 @@ UT_DEFINE_GLOBALS();
 
 #include "storage/shmem.h"
 /* spec-5.13 D3 grew ClusterReconfigState with clean_departed_epoch[CLUSTER_MAX_NODES]
- * (1 KiB) + clean_departed_bitmap + counter; bump the mock backing store to fit. */
-static char reconfig_shmem_storage[2048] __attribute__((aligned(64)));
+ * (1 KiB) + clean_departed_bitmap + counter; spec-5.15 D2 added the membership SSOT
+ * table (last_admitted_incarnation[CLUSTER_MAX_NODES] 1 KiB + membership_state[] +
+ * pending_join_bitmap + self_join_admitted) plus the D1 observed-slot snapshot
+ * (observed_incarnation[] + observed_generation[], 2 KiB).  Bump the mock backing
+ * store to fit. */
+static char reconfig_shmem_storage[8192] __attribute__((aligned(64)));
 static char epoch_shmem_storage[64] __attribute__((aligned(64)));
 static bool reconfig_init_done = false;
 static bool epoch_init_done = false;
@@ -347,6 +351,34 @@ void
 cluster_tt_status_flush_all(uint32 new_epoch pg_attribute_unused())
 {}
 
+/* spec-5.15 D4 stubs: the join-marker handshake + seed reference these.  The
+ * join path is gated by cluster_online_join (off by default in this fixture), so
+ * apply/commit/submit are never exercised at runtime here; the symbols just need
+ * a definition for the standalone link. */
+bool cluster_online_join = false;
+int cluster_quorum_poll_interval_ms = 100;
+int cluster_join_convergence_timeout_ms = 30000;
+/* pgstat backend global referenced by pgstat_report_wait_start/end (the D4 join
+ * marker submit wait); provide a file-static fake so the standalone link works. */
+static uint32 ut_wait_event_info_storage;
+uint32 *my_wait_event_info = &ut_wait_event_info_storage;
+#include "storage/latch.h"
+void
+SetLatch(Latch *latch pg_attribute_unused())
+{}
+#include "storage/ipc.h"
+void
+on_shmem_exit(pg_on_exit_callback function pg_attribute_unused(), Datum arg pg_attribute_unused())
+{}
+#include "cluster/cluster_voting_disk_io.h"
+ClusterVotingDiskIoState
+cluster_voting_disk_read_join_slot(int fd pg_attribute_unused(),
+								   uint32 node_id pg_attribute_unused(),
+								   void *out_slot512 pg_attribute_unused())
+{
+	return CLUSTER_VOTING_DISK_IO_FAILED; /* no marker -> seed is a no-op */
+}
+
 /* Reset helper for between-test mock state. */
 static void
 ut_reset_mocks(void)
@@ -385,15 +417,15 @@ UT_TEST(test_reconfig_dead_bitmap_bytes_eq_16)
 UT_TEST(test_reconfig_event_sizeof_bounds)
 {
 	/* P2.8 fix:  natural-aligned, NOT pg_attribute_packed.  Lower bound
-	 * 64 catches accidental field removal;upper bound 96 catches
-	 * accidental field bloat. */
+	 * 64 catches accidental field removal;upper bound widened to 112 by
+	 * spec-5.15 (join_bitmap[16]) catches accidental field bloat. */
 	UT_ASSERT(sizeof(ReconfigEvent) >= 64);
-	UT_ASSERT(sizeof(ReconfigEvent) <= 96);
+	UT_ASSERT(sizeof(ReconfigEvent) <= 112);
 
-	/* Field-level sanity:  expect exactly 88 bytes on 64-bit ABI with
-	 * natural alignment (8+4+4 + 8+8+16 + 8+4+4 + 8+8 = 80, plus spec-5.14's
-	 * reconfig_kind uint8 + _pad2[7] = 8 -> 88). */
-	UT_ASSERT_EQ(sizeof(ReconfigEvent), 88);
+	/* Field-level sanity:  88 bytes through spec-5.14 (8+4+4 + 8+8+16 + 8+4+4 +
+	 * 8+8 = 80, plus reconfig_kind uint8 + _pad2[7] = 8), plus spec-5.15's
+	 * join_bitmap[16] -> 104. */
+	UT_ASSERT_EQ(sizeof(ReconfigEvent), 104);
 }
 
 
@@ -1073,13 +1105,255 @@ UT_TEST(test_reconfig_classify_verdict_matrix)
 
 
 /* ============================================================
+ * spec-5.15 D1 — cluster_reconfig_compute_join_bitmap (join-edge detection).
+ *
+ *	These exercise the join-edge detector against the membership SSOT + the
+ *	qvotec-published observed slots (U6-U9 of the spec §4.1 list; they live here
+ *	rather than test_cluster_membership.c because the detector reads
+ *	ClusterReconfigState + the CSSD/conf mocks this fixture already provides).
+ * ============================================================ */
+
+/* test a bit in a returned join_bitmap (mirrors the module-private helper). */
+static bool
+jb_test(const uint8 *bmp, int i)
+{
+	return (bmp[i / 8] & (uint8)(1u << (i % 8))) != 0;
+}
+
+/* fresh reconfig shmem (membership all ABSENT, observed all 0) + clean mocks. */
+static void
+ut_join_setup(void)
+{
+	ut_reset_mocks();
+	reconfig_init_done = false;
+	cluster_reconfig_shmem_init(); /* memset clean + attach membership table */
+	cluster_node_id = 0;		   /* self */
+	ut_declared_set[0] = true;	   /* self declared */
+}
+
+/* U6 — declared-peer filter: an un-declared CSSD-ALIVE peer is never a join edge. */
+UT_TEST(test_join_bitmap_declared_peer_filter)
+{
+	uint8 jb[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	int n;
+
+	ut_join_setup();
+	/* node 3 declared, ALIVE, fresh slot, membership ABSENT -> join edge */
+	ut_declared_set[3] = true;
+	ut_peer_state[3] = CLUSTER_CSSD_PEER_ALIVE;
+	cluster_reconfig_record_observed_slot(3, 10, 1, 0);
+	/* node 5 NOT declared, ALIVE, fresh slot -> filtered out */
+	ut_peer_state[5] = CLUSTER_CSSD_PEER_ALIVE;
+	cluster_reconfig_record_observed_slot(5, 10, 1, 0);
+
+	n = cluster_reconfig_compute_join_bitmap(jb);
+	UT_ASSERT_EQ(n, 1);
+	UT_ASSERT(jb_test(jb, 3));
+	UT_ASSERT(!jb_test(jb, 5));
+}
+
+/* U7 — DEAD->ALIVE edge is a join; a steady-state MEMBER is not. */
+UT_TEST(test_join_bitmap_dead_edge_not_member)
+{
+	uint8 jb[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	int n;
+
+	ut_join_setup();
+	/* node 1: MEMBER + ALIVE -> already a member, NOT a join edge */
+	ut_declared_set[1] = true;
+	ut_peer_state[1] = CLUSTER_CSSD_PEER_ALIVE;
+	cluster_membership_set_state(1, CLUSTER_MEMBER_MEMBER);
+	cluster_reconfig_record_observed_slot(1, 10, 1, 0);
+	/* node 2: DEAD + ALIVE + fresh -> join edge */
+	ut_declared_set[2] = true;
+	ut_peer_state[2] = CLUSTER_CSSD_PEER_ALIVE;
+	cluster_membership_set_state(2, CLUSTER_MEMBER_DEAD);
+	cluster_reconfig_record_observed_slot(2, 10, 1, 0);
+
+	n = cluster_reconfig_compute_join_bitmap(jb);
+	UT_ASSERT_EQ(n, 1);
+	UT_ASSERT(!jb_test(jb, 1));
+	UT_ASSERT(jb_test(jb, 2));
+}
+
+/* U8 — multiple simultaneous joiners. */
+UT_TEST(test_join_bitmap_multi_joiner)
+{
+	uint8 jb[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	int n;
+
+	ut_join_setup();
+	ut_declared_set[1] = true;
+	ut_peer_state[1] = CLUSTER_CSSD_PEER_ALIVE;
+	cluster_membership_set_state(1, CLUSTER_MEMBER_DEAD);
+	cluster_reconfig_record_observed_slot(1, 10, 1, 0);
+	ut_declared_set[2] = true;
+	ut_peer_state[2] = CLUSTER_CSSD_PEER_ALIVE;
+	cluster_membership_set_state(2, CLUSTER_MEMBER_DEAD);
+	cluster_reconfig_record_observed_slot(2, 10, 1, 0);
+
+	n = cluster_reconfig_compute_join_bitmap(jb);
+	UT_ASSERT_EQ(n, 2);
+	UT_ASSERT(jb_test(jb, 1));
+	UT_ASSERT(jb_test(jb, 2));
+}
+
+/* U9 — a stale incarnation (<= floor) and a not-ready (generation 0) peer are
+ * both excluded; only the fresh+ready DEAD->ALIVE peer is a join edge. */
+UT_TEST(test_join_bitmap_stale_and_notready_excluded)
+{
+	uint8 jb[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	int n;
+
+	ut_join_setup();
+	/* node 1: stale — observed incarnation 10 <= admitted floor 10 */
+	ut_declared_set[1] = true;
+	ut_peer_state[1] = CLUSTER_CSSD_PEER_ALIVE;
+	cluster_membership_set_state(1, CLUSTER_MEMBER_DEAD);
+	cluster_membership_record_admitted(1, 10);
+	cluster_reconfig_record_observed_slot(1, 10, 1, 0);
+	/* node 2: not ready — observed generation 0 (no valid published slot) */
+	ut_declared_set[2] = true;
+	ut_peer_state[2] = CLUSTER_CSSD_PEER_ALIVE;
+	cluster_membership_set_state(2, CLUSTER_MEMBER_DEAD);
+	cluster_reconfig_record_observed_slot(2, 99, 0, 0);
+	/* node 3: fresh (11 > floor 10) + ready -> join edge */
+	ut_declared_set[3] = true;
+	ut_peer_state[3] = CLUSTER_CSSD_PEER_ALIVE;
+	cluster_membership_set_state(3, CLUSTER_MEMBER_DEAD);
+	cluster_membership_record_admitted(3, 10);
+	cluster_reconfig_record_observed_slot(3, 11, 1, 0);
+
+	n = cluster_reconfig_compute_join_bitmap(jb);
+	UT_ASSERT_EQ(n, 1);
+	UT_ASSERT(!jb_test(jb, 1));
+	UT_ASSERT(!jb_test(jb, 2));
+	UT_ASSERT(jb_test(jb, 3));
+}
+
+/* U12 (D3, INV-J11) — event_id_v2: the 4 real kinds are mutually distinct under
+ * their actual non-collision bases; FAIL_STOP stays byte-compatible with the
+ * legacy hash; CLEAN_LEAVE also uses legacy (5.13 marker binding, RC-1) and is
+ * distinguished from FAIL_STOP by cssd_dead_generation; the two JOIN phases fold
+ * the kind; NONE is the 0 sentinel. */
+UT_TEST(test_event_id_v2_kind_distinctness)
+{
+	uint8 dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	uint8 join[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	uint64 incs[CLUSTER_MAX_NODES];
+	uint64 incs2[CLUSTER_MAX_NODES];
+	uint64 gen = 7;
+	uint64 legacy, id_fs, id_cl, id_jp, id_jc;
+
+	memset(dead, 0, sizeof(dead));
+	memset(join, 0, sizeof(join));
+	memset(incs, 0, sizeof(incs));
+	dead[0] = 0x02;	 /* node 1 in the leave set */
+	join[0] = 0x04;	 /* node 2 in the join set */
+	incs[2] = 12345; /* joiner 2 incarnation */
+
+	/* NONE is the never-applied sentinel. */
+	UT_ASSERT_EQ(cluster_reconfig_compute_event_id_v2(RECONFIG_KIND_NONE, dead, join, incs, gen),
+				 0);
+
+	/* FAIL_STOP == the legacy hash over (dead, gen). */
+	legacy = cluster_reconfig_compute_event_id(dead, gen);
+	id_fs = cluster_reconfig_compute_event_id_v2(RECONFIG_KIND_FAIL_STOP, dead, join, incs, gen);
+	UT_ASSERT_EQ(id_fs, legacy);
+
+	/* CLEAN_LEAVE also uses legacy (RC-1): equal to FAIL_STOP for identical
+	 * (dead, gen); the real-world distinction is cssd_dead_generation. */
+	id_cl = cluster_reconfig_compute_event_id_v2(RECONFIG_KIND_CLEAN_LEAVE, dead, join, incs, gen);
+	UT_ASSERT_EQ(id_cl, legacy);
+	UT_ASSERT(
+		cluster_reconfig_compute_event_id_v2(RECONFIG_KIND_CLEAN_LEAVE, dead, join, incs, gen + 1)
+		!= id_fs);
+
+	/* JOIN_PENDING != JOIN_COMMITTED (kind folded); both != the leave ids, != 0. */
+	id_jp = cluster_reconfig_compute_event_id_v2(RECONFIG_KIND_JOIN_PENDING, dead, join, incs, gen);
+	id_jc
+		= cluster_reconfig_compute_event_id_v2(RECONFIG_KIND_JOIN_COMMITTED, dead, join, incs, gen);
+	UT_ASSERT(id_jp != id_jc);
+	UT_ASSERT(id_jp != id_fs);
+	UT_ASSERT(id_jc != id_fs);
+	UT_ASSERT(id_jp != 0);
+	UT_ASSERT(id_jc != 0);
+
+	/* distinct joiner incarnations -> distinct join ids. */
+	memcpy(incs2, incs, sizeof(incs2));
+	incs2[2] = 99999;
+	UT_ASSERT(
+		cluster_reconfig_compute_event_id_v2(RECONFIG_KIND_JOIN_PENDING, dead, join, incs2, gen)
+		!= id_jp);
+}
+
+/* U14 (D4, INV-J10) — clearing clean_departed (what commit_member does at
+ * JOIN_COMMITTED) re-enables a node's later fail-stop: a clean-left node that
+ * rejoins must have clean_departed[N] cleared so effective_dead = cssd_dead &
+ * ~clean_departed once again includes N's later real CSSD DEAD.  The full
+ * marker-durable commit path is covered e2e by TAP L6; here we exercise the
+ * clear primitive the commit uses + that it is JOIN_COMMITTED-only (Phase-1 /
+ * apply does NOT clear). */
+UT_TEST(test_clean_departed_clear_for_rejoin)
+{
+	ut_join_setup();
+	ut_declared_set[2] = true;
+
+	/* node 2 cleanly departed at epoch 5 -> masked from effective_dead */
+	cluster_reconfig_record_clean_departed(2, 5, false);
+	UT_ASSERT(cluster_reconfig_is_clean_departed(2));
+	UT_ASSERT_EQ(cluster_reconfig_get_clean_departed_epoch(2), 5);
+
+	/* Phase-1 (apply_join) sets JOINING + pending but does NOT clear (only a real
+	 * MEMBER commit may) — assert the suppression still holds at JOINING. */
+	cluster_membership_set_state(2, CLUSTER_MEMBER_JOINING);
+	UT_ASSERT(cluster_reconfig_is_clean_departed(2));
+
+	/* JOIN_COMMITTED clears it (commit_member calls clear_clean_departed). */
+	cluster_reconfig_clear_clean_departed(2);
+	UT_ASSERT(!cluster_reconfig_is_clean_departed(2));
+	UT_ASSERT_EQ(cluster_reconfig_get_clean_departed_epoch(2), 0);
+}
+
+/* D5 (INV-J9) — joiner write-gate lifecycle: a fresh node defaults ALLOW; when
+ * it detects a running cluster (a peer at epoch > 0) the tick closes the gate
+ * (53R60, retry-safe); note_self_admitted reopens it (ALLOW). */
+UT_TEST(test_self_join_gate_lifecycle)
+{
+	ut_join_setup();
+	cluster_node_id = 2;
+	ut_declared_set[2] = true;
+	ut_declared_set[0] = true;
+	ut_in_quorum_value = true;
+	cluster_enabled = true;
+	cluster_online_join = true;
+
+	/* default gate open */
+	UT_ASSERT_EQ((int)cluster_reconfig_self_join_gate_verdict(), (int)CLUSTER_JOIN_GATE_ALLOW);
+
+	/* a peer observed at epoch > 0 => cluster running => this node is rejoining;
+	 * the tick's joiner self-tick closes the gate. */
+	cluster_reconfig_record_observed_slot(0, 100, 1, 7); /* node 0 at epoch 7 */
+	cluster_reconfig_lmon_tick();
+	UT_ASSERT_EQ((int)cluster_reconfig_self_join_gate_verdict(),
+				 (int)CLUSTER_JOIN_GATE_BLOCK_53R60);
+
+	/* admission (note_self_admitted) reopens the gate. */
+	cluster_reconfig_note_self_admitted(7);
+	UT_ASSERT_EQ((int)cluster_reconfig_self_join_gate_verdict(), (int)CLUSTER_JOIN_GATE_ALLOW);
+
+	cluster_online_join = false; /* leave global off for other tests */
+}
+
+
+/* ============================================================
  * Main — register + run all tests.
  * ============================================================ */
 
 int
 main(void)
 {
-	UT_PLAN(33);
+	UT_PLAN(40);
 
 	/* T-reconfig-1 */
 	UT_RUN(test_reconfig_dead_bitmap_bytes_eq_16);
@@ -1129,6 +1403,21 @@ main(void)
 	/* spec-5.14 — reconfig_kind round-trip (U6) + verdict matrix (U8). */
 	UT_RUN(test_reconfig_kind_field_roundtrip);
 	UT_RUN(test_reconfig_classify_verdict_matrix);
+
+	/* spec-5.15 D1 — join-edge detection (U6-U9). */
+	UT_RUN(test_join_bitmap_declared_peer_filter);
+	UT_RUN(test_join_bitmap_dead_edge_not_member);
+	UT_RUN(test_join_bitmap_multi_joiner);
+	UT_RUN(test_join_bitmap_stale_and_notready_excluded);
+
+	/* spec-5.15 D3 — event_id_v2 kind distinctness (U12). */
+	UT_RUN(test_event_id_v2_kind_distinctness);
+
+	/* spec-5.15 D4 — clean-departed clear for rejoin (U14). */
+	UT_RUN(test_clean_departed_clear_for_rejoin);
+
+	/* spec-5.15 D5 — joiner write-gate lifecycle (INV-J9). */
+	UT_RUN(test_self_join_gate_lifecycle);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

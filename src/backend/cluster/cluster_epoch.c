@@ -166,6 +166,37 @@ cluster_epoch_advance_for_reconfig(uint64 *old_out, uint64 *new_out)
 }
 
 /*
+ * spec-5.15 D5/§2.7: cluster_epoch_adopt_admitted
+ *
+ *	  Join-admission epoch adoption: monotonic CAS-up to admitted_epoch.  Unlike
+ *	  cluster_epoch_observe_remote (bounded by CLUSTER_EPOCH_OBSERVE_MAX_JUMP to
+ *	  defend against an anonymous IC-envelope spoof), this MAY legally jump > 16
+ *	  because it is the quorum-authenticated path — the joiner only calls it after
+ *	  reading its own §2.6 COMMITTED join-commit marker (majority-durable, CRC +
+ *	  phase verified).  A long-absent rejoiner that fell > 16 epochs behind catches
+ *	  up here (INV-J12) instead of being dropped by the bounded observe path.
+ *	  Never retreats.
+ */
+void
+cluster_epoch_adopt_admitted(uint64 admitted_epoch)
+{
+	uint64 old_val;
+
+	if (cluster_epoch_state == NULL)
+		return;
+
+	for (;;) {
+		old_val = pg_atomic_read_u64(&cluster_epoch_state->current_epoch);
+		if (admitted_epoch <= old_val)
+			break; /* already at or above — monotonic, no change */
+		if (pg_atomic_compare_exchange_u64(&cluster_epoch_state->current_epoch, &old_val,
+										   admitted_epoch))
+			break;
+		/* CAS lost — re-read and retry */
+	}
+}
+
+/*
  * spec-5.13 D3 (CL-I3): cluster_epoch_advance_for_reconfig_if_baseline
  *
  *	  Guarded variant of the coordinator advance: bump the epoch to
@@ -297,6 +328,10 @@ cluster_epoch_advance_for_reconfig(uint64 *old_out, uint64 *new_out)
 	if (new_out != NULL)
 		*new_out = CLUSTER_EPOCH_INITIAL;
 }
+
+void
+cluster_epoch_adopt_admitted(uint64 admitted_epoch pg_attribute_unused())
+{}
 
 bool
 cluster_epoch_advance_for_reconfig_if_baseline(uint64 baseline pg_attribute_unused(),

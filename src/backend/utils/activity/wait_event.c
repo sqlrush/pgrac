@@ -1122,6 +1122,9 @@ pgstat_get_wait_cluster_reconfig(WaitEventCluster w)
 	case WAIT_EVENT_CLUSTER_WRITE_FENCE_MARKER_WRITE:
 		event_name = "ClusterWriteFenceMarkerWrite";
 		break;
+	case WAIT_EVENT_RECONFIG_JOIN_CONVERGENCE:
+		event_name = "ReconfigJoinConvergence";
+		break;
 	default:
 		break;
 	}

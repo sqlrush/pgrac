@@ -700,10 +700,14 @@
  * the system_views.sql view updated.  Rebased on top of 5.12 (202606290);
  * bump to 202606300. */
 
+/* spec-5.15 (2026-06-28): online-join catalog surface — cluster_get_membership SRF
+ * (oid 8962) + pg_cluster_membership view + reconfig_kind text map extended with
+ * join_pending/join_committed.  Bump 202606310 -> 202606320. */
+#define CATALOG_VERSION_NO 202606320
+
 /* spec-5.13 (2026-06-27): clean-leave catalog surface — cluster_get_clean_leave_state
  * SRF (oid 8960) + pg_cluster_clean_leave_state view + pg_cluster_clean_leave_request
  * operator UDF (oid 8961).  Bump 202606300 -> 202606310. */
-#define CATALOG_VERSION_NO 202606310
 
 /* spec-2.39 D10 (2026-05-21):  SI Broadcaster production activation —
  * DDL commit hook (AtEOXact_Inval + COMMIT PREPARED via cluster-aware
