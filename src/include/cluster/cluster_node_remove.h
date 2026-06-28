@@ -91,17 +91,17 @@
  * fail-stop 5.14).
  */
 typedef enum ClusterRemovePhase {
-	CLUSTER_REMOVE_IDLE = 0,		  /* no removal in progress */
-	CLUSTER_REMOVE_REQUESTED,		  /* operator request recorded */
-	CLUSTER_REMOVE_PRECHECK,		  /* validating drained / quorum / declared / !self / !already */
-	CLUSTER_REMOVE_FENCE_ARMING,	  /* writing 4.12 fence marker (target in fenced set), wait majority-durable */
+	CLUSTER_REMOVE_IDLE = 0,  /* no removal in progress */
+	CLUSTER_REMOVE_REQUESTED, /* operator request recorded */
+	CLUSTER_REMOVE_PRECHECK,  /* validating drained / quorum / declared / !self / !already */
+	CLUSTER_REMOVE_FENCE_ARMING, /* writing 4.12 fence marker (target in fenced set), wait majority-durable */
 	CLUSTER_REMOVE_SHRINK_COMMITTING, /* marker REMOVING + epoch bump + publish membership=REMOVED + marker SHRUNK */
-	CLUSTER_REMOVE_CLEANUP,			  /* cluster-wide cleanup_on_exit: GRD remaster + GES/PCM clear + verify */
-	CLUSTER_REMOVE_CLEANUP_BLOCKED,	  /* post-SHRUNK cleanup leftover/deadline: committed+fenced, cleanup pending;
+	CLUSTER_REMOVE_CLEANUP, /* cluster-wide cleanup_on_exit: GRD remaster + GES/PCM clear + verify */
+	CLUSTER_REMOVE_CLEANUP_BLOCKED, /* post-SHRUNK cleanup leftover/deadline: committed+fenced, cleanup pending;
 									   * RESUMABLE/retryable; fail-closed (NEVER reports COMMITTED); NOT escalated */
-	CLUSTER_REMOVE_COMMITTED,		  /* removal complete; target fenced + non-member + zero leftover (marker REMOVED) */
-	CLUSTER_REMOVE_ABORTED,			  /* clean abort (precheck reject / fence-arm confirmed-no-majority) — nothing committed */
-	CLUSTER_REMOVE_ABORTED_ESCALATE	  /* PRE-SHRUNK only: real death/contest before membership commit -> fail-stop 5.14.
+	CLUSTER_REMOVE_COMMITTED, /* removal complete; target fenced + non-member + zero leftover (marker REMOVED) */
+	CLUSTER_REMOVE_ABORTED, /* clean abort (precheck reject / fence-arm confirmed-no-majority) — nothing committed */
+	CLUSTER_REMOVE_ABORTED_ESCALATE /* PRE-SHRUNK only: real death/contest before membership commit -> fail-stop 5.14.
 									   * Post-SHRUNK is irreversible -> never reaches here (uses CLEANUP_BLOCKED). */
 } ClusterRemovePhase;
 
@@ -116,10 +116,10 @@ typedef enum ClusterRemoveRequestResult {
 	CLUSTER_REMOVE_REQ_NOT_DECLARED,	   /* "rejected:not_declared" */
 	CLUSTER_REMOVE_REQ_NOT_DRAINED,		   /* "rejected:node_not_drained" (INV-LF4) */
 	CLUSTER_REMOVE_REQ_NOT_IN_QUORUM,	   /* "rejected:not_in_quorum" */
-	CLUSTER_REMOVE_REQ_ALREADY_REMOVED,	   /* "noop:already_removed" — ONLY when marker==REMOVED (fully complete) */
-	CLUSTER_REMOVE_REQ_RESUME,			   /* "resume:cleanup_pending" — SHRUNK/CLEANUP_BLOCKED-but-not-REMOVED:
+	CLUSTER_REMOVE_REQ_ALREADY_REMOVED, /* "noop:already_removed" — ONLY when marker==REMOVED (fully complete) */
+	CLUSTER_REMOVE_REQ_RESUME, /* "resume:cleanup_pending" — SHRUNK/CLEANUP_BLOCKED-but-not-REMOVED:
 											* re-drives cleanup (accepted), NOT a noop (v0.4 P1) */
-	CLUSTER_REMOVE_REQ_IN_PROGRESS		   /* "rejected:removal_in_progress" — active drive in a non-blocked phase */
+	CLUSTER_REMOVE_REQ_IN_PROGRESS /* "rejected:removal_in_progress" — active drive in a non-blocked phase */
 } ClusterRemoveRequestResult;
 
 /*
@@ -140,19 +140,22 @@ typedef enum ClusterRemoveRequestResult {
 #define CLUSTER_REMOVAL_MARKER_VERSION 1
 
 typedef enum ClusterRemovalMarkerPhase {
-	CLUSTER_REMOVAL_MARKER_REMOVING = 1, /* pre-epoch-bump durable; NOT a trust source (mirror 5.13 COMMITTING) */
-	CLUSTER_REMOVAL_MARKER_SHRUNK = 2,	 /* post-epoch-bump durable; membership shrunk + fence armed, cleanup
+	CLUSTER_REMOVAL_MARKER_REMOVING
+	= 1, /* pre-epoch-bump durable; NOT a trust source (mirror 5.13 COMMITTING) */
+	CLUSTER_REMOVAL_MARKER_SHRUNK
+	= 2, /* post-epoch-bump durable; membership shrunk + fence armed, cleanup
 										  * PENDING.  Trusts only "N is non-member + fenced"; startup MUST
 										  * resume/finish cleanup, MUST NOT report COMMITTED. */
-	CLUSTER_REMOVAL_MARKER_REMOVED = 3	 /* written ONLY after verify_no_leftover + all-survivor ACK; THE final
+	CLUSTER_REMOVAL_MARKER_REMOVED
+	= 3 /* written ONLY after verify_no_leftover + all-survivor ACK; THE final
 										  * trust source = "removal complete, zero leftover". */
 } ClusterRemovalMarkerPhase;
 
 typedef struct ClusterRemovalMarker {
-	uint32 magic;				/* CLUSTER_REMOVAL_MARKER_MAGIC — guards against a stale slot */
-	uint16 version;				/* CLUSTER_REMOVAL_MARKER_VERSION */
-	uint16 phase;				/* ClusterRemovalMarkerPhase */
-	int32 removed_node_id;		/* who is removed (rebuild must check == declared peer) */
+	uint32 magic;		   /* CLUSTER_REMOVAL_MARKER_MAGIC — guards against a stale slot */
+	uint16 version;		   /* CLUSTER_REMOVAL_MARKER_VERSION */
+	uint16 phase;		   /* ClusterRemovalMarkerPhase */
+	int32 removed_node_id; /* who is removed (rebuild must check == declared peer) */
 	uint32 _pad0;
 	uint64 remove_epoch;		/* epoch this removal is bound to */
 	uint64 removed_incarnation; /* target's last admitted incarnation (re-admit must exceed) */
@@ -169,7 +172,8 @@ typedef struct ClusterRemovalMarker {
  * needs ClusterVotingSlot and lives in cluster_node_remove_policy.c, mirroring the
  * fence-marker StaticAsserts in cluster_write_fence.c.)
  */
-#define CLUSTER_REMOVAL_MARKER_RESERVED1_OFFSET CLUSTER_FENCE_MARKER_BYTES /* 64 -> slot offset 192 */
+#define CLUSTER_REMOVAL_MARKER_RESERVED1_OFFSET                                                    \
+	CLUSTER_FENCE_MARKER_BYTES /* 64 -> slot offset 192 */
 StaticAssertDecl(CLUSTER_REMOVAL_MARKER_RESERVED1_OFFSET >= CLUSTER_FENCE_MARKER_BYTES,
 				 "removal marker must not overlap the 4.12 fence marker in _reserved1");
 
@@ -186,34 +190,37 @@ typedef enum ClusterRemovalMarkerSubmitResult {
  * also kept as an atomic for the hot serve-gate read.
  */
 typedef struct ClusterNodeRemoveState {
-	LWLock lock;			/* guard phase transitions + publish */
-	pg_atomic_uint32 phase; /* ClusterRemovePhase (atomic read for hot gate) */
-	int32 target_node_id;	/* -1 if none; node being removed */
-	int32 coordinator_node_id;	  /* survivor driving removal (min(member)) */
-	uint64 remove_epoch;		  /* epoch this removal is bound to (immutable once set) */
-	uint64 target_last_incarnation; /* target's last admitted incarnation (durable removed record) */
-	uint64 removal_event_id;	  /* removal identity (NODE_REMOVED event id; not sorted) */
+	LWLock lock;			   /* guard phase transitions + publish */
+	pg_atomic_uint32 phase;	   /* ClusterRemovePhase (atomic read for hot gate) */
+	int32 target_node_id;	   /* -1 if none; node being removed */
+	int32 coordinator_node_id; /* survivor driving removal (min(member)) */
+	uint64 remove_epoch;	   /* epoch this removal is bound to (immutable once set) */
+	uint64
+		target_last_incarnation; /* target's last admitted incarnation (durable removed record) */
+	uint64 removal_event_id;	 /* removal identity (NODE_REMOVED event id; not sorted) */
 	uint64 remove_baseline_dead_gen; /* CSSD dead_generation when bound; an unchanged value at the
 									  * epoch bump means OUR removal committed (no real death intruded) */
-	bool fence_armed;			  /* INV-LF2: true only after 4.12 marker majority-durable */
-	bool membership_shrunk;		  /* true after membership_state[target]=REMOVED published */
-	bool grd_cleaned;			  /* GRD remaster + cleanup_on_node_dead + verify done */
-	bool pcm_cleaned;			  /* PCM clear + verify done */
+	bool fence_armed;				 /* INV-LF2: true only after 4.12 marker majority-durable */
+	bool membership_shrunk;			 /* true after membership_state[target]=REMOVED published */
+	bool grd_cleaned;				 /* GRD remaster + cleanup_on_node_dead + verify done */
+	bool pcm_cleaned;				 /* PCM clear + verify done */
 	uint8 ack_bitmap[CLUSTER_NODE_REMOVE_ACK_BITMAP_BYTES]; /* survivor cleanup ACK set */
-	TimestampTz cleanup_deadline_us; /* post-SHRUNK: exceed -> CLEANUP_BLOCKED (resumable); pre-SHRUNK n/a */
+	TimestampTz
+		cleanup_deadline_us; /* post-SHRUNK: exceed -> CLEANUP_BLOCKED (resumable); pre-SHRUNK n/a */
 
 	/* observability counters */
 	pg_atomic_uint64 removal_request_count;
 	pg_atomic_uint64 removal_committed_count;
 	pg_atomic_uint64 removal_aborted_count;
-	pg_atomic_uint64 removal_escalate_count;	  /* pre-SHRUNK ABORTED_ESCALATE only */
-	pg_atomic_uint64 cleanup_blocked_count;		  /* post-SHRUNK cleanup blocked->resume cycles (LOG-once) */
+	pg_atomic_uint64 removal_escalate_count; /* pre-SHRUNK ABORTED_ESCALATE only */
+	pg_atomic_uint64
+		cleanup_blocked_count; /* post-SHRUNK cleanup blocked->resume cycles (LOG-once) */
 	pg_atomic_uint64 leftover_detected_count;	  /* INV-LF3 fail-closed trips */
 	pg_atomic_uint64 zombie_write_rejected_count; /* INV-LF8 (mirrors 53R51 trips for removed) */
 
 	/* survivor / coordinator side of someone else's removal */
-	pg_atomic_uint32 survivor_acked;	/* this survivor dropped its N-refs + sent its cleanup ACK */
-	pg_atomic_uint32 announce_sent;		/* LMON broadcast the real NODE_REMOVE_ANNOUNCE once */
+	pg_atomic_uint32 survivor_acked; /* this survivor dropped its N-refs + sent its cleanup ACK */
+	pg_atomic_uint32 announce_sent;	 /* LMON broadcast the real NODE_REMOVE_ANNOUNCE once */
 
 	/*
 	 * Voting-disk removal-marker submit mailbox (§2.5 three-phase commit) — a
@@ -224,12 +231,12 @@ typedef struct ClusterNodeRemoveState {
 	 * majority-durability.  pending_marker is written before request_seq is bumped
 	 * (write barrier between); qvotec sets completion_seq = request_seq when done.
 	 */
-	struct Latch *qvotec_latch;				 /* qvotec publishes MyLatch (latch-wake) */
-	pg_atomic_uint64 marker_request_seq;	 /* driver bumps to submit a marker write */
-	pg_atomic_uint64 marker_completion_seq;	 /* qvotec sets = request_seq when done */
-	pg_atomic_uint32 marker_result;			 /* ClusterRemovalMarkerSubmitResult */
+	struct Latch *qvotec_latch;				/* qvotec publishes MyLatch (latch-wake) */
+	pg_atomic_uint64 marker_request_seq;	/* driver bumps to submit a marker write */
+	pg_atomic_uint64 marker_completion_seq; /* qvotec sets = request_seq when done */
+	pg_atomic_uint32 marker_result;			/* ClusterRemovalMarkerSubmitResult */
 	uint32 _pad1;
-	ClusterRemovalMarker pending_marker;	 /* staged here before bumping request_seq */
+	ClusterRemovalMarker pending_marker; /* staged here before bumping request_seq */
 } ClusterNodeRemoveState;
 
 StaticAssertDecl(sizeof(ClusterNodeRemoveState) <= 512, "ClusterNodeRemoveState region budget");
@@ -256,10 +263,10 @@ typedef struct ClusterNodeRemoveAnnouncePayload {
 	uint16 version;
 	uint16 _pad0;
 	int32 coordinator_node_id;
-	int32 target_node_id;	/* who is removed */
-	uint64 remove_epoch;	/* the removal reconfig new_epoch */
+	int32 target_node_id;	 /* who is removed */
+	uint64 remove_epoch;	 /* the removal reconfig new_epoch */
 	uint64 removal_event_id; /* identity bound to this removal attempt */
-	uint32 crc; /* CRC32C over [magic..removal_event_id] */
+	uint32 crc;				 /* CRC32C over [magic..removal_event_id] */
 } ClusterNodeRemoveAnnouncePayload;
 
 /*
@@ -298,10 +305,11 @@ extern const char *cluster_node_remove_request_result_str(ClusterRemoveRequestRe
  * result.  marker_phase is the on-disk removal marker phase for the target
  * (0 = none).  drive_active = a non-blocked active drive is already running.
  */
-extern ClusterRemoveRequestResult
-cluster_node_remove_precheck(bool feature_enabled, bool is_self, bool is_declared,
-							 bool is_drained, bool in_quorum, int marker_phase,
-							 bool cleanup_blocked, bool drive_active);
+extern ClusterRemoveRequestResult cluster_node_remove_precheck(bool feature_enabled, bool is_self,
+															   bool is_declared, bool is_drained,
+															   bool in_quorum, int marker_phase,
+															   bool cleanup_blocked,
+															   bool drive_active);
 
 /*
  * version-coherent classify (U4 / L235): given a removal that detected a real

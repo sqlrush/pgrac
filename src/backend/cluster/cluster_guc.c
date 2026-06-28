@@ -2250,14 +2250,15 @@ cluster_init_guc(void)
 					 "its GRD/GES/PCM leftover cleaned up cluster-wide."),
 		&cluster_online_node_removal, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
-	DefineCustomIntVariable("cluster.node_removal_cleanup_timeout_ms",
-							gettext_noop("Deadline for the post-shrink cluster-wide removal cleanup."),
-							gettext_noop("If verify_no_leftover + all-survivor cleanup ACKs do not "
-										 "complete within this bound, the removal enters "
-										 "CLEANUP_BLOCKED (resumable, fail-closed — never reports "
-										 "complete).  Range [5000, 120000] ms."),
-							&cluster_node_removal_cleanup_timeout_ms, 30000, 5000, 120000, PGC_SIGHUP,
-							GUC_UNIT_MS, NULL, NULL, NULL);
+	DefineCustomIntVariable(
+		"cluster.node_removal_cleanup_timeout_ms",
+		gettext_noop("Deadline for the post-shrink cluster-wide removal cleanup."),
+		gettext_noop("If verify_no_leftover + all-survivor cleanup ACKs do not "
+					 "complete within this bound, the removal enters "
+					 "CLEANUP_BLOCKED (resumable, fail-closed — never reports "
+					 "complete).  Range [5000, 120000] ms."),
+		&cluster_node_removal_cleanup_timeout_ms, 30000, 5000, 120000, PGC_SIGHUP, GUC_UNIT_MS,
+		NULL, NULL, NULL);
 
 	/* spec-2.28 Sprint A Step 1 D7: 4 fence-lite GUCs (Q8 user approve). */
 

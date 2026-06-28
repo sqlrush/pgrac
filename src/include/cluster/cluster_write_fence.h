@@ -149,7 +149,8 @@ cluster_write_fence_grace_before_engage(bool enforcement_on, bool region_attache
 typedef enum ClusterFenceMarkerKind {
 	CLUSTER_FENCE_MARKER_KIND_FENCE = 0,	/* reconfig-issued fence (4.12 default) */
 	CLUSTER_FENCE_MARKER_KIND_BASELINE = 1, /* spec-4.12b steady-state membership republish */
-	CLUSTER_FENCE_MARKER_KIND_NODE_REMOVED = 2, /* spec-5.18: permanent-removal fence (observability) */
+	CLUSTER_FENCE_MARKER_KIND_NODE_REMOVED
+	= 2, /* spec-5.18: permanent-removal fence (observability) */
 } ClusterFenceMarkerKind;
 
 typedef struct ClusterFenceMarker {

@@ -112,7 +112,8 @@ UT_TEST(test_struct_layout)
 	UT_ASSERT_EQ((int)CLUSTER_REMOVAL_MARKER_REMOVED, 3);
 
 	/* phase + request-result canonical strings are non-null and distinct. */
-	UT_ASSERT_STR_EQ(cluster_node_remove_phase_str(CLUSTER_REMOVE_CLEANUP_BLOCKED), "cleanup_blocked");
+	UT_ASSERT_STR_EQ(cluster_node_remove_phase_str(CLUSTER_REMOVE_CLEANUP_BLOCKED),
+					 "cleanup_blocked");
 	UT_ASSERT_STR_EQ(cluster_node_remove_phase_str(CLUSTER_REMOVE_COMMITTED), "committed");
 	UT_ASSERT_STR_EQ(cluster_node_remove_request_result_str(CLUSTER_REMOVE_REQ_RESUME),
 					 "resume:cleanup_pending");
@@ -128,38 +129,59 @@ UT_TEST(test_struct_layout)
 UT_TEST(test_phase_transitions)
 {
 	/* legal forward path */
-	UT_ASSERT(cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_IDLE, CLUSTER_REMOVE_REQUESTED));
-	UT_ASSERT(cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_REQUESTED, CLUSTER_REMOVE_PRECHECK));
-	UT_ASSERT(cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_PRECHECK, CLUSTER_REMOVE_FENCE_ARMING));
-	UT_ASSERT(cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_FENCE_ARMING, CLUSTER_REMOVE_SHRINK_COMMITTING));
-	UT_ASSERT(cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_SHRINK_COMMITTING, CLUSTER_REMOVE_CLEANUP));
-	UT_ASSERT(cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_CLEANUP, CLUSTER_REMOVE_COMMITTED));
+	UT_ASSERT(
+		cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_IDLE, CLUSTER_REMOVE_REQUESTED));
+	UT_ASSERT(cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_REQUESTED,
+														 CLUSTER_REMOVE_PRECHECK));
+	UT_ASSERT(cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_PRECHECK,
+														 CLUSTER_REMOVE_FENCE_ARMING));
+	UT_ASSERT(cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_FENCE_ARMING,
+														 CLUSTER_REMOVE_SHRINK_COMMITTING));
+	UT_ASSERT(cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_SHRINK_COMMITTING,
+														 CLUSTER_REMOVE_CLEANUP));
+	UT_ASSERT(cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_CLEANUP,
+														 CLUSTER_REMOVE_COMMITTED));
 
 	/* CLEANUP <-> CLEANUP_BLOCKED is a resumable round-trip (post-SHRUNK) */
-	UT_ASSERT(cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_CLEANUP, CLUSTER_REMOVE_CLEANUP_BLOCKED));
-	UT_ASSERT(cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_CLEANUP_BLOCKED, CLUSTER_REMOVE_CLEANUP));
-	UT_ASSERT(cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_CLEANUP_BLOCKED, CLUSTER_REMOVE_COMMITTED));
+	UT_ASSERT(cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_CLEANUP,
+														 CLUSTER_REMOVE_CLEANUP_BLOCKED));
+	UT_ASSERT(cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_CLEANUP_BLOCKED,
+														 CLUSTER_REMOVE_CLEANUP));
+	UT_ASSERT(cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_CLEANUP_BLOCKED,
+														 CLUSTER_REMOVE_COMMITTED));
 
 	/* clean ABORTED only pre-fence-commit (PRECHECK / FENCE_ARMING) */
-	UT_ASSERT(cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_PRECHECK, CLUSTER_REMOVE_ABORTED));
-	UT_ASSERT(cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_FENCE_ARMING, CLUSTER_REMOVE_ABORTED));
+	UT_ASSERT(cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_PRECHECK,
+														 CLUSTER_REMOVE_ABORTED));
+	UT_ASSERT(cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_FENCE_ARMING,
+														 CLUSTER_REMOVE_ABORTED));
 
 	/* ABORTED_ESCALATE only PRE-SHRUNK (REQUESTED..SHRINK_COMMITTING) */
-	UT_ASSERT(cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_FENCE_ARMING, CLUSTER_REMOVE_ABORTED_ESCALATE));
-	UT_ASSERT(cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_SHRINK_COMMITTING, CLUSTER_REMOVE_ABORTED_ESCALATE));
+	UT_ASSERT(cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_FENCE_ARMING,
+														 CLUSTER_REMOVE_ABORTED_ESCALATE));
+	UT_ASSERT(cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_SHRINK_COMMITTING,
+														 CLUSTER_REMOVE_ABORTED_ESCALATE));
 
 	/* illegal edges rejected */
-	UT_ASSERT(!cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_PRECHECK, CLUSTER_REMOVE_SHRINK_COMMITTING)); /* must fence first */
-	UT_ASSERT(!cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_IDLE, CLUSTER_REMOVE_CLEANUP));
+	UT_ASSERT(!cluster_node_remove_phase_valid_transition(
+		CLUSTER_REMOVE_PRECHECK, CLUSTER_REMOVE_SHRINK_COMMITTING)); /* must fence first */
+	UT_ASSERT(
+		!cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_IDLE, CLUSTER_REMOVE_CLEANUP));
 	/* post-SHRUNK must NOT clean-abort or escalate (irreversible) */
-	UT_ASSERT(!cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_CLEANUP, CLUSTER_REMOVE_ABORTED));
-	UT_ASSERT(!cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_CLEANUP, CLUSTER_REMOVE_ABORTED_ESCALATE));
-	UT_ASSERT(!cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_CLEANUP_BLOCKED, CLUSTER_REMOVE_ABORTED_ESCALATE));
+	UT_ASSERT(!cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_CLEANUP,
+														  CLUSTER_REMOVE_ABORTED));
+	UT_ASSERT(!cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_CLEANUP,
+														  CLUSTER_REMOVE_ABORTED_ESCALATE));
+	UT_ASSERT(!cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_CLEANUP_BLOCKED,
+														  CLUSTER_REMOVE_ABORTED_ESCALATE));
 
 	/* terminal phases reset to IDLE */
-	UT_ASSERT(cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_COMMITTED, CLUSTER_REMOVE_IDLE));
-	UT_ASSERT(cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_ABORTED, CLUSTER_REMOVE_IDLE));
-	UT_ASSERT(cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_ABORTED_ESCALATE, CLUSTER_REMOVE_IDLE));
+	UT_ASSERT(
+		cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_COMMITTED, CLUSTER_REMOVE_IDLE));
+	UT_ASSERT(
+		cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_ABORTED, CLUSTER_REMOVE_IDLE));
+	UT_ASSERT(cluster_node_remove_phase_valid_transition(CLUSTER_REMOVE_ABORTED_ESCALATE,
+														 CLUSTER_REMOVE_IDLE));
 }
 
 
@@ -191,13 +213,15 @@ UT_TEST(test_contest_classify)
 {
 	/* coherent helper */
 	UT_ASSERT(cluster_node_remove_version_coherent(5, 5, 2, 2));
-	UT_ASSERT(!cluster_node_remove_version_coherent(5, 6, 2, 2));	/* epoch moved */
-	UT_ASSERT(!cluster_node_remove_version_coherent(5, 5, 2, 3));	/* dead_gen moved */
+	UT_ASSERT(!cluster_node_remove_version_coherent(5, 6, 2, 2)); /* epoch moved */
+	UT_ASSERT(!cluster_node_remove_version_coherent(5, 5, 2, 3)); /* dead_gen moved */
 
 	/* pre-SHRUNK contest -> ABORTED_ESCALATE (removal not committed -> fail-stop) */
-	UT_ASSERT_EQ((int)cluster_node_remove_classify_contest(false), (int)CLUSTER_REMOVE_ABORTED_ESCALATE);
+	UT_ASSERT_EQ((int)cluster_node_remove_classify_contest(false),
+				 (int)CLUSTER_REMOVE_ABORTED_ESCALATE);
 	/* post-SHRUNK contest -> CLEANUP_BLOCKED (irreversible; resumable; never escalate) */
-	UT_ASSERT_EQ((int)cluster_node_remove_classify_contest(true), (int)CLUSTER_REMOVE_CLEANUP_BLOCKED);
+	UT_ASSERT_EQ((int)cluster_node_remove_classify_contest(true),
+				 (int)CLUSTER_REMOVE_CLEANUP_BLOCKED);
 }
 
 
@@ -286,12 +310,12 @@ UT_TEST(test_recover_matrix)
 
 	/* fence=no, rm=SHRUNK -> IMPOSSIBLE (INV-LF2) -> corruption */
 	corrupt = false;
-	(void) cluster_node_remove_recover_phase(false, CLUSTER_REMOVAL_MARKER_SHRUNK, &corrupt);
+	(void)cluster_node_remove_recover_phase(false, CLUSTER_REMOVAL_MARKER_SHRUNK, &corrupt);
 	UT_ASSERT(corrupt);
 
 	/* fence=no, rm=REMOVED -> IMPOSSIBLE -> corruption */
 	corrupt = false;
-	(void) cluster_node_remove_recover_phase(false, CLUSTER_REMOVAL_MARKER_REMOVED, &corrupt);
+	(void)cluster_node_remove_recover_phase(false, CLUSTER_REMOVAL_MARKER_REMOVED, &corrupt);
 	UT_ASSERT(corrupt);
 }
 
@@ -307,7 +331,7 @@ mk_marker(ClusterRemovalMarker *m, int32 node, uint64 epoch, int phase, uint64 i
 	memset(m, 0, sizeof(*m));
 	m->magic = CLUSTER_REMOVAL_MARKER_MAGIC;
 	m->version = CLUSTER_REMOVAL_MARKER_VERSION;
-	m->phase = (uint16) phase;
+	m->phase = (uint16)phase;
 	m->removed_node_id = node;
 	m->remove_epoch = epoch;
 	m->removed_incarnation = incarnation;

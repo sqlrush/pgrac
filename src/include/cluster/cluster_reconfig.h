@@ -661,7 +661,8 @@ extern void cluster_reconfig_record_removed(int32 node_id, uint64 remove_epoch,
 extern bool cluster_reconfig_is_removed(int32 node_id);
 extern uint64 cluster_reconfig_get_removed_epoch(int32 node_id);
 extern uint64 cluster_reconfig_get_removed_count(void);
-extern void cluster_reconfig_snapshot_removed_bitmap(uint8 *out /* [CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] */);
+extern void
+cluster_reconfig_snapshot_removed_bitmap(uint8 *out /* [CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] */);
 extern void cluster_reconfig_seed_removed_membership(int32 node_id, uint64 remove_epoch,
 													 uint64 removed_incarnation,
 													 bool raise_epoch_floor);

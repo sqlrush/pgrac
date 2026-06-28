@@ -74,7 +74,7 @@ extern PGDLLIMPORT bool cluster_enabled;
 /* on-slot StaticAssert: the removal marker must fit within the voting-slot
  * _reserved1 region after the 4.12 fence marker, clear of the slot crc32c. */
 StaticAssertDecl(CLUSTER_REMOVAL_MARKER_RESERVED1_OFFSET + sizeof(ClusterRemovalMarker)
-				 <= sizeof(((ClusterVotingSlot *)0)->_reserved1),
+					 <= sizeof(((ClusterVotingSlot *)0)->_reserved1),
 				 "removal marker must fit within voting-slot _reserved1 (after fence marker)");
 
 static ClusterNodeRemoveState *nr_state = NULL;
@@ -347,8 +347,7 @@ nr_node_is_drained(int32 node_id)
 	if (cluster_reconfig_is_clean_departed(node_id))
 		return true;
 	st = cluster_membership_get_state(node_id);
-	return st == CLUSTER_MEMBER_DEAD || st == CLUSTER_MEMBER_ABSENT
-		   || st == CLUSTER_MEMBER_REMOVED;
+	return st == CLUSTER_MEMBER_DEAD || st == CLUSTER_MEMBER_ABSENT || st == CLUSTER_MEMBER_REMOVED;
 }
 
 /* generate a per-attempt removal identity (R14 folds it into the event id). */
@@ -428,8 +427,8 @@ cluster_node_remove_request(int32 node_id)
 		nr_state->coordinator_node_id = cluster_node_id;
 		nr_state->remove_epoch = 0;
 		nr_state->removal_event_id = nr_make_event_id(node_id);
-		nr_state->target_last_incarnation =
-			cluster_membership_get_last_admitted_incarnation(node_id);
+		nr_state->target_last_incarnation
+			= cluster_membership_get_last_admitted_incarnation(node_id);
 		nr_state->remove_baseline_dead_gen = cluster_cssd_get_dead_generation();
 		nr_state->fence_armed = false;
 		nr_state->membership_shrunk = false;
@@ -444,8 +443,7 @@ cluster_node_remove_request(int32 node_id)
 	}
 	/* RESUME: keep the existing target/epoch; just re-arm the drive from SHRUNK by
 	 * moving CLEANUP_BLOCKED back to CLEANUP (the lmon_tick retries the cleanup). */
-	else if (verdict == CLUSTER_REMOVE_REQ_RESUME
-			 && cur_phase == CLUSTER_REMOVE_CLEANUP_BLOCKED) {
+	else if (verdict == CLUSTER_REMOVE_REQ_RESUME && cur_phase == CLUSTER_REMOVE_CLEANUP_BLOCKED) {
 		pg_atomic_write_u32(&nr_state->phase, CLUSTER_REMOVE_CLEANUP);
 	}
 	LWLockRelease(&nr_state->lock);
@@ -507,8 +505,7 @@ cluster_node_remove_drive(void)
 		pg_atomic_write_u32(&nr_state->phase, CLUSTER_REMOVE_PRECHECK);
 		/* fall through to re-validate on the same tick */
 		/* FALLTHROUGH */
-	case CLUSTER_REMOVE_PRECHECK:
-	{
+	case CLUSTER_REMOVE_PRECHECK: {
 		CLUSTER_INJECTION_POINT("cluster-node-remove-precheck");
 		/* re-validate (a node may have come back ALIVE, or quorum lost). */
 		if (!cluster_qvotec_in_quorum() || !nr_node_is_drained(node_id)) {
@@ -520,13 +517,12 @@ cluster_node_remove_drive(void)
 		pg_atomic_write_u32(&nr_state->phase, CLUSTER_REMOVE_FENCE_ARMING);
 	}
 		/* FALLTHROUGH */
-	case CLUSTER_REMOVE_FENCE_ARMING:
-	{
+	case CLUSTER_REMOVE_FENCE_ARMING: {
 		uint64 baseline_epoch = cluster_epoch_get_current();
 		uint64 new_epoch;
 		bool contest = false;
 
-		(void) baseline_dead_gen; /* contest is now signalled by out_contest, not derived */
+		(void)baseline_dead_gen; /* contest is now signalled by out_contest, not derived */
 
 		/* §2.5: durable REMOVING marker (pre-commit; not a trust source). */
 		(void)nr_write_marker(CLUSTER_REMOVAL_MARKER_REMOVING, node_id, baseline_epoch,
@@ -540,17 +536,16 @@ cluster_node_remove_drive(void)
 		 * set) or because the fence submit did not reach majority (transient, NOT a
 		 * contest) — both fail-closed (nothing published on 0).
 		 */
-		new_epoch = cluster_reconfig_apply_node_removed_as_coordinator(node_id, baseline_epoch,
-																	   removal_event_id,
-																	   last_incarnation, &contest);
+		new_epoch = cluster_reconfig_apply_node_removed_as_coordinator(
+			node_id, baseline_epoch, removal_event_id, last_incarnation, &contest);
 		if (new_epoch == 0) {
 			if (contest) {
 				/* a real death/contest intruded BEFORE the membership commit
 				 * (pre-SHRUNK) -> ABORTED_ESCALATE (hand to fail-stop 5.14).  Routed
 				 * through classify_contest for the pre/post-SHRUNK discipline (here
 				 * always pre-SHRUNK: membership not yet shrunk). */
-				ClusterRemovePhase next =
-					cluster_node_remove_classify_contest(nr_state->membership_shrunk);
+				ClusterRemovePhase next
+					= cluster_node_remove_classify_contest(nr_state->membership_shrunk);
 
 				CLUSTER_INJECTION_POINT("cluster-node-remove-escalate");
 				pg_atomic_write_u32(&nr_state->phase, next);
@@ -568,9 +563,9 @@ cluster_node_remove_drive(void)
 		nr_state->remove_epoch = new_epoch;
 		nr_state->fence_armed = true;
 		nr_state->membership_shrunk = true; /* committed: N is now a fenced non-member */
-		nr_state->cleanup_deadline_us =
-			(TimestampTz)((uint64)GetCurrentTimestamp()
-						  + (uint64)cluster_node_removal_cleanup_timeout_ms * 1000ULL);
+		nr_state->cleanup_deadline_us
+			= (TimestampTz)((uint64)GetCurrentTimestamp()
+							+ (uint64)cluster_node_removal_cleanup_timeout_ms * 1000ULL);
 		LWLockRelease(&nr_state->lock);
 
 		/* membership is committed-shrunk: advance to SHRINK_COMMITTING, which writes
@@ -579,8 +574,7 @@ cluster_node_remove_drive(void)
 		pg_atomic_write_u32(&nr_state->phase, CLUSTER_REMOVE_SHRINK_COMMITTING);
 	}
 		/* FALLTHROUGH */
-	case CLUSTER_REMOVE_SHRINK_COMMITTING:
-	{
+	case CLUSTER_REMOVE_SHRINK_COMMITTING: {
 		uint64 epoch;
 
 		LWLockAcquire(&nr_state->lock, LW_SHARED);
@@ -601,8 +595,7 @@ cluster_node_remove_drive(void)
 	}
 		/* FALLTHROUGH */
 	case CLUSTER_REMOVE_CLEANUP:
-	case CLUSTER_REMOVE_CLEANUP_BLOCKED:
-	{
+	case CLUSTER_REMOVE_CLEANUP_BLOCKED: {
 		uint64 epoch;
 		bool clean;
 
@@ -753,8 +746,8 @@ nr_announce_handler(const ClusterICEnvelope *env, const void *payload)
 static void
 nr_ack_handler(const ClusterICEnvelope *env, const void *payload)
 {
-	const ClusterNodeRemoveCleanupAckPayload *p =
-		(const ClusterNodeRemoveCleanupAckPayload *)payload;
+	const ClusterNodeRemoveCleanupAckPayload *p
+		= (const ClusterNodeRemoveCleanupAckPayload *)payload;
 
 	if (nr_state == NULL || !cluster_node_remove_ack_payload_valid(p))
 		return;
@@ -898,11 +891,10 @@ cluster_node_remove_rebuild_from_disks(const int *fds, int n_disks)
 				has[i] = true;
 		}
 
-		if (!cluster_removal_marker_authority_decide(per_disk, has,
-													 (n_disks < CLUSTER_MAX_VOTING_DISKS
-														  ? n_disks
-														  : CLUSTER_MAX_VOTING_DISKS),
-													 &authority))
+		if (!cluster_removal_marker_authority_decide(
+				per_disk, has,
+				(n_disks < CLUSTER_MAX_VOTING_DISKS ? n_disks : CLUSTER_MAX_VOTING_DISKS),
+				&authority))
 			continue; /* no majority removal marker on this slot */
 		/* structural-only validation (magic/version/crc/phase/range); the marker's
 		 * removed_node_id is the node to seed, not the slot it physically lives in. */
@@ -925,7 +917,7 @@ cluster_node_remove_rebuild_from_disks(const int *fds, int n_disks)
 		fence_says_fenced = cluster_write_fence_verify_durable(authority.remove_epoch);
 		resume = cluster_node_remove_recover_phase(true /* trust the durable marker */,
 												   authority.phase, &corrupt);
-		(void) fence_says_fenced;
+		(void)fence_says_fenced;
 		if (corrupt)
 			continue; /* unknown marker phase — ignore (struct_valid already vetted phase) */
 
@@ -947,9 +939,9 @@ cluster_node_remove_rebuild_from_disks(const int *fds, int n_disks)
 			nr_state->target_last_incarnation = authority.removed_incarnation;
 			nr_state->fence_armed = true;
 			nr_state->membership_shrunk = true;
-			nr_state->cleanup_deadline_us =
-				(TimestampTz)((uint64)GetCurrentTimestamp()
-							  + (uint64)cluster_node_removal_cleanup_timeout_ms * 1000ULL);
+			nr_state->cleanup_deadline_us
+				= (TimestampTz)((uint64)GetCurrentTimestamp()
+								+ (uint64)cluster_node_removal_cleanup_timeout_ms * 1000ULL);
 			pg_atomic_write_u32(&nr_state->phase, (resume == CLUSTER_REMOVE_COMMITTED)
 													  ? CLUSTER_REMOVE_COMMITTED
 													  : CLUSTER_REMOVE_CLEANUP);

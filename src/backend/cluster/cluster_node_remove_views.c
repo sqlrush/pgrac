@@ -137,8 +137,8 @@ pg_cluster_remove_node(PG_FUNCTION_ARGS)
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("cluster.enabled is off; node removal is not available")));
 
-	PG_RETURN_TEXT_P(
-		cstring_to_text(cluster_node_remove_request_result_str(cluster_node_remove_request(node_id))));
+	PG_RETURN_TEXT_P(cstring_to_text(
+		cluster_node_remove_request_result_str(cluster_node_remove_request(node_id))));
 }
 
 #else /* !USE_PGRAC_CLUSTER */

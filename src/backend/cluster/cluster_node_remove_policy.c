@@ -68,8 +68,7 @@ cluster_node_remove_phase_valid_transition(ClusterRemovePhase from, ClusterRemov
 	/* escalate is reachable ONLY from a pre-SHRUNK active phase */
 	if (to == CLUSTER_REMOVE_ABORTED_ESCALATE)
 		return (from == CLUSTER_REMOVE_REQUESTED || from == CLUSTER_REMOVE_PRECHECK
-				|| from == CLUSTER_REMOVE_FENCE_ARMING
-				|| from == CLUSTER_REMOVE_SHRINK_COMMITTING);
+				|| from == CLUSTER_REMOVE_FENCE_ARMING || from == CLUSTER_REMOVE_SHRINK_COMMITTING);
 
 	/* clean abort is reachable ONLY pre-fence-commit */
 	if (to == CLUSTER_REMOVE_ABORTED)
@@ -183,9 +182,9 @@ cluster_node_remove_request_result_str(ClusterRemoveRequestResult r)
  *	(SHRUNK/REMOVED) is recognised regardless of the live drained snapshot.
  */
 ClusterRemoveRequestResult
-cluster_node_remove_precheck(bool feature_enabled, bool is_self, bool is_declared,
-							 bool is_drained, bool in_quorum, int marker_phase,
-							 bool cleanup_blocked, bool drive_active)
+cluster_node_remove_precheck(bool feature_enabled, bool is_self, bool is_declared, bool is_drained,
+							 bool in_quorum, int marker_phase, bool cleanup_blocked,
+							 bool drive_active)
 {
 	if (!feature_enabled)
 		return CLUSTER_REMOVE_REQ_FEATURE_DISABLED;
@@ -290,7 +289,7 @@ cluster_node_remove_recover_phase(bool fence_says_fenced, int marker_phase, bool
 
 	/* fence is durable (N is fenced): drive the removal to completion. */
 	switch (marker_phase) {
-	case 0:							/* no removal marker yet */
+	case 0: /* no removal marker yet */
 	case CLUSTER_REMOVAL_MARKER_REMOVING:
 		/* fenced but membership not committed -> finish the shrink+cleanup */
 		return CLUSTER_REMOVE_SHRINK_COMMITTING;
@@ -392,7 +391,8 @@ cluster_removal_marker_unpack(const uint8 *reserved1, ClusterRemovalMarker *out)
  * region as-is (the caller zeroed it).
  */
 void
-cluster_removal_marker_preserve_per_disk(uint8 *new_reserved1, const uint8 *prior_reserved1_same_disk)
+cluster_removal_marker_preserve_per_disk(uint8 *new_reserved1,
+										 const uint8 *prior_reserved1_same_disk)
 {
 	ClusterRemovalMarker m;
 

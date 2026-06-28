@@ -538,8 +538,8 @@ cluster_reconfig_compute_event_id_v2(uint8 reconfig_kind,
  *	produces a distinct, non-deduped event id.
  */
 uint64
-cluster_reconfig_compute_removal_event_id(const uint8 removed_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES],
-										  uint64 removal_event_id)
+cluster_reconfig_compute_removal_event_id(
+	const uint8 removed_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES], uint64 removal_event_id)
 {
 	uint8 hash_input[1 + CLUSTER_RECONFIG_DEAD_BITMAP_BYTES + sizeof(uint64)];
 	Size off = 0;
@@ -1492,8 +1492,8 @@ cluster_reconfig_lmon_tick(void)
 		 * re-admits it — it is no longer a member.
 		 */
 		for (b = 0; b < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; b++)
-			dead_bitmap[b] &= (uint8)~(ReconfigShmem->clean_departed_bitmap[b]
-									   | ReconfigShmem->removed_bitmap[b]);
+			dead_bitmap[b] &= (uint8) ~(ReconfigShmem->clean_departed_bitmap[b]
+										| ReconfigShmem->removed_bitmap[b]);
 
 		LWLockRelease(&ReconfigShmem->lock);
 	} else {
@@ -1942,8 +1942,8 @@ cluster_reconfig_apply_node_removed_as_coordinator(int32 removed_node_id, uint64
 		marker.magic = CLUSTER_FENCE_MARKER_MAGIC;
 		marker.version = CLUSTER_FENCE_MARKER_VERSION;
 		marker.fence_epoch = new_epoch;
-		marker.fence_event_id = cluster_reconfig_compute_removal_event_id(removed_with_n,
-																		  removal_event_id);
+		marker.fence_event_id
+			= cluster_reconfig_compute_removal_event_id(removed_with_n, removal_event_id);
 		marker.fence_generation = cssd_dead_generation;
 		marker.issuer_node_id = cluster_node_id;
 		marker.marker_kind = CLUSTER_FENCE_MARKER_KIND_NODE_REMOVED;

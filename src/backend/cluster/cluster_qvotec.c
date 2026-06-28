@@ -677,8 +677,8 @@ qvotec_build_baseline_marker(ClusterFenceMarker *out)
 		memset(fenced, 0, sizeof(fenced));
 		if (any_removed)
 			cluster_reconfig_snapshot_removed_bitmap(fenced);
-		cluster_fence_marker_build_baseline(out, CLUSTER_EPOCH_INITIAL, fenced,
-											0 /* generation */, 0 /* event_id */,
+		cluster_fence_marker_build_baseline(out, CLUSTER_EPOCH_INITIAL, fenced, 0 /* generation */,
+											0 /* event_id */,
 											CLUSTER_FENCE_BASELINE_INITIAL_ISSUER);
 	} else {
 		/* applied reconfig: republish its membership tuple, unioned with removed. */

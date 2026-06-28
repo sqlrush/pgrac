@@ -407,7 +407,7 @@ UT_TEST(test_member_count_shrink)
 	cluster_membership_set_state(40, CLUSTER_MEMBER_MEMBER);
 	cluster_membership_set_state(41, CLUSTER_MEMBER_MEMBER);
 	cluster_membership_set_state(42, CLUSTER_MEMBER_MEMBER);
-	cluster_membership_set_state(43, CLUSTER_MEMBER_DEAD);	 /* not counted */
+	cluster_membership_set_state(43, CLUSTER_MEMBER_DEAD);	  /* not counted */
 	cluster_membership_set_state(44, CLUSTER_MEMBER_JOINING); /* not counted */
 	before = cluster_membership_member_count();
 	UT_ASSERT_EQ(before, 3);

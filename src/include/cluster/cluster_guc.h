@@ -445,8 +445,8 @@ extern char *cluster_voting_disks;
 extern int cluster_quorum_poll_interval_ms;
 extern int cluster_voting_disk_io_timeout_ms;
 extern int cluster_voting_disk_size_bytes;
-extern bool cluster_online_join;				/* spec-5.15 D7 */
-extern int cluster_join_convergence_timeout_ms; /* spec-5.15 D7 */
+extern bool cluster_online_join;					/* spec-5.15 D7 */
+extern int cluster_join_convergence_timeout_ms;		/* spec-5.15 D7 */
 extern bool cluster_online_node_removal;			/* spec-5.18 D13 */
 extern int cluster_node_removal_cleanup_timeout_ms; /* spec-5.18 D13 */
 
