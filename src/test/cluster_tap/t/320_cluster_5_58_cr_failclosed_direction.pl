@@ -46,7 +46,6 @@ use FindBin;
 use lib "$FindBin::RealBin/../lib";
 
 use Test::More;
-use Time::HiRes qw(usleep);
 use PgracClusterNode;
 
 # all-on band profile
@@ -127,12 +126,15 @@ for my $kind (1 .. 4)
 }
 is($corrupt_hits, 4, 'L4 cr_corruption fails closed data_corrupted for all 4 subkinds (band on)');
 
-# --- L5: clean construct (no injection) is deterministic CR behavior ---
+# --- L5: clean construct (no injection, max read_scn) SUCCEEDS -------------
+# All injections disarmed and read_scn = INT64_MAX (the watermark can never
+# exceed it, so no 53R9F), so the construct must succeed with NO error -- this
+# leg can actually fail if the band leaks a stale/masked error after the armed
+# cases (review P2-1: was an or-tautology that passed on any CR-shaped error).
 $s->query("SELECT cluster_cr_test_construct('t_fc'::regclass,0,0,9223372036854775807)");
 my $eclean = $s->{stderr}; $s->{stderr} = '';
-ok($eclean eq '' || $eclean =~ /(53R9F|53R9G|XX001|cluster CR)/,
-	'L5 a clean construct is deterministic CR behavior, not a leftover/masked error '
-  . '(the band did not enter a broken state)');
+is($eclean, '',
+	'L5 a clean construct succeeds with no error (the band did not enter a broken state)');
 $s->quit;
 
 # --- L6: the fail-closed paths really ran (counters advanced) ---

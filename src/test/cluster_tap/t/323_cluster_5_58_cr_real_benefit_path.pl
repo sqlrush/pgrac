@@ -47,7 +47,6 @@ use FindBin;
 use lib "$FindBin::RealBin/../lib";
 
 use Test::More;
-use Time::HiRes qw(usleep);
 use PgracClusterNode;
 
 my $node = PgracClusterNode->new('cr_rb');

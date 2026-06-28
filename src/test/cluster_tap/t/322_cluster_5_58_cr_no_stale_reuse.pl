@@ -4,27 +4,34 @@
 # 322_cluster_5_58_cr_no_stale_reuse.pl
 #	  spec-5.58 D2 (HG#2) — no stale reuse under lifecycle churn, full band on.
 #
-#	  With the WHOLE CR read-path band live (shared L2 pool + admission + tuple
-#	  fast path + per-rel generation + resolver + L1 cache), prove that lifecycle
-#	  churn that frees/rewrites a relfilenode (TRUNCATE / VACUUM FULL / CLUSTER /
-#	  DROP+recreate) NEVER lets a cached CR image be served stale: a read after
-#	  the churn reflects the NEW relation state, never the pre-churn image, and
-#	  the pool/cache invalidation (epoch bump on relfilenode unlink) really fires.
-#	  This is the combination-level check (5.53 relfilenode-reuse fence + 5.56
-#	  lifecycle epoch bump live at once).
+#	  With the WHOLE CR read-path band live, prove that lifecycle churn that
+#	  frees/rewrites a relfilenode (TRUNCATE / VACUUM FULL / DROP+recreate) leaves
+#	  the relation correct and the band live -- DDL correctness with the band on,
+#	  plus a held-snapshot historical CR read that still reconstructs correctly
+#	  after the churn.
+#
+#	  Scope (review P1-2, honest): L3/L4/L5 are CURRENT-snapshot reads; a current
+#	  read sees live tuples via native MVCC and does NOT enter the CR construct /
+#	  pool path (only an as-of-snapshot HISTORICAL read does -- L6), so these legs
+#	  cannot serve a cached CR image stale and are DDL-correctness smoke checks,
+#	  not CR-pool stale-reuse gates.  The genuine CR-pool relfilenode-reuse
+#	  stale-serve gate (shared-read_scn cross-backend pool HIT -> epoch bump on
+#	  unlink -> the stale-epoch image MISSES) is spec-5.53 t/306, which spec-5.58
+#	  re-runs in nightly range 276-323; the tuple fast path never reads the pool,
+#	  so its isolation coverage == its combination coverage on this axis.
 #
 #	    L1  band-all-on node up.
-#	    L2  warm the band: a long-snapshot CR read populates the pool/cache with
-#	        the relation's images.
-#	    L3  TRUNCATE + reinsert DIFFERENT data -> a fresh read reflects the new
-#	        data, never the warmed (pre-truncate) image (no stale serve).
-#	    L4  VACUUM FULL (relfilenode rewrite, same data) -> the optimized read
-#	        still equals the authoritative reconstruct (differential preserved
-#	        across a rewrite).
-#	    L5  DROP + recreate + insert -> a read of the recreated relation reflects
-#	        ONLY the new data (no over-hit from the old relfilenode's pool entries).
-#	    L6  the pool epoch really bumped across the churn (relfilenode-unlink
-#	        invalidation fired -- the no-stale guarantee is enforced, not luck).
+#	    L2  a long-snapshot CR read sees the pre-churn relation (band engaged).
+#	    L3  TRUNCATE + reinsert DIFFERENT data -> a current read reflects ONLY the
+#	        new data (DDL correctness, band on).
+#	    L4  VACUUM FULL (relfilenode rewrite) -> a current read reflects ONLY the
+#	        new data exactly (no loss / no duplicate across the rewrite).
+#	    L5  DROP + recreate + insert -> a current read reflects ONLY the reborn
+#	        data (DDL correctness, band on).
+#	    L6  a held-snapshot HISTORICAL CR read after all the churn STILL
+#	        reconstructs the pre-update image exactly, and the tuple fast path
+#	        still fires -- the band is live + correct after lifecycle churn (not a
+#	        broken state).
 #
 # IDENTIFICATION
 #	  src/test/cluster_tap/t/322_cluster_5_58_cr_no_stale_reuse.pl
@@ -42,7 +49,6 @@ use FindBin;
 use lib "$FindBin::RealBin/../lib";
 
 use Test::More;
-use Time::HiRes qw(usleep);
 use PgracClusterNode;
 
 my $node = PgracClusterNode->new('cr_nsr');
@@ -90,7 +96,7 @@ my $warm = $r->query_safe('SELECT count(*) FROM t_nsr');	# real CR path -> pool 
 $r->query_safe('ROLLBACK');
 $r->quit;
 chomp($warm);
-is($warm, '300', 'L2 long-snapshot CR read warmed the band (sees all 300 pre-churn rows)');
+is($warm, '300', 'L2 long-snapshot CR read sees all 300 pre-churn rows (band engaged)');
 
 # ---- L3: TRUNCATE + reinsert different -> no stale serve -------------------
 $node->safe_psql('postgres', 'TRUNCATE t_nsr');
@@ -100,7 +106,7 @@ my $after_trunc = $node->safe_psql('postgres',
 	q{SELECT count(*) || ',' || count(*) FILTER (WHERE v LIKE 'NEW_%') || ',' ||
 	         count(*) FILTER (WHERE v LIKE 'orig_%' OR v LIKE 'upd%') FROM t_nsr});
 is($after_trunc, '50,50,0',
-	'L3 after TRUNCATE+reinsert: read reflects ONLY the new 50 rows, NO stale pre-truncate image');
+	'L3 after TRUNCATE+reinsert: current read reflects ONLY the new 50 rows (DDL correctness, band on)');
 
 # ---- L4: VACUUM FULL (rewrite) -> differential preserved -------------------
 $node->safe_psql('postgres', 'VACUUM FULL t_nsr');
@@ -109,7 +115,7 @@ my $after_vac = $node->safe_psql('postgres',
 my $expect_vac = $node->safe_psql('postgres',
 	q{SELECT string_agg(g||':'||'NEW_'||g, '|' ORDER BY g) FROM generate_series(1,50) g});
 is($after_vac, $expect_vac,
-	'L4 after VACUUM FULL (relfilenode rewrite): every row exactly the new data (no stale, no loss)');
+	'L4 after VACUUM FULL (relfilenode rewrite): current read is exactly the new data (no loss, no duplicate)');
 
 # ---- L5: DROP + recreate + insert -> no over-hit --------------------------
 $node->safe_psql('postgres', 'DROP TABLE t_nsr');
@@ -119,8 +125,8 @@ $node->safe_psql('postgres',
 my $after_drop = $node->safe_psql('postgres',
 	q{SELECT count(*) || ',' || count(*) FILTER (WHERE v LIKE 'REBORN_%') FROM t_nsr});
 is($after_drop, '20,20',
-	'L5 after DROP+recreate+insert: read reflects ONLY the reborn 20 rows '
-  . '(no over-hit from the old relfilenode pool entries)');
+	'L5 after DROP+recreate+insert: current read reflects ONLY the reborn 20 rows '
+  . '(DDL correctness, band on)');
 
 # ---- L6: the band is STILL live + correct after all the churn --------------
 # A fresh long-snapshot CR read on the reborn relation reconstructs correctly

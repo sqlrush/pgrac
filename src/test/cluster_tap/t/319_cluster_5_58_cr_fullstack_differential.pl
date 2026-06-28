@@ -22,9 +22,10 @@
 #	      (cluster_cr.c:1958) = L1 cache -> L2 pool -> reconstruct, i.e. the LIVE
 #	      optimized band.
 #	    * two backends (R1, R2) take REPEATABLE READ snapshots in the same
-#	      quiescent window so they share one read_scn (5.50 §17.3): R1's read
-#	      publishes the CR image to the shared L2 pool, R2's read HITS it
-#	      cross-backend -> proves the pool really fired (not all-fallback).
+#	      quiescent window so they share one read_scn (5.50 §17.3) -> cross-backend
+#	      equivalence of the live optimized read.  (The tuple fast path serves
+#	      these verdicts WITHOUT warming the L2 pool; the pool cross-backend HIT is
+#	      gated by the dedicated t/303 + t/306, re-run in nightly range 276-323.)
 #
 #	  Assertions (own-instance, single all-on node):
 #	    L1  R1 and R2 share one read_scn (quiescent window).
@@ -32,9 +33,14 @@
 #	        (id,v) set, for every sampled block (the master differential, HG#1).
 #	    L3  cross-backend equivalence: R1's optimized read == R2's optimized read
 #	        (no false-visible / extra / missing row across backends).
-#	    L4  the band REALLY fired: the shared L2 pool recorded a cross-backend HIT
-#	        (R2 served from R1's published image) -- the equivalence is over the
-#	        live optimized path (L250).
+#	    L4  the band REALLY fired: the tuple-level fast path served a DECIDED
+#	        verdict (cr_tuple_verdict_count advanced -- a distinct counter from the
+#	        fallback outcomes), so the differential above is over the LIVE
+#	        optimized path, not an all-fallback no-op (L250).  (A plain verdict
+#	        SELECT does NOT warm the shared L2 pool -- the fast path short-circuits
+#	        the full-block construct -- so the pool cross-backend HIT is gated by
+#	        t/303 + t/306, which spec-5.58 re-runs in nightly range 276-323, not
+#	        here.)
 #	    L5  determinism: re-reading is identical across >=5 runs (no flake).
 #
 # IDENTIFICATION
@@ -53,7 +59,6 @@ use FindBin;
 use lib "$FindBin::RealBin/../lib";
 
 use Test::More;
-use Time::HiRes qw(usleep);
 use PgracClusterNode;
 
 # ---- all-on profile: the whole CR read-path band live ---------------------
@@ -83,7 +88,6 @@ sub cr_counter
 		qq{SELECT COALESCE((SELECT value::bigint FROM pg_cluster_state
 		   WHERE category='$cat' AND key='$key'), 0)}) + 0);
 }
-sub pool_hit { return cr_counter('cr_pool', 'hit_count'); }
 sub tuple_verdict { return cr_counter('cr', 'cr_tuple_verdict_count'); }
 
 # Authoritative ground truth: raw full-block reconstruct (no cache) as a sorted
@@ -111,6 +115,12 @@ $node->safe_psql('postgres', 'CHECKPOINT');
 
 my $maxblk = $node->safe_psql('postgres',
 	q{SELECT GREATEST(0, (pg_relation_size('t_diff') / current_setting('block_size')::int)::int - 1)});
+# P2-3 (review): the authoritative SRF is sampled over blocks 0..maxblk while the
+# optimized read is the whole table; assert the pre-churn relation fits within the
+# sampled range so the 4-block cap below can never silently drop rows from the
+# authoritative side (which would make L2a fail for the wrong reason).
+cmp_ok($maxblk, '<=', 3,
+	"L1 pre-churn t_diff fits in the sampled block range (maxblk=$maxblk <= 3)");
 $maxblk = 3 if $maxblk > 3;	# sample the first few blocks
 
 # Two readers take REPEATABLE READ snapshots in the same quiescent window: their
@@ -154,6 +164,10 @@ my $auth = auth_digest($scn1, $maxblk);
 # Normalize: both are sorted (id,v) over the same visible set; compare as sets.
 my %rset = map { $_ => 1 } split /\|/, $real1;
 my %aset = map { $_ => 1 } split /\|/, $auth;
+# P2-2 (review): the master differential must not pass on empty input (both sets
+# empty would make the diff asserts trivially green).
+cmp_ok(scalar keys %rset, '>', 300,
+	'L2 sanity: the optimized read returned the expected ~400 pre-churn rows (not empty)');
 my $only_real = join(',', grep { !$aset{$_} } sort keys %rset);
 my $only_auth = join(',', grep { !$rset{$_} } sort keys %aset);
 
