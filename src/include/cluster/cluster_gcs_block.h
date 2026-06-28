@@ -171,8 +171,26 @@ typedef enum GcsBlockReplyStatus {
 													 * 8.A: a cached copy with no
 													 * invalidation path would go stale).
 													 * Reuses HC103 copy-ship + HC127
-													 * watermark. */
+													 * watermark. */,
+	GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING = 14 /* PGRAC: spec-5.16 D3b NEW;
+													 * master-side hard gate (INV-R8/R14)
+													 * — the master (a rejoining node) is
+													 * NOT yet a quorum MEMBER, or the
+													 * requested block's joiner-home view
+													 * is still being rebuilt (survivors
+													 * not all re-declared).  Default-deny
+													 * BEFORE dedup/grant so a stale-view
+													 * requester routed here never gets a
+													 * cold grant.  sender maps to 53R9L
+													 * (retry-safe, Class 53). */
 } GcsBlockReplyStatus;
+
+/* spec-5.16 D3b / r4 — the new reply status MUST be the tail value (no
+ * collision with any shipped status; r3 mis-read a truncated enum as max 8,
+ * the real shipped max is READ_IMAGE_FROM_XHOLDER=13). */
+StaticAssertDecl(GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING
+					 == GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER + 1,
+				 "GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING must be the tail enum value");
 
 /* ============================================================
  * GcsBlockInvalidatePayload — spec-2.36 D1 NEW.
@@ -984,6 +1002,25 @@ typedef enum ClusterGcsBlockPhase {
 } ClusterGcsBlockPhase;
 
 extern ClusterGcsBlockPhase cluster_gcs_block_phase_for_tag(BufferTag tag);
+
+/*
+ * spec-5.16 D3 — online-join PCM block snap-back fence predicates (impl in
+ * cluster_grd.c;  declared here because BufferTag is in scope and both the
+ * requester-side phase gate and the master-side envelope handler consume them).
+ *
+ *	cluster_grd_join_remaster_active_for_shard:  the block's STATIC PCM home
+ *	    (cluster_gcs_lookup_master_static) is in the armed join_pcm_fenced_member
+ *	    set (bound to online_join, INDEPENDENT of any GRD master[] movement —
+ *	    so join_remaster_enabled=off still fences, r2 P1-①).  false when the
+ *	    fence is not armed (join_pcm_fence_epoch == 0).
+ *	cluster_grd_block_view_rebuilt:  the joiner-home view is rebuilt — i.e.
+ *	    EVERY declared member's recovery_done_epoch >= join_pcm_fence_epoch
+ *	    (Hardening v1.1:  the all-members all_done barrier, NOT the joiner's own
+ *	    done-epoch, which advances before survivors finish re-declaring → 8.A).
+ *	    true when the fence is not armed.
+ */
+extern bool cluster_grd_join_remaster_active_for_shard(BufferTag tag);
+extern bool cluster_grd_block_view_rebuilt(BufferTag tag);
 
 /*
  * spec-4.7 D5 — redo-before-unfreeze gate (Q5):  true iff the dead origin's

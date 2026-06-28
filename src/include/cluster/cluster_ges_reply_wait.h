@@ -95,7 +95,24 @@ typedef struct GesReplyWaitEntry {
 	uint32 reply_opcode;  /* set by reply handler (GesReplyOpcode) */
 	TimestampTz deadline; /* timeout sweep gate; 0 means no timeout */
 	bool ready;			  /* CV check predicate */
+	/*
+	 * spec-5.16 (orphan-grant, Rule 8.A) — the waiter abandoned this request at the
+	 * bounded GES timeout but kept the entry as a TOMBSTONE (deadline re-armed to a
+	 * short TTL) instead of deleting it.  A late GRANT that lands on a tombstone is
+	 * an ORPHAN (the master granted a waiter no backend wants); the reply handler
+	 * auto-releases it back to the master rather than leaving it as a phantom holder.
+	 * Distinguished from a retransmit-duplicate GRANT for a SUCCEEDED request, whose
+	 * entry was DELETED on success (lookup miss -> dropped, no release).
+	 */
+	bool abandoned;
 } GesReplyWaitEntry;
+
+/* spec-5.16 — result of an atomic reply delivery (lookup + act under one lock). */
+typedef enum GesReplyDeliverResult {
+	GES_REPLY_DELIVER_NO_WAITER = 0, /* entry gone (succeeded/late) -> drop */
+	GES_REPLY_DELIVER_WOKE,			 /* live waiter woken (normal grant/reject) */
+	GES_REPLY_DELIVER_ORPHAN		 /* tombstone GRANT -> caller auto-releases */
+} GesReplyDeliverResult;
 
 /*
  * Shmem region lifecycle (mirror cluster_lmd_graph_shmem pattern).
@@ -103,6 +120,14 @@ typedef struct GesReplyWaitEntry {
 extern Size cluster_ges_reply_wait_shmem_size(void);
 extern void cluster_ges_reply_wait_shmem_init(void);
 extern void cluster_ges_reply_wait_shmem_register(void);
+
+/*
+ * spec-5.16 (Rule 8.A) — next node-global request_id (never 0).  The reply-wait
+ * 5-tuple key requires request_id to be unique node-wide; the lock-acquire path
+ * sources it here instead of a backend-local counter (which reused request_id=1
+ * across backends and collided on the key).
+ */
+extern uint64 cluster_ges_reply_wait_next_request_id(void);
 
 /*
  * Insert a new wait entry keyed by HC17 5-tuple.
@@ -140,6 +165,27 @@ extern void cluster_ges_reply_wait_wake(GesReplyWaitEntry *entry, uint32 reply_o
 										uint32 reject_reason);
 
 /*
+ * spec-5.16 — atomic reply delivery (lookup + act under the HTAB lock, race-free).
+ *	NO_WAITER: no entry (succeeded/late retransmit-dup) -> caller drops.
+ *	WOKE:	   live waiter found -> verdict stored + CV broadcast (== wake).
+ *	ORPHAN:	   a GRANT landed on an abandoned tombstone -> entry removed; the caller
+ *			   auto-releases the phantom holder back to the master.
+ */
+extern GesReplyDeliverResult cluster_ges_reply_wait_deliver(const GesReplyWaitKey *key,
+															uint32 reply_opcode,
+															uint32 reject_reason);
+
+/*
+ * spec-5.16 — abandon a wait entry at the bounded GES timeout instead of deleting
+ * it: keep it as a tombstone with deadline re-armed to `tombstone_deadline` (swept
+ * later) so a late GRANT can be recognized as an orphan and auto-released.  Returns
+ * true if a GRANT had ALREADY been delivered (raced just ahead of the timeout): the
+ * entry is removed and the caller must auto-release that grant itself.
+ */
+extern bool cluster_ges_reply_wait_mark_abandoned(const GesReplyWaitKey *key,
+												  TimestampTz tombstone_deadline);
+
+/*
  * Delete an entry by 5-tuple key.  Called by:
  *	 - the waiter after CV wake (normal path) or after timeout
  *	   (HC17:  timeout MUST delete entry before request_id slot reuse).
@@ -149,9 +195,17 @@ extern void cluster_ges_reply_wait_wake(GesReplyWaitEntry *entry, uint32 reply_o
 extern void cluster_ges_reply_wait_delete(const GesReplyWaitKey *key);
 
 /*
- * Sweep timed-out entries.  Walks the HTAB, deletes entries whose
- * deadline < now, and increments the sweep counter for each.  Called
- * by the LMON tick (Step 2 D2 wires).  No-op in Step 1.
+ * Sweep expired ABANDONED tombstones.  Walks the HTAB and deletes entries
+ * that are abandoned (spec-5.16 orphan-grant) AND past their re-armed TTL
+ * deadline, incrementing the sweep counter for each.  Wired to the LMON tick
+ * (cluster_lmon.c) — it is the backstop that reclaims an orphan tombstone when
+ * no late GRANT ever lands on it.
+ *
+ *	spec-5.16 (Rule 8.A):  it deliberately does NOT sweep a live (non-abandoned)
+ *	waiter whose deadline merely elapsed — that backend is still sleeping on the
+ *	entry's CV and owns its own teardown; removing it here would race a freed
+ *	slot against the sleeper.  Only a tombstone (whose backend has already
+ *	returned) is safe to reclaim.
  *
  *	Returns the number of entries swept.
  */

@@ -300,6 +300,14 @@ int cluster_voting_disk_size_bytes = 196608; /* spec-5.15: 3 regions × 128 × 5
 bool cluster_online_join = false;
 /* spec-5.15 D7 — join convergence / commit deadline (PGC_SIGHUP). */
 int cluster_join_convergence_timeout_ms = 30000;
+/*
+ * spec-5.16 D6 — gate the OPTIONAL GRD logical-lock rebalance on node rejoin
+ * (move the joiner's home-shard GES mastership back from the survivor).  The
+ * PCM block snap-back fence is NOT gated by this — it is forced correctness
+ * bound to cluster.online_join (INV-R13);  off only leaves GRD mastership on
+ * the survivor (load imbalance, no correctness impact).  Default off (opt-in).
+ */
+bool cluster_join_remaster_enabled = false;
 
 /* spec-5.18 D13 — permanent node removal opt-in + cleanup ACK-barrier deadline. */
 bool cluster_online_node_removal = false;
@@ -2224,6 +2232,21 @@ cluster_init_guc(void)
 										  "vetted (monotonic incarnation guard) and published into "
 										  "membership via a two-phase epoch-converged reconfig."),
 							 &cluster_online_join, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	/* spec-5.16 D6 — OPTIONAL GRD logical-lock rebalance on node rejoin.  The
+	 * PCM block snap-back fence is NOT gated here (it is forced correctness
+	 * bound to cluster.online_join, INV-R13); this only controls whether the
+	 * joiner's home-shard GES mastership is moved back from the survivor. */
+	DefineCustomBoolVariable("cluster.join_remaster_enabled",
+							 gettext_noop("On node rejoin, move the joiner's home-shard GES "
+										  "mastership back from the survivor (optional rebalance)."),
+							 gettext_noop("Default off: the joiner's logical-lock mastership stays "
+										  "on the survivor that held it during the absence (load "
+										  "imbalance only).  The PCM block view rebuild + RECOVERING "
+										  "fence always run when cluster.online_join is on, "
+										  "independent of this GUC (forced correctness)."),
+							 &cluster_join_remaster_enabled, false, PGC_POSTMASTER, 0, NULL, NULL,
+							 NULL);
 
 	DefineCustomIntVariable("cluster.join_convergence_timeout_ms",
 							gettext_noop("Deadline for an online join to converge + commit."),

@@ -394,6 +394,51 @@ cluster_write_fence_startup_self_check(void)
 }
 
 /*
+ * cluster_write_fence_supersede_by_admit -- spec-5.16 (3-node rejoin fence
+ * clear).  RC-5 supersede applied to the write-fence: when THIS node observes
+ * its OWN durable quorum-majority COMMITTED join marker with an admitted_epoch
+ * strictly newer than the fence it is under, the cluster has durably re-admitted
+ * this node AFTER the fail-stop fence — so the fence is superseded and self
+ * un-fences.  This is NOT manual self-unfencing (forbidden, split-brain): the
+ * COMMITTED join marker is authored by the coordinator on a quorum-majority of
+ * voting disks, and the epoch monotonicity (admit_epoch > authorized_epoch)
+ * guarantees a later genuine fail-stop (epoch > admit) re-fences via the qvotec
+ * refresh's advance guard.  Called from the qvotec self-admission detection.
+ *
+ *	Without this, a node restarting into an online rejoin self-fences at startup
+ *	(the fail-stop marker still lists it dead before the rejoin commits) and the
+ *	qvotec refresh never clears it, because the leader's no-fence baseline either
+ *	races the rejoin window or the survivor's stale dead view keeps re-asserting
+ *	the fence — a 3-node convergence deadlock (2-node has no second survivor to
+ *	hold the stale view).
+ */
+void
+cluster_write_fence_supersede_by_admit(uint64 admitted_epoch)
+{
+	if (cluster_write_fence_shmem == NULL)
+		return;
+	if (pg_atomic_read_u32(&cluster_write_fence_shmem->self_fenced) == 0)
+		return; /* not fenced — nothing to supersede */
+	if (admitted_epoch <= pg_atomic_read_u64(&cluster_write_fence_shmem->authorized_epoch))
+		return; /* the fence is at least as new as this admit — not superseded */
+
+	/*
+	 * The cluster durably re-admitted self at a newer epoch than the fence.
+	 * Advance the latched authorized_epoch to the admit epoch (so the next qvotec
+	 * refresh's monotonic guard does NOT re-fence from the stale lower-epoch
+	 * marker) and clear the self-fence + engage latch.
+	 */
+	pg_atomic_write_u64(&cluster_write_fence_shmem->authorized_epoch, admitted_epoch);
+	pg_atomic_write_u32(&cluster_write_fence_shmem->self_fenced, 0);
+	pg_atomic_write_u32(&cluster_write_fence_shmem->fence_engaged, 0);
+	ereport(LOG,
+			(errmsg("cluster write-fence: self un-fenced — durable COMMITTED join marker "
+					"(admitted epoch " UINT64_FORMAT ") supersedes the fail-stop fence; this node "
+					"may serve again",
+					admitted_epoch)));
+}
+
+/*
  * cluster_write_fence_reject_if_fenced -- spec-4.12 D5 hot-path gate.  The ONE
  *	helper that every cooperative shared-storage write entry calls so they all
  *	mirror the identical CritSectionCount-aware fail-closed action (L240 -- a single

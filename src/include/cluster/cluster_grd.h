@@ -158,6 +158,13 @@ typedef enum ClusterGrdShardPhase {
 	GRD_SHARD_REBUILDING = 2,
 } ClusterGrdShardPhase;
 
+/* spec-5.16 D2 — direction of the current remaster episode (shmem-only). */
+typedef enum ClusterGrdRemasterDirection {
+	GRD_REMASTER_DIR_NONE = 0, /* idle / never run */
+	GRD_REMASTER_DIR_FAIL = 1, /* spec-4.6 failure-driven */
+	GRD_REMASTER_DIR_JOIN = 2  /* spec-5.16 join-driven */
+} ClusterGrdRemasterDirection;
+
 typedef struct ClusterGrdShared {
 	pg_atomic_uint32 master[PGRAC_GRD_SHARD_COUNT];
 
@@ -328,6 +335,41 @@ typedef struct ClusterGrdShared {
 	pg_atomic_uint64 starvation_barrier_enqueued_count;		/* jumpers held behind a boost */
 	pg_atomic_uint64 starvation_barrier_publish_fail_count; /* edge publish/revalidate fail */
 	pg_atomic_uint64 starvation_max_skip_observed;			/* high-water skip_count seen */
+
+	/*
+	 * spec-5.16 D2/D3b — online node-join remaster (PCM block snap-back fence
+	 * + optional GRD logical-lock rebalance).  Shmem-ONLY, NEVER on the wire
+	 * (INV-R2:  the existing epoch token is the staleness discriminator;  the
+	 * intra-epoch old(survivor)/new(joiner) ambiguity is serialized by FREEZE,
+	 * not by these fields).
+	 *
+	 *	join_pcm_fence_epoch       JOIN_COMMITTED epoch the joiner-home block
+	 *	                           fence is armed for (0 = never armed).  Armed
+	 *	                           SYNCHRONOUSLY by 5.15 commit_member /
+	 *	                           note_self_admitted (D3b, INV-R13) on the
+	 *	                           joiner BEFORE is_member(self) flips, and by
+	 *	                           each survivor's LMON P0-accept (D2).
+	 *	                           Monotonic max (a later join re-arms higher).
+	 *	join_pcm_fenced_member     the rejoining MEMBER set this fence covers
+	 *	                           (PCM home = hash%declared_count = node domain,
+	 *	                           NOT the 4096-shard domain).  CLUSTER_MAX_NODES
+	 *	                           bits as uint64 words.
+	 *	recovery_direction         ClusterGrdRemasterDirection — FAIL (4.6) /
+	 *	                           JOIN (5.16) / NONE (idle).  Observability +
+	 *	                           recompute selection;  does not change the FSM.
+	 */
+	pg_atomic_uint64 join_pcm_fence_epoch;
+	pg_atomic_uint64 join_pcm_fenced_member[(CLUSTER_MAX_NODES + 63) / 64];
+	pg_atomic_uint32 recovery_direction;
+
+	/* spec-5.16 D5 — join-direction remaster counters (dump_grd grd_recovery
+	 * segment;  kept distinct from the failure-driven remaster_* counters so
+	 * ops can tell the two remaster kinds apart — §8 Q6-A). */
+	pg_atomic_uint64 join_remaster_started_count;			   /* JOIN episode entered */
+	pg_atomic_uint64 join_remaster_done_count;				   /* JOIN episode reached IDLE */
+	pg_atomic_uint64 join_shards_remastered_count;			   /* GRD shards moved to joiner */
+	pg_atomic_uint64 join_block_views_rebuilt_count;		   /* joiner-home fences lifted */
+	pg_atomic_uint64 join_block_recovering_failclosed_count;   /* 53R9L denied (both gates) */
 } ClusterGrdShared;
 
 /* spec-2.17 D28b — extern atomic generation alloc helper(InitProcess hook). */
@@ -470,6 +512,42 @@ extern bool cluster_grd_is_local_master(uint32 shard_id);
 extern uint32 cluster_grd_master_map_remaster(const uint64 *dead_bitmap, uint64 reconfig_epoch);
 
 /*
+ * spec-5.16 D1 — membership-aware deterministic master-map recompute.
+ *
+ *	JOIN-DIRECTION ONLY.  The shipped failure-driven cluster_grd_master_map_
+ *	remaster() is NOT touched (Q3=A parallel function).  Per shard i:
+ *	  home    = declared[i % declared_count];
+ *	  desired = is_member(home) ? home : deterministic_survivor(active, i);
+ *	  master[i] != desired -> write + master_generation[i]++.
+ *	Returns the number of shards actually moved (0 = idempotent no-op).
+ *
+ *	active_member is the CLUSTER_MAX_NODES-bit accepted-MEMBER set, uint8[16]
+ *	(the reconfig dead/join bitmap shape;  CLUSTER_RECONFIG_DEAD_BITMAP_BYTES).
+ *	It MUST be projected from the 5.15 membership SSOT (cluster_membership_is_
+ *	member), NEVER ad-hoc CSSD peer_state (INV-R1/R3).  In a pure failure
+ *	scenario (no home revival) the per-shard result equals the old remaster
+ *	(U2):  the steady-state map is home-based, so home-dead -> survivor[i%n]
+ *	matches the dead-only reassignment.
+ */
+extern uint32 cluster_grd_master_map_recompute_for_membership(const uint8 *active_member,
+															  uint64 epoch);
+
+/*
+ * spec-5.16 D2/D3b — online-join PCM block snap-back fence accessors.
+ *
+ *	cluster_grd_arm_join_pcm_fence:  set join_pcm_fence_epoch = the joiner's
+ *	    JOIN_COMMITTED epoch + fenced_member_bitmap = rejoining_set.  Called
+ *	    SYNCHRONOUSLY (NEVER from the LMON tick — INV-R13) by 5.15
+ *	    note_self_admitted on the joiner BEFORE is_member(self) flips, and by
+ *	    each survivor's LMON P0-accept.  Idempotent (monotonic-max epoch).
+ *	cluster_grd_join_remaster_in_progress:  recovery_direction == JOIN.
+ *	The two BufferTag predicates (active_for_shard / block_view_rebuilt) live
+ *	in cluster_gcs_block.h (BufferTag is in scope there).
+ */
+extern void cluster_grd_arm_join_pcm_fence(const uint8 *rejoining_set /* [16] */);
+extern bool cluster_grd_join_remaster_in_progress(void);
+
+/*
  * spec-4.6 D2 — per-shard master lookup + wire routing token.
  *
  *	Q3-C:  *out_routing_generation is the EXISTING shard_master_
@@ -536,6 +614,8 @@ extern void cluster_grd_recovery_mark_peer_done(int32 node, uint64 epoch);
 /* spec-4.6 D4/D5 — recovery counter bumps for out-of-module call sites. */
 extern void cluster_grd_inc_stale_request_drop(void);
 extern void cluster_grd_inc_block_path_failclosed(void);
+/* spec-5.16 D5 — join-direction 53R9L fail-closed bump (requester + master gate). */
+extern void cluster_grd_inc_join_block_failclosed(void);
 
 /* spec-4.6 D5 — bulk snapshot of the 13 grd_recovery counters for the
  * pg_cluster_state dump (category 'grd_recovery';  one t/249 leg each). */
@@ -553,6 +633,13 @@ typedef struct ClusterGrdRecoveryCounters {
 	uint64 block_path_failclosed;
 	uint64 unaffected_holder_survived;
 	uint64 stale_holder_swept;
+	/* spec-5.16 D5 — join-direction remaster counters (distinct from the
+	 * failure-driven remaster_* above; §8 Q6-A). */
+	uint64 join_remaster_started;
+	uint64 join_remaster_done;
+	uint64 join_shards_remastered;
+	uint64 join_block_views_rebuilt;
+	uint64 join_block_recovering_failclosed;
 } ClusterGrdRecoveryCounters;
 
 extern void cluster_grd_recovery_counters_snapshot(ClusterGrdRecoveryCounters *out);

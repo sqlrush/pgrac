@@ -611,6 +611,14 @@ cluster_ges_lmon_drain_work_queue(void)
 	return 0;
 }
 
+/* spec-5.16 — LmonMain sweeps abandoned reply-wait tombstones each tick; stub it
+ * (real impl in cluster_ges_reply_wait.o, not linked into this standalone test). */
+int
+cluster_ges_reply_wait_sweep_timeout(TimestampTz now pg_attribute_unused())
+{
+	return 0;
+}
+
 int
 cluster_grd_outbound_lmon_drain_send(void)
 {

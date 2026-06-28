@@ -148,6 +148,19 @@ elog_finish(int e pg_attribute_unused(), const char *f pg_attribute_unused(), ..
 {}
 
 /*
+ * spec-5.16 — test-only flag to force the GRD shmem stub to re-run its full
+ * init (so the join-fence suite gets a clean recovery_done_epoch / fence /
+ * direction between tests; the stub allocates the buffer once, so without this
+ * a repeat cluster_grd_shmem_init() would see found=true and skip the field
+ * init).  Set by ut_reset_grd_shmem(); honoured + cleared on the next call. */
+static bool ut_grd_force_reinit = false;
+static void
+ut_reset_grd_shmem(void)
+{
+	ut_grd_force_reinit = true;
+}
+
+/*
  * L105 union force-align shmem stub.
  */
 void *
@@ -166,6 +179,10 @@ ShmemInitStruct(const char *name, Size size, bool *foundPtr)
 		} grd_buf;
 		static bool grd_initialized = false;
 
+		if (ut_grd_force_reinit) {
+			grd_initialized = false;
+			ut_grd_force_reinit = false;
+		}
 		Assert(size <= sizeof(grd_buf.data));
 		*foundPtr = grd_initialized;
 		grd_initialized = true;
@@ -255,13 +272,17 @@ cluster_lms_get_shard_master_generation(void)
  * primitive-equivalent;  the real headers are not pulled in. */
 bool cluster_enabled = false;
 int cluster_grd_rebuild_timeout_ms = 5000;
+bool cluster_join_remaster_enabled = false; /* spec-5.16 L104 — lmon_tick GUC ref */
 volatile sig_atomic_t cluster_grd_redeclare_pending = false;
 int MyProcPid = 0;
 
+/* spec-5.16 — settable so the join-fence suite can drive arm/observe epochs.
+ * Default 0 keeps every pre-5.16 test unchanged. */
+static uint64 ut_mock_epoch = 0;
 uint64
 cluster_epoch_get_current(void)
 {
-	return 0;
+	return ut_mock_epoch;
 }
 
 /*
@@ -275,6 +296,27 @@ int
 cluster_gcs_lookup_master(BufferTag tag pg_attribute_unused())
 {
 	return 0;
+}
+/* spec-5.16 L104 — cluster_grd.c now references these (join fence predicates).
+ * Settable so the join-fence suite can drive a specific static home + member
+ * set.  Defaults (static master 0, all members) keep pre-5.16 tests unchanged. */
+static int ut_mock_static_master = 0;
+int
+cluster_gcs_lookup_master_static(BufferTag tag pg_attribute_unused())
+{
+	return ut_mock_static_master;
+}
+/* ut_member_mask < 0 (default) means "all declared nodes are members";
+ * otherwise a node is a member iff (ut_member_mask >> node) & 1. */
+static int ut_member_mask = -1;
+bool
+cluster_membership_is_member(int32 node_id)
+{
+	if (ut_member_mask < 0)
+		return true;
+	if (node_id < 0 || node_id >= 31)
+		return false;
+	return ((ut_member_mask >> node_id) & 1) != 0;
 }
 void
 cluster_gcs_block_send_redeclare(BufferTag tag pg_attribute_unused(),
@@ -3211,6 +3253,347 @@ UT_TEST(test_5_8_d1e_u4b_convert_waiter_carries_wait_seq)
 }
 
 
+/* ============================================================
+ * spec-5.16 — online node-join GRD/PCM remaster (D7 unit suite).
+ *
+ *	Lives in this binary (rule 6.A low-risk deviation from the spec's
+ *	test_cluster_join_remaster.c name) to reuse the shmem-stub + mock-declared
+ *	+ epoch/membership/static-master mock harness — same precedent as the
+ *	spec-5.1b convert suite above.  These units prove the NEW 5.16 logic:
+ *	the membership-aware recompute (U1-U5), the PCM fence predicates + the
+ *	Hardening-v1.1 all-members view-rebuilt barrier (U10-U16).  The reused
+ *	mechanisms are covered elsewhere: U6 single-X reject = cluster_pcm_lock
+ *	block re-declare apply + cluster_tap t/326 L9; U7 default-deny = the GES
+ *	result-enum invariant test above; U8 episode-epoch coherence / U9 publish-
+ *	before-signal = the spec-4.6 failure-FSM tests above + t/326; the multi-
+ *	node no-double-grant / gate-open / master-side / pre-MEMBER e2e are the
+ *	t/326 ship-blockers (L8/L11/L12/L13).
+ * ============================================================ */
+
+/* Build a uint8[16] node bitmap from a small node list. */
+static void
+ut_jr_build_bitmap(uint8 *bm, const int *nodes, int n)
+{
+	int i;
+
+	memset(bm, 0, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
+	for (i = 0; i < n; i++)
+		bm[nodes[i] >> 3] |= (uint8)(1u << (nodes[i] & 7));
+}
+
+/* 3-node declared {0,1,2} fixture with a home-based master map. */
+static void
+ut_jr_setup_3node(void)
+{
+	int32 nodes3[] = { 0, 1, 2 };
+
+	ut_mock_epoch = 0;
+	ut_member_mask = -1;	  /* all members */
+	ut_mock_static_master = 0;
+	ut_reset_grd_shmem(); /* clean fence / recovery_done_epoch / direction */
+	cluster_grd_shmem_init();
+	set_mock_declared(3, nodes3);
+	cluster_grd_master_map_init();
+}
+
+/* U1 — recompute moves the joiner's home shards back from the survivor. */
+UT_TEST(test_jr_u1_recompute_moves_joiner_home)
+{
+	uint8 active[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	int all3[3] = { 0, 1, 2 };
+	uint64 dead_n1[2] = { 0, 0 };
+	uint32 moved_away;
+	uint32 moved_back;
+	int i;
+
+	ut_jr_setup_3node();
+
+	/* node 1 leaves: its home shards (i%3==1) move to survivors {0,2}. */
+	dead_n1[0] = (uint64)1 << 1;
+	moved_away = cluster_grd_master_map_remaster(dead_n1, 5);
+	UT_ASSERT(moved_away > 0);
+
+	/* node 1 rejoins: recompute with all members → home shards snap back to 1. */
+	ut_jr_build_bitmap(active, all3, 3);
+	moved_back = cluster_grd_master_map_recompute_for_membership(active, 6);
+
+	/* 4096 = 3*1365 + 1 → shards ≡ 1 (mod 3) count = 1365. */
+	UT_ASSERT_EQ(moved_back, (uint32)1365);
+	for (i = 0; i < PGRAC_GRD_SHARD_COUNT; i++) {
+		if ((i % 3) == 1)
+			UT_ASSERT_EQ(cluster_grd_shard_master(i), (int32)1);
+		else
+			UT_ASSERT_EQ(cluster_grd_shard_master(i), (int32)(i % 3));
+	}
+}
+
+/* U2 — pure-failure recompute is per-shard equivalent to the 4.6 remaster. */
+UT_TEST(test_jr_u2_equivalence_with_failure_remaster)
+{
+	int32 nodes3[] = { 0, 1, 2 };
+	uint8 active02[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	int nodes02[2] = { 0, 2 };
+	uint64 dead_n1[2] = { 0, 0 };
+	int32 remaster_map[PGRAC_GRD_SHARD_COUNT];
+	int i;
+
+	/* Path A: failure remaster of node 1. */
+	cluster_grd_shmem_init();
+	set_mock_declared(3, nodes3);
+	cluster_grd_master_map_init();
+	dead_n1[0] = (uint64)1 << 1;
+	(void)cluster_grd_master_map_remaster(dead_n1, 7);
+	for (i = 0; i < PGRAC_GRD_SHARD_COUNT; i++)
+		remaster_map[i] = cluster_grd_shard_master(i);
+
+	/* Path B: membership recompute with node 1 NOT a member (== dead). */
+	cluster_grd_shmem_init();
+	set_mock_declared(3, nodes3);
+	cluster_grd_master_map_init();
+	ut_jr_build_bitmap(active02, nodes02, 2);
+	(void)cluster_grd_master_map_recompute_for_membership(active02, 7);
+
+	for (i = 0; i < PGRAC_GRD_SHARD_COUNT; i++)
+		UT_ASSERT_EQ(cluster_grd_shard_master(i), remaster_map[i]);
+}
+
+/* U3 — idempotent: same membership snapshot re-run is a no-op. */
+UT_TEST(test_jr_u3_recompute_idempotent)
+{
+	uint8 active[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	int all3[3] = { 0, 1, 2 };
+	uint32 gen1;
+	uint32 moved2;
+
+	ut_jr_setup_3node();
+	ut_jr_build_bitmap(active, all3, 3);
+
+	(void)cluster_grd_master_map_recompute_for_membership(active, 6); /* already home — 0 moves */
+	gen1 = cluster_grd_shard_master_generation(1);
+	moved2 = cluster_grd_master_map_recompute_for_membership(active, 6);
+	UT_ASSERT_EQ(moved2, (uint32)0);
+	UT_ASSERT_EQ(cluster_grd_shard_master_generation(1), gen1);
+}
+
+/* U4 — scoped: only the joiner-home shards' generation bumps on rejoin. */
+UT_TEST(test_jr_u4_scoped_move_set)
+{
+	uint8 active[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	int all3[3] = { 0, 1, 2 };
+	uint64 dead_n1[2] = { 0, 0 };
+	uint32 gen0_before;
+	uint32 gen2_before;
+	uint32 gen0_after;
+	uint32 gen2_after;
+
+	ut_jr_setup_3node();
+	dead_n1[0] = (uint64)1 << 1;
+	(void)cluster_grd_master_map_remaster(dead_n1, 5);
+
+	/* shards 0 (home 0) and 2 (home 2) were never touched by node 1's leave. */
+	gen0_before = cluster_grd_shard_master_generation(0);
+	gen2_before = cluster_grd_shard_master_generation(2);
+
+	ut_jr_build_bitmap(active, all3, 3);
+	(void)cluster_grd_master_map_recompute_for_membership(active, 6);
+
+	gen0_after = cluster_grd_shard_master_generation(0);
+	gen2_after = cluster_grd_shard_master_generation(2);
+	/* non-joiner-home shards untouched by the rejoin recompute. */
+	UT_ASSERT_EQ(gen0_after, gen0_before);
+	UT_ASSERT_EQ(gen2_after, gen2_before);
+	/* joiner-home shard 1 moved back → its generation bumped. */
+	UT_ASSERT_EQ(cluster_grd_shard_master(1), (int32)1);
+}
+
+/* U5 — INV-R1: never remaster a shard to a non-member (joiner bit clear). */
+UT_TEST(test_jr_u5_inv_r1_non_member_gets_nothing)
+{
+	uint8 active02[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	int nodes02[2] = { 0, 2 };
+	int i;
+
+	ut_jr_setup_3node();
+	ut_jr_build_bitmap(active02, nodes02, 2); /* node 1 NOT a member */
+	(void)cluster_grd_master_map_recompute_for_membership(active02, 6);
+
+	for (i = 0; i < PGRAC_GRD_SHARD_COUNT; i++)
+		UT_ASSERT_NE(cluster_grd_shard_master(i), (int32)1);
+}
+
+/* U10 — GRD-off + PCM-on: the fence predicates are INDEPENDENT of any GRD
+ * master[] movement (bound to online_join via the armed epoch), so the PCM
+ * fence holds even when no recompute ran. */
+UT_TEST(test_jr_u10_pcm_fence_independent_of_grd_move)
+{
+	uint8 join1[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	int n1[1] = { 1 };
+	BufferTag tag;
+
+	memset(&tag, 0, sizeof(tag));
+	ut_jr_setup_3node();
+	ut_mock_epoch = 10;
+
+	/* Arm the fence for the rejoining node 1 — NO recompute / GRD move done. */
+	ut_jr_build_bitmap(join1, n1, 1);
+	cluster_grd_arm_join_pcm_fence(join1);
+
+	/* A block whose static home is the rejoiner is fenced... */
+	ut_mock_static_master = 1;
+	UT_ASSERT(cluster_grd_join_remaster_active_for_shard(tag));
+	UT_ASSERT(!cluster_grd_block_view_rebuilt(tag)); /* survivors not done yet */
+
+	/* ...a block whose home is a steady member is NOT fenced. */
+	ut_mock_static_master = 0;
+	UT_ASSERT(!cluster_grd_join_remaster_active_for_shard(tag));
+}
+
+/* U11 — scan-completion gate (join episode flavor of the 4.7 D2 gate). */
+UT_TEST(test_jr_u11_scan_completion_gate)
+{
+	fake_scan_nbuffers = 600;
+	grd_block_redeclare_step(20);
+	UT_ASSERT(!grd_block_redeclare_scan_complete(20));
+	grd_block_redeclare_step(20);
+	grd_block_redeclare_step(20);
+	grd_block_redeclare_step(20);
+	UT_ASSERT(grd_block_redeclare_scan_complete(20));
+	fake_scan_nbuffers = 0;
+}
+
+/* U12 — new shmem fields zeroed at init; in_progress flips on arm; the reply-
+ * status no-collision StaticAssert is enforced at compile time in the header. */
+UT_TEST(test_jr_u12_state_init_and_in_progress)
+{
+	uint8 join1[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	int n1[1] = { 1 };
+
+	ut_jr_setup_3node();
+	UT_ASSERT(!cluster_grd_join_remaster_in_progress()); /* NONE after init */
+
+	ut_mock_epoch = 10;
+	ut_jr_build_bitmap(join1, n1, 1);
+	cluster_grd_arm_join_pcm_fence(join1);
+	UT_ASSERT(cluster_grd_join_remaster_in_progress()); /* JOIN after arm */
+}
+
+/* U13 — gate-open ordering + Hardening v1.1: the fence lifts ONLY after EVERY
+ * member re-declared (all-members barrier), NOT after the joiner's own done. */
+UT_TEST(test_jr_u13_view_rebuilt_all_members_barrier)
+{
+	uint8 join1[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	int n1[1] = { 1 };
+	BufferTag tag;
+
+	memset(&tag, 0, sizeof(tag));
+	ut_jr_setup_3node();
+	ut_mock_epoch = 10;
+	ut_jr_build_bitmap(join1, n1, 1);
+	cluster_grd_arm_join_pcm_fence(join1);
+	ut_mock_static_master = 1; /* the rejoiner's home block */
+
+	/* Initially fenced: armed, nobody done. */
+	UT_ASSERT(cluster_grd_join_remaster_active_for_shard(tag));
+	UT_ASSERT(!cluster_grd_block_view_rebuilt(tag));
+
+	/* HARDENING v1.1 — the joiner (node 1) announcing its OWN trivial barrier
+	 * must NOT lift the fence: survivors 0 and 2 have not re-declared yet. */
+	cluster_grd_recovery_mark_peer_done(1, 10);
+	UT_ASSERT(!cluster_grd_block_view_rebuilt(tag));
+
+	/* One survivor done is still not enough. */
+	cluster_grd_recovery_mark_peer_done(0, 10);
+	UT_ASSERT(!cluster_grd_block_view_rebuilt(tag));
+
+	/* All members done → view rebuilt → fence lifts. */
+	cluster_grd_recovery_mark_peer_done(2, 10);
+	UT_ASSERT(cluster_grd_block_view_rebuilt(tag));
+}
+
+/* U14 — fence-arm sets fence epoch (monotonic-max) + fenced member scope. */
+UT_TEST(test_jr_u14_fence_arm_monotonic_and_scope)
+{
+	uint8 join1[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	int n1[1] = { 1 };
+	BufferTag tag;
+
+	memset(&tag, 0, sizeof(tag));
+	ut_jr_setup_3node();
+
+	ut_mock_epoch = 10;
+	ut_jr_build_bitmap(join1, n1, 1);
+	cluster_grd_arm_join_pcm_fence(join1);
+
+	/* A lower-epoch re-arm must NOT lower the fence epoch (monotonic-max):
+	 * marking members done at epoch 5 must leave the fence (epoch 10) unlifted. */
+	ut_mock_epoch = 5;
+	cluster_grd_arm_join_pcm_fence(join1);
+	ut_mock_static_master = 1;
+	cluster_grd_recovery_mark_peer_done(0, 5);
+	cluster_grd_recovery_mark_peer_done(1, 5);
+	cluster_grd_recovery_mark_peer_done(2, 5);
+	UT_ASSERT(!cluster_grd_block_view_rebuilt(tag)); /* 5 < fence epoch 10 */
+
+	/* Done at the real fence epoch lifts it. */
+	cluster_grd_recovery_mark_peer_done(0, 10);
+	cluster_grd_recovery_mark_peer_done(1, 10);
+	cluster_grd_recovery_mark_peer_done(2, 10);
+	UT_ASSERT(cluster_grd_block_view_rebuilt(tag));
+}
+
+/* U15 — master-side gate decision (home-block leg): deny while (active &&
+ * !view_rebuilt), allow once rebuilt.  The in_quorum / is_member legs and the
+ * envelope wiring are the t/326 L12 ship-blocker. */
+UT_TEST(test_jr_u15_master_side_gate_decision)
+{
+	uint8 join1[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	int n1[1] = { 1 };
+	BufferTag tag;
+	bool deny;
+
+	memset(&tag, 0, sizeof(tag));
+	ut_jr_setup_3node();
+	ut_mock_epoch = 10;
+	ut_jr_build_bitmap(join1, n1, 1);
+	cluster_grd_arm_join_pcm_fence(join1);
+	ut_mock_static_master = 1;
+
+	/* The gate's home-block leg: active_for_shard && !view_rebuilt. */
+	deny = cluster_grd_join_remaster_active_for_shard(tag)
+		   && !cluster_grd_block_view_rebuilt(tag);
+	UT_ASSERT(deny);
+
+	cluster_grd_recovery_mark_peer_done(0, 10);
+	cluster_grd_recovery_mark_peer_done(1, 10);
+	cluster_grd_recovery_mark_peer_done(2, 10);
+	deny = cluster_grd_join_remaster_active_for_shard(tag)
+		   && !cluster_grd_block_view_rebuilt(tag);
+	UT_ASSERT(!deny);
+}
+
+/* U16 — pre-MEMBER guard: the master-side gate denies whenever self is not a
+ * MEMBER (the CSSD-ALIVE-before-commit window, INV-R14). */
+UT_TEST(test_jr_u16_pre_member_guard)
+{
+	int saved = cluster_node_id;
+
+	ut_jr_setup_3node();
+	cluster_node_id = 0;
+
+	/* Self (node 0) NOT a member (nodes 1,2 are): is_member(self) == false → the
+	 * master-side gate's pre-MEMBER leg denies regardless of any fence/view. */
+	ut_member_mask = (1 << 1) | (1 << 2);
+	UT_ASSERT(!cluster_membership_is_member(cluster_node_id));
+
+	/* Once committed (self a member) the pre-MEMBER leg no longer denies. */
+	ut_member_mask = (1 << 0) | (1 << 1) | (1 << 2);
+	UT_ASSERT(cluster_membership_is_member(cluster_node_id));
+
+	ut_member_mask = -1;
+	cluster_node_id = saved;
+}
+
+
 int
 /* cppcheck-suppress constParameter
  * Reason: main() keeps the standard test harness signature used by the
@@ -3218,7 +3601,7 @@ int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
 	UT_PLAN(
-		61); /* prior 42; spec-5.3:+6; 5.5:+3; +1 release reclaim; 5.8 D1b:+4 (U2a-d); D1c:+2 (U3a-b); D1e:+2 (U4a-b); 5.9 Hardening:+1 (convert ABA) */
+		73); /* prior 42; spec-5.3:+6; 5.5:+3; +1 release reclaim; 5.8 D1b:+4 (U2a-d); D1c:+2 (U3a-b); D1e:+2 (U4a-b); 5.9 Hardening:+1 (convert ABA); spec-5.16:+12 (join-remaster U1-U5/U10-U16) */
 
 	UT_RUN(test_grd_clusterresid_size_16);
 	UT_RUN(test_grd_resid_encode_decode_roundtrip);
@@ -3300,6 +3683,20 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	/* spec-5.8 D1e — waiter wait_seq threaded into the WFG vertex (U4a-b). */
 	UT_RUN(test_5_8_d1e_u4a_request_waiter_carries_wait_seq);
 	UT_RUN(test_5_8_d1e_u4b_convert_waiter_carries_wait_seq);
+
+	/* spec-5.16 — online node-join GRD/PCM remaster (D7 unit suite). */
+	UT_RUN(test_jr_u1_recompute_moves_joiner_home);
+	UT_RUN(test_jr_u2_equivalence_with_failure_remaster);
+	UT_RUN(test_jr_u3_recompute_idempotent);
+	UT_RUN(test_jr_u4_scoped_move_set);
+	UT_RUN(test_jr_u5_inv_r1_non_member_gets_nothing);
+	UT_RUN(test_jr_u10_pcm_fence_independent_of_grd_move);
+	UT_RUN(test_jr_u11_scan_completion_gate);
+	UT_RUN(test_jr_u12_state_init_and_in_progress);
+	UT_RUN(test_jr_u13_view_rebuilt_all_members_barrier);
+	UT_RUN(test_jr_u14_fence_arm_monotonic_and_scope);
+	UT_RUN(test_jr_u15_master_side_gate_decision);
+	UT_RUN(test_jr_u16_pre_member_guard);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

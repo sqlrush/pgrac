@@ -50,6 +50,7 @@
 #include "cluster/cluster_advisory.h" /* spec-5.5 D8 — UL counters */
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_ges.h"
+#include "cluster/cluster_ges_reply_wait.h" /* cluster_ges_reply_wait_next_request_id (spec-5.16: node-global request_id) */
 #include "cluster/cluster_ges_mode.h" /* spec-5.3 D1 — ges_mode_convert_class for UPGRADE filter */
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_guc.h"
@@ -91,7 +92,6 @@ static pg_atomic_uint64 stub_s5_promote_count;
 static pg_atomic_uint64 stub_s6_release_count;
 static pg_atomic_uint64 stub_s7_cleanup_count;
 static pg_atomic_uint64 stub_local_fast_path_count;
-static pg_atomic_uint64 request_id_counter;
 static bool stub_counter_initialized = false;
 
 static inline void
@@ -105,7 +105,6 @@ ensure_counter_initialized(void)
 		pg_atomic_init_u64(&stub_s6_release_count, 0);
 		pg_atomic_init_u64(&stub_s7_cleanup_count, 0);
 		pg_atomic_init_u64(&stub_local_fast_path_count, 0);
-		pg_atomic_init_u64(&request_id_counter, 0);
 		stub_counter_initialized = true;
 	}
 }
@@ -121,7 +120,7 @@ fill_request_holder(ClusterLockAcquireRequest *req)
 
 	request_id = req->request_id;
 	if (request_id == 0)
-		request_id = pg_atomic_fetch_add_u64(&request_id_counter, 1) + 1;
+		request_id = cluster_ges_reply_wait_next_request_id();
 
 	req->request_id = request_id;
 	req->holder.node_id = (uint32)(cluster_node_id >= 0 ? cluster_node_id : 0);
@@ -1096,7 +1095,7 @@ cluster_grd_redeclare_all_registered(void)
 
 			cluster_grd_resid_encode(&locallock->tag.lock, &resid);
 
-			fresh_request_id = pg_atomic_fetch_add_u64(&request_id_counter, 1) + 1;
+			fresh_request_id = cluster_ges_reply_wait_next_request_id();
 			new_holder.node_id = old_holder.node_id;
 			new_holder.procno = old_holder.procno;
 			new_holder.cluster_epoch = cur_epoch;

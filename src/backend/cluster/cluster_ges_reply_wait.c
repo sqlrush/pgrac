@@ -42,6 +42,7 @@
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
 
+#include "cluster/cluster_ges.h" /* spec-5.16: GES_REPLY_OPCODE_GRANT (orphan tombstone) */
 #include "cluster/cluster_ges_reply_wait.h"
 #include "cluster/cluster_shmem.h"
 
@@ -65,6 +66,18 @@ typedef struct ClusterGesReplyWaitShared {
 	pg_atomic_uint64 reply_late_drop_count;	  /* HC17 late reply drops */
 	pg_atomic_uint64 release_ack_count;		  /* spec-2.23 D3 wire */
 	pg_atomic_uint64 sweep_deleted_count;	  /* timeout sweep total */
+	/*
+	 * spec-5.16 (Rule 8.A) — node-global request_id sequence.  The reply-wait HTAB
+	 * key is the 5-tuple {request_id, source, dest, opcode, epoch}; for that key to
+	 * be unique per in-flight request, request_id MUST be unique node-wide.  The
+	 * lock-acquire path historically used a *backend-local* counter, so every fresh
+	 * backend's first acquire reused request_id=1 — two such requests to the same
+	 * master/epoch collided on one key, which was masked only because entries were
+	 * short-lived (delete-on-timeout).  The orphan tombstone (long-lived) exposed
+	 * the collision (a fresh same-key insert hits found==true -> spurious fail-close).
+	 * Sourcing request_id from this node-global counter makes the key truly unique.
+	 */
+	pg_atomic_uint64 request_id_seq;
 } ClusterGesReplyWaitShared;
 
 static ClusterGesReplyWaitShared *reply_wait_state = NULL;
@@ -114,6 +127,7 @@ cluster_ges_reply_wait_shmem_init(void)
 		pg_atomic_init_u64(&reply_wait_state->reply_late_drop_count, 0);
 		pg_atomic_init_u64(&reply_wait_state->release_ack_count, 0);
 		pg_atomic_init_u64(&reply_wait_state->sweep_deleted_count, 0);
+		pg_atomic_init_u64(&reply_wait_state->request_id_seq, 0);
 	}
 
 	MemSet(&hctl, 0, sizeof(hctl));
@@ -130,16 +144,99 @@ cluster_ges_reply_wait_shmem_register(void)
 	cluster_shmem_register_region(&cluster_ges_reply_wait_region);
 }
 
+/*
+ * spec-5.16 (Rule 8.A) — hand out the next node-global request_id (never 0).
+ *
+ *	Used by the lock-acquire path (cluster_lock_acquire.c) so the reply-wait
+ *	5-tuple key is unique node-wide, never colliding across backends.  Before
+ *	shmem is attached (or on a non-cluster path that somehow asks), fall back to a
+ *	backend-local counter — that path creates no reply-wait entry, so per-backend
+ *	uniqueness is sufficient there and a 0 (sentinel) is never returned.
+ */
+uint64
+cluster_ges_reply_wait_next_request_id(void)
+{
+	static uint64 local_fallback = 0;
+
+	if (reply_wait_state == NULL)
+		return ++local_fallback;
+	return pg_atomic_fetch_add_u64(&reply_wait_state->request_id_seq, 1) + 1;
+}
+
 
 /* ============================================================
  * HTAB mutator / accessor API (HC17).
  * ============================================================ */
+
+/*
+ * spec-5.16 (orphan-grant, Rule 8.A) — reclaim one slot under table-full pressure
+ * by evicting the oldest ABANDONED tombstone.  The reply-wait table MUST always be
+ * able to admit a LIVE request: a tombstone is only an optimization that lets the
+ * waiter side auto-release a late orphan GRANT promptly, but the master-side P6
+ * sweep is the real orphan backstop (see cluster_ges.c ges_abandon_wait_or_release
+ * NOTES), so dropping a tombstone here at worst defers one orphan's cleanup to that
+ * backstop — strictly better than fail-closing a live request with "reply wait
+ * table full" (which is exactly what a node-leave burst would otherwise trigger,
+ * as every in-flight request to the departed master times out at once).  A live
+ * (non-abandoned) waiter is NEVER evicted — a backend is sleeping on its CV.
+ *
+ *	Caller holds reply_wait_state->lwlock EXCLUSIVE.  Returns true if a tombstone
+ *	was evicted (a slot is now free).  Two-pass (collect key, then HASH_REMOVE) to
+ *	avoid mutating the HTAB mid-iteration.
+ */
+static bool
+ges_reply_wait_evict_oldest_tombstone_locked(void)
+{
+	HASH_SEQ_STATUS scan;
+	GesReplyWaitEntry *entry;
+	GesReplyWaitKey victim_key;
+	TimestampTz oldest = 0;
+	bool have_victim = false;
+	bool found;
+
+	hash_seq_init(&scan, reply_wait_htab);
+	while ((entry = (GesReplyWaitEntry *)hash_seq_search(&scan)) != NULL) {
+		if (!entry->abandoned)
+			continue; /* live waiter — never evict */
+		if (!have_victim || entry->deadline < oldest) {
+			oldest = entry->deadline;
+			victim_key = entry->key;
+			have_victim = true;
+		}
+	}
+	if (!have_victim)
+		return false; /* table is full of live waiters — genuinely full */
+
+	(void)hash_search(reply_wait_htab, &victim_key, HASH_REMOVE, &found);
+	if (found) {
+		pg_atomic_fetch_sub_u64(&reply_wait_state->reply_wait_table_active, 1);
+		pg_atomic_fetch_add_u64(&reply_wait_state->sweep_deleted_count, 1);
+	}
+	return true;
+}
+
+/* spec-5.16 — one-shot LOG when the reply-wait table first sweeps under pressure
+ * (Rule 17:  capacity / degradation event → counter (sweep_deleted_count) +
+ * LOG-once, not a per-event WARNING flood).  Backend-local flag. */
+static void
+ges_reply_wait_log_pressure_once(void)
+{
+	static bool logged = false;
+
+	if (logged)
+		return;
+	logged = true;
+	ereport(LOG, (errmsg_internal("cluster GES reply-wait table full; evicting orphan tombstones"
+								  " to admit live requests (master-side P6 sweep remains the orphan"
+								  " backstop)")));
+}
 
 GesReplyWaitEntry *
 cluster_ges_reply_wait_insert(const GesReplyWaitKey *key, TimestampTz deadline)
 {
 	GesReplyWaitEntry *entry;
 	bool found;
+	bool evicted = false;
 
 	Assert(key != NULL);
 	if (reply_wait_state == NULL || reply_wait_htab == NULL)
@@ -147,16 +244,32 @@ cluster_ges_reply_wait_insert(const GesReplyWaitKey *key, TimestampTz deadline)
 
 	LWLockAcquire(&reply_wait_state->lwlock, LW_EXCLUSIVE);
 
-	/* Cap check — fail-closed at SQLSTATE 53R71 from caller. */
+	/*
+	 * Cap check.  When the table is full, first try to reclaim a slot by evicting
+	 * an orphan tombstone (spec-5.16) — a live request must never be fail-closed
+	 * (SQLSTATE 53R71) because opportunistic tombstones filled the table.  Only if
+	 * no tombstone can be evicted (the table is genuinely full of live waiters) do
+	 * we fail closed.
+	 */
 	if (hash_get_num_entries(reply_wait_htab) >= CLUSTER_GES_REPLY_WAIT_DEFAULT_MAX) {
-		LWLockRelease(&reply_wait_state->lwlock);
-		return NULL;
+		if (!ges_reply_wait_evict_oldest_tombstone_locked()) {
+			LWLockRelease(&reply_wait_state->lwlock);
+			return NULL;
+		}
+		evicted = true;
 	}
 
 	entry = (GesReplyWaitEntry *)hash_search(reply_wait_htab, key, HASH_ENTER_NULL, &found);
 	if (entry == NULL) {
-		LWLockRelease(&reply_wait_state->lwlock);
-		return NULL;
+		/* HTAB internal slots exhausted despite the count check — evict + retry once. */
+		if (ges_reply_wait_evict_oldest_tombstone_locked()) {
+			evicted = true;
+			entry = (GesReplyWaitEntry *)hash_search(reply_wait_htab, key, HASH_ENTER_NULL, &found);
+		}
+		if (entry == NULL) {
+			LWLockRelease(&reply_wait_state->lwlock);
+			return NULL;
+		}
 	}
 	if (found) {
 		/*
@@ -173,10 +286,16 @@ cluster_ges_reply_wait_insert(const GesReplyWaitKey *key, TimestampTz deadline)
 	entry->reply_opcode = 0;
 	entry->deadline = deadline;
 	entry->ready = false;
+	entry->abandoned = false;
 
 	pg_atomic_fetch_add_u64(&reply_wait_state->reply_wait_table_active, 1);
 
 	LWLockRelease(&reply_wait_state->lwlock);
+
+	/* LOG-once outside the lock (Rule 17 — no log I/O under the LWLock). */
+	if (evicted)
+		ges_reply_wait_log_pressure_once();
+
 	return entry;
 }
 
@@ -211,6 +330,86 @@ cluster_ges_reply_wait_wake(GesReplyWaitEntry *entry, uint32 reply_opcode, uint3
 	pg_write_barrier();
 	entry->ready = true;
 	ConditionVariableBroadcast(&entry->cv);
+}
+
+GesReplyDeliverResult
+cluster_ges_reply_wait_deliver(const GesReplyWaitKey *key, uint32 reply_opcode,
+							   uint32 reject_reason)
+{
+	GesReplyWaitEntry *entry;
+	GesReplyWaitEntry *woke = NULL;
+	GesReplyDeliverResult result;
+
+	if (reply_wait_state == NULL || reply_wait_htab == NULL)
+		return GES_REPLY_DELIVER_NO_WAITER;
+
+	LWLockAcquire(&reply_wait_state->lwlock, LW_EXCLUSIVE);
+	entry = (GesReplyWaitEntry *)hash_search(reply_wait_htab, key, HASH_FIND, NULL);
+	if (entry == NULL) {
+		/* No entry: the waiter already succeeded and deleted it (this also covers a
+		 * retransmit-duplicate GRANT for that succeeded request). */
+		result = GES_REPLY_DELIVER_NO_WAITER;
+	} else if (entry->abandoned) {
+		/* Tombstone: the waiter gave up at the GES timeout.  A GRANT landing here is
+		 * an ORPHAN — remove the tombstone and let the caller release it.  A REJECT
+		 * grants nothing, so just drop it. */
+		bool found;
+
+		result = (reply_opcode == (uint32)GES_REPLY_OPCODE_GRANT) ? GES_REPLY_DELIVER_ORPHAN
+																  : GES_REPLY_DELIVER_NO_WAITER;
+		(void)hash_search(reply_wait_htab, key, HASH_REMOVE, &found);
+		if (found)
+			pg_atomic_fetch_sub_u64(&reply_wait_state->reply_wait_table_active, 1);
+	} else {
+		/* Live waiter: store the verdict + ready under the lock; broadcast the CV
+		 * AFTER releasing it (the waiter re-checks `ready`, so the broadcast is only a
+		 * wakeup hint — mirrors the lock-free cluster_ges_reply_wait_wake contract). */
+		entry->reply_opcode = reply_opcode;
+		entry->reject_reason = reject_reason;
+		pg_write_barrier();
+		entry->ready = true;
+		woke = entry;
+		result = GES_REPLY_DELIVER_WOKE;
+	}
+	LWLockRelease(&reply_wait_state->lwlock);
+
+	if (woke != NULL)
+		ConditionVariableBroadcast(&woke->cv);
+	return result;
+}
+
+bool
+cluster_ges_reply_wait_mark_abandoned(const GesReplyWaitKey *key, TimestampTz tombstone_deadline)
+{
+	GesReplyWaitEntry *entry;
+	bool was_granted = false;
+
+	if (reply_wait_state == NULL || reply_wait_htab == NULL)
+		return false;
+
+	LWLockAcquire(&reply_wait_state->lwlock, LW_EXCLUSIVE);
+	entry = (GesReplyWaitEntry *)hash_search(reply_wait_htab, key, HASH_FIND, NULL);
+	if (entry != NULL) {
+		if (entry->ready && entry->reply_opcode == (uint32)GES_REPLY_OPCODE_GRANT) {
+			/* A GRANT raced just ahead of this timeout — the master already granted
+			 * us.  Remove the entry; the caller (backend context) releases the
+			 * unwanted grant itself. */
+			bool found;
+
+			was_granted = true;
+			(void)hash_search(reply_wait_htab, key, HASH_REMOVE, &found);
+			if (found)
+				pg_atomic_fetch_sub_u64(&reply_wait_state->reply_wait_table_active, 1);
+		} else {
+			/* Keep as a tombstone so a later GRANT is recognized as an orphan and
+			 * auto-released by the reply handler.  Re-arm the deadline to the short
+			 * TTL so the timeout sweep reaps it if no grant ever lands. */
+			entry->abandoned = true;
+			entry->deadline = tombstone_deadline;
+		}
+	}
+	LWLockRelease(&reply_wait_state->lwlock);
+	return was_granted;
 }
 
 void
@@ -249,7 +448,18 @@ cluster_ges_reply_wait_sweep_timeout(TimestampTz now)
 
 	hash_seq_init(&scan, reply_wait_htab);
 	while ((entry = (GesReplyWaitEntry *)hash_seq_search(&scan)) != NULL) {
-		if (entry->deadline != 0 && entry->deadline <= now) {
+		/*
+		 * spec-5.16 (orphan-grant, Rule 8.A) — reclaim ONLY abandoned tombstones,
+		 * never a live waiter whose deadline merely elapsed.  A live (non-abandoned)
+		 * waiter owns its own entry while it sleeps on entry->cv; it processes its
+		 * deadline itself (cluster_ges.c ges_send_request_opcode_and_wait caps the
+		 * CV sleep at the remaining time, then deletes or tombstones).  Sweeping a
+		 * live waiter's entry here would HASH_REMOVE it out from under a sleeping
+		 * backend and let the freed slot be reused — a use-after-reuse race on the
+		 * CV.  A tombstone, by contrast, is set ONLY after its backend has already
+		 * returned (no one sleeps on it), so reclaiming it is race-free.
+		 */
+		if (entry->abandoned && entry->deadline != 0 && entry->deadline <= now) {
 			if (n_victims < (int)lengthof(victim_keys))
 				victim_keys[n_victims++] = entry->key;
 		}

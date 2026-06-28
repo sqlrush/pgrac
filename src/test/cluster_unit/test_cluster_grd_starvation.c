@@ -258,6 +258,7 @@ cluster_lms_get_shard_master_generation(void)
  * primitive-equivalent;  the real headers are not pulled in. */
 bool cluster_enabled = false;
 int cluster_grd_rebuild_timeout_ms = 5000;
+bool cluster_join_remaster_enabled = false; /* spec-5.16 L104 — lmon_tick GUC ref */
 volatile sig_atomic_t cluster_grd_redeclare_pending = false;
 int MyProcPid = 0;
 
@@ -278,6 +279,17 @@ int
 cluster_gcs_lookup_master(BufferTag tag pg_attribute_unused())
 {
 	return 0;
+}
+/* spec-5.16 L104 — cluster_grd.c now references these (join fence predicates). */
+int
+cluster_gcs_lookup_master_static(BufferTag tag pg_attribute_unused())
+{
+	return 0;
+}
+bool
+cluster_membership_is_member(int32 node_id pg_attribute_unused())
+{
+	return true;
 }
 void
 cluster_gcs_block_send_redeclare(BufferTag tag pg_attribute_unused(),

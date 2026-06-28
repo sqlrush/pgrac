@@ -565,6 +565,10 @@ extern bool cluster_write_fence_verify_durable(uint64 required_epoch);
  *	cold-admin; no online rejoin in Stage 4).  Enforcement off -> false.
  */
 extern bool cluster_write_fence_startup_self_check(void);
+/* spec-5.16 (3-node rejoin) — a self-fenced node un-fences when its own durable
+ * quorum-majority COMMITTED join marker (admitted_epoch) is newer than the fence
+ * it is under (RC-5 supersede for the write-fence; coordinator-authored, safe). */
+extern void cluster_write_fence_supersede_by_admit(uint64 admitted_epoch);
 
 /* D7 observability counter accessors (cluster_debug 'write_fence' category). */
 extern uint64 cluster_write_fence_get_hot_gate_blocked(void);

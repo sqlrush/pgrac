@@ -829,7 +829,7 @@ cluster_ges_reply_handler(const ClusterICEnvelope *env, const void *payload)
 	 */
 	{
 		GesReplyWaitKey key;
-		GesReplyWaitEntry *entry;
+		GesReplyDeliverResult dr;
 
 		memset(&key, 0, sizeof(key));
 		key.request_id
@@ -839,8 +839,10 @@ cluster_ges_reply_handler(const ClusterICEnvelope *env, const void *payload)
 		key.request_opcode = rep->reply_for_opcode;
 		key.cluster_epoch = holder_epoch;
 
-		entry = cluster_ges_reply_wait_lookup(&key);
-		if (entry == NULL) {
+		/* Atomic deliver (lookup + act under the HTAB lock) so a tombstone GRANT is
+		 * recognized as an orphan race-free against the waiter's timeout. */
+		dr = cluster_ges_reply_wait_deliver(&key, rep->opcode, rep->reject_reason);
+		if (dr == GES_REPLY_DELIVER_NO_WAITER) {
 			cluster_ges_inc_reply_late_drop();
 			ereport(DEBUG2,
 					(errmsg_internal("cluster_ges_reply: late reply (no waiter) "
@@ -848,8 +850,37 @@ cluster_ges_reply_handler(const ClusterICEnvelope *env, const void *payload)
 									 key.request_id, rep->reply_for_opcode, env->source_node_id)));
 			return;
 		}
+		if (dr == GES_REPLY_DELIVER_ORPHAN) {
+			/*
+			 * spec-5.16 (P0, Rule 8.A) — orphan-grant auto-release.  The master popped
+			 * + granted a waiter this node had already abandoned at the bounded GES
+			 * timeout (its reply-wait entry is a tombstone, not deleted).  Left alone
+			 * the master would count US as a live holder — a phantom holder that blocks
+			 * every later acquire of the key (the requester's retry conflicts with its
+			 * own orphan; surfaced by spec-5.16 t/326 across a rejoin transient).  The
+			 * existing master-side pop-guard/P6 only reaps a waiter whose owner NODE is
+			 * dead; a timed-out-but-alive requester needs this requester-side undo.
+			 * Send a fire-and-forget RELEASE with the echoed holder tuple so the
+			 * master's release-drain removes the phantom holder (idempotent — a
+			 * duplicate/retransmitted orphan GRANT finds the tombstone already gone and
+			 * is dropped as NO_WAITER).
+			 */
+			GesRequestPayload rel;
 
-		cluster_ges_reply_wait_wake(entry, rep->opcode, rep->reject_reason);
+			cluster_ges_inc_reply_late_drop();
+			memset(&rel, 0, sizeof(rel));
+			rel.opcode = GES_REQ_OPCODE_RELEASE;
+			rel.holder_node_id = rep->holder_node_id;
+			rel.holder_procno = rep->holder_procno;
+			rel.holder_cluster_epoch_lo = rep->holder_cluster_epoch_lo;
+			rel.holder_cluster_epoch_hi = rep->holder_cluster_epoch_hi;
+			rel.holder_request_id_lo = rep->holder_request_id_lo;
+			rel.holder_request_id_hi = rep->holder_request_id_hi;
+			memcpy(rel.resid, rep->resid, sizeof(rel.resid));
+			cluster_grd_outbound_enqueue_cleanup_release(env->source_node_id, &rel, sizeof(rel));
+			return;
+		}
+		/* GES_REPLY_DELIVER_WOKE — verdict delivered to the live waiter. */
 	}
 }
 
@@ -1421,6 +1452,68 @@ cluster_ges_reply_defer_count(void)
  * ============================================================ */
 
 /*
+ * spec-5.16 (orphan-grant, Rule 8.A) — bounded tombstone lifetime for an abandoned
+ * reply-wait entry.  Long enough to catch the orphan GRANT (it arrives when the
+ * current holder releases the key) without lingering in the table; the master-side
+ * P6 sweep is the backstop for a holder that releases later than this.
+ */
+#define GES_ORPHAN_TOMBSTONE_TTL_MS 30000
+
+/*
+ * spec-5.16 — on a bounded GES timeout, abandon the reply-wait entry as a tombstone
+ * (so a late orphan GRANT is auto-released by the reply handler) instead of deleting
+ * it.  If a GRANT raced just ahead of this timeout, release the unwanted grant here
+ * (backend context).  `req` carries the holder tuple the master will match.
+ */
+static void
+ges_abandon_wait_or_release(const GesReplyWaitKey *key, const GesRequestPayload *req, int32 master,
+							uint32 send_opcode)
+{
+	TimestampTz tombstone;
+
+	/*
+	 * A lock-acquiring REQUEST *or* REQUEST_NOWAIT creates a master-side holder on
+	 * GRANT that can be orphaned by a timeout: NOWAIT is grant-or-reject, but a
+	 * granted NOWAIT still records a holder, and if the reply is delayed past the
+	 * requester's bounded wire round-trip (master work queue backed up) the late
+	 * GRANT lands on a missing waiter -> phantom holder, identical to REQUEST.  So
+	 * both opcodes ride the tombstone + auto-release path.  REDECLARE (and any
+	 * other opcode on this send-and-wait body) rebinds idempotently and creates no
+	 * new holder, so a tombstone + auto-release would be wrong — just delete those.
+	 */
+	if (send_opcode != (uint32)GES_REQ_OPCODE_REQUEST
+		&& send_opcode != (uint32)GES_REQ_OPCODE_REQUEST_NOWAIT) {
+		cluster_ges_reply_wait_delete(key);
+		return;
+	}
+
+	/*
+	 * spec-5.16 (orphan-grant, Rule 8.A) — a DEAD master sends no further grants,
+	 * and any grant it handed out before dying is reclaimed by the fail-stop
+	 * remaster (the dead node's GRD/GES holder state is discarded on the epoch
+	 * advance, and survivors rebuild the resource).  So an abandoned REQUEST to a
+	 * DEAD master can never leave a lingering orphan holder -> delete the entry
+	 * outright rather than keep a tombstone.  This also bounds tombstone growth
+	 * during a leave / fail-stop reconfig, where every in-flight request to the
+	 * departed master times out at once.  SUSPECTED is NOT treated as DEAD (it may
+	 * recover and grant late) — those keep the tombstone, matching the dead-master-
+	 * native guard's discipline at the call site.
+	 */
+	if (cluster_cssd_get_peer_state(master) == CLUSTER_CSSD_PEER_DEAD) {
+		cluster_ges_reply_wait_delete(key);
+		return;
+	}
+
+	tombstone = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), GES_ORPHAN_TOMBSTONE_TTL_MS);
+	if (cluster_ges_reply_wait_mark_abandoned(key, tombstone)) {
+		GesRequestPayload rel = *req;
+
+		rel.opcode = GES_REQ_OPCODE_RELEASE;
+		cluster_grd_outbound_enqueue_cleanup_release((uint32)master, &rel, sizeof(rel));
+	}
+}
+
+/*
  * spec-4.6 D3 — shared body for REQUEST and REDECLARE send-and-wait.
  *	Both opcodes ride the identical GesRequestPayload + retransmit +
  *	5-tuple reply-wait machinery;  only the opcode byte differs (and
@@ -1773,7 +1866,7 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 		} else {
 			TimestampTz now = GetCurrentTimestamp();
 			if (now >= deadline) {
-				cluster_ges_reply_wait_delete(&key);
+				ges_abandon_wait_or_release(&key, &req, master, send_opcode);
 				ConditionVariableCancelSleep();
 				return GES_REJECT_REASON_TIMEOUT;
 			}
@@ -1800,7 +1893,7 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 		}
 
 		if (!perpetual && max_attempts > 0 && attempt > max_attempts) {
-			cluster_ges_reply_wait_delete(&key);
+			ges_abandon_wait_or_release(&key, &req, master, send_opcode);
 			ConditionVariableCancelSleep();
 			return GES_REJECT_REASON_TIMEOUT;
 		}

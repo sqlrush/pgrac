@@ -44,6 +44,7 @@
 #include "cluster/cluster_lms.h"		 /* spec-4.6 D2 — Q3-C wire routing token */
 #include "cluster/cluster_pcm_lock.h"	 /* spec-2.36 HC124 pending_x node-dead cleanup */
 #include "cluster/cluster_gcs.h"		 /* spec-4.7 D2 — cluster_gcs_lookup_master */
+#include "cluster/cluster_membership.h"	 /* spec-5.16 D1 — cluster_membership_is_member */
 #include "cluster/cluster_gcs_block.h"	 /* spec-4.7 D2 — block re-declare scan + send */
 #include "cluster/cluster_signal.h"
 #include "cluster/cluster_shmem.h"
@@ -628,6 +629,17 @@ cluster_grd_shmem_init(void)
 		pg_atomic_init_u64(&cluster_grd_state->block_path_failclosed_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->unaffected_holder_survived_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->stale_holder_swept_count, 0);
+
+		/* spec-5.16 D2/D3b/D5 — online-join remaster fence + counters. */
+		pg_atomic_init_u64(&cluster_grd_state->join_pcm_fence_epoch, 0);
+		for (i = 0; i < (CLUSTER_MAX_NODES + 63) / 64; i++)
+			pg_atomic_init_u64(&cluster_grd_state->join_pcm_fenced_member[i], 0);
+		pg_atomic_init_u32(&cluster_grd_state->recovery_direction, (uint32)GRD_REMASTER_DIR_NONE);
+		pg_atomic_init_u64(&cluster_grd_state->join_remaster_started_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->join_remaster_done_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->join_shards_remastered_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->join_block_views_rebuilt_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->join_block_recovering_failclosed_count, 0);
 	}
 
 	/* spec-2.15 v0.4 P1.1:  entry HTAB allocation gated on GUC.  GUC=0
@@ -1051,6 +1063,334 @@ cluster_grd_master_map_remaster(const uint64 *dead_bitmap, uint64 reconfig_epoch
 }
 
 /*
+ * join_member_bitmap_test -- spec-5.16 D1 helper.
+ *
+ *	Test bit `node_id` in a CLUSTER_MAX_NODES-bit bitmap stored as uint8[16]
+ *	(the reconfig dead/join bitmap shape, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES).
+ */
+static inline bool
+join_member_bitmap_test(const uint8 *bm, int32 node_id)
+{
+	if (node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return false;
+	if ((node_id >> 3) >= CLUSTER_RECONFIG_DEAD_BITMAP_BYTES)
+		return false;
+	return (bm[node_id >> 3] & (uint8)(1u << (node_id & 7))) != 0;
+}
+
+/*
+ * grd_build_membership_lists -- spec-5.16 D1/D2 helper.
+ *
+ *	Build the declared-node list (ascending scan order, same as master_map_init
+ *	/ remaster) and its MEMBER sublist from an accepted membership snapshot
+ *	(uint8[16]).  Both arrays are sized CLUSTER_MAX_NODES;  *declared_count /
+ *	*member_count receive the populated lengths.
+ */
+static void
+grd_build_membership_lists(const uint8 *active_member, int32 *declared, int *declared_count,
+						   int32 *members, int *member_count)
+{
+	int i;
+
+	*declared_count = 0;
+	*member_count = 0;
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		if (cluster_conf_lookup_node(i) == NULL)
+			continue;
+		declared[(*declared_count)++] = i;
+		if (join_member_bitmap_test(active_member, i))
+			members[(*member_count)++] = i;
+	}
+}
+
+/*
+ * grd_membership_desired_master -- spec-5.16 D1/D2 helper (SINGLE SOURCE).
+ *
+ *	The deterministic membership-desired master of shard `shard`:  its static
+ *	home if the home is a member, else the deterministic survivor (the same
+ *	survivor[i%n] formula the failure remaster uses → U2 equivalence).  Used by
+ *	BOTH the WAIT_EPOCH freeze predicate AND the recompute apply, so freeze and
+ *	move can never diverge (INV-R4 freeze-before-move).  Returns -1 if there is
+ *	no member (defensive; caller must not freeze/move then).
+ */
+static int32
+grd_membership_desired_master(const uint8 *active_member, const int32 *declared, int declared_count,
+							  const int32 *members, int member_count, int shard)
+{
+	int32 home;
+
+	if (declared_count <= 0 || member_count <= 0)
+		return -1;
+	home = declared[shard % declared_count];
+	if (join_member_bitmap_test(active_member, home))
+		return home;
+	return members[shard % member_count];
+}
+
+/*
+ * grd_build_active_member_bitmap -- spec-5.16 D2 helper.
+ *
+ *	Project the accepted MEMBER set into a uint8[16] bitmap from the 5.15
+ *	membership SSOT (cluster_membership_is_member, INV-J8) — NEVER ad-hoc CSSD
+ *	peer_state (INV-R3).  By the time a JOIN_COMMITTED episode reaches
+ *	WAIT_EPOCH the joiner is already MEMBER on every node (5.15 D4 apply).
+ */
+static void
+grd_build_active_member_bitmap(uint8 *out /* [CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] */)
+{
+	int i;
+
+	memset(out, 0, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		if (cluster_conf_lookup_node(i) == NULL)
+			continue;
+		if (cluster_membership_is_member(i))
+			out[i >> 3] |= (uint8)(1u << (i & 7));
+	}
+}
+
+/*
+ * cluster_grd_master_map_recompute_for_membership -- spec-5.16 D1.
+ *
+ *	Membership-aware deterministic recompute (JOIN direction only).  See
+ *	cluster_grd.h for the full contract.  Parallel to cluster_grd_master_map_
+ *	remaster (Q3=A);  the shipped failure-driven function is NOT touched.  Join
+ *	moves the joiner's home shards back from the survivor that held them in its
+ *	absence;  a pure failure scenario (no home revival) is per-shard equivalent
+ *	to the old function (U2), because the steady-state map is home-based.
+ */
+uint32
+cluster_grd_master_map_recompute_for_membership(const uint8 *active_member, uint64 epoch)
+{
+	int32 declared[CLUSTER_MAX_NODES];
+	int32 members[CLUSTER_MAX_NODES];
+	int declared_count = 0;
+	int member_count = 0;
+	uint32 moved = 0;
+	int i;
+
+	Assert(cluster_grd_state != NULL);
+
+	if (active_member == NULL)
+		return 0;
+	if (pg_atomic_read_u32(&cluster_grd_state->master_map_initialized) == 0)
+		return 0; /* no map yet — nothing to recompute */
+
+	grd_build_membership_lists(active_member, declared, &declared_count, members, &member_count);
+	if (declared_count <= 0)
+		return 0;
+	if (member_count <= 0) {
+		/*
+		 * Total-membership-empty:  fail-closed precondition (never reassign a
+		 * shard to nobody).  Unreachable in practice — self is always a member
+		 * when this runs — so this is defensive only (INV-R1).
+		 */
+		return 0;
+	}
+
+	for (i = 0; i < PGRAC_GRD_SHARD_COUNT; i++) {
+		int32 desired = grd_membership_desired_master(active_member, declared, declared_count,
+													  members, member_count, i);
+		uint32 cur;
+
+		if (desired < 0)
+			continue;
+		cur = pg_atomic_read_u32(&cluster_grd_state->master[i]);
+		if ((int32)cur != desired) {
+			pg_atomic_write_u32(&cluster_grd_state->master[i], (uint32)desired);
+			pg_atomic_fetch_add_u32(&cluster_grd_state->master_generation[i], 1);
+			moved++;
+		}
+	}
+
+	if (moved > 0) {
+		pg_atomic_write_u64(&cluster_grd_state->reconfig_remaster_epoch, epoch);
+		pg_atomic_fetch_add_u64(&cluster_grd_state->join_shards_remastered_count, moved);
+		pg_atomic_fetch_add_u64(&cluster_grd_state->master_map_refresh_count, 1);
+		ereport(DEBUG1,
+				(errmsg_internal("cluster_grd_master_map_recompute_for_membership: moved %u "
+								 "shards to membership (epoch " UINT64_FORMAT ")",
+								 moved, epoch)));
+	}
+	return moved;
+}
+
+/*
+ * cluster_grd_arm_join_pcm_fence -- spec-5.16 D3b (INV-R13).
+ *
+ *	Arm the joiner-home PCM block fence SYNCHRONOUSLY (NEVER from the LMON
+ *	tick — the async tick is structurally later than the 5.15 write-gate open,
+ *	so a fence armed there would leave a "MEMBER-writable but unfenced" window).
+ *	Sets join_pcm_fenced_member (the rejoining set) THEN raises join_pcm_fence_
+ *	epoch (a write barrier between, so a reader that sees the raised epoch sees
+ *	the member set).  Monotonic-max:  a later join re-arms higher;  re-arm of
+ *	the same epoch is an idempotent no-op (INV-R12).
+ *
+ *	spec-5.16 Hardening v1.3 (Rule 8.A) — the member set is OR-accumulated, never
+ *	overwritten.  Two arms race on the rejoining node: qvotec (note_self_admitted,
+ *	{self}) and the LMON tick ({evt.join_bitmap} for a multi-joiner episode).  A
+ *	plain write would let the {self} arm zero a co-joiner's bit, UNDER-fencing its
+ *	home block -> cold-serve -> 8.A double-grant.  OR makes concurrent arms
+ *	accumulate the union regardless of interleaving (no under-fence).  A stale bit
+ *	carried from a completed prior episode only OVER-fences (the block waits for
+ *	this epoch's view_rebuilt barrier, then lifts) — benign liveness, never a
+ *	correctness fault, so no per-bit clear is required here.
+ */
+void
+cluster_grd_arm_join_pcm_fence(const uint8 *rejoining_set)
+{
+	uint64 epoch;
+	uint64 prev;
+	int w;
+
+	if (cluster_grd_state == NULL || rejoining_set == NULL)
+		return;
+
+	epoch = cluster_epoch_get_current();
+
+	for (w = 0; w < (CLUSTER_MAX_NODES + 63) / 64; w++) {
+		uint64 word = 0;
+		int j;
+
+		for (j = 0; j < 8; j++) {
+			int byte_idx = w * 8 + j;
+
+			if (byte_idx < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES)
+				word |= ((uint64)rejoining_set[byte_idx]) << (8 * j);
+		}
+		pg_atomic_fetch_or_u64(&cluster_grd_state->join_pcm_fenced_member[w], word);
+	}
+	pg_write_barrier(); /* member set visible before the epoch is raised */
+
+	prev = pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_epoch);
+	while (epoch > prev) {
+		if (pg_atomic_compare_exchange_u64(&cluster_grd_state->join_pcm_fence_epoch, &prev, epoch))
+			break;
+	}
+	pg_atomic_write_u32(&cluster_grd_state->recovery_direction, (uint32)GRD_REMASTER_DIR_JOIN);
+}
+
+/*
+ * cluster_grd_join_remaster_in_progress -- spec-5.16 D2.  recovery_direction
+ * == JOIN (observability + recompute selection; does not change the FSM).
+ */
+bool
+cluster_grd_join_remaster_in_progress(void)
+{
+	if (cluster_grd_state == NULL)
+		return false;
+	return pg_atomic_read_u32(&cluster_grd_state->recovery_direction)
+		   == (uint32)GRD_REMASTER_DIR_JOIN;
+}
+
+/*
+ * cluster_grd_join_remaster_active_for_shard -- spec-5.16 D3 (INV-R8).
+ *
+ *	True iff the block's STATIC PCM home (cluster_gcs_lookup_master_static) is
+ *	in the armed join_pcm_fenced_member set.  Bound to online_join (the fence
+ *	epoch is armed by note_self_admitted / LMON P0-accept), INDEPENDENT of any
+ *	GRD master[] movement — so join_remaster_enabled=off still fences (r2 P1-①,
+ *	P1-A closure).  false when the fence is not armed.
+ */
+bool
+cluster_grd_join_remaster_active_for_shard(BufferTag tag)
+{
+	uint64 fence_epoch;
+	int home;
+	int w, b;
+
+	if (cluster_grd_state == NULL)
+		return false;
+	fence_epoch = pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_epoch);
+	if (fence_epoch == 0)
+		return false; /* fence not armed */
+	pg_read_barrier();
+
+	home = cluster_gcs_lookup_master_static(tag);
+	if (home < 0 || home >= CLUSTER_MAX_NODES)
+		return false;
+	w = home >> 6;
+	b = home & 63;
+	return (pg_atomic_read_u64(&cluster_grd_state->join_pcm_fenced_member[w])
+			& (UINT64CONST(1) << b))
+		   != 0;
+}
+
+/*
+ * cluster_grd_block_view_rebuilt -- spec-5.16 D3 / Hardening v1.1.
+ *
+ *	True iff the joiner-home block view is rebuilt = EVERY declared member has
+ *	announced its local re-declare barrier for the fence epoch (recovery_done_
+ *	epoch >= join_pcm_fence_epoch).  This is the all_done barrier, NOT the
+ *	joiner's own done-epoch:  the joiner announces its trivial local barrier
+ *	BEFORE the survivors finish re-declaring their held joiner-home blocks to
+ *	it, so gating on recovery_done_epoch[joiner] alone would lift the fence
+ *	early → the joiner cold-serves a block a survivor still holds X on → 8.A
+ *	double-grant (Hardening v1.1, user-approved 2026-06-28).  The tag is
+ *	vestigial (the barrier is per-fence-epoch, not per-block) but kept so
+ *	call sites read uniformly with active_for_shard.
+ *
+ *	The barrier set is the CURRENT members (cluster_membership_is_member), NOT
+ *	all declared nodes:  a node dead from a prior failure never re-declares, so
+ *	requiring it would wedge the fence forever;  and if the joiner itself
+ *	re-dies mid-join it drops out of the member set, lifting this JOIN fence so
+ *	the failure-remaster path's own gate (recovery_in_progress / materialized)
+ *	takes over (§3.2).  The binding safety condition is "all survivors finished
+ *	re-declaring" (their recovery_done_epoch >= fence_epoch);  the master-side
+ *	gate on the joiner is the authoritative backstop (INV-R8/R14).
+ */
+
+/* Test whether node_id is in the armed join_pcm_fenced_member (rejoining) set. */
+static inline bool
+join_fenced_member_test(int32 node_id)
+{
+	int w, b;
+
+	if (cluster_grd_state == NULL || node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return false;
+	w = node_id >> 6;
+	b = node_id & 63;
+	return (pg_atomic_read_u64(&cluster_grd_state->join_pcm_fenced_member[w])
+			& (UINT64CONST(1) << b))
+		   != 0;
+}
+
+bool
+cluster_grd_block_view_rebuilt(BufferTag tag)
+{
+	uint64 fence_epoch;
+	int i;
+
+	(void)tag;
+	if (cluster_grd_state == NULL)
+		return true;
+	fence_epoch = pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_epoch);
+	if (fence_epoch == 0)
+		return true; /* nothing fenced */
+
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		if (cluster_conf_lookup_node(i) == NULL)
+			continue;
+		if (!cluster_membership_is_member(i))
+			continue; /* dead/joining node never re-declares; not a barrier member */
+		/*
+		 * The rejoining node(s) are the re-declare RECIPIENTS, not re-declarers:
+		 * a fresh joiner holds no blocks to re-declare and never observes the
+		 * JOIN_COMMITTED event as a reconfig episode (it is published coordinator-
+		 * side only), so it never announces REDECLARE_DONE.  The binding safety
+		 * condition is "every SURVIVOR finished re-declaring its held joiner-home
+		 * blocks" — exclude the fenced set so view_rebuilt converges on the
+		 * survivors' done (Hardening v1.1 + D8 fix).
+		 */
+		if (join_fenced_member_test(i))
+			continue;
+		if (pg_atomic_read_u64(&cluster_grd_state->recovery_done_epoch[i]) < fence_epoch)
+			return false;
+	}
+	return true;
+}
+
+/*
  * cluster_grd_lookup_master_gen
  *
  *	spec-4.6 D2 — master lookup + wire routing token.  Q3-C:  the token
@@ -1187,6 +1527,15 @@ cluster_grd_inc_block_path_failclosed(void)
 		pg_atomic_fetch_add_u64(&cluster_grd_state->block_path_failclosed_count, 1);
 }
 
+/* spec-5.16 D5 — bump the join-direction 53R9L fail-closed counter (both the
+ * requester-side phase gate and the master-side envelope gate call this). */
+void
+cluster_grd_inc_join_block_failclosed(void)
+{
+	if (cluster_grd_state != NULL)
+		pg_atomic_fetch_add_u64(&cluster_grd_state->join_block_recovering_failclosed_count, 1);
+}
+
 /* spec-4.6 D5 — bulk counter snapshot for the dump path. */
 void
 cluster_grd_recovery_counters_snapshot(ClusterGrdRecoveryCounters *out)
@@ -1209,6 +1558,16 @@ cluster_grd_recovery_counters_snapshot(ClusterGrdRecoveryCounters *out)
 	out->unaffected_holder_survived
 		= pg_atomic_read_u64(&cluster_grd_state->unaffected_holder_survived_count);
 	out->stale_holder_swept = pg_atomic_read_u64(&cluster_grd_state->stale_holder_swept_count);
+	/* spec-5.16 D5 — join-direction remaster counters. */
+	out->join_remaster_started
+		= pg_atomic_read_u64(&cluster_grd_state->join_remaster_started_count);
+	out->join_remaster_done = pg_atomic_read_u64(&cluster_grd_state->join_remaster_done_count);
+	out->join_shards_remastered
+		= pg_atomic_read_u64(&cluster_grd_state->join_shards_remastered_count);
+	out->join_block_views_rebuilt
+		= pg_atomic_read_u64(&cluster_grd_state->join_block_views_rebuilt_count);
+	out->join_block_recovering_failclosed
+		= pg_atomic_read_u64(&cluster_grd_state->join_block_recovering_failclosed_count);
 }
 
 /*
@@ -1627,7 +1986,26 @@ cluster_grd_recovery_lmon_tick(void)
 			}
 			pg_atomic_write_u64(&cluster_grd_state->recovery_dead_bitmap[b], word);
 		}
-		pg_atomic_fetch_add_u64(&cluster_grd_state->remaster_started_count, 1);
+		/*
+		 * spec-5.16 D2 — record the remaster direction and, for JOIN, arm the
+		 * joiner-home PCM block fence on THIS node.  The joiner already armed it
+		 * synchronously before opening its write gate (note_self_admitted,
+		 * INV-R13);  this covers survivors and is an idempotent monotonic-max
+		 * re-arm on the joiner.  JOIN events carry the rejoiner set in
+		 * join_bitmap (dead_bitmap is empty), so the failure-path freeze/remaster
+		 * below is a structural no-op — only the block re-declare barrier runs,
+		 * which rebuilds the joiner's PCM block view.
+		 */
+		if (evt.reconfig_kind == (uint8)RECONFIG_KIND_JOIN_COMMITTED) {
+			pg_atomic_write_u32(&cluster_grd_state->recovery_direction,
+								(uint32)GRD_REMASTER_DIR_JOIN);
+			cluster_grd_arm_join_pcm_fence(evt.join_bitmap);
+			pg_atomic_fetch_add_u64(&cluster_grd_state->join_remaster_started_count, 1);
+		} else {
+			pg_atomic_write_u32(&cluster_grd_state->recovery_direction,
+								(uint32)GRD_REMASTER_DIR_FAIL);
+			pg_atomic_fetch_add_u64(&cluster_grd_state->remaster_started_count, 1);
+		}
 		pg_atomic_write_u32(&cluster_grd_state->recovery_state, (uint32)GRD_RECOVERY_WAIT_EPOCH);
 		state = (uint32)GRD_RECOVERY_WAIT_EPOCH;
 		ereport(DEBUG1,
@@ -1657,36 +2035,100 @@ cluster_grd_recovery_lmon_tick(void)
 		 * non-coordinator survivor observes it via IC envelope piggyback
 		 * a tick or two later.  Running the rebind before the local
 		 * epoch advances would mint holders the new master rejects.
+		 *
+		 * spec-5.16 (P0, Rule 8.A) — direction-aware.  A FAIL survivor captures
+		 * old_epoch BEFORE the coordinator bumps, so it must wait for a STRICT
+		 * advance (cur > old) to prove it adopted the new master view.  A JOIN
+		 * observer survivor instead adopts the coordinator's JOIN epoch bump (via the
+		 * joiner_self_tick max-peer-epoch adoption, same LMON tick) BEFORE it readmits
+		 * the rejoiner and publishes its own observer JOIN_COMMITTED event, so by the
+		 * time its FSM accepts that event old_epoch == cur_epoch == the join epoch.
+		 * Requiring a strict advance there wedges the survivor in WAIT_EPOCH forever:
+		 * it never runs the re-declare barrier, never broadcasts REDECLARE_DONE, and
+		 * the coordinator's all-members JOIN barrier (Hardening v1.1) hangs →
+		 * join_remaster_done never advances.  For JOIN the survivor already holds the
+		 * epoch it rebinds under (that IS the post-bump master view), so equality is
+		 * sufficient; cur_epoch is monotonic so cur < old never occurs for JOIN.
 		 */
-		if (cur_epoch <= old_epoch)
+		if (pg_atomic_read_u32(&cluster_grd_state->recovery_direction)
+					== (uint32)GRD_REMASTER_DIR_JOIN
+				? cur_epoch < old_epoch
+				: cur_epoch <= old_epoch)
 			return;
 
 		for (i = 0; i < (CLUSTER_MAX_NODES + 63) / 64; i++)
 			dead[i] = pg_atomic_read_u64(&cluster_grd_state->recovery_dead_bitmap[i]);
 
-		/* P1 freeze affected:  master map not yet flipped, so affected =
-		 * shards whose CURRENT master carries a dead bit. */
+		/*
+		 * P1 freeze affected + P3 scoped sweep + P4 remaster.  Direction-
+		 * specific (spec-5.16 D2):
+		 *   FAIL (4.6):  affected = shards whose CURRENT master is dead;
+		 *                remaster dead → survivor.
+		 *   JOIN (5.16): affected = shards the membership recompute will move
+		 *                (joiner home shards a survivor held in its absence);
+		 *                recompute survivor → joiner.  ONLY when join_remaster_
+		 *                enabled — the PCM block fence (D3b) carries correctness
+		 *                regardless, so off leaves GRD mastership on the survivor
+		 *                (load imbalance only, INV-R12 / r2 P1-①).
+		 * Both directions then run the cluster-wide block re-declare barrier
+		 * (P5-P7 below);  for JOIN that rebuilds the joiner's PCM block view even
+		 * when join_remaster_enabled is off.  The two scopes are independent:
+		 * grd_moved_shards = `affected` here (GRD, GUC-gated); pcm_fenced_home_set
+		 * lives in join_pcm_fenced_member (PCM, online_join-gated, armed at P0).
+		 */
 		memset(affected, 0, sizeof(affected));
-		for (i = 0; i < PGRAC_GRD_SHARD_COUNT; i++) {
-			uint32 m = pg_atomic_read_u32(&cluster_grd_state->master[i]);
+		if (pg_atomic_read_u32(&cluster_grd_state->recovery_direction)
+			== (uint32)GRD_REMASTER_DIR_JOIN) {
+			if (cluster_join_remaster_enabled) {
+				uint8 active_member[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+				int32 declared[CLUSTER_MAX_NODES];
+				int32 members[CLUSTER_MAX_NODES];
+				int declared_count = 0;
+				int member_count = 0;
 
-			if (grd_dead_bitmap_test(dead, (int32)m)) {
-				cluster_grd_shard_set_phase((uint32)i, GRD_SHARD_FROZEN);
-				grd_shard_bitmap_set(affected, (uint32)i);
-				nfrozen++;
+				grd_build_active_member_bitmap(active_member);
+				grd_build_membership_lists(active_member, declared, &declared_count, members,
+										   &member_count);
+				for (i = 0; i < PGRAC_GRD_SHARD_COUNT; i++) {
+					int32 desired = grd_membership_desired_master(
+						active_member, declared, declared_count, members, member_count, i);
+
+					if (desired >= 0
+						&& (int32)pg_atomic_read_u32(&cluster_grd_state->master[i]) != desired) {
+						cluster_grd_shard_set_phase((uint32)i, GRD_SHARD_FROZEN);
+						grd_shard_bitmap_set(affected, (uint32)i);
+						nfrozen++;
+					}
+				}
+				cluster_grd_cleanup_stale_epoch_scoped(cur_epoch, affected);
+				moved = cluster_grd_master_map_recompute_for_membership(active_member, cur_epoch);
+			} else {
+				/* JOIN with GRD rebalance off: no GRD freeze/move; the PCM
+				 * fence (armed at P0) + the barrier below carry the rebuild. */
+				cluster_grd_cleanup_stale_epoch_scoped(cur_epoch, affected); /* empty: no-op */
+				moved = 0;
 			}
+		} else {
+			for (i = 0; i < PGRAC_GRD_SHARD_COUNT; i++) {
+				uint32 m = pg_atomic_read_u32(&cluster_grd_state->master[i]);
+
+				if (grd_dead_bitmap_test(dead, (int32)m)) {
+					cluster_grd_shard_set_phase((uint32)i, GRD_SHARD_FROZEN);
+					grd_shard_bitmap_set(affected, (uint32)i);
+					nfrozen++;
+				}
+			}
+			cluster_grd_cleanup_stale_epoch_scoped(cur_epoch, affected);
+			moved = cluster_grd_master_map_remaster(dead, cur_epoch);
 		}
-		ereport(DEBUG1,
-				(errmsg_internal("cluster_grd_recovery: P1 freeze %u affected shards", nfrozen)));
-
-		/* P3 scoped stale sweep (P2 dead_sweep ran earlier in the tick,
-		 * I47:  dead sweep precedes the epoch bump). */
-		cluster_grd_cleanup_stale_epoch_scoped(cur_epoch, affected);
-
-		/* P4 remaster (D2, deterministic from the accepted snapshot). */
-		moved = cluster_grd_master_map_remaster(dead, cur_epoch);
-		ereport(DEBUG1,
-				(errmsg_internal("cluster_grd_recovery: P4 remaster moved %u shards", moved)));
+		ereport(DEBUG1, (errmsg_internal("cluster_grd_recovery: P1 freeze %u affected shards "
+										 "(%s); P4 moved %u",
+										 nfrozen,
+										 pg_atomic_read_u32(&cluster_grd_state->recovery_direction)
+												 == (uint32)GRD_REMASTER_DIR_JOIN
+											 ? "join"
+											 : "fail",
+										 moved)));
 
 		/* Affected shards now have a live master but unrebuilt holder
 		 * state:  REBUILDING (requests stay fenced until P7). */
@@ -1850,14 +2292,31 @@ cluster_grd_recovery_lmon_tick(void)
 		 * shards stay frozen until the cluster converges;  the lagging
 		 * node's own rebuild_timeout WARNING is the observability surface.
 		 */
-		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
-			if (cluster_conf_lookup_node(i) == NULL)
-				continue;
-			if (grd_dead_bitmap_test(dead, i))
-				continue;
-			if (pg_atomic_read_u64(&cluster_grd_state->recovery_done_epoch[i]) < episode_epoch) {
-				all_done = false;
-				break;
+		{
+			bool is_join = (pg_atomic_read_u32(&cluster_grd_state->recovery_direction)
+							== (uint32)GRD_REMASTER_DIR_JOIN);
+
+			for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+				if (cluster_conf_lookup_node(i) == NULL)
+					continue;
+				if (grd_dead_bitmap_test(dead, i))
+					continue;
+				/*
+				 * spec-5.16 D8 — for a JOIN episode the rejoining node(s) are the
+				 * re-declare RECIPIENTS: a fresh joiner holds nothing to re-declare
+				 * and never observes the JOIN_COMMITTED event as its own reconfig
+				 * episode (it is published coordinator-side only), so it never
+				 * announces REDECLARE_DONE.  Waiting for it would wedge the survivor's
+				 * barrier forever.  The survivors (everyone outside the fenced set)
+				 * ARE the re-declarers and must converge.
+				 */
+				if (is_join && join_fenced_member_test(i))
+					continue;
+				if (pg_atomic_read_u64(&cluster_grd_state->recovery_done_epoch[i])
+					< episode_epoch) {
+					all_done = false;
+					break;
+				}
 			}
 		}
 
@@ -1927,7 +2386,22 @@ cluster_grd_recovery_lmon_tick(void)
 					unfrozen++;
 				}
 			}
-			pg_atomic_fetch_add_u64(&cluster_grd_state->remaster_done_count, 1);
+			/*
+			 * spec-5.16 D2/D5 — JOIN episodes count separately;  reaching IDLE
+			 * means every declared member announced REDECLARE_DONE for the
+			 * episode epoch (>= fence_epoch), so cluster_grd_block_view_rebuilt
+			 * now returns true and the joiner-home PCM fence lifts (Hardening
+			 * v1.1 all-members barrier).  Reset the direction to NONE.
+			 */
+			if (pg_atomic_read_u32(&cluster_grd_state->recovery_direction)
+				== (uint32)GRD_REMASTER_DIR_JOIN) {
+				pg_atomic_fetch_add_u64(&cluster_grd_state->join_remaster_done_count, 1);
+				pg_atomic_fetch_add_u64(&cluster_grd_state->join_block_views_rebuilt_count, 1);
+			} else {
+				pg_atomic_fetch_add_u64(&cluster_grd_state->remaster_done_count, 1);
+			}
+			pg_atomic_write_u32(&cluster_grd_state->recovery_direction,
+								(uint32)GRD_REMASTER_DIR_NONE);
 			pg_atomic_write_u32(&cluster_grd_state->recovery_state, (uint32)GRD_RECOVERY_IDLE);
 			ereport(DEBUG1,
 					(errmsg_internal("cluster_grd_recovery: cluster gate passed; P6 swept %u "

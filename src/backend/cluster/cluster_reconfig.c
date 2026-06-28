@@ -68,6 +68,7 @@
 #include "cluster/cluster_elog.h"		 /* cluster_node_id */
 #include "cluster/cluster_epoch.h"		 /* advance + observe + set_changed_at_lsn */
 #include "cluster/cluster_gcs_block.h"	 /* spec-2.34 D4 — eager epoch wake hook */
+#include "cluster/cluster_grd.h"		 /* spec-5.16 D3b — arm join PCM block fence */
 #include "cluster/cluster_sinval.h"		 /* spec-2.39 D14 — RESET-all reconfig hook */
 #include "cluster/cluster_tt_status.h"	 /* spec-3.1 D7 — TT status overlay flush hook */
 #include "storage/ipc.h"				 /* on_shmem_exit (spec-5.15 D4 latch clear) */
@@ -169,11 +170,30 @@ cluster_reconfig_shmem_init(void)
 		 * steady-state writes are unaffected. */
 		ReconfigShmem->self_join_admitted = cluster_online_join ? 0 : 1;
 
+		/*
+		 * spec-5.16 D6 — startup invariant (postmaster-once, in the !found shmem
+		 * init).  The joiner-home PCM block snap-back fence is bound to
+		 * cluster.online_join (forced correctness, INV-R13), NOT to
+		 * cluster.join_remaster_enabled: online_join=on therefore ALWAYS arms the
+		 * fence (note_self_admitted, before opening the joiner write gate), so
+		 * there is no config that leaves the block hazard open.  join_remaster_
+		 * enabled only gates the OPTIONAL GRD logical-lock move.  Log the
+		 * meaningless combo (rebalance on but joins off) so it is not mistaken
+		 * for an active feature. */
+		if (cluster_enabled && cluster_join_remaster_enabled && !cluster_online_join)
+			ereport(LOG,
+					(errmsg("cluster.join_remaster_enabled is on but cluster.online_join is off; "
+							"no node will rejoin, so the GRD logical-lock rebalance never runs"),
+					 errhint("Enable cluster.online_join to allow online node rejoin.")));
+
 		/* spec-5.15 D1/D4 — no slot observed yet (generation 0 = absent/not ready). */
 		for (int n = 0; n < CLUSTER_MAX_NODES; n++) {
 			pg_atomic_init_u64(&ReconfigShmem->observed_incarnation[n], 0);
 			pg_atomic_init_u64(&ReconfigShmem->observed_generation[n], 0);
 			pg_atomic_init_u64(&ReconfigShmem->observed_epoch[n], 0);
+			/* spec-5.16 — no peer COMMITTED join marker observed yet. */
+			pg_atomic_init_u64(&ReconfigShmem->observed_committed_join_incarnation[n], 0);
+			pg_atomic_init_u64(&ReconfigShmem->observed_committed_join_epoch[n], 0);
 		}
 
 		/* spec-5.15 D4 — join-marker submit mailbox (latch published by qvotec). */
@@ -636,6 +656,44 @@ cluster_reconfig_get_observed_epoch(int32 node_id)
 	if (ReconfigShmem == NULL || node_id < 0 || node_id >= CLUSTER_MAX_NODES)
 		return 0;
 	return pg_atomic_read_u64(&ReconfigShmem->observed_epoch[node_id]);
+}
+
+/*
+ * spec-5.16 (3-node join participation) — qvotec publishes / the LMON reads the
+ * per-peer durable COMMITTED join marker (admitted incarnation + epoch) it
+ * observed on a quorum-majority of that peer's region-3 slots.  This is the
+ * runtime signal a SURVIVOR uses to recognize a rejoined peer as MEMBER (the
+ * symmetric observer half of the LEAVE detection), so its GRD FSM joins the
+ * re-declare barrier.  pg_atomic — qvotec (writer) and LMON (reader) are
+ * different processes.
+ */
+void
+cluster_reconfig_record_observed_committed_join(int32 node_id, uint64 incarnation, uint64 epoch)
+{
+	if (ReconfigShmem == NULL || node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return;
+	pg_atomic_write_u64(&ReconfigShmem->observed_committed_join_incarnation[node_id], incarnation);
+	pg_atomic_write_u64(&ReconfigShmem->observed_committed_join_epoch[node_id], epoch);
+}
+
+bool
+cluster_reconfig_get_observed_committed_join(int32 node_id, uint64 *incarnation, uint64 *epoch)
+{
+	uint64 inc;
+
+	if (ReconfigShmem == NULL || node_id < 0 || node_id >= CLUSTER_MAX_NODES) {
+		if (incarnation != NULL)
+			*incarnation = 0;
+		if (epoch != NULL)
+			*epoch = 0;
+		return false;
+	}
+	inc = pg_atomic_read_u64(&ReconfigShmem->observed_committed_join_incarnation[node_id]);
+	if (incarnation != NULL)
+		*incarnation = inc;
+	if (epoch != NULL)
+		*epoch = pg_atomic_read_u64(&ReconfigShmem->observed_committed_join_epoch[node_id]);
+	return inc > 0;
 }
 
 
@@ -1190,6 +1248,24 @@ cluster_reconfig_note_self_admitted(uint64 admitted_epoch)
 	 * the gate.
 	 */
 	cluster_epoch_adopt_admitted(admitted_epoch);
+
+	/*
+	 * spec-5.16 D3b (INV-R13) — arm the joiner-home PCM block fence SYNCHRONOUSLY,
+	 * BEFORE setting self MEMBER below.  Setting MEMBER flips cluster_membership_
+	 * is_member(self) true and opens the write gate; the async GRD LMON tick that
+	 * consumes JOIN_COMMITTED is structurally LATER, so a fence armed there would
+	 * leave a window where self is a writable MEMBER but its home blocks are
+	 * unfenced — a cold-serve / double-grant hazard (8.A).  The fence epoch is the
+	 * just-adopted admitted (JOIN_COMMITTED) epoch; rejoining_set = {self}.  No-op
+	 * when the GRD region is absent (cluster off).
+	 */
+	{
+		uint8 self_set[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
+
+		self_set[cluster_node_id >> 3] = (uint8)(1u << (cluster_node_id & 7));
+		cluster_grd_arm_join_pcm_fence(self_set);
+	}
+
 	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
 	cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_MEMBER);
 	ReconfigShmem->self_join_admitted = 1;
@@ -1533,6 +1609,13 @@ cluster_reconfig_lmon_tick(void)
 	 */
 	if (ReconfigShmem != NULL) {
 		int b;
+		/* spec-5.16 — survivor-side runtime readmit: peers recognized DEAD->MEMBER
+		 * from their durable COMMITTED join marker this tick (an observer JOIN
+		 * event is published for them after the lock is released). */
+		uint8 newly_joined[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+		bool any_joined = false;
+
+		memset(newly_joined, 0, sizeof(newly_joined));
 
 		LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
 
@@ -1579,6 +1662,29 @@ cluster_reconfig_lmon_tick(void)
 				cluster_membership_set_state(i, CLUSTER_MEMBER_DEAD);
 			else if (ms == CLUSTER_MEMBER_ABSENT)
 				cluster_membership_set_state(i, CLUSTER_MEMBER_MEMBER);
+			else if (cluster_online_join && ms == CLUSTER_MEMBER_DEAD
+					 && cluster_cssd_get_peer_state(i) == CLUSTER_CSSD_PEER_ALIVE) {
+				/*
+				 * spec-5.16 (3-node join participation) — survivor-side runtime
+				 * readmit.  A DEAD peer whose durable COMMITTED join marker (observed
+				 * by qvotec) carries a fresh admitted incarnation is a node the
+				 * coordinator just rejoined.  Recognize it as MEMBER here too (the
+				 * coordinator did so in commit_member), and remember it so an
+				 * observer JOIN_COMMITTED event is published below — making THIS
+				 * survivor's GRD FSM join the re-declare barrier.  record_admitted
+				 * floors the incarnation (INV-J1, monotonic).
+				 */
+				uint64 obs_inc = 0;
+				uint64 obs_epoch = 0;
+
+				if (cluster_reconfig_get_observed_committed_join(i, &obs_inc, &obs_epoch)
+					&& obs_inc > cluster_membership_get_last_admitted_incarnation(i)) {
+					cluster_membership_set_state(i, CLUSTER_MEMBER_MEMBER);
+					cluster_membership_record_admitted(i, obs_inc);
+					dead_bitmap_set_bit(newly_joined, i);
+					any_joined = true;
+				}
+			}
 			/* else DEAD stays DEAD (no auto-readmit); JOINING/MEMBER unchanged */
 		}
 
@@ -1600,6 +1706,51 @@ cluster_reconfig_lmon_tick(void)
 										| ReconfigShmem->removed_bitmap[b]);
 
 		LWLockRelease(&ReconfigShmem->lock);
+
+		/*
+		 * spec-5.16 (3-node join participation) — publish an observer-role
+		 * JOIN_COMMITTED event for peers this survivor just recognized as MEMBER,
+		 * so its GRD FSM runs the JOIN remaster episode (re-declares its held
+		 * joiner-home blocks to the joiner + announces REDECLARE_DONE).  Done AFTER
+		 * the lock release (publish_event takes the lock).  Only survivors reach
+		 * here — on the coordinator the peer is already MEMBER, so the readmit
+		 * branch never fires.  Mirrors the observer-role FAIL_STOP publish in the
+		 * leave dispatch below;  clean_departed is cleared here (INV-J10) like
+		 * commit_member.
+		 */
+		if (any_joined) {
+			ReconfigEvent jevt;
+			uint8 empty_dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+			uint64 incs[CLUSTER_MAX_NODES];
+			int jn;
+
+			memset(empty_dead, 0, sizeof(empty_dead));
+			memset(incs, 0, sizeof(incs));
+			for (jn = 0; jn < CLUSTER_MAX_NODES; jn++) {
+				if (dead_bitmap_test_bit(newly_joined, jn)) {
+					uint64 oi = 0;
+
+					(void)cluster_reconfig_get_observed_committed_join(jn, &oi, NULL);
+					incs[jn] = oi;
+					if (cluster_reconfig_is_clean_departed(jn))
+						cluster_reconfig_clear_clean_departed(jn);
+				}
+			}
+
+			memset(&jevt, 0, sizeof(jevt));
+			jevt.event_id = cluster_reconfig_compute_event_id_v2(
+				RECONFIG_KIND_JOIN_COMMITTED, empty_dead, newly_joined, incs,
+				cluster_cssd_get_dead_generation());
+			jevt.coordinator_node_id = self_id; /* observer; informational */
+			jevt.old_epoch = cluster_epoch_get_current();
+			jevt.new_epoch = jevt.old_epoch; /* survivor observes the bump via piggyback */
+			memcpy(jevt.join_bitmap, newly_joined, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
+			jevt.applied_at = GetCurrentTimestamp();
+			jevt.observer_role = CLUSTER_RECONFIG_OBSERVER_SURVIVOR;
+			jevt.cssd_dead_generation = cluster_cssd_get_dead_generation();
+			jevt.reconfig_kind = RECONFIG_KIND_JOIN_COMMITTED;
+			cluster_reconfig_publish_event(&jevt);
+		}
 	} else {
 		dead_bitmap_set_bit(alive_set, self_id);
 		for (i = 0; i < CLUSTER_MAX_NODES; i++) {

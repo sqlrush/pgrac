@@ -1746,7 +1746,24 @@ cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd)
 				&env, payload, payload_len, (uint32)cluster_node_id, peer_id);
 
 			if (vrc == CLUSTER_IC_ENVELOPE_DROP_NO_CLOSE) {
-				/* Drop frame, keep peer.  Reset state for next frame. */
+				/*
+				 * Drop frame, keep peer.  Reset state for next frame.
+				 *
+				 * spec-5.16 (P0, Rule 8.A) — a stale-epoch HEARTBEAT is dropped for
+				 * CONTENT (no Lamport observe) but still proves TRANSPORT liveness:
+				 * the peer is demonstrably sending frames.  Refresh last_heartbeat_
+				 * recv_at so the LMON 3x-heartbeat liveness scan does NOT close the
+				 * peer (cluster_lmon.c).  Without this, a node that rejoins online boots
+				 * at a low epoch and its heartbeats are stale-dropped by the survivors
+				 * until it catches up — so the survivors' liveness timer fires, closes
+				 * the peer, stops sending, and the connection FLAPS for ~10s, delaying
+				 * GES release/grant traffic past cluster.ges_request_timeout_ms and
+				 * wedging cross-node lock continuity through the rejoined master.  This
+				 * matches the verify-side intent (spec-2.4: "LMON should NOT close the
+				 * peer on stale epoch").  Liveness only — never processes stale content.
+				 */
+				if (Tier1Shmem != NULL && env.msg_type == PGRAC_IC_MSG_HEARTBEAT)
+					Tier1Shmem->peers[peer_id].last_heartbeat_recv_at = GetCurrentTimestamp();
 				tier1_recv_buf_len[peer_id] = 0;
 				tier1_recv_phase[peer_id] = 0;
 				tier1_recv_payload_filled[peer_id] = 0;

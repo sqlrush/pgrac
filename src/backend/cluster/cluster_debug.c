@@ -1124,6 +1124,18 @@ dump_grd_recovery(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "grd_recovery", "unaffected_holder_survived",
 			 fmt_int64((int64)c.unaffected_holder_survived));
 	emit_row(rsinfo, "grd_recovery", "stale_holder_swept", fmt_int64((int64)c.stale_holder_swept));
+	/* spec-5.16 D5 — join-direction remaster counters (same grd_recovery
+	 * category; no new dump category, §8 Q6-A). */
+	emit_row(rsinfo, "grd_recovery", "join_remaster_started",
+			 fmt_int64((int64)c.join_remaster_started));
+	emit_row(rsinfo, "grd_recovery", "join_remaster_done",
+			 fmt_int64((int64)c.join_remaster_done));
+	emit_row(rsinfo, "grd_recovery", "join_shards_remastered",
+			 fmt_int64((int64)c.join_shards_remastered));
+	emit_row(rsinfo, "grd_recovery", "join_block_views_rebuilt",
+			 fmt_int64((int64)c.join_block_views_rebuilt));
+	emit_row(rsinfo, "grd_recovery", "join_block_recovering_failclosed",
+			 fmt_int64((int64)c.join_block_recovering_failclosed));
 }
 
 /*

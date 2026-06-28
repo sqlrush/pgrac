@@ -872,6 +872,55 @@ qvotec_poll_once(void)
 	}
 
 	/*
+	 * spec-5.16 (3-node join participation) — observe each PEER's durable COMMITTED
+	 * join marker (region-3) and publish its admitted incarnation + epoch to shmem.
+	 * This is the symmetric observer half of the LEAVE detection: a SURVIVOR's LMON
+	 * membership tick uses it to recognize a rejoined peer as MEMBER so its GRD FSM
+	 * joins the re-declare barrier (without it the coordinator's barrier waits
+	 * forever for a non-participating survivor in >=3-node).  Mirrors the self-
+	 * admission read below; one extra region-3 slot read per (disk × peer) per poll
+	 * (qvotec already has the fds).  Majority + COMMITTED-basis validated; a never-
+	 * joined / undeclared slot fails the basis check and publishes nothing.
+	 */
+	{
+		uint32 node;
+		uint32 majority = ((uint32)qvotec_n_disks / 2u) + 1u;
+
+		for (node = 0; node < CLUSTER_MAX_NODES; node++) {
+			uint32 agree = 0;
+			uint64 best_incarnation = 0;
+			uint64 best_admitted_epoch = 0;
+			int d;
+
+			if ((int32)node == cluster_node_id)
+				continue; /* self handled below */
+
+			for (d = 0; d < qvotec_n_disks; d++) {
+				union {
+					uint8 bytes[CLUSTER_VOTING_SLOT_BYTES];
+					uint64 _align;
+				} jslot;
+				ClusterJoinCommitMarker m;
+
+				if (cluster_voting_disk_read_join_slot(qvotec_fds[d], node, jslot.bytes)
+					!= CLUSTER_VOTING_DISK_IO_OK)
+					continue;
+				memcpy(&m, jslot.bytes, sizeof(m));
+				if (!cluster_join_marker_is_committed_basis(&m, (int32)node))
+					continue;
+				agree++;
+				if (m.admitted_incarnation > best_incarnation)
+					best_incarnation = m.admitted_incarnation;
+				if (m.admitted_epoch > best_admitted_epoch)
+					best_admitted_epoch = m.admitted_epoch;
+			}
+			if (agree >= majority && best_incarnation > 0)
+				cluster_reconfig_record_observed_committed_join((int32)node, best_incarnation,
+																best_admitted_epoch);
+		}
+	}
+
+	/*
 	 * spec-5.15 D5: detect THIS node's own admission — a §2.6 COMMITTED join
 	 * marker in region-3 slot self, with admitted_incarnation == our incarnation,
 	 * on a quorum-majority of disks (one extra slot read per disk; qvotec already
@@ -913,7 +962,6 @@ qvotec_poll_once(void)
 				continue; /* a stale prior-incarnation admission — not us */
 			self_markers[n_self++] = m;
 		}
-
 		/* HF-3: find a single commit (nonce) present on >= majority disks. */
 		for (a = 0; a < n_self; a++) {
 			uint32 same = 0;
@@ -930,8 +978,17 @@ qvotec_poll_once(void)
 
 		/* HF-1: gate-open requires the publish-proof too, not the marker alone. */
 		if (win >= 0 && win_agree >= majority
-			&& cluster_reconfig_join_publish_proven(self_markers[win].admitted_epoch))
+			&& cluster_reconfig_join_publish_proven(self_markers[win].admitted_epoch)) {
 			cluster_reconfig_note_self_admitted(self_markers[win].admitted_epoch);
+			/*
+			 * spec-5.16 (3-node rejoin) — the same durable COMMITTED join marker
+			 * that admits self also supersedes any fail-stop write-fence still
+			 * listing self as dead (RC-5 for the write-fence): if its admitted
+			 * epoch is newer than the fence, self un-fences and may serve again,
+			 * breaking the 3-node rejoin convergence deadlock.
+			 */
+			cluster_write_fence_supersede_by_admit(self_markers[win].admitted_epoch);
+		}
 	}
 
 	/*

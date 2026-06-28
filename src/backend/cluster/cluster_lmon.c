@@ -78,6 +78,7 @@
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_scn.h" /* cluster_scn_boc_broadcast_handler (spec-2.9 D1) */
 #include "cluster/cluster_ges.h" /* cluster_ges_{request,reply}_handler (spec-2.13 D3) */
+#include "cluster/cluster_ges_reply_wait.h" /* cluster_ges_reply_wait_sweep_timeout (spec-5.16 orphan-grant TTL backstop) */
 #include "cluster/cluster_sinval.h"
 #include "cluster/cluster_tt_status_hint.h" /* spec-3.2 D6 — drain hook + register */
 #include "utils/timestamp.h"
@@ -974,6 +975,17 @@ LmonMain(void)
 			 * LMS never advances past STARTING for the ownership purpose.
 			 */
 			cluster_ges_lmon_drain_work_queue();
+			/*
+			 * spec-5.16 (orphan-grant, Rule 8.A) — reclaim abandoned reply-wait
+			 * tombstones whose bounded TTL has elapsed.  This is the documented
+			 * LMON-tick backstop for the orphan-grant auto-release path: an
+			 * abandoned REQUEST keeps its 5-tuple entry as a tombstone so a late
+			 * orphan GRANT can be recognized and auto-released, then this sweep
+			 * reclaims the slot once the TTL passes.  Without it the tombstones
+			 * never drain and eventually fail-close live requests with "reply
+			 * wait table full" (cap = cluster.ges_reply_wait_max_entries).
+			 */
+			(void)cluster_ges_reply_wait_sweep_timeout(GetCurrentTimestamp());
 			cluster_grd_outbound_lmon_drain_send();
 			cluster_lms_native_probe_retry_tick();
 

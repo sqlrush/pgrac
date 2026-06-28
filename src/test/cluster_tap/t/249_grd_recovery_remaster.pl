@@ -395,12 +395,13 @@ is($rc5, 0,
 
 
 # ----------
-# L7 (FLIPPED by D5): grd_recovery dump category exposes 13 counters
-#     and the recovery episode left the expected trail.
+# L7 (FLIPPED by D5; spec-5.16 D5 +5 join-direction counters): grd_recovery
+#     dump category exposes 18 counters and the recovery episode left the
+#     expected trail.
 # ----------
 is($pair->node1->safe_psql('postgres',
 		q{SELECT count(*) FROM cluster_dump_state() WHERE category = 'grd_recovery'}),
-	'13', 'L7 grd_recovery dump category exposes 13 counters (D5)');
+	'18', 'L7 grd_recovery dump category exposes 18 counters (D5 + spec-5.16 join)');
 
 is($pair->node1->safe_psql('postgres', q{
 	SELECT string_agg(key, ',' ORDER BY key) FROM cluster_dump_state()

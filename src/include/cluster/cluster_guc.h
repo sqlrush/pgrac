@@ -449,6 +449,7 @@ extern bool cluster_online_join;					/* spec-5.15 D7 */
 extern int cluster_join_convergence_timeout_ms;		/* spec-5.15 D7 */
 extern bool cluster_online_node_removal;			/* spec-5.18 D13 */
 extern int cluster_node_removal_cleanup_timeout_ms; /* spec-5.18 D13 */
+extern bool cluster_join_remaster_enabled;			/* spec-5.16 D6 */
 
 /*
  * spec-2.2 D7 -- Tier 1 TCP transport tuning (PGC_POSTMASTER).

@@ -92,9 +92,11 @@ UT_DEFINE_GLOBALS();
  * (1 KiB) + clean_departed_bitmap + counter; spec-5.15 D2 added the membership SSOT
  * table (last_admitted_incarnation[CLUSTER_MAX_NODES] 1 KiB + membership_state[] +
  * pending_join_bitmap + self_join_admitted) plus the D1 observed-slot snapshot
- * (observed_incarnation[] + observed_generation[], 2 KiB).  Bump the mock backing
- * store to fit. */
-static char reconfig_shmem_storage[8192] __attribute__((aligned(64)));
+ * (observed_incarnation[] + observed_generation[], 2 KiB).  spec-5.15 H1.3 added
+ * observed_fresh_alive[] and spec-5.16 added observed_committed_join_incarnation[] +
+ * observed_committed_join_epoch[] (3 more pg_atomic_uint64[CLUSTER_MAX_NODES=128]
+ * arrays, +3 KiB).  Bump the mock backing store to fit the grown state struct. */
+static char reconfig_shmem_storage[16384] __attribute__((aligned(64)));
 static char epoch_shmem_storage[64] __attribute__((aligned(64)));
 static bool reconfig_init_done = false;
 static bool epoch_init_done = false;
@@ -370,6 +372,14 @@ cluster_tt_status_flush_all(uint32 new_epoch pg_attribute_unused())
 bool cluster_online_join = false;
 int cluster_quorum_poll_interval_ms = 100;
 int cluster_join_convergence_timeout_ms = 30000;
+/* spec-5.16 D6 GUC + joiner-home PCM fence arm referenced by the reconfig lmon tick /
+ * note_self_admitted; the join-remaster path is off by default in this fixture, so
+ * stub for the standalone link. */
+bool cluster_join_remaster_enabled = false;
+void cluster_grd_arm_join_pcm_fence(const uint8 *rejoining_set);
+void
+cluster_grd_arm_join_pcm_fence(const uint8 *rejoining_set pg_attribute_unused())
+{}
 /* pgstat backend global referenced by pgstat_report_wait_start/end (the D4 join
  * marker submit wait); provide a file-static fake so the standalone link works. */
 static uint32 ut_wait_event_info_storage;

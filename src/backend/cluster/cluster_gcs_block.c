@@ -49,6 +49,8 @@
 #include "cluster/cluster_gcs_block_dedup.h" /* spec-2.34 D1 — counter forward */
 #include "cluster/cluster_grd.h"			 /* spec-4.6 D4 — block_path_failclosed counter */
 #include "cluster/cluster_grd_outbound.h"
+#include "cluster/cluster_membership.h" /* spec-5.16 D3b — is_member master-side gate */
+#include "cluster/cluster_qvotec.h"		/* spec-5.16 D3b — in_quorum master-side gate */
 #include "cluster/cluster_recovery_merge.h" /* spec-4.7 D5 — recovered_through redo gate */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
@@ -660,6 +662,26 @@ cluster_gcs_block_phase_for_tag(BufferTag tag)
 	 * (unchanged).
 	 */
 	static_master = cluster_gcs_lookup_master_static(tag);
+
+	/*
+	 * spec-5.16 D3 (r1 P1-C) — online-join PCM block snap-back fence, placed
+	 * BEFORE the non-DEAD-static-master early NORMAL below.  When a joiner (a
+	 * non-DEAD static master) rejoins, block routing snaps its home blocks back
+	 * to it the instant it is CSSD-ALIVE; if its block view is not yet rebuilt
+	 * (survivors have not all re-declared their held joiner-home blocks), serving
+	 * it cold would double-grant a block a survivor still holds X on (8.A).  Fence
+	 * RECOVERING until the all-members re-declare barrier completes (view
+	 * rebuilt — Hardening v1.1).  Bound to online_join via the armed fence epoch,
+	 * INDEPENDENT of join_remaster_enabled (r2 P1-①).  This requester-side gate is
+	 * the optimization; the master-side hard gate (cluster_gcs_handle_block_
+	 * request_envelope) is the correctness backstop for stale-view requesters.
+	 */
+	if (cluster_grd_join_remaster_active_for_shard(tag)
+		&& !cluster_grd_block_view_rebuilt(tag)) {
+		cluster_grd_inc_join_block_failclosed();
+		return GCS_BLOCK_RECOVERING;
+	}
+
 	if (static_master == cluster_node_id
 		|| cluster_cssd_get_peer_state(static_master) != CLUSTER_CSSD_PEER_DEAD)
 		return GCS_BLOCK_NORMAL;
@@ -1085,6 +1107,19 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 				break;
 			}
 
+			/* spec-5.16 D3b (INV-R8/R14) — master-side join fence denied this
+			 * request: the master (a rejoining node) is not yet a serving MEMBER
+			 * or the joiner-home block view is still being rebuilt.  Retryable
+			 * (re-lookup master so a completed rebuild / membership change takes
+			 * effect); on budget exhaustion surface the dedicated 53R9L. */
+			if (final_status == GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING) {
+				current_master = cluster_gcs_lookup_master(tag);
+				if (retry_attempt < max_retries)
+					continue;
+				terminal_denied = true; /* exhausted → terminal 53R9L below */
+				break;
+			}
+
 			/* PGRAC: spec-2.36 D6 (HC117) — reader starvation guard transient
 			 * denial.  N→S request was rejected because an X writer's broadcast
 			 * is in flight at the master;  reader exponential-backoffs per
@@ -1254,6 +1289,20 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 							errmsg("cluster_gcs_block: master does not hold tag and state != N"),
 							errhint("Cross-node holder migration / DRM handling lands in Stage 6; "
 									"the cross-instance read-path boundary is Spec: spec-5.57.")));
+			break;
+		case GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING:
+			/* spec-5.16 D3b — master-side join fence, retry budget exhausted.
+			 * 53R9L (retry-safe): the joiner-home block view is still rebuilding
+			 * or the master is not yet a serving MEMBER. */
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_GCS_BLOCK_RESOURCE_RECOVERING),
+					 errmsg("cluster_gcs_block: block master is recovering for tag "
+							"spc=%u db=%u relNumber=%u block=%u (node rejoin)",
+							tag.spcOid, tag.dbOid, (unsigned int)BufTagGetRelNumber(&tag),
+							(unsigned int)tag.blockNum),
+					 errhint("A rejoining node's home block view is being rebuilt (survivors "
+							 "re-declaring), or the master is not yet a quorum member; retry — "
+							 "retry is safe.")));
 			break;
 		case GCS_BLOCK_REPLY_DENIED_INCOMPATIBLE:
 		default:
@@ -2002,6 +2051,28 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 		return;
 
 	req = (const GcsBlockRequestPayload *)payload;
+
+	/*
+	 * spec-5.16 D3b (r3 P1 + sr1-②, INV-R8/R14) — master-side hard gate, BEFORE
+	 * any dedup / state change.  This is the authoritative fail-closed point: a
+	 * remote requester with a stale membership view may route a joiner-home
+	 * block request here while this node (the joiner) is not yet a serving
+	 * MEMBER, or while its block view is still being rebuilt — serving cold
+	 * would double-grant (8.A).  Default-deny until BOTH (a) this node is an
+	 * in-quorum MEMBER (closes the CSSD-ALIVE-before-commit window) AND (b) the
+	 * requested block's joiner-home view is rebuilt (closes the committed-but-
+	 * not-rebuilt window, Hardening v1.1 all-members barrier).  A no-op in
+	 * steady state (every node is an in-quorum MEMBER, no fence armed).  Reply
+	 * DENIED_RESOURCE_RECOVERING -> sender maps to 53R9L (retry-safe).
+	 */
+	if (!cluster_qvotec_in_quorum() || !cluster_membership_is_member(cluster_node_id)
+		|| (cluster_grd_join_remaster_active_for_shard(req->tag)
+			&& !cluster_grd_block_view_rebuilt(req->tag))) {
+		cluster_grd_inc_join_block_failclosed();
+		gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING,
+							 InvalidXLogRecPtr, NULL);
+		return;
+	}
 
 	/* HC75 range guard — out of range never enters dedup HTAB. */
 	if (req->transition_id < PCM_TRANS_N_TO_S || req->transition_id > PCM_TRANS_S_TO_X_CLEANOUT) {

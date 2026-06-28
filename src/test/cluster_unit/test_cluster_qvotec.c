@@ -453,6 +453,19 @@ void
 cluster_reconfig_record_observed_fresh_alive(int32 node_id pg_attribute_unused(),
 											 bool fresh_alive pg_attribute_unused())
 {}
+/* spec-5.16: qvotec.o also publishes each peer's durable COMMITTED join marker and
+ * supersedes a stale write-fence on self-admit; stub both for the standalone link. */
+void cluster_reconfig_record_observed_committed_join(int32 node_id, uint64 incarnation,
+													 uint64 epoch);
+void
+cluster_reconfig_record_observed_committed_join(int32 node_id pg_attribute_unused(),
+												uint64 incarnation pg_attribute_unused(),
+												uint64 epoch pg_attribute_unused())
+{}
+void cluster_write_fence_supersede_by_admit(uint64 admitted_epoch);
+void
+cluster_write_fence_supersede_by_admit(uint64 admitted_epoch pg_attribute_unused())
+{}
 bool cluster_reconfig_join_qvotec_poll_pending(int32 *out_target_node, void *out_slot512);
 bool
 cluster_reconfig_join_qvotec_poll_pending(int32 *out_target_node,

@@ -353,6 +353,19 @@ typedef struct ClusterReconfigState {
 	pg_atomic_uint64 observed_fresh_alive[CLUSTER_MAX_NODES];
 
 	/*
+	 * spec-5.16 (Hardening — 3-node join participation) — per declared node, the
+	 * COMMITTED join-marker incarnation + admitted epoch qvotec last observed on a
+	 * quorum-majority of that node's region-3 slots.  This is the durable signal a
+	 * SURVIVOR (not just the coordinator) uses to recognize a rejoined peer as
+	 * MEMBER at runtime — the symmetric observer half of the LEAVE detection — so
+	 * its GRD FSM joins the JOIN re-declare barrier (without it the coordinator's
+	 * barrier waits forever for a non-participating survivor in >=3-node).  0 = no
+	 * durable COMMITTED marker observed.  pg_atomic so qvotec publishes lock-free.
+	 */
+	pg_atomic_uint64 observed_committed_join_incarnation[CLUSTER_MAX_NODES];
+	pg_atomic_uint64 observed_committed_join_epoch[CLUSTER_MAX_NODES];
+
+	/*
 	 * spec-5.15 D4 — join-commit-marker submit mailbox (§2.6).  The coordinator
 	 * stages a marker for the joiner (join_marker_target_node_id), bumps
 	 * join_marker_request_seq, wakes qvotec via join_qvotec_latch, and waits
@@ -495,6 +508,12 @@ extern void cluster_reconfig_record_observed_slot(int32 node_id, uint64 incarnat
 extern bool cluster_reconfig_get_observed_slot(int32 node_id, uint64 *incarnation,
 											   uint64 *generation);
 extern uint64 cluster_reconfig_get_observed_epoch(int32 node_id);
+/* spec-5.16 — qvotec publishes / LMON reads the per-peer durable COMMITTED join
+ * marker so a survivor recognizes a rejoined peer as MEMBER (3-node join). */
+extern void cluster_reconfig_record_observed_committed_join(int32 node_id, uint64 incarnation,
+															uint64 epoch);
+extern bool cluster_reconfig_get_observed_committed_join(int32 node_id, uint64 *incarnation,
+														 uint64 *epoch);
 
 /*
  * spec-5.15 Hardening v1.3 — publish / read the per-node FRESH-ALIVE liveness

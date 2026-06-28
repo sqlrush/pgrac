@@ -159,6 +159,16 @@ void
 cluster_lmd_wait_state_clear(ClusterLmdProcWaitState *ws pg_attribute_unused())
 {}
 
+/* spec-5.16 — node-global request_id source (real impl in cluster_ges_reply_wait.o,
+ * not linked here).  A monotonic local counter is enough for the standalone test. */
+uint64
+cluster_ges_reply_wait_next_request_id(void)
+{
+	static uint64 n = 0;
+
+	return ++n;
+}
+
 /* spec-2.17 — sig_atomic_t cancel flag (cluster_signal.o not linked). */
 #include <signal.h>
 volatile sig_atomic_t cluster_ges_cancel_pending = 0;

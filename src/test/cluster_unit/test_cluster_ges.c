@@ -452,6 +452,12 @@ cluster_grd_outbound_enqueue_lmon_reply(uint32 d pg_attribute_unused(),
 {
 	stub_lmon_reply_enqueue_count++;
 }
+/* spec-5.16 orphan-grant auto-release uses the cleanup-release producer. */
+void
+cluster_grd_outbound_enqueue_cleanup_release(uint32 d pg_attribute_unused(),
+											 const void *p pg_attribute_unused(),
+											 uint16 l pg_attribute_unused())
+{}
 
 /* spec-2.23 D14 R13 stub audit — new symbol surface introduced by
  * Steps 1-9 needs file-local stubs so cluster_ges.o links standalone
@@ -710,6 +716,22 @@ cluster_ges_reply_wait_wake(struct GesReplyWaitEntry *e pg_attribute_unused(),
 void
 cluster_ges_reply_wait_delete(const struct GesReplyWaitKey *k pg_attribute_unused())
 {}
+/* spec-5.16 orphan-grant stubs (deliver / mark_abandoned).  int/int64 returns mirror
+ * the minimal-stub style above (reply_wait.h not included here); cluster_ges.o links
+ * by symbol name and the inert bodies keep the standalone harness coverage unchanged. */
+int
+cluster_ges_reply_wait_deliver(const struct GesReplyWaitKey *k pg_attribute_unused(),
+							   uint32 opcode pg_attribute_unused(),
+							   uint32 reason pg_attribute_unused())
+{
+	return 0; /* GES_REPLY_DELIVER_NO_WAITER */
+}
+bool
+cluster_ges_reply_wait_mark_abandoned(const struct GesReplyWaitKey *k pg_attribute_unused(),
+									  int64 tombstone_deadline pg_attribute_unused())
+{
+	return false;
+}
 void
 cluster_ges_inc_release_ack(void)
 {}
