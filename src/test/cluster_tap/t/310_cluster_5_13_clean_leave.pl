@@ -300,26 +300,6 @@ my $reqh = IPC::Run::start(
 		'-c', 'SELECT pg_cluster_clean_leave_request()' ],
 	\$in, \$out, \$err);
 
-# DIAGNOSTIC (Hardening v1.0.2 L8 investigation): the inject is supposed to hold
-# node1 at quiesce-pre, but in CI node1 has been draining + committing in <1s.
-# Sample node1's leave phase + the quiesce-pre inject row (fault_type/param/hits)
-# rapidly right after firing, to see in the CI log whether the inject is armed
-# (fault_type=sleep/param=30000000) and reached (hits>0) and whether node1 ever
-# actually pauses.  Uses psql on_error_stop=0 so a vanished node1 does not die us.
-for my $k (1 .. 40)
-{
-	my ($drc, $dout, $derr) = ('', '', '');
-	$drc = $esc->node1->psql('postgres', q{
-		SELECT coalesce((SELECT phase FROM pg_cluster_clean_leave_state), '?')
-		  || ' | inj=' || coalesce((SELECT fault_type || '/' || param || '/h' || hits
-		                            FROM pg_stat_cluster_injections
-		                            WHERE name = 'cluster-clean-leave-quiesce-pre'), 'MISSING')
-	}, stdout => \$dout, stderr => \$derr, on_error_stop => 0, timeout => 5);
-	diag("L8DIAG t+${k} node1: " . ($dout ne '' ? $dout : "(rc=$drc err=$derr)"));
-	last if $dout =~ /committed/ || $derr ne '';
-	usleep(50_000);
-}
-
 # Wait until node1 is genuinely mid-leave: node0 (the survivor) is tracking
 # node1's leave (its real announce arrived) and node1 is in a pre-drain leave
 # phase, held by the quiesce-pre inject.

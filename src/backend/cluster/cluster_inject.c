@@ -45,6 +45,8 @@
 #include "port/atomics.h"
 #include "utils/builtins.h"
 
+#include <sys/time.h> /* gettimeofday (full-duration sleep loop) */
+
 #include "cluster/cluster_inject.h"
 
 
@@ -783,9 +785,40 @@ cluster_injection_run(const char *name)
 						  errmsg("cluster injection point \"%s\" armed with WARNING", name)));
 		break;
 
-	case CLUSTER_FAULT_SLEEP:
-		pg_usleep((long)param);
+	case CLUSTER_FAULT_SLEEP: {
+		/*
+		 * pg_usleep() returns EARLY when interrupted by a signal (latch sets,
+		 * procsignals, etc.).  A backend that is armed with a :sleep injection
+		 * frequently receives such signals while it is paused -- e.g. a node
+		 * mid-clean-leave -- which would cut a :sleep:Nus arm far short of N
+		 * (observed in CI: a 30s arm slept ~2s, so a node meant to be held
+		 * mid-phase raced past the injection and committed before the test could
+		 * act).  A :sleep:Nus injection that sleeps for less than N is a framework
+		 * bug: it makes every injection-driven pause non-deterministic.  Loop on
+		 * the wall clock until the full requested duration has elapsed so the
+		 * injection deterministically holds the phase.  CHECK_FOR_INTERRUPTS()
+		 * keeps a genuine query-cancel / backend-terminate honoured (a SIGKILL is
+		 * uncatchable and ends the backend immediately regardless); a bare latch
+		 * set processes to nothing and the loop simply re-sleeps the remainder.
+		 */
+		struct timeval start, now;
+		int64 elapsed_us;
+
+		gettimeofday(&start, NULL);
+		for (;;) {
+			int64 remaining;
+
+			gettimeofday(&now, NULL);
+			elapsed_us = (int64)(now.tv_sec - start.tv_sec) * INT64CONST(1000000)
+						 + (int64)(now.tv_usec - start.tv_usec);
+			if (elapsed_us >= (int64)param)
+				break;
+			remaining = (int64)param - elapsed_us;
+			CHECK_FOR_INTERRUPTS();
+			pg_usleep((long)remaining);
+		}
 		break;
+	}
 
 	case CLUSTER_FAULT_CRASH:
 #ifdef USE_ASSERT_CHECKING

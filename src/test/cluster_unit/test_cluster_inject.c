@@ -92,6 +92,18 @@ pg_usleep(long microsec)
 	last_sleep_us = (int)microsec;
 }
 
+/*
+ * CHECK_FOR_INTERRUPTS() in the full-duration SLEEP dispatcher expands to
+ * references to InterruptPending + ProcessInterrupts.  No armed-SLEEP path is
+ * exercised here (only the WARNING dispatcher and disarmed runs), so these only
+ * satisfy the linker; InterruptPending stays false so the macro is a no-op.
+ */
+volatile sig_atomic_t InterruptPending = false;
+
+void
+ProcessInterrupts(void)
+{}
+
 bool
 errstart(int elevel, const char *domain pg_attribute_unused())
 {
