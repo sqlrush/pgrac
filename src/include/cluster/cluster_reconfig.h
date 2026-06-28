@@ -523,6 +523,14 @@ extern uint64 cluster_reconfig_get_join_timeout_count(void);
 extern uint64 cluster_reconfig_get_clean_departed_cleared_count(void);
 
 /*
+ * Hardening v1.0.4 (spec-5.13 clean-leave x spec-5.15 online-join serialization):
+ * true iff a membership JOIN is currently in its pending window.  The clean-leave
+ * request + announce paths consult this to enforce "one membership reconfig at a
+ * time"; the join driver checks the mirror predicate cluster_clean_leave_in_progress().
+ */
+extern bool cluster_reconfig_join_in_progress(void);
+
+/*
  * qvotec calls this when it has read this node's own §2.6 COMMITTED join marker
  * (admitted_incarnation == self's incarnation) on a quorum-majority of disks:
  * adopt the admitted epoch (may jump >16) AND set self MEMBER, THEN open the

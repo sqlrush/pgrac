@@ -204,6 +204,18 @@ cluster_cssd_get_dead_generation(void)
 	return ut_dead_generation;
 }
 
+/*
+ * Hardening v1.0.4 stub: cluster_reconfig.c's join driver now consults
+ * cluster_clean_leave_in_progress() (one membership reconfig at a time) — defined
+ * in cluster_clean_leave.c, which this standalone unit does not link.  No clean
+ * leave is ever in progress in these reconfig unit tests, so return false.
+ */
+bool
+cluster_clean_leave_in_progress(void)
+{
+	return false;
+}
+
 /* declared-peer set:  bit i set → node i is declared in cluster.conf. */
 static bool ut_declared_set[CLUSTER_MAX_NODES];
 static ClusterNodeInfo ut_dummy_node;

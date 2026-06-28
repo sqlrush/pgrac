@@ -486,4 +486,13 @@ extern bool cluster_clean_leave_block_serve_gate_allows(void);
  */
 extern bool cluster_clean_leave_node_refuses_writes(void);
 
+/*
+ * Hardening v1.0.4 (P1-1/P2): true iff THIS node is participating in any clean
+ * leave (leaver / survivor / mid-request).  The spec-5.15 online-join driver
+ * consults this to enforce "one membership reconfig at a time" — a join must not
+ * start or commit while a clean leave is active (a join's epoch bump is otherwise
+ * indistinguishable from the leave's commit on the leaving node, CL barrier hang).
+ */
+extern bool cluster_clean_leave_in_progress(void);
+
 #endif /* CLUSTER_CLEAN_LEAVE_H */

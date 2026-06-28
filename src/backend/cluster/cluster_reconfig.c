@@ -63,17 +63,18 @@
 #include "utils/timestamp.h"
 #include "utils/wait_event.h" /* WAIT_EVENT_CLUSTER_BGPROC_LMON_RECONFIG_TICK (D9) */
 
-#include "cluster/cluster_conf.h"			/* cluster_conf_lookup_node */
-#include "cluster/cluster_cssd.h"			/* cluster_cssd_get_peer_state, get_dead_generation */
-#include "cluster/cluster_elog.h"			/* cluster_node_id */
-#include "cluster/cluster_epoch.h"			/* advance + observe + set_changed_at_lsn */
-#include "cluster/cluster_gcs_block.h"		/* spec-2.34 D4 — eager epoch wake hook */
-#include "cluster/cluster_sinval.h"			/* spec-2.39 D14 — RESET-all reconfig hook */
-#include "cluster/cluster_tt_status.h"		/* spec-3.1 D7 — TT status overlay flush hook */
-#include "storage/ipc.h"					/* on_shmem_exit (spec-5.15 D4 latch clear) */
-#include "storage/latch.h"					/* Latch / SetLatch (spec-5.15 D4 marker mailbox) */
-#include "cluster/cluster_guc.h"			/* cluster_enabled, cluster_online_join */
-#include "cluster/cluster_inject.h"			/* CLUSTER_INJECTION_POINT */
+#include "cluster/cluster_conf.h"		 /* cluster_conf_lookup_node */
+#include "cluster/cluster_cssd.h"		 /* cluster_cssd_get_peer_state, get_dead_generation */
+#include "cluster/cluster_elog.h"		 /* cluster_node_id */
+#include "cluster/cluster_epoch.h"		 /* advance + observe + set_changed_at_lsn */
+#include "cluster/cluster_gcs_block.h"	 /* spec-2.34 D4 — eager epoch wake hook */
+#include "cluster/cluster_sinval.h"		 /* spec-2.39 D14 — RESET-all reconfig hook */
+#include "cluster/cluster_tt_status.h"	 /* spec-3.1 D7 — TT status overlay flush hook */
+#include "storage/ipc.h"				 /* on_shmem_exit (spec-5.15 D4 latch clear) */
+#include "storage/latch.h"				 /* Latch / SetLatch (spec-5.15 D4 marker mailbox) */
+#include "cluster/cluster_clean_leave.h" /* v1.0.4 — cluster_clean_leave_in_progress (serialize) */
+#include "cluster/cluster_guc.h"		 /* cluster_enabled, cluster_online_join */
+#include "cluster/cluster_inject.h"		 /* CLUSTER_INJECTION_POINT */
 #include "cluster/cluster_voting_disk_io.h" /* spec-5.15 D4 — region-3 join-marker slot I/O */
 #include "cluster/cluster_write_fence.h"	/* spec-4.12 D4 — durable fence marker submit */
 #include "cluster/cluster_qvotec.h"			/* cluster_qvotec_in_quorum */
@@ -786,6 +787,45 @@ cluster_reconfig_get_clean_departed_cleared_count(void)
 								 : pg_atomic_read_u64(&ReconfigShmem->clean_departed_cleared_count);
 }
 
+/*
+ * cluster_reconfig_join_in_progress -- Hardening v1.0.4 (spec-5.13 clean-leave x
+ * spec-5.15 online-join serialization, P1-1/P2): is a membership JOIN currently in
+ * its pending window anywhere this node can observe?  The clean-leave request +
+ * real-announce paths consult this so a clean leave does not START (or a survivor
+ * does not ACCEPT an announce) while a join is mid-flight — the symmetric half of
+ * "one membership reconfig at a time" (the join driver checks the mirror predicate
+ * cluster_clean_leave_in_progress()).  A join bumps the membership epoch with
+ * dead_gen unchanged, which the leaving node would otherwise mis-observe as its own
+ * clean-leave commit and wedge in BARRIER_WAIT (P2).  Read under the reconfig lock
+ * (consistent snapshot of the 16-byte pending bitmap); called only at reconfig-rate
+ * boundaries, never on a hot path.
+ */
+bool
+cluster_reconfig_join_in_progress(void)
+{
+	bool in_progress = false;
+	int i;
+
+	if (ReconfigShmem == NULL)
+		return false;
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	if (ReconfigShmem->self_join_admitted == 0)
+		in_progress = true; /* this node is itself a not-yet-admitted joiner */
+	else if (ReconfigShmem->last_applied.reconfig_kind == RECONFIG_KIND_JOIN_PENDING)
+		in_progress = true; /* the last published edge is a JOIN Phase-1 */
+	else {
+		for (i = 0; i < (int)sizeof(ReconfigShmem->pending_join_bitmap); i++) {
+			if (ReconfigShmem->pending_join_bitmap[i] != 0) {
+				in_progress = true; /* a declared peer is in the join pending window */
+				break;
+			}
+		}
+	}
+	LWLockRelease(&ReconfigShmem->lock);
+	return in_progress;
+}
+
 
 /*
  * spec-5.15 D4 §3.3 — has the JOIN_PENDING converged?  Every existing MEMBER
@@ -1004,7 +1044,14 @@ cluster_reconfig_joiner_self_tick(void)
 			cluster_epoch_adopt_admitted(max_peer_epoch);
 	}
 
-	if (!joiner_gate_decided) {
+	/*
+	 * Hardening v1.0.4 (P2 serialization): do NOT start driving this node's own join
+	 * while a clean leave is active here.  Deferring is safe — joiner_self_tick is
+	 * LMON-driven and retries next tick once the leave reaches a terminal state (one
+	 * membership reconfig at a time; the leave side refuses to start while a join is
+	 * pending via cluster_reconfig_join_in_progress).
+	 */
+	if (!joiner_gate_decided && !cluster_clean_leave_in_progress()) {
 		if (cluster_reconfig_cluster_already_running()) {
 			joiner_gate_decided = true;
 			LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
@@ -1257,7 +1304,17 @@ cluster_reconfig_lmon_tick(void)
 	 * the coordinator.  Runs whether or not there was a death this tick; gated by
 	 * online_join (off = no runtime readmit, §3.4 fail-closed-safe via INV-J8).
 	 */
-	if (cluster_online_join && self_id == coordinator)
+	/*
+	 * Hardening v1.0.4 (P2 serialization, one membership reconfig at a time): do NOT
+	 * drive any node's join while a clean leave is active on this node (leaver or
+	 * survivor).  A join Phase-1 / commit bumps the membership epoch with dead_gen
+	 * unchanged, which the leaving node mis-observes as its own clean-leave commit
+	 * and wedges in BARRIER_WAIT (the leave's epoch-observe premise holds ONLY under
+	 * no concurrent dead_gen-unchanged reconfig).  Joins are LMON-driven and simply
+	 * retry next tick once the leave finishes; the leave side symmetrically refuses
+	 * to start while a join is pending.
+	 */
+	if (cluster_online_join && self_id == coordinator && !cluster_clean_leave_in_progress())
 		cluster_reconfig_drive_joins(coordinator);
 }
 
@@ -1790,6 +1847,15 @@ cluster_reconfig_commit_member(int32 node_id, uint64 admitted_incarnation)
 	if (!cluster_enabled || ReconfigShmem == NULL)
 		return false;
 	if (node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return false;
+	/*
+	 * Hardening v1.0.4 (P2 serialization, defense re-check at the hard-commit point):
+	 * resolve the residual race where drive_joins started before a clean leave became
+	 * active on this node.  If a clean leave is active now, do NOT commit the join
+	 * (which would bump the epoch and wedge the leaver, P2).  Return false so the
+	 * coordinator retries next tick once the leave finishes; the joiner stays JOINING.
+	 */
+	if (cluster_clean_leave_in_progress())
 		return false;
 
 	CLUSTER_INJECTION_POINT("cluster-reconfig-join-commit-pre");

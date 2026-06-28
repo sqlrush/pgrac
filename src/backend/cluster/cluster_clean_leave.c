@@ -61,7 +61,8 @@
 #include "cluster/cluster_inject.h"	  /* CLUSTER_INJECTION_POINT (D12) */
 #include "cluster/cluster_pcm_lock.h" /* PCM release-all-self + no-leftover verify (D5) */
 #include "cluster/cluster_qvotec.h"	  /* cluster_qvotec_in_quorum (request gate) */
-#include "cluster/cluster_reconfig.h" /* apply_clean_leave + record/is_clean_departed */
+#include "cluster/cluster_reconfig.h" /* apply_clean_leave + record/is_clean_departed + join_in_progress */
+#include "cluster/cluster_membership.h" /* v1.0.4 — cluster_membership_is_member (P1-2 INV-J8) */
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_voting_disk_io.h" /* leave-slot raw I/O + CLUSTER_VOTING_SLOT_BYTES */
 
@@ -244,6 +245,30 @@ cluster_clean_leave_node_refuses_writes(void)
 }
 
 /*
+ * cluster_clean_leave_in_progress -- is THIS node participating in any clean
+ * leave right now (as the leaver OR as a survivor tracking someone else's
+ * leave, OR mid-request before it has bound its slot)?  Hardening v1.0.4
+ * (P1-1/P2): the spec-5.15 online-join driver consults this to enforce "one
+ * membership reconfig at a time" — it must NOT start or commit a join (which
+ * bumps the epoch with dead_gen unchanged, indistinguishable from a clean-leave
+ * commit, CL barrier-observe hang) while a clean leave is active anywhere this
+ * node can see it.  Cheap: a few unlocked atomic reads; the authoritative race
+ * resolution is the re-check the join driver does under the reconfig lock at its
+ * own commit point, plumbed symmetrically with cluster_reconfig_join_in_progress.
+ */
+bool
+cluster_clean_leave_in_progress(void)
+{
+	if (cl_state == NULL)
+		return false;
+	if (pg_atomic_read_u32(&cl_state->request_in_progress) != 0)
+		return true; /* mid-request: reserved before phase/leaving_node_id are set */
+	if (cl_state->leaving_node_id != -1)
+		return true; /* leaver or survivor tracking a leave */
+	return pg_atomic_read_u32(&cl_state->phase) != CLUSTER_LEAVE_IDLE;
+}
+
+/*
  * cluster_clean_leave_survivor_ack -- a survivor signals readiness (§3.2 step 3,
  * F1 PRE-epoch).  Sent to the leaving node AFTER this survivor has dropped all
  * refs to it (the LMON tick survivor branch runs the drop, then calls this).
@@ -382,6 +407,30 @@ cl_announce_handler(const ClusterICEnvelope *env, const void *payload)
 		return;
 	}
 
+	/*
+	 * Hardening v1.0.4 (P1-1 + P1-2 + P2) — decided BEFORE the preflight/real split
+	 * so it gates BOTH; gating only the real announce is NOT enough (the leaver would
+	 * pass preflight, broadcast the real announce, and OTHER survivors would accept +
+	 * track it before this node's NAK arrived, then the leaver clean-aborts, leaving
+	 * those survivors tracking an aborted leave).
+	 *   - Non-MEMBER (INV-J8): silently ignore.  A JOINING/ABSENT node is not a
+	 *     survivor, must not ACK/track/drop — and must NOT NAK either, because the
+	 *     leaver's cl_all_survivors_acked already excludes it; a NAK would wrongly
+	 *     abort the leave.
+	 *   - MEMBER but busy (this node is itself mid-request to leave, or a membership
+	 *     join is in flight): NAK LEAVE_IN_PROGRESS at preflight so the leaver rejects
+	 *     before any survivor enters tracking (one membership reconfig at a time).
+	 */
+	if (!cluster_membership_is_member(cluster_node_id))
+		return;
+	if (pg_atomic_read_u32(&cl_state->request_in_progress) != 0
+		|| cluster_reconfig_join_in_progress()) {
+		cluster_clean_leave_ic_send_ack(env->source_node_id, leaving, p->leave_epoch,
+										p->leave_nonce, true,
+										(uint8)CLUSTER_LEAVE_NAK_LEAVE_IN_PROGRESS);
+		return;
+	}
+
 	/* preflight probe (F6 layer-1): we are enabled → ACK (enablement only, NO state
 	 * change, NO GRD/PCM cleanup).  This is the side-effect-free half of the
 	 * two-layer mixed-mode defense — the leaver gathers these ACKs before it ever
@@ -421,6 +470,19 @@ cl_announce_handler(const ClusterICEnvelope *env, const void *payload)
 				(errmsg("cluster clean-leave: node %d announced a leave while node %d's leave is "
 						"in progress; NAK (single-leave-at-a-time)",
 						leaving, cl_state->leaving_node_id)));
+		return;
+	}
+	/*
+	 * Hardening v1.0.4 (P1-1, TOCTOU re-check under the lock): the membership/busy
+	 * gate before the preflight split was lock-free; if this node reserved its OWN
+	 * request between that gate and here, NAK now rather than become a survivor
+	 * (the requester's self-bind re-check is the symmetric guard).
+	 */
+	if (pg_atomic_read_u32(&cl_state->request_in_progress) != 0) {
+		LWLockRelease(&cl_state->lock);
+		cluster_clean_leave_ic_send_ack(env->source_node_id, leaving, p->leave_epoch,
+										p->leave_nonce, true,
+										(uint8)CLUSTER_LEAVE_NAK_LEAVE_IN_PROGRESS);
 		return;
 	}
 
@@ -797,50 +859,82 @@ cluster_clean_leave_rebuild_from_disks(const int *fds, int n_disks)
 	if (cl_state == NULL || fds == NULL || n_disks <= 0)
 		return;
 
+	if (n_disks > CLUSTER_MAX_VOTING_DISKS)
+		n_disks = CLUSTER_MAX_VOTING_DISKS; /* defensive clamp (fixed-array bound, no VLA) */
 	majority = ((uint32)n_disks / 2u) + 1u;
 
 	for (s = 0; s < CLUSTER_MAX_NODES; s++) {
-		union {
-			uint8 bytes[CLUSTER_VOTING_SLOT_BYTES];
-			uint64 _align;
-		} slot;
-		ClusterLeaveIntentMarker m;
-		int32 departed = -1;
-		uint64 epoch = 0;
-		uint32 agree = 0;
-		int d;
+		ClusterLeaveIntentMarker markers[CLUSTER_MAX_VOTING_DISKS];
+		bool valid[CLUSTER_MAX_VOTING_DISKS];
+		int n_read = 0;
+		int d, e;
 
+		/*
+		 * Read this slot from every disk, keeping each disk's COMMITTED-basis marker
+		 * for a declared peer.  Hardening v1.0.4 (finding 4): the majority must be of
+		 * the SAME durable proof.  The earlier code counted agreement by
+		 * leaving_node_id and took max(leave_epoch); a stale ghost leave-slot is NOT
+		 * zeroed on rejoin (qvotec read-only ghost mitigation), so an OLD attempt's
+		 * COMMITTED marker can persist on most disks while a NEWER attempt's COMMITTED
+		 * marker reached only a minority — node-id counting then synthesized a
+		 * "majority" and rebuilt at the newer epoch that itself never reached majority
+		 * (trusting a non-majority durable fact, 8.A-adjacent).  Keep the markers and
+		 * count by full identity below instead.
+		 */
 		for (d = 0; d < n_disks; d++) {
+			union {
+				uint8 bytes[CLUSTER_VOTING_SLOT_BYTES];
+				uint64 _align;
+			} slot;
+
+			valid[d] = false;
 			if (cluster_voting_disk_read_leave_slot(fds[d], (uint32)s, slot.bytes)
 				!= CLUSTER_VOTING_DISK_IO_OK)
 				continue;
-			memcpy(&m, slot.bytes, sizeof(m));
-
+			memcpy(&markers[d], slot.bytes, sizeof(markers[d]));
 			/* COMMITTED + magic/version/CRC/dead_bitmap valid for its own
-			 * leaving_node_id, which must be a declared peer (defence vs a
-			 * marker naming a node not in cluster.conf). */
-			if (!cluster_clean_leave_marker_is_committed_basis(&m, m.leaving_node_id))
+			 * leaving_node_id, which must be a declared peer. */
+			if (!cluster_clean_leave_marker_is_committed_basis(&markers[d],
+															   markers[d].leaving_node_id))
 				continue;
-			if (cluster_conf_lookup_node(m.leaving_node_id) == NULL)
+			if (cluster_conf_lookup_node(markers[d].leaving_node_id) == NULL)
 				continue;
-
-			if (departed < 0) {
-				departed = m.leaving_node_id;
-				epoch = m.leave_epoch;
-				agree = 1;
-			} else if (m.leaving_node_id == departed) {
-				agree++;
-				if (m.leave_epoch > epoch)
-					epoch = m.leave_epoch;
-			}
+			valid[d] = true;
+			n_read++;
 		}
+		if (n_read == 0)
+			continue;
 
-		if (departed >= 0 && agree >= majority) {
-			cluster_reconfig_record_clean_departed(departed, epoch, /*raise_epoch_floor*/ true);
-			ereport(LOG,
-					(errmsg("cluster clean-leave: rebuilt clean-departed node %d at epoch %llu "
-							"from %u/%d durable COMMITTED marker(s)",
-							departed, (unsigned long long)epoch, agree, n_disks)));
+		/*
+		 * Find a marker IDENTITY {leaving_node_id, leave_epoch, event_id,
+		 * cssd_dead_generation} present on a quorum-majority of disks — THAT is the
+		 * durable proof.  At most one identity can hold a majority, so the first
+		 * match is unique; rebuild at its own leave_epoch (never a different
+		 * attempt's higher epoch).
+		 */
+		for (d = 0; d < n_disks; d++) {
+			uint32 agree = 0;
+
+			if (!valid[d])
+				continue;
+			for (e = 0; e < n_disks; e++) {
+				if (valid[e] && markers[e].leaving_node_id == markers[d].leaving_node_id
+					&& markers[e].leave_epoch == markers[d].leave_epoch
+					&& markers[e].event_id == markers[d].event_id
+					&& markers[e].cssd_dead_generation == markers[d].cssd_dead_generation)
+					agree++;
+			}
+			if (agree >= majority) {
+				cluster_reconfig_record_clean_departed(markers[d].leaving_node_id,
+													   markers[d].leave_epoch,
+													   /*raise_epoch_floor*/ true);
+				ereport(LOG,
+						(errmsg("cluster clean-leave: rebuilt clean-departed node %d at epoch %llu "
+								"from %u/%d durable COMMITTED marker(s) of one identity",
+								markers[d].leaving_node_id,
+								(unsigned long long)markers[d].leave_epoch, agree, n_disks)));
+				break; /* one identity per slot can reach majority */
+			}
 		}
 	}
 }
@@ -877,7 +971,7 @@ cl_set_phase(ClusterLeavePhase to)
 	pg_atomic_write_u32(&cl_state->phase, to);
 }
 
-/* min declared node that is alive (CSSD not DEAD) and != leaving; -1 if none. */
+/* min MEMBER node that is alive (CSSD not DEAD) and != leaving; -1 if none. */
 static int32
 cl_compute_coordinator(int32 leaving)
 {
@@ -886,8 +980,15 @@ cl_compute_coordinator(int32 leaving)
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 		if (i == leaving)
 			continue;
-		if (cluster_conf_lookup_node(i) == NULL)
-			continue; /* not a declared peer */
+		/*
+		 * Hardening v1.0.4 (P1-2, INV-J8): only a MEMBER may be elected clean-leave
+		 * coordinator (it drives the two-phase commit + epoch bump).  A JOINING /
+		 * ABSENT (but CSSD-alive) declared node must never be chosen — that would let
+		 * a non-member bump the membership epoch, conflicting with safe-publication.
+		 * Subsumes the old declared-peer check (a member is a declared peer).
+		 */
+		if (!cluster_membership_is_member(i))
+			continue;
 		if (i == cluster_node_id)
 			return i; /* self is alive by definition */
 		if (cluster_cssd_get_peer_state(i) != CLUSTER_CSSD_PEER_DEAD)
@@ -896,7 +997,7 @@ cl_compute_coordinator(int32 leaving)
 	return -1;
 }
 
-/* every alive declared survivor (!= leaving) has set its ack bit? */
+/* every alive MEMBER survivor (!= leaving) has set its ack bit? */
 static bool
 cl_all_survivors_acked(int32 leaving)
 {
@@ -907,7 +1008,14 @@ cl_all_survivors_acked(int32 leaving)
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 		if (i == leaving)
 			continue;
-		if (cluster_conf_lookup_node(i) == NULL)
+		/*
+		 * Hardening v1.0.4 (P1-2, INV-J8): only MEMBERs are expected to ACK a clean
+		 * leave.  A JOINING / ABSENT (but CSSD-alive) node is NOT a survivor — it
+		 * ignores the announce (mirror gate in the handler), so counting it here
+		 * would wait forever for an ACK it must never send.  Subsumes the old
+		 * declared-peer check (a member is a declared peer).
+		 */
+		if (!cluster_membership_is_member(i))
 			continue;
 		if (cluster_cssd_get_peer_state(i) == CLUSTER_CSSD_PEER_DEAD)
 			continue; /* a dead survivor is not expected to ack (CL-I7 escalate handles it) */
@@ -1061,6 +1169,15 @@ cl_request_body(void)
 	 */
 	if (cl_state->leaving_node_id != -1 && cl_state->leaving_node_id != cluster_node_id)
 		return CLUSTER_LEAVE_REQ_REJECTED_IN_PROGRESS;
+	/*
+	 * Hardening v1.0.4 (P2 serialization): one membership reconfig at a time.  If a
+	 * spec-5.15 online JOIN is in its pending window, do NOT start a clean leave —
+	 * the join bumps the membership epoch with dead_gen unchanged, which the leaving
+	 * node would mis-observe as its own commit and wedge in BARRIER_WAIT.  The join
+	 * driver defers symmetrically while a clean leave is active.
+	 */
+	if (cluster_reconfig_join_in_progress())
+		return CLUSTER_LEAVE_REQ_REJECTED_IN_PROGRESS;
 	if (!cluster_qvotec_in_quorum())
 		return CLUSTER_LEAVE_REQ_REJECTED_NOT_IN_QUORUM;
 	coordinator = cl_compute_coordinator(cluster_node_id);
@@ -1086,6 +1203,16 @@ cl_request_body(void)
 		int i;
 
 		LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
+		/*
+		 * Hardening v1.0.4 (P1-1): re-check leaving_node_id UNDER the lock.  The
+		 * test above was unlocked; in between, an incoming real announce could have
+		 * made this node a survivor of someone else's leave (leaving_node_id :=
+		 * other).  Bail before we stamp our own nonce/bitmap over that tracking.
+		 */
+		if (cl_state->leaving_node_id != -1 && cl_state->leaving_node_id != cluster_node_id) {
+			LWLockRelease(&cl_state->lock);
+			return CLUSTER_LEAVE_REQ_REJECTED_IN_PROGRESS;
+		}
 		pg_atomic_write_u64(&cl_state->leave_attempt_nonce, nonce);
 		memset(cl_state->ack_bitmap, 0, sizeof(cl_state->ack_bitmap));
 		pg_atomic_write_u32(&cl_state->nak_received, 0);
@@ -1135,6 +1262,18 @@ cl_request_body(void)
 	baseline_epoch = cluster_epoch_get_current();
 
 	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
+	/*
+	 * Hardening v1.0.4 (P1-1, final recheck): the ~5s preflight wait above ran
+	 * with the lock released, so an incoming real announce could have made this
+	 * node a survivor (leaving_node_id := other) during it.  Binding self here
+	 * would silently drop that other leave's serve-gate protection (false-visible,
+	 * 8.A).  Re-check under the lock and bail if so; the announce handler is the
+	 * symmetric enforcement point (it NAKs while our request is in progress).
+	 */
+	if (cl_state->leaving_node_id != -1 && cl_state->leaving_node_id != cluster_node_id) {
+		LWLockRelease(&cl_state->lock);
+		return CLUSTER_LEAVE_REQ_REJECTED_IN_PROGRESS;
+	}
 	cl_state->leaving_node_id = cluster_node_id;
 	cl_state->leave_epoch = baseline_epoch;
 	cl_state->leave_baseline_dead_gen = cluster_cssd_get_dead_generation();
@@ -1423,6 +1562,18 @@ cl_leaving_barrier_tick(void)
 	 * CSSD dead_generation: a cooperative leave does NOT mark anyone CSSD-dead, so
 	 * an unchanged dead_generation at the bump means OUR clean-leave committed; a
 	 * changed one means a real death (escalate).
+	 *
+	 *	Hardening v1.0.4 (P2): this "epoch bump + dead_gen unchanged == OUR commit"
+	 *	inference is sound ONLY because there is no OTHER dead_gen-unchanged reconfig
+	 *	in flight.  A spec-5.15 online JOIN also bumps the epoch with dead_gen
+	 *	unchanged and would be mis-observed here as the leave's commit (then the node
+	 *	stops escalating but never gets the real LEAVE_COMMITTED -> BARRIER_WAIT
+	 *	hang).  That collision is removed STRUCTURALLY by the one-membership-reconfig-
+	 *	at-a-time serialization: the join driver does not bump the epoch while a clean
+	 *	leave is active (cluster_clean_leave_in_progress gates drive_joins +
+	 *	commit_member), and the leave does not start while a join is pending
+	 *	(cluster_reconfig_join_in_progress gates the request).  Under that invariant a
+	 *	dead_gen-unchanged bump during a leave can only be the leave's own commit.
 	 */
 	if (cluster_epoch_get_current() > baseline_epoch) {
 		if (cluster_cssd_get_dead_generation() == cl_state->leave_baseline_dead_gen) {
