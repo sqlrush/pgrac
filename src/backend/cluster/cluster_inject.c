@@ -455,6 +455,18 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	{ .name = "cluster-cr-skip-epoch-bump" },
 
 	/*
+	 * spec-5.55 Hardening v1.1 (finding #2) — shared-resolver-cache memo-path
+	 * acceptance fail-closed (1 entry).  When armed, a TRUST-mode memo hit's
+	 * Source-3 acceptance verdict is forced to fail closed (gate (3)), driving
+	 * the exact production branch (count_acceptance(false) -> INVALID_OR_AMBIGUOUS).
+	 * The natural MVCC workload cannot reach it: a resolved deleter is always
+	 * recent (scn >= horizon -> never wrap-suspect), and an old entry below an
+	 * advanced horizon is never re-probed.  The fault-inject test then proves the
+	 * branch routes correctly AND the 8.A balance invariant still holds.
+	 */
+	{ .name = "cluster-cr-resolver-memo-suspect" },
+
+	/*
 	 * spec-4.1 D7 — per-thread WAL routing (2 NEW points).
 	 *
 	 *	cluster-wal-thread-validate-pre:
