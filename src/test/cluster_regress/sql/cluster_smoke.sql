@@ -44,7 +44,7 @@ SELECT attname, format_type(atttypid, atttypmod)
 
 
 -- ----------
--- 3. Cluster wait events: 102 rows (anchored by
+-- 3. Cluster wait events: 103 rows (anchored by
 --    CLUSTER_WAIT_EVENTS_COUNT, spec-0.11 + StaticAssertDecl
 --    in cluster_views.c; spec-4.12 D7 +2 write-fence events).
 -- ----------
