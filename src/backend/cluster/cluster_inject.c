@@ -569,6 +569,13 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	{ .name = "cluster-clean-leave-gcs-flushed" },
 	{ .name = "cluster-clean-leave-barrier-complete" },
 	{ .name = "cluster-clean-leave-escalate-to-failstop" },
+	/*
+	 * spec-5.13 Hardening v1.0.3 (1 NEW point) — a survivor receives the F6
+	 * preflight probe but replies neither ACK nor NAK (armed :skip on the
+	 * survivor).  Drives the leaver's fail-closed preflight-incomplete gate
+	 * (t/315 P1): the leaver must reject:preflight_incomplete, NOT fail open.
+	 */
+	{ .name = "cluster-clean-leave-survivor-suppress-preflight-ack" },
 };
 
 #define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_points)

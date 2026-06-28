@@ -16,7 +16,7 @@
 --     - the mutating UDF REVOKEd from PUBLIC (L7 defense-in-depth)
 --
 -- The cooperative leave runtime (drain -> cross-node commit -> survivor
--- serve-gate, 53R62 quiesce) + the 6 cluster-clean-leave-* inject points
+-- serve-gate, 53R62 quiesce) + the 7 cluster-clean-leave-* inject points
 -- (which register lazily on first hit, so they are not visible in this
 -- single-node never-leaves instance) are exercised in
 -- t/308_cluster_5_13_clean_leave.pl.

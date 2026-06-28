@@ -319,6 +319,17 @@ UT_TEST(test_ic_payload_validation)
 	a.version = CLUSTER_CLEAN_LEAVE_IC_VERSION + 1;
 	cluster_clean_leave_announce_compute_crc(&a);
 	UT_ASSERT(!cluster_clean_leave_announce_payload_valid(&a));
+
+	/*
+	 * Hardening v1.0.3 (P2): an OLD payload version (v1, pre-nonce) must be
+	 * DROPPED, not accepted — the wider v2 frame would misparse a v1 sender's
+	 * narrower bytes, and mixed-version fail-closed must not rely on a CRC-offset
+	 * accident.  CRC is recomputed over the v2 layout so it is valid; ONLY the
+	 * exact-version gate may reject this, isolating the fix.
+	 */
+	a.version = 1;
+	cluster_clean_leave_announce_compute_crc(&a);
+	UT_ASSERT(!cluster_clean_leave_announce_payload_valid(&a));
 	a.version = CLUSTER_CLEAN_LEAVE_IC_VERSION;
 
 	/* tampered field after CRC -> invalid */
@@ -344,6 +355,13 @@ UT_TEST(test_ic_payload_validation)
 	ack.nak = 0;
 	cluster_clean_leave_ack_compute_crc(&ack);
 	UT_ASSERT(cluster_clean_leave_ack_payload_valid(&ack));
+
+	/* Hardening v1.0.3 (P2): old ACK version (v1) dropped too (exact-version gate). */
+	ack.version = 1;
+	cluster_clean_leave_ack_compute_crc(&ack);
+	UT_ASSERT(!cluster_clean_leave_ack_payload_valid(&ack));
+	ack.version = CLUSTER_CLEAN_LEAVE_IC_VERSION;
+	cluster_clean_leave_ack_compute_crc(&ack);
 
 	/* tampered ACK (flip nak after CRC) -> invalid */
 	ack.nak = 1;

@@ -128,6 +128,17 @@ typedef enum ClusterLeaveMarkerSubmitResult {
 } ClusterLeaveMarkerSubmitResult;
 
 /*
+ * ClusterLeaveAbortReason (Hardening v1.0.3) — why an in-flight leave clean-
+ * aborted, recorded in shmem so cluster_clean_leave_request() can map a
+ * drive_drain-side preflight-incomplete timeout to rejected:preflight_incomplete
+ * (a clean abort lands back in IDLE with no NAK, so the phase alone is ambiguous).
+ */
+typedef enum ClusterLeaveAbortReason {
+	CLUSTER_LEAVE_ABORT_NONE = 0,
+	CLUSTER_LEAVE_ABORT_PREFLIGHT_INCOMPLETE = 1 /* not every alive survivor ACKed in time */
+} ClusterLeaveAbortReason;
+
+/*
  * ClusterLeaveState — shmem state for the in-progress leave (§2.1).  Single
  * leave at a time (declared-set is static in v1).  Guarded by `lock`; `phase`
  * is also kept as an atomic for the hot serve-gate read.
@@ -203,6 +214,25 @@ typedef struct ClusterLeaveState {
 	pg_atomic_uint64 leave_attempt_nonce;
 	pg_atomic_uint32 preflight_pending;
 	pg_atomic_uint32 preflight_sent;
+
+	/*
+	 * Hardening v1.0.3 fields.
+	 *   request_in_progress (P1 same-node serialization): a CAS-reserved owner
+	 *     flag held for the WHOLE request (entry..return, including the multi-
+	 *     second preflight wait and the inline drain).  The unlocked phase==IDLE
+	 *     test cannot serialize two same-node pg_cluster_clean_leave_request()
+	 *     callers — phase stays IDLE until REQUESTED, which is set only AFTER the
+	 *     preflight — so both could pass it and double-drain.  A second caller
+	 *     whose CAS fails is rejected:leave_in_progress.  Released via PG_CATCH on
+	 *     any ereport(ERROR) escape so the reservation can never leak.
+	 *   abort_reason (P1 preflight-incomplete): set before a drive_drain-side
+	 *     clean-abort caused by a preflight-incomplete timeout (no NAK, but not
+	 *     every alive survivor ACKed) so the request maps it to
+	 *     rejected:preflight_incomplete instead of the bare ACCEPTED (the request
+	 *     keys on this, NOT the post-abort phase, which is back at IDLE).
+	 */
+	pg_atomic_uint32 request_in_progress;
+	pg_atomic_uint32 abort_reason; /* ClusterLeaveAbortReason */
 
 	/*
 	 * Voting-disk leave-marker submit mailbox (§2.5 two-phase commit) — a
@@ -394,7 +424,13 @@ typedef enum ClusterLeaveRequestResult {
 	CLUSTER_LEAVE_REQ_NOOP_NO_PEER,			  /* single-node / no surviving peer to hand off to */
 	CLUSTER_LEAVE_REQ_REJECTED_IN_PROGRESS,	  /* a leave is already in progress */
 	CLUSTER_LEAVE_REQ_REJECTED_PEERS_NOT_ENABLED, /* mixed-mode: a survivor is disabled (preflight) */
-	CLUSTER_LEAVE_REQ_REJECTED_NOT_DURABLE /* REQUESTED marker did not reach a disk majority */
+	CLUSTER_LEAVE_REQ_REJECTED_NOT_DURABLE, /* REQUESTED marker did not reach a disk majority */
+	CLUSTER_LEAVE_REQ_REJECTED_PREFLIGHT_INCOMPLETE /* Hardening v1.0.3 (P1): an alive survivor did
+													 * not preflight-ACK before the deadline (silent /
+													 * version-skew / IC loss) — fail-closed, NOT the
+													 * old fail-open ACCEPTED.  Distinct from
+													 * peers_not_all_enabled (a definite disabled NAK):
+													 * incomplete = handshake unfinished, retry/diagnose */
 } ClusterLeaveRequestResult;
 
 /* leaving-node driver (runs on the LEAVING node). */

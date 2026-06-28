@@ -124,6 +124,9 @@ cluster_clean_leave_shmem_init(void)
 		pg_atomic_init_u64(&cl_state->leave_attempt_nonce, 0);
 		pg_atomic_init_u32(&cl_state->preflight_pending, 0);
 		pg_atomic_init_u32(&cl_state->preflight_sent, 0);
+		/* Hardening v1.0.3 (P1 same-node serialization + preflight-incomplete reason). */
+		pg_atomic_init_u32(&cl_state->request_in_progress, 0);
+		pg_atomic_init_u32(&cl_state->abort_reason, (uint32)CLUSTER_LEAVE_ABORT_NONE);
 		/* §2.5 leave-marker submit mailbox. */
 		cl_state->qvotec_latch = NULL;
 		pg_atomic_init_u64(&cl_state->marker_request_seq, 0);
@@ -384,6 +387,15 @@ cl_announce_handler(const ClusterICEnvelope *env, const void *payload)
 	 * two-layer mixed-mode defense — the leaver gathers these ACKs before it ever
 	 * enters REQUESTED / broadcasts the real announce. */
 	if (p->preflight) {
+		/*
+		 * Hardening v1.0.3 (P1 test seam): a :skip arm makes this survivor SILENT
+		 * on the probe — neither ACK nor NAK — modelling a version-skewed / IC-
+		 * dropping / slow survivor.  The leaver must then fail-closed
+		 * (rejected:preflight_incomplete), not fail-open past the deadline.
+		 */
+		CLUSTER_INJECTION_POINT("cluster-clean-leave-survivor-suppress-preflight-ack");
+		if (cluster_injection_should_skip("cluster-clean-leave-survivor-suppress-preflight-ack"))
+			return;
 		cluster_clean_leave_ic_send_ack(env->source_node_id, leaving, p->leave_epoch,
 										p->leave_nonce, false, (uint8)CLUSTER_LEAVE_NAK_NONE);
 		return;
@@ -1010,32 +1022,33 @@ cl_escalate(void)
 }
 
 /*
- * cluster_clean_leave_request -- internal C driver entry (the operator SQL UDF
- * pg_cluster_clean_leave_request maps the result to its text return, D13b).
- * Gates on enabled + in_quorum + a live peer + no leave already in progress, then
- * records intent (durable REQUESTED marker) and drives the local drain
- * synchronously (Option A: the flush runs in THIS backend, CL-I9).
+ * cl_request_body -- the reserved core of a clean-leave request.  The public
+ * entry cluster_clean_leave_request holds the request_in_progress reservation
+ * around this (Hardening v1.0.3); the operator SQL UDF maps the result to text,
+ * D13b.  Gates on in_quorum + a live peer + no leave already in progress, runs the
+ * F6 preflight (fail-CLOSED, Hardening v1.0.3), then records intent (durable
+ * REQUESTED marker) and drives the local drain synchronously (Option A: the flush
+ * runs in THIS backend, CL-I9).
  *
  *	IC-send ownership (architectural): cluster_ic_send_envelope* is LMON-only
  *	(single-producer invariant), so this backend does NO IC send.  The
  *	CLEAN_LEAVE_ANNOUNCE is broadcast by the leaving-node LMON tick once it sees
  *	the REQUESTED state; the survivor ACK / NAK and the LEAVE_COMMIT_READY are
- *	likewise LMON-driven.  The mixed-mode preflight (a disabled survivor) is
- *	therefore caught by the announce-NAK rather than a synchronous probe — the
- *	drain waits briefly for that NAK before any destructive step (clean abort, no
- *	commit).  v1 thus returns ACCEPTED for a mixed-mode request and aborts
- *	cleanly async (no false commit); a synchronous rejected:peers_not_all_enabled
- *	would need a backend↔LMON preflight handshake (forward).
+ *	likewise LMON-driven.  The F6 preflight (Hardening v1.0.2) probes every survivor
+ *	with a side-effect-free preflight=true announce BEFORE any state change: a
+ *	disabled survivor NAKs (rejected:peers_not_all_enabled), and a silent / version-
+ *	skewed survivor that never ACKs makes the request fail-CLOSED
+ *	(rejected:preflight_incomplete, Hardening v1.0.3) instead of falling open into
+ *	the drain.  Only an escalate (real death / deadline mid-drain) returns ACCEPTED
+ *	and leaves via fail-stop.
  */
-ClusterLeaveRequestResult
-cluster_clean_leave_request(void)
+static ClusterLeaveRequestResult
+cl_request_body(void)
 {
 	uint64 baseline_epoch;
 	int32 coordinator;
 	ClusterLeaveIntentMarker m;
 
-	if (cl_state == NULL || !cluster_enabled || !cluster_clean_leave_enabled)
-		return CLUSTER_LEAVE_REQ_REJECTED_DISABLED;
 	if (pg_atomic_read_u32(&cl_state->phase) != CLUSTER_LEAVE_IDLE)
 		return CLUSTER_LEAVE_REQ_REJECTED_IN_PROGRESS;
 	/*
@@ -1102,6 +1115,21 @@ cluster_clean_leave_request(void)
 				return CLUSTER_LEAVE_REQ_REJECTED_IN_PROGRESS;
 			return CLUSTER_LEAVE_REQ_REJECTED_PEERS_NOT_ENABLED;
 		}
+
+		/*
+		 * Hardening v1.0.3 (P1, fail-CLOSED): the loop breaks early ONLY when every
+		 * alive survivor preflight-ACKed.  Reaching here with no NAK but not-all-
+		 * acked means the ~5s deadline expired with a survivor still silent (version
+		 * skew drops the v2 frame / IC loss / slow).  v1.0.2 fell THROUGH to
+		 * REQUESTED here — fail-OPEN: it then broadcast the real announce and an
+		 * enabled-but-silent survivor would drop its GRD/PCM refs to a leaver whose
+		 * readiness was never confirmed (8.A).  Fail closed instead: no marker, no
+		 * state, no survivor side effect — the operator retries / diagnoses the
+		 * silent peer.  Distinct from peers_not_all_enabled (a definite DISABLED
+		 * NAK); incomplete = the handshake never finished.
+		 */
+		if (!cl_all_survivors_acked(cluster_node_id))
+			return CLUSTER_LEAVE_REQ_REJECTED_PREFLIGHT_INCOMPLETE;
 	}
 
 	baseline_epoch = cluster_epoch_get_current();
@@ -1112,6 +1140,24 @@ cluster_clean_leave_request(void)
 	cl_state->leave_baseline_dead_gen = cluster_cssd_get_dead_generation();
 	cl_state->barrier_deadline_us
 		= (uint64)GetCurrentTimestamp() + (uint64)cluster_clean_leave_drain_timeout_ms * 1000ULL;
+	/*
+	 * Hardening v1.0.3 (P1, nonce pollution): the REAL announce gets a FRESH nonce,
+	 * distinct from the preflight's.  The ack handler binds an ACK to the current
+	 * leave_attempt_nonce only; with the preflight and real announce sharing one
+	 * nonce (v1.0.2), a preflight ACK arriving AFTER the ack_bitmap memset below
+	 * could re-set a survivor's bit and pollute the real readiness tally.  A fresh
+	 * nonce makes any late preflight ACK/NAK fail the nonce gate and be dropped.
+	 * GetCurrentTimestamp() is microseconds-monotonic and the preflight wait was
+	 * seconds, so it already differs; the guard is belt-and-suspenders.
+	 */
+	{
+		uint64 preflight_nonce = pg_atomic_read_u64(&cl_state->leave_attempt_nonce);
+		uint64 real_nonce = (uint64)GetCurrentTimestamp();
+
+		if (real_nonce == preflight_nonce)
+			real_nonce++;
+		pg_atomic_write_u64(&cl_state->leave_attempt_nonce, real_nonce);
+	}
 	memset(cl_state->ack_bitmap, 0, sizeof(cl_state->ack_bitmap));
 	pg_atomic_write_u32(&cl_state->nak_received, 0);
 	pg_atomic_write_u32(&cl_state->nak_reason, (uint32)CLUSTER_LEAVE_NAK_NONE);
@@ -1158,7 +1204,63 @@ cluster_clean_leave_request(void)
 		/* DISABLED (or an unspecified refusal): a survivor is not enabled. */
 		return CLUSTER_LEAVE_REQ_REJECTED_PEERS_NOT_ENABLED;
 	}
+	/*
+	 * Hardening v1.0.3 (P1): drive_drain clean-aborts (no NAK) when its own ~5s
+	 * announce-ACK wait expires with a survivor still silent.  cl_clean_abort lands
+	 * back in IDLE and sets NO nak, so the bare return below would mis-report
+	 * ACCEPTED.  It records CLUSTER_LEAVE_ABORT_PREFLIGHT_INCOMPLETE; map it to the
+	 * same fail-closed reject the request-side preflight uses.
+	 */
+	if (pg_atomic_read_u32(&cl_state->abort_reason)
+		== (uint32)CLUSTER_LEAVE_ABORT_PREFLIGHT_INCOMPLETE)
+		return CLUSTER_LEAVE_REQ_REJECTED_PREFLIGHT_INCOMPLETE;
 	return CLUSTER_LEAVE_REQ_ACCEPTED;
+}
+
+/*
+ * cluster_clean_leave_request -- public C driver entry (the operator SQL UDF
+ * pg_cluster_clean_leave_request maps the result to its text return, D13b).
+ *
+ *	Hardening v1.0.3 (P1, same-node serialization): the unlocked phase==IDLE test
+ *	in cl_request_body cannot serialize two same-node callers — phase stays IDLE
+ *	through the multi-second preflight window (REQUESTED is set only AFTER the
+ *	preflight), so without a reservation BOTH could pass it, both set REQUESTED, and
+ *	both run cluster_clean_leave_drive_drain (which gates only on phase==REQUESTED)
+ *	= a double GES drain / double PCM-X release.  Reserve request_in_progress with a
+ *	CAS held for the WHOLE request (entry..return, including the inline drain); a
+ *	second caller whose CAS fails is rejected:leave_in_progress.  The reservation is
+ *	released on every path, including an ereport(ERROR) escape (PG_CATCH +
+ *	PG_RE_THROW) — a leaked flag would wedge the node (no future leave) until restart.
+ */
+ClusterLeaveRequestResult
+cluster_clean_leave_request(void)
+{
+	ClusterLeaveRequestResult result;
+	uint32 expected = 0;
+
+	if (cl_state == NULL || !cluster_enabled || !cluster_clean_leave_enabled)
+		return CLUSTER_LEAVE_REQ_REJECTED_DISABLED;
+
+	/* Reserve before any other work; a second concurrent caller is rejected. */
+	if (!pg_atomic_compare_exchange_u32(&cl_state->request_in_progress, &expected, 1))
+		return CLUSTER_LEAVE_REQ_REJECTED_IN_PROGRESS;
+
+	/* Clear any prior attempt's abort reason so the post-drain mapping is fresh. */
+	pg_atomic_write_u32(&cl_state->abort_reason, (uint32)CLUSTER_LEAVE_ABORT_NONE);
+
+	PG_TRY();
+	{
+		result = cl_request_body();
+	}
+	PG_CATCH();
+	{
+		pg_atomic_write_u32(&cl_state->request_in_progress, 0);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	pg_atomic_write_u32(&cl_state->request_in_progress, 0);
+	return result;
 }
 
 /*
@@ -1203,6 +1305,25 @@ cluster_clean_leave_drive_drain(void)
 		pg_usleep(10 * 1000);
 	}
 	if (pg_atomic_read_u32(&cl_state->nak_received)) {
+		cl_clean_abort();
+		return;
+	}
+	/*
+	 * Hardening v1.0.3 (P1, fail-CLOSED; mirrors the request-side preflight gate):
+	 * the loop also exits on the ~5s deadline.  If it expired with no NAK but not
+	 * every alive survivor ACKed, a survivor is silent — do NOT fall through into
+	 * the destructive drain (quiesce / GES drain / GCS flush + PCM-X release) on an
+	 * unconfirmed barrier (8.A: a survivor that never dropped its refs could serve
+	 * a leaving-node block stale after the flush).  Record the reason so the
+	 * request maps it to rejected:preflight_incomplete, then clean-abort (revert
+	 * the REQUESTED marker -> IDLE).  NOT an escalate: a silent survivor is not a
+	 * real death, so the fail-stop fallback must not fire.
+	 */
+	if (!cl_all_survivors_acked(cluster_node_id)) {
+		pg_atomic_write_u32(&cl_state->abort_reason,
+							(uint32)CLUSTER_LEAVE_ABORT_PREFLIGHT_INCOMPLETE);
+		ereport(LOG, (errmsg("cluster clean-leave: not every alive survivor acknowledged the leave "
+							 "before the deadline; clean-aborting (no drain, no commit)")));
 		cl_clean_abort();
 		return;
 	}

@@ -307,7 +307,15 @@ cluster_clean_leave_announce_payload_valid(const ClusterLeaveAnnouncePayload *p)
 {
 	if (p->magic != CLUSTER_CLEAN_LEAVE_IC_MAGIC)
 		return false;
-	if (p->version == 0 || p->version > CLUSTER_CLEAN_LEAVE_IC_VERSION)
+	/*
+	 * Hardening v1.0.3 (P2): require the EXACT current wire version.  The v1->v2
+	 * widening (leave_nonce) moved the crc offset and the struct width, so a v1
+	 * sender's narrower frame parsed as v2 is garbage past cssd_dead_generation;
+	 * accepting version<CURRENT would rely on the crc-offset mismatch happening to
+	 * differ, not on an explicit gate.  Drop any non-current version (mixed-version
+	 * fail-closed, 8.A defense-in-depth) — there is no length field to disambiguate.
+	 */
+	if (p->version != CLUSTER_CLEAN_LEAVE_IC_VERSION)
 		return false;
 	if (p->crc != clean_leave_announce_crc(p))
 		return false;
@@ -338,7 +346,8 @@ cluster_clean_leave_ack_payload_valid(const ClusterLeaveAckPayload *p)
 {
 	if (p->magic != CLUSTER_CLEAN_LEAVE_IC_MAGIC)
 		return false;
-	if (p->version == 0 || p->version > CLUSTER_CLEAN_LEAVE_IC_VERSION)
+	/* Hardening v1.0.3 (P2): exact version gate (see announce validator). */
+	if (p->version != CLUSTER_CLEAN_LEAVE_IC_VERSION)
 		return false;
 	if (p->crc != clean_leave_ack_crc(p))
 		return false;
