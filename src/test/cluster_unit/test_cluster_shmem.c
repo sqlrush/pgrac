@@ -621,6 +621,14 @@ cluster_cr_admit_shmem_register(void)
 void
 cluster_cr_tuple_stat_shmem_register(void)
 {}
+/* spec-5.57 D3: cross-instance CR coordinator boundary region register +
+ * GUC backing vars referenced by cluster_guc.o.  Link-only stubs (independent
+ * region; not a substrate change). */
+void
+cluster_cr_coordinator_shmem_register(void)
+{}
+int cluster_cross_instance_cr_coordinator = 1;		/* CR_COORD_MODE_BOUNDARY (spec-5.57) */
+bool cluster_cross_instance_cr_probe = false;		/* spec-5.57 D0 */
 int cluster_cr_pool_admission_policy = 0;			/* spec-5.52 D8 */
 int cluster_cr_pool_admit_relation_backend_cap = 0; /* spec-5.52 D8 */
 int cluster_cr_pool_admit_pressure_ratio = 0;		/* spec-5.52 D8 */

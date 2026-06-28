@@ -196,13 +196,21 @@ extern void cluster_cr_pool_abort(const ClusterCRPoolHandle *h);
  *                                                               runtime-warm remote image is
  *                                                               NOT in the pool (tier-3 fall-
  *                                                               through) => class-③ fail-
- *                                                               closed assert + forward 5.57
+ *                                                               closed (spec-5.57 FROZEN)
  *
  *  INV-L0 (total fail-closed): if ANY lifecycle signal is unavailable /
  *    inconsistent / uncertain -> MISS / reconstruct (NEVER stale-serve).  The
  *    pool holds ONLY fully-materialized images (no live-undo serve path); if that
  *    invariant is ever broken, the corresponding invalidation MUST be added — the
  *    image must never be served by default.
+ *
+ *  C4 class-③ (spec-5.57 D6, frozen contract): the runtime-warm remote image's
+ *    "fail-closed assert" is now the FROZEN read-path coordinator boundary (CR-9):
+ *    the CR walker fail-closes 53R9G before construct, so class③ never enters the
+ *    pool and needs no membership/remaster invalidation while it stays out.  When
+ *    the Stage 6 data plane (#119) lets class③ images IN, that ship gate MUST add
+ *    the GES-remaster-driven (fence_epoch) invalidation (spec-5.57 §3.4); until
+ *    then this stays a hard boundary, not a silent assumption.
  * ============================================================ */
 
 /* ---- lifecycle epoch (spec-5.51 D5) ---- */

@@ -268,6 +268,8 @@ int cluster_cr_cache_max_blocks = 64;
 int cluster_cr_pool_admission_policy = 0;			/* spec-5.52 D8 (0 == admit_all) */
 int cluster_cr_pool_admit_relation_backend_cap = 0; /* spec-5.52 D8 */
 int cluster_cr_pool_admit_pressure_ratio = 0;		/* spec-5.52 D8 */
+int cluster_cross_instance_cr_coordinator = 1;		/* spec-5.57 D3 (1 == boundary) */
+bool cluster_cross_instance_cr_probe = false;		/* spec-5.57 D0 */
 
 /* spec-5.1b D7: cluster_ges_mode_selfcheck GUC removed (cluster_guc.c no
  * longer references it), so the stub definition is gone too. */

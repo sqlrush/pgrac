@@ -1722,13 +1722,23 @@ cluster_undo_get_record(UBA uba, void *out_buffer, size_t buffer_size)
 	/* Own-instance, or a merged-materialized remote instance (spec-4.5a D8):
 	 * the path builder below derives the directory from owner_instance, so a
 	 * materialized peer's records read straight from the local
-	 * pg_undo/instance_<origin> tree.  Other cross-instance reads stay
-	 * unsupported (runtime Cache Fusion is 4.6/4.7). */
+	 * pg_undo/instance_<origin> tree.  Other (runtime-warm) cross-instance reads
+	 * stay unsupported -- the read-path coordinator boundary (Spec: spec-5.57).
+	 *
+	 * This is the W3 wall.  It keeps its RETURN-BASED fail-closed contract (the
+	 * recovery (cluster_tt_recovery.c) and SQL SRF (cluster_undo_srf.c) callers
+	 * treat 0 as stop/NULL, never visible); per spec-5.57 Q11-A it is NOT
+	 * blanket-converted to ERROR.  The CR-construct caller no longer relies on
+	 * this branch: the spec-5.57 D2 pre-check in cluster_cr.c fail-closes a
+	 * runtime-warm cross-instance origin with 53R9G BEFORE this read, so for the
+	 * CR path the boundary is consolidated to one errcode.  The runtime
+	 * cross-instance undo data plane lands in Stage 6 (#119). */
 	if (owner_instance != (uint8)(cluster_node_id + 1)
 		&& !cluster_merged_instance_is_materialized((int)owner_instance - 1)) {
 		ereport(WARNING,
-				(errmsg("cluster_undo_get_record: cross-instance read not supported at spec-3.7"),
-				 errhint("cross-instance undo read 推 spec-3.9 CR construction / Cache Fusion")));
+				(errmsg("cluster_undo_get_record: runtime cross-instance undo read not supported"),
+				 errhint("Cross-instance undo/CR data plane lands in Stage 6 (#119 undo-block "
+						 "Cache Fusion); see Spec: spec-5.57.")));
 		return 0;
 	}
 	if (owner_instance != (uint8)(cluster_node_id + 1))

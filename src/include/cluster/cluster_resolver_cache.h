@@ -102,6 +102,19 @@ extern uint64 cluster_resolver_xid_epoch(void);
 /* ---- spec-5.55 D4/D5: probe + install (trust path) ---- */
 
 /*
+ * spec-5.57 D5 (cross-instance identity contract, frozen; no data plane here):
+ *	the memo's (origin_node, xid_epoch) is OWN-INSTANCE-ONLY at 5.55 -- the caller
+ *	passes its own node id and the by-xid scan is local.  spec-5.57 freezes the
+ *	cross-instance forward semantics: origin_node != cluster_node_id is the
+ *	class③ runtime-warm-remote ROUTING dimension (where to fetch undo from), and
+ *	xid_epoch is the fence that, extended to be GES-remaster-aware, invalidates a
+ *	cross-instance hint on remaster.  These are ENABLED only when the Stage 6
+ *	(#119) cross-instance undo data plane lands; until then the CR walker
+ *	fail-closes a runtime-warm remote origin (53R9G) before any resolve, so the
+ *	memo is never consulted cross-instance.  See Spec: spec-5.57 §2.4 / §3.5.
+ */
+
+/*
  * cluster_resolver_cache_probe -- look up the memo for (current-epoch, raw_xid,
  *	origin) and, on a key match, LOCK-FREE re-validate the hint slot via
  *	cluster_tt_slot_durable_lookup (gate (1)+(2)+(4)).  Returns true and a

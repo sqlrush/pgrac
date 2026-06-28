@@ -49,7 +49,8 @@
 #include "cluster/cluster_cr_admit.h" /* spec-5.52 D2: insert-side admission gate */
 #include "cluster/cluster_cr_apply.h"
 #include "cluster/cluster_cr_cache.h"
-#include "cluster/cluster_cr_pool.h"  /* spec-5.51 D4: shared L2 CR pool */
+#include "cluster/cluster_cr_coordinator_stat.h" /* spec-5.57 D2/D3: coordinator boundary */
+#include "cluster/cluster_cr_pool.h"			 /* spec-5.51 D4: shared L2 CR pool */
 #include "cluster/cluster_cr_tuple.h" /* spec-5.54: tuple-level / verdict-only fast path */
 #include "cluster/cluster_conf.h"	  /* spec-3.24 D1: cluster_conf_has_peers */
 #include "cluster/cluster_guc.h"	  /* cluster_cr_chain_walk_max_steps, cluster_node_id */
@@ -237,6 +238,55 @@ cr_scratch_ensure(void)
 }
 
 
+/*
+ * cr_coordinator_refuse_runtime_remote -- spec-5.57 D2: the single fail-closed
+ *	refusal routine for a class③ (runtime-warm remote) CR origin.  Shared by the
+ *	CR-side pre-check (the real boundary, on a real remote UBA) AND the W2 test
+ *	injection (a synthetic class③), so the injection exercises the exact runtime
+ *	behavior the production pre-check uses.
+ *
+ *	One class③ refusal is BOTH the boundary headline (cross_instance_cr_refused)
+ *	and specifically the remote-undo-read leg (remote_undo_read_refused); both
+ *	bump by construction.  The rare W1 header-mismatch belt bumps only
+ *	cross_instance_cr_refused, giving the invariant
+ *	cross_instance_cr_refused >= remote_undo_read_refused.
+ *
+ *	NON-DEGRADABLE (rule 8.A, §2.2): the ereport fires under ANY GUC value; the
+ *	GUC only gates the advisory counters / probe / LOG-once.  This function never
+ *	returns (it always ereport(ERROR)s).  The data plane is Stage 6 (#119).
+ */
+static void
+pg_attribute_noreturn() cr_coordinator_refuse_runtime_remote(int origin_node)
+{
+	if (cluster_cross_instance_cr_coordinator != CR_COORD_MODE_OFF) {
+		cluster_cr_coordinator_stat_bump(CR_COORD_CROSS_INSTANCE_CR_REFUSED);
+		cluster_cr_coordinator_stat_bump(CR_COORD_REMOTE_UNDO_READ_REFUSED);
+	}
+	/* D0 measure-leg: count the class③ hit (behavior unchanged -- still fails). */
+	if (cluster_cross_instance_cr_probe)
+		cluster_cr_coordinator_stat_bump(CR_COORD_CROSS_INSTANCE_BOUNDARY_PROBE);
+	/* forward mode: LOG-once that the data plane is Stage 6 (L213: once per
+	 * backend so the hot path is never flooded). */
+	if (cluster_cross_instance_cr_coordinator == CR_COORD_MODE_FORWARD) {
+		static bool forward_logged = false;
+
+		if (!forward_logged) {
+			forward_logged = true;
+			elog(LOG, "cluster.cross_instance_cr_coordinator=forward is a contract "
+					  "placeholder: cross-instance CR/undo data plane lands in Stage 6 "
+					  "(#119); reads stay fail-closed (Spec: spec-5.57)");
+		}
+	}
+	ereport(ERROR, (errcode(ERRCODE_CLUSTER_CR_CROSS_INSTANCE_UNSUPPORTED),
+					errmsg("cluster CR cross-instance UBA encountered at the remote-undo-read "
+						   "leg (origin_node_id=%d, local=%d)",
+						   origin_node, cluster_node_id),
+					errhint("Own-instance CR only unless the origin was materialized by merged "
+							"recovery; the runtime cross-instance CR/undo data plane lands in "
+							"Stage 6 (#119 undo-block Cache Fusion); see Spec: spec-5.57.")));
+}
+
+
 /* ============================================================
  * Test injection hooks (spec-3.9 Step 7; SKIP-style precondition)
  * ============================================================ */
@@ -260,11 +310,11 @@ cr_check_error_injections(void)
 								"cluster_inject_fault('cr_snapshot_too_old','none',0).")));
 
 	if (cluster_cr_injection_armed("cr_cross_instance", &param))
-		ereport(ERROR,
-				(errcode(ERRCODE_CLUSTER_CR_CROSS_INSTANCE_UNSUPPORTED),
-				 errmsg("cluster CR cross-instance UBA (injected; origin_node_id=%u, local=%d)",
-						(uint32)param, cluster_node_id),
-				 errhint("test injection cr_cross_instance; spec-3.9 is own-instance only.")));
+		/* spec-5.57 D2/D3: synthetic class③ refusal -- drive the SAME fail-closed
+		 * routine the production pre-check uses (53R9G + both coordinator counters
+		 * + probe/forward), so the TAP injection legs exercise the real boundary
+		 * behavior deterministically (param = synthetic origin_node_id). */
+		cr_coordinator_refuse_runtime_remote((int)param);
 
 	if (cluster_cr_injection_armed("cr_corruption", &param)) {
 		const char *kind = (param == 1)	  ? "uba_decode"
@@ -341,6 +391,39 @@ cr_walk_chain(char *scratch_page, UBA start_uba, SCN read_scn,
 			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 							errmsg("cluster CR encountered a malformed UBA in the undo chain")));
 
+		/*
+		 * spec-5.57 D2 (Q11-A): CR-side remote-UBA pre-check -- the read-path
+		 * coordinator boundary, applied BEFORE the undo read.  Derive the
+		 * segment owner from the UBA and classify it (§0.1).  A runtime-warm
+		 * cross-instance origin (class③: not own, not merged-materialized) is
+		 * the net-new boundary: fail closed HERE with the canonical 53R9G,
+		 * rather than letting cluster_undo_get_record() return 0 and conflate it
+		 * with own-instance retention-recycled undo (53R9F below).  This is the
+		 * W3 hardening: the remote-undo-read leg now fails closed with the SAME
+		 * errcode as the W1 walker wall (errcode consolidation, CR-9).  It is
+		 * NON-DEGRADABLE -- the ereport fires under any GUC value; the GUC only
+		 * gates the advisory counters (rule 8.A, §2.2).  Own-instance is the
+		 * common OLTP path: classify returns OWN and we fall straight through.
+		 * The data plane (real remote undo fetch) is Stage 6 (#119).
+		 * See Spec: spec-5.57 §3.1 (W3) / §2.1 (three roles).
+		 */
+		{
+			NodeId cr_origin = uba_origin_node_id(uba);
+			ClusterCrCoordOriginClass cr_origin_class
+				= cluster_cr_coordinator_classify_origin(cr_origin);
+
+			if (cr_origin_class == CR_COORD_ORIGIN_RUNTIME_REMOTE) {
+				/* class③: fail closed via the shared refusal routine (53R9G +
+				 * both coordinator counters; non-degradable, §2.2). */
+				cr_coordinator_refuse_runtime_remote((int)cr_origin);
+			} else if (cr_origin_class == CR_COORD_ORIGIN_MATERIALIZED_REMOTE) {
+				/* class②: merged-materialized remote, served from the local tree
+				 * (already shipped, spec-4.5a D8).  Count the serve (advisory). */
+				if (cluster_cross_instance_cr_coordinator != CR_COORD_MODE_OFF)
+					cluster_cr_coordinator_stat_bump(CR_COORD_MATERIALIZED_REMOTE_SERVED);
+			}
+		}
+
 		len = cluster_undo_get_record(uba, record_buf.data, sizeof(record_buf.data));
 		if (len == 0)
 			ereport(ERROR,
@@ -361,30 +444,40 @@ cr_walk_chain(char *scratch_page, UBA start_uba, SCN read_scn,
 
 		/* Own-instance, or a merged-materialized remote instance whose undo
 		 * lives in the local pg_undo/instance_<origin> tree (spec-4.5a D8).
-		 * Anything else stays the spec-3.9 fail-closed.
+		 * Anything else stays fail-closed (Spec: spec-5.57 §3.1 W1).
+		 *
+		 * This is the W1 belt: the spec-5.57 D2 segment-derived pre-check above
+		 * (on uba_origin_node_id) catches the common class③ case BEFORE the undo
+		 * read, so this header-origin check now fires only on the rare segment-
+		 * vs-header mismatch (D8 §2.5 cross-check) -- defense-in-depth, never a
+		 * silent assumption.
 		 *
 		 * spec-5.56 C4 (reconfig contract, §3.3): this carve-out is ALSO the
 		 * fail-closed boundary that keeps the THIRD origin class — runtime warm
 		 * remote (not own, not merged-materialized) — OUT of the CR pool: it never
-		 * constructs (ERROR below) so it never caches.  The two pool-eligible
-		 * classes are reconfig-INVARIANT and need NO membership/remaster
-		 * invalidation: (①) own-instance pages/undo are unchanged by reconfig; (②)
-		 * merged-materialized remote undo is durable in the local tree with a
-		 * reconfig-invariant merge_recovered_lsn authority, and an origin rejoin's
-		 * NEW writes are new versions => new key => MISS (already fenced by C1/key).
-		 * read_scn is a GLOBAL SCN (AD-008), not a membership epoch (INV-C2).  The
-		 * runtime-warm-remote class's reconfig/remaster invalidation is forwarded to
-		 * spec-5.57 (where construct stops fail-closing it); until then this ERROR
-		 * is the C4 class-③ guard (INV-C3), not a silent assumption. */
+		 * constructs (ERROR) so it never caches.  The two pool-eligible classes are
+		 * reconfig-INVARIANT and need NO membership/remaster invalidation: (①)
+		 * own-instance pages/undo are unchanged by reconfig; (②) merged-materialized
+		 * remote undo is durable in the local tree with a reconfig-invariant
+		 * merge_recovered_lsn authority, and an origin rejoin's NEW writes are new
+		 * versions => new key => MISS (already fenced by C1/key).  read_scn is a
+		 * GLOBAL SCN (AD-008), not a membership epoch (INV-C2).  spec-5.57 freezes
+		 * this class③ fail-closed as the read-path coordinator boundary (CR-9); the
+		 * runtime-warm-remote data plane lands in Stage 6 (#119). */
 		if (hdr->origin_node_id != (uint16)cluster_node_id
-			&& !cluster_merged_instance_is_materialized((int)hdr->origin_node_id))
-			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CR_CROSS_INSTANCE_UNSUPPORTED),
-							errmsg("cluster CR cross-instance UBA encountered "
-								   "(origin_node_id=%u, local=%d)",
-								   hdr->origin_node_id, cluster_node_id),
-							errhint("Own-instance CR only unless the origin was materialized by "
-									"merged recovery; runtime cross-instance CR is Stage 4 "
-									"(Cache Fusion CR coordinator).")));
+			&& !cluster_merged_instance_is_materialized((int)hdr->origin_node_id)) {
+			if (cluster_cross_instance_cr_coordinator != CR_COORD_MODE_OFF)
+				cluster_cr_coordinator_stat_bump(CR_COORD_CROSS_INSTANCE_CR_REFUSED);
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_CR_CROSS_INSTANCE_UNSUPPORTED),
+					 errmsg("cluster CR cross-instance UBA encountered "
+							"(origin_node_id=%u, local=%d)",
+							hdr->origin_node_id, cluster_node_id),
+					 errhint("Own-instance CR only unless the origin was materialized by "
+							 "merged recovery; the runtime cross-instance CR/undo data plane "
+							 "lands in Stage 6 (#119 undo-block Cache Fusion); see "
+							 "Spec: spec-5.57.")));
+		}
 
 		/* I-chain-1: normal SCN stop. */
 		if (scn_time_cmp(hdr->write_scn, read_scn) <= 0)

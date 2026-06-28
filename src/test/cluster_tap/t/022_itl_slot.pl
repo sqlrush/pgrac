@@ -71,7 +71,7 @@ my $has_visibility_inject =
 # and +1 for the unconditional "pgrac cluster cr admit stats" region (spec-5.52 D9;
 # and +1 for the unconditional "pgrac cluster cr relgen" region (spec-5.56 D4;
 # full enumerated region list + count lives in t/020).
-  my $expected_region_count = $has_visibility_inject ? '66' : '65'; # +1 clean_leave +1 cr relgen +1 cr tuple stats +1 resolver cache
+  my $expected_region_count = $has_visibility_inject ? '67' : '66'; # +1 clean_leave +1 cr relgen +1 cr tuple stats +1 resolver cache +1 cr coordinator
 
 
 # ----------

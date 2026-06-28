@@ -134,9 +134,10 @@ cluster_injection_get_count(void)
 	return 0;
 }
 
-#include "cluster/cluster_cr_pool.h"  /* spec-5.51 counter prototypes */
-#include "cluster/cluster_cr_admit.h" /* spec-5.52 D9 counter prototype */
-#include "cluster/cluster_cr_tuple.h" /* spec-5.54 D5 counter prototype */
+#include "cluster/cluster_cr_pool.h"			 /* spec-5.51 counter prototypes */
+#include "cluster/cluster_cr_admit.h"			 /* spec-5.52 D9 counter prototype */
+#include "cluster/cluster_cr_tuple.h"			 /* spec-5.54 D5 counter prototype */
+#include "cluster/cluster_cr_coordinator_stat.h" /* spec-5.57 D3 counter prototype */
 
 /*
  * spec-5.52 D9 stub (standalone cluster_debug unit test).  cluster_debug.o reads
@@ -157,6 +158,33 @@ uint64
 cluster_cr_tuple_stat_count(ClusterCRTupleOutcome outcome pg_attribute_unused())
 {
 	return 0;
+}
+
+/* spec-5.57 D3: cross-instance CR coordinator boundary counter accessor + key.
+ * Link-only stubs (the dump reads them; this test only checks the 'cr_coord'
+ * rows are emitted).  cluster_cr_coordinator_stat.o is not linked here. */
+uint64
+cluster_cr_coordinator_stat_count(ClusterCrCoordCounter counter pg_attribute_unused())
+{
+	return 0;
+}
+
+const char *
+cluster_cr_coordinator_counter_key(ClusterCrCoordCounter counter)
+{
+	switch (counter) {
+	case CR_COORD_CROSS_INSTANCE_CR_REFUSED:
+		return "cross_instance_cr_refused";
+	case CR_COORD_REMOTE_UNDO_READ_REFUSED:
+		return "remote_undo_read_refused";
+	case CR_COORD_MATERIALIZED_REMOTE_SERVED:
+		return "materialized_remote_served";
+	case CR_COORD_CROSS_INSTANCE_BOUNDARY_PROBE:
+		return "cross_instance_boundary_probe";
+	case CR_COORD_COUNTER__COUNT:
+		break;
+	}
+	return "unknown";
 }
 
 bool

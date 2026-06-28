@@ -1252,7 +1252,8 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 			}
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							errmsg("cluster_gcs_block: master does not hold tag and state != N"),
-							errhint("Cross-node holder migration handling lands in spec-2.X+.")));
+							errhint("Cross-node holder migration / DRM handling lands in Stage 6; "
+									"the cross-instance read-path boundary is Spec: spec-5.57.")));
 			break;
 		case GCS_BLOCK_REPLY_DENIED_INCOMPATIBLE:
 		default:

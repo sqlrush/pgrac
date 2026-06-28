@@ -38,15 +38,16 @@
 
 #include "utils/guc.h"
 
-#include "cluster/cluster_block_recovery.h"	 /* spec-4.10 D1 online block recovery GUCs */
-#include "cluster/cluster_thread_recovery.h" /* spec-4.11 D1 online thread recovery GUCs */
-#include "cluster/cluster_write_fence.h"	 /* spec-4.12 D7 write-fence enforcement GUCs */
-#include "cluster/cluster_conf.h"			 /* cluster_conf_has_peers (spec-3.18 D2b latch) */
-#include "cluster/cluster_cr_admit.h"		 /* cluster_cr_pool_admit* (spec-5.52 D8) */
-#include "cluster/cluster_cr_cache.h"		 /* cluster_cr_cache_max_blocks (spec-3.10 D4) */
-#include "cluster/cluster_grd.h"			 /* spec-5.10 starvation-protection shared flag */
-#include "cluster/cluster_cr_pool.h"		 /* cluster_shared_cr_pool_* (spec-5.51 D8) */
-#include "cluster/cluster_resolver_cache.h"	 /* cluster_shared_resolver_cache_* (spec-5.55 D7) */
+#include "cluster/cluster_block_recovery.h"		 /* spec-4.10 D1 online block recovery GUCs */
+#include "cluster/cluster_thread_recovery.h"	 /* spec-4.11 D1 online thread recovery GUCs */
+#include "cluster/cluster_write_fence.h"		 /* spec-4.12 D7 write-fence enforcement GUCs */
+#include "cluster/cluster_conf.h"				 /* cluster_conf_has_peers (spec-3.18 D2b latch) */
+#include "cluster/cluster_cr_admit.h"			 /* cluster_cr_pool_admit* (spec-5.52 D8) */
+#include "cluster/cluster_cr_coordinator_stat.h" /* cluster_cross_instance_cr_* (spec-5.57 D3) */
+#include "cluster/cluster_cr_cache.h"			 /* cluster_cr_cache_max_blocks (spec-3.10 D4) */
+#include "cluster/cluster_grd.h"				 /* spec-5.10 starvation-protection shared flag */
+#include "cluster/cluster_cr_pool.h"			 /* cluster_shared_cr_pool_* (spec-5.51 D8) */
+#include "cluster/cluster_resolver_cache.h" /* cluster_shared_resolver_cache_* (spec-5.55 D7) */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_hang.h"			  /* CLUSTER_HANG_MAX_SAMPLES (spec-5.11 D7) */
 #include "cluster/cluster_hang_resolve.h"	  /* HANG_RESOLVE_* + disposition GUCs (spec-5.12 D6) */
@@ -2632,6 +2633,47 @@ cluster_init_guc(void)
 					 "resolver_cache_measure must be on for this to allocate.  Each hint slot "
 					 "costs a few dozen bytes of shared memory."),
 		&cluster_shared_resolver_cache_entries, 0, 0, 1048576, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	/* spec-5.57 D3 §2.2: cross-instance CR read-path coordinator boundary.  This
+	 * GUC ONLY gates the D3 observability surface (counter bumps / dump / probe /
+	 * LOG-once); it NEVER gates the fail-closed 53R9G boundary, which is
+	 * non-degradable and fires under any value (8.A).  off != spec-5.56 zero
+	 * behavior change: the CR-path remote-undo read is unified to fail-closed
+	 * 53R9G under every value. */
+	{
+		static const struct config_enum_entry cluster_cross_instance_cr_coordinator_options[]
+			= { { "off", CR_COORD_MODE_OFF, false },
+				{ "boundary", CR_COORD_MODE_BOUNDARY, false },
+				{ "forward", CR_COORD_MODE_FORWARD, false },
+				{ NULL, 0, false } };
+
+		DefineCustomEnumVariable(
+			"cluster.cross_instance_cr_coordinator",
+			gettext_noop(
+				"Observability mode for the cross-instance CR read-path coordinator boundary."),
+			gettext_noop(
+				"Spec-5.57. Default boundary = the fail-closed cross-instance boundary plus "
+				"D3 counters. off turns OFF only the observability surface (counters/dump/"
+				"probe/LOG-once); the fail-closed 53R9G boundary itself is non-degradable "
+				"and fires under EVERY value (8.A) -- runtime-warm cross-instance CR/undo "
+				"reads never become visible. forward is a contract placeholder: it stays "
+				"fail-closed (the data plane is Stage 6, #119 undo-block Cache Fusion) but "
+				"LOG-once tells the operator so."),
+			&cluster_cross_instance_cr_coordinator, CR_COORD_MODE_BOUNDARY,
+			cluster_cross_instance_cr_coordinator_options, PGC_SIGHUP, 0, NULL, NULL, NULL);
+	}
+
+	DefineCustomBoolVariable(
+		"cluster.cross_instance_cr_probe",
+		gettext_noop(
+			"Count class③ runtime-warm cross-instance CR hits for the spec-5.57 measure-leg."),
+		gettext_noop(
+			"Spec-5.57 D0. Default off. When on, a class③ (runtime-warm remote) CR hit "
+			"additionally bumps the cross_instance_boundary_probe counter -- COUNT ONLY, "
+			"behavior unchanged: the read is still fail-closed 53R9G (never visible). Used "
+			"to measure that the cross-instance data plane is unreachable in Stage 5.5 "
+			"(value-gate -> Stage 6)."),
+		&cluster_cross_instance_cr_probe, false, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
 		"cluster.boc_sweep_interval_ms",

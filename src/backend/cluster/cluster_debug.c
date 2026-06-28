@@ -100,9 +100,10 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_cr_admit.h"		  /* cluster_cr_admit_stat_* counters (spec-5.52 D9) */
 #include "cluster/cluster_cr_tuple.h"		  /* cluster_cr_tuple_stat_* counters (spec-5.54 D5) */
 #include "cluster/cluster_resolver_cache.h"	  /* cluster_resolver_cache_* counters (spec-5.55 D8) */
-#include "cluster/cluster_wal_state.h"		  /* wal_state registry dump (spec-4.2 D5) */
-#include "cluster/cluster_wal_thread.h"		  /* wal_thread dump accessors (spec-4.1 D7) */
-#include "cluster/cluster_tt_durable.h"		  /* cluster_tt_durable_* counters (spec-3.11 D8) */
+#include "cluster/cluster_cr_coordinator_stat.h" /* cluster_cr_coordinator_* counters (spec-5.57 D3) */
+#include "cluster/cluster_wal_state.h"			 /* wal_state registry dump (spec-4.2 D5) */
+#include "cluster/cluster_wal_thread.h"			 /* wal_thread dump accessors (spec-4.1 D7) */
+#include "cluster/cluster_tt_durable.h"			 /* cluster_tt_durable_* counters (spec-3.11 D8) */
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_grd_pending.h"
 #include "cluster/cluster_grd_work_queue.h"
@@ -2465,6 +2466,25 @@ dump_cr(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_resolver_cache_nonterminal_skip_count()));
 	emit_row(rsinfo, "resolver_cache", "live_entries",
 			 fmt_int64((int64)cluster_resolver_cache_live_entries()));
+
+	/* spec-5.57 D3: cross-instance CR read-path coordinator boundary counters
+	 * (independent region; advisory; category 'cr_coord').  Always emitted so the
+	 * category is deterministically present.  Values stay 0 under
+	 * cluster.cross_instance_cr_coordinator=off (the fail-closed 53R9G boundary
+	 * still fires; only the bumps are gated, §2.2). */
+	emit_row(
+		rsinfo, "cr_coord", cluster_cr_coordinator_counter_key(CR_COORD_CROSS_INSTANCE_CR_REFUSED),
+		fmt_int64((int64)cluster_cr_coordinator_stat_count(CR_COORD_CROSS_INSTANCE_CR_REFUSED)));
+	emit_row(
+		rsinfo, "cr_coord", cluster_cr_coordinator_counter_key(CR_COORD_REMOTE_UNDO_READ_REFUSED),
+		fmt_int64((int64)cluster_cr_coordinator_stat_count(CR_COORD_REMOTE_UNDO_READ_REFUSED)));
+	emit_row(
+		rsinfo, "cr_coord", cluster_cr_coordinator_counter_key(CR_COORD_MATERIALIZED_REMOTE_SERVED),
+		fmt_int64((int64)cluster_cr_coordinator_stat_count(CR_COORD_MATERIALIZED_REMOTE_SERVED)));
+	emit_row(rsinfo, "cr_coord",
+			 cluster_cr_coordinator_counter_key(CR_COORD_CROSS_INSTANCE_BOUNDARY_PROBE),
+			 fmt_int64(
+				 (int64)cluster_cr_coordinator_stat_count(CR_COORD_CROSS_INSTANCE_BOUNDARY_PROBE)));
 }
 
 

@@ -128,6 +128,19 @@ StaticAssertDecl(sizeof(((ClusterCRCacheKey *)0)->read_scn) == sizeof(SCN)
 				 "ClusterCRCacheKey identity field width changed: re-review spec-5.53 §3.1.");
 
 /*
+ * spec-5.57 D5 (cross-instance key identity contract, Q7-A): the 5-field key is
+ * ALREADY cross-instance comparable and stays FROZEN at 5 fields -- read_scn is a
+ * GLOBAL Lamport SCN (AD-008) and rlocator is cluster-unique, so the same
+ * (rlocator, forknum, blockno, read_scn, base_page_lsn) denotes the same
+ * consistent version on EVERY node.  The undo origin is therefore NOT a key
+ * dimension: it is a resolver/coordinator ROUTING dimension (where to fetch undo
+ * from), carried by the spec-5.55 resolver memo (origin_node_id + fence), never
+ * by this key.  Adding origin here would break the reconfig-invariant (INV-C2).
+ * The runtime-warm cross-instance data plane is Stage 6 (#119); see
+ * Spec: spec-5.57 §2.4 / §3.5.
+ */
+
+/*
  * cluster_cr_cache_key_equal -- canonical CR cache key equality (spec-5.51 D6).
  *   Field-wise compare (RelFileLocatorEquals + scalar fields); NEVER memcmp the
  *   struct (padding bytes are not part of identity).  Exported so the shared CR
