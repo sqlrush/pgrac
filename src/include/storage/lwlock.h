@@ -247,6 +247,8 @@ typedef enum BuiltinTrancheIds {
 	LWTRANCHE_CLUSTER_DIAG,
 	/* spec-5.13: guards the clean-leave ClusterLeaveState shmem block. */
 	LWTRANCHE_CLUSTER_CLEAN_LEAVE,
+	/* spec-5.18: guards the permanent-removal ClusterNodeRemoveState shmem block. */
+	LWTRANCHE_CLUSTER_NODE_REMOVE,
 	/*
 	 * PGRAC (stage 1.14 Sprint A): dedicated tranche for
 	 * ClusterStatsSharedState lwlock — same pattern as LMON / LCK / DIAG.

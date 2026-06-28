@@ -511,6 +511,14 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 # cooperative clean leave.  Separate from 53R60 (any node hit by another's
 # death): 53R62 retry must reconnect to a survivor, this node is departing.
 53R62    E    ERRCODE_CLUSTER_CLEAN_LEAVE_IN_PROGRESS                        cluster_clean_leave_in_progress
+# spec-5.18 D11 — permanent node removal.  53R63 is a retry-safe transitional
+# abort (writable backend hit while a removal epoch is publishing; class 53R60):
+# retry on the new epoch.  53R64 is FATAL non-retry: the LOCAL node observes
+# itself permanently removed + fenced (INV-LF9 self-demote) or a removed node's
+# join/serve was refused (INV-LF1) — it must be re-admitted by an operator
+# un-fence (external plane), never by passive rejoin.
+53R63    E    ERRCODE_CLUSTER_NODE_REMOVAL_IN_PROGRESS                       cluster_node_removal_in_progress
+53R64    E    ERRCODE_CLUSTER_NODE_REMOVED_FENCED                            cluster_node_removed_fenced
 
 # spec-2.16 D14:  GES cross-node grant timeout / pending HTAB full
 # 53R70 fires when backend wait exceeds cluster.ges_request_timeout_ms

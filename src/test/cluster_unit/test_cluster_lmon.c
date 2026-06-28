@@ -416,6 +416,17 @@ void
 cluster_clean_leave_lmon_tick(void)
 {}
 
+/* spec-5.18 D9/D10 stubs: the LMON tick drives node removal + registers its IC
+ * msg types; this standalone unit binary does not link cluster_node_remove.o. */
+void cluster_node_remove_lmon_tick(void);
+void
+cluster_node_remove_lmon_tick(void)
+{}
+void cluster_node_remove_register_ic_msg_types(void);
+void
+cluster_node_remove_register_ic_msg_types(void)
+{}
+
 /* spec-2.2 D5 LMON drive references cluster_conf_lookup_node + cluster_node_id. */
 const struct ClusterNodeInfo *
 cluster_conf_lookup_node(int32 node_id pg_attribute_unused())

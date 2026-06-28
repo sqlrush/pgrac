@@ -1125,6 +1125,9 @@ pgstat_get_wait_cluster_reconfig(WaitEventCluster w)
 	case WAIT_EVENT_RECONFIG_JOIN_CONVERGENCE:
 		event_name = "ReconfigJoinConvergence";
 		break;
+	case WAIT_EVENT_RECONFIG_NODE_REMOVE_CLEANUP_WAIT:
+		event_name = "ReconfigNodeRemoveCleanupWait";
+		break;
 	default:
 		break;
 	}

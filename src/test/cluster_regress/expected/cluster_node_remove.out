@@ -1,0 +1,94 @@
+-- ============================================================
+-- cluster_node_remove -- pgrac spec-5.18 permanent node-removal surface.
+--
+--	Author: SqlRush <sqlrush@gmail.com>
+--	Portions Copyright (c) 2026, pgrac contributors
+-- ============================================================
+-- spec-5.18 D20: permanent node-removal catalog smoke (cluster_regress).
+--
+--   Verifies the catalog surface added by spec-5.18:
+--     - pg_cluster_node_removal_state view (14 columns, always-1-row when
+--       cluster.enabled=on; idle = phase 'idle', target_node_id -1,
+--       deadline_us NULL)
+--     - pg_cluster_remove_node(int) operator UDF: with
+--       cluster.online_node_removal=off (the regress default) it returns
+--       'rejected:feature_disabled' (behaviour matrix)
+--     - the mutating UDF REVOKEd from PUBLIC (L7 defense-in-depth)
+--     - the pg_cluster_membership view carries the spec-5.18 removed +
+--       removed_epoch columns
+--
+-- The removal runtime (fence-arm -> membership shrink -> cluster-wide cleanup ->
+-- crash-recovery from the durable marker) + the 7 cluster-node-remove-* inject
+-- points (which register lazily, so they are not visible in this single-node
+-- never-removes instance) are exercised in t/316_cluster_5_18_node_remove.pl.
+-- ----------
+-- Block 1: pg_cluster_node_removal_state view exists with 14 columns.
+-- ----------
+SELECT count(*) AS column_count
+  FROM information_schema.columns
+ WHERE table_name = 'pg_cluster_node_removal_state';
+ column_count 
+--------------
+           14
+(1 row)
+
+-- ----------
+-- Block 2: always-1-row contract (cluster.enabled=on); idle state.
+-- ----------
+SELECT count(*) AS row_count
+  FROM pg_cluster_node_removal_state;
+ row_count 
+-----------
+         1
+(1 row)
+
+SELECT phase,
+       target_node_id,
+       coordinator_node_id,
+       remove_epoch,
+       fence_armed,
+       membership_shrunk,
+       grd_cleaned,
+       pcm_cleaned,
+       ack_count,
+       deadline_us IS NULL AS deadline_null
+  FROM pg_cluster_node_removal_state;
+ phase | target_node_id | coordinator_node_id | remove_epoch | fence_armed | membership_shrunk | grd_cleaned | pcm_cleaned | ack_count | deadline_null 
+-------+----------------+---------------------+--------------+-------------+-------------------+-------------+-------------+-----------+---------------
+ idle  |             -1 |                  -1 |            0 | f           | f                 | f           | f           |         0 | t
+(1 row)
+
+-- ----------
+-- Block 3: operator UDF behaviour matrix — online_node_removal=off (default)
+-- returns 'rejected:feature_disabled'.
+-- ----------
+SELECT pg_cluster_remove_node(1) AS request_result;
+      request_result       
+---------------------------
+ rejected:feature_disabled
+(1 row)
+
+-- ----------
+-- Block 4: the mutating UDF is REVOKEd from PUBLIC (defense-in-depth on top of
+-- the C superuser() gate, L7) — PUBLIC cannot EXECUTE it.
+-- ----------
+SELECT has_function_privilege('public', 'pg_cluster_remove_node(int)', 'EXECUTE')
+         AS public_can_execute_request;
+ public_can_execute_request 
+----------------------------
+ f
+(1 row)
+
+-- ----------
+-- Block 5: the pg_cluster_membership view carries the spec-5.18 removed +
+-- removed_epoch columns (the shrink dual of online join).
+-- ----------
+SELECT count(*) AS membership_column_count
+  FROM information_schema.columns
+ WHERE table_name = 'pg_cluster_membership'
+   AND column_name IN ('removed', 'removed_epoch');
+ membership_column_count 
+-------------------------
+                       2
+(1 row)
+

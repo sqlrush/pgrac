@@ -220,13 +220,21 @@ typedef enum ClusterICMsgType {
 		   * bump (Q6-A); this is the readiness handoff that triggers the coordinator's
 		   * two-phase commit.  Idempotent (re-sent each tick until the CLEAN_LEAVE
 		   * commit is observed; the coordinator ignores it once clean_departed). */
-	PGRAC_IC_MSG_LEAVE_COMMITTED = 30		/* PGRAC: spec-5.13 Hardening v1.0.1 (P1-V0.7) —
+	PGRAC_IC_MSG_LEAVE_COMMITTED = 30,		/* PGRAC: spec-5.13 Hardening v1.0.1 (P1-V0.7) —
 		   * survivor coordinator -> leaving node (ClusterLeaveAnnouncePayload, preflight=0):
 		   * "the COMMITTED marker is majority-durable; the durable truth-source exists,
 		   * you may exit".  Gates the leaving node's BARRIER_WAIT -> COMMITTED transition
 		   * so it never departs before the marker is durable (§2.5 exit gate); re-sent
 		   * each tick while the leaver is alive (idempotent; best-effort delivery). */
-	/* values 31..255 available for future sub-spec; never reuse 0..30 */
+	PGRAC_IC_MSG_NODE_REMOVE_ANNOUNCE = 31, /* PGRAC: spec-5.18 D10 — removal coordinator ->
+		   * survivors (ClusterNodeRemoveAnnouncePayload: coordinator + target + remove_epoch +
+		   * removal_event_id).  Survivors drop their refs to the removed node + reply
+		   * REMOVE_CLEANUP_ACK. */
+	PGRAC_IC_MSG_REMOVE_CLEANUP_ACK = 32	/* PGRAC: spec-5.18 D10 — survivor -> removal
+		   * coordinator (ClusterNodeRemoveCleanupAckPayload): "I dropped all refs to the removed
+		   * node + accepted the permanent remaster"; sets the survivor's bit in the coordinator's
+		   * cleanup ACK barrier. */
+	/* values 33..255 available for future sub-spec; never reuse 0..32 */
 } ClusterICMsgType;
 
 

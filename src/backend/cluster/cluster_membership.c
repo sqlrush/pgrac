@@ -90,6 +90,17 @@ cluster_membership_vet_joiner(int32 node_id, uint64 presented_incarnation, uint6
 		return CLUSTER_JOIN_REJECT_NOT_READY;
 
 	/*
+	 * spec-5.18 INV-LF1 (rule 8.A): a permanently-removed node is fenced and is
+	 * NEVER passively re-admitted — not even with a fresh incarnation.  This is a
+	 * DEFINITIVE reject (checked before the transient quorum/readiness holds, so a
+	 * removed node is never told to retry): it can only return via an operator
+	 * un-fence (external plane, not implemented here) + a fresh join.  Distinct
+	 * code (53R64) from the floor-based stale reject.
+	 */
+	if (MembershipTable->membership_state[node_id] == CLUSTER_MEMBER_REMOVED)
+		return CLUSTER_JOIN_REJECT_REMOVED_FENCED;
+
+	/*
 	 * Readiness sub-gate (INV-J5 / Q10): a joiner that has not published a valid
 	 * voting slot (generation 0) has not completed its own startup / crash
 	 * recovery and is not yet ready to be admitted -- hold, never half-admit.
@@ -172,6 +183,42 @@ cluster_membership_is_member(int32 node_id)
 	if (!node_id_in_range(node_id))
 		return false;
 	return MembershipTable->membership_state[node_id] == CLUSTER_MEMBER_MEMBER;
+}
+
+/*
+ * spec-5.18 D4 — member-set denominator: count declared nodes in MEMBER state.
+ * This is the denominator that shrinks on permanent removal (NOT the disk-quorum
+ * denominator, §0.3).  Caller holds the reconfig LWLock for a coherent snapshot
+ * (single-byte reads are naturally atomic; the count is advisory observability).
+ */
+int
+cluster_membership_member_count(void)
+{
+	int count = 0;
+	int i;
+
+	for (i = 0; i < CLUSTER_MAX_NODES; i++)
+		if (MembershipTable->membership_state[i] == CLUSTER_MEMBER_MEMBER)
+			count++;
+	return count;
+}
+
+/*
+ * spec-5.18 D4 — permanent removal (shrink dual of record_admitted).  Pin the
+ * admitted-incarnation floor at last_incarnation (monotone; a future re-admit must
+ * present strictly greater) then mark the node REMOVED (terminal).  Idempotent —
+ * the startup rebuild re-applies it.  Coordinator-only; mutates under the reconfig
+ * LWLock held by the caller.
+ */
+void
+cluster_membership_shrink_to_removed(int32 node_id, uint64 last_incarnation)
+{
+	if (!node_id_in_range(node_id))
+		return;
+	/* raise the floor first (monotone) so re-admit must exceed the removed incarnation */
+	if (last_incarnation > MembershipTable->last_admitted_incarnation[node_id])
+		MembershipTable->last_admitted_incarnation[node_id] = last_incarnation;
+	MembershipTable->membership_state[node_id] = (uint8)CLUSTER_MEMBER_REMOVED;
 }
 
 

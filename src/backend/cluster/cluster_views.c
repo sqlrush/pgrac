@@ -139,6 +139,8 @@ static const uint32 cluster_wait_event_infos[CLUSTER_WAIT_EVENTS_COUNT] = {
 	WAIT_EVENT_CLUSTER_GRD_SHARD_REMASTER,
 	/* spec-4.12 D4: coordinator wait for the durable fence-marker majority write. */
 	WAIT_EVENT_CLUSTER_WRITE_FENCE_MARKER_WRITE,
+	/* spec-5.18 D12: removal coordinator wait for all-survivor cleanup ACKs. */
+	WAIT_EVENT_RECONFIG_NODE_REMOVE_CLEANUP_WAIT,
 
 	/* Cluster: Recovery (7 = 5 + spec-4.11 D5 thread recovery + spec-4.12 D6 verify) */
 	WAIT_EVENT_RECOVERY_WAL_FETCH,

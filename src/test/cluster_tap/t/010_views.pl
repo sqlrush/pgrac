@@ -50,8 +50,8 @@ $node->start;
 # ----------
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'102',
-	'pg_stat_cluster_wait_events returns 102 rows (spec-4.12 D7 +2 ClusterWriteFenceMarkerWrite/Verify)');
+	'103',
+	'pg_stat_cluster_wait_events returns 103 rows (spec-5.18 D12 +1 ReconfigNodeRemoveCleanupWait)');
 
 
 # ----------
@@ -72,7 +72,7 @@ my %expected = (
 	'Cluster: PCM' => 20,	# spec-4.7 D1: +ClusterGCSBlockRecovering
 	'Cluster: BufferShip' => 5,
 	'Cluster: SCN' => 4,
-	'Cluster: Reconfig' => 7,    # spec-4.12 D4: +ClusterWriteFenceMarkerWrite
+	'Cluster: Reconfig' => 8,    # spec-5.18 D12: +ReconfigNodeRemoveCleanupWait
 	'Cluster: Recovery' => 7,    # spec-4.12 D6: +ClusterWriteFenceVerify
 	'Cluster: Sinval' => 6,
 	'Cluster: Interconnect' => 5,

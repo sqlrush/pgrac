@@ -393,6 +393,10 @@ typedef enum {
 	 * qvotec to write + fdatasync the durable join-commit marker to a voting-disk
 	 * majority before publishing JOIN_COMMITTED (the §2.6 commit point). */
 	WAIT_EVENT_RECONFIG_JOIN_CONVERGENCE,
+	/* spec-5.18 D12: the permanent-removal coordinator (LMON) waits for all
+	 * survivors to ACK their cluster-wide removal cleanup (the §4 ACK barrier)
+	 * before writing the REMOVED marker. */
+	WAIT_EVENT_RECONFIG_NODE_REMOVE_CLEANUP_WAIT,
 
 	/* Cluster: Recovery (6 events) -- #86; +1 spec-4.11 D5; +1 spec-4.12 D6 */
 	WAIT_EVENT_RECOVERY_WAL_FETCH = PG_WAIT_CLUSTER_RECOVERY,

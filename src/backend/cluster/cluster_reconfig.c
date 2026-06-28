@@ -152,6 +152,9 @@ cluster_reconfig_shmem_init(void)
 		/* spec-5.13 D3 — clean_departed_bitmap + clean_departed_epoch[] left
 		 * zeroed by memset (no node departed); init the lifetime counter. */
 		pg_atomic_init_u64(&ReconfigShmem->clean_departed_count, 0);
+		/* spec-5.18 D3 — removed_bitmap + removed_epoch[] left zeroed by memset
+		 * (no node removed); init the lifetime counter. */
+		pg_atomic_init_u64(&ReconfigShmem->removed_count, 0);
 		/* last_applied left zeroed by memset — event_id=0 =
 		 * CLUSTER_RECONFIG_OBSERVER_NONE = never-applied sentinel. */
 
@@ -523,6 +526,32 @@ cluster_reconfig_compute_event_id_v2(uint8 reconfig_kind,
 	}
 }
 
+/*
+ * spec-5.18 D3 (R14) — NODE_REMOVED event identity.
+ *
+ *	The legacy event_id hashes only (dead_bitmap, cssd_dead_generation).  A
+ *	clean-left removal leaves dead_bitmap unchanged (the node already departed)
+ *	and does not bump cssd_dead_generation, so the legacy id would collide with
+ *	the prior event and be deduped away — the removal would never publish (打穿
+ *	INV-LF1).  Fold the kind + removed_bitmap + removal_event_id (the per-attempt
+ *	identity) — NOT old_epoch (2.29 P1.2 anti-self-loop) — so each removal attempt
+ *	produces a distinct, non-deduped event id.
+ */
+uint64
+cluster_reconfig_compute_removal_event_id(const uint8 removed_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES],
+										  uint64 removal_event_id)
+{
+	uint8 hash_input[1 + CLUSTER_RECONFIG_DEAD_BITMAP_BYTES + sizeof(uint64)];
+	Size off = 0;
+
+	hash_input[off++] = RECONFIG_KIND_NODE_REMOVED;
+	memcpy(hash_input + off, removed_bitmap, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
+	off += CLUSTER_RECONFIG_DEAD_BITMAP_BYTES;
+	memcpy(hash_input + off, &removal_event_id, sizeof(uint64));
+	off += sizeof(uint64);
+	return hash_bytes_extended(hash_input, off, 0);
+}
+
 
 /*
  * spec-5.15 D1 — cluster_reconfig_compute_join_bitmap.
@@ -762,6 +791,115 @@ cluster_reconfig_get_clean_departed_count(void)
 	if (ReconfigShmem == NULL)
 		return 0;
 	return pg_atomic_read_u64(&ReconfigShmem->clean_departed_count);
+}
+
+/* ============================================================
+ * spec-5.18 D3 — permanently-removed set accessors (INV-LF1).
+ * ============================================================ */
+
+void
+cluster_reconfig_record_removed(int32 node_id, uint64 remove_epoch, bool raise_epoch_floor)
+{
+	bool newly_set = false;
+
+	if (ReconfigShmem == NULL)
+		return;
+	if (node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return;
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	if (!clean_departed_test_bit_locked(ReconfigShmem->removed_bitmap, node_id)) {
+		dead_bitmap_set_bit(ReconfigShmem->removed_bitmap, node_id);
+		newly_set = true;
+	}
+	if (remove_epoch > ReconfigShmem->removed_epoch[node_id])
+		ReconfigShmem->removed_epoch[node_id] = remove_epoch;
+	/* a removed node supersedes a dormant clean-departed one (no auto re-admit). */
+	if (clean_departed_test_bit_locked(ReconfigShmem->clean_departed_bitmap, node_id)) {
+		ReconfigShmem->clean_departed_bitmap[node_id / 8] &= (uint8) ~(1u << (node_id % 8));
+		ReconfigShmem->clean_departed_epoch[node_id] = 0;
+	}
+	LWLockRelease(&ReconfigShmem->lock);
+
+	if (newly_set)
+		pg_atomic_fetch_add_u64(&ReconfigShmem->removed_count, 1);
+
+	/* P1-V0.7 epoch-floor recovery (mirror clean_departed): the removal marker is
+	 * the only durable proof the cluster reached remove_epoch. */
+	if (raise_epoch_floor && remove_epoch > 0)
+		(void)cluster_epoch_observe_remote(remove_epoch);
+}
+
+bool
+cluster_reconfig_is_removed(int32 node_id)
+{
+	bool removed;
+
+	if (ReconfigShmem == NULL || node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	removed = clean_departed_test_bit_locked(ReconfigShmem->removed_bitmap, node_id);
+	LWLockRelease(&ReconfigShmem->lock);
+	return removed;
+}
+
+uint64
+cluster_reconfig_get_removed_epoch(int32 node_id)
+{
+	uint64 epoch;
+
+	if (ReconfigShmem == NULL || node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return 0;
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	epoch = ReconfigShmem->removed_epoch[node_id];
+	LWLockRelease(&ReconfigShmem->lock);
+	return epoch;
+}
+
+uint64
+cluster_reconfig_get_removed_count(void)
+{
+	if (ReconfigShmem == NULL)
+		return 0;
+	return pg_atomic_read_u64(&ReconfigShmem->removed_count);
+}
+
+/*
+ * spec-5.18 D3 — startup-rebuild seed: record the node removed (removed_bitmap +
+ * epoch floor) AND shrink its membership_state to REMOVED, under the reconfig lock.
+ * Used by cluster_node_remove_rebuild_from_disks so the driver does not need direct
+ * access to ReconfigShmem->lock for the membership mutation.
+ */
+void
+cluster_reconfig_seed_removed_membership(int32 node_id, uint64 remove_epoch,
+										 uint64 removed_incarnation, bool raise_epoch_floor)
+{
+	cluster_reconfig_record_removed(node_id, remove_epoch, raise_epoch_floor);
+	if (ReconfigShmem == NULL || node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return;
+	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	cluster_membership_shrink_to_removed(node_id, removed_incarnation);
+	LWLockRelease(&ReconfigShmem->lock);
+}
+
+/*
+ * Snapshot the removed_bitmap under SHARED lock (qvotec ORs it into the fence
+ * baseline, INV-LF10; the driver folds it into the removal event_id).
+ */
+void
+cluster_reconfig_snapshot_removed_bitmap(uint8 *out)
+{
+	if (out == NULL)
+		return;
+	if (ReconfigShmem == NULL) {
+		memset(out, 0, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
+		return;
+	}
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	memcpy(out, ReconfigShmem->removed_bitmap, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
+	LWLockRelease(&ReconfigShmem->lock);
 }
 
 /* spec-5.15 D6 — online-join observability counter accessors. */
@@ -1322,6 +1460,17 @@ cluster_reconfig_lmon_tick(void)
 				continue;
 
 			ms = cluster_membership_get_state(i);
+			/*
+			 * spec-5.18 INV-LF1 (P0): REMOVED is TERMINAL.  This loop reads the RAW
+			 * CSSD dead set (the removed mask is applied later, below), so a
+			 * fail-stopped-then-removed node is still CSSD-DEAD here — without this
+			 * guard the next branch would flip its membership_state REMOVED -> DEAD
+			 * every tick, silently defeating the vet_joiner REJECT_REMOVED_FENCED
+			 * gate (which keys on state==REMOVED) and letting a fresh-incarnation
+			 * zombie passively re-admit.  A removed node never leaves REMOVED here.
+			 */
+			if (ms == CLUSTER_MEMBER_REMOVED)
+				continue;
 			if (dead_bitmap_test_bit(dead_bitmap, i))
 				cluster_membership_set_state(i, CLUSTER_MEMBER_DEAD);
 			else if (ms == CLUSTER_MEMBER_ABSENT)
@@ -1336,8 +1485,15 @@ cluster_reconfig_lmon_tick(void)
 				dead_bitmap_set_bit(alive_set, i);
 		}
 
+		/*
+		 * effective_dead = cssd_dead & ~clean_departed_bitmap & ~removed_bitmap.
+		 * A permanently-removed node (spec-5.18, INV-LF1) is masked out so its
+		 * subsequent CSSD DEAD/ALIVE never re-triggers a reconfig nor passively
+		 * re-admits it — it is no longer a member.
+		 */
 		for (b = 0; b < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; b++)
-			dead_bitmap[b] &= (uint8)~ReconfigShmem->clean_departed_bitmap[b];
+			dead_bitmap[b] &= (uint8)~(ReconfigShmem->clean_departed_bitmap[b]
+									   | ReconfigShmem->removed_bitmap[b]);
 
 		LWLockRelease(&ReconfigShmem->lock);
 	} else {
@@ -1586,6 +1742,22 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 		marker.fence_generation = cssd_dead_generation;
 		marker.issuer_node_id = coordinator_node_id;
 		memcpy(marker.fenced_dead_bitmap, dead_bitmap, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
+		/*
+		 * spec-5.18 INV-LF10: when there ARE permanently-removed nodes, every
+		 * reconfig-issued fence marker must also carry them, so a later fail-stop
+		 * fence (dead = {M}) does not drop a previously-removed node {N} from the
+		 * authority — the fenced set is dead | removed (superset-monotone, removed
+		 * only grows).  Guarded on removed_count so a cluster that never removed a
+		 * node pays nothing and the fence marker is byte-identical to pre-5.18.
+		 */
+		if (cluster_reconfig_get_removed_count() > 0) {
+			uint8 removed_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+			int b;
+
+			cluster_reconfig_snapshot_removed_bitmap(removed_bitmap);
+			for (b = 0; b < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; b++)
+				marker.fenced_dead_bitmap[b] |= removed_bitmap[b];
+		}
 
 		if (cluster_write_fence_submit_marker(&marker) != CLUSTER_FENCE_MARKER_SUBMIT_ACK) {
 			ereport(LOG, (errmsg("cluster reconfig: fence marker did not reach a voting-disk "
@@ -1680,6 +1852,134 @@ cluster_reconfig_apply_clean_leave_as_coordinator(int32 leaving_node_id, uint64 
 	/* CL-I13: record clean-departed at E so the lmon_tick mask suppresses the
 	 * node's later CSSD DEAD (no epoch-floor raise — the epoch is live here). */
 	cluster_reconfig_record_clean_departed(leaving_node_id, new_epoch, false);
+
+	return new_epoch;
+}
+
+
+/*
+ * spec-5.18 D3 — cluster_reconfig_apply_node_removed_as_coordinator.
+ *
+ *	The membership-shrink commit point of permanent removal (§3.1
+ *	SHRINK_COMMITTING), run on the survivor coordinator AFTER the 4.12 fence
+ *	marker for the removed node is majority-durable (INV-LF2, enforced by the
+ *	driver).  Mirrors apply_clean_leave_as_coordinator's guarded epoch advance +
+ *	epoch-advance side effects, but publishes a NODE_REMOVED event whose id folds
+ *	removed_bitmap + removal_event_id (R14 — never deduped even when dead_bitmap is
+ *	unchanged), then records the node removed (removed_bitmap + epoch, masking it
+ *	out of effective_dead) and shrinks membership_state to REMOVED.  The published
+ *	event's dead_bitmap is empty: the removed node already departed (clean-left /
+ *	fail-stopped), so this is a membership change, not a new death.  Returns the
+ *	new epoch, or 0 if the guarded advance lost (a real death intruded — the driver
+ *	ABORTED_ESCALATEs, pre-SHRUNK).
+ */
+uint64
+cluster_reconfig_apply_node_removed_as_coordinator(int32 removed_node_id, uint64 baseline_epoch,
+												   uint64 removal_event_id, uint64 last_incarnation,
+												   bool *out_contest)
+{
+	uint64 old_epoch, new_epoch;
+	XLogRecPtr lsn;
+	uint8 empty_dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
+	uint8 removed_with_n[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	uint64 cssd_dead_generation;
+	ReconfigEvent evt;
+
+	/*
+	 * *out_contest distinguishes the two zero-returns for the driver (P1-A): a lost
+	 * guarded-advance means ANOTHER node moved the epoch (a real contest -> the
+	 * driver classifies escalate vs cleanup-blocked); a fence-submit failure is a
+	 * transient self-bumped retry (NOT a contest -> the driver just retries).
+	 */
+	if (out_contest != NULL)
+		*out_contest = false;
+
+	if (!cluster_enabled || ReconfigShmem == NULL)
+		return 0;
+	if (removed_node_id < 0 || removed_node_id >= CLUSTER_MAX_NODES)
+		return 0;
+
+	CLUSTER_INJECTION_POINT("cluster-node-remove-shrink-committing");
+
+	cssd_dead_generation = cluster_cssd_get_dead_generation();
+
+	/* CL-I3-style guarded advance: fail closed if a real death moved the epoch. */
+	old_epoch = baseline_epoch;
+	if (!cluster_epoch_advance_for_reconfig_if_baseline(baseline_epoch, &new_epoch)) {
+		if (out_contest != NULL)
+			*out_contest = true; /* another node moved the epoch -> real contest */
+		return 0;
+	}
+	lsn = GetXLogInsertRecPtr();
+	cluster_epoch_set_changed_at_lsn((uint64)lsn);
+
+	/* same epoch-advance side effects as the other coordinator paths (cache
+	 * invalidation happens-before): wake GCS slots, reset sinval, flush TT overlay. */
+	cluster_gcs_block_on_epoch_advance(new_epoch);
+	cluster_sinval_reset_all_on_reconfig();
+	cluster_tt_status_flush_all((uint32)new_epoch);
+
+	/* R14: event_id folds the removed set (current removed_bitmap | {N}) + the
+	 * per-attempt removal_event_id, so a clean-left removal (dead_bitmap unchanged)
+	 * still produces a distinct, non-deduped id. */
+	cluster_reconfig_snapshot_removed_bitmap(removed_with_n);
+	removed_with_n[removed_node_id / 8] |= (uint8)(1u << (removed_node_id % 8));
+
+	/*
+	 * INV-LF2 (fence-before-shrink): arm the 4.12 write fence for the removed node
+	 * BEFORE publishing the membership shrink — exactly like the fail-stop coordinator
+	 * submits its fence before publishing.  The marker is at NEW epoch with the
+	 * removed node in the fenced set, so the lower-epoch steady-state baseline is
+	 * stale-guarded and cannot drop it in the arm->publish window.  Fail-closed: if
+	 * the marker does not reach a voting-disk majority, do NOT publish / shrink (the
+	 * epoch is bumped = a safe frozen state; the driver retries).  Skipped when
+	 * enforcement is off (single-node / non-fenced cluster pays nothing).
+	 */
+	if (cluster_write_fence_enforcement == CLUSTER_WRITE_FENCE_ENFORCE_ON) {
+		ClusterFenceMarker marker;
+
+		memset(&marker, 0, sizeof(marker));
+		marker.magic = CLUSTER_FENCE_MARKER_MAGIC;
+		marker.version = CLUSTER_FENCE_MARKER_VERSION;
+		marker.fence_epoch = new_epoch;
+		marker.fence_event_id = cluster_reconfig_compute_removal_event_id(removed_with_n,
+																		  removal_event_id);
+		marker.fence_generation = cssd_dead_generation;
+		marker.issuer_node_id = cluster_node_id;
+		marker.marker_kind = CLUSTER_FENCE_MARKER_KIND_NODE_REMOVED;
+		/* fenced set = removed (already includes N) — the removal needs only N fenced;
+		 * a concurrent dead set, if any, is carried by its own fail-stop fence. */
+		memcpy(marker.fenced_dead_bitmap, removed_with_n, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
+
+		if (cluster_write_fence_submit_marker(&marker) != CLUSTER_FENCE_MARKER_SUBMIT_ACK) {
+			ereport(LOG, (errmsg("cluster node removal: fence marker for node %d did not reach a "
+								 "voting-disk majority for epoch %llu; not publishing removal "
+								 "(write-fenced, will retry)",
+								 removed_node_id, (unsigned long long)new_epoch)));
+			return 0; /* fail-closed: epoch bumped, removal NOT published, driver retries */
+		}
+	}
+
+	CLUSTER_INJECTION_POINT("cluster-node-remove-fence-armed");
+
+	memset(&evt, 0, sizeof(evt));
+	evt.event_id = cluster_reconfig_compute_removal_event_id(removed_with_n, removal_event_id);
+	evt.coordinator_node_id = cluster_node_id;
+	evt.old_epoch = old_epoch;
+	evt.new_epoch = new_epoch;
+	memcpy(evt.dead_bitmap, empty_dead, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
+	evt.applied_at = GetCurrentTimestamp();
+	evt.observer_role = CLUSTER_RECONFIG_OBSERVER_COORDINATOR;
+	evt.cssd_dead_generation = cssd_dead_generation;
+	evt.reconfig_kind = RECONFIG_KIND_NODE_REMOVED;
+	cluster_reconfig_publish_event(&evt);
+
+	/* durable removed set (masks the node out of effective_dead, INV-LF1) + the
+	 * member-set shrink (membership_state -> REMOVED), pinning the incarnation floor. */
+	cluster_reconfig_record_removed(removed_node_id, new_epoch, false);
+	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	cluster_membership_shrink_to_removed(removed_node_id, last_incarnation);
+	LWLockRelease(&ReconfigShmem->lock);
 
 	return new_epoch;
 }
@@ -2270,6 +2570,8 @@ reconfig_kind_to_string(uint8 kind)
 		return "join_pending"; /* spec-5.15 D6 */
 	case RECONFIG_KIND_JOIN_COMMITTED:
 		return "join_committed"; /* spec-5.15 D6 */
+	case RECONFIG_KIND_NODE_REMOVED:
+		return "node_removed"; /* spec-5.18 D3 */
 	case RECONFIG_KIND_NONE:
 	default:
 		return "none";
@@ -2291,6 +2593,8 @@ membership_state_to_string(ClusterMembershipState st)
 		return "member";
 	case CLUSTER_MEMBER_REJECTED:
 		return "rejected";
+	case CLUSTER_MEMBER_REMOVED:
+		return "removed"; /* spec-5.18 D4 */
 	default:
 		return "unknown";
 	}
@@ -2371,8 +2675,8 @@ cluster_get_membership(PG_FUNCTION_ARGS)
 		return (Datum)0; /* disabled — 0 rows */
 
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
-		Datum values[6];
-		bool nulls[6];
+		Datum values[8];
+		bool nulls[8];
 		uint64 presented = 0;
 
 		if (cluster_conf_lookup_node(i) == NULL)
@@ -2388,6 +2692,9 @@ cluster_get_membership(PG_FUNCTION_ARGS)
 		values[3] = Int64GetDatum((int64)presented);
 		values[4] = Int64GetDatum((int64)cluster_membership_get_last_admitted_incarnation(i));
 		values[5] = Int64GetDatum((int64)cluster_reconfig_get_observed_epoch(i));
+		/* spec-5.18 D15: +2 cols — permanently-removed flag + removal epoch. */
+		values[6] = BoolGetDatum(cluster_reconfig_is_removed(i));
+		values[7] = Int64GetDatum((int64)cluster_reconfig_get_removed_epoch(i));
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}

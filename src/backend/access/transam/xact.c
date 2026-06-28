@@ -155,6 +155,7 @@
 #include "cluster/cluster_undo_record_api.h"  /* PGRAC: spec-3.7 D16 PREPARE guard */
 #include "cluster/cluster_touched_peers.h"	  /* PGRAC: spec-5.14 D1 per-tx reset */
 #include "cluster/cluster_clean_leave.h"		  /* PGRAC: spec-5.13 §3.1 refuse-writes gate */
+#include "cluster/cluster_node_remove.h"		  /* PGRAC: spec-5.18 INV-LF9 self-demote gate */
 #include "cluster/cluster_reconfig.h"			  /* PGRAC: spec-5.15 §2.4 joiner write gate */
 #include "cluster/storage/cluster_undo_xlog.h" /* PGRAC: spec-3.18 D4.1 TT fold redo stamp */
 #endif
@@ -755,6 +756,26 @@ AssignTransactionId(TransactionState s)
 						" this node is leaving the cluster"),
 				 errhint("reconnect to a surviving node and retry;"
 						 " the retry is safe")));
+
+	/*
+	 * PGRAC MODIFICATIONS (spec-5.18 INV-LF9, self-demote gate)
+	 *
+	 * What changed: if THIS node observes that it has itself been permanently
+	 * removed from the cluster (durable removed set / membership_state==REMOVED),
+	 * it must stop serving — a removed node is a non-member and is fenced off the
+	 * shared storage, so any write it starts is both refused at the smgr gate
+	 * (53R51) and semantically invalid (it is no longer part of the cluster).  We
+	 * fail-closed at xid assignment with 53R64 (FATAL, non-retry): the node cannot
+	 * rejoin by retrying — it must be re-admitted (un-fenced) by an operator.
+	 * Read-only transactions assign no xid and are unaffected.
+	 */
+	if (cluster_node_remove_self_is_removed())
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_NODE_REMOVED_FENCED),
+				 errmsg("cannot start a writable transaction:"
+						" this node has been permanently removed from the cluster"),
+				 errhint("this node must be re-admitted (un-fenced) by an operator"
+						 " before it can rejoin the cluster")));
 
 	/*
 	 * PGRAC MODIFICATIONS (spec-5.15 §2.4 / INV-J9, node-local joiner write gate)

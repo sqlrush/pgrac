@@ -374,6 +374,47 @@ cluster_clean_leave_rebuild_from_disks(const int *fds pg_attribute_unused(),
 									   int n_disks pg_attribute_unused())
 {}
 
+/* spec-5.18 D8 stubs: cluster_qvotec.o now references the node-removal marker
+ * mailbox + carry-forward + the removed-bitmap snapshot; cluster_node_remove.o /
+ * cluster_node_remove_policy.o / cluster_reconfig.o are not linked here.  The
+ * poll returns "no pending submit" so the qvotec poll path under test is unchanged;
+ * pack/preserve/snapshot are inert. */
+#include "cluster/cluster_node_remove.h"
+bool
+cluster_node_remove_qvotec_poll_pending(ClusterRemovalMarker *out pg_attribute_unused())
+{
+	return false;
+}
+void
+cluster_node_remove_qvotec_complete(bool acked pg_attribute_unused())
+{}
+void
+cluster_node_remove_publish_qvotec_latch(struct Latch *latch pg_attribute_unused())
+{}
+void
+cluster_node_remove_rebuild_from_disks(const int *fds pg_attribute_unused(),
+									   int n_disks pg_attribute_unused())
+{}
+void
+cluster_removal_marker_pack(uint8 *reserved1 pg_attribute_unused(),
+							const ClusterRemovalMarker *m pg_attribute_unused())
+{}
+void
+cluster_removal_marker_preserve_per_disk(uint8 *new_reserved1 pg_attribute_unused(),
+										 const uint8 *prior pg_attribute_unused())
+{}
+void
+cluster_reconfig_snapshot_removed_bitmap(uint8 *out)
+{
+	if (out != NULL)
+		memset(out, 0, 16); /* no removed nodes in the unit harness */
+}
+uint64
+cluster_reconfig_get_removed_count(void)
+{
+	return 0; /* no removed nodes in the unit harness -> fence baseline path unchanged */
+}
+
 /* spec-4.12b D2/D4/D6 stubs: cluster_qvotec.o now references the enforcement GUC
  * (D2 author gate), the applied-membership snapshot (D2 baseline build), the
  * current-epoch upper-bound Assert (cassert), and the D6 baseline observability

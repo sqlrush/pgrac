@@ -595,6 +595,19 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 * (t/315 P1): the leaver must reject:preflight_incomplete, NOT fail open.
 	 */
 	{ .name = "cluster-clean-leave-survivor-suppress-preflight-ack" },
+	/*
+	 * spec-5.18 D14 (7 NEW points) — permanent node-removal state-machine
+	 * checkpoints, one per phase transition, so the cluster_tap can drive the
+	 * fence-before-shrink ordering (INV-LF2), the three-phase marker recovery
+	 * (INV-LF7), and the post-SHRUNK CLEANUP_BLOCKED resume (v0.4 P1).
+	 */
+	{ .name = "cluster-node-remove-request" },
+	{ .name = "cluster-node-remove-precheck" },
+	{ .name = "cluster-node-remove-fence-armed" },
+	{ .name = "cluster-node-remove-shrink-committing" },
+	{ .name = "cluster-node-remove-shrink-committed" },
+	{ .name = "cluster-node-remove-cleanup-done" },
+	{ .name = "cluster-node-remove-escalate" },
 };
 
 #define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_points)

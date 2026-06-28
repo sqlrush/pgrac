@@ -88,6 +88,7 @@
 #include "utils/timestamp.h"
 
 #include "cluster/cluster_clean_leave.h" /* spec-5.13 §2.5: leave-marker submit + rebuild */
+#include "cluster/cluster_node_remove.h" /* spec-5.18 §2.5: removal-marker carry-forward */
 #include "cluster/cluster_elog.h"		 /* CLUSTER_LOG (best-effort logging) */
 #include "cluster/cluster_epoch.h"		 /* spec-4.12b D2/D5: current-epoch upper-bound Assert */
 #include "cluster/cluster_guc.h"		 /* cluster_enabled */
@@ -540,6 +541,23 @@ qvotec_clear_self_alive_on_clean_shutdown(void)
 	blanked.flags = 0; /* ALIVE bit cleared — that's the whole point */
 
 	for (i = 0; i < qvotec_n_disks; i++) {
+		ClusterVotingSlot existing;
+
+		/*
+		 * spec-5.18 R12: the durable removal marker (§2.5) rides THIS slot's
+		 * _reserved1[64..].  Clearing ALIVE is a LIVENESS signal — it must NOT
+		 * erase the durable removal record, or a clean coordinator restart would
+		 * lose the SHRUNK/REMOVED marker and fail the INV-LF7 crash-recovery.
+		 * Carry the removal marker forward per-disk from this disk's current slot.
+		 * (The 4.12 fence marker [0..64) keeps its existing clean-shutdown behaviour
+		 * — cleared here, re-established by the cluster-wide baseline republish;
+		 * the removal-marker recovery re-fences via the seeded removed_bitmap.)
+		 */
+		memset(blanked._reserved1, 0, sizeof(blanked._reserved1));
+		if (cluster_voting_disk_read_slot(qvotec_fds[i], i, (uint32)cluster_node_id, &existing)
+			== CLUSTER_VOTING_DISK_IO_OK)
+			cluster_removal_marker_preserve_per_disk(blanked._reserved1, existing._reserved1);
+
 		qvotec_slot_generation++;
 		blanked.generation = qvotec_slot_generation;
 		blanked.disk_index = (uint32)i;
@@ -637,20 +655,43 @@ static void
 qvotec_build_baseline_marker(ClusterFenceMarker *out)
 {
 	ReconfigEvent applied;
+	uint8 fenced[CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES];
+	bool any_removed;
 
 	cluster_reconfig_get_last_event(&applied);
 
-	if (applied.event_id == 0) {
-		/* pristine membership: initial epoch, empty dead set, sentinel issuer. */
-		uint8 empty_dead[CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES];
+	/*
+	 * spec-5.18 INV-LF10 (R13): when there ARE permanently-removed nodes, the
+	 * steady-state fence baseline MUST keep every removed node in the fenced set,
+	 * not just at the arm-instant — the fenced set is `applied.dead | removed`, so
+	 * a removed node stays fenced across every later reconfig/baseline republish
+	 * (a fresh/restart node's first-authority baseline never re-releases it,
+	 * INV-LF8).  removed_bitmap only grows, so the superset guard is satisfied.
+	 * Guarded on removed_count so a cluster that never removed a node builds a
+	 * fence baseline byte-identical to pre-5.18 (zero extra lock/work).
+	 */
+	any_removed = (cluster_reconfig_get_removed_count() > 0);
 
-		memset(empty_dead, 0, sizeof(empty_dead));
-		cluster_fence_marker_build_baseline(out, CLUSTER_EPOCH_INITIAL, empty_dead,
+	if (applied.event_id == 0) {
+		/* pristine membership: initial epoch, removed-only fenced set, sentinel issuer. */
+		memset(fenced, 0, sizeof(fenced));
+		if (any_removed)
+			cluster_reconfig_snapshot_removed_bitmap(fenced);
+		cluster_fence_marker_build_baseline(out, CLUSTER_EPOCH_INITIAL, fenced,
 											0 /* generation */, 0 /* event_id */,
 											CLUSTER_FENCE_BASELINE_INITIAL_ISSUER);
 	} else {
-		/* applied reconfig: republish its exact membership tuple + issuer. */
-		cluster_fence_marker_build_baseline(out, applied.new_epoch, applied.dead_bitmap,
+		/* applied reconfig: republish its membership tuple, unioned with removed. */
+		memcpy(fenced, applied.dead_bitmap, sizeof(fenced));
+		if (any_removed) {
+			uint8 removed_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+			int b;
+
+			cluster_reconfig_snapshot_removed_bitmap(removed_bitmap);
+			for (b = 0; b < CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES; b++)
+				fenced[b] |= removed_bitmap[b];
+		}
+		cluster_fence_marker_build_baseline(out, applied.new_epoch, fenced,
 											applied.cssd_dead_generation, applied.event_id,
 											applied.coordinator_node_id);
 	}
@@ -678,6 +719,8 @@ qvotec_poll_once(void)
 	bool have_join_submit;
 	int32 join_target_node = -1; /* region-3 slot to write (the joiner N) */
 	uint32 join_disks_ok = 0;
+	ClusterRemovalMarker removal_submit_marker; /* spec-5.18 §2.5 staged removal marker */
+	bool have_removal_submit;
 	ClusterFenceMarker baseline_marker; /* spec-4.12b D2 */
 	bool author_baseline = false;		/* spec-4.12b D2: wrote a baseline this cycle */
 	bool is_leader = false;				/* spec-4.12b D6: lowest-live baseline leader */
@@ -714,6 +757,12 @@ qvotec_poll_once(void)
 	have_join_submit
 		= cluster_reconfig_join_qvotec_poll_pending(&join_target_node, join_marker_slot);
 
+	/* spec-5.18 §2.5: pick up a pending removal-marker submit too.  It rides THIS
+	 * node's own self-slot _reserved1[64..] (right after the 4.12 fence marker),
+	 * carried forward every poll like the fence marker (R12), and acked majority-
+	 * durable from the self-slot write tally. */
+	have_removal_submit = cluster_node_remove_qvotec_poll_pending(&removal_submit_marker);
+
 	if (qvotec_n_disks == 0) {
 		/* Single-node compat: no disks, no quorum to decide.  Hold
 		 * quorum_state at INITIALIZING so any explicit consumer that
@@ -724,6 +773,8 @@ qvotec_poll_once(void)
 			cluster_clean_leave_qvotec_complete(false); /* no disk -> no majority */
 		if (have_join_submit)
 			cluster_reconfig_join_qvotec_complete(false); /* no disk -> no majority */
+		if (have_removal_submit)
+			cluster_node_remove_qvotec_complete(false); /* no disk -> no majority */
 		return;
 	}
 
@@ -738,6 +789,8 @@ qvotec_poll_once(void)
 			cluster_clean_leave_qvotec_complete(false); /* cannot author self slot */
 		if (have_join_submit)
 			cluster_reconfig_join_qvotec_complete(false); /* cannot author self slot */
+		if (have_removal_submit)
+			cluster_node_remove_qvotec_complete(false); /* cannot author self slot */
 		return;
 	}
 
@@ -1034,6 +1087,20 @@ qvotec_poll_once(void)
 		else
 			cluster_fence_marker_preserve_per_disk(self_slot._reserved1, own_prior->_reserved1);
 
+		/*
+		 * spec-5.18 §2.5 (R12): the removal marker rides _reserved1[64..] (after
+		 * the fence marker).  The memset above zeroed it, so it MUST be re-packed
+		 * (a fresh submit) or carried forward from THIS disk's own prior slot every
+		 * poll — exactly like the fence marker's R13 carry-forward — else the next
+		 * heartbeat erases the durable SHRUNK/REMOVED record (crash-recovery would
+		 * then mis-read the removal phase).  This block runs UNCONDITIONALLY: it is
+		 * independent of the fence-marker path above (different _reserved1 region).
+		 */
+		if (have_removal_submit)
+			cluster_removal_marker_pack(self_slot._reserved1, &removal_submit_marker);
+		else
+			cluster_removal_marker_preserve_per_disk(self_slot._reserved1, own_prior->_reserved1);
+
 		qvotec_slot_generation++;
 		self_slot.generation = qvotec_slot_generation;
 		self_slot.disk_index = (uint32)i;
@@ -1149,6 +1216,16 @@ qvotec_poll_once(void)
 		/* spec-5.15 §2.6: ack the join-commit marker majority-durable. */
 		if (have_join_submit)
 			cluster_reconfig_join_qvotec_complete(join_disks_ok >= quorum_size_post_write);
+
+		/*
+		 * spec-5.18 §2.5: ack the removal-marker submit.  It rode in the self-slot
+		 * write (same _reserved1 as the fence marker), so the count of disks that
+		 * accepted the write is exactly its durable-disk count.  ACK only on >=
+		 * quorum-majority — otherwise the driver fails closed (no false durable
+		 * REMOVING/SHRUNK/REMOVED).
+		 */
+		if (have_removal_submit)
+			cluster_node_remove_qvotec_complete(disks_ok_post_write >= quorum_size_post_write);
 	}
 
 	/* ---- 4. publish shmem ---- */
@@ -1339,6 +1416,11 @@ ClusterQvotecMain(void)
 	 */
 	cluster_clean_leave_publish_qvotec_latch(MyLatch);
 	cluster_clean_leave_rebuild_from_disks(qvotec_fds, qvotec_n_disks);
+
+	/* spec-5.18 D8: publish the removal-marker latch + rebuild the permanently-
+	 * removed set from durable §2.5 SHRUNK/REMOVED markers (INV-LF7 restart leg). */
+	cluster_node_remove_publish_qvotec_latch(MyLatch);
+	cluster_node_remove_rebuild_from_disks(qvotec_fds, qvotec_n_disks);
 
 	/*
 	 * spec-5.15 D4: publish the join-marker latch + seed last_admitted from the

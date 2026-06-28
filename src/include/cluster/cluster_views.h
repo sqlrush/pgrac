@@ -51,7 +51,7 @@
  *	internal table in cluster_views.c stays in sync with the enum.
  */
 #define CLUSTER_WAIT_EVENTS_COUNT                                                                  \
-	102 /* spec-4.12 D7: +2 ClusterWriteFenceMarkerWrite/Verify; was 100 (spec-4.11 D5) */
+	103 /* spec-5.18 D12: +1 ReconfigNodeRemoveCleanupWait; was 102 (spec-4.12 D7) */
 
 
 /*

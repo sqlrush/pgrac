@@ -131,6 +131,9 @@ OBJS = \
 	cluster_lmon.o \
 	cluster_lms.o \
 	cluster_membership.o \
+	cluster_node_remove.o \
+	cluster_node_remove_policy.o \
+	cluster_node_remove_views.o \
 	cluster_pcm_lock.o \
 	cluster_pgstat.o \
 	cluster_quorum_decision.o \
@@ -205,13 +208,15 @@ else
 OBJS = cluster_conf.o cluster_debug.o cluster_ic.o cluster_inject.o cluster_undo_srf.o \
 	cluster_cr_srf.o cluster_block_apply_srf.o cluster_block_recovery_srf.o cluster_thread_recovery_apply_srf.o cluster_thread_recovery_replay_srf.o cluster_thread_recovery_driver_srf.o cluster_thread_recovery_orchestrator_srf.o cluster_pgstat.o cluster_scn.o cluster_views.o cluster_ges_mode_backend.o \
 	cluster_ir_srf.o cluster_ts_srf.o cluster_ko_srf.o \
-	cluster_hang_resolve.o cluster_clean_leave_views.o
+	cluster_hang_resolve.o cluster_clean_leave_views.o cluster_node_remove_views.o
 # spec-5.12: cluster_hang_resolve.o provides the pg_cluster_hang_victims /
 # pg_cluster_hang_resolve SQL symbols (real bodies #ifdef USE_PGRAC_CLUSTER,
 # --disable-cluster stubs raise ERRCODE_FEATURE_NOT_SUPPORTED); the symbols
 # must resolve at link time in both build modes.
 # spec-5.13: cluster_clean_leave_views.o provides the cluster_get_clean_leave_state
 # SRF + pg_cluster_clean_leave_request UDF symbols, same unconditional-link reason.
+# spec-5.18: cluster_node_remove_views.o provides cluster_get_node_removal_state +
+# pg_cluster_remove_node, same unconditional-link reason.
 endif
 
 include $(top_srcdir)/src/backend/common.mk

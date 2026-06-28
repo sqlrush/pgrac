@@ -1609,13 +1609,17 @@ GRANT SELECT ON pg_cluster_reconfig_state TO PUBLIC;
 --   observed), last_admitted_incarnation (the monotonic floor, INV-J1),
 --   admitted_epoch (the membership epoch observed for the node).  Backed by
 --   cluster_get_membership (OID 8962).  cluster.enabled=off returns 0 rows.
+--   spec-5.18 D15 extends this with removed (permanently-removed flag, the
+--   terminal state) + removed_epoch (the removal epoch, 0 when not removed).
 CREATE VIEW pg_cluster_membership AS
     SELECT node_id,
            declared,
            state,
            presented_incarnation,
            last_admitted_incarnation,
-           admitted_epoch
+           admitted_epoch,
+           removed,
+           removed_epoch
       FROM cluster_get_membership();
 
 REVOKE ALL ON pg_cluster_membership FROM PUBLIC;
@@ -1648,6 +1652,38 @@ GRANT SELECT ON pg_cluster_clean_leave_state TO PUBLIC;
 -- this node to leave the cluster).  Superuser-only (the C body also gates on
 -- superuser()); REVOKE EXECUTE FROM PUBLIC for defense-in-depth (L7).
 REVOKE ALL ON FUNCTION pg_cluster_clean_leave_request() FROM PUBLIC;
+
+-- PGRAC: pg_cluster_node_removal_state (spec-5.18 D15).
+--   Always-1-row view of permanent node-removal progress: phase (idle/requested/
+--   precheck/fence_arming/shrink_committing/cleanup/cleanup_blocked/committed/
+--   aborted/aborted_escalate), target_node_id (-1 when idle), coordinator_node_id,
+--   remove_epoch, fence_armed, membership_shrunk, grd_cleaned, pcm_cleaned,
+--   ack_count, deadline_us (NULL pre-cleanup), and lifetime counters.  Backed by
+--   cluster_get_node_removal_state (OID 8963); read-only → public.  enabled=off → 0 rows.
+CREATE VIEW pg_cluster_node_removal_state AS
+    SELECT phase,
+           target_node_id,
+           coordinator_node_id,
+           remove_epoch,
+           fence_armed,
+           membership_shrunk,
+           grd_cleaned,
+           pcm_cleaned,
+           ack_count,
+           deadline_us,
+           removal_committed_count,
+           cleanup_blocked_count,
+           leftover_detected_count,
+           zombie_write_rejected_count
+      FROM cluster_get_node_removal_state();
+
+REVOKE ALL ON pg_cluster_node_removal_state FROM PUBLIC;
+GRANT SELECT ON pg_cluster_node_removal_state TO PUBLIC;
+
+-- PGRAC: pg_cluster_remove_node(int) is a mutating operator entry (permanently
+-- removes a declared node).  Superuser-only (the C body also gates on superuser());
+-- REVOKE EXECUTE FROM PUBLIC for defense-in-depth (L7).
+REVOKE ALL ON FUNCTION pg_cluster_remove_node(int) FROM PUBLIC;
 
 -- PGRAC: pg_cluster_ic_msg_types (spec-2.3 D8; 2026-05-08).
 --   Lists every IC message type registered in the process-local

@@ -188,7 +188,7 @@ UT_TEST(test_stage5_5_wait_events_count_snapshot_102)
 	 * the spec-3.9 ClusterCRConstruct event — so the Stage 4 snapshot (102) is
 	 * unchanged.  update-required contract: a future spec adding cluster wait
 	 * events MUST bump this snapshot (and the dump/test baselines). */
-	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 102);
+	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 103);
 }
 
 

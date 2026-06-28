@@ -703,7 +703,10 @@
 /* spec-5.15 (2026-06-28): online-join catalog surface — cluster_get_membership SRF
  * (oid 8962) + pg_cluster_membership view + reconfig_kind text map extended with
  * join_pending/join_committed.  Bump 202606310 -> 202606320. */
-#define CATALOG_VERSION_NO 202606320
+/* spec-5.18: permanent node removal — pg_cluster_node_removal_state SRF (oid 8963)
+ * + pg_cluster_remove_node UDF (oid 8964) + pg_cluster_membership +2 cols
+ * (removed/removed_epoch) + 53R63/53R64 SQLSTATE.  Bump 202606320 -> 202606330. */
+#define CATALOG_VERSION_NO 202606330
 
 /* spec-5.13 (2026-06-27): clean-leave catalog surface — cluster_get_clean_leave_state
  * SRF (oid 8960) + pg_cluster_clean_leave_state view + pg_cluster_clean_leave_request

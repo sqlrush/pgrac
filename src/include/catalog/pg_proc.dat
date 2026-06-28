@@ -12354,9 +12354,9 @@
   proname => 'cluster_get_membership', prorows => '16',
   proretset => 't', provolatile => 'v', proparallel => 'r',
   prorettype => 'record', proargtypes => '',
-  proallargtypes => '{int4,bool,text,int8,int8,int8}',
-  proargmodes => '{o,o,o,o,o,o}',
-  proargnames => '{node_id,declared,state,presented_incarnation,last_admitted_incarnation,admitted_epoch}',
+  proallargtypes => '{int4,bool,text,int8,int8,int8,bool,int8}',
+  proargmodes => '{o,o,o,o,o,o,o,o}',
+  proargnames => '{node_id,declared,state,presented_incarnation,last_admitted_incarnation,admitted_epoch,removed,removed_epoch}',
   prosrc => 'cluster_get_membership' },
 
 
@@ -12515,6 +12515,29 @@
   proname => 'pg_cluster_clean_leave_request', provolatile => 'v',
   prorettype => 'text', proargtypes => '',
   prosrc => 'pg_cluster_clean_leave_request' },
+
+# spec-5.18 D15 -- pg_cluster_node_removal_state SRF (oid 8963).  Always-1-row
+# permanent-removal progress (phase / target_node_id / coordinator_node_id /
+# remove_epoch / fence_armed / membership_shrunk / grd_cleaned / pcm_cleaned /
+# ack_count / deadline_us + lifetime counters).  Idle surfaces as phase='idle',
+# target_node_id=-1, deadline_us NULL.  cluster.enabled=off returns 0 rows.
+{ oid => '8963', descr => 'show permanent node-removal state (spec-5.18)',
+  proname => 'cluster_get_node_removal_state', prorows => '1',
+  proretset => 't', provolatile => 'v', proparallel => 'r',
+  prorettype => 'record', proargtypes => '',
+  proallargtypes => '{text,int4,int4,int8,bool,bool,bool,bool,int4,int8,int8,int8,int8,int8}',
+  proargmodes => '{o,o,o,o,o,o,o,o,o,o,o,o,o,o}',
+  proargnames => '{phase,target_node_id,coordinator_node_id,remove_epoch,fence_armed,membership_shrunk,grd_cleaned,pcm_cleaned,ack_count,deadline_us,removal_committed_count,cleanup_blocked_count,leftover_detected_count,zombie_write_rejected_count}',
+  prosrc => 'cluster_get_node_removal_state' },
+
+# spec-5.18 D16 -- pg_cluster_remove_node(node_id int): operator entry permanently
+# removing a declared node.  Mutating -> superuser-only (C superuser() gate +
+# REVOKE EXECUTE FROM PUBLIC).  Returns a behaviour-matrix text: accepted /
+# noop:already_removed / resume:cleanup_pending / rejected:<reason>.
+{ oid => '8964', descr => 'permanently remove a declared cluster node',
+  proname => 'pg_cluster_remove_node', provolatile => 'v',
+  prorettype => 'text', proargtypes => 'int4',
+  prosrc => 'pg_cluster_remove_node' },
 
 # spec-3.2 D5b (2026-05-22) -- test-only visibility fork injection
 # functions.  These are SQL-visible so TAP can drive a real

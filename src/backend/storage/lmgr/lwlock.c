@@ -202,6 +202,8 @@ static const char *const BuiltinTrancheNames[] = {
 	"ClusterDiag",
 	/* PGRAC LWTRANCHE_CLUSTER_CLEAN_LEAVE (spec-5.13): */
 	"ClusterCleanLeave",
+	/* PGRAC LWTRANCHE_CLUSTER_NODE_REMOVE (spec-5.18): */
+	"ClusterNodeRemove",
 	/* PGRAC LWTRANCHE_CLUSTER_STATS: */
 	"ClusterStats",
 	/* PGRAC LWTRANCHE_CLUSTER_SCN: */

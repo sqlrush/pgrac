@@ -56,6 +56,7 @@
 #include "utils/timestamp.h"
 
 #include "cluster/cluster_clean_leave.h" /* cluster_clean_leave_register_ic_msg_types (spec-5.13 D8) */
+#include "cluster/cluster_node_remove.h" /* cluster_node_remove_lmon_tick + register (spec-5.18 D9/D10) */
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_cssd.h"	   /* cluster_cssd_outbound_slots (spec-2.5 D2.6) */
 #include "cluster/cluster_fence.h"	   /* cluster_fence_lmon_tick (spec-2.28 D5) */
@@ -412,6 +413,15 @@ cluster_lmon_shmem_init(void)
 		if (!clean_leave_registered) {
 			cluster_clean_leave_register_ic_msg_types();
 			clean_leave_registered = true;
+		}
+	}
+	/* spec-5.18 D10: register the permanent node-removal IC msg types. */
+	{
+		static bool node_remove_registered = false;
+
+		if (!node_remove_registered) {
+			cluster_node_remove_register_ic_msg_types();
+			node_remove_registered = true;
 		}
 	}
 }
@@ -972,6 +982,10 @@ LmonMain(void)
 			 * is recorded before reconfig builds its dead set (CL-I13). */
 			cluster_clean_leave_lmon_tick();
 
+			/* spec-5.18 D9: drive permanent node removal before reconfig (a removal
+			 * masks the node out of effective_dead, INV-LF1). */
+			cluster_node_remove_lmon_tick();
+
 			cluster_reconfig_lmon_tick();
 
 			/*
@@ -1521,6 +1535,10 @@ LmonMain(void)
 
 			/* spec-5.13 D6: clean-leave orchestration before the reconfig tick. */
 			cluster_clean_leave_lmon_tick();
+
+			/* spec-5.18 D9: drive permanent node removal before reconfig (a removal
+			 * masks the node out of effective_dead, INV-LF1). */
+			cluster_node_remove_lmon_tick();
 
 			cluster_reconfig_lmon_tick();
 			/* spec-4.6 D1:  GRD recovery sequence (see main-loop site). */

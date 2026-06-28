@@ -301,6 +301,10 @@ bool cluster_online_join = false;
 /* spec-5.15 D7 — join convergence / commit deadline (PGC_SIGHUP). */
 int cluster_join_convergence_timeout_ms = 30000;
 
+/* spec-5.18 D13 — permanent node removal opt-in + cleanup ACK-barrier deadline. */
+bool cluster_online_node_removal = false;
+int cluster_node_removal_cleanup_timeout_ms = 30000;
+
 /* spec-2.28 Sprint A Step 1 D7: 4 fence-lite GUCs (Q8 user approve). */
 bool cluster_self_fence_enabled = true;	   /* default fail-safe */
 int cluster_self_fence_grace_ms = 30000;   /* 30s = 7.5x lease */
@@ -2228,6 +2232,31 @@ cluster_init_guc(void)
 										 "incarnation) rather than half-admitting.  Range "
 										 "[5000, 120000] ms."),
 							&cluster_join_convergence_timeout_ms, 30000, 5000, 120000, PGC_SIGHUP,
+							GUC_UNIT_MS, NULL, NULL, NULL);
+
+	/*
+	 * cluster.online_node_removal -- opt-in permanent node removal (spec-5.18).
+	 * Default OFF (5.6 opt-in paradigm): pg_cluster_remove_node() returns
+	 * rejected:feature_disabled and no removal path runs.  Permanent removal is a
+	 * high-risk irreversible operation (fence + member-set shrink), so rollout is
+	 * conservative; flipped on after the spec-5.19 4-node fault-matrix acceptance.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.online_node_removal",
+		gettext_noop("Enable permanent removal (decommission) of a declared node."),
+		gettext_noop("Off: pg_cluster_remove_node() is rejected (feature_disabled) and no "
+					 "removal/fence/cleanup path runs.  On: an already-left or non-returning "
+					 "declared node is permanently fenced, shrunk out of the member set, and "
+					 "its GRD/GES/PCM leftover cleaned up cluster-wide."),
+		&cluster_online_node_removal, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("cluster.node_removal_cleanup_timeout_ms",
+							gettext_noop("Deadline for the post-shrink cluster-wide removal cleanup."),
+							gettext_noop("If verify_no_leftover + all-survivor cleanup ACKs do not "
+										 "complete within this bound, the removal enters "
+										 "CLEANUP_BLOCKED (resumable, fail-closed — never reports "
+										 "complete).  Range [5000, 120000] ms."),
+							&cluster_node_removal_cleanup_timeout_ms, 30000, 5000, 120000, PGC_SIGHUP,
 							GUC_UNIT_MS, NULL, NULL, NULL);
 
 	/* spec-2.28 Sprint A Step 1 D7: 4 fence-lite GUCs (Q8 user approve). */

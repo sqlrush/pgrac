@@ -72,7 +72,16 @@ typedef enum ClusterJoinVerdict {
 	CLUSTER_JOIN_ACCEPT = 0,
 	CLUSTER_JOIN_REJECT_STALE_INCARNATION, /* presented <= last_admitted -> 53R61 */
 	CLUSTER_JOIN_REJECT_QUORUM,			   /* joiner/cluster not in quorum -> hold */
-	CLUSTER_JOIN_REJECT_NOT_READY		   /* recovery/precondition unmet  -> hold */
+	CLUSTER_JOIN_REJECT_NOT_READY,		   /* recovery/precondition unmet  -> hold */
+	/*
+	 * spec-5.18 D4 (INV-LF1): the node is permanently removed (membership_state
+	 * == REMOVED) and fenced.  A definitive, non-transient reject regardless of
+	 * the presented incarnation — it can only return via an operator un-fence
+	 * (external plane) followed by a fresh join, NEVER by passive rejoin (-> 53R64
+	 * FATAL).  Distinct from STALE_INCARNATION so diagnostics tell "removed" apart
+	 * from "merely behind the floor".
+	 */
+	CLUSTER_JOIN_REJECT_REMOVED_FENCED
 } ClusterJoinVerdict;
 
 /*
@@ -85,7 +94,15 @@ typedef enum ClusterMembershipState {
 	CLUSTER_MEMBER_DEAD,
 	CLUSTER_MEMBER_JOINING,
 	CLUSTER_MEMBER_MEMBER,
-	CLUSTER_MEMBER_REJECTED
+	CLUSTER_MEMBER_REJECTED,
+	/*
+	 * spec-5.18 D4 — terminal: permanently removed (decommissioned) + fenced.
+	 * REMOVED is excluded from the member-set denominator (member_count) and is a
+	 * definitive vet_joiner reject (REJECT_REMOVED_FENCED).  This is the shrink
+	 * dual of 5.15's JOIN admission (MEMBER -> REMOVED, never the reverse without
+	 * an operator un-fence).
+	 */
+	CLUSTER_MEMBER_REMOVED
 } ClusterMembershipState;
 
 /*
@@ -213,6 +230,22 @@ extern void cluster_membership_record_admitted(int32 node_id, uint64 incarnation
 extern ClusterMembershipState cluster_membership_get_state(int32 node_id);
 extern void cluster_membership_set_state(int32 node_id, ClusterMembershipState state);
 extern bool cluster_membership_is_member(int32 node_id);
+
+/*
+ * spec-5.18 D4 — member-set denominator SSOT.  Counts declared nodes whose
+ * membership_state == MEMBER (excludes REMOVED, DEAD, JOINING, ABSENT, REJECTED).
+ * This is the denominator that shrinks on permanent removal (barrier expected-set
+ * / GRD baseline), NOT the disk-quorum denominator (§0.3 honest split).
+ */
+extern int cluster_membership_member_count(void);
+
+/*
+ * spec-5.18 D4 — permanent removal (the shrink dual of record_admitted): set
+ * membership_state[node]=REMOVED (terminal) and pin the admitted-incarnation floor
+ * at last_incarnation (a future re-admit must present > this).  Coordinator-only,
+ * under the reconfig LWLock; idempotent (also used by the startup rebuild).
+ */
+extern void cluster_membership_shrink_to_removed(int32 node_id, uint64 last_incarnation);
 
 #endif /* FRONTEND */
 #endif /* CLUSTER_MEMBERSHIP_H */

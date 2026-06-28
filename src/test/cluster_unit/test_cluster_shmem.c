@@ -755,6 +755,13 @@ void
 cluster_clean_leave_shmem_register(void)
 {}
 
+/* spec-5.18 D2 stub: cluster_node_remove shmem region (real impl in
+ * cluster_node_remove.c; standalone unit test doesn't link it). */
+void cluster_node_remove_shmem_register(void);
+void
+cluster_node_remove_shmem_register(void)
+{}
+
 /* spec-4.12 D7 stub: cluster write-fence token region. */
 void cluster_write_fence_shmem_register(void);
 void

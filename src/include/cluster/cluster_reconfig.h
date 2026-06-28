@@ -112,7 +112,16 @@ typedef enum ClusterReconfigKind {
 	 * is carried in join_bitmap (leave kinds keep dead_bitmap).
 	 */
 	RECONFIG_KIND_JOIN_PENDING = 3,
-	RECONFIG_KIND_JOIN_COMMITTED = 4
+	RECONFIG_KIND_JOIN_COMMITTED = 4,
+	/*
+	 * spec-5.18 D3 — permanent node removal (decommission).  Append-only after
+	 * 5.15's JOIN_COMMITTED (spec-5.17 RETIRED -> no LEAVE_DRAINING reservation).
+	 * The removed set is carried in ClusterReconfigState.removed_bitmap (a leave-
+	 * direction kind; NODE_REMOVED's own event_id folds removed_bitmap +
+	 * removal_event_id so a clean-left removal that leaves dead_bitmap unchanged is
+	 * NOT deduped away, R14).
+	 */
+	RECONFIG_KIND_NODE_REMOVED = 5
 } ClusterReconfigKind;
 
 
@@ -240,6 +249,22 @@ typedef struct ClusterReconfigState {
 	uint8 clean_departed_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
 	uint64 clean_departed_epoch[CLUSTER_MAX_NODES]; /* per-node leave epoch; 0 = not departed */
 	pg_atomic_uint64 clean_departed_count; /* lifetime departures recorded (observability) */
+
+	/*
+	 * spec-5.18 D3 (INV-LF1) — permanently-removed set.  A node permanently
+	 * removed (decommissioned) is durable membership_state==REMOVED; this bitmap is
+	 * the masking parallel (distinct from clean_departed_bitmap dormant / dead_bitmap
+	 * liveness).  cluster_reconfig_lmon_tick masks it out of the effective dead set:
+	 *   effective_dead = cssd_dead & ~clean_departed_bitmap & ~removed_bitmap
+	 * so a removed node's subsequent CSSD DEAD/ALIVE is ignored (never re-triggers a
+	 * reconfig and never passively re-admits it).  qvotec also ORs it into the
+	 * steady-state fence baseline (INV-LF10) so a removed node stays fenced forever.
+	 * Set EXCLUSIVE at the removal commit / rebuilt at startup from the durable §2.5
+	 * removal marker (the epoch is NOT durable, so removed_epoch is the floor source).
+	 */
+	uint8 removed_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	uint64 removed_epoch[CLUSTER_MAX_NODES]; /* per-node removal epoch; 0 = not removed */
+	pg_atomic_uint64 removed_count;			 /* lifetime removals recorded (observability) */
 
 	/*
 	 * spec-5.15 D2 — online-join membership SSOT.  The decision table (the
@@ -623,6 +648,34 @@ extern bool cluster_reconfig_is_clean_departed(int32 node_id);
 extern uint64 cluster_reconfig_get_clean_departed_epoch(int32 node_id);
 extern uint64 cluster_reconfig_get_clean_departed_count(void);
 
+/* ============================================================
+ * spec-5.18 D3 — permanently-removed set accessors (INV-LF1).
+ *
+ *	record: set removed_bitmap[node] + removed_epoch[node] + clear the dormant
+ *	  clean_departed[node] (a removed node supersedes a dormant one) under `lock`;
+ *	  raise_epoch_floor for the startup-rebuild path (mirror clean_departed P1-V0.7).
+ *	is_removed / get_removed_epoch: read the durable removal state (decision side).
+ * ============================================================ */
+extern void cluster_reconfig_record_removed(int32 node_id, uint64 remove_epoch,
+											bool raise_epoch_floor);
+extern bool cluster_reconfig_is_removed(int32 node_id);
+extern uint64 cluster_reconfig_get_removed_epoch(int32 node_id);
+extern uint64 cluster_reconfig_get_removed_count(void);
+extern void cluster_reconfig_snapshot_removed_bitmap(uint8 *out /* [CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] */);
+extern void cluster_reconfig_seed_removed_membership(int32 node_id, uint64 remove_epoch,
+													 uint64 removed_incarnation,
+													 bool raise_epoch_floor);
+
+/*
+ * spec-5.18 D3 (R14) — NODE_REMOVED event identity.  The legacy event_id hashes
+ * only (dead_bitmap, cssd_dead_generation); a clean-left removal leaves those
+ * unchanged so it would be deduped away and never published.  Fold the kind +
+ * removed_bitmap + removal_event_id (NOT old_epoch, per 2.29 P1.2 anti-self-loop)
+ * to guarantee a distinct, non-deduped event id for each removal attempt.
+ */
+extern uint64 cluster_reconfig_compute_removal_event_id(
+	const uint8 removed_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES], uint64 removal_event_id);
+
 /*
  * spec-5.13 D3 — coordinator publishes the CLEAN_LEAVE reconfig event (the
  * commit point of the §3.1 two-phase commit): bump the membership epoch and
@@ -640,6 +693,22 @@ extern uint64 cluster_reconfig_get_clean_departed_count(void);
  */
 extern uint64 cluster_reconfig_apply_clean_leave_as_coordinator(int32 leaving_node_id,
 																uint64 baseline_epoch);
+
+/*
+ * spec-5.18 D3 — the membership-shrink commit point of permanent removal, run on
+ * the survivor coordinator.  Guarded epoch advance (CL-I3-style TOCTOU defense at
+ * >=3 nodes): bump baseline+1 ONLY if the epoch is still the baseline the removal
+ * bound against; on a lost CAS (a real death intruded) return 0 so the driver
+ * ABORTED_ESCALATEs (pre-SHRUNK).  On success: publish a NODE_REMOVED reconfig
+ * event (event_id folds removed_bitmap + removal_event_id, R14), record the node
+ * removed (removed_bitmap + epoch), and shrink its membership_state to REMOVED.
+ * Returns the new epoch (0 on guarded-advance failure).
+ */
+extern uint64 cluster_reconfig_apply_node_removed_as_coordinator(int32 removed_node_id,
+																 uint64 baseline_epoch,
+																 uint64 removal_event_id,
+																 uint64 last_incarnation,
+																 bool *out_contest);
 
 
 #endif /* CLUSTER_RECONFIG_H */

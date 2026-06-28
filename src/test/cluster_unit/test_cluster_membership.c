@@ -368,10 +368,63 @@ UT_TEST(test_marker_version_mismatch_failclosed)
 	UT_ASSERT(!cluster_join_marker_is_committed_basis(&m, 8));
 }
 
+/* ======================================================================
+ * spec-5.18 U5 -- a REMOVED node is rejected REMOVED_FENCED, even with a fresh
+ * incarnation, and definitively (not a transient quorum/readiness hold).
+ * ====================================================================== */
+UT_TEST(test_vet_removed_fenced)
+{
+	test_in_quorum = true;
+	cluster_membership_attach(NULL); /* process-local default table */
+
+	/* admit node 30 at incarnation 5, then permanently remove it. */
+	cluster_membership_record_admitted(30, 5);
+	cluster_membership_set_state(30, CLUSTER_MEMBER_MEMBER);
+	cluster_membership_shrink_to_removed(30, 5);
+	UT_ASSERT_EQ(cluster_membership_get_state(30), CLUSTER_MEMBER_REMOVED);
+
+	/* even a far-fresher incarnation is rejected REMOVED_FENCED (INV-LF1). */
+	UT_ASSERT_EQ(cluster_membership_vet_joiner(30, 9999, 1), CLUSTER_JOIN_REJECT_REMOVED_FENCED);
+
+	/* definitive: out-of-quorum does NOT downgrade it to the transient hold. */
+	test_in_quorum = false;
+	UT_ASSERT_EQ(cluster_membership_vet_joiner(30, 9999, 1), CLUSTER_JOIN_REJECT_REMOVED_FENCED);
+	test_in_quorum = true;
+}
+
+/* ======================================================================
+ * spec-5.18 U7 -- member_count is the MEMBER-only denominator; shrink_to_removed
+ * shrinks it by one and pins the incarnation floor.
+ * ====================================================================== */
+UT_TEST(test_member_count_shrink)
+{
+	int before;
+
+	test_in_quorum = true;
+	cluster_membership_attach(&seed_tab);
+	memset(&seed_tab, 0, sizeof(seed_tab));
+
+	cluster_membership_set_state(40, CLUSTER_MEMBER_MEMBER);
+	cluster_membership_set_state(41, CLUSTER_MEMBER_MEMBER);
+	cluster_membership_set_state(42, CLUSTER_MEMBER_MEMBER);
+	cluster_membership_set_state(43, CLUSTER_MEMBER_DEAD);	 /* not counted */
+	cluster_membership_set_state(44, CLUSTER_MEMBER_JOINING); /* not counted */
+	before = cluster_membership_member_count();
+	UT_ASSERT_EQ(before, 3);
+
+	/* permanent removal shrinks the denominator by one + pins the floor. */
+	cluster_membership_shrink_to_removed(41, 7);
+	UT_ASSERT_EQ(cluster_membership_member_count(), 2);
+	UT_ASSERT_EQ(cluster_membership_get_state(41), CLUSTER_MEMBER_REMOVED);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(41), 7);
+
+	cluster_membership_attach(NULL);
+}
+
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(17);
 	UT_RUN(test_vet_fresh_above_accept);
 	UT_RUN(test_vet_equal_reject_stale);
 	UT_RUN(test_vet_below_reject_stale);
@@ -387,6 +440,8 @@ main(void)
 	UT_RUN(test_seed_committed_marker_epoch_reset_still_seeds);
 	UT_RUN(test_marker_same_commit_identity_group);
 	UT_RUN(test_marker_version_mismatch_failclosed);
+	UT_RUN(test_vet_removed_fenced);
+	UT_RUN(test_member_count_shrink);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;
