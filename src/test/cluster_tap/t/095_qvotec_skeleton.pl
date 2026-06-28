@@ -101,11 +101,11 @@ is($io_default, '5000', 'L3 cluster.voting_disk_io_timeout_ms default 5000ms');
 
 
 # ----------
-# L4: cluster.voting_disk_size_bytes GUC default 65536 bytes.
+# L4: cluster.voting_disk_size_bytes GUC default 196608 bytes (3 regions).
 # ----------
 my $size_default = $node->safe_psql('postgres',
 	q{SELECT setting FROM pg_settings WHERE name = 'cluster.voting_disk_size_bytes'});
-is($size_default, '131072', 'L4 cluster.voting_disk_size_bytes default 131072 (spec-5.13: 2 regions x 128 x 512)');
+is($size_default, '196608', 'L4 cluster.voting_disk_size_bytes default 196608 (spec-5.15: 3 regions x 128 x 512 -- adds the join-commit marker region)');
 
 
 # ----------

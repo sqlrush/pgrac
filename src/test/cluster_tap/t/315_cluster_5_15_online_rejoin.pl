@@ -75,6 +75,26 @@ sub current_epoch
 	return $v + 0;
 }
 
+# Poll until $node's reconfig epoch advances strictly past $floor, or time out.
+# The membership-state demote and the epoch-bump publish are written sequentially
+# inside one LMON tick but observed through two separate SRF round-trips, so on a
+# loaded/slow runner the epoch can lag the membership demote by a tick.  Returns
+# the observed epoch (> $floor on success, <= $floor on timeout).
+sub poll_epoch_gt
+{
+	my ($node, $floor, $timeout_s, $label) = @_;
+	$timeout_s //= 30;
+	my $deadline = time + $timeout_s;
+	my $e = current_epoch($node);
+	while ($e <= $floor && time < $deadline)
+	{
+		usleep(200_000);
+		$e = current_epoch($node);
+	}
+	diag("poll_epoch_gt timeout ($label): epoch=$e floor=$floor") if $e <= $floor;
+	return $e;
+}
+
 # Strict pair + shared data + 3 voting disks (the proven 2-node recipe), with
 # online_join ON and brisk CSSD timing so the rejoin converges within the test.
 my @conf = (
@@ -124,20 +144,36 @@ my $node1 = $pair->node1;
 	$node1->stop;
 	ok(poll_until($node0,
 			q{SELECT state IN ('suspected','dead') FROM pg_cluster_cssd_peers WHERE node_id = 1},
-			't', 40, 'node1 CSSD dead'),
+			't', 60, 'node1 CSSD dead'),
 		'L2-i node0 CSSD declared node1 dead');
 	ok(poll_until($node0, q{SELECT state <> 'member' FROM pg_cluster_membership WHERE node_id = 1},
-			't', 40, 'node1 not member'),
+			't', 60, 'node1 not member'),
 		'L2-ii node0 dropped node1 from the MEMBER set');
-	my $epoch_dead = current_epoch($node0);
+	# The membership demote (observed by L2-ii) and the epoch-bump publish are
+	# written in the same LMON tick but read through two separate SRF round-trips,
+	# so on a loaded runner the epoch can lag the demote by a tick -- poll for it
+	# rather than reading once (the bump is what L2-v later builds on).
+	my $epoch_dead = poll_epoch_gt($node0, $epoch_before, 60, 'epoch bump on leave');
 	cmp_ok($epoch_dead, '>', $epoch_before, 'L2-iii epoch bumped on the leave');
 
 	# Bring node1 back: a fresh process => a fresh (µs-clock) slot incarnation.
 	# The coordinator (node0) detects the join edge, vets the fresh incarnation,
 	# and drives the two-phase publish -> node1 returns to MEMBER.
 	$node1->start;
+	# Precondition for the join drive: the restarted peer must first be seen
+	# CSSD-alive again (the transport peer-restart->reconnect chain -- the
+	# substrate this spec had to fix).  Await it explicitly so a future failure
+	# distinguishes "transport never reconnected" from "join drive stuck".
+	# Generous convergence budgets: the online rejoin (CSSD reconnect + two-phase
+	# join drive + voting-disk I/O) is correct-but-not-instant, and this test runs
+	# last in a heavy reconfig shard on CI, so a loaded runner needs headroom.  The
+	# polls still require the rejoin to actually happen -- they only tolerate slow.
+	ok(poll_until($node0,
+			q{SELECT state = 'alive' FROM pg_cluster_cssd_peers WHERE node_id = 1},
+			't', 90, 'node1 CSSD alive again'),
+		'L2-iiib node0 sees node1 CSSD alive again after restart (transport reconnect)');
 	ok(poll_until($node0, q{SELECT state = 'member' FROM pg_cluster_membership WHERE node_id = 1},
-			't', 60, 'node1 rejoined member'),
+			't', 90, 'node1 rejoined member'),
 		'L2-iv node0 republished node1 as MEMBER (online rejoin, no full restart)');
 	cmp_ok(current_epoch($node0), '>', $epoch_dead,
 		'L2-v epoch bumped again on the JOIN reconfig');
@@ -145,12 +181,12 @@ my $node1 = $pair->node1;
 	# Once admitted, node1's own write gate reopens -> it is writable again.
 	ok(poll_until($node1,
 			q{SELECT 1 FROM (SELECT pg_catalog.txid_current()) s} ,
-			'1', 60, 'node1 writable after admission'),
+			'1', 90, 'node1 writable after admission'),
 		'L2-vi node1 write gate reopened (it can assign an xid)');
 
 	# node1 itself observes membership MEMBER (its self-state followed the gate).
 	ok(poll_until($node1, q{SELECT state = 'member' FROM pg_cluster_membership WHERE node_id = 1},
-			't', 30, 'node1 self member'),
+			't', 90, 'node1 self member'),
 		'L2-vii node1 observes its own state as MEMBER');
 }
 
