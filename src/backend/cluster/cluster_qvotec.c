@@ -821,15 +821,26 @@ qvotec_poll_once(void)
 	/*
 	 * spec-5.15 D5: detect THIS node's own admission — a §2.6 COMMITTED join
 	 * marker in region-3 slot self, with admitted_incarnation == our incarnation,
-	 * on a quorum-majority of disks.  note_self_admitted then adopts the admitted
-	 * epoch + sets self MEMBER + opens the joiner write gate (one extra slot read
-	 * per disk; qvotec already has the fds open).
+	 * on a quorum-majority of disks (one extra slot read per disk; qvotec already
+	 * has the fds open).
+	 *
+	 * Hardening v1.1:
+	 *   HF-3 (INV-J13): require a majority of the SAME commit (identical nonce),
+	 *     not "any COMMITTED marker" — two minority writes from different commit
+	 *     attempts (different coordinator / epoch) must not aggregate (P1-3).
+	 *   HF-1 (INV-J9): open the gate only after the publish-proof also holds (a
+	 *     member quorum reached admitted_epoch).  marker-durable-but-coordinator-
+	 *     crashed-before-publish keeps the gate CLOSED -> the joiner times out ->
+	 *     53R61 -> restarts (P1-1 half-publish window).  Until then the lmon
+	 *     epoch catch-up keeps transport alive and the next poll re-checks.
 	 */
 	if (cluster_node_id >= 0 && cluster_node_id < CLUSTER_MAX_NODES) {
-		uint32 self_agree = 0;
-		uint64 self_admitted_epoch = 0;
+		ClusterJoinCommitMarker self_markers[CLUSTER_MAX_VOTING_DISKS];
+		int n_self = 0;
 		uint32 majority = ((uint32)qvotec_n_disks / 2u) + 1u;
-		int d;
+		int d, a, b;
+		int win = -1;
+		uint32 win_agree = 0;
 
 		for (d = 0; d < qvotec_n_disks; d++) {
 			union {
@@ -847,12 +858,27 @@ qvotec_poll_once(void)
 				continue;
 			if (m.admitted_incarnation != qvotec_self_incarnation)
 				continue; /* a stale prior-incarnation admission — not us */
-			self_agree++;
-			if (m.admitted_epoch > self_admitted_epoch)
-				self_admitted_epoch = m.admitted_epoch;
+			self_markers[n_self++] = m;
 		}
-		if (self_agree >= majority)
-			cluster_reconfig_note_self_admitted(self_admitted_epoch);
+
+		/* HF-3: find a single commit (nonce) present on >= majority disks. */
+		for (a = 0; a < n_self; a++) {
+			uint32 same = 0;
+
+			for (b = 0; b < n_self; b++)
+				if (cluster_join_marker_same_commit(&self_markers[a], &self_markers[b]))
+					same++;
+			if (same >= majority) {
+				win = a;
+				win_agree = same;
+				break;
+			}
+		}
+
+		/* HF-1: gate-open requires the publish-proof too, not the marker alone. */
+		if (win >= 0 && win_agree >= majority
+			&& cluster_reconfig_join_publish_proven(self_markers[win].admitted_epoch))
+			cluster_reconfig_note_self_admitted(self_markers[win].admitted_epoch);
 	}
 
 	/*

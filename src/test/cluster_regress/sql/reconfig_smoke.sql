@@ -53,7 +53,7 @@ SELECT count(*)
  WHERE name = 'BgProcLmonReconfigTick';
 
 -- ----------
--- Block 4: 5 NEW inject points visible.
+-- Block 4: 6 inject points visible (spec-5.15 Hardening v1.1 +1 cluster-reconfig-join-commit-marker-durable).
 -- ----------
 SELECT count(*)
   FROM pg_stat_cluster_injections

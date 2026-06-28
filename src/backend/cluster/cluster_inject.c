@@ -229,6 +229,13 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	{ .name = "cluster-reconfig-decide-coordinator" },
 	{ .name = "cluster-reconfig-epoch-bump-pre" },
 	{ .name = "cluster-reconfig-broadcast-procsig-pre" },
+	/*
+	 * spec-5.15 Hardening v1.1 (HF-1): pause the join coordinator inside
+	 * commit_member after the COMMITTED marker is majority-durable but before
+	 * the publish, so t/315 L8 can prove the half-publish window keeps the
+	 * joiner's write gate CLOSED (publish-proof, not the marker alone, opens it).
+	 */
+	{ .name = "cluster-reconfig-join-commit-marker-durable" },
 	{ .name = "cluster-cssd-mark-peer-dead" },
 	/* Stage 1.15 (spec-1.15 D11 inject) — 4 SCN encoding-layer injects. */
 	{ .name = "cluster-scn-advance-pre" },

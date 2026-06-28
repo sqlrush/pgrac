@@ -139,7 +139,14 @@ extern void cluster_membership_seed_last_admitted_from_voting_disk(const int *fd
  * monotonic incarnation floor.
  */
 #define CLUSTER_JCMK_MAGIC 0x4A434D4B /* "JCMK" */
-#define CLUSTER_JCMK_VERSION 1
+/*
+ * version 2 (Hardening v1.1, INV-J13): adds commit_nonce so that the majority
+ * judgement groups markers by full commit identity, not "any COMMITTED marker".
+ * A v1 marker fails struct_valid (version mismatch) and is fail-closed rejected
+ * -- correct: a marker whose layout we cannot parse is never trusted (pre-1.0,
+ * no on-disk upgrade guarantee).
+ */
+#define CLUSTER_JCMK_VERSION 2
 #define CLUSTER_JCMK_PHASE_PREPARE 1   /* intent recorded; does NOT seed */
 #define CLUSTER_JCMK_PHASE_COMMITTED 2 /* committed; THIS seeds last_admitted */
 
@@ -153,7 +160,8 @@ typedef struct ClusterJoinCommitMarker {
 	uint64 admitted_incarnation;   /* incarnation N was admitted at (uint64, P1a) */
 	uint64 admitted_epoch;		   /* INFORMATIONAL only — NOT a trust gate */
 	uint64 supersedes_leave_epoch; /* clears clean_departed/leave marker for N */
-	uint32 crc32c;				   /* CRC32C over [magic .. supersedes_leave_epoch] */
+	uint64 commit_nonce;		   /* per-commit-attempt id (INV-J13 identity group) */
+	uint32 crc32c;				   /* CRC32C over [magic .. commit_nonce] */
 } ClusterJoinCommitMarker;
 
 /* outcome of cluster_reconfig_submit_join_marker (mirrors the fence/leave result). */
@@ -168,6 +176,15 @@ extern void cluster_join_marker_compute_crc(ClusterJoinCommitMarker *m);
 extern bool cluster_join_marker_struct_valid(const ClusterJoinCommitMarker *m, int32 expected_node);
 extern bool cluster_join_marker_is_committed_basis(const ClusterJoinCommitMarker *m,
 												   int32 expected_node);
+/*
+ * INV-J13 (Hardening v1.1): do two markers describe the SAME commit attempt?
+ * Compares the full identity range [magic .. commit_nonce] (the markers are
+ * memset-0 before fill, so _pad is stable).  The majority judgement counts only
+ * markers that are same_commit -- different attempts (different coordinator /
+ * epoch / nonce) MUST NOT aggregate into a false majority (P1-3).
+ */
+extern bool cluster_join_marker_same_commit(const ClusterJoinCommitMarker *a,
+											const ClusterJoinCommitMarker *b);
 
 /*
  * Apply one durable marker to the admitted floor (INV-J7): if it is a committed

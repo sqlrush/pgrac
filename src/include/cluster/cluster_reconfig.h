@@ -457,6 +457,26 @@ extern bool cluster_reconfig_get_observed_slot(int32 node_id, uint64 *incarnatio
 											   uint64 *generation);
 extern uint64 cluster_reconfig_get_observed_epoch(int32 node_id);
 
+/*
+ * spec-5.15 Hardening v1.1 (HF-1 / INV-J9): true iff a majority of the current
+ * MEMBER survivors have advanced their durable observed epoch to >=
+ * admitted_epoch — i.e. the coordinator's JOIN_COMMITTED publish actually
+ * propagated to a quorum of the membership.  qvotec gates the joiner's gate-open
+ * on this (not on the durable marker alone), closing the half-publish window
+ * (P1-1).  Fail-closed: 0 visible MEMBER survivor -> false.
+ */
+extern bool cluster_reconfig_join_publish_proven(uint64 admitted_epoch);
+
+/*
+ * spec-5.15 Hardening v1.1 (HF-2 / INV-J14): positive cold-bootstrap proof — a
+ * majority of declared nodes CSSD-alive AND no declared peer past
+ * CLUSTER_EPOCH_INITIAL.  joiner_self_tick uses it to decide, fail-closed,
+ * whether a freshly-booted online_join node may keep its gate open (bootstrap)
+ * vs must seek admission (rejoiner); a slow qvotec stays UNDECIDED (gate closed)
+ * rather than mis-deciding bootstrap (P1-2).  Exposed for the unit test.
+ */
+extern bool cluster_reconfig_bootstrap_quorum_at_initial(void);
+
 /* ============================================================
  * spec-5.15 D4 — two-phase online-join publication + §2.6 marker handshake.
  * ============================================================

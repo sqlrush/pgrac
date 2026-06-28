@@ -440,6 +440,23 @@ void cluster_reconfig_note_self_admitted(uint64 admitted_epoch);
 void
 cluster_reconfig_note_self_admitted(uint64 admitted_epoch pg_attribute_unused())
 {}
+/* Hardening v1.1: self-admit now groups by commit identity (HF-3) and gates on
+ * the publish-proof (HF-1).  The is_committed_basis stub returns false so the
+ * collection loop is empty and neither runs, but the linker needs the symbols. */
+bool cluster_join_marker_same_commit(const ClusterJoinCommitMarker *a,
+									 const ClusterJoinCommitMarker *b);
+bool
+cluster_join_marker_same_commit(const ClusterJoinCommitMarker *a pg_attribute_unused(),
+								const ClusterJoinCommitMarker *b pg_attribute_unused())
+{
+	return false;
+}
+bool cluster_reconfig_join_publish_proven(uint64 admitted_epoch);
+bool
+cluster_reconfig_join_publish_proven(uint64 admitted_epoch pg_attribute_unused())
+{
+	return false;
+}
 ClusterVotingDiskIoState cluster_voting_disk_read_join_slot(int fd, uint32 node_id,
 															void *out_slot512);
 ClusterVotingDiskIoState

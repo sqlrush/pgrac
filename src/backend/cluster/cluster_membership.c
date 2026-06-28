@@ -180,7 +180,7 @@ cluster_membership_is_member(int32 node_id)
  * ============================================================
  */
 
-/* Set m->crc32c = CRC32C over [magic .. supersedes_leave_epoch]. */
+/* Set m->crc32c = CRC32C over [magic .. commit_nonce]. */
 void
 cluster_join_marker_compute_crc(ClusterJoinCommitMarker *m)
 {
@@ -225,6 +225,23 @@ cluster_join_marker_is_committed_basis(const ClusterJoinCommitMarker *m, int32 e
 {
 	return cluster_join_marker_struct_valid(m, expected_node)
 		   && m->phase == CLUSTER_JCMK_PHASE_COMMITTED;
+}
+
+/*
+ * INV-J13 (Hardening v1.1): same commit attempt?  Compares the whole identity
+ * range [0 .. offsetof(crc32c)) -- magic/version/node_id/phase/_pad/generation/
+ * admitted_incarnation/admitted_epoch/supersedes_leave_epoch/commit_nonce.  The
+ * markers are memset-0 before fill so _pad never differs.  Used by the self-
+ * admit and the startup-seed majority judgements so that two minority writes
+ * from DIFFERENT commit attempts (different coordinator / epoch / nonce) cannot
+ * be counted together as a false majority (P1-3).
+ */
+bool
+cluster_join_marker_same_commit(const ClusterJoinCommitMarker *a, const ClusterJoinCommitMarker *b)
+{
+	if (a == NULL || b == NULL)
+		return false;
+	return memcmp(a, b, offsetof(ClusterJoinCommitMarker, crc32c)) == 0;
 }
 
 /*

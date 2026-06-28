@@ -1357,6 +1357,79 @@ UT_TEST(test_self_join_gate_lifecycle)
 	cluster_online_join = false; /* leave global off for other tests */
 }
 
+/* ======================================================================
+ * U18 (HF-1 / INV-J9) -- the publish-proof is true only when a MAJORITY of the
+ * current MEMBER survivors have reached admitted_epoch: i.e. the coordinator's
+ * JOIN_COMMITTED publish actually propagated.  A marker-durable-but-unpublished
+ * state (survivors still behind) is NOT proven -> the joiner gate stays closed
+ * (the half-publish window, P1-1).
+ * ====================================================================== */
+UT_TEST(test_reconfig_join_publish_proven_member_quorum)
+{
+	ut_join_setup();		   /* self = node 0, the joiner */
+	ut_declared_set[1] = true; /* peers 1 and 2 are MEMBER survivors */
+	ut_declared_set[2] = true;
+	cluster_membership_set_state(1, CLUSTER_MEMBER_MEMBER);
+	cluster_membership_set_state(2, CLUSTER_MEMBER_MEMBER);
+
+	/* admitted_epoch 5; nobody advanced yet -> not proven (half-publish). */
+	cluster_reconfig_record_observed_slot(1, 1, 1, 0);
+	cluster_reconfig_record_observed_slot(2, 1, 1, 0);
+	UT_ASSERT(!cluster_reconfig_join_publish_proven(5));
+
+	/* one of two members reached it -> still below majority(2) -> not proven. */
+	cluster_reconfig_record_observed_slot(1, 1, 1, 5);
+	UT_ASSERT(!cluster_reconfig_join_publish_proven(5));
+
+	/* both members reached it -> proven. */
+	cluster_reconfig_record_observed_slot(2, 1, 1, 5);
+	UT_ASSERT(cluster_reconfig_join_publish_proven(5));
+
+	/* admitted_epoch 0 is never a real epoch -> fail-closed. */
+	UT_ASSERT(!cluster_reconfig_join_publish_proven(0));
+}
+
+/* ======================================================================
+ * U18b (HF-1) -- zero visible MEMBER survivor -> cannot prove -> fail-closed
+ * (a peer at a high epoch that is NOT a member does not count).
+ * ====================================================================== */
+UT_TEST(test_reconfig_join_publish_proven_no_member_failclosed)
+{
+	ut_join_setup();
+	ut_declared_set[1] = true;
+	cluster_membership_set_state(1, CLUSTER_MEMBER_JOINING); /* not a member */
+	cluster_reconfig_record_observed_slot(1, 1, 1, 9);
+	UT_ASSERT(!cluster_reconfig_join_publish_proven(5));
+}
+
+/* ======================================================================
+ * U19 (HF-2 / INV-J14) -- bootstrap is a POSITIVE epoch proof, not a timing
+ * grace: quorum of declared CSSD-alive AND no peer past INITIAL.  A running
+ * cluster (any peer past INITIAL) is NOT a bootstrap -> false (a slow rejoiner
+ * stays fail-closed, P1-2).  Too few alive -> undecided -> false.
+ * ====================================================================== */
+UT_TEST(test_reconfig_bootstrap_quorum_epoch_proof)
+{
+	ut_join_setup();		   /* self = node 0 */
+	ut_declared_set[1] = true; /* 3 declared nodes */
+	ut_declared_set[2] = true;
+	ut_peer_state[1] = CLUSTER_CSSD_PEER_ALIVE;
+	ut_peer_state[2] = CLUSTER_CSSD_PEER_ALIVE;
+
+	/* all CSSD-alive at epoch 0 -> cold bootstrap proven. */
+	UT_ASSERT(cluster_reconfig_bootstrap_quorum_at_initial());
+
+	/* a peer past INITIAL (running cluster) -> NOT a bootstrap (fail-closed). */
+	cluster_reconfig_record_observed_slot(1, 1, 1, 4);
+	UT_ASSERT(!cluster_reconfig_bootstrap_quorum_at_initial());
+
+	/* back at epoch 0 but only self alive (peers DEAD) -> below quorum -> false. */
+	cluster_reconfig_record_observed_slot(1, 1, 1, 0);
+	ut_peer_state[1] = CLUSTER_CSSD_PEER_DEAD;
+	ut_peer_state[2] = CLUSTER_CSSD_PEER_DEAD;
+	UT_ASSERT(!cluster_reconfig_bootstrap_quorum_at_initial());
+}
+
 
 /* ============================================================
  * Main — register + run all tests.
@@ -1365,7 +1438,7 @@ UT_TEST(test_self_join_gate_lifecycle)
 int
 main(void)
 {
-	UT_PLAN(40);
+	UT_PLAN(43);
 
 	/* T-reconfig-1 */
 	UT_RUN(test_reconfig_dead_bitmap_bytes_eq_16);
@@ -1430,6 +1503,11 @@ main(void)
 
 	/* spec-5.15 D5 — joiner write-gate lifecycle (INV-J9). */
 	UT_RUN(test_self_join_gate_lifecycle);
+
+	/* spec-5.15 Hardening v1.1 — HF-1 publish-proof + HF-2 bootstrap epoch-proof. */
+	UT_RUN(test_reconfig_join_publish_proven_member_quorum);
+	UT_RUN(test_reconfig_join_publish_proven_no_member_failclosed);
+	UT_RUN(test_reconfig_bootstrap_quorum_epoch_proof);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

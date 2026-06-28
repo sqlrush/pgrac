@@ -320,10 +320,58 @@ UT_TEST(test_seed_committed_marker_epoch_reset_still_seeds)
 	UT_ASSERT(!cluster_join_marker_is_committed_basis(&m, 14));
 }
 
+/* ======================================================================
+ * U16 (HF-3 / INV-J13) -- same_commit groups by full identity (incl. nonce).
+ * Two markers of the SAME commit attempt are same_commit; differing by nonce or
+ * by admitted_epoch (a different coordinator / attempt) are NOT, so two minority
+ * writes from different attempts cannot aggregate into a false majority (P1-3).
+ * ====================================================================== */
+UT_TEST(test_marker_same_commit_identity_group)
+{
+	ClusterJoinCommitMarker a, b;
+
+	make_marker(&a, 7, CLUSTER_JCMK_PHASE_COMMITTED, 100, 5);
+	make_marker(&b, 7, CLUSTER_JCMK_PHASE_COMMITTED, 100, 5);
+	a.commit_nonce = b.commit_nonce = 0xABCDEFu;
+	cluster_join_marker_compute_crc(&a);
+	cluster_join_marker_compute_crc(&b);
+	UT_ASSERT(cluster_join_marker_same_commit(&a, &b)); /* byte-identical -> same */
+
+	/* a different commit_nonce (a different attempt) -> NOT the same commit */
+	b.commit_nonce = 0x123456u;
+	cluster_join_marker_compute_crc(&b);
+	UT_ASSERT(!cluster_join_marker_same_commit(&a, &b));
+
+	/* same nonce but a different admitted_epoch (different coordinator/epoch) */
+	make_marker(&b, 7, CLUSTER_JCMK_PHASE_COMMITTED, 100, 9);
+	b.commit_nonce = 0xABCDEFu;
+	cluster_join_marker_compute_crc(&b);
+	UT_ASSERT(!cluster_join_marker_same_commit(&a, &b));
+
+	UT_ASSERT(!cluster_join_marker_same_commit(&a, NULL)); /* NULL defensive */
+}
+
+/* ======================================================================
+ * U17 (HF-3) -- a stale on-disk format (version != current) is fail-closed
+ * rejected: a marker whose layout we cannot parse is never trusted.
+ * ====================================================================== */
+UT_TEST(test_marker_version_mismatch_failclosed)
+{
+	ClusterJoinCommitMarker m;
+
+	make_marker(&m, 8, CLUSTER_JCMK_PHASE_COMMITTED, 3, 1);
+	UT_ASSERT(cluster_join_marker_is_committed_basis(&m, 8)); /* current version */
+
+	m.version = CLUSTER_JCMK_VERSION - 1; /* an older on-disk format */
+	cluster_join_marker_compute_crc(&m);
+	UT_ASSERT(!cluster_join_marker_struct_valid(&m, 8));
+	UT_ASSERT(!cluster_join_marker_is_committed_basis(&m, 8));
+}
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(15);
 	UT_RUN(test_vet_fresh_above_accept);
 	UT_RUN(test_vet_equal_reject_stale);
 	UT_RUN(test_vet_below_reject_stale);
@@ -337,6 +385,8 @@ main(void)
 	UT_RUN(test_seed_committed_marker_reseeds_floor);
 	UT_RUN(test_seed_prepare_marker_not_a_basis);
 	UT_RUN(test_seed_committed_marker_epoch_reset_still_seeds);
+	UT_RUN(test_marker_same_commit_identity_group);
+	UT_RUN(test_marker_version_mismatch_failclosed);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

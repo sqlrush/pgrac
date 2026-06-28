@@ -156,10 +156,15 @@ cluster_reconfig_shmem_init(void)
 		 * CLUSTER_RECONFIG_OBSERVER_NONE = never-applied sentinel. */
 
 		/* spec-5.15 D2/D5 — membership table + pending_join_bitmap left zeroed by
-		 * memset (all nodes CLUSTER_MEMBER_ABSENT, no pending join).  Open the
-		 * joiner write gate by default: a steady-state / non-joining node may
-		 * write; a joiner explicitly closes it in its D5 startup. */
-		ReconfigShmem->self_join_admitted = 1;
+		 * memset (all nodes CLUSTER_MEMBER_ABSENT, no pending join).
+		 *
+		 * Hardening v1.1 (HF-2): default the joiner write gate CLOSED when
+		 * online_join is on (fail-closed — a freshly-booted node must PROVE it is
+		 * a cold-bootstrap member or be admitted before it may write; this closes
+		 * the boot-to-first-LMON-tick fail-open window, P1-2).  When online_join
+		 * is off the gate is open: no online membership gating, so bootstrap and
+		 * steady-state writes are unaffected. */
+		ReconfigShmem->self_join_admitted = cluster_online_join ? 0 : 1;
 
 		/* spec-5.15 D1/D4 — no slot observed yet (generation 0 = absent/not ready). */
 		for (int n = 0; n < CLUSTER_MAX_NODES; n++) {
@@ -855,6 +860,55 @@ cluster_reconfig_join_converged(int joiner)
 }
 
 /*
+ * spec-5.15 Hardening v1.1 (HF-1 / INV-J9 strengthened) — proof that the
+ * coordinator's JOIN_COMMITTED publish actually propagated to a quorum of the
+ * membership, NOT merely that the COMMITTED marker is durable.  A joiner opens
+ * its write gate only after a majority of the current MEMBER survivors have
+ * advanced their durable (voting-disk-observed) epoch to >= admitted_epoch.
+ *
+ * The survivor epoch is observable because qvotec publishes the LIVE
+ * cluster_epoch_get_current() into each slot (5.15 ship substrate-fix #1);
+ * after the coordinator's publish advances the cluster epoch to admitted_epoch
+ * (== new_epoch == current+1 at marker-write time) the members reach it via the
+ * normal bounded observe and persist it, and the joiner reads it back through
+ * observed_epoch[].  If the coordinator crashes AFTER the COMMITTED marker is
+ * durable but BEFORE the publish (injection cluster-reconfig-join-commit-marker-
+ * durable), the survivors never advance, this proof never holds, the gate stays
+ * closed, and the joiner times out -> 53R61 -> restarts with a fresh incarnation
+ * (P1-1: the half-publish window the v1.0 note_self_admitted left open).
+ *
+ * Lock-free, mirroring cluster_reconfig_join_converged: is_member is a single-
+ * byte read and get_observed_epoch is an atomic read.  Fail-closed: zero visible
+ * MEMBER survivor (e.g. transient) -> cannot prove -> false.
+ */
+bool
+cluster_reconfig_join_publish_proven(uint64 admitted_epoch)
+{
+	uint32 members = 0;
+	uint32 advanced = 0;
+	int i;
+
+	if (ReconfigShmem == NULL || admitted_epoch == 0)
+		return false;
+
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		if (i == cluster_node_id)
+			continue;
+		if (cluster_conf_lookup_node(i) == NULL)
+			continue;
+		if (!cluster_membership_is_member(i))
+			continue; /* only existing MEMBER survivors carry the publish */
+		members++;
+		if (cluster_reconfig_get_observed_epoch(i) >= admitted_epoch)
+			advanced++;
+	}
+
+	if (members == 0)
+		return false; /* nobody to prove it -> fail-closed */
+	return advanced >= ((members / 2u) + 1u);
+}
+
+/*
  * spec-5.15 D4 — coordinator-side join driver (called from the tick when
  * online_join is on and self is the min-MEMBER coordinator).  Phase-1: fresh
  * join edges -> apply_join_as_coordinator (JOIN_PENDING).  Phase-2: pending joins
@@ -943,10 +997,16 @@ cluster_reconfig_note_self_admitted(uint64 admitted_epoch)
 		return;
 
 	/*
-	 * P1-r5 strict order: adopt the admitted epoch (quorum-authenticated, may
-	 * jump >16 — INV-J12) AND set self MEMBER BEFORE opening the write gate
-	 * (gate-open guard = adopt && state==MEMBER; never open right after the
-	 * COMMITTED marker is durable but before the publish reached self).
+	 * Hardening v1.1 (HF-1 / INV-J9): this is called ONLY after the caller
+	 * (qvotec) has confirmed BOTH a same-commit majority COMMITTED marker (HF-3)
+	 * AND the publish-proof — cluster_reconfig_join_publish_proven — i.e. a
+	 * member quorum has reached admitted_epoch, proving the coordinator's
+	 * JOIN_COMMITTED publish actually propagated.  The v1.0 "gate-open guard =
+	 * adopt && state==MEMBER" was vacuous (this function self-set state==MEMBER),
+	 * which left the half-publish window open (P1-1); the real guard is now the
+	 * publish-proof at the caller.  Here we just adopt the admitted epoch
+	 * (quorum-authenticated, may jump >16 — INV-J12), set self MEMBER and open
+	 * the gate.
 	 */
 	cluster_epoch_adopt_admitted(admitted_epoch);
 	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
@@ -983,25 +1043,65 @@ cluster_reconfig_cluster_already_running(void)
 }
 
 /*
+ * spec-5.15 Hardening v1.1 (HF-2 / INV-J14) — positive cold-bootstrap proof.
+ * A node may keep its write gate open WITHOUT online-join admission only when a
+ * majority of declared nodes are CSSD-alive AND no declared peer is observed
+ * past CLUSTER_EPOCH_INITIAL (everyone co-booting at epoch 0).  This is an EPOCH
+ * proof, not a timing grace: a slow qvotec leaves the decision UNDECIDED (gate
+ * stays closed, fail-closed) instead of mis-deciding bootstrap and permanently
+ * fail-opening (P1-2).  A rejoiner can never satisfy it — by the time it sees
+ * its peers they are already at epoch > INITIAL.
+ */
+bool
+cluster_reconfig_bootstrap_quorum_at_initial(void)
+{
+	uint32 declared = 0;
+	uint32 alive_at_initial = 0;
+	int i;
+
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		if (cluster_conf_lookup_node(i) == NULL)
+			continue;
+		declared++;
+		if (i == cluster_node_id) {
+			alive_at_initial++; /* self is up, at INITIAL (not yet admitted) */
+			continue;
+		}
+		/* any declared peer past INITIAL => a running cluster, NOT a bootstrap */
+		if (cluster_reconfig_get_observed_epoch(i) > CLUSTER_EPOCH_INITIAL)
+			return false;
+		if (cluster_cssd_get_peer_state(i) != CLUSTER_CSSD_PEER_DEAD)
+			alive_at_initial++;
+	}
+	if (declared == 0)
+		return false;
+	return alive_at_initial >= ((declared / 2u) + 1u);
+}
+
+/*
  * spec-5.15 D5 — joiner self-tick (runs on every node each LMON tick).
  *
- *	One-time boot decision: within an early startup window, if online_join is on
- *	and the cluster is already running, this node is a rejoiner — close the write
- *	gate (53R60) and start the join (the coordinator drives it from the other
- *	side).  Once admitted, qvotec's note_self_admitted opens the gate; if the join
- *	does not converge within join_convergence_timeout_ms, latch self_join_failed
- *	(53R61, restart with a fresh incarnation — INV-J4 never half-admit).  A cold
- *	bootstrap observes no running peer within the grace and leaves the gate open
- *	(boot-time membership formation is NOT gated by online_join).
+ *	Decides, fail-closed, whether THIS node may write before it is a confirmed
+ *	member.  Hardening v1.1 (HF-2 / INV-J14) replaces the v1.0 timing-grace
+ *	heuristic — which permanently fail-opened a rejoiner that a slow qvotec
+ *	mis-saw as a cold bootstrap (P1-2) — with a POSITIVE epoch proof:
+ *	  - any declared peer past INITIAL          -> REJOINER: close the gate
+ *	    (53R60), start the join, latch a convergence deadline -> 53R61 on timeout
+ *	    (restart with a fresh incarnation, INV-J4 never half-admit).  qvotec's
+ *	    note_self_admitted opens the gate once the COMMITTED marker AND the
+ *	    publish-proof (HF-1) both hold.
+ *	  - quorum of declared CSSD-alive at INITIAL -> BOOTSTRAP: open the gate
+ *	    (boot-time formation is not gated by online_join) and latch it so a later
+ *	    epoch advance does not re-close this genuine member.
+ *	  - neither proven yet                       -> UNDECIDED: keep the gate
+ *	    closed (fail-closed); a slow qvotec waits here, it never mis-opens.
  */
-static uint64 joiner_lmon_boot_time_us = 0;
 static bool joiner_gate_decided = false;
 
 static void
 cluster_reconfig_joiner_self_tick(void)
 {
 	uint64 now_us;
-	uint64 decide_grace_us;
 
 	if (ReconfigShmem == NULL || !cluster_online_join)
 		return;
@@ -1009,10 +1109,6 @@ cluster_reconfig_joiner_self_tick(void)
 		return;
 
 	now_us = (uint64)GetCurrentTimestamp();
-	if (joiner_lmon_boot_time_us == 0)
-		joiner_lmon_boot_time_us = now_us;
-	/* enough for qvotec to have published at least one poll's observed epochs. */
-	decide_grace_us = Max((uint64)cluster_quorum_poll_interval_ms * 5 * 1000ULL, 2000ULL * 1000ULL);
 
 	/*
 	 * Catch up to the cluster epoch observed on the durable voting disk (quorum-
@@ -1053,6 +1149,8 @@ cluster_reconfig_joiner_self_tick(void)
 	 */
 	if (!joiner_gate_decided && !cluster_clean_leave_in_progress()) {
 		if (cluster_reconfig_cluster_already_running()) {
+			/* REJOINER: a running cluster exists.  Close the gate, start the
+			 * join, latch a convergence deadline (-> 53R61 on timeout). */
 			joiner_gate_decided = true;
 			LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
 			ReconfigShmem->self_join_admitted = 0;
@@ -1065,9 +1163,29 @@ cluster_reconfig_joiner_self_tick(void)
 					(errmsg("cluster membership: node %d joining a running cluster — write gate "
 							"closed (53R60) pending admission",
 							cluster_node_id)));
-		} else if (now_us - joiner_lmon_boot_time_us > decide_grace_us) {
-			/* no running peer observed in the early window -> cold bootstrap. */
+		} else if (cluster_reconfig_bootstrap_quorum_at_initial()) {
+			/* BOOTSTRAP proven: quorum of declared nodes CSSD-alive at INITIAL.
+			 * Open the gate (boot formation is not gated) and latch so a later
+			 * epoch advance does not re-close this genuine member (INV-J14). */
 			joiner_gate_decided = true;
+			LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+			ReconfigShmem->self_join_admitted = 1;
+			ReconfigShmem->self_join_failed = 0;
+			ReconfigShmem->self_join_deadline_us = 0;
+			cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_MEMBER);
+			LWLockRelease(&ReconfigShmem->lock);
+			ereport(LOG,
+					(errmsg("cluster membership: node %d cold-bootstrap membership formation — "
+							"write gate open",
+							cluster_node_id)));
+		} else {
+			/* UNDECIDED: neither proof holds yet.  Keep the gate CLOSED
+			 * (fail-closed) and re-evaluate next tick — a slow qvotec waits here
+			 * rather than mis-opening as bootstrap (P1-2). */
+			LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+			ReconfigShmem->self_join_admitted = 0;
+			cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_JOINING);
+			LWLockRelease(&ReconfigShmem->lock);
 		}
 		return;
 	}
@@ -1708,46 +1826,68 @@ cluster_membership_seed_last_admitted_from_voting_disk(const int *fds, int n_dis
 			uint8 bytes[CLUSTER_VOTING_SLOT_BYTES];
 			uint64 _align;
 		} slot;
-		ClusterJoinCommitMarker m;
-		uint64 best_incarnation = 0;
-		uint64 best_admitted_epoch = 0;
-		uint32 agree = 0;
-		int d;
+		ClusterJoinCommitMarker committed[CLUSTER_MAX_VOTING_DISKS];
+		int n_committed = 0;
+		int win = -1;
+		uint32 win_agree = 0;
+		int d, a, b;
 
 		if (cluster_conf_lookup_node(s) == NULL)
 			continue;
 
+		/* Collect every committed-basis marker for slot s across the disks. */
 		for (d = 0; d < n_disks; d++) {
+			ClusterJoinCommitMarker m;
+
 			if (cluster_voting_disk_read_join_slot(fds[d], (uint32)s, slot.bytes)
 				!= CLUSTER_VOTING_DISK_IO_OK)
 				continue;
 			memcpy(&m, slot.bytes, sizeof(m));
-
 			if (!cluster_join_marker_is_committed_basis(&m, s))
 				continue;
-			agree++;
-			if (m.admitted_incarnation > best_incarnation)
-				best_incarnation = m.admitted_incarnation;
-			if (m.admitted_epoch > best_admitted_epoch)
-				best_admitted_epoch = m.admitted_epoch;
+			committed[n_committed++] = m;
 		}
 
-		if (agree >= majority && best_incarnation > 0) {
+		/*
+		 * INV-J13: require a MAJORITY of the SAME commit (identical identity /
+		 * nonce), not "any COMMITTED marker".  Two minority writes from
+		 * different attempts (different coordinator / epoch) must not aggregate.
+		 * Only a marker that actually reached a disk majority represents a real
+		 * admission, so only it raises the monotonic floor (P1-3).  O(disks^2),
+		 * disks <= CLUSTER_MAX_VOTING_DISKS (small).
+		 */
+		for (a = 0; a < n_committed; a++) {
+			uint32 same = 0;
+
+			for (b = 0; b < n_committed; b++)
+				if (cluster_join_marker_same_commit(&committed[a], &committed[b]))
+					same++;
+			if (same >= majority) {
+				win = a;
+				win_agree = same;
+				break;
+			}
+		}
+
+		if (win >= 0 && committed[win].admitted_incarnation > 0) {
+			uint64 win_incarnation = committed[win].admitted_incarnation;
+			uint64 win_admitted_epoch = committed[win].admitted_epoch;
+
 			LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
-			cluster_membership_record_admitted(s, best_incarnation);
+			cluster_membership_record_admitted(s, win_incarnation);
 			LWLockRelease(&ReconfigShmem->lock);
 
 			/* RC-5 / INV-J10 durable supersede: a rejoin newer than the leave
 			 * clears clean_departed[N] so a survivor restart does not keep
 			 * masking N's later real fail-stop. */
 			if (cluster_reconfig_is_clean_departed(s)
-				&& best_admitted_epoch > cluster_reconfig_get_clean_departed_epoch(s))
+				&& win_admitted_epoch > cluster_reconfig_get_clean_departed_epoch(s))
 				cluster_reconfig_clear_clean_departed(s);
 
 			ereport(LOG,
 					(errmsg("cluster membership: seeded last_admitted[%d]=%llu from %u/%d durable "
-							"COMMITTED join marker(s)",
-							s, (unsigned long long)best_incarnation, agree, n_disks)));
+							"COMMITTED join marker(s) of one commit (INV-J13)",
+							s, (unsigned long long)win_incarnation, win_agree, n_disks)));
 		}
 	}
 }
@@ -1875,6 +2015,15 @@ cluster_reconfig_commit_member(int32 node_id, uint64 admitted_incarnation)
 	m.generation = admitted_incarnation;
 	m.admitted_epoch = cluster_epoch_get_current() + 1; /* the epoch we publish below */
 	m.supersedes_leave_epoch = cluster_reconfig_get_clean_departed_epoch(node_id);
+	/*
+	 * INV-J13 (Hardening v1.1): per-attempt nonce so the majority judgement
+	 * groups by full commit identity.  Computed ONCE here -> all disks of THIS
+	 * attempt share it; a later attempt (>= 1 LMON tick away -> distinct µs
+	 * timestamp) or a different coordinator (distinct node_id high bits) gets a
+	 * distinct nonce, so two minority writes from different attempts cannot be
+	 * mis-counted as one majority (P1-3).  No new shmem field needed.
+	 */
+	m.commit_nonce = ((uint64)cluster_node_id << 56) ^ (uint64)GetCurrentTimestamp();
 	cluster_join_marker_compute_crc(&m);
 
 	if (cluster_reconfig_submit_join_marker(node_id, &m) != CLUSTER_JOIN_MARKER_SUBMIT_ACK) {
@@ -2393,6 +2542,18 @@ cluster_reconfig_self_join_gate_verdict(void)
 void
 cluster_reconfig_note_self_admitted(uint64 admitted_epoch pg_attribute_unused())
 {}
+
+bool
+cluster_reconfig_join_publish_proven(uint64 admitted_epoch pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_reconfig_bootstrap_quorum_at_initial(void)
+{
+	return false;
+}
 
 uint64
 cluster_reconfig_get_join_pending_count(void)

@@ -303,7 +303,7 @@ ok(defined $postgres_bin && -x $postgres_bin,
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-	'140', 'M1 140 injection points (spec-5.13 +6 cluster-clean-leave-*; spec-5.13 Hardening v1.0.3 +1 clean-leave-survivor-suppress-preflight-ack; spec-2.41 +1 gcs-block-stale-ship; spec-5.7 D6 +1 ko-peer-skip-ack; spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2 undo boundary guards; spec-5.55 Hardening v1.1 +1 cluster-cr-resolver-memo-suspect)');
+	'141', 'M1 141 injection points (spec-5.13 +6 cluster-clean-leave-*; spec-5.13 Hardening v1.0.3 +1 clean-leave-survivor-suppress-preflight-ack; spec-2.41 +1 gcs-block-stale-ship; spec-5.7 D6 +1 ko-peer-skip-ack; spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2 undo boundary guards; spec-5.55 Hardening v1.1 +1 cluster-cr-resolver-memo-suspect; spec-5.15 Hardening v1.1 +1 cluster-reconfig-join-commit-marker-durable)');
 
 is($node->safe_psql('postgres',
 		q{SELECT string_agg(name, ',' ORDER BY name) FROM pg_stat_cluster_injections WHERE name LIKE 'cluster-init-%'}),
@@ -333,8 +333,8 @@ ok( $node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT key) FROM pg_cluster_state
 		   WHERE category='inject' AND (key LIKE '%.fault_type' OR key LIKE '%.hits')}
-	) eq '280',
-	'M5 inject category has 140×2 = 280 sub-keys (.fault_type + .hits; spec-5.13 +6 cluster-clean-leave-*; spec-2.41 +1 gcs-block-stale-ship; spec-5.55 Hardening v1.1 +1 cluster-cr-resolver-memo-suspect)');
+	) eq '282',
+	'M5 inject category has 141×2 = 282 sub-keys (.fault_type + .hits; spec-5.13 +6 cluster-clean-leave-*; spec-2.41 +1 gcs-block-stale-ship; spec-5.55 Hardening v1.1 +1 cluster-cr-resolver-memo-suspect; spec-5.15 Hardening v1.1 +1 cluster-reconfig-join-commit-marker-durable)');
 
 is($node->get_cluster_state_value('inject', 'armed_count'),
 	'0', 'M6 inject.armed_count starts at 0 in fresh backend');
