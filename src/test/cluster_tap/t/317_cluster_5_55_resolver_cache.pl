@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 #-------------------------------------------------------------------------
 #
-# 316_cluster_5_55_resolver_cache.pl
+# 317_cluster_5_55_resolver_cache.pl
 #	  spec-5.55 -- shared resolver cache (CR Source 3 by-xid search-shortcut memo).
 #
 #	  The memo caches the position the last own-instance WRAP_ANY by-xid scan
