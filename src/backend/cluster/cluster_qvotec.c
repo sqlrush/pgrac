@@ -970,6 +970,25 @@ qvotec_poll_once(void)
 							 now_us, heartbeat_timeout_us, &decision);
 
 	/*
+	 * spec-5.15 Hardening v1.3 (INV-J14 stale-slot fail-open) — publish the
+	 * per-node FRESH-ALIVE liveness from decide_quorum_view's alive_bitmap (the
+	 * P2.1 heartbeat-freshness gate that already excludes a crashed peer's stale
+	 * leftover slot) into the reconfig region.  The cold-bootstrap proof reads it
+	 * so it counts only genuinely live co-booting peers, never a stale gen > 0
+	 * leftover (which would fail-open).  Anchored on the durable voting-disk
+	 * heartbeat, so it is robust to CSSD / tier1 churn — the v1.2 race fix stands.
+	 */
+	{
+		uint32 node;
+
+		for (node = 0; node < CLUSTER_MAX_NODES; node++) {
+			bool fresh = (decision.alive_bitmap[node / 8] & (uint8)(1u << (node % 8))) != 0;
+
+			cluster_reconfig_record_observed_fresh_alive((int32)node, fresh);
+		}
+	}
+
+	/*
 	 * Hardening v0.4 P1.1:  Q6 v0.2 newer-self-FATAL.  decide_quorum_
 	 * view observed an OK-disk fresh slot at our node_id offset with
 	 * an incarnation strictly less than ours — a peer was serving

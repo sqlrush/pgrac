@@ -666,6 +666,30 @@ cluster_reconfig_get_observed_slot(int32 node_id, uint64 *incarnation, uint64 *g
 	return gen > 0;
 }
 
+/*
+ * spec-5.15 Hardening v1.3 (INV-J14 stale-slot fail-open) — publish / read the
+ * per-node FRESH-ALIVE liveness qvotec derived from decide_quorum_view's
+ * heartbeat-freshness gate (P2.1).  The cold-bootstrap proof counts a peer only
+ * when it is fresh-alive at epoch INITIAL — a generation > 0 slot alone may be a
+ * crashed peer's stale leftover.  Anchored on the durable voting-disk heartbeat,
+ * not live CSSD, so the v1.2 IC-churn race fix is preserved.
+ */
+void
+cluster_reconfig_record_observed_fresh_alive(int32 node_id, bool fresh_alive)
+{
+	if (ReconfigShmem == NULL || node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return;
+	pg_atomic_write_u64(&ReconfigShmem->observed_fresh_alive[node_id], fresh_alive ? 1 : 0);
+}
+
+bool
+cluster_reconfig_get_observed_fresh_alive(int32 node_id)
+{
+	if (ReconfigShmem == NULL || node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return false;
+	return pg_atomic_read_u64(&ReconfigShmem->observed_fresh_alive[node_id]) != 0;
+}
+
 
 /*
  * Read snapshot of last_applied.event_id under shared lock.  Used by
@@ -1252,12 +1276,20 @@ cluster_reconfig_bootstrap_quorum_at_initial(void)
 		if (ep > CLUSTER_EPOCH_INITIAL)
 			return false;
 		/*
-		 * Count a peer only on a VALID durable co-boot slot: a real observed
-		 * voting-disk slot (generation > 0) at epoch INITIAL.  Never count a
-		 * default-0 placeholder (generation 0) nor rely on live CSSD state.
+		 * Count a peer only on a FRESH-ALIVE co-boot slot: a real observed
+		 * voting-disk slot (generation > 0) that qvotec's decide_quorum_view saw
+		 * FRESH-ALIVE this poll (heartbeat_ts_us recent, the P2.1 freshness gate),
+		 * at epoch INITIAL.  Hardening v1.3: the generation > 0 test alone is NOT
+		 * liveness — a CRASHED peer leaves a stale leftover slot (gen > 0, epoch
+		 * INITIAL) that v1.2 wrongly counted, letting a node fail-open (latch
+		 * BOOTSTRAP on self + a stale peer slot, with no live co-boot quorum).  The
+		 * fresh-alive signal is anchored on the durable voting-disk heartbeat (NOT
+		 * live CSSD), so it rejects stale slots WITHOUT reintroducing the v1.2
+		 * IC-churn race (the disk heartbeat keeps flowing while CSSD/tier1 churns).
+		 * A default-0 placeholder (generation 0) never counts either.
 		 */
 		if (cluster_reconfig_get_observed_slot(i, &inc, &gen) && gen > 0
-			&& ep == CLUSTER_EPOCH_INITIAL)
+			&& cluster_reconfig_get_observed_fresh_alive(i) && ep == CLUSTER_EPOCH_INITIAL)
 			proven_at_initial++;
 	}
 	if (declared == 0)
@@ -2867,6 +2899,17 @@ uint64
 cluster_reconfig_get_observed_epoch(int32 node_id pg_attribute_unused())
 {
 	return 0;
+}
+
+void
+cluster_reconfig_record_observed_fresh_alive(int32 node_id pg_attribute_unused(),
+											 bool fresh_alive pg_attribute_unused())
+{}
+
+bool
+cluster_reconfig_get_observed_fresh_alive(int32 node_id pg_attribute_unused())
+{
+	return false;
 }
 
 ClusterJoinMarkerSubmitResult

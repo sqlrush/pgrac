@@ -1414,10 +1414,12 @@ UT_TEST(test_reconfig_bootstrap_quorum_epoch_proof)
 	ut_declared_set[1] = true; /* 3 declared nodes */
 	ut_declared_set[2] = true;
 
-	/* quorum of declared on VALID co-boot slots at INITIAL -> bootstrap proven
-	 * (v1.2: anchored on the durable voting-disk slot, not live CSSD). */
+	/* quorum of declared FRESH-ALIVE co-boot slots at INITIAL -> bootstrap proven
+	 * (v1.3: durable voting-disk heartbeat freshness + valid slot, not live CSSD). */
 	cluster_reconfig_record_observed_slot(1, 1, 1, 0);
 	cluster_reconfig_record_observed_slot(2, 1, 1, 0);
+	cluster_reconfig_record_observed_fresh_alive(1, true);
+	cluster_reconfig_record_observed_fresh_alive(2, true);
 	UT_ASSERT(cluster_reconfig_bootstrap_quorum_at_initial());
 
 	/* a peer past INITIAL (running cluster) -> NOT a bootstrap (fail-closed). */
@@ -1448,15 +1450,18 @@ UT_TEST(test_reconfig_bootstrap_quorum_epoch_proof)
  * ====================================================================== */
 UT_TEST(test_reconfig_bootstrap_proof_valid_slot_not_cssd)
 {
-	/* --- A. valid co-boot slots at INITIAL but peers CSSD-DEAD -> still a
-	 *        proven bootstrap (durable slot, not live CSSD).  v1.1 returned
-	 *        false here (the race window); v1.2 returns true. --- */
+	/* --- A. FRESH-ALIVE co-boot slots at INITIAL but peers CSSD-DEAD -> still a
+	 *        proven bootstrap (durable voting-disk heartbeat, not live CSSD).  v1.1
+	 *        returned false here (the race window); v1.3 returns true because the
+	 *        liveness is the voting-disk fresh-alive signal, immune to CSSD churn. --- */
 	ut_join_setup();		   /* self = node 0 */
 	ut_declared_set[1] = true; /* 3 declared nodes */
 	ut_declared_set[2] = true;
-	cluster_reconfig_record_observed_slot(1, 7, 1, 0); /* valid slot, INITIAL */
-	cluster_reconfig_record_observed_slot(2, 7, 1, 0); /* valid slot, INITIAL */
-	ut_peer_state[1] = CLUSTER_CSSD_PEER_DEAD;		   /* live CSSD churned down */
+	cluster_reconfig_record_observed_slot(1, 7, 1, 0);	   /* valid slot, INITIAL */
+	cluster_reconfig_record_observed_slot(2, 7, 1, 0);	   /* valid slot, INITIAL */
+	cluster_reconfig_record_observed_fresh_alive(1, true); /* voting-disk fresh */
+	cluster_reconfig_record_observed_fresh_alive(2, true);
+	ut_peer_state[1] = CLUSTER_CSSD_PEER_DEAD; /* live CSSD churned down */
 	ut_peer_state[2] = CLUSTER_CSSD_PEER_DEAD;
 	UT_ASSERT(cluster_reconfig_bootstrap_quorum_at_initial());
 
@@ -1481,6 +1486,42 @@ UT_TEST(test_reconfig_bootstrap_proof_valid_slot_not_cssd)
 }
 
 
+/* ======================================================================
+ * U21 (spec-5.15 Hardening v1.3 / INV-J14 stale-slot fail-open) -- a valid
+ * generation > 0 slot at epoch INITIAL is NOT proof of co-booting: it may be a
+ * CRASHED peer's stale leftover (decide_quorum_view's P2.1 freshness gate marks
+ * it not-fresh).  The cold-bootstrap proof must additionally require the per-node
+ * FRESH-ALIVE signal (durable voting-disk heartbeat), not slot existence alone —
+ * else a node with self + a stale peer slot fail-opens (latches BOOTSTRAP without
+ * a live co-boot quorum).  v1.2 counted such a stale slot (the regression this
+ * guards); v1.3 fail-closes on it.
+ * ====================================================================== */
+UT_TEST(test_reconfig_bootstrap_proof_stale_slot_failclosed)
+{
+	/* --- A. valid slots at INITIAL but STALE heartbeat (fresh_alive=false) must
+	 *        NOT count -> only self proven -> below quorum -> false.  v1.2 (no
+	 *        freshness) counted them = fail-open; v1.3 fail-closes. --- */
+	ut_join_setup();		   /* self = node 0 */
+	ut_declared_set[1] = true; /* 3 declared nodes */
+	ut_declared_set[2] = true;
+	cluster_reconfig_record_observed_slot(1, 7, 1, 0);		/* valid slot, INITIAL */
+	cluster_reconfig_record_observed_slot(2, 7, 1, 0);		/* valid slot, INITIAL */
+	cluster_reconfig_record_observed_fresh_alive(1, false); /* crashed peer: stale hb */
+	cluster_reconfig_record_observed_fresh_alive(2, false);
+	UT_ASSERT(!cluster_reconfig_bootstrap_quorum_at_initial());
+
+	/* --- B. the same slots but FRESH-ALIVE -> genuine co-boot -> proven. --- */
+	cluster_reconfig_record_observed_fresh_alive(1, true);
+	cluster_reconfig_record_observed_fresh_alive(2, true);
+	UT_ASSERT(cluster_reconfig_bootstrap_quorum_at_initial());
+
+	/* --- C. one fresh + one stale -> self + the one fresh = quorum (3-node) ->
+	 *        proven; the stale peer simply does not contribute (no over-reject). --- */
+	cluster_reconfig_record_observed_fresh_alive(2, false);
+	UT_ASSERT(cluster_reconfig_bootstrap_quorum_at_initial());
+}
+
+
 /* ============================================================
  * Main — register + run all tests.
  * ============================================================ */
@@ -1488,7 +1529,7 @@ UT_TEST(test_reconfig_bootstrap_proof_valid_slot_not_cssd)
 int
 main(void)
 {
-	UT_PLAN(43);
+	UT_PLAN(45);
 
 	/* T-reconfig-1 */
 	UT_RUN(test_reconfig_dead_bitmap_bytes_eq_16);
@@ -1559,6 +1600,7 @@ main(void)
 	UT_RUN(test_reconfig_join_publish_proven_no_member_failclosed);
 	UT_RUN(test_reconfig_bootstrap_quorum_epoch_proof);
 	UT_RUN(test_reconfig_bootstrap_proof_valid_slot_not_cssd);
+	UT_RUN(test_reconfig_bootstrap_proof_stale_slot_failclosed);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

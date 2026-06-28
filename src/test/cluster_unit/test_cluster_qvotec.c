@@ -447,6 +447,12 @@ cluster_reconfig_record_observed_slot(int32 node_id pg_attribute_unused(),
 									  uint64 generation pg_attribute_unused(),
 									  uint64 epoch pg_attribute_unused())
 {}
+/* spec-5.15 Hardening v1.3: qvotec.o now also publishes per-node fresh-alive. */
+void cluster_reconfig_record_observed_fresh_alive(int32 node_id, bool fresh_alive);
+void
+cluster_reconfig_record_observed_fresh_alive(int32 node_id pg_attribute_unused(),
+											 bool fresh_alive pg_attribute_unused())
+{}
 bool cluster_reconfig_join_qvotec_poll_pending(int32 *out_target_node, void *out_slot512);
 bool
 cluster_reconfig_join_qvotec_poll_pending(int32 *out_target_node,

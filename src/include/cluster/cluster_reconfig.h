@@ -339,6 +339,20 @@ typedef struct ClusterReconfigState {
 	pg_atomic_uint64 observed_epoch[CLUSTER_MAX_NODES];
 
 	/*
+	 * spec-5.15 Hardening v1.3 (INV-J14 stale-slot fail-open) — per declared node,
+	 * whether qvotec's decide_quorum_view saw that node FRESH-ALIVE this poll (its
+	 * voting-disk heartbeat_ts_us recent, per the P2.1 freshness gate).  This is the
+	 * liveness signal the cold-bootstrap proof needs: a generation > 0 slot alone
+	 * may be a CRASHED peer's stale leftover at epoch INITIAL — counting it would
+	 * fail-open (latch BOOTSTRAP without a live co-boot quorum).  Anchored on the
+	 * durable voting-disk heartbeat (NOT live CSSD), so it is robust to IC/tier1
+	 * heartbeat churn — the v1.2 race fix is preserved.  1 = fresh-alive, 0 = stale /
+	 * absent (default 0 = fail-closed).  pg_atomic — qvotec (writer) and LMON (reader)
+	 * are different processes.
+	 */
+	pg_atomic_uint64 observed_fresh_alive[CLUSTER_MAX_NODES];
+
+	/*
 	 * spec-5.15 D4 — join-commit-marker submit mailbox (§2.6).  The coordinator
 	 * stages a marker for the joiner (join_marker_target_node_id), bumps
 	 * join_marker_request_seq, wakes qvotec via join_qvotec_latch, and waits
@@ -481,6 +495,16 @@ extern void cluster_reconfig_record_observed_slot(int32 node_id, uint64 incarnat
 extern bool cluster_reconfig_get_observed_slot(int32 node_id, uint64 *incarnation,
 											   uint64 *generation);
 extern uint64 cluster_reconfig_get_observed_epoch(int32 node_id);
+
+/*
+ * spec-5.15 Hardening v1.3 — publish / read the per-node FRESH-ALIVE liveness
+ * qvotec's decide_quorum_view derived from the durable voting-disk heartbeat
+ * (the P2.1 freshness gate).  The cold-bootstrap proof counts a peer only when
+ * it is fresh-alive AND at epoch INITIAL — never on a generation > 0 slot alone
+ * (a crashed peer's stale leftover).  get returns false when absent (fail-closed).
+ */
+extern void cluster_reconfig_record_observed_fresh_alive(int32 node_id, bool fresh_alive);
+extern bool cluster_reconfig_get_observed_fresh_alive(int32 node_id);
 
 /*
  * spec-5.15 Hardening v1.1 (HF-1 / INV-J9): true iff a majority of the current
