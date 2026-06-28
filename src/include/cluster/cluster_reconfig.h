@@ -659,6 +659,8 @@ extern uint64 cluster_reconfig_get_clean_departed_count(void);
 extern void cluster_reconfig_record_removed(int32 node_id, uint64 remove_epoch,
 											bool raise_epoch_floor);
 extern bool cluster_reconfig_is_removed(int32 node_id);
+/* HF-2: lock-free durable removed test for the 53R64 self-demote write-gate hot path. */
+extern bool cluster_reconfig_is_removed_unlocked(int32 node_id);
 extern uint64 cluster_reconfig_get_removed_epoch(int32 node_id);
 extern uint64 cluster_reconfig_get_removed_count(void);
 extern void

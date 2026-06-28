@@ -502,10 +502,44 @@ UT_TEST(test_ic_payloads)
 }
 
 
+/* ============================================================
+ * U-H (Hardening v1.1, HF-1) — the announce payload carries removed_incarnation,
+ * the wire version is 2, and the incarnation is covered by the payload CRC (a
+ * non-target survivor seeds membership_state[N]=REMOVED with this floor, INV-LF11).
+ * ============================================================ */
+
+UT_TEST(test_ic_payload_removed_incarnation)
+{
+	ClusterNodeRemoveAnnouncePayload a;
+
+	/* HF-1: wire version bumped to 2 for the removed_incarnation field. */
+	UT_ASSERT_EQ((int)CLUSTER_NODE_REMOVE_IC_VERSION, 2);
+
+	memset(&a, 0, sizeof(a));
+	a.magic = CLUSTER_NODE_REMOVE_IC_MAGIC;
+	a.version = CLUSTER_NODE_REMOVE_IC_VERSION;
+	a.coordinator_node_id = 0;
+	a.target_node_id = 1;
+	a.remove_epoch = 5;
+	a.removal_event_id = 0xBEEF;
+	a.removed_incarnation = UINT64CONST(0x1234567890ABCDEF);
+	cluster_node_remove_announce_compute_crc(&a);
+	UT_ASSERT(cluster_node_remove_announce_payload_valid(&a));
+
+	/* the incarnation floor round-trips intact. */
+	UT_ASSERT(a.removed_incarnation == UINT64CONST(0x1234567890ABCDEF));
+
+	/* tampering it after the crc breaks integrity (it is inside the CRC range
+	 * [magic..removed_incarnation], so a corrupted floor cannot pass). */
+	a.removed_incarnation = 0;
+	UT_ASSERT(!cluster_node_remove_announce_payload_valid(&a));
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(12);
 	UT_RUN(test_struct_layout);
 	UT_RUN(test_phase_transitions);
 	UT_RUN(test_ordering_gate);
@@ -517,6 +551,7 @@ main(void)
 	UT_RUN(test_marker_pack_unpack_preserve);
 	UT_RUN(test_marker_authority_decide);
 	UT_RUN(test_ic_payloads);
+	UT_RUN(test_ic_payload_removed_incarnation);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

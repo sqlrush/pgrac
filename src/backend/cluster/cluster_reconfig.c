@@ -844,6 +844,25 @@ cluster_reconfig_is_removed(int32 node_id)
 	return removed;
 }
 
+/*
+ * spec-5.18 HF-2: lock-free removed test for the 53R64 self-demote write gate
+ * (cluster_node_remove_self_is_removed), called at every writable-xid assignment.
+ * Reads a single removed_bitmap bit without the reconfig lock — safe because the
+ * removed set is monotonic at runtime (a removal is terminal, INV-LF1; only an
+ * operator un-fence, not implemented, could clear it), so a one-byte read cannot
+ * tear and the bit never spuriously clears.  The durable bitmap is the
+ * authoritative floor: unlike membership_state[self] (which the joiner / lmon
+ * self-state paths rewrite each tick), it cannot be flipped REMOVED -> not-removed
+ * by membership churn, so the write gate stays fail-closed for a removed node.
+ */
+bool
+cluster_reconfig_is_removed_unlocked(int32 node_id)
+{
+	if (ReconfigShmem == NULL || node_id < 0 || node_id >= CLUSTER_RECONFIG_DEAD_BITMAP_BYTES * 8)
+		return false;
+	return (ReconfigShmem->removed_bitmap[node_id / 8] & (uint8)(1u << (node_id % 8))) != 0;
+}
+
 uint64
 cluster_reconfig_get_removed_epoch(int32 node_id)
 {
@@ -1246,6 +1265,17 @@ cluster_reconfig_joiner_self_tick(void)
 	if (cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES)
 		return;
 
+	/*
+	 * spec-5.18 INV-LF9 (HF-2): a durably-removed node (this node was permanently
+	 * removed; startup rebuild seeded removed_bitmap[self]) must NOT run the joiner
+	 * gate — doing so would flip its own membership_state REMOVED -> JOINING/MEMBER
+	 * (the REJOINER/bootstrap branches below) and defeat the 53R64 self-demote write
+	 * gate.  A removed node can only return via operator un-fence + a fresh-
+	 * incarnation join (external plane, §1.3) — never by re-running this gate.
+	 */
+	if (cluster_reconfig_is_removed_unlocked(cluster_node_id))
+		return;
+
 	now_us = (uint64)GetCurrentTimestamp();
 
 	/*
@@ -1444,9 +1474,21 @@ cluster_reconfig_lmon_tick(void)
 
 		LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
 
+		/*
+		 * spec-5.18 INV-LF9 (HF-2): REMOVED is TERMINAL for self too.  A removed
+		 * node still running / restarted (rebuild seeded removed_bitmap[self] +
+		 * membership_state[self]=REMOVED) must keep self REMOVED — the joiner gate
+		 * below must NOT flip it back to MEMBER/JOINING, which would defeat the
+		 * 53R64 self-demote write gate and let a removed node serve writes.  The
+		 * durable removed_bitmap is the authoritative floor (mirrors the peer
+		 * REMOVED terminal guard further down + the joiner_self_tick guard).
+		 */
+		if (clean_departed_test_bit_locked(ReconfigShmem->removed_bitmap, self_id)
+			|| cluster_membership_get_state(self_id) == CLUSTER_MEMBER_REMOVED)
+			cluster_membership_set_state(self_id, CLUSTER_MEMBER_REMOVED);
 		/* self-state follows the joiner gate (D5): MEMBER when admitted / steady,
 		 * JOINING while this node is itself a joiner whose gate is closed. */
-		if (ReconfigShmem->self_join_admitted && !ReconfigShmem->self_join_failed)
+		else if (ReconfigShmem->self_join_admitted && !ReconfigShmem->self_join_failed)
 			cluster_membership_set_state(self_id, CLUSTER_MEMBER_MEMBER);
 		else
 			cluster_membership_set_state(self_id, CLUSTER_MEMBER_JOINING);

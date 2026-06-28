@@ -182,6 +182,34 @@ like(($werr // ''),
 
 
 # ----------
+# L12 (Hardening v1.1, HF-2): a removed node that RESTARTS must STAY removed.  On
+# bring-up node1 reads its own durable removal marker (removed_bitmap[self] +
+# membership_state[self]=REMOVED); its lmon self-state maintenance must NOT flip
+# that back to JOINING/MEMBER (before the fix the joiner / self-state path rewrote
+# self each tick, defeating the 53R64 self-demote write gate and letting a removed
+# node serve writes).  node0 stays up so node1 is held removed + fenced.
+# ----------
+$pair->node1->restart;
+usleep(6_000_000);    # several lmon ticks (1s heartbeat / 500ms qvotec poll)
+# node1's own view of itself stays removed across the tick churn (the HF-2 signal:
+# self membership_state is NOT flipped REMOVED -> JOINING/MEMBER).
+ok(poll_until($pair->node1,
+		q{SELECT state = 'removed' FROM pg_cluster_membership WHERE node_id = 1},
+		't', 30, 'L12 node1 self stays removed after restart'),
+	'L12 node1 self-state stays removed across lmon ticks after restart (HF-2)');
+# Forcing an xid assignment (txid_current) hits the AssignTransactionId
+# self-demote gate directly: a removed node must fail closed there (53R64),
+# proving cluster_node_remove_self_is_removed held across the tick churn (HF-2) and
+# was not defeated by a stale self-state write.
+my ($hf2rc, $hf2out, $hf2err) =
+  $pair->node1->psql('postgres', 'SELECT txid_current()');
+ok($hf2rc != 0, 'L12 restarted removed node fail-closes xid assignment (HF-2)');
+like(($hf2err // ''),
+	qr/53R64|removed/i,
+	'L12 restarted removed node xid assignment blocked by 53R64 self-demote gate (HF-2)');
+
+
+# ----------
 # L10 crash-recovery-from-marker (INV-LF7): restart node0; the durable §2.5
 # SHRUNK/REMOVED marker must rebuild removed_bitmap + membership REMOVED so node1
 # stays a non-member after restart.

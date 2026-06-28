@@ -270,14 +270,21 @@ cluster_node_remove_self_is_removed(void)
 	if (!cluster_enabled || cluster_node_id < 0)
 		return false;
 	/*
-	 * Lock-free hot-path check (called at every writable-xid assignment): the
-	 * membership_state[self] byte is the naturally-atomic SSOT.  REMOVED is published
-	 * into this node's own table by the startup durable-marker rebuild
+	 * Lock-free hot-path check (called at every writable-xid assignment).  REMOVED
+	 * is published into this node's own table by the startup durable-marker rebuild
 	 * (rebuild_from_disks) and, for a still-running removed node, by the
-	 * NODE_REMOVE_ANNOUNCE handler (nr_announce_handler self-demote).  No reconfig
-	 * lock is taken here (mirrors the clean-leave refuse-writes gate).
+	 * NODE_REMOVE_ANNOUNCE handler (nr_announce_handler self-demote).
+	 *
+	 * HF-2: consult the durable removed_bitmap (lock-free, monotonic) IN ADDITION to
+	 * the membership_state[self] byte.  membership_state[self] is rewritten every
+	 * LMON tick by the joiner / self-state maintenance paths; although those now
+	 * carry a REMOVED terminal guard, the durable bitmap is the authoritative floor
+	 * and closes any residual window where a stale self-state write could transiently
+	 * un-REMOVE this node and open the 53R64 write gate.  Either signal = removed.
+	 * No reconfig lock is taken (mirrors the clean-leave refuse-writes gate).
 	 */
-	return cluster_membership_get_state(cluster_node_id) == CLUSTER_MEMBER_REMOVED;
+	return cluster_membership_get_state(cluster_node_id) == CLUSTER_MEMBER_REMOVED
+		   || cluster_reconfig_is_removed_unlocked(cluster_node_id);
 }
 
 
@@ -440,6 +447,16 @@ cluster_node_remove_request(int32 node_id)
 		pg_atomic_write_u32(&nr_state->announce_sent, 0);
 		pg_atomic_write_u32(&nr_state->phase, CLUSTER_REMOVE_REQUESTED);
 		pg_atomic_fetch_add_u64(&nr_state->removal_request_count, 1);
+	}
+	/*
+	 * HF-5: ACCEPTED at the lock-free precheck but the phase advanced out of the
+	 * reservable set between the precheck and this exclusive section — a concurrent
+	 * request reserved first.  Do NOT return a stale ACCEPTED without actually
+	 * reserving (the caller would believe its target is being removed when it is
+	 * not); downgrade to removal_in_progress so it retries.
+	 */
+	else if (verdict == CLUSTER_REMOVE_REQ_ACCEPTED) {
+		verdict = CLUSTER_REMOVE_REQ_IN_PROGRESS;
 	}
 	/* RESUME: keep the existing target/epoch; just re-arm the drive from SHRUNK by
 	 * moving CLEANUP_BLOCKED back to CLEANUP (the lmon_tick retries the cleanup). */
@@ -656,16 +673,50 @@ cluster_node_remove_drive(void)
 void
 cluster_node_remove_survivor_ack(int32 target_node_id, uint64 remove_epoch)
 {
-	/* a non-coordinator survivor drops its local refs to the removed node and
-	 * records its ACK so the coordinator's barrier can complete. */
+	uint64 removal_event_id;
+	uint64 removed_incarnation;
+	int32 coordinator;
+
+	/*
+	 * HF-1/HF-3 (INV-LF11): a non-coordinator survivor APPLIES the removal
+	 * locally — not just drops its N-refs.  It seeds the durable removed set +
+	 * membership_state[N]=REMOVED (so its own removed_bitmap carries N for any
+	 * fence baseline it later publishes, INV-LF10), permanently remasters
+	 * N-mastered shards onto a MEMBER survivor, clears N's GES/PCM, and PROVES
+	 * zero leftover — and only ACKs once verify passes.  The coordinator's final
+	 * REMOVED marker (the trust source) is built on "local verify + all-survivor
+	 * ACK", so an ACK must mean THIS survivor is genuinely clean, not merely
+	 * "dropped some refs".  Idempotent: the survivor lmon_tick re-runs it every
+	 * tick until it converges (the announce is one-shot, so a transient leftover
+	 * must be retried locally, not re-announced).
+	 */
 	if (nr_state == NULL || target_node_id < 0 || target_node_id >= CLUSTER_MAX_NODES)
 		return;
 
-	(void)cluster_grd_cleanup_on_node_dead(target_node_id);
-	(void)cluster_pcm_lock_clear_pending_x_for_node(target_node_id);
+	/* identity for the seed + ACK = THIS attempt (recorded by the announce
+	 * handler / lmon_tick adopt path, HF-4). */
+	LWLockAcquire(&nr_state->lock, LW_SHARED);
+	removal_event_id = nr_state->removal_event_id;
+	removed_incarnation = nr_state->target_last_incarnation;
+	coordinator = nr_state->coordinator_node_id;
+	LWLockRelease(&nr_state->lock);
 
-	cluster_node_remove_ic_send_ack(nr_state->coordinator_node_id, target_node_id, remove_epoch,
-									nr_state->removal_event_id);
+	/* seed the durable removed set + membership REMOVED with the coordinator's
+	 * pinned incarnation floor (carried in the announce, HF-1). */
+	cluster_reconfig_seed_removed_membership(target_node_id, remove_epoch, removed_incarnation,
+											 /*raise_epoch_floor*/ true);
+
+	/* full cluster-wide cleanup on THIS survivor + zero-leftover proof (HF-3).
+	 * run_cleanup bumps leftover_detected_count + returns false when not clean. */
+	if (!cluster_node_remove_run_cleanup(target_node_id, remove_epoch)) {
+		pg_atomic_write_u32(&nr_state->survivor_acked, 0);
+		return; /* leftover -> retry next survivor tick, do NOT ACK */
+	}
+
+	/* clean: ACK with THIS attempt's identity so the coordinator's barrier keys on
+	 * this removal, not a stale prior one. */
+	cluster_node_remove_ic_send_ack(coordinator, target_node_id, remove_epoch, removal_event_id);
+	pg_atomic_write_u32(&nr_state->survivor_acked, 1);
 }
 
 void
@@ -674,6 +725,7 @@ cluster_node_remove_lmon_tick(void)
 	ClusterRemovePhase phase;
 	int32 node_id;
 	int32 coordinator;
+	uint64 remove_epoch;
 
 	if (nr_state == NULL || !cluster_enabled || !cluster_online_node_removal)
 		return;
@@ -684,6 +736,7 @@ cluster_node_remove_lmon_tick(void)
 	phase = (ClusterRemovePhase)pg_atomic_read_u32(&nr_state->phase);
 	node_id = nr_state->target_node_id;
 	coordinator = nr_state->coordinator_node_id;
+	remove_epoch = nr_state->remove_epoch;
 	LWLockRelease(&nr_state->lock);
 
 	if (node_id < 0)
@@ -695,10 +748,20 @@ cluster_node_remove_lmon_tick(void)
 		if (phase >= CLUSTER_REMOVE_CLEANUP && phase <= CLUSTER_REMOVE_CLEANUP_BLOCKED
 			&& pg_atomic_read_u32(&nr_state->announce_sent) == 0) {
 			cluster_node_remove_ic_broadcast_announce(node_id, nr_state->remove_epoch,
-													  nr_state->removal_event_id);
+													  nr_state->removal_event_id,
+													  nr_state->target_last_incarnation);
 			pg_atomic_write_u32(&nr_state->announce_sent, 1);
 		}
 		cluster_node_remove_drive();
+	} else {
+		/*
+		 * HF-1/HF-3 (INV-LF11): survivor side — (re)apply the recorded removal
+		 * locally + ACK; retry each tick until verify converges.  The announce is
+		 * one-shot, so a transient leftover (or an announce that arrived before the
+		 * GRD/PCM state was settleable) must be retried here, not re-announced.
+		 */
+		if (pg_atomic_read_u32(&nr_state->survivor_acked) == 0)
+			cluster_node_remove_survivor_ack(node_id, remove_epoch);
 	}
 }
 
@@ -707,7 +770,7 @@ cluster_node_remove_lmon_tick(void)
  * IC wire (D10): NODE_REMOVE_ANNOUNCE (broadcast) + REMOVE_CLEANUP_ACK (p2p).
  * ============================================================ */
 
-/* survivor side: a coordinator announced a removal — drop refs + ACK. */
+/* survivor side: a coordinator announced a removal — apply it locally + ACK. */
 static void
 nr_announce_handler(const ClusterICEnvelope *env, const void *payload)
 {
@@ -721,24 +784,38 @@ nr_announce_handler(const ClusterICEnvelope *env, const void *payload)
 		 * into our own membership table (lock-free SSOT for the self-demote write
 		 * gate) + the durable removed set so a still-running removed node fail-closes
 		 * new writable transactions (53R64) instead of serving as a phantom member.
-		 * Do NOT send a cleanup ACK — a removed node is not a survivor.
+		 * HF-1: pin the coordinator's incarnation floor from the announce so a future
+		 * re-admit must present a strictly newer incarnation.  Do NOT send a cleanup
+		 * ACK — a removed node is not a survivor.
 		 */
 		cluster_reconfig_seed_removed_membership(cluster_node_id, p->remove_epoch,
-												 0 /* incarnation floor set by coordinator */,
+												 p->removed_incarnation,
 												 /*raise_epoch_floor*/ false);
 		return;
 	}
 
-	/* record the attempt so our ACK echoes the right identity. */
+	/*
+	 * HF-4: adopt THIS removal attempt's identity when our recorded one is absent,
+	 * terminal, or a different attempt — a survivor never runs the driver's
+	 * abort/commit resets, so a prior attempt's identity would otherwise linger and
+	 * get this attempt's ACK rejected by the coordinator (event_id mismatch),
+	 * wedging the next removal's cleanup barrier.  Same event_id = an idempotent
+	 * re-announce: keep progress (do not reset survivor_acked).
+	 */
 	LWLockAcquire(&nr_state->lock, LW_EXCLUSIVE);
-	if (nr_state->target_node_id < 0) {
+	if (nr_state->removal_event_id != p->removal_event_id
+		|| nr_state->target_node_id != p->target_node_id) {
 		nr_state->target_node_id = p->target_node_id;
 		nr_state->coordinator_node_id = p->coordinator_node_id;
 		nr_state->remove_epoch = p->remove_epoch;
 		nr_state->removal_event_id = p->removal_event_id;
+		nr_state->target_last_incarnation = p->removed_incarnation;
+		pg_atomic_write_u32(&nr_state->survivor_acked, 0); /* re-apply for the new attempt */
 	}
 	LWLockRelease(&nr_state->lock);
 
+	/* INV-LF11: apply the removal locally + ACK when clean (the survivor lmon_tick
+	 * retries until verify converges). */
 	cluster_node_remove_survivor_ack(p->target_node_id, p->remove_epoch);
 }
 
@@ -753,11 +830,18 @@ nr_ack_handler(const ClusterICEnvelope *env, const void *payload)
 		return;
 	if (p->survivor_node_id < 0 || p->survivor_node_id >= CLUSTER_NODE_REMOVE_ACK_BITMAP_BYTES * 8)
 		return;
-	if (p->removal_event_id != nr_state->removal_event_id)
-		return; /* stale ACK from a prior attempt */
 
+	/*
+	 * HF-4: an ACK counts toward the barrier only for THIS exact removal attempt —
+	 * validate the full identity tuple (target, epoch, event_id) under the lock, not
+	 * just event_id, so a stale ACK from a prior attempt can never satisfy the
+	 * current barrier (and the snapshot is consistent with the bitmap write).
+	 */
 	LWLockAcquire(&nr_state->lock, LW_EXCLUSIVE);
-	nr_state->ack_bitmap[p->survivor_node_id / 8] |= (uint8)(1u << (p->survivor_node_id % 8));
+	if (p->removal_event_id == nr_state->removal_event_id
+		&& p->target_node_id == nr_state->target_node_id
+		&& p->remove_epoch == nr_state->remove_epoch)
+		nr_state->ack_bitmap[p->survivor_node_id / 8] |= (uint8)(1u << (p->survivor_node_id % 8));
 	LWLockRelease(&nr_state->lock);
 }
 
@@ -785,7 +869,7 @@ cluster_node_remove_register_ic_msg_types(void)
 
 void
 cluster_node_remove_ic_broadcast_announce(int32 target_node_id, uint64 remove_epoch,
-										  uint64 removal_event_id)
+										  uint64 removal_event_id, uint64 removed_incarnation)
 {
 	ClusterNodeRemoveAnnouncePayload p;
 	ClusterICFanoutResult per_peer[CLUSTER_MAX_NODES];
@@ -797,6 +881,7 @@ cluster_node_remove_ic_broadcast_announce(int32 target_node_id, uint64 remove_ep
 	p.target_node_id = target_node_id;
 	p.remove_epoch = remove_epoch;
 	p.removal_event_id = removal_event_id;
+	p.removed_incarnation = removed_incarnation; /* HF-1: incarnation floor for survivor seed */
 	cluster_node_remove_announce_compute_crc(&p);
 
 	cluster_ic_send_envelope_fanout(PGRAC_IC_MSG_NODE_REMOVE_ANNOUNCE, &p, (uint32)sizeof(p),

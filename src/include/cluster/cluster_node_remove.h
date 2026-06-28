@@ -251,7 +251,13 @@ StaticAssertDecl(sizeof(ClusterNodeRemoveState) <= 512, "ClusterNodeRemoveState 
  *	message being acted on as a removal command (8.A defense-in-depth).
  * ============================================================ */
 #define CLUSTER_NODE_REMOVE_IC_MAGIC 0x50524943 /* "PRIC" — pgrac remove IC */
-#define CLUSTER_NODE_REMOVE_IC_VERSION 1
+/*
+ * Wire version.  v2 (spec-5.18 Hardening v1.1, HF-1): the announce payload
+ * carries removed_incarnation so a non-target survivor can seed its own
+ * membership_state[N]=REMOVED with the correct incarnation floor when it
+ * applies the removal locally (INV-LF11), not just drop its N-refs.
+ */
+#define CLUSTER_NODE_REMOVE_IC_VERSION 2
 
 /*
  * NODE_REMOVE_ANNOUNCE payload — coordinator -> all survivors (broadcast).
@@ -263,10 +269,12 @@ typedef struct ClusterNodeRemoveAnnouncePayload {
 	uint16 version;
 	uint16 _pad0;
 	int32 coordinator_node_id;
-	int32 target_node_id;	 /* who is removed */
-	uint64 remove_epoch;	 /* the removal reconfig new_epoch */
-	uint64 removal_event_id; /* identity bound to this removal attempt */
-	uint32 crc;				 /* CRC32C over [magic..removal_event_id] */
+	int32 target_node_id;		/* who is removed */
+	uint64 remove_epoch;		/* the removal reconfig new_epoch */
+	uint64 removal_event_id;	/* identity bound to this removal attempt */
+	uint64 removed_incarnation; /* HF-1: target's pinned incarnation floor (for
+								 * survivor-local membership REMOVED seed, INV-LF11) */
+	uint32 crc;					/* CRC32C over [magic..removed_incarnation] */
 } ClusterNodeRemoveAnnouncePayload;
 
 /*
@@ -435,7 +443,8 @@ extern bool cluster_node_remove_verify_no_leftover(int32 node_id);
  * msg-type registration block, postmaster phase 1). */
 extern void cluster_node_remove_register_ic_msg_types(void);
 extern void cluster_node_remove_ic_broadcast_announce(int32 target_node_id, uint64 remove_epoch,
-													  uint64 removal_event_id);
+													  uint64 removal_event_id,
+													  uint64 removed_incarnation);
 extern void cluster_node_remove_ic_send_ack(int32 dest_node_id, int32 target_node_id,
 											uint64 remove_epoch, uint64 removal_event_id);
 
