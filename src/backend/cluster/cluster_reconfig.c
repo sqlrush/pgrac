@@ -1200,39 +1200,69 @@ cluster_reconfig_cluster_already_running(void)
 }
 
 /*
- * spec-5.15 Hardening v1.1 (HF-2 / INV-J14) — positive cold-bootstrap proof.
+ * spec-5.15 Hardening v1.1 (HF-2 / INV-J14) — positive cold-bootstrap proof,
+ * REVISED by Hardening v1.2 (INV-J14 self-join-gate race) to rest on the durable
+ * voting-disk slot rather than live CSSD.
+ *
  * A node may keep its write gate open WITHOUT online-join admission only when a
- * majority of declared nodes are CSSD-alive AND no declared peer is observed
- * past CLUSTER_EPOCH_INITIAL (everyone co-booting at epoch 0).  This is an EPOCH
- * proof, not a timing grace: a slow qvotec leaves the decision UNDECIDED (gate
- * stays closed, fail-closed) instead of mis-deciding bootstrap and permanently
- * fail-opening (P1-2).  A rejoiner can never satisfy it — by the time it sees
- * its peers they are already at epoch > INITIAL.
+ * majority of declared nodes are observed CO-BOOTING at CLUSTER_EPOCH_INITIAL on
+ * a VALID durable slot (qvotec saw a real voting-disk slot, generation > 0, at
+ * epoch INITIAL) AND no declared peer is observed past CLUSTER_EPOCH_INITIAL.
+ * This is an EPOCH proof, not a timing grace: a slow qvotec leaves the decision
+ * UNDECIDED (gate stays closed, fail-closed) instead of mis-deciding bootstrap
+ * and permanently fail-opening (P1-2).  A rejoiner can never satisfy it — by the
+ * time it sees its peers they are already at epoch > INITIAL.
+ *
+ * v1.2 RATIONALE: the v1.1 proof counted live CSSD-alive peers, which a
+ * transient IC / heartbeat churn could momentarily drop below quorum — leaving a
+ * GENUINE founding member UNDECIDED (never latched).  An UNRELATED peer's later
+ * fail-stop then advanced the epoch, and joiner_self_tick reclassified that
+ * still-UNDECIDED member as a rejoiner: it closed its own write gate and timed
+ * out to 53R61 (refused its own writes), never participating again.  Anchoring
+ * the quorum on the DURABLE slot (stable across CSSD churn) lets a founding
+ * member latch reliably during formation, closing the UNDECIDED window before
+ * any unrelated epoch advance.  A default-0 placeholder (generation 0) is NOT
+ * proof and must never count (else a node with no real evidence fail-opens) —
+ * the v1.2 user constraint: latch only on a valid co-boot slot, never on 0.
+ * Quorum (not all-declared) is retained so a degraded co-boot (e.g. 2 of 3) can
+ * still form, and because requiring every peer would only WIDEN the UNDECIDED
+ * window the race exploits.
  */
 bool
 cluster_reconfig_bootstrap_quorum_at_initial(void)
 {
 	uint32 declared = 0;
-	uint32 alive_at_initial = 0;
+	uint32 proven_at_initial = 0;
 	int i;
 
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		uint64 inc = 0;
+		uint64 gen = 0;
+		uint64 ep;
+
 		if (cluster_conf_lookup_node(i) == NULL)
 			continue;
 		declared++;
 		if (i == cluster_node_id) {
-			alive_at_initial++; /* self is up, at INITIAL (not yet admitted) */
+			proven_at_initial++; /* self is up, at INITIAL (not yet admitted) */
 			continue;
 		}
+		ep = cluster_reconfig_get_observed_epoch(i);
 		/* any declared peer past INITIAL => a running cluster, NOT a bootstrap */
-		if (cluster_reconfig_get_observed_epoch(i) > CLUSTER_EPOCH_INITIAL)
+		if (ep > CLUSTER_EPOCH_INITIAL)
 			return false;
-		if (cluster_cssd_get_peer_state(i) != CLUSTER_CSSD_PEER_DEAD)
-			alive_at_initial++;
+		/*
+		 * Count a peer only on a VALID durable co-boot slot: a real observed
+		 * voting-disk slot (generation > 0) at epoch INITIAL.  Never count a
+		 * default-0 placeholder (generation 0) nor rely on live CSSD state.
+		 */
+		if (cluster_reconfig_get_observed_slot(i, &inc, &gen) && gen > 0
+			&& ep == CLUSTER_EPOCH_INITIAL)
+			proven_at_initial++;
 	}
 	if (declared == 0)
 		return false;
-	return alive_at_initial >= ((declared / 2u) + 1u);
+	return proven_at_initial >= ((declared / 2u) + 1u);
 }
 
 /*

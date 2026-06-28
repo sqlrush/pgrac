@@ -1413,20 +1413,70 @@ UT_TEST(test_reconfig_bootstrap_quorum_epoch_proof)
 	ut_join_setup();		   /* self = node 0 */
 	ut_declared_set[1] = true; /* 3 declared nodes */
 	ut_declared_set[2] = true;
-	ut_peer_state[1] = CLUSTER_CSSD_PEER_ALIVE;
-	ut_peer_state[2] = CLUSTER_CSSD_PEER_ALIVE;
 
-	/* all CSSD-alive at epoch 0 -> cold bootstrap proven. */
+	/* quorum of declared on VALID co-boot slots at INITIAL -> bootstrap proven
+	 * (v1.2: anchored on the durable voting-disk slot, not live CSSD). */
+	cluster_reconfig_record_observed_slot(1, 1, 1, 0);
+	cluster_reconfig_record_observed_slot(2, 1, 1, 0);
 	UT_ASSERT(cluster_reconfig_bootstrap_quorum_at_initial());
 
 	/* a peer past INITIAL (running cluster) -> NOT a bootstrap (fail-closed). */
 	cluster_reconfig_record_observed_slot(1, 1, 1, 4);
 	UT_ASSERT(!cluster_reconfig_bootstrap_quorum_at_initial());
 
-	/* back at epoch 0 but only self alive (peers DEAD) -> below quorum -> false. */
-	cluster_reconfig_record_observed_slot(1, 1, 1, 0);
-	ut_peer_state[1] = CLUSTER_CSSD_PEER_DEAD;
+	/* no valid co-boot slot on either peer (generation 0) -> only self proven ->
+	 * below quorum -> false (never latch on a default-0 placeholder). */
+	cluster_reconfig_record_observed_slot(1, 0, 0, 0);
+	cluster_reconfig_record_observed_slot(2, 0, 0, 0);
+	UT_ASSERT(!cluster_reconfig_bootstrap_quorum_at_initial());
+}
+
+
+/* ======================================================================
+ * U20 (spec-5.15 Hardening v1.2 / INV-J14 self-join-gate race) -- the
+ * cold-bootstrap proof must rest on a VALID durable co-boot slot
+ * (cluster_reconfig_get_observed_slot true, generation > 0, observed_epoch
+ * == INITIAL), NOT on live CSSD state and NOT on a default-0 placeholder.
+ *
+ * Root cause it guards: a founding survivor that has durable proof of co-
+ * booting at INITIAL but whose peers' live CSSD is momentarily DOWN (IC /
+ * heartbeat churn) was denied bootstrap by the v1.1 CSSD-quorum proof, so it
+ * stayed UNDECIDED; a later UNRELATED node fail-stop then advanced the epoch
+ * and reclassified this genuine member as a rejoiner -> 53R61 (refused its own
+ * writes).  Anchoring the proof on the durable voting-disk slot lets the member
+ * latch reliably during formation (immune to CSSD churn), closing the window.
+ * ====================================================================== */
+UT_TEST(test_reconfig_bootstrap_proof_valid_slot_not_cssd)
+{
+	/* --- A. valid co-boot slots at INITIAL but peers CSSD-DEAD -> still a
+	 *        proven bootstrap (durable slot, not live CSSD).  v1.1 returned
+	 *        false here (the race window); v1.2 returns true. --- */
+	ut_join_setup();		   /* self = node 0 */
+	ut_declared_set[1] = true; /* 3 declared nodes */
+	ut_declared_set[2] = true;
+	cluster_reconfig_record_observed_slot(1, 7, 1, 0); /* valid slot, INITIAL */
+	cluster_reconfig_record_observed_slot(2, 7, 1, 0); /* valid slot, INITIAL */
+	ut_peer_state[1] = CLUSTER_CSSD_PEER_DEAD;		   /* live CSSD churned down */
 	ut_peer_state[2] = CLUSTER_CSSD_PEER_DEAD;
+	UT_ASSERT(cluster_reconfig_bootstrap_quorum_at_initial());
+
+	/* --- B. CSSD-alive but NO valid slot (generation 0 placeholder) must
+	 *        NOT prove bootstrap — never latch on a default-0 epoch. --- */
+	ut_join_setup();
+	ut_declared_set[1] = true;
+	ut_declared_set[2] = true;
+	ut_peer_state[1] = CLUSTER_CSSD_PEER_ALIVE;
+	ut_peer_state[2] = CLUSTER_CSSD_PEER_ALIVE;
+	/* no record_observed_slot -> generation 0 -> not a valid co-boot proof */
+	UT_ASSERT(!cluster_reconfig_bootstrap_quorum_at_initial());
+
+	/* --- C. a peer observed past INITIAL is a running cluster, never a
+	 *        bootstrap (rejoiner fail-closed) — unchanged from v1.1. --- */
+	ut_join_setup();
+	ut_declared_set[1] = true;
+	ut_declared_set[2] = true;
+	cluster_reconfig_record_observed_slot(1, 7, 1, 0); /* valid, INITIAL */
+	cluster_reconfig_record_observed_slot(2, 7, 1, 5); /* valid, past INITIAL */
 	UT_ASSERT(!cluster_reconfig_bootstrap_quorum_at_initial());
 }
 
@@ -1508,6 +1558,7 @@ main(void)
 	UT_RUN(test_reconfig_join_publish_proven_member_quorum);
 	UT_RUN(test_reconfig_join_publish_proven_no_member_failclosed);
 	UT_RUN(test_reconfig_bootstrap_quorum_epoch_proof);
+	UT_RUN(test_reconfig_bootstrap_proof_valid_slot_not_cssd);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
