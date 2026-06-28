@@ -68,6 +68,8 @@
  * here, so stubs satisfy the linker only.
  * ----------
  */
+#include <signal.h> /* sig_atomic_t (InterruptPending stub) */
+
 #include "fmgr.h"
 #include "funcapi.h"
 #include "utils/elog.h"
