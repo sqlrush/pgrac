@@ -229,6 +229,8 @@ ok($wait_events_present > 0,
 my @two_node_tps;
 my $two_node_started = 0;
 my $two_node_ready = 0;
+my $two_init_ok = 0;
+my $two_err;
 eval {
 	my @pair_perf_conf = map { my $line = $_; chomp $line; $line } @perf_conf;
 	my $pair = PostgreSQL::Test::ClusterPair->new_pair(
@@ -249,21 +251,25 @@ eval {
 	  && poll_sql_eq($pair->node0, 'SELECT in_quorum FROM pg_cluster_quorum_state', 't', 20)
 	  && poll_sql_eq($pair->node1, 'SELECT in_quorum FROM pg_cluster_quorum_state', 't', 20);
 
-	if ($two_node_ready && pgbench_init($pair->node0))
+	if ($two_node_ready)
 	{
-		for my $r (1 .. $TWO_NODE_ROUNDS)
+		$two_init_ok = pgbench_init($pair->node0) ? 1 : 0;
+		if ($two_init_ok)
 		{
-			my $t = pgbench_one($pair->node0);
-			next unless defined $t && $t > 0;
-			push @two_node_tps, $t;
-			note(sprintf("  two-node round %d: node0 tps=%.0f", $r, $t));
+			for my $r (1 .. $TWO_NODE_ROUNDS)
+			{
+				my $t = pgbench_one($pair->node0);
+				next unless defined $t && $t > 0;
+				push @two_node_tps, $t;
+				note(sprintf("  two-node round %d: node0 tps=%.0f", $r, $t));
+			}
 		}
 	}
 	$pair->stop_pair;
 	1;
 } or do {
-	my $err = $@ || 'unknown error';
-	diag("M3 two-node report-only measurement failed before completion: $err");
+	$two_err = $@ || 'unknown error';
+	diag("M3 two-node report-only measurement failed before completion: $two_err");
 };
 
 my $two_have = ($two_node_started && $two_node_ready && scalar(@two_node_tps) > 0
@@ -273,12 +279,42 @@ my $two_tax = ($two_have && defined $two_tps)
 	? 100.0 * (1.0 - $two_tps / $tps_native) : undef;
 my $two_tax_s = defined $two_tax ? sprintf('%.2f', $two_tax) : 'n/a';
 
-note("MG-B two-node peer-online write-path REPORT-ONLY measurement:");
-note("  native single-node TPC-B median tps         = "
-	. (defined $tps_native ? sprintf('%.0f', $tps_native) : 'n/a'));
-note("  two-node peer-online node0 TPC-B median tps = "
-	. (defined $two_tps ? sprintf('%.0f', $two_tps) : 'n/a'));
-note("  two-node write tax % (report-only)          = $two_tax_s");
+my $native_s = defined $tps_native ? sprintf('%.0f', $tps_native) : 'n/a';
+my $two_tps_s = defined $two_tps ? sprintf('%.0f', $two_tps) : 'n/a';
+
+# Specific unavailable reason (reported even on PASS so the report-only leg is
+# never a silent black box).
+my $two_reason;
+if (!$two_node_started)
+{
+	$two_reason = "ClusterPair failed to boot/start"
+		. (defined $two_err ? ": $two_err" : "");
+}
+elsif (!$two_node_ready)
+{
+	$two_reason = "peers did not reach connected + in_quorum within timeout";
+}
+elsif (!$two_init_ok)
+{
+	$two_reason = "pgbench init on node0 failed";
+}
+elsif (!scalar(@two_node_tps))
+{
+	$two_reason = "pgbench produced no valid (>0 tps) rounds";
+}
+elsif (!(defined $tps_native && $tps_native > 0))
+{
+	$two_reason = "native single-node baseline tps missing";
+}
+
+# diag() reaches the captured CI log even on PASS / non-verbose prove, so the
+# 2-node report-only numbers are always visible alongside the M1 single-node
+# gate -- not just when run with -v.
+diag("MG-B two-node peer-online write-path REPORT-ONLY measurement:");
+diag("  native single-node TPC-B median tps         = $native_s");
+diag("  two-node peer-online node0 TPC-B median tps = $two_tps_s");
+diag("  two-node write tax % (report-only)          = $two_tax_s"
+	. (defined $two_reason ? "  (unavailable: $two_reason)" : ""));
 
 # REPORT ONLY: this leg must never fail the single-node hard gate.  If the
 # 2-node ClusterPair could not boot / reach quorum / produce a number this run
@@ -286,16 +322,16 @@ note("  two-node write tax % (report-only)          = $two_tax_s");
 # note rather than failing -- the HARD gate is the single-node M1 tax only.
 if ($two_have)
 {
-	diag("MG-B two-node peer-online write tax (report-only) = ${two_tax_s}%");
 	ok(1,
 		"M3 two-node peer-online single-writer write tax measured: ${two_tax_s}% "
-		. "(REPORT ONLY; no threshold asserted)");
+		. "(native=$native_s two-node=$two_tps_s tps; REPORT ONLY; no threshold asserted)");
 }
 else
 {
 	ok(1,
-		"M3 two-node peer-online write tax unavailable this run "
-		. "(REPORT ONLY; never fails the single-node hard gate)");
+		"M3 two-node peer-online write tax unavailable this run: "
+		. ($two_reason // 'unknown reason')
+		. " (REPORT ONLY; never fails the single-node hard gate)");
 }
 $report->record_multinode_write_value(2, 'tpcb-peer-online-single-writer',
 	tps_native => (defined $tps_native ? $tps_native : 0),
