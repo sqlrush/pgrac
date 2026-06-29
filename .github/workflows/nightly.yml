@@ -150,6 +150,12 @@ jobs:
           - { name: stage4-wal,        ranges: "242-248 273 275", unit: false, regress: false }
           - { name: stage4-hardgate,   ranges: "274-274", unit: false, regress: false }
           - { name: stage5-ges-locking, ranges: "276-326", unit: false, regress: false }
+          # spec-5.19 D9: Stage 5 integrated acceptance (heavy 4-node ClusterQuad
+          # + pgbench + crash-recovery) gets its own shard so the multi-node
+          # legs run in parallel and do not extend the ges-locking shard
+          # wallclock.  t/327 HW workload / t/328 MG-B write perf / t/329 MG-D
+          # heap-ITL WAL measure / t/330 production-bench-subset.
+          - { name: stage5-integrated-acceptance, ranges: "327-330", unit: false, regress: false }
     steps:
       - name: Checkout
         uses: actions/checkout@v4
