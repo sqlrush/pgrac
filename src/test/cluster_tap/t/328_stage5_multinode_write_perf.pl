@@ -18,6 +18,13 @@
 #    fsync/shared_buffers, pgbench TPC-B write workload, best-of-N for
 #    stability, ratio-based so the runner's absolute speed cancels.
 #
+#    Additional report-only measurement:
+#        two-node peer-online single-writer write tax
+#
+#    This boots a real ClusterPair (strict quorum + shared_data) and measures
+#    TPC-B writes on node0 while node1 is connected/in quorum.  It is a value
+#    report only: no percentage threshold is asserted here.
+#
 #    SEPARATE capability limitation (does NOT cover or excuse the gate above):
 #    true concurrent multi-node shared-block write competition is bounded by
 #    cross-node holder migration (DRM = Stage 6;  spec-5.57 cross-instance
@@ -39,6 +46,7 @@ use warnings;
 
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
+use PostgreSQL::Test::ClusterPair;
 use PostgreSQL::Test::Stage5IntegratedAcceptanceReport;
 use Test::More;
 
@@ -50,6 +58,7 @@ my $SCALE      = 10;
 my $SECS       = $ENV{PGRAC_PGBENCH_SECS} // 8;
 my $CLIENTS    = 4;
 my $ROUNDS     = $ENV{PGRAC_PGBENCH_ROUNDS} // 7;    # interleaved rounds
+my $TWO_NODE_ROUNDS = $ENV{PGRAC_2NODE_PGBENCH_ROUNDS} // $ROUNDS;
 # The hard gate: cluster write tax must not exceed this percentage.
 my $GATE_PCT   = $ENV{PGRAC_WRITE_TAX_GATE_PCT} // 10.0;
 
@@ -77,6 +86,23 @@ sub median
 	my @s = sort { $a <=> $b } @_;
 	return undef unless @s;
 	return $s[int((@s) / 2)];
+}
+
+sub poll_sql_eq
+{
+	my ($node, $sql, $want, $timeout_s) = @_;
+	$timeout_s //= 15;
+	my $deadline = time + $timeout_s;
+	my $last = '(never-queried)';
+	while (time < $deadline)
+	{
+		my $got = eval { $node->safe_psql('postgres', $sql); };
+		$last = defined $got ? $got : '(undef)';
+		return 1 if defined $got && $got eq $want;
+		select(undef, undef, undef, 0.25);
+	}
+	diag("poll_sql_eq timeout after ${timeout_s}s: want='$want' last='$last' sql=$sql");
+	return 0;
 }
 
 # Common perf-isolation knobs (CPU-overhead measurement: fsync off removes
@@ -149,6 +175,16 @@ note("  native  TPC-B median tps = " . (defined $tps_native ? sprintf('%.0f', $t
 note("  cluster TPC-B median tps = " . (defined $tps_cluster ? sprintf('%.0f', $tps_cluster) : 'n/a'));
 note("  write tax % (median)     = $tax_s (gate: <= $GATE_PCT%)");
 
+# Surface the measured median to the captured CI log unconditionally:  note()
+# is swallowed by non-verbose prove, but diag() reaches the log even on PASS.
+# This makes the gate's headroom (e.g. spec-5.19 MG-D v3 WAL delta effect)
+# visible without re-running the shard verbose.
+diag(sprintf("MG-B single-node write tax (median of %d rounds) = %s%% "
+		. "(gate <= %s%%; native=%s cluster=%s median tps)",
+	scalar(@taxes), $tax_s, $GATE_PCT,
+	(defined $tps_native ? sprintf('%.0f', $tps_native) : 'n/a'),
+	(defined $tps_cluster ? sprintf('%.0f', $tps_cluster) : 'n/a')));
+
 ok($have_both,
 	"M0 native + cluster single-node throughput measured over "
 	. scalar(@taxes) . " interleaved rounds");
@@ -180,6 +216,94 @@ $report->record_multinode_write_value(1, 'tpcb',
 # ---------------------------------------------------------------------
 ok($wait_events_present > 0,
 	"M2 cluster write-path wait-event surface present ($wait_events_present rows)");
+
+# ---------------------------------------------------------------------
+# M3: two-node peer-online write tax — REPORT ONLY.
+#
+# This is deliberately NOT a hard gate.  It measures the current two-node
+# online shape that Stage 5 can soundly run: strict-quorum ClusterPair with
+# shared_data, node0 executing TPC-B writes while node1 is connected and in
+# quorum.  True concurrent dual-writer shared-block competition remains the
+# separate DRM/Stage-6 limitation recorded below.
+# ---------------------------------------------------------------------
+my @two_node_tps;
+my $two_node_started = 0;
+my $two_node_ready = 0;
+eval {
+	my @pair_perf_conf = map { my $line = $_; chomp $line; $line } @perf_conf;
+	my $pair = PostgreSQL::Test::ClusterPair->new_pair(
+		'mnw_pair',
+		quorum_voting_disks => 3,
+		shared_data         => 1,
+		extra_conf          => [
+			@pair_perf_conf,
+			'cluster.quorum_poll_interval_ms = 500',
+			'cluster.cssd_heartbeat_interval_ms = 2000',
+			'cluster.cssd_dead_deadband_factor = 10',
+		]);
+	$pair->start_pair;
+	$two_node_started = 1;
+	$two_node_ready =
+	  $pair->wait_for_peer_state(0, 1, 'connected', 30)
+	  && $pair->wait_for_peer_state(1, 0, 'connected', 30)
+	  && poll_sql_eq($pair->node0, 'SELECT in_quorum FROM pg_cluster_quorum_state', 't', 20)
+	  && poll_sql_eq($pair->node1, 'SELECT in_quorum FROM pg_cluster_quorum_state', 't', 20);
+
+	if ($two_node_ready && pgbench_init($pair->node0))
+	{
+		for my $r (1 .. $TWO_NODE_ROUNDS)
+		{
+			my $t = pgbench_one($pair->node0);
+			next unless defined $t && $t > 0;
+			push @two_node_tps, $t;
+			note(sprintf("  two-node round %d: node0 tps=%.0f", $r, $t));
+		}
+	}
+	$pair->stop_pair;
+	1;
+} or do {
+	my $err = $@ || 'unknown error';
+	diag("M3 two-node report-only measurement failed before completion: $err");
+};
+
+my $two_have = ($two_node_started && $two_node_ready && scalar(@two_node_tps) > 0
+	&& defined $tps_native && $tps_native > 0);
+my $two_tps = scalar(@two_node_tps) ? median(@two_node_tps) : undef;
+my $two_tax = ($two_have && defined $two_tps)
+	? 100.0 * (1.0 - $two_tps / $tps_native) : undef;
+my $two_tax_s = defined $two_tax ? sprintf('%.2f', $two_tax) : 'n/a';
+
+note("MG-B two-node peer-online write-path REPORT-ONLY measurement:");
+note("  native single-node TPC-B median tps         = "
+	. (defined $tps_native ? sprintf('%.0f', $tps_native) : 'n/a'));
+note("  two-node peer-online node0 TPC-B median tps = "
+	. (defined $two_tps ? sprintf('%.0f', $two_tps) : 'n/a'));
+note("  two-node write tax % (report-only)          = $two_tax_s");
+
+# REPORT ONLY: this leg must never fail the single-node hard gate.  If the
+# 2-node ClusterPair could not boot / reach quorum / produce a number this run
+# (transient runner shmem pressure, etc.), pass with an explicit unavailable
+# note rather than failing -- the HARD gate is the single-node M1 tax only.
+if ($two_have)
+{
+	diag("MG-B two-node peer-online write tax (report-only) = ${two_tax_s}%");
+	ok(1,
+		"M3 two-node peer-online single-writer write tax measured: ${two_tax_s}% "
+		. "(REPORT ONLY; no threshold asserted)");
+}
+else
+{
+	ok(1,
+		"M3 two-node peer-online write tax unavailable this run "
+		. "(REPORT ONLY; never fails the single-node hard gate)");
+}
+$report->record_multinode_write_value(2, 'tpcb-peer-online-single-writer',
+	tps_native => (defined $tps_native ? $tps_native : 0),
+	tps_cluster => (defined $two_tps ? $two_tps : 0),
+	write_tax_pct => $two_tax_s,
+	gate => 'REPORT-ONLY',
+	note => 'ClusterPair strict-quorum + shared_data; node0 writes while node1 '
+		. 'is connected/in quorum. No threshold asserted.');
 
 # ---------------------------------------------------------------------
 # SOUNDNESS — the single-node tax above is REAL + gated.  The TRUE concurrent
