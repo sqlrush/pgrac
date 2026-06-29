@@ -154,8 +154,9 @@ jobs:
           # + pgbench + crash-recovery) gets its own shard so the multi-node
           # legs run in parallel and do not extend the ges-locking shard
           # wallclock.  t/327 HW workload / t/328 MG-B write perf / t/329 MG-D
-          # heap-ITL WAL measure / t/330 production-bench-subset.
-          - { name: stage5-integrated-acceptance, ranges: "327-330", unit: false, regress: false }
+          # heap-ITL WAL measure / t/330 production-bench-subset / t/331 4-node
+          # reconfig fault matrix.
+          - { name: stage5-integrated-acceptance, ranges: "327-331", unit: false, regress: false }
     steps:
       - name: Checkout
         uses: actions/checkout@v4
