@@ -31,11 +31,13 @@
  *	        ship value;  update-required contract) + the multi-node write-path
  *	        wait events present and pairwise distinct (GES_S4 / GES_REPLY /
  *	        CF_ENQUEUE / CR_CONSTRUCT / REL_EXTEND_WAIT — the MG-B M2 share).
- *	    L6  heap-ITL WAL delta width invariant (MG-D measure baseline):
- *	        sizeof(xl_heap_itl_delta_v2) == 40 and
+ *	    L6  heap-ITL WAL delta width invariant (MG-D decided GO):
+ *	        sizeof(xl_heap_itl_delta_v3) == 32 and
  *	        offsetof(xl_heap_itl_delta_block, deltas) == 8 — every mutating
- *	        heap record carries a fixed 8 + 40 == 48-byte ITL delta;  a layout
- *	        change would invalidate the MG-D 48B/record measurement basis.
+ *	        heap record now carries a fixed 8 + 32 == 40-byte ITL delta (was
+ *	        8 + 40 == 48 with v2; commit_scn dropped).  v2 (40B) retained for
+ *	        backward replay.  A layout change would invalidate the MG-D
+ *	        40B/record measurement basis.
  *
  *	  Static contract assertions only.  Behavioral coverage in cluster_tap
  *	  t/32x (reconfig matrix), the HW/extend workload, and the production-
@@ -206,15 +208,19 @@ UT_TEST(test_stage5_wait_events_count_and_multinode_set)
 
 UT_TEST(test_stage5_heap_itl_wal_delta_width_invariant)
 {
-	/* MG-D measures the per-record heap-ITL WAL overhead (every mutating heap
-	 * record carries a fixed 8-byte block header + 40-byte v2 delta == 48 B,
-	 * ndeltas == 1, not coalesced).  Pin the struct widths so the 48B/record
-	 * measurement basis cannot silently change underneath the decision record. */
-	UT_ASSERT_EQ((int)sizeof(xl_heap_itl_delta_v2), 40);
+	/* MG-D decided GO: the always-Invalid write-time commit_scn (8B) is dropped
+	 * from the write-path ITL delta (v3).  Every mutating heap record now carries
+	 * a fixed 8-byte block header + 32-byte v3 delta == 40 B (ndeltas == 1, not
+	 * coalesced) -- down from the v2 48B baseline.  Pin the v3 width so the
+	 * post-decision 40B/record measurement basis cannot silently change. */
+	UT_ASSERT_EQ((int)sizeof(xl_heap_itl_delta_v3), 32);
 	UT_ASSERT_EQ((int)offsetof(xl_heap_itl_delta_block, deltas), 8);
-	/* 8-byte block header + 40-byte v2 delta == 48 B per mutating heap record. */
-	UT_ASSERT_EQ((int)(offsetof(xl_heap_itl_delta_block, deltas) + sizeof(xl_heap_itl_delta_v2)),
-				 48);
+	/* 8-byte block header + 32-byte v3 delta == 40 B per mutating heap record. */
+	UT_ASSERT_EQ((int)(offsetof(xl_heap_itl_delta_block, deltas) + sizeof(xl_heap_itl_delta_v3)),
+				 40);
+	/* v2 (40B) is retained for backward WAL replay only -- pin it so the redo
+	 * dispatch keeps a stable legacy width. */
+	UT_ASSERT_EQ((int)sizeof(xl_heap_itl_delta_v2), 40);
 }
 
 

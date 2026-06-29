@@ -264,6 +264,41 @@ UT_TEST(test_t29_v1_v2_slot_idx_same_offset)
 				 (int)offsetof(xl_heap_itl_delta_v2, slot_idx));
 }
 
+/* ---------- spec-5.19 MG-D v3 32B ABI tests (commit_scn dropped) ---------- */
+
+UT_TEST(test_t30_delta_v3_sizeof_32)
+{
+	/* v2 40B minus the always-Invalid 8B commit_scn == 32B. */
+	UT_ASSERT_EQ((int)sizeof(xl_heap_itl_delta_v3), 32);
+}
+
+UT_TEST(test_t31_delta_v3_field_offsets)
+{
+	UT_ASSERT_EQ((int)offsetof(xl_heap_itl_delta_v3, slot_idx), 0);
+	UT_ASSERT_EQ((int)offsetof(xl_heap_itl_delta_v3, flags_after), 2);
+	UT_ASSERT_EQ((int)offsetof(xl_heap_itl_delta_v3, xid), 4);
+	UT_ASSERT_EQ((int)offsetof(xl_heap_itl_delta_v3, write_scn), 8);
+	/* commit_scn is gone; undo_segment_head moves up from 24 (v2) to 16. */
+	UT_ASSERT_EQ((int)offsetof(xl_heap_itl_delta_v3, undo_segment_head), 16);
+}
+
+UT_TEST(test_t32_format_version_v3_distinct)
+{
+	UT_ASSERT_EQ((int)CLUSTER_ITL_DELTA_FORMAT_V3, 2);
+	UT_ASSERT_NE((int)CLUSTER_ITL_DELTA_FORMAT_V3, (int)CLUSTER_ITL_DELTA_FORMAT_V1);
+	UT_ASSERT_NE((int)CLUSTER_ITL_DELTA_FORMAT_V3, (int)CLUSTER_ITL_DELTA_FORMAT_V2);
+}
+
+UT_TEST(test_t33_v1_v2_v3_slot_idx_same_offset)
+{
+	/* cluster_itl_wal_block_first_slot_idx reads slot_idx at offset 0
+	 * version-agnostically -- must hold for v3 too. */
+	UT_ASSERT_EQ((int)offsetof(xl_heap_itl_delta, slot_idx),
+				 (int)offsetof(xl_heap_itl_delta_v3, slot_idx));
+	UT_ASSERT_EQ((int)offsetof(xl_heap_itl_delta_v2, slot_idx),
+				 (int)offsetof(xl_heap_itl_delta_v3, slot_idx));
+}
+
 
 int
 main(void)
@@ -297,5 +332,9 @@ main(void)
 	UT_RUN(test_t27_block_format_version_repurposed_pad);
 	UT_RUN(test_t28_block_deltas_offset_still_8);
 	UT_RUN(test_t29_v1_v2_slot_idx_same_offset);
+	UT_RUN(test_t30_delta_v3_sizeof_32);
+	UT_RUN(test_t31_delta_v3_field_offsets);
+	UT_RUN(test_t32_format_version_v3_distinct);
+	UT_RUN(test_t33_v1_v2_v3_slot_idx_same_offset);
 	UT_DONE();
 }

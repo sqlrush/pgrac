@@ -2185,7 +2185,7 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 		int			bufflags = 0;
 #ifdef USE_PGRAC_CLUSTER
 		xl_heap_itl_delta_block cluster_itl_hdr;
-		xl_heap_itl_delta_v2 cluster_itl_delta;	/* spec-3.4b D6 F9 — v2 40B */
+		xl_heap_itl_delta_v3 cluster_itl_delta;	/* spec-5.19 MG-D — v3 32B (commit_scn dropped) */
 #endif
 
 		/*
@@ -2241,12 +2241,11 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 		{
 			cluster_itl_hdr.ndeltas = 1;
 			cluster_itl_hdr.reserved = 0;
-			cluster_itl_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V2;
+			cluster_itl_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V3;
 			cluster_itl_delta.slot_idx = cluster_itl_slot;
 			cluster_itl_delta.flags_after = ITL_FLAG_ACTIVE;
 			cluster_itl_delta.xid = xid;
 			cluster_itl_delta.write_scn = ClusterPageGetItlSlots(BufferGetPage(buffer))[cluster_itl_slot].write_scn;
-			cluster_itl_delta.commit_scn = InvalidScn;
 			cluster_itl_delta.undo_segment_head = cluster_itl_uba;
 
 			xlrec.flags |= XLH_INSERT_ITL_DELTA;
@@ -2777,16 +2776,15 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			if (cluster_mi_active)
 			{
 				xl_heap_itl_delta_block mi_hdr;
-				xl_heap_itl_delta_v2 mi_delta;	/* spec-3.4b D6 F9 — v2 40B */
+				xl_heap_itl_delta_v3 mi_delta;	/* spec-5.19 MG-D — v3 32B (commit_scn dropped) */
 
 				mi_hdr.ndeltas = 1;
 				mi_hdr.reserved = 0;
-				mi_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V2;
+				mi_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V3;
 				mi_delta.slot_idx = cluster_mi_slot;
 				mi_delta.flags_after = ITL_FLAG_ACTIVE;
 				mi_delta.xid = xid;
 				mi_delta.write_scn = ClusterPageGetItlSlots(page)[cluster_mi_slot].write_scn;
-				mi_delta.commit_scn = InvalidScn;
 				mi_delta.undo_segment_head = cluster_mi_uba;
 
 				XLogRegisterData((char *) &mi_hdr,
@@ -3603,7 +3601,7 @@ l1:
 		XLogRecPtr	recptr;
 #ifdef USE_PGRAC_CLUSTER
 		xl_heap_itl_delta_block cluster_itl_hdr;
-		xl_heap_itl_delta_v2 cluster_itl_delta;	/* spec-3.4b D6 F9 — v2 40B */
+		xl_heap_itl_delta_v3 cluster_itl_delta;	/* spec-5.19 MG-D — v3 32B (commit_scn dropped) */
 #endif
 
 		/*
@@ -3638,12 +3636,11 @@ l1:
 		{
 			cluster_itl_hdr.ndeltas = 1;
 			cluster_itl_hdr.reserved = 0;
-			cluster_itl_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V2;
+			cluster_itl_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V3;
 			cluster_itl_delta.slot_idx = cluster_itl_slot;
 			cluster_itl_delta.flags_after = ITL_FLAG_ACTIVE;
 			cluster_itl_delta.xid = xid;
 			cluster_itl_delta.write_scn = ClusterPageGetItlSlots(page)[cluster_itl_slot].write_scn;
-			cluster_itl_delta.commit_scn = InvalidScn;
 			cluster_itl_delta.undo_segment_head = cluster_itl_uba;
 			xlrec.flags |= XLH_DELETE_ITL_DELTA;
 		}
@@ -6464,7 +6461,7 @@ failed:
 		XLogRecPtr	recptr;
 #ifdef USE_PGRAC_CLUSTER
 		xl_heap_itl_delta_block hdr;
-		xl_heap_itl_delta_v2 delta;
+		xl_heap_itl_delta_v3 delta;
 #endif
 
 		XLogBeginInsert();
@@ -6485,7 +6482,7 @@ failed:
 
 #ifdef USE_PGRAC_CLUSTER
 		/*
-		 * PGRAC (spec-3.4d D4 WAL emit / Q4 A2):  append v2 40B ITL delta
+		 * PGRAC (spec-3.4d D4 WAL emit / Q4 A2):  append v3 32B ITL delta (spec-5.19 MG-D)
 		 * + 4B block header inside same xlrec so heap_xlog_lock can replay
 		 * the lock-only ITL slot stamp on standbys.  Layout mirrors
 		 * spec-3.4b D6 single-block delta WAL ABI.
@@ -6493,7 +6490,7 @@ failed:
 		if (cluster_did_lock_stamp)
 		{
 			memset(&hdr, 0, sizeof(hdr));
-			hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V2;
+			hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V3;
 			hdr.ndeltas = 1;
 			hdr.reserved = 0;
 			XLogRegisterData((char *) &hdr, offsetof(xl_heap_itl_delta_block, deltas));
@@ -6503,7 +6500,6 @@ failed:
 			delta.flags_after = ITL_FLAG_LOCK_ONLY_ACTIVE;
 			delta.xid = xid;
 			delta.write_scn = cluster_lock_write_scn;
-			delta.commit_scn = InvalidScn;
 			delta.undo_segment_head = cluster_lock_uba;
 			XLogRegisterData((char *) &delta, sizeof(delta));
 		}
@@ -7366,7 +7362,7 @@ l4:
 			Page		page = BufferGetPage(buf);
 #ifdef USE_PGRAC_CLUSTER
 			xl_heap_itl_delta_block chain_hdr;
-			xl_heap_itl_delta_v2 chain_delta;
+			xl_heap_itl_delta_v3 chain_delta;
 #endif
 
 			XLogBeginInsert();
@@ -7388,7 +7384,7 @@ l4:
 			if (cluster_chain_lock_stamp)
 			{
 				memset(&chain_hdr, 0, sizeof(chain_hdr));
-				chain_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V2;
+				chain_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V3;
 				chain_hdr.ndeltas = 1;
 				chain_hdr.reserved = 0;
 				XLogRegisterData((char *) &chain_hdr,
@@ -7399,7 +7395,6 @@ l4:
 				chain_delta.flags_after = ITL_FLAG_LOCK_ONLY_ACTIVE;
 				chain_delta.xid = xid;
 				chain_delta.write_scn = cluster_chain_write_scn;
-				chain_delta.commit_scn = InvalidScn;
 				chain_delta.undo_segment_head = cluster_chain_uba;
 				XLogRegisterData((char *) &chain_delta, sizeof(chain_delta));
 			}
@@ -10590,9 +10585,9 @@ log_heap_update(Relation reln, Buffer oldbuf,
 	int			bufflags;
 #ifdef USE_PGRAC_CLUSTER
 	xl_heap_itl_delta_block cluster_itl_old_hdr;
-	xl_heap_itl_delta_v2 cluster_itl_old_delta;	/* spec-3.4b D6 F9 — v2 40B */
+	xl_heap_itl_delta_v3 cluster_itl_old_delta;	/* spec-5.19 MG-D — v3 32B (commit_scn dropped) */
 	xl_heap_itl_delta_block cluster_itl_new_hdr;
-	xl_heap_itl_delta_v2 cluster_itl_new_delta;	/* spec-3.4b D6 F9 — v2 40B */
+	xl_heap_itl_delta_v3 cluster_itl_new_delta;	/* spec-5.19 MG-D — v3 32B (commit_scn dropped) */
 #endif
 
 	/* Caller should not call me on a non-WAL-logged relation */
@@ -10695,24 +10690,22 @@ log_heap_update(Relation reln, Buffer oldbuf,
 		{
 			cluster_itl_new_hdr.ndeltas = 1;
 			cluster_itl_new_hdr.reserved = 0;
-			cluster_itl_new_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V2;
+			cluster_itl_new_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V3;
 			cluster_itl_new_delta.slot_idx = cluster_itl_new_slot;
 			cluster_itl_new_delta.flags_after = ITL_FLAG_ACTIVE;
 			cluster_itl_new_delta.xid = cluster_itl_xid;
 			cluster_itl_new_delta.write_scn = ClusterPageGetItlSlots(BufferGetPage(newbuf))[cluster_itl_new_slot].write_scn;
-			cluster_itl_new_delta.commit_scn = InvalidScn;
 			cluster_itl_new_delta.undo_segment_head = cluster_itl_uba;
 		}
 		if (cluster_itl_old_active && oldbuf != newbuf)
 		{
 			cluster_itl_old_hdr.ndeltas = 1;
 			cluster_itl_old_hdr.reserved = 0;
-			cluster_itl_old_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V2;
+			cluster_itl_old_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V3;
 			cluster_itl_old_delta.slot_idx = cluster_itl_old_slot;
 			cluster_itl_old_delta.flags_after = ITL_FLAG_ACTIVE;
 			cluster_itl_old_delta.xid = cluster_itl_xid;
 			cluster_itl_old_delta.write_scn = ClusterPageGetItlSlots(BufferGetPage(oldbuf))[cluster_itl_old_slot].write_scn;
-			cluster_itl_old_delta.commit_scn = InvalidScn;
 			cluster_itl_old_delta.undo_segment_head = cluster_itl_uba;
 		}
 		else if (cluster_itl_old_active)
@@ -10724,12 +10717,11 @@ log_heap_update(Relation reln, Buffer oldbuf,
 			 */
 			cluster_itl_new_hdr.ndeltas = 1;
 			cluster_itl_new_hdr.reserved = 0;
-			cluster_itl_new_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V2;
+			cluster_itl_new_hdr.format_version = CLUSTER_ITL_DELTA_FORMAT_V3;
 			cluster_itl_new_delta.slot_idx = cluster_itl_old_slot;
 			cluster_itl_new_delta.flags_after = ITL_FLAG_ACTIVE;
 			cluster_itl_new_delta.xid = cluster_itl_xid;
 			cluster_itl_new_delta.write_scn = ClusterPageGetItlSlots(BufferGetPage(newbuf))[cluster_itl_old_slot].write_scn;
-			cluster_itl_new_delta.commit_scn = InvalidScn;
 			cluster_itl_new_delta.undo_segment_head = cluster_itl_uba;
 		}
 	}
@@ -11524,7 +11516,7 @@ heap_xlog_delete(XLogReaderState *record)
 		/*
 		 * PGRAC (spec-3.4a D9 / spec-3.4b D6): replay block-local ITL
 		 * delta when XLH_DELETE_ITL_DELTA is set.  The helper dispatches
-		 * by format_version (v1 24B legacy / v2 40B with UBA).
+		 * by format_version (v1 24B legacy / v2 40B / v3 32B, all with UBA).
 		 */
 		if (xlrec->flags & XLH_DELETE_ITL_DELTA)
 		{
@@ -11666,7 +11658,7 @@ heap_xlog_insert(XLogReaderState *record)
 		/*
 		 * PGRAC (spec-3.4a D9 / spec-3.4b D6): replay block-local ITL
 		 * delta array when XLH_INSERT_ITL_DELTA is set.  The helper
-		 * dispatches by format_version (v1 24B legacy / v2 40B with UBA).
+		 * dispatches by format_version (v1 24B legacy / v2 40B / v3 32B, all with UBA).
 		 */
 		if (xlrec->flags & XLH_INSERT_ITL_DELTA)
 		{
@@ -12343,7 +12335,7 @@ heap_xlog_lock(XLogReaderState *record)
 #ifdef USE_PGRAC_CLUSTER
 		/*
 		 * PGRAC (spec-3.4d D6 redo / Q4 A2):  replay lock-only ITL slot
-		 * stamp from v2 40B delta appended after xlrec.  See spec-3.4b D6
+		 * stamp from the dispatched ITL delta (v1 24B / v2 40B / v3 32B) appended after xlrec.  See spec-3.4b D6
 		 * for delta block layout.  htup tuple header has no
 		 * t_lock_itl_slot_idx field (per F2 raw_xmax scan derivation), so
 		 * we do not patch any tuple header field;  the slot stamp itself
@@ -12419,7 +12411,7 @@ heap_xlog_lock_updated(XLogReaderState *record)
 
 #ifdef USE_PGRAC_CLUSTER
 		/* PGRAC (spec-3.4d D6 redo / follow_updates):  replay lock-only
-		 * ITL slot for successor tuple from v2 40B delta. */
+		 * ITL slot for successor tuple from the dispatched ITL delta (v2 40B / v3 32B). */
 		if (xlrec->flags & XLH_LOCK_UPDATED_ITL_DELTA)
 		{
 			const char *delta_start = ((const char *) xlrec) + SizeOfHeapLockUpdated;

@@ -7,12 +7,19 @@
 #
 #    Every mutating heap WAL record (INSERT / UPDATE / DELETE / LOCK /
 #    LOCK_UPDATED) carries a fixed 8-byte block header (xl_heap_itl_delta_
-#    block) + 40-byte v2 delta (xl_heap_itl_delta_v2) == 48 bytes, with
+#    block) + 32-byte v3 delta (xl_heap_itl_delta_v3) == 40 bytes, with
 #    ndeltas == 1 (NOT coalesced — N single-row mutations to the same block
-#    emit N separate 48-byte deltas).  This test MEASURES that overhead under
+#    emit N separate 40-byte deltas).  This test MEASURES that overhead under
 #    a hot-block workload and emits a GO/NO-GO decision on whether to
-#    implement WAL-delta compaction (array-pack multiple deltas / elide
-#    repeated ACTIVE stamps).
+#    implement the REMAINING WAL-delta compaction (array-pack multiple deltas
+#    into one record / elide repeated ACTIVE stamps / dedup the 8-byte block
+#    header across same-block deltas).
+#
+#    MG-D GO part already shipped: the per-delta commit_scn (always Invalid at
+#    write time) was dropped in spec-5.19 (v2 40B -> v3 32B; per-record
+#    48 -> 40 B), to close the MG-B single-node write-tax blocker.  This test
+#    now measures the per-record footprint at the post-v3 40 B and evaluates
+#    the FURTHER same-block header-dedup / coalesce opportunity.
 #
 #    Measure-and-decide (L257):  the metric is report-only.  NO-GO is a legal
 #    outcome (small overhead / non-blocker — mirrors the spec-5.53 / 5.55
@@ -22,7 +29,7 @@
 #    Method: single cluster-enabled node, autovacuum off.  A hot-block
 #    workload performs many single-row UPDATEs concentrated on a few heap
 #    pages, then pg_waldump over the workload LSN window counts the mutating
-#    heap records (each == one 48-byte ITL delta) and the same-block grouping
+#    heap records (each == one 40-byte ITL delta) and the same-block grouping
 #    (the array-pack coalesce opportunity).
 #
 # Author: SqlRush <sqlrush@gmail.com>
@@ -42,7 +49,7 @@ use PostgreSQL::Test::Utils;
 use PostgreSQL::Test::Stage5IntegratedAcceptanceReport;
 use Test::More;
 
-my $ITL_DELTA_BYTES = 48;    # 8 (block header) + 40 (v2 delta) — D8 L6 invariant
+my $ITL_DELTA_BYTES = 40;    # 8 (block header) + 32 (v3 delta) — D8 L6 invariant, post-MG-D-GO
 
 my $report = PostgreSQL::Test::Stage5IntegratedAcceptanceReport->new(
 	tag => $ENV{PGRAC_TAG} // 'unknown');
@@ -120,7 +127,7 @@ for my $line (@dump)
 	next unless $line =~ /rmgr:\s+Heap2?\s/;
 	next unless $line =~ /desc:\s+(INSERT|UPDATE|HOT_UPDATE|DELETE|LOCK|LOCK_UPDATED|MULTI_INSERT)/;
 	my $op = $1;
-	# Only the per-record mutations carry one 48-byte ITL delta.
+	# Only the per-record mutations carry one 40-byte ITL delta (v3).
 	$heap_mut_records++;
 	if ($line =~ m{len \(rec/tot\):\s*\d+/\s*(\d+)})
 	{
@@ -161,7 +168,7 @@ note("MG-D heap-ITL WAL measurement:");
 note("  mutating heap records         = $heap_mut_records");
 note("  heap WAL total bytes          = $heap_total_bytes");
 note("  total WAL bytes (window)      = $total_wal_bytes");
-note("  ITL delta bytes (48 * recs)   = $itl_delta_bytes");
+note("  ITL delta bytes (40 * recs)   = $itl_delta_bytes");
 note("  ITL delta share of heap WAL   = $itl_share_pct %");
 note("  coalescible (same-block) recs = $coalescible_records ($coalesce_rate_pct %)");
 note("  header-dedup saving (lower b.) = $header_dedup_saving_bytes B ($header_dedup_saving_pct % of heap WAL)");
@@ -191,7 +198,7 @@ $report->set_itl_wal_decision($decision,
 	},
 	blocker => $blocker,
 	threshold_pct => $GO_THRESHOLD_PCT,
-	note => "fixed 48 B/record ITL delta, ndeltas==1 (not coalesced); "
+	note => "fixed 40 B/record ITL delta (v3; commit_scn dropped), ndeltas==1 (not coalesced); "
 		. "$decision per header-dedup lower bound vs ${GO_THRESHOLD_PCT}% "
 		. "threshold; non-blocker (shipped correct cost, not a regression)");
 
@@ -200,7 +207,7 @@ ok($heap_mut_records > 0,
 	"MG-D measured $heap_mut_records mutating heap records under the hot-block "
 	. "workload");
 ok($itl_delta_bytes == $heap_mut_records * $ITL_DELTA_BYTES,
-	"MG-D ITL delta overhead == 48 B * mutating records (D8 L6 invariant)");
+	"MG-D ITL delta overhead == 40 B * mutating records (D8 L6 invariant)");
 ok($decision eq 'GO' || $decision eq 'NO-GO',
 	"MG-D decision recorded: $decision (header-dedup saving $header_dedup_saving_pct% "
 	. "vs ${GO_THRESHOLD_PCT}% threshold; non-blocker)");

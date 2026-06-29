@@ -545,7 +545,33 @@ StaticAssertDecl(offsetof(xl_heap_itl_delta_block, deltas) == 8,
  *	    falls back to zero triple → PG-native).
  *	  xl_heap_itl_delta_block.format_version == 1  →  v2 (40B deltas;
  *	    UBA bytes restored from delta).
+ *	  xl_heap_itl_delta_block.format_version == 2  →  v3 (32B deltas;
+ *	    UBA bytes restored from delta; commit_scn elided, see below).
  *	  Other values  →  PANIC (corruption).
+ *
+ * PGRAC (spec-5.19 MG-D): v3 ITL delta drops the write-time commit_scn
+ * field (8B).  Every write-path emit site (heap_insert / multi_insert /
+ * delete / lock / lock-chain / update old+new) only ever stamps an
+ * ITL_FLAG_ACTIVE / ITL_FLAG_LOCK_ONLY_ACTIVE transition, for which
+ * commit_scn is *always* InvalidScn at write time (the slot is not yet
+ * committed -- COMMITTED stamping happens later via the commit-time /
+ * delayed-cleanout page mutation, which is FPI-logged, not via a write-path
+ * delta).  Dropping an always-Invalid field is therefore lossless: redo
+ * reconstructs commit_scn = InvalidScn for every v3 delta.  This shrinks
+ * the per-mutating-record heap-ITL WAL footprint from 8 + 40 == 48 B to
+ * 8 + 32 == 40 B (MG-D measure baseline).  The COMMITTED-requires-valid-SCN
+ * redo guard (heap_redo) still fires for any v3 delta that somehow carries
+ * ITL_FLAG_COMMITTED, so a mis-emitted COMMITTED v3 delta fails closed
+ * (PANIC) rather than installing a committed slot with InvalidScn.
+ *
+ *	Wire-stable layout (cluster_unit test_cluster_itl_wal enforces):
+ *	  xl_heap_itl_delta_v3 (32 bytes):
+ *	    offset  0,  2B : slot_idx
+ *	    offset  2,  2B : flags_after
+ *	    offset  4,  4B : xid
+ *	    offset  8,  8B : write_scn
+ *	    offset 16, 16B : undo_segment_head (UBA; InvalidUba on finish
+ *	                     deltas that do not re-bind -- same semantic as v2)
  *
  *	Wire-stable layout (cluster_unit test_cluster_itl_wal enforces):
  *	  xl_heap_itl_delta_v2 (40 bytes):
@@ -567,6 +593,7 @@ StaticAssertDecl(offsetof(xl_heap_itl_delta_block, deltas) == 8,
  */
 #define CLUSTER_ITL_DELTA_FORMAT_V1 ((uint32) 0)
 #define CLUSTER_ITL_DELTA_FORMAT_V2 ((uint32) 1)
+#define CLUSTER_ITL_DELTA_FORMAT_V3 ((uint32) 2)
 
 typedef struct xl_heap_itl_delta_v2
 {
@@ -592,6 +619,28 @@ StaticAssertDecl(offsetof(xl_heap_itl_delta_v2, commit_scn) == 16,
 				 "spec-3.4b D6 — commit_scn at offset 16");
 StaticAssertDecl(offsetof(xl_heap_itl_delta_v2, undo_segment_head) == 24,
 				 "spec-3.4b D6 — undo_segment_head at offset 24");
+
+typedef struct xl_heap_itl_delta_v3
+{
+	uint16			slot_idx;			/* offset 0,  2B */
+	uint16			flags_after;		/* offset 2,  2B (ClusterItlFlags) */
+	TransactionId	xid;				/* offset 4,  4B */
+	SCN				write_scn;			/* offset 8,  8B */
+	UBA				undo_segment_head;	/* offset 16, 16B (commit_scn elided) */
+} xl_heap_itl_delta_v3;
+
+StaticAssertDecl(sizeof(xl_heap_itl_delta_v3) == 32,
+				 "spec-5.19 MG-D — xl_heap_itl_delta_v3 must be 32 bytes (v2 40B minus the always-Invalid 8B commit_scn)");
+StaticAssertDecl(offsetof(xl_heap_itl_delta_v3, slot_idx) == 0,
+				 "spec-5.19 MG-D — slot_idx at offset 0");
+StaticAssertDecl(offsetof(xl_heap_itl_delta_v3, flags_after) == 2,
+				 "spec-5.19 MG-D — flags_after at offset 2");
+StaticAssertDecl(offsetof(xl_heap_itl_delta_v3, xid) == 4,
+				 "spec-5.19 MG-D — xid at offset 4");
+StaticAssertDecl(offsetof(xl_heap_itl_delta_v3, write_scn) == 8,
+				 "spec-5.19 MG-D — write_scn at offset 8");
+StaticAssertDecl(offsetof(xl_heap_itl_delta_v3, undo_segment_head) == 16,
+				 "spec-5.19 MG-D — undo_segment_head at offset 16 (commit_scn dropped vs v2)");
 
 
 #endif							/* USE_PGRAC_CLUSTER */

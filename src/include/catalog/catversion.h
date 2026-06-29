@@ -706,7 +706,14 @@
 /* spec-5.18: permanent node removal — pg_cluster_node_removal_state SRF (oid 8963)
  * + pg_cluster_remove_node UDF (oid 8964) + pg_cluster_membership +2 cols
  * (removed/removed_epoch) + 53R63/53R64 SQLSTATE.  Bump 202606320 -> 202606330. */
-#define CATALOG_VERSION_NO 202606330
+/* spec-5.19 MG-D (2026-06-29): heap-ITL WAL delta v3 — new xl_heap_itl_delta_v3
+ * (32B) + CLUSTER_ITL_DELTA_FORMAT_V3; the always-Invalid write-time commit_scn
+ * (8B) is dropped from every write-path ITL delta, shrinking the per-mutating-
+ * record footprint 8+40==48B -> 8+32==40B.  Redo keeps v1/v2 branches for
+ * backward replay and reconstructs commit_scn=InvalidScn for v3.  No catalog
+ * surface change; the bump fences an old binary from replaying v3-format WAL
+ * (unknown format_version -> redo PANIC).  Bump 202606330 -> 202606340. */
+#define CATALOG_VERSION_NO 202606340
 
 /* spec-5.13 (2026-06-27): clean-leave catalog surface — cluster_get_clean_leave_state
  * SRF (oid 8960) + pg_cluster_clean_leave_state view + pg_cluster_clean_leave_request

@@ -968,6 +968,8 @@ cluster_itl_redo_apply_block_local_delta(Page page, HeapTupleHeader htup,
 		delta_size = sizeof(xl_heap_itl_delta);
 	else if (hdr.format_version == CLUSTER_ITL_DELTA_FORMAT_V2)
 		delta_size = sizeof(xl_heap_itl_delta_v2);
+	else if (hdr.format_version == CLUSTER_ITL_DELTA_FORMAT_V3)
+		delta_size = sizeof(xl_heap_itl_delta_v3);
 	else
 		elog(PANIC, "spec-3.4b D6: unknown xl_heap_itl_delta_block.format_version %u",
 			 (unsigned)hdr.format_version);
@@ -996,7 +998,7 @@ cluster_itl_redo_apply_block_local_delta(Page page, HeapTupleHeader htup,
 			 * slot's existing UBA on page is preserved.  Legacy ACTIVE
 			 * stamps wrote InvalidUba to the page anyway, so reader
 			 * 3-branch (D7) will fall back to zero triple. */
-		} else {
+		} else if (hdr.format_version == CLUSTER_ITL_DELTA_FORMAT_V2) {
 			xl_heap_itl_delta_v2 d;
 
 			memcpy(&d, p, sizeof(d));
@@ -1005,6 +1007,24 @@ cluster_itl_redo_apply_block_local_delta(Page page, HeapTupleHeader htup,
 			d_xid = d.xid;
 			d_write_scn = d.write_scn;
 			d_commit_scn = d.commit_scn;
+			d_uba = d.undo_segment_head;
+		} else {
+			/* CLUSTER_ITL_DELTA_FORMAT_V3 (delta_size dispatch above already
+			 * PANICked on any other value). */
+			xl_heap_itl_delta_v3 d;
+
+			memcpy(&d, p, sizeof(d));
+			slot_idx = d.slot_idx;
+			flags_after = d.flags_after;
+			d_xid = d.xid;
+			d_write_scn = d.write_scn;
+			/* spec-5.19 MG-D: v3 elides the write-time commit_scn (it is
+			 * always InvalidScn for the ACTIVE / LOCK_ONLY_ACTIVE transitions
+			 * the write path emits).  Reconstruct it as InvalidScn.  If a v3
+			 * delta ever carries ITL_FLAG_COMMITTED, the COMMITTED-requires-
+			 * valid-SCN guard below fails closed (PANIC) -- v3 must never be
+			 * used for a COMMITTED transition. */
+			d_commit_scn = InvalidScn;
 			d_uba = d.undo_segment_head;
 		}
 
@@ -1085,6 +1105,8 @@ cluster_itl_wal_block_consumed_bytes(const char *itl_block_start)
 		delta_size = sizeof(xl_heap_itl_delta);
 	else if (hdr.format_version == CLUSTER_ITL_DELTA_FORMAT_V2)
 		delta_size = sizeof(xl_heap_itl_delta_v2);
+	else if (hdr.format_version == CLUSTER_ITL_DELTA_FORMAT_V3)
+		delta_size = sizeof(xl_heap_itl_delta_v3);
 	else
 		elog(PANIC, "spec-3.4b D6: unknown xl_heap_itl_delta_block.format_version %u",
 			 (unsigned)hdr.format_version);
