@@ -1128,8 +1128,7 @@ dump_grd_recovery(ReturnSetInfo *rsinfo)
 	 * category; no new dump category, §8 Q6-A). */
 	emit_row(rsinfo, "grd_recovery", "join_remaster_started",
 			 fmt_int64((int64)c.join_remaster_started));
-	emit_row(rsinfo, "grd_recovery", "join_remaster_done",
-			 fmt_int64((int64)c.join_remaster_done));
+	emit_row(rsinfo, "grd_recovery", "join_remaster_done", fmt_int64((int64)c.join_remaster_done));
 	emit_row(rsinfo, "grd_recovery", "join_shards_remastered",
 			 fmt_int64((int64)c.join_shards_remastered));
 	emit_row(rsinfo, "grd_recovery", "join_block_views_rebuilt",

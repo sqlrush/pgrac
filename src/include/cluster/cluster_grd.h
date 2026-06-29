@@ -365,11 +365,11 @@ typedef struct ClusterGrdShared {
 	/* spec-5.16 D5 — join-direction remaster counters (dump_grd grd_recovery
 	 * segment;  kept distinct from the failure-driven remaster_* counters so
 	 * ops can tell the two remaster kinds apart — §8 Q6-A). */
-	pg_atomic_uint64 join_remaster_started_count;			   /* JOIN episode entered */
-	pg_atomic_uint64 join_remaster_done_count;				   /* JOIN episode reached IDLE */
-	pg_atomic_uint64 join_shards_remastered_count;			   /* GRD shards moved to joiner */
-	pg_atomic_uint64 join_block_views_rebuilt_count;		   /* joiner-home fences lifted */
-	pg_atomic_uint64 join_block_recovering_failclosed_count;   /* 53R9L denied (both gates) */
+	pg_atomic_uint64 join_remaster_started_count;			 /* JOIN episode entered */
+	pg_atomic_uint64 join_remaster_done_count;				 /* JOIN episode reached IDLE */
+	pg_atomic_uint64 join_shards_remastered_count;			 /* GRD shards moved to joiner */
+	pg_atomic_uint64 join_block_views_rebuilt_count;		 /* joiner-home fences lifted */
+	pg_atomic_uint64 join_block_recovering_failclosed_count; /* 53R9L denied (both gates) */
 } ClusterGrdShared;
 
 /* spec-2.17 D28b — extern atomic generation alloc helper(InitProcess hook). */

@@ -49,8 +49,8 @@
 #include "cluster/cluster_gcs_block_dedup.h" /* spec-2.34 D1 — counter forward */
 #include "cluster/cluster_grd.h"			 /* spec-4.6 D4 — block_path_failclosed counter */
 #include "cluster/cluster_grd_outbound.h"
-#include "cluster/cluster_membership.h" /* spec-5.16 D3b — is_member master-side gate */
-#include "cluster/cluster_qvotec.h"		/* spec-5.16 D3b — in_quorum master-side gate */
+#include "cluster/cluster_membership.h"		/* spec-5.16 D3b — is_member master-side gate */
+#include "cluster/cluster_qvotec.h"			/* spec-5.16 D3b — in_quorum master-side gate */
 #include "cluster/cluster_recovery_merge.h" /* spec-4.7 D5 — recovered_through redo gate */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
@@ -676,8 +676,7 @@ cluster_gcs_block_phase_for_tag(BufferTag tag)
 	 * the optimization; the master-side hard gate (cluster_gcs_handle_block_
 	 * request_envelope) is the correctness backstop for stale-view requesters.
 	 */
-	if (cluster_grd_join_remaster_active_for_shard(tag)
-		&& !cluster_grd_block_view_rebuilt(tag)) {
+	if (cluster_grd_join_remaster_active_for_shard(tag) && !cluster_grd_block_view_rebuilt(tag)) {
 		cluster_grd_inc_join_block_failclosed();
 		return GCS_BLOCK_RECOVERING;
 	}

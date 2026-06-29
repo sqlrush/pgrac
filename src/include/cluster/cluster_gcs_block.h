@@ -171,7 +171,8 @@ typedef enum GcsBlockReplyStatus {
 													 * 8.A: a cached copy with no
 													 * invalidation path would go stale).
 													 * Reuses HC103 copy-ship + HC127
-													 * watermark. */,
+													 * watermark. */
+	,
 	GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING = 14 /* PGRAC: spec-5.16 D3b NEW;
 													 * master-side hard gate (INV-R8/R14)
 													 * — the master (a rejoining node) is

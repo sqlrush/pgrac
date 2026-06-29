@@ -3288,7 +3288,7 @@ ut_jr_setup_3node(void)
 	int32 nodes3[] = { 0, 1, 2 };
 
 	ut_mock_epoch = 0;
-	ut_member_mask = -1;	  /* all members */
+	ut_member_mask = -1; /* all members */
 	ut_mock_static_master = 0;
 	ut_reset_grd_shmem(); /* clean fence / recovery_done_epoch / direction */
 	cluster_grd_shmem_init();
@@ -3559,15 +3559,13 @@ UT_TEST(test_jr_u15_master_side_gate_decision)
 	ut_mock_static_master = 1;
 
 	/* The gate's home-block leg: active_for_shard && !view_rebuilt. */
-	deny = cluster_grd_join_remaster_active_for_shard(tag)
-		   && !cluster_grd_block_view_rebuilt(tag);
+	deny = cluster_grd_join_remaster_active_for_shard(tag) && !cluster_grd_block_view_rebuilt(tag);
 	UT_ASSERT(deny);
 
 	cluster_grd_recovery_mark_peer_done(0, 10);
 	cluster_grd_recovery_mark_peer_done(1, 10);
 	cluster_grd_recovery_mark_peer_done(2, 10);
-	deny = cluster_grd_join_remaster_active_for_shard(tag)
-		   && !cluster_grd_block_view_rebuilt(tag);
+	deny = cluster_grd_join_remaster_active_for_shard(tag) && !cluster_grd_block_view_rebuilt(tag);
 	UT_ASSERT(!deny);
 }
 

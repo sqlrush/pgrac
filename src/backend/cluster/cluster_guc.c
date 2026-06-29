@@ -2237,16 +2237,16 @@ cluster_init_guc(void)
 	 * PCM block snap-back fence is NOT gated here (it is forced correctness
 	 * bound to cluster.online_join, INV-R13); this only controls whether the
 	 * joiner's home-shard GES mastership is moved back from the survivor. */
-	DefineCustomBoolVariable("cluster.join_remaster_enabled",
-							 gettext_noop("On node rejoin, move the joiner's home-shard GES "
-										  "mastership back from the survivor (optional rebalance)."),
-							 gettext_noop("Default off: the joiner's logical-lock mastership stays "
-										  "on the survivor that held it during the absence (load "
-										  "imbalance only).  The PCM block view rebuild + RECOVERING "
-										  "fence always run when cluster.online_join is on, "
-										  "independent of this GUC (forced correctness)."),
-							 &cluster_join_remaster_enabled, false, PGC_POSTMASTER, 0, NULL, NULL,
-							 NULL);
+	DefineCustomBoolVariable(
+		"cluster.join_remaster_enabled",
+		gettext_noop("On node rejoin, move the joiner's home-shard GES "
+					 "mastership back from the survivor (optional rebalance)."),
+		gettext_noop("Default off: the joiner's logical-lock mastership stays "
+					 "on the survivor that held it during the absence (load "
+					 "imbalance only).  The PCM block view rebuild + RECOVERING "
+					 "fence always run when cluster.online_join is on, "
+					 "independent of this GUC (forced correctness)."),
+		&cluster_join_remaster_enabled, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	DefineCustomIntVariable("cluster.join_convergence_timeout_ms",
 							gettext_noop("Deadline for an online join to converge + commit."),
