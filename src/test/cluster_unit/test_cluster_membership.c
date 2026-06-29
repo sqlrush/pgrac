@@ -421,10 +421,62 @@ UT_TEST(test_member_count_shrink)
 	cluster_membership_attach(NULL);
 }
 
+/* ======================================================================
+ * U8 (reviewer P1 #2; Hardening v1.4 / INV-J13) -- select_majority groups
+ * voting-disk join markers by commit IDENTITY.  Distinct-attempt (different
+ * nonce) minority markers must NOT aggregate into a false majority — the bug
+ * the qvotec peer-observe path had (it counted any COMMITTED marker), unlike
+ * the self-admit and startup-seed paths which already required a same-commit
+ * majority.  This is the shared helper all three now use.
+ * ====================================================================== */
+UT_TEST(test_marker_select_majority_groups_by_commit)
+{
+	ClusterJoinCommitMarker mk[3];
+	uint32 majority = 2; /* 3 voting disks */
+	uint32 agree = 99;
+	int win;
+
+	/* Three COMMITTED markers for node 7, each a DIFFERENT attempt (distinct
+	 * nonce): every one is committed-basis, but NONE reached a same-commit
+	 * majority.  Must select nothing — a false-majority readmit would be 8.A. */
+	make_marker(&mk[0], 7, CLUSTER_JCMK_PHASE_COMMITTED, 5, 10);
+	mk[0].commit_nonce = 0x111;
+	cluster_join_marker_compute_crc(&mk[0]);
+	make_marker(&mk[1], 7, CLUSTER_JCMK_PHASE_COMMITTED, 6, 12);
+	mk[1].commit_nonce = 0x222;
+	cluster_join_marker_compute_crc(&mk[1]);
+	make_marker(&mk[2], 7, CLUSTER_JCMK_PHASE_COMMITTED, 7, 14);
+	mk[2].commit_nonce = 0x333;
+	cluster_join_marker_compute_crc(&mk[2]);
+	UT_ASSERT_EQ(cluster_join_marker_select_majority(mk, 3, majority, &agree), -1);
+	UT_ASSERT_EQ((int)agree, 0); /* no winning group */
+
+	/* Two of the SAME commit (identical identity/nonce) + one different: the
+	 * same-commit pair IS a majority -> a member of that commit is selected. */
+	make_marker(&mk[0], 7, CLUSTER_JCMK_PHASE_COMMITTED, 9, 20);
+	mk[0].commit_nonce = 0xAAA;
+	cluster_join_marker_compute_crc(&mk[0]);
+	make_marker(&mk[1], 7, CLUSTER_JCMK_PHASE_COMMITTED, 9, 20);
+	mk[1].commit_nonce = 0xAAA;
+	cluster_join_marker_compute_crc(&mk[1]);
+	make_marker(&mk[2], 7, CLUSTER_JCMK_PHASE_COMMITTED, 8, 18);
+	mk[2].commit_nonce = 0xBBB;
+	cluster_join_marker_compute_crc(&mk[2]);
+	win = cluster_join_marker_select_majority(mk, 3, majority, &agree);
+	UT_ASSERT(win == 0 || win == 1); /* a member of the winning same-commit set */
+	UT_ASSERT_EQ((int)agree, 2);	 /* exactly the same-commit pair */
+	UT_ASSERT_EQ((int)mk[win].admitted_incarnation, 9);
+	UT_ASSERT_EQ((int)mk[win].commit_nonce, (int)0xAAA);
+
+	/* Empty / defensive input selects nothing. */
+	UT_ASSERT_EQ(cluster_join_marker_select_majority(mk, 0, majority, NULL), -1);
+	UT_ASSERT_EQ(cluster_join_marker_select_majority(NULL, 3, majority, NULL), -1);
+}
+
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(18);
 	UT_RUN(test_vet_fresh_above_accept);
 	UT_RUN(test_vet_equal_reject_stale);
 	UT_RUN(test_vet_below_reject_stale);
@@ -439,6 +491,7 @@ main(void)
 	UT_RUN(test_seed_prepare_marker_not_a_basis);
 	UT_RUN(test_seed_committed_marker_epoch_reset_still_seeds);
 	UT_RUN(test_marker_same_commit_identity_group);
+	UT_RUN(test_marker_select_majority_groups_by_commit);
 	UT_RUN(test_marker_version_mismatch_failclosed);
 	UT_RUN(test_vet_removed_fenced);
 	UT_RUN(test_member_count_shrink);

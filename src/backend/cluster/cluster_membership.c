@@ -292,6 +292,41 @@ cluster_join_marker_same_commit(const ClusterJoinCommitMarker *a, const ClusterJ
 }
 
 /*
+ * INV-J13 majority selector (shared by self-admit, startup-seed and qvotec
+ * peer-observe).  `markers` must already be committed-basis; O(n^2) over n disks
+ * (n <= CLUSTER_MAX_VOTING_DISKS, small).  Returns the index of the first marker
+ * that is same_commit with >= `majority` of the array (i.e. a single commit
+ * attempt that actually reached a disk majority), or -1.  A set of distinct-
+ * attempt minority markers therefore selects NOTHING — they never aggregate
+ * into a false majority (reviewer P1 #2 / P1-3).
+ */
+int
+cluster_join_marker_select_majority(const ClusterJoinCommitMarker *markers, int n, uint32 majority,
+									uint32 *out_agree)
+{
+	int a, b;
+
+	if (out_agree != NULL)
+		*out_agree = 0;
+	if (markers == NULL || n <= 0)
+		return -1;
+
+	for (a = 0; a < n; a++) {
+		uint32 same = 0;
+
+		for (b = 0; b < n; b++)
+			if (cluster_join_marker_same_commit(&markers[a], &markers[b]))
+				same++;
+		if (same >= majority) {
+			if (out_agree != NULL)
+				*out_agree = same;
+			return a;
+		}
+	}
+	return -1;
+}
+
+/*
  * Apply one durable marker to the admitted floor (INV-J7).  Only a committed
  * basis raises the floor; record_admitted is monotonic so re-applying / lower
  * markers are no-ops.  Returns true iff applied.  Pure w.r.t. the attached table;

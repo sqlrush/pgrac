@@ -204,6 +204,17 @@ extern bool cluster_join_marker_same_commit(const ClusterJoinCommitMarker *a,
 											const ClusterJoinCommitMarker *b);
 
 /*
+ * INV-J13 — select a marker that belongs to a same-commit MAJORITY from an
+ * array of (already committed-basis) markers.  Returns the index of any member
+ * of the winning same-commit group (and, if out_agree != NULL, the number of
+ * markers in that group), or -1 if no single commit attempt reached `majority`.
+ * Shared by self-admit, startup-seed and qvotec peer-observe so a distinct-
+ * attempt minority can never aggregate into a false majority (P1 #2).
+ */
+extern int cluster_join_marker_select_majority(const ClusterJoinCommitMarker *markers, int n,
+											   uint32 majority, uint32 *out_agree);
+
+/*
  * Apply one durable marker to the admitted floor (INV-J7): if it is a committed
  * basis for expected_node, raise last_admitted_incarnation[node] toward its
  * admitted_incarnation (monotonic).  Pure (operates on the attached table); the

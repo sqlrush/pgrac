@@ -350,16 +350,26 @@ typedef struct ClusterGrdShared {
 	 *	                           joiner BEFORE is_member(self) flips, and by
 	 *	                           each survivor's LMON P0-accept (D2).
 	 *	                           Monotonic max (a later join re-arms higher).
-	 *	join_pcm_fenced_member     the rejoining MEMBER set this fence covers
-	 *	                           (PCM home = hash%declared_count = node domain,
-	 *	                           NOT the 4096-shard domain).  CLUSTER_MAX_NODES
-	 *	                           bits as uint64 words.
+	 *	join_pcm_fence_member_epoch  per-node:  the fence epoch at which node N was
+	 *	                           last armed as a rejoining RECIPIENT (0 = never).
+	 *	                           A node is a recipient of the CURRENT episode iff
+	 *	                           its slot == join_pcm_fence_epoch;  a stale stamp
+	 *	                           from a COMPLETED prior episode (< the current
+	 *	                           epoch) no longer counts, so a prior rejoiner —
+	 *	                           now a steady survivor that may hold X on the new
+	 *	                           joiner's home block — is NOT excluded from the
+	 *	                           next episode's re-declare barrier.  Hardening
+	 *	                           v1.4 (Rule 8.A):  the previous OR-accumulated
+	 *	                           bitmap was never cleared and conflated prior +
+	 *	                           current recipients -> barrier under-wait ->
+	 *	                           premature fence lift -> cold-serve -> double-
+	 *	                           grant / false-visible.
 	 *	recovery_direction         ClusterGrdRemasterDirection — FAIL (4.6) /
 	 *	                           JOIN (5.16) / NONE (idle).  Observability +
 	 *	                           recompute selection;  does not change the FSM.
 	 */
 	pg_atomic_uint64 join_pcm_fence_epoch;
-	pg_atomic_uint64 join_pcm_fenced_member[(CLUSTER_MAX_NODES + 63) / 64];
+	pg_atomic_uint64 join_pcm_fence_member_epoch[CLUSTER_MAX_NODES];
 	pg_atomic_uint32 recovery_direction;
 
 	/* spec-5.16 D5 — join-direction remaster counters (dump_grd grd_recovery

@@ -2383,9 +2383,9 @@ cluster_membership_seed_last_admitted_from_voting_disk(const int *fds, int n_dis
 		} slot;
 		ClusterJoinCommitMarker committed[CLUSTER_MAX_VOTING_DISKS];
 		int n_committed = 0;
-		int win = -1;
+		int win;
 		uint32 win_agree = 0;
-		int d, a, b;
+		int d;
 
 		if (cluster_conf_lookup_node(s) == NULL)
 			continue;
@@ -2408,21 +2408,10 @@ cluster_membership_seed_last_admitted_from_voting_disk(const int *fds, int n_dis
 		 * nonce), not "any COMMITTED marker".  Two minority writes from
 		 * different attempts (different coordinator / epoch) must not aggregate.
 		 * Only a marker that actually reached a disk majority represents a real
-		 * admission, so only it raises the monotonic floor (P1-3).  O(disks^2),
-		 * disks <= CLUSTER_MAX_VOTING_DISKS (small).
+		 * admission, so only it raises the monotonic floor (P1-3).  Shared
+		 * selector — same logic as self-admit and qvotec peer-observe.
 		 */
-		for (a = 0; a < n_committed; a++) {
-			uint32 same = 0;
-
-			for (b = 0; b < n_committed; b++)
-				if (cluster_join_marker_same_commit(&committed[a], &committed[b]))
-					same++;
-			if (same >= majority) {
-				win = a;
-				win_agree = same;
-				break;
-			}
-		}
+		win = cluster_join_marker_select_majority(committed, n_committed, majority, &win_agree);
 
 		if (win >= 0 && committed[win].admitted_incarnation > 0) {
 			uint64 win_incarnation = committed[win].admitted_incarnation;

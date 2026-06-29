@@ -632,8 +632,8 @@ cluster_grd_shmem_init(void)
 
 		/* spec-5.16 D2/D3b/D5 — online-join remaster fence + counters. */
 		pg_atomic_init_u64(&cluster_grd_state->join_pcm_fence_epoch, 0);
-		for (i = 0; i < (CLUSTER_MAX_NODES + 63) / 64; i++)
-			pg_atomic_init_u64(&cluster_grd_state->join_pcm_fenced_member[i], 0);
+		for (i = 0; i < CLUSTER_MAX_NODES; i++)
+			pg_atomic_init_u64(&cluster_grd_state->join_pcm_fence_member_epoch[i], 0);
 		pg_atomic_init_u32(&cluster_grd_state->recovery_direction, (uint32)GRD_REMASTER_DIR_NONE);
 		pg_atomic_init_u64(&cluster_grd_state->join_remaster_started_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->join_remaster_done_count, 0);
@@ -1221,46 +1221,55 @@ cluster_grd_master_map_recompute_for_membership(const uint8 *active_member, uint
  *	Arm the joiner-home PCM block fence SYNCHRONOUSLY (NEVER from the LMON
  *	tick — the async tick is structurally later than the 5.15 write-gate open,
  *	so a fence armed there would leave a "MEMBER-writable but unfenced" window).
- *	Sets join_pcm_fenced_member (the rejoining set) THEN raises join_pcm_fence_
- *	epoch (a write barrier between, so a reader that sees the raised epoch sees
- *	the member set).  Monotonic-max:  a later join re-arms higher;  re-arm of
- *	the same epoch is an idempotent no-op (INV-R12).
+ *	Stamps each rejoining recipient's join_pcm_fence_member_epoch with THIS
+ *	episode's epoch THEN raises join_pcm_fence_epoch (a write barrier between, so
+ *	a reader that sees the raised epoch sees the recipient stamps).  Monotonic-
+ *	max:  a later join re-arms higher;  re-arm of the same epoch is an idempotent
+ *	no-op (INV-R12).
  *
- *	spec-5.16 Hardening v1.3 (Rule 8.A) — the member set is OR-accumulated, never
- *	overwritten.  Two arms race on the rejoining node: qvotec (note_self_admitted,
- *	{self}) and the LMON tick ({evt.join_bitmap} for a multi-joiner episode).  A
- *	plain write would let the {self} arm zero a co-joiner's bit, UNDER-fencing its
- *	home block -> cold-serve -> 8.A double-grant.  OR makes concurrent arms
- *	accumulate the union regardless of interleaving (no under-fence).  A stale bit
- *	carried from a completed prior episode only OVER-fences (the block waits for
- *	this epoch's view_rebuilt barrier, then lifts) — benign liveness, never a
- *	correctness fault, so no per-bit clear is required here.
+ *	spec-5.16 Hardening v1.4 (Rule 8.A) — the recipient set is keyed PER NODE by
+ *	the arming epoch, not an OR-accumulated bitmap.  Two arms race on the
+ *	rejoining node: qvotec (note_self_admitted, {self}) and the LMON tick
+ *	({evt.join_bitmap} for a multi-joiner episode).  Both stamp the SAME epoch on
+ *	their respective nodes, so they union with no lost update and no under-fence.
+ *	Crucially, a node armed in a COMPLETED prior episode keeps its lower stamp,
+ *	which is < the current join_pcm_fence_epoch, so the recipient test (used by
+ *	active_for_shard AND the re-declare barriers) excludes it from THIS episode
+ *	automatically.  The previous v1.3 bitmap was never cleared, so a prior
+ *	rejoiner — now a steady survivor that may hold X on the new joiner's home
+ *	block — was wrongly skipped by the barrier -> premature fence lift -> cold-
+ *	serve -> 8.A double-grant / false-visible (reviewer P1 #1).  Per-node epoch
+ *	keying fixes both the union (no under-fence) and the staleness (no cross-
+ *	episode under-wait) with no reset race.
  */
 void
 cluster_grd_arm_join_pcm_fence(const uint8 *rejoining_set)
 {
 	uint64 epoch;
 	uint64 prev;
-	int w;
+	int node;
 
 	if (cluster_grd_state == NULL || rejoining_set == NULL)
 		return;
 
 	epoch = cluster_epoch_get_current();
 
-	for (w = 0; w < (CLUSTER_MAX_NODES + 63) / 64; w++) {
-		uint64 word = 0;
-		int j;
+	for (node = 0; node < CLUSTER_MAX_NODES; node++) {
+		uint64 cur;
 
-		for (j = 0; j < 8; j++) {
-			int byte_idx = w * 8 + j;
-
-			if (byte_idx < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES)
-				word |= ((uint64)rejoining_set[byte_idx]) << (8 * j);
+		if (node >= CLUSTER_RECONFIG_DEAD_BITMAP_BYTES * 8)
+			break; /* rejoining_set bitmap is exhausted */
+		if (((rejoining_set[node >> 3] >> (node & 7)) & 1) == 0)
+			continue;
+		/* monotonic-max per node — concurrent same-epoch arms union safely */
+		cur = pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_member_epoch[node]);
+		while (epoch > cur) {
+			if (pg_atomic_compare_exchange_u64(
+					&cluster_grd_state->join_pcm_fence_member_epoch[node], &cur, epoch))
+				break;
 		}
-		pg_atomic_fetch_or_u64(&cluster_grd_state->join_pcm_fenced_member[w], word);
 	}
-	pg_write_barrier(); /* member set visible before the epoch is raised */
+	pg_write_barrier(); /* recipient stamps visible before the epoch is raised */
 
 	prev = pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_epoch);
 	while (epoch > prev) {
@@ -1286,18 +1295,19 @@ cluster_grd_join_remaster_in_progress(void)
 /*
  * cluster_grd_join_remaster_active_for_shard -- spec-5.16 D3 (INV-R8).
  *
- *	True iff the block's STATIC PCM home (cluster_gcs_lookup_master_static) is
- *	in the armed join_pcm_fenced_member set.  Bound to online_join (the fence
- *	epoch is armed by note_self_admitted / LMON P0-accept), INDEPENDENT of any
- *	GRD master[] movement — so join_remaster_enabled=off still fences (r2 P1-①,
- *	P1-A closure).  false when the fence is not armed.
+ *	True iff the block's STATIC PCM home (cluster_gcs_lookup_master_static) is a
+ *	rejoining RECIPIENT of the CURRENT fence episode (member_epoch[home] ==
+ *	join_pcm_fence_epoch).  Bound to online_join (the fence epoch is armed by
+ *	note_self_admitted / LMON P0-accept), INDEPENDENT of any GRD master[]
+ *	movement — so join_remaster_enabled=off still fences (r2 P1-①, P1-A
+ *	closure).  false when the fence is not armed or the home is a steady member
+ *	(incl. a prior rejoiner whose stamp is from a completed earlier episode).
  */
 bool
 cluster_grd_join_remaster_active_for_shard(BufferTag tag)
 {
 	uint64 fence_epoch;
 	int home;
-	int w, b;
 
 	if (cluster_grd_state == NULL)
 		return false;
@@ -1309,11 +1319,7 @@ cluster_grd_join_remaster_active_for_shard(BufferTag tag)
 	home = cluster_gcs_lookup_master_static(tag);
 	if (home < 0 || home >= CLUSTER_MAX_NODES)
 		return false;
-	w = home >> 6;
-	b = home & 63;
-	return (pg_atomic_read_u64(&cluster_grd_state->join_pcm_fenced_member[w])
-			& (UINT64CONST(1) << b))
-		   != 0;
+	return pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_member_epoch[home]) == fence_epoch;
 }
 
 /*
@@ -1340,19 +1346,21 @@ cluster_grd_join_remaster_active_for_shard(BufferTag tag)
  *	gate on the joiner is the authoritative backstop (INV-R8/R14).
  */
 
-/* Test whether node_id is in the armed join_pcm_fenced_member (rejoining) set. */
+/*
+ * Test whether node_id is a rejoining RECIPIENT of the fence episode identified
+ * by ref_epoch (member_epoch[node] == ref_epoch).  A stale stamp from a prior
+ * episode (< ref_epoch) returns false, so a now-steady survivor is correctly
+ * waited for by the re-declare barriers (Hardening v1.4, reviewer P1 #1).
+ */
 static inline bool
-join_fenced_member_test(int32 node_id)
+join_fence_is_recipient_for(int32 node_id, uint64 ref_epoch)
 {
-	int w, b;
-
 	if (cluster_grd_state == NULL || node_id < 0 || node_id >= CLUSTER_MAX_NODES)
 		return false;
-	w = node_id >> 6;
-	b = node_id & 63;
-	return (pg_atomic_read_u64(&cluster_grd_state->join_pcm_fenced_member[w])
-			& (UINT64CONST(1) << b))
-		   != 0;
+	if (ref_epoch == 0)
+		return false;
+	return pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_member_epoch[node_id])
+		   == ref_epoch;
 }
 
 bool
@@ -1379,10 +1387,12 @@ cluster_grd_block_view_rebuilt(BufferTag tag)
 		 * JOIN_COMMITTED event as a reconfig episode (it is published coordinator-
 		 * side only), so it never announces REDECLARE_DONE.  The binding safety
 		 * condition is "every SURVIVOR finished re-declaring its held joiner-home
-		 * blocks" — exclude the fenced set so view_rebuilt converges on the
-		 * survivors' done (Hardening v1.1 + D8 fix).
+		 * blocks" — exclude only THIS episode's recipients so view_rebuilt
+		 * converges on the survivors' done (Hardening v1.1 + D8 fix).  Keyed on
+		 * fence_epoch so a prior rejoiner (now a steady survivor) is NOT skipped
+		 * (Hardening v1.4, reviewer P1 #1: cross-episode under-wait -> 8.A).
 		 */
-		if (join_fenced_member_test(i))
+		if (join_fence_is_recipient_for(i, fence_epoch))
 			continue;
 		if (pg_atomic_read_u64(&cluster_grd_state->recovery_done_epoch[i]) < fence_epoch)
 			return false;
@@ -2074,7 +2084,7 @@ cluster_grd_recovery_lmon_tick(void)
 		 * (P5-P7 below);  for JOIN that rebuilds the joiner's PCM block view even
 		 * when join_remaster_enabled is off.  The two scopes are independent:
 		 * grd_moved_shards = `affected` here (GRD, GUC-gated); pcm_fenced_home_set
-		 * lives in join_pcm_fenced_member (PCM, online_join-gated, armed at P0).
+		 * lives in join_pcm_fence_member_epoch (PCM, online_join-gated, armed at P0).
 		 */
 		memset(affected, 0, sizeof(affected));
 		if (pg_atomic_read_u32(&cluster_grd_state->recovery_direction)
@@ -2307,10 +2317,14 @@ cluster_grd_recovery_lmon_tick(void)
 				 * and never observes the JOIN_COMMITTED event as its own reconfig
 				 * episode (it is published coordinator-side only), so it never
 				 * announces REDECLARE_DONE.  Waiting for it would wedge the survivor's
-				 * barrier forever.  The survivors (everyone outside the fenced set)
-				 * ARE the re-declarers and must converge.
+				 * barrier forever.  The survivors (everyone outside THIS episode's
+				 * recipient set) ARE the re-declarers and must converge.  Keyed on
+				 * episode_epoch so a prior rejoiner (now a steady survivor) is still
+				 * waited for (Hardening v1.4, reviewer P1 #1: a stale cross-episode
+				 * exclusion would skip a survivor holding X on the joiner's home
+				 * block -> premature unfreeze -> 8.A double-grant).
 				 */
-				if (is_join && join_fenced_member_test(i))
+				if (is_join && join_fence_is_recipient_for(i, episode_epoch))
 					continue;
 				if (pg_atomic_read_u64(&cluster_grd_state->recovery_done_epoch[i])
 					< episode_epoch) {

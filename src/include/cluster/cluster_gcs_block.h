@@ -1010,10 +1010,11 @@ extern ClusterGcsBlockPhase cluster_gcs_block_phase_for_tag(BufferTag tag);
  * requester-side phase gate and the master-side envelope handler consume them).
  *
  *	cluster_grd_join_remaster_active_for_shard:  the block's STATIC PCM home
- *	    (cluster_gcs_lookup_master_static) is in the armed join_pcm_fenced_member
- *	    set (bound to online_join, INDEPENDENT of any GRD master[] movement —
- *	    so join_remaster_enabled=off still fences, r2 P1-①).  false when the
- *	    fence is not armed (join_pcm_fence_epoch == 0).
+ *	    (cluster_gcs_lookup_master_static) is a rejoining RECIPIENT of the current
+ *	    fence episode (join_pcm_fence_member_epoch[home] == join_pcm_fence_epoch;
+ *	    bound to online_join, INDEPENDENT of any GRD master[] movement — so
+ *	    join_remaster_enabled=off still fences, r2 P1-①).  false when the fence is
+ *	    not armed (join_pcm_fence_epoch == 0) or the home is a steady member.
  *	cluster_grd_block_view_rebuilt:  the joiner-home view is rebuilt — i.e.
  *	    EVERY declared member's recovery_done_epoch >= join_pcm_fence_epoch
  *	    (Hardening v1.1:  the all-members all_done barrier, NOT the joiner's own

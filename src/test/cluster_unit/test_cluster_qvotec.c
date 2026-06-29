@@ -511,6 +511,21 @@ cluster_join_marker_same_commit(const ClusterJoinCommitMarker *a pg_attribute_un
 {
 	return false;
 }
+/* Hardening v1.4: peer-observe and self-admit now share the majority selector.
+ * With the is_committed_basis stub returning false the marker arrays are always
+ * empty (n == 0), so the selector returns -1 (no admission); the linker just
+ * needs the symbol. */
+int cluster_join_marker_select_majority(const ClusterJoinCommitMarker *markers, int n,
+										uint32 majority, uint32 *out_agree);
+int
+cluster_join_marker_select_majority(const ClusterJoinCommitMarker *markers pg_attribute_unused(),
+									int n pg_attribute_unused(),
+									uint32 majority pg_attribute_unused(), uint32 *out_agree)
+{
+	if (out_agree != NULL)
+		*out_agree = 0;
+	return -1;
+}
 bool cluster_reconfig_join_publish_proven(uint64 admitted_epoch);
 bool
 cluster_reconfig_join_publish_proven(uint64 admitted_epoch pg_attribute_unused())

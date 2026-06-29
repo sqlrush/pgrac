@@ -879,17 +879,27 @@ qvotec_poll_once(void)
 	 * joins the re-declare barrier (without it the coordinator's barrier waits
 	 * forever for a non-participating survivor in >=3-node).  Mirrors the self-
 	 * admission read below; one extra region-3 slot read per (disk × peer) per poll
-	 * (qvotec already has the fds).  Majority + COMMITTED-basis validated; a never-
-	 * joined / undeclared slot fails the basis check and publishes nothing.
+	 * (qvotec already has the fds).  Same-commit majority + COMMITTED-basis
+	 * validated (INV-J13); a never-joined / undeclared slot fails the basis check
+	 * and publishes nothing.
+	 *
+	 * Hardening v1.4 (reviewer P1 #2) — this used to count ANY committed-basis
+	 * marker toward the majority and take the max incarnation/epoch, UNLIKE the
+	 * self-admit and startup-seed paths.  Two distinct join attempts (different
+	 * coordinator / epoch / nonce), each on a minority of disks, would then
+	 * aggregate into a false majority -> the survivor readmits a peer whose join
+	 * never durably committed (DEAD->MEMBER + observer JOIN event) -> 8.A.  Now it
+	 * mirrors them exactly: collect committed-basis markers, then require a
+	 * same-commit majority via the shared cluster_join_marker_select_majority.
 	 */
 	{
 		uint32 node;
 		uint32 majority = ((uint32)qvotec_n_disks / 2u) + 1u;
 
 		for (node = 0; node < CLUSTER_MAX_NODES; node++) {
-			uint32 agree = 0;
-			uint64 best_incarnation = 0;
-			uint64 best_admitted_epoch = 0;
+			ClusterJoinCommitMarker committed[CLUSTER_MAX_VOTING_DISKS];
+			int n_committed = 0;
+			int win;
 			int d;
 
 			if ((int32)node == cluster_node_id)
@@ -908,15 +918,13 @@ qvotec_poll_once(void)
 				memcpy(&m, jslot.bytes, sizeof(m));
 				if (!cluster_join_marker_is_committed_basis(&m, (int32)node))
 					continue;
-				agree++;
-				if (m.admitted_incarnation > best_incarnation)
-					best_incarnation = m.admitted_incarnation;
-				if (m.admitted_epoch > best_admitted_epoch)
-					best_admitted_epoch = m.admitted_epoch;
+				committed[n_committed++] = m;
 			}
-			if (agree >= majority && best_incarnation > 0)
-				cluster_reconfig_record_observed_committed_join((int32)node, best_incarnation,
-																best_admitted_epoch);
+			win = cluster_join_marker_select_majority(committed, n_committed, majority, NULL);
+			if (win >= 0 && committed[win].admitted_incarnation > 0)
+				cluster_reconfig_record_observed_committed_join((int32)node,
+																committed[win].admitted_incarnation,
+																committed[win].admitted_epoch);
 		}
 	}
 
@@ -940,9 +948,8 @@ qvotec_poll_once(void)
 		ClusterJoinCommitMarker self_markers[CLUSTER_MAX_VOTING_DISKS];
 		int n_self = 0;
 		uint32 majority = ((uint32)qvotec_n_disks / 2u) + 1u;
-		int d, a, b;
-		int win = -1;
-		uint32 win_agree = 0;
+		int d;
+		int win;
 
 		for (d = 0; d < qvotec_n_disks; d++) {
 			union {
@@ -962,23 +969,12 @@ qvotec_poll_once(void)
 				continue; /* a stale prior-incarnation admission — not us */
 			self_markers[n_self++] = m;
 		}
-		/* HF-3: find a single commit (nonce) present on >= majority disks. */
-		for (a = 0; a < n_self; a++) {
-			uint32 same = 0;
-
-			for (b = 0; b < n_self; b++)
-				if (cluster_join_marker_same_commit(&self_markers[a], &self_markers[b]))
-					same++;
-			if (same >= majority) {
-				win = a;
-				win_agree = same;
-				break;
-			}
-		}
+		/* HF-3 / INV-J13: find a single commit (nonce) present on >= majority disks
+		 * (shared selector — same logic as startup-seed and peer-observe). */
+		win = cluster_join_marker_select_majority(self_markers, n_self, majority, NULL);
 
 		/* HF-1: gate-open requires the publish-proof too, not the marker alone. */
-		if (win >= 0 && win_agree >= majority
-			&& cluster_reconfig_join_publish_proven(self_markers[win].admitted_epoch)) {
+		if (win >= 0 && cluster_reconfig_join_publish_proven(self_markers[win].admitted_epoch)) {
 			cluster_reconfig_note_self_admitted(self_markers[win].admitted_epoch);
 			/*
 			 * spec-5.16 (3-node rejoin) — the same durable COMMITTED join marker

@@ -3591,6 +3591,53 @@ UT_TEST(test_jr_u16_pre_member_guard)
 	cluster_node_id = saved;
 }
 
+/* U17 — cross-episode fence accumulation (reviewer P1 #1; Hardening fix, 8.A).
+ * A fenced recipient from a COMPLETED prior join episode must NOT be excluded
+ * from the CURRENT episode's all-members re-declare barrier: it is now a steady
+ * survivor that may hold X on the NEW joiner's home block and MUST re-declare
+ * before that joiner cold-serves.  Pre-fix the OR-accumulated member bitmap kept
+ * the prior rejoiner's bit set, so episode-2's barrier skipped it -> premature
+ * fence lift -> cold-serve a block the survivor still holds X on -> double-grant
+ * / false-visible. */
+UT_TEST(test_jr_u17_stale_recipient_not_excluded_next_episode)
+{
+	uint8 join1[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	uint8 join2[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	int n1[1] = { 1 };
+	int n2[1] = { 2 };
+	BufferTag tag;
+
+	memset(&tag, 0, sizeof(tag));
+	ut_jr_setup_3node(); /* declared {0,1,2}, all members */
+
+	/* --- Episode 1: node 1 rejoins and completes (all survivors re-declare). --- */
+	ut_mock_epoch = 10;
+	ut_jr_build_bitmap(join1, n1, 1);
+	cluster_grd_arm_join_pcm_fence(join1);
+	ut_mock_static_master = 1; /* a node-1-home block */
+	cluster_grd_recovery_mark_peer_done(0, 10);
+	cluster_grd_recovery_mark_peer_done(1, 10);
+	cluster_grd_recovery_mark_peer_done(2, 10);
+	UT_ASSERT(cluster_grd_block_view_rebuilt(tag)); /* episode 1 converged */
+
+	/* --- Episode 2: node 2 rejoins.  node 1 is now a steady survivor whose held
+	 * node-2-home blocks MUST be re-declared before node 2 may cold-serve. --- */
+	ut_mock_epoch = 20;
+	ut_jr_build_bitmap(join2, n2, 1);
+	cluster_grd_arm_join_pcm_fence(join2);
+	ut_mock_static_master = 2; /* a node-2-home block (the new joiner's home) */
+
+	/* Only the OTHER survivor (node 0) has re-declared for episode 2; node 1 has
+	 * NOT.  node 1's stale episode-1 fence bit must NOT exclude it from the
+	 * barrier — it must still gate the fence lift. */
+	cluster_grd_recovery_mark_peer_done(0, 20);
+	UT_ASSERT(!cluster_grd_block_view_rebuilt(tag)); /* must still wait for node 1 */
+
+	/* Once node 1 re-declares for episode 2 the barrier converges and lifts. */
+	cluster_grd_recovery_mark_peer_done(1, 20);
+	UT_ASSERT(cluster_grd_block_view_rebuilt(tag));
+}
+
 
 int
 /* cppcheck-suppress constParameter
@@ -3599,7 +3646,7 @@ int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
 	UT_PLAN(
-		73); /* prior 42; spec-5.3:+6; 5.5:+3; +1 release reclaim; 5.8 D1b:+4 (U2a-d); D1c:+2 (U3a-b); D1e:+2 (U4a-b); 5.9 Hardening:+1 (convert ABA); spec-5.16:+12 (join-remaster U1-U5/U10-U16) */
+		74); /* prior 42; spec-5.3:+6; 5.5:+3; +1 release reclaim; 5.8 D1b:+4 (U2a-d); D1c:+2 (U3a-b); D1e:+2 (U4a-b); 5.9 Hardening:+1 (convert ABA); spec-5.16:+12 (join-remaster U1-U5/U10-U16); +1 (U17 cross-episode fence Hardening) */
 
 	UT_RUN(test_grd_clusterresid_size_16);
 	UT_RUN(test_grd_resid_encode_decode_roundtrip);
@@ -3695,6 +3742,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_jr_u14_fence_arm_monotonic_and_scope);
 	UT_RUN(test_jr_u15_master_side_gate_decision);
 	UT_RUN(test_jr_u16_pre_member_guard);
+	UT_RUN(test_jr_u17_stale_recipient_not_excluded_next_episode);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
