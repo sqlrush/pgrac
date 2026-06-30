@@ -81,6 +81,16 @@ int cluster_recovery_workers_max = 4;
 /* spec-4.5 D9: merged k-way recovery (default OFF, Q8) + wait timeout. */
 bool cluster_merged_recovery = false;
 int cluster_recovery_merge_wait_timeout = 10000;
+/* spec-6.5: cluster-aware backup / restore / PITR target knobs. */
+char *cluster_recovery_target_scn = NULL;
+char *cluster_recovery_target_cluster_time = NULL;
+char *cluster_recovery_target_name = NULL;
+int cluster_recovery_target_action = CLUSTER_RECOVERY_TARGET_ACTION_PAUSE;
+bool cluster_enable_pitr_restore_points = false;
+int cluster_pitr_restore_point_interval_ms = 0;
+int cluster_backup_wal_retention = 0;
+int cluster_backup_parallel_channels = 1;
+int cluster_backup_manifest_checksums = CLUSTER_BACKUP_MANIFEST_CHECKSUM_CRC32C;
 int cluster_shared_storage_backend = CLUSTER_SHARED_FS_BACKEND_STUB;
 /* spec-4.5a D2: shared data root for the cluster_fs (shared_fs) backend. */
 char *cluster_shared_data_dir = NULL;
@@ -817,6 +827,16 @@ static const struct config_enum_entry cluster_shared_storage_backend_options[]
 		{ "multi_attach", CLUSTER_SHARED_FS_BACKEND_MULTI_ATTACH, false },
 		{ NULL, 0, false } };
 
+static const struct config_enum_entry cluster_recovery_target_action_options[]
+	= { { "pause", CLUSTER_RECOVERY_TARGET_ACTION_PAUSE, false },
+		{ "promote", CLUSTER_RECOVERY_TARGET_ACTION_PROMOTE, false },
+		{ "shutdown", CLUSTER_RECOVERY_TARGET_ACTION_SHUTDOWN, false },
+		{ NULL, 0, false } };
+
+static const struct config_enum_entry cluster_backup_manifest_checksum_options[]
+	= { { "crc32c", CLUSTER_BACKUP_MANIFEST_CHECKSUM_CRC32C, false },
+		{ NULL, 0, false } };
+
 
 /*
  * check_cluster_shared_data_dir -- GUC check_hook for
@@ -1144,6 +1164,77 @@ cluster_init_guc(void)
 		gettext_noop("After this, the coordinator re-validates candidate streams inline."),
 		&cluster_recovery_merge_wait_timeout, 10000, 0, 600000, PGC_POSTMASTER, GUC_UNIT_MS, NULL,
 		NULL, NULL);
+
+	DefineCustomStringVariable(
+		"cluster.recovery_target_scn",
+		gettext_noop("Cluster PITR target SCN."),
+		gettext_noop("When set, cluster PITR status resolves the requested SCN against "
+					 "cluster restore points and refuses unreachable targets."),
+		&cluster_recovery_target_scn, "", PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	DefineCustomStringVariable(
+		"cluster.recovery_target_cluster_time",
+		gettext_noop("Cluster PITR target timestamp."),
+		gettext_noop("Reserved target timestamp for cluster-aware recovery planning. "
+					 "Spec-6.5 exposes the configuration and status surface; the "
+					 "startup recovery action remains fail-closed until the "
+					 "coordinator can prove all WAL threads are present."),
+		&cluster_recovery_target_cluster_time, "", PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	DefineCustomStringVariable(
+		"cluster.recovery_target_name",
+		gettext_noop("Cluster PITR named restore point target."),
+		gettext_noop("Reserved named cluster restore-point target.  The status view "
+					 "reports restore points produced by pg_cluster_create_restore_point."),
+		&cluster_recovery_target_name, "", PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	DefineCustomEnumVariable(
+		"cluster.recovery_target_action",
+		gettext_noop("Action to take when a cluster PITR target is reached."),
+		gettext_noop("Accepted values are pause, promote, and shutdown.  The setting is "
+					 "advertised with the 6.5 target surface; startup recovery remains "
+					 "fail-closed until every required WAL thread is proven present."),
+		&cluster_recovery_target_action, CLUSTER_RECOVERY_TARGET_ACTION_PAUSE,
+		cluster_recovery_target_action_options, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"cluster.enable_pitr_restore_points",
+		gettext_noop("Enable automatic cluster restore point creation."),
+		gettext_noop("Manual pg_cluster_create_restore_point is available regardless of "
+					 "this setting.  Automatic background creation is reserved until a "
+					 "cluster-wide cut coordinator is present."),
+		&cluster_enable_pitr_restore_points, false, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.pitr_restore_point_interval_ms",
+		gettext_noop("Interval for automatic cluster PITR restore points."),
+		gettext_noop("Zero disables automatic restore point scheduling."),
+		&cluster_pitr_restore_point_interval_ms, 0, 0, 86400000, PGC_SIGHUP, GUC_UNIT_MS, NULL,
+		NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.backup_wal_retention",
+		gettext_noop("Cluster backup WAL retention hint in megabytes."),
+		gettext_noop("The 6.5 manifest/status surface records the setting; actual "
+					 "multi-thread retention enforcement is deferred to the backup-set "
+					 "writer."),
+		&cluster_backup_wal_retention, 0, 0, INT_MAX, PGC_SIGHUP, GUC_UNIT_MB, NULL, NULL,
+		NULL);
+
+	DefineCustomIntVariable(
+		"cluster.backup_parallel_channels",
+		gettext_noop("Maximum cluster backup copy channels."),
+		gettext_noop("Reserved capacity knob for the cluster backup-set writer."),
+		&cluster_backup_parallel_channels, 1, 1, CLUSTER_MAX_NODES, PGC_SIGHUP, 0, NULL, NULL,
+		NULL);
+
+	DefineCustomEnumVariable(
+		"cluster.backup_manifest_checksums",
+		gettext_noop("Checksum mode for cluster backup manifests."),
+		gettext_noop("crc32c protects the in-memory and SQL-visible manifest substrate; "
+					 "6.5 does not provide an unchecked manifest mode."),
+		&cluster_backup_manifest_checksums, CLUSTER_BACKUP_MANIFEST_CHECKSUM_CRC32C,
+		cluster_backup_manifest_checksum_options, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	/*
 	 * cluster.injection_points -- comma-separated list of injection point

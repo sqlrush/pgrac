@@ -1685,6 +1685,71 @@ GRANT SELECT ON pg_cluster_node_removal_state TO PUBLIC;
 -- REVOKE EXECUTE FROM PUBLIC for defense-in-depth (L7).
 REVOKE ALL ON FUNCTION pg_cluster_remove_node(int) FROM PUBLIC;
 
+-- PGRAC: cluster-aware backup / restore / PITR surface (spec-6.5).
+--   The state/history/restore-point/PITR views are read-only observability.
+--   Mutating entry points are superuser-gated in C and revoked from PUBLIC.
+CREATE VIEW pg_stat_cluster_backup AS
+    SELECT in_progress,
+           backup_id,
+           coordinator_node_id,
+           start_redo_lsn,
+           checkpoint_lsn,
+           stop_cut_lsn,
+           consistent_scn,
+           manifest_crc,
+           started_at,
+           stopped_at,
+           backup_parallel_channels,
+           backup_wal_retention,
+           restore_points_enabled,
+           restore_point_interval_ms
+      FROM cluster_get_backup_state();
+
+REVOKE ALL ON pg_stat_cluster_backup FROM PUBLIC;
+GRANT SELECT ON pg_stat_cluster_backup TO PUBLIC;
+
+CREATE VIEW pg_cluster_backup_history AS
+    SELECT backup_id,
+           consistent_scn,
+           scn_durable_peak,
+           timeline,
+           catversion,
+           storage_id,
+           node_count,
+           thread_count,
+           manifest_crc
+      FROM cluster_get_backup_history();
+
+REVOKE ALL ON pg_cluster_backup_history FROM PUBLIC;
+GRANT SELECT ON pg_cluster_backup_history TO PUBLIC;
+
+CREATE VIEW pg_cluster_restore_points AS
+    SELECT restore_point_name,
+           cut_scn,
+           thread_count,
+           incarnation,
+           created_at
+      FROM cluster_get_restore_points();
+
+REVOKE ALL ON pg_cluster_restore_points FROM PUBLIC;
+GRANT SELECT ON pg_cluster_restore_points TO PUBLIC;
+
+CREATE VIEW pg_cluster_pitr_status AS
+    SELECT target_type,
+           target_action,
+           reachable,
+           reason,
+           resolved_scn,
+           restore_point_name
+      FROM cluster_get_pitr_status();
+
+REVOKE ALL ON pg_cluster_pitr_status FROM PUBLIC;
+GRANT SELECT ON pg_cluster_pitr_status TO PUBLIC;
+
+REVOKE ALL ON FUNCTION pg_cluster_backup_start(text, bool) FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_cluster_backup_stop(bool) FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_cluster_create_restore_point(text) FROM PUBLIC;
+
 -- PGRAC: pg_cluster_ic_msg_types (spec-2.3 D8; 2026-05-08).
 --   Lists every IC message type registered in the process-local
 --   dispatch_table[] under cluster_ic_router.c.  Diagnostic /
