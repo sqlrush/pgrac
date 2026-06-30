@@ -182,19 +182,21 @@ SKIP:
 	my $a_delta = $tg - $taa;     # pp the bespoke record removed vs generic
 	my $b_delta = $taa - $tbb;    # pp the undo-pin fast path removed vs A-only
 
-	note("=== spec-3.26 lever isolation (same-runner, median of "
+	# diag() (STDERR) so the medians reach the captured CI console log even
+	# without prove -v (note() STDOUT comments are suppressed; mirrors t/328).
+	diag("=== spec-3.26 lever isolation (same-runner, median of "
 		  . scalar(@tab)
 		  . " interleaved rounds) ===");
-	note(sprintf("  native (cluster off) median tps        = %.0f", median(@nat)));
-	note(sprintf("  arm2 generic + no-fastpath  tax = %6.2f%%  (tps %.0f)  [pre-A/B baseline]",
+	diag(sprintf("  native (cluster off) median tps        = %.0f", median(@nat)));
+	diag(sprintf("  arm2 generic + no-fastpath  tax = %6.2f%%  (tps %.0f)  [pre-A/B baseline]",
 		$tg, median(@gen)));
-	note(sprintf("  arm3 bespoke + no-fastpath  tax = %6.2f%%  (tps %.0f)  [Lever A only]",
+	diag(sprintf("  arm3 bespoke + no-fastpath  tax = %6.2f%%  (tps %.0f)  [Lever A only]",
 		$taa, median(@a)));
-	note(sprintf("  arm4 bespoke + fastpath     tax = %6.2f%%  (tps %.0f)  [Lever A + B]",
+	diag(sprintf("  arm4 bespoke + fastpath     tax = %6.2f%%  (tps %.0f)  [Lever A + B]",
 		$tbb, median(@ab)));
-	note(sprintf("  Lever A delta (generic -> bespoke)     = %+.2f pp", $a_delta));
-	note(sprintf("  Lever B delta (no-fastpath -> fastpath)= %+.2f pp", $b_delta));
-	note(sprintf("  A+B median tax = %.2f%%   <= 5%% ? %s   (REPORT-ONLY, not a gate)",
+	diag(sprintf("  Lever A delta (generic -> bespoke)     = %+.2f pp", $a_delta));
+	diag(sprintf("  Lever B delta (no-fastpath -> fastpath)= %+.2f pp", $b_delta));
+	diag(sprintf("  A+B median tax = %.2f%%   <= 5%% ? %s   (REPORT-ONLY, not a gate)",
 		$tbb, ($tbb <= 5.0 ? 'YES' : 'NO')));
 
 	ok(1, "lever-isolation measurement reported (report-only; ship decision is manual)");
