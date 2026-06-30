@@ -33,6 +33,9 @@
 #           FATAL 53RA2; the slot is never overwritten (round-2 P1)
 #      L12  registry truncated to 512B -> startup FATAL 53RA2 (fixed
 #           66048; never resized in place) (round-2 P1)
+#      L2b  checkpoint redo publish also advances highest_lsn in the same
+#           owner slot write, so readers never see redo > highest between
+#           checkpoint and the next cluster_stats tick.
 #
 #    Author: SqlRush <sqlrush@gmail.com>
 #    Spec: spec-4.2-wal-thread-metadata-catalog.md (FROZEN v1.0)
@@ -105,6 +108,20 @@ while (time() < $deadline) {
 }
 cmp_ok($ts1, '>', $ts0, "L2 registry_last_updated advances ($ts0 -> $ts1)");
 isnt($lsn1, $lsn0, 'L2 registry_highest_lsn advances with WAL volume');
+
+# ============================================================
+# L2b: checkpoint redo publish keeps the slot internally usable immediately.
+# ============================================================
+$node->safe_psql('postgres',
+	q{CREATE TABLE t244_ckpt AS SELECT g FROM generate_series(1, 1000) g});
+$node->safe_psql('postgres', q{CHECKPOINT});
+{
+	my $slot = read_slot_raw($regfile, 4);
+	cmp_ok($slot->{checkpoint_redo_lsn}, '>', 0,
+		'L2b checkpoint_redo_lsn published after CHECKPOINT');
+	cmp_ok($slot->{highest_lsn}, '>', $slot->{checkpoint_redo_lsn},
+		'L2b checkpoint publish leaves highest_lsn past checkpoint_redo_lsn');
+}
 
 # ============================================================
 # L3: clean stop publishes STOPPED.

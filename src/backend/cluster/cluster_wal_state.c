@@ -469,7 +469,19 @@ own_slot_modify(void (*mutate)(ClusterWalStateSlot *, uint64), uint64 arg)
 static void
 mutate_checkpoint_redo(ClusterWalStateSlot *s, uint64 v)
 {
+	XLogRecPtr write_lsn;
+
 	s->checkpoint_redo_lsn = v;
+
+	/*
+	 * CreateCheckPoint publishes checkpoint_redo_lsn synchronously, while the
+	 * normal highest_lsn watermark is refreshed later by cluster_stats.  Do not
+	 * expose a transient slot with new redo but stale highest_lsn: online thread
+	 * recovery treats highest_lsn <= checkpoint_redo_lsn as fail-closed.
+	 */
+	write_lsn = GetXLogWriteRecPtr();
+	if (s->highest_lsn < (uint64)write_lsn)
+		s->highest_lsn = (uint64)write_lsn;
 }
 
 static void
