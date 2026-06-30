@@ -36,6 +36,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/storage/cluster_undo_xlog.h"	/* RM_CLUSTER_UNDO_ID handlers */
+#include "cluster/storage/cluster_itl_xlog.h"	/* RM_CLUSTER_ITL_ID handlers (spec-3.26) */
 #endif
 
 /* must be kept in sync with RmgrData definition in xlog_internal.h */

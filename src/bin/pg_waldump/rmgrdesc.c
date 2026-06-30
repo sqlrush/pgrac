@@ -24,6 +24,7 @@
 #include "access/xlog_internal.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/storage/cluster_undo_xlog.h"	/* spec-1.22 D14a */
+#include "cluster/storage/cluster_itl_xlog.h"	/* spec-3.26: RM_CLUSTER_ITL desc/identify */
 #endif
 #include "catalog/storage_xlog.h"
 #include "commands/dbcommands_xlog.h"
