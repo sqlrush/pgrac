@@ -1156,21 +1156,22 @@ cluster_reconfig_join_publish_proven(uint64 admitted_epoch)
 static void
 cluster_reconfig_drive_joins(int coordinator)
 {
+	ClusterReconfigState *state = ReconfigShmem;
 	uint8 join_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
 	uint8 pending_snapshot[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
 	uint64 joiner_incarnations[CLUSTER_MAX_NODES];
 	int n_join;
 	int i;
 
-	if (ReconfigShmem == NULL)
+	if (state == NULL)
 		return;
 
 	/* Phase-1 detection + a snapshot of the current pending set, under the lock
 	 * (compute_join_bitmap reads membership_state). */
-	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	LWLockAcquire(&state->lock, LW_SHARED);
 	n_join = cluster_reconfig_compute_join_bitmap(join_bitmap);
-	memcpy(pending_snapshot, ReconfigShmem->pending_join_bitmap, sizeof(pending_snapshot));
-	LWLockRelease(&ReconfigShmem->lock);
+	memcpy(pending_snapshot, state->pending_join_bitmap, sizeof(pending_snapshot));
+	LWLockRelease(&state->lock);
 
 	if (n_join > 0) {
 		memset(joiner_incarnations, 0, sizeof(joiner_incarnations));

@@ -353,7 +353,7 @@ cluster_backup_wire_request_valid(const ClusterBackupWireRequest *request)
 		return false;
 	if (request->magic != CLUSTER_BACKUP_IC_MAGIC || request->version != CLUSTER_BACKUP_IC_VERSION)
 		return false;
-	if (request->op <= CLUSTER_BACKUP_WIRE_OP_NONE
+	if (request->op == CLUSTER_BACKUP_WIRE_OP_NONE
 		|| request->op > CLUSTER_BACKUP_WIRE_OP_RESTORE_POINT)
 		return false;
 	if (request->request_id == 0)
@@ -394,7 +394,7 @@ cluster_backup_wire_ack_valid(const ClusterBackupWireAck *ack)
 		return false;
 	if (ack->magic != CLUSTER_BACKUP_IC_MAGIC || ack->version != CLUSTER_BACKUP_IC_VERSION)
 		return false;
-	if (ack->op <= CLUSTER_BACKUP_WIRE_OP_NONE || ack->op > CLUSTER_BACKUP_WIRE_OP_RESTORE_POINT)
+	if (ack->op == CLUSTER_BACKUP_WIRE_OP_NONE || ack->op > CLUSTER_BACKUP_WIRE_OP_RESTORE_POINT)
 		return false;
 	if (ack->result > CLUSTER_BACKUP_WIRE_RESULT_EXECUTOR_ERROR)
 		return false;
