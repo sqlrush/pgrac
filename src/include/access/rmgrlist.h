@@ -75,4 +75,9 @@ PG_RMGR(RM_LOGICALMSG_ID, "LogicalMessage", logicalmsg_redo, logicalmsg_desc, lo
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC stage 1.22: see banner above + spec-1.22 §D14a. */
 PG_RMGR(RM_CLUSTER_UNDO_ID, "ClusterUndo", cluster_undo_redo, cluster_undo_desc, cluster_undo_identify, NULL, NULL, NULL, NULL)
+/* PGRAC spec-3.26: bespoke ITL-finish WAL (replaces RM_GENERIC finish, drops
+ * the whole-page byte-diff CPU).  Carries heap shared-block refs -> recovery
+ * classifier routes SHARED (cluster_recovery_merge.h).  Appended after
+ * RM_CLUSTER_UNDO so existing WAL ids stay stable; bumps XLOG_PAGE_MAGIC. */
+PG_RMGR(RM_CLUSTER_ITL_ID, "ClusterITL", cluster_itl_redo, cluster_itl_desc, cluster_itl_identify, NULL, NULL, NULL, NULL)
 #endif

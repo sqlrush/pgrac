@@ -12,6 +12,7 @@ OBJS = \
 	brindesc.o \
 	clogdesc.o \
 	clusterundodesc.o \
+	clusteritldesc.o \
 	committsdesc.o \
 	dbasedesc.o \
 	genericdesc.o \
