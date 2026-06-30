@@ -91,6 +91,24 @@
  */
 #define GCS_BLOCK_REPLY_NO_FORWARDING_MASTER (-1)
 
+/*
+ * spec-5.19 (MG-B / 2-node write path): per-backend cap on concurrently
+ * outstanding block requests.  A backend reserves one of these slots per
+ * in-flight request and assigns a strictly-increasing per-backend request_id;
+ * once all slots are busy it cannot issue another request.  This bounds the
+ * sender's retransmit window: a request whose id is <= (current_id -
+ * CLUSTER_GCS_BLOCK_MAX_OUTSTANDING_PER_BACKEND) is provably complete (the
+ * backend reused its slot for a newer request) and will never be
+ * retransmitted.  The master-side dedup table (cluster_gcs_block_dedup.c)
+ * relies on this to reclaim superseded cached replies eagerly instead of
+ * waiting for the age-based TTL sweep -- without it a sustained single-node
+ * writer (bulk COPY / pgbench) overruns the fixed dedup table and the master
+ * answers DENIED_DEDUP_FULL until the retransmit budget is exhausted.  This is
+ * the single source of truth: cluster_gcs_block.c derives its per-backend
+ * outstanding-slot count from it so the two can never drift.
+ */
+#define CLUSTER_GCS_BLOCK_MAX_OUTSTANDING_PER_BACKEND 8
+
 
 /* ============================================================
  * GcsBlockReplyStatus -- reply status code carried in

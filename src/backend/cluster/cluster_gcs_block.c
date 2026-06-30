@@ -88,7 +88,9 @@
  *	backend slot without scanning all backends.
  * ============================================================ */
 
-#define MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND 8
+/* spec-5.19: single source of truth lives in the header so the dedup
+ * eager-reclaim window (cluster_gcs_block_dedup.c) tracks this exactly. */
+#define MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND CLUSTER_GCS_BLOCK_MAX_OUTSTANDING_PER_BACKEND
 
 typedef struct ClusterGcsBlockOutstandingSlot {
 	bool in_use;

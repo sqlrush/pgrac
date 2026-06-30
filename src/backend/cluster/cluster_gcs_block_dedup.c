@@ -241,6 +241,35 @@ cluster_gcs_block_dedup_lookup_or_register(const GcsBlockDedupKey *key, BufferTa
 		return GCS_BLOCK_DEDUP_CACHED_REPLY;
 	}
 
+	/*
+	 * spec-5.19 (2-node write path) — eager reclaim of the superseded cached
+	 * reply BEFORE claiming a new slot.  request_id is a per-backend monotonic
+	 * counter and a backend keeps at most
+	 * CLUSTER_GCS_BLOCK_MAX_OUTSTANDING_PER_BACKEND requests outstanding, so the
+	 * request exactly that many ids older than this one is provably complete:
+	 * the sender reused its slot and will never retransmit it, hence its cached
+	 * reply can no longer absorb a retransmit.  Dropping it here frees this
+	 * backend's own stale slot and bounds the master table to the
+	 * genuinely-in-flight working set (~MAX_OUTSTANDING per backend) instead of
+	 * letting completed grants linger for the full TTL window — without this a
+	 * sustained single writer (bulk COPY / pgbench) overruns the fixed table and
+	 * the master answers DENIED_DEDUP_FULL until the retransmit budget exhausts.
+	 * This is strictly safer than the age-based TTL sweep below (which can evict
+	 * an entry the sender may still be retransmitting): we only drop requests
+	 * provably outside the sender's outstanding window.  A request issued under
+	 * an older epoch (key differs only in request_id) is left to the TTL /
+	 * node-dead path, which is harmless.
+	 */
+	if (key->request_id > CLUSTER_GCS_BLOCK_MAX_OUTSTANDING_PER_BACKEND) {
+		GcsBlockDedupKey superseded = *key;
+		bool sfound;
+
+		superseded.request_id = key->request_id - CLUSTER_GCS_BLOCK_MAX_OUTSTANDING_PER_BACKEND;
+		(void)hash_search(cluster_gcs_block_dedup_htab, &superseded, HASH_REMOVE, &sfound);
+		if (sfound)
+			pg_atomic_fetch_sub_u32(&cluster_gcs_block_dedup_shared->entry_count, 1);
+	}
+
 	/* MISS path — insert new in-flight slot.  HASH_ENTER_NULL → may fail
 	 * with cap reached; convert to FULL fail-closed (HC92). */
 	entry = (GcsBlockDedupEntry *)hash_search(cluster_gcs_block_dedup_htab, key, HASH_ENTER_NULL,
