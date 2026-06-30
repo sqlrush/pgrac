@@ -39,7 +39,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_xlog test_cluster_tt_slot test_cluster_undo_segment \
         test_cluster_epoch test_cluster_fence test_cluster_reconfig \
         test_cluster_ges test_cluster_grd test_cluster_grd_starvation test_cluster_lmd test_cluster_lmd_graph test_cluster_lmd_wait_state test_cluster_cancel_token test_cluster_lmd_probe_collector test_cluster_lock_acquire test_cluster_advisory \
-        test_cluster_tt_slot_allocator test_cluster_itl_reader_real_triple \
+        test_cluster_tt_slot_allocator test_cluster_itl_reader_real_triple test_cluster_itl_finish_wal \
         test_cluster_itl_cleanout test_cluster_visibility_inject test_cluster_itl_cleanout_perf \
         test_cluster_heap_lock_tuple test_cluster_perf_gates \
         test_cluster_subtrans test_cluster_multixact test_cluster_undo_format \
@@ -1290,6 +1290,16 @@ test_cluster_tt_slot_allocator: test_cluster_tt_slot_allocator.c unit_test.h \
 # a hand-constructed Page + ItlSlotData fixture.
 CLUSTER_ITL_O = $(top_builddir)/src/backend/cluster/cluster_itl.o
 test_cluster_itl_reader_real_triple: test_cluster_itl_reader_real_triple.c unit_test.h \
+		$(CLUSTER_VERSION_O) $(CLUSTER_ITL_O) $(CLUSTER_UBA_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_ITL_O) $(CLUSTER_UBA_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-3.26 D7: test_cluster_itl_finish_wal — byte-equivalence of the bespoke
+# RM_CLUSTER_ITL finish redo vs the primary itl_finish_stamp_page result, on a
+# hand-constructed ITL page fixture (links cluster_itl.o for the shared apply).
+test_cluster_itl_finish_wal: test_cluster_itl_finish_wal.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_ITL_O) $(CLUSTER_UBA_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_ITL_O) $(CLUSTER_UBA_O) \
