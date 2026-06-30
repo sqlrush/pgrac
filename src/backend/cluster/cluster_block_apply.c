@@ -36,12 +36,14 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "access/heapam_xlog.h"	/* spec-3.26: xl_heap_itl_delta_block */
 #include "access/rmgr.h"
 #include "access/xlogreader.h"
 #include "access/xlogrecord.h"
 #include "storage/bufpage.h"
 #include "storage/off.h"
 #include "cluster/cluster_block_apply.h"
+#include "cluster/cluster_itl.h"	/* spec-3.26: RM_CLUSTER_ITL delta apply helper */
 
 /*
  * cluster_block_apply_fpi -- restore a full-page image onto a detached page.
@@ -148,6 +150,33 @@ cluster_block_apply_generic(XLogReaderState *record, uint8 block_id, char *page)
 }
 
 /*
+ * cluster_block_apply_clusteritl -- apply one RM_CLUSTER_ITL (spec-3.26
+ *		ITL-finish) record's block-local delta to a detached page.
+ *
+ *	Reuses the shared slot-stamp helper cluster_itl_redo_apply_block_local_delta
+ *	(htup = NULL: a finish record carries no tuple) -- the SAME helper the
+ *	buffered redo (cluster_itl_redo) and the inline DML ITL-delta redo use, so
+ *	the reconstructed page is byte-identical to PG real redo (8.A; t/256
+ *	differential).  A missing / undersized delta fails closed (FAILED) rather
+ *	than risking a wrong-block install.
+ */
+static ClusterBlkApplyResult
+cluster_block_apply_clusteritl(XLogReaderState *record, uint8 block_id, char *page)
+{
+	char *delta;
+	Size delta_size;
+
+	delta = XLogRecGetBlockData(record, block_id, &delta_size);
+	if (delta == NULL || delta_size < offsetof(xl_heap_itl_delta_block, deltas))
+		return CLUSTER_BLKAPPLY_FAILED;
+
+	(void) cluster_itl_redo_apply_block_local_delta(page, NULL, delta);
+
+	PageSetLSN(page, record->EndRecPtr);
+	return CLUSTER_BLKAPPLY_OK;
+}
+
+/*
  * cluster_block_apply_delta -- dispatch a no-image (delta) record to its
  *		per-rmgr single-block applicator.
  *
@@ -165,6 +194,9 @@ cluster_block_apply_delta(XLogReaderState *record, uint8 block_id, char *page)
 	switch (XLogRecGetRmid(record)) {
 	case RM_GENERIC_ID:
 		return cluster_block_apply_generic(record, block_id, page);
+
+	case RM_CLUSTER_ITL_ID:
+		return cluster_block_apply_clusteritl(record, block_id, page);
 
 	case RM_HEAP_ID:
 		return cluster_block_apply_heap(record, block_id, page);

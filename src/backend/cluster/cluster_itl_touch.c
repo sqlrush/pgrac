@@ -46,11 +46,16 @@
 #include "postgres.h"
 
 #include "access/generic_xlog.h" /* GenericXLog delta WAL (spec-3.4a D8) */
+#include "access/heapam_xlog.h"  /* xl_heap_itl_delta(_block) (spec-3.26) */
+#include "access/rmgr.h"		  /* RM_CLUSTER_ITL_ID (spec-3.26) */
+#include "access/xloginsert.h"	  /* bespoke ITL-finish WAL emit (spec-3.26) */
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h" /* cluster_enabled */
 #include "cluster/cluster_itl.h" /* stamp_committed / stamp_aborted */
 #include "cluster/cluster_itl_touch.h"
 #include "cluster/cluster_mode.h" /* cluster_storage_mode_enabled */
+#include "cluster/storage/cluster_itl_xlog.h" /* XLOG_CLUSTER_ITL_FINISH (spec-3.26) */
+#include "miscadmin.h"			  /* START_CRIT_SECTION (spec-3.26) */
 #include "storage/bufmgr.h"		  /* ReadBufferWithoutRelcache / ReleaseBuffer */
 #include "storage/buf_internals.h"
 #include "utils/memutils.h"
@@ -493,7 +498,7 @@ itl_paged_handle_needs_wal(const ClusterItlPagedHandle *page_handle)
  * grouping consecutive pages with the same WAL requirement.
  */
 static void
-itl_finish_flush_batch(ItlFinishBatchCtx *bctx)
+itl_finish_flush_batch_generic(ItlFinishBatchCtx *bctx)
 {
 	GenericXLogState *state;
 	Buffer bufs[MAX_GENERIC_XLOG_PAGES];
@@ -532,6 +537,125 @@ itl_finish_flush_batch(ItlFinishBatchCtx *bctx)
 		itl_touch_release_buffer(bufs[p]);
 
 	bctx->npages = 0;
+}
+
+/*
+ * spec-3.26 D2: bespoke ITL-finish emit.  Stamps the touched slots directly on
+ * the real (exclusive-locked) buffer page and WAL-logs one RM_CLUSTER_ITL
+ * record carrying a block-local v1 ITL delta per page -- replacing the
+ * GenericXLog whole-page byte-diff (computeRegionDelta CPU).  One record covers
+ * every page in the batch (preserves the spec-3.4c D14 XLogInsert-count win).
+ *
+ * The page mutation + XLogInsert + PageSetLSN run inside one critical section
+ * (rule 16; mirrors GenericXLogFinish's contract -- nothing that can ereport).
+ * The delta is built from the POST-stamp slot state, so a replayed page is
+ * byte-identical to this itl_finish_stamp_page() result (spec-3.26
+ * byte-equivalence; redo reuses cluster_itl_redo_apply_block_local_delta).
+ */
+static void
+itl_finish_flush_batch_bespoke(ItlFinishBatchCtx *bctx)
+{
+	Buffer bufs[MAX_GENERIC_XLOG_PAGES];
+	Page pages[MAX_GENERIC_XLOG_PAGES];
+	char deltabuf[MAX_GENERIC_XLOG_PAGES]
+				 [offsetof(xl_heap_itl_delta_block, deltas)
+				  + CLUSTER_ITL_INITRANS_DEFAULT * sizeof(xl_heap_itl_delta)];
+	uint16 deltalen[MAX_GENERIC_XLOG_PAGES];
+	uint8 nbufs = 0;
+	uint8 p;
+
+	if (bctx->npages == 0)
+		return;
+
+	/* Acquire + exclusive-lock every buffer before the critical section. */
+	for (p = 0; p < bctx->npages; p++) {
+		const ClusterItlPagedHandle *page_handle = &bctx->pages[p];
+		ClusterItlTouchHandle key_handle;
+
+		memset(&key_handle, 0, sizeof(key_handle));
+		key_handle.rloc = page_handle->rloc;
+		key_handle.forknum = page_handle->forknum;
+		key_handle.block = page_handle->block;
+		key_handle.slot_idx = 0;
+		key_handle.flags = page_handle->flags;
+
+		bufs[nbufs] = itl_touch_acquire_buffer(&key_handle);
+		pages[nbufs] = BufferGetPage(bufs[nbufs]);
+		nbufs++;
+	}
+
+	START_CRIT_SECTION();
+
+	/* Stamp every touched slot on the real page; build the v1 delta from the
+	 * post-stamp slot state (so redo rewrites identical bytes). */
+	for (p = 0; p < bctx->npages; p++) {
+		const ClusterItlPagedHandle *page_handle = &bctx->pages[p];
+		Page page = pages[p];
+		xl_heap_itl_delta_block *hdr = (xl_heap_itl_delta_block *) deltabuf[p];
+		char *deltas = deltabuf[p] + offsetof(xl_heap_itl_delta_block, deltas);
+		uint8 i;
+
+		hdr->ndeltas = page_handle->nslots;
+		hdr->reserved = 0;
+		hdr->format_version = CLUSTER_ITL_DELTA_FORMAT_V1;
+
+		for (i = 0; i < page_handle->nslots; i++) {
+			uint8 slot_idx = page_handle->slot_indices[i];
+			ClusterItlSlotData *slot;
+			xl_heap_itl_delta d;
+
+			itl_finish_stamp_page(page, slot_idx, &bctx->finish);
+
+			slot = &ClusterPageGetItlSlots(page)[slot_idx];
+			d.slot_idx = slot_idx;
+			d.flags_after = slot->flags;
+			d.xid = slot->xid;
+			d.write_scn = slot->write_scn;
+			d.commit_scn = slot->commit_scn;
+			memcpy(deltas + (Size) i * sizeof(xl_heap_itl_delta), &d, sizeof(d));
+		}
+
+		deltalen[p] = (uint16) (offsetof(xl_heap_itl_delta_block, deltas)
+								+ (Size) page_handle->nslots * sizeof(xl_heap_itl_delta));
+	}
+
+	if (bctx->needs_wal) {
+		XLogRecPtr recptr;
+
+		XLogBeginInsert();
+		for (p = 0; p < bctx->npages; p++) {
+			XLogRegisterBuffer(p, bufs[p], REGBUF_STANDARD);
+			XLogRegisterBufData(p, deltabuf[p], deltalen[p]);
+		}
+		recptr = XLogInsert(RM_CLUSTER_ITL_ID, XLOG_CLUSTER_ITL_FINISH);
+		for (p = 0; p < bctx->npages; p++) {
+			PageSetLSN(pages[p], recptr);
+			MarkBufferDirty(bufs[p]);
+		}
+	} else {
+		for (p = 0; p < bctx->npages; p++)
+			MarkBufferDirty(bufs[p]);
+	}
+
+	END_CRIT_SECTION();
+
+	for (p = 0; p < nbufs; p++)
+		itl_touch_release_buffer(bufs[p]);
+
+	bctx->npages = 0;
+}
+
+/*
+ * itl_finish_flush_batch -- dispatch to the bespoke (default) or legacy
+ * GenericXLog finish emit per cluster.itl_finish_wal_mode (spec-3.26 D2 / Q3).
+ */
+static void
+itl_finish_flush_batch(ItlFinishBatchCtx *bctx)
+{
+	if (cluster_itl_finish_wal_mode == CLUSTER_ITL_FINISH_WAL_GENERIC)
+		itl_finish_flush_batch_generic(bctx);
+	else
+		itl_finish_flush_batch_bespoke(bctx);
 }
 
 static void
