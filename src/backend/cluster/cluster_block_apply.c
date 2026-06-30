@@ -36,14 +36,14 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
-#include "access/heapam_xlog.h"	/* spec-3.26: xl_heap_itl_delta_block */
+#include "access/heapam_xlog.h" /* spec-3.26: xl_heap_itl_delta_block */
 #include "access/rmgr.h"
 #include "access/xlogreader.h"
 #include "access/xlogrecord.h"
 #include "storage/bufpage.h"
 #include "storage/off.h"
 #include "cluster/cluster_block_apply.h"
-#include "cluster/cluster_itl.h"	/* spec-3.26: RM_CLUSTER_ITL delta apply helper */
+#include "cluster/cluster_itl.h" /* spec-3.26: RM_CLUSTER_ITL delta apply helper */
 
 /*
  * cluster_block_apply_fpi -- restore a full-page image onto a detached page.
@@ -170,7 +170,7 @@ cluster_block_apply_clusteritl(XLogReaderState *record, uint8 block_id, char *pa
 	if (delta == NULL || delta_size < offsetof(xl_heap_itl_delta_block, deltas))
 		return CLUSTER_BLKAPPLY_FAILED;
 
-	(void) cluster_itl_redo_apply_block_local_delta(page, NULL, delta);
+	(void)cluster_itl_redo_apply_block_local_delta(page, NULL, delta);
 
 	PageSetLSN(page, record->EndRecPtr);
 	return CLUSTER_BLKAPPLY_OK;

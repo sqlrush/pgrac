@@ -1018,11 +1018,10 @@ cluster_init_guc(void)
 					 "record (no whole-page byte-diff); generic keeps the legacy "
 					 "GenericXLog path for byte-equivalence verification."),
 		&cluster_itl_finish_wal_mode, CLUSTER_ITL_FINISH_WAL_BESPOKE, /* boot value */
-		cluster_itl_finish_wal_mode_options, PGC_SUSET,
-		0,	  /* flags */
-		NULL, /* check_hook */
-		NULL, /* assign_hook */
-		NULL); /* show_hook */
+		cluster_itl_finish_wal_mode_options, PGC_SUSET, 0,			  /* flags */
+		NULL,														  /* check_hook */
+		NULL,														  /* assign_hook */
+		NULL);														  /* show_hook */
 
 	/*
 	 * cluster.config_file -- path to pgrac.conf.  Default "pgrac.conf"

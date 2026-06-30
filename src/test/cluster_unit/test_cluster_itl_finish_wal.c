@@ -288,8 +288,8 @@ build_v1_delta(char *buf, char *stamped_page, const uint8 *idxs, uint8 n)
  * byte-identical to the reference itl_finish_stamp_page result.
  */
 static void
-assert_finish_byte_equal(uint8 active_flags, uint8 idx, bool is_commit, SCN wscn,
-						 SCN commit_scn, UBA uba)
+assert_finish_byte_equal(uint8 active_flags, uint8 idx, bool is_commit, SCN wscn, SCN commit_scn,
+						 UBA uba)
 {
 	static char pa[BLCKSZ];
 	static char pb[BLCKSZ];
@@ -318,22 +318,20 @@ assert_finish_byte_equal(uint8 active_flags, uint8 idx, bool is_commit, SCN wscn
 
 UT_TEST(test_t1_committed_single_byte_equal)
 {
-	assert_finish_byte_equal(ITL_FLAG_ACTIVE, 3, /* commit */ true,
-							 scn_encode(0, 100), scn_encode(0, 200),
-							 uba_encode(7, 9, 11, 13));
+	assert_finish_byte_equal(ITL_FLAG_ACTIVE, 3, /* commit */ true, scn_encode(0, 100),
+							 scn_encode(0, 200), uba_encode(7, 9, 11, 13));
 }
 
 UT_TEST(test_t2_aborted_single_byte_equal)
 {
-	assert_finish_byte_equal(ITL_FLAG_ACTIVE, 5, /* abort */ false,
-							 scn_encode(0, 100), InvalidScn, uba_encode(7, 9, 11, 13));
+	assert_finish_byte_equal(ITL_FLAG_ACTIVE, 5, /* abort */ false, scn_encode(0, 100), InvalidScn,
+							 uba_encode(7, 9, 11, 13));
 }
 
 UT_TEST(test_t3_lock_only_commit_byte_equal)
 {
-	assert_finish_byte_equal(ITL_FLAG_LOCK_ONLY_ACTIVE, 2, /* commit */ true,
-							 scn_encode(0, 100), scn_encode(0, 200),
-							 uba_encode(7, 9, 11, 13));
+	assert_finish_byte_equal(ITL_FLAG_LOCK_ONLY_ACTIVE, 2, /* commit */ true, scn_encode(0, 100),
+							 scn_encode(0, 200), uba_encode(7, 9, 11, 13));
 }
 
 UT_TEST(test_t4_uba_preserved)
@@ -355,8 +353,8 @@ UT_TEST(test_t4_uba_preserved)
 
 	/* v1 carries InvalidUba -> on-page UBA must survive unchanged on both. */
 	UT_ASSERT_EQ((int)UBA_is_invalid(slot_at(pb, idx)->undo_segment_head), 0);
-	UT_ASSERT_EQ(memcmp(&slot_at(pa, idx)->undo_segment_head,
-						&slot_at(pb, idx)->undo_segment_head, sizeof(UBA)),
+	UT_ASSERT_EQ(memcmp(&slot_at(pa, idx)->undo_segment_head, &slot_at(pb, idx)->undo_segment_head,
+						sizeof(UBA)),
 				 0);
 	UT_ASSERT_EQ(memcmp(pa, pb, BLCKSZ), 0);
 }
