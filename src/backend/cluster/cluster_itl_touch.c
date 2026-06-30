@@ -46,17 +46,17 @@
 #include "postgres.h"
 
 #include "access/generic_xlog.h" /* GenericXLog delta WAL (spec-3.4a D8) */
-#include "access/heapam_xlog.h"  /* xl_heap_itl_delta(_block) (spec-3.26) */
-#include "access/rmgr.h"		  /* RM_CLUSTER_ITL_ID (spec-3.26) */
-#include "access/xloginsert.h"	  /* bespoke ITL-finish WAL emit (spec-3.26) */
+#include "access/heapam_xlog.h"	 /* xl_heap_itl_delta(_block) (spec-3.26) */
+#include "access/rmgr.h"		 /* RM_CLUSTER_ITL_ID (spec-3.26) */
+#include "access/xloginsert.h"	 /* bespoke ITL-finish WAL emit (spec-3.26) */
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h" /* cluster_enabled */
 #include "cluster/cluster_itl.h" /* stamp_committed / stamp_aborted */
 #include "cluster/cluster_itl_touch.h"
-#include "cluster/cluster_mode.h" /* cluster_storage_mode_enabled */
+#include "cluster/cluster_mode.h"			  /* cluster_storage_mode_enabled */
 #include "cluster/storage/cluster_itl_xlog.h" /* XLOG_CLUSTER_ITL_FINISH (spec-3.26) */
-#include "miscadmin.h"			  /* START_CRIT_SECTION (spec-3.26) */
-#include "storage/bufmgr.h"		  /* ReadBufferWithoutRelcache / ReleaseBuffer */
+#include "miscadmin.h"						  /* START_CRIT_SECTION (spec-3.26) */
+#include "storage/bufmgr.h"					  /* ReadBufferWithoutRelcache / ReleaseBuffer */
 #include "storage/buf_internals.h"
 #include "utils/memutils.h"
 
@@ -591,7 +591,7 @@ itl_finish_flush_batch_bespoke(ItlFinishBatchCtx *bctx)
 	for (p = 0; p < bctx->npages; p++) {
 		const ClusterItlPagedHandle *page_handle = &bctx->pages[p];
 		Page page = pages[p];
-		xl_heap_itl_delta_block *hdr = (xl_heap_itl_delta_block *) deltabuf[p];
+		xl_heap_itl_delta_block *hdr = (xl_heap_itl_delta_block *)deltabuf[p];
 		char *deltas = deltabuf[p] + offsetof(xl_heap_itl_delta_block, deltas);
 		uint8 i;
 
@@ -612,11 +612,11 @@ itl_finish_flush_batch_bespoke(ItlFinishBatchCtx *bctx)
 			d.xid = slot->xid;
 			d.write_scn = slot->write_scn;
 			d.commit_scn = slot->commit_scn;
-			memcpy(deltas + (Size) i * sizeof(xl_heap_itl_delta), &d, sizeof(d));
+			memcpy(deltas + (Size)i * sizeof(xl_heap_itl_delta), &d, sizeof(d));
 		}
 
-		deltalen[p] = (uint16) (offsetof(xl_heap_itl_delta_block, deltas)
-								+ (Size) page_handle->nslots * sizeof(xl_heap_itl_delta));
+		deltalen[p] = (uint16)(offsetof(xl_heap_itl_delta_block, deltas)
+							   + (Size)page_handle->nslots * sizeof(xl_heap_itl_delta));
 	}
 
 	if (bctx->needs_wal) {

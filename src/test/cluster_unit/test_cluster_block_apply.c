@@ -52,6 +52,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "access/htup.h" /* HeapTupleHeader (spec-3.26 stub) */
 #include "access/rmgr.h"
 #include "access/xlogreader.h"
 #include "access/xlogrecord.h"
@@ -139,6 +140,17 @@ cluster_block_apply_heap(XLogReaderState *record, uint8 block_id, char *page)
 {
 	stub_heap_calls++;
 	return stub_heap_ret;
+}
+
+/* spec-3.26: cluster_block_apply.o now references the shared ITL slot-stamp
+ * helper (via cluster_block_apply_clusteritl).  Its byte-equivalence is
+ * test_cluster_itl_finish_wal's job; stub it here so the dispatch test links. */
+Size
+cluster_itl_redo_apply_block_local_delta(Page page pg_attribute_unused(),
+										 HeapTupleHeader htup pg_attribute_unused(),
+										 const char *itl_block_start pg_attribute_unused())
+{
+	return 0;
 }
 
 

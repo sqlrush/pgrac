@@ -58,8 +58,7 @@ cluster_itl_redo_finish(XLogReaderState *record)
 {
 	uint8 block_id;
 
-	for (block_id = 0; block_id <= XLogRecMaxBlockId(record); block_id++)
-	{
+	for (block_id = 0; block_id <= XLogRecMaxBlockId(record); block_id++) {
 		Buffer buffer;
 		XLogRedoAction action;
 
@@ -67,8 +66,7 @@ cluster_itl_redo_finish(XLogReaderState *record)
 			continue;
 
 		action = XLogReadBufferForRedo(record, block_id, &buffer);
-		if (action == BLK_NEEDS_REDO)
-		{
+		if (action == BLK_NEEDS_REDO) {
 			Page page = BufferGetPage(buffer);
 			Size datalen = 0;
 			char *blkdata = XLogRecGetBlockData(record, block_id, &datalen);
@@ -77,7 +75,7 @@ cluster_itl_redo_finish(XLogReaderState *record)
 				ereport(PANIC,
 						(errcode(ERRCODE_DATA_CORRUPTED),
 						 errmsg("XLOG_CLUSTER_ITL_FINISH redo: block %u carries no ITL delta",
-								(unsigned) block_id)));
+								(unsigned)block_id)));
 
 			/*
 			 * Apply the v1 ITL-finish delta via the shared helper.  htup = NULL:
@@ -87,7 +85,7 @@ cluster_itl_redo_finish(XLogReaderState *record)
 			 * byte-identical to the primary's itl_finish_stamp_page() result
 			 * (spec-3.26 byte-equivalence; verified by unit + crash-redo TAP).
 			 */
-			(void) cluster_itl_redo_apply_block_local_delta(page, NULL, blkdata);
+			(void)cluster_itl_redo_apply_block_local_delta(page, NULL, blkdata);
 
 			PageSetLSN(page, record->EndRecPtr);
 			MarkBufferDirty(buffer);
@@ -105,15 +103,13 @@ cluster_itl_redo(XLogReaderState *record)
 {
 	uint8 info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
 
-	switch (info)
-	{
+	switch (info) {
 	case XLOG_CLUSTER_ITL_FINISH:
 		cluster_itl_redo_finish(record);
 		break;
 	default:
-		ereport(PANIC,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("cluster_itl_redo: unknown op %u", (unsigned) info)));
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("cluster_itl_redo: unknown op %u", (unsigned)info)));
 	}
 }
 
