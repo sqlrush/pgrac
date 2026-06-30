@@ -249,7 +249,7 @@ jobs:
           # Full cluster_tap suite + 2-node ClusterPair + heartbeat round-
           # trip + Stage 2/3 medium perf matrix tests run in nightly.yml.
           make -C src/test/cluster_tap check \
-            PROVE_TESTS="t/010_views.pl t/030_acceptance.pl t/050_shared_storage_initdb.pl t/200_stage2_acceptance_capability.pl t/226_stage3_mvcc_acceptance_capability.pl t/273_stage4_recovery_acceptance_capability.pl"
+            PROVE_TESTS="t/010_views.pl t/030_acceptance.pl t/050_shared_storage_initdb.pl t/200_stage2_acceptance_capability.pl t/226_stage3_mvcc_acceptance_capability.pl t/273_stage4_recovery_acceptance_capability.pl t/332_block_device_backend.pl"
 
       - name: Upload regression diffs on failure
         if: failure()

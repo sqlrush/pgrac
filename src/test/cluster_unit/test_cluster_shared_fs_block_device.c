@@ -184,6 +184,12 @@ PathNameOpenFile(const char *fileName, int fileFlags)
 	return (File)open(fileName, fileFlags, 0600);
 }
 
+int
+BasicOpenFile(const char *fileName, int fileFlags)
+{
+	return open(fileName, fileFlags, 0600);
+}
+
 void
 FileClose(File file)
 {
@@ -206,6 +212,12 @@ int
 FileSync(File f, uint32 w pg_attribute_unused())
 {
 	return fsync((int)f);
+}
+
+int
+pg_fsync(int fd)
+{
+	return fsync(fd);
 }
 
 off_t
@@ -336,9 +348,12 @@ UT_TEST(test_block_device_roundtrip_layout_and_eof)
 {
 	const ClusterSharedFsOps *ops = &cluster_shared_fs_block_device_ops;
 	RelFileLocator rl = { .spcOid = 1663, .dbOid = 5, .relNumber = 60001 };
+	RelFileLocator rl_b = { .spcOid = 1663, .dbOid = 5, .relNumber = 60002 };
 	ClusterSharedFsHandle *handle = NULL;
+	ClusterSharedFsHandle *handle_b = NULL;
 	char path[256];
 	char in0[BLCKSZ];
+	char in_b0[BLCKSZ];
 	char in130[BLCKSZ];
 	char out[BLCKSZ];
 	int fd;
@@ -374,6 +389,20 @@ UT_TEST(test_block_device_roundtrip_layout_and_eof)
 	ops->read(handle, 0, out);
 	UT_ASSERT_EQ(memcmp(in0, out, BLCKSZ), 0);
 
+	memset(in_b0, 0x7e, sizeof(in_b0));
+	UT_ASSERT(!ops->exists(rl_b, MAIN_FORKNUM));
+	ops->create(rl_b, MAIN_FORKNUM, false, &handle_b);
+	ops->extend(handle_b, 0);
+	ops->write(handle_b, 0, in_b0);
+	memset(out, 0, sizeof(out));
+	ops->read(handle_b, 0, out);
+	UT_ASSERT_EQ(memcmp(in_b0, out, BLCKSZ), 0);
+	memset(out, 0, sizeof(out));
+	ops->read(handle, 0, out);
+	UT_ASSERT_EQ(memcmp(in0, out, BLCKSZ), 0);
+	ops->close(handle_b);
+	handle_b = NULL;
+
 	memset(in130, 0xc3, sizeof(in130));
 	ops->extend(handle, 130);
 	ops->write(handle, 130, in130);
@@ -399,7 +428,9 @@ UT_TEST(test_block_device_roundtrip_layout_and_eof)
 	ops->close(handle);
 
 	ops->unlink(rl, MAIN_FORKNUM);
+	ops->unlink(rl_b, MAIN_FORKNUM);
 	UT_ASSERT(!ops->exists(rl, MAIN_FORKNUM));
+	UT_ASSERT(!ops->exists(rl_b, MAIN_FORKNUM));
 	ops->shutdown();
 	unlink(path);
 }

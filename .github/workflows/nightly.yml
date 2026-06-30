@@ -157,6 +157,10 @@ jobs:
           # heap-ITL WAL measure / t/330 production-bench-subset / t/331 4-node
           # reconfig fault matrix.
           - { name: stage5-integrated-acceptance, ranges: "327-331", unit: false, regress: false }
+          # spec-6.0a production shared-storage backend matrix.  The first
+          # shard covers the CI-portable block_device raw-image e2e; hardware
+          # O_DIRECT / SCSI-3 PR legs remain external/manual.
+          - { name: stage6-storage, ranges: "332-339", unit: false, regress: false }
     steps:
       - name: Checkout
         uses: actions/checkout@v4

@@ -35,6 +35,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "access/xlog.h"
@@ -104,8 +105,9 @@ typedef struct ClusterRawDirEntry {
 	uint16 n_extents;
 	uint32 logical_nblocks;
 	uint64 first_extent;
+	uint64 layout_generation;
 	uint32 flags;
-	uint8 _pad[28];
+	uint8 _pad[20];
 } ClusterRawDirEntry;
 
 typedef struct ClusterRawExtentSlot {
@@ -125,6 +127,10 @@ struct ClusterSharedFsHandle {
 	RelFileLocator rlocator;
 	ForkNumber forknum;
 	uint32 entry_index;
+	uint64 cached_first_extent;
+	uint64 cached_layout_generation;
+	uint16 cached_n_extents;
+	uint32 *cached_data_extents;
 };
 
 StaticAssertDecl(sizeof(ClusterRawSuperblock) <= BLCKSZ,
@@ -132,13 +138,44 @@ StaticAssertDecl(sizeof(ClusterRawSuperblock) <= BLCKSZ,
 StaticAssertDecl(sizeof(ClusterRawDirEntry) == 64, "raw dir entry ABI must stay 64 bytes");
 StaticAssertDecl(sizeof(ClusterRawExtentSlot) == 16, "raw extent slot ABI must stay 16 bytes");
 
-static File cluster_raw_device_file = -1;
+static int cluster_raw_device_fd = -1;
 static uint64 cluster_raw_total_extents = 0;
 
 #define CLUSTER_RAW_DIR_MAX_ENTRIES (CLUSTER_RAW_DIR_REGION_BYTES / sizeof(ClusterRawDirEntry))
 #define CLUSTER_RAW_SLOT_REGION_OFF CLUSTER_RAW_DIR_REGION_BYTES
 #define CLUSTER_RAW_SLOT_MAX                                                                       \
 	((CLUSTER_RAW_EXTENT_SIZE - CLUSTER_RAW_SLOT_REGION_OFF) / sizeof(ClusterRawExtentSlot))
+
+static int
+raw_device_read(void *buffer, size_t amount, off_t offset, uint32 wait_event_info)
+{
+	(void)wait_event_info;
+	return (int)pg_pread(cluster_raw_device_fd, buffer, amount, offset);
+}
+
+static int
+raw_device_write(const void *buffer, size_t amount, off_t offset, uint32 wait_event_info)
+{
+	(void)wait_event_info;
+	return (int)pg_pwrite(cluster_raw_device_fd, buffer, amount, offset);
+}
+
+static int
+raw_device_sync(uint32 wait_event_info)
+{
+	(void)wait_event_info;
+	return pg_fsync(cluster_raw_device_fd);
+}
+
+static off_t
+raw_device_size(void)
+{
+	struct stat st;
+
+	if (fstat(cluster_raw_device_fd, &st) != 0)
+		return -1;
+	return st.st_size;
+}
 
 static uint64
 raw_extent_offset(uint64 extent)
@@ -204,12 +241,11 @@ raw_read_page(uint64 offset, PGIOAlignedBlock *page)
 {
 	int nbytes;
 
-	if (cluster_raw_device_file < 0 || offset % BLCKSZ != 0)
+	if (cluster_raw_device_fd < 0 || offset % BLCKSZ != 0)
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_STORAGE_IO_ALIGNMENT),
 						errmsg("raw layout read offset is not BLCKSZ-aligned")));
 
-	nbytes = FileRead(cluster_raw_device_file, page->data, BLCKSZ, (off_t)offset,
-					  WAIT_EVENT_DATA_FILE_READ);
+	nbytes = raw_device_read(page->data, BLCKSZ, (off_t)offset, WAIT_EVENT_DATA_FILE_READ);
 	if (nbytes < 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
@@ -227,7 +263,7 @@ raw_write_page(uint64 offset, const char *image, bool wal_log)
 	XLogRecPtr lsn = InvalidXLogRecPtr;
 	int nbytes;
 
-	if (cluster_raw_device_file < 0 || image == NULL || offset % BLCKSZ != 0)
+	if (cluster_raw_device_fd < 0 || image == NULL || offset % BLCKSZ != 0)
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_STORAGE_IO_ALIGNMENT),
 						errmsg("raw layout write image or offset is invalid")));
 
@@ -240,8 +276,7 @@ raw_write_page(uint64 offset, const char *image, bool wal_log)
 		XLogFlush(lsn);
 
 	memcpy(io.data, image, BLCKSZ);
-	nbytes = FileWrite(cluster_raw_device_file, io.data, BLCKSZ, (off_t)offset,
-					   WAIT_EVENT_DATA_FILE_WRITE);
+	nbytes = raw_device_write(io.data, BLCKSZ, (off_t)offset, WAIT_EVENT_DATA_FILE_WRITE);
 	if (nbytes < 0)
 		ereport(ERROR, (errcode_for_file_access(),
 						errmsg("could not write raw layout page at offset " UINT64_FORMAT ": %m",
@@ -478,7 +513,7 @@ raw_layout_lock(RawLayoutLock *lock)
 	memset(lock, 0, sizeof(*lock));
 
 	if (!cluster_conf_has_peers() || MyProc == NULL) {
-		fd = FileGetRawDesc(cluster_raw_device_file);
+		fd = cluster_raw_device_fd;
 		if (fd < 0)
 			ereport(ERROR, (errcode_for_file_access(),
 							errmsg("could not access raw block device for layout lock: %m")));
@@ -524,7 +559,7 @@ raw_layout_unlock(RawLayoutLock *lock)
 	if (lock->coordinated)
 		(void)cluster_lock_acquire_s6_release(&lock->req);
 	else {
-		fd = FileGetRawDesc(cluster_raw_device_file);
+		fd = cluster_raw_device_fd;
 		if (fd >= 0 && flock(fd, LOCK_UN) != 0)
 			ereport(WARNING, (errcode_for_file_access(),
 							  errmsg("could not unlock raw block device layout: %m")));
@@ -594,9 +629,101 @@ raw_initialize_layout(uint64 total_extents)
 	memcpy(page.data, &super, sizeof(super));
 	raw_write_page(0, page.data, false);
 
-	if (FileSync(cluster_raw_device_file, WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC) < 0)
+	if (raw_device_sync(WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC) < 0)
 		ereport(FATAL, (errcode_for_file_access(),
 						errmsg("could not fsync initialized raw block device layout: %m")));
+}
+
+static void
+raw_verify_layout_invariants(void)
+{
+	bool *seen_extents;
+	bool *seen_slots;
+	uint32 index;
+
+	seen_extents = (bool *)palloc0(sizeof(bool) * cluster_raw_total_extents);
+	seen_slots = (bool *)palloc0(sizeof(bool) * CLUSTER_RAW_SLOT_MAX);
+
+	for (index = 0; index < CLUSTER_RAW_DIR_MAX_ENTRIES; index++) {
+		ClusterRawDirEntry entry;
+		uint64 capacity_blocks;
+		uint64 cur;
+		uint32 ordinal;
+
+		raw_read_dir_entry(index, &entry);
+		if ((entry.flags & CLUSTER_RAW_ENTRY_IN_USE) == 0)
+			continue;
+
+		if (entry.n_extents == 0)
+			ereport(FATAL, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("raw directory entry %u has no extents", index)));
+
+		capacity_blocks = (uint64)entry.n_extents * CLUSTER_RAW_BLOCKS_PER_EXTENT;
+		if ((uint64)entry.logical_nblocks > capacity_blocks)
+			ereport(FATAL,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("raw directory entry %u has logical EOF beyond allocated capacity",
+							index),
+					 errdetail("logical_nblocks=%u capacity_blocks=" UINT64_FORMAT,
+							   entry.logical_nblocks, capacity_blocks)));
+
+		cur = entry.first_extent;
+		for (ordinal = 0; ordinal < entry.n_extents; ordinal++) {
+			ClusterRawExtentSlot slot;
+			uint64 next;
+
+			if (cur >= CLUSTER_RAW_SLOT_MAX)
+				ereport(FATAL,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("raw directory entry %u references invalid slot " UINT64_FORMAT,
+								index, cur)));
+			if (seen_slots[cur])
+				ereport(FATAL,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("raw extent slot " UINT64_FORMAT
+								" is referenced by more than one relation",
+								cur)));
+			seen_slots[cur] = true;
+
+			raw_read_slot((uint32)cur, &slot);
+			if ((slot.flags & CLUSTER_RAW_SLOT_IN_USE) == 0)
+				ereport(FATAL,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("raw directory entry %u references free slot " UINT64_FORMAT,
+								index, cur)));
+			if (slot.data_extent < CLUSTER_RAW_DATA_START_EXTENT
+				|| slot.data_extent >= cluster_raw_total_extents)
+				ereport(FATAL,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("raw directory entry %u maps to invalid data extent %u",
+								index, slot.data_extent)));
+			if (!raw_extent_allocated(slot.data_extent))
+				ereport(FATAL,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("raw directory entry %u maps to unallocated data extent %u",
+								index, slot.data_extent)));
+			if (seen_extents[slot.data_extent])
+				ereport(FATAL,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("raw data extent %u is mapped by more than one relation",
+								slot.data_extent),
+						 errdetail("directory entry %u relation %u/%u/%u fork %d violates "
+								   "INV-RL",
+								   index, entry.spcOid, entry.dbOid, entry.relNumber,
+								   entry.forknum)));
+			seen_extents[slot.data_extent] = true;
+
+			next = slot.next_slot == UINT32_MAX ? CLUSTER_RAW_INVALID_SLOT : slot.next_slot;
+			if (ordinal + 1 < entry.n_extents && next == CLUSTER_RAW_INVALID_SLOT)
+				ereport(FATAL,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("raw directory entry %u extent chain ended early", index)));
+			cur = next;
+		}
+	}
+
+	pfree(seen_slots);
+	pfree(seen_extents);
 }
 
 static void
@@ -609,7 +736,7 @@ raw_ensure_layout(void)
 	bool all_zero;
 	RawLayoutLock lock;
 
-	size = FileSize(cluster_raw_device_file);
+	size = raw_device_size();
 	if (size < 0)
 		ereport(FATAL, (errcode_for_file_access(),
 						errmsg("could not determine raw block device size: %m")));
@@ -649,6 +776,7 @@ raw_ensure_layout(void)
 								errmsg("raw block device is smaller than recorded layout")));
 			cluster_raw_total_extents = super.total_extents;
 		}
+		raw_verify_layout_invariants();
 	}
 	PG_FINALLY();
 	{
@@ -689,20 +817,91 @@ raw_slot_for_ordinal(const ClusterRawDirEntry *entry, uint32 ordinal, ClusterRaw
 	return CLUSTER_RAW_INVALID_SLOT;
 }
 
+static void
+raw_clear_handle_cache(ClusterSharedFsHandle *handle)
+{
+	if (handle->cached_data_extents != NULL) {
+		pfree(handle->cached_data_extents);
+		handle->cached_data_extents = NULL;
+	}
+	handle->cached_n_extents = 0;
+	handle->cached_first_extent = CLUSTER_RAW_INVALID_SLOT;
+	handle->cached_layout_generation = 0;
+}
+
+static void
+raw_rebuild_handle_cache(ClusterSharedFsHandle *handle, const ClusterRawDirEntry *entry)
+{
+	uint32 *data_extents;
+	uint64 cur;
+	uint32 i;
+	MemoryContext oldcxt;
+
+	if ((entry->flags & CLUSTER_RAW_ENTRY_IN_USE) == 0 || entry->n_extents == 0)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("raw relation has no extent mapping")));
+
+	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+	data_extents = (uint32 *)palloc0(sizeof(uint32) * entry->n_extents);
+	MemoryContextSwitchTo(oldcxt);
+
+	cur = entry->first_extent;
+	for (i = 0; i < entry->n_extents; i++) {
+		ClusterRawExtentSlot slot;
+
+		if (cur >= CLUSTER_RAW_SLOT_MAX) {
+			pfree(data_extents);
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("raw relation extent chain references invalid slot " UINT64_FORMAT, cur)));
+		}
+		raw_read_slot((uint32)cur, &slot);
+		if ((slot.flags & CLUSTER_RAW_SLOT_IN_USE) == 0) {
+			pfree(data_extents);
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("raw relation extent chain references free slot " UINT64_FORMAT, cur)));
+		}
+		if (slot.data_extent >= cluster_raw_total_extents) {
+			pfree(data_extents);
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("raw relation maps to out-of-range data extent %u",
+							slot.data_extent)));
+		}
+
+		data_extents[i] = slot.data_extent;
+		cur = slot.next_slot == UINT32_MAX ? CLUSTER_RAW_INVALID_SLOT : slot.next_slot;
+	}
+
+	raw_clear_handle_cache(handle);
+	handle->cached_data_extents = data_extents;
+	handle->cached_n_extents = entry->n_extents;
+	handle->cached_first_extent = entry->first_extent;
+	handle->cached_layout_generation = entry->layout_generation;
+}
+
 static uint64
-raw_block_offset(const ClusterRawDirEntry *entry, BlockNumber blocknum)
+raw_block_offset(const ClusterSharedFsHandle *handle, const ClusterRawDirEntry *entry,
+				 BlockNumber blocknum)
 {
 	uint32 ordinal = blocknum / CLUSTER_RAW_BLOCKS_PER_EXTENT;
 	uint32 in_extent = blocknum % CLUSTER_RAW_BLOCKS_PER_EXTENT;
-	ClusterRawExtentSlot slot;
+	uint32 data_extent;
 
-	(void)raw_slot_for_ordinal(entry, ordinal, &slot);
-	if (slot.data_extent >= cluster_raw_total_extents)
+	if (ordinal >= entry->n_extents || ordinal >= handle->cached_n_extents
+		|| handle->cached_data_extents == NULL)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("raw relation block is outside cached extent mapping")));
+
+	data_extent = handle->cached_data_extents[ordinal];
+	if (data_extent >= cluster_raw_total_extents)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("raw relation maps to out-of-range data extent %u", slot.data_extent)));
+				 errmsg("raw relation maps to out-of-range data extent %u", data_extent)));
 
-	return raw_extent_offset(slot.data_extent) + (uint64)in_extent * BLCKSZ;
+	return raw_extent_offset(data_extent) + (uint64)in_extent * BLCKSZ;
 }
 
 static void
@@ -714,17 +913,23 @@ raw_refresh_handle_entry(ClusterSharedFsHandle *handle, ClusterRawDirEntry *entr
 	if (!raw_entry_matches(entry, handle->rlocator, handle->forknum))
 		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("raw shared-fs handle no longer matches directory entry")));
+	if (handle->cached_data_extents == NULL || handle->cached_n_extents != entry->n_extents
+		|| handle->cached_first_extent != entry->first_extent
+		|| handle->cached_layout_generation != entry->layout_generation)
+		raw_rebuild_handle_cache(handle, entry);
 }
 
 static void
-raw_zero_data_block(const ClusterRawDirEntry *entry, BlockNumber blocknum)
+raw_zero_data_block(const ClusterSharedFsHandle *handle, const ClusterRawDirEntry *entry,
+					BlockNumber blocknum)
 {
 	PGIOAlignedBlock zero;
 	int nbytes;
 
 	memset(&zero, 0, sizeof(zero));
-	nbytes = FileWrite(cluster_raw_device_file, zero.data, BLCKSZ,
-					   (off_t)raw_block_offset(entry, blocknum), WAIT_EVENT_DATA_FILE_WRITE);
+	nbytes = raw_device_write(zero.data, BLCKSZ,
+							  (off_t)raw_block_offset(handle, entry, blocknum),
+							  WAIT_EVENT_DATA_FILE_WRITE);
 	if (nbytes < 0)
 		ereport(ERROR, (errcode_for_file_access(),
 						errmsg("could not zero raw relation block %u: %m", blocknum)));
@@ -756,6 +961,7 @@ raw_append_extent(ClusterRawDirEntry *entry)
 		raw_write_slot((uint32)tail, &slot);
 	}
 	entry->n_extents++;
+	entry->layout_generation++;
 }
 
 static bool
@@ -821,13 +1027,14 @@ cluster_shared_fs_block_device_create(RelFileLocator rlocator, ForkNumber forknu
 			entry.n_extents = 1;
 			entry.logical_nblocks = 0;
 			entry.first_extent = slot;
+			entry.layout_generation = 1;
 			entry.flags = CLUSTER_RAW_ENTRY_IN_USE;
 			entry_index = free_index;
 			raw_write_dir_entry(entry_index, &entry);
 		}
-		if (FileSync(cluster_raw_device_file, WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC) < 0)
-			ereport(ERROR, (errcode_for_file_access(),
-							errmsg("could not barrier-sync raw layout create: %m")));
+			if (raw_device_sync(WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC) < 0)
+				ereport(ERROR, (errcode_for_file_access(),
+								errmsg("could not barrier-sync raw layout create: %m")));
 	}
 	PG_FINALLY();
 	{
@@ -841,6 +1048,8 @@ cluster_shared_fs_block_device_create(RelFileLocator rlocator, ForkNumber forknu
 static void
 cluster_shared_fs_block_device_close(ClusterSharedFsHandle *handle)
 {
+	if (handle != NULL)
+		raw_clear_handle_cache(handle);
 	if (handle != NULL)
 		pfree(handle);
 }
@@ -858,8 +1067,9 @@ cluster_shared_fs_block_device_read(ClusterSharedFsHandle *handle, BlockNumber b
 				(errcode(ERRCODE_DATA_CORRUPTED), errmsg("raw block-device read past logical EOF"),
 				 errdetail("block=%u logical_nblocks=%u", blocknum, entry.logical_nblocks)));
 
-	nbytes = FileRead(cluster_raw_device_file, io.data, BLCKSZ,
-					  (off_t)raw_block_offset(&entry, blocknum), WAIT_EVENT_DATA_FILE_READ);
+	nbytes = raw_device_read(io.data, BLCKSZ,
+							 (off_t)raw_block_offset(handle, &entry, blocknum),
+							 WAIT_EVENT_DATA_FILE_READ);
 	if (nbytes < 0)
 		ereport(ERROR, (errcode_for_file_access(),
 						errmsg("could not read raw relation block %u: %m", blocknum)));
@@ -885,8 +1095,9 @@ cluster_shared_fs_block_device_write(ClusterSharedFsHandle *handle, BlockNumber 
 				 errdetail("block=%u logical_nblocks=%u", blocknum, entry.logical_nblocks)));
 
 	memcpy(io.data, buf, BLCKSZ);
-	nbytes = FileWrite(cluster_raw_device_file, io.data, BLCKSZ,
-					   (off_t)raw_block_offset(&entry, blocknum), WAIT_EVENT_DATA_FILE_WRITE);
+	nbytes = raw_device_write(io.data, BLCKSZ,
+							  (off_t)raw_block_offset(handle, &entry, blocknum),
+							  WAIT_EVENT_DATA_FILE_WRITE);
 	if (nbytes < 0)
 		ereport(ERROR, (errcode_for_file_access(),
 						errmsg("could not write raw relation block %u: %m", blocknum)));
@@ -920,13 +1131,18 @@ cluster_shared_fs_block_device_extend(ClusterSharedFsHandle *handle, BlockNumber
 			needed_extents = blocknum / CLUSTER_RAW_BLOCKS_PER_EXTENT + 1;
 			while (entry.n_extents < needed_extents)
 				raw_append_extent(&entry);
+			raw_rebuild_handle_cache(handle, &entry);
 
 			old_logical = entry.logical_nblocks;
 			for (blk = old_logical; blk <= blocknum; blk++)
-				raw_zero_data_block(&entry, blk);
+				raw_zero_data_block(handle, &entry, blk);
+			if (raw_device_sync(WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC) < 0)
+				ereport(ERROR, (errcode_for_file_access(),
+								errmsg("could not barrier-sync raw zero extension before "
+									   "publishing logical EOF: %m")));
 			entry.logical_nblocks = blocknum + 1;
 			raw_write_dir_entry(handle->entry_index, &entry);
-			if (FileSync(cluster_raw_device_file, WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC) < 0)
+			if (raw_device_sync(WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC) < 0)
 				ereport(ERROR, (errcode_for_file_access(),
 								errmsg("could not barrier-sync raw layout extend: %m")));
 		}
@@ -982,6 +1198,8 @@ cluster_shared_fs_block_device_truncate(ClusterSharedFsHandle *handle, BlockNumb
 															  : tail_slot.next_slot;
 		}
 
+		if (keep_extents != entry.n_extents)
+			entry.layout_generation++;
 		entry.n_extents = keep_extents;
 		entry.logical_nblocks = nblocks;
 		raw_write_dir_entry(handle->entry_index, &entry);
@@ -992,7 +1210,7 @@ cluster_shared_fs_block_device_truncate(ClusterSharedFsHandle *handle, BlockNumb
 			raw_release_slot_chain(release_first);
 		}
 
-		if (FileSync(cluster_raw_device_file, WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC) < 0)
+		if (raw_device_sync(WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC) < 0)
 			ereport(ERROR, (errcode_for_file_access(),
 							errmsg("could not barrier-sync raw layout truncate: %m")));
 	}
@@ -1007,7 +1225,7 @@ static void
 cluster_shared_fs_block_device_immedsync(ClusterSharedFsHandle *handle)
 {
 	(void)handle;
-	if (FileSync(cluster_raw_device_file, WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC) < 0)
+	if (raw_device_sync(WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC) < 0)
 		ereport(ERROR,
 				(errcode_for_file_access(), errmsg("could not barrier-sync raw block device: %m")));
 }
@@ -1031,7 +1249,7 @@ cluster_shared_fs_block_device_unlink(RelFileLocator rlocator, ForkNumber forknu
 			memset(&entry, 0, sizeof(entry));
 			raw_write_dir_entry(entry_index, &entry);
 			raw_release_slot_chain(first_slot);
-			if (FileSync(cluster_raw_device_file, WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC) < 0)
+			if (raw_device_sync(WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC) < 0)
 				ereport(ERROR, (errcode_for_file_access(),
 								errmsg("could not barrier-sync raw layout unlink: %m")));
 		}
@@ -1073,8 +1291,8 @@ cluster_shared_fs_block_device_init(void)
 				 errhint("Use cluster.storage_fence_driver=auto or disabled until a platform "
 						 "SCSI-3 PR driver is installed.")));
 
-	cluster_raw_device_file = PathNameOpenFile(cluster_block_device_path, flags);
-	if (cluster_raw_device_file < 0)
+	cluster_raw_device_fd = BasicOpenFile(cluster_block_device_path, flags);
+	if (cluster_raw_device_fd < 0)
 		ereport(FATAL,
 				(errcode_for_file_access(),
 				 errmsg("could not open raw block device \"%s\": %m", cluster_block_device_path)));
@@ -1087,9 +1305,9 @@ cluster_shared_fs_block_device_init(void)
 static void
 cluster_shared_fs_block_device_shutdown(void)
 {
-	if (cluster_raw_device_file >= 0) {
-		FileClose(cluster_raw_device_file);
-		cluster_raw_device_file = -1;
+	if (cluster_raw_device_fd >= 0) {
+		close(cluster_raw_device_fd);
+		cluster_raw_device_fd = -1;
 	}
 }
 
