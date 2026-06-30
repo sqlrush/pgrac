@@ -291,6 +291,11 @@ typedef enum ClusterItlFinishWalMode {
 } ClusterItlFinishWalMode;
 extern int cluster_itl_finish_wal_mode;
 
+/* spec-3.26 D5 (Lever B): backend-local last-pin fast path for the undo buffer
+ * pool pin lookup (avoids the O(nslots) EXCLUSIVE linear scan on the hot
+ * per-DML repeat-block path).  Default on; off = always the authoritative path. */
+extern bool cluster_undo_buf_pin_fastpath;
+
 /* spec-2.23 D11 NEW: coordinator REPORT collect timeout + reply wait cap. */
 extern int cluster_lmd_probe_collect_timeout_ms;
 extern int cluster_ges_reply_wait_max_entries;

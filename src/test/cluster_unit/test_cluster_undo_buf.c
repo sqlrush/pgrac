@@ -74,6 +74,7 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 /* ----- GUC globals the pool reads ----- */
 int cluster_undo_buffers = 4; /* small pool for evict testing */
 bool cluster_undo_buffer_writeback = false;
+bool cluster_undo_buf_pin_fastpath = true; /* spec-3.26 D5: exercise the fast path */
 /* spec-4.8ab D5: advisory boundary-check mode (default ON);  the pool reads it
  * via the header extern.  ON so the eviction path exercises verdict accounting. */
 int cluster_undo_writeback_boundary_check = CLUSTER_UNDO_WB_CHECK_ON;
