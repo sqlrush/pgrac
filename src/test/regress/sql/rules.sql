@@ -772,6 +772,7 @@ drop table cchild;
 -- Check that ruleutils are working
 --
 
+-- PGRAC: expected ruleutils output includes cluster backup/PITR catalog views.
 -- temporarily disable fancy output, so view changes create less diff noise
 \a\t
 
