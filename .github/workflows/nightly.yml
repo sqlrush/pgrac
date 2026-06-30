@@ -155,10 +155,11 @@ jobs:
           # legs run in parallel and do not extend the ges-locking shard
           # wallclock.  t/327 HW workload / t/328 MG-B write perf / t/329 MG-D
           # heap-ITL WAL measure / t/330 production-bench-subset / t/331 4-node
-          # reconfig fault matrix / t/332 write-tax CPU profile (Thread B perf
-          # artifact -- perf on the clean runner; gracefully skips if perf is
-          # unavailable, never a gate).
-          - { name: stage5-integrated-acceptance, ranges: "327-332", unit: false, regress: false }
+          # reconfig fault matrix.  t/332 (write-tax CPU profile) is NOT in this
+          # shard: it needs a non-cassert build for a trustworthy signal, so it
+          # runs in its own linux-writetax-profile job below (schedule/dispatch
+          # only -- the cassert build here would bury the cluster_* hot path).
+          - { name: stage5-integrated-acceptance, ranges: "327-331", unit: false, regress: false }
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -259,6 +260,87 @@ jobs:
             src/test/cluster_tap/tmp_check/log/
           if-no-files-found: ignore
           retention-days: 14
+
+  # ====================================================================
+  # Tier 2.1b' — spec-5.19 Thread B write-tax CPU profile (clean build)
+  # --------------------------------------------------------------------
+  # t/332 needs a TRUSTWORTHY CPU profile to locate the residual single-node
+  # write-tax lever, but every shard above builds --enable-cassert, whose
+  # AllocSetCheck/MemoryContextCheck noise buries the real cluster_* hot path.
+  # This job builds a release-like binary WITHOUT cassert (-O2
+  # -fno-omit-frame-pointer -g so perf gets call graphs + symbol names) and
+  # runs ONLY t/332, so the perf report + native-vs-cluster diff in its log
+  # and uploaded artifact are clean.  It is slow (full clean build) and is NOT
+  # part of the ship gate, so it runs only on the daily schedule or an explicit
+  # workflow_dispatch -- never on a ship tag push.  t/332 is a never-a-gate
+  # artifact: it passes even when perf is unavailable.
+  # ====================================================================
+  linux-writetax-profile:
+    name: spec-5.19 write-tax CPU profile (clean build)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ccache \
+            libreadline-dev zlib1g-dev libicu-dev \
+            liblz4-dev libzstd-dev libssl-dev libxml2-dev \
+            libipc-run-perl pkg-config \
+            linux-tools-common linux-tools-generic || true
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ${{ runner.os }}-writetax-profile-ccache-${{ github.ref_name }}
+          restore-keys: |
+            ${{ runner.os }}-writetax-profile-ccache-
+
+      - name: Configure ccache
+        run: |
+          ccache --max-size=700M
+          ccache --zero-stats
+
+      - name: Configure (--enable-cluster, NO cassert, frame pointers)
+        # No --enable-cassert: assertion checks would pollute the CPU profile.
+        # -O2 release optimisation + -fno-omit-frame-pointer for perf -g call
+        # graphs + -g for symbol/line resolution in perf report/diff.
+        run: |
+          CC="ccache gcc" ./configure \
+            --prefix=$HOME/pgrac-install \
+            --with-openssl --with-icu --with-lz4 --with-zstd \
+            --enable-cluster --enable-tap-tests \
+            CFLAGS="-O2 -fno-omit-frame-pointer -g"
+
+      - name: Build and install
+        run: |
+          make -j$(getconf _NPROCESSORS_ONLN)
+          ccache --show-stats
+          make install
+
+      - name: Set up perf
+        run: |
+          sudo sysctl -w kernel.perf_event_paranoid=0 || true
+          sudo sysctl -w kernel.kptr_restrict=0 || true
+          perf --version || true
+
+      - name: Run t/332 write-tax CPU profile
+        run: make -C src/test/cluster_tap check PROVE_TESTS="t/332_write_tax_profile.pl"
+
+      - name: Upload write-tax profile log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-writetax-profile
+          path: |
+            src/test/cluster_tap/tmp_check/log/
+          if-no-files-found: ignore
+          retention-days: 30
 
   # ====================================================================
   # Tier 2.1c — macOS Build+Test (smoke)
