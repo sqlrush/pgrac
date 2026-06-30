@@ -660,12 +660,12 @@ raw_verify_layout_invariants(void)
 
 		capacity_blocks = (uint64)entry.n_extents * CLUSTER_RAW_BLOCKS_PER_EXTENT;
 		if ((uint64)entry.logical_nblocks > capacity_blocks)
-			ereport(FATAL,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("raw directory entry %u has logical EOF beyond allocated capacity",
-							index),
-					 errdetail("logical_nblocks=%u capacity_blocks=" UINT64_FORMAT,
-							   entry.logical_nblocks, capacity_blocks)));
+			ereport(
+				FATAL,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("raw directory entry %u has logical EOF beyond allocated capacity", index),
+				 errdetail("logical_nblocks=%u capacity_blocks=" UINT64_FORMAT,
+						   entry.logical_nblocks, capacity_blocks)));
 
 		cur = entry.first_extent;
 		for (ordinal = 0; ordinal < entry.n_extents; ordinal++) {
@@ -678,46 +678,40 @@ raw_verify_layout_invariants(void)
 						 errmsg("raw directory entry %u references invalid slot " UINT64_FORMAT,
 								index, cur)));
 			if (seen_slots[cur])
-				ereport(FATAL,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("raw extent slot " UINT64_FORMAT
-								" is referenced by more than one relation",
-								cur)));
+				ereport(FATAL, (errcode(ERRCODE_DATA_CORRUPTED),
+								errmsg("raw extent slot " UINT64_FORMAT
+									   " is referenced by more than one relation",
+									   cur)));
 			seen_slots[cur] = true;
 
 			raw_read_slot((uint32)cur, &slot);
 			if ((slot.flags & CLUSTER_RAW_SLOT_IN_USE) == 0)
-				ereport(FATAL,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("raw directory entry %u references free slot " UINT64_FORMAT,
-								index, cur)));
+				ereport(FATAL, (errcode(ERRCODE_DATA_CORRUPTED),
+								errmsg("raw directory entry %u references free slot " UINT64_FORMAT,
+									   index, cur)));
 			if (slot.data_extent < CLUSTER_RAW_DATA_START_EXTENT
 				|| slot.data_extent >= cluster_raw_total_extents)
-				ereport(FATAL,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("raw directory entry %u maps to invalid data extent %u",
-								index, slot.data_extent)));
+				ereport(FATAL, (errcode(ERRCODE_DATA_CORRUPTED),
+								errmsg("raw directory entry %u maps to invalid data extent %u",
+									   index, slot.data_extent)));
 			if (!raw_extent_allocated(slot.data_extent))
-				ereport(FATAL,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("raw directory entry %u maps to unallocated data extent %u",
-								index, slot.data_extent)));
+				ereport(FATAL, (errcode(ERRCODE_DATA_CORRUPTED),
+								errmsg("raw directory entry %u maps to unallocated data extent %u",
+									   index, slot.data_extent)));
 			if (seen_extents[slot.data_extent])
-				ereport(FATAL,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("raw data extent %u is mapped by more than one relation",
-								slot.data_extent),
-						 errdetail("directory entry %u relation %u/%u/%u fork %d violates "
-								   "INV-RL",
-								   index, entry.spcOid, entry.dbOid, entry.relNumber,
-								   entry.forknum)));
+				ereport(FATAL, (errcode(ERRCODE_DATA_CORRUPTED),
+								errmsg("raw data extent %u is mapped by more than one relation",
+									   slot.data_extent),
+								errdetail("directory entry %u relation %u/%u/%u fork %d violates "
+										  "INV-RL",
+										  index, entry.spcOid, entry.dbOid, entry.relNumber,
+										  entry.forknum)));
 			seen_extents[slot.data_extent] = true;
 
 			next = slot.next_slot == UINT32_MAX ? CLUSTER_RAW_INVALID_SLOT : slot.next_slot;
 			if (ordinal + 1 < entry.n_extents && next == CLUSTER_RAW_INVALID_SLOT)
-				ereport(FATAL,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("raw directory entry %u extent chain ended early", index)));
+				ereport(FATAL, (errcode(ERRCODE_DATA_CORRUPTED),
+								errmsg("raw directory entry %u extent chain ended early", index)));
 			cur = next;
 		}
 	}
@@ -838,8 +832,8 @@ raw_rebuild_handle_cache(ClusterSharedFsHandle *handle, const ClusterRawDirEntry
 	MemoryContext oldcxt;
 
 	if ((entry->flags & CLUSTER_RAW_ENTRY_IN_USE) == 0 || entry->n_extents == 0)
-		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-						errmsg("raw relation has no extent mapping")));
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED), errmsg("raw relation has no extent mapping")));
 
 	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
 	data_extents = (uint32 *)palloc0(sizeof(uint32) * entry->n_extents);
@@ -867,8 +861,7 @@ raw_rebuild_handle_cache(ClusterSharedFsHandle *handle, const ClusterRawDirEntry
 			pfree(data_extents);
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("raw relation maps to out-of-range data extent %u",
-							slot.data_extent)));
+					 errmsg("raw relation maps to out-of-range data extent %u", slot.data_extent)));
 		}
 
 		data_extents[i] = slot.data_extent;
@@ -897,9 +890,8 @@ raw_block_offset(const ClusterSharedFsHandle *handle, const ClusterRawDirEntry *
 
 	data_extent = handle->cached_data_extents[ordinal];
 	if (data_extent >= cluster_raw_total_extents)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("raw relation maps to out-of-range data extent %u", data_extent)));
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("raw relation maps to out-of-range data extent %u", data_extent)));
 
 	return raw_extent_offset(data_extent) + (uint64)in_extent * BLCKSZ;
 }
@@ -927,8 +919,7 @@ raw_zero_data_block(const ClusterSharedFsHandle *handle, const ClusterRawDirEntr
 	int nbytes;
 
 	memset(&zero, 0, sizeof(zero));
-	nbytes = raw_device_write(zero.data, BLCKSZ,
-							  (off_t)raw_block_offset(handle, entry, blocknum),
+	nbytes = raw_device_write(zero.data, BLCKSZ, (off_t)raw_block_offset(handle, entry, blocknum),
 							  WAIT_EVENT_DATA_FILE_WRITE);
 	if (nbytes < 0)
 		ereport(ERROR, (errcode_for_file_access(),
@@ -1032,9 +1023,9 @@ cluster_shared_fs_block_device_create(RelFileLocator rlocator, ForkNumber forknu
 			entry_index = free_index;
 			raw_write_dir_entry(entry_index, &entry);
 		}
-			if (raw_device_sync(WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC) < 0)
-				ereport(ERROR, (errcode_for_file_access(),
-								errmsg("could not barrier-sync raw layout create: %m")));
+		if (raw_device_sync(WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC) < 0)
+			ereport(ERROR, (errcode_for_file_access(),
+							errmsg("could not barrier-sync raw layout create: %m")));
 	}
 	PG_FINALLY();
 	{
@@ -1067,8 +1058,7 @@ cluster_shared_fs_block_device_read(ClusterSharedFsHandle *handle, BlockNumber b
 				(errcode(ERRCODE_DATA_CORRUPTED), errmsg("raw block-device read past logical EOF"),
 				 errdetail("block=%u logical_nblocks=%u", blocknum, entry.logical_nblocks)));
 
-	nbytes = raw_device_read(io.data, BLCKSZ,
-							 (off_t)raw_block_offset(handle, &entry, blocknum),
+	nbytes = raw_device_read(io.data, BLCKSZ, (off_t)raw_block_offset(handle, &entry, blocknum),
 							 WAIT_EVENT_DATA_FILE_READ);
 	if (nbytes < 0)
 		ereport(ERROR, (errcode_for_file_access(),
@@ -1095,8 +1085,7 @@ cluster_shared_fs_block_device_write(ClusterSharedFsHandle *handle, BlockNumber 
 				 errdetail("block=%u logical_nblocks=%u", blocknum, entry.logical_nblocks)));
 
 	memcpy(io.data, buf, BLCKSZ);
-	nbytes = raw_device_write(io.data, BLCKSZ,
-							  (off_t)raw_block_offset(handle, &entry, blocknum),
+	nbytes = raw_device_write(io.data, BLCKSZ, (off_t)raw_block_offset(handle, &entry, blocknum),
 							  WAIT_EVENT_DATA_FILE_WRITE);
 	if (nbytes < 0)
 		ereport(ERROR, (errcode_for_file_access(),
