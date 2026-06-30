@@ -3447,15 +3447,13 @@ UT_TEST(test_grd_pin_cleanup_on_lmd_submit_error)
 	bast_resid(5804, &resid);
 
 	h = bast_holder(1, 100, 1);
-	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 1, 0,
-														 UT_GES_OPCODE_REQUEST, ShareLock,
-														 conflicts, &nc),
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 1, 0, UT_GES_OPCODE_REQUEST,
+														 ShareLock, conflicts, &nc),
 				 (int)CLUSTER_GRD_GRANT_NOW);
 
 	h = bast_holder(2, 200, 2);
-	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 2, 2, 0,
-														 UT_GES_OPCODE_REQUEST, ExclusiveLock,
-														 conflicts, &nc),
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 2, 2, 0, UT_GES_OPCODE_REQUEST,
+														 ExclusiveLock, conflicts, &nc),
 				 (int)CLUSTER_GRD_ENQUEUED_WAITER);
 
 	ut_wfg_throw_on_submit_once = true;

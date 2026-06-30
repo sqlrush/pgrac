@@ -161,7 +161,7 @@ typedef struct ClusterGrdWaiter {
 struct ClusterGrdEntry {
 	ClusterResId resid; /* hash key (16B) */
 	dlist_node shard_link;
-	slock_t lock;		/* entry-level spinlock (Q11 + P1.3 minor) */
+	slock_t lock; /* entry-level spinlock (Q11 + P1.3 minor) */
 	int ngranted;
 	ClusterGrdHolder holders[PGRAC_GRD_MAX_HOLDERS];
 	int nwaiters;

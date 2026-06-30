@@ -199,7 +199,8 @@ typedef struct ClusterGrdShared {
 	pg_atomic_uint64 reclaim_skipped_pinned_count; /* spec-6.3a: pin>0 reclaim skips */
 	pg_atomic_uint64 pin_high_water;			   /* spec-6.3a: max observed entry pin */
 	pg_atomic_uint64 sweep_runs;				   /* spec-6.3a: LMON reclaim sweeps */
-	dlist_head entry_shard_lists[PGRAC_GRD_SHARD_COUNT]; /* spec-6.3a: scan-safe per-shard entry lists */
+	dlist_head
+		entry_shard_lists[PGRAC_GRD_SHARD_COUNT]; /* spec-6.3a: scan-safe per-shard entry lists */
 
 	/* spec-2.16 D1:  4 cap counter + 5 nofail counter (skeleton-init;
 	 * mutator bodies + nofail paths land Step 2-4). */
