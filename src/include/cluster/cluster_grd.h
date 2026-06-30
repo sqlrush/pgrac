@@ -67,6 +67,7 @@
 
 #include "cluster/cluster_conf.h" /* CLUSTER_MAX_NODES (spec-4.6 D1 bitmap sizing) */
 #include "datatype/timestamp.h"	  /* TimestampTz (spec-5.1b ClusterGrdConvert) */
+#include "lib/ilist.h"
 #include "port/atomics.h"
 #include "storage/lock.h" /* LOCKTAG */
 
@@ -198,6 +199,7 @@ typedef struct ClusterGrdShared {
 	pg_atomic_uint64 reclaim_skipped_pinned_count; /* spec-6.3a: pin>0 reclaim skips */
 	pg_atomic_uint64 pin_high_water;			   /* spec-6.3a: max observed entry pin */
 	pg_atomic_uint64 sweep_runs;				   /* spec-6.3a: LMON reclaim sweeps */
+	dlist_head entry_shard_lists[PGRAC_GRD_SHARD_COUNT]; /* spec-6.3a: scan-safe per-shard entry lists */
 
 	/* spec-2.16 D1:  4 cap counter + 5 nofail counter (skeleton-init;
 	 * mutator bodies + nofail paths land Step 2-4). */
@@ -798,8 +800,8 @@ extern int cluster_grd_reclaim_sweep(void);
 
 
 /*
- * spec-2.15 D8 + spec-6.3a: SRF row visitor.  Snapshots entry keys under the
- * GRD entry table scan lock, re-lookups each key through the lookup-pin API,
+ * spec-2.15 D8 + spec-6.3a: SRF row visitor.  Snapshots entry keys from
+ * shard-local entry lists, re-lookups each key through the lookup-pin API,
  * and invokes `visitor(ctx, row_fields)` per entry under per-entry
  * slock_t snapshot.  The 11 row_fields columns are
  * (shard_id, field1, field2, field3, field4, type, lockmethodid,

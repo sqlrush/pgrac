@@ -51,6 +51,7 @@
 #include "postgres.h"
 
 #include <signal.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "cluster/cluster_conf.h"
@@ -153,6 +154,30 @@ void
 elog_finish(int e pg_attribute_unused(), const char *f pg_attribute_unused(), ...)
 {}
 
+sigjmp_buf *PG_exception_stack = NULL;
+ErrorContextCallback *error_context_stack = NULL;
+
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	abort();
+}
+
+/*
+ * spec-5.16 — test-only flag to force the GRD shmem stub to re-run its full
+ * init between scenarios.  The stub allocates the buffer once, so without this
+ * a repeat cluster_grd_shmem_init() would see found=true and skip shared-state
+ * field init, including the spec-6.3a shard entry lists.
+ */
+static bool ut_grd_force_reinit = false;
+static void
+ut_reset_grd_shmem(void)
+{
+	ut_grd_force_reinit = true;
+}
+
 /*
  * L105 union force-align shmem stub.
  */
@@ -166,12 +191,14 @@ ShmemInitStruct(const char *name, Size size, bool *foundPtr)
 			 * standalone shmem stub's alignment to at least 8 bytes for
 			 * pg_atomic_uint64 fields inside ClusterGrdShared. */
 			uint64 force_align;
-			char data[131072]; /* 3×4096 atomic uint32 arrays + counters < 50KB
-								* (spec-4.6 adds master_generation[] + shard_phase[]);
-								* buffer 128KB 充足 */
+			char data[262144]; /* ClusterGrdShared includes 4096 shard lists. */
 		} grd_buf;
 		static bool grd_initialized = false;
 
+		if (ut_grd_force_reinit) {
+			grd_initialized = false;
+			ut_grd_force_reinit = false;
+		}
 		Assert(size <= sizeof(grd_buf.data));
 		*foundPtr = grd_initialized;
 		grd_initialized = true;
@@ -397,13 +424,14 @@ cluster_grd_outbound_enqueue_backend_request(uint32 dest_node_id pg_attribute_un
 	return true;
 }
 
-#define FAKE_GRD_HTAB_MAX_ENTRIES 4
+#define FAKE_GRD_HTAB_MAX_ENTRIES 320
 #define FAKE_GRD_HTAB_ENTRY_BYTES 4096
 
 static int fake_grd_htab_token;
 static int fake_grd_htab_count;
 static int fake_grd_htab_seq_index;
 static Size fake_grd_entrysize;
+static bool fake_grd_htab_used[FAKE_GRD_HTAB_MAX_ENTRIES];
 static union {
 	uint64 force_align;
 	char data[FAKE_GRD_HTAB_MAX_ENTRIES][FAKE_GRD_HTAB_ENTRY_BYTES];
@@ -412,9 +440,11 @@ static union {
 static void
 reset_fake_grd_htab(void)
 {
+	ut_reset_grd_shmem();
 	fake_grd_htab_count = 0;
 	fake_grd_htab_seq_index = 0;
 	fake_grd_entrysize = 0;
+	memset(fake_grd_htab_used, 0, sizeof(fake_grd_htab_used));
 	memset(&fake_grd_htab_entries, 0, sizeof(fake_grd_htab_entries));
 }
 
@@ -438,6 +468,7 @@ ShmemInitHash(const char *name pg_attribute_unused(), long init_size pg_attribut
 
 	fake_grd_entrysize = infoP->entrysize;
 	fake_grd_htab_count = 0;
+	memset(fake_grd_htab_used, 0, sizeof(fake_grd_htab_used));
 	memset(&fake_grd_htab_entries, 0, sizeof(fake_grd_htab_entries));
 	return (HTAB *)&fake_grd_htab_token;
 }
@@ -459,17 +490,17 @@ hash_search_with_hash_value(HTAB *hashp pg_attribute_unused(),
 	Assert(keyPtr != NULL);
 	Assert(fake_grd_entrysize > 0);
 
-	for (i = 0; i < fake_grd_htab_count; i++) {
+	for (i = 0; i < FAKE_GRD_HTAB_MAX_ENTRIES; i++) {
 		char *entry = fake_grd_htab_entries.data[i];
 
+		if (!fake_grd_htab_used[i])
+			continue;
 		if (memcmp(entry, keyPtr, sizeof(ClusterResId)) == 0) {
 			if (action == HASH_REMOVE) {
 				if (foundPtr != NULL)
 					*foundPtr = true;
-				if (i < fake_grd_htab_count - 1)
-					memcpy(fake_grd_htab_entries.data[i],
-						   fake_grd_htab_entries.data[fake_grd_htab_count - 1], fake_grd_entrysize);
-				memset(fake_grd_htab_entries.data[fake_grd_htab_count - 1], 0, fake_grd_entrysize);
+				fake_grd_htab_used[i] = false;
+				memset(entry, 0, fake_grd_entrysize);
 				fake_grd_htab_count--;
 				return entry;
 			}
@@ -491,7 +522,16 @@ hash_search_with_hash_value(HTAB *hashp pg_attribute_unused(),
 		if (fake_grd_htab_count >= FAKE_GRD_HTAB_MAX_ENTRIES)
 			return NULL;
 
-		entry = fake_grd_htab_entries.data[fake_grd_htab_count++];
+		for (i = 0; i < FAKE_GRD_HTAB_MAX_ENTRIES; i++)
+			if (!fake_grd_htab_used[i])
+				break;
+		Assert(i < FAKE_GRD_HTAB_MAX_ENTRIES);
+		if (i >= FAKE_GRD_HTAB_MAX_ENTRIES)
+			return NULL;
+
+		fake_grd_htab_used[i] = true;
+		fake_grd_htab_count++;
+		entry = fake_grd_htab_entries.data[i];
 		memset(entry, 0, fake_grd_entrysize);
 		memcpy(entry, keyPtr, sizeof(ClusterResId));
 		return entry;
@@ -509,9 +549,13 @@ hash_seq_init(HASH_SEQ_STATUS *status pg_attribute_unused(), HTAB *hashp pg_attr
 void *
 hash_seq_search(HASH_SEQ_STATUS *status pg_attribute_unused())
 {
-	if (fake_grd_htab_seq_index >= fake_grd_htab_count)
-		return NULL;
-	return fake_grd_htab_entries.data[fake_grd_htab_seq_index++];
+	while (fake_grd_htab_seq_index < FAKE_GRD_HTAB_MAX_ENTRIES) {
+		int i = fake_grd_htab_seq_index++;
+
+		if (fake_grd_htab_used[i])
+			return fake_grd_htab_entries.data[i];
+	}
+	return NULL;
 }
 
 /* spec-5.13 S3/D4 stub: cluster_grd_clean_leave_verify_no_leftover (in

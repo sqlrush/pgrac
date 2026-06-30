@@ -73,6 +73,10 @@ spec-6.3a adds GRD entry-lifecycle counters in the `grd` category:
 | `grd_pin_high_water` | Highest observed lookup-pin count on a single entry |
 | `grd_sweep_runs` | LMON cold-reclaim sweep invocations |
 
+Implementation details for the pin/release discipline, shard-local scan
+model, and ERROR cleanup classification are in
+`docs/cluster/grd-entry-lifecycle.md`.
+
 ## Wire Format
 
 Payload bytes follow the 36-byte `ClusterICEnvelope`:

@@ -77,17 +77,12 @@ static ClusterGrdShared *cluster_grd_state = NULL;
  * LWLock managed by PG lwlock.c — cluster_grd_shmem_init only obtains
  * the array pointer; PG auto-initializes the lock objects. */
 static LWLockPadded *cluster_grd_shard_locks = NULL;
-/* spec-6.3a:  table-level scan/mutation interlock for the partitioned HTAB.
- * hash_seq_search takes this in shared mode; HASH_ENTER/HASH_REMOVE take it in
- * exclusive mode before the per-shard partition LWLock. */
-static LWLockPadded *cluster_grd_table_lock = NULL;
 
 /* spec-2.15:  HTAB for entry storage.  NULL when cluster.grd_max_entries
  * = 0 (skeleton mode → NOT_READY sentinel) or non-cluster builds. */
 static HTAB *cluster_grd_entry_htab = NULL;
 
 #define CLUSTER_GRD_ENTRY_FLAG_RECLAIMING ((uint32)0x00000001)
-#define CLUSTER_GRD_SWEEP_BATCH_MAX 256
 
 static int cluster_grd_snapshot_entry_resids(ClusterResId **out_resids);
 
@@ -165,6 +160,7 @@ typedef struct ClusterGrdWaiter {
 
 struct ClusterGrdEntry {
 	ClusterResId resid; /* hash key (16B) */
+	dlist_node shard_link;
 	slock_t lock;		/* entry-level spinlock (Q11 + P1.3 minor) */
 	int ngranted;
 	ClusterGrdHolder holders[PGRAC_GRD_MAX_HOLDERS];
@@ -281,6 +277,41 @@ grd_wfg_make_vertex(int32 node_id, uint32 procno, uint64 cluster_epoch, uint64 r
 	out->xid = xid;
 	out->local_start_ts_ms = 0;
 	out->wait_seq = wait_seq;
+}
+
+static bool
+grd_lmd_submit_wait_edge_pinned(ClusterGrdEntry *entry, ClusterLmdVertex *waiter,
+								ClusterLmdVertex *blocker, uint64 request_id)
+{
+	bool published = false;
+
+	PG_TRY();
+	{
+		published = cluster_lmd_submit_wait_edge_real(waiter, blocker, request_id);
+	}
+	PG_CATCH();
+	{
+		cluster_grd_entry_release(entry);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	return published;
+}
+
+static void
+grd_lmd_cancel_wait_edge_pinned(ClusterGrdEntry *entry, ClusterLmdVertex *waiter)
+{
+	PG_TRY();
+	{
+		cluster_lmd_cancel_wait_edge_real(waiter);
+	}
+	PG_CATCH();
+	{
+		cluster_grd_entry_release(entry);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 /* Caller holds entry->lock.  Copy holders + queued waiters + pending converts
@@ -484,7 +515,6 @@ void
 cluster_grd_request_lwlocks(void)
 {
 	RequestNamedLWLockTranche("ClusterGrdShard", PGRAC_GRD_SHARD_COUNT);
-	RequestNamedLWLockTranche("ClusterGrdTable", 1);
 	/* spec-2.16 D4/D5:  outbound ring + work queue named tranches.
 	 * Same process_shmem_requests_in_progress lifecycle window — co-
 	 * located here so cluster_unit standalone tests piggyback on the
@@ -622,6 +652,7 @@ cluster_grd_shmem_init(void)
 			/* spec-4.6 D2/D1: remaster generation + recovery phase. */
 			pg_atomic_init_u32(&cluster_grd_state->master_generation[i], 0);
 			pg_atomic_init_u32(&cluster_grd_state->shard_phase[i], (uint32)GRD_SHARD_NORMAL);
+			dlist_init(&cluster_grd_state->entry_shard_lists[i]);
 		}
 		pg_atomic_init_u32(&cluster_grd_state->master_map_initialized, 0);
 		pg_atomic_init_u64(&cluster_grd_state->resid_encode_count, 0);
@@ -736,7 +767,6 @@ cluster_grd_shmem_init(void)
 	 * so the tranche is not registered there;  gating here keeps the
 	 * skeleton-mode path FATAL-free. */
 	cluster_grd_shard_locks = NULL;
-	cluster_grd_table_lock = NULL;
 
 	if (entry_alloc > 0) {
 		HASHCTL info;
@@ -748,7 +778,6 @@ cluster_grd_shmem_init(void)
 		 * reachable when cluster_grd_request_lwlocks() has run, i.e.
 		 * full postmaster init under cluster.grd_max_entries > 0. */
 		cluster_grd_shard_locks = GetNamedLWLockTranche("ClusterGrdShard");
-		cluster_grd_table_lock = GetNamedLWLockTranche("ClusterGrdTable");
 
 		memset(&info, 0, sizeof(info));
 		info.keysize = sizeof(ClusterResId);
@@ -2758,38 +2787,12 @@ cluster_grd_entry_lookup_or_create(const ClusterResId *resid, bool create, Clust
 		return CLUSTER_GRD_ENTRY_NOT_FOUND;
 	}
 
-	/*
-	 * A create can mutate the dynahash bucket/free list.  Release the shard
-	 * lock and re-enter through table->shard order so hash_seq_search users can
-	 * hold the table lock in shared mode without requiring 4096 simultaneous
-	 * shard LWLocks.
-	 */
-	LWLockRelease(&cluster_grd_shard_locks[shard_id].lock);
-	LWLockAcquire(&cluster_grd_table_lock[0].lock, LW_EXCLUSIVE);
-	LWLockAcquire(&cluster_grd_shard_locks[shard_id].lock, LW_EXCLUSIVE);
-
-	entry
-		= hash_search_with_hash_value(cluster_grd_entry_htab, resid, hashvalue, HASH_FIND, &found);
-	if (entry != NULL) {
-		if (!cluster_grd_entry_pin_locked(entry)) {
-			LWLockRelease(&cluster_grd_shard_locks[shard_id].lock);
-			LWLockRelease(&cluster_grd_table_lock[0].lock);
-			return CLUSTER_GRD_ENTRY_ERROR;
-		}
-		pg_atomic_fetch_add_u64(&cluster_grd_state->entry_lookup_hit_count, 1);
-		LWLockRelease(&cluster_grd_shard_locks[shard_id].lock);
-		LWLockRelease(&cluster_grd_table_lock[0].lock);
-		*out = entry;
-		return CLUSTER_GRD_ENTRY_OK;
-	}
-
 	/* Step 5: new-entry soft cap.  Use our own atomic current count rather
 	 * than hash_get_num_entries(); future remove will decrement this counter
 	 * in cluster_grd_entry_release while holding the proper partition lock. */
 	if (pg_atomic_read_u64(&cluster_grd_state->entry_current_count)
 		>= (uint64)cluster_grd_max_entries) {
 		LWLockRelease(&cluster_grd_shard_locks[shard_id].lock);
-		LWLockRelease(&cluster_grd_table_lock[0].lock);
 		pg_atomic_fetch_add_u64(&cluster_grd_state->entry_full_count, 1);
 		ereport(LOG, (errmsg("cluster_grd: entry table soft cap reached "
 							 "(cluster.grd_max_entries = %d)",
@@ -2807,7 +2810,6 @@ cluster_grd_entry_lookup_or_create(const ClusterResId *resid, bool create, Clust
 	 * bounce; OK otherwise. */
 	if (entry == NULL) {
 		LWLockRelease(&cluster_grd_shard_locks[shard_id].lock);
-		LWLockRelease(&cluster_grd_table_lock[0].lock);
 		/* HASH_ENTER_NULL returned NULL — shmem OOM defensive. */
 		pg_atomic_fetch_add_u64(&cluster_grd_state->entry_full_count, 1);
 		ereport(LOG, (errmsg("cluster_grd: HASH_ENTER_NULL returned NULL "
@@ -2817,6 +2819,7 @@ cluster_grd_entry_lookup_or_create(const ClusterResId *resid, bool create, Clust
 
 	if (!found) {
 		/* New entry — init slock + body zero. */
+		dlist_node_init(&entry->shard_link);
 		SpinLockInit(&entry->lock);
 		entry->ngranted = 0;
 		entry->nwaiters = 0;
@@ -2827,6 +2830,7 @@ cluster_grd_entry_lookup_or_create(const ClusterResId *resid, bool create, Clust
 		entry->nreservations = 0;
 		entry->fair_queue_next = 0;
 		pg_atomic_init_u32(&entry->pin, 0);
+		dlist_push_tail(&cluster_grd_state->entry_shard_lists[shard_id], &entry->shard_link);
 		/* holders / waiters / converts arrays left uninitialized;
 		 * spec-2.16 mutator path initializes per-slot on add. */
 		pg_atomic_fetch_add_u64(&cluster_grd_state->entry_current_count, 1);
@@ -2834,14 +2838,12 @@ cluster_grd_entry_lookup_or_create(const ClusterResId *resid, bool create, Clust
 	}
 	if (!cluster_grd_entry_pin_locked(entry)) {
 		LWLockRelease(&cluster_grd_shard_locks[shard_id].lock);
-		LWLockRelease(&cluster_grd_table_lock[0].lock);
 		return CLUSTER_GRD_ENTRY_ERROR;
 	}
 	pg_atomic_fetch_add_u64(&cluster_grd_state->entry_lookup_hit_count, 1);
 
 	/* Step 8: release shard partition LWLock — caller holds a lookup pin. */
 	LWLockRelease(&cluster_grd_shard_locks[shard_id].lock);
-	LWLockRelease(&cluster_grd_table_lock[0].lock);
 
 	*out = entry;
 	return CLUSTER_GRD_ENTRY_OK;
@@ -2969,11 +2971,11 @@ cluster_grd_sweep_runs(void)
 /* ============================================================
  * spec-2.15 D8 + spec-6.3a: SRF row visitor.
  *
- *   Snapshot resource ids while holding the GRD entry table lock in shared
- *   mode, then re-lookup each row through cluster_grd_entry_lookup_or_create()
- *   so the per-entry slock_t snapshot is protected by a real lookup pin.  This
- *   keeps observability safe while cold reclaim can HASH_REMOVE holderless
- *   entries.
+ *   Snapshot resource ids from shard-local entry lists while holding one shard
+ *   lock at a time, then re-lookup each row through cluster_grd_entry_lookup_
+ *   or_create() so the per-entry slock_t snapshot is protected by a real lookup
+ *   pin.  This keeps observability safe while cold reclaim can HASH_REMOVE
+ *   holderless entries.
  * ============================================================ */
 
 void
@@ -3949,7 +3951,8 @@ cluster_grd_entry_enqueue_or_grant_impl(const ClusterResId *resid, const Cluster
 									request_id, meta.xid, meta.wait_seq, &r_vertex);
 				SpinLockRelease(&entry->lock);
 
-				published = cluster_lmd_submit_wait_edge_real(&r_vertex, &w_vertex, request_id);
+				published
+					= grd_lmd_submit_wait_edge_pinned(entry, &r_vertex, &w_vertex, request_id);
 
 				SpinLockAcquire(&entry->lock);
 				/*
@@ -3969,7 +3972,7 @@ cluster_grd_entry_enqueue_or_grant_impl(const ClusterResId *resid, const Cluster
 												  (LOCKMODE)lockmode, meta)
 						< 0) {
 						SpinLockRelease(&entry->lock);
-						cluster_lmd_cancel_wait_edge_real(&r_vertex);
+						grd_lmd_cancel_wait_edge_pinned(entry, &r_vertex);
 						cluster_grd_entry_release(entry);
 						cluster_grd_inc_ges_work_queue_full();
 						return CLUSTER_GRD_WAIT_QUEUE_FULL;
@@ -3986,7 +3989,7 @@ cluster_grd_entry_enqueue_or_grant_impl(const ClusterResId *resid, const Cluster
 				 * the CURRENT holders (never false-grant). */
 				SpinLockRelease(&entry->lock);
 				if (published)
-					cluster_lmd_cancel_wait_edge_real(&r_vertex);
+					grd_lmd_cancel_wait_edge_pinned(entry, &r_vertex);
 				else
 					pg_atomic_fetch_add_u64(
 						&cluster_grd_state->starvation_barrier_publish_fail_count, 1);
@@ -5197,7 +5200,7 @@ cluster_grd_reservation_promote(ClusterGrdEntry *entry, const ClusterGrdHolderId
 /*
  * spec-2.16 Step 4 D11 + spec-6.3a: CSSD DEAD master sweep.
  *
- *   Snapshot entry keys under the table scan lock, then re-lookup each resource
+ *   Snapshot entry keys from shard-local lists, then re-lookup each resource
  *   through the 6.3a pin discipline before filtering holders[] / waiters[] /
  *   converts[] / reservations by node_id == dead_node_id (I48 — NO epoch
  *   filter).  Empty entries are reclaimed by the last-pin release path, not by
@@ -5211,11 +5214,10 @@ static int
 cluster_grd_snapshot_entry_resids(ClusterResId **out_resids)
 {
 	ClusterResId *resids;
-	HASH_SEQ_STATUS status;
-	ClusterGrdEntry *entry;
 	int capacity;
 	int n = 0;
-	bool overflow;
+	bool overflow = false;
+	uint32 shard_id;
 
 	Assert(out_resids != NULL);
 	*out_resids = NULL;
@@ -5223,26 +5225,36 @@ cluster_grd_snapshot_entry_resids(ClusterResId **out_resids)
 	if (cluster_grd_entry_htab == NULL)
 		return 0;
 
+	capacity = Max(cluster_grd_entry_count(), 1);
 	do {
-		capacity = Max(cluster_grd_entry_count(), 1);
 		resids = (ClusterResId *)palloc0((Size)capacity * sizeof(ClusterResId));
 		n = 0;
 		overflow = false;
 
-		LWLockAcquire(&cluster_grd_table_lock[0].lock, LW_SHARED);
-		hash_seq_init(&status, cluster_grd_entry_htab);
-		while ((entry = (ClusterGrdEntry *)hash_seq_search(&status)) != NULL) {
-			if (n >= capacity) {
-				overflow = true;
-				hash_seq_term(&status);
-				break;
-			}
-			resids[n++] = entry->resid;
-		}
-		LWLockRelease(&cluster_grd_table_lock[0].lock);
+		for (shard_id = 0; shard_id < PGRAC_GRD_SHARD_COUNT; shard_id++) {
+			dlist_iter iter;
 
-		if (overflow)
+			LWLockAcquire(&cluster_grd_shard_locks[shard_id].lock, LW_SHARED);
+			dlist_foreach(iter, &cluster_grd_state->entry_shard_lists[shard_id])
+			{
+				ClusterGrdEntry *entry;
+
+				if (n >= capacity) {
+					overflow = true;
+					break;
+				}
+				entry = dlist_container(ClusterGrdEntry, shard_link, iter.cur);
+				resids[n++] = entry->resid;
+			}
+			LWLockRelease(&cluster_grd_shard_locks[shard_id].lock);
+			if (overflow)
+				break;
+		}
+
+		if (overflow) {
 			pfree(resids);
+			capacity = capacity <= INT_MAX / 2 ? capacity * 2 : INT_MAX;
+		}
 	} while (overflow);
 
 	*out_resids = resids;
@@ -5717,11 +5729,10 @@ DEFINE_BAST_COUNTER(deadlock_chunk_oo_buffer_overflow, deadlock_chunk_oo_buffer_
  * ============================================================ */
 
 /*
- * spec-2.24 D10 helper — HASH_REMOVE guarded by the GRD table lock in
- * exclusive mode plus the shard partition LWLock, with re-lookup and
- * verify-still-empty.  Returns true if removed (we are the at-most-once
- * winner per HC26 I-cleanup-4); false if another cleanup path already removed
- * the entry or the entry is no longer empty.
+ * spec-2.24 D10 helper — HASH_REMOVE guarded by the shard partition LWLock,
+ * with re-lookup and verify-still-empty.  Returns true if removed (we are the
+ * at-most-once winner per HC26 I-cleanup-4); false if another cleanup path
+ * already removed the entry or the entry is no longer empty.
  */
 static bool
 cluster_grd_hashremove_if_still_empty_locked(ClusterGrdEntry *entry)
@@ -5745,6 +5756,7 @@ cluster_grd_hashremove_if_still_empty_locked(ClusterGrdEntry *entry)
 		entry->state_flags |= CLUSTER_GRD_ENTRY_FLAG_RECLAIMING;
 		SpinLockRelease(&entry->lock);
 
+		dlist_delete_thoroughly(&entry->shard_link);
 		(void)hash_search_with_hash_value(cluster_grd_entry_htab, &rid, hashvalue, HASH_REMOVE,
 										  &found);
 		if (found) {
@@ -5778,7 +5790,6 @@ cluster_grd_hashremove_if_still_empty(const ClusterResId *resid)
 	hashvalue = (uint32)hash64;
 	shard_id = cluster_grd_shard_for_hash(hash64);
 
-	LWLockAcquire(&cluster_grd_table_lock[0].lock, LW_EXCLUSIVE);
 	LWLockAcquire(&cluster_grd_shard_locks[shard_id].lock, LW_EXCLUSIVE);
 
 	entry
@@ -5787,7 +5798,6 @@ cluster_grd_hashremove_if_still_empty(const ClusterResId *resid)
 		removed = cluster_grd_hashremove_if_still_empty_locked(entry);
 
 	LWLockRelease(&cluster_grd_shard_locks[shard_id].lock);
-	LWLockRelease(&cluster_grd_table_lock[0].lock);
 	return removed;
 }
 
@@ -5802,46 +5812,48 @@ cluster_grd_reclaim_if_cold(const ClusterResId *resid)
 int
 cluster_grd_reclaim_sweep(void)
 {
-	ClusterResId batch[CLUSTER_GRD_SWEEP_BATCH_MAX];
-	HASH_SEQ_STATUS status;
-	ClusterGrdEntry *entry;
+	ClusterResId *batch;
 	int budget;
 	int n = 0;
 	int removed = 0;
 	int i;
-	bool scan_done = false;
+	uint32 shard_id;
 
 	if (!cluster_grd_entry_reclaim || cluster_grd_entry_htab == NULL)
 		return 0;
 	if (cluster_grd_entry_reclaim_max_per_sweep <= 0)
 		return 0;
 
-	budget = Min(cluster_grd_entry_reclaim_max_per_sweep, CLUSTER_GRD_SWEEP_BATCH_MAX);
+	budget = cluster_grd_entry_reclaim_max_per_sweep;
+	batch = (ClusterResId *)palloc0((Size)budget * sizeof(ClusterResId));
 	pg_atomic_fetch_add_u64(&cluster_grd_state->sweep_runs, 1);
 
-	LWLockAcquire(&cluster_grd_table_lock[0].lock, LW_SHARED);
-	hash_seq_init(&status, cluster_grd_entry_htab);
-	while (n < budget) {
-		entry = (ClusterGrdEntry *)hash_seq_search(&status);
-		if (entry == NULL) {
-			scan_done = true;
-			break;
+	for (shard_id = 0; shard_id < PGRAC_GRD_SHARD_COUNT && n < budget; shard_id++) {
+		dlist_iter iter;
+
+		LWLockAcquire(&cluster_grd_shard_locks[shard_id].lock, LW_SHARED);
+		dlist_foreach(iter, &cluster_grd_state->entry_shard_lists[shard_id])
+		{
+			ClusterGrdEntry *entry;
+
+			if (n >= budget)
+				break;
+			entry = dlist_container(ClusterGrdEntry, shard_link, iter.cur);
+			SpinLockAcquire(&entry->lock);
+			if (cluster_grd_entry_is_reclaimable(entry))
+				batch[n++] = entry->resid;
+			else if (pg_atomic_read_u32(&entry->pin) != 0)
+				pg_atomic_fetch_add_u64(&cluster_grd_state->reclaim_skipped_pinned_count, 1);
+			SpinLockRelease(&entry->lock);
 		}
-		SpinLockAcquire(&entry->lock);
-		if (cluster_grd_entry_is_reclaimable(entry))
-			batch[n++] = entry->resid;
-		else if (pg_atomic_read_u32(&entry->pin) != 0)
-			pg_atomic_fetch_add_u64(&cluster_grd_state->reclaim_skipped_pinned_count, 1);
-		SpinLockRelease(&entry->lock);
+		LWLockRelease(&cluster_grd_shard_locks[shard_id].lock);
 	}
-	if (!scan_done)
-		hash_seq_term(&status);
-	LWLockRelease(&cluster_grd_table_lock[0].lock);
 
 	for (i = 0; i < n; i++)
 		if (cluster_grd_hashremove_if_still_empty(&batch[i]))
 			removed++;
 
+	pfree(batch);
 	return removed;
 }
 
@@ -5879,11 +5891,9 @@ int
 cluster_grd_entry_cleanup_guarded(ClusterGrdEntry *entry, int dead_procno, int32 dead_node_id)
 {
 	int removed = 0;
-	bool became_empty = false;
 	GesRequestPayload release_payloads[PGRAC_GRD_MAX_HOLDERS];
 	int n_release = 0;
 	ClusterResId entry_resid;
-	bool pinned_after_cleanup;
 
 	Assert(entry != NULL);
 
@@ -5991,10 +6001,6 @@ cluster_grd_entry_cleanup_guarded(ClusterGrdEntry *entry, int dead_procno, int32
 	if (removed > 0)
 		entry->generation++;
 
-	became_empty = (entry->ngranted == 0 && entry->nwaiters == 0 && entry->nconverts == 0
-					&& entry->nreservations == 0);
-	pinned_after_cleanup = (pg_atomic_read_u32(&entry->pin) != 0);
-
 	memcpy(&entry_resid, &entry->resid, sizeof(entry_resid));
 
 	SpinLockRelease(&entry->lock);
@@ -6011,22 +6017,13 @@ cluster_grd_entry_cleanup_guarded(ClusterGrdEntry *entry, int dead_procno, int32
 		}
 	}
 
-	/* HC26 I-cleanup-4 — HASH_REMOVE at-most-once per entry lifetime.
-	 * Re-acquire shard partition LWLock + re-lookup resid + verify still
-	 * empty; the losing path (race with another cleanup that already
-	 * removed) increments skip counter. */
-	if (became_empty && !pinned_after_cleanup) {
-		bool removed_ok = cluster_grd_hashremove_if_still_empty(&entry_resid);
-		if (!removed_ok)
-			cluster_lmd_cleanup_skip_other_owner_count_inc(1);
-	}
-
 	return removed;
 }
 
 /*
- * Entry-by-procno sweep.  Iterates GRD HTAB; for each entry, invokes
- * D10 guarded primitive.  Returns total slots removed.
+ * Entry-by-procno sweep.  Snapshots GRD entry keys, then re-lookups each entry
+ * with a pin before invoking the D10 guarded primitive.  Returns total slots
+ * removed.
  */
 static int
 cluster_grd_entries_cleanup_by_procno_guarded(int procno)
