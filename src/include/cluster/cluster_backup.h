@@ -129,8 +129,7 @@ typedef struct ClusterBackupStatus {
 } ClusterBackupStatus;
 
 extern void cluster_backup_manifest_init(ClusterBackupManifest *manifest, const char *backup_id);
-extern bool cluster_backup_manifest_set_thread(ClusterBackupManifest *manifest,
-											   int thread_index,
+extern bool cluster_backup_manifest_set_thread(ClusterBackupManifest *manifest, int thread_index,
 											   const ClusterBackupManifestThread *thread);
 extern uint32 cluster_backup_manifest_compute_crc(const ClusterBackupManifest *manifest);
 extern void cluster_backup_manifest_seal(ClusterBackupManifest *manifest);
@@ -139,29 +138,20 @@ cluster_backup_manifest_validate(const ClusterBackupManifest *manifest);
 extern const char *cluster_backup_manifest_reason_name(ClusterBackupManifestReason reason);
 
 extern ClusterRestorePointCutReason
-cluster_restore_point_build(ClusterRestorePoint *out,
-							const char *name,
-							const SCN *thread_scn,
-							const XLogRecPtr *thread_lsn,
-							int max_threads,
-							bool pending_commits_empty,
-							bool commit_fence_held,
-							uint32 incarnation);
+cluster_restore_point_build(ClusterRestorePoint *out, const char *name, const SCN *thread_scn,
+							const XLogRecPtr *thread_lsn, int max_threads,
+							bool pending_commits_empty, bool commit_fence_held, uint32 incarnation);
 extern const char *cluster_restore_point_cut_reason_name(ClusterRestorePointCutReason reason);
 
-extern ClusterPitrTargetReason
-cluster_pitr_resolve_scn(const ClusterRestorePoint *points,
-						 int npoints,
-						 SCN requested_scn,
-						 SCN backup_consistent_scn,
-						 ClusterRestorePoint *out);
+extern ClusterPitrTargetReason cluster_pitr_resolve_scn(const ClusterRestorePoint *points,
+														int npoints, SCN requested_scn,
+														SCN backup_consistent_scn,
+														ClusterRestorePoint *out);
 extern const char *cluster_pitr_target_reason_name(ClusterPitrTargetReason reason);
 
 extern ClusterRestoreCompatibilityReason
-cluster_backup_manifest_compatible(const ClusterBackupManifest *manifest,
-								   uint32 current_catversion,
-								   uint32 current_storage_id,
-								   uint32 expected_node_count);
+cluster_backup_manifest_compatible(const ClusterBackupManifest *manifest, uint32 current_catversion,
+								   uint32 current_storage_id, uint32 expected_node_count);
 extern const char *cluster_restore_compat_reason_name(ClusterRestoreCompatibilityReason reason);
 
 #ifndef FRONTEND

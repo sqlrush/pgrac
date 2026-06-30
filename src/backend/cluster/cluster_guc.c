@@ -834,8 +834,7 @@ static const struct config_enum_entry cluster_recovery_target_action_options[]
 		{ NULL, 0, false } };
 
 static const struct config_enum_entry cluster_backup_manifest_checksum_options[]
-	= { { "crc32c", CLUSTER_BACKUP_MANIFEST_CHECKSUM_CRC32C, false },
-		{ NULL, 0, false } };
+	= { { "crc32c", CLUSTER_BACKUP_MANIFEST_CHECKSUM_CRC32C, false }, { NULL, 0, false } };
 
 
 /*
@@ -1166,15 +1165,13 @@ cluster_init_guc(void)
 		NULL, NULL);
 
 	DefineCustomStringVariable(
-		"cluster.recovery_target_scn",
-		gettext_noop("Cluster PITR target SCN."),
+		"cluster.recovery_target_scn", gettext_noop("Cluster PITR target SCN."),
 		gettext_noop("When set, cluster PITR status resolves the requested SCN against "
 					 "cluster restore points and refuses unreachable targets."),
 		&cluster_recovery_target_scn, "", PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	DefineCustomStringVariable(
-		"cluster.recovery_target_cluster_time",
-		gettext_noop("Cluster PITR target timestamp."),
+		"cluster.recovery_target_cluster_time", gettext_noop("Cluster PITR target timestamp."),
 		gettext_noop("Reserved target timestamp for cluster-aware recovery planning. "
 					 "Spec-6.5 exposes the configuration and status surface; the "
 					 "startup recovery action remains fail-closed until the "
@@ -1182,8 +1179,7 @@ cluster_init_guc(void)
 		&cluster_recovery_target_cluster_time, "", PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	DefineCustomStringVariable(
-		"cluster.recovery_target_name",
-		gettext_noop("Cluster PITR named restore point target."),
+		"cluster.recovery_target_name", gettext_noop("Cluster PITR named restore point target."),
 		gettext_noop("Reserved named cluster restore-point target.  The status view "
 					 "reports restore points produced by pg_cluster_create_restore_point."),
 		&cluster_recovery_target_name, "", PGC_POSTMASTER, 0, NULL, NULL, NULL);
@@ -1205,12 +1201,11 @@ cluster_init_guc(void)
 					 "cluster-wide cut coordinator is present."),
 		&cluster_enable_pitr_restore_points, false, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
-	DefineCustomIntVariable(
-		"cluster.pitr_restore_point_interval_ms",
-		gettext_noop("Interval for automatic cluster PITR restore points."),
-		gettext_noop("Zero disables automatic restore point scheduling."),
-		&cluster_pitr_restore_point_interval_ms, 0, 0, 86400000, PGC_SIGHUP, GUC_UNIT_MS, NULL,
-		NULL, NULL);
+	DefineCustomIntVariable("cluster.pitr_restore_point_interval_ms",
+							gettext_noop("Interval for automatic cluster PITR restore points."),
+							gettext_noop("Zero disables automatic restore point scheduling."),
+							&cluster_pitr_restore_point_interval_ms, 0, 0, 86400000, PGC_SIGHUP,
+							GUC_UNIT_MS, NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
 		"cluster.backup_wal_retention",
@@ -1218,12 +1213,10 @@ cluster_init_guc(void)
 		gettext_noop("The 6.5 manifest/status surface records the setting; actual "
 					 "multi-thread retention enforcement is deferred to the backup-set "
 					 "writer."),
-		&cluster_backup_wal_retention, 0, 0, INT_MAX, PGC_SIGHUP, GUC_UNIT_MB, NULL, NULL,
-		NULL);
+		&cluster_backup_wal_retention, 0, 0, INT_MAX, PGC_SIGHUP, GUC_UNIT_MB, NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
-		"cluster.backup_parallel_channels",
-		gettext_noop("Maximum cluster backup copy channels."),
+		"cluster.backup_parallel_channels", gettext_noop("Maximum cluster backup copy channels."),
 		gettext_noop("Reserved capacity knob for the cluster backup-set writer."),
 		&cluster_backup_parallel_channels, 1, 1, CLUSTER_MAX_NODES, PGC_SIGHUP, 0, NULL, NULL,
 		NULL);

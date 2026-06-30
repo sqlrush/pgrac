@@ -168,8 +168,7 @@ cluster_backup_update_start(const char *backup_id, const BackupState *state)
 }
 
 static void
-cluster_backup_update_stop(const BackupState *state,
-						   const ClusterBackupManifest *manifest,
+cluster_backup_update_stop(const BackupState *state, const ClusterBackupManifest *manifest,
 						   SCN cut_scn)
 {
 	LWLockAcquire(&cluster_backup_state->lock.lock, LW_EXCLUSIVE);
@@ -270,8 +269,7 @@ cluster_backup_get_restore_points(ClusterRestorePoint *out, int max_points)
 }
 
 static void
-cluster_backup_fill_local_manifest(ClusterBackupManifest *manifest,
-								   const BackupState *state,
+cluster_backup_fill_local_manifest(ClusterBackupManifest *manifest, const BackupState *state,
 								   SCN cut_scn)
 {
 	ClusterBackupManifestThread thread;
@@ -319,8 +317,7 @@ cluster_backup_fill_local_manifest(ClusterBackupManifest *manifest,
 }
 
 static char *
-cluster_backup_build_label(const BackupState *state,
-						   const ClusterBackupManifest *manifest,
+cluster_backup_build_label(const BackupState *state, const ClusterBackupManifest *manifest,
 						   SCN cut_scn)
 {
 	StringInfoData buf;
@@ -343,8 +340,8 @@ pg_cluster_backup_start(PG_FUNCTION_ARGS)
 {
 #define PG_CLUSTER_BACKUP_START_COLS 4
 	TupleDesc tupdesc;
-	Datum values[PG_CLUSTER_BACKUP_START_COLS] = {0};
-	bool nulls[PG_CLUSTER_BACKUP_START_COLS] = {0};
+	Datum values[PG_CLUSTER_BACKUP_START_COLS] = { 0 };
+	bool nulls[PG_CLUSTER_BACKUP_START_COLS] = { 0 };
 	text *backupid = PG_GETARG_TEXT_PP(0);
 	bool fast = PG_GETARG_BOOL(1);
 	char *backupidstr;
@@ -361,9 +358,9 @@ pg_cluster_backup_start(PG_FUNCTION_ARGS)
 
 	backupidstr = text_to_cstring(backupid);
 	if (strlen(backupidstr) >= CLUSTER_BACKUP_ID_MAX)
-		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						errmsg("cluster backup id is too long"),
-						errdetail("Maximum length is %d bytes.", CLUSTER_BACKUP_ID_MAX - 1)));
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("cluster backup id is too long"),
+				 errdetail("Maximum length is %d bytes.", CLUSTER_BACKUP_ID_MAX - 1)));
 
 	status = get_backup_status();
 	if (status == SESSION_BACKUP_RUNNING)
@@ -371,8 +368,7 @@ pg_cluster_backup_start(PG_FUNCTION_ARGS)
 						errmsg("a backup is already in progress in this session")));
 
 	if (cluster_backup_context == NULL)
-		cluster_backup_context = AllocSetContextCreate(TopMemoryContext,
-													   "cluster backup context",
+		cluster_backup_context = AllocSetContextCreate(TopMemoryContext, "cluster backup context",
 													   ALLOCSET_START_SMALL_SIZES);
 	else {
 		cluster_backup_session_state = NULL;
@@ -403,8 +399,8 @@ pg_cluster_backup_stop(PG_FUNCTION_ARGS)
 {
 #define PG_CLUSTER_BACKUP_STOP_COLS 4
 	TupleDesc tupdesc;
-	Datum values[PG_CLUSTER_BACKUP_STOP_COLS] = {0};
-	bool nulls[PG_CLUSTER_BACKUP_STOP_COLS] = {0};
+	Datum values[PG_CLUSTER_BACKUP_STOP_COLS] = { 0 };
+	bool nulls[PG_CLUSTER_BACKUP_STOP_COLS] = { 0 };
 	bool waitforarchive = PG_GETARG_BOOL(0);
 	ClusterBackupManifest manifest;
 	ClusterRestorePoint point;
@@ -471,8 +467,8 @@ pg_cluster_create_restore_point(PG_FUNCTION_ARGS)
 {
 #define PG_CLUSTER_RESTORE_POINT_COLS 3
 	TupleDesc tupdesc;
-	Datum values[PG_CLUSTER_RESTORE_POINT_COLS] = {0};
-	bool nulls[PG_CLUSTER_RESTORE_POINT_COLS] = {0};
+	Datum values[PG_CLUSTER_RESTORE_POINT_COLS] = { 0 };
+	bool nulls[PG_CLUSTER_RESTORE_POINT_COLS] = { 0 };
 	text *restore_name = PG_GETARG_TEXT_PP(0);
 	char *restore_name_str;
 	XLogRecPtr restorepoint;
@@ -493,19 +489,20 @@ pg_cluster_create_restore_point(PG_FUNCTION_ARGS)
 						errmsg("recovery is in progress"),
 						errhint("WAL control functions cannot be executed during recovery.")));
 	if (!XLogIsNeeded())
-		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						errmsg("WAL level not sufficient for creating a restore point"),
-						errhint("wal_level must be set to \"replica\" or \"logical\" at server start.")));
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("WAL level not sufficient for creating a restore point"),
+				 errhint("wal_level must be set to \"replica\" or \"logical\" at server start.")));
 
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
 
 	restore_name_str = text_to_cstring(restore_name);
 	if (strlen(restore_name_str) >= CLUSTER_RESTORE_POINT_NAME_MAX)
-		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						errmsg("cluster restore point name is too long"),
-						errdetail("Maximum length is %d bytes.",
-								  CLUSTER_RESTORE_POINT_NAME_MAX - 1)));
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("cluster restore point name is too long"),
+				 errdetail("Maximum length is %d bytes.", CLUSTER_RESTORE_POINT_NAME_MAX - 1)));
 
 	restorepoint = XLogRestorePoint(restore_name_str);
 	cut_scn = cluster_backup_current_scn();
@@ -621,7 +618,7 @@ cluster_get_restore_points(PG_FUNCTION_ARGS)
 	count = cluster_backup_get_restore_points(points, CLUSTER_BACKUP_RESTORE_POINT_MAX);
 	for (i = 0; i < count; i++) {
 		Datum values[5];
-		bool nulls[5] = {false};
+		bool nulls[5] = { false };
 
 		values[0] = CStringGetTextDatum(points[i].name);
 		values[1] = Int64GetDatum((int64)points[i].cut_scn);
@@ -645,7 +642,7 @@ cluster_get_pitr_status(PG_FUNCTION_ARGS)
 	ClusterRestorePoint chosen;
 	ClusterPitrTargetReason reason;
 	Datum values[6];
-	bool nulls[6] = {false};
+	bool nulls[6] = { false };
 	int count;
 	int i;
 	const char *target_action = cluster_pitr_action_name(cluster_recovery_target_action);
@@ -775,8 +772,8 @@ cluster_get_pitr_status(PG_FUNCTION_ARGS)
 	}
 
 	count = cluster_backup_get_restore_points(points, CLUSTER_BACKUP_RESTORE_POINT_MAX);
-	reason = cluster_pitr_resolve_scn(points, count, requested_scn,
-									  manifest.consistent_scn, &chosen);
+	reason
+		= cluster_pitr_resolve_scn(points, count, requested_scn, manifest.consistent_scn, &chosen);
 	values[0] = CStringGetTextDatum("scn");
 	values[1] = CStringGetTextDatum(target_action);
 	values[2] = BoolGetDatum(reason == CLUSTER_PITR_TARGET_OK);
@@ -802,13 +799,11 @@ cluster_backup_shmem_size(void)
 
 void
 cluster_backup_shmem_init(void)
-{
-}
+{}
 
 void
 cluster_backup_shmem_register(void)
-{
-}
+{}
 
 void
 cluster_backup_get_status(ClusterBackupStatus *out)

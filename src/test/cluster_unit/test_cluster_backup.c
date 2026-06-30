@@ -175,12 +175,12 @@ UT_TEST(test_restore_point_cut_requires_drain_and_fence)
 	scns[0] = test_scn(20);
 	lsns[0] = 500;
 
-	UT_ASSERT_EQ(cluster_restore_point_build(&point, "rp", scns, lsns, CLUSTER_MAX_NODES,
-											 false, true, 0),
-				 CLUSTER_RESTORE_POINT_CUT_PENDING_COMMITS);
-	UT_ASSERT_EQ(cluster_restore_point_build(&point, "rp", scns, lsns, CLUSTER_MAX_NODES,
-											 true, false, 0),
-				 CLUSTER_RESTORE_POINT_CUT_NO_FENCE);
+	UT_ASSERT_EQ(
+		cluster_restore_point_build(&point, "rp", scns, lsns, CLUSTER_MAX_NODES, false, true, 0),
+		CLUSTER_RESTORE_POINT_CUT_PENDING_COMMITS);
+	UT_ASSERT_EQ(
+		cluster_restore_point_build(&point, "rp", scns, lsns, CLUSTER_MAX_NODES, true, false, 0),
+		CLUSTER_RESTORE_POINT_CUT_NO_FENCE);
 }
 
 UT_TEST(test_restore_point_cut_records_all_threads)
@@ -196,9 +196,9 @@ UT_TEST(test_restore_point_cut_records_all_threads)
 	scns[2] = test_scn(30);
 	lsns[2] = 700;
 
-	UT_ASSERT_EQ(cluster_restore_point_build(&point, "rp", scns, lsns, CLUSTER_MAX_NODES,
-											 true, true, 9),
-				 CLUSTER_RESTORE_POINT_CUT_OK);
+	UT_ASSERT_EQ(
+		cluster_restore_point_build(&point, "rp", scns, lsns, CLUSTER_MAX_NODES, true, true, 9),
+		CLUSTER_RESTORE_POINT_CUT_OK);
 	UT_ASSERT_EQ(point.thread_count, 2);
 	UT_ASSERT_EQ(point.cut_scn, test_scn(30));
 	UT_ASSERT_EQ(point.incarnation, 9);
@@ -214,9 +214,9 @@ UT_TEST(test_restore_point_cut_rejects_partial_thread)
 	memset(scns, 0, sizeof(scns));
 	memset(lsns, 0, sizeof(lsns));
 	scns[0] = test_scn(20);
-	UT_ASSERT_EQ(cluster_restore_point_build(&point, "rp", scns, lsns, CLUSTER_MAX_NODES,
-											 true, true, 0),
-				 CLUSTER_RESTORE_POINT_CUT_BAD_THREAD);
+	UT_ASSERT_EQ(
+		cluster_restore_point_build(&point, "rp", scns, lsns, CLUSTER_MAX_NODES, true, true, 0),
+		CLUSTER_RESTORE_POINT_CUT_BAD_THREAD);
 }
 
 UT_TEST(test_pitr_resolves_latest_reachable_restore_point)

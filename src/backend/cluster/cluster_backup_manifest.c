@@ -54,8 +54,7 @@ cluster_backup_manifest_init(ClusterBackupManifest *manifest, const char *backup
 }
 
 bool
-cluster_backup_manifest_set_thread(ClusterBackupManifest *manifest,
-								   int thread_index,
+cluster_backup_manifest_set_thread(ClusterBackupManifest *manifest, int thread_index,
 								   const ClusterBackupManifestThread *thread)
 {
 	if (manifest == NULL || thread == NULL)
@@ -109,13 +108,13 @@ cluster_backup_manifest_validate(const ClusterBackupManifest *manifest)
 		return CLUSTER_BACKUP_MANIFEST_BAD_MAGIC;
 	if (manifest->version != CLUSTER_BACKUP_MANIFEST_VERSION)
 		return CLUSTER_BACKUP_MANIFEST_BAD_VERSION;
-	if (manifest->node_count == 0 || manifest->node_count > CLUSTER_MAX_NODES ||
-		manifest->thread_count == 0 || manifest->thread_count > CLUSTER_MAX_NODES)
+	if (manifest->node_count == 0 || manifest->node_count > CLUSTER_MAX_NODES
+		|| manifest->thread_count == 0 || manifest->thread_count > CLUSTER_MAX_NODES)
 		return CLUSTER_BACKUP_MANIFEST_BAD_COUNTS;
 	if (!manifest->control_included)
 		return CLUSTER_BACKUP_MANIFEST_MISSING_CONTROL;
-	if (!SCN_VALID(manifest->consistent_scn) || !SCN_VALID(manifest->scn_durable_peak) ||
-		cluster_backup_scn_cmp(manifest->scn_durable_peak, manifest->consistent_scn) < 0)
+	if (!SCN_VALID(manifest->consistent_scn) || !SCN_VALID(manifest->scn_durable_peak)
+		|| cluster_backup_scn_cmp(manifest->scn_durable_peak, manifest->consistent_scn) < 0)
 		return CLUSTER_BACKUP_MANIFEST_BAD_SCN_PEAK;
 
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
@@ -127,10 +126,10 @@ cluster_backup_manifest_validate(const ClusterBackupManifest *manifest)
 		present_count++;
 		if (thread->thread_id == 0 || thread->thread_id > CLUSTER_MAX_NODES)
 			return CLUSTER_BACKUP_MANIFEST_MISSING_THREAD;
-		if (thread->start_redo_lsn == InvalidXLogRecPtr ||
-			thread->checkpoint_lsn == InvalidXLogRecPtr ||
-			thread->stop_cut_lsn == InvalidXLogRecPtr ||
-			thread->stop_cut_lsn < thread->start_redo_lsn)
+		if (thread->start_redo_lsn == InvalidXLogRecPtr
+			|| thread->checkpoint_lsn == InvalidXLogRecPtr
+			|| thread->stop_cut_lsn == InvalidXLogRecPtr
+			|| thread->stop_cut_lsn < thread->start_redo_lsn)
 			return CLUSTER_BACKUP_MANIFEST_BAD_LSN_RANGE;
 		if (!thread->wal_included)
 			return CLUSTER_BACKUP_MANIFEST_MISSING_WAL;
@@ -183,14 +182,9 @@ cluster_backup_manifest_reason_name(ClusterBackupManifestReason reason)
 }
 
 ClusterRestorePointCutReason
-cluster_restore_point_build(ClusterRestorePoint *out,
-							const char *name,
-							const SCN *thread_scn,
-							const XLogRecPtr *thread_lsn,
-							int max_threads,
-							bool pending_commits_empty,
-							bool commit_fence_held,
-							uint32 incarnation)
+cluster_restore_point_build(ClusterRestorePoint *out, const char *name, const SCN *thread_scn,
+							const XLogRecPtr *thread_lsn, int max_threads,
+							bool pending_commits_empty, bool commit_fence_held, uint32 incarnation)
 {
 	SCN max_scn = InvalidScn;
 	int i;
@@ -200,8 +194,8 @@ cluster_restore_point_build(ClusterRestorePoint *out,
 		return CLUSTER_RESTORE_POINT_CUT_PENDING_COMMITS;
 	if (!commit_fence_held)
 		return CLUSTER_RESTORE_POINT_CUT_NO_FENCE;
-	if (out == NULL || thread_scn == NULL || thread_lsn == NULL ||
-		max_threads <= 0 || max_threads > CLUSTER_MAX_NODES)
+	if (out == NULL || thread_scn == NULL || thread_lsn == NULL || max_threads <= 0
+		|| max_threads > CLUSTER_MAX_NODES)
 		return CLUSTER_RESTORE_POINT_CUT_NO_THREADS;
 
 	memset(out, 0, sizeof(*out));
@@ -249,17 +243,14 @@ cluster_restore_point_cut_reason_name(ClusterRestorePointCutReason reason)
 }
 
 ClusterPitrTargetReason
-cluster_pitr_resolve_scn(const ClusterRestorePoint *points,
-						 int npoints,
-						 SCN requested_scn,
-						 SCN backup_consistent_scn,
-						 ClusterRestorePoint *out)
+cluster_pitr_resolve_scn(const ClusterRestorePoint *points, int npoints, SCN requested_scn,
+						 SCN backup_consistent_scn, ClusterRestorePoint *out)
 {
 	const ClusterRestorePoint *best = NULL;
 	int i;
 
-	if (!SCN_VALID(requested_scn) || !SCN_VALID(backup_consistent_scn) ||
-		cluster_backup_scn_cmp(requested_scn, backup_consistent_scn) < 0)
+	if (!SCN_VALID(requested_scn) || !SCN_VALID(backup_consistent_scn)
+		|| cluster_backup_scn_cmp(requested_scn, backup_consistent_scn) < 0)
 		return CLUSTER_PITR_TARGET_BEFORE_BACKUP;
 	if (points == NULL || npoints <= 0)
 		return CLUSTER_PITR_TARGET_NO_RESTORE_POINT;
@@ -306,10 +297,8 @@ cluster_pitr_target_reason_name(ClusterPitrTargetReason reason)
 }
 
 ClusterRestoreCompatibilityReason
-cluster_backup_manifest_compatible(const ClusterBackupManifest *manifest,
-								   uint32 current_catversion,
-								   uint32 current_storage_id,
-								   uint32 expected_node_count)
+cluster_backup_manifest_compatible(const ClusterBackupManifest *manifest, uint32 current_catversion,
+								   uint32 current_storage_id, uint32 expected_node_count)
 {
 	if (cluster_backup_manifest_validate(manifest) != CLUSTER_BACKUP_MANIFEST_OK)
 		return CLUSTER_RESTORE_COMPAT_MANIFEST;
