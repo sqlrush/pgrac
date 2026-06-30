@@ -690,6 +690,9 @@ static const struct config_enum_entry cluster_itl_finish_wal_mode_options[]
 		{ "generic", CLUSTER_ITL_FINISH_WAL_GENERIC, false },
 		{ NULL, 0, false } };
 
+/* spec-3.26 D5 (Lever B): undo buffer pin fast-path (default on). */
+bool cluster_undo_buf_pin_fastpath = true;
+
 /* spec-4.11 D1: online single-thread recovery (storage defined here; logic in
  * cluster_thread_recovery.c).  Dev default OFF (Q7/P2): default-on only once
  * the D7 capability gate is complete and every unsupported environment is
@@ -1013,6 +1016,16 @@ cluster_init_guc(void)
 
 	/* spec-3.26 D2: ITL xact-finish WAL mode (bespoke RM_CLUSTER_ITL vs legacy
 	 * GenericXLog).  PGC_SUSET so an operator can A/B compare / fall back. */
+	/* spec-3.26 D5 (Lever B): undo buffer pin fast-path toggle.  PGC_SUSET so an
+	 * operator can A/B compare / disable on a suspected pin-path regression. */
+	DefineCustomBoolVariable(
+		"cluster.undo_buf_pin_fastpath",
+		gettext_noop("Enable the backend-local last-pin fast path for undo buffer pins."),
+		gettext_noop("on (default) takes a SHARED map_lock + cached-slot revalidation to "
+					 "skip the O(nslots) EXCLUSIVE linear scan on repeat-block pins; off "
+					 "always uses the authoritative scan."),
+		&cluster_undo_buf_pin_fastpath, true, PGC_SUSET, 0, NULL, NULL, NULL);
+
 	DefineCustomEnumVariable(
 		"cluster.itl_finish_wal_mode",
 		gettext_noop("WAL representation for the ITL transaction-finish record."),

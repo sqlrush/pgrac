@@ -49,6 +49,7 @@
 
 #include "access/xlog.h"			/* XLogFlush — WAL-before-data on write-back (D2b) */
 #include "cluster/cluster_conf.h"	/* cluster_conf_has_peers — single-node gate (D2b) */
+#include "cluster/cluster_guc.h"	/* cluster_undo_buf_pin_fastpath (spec-3.26 D5) */
 #include "cluster/cluster_inject.h" /* spec-4.8ab D1 boundary-guard injection points */
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_undo_smgr.h"
@@ -553,6 +554,22 @@ cluster_undo_buf_invalidate_segment(uint32 segment_id, uint8 owner)
 }
 
 
+/*
+ * spec-3.26 D5 (Lever B): backend-local last-pin cache.  No shmem, no lock --
+ * a per-backend hot-path hint.  A repeat pin of the same undo block (the common
+ * per-DML pattern) revalidates this one cached slot under a SHARED map_lock
+ * instead of paying the O(nslots) EXCLUSIVE linear scan.  A stale cache simply
+ * fails revalidation and falls back to the authoritative path (never a
+ * wrong-slot pin -- r1-P1-3 / r2-P1-2).
+ */
+typedef struct UndoBufLastPin {
+	uint32 seg;
+	uint8 owner;
+	uint32 blk;
+	int slotno;
+} UndoBufLastPin;
+static UndoBufLastPin undo_last_pin = { .slotno = -1 };
+
 char *
 cluster_undo_buf_pin(uint32 segment_id, uint8 owner, uint32 block_no, ClusterUndoBufMode mode,
 					 ClusterUndoBufPin *pin)
@@ -565,7 +582,31 @@ cluster_undo_buf_pin(uint32 segment_id, uint8 owner, uint32 block_no, ClusterUnd
 	if (block_no < CLUSTER_UNDO_BUF_FIRST_DATA_BLOCK || UndoBufPool == NULL)
 		return NULL; /* caller uses the direct smgr path */
 
-	for (;;) {
+	/*
+	 * spec-3.26 D5 fast path: if the cached slot still maps this (seg, owner,
+	 * block) and is not mid-fill, pin it under a SHARED map_lock (which excludes
+	 * the EXCLUSIVE evictor, so the slot cannot be reused under us).  Any
+	 * mismatch / io_in_progress / disabled GUC -> fall through to the
+	 * authoritative EXCLUSIVE scan below.  Same return semantics either way.
+	 */
+	if (cluster_undo_buf_pin_fastpath && undo_last_pin.slotno >= 0
+		&& undo_last_pin.seg == segment_id && undo_last_pin.owner == owner
+		&& undo_last_pin.blk == block_no) {
+		int cs = undo_last_pin.slotno;
+
+		LWLockAcquire(&UndoBufPool->map_lock, LW_SHARED);
+		if (cs < UndoBufPool->nslots && slot_matches(&UndoBufSlots[cs], segment_id, owner, block_no)
+			&& !UndoBufSlots[cs].io_in_progress) {
+			pg_atomic_fetch_add_u32(&UndoBufSlots[cs].pincount, 1);
+			UndoBufSlots[cs].clock_used = 1; /* same-value hint; SHARED excludes evictor */
+			pg_atomic_fetch_add_u64(&UndoBufPool->hit_count, 1);
+			LWLockRelease(&UndoBufPool->map_lock);
+			slotno = cs;
+		} else
+			LWLockRelease(&UndoBufPool->map_lock);
+	}
+
+	while (slotno < 0) {
 		LWLockAcquire(&UndoBufPool->map_lock, LW_EXCLUSIVE);
 
 		/* Lookup. */
@@ -702,6 +743,13 @@ cluster_undo_buf_pin(uint32 segment_id, uint8 owner, uint32 block_no, ClusterUnd
 			break; /* pincount==1 held;  acquire mode below */
 		}
 	}
+
+	/* spec-3.26 D5: remember this slot so the next pin of the same block can
+	 * take the SHARED fast path above.  Pure hint -- always revalidated. */
+	undo_last_pin.seg = segment_id;
+	undo_last_pin.owner = owner;
+	undo_last_pin.blk = block_no;
+	undo_last_pin.slotno = slotno;
 
 	/* Acquire the content lock in the caller's mode (fixed — no upgrade). */
 	LWLockAcquire(&UndoBufSlots[slotno].content_lock,
