@@ -3,6 +3,8 @@
  * cluster_shared_fs_block_device.c
  *    spec-6.0a raw block-device ClusterSharedFs backend.
  *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"

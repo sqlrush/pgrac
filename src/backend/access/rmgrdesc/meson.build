@@ -1,6 +1,7 @@
 # Copyright (c) 2022-2023, PostgreSQL Global Development Group
 
 # used by frontend programs like pg_waldump
+# PGRAC: spec-6.0a adds clusterrawdesc.c for RM_CLUSTER_RAW_LAYOUT.
 rmgr_desc_sources = files(
   'brindesc.c',
   'clogdesc.c',

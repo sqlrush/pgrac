@@ -3,6 +3,8 @@
  * cluster_raw_xlog.c
  *    WAL redo/emit for spec-6.0a raw block-device layout metadata pages.
  *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"

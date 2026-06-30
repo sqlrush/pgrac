@@ -3,6 +3,8 @@
  * test_cluster_shared_fs_block_device.c
  *    Runtime unit tests for spec-6.0a raw block_device backend.
  *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"

@@ -3,6 +3,8 @@
  * cluster_raw_xlog.h
  *    WAL records for the spec-6.0a raw block-device layout metadata.
  *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
  *-------------------------------------------------------------------------
  */
 #ifndef CLUSTER_RAW_XLOG_H

@@ -8,6 +8,7 @@ subdir = src/backend/access/rmgrdesc
 top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
 
+# PGRAC: spec-6.0a adds clusterrawdesc.o for RM_CLUSTER_RAW_LAYOUT.
 OBJS = \
 	brindesc.o \
 	clogdesc.o \
