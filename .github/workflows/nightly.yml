@@ -155,8 +155,10 @@ jobs:
           # legs run in parallel and do not extend the ges-locking shard
           # wallclock.  t/327 HW workload / t/328 MG-B write perf / t/329 MG-D
           # heap-ITL WAL measure / t/330 production-bench-subset / t/331 4-node
-          # reconfig fault matrix.
-          - { name: stage5-integrated-acceptance, ranges: "327-331", unit: false, regress: false }
+          # reconfig fault matrix / t/332 write-tax CPU profile (Thread B perf
+          # artifact -- perf on the clean runner; gracefully skips if perf is
+          # unavailable, never a gate).
+          - { name: stage5-integrated-acceptance, ranges: "327-332", unit: false, regress: false }
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -206,6 +208,21 @@ jobs:
       - name: Run cluster_regress (foundation-core shard only)
         if: matrix.shard.regress
         run: make -C src/test/cluster_regress check
+
+      - name: Set up perf for the write-tax CPU profile (spec-5.19 Thread B)
+        # Only the integrated-acceptance shard runs t/332 (perf profile).  perf
+        # on GitHub runners is best-effort: linux-tools may not exactly match the
+        # kernel and perf_event access is restricted by default.  Every command
+        # is `|| true` -- t/332 itself gracefully skips (never fails) when perf
+        # is unavailable, so an imperfect setup never breaks the shard;  it only
+        # decides whether the profiling ARTIFACT gets produced this run.
+        if: matrix.shard.name == 'stage5-integrated-acceptance'
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            linux-tools-common linux-tools-generic || true
+          sudo sysctl -w kernel.perf_event_paranoid=0 || true
+          sudo sysctl -w kernel.kptr_restrict=0 || true
+          perf --version || true
 
       - name: Run cluster_tap shard ${{ matrix.shard.name }}
         env:
