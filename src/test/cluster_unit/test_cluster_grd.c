@@ -3460,8 +3460,8 @@ UT_TEST(test_grd_pin_cleanup_on_lmd_submit_error)
 	h = bast_holder(3, 300, 3);
 	PG_TRY();
 	{
-		(void)cluster_grd_entry_enqueue_or_grant(&resid, &h, 3, 3, 0,
-												 UT_GES_OPCODE_REQUEST, ShareLock, conflicts, &nc);
+		(void)cluster_grd_entry_enqueue_or_grant(&resid, &h, 3, 3, 0, UT_GES_OPCODE_REQUEST,
+												 ShareLock, conflicts, &nc);
 	}
 	PG_CATCH();
 	{
