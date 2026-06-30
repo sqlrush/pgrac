@@ -21,12 +21,14 @@
 #    hot path under AllocSetCheck/MemoryContextCheck.  v2 fixes all three:
 #      1. saturate with `-c $CLIENTS -j $CLIENTS -N` so the runner is never idle
 #         and the idle swapper stops dominating the samples;
-#      2. emit a `perf diff` of native-vs-cluster on the SAME binary
-#         (cluster.enabled off vs on): the diff cancels every path common to
-#         both runs (idle, shared PG hot paths) and surfaces ONLY the extra
-#         per-symbol Delta cluster carries -- including same-named-but-heavier
-#         shared paths (XLogInsert / heap_update / ...), not just brand-new
-#         cluster_* symbols;
+#      2. report SELF-sorted (--no-children) so the leaf functions actually
+#         burning CPU surface (a children sort floats only call-stack
+#         ancestors whose self% ~ 0), and compute the native-vs-cluster
+#         self-% DELTA in-process (cluster.enabled off vs on, same binary):
+#         positive delta = the extra per-symbol CPU cluster carries = the
+#         lever, including same-named-but-heavier shared paths, not just new
+#         cluster_* symbols.  (In-process delta because `perf diff` emitted
+#         nothing on the runner; the self-% maps are fully under our control.)
 #      3. detect & loudly flag a cassert build (SHOW debug_assertions) -- the
 #         dedicated nightly write-tax profiling job builds WITHOUT
 #         --enable-cassert so the signal is trustworthy.
@@ -104,11 +106,20 @@ sub profile_node
 	return $data;
 }
 
-# Top-N postgres symbols of one perf data file.
-sub report_top
+# Raw SELF-sorted (--no-children) perf report text for one data file.  Self
+# sort surfaces the leaf functions actually burning CPU (undo memcpy / ITL
+# stamp / SCN advance) instead of the call-stack ancestors a children sort
+# floats to the top with self% ~ 0.
+sub raw_report
 {
 	my ($perf, $data) = @_;
-	my $rep = `$perf report --stdio --percent-limit 0.3 -i '$data' 2>/dev/null`;
+	return `$perf report --stdio --no-children --percent-limit 0.3 -i '$data' 2>/dev/null`;
+}
+
+# Top-N symbol lines (those with a leading self percentage) of a report.
+sub top_lines
+{
+	my ($rep) = @_;
 	my @lines;
 	for my $l (split /\n/, $rep)
 	{
@@ -119,23 +130,51 @@ sub report_top
 	return join("\n", @lines);
 }
 
-# native-vs-cluster per-symbol delta on the SAME binary.  baseline=native,
-# data=cluster: a positive Delta on a cluster_* symbol (or on a shared
-# heap/xlog/undo path called more heavily) is exactly the per-DML write-tax
-# lever to target with a rule-8.A optimization.
-sub report_diff
+# symbol => self% map parsed from a self-sorted report line such as
+#   "   12.34%  postgres  postgres  [.] heap_update".
+sub parse_self
 {
-	my ($perf, $native_data, $cluster_data) = @_;
-	my $rep = `$perf diff --percent-limit 0.3 '$native_data' '$cluster_data' 2>/dev/null`;
-	my @lines;
+	my ($rep) = @_;
+	my %h;
 	for my $l (split /\n/, $rep)
 	{
-		next if $l =~ /^\s*#/;
-		next unless $l =~ /\S/;
-		push @lines, $l;
-		last if @lines >= 40;
+		next unless $l =~ /^\s*(\d+\.\d+)%/;
+		my $pct = $1;
+		next unless $l =~ /\[[.k]\]\s+(.+?)\s*$/;
+		$h{$1} += $pct;
 	}
-	return join("\n", @lines);
+	return \%h;
+}
+
+# native-vs-cluster self-% delta computed IN-PROCESS on the SAME binary
+# (cluster.enabled off vs on) -- robust where `perf diff` emits nothing.  A
+# positive delta on a cluster_* symbol (or on a shared heap/xlog/undo path
+# called more heavily under cluster) is exactly the per-DML write-tax lever to
+# target with a rule-8.A optimization.  Returns the top-$n cluster-heavier
+# movers, formatted.
+sub self_delta
+{
+	my ($nat_rep, $clr_rep, $n) = @_;
+	my $nh = parse_self($nat_rep);
+	my $ch = parse_self($clr_rep);
+	my %all = map { $_ => 1 } (keys %$nh, keys %$ch);
+	my @rows;
+	for my $s (keys %all)
+	{
+		my $nv = $nh->{$s} // 0;
+		my $cv = $ch->{$s} // 0;
+		push @rows, [ $s, $cv - $nv, $cv, $nv ];
+	}
+	@rows = sort { $b->[1] <=> $a->[1] } @rows;
+	my @out;
+	for my $r (@rows)
+	{
+		last if @out >= $n;
+		last if $r->[1] <= 0.0;	# only the cluster-heavier symbols
+		push @out, sprintf("  %+6.2f%%  %-44s (cluster %5.2f%% vs native %5.2f%%)",
+			$r->[1], $r->[0], $r->[2], $r->[3]);
+	}
+	return join("\n", @out);
 }
 
 my $perf = find_perf();
@@ -188,19 +227,21 @@ else
 	my $clr_data = profile_node($perf, $clu, 'cluster', $datadir);
 	if (defined $nat_data && defined $clr_data)
 	{
-		my $nat  = report_top($perf, $nat_data);
-		my $clr  = report_top($perf, $clr_data);
-		my $diff = report_diff($perf, $nat_data, $clr_data);
-		diag("===== write-tax CPU profile (-c $CLIENTS -T $SECS -N): "
+		my $nat_rep = raw_report($perf, $nat_data);
+		my $clr_rep = raw_report($perf, $clr_data);
+		my $nat  = top_lines($nat_rep);
+		my $clr  = top_lines($clr_rep);
+		my $diff = self_delta($nat_rep, $clr_rep, 25);
+		diag("===== write-tax CPU profile (-c $CLIENTS -T $SECS -N, self-sorted): "
 			. "NATIVE top $TOPN symbols =====\n$nat");
 		diag("===== write-tax CPU profile: CLUSTER top $TOPN symbols =====\n$clr");
-		diag("===== write-tax perf DIFF (baseline=native, data=cluster; positive "
-			. "Delta = extra cluster CPU per symbol = the lever to target) =====\n$diff");
+		diag("===== write-tax SELF-% DELTA (cluster - native; positive = extra "
+			. "cluster CPU per symbol = the lever to target) =====\n$diff");
 		# Surface cluster_* delta lines explicitly for quick scanning.
 		my @hot = grep { /cluster_/ } split /\n/, $diff;
-		diag("cluster_* symbols in the diff (per-DML write-tax levers):\n"
+		diag("cluster_* symbols in the delta (per-DML write-tax levers):\n"
 			. join("\n", @hot)) if @hot;
-		ok(1, "P1 write-tax CPU profile + native-vs-cluster diff captured"
+		ok(1, "P1 write-tax CPU profile + native-vs-cluster self-delta captured"
 			. ($polluted ? " (cassert-polluted -- see build warning)" : ""));
 	}
 	else
