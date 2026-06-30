@@ -683,6 +683,13 @@ static const struct config_enum_entry cluster_block_recovery_on_unrecoverable_op
 		{ "panic", CLUSTER_BLKREC_ACTION_PANIC, false },
 		{ NULL, 0, false } };
 
+/* spec-3.26 D2: ITL xact-finish WAL representation (default bespoke). */
+int cluster_itl_finish_wal_mode = CLUSTER_ITL_FINISH_WAL_BESPOKE;
+static const struct config_enum_entry cluster_itl_finish_wal_mode_options[]
+	= { { "bespoke", CLUSTER_ITL_FINISH_WAL_BESPOKE, false },
+		{ "generic", CLUSTER_ITL_FINISH_WAL_GENERIC, false },
+		{ NULL, 0, false } };
+
 /* spec-4.11 D1: online single-thread recovery (storage defined here; logic in
  * cluster_thread_recovery.c).  Dev default OFF (Q7/P2): default-on only once
  * the D7 capability gate is complete and every unsupported environment is
@@ -1003,6 +1010,21 @@ cluster_init_guc(void)
 		NULL,											   /* check_hook */
 		NULL,											   /* assign_hook */
 		NULL);											   /* show_hook */
+
+	/* spec-3.26 D2: ITL xact-finish WAL mode (bespoke RM_CLUSTER_ITL vs legacy
+	 * GenericXLog).  PGC_SUSET so an operator can A/B compare / fall back. */
+	DefineCustomEnumVariable(
+		"cluster.itl_finish_wal_mode",
+		gettext_noop("WAL representation for the ITL transaction-finish record."),
+		gettext_noop("bespoke (default) emits the RM_CLUSTER_ITL block-local delta "
+					 "record (no whole-page byte-diff); generic keeps the legacy "
+					 "GenericXLog path for byte-equivalence verification."),
+		&cluster_itl_finish_wal_mode, CLUSTER_ITL_FINISH_WAL_BESPOKE, /* boot value */
+		cluster_itl_finish_wal_mode_options, PGC_SUSET,
+		0,	  /* flags */
+		NULL, /* check_hook */
+		NULL, /* assign_hook */
+		NULL); /* show_hook */
 
 	/*
 	 * cluster.config_file -- path to pgrac.conf.  Default "pgrac.conf"

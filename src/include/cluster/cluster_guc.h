@@ -284,6 +284,15 @@ typedef enum ClusterTmConvertMode {
 extern int cluster_ges_convert_timeout_ms;
 extern int cluster_tm_convert_mode;
 
+/* spec-3.26 D2: ITL xact-finish WAL representation.  bespoke (default) emits the
+ * RM_CLUSTER_ITL block-local delta record (no whole-page byte-diff); generic
+ * keeps the legacy GenericXLog path for A/B byte-equivalence verification. */
+typedef enum ClusterItlFinishWalMode {
+	CLUSTER_ITL_FINISH_WAL_BESPOKE = 0,
+	CLUSTER_ITL_FINISH_WAL_GENERIC = 1
+} ClusterItlFinishWalMode;
+extern int cluster_itl_finish_wal_mode;
+
 /* spec-2.23 D11 NEW: coordinator REPORT collect timeout + reply wait cap. */
 extern int cluster_lmd_probe_collect_timeout_ms;
 extern int cluster_ges_reply_wait_max_entries;
