@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * test_cluster_errcodes.c
- *	  Compile-time invariants for the 45 cluster SQLSTATE error codes
+ *	  Compile-time invariants for the cluster SQLSTATE error codes
  *	  registered in stage 0.12.
  *
  *	  All ERRCODE_CLUSTER_* macros are generated automatically by PG's
@@ -14,7 +14,7 @@
  *	  - Each ERRCODE_CLUSTER_* macro encodes the exact SQLSTATE string
  *	    via MAKE_SQLSTATE() (proves the .txt -> .h pipeline produced
  *	    correct values).
- *	  - All 45 codes use the 'R' subclass character (pgrac namespace
+ *	  - All checked codes use the 'R' subclass character (pgrac namespace
  *	    discipline; design doc §2.3).
  *	  - The Class 58 pgrac block is dense from 58R01..58R12 (the
  *	    largest pgrac sub-class, anchors the count proof).
@@ -118,7 +118,8 @@ UT_TEST(test_class_40_first_last)
 UT_TEST(test_class_53_first_last)
 {
 	UT_ASSERT_EQ(ERRCODE_CLUSTER_LMS_QUEUE_FULL, MAKE_SQLSTATE('5', '3', 'R', '0', '1'));
-	UT_ASSERT_EQ(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS, MAKE_SQLSTATE('5', '3', 'R', '6', '0'));
+	UT_ASSERT_EQ(ERRCODE_CLUSTER_RESTORE_POINT_DRAIN_TIMEOUT,
+				 MAKE_SQLSTATE('5', '3', 'R', 'A', 'F'));
 }
 
 UT_TEST(test_class_55_first_last)
@@ -175,6 +176,17 @@ UT_TEST(test_class_58_complete)
 	UT_ASSERT_EQ(ERRCODE_CLUSTER_RECOVERY_FAILED, MAKE_SQLSTATE('5', '8', 'R', '1', '2'));
 }
 
+UT_TEST(test_class_53_backup_band)
+{
+	UT_ASSERT_EQ(ERRCODE_CLUSTER_BACKUP_IN_PROGRESS, MAKE_SQLSTATE('5', '3', 'R', 'A', 'B'));
+	UT_ASSERT_EQ(ERRCODE_CLUSTER_PITR_TARGET_UNREACHABLE,
+				 MAKE_SQLSTATE('5', '3', 'R', 'A', 'C'));
+	UT_ASSERT_EQ(ERRCODE_CLUSTER_BACKUP_INCOMPLETE, MAKE_SQLSTATE('5', '3', 'R', 'A', 'D'));
+	UT_ASSERT_EQ(ERRCODE_CLUSTER_RESTORE_INCOMPATIBLE, MAKE_SQLSTATE('5', '3', 'R', 'A', 'E'));
+	UT_ASSERT_EQ(ERRCODE_CLUSTER_RESTORE_POINT_DRAIN_TIMEOUT,
+				 MAKE_SQLSTATE('5', '3', 'R', 'A', 'F'));
+}
+
 
 /* ----------
  * All 45 cluster errcodes use 'R' as their subclass character
@@ -190,6 +202,7 @@ UT_TEST(test_all_use_r_subclass)
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_LMS_QUEUE_FULL, 3), 'R');
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_PCM_STATE_INVALID, 3), 'R');
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS, 3), 'R');
+	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_RESTORE_POINT_DRAIN_TIMEOUT, 3), 'R');
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_SHARED_STORAGE_FAILED, 3), 'R');
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_SNAPSHOT_TOO_OLD, 3), 'R');
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_ASSERTION_FAILURE, 3), 'R');
@@ -229,9 +242,9 @@ UT_TEST(test_per_class_anchors)
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_PROTOCOL_VERSION_MISMATCH, 5), '5');
 	/* Class 40 has 4 entries: 40R01..40R04 */
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_PI_INVALIDATED_RETRY, 5), '4');
-	/* Class 53 spans base 53R01..53R07 plus quorum/fence/reconfig ranges up to 53R60. */
-	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS, 4), '6');
-	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS, 5), '0');
+	/* Class 53 spans base 53R01..53R07 plus later pgrac bands up to 53RAF. */
+	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_RESTORE_POINT_DRAIN_TIMEOUT, 4), 'A');
+	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_RESTORE_POINT_DRAIN_TIMEOUT, 5), 'F');
 	/* Class 55 has 6 entries: 55R01..55R06 */
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_BLOCK_MISSING_TEMPORARY, 5), '6');
 	/* Class 57 keeps operator-intervention cluster codes 57R02..57R06. */
@@ -246,7 +259,7 @@ UT_TEST(test_per_class_anchors)
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
 	UT_RUN(test_class_08_first_last);
 	UT_RUN(test_class_40_first_last);
 	UT_RUN(test_class_53_first_last);
@@ -256,6 +269,7 @@ main(void)
 	UT_RUN(test_class_72_first_last);
 	UT_RUN(test_class_xx_first_last);
 	UT_RUN(test_class_58_complete);
+	UT_RUN(test_class_53_backup_band);
 	UT_RUN(test_all_use_r_subclass);
 	UT_RUN(test_no_overlap_with_pg_native);
 	UT_RUN(test_per_class_anchors);

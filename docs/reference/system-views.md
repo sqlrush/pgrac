@@ -1,14 +1,114 @@
 # System views
 
-linkdb adds three cluster-aware system views to the standard
-PostgreSQL catalog.  All three are present in `--enable-cluster`
-builds; in `--disable-cluster` builds they return zero rows.
+linkdb adds cluster-aware system views to the standard PostgreSQL
+catalog.  These views are present in `--enable-cluster` builds; in
+`--disable-cluster` builds the backing functions are unavailable or
+return zero rows, depending on whether the function is read-only or
+operator-facing.
 
 | View | Purpose |
 |---|---|
 | `pg_cluster_nodes` | Cluster topology (the parsed `pgrac.conf`) |
 | `pg_stat_cluster_wait_events` | Cluster-specific wait events on the local node |
 | `pg_stat_gcluster_wait_events` | Cluster wait events globally (cross-node placeholder) |
+| `pg_stat_cluster_backup` | Current cluster backup state on the local node |
+| `pg_cluster_backup_history` | Latest cluster backup manifest summary |
+| `pg_cluster_restore_points` | Cluster restore points visible to PITR status |
+| `pg_cluster_pitr_status` | Cluster PITR target reachability status |
+
+## Cluster Backup / PITR Views
+
+The cluster backup surface exposes the manifest and target-resolution
+state used by `pg_cluster_backup_start`, `pg_cluster_backup_stop`, and
+`pg_cluster_create_restore_point`.
+
+Current 6.5 scope is conservative:
+
+- A single-node cluster can start and stop a cluster-aware physical
+  backup.  The backup label returned by `pg_cluster_backup_stop`
+  includes native PostgreSQL label content followed by `CLUSTER_*`
+  metadata lines.
+- If the node has declared peers, the mutating backup/restore-point
+  functions fail closed with a cluster backup SQLSTATE rather than
+  silently producing a partial backup.
+- The manifest records WAL thread, undo, transaction-table, SCN, and
+  control-file inclusion state for the proven local cut.  A later
+  backup-set writer can extend the same contract to coordinated
+  multi-node copying without changing these view shapes.
+
+### `pg_stat_cluster_backup`
+
+One row describing the current or most recent cluster backup on this
+node.
+
+| Column | Type | Description |
+|---|---|---|
+| `in_progress` | `bool` | True while this session has an active cluster backup. |
+| `backup_id` | `text` | Backup label/id, or NULL before the first backup. |
+| `coordinator_node_id` | `int4` | Local node id that started the backup. |
+| `start_redo_lsn` | `pg_lsn` | Checkpoint redo LSN used as the backup start contract. |
+| `checkpoint_lsn` | `pg_lsn` | Checkpoint record LSN captured at backup start. |
+| `stop_cut_lsn` | `pg_lsn` | WAL cut LSN captured at backup stop. |
+| `consistent_scn` | `int8` | Cluster SCN selected for the backup cut. |
+| `manifest_crc` | `int8` | CRC32C of the latest manifest image. |
+| `started_at` | `timestamptz` | Local timestamp when the backup started. |
+| `stopped_at` | `timestamptz` | Local timestamp when the backup stopped. |
+| `backup_parallel_channels` | `int4` | Configured copy-channel capacity for the backup substrate. |
+| `backup_wal_retention` | `int4` | Configured WAL retention hint, in MB. |
+| `restore_points_enabled` | `bool` | Whether automatic PITR restore-point scheduling is enabled. |
+| `restore_point_interval_ms` | `int4` | Automatic restore-point scheduling interval, in milliseconds. |
+
+### `pg_cluster_backup_history`
+
+Returns the latest cluster backup manifest summary retained in shared
+memory.
+
+| Column | Type | Description |
+|---|---|---|
+| `backup_id` | `text` | Backup label/id. |
+| `consistent_scn` | `int8` | SCN that defines the backup cut. |
+| `scn_durable_peak` | `int8` | Highest durable SCN covered by the cut. |
+| `timeline` | `int4` | WAL timeline recorded at backup stop. |
+| `catversion` | `int8` | Catalog version used to reject incompatible restores. |
+| `storage_id` | `int4` | Cluster shared-storage backend id. |
+| `node_count` | `int4` | Number of nodes proven in the manifest. |
+| `thread_count` | `int4` | Number of WAL threads proven in the manifest. |
+| `manifest_crc` | `int8` | CRC32C of the manifest image. |
+
+### `pg_cluster_restore_points`
+
+Shows restore points created by the cluster-aware restore-point entry
+point.
+
+| Column | Type | Description |
+|---|---|---|
+| `restore_point_name` | `text` | Restore point name. |
+| `cut_scn` | `int8` | SCN selected for the restore point cut. |
+| `thread_count` | `int4` | WAL threads covered by the cut. |
+| `incarnation` | `int4` | Cluster incarnation recorded with the cut. |
+| `created_at` | `timestamptz` | Local timestamp when the point was recorded. |
+
+### `pg_cluster_pitr_status`
+
+Resolves the configured cluster PITR target against known restore
+points and the latest manifest.
+
+| Column | Type | Description |
+|---|---|---|
+| `target_type` | `text` | `latest` when no target is configured, `scn`, `name`, or `cluster_time`. |
+| `target_action` | `text` | Configured PITR action: `pause`, `promote`, or `shutdown`. |
+| `reachable` | `bool` | True if the configured target is reachable. |
+| `reason` | `text` | `ok` or the fail-closed reason. |
+| `resolved_scn` | `int8` | Restore-point SCN selected for the target, when reachable. |
+| `restore_point_name` | `text` | Restore point used for the target, when reachable. |
+
+Mutating function execution is revoked from PUBLIC:
+
+```sql
+SELECT * FROM pg_cluster_backup_start('b1', true);
+SELECT * FROM pg_cluster_backup_stop(true);
+SELECT * FROM pg_cluster_create_restore_point('rp1');
+```
 
 ## pg_cluster_nodes
 

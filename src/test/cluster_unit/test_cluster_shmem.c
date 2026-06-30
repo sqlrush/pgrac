@@ -762,6 +762,12 @@ void
 cluster_node_remove_shmem_register(void)
 {}
 
+/* spec-6.5 stub: cluster backup / restore / PITR shmem region. */
+void cluster_backup_shmem_register(void);
+void
+cluster_backup_shmem_register(void)
+{}
+
 /* spec-4.12 D7 stub: cluster write-fence token region. */
 void cluster_write_fence_shmem_register(void);
 void

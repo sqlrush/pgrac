@@ -3,7 +3,7 @@
 linkdb uses two configuration mechanisms layered on top of standard
 PostgreSQL configuration:
 
-1. **`postgresql.conf`** — standard PG config plus the `cluster.*`
+1. **`postgresql.conf`** — standard PG config plus `cluster.*`
    GUCs added by linkdb's cluster subsystem.
 2. **`pgrac.conf`** — INI-style file describing the cluster
    topology (the list of nodes that participate in the cluster).
@@ -61,6 +61,29 @@ an absolute path), `$PGDATA/pg_wal` must resolve to
 # postgresql.conf
 cluster.wal_threads_dir = '/shared/walroot'
 ```
+
+### Cluster backup / PITR GUCs
+
+These settings support the cluster-aware physical backup / restore /
+PITR surface.
+
+| GUC | Type | Default | Context | Notes |
+|---|---|---|---|---|
+| `cluster.recovery_target_scn` | string | `''` | postmaster | Target SCN used by `pg_cluster_pitr_status`. Empty means latest unless a name or cluster-time target is set. |
+| `cluster.recovery_target_cluster_time` | string | `''` | postmaster | Timestamp target reported by `pg_cluster_pitr_status`; current 6.5 recovery action remains fail-closed for this target type. |
+| `cluster.recovery_target_name` | string | `''` | postmaster | Named restore-point target resolved by `pg_cluster_pitr_status`. |
+| `cluster.recovery_target_action` | enum | `pause` | postmaster | Accepted values: `pause`, `promote`, `shutdown`; exposed in PITR status. |
+| `cluster.enable_pitr_restore_points` | bool | `off` | sighup | Enables future automatic restore-point scheduling. Manual `pg_cluster_create_restore_point()` is independent. |
+| `cluster.pitr_restore_point_interval_ms` | integer | `0` | sighup | Zero disables automatic scheduling. |
+| `cluster.backup_wal_retention` | integer | `0` MB | sighup | Retention hint for the future backup-set writer. |
+| `cluster.backup_parallel_channels` | integer | `1` | sighup | Reserved copy-channel capacity for the future backup-set writer. |
+| `cluster.backup_manifest_checksums` | enum | `crc32c` | sighup | Manifest checksums are mandatory; unchecked manifests are not supported. |
+
+The current implementation is intentionally conservative.  A
+single-node cluster can create a cluster manifest via
+`pg_cluster_backup_start()` / `pg_cluster_backup_stop()`.  If declared
+peers exist, cluster backup and restore-point mutation fail closed
+instead of producing a partial backup or an unreachable PITR target.
 
 ### `cluster.interconnect_tier`
 

@@ -179,5 +179,28 @@ like($log,
 	 qr/999 is outside the valid range for parameter "cluster.node_id"/,
 	 'startup log contains GUC out-of-range WARNING for cluster.node_id');
 
+# ----------
+# spec-6.5 cluster backup / PITR GUCs.
+# ----------
+is($node->safe_psql('postgres',
+	q{SELECT setting || '|' || vartype || '|' || context
+	    FROM pg_settings WHERE name = 'cluster.recovery_target_scn'}),
+	'|string|postmaster',
+	'cluster.recovery_target_scn default and context');
+is($node->safe_psql('postgres',
+	q{SELECT setting || '|' || vartype || '|' || context
+	    FROM pg_settings WHERE name = 'cluster.recovery_target_action'}),
+	'pause|enum|postmaster',
+	'cluster.recovery_target_action default and context');
+is($node->safe_psql('postgres',
+	q{SELECT setting || '|' || vartype || '|' || context
+	    FROM pg_settings WHERE name = 'cluster.backup_manifest_checksums'}),
+	'crc32c|enum|sighup',
+	'cluster.backup_manifest_checksums is mandatory crc32c');
+is($node->safe_psql('postgres',
+	q{SELECT setting || '|' || vartype || '|' || context
+	    FROM pg_settings WHERE name = 'cluster.backup_parallel_channels'}),
+	'1|integer|sighup',
+	'cluster.backup_parallel_channels default and context');
 
 done_testing();
