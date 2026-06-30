@@ -123,6 +123,9 @@ static const struct config_enum_entry cluster_undo_writeback_boundary_check_opti
 		{ "strict", CLUSTER_UNDO_WB_CHECK_STRICT, false },
 		{ NULL, 0, false } };
 
+/* spec-5.19 #2 rebase onto 6.3a: keep 6.3a's default 1024 + lifecycle reclaim
+ * (supersedes the #2 16384 capacity stopgap -- reclaim now prevents
+ * RESERVATION_FULL; re-verified by the M3/two-node D0 re-ground). */
 int cluster_grd_max_entries = 1024;
 bool cluster_grd_entry_reclaim = true;
 int cluster_grd_entry_reclaim_max_per_sweep = 256;
@@ -1425,23 +1428,31 @@ cluster_init_guc(void)
 	 *  PGC_POSTMASTER because ShmemInitHash is called once at postmaster
 	 *  init from this value.
 	 */
-	DefineCustomIntVariable("cluster.grd_max_entries",
-							gettext_noop("Maximum number of cluster_grd entry table slots."),
-							gettext_noop("Default 1024 allocates the entry table so a cluster node "
-										 "can coordinate out of the box.  An explicit 0 selects "
-										 "skeleton mode: entry HTAB not allocated, "
-										 "cluster_grd_entry_lookup_or_create() returns NOT_READY. "
-										 "Note PG dynahash "
-										 "HASH_PARTITION=4096 forces internal nbuckets >= 4096, "
-										 "so even GUC=16 reserves ~3-5MB shmem via "
-										 "hash_estimate_size(Max(GUC, 4096), entry_size). "
-										 "Production 推荐 NBuffers × 2 (spec-2.16+ caller-side)."),
-							&cluster_grd_max_entries, 1024, 0, 1048576,
-							PGC_POSTMASTER, /* ShmemInitHash size fixed at init */
-							0,				/* flags */
-							NULL,			/* check_hook */
-							NULL,			/* assign_hook */
-							NULL);			/* show_hook */
+	DefineCustomIntVariable(
+		"cluster.grd_max_entries", gettext_noop("Maximum number of cluster_grd entry table slots."),
+		gettext_noop("Allocates the entry table so a cluster node can coordinate "
+					 "out of the box.  An explicit 0 selects skeleton mode: entry "
+					 "HTAB not allocated, cluster_grd_entry_lookup_or_create() "
+					 "returns NOT_READY. "
+					 "Note PG dynahash "
+					 "HASH_PARTITION=4096 forces internal nbuckets >= 4096, "
+					 "so even GUC=16 reserves ~3-5MB shmem via "
+					 "hash_estimate_size(Max(GUC, 4096), entry_size). "
+					 "spec-5.19 sizing note: only the local-master REQUEST/CONVERT "
+					 "release path reclaims an emptied entry "
+					 "(cluster_grd_hashremove_if_still_empty);  remote-master and "
+					 "block-lock (Cache Fusion) entries are NOT reclaimed until the "
+					 "Stage-6 DRM cold-entry reclaim lands, so a node accumulates one "
+					 "entry per distinct remote-mastered resource it has locked.  Set "
+					 "this above the node's sustained distinct-resource working set "
+					 "(roughly NBuffers × 2 for an OLTP node);  too low surfaces "
+					 "53R71 FAIL_RESERVATION_FULL once the working set is exceeded."),
+		&cluster_grd_max_entries, 16384, 0, 1048576,
+		PGC_POSTMASTER, /* ShmemInitHash size fixed at init */
+		0,				/* flags */
+		NULL,			/* check_hook */
+		NULL,			/* assign_hook */
+		NULL);			/* show_hook */
 
 	DefineCustomBoolVariable(
 		"cluster.grd_entry_reclaim",
