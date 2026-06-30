@@ -1,7 +1,26 @@
 /*-------------------------------------------------------------------------
  *
  * clusterrawdesc.c
- *    rmgr descriptor for RM_CLUSTER_RAW_LAYOUT.
+ *	  rmgr descriptor for RM_CLUSTER_RAW_LAYOUT.
+ *
+ *	  Human-readable WAL descriptor/identifier for the spec-6.0a raw
+ *	  block-device layout metadata resource manager.  pg_waldump and
+ *	  backend rmgrdesc callers use this file to decode raw layout metadata
+ *	  page-image records without needing the block-device provider itself.
+ *
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2026, pgrac contributors
+ *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
+ * IDENTIFICATION
+ *	  src/backend/access/rmgrdesc/clusterrawdesc.c
+ *
+ * NOTES
+ *	  This is a pgrac-original file (no derivation from PostgreSQL).
+ *	  Spec: spec-6.0a-production-shared-storage-backend-matrix.md
+ *	  (FROZEN, RM_CLUSTER_RAW_LAYOUT descriptor surface).
  *
  *-------------------------------------------------------------------------
  */

@@ -12,6 +12,25 @@
  *
  *-------------------------------------------------------------------------
  */
+/*-------------------------------------------------------------------------
+ * PGRAC MODIFICATIONS (spec-6.0a)
+ *
+ * Modified by: SqlRush <sqlrush@gmail.com>
+ *
+ * What changed:
+ *	Add a USE_PGRAC_CLUSTER-gated sync handler table entry for
+ *	SYNC_HANDLER_CLUSTER_SHARED.  The handler delegates checkpoint fsync,
+ *	unlink-forget, and tag-match filtering to cluster_smgr.
+ *
+ * Why:
+ *	spec-6.0a promotes shared storage from experimental passthrough to a
+ *	production durability surface.  Cluster-routed relation writes must
+ *	participate in PostgreSQL's pending-fsync machinery instead of relying
+ *	on Assert-only or best-effort immediate sync behavior.
+ *
+ *	Spec: spec-6.0a-production-shared-storage-backend-matrix.md
+ *-------------------------------------------------------------------------
+ */
 #include "postgres.h"
 
 #include <unistd.h>

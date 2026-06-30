@@ -5,6 +5,27 @@
  *
  * src/backend/access/transam/rmgr.c
  */
+/*-------------------------------------------------------------------------
+ * PGRAC MODIFICATIONS (spec-1.22, spec-6.0a)
+ *
+ * Modified by: SqlRush <sqlrush@gmail.com>
+ *
+ * What changed:
+ *	When USE_PGRAC_CLUSTER is defined, include pgrac resource-manager
+ *	handler declarations for ClusterUndo and ClusterRawLayout so the
+ *	PG_RMGR entries added in rmgrlist.h compile into the backend rmgr
+ *	table.
+ *
+ * Why:
+ *	spec-1.22 introduced WAL replay for pgrac undo metadata outside normal
+ *	PG relation forks.  spec-6.0a adds RM_CLUSTER_RAW_LAYOUT for crash-safe
+ *	raw block-device layout metadata page images.
+ *
+ *	Specs:
+ *	  - spec-1.22-undo-tablespace-bootstrap.md
+ *	  - spec-6.0a-production-shared-storage-backend-matrix.md
+ *-------------------------------------------------------------------------
+ */
 #include "postgres.h"
 
 #include "access/brin_xlog.h"

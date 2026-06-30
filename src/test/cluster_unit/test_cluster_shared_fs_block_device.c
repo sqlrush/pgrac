@@ -1,9 +1,27 @@
 /*-------------------------------------------------------------------------
  *
  * test_cluster_shared_fs_block_device.c
- *    Runtime unit tests for spec-6.0a raw block_device backend.
+ *	  Runtime unit tests for spec-6.0a raw block_device backend.
+ *
+ *	  Uses a regular-file device image with O_DIRECT disabled to exercise
+ *	  the raw provider's layout initialization, extent allocation, logical
+ *	  EOF checks, WAL emit path, truncate fail-closed guard, reopen, barrier
+ *	  sync, fence-surface reporting, and unlink behavior without starting a
+ *	  PostgreSQL postmaster.
+ *
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2026, pgrac contributors
  *
  * Author: SqlRush <sqlrush@gmail.com>
+ *
+ * IDENTIFICATION
+ *	  src/test/cluster_unit/test_cluster_shared_fs_block_device.c
+ *
+ * NOTES
+ *	  This is a pgrac-original file (no derivation from PostgreSQL).
+ *	  Spec: spec-6.0a-production-shared-storage-backend-matrix.md
+ *	  (FROZEN, raw block_device conformance unit).
  *
  *-------------------------------------------------------------------------
  */

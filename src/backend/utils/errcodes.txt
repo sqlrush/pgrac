@@ -905,6 +905,11 @@ Section: Class 58 - System Error (pgrac extension)
 58R11    E    ERRCODE_CLUSTER_SINVAL_INCONSISTENT                            cluster_sinval_inconsistent
 58R12    E    ERRCODE_CLUSTER_RECOVERY_FAILED                                cluster_recovery_failed
 58R13    E    ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE              cluster_controlfile_authority_unavailable
+
+# PGRAC spec-6.0a: raw block-device production backend fail-closed surfaces.
+# 58R14 is raised when O_DIRECT / BLCKSZ / raw-layout page offsets cannot meet
+# the required alignment contract.  58R15 is raised when a production fence
+# driver is explicitly required (for example scsi3_pr) but unavailable.
 58R14    E    ERRCODE_CLUSTER_STORAGE_IO_ALIGNMENT                             cluster_storage_io_alignment
 58R15    E    ERRCODE_CLUSTER_STORAGE_FENCE_UNAVAILABLE                        cluster_storage_fence_unavailable
 

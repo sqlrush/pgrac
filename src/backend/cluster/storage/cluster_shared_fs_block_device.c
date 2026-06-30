@@ -1,9 +1,32 @@
 /*-------------------------------------------------------------------------
  *
  * cluster_shared_fs_block_device.c
- *    spec-6.0a raw block-device ClusterSharedFs backend.
+ *	  spec-6.0a raw block-device ClusterSharedFs backend.
+ *
+ *	  Production shared-storage provider for an O_DIRECT-capable raw block
+ *	  device or regular-file test image.  The provider maintains a compact
+ *	  on-device layout (superblock, free bitmap, directory, extent-slot
+ *	  table) and exposes logical relation files through ClusterSharedFsOps.
+ *	  Metadata updates are serialized and WAL-logged; data writes never
+ *	  silently fall back when required durability/fencing settings are
+ *	  missing.
+ *
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2026, pgrac contributors
  *
  * Author: SqlRush <sqlrush@gmail.com>
+ *
+ * IDENTIFICATION
+ *	  src/backend/cluster/storage/cluster_shared_fs_block_device.c
+ *
+ * NOTES
+ *	  This is a pgrac-original file (no derivation from PostgreSQL).
+ *	  The block_device backend is compiled only with --enable-cluster
+ *	  (USE_PGRAC_CLUSTER defined).
+ *
+ *	  Spec: spec-6.0a-production-shared-storage-backend-matrix.md
+ *	  (FROZEN, provider framework + raw block_device backend).
  *
  *-------------------------------------------------------------------------
  */

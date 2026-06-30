@@ -1,9 +1,27 @@
 /*-------------------------------------------------------------------------
  *
  * cluster_raw_xlog.c
- *    WAL redo/emit for spec-6.0a raw block-device layout metadata pages.
+ *	  WAL redo/emit for spec-6.0a raw block-device layout metadata pages.
+ *
+ *	  The raw block-device provider owns allocator metadata outside PG's
+ *	  normal relation forks.  RM_CLUSTER_RAW_LAYOUT logs full BLCKSZ page
+ *	  images for those metadata pages so crash restart and WAL replay can
+ *	  restore the raw superblock/bitmap/directory/extent-slot contract
+ *	  before relation data is trusted.
+ *
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2026, pgrac contributors
  *
  * Author: SqlRush <sqlrush@gmail.com>
+ *
+ * IDENTIFICATION
+ *	  src/backend/cluster/storage/cluster_raw_xlog.c
+ *
+ * NOTES
+ *	  This is a pgrac-original file (no derivation from PostgreSQL).
+ *	  Spec: spec-6.0a-production-shared-storage-backend-matrix.md
+ *	  (FROZEN, crash-safe RM_CLUSTER_RAW_LAYOUT metadata WAL).
  *
  *-------------------------------------------------------------------------
  */

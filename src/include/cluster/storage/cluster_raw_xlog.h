@@ -1,9 +1,26 @@
 /*-------------------------------------------------------------------------
  *
  * cluster_raw_xlog.h
- *    WAL records for the spec-6.0a raw block-device layout metadata.
+ *	  WAL records for the spec-6.0a raw block-device layout metadata.
+ *
+ *	  Defines the RM_CLUSTER_RAW_LAYOUT record ABI shared by the raw
+ *	  block-device provider, backend redo, and pg_waldump descriptor code.
+ *	  The record currently carries one BLCKSZ metadata page image plus its
+ *	  raw-device byte offset.
+ *
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2026, pgrac contributors
  *
  * Author: SqlRush <sqlrush@gmail.com>
+ *
+ * IDENTIFICATION
+ *	  src/include/cluster/storage/cluster_raw_xlog.h
+ *
+ * NOTES
+ *	  This is a pgrac-original file (no derivation from PostgreSQL).
+ *	  Spec: spec-6.0a-production-shared-storage-backend-matrix.md
+ *	  (FROZEN, raw layout WAL ABI).
  *
  *-------------------------------------------------------------------------
  */
