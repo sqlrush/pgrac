@@ -11,9 +11,9 @@
 #        last complete record) -> DONE, the boundary is the last complete record;
 #      from
 #      * corruption BELOW the durable watermark (decode stops short of the
-#        registry's highest_lsn, a safe lower bound refreshed AFTER the bytes were
-#        written) -> BLOCKED, never a silent truncation of the dead thread's
-#        committed WAL (8.A).
+#        registry's highest_lsn complete-page floor) -> BLOCKED, never a silent
+#        truncation of the dead thread's committed WAL (8.A).  The final observed
+#        WAL page itself remains a legitimate crash-time torn tail.
 #
 #    Single-node stand-in (L239, mirrors t/260-262): node_id 0 routes its own WAL
 #    into thread_1, so driving thread_1 exercises the real reader + decode over a

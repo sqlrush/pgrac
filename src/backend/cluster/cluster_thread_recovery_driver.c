@@ -103,6 +103,18 @@ typedef struct ThreadWalReadPrivate {
 	char dir[MAXPGPATH];
 } ThreadWalReadPrivate;
 
+static XLogRecPtr
+thread_validated_lsn_floor(XLogRecPtr highest_lsn)
+{
+	XLogRecPtr prior;
+
+	if (XLogRecPtrIsInvalid(highest_lsn))
+		return InvalidXLogRecPtr;
+
+	prior = highest_lsn - 1;
+	return prior - (prior % XLOG_BLCKSZ);
+}
+
 static void
 /* cppcheck-suppress constParameterCallback */
 thread_wal_segment_open(XLogReaderState *state, XLogSegNo nextSegNo, TimeLineID *tli_p)
@@ -401,11 +413,13 @@ cluster_thread_recovery_drive_data(uint16 dead_tid, XLogRecPtr scan_lower, XLogR
  *	may legitimately stop mid-record at the crash point).  The dead thread is
  *	always a FOREIGN candidate, so both fail-closed checks apply (8.A):
  *	  (a) no complete record decoded from scan_lower -> corruption at the start;
- *	  (b) valid_end < validated_min (the registry's durable highest_lsn, a safe
- *	      lower bound refreshed AFTER the bytes were written) -> the decode
- *	      stopped BELOW the durable write end = mid-stream corruption, NOT a torn
- *	      tail.  Treating that as a torn tail would silently drop the dead
- *	      thread's committed WAL.
+ *	  (b) valid_end < validated_floor (the registry's highest_lsn rounded down
+ *	      to the start of its final WAL page) -> the decode stopped BELOW the
+ *	      durable complete-page floor = mid-stream corruption, NOT a torn tail.
+ *	      The final observed WAL page itself can be a crash-time partial page,
+ *	      especially after pg_switch_wal(), so it is not used as the hard floor.
+ *	      Treating earlier corruption as a torn tail would silently drop the
+ *	      dead thread's committed WAL.
  *	Either yields BLOCKED (result-returning, NOT the cold FATAL -- online R13);
  *	a clean decode yields DONE with *out_valid_end set to the boundary the
  *	replay pass must reach.
@@ -418,6 +432,7 @@ validated_end_inner(uint16 dead_tid, XLogRecPtr scan_lower, XLogRecPtr validated
 	XLogReaderState *reader;
 	XLogRecPtr first_valid;
 	XLogRecPtr valid_end;
+	XLogRecPtr validated_floor;
 	char *errm = NULL;
 
 	*out_valid_end = InvalidXLogRecPtr;
@@ -454,9 +469,12 @@ validated_end_inner(uint16 dead_tid, XLogRecPtr scan_lower, XLogRecPtr validated
 	XLogReaderFree(reader);
 	pfree(priv);
 
-	/* (a) not one complete record / (b) stopped below the durable watermark. */
+	/* (a) not one complete record / (b) stopped below the durable page floor. */
+	validated_floor = thread_validated_lsn_floor(validated_min);
+	if (validated_floor <= first_valid)
+		validated_floor = InvalidXLogRecPtr;
 	if (valid_end == first_valid
-		|| (!XLogRecPtrIsInvalid(validated_min) && valid_end < validated_min))
+		|| (!XLogRecPtrIsInvalid(validated_floor) && valid_end < validated_floor))
 		return CLUSTER_THREADREC_BLOCKED;
 
 	*out_valid_end = valid_end;
