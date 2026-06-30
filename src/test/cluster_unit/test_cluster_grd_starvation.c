@@ -240,6 +240,8 @@ cluster_cssd_get_peer_state(int32 peer_id pg_attribute_unused())
  * → skeleton mode → lookup_or_create returns NOT_READY; the soft-cap
  * regression test sets 1 and drives a tiny fake HTAB path. */
 int cluster_grd_max_entries = 0;
+bool cluster_grd_entry_reclaim = true;
+int cluster_grd_entry_reclaim_max_per_sweep = 256;
 
 /* spec-4.6 D2 stub:  cluster_grd_lookup_master_gen forwards the LMS
  * wire routing token verbatim (Q3-C).  Settable so the unit test can

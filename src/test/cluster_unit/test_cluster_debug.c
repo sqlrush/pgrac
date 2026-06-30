@@ -2768,6 +2768,30 @@ cluster_grd_entry_full_count(void)
 }
 
 uint64
+cluster_grd_entries_reclaimed_count(void)
+{
+	return 0;
+}
+
+uint64
+cluster_grd_reclaim_skipped_pinned_count(void)
+{
+	return 0;
+}
+
+uint64
+cluster_grd_pin_high_water(void)
+{
+	return 0;
+}
+
+uint64
+cluster_grd_sweep_runs(void)
+{
+	return 0;
+}
+
+uint64
 cluster_grd_holders_full_count(void)
 {
 	return 0;
