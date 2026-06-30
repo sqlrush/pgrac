@@ -82,8 +82,11 @@ PITR surface.
 The current implementation is intentionally conservative.  A
 single-node cluster can create a cluster manifest via
 `pg_cluster_backup_start()` / `pg_cluster_backup_stop()`.  If declared
-peers exist, cluster backup and restore-point mutation fail closed
-instead of producing a partial backup or an unreachable PITR target.
+peers exist, mutating backup and restore-point functions require the
+LMON-mediated coordinator/peer ACK path to complete.  Missing peer
+ACKs, peer NAKs, disconnected peers, or topology changes during a
+backup fail closed instead of producing a partial backup or an
+unreachable PITR target.
 
 ### `cluster.interconnect_tier`
 

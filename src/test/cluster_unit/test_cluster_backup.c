@@ -278,10 +278,62 @@ UT_TEST(test_restore_compatibility_rejects_mismatches)
 				 CLUSTER_RESTORE_COMPAT_MANIFEST);
 }
 
+UT_TEST(test_backup_wire_request_crc_and_bounds)
+{
+	ClusterBackupWireRequest req;
+
+	memset(&req, 0, sizeof(req));
+	req.magic = CLUSTER_BACKUP_IC_MAGIC;
+	req.version = CLUSTER_BACKUP_IC_VERSION;
+	req.op = CLUSTER_BACKUP_WIRE_OP_START;
+	req.request_id = 42;
+	req.coordinator_node_id = 0;
+	strlcpy(req.backup_id, "b-wire", sizeof(req.backup_id));
+	cluster_backup_wire_request_compute_crc(&req);
+	UT_ASSERT(cluster_backup_wire_request_valid(&req));
+
+	req.request_id = 43;
+	UT_ASSERT(!cluster_backup_wire_request_valid(&req));
+	req.request_id = 42;
+	cluster_backup_wire_request_compute_crc(&req);
+	req.backup_id[CLUSTER_BACKUP_ID_MAX - 1] = 'x';
+	UT_ASSERT(!cluster_backup_wire_request_valid(&req));
+}
+
+UT_TEST(test_backup_wire_ack_fail_closed_validation)
+{
+	ClusterBackupWireAck ack;
+
+	memset(&ack, 0, sizeof(ack));
+	ack.magic = CLUSTER_BACKUP_IC_MAGIC;
+	ack.version = CLUSTER_BACKUP_IC_VERSION;
+	ack.op = CLUSTER_BACKUP_WIRE_OP_STOP;
+	ack.result = CLUSTER_BACKUP_WIRE_RESULT_OK;
+	ack.sender_node_id = 1;
+	ack.thread_id = 2;
+	ack.request_id = 99;
+	ack.stop_cut_lsn = 500;
+	ack.cut_scn = test_scn(30);
+	cluster_backup_wire_ack_compute_crc(&ack);
+	UT_ASSERT(cluster_backup_wire_ack_valid(&ack));
+
+	ack.stop_cut_lsn = InvalidXLogRecPtr;
+	cluster_backup_wire_ack_compute_crc(&ack);
+	UT_ASSERT(!cluster_backup_wire_ack_valid(&ack));
+
+	ack.result = CLUSTER_BACKUP_WIRE_RESULT_EXECUTOR_ERROR;
+	ack.thread_id = 0;
+	ack.cut_scn = InvalidScn;
+	cluster_backup_wire_ack_compute_crc(&ack);
+	UT_ASSERT(cluster_backup_wire_ack_valid(&ack));
+	UT_ASSERT_STR_EQ(cluster_backup_wire_result_name(CLUSTER_BACKUP_WIRE_RESULT_EXECUTOR_ERROR),
+					 "executor_error");
+}
+
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(12);
 	UT_RUN(test_manifest_validates_complete_single_thread);
 	UT_RUN(test_manifest_rejects_missing_control_wal_undo_tt);
 	UT_RUN(test_manifest_rejects_bad_scn_lsn_count_and_crc);
@@ -292,6 +344,8 @@ main(void)
 	UT_RUN(test_pitr_resolves_latest_reachable_restore_point);
 	UT_RUN(test_pitr_fail_closed_reasons);
 	UT_RUN(test_restore_compatibility_rejects_mismatches);
+	UT_RUN(test_backup_wire_request_crc_and_bounds);
+	UT_RUN(test_backup_wire_ack_fail_closed_validation);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -109,9 +109,9 @@ $peer_node->start;
 
 my ($ret, $out, $err) = $peer_node->psql('postgres',
 	"\\set VERBOSITY verbose\nSELECT * FROM pg_cluster_backup_start('partial', true)");
-isnt($ret, 0, 'L8 peer topology rejects cluster backup start');
+isnt($ret, 0, 'L8 peer topology requires complete backup ACKs');
 like($err, qr/53RAD|cluster_backup_incomplete/,
-	'L8 peer topology fails closed with cluster_backup_incomplete');
+	'L8 missing peer ACK fails closed with cluster_backup_incomplete');
 is($peer_node->safe_psql('postgres',
 	q{SELECT CASE WHEN in_progress THEN 't' ELSE 'f' END
 	     FROM pg_stat_cluster_backup}),

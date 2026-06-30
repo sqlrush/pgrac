@@ -230,11 +230,18 @@ typedef enum ClusterICMsgType {
 		   * survivors (ClusterNodeRemoveAnnouncePayload: coordinator + target + remove_epoch +
 		   * removal_event_id).  Survivors drop their refs to the removed node + reply
 		   * REMOVE_CLEANUP_ACK. */
-	PGRAC_IC_MSG_REMOVE_CLEANUP_ACK = 32	/* PGRAC: spec-5.18 D10 — survivor -> removal
+	PGRAC_IC_MSG_REMOVE_CLEANUP_ACK = 32,	/* PGRAC: spec-5.18 D10 — survivor -> removal
 		   * coordinator (ClusterNodeRemoveCleanupAckPayload): "I dropped all refs to the removed
 		   * node + accepted the permanent remaster"; sets the survivor's bit in the coordinator's
 		   * cleanup ACK barrier. */
-	/* values 33..255 available for future sub-spec; never reuse 0..32 */
+	PGRAC_IC_MSG_BACKUP_REQUEST = 33,		/* PGRAC: spec-6.5 D1/D4 — backup coordinator ->
+		   * peers (ClusterBackupWireRequest): START / STOP / ABORT / RESTORE_POINT request.
+		   * LMON-mediated; peer LMON executes the local native backup/restore-point leg and
+		   * replies with BACKUP_ACK. */
+	PGRAC_IC_MSG_BACKUP_ACK = 34			/* PGRAC: spec-6.5 D1/D4 — peer -> backup
+		   * coordinator (ClusterBackupWireAck): local thread REDO/checkpoint/stop-cut
+		   * metadata or fail-closed NAK reason. */
+	/* values 35..255 available for future sub-spec; never reuse 0..34 */
 } ClusterICMsgType;
 
 

@@ -55,6 +55,7 @@
 #include "utils/ps_status.h"
 #include "utils/timestamp.h"
 
+#include "cluster/cluster_backup.h" /* cluster_backup_register_ic_msg_types + lmon_tick (spec-6.5) */
 #include "cluster/cluster_clean_leave.h" /* cluster_clean_leave_register_ic_msg_types (spec-5.13 D8) */
 #include "cluster/cluster_node_remove.h" /* cluster_node_remove_lmon_tick + register (spec-5.18 D9/D10) */
 #include "cluster/cluster_conf.h"
@@ -423,6 +424,16 @@ cluster_lmon_shmem_init(void)
 		if (!node_remove_registered) {
 			cluster_node_remove_register_ic_msg_types();
 			node_remove_registered = true;
+		}
+	}
+	/* spec-6.5 D1/D4: register cluster backup coordinator/peer request + ACK
+	 * messages.  Backends enqueue requests in shmem; LMON owns IC fanout. */
+	{
+		static bool backup_registered = false;
+
+		if (!backup_registered) {
+			cluster_backup_register_ic_msg_types();
+			backup_registered = true;
 		}
 	}
 }
@@ -1024,6 +1035,7 @@ LmonMain(void)
 			/* spec-3.2 D6:  LMON drain cross-node TT status hint outbound.
 			 * Fire-and-forget;  L172 family — only LMON owns tier1 fds. */
 			cluster_tt_status_hint_drain_outbound();
+			cluster_backup_lmon_tick();
 
 			/*
 			 * spec-2.34 D6 (HC93 leg a):  TTL sweep of the GCS block
@@ -1581,6 +1593,7 @@ LmonMain(void)
 			/* spec-3.2 D6:  LMON drain cross-node TT status hint outbound.
 			 * Fire-and-forget;  L172 family — only LMON owns tier1 fds. */
 			cluster_tt_status_hint_drain_outbound();
+			cluster_backup_lmon_tick();
 
 			/* spec-2.34 D6 (HC93 leg a):  TTL sweep GCS block dedup HTAB. */
 			cluster_gcs_block_dedup_sweep_expired(GetCurrentTimestamp());

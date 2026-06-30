@@ -32,6 +32,9 @@
 #define CLUSTER_BACKUP_MANIFEST_MAGIC 0x5047424BU /* "PGBK" */
 #define CLUSTER_BACKUP_MANIFEST_VERSION 1
 #define CLUSTER_BACKUP_RESTORE_POINT_MAX 16
+#define CLUSTER_BACKUP_NODE_BITMAP_BYTES (CLUSTER_MAX_NODES / 8)
+#define CLUSTER_BACKUP_IC_MAGIC 0x50424249U /* "PBBI" */
+#define CLUSTER_BACKUP_IC_VERSION 1
 
 typedef enum ClusterBackupManifestReason {
 	CLUSTER_BACKUP_MANIFEST_OK = 0,
@@ -72,6 +75,22 @@ typedef enum ClusterRestorePointCutReason {
 	CLUSTER_RESTORE_POINT_CUT_NO_THREADS,
 	CLUSTER_RESTORE_POINT_CUT_BAD_THREAD
 } ClusterRestorePointCutReason;
+
+typedef enum ClusterBackupWireOp {
+	CLUSTER_BACKUP_WIRE_OP_NONE = 0,
+	CLUSTER_BACKUP_WIRE_OP_START,
+	CLUSTER_BACKUP_WIRE_OP_STOP,
+	CLUSTER_BACKUP_WIRE_OP_ABORT,
+	CLUSTER_BACKUP_WIRE_OP_RESTORE_POINT
+} ClusterBackupWireOp;
+
+typedef enum ClusterBackupWireResult {
+	CLUSTER_BACKUP_WIRE_RESULT_OK = 0,
+	CLUSTER_BACKUP_WIRE_RESULT_BUSY,
+	CLUSTER_BACKUP_WIRE_RESULT_BAD_REQUEST,
+	CLUSTER_BACKUP_WIRE_RESULT_NOT_IN_BACKUP,
+	CLUSTER_BACKUP_WIRE_RESULT_EXECUTOR_ERROR
+} ClusterBackupWireResult;
 
 typedef struct ClusterBackupManifestThread {
 	bool present;
@@ -128,6 +147,38 @@ typedef struct ClusterBackupStatus {
 	TimestampTz stopped_at;
 } ClusterBackupStatus;
 
+typedef struct ClusterBackupWireRequest {
+	uint32 magic;
+	uint16 version;
+	uint16 op;
+	uint64 request_id;
+	int32 coordinator_node_id;
+	bool fast;
+	bool waitforarchive;
+	uint16 _pad0;
+	SCN requested_scn;
+	char backup_id[CLUSTER_BACKUP_ID_MAX];
+	char restore_point_name[CLUSTER_RESTORE_POINT_NAME_MAX];
+	uint32 crc;
+} ClusterBackupWireRequest;
+
+typedef struct ClusterBackupWireAck {
+	uint32 magic;
+	uint16 version;
+	uint16 op;
+	uint16 result;
+	int32 sender_node_id;
+	uint16 thread_id;
+	uint16 _pad0;
+	uint64 request_id;
+	XLogRecPtr start_redo_lsn;
+	XLogRecPtr checkpoint_lsn;
+	XLogRecPtr stop_cut_lsn;
+	SCN cut_scn;
+	TimeLineID timeline;
+	uint32 crc;
+} ClusterBackupWireAck;
+
 extern void cluster_backup_manifest_init(ClusterBackupManifest *manifest, const char *backup_id);
 extern bool cluster_backup_manifest_set_thread(ClusterBackupManifest *manifest, int thread_index,
 											   const ClusterBackupManifestThread *thread);
@@ -154,10 +205,18 @@ cluster_backup_manifest_compatible(const ClusterBackupManifest *manifest, uint32
 								   uint32 current_storage_id, uint32 expected_node_count);
 extern const char *cluster_restore_compat_reason_name(ClusterRestoreCompatibilityReason reason);
 
+extern void cluster_backup_wire_request_compute_crc(ClusterBackupWireRequest *request);
+extern bool cluster_backup_wire_request_valid(const ClusterBackupWireRequest *request);
+extern void cluster_backup_wire_ack_compute_crc(ClusterBackupWireAck *ack);
+extern bool cluster_backup_wire_ack_valid(const ClusterBackupWireAck *ack);
+extern const char *cluster_backup_wire_result_name(ClusterBackupWireResult result);
+
 #ifndef FRONTEND
 extern Size cluster_backup_shmem_size(void);
 extern void cluster_backup_shmem_init(void);
 extern void cluster_backup_shmem_register(void);
+extern void cluster_backup_register_ic_msg_types(void);
+extern void cluster_backup_lmon_tick(void);
 extern void cluster_backup_get_status(ClusterBackupStatus *out);
 extern bool cluster_backup_get_last_manifest(ClusterBackupManifest *out);
 extern int cluster_backup_get_restore_points(ClusterRestorePoint *out, int max_points);

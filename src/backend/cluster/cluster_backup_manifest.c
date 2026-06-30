@@ -328,3 +328,112 @@ cluster_restore_compat_reason_name(ClusterRestoreCompatibilityReason reason)
 	}
 	return "unknown";
 }
+
+void
+cluster_backup_wire_request_compute_crc(ClusterBackupWireRequest *request)
+{
+	pg_crc32c crc;
+
+	if (request == NULL)
+		return;
+
+	request->crc = 0;
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, request, offsetof(ClusterBackupWireRequest, crc));
+	FIN_CRC32C(crc);
+	request->crc = crc;
+}
+
+bool
+cluster_backup_wire_request_valid(const ClusterBackupWireRequest *request)
+{
+	ClusterBackupWireRequest copy;
+
+	if (request == NULL)
+		return false;
+	if (request->magic != CLUSTER_BACKUP_IC_MAGIC || request->version != CLUSTER_BACKUP_IC_VERSION)
+		return false;
+	if (request->op <= CLUSTER_BACKUP_WIRE_OP_NONE
+		|| request->op > CLUSTER_BACKUP_WIRE_OP_RESTORE_POINT)
+		return false;
+	if (request->request_id == 0)
+		return false;
+	if (request->coordinator_node_id < 0 || request->coordinator_node_id >= CLUSTER_MAX_NODES)
+		return false;
+	if (request->backup_id[CLUSTER_BACKUP_ID_MAX - 1] != '\0')
+		return false;
+	if (request->restore_point_name[CLUSTER_RESTORE_POINT_NAME_MAX - 1] != '\0')
+		return false;
+
+	copy = *request;
+	cluster_backup_wire_request_compute_crc(&copy);
+	return copy.crc == request->crc;
+}
+
+void
+cluster_backup_wire_ack_compute_crc(ClusterBackupWireAck *ack)
+{
+	pg_crc32c crc;
+
+	if (ack == NULL)
+		return;
+
+	ack->crc = 0;
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, ack, offsetof(ClusterBackupWireAck, crc));
+	FIN_CRC32C(crc);
+	ack->crc = crc;
+}
+
+bool
+cluster_backup_wire_ack_valid(const ClusterBackupWireAck *ack)
+{
+	ClusterBackupWireAck copy;
+
+	if (ack == NULL)
+		return false;
+	if (ack->magic != CLUSTER_BACKUP_IC_MAGIC || ack->version != CLUSTER_BACKUP_IC_VERSION)
+		return false;
+	if (ack->op <= CLUSTER_BACKUP_WIRE_OP_NONE || ack->op > CLUSTER_BACKUP_WIRE_OP_RESTORE_POINT)
+		return false;
+	if (ack->result > CLUSTER_BACKUP_WIRE_RESULT_EXECUTOR_ERROR)
+		return false;
+	if (ack->sender_node_id < 0 || ack->sender_node_id >= CLUSTER_MAX_NODES)
+		return false;
+	if (ack->request_id == 0)
+		return false;
+	if (ack->result == CLUSTER_BACKUP_WIRE_RESULT_OK) {
+		if (ack->thread_id == 0 || ack->thread_id > CLUSTER_MAX_NODES)
+			return false;
+		if (ack->op == CLUSTER_BACKUP_WIRE_OP_START
+			&& (ack->start_redo_lsn == InvalidXLogRecPtr
+				|| ack->checkpoint_lsn == InvalidXLogRecPtr))
+			return false;
+		if ((ack->op == CLUSTER_BACKUP_WIRE_OP_STOP
+			 || ack->op == CLUSTER_BACKUP_WIRE_OP_RESTORE_POINT)
+			&& (ack->stop_cut_lsn == InvalidXLogRecPtr || !SCN_VALID(ack->cut_scn)))
+			return false;
+	}
+
+	copy = *ack;
+	cluster_backup_wire_ack_compute_crc(&copy);
+	return copy.crc == ack->crc;
+}
+
+const char *
+cluster_backup_wire_result_name(ClusterBackupWireResult result)
+{
+	switch (result) {
+	case CLUSTER_BACKUP_WIRE_RESULT_OK:
+		return "ok";
+	case CLUSTER_BACKUP_WIRE_RESULT_BUSY:
+		return "busy";
+	case CLUSTER_BACKUP_WIRE_RESULT_BAD_REQUEST:
+		return "bad_request";
+	case CLUSTER_BACKUP_WIRE_RESULT_NOT_IN_BACKUP:
+		return "not_in_backup";
+	case CLUSTER_BACKUP_WIRE_RESULT_EXECUTOR_ERROR:
+		return "executor_error";
+	}
+	return "unknown";
+}

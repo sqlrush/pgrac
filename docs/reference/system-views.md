@@ -29,12 +29,13 @@ Current 6.5 scope is conservative:
   includes native PostgreSQL label content followed by `CLUSTER_*`
   metadata lines.
 - If the node has declared peers, the mutating backup/restore-point
-  functions fail closed with a cluster backup SQLSTATE rather than
-  silently producing a partial backup.
+  functions require LMON-mediated peer ACKs.  Missing ACKs, peer NAKs,
+  disconnected peers, or a changed peer set fail closed with a cluster
+  backup SQLSTATE rather than silently producing a partial backup.
 - The manifest records WAL thread, undo, transaction-table, SCN, and
-  control-file inclusion state for the proven local cut.  A later
-  backup-set writer can extend the same contract to coordinated
-  multi-node copying without changing these view shapes.
+  control-file inclusion state for the proven cut.  In a peer topology
+  the manifest is written only after every start-time peer has returned
+  STOP metadata for its WAL thread.
 
 ### `pg_stat_cluster_backup`
 

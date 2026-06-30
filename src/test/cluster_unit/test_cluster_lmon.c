@@ -427,6 +427,18 @@ void
 cluster_node_remove_register_ic_msg_types(void)
 {}
 
+/* spec-6.5 D1/D4 stubs: cluster_lmon registers and ticks the backup
+ * coordinator/peer ACK path, but this standalone unit binary intentionally
+ * does not link cluster_backup.o or backend backup symbols. */
+void cluster_backup_register_ic_msg_types(void);
+void
+cluster_backup_register_ic_msg_types(void)
+{}
+void cluster_backup_lmon_tick(void);
+void
+cluster_backup_lmon_tick(void)
+{}
+
 /* spec-2.2 D5 LMON drive references cluster_conf_lookup_node + cluster_node_id. */
 const struct ClusterNodeInfo *
 cluster_conf_lookup_node(int32 node_id pg_attribute_unused())
