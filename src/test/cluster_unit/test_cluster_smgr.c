@@ -40,7 +40,10 @@
  */
 #include "postgres.h"
 
+#include <stdarg.h>
+
 #include "cluster/storage/cluster_smgr.h"
+#include "cluster/storage/cluster_shared_fs.h"
 
 #undef printf
 #undef fprintf
@@ -215,6 +218,133 @@ void
 before_shmem_exit(pg_on_exit_callback function pg_attribute_unused(),
 				  Datum arg pg_attribute_unused())
 {}
+
+
+int
+pg_snprintf(char *str, size_t count, const char *fmt, ...)
+{
+	va_list args;
+	int ret;
+
+	va_start(args, fmt);
+	ret = vsnprintf(str, count, fmt, args);
+	va_end(args);
+	return ret;
+}
+
+bool
+RegisterSyncRequest(const FileTag *ftag pg_attribute_unused(),
+					SyncRequestType type pg_attribute_unused(),
+					bool retryOnError pg_attribute_unused())
+{
+	return true;
+}
+
+static const ClusterSharedFsCaps dummy_block_caps = {
+	.supports_odirect = true,
+	.required_io_alignment = 512,
+	.supports_scsi3_pr = false,
+	.durability_class = CLUSTER_DURABILITY_ODIRECT_BARRIER,
+	.max_nodes = 128,
+};
+
+static bool
+dummy_block_exists(RelFileLocator rlocator pg_attribute_unused(),
+				   ForkNumber forknum pg_attribute_unused())
+{
+	return false;
+}
+
+static void
+dummy_block_open(RelFileLocator rlocator pg_attribute_unused(),
+				 ForkNumber forknum pg_attribute_unused(),
+				 ClusterSharedFsHandle **out_handle pg_attribute_unused())
+{}
+
+static void
+dummy_block_create(RelFileLocator rlocator pg_attribute_unused(),
+				   ForkNumber forknum pg_attribute_unused(), bool isRedo pg_attribute_unused(),
+				   ClusterSharedFsHandle **out_handle pg_attribute_unused())
+{}
+
+static void
+dummy_block_close(ClusterSharedFsHandle *handle pg_attribute_unused())
+{}
+static int
+dummy_block_read(ClusterSharedFsHandle *handle pg_attribute_unused(),
+				 BlockNumber blocknum pg_attribute_unused(), char *buf pg_attribute_unused())
+{
+	return 0;
+}
+static int
+dummy_block_write(ClusterSharedFsHandle *handle pg_attribute_unused(),
+				  BlockNumber blocknum pg_attribute_unused(), const char *buf pg_attribute_unused())
+{
+	return 0;
+}
+static void
+dummy_block_extend(ClusterSharedFsHandle *handle pg_attribute_unused(),
+				   BlockNumber blocknum pg_attribute_unused())
+{}
+static BlockNumber
+dummy_block_nblocks(ClusterSharedFsHandle *handle pg_attribute_unused())
+{
+	return 0;
+}
+static void
+dummy_block_truncate(ClusterSharedFsHandle *handle pg_attribute_unused(),
+					 BlockNumber nblocks pg_attribute_unused())
+{}
+static void
+dummy_block_immedsync(ClusterSharedFsHandle *handle pg_attribute_unused())
+{}
+static void
+dummy_block_unlink(RelFileLocator rlocator pg_attribute_unused(),
+				   ForkNumber forknum pg_attribute_unused())
+{}
+static void
+dummy_block_init(void)
+{}
+static void
+dummy_block_shutdown(void)
+{}
+static int
+dummy_block_barrier_sync(ClusterSharedFsHandle *handle pg_attribute_unused())
+{
+	return 0;
+}
+static int
+dummy_block_register_fence_key(int node_id pg_attribute_unused())
+{
+	return 0;
+}
+static ClusterFenceCapability
+dummy_block_fence_capability(void)
+{
+	return CLUSTER_FENCE_CAP_NONE;
+}
+
+const ClusterSharedFsOps cluster_shared_fs_block_device_ops = {
+	.name = "block_device",
+	.id = CLUSTER_SHARED_FS_BACKEND_BLOCK_DEVICE,
+	.caps = &dummy_block_caps,
+	.exists = dummy_block_exists,
+	.open_existing = dummy_block_open,
+	.create = dummy_block_create,
+	.close = dummy_block_close,
+	.read = dummy_block_read,
+	.write = dummy_block_write,
+	.extend = dummy_block_extend,
+	.nblocks = dummy_block_nblocks,
+	.truncate = dummy_block_truncate,
+	.immedsync = dummy_block_immedsync,
+	.unlink = dummy_block_unlink,
+	.init = dummy_block_init,
+	.shutdown = dummy_block_shutdown,
+	.barrier_sync = dummy_block_barrier_sync,
+	.register_fence_key = dummy_block_register_fence_key,
+	.fence_capability = dummy_block_fence_capability,
+};
 
 /* ----------
  * spec-5.2 D1 stubs:  cluster_smgr_invalidate_relation now broadcasts a
