@@ -1313,6 +1313,16 @@ pg_backend_memory_contexts| SELECT name,
     free_chunks,
     used_bytes
    FROM pg_get_backend_memory_contexts() pg_get_backend_memory_contexts(name, ident, parent, level, total_bytes, total_nblocks, free_bytes, free_chunks, used_bytes);
+pg_cluster_backup_history| SELECT backup_id,
+    consistent_scn,
+    scn_durable_peak,
+    timeline,
+    catversion,
+    storage_id,
+    node_count,
+    thread_count,
+    manifest_crc
+   FROM cluster_get_backup_history() cluster_get_backup_history(backup_id, consistent_scn, scn_durable_peak, timeline, catversion, storage_id, node_count, thread_count, manifest_crc);
 pg_cluster_clean_leave_state| SELECT phase,
     leaving_node_id,
     leave_epoch,
@@ -1431,6 +1441,13 @@ pg_cluster_nodes| SELECT node_id,
     region,
     is_self
    FROM cluster_get_nodes() cluster_get_nodes(node_id, hostname, interconnect_addr, public_addr, role, region, is_self);
+pg_cluster_pitr_status| SELECT target_type,
+    target_action,
+    reachable,
+    reason,
+    resolved_scn,
+    restore_point_name
+   FROM cluster_get_pitr_status() cluster_get_pitr_status(target_type, target_action, reachable, reason, resolved_scn, restore_point_name);
 pg_cluster_quorum_state| SELECT in_quorum,
     quorum_size,
     disks_ok,
@@ -1450,6 +1467,12 @@ pg_cluster_reconfig_state| SELECT event_id,
     cssd_dead_generation,
     reconfig_kind
    FROM cluster_get_reconfig_state() cluster_get_reconfig_state(event_id, coordinator_node_id, old_epoch, new_epoch, dead_bitmap, applied_at, observer_role, event_seq, cssd_dead_generation, reconfig_kind);
+pg_cluster_restore_points| SELECT restore_point_name,
+    cut_scn,
+    thread_count,
+    incarnation,
+    created_at
+   FROM cluster_get_restore_points() cluster_get_restore_points(restore_point_name, cut_scn, thread_count, incarnation, created_at);
 pg_cluster_shmem| SELECT name,
     size_bytes,
     lwlock_count,
@@ -1981,6 +2004,21 @@ pg_stat_bgwriter| SELECT pg_stat_get_bgwriter_timed_checkpoints() AS checkpoints
     pg_stat_get_buf_fsync_backend() AS buffers_backend_fsync,
     pg_stat_get_buf_alloc() AS buffers_alloc,
     pg_stat_get_bgwriter_stat_reset_time() AS stats_reset;
+pg_stat_cluster_backup| SELECT in_progress,
+    backup_id,
+    coordinator_node_id,
+    start_redo_lsn,
+    checkpoint_lsn,
+    stop_cut_lsn,
+    consistent_scn,
+    manifest_crc,
+    started_at,
+    stopped_at,
+    backup_parallel_channels,
+    backup_wal_retention,
+    restore_points_enabled,
+    restore_point_interval_ms
+   FROM cluster_get_backup_state() cluster_get_backup_state(in_progress, backup_id, coordinator_node_id, start_redo_lsn, checkpoint_lsn, stop_cut_lsn, consistent_scn, manifest_crc, started_at, stopped_at, backup_parallel_channels, backup_wal_retention, restore_points_enabled, restore_point_interval_ms);
 pg_stat_cluster_counters| SELECT name,
     value
    FROM cluster_get_pgstat_counters() cluster_get_pgstat_counters(name, value);
