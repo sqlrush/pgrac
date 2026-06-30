@@ -15,6 +15,8 @@
 #
 # Portions Copyright (c) 2026, pgrac contributors
 #
+# Author: SqlRush <sqlrush@gmail.com>
+#
 #-------------------------------------------------------------------------
 
 use strict;
