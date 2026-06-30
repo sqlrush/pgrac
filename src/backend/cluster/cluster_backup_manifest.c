@@ -23,6 +23,23 @@
 #include "cluster/cluster_backup.h"
 #include "port/pg_crc32c.h"
 
+static int
+cluster_backup_scn_cmp(SCN a, SCN b)
+{
+#ifdef USE_PGRAC_CLUSTER
+	return scn_time_cmp(a, b);
+#else
+	uint64 alocal = scn_local(a);
+	uint64 blocal = scn_local(b);
+
+	if (alocal < blocal)
+		return -1;
+	if (alocal > blocal)
+		return 1;
+	return 0;
+#endif
+}
+
 void
 cluster_backup_manifest_init(ClusterBackupManifest *manifest, const char *backup_id)
 {
@@ -98,7 +115,7 @@ cluster_backup_manifest_validate(const ClusterBackupManifest *manifest)
 	if (!manifest->control_included)
 		return CLUSTER_BACKUP_MANIFEST_MISSING_CONTROL;
 	if (!SCN_VALID(manifest->consistent_scn) || !SCN_VALID(manifest->scn_durable_peak) ||
-		scn_time_cmp(manifest->scn_durable_peak, manifest->consistent_scn) < 0)
+		cluster_backup_scn_cmp(manifest->scn_durable_peak, manifest->consistent_scn) < 0)
 		return CLUSTER_BACKUP_MANIFEST_BAD_SCN_PEAK;
 
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
@@ -200,7 +217,7 @@ cluster_restore_point_build(ClusterRestorePoint *out,
 			return CLUSTER_RESTORE_POINT_CUT_BAD_THREAD;
 
 		out->cut_lsn[i] = thread_lsn[i];
-		if (!SCN_VALID(max_scn) || scn_time_cmp(thread_scn[i], max_scn) > 0)
+		if (!SCN_VALID(max_scn) || cluster_backup_scn_cmp(thread_scn[i], max_scn) > 0)
 			max_scn = thread_scn[i];
 		nthreads++;
 	}
@@ -242,7 +259,7 @@ cluster_pitr_resolve_scn(const ClusterRestorePoint *points,
 	int i;
 
 	if (!SCN_VALID(requested_scn) || !SCN_VALID(backup_consistent_scn) ||
-		scn_time_cmp(requested_scn, backup_consistent_scn) < 0)
+		cluster_backup_scn_cmp(requested_scn, backup_consistent_scn) < 0)
 		return CLUSTER_PITR_TARGET_BEFORE_BACKUP;
 	if (points == NULL || npoints <= 0)
 		return CLUSTER_PITR_TARGET_NO_RESTORE_POINT;
@@ -252,13 +269,13 @@ cluster_pitr_resolve_scn(const ClusterRestorePoint *points,
 
 		if (!point->present || !SCN_VALID(point->cut_scn))
 			continue;
-		if (scn_time_cmp(point->cut_scn, backup_consistent_scn) < 0)
+		if (cluster_backup_scn_cmp(point->cut_scn, backup_consistent_scn) < 0)
 			continue;
-		if (scn_time_cmp(point->cut_scn, requested_scn) > 0)
+		if (cluster_backup_scn_cmp(point->cut_scn, requested_scn) > 0)
 			continue;
 		if (point->thread_count == 0 || point->thread_count > CLUSTER_MAX_NODES)
 			return CLUSTER_PITR_TARGET_MISSING_THREAD;
-		if (best == NULL || scn_time_cmp(point->cut_scn, best->cut_scn) > 0)
+		if (best == NULL || cluster_backup_scn_cmp(point->cut_scn, best->cut_scn) > 0)
 			best = point;
 	}
 
