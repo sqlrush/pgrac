@@ -4,6 +4,8 @@
 rmgr_desc_sources = files(
   'brindesc.c',
   'clogdesc.c',
+  'clusterrawdesc.c',
+  'clusterundodesc.c',
   'committsdesc.c',
   'dbasedesc.c',
   'genericdesc.c',

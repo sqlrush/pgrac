@@ -33,6 +33,9 @@
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/md.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/storage/cluster_smgr.h"
+#endif
 #include "utils/hsearch.h"
 #include "utils/inval.h"
 #include "utils/memutils.h"
@@ -119,7 +122,15 @@ static const SyncOps syncsw[] = {
 	/* pg_multixact/members */
 	[SYNC_HANDLER_MULTIXACT_MEMBER] = {
 		.sync_syncfiletag = multixactmemberssyncfiletag
+	},
+#ifdef USE_PGRAC_CLUSTER
+	/* pgrac cluster shared-storage relation files */
+	[SYNC_HANDLER_CLUSTER_SHARED] = {
+		.sync_syncfiletag = cluster_smgr_syncfiletag,
+		.sync_unlinkfiletag = cluster_smgr_unlinkfiletag,
+		.sync_filetagmatches = cluster_smgr_filetagmatches
 	}
+#endif
 };
 
 /*

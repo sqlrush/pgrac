@@ -24,21 +24,20 @@
  *	      (relfilenode, relfilenode.1, .2 ...); cluster_smgr keeps
  *	      one file per relation per fork to simplify shared-storage
  *	      backend semantics in Stage 2.
- *	    - fsync registration NOT EQUIVALENT to md.c: cluster_smgr
- *	      currently ignores `skipFsync` and does not call PG's
- *	      RegisterSyncRequest / pending-delete machinery.  Crash
- *	      recovery durability is NOT GUARANTEED in Stage 1.X.  Full
- *	      fsync registration (Sprint B) lands in Stage 2 共享存储 spec
- *	      together with the multi-node fsync protocol design.
+ *	    - fsync registration: spec-6.0a wires cluster_smgr writes into
+ *	      PG's RegisterSyncRequest path via SYNC_HANDLER_CLUSTER_SHARED;
+ *	      queue-full fallback performs an immediate backend barrier_sync.
+ *	      Pending-unlink remains backend-specific because raw layout frees
+ *	      extents through WAL-logged metadata rather than md.c segments.
  *	    - GUC `cluster.smgr_user_relations` is EXPERIMENTAL in
  *	      Stage 1.X (default off; ON triggers postmaster startup
  *	      WARNING from cluster_shared_fs_init -- moved here from
  *	      cluster_smgr_init in spec-1.7.2 F2 fix because PG
  *	      smgr.c:162 explicitly states smgrinit() is "not called
  *	      during postmaster start").  Stage 1.8 verifies the opt-in
- *	      workflow end-to-end but the fsync gap remains -- do not
- *	      enable in production until Stage 2 spec delivers full
- *	      md.c-equivalent durability semantics.
+ *	      workflow end-to-end.  spec-6.0a adds production shared-storage
+ *	      durability hooks, but merge/ship remains blocked on the Stage 5
+ *	      beta close-out and final Stage 6 D0 re-ground.
  *
  *	  I/O dispatch chain: smgr -> cluster_smgr -> cluster_shared_fs
  *	  -> active backend (local for Stage 1.2) -> fd.c.  Stage 2 swaps
@@ -78,6 +77,7 @@
 #include "storage/relfilelocator.h"
 #include "storage/sinval.h" /* spec-5.2 D1: SharedInvalidationMessage */
 #include "storage/smgr.h"
+#include "storage/sync.h"
 
 
 /* ----------
@@ -147,6 +147,11 @@ extern BlockNumber cluster_smgr_nblocks(SMgrRelation reln, ForkNumber forknum);
 extern void cluster_smgr_truncate(SMgrRelation reln, ForkNumber forknum, BlockNumber old_blocks,
 								  BlockNumber nblocks);
 extern void cluster_smgr_immedsync(SMgrRelation reln, ForkNumber forknum);
+
+/* spec-6.0a: sync.c handler for cluster shared-storage relation tags. */
+extern int cluster_smgr_syncfiletag(const FileTag *ftag, char *path);
+extern int cluster_smgr_unlinkfiletag(const FileTag *ftag, char *path);
+extern bool cluster_smgr_filetagmatches(const FileTag *ftag, const FileTag *candidate);
 
 
 /* ----------

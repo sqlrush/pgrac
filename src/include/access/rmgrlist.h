@@ -75,4 +75,6 @@ PG_RMGR(RM_LOGICALMSG_ID, "LogicalMessage", logicalmsg_redo, logicalmsg_desc, lo
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC stage 1.22: see banner above + spec-1.22 §D14a. */
 PG_RMGR(RM_CLUSTER_UNDO_ID, "ClusterUndo", cluster_undo_redo, cluster_undo_desc, cluster_undo_identify, NULL, NULL, NULL, NULL)
+/* PGRAC spec-6.0a: crash-safe raw block-device layout metadata. */
+PG_RMGR(RM_CLUSTER_RAW_LAYOUT_ID, "ClusterRawLayout", cluster_raw_layout_redo, cluster_raw_layout_desc, cluster_raw_layout_identify, NULL, NULL, NULL, NULL)
 #endif

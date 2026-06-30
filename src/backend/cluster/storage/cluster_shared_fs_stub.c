@@ -50,6 +50,14 @@
 	"Set cluster.shared_storage_backend=local for single-node passthrough; "                       \
 	"\"block_device\", \"cluster_fs\", \"rbd\", and \"multi_attach\" land in Stage 2."
 
+static const ClusterSharedFsCaps cluster_shared_fs_stub_caps = {
+	.supports_odirect = false,
+	.required_io_alignment = 0,
+	.supports_scsi3_pr = false,
+	.durability_class = CLUSTER_DURABILITY_NONE,
+	.max_nodes = 0,
+};
+
 
 pg_attribute_noreturn() static void cluster_shared_fs_stub_reject(const char *callsite)
 {
@@ -171,10 +179,31 @@ static void
 cluster_shared_fs_stub_shutdown(void)
 {}
 
+static int
+cluster_shared_fs_stub_barrier_sync(ClusterSharedFsHandle *handle)
+{
+	(void)handle;
+	cluster_shared_fs_stub_reject("barrier_sync");
+}
+
+static int
+cluster_shared_fs_stub_register_fence_key(int node_id)
+{
+	(void)node_id;
+	cluster_shared_fs_stub_reject("register_fence_key");
+}
+
+static ClusterFenceCapability
+cluster_shared_fs_stub_fence_capability(void)
+{
+	return CLUSTER_FENCE_CAP_NONE;
+}
+
 
 const ClusterSharedFsOps cluster_shared_fs_stub_ops = {
 	.name = "stub",
 	.id = CLUSTER_SHARED_FS_BACKEND_STUB,
+	.caps = &cluster_shared_fs_stub_caps,
 
 	.exists = cluster_shared_fs_stub_exists,
 	.open_existing = cluster_shared_fs_stub_open_existing,
@@ -190,6 +219,10 @@ const ClusterSharedFsOps cluster_shared_fs_stub_ops = {
 
 	.init = cluster_shared_fs_stub_init,
 	.shutdown = cluster_shared_fs_stub_shutdown,
+
+	.barrier_sync = cluster_shared_fs_stub_barrier_sync,
+	.register_fence_key = cluster_shared_fs_stub_register_fence_key,
+	.fence_capability = cluster_shared_fs_stub_fence_capability,
 };
 
 #endif /* USE_PGRAC_CLUSTER */

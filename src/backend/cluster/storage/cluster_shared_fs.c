@@ -114,9 +114,10 @@ cluster_shared_fs_register_backend(const ClusterSharedFsOps *ops)
 				 errmsg("cluster_shared_fs_register_backend called outside cluster_shared_fs_init"),
 				 errdetail("Backend registration is only legal during postmaster init.")));
 
-	if (ops == NULL || ops->name == NULL)
-		ereport(FATAL, (errcode(ERRCODE_INTERNAL_ERROR),
-						errmsg("cluster_shared_fs backend registered with NULL ops or name")));
+	if (ops == NULL || ops->name == NULL || ops->caps == NULL)
+		ereport(FATAL,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("cluster_shared_fs backend registered with NULL ops, name, or caps")));
 
 	id = (int)ops->id;
 	if (id < 0 || id >= CLUSTER_SHARED_FS_BACKEND_MAX)
@@ -128,10 +129,12 @@ cluster_shared_fs_register_backend(const ClusterSharedFsOps *ops)
 	if (ops->exists == NULL || ops->open_existing == NULL || ops->create == NULL
 		|| ops->close == NULL || ops->read == NULL || ops->write == NULL || ops->extend == NULL
 		|| ops->nblocks == NULL || ops->truncate == NULL || ops->immedsync == NULL
-		|| ops->unlink == NULL || ops->init == NULL || ops->shutdown == NULL)
+		|| ops->unlink == NULL || ops->init == NULL || ops->shutdown == NULL
+		|| ops->barrier_sync == NULL || ops->register_fence_key == NULL
+		|| ops->fence_capability == NULL)
 		ereport(FATAL, (errcode(ERRCODE_INTERNAL_ERROR),
 						errmsg("cluster_shared_fs backend \"%s\" has NULL callbacks", ops->name),
-						errdetail("All thirteen vtable members must be non-NULL "
+						errdetail("All provider vtable members must be non-NULL "
 								  "(Sprint A 2026-05-02: open split into exists / "
 								  "open_existing / create).")));
 
@@ -175,6 +178,7 @@ cluster_shared_fs_init(void)
 	 */
 	cluster_shared_fs_register_backend(&cluster_shared_fs_stub_ops);
 	cluster_shared_fs_register_backend(&cluster_shared_fs_local_ops);
+	cluster_shared_fs_register_backend(&cluster_shared_fs_block_device_ops);
 	/*
 	 * PGRAC: spec-4.5a D3 -- shared_fs (id 3 CLUSTER_FS) is the first
 	 * cluster_shared_fs backend on genuinely cross-node-shared storage.
@@ -198,9 +202,9 @@ cluster_shared_fs_init(void)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cluster.shared_storage_backend selected backend (id %d) is not available",
 						(int)requested),
-				 errhint("Backends \"stub\", \"local\", and \"cluster_fs\" (shared_fs, "
-						 "spec-4.5a) are built in; \"block_device\", \"rbd\", and "
-						 "\"multi_attach\" land in Stage 6.  Set "
+				 errhint("Backends \"stub\", \"local\", \"block_device\", and "
+						 "\"cluster_fs\" (shared_fs) are built in; \"rbd\" and "
+						 "\"multi_attach\" remain future Stage 6 backends.  Set "
 						 "cluster.shared_storage_backend to one of the built-in "
 						 "backends in postgresql.conf and restart.")));
 
@@ -260,11 +264,11 @@ cluster_shared_fs_init(void)
 	if (cluster_smgr_user_relations && !IsUnderPostmaster)
 		ereport(WARNING,
 				(errmsg("cluster.smgr_user_relations is experimental"),
-				 errdetail("Two-instance concurrent open of the same relation is supported, "
-						   "but cross-instance cache invalidation across the cluster and "
-						   "md.c-equivalent fsync registration are not yet activated."),
-				 errhint("Do not enable in production: stale cache across cluster peers and "
-						 "crash-recovery durability are not guaranteed at this stage.")));
+				 errdetail("Shared-storage fsync/barrier registration is active, but "
+						   "cross-instance cache invalidation and catalog coordination remain "
+						   "experimental."),
+				 errhint("Do not treat this early shared-storage path as shipped until the "
+						 "spec-5.19/5.21 close-out and final Stage 6 D0 re-ground are complete.")));
 
 	cluster_shared_fs_init_in_progress = false;
 
@@ -297,6 +301,16 @@ const ClusterSharedFsOps *
 cluster_shared_fs_get_active_ops(void)
 {
 	return cluster_shared_fs_active_ops;
+}
+
+
+const ClusterSharedFsCaps *
+cluster_shared_fs_get_active_caps(void)
+{
+	if (cluster_shared_fs_active_ops == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR), errmsg("cluster_shared_fs is not initialised")));
+	return cluster_shared_fs_active_ops->caps;
 }
 
 
@@ -432,6 +446,27 @@ cluster_shared_fs_unlink(RelFileLocator rlocator, ForkNumber forknum)
 {
 	ENSURE_ACTIVE();
 	cluster_shared_fs_active_ops->unlink(rlocator, forknum);
+}
+
+int
+cluster_shared_fs_barrier_sync(ClusterSharedFsHandle *handle)
+{
+	ENSURE_ACTIVE();
+	return cluster_shared_fs_active_ops->barrier_sync(handle);
+}
+
+int
+cluster_shared_fs_register_fence_key(int node_id)
+{
+	ENSURE_ACTIVE();
+	return cluster_shared_fs_active_ops->register_fence_key(node_id);
+}
+
+ClusterFenceCapability
+cluster_shared_fs_fence_capability(void)
+{
+	ENSURE_ACTIVE();
+	return cluster_shared_fs_active_ops->fence_capability();
 }
 
 #endif /* USE_PGRAC_CLUSTER */

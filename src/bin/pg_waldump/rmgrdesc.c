@@ -23,7 +23,8 @@
 #include "access/xact.h"
 #include "access/xlog_internal.h"
 #ifdef USE_PGRAC_CLUSTER
-#include "cluster/storage/cluster_undo_xlog.h"	/* spec-1.22 D14a */
+#include "cluster/storage/cluster_undo_xlog.h" /* spec-1.22 D14a */
+#include "cluster/storage/cluster_raw_xlog.h"  /* spec-6.0a raw layout */
 #endif
 #include "catalog/storage_xlog.h"
 #include "commands/dbcommands_xlog.h"
@@ -35,8 +36,8 @@
 #include "storage/standbydefs.h"
 #include "utils/relmapper.h"
 
-#define PG_RMGR(symname,name,redo,desc,identify,startup,cleanup,mask,decode) \
-	{ name, desc, identify},
+#define PG_RMGR(symname, name, redo, desc, identify, startup, cleanup, mask, decode)               \
+	{ name, desc, identify },
 
 static const RmgrDescData RmgrDescTable[RM_N_BUILTIN_IDS] = {
 #include "access/rmgrlist.h"
@@ -44,8 +45,8 @@ static const RmgrDescData RmgrDescTable[RM_N_BUILTIN_IDS] = {
 
 #define CUSTOM_NUMERIC_NAME_LEN sizeof("custom###")
 
-static char CustomNumericNames[RM_N_CUSTOM_IDS][CUSTOM_NUMERIC_NAME_LEN] = {{0}};
-static RmgrDescData CustomRmgrDesc[RM_N_CUSTOM_IDS] = {{0}};
+static char CustomNumericNames[RM_N_CUSTOM_IDS][CUSTOM_NUMERIC_NAME_LEN] = { { 0 } };
+static RmgrDescData CustomRmgrDesc[RM_N_CUSTOM_IDS] = { { 0 } };
 static bool CustomRmgrDescInitialized = false;
 
 /*
@@ -75,10 +76,9 @@ default_identify(uint8 info)
 static void
 initialize_custom_rmgrs(void)
 {
-	for (int i = 0; i < RM_N_CUSTOM_IDS; i++)
-	{
-		snprintf(CustomNumericNames[i], CUSTOM_NUMERIC_NAME_LEN,
-				 "custom%03d", i + RM_MIN_CUSTOM_ID);
+	for (int i = 0; i < RM_N_CUSTOM_IDS; i++) {
+		snprintf(CustomNumericNames[i], CUSTOM_NUMERIC_NAME_LEN, "custom%03d",
+				 i + RM_MIN_CUSTOM_ID);
 		CustomRmgrDesc[i].rm_name = CustomNumericNames[i];
 		CustomRmgrDesc[i].rm_desc = default_desc;
 		CustomRmgrDesc[i].rm_identify = default_identify;
@@ -93,8 +93,7 @@ GetRmgrDesc(RmgrId rmid)
 
 	if (RmgrIdIsBuiltin(rmid))
 		return &RmgrDescTable[rmid];
-	else
-	{
+	else {
 		if (!CustomRmgrDescInitialized)
 			initialize_custom_rmgrs();
 		return &CustomRmgrDesc[rmid - RM_MIN_CUSTOM_ID];
