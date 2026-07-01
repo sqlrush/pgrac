@@ -17,6 +17,7 @@
 #      L5  ROLLBACK PREPARED does not leak prepared changes
 #      L6  standby SCN floor is monotonic and barrier-driven
 #      L7  standby writes fail closed
+#      L8  injection-only: standby TT overlay lookup tolerates primary epoch
 #
 # Author: SqlRush <sqlrush@gmail.com>
 #
@@ -174,6 +175,47 @@ my ($ret, $stdout, $stderr) = $standby->psql('postgres',
 isnt($ret, 0, 'L7 ADG standby rejects writes');
 like($stderr, qr/read-only transaction|cannot execute .* in a read-only transaction|recovery is in progress/i,
 	'L7 standby write failure is a read-only/recovery error');
+
+my $injection_enabled = $standby->safe_psql('postgres', q{
+	SELECT count(*) FROM pg_settings
+	 WHERE name = 'cluster_test_force_visibility_cluster_path'
+});
+
+SKIP: {
+	skip "ENABLE_INJECTION not configured (production build)", 5
+		unless $injection_enabled == 1;
+
+	$primary->safe_psql('postgres', q{
+		CREATE TABLE adg_epoch_visibility(id int primary key, note text);
+		INSERT INTO adg_epoch_visibility VALUES (1, 'primary epoch overlay');
+	});
+	$primary->wait_for_catchup($standby);
+
+	my $epoch_xid = trim($standby->safe_psql('postgres',
+		q{SELECT xmin::text::int FROM adg_epoch_visibility WHERE id = 1}));
+	like($epoch_xid, qr/^\d+$/, 'L8 captured replayed tuple xid on standby');
+
+	my ($inj_ret, $inj_stdout, $inj_stderr) = $standby->psql('postgres', qq{
+		SELECT cluster_test_inject_visibility_tt_ref(
+			'$epoch_xid'::xid, 7, 3, 77, 42, 1::int8, false)
+	});
+	is($inj_ret, 0,
+		'L8 installs TT overlay whose record epoch differs from standby live epoch');
+	unlike($inj_stderr, qr/53R97|cluster TT status unknown|overlay install verification failed/,
+		'L8 install verification did not fail closed on epoch mismatch');
+
+	$standby->append_conf('postgresql.conf',
+		"cluster_test_force_visibility_cluster_path = on\n");
+	$standby->reload;
+
+	my ($vis_ret, $vis_stdout, $vis_stderr) = $standby->psql('postgres',
+		q{SELECT count(*) FROM adg_epoch_visibility});
+	chomp $vis_stdout;
+	is($vis_ret, 0,
+		'L8 forced standby visibility path accepts primary-epoch overlay');
+	is($vis_stdout, '1',
+		'L8 forced standby visibility path returns the committed row');
+}
 
 $standby->stop;
 $primary->stop;

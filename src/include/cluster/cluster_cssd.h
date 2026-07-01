@@ -164,12 +164,10 @@ typedef enum ClusterCssdPeerState {
  *	cssd_seq           : per-sender monotonic counter (detect dup /
  *	                     reorder on receiver side; diagnostic).
  */
-typedef struct pg_attribute_packed() ClusterCssdHeartbeatPayload
-{
+typedef struct pg_attribute_packed() ClusterCssdHeartbeatPayload {
 	uint64 sender_local_clock;
 	uint32 cssd_seq;
-}
-ClusterCssdHeartbeatPayload;
+} ClusterCssdHeartbeatPayload;
 
 
 /*
