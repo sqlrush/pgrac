@@ -46,12 +46,12 @@ $node->start;
 
 
 # ----------
-# Total row count: 88 (spec-2.34 85 + spec-2.36 +3 reliability hardening).
+# Total row count: 110 (spec-6.0a adds 7 block-device storage waits).
 # ----------
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'103',
-	'pg_stat_cluster_wait_events returns 103 rows (spec-5.18 D12 +1 ReconfigNodeRemoveCleanupWait)');
+	'110',
+	'pg_stat_cluster_wait_events returns 110 rows (spec-6.0a +7 storage wait events)');
 
 
 # ----------
