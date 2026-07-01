@@ -533,6 +533,39 @@ cluster_undo_emit_block_write(uint8 instance, uint32 segment_id, uint32 block_no
 }
 
 /*
+ * cluster_undo_emit_block_write_full (spec-3.27 D3b)
+ *	  Always-FPI emit for the bufmgr runtime write path.  The record body is
+ *	  byte-identical to cluster_undo_emit_block_write's has_fpi=1 branch (the
+ *	  xl_undo_block_write header + the full BLCKSZ page), so redo applies it
+ *	  through the same full-image restore -- no new redo case, no delta decision,
+ *	  no DELAY_CHKPT_START.  The bufmgr caller holds the buffer content lock and
+ *	  is inside a critical section spanning the page modify + this insert +
+ *	  PageSetLSN + MarkBufferDirty.
+ */
+XLogRecPtr
+cluster_undo_emit_block_write_full(uint8 instance, uint32 segment_id, uint32 block_no,
+								   const char *block_image)
+{
+	xl_undo_block_write rec;
+
+	Assert(instance >= 1);
+	Assert(block_no >= 1); /* block 0 is the segment header (Q2-A: never bufmgr) */
+	Assert(block_image != NULL);
+
+	memset(&rec, 0, sizeof(rec));
+	rec.segment_id = segment_id;
+	rec.block_no = block_no;
+	rec.instance = instance;
+	rec.has_fpi = 1;
+
+	XLogBeginInsert();
+	XLogRegisterData((char *)&rec, sizeof(rec));
+	XLogRegisterData(unconstify(char *, block_image), BLCKSZ);
+
+	return XLogInsert(RM_CLUSTER_UNDO_ID, XLOG_UNDO_BLOCK_WRITE);
+}
+
+/*
  * cluster_undo_emit_block_write_multi (spec-3.25 D1b)
  *
  *	  Multi-record sibling of cluster_undo_emit_block_write: one record carries

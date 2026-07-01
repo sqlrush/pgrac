@@ -62,6 +62,7 @@
 #include "access/twophase.h" /* spec-4.12a D1: prepared-xact guard (硬门 6) */
 #include "access/xact.h"
 #include "port/atomics.h"
+#include "storage/bufmgr.h" /* spec-3.27 D3b: ReadBufferWithoutRelcache / MarkBufferDirty */
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
@@ -79,6 +80,7 @@
 #include "cluster/cluster_tt_status.h"	  /* spec-4.5a D11: remote_uba_resolved */
 #include "cluster/cluster_undo_cleaner.h" /* Q8 pressure wakeup (3.13) */
 #include "cluster/cluster_uba.h"
+#include "cluster/cluster_undo_buftag.h" /* spec-3.27 D1: reserved undo RelFileLocator */
 #include "cluster/cluster_undo_format.h"
 #include "cluster/cluster_undo_record.h"
 #include "cluster/cluster_undo_record_api.h"
@@ -241,6 +243,10 @@ static bool cluster_undo_residual_validated_this_xact = false;
 
 /* Per-backend state(D16 PREPARE guard support). */
 static bool cluster_undo_touched_in_xact = false;
+
+/* spec-3.27 D3b: once-per-backend latch so the "bufmgr write path engaged" LOG
+ * (anti-silent-fallback proof, rule 8.A) is emitted once, not per undo record. */
+static bool cluster_undo_bufmgr_logged = false;
 
 /*
  * spec-3.18 D3:  the backend's currently-held undo extent.  segment_id ==
@@ -857,6 +863,26 @@ read_undo_block(uint32 segment_id, uint8 owner_instance, uint32 block_no, char *
 	const char *img;
 
 	/*
+	 * spec-3.27 D3b:  in bufmgr mode the shared buffer is the single source of
+	 * truth for undo DATA blocks (block_no >= 1).  A direct smgr read would miss
+	 * un-checkpointed dirty content, so a reader (CR construction, get_record)
+	 * could see stale undo = false-visible (rule 8.A).  Read the LIVE buffer
+	 * under a SHARE content lock instead.  Block 0 (durable TT slot header,
+	 * Q2-A) is never bufmgr-backed and stays on the pool / smgr path below.
+	 */
+	if (block_no >= 1 && cluster_undo_buffer_backend_is_bufmgr()) {
+		RelFileLocator rl = cluster_undo_relfilelocator(owner_instance, segment_id);
+		Buffer b;
+
+		b = ReadBufferWithoutRelcache(rl, MAIN_FORKNUM, block_no, RBM_NORMAL, NULL,
+									  /* permanent = */ true);
+		LockBuffer(b, BUFFER_LOCK_SHARE);
+		memcpy(buf, BufferGetPage(b), BLCKSZ);
+		UnlockReleaseBuffer(b);
+		return true;
+	}
+
+	/*
 	 * spec-3.18 D1:  read-through the undo buffer pool for DATA blocks.  A NULL
 	 * pin means block 0 (not poolable) or the pool is disabled — fall back to
 	 * the direct smgr read.  On a hit/miss-fill the pool owns the disk read.
@@ -1299,6 +1325,8 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 	char wt_block_buf[BLCKSZ]; /* write-through scratch (defer path uses pending.buf) */
 	char *block_buf;
 	bool use_defer;
+	bool use_bufmgr;				 /* spec-3.27 D3b: undo_buffer_backend = bufmgr */
+	Buffer undo_buf = InvalidBuffer; /* spec-3.27 D3b: live undo buffer (bufmgr path) */
 	UndoBlockHeader *blkhdr;
 	UndoRecordHeader *rechdr;
 	UndoSlotDirEntry *slot;
@@ -1506,61 +1534,103 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 	}
 
 	/*
-	 * spec-3.25 D1b: choose the deferred-merge path.  A pending image for THIS
-	 * block keeps draining even if the GUC flipped off mid-window (the cursor
-	 * state describes pending.buf, not the stale pool copy).
+	 * spec-3.27 D3b: buffer-backed undo write path.  When undo_buffer_backend =
+	 * bufmgr, the undo DATA block is a shared-buffer-manager buffer: pin it, take
+	 * its EXCLUSIVE content lock, and read-modify-write THIS record's bytes
+	 * directly into the LIVE page under a critical section (NOT a full-page
+	 * memcpy of an out-of-lock image -- §2.4;  the EXCLUSIVE content lock is the
+	 * load-bearing serialization that replaces the custom pool's content_lock).
+	 * The buffer is the single source of truth, so no separate pool read is
+	 * needed;  the legacy pool defer / write-through machinery is bypassed.
 	 */
-	use_defer = cluster_undo_buf_writeback_allowed()
-				|| (cluster_undo_pending.active && cluster_undo_pending.segment_id == segment_id
-					&& cluster_undo_pending.owner_instance == owner_instance
-					&& cluster_undo_pending.block_no == current_block);
+	use_bufmgr = cluster_undo_buffer_backend_is_bufmgr();
+	if (use_bufmgr) {
+		RelFileLocator rl = cluster_undo_relfilelocator(owner_instance, segment_id);
 
-	if (use_defer && cluster_undo_pending.active
-		&& (cluster_undo_pending.segment_id != segment_id
-			|| cluster_undo_pending.owner_instance != owner_instance
-			|| cluster_undo_pending.block_no != current_block)) {
-		/* Block/segment switch: emit the previous block's merged record. */
-		if (!cluster_undo_pending_flush_internal(false))
-			return InvalidUba;
-	}
+		use_defer = false; /* bufmgr bypasses the legacy pool defer/write-through */
 
-	if (use_defer && cluster_undo_pending.active) {
-		/* Same (xact, block): keep appending into the pending image. */
-		block_buf = cluster_undo_pending.buf;
-		blkhdr = cluster_undo_page_get_payload(block_buf);
-	} else {
-		block_buf = use_defer ? cluster_undo_pending.buf : wt_block_buf;
+		undo_buf = ReadBufferWithoutRelcache(rl, MAIN_FORKNUM, current_block, RBM_NORMAL, NULL,
+											 /* permanent = */ true);
+		LockBuffer(undo_buf, BUFFER_LOCK_EXCLUSIVE);
+		block_buf = (char *)BufferGetPage(undo_buf);
 
-		/* Read current block (or zeroed if first write to this block). */
-		if (slot_count == 0) {
-			/*
-			 * Fresh block (spec-3.27 D3a / Q12-A):  lay down a standard PG
-			 * PageHeader at offset 0 and seed the UndoBlockHeader in the payload
-			 * (page + SizeOfPageHeaderData).  All record/slot offsets below are
-			 * payload-relative;  the header now lives at payload offset 0.
-			 */
-			cluster_undo_page_init(block_buf, current_scn, GetXLogWriteRecPtr());
-			blkhdr = cluster_undo_page_get_payload(block_buf);
-		} else {
-			/* Mid-extent block we already wrote -> read it back from the pool. */
-			if (!read_undo_block(segment_id, owner_instance, current_block, block_buf))
-				return InvalidUba; /* I/O fail (no shared lock held in D3 path) */
-			blkhdr = cluster_undo_page_get_payload(block_buf);
+		/* Anti-silent-fallback proof (rule 8.A): announce the engaged backend
+		 * once, before the critical section, at LOG so a TAP can assert it. */
+		if (!cluster_undo_bufmgr_logged) {
+			cluster_undo_bufmgr_logged = true;
+			elog(LOG, "cluster undo: buffer-backed (bufmgr) write path engaged for instance %u",
+				 (unsigned)owner_instance);
 		}
 
-		if (use_defer) {
-			/* Start a pending window for this block. */
-			cluster_undo_pending.active = true;
-			cluster_undo_pending.owner_instance = owner_instance;
-			cluster_undo_pending.segment_id = segment_id;
-			cluster_undo_pending.block_no = current_block;
-			cluster_undo_pending.old_block_lsn = blkhdr->block_lsn;
-			cluster_undo_pending.rec_lo = (uint16)free_offset;
-			cluster_undo_pending.rec_hi = (uint16)free_offset;
-			cluster_undo_pending.slot_min_off = PG_UINT16_MAX;
-			cluster_undo_pending.slot_max_off = 0;
-			cluster_undo_pending.nrecords = 0;
-			cluster_undo_pending.ref_slot = -1;
+		/*
+		 * Enter the critical section BEFORE modifying the shared page:  the page
+		 * write + always-FPI XLogInsert + PageSetLSN + MarkBufferDirty must be
+		 * atomic, so a failure PANICs (recovery replays the undo WAL) rather than
+		 * leaving a half-written shared undo buffer a reader could observe.  The
+		 * construction below performs no ereport(ERROR).
+		 */
+		START_CRIT_SECTION();
+		if (slot_count == 0)
+			cluster_undo_page_init(block_buf, current_scn, GetXLogWriteRecPtr());
+		blkhdr = cluster_undo_page_get_payload(block_buf);
+	} else {
+		/*
+		 * spec-3.25 D1b: choose the deferred-merge path.  A pending image for THIS
+		 * block keeps draining even if the GUC flipped off mid-window (the cursor
+		 * state describes pending.buf, not the stale pool copy).
+		 */
+		use_defer = cluster_undo_buf_writeback_allowed()
+					|| (cluster_undo_pending.active && cluster_undo_pending.segment_id == segment_id
+						&& cluster_undo_pending.owner_instance == owner_instance
+						&& cluster_undo_pending.block_no == current_block);
+
+		if (use_defer && cluster_undo_pending.active
+			&& (cluster_undo_pending.segment_id != segment_id
+				|| cluster_undo_pending.owner_instance != owner_instance
+				|| cluster_undo_pending.block_no != current_block)) {
+			/* Block/segment switch: emit the previous block's merged record. */
+			if (!cluster_undo_pending_flush_internal(false))
+				return InvalidUba;
+		}
+
+		if (use_defer && cluster_undo_pending.active) {
+			/* Same (xact, block): keep appending into the pending image. */
+			block_buf = cluster_undo_pending.buf;
+			blkhdr = cluster_undo_page_get_payload(block_buf);
+		} else {
+			block_buf = use_defer ? cluster_undo_pending.buf : wt_block_buf;
+
+			/* Read current block (or zeroed if first write to this block). */
+			if (slot_count == 0) {
+				/*
+				 * Fresh block (spec-3.27 D3a / Q12-A):  lay down a standard PG
+				 * PageHeader at offset 0 and seed the UndoBlockHeader in the payload
+				 * (page + SizeOfPageHeaderData).  All record/slot offsets below are
+				 * payload-relative;  the header now lives at payload offset 0.
+				 */
+				cluster_undo_page_init(block_buf, current_scn, GetXLogWriteRecPtr());
+				blkhdr = cluster_undo_page_get_payload(block_buf);
+			} else {
+				/* Mid-extent block we already wrote -> read it back from the pool. */
+				if (!read_undo_block(segment_id, owner_instance, current_block, block_buf))
+					return InvalidUba; /* I/O fail (no shared lock held in D3 path) */
+				blkhdr = cluster_undo_page_get_payload(block_buf);
+			}
+
+			if (use_defer) {
+				/* Start a pending window for this block. */
+				cluster_undo_pending.active = true;
+				cluster_undo_pending.owner_instance = owner_instance;
+				cluster_undo_pending.segment_id = segment_id;
+				cluster_undo_pending.block_no = current_block;
+				cluster_undo_pending.old_block_lsn = blkhdr->block_lsn;
+				cluster_undo_pending.rec_lo = (uint16)free_offset;
+				cluster_undo_pending.rec_hi = (uint16)free_offset;
+				cluster_undo_pending.slot_min_off = PG_UINT16_MAX;
+				cluster_undo_pending.slot_max_off = 0;
+				cluster_undo_pending.nrecords = 0;
+				cluster_undo_pending.ref_slot = -1;
+			}
 		}
 	}
 
@@ -1634,7 +1704,29 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 	 * or write-back + checkpoint-flush (gate on) are chosen inside it.
 	 */
 	Assert(current_block >= 1); /* data blocks only; block 0 is the segment header */
-	if (use_defer) {
+	if (use_bufmgr) {
+		/*
+		 * spec-3.27 D3b: the record + slot + header were read-modify-written into
+		 * the LIVE page above, under the EXCLUSIVE content lock inside the crit
+		 * section opened at page setup.  Emit the always-FPI WAL (data-only redo,
+		 * Q5-C keeps recovery path-based), stamp the record LSN into pd_lsn (the
+		 * SOLE flush/FPI/WAL-before-data authority, P1-2) and the block_lsn
+		 * self-check mirror, mark the buffer dirty, then close the crit section.
+		 * Durability is the standard bufmgr interlock: FlushBuffer / checkpoint
+		 * does XLogFlush(PageGetLSN) before any write-out.
+		 */
+		XLogRecPtr lsn;
+
+		lsn = cluster_undo_emit_block_write_full(owner_instance, segment_id, current_block,
+												 block_buf);
+		blkhdr->block_lsn = lsn;
+		PageSetLSN((Page)block_buf, lsn); /* pd_lsn == block_lsn invariant */
+		MarkBufferDirty(undo_buf);
+		END_CRIT_SECTION();
+		UnlockReleaseBuffer(undo_buf);
+
+		pg_atomic_fetch_add_u64(&UndoRecordShared->block_write_count, 1);
+	} else if (use_defer) {
 		/*
 		 * spec-3.25 D1b: extend the pending spans instead of emitting WAL per
 		 * record.  block_write_count is bumped at the flush (its semantics is

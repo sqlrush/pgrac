@@ -123,6 +123,16 @@ static const struct config_enum_entry cluster_undo_writeback_boundary_check_opti
 		{ "strict", CLUSTER_UNDO_WB_CHECK_STRICT, false },
 		{ NULL, 0, false } };
 
+/* spec-3.27 D7 (gate for D3b): undo DATA-block buffer backend.  Boot value MUST
+ * match the DefineCustomEnumVariable boot value below (check_GUC_init cassert
+ * trap).  legacy_pool = spec-3.18 custom UndoBufPool (default, byte-identical);
+ * bufmgr = PG shared buffer manager (B2-full). */
+int cluster_undo_buffer_backend = CLUSTER_UNDO_BUFFER_BACKEND_LEGACY_POOL;
+static const struct config_enum_entry cluster_undo_buffer_backend_options[]
+	= { { "legacy_pool", CLUSTER_UNDO_BUFFER_BACKEND_LEGACY_POOL, false },
+		{ "bufmgr", CLUSTER_UNDO_BUFFER_BACKEND_BUFMGR, false },
+		{ NULL, 0, false } };
+
 int cluster_grd_max_entries = 1024;
 bool cluster_grd_entry_reclaim = true;
 int cluster_grd_entry_reclaim_max_per_sweep = 256;
@@ -1037,6 +1047,22 @@ cluster_init_guc(void)
 		NULL,														  /* check_hook */
 		NULL,														  /* assign_hook */
 		NULL);														  /* show_hook */
+
+	/* spec-3.27 D7 (gate for D3b): undo DATA-block buffer backend.  PGC_POSTMASTER
+	 * because the bufmgr backend changes the undo storage architecture at start
+	 * (the custom pool vs shared buffers are not swappable at runtime). */
+	DefineCustomEnumVariable(
+		"cluster.undo_buffer_backend",
+		gettext_noop("Buffer layer that backs cluster undo DATA blocks."),
+		gettext_noop("legacy_pool (default) keeps the custom undo buffer pool "
+					 "(spec-3.18, write-through / write-back); bufmgr routes undo "
+					 "runtime writes and reads through PostgreSQL's shared buffer "
+					 "manager (spec-3.27 B2-full).  recovery stays path-based."),
+		&cluster_undo_buffer_backend, CLUSTER_UNDO_BUFFER_BACKEND_LEGACY_POOL, /* boot */
+		cluster_undo_buffer_backend_options, PGC_POSTMASTER, 0,				   /* flags */
+		NULL,																   /* check_hook */
+		NULL,																   /* assign_hook */
+		NULL);																   /* show_hook */
 
 	/*
 	 * cluster.config_file -- path to pgrac.conf.  Default "pgrac.conf"

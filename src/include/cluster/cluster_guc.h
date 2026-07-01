@@ -298,6 +298,27 @@ extern int cluster_itl_finish_wal_mode;
  * per-DML repeat-block path).  Default on; off = always the authoritative path. */
 extern bool cluster_undo_buf_pin_fastpath;
 
+/* spec-3.27 D7 (gate for D3b): which buffer layer backs undo DATA blocks.
+ * legacy_pool (default) keeps the custom UndoBufPool (spec-3.18); bufmgr routes
+ * undo runtime writes/reads through PG's shared buffer manager (B2-full).  The
+ * backend is chosen once at postmaster start (PGC_POSTMASTER). */
+typedef enum ClusterUndoBufferBackend {
+	CLUSTER_UNDO_BUFFER_BACKEND_LEGACY_POOL = 0,
+	CLUSTER_UNDO_BUFFER_BACKEND_BUFMGR = 1
+} ClusterUndoBufferBackend;
+extern int cluster_undo_buffer_backend;
+
+/*
+ * cluster_undo_buffer_backend_is_bufmgr -- true iff undo DATA blocks are served
+ *	by the shared buffer manager (spec-3.27 D3b).  Read on the per-DML undo
+ *	write/read hot path, so it stays a trivial integer compare.
+ */
+static inline bool
+cluster_undo_buffer_backend_is_bufmgr(void)
+{
+	return cluster_undo_buffer_backend == CLUSTER_UNDO_BUFFER_BACKEND_BUFMGR;
+}
+
 /* spec-2.23 D11 NEW: coordinator REPORT collect timeout + reply wait cap. */
 extern int cluster_lmd_probe_collect_timeout_ms;
 extern int cluster_ges_reply_wait_max_entries;
