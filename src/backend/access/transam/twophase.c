@@ -144,6 +144,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: spec-1.16 commit/abort SCN hooks for 2PC durable decisions. */
+#include "cluster/cluster_backup.h"
 #include "cluster/cluster_scn.h"
 /* PGRAC: spec-2.39 D1 — COMMIT PREPARED cluster sinval propagation. */
 #include "cluster/cluster_guc.h"
@@ -1530,18 +1531,33 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 	 */
 #ifdef USE_PGRAC_CLUSTER
 	if (isCommit)
-		final_scn = cluster_scn_advance_for_commit();
+	{
+		PG_TRY();
+		{
+			cluster_backup_pending_commit_enter();
+			final_scn = cluster_scn_advance_for_commit();
+			ProcessClusterTTPrefinish(bufptr, xid, final_scn, isCommit);
+		}
+		PG_CATCH();
+		{
+			cluster_backup_pending_commit_abort(0, (Datum)0);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+	}
 	else
+	{
 		final_scn = cluster_scn_advance_for_abort();
 
-	/*
-	 * PGRAC (spec-3.15 D5, C-P6): durably resolve this prepared xact's
-	 * cluster TT state BEFORE the prepared commit/abort WAL record.
-	 * Commit: per-binding 0x30 (+ overlay COMMITTED).  Abort: per-binding
-	 * 0x31 abort-clear (+ overlay ABORTED).  bufptr already points at the
-	 * on-disk 2PC records (sliced above).
-	 */
-	ProcessClusterTTPrefinish(bufptr, xid, final_scn, isCommit);
+		/*
+		 * PGRAC (spec-3.15 D5, C-P6): durably resolve this prepared xact's
+		 * cluster TT state BEFORE the prepared commit/abort WAL record.
+		 * Commit: per-binding 0x30 (+ overlay COMMITTED).  Abort: per-binding
+		 * 0x31 abort-clear (+ overlay ABORTED).  bufptr already points at the
+		 * on-disk 2PC records (sliced above).
+		 */
+		ProcessClusterTTPrefinish(bufptr, xid, final_scn, isCommit);
+	}
 #endif
 
 	/*
@@ -1560,6 +1576,9 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 		RecordTransactionAbortPrepared(xid, hdr->nsubxacts, children, hdr->nabortrels, abortrels,
 									   hdr->nabortstats, abortstats, gid,
 									   final_scn); /* PGRAC: spec-1.18 */
+#ifdef USE_PGRAC_CLUSTER
+	cluster_backup_pending_commit_exit();
+#endif
 
 	ProcArrayRemove(proc, latestXid);
 

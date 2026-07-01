@@ -22,18 +22,19 @@ The cluster backup surface exposes the manifest and target-resolution
 state used by `pg_cluster_backup_start`, `pg_cluster_backup_stop`, and
 `pg_cluster_create_restore_point`.
 
-Current 6.5 scope is conservative:
+Current 6.5 scope is conservative but no longer entirely read-only:
 
-- The views, catalog entries, manifest validators, PITR target resolver,
-  shared-memory state, and IC wire format are present as substrate.
-- Mutating physical backup and restore-point entry points fail closed
-  with `feature_not_supported` until the cluster physical capture,
-  durable WAL pin, restore-point commit-drain barrier, restore, and PITR
-  replay paths are implemented.
-- No manifest is published unless WAL, undo, transaction-table, SCN, and
-  control-file inclusion are proven.  The current substrate therefore
-  refuses to create a manifest instead of reporting a partial or unsound
-  backup as complete.
+- Single-node primary backups can start and stop through the cluster SQL
+  surface.  Stop requires `waitforarchive=true` and active WAL archiving;
+  the manifest is published only after a commit-drained restore point and
+  PostgreSQL's required-WAL archive wait complete.
+- Manual `pg_cluster_create_restore_point()` records a local restore point
+  after the same commit fence drains and the restore-point WAL record is
+  flushed.
+- Declared-peer backup, standby-offload backup, offline restore execution,
+  and PITR replay remain fail-closed until their cross-node proof is
+  implemented.  The server refuses to publish a partial manifest instead
+  of reporting an unsound backup as complete.
 
 ### `pg_stat_cluster_backup`
 

@@ -141,6 +141,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: spec-1.16 commit/abort SCN hooks; spec-1.18 WAL emit + replay. */
+#include "cluster/cluster_backup.h"		/* spec-6.5 restore-point commit drain */
 #include "cluster/cluster_conf.h"		/* cluster_conf_has_peers */
 #include "cluster/cluster_mode.h"		/* cluster_storage_mode_enabled */
 #include "cluster/cluster_inject.h"
@@ -1598,53 +1599,63 @@ RecordTransactionCommit(void)
 		 * WAL bytestream is byte-identical to vanilla PG.
 		 */
 #ifdef USE_PGRAC_CLUSTER
-		if (cluster_storage_mode_enabled())
+		PG_TRY();
 		{
-			/*
-			 * P0 perf hardening (2026-05-31): make this xact's undo durable
-			 * BEFORE the commit becomes visible.  Durable ordering:
-			 *   undo segment fsync -> commit_scn publish (ITL/TT) -> commit
-			 *   XLOG flush.
-			 * Replaces the old per-record fsync (one fsync per xact instead of
-			 * one per undo record, off the cursor_lock).  Runs before
-			 * START_CRIT_SECTION, so an fsync failure ereport(ERROR)s into a
-			 * clean abort (an aborted xact's un-fsync'd undo is irrelevant).
-			 */
-			cluster_undo_xact_precommit_flush();
+			if (cluster_storage_mode_enabled())
+			{
+				/*
+				 * P0 perf hardening (2026-05-31): make this xact's undo durable
+				 * BEFORE the commit becomes visible.  Durable ordering:
+				 *   undo segment fsync -> commit_scn publish (ITL/TT) -> commit
+				 *   XLOG flush.
+				 * Replaces the old per-record fsync (one fsync per xact instead of
+				 * one per undo record, off the cursor_lock).  Runs before
+				 * START_CRIT_SECTION, so an fsync failure ereport(ERROR)s into a
+				 * clean abort (an aborted xact's un-fsync'd undo is irrelevant).
+				 */
+				cluster_undo_xact_precommit_flush();
 
-			commit_scn = cluster_scn_advance_for_commit();
-			/* spec-3.3 D7: copy to function-scope variable for TT hook below. */
-			tt_commit_scn = commit_scn;
+				cluster_backup_pending_commit_enter();
+				commit_scn = cluster_scn_advance_for_commit();
+				/* spec-3.3 D7: copy to function-scope variable for TT hook below. */
+				tt_commit_scn = commit_scn;
 
-			/*
-			 * PGRAC (spec-3.4a D6 / N12 P0):
-			 * Stamp every touched ITL slot COMMITTED + emit WAL BEFORE the
-			 * commit XLOG record is written.  XACT_EVENT_COMMIT fires after
-			 * the commit record is durable -- too late to write ITL state
-			 * with crash-safe ordering -- so we use an explicit pre-commit
-			 * hook here instead of RegisterXactCallback (N10/N12).  The
-			 * hook is a no-op when the touched list is empty (DDL-only
-			 * transactions, autovacuum, etc.).
-			 */
-			if (cluster_itl_touch_has_pending())
-				cluster_itl_xact_precommit_finish(xid, tt_commit_scn);
+				/*
+				 * PGRAC (spec-3.4a D6 / N12 P0):
+				 * Stamp every touched ITL slot COMMITTED + emit WAL BEFORE the
+				 * commit XLOG record is written.  XACT_EVENT_COMMIT fires after
+				 * the commit record is durable -- too late to write ITL state
+				 * with crash-safe ordering -- so we use an explicit pre-commit
+				 * hook here instead of RegisterXactCallback (N10/N12).  The
+				 * hook is a no-op when the touched list is empty (DDL-only
+				 * transactions, autovacuum, etc.).
+				 */
+				if (cluster_itl_touch_has_pending())
+					cluster_itl_xact_precommit_finish(xid, tt_commit_scn);
 
-			/*
-			 * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
-			 * What changed: spec-3.11 D4 -- durably stamp commit_scn on this
-			 * xact's TT slot in the undo segment header (+ emit
-			 * XLOG_UNDO_TT_SLOT_COMMIT) BEFORE the commit XLOG record, so the
-			 * durable TT survives overlay eviction / restart and the spec-3.10
-			 * watermark gate resolves commit_scn precisely (own-instance).
-			 * Why: C1 ordering -- WAL before commit record, flushed by the
-			 * commit record's XLogFlush (no independent fsync, C10).  No-op
-			 * when the xact has no TT binding.  Distinct from the post-CLOG
-			 * cluster_tt_local_record_commit() overlay install (C1b: this only
-			 * stamps commit_scn; committed-ness stays CLOG's authority).
-			 */
-			has_tt_fold =
-				cluster_tt_local_precommit_durable_finish(xid, tt_commit_scn, &tt_fold);
+				/*
+				 * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+				 * What changed: spec-3.11 D4 -- durably stamp commit_scn on this
+				 * xact's TT slot in the undo segment header (+ emit
+				 * XLOG_UNDO_TT_SLOT_COMMIT) BEFORE the commit XLOG record, so the
+				 * durable TT survives overlay eviction / restart and the spec-3.10
+				 * watermark gate resolves commit_scn precisely (own-instance).
+				 * Why: C1 ordering -- WAL before commit record, flushed by the
+				 * commit record's XLogFlush (no independent fsync, C10).  No-op
+				 * when the xact has no TT binding.  Distinct from the post-CLOG
+				 * cluster_tt_local_record_commit() overlay install (C1b: this only
+				 * stamps commit_scn; committed-ness stays CLOG's authority).
+				 */
+				has_tt_fold =
+					cluster_tt_local_precommit_durable_finish(xid, tt_commit_scn, &tt_fold);
+			}
 		}
+		PG_CATCH();
+		{
+			cluster_backup_pending_commit_abort(0, (Datum)0);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
 #endif
 
 		START_CRIT_SECTION();
@@ -1662,6 +1673,9 @@ RecordTransactionCommit(void)
 							InvalidTransactionId, NULL /* plain commit */ ,
 							commit_scn,		/* PGRAC: spec-1.18 */
 							has_tt_fold ? &tt_fold : NULL); /* PGRAC: spec-3.18 D4.1 */
+#ifdef USE_PGRAC_CLUSTER
+		cluster_backup_pending_commit_exit();
+#endif
 
 		if (replorigin)
 			/* Move LSNs forward for this replication origin */

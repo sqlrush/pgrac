@@ -30,6 +30,7 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "storage/lwlock.h"
+#include "storage/ipc.h"
 #include "storage/shmem.h"
 #include "utils/builtins.h"
 #include "utils/elog.h"
@@ -43,6 +44,7 @@
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_shmem.h"
+#include "port/atomics.h"
 
 PG_FUNCTION_INFO_V1(pg_cluster_backup_start);
 PG_FUNCTION_INFO_V1(pg_cluster_backup_stop);
@@ -67,6 +69,8 @@ typedef struct ClusterBackupSharedState {
 	int restore_point_count;
 	int restore_point_next;
 	ClusterRestorePoint restore_points[CLUSTER_BACKUP_RESTORE_POINT_MAX];
+	pg_atomic_uint32 pending_commit_count;
+	pg_atomic_uint32 commit_fence_active;
 
 	uint64 next_request_id;
 	bool coordinator_send_pending;
@@ -93,6 +97,10 @@ static MemoryContext cluster_backup_context = NULL;
 static BackupState *cluster_backup_lmon_state = NULL;
 static StringInfo cluster_backup_lmon_tablespace_map = NULL;
 static MemoryContext cluster_backup_lmon_context = NULL;
+static bool cluster_backup_pending_commit_registered = false;
+static bool cluster_backup_pending_commit_exit_registered = false;
+
+#define CLUSTER_BACKUP_RESTORE_POINT_DRAIN_TIMEOUT_MS 30000
 
 static inline void
 cluster_backup_bitmap_set(uint8 *bitmap, int node_id)
@@ -150,6 +158,8 @@ cluster_backup_shmem_init(void)
 	if (!found) {
 		MemSet(cluster_backup_state, 0, sizeof(*cluster_backup_state));
 		LWLockInitialize(&cluster_backup_state->lock.lock, LWTRANCHE_CLUSTER_BACKUP);
+		pg_atomic_init_u32(&cluster_backup_state->pending_commit_count, 0);
+		pg_atomic_init_u32(&cluster_backup_state->commit_fence_active, 0);
 	}
 }
 
@@ -169,7 +179,10 @@ cluster_backup_shmem_register(void)
 }
 
 static void cluster_backup_cleanup_session_context(void);
+static void cluster_backup_session_exit(int code, Datum arg);
 static void cluster_backup_mark_native_stopped(const BackupState *state);
+static void cluster_backup_restore_point_fence_begin(void);
+static void cluster_backup_restore_point_fence_end(void);
 
 static void
 cluster_backup_error_if_unavailable(const char *op)
@@ -315,6 +328,103 @@ cluster_backup_lmon_reset_context(void)
 		MemoryContextDelete(cluster_backup_lmon_context);
 		cluster_backup_lmon_context = NULL;
 	}
+}
+
+static void
+cluster_backup_session_exit(int code, Datum arg)
+{
+	if (cluster_backup_state != NULL && cluster_backup_session_state != NULL)
+		cluster_backup_mark_native_stopped(NULL);
+	cluster_backup_cleanup_session_context();
+}
+
+void
+cluster_backup_pending_commit_enter(void)
+{
+	if (!cluster_enabled || cluster_backup_state == NULL)
+		return;
+
+	if (!cluster_backup_pending_commit_exit_registered) {
+		before_shmem_exit(cluster_backup_pending_commit_abort, (Datum)0);
+		cluster_backup_pending_commit_exit_registered = true;
+	}
+
+	for (;;) {
+		while (pg_atomic_read_u32(&cluster_backup_state->commit_fence_active) != 0) {
+			CHECK_FOR_INTERRUPTS();
+			pg_usleep(1000L);
+		}
+
+		pg_atomic_fetch_add_u32(&cluster_backup_state->pending_commit_count, 1);
+		cluster_backup_pending_commit_registered = true;
+		pg_memory_barrier();
+		if (pg_atomic_read_u32(&cluster_backup_state->commit_fence_active) == 0)
+			return;
+
+		cluster_backup_pending_commit_exit();
+	}
+}
+
+void
+cluster_backup_pending_commit_exit(void)
+{
+	if (!cluster_backup_pending_commit_registered)
+		return;
+
+	if (!cluster_enabled || cluster_backup_state == NULL) {
+		cluster_backup_pending_commit_registered = false;
+		return;
+	}
+	pg_atomic_fetch_sub_u32(&cluster_backup_state->pending_commit_count, 1);
+	cluster_backup_pending_commit_registered = false;
+}
+
+void
+cluster_backup_pending_commit_abort(int code, Datum arg)
+{
+	cluster_backup_pending_commit_exit();
+}
+
+static void
+cluster_backup_restore_point_fence_begin(void)
+{
+	uint32 expected = 0;
+	TimestampTz started_at;
+
+	if (cluster_backup_state == NULL)
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("cluster backup shared state is not initialized")));
+
+	if (!pg_atomic_compare_exchange_u32(&cluster_backup_state->commit_fence_active, &expected, 1))
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_RESTORE_POINT_DRAIN_TIMEOUT),
+						errmsg("cluster restore-point commit fence is already active")));
+
+	started_at = GetCurrentTimestamp();
+	for (;;) {
+		if (pg_atomic_read_u32(&cluster_backup_state->pending_commit_count) == 0)
+			return;
+
+		if (TimestampDifferenceExceeds(started_at, GetCurrentTimestamp(),
+									   CLUSTER_BACKUP_RESTORE_POINT_DRAIN_TIMEOUT_MS)) {
+			cluster_backup_restore_point_fence_end();
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_RESTORE_POINT_DRAIN_TIMEOUT),
+							errmsg("timed out waiting for cluster restore-point commit drain"),
+							errdetail("Pending commits did not drain within %d ms.",
+									  CLUSTER_BACKUP_RESTORE_POINT_DRAIN_TIMEOUT_MS)));
+		}
+
+		CHECK_FOR_INTERRUPTS();
+		pg_usleep(1000L);
+	}
+}
+
+static void
+cluster_backup_restore_point_fence_end(void)
+{
+	if (cluster_backup_state == NULL)
+		return;
+
+	pg_atomic_write_u32(&cluster_backup_state->commit_fence_active, 0);
 }
 
 static ClusterBackupWireAck
@@ -608,55 +718,321 @@ cluster_backup_lmon_tick(void)
 	cluster_backup_lmon_send_peer_reply();
 }
 
+static void
+cluster_backup_require_single_node_success_path(const char *op)
+{
+	if (RecoveryInProgress())
+		cluster_backup_fail_closed_unimplemented(op, "backup-from-standby restore-point proof");
+	if (cluster_conf_has_peers())
+		cluster_backup_fail_closed_unimplemented(
+			op, "cross-node commit-drain and per-thread capture ACKs");
+	if (cluster_conf_node_count() != 1)
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_RESTORE_INCOMPATIBLE),
+						errmsg("%s requires a single declared cluster node in this build", op)));
+}
+
+static void
+cluster_backup_prepare_session_context(void)
+{
+	MemoryContext oldcontext;
+
+	if (cluster_backup_context == NULL)
+		cluster_backup_context = AllocSetContextCreate(TopMemoryContext, "cluster backup context",
+													   ALLOCSET_START_SMALL_SIZES);
+	else {
+		cluster_backup_session_state = NULL;
+		cluster_backup_tablespace_map = NULL;
+		MemoryContextReset(cluster_backup_context);
+	}
+
+	oldcontext = MemoryContextSwitchTo(cluster_backup_context);
+	cluster_backup_session_state = (BackupState *)palloc0(sizeof(BackupState));
+	cluster_backup_tablespace_map = makeStringInfo();
+	MemoryContextSwitchTo(oldcontext);
+}
+
+static void
+cluster_backup_store_restore_point(const ClusterRestorePoint *point)
+{
+	int slot;
+
+	if (point == NULL)
+		return;
+
+	LWLockAcquire(&cluster_backup_state->lock.lock, LW_EXCLUSIVE);
+	slot = cluster_backup_state->restore_point_next % CLUSTER_BACKUP_RESTORE_POINT_MAX;
+	cluster_backup_state->restore_points[slot] = *point;
+	cluster_backup_state->restore_point_next = (slot + 1) % CLUSTER_BACKUP_RESTORE_POINT_MAX;
+	if (cluster_backup_state->restore_point_count < CLUSTER_BACKUP_RESTORE_POINT_MAX)
+		cluster_backup_state->restore_point_count++;
+	LWLockRelease(&cluster_backup_state->lock.lock);
+}
+
+static void
+cluster_backup_make_restore_point(const char *name, ClusterRestorePoint *point)
+{
+	SCN thread_scn[CLUSTER_MAX_NODES];
+	XLogRecPtr thread_lsn[CLUSTER_MAX_NODES];
+	SCN cut_scn;
+	XLogRecPtr cut_lsn;
+	uint16 thread_id;
+	int thread_index;
+	ClusterRestorePointCutReason reason;
+
+	MemSet(thread_scn, 0, sizeof(thread_scn));
+	MemSet(thread_lsn, 0, sizeof(thread_lsn));
+
+	cluster_backup_restore_point_fence_begin();
+	PG_TRY();
+	{
+		cut_scn = cluster_scn_current();
+		if (!SCN_VALID(cut_scn))
+			cut_scn = cluster_scn_advance();
+		cut_lsn = XLogRestorePoint(name);
+		XLogFlush(cut_lsn);
+	}
+	PG_CATCH();
+	{
+		cluster_backup_restore_point_fence_end();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	cluster_backup_restore_point_fence_end();
+
+	thread_id = cluster_backup_local_thread_id();
+	thread_index = (int)thread_id - 1;
+	if (thread_index < 0 || thread_index >= CLUSTER_MAX_NODES)
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_BACKUP_INCOMPLETE),
+						errmsg("cluster restore point produced invalid local WAL thread id %u",
+							   thread_id)));
+	thread_scn[thread_index] = cut_scn;
+	thread_lsn[thread_index] = cut_lsn;
+
+	reason = cluster_restore_point_build(point, name, thread_scn, thread_lsn, CLUSTER_MAX_NODES,
+										 true, true, 1);
+	if (reason != CLUSTER_RESTORE_POINT_CUT_OK)
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_BACKUP_INCOMPLETE),
+						errmsg("could not build cluster restore point cut"),
+						errdetail("Reason: %s.", cluster_restore_point_cut_reason_name(reason))));
+	point->created_at = GetCurrentTimestamp();
+}
+
 Datum
 pg_cluster_backup_start(PG_FUNCTION_ARGS)
 {
+#define CLUSTER_BACKUP_START_COLS 4
+	TupleDesc tupdesc;
+	Datum values[CLUSTER_BACKUP_START_COLS] = { 0 };
+	bool nulls[CLUSTER_BACKUP_START_COLS] = { 0 };
 	text *backupid = PG_GETARG_TEXT_PP(0);
+	bool fast = PG_GETARG_BOOL(1);
 	char *backupidstr;
 
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
 	if (!superuser())
 		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 						errmsg("must be superuser to start a cluster backup")));
 	cluster_backup_error_if_unavailable("pg_cluster_backup_start");
+	cluster_backup_require_single_node_success_path("pg_cluster_backup_start");
+	if (get_backup_status() == SESSION_BACKUP_RUNNING)
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("a backup is already in progress in this session")));
 
 	backupidstr = text_to_cstring(backupid);
 	if (strlen(backupidstr) >= CLUSTER_BACKUP_ID_MAX)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("cluster backup id is too long"),
 				 errdetail("Maximum length is %d bytes.", CLUSTER_BACKUP_ID_MAX - 1)));
-	cluster_backup_fail_closed_unimplemented(
-		"pg_cluster_backup_start",
-		"cluster physical backup capture, durable WAL pinning, and restore integration");
-	PG_RETURN_NULL();
+
+	LWLockAcquire(&cluster_backup_state->lock.lock, LW_EXCLUSIVE);
+	if (cluster_backup_state->status.in_progress) {
+		LWLockRelease(&cluster_backup_state->lock.lock);
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_BACKUP_IN_PROGRESS),
+						errmsg("a cluster backup is already in progress")));
+	}
+	MemSet(&cluster_backup_state->status, 0, sizeof(cluster_backup_state->status));
+	cluster_backup_state->status.in_progress = true;
+	strlcpy(cluster_backup_state->status.backup_id, backupidstr,
+			sizeof(cluster_backup_state->status.backup_id));
+	cluster_backup_state->status.coordinator_node_id = cluster_node_id;
+	cluster_backup_state->status.started_at = GetCurrentTimestamp();
+	LWLockRelease(&cluster_backup_state->lock.lock);
+
+	cluster_backup_prepare_session_context();
+	register_persistent_abort_backup_handler();
+	before_shmem_exit(cluster_backup_session_exit, (Datum)0);
+
+	PG_TRY();
+	{
+		do_pg_backup_start(backupidstr, fast, NULL, cluster_backup_session_state,
+						   cluster_backup_tablespace_map);
+	}
+	PG_CATCH();
+	{
+		cluster_backup_mark_native_stopped(NULL);
+		cluster_backup_cleanup_session_context();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	LWLockAcquire(&cluster_backup_state->lock.lock, LW_EXCLUSIVE);
+	cluster_backup_state->status.start_redo_lsn = cluster_backup_session_state->startpoint;
+	cluster_backup_state->status.checkpoint_lsn = cluster_backup_session_state->checkpointloc;
+	cluster_backup_state->status.start_tli = cluster_backup_session_state->starttli;
+	LWLockRelease(&cluster_backup_state->lock.lock);
+
+	values[0] = CStringGetTextDatum(backupidstr);
+	values[1] = LSNGetDatum(cluster_backup_session_state->startpoint);
+	values[2] = LSNGetDatum(cluster_backup_session_state->checkpointloc);
+	values[3] = Int32GetDatum((int32)cluster_backup_session_state->starttli);
+
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+#undef CLUSTER_BACKUP_START_COLS
 }
 
 Datum
 pg_cluster_backup_stop(PG_FUNCTION_ARGS)
 {
+#define CLUSTER_BACKUP_STOP_COLS 4
+	TupleDesc tupdesc;
+	Datum values[CLUSTER_BACKUP_STOP_COLS] = { 0 };
+	bool nulls[CLUSTER_BACKUP_STOP_COLS] = { 0 };
+	bool waitforarchive = PG_GETARG_BOOL(0);
+	ClusterRestorePoint stop_point;
+	ClusterBackupManifest manifest;
+	ClusterBackupManifestThread thread;
+	ClusterBackupManifestReason manifest_reason;
+	char restore_point_name[CLUSTER_RESTORE_POINT_NAME_MAX];
+	char *backup_label = NULL;
+	uint16 thread_id;
+	int thread_index;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
 	if (!superuser())
 		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 						errmsg("must be superuser to stop a cluster backup")));
 	cluster_backup_error_if_unavailable("pg_cluster_backup_stop");
+	cluster_backup_require_single_node_success_path("pg_cluster_backup_stop");
 
-	if (get_backup_status() == SESSION_BACKUP_RUNNING)
+	if (!waitforarchive || !XLogArchivingActive()) {
 		cluster_backup_abort_local_session_if_running();
-	cluster_backup_fail_closed_unimplemented(
-		"pg_cluster_backup_stop",
-		"cluster-wide restore-point commit-drain barrier and durable per-thread "
-		"WAL/undo/transaction-table capture");
-	PG_RETURN_NULL();
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_BACKUP_INCOMPLETE),
+						errmsg("cluster backup stop requires durable WAL archive proof"),
+						errdetail("Call pg_cluster_backup_stop(true) with archive_mode enabled so "
+								  "required WAL is archived before the manifest is published.")));
+	}
+	if (get_backup_status() != SESSION_BACKUP_RUNNING || cluster_backup_session_state == NULL)
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("cluster backup is not in progress"),
+						errhint("Did you call pg_cluster_backup_start()?")));
+
+	snprintf(restore_point_name, sizeof(restore_point_name), "cluster_backup_stop_%s",
+			 cluster_backup_session_state->name);
+	restore_point_name[CLUSTER_RESTORE_POINT_NAME_MAX - 1] = '\0';
+
+	PG_TRY();
+	{
+		cluster_backup_make_restore_point(restore_point_name, &stop_point);
+		do_pg_backup_stop(cluster_backup_session_state, waitforarchive);
+
+		backup_label = build_backup_content(cluster_backup_session_state, false);
+
+		cluster_backup_manifest_init(&manifest, cluster_backup_session_state->name);
+		manifest.consistent_scn = stop_point.cut_scn;
+		manifest.scn_durable_peak = stop_point.cut_scn;
+		manifest.timeline = cluster_backup_session_state->stoptli;
+		manifest.catversion = CATALOG_VERSION_NO;
+		manifest.incarnation = stop_point.incarnation;
+		manifest.backend_storage_id = (uint32)cluster_shared_storage_backend;
+		manifest.node_count = 1;
+		manifest.control_included = true;
+		manifest.voting_included = true;
+
+		thread_id = cluster_backup_local_thread_id();
+		thread_index = (int)thread_id - 1;
+		if (thread_index < 0 || thread_index >= CLUSTER_MAX_NODES)
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_BACKUP_INCOMPLETE),
+					 errmsg("cluster backup produced invalid local WAL thread id %u", thread_id)));
+		MemSet(&thread, 0, sizeof(thread));
+		thread.present = true;
+		thread.wal_included = true;
+		thread.undo_included = true;
+		thread.tt_included = true;
+		thread.thread_id = thread_id;
+		thread.node_id = cluster_node_id;
+		thread.start_redo_lsn = cluster_backup_session_state->startpoint;
+		thread.checkpoint_lsn = cluster_backup_session_state->checkpointloc;
+		thread.start_tli = cluster_backup_session_state->starttli;
+		thread.stop_cut_lsn = stop_point.cut_lsn[thread_index];
+		if (!cluster_backup_manifest_set_thread(&manifest, thread_index, &thread))
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_BACKUP_INCOMPLETE),
+					 errmsg("could not record local WAL thread in cluster backup manifest")));
+		cluster_backup_manifest_seal(&manifest);
+		manifest_reason = cluster_backup_manifest_validate(&manifest);
+		if (manifest_reason != CLUSTER_BACKUP_MANIFEST_OK)
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_BACKUP_INCOMPLETE),
+							errmsg("cluster backup manifest validation failed"),
+							errdetail("Reason: %s.",
+									  cluster_backup_manifest_reason_name(manifest_reason))));
+
+		cluster_backup_store_restore_point(&stop_point);
+
+		LWLockAcquire(&cluster_backup_state->lock.lock, LW_EXCLUSIVE);
+		cluster_backup_state->last_manifest = manifest;
+		cluster_backup_state->have_manifest = true;
+		cluster_backup_state->status.in_progress = false;
+		cluster_backup_state->status.stop_cut_lsn = thread.stop_cut_lsn;
+		cluster_backup_state->status.consistent_scn = manifest.consistent_scn;
+		cluster_backup_state->status.manifest_crc = manifest.manifest_crc;
+		cluster_backup_state->status.stopped_at = GetCurrentTimestamp();
+		LWLockRelease(&cluster_backup_state->lock.lock);
+	}
+	PG_CATCH();
+	{
+		if (get_backup_status() == SESSION_BACKUP_RUNNING)
+			do_pg_abort_backup(0, DatumGetBool(false));
+		cluster_backup_mark_native_stopped(NULL);
+		cluster_backup_cleanup_session_context();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	values[0] = Int64GetDatum((int64)manifest.consistent_scn);
+	values[1] = LSNGetDatum(thread.stop_cut_lsn);
+	values[2] = Int64GetDatum((int64)manifest.manifest_crc);
+	values[3] = CStringGetTextDatum(backup_label);
+
+	pfree(backup_label);
+	cluster_backup_cleanup_session_context();
+
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+#undef CLUSTER_BACKUP_STOP_COLS
 }
 
 Datum
 pg_cluster_create_restore_point(PG_FUNCTION_ARGS)
 {
+#define CLUSTER_CREATE_RESTORE_POINT_COLS 3
+	TupleDesc tupdesc;
+	Datum values[CLUSTER_CREATE_RESTORE_POINT_COLS] = { 0 };
+	bool nulls[CLUSTER_CREATE_RESTORE_POINT_COLS] = { 0 };
 	text *restore_name = PG_GETARG_TEXT_PP(0);
 	char *restore_name_str;
+	ClusterRestorePoint point;
+	uint16 thread_id;
+	int thread_index;
 
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
 	if (!superuser())
 		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 						errmsg("must be superuser to create a cluster restore point")));
 	cluster_backup_error_if_unavailable("pg_cluster_create_restore_point");
+	cluster_backup_require_single_node_success_path("pg_cluster_create_restore_point");
 	if (RecoveryInProgress())
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						errmsg("recovery is in progress"),
@@ -673,9 +1049,21 @@ pg_cluster_create_restore_point(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("cluster restore point name is too long"),
 				 errdetail("Maximum length is %d bytes.", CLUSTER_RESTORE_POINT_NAME_MAX - 1)));
-	cluster_backup_fail_closed_unimplemented("pg_cluster_create_restore_point",
-											 "cluster-wide restore-point commit-drain barrier");
-	PG_RETURN_NULL();
+	cluster_backup_make_restore_point(restore_name_str, &point);
+	cluster_backup_store_restore_point(&point);
+
+	thread_id = cluster_backup_local_thread_id();
+	thread_index = (int)thread_id - 1;
+	if (thread_index < 0 || thread_index >= CLUSTER_MAX_NODES)
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_BACKUP_INCOMPLETE),
+						errmsg("cluster restore point produced invalid local WAL thread id %u",
+							   thread_id)));
+	values[0] = CStringGetTextDatum(point.name);
+	values[1] = Int64GetDatum((int64)point.cut_scn);
+	values[2] = LSNGetDatum(point.cut_lsn[thread_index]);
+
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+#undef CLUSTER_CREATE_RESTORE_POINT_COLS
 }
 
 Datum
