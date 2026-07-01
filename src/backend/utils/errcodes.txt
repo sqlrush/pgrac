@@ -827,6 +827,16 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 # relfilenode (stale writeback, 8.A).
 53RAA    E    ERRCODE_CLUSTER_OBJECT_FLUSH_UNAVAILABLE                         cluster_object_flush_unavailable
 
+# spec-6.5:  cluster-aware backup / restore / PITR correctness band.
+# These states are raised before any path can silently produce a partial
+# cluster backup, choose an unreachable PITR target, or start from an
+# incomplete / incompatible restore substrate.
+53RAB    E    ERRCODE_CLUSTER_BACKUP_IN_PROGRESS                              cluster_backup_in_progress
+53RAC    E    ERRCODE_CLUSTER_PITR_TARGET_UNREACHABLE                         cluster_pitr_target_unreachable
+53RAD    E    ERRCODE_CLUSTER_BACKUP_INCOMPLETE                               cluster_backup_incomplete
+53RAE    E    ERRCODE_CLUSTER_RESTORE_INCOMPATIBLE                            cluster_restore_incompatible
+53RAF    E    ERRCODE_CLUSTER_RESTORE_POINT_DRAIN_TIMEOUT                     cluster_restore_point_drain_timeout
+
 Section: Class 54 - Program Limit Exceeded
 
 # this is for wired-in limits, not resource exhaustion problems (class borrowed from DB2)

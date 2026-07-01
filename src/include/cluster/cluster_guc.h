@@ -497,6 +497,24 @@ extern int cluster_boc_sweep_interval_ms;
  */
 extern bool cluster_enabled;
 
+/* spec-6.5: cluster-aware backup / restore / PITR target configuration. */
+#define CLUSTER_RECOVERY_TARGET_ACTION_PAUSE 0
+#define CLUSTER_RECOVERY_TARGET_ACTION_PROMOTE 1
+#define CLUSTER_RECOVERY_TARGET_ACTION_SHUTDOWN 2
+
+#define CLUSTER_BACKUP_MANIFEST_CHECKSUM_OFF 0
+#define CLUSTER_BACKUP_MANIFEST_CHECKSUM_CRC32C 1
+
+extern char *cluster_recovery_target_scn;
+extern char *cluster_recovery_target_cluster_time;
+extern char *cluster_recovery_target_name;
+extern int cluster_recovery_target_action;
+extern bool cluster_enable_pitr_restore_points;
+extern int cluster_pitr_restore_point_interval_ms;
+extern int cluster_backup_wal_retention;
+extern int cluster_backup_parallel_channels;
+extern int cluster_backup_manifest_checksums;
+
 /* spec-3.12 D5: own-instance undo/TT-slot retention horizon gate (default on). */
 extern bool cluster_undo_retention_horizon_enabled;
 

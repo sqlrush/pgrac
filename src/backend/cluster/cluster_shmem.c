@@ -64,6 +64,7 @@
 #include "cluster/cluster_diag.h"			/* cluster_diag_shmem_register (1.13 Sprint A) */
 #include "cluster/cluster_clean_leave.h"	/* cluster_clean_leave_shmem_register (spec-5.13 D2) */
 #include "cluster/cluster_node_remove.h"	/* cluster_node_remove_shmem_register (spec-5.18 D2) */
+#include "cluster/cluster_backup.h"			/* cluster_backup_shmem_register (spec-6.5) */
 #include "cluster/cluster_inject.h"			/* CLUSTER_INJECTION_POINT */
 #include "cluster/cluster_lck.h"			/* cluster_lck_shmem_register (1.12 Sprint A) */
 #include "cluster/cluster_epoch.h"			/* cluster_epoch_shmem_register (2.4) */
@@ -595,6 +596,10 @@ cluster_init_shmem_module(void)
 	/* spec-5.18 D2: register node-remove shmem region. */
 	if (cluster_shmem_lookup_region("pgrac cluster node_remove") == NULL)
 		cluster_node_remove_shmem_register();
+
+	/* spec-6.5: register cluster backup / restore / PITR state. */
+	if (cluster_shmem_lookup_region("pgrac cluster backup") == NULL)
+		cluster_backup_shmem_register();
 
 	/* spec-1.14 Sprint A D7: register cluster_stats shmem region. */
 	if (cluster_shmem_lookup_region("pgrac cluster stats") == NULL)

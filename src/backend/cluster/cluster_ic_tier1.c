@@ -1477,6 +1477,7 @@ cluster_ic_tier1_continue_hello_recv(int anon_slot, int peer_fd, int32 *out_lear
 			const char *self_name
 				= (ClusterConfShmem != NULL) ? ClusterConfShmem->cluster_name : "(no-conf)";
 
+			memset(&peer_sa, 0, sizeof(peer_sa));
 			if (getpeername(peer_fd, (struct sockaddr *)&peer_sa, &peer_sa_len) == 0) {
 				if (inet_ntop(AF_INET, &peer_sa.sin_addr, peer_ip, sizeof(peer_ip)) == NULL)
 					strcpy(peer_ip, "?");

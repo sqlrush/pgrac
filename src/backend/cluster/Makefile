@@ -41,6 +41,8 @@ OBJS = \
 	cluster.o \
 	cluster_advisory.o \
 	cluster_cancel_token.o \
+	cluster_backup.o \
+	cluster_backup_manifest.o \
 	cluster_cf_authority.o \
 	cluster_cf_enqueue.o \
 	cluster_cf_phase2.o \
@@ -208,7 +210,8 @@ else
 OBJS = cluster_conf.o cluster_debug.o cluster_ic.o cluster_inject.o cluster_undo_srf.o \
 	cluster_cr_srf.o cluster_block_apply_srf.o cluster_block_recovery_srf.o cluster_thread_recovery_apply_srf.o cluster_thread_recovery_replay_srf.o cluster_thread_recovery_driver_srf.o cluster_thread_recovery_orchestrator_srf.o cluster_pgstat.o cluster_scn.o cluster_views.o cluster_ges_mode_backend.o \
 	cluster_ir_srf.o cluster_ts_srf.o cluster_ko_srf.o \
-	cluster_hang_resolve.o cluster_clean_leave_views.o cluster_node_remove_views.o
+	cluster_hang_resolve.o cluster_clean_leave_views.o cluster_node_remove_views.o \
+	cluster_backup.o cluster_backup_manifest.o
 # spec-5.12: cluster_hang_resolve.o provides the pg_cluster_hang_victims /
 # pg_cluster_hang_resolve SQL symbols (real bodies #ifdef USE_PGRAC_CLUSTER,
 # --disable-cluster stubs raise ERRCODE_FEATURE_NOT_SUPPORTED); the symbols
@@ -217,6 +220,8 @@ OBJS = cluster_conf.o cluster_debug.o cluster_ic.o cluster_inject.o cluster_undo
 # SRF + pg_cluster_clean_leave_request UDF symbols, same unconditional-link reason.
 # spec-5.18: cluster_node_remove_views.o provides cluster_get_node_removal_state +
 # pg_cluster_remove_node, same unconditional-link reason.
+# spec-6.5: cluster_backup.o provides the cluster-aware backup/restore/PITR
+# SQL symbols; --disable-cluster bodies raise ERRCODE_FEATURE_NOT_SUPPORTED.
 endif
 
 include $(top_srcdir)/src/backend/common.mk

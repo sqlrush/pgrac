@@ -12540,6 +12540,67 @@
   prorettype => 'text', proargtypes => 'int4',
   prosrc => 'pg_cluster_remove_node' },
 
+# spec-6.5 -- cluster-aware backup / restore / PITR SQL surface.
+{ oid => '8965', descr => 'start a cluster-aware physical backup',
+  proname => 'pg_cluster_backup_start', provolatile => 'v',
+  prorettype => 'record', proargtypes => 'text bool',
+  proallargtypes => '{text,bool,text,pg_lsn,pg_lsn,int4}',
+  proargmodes => '{i,i,o,o,o,o}',
+  proargnames => '{label,fast,backup_id,start_redo_lsn,checkpoint_lsn,start_tli}',
+  prosrc => 'pg_cluster_backup_start' },
+
+{ oid => '8966', descr => 'stop a cluster-aware physical backup',
+  proname => 'pg_cluster_backup_stop', provolatile => 'v',
+  prorettype => 'record', proargtypes => 'bool',
+  proallargtypes => '{bool,int8,pg_lsn,int8,text}',
+  proargmodes => '{i,o,o,o,o}',
+  proargnames => '{waitforarchive,consistent_scn,stop_cut_lsn,manifest_crc,backup_label}',
+  prosrc => 'pg_cluster_backup_stop' },
+
+{ oid => '8967', descr => 'create a cluster-aware restore point',
+  proname => 'pg_cluster_create_restore_point', provolatile => 'v',
+  prorettype => 'record', proargtypes => 'text',
+  proallargtypes => '{text,text,int8,pg_lsn}',
+  proargmodes => '{i,o,o,o}',
+  proargnames => '{name,restore_point_name,cut_scn,cut_lsn}',
+  prosrc => 'pg_cluster_create_restore_point' },
+
+{ oid => '8968', descr => 'show current cluster backup state',
+  proname => 'cluster_get_backup_state', prorows => '1',
+  proretset => 't', provolatile => 'v', proparallel => 'r',
+  prorettype => 'record', proargtypes => '',
+  proallargtypes => '{bool,text,int4,pg_lsn,pg_lsn,pg_lsn,int8,int8,timestamptz,timestamptz,int4,int4,bool,int4}',
+  proargmodes => '{o,o,o,o,o,o,o,o,o,o,o,o,o,o}',
+  proargnames => '{in_progress,backup_id,coordinator_node_id,start_redo_lsn,checkpoint_lsn,stop_cut_lsn,consistent_scn,manifest_crc,started_at,stopped_at,backup_parallel_channels,backup_wal_retention,restore_points_enabled,restore_point_interval_ms}',
+  prosrc => 'cluster_get_backup_state' },
+
+{ oid => '8969', descr => 'show latest cluster backup manifest summary',
+  proname => 'cluster_get_backup_history', prorows => '16',
+  proretset => 't', provolatile => 'v', proparallel => 'r',
+  prorettype => 'record', proargtypes => '',
+  proallargtypes => '{text,int8,int8,int4,int8,int4,int4,int4,int8}',
+  proargmodes => '{o,o,o,o,o,o,o,o,o}',
+  proargnames => '{backup_id,consistent_scn,scn_durable_peak,timeline,catversion,storage_id,node_count,thread_count,manifest_crc}',
+  prosrc => 'cluster_get_backup_history' },
+
+{ oid => '8970', descr => 'show cluster restore points',
+  proname => 'cluster_get_restore_points', prorows => '16',
+  proretset => 't', provolatile => 'v', proparallel => 'r',
+  prorettype => 'record', proargtypes => '',
+  proallargtypes => '{text,int8,int4,int4,timestamptz}',
+  proargmodes => '{o,o,o,o,o}',
+  proargnames => '{restore_point_name,cut_scn,thread_count,incarnation,created_at}',
+  prosrc => 'cluster_get_restore_points' },
+
+{ oid => '8971', descr => 'show cluster PITR target resolution status',
+  proname => 'cluster_get_pitr_status', prorows => '1',
+  proretset => 't', provolatile => 'v', proparallel => 'r',
+  prorettype => 'record', proargtypes => '',
+  proallargtypes => '{text,text,bool,text,int8,text}',
+  proargmodes => '{o,o,o,o,o,o}',
+  proargnames => '{target_type,target_action,reachable,reason,resolved_scn,restore_point_name}',
+  prosrc => 'cluster_get_pitr_status' },
+
 # spec-3.2 D5b (2026-05-22) -- test-only visibility fork injection
 # functions.  These are SQL-visible so TAP can drive a real
 # HeapTupleSatisfiesMVCC cluster-path miss and assert 53R97.  Production
