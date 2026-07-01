@@ -970,7 +970,7 @@ cluster_undo_wal_protect_block(uint32 segment_id, uint8 owner_instance, uint32 b
 							   char *block_buf, XLogRecPtr old_block_lsn, uint16 rec_off,
 							   uint16 rec_len, uint16 slot_off)
 {
-	UndoBlockHeader *blkhdr = (UndoBlockHeader *)block_buf;
+	UndoBlockHeader *blkhdr = cluster_undo_page_get_payload(block_buf);
 	XLogRecPtr lsn;
 	int saved_delay_flags;
 	bool ok = false; /* assigned in PG_TRY; init silences cppcheck uninitvar */
@@ -979,7 +979,10 @@ cluster_undo_wal_protect_block(uint32 segment_id, uint8 owner_instance, uint32 b
 		/* D2a: always-FPI, write-through (no checkpoint-race window). */
 		lsn = cluster_undo_emit_block_write(owner_instance, segment_id, block_no, block_buf,
 											old_block_lsn, rec_off, rec_len, slot_off);
+		/* spec-3.27 D3a: pd_lsn is the single LSN authority; block_lsn is the
+		 * read-only self-check mirror (invariant block_lsn == PageGetLSN). */
 		blkhdr->block_lsn = lsn;
+		PageSetLSN((Page)block_buf, lsn);
 		return write_undo_block(segment_id, owner_instance, block_no, block_buf,
 								/* do_fsync = */ false, lsn);
 	}
@@ -999,6 +1002,7 @@ cluster_undo_wal_protect_block(uint32 segment_id, uint8 owner_instance, uint32 b
 		lsn = cluster_undo_emit_block_write(owner_instance, segment_id, block_no, block_buf,
 											old_block_lsn, rec_off, rec_len, slot_off);
 		blkhdr->block_lsn = lsn;
+		PageSetLSN((Page)block_buf, lsn); /* spec-3.27 D3a: pd_lsn == block_lsn */
 		ok = write_undo_block(segment_id, owner_instance, block_no, block_buf,
 							  /* do_fsync = */ false, lsn);
 	}
@@ -1041,7 +1045,7 @@ cluster_undo_pending_flush_internal(bool error_on_fail)
 	Assert(p->nrecords > 0);
 	Assert(p->rec_hi > p->rec_lo);
 	Assert(p->slot_min_off <= p->slot_max_off);
-	blkhdr = (UndoBlockHeader *)p->buf;
+	blkhdr = cluster_undo_page_get_payload(p->buf);
 	slot_off = p->slot_min_off;
 	slot_len = (uint16)(p->slot_max_off - p->slot_min_off + sizeof(UndoSlotDirEntry));
 
@@ -1050,6 +1054,7 @@ cluster_undo_pending_flush_internal(bool error_on_fail)
 			p->owner_instance, p->segment_id, p->block_no, p->buf, p->old_block_lsn, p->rec_lo,
 			(uint16)(p->rec_hi - p->rec_lo), slot_off, slot_len);
 		blkhdr->block_lsn = lsn;
+		PageSetLSN((Page)p->buf, lsn); /* spec-3.27 D3a: pd_lsn == block_lsn */
 		ok = write_undo_block(p->segment_id, p->owner_instance, p->block_no, p->buf,
 							  /* do_fsync = */ false, lsn);
 	} else {
@@ -1062,6 +1067,7 @@ cluster_undo_pending_flush_internal(bool error_on_fail)
 				p->owner_instance, p->segment_id, p->block_no, p->buf, p->old_block_lsn, p->rec_lo,
 				(uint16)(p->rec_hi - p->rec_lo), slot_off, slot_len);
 			blkhdr->block_lsn = lsn;
+			PageSetLSN((Page)p->buf, lsn); /* spec-3.27 D3a: pd_lsn == block_lsn */
 			ok = write_undo_block(p->segment_id, p->owner_instance, p->block_no, p->buf,
 								  /* do_fsync = */ false, lsn);
 		}
@@ -1456,8 +1462,8 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 
 		for (;;) {
 			if (!cluster_undo_extent_exhausted(ext)
-				&& cluster_undo_block_has_space(ext->cur_free_offset, ext->cur_slot_count,
-												record_length))
+				&& cluster_undo_payload_has_space(ext->cur_free_offset, ext->cur_slot_count,
+												  record_length))
 				break; /* current block has room for this record */
 
 			if (!cluster_undo_extent_exhausted(ext)) {
@@ -1521,27 +1527,25 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 	if (use_defer && cluster_undo_pending.active) {
 		/* Same (xact, block): keep appending into the pending image. */
 		block_buf = cluster_undo_pending.buf;
-		blkhdr = (UndoBlockHeader *)block_buf;
+		blkhdr = cluster_undo_page_get_payload(block_buf);
 	} else {
 		block_buf = use_defer ? cluster_undo_pending.buf : wt_block_buf;
 
 		/* Read current block (or zeroed if first write to this block). */
 		if (slot_count == 0) {
-			/* Fresh block — init zeroed buffer + header. */
-			memset(block_buf, 0, BLCKSZ);
-			blkhdr = (UndoBlockHeader *)block_buf;
-			blkhdr->magic = PGRAC_UNDO_BLOCK_MAGIC;
-			blkhdr->block_version = UNDO_BLOCK_VERSION_1;
-			blkhdr->slot_count = 0;
-			blkhdr->free_offset = sizeof(UndoBlockHeader);
-			blkhdr->first_change_scn = current_scn;
-			blkhdr->first_change_lsn = GetXLogWriteRecPtr();
-			blkhdr->crc64 = 0;
+			/*
+			 * Fresh block (spec-3.27 D3a / Q12-A):  lay down a standard PG
+			 * PageHeader at offset 0 and seed the UndoBlockHeader in the payload
+			 * (page + SizeOfPageHeaderData).  All record/slot offsets below are
+			 * payload-relative;  the header now lives at payload offset 0.
+			 */
+			cluster_undo_page_init(block_buf, current_scn, GetXLogWriteRecPtr());
+			blkhdr = cluster_undo_page_get_payload(block_buf);
 		} else {
 			/* Mid-extent block we already wrote -> read it back from the pool. */
 			if (!read_undo_block(segment_id, owner_instance, current_block, block_buf))
 				return InvalidUba; /* I/O fail (no shared lock held in D3 path) */
-			blkhdr = (UndoBlockHeader *)block_buf;
+			blkhdr = cluster_undo_page_get_payload(block_buf);
 		}
 
 		if (use_defer) {
@@ -1560,8 +1564,9 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 		}
 	}
 
-	/* Construct UndoRecordHeader at free_offset. */
-	rechdr = (UndoRecordHeader *)(block_buf + free_offset);
+	/* Construct UndoRecordHeader at free_offset (payload-relative, spec-3.27
+	 * D3a: base is the UndoBlockHeader payload, not the raw page). */
+	rechdr = (UndoRecordHeader *)((char *)blkhdr + free_offset);
 	memset(rechdr, 0, sizeof(UndoRecordHeader));
 	rechdr->record_type = record_type;
 	rechdr->flags = first_in_tx ? UNDO_REC_FLAG_FIRST_IN_TX : 0;
@@ -1599,12 +1604,12 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 	rechdr->target_block = target->blockno;
 	rechdr->target_offset = target->offnum;
 
-	/* Copy op-specific payload bytes after the header. */
-	memcpy(block_buf + free_offset + sizeof(UndoRecordHeader), payload, payload_len);
+	/* Copy op-specific payload bytes after the header (payload-relative). */
+	memcpy((char *)blkhdr + free_offset + sizeof(UndoRecordHeader), payload, payload_len);
 
-	/* Append slot directory entry. */
+	/* Append slot directory entry (payload-relative slot dir, spec-3.27 D3a). */
 	new_slot_idx = slot_count;
-	slot = UNDO_SLOT_DIR_PTR(block_buf, new_slot_idx);
+	slot = UNDO_PAYLOAD_SLOT_DIR_PTR(blkhdr, new_slot_idx);
 	slot->record_offset = free_offset;
 	slot->record_length = record_length;
 	slot->record_type = record_type;
@@ -1636,7 +1641,7 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 		 * now per-EMISSION; record_alloc_count / block_write_count = the
 		 * bundle factor).
 		 */
-		uint16 this_slot_off = (uint16)UNDO_SLOT_DIR_OFFSET(new_slot_idx);
+		uint16 this_slot_off = (uint16)UNDO_PAYLOAD_SLOT_DIR_OFFSET(new_slot_idx);
 
 		cluster_undo_pending.rec_hi = (uint16)(free_offset + record_length);
 		if (this_slot_off < cluster_undo_pending.slot_min_off)
@@ -1660,7 +1665,7 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 		if (!cluster_undo_wal_protect_block(segment_id, owner_instance, current_block, block_buf,
 											blkhdr->block_lsn, (uint16)free_offset,
 											(uint16)record_length,
-											(uint16)UNDO_SLOT_DIR_OFFSET(new_slot_idx)))
+											(uint16)UNDO_PAYLOAD_SLOT_DIR_OFFSET(new_slot_idx)))
 			return InvalidUba; /* I/O fail (no shared lock held in D3 path) */
 
 		pg_atomic_fetch_add_u64(&UndoRecordShared->block_write_count, 1);
@@ -1747,14 +1752,17 @@ cluster_undo_get_record(UBA uba, void *out_buffer, size_t buffer_size)
 	if (!read_undo_block(segment_id, owner_instance, block_no, block_buf))
 		return 0;
 
-	blkhdr = (UndoBlockHeader *)block_buf;
+	/* spec-3.27 D3a: the on-disk block is a standard PG page; the undo payload
+	 * (UndoBlockHeader + records + slot dir) lives at page + SizeOfPageHeaderData.
+	 * record_offset / slot dir are payload-relative. */
+	blkhdr = cluster_undo_page_get_payload(block_buf);
 	if (blkhdr->magic != PGRAC_UNDO_BLOCK_MAGIC)
 		return 0;
 
 	if (row_offset >= blkhdr->slot_count)
 		return 0;
 
-	slot = UNDO_SLOT_DIR_PTR(block_buf, row_offset);
+	slot = UNDO_PAYLOAD_SLOT_DIR_PTR(blkhdr, row_offset);
 	if (slot->record_offset == 0 || slot->record_length == 0)
 		return 0;
 
@@ -1762,7 +1770,7 @@ cluster_undo_get_record(UBA uba, void *out_buffer, size_t buffer_size)
 		return 0;
 
 	copy_bytes = slot->record_length;
-	memcpy(out_buffer, block_buf + slot->record_offset, copy_bytes);
+	memcpy(out_buffer, (char *)blkhdr + slot->record_offset, copy_bytes);
 
 	pg_atomic_fetch_add_u64(&UndoRecordShared->reader_lookup_count, 1);
 

@@ -89,6 +89,18 @@
 UT_DEFINE_GLOBALS();
 
 
+/*
+ * spec-3.27 D3a: the undo apply helpers (cluster_undo_xlog.h) now call
+ * PageSetLSN, whose PGRAC merged-recovery hook (bufpage.h) references these two
+ * recovery-merge globals.  This standalone test never runs recovery, so stub
+ * them false (same pattern as test_cluster_block_apply.c).
+ */
+bool cluster_recmerge_window_active = false;
+uint64 cluster_recmerge_window_scn = 0;
+uint64 cluster_recmerge_window_own_lsn = 0;
+bool cluster_recmerge_apply_foreign = false;
+
+
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 					 const char *fileName pg_attribute_unused(),
@@ -177,23 +189,30 @@ UT_TEST(test_stage3_undo_block_write_fpi_apply)
 {
 	char image[BLCKSZ];
 	char out[BLCKSZ] = { 0 }; /* filled by the FPI apply; init silences cppcheck uninitvar */
-	UndoBlockHeader *ih = (UndoBlockHeader *)image;
-	UndoBlockHeader *oh = (UndoBlockHeader *)out;
+	UndoBlockHeader *ih;
+	UndoBlockHeader *oh;
 
-	/* A WAL full-page image carries a STALE block_lsn (set before XLogInsert);
-	 * redo must overwrite it with the record's own LSN and leave every other
-	 * byte byte-identical (block_lsn never travels in the body -- §2.6). */
+	/* spec-3.27 D3a: the undo block is a standard PG page -- the UndoBlockHeader
+	 * lives in the payload (page + UNDO_PAGE_HEADER_BYTES).  A WAL full-page image
+	 * carries a STALE block_lsn (set before XLogInsert); redo must overwrite BOTH
+	 * the payload block_lsn AND pd_lsn (PageSetLSN) with the record's own LSN and
+	 * leave every other byte byte-identical (neither travels in the body -- §2.6). */
 	memset(image, 0xAB, BLCKSZ);
+	ih = cluster_undo_page_get_payload((Page)image);
 	ih->magic = PGRAC_UNDO_BLOCK_MAGIC;
 	ih->block_lsn = (XLogRecPtr)0xDEAD; /* stale value inside the image */
 
 	cluster_undo_apply_block_write_fpi(image, (XLogRecPtr)0xBEEF, out);
 
-	UT_ASSERT_EQ((long long)oh->block_lsn, (long long)0xBEEF); /* = record LSN */
+	oh = cluster_undo_page_get_payload((Page)out);
+	UT_ASSERT_EQ((long long)oh->block_lsn, (long long)0xBEEF);		   /* = record LSN */
+	UT_ASSERT_EQ((long long)PageGetLSN((Page)out), (long long)0xBEEF); /* pd_lsn == block_lsn */
 	UT_ASSERT_EQ((long long)oh->magic, (long long)PGRAC_UNDO_BLOCK_MAGIC);
 
-	/* Normalize the one intended diff, then the rest must be identical. */
-	oh->block_lsn = ih->block_lsn;
+	/* Normalize the two intended stamps (payload block_lsn + pd_lsn), then the
+	 * rest must be byte-identical. */
+	ih->block_lsn = oh->block_lsn;
+	PageSetLSN((Page)image, PageGetLSN((Page)out));
 	UT_ASSERT_EQ(memcmp(image, out, BLCKSZ), 0);
 }
 
@@ -205,12 +224,16 @@ UT_TEST(test_stage3_undo_block_write_delta_apply)
 	char base[BLCKSZ];
 	xl_undo_block_write rec;
 	char body[UNDO_BLOCK_HDR_PREFIX_LEN + 64 + 8]; /* hdr_prefix(40) + rec(64) + slot(8) */
-	const UndoBlockHeader *bh = (const UndoBlockHeader *)base;
+	const UndoBlockHeader *bh;
+	/* spec-3.27 D3a: rec_off / slot_off are PAYLOAD-relative;  the delta writes at
+	 * base + UNDO_PAGE_HEADER_BYTES + off.  PL is the payload base within `base`. */
+	char *PL = (char *)cluster_undo_page_get_payload((Page)base);
 
 	/* Existing on-disk block image (the redo base). */
 	memset(base, 0x11, BLCKSZ);
 
-	/* Delta: a 64-byte record at offset 200, an 8-byte slot near the tail. */
+	/* Delta: a 64-byte record at payload offset 200, an 8-byte slot near the
+	 * payload tail (slot_off + 8 <= UNDO_PAYLOAD_BYTES). */
 	memset(&rec, 0, sizeof(rec));
 	rec.has_fpi = 0;
 	rec.rec_off = 200;
@@ -223,20 +246,23 @@ UT_TEST(test_stage3_undo_block_write_delta_apply)
 
 	cluster_undo_apply_block_write_delta(base, &rec, body, (XLogRecPtr)0xCAFE);
 
-	/* header prefix [0,40) patched (block_lsn at offset 40 is NOT in the prefix) */
-	UT_ASSERT_EQ((int)(unsigned char)base[0], 0x22);
-	UT_ASSERT_EQ((int)(unsigned char)base[UNDO_BLOCK_HDR_PREFIX_LEN - 1], 0x22);
-	/* record [200,264) patched */
-	UT_ASSERT_EQ((int)(unsigned char)base[200], 0x33);
-	UT_ASSERT_EQ((int)(unsigned char)base[263], 0x33);
-	/* slot [8000,8008) patched */
-	UT_ASSERT_EQ((int)(unsigned char)base[8000], 0x44);
-	UT_ASSERT_EQ((int)(unsigned char)base[8007], 0x44);
-	/* untouched gaps keep the base bytes */
-	UT_ASSERT_EQ((int)(unsigned char)base[199], 0x11); /* between header and record */
-	UT_ASSERT_EQ((int)(unsigned char)base[264], 0x11); /* after the record */
-	/* block_lsn set from the record LSN (never carried in the body) */
+	bh = cluster_undo_page_get_payload((Page)base);
+	/* payload header prefix [0,40) patched (block_lsn at payload offset 40 is NOT
+	 * in the prefix) */
+	UT_ASSERT_EQ((int)(unsigned char)PL[0], 0x22);
+	UT_ASSERT_EQ((int)(unsigned char)PL[UNDO_BLOCK_HDR_PREFIX_LEN - 1], 0x22);
+	/* record payload [200,264) patched */
+	UT_ASSERT_EQ((int)(unsigned char)PL[200], 0x33);
+	UT_ASSERT_EQ((int)(unsigned char)PL[263], 0x33);
+	/* slot payload [8000,8008) patched */
+	UT_ASSERT_EQ((int)(unsigned char)PL[8000], 0x44);
+	UT_ASSERT_EQ((int)(unsigned char)PL[8007], 0x44);
+	/* untouched payload gaps keep the base bytes */
+	UT_ASSERT_EQ((int)(unsigned char)PL[199], 0x11); /* between header and record */
+	UT_ASSERT_EQ((int)(unsigned char)PL[264], 0x11); /* after the record */
+	/* block_lsn + pd_lsn set from the record LSN (never carried in the body) */
 	UT_ASSERT_EQ((long long)bh->block_lsn, (long long)0xCAFE);
+	UT_ASSERT_EQ((long long)PageGetLSN((Page)base), (long long)0xCAFE);
 }
 
 
@@ -259,17 +285,22 @@ UT_TEST(test_undo_4_8ab_redo_determinism_converges)
 	char body2[UNDO_BLOCK_HDR_PREFIX_LEN + 64
 			   + sizeof(UndoSlotDirEntry)]; /* fits both 32B + 64B records */
 
-	/* --- FPI half: applying the same full-page image twice is byte-identical --- */
+	/* spec-3.27 D3a: the UndoBlockHeader is payload-relative (page +
+	 * UNDO_PAGE_HEADER_BYTES). */
+
+	/* --- FPI half: applying the same full-page image twice is byte-identical
+	 * (both stamp payload block_lsn + pd_lsn deterministically) --- */
 	memset(s0, 0xAB, BLCKSZ);
-	((UndoBlockHeader *)s0)->magic = PGRAC_UNDO_BLOCK_MAGIC;
+	cluster_undo_page_get_payload((Page)s0)->magic = PGRAC_UNDO_BLOCK_MAGIC;
 	cluster_undo_apply_block_write_fpi(s0, (XLogRecPtr)0xBEEF, fpi_once);
 	cluster_undo_apply_block_write_fpi(s0, (XLogRecPtr)0xBEEF, fpi_twice);
 	UT_ASSERT_EQ(memcmp(fpi_once, fpi_twice, BLCKSZ), 0); /* idempotent full overwrite */
 
 	/* --- delta half: build two non-overlapping deltas at increasing LSNs --- */
 	memset(s0, 0x11, BLCKSZ);
-	((UndoBlockHeader *)s0)->magic = PGRAC_UNDO_BLOCK_MAGIC;
-	((UndoBlockHeader *)s0)->block_lsn = (XLogRecPtr)0x100; /* valid base (D4 guard) */
+	cluster_undo_page_get_payload((Page)s0)->magic = PGRAC_UNDO_BLOCK_MAGIC;
+	cluster_undo_page_get_payload((Page)s0)->block_lsn
+		= (XLogRecPtr)0x100; /* valid base (D4 guard) */
 
 	memset(&d1, 0, sizeof(d1));
 	d1.has_fpi = 0;
@@ -301,7 +332,8 @@ UT_TEST(test_undo_4_8ab_redo_determinism_converges)
 	cluster_undo_apply_block_write_delta(reapply, &d1, body1, (XLogRecPtr)0x200);
 	cluster_undo_apply_block_write_delta(reapply, &d2, body2, (XLogRecPtr)0x300);
 	UT_ASSERT_EQ(memcmp(reapply, forward, BLCKSZ), 0); /* idempotent convergence */
-	UT_ASSERT_EQ((long long)((UndoBlockHeader *)reapply)->block_lsn, (long long)0x300);
+	UT_ASSERT_EQ((long long)cluster_undo_page_get_payload((Page)reapply)->block_lsn,
+				 (long long)0x300);
 
 	/* Sanity: the deltas actually changed the block (not a no-op convergence). */
 	UT_ASSERT_EQ(memcmp(forward, s0, BLCKSZ) != 0 ? 1 : 0, 1);
@@ -323,8 +355,10 @@ UT_TEST(test_undo_4_8ab_redo_determinism_converges)
 	cluster_undo_apply_block_write_delta(reapply, &d1, body1, (XLogRecPtr)0x200);
 	cluster_undo_apply_block_write_delta(reapply, &d2, body2, (XLogRecPtr)0x300);
 	UT_ASSERT_EQ(memcmp(reapply, forward, BLCKSZ), 0); /* overlapping convergence */
-	/* The overlap [240,264) is the higher-LSN (d2) record's 0x55, not d1's 0x33. */
-	UT_ASSERT_EQ((int)(unsigned char)forward[250], 0x55);
+	/* The overlap [240,264) is the higher-LSN (d2) record's 0x55, not d1's 0x33
+	 * (payload-relative offset). */
+	UT_ASSERT_EQ((int)(unsigned char)((char *)cluster_undo_page_get_payload((Page)forward))[250],
+				 0x55);
 }
 
 

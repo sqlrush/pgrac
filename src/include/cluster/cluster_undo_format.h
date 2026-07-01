@@ -231,6 +231,43 @@ cluster_undo_payload_has_space(uint32 free_offset, uint16 slot_count, uint16 rec
 }
 
 /*
+ * cluster_undo_page_init (spec-3.27 D3a / Q12-A) -- initialize a fresh undo DATA
+ * block (block_no >= 1) as a standard-but-empty PG page with the UndoBlockHeader
+ * seeded in its payload.
+ *
+ *	PageInit lays down a valid PageHeaderData at offset 0 (pd_lsn = 0, pd_lower =
+ *	SizeOfPageHeaderData, pd_upper = pd_special = BLCKSZ, a valid
+ *	pd_pagesize_version) so the block passes PageIsVerified when bufmgr's
+ *	ReadBufferExtended(RBM_NORMAL) reads it back (D3b).  The undo payload
+ *	(UndoBlockHeader + records + slot directory) lives entirely below the
+ *	PageHeader, addressed with the UNDO_PAYLOAD_* macros;  PG treats it as free
+ *	space and never touches it (we never call PageAddItem).
+ *
+ *	free_offset is payload-relative:  sizeof(UndoBlockHeader) = the first byte
+ *	after the header, exactly as in the legacy full-BLCKSZ layout (the header now
+ *	sits at payload offset 0 instead of raw page offset 0).  crc64 is left 0
+ *	(computed lazily by the writer, matching the legacy fresh-block path).
+ */
+static inline void
+cluster_undo_page_init(Page page, SCN first_change_scn, XLogRecPtr first_change_lsn)
+{
+	UndoBlockHeader *blkhdr;
+
+	PageInit(page, BLCKSZ, 0);
+
+	blkhdr = cluster_undo_page_get_payload(page);
+	blkhdr->magic = PGRAC_UNDO_BLOCK_MAGIC;
+	blkhdr->block_version = UNDO_BLOCK_VERSION_1;
+	blkhdr->slot_count = 0;
+	blkhdr->free_offset = (uint32)sizeof(UndoBlockHeader);
+	blkhdr->_pad12 = 0;
+	blkhdr->first_change_scn = first_change_scn;
+	blkhdr->first_change_lsn = first_change_lsn;
+	blkhdr->crc64 = 0;
+	blkhdr->block_lsn = InvalidXLogRecPtr; /* == PageGetLSN(page) (0) invariant */
+}
+
+/*
  * §2.5 non-overflow invariants (P1-1).  The UndoBlockHeader plus at least
  * one record byte must fit below the slot directory, and slot 0 must land
  * strictly inside the payload (never past the physical page tail).

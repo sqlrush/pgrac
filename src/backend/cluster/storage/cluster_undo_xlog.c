@@ -509,10 +509,19 @@ cluster_undo_emit_block_write(uint8 instance, uint32 segment_id, uint32 block_no
 		rec.rec_len = rec_len;
 		rec.slot_off = slot_off;
 		XLogRegisterData((char *)&rec, sizeof(rec));
-		/* body = hdr_prefix [0,40) ++ record ++ slot (matches the redo apply). */
-		XLogRegisterData(unconstify(char *, block_image), UNDO_BLOCK_HDR_PREFIX_LEN);
-		XLogRegisterData(unconstify(char *, block_image) + rec_off, rec_len);
-		XLogRegisterData(unconstify(char *, block_image) + slot_off, sizeof(UndoSlotDirEntry));
+		/*
+		 * body = payload hdr_prefix [0,40) ++ record ++ slot (matches the redo
+		 * apply).  spec-3.27 D3a:  rec_off / slot_off are PAYLOAD-relative and
+		 * the UndoBlockHeader now lives at page + UNDO_PAGE_HEADER_BYTES, so every
+		 * source pointer is offset by the payload base.  The FPI branch keeps the
+		 * whole page (PageHeader included).
+		 */
+		XLogRegisterData(unconstify(char *, block_image) + UNDO_PAGE_HEADER_BYTES,
+						 UNDO_BLOCK_HDR_PREFIX_LEN);
+		XLogRegisterData(unconstify(char *, block_image) + UNDO_PAGE_HEADER_BYTES + rec_off,
+						 rec_len);
+		XLogRegisterData(unconstify(char *, block_image) + UNDO_PAGE_HEADER_BYTES + slot_off,
+						 sizeof(UndoSlotDirEntry));
 	} else {
 		XLogRegisterData((char *)&rec, sizeof(rec));
 		XLogRegisterData(unconstify(char *, block_image), BLCKSZ);
@@ -576,10 +585,14 @@ cluster_undo_emit_block_write_multi(uint8 instance, uint32 segment_id, uint32 bl
 		rec.slot_off = slot_off;
 		rec.slot_len = slot_len;
 		XLogRegisterData((char *)&rec, sizeof(rec));
-		/* body = hdr_prefix [0,40) ++ records span ++ slot-dir span. */
-		XLogRegisterData(unconstify(char *, block_image), UNDO_BLOCK_HDR_PREFIX_LEN);
-		XLogRegisterData(unconstify(char *, block_image) + rec_off, rec_len);
-		XLogRegisterData(unconstify(char *, block_image) + slot_off, slot_len);
+		/* body = payload hdr_prefix [0,40) ++ records span ++ slot-dir span.
+		 * spec-3.27 D3a:  payload-relative sources (page + UNDO_PAGE_HEADER_BYTES). */
+		XLogRegisterData(unconstify(char *, block_image) + UNDO_PAGE_HEADER_BYTES,
+						 UNDO_BLOCK_HDR_PREFIX_LEN);
+		XLogRegisterData(unconstify(char *, block_image) + UNDO_PAGE_HEADER_BYTES + rec_off,
+						 rec_len);
+		XLogRegisterData(unconstify(char *, block_image) + UNDO_PAGE_HEADER_BYTES + slot_off,
+						 slot_len);
 	} else {
 		XLogRegisterData((char *)&rec, sizeof(rec));
 		XLogRegisterData(unconstify(char *, block_image), BLCKSZ);
@@ -1304,7 +1317,10 @@ cluster_undo_redo_segment_reuse(XLogReaderState *record)
 static inline void
 cluster_undo_redo_check_delta_base(const char *block_image, uint32 segment_id, uint32 block_no)
 {
-	XLogRecPtr base_lsn = ((const UndoBlockHeader *)block_image)->block_lsn;
+	/* spec-3.27 D3a: the UndoBlockHeader lives in the payload (page +
+	 * UNDO_PAGE_HEADER_BYTES), not at raw page offset 0. */
+	XLogRecPtr base_lsn
+		= cluster_undo_page_get_payload((Page)unconstify(char *, block_image))->block_lsn;
 
 	if (XLogRecPtrIsInvalid(base_lsn))
 		ereport(
@@ -1389,10 +1405,12 @@ cluster_undo_redo_block_write(XLogReaderState *record)
 		uint32 expect_body
 			= UNDO_BLOCK_HDR_PREFIX_LEN + rec->rec_len + (uint32)sizeof(UndoSlotDirEntry);
 
+		/* spec-3.27 D3a: rec_off / slot_off are PAYLOAD-relative, bounded by
+		 * UNDO_PAYLOAD_BYTES (payload = page + UNDO_PAGE_HEADER_BYTES). */
 		if (rec->rec_off < sizeof(UndoBlockHeader) || rec->rec_len == 0
-			|| (uint32)rec->rec_off + rec->rec_len > BLCKSZ
+			|| (uint32)rec->rec_off + rec->rec_len > UNDO_PAYLOAD_BYTES
 			|| rec->slot_off < sizeof(UndoBlockHeader)
-			|| (uint32)rec->slot_off + sizeof(UndoSlotDirEntry) > BLCKSZ) {
+			|| (uint32)rec->slot_off + sizeof(UndoSlotDirEntry) > UNDO_PAYLOAD_BYTES) {
 			close(fd);
 			ereport(PANIC, (errmsg("XLOG_UNDO_BLOCK_WRITE delta out of bounds: "
 								   "rec_off=%u rec_len=%u slot_off=%u",
@@ -1499,11 +1517,12 @@ cluster_undo_redo_block_write_multi(XLogReaderState *record)
 		ssize_t nread;
 		uint32 expect_body = UNDO_BLOCK_HDR_PREFIX_LEN + rec->rec_len + rec->slot_len;
 
+		/* spec-3.27 D3a: payload-relative bounds (UNDO_PAYLOAD_BYTES). */
 		if (rec->rec_off < sizeof(UndoBlockHeader) || rec->rec_len == 0
-			|| (uint32)rec->rec_off + rec->rec_len > BLCKSZ
+			|| (uint32)rec->rec_off + rec->rec_len > UNDO_PAYLOAD_BYTES
 			|| rec->slot_off < sizeof(UndoBlockHeader) || rec->slot_len == 0
 			|| rec->slot_len % sizeof(UndoSlotDirEntry) != 0
-			|| (uint32)rec->slot_off + rec->slot_len > BLCKSZ) {
+			|| (uint32)rec->slot_off + rec->slot_len > UNDO_PAYLOAD_BYTES) {
 			close(fd);
 			ereport(PANIC, (errmsg("XLOG_UNDO_BLOCK_WRITE_MULTI delta out of bounds: "
 								   "rec_off=%u rec_len=%u slot_off=%u slot_len=%u",

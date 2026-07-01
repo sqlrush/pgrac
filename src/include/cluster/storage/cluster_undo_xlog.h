@@ -394,43 +394,61 @@ StaticAssertDecl(sizeof(xl_undo_block_write) == 16,
 				 "spec-3.18: xl_undo_block_write is 16 bytes, no implicit padding");
 
 /*
+ * spec-3.27 D3a / Q12-A:  the on-disk undo block is now a standard PG page with
+ * a PageHeader at offset 0, so the apply helpers write PAYLOAD-relative (page +
+ * UNDO_PAGE_HEADER_BYTES) and stamp BOTH block_lsn (the payload self-check
+ * mirror) and pd_lsn (the single flush/checkpoint authority, via PageSetLSN).
+ * They depend on the backend-only payload macros (SizeOfPageHeaderData) and
+ * PageSetLSN, so they are backend-only;  the frontend rmgr desc only needs the
+ * xl_undo_* struct typedefs above (L8 frontend/backend boundary).
+ */
+#ifndef FRONTEND
+
+/*
  * cluster_undo_apply_block_write_fpi -- D2a full-page-image apply (pure;
- * cluster_unit-tested).  Restores the WAL image wholesale, then stamps
- * block_lsn with the record's own end LSN.  block_lsn never travels in the
- * WAL body (it IS the record LSN), so the image's block_lsn bytes are stale
- * and overwritten here -- the same way PG redo sets a page LSN (§2.6).
+ * cluster_unit-tested).  Restores the WAL image wholesale (PageHeader included),
+ * then stamps block_lsn + pd_lsn with the record's own end LSN.  The LSN never
+ * travels in the WAL body (it IS the record LSN), so the image's stale bytes are
+ * overwritten here -- the same way PG redo sets a page LSN (§2.6).
  */
 static inline void
 cluster_undo_apply_block_write_fpi(const char *fpi_image, XLogRecPtr record_lsn, char *out_block)
 {
 	memcpy(out_block, fpi_image, BLCKSZ);
-	((UndoBlockHeader *)out_block)->block_lsn = record_lsn;
+	cluster_undo_page_get_payload((Page)out_block)->block_lsn = record_lsn;
+	PageSetLSN((Page)out_block, record_lsn); /* pd_lsn == block_lsn invariant */
 }
 
 /*
  * cluster_undo_apply_block_write_delta -- D2b 3-range delta apply (pure;
  * cluster_unit-tested).  Patches an existing block image in place with the
- * header prefix [0, UNDO_BLOCK_HDR_PREFIX_LEN), the new record [rec_off,
+ * PAYLOAD header prefix [0, UNDO_BLOCK_HDR_PREFIX_LEN), the new record [rec_off,
  * +rec_len), and the new slot dir entry [slot_off, +sizeof(UndoSlotDirEntry))
- * carried back-to-back in delta_body, then stamps block_lsn from the record
- * LSN (never in the body -- §2.6).  The redo caller MUST have validated
- * rec_off / rec_len / slot_off bounds before calling.
+ * carried back-to-back in delta_body -- all payload-relative (page +
+ * UNDO_PAGE_HEADER_BYTES) -- then stamps block_lsn + pd_lsn from the record LSN
+ * (never in the body -- §2.6).  The redo caller MUST have validated rec_off /
+ * rec_len / slot_off payload bounds before calling.
  */
 static inline void
 cluster_undo_apply_block_write_delta(char *block, const xl_undo_block_write *rec,
 									 const char *delta_body, XLogRecPtr record_lsn)
 {
+	char *payload = (char *)cluster_undo_page_get_payload((Page)block);
 	const char *p = delta_body;
 
 	/* header prefix [0, UNDO_BLOCK_HDR_PREFIX_LEN=40); excludes block_lsn @40
 	 * (set from the record LSN, never carried in the delta body). */
-	memcpy(block, p, UNDO_BLOCK_HDR_PREFIX_LEN);
+	memcpy(payload, p, UNDO_BLOCK_HDR_PREFIX_LEN);
 	p += UNDO_BLOCK_HDR_PREFIX_LEN;
-	memcpy(block + rec->rec_off, p, rec->rec_len); /* new record */
+	memcpy(payload + rec->rec_off, p, rec->rec_len); /* new record */
 	p += rec->rec_len;
-	memcpy(block + rec->slot_off, p, sizeof(UndoSlotDirEntry)); /* new slot dir entry */
-	((UndoBlockHeader *)block)->block_lsn = record_lsn;
+	memcpy(payload + rec->slot_off, p, sizeof(UndoSlotDirEntry)); /* new slot dir entry */
+	((UndoBlockHeader *)payload)->block_lsn = record_lsn;
+	PageSetLSN((Page)block, record_lsn); /* pd_lsn == block_lsn invariant */
 }
+
+#endif /* !FRONTEND (single-record apply helpers; multi typedef below is
+		* frontend-visible for the rmgr desc) */
 
 /*
  * spec-3.25 D1b: multi-record sibling of xl_undo_block_write.  One record
@@ -459,22 +477,27 @@ StaticAssertDecl(sizeof(xl_undo_block_write_multi) == 20,
 /*
  * cluster_undo_apply_block_write_multi_delta -- D1b 3-span delta apply (pure;
  * cluster_unit-tested).  Same contract as the single-record delta apply, with
- * the slot-dir span length carried in the record.  The redo caller MUST have
- * validated all bounds (fail-closed) before calling.
+ * the slot-dir span length carried in the record;  payload-relative under
+ * spec-3.27 D3a.  The redo caller MUST have validated all bounds (fail-closed)
+ * before calling.  Backend-only (payload macros + PageSetLSN).
  */
+#ifndef FRONTEND
 static inline void
 cluster_undo_apply_block_write_multi_delta(char *block, const xl_undo_block_write_multi *rec,
 										   const char *delta_body, XLogRecPtr record_lsn)
 {
+	char *payload = (char *)cluster_undo_page_get_payload((Page)block);
 	const char *p = delta_body;
 
-	memcpy(block, p, UNDO_BLOCK_HDR_PREFIX_LEN);
+	memcpy(payload, p, UNDO_BLOCK_HDR_PREFIX_LEN);
 	p += UNDO_BLOCK_HDR_PREFIX_LEN;
-	memcpy(block + rec->rec_off, p, rec->rec_len); /* records span */
+	memcpy(payload + rec->rec_off, p, rec->rec_len); /* records span */
 	p += rec->rec_len;
-	memcpy(block + rec->slot_off, p, rec->slot_len); /* slot-dir span */
-	((UndoBlockHeader *)block)->block_lsn = record_lsn;
+	memcpy(payload + rec->slot_off, p, rec->slot_len); /* slot-dir span */
+	((UndoBlockHeader *)payload)->block_lsn = record_lsn;
+	PageSetLSN((Page)block, record_lsn); /* pd_lsn == block_lsn invariant */
 }
+#endif /* !FRONTEND */
 
 
 /*

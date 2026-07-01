@@ -713,7 +713,18 @@
  * backward replay and reconstructs commit_scn=InvalidScn for v3.  No catalog
  * surface change; the bump fences an old binary from replaying v3-format WAL
  * (unknown format_version -> redo PANIC).  Bump 202606330 -> 202606340. */
-#define CATALOG_VERSION_NO 202606340
+
+/* spec-3.27 D3a (2026-07-01): undo DATA block on-disk format flip (Q12-A) --
+ * every undo data block (block_no >= 1) now carries a standard PG PageHeader at
+ * offset 0 (pd_lsn@0) so bufmgr FlushBuffer / BufferSync / checkpoint LSN-gating
+ * apply directly; the UndoBlockHeader + records + slot dir move to the payload
+ * (page + SizeOfPageHeaderData), addressed payload-relative.  The
+ * XLOG_UNDO_BLOCK_WRITE{,_MULTI} delta offsets (rec_off / slot_off) become
+ * payload-relative and the header prefix source shifts by the payload base, so
+ * old and new binaries cannot cross-replay one another's undo WAL / read one
+ * another's undo segments -- clean-shutdown pg_upgrade only.  Bump
+ * 202606340 -> 202607010. */
+#define CATALOG_VERSION_NO 202607010
 
 /* spec-5.13 (2026-06-27): clean-leave catalog surface — cluster_get_clean_leave_state
  * SRF (oid 8960) + pg_cluster_clean_leave_state view + pg_cluster_clean_leave_request
