@@ -814,6 +814,8 @@ cluster_smgr_remote_invalidation_inc(void)
 void
 cluster_smgr_build_smgr_inval_msg(RelFileLocator rlocator, SharedInvalidationMessage *out)
 {
+	uint32 backend = (uint32)InvalidBackendId;
+
 	/*
 	 * Mirror PG's CacheInvalidateSmgr() construction (inval.c).  Cluster
 	 * relations live on shared storage and are never temp, so the backend
@@ -826,8 +828,8 @@ cluster_smgr_build_smgr_inval_msg(RelFileLocator rlocator, SharedInvalidationMes
 	 * which truncates into the int8 backend_hi as -1 — byte-identical to PG's
 	 * CacheInvalidateSmgr() and round-trips back to InvalidBackendId in the
 	 * SHAREDINVALSMGR_ID apply path. */
-	out->sm.backend_hi = ((uint32)InvalidBackendId) >> 16;
-	out->sm.backend_lo = InvalidBackendId & 0xffff;
+	out->sm.backend_hi = backend >> 16;
+	out->sm.backend_lo = backend & 0xffff;
 	out->sm.rlocator = rlocator;
 }
 
