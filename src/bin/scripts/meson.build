@@ -1,4 +1,5 @@
 # Copyright (c) 2022-2023, PostgreSQL Global Development Group
+# PGRAC: spec-6.5 adds pg_cluster_basebackup as the cluster backup frontend.
 
 scripts_common = static_library('libscripts_common',
   files('common.c'),

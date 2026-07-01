@@ -16,6 +16,7 @@ subdir = src/bin/scripts
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
+# PGRAC: spec-6.5 adds pg_cluster_basebackup as the cluster backup frontend.
 PROGRAMS = createdb createuser dropdb dropuser clusterdb vacuumdb reindexdb pg_isready pg_cluster_basebackup
 
 override CPPFLAGS := -I$(libpq_srcdir) $(CPPFLAGS)
