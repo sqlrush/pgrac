@@ -805,6 +805,12 @@ void
 cluster_lmd_shmem_register(void)
 {}
 
+/* spec-6.4 stub: ADG Managed Recovery Process shmem region. */
+void cluster_mrp_shmem_register(void);
+void
+cluster_mrp_shmem_register(void)
+{}
+
 /* spec-2.27 D2 stub: cluster_ges_dedup shmem region. */
 void cluster_ges_dedup_shmem_register(void);
 void cluster_ges_dedup_shmem_request(void);
