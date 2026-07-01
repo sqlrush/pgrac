@@ -25,7 +25,7 @@
  *	        recovering / 53R9N undo-writeback-boundary / 53RA0 wal-thread-
  *	        routing-mismatch / 53RA3 merged-recovery-blocked / 53RA4 thread-
  *	        recovery-blocked.
- *	    L5  CLUSTER_WAIT_EVENTS_COUNT current snapshot = 110 (spec-6.0a D10
+ *	    L5  CLUSTER_WAIT_EVENTS_COUNT current snapshot = 112 (spec-6.1 D8
  *	        value;  update-required contract — any future spec adding wait
  *	        events MUST bump this snapshot).
  *	    L6  write-fence wire/ABI enums locked:  ClusterFenceMarkerKind
@@ -203,13 +203,13 @@ UT_TEST(test_stage4_sqlstate_recovery_fence_surface_encodable)
 
 /* ===== L5 — wait-events count snapshot ===== */
 
-UT_TEST(test_stage4_wait_events_count_snapshot_110)
+UT_TEST(test_stage4_wait_events_count_snapshot_112)
 {
 	/* Current Stage 4 surface value (the macro in cluster_views.h attributes
 	 * the latest bump to spec-4.12 D7).  update-required contract: a future
 	 * spec adding cluster wait events MUST bump this snapshot (and the dump/test
 	 * baselines that count them). */
-	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 110);
+	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 112);
 }
 
 
@@ -312,7 +312,7 @@ main(void)
 	UT_RUN(test_stage4_undo_opcodes_preserved_and_info_mask_clear);
 	UT_RUN(test_stage4_recovery_dump_category_names);
 	UT_RUN(test_stage4_sqlstate_recovery_fence_surface_encodable);
-	UT_RUN(test_stage4_wait_events_count_snapshot_110);
+	UT_RUN(test_stage4_wait_events_count_snapshot_112);
 	UT_RUN(test_stage4_write_fence_enums_locked);
 	UT_RUN(test_stage4_thread_recovery_scope_enum_complete);
 	UT_RUN(test_stage4_undo_writeback_boundary_enum_complete);

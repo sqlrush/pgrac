@@ -462,6 +462,7 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 53R12    E    ERRCODE_CLUSTER_SCN_WRAPAROUND_PANIC                           cluster_scn_wraparound_panic
 53R20    E    ERRCODE_CLUSTER_IC_STALE_EPOCH_DROP                            cluster_ic_stale_epoch_drop
 53R21    E    ERRCODE_CLUSTER_IC_CHUNK_REASSEMBLY_TIMEOUT                    cluster_ic_chunk_reassembly_timeout
+53R22    E    ERRCODE_CLUSTER_IC_RDMA_UNAVAILABLE                            cluster_ic_rdma_unavailable
 53R30    E    ERRCODE_CLUSTER_CSSD_SPAWN_FAILED                              cluster_cssd_spawn_failed
 53R31    E    ERRCODE_CLUSTER_CSSD_NOT_READY                                 cluster_cssd_not_ready
 53R32    E    ERRCODE_CLUSTER_CSSD_PEER_SUSPECTED                            cluster_cssd_peer_suspected
@@ -912,6 +913,7 @@ Section: Class 58 - System Error (pgrac extension)
 # driver is explicitly required (for example scsi3_pr) but unavailable.
 58R14    E    ERRCODE_CLUSTER_STORAGE_IO_ALIGNMENT                             cluster_storage_io_alignment
 58R15    E    ERRCODE_CLUSTER_STORAGE_FENCE_UNAVAILABLE                        cluster_storage_fence_unavailable
+58R16    E    ERRCODE_CLUSTER_IC_RDMA_FABRIC_ERROR                             cluster_ic_rdma_fabric_error
 
 Section: Class 72 - Snapshot Failure
 # (class borrowed from Oracle)

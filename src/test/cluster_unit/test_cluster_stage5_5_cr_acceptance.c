@@ -27,8 +27,8 @@
  *	        OFF=0 / BOUNDARY=1(default) and the 4-counter ClusterCrCoordCounter
  *	        enum complete (CR_COORD_COUNTER__COUNT == 4) — the cr_coord
  *	        observability surface 5.58 HG#3 asserts.
- *	    L6  CLUSTER_WAIT_EVENTS_COUNT snapshot = 110 — spec-6.0a adds the
- *	        block_device wait-event band after the CR read-path band; update-
+ *	    L6  CLUSTER_WAIT_EVENTS_COUNT snapshot = 112 — spec-6.1 adds the RDMA
+ *	        wait-event pair after the block_device band; update-
  *	        required contract: a future spec adding cluster wait events MUST bump
  *	        this snapshot (and the dump/test baselines that count them).
  *
@@ -182,12 +182,12 @@ UT_TEST(test_stage5_5_cross_instance_coordinator_enums_locked)
 
 /* ===== L6 — wait-events count snapshot ===== */
 
-UT_TEST(test_stage5_5_wait_events_count_snapshot_110)
+UT_TEST(test_stage5_5_wait_events_count_snapshot_112)
 {
 	/* The whole CR read-path band (5.51-5.57) adds NO new wait events — it reuses
 	 * the spec-3.9 ClusterCRConstruct event.  spec-6.0a adds 7 block_device
-	 * wait events after that band. */
-	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 110);
+	 * wait events after that band; spec-6.1 adds 2 RDMA wait events. */
+	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 112);
 }
 
 
@@ -199,6 +199,6 @@ main(void)
 	UT_RUN(test_stage5_5_cr_dump_category_names);
 	UT_RUN(test_stage5_5_admission_policy_enum_locked);
 	UT_RUN(test_stage5_5_cross_instance_coordinator_enums_locked);
-	UT_RUN(test_stage5_5_wait_events_count_snapshot_110);
+	UT_RUN(test_stage5_5_wait_events_count_snapshot_112);
 	UT_DONE();
 }

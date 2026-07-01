@@ -102,8 +102,8 @@ Selects the cluster interconnect transport.
 |---|---|
 | `stub` (default) | Same-node operation is a no-op success.  Cross-node send raises `ERRCODE_FEATURE_NOT_SUPPORTED`.  No real wire traffic.  Suitable for single-node deployments and CI. |
 | `tier1` | TCP transport for the LMON heartbeat path between cluster nodes.  Requires every peer (including self) to be listed in `pgrac.conf` with an `interconnect_addr`.  See `pg_cluster_ic_peers` for runtime peer state. |
-| `tier2` | Currently not supported.  Setting this causes the postmaster to refuse to start with `ERRCODE_FEATURE_NOT_SUPPORTED`. |
-| `tier3` | Same as `tier2`: not supported. |
+| `tier2` | RDMA-capable transport mux.  Requires a binary configured with `--with-rdma`; otherwise startup fails closed with `53R22`.  When RDMA is built but unavailable at runtime, `cluster.interconnect_rdma_fallback=auto` keeps TCP fallback active. |
+| `tier3` | RDMA-capable optimized mux tier.  Uses the same fallback and fail-closed rules as `tier2`, with provider selection controlled by `cluster.interconnect_rdma_provider`. |
 
 ```text
 # postgresql.conf
@@ -120,6 +120,21 @@ SELECT name, vartype, context, setting
 -- ------------------------+---------+------------+---------
 --  cluster.interconnect_tier | enum    | postmaster | stub
 ```
+
+### RDMA interconnect settings
+
+These settings are relevant only when `cluster.interconnect_tier` is
+`tier2` or `tier3`.
+
+| Setting | Type | Default | Context | Notes |
+|---|---|---|---|---|
+| `cluster.interconnect_rdma_fallback` | enum | `auto` | postmaster | `auto` allows TCP fallback; `off` fails closed if RDMA is unavailable. |
+| `cluster.interconnect_rdma_provider` | enum | `auto` | postmaster | `auto`, `verbs`, or `mlx5`. |
+| `cluster.interconnect_rdma_completion` | enum | `event` | postmaster | `event` or `busypoll`. |
+| `cluster.interconnect_rdma_busypoll_us` | integer | `50` | sighup | Busy-poll spin budget when busypoll mode is selected. |
+| `cluster.interconnect_rdma_crc_offload` | bool | `off` | postmaster | Experimental control-plane setting. Block shipping keeps application CRC32C enabled. |
+| `cluster.interconnect_rdma_inline_max` | integer | `256` | postmaster | Inline-send threshold in bytes. |
+| `cluster.interconnect_rdma_max_send_wr` | integer | `256` | postmaster | Per-peer send work-request depth. |
 
 ### `cluster.interconnect_heartbeat_interval_ms`
 

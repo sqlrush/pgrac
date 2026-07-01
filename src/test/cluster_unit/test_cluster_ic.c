@@ -33,6 +33,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_ic.h"
+#include "cluster/cluster_ic_rdma.h"
 
 /*
  * postgres.h transitively pulls in port.h which redirects printf etc.
@@ -142,6 +143,33 @@ const ClusterICOps ClusterICOps_Tier1 = {
 	.tier_init = tier1_test_stub_init,
 	.tier_shutdown = tier1_test_stub_shutdown,
 	.tier_name = "tier1-unit-test-stub",
+};
+
+const ClusterICOps ClusterICOps_Tier2 = {
+	.send_bytes = tier1_test_stub_send,
+	.recv_bytes = tier1_test_stub_recv,
+	.peek_sender = tier1_test_stub_peek,
+	.tier_init = tier1_test_stub_init,
+	.tier_shutdown = tier1_test_stub_shutdown,
+	.tier_name = "tier2-unit-test-stub",
+};
+
+const ClusterICOps ClusterICOps_Tier3 = {
+	.send_bytes = tier1_test_stub_send,
+	.recv_bytes = tier1_test_stub_recv,
+	.peek_sender = tier1_test_stub_peek,
+	.tier_init = tier1_test_stub_init,
+	.tier_shutdown = tier1_test_stub_shutdown,
+	.tier_name = "tier3-unit-test-stub",
+};
+
+const ClusterICOps ClusterICOps_Mux = {
+	.send_bytes = tier1_test_stub_send,
+	.recv_bytes = tier1_test_stub_recv,
+	.peek_sender = tier1_test_stub_peek,
+	.tier_init = tier1_test_stub_init,
+	.tier_shutdown = tier1_test_stub_shutdown,
+	.tier_name = "mux-unit-test-stub",
 };
 
 void
@@ -455,6 +483,16 @@ UT_TEST(test_tier1_vtable_extern_linkable)
 	UT_ASSERT_NOT_NULL((void *)ClusterICOps_Tier1.tier_name);
 }
 
+UT_TEST(test_rdma_mux_vtable_extern_linkable)
+{
+	UT_ASSERT_NOT_NULL((void *)ClusterICOps_Tier2.send_bytes);
+	UT_ASSERT_NOT_NULL((void *)ClusterICOps_Tier3.send_bytes);
+	UT_ASSERT_NOT_NULL((void *)ClusterICOps_Mux.recv_bytes);
+	UT_ASSERT_EQ(CLUSTER_IC_RDMA_FALLBACK_AUTO, 0);
+	UT_ASSERT_EQ(CLUSTER_IC_RDMA_PROVIDER_VERBS, 1);
+	UT_ASSERT_EQ(CLUSTER_IC_RDMA_COMPLETION_BUSYPOLL, 1);
+}
+
 
 /*
  * spec-2.2 D2 (post-codex review) -- HELLO wire roundtrip + reference
@@ -572,7 +610,7 @@ UT_TEST(test_hello_build_truncates_long_name)
 int
 main(void)
 {
-	UT_PLAN(18); /* spec-2.3 D3: 6 ClusterMsgHeader/msg_send/recv tests deleted */
+	UT_PLAN(19); /* spec-2.3 D3: 6 ClusterMsgHeader/msg_send/recv tests deleted */
 	UT_RUN(test_ic_send_bytes_linkable);
 	UT_RUN(test_ic_recv_bytes_linkable);
 	UT_RUN(test_ic_init_linkable);
@@ -588,6 +626,7 @@ main(void)
 	UT_RUN(test_mesh_role_low_id_active);
 	UT_RUN(test_mesh_role_high_id_passive);
 	UT_RUN(test_tier1_vtable_extern_linkable);
+	UT_RUN(test_rdma_mux_vtable_extern_linkable);
 	/* HELLO wire encode/decode + reference bytes (post-codex review) */
 	UT_RUN(test_hello_wire_roundtrip);
 	UT_RUN(test_hello_wire_reference_bytes);

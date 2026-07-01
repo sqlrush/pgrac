@@ -93,9 +93,9 @@ extern int cluster_node_id;
  *
  *	0 (stub)  = no real wire traffic; target=self is no-op success,
  *	            target!=self ereports ERRCODE_FEATURE_NOT_SUPPORTED.
- *	1 (tier1) = TCP, lands in Stage 2.
- *	2 (tier2) = RDMA optimized, lands in Stage 6+.
- *	3 (tier3) = RDMA production-grade, lands in Stage 6+.
+ *	1 (tier1) = TCP.
+ *	2 (tier2) = RDMA baseline through the transport mux.
+ *	3 (tier3) = RDMA optimized through the transport mux.
  *
  *	context: PGC_POSTMASTER (tier change requires reinitialising the
  *	         interconnect stack; runtime SET is rejected).
@@ -478,6 +478,13 @@ extern int cluster_interconnect_chunk_reassembly_timeout_ms;
 extern int cluster_interconnect_tcp_keepidle_sec;
 extern int cluster_interconnect_tcp_keepintvl_sec;
 extern int cluster_interconnect_tcp_keepcnt;
+extern int cluster_interconnect_rdma_fallback;
+extern int cluster_interconnect_rdma_provider;
+extern int cluster_interconnect_rdma_completion;
+extern int cluster_interconnect_rdma_busypoll_us;
+extern bool cluster_interconnect_rdma_crc_offload;
+extern int cluster_interconnect_rdma_inline_max;
+extern int cluster_interconnect_rdma_max_send_wr;
 
 /*
  * cluster.boc_sweep_interval_ms (spec-1.17 D4): walwriter BOC sweep

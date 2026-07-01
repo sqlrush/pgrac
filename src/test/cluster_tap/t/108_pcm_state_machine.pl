@@ -78,11 +78,11 @@ my $apply_event = $node_default->safe_psql(
 is($apply_event, '1',
    'L5 ClusterPcmTransitionApply wait event registered');
 
-# L6 — wait event count baseline through spec-2.33.
+# L6 — wait event count baseline through spec-6.1.
 my $wait_event_count = $node_default->safe_psql(
 	'postgres', "SELECT count(*) FROM pg_stat_cluster_wait_events");
-is($wait_event_count, '110',
-   'L6 wait event baseline 110 (spec-6.0a +7 storage wait events)');
+is($wait_event_count, '112',
+   'L6 wait event baseline 112 (spec-6.1 +2 RDMA wait events)');
 
 # L7 — no PCM wire opcode smoke (no SQL-visible PCM wire opcode enum surface)
 my $pcm_grd_init_event = $node_default->safe_psql(

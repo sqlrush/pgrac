@@ -9,8 +9,9 @@
  *	  stage 0.18 the implementation is a stub: target == self is a
  *	  no-op success, target != self ereports
  *	  ERRCODE_FEATURE_NOT_SUPPORTED.  Stage 2 swaps in a TCP-backed
- *	  vtable, Stage 6+ adds RDMA tier vtables; the API surface
- *	  declared here stays unchanged across that evolution.
+ *	  vtable, and Stage 6.1 adds the RDMA-capable mux and tier
+ *	  vtables; the API surface declared here stays unchanged across
+ *	  that evolution.
  *
  *	  Two layers, both exported:
  *
@@ -19,12 +20,11 @@
  *	                             cluster_rpc_call (sync request-reply)
  *
  *	  99% of subsystems should use the high-level API.  The byte stream
- *	  is reserved for performance-critical paths that need to bypass
- *	  the protocol layer (e.g. RDMA write zero-copy in Stage 6+).
+ *	  is reserved for performance-critical paths that need transport-
+ *	  specific handling such as RDMA SEND-with-SGE block shipping.
  *
- *	  Wire format is a 24-byte fixed header (ClusterMsgHeader) followed
- *	  by an opaque payload.  Header layout is anchored by a compile-time
- *	  StaticAssertDecl below; protocol_version=1 is the 0.18 baseline.
+ *	  Wire format is the 36-byte ClusterICEnvelope followed by an opaque
+ *	  payload; cluster_ic_envelope.c owns the ABI StaticAssertDecls.
  *
  *	  See docs/cluster-ic-design.md for the full design rationale and
  *	  Stage evolution path; specs/spec-0.18-ic-framework.md for the
@@ -101,8 +101,8 @@ typedef enum ClusterICTier {
  * ClusterICOps -- vtable of the active interconnect tier.
  *
  *	Stage 0.18 ships exactly one vtable instance, ClusterICOps_Stub.
- *	Stage 2+ adds ClusterICOps_TCP; Stage 6+ adds Tier 1 / Tier 2 /
- *	Tier 3 RDMA vtables (see interconnect-tier-strategy.md).  The
+ *	Stage 2 adds ClusterICOps_Tier1 (TCP); Stage 6.1 adds the
+ *	ClusterICOps_Mux plus Tier2/Tier3 RDMA vtables.  The
  *	active tier is selected at postmaster startup based on the
  *	cluster.interconnect_tier GUC and stored in ClusterICOps_Active.
  *
@@ -180,6 +180,9 @@ extern const ClusterICOps ClusterICOps_Mock;
  * spec-2.2 §3.7).
  */
 extern const ClusterICOps ClusterICOps_Tier1;
+extern const ClusterICOps ClusterICOps_Tier2;
+extern const ClusterICOps ClusterICOps_Tier3;
+extern const ClusterICOps ClusterICOps_Mux;
 
 extern const ClusterICOps *ClusterICOps_Active;
 

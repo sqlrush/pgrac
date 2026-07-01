@@ -7,9 +7,9 @@
  *	  Stage 0.18 ships exactly one interconnect tier vtable -- the stub
  *	  -- whose send_bytes returns true for target == self and ereports
  *	  ERRCODE_FEATURE_NOT_SUPPORTED for cross-node, and whose
- *	  recv_bytes always returns false (no messages).  Tier1 (TCP)
- *	  lands in Stage 2 and replaces the vtable at startup based on the
- *	  cluster.interconnect_tier GUC; Tier2/3 (RDMA) land in Stage 6+.
+ *	  recv_bytes always returns false (no messages).  Tier1 (TCP) and
+ *	  the Stage 6.1 RDMA-capable mux replace the vtable at startup
+ *	  based on the cluster.interconnect_tier GUC.
  *
  *	  The high-level protocol layer (cluster_msg_*, cluster_rpc_*) is
  *	  fully wired here and forwards through the vtable: at stage 0.18
@@ -140,6 +140,7 @@ PG_FUNCTION_INFO_V1(cluster_test_inject_subtrans_subcommitted);
 
 #include "cluster/cluster_conf.h"	/* CLUSTER_MAX_NODES */
 #include "cluster/cluster_guc.h"	/* cluster_node_id, cluster_interconnect_tier */
+#include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_inject.h" /* CLUSTER_INJECTION_POINT (stage 0.27) */
 
 
@@ -289,9 +290,16 @@ cluster_ic_init(void)
 
 	case CLUSTER_IC_TIER_2:
 	case CLUSTER_IC_TIER_3:
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("cluster.interconnect_tier=tier2/tier3 is not implemented"),
-						errhint("tier2/tier3 (RDMA) land in Stage 6+; stay on stub for now.")));
+#ifdef HAVE_LIBIBVERBS
+		ClusterICOps_Active = &ClusterICOps_Mux;
+#else
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_IC_RDMA_UNAVAILABLE),
+				 errmsg("cluster.interconnect_tier=tier%d requires an RDMA-enabled build",
+						(ClusterICTier)cluster_interconnect_tier == CLUSTER_IC_TIER_2 ? 2 : 3),
+				 errhint("Rebuild with --with-rdma, or set cluster.interconnect_tier=tier1 "
+						 "for TCP.")));
+#endif
 		break;
 
 	default:

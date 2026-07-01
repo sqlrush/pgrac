@@ -46,12 +46,12 @@ $node->start;
 
 
 # ----------
-# Total row count: 110 (spec-6.0a adds 7 block-device storage waits).
+# Total row count: 112 (spec-6.1 adds 2 RDMA interconnect waits).
 # ----------
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'110',
-	'pg_stat_cluster_wait_events returns 110 rows (spec-6.0a +7 storage wait events)');
+	'112',
+	'pg_stat_cluster_wait_events returns 112 rows (spec-6.1 +2 RDMA wait events)');
 
 
 # ----------
@@ -75,7 +75,7 @@ my %expected = (
 	'Cluster: Reconfig' => 8,    # spec-5.18 D12: +ReconfigNodeRemoveCleanupWait
 	'Cluster: Recovery' => 7,    # spec-4.12 D6: +ClusterWriteFenceVerify
 	'Cluster: Sinval' => 6,
-	'Cluster: Interconnect' => 5,
+	'Cluster: Interconnect' => 7,
 	'Cluster: Undo' => 4,
 	'Cluster: ADG' => 4,
 );

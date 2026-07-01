@@ -152,7 +152,7 @@ SELECT role, count(*) FROM pg_cluster_nodes GROUP BY role;
 ## pg_stat_cluster_wait_events
 
 Lists the cluster-specific wait event registry on the local node.
-Always returns 110 rows in `--enable-cluster` builds (one per
+Always returns 112 rows in `--enable-cluster` builds (one per
 registered cluster wait event).
 
 ### Columns
@@ -165,10 +165,10 @@ registered cluster wait event).
 ### Example queries
 
 ```sql
--- Total registered events (must be 46):
+-- Total registered events:
 SELECT count(*) FROM pg_stat_cluster_wait_events;
 
--- Distinct classes (must be 10):
+-- Distinct classes:
 SELECT DISTINCT type FROM pg_stat_cluster_wait_events ORDER BY type;
 
 -- Per-class counts:
@@ -180,7 +180,7 @@ See [Wait events](wait-events.md) for the full event roster.
 ## pg_stat_gcluster_wait_events
 
 Cross-node placeholder for cluster-wide wait events.  In the
-current release returns 110 rows for the local node only;
+current release returns 112 rows for the local node only;
 `node_id` is always the value of the local `cluster.node_id` GUC.
 
 The column shape `(node_id, type, name)` is the public contract

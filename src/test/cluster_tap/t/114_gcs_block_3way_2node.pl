@@ -13,7 +13,7 @@
 #	  L1   ClusterPair startup baseline (both postmasters healthy)
 #	  L2   fresh baseline: 6 NEW spec-2.36 counters all 0
 #	  L3   pg_cluster_state.gcs has 58 keys (38 spec-2.35 + 6 spec-2.36)
-#	  L4   catversion lower-bound >= 202605430; wait event count == 110
+#	  L4   catversion lower-bound >= 202605430; wait event count == 112
 #	  L5   S barrier injection — DENIED_PENDING_X surfaces under
 #	       cluster-gcs-block-starvation-force-denied inject; reader
 #	       sees starvation_denied_pending_x_count tick
@@ -132,8 +132,8 @@ cmp_ok($catver, '>=', 202605430,
 is($pair->node0->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'110',
-	'L4 wait event count == 110 (spec-6.0a +7 storage wait events)');
+	'112',
+	'L4 wait event count == 112 (spec-6.1 +2 RDMA wait events)');
 
 
 # ============================================================

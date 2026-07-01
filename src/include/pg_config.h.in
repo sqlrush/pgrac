@@ -157,6 +157,18 @@
 /* Define to 1 if you have the <execinfo.h> header file. */
 #undef HAVE_EXECINFO_H
 
+/* Define to 1 if you have the <infiniband/verbs.h> header file. */
+#undef HAVE_INFINIBAND_VERBS_H
+
+/* Define to 1 to build pgrac RDMA interconnect support. (--with-rdma) */
+#undef HAVE_LIBIBVERBS
+
+/* Define to 1 when librdmacm is available for pgrac RDMA. */
+#undef HAVE_LIBRDMACM
+
+/* Define to 1 if you have the <rdma/rdma_cma.h> header file. */
+#undef HAVE_RDMA_RDMA_CMA_H
+
 /* Define to 1 if you have the `explicit_bzero' function. */
 #undef HAVE_EXPLICIT_BZERO
 
