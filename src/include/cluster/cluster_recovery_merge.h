@@ -155,6 +155,17 @@ typedef struct ClusterRecmergeHeap {
 	int n;
 } ClusterRecmergeHeap;
 
+typedef enum ClusterRecmergeStreamingDecision {
+	CLUSTER_RECMERGE_STREAMING_NO_RECORD = 0,
+	CLUSTER_RECMERGE_STREAMING_RECORD_READY = 1
+} ClusterRecmergeStreamingDecision;
+
+typedef struct ClusterRecmergeStreamingInput {
+	bool record_available;
+	bool heartbeat_seen;
+	ClusterRecmergeKey key;
+} ClusterRecmergeStreamingInput;
+
 /* Strict weak ordering: a < b ?  (scn -> lsn -> node, via the gated cmp). */
 static inline int
 cluster_recovery_merge_cmp(const ClusterRecmergeKey *a, const ClusterRecmergeKey *b)
@@ -223,6 +234,40 @@ cluster_recmerge_heap_pop(ClusterRecmergeHeap *h, ClusterRecmergeHeapEntry *out)
 		i = sm;
 	}
 	return true;
+}
+
+/*
+ * Streaming mode selector for spec-6.4 ADG MRP.
+ *
+ * Heartbeats only prove stream liveness; they are deliberately ignored as
+ * ordering/read-floor evidence.  A caller gets RECORD_READY only when at least
+ * one concrete WAL record is available.
+ */
+static inline ClusterRecmergeStreamingDecision
+cluster_recmerge_streaming_select(const ClusterRecmergeStreamingInput *inputs, int ninputs,
+								  int *stream_out, ClusterRecmergeKey *key_out)
+{
+	ClusterRecmergeHeap h;
+	ClusterRecmergeHeapEntry out;
+	int i;
+
+	if (stream_out == NULL || key_out == NULL || inputs == NULL || ninputs <= 0
+		|| ninputs > CLUSTER_RECMERGE_MAX_STREAMS)
+		return CLUSTER_RECMERGE_STREAMING_NO_RECORD;
+
+	cluster_recmerge_heap_init(&h);
+	for (i = 0; i < ninputs; i++) {
+		if (!inputs[i].record_available)
+			continue;
+		cluster_recmerge_heap_push(&h, inputs[i].key, i);
+	}
+
+	if (!cluster_recmerge_heap_pop(&h, &out))
+		return CLUSTER_RECMERGE_STREAMING_NO_RECORD;
+
+	*stream_out = out.stream;
+	*key_out = out.key;
+	return CLUSTER_RECMERGE_STREAMING_RECORD_READY;
 }
 
 #ifndef FRONTEND

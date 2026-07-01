@@ -54,6 +54,12 @@ typedef enum ClusterAdgLeaseDecision {
 	CLUSTER_ADG_LEASE_EXPIRED = 4
 } ClusterAdgLeaseDecision;
 
+typedef enum ClusterAdgStandbyConflictDecision {
+	CLUSTER_ADG_CONFLICT_NONE = 0,
+	CLUSTER_ADG_CONFLICT_WAIT = 1,
+	CLUSTER_ADG_CONFLICT_CANCEL_READER = 2
+} ClusterAdgStandbyConflictDecision;
+
 typedef struct ClusterAdgThreadStatus {
 	bool active;
 	bool has_receive;
@@ -140,6 +146,9 @@ extern ClusterAdgReadDecision cluster_adg_read_only_decide(bool enable_adg, bool
 														   SCN requested_read_scn,
 														   SCN standby_consistent_scn,
 														   int64 apply_lag_ms, int64 max_lag_ms);
+extern ClusterAdgStandbyConflictDecision
+cluster_adg_standby_conflict_decide(bool enable_adg, bool standby_role, int64 wait_ms,
+									int64 max_standby_delay_ms);
 extern bool cluster_adg_overlay_resolve_on_commit_prepared(ClusterTTStatus current_status,
 														   SCN commit_scn,
 														   ClusterTTStatus *out_status,

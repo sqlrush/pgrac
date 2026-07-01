@@ -490,9 +490,15 @@ lease cannot be validated, replay waits fail-closed and
 advance the read-consistent SCN only after every active WAL thread has
 published a safe SCN.
 
+On the primary, `cluster.dg_mode` controls LNS commit acknowledgement.
+`async` does not add an ADG wait.  `sync` waits until at least one ADG
+standby has flushed the commit WAL.  `max_availability` waits while an
+ADG standby is connected, but releases commits when no ADG standby is
+connected so the primary remains available.
+
 `pg_stat_cluster_adg` and `pg_stat_gcluster_adg` expose the current MRP
-state, Apply Master owner/term, receive/apply LSNs, lag bytes, and
-`standby_consistent_scn`.
+state, Apply Master owner/term, receive/apply LSNs, lag bytes, lag
+seconds, apply rate, and `standby_consistent_scn`.
 
 ### ADG GUC Summary
 

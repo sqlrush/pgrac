@@ -137,6 +137,13 @@ constParameterCallback:src/test/cluster_unit/test_cluster_visibility_inject.c
 constParameterCallback:src/test/cluster_unit/test_cluster_itl_cleanout_perf.c
 constParameterCallback:src/test/cluster_unit/test_cluster_heap_lock_tuple.c
 
+# Reason: block-device stubs in these cluster_unit tests are installed into
+# ClusterSharedFsOps.  cppcheck 2.20 suggests const-widening dummy callback
+# parameters because the bodies are no-ops, but the function signatures must
+# match the production vtable exactly.
+constParameterCallback:src/test/cluster_unit/test_cluster_shared_fs.c
+constParameterCallback:src/test/cluster_unit/test_cluster_smgr.c
+
 # === Inline suppressions ===
 # All inline /* cppcheck-suppress xxx */ comments must include a
 # "Reason:" line on the next line.  Currently:

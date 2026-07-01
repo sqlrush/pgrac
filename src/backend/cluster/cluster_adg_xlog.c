@@ -24,7 +24,7 @@
 #include "access/xloginsert.h"
 #include "cluster/cluster_adg_xlog.h"
 #include "cluster/cluster_guc.h"
-#include "cluster/cluster_mrp.h"
+#include "cluster/cluster_mrp_apply.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_wal_thread.h"
 
@@ -62,9 +62,9 @@ cluster_adg_emit_thread_barrier(void)
 void
 cluster_adg_redo(XLogReaderState *record)
 {
-	char *payload = XLogRecGetData(record);
+	const char *payload = XLogRecGetData(record);
 	uint8 info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
-	xl_cluster_adg_thread_barrier *rec;
+	const xl_cluster_adg_thread_barrier *rec;
 
 	if (info != XLOG_CLUSTER_ADG_THREAD_BARRIER)
 		ereport(PANIC, (errmsg("cluster_adg_redo: unknown op %u", info)));
@@ -73,8 +73,9 @@ cluster_adg_redo(XLogReaderState *record)
 		ereport(PANIC, (errmsg("cluster_adg_redo: invalid thread barrier record length %u",
 							   XLogRecGetDataLen(record))));
 
-	rec = (xl_cluster_adg_thread_barrier *)payload;
-	cluster_mrp_apply_thread_barrier(rec->thread_id, record->EndRecPtr, rec->thread_safe_scn);
+	rec = (const xl_cluster_adg_thread_barrier *)payload;
+	(void)cluster_mrp_apply_barrier_replayed(rec->thread_id, record->EndRecPtr,
+											 rec->thread_safe_scn);
 }
 
 #endif /* USE_PGRAC_CLUSTER */

@@ -12,7 +12,7 @@ operator-facing.
 | `pg_stat_cluster_wait_events` | Cluster-specific wait events on the local node |
 | `pg_stat_gcluster_wait_events` | Cluster wait events globally (cross-node placeholder) |
 | `pg_stat_cluster_adg` | Local ADG standby apply/read-only service state |
-| `pg_stat_gcluster_adg` | Global ADG standby state (local-only placeholder) |
+| `pg_stat_gcluster_adg` | Cluster ADG standby state with the same row contract as the local view |
 | `pg_stat_cluster_backup` | Current cluster backup state on the local node |
 | `pg_cluster_backup_history` | Latest cluster backup manifest summary |
 | `pg_cluster_restore_points` | Cluster restore points visible to PITR status |
@@ -42,14 +42,14 @@ One row describing this node's ADG role and standby apply state.
 | `apply_lsn` | `pg_lsn` | Latest applied ADG WAL LSN, NULL while disabled. |
 | `standby_consistent_scn` | `int8` | Read-consistent standby SCN floor; zero means unavailable. |
 | `lag_bytes` | `int8` | `receive_lsn - apply_lsn`, floored at zero. |
-| `lag_seconds` | `float8` | Reserved lag time metric; currently zero. |
-| `apply_rate_bytes_per_sec` | `float8` | Reserved apply-rate metric; currently zero. |
+| `lag_seconds` | `float8` | Receive/apply timestamp gap across ADG WAL threads, floored at zero. |
+| `apply_rate_bytes_per_sec` | `float8` | Apply catch-up rate derived from `lag_bytes / lag_seconds`, or zero when no lag is measurable. |
 
 ### `pg_stat_gcluster_adg`
 
-Same row shape as `pg_stat_cluster_adg`.  In the current release it is
-local-only; future cross-node fanout will add one row per visible ADG
-node without changing the column contract.
+Same row shape as `pg_stat_cluster_adg`.  The current implementation
+emits the local node's ADG state and preserves the global-view column
+contract used by cluster diagnostics.
 
 ## Cluster Backup / PITR Views
 
