@@ -74,13 +74,15 @@
  * msg_type=255 payload, before the chunk byte slice.  16 bytes
  * packed (StaticAssertDecl in cluster_ic_chunk.c).
  */
-typedef struct pg_attribute_packed() ClusterICChunkHeader {
+typedef struct pg_attribute_packed() ClusterICChunkHeader
+{
 	uint32 chunk_seq;		  /* 0-based;offset 0;4 B */
 	uint32 chunk_total;		  /* total chunks (>= 2);offset 4;4 B */
 	uint32 total_payload_len; /* original payload bytes;offset 8;4 B */
 	uint8 inner_msg_type;	  /* offset 12;1 B;1..254 */
 	uint8 _pad[3];			  /* offset 13;3 B;write 0;ignored */
-} ClusterICChunkHeader;
+}
+ClusterICChunkHeader;
 
 /*
  * Send a payload of arbitrary length up to
