@@ -158,4 +158,87 @@ cluster_undo_block_has_space(uint32 free_offset, uint16 slot_count, uint16 recor
 }
 
 
+/*-------------------------------------------------------------------------
+ * spec-3.27 Q12-A / §2.5 — payload-relative addressing for the
+ * buffer-backed undo model.
+ *
+ *	Under Q12-A an undo block gains a standard PG PageHeader at offset 0
+ *	(pd_lsn@0) so the standard bufmgr FlushBuffer / BufferSync / checkpoint
+ *	LSN-gating applies directly.  The undo payload (UndoBlockHeader + records
+ *	+ slot directory) therefore starts at offset UNDO_PAGE_HEADER_BYTES
+ *	(= SizeOfPageHeaderData) and spans UNDO_PAYLOAD_BYTES bytes.
+ *
+ *	The legacy full-BLCKSZ macros above (UNDO_SLOT_DIR_OFFSET /
+ *	cluster_undo_block_has_space) address a raw block with UndoBlockHeader@0;
+ *	applying them to a payload pointer would run
+ *	`payload + (BLCKSZ - 8)` past the physical page tail.  The macros below
+ *	are the payload-relative replacements — every reader/writer/redo of a
+ *	Q12-A undo block MUST use these (never the legacy ones) with
+ *	`payload = (char *) page + UNDO_PAGE_HEADER_BYTES` as the base.
+ *
+ *	SizeOfPageHeaderData is a backend concept (storage/bufpage.h), so this
+ *	block is guarded by #ifndef FRONTEND to keep the header frontend-safe
+ *	(pg_waldump undo/ITL descriptors include this file — L8 boundary).  The
+ *	frontend decodes WAL records, not on-disk page payload, so it needs only
+ *	the ABI typedefs above.
+ *-------------------------------------------------------------------------
+ */
+#ifndef FRONTEND
+
+#include "storage/bufpage.h" /* SizeOfPageHeaderData, Page */
+
+/* Bytes consumed by the standard PG PageHeader prepended under Q12-A. */
+#define UNDO_PAGE_HEADER_BYTES ((uint32)SizeOfPageHeaderData)
+
+/* Bytes available for the undo payload (UndoBlockHeader + records + slots). */
+#define UNDO_PAYLOAD_BYTES ((uint32)(BLCKSZ - SizeOfPageHeaderData))
+
+/* Bytes available for records + slot dir inside the payload. */
+#define UNDO_PAYLOAD_BLOCK_BYTES (UNDO_PAYLOAD_BYTES - (uint32)sizeof(UndoBlockHeader))
+
+/*
+ * Payload-relative slot directory addressing.  Slot 0 is the newest record,
+ * at payload offset UNDO_PAYLOAD_BYTES - 8;  slot N at UNDO_PAYLOAD_BYTES -
+ * 8*(N+1).  `payload` is the UndoBlockHeader base (= page + header bytes),
+ * NOT the raw page.
+ */
+#define UNDO_PAYLOAD_SLOT_DIR_OFFSET(slot_idx)                                                     \
+	((uint32)(UNDO_PAYLOAD_BYTES - (((uint32)(slot_idx) + 1) * sizeof(UndoSlotDirEntry))))
+
+#define UNDO_PAYLOAD_SLOT_DIR_PTR(payload, slot_idx)                                               \
+	((UndoSlotDirEntry *)((char *)(payload) + UNDO_PAYLOAD_SLOT_DIR_OFFSET(slot_idx)))
+
+/*
+ * P2 payload abstraction (spec-3.27 §2.4):  single entry point that maps a
+ * Q12-A undo page to its UndoBlockHeader base.  All undo reader/writer/redo
+ * go through this;  raw `BufferGetBlock` casts are forbidden (would skip the
+ * PageHeader offset).
+ */
+static inline UndoBlockHeader *
+cluster_undo_page_get_payload(Page page)
+{
+	return (UndoBlockHeader *)((char *)page + UNDO_PAGE_HEADER_BYTES);
+}
+
+/* Payload-relative block-full test (mirrors cluster_undo_block_has_space). */
+static inline bool
+cluster_undo_payload_has_space(uint32 free_offset, uint16 slot_count, uint16 record_length)
+{
+	uint32 slot_dir_low
+		= UNDO_PAYLOAD_BYTES - ((uint32)(slot_count + 1) * sizeof(UndoSlotDirEntry));
+
+	return (free_offset + record_length) <= slot_dir_low;
+}
+
+/*
+ * §2.5 non-overflow invariants (P1-1).  The UndoBlockHeader plus at least
+ * one record byte must fit below the slot directory, and slot 0 must land
+ * strictly inside the payload (never past the physical page tail).
+ */
+StaticAssertDecl(SizeOfPageHeaderData + sizeof(UndoBlockHeader) + sizeof(UndoSlotDirEntry) < BLCKSZ,
+				 "Q12-A undo payload too small — PageHeader + UndoBlockHeader + one slot must fit");
+
+#endif /* !FRONTEND */
+
+
 #endif /* CLUSTER_UNDO_FORMAT_H */
