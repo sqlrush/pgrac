@@ -85,6 +85,18 @@ extern Datum cluster_get_wait_events(PG_FUNCTION_ARGS);
  */
 extern Datum cluster_get_gcluster_wait_events(PG_FUNCTION_ARGS);
 
+/*
+ * cluster_get_adg_state / cluster_get_gcluster_adg -- SRFs backing
+ * pg_stat_cluster_adg and pg_stat_gcluster_adg (spec-6.4).
+ *
+ * v1 row shape is intentionally narrow and stable: local/global ADG role,
+ * Apply Master lease identity, receive/apply watermarks, read-consistency SCN,
+ * and lag metrics.  MRP/RFS update the same underlying fields as the runtime
+ * pieces land; the default primary/ADG-off state emits status "disabled".
+ */
+extern Datum cluster_get_adg_state(PG_FUNCTION_ARGS);
+extern Datum cluster_get_gcluster_adg(PG_FUNCTION_ARGS);
+
 
 /*
  * cluster_get_stat_nodes -- SRF backing pg_stat_cluster_nodes (stage 0.28).

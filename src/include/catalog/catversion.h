@@ -720,7 +720,11 @@
 /* spec-6.1: RDMA interconnect observability catalog surface —
  * cluster_get_ic_rdma_peers SRF (oid 8972) plus pg_stat_cluster_ic RDMA
  * columns.  Bump 202606350 -> 202606360. */
-#define CATALOG_VERSION_NO 202606360
+/* spec-6.4: ADG physical standby/read-only catalog surface —
+ * cluster_get_adg_state + cluster_get_gcluster_adg SRFs and
+ * pg_stat_cluster_adg + pg_stat_gcluster_adg views.  Bump 202606360 ->
+ * 202606370. */
+#define CATALOG_VERSION_NO 202606370
 
 /* spec-5.13 (2026-06-27): clean-leave catalog surface — cluster_get_clean_leave_state
  * SRF (oid 8960) + pg_cluster_clean_leave_state view + pg_cluster_clean_leave_request

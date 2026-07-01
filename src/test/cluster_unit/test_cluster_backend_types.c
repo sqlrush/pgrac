@@ -57,6 +57,7 @@
 #include "postgres.h"
 
 #include "miscadmin.h"
+#include "storage/proc.h"
 
 /*
  * postgres.h transitively pulls in port.h, which #defines printf and
@@ -164,16 +165,27 @@ UT_TEST(test_undo_cleaner_is_last)
 	UT_ASSERT_EQ(B_UNDO_CLEANER, BACKEND_NUM_TYPES - 1);
 }
 
+UT_TEST(test_mrp_aux_proc_slot_is_reserved)
+{
+#ifdef USE_PGRAC_CLUSTER
+	UT_ASSERT(MrpProcess > UndoCleanerProcess);
+	UT_ASSERT(NUM_AUXILIARY_PROCS >= NUM_AUXPROCTYPES);
+#else
+	UT_ASSERT(NUM_AUXILIARY_PROCS >= NUM_AUXPROCTYPES);
+#endif
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(5);
+	UT_PLAN(6);
 	UT_RUN(test_backend_num_types_is_31);
 	UT_RUN(test_pgrac_values_appended_after_wal_writer);
 	UT_RUN(test_pg_native_values_unchanged);
 	UT_RUN(test_pgrac_values_are_dense_and_distinct);
 	UT_RUN(test_undo_cleaner_is_last);
+	UT_RUN(test_mrp_aux_proc_slot_is_reserved);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

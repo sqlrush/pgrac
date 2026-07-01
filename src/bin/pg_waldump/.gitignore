@@ -3,6 +3,7 @@
 # Source files copied from src/backend/access/rmgrdesc/
 /brindesc.c
 /clogdesc.c
+/clusteradgdesc.c
 /clusterundodesc.c
 /committsdesc.c
 /dbasedesc.c

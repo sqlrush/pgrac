@@ -120,6 +120,7 @@
 #include "cluster/cluster_write_fence.h" /* cluster_write_fence_shmem_register (spec-4.12 D7) */
 #include "cluster/cluster_lms.h" /* cluster_lms_shmem_register (spec-2.18 Sprint A Step 1) */
 #include "cluster/cluster_lmd.h" /* cluster_lmd_shmem_register (spec-2.19 Sprint A Step 1) */
+#include "cluster/cluster_mrp.h" /* cluster_mrp_shmem_register (spec-6.4 D1) */
 /* spec-2.7 hardening F1: cluster_smgr_shmem_register;intentionally no
  * trailing line-end comment so the longer storage/ path doesn't force
  * clang-format to realign every neighbour include above. */
@@ -758,6 +759,16 @@ cluster_init_shmem_module(void)
 	 */
 	if (cluster_shmem_lookup_region("pgrac cluster lmd") == NULL)
 		cluster_lmd_shmem_register();
+
+	/*
+	 * spec-6.4 D1/D7: register the ADG Managed Recovery Process state
+	 * region.  The process is spawned only for standby+ADG configurations,
+	 * but the tiny status region is always registered in cluster builds so
+	 * pg_stat_cluster_adg can report "disabled" without special catalog
+	 * branching.
+	 */
+	if (cluster_shmem_lookup_region("pgrac cluster mrp") == NULL)
+		cluster_mrp_shmem_register();
 
 	/*
 	 * PGRAC (spec-2.27 D2):  register GES dedup HTAB shmem region.

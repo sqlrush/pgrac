@@ -29,6 +29,9 @@
  *	    - cluster_voting_disk_compute_crc32c  (helper used by write +
  *	                                           verified by read)
  *
+ *	  Later specs extend the file with raw marker regions after the base
+ *	  voting slots: clean leave, join commit, and ADG apply-master lease.
+ *
  *	  Step 2 explicitly DEFERS:
  *	    - read_all_disks_into_view orchestration (Step 2 D4 cluster_
  *	      quorum_decision.c — that module owns the cross-disk loop)
@@ -78,8 +81,9 @@
  * writes ONLY its own leave-slot (qvotec sole-writer invariant); a marker
  * reaches a quorum-majority because qvotec replicates that one slot to every
  * disk, exactly like the fence marker.  The voting disk file therefore doubles
- * to 2 × CLUSTER_MAX_NODES × 512 bytes (cluster.voting_disk_size_bytes default
- * bumped to match).  The marker payload (ClusterLeaveIntentMarker) carries its
+ * to 2 × CLUSTER_MAX_NODES × 512 bytes (cluster.voting_disk_size_bytes has
+ * grown further as later marker regions were added).  The marker payload
+ * (ClusterLeaveIntentMarker) carries its
  * own magic/version/CRC, validated by the clean-leave policy layer — this layer
  * is payload-agnostic and just does aligned 512-byte raw slot I/O at the offset.
  */
@@ -93,14 +97,23 @@
  * coordinator writes the JOINER's join-slot (offset = joiner node_id) — unlike
  * the leave region where each node writes its own slot — so a join marker reaches
  * a quorum-majority because the coordinator's qvotec replicates that one slot to
- * every disk.  The voting disk file therefore grows to 3 × CLUSTER_MAX_NODES ×
- * 512 (cluster.voting_disk_size_bytes default bumped to match).  Payload =
+ * every disk.  The voting disk file therefore grows to at least
+ * 3 × CLUSTER_MAX_NODES × 512.  Payload =
  * ClusterJoinCommitMarker (magic 'JCMK'); this layer is payload-agnostic and does
  * aligned 512-byte raw slot I/O at the offset.
  */
 #define CLUSTER_VOTING_JOIN_SLOT_OFFSET(node_id)                                                   \
 	((off_t)(2 * CLUSTER_MAX_NODES + (node_id)) * CLUSTER_VOTING_SLOT_BYTES)
-#define CLUSTER_VOTING_FILE_BYTES_MIN ((off_t)3 * CLUSTER_MAX_NODES * CLUSTER_VOTING_SLOT_BYTES)
+
+/*
+ * spec-6.4 D7 — ADG Apply Master term/lease region (region 4).  This is an
+ * independent 512-byte slot per node and deliberately does NOT reuse
+ * ClusterVotingSlot._reserved1, which belongs to the write-fence marker and is
+ * rewritten by qvotec heartbeats.  Payload = ClusterAdgApplyMasterLease.
+ */
+#define CLUSTER_VOTING_APPLY_LEASE_SLOT_OFFSET(node_id)                                            \
+	((off_t)(3 * CLUSTER_MAX_NODES + (node_id)) * CLUSTER_VOTING_SLOT_BYTES)
+#define CLUSTER_VOTING_FILE_BYTES_MIN ((off_t)4 * CLUSTER_MAX_NODES * CLUSTER_VOTING_SLOT_BYTES)
 
 
 /*
@@ -229,6 +242,15 @@ extern ClusterVotingDiskIoState cluster_voting_disk_read_join_slot(int fd, uint3
 																   void *out_slot512);
 extern ClusterVotingDiskIoState cluster_voting_disk_write_join_slot(int fd, uint32 node_id,
 																	const void *in_slot512);
+
+/*
+ * spec-6.4 D7 — raw 512-byte ADG apply-master lease slot R/W in region 4.
+ * Payload-agnostic; cluster_adg.c owns the marker CRC and validation.
+ */
+extern ClusterVotingDiskIoState cluster_voting_disk_read_apply_lease_slot(int fd, uint32 node_id,
+																		  void *out_slot512);
+extern ClusterVotingDiskIoState cluster_voting_disk_write_apply_lease_slot(int fd, uint32 node_id,
+																		   const void *in_slot512);
 
 #endif /* USE_PGRAC_CLUSTER */
 

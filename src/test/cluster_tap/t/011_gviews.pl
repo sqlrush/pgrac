@@ -65,6 +65,13 @@ is($node->safe_psql('postgres',
 	'116',
 	'pg_stat_gcluster_wait_events returns 116 rows (spec-6.2 Smart Fusion authority waits)');
 
+is($node->safe_psql(
+		'postgres',
+		'SELECT node_id, dg_role, dg_mode, adg_enabled, mrp_status, lag_bytes
+		   FROM pg_stat_gcluster_adg'),
+	'-1|primary|async|f|disabled|0',
+	'pg_stat_gcluster_adg returns default local-only ADG row');
+
 
 # ----------
 # Distinct node count: 1 (placeholder; Stage 6+ will multiply by N).

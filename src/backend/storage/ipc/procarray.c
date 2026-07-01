@@ -73,6 +73,7 @@
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h" /* spec-4.5a L4: cr_force_read_scn */
+#include "cluster/cluster_mrp.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_undo_retention.h" /* spec-3.12 D1: retention horizon */
@@ -2148,8 +2149,22 @@ ClusterSnapshotRefreshFields(Snapshot snapshot)
 	 */
 	if (cluster_storage_mode_enabled())
 	{
+		SCN			read_scn;
+
 		snapshot->cluster_source = (uint8) SNAPSHOT_SOURCE_CLUSTER;
-		snapshot->read_scn = cluster_scn_current();
+		if (cluster_mrp_should_start())
+		{
+			read_scn = cluster_mrp_standby_consistent_scn();
+			if (!SCN_VALID(read_scn))
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_ADG_STANDBY_UNRESOLVABLE),
+						 errmsg("ADG standby read point is not available"),
+						 errhint("Wait for the Apply Master to publish "
+								 "standby_consistent_scn before running read-only queries.")));
+		}
+		else
+			read_scn = cluster_scn_current();
+		snapshot->read_scn = read_scn;
 		snapshot->read_epoch = cluster_epoch_get_current();
 
 		/*

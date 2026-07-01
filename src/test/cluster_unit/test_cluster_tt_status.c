@@ -116,6 +116,13 @@ cluster_tt_status_install_local(const ClusterTTStatusKey *key pg_attribute_unuse
 	return false;
 }
 
+int
+cluster_tt_status_resolve_prepared_commit(TransactionId xid pg_attribute_unused(),
+										  SCN commit_scn pg_attribute_unused())
+{
+	return 0;
+}
+
 void
 cluster_tt_status_flush_all(uint32 new_epoch pg_attribute_unused())
 {}
@@ -225,6 +232,10 @@ UT_TEST(test_t8_lookup_exact_linkable)
 UT_TEST(test_t9_install_local_linkable)
 {
 	UT_ASSERT_NE((void *)cluster_tt_status_install_local, NULL);
+}
+UT_TEST(test_t9b_resolve_prepared_commit_linkable)
+{
+	UT_ASSERT_NE((void *)cluster_tt_status_resolve_prepared_commit, NULL);
 }
 UT_TEST(test_t10_flush_all_linkable)
 {
@@ -356,6 +367,7 @@ main(void)
 	UT_RUN(test_t7_enum_cleaned_out_four);
 	UT_RUN(test_t8_lookup_exact_linkable);
 	UT_RUN(test_t9_install_local_linkable);
+	UT_RUN(test_t9b_resolve_prepared_commit_linkable);
 	UT_RUN(test_t10_flush_all_linkable);
 	UT_RUN(test_t11_generation_linkable);
 	UT_RUN(test_t12_status_key_field_offsets);

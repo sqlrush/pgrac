@@ -12611,6 +12611,25 @@
   proargnames => '{target_type,target_action,reachable,reason,resolved_scn,restore_point_name}',
   prosrc => 'cluster_get_pitr_status' },
 
+# spec-6.4 -- ADG physical standby / read-only service status views.
+{ oid => '8972', descr => 'show local ADG standby apply and lag state',
+  proname => 'cluster_get_adg_state', prorows => '1',
+  proretset => 't', provolatile => 'v', proparallel => 'r',
+  prorettype => 'record', proargtypes => '',
+  proallargtypes => '{int4,text,text,bool,int4,int8,text,pg_lsn,pg_lsn,int8,int8,float8,float8}',
+  proargmodes => '{o,o,o,o,o,o,o,o,o,o,o,o,o}',
+  proargnames => '{node_id,dg_role,dg_mode,adg_enabled,apply_master_node_id,apply_master_term,mrp_status,receive_lsn,apply_lsn,standby_consistent_scn,lag_bytes,lag_seconds,apply_rate_bytes_per_sec}',
+  prosrc => 'cluster_get_adg_state' },
+
+{ oid => '8973', descr => 'show global ADG standby apply and lag state',
+  proname => 'cluster_get_gcluster_adg', prorows => '16',
+  proretset => 't', provolatile => 'v', proparallel => 'r',
+  prorettype => 'record', proargtypes => '',
+  proallargtypes => '{int4,text,text,bool,int4,int8,text,pg_lsn,pg_lsn,int8,int8,float8,float8}',
+  proargmodes => '{o,o,o,o,o,o,o,o,o,o,o,o,o}',
+  proargnames => '{node_id,dg_role,dg_mode,adg_enabled,apply_master_node_id,apply_master_term,mrp_status,receive_lsn,apply_lsn,standby_consistent_scn,lag_bytes,lag_seconds,apply_rate_bytes_per_sec}',
+  prosrc => 'cluster_get_gcluster_adg' },
+
 # spec-3.2 D5b (2026-05-22) -- test-only visibility fork injection
 # functions.  These are SQL-visible so TAP can drive a real
 # HeapTupleSatisfiesMVCC cluster-path miss and assert 53R97.  Production

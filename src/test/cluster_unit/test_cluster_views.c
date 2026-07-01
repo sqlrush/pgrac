@@ -38,6 +38,8 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_mrp.h"
 #include "cluster/cluster_views.h"
 #include "cluster/cluster_wait_events.h" /* PG_WAIT_CLUSTER_GES / ADG */
 #include "utils/wait_event.h"			 /* WAIT_EVENT_GES_ENQUEUE_ACQUIRE etc. */
@@ -72,6 +74,14 @@
  */
 #include "funcapi.h"
 #include "utils/builtins.h"
+
+void
+ExceptionalCondition(const char *conditionName pg_attribute_unused(),
+					 const char *fileName pg_attribute_unused(),
+					 int lineNumber pg_attribute_unused())
+{
+	abort();
+}
 
 void
 InitMaterializedSRF(FunctionCallInfo fcinfo pg_attribute_unused(),
@@ -117,6 +127,21 @@ pgstat_get_wait_event_type(uint32 wait_event_info pg_attribute_unused())
  * value as the GUC.  Mirrors the stub in test_cluster_gviews.c.
  */
 int cluster_node_id = -1;
+int cluster_dg_role = CLUSTER_DG_ROLE_PRIMARY;
+int cluster_dg_mode = CLUSTER_DG_MODE_ASYNC;
+bool cluster_enable_adg = false;
+
+ClusterMrpSharedState *
+cluster_mrp_shared_state(void)
+{
+	return NULL;
+}
+
+const char *
+cluster_mrp_state_to_string(ClusterMrpState state pg_attribute_unused())
+{
+	return "disabled";
+}
 
 /*
  * Stage 0.28 stubs: cluster_views.c::cluster_get_stat_nodes references
@@ -210,6 +235,11 @@ UT_TEST(test_srf_symbol_linkable)
 	UT_ASSERT_NOT_NULL((void *)cluster_get_wait_events);
 }
 
+UT_TEST(test_adg_srf_symbol_linkable)
+{
+	UT_ASSERT_NOT_NULL((void *)cluster_get_adg_state);
+}
+
 
 UT_TEST(test_first_event_is_ges_enqueue_acquire)
 {
@@ -240,9 +270,10 @@ UT_TEST(test_adg_scn_sync_wait_in_adg_class)
 int
 main(void)
 {
-	UT_PLAN(4);
+	UT_PLAN(5);
 	UT_RUN(test_cluster_wait_events_count_is_116);
 	UT_RUN(test_srf_symbol_linkable);
+	UT_RUN(test_adg_srf_symbol_linkable);
 	UT_RUN(test_first_event_is_ges_enqueue_acquire);
 	UT_RUN(test_adg_scn_sync_wait_in_adg_class);
 	UT_DONE();

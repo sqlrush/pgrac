@@ -248,9 +248,9 @@ cluster_tt_twophase_postabort(TransactionId xid, uint16 info, void *recdata, uin
  *	  - overlay capacity / shmem unavailable: WARNING + count, and the
  *	    affected prepared reads 53R97 fail-closed on the standby.
  *
- *	V-3 note: the overlay is NOT updated when the standby later replays
- *	COMMIT PREPARED (0x30 redo touches only the durable header) -- full
- *	standby reader visibility is forward-linked to #95.
+ *	V-3: COMMIT PREPARED redo later calls
+ *	cluster_tt_twophase_standby_commit_prepared() to resolve the rebuilt
+ *	IN_PROGRESS overlay to COMMITTED using the prepared commit SCN.
  */
 void
 cluster_tt_twophase_standby_recover(TransactionId xid, uint16 info, void *recdata, uint32 len)
@@ -306,6 +306,14 @@ cluster_tt_twophase_standby_recover(TransactionId xid, uint16 info, void *recdat
 	}
 
 	cluster_vis_bump_recovery_2pc_standby_rebuilds();
+}
+
+int
+cluster_tt_twophase_standby_commit_prepared(TransactionId xid, SCN commit_scn)
+{
+	if (!cluster_enabled || cluster_node_id < 0 || !SCN_VALID(commit_scn))
+		return 0;
+	return cluster_tt_status_resolve_prepared_commit(xid, commit_scn);
 }
 
 

@@ -606,6 +606,14 @@ typedef enum {
 	 */
 	UndoCleanerProcess,
 
+	/*
+	 * MRP (Managed Recovery Process) is the spec-6.4 ADG physical standby
+	 * apply process.  Appended after UndoCleanerProcess to preserve every
+	 * existing AuxProcType value; postmaster only forks it when
+	 * cluster.dg_role=standby and cluster.enable_adg=on.
+	 */
+	MrpProcess,
+
 #endif
 	NUM_AUXPROCTYPES /* Must be last! */
 } AuxProcType;
@@ -629,6 +637,7 @@ extern PGDLLIMPORT AuxProcType MyAuxProcType;
 #define AmLmdProcess() (MyAuxProcType == LmdProcess)
 #define AmSinvalBcastProcess() (MyAuxProcType == SinvalBcastProcess)
 #define AmUndoCleanerProcess() (MyAuxProcType == UndoCleanerProcess)
+#define AmMrpProcess() (MyAuxProcType == MrpProcess)
 #endif
 
 

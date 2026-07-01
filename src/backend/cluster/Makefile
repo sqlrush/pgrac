@@ -39,6 +39,8 @@ include $(top_builddir)/src/Makefile.global
 ifeq ($(enable_pgrac_cluster), yes)
 OBJS = \
 	cluster.o \
+	cluster_adg.o \
+	cluster_adg_xlog.o \
 	cluster_advisory.o \
 	cluster_cancel_token.o \
 	cluster_backup.o \
@@ -135,6 +137,7 @@ OBJS = \
 	cluster_lmon.o \
 	cluster_lms.o \
 	cluster_membership.o \
+	cluster_mrp.o \
 	cluster_node_remove.o \
 	cluster_node_remove_policy.o \
 	cluster_node_remove_views.o \

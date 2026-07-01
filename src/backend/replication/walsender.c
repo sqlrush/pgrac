@@ -95,6 +95,10 @@
 #include "utils/timeout.h"
 #include "utils/timestamp.h"
 
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_adg.h"
+#endif
+
 /* Minimum interval used by walsender for stats flushes, in ms */
 #define WALSENDER_STATS_FLUSH_INTERVAL         1000
 
@@ -258,6 +262,11 @@ static void StartLogicalReplication(StartReplicationCmd *cmd);
 static void ProcessStandbyMessage(void);
 static void ProcessStandbyReplyMessage(void);
 static void ProcessStandbyHSFeedbackMessage(void);
+#ifdef USE_PGRAC_CLUSTER
+static bool ProcessStandbyAdgReplyTrailer(uint16 *thread_id,
+										  uint64 *standby_consistent_scn,
+										  uint64 *apply_master_term);
+#endif
 static void ProcessRepliesIfAny(void);
 static void ProcessPendingWrites(void);
 static void WalSndKeepalive(bool requestReply, XLogRecPtr writePtr);
@@ -2095,6 +2104,53 @@ PhysicalConfirmReceivedLocation(XLogRecPtr lsn)
 /*
  * Regular reply from standby advising of WAL locations on standby server.
  */
+#ifdef USE_PGRAC_CLUSTER
+static bool
+ProcessStandbyAdgReplyTrailer(uint16 *thread_id, uint64 *standby_consistent_scn,
+							  uint64 *apply_master_term)
+{
+	int			saved_cursor = reply_message.cursor;
+	int			remaining = reply_message.len - reply_message.cursor;
+	uint32		magic;
+	uint16		version;
+	uint16		parsed_thread_id;
+	uint64		parsed_consistent_scn;
+	uint64		parsed_term;
+
+	if (remaining == 0)
+		return false;
+	if (remaining != CLUSTER_ADG_REPLY_TRAILER_BYTES)
+		return false;
+
+	magic = (uint32)pq_getmsgint(&reply_message, 4);
+	if (magic != CLUSTER_ADG_REPLY_MAGIC)
+	{
+		reply_message.cursor = saved_cursor;
+		return false;
+	}
+
+	version = (uint16)pq_getmsgint(&reply_message, 2);
+	parsed_thread_id = (uint16)pq_getmsgint(&reply_message, 2);
+	parsed_consistent_scn = (uint64)pq_getmsgint64(&reply_message);
+	parsed_term = (uint64)pq_getmsgint64(&reply_message);
+
+	if (!cluster_adg_reply_trailer_valid(magic, version, parsed_thread_id,
+										 (SCN)parsed_consistent_scn,
+										 parsed_term))
+	{
+		ereport(COMMERROR,
+				(errcode(ERRCODE_PROTOCOL_VIOLATION),
+				 errmsg("invalid ADG standby reply trailer")));
+		proc_exit(0);
+	}
+
+	*thread_id = parsed_thread_id;
+	*standby_consistent_scn = parsed_consistent_scn;
+	*apply_master_term = parsed_term;
+	return true;
+}
+#endif
+
 static void
 ProcessStandbyReplyMessage(void)
 {
@@ -2108,6 +2164,12 @@ ProcessStandbyReplyMessage(void)
 	bool		clearLagTimes;
 	TimestampTz now;
 	TimestampTz replyTime;
+#ifdef USE_PGRAC_CLUSTER
+	bool		has_adg_reply;
+	uint16		adg_thread_id = 0;
+	uint64		adg_standby_consistent_scn = 0;
+	uint64		adg_apply_master_term = 0;
+#endif
 
 	static bool fullyAppliedLastTime = false;
 
@@ -2117,6 +2179,11 @@ ProcessStandbyReplyMessage(void)
 	applyPtr = pq_getmsgint64(&reply_message);
 	replyTime = pq_getmsgint64(&reply_message);
 	replyRequested = pq_getmsgbyte(&reply_message);
+#ifdef USE_PGRAC_CLUSTER
+	has_adg_reply = ProcessStandbyAdgReplyTrailer(&adg_thread_id,
+												  &adg_standby_consistent_scn,
+												  &adg_apply_master_term);
+#endif
 
 	if (message_level_is_interesting(DEBUG2))
 	{
@@ -2181,6 +2248,16 @@ ProcessStandbyReplyMessage(void)
 		if (applyLag != -1 || clearLagTimes)
 			walsnd->applyLag = applyLag;
 		walsnd->replyTime = replyTime;
+#ifdef USE_PGRAC_CLUSTER
+		if (has_adg_reply)
+		{
+			walsnd->adg_thread_id = adg_thread_id;
+			walsnd->adg_reply_version = CLUSTER_ADG_REPLY_VERSION;
+			walsnd->adg_reply_reserved = 0;
+			walsnd->adg_standby_consistent_scn = adg_standby_consistent_scn;
+			walsnd->adg_apply_master_term = adg_apply_master_term;
+		}
+#endif
 		SpinLockRelease(&walsnd->mutex);
 	}
 
@@ -2661,6 +2738,11 @@ InitWalSenderSlot(void)
 			walsnd->sync_standby_priority = 0;
 			walsnd->latch = &MyProc->procLatch;
 			walsnd->replyTime = 0;
+			walsnd->adg_thread_id = 0;
+			walsnd->adg_reply_version = 0;
+			walsnd->adg_reply_reserved = 0;
+			walsnd->adg_standby_consistent_scn = 0;
+			walsnd->adg_apply_master_term = 0;
 
 			/*
 			 * The kind assignment is done here and not in StartReplication()

@@ -45,6 +45,9 @@
  *	               See specs/spec-6.0a-production-shared-storage-
  *	               backend-matrix.md and
  *	               src/backend/cluster/storage/cluster_raw_xlog.c.
+ *
+ *	               spec-6.4 adds RM_CLUSTER_ADG for narrow ADG thread
+ *	               barrier records used to advance standby read SCN.
  *---------------------------------------------------------------------------
  */
 
@@ -87,4 +90,6 @@ PG_RMGR(RM_LOGICALMSG_ID, "LogicalMessage", logicalmsg_redo, logicalmsg_desc, lo
 PG_RMGR(RM_CLUSTER_UNDO_ID, "ClusterUndo", cluster_undo_redo, cluster_undo_desc, cluster_undo_identify, NULL, NULL, NULL, NULL)
 /* PGRAC spec-6.0a: crash-safe raw block-device layout metadata. */
 PG_RMGR(RM_CLUSTER_RAW_LAYOUT_ID, "ClusterRawLayout", cluster_raw_layout_redo, cluster_raw_layout_desc, cluster_raw_layout_identify, NULL, NULL, NULL, NULL)
+/* PGRAC spec-6.4: ADG thread-safe-SCN barriers. */
+PG_RMGR(RM_CLUSTER_ADG_ID, "ClusterAdg", cluster_adg_redo, cluster_adg_desc, cluster_adg_identify, NULL, NULL, NULL, NULL)
 #endif

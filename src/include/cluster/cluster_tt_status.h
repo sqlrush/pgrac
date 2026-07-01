@@ -231,6 +231,7 @@ extern bool cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key,
 										   ClusterTTStatusResult *result);
 extern bool cluster_tt_status_install_local(const ClusterTTStatusKey *key, ClusterTTStatus status,
 											SCN commit_scn);
+extern int cluster_tt_status_resolve_prepared_commit(TransactionId xid, SCN commit_scn);
 extern void cluster_tt_status_flush_all(uint32 new_epoch);
 
 /*
