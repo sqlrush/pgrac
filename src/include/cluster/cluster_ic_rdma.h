@@ -5,6 +5,13 @@
  *
  * Spec: spec-6.1-rdma-transport-stack.md
  *
+ * Portions Copyright (c) 2026, pgrac contributors
+ *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
+ * IDENTIFICATION
+ *	  src/include/cluster/cluster_ic_rdma.h
+ *
  *-------------------------------------------------------------------------
  */
 #ifndef CLUSTER_IC_RDMA_H
@@ -101,6 +108,7 @@ extern ClusterICPeerTransport cluster_ic_mux_peer_transport(int32 peer_id);
 extern void cluster_ic_mux_set_peer_transport(int32 peer_id, ClusterICPeerTransport transport,
 											  ClusterICRdmaPeerState state);
 extern uint64 cluster_ic_mux_fallback_count(void);
+extern bool cluster_ic_mux_peer_has_pending_outbound(int32 peer_id);
 extern void cluster_ic_rdma_stats_note_transport(int32 peer_id, ClusterICPeerTransport transport,
 												 ClusterICRdmaPeerState state);
 extern void cluster_ic_rdma_stats_note_fallback(int32 peer_id, const char *reason);
@@ -120,14 +128,22 @@ extern void cluster_ic_rdma_lmon_handle_completion_events(void);
 extern bool cluster_ic_rdma_drain_recv(int32 *out_sender_node_id, void *buf, size_t bufsize,
 									   size_t *out_received_len);
 extern bool cluster_ic_rdma_peek_sender(int32 *out_sender_node_id);
+extern bool cluster_ic_rdma_pending_outbound(int32 peer_id);
 
 /*
  * D5 guard surface: callers may ask whether the current active transport can
  * carry a block image by RDMA SEND-with-SGE while preserving the envelope
- * verify/quarantine/install chain.  False means the caller must keep the
- * existing contiguous envelope path.
+ * verify/quarantine/install chain.  The SGE points at a registered per-peer
+ * scratch MR populated under the normal bufmgr content-lock copy contract;
+ * it never borrows a live shared_buffers page across asynchronous CQ
+ * completion.  False means the caller must keep the existing contiguous
+ * envelope path.
  */
 extern bool cluster_ic_rdma_block_sge_supported(const char **reason);
+extern bool cluster_ic_rdma_borrow_block_scratch(int32 peer_id, size_t len,
+												 void **out_addr, uint32 *out_lkey,
+												 ClusterICSgeReleaseCallback *out_release_cb,
+												 void **out_release_arg);
 extern ClusterICSendResult cluster_ic_rdma_send_envelope_sge(uint8 msg_type,
 															 int32 dest_node_id,
 															 const ClusterICSge *payload_sge,

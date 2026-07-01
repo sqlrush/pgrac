@@ -326,12 +326,12 @@ see why RDMA was not selected.
 | `rdma_addr` | `text` | Optional RDMA CM address from `pgrac.conf`. |
 | `rdma_gid` | `text` | Optional GID label from `pgrac.conf`. |
 | `rdma_port` | `int4` | HCA port number, default `1`. |
-| `mr_registered` | `bool` | Whether shared_buffers MR registration completed in this postmaster. |
+| `mr_registered` | `bool` | Whether RDMA memory registration resources completed in this postmaster. |
 | `cq_depth` | `int4` | Last completion batch depth observed by LMON. |
 | `fallback_count` | `int8` | Per-peer RDMA-to-TCP fallback decisions. |
 | `send_count` / `recv_count` | `int8` | Mux-level send/receive handoffs counted by transport. |
 | `bytes_send` / `bytes_recv` | `int8` | Mux-level bytes handed to/from the selected transport. |
-| `block_sge_send_count` | `int8` | SEND-with-SGE block ship attempts posted on the RDMA path.  Normal block replies use a registered `shared_buffers` page SGE. |
+| `block_sge_send_count` | `int8` | SEND-with-SGE block ship attempts posted on the RDMA path.  Spec-6.1 block replies use registered per-peer scratch MR, not live shared_buffers DMA. |
 | `block_sge_fallback_count` | `int8` | SEND-with-SGE block ship attempts that materialized the SGEs and used TCP fallback. |
 | `latency_us_sum` / `latency_sample_count` | `int8` | Reserved latency aggregation counters for tier2/tier3 completion timing. |
 | `last_error_code` | `text` | Last SQLSTATE-style RDMA/mux error for this peer. |

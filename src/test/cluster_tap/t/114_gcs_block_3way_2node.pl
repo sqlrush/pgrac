@@ -133,7 +133,7 @@ is($pair->node0->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
 	'112',
-	'L4 wait event count == 112 (spec-6.1 +2 RDMA wait events)');
+	'L4 wait event count == 112 (spec-6.1 RDMA wait events)');
 
 
 # ============================================================

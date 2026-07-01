@@ -1155,13 +1155,13 @@ LmonMain(void)
 			 * Heartbeat send tick.
 			 *
 			 * spec-2.3 hardening v1.0.1 F1 (L68):
-			 *   send_heartbeat returns three-state.  WOULD_BLOCK = the
-			 *   outbound buffer holds the (possibly partial) frame; we
-			 *   keep the peer CONNECTED, mark wes_dirty so the WaitEventSet
-			 *   rebuild adds WL_SOCKET_WRITEABLE for that fd, and let the
-			 *   next writability wakeup drain the tail.  Closing the peer
-			 *   on EAGAIN was the v1.0.0 bug -- it silently bypassed the
-			 *   per-peer outbound buffer designed exactly for this case.
+				 *   send_heartbeat returns three-state.  WOULD_BLOCK means the
+				 *   selected transport has retained the frame: TCP drains its
+				 *   tier1 tail on WL_SOCKET_WRITEABLE; RDMA drains its one-frame
+				 *   send queue from the SEND CQE completion path.  We keep the
+				 *   peer CONNECTED and rebuild the wait set so either transport's
+				 *   next wake can make progress.  Closing the peer on EAGAIN was
+				 *   the v1.0.0 bug -- it bypassed the per-peer outbound buffer.
 			 *   HARD_ERROR = real socket death; close peer + state DOWN.
 			 */
 			if (now >= next_heartbeat_at) {
@@ -1175,12 +1175,12 @@ LmonMain(void)
 					else
 						rc = cluster_ic_tier1_send_heartbeat(pi);
 					switch (rc) {
-					case CLUSTER_IC_SEND_DONE:
-						break;
-					case CLUSTER_IC_SEND_WOULD_BLOCK:
-						/* Tail buffered; arrange WL_SOCKET_WRITEABLE drain. */
-						wes_dirty = true;
-						break;
+						case CLUSTER_IC_SEND_DONE:
+							break;
+						case CLUSTER_IC_SEND_WOULD_BLOCK:
+							/* Transport-retained frame; arrange the next drain wake. */
+							wes_dirty = true;
+							break;
 					case CLUSTER_IC_SEND_HARD_ERROR:
 						cluster_ic_tier1_close_peer(pi, "heartbeat send hard error");
 						lmon_peer_track[pi].fd = -1;

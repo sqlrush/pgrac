@@ -91,7 +91,7 @@ is($gcs_reply_wait_event, '1',
 my $total_wait_events = $node->safe_psql(
 	'postgres', 'SELECT count(*) FROM pg_stat_cluster_wait_events');
 is($total_wait_events, '112',
-	'L4 wait_events count 112 (spec-6.1 +2 RDMA wait events)');
+	'L4 wait_events count 112 (spec-6.1 RDMA wait events)');
 
 
 # L6 — Production workload does NOT trigger wire path (HC72 short-circuit).

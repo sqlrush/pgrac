@@ -356,6 +356,28 @@ parse_rdma_port(const char *value, int32 *out)
 	return true;
 }
 
+static bool
+parse_rdma_uint32(const char *value, uint32 *out)
+{
+	char *endptr;
+	unsigned long parsed;
+	int base = 10;
+
+	if (value == NULL || *value == '\0' || out == NULL)
+		return false;
+
+	if (strlen(value) > 2 && value[0] == '0' && (value[1] == 'x' || value[1] == 'X'))
+		base = 16;
+
+	errno = 0;
+	parsed = strtoul(value, &endptr, base);
+	if (errno != 0 || *endptr != '\0' || parsed > PG_UINT32_MAX)
+		return false;
+
+	*out = (uint32)parsed;
+	return true;
+}
+
 
 /* ============================================================
  * Loader: parse pgrac.conf and populate ClusterConfShmem.
@@ -371,6 +393,8 @@ init_node_slot(ClusterNodeInfo *n, int32 node_id)
 	n->node_id = node_id;
 	n->role = CLUSTER_ROLE_PRIMARY;
 	n->rdma_port = 1;
+	n->rdma_pkey = 0xffff;
+	n->rdma_qkey = 0;
 }
 
 /*
@@ -487,7 +511,27 @@ apply_node_field(ClusterNodeInfo *n, const char *key, const char *value, const c
 			*out_err = "rdma_port must be an integer in [1, 255]";
 			return false;
 		}
-		n->rdma_port = port;
+		n->rdma_port = (uint16)port;
+		return true;
+	}
+	if (strcmp(key, "rdma_pkey") == 0) {
+		uint32 pkey;
+
+		if (!parse_rdma_uint32(value, &pkey) || pkey > 0xffff) {
+			*out_err = "rdma_pkey must be an integer or hex value in [0, 65535]";
+			return false;
+		}
+		n->rdma_pkey = (uint16)pkey;
+		return true;
+	}
+	if (strcmp(key, "rdma_qkey") == 0) {
+		uint32 qkey;
+
+		if (!parse_rdma_uint32(value, &qkey)) {
+			*out_err = "rdma_qkey must be a uint32 integer or hex value";
+			return false;
+		}
+		n->rdma_qkey = qkey;
 		return true;
 	}
 	*out_err = "unknown key in [node.N] section";
@@ -542,7 +586,7 @@ post_validate(const char *path)
 	}
 
 	for (i = 0; i < ClusterConfShmem->node_count; i++) {
-		const ClusterNodeInfo *n = &ClusterConfShmem->nodes[i];
+		ClusterNodeInfo *n = &ClusterConfShmem->nodes[i];
 
 		if (n->interconnect_addr[0] == '\0') {
 			ereport(
@@ -552,6 +596,8 @@ post_validate(const char *path)
 					 "cluster_conf: node %d in \"%s\" is missing required field interconnect_addr",
 					 n->node_id, path)));
 		}
+		if (n->rdma_port == 0)
+			n->rdma_port = 1;
 		if (n->node_id == cluster_node_id)
 			self_seen = true;
 	}

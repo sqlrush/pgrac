@@ -1057,7 +1057,8 @@ cluster_init_guc(void)
 	DefineCustomEnumVariable(
 		"cluster.interconnect_tier", gettext_noop("Cluster interconnect tier vtable selection."),
 		gettext_noop("stub (default) keeps cross-node IPC disabled; tier1 (TCP) "
-					 "uses TCP; tier2 / tier3 select the RDMA-capable transport mux. "
+					 "uses TCP; tier2 selects the RDMA-capable transport mux; "
+					 "tier3 is reserved until mlx5 direct verbs are implemented. "
 					 "See docs/cluster-ic-design.md."),
 		&cluster_interconnect_tier, CLUSTER_IC_TIER_STUB,  /* boot value */
 		cluster_interconnect_tier_options, PGC_POSTMASTER, /* tier change requires restart */
@@ -1077,30 +1078,31 @@ cluster_init_guc(void)
 	DefineCustomEnumVariable(
 		"cluster.interconnect_rdma_provider",
 		gettext_noop("RDMA provider selection for tier2/tier3 interconnect."),
-		gettext_noop("auto probes the best available provider; verbs requests generic "
-					 "libibverbs; mlx5 requests the optimized mlx5 provider."),
+		gettext_noop("auto and verbs request generic libibverbs; mlx5 is reserved and "
+					 "fails closed until the optimized mlx5 provider is implemented."),
 		&cluster_interconnect_rdma_provider, CLUSTER_IC_RDMA_PROVIDER_AUTO,
 		cluster_interconnect_rdma_provider_options, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	DefineCustomEnumVariable(
 		"cluster.interconnect_rdma_completion",
 		gettext_noop("RDMA completion model for the interconnect."),
-		gettext_noop("event integrates with the LMON wait loop; busypoll is an opt-in "
-					 "low-latency mode for tier3 deployments."),
+		gettext_noop("event integrates with the LMON wait loop; busypoll is reserved "
+					 "and fails closed until the tier3 poller is implemented."),
 		&cluster_interconnect_rdma_completion, CLUSTER_IC_RDMA_COMPLETION_EVENT,
 		cluster_interconnect_rdma_completion_options, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
 		"cluster.interconnect_rdma_busypoll_us",
 		gettext_noop("RDMA busy-poll spin budget in microseconds."),
-		gettext_noop("Used only when cluster.interconnect_rdma_completion=busypoll."),
+		gettext_noop("Reserved for cluster.interconnect_rdma_completion=busypoll; "
+					 "unused by the spec-6.1 event-driven path."),
 		&cluster_interconnect_rdma_busypoll_us, 50, 0, 10000, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
 		"cluster.interconnect_rdma_crc_offload",
-		gettext_noop("Allow experimental RDMA control-plane CRC offload."),
-		gettext_noop("Block shipping keeps application-level CRC32C enabled regardless of "
-					 "this setting."),
+		gettext_noop("Reserved RDMA control-plane CRC offload switch."),
+		gettext_noop("Spec-6.1 rejects this setting when enabled; block shipping always "
+					 "uses application-level CRC32C."),
 		&cluster_interconnect_rdma_crc_offload, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	DefineCustomIntVariable(

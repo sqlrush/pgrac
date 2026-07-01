@@ -105,7 +105,7 @@ Network transport layer.
 | `InterconnectRdmaRecv` | Waiting for an RDMA receive |
 | `ClusterICRdmaPoll` | Waiting for RDMA completion-queue polling |
 | `ClusterICRdmaConnect` | Waiting for RDMA connection setup |
-| `InterconnectTcpFallback` | Waiting on the TCP fallback transport |
+| `ClusterICRdmaFallback` | Waiting on the TCP fallback transport selected by the RDMA mux |
 | `InterconnectTierSwitch` | Waiting for transport tier switch (e.g. RDMA → TCP fallback) |
 | `InterconnectConnectRetry` | Waiting for an interconnect reconnection attempt |
 | `ClusterICTcpAccept` | LMON waiting on the Tier 1 listener for an incoming peer connection |

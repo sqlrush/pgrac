@@ -103,7 +103,7 @@ Selects the cluster interconnect transport.
 | `stub` (default) | Same-node operation is a no-op success.  Cross-node send raises `ERRCODE_FEATURE_NOT_SUPPORTED`.  No real wire traffic.  Suitable for single-node deployments and CI. |
 | `tier1` | TCP transport for the LMON heartbeat path between cluster nodes.  Requires every peer (including self) to be listed in `pgrac.conf` with an `interconnect_addr`.  See `pg_cluster_ic_peers` for runtime peer state. |
 | `tier2` | RDMA-capable transport mux.  Requires a binary configured with `--with-rdma`; otherwise startup fails closed with `53R22`.  When RDMA is built but unavailable at runtime, `cluster.interconnect_rdma_fallback=auto` keeps TCP fallback active. |
-| `tier3` | RDMA-capable optimized mux tier.  Uses the same fallback and fail-closed rules as `tier2`, with provider selection controlled by `cluster.interconnect_rdma_provider`. |
+| `tier3` | Reserved for mlx5 direct-verbs optimization.  Spec-6.1 fails closed with `FEATURE_NOT_SUPPORTED` until the `mlx5dv` path is implemented. |
 
 ```text
 # postgresql.conf
@@ -129,10 +129,10 @@ These settings are relevant only when `cluster.interconnect_tier` is
 | Setting | Type | Default | Context | Notes |
 |---|---|---|---|---|
 | `cluster.interconnect_rdma_fallback` | enum | `auto` | postmaster | `auto` allows TCP fallback; `off` fails closed if RDMA is unavailable. |
-| `cluster.interconnect_rdma_provider` | enum | `auto` | postmaster | `auto`, `verbs`, or `mlx5`. |
-| `cluster.interconnect_rdma_completion` | enum | `event` | postmaster | `event` or `busypoll`. |
-| `cluster.interconnect_rdma_busypoll_us` | integer | `50` | sighup | Busy-poll spin budget when busypoll mode is selected. |
-| `cluster.interconnect_rdma_crc_offload` | bool | `off` | postmaster | Experimental control-plane setting. Block shipping keeps application CRC32C enabled. |
+| `cluster.interconnect_rdma_provider` | enum | `auto` | postmaster | `auto` and `verbs` use generic verbs.  `mlx5` is reserved and fails closed in spec-6.1. |
+| `cluster.interconnect_rdma_completion` | enum | `event` | postmaster | `event` is implemented.  `busypoll` is reserved and fails closed in spec-6.1. |
+| `cluster.interconnect_rdma_busypoll_us` | integer | `50` | sighup | Reserved busy-poll spin budget; accepted for forward compatibility but unused unless busypoll is implemented. |
+| `cluster.interconnect_rdma_crc_offload` | bool | `off` | postmaster | Reserved.  Enabling it fails closed in spec-6.1; block shipping always keeps application CRC32C enabled. |
 | `cluster.interconnect_rdma_inline_max` | integer | `256` | postmaster | Inline-send threshold in bytes. |
 | `cluster.interconnect_rdma_max_send_wr` | integer | `256` | postmaster | Per-peer send work-request depth. |
 
@@ -633,6 +633,8 @@ interconnect_addr = 10.0.0.1:6432
 rdma_addr        = 10.10.0.1:18515
 rdma_gid         = fe80::1
 rdma_port        = 1
+rdma_pkey        = 0xffff
+rdma_qkey        = 0
 hostname          = db-1.internal
 public_addr       = 192.168.1.1:5432
 role              = primary
@@ -643,6 +645,8 @@ interconnect_addr = 10.0.0.2:6432
 rdma_addr        = 10.10.0.2:18515
 rdma_gid         = fe80::2
 rdma_port        = 1
+rdma_pkey        = 0xffff
+rdma_qkey        = 0
 hostname          = db-2.internal
 role              = standby
 ```
@@ -666,6 +670,8 @@ role              = standby
 | `rdma_addr` | no | `host:port` | RDMA CM listener address for `tier2`/`tier3`.  If absent, that RDMA link stays on TCP fallback; `interconnect_addr` remains the TCP listener address. |
 | `rdma_gid` | no | string | RoCE/IB GID selector recorded for diagnostics and operator validation. |
 | `rdma_port` | no | integer `[1, 255]` | HCA port number.  Defaults to `1`. |
+| `rdma_pkey` | no | integer `[0, 65535]` or `0x` hex | RDMA partition key checked during HELLO/private-data validation.  Defaults to `0xffff`. |
+| `rdma_qkey` | no | uint32 or `0x` hex | RDMA Q_Key metadata checked during HELLO/private-data validation.  Defaults to `0`. |
 
 ### Comment forms
 
@@ -691,6 +697,8 @@ on any of:
 - `interconnect_addr` not in `host:port` form
 - `rdma_addr` is present but not in `host:port` form
 - `rdma_port` is present but outside `[1, 255]`
+- `rdma_pkey` is present but outside `[0, 65535]`
+- `rdma_qkey` is present but outside `uint32`
 - `role` not one of `primary` / `standby` / `arbiter`
 - `cluster.node_id` (the GUC) is not present in any `[node.<N>]` section
 

@@ -144,6 +144,8 @@ interconnect_addr = 10.0.0.10:6432
 rdma_addr = 10.0.1.10:18515
 rdma_gid = fe80::10
 rdma_port = 1
+rdma_pkey = 0xffff
+rdma_qkey = 0x11112222
 hostname = test-node-0
 role = primary
 region = us-east-1a
@@ -153,6 +155,8 @@ interconnect_addr = 10.0.0.11:6432
 rdma_addr = 10.0.1.11:18515
 rdma_gid = fe80::11
 rdma_port = 2
+rdma_pkey = 0x7fff
+rdma_qkey = 305419896
 hostname = test-node-1
 role = standby
 EOC
@@ -193,6 +197,13 @@ is($node->safe_psql('postgres',
 		   WHERE node_id = 0}),
 	'10.0.1.10:18515|fe80::10|1',
 	'pg_stat_cluster_ic reflects RDMA fields from [node.0]');
+
+is($node->safe_psql('postgres',
+		q{SELECT node_id::text
+		    FROM pg_cluster_nodes
+		   WHERE node_id = 1}),
+	'1',
+	'pgrac.conf accepts rdma_pkey/rdma_qkey partition metadata');
 
 
 # ----------

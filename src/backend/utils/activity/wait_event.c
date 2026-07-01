@@ -1220,7 +1220,7 @@ pgstat_get_wait_cluster_interconnect(WaitEventCluster w)
 		event_name = "ClusterICRdmaConnect";
 		break;
 	case WAIT_EVENT_INTERCONNECT_TCP_FALLBACK:
-		event_name = "InterconnectTcpFallback";
+		event_name = "ClusterICRdmaFallback";
 		break;
 	case WAIT_EVENT_INTERCONNECT_TIER_SWITCH:
 		event_name = "InterconnectTierSwitch";

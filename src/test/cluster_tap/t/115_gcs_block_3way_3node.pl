@@ -126,7 +126,7 @@ for my $i (0 .. 2)
 	is($node->safe_psql('postgres',
 			'SELECT count(*) FROM pg_stat_cluster_wait_events'),
 		'112',
-		"L4 node$i wait event count == 112 (spec-6.1 +2 RDMA wait events)");
+		"L4 node$i wait event count == 112 (spec-6.1 RDMA wait events)");
 
 	is($node->safe_psql('postgres',
 			q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),

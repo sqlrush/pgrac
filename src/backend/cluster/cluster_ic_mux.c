@@ -5,6 +5,13 @@
  *
  * Spec: spec-6.1-rdma-transport-stack.md
  *
+ * Portions Copyright (c) 2026, pgrac contributors
+ *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
+ * IDENTIFICATION
+ *	  src/backend/cluster/cluster_ic_mux.c
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -60,6 +67,17 @@ uint64
 cluster_ic_mux_fallback_count(void)
 {
 	return MuxFallbackCount;
+}
+
+bool
+cluster_ic_mux_peer_has_pending_outbound(int32 peer_id)
+{
+	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	if (MuxPeerTransport[peer_id] == CLUSTER_IC_PEER_TRANSPORT_RDMA)
+		return cluster_ic_rdma_pending_outbound(peer_id);
+	return cluster_ic_tier1_pending_outbound(peer_id);
 }
 
 static ClusterICPeerTransport

@@ -343,12 +343,14 @@ typedef enum BuiltinTrancheIds {
 	 * pin time — no in-place upgrade). */
 	LWTRANCHE_CLUSTER_UNDO_BUF,
 	/* PGRAC: spec-5.4 D1 — SQ sequence node-level instance cache region. */
-	LWTRANCHE_CLUSTER_SQ,
-	/* PGRAC: spec-5.7 D1 — HW relation-extend block-number authority region. */
-	LWTRANCHE_CLUSTER_HW,
+		LWTRANCHE_CLUSTER_SQ,
+		/* PGRAC: spec-5.7 D1 — HW relation-extend block-number authority region. */
+		LWTRANCHE_CLUSTER_HW,
+		/* PGRAC: spec-6.1 — RDMA transport observability shmem strings/state. */
+		LWTRANCHE_CLUSTER_IC_RDMA,
 #endif
-	LWTRANCHE_FIRST_USER_DEFINED
-} BuiltinTrancheIds;
+		LWTRANCHE_FIRST_USER_DEFINED
+	} BuiltinTrancheIds;
 
 /*
  * Prior to PostgreSQL 9.4, we used an enum type called LWLockId to refer

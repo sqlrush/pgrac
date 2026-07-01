@@ -67,7 +67,7 @@
 #define CLUSTER_NODE_HOSTNAME_LEN 64
 #define CLUSTER_NODE_ADDR_LEN 128
 #define CLUSTER_NODE_RDMA_ADDR_LEN 64
-#define CLUSTER_NODE_RDMA_GID_LEN 44
+#define CLUSTER_NODE_RDMA_GID_LEN 40
 #define CLUSTER_NODE_REGION_LEN 64
 #define CLUSTER_CONF_NAME_LEN 64
 
@@ -108,7 +108,9 @@ typedef struct ClusterNodeInfo {
 	char region[CLUSTER_NODE_REGION_LEN];
 	char rdma_addr[CLUSTER_NODE_RDMA_ADDR_LEN];
 	char rdma_gid[CLUSTER_NODE_RDMA_GID_LEN];
-	int32 rdma_port;
+	uint16 rdma_port;
+	uint16 rdma_pkey;
+	uint32 rdma_qkey;
 } ClusterNodeInfo;
 
 

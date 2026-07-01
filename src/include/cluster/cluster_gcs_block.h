@@ -863,9 +863,6 @@ StaticAssertDecl(GCS_BLOCK_DATA_SIZE == BLCKSZ,
 #include "cluster/cluster_pcm_lock.h" /* PcmLockMode for invalidate helper */
 extern bool cluster_bufmgr_probe_block_for_gcs(BufferTag tag);
 extern bool cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char *dst);
-extern bool cluster_bufmgr_borrow_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn,
-											   const char **out_block, void **out_release_arg);
-extern void cluster_bufmgr_release_borrowed_block_for_gcs(void *release_arg);
 /* PGRAC: spec-2.36 D4 (HC118 / HC123) — by-tag invalidate wrapper for
  * holder-side INVALIDATE handler.  XLogFlush+InvalidateBuffer. */
 extern bool cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode,

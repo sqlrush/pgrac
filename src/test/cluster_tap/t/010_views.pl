@@ -51,7 +51,7 @@ $node->start;
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
 	'112',
-	'pg_stat_cluster_wait_events returns 112 rows (spec-6.1 +2 RDMA wait events)');
+	'pg_stat_cluster_wait_events returns 112 rows (spec-6.1 RDMA wait events)');
 
 
 # ----------
@@ -91,10 +91,10 @@ for my $type (sort keys %expected)
 
 
 # ----------
-# Spot-check 5 event names exist.
+# Spot-check 6 event names exist.
 # ----------
 for my $name ('GesEnqueueAcquire', 'PcmBlockReadNS', 'SinvalInjectLocalQueue',
-              'InterconnectRdmaSend', 'AdgScnSyncWait')
+              'InterconnectRdmaSend', 'ClusterICRdmaFallback', 'AdgScnSyncWait')
 {
 	my $count = $node->safe_psql(
 		'postgres',

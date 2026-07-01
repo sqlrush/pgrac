@@ -234,7 +234,7 @@ compiled only with `--with-rdma`; without that build option, selecting
 | `stub` | **Active** — same-node ops are no-ops, cross-node ops raise `ERRCODE_FEATURE_NOT_SUPPORTED` |
 | `tier1` | **Active** — TCP transport carrying the LMON aux-process heartbeat between every pair of nodes declared in `pgrac.conf`.  Per-peer state is exposed via [`pg_cluster_ic_peers`](../reference/system-views.md#pg_cluster_ic_peers). |
 | `tier2` | **RDMA-capable** — binds the TCP/RDMA mux.  If RDMA is unavailable and `cluster.interconnect_rdma_fallback=auto`, peers use TCP fallback; with `fallback=off`, startup fails closed. |
-| `tier3` | **RDMA-capable optimized tier** — same mux contract as `tier2`, with provider selection prepared for optimized RDMA implementations. |
+| `tier3` | **Reserved** — intended for mlx5 direct-verbs optimization.  Spec-6.1 fails closed until that provider is implemented. |
 
 Switching tiers is controlled via the `cluster.interconnect_tier`
 GUC.  See [Configuration](../user-guide/configuration.md) for

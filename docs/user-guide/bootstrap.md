@@ -152,7 +152,8 @@ sure the interconnect ports are reachable.
 - **`tier1` carries the heartbeat path only**: the cross-node interconnect
   carries LMON heartbeat and membership today.  `tier2` / `tier3` select the
   RDMA-capable mux and require a `--with-rdma` build; otherwise startup fails
-  closed with `53R22`.  Cross-node GES / Cache Fusion / recovery remain
+  closed with `53R22`.  `tier3` is reserved in spec-6.1 and fails closed until
+  mlx5 direct verbs are implemented.  Cross-node GES / Cache Fusion / recovery remain
   separately staged.  See [Configuration](configuration.md) for the GUC
   reference.
 - **Bash only**: `pgrac-init` / `pgrac-start` are bash scripts;

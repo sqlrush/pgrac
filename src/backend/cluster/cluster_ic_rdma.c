@@ -5,6 +5,13 @@
  *
  * Spec: spec-6.1-rdma-transport-stack.md
  *
+ * Portions Copyright (c) 2026, pgrac contributors
+ *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
+ * IDENTIFICATION
+ *	  src/backend/cluster/cluster_ic_rdma.c
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -15,6 +22,7 @@
 #include "port/atomics.h"
 #include "port/pg_crc32c.h"
 #include "storage/bufmgr.h"
+#include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
@@ -40,6 +48,8 @@
 
 
 #define PGRAC_CLUSTER_IC_RDMA_MAGIC ((uint32)0x414D4452) /* "RDMA" LE */
+#define PGRAC_CLUSTER_IC_RDMA_PRIVATE_MAGIC ((uint32)0x52445056) /* "RDPR" LE */
+#define PGRAC_CLUSTER_IC_RDMA_PRIVATE_VERSION 1
 #define CLUSTER_IC_RDMA_PROVIDER_NAME_LEN 32
 #define CLUSTER_IC_RDMA_ERRCODE_LEN 6
 #define CLUSTER_IC_RDMA_ERRMSG_LEN 128
@@ -49,7 +59,7 @@
 #define CLUSTER_IC_RDMA_WR_TYPE_RECV UINT64CONST(0x5200000000000000)
 #define CLUSTER_IC_RDMA_WR_TYPE_MASK UINT64CONST(0xFF00000000000000)
 #define CLUSTER_IC_RDMA_WR_PEER_SHIFT 32
-#define CLUSTER_IC_RDMA_CM_PRIVATE_BYTES PGRAC_IC_HELLO_BYTES
+#define CLUSTER_IC_RDMA_CM_PRIVATE_BYTES sizeof(ClusterICRdmaPrivateData)
 
 typedef struct ClusterICRdmaPeerStats {
 	int32 node_id;
@@ -77,6 +87,7 @@ typedef struct ClusterICRdmaShmem {
 	pg_atomic_uint64 global_fallback_count;
 	pg_atomic_uint64 block_sge_send_count;
 	pg_atomic_uint64 block_sge_fallback_count;
+	LWLockPadded lock;
 	ClusterICRdmaPeerStats peers[CLUSTER_MAX_NODES];
 } ClusterICRdmaShmem;
 
@@ -127,22 +138,38 @@ typedef struct ClusterICRdmaPeer {
 	uint8 *recv_buf;
 	size_t recv_buf_len;
 	struct ibv_mr *recv_mr;
+	uint8 *block_scratch_buf;
+	size_t block_scratch_len;
+	struct ibv_mr *block_scratch_mr;
+	bool block_scratch_borrowed;
+	uint8 *queued_buf;
+	size_t queued_len;
+	size_t queued_buf_len;
 	ClusterICSgeReleaseCallback pending_release_cb[CLUSTER_IC_RDMA_MAX_SGE];
 	void *pending_release_arg[CLUSTER_IC_RDMA_MAX_SGE];
 	int pending_release_count;
 } ClusterICRdmaPeer;
 #endif
 
+typedef struct ClusterICRdmaPrivateData {
+	uint32 magic;
+	uint16 version;
+	uint16 rdma_port;
+	uint32 rdma_pkey;
+	uint32 rdma_qkey;
+	uint8 hello[PGRAC_IC_HELLO_BYTES];
+} ClusterICRdmaPrivateData;
+
 static const char *RdmaUnavailableReason = "RDMA data path has not been initialized";
 static ClusterICRdmaShmem *RdmaShmem = NULL;
 static ClusterICRdmaCtx RdmaCtx;
-static ClusterICMr RdmaSharedBuffersMr;
 static const ClusterICRdmaProvider *RdmaProvider = NULL;
 static ClusterICRdmaInboundFrame *RdmaInboundHead = NULL;
 static ClusterICRdmaInboundFrame *RdmaInboundTail = NULL;
 #ifdef HAVE_LIBIBVERBS
+static ClusterICMr RdmaSharedBuffersMr;
 static bool RdmaCtxOpen = false;
-static bool RdmaSharedBuffersRegistered = false;
+static bool RdmaForkInitialized = false;
 #endif
 #if defined(HAVE_LIBIBVERBS) && defined(HAVE_LIBRDMACM) && defined(HAVE_RDMA_RDMA_CMA_H)
 static struct rdma_event_channel *RdmaCmChannel = NULL;
@@ -154,6 +181,7 @@ static int rdma_provider_poll_cq(ClusterICRdmaCtx *ctx, ClusterICWc *out, int ma
 #if defined(HAVE_LIBIBVERBS) && defined(HAVE_LIBRDMACM) && defined(HAVE_RDMA_RDMA_CMA_H)
 static bool rdma_split_host_port(const char *addr, char *host, size_t host_len,
 								 char *port, size_t port_len);
+static void rdma_peer_fail_or_fallback(int32 peer_id, const char *reason);
 #endif
 
 
@@ -315,7 +343,7 @@ rdma_ctx_close(ClusterICRdmaCtx *ctx)
 		ctx->verbs = NULL;
 	}
 	RdmaCtxOpen = false;
-	RdmaSharedBuffersRegistered = false;
+	memset(&RdmaSharedBuffersMr, 0, sizeof(RdmaSharedBuffersMr));
 	cluster_ic_rdma_stats_note_mr_registered(false);
 }
 
@@ -330,6 +358,14 @@ rdma_ctx_open_first_device(ClusterICRdmaCtx *ctx)
 		return false;
 	if (RdmaCtxOpen)
 		return true;
+
+	if (!RdmaForkInitialized) {
+		if (ibv_fork_init() != 0) {
+			RdmaUnavailableReason = "ibv_fork_init failed";
+			return false;
+		}
+		RdmaForkInitialized = true;
+	}
 
 	devices = ibv_get_device_list(&ndev);
 	if (devices == NULL || ndev <= 0) {
@@ -395,8 +431,13 @@ rdma_register_shared_buffers(ClusterICRdmaCtx *ctx, ClusterICMr *out)
 		RdmaUnavailableReason = "shared_buffers memory is not initialized";
 		return false;
 	}
-	if (RdmaSharedBuffersRegistered)
+	if (ctx->shared_mr != NULL) {
+		out->base = BufferBlocks;
+		out->len = (size_t)NBuffers * (size_t)BLCKSZ;
+		out->lkey = ctx->shared_mr->lkey;
+		out->rkey = ctx->shared_mr->rkey;
 		return true;
+	}
 
 	len = (size_t)NBuffers * (size_t)BLCKSZ;
 	access = IBV_ACCESS_LOCAL_WRITE;
@@ -410,7 +451,6 @@ rdma_register_shared_buffers(ClusterICRdmaCtx *ctx, ClusterICMr *out)
 	out->len = len;
 	out->lkey = ctx->shared_mr->lkey;
 	out->rkey = ctx->shared_mr->rkey;
-	RdmaSharedBuffersRegistered = true;
 	cluster_ic_rdma_stats_note_mr_registered(true);
 	return true;
 }
@@ -436,14 +476,24 @@ rdma_cm_id_peer(struct rdma_cm_id *id)
 }
 
 static void
-rdma_build_private_hello(uint8 hello[PGRAC_IC_HELLO_BYTES])
+rdma_build_private_data(ClusterICRdmaPrivateData *private_data)
 {
 	const char *cluster_name = "";
+	const ClusterNodeInfo *self;
 
 	if (ClusterConfShmem != NULL)
 		cluster_name = ClusterConfShmem->cluster_name;
 
-	cluster_ic_build_hello(hello, PGRAC_IC_HELLO_VERSION_V1,
+	memset(private_data, 0, sizeof(*private_data));
+	private_data->magic = PGRAC_CLUSTER_IC_RDMA_PRIVATE_MAGIC;
+	private_data->version = PGRAC_CLUSTER_IC_RDMA_PRIVATE_VERSION;
+	self = cluster_conf_lookup_node(cluster_node_id);
+	if (self != NULL) {
+		private_data->rdma_port = (uint16)self->rdma_port;
+		private_data->rdma_pkey = self->rdma_pkey;
+		private_data->rdma_qkey = self->rdma_qkey;
+	}
+	cluster_ic_build_hello(private_data->hello, PGRAC_IC_HELLO_VERSION_V1,
 						   PGRAC_IC_ENVELOPE_VERSION_V1, cluster_node_id,
 						   cluster_name);
 }
@@ -452,17 +502,25 @@ static bool
 rdma_verify_private_hello(const void *data, uint8 len, int32 expected_peer,
 						  int32 *out_peer_id, const char **out_reason)
 {
+	const ClusterICRdmaPrivateData *private_data = (const ClusterICRdmaPrivateData *)data;
 	ClusterICHelloMsg msg;
 	const char *self_cluster_name;
+	const ClusterNodeInfo *peer_conf;
 
 	if (out_peer_id != NULL)
 		*out_peer_id = -1;
 	if (out_reason != NULL)
 		*out_reason = "RDMA HELLO missing";
 
-	if (data == NULL || len < PGRAC_IC_HELLO_BYTES)
+	if (data == NULL || len < sizeof(ClusterICRdmaPrivateData))
 		return false;
-	if (!cluster_ic_parse_hello((const uint8 *)data, &msg)) {
+	if (private_data->magic != PGRAC_CLUSTER_IC_RDMA_PRIVATE_MAGIC
+		|| private_data->version != PGRAC_CLUSTER_IC_RDMA_PRIVATE_VERSION) {
+		if (out_reason != NULL)
+			*out_reason = "RDMA private data version mismatch";
+		return false;
+	}
+	if (!cluster_ic_parse_hello(private_data->hello, &msg)) {
 		if (out_reason != NULL)
 			*out_reason = "RDMA HELLO bad magic";
 		return false;
@@ -491,6 +549,19 @@ rdma_verify_private_hello(const void *data, uint8 len, int32 expected_peer,
 			*out_reason = "RDMA HELLO peer id mismatch";
 		return false;
 	}
+	peer_conf = cluster_conf_lookup_node(msg.source_node_id);
+	if (peer_conf == NULL) {
+		if (out_reason != NULL)
+			*out_reason = "RDMA HELLO unknown peer config";
+		return false;
+	}
+	if (private_data->rdma_port != (uint16)peer_conf->rdma_port
+		|| private_data->rdma_pkey != peer_conf->rdma_pkey
+		|| private_data->rdma_qkey != peer_conf->rdma_qkey) {
+		if (out_reason != NULL)
+			*out_reason = "RDMA partition metadata mismatch";
+		return false;
+	}
 
 	if (out_peer_id != NULL)
 		*out_peer_id = msg.source_node_id;
@@ -513,6 +584,10 @@ rdma_peer_release_buffers(ClusterICRdmaPeer *peer)
 		(void)ibv_dereg_mr(peer->recv_mr);
 		peer->recv_mr = NULL;
 	}
+	if (peer->block_scratch_mr != NULL) {
+		(void)ibv_dereg_mr(peer->block_scratch_mr);
+		peer->block_scratch_mr = NULL;
+	}
 	if (peer->send_buf != NULL) {
 		pfree(peer->send_buf);
 		peer->send_buf = NULL;
@@ -522,6 +597,18 @@ rdma_peer_release_buffers(ClusterICRdmaPeer *peer)
 		pfree(peer->recv_buf);
 		peer->recv_buf = NULL;
 		peer->recv_buf_len = 0;
+	}
+	if (peer->block_scratch_buf != NULL) {
+		pfree(peer->block_scratch_buf);
+		peer->block_scratch_buf = NULL;
+		peer->block_scratch_len = 0;
+		peer->block_scratch_borrowed = false;
+	}
+	if (peer->queued_buf != NULL) {
+		pfree(peer->queued_buf);
+		peer->queued_buf = NULL;
+		peer->queued_buf_len = 0;
+		peer->queued_len = 0;
 	}
 }
 
@@ -564,6 +651,15 @@ rdma_peer_add_pending_release(ClusterICRdmaPeer *peer, ClusterICSgeReleaseCallba
 	return true;
 }
 
+static void
+rdma_peer_release_block_scratch(void *arg)
+{
+	ClusterICRdmaPeer *peer = (ClusterICRdmaPeer *)arg;
+
+	if (peer != NULL)
+		peer->block_scratch_borrowed = false;
+}
+
 static bool
 rdma_peer_ensure_buffers(ClusterICRdmaPeer *peer)
 {
@@ -571,16 +667,18 @@ rdma_peer_ensure_buffers(ClusterICRdmaPeer *peer)
 
 	if (peer == NULL || RdmaCtx.pd == NULL)
 		return false;
-	if (peer->send_buf != NULL && peer->recv_buf != NULL && peer->send_mr != NULL
-		&& peer->recv_mr != NULL)
+	if (peer->send_buf != NULL && peer->recv_buf != NULL && peer->block_scratch_buf != NULL
+		&& peer->send_mr != NULL && peer->recv_mr != NULL && peer->block_scratch_mr != NULL)
 		return true;
 
 	rdma_peer_release_buffers(peer);
 	oldctx = MemoryContextSwitchTo(TopMemoryContext);
 	peer->send_buf_len = CLUSTER_IC_RDMA_RECV_BUFFER_BYTES;
 	peer->recv_buf_len = CLUSTER_IC_RDMA_RECV_BUFFER_BYTES;
+	peer->block_scratch_len = BLCKSZ;
 	peer->send_buf = (uint8 *)palloc(peer->send_buf_len);
 	peer->recv_buf = (uint8 *)palloc(peer->recv_buf_len);
+	peer->block_scratch_buf = (uint8 *)palloc(peer->block_scratch_len);
 	MemoryContextSwitchTo(oldctx);
 
 	peer->send_mr = ibv_reg_mr(RdmaCtx.pd, peer->send_buf, peer->send_buf_len,
@@ -597,7 +695,80 @@ rdma_peer_ensure_buffers(ClusterICRdmaPeer *peer)
 		rdma_peer_release_buffers(peer);
 		return false;
 	}
+	peer->block_scratch_mr = ibv_reg_mr(RdmaCtx.pd, peer->block_scratch_buf,
+										peer->block_scratch_len,
+										IBV_ACCESS_LOCAL_WRITE);
+	if (peer->block_scratch_mr == NULL) {
+		RdmaUnavailableReason = "ibv_reg_mr(RDMA block scratch) failed";
+		rdma_peer_release_buffers(peer);
+		return false;
+	}
+	cluster_ic_rdma_stats_note_mr_registered(true);
 	return true;
+}
+
+static bool
+rdma_peer_queue_send(ClusterICRdmaPeer *peer, const void *buf, size_t len)
+{
+	MemoryContext oldctx;
+
+	if (peer == NULL || buf == NULL || len == 0 || len > CLUSTER_IC_RDMA_RECV_BUFFER_BYTES)
+		return false;
+	if (peer->queued_len > 0)
+		return false;
+	if (peer->queued_buf == NULL || peer->queued_buf_len < len) {
+		oldctx = MemoryContextSwitchTo(TopMemoryContext);
+		if (peer->queued_buf != NULL)
+			pfree(peer->queued_buf);
+		peer->queued_buf = (uint8 *)palloc(len);
+		peer->queued_buf_len = len;
+		MemoryContextSwitchTo(oldctx);
+	}
+	memcpy(peer->queued_buf, buf, len);
+	peer->queued_len = len;
+	return true;
+}
+
+static void
+rdma_peer_flush_queued_send(int32 peer_id)
+{
+	ClusterICRdmaPeer *peer;
+	ClusterICSge sge;
+	size_t len;
+	ClusterICSendResult rc;
+
+	if (!rdma_valid_peer_id(peer_id))
+		return;
+	peer = &RdmaPeers[peer_id];
+	if (!peer->connected || peer->send_busy || peer->queued_len == 0 || RdmaProvider == NULL)
+		return;
+	if (peer->queued_len > peer->send_buf_len || peer->send_mr == NULL || peer->qp.qp == NULL) {
+		peer->queued_len = 0;
+		rdma_peer_fail_or_fallback(peer_id, "RDMA queued send is no longer valid");
+		return;
+	}
+
+	len = peer->queued_len;
+	memcpy(peer->send_buf, peer->queued_buf, len);
+	peer->queued_len = 0;
+	memset(&sge, 0, sizeof(sge));
+	sge.addr = peer->send_buf;
+	sge.len = len;
+	sge.lkey = peer->send_mr->lkey;
+
+	pgstat_report_wait_start(WAIT_EVENT_INTERCONNECT_RDMA_SEND);
+	rc = RdmaProvider->post_send(&peer->qp, &sge, 1, true, 0);
+	pgstat_report_wait_end();
+	if (rc == CLUSTER_IC_SEND_DONE) {
+		peer->send_busy = true;
+		cluster_ic_rdma_stats_note_send(peer_id, len, true);
+	} else {
+		cluster_ic_rdma_stats_note_error(peer_id, "58R16",
+										 RdmaUnavailableReason != NULL
+											 ? RdmaUnavailableReason
+											 : "RDMA queued post_send failed");
+		rdma_peer_fail_or_fallback(peer_id, "RDMA queued post_send failed");
+	}
 }
 
 static void
@@ -650,6 +821,57 @@ rdma_peer_fail_or_fallback(int32 peer_id, const char *reason)
 
 	rdma_peer_close(peer_id, reason, true);
 }
+
+#ifdef HAVE_LIBIBVERBS
+static bool
+rdma_wc_status_is_peer_loss(int status)
+{
+	return status == IBV_WC_RNR_RETRY_EXC_ERR
+		|| status == IBV_WC_RETRY_EXC_ERR
+		|| status == IBV_WC_WR_FLUSH_ERR;
+}
+
+static bool
+rdma_wc_status_is_local_protection(int status)
+{
+	return status == IBV_WC_LOC_LEN_ERR
+		|| status == IBV_WC_LOC_QP_OP_ERR
+		|| status == IBV_WC_LOC_EEC_OP_ERR
+		|| status == IBV_WC_LOC_PROT_ERR
+		|| status == IBV_WC_MW_BIND_ERR
+		|| status == IBV_WC_BAD_RESP_ERR
+		|| status == IBV_WC_LOC_ACCESS_ERR;
+}
+
+static void
+rdma_handle_completion_error(int32 peer_id, uint64 wr_type, int status)
+{
+	char reason[96];
+
+#if defined(HAVE_LIBRDMACM) && defined(HAVE_RDMA_RDMA_CMA_H)
+	if (wr_type == CLUSTER_IC_RDMA_WR_TYPE_SEND)
+		rdma_peer_release_pending_send(&RdmaPeers[peer_id]);
+#endif
+
+	snprintf(reason, sizeof(reason), "RDMA completion error status %d", status);
+	if (rdma_wc_status_is_local_protection(status)) {
+		cluster_ic_rdma_stats_note_error(peer_id, "58R16", reason);
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_IC_RDMA_FABRIC_ERROR),
+				 errmsg("RDMA local protection completion error for peer %d", peer_id),
+				 errdetail("%s", reason)));
+	}
+
+	if (rdma_wc_status_is_peer_loss(status)) {
+		cluster_ic_rdma_stats_note_error(peer_id, "08R04", reason);
+		rdma_peer_fail_or_fallback(peer_id, reason);
+		return;
+	}
+
+	cluster_ic_rdma_stats_note_error(peer_id, "58R16", reason);
+	rdma_peer_fail_or_fallback(peer_id, reason);
+}
+#endif
 
 static bool
 rdma_create_cm_qp(ClusterICRdmaPeer *peer)
@@ -730,14 +952,14 @@ rdma_prepare_peer_for_connect(int32 peer_id, struct rdma_cm_id *id, bool active_
 }
 
 static bool
-rdma_conn_params(struct rdma_conn_param *param, uint8 hello[PGRAC_IC_HELLO_BYTES])
+rdma_conn_params(struct rdma_conn_param *param, ClusterICRdmaPrivateData *private_data)
 {
-	if (param == NULL || hello == NULL)
+	if (param == NULL || private_data == NULL)
 		return false;
 
 	memset(param, 0, sizeof(*param));
-	rdma_build_private_hello(hello);
-	param->private_data = hello;
+	rdma_build_private_data(private_data);
+	param->private_data = private_data;
 	param->private_data_len = CLUSTER_IC_RDMA_CM_PRIVATE_BYTES;
 	param->responder_resources = 1;
 	param->initiator_depth = 1;
@@ -930,27 +1152,6 @@ rdma_dispatch_pending_frames(void)
 	}
 }
 
-static bool
-rdma_sge_uses_shared_mr(const ClusterICSge *sge, uint32 *out_lkey)
-{
-	uintptr_t base;
-	uintptr_t end;
-	uintptr_t addr;
-	uintptr_t addr_end;
-
-	if (sge == NULL || sge->addr == NULL || sge->len == 0 || !RdmaSharedBuffersRegistered)
-		return false;
-	base = (uintptr_t)RdmaSharedBuffersMr.base;
-	end = base + RdmaSharedBuffersMr.len;
-	addr = (uintptr_t)sge->addr;
-	addr_end = addr + sge->len;
-	if (addr < base || addr_end < addr || addr_end > end)
-		return false;
-	if (out_lkey != NULL)
-		*out_lkey = RdmaSharedBuffersMr.lkey;
-	return true;
-}
-
 static ClusterICSendResult
 rdma_peer_post_sge(int32 peer_id, const ClusterICEnvelope *env,
 				   const ClusterICSge *payload_sge, int n_sge, uint32 payload_len)
@@ -986,8 +1187,6 @@ rdma_peer_post_sge(int32 peer_id, const ClusterICEnvelope *env,
 
 	scratch = peer->send_buf + sizeof(*env);
 	for (i = 0; i < n_sge; i++) {
-		uint32 lkey = 0;
-
 		if (payload_sge[i].len == 0)
 			continue;
 		if (payload_sge[i].release_cb != NULL) {
@@ -1009,12 +1208,10 @@ rdma_peer_post_sge(int32 peer_id, const ClusterICEnvelope *env,
 				release_count++;
 			}
 		}
-		if (payload_sge[i].lkey != 0 || rdma_sge_uses_shared_mr(&payload_sge[i], &lkey)) {
+		if (payload_sge[i].lkey != 0) {
 			if (send_sge_count >= lengthof(send_sge))
 				return CLUSTER_IC_SEND_HARD_ERROR;
 			send_sge[send_sge_count] = payload_sge[i];
-			if (send_sge[send_sge_count].lkey == 0)
-				send_sge[send_sge_count].lkey = lkey;
 			send_sge_count++;
 			saw_registered_payload = true;
 			continue;
@@ -1054,10 +1251,11 @@ rdma_peer_post_sge(int32 peer_id, const ClusterICEnvelope *env,
 
 		rdma_peer_release_pending_send(peer);
 		for (j = 0; j < release_count; j++) {
-			if (!rdma_peer_add_pending_release(peer, release_cb[j], release_arg[j])) {
-				if (release_cb[j] != NULL)
-					release_cb[j](release_arg[j]);
-			}
+			if (!rdma_peer_add_pending_release(peer, release_cb[j], release_arg[j]))
+				ereport(FATAL,
+						(errcode(ERRCODE_CLUSTER_IC_RDMA_FABRIC_ERROR),
+						 errmsg("RDMA SEND posted but release callback table is full"),
+						 errdetail("peer_id=%d, release_count=%d", peer_id, release_count)));
 		}
 		peer->send_busy = true;
 		cluster_ic_rdma_stats_note_send(peer_id, sizeof(*env) + payload_len, true);
@@ -1082,10 +1280,15 @@ rdma_peer_send_bytes(int32 peer_id, const void *buf, size_t len)
 	peer = &RdmaPeers[peer_id];
 	if (!peer->connected || peer->send_mr == NULL || peer->qp.qp == NULL)
 		return CLUSTER_IC_SEND_HARD_ERROR;
-	if (peer->send_busy)
-		return CLUSTER_IC_SEND_WOULD_BLOCK;
 	if (len > peer->send_buf_len)
 		return CLUSTER_IC_SEND_HARD_ERROR;
+	if (peer->send_busy) {
+		if (rdma_peer_queue_send(peer, buf, len))
+			return CLUSTER_IC_SEND_WOULD_BLOCK;
+		cluster_ic_rdma_stats_note_error(peer_id, "58R16",
+										 "RDMA outbound queue is full");
+		return CLUSTER_IC_SEND_HARD_ERROR;
+	}
 
 	memcpy(peer->send_buf, buf, len);
 	memset(&sge, 0, sizeof(sge));
@@ -1130,6 +1333,7 @@ cluster_ic_rdma_shmem_init(void)
 		RdmaShmem->magic = PGRAC_CLUSTER_IC_RDMA_MAGIC;
 		RdmaShmem->provider = cluster_interconnect_rdma_provider;
 		RdmaShmem->completion = cluster_interconnect_rdma_completion;
+		LWLockInitialize(&RdmaShmem->lock.lock, LWTRANCHE_CLUSTER_IC_RDMA);
 		pg_atomic_init_u32(&RdmaShmem->mr_registered, 0);
 		pg_atomic_init_u64(&RdmaShmem->global_fallback_count, 0);
 		pg_atomic_init_u64(&RdmaShmem->block_sge_send_count, 0);
@@ -1157,7 +1361,7 @@ static const ClusterShmemRegion cluster_ic_rdma_region = {
 	.name = "pgrac cluster_ic_rdma",
 	.size_fn = cluster_ic_rdma_shmem_size,
 	.init_fn = cluster_ic_rdma_shmem_init,
-	.lwlock_count = 0,
+	.lwlock_count = 1,
 	.owner_subsys = "cluster_ic_rdma",
 	.reserved_flags = 0,
 };
@@ -1176,7 +1380,7 @@ cluster_ic_rdma_runtime_available(const char **reason)
 	struct ibv_device **devices;
 	int ndev = 0;
 
-	if (RdmaCtxOpen && RdmaSharedBuffersRegistered) {
+	if (RdmaCtxOpen) {
 		if (reason != NULL)
 			*reason = NULL;
 		return true;
@@ -1186,9 +1390,8 @@ cluster_ic_rdma_runtime_available(const char **reason)
 	if (devices != NULL && ndev > 0) {
 		ibv_free_device_list(devices);
 		if (reason != NULL)
-			*reason = RdmaUnavailableReason != NULL ? RdmaUnavailableReason
-													: "RDMA HCA detected, but the RDMA data path is not active";
-		return false;
+			*reason = NULL;
+		return true;
 	}
 
 	if (devices != NULL)
@@ -1229,9 +1432,11 @@ cluster_ic_rdma_stats_note_transport(int32 peer_id, ClusterICPeerTransport trans
 
 	if (p == NULL)
 		return;
+	LWLockAcquire(&RdmaShmem->lock.lock, LW_EXCLUSIVE);
 	p->transport = (int32)transport;
 	p->state = (int32)state;
 	strlcpy(p->provider, rdma_provider_name_from_guc(), sizeof(p->provider));
+	LWLockRelease(&RdmaShmem->lock.lock);
 }
 
 void
@@ -1246,12 +1451,14 @@ cluster_ic_rdma_stats_note_fallback(int32 peer_id, const char *reason)
 	if (p == NULL)
 		return;
 
+	LWLockAcquire(&RdmaShmem->lock.lock, LW_EXCLUSIVE);
 	p->transport = CLUSTER_IC_PEER_TRANSPORT_TCP;
 	p->state = CLUSTER_IC_RDMA_PEER_FALLBACK_TCP;
 	pg_atomic_fetch_add_u64(&p->fallback_count, 1);
 	strlcpy(p->provider, rdma_provider_name_from_guc(), sizeof(p->provider));
 	if (reason != NULL)
 		strlcpy(p->last_error, reason, sizeof(p->last_error));
+	LWLockRelease(&RdmaShmem->lock.lock);
 }
 
 void
@@ -1261,7 +1468,9 @@ cluster_ic_rdma_stats_note_send(int32 peer_id, uint64 bytes, bool rdma)
 
 	if (p == NULL)
 		return;
+	LWLockAcquire(&RdmaShmem->lock.lock, LW_EXCLUSIVE);
 	p->transport = rdma ? CLUSTER_IC_PEER_TRANSPORT_RDMA : CLUSTER_IC_PEER_TRANSPORT_TCP;
+	LWLockRelease(&RdmaShmem->lock.lock);
 	pg_atomic_fetch_add_u64(&p->send_count, 1);
 	pg_atomic_fetch_add_u64(&p->bytes_send, bytes);
 }
@@ -1273,7 +1482,9 @@ cluster_ic_rdma_stats_note_recv(int32 peer_id, uint64 bytes, bool rdma)
 
 	if (p == NULL)
 		return;
+	LWLockAcquire(&RdmaShmem->lock.lock, LW_EXCLUSIVE);
 	p->transport = rdma ? CLUSTER_IC_PEER_TRANSPORT_RDMA : CLUSTER_IC_PEER_TRANSPORT_TCP;
+	LWLockRelease(&RdmaShmem->lock.lock);
 	pg_atomic_fetch_add_u64(&p->recv_count, 1);
 	pg_atomic_fetch_add_u64(&p->bytes_recv, bytes);
 }
@@ -1285,11 +1496,13 @@ cluster_ic_rdma_stats_note_error(int32 peer_id, const char *sqlstate, const char
 
 	if (p == NULL)
 		return;
+	LWLockAcquire(&RdmaShmem->lock.lock, LW_EXCLUSIVE);
 	p->state = CLUSTER_IC_RDMA_PEER_ERROR;
 	if (sqlstate != NULL)
 		strlcpy(p->last_error_code, sqlstate, sizeof(p->last_error_code));
 	if (message != NULL)
 		strlcpy(p->last_error, message, sizeof(p->last_error));
+	LWLockRelease(&RdmaShmem->lock.lock);
 }
 
 void
@@ -1299,7 +1512,9 @@ cluster_ic_rdma_stats_note_cq_depth(int32 peer_id, int32 depth)
 
 	if (p == NULL)
 		return;
+	LWLockAcquire(&RdmaShmem->lock.lock, LW_EXCLUSIVE);
 	p->cq_depth = depth < 0 ? 0 : depth;
+	LWLockRelease(&RdmaShmem->lock.lock);
 }
 
 void
@@ -1314,15 +1529,70 @@ bool
 cluster_ic_rdma_block_sge_supported(const char **reason)
 {
 #if defined(HAVE_LIBIBVERBS) && defined(HAVE_LIBRDMACM) && defined(HAVE_RDMA_RDMA_CMA_H)
-	if (RdmaCtxOpen && RdmaSharedBuffersRegistered && RdmaProvider != NULL) {
+	if (RdmaCtxOpen && RdmaProvider != NULL) {
 		if (reason != NULL)
 			*reason = NULL;
 		return true;
 	}
 #endif
 	if (reason != NULL)
-		*reason = "RDMA SEND-with-SGE block path is not active; using envelope-safe TCP path";
+		*reason = "RDMA SEND-with-SGE scratch path is not active; using envelope-safe TCP path";
 	return false;
+}
+
+bool
+cluster_ic_rdma_borrow_block_scratch(int32 peer_id, size_t len,
+									 void **out_addr, uint32 *out_lkey,
+									 ClusterICSgeReleaseCallback *out_release_cb,
+									 void **out_release_arg)
+{
+#if defined(HAVE_LIBIBVERBS) && defined(HAVE_LIBRDMACM) && defined(HAVE_RDMA_RDMA_CMA_H)
+	ClusterICRdmaPeer *peer;
+
+	if (out_addr != NULL)
+		*out_addr = NULL;
+	if (out_lkey != NULL)
+		*out_lkey = 0;
+	if (out_release_cb != NULL)
+		*out_release_cb = NULL;
+	if (out_release_arg != NULL)
+		*out_release_arg = NULL;
+
+	if (!rdma_valid_peer_id(peer_id) || len == 0)
+		return false;
+	peer = &RdmaPeers[peer_id];
+	if (!peer->connected || peer->block_scratch_buf == NULL || peer->block_scratch_mr == NULL
+		|| len > peer->block_scratch_len || peer->block_scratch_borrowed)
+		return false;
+
+	peer->block_scratch_borrowed = true;
+	if (out_addr != NULL)
+		*out_addr = peer->block_scratch_buf;
+	if (out_lkey != NULL)
+		*out_lkey = peer->block_scratch_mr->lkey;
+	if (out_release_cb != NULL)
+		*out_release_cb = rdma_peer_release_block_scratch;
+	if (out_release_arg != NULL)
+		*out_release_arg = peer;
+	return true;
+#else
+	return false;
+#endif
+}
+
+bool
+cluster_ic_rdma_pending_outbound(int32 peer_id)
+{
+#if defined(HAVE_LIBIBVERBS) && defined(HAVE_LIBRDMACM) && defined(HAVE_RDMA_RDMA_CMA_H)
+	ClusterICRdmaPeer *peer;
+
+	if (!rdma_valid_peer_id(peer_id))
+		return false;
+	peer = &RdmaPeers[peer_id];
+	return peer->send_busy || peer->queued_len > 0;
+#else
+	return false;
+#endif
 }
 
 static uint32
@@ -1435,7 +1705,9 @@ rdma_send_envelope_sge_fallback(const ClusterICEnvelope *env, int32 dest_node_id
 	 * would re-enter the mux and route back to RDMA for a peer that is still
 	 * marked RDMA-connected.
 	 */
+	pgstat_report_wait_start(WAIT_EVENT_INTERCONNECT_TCP_FALLBACK);
 	rc = ClusterICOps_Tier1.send_bytes(dest_node_id, frame, sizeof(*env) + payload_len);
+	pgstat_report_wait_end();
 	if (rc == CLUSTER_IC_SEND_DONE)
 		cluster_ic_rdma_stats_note_send(dest_node_id, sizeof(*env) + payload_len, false);
 	else if (rc == CLUSTER_IC_SEND_HARD_ERROR)
@@ -1580,6 +1852,9 @@ static void
 rdma_lmon_report_start_failure(const char *reason)
 {
 	RdmaUnavailableReason = reason;
+	rdma_cm_close();
+	if (RdmaProvider != NULL)
+		RdmaProvider->device_close(&RdmaCtx);
 	cluster_ic_rdma_stats_note_error(cluster_node_id, "58R16", reason);
 	if (cluster_interconnect_rdma_fallback == CLUSTER_IC_RDMA_FALLBACK_OFF)
 		ereport(FATAL,
@@ -1625,8 +1900,35 @@ cluster_ic_rdma_lmon_start(void)
 	struct addrinfo *res = NULL;
 	int gai_rc;
 
-	if (!RdmaCtxOpen)
+	if (!IsUnderPostmaster || MyBackendType != B_LMON)
+		ereport(FATAL,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("RDMA transport must be opened only by LMON")));
+
+	if (RdmaProvider == NULL)
+		RdmaProvider = rdma_select_provider();
+	if (!RdmaCtxOpen && !RdmaProvider->device_open(&RdmaCtx)) {
+		rdma_lmon_report_start_failure(RdmaUnavailableReason != NULL
+										? RdmaUnavailableReason
+										: "RDMA device open failed");
 		return;
+	}
+	if (RdmaCtx.shared_mr == NULL
+		&& !RdmaProvider->reg_region(&RdmaCtx, BufferBlocks,
+									 (size_t)NBuffers * (size_t)BLCKSZ,
+									 &RdmaSharedBuffersMr)) {
+		const char *reason = RdmaUnavailableReason != NULL
+			? RdmaUnavailableReason
+			: "shared_buffers MR registration failed";
+
+		cluster_ic_rdma_stats_note_error(cluster_node_id, "58R16", reason);
+		rdma_cm_close();
+		RdmaProvider->device_close(&RdmaCtx);
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_IC_RDMA_FABRIC_ERROR),
+				 errmsg("RDMA shared_buffers memory registration failed"),
+				 errdetail("%s", reason)));
+	}
 	if (RdmaCmChannel != NULL)
 		return;
 
@@ -1686,6 +1988,8 @@ cluster_ic_rdma_lmon_stop(void)
 {
 #if defined(HAVE_LIBIBVERBS) && defined(HAVE_LIBRDMACM) && defined(HAVE_RDMA_RDMA_CMA_H)
 	rdma_cm_close();
+	if (RdmaProvider != NULL)
+		RdmaProvider->device_close(&RdmaCtx);
 #endif
 }
 
@@ -1697,7 +2001,7 @@ cluster_ic_rdma_lmon_handle_cm_events(void)
 	enum rdma_cm_event_type event_type;
 	struct rdma_cm_id *id;
 	struct rdma_conn_param conn_param;
-	uint8 hello[PGRAC_IC_HELLO_BYTES];
+	ClusterICRdmaPrivateData private_reply;
 	const void *private_data = NULL;
 	uint8 private_data_len = 0;
 	int32 peer_id = -1;
@@ -1752,7 +2056,7 @@ cluster_ic_rdma_lmon_handle_cm_events(void)
 																	 : "RDMA accept preparation failed");
 			return;
 		}
-		if (!rdma_conn_params(&conn_param, hello) || rdma_accept(id, &conn_param) != 0) {
+		if (!rdma_conn_params(&conn_param, &private_reply) || rdma_accept(id, &conn_param) != 0) {
 			rdma_ack_cm_event(event);
 			rdma_peer_fail_or_fallback(peer_id, "rdma_accept failed");
 			return;
@@ -1787,7 +2091,7 @@ cluster_ic_rdma_lmon_handle_cm_events(void)
 											 "RDMA route-resolved event lacked peer context");
 			return;
 		}
-		if (!rdma_conn_params(&conn_param, hello) || rdma_connect(id, &conn_param) != 0) {
+		if (!rdma_conn_params(&conn_param, &private_reply) || rdma_connect(id, &conn_param) != 0) {
 			rdma_ack_cm_event(event);
 			rdma_peer_fail_or_fallback(peer_id, "rdma_connect failed");
 			return;
@@ -1870,34 +2174,33 @@ cluster_ic_rdma_lmon_handle_completion_events(void)
 	n = rdma_provider_poll_cq(&RdmaCtx, wc, lengthof(wc));
 	if (n > 0)
 		cluster_ic_rdma_stats_note_cq_depth(cluster_node_id, n);
-	for (i = 0; i < n; i++) {
-		int32 peer_id = rdma_wr_peer(wc[i].wc.wr_id);
-		uint64 wr_type = wc[i].wc.wr_id & CLUSTER_IC_RDMA_WR_TYPE_MASK;
+		for (i = 0; i < n; i++) {
+			int32 peer_id = rdma_wr_peer(wc[i].wc.wr_id);
+			uint64 wr_type = wc[i].wc.wr_id & CLUSTER_IC_RDMA_WR_TYPE_MASK;
 
-		if (!rdma_valid_peer_id(peer_id)) {
-			cluster_ic_rdma_stats_note_error(cluster_node_id, "58R16",
-											 "RDMA completion had invalid peer id");
-			continue;
-		}
-		if (wc[i].status != IBV_WC_SUCCESS) {
+			if (!rdma_valid_peer_id(peer_id)) {
+				cluster_ic_rdma_stats_note_error(cluster_node_id, "58R16",
+												 "RDMA completion had invalid peer id");
+				continue;
+			}
+			if (wc[i].status != IBV_WC_SUCCESS) {
+				rdma_handle_completion_error(peer_id, wr_type, wc[i].status);
+				continue;
+			}
+			if (wr_type == CLUSTER_IC_RDMA_WR_TYPE_SEND) {
 #if defined(HAVE_LIBRDMACM) && defined(HAVE_RDMA_RDMA_CMA_H)
-			if (wr_type == CLUSTER_IC_RDMA_WR_TYPE_SEND)
 				rdma_peer_release_pending_send(&RdmaPeers[peer_id]);
+				RdmaPeers[peer_id].send_busy = false;
+				rdma_peer_flush_queued_send(peer_id);
 #endif
-			rdma_peer_fail_or_fallback(peer_id, "RDMA completion returned error status");
-			continue;
-		}
-		if (wr_type == CLUSTER_IC_RDMA_WR_TYPE_SEND) {
+			} else if (wr_type == CLUSTER_IC_RDMA_WR_TYPE_RECV) {
 #if defined(HAVE_LIBRDMACM) && defined(HAVE_RDMA_RDMA_CMA_H)
-			rdma_peer_release_pending_send(&RdmaPeers[peer_id]);
-			RdmaPeers[peer_id].send_busy = false;
+				pgstat_report_wait_start(WAIT_EVENT_INTERCONNECT_RDMA_RECV);
+				rdma_process_recv_completion(&RdmaPeers[peer_id], wc[i].wc.byte_len);
+				pgstat_report_wait_end();
 #endif
-		} else if (wr_type == CLUSTER_IC_RDMA_WR_TYPE_RECV) {
-#if defined(HAVE_LIBRDMACM) && defined(HAVE_RDMA_RDMA_CMA_H)
-			rdma_process_recv_completion(&RdmaPeers[peer_id], wc[i].wc.byte_len);
-#endif
+			}
 		}
-	}
 #if defined(HAVE_LIBRDMACM) && defined(HAVE_RDMA_RDMA_CMA_H)
 	rdma_dispatch_pending_frames();
 #endif
@@ -2146,8 +2449,30 @@ rdma_select_provider(void)
 static void
 rdma_tier_init(void)
 {
-	const char *reason = NULL;
 	int i;
+
+	if ((ClusterICTier)cluster_interconnect_tier == CLUSTER_IC_TIER_3
+		|| (ClusterICRdmaProviderId)cluster_interconnect_rdma_provider
+		   == CLUSTER_IC_RDMA_PROVIDER_MLX5)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("tier3/mlx5 RDMA direct verbs are not implemented in spec-6.1"),
+				 errhint("Use cluster.interconnect_tier=tier2 and "
+						 "cluster.interconnect_rdma_provider=verbs until the mlx5dv path lands.")));
+
+	if ((ClusterICRdmaCompletionModel)cluster_interconnect_rdma_completion
+		== CLUSTER_IC_RDMA_COMPLETION_BUSYPOLL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("RDMA busy-poll completion mode is not implemented in spec-6.1"),
+				 errhint("Use cluster.interconnect_rdma_completion=event.")));
+
+	if (cluster_interconnect_rdma_crc_offload)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("RDMA CRC offload is not implemented in spec-6.1"),
+				 errhint("Leave cluster.interconnect_rdma_crc_offload=off; "
+						 "block shipping always uses application CRC32C.")));
 
 #if defined(HAVE_LIBIBVERBS) && defined(HAVE_LIBRDMACM) && defined(HAVE_RDMA_RDMA_CMA_H)
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
@@ -2167,33 +2492,6 @@ rdma_tier_init(void)
 	}
 
 	RdmaProvider = rdma_select_provider();
-	if (!RdmaProvider->device_open(&RdmaCtx)
-		|| !RdmaProvider->reg_region(&RdmaCtx, BufferBlocks,
-									  BufferBlocks != NULL ? (size_t)NBuffers * (size_t)BLCKSZ : 0,
-									  &RdmaSharedBuffersMr)) {
-		(void)cluster_ic_rdma_runtime_available(&reason);
-		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
-			if (cluster_conf_lookup_node(i) == NULL || i == cluster_node_id)
-				continue;
-			cluster_ic_rdma_stats_note_fallback(i, reason);
-		}
-
-		if (cluster_interconnect_rdma_fallback == CLUSTER_IC_RDMA_FALLBACK_OFF) {
-			cluster_ic_rdma_stats_note_error(cluster_node_id, "53R22",
-											 reason != NULL ? reason
-															: "unknown RDMA availability failure");
-			ereport(FATAL,
-					(errcode(ERRCODE_CLUSTER_IC_RDMA_UNAVAILABLE),
-					 errmsg("RDMA interconnect requested but unavailable"),
-					 errdetail("%s", reason != NULL ? reason : "unknown RDMA availability failure"),
-					 errhint("Build with --with-rdma and configure an RDMA-capable device, or set "
-							 "cluster.interconnect_rdma_fallback=auto.")));
-		}
-
-		ereport(LOG,
-				(errmsg("RDMA interconnect unavailable; falling back to TCP"),
-				 errdetail("%s", reason != NULL ? reason : "unknown RDMA availability failure")));
-	}
 }
 
 static void
@@ -2230,7 +2528,9 @@ rdma_send_bytes(int32 target_node_id, const void *buf, size_t len)
 		return CLUSTER_IC_SEND_HARD_ERROR;
 	}
 
+	pgstat_report_wait_start(WAIT_EVENT_INTERCONNECT_TCP_FALLBACK);
 	rc = ClusterICOps_Tier1.send_bytes(target_node_id, buf, len);
+	pgstat_report_wait_end();
 	if (rc == CLUSTER_IC_SEND_DONE)
 		cluster_ic_rdma_stats_note_send(target_node_id, (uint64)len, false);
 	else if (rc == CLUSTER_IC_SEND_HARD_ERROR)
@@ -2244,6 +2544,13 @@ rdma_recv_bytes(int32 *out_sender_node_id, void *buf, size_t bufsize,
 {
 	bool ok;
 
+	ok = cluster_ic_rdma_drain_recv(out_sender_node_id, buf, bufsize, out_received_len);
+	if (ok) {
+		if (out_sender_node_id != NULL && out_received_len != NULL && *out_received_len > 0)
+			cluster_ic_rdma_stats_note_recv(*out_sender_node_id, (uint64)*out_received_len, true);
+		return true;
+	}
+
 	ok = ClusterICOps_Tier1.recv_bytes(out_sender_node_id, buf, bufsize, out_received_len);
 	if (ok && out_sender_node_id != NULL && out_received_len != NULL && *out_received_len > 0)
 		cluster_ic_rdma_stats_note_recv(*out_sender_node_id, (uint64)*out_received_len, false);
@@ -2253,6 +2560,8 @@ rdma_recv_bytes(int32 *out_sender_node_id, void *buf, size_t bufsize,
 static bool
 rdma_peek_sender(int32 *out_sender_node_id)
 {
+	if (cluster_ic_rdma_peek_sender(out_sender_node_id))
+		return true;
 	return ClusterICOps_Tier1.peek_sender(out_sender_node_id);
 }
 
@@ -2295,26 +2604,39 @@ cluster_get_ic_rdma_peers(PG_FUNCTION_ARGS)
 			block_sge_fallback_count = pg_atomic_read_u64(&RdmaShmem->block_sge_fallback_count);
 		}
 
-		for (i = 0; i < ClusterConfShmem->node_count; i++) {
-			const ClusterNodeInfo *n = &ClusterConfShmem->nodes[i];
-			ClusterICRdmaPeerStats *p = rdma_peer_stats(n->node_id);
-			ClusterICPeerTransport transport = CLUSTER_IC_PEER_TRANSPORT_TCP;
-			ClusterICRdmaPeerState state = CLUSTER_IC_RDMA_PEER_DISABLED;
-			const char *provider = rdma_provider_name_from_guc();
-			Datum values[20];
-			bool nulls[20] = { false };
+			for (i = 0; i < ClusterConfShmem->node_count; i++) {
+				const ClusterNodeInfo *n = &ClusterConfShmem->nodes[i];
+				ClusterICRdmaPeerStats *p = rdma_peer_stats(n->node_id);
+				ClusterICPeerTransport transport = CLUSTER_IC_PEER_TRANSPORT_TCP;
+				ClusterICRdmaPeerState state = CLUSTER_IC_RDMA_PEER_DISABLED;
+				char provider_buf[CLUSTER_IC_RDMA_PROVIDER_NAME_LEN];
+				char last_error_code_buf[CLUSTER_IC_RDMA_ERRCODE_LEN];
+				char last_error_buf[CLUSTER_IC_RDMA_ERRMSG_LEN];
+				int32 cq_depth = 0;
+				Datum values[20];
+				bool nulls[20] = { false };
 
-			if (p != NULL) {
-				transport = (ClusterICPeerTransport)p->transport;
-				state = (ClusterICRdmaPeerState)p->state;
-				if (p->provider[0] != '\0')
-					provider = p->provider;
-			}
+				strlcpy(provider_buf, rdma_provider_name_from_guc(), sizeof(provider_buf));
+				last_error_code_buf[0] = '\0';
+				last_error_buf[0] = '\0';
+				if (p != NULL) {
+					LWLockAcquire(&RdmaShmem->lock.lock, LW_SHARED);
+					transport = (ClusterICPeerTransport)p->transport;
+					state = (ClusterICRdmaPeerState)p->state;
+					cq_depth = p->cq_depth;
+					if (p->provider[0] != '\0')
+						strlcpy(provider_buf, p->provider, sizeof(provider_buf));
+					if (p->last_error_code[0] != '\0')
+						strlcpy(last_error_code_buf, p->last_error_code, sizeof(last_error_code_buf));
+					if (p->last_error[0] != '\0')
+						strlcpy(last_error_buf, p->last_error, sizeof(last_error_buf));
+					LWLockRelease(&RdmaShmem->lock.lock);
+				}
 
-			values[0] = Int32GetDatum(n->node_id);
-			values[1] = CStringGetTextDatum(cluster_ic_peer_transport_name(transport));
-			values[2] = CStringGetTextDatum(cluster_ic_rdma_peer_state_name(state));
-			values[3] = CStringGetTextDatum(provider);
+				values[0] = Int32GetDatum(n->node_id);
+				values[1] = CStringGetTextDatum(cluster_ic_peer_transport_name(transport));
+				values[2] = CStringGetTextDatum(cluster_ic_rdma_peer_state_name(state));
+				values[3] = CStringGetTextDatum(provider_buf);
 
 			if (n->rdma_addr[0] == '\0')
 				nulls[4] = true;
@@ -2328,7 +2650,7 @@ cluster_get_ic_rdma_peers(PG_FUNCTION_ARGS)
 
 			values[6] = Int32GetDatum(n->rdma_port);
 			values[7] = BoolGetDatum(mr_registered);
-			values[8] = Int32GetDatum(p != NULL ? p->cq_depth : 0);
+				values[8] = Int32GetDatum(cq_depth);
 			values[9] = Int64GetDatum(p != NULL ? (int64)pg_atomic_read_u64(&p->fallback_count)
 												 : 0);
 			values[10] = Int64GetDatum(p != NULL ? (int64)pg_atomic_read_u64(&p->send_count) : 0);
@@ -2342,15 +2664,15 @@ cluster_get_ic_rdma_peers(PG_FUNCTION_ARGS)
 			values[17] = Int64GetDatum(p != NULL ? (int64)pg_atomic_read_u64(&p->latency_sample_count)
 												  : 0);
 
-			if (p == NULL || p->last_error_code[0] == '\0')
-				nulls[18] = true;
-			else
-				values[18] = CStringGetTextDatum(p->last_error_code);
+				if (last_error_code_buf[0] == '\0')
+					nulls[18] = true;
+				else
+					values[18] = CStringGetTextDatum(last_error_code_buf);
 
-			if (p == NULL || p->last_error[0] == '\0')
-				nulls[19] = true;
-			else
-				values[19] = CStringGetTextDatum(p->last_error);
+				if (last_error_buf[0] == '\0')
+					nulls[19] = true;
+				else
+					values[19] = CStringGetTextDatum(last_error_buf);
 
 			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 		}

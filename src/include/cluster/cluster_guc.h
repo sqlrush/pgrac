@@ -95,7 +95,8 @@ extern int cluster_node_id;
  *	            target!=self ereports ERRCODE_FEATURE_NOT_SUPPORTED.
  *	1 (tier1) = TCP.
  *	2 (tier2) = RDMA baseline through the transport mux.
- *	3 (tier3) = RDMA optimized through the transport mux.
+ *	3 (tier3) = reserved RDMA optimized tier; fails closed until the
+ *	            mlx5 direct-verbs provider is implemented.
  *
  *	context: PGC_POSTMASTER (tier change requires reinitialising the
  *	         interconnect stack; runtime SET is rejected).

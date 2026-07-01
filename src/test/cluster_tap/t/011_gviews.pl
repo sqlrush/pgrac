@@ -58,12 +58,12 @@ my $node_id = $node->safe_psql('postgres', 'SHOW cluster.node_id');
 
 
 # ----------
-# Total row count: 1 node x 112 events (spec-6.1 +2 RDMA wait events).
+# Total row count: 1 node x 112 events (spec-6.1 RDMA wait events).
 # ----------
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_gcluster_wait_events'),
 	'112',
-	'pg_stat_gcluster_wait_events returns 112 rows (spec-6.1 +2 RDMA wait events)');
+	'pg_stat_gcluster_wait_events returns 112 rows (spec-6.1 RDMA wait events)');
 
 
 # ----------
@@ -129,10 +129,10 @@ is($node->safe_psql('postgres', q{
 
 
 # ----------
-# Spot-check 5 event names exist exactly once with the expected node_id.
+# Spot-check 6 event names exist exactly once with the expected node_id.
 # ----------
 for my $name ('GesEnqueueAcquire', 'PcmBlockReadNS', 'SinvalInjectLocalQueue',
-              'InterconnectRdmaSend', 'AdgScnSyncWait')
+              'InterconnectRdmaSend', 'ClusterICRdmaFallback', 'AdgScnSyncWait')
 {
 	my $count = $node->safe_psql(
 		'postgres',

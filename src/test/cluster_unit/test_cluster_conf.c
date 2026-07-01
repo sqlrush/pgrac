@@ -246,7 +246,7 @@ UT_TEST(test_node_info_alignment)
 UT_TEST(test_rdma_node_field_budgets)
 {
 	UT_ASSERT_EQ(CLUSTER_NODE_RDMA_ADDR_LEN, 64);
-	UT_ASSERT_EQ(CLUSTER_NODE_RDMA_GID_LEN, 44);
+	UT_ASSERT_EQ(CLUSTER_NODE_RDMA_GID_LEN, 40);
 	UT_ASSERT(sizeof(ClusterConf) <= 65536);
 }
 
