@@ -53,6 +53,17 @@ fi
 PATH="$INSTALL/bin:$PATH"
 export PGHOST="$WORK"
 
+write_unavailable() {
+	local reason="$1"
+
+	cat > "$OUT" <<EOF
+{"status":"unavailable","reason":"$(json_escape "$reason")","install":"$(json_escape "$INSTALL")"}
+EOF
+	echo "storage I/O matrix unavailable: $reason" >&2
+	echo "results: $OUT"
+	exit 0
+}
+
 json_escape() {
 	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
@@ -65,7 +76,7 @@ bench_backend() {
 	local log="$WORK/log_$backend"
 	local tps
 
-	initdb -D "$pgdata" -A trust -N > /dev/null
+	initdb -D "$pgdata" -A trust -N > /dev/null || return 1
 	{
 		echo "port = $port"
 		echo "unix_socket_directories = '$WORK'"
@@ -84,17 +95,34 @@ bench_backend() {
 		fi
 	} >> "$pgdata/postgresql.conf"
 
-	pg_ctl -D "$pgdata" -l "$log" -w start > /dev/null
-	pgbench -p "$port" -i -s "$SCALE" postgres > /dev/null 2>&1
+	pg_ctl -D "$pgdata" -l "$log" -w start > /dev/null || return 1
+	if ! pgbench -p "$port" -i -s "$SCALE" postgres > /dev/null 2>&1; then
+		pg_ctl -D "$pgdata" -m fast -w stop > /dev/null || true
+		return 1
+	fi
 	tps=$(pgbench -p "$port" -c "$CLIENTS" -j "$JOBS" -T "$DURATION" postgres 2>/dev/null \
-		| awk '/tps =/ {print $3; exit}')
-	pg_ctl -D "$pgdata" -m fast -w stop > /dev/null
+		| awk '/tps =/ {print $3; exit}') || {
+		pg_ctl -D "$pgdata" -m fast -w stop > /dev/null || true
+		return 1
+	}
+	if [ -z "$tps" ]; then
+		pg_ctl -D "$pgdata" -m fast -w stop > /dev/null || true
+		return 1
+	fi
+	pg_ctl -D "$pgdata" -m fast -w stop > /dev/null || return 1
 
 	printf '%s' "$tps"
 }
 
-TPS_LOCAL="$(bench_backend local 54601)"
-TPS_BLOCK="$(bench_backend block_device 54602)"
+if ! bench_backend local 54601 > "$WORK/tps_local"; then
+	write_unavailable "local backend benchmark failed"
+fi
+if ! bench_backend block_device 54602 > "$WORK/tps_block"; then
+	write_unavailable "block_device backend benchmark failed"
+fi
+
+TPS_LOCAL="$(cat "$WORK/tps_local")"
+TPS_BLOCK="$(cat "$WORK/tps_block")"
 
 cat > "$OUT" <<EOF
 {
