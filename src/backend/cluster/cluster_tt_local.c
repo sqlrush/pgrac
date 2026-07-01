@@ -493,7 +493,7 @@ install_status(TransactionId xid, ClusterTTStatus status, SCN commit_scn)
 	if (!installed)
 		return;
 
-		/*
+	/*
 	 * spec-3.1 v0.4 N7 self-consumer:  re-lookup to prove the just-installed key
 	 * is reachable + bump self_consumer_hit_count (D9 T8 + D10 L2).
 	 *

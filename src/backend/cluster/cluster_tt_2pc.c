@@ -41,12 +41,36 @@
 #include "cluster/cluster_itl_touch.h" /* PostPrepare touch-list drop (V-2) */
 #include "cluster/cluster_subtrans.h"  /* sub-link export/reset (D7) */
 #include "cluster/cluster_tt_2pc.h"
-#include "cluster/cluster_tt_local.h"		 /* binding export/reset */
-#include "cluster/cluster_tt_slot.h"		 /* protected-slot map (D6/V-4) */
-#include "cluster/cluster_tt_status.h"		 /* SUBCOMMITTED overlay rebuild */
-#include "cluster/cluster_undo_record_api.h" /* xact_reset (PostPrepare) */
-#include "cluster/cluster_tt_durable.h"		 /* durable 0x30 commit (prefinish) */
-#include "cluster/cluster_tt_status_hint.h"	 /* cross-node hint emit (prefinish) */
+#include "cluster/cluster_tt_local.h"			/* binding export/reset */
+#include "cluster/cluster_tt_slot.h"			/* protected-slot map (D6/V-4) */
+#include "cluster/cluster_tt_status.h"			/* SUBCOMMITTED overlay rebuild */
+#include "cluster/cluster_undo_record_api.h"	/* xact_reset (PostPrepare) */
+#include "cluster/cluster_tt_durable.h"			/* durable 0x30 commit (prefinish) */
+#include "cluster/cluster_tt_status_hint.h"		/* cross-node hint emit (prefinish) */
+#include "cluster/storage/cluster_undo_alloc.h" /* CLUSTER_UNDO_SEGS_PER_INSTANCE */
+
+static bool
+cluster_tt_2pc_binding_origin_node(const ClusterTT2PCBinding *binding, uint16 *origin)
+{
+	uint32 derived;
+
+	if (binding == NULL || origin == NULL || binding->undo_segment_id == 0)
+		return false;
+
+	/*
+	 * The 2PC binding format predates ADG and carries no explicit origin.
+	 * Segment ids are nevertheless globally partitioned by owner instance:
+	 * segment_id = owner_node_id * CLUSTER_UNDO_SEGS_PER_INSTANCE + slot + 1.
+	 * A physical standby must preserve that primary owner, not substitute its
+	 * own cluster.node_id while replaying the primary's prepare record.
+	 */
+	derived = (binding->undo_segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE;
+	if (derived > (uint32)SCN_MAX_VALID_NODE_ID)
+		return false;
+
+	*origin = (uint16)derived;
+	return true;
+}
 
 
 /*
@@ -270,9 +294,17 @@ cluster_tt_twophase_standby_recover(TransactionId xid, uint16 info, void *recdat
 	for (i = 0; i < p.nbindings; i++) {
 		const ClusterTT2PCBinding *b = &p.bindings[i];
 		ClusterTTStatusKey key;
+		uint16 origin_node_id;
+
+		if (!cluster_tt_2pc_binding_origin_node(b, &origin_node_id)) {
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("cluster standby: invalid TT binding segment %u for prepared "
+								   "transaction %u",
+								   b->undo_segment_id, xid)));
+		}
 
 		memset(&key, 0, sizeof(key));
-		key.origin_node_id = (uint16)cluster_node_id;
+		key.origin_node_id = origin_node_id;
 		key.undo_segment_id = (uint16)b->undo_segment_id;
 		key.tt_slot_id = cluster_tt_slot_offset_to_id(b->slot_offset);
 		key.cluster_epoch = b->cluster_epoch;

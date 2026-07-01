@@ -38,14 +38,14 @@
 #include "cluster/cluster_ges_mode.h" /* spec-5.1b D1: ges_modes_compatible (frozen matrix) */
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_grd_outbound.h" /* cluster_grd_outbound_enqueue_cleanup_release (D10) */
-#include "cluster/cluster_hw_remaster.h" /* spec-5.7 D3 S5d — HW authority rebuild launch + gate */
-#include "cluster/cluster_lmd.h"		 /* spec-2.24 D10 cleanup_*_count_inc */
-#include "cluster/cluster_guc.h"		 /* cluster_node_id, cluster_grd_max_entries */
-#include "cluster/cluster_lms.h"		 /* spec-4.6 D2 — Q3-C wire routing token */
-#include "cluster/cluster_pcm_lock.h"	 /* spec-2.36 HC124 pending_x node-dead cleanup */
-#include "cluster/cluster_gcs.h"		 /* spec-4.7 D2 — cluster_gcs_lookup_master */
-#include "cluster/cluster_membership.h"	 /* spec-5.16 D1 — cluster_membership_is_member */
-#include "cluster/cluster_gcs_block.h"	 /* spec-4.7 D2 — block re-declare scan + send */
+#include "cluster/cluster_hw_remaster.h"  /* spec-5.7 D3 S5d — HW authority rebuild launch + gate */
+#include "cluster/cluster_lmd.h"		  /* spec-2.24 D10 cleanup_*_count_inc */
+#include "cluster/cluster_guc.h"		  /* cluster_node_id, cluster_grd_max_entries */
+#include "cluster/cluster_lms.h"		  /* spec-4.6 D2 — Q3-C wire routing token */
+#include "cluster/cluster_pcm_lock.h"	  /* spec-2.36 HC124 pending_x node-dead cleanup */
+#include "cluster/cluster_gcs.h"		  /* spec-4.7 D2 — cluster_gcs_lookup_master */
+#include "cluster/cluster_membership.h"	  /* spec-5.16 D1 — cluster_membership_is_member */
+#include "cluster/cluster_gcs_block.h"	  /* spec-4.7 D2 — block re-declare scan + send */
 #include "cluster/cluster_signal.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_cssd.h"			 /* spec-2.16 D8 newly-dead bitmap diff */
