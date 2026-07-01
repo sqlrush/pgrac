@@ -133,7 +133,8 @@
 /* PGRAC: spec-4.1 own-stream strict thread-id for crash recovery. */
 #include "cluster/cluster_guc.h" /* PGRAC: spec-4.5a cluster_wal_threads_dir */
 #include "cluster/cluster_hw_snapshot.h" /* PGRAC: spec-5.7 D3 HW authority recovery load */
-#include "cluster/cluster_mrp.h" /* PGRAC: spec-6.4 ADG Apply Master gate */
+#include "cluster/cluster_mrp.h"	   /* PGRAC: spec-6.4 ADG Apply Master gate */
+#include "cluster/cluster_mrp_apply.h" /* PGRAC: spec-6.4 MRP apply facade */
 #include "cluster/cluster_remote_xact.h" /* PGRAC: spec-4.5a G5 */
 #include "cluster/cluster_tt_status.h" /* PGRAC: spec-4.5a D11 merged counters */
 #include "cluster/cluster_recovery_plan.h"
@@ -2484,10 +2485,9 @@ ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *repl
 #ifdef USE_PGRAC_CLUSTER
 	if (cluster_mrp_should_start())
 	{
-		cluster_mrp_mark_thread_applied(XLogReaderGetThreadId(xlogreader),
-										xlogreader->EndRecPtr);
-		cluster_mrp_publish_watermarks(xlogreader->EndRecPtr, xlogreader->EndRecPtr,
-									   (uint64)cluster_mrp_standby_consistent_scn());
+		(void)cluster_mrp_apply_record_replayed(XLogReaderGetThreadId(xlogreader),
+												xlogreader->EndRecPtr,
+												XLogRecGetScn(xlogreader));
 	}
 #endif
 

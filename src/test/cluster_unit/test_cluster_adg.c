@@ -162,6 +162,18 @@ UT_TEST(test_apply_cannot_overtake_receive)
 	UT_ASSERT_EQ(cluster_adg_scn_tracker_consistent_scn(&tracker), InvalidScn);
 }
 
+UT_TEST(test_non_monotone_record_scn_does_not_block_apply_or_publish)
+{
+	ClusterAdgScnTracker tracker;
+
+	UT_ASSERT(cluster_adg_scn_tracker_init(&tracker, 1));
+	UT_ASSERT(cluster_adg_mark_received(&tracker, 1, 300, 10));
+	UT_ASSERT(cluster_adg_mark_applied(&tracker, 1, 100, S(1, 200), 20));
+	UT_ASSERT(cluster_adg_mark_applied(&tracker, 1, 200, S(1, 150), 21));
+	UT_ASSERT_EQ(scn_time_cmp(tracker.threads[0].last_apply_scn, S(1, 200)), 0);
+	UT_ASSERT_EQ(cluster_adg_scn_tracker_consistent_scn(&tracker), InvalidScn);
+}
+
 UT_TEST(test_barrier_retreat_is_rejected)
 {
 	ClusterAdgScnTracker tracker;
@@ -172,6 +184,21 @@ UT_TEST(test_barrier_retreat_is_rejected)
 	UT_ASSERT_EQ(scn_time_cmp(cluster_adg_scn_tracker_consistent_scn(&tracker), S(1, 50)), 0);
 	UT_ASSERT(!cluster_adg_apply_thread_barrier(&tracker, 1, 81, S(1, 49), 21));
 	UT_ASSERT_EQ(scn_time_cmp(cluster_adg_scn_tracker_consistent_scn(&tracker), S(1, 50)), 0);
+}
+
+UT_TEST(test_barrier_not_record_scn_advances_read_floor)
+{
+	ClusterAdgScnTracker tracker;
+
+	UT_ASSERT(cluster_adg_scn_tracker_init(&tracker, 2));
+	UT_ASSERT(cluster_adg_mark_received(&tracker, 1, 1000, 10));
+	UT_ASSERT(cluster_adg_mark_received(&tracker, 2, 1000, 10));
+	UT_ASSERT(cluster_adg_mark_applied(&tracker, 1, 900, S(1, 900), 20));
+	UT_ASSERT(cluster_adg_mark_applied(&tracker, 2, 900, S(2, 10), 20));
+	UT_ASSERT_EQ(cluster_adg_scn_tracker_consistent_scn(&tracker), InvalidScn);
+	UT_ASSERT(cluster_adg_apply_thread_barrier(&tracker, 1, 950, S(1, 80), 21));
+	UT_ASSERT(cluster_adg_apply_thread_barrier(&tracker, 2, 950, S(2, 70), 21));
+	UT_ASSERT_EQ(scn_time_cmp(cluster_adg_scn_tracker_consistent_scn(&tracker), S(2, 70)), 0);
 }
 
 UT_TEST(test_thread_bounds_are_release_checked)
@@ -217,6 +244,15 @@ UT_TEST(test_pending_min_predecessor_and_abort_cleanup)
 	UT_ASSERT_EQ(cluster_adg_pending_min_scn(&registry), InvalidScn);
 }
 
+UT_TEST(test_pending_predecessor_local_zero_fails_closed)
+{
+	ClusterAdgPendingCommitRegistry registry;
+
+	cluster_adg_pending_init(&registry);
+	UT_ASSERT(cluster_adg_pending_register(&registry, S(3, 0)));
+	UT_ASSERT_EQ(cluster_adg_thread_safe_scn(&registry, S(1, 200)), InvalidScn);
+}
+
 UT_TEST(test_pending_overflow_fails_closed)
 {
 	ClusterAdgPendingCommitRegistry registry;
@@ -242,6 +278,14 @@ UT_TEST(test_apply_master_lease_decisions)
 				 (int)CLUSTER_ADG_LEASE_TERM_STALE);
 	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_check(5, 5, true, true, 11, 11),
 				 (int)CLUSTER_ADG_LEASE_EXPIRED);
+}
+
+UT_TEST(test_apply_master_term_guard_rejects_publish_when_stale)
+{
+	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_check(9, 10, true, true, 100, 200),
+				 (int)CLUSTER_ADG_LEASE_TERM_STALE);
+	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_check(10, 10, true, false, 100, 200),
+				 (int)CLUSTER_ADG_LEASE_NO_QUORUM);
 }
 
 UT_TEST(test_apply_master_next_term_overflow)
@@ -273,6 +317,18 @@ UT_TEST(test_apply_master_lease_marker_pack_unpack)
 
 	slot[offsetof(ClusterAdgApplyMasterLease, generation)] ^= 0x01;
 	UT_ASSERT(!cluster_adg_apply_master_lease_unpack(slot, &out));
+}
+
+UT_TEST(test_apply_master_lease_slot_zero_fills_tail)
+{
+	ClusterAdgApplyMasterLease lease;
+	uint8 slot[CLUSTER_ADG_APPLY_LEASE_SLOT_BYTES];
+
+	memset(slot, 0x5A, sizeof(slot));
+	cluster_adg_apply_master_lease_init(&lease, 8, 4, 2000, 12);
+	UT_ASSERT(cluster_adg_apply_master_lease_pack(slot, &lease));
+	for (uint32 i = sizeof(ClusterAdgApplyMasterLease); i < sizeof(slot); i++)
+		UT_ASSERT_EQ((int)slot[i], 0);
 }
 
 UT_TEST(test_apply_master_lease_marker_rejects_invalid_fields)
@@ -351,6 +407,20 @@ UT_TEST(test_read_only_decision_matrix)
 				 (int)CLUSTER_ADG_READ_UNRESOLVABLE);
 }
 
+UT_TEST(test_standby_conflict_decision_matrix)
+{
+	UT_ASSERT_EQ((int)cluster_adg_standby_conflict_decide(true, true, 0, 1000),
+				 (int)CLUSTER_ADG_CONFLICT_NONE);
+	UT_ASSERT_EQ((int)cluster_adg_standby_conflict_decide(true, true, 999, 1000),
+				 (int)CLUSTER_ADG_CONFLICT_WAIT);
+	UT_ASSERT_EQ((int)cluster_adg_standby_conflict_decide(true, true, 1000, 1000),
+				 (int)CLUSTER_ADG_CONFLICT_CANCEL_READER);
+	UT_ASSERT_EQ((int)cluster_adg_standby_conflict_decide(true, true, 60000, -1),
+				 (int)CLUSTER_ADG_CONFLICT_WAIT);
+	UT_ASSERT_EQ((int)cluster_adg_standby_conflict_decide(false, true, 60000, 1000),
+				 (int)CLUSTER_ADG_CONFLICT_NONE);
+}
+
 UT_TEST(test_overlay_resolve_on_commit_prepared)
 {
 	ClusterTTStatus out_status = CLUSTER_TT_STATUS_UNKNOWN;
@@ -401,25 +471,31 @@ UT_TEST(test_standby_reply_trailer_validation)
 int
 main(void)
 {
-	UT_PLAN(20);
+	UT_PLAN(26);
 
 	UT_RUN(test_tracker_init_bounds);
 	UT_RUN(test_barrier_min_publishes_after_all_threads);
 	UT_RUN(test_receive_watermark_does_not_publish_consistent_scn);
 	UT_RUN(test_apply_cannot_overtake_receive);
+	UT_RUN(test_non_monotone_record_scn_does_not_block_apply_or_publish);
 	UT_RUN(test_barrier_retreat_is_rejected);
+	UT_RUN(test_barrier_not_record_scn_advances_read_floor);
 	UT_RUN(test_thread_bounds_are_release_checked);
 	UT_RUN(test_apply_lag_floor);
 	UT_RUN(test_pending_no_pending_uses_current_scn);
 	UT_RUN(test_pending_min_predecessor_and_abort_cleanup);
+	UT_RUN(test_pending_predecessor_local_zero_fails_closed);
 	UT_RUN(test_pending_overflow_fails_closed);
 	UT_RUN(test_apply_master_lease_decisions);
+	UT_RUN(test_apply_master_term_guard_rejects_publish_when_stale);
 	UT_RUN(test_apply_master_next_term_overflow);
 	UT_RUN(test_apply_master_lease_marker_pack_unpack);
+	UT_RUN(test_apply_master_lease_slot_zero_fills_tail);
 	UT_RUN(test_apply_master_lease_marker_rejects_invalid_fields);
 	UT_RUN(test_streaming_merge_selects_scn_lsn_node_order);
 	UT_RUN(test_streaming_merge_ignores_unavailable_or_invalid);
 	UT_RUN(test_read_only_decision_matrix);
+	UT_RUN(test_standby_conflict_decision_matrix);
 	UT_RUN(test_overlay_resolve_on_commit_prepared);
 	UT_RUN(test_thread_barrier_wal_abi);
 	UT_RUN(test_standby_reply_trailer_validation);

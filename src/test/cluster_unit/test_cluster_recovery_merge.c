@@ -4,7 +4,7 @@
  *	  pgrac spec-4.5 D11 — cluster_unit tests for the merge engine pure
  *	  core (cluster_recovery_merge.h) and the xl_scn record layout.
  *
- *	  20 tests:
+ *	  22 tests:
  *	    heap   T1  push/pop yields ascending (scn) order
  *	           T2  scn tie -> lsn order (scn_recovery_cmp level 2)
  *	           T3  scn+lsn tie -> node order (level 3)
@@ -25,6 +25,8 @@
  *	           T18 InvalidScn is 0 (zero-prefix legality)
  *	           T19 heap empty pop returns false
  *	           T20 heap key carries the stream index intact
+ *	    stream T21 streaming mode selects concrete WAL records
+ *	           T22 heartbeat-only streams do not emit records
  *
  * Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 2026, pgrac contributors
@@ -309,11 +311,48 @@ UT_TEST(test_heap_stream_index)
 	UT_ASSERT(cluster_recmerge_heap_pop(&h, &o) && o.stream == 7 && o.key.node == 7);
 }
 
+UT_TEST(test_streaming_selects_record)
+{
+	ClusterRecmergeStreamingInput inputs[3];
+	ClusterRecmergeKey key;
+	int stream = -1;
+
+	memset(inputs, 0, sizeof(inputs));
+	inputs[0].record_available = true;
+	inputs[0].key = K(50, 30, 0);
+	inputs[1].heartbeat_seen = true;
+	inputs[1].key = K(1, 1, 1);
+	inputs[2].record_available = true;
+	inputs[2].key = K(40, 90, 2);
+
+	UT_ASSERT_EQ((int)cluster_recmerge_streaming_select(inputs, 3, &stream, &key),
+				 (int)CLUSTER_RECMERGE_STREAMING_RECORD_READY);
+	UT_ASSERT_EQ(stream, 2);
+	UT_ASSERT_EQ((int)key.scn, 40);
+}
+
+UT_TEST(test_streaming_heartbeat_only_no_record)
+{
+	ClusterRecmergeStreamingInput inputs[2];
+	ClusterRecmergeKey key;
+	int stream = -1;
+
+	memset(inputs, 0, sizeof(inputs));
+	inputs[0].heartbeat_seen = true;
+	inputs[0].key = K(10, 10, 0);
+	inputs[1].heartbeat_seen = true;
+	inputs[1].key = K(20, 20, 1);
+
+	UT_ASSERT_EQ((int)cluster_recmerge_streaming_select(inputs, 2, &stream, &key),
+				 (int)CLUSTER_RECMERGE_STREAMING_NO_RECORD);
+	UT_ASSERT_EQ(stream, -1);
+}
+
 
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(20);
+	UT_PLAN(22);
 
 	UT_RUN(test_heap_scn_order);
 	UT_RUN(test_heap_scn_tie_lsn);
@@ -335,6 +374,8 @@ main(int argc, char **argv)
 	UT_RUN(test_invalid_scn_zero);
 	UT_RUN(test_heap_empty_pop);
 	UT_RUN(test_heap_stream_index);
+	UT_RUN(test_streaming_selects_record);
+	UT_RUN(test_streaming_heartbeat_only_no_record);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

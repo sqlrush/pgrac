@@ -120,14 +120,15 @@ cluster_adg_mark_applied(ClusterAdgScnTracker *tracker, uint16 thread_id, XLogRe
 	if (thread->has_apply) {
 		if (apply_lsn < thread->apply_lsn)
 			return false;
-		if (scn_time_cmp(apply_scn, thread->last_apply_scn) < 0)
-			return false;
 	}
 
 	thread->active = true;
 	thread->has_apply = true;
 	thread->apply_lsn = apply_lsn;
-	thread->last_apply_scn = apply_scn;
+	if (!SCN_VALID(thread->last_apply_scn) || scn_time_cmp(apply_scn, thread->last_apply_scn) > 0
+		|| (scn_time_cmp(apply_scn, thread->last_apply_scn) == 0
+			&& scn_total_cmp(apply_scn, thread->last_apply_scn) > 0))
+		thread->last_apply_scn = apply_scn;
 	thread->apply_time_ms = apply_time_ms;
 	return true;
 }
@@ -156,7 +157,11 @@ cluster_adg_apply_thread_barrier(ClusterAdgScnTracker *tracker, uint16 thread_id
 	thread->has_apply = true;
 	thread->has_barrier = true;
 	thread->apply_lsn = apply_lsn;
-	thread->last_apply_scn = barrier_safe_scn;
+	if (!SCN_VALID(thread->last_apply_scn)
+		|| scn_time_cmp(barrier_safe_scn, thread->last_apply_scn) > 0
+		|| (scn_time_cmp(barrier_safe_scn, thread->last_apply_scn) == 0
+			&& scn_total_cmp(barrier_safe_scn, thread->last_apply_scn) > 0))
+		thread->last_apply_scn = barrier_safe_scn;
 	thread->barrier_safe_scn = barrier_safe_scn;
 	thread->apply_time_ms = apply_time_ms;
 	return cluster_adg_recompute_consistent_scn(tracker);
@@ -391,6 +396,21 @@ cluster_adg_read_only_decide(bool enable_adg, bool standby_role, SCN requested_r
 	if (scn_time_cmp(requested_read_scn, standby_consistent_scn) <= 0)
 		return CLUSTER_ADG_READ_ALLOW;
 	return CLUSTER_ADG_READ_WAIT;
+}
+
+ClusterAdgStandbyConflictDecision
+cluster_adg_standby_conflict_decide(bool enable_adg, bool standby_role, int64 wait_ms,
+									int64 max_standby_delay_ms)
+{
+	if (!enable_adg || !standby_role)
+		return CLUSTER_ADG_CONFLICT_NONE;
+	if (wait_ms <= 0)
+		return CLUSTER_ADG_CONFLICT_NONE;
+	if (max_standby_delay_ms < 0)
+		return CLUSTER_ADG_CONFLICT_WAIT;
+	if (wait_ms >= max_standby_delay_ms)
+		return CLUSTER_ADG_CONFLICT_CANCEL_READER;
+	return CLUSTER_ADG_CONFLICT_WAIT;
 }
 
 bool
