@@ -718,6 +718,11 @@ void
 cluster_ic_tier1_shmem_register(void)
 {}
 
+/* spec-6.1 D8 stub: RDMA mux observability region. */
+void
+cluster_ic_rdma_shmem_register(void)
+{}
+
 /* spec-2.4 D2 stub: cluster_epoch shmem region. */
 void
 cluster_epoch_shmem_register(void)

@@ -630,6 +630,9 @@ name = pgrac-prod-01
 
 [node.0]
 interconnect_addr = 10.0.0.1:6432
+rdma_addr        = 10.10.0.1:18515
+rdma_gid         = fe80::1
+rdma_port        = 1
 hostname          = db-1.internal
 public_addr       = 192.168.1.1:5432
 role              = primary
@@ -637,6 +640,9 @@ region            = us-east-1a
 
 [node.1]
 interconnect_addr = 10.0.0.2:6432
+rdma_addr        = 10.10.0.2:18515
+rdma_gid         = fe80::2
+rdma_port        = 1
 hostname          = db-2.internal
 role              = standby
 ```
@@ -657,6 +663,9 @@ role              = standby
 | `public_addr` | no | `host:port` | Client-facing address (for load balancer use). |
 | `role` | no | `primary` / `standby` / `arbiter` | Defaults to `primary` if absent. |
 | `region` | no | string | Free-form region tag for diagnostic display. |
+| `rdma_addr` | no | `host:port` | RDMA CM listener address for `tier2`/`tier3`.  If absent, that RDMA link stays on TCP fallback; `interconnect_addr` remains the TCP listener address. |
+| `rdma_gid` | no | string | RoCE/IB GID selector recorded for diagnostics and operator validation. |
+| `rdma_port` | no | integer `[1, 255]` | HCA port number.  Defaults to `1`. |
 
 ### Comment forms
 
@@ -680,6 +689,8 @@ on any of:
 - node id outside `[0, 127]`
 - `[node.<N>]` missing the required `interconnect_addr` key
 - `interconnect_addr` not in `host:port` form
+- `rdma_addr` is present but not in `host:port` form
+- `rdma_port` is present but outside `[1, 255]`
 - `role` not one of `primary` / `standby` / `arbiter`
 - `cluster.node_id` (the GUC) is not present in any `[node.<N>]` section
 

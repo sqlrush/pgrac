@@ -111,6 +111,27 @@ my $native_activity_count = $node->safe_psql('postgres',
 cmp_ok($native_activity_count, '>=', 1,
 	'pg_stat_activity still works after cluster view extension');
 
+# ----------
+# spec-6.1: pg_stat_cluster_ic mux/RDMA observability view.
+# ----------
+is($node->safe_psql('postgres',
+		q{SELECT count(*) FROM pg_stat_cluster_ic}),
+	'1',
+	'pg_stat_cluster_ic returns one single-node fallback row');
+
+is($node->safe_psql('postgres',
+		q{SELECT transport || '|' || rdma_state || '|' || provider
+		    FROM pg_stat_cluster_ic}),
+	'tcp|disabled|auto',
+	'pg_stat_cluster_ic exposes TCP fallback transport defaults');
+
+is($node->safe_psql('postgres',
+		q{SELECT string_agg(column_name, ',' ORDER BY ordinal_position)
+		    FROM information_schema.columns
+		   WHERE table_name = 'pg_stat_cluster_ic'}),
+	'node_id,transport,rdma_state,provider,rdma_addr,rdma_gid,rdma_port,mr_registered,cq_depth,fallback_count,send_count,recv_count,bytes_send,bytes_recv,block_sge_send_count,block_sge_fallback_count,latency_us_sum,latency_sample_count,last_error_code,last_error',
+	'pg_stat_cluster_ic column contract matches spec-6.1 D8');
+
 
 $node->stop;
 

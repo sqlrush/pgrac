@@ -141,12 +141,18 @@ name = pgrac-test-013
 
 [node.0]
 interconnect_addr = 10.0.0.10:6432
+rdma_addr = 10.0.1.10:18515
+rdma_gid = fe80::10
+rdma_port = 1
 hostname = test-node-0
 role = primary
 region = us-east-1a
 
 [node.1]
 interconnect_addr = 10.0.0.11:6432
+rdma_addr = 10.0.1.11:18515
+rdma_gid = fe80::11
+rdma_port = 2
 hostname = test-node-1
 role = standby
 EOC
@@ -180,6 +186,13 @@ is($node->safe_psql('postgres',
 		   WHERE node_id = 1 AND role = 'standby'}),
 	'1',
 	'non-self row matches [node.1] from pgrac.conf');
+
+is($node->safe_psql('postgres',
+		q{SELECT rdma_addr || '|' || rdma_gid || '|' || rdma_port
+		    FROM pg_stat_cluster_ic
+		   WHERE node_id = 0}),
+	'10.0.1.10:18515|fe80::10|1',
+	'pg_stat_cluster_ic reflects RDMA fields from [node.0]');
 
 
 # ----------

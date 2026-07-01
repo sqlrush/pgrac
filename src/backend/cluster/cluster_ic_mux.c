@@ -42,6 +42,20 @@ cluster_ic_mux_peer_transport(int32 peer_id)
 	return MuxPeerTransport[peer_id];
 }
 
+void
+cluster_ic_mux_set_peer_transport(int32 peer_id, ClusterICPeerTransport transport,
+								  ClusterICRdmaPeerState state)
+{
+	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES) {
+		MuxFallbackCount++;
+		cluster_ic_rdma_stats_note_fallback(peer_id, "invalid peer id for RDMA mux update");
+		return;
+	}
+
+	MuxPeerTransport[peer_id] = transport;
+	cluster_ic_rdma_stats_note_transport(peer_id, transport, state);
+}
+
 uint64
 cluster_ic_mux_fallback_count(void)
 {
@@ -53,6 +67,7 @@ mux_transport_for_peer(int32 peer_id)
 {
 	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES) {
 		MuxFallbackCount++;
+		cluster_ic_rdma_stats_note_fallback(peer_id, "invalid peer id for RDMA mux");
 		return CLUSTER_IC_PEER_TRANSPORT_TCP;
 	}
 
@@ -75,7 +90,14 @@ mux_tier_init(void)
 
 	mux_mark_all_tcp();
 	MuxFallbackCount = 0;
+
+	if ((ClusterICTier)cluster_interconnect_tier == CLUSTER_IC_TIER_3)
+		ClusterICOps_Tier3.tier_init();
+	else
+		ClusterICOps_Tier2.tier_init();
+
 	if (!cluster_ic_rdma_runtime_available(&reason)) {
+		int i;
 
 		if (cluster_interconnect_rdma_fallback == CLUSTER_IC_RDMA_FALLBACK_OFF)
 			ereport(FATAL,
@@ -86,9 +108,21 @@ mux_tier_init(void)
 							 "the RDMA build/device configuration.")));
 
 		MuxFallbackCount++;
-		ereport(LOG,
-				(errmsg("RDMA interconnect unavailable; using TCP fallback for all peers"),
-				 errdetail("%s", reason != NULL ? reason : "unknown RDMA availability failure")));
+		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+			if (cluster_conf_lookup_node(i) == NULL || i == cluster_node_id)
+				continue;
+			cluster_ic_rdma_stats_note_transport(i, CLUSTER_IC_PEER_TRANSPORT_TCP,
+												 CLUSTER_IC_RDMA_PEER_FALLBACK_TCP);
+		}
+	} else {
+		int i;
+
+		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+			if (cluster_conf_lookup_node(i) == NULL || i == cluster_node_id)
+				continue;
+			cluster_ic_rdma_stats_note_transport(i, CLUSTER_IC_PEER_TRANSPORT_TCP,
+												 CLUSTER_IC_RDMA_PEER_CONNECTING);
+		}
 	}
 
 	/*
@@ -101,6 +135,10 @@ mux_tier_init(void)
 static void
 mux_tier_shutdown(void)
 {
+	if ((ClusterICTier)cluster_interconnect_tier == CLUSTER_IC_TIER_3)
+		ClusterICOps_Tier3.tier_shutdown();
+	else
+		ClusterICOps_Tier2.tier_shutdown();
 	ClusterICOps_Tier1.tier_shutdown();
 	mux_mark_all_tcp();
 }
@@ -109,6 +147,7 @@ static ClusterICSendResult
 mux_send_bytes(int32 target_node_id, const void *buf, size_t len)
 {
 	ClusterICPeerTransport transport;
+	ClusterICSendResult rc;
 
 	transport = mux_transport_for_peer(target_node_id);
 	if (transport == CLUSTER_IC_PEER_TRANSPORT_RDMA) {
@@ -117,24 +156,35 @@ mux_send_bytes(int32 target_node_id, const void *buf, size_t len)
 		return ClusterICOps_Tier2.send_bytes(target_node_id, buf, len);
 	}
 
-	return ClusterICOps_Tier1.send_bytes(target_node_id, buf, len);
+	rc = ClusterICOps_Tier1.send_bytes(target_node_id, buf, len);
+	if (rc == CLUSTER_IC_SEND_DONE)
+		cluster_ic_rdma_stats_note_send(target_node_id, (uint64)len, false);
+	else if (rc == CLUSTER_IC_SEND_HARD_ERROR)
+		cluster_ic_rdma_stats_note_error(target_node_id, "08R04", "TCP fallback send failed");
+	return rc;
 }
 
 static bool
 mux_recv_bytes(int32 *out_sender_node_id, void *buf, size_t bufsize,
 			   size_t *out_received_len)
 {
-	/*
-	 * RDMA CQ drain plugs in here once a peer has an active QP.  Until then
-	 * the mux drains the always-initialized TCP tier, preserving the public
-	 * recv_bytes signature and the fallback correctness contract.
-	 */
-	return ClusterICOps_Tier1.recv_bytes(out_sender_node_id, buf, bufsize, out_received_len);
+	if (!cluster_ic_rdma_drain_recv(out_sender_node_id, buf, bufsize, out_received_len))
+		return false;
+	if (out_received_len != NULL && *out_received_len > 0)
+		return true;
+
+	if (!ClusterICOps_Tier1.recv_bytes(out_sender_node_id, buf, bufsize, out_received_len))
+		return false;
+	if (out_sender_node_id != NULL && out_received_len != NULL && *out_received_len > 0)
+		cluster_ic_rdma_stats_note_recv(*out_sender_node_id, (uint64)*out_received_len, false);
+	return true;
 }
 
 static bool
 mux_peek_sender(int32 *out_sender_node_id)
 {
+	if (cluster_ic_rdma_peek_sender(out_sender_node_id))
+		return true;
 	return ClusterICOps_Tier1.peek_sender(out_sender_node_id);
 }
 

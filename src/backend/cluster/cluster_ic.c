@@ -74,6 +74,7 @@ PG_FUNCTION_INFO_V1(cluster_ic_mock_recv_test);
  * USE_PGRAC_CLUSTER); enable-mode body is in cluster_ic_tier1.c.
  */
 PG_FUNCTION_INFO_V1(cluster_get_ic_peers);
+PG_FUNCTION_INFO_V1(cluster_get_ic_rdma_peers);
 
 /*
  * spec-2.3 D8 -- cluster_get_ic_msg_types SRF.  Body lives in
@@ -1244,6 +1245,14 @@ cluster_get_ic_peers(PG_FUNCTION_ARGS pg_attribute_unused())
 {
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("cluster_get_ic_peers requires --enable-cluster")));
+	PG_RETURN_NULL();
+}
+
+Datum
+cluster_get_ic_rdma_peers(PG_FUNCTION_ARGS pg_attribute_unused())
+{
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cluster_get_ic_rdma_peers requires --enable-cluster")));
 	PG_RETURN_NULL();
 }
 

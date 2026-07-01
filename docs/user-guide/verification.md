@@ -104,6 +104,7 @@ directly:
 SELECT * FROM cluster_get_wait_events();
 SELECT * FROM cluster_get_global_wait_events();
 SELECT * FROM cluster_get_nodes();
+SELECT * FROM cluster_get_ic_rdma_peers();
 SELECT * FROM cluster_get_injection_state();
 SELECT * FROM cluster_get_stat_nodes();
 SELECT * FROM cluster_get_pgstat_counters();

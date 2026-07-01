@@ -37,6 +37,14 @@ typedef enum ClusterICPeerTransport {
 	CLUSTER_IC_PEER_TRANSPORT_RDMA,
 } ClusterICPeerTransport;
 
+typedef enum ClusterICRdmaPeerState {
+	CLUSTER_IC_RDMA_PEER_DISABLED = 0,
+	CLUSTER_IC_RDMA_PEER_FALLBACK_TCP,
+	CLUSTER_IC_RDMA_PEER_CONNECTING,
+	CLUSTER_IC_RDMA_PEER_CONNECTED,
+	CLUSTER_IC_RDMA_PEER_ERROR,
+} ClusterICRdmaPeerState;
+
 typedef struct ClusterICMr {
 	void *base;
 	size_t len;
@@ -44,10 +52,14 @@ typedef struct ClusterICMr {
 	uint32 rkey;
 } ClusterICMr;
 
+typedef void (*ClusterICSgeReleaseCallback)(void *arg);
+
 typedef struct ClusterICSge {
 	void *addr;
 	size_t len;
 	uint32 lkey;
+	ClusterICSgeReleaseCallback release_cb;
+	void *release_arg;
 } ClusterICSge;
 
 typedef struct ClusterICRdmaCtx ClusterICRdmaCtx;
@@ -81,10 +93,33 @@ extern bool cluster_interconnect_rdma_crc_offload;
 extern int cluster_interconnect_rdma_inline_max;
 extern int cluster_interconnect_rdma_max_send_wr;
 
+extern void cluster_ic_rdma_shmem_register(void);
 extern bool cluster_ic_rdma_runtime_available(const char **reason);
 extern const char *cluster_ic_peer_transport_name(ClusterICPeerTransport transport);
+extern const char *cluster_ic_rdma_peer_state_name(ClusterICRdmaPeerState state);
 extern ClusterICPeerTransport cluster_ic_mux_peer_transport(int32 peer_id);
+extern void cluster_ic_mux_set_peer_transport(int32 peer_id, ClusterICPeerTransport transport,
+											  ClusterICRdmaPeerState state);
 extern uint64 cluster_ic_mux_fallback_count(void);
+extern void cluster_ic_rdma_stats_note_transport(int32 peer_id, ClusterICPeerTransport transport,
+												 ClusterICRdmaPeerState state);
+extern void cluster_ic_rdma_stats_note_fallback(int32 peer_id, const char *reason);
+extern void cluster_ic_rdma_stats_note_send(int32 peer_id, uint64 bytes, bool rdma);
+extern void cluster_ic_rdma_stats_note_recv(int32 peer_id, uint64 bytes, bool rdma);
+extern void cluster_ic_rdma_stats_note_error(int32 peer_id, const char *sqlstate,
+											 const char *message);
+extern void cluster_ic_rdma_stats_note_cq_depth(int32 peer_id, int32 depth);
+extern void cluster_ic_rdma_stats_note_mr_registered(bool registered);
+
+extern int cluster_ic_rdma_lmon_cm_fd(void);
+extern int cluster_ic_rdma_lmon_completion_fd(void);
+extern void cluster_ic_rdma_lmon_start(void);
+extern void cluster_ic_rdma_lmon_stop(void);
+extern void cluster_ic_rdma_lmon_handle_cm_events(void);
+extern void cluster_ic_rdma_lmon_handle_completion_events(void);
+extern bool cluster_ic_rdma_drain_recv(int32 *out_sender_node_id, void *buf, size_t bufsize,
+									   size_t *out_received_len);
+extern bool cluster_ic_rdma_peek_sender(int32 *out_sender_node_id);
 
 /*
  * D5 guard surface: callers may ask whether the current active transport can
@@ -93,5 +128,12 @@ extern uint64 cluster_ic_mux_fallback_count(void);
  * existing contiguous envelope path.
  */
 extern bool cluster_ic_rdma_block_sge_supported(const char **reason);
+extern ClusterICSendResult cluster_ic_rdma_send_envelope_sge(uint8 msg_type,
+															 int32 dest_node_id,
+															 const ClusterICSge *payload_sge,
+															 int n_sge,
+															 uint32 payload_len);
+
+extern Datum cluster_get_ic_rdma_peers(PG_FUNCTION_ARGS);
 
 #endif /* CLUSTER_IC_RDMA_H */

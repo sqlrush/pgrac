@@ -95,7 +95,9 @@ my $has_visibility_inject =
 # always registered; sorts between "multixact overlay" and "pcm grd").
 # spec-6.5: +1 "pgrac cluster backup" (backup / restore / PITR state; sorts
 # between "advisory" and "cf stats").
-my $expected_region_count = $has_visibility_inject ? '69' : '68';
+# spec-6.1: +1 "pgrac cluster_ic_rdma" (RDMA mux observability; sorts before
+# "pgrac cluster_ic_tier1").
+my $expected_region_count = $has_visibility_inject ? '70' : '69';
 my $expected_regions =
   'pgrac block recovery,pgrac cluster advisory,pgrac cluster backup,pgrac cluster cf stats,pgrac cluster clean_leave,pgrac cluster conf,pgrac cluster control,pgrac cluster cr admit stats,pgrac cluster cr coordinator,pgrac cluster cr counters,pgrac cluster cr pool,pgrac cluster cr relgen,pgrac cluster cr tuple stats,pgrac cluster cssd,pgrac cluster diag,pgrac cluster dl,pgrac cluster durable tt counters,pgrac cluster epoch,pgrac cluster fence,pgrac cluster gcs,pgrac cluster gcs block,pgrac cluster gcs block dedup,pgrac cluster ges,pgrac cluster ges dedup,pgrac cluster ges reply wait,pgrac cluster grd,pgrac cluster grd outbound,pgrac cluster grd pending,pgrac cluster grd work queue,pgrac cluster hw,pgrac cluster ir,pgrac cluster ko,pgrac cluster lck,pgrac cluster lmd,pgrac cluster lmd graph,pgrac cluster lmd probe,pgrac cluster lmon,pgrac cluster lms,pgrac cluster lock-path counters,pgrac cluster multixact overlay,pgrac cluster node_remove,pgrac cluster pcm grd,pgrac cluster qvotec,pgrac cluster reconfig,pgrac cluster resolver cache,pgrac cluster scn,pgrac cluster sequence,pgrac cluster sinval ack outbound,pgrac cluster sinval ack wait,pgrac cluster sinval inbound,pgrac cluster sinval outbound,pgrac cluster smgr,pgrac cluster startup phase,pgrac cluster stats,pgrac cluster subtrans state,pgrac cluster ts,pgrac cluster tt local seq,pgrac cluster tt slot allocator,pgrac cluster tt status hint outbound,pgrac cluster tt status overlay,pgrac cluster tx enqueue,pgrac cluster undo cleaner,pgrac cluster undo record cursor';
 $expected_regions .= ',pgrac cluster visibility inject'
@@ -104,6 +106,7 @@ $expected_regions .= ',pgrac cluster visibility inject'
 # 'pgrac cluster visibility inject' ('w' > 'v') and before 'pgrac cluster_ic_tier1'
 # (space 0x20 < underscore 0x5F at the 'cluster ' boundary).
 $expected_regions .= ',pgrac cluster write fence';
+$expected_regions .= ',pgrac cluster_ic_rdma';
 $expected_regions .= ',pgrac cluster_ic_tier1';
 # spec-4.3 D4: recovery plan mirror;  sorts after the 'pgrac cluster*'
 # block and the underscore form ('r' > '_').

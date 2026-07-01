@@ -339,6 +339,23 @@ validate_addr_format(const char *addr)
 	return true;
 }
 
+static bool
+parse_rdma_port(const char *value, int32 *out)
+{
+	char *endptr;
+	long port;
+
+	if (value == NULL || *value == '\0' || out == NULL)
+		return false;
+
+	port = strtol(value, &endptr, 10);
+	if (*endptr != '\0' || port < 1 || port > 255)
+		return false;
+
+	*out = (int32)port;
+	return true;
+}
+
 
 /* ============================================================
  * Loader: parse pgrac.conf and populate ClusterConfShmem.
@@ -353,6 +370,7 @@ init_node_slot(ClusterNodeInfo *n, int32 node_id)
 	memset(n, 0, sizeof(*n));
 	n->node_id = node_id;
 	n->role = CLUSTER_ROLE_PRIMARY;
+	n->rdma_port = 1;
 }
 
 /*
@@ -448,6 +466,28 @@ apply_node_field(ClusterNodeInfo *n, const char *key, const char *value, const c
 	}
 	if (strcmp(key, "region") == 0) {
 		strlcpy(n->region, value, sizeof(n->region));
+		return true;
+	}
+	if (strcmp(key, "rdma_addr") == 0) {
+		if (*value != '\0' && !validate_addr_format(value)) {
+			*out_err = "rdma_addr must be empty or in host:port form";
+			return false;
+		}
+		strlcpy(n->rdma_addr, value, sizeof(n->rdma_addr));
+		return true;
+	}
+	if (strcmp(key, "rdma_gid") == 0) {
+		strlcpy(n->rdma_gid, value, sizeof(n->rdma_gid));
+		return true;
+	}
+	if (strcmp(key, "rdma_port") == 0) {
+		int32 port;
+
+		if (!parse_rdma_port(value, &port)) {
+			*out_err = "rdma_port must be an integer in [1, 255]";
+			return false;
+		}
+		n->rdma_port = port;
 		return true;
 	}
 	*out_err = "unknown key in [node.N] section";

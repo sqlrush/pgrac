@@ -1498,6 +1498,36 @@ CREATE VIEW pg_cluster_ic_peers AS
 REVOKE ALL ON pg_cluster_ic_peers FROM PUBLIC;
 GRANT SELECT ON pg_cluster_ic_peers TO PUBLIC;
 
+-- PGRAC: pg_stat_cluster_ic (spec-6.1 D8).
+--   Per-peer TCP/RDMA mux state plus RDMA bring-up and block-SGE
+--   observability.  This view is additive; pg_cluster_ic_peers keeps
+--   the tier1 TCP connection telemetry contract from spec-2.2.
+CREATE VIEW pg_stat_cluster_ic AS
+    SELECT node_id,
+           transport,
+           rdma_state,
+           provider,
+           rdma_addr,
+           rdma_gid,
+           rdma_port,
+           mr_registered,
+           cq_depth,
+           fallback_count,
+           send_count,
+           recv_count,
+           bytes_send,
+           bytes_recv,
+           block_sge_send_count,
+           block_sge_fallback_count,
+           latency_us_sum,
+           latency_sample_count,
+           last_error_code,
+           last_error
+      FROM cluster_get_ic_rdma_peers();
+
+REVOKE ALL ON pg_stat_cluster_ic FROM PUBLIC;
+GRANT SELECT ON pg_stat_cluster_ic TO PUBLIC;
+
 -- PGRAC: pg_cluster_cssd_peers (spec-2.5 D15; 2026-05-08).
 --   Lists every peer declared in pgrac.conf with current CSSD
 --   (Cluster Synchronization Service Daemon) membership state +

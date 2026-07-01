@@ -11,6 +11,8 @@ operator-facing.
 | `pg_cluster_nodes` | Cluster topology (the parsed `pgrac.conf`) |
 | `pg_stat_cluster_wait_events` | Cluster-specific wait events on the local node |
 | `pg_stat_gcluster_wait_events` | Cluster wait events globally (cross-node placeholder) |
+| `pg_cluster_ic_peers` | Tier1 TCP interconnect peer state and counters |
+| `pg_stat_cluster_ic` | TCP/RDMA mux and RDMA transport observability |
 | `pg_stat_cluster_backup` | Current cluster backup state on the local node |
 | `pg_cluster_backup_history` | Latest cluster backup manifest summary |
 | `pg_cluster_restore_points` | Cluster restore points visible to PITR status |
@@ -308,6 +310,40 @@ interconnect envelope (4-byte aligned little-endian fixed header,
 followed by a per-message-type payload).  The envelope is the same
 for every message type and is independent of the active interconnect
 tier.
+
+## pg_stat_cluster_ic
+
+Per-peer TCP/RDMA mux observability for `tier2` and `tier3`.  The view
+is also populated in single-node and TCP-fallback modes so operators can
+see why RDMA was not selected.
+
+| Column | Type | Description |
+|---|---|---|
+| `node_id` | `int4` | Declared peer id from `pgrac.conf`. |
+| `transport` | `text` | Current mux transport for the peer: `tcp` or `rdma`. |
+| `rdma_state` | `text` | RDMA bring-up state: `disabled`, `fallback_tcp`, `connecting`, `connected`, or `error`. |
+| `provider` | `text` | Selected provider (`auto`, `verbs-generic`, or `mlx5-direct`). |
+| `rdma_addr` | `text` | Optional RDMA CM address from `pgrac.conf`. |
+| `rdma_gid` | `text` | Optional GID label from `pgrac.conf`. |
+| `rdma_port` | `int4` | HCA port number, default `1`. |
+| `mr_registered` | `bool` | Whether shared_buffers MR registration completed in this postmaster. |
+| `cq_depth` | `int4` | Last completion batch depth observed by LMON. |
+| `fallback_count` | `int8` | Per-peer RDMA-to-TCP fallback decisions. |
+| `send_count` / `recv_count` | `int8` | Mux-level send/receive handoffs counted by transport. |
+| `bytes_send` / `bytes_recv` | `int8` | Mux-level bytes handed to/from the selected transport. |
+| `block_sge_send_count` | `int8` | SEND-with-SGE block ship attempts posted on the RDMA path.  Normal block replies use a registered `shared_buffers` page SGE. |
+| `block_sge_fallback_count` | `int8` | SEND-with-SGE block ship attempts that materialized the SGEs and used TCP fallback. |
+| `latency_us_sum` / `latency_sample_count` | `int8` | Reserved latency aggregation counters for tier2/tier3 completion timing. |
+| `last_error_code` | `text` | Last SQLSTATE-style RDMA/mux error for this peer. |
+| `last_error` | `text` | Last human-readable RDMA/mux error. |
+
+Example:
+
+```sql
+SELECT node_id, transport, rdma_state, provider, fallback_count, last_error
+  FROM pg_stat_cluster_ic
+ ORDER BY node_id;
+```
 
 ## pg_cluster_quorum_state
 
