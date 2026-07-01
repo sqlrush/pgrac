@@ -79,14 +79,13 @@ PITR surface.
 | `cluster.backup_parallel_channels` | integer | `1` | sighup | Reserved copy-channel capacity for the future backup-set writer. |
 | `cluster.backup_manifest_checksums` | enum | `crc32c` | sighup | Manifest checksums are mandatory; unchecked manifests are not supported. |
 
-The current implementation is intentionally conservative.  A
-single-node cluster can create a cluster manifest via
-`pg_cluster_backup_start()` / `pg_cluster_backup_stop()`.  If declared
-peers exist, mutating backup and restore-point functions require the
-LMON-mediated coordinator/peer ACK path to complete.  Missing peer
-ACKs, peer NAKs, disconnected peers, or topology changes during a
-backup fail closed instead of producing a partial backup or an
-unreachable PITR target.
+The current implementation is intentionally conservative.  These GUCs
+expose the 6.5 catalog and state surface, but mutating cluster physical
+backup and restore-point entry points fail closed with
+`feature_not_supported` until the physical capture, durable WAL pin,
+commit-drain restore-point barrier, restore, and PITR replay paths are
+implemented.  The server refuses to publish a manifest or restore point
+when those proofs are absent.
 
 ### `cluster.interconnect_tier`
 

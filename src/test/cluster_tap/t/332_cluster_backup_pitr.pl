@@ -17,13 +17,37 @@ use strict;
 use warnings;
 
 use FindBin;
+use IO::Socket::INET;
 use lib "$FindBin::RealBin/../lib";
 
 use PgracClusterNode;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
-my $node = PgracClusterNode->new('cluster_backup_single');
+my $next_high_port = $ENV{PGRAC_BACKUP_TAP_PORT_BASE} // 60432;
+
+sub next_free_high_port
+{
+	for (1 .. 256)
+	{
+		my $port = $next_high_port++;
+		my $sock = IO::Socket::INET->new(
+			Listen    => 5,
+			LocalAddr => '127.0.0.1',
+			LocalPort => $port,
+			Proto     => 'tcp',
+			ReuseAddr => 1);
+		if ($sock)
+		{
+			close $sock;
+			return $port;
+		}
+	}
+	die "could not find a free high TCP port for cluster backup TAP";
+}
+
+my $node = PgracClusterNode->new('cluster_backup_single',
+	port => next_free_high_port());
 $node->init(allows_streaming => 1);
 $node->append_conf('postgresql.conf',
 	  "cluster.enabled = on\n"
@@ -50,68 +74,68 @@ is($node->safe_psql('postgres',
 	'latest,pause,t,ok',
 	'L2 default PITR target status is latest/pause/ok');
 
-my $backup_row = $node->safe_psql('postgres',
-	q{SELECT s.backup_id || ',' ||
-	          CASE WHEN s.start_redo_lsn IS NOT NULL THEN 't' ELSE 'f' END || ',' ||
-	          CASE WHEN s.checkpoint_lsn IS NOT NULL THEN 't' ELSE 'f' END || ',' ||
-	          CASE WHEN t.consistent_scn > 0 THEN 't' ELSE 'f' END || ',' ||
-	          CASE WHEN t.stop_cut_lsn IS NOT NULL THEN 't' ELSE 'f' END || ',' ||
-	          CASE WHEN t.manifest_crc > 0 THEN 't' ELSE 'f' END || ',' ||
-	          CASE WHEN t.backup_label LIKE '%CLUSTER_BACKUP_ID: b332%' THEN 't' ELSE 'f' END || ',' ||
-	          CASE WHEN t.backup_label LIKE '%CLUSTER_MANIFEST_CRC32C:%' THEN 't' ELSE 'f' END
-	     FROM pg_cluster_backup_start('b332', true) AS s
-	     CROSS JOIN LATERAL
-	          pg_cluster_backup_stop(COALESCE(s.backup_id = '', false)) AS t});
-is($backup_row, 'b332,t,t,t,t,t,t,t',
-	'L3 cluster backup start/stop returns checkpoint, SCN, LSN, CRC, and label contract');
+my ($backup_ret, $backup_out, $backup_err) = $node->psql('postgres',
+	"\\set VERBOSITY verbose\nSELECT * FROM pg_cluster_backup_start('b332', true)");
+isnt($backup_ret, 0,
+	'L3 cluster backup start fails closed until physical capture lands');
+like($backup_err, qr/0A000|feature_not_supported/,
+	'L3 cluster backup start reports feature_not_supported');
+like($backup_err, qr/physical backup capture|durable WAL pinning|restore integration/,
+	'L3 cluster backup start names the missing substrate');
 
 is($node->safe_psql('postgres',
-	q{SELECT backup_id || ',' || node_count || ',' || thread_count || ',' ||
-	          CASE WHEN manifest_crc > 0 THEN 't' ELSE 'f' END
-	     FROM pg_cluster_backup_history}),
-	'b332,1,1,t',
-	'L4 latest manifest summary is visible');
+	q{SELECT CASE WHEN in_progress THEN 't' ELSE 'f' END
+	     FROM pg_stat_cluster_backup}),
+	'f',
+	'L4 rejected cluster backup does not leave in-progress state');
+is($node->safe_psql('postgres',
+	q{SELECT count(*) FROM pg_cluster_backup_history}),
+	'0',
+	'L4 rejected cluster backup does not publish a manifest');
+
+my ($rp_ret, $rp_out, $rp_err) = $node->psql('postgres',
+	"\\set VERBOSITY verbose\nSELECT * FROM pg_cluster_create_restore_point('rp332')");
+isnt($rp_ret, 0,
+	'L5 cluster restore point fails closed until commit-drain lands');
+like($rp_err, qr/0A000|feature_not_supported/,
+	'L5 cluster restore point reports feature_not_supported');
+like($rp_err, qr/restore-point commit-drain barrier/,
+	'L5 cluster restore point names the missing barrier');
 
 is($node->safe_psql('postgres',
-	q{SELECT restore_point_name || ',' ||
-	          CASE WHEN cut_scn > 0 THEN 't' ELSE 'f' END || ',' ||
-	          CASE WHEN cut_lsn IS NOT NULL THEN 't' ELSE 'f' END
-	     FROM pg_cluster_create_restore_point('rp332')}),
-	'rp332,t,t',
-	'L5 cluster restore point records SCN and LSN');
-
-is($node->safe_psql('postgres',
-	q{SELECT count(*) FROM pg_cluster_restore_points
-	    WHERE restore_point_name IN ('b332', 'rp332')}),
-	'2',
-	'L6 backup stop and manual restore point are retained');
+	q{SELECT count(*) FROM pg_cluster_restore_points}),
+	'0',
+	'L6 rejected restore point is not retained');
 
 $node->stop;
 
-my $peer_node = PgracClusterNode->new('cluster_backup_peers');
+my $peer_node = PgracClusterNode->new('cluster_backup_peers',
+	port => next_free_high_port());
+my $peer_ic0 = next_free_high_port();
+my $peer_ic1 = next_free_high_port();
 $peer_node->init(allows_streaming => 1);
 $peer_node->append_conf('postgresql.conf',
 	  "cluster.enabled = on\n"
 	. "cluster.node_id = 0\n"
 	. "cluster.allow_single_node = on\n"
 	. "wal_level = replica\n");
-PostgreSQL::Test::Utils::append_to_file($peer_node->data_dir . '/pgrac.conf', <<'EOC');
+PostgreSQL::Test::Utils::append_to_file($peer_node->data_dir . '/pgrac.conf', <<EOC);
 [cluster]
 name = pgrac-backup-peer-failclosed
 
 [node.0]
-interconnect_addr = 127.0.0.1:6432
+interconnect_addr = 127.0.0.1:$peer_ic0
 
 [node.1]
-interconnect_addr = 127.0.0.1:6433
+interconnect_addr = 127.0.0.1:$peer_ic1
 EOC
 $peer_node->start;
 
 my ($ret, $out, $err) = $peer_node->psql('postgres',
 	"\\set VERBOSITY verbose\nSELECT * FROM pg_cluster_backup_start('partial', true)");
-isnt($ret, 0, 'L8 peer topology requires complete backup ACKs');
-like($err, qr/53RAD|cluster_backup_incomplete/,
-	'L8 missing peer ACK fails closed with cluster_backup_incomplete');
+isnt($ret, 0, 'L8 declared-peer backup remains fail-closed without capture substrate');
+like($err, qr/0A000|feature_not_supported/,
+	'L8 declared-peer backup reports feature_not_supported');
 is($peer_node->safe_psql('postgres',
 	q{SELECT CASE WHEN in_progress THEN 't' ELSE 'f' END
 	     FROM pg_stat_cluster_backup}),
@@ -120,7 +144,8 @@ is($peer_node->safe_psql('postgres',
 
 $peer_node->stop;
 
-my $bad_target_node = PgracClusterNode->new('cluster_backup_bad_target');
+my $bad_target_node = PgracClusterNode->new('cluster_backup_bad_target',
+	port => next_free_high_port());
 $bad_target_node->init(allows_streaming => 1);
 $bad_target_node->append_conf('postgresql.conf',
 	  "cluster.enabled = on\n"

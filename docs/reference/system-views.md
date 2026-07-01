@@ -24,18 +24,16 @@ state used by `pg_cluster_backup_start`, `pg_cluster_backup_stop`, and
 
 Current 6.5 scope is conservative:
 
-- A single-node cluster can start and stop a cluster-aware physical
-  backup.  The backup label returned by `pg_cluster_backup_stop`
-  includes native PostgreSQL label content followed by `CLUSTER_*`
-  metadata lines.
-- If the node has declared peers, the mutating backup/restore-point
-  functions require LMON-mediated peer ACKs.  Missing ACKs, peer NAKs,
-  disconnected peers, or a changed peer set fail closed with a cluster
-  backup SQLSTATE rather than silently producing a partial backup.
-- The manifest records WAL thread, undo, transaction-table, SCN, and
-  control-file inclusion state for the proven cut.  In a peer topology
-  the manifest is written only after every start-time peer has returned
-  STOP metadata for its WAL thread.
+- The views, catalog entries, manifest validators, PITR target resolver,
+  shared-memory state, and IC wire format are present as substrate.
+- Mutating physical backup and restore-point entry points fail closed
+  with `feature_not_supported` until the cluster physical capture,
+  durable WAL pin, restore-point commit-drain barrier, restore, and PITR
+  replay paths are implemented.
+- No manifest is published unless WAL, undo, transaction-table, SCN, and
+  control-file inclusion are proven.  The current substrate therefore
+  refuses to create a manifest instead of reporting a partial or unsound
+  backup as complete.
 
 ### `pg_stat_cluster_backup`
 
