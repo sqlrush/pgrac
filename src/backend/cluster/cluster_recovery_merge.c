@@ -74,18 +74,6 @@ uint64 cluster_recmerge_window_scn = 0;
 uint64 cluster_recmerge_window_own_lsn = 0;
 bool cluster_recmerge_apply_foreign = false;
 
-static XLogRecPtr
-merge_validated_lsn_floor(XLogRecPtr highest_lsn)
-{
-	XLogRecPtr prior;
-
-	if (XLogRecPtrIsInvalid(highest_lsn))
-		return InvalidXLogRecPtr;
-
-	prior = highest_lsn - 1;
-	return prior - (prior % XLOG_BLCKSZ);
-}
-
 void
 cluster_recovery_merge_window_enter(void)
 {
@@ -675,17 +663,9 @@ cluster_recovery_merge_decide(uint16 own_thread, XLogRecPtr own_redo, uint64 out
  * startup process (after merge_decide), so -- unlike spec-4.5a v0.5's
  * worker-pool stream_valid_end_lsn ABI -- no cross-process concurrency or
  * release/acquire is involved; the P1-3 torn-snapshot hazard cannot arise.
- *
- * The registry highest_lsn is an observational write watermark, not a promise
- * that the final WAL page contains a complete record.  Crash windows around
- * pg_switch_wal() can advance highest_lsn into the next segment's first page
- * before any complete post-switch record exists.  Therefore the hard
- * fail-closed floor is the start of the WAL page containing highest_lsn - 1:
- * corruption before that page is below the validated end; a decode stop inside
- * that final page is a legitimate torn tail.
  */
 static XLogRecPtr
-merge_compute_valid_end(const char *dir, XLogRecPtr start_lsn, XLogRecPtr validated_floor,
+merge_compute_valid_end(const char *dir, XLogRecPtr start_lsn, XLogRecPtr validated_min,
 						bool is_candidate, uint16 tid, TimeLineID tli)
 {
 	MergeStream tmp;
@@ -729,23 +709,22 @@ merge_compute_valid_end(const char *dir, XLogRecPtr start_lsn, XLogRecPtr valida
 	 *       the start (the worst case -- it would drop EVERYTHING).  This is
 	 *       reliable regardless of the observational highest_lsn cadence.
 	 *
-	 *   (b) valid_end < validated_floor: the registry's highest_lsn watermark,
-	 *       rounded down to the start of its last WAL page, sits past where
-	 *       decode stopped -> mid-stream corruption.  The last observed page is
-	 *       intentionally excluded because it can be a crash-time torn tail.
-	 *       Only enforced when the floored watermark is fresh enough to exceed
-	 *       start_lsn; otherwise (a) is the floor.
+	 *   (b) valid_end < validated_min: the registry's highest_lsn watermark
+	 *       (refreshed AFTER the bytes were written, hence a safe lower bound)
+	 *       sits past where decode stopped -> mid-stream corruption.  Only
+	 *       enforced when the watermark is fresh enough to exceed start_lsn;
+	 *       otherwise (a) is the floor.
 	 */
 	if (is_candidate
 		&& (valid_end == start_lsn
-			|| (validated_floor != InvalidXLogRecPtr && valid_end < validated_floor)))
+			|| (validated_min != InvalidXLogRecPtr && valid_end < validated_min)))
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
 						errmsg("merged recovery: thread %u WAL is corrupt below the validated end",
 							   (unsigned)tid),
 						errdetail("decoded through %X/%X from checkpoint redo %X/%X; the registry "
-								  "validated complete pages through %X/%X.",
+								  "recorded durable writes through %X/%X.",
 								  LSN_FORMAT_ARGS(valid_end), LSN_FORMAT_ARGS(start_lsn),
-								  LSN_FORMAT_ARGS(validated_floor)),
+								  LSN_FORMAT_ARGS(validated_min)),
 						errhint("A crashed peer's WAL stream is truncated or corrupt before its "
 								"recorded end; recover this node's own stream with "
 								"cluster.merged_recovery=off.")));
@@ -791,20 +770,16 @@ cluster_recovery_merge_begin(const uint64 merge_bitmap[2], const XLogRecPtr *sta
 		XLogBeginRead(ms->reader, start_lsn[tid]);
 		{
 			/* spec-4.5a hard obligation 2: bound the validated end by the
-			 * candidate's registry-recorded highest_lsn, minus its final WAL
-			 * page.  A stream whose decode stops short of that floor is
-			 * corrupt below the validated end, not a torn tail -- fail-closed
-			 * in the helper. */
+			 * candidate's registry-recorded highest_lsn (durable write end).
+			 * A stream whose decode stops short of it is corrupt below the
+			 * validated end, not a torn tail -- fail-closed in the helper. */
 			ClusterWalStateSlot slot;
-			XLogRecPtr validated_floor = InvalidXLogRecPtr;
+			XLogRecPtr validated_min = InvalidXLogRecPtr;
 
 			if (cluster_wal_state_read_slot(tid, &slot) == CLUSTER_WAL_SLOT_OK
-				&& slot.highest_lsn > (uint64)start_lsn[tid]) {
-				validated_floor = merge_validated_lsn_floor((XLogRecPtr)slot.highest_lsn);
-				if (validated_floor <= start_lsn[tid])
-					validated_floor = InvalidXLogRecPtr;
-			}
-			ms->valid_end = merge_compute_valid_end(ms->dir, start_lsn[tid], validated_floor,
+				&& slot.highest_lsn > (uint64)start_lsn[tid])
+				validated_min = (XLogRecPtr)slot.highest_lsn;
+			ms->valid_end = merge_compute_valid_end(ms->dir, start_lsn[tid], validated_min,
 													tid != own_thread, tid, tli);
 		}
 		ms->last_end = start_lsn[tid];
