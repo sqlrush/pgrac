@@ -45,6 +45,7 @@
 #include "postgres.h"
 
 #include <signal.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "cluster/cluster_conf.h"
@@ -147,6 +148,17 @@ void
 elog_finish(int e pg_attribute_unused(), const char *f pg_attribute_unused(), ...)
 {}
 
+sigjmp_buf *PG_exception_stack = NULL;
+ErrorContextCallback *error_context_stack = NULL;
+
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	abort();
+}
+
 /*
  * spec-5.16 — test-only flag to force the GRD shmem stub to re-run its full
  * init (so the join-fence suite gets a clean recovery_done_epoch / fence /
@@ -173,9 +185,7 @@ ShmemInitStruct(const char *name, Size size, bool *foundPtr)
 			 * standalone shmem stub's alignment to at least 8 bytes for
 			 * pg_atomic_uint64 fields inside ClusterGrdShared. */
 			uint64 force_align;
-			char data[131072]; /* 3×4096 atomic uint32 arrays + counters < 50KB
-								* (spec-4.6 adds master_generation[] + shard_phase[]);
-								* buffer 128KB 充足 */
+			char data[262144]; /* ClusterGrdShared includes 4096 shard lists. */
 		} grd_buf;
 		static bool grd_initialized = false;
 
@@ -251,6 +261,8 @@ cluster_cssd_get_peer_state(int32 peer_id pg_attribute_unused())
  * → skeleton mode → lookup_or_create returns NOT_READY; the soft-cap
  * regression test sets 1 and drives a tiny fake HTAB path. */
 int cluster_grd_max_entries = 0;
+bool cluster_grd_entry_reclaim = true;
+int cluster_grd_entry_reclaim_max_per_sweep = 256;
 
 /* spec-5.10 — GES starvation-fairness GUC stub (cluster_grd.o references it). */
 int cluster_ges_starvation_max_skips = 8;
@@ -422,13 +434,14 @@ cluster_grd_outbound_enqueue_backend_request(uint32 dest_node_id pg_attribute_un
 	return true;
 }
 
-#define FAKE_GRD_HTAB_MAX_ENTRIES 4
+#define FAKE_GRD_HTAB_MAX_ENTRIES 320
 #define FAKE_GRD_HTAB_ENTRY_BYTES 4096
 
 static int fake_grd_htab_token;
 static int fake_grd_htab_count;
 static int fake_grd_htab_seq_index;
 static Size fake_grd_entrysize;
+static bool fake_grd_htab_used[FAKE_GRD_HTAB_MAX_ENTRIES];
 static union {
 	uint64 force_align;
 	char data[FAKE_GRD_HTAB_MAX_ENTRIES][FAKE_GRD_HTAB_ENTRY_BYTES];
@@ -437,9 +450,11 @@ static union {
 static void
 reset_fake_grd_htab(void)
 {
+	ut_reset_grd_shmem();
 	fake_grd_htab_count = 0;
 	fake_grd_htab_seq_index = 0;
 	fake_grd_entrysize = 0;
+	memset(fake_grd_htab_used, 0, sizeof(fake_grd_htab_used));
 	memset(&fake_grd_htab_entries, 0, sizeof(fake_grd_htab_entries));
 }
 
@@ -463,6 +478,7 @@ ShmemInitHash(const char *name pg_attribute_unused(), long init_size pg_attribut
 
 	fake_grd_entrysize = infoP->entrysize;
 	fake_grd_htab_count = 0;
+	memset(fake_grd_htab_used, 0, sizeof(fake_grd_htab_used));
 	memset(&fake_grd_htab_entries, 0, sizeof(fake_grd_htab_entries));
 	return (HTAB *)&fake_grd_htab_token;
 }
@@ -484,17 +500,17 @@ hash_search_with_hash_value(HTAB *hashp pg_attribute_unused(),
 	Assert(keyPtr != NULL);
 	Assert(fake_grd_entrysize > 0);
 
-	for (i = 0; i < fake_grd_htab_count; i++) {
+	for (i = 0; i < FAKE_GRD_HTAB_MAX_ENTRIES; i++) {
 		char *entry = fake_grd_htab_entries.data[i];
 
+		if (!fake_grd_htab_used[i])
+			continue;
 		if (memcmp(entry, keyPtr, sizeof(ClusterResId)) == 0) {
 			if (action == HASH_REMOVE) {
 				if (foundPtr != NULL)
 					*foundPtr = true;
-				if (i < fake_grd_htab_count - 1)
-					memcpy(fake_grd_htab_entries.data[i],
-						   fake_grd_htab_entries.data[fake_grd_htab_count - 1], fake_grd_entrysize);
-				memset(fake_grd_htab_entries.data[fake_grd_htab_count - 1], 0, fake_grd_entrysize);
+				fake_grd_htab_used[i] = false;
+				memset(entry, 0, fake_grd_entrysize);
 				fake_grd_htab_count--;
 				return entry;
 			}
@@ -516,7 +532,16 @@ hash_search_with_hash_value(HTAB *hashp pg_attribute_unused(),
 		if (fake_grd_htab_count >= FAKE_GRD_HTAB_MAX_ENTRIES)
 			return NULL;
 
-		entry = fake_grd_htab_entries.data[fake_grd_htab_count++];
+		for (i = 0; i < FAKE_GRD_HTAB_MAX_ENTRIES; i++)
+			if (!fake_grd_htab_used[i])
+				break;
+		Assert(i < FAKE_GRD_HTAB_MAX_ENTRIES);
+		if (i >= FAKE_GRD_HTAB_MAX_ENTRIES)
+			return NULL;
+
+		fake_grd_htab_used[i] = true;
+		fake_grd_htab_count++;
+		entry = fake_grd_htab_entries.data[i];
 		memset(entry, 0, fake_grd_entrysize);
 		memcpy(entry, keyPtr, sizeof(ClusterResId));
 		return entry;
@@ -534,9 +559,13 @@ hash_seq_init(HASH_SEQ_STATUS *status pg_attribute_unused(), HTAB *hashp pg_attr
 void *
 hash_seq_search(HASH_SEQ_STATUS *status pg_attribute_unused())
 {
-	if (fake_grd_htab_seq_index >= fake_grd_htab_count)
-		return NULL;
-	return fake_grd_htab_entries.data[fake_grd_htab_seq_index++];
+	while (fake_grd_htab_seq_index < FAKE_GRD_HTAB_MAX_ENTRIES) {
+		int i = fake_grd_htab_seq_index++;
+
+		if (fake_grd_htab_used[i])
+			return fake_grd_htab_entries.data[i];
+	}
+	return NULL;
 }
 
 /* spec-5.13 S3/D4 stub: cluster_grd_clean_leave_verify_no_leftover early-
@@ -638,11 +667,15 @@ typedef struct UtWfgEdge {
 
 static UtWfgEdge ut_wfg[UT_WFG_MAX];
 static int ut_wfg_n = 0;
+static bool ut_wfg_throw_on_submit_once = false;
+static bool ut_wfg_throw_on_cancel_once = false;
 
 static void
 ut_wfg_reset(void)
 {
 	ut_wfg_n = 0;
+	ut_wfg_throw_on_submit_once = false;
+	ut_wfg_throw_on_cancel_once = false;
 	memset(ut_wfg, 0, sizeof(ut_wfg));
 }
 
@@ -661,6 +694,12 @@ cluster_lmd_submit_wait_edge_real(const ClusterLmdVertex *waiter, const ClusterL
 {
 	int i;
 
+	if (ut_wfg_throw_on_submit_once) {
+		ut_wfg_throw_on_submit_once = false;
+		if (PG_exception_stack != NULL)
+			siglongjmp(*PG_exception_stack, 1);
+		abort();
+	}
 	if (waiter == NULL || blocker == NULL)
 		return false;
 	if (ut_vtx_eq(waiter, blocker)) /* self-edge rejected (graph defensive) */
@@ -682,6 +721,12 @@ cluster_lmd_cancel_wait_edge_real(const ClusterLmdVertex *waiter)
 {
 	int i;
 
+	if (ut_wfg_throw_on_cancel_once) {
+		ut_wfg_throw_on_cancel_once = false;
+		if (PG_exception_stack != NULL)
+			siglongjmp(*PG_exception_stack, 1);
+		abort();
+	}
 	if (waiter == NULL)
 		return;
 	for (i = 0; i < ut_wfg_n;) {
@@ -1156,8 +1201,7 @@ UT_TEST(test_grd_named_tranche_describe_only)
 
 UT_TEST(test_grd_entry_release_no_op_safe)
 {
-	/* RESERVED no-op contract (P1.3):  cluster_grd_entry_release(NULL)
-	 * must not crash;  no side effect promised. */
+	/* spec-6.3a: NULL release must remain safe for cleanup-style callers. */
 	cluster_grd_entry_release(NULL);
 	UT_ASSERT_EQ(1, 1); /* reaching here suffices */
 }
@@ -1192,6 +1236,283 @@ UT_TEST(test_grd_hash_source_unification)
 	shard_b = cluster_grd_shard_for_resource(&resid);
 
 	UT_ASSERT_EQ(shard_a, shard_b);
+}
+
+static void
+grd_lifecycle_reset(int max_entries)
+{
+	ut_reset_grd_shmem();
+	reset_fake_grd_htab();
+	cluster_grd_max_entries = max_entries;
+	cluster_grd_entry_reclaim = true;
+	cluster_grd_entry_reclaim_max_per_sweep = 256;
+	cluster_node_id = 0;
+	cluster_grd_shmem_init();
+}
+
+static void
+grd_lifecycle_resid(uint32 field1, ClusterResId *resid)
+{
+	LOCKTAG src;
+
+	memset(&src, 0, sizeof(src));
+	src.locktag_field1 = field1;
+	src.locktag_type = LOCKTAG_RELATION;
+	src.locktag_lockmethodid = 1;
+	cluster_grd_resid_encode(&src, resid);
+}
+
+static ClusterGrdHolderId
+grd_lifecycle_holder(int32 node_id, uint32 procno, uint64 request_id)
+{
+	ClusterGrdHolderId holder;
+
+	memset(&holder, 0, sizeof(holder));
+	holder.node_id = node_id;
+	holder.procno = procno;
+	holder.cluster_epoch = 1;
+	holder.request_id = request_id;
+	return holder;
+}
+
+static ClusterGrdConvert
+grd_lifecycle_convert_req(int32 node_id, uint32 procno, LOCKMODE current_mode,
+						  LOCKMODE requested_mode, uint64 request_id)
+{
+	ClusterGrdConvert req;
+
+	memset(&req, 0, sizeof(req));
+	req.node_id = node_id;
+	req.source_node_id = node_id;
+	req.procno = procno;
+	req.cluster_epoch = 1;
+	req.current_mode = current_mode;
+	req.requested_mode = requested_mode;
+	req.convert_request_id = request_id;
+	req.request_opcode = 2; /* mirror GES_REQ_OPCODE_CONVERT without cluster_ges.h */
+	return req;
+}
+
+UT_TEST(test_grd_entry_pin_release_reclaims_cold)
+{
+	ClusterResId resid;
+	ClusterGrdEntry *first = NULL;
+	ClusterGrdEntry *second = NULL;
+	ClusterGrdEntry *again = NULL;
+	ClusterGrdEntry *after = (ClusterGrdEntry *)0xdeadbeef;
+	uint64 skipped_before;
+	uint64 reclaimed_before;
+
+	grd_lifecycle_reset(4);
+	grd_lifecycle_resid(6301, &resid);
+
+	skipped_before = cluster_grd_reclaim_skipped_pinned_count();
+	reclaimed_before = cluster_grd_entries_reclaimed_count();
+
+	UT_ASSERT_EQ((int)cluster_grd_entry_lookup_or_create(&resid, true, &first),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_pin_count(first), 1);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 1);
+
+	UT_ASSERT_EQ((int)cluster_grd_entry_lookup_or_create(&resid, true, &second),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ((void *)second, (void *)first);
+	UT_ASSERT_EQ(cluster_grd_entry_pin_count(first), 2);
+	UT_ASSERT(cluster_grd_pin_high_water() >= 2);
+
+	UT_ASSERT(!cluster_grd_reclaim_if_cold(&resid));
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 1);
+	UT_ASSERT_EQ(cluster_grd_reclaim_skipped_pinned_count(), skipped_before + 1);
+
+	cluster_grd_entry_release(second);
+	UT_ASSERT_EQ(cluster_grd_entry_pin_count(first), 1);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 1);
+
+	cluster_grd_entry_release(first);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+	UT_ASSERT_EQ(cluster_grd_entries_reclaimed_count(), reclaimed_before + 1);
+
+	UT_ASSERT_EQ((int)cluster_grd_entry_lookup_or_create(&resid, false, &after),
+				 (int)CLUSTER_GRD_ENTRY_NOT_FOUND);
+	UT_ASSERT_EQ((void *)after, (void *)NULL);
+
+	/* Reusing the same resource after reclaim must start from a clean pin/state. */
+	UT_ASSERT_EQ((int)cluster_grd_entry_lookup_or_create(&resid, true, &again),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_pin_count(again), 1);
+	UT_ASSERT(!cluster_grd_entry_is_reclaimable(again));
+	cluster_grd_entry_release(again);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+
+	cluster_grd_max_entries = 0;
+	reset_fake_grd_htab();
+}
+
+UT_TEST(test_grd_reclaim_sweep_reclaims_legacy_cold_entries)
+{
+	ClusterGrdEntry *entry = NULL;
+	uint64 runs_before;
+	int i;
+
+	grd_lifecycle_reset(4);
+	cluster_grd_entry_reclaim = false;
+
+	for (i = 0; i < 3; i++) {
+		ClusterResId resid;
+
+		grd_lifecycle_resid((uint32)(6310 + i), &resid);
+		UT_ASSERT_EQ((int)cluster_grd_entry_lookup_or_create(&resid, true, &entry),
+					 (int)CLUSTER_GRD_ENTRY_OK);
+		cluster_grd_entry_release(entry);
+		UT_ASSERT_EQ(cluster_grd_entry_count(), i + 1);
+	}
+
+	runs_before = cluster_grd_sweep_runs();
+	UT_ASSERT_EQ(cluster_grd_reclaim_sweep(), 0);
+	UT_ASSERT_EQ(cluster_grd_sweep_runs(), runs_before);
+
+	cluster_grd_entry_reclaim = true;
+	cluster_grd_entry_reclaim_max_per_sweep = 2;
+	UT_ASSERT_EQ(cluster_grd_reclaim_sweep(), 2);
+	UT_ASSERT_EQ(cluster_grd_sweep_runs(), runs_before + 1);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 1);
+
+	cluster_grd_entry_reclaim_max_per_sweep = 256;
+	UT_ASSERT_EQ(cluster_grd_reclaim_sweep(), 1);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+
+	cluster_grd_max_entries = 0;
+	reset_fake_grd_htab();
+}
+
+UT_TEST(test_grd_reclaim_sweep_honors_large_batch_guc)
+{
+	ClusterGrdEntry *entry = NULL;
+	int i;
+
+	grd_lifecycle_reset(320);
+	cluster_grd_entry_reclaim = false;
+
+	for (i = 0; i < 300; i++) {
+		ClusterResId resid;
+
+		grd_lifecycle_resid((uint32)(6340 + i), &resid);
+		UT_ASSERT_EQ((int)cluster_grd_entry_lookup_or_create(&resid, true, &entry),
+					 (int)CLUSTER_GRD_ENTRY_OK);
+		cluster_grd_entry_release(entry);
+	}
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 300);
+
+	cluster_grd_entry_reclaim = true;
+	cluster_grd_entry_reclaim_max_per_sweep = 300;
+	UT_ASSERT_EQ(cluster_grd_reclaim_sweep(), 300);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+
+	cluster_grd_max_entries = 0;
+	reset_fake_grd_htab();
+}
+
+UT_TEST(test_grd_reclaim_excludes_live_state)
+{
+	ClusterResId resid;
+	ClusterGrdEntry *entry = NULL;
+	ClusterGrdHolderId h1;
+	ClusterGrdHolderId h2;
+	ClusterGrdConvert creq;
+	bool drain = false;
+
+	grd_lifecycle_reset(4);
+
+	grd_lifecycle_resid(6320, &resid);
+	h1 = grd_lifecycle_holder(1, 10, 100);
+	UT_ASSERT_EQ((int)cluster_grd_entry_lookup_or_create(&resid, true, &entry),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ((int)cluster_grd_entry_grant_holder(entry, &h1, ShareLock),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	cluster_grd_entry_release(entry);
+	UT_ASSERT(!cluster_grd_reclaim_if_cold(&resid));
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 1);
+	UT_ASSERT_EQ((int)cluster_grd_release_holder_by_id(&resid, &h1), (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+
+	grd_lifecycle_resid(6321, &resid);
+	h1 = grd_lifecycle_holder(1, 11, 101);
+	UT_ASSERT_EQ((int)cluster_grd_entry_lookup_or_create(&resid, true, &entry),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ((int)cluster_grd_entry_add_waiter(entry, &h1, ExclusiveLock),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	cluster_grd_entry_release(entry);
+	UT_ASSERT(!cluster_grd_reclaim_if_cold(&resid));
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 1);
+	UT_ASSERT_EQ((int)cluster_grd_cancel_waiter_by_id(&resid, &h1), (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+
+	grd_lifecycle_resid(6322, &resid);
+	h1 = grd_lifecycle_holder(1, 12, 102);
+	UT_ASSERT_EQ((int)cluster_grd_entry_lookup_or_create(&resid, true, &entry),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ((int)cluster_grd_reservation_create(entry, &h1, ShareLock),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	cluster_grd_entry_release(entry);
+	UT_ASSERT(!cluster_grd_reclaim_if_cold(&resid));
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 1);
+	UT_ASSERT_EQ((int)cluster_grd_cancel_reservation_by_id(&resid, &h1), (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+
+	grd_lifecycle_resid(6323, &resid);
+	h1 = grd_lifecycle_holder(1, 13, 103);
+	h2 = grd_lifecycle_holder(2, 14, 104);
+	UT_ASSERT_EQ((int)cluster_grd_entry_lookup_or_create(&resid, true, &entry),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ((int)cluster_grd_entry_grant_holder(entry, &h1, ShareLock),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ((int)cluster_grd_entry_grant_holder(entry, &h2, ShareLock),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	creq = grd_lifecycle_convert_req(1, 13, ShareLock, AccessExclusiveLock, 203);
+	UT_ASSERT_EQ((int)cluster_grd_entry_request_convert(entry, &creq, &drain),
+				 (int)CLUSTER_GRD_CONVERT_ENQUEUED);
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(entry), 1);
+	cluster_grd_entry_release(entry);
+	UT_ASSERT(!cluster_grd_reclaim_if_cold(&resid));
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 1);
+	h1.request_id = 203;
+	UT_ASSERT_EQ((int)cluster_grd_cancel_convert_by_id(&resid, &h1, 0), (int)CLUSTER_GRD_ENTRY_OK);
+	h1.request_id = 103;
+	UT_ASSERT_EQ((int)cluster_grd_release_holder_by_id(&resid, &h2), (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ((int)cluster_grd_release_holder_by_id(&resid, &h1), (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+
+	cluster_grd_max_entries = 0;
+	reset_fake_grd_htab();
+}
+
+UT_TEST(test_grd_entry_release_overrelease_fail_safe)
+{
+	ClusterResId resid;
+	ClusterGrdEntry *entry = NULL;
+	ClusterGrdHolderId holder;
+
+	grd_lifecycle_reset(4);
+	grd_lifecycle_resid(6330, &resid);
+	holder = grd_lifecycle_holder(1, 20, 200);
+
+	UT_ASSERT_EQ((int)cluster_grd_entry_lookup_or_create(&resid, true, &entry),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ((int)cluster_grd_entry_grant_holder(entry, &holder, ShareLock),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	cluster_grd_entry_release(entry);
+	UT_ASSERT_EQ(cluster_grd_entry_pin_count(entry), 0);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 1);
+
+	cluster_grd_entry_release(entry);
+	UT_ASSERT_EQ(cluster_grd_entry_pin_count(entry), 0);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 1);
+
+	UT_ASSERT_EQ((int)cluster_grd_release_holder_by_id(&resid, &holder), (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+
+	cluster_grd_max_entries = 0;
+	reset_fake_grd_htab();
 }
 
 /* ============================================================
@@ -1334,6 +1655,7 @@ UT_TEST(test_grd_transaction_cleanup_on_node_dead_removes_entry)
 				 (int)CLUSTER_GRD_ENTRY_OK);
 	UT_ASSERT_EQ(cluster_grd_entry_has_remote_holder(entry, 0), true);
 	UT_ASSERT_EQ(cluster_grd_entry_has_pending_waiter(entry), true);
+	cluster_grd_entry_release(entry);
 
 	cluster_grd_cleanup_on_node_dead(5);
 
@@ -1382,6 +1704,7 @@ UT_TEST(test_grd_release_and_drain_reclaims_empty_entry)
 	UT_ASSERT_EQ((int)cluster_grd_entry_grant_holder(entry, &h1, ExclusiveLock),
 				 (int)CLUSTER_GRD_ENTRY_OK);
 	UT_ASSERT_EQ(cluster_grd_entry_count(), 1);
+	cluster_grd_entry_release(entry);
 	(void)cluster_grd_release_and_drain(&resid, &h1, granted, lengthof(granted));
 	UT_ASSERT_EQ(cluster_grd_entry_count(), 0); /* empty -> reclaimed */
 
@@ -1403,6 +1726,7 @@ UT_TEST(test_grd_release_and_drain_reclaims_empty_entry)
 	UT_ASSERT_EQ((int)cluster_grd_entry_grant_holder(entry, &h2, AccessShareLock),
 				 (int)CLUSTER_GRD_ENTRY_OK);
 	UT_ASSERT_EQ(cluster_grd_entry_count(), 1);
+	cluster_grd_entry_release(entry);
 	(void)cluster_grd_release_and_drain(&resid, &h1, granted, lengthof(granted));
 	UT_ASSERT_EQ(cluster_grd_entry_count(), 1); /* h2 still holds -> NOT reclaimed */
 	(void)cluster_grd_release_and_drain(&resid, &h2, granted, lengthof(granted));
@@ -1430,6 +1754,7 @@ UT_TEST(test_grd_release_and_drain_reclaims_empty_entry)
 		hx.request_id = (uint64)(200 + i);
 		UT_ASSERT_EQ((int)cluster_grd_entry_grant_holder(e2, &hx, ExclusiveLock),
 					 (int)CLUSTER_GRD_ENTRY_OK);
+		cluster_grd_entry_release(e2);
 		(void)cluster_grd_release_and_drain(&r2, &hx, granted, lengthof(granted));
 	}
 	UT_ASSERT_EQ(cluster_grd_entry_count(), 0); /* no accumulation */
@@ -1479,6 +1804,8 @@ UT_TEST(test_grd_entry_existing_hit_survives_soft_cap)
 	UT_ASSERT_EQ((void *)third, (void *)NULL);
 	UT_ASSERT_EQ(cluster_grd_entry_count(), 1);
 
+	cluster_grd_entry_release(second);
+	cluster_grd_entry_release(first);
 	cluster_grd_max_entries = 0;
 	reset_fake_grd_htab();
 }
@@ -1742,8 +2069,7 @@ convert_reset(void)
 	 * reset_fake_grd_htab() only clears the fake HTAB storage.  The convert
 	 * suite is not exercising the entry cap, so set a max far above the
 	 * total entries the suite ever creates to keep lookup_or_create out of
-	 * the FULL path.  At most ~2 entries are live per fake-HTAB reset, so
-	 * the 4-slot fake storage never overflows.
+	 * the FULL path.  The fake storage is larger than the per-test live set.
 	 */
 	reset_fake_grd_htab();
 	cluster_grd_max_entries = 1000000;
@@ -2723,6 +3049,7 @@ UT_TEST(test_ul_grant_conditional_no_waiter_enqueued)
 														  conflicts, &n_conflict),
 				 (int)CLUSTER_GRD_CONFLICT_NOWAIT);
 	UT_ASSERT_EQ(cluster_grd_entry_ngranted(e), 1); /* node2 NOT added as a holder */
+	cluster_grd_entry_release(e);
 
 	/* Release node1: zero compatible waiters pop (grant_conditional enqueued none). */
 	h = bast_holder(1, 100, 1);
@@ -3098,6 +3425,65 @@ UT_TEST(test_5_8_d1b_u2d_cancel_removes_waiter_edges)
 	UT_ASSERT_EQ(ut_wfg_count_waiter(2, 200, 0, 2), 0);
 
 	cluster_node_id = saved;
+	convert_teardown();
+}
+
+UT_TEST(test_grd_pin_cleanup_on_lmd_submit_error)
+{
+	int saved_node = cluster_node_id;
+	int saved_max_skips = cluster_ges_starvation_max_skips;
+	ClusterResId resid;
+	ClusterGrdHolderId h;
+	ClusterGrdEntry *entry = NULL;
+	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	volatile bool caught = false;
+	int nc = -1;
+
+	cluster_node_id = 0;
+	convert_reset();
+	ut_wfg_reset();
+	cluster_grd_set_starvation_protection(true);
+	cluster_ges_starvation_max_skips = 1;
+	bast_resid(5804, &resid);
+
+	h = bast_holder(1, 100, 1);
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 1, 1, 0, UT_GES_OPCODE_REQUEST,
+														 ShareLock, conflicts, &nc),
+				 (int)CLUSTER_GRD_GRANT_NOW);
+
+	h = bast_holder(2, 200, 2);
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 2, 2, 0, UT_GES_OPCODE_REQUEST,
+														 ExclusiveLock, conflicts, &nc),
+				 (int)CLUSTER_GRD_ENQUEUED_WAITER);
+
+	ut_wfg_throw_on_submit_once = true;
+	h = bast_holder(3, 300, 3);
+	PG_TRY();
+	{
+		(void)cluster_grd_entry_enqueue_or_grant(&resid, &h, 3, 3, 0, UT_GES_OPCODE_REQUEST,
+												 ShareLock, conflicts, &nc);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+
+	UT_ASSERT(caught);
+	UT_ASSERT(!ut_wfg_throw_on_submit_once);
+	UT_ASSERT_EQ((int)cluster_grd_entry_lookup_or_create(&resid, false, &entry),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_pin_count(entry), 1);
+	cluster_grd_entry_release(entry);
+
+	h = bast_holder(2, 200, 2);
+	UT_ASSERT_EQ((int)cluster_grd_cancel_waiter_by_id(&resid, &h), (int)CLUSTER_GRD_ENTRY_OK);
+	h = bast_holder(1, 100, 1);
+	UT_ASSERT_EQ((int)cluster_grd_release_holder_by_id(&resid, &h), (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+
+	cluster_ges_starvation_max_skips = saved_max_skips;
+	cluster_node_id = saved_node;
 	convert_teardown();
 }
 
@@ -3645,8 +4031,12 @@ int
  * other cluster_unit binaries; argv is intentionally unused. */
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(
-		74); /* prior 42; spec-5.3:+6; 5.5:+3; +1 release reclaim; 5.8 D1b:+4 (U2a-d); D1c:+2 (U3a-b); D1e:+2 (U4a-b); 5.9 Hardening:+1 (convert ABA); spec-5.16:+12 (join-remaster U1-U5/U10-U16); +1 (U17 cross-episode fence Hardening) */
+	/* prior 42; spec-5.3:+6; 5.5:+3; +1 release reclaim;
+	 * spec-6.3a:+6 lifecycle; 5.8 D1b:+4 (U2a-d); D1c:+2 (U3a-b);
+	 * D1e:+2 (U4a-b); 5.9 Hardening:+1 (convert ABA);
+	 * spec-5.16:+12 (join-remaster U1-U5/U10-U16);
+	 * +1 (U17 cross-episode fence Hardening). */
+	UT_PLAN(80);
 
 	UT_RUN(test_grd_clusterresid_size_16);
 	UT_RUN(test_grd_resid_encode_decode_roundtrip);
@@ -3662,6 +4052,11 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_grd_named_tranche_describe_only);
 	UT_RUN(test_grd_entry_release_no_op_safe);
 	UT_RUN(test_grd_hash_source_unification);
+	UT_RUN(test_grd_entry_pin_release_reclaims_cold);
+	UT_RUN(test_grd_reclaim_sweep_reclaims_legacy_cold_entries);
+	UT_RUN(test_grd_reclaim_sweep_honors_large_batch_guc);
+	UT_RUN(test_grd_reclaim_excludes_live_state);
+	UT_RUN(test_grd_entry_release_overrelease_fail_safe);
 
 	/* spec-2.26 T-grd-N..N+2 */
 	UT_RUN(test_grd_resid_encode_transaction_roundtrip);
@@ -3720,6 +4115,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_5_8_d1b_u2b_refresh_follows_current_holders);
 	UT_RUN(test_5_8_d1b_u2c_convert_enqueue_registers_edge);
 	UT_RUN(test_5_8_d1b_u2d_cancel_removes_waiter_edges);
+	UT_RUN(test_grd_pin_cleanup_on_lmd_submit_error);
 
 	/* spec-5.8 D1c — waiter xid threaded into the WFG vertex (U3a-b). */
 	UT_RUN(test_5_8_d1c_u3a_request_waiter_carries_xid);

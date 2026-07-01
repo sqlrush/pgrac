@@ -77,7 +77,10 @@ Ordinary lock acquisition, waiting, and release across nodes are unaffected.
 
 The `nconverts` column of `pg_cluster_grd_entries` reports the number of
 pending conversion requests queued on a resource; it is `0` in normal
-operation.
+operation. The diagnostic view snapshots entry keys by walking shard-local
+entry lists under each shard lock and then re-looks up each entry through the
+normal pin/release API before taking the per-entry snapshot, so cold reclaim
+can safely remove holderless entries while diagnostics are active.
 
 ## Blocking notifications
 

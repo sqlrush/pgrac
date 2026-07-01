@@ -12375,9 +12375,10 @@
 
 # spec-2.15 D6 (2026-05-13) -- pg_cluster_grd_entries SRF (oid 8922).
 # Diagnostic/observability only -- NOT for production hot-path queries
-# (P1.5).  hash_seq_search() walks the entire entry HTAB; per-entry
-# slock_t snapshot.  Returns 0 rows when cluster.grd_max_entries=0
-# (skeleton mode) or when the entry table is empty (本 spec 0 caller).
+# (P1.5).  The implementation snapshots keys under the GRD entry table scan
+# lock, then re-lookups through the GRD entry pin/release API before taking
+# the per-entry slock_t snapshot.  Returns 0 rows when cluster.grd_max_entries=0
+# (skeleton mode) or when the entry table is empty.
 { oid => '8922', descr => 'list cluster_grd entry table snapshot (diagnostic only; not for production hot-path queries) (spec-2.15)',
   proname => 'cluster_get_grd_entries', prorows => '1024',
   proretset => 't', provolatile => 's', proparallel => 'r',

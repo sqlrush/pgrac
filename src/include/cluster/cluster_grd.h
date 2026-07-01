@@ -67,6 +67,7 @@
 
 #include "cluster/cluster_conf.h" /* CLUSTER_MAX_NODES (spec-4.6 D1 bitmap sizing) */
 #include "datatype/timestamp.h"	  /* TimestampTz (spec-5.1b ClusterGrdConvert) */
+#include "lib/ilist.h"
 #include "port/atomics.h"
 #include "storage/lock.h" /* LOCKTAG */
 
@@ -190,10 +191,16 @@ typedef struct ClusterGrdShared {
 	 * 删 holder/waiter/convert counter,推 spec-2.16 配 mutator API).
 	 * entry_current_count is an internal current-size source for soft-cap
 	 * and observability; it is not a separate pg_cluster_state row. */
-	pg_atomic_uint64 entry_current_count;	 /* current live HTAB entries */
-	pg_atomic_uint64 entry_create_count;	 /* lifetime ++ on HASH_ENTER_NULL OK + new */
-	pg_atomic_uint64 entry_lookup_hit_count; /* lifetime ++ on OK return (hit 语义;P2.5) */
-	pg_atomic_uint64 entry_full_count;		 /* lifetime ++ on FULL */
+	pg_atomic_uint64 entry_current_count;		   /* current live HTAB entries */
+	pg_atomic_uint64 entry_create_count;		   /* lifetime ++ on HASH_ENTER_NULL OK + new */
+	pg_atomic_uint64 entry_lookup_hit_count;	   /* lifetime ++ on OK return (hit 语义;P2.5) */
+	pg_atomic_uint64 entry_full_count;			   /* lifetime ++ on FULL */
+	pg_atomic_uint64 entries_reclaimed_count;	   /* spec-6.3a: cold entry removes */
+	pg_atomic_uint64 reclaim_skipped_pinned_count; /* spec-6.3a: pin>0 reclaim skips */
+	pg_atomic_uint64 pin_high_water;			   /* spec-6.3a: max observed entry pin */
+	pg_atomic_uint64 sweep_runs;				   /* spec-6.3a: LMON reclaim sweeps */
+	dlist_head
+		entry_shard_lists[PGRAC_GRD_SHARD_COUNT]; /* spec-6.3a: scan-safe per-shard entry lists */
 
 	/* spec-2.16 D1:  4 cap counter + 5 nofail counter (skeleton-init;
 	 * mutator bodies + nofail paths land Step 2-4). */
@@ -759,17 +766,12 @@ extern ClusterGrdEntryResult cluster_grd_entry_lookup_or_create(const ClusterRes
 																bool create, ClusterGrdEntry **out);
 
 /*
- * spec-2.15:  Entry release — RESERVED no-op (v0.3 P1.3 contract unified).
- *
- *  本 spec 不保证任何 side effect:
- *    - 不 decrement refcount
- *    - 不 remove entry from HTAB
- *    - 不改 holders/waiters/converts 状态
- *
- *  caller 调 release 是 stub safe-call (本 spec 0 caller,future spec-2.16+
- *  caller-side 集成时按 reserved no-op 契约调用).  真 refcount + HASH_REMOVE
- *  + reclaim logic 在 spec-2.16 caller-side 实装 (API signature 不变,body
- *  加 logic).
+ * spec-6.3a: Entry release — decrements the lookup pin acquired by
+ * cluster_grd_entry_lookup_or_create().  Every successful lookup returning
+ * CLUSTER_GRD_ENTRY_OK must be paired with exactly one release.  The release
+ * path copies resid before decrement; after pin reaches zero it never
+ * dereferences the old pointer and instead reclaims by value under the shard
+ * LWLock + entry spinlock cold recheck.
  */
 extern void cluster_grd_entry_release(ClusterGrdEntry *entry);
 
@@ -788,12 +790,21 @@ cluster_grd_entry_create_count(void); /* lifetime ++ on HASH_ENTER_NULL OK + new
 extern uint64
 cluster_grd_entry_lookup_hit_count(void); /* lifetime ++ on OK return (atomic;P2.5 hit 语义) */
 extern uint64 cluster_grd_entry_full_count(void); /* lifetime ++ on FULL (atomic) */
+extern uint64 cluster_grd_entries_reclaimed_count(void);
+extern uint64 cluster_grd_reclaim_skipped_pinned_count(void);
+extern uint64 cluster_grd_pin_high_water(void);
+extern uint64 cluster_grd_sweep_runs(void);
+extern uint32 cluster_grd_entry_pin_count(ClusterGrdEntry *entry);
+extern bool cluster_grd_entry_is_reclaimable(ClusterGrdEntry *entry);
+extern bool cluster_grd_reclaim_if_cold(const ClusterResId *resid);
+extern int cluster_grd_reclaim_sweep(void);
 
 
 /*
- * spec-2.15 D8:  SRF row visitor.  Iterates the entry HTAB (when
- * allocated) and invokes `visitor(ctx, row_fields)` per entry under
- * per-entry slock_t snapshot.  The 11 row_fields columns are
+ * spec-2.15 D8 + spec-6.3a: SRF row visitor.  Snapshots entry keys from
+ * shard-local entry lists, re-lookups each key through the lookup-pin API,
+ * and invokes `visitor(ctx, row_fields)` per entry under per-entry
+ * slock_t snapshot.  The 11 row_fields columns are
  * (shard_id, field1, field2, field3, field4, type, lockmethodid,
  * ngranted, nwaiters, nconverts, state_flags) — all stored as int32.
  *
@@ -801,12 +812,6 @@ extern uint64 cluster_grd_entry_full_count(void); /* lifetime ++ on FULL (atomic
  * srf.c) emit rows without exposing the private ClusterGrdEntry layout.
  * GUC=0 / htab==NULL → visitor invoked zero times (caller sees empty
  * result set, matching the NOT_READY sentinel surface).
- *
- * **spec-2.16 forward-link (P2.4 + I14)**:  before caller-side
- * LockAcquire 集成 ships, this visitor must amend locking — wrap
- * hash_seq_search in full 4096-shard LW_SHARED acquire or chunked
- * snapshot to defend concurrent HASH_ENTER_NULL writers.  本 spec
- * 0 caller → 0 row → 无并发问题.
  */
 typedef void (*ClusterGrdEntryRowVisitor)(void *ctx, const int32 row_fields[11]);
 
@@ -1450,8 +1455,9 @@ extern ClusterGrdEntryResult cluster_grd_rollback_convert(const ClusterResId *re
  *   diff).  Sweeps all GRD entries: holder.node_id == dead_node_id
  *   → release (independent of epoch per I48).
  *
- *   Idempotent (safe re-entry on bitmap re-sync).  Skeleton (Step 1):
- *   no-op + DEBUG2 log.  Body activation Step 4 D11.
+ *   Idempotent (safe re-entry on bitmap re-sync).  Since spec-6.3a, the
+ *   sweep snapshots keys and re-lookups through the pin/release lifecycle
+ *   before mutating entry state.
  */
 extern void cluster_grd_cleanup_on_node_dead(int32 dead_node_id);
 

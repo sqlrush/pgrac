@@ -14,7 +14,7 @@
 #	        so hash_estimate_size(4096,...) ≈ 3-5MB,not naive 12KB) +
 #	        pg_cluster_grd_entries still 0 row (0 caller)
 #	    L4  SET cluster.grd_max_entries session-level fail (PGC_POSTMASTER)
-#	        + dump_grd 37 row baseline + GRD atomic counters all 0
+#	        + dump_grd row baseline + GRD atomic counters all 0
 #
 #	  Spec authority: pgrac:specs/spec-2.15-grd-entry-table-holders-
 #	  waiters.md (frozen v0.4 Q1-Q15 + 4 轮 codereview corrections).
@@ -129,13 +129,14 @@ is($node->safe_psql('postgres',
 # 1 cleanup_skip_stale_cancel_count counter, spec-2.25 adds
 # 1 relation_object_cluster_path_count counter, spec-2.26 adds
 # 1 transaction_cluster_path_count counter, spec-5.1b D9 adds 3
-# convert verdict counters (granted_inplace / enqueued / illegal), and
+# convert verdict counters (granted_inplace / enqueued / illegal),
+# spec-6.3a adds 4 entry lifecycle reclaim counters, and
 # spec-5.10 D7 adds 4 starvation-fairness counters (boost / barrier_enqueued
 # / barrier_publish_fail / max_skip_observed).
 is($node->safe_psql('postgres',
 		q{SELECT count(*)::int FROM pg_cluster_state WHERE category='grd'}),
-   '47',
-   'L4b dump_grd category="grd" emits 47 rows (spec-2.14 8 + spec-2.15 6 + spec-2.16 14 + spec-2.17 9 + spec-2.24 1 + spec-2.25 1 + spec-2.26 1 + spec-5.1b 3 + spec-5.10 4)');
+   '51',
+   'L4b dump_grd category="grd" emits 51 rows (adds spec-6.3a entry lifecycle counters)');
 
 # All 3 NEW atomic counter baseline 0 (本 spec 0 caller invokes
 # cluster_grd_entry_lookup_or_create).
@@ -150,6 +151,23 @@ is($node->safe_psql('postgres',
 		           WHERE category='grd' AND key='grd_entry_full_count')}),
    '0|0|0',
    'L4c grd_entry_{create,lookup_hit,full}_count all 0 baseline (0 caller)');
+
+is($node->safe_psql('postgres',
+		q{SELECT (SELECT value FROM pg_cluster_state
+		           WHERE category='grd' AND key='grd_entries_reclaimed_count')
+		    || '|' ||
+		         (SELECT value FROM pg_cluster_state
+		           WHERE category='grd' AND key='grd_reclaim_skipped_pinned_count')
+		    || '|' ||
+		         (SELECT value FROM pg_cluster_state
+		           WHERE category='grd' AND key='grd_pin_high_water')}),
+   '0|0|0',
+   'L4c2 grd entry lifecycle reclaim counters all 0 baseline except sweep tick count');
+
+ok($node->safe_psql('postgres',
+		q{SELECT (SELECT value::bigint FROM pg_cluster_state
+		           WHERE category='grd' AND key='grd_sweep_runs') >= 0}) eq 't',
+   'L4c3 grd_sweep_runs is present and non-negative');
 
 is($node->safe_psql('postgres',
 		q{SELECT count(*)::int FROM pg_cluster_state

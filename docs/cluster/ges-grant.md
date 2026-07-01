@@ -16,6 +16,8 @@ cross-node grants will land in spec-2.17 (BAST + deadlock + 4-node).
 |---|---|---|---|---|
 | `cluster.ges_request_timeout_ms` | `60000` | `[1, 600000]` | `USERSET` | Timeout (ms) for cross-node GES grant request.  Backend rolls back via GES_RELEASE on expiry.  PG `lock_timeout=0` (disabled) does NOT short-circuit — falls back to this GUC. |
 | `cluster.grd_max_entries` | `0` | `[0, 1048576]` | `POSTMASTER` | Size of GRD entry HTAB (per spec-2.15).  `0` = skeleton mode. |
+| `cluster.grd_entry_reclaim` | `on` | `bool` | `SIGHUP` | Enable safe cold reclaim of holderless GRD entries after the lookup pin drops to zero. |
+| `cluster.grd_entry_reclaim_max_per_sweep` | `256` | `[0, 65536]` | `SIGHUP` | Maximum cold entries LMON attempts to reclaim per sweep. |
 
 ### Effective timeout
 
@@ -61,6 +63,19 @@ Four cap counters (per spec-2.16 D1) surface entry-level saturation:
 - `waiters_full_count`
 - `converts_full_count`
 - `ngranted_promoted_count`
+
+spec-6.3a adds GRD entry-lifecycle counters in the `grd` category:
+
+| Key | Meaning |
+|---|---|
+| `grd_entries_reclaimed_count` | Cold holderless entries removed from the GRD HTAB |
+| `grd_reclaim_skipped_pinned_count` | Reclaim attempts skipped because a lookup pin was still held |
+| `grd_pin_high_water` | Highest observed lookup-pin count on a single entry |
+| `grd_sweep_runs` | LMON cold-reclaim sweep invocations |
+
+Implementation details for the pin/release discipline, shard-local scan
+model, and ERROR cleanup classification are in
+`docs/cluster/grd-entry-lifecycle.md`.
 
 ## Wire Format
 

@@ -3,14 +3,16 @@
 linkdb uses two configuration mechanisms layered on top of standard
 PostgreSQL configuration:
 
-1. **`postgresql.conf`** — standard PG config plus three new
-   `cluster.*` GUCs added by linkdb's cluster subsystem.
+1. **`postgresql.conf`** — standard PG config plus the `cluster.*`
+   GUCs added by linkdb's cluster subsystem.
 2. **`pgrac.conf`** — INI-style file describing the cluster
    topology (the list of nodes that participate in the cluster).
 
 ## cluster.* GUCs
 
-All three GUCs require server restart to change (PGC_POSTMASTER).
+Most bootstrap and storage-routing GUCs require server restart to
+change (PGC_POSTMASTER). Runtime maintenance knobs are marked with
+their own context below.
 
 ### `cluster.node_id`
 
@@ -137,6 +139,47 @@ Reserved for future timeout enforcement on `tier1` peer `recv(2)`.  Currently in
 | Context | postmaster |
 
 Upper bound on the payload size accepted by the chunked-send API.  A caller asking to send a larger payload is rejected outright with `ERRCODE_PROGRAM_LIMIT_EXCEEDED` rather than silently truncating.  Increase this when the workload expects larger cross-node messages; the hard cap is 256 MB.
+
+### `cluster.grd_max_entries`
+
+| | |
+|---|---|
+| Type | integer |
+| Default | `0` |
+| Range | `0` – `1048576` |
+| Context | postmaster |
+
+Capacity of the GRD resource-entry hash table. `0` keeps the entry
+table disabled for skeleton-mode deployments. Values above zero enable
+GES resource tracking; empty entries are eligible for lifecycle reclaim
+once they have no holders, waiters, converts, reservations, or lookup
+pins.
+
+### `cluster.grd_entry_reclaim`
+
+| | |
+|---|---|
+| Type | bool |
+| Default | `on` |
+| Context | sighup |
+
+Enables safe cold reclaim of holderless GRD entries. The lookup/release
+pin discipline remains active even when this is off; disabling reclaim
+only prevents `HASH_REMOVE` so operators can preserve entries for
+diagnostics during investigation.
+
+### `cluster.grd_entry_reclaim_max_per_sweep`
+
+| | |
+|---|---|
+| Type | integer |
+| Default | `256` |
+| Range | `0` – `65536` |
+| Context | sighup |
+
+Maximum number of cold entries LMON attempts to reclaim during one
+sweep. `0` disables periodic sweeps, while last-pin release can still
+reclaim a cold entry when `cluster.grd_entry_reclaim = on`.
 
 ### `cluster.interconnect_chunk_reassembly_timeout_ms`
 

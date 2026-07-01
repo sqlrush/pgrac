@@ -82,6 +82,10 @@ static LWLockPadded *cluster_grd_shard_locks = NULL;
  * = 0 (skeleton mode → NOT_READY sentinel) or non-cluster builds. */
 static HTAB *cluster_grd_entry_htab = NULL;
 
+#define CLUSTER_GRD_ENTRY_FLAG_RECLAIMING ((uint32)0x00000001)
+
+static int cluster_grd_snapshot_entry_resids(ClusterResId **out_resids);
+
 /* spec-2.15 v0.4 P1.1:  HTAB init size = Max(GUC, PGRAC_GRD_SHARD_COUNT)
  * — HASH_PARTITION=4096 forces dynahash nbuckets >= 4096 (nbuckets =
  * max(next_pow2(n), num_partitions)).  naive max_size=GUC=16 would let
@@ -156,7 +160,8 @@ typedef struct ClusterGrdWaiter {
 
 struct ClusterGrdEntry {
 	ClusterResId resid; /* hash key (16B) */
-	slock_t lock;		/* entry-level spinlock (Q11 + P1.3 minor) */
+	dlist_node shard_link;
+	slock_t lock; /* entry-level spinlock (Q11 + P1.3 minor) */
 	int ngranted;
 	ClusterGrdHolder holders[PGRAC_GRD_MAX_HOLDERS];
 	int nwaiters;
@@ -186,6 +191,7 @@ struct ClusterGrdEntry {
 	 * (P1c) — never for a grant or a scan-on-grant pass.
 	 */
 	uint64 fair_queue_next;
+	pg_atomic_uint32 pin; /* spec-6.3a: lookup pin gating safe cold reclaim */
 };
 
 
@@ -271,6 +277,41 @@ grd_wfg_make_vertex(int32 node_id, uint32 procno, uint64 cluster_epoch, uint64 r
 	out->xid = xid;
 	out->local_start_ts_ms = 0;
 	out->wait_seq = wait_seq;
+}
+
+static bool
+grd_lmd_submit_wait_edge_pinned(ClusterGrdEntry *entry, ClusterLmdVertex *waiter,
+								ClusterLmdVertex *blocker, uint64 request_id)
+{
+	bool published = false;
+
+	PG_TRY();
+	{
+		published = cluster_lmd_submit_wait_edge_real(waiter, blocker, request_id);
+	}
+	PG_CATCH();
+	{
+		cluster_grd_entry_release(entry);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	return published;
+}
+
+static void
+grd_lmd_cancel_wait_edge_pinned(ClusterGrdEntry *entry, ClusterLmdVertex *waiter)
+{
+	PG_TRY();
+	{
+		cluster_lmd_cancel_wait_edge_real(waiter);
+	}
+	PG_CATCH();
+	{
+		cluster_grd_entry_release(entry);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 /* Caller holds entry->lock.  Copy holders + queued waiters + pending converts
@@ -515,6 +556,77 @@ grd_entries_estimate_bytes(void)
 	return hash_estimate_size(init_max_size, sizeof(ClusterGrdEntry));
 }
 
+static void
+cluster_grd_update_pin_high_water(uint32 value)
+{
+	uint64 observed;
+
+	if (cluster_grd_state == NULL)
+		return;
+
+	observed = pg_atomic_read_u64(&cluster_grd_state->pin_high_water);
+	while ((uint64)value > observed) {
+		uint64 expected = observed;
+
+		if (pg_atomic_compare_exchange_u64(&cluster_grd_state->pin_high_water, &expected,
+										   (uint64)value))
+			break;
+		observed = expected;
+	}
+}
+
+static bool
+cluster_grd_entry_pin_locked(ClusterGrdEntry *entry)
+{
+	uint32 old;
+	bool reclaiming;
+
+	Assert(entry != NULL);
+	if (entry == NULL)
+		return false;
+
+	SpinLockAcquire(&entry->lock);
+	reclaiming = ((entry->state_flags & CLUSTER_GRD_ENTRY_FLAG_RECLAIMING) != 0);
+	SpinLockRelease(&entry->lock);
+	if (reclaiming) {
+		ereport(WARNING, (errmsg("cluster_grd: refusing lookup of reclaiming entry")));
+		return false;
+	}
+
+	old = pg_atomic_read_u32(&entry->pin);
+	for (;;) {
+		uint32 expected = old;
+
+		if (old == PG_UINT32_MAX) {
+			ereport(WARNING, (errmsg("cluster_grd: entry pin count overflow; refusing lookup")));
+			return false;
+		}
+		if (pg_atomic_compare_exchange_u32(&entry->pin, &expected, old + 1)) {
+			cluster_grd_update_pin_high_water(old + 1);
+			return true;
+		}
+		old = expected;
+	}
+}
+
+uint32
+cluster_grd_entry_pin_count(ClusterGrdEntry *entry)
+{
+	if (entry == NULL)
+		return 0;
+	return pg_atomic_read_u32(&entry->pin);
+}
+
+bool
+cluster_grd_entry_is_reclaimable(ClusterGrdEntry *entry)
+{
+	if (entry == NULL)
+		return false;
+	return pg_atomic_read_u32(&entry->pin) == 0 && entry->ngranted == 0 && entry->nwaiters == 0
+		   && entry->nconverts == 0 && entry->nreservations == 0
+		   && (entry->state_flags & CLUSTER_GRD_ENTRY_FLAG_RECLAIMING) == 0;
+}
+
 Size
 cluster_grd_shmem_size(void)
 {
@@ -540,6 +652,7 @@ cluster_grd_shmem_init(void)
 			/* spec-4.6 D2/D1: remaster generation + recovery phase. */
 			pg_atomic_init_u32(&cluster_grd_state->master_generation[i], 0);
 			pg_atomic_init_u32(&cluster_grd_state->shard_phase[i], (uint32)GRD_SHARD_NORMAL);
+			dlist_init(&cluster_grd_state->entry_shard_lists[i]);
 		}
 		pg_atomic_init_u32(&cluster_grd_state->master_map_initialized, 0);
 		pg_atomic_init_u64(&cluster_grd_state->resid_encode_count, 0);
@@ -555,6 +668,10 @@ cluster_grd_shmem_init(void)
 		pg_atomic_init_u64(&cluster_grd_state->entry_create_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->entry_lookup_hit_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->entry_full_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->entries_reclaimed_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->reclaim_skipped_pinned_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->pin_high_water, 0);
+		pg_atomic_init_u64(&cluster_grd_state->sweep_runs, 0);
 
 		/* spec-2.16 D1:  4 cap counter + 5 nofail counter
 		 * (skeleton-init;  mutator + nofail path 真激活在 Step 2-4). */
@@ -1593,18 +1710,23 @@ cluster_grd_recovery_counters_snapshot(ClusterGrdRecoveryCounters *out)
 void
 cluster_grd_cleanup_stale_epoch_scoped(uint64 current_epoch, const uint64 *affected_shards)
 {
-	HASH_SEQ_STATUS status;
-	ClusterGrdEntry *entry;
+	ClusterResId *resids = NULL;
 	int swept = 0;
+	int nresids;
+	int r;
 
 	if (cluster_grd_entry_htab == NULL || affected_shards == NULL)
 		return;
 
-	hash_seq_init(&status, cluster_grd_entry_htab);
-	while ((entry = (ClusterGrdEntry *)hash_seq_search(&status)) != NULL) {
+	nresids = cluster_grd_snapshot_entry_resids(&resids);
+	for (r = 0; r < nresids; r++) {
+		ClusterGrdEntry *entry = NULL;
 		int i;
 
-		if (!grd_shard_bitmap_test(affected_shards, cluster_grd_shard_for_resource(&entry->resid)))
+		if (!grd_shard_bitmap_test(affected_shards, cluster_grd_shard_for_resource(&resids[r])))
+			continue;
+		if (cluster_grd_entry_lookup_or_create(&resids[r], false, &entry) != CLUSTER_GRD_ENTRY_OK
+			|| entry == NULL)
 			continue;
 
 		SpinLockAcquire(&entry->lock);
@@ -1646,7 +1768,10 @@ cluster_grd_cleanup_stale_epoch_scoped(uint64 current_epoch, const uint64 *affec
 			i++;
 		}
 		SpinLockRelease(&entry->lock);
+		cluster_grd_entry_release(entry);
 	}
+	if (resids != NULL)
+		pfree(resids);
 
 	if (swept > 0)
 		ereport(DEBUG1, (errmsg_internal("cluster_grd_cleanup_stale_epoch_scoped(" UINT64_FORMAT
@@ -1670,17 +1795,23 @@ cluster_grd_cleanup_stale_epoch_scoped(uint64 current_epoch, const uint64 *affec
 uint32
 cluster_grd_cleanup_stale_epoch_postbarrier(uint64 current_epoch)
 {
-	HASH_SEQ_STATUS status;
-	ClusterGrdEntry *entry;
+	ClusterResId *resids = NULL;
 	uint32 swept = 0;
 	uint32 waiters_dropped = 0;
+	int nresids;
+	int r;
 
 	if (cluster_grd_entry_htab == NULL)
 		return 0;
 
-	hash_seq_init(&status, cluster_grd_entry_htab);
-	while ((entry = (ClusterGrdEntry *)hash_seq_search(&status)) != NULL) {
+	nresids = cluster_grd_snapshot_entry_resids(&resids);
+	for (r = 0; r < nresids; r++) {
+		ClusterGrdEntry *entry = NULL;
 		int i;
+
+		if (cluster_grd_entry_lookup_or_create(&resids[r], false, &entry) != CLUSTER_GRD_ENTRY_OK
+			|| entry == NULL)
+			continue;
 
 		SpinLockAcquire(&entry->lock);
 		for (i = 0; i < entry->ngranted;) {
@@ -1706,7 +1837,10 @@ cluster_grd_cleanup_stale_epoch_postbarrier(uint64 current_epoch)
 			i++;
 		}
 		SpinLockRelease(&entry->lock);
+		cluster_grd_entry_release(entry);
 	}
+	if (resids != NULL)
+		pfree(resids);
 
 	if (swept > 0)
 		pg_atomic_fetch_add_u64(&cluster_grd_state->stale_holder_swept_count, swept);
@@ -2474,6 +2608,7 @@ cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid,
 			 * deleted by the scoped sweep and stays operable. */
 			if (cluster_grd_shard_phase(rb_shard) == GRD_SHARD_NORMAL)
 				pg_atomic_fetch_add_u64(&cluster_grd_state->unaffected_holder_survived_count, 1);
+			cluster_grd_entry_release(entry);
 			return CLUSTER_GRD_ENTRY_OK;
 		}
 	}
@@ -2485,6 +2620,7 @@ cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid,
 			&& !ges_modes_compatible(entry->holders[i].mode,
 									 (LOCKMODE)lockmode)) { /* spec-5.1b D1: frozen matrix */
 			SpinLockRelease(&entry->lock);
+			cluster_grd_entry_release(entry);
 			return CLUSTER_GRD_ENTRY_ERROR;
 		}
 	}
@@ -2492,6 +2628,7 @@ cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid,
 	if (entry->ngranted >= PGRAC_GRD_MAX_HOLDERS) {
 		pg_atomic_fetch_add_u64(&cluster_grd_state->holders_full_count, 1);
 		SpinLockRelease(&entry->lock);
+		cluster_grd_entry_release(entry);
 		return CLUSTER_GRD_ENTRY_FULL;
 	}
 
@@ -2506,6 +2643,7 @@ cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid,
 
 	(void)source_node_id; /* identity already carried by new_holder */
 	pg_atomic_fetch_add_u64(&cluster_grd_state->holders_redeclared_count, 1);
+	cluster_grd_entry_release(entry);
 	return CLUSTER_GRD_ENTRY_OK;
 }
 
@@ -2634,6 +2772,10 @@ cluster_grd_entry_lookup_or_create(const ClusterResId *resid, bool create, Clust
 	entry
 		= hash_search_with_hash_value(cluster_grd_entry_htab, resid, hashvalue, HASH_FIND, &found);
 	if (entry != NULL) {
+		if (!cluster_grd_entry_pin_locked(entry)) {
+			LWLockRelease(&cluster_grd_shard_locks[shard_id].lock);
+			return CLUSTER_GRD_ENTRY_ERROR;
+		}
 		pg_atomic_fetch_add_u64(&cluster_grd_state->entry_lookup_hit_count, 1);
 		LWLockRelease(&cluster_grd_shard_locks[shard_id].lock);
 		*out = entry;
@@ -2677,20 +2819,30 @@ cluster_grd_entry_lookup_or_create(const ClusterResId *resid, bool create, Clust
 
 	if (!found) {
 		/* New entry — init slock + body zero. */
+		dlist_node_init(&entry->shard_link);
 		SpinLockInit(&entry->lock);
 		entry->ngranted = 0;
 		entry->nwaiters = 0;
 		entry->nconverts = 0;
 		entry->last_modified_scn = 0;
 		entry->state_flags = 0;
+		entry->generation = 0;
+		entry->nreservations = 0;
+		entry->fair_queue_next = 0;
+		pg_atomic_init_u32(&entry->pin, 0);
+		dlist_push_tail(&cluster_grd_state->entry_shard_lists[shard_id], &entry->shard_link);
 		/* holders / waiters / converts arrays left uninitialized;
 		 * spec-2.16 mutator path initializes per-slot on add. */
 		pg_atomic_fetch_add_u64(&cluster_grd_state->entry_current_count, 1);
 		pg_atomic_fetch_add_u64(&cluster_grd_state->entry_create_count, 1);
 	}
+	if (!cluster_grd_entry_pin_locked(entry)) {
+		LWLockRelease(&cluster_grd_shard_locks[shard_id].lock);
+		return CLUSTER_GRD_ENTRY_ERROR;
+	}
 	pg_atomic_fetch_add_u64(&cluster_grd_state->entry_lookup_hit_count, 1);
 
-	/* Step 8: release shard partition LWLock — caller holds entry handle. */
+	/* Step 8: release shard partition LWLock — caller holds a lookup pin. */
 	LWLockRelease(&cluster_grd_shard_locks[shard_id].lock);
 
 	*out = entry;
@@ -2700,15 +2852,38 @@ cluster_grd_entry_lookup_or_create(const ClusterResId *resid, bool create, Clust
 void
 cluster_grd_entry_release(ClusterGrdEntry *entry)
 {
-	/* spec-2.15 RESERVED no-op (v0.3 P1.3 contract unified — header doc
-	 * + impl 一致).  本 spec 不保证任何 side effect:不 decrement
-	 * refcount,不 remove entry,不改 holders/waiters/converts 状态.
-	 *
-	 * spec-2.16 caller-side 集成时真实装 logic (API signature 不变,body
-	 * 加):decrement refcount + 若 ngranted == 0 && nwaiters == 0 &&
-	 * nconverts == 0 → HASH_REMOVE + DRM reclaim path (Stage 6).
+	ClusterResId rid;
+	uint32 old;
+	bool last;
+
+	if (entry == NULL)
+		return;
+
+	/*
+	 * spec-6.3a: copy the hash key before dropping the last pin.  Once the
+	 * CAS publishes pin==0, a different reclaimer may remove and recycle the
+	 * slot, so this function must not dereference entry after the decrement.
 	 */
-	(void)entry;
+	rid = entry->resid;
+
+	old = pg_atomic_read_u32(&entry->pin);
+	for (;;) {
+		uint32 expected = old;
+
+		if (old == 0) {
+			ereport(WARNING, (errmsg("cluster_grd: over-release of unpinned entry ignored")));
+			return;
+		}
+		if (pg_atomic_compare_exchange_u32(&entry->pin, &expected, old - 1))
+			break;
+		old = expected;
+	}
+
+	last = (old == 1);
+	if (!last || !cluster_grd_entry_reclaim)
+		return;
+
+	(void)cluster_grd_reclaim_if_cold(&rid);
 }
 
 
@@ -2764,23 +2939,51 @@ cluster_grd_entry_full_count(void)
 	return pg_atomic_read_u64(&cluster_grd_state->entry_full_count);
 }
 
+uint64
+cluster_grd_entries_reclaimed_count(void)
+{
+	Assert(cluster_grd_state != NULL);
+	return pg_atomic_read_u64(&cluster_grd_state->entries_reclaimed_count);
+}
+
+uint64
+cluster_grd_reclaim_skipped_pinned_count(void)
+{
+	Assert(cluster_grd_state != NULL);
+	return pg_atomic_read_u64(&cluster_grd_state->reclaim_skipped_pinned_count);
+}
+
+uint64
+cluster_grd_pin_high_water(void)
+{
+	Assert(cluster_grd_state != NULL);
+	return pg_atomic_read_u64(&cluster_grd_state->pin_high_water);
+}
+
+uint64
+cluster_grd_sweep_runs(void)
+{
+	Assert(cluster_grd_state != NULL);
+	return pg_atomic_read_u64(&cluster_grd_state->sweep_runs);
+}
+
 
 /* ============================================================
- * spec-2.15 D8:  SRF row visitor — hash_seq_search the entry HTAB
- *   and emit one row per entry under per-entry slock_t snapshot.
+ * spec-2.15 D8 + spec-6.3a: SRF row visitor.
  *
- *   **spec-2.16 forward-link TODO (P2.4 + I14)**:
- *   Wrap hash_seq_search in full 4096-shard LW_SHARED acquire OR
- *   chunked snapshot to defend concurrent HASH_ENTER_NULL writers
- *   once caller-side LockAcquire integration lands.  本 spec 0
- *   caller → 0 row → 无并发问题 (本 walker safe).
+ *   Snapshot resource ids from shard-local entry lists while holding one shard
+ *   lock at a time, then re-lookup each row through cluster_grd_entry_lookup_
+ *   or_create() so the per-entry slock_t snapshot is protected by a real lookup
+ *   pin.  This keeps observability safe while cold reclaim can HASH_REMOVE
+ *   holderless entries.
  * ============================================================ */
 
 void
 cluster_grd_entries_walk(ClusterGrdEntryRowVisitor visitor, void *ctx)
 {
-	HASH_SEQ_STATUS status;
-	ClusterGrdEntry *entry;
+	ClusterResId *resids = NULL;
+	int nresids;
+	int r;
 
 	Assert(visitor != NULL);
 
@@ -2789,9 +2992,14 @@ cluster_grd_entries_walk(ClusterGrdEntryRowVisitor visitor, void *ctx)
 	if (cluster_grd_entry_htab == NULL)
 		return;
 
-	hash_seq_init(&status, cluster_grd_entry_htab);
-	while ((entry = (ClusterGrdEntry *)hash_seq_search(&status)) != NULL) {
+	nresids = cluster_grd_snapshot_entry_resids(&resids);
+	for (r = 0; r < nresids; r++) {
+		ClusterGrdEntry *entry = NULL;
 		int32 fields[11];
+
+		if (cluster_grd_entry_lookup_or_create(&resids[r], false, &entry) != CLUSTER_GRD_ENTRY_OK
+			|| entry == NULL)
+			continue;
 
 		/* per-entry slock_t snapshot — short critical section (memcpy
 		 * fixed-size struct fields).  spec-2.16 mutator writers also
@@ -2809,9 +3017,12 @@ cluster_grd_entries_walk(ClusterGrdEntryRowVisitor visitor, void *ctx)
 		fields[9] = entry->nconverts;
 		fields[10] = (int32)entry->state_flags;
 		SpinLockRelease(&entry->lock);
+		cluster_grd_entry_release(entry);
 
 		visitor(ctx, fields);
 	}
+	if (resids != NULL)
+		pfree(resids);
 }
 
 
@@ -3265,18 +3476,24 @@ cluster_grd_starvation_max_skip_observed(void)
 uint32
 cluster_grd_clear_all_boosted(void)
 {
-	HASH_SEQ_STATUS status;
-	ClusterGrdEntry *entry;
+	ClusterResId *resids = NULL;
 	uint32 cleared = 0;
+	int nresids;
+	int r;
 
 	if (cluster_grd_entry_htab == NULL)
 		return 0;
 
-	hash_seq_init(&status, cluster_grd_entry_htab);
-	while ((entry = (ClusterGrdEntry *)hash_seq_search(&status)) != NULL) {
+	nresids = cluster_grd_snapshot_entry_resids(&resids);
+	for (r = 0; r < nresids; r++) {
+		ClusterGrdEntry *entry = NULL;
 		GrdWfgSnapshot snap;
 		bool changed = false;
 		int i;
+
+		if (cluster_grd_entry_lookup_or_create(&resids[r], false, &entry) != CLUSTER_GRD_ENTRY_OK
+			|| entry == NULL)
+			continue;
 
 		SpinLockAcquire(&entry->lock);
 		for (i = 0; i < entry->nwaiters; i++) {
@@ -3296,12 +3513,15 @@ cluster_grd_clear_all_boosted(void)
 			entry->generation++;
 		grd_wfg_snapshot_locked(entry, &snap);
 		SpinLockRelease(&entry->lock);
+		cluster_grd_entry_release(entry);
 
 		if (changed) {
 			for (i = 0; i < snap.n_waiters; i++)
 				grd_wfg_refresh_waiter_edges(&snap, &snap.waiters[i]);
 		}
 	}
+	if (resids != NULL)
+		pfree(resids);
 	return cleared;
 }
 
@@ -3316,18 +3536,24 @@ cluster_grd_clear_all_boosted(void)
 uint32
 cluster_grd_clear_boosted_for_node(int32 dead_node)
 {
-	HASH_SEQ_STATUS status;
-	ClusterGrdEntry *entry;
+	ClusterResId *resids = NULL;
 	uint32 cleared = 0;
+	int nresids;
+	int r;
 
 	if (cluster_grd_entry_htab == NULL)
 		return 0;
 
-	hash_seq_init(&status, cluster_grd_entry_htab);
-	while ((entry = (ClusterGrdEntry *)hash_seq_search(&status)) != NULL) {
+	nresids = cluster_grd_snapshot_entry_resids(&resids);
+	for (r = 0; r < nresids; r++) {
+		ClusterGrdEntry *entry = NULL;
 		GrdWfgSnapshot snap;
 		bool changed = false;
 		int i;
+
+		if (cluster_grd_entry_lookup_or_create(&resids[r], false, &entry) != CLUSTER_GRD_ENTRY_OK
+			|| entry == NULL)
+			continue;
 
 		SpinLockAcquire(&entry->lock);
 		for (i = 0; i < entry->nwaiters; i++) {
@@ -3347,12 +3573,15 @@ cluster_grd_clear_boosted_for_node(int32 dead_node)
 			entry->generation++;
 		grd_wfg_snapshot_locked(entry, &snap);
 		SpinLockRelease(&entry->lock);
+		cluster_grd_entry_release(entry);
 
 		if (changed) {
 			for (i = 0; i < snap.n_waiters; i++)
 				grd_wfg_refresh_waiter_edges(&snap, &snap.waiters[i]);
 		}
 	}
+	if (resids != NULL)
+		pfree(resids);
 	return cleared;
 }
 
@@ -3722,7 +3951,8 @@ cluster_grd_entry_enqueue_or_grant_impl(const ClusterResId *resid, const Cluster
 									request_id, meta.xid, meta.wait_seq, &r_vertex);
 				SpinLockRelease(&entry->lock);
 
-				published = cluster_lmd_submit_wait_edge_real(&r_vertex, &w_vertex, request_id);
+				published
+					= grd_lmd_submit_wait_edge_pinned(entry, &r_vertex, &w_vertex, request_id);
 
 				SpinLockAcquire(&entry->lock);
 				/*
@@ -3742,7 +3972,7 @@ cluster_grd_entry_enqueue_or_grant_impl(const ClusterResId *resid, const Cluster
 												  (LOCKMODE)lockmode, meta)
 						< 0) {
 						SpinLockRelease(&entry->lock);
-						cluster_lmd_cancel_wait_edge_real(&r_vertex);
+						grd_lmd_cancel_wait_edge_pinned(entry, &r_vertex);
 						cluster_grd_entry_release(entry);
 						cluster_grd_inc_ges_work_queue_full();
 						return CLUSTER_GRD_WAIT_QUEUE_FULL;
@@ -3759,7 +3989,7 @@ cluster_grd_entry_enqueue_or_grant_impl(const ClusterResId *resid, const Cluster
 				 * the CURRENT holders (never false-grant). */
 				SpinLockRelease(&entry->lock);
 				if (published)
-					cluster_lmd_cancel_wait_edge_real(&r_vertex);
+					grd_lmd_cancel_wait_edge_pinned(entry, &r_vertex);
 				else
 					pg_atomic_fetch_add_u64(
 						&cluster_grd_state->starvation_barrier_publish_fail_count, 1);
@@ -4711,6 +4941,7 @@ cluster_grd_convert_grant_by_backend(const ClusterResId *resid, int32 node_id, u
 
 /* spec-5.3 — forward decl for the post-release empty-entry reclaim (definition
  * lives further down with the D10 cleanup primitives). */
+static bool cluster_grd_hashremove_if_still_empty_locked(ClusterGrdEntry *entry);
 static bool cluster_grd_hashremove_if_still_empty(const ClusterResId *resid);
 
 /*
@@ -4787,25 +5018,10 @@ cluster_grd_release_and_drain(const ClusterResId *resid, const ClusterGrdHolderI
 	cluster_grd_entry_release(entry);
 
 	/* spec-5.8 D1b — granted waiters/converts departed; holders changed.
-	 * Runs BEFORE the spec-5.3 empty-entry reclaim below: resync re-looks-up
-	 * the entry by resid to refresh WFG edges, so it must see the entry before
-	 * the reclaim may HASH_REMOVE it. */
+	 * cluster_grd_entry_release() may already have reclaimed a now-empty entry;
+	 * the resync path first removes departed edges by identity and then treats a
+	 * missing entry as "nothing left to refresh". */
 	grd_wfg_resync_after_grants(resid, granted_out, n);
-
-	/*
-	 * PGRAC: spec-5.3 — reclaim the entry if this release left it completely
-	 * empty (no holders/waiters/converts/reservations).  cluster_grd_entry_release
-	 * is a documented no-op and the D8 periodic sweep is not wired, so without
-	 * this a long-lived backend never frees GRD HTAB slots for finished lock
-	 * resources — most visibly LOCKTAG_TRANSACTION, where every write txn has a
-	 * unique xid (unique entry) and the HTAB fills (53R71 FAIL_RESERVATION_FULL).
-	 * The helper re-acquires the shard partition lock, re-looks up by resid, and
-	 * HASH_REMOVEs at-most-once ONLY when all occupancy counters are 0 — so a
-	 * concurrent S3 reservation (nreservations > 0) or a freshly granted waiter
-	 * (ngranted > 0) is safe (no-op).  Done after the spinlock is dropped to keep
-	 * the partition-lock-then-entry-spinlock order.
-	 */
-	(void)cluster_grd_hashremove_if_still_empty(resid);
 	return n;
 }
 
@@ -4982,33 +5198,93 @@ cluster_grd_reservation_promote(ClusterGrdEntry *entry, const ClusterGrdHolderId
  * ============================================================ */
 
 /*
- * spec-2.16 Step 4 D11:  CSSD DEAD master sweep — traverses entry HTAB
- *   and per-entry filters holders[] / waiters[] / converts[] by
- *   node_id == dead_node_id (I48 — NO epoch filter).
+ * spec-2.16 Step 4 D11 + spec-6.3a: CSSD DEAD master sweep.
  *
- *   Step 4 implementation:  uses cluster_grd_entry_htab via existing
- *   hash_seq_search pattern (mirror cluster_grd_entries_walk).  For
- *   each matching slot, decrement entry->ngranted / nwaiters / nconverts
- *   under entry->lock and zero the slot.  Idempotent re-entry safe.
- *
- *   Counters per cleanup invocation tracked via existing entry mutator
- *   counter family (spec-2.15 entry_current_count when ngranted hits 0).
- *   本 Step 0 真 mutator caller (spec-2.16 ships caller-side hooks
- *   stub only — full LockAcquireExtended 6-step integration in spec-
- *   2.17), so sweep is a no-op until cluster_unit Step 6 inject test
- *   exercises mutator + sweep round-trip.
+ *   Snapshot entry keys from shard-local lists, then re-lookup each resource
+ *   through the 6.3a pin discipline before filtering holders[] / waiters[] /
+ *   converts[] / reservations by node_id == dead_node_id (I48 — NO epoch
+ *   filter).  Empty entries are reclaimed by the last-pin release path, not by
+ *   an escaped raw HTAB pointer.
  */
 /* spec-2.24 D10 forward decl (definition later in same TU). */
 extern int cluster_grd_entry_cleanup_guarded(ClusterGrdEntry *entry, int dead_procno,
 											 int32 dead_node_id);
 
+static int
+cluster_grd_snapshot_entry_resids(ClusterResId **out_resids)
+{
+	ClusterResId *resids;
+	int capacity;
+	int n = 0;
+	bool overflow = false;
+	uint32 shard_id;
+
+	Assert(out_resids != NULL);
+	*out_resids = NULL;
+
+	if (cluster_grd_entry_htab == NULL)
+		return 0;
+
+	capacity = Max(cluster_grd_entry_count(), 1);
+	do {
+		resids = (ClusterResId *)palloc0((Size)capacity * sizeof(ClusterResId));
+		n = 0;
+		overflow = false;
+
+		for (shard_id = 0; shard_id < PGRAC_GRD_SHARD_COUNT; shard_id++) {
+			dlist_iter iter;
+
+			LWLockAcquire(&cluster_grd_shard_locks[shard_id].lock, LW_SHARED);
+			dlist_foreach(iter, &cluster_grd_state->entry_shard_lists[shard_id])
+			{
+				ClusterGrdEntry *entry;
+
+				if (n >= capacity) {
+					overflow = true;
+					break;
+				}
+				entry = dlist_container(ClusterGrdEntry, shard_link, iter.cur);
+				resids[n++] = entry->resid;
+			}
+			LWLockRelease(&cluster_grd_shard_locks[shard_id].lock);
+			if (overflow)
+				break;
+		}
+
+		if (overflow) {
+			pfree(resids);
+			capacity = capacity <= INT_MAX / 2 ? capacity * 2 : INT_MAX;
+		}
+	} while (overflow);
+
+	*out_resids = resids;
+	return n;
+}
+
+static int
+cluster_grd_entry_cleanup_guarded_by_resid(const ClusterResId *resid, int dead_procno,
+										   int32 dead_node_id)
+{
+	ClusterGrdEntry *entry = NULL;
+	int removed;
+
+	if (cluster_grd_entry_lookup_or_create(resid, false, &entry) != CLUSTER_GRD_ENTRY_OK
+		|| entry == NULL)
+		return 0;
+
+	removed = cluster_grd_entry_cleanup_guarded(entry, dead_procno, dead_node_id);
+	cluster_grd_entry_release(entry);
+	return removed;
+}
+
 void
 cluster_grd_cleanup_on_node_dead(int32 dead_node_id)
 {
-	HASH_SEQ_STATUS status;
-	ClusterGrdEntry *entry;
+	ClusterResId *resids = NULL;
 	int swept = 0;
+	int nresids;
 	uint64 pending_x_cleared = 0;
+	int i;
 
 	pending_x_cleared = cluster_pcm_lock_clear_pending_x_for_node(dead_node_id);
 	if (pending_x_cleared > 0)
@@ -5029,10 +5305,11 @@ cluster_grd_cleanup_on_node_dead(int32 dead_node_id)
 	 * sweep loop here).  D10 enforces HC25-26 / I-cleanup-1..4 — HASH_REMOVE
 	 * at-most-once + concurrent cleanup safety + RELEASE enqueue.
 	 */
-	hash_seq_init(&status, cluster_grd_entry_htab);
-	while ((entry = (ClusterGrdEntry *)hash_seq_search(&status)) != NULL) {
-		swept += cluster_grd_entry_cleanup_guarded(entry, -1, dead_node_id);
-	}
+	nresids = cluster_grd_snapshot_entry_resids(&resids);
+	for (i = 0; i < nresids; i++)
+		swept += cluster_grd_entry_cleanup_guarded_by_resid(&resids[i], -1, dead_node_id);
+	if (resids != NULL)
+		pfree(resids);
 
 	if (swept > 0)
 		ereport(DEBUG1, (errmsg_internal("cluster_grd_cleanup_on_node_dead(%d): "
@@ -5087,9 +5364,11 @@ cluster_grd_clean_leave_drain_self(int32 leaving_node, uint64 leave_epoch)
 bool
 cluster_grd_clean_leave_verify_no_leftover(int32 leaving_node)
 {
-	HASH_SEQ_STATUS status;
-	ClusterGrdEntry *entry;
+	ClusterResId *resids = NULL;
 	uint32 i;
+	int nresids;
+	int r;
+	bool ok = true;
 
 	if (leaving_node < 0 || leaving_node >= CLUSTER_MAX_NODES)
 		return true;
@@ -5106,30 +5385,42 @@ cluster_grd_clean_leave_verify_no_leftover(int32 leaving_node)
 	if (cluster_grd_entry_htab == NULL)
 		return true;
 
-	hash_seq_init(&status, cluster_grd_entry_htab);
-	while ((entry = (ClusterGrdEntry *)hash_seq_search(&status)) != NULL) {
+	nresids = cluster_grd_snapshot_entry_resids(&resids);
+	for (r = 0; r < nresids; r++) {
+		ClusterGrdEntry *entry = NULL;
 		int k;
 
+		if (cluster_grd_entry_lookup_or_create(&resids[r], false, &entry) != CLUSTER_GRD_ENTRY_OK
+			|| entry == NULL)
+			continue;
+
+		SpinLockAcquire(&entry->lock);
 		for (k = 0; k < entry->ngranted; k++) {
 			if (entry->holders[k].node_id == leaving_node) {
-				hash_seq_term(&status);
-				return false;
+				ok = false;
+				break;
 			}
 		}
-		for (k = 0; k < entry->nwaiters; k++) {
+		for (k = 0; ok && k < entry->nwaiters; k++) {
 			if (entry->waiters[k].node_id == leaving_node) {
-				hash_seq_term(&status);
-				return false;
+				ok = false;
+				break;
 			}
 		}
-		for (k = 0; k < entry->nconverts; k++) {
+		for (k = 0; ok && k < entry->nconverts; k++) {
 			if (entry->converts[k].node_id == leaving_node) {
-				hash_seq_term(&status);
-				return false;
+				ok = false;
+				break;
 			}
 		}
+		SpinLockRelease(&entry->lock);
+		cluster_grd_entry_release(entry);
+		if (!ok)
+			break;
 	}
-	return true;
+	if (resids != NULL)
+		pfree(resids);
+	return ok;
 }
 
 /*
@@ -5144,9 +5435,10 @@ cluster_grd_clean_leave_verify_no_leftover(int32 leaving_node)
 void
 cluster_grd_cleanup_stale_epoch(uint64 current_epoch)
 {
-	HASH_SEQ_STATUS status;
-	ClusterGrdEntry *entry;
+	ClusterResId *resids = NULL;
 	int swept = 0;
+	int nresids;
+	int r;
 
 	if (cluster_grd_entry_htab == NULL) {
 		ereport(DEBUG2, (errmsg_internal("cluster_grd_cleanup_stale_epoch(%lu): "
@@ -5155,9 +5447,14 @@ cluster_grd_cleanup_stale_epoch(uint64 current_epoch)
 		return;
 	}
 
-	hash_seq_init(&status, cluster_grd_entry_htab);
-	while ((entry = (ClusterGrdEntry *)hash_seq_search(&status)) != NULL) {
+	nresids = cluster_grd_snapshot_entry_resids(&resids);
+	for (r = 0; r < nresids; r++) {
+		ClusterGrdEntry *entry = NULL;
 		int i;
+
+		if (cluster_grd_entry_lookup_or_create(&resids[r], false, &entry) != CLUSTER_GRD_ENTRY_OK
+			|| entry == NULL)
+			continue;
 
 		SpinLockAcquire(&entry->lock);
 		for (i = 0; i < entry->ngranted;) {
@@ -5172,7 +5469,10 @@ cluster_grd_cleanup_stale_epoch(uint64 current_epoch)
 			i++;
 		}
 		SpinLockRelease(&entry->lock);
+		cluster_grd_entry_release(entry);
 	}
+	if (resids != NULL)
+		pfree(resids);
 
 	if (swept > 0)
 		ereport(DEBUG1, (errmsg_internal("cluster_grd_cleanup_stale_epoch(%lu): "
@@ -5429,17 +5729,56 @@ DEFINE_BAST_COUNTER(deadlock_chunk_oo_buffer_overflow, deadlock_chunk_oo_buffer_
  * ============================================================ */
 
 /*
- * spec-2.24 D10 helper — HASH_REMOVE guarded by shard partition LWLock
- * + re-lookup + verify-still-empty.  Returns true if removed (we are
- * the at-most-once winner per HC26 I-cleanup-4);  false if another
- * cleanup path already removed the entry or the entry is no longer
- * empty (race lost — caller bumps skip counter).
+ * spec-2.24 D10 helper — HASH_REMOVE guarded by the shard partition LWLock,
+ * with re-lookup and verify-still-empty.  Returns true if removed (we are the
+ * at-most-once winner per HC26 I-cleanup-4); false if another cleanup path
+ * already removed the entry or the entry is no longer empty.
  */
+static bool
+cluster_grd_hashremove_if_still_empty_locked(ClusterGrdEntry *entry)
+{
+	ClusterResId rid;
+	uint64 hash64;
+	uint32 hashvalue;
+	bool found = false;
+	bool pinned = false;
+	bool removed = false;
+
+	if (entry == NULL || cluster_grd_entry_htab == NULL)
+		return false;
+
+	SpinLockAcquire(&entry->lock);
+	pinned = (pg_atomic_read_u32(&entry->pin) != 0);
+	if (cluster_grd_entry_is_reclaimable(entry)) {
+		rid = entry->resid;
+		hash64 = cluster_grd_hash_resource(&rid);
+		hashvalue = (uint32)hash64;
+		entry->state_flags |= CLUSTER_GRD_ENTRY_FLAG_RECLAIMING;
+		SpinLockRelease(&entry->lock);
+
+		dlist_delete_thoroughly(&entry->shard_link);
+		(void)hash_search_with_hash_value(cluster_grd_entry_htab, &rid, hashvalue, HASH_REMOVE,
+										  &found);
+		if (found) {
+			pg_atomic_fetch_sub_u64(&cluster_grd_state->entry_current_count, 1);
+			pg_atomic_fetch_add_u64(&cluster_grd_state->entries_reclaimed_count, 1);
+			removed = true;
+		}
+	} else {
+		SpinLockRelease(&entry->lock);
+		if (pinned)
+			pg_atomic_fetch_add_u64(&cluster_grd_state->reclaim_skipped_pinned_count, 1);
+	}
+
+	return removed;
+}
+
 static bool
 cluster_grd_hashremove_if_still_empty(const ClusterResId *resid)
 {
+	uint64 hash64;
 	uint32 hashvalue;
-	int shard_id;
+	uint32 shard_id;
 	bool found = false;
 	ClusterGrdEntry *entry;
 	bool removed = false;
@@ -5447,28 +5786,74 @@ cluster_grd_hashremove_if_still_empty(const ClusterResId *resid)
 	if (cluster_grd_entry_htab == NULL)
 		return false;
 
-	hashvalue = cluster_grd_hash_resource(resid);
-	shard_id = cluster_grd_shard_for_hash(hashvalue);
+	hash64 = cluster_grd_hash_resource(resid);
+	hashvalue = (uint32)hash64;
+	shard_id = cluster_grd_shard_for_hash(hash64);
 
 	LWLockAcquire(&cluster_grd_shard_locks[shard_id].lock, LW_EXCLUSIVE);
 
 	entry
 		= hash_search_with_hash_value(cluster_grd_entry_htab, resid, hashvalue, HASH_FIND, &found);
-	if (entry != NULL) {
-		SpinLockAcquire(&entry->lock);
-		if (entry->ngranted == 0 && entry->nwaiters == 0 && entry->nconverts == 0
-			&& entry->nreservations == 0) {
-			SpinLockRelease(&entry->lock);
-			(void)hash_search_with_hash_value(cluster_grd_entry_htab, resid, hashvalue, HASH_REMOVE,
-											  &found);
-			pg_atomic_fetch_sub_u64(&cluster_grd_state->entry_current_count, 1);
-			removed = true;
-		} else {
-			SpinLockRelease(&entry->lock);
-		}
-	}
+	if (entry != NULL)
+		removed = cluster_grd_hashremove_if_still_empty_locked(entry);
 
 	LWLockRelease(&cluster_grd_shard_locks[shard_id].lock);
+	return removed;
+}
+
+bool
+cluster_grd_reclaim_if_cold(const ClusterResId *resid)
+{
+	if (resid == NULL)
+		return false;
+	return cluster_grd_hashremove_if_still_empty(resid);
+}
+
+int
+cluster_grd_reclaim_sweep(void)
+{
+	ClusterResId *batch;
+	int budget;
+	int n = 0;
+	int removed = 0;
+	int i;
+	uint32 shard_id;
+
+	if (!cluster_grd_entry_reclaim || cluster_grd_entry_htab == NULL)
+		return 0;
+	if (cluster_grd_entry_reclaim_max_per_sweep <= 0)
+		return 0;
+
+	budget = cluster_grd_entry_reclaim_max_per_sweep;
+	batch = (ClusterResId *)palloc0((Size)budget * sizeof(ClusterResId));
+	pg_atomic_fetch_add_u64(&cluster_grd_state->sweep_runs, 1);
+
+	for (shard_id = 0; shard_id < PGRAC_GRD_SHARD_COUNT && n < budget; shard_id++) {
+		dlist_iter iter;
+
+		LWLockAcquire(&cluster_grd_shard_locks[shard_id].lock, LW_SHARED);
+		dlist_foreach(iter, &cluster_grd_state->entry_shard_lists[shard_id])
+		{
+			ClusterGrdEntry *entry;
+
+			if (n >= budget)
+				break;
+			entry = dlist_container(ClusterGrdEntry, shard_link, iter.cur);
+			SpinLockAcquire(&entry->lock);
+			if (cluster_grd_entry_is_reclaimable(entry))
+				batch[n++] = entry->resid;
+			else if (pg_atomic_read_u32(&entry->pin) != 0)
+				pg_atomic_fetch_add_u64(&cluster_grd_state->reclaim_skipped_pinned_count, 1);
+			SpinLockRelease(&entry->lock);
+		}
+		LWLockRelease(&cluster_grd_shard_locks[shard_id].lock);
+	}
+
+	for (i = 0; i < n; i++)
+		if (cluster_grd_hashremove_if_still_empty(&batch[i]))
+			removed++;
+
+	pfree(batch);
 	return removed;
 }
 
@@ -5506,7 +5891,6 @@ int
 cluster_grd_entry_cleanup_guarded(ClusterGrdEntry *entry, int dead_procno, int32 dead_node_id)
 {
 	int removed = 0;
-	bool became_empty = false;
 	GesRequestPayload release_payloads[PGRAC_GRD_MAX_HOLDERS];
 	int n_release = 0;
 	ClusterResId entry_resid;
@@ -5617,9 +6001,6 @@ cluster_grd_entry_cleanup_guarded(ClusterGrdEntry *entry, int dead_procno, int32
 	if (removed > 0)
 		entry->generation++;
 
-	became_empty = (entry->ngranted == 0 && entry->nwaiters == 0 && entry->nconverts == 0
-					&& entry->nreservations == 0);
-
 	memcpy(&entry_resid, &entry->resid, sizeof(entry_resid));
 
 	SpinLockRelease(&entry->lock);
@@ -5636,37 +6017,30 @@ cluster_grd_entry_cleanup_guarded(ClusterGrdEntry *entry, int dead_procno, int32
 		}
 	}
 
-	/* HC26 I-cleanup-4 — HASH_REMOVE at-most-once per entry lifetime.
-	 * Re-acquire shard partition LWLock + re-lookup resid + verify still
-	 * empty; the losing path (race with another cleanup that already
-	 * removed) increments skip counter. */
-	if (became_empty) {
-		bool removed_ok = cluster_grd_hashremove_if_still_empty(&entry_resid);
-		if (!removed_ok)
-			cluster_lmd_cleanup_skip_other_owner_count_inc(1);
-	}
-
 	return removed;
 }
 
 /*
- * Entry-by-procno sweep.  Iterates GRD HTAB; for each entry, invokes
- * D10 guarded primitive.  Returns total slots removed.
+ * Entry-by-procno sweep.  Snapshots GRD entry keys, then re-lookups each entry
+ * with a pin before invoking the D10 guarded primitive.  Returns total slots
+ * removed.
  */
 static int
 cluster_grd_entries_cleanup_by_procno_guarded(int procno)
 {
-	HASH_SEQ_STATUS status;
-	ClusterGrdEntry *entry;
+	ClusterResId *resids = NULL;
 	int total = 0;
+	int nresids;
+	int i;
 
 	if (cluster_grd_entry_htab == NULL || procno < 0)
 		return 0;
 
-	hash_seq_init(&status, cluster_grd_entry_htab);
-	while ((entry = (ClusterGrdEntry *)hash_seq_search(&status)) != NULL) {
-		total += cluster_grd_entry_cleanup_guarded(entry, procno, -1);
-	}
+	nresids = cluster_grd_snapshot_entry_resids(&resids);
+	for (i = 0; i < nresids; i++)
+		total += cluster_grd_entry_cleanup_guarded_by_resid(&resids[i], procno, -1);
+	if (resids != NULL)
+		pfree(resids);
 	return total;
 }
 
@@ -5705,11 +6079,12 @@ cluster_grd_cleanup_on_backend_exit(int procno)
 int
 cluster_grd_sweep_local_stale_procnos(void)
 {
-	HASH_SEQ_STATUS status;
-	ClusterGrdEntry *entry;
+	ClusterResId *resids = NULL;
 	int total = 0;
 	uint8 *alive;
 	int n_alive_max = MaxBackends;
+	int nresids;
+	int r;
 
 	if (cluster_grd_entry_htab == NULL)
 		return 0;
@@ -5728,10 +6103,15 @@ cluster_grd_sweep_local_stale_procnos(void)
 	}
 	LWLockRelease(ProcArrayLock);
 
-	hash_seq_init(&status, cluster_grd_entry_htab);
-	while ((entry = (ClusterGrdEntry *)hash_seq_search(&status)) != NULL) {
+	nresids = cluster_grd_snapshot_entry_resids(&resids);
+	for (r = 0; r < nresids; r++) {
+		ClusterGrdEntry *entry = NULL;
 		uint32 stale_procno = (uint32)-1;
 		uint32 i;
+
+		if (cluster_grd_entry_lookup_or_create(&resids[r], false, &entry) != CLUSTER_GRD_ENTRY_OK
+			|| entry == NULL)
+			continue;
 
 		SpinLockAcquire(&entry->lock);
 		for (i = 0; i < (uint32)entry->ngranted; i++) {
@@ -5747,8 +6127,11 @@ cluster_grd_sweep_local_stale_procnos(void)
 
 		if (stale_procno != (uint32)-1)
 			total += cluster_grd_entry_cleanup_guarded(entry, (int)stale_procno, -1);
+		cluster_grd_entry_release(entry);
 	}
 
+	if (resids != NULL)
+		pfree(resids);
 	pfree(alive);
 	return total;
 }
@@ -5801,6 +6184,7 @@ cluster_grd_try_reserve(const ClusterResId *resid, const ClusterGrdHolderId *hol
 
 	if (fast_path_out)
 		*fast_path_out = fast_path && (er == CLUSTER_GRD_ENTRY_OK);
+	cluster_grd_entry_release(entry);
 	return er;
 }
 
@@ -5858,10 +6242,12 @@ cluster_grd_revalidate_and_promote(const ClusterResId *resid, const ClusterGrdHo
 	if (!revalidate_ok) {
 		(void)cluster_grd_reservation_cancel(entry, holder);
 		SpinLockRelease(&entry->lock);
+		cluster_grd_entry_release(entry);
 		return CLUSTER_GRD_ENTRY_NOT_FOUND;
 	}
 	er = cluster_grd_reservation_promote(entry, holder);
 	SpinLockRelease(&entry->lock);
+	cluster_grd_entry_release(entry);
 	return er;
 }
 
@@ -5880,6 +6266,7 @@ cluster_grd_release_holder_by_id(const ClusterResId *resid, const ClusterGrdHold
 	SpinLockAcquire(&entry->lock);
 	er = cluster_grd_entry_release_holder(entry, holder);
 	SpinLockRelease(&entry->lock);
+	cluster_grd_entry_release(entry);
 	/* spec-5.8 D1b — holder removed; refresh queued waiters' edges. */
 	grd_wfg_resync_entry(resid, NULL, 0);
 	return er;
@@ -5900,6 +6287,7 @@ cluster_grd_cancel_reservation_by_id(const ClusterResId *resid, const ClusterGrd
 	SpinLockAcquire(&entry->lock);
 	er = cluster_grd_reservation_cancel(entry, holder);
 	SpinLockRelease(&entry->lock);
+	cluster_grd_entry_release(entry);
 	return er;
 }
 

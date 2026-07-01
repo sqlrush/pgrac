@@ -968,8 +968,8 @@ dump_scn(ReturnSetInfo *rsinfo)
 /*
  * dump_grd -- spec-2.14 D6 GRD routing substrate observability.
  *
- *	Emits 14 rows under category='grd' (8 from spec-2.14 + 6 from
- *	spec-2.15 entry-table infrastructure):
+ *	Emits core routing rows plus entry lifecycle counters under
+ *	category='grd':
  *	  - grd_shard_count:             4096 (constant)
  *	  - grd_local_master_count:      shards mastered by self node
  *	  - grd_remote_master_count:     4096 - local (SQL-friendly though derivable)
@@ -984,6 +984,10 @@ dump_scn(ReturnSetInfo *rsinfo)
  *	  - grd_entry_create_count:      lifetime created entries
  *	  - grd_entry_lookup_hit_count:  lifetime OK lookups
  *	  - grd_entry_full_count:        lifetime FULL returns
+ *	  - grd_entries_reclaimed_count: lifetime cold entry removes
+ *	  - grd_reclaim_skipped_pinned_count: reclaim skipped because pin>0
+ *	  - grd_pin_high_water:          max observed per-entry pin count
+ *	  - grd_sweep_runs:              LMON reclaim sweep invocations
  *
  *	Counter invariant (v0.4 P1.2):
  *	  grd_shard_lookup_count >=
@@ -1025,6 +1029,12 @@ dump_grd(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_grd_entry_lookup_hit_count()));
 	emit_row(rsinfo, "grd", "grd_entry_full_count",
 			 fmt_int64((int64)cluster_grd_entry_full_count()));
+	emit_row(rsinfo, "grd", "grd_entries_reclaimed_count",
+			 fmt_int64((int64)cluster_grd_entries_reclaimed_count()));
+	emit_row(rsinfo, "grd", "grd_reclaim_skipped_pinned_count",
+			 fmt_int64((int64)cluster_grd_reclaim_skipped_pinned_count()));
+	emit_row(rsinfo, "grd", "grd_pin_high_water", fmt_int64((int64)cluster_grd_pin_high_water()));
+	emit_row(rsinfo, "grd", "grd_sweep_runs", fmt_int64((int64)cluster_grd_sweep_runs()));
 
 	emit_row(rsinfo, "grd", "grd_holders_full_count",
 			 fmt_int64((int64)cluster_grd_holders_full_count()));

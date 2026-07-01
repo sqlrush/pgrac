@@ -262,6 +262,8 @@ extern int cluster_shmem_max_regions;
  * ----------
  */
 extern int cluster_grd_max_entries;
+extern bool cluster_grd_entry_reclaim;
+extern int cluster_grd_entry_reclaim_max_per_sweep;
 
 /* spec-2.16 D12 + v0.5 P1.5:  cluster.ges_request_timeout_ms +
  * effective_timeout helper.  range [1, 600000];  default 60000. */

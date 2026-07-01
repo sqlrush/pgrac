@@ -944,6 +944,7 @@ LmonMain(void)
 			 * reconfig epoch bump (S1 → S2 order writ).  bitmap diff
 			 * per v0.5 P1.2;  no-op when dead_generation unchanged. */
 			cluster_grd_lmon_tick_dead_sweep();
+			(void)cluster_grd_reclaim_sweep();
 			/* spec-5.10 fix-forward — runtime-off starvation sweep (no-op
 			 * unless cluster.ges_starvation_protection was just turned off). */
 			(void)cluster_grd_lmon_tick_starvation_sweep();
@@ -1542,6 +1543,7 @@ LmonMain(void)
 			 * reconfig epoch bump (S1 → S2 order writ).  bitmap diff
 			 * per v0.5 P1.2;  no-op when dead_generation unchanged. */
 			cluster_grd_lmon_tick_dead_sweep();
+			(void)cluster_grd_reclaim_sweep();
 			/* spec-5.10 fix-forward — runtime-off starvation sweep. */
 			(void)cluster_grd_lmon_tick_starvation_sweep();
 

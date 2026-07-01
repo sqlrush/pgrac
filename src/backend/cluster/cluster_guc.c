@@ -124,6 +124,8 @@ static const struct config_enum_entry cluster_undo_writeback_boundary_check_opti
 		{ NULL, 0, false } };
 
 int cluster_grd_max_entries = 1024;
+bool cluster_grd_entry_reclaim = true;
+int cluster_grd_entry_reclaim_max_per_sweep = 256;
 int cluster_ges_request_timeout_ms = 60000;	   /* spec-2.16 D12 + v0.5 P1.5 */
 int cluster_cf_enqueue_timeout_ms = 30000;	   /* spec-5.6 Dc4b — CF X/S grant wait */
 int cluster_ges_starvation_max_skips = 8;	   /* spec-5.10 — boost after N skips */
@@ -1440,6 +1442,23 @@ cluster_init_guc(void)
 							NULL,			/* check_hook */
 							NULL,			/* assign_hook */
 							NULL);			/* show_hook */
+
+	DefineCustomBoolVariable(
+		"cluster.grd_entry_reclaim",
+		gettext_noop("Enable safe cold reclaim for GRD resource entries."),
+		gettext_noop(
+			"When on, lookup pins are released with a copy-resid last-ref protocol and "
+			"cold holderless entries are removed after shard-LWLock and entry-spinlock "
+			"recheck.  Turning this off keeps the pin discipline but disables HASH_REMOVE, "
+			"matching the legacy cap-only entry table shape."),
+		&cluster_grd_entry_reclaim, true, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.grd_entry_reclaim_max_per_sweep",
+		gettext_noop("Maximum GRD cold entries reclaimed by one LMON sweep."),
+		gettext_noop("Bounds the background cold-entry reclaim pass.  0 disables the sweep while "
+					 "leaving eager last-unpin reclaim enabled."),
+		&cluster_grd_entry_reclaim_max_per_sweep, 256, 0, 65536, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	/*
 	 * spec-5.10:  cluster.ges_starvation_max_skips — bounded fairness threshold
