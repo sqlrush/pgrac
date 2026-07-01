@@ -1,4 +1,5 @@
 # src/bin/scripts/nls.mk
+# PGRAC: spec-6.5 includes pg_cluster_basebackup in frontend gettext scans.
 CATALOG_NAME     = pgscripts
 GETTEXT_FILES    = $(FRONTEND_COMMON_GETTEXT_FILES) \
                    createdb.c \
@@ -9,6 +10,7 @@ GETTEXT_FILES    = $(FRONTEND_COMMON_GETTEXT_FILES) \
                    vacuumdb.c \
                    reindexdb.c \
                    pg_isready.c \
+                   pg_cluster_basebackup.c \
                    common.c \
                    ../../fe_utils/parallel_slot.c \
                    ../../fe_utils/cancel.c \

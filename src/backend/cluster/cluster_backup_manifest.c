@@ -21,6 +21,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_backup.h"
+#include "cluster/storage/cluster_shared_fs.h"
 #include "port/pg_crc32c.h"
 
 static int
@@ -113,9 +114,31 @@ cluster_backup_manifest_validate(const ClusterBackupManifest *manifest)
 		return CLUSTER_BACKUP_MANIFEST_BAD_COUNTS;
 	if (!manifest->control_included)
 		return CLUSTER_BACKUP_MANIFEST_MISSING_CONTROL;
+	if (manifest->backend_storage_id == CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS
+		&& !manifest->shared_data_included)
+		return CLUSTER_BACKUP_MANIFEST_MISSING_SHARED_DATA;
+	if (manifest->restore_point_count > CLUSTER_BACKUP_RESTORE_POINT_MAX)
+		return CLUSTER_BACKUP_MANIFEST_BAD_COUNTS;
 	if (!SCN_VALID(manifest->consistent_scn) || !SCN_VALID(manifest->scn_durable_peak)
 		|| cluster_backup_scn_cmp(manifest->scn_durable_peak, manifest->consistent_scn) < 0)
 		return CLUSTER_BACKUP_MANIFEST_BAD_SCN_PEAK;
+
+	for (i = 0; i < (int)manifest->restore_point_count; i++) {
+		const ClusterRestorePoint *point = &manifest->restore_points[i];
+		int thread_count = 0;
+		int j;
+
+		if (!point->present || !SCN_VALID(point->cut_scn) || point->thread_count == 0
+			|| point->thread_count > CLUSTER_MAX_NODES)
+			return CLUSTER_BACKUP_MANIFEST_MISSING_THREAD;
+		for (j = 0; j < CLUSTER_MAX_NODES; j++) {
+			if (point->cut_lsn[j] == InvalidXLogRecPtr)
+				continue;
+			thread_count++;
+		}
+		if (thread_count != (int)point->thread_count)
+			return CLUSTER_BACKUP_MANIFEST_MISSING_THREAD;
+	}
 
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 		const ClusterBackupManifestThread *thread = &manifest->threads[i];
@@ -173,6 +196,8 @@ cluster_backup_manifest_reason_name(ClusterBackupManifestReason reason)
 		return "missing_tt";
 	case CLUSTER_BACKUP_MANIFEST_MISSING_CONTROL:
 		return "missing_control";
+	case CLUSTER_BACKUP_MANIFEST_MISSING_SHARED_DATA:
+		return "missing_shared_data";
 	case CLUSTER_BACKUP_MANIFEST_BAD_SCN_PEAK:
 		return "bad_scn_peak";
 	case CLUSTER_BACKUP_MANIFEST_BAD_CRC:
@@ -354,7 +379,7 @@ cluster_backup_wire_request_valid(const ClusterBackupWireRequest *request)
 	if (request->magic != CLUSTER_BACKUP_IC_MAGIC || request->version != CLUSTER_BACKUP_IC_VERSION)
 		return false;
 	if (request->op == CLUSTER_BACKUP_WIRE_OP_NONE
-		|| request->op > CLUSTER_BACKUP_WIRE_OP_RESTORE_POINT)
+		|| request->op > CLUSTER_BACKUP_WIRE_OP_RESTORE_POINT_RELEASE)
 		return false;
 	if (request->request_id == 0)
 		return false;
@@ -363,6 +388,8 @@ cluster_backup_wire_request_valid(const ClusterBackupWireRequest *request)
 	if (request->backup_id[CLUSTER_BACKUP_ID_MAX - 1] != '\0')
 		return false;
 	if (request->restore_point_name[CLUSTER_RESTORE_POINT_NAME_MAX - 1] != '\0')
+		return false;
+	if (request->backup_set_path[MAXPGPATH - 1] != '\0')
 		return false;
 
 	copy = *request;
@@ -394,7 +421,8 @@ cluster_backup_wire_ack_valid(const ClusterBackupWireAck *ack)
 		return false;
 	if (ack->magic != CLUSTER_BACKUP_IC_MAGIC || ack->version != CLUSTER_BACKUP_IC_VERSION)
 		return false;
-	if (ack->op == CLUSTER_BACKUP_WIRE_OP_NONE || ack->op > CLUSTER_BACKUP_WIRE_OP_RESTORE_POINT)
+	if (ack->op == CLUSTER_BACKUP_WIRE_OP_NONE
+		|| ack->op > CLUSTER_BACKUP_WIRE_OP_RESTORE_POINT_RELEASE)
 		return false;
 	if (ack->result > CLUSTER_BACKUP_WIRE_RESULT_EXECUTOR_ERROR)
 		return false;
@@ -410,7 +438,9 @@ cluster_backup_wire_ack_valid(const ClusterBackupWireAck *ack)
 				|| ack->checkpoint_lsn == InvalidXLogRecPtr))
 			return false;
 		if ((ack->op == CLUSTER_BACKUP_WIRE_OP_STOP
-			 || ack->op == CLUSTER_BACKUP_WIRE_OP_RESTORE_POINT)
+			 || ack->op == CLUSTER_BACKUP_WIRE_OP_RESTORE_POINT
+			 || ack->op == CLUSTER_BACKUP_WIRE_OP_RESTORE_POINT_PREPARE
+			 || ack->op == CLUSTER_BACKUP_WIRE_OP_RESTORE_POINT_RELEASE)
 			&& (ack->stop_cut_lsn == InvalidXLogRecPtr || !SCN_VALID(ack->cut_scn)))
 			return false;
 	}

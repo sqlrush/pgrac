@@ -256,6 +256,10 @@ extern ClusterMergeEngage cluster_recovery_merge_decide(uint16 own_thread, XLogR
 extern ClusterRecoveryMergeState *cluster_recovery_merge_begin(const uint64 merge_bitmap[2],
 															   const XLogRecPtr *start_lsn,
 															   uint16 own_thread, TimeLineID tli);
+extern ClusterRecoveryMergeState *
+cluster_recovery_merge_begin_restore(const uint64 merge_bitmap[2], const XLogRecPtr *start_lsn,
+									 const XLogRecPtr *stop_lsn, const char *wal_root,
+									 uint16 own_thread, TimeLineID tli);
 extern struct XLogReaderState *cluster_recovery_merge_next(ClusterRecoveryMergeState *st,
 														   uint16 *thread_out, char **errmsg_out);
 extern void cluster_recovery_merge_end(ClusterRecoveryMergeState *st);

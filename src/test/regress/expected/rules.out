@@ -1322,8 +1322,10 @@ pg_cluster_backup_history| SELECT backup_id,
     storage_id,
     node_count,
     thread_count,
-    manifest_crc
-   FROM cluster_get_backup_history() cluster_get_backup_history(backup_id, consistent_scn, scn_durable_peak, timeline, catversion, storage_id, node_count, thread_count, manifest_crc);
+    manifest_crc,
+    backup_set_path,
+    manifest_path
+   FROM cluster_get_backup_history() cluster_get_backup_history(backup_id, consistent_scn, scn_durable_peak, timeline, catversion, storage_id, node_count, thread_count, manifest_crc, backup_set_path, manifest_path);
 pg_cluster_clean_leave_state| SELECT phase,
     leaving_node_id,
     leave_epoch,
@@ -2018,8 +2020,10 @@ pg_stat_cluster_backup| SELECT in_progress,
     backup_parallel_channels,
     backup_wal_retention,
     restore_points_enabled,
-    restore_point_interval_ms
-   FROM cluster_get_backup_state() cluster_get_backup_state(in_progress, backup_id, coordinator_node_id, start_redo_lsn, checkpoint_lsn, stop_cut_lsn, consistent_scn, manifest_crc, started_at, stopped_at, backup_parallel_channels, backup_wal_retention, restore_points_enabled, restore_point_interval_ms);
+    restore_point_interval_ms,
+    backup_set_path,
+    manifest_path
+   FROM cluster_get_backup_state() cluster_get_backup_state(in_progress, backup_id, coordinator_node_id, start_redo_lsn, checkpoint_lsn, stop_cut_lsn, consistent_scn, manifest_crc, started_at, stopped_at, backup_parallel_channels, backup_wal_retention, restore_points_enabled, restore_point_interval_ms, backup_set_path, manifest_path);
 pg_stat_cluster_counters| SELECT name,
     value
    FROM cluster_get_pgstat_counters() cluster_get_pgstat_counters(name, value);
