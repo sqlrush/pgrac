@@ -129,8 +129,11 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlog_internal.h"
+#include "catalog/catversion.h"
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: spec-4.1 own-stream strict thread-id for crash recovery. */
+#include "cluster/cluster_backup.h" /* PGRAC: spec-6.5 restore/PITR manifest */
+#include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h" /* PGRAC: spec-4.5a cluster_wal_threads_dir */
 #include "cluster/cluster_hw_snapshot.h" /* PGRAC: spec-5.7 D3 HW authority recovery load */
 #include "cluster/cluster_remote_xact.h" /* PGRAC: spec-4.5a G5 */
@@ -504,6 +507,179 @@ static uint64 cluster_recovery_own_merge_bound = 0;
 static XLogRecPtr cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start,
 												 TimeLineID tli, uint16 own_thread,
 												 TimeLineID *replayTLI);
+static bool cluster_backup_recovery_have_manifest = false;
+static ClusterBackupManifest cluster_backup_recovery_manifest;
+static void cluster_backup_recovery_load_manifest(void);
+static void cluster_backup_recovery_apply_target(void);
+#endif
+
+#ifdef USE_PGRAC_CLUSTER
+static void
+cluster_backup_recovery_load_manifest(void)
+{
+	ClusterBackupManifest manifest;
+	ClusterRestoreCompatibilityReason compat;
+	struct stat st;
+	uint32 expected_node_count;
+
+	cluster_backup_recovery_have_manifest = false;
+	MemSet(&cluster_backup_recovery_manifest, 0, sizeof(cluster_backup_recovery_manifest));
+
+	if (!cluster_enabled)
+		return;
+	if (stat(CLUSTER_BACKUP_MANIFEST_DATADIR_FILE, &st) != 0) {
+		if (errno != ENOENT)
+			ereport(FATAL, (errcode_for_file_access(),
+							errmsg("could not stat cluster backup manifest \"%s\": %m",
+								   CLUSTER_BACKUP_MANIFEST_DATADIR_FILE)));
+		return;
+	}
+	if (!S_ISREG(st.st_mode)
+		|| !cluster_backup_manifest_read_file(CLUSTER_BACKUP_MANIFEST_DATADIR_FILE, &manifest))
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_BACKUP_INCOMPLETE),
+						errmsg("cluster backup manifest is invalid"),
+						errdetail("File \"%s\" exists but could not be validated.",
+								  CLUSTER_BACKUP_MANIFEST_DATADIR_FILE)));
+	expected_node_count = (uint32)cluster_conf_node_count();
+	compat = cluster_backup_manifest_compatible(&manifest, CATALOG_VERSION_NO,
+												(uint32)cluster_shared_storage_backend,
+												expected_node_count);
+	if (compat != CLUSTER_RESTORE_COMPAT_OK)
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_RESTORE_INCOMPATIBLE),
+						errmsg("cluster backup manifest is not compatible with this server"),
+						errdetail("Reason: %s.",
+								  cluster_restore_compat_reason_name(compat))));
+
+	cluster_backup_recovery_manifest = manifest;
+	cluster_backup_recovery_have_manifest = true;
+	ereport(LOG,
+			(errmsg("cluster backup manifest \"%s\" loaded for recovery",
+					CLUSTER_BACKUP_MANIFEST_DATADIR_FILE),
+			 errdetail("backup_id=%s consistent_scn=%llu incarnation=%u crc=%u",
+					   manifest.backup_id,
+					   (unsigned long long)manifest.consistent_scn,
+					   manifest.incarnation,
+					   manifest.manifest_crc)));
+}
+
+static void
+cluster_backup_recovery_apply_target(void)
+{
+	bool have_scn_target;
+	bool have_time_target;
+	bool have_name_target;
+	int target_count;
+	char stop_restore_point[CLUSTER_RESTORE_POINT_NAME_MAX + CLUSTER_BACKUP_ID_MAX];
+	uint16 local_thread_id;
+	int local_thread_index;
+
+	if (!cluster_enabled)
+		return;
+
+	have_scn_target = cluster_recovery_target_scn != NULL
+		&& cluster_recovery_target_scn[0] != '\0';
+	have_time_target = cluster_recovery_target_cluster_time != NULL
+		&& cluster_recovery_target_cluster_time[0] != '\0';
+	have_name_target = cluster_recovery_target_name != NULL
+		&& cluster_recovery_target_name[0] != '\0';
+	target_count = (have_scn_target ? 1 : 0) + (have_time_target ? 1 : 0)
+		+ (have_name_target ? 1 : 0);
+	if (!have_scn_target && !have_time_target && !have_name_target)
+		return;
+
+	if (!ArchiveRecoveryRequested)
+		return;
+	if (target_count > 1)
+		ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("multiple cluster PITR targets are configured"),
+						errdetail("Set only one of cluster.recovery_target_scn, "
+								  "cluster.recovery_target_cluster_time, or "
+								  "cluster.recovery_target_name.")));
+	if (recoveryTarget != RECOVERY_TARGET_UNSET)
+		ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("cluster PITR target conflicts with native recovery target"),
+						errdetail("Use either cluster.recovery_target_* or native recovery_target_* "
+								  "settings, not both.")));
+	if (have_time_target)
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_PITR_TARGET_UNREACHABLE),
+						errmsg("cluster PITR target by cluster time is not reachable"),
+						errdetail("No durable cluster restore-point timestamp catalog is present "
+								  "in this backup set.")));
+	if (!cluster_backup_recovery_have_manifest)
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_BACKUP_INCOMPLETE),
+						errmsg("cluster PITR target requires a valid cluster backup manifest")));
+
+	snprintf(stop_restore_point, sizeof(stop_restore_point), "cluster_backup_stop_%s",
+			 cluster_backup_recovery_manifest.backup_id);
+	if (have_name_target) {
+		if (strcmp(cluster_recovery_target_name, stop_restore_point) != 0)
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_PITR_TARGET_UNREACHABLE),
+							errmsg("cluster PITR named restore point is not reachable"),
+							errdetail("Requested restore point \"%s\" is not recorded in this "
+									  "backup manifest.",
+									  cluster_recovery_target_name)));
+	}
+	if (have_scn_target) {
+		int64 parsed = pg_strtoint64(cluster_recovery_target_scn);
+		SCN requested_scn;
+
+		if (parsed <= 0)
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_PITR_TARGET_UNREACHABLE),
+							errmsg("cluster PITR target SCN is invalid")));
+		requested_scn = (SCN)parsed;
+		if (scn_time_cmp(requested_scn,
+						 cluster_backup_recovery_manifest.consistent_scn) < 0)
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_PITR_TARGET_UNREACHABLE),
+							errmsg("cluster PITR target SCN is before the backup consistent SCN"),
+							errdetail("Requested SCN %llu, backup consistent SCN %llu.",
+									  (unsigned long long)requested_scn,
+									  (unsigned long long)
+										  cluster_backup_recovery_manifest.consistent_scn)));
+	}
+
+	if (cluster_backup_recovery_manifest.thread_count > 1)
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_BACKUP_INCOMPLETE),
+						errmsg("cluster PITR target requires multi-thread restore replay"),
+						errdetail("This backup manifest records %u WAL threads; this startup "
+								  "path can only prove native single-thread replay.",
+								  cluster_backup_recovery_manifest.thread_count)));
+	local_thread_id = cluster_wal_thread_id();
+	if (local_thread_id == XLP_THREAD_ID_LEGACY)
+		local_thread_id = 1;
+	local_thread_index = (int)local_thread_id - 1;
+	if (local_thread_index < 0 || local_thread_index >= CLUSTER_MAX_NODES
+		|| !cluster_backup_recovery_manifest.threads[local_thread_index].present
+		|| cluster_backup_recovery_manifest.threads[local_thread_index].stop_cut_lsn
+			   == InvalidXLogRecPtr)
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_BACKUP_INCOMPLETE),
+						errmsg("cluster PITR target is missing this node's WAL thread cut")));
+
+	recoveryTarget = RECOVERY_TARGET_LSN;
+	recoveryTargetLSN =
+		cluster_backup_recovery_manifest.threads[local_thread_index].stop_cut_lsn;
+	recoveryTargetInclusive = true;
+	switch (cluster_recovery_target_action) {
+	case CLUSTER_RECOVERY_TARGET_ACTION_PROMOTE:
+		recoveryTargetAction = RECOVERY_TARGET_ACTION_PROMOTE;
+		break;
+	case CLUSTER_RECOVERY_TARGET_ACTION_SHUTDOWN:
+		recoveryTargetAction = RECOVERY_TARGET_ACTION_SHUTDOWN;
+		break;
+	case CLUSTER_RECOVERY_TARGET_ACTION_PAUSE:
+	default:
+		recoveryTargetAction = RECOVERY_TARGET_ACTION_PAUSE;
+		break;
+	}
+	ereport(LOG,
+			(errmsg("cluster PITR target resolved to WAL location %X/%X",
+					LSN_FORMAT_ARGS(recoveryTargetLSN)),
+			 errdetail("Requested cluster target snaps to restore point \"%s\" at "
+					   "backup consistent SCN %llu.",
+					   stop_restore_point,
+					   (unsigned long long)
+						   cluster_backup_recovery_manifest.consistent_scn)));
+}
+
 #endif
 
 static void EnableStandbyMode(void);
@@ -660,6 +836,10 @@ InitWalRecovery(ControlFileData *ControlFile, bool *wasShutdown_ptr,
 	 */
 	readRecoverySignalFile();
 	validateRecoveryParameters();
+#ifdef USE_PGRAC_CLUSTER
+	cluster_backup_recovery_load_manifest();
+	cluster_backup_recovery_apply_target();
+#endif
 
 	if (ArchiveRecoveryRequested)
 	{

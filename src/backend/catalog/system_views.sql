@@ -1702,7 +1702,9 @@ CREATE VIEW pg_stat_cluster_backup AS
            backup_parallel_channels,
            backup_wal_retention,
            restore_points_enabled,
-           restore_point_interval_ms
+           restore_point_interval_ms,
+           backup_set_path,
+           manifest_path
       FROM cluster_get_backup_state();
 
 REVOKE ALL ON pg_stat_cluster_backup FROM PUBLIC;
@@ -1717,7 +1719,9 @@ CREATE VIEW pg_cluster_backup_history AS
            storage_id,
            node_count,
            thread_count,
-           manifest_crc
+           manifest_crc,
+           backup_set_path,
+           manifest_path
       FROM cluster_get_backup_history();
 
 REVOKE ALL ON pg_cluster_backup_history FROM PUBLIC;

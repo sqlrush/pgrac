@@ -34,7 +34,10 @@
 #define CLUSTER_BACKUP_RESTORE_POINT_MAX 16
 #define CLUSTER_BACKUP_NODE_BITMAP_BYTES (CLUSTER_MAX_NODES / 8)
 #define CLUSTER_BACKUP_IC_MAGIC 0x50424249U /* "PBBI" */
-#define CLUSTER_BACKUP_IC_VERSION 1
+#define CLUSTER_BACKUP_IC_VERSION 2
+#define CLUSTER_BACKUP_SET_DIR "pg_cluster_backups"
+#define CLUSTER_BACKUP_MANIFEST_FILE "cluster_backup.manifest"
+#define CLUSTER_BACKUP_MANIFEST_DATADIR_FILE "cluster_backup.manifest"
 
 typedef enum ClusterBackupManifestReason {
 	CLUSTER_BACKUP_MANIFEST_OK = 0,
@@ -81,7 +84,9 @@ typedef enum ClusterBackupWireOp {
 	CLUSTER_BACKUP_WIRE_OP_START,
 	CLUSTER_BACKUP_WIRE_OP_STOP,
 	CLUSTER_BACKUP_WIRE_OP_ABORT,
-	CLUSTER_BACKUP_WIRE_OP_RESTORE_POINT
+	CLUSTER_BACKUP_WIRE_OP_RESTORE_POINT,
+	CLUSTER_BACKUP_WIRE_OP_RESTORE_POINT_PREPARE,
+	CLUSTER_BACKUP_WIRE_OP_RESTORE_POINT_RELEASE
 } ClusterBackupWireOp;
 
 typedef enum ClusterBackupWireResult {
@@ -117,6 +122,8 @@ typedef struct ClusterBackupManifest {
 	uint32 backend_storage_id;
 	uint32 node_count;
 	uint32 thread_count;
+	char backup_set_path[MAXPGPATH];
+	char manifest_path[MAXPGPATH];
 	bool control_included;
 	bool voting_included;
 	ClusterBackupManifestThread threads[CLUSTER_MAX_NODES];
@@ -145,6 +152,8 @@ typedef struct ClusterBackupStatus {
 	uint32 manifest_crc;
 	TimestampTz started_at;
 	TimestampTz stopped_at;
+	char backup_set_path[MAXPGPATH];
+	char manifest_path[MAXPGPATH];
 } ClusterBackupStatus;
 
 typedef struct ClusterBackupWireRequest {
@@ -159,6 +168,7 @@ typedef struct ClusterBackupWireRequest {
 	SCN requested_scn;
 	char backup_id[CLUSTER_BACKUP_ID_MAX];
 	char restore_point_name[CLUSTER_RESTORE_POINT_NAME_MAX];
+	char backup_set_path[MAXPGPATH];
 	uint32 crc;
 } ClusterBackupWireRequest;
 
@@ -220,6 +230,16 @@ extern void cluster_backup_lmon_tick(void);
 extern void cluster_backup_pending_commit_enter(void);
 extern void cluster_backup_pending_commit_exit(void);
 extern void cluster_backup_pending_commit_abort(int code, Datum arg);
+extern void cluster_backup_durable_pin_publish(XLogRecPtr start_redo_lsn,
+											   const char *backup_id);
+extern void cluster_backup_durable_pin_clear(void);
+extern XLogRecPtr cluster_backup_durable_pin_lsn(void);
+extern bool cluster_backup_manifest_read_file(const char *path,
+											  ClusterBackupManifest *manifest);
+extern ClusterBackupManifestReason
+cluster_backup_manifest_validate_artifacts(const ClusterBackupManifest *manifest,
+										   const char *backup_set_path);
+extern void cluster_backup_recovery_observe_highwater(void);
 extern void cluster_backup_get_status(ClusterBackupStatus *out);
 extern bool cluster_backup_get_last_manifest(ClusterBackupManifest *out);
 extern int cluster_backup_get_restore_points(ClusterRestorePoint *out, int max_points);

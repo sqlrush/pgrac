@@ -28,13 +28,22 @@ Current 6.5 scope is conservative but no longer entirely read-only:
   surface.  Stop requires `waitforarchive=true` and active WAL archiving;
   the manifest is published only after a commit-drained restore point and
   PostgreSQL's required-WAL archive wait complete.
+- The backup set records physical data, native `backup_label`, binary
+  cluster manifest, control-file copy, voting-disk evidence, and per-node
+  undo/WAL-thread slices plus durable-TT proof files.  The latest artifact
+  paths are visible in the state and history views.
+- Single-thread offline restore/PITR can consume the captured `data/`
+  directory and manifest.  Startup recovery maps the cluster SCN/name target
+  to the native end-of-backup LSN proven by the manifest and restores the SCN
+  high-water mark before opening.
 - Manual `pg_cluster_create_restore_point()` records a local restore point
   after the same commit fence drains and the restore-point WAL record is
   flushed.
-- Declared-peer backup, standby-offload backup, offline restore execution,
-  and PITR replay remain fail-closed until their cross-node proof is
-  implemented.  The server refuses to publish a partial manifest instead
-  of reporting an unsound backup as complete.
+- Multi-thread restore replay, standby-offload backup, timestamp targets,
+  automatic restore-point scheduling, and multiple simultaneous cluster
+  PITR target settings remain fail-closed until their proof is implemented.
+  The server refuses to publish a partial manifest instead of reporting an
+  unsound backup as complete.
 
 ### `pg_stat_cluster_backup`
 
@@ -57,6 +66,8 @@ node.
 | `backup_wal_retention` | `int4` | Configured WAL retention hint, in MB. |
 | `restore_points_enabled` | `bool` | Whether automatic PITR restore-point scheduling is enabled. |
 | `restore_point_interval_ms` | `int4` | Automatic restore-point scheduling interval, in milliseconds. |
+| `backup_set_path` | `text` | Filesystem path of the latest backup set, or NULL before start. |
+| `manifest_path` | `text` | Filesystem path of the latest root cluster manifest, or NULL before stop. |
 
 ### `pg_cluster_backup_history`
 
@@ -74,6 +85,8 @@ memory.
 | `node_count` | `int4` | Number of nodes proven in the manifest. |
 | `thread_count` | `int4` | Number of WAL threads proven in the manifest. |
 | `manifest_crc` | `int8` | CRC32C of the manifest image. |
+| `backup_set_path` | `text` | Filesystem path of the backup set. |
+| `manifest_path` | `text` | Filesystem path of the root cluster manifest. |
 
 ### `pg_cluster_restore_points`
 
@@ -95,7 +108,7 @@ points and the latest manifest.
 
 | Column | Type | Description |
 |---|---|---|
-| `target_type` | `text` | `latest` when no target is configured, `scn`, `name`, or `cluster_time`. |
+| `target_type` | `text` | `latest` when no target is configured, `scn`, `name`, `cluster_time`, or `multiple` for conflicting cluster targets. |
 | `target_action` | `text` | Configured PITR action: `pause`, `promote`, or `shutdown`. |
 | `reachable` | `bool` | True if the configured target is reachable. |
 | `reason` | `text` | `ok` or the fail-closed reason. |

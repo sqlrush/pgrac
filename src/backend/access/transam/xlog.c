@@ -170,6 +170,7 @@
 #include "cluster/cluster_scn.h" /* PGRAC: xl_scn stamp (spec-4.5) */
 #include "cluster/cluster_wal_state.h" /* PGRAC: checkpoint redo / fpw sticky (spec-4.5) */
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_backup.h" /* PGRAC: spec-6.5 durable backup WAL pin */
 #include "cluster/cluster_tt_durable.h" /* PGRAC: spec-4.8 D1 crash-left ACTIVE resolution */
 #include "cluster/cluster_cf_authority.h" /* PGRAC: spec-5.6 shared pg_control authority write */
 #include "cluster/cluster_cf_enqueue.h" /* PGRAC: spec-5.6 CF X write-permission gate */
@@ -6069,6 +6070,7 @@ StartupXLOG(void)
 	 * up).  Lamport-monotonic, so it can only advance cluster_scn.
 	 */
 	cluster_tt_recovery_observe_scn_highwater();
+	cluster_backup_recovery_observe_highwater();
 
 	/*
 	 * PGRAC MODIFICATIONS (spec-4.8 D7): index-safe physical rollback of
@@ -7991,6 +7993,9 @@ KeepLogSeg(XLogRecPtr recptr, XLogRecPtr slotsMinReqLSN, XLogSegNo *logSegNo)
 	XLogSegNo	currSegNo;
 	XLogSegNo	segno;
 	XLogRecPtr	keep;
+#ifdef USE_PGRAC_CLUSTER
+	XLogRecPtr	clusterBackupPin;
+#endif
 
 	XLByteToSeg(recptr, currSegNo, wal_segment_size);
 	segno = currSegNo;
@@ -8032,6 +8037,18 @@ KeepLogSeg(XLogRecPtr recptr, XLogRecPtr slotsMinReqLSN, XLogSegNo *logSegNo)
 				segno = currSegNo - keep_segs;
 		}
 	}
+
+#ifdef USE_PGRAC_CLUSTER
+	clusterBackupPin = cluster_backup_durable_pin_lsn();
+	if (clusterBackupPin != InvalidXLogRecPtr && clusterBackupPin < recptr)
+	{
+		XLogSegNo	pinSegNo;
+
+		XLByteToSeg(clusterBackupPin, pinSegNo, wal_segment_size);
+		if (pinSegNo < segno)
+			segno = pinSegNo;
+	}
+#endif
 
 	/* don't delete WAL segments newer than the calculated segment */
 	if (segno < *logSegNo)
