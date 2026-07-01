@@ -1282,24 +1282,23 @@ cluster_init_guc(void)
 
 	DefineCustomStringVariable(
 		"cluster.recovery_target_cluster_time", gettext_noop("Cluster PITR target timestamp."),
-		gettext_noop("Reserved target timestamp for cluster-aware recovery planning. "
-					 "Spec-6.5 exposes the configuration and status surface; the "
-					 "startup recovery action remains fail-closed until the "
-					 "coordinator can prove all WAL threads are present."),
+		gettext_noop("During archive recovery of a cluster backup set, the target "
+					 "snaps to the latest manifest restore point not later than "
+					 "the requested timestamp."),
 		&cluster_recovery_target_cluster_time, "", PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	DefineCustomStringVariable(
 		"cluster.recovery_target_name", gettext_noop("Cluster PITR named restore point target."),
-		gettext_noop("Reserved named cluster restore-point target.  The status view "
-					 "reports restore points produced by pg_cluster_create_restore_point."),
+		gettext_noop("During archive recovery of a cluster backup set, the named target "
+					 "must match a restore point recorded in the backup manifest."),
 		&cluster_recovery_target_name, "", PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	DefineCustomEnumVariable(
 		"cluster.recovery_target_action",
 		gettext_noop("Action to take when a cluster PITR target is reached."),
 		gettext_noop("Accepted values are pause, promote, and shutdown.  The setting is "
-					 "advertised with the 6.5 target surface; startup recovery remains "
-					 "fail-closed until every required WAL thread is proven present."),
+					 "honored after startup recovery reaches the resolved cluster "
+					 "restore point."),
 		&cluster_recovery_target_action, CLUSTER_RECOVERY_TARGET_ACTION_PAUSE,
 		cluster_recovery_target_action_options, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
@@ -1307,8 +1306,8 @@ cluster_init_guc(void)
 		"cluster.enable_pitr_restore_points",
 		gettext_noop("Enable automatic cluster restore point creation."),
 		gettext_noop("Manual pg_cluster_create_restore_point is available regardless of "
-					 "this setting.  Automatic background creation is reserved until a "
-					 "cluster-wide cut coordinator is present."),
+					 "this setting.  Automatic background creation is enabled only "
+					 "when no declared peers are present."),
 		&cluster_enable_pitr_restore_points, false, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	DefineCustomIntVariable("cluster.pitr_restore_point_interval_ms",
@@ -1320,14 +1319,13 @@ cluster_init_guc(void)
 	DefineCustomIntVariable(
 		"cluster.backup_wal_retention",
 		gettext_noop("Cluster backup WAL retention hint in megabytes."),
-		gettext_noop("The 6.5 manifest/status surface records the setting; actual "
-					 "multi-thread retention enforcement is deferred to the backup-set "
-					 "writer."),
+		gettext_noop("The 6.5 manifest/status surface reports the setting.  Durable "
+					 "backup pins still retain WAL from the backup start REDO point."),
 		&cluster_backup_wal_retention, 0, 0, INT_MAX, PGC_SIGHUP, GUC_UNIT_MB, NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
 		"cluster.backup_parallel_channels", gettext_noop("Maximum cluster backup copy channels."),
-		gettext_noop("Reserved capacity knob for the cluster backup-set writer."),
+		gettext_noop("Maximum copy-channel capacity reported by the cluster backup surface."),
 		&cluster_backup_parallel_channels, 1, 1, CLUSTER_MAX_NODES, PGC_SIGHUP, 0, NULL, NULL,
 		NULL);
 

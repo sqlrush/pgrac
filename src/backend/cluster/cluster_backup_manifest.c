@@ -21,6 +21,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_backup.h"
+#include "cluster/storage/cluster_shared_fs.h"
 #include "port/pg_crc32c.h"
 
 static int
@@ -113,9 +114,31 @@ cluster_backup_manifest_validate(const ClusterBackupManifest *manifest)
 		return CLUSTER_BACKUP_MANIFEST_BAD_COUNTS;
 	if (!manifest->control_included)
 		return CLUSTER_BACKUP_MANIFEST_MISSING_CONTROL;
+	if (manifest->backend_storage_id == CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS
+		&& !manifest->shared_data_included)
+		return CLUSTER_BACKUP_MANIFEST_MISSING_SHARED_DATA;
+	if (manifest->restore_point_count > CLUSTER_BACKUP_RESTORE_POINT_MAX)
+		return CLUSTER_BACKUP_MANIFEST_BAD_COUNTS;
 	if (!SCN_VALID(manifest->consistent_scn) || !SCN_VALID(manifest->scn_durable_peak)
 		|| cluster_backup_scn_cmp(manifest->scn_durable_peak, manifest->consistent_scn) < 0)
 		return CLUSTER_BACKUP_MANIFEST_BAD_SCN_PEAK;
+
+	for (i = 0; i < (int)manifest->restore_point_count; i++) {
+		const ClusterRestorePoint *point = &manifest->restore_points[i];
+		int thread_count = 0;
+		int j;
+
+		if (!point->present || !SCN_VALID(point->cut_scn) || point->thread_count == 0
+			|| point->thread_count > CLUSTER_MAX_NODES)
+			return CLUSTER_BACKUP_MANIFEST_MISSING_THREAD;
+		for (j = 0; j < CLUSTER_MAX_NODES; j++) {
+			if (point->cut_lsn[j] == InvalidXLogRecPtr)
+				continue;
+			thread_count++;
+		}
+		if (thread_count != (int)point->thread_count)
+			return CLUSTER_BACKUP_MANIFEST_MISSING_THREAD;
+	}
 
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 		const ClusterBackupManifestThread *thread = &manifest->threads[i];
@@ -173,6 +196,8 @@ cluster_backup_manifest_reason_name(ClusterBackupManifestReason reason)
 		return "missing_tt";
 	case CLUSTER_BACKUP_MANIFEST_MISSING_CONTROL:
 		return "missing_control";
+	case CLUSTER_BACKUP_MANIFEST_MISSING_SHARED_DATA:
+		return "missing_shared_data";
 	case CLUSTER_BACKUP_MANIFEST_BAD_SCN_PEAK:
 		return "bad_scn_peak";
 	case CLUSTER_BACKUP_MANIFEST_BAD_CRC:

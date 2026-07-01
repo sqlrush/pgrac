@@ -30,7 +30,7 @@
 #define CLUSTER_BACKUP_ID_MAX 64
 #define CLUSTER_RESTORE_POINT_NAME_MAX 64
 #define CLUSTER_BACKUP_MANIFEST_MAGIC 0x5047424BU /* "PGBK" */
-#define CLUSTER_BACKUP_MANIFEST_VERSION 1
+#define CLUSTER_BACKUP_MANIFEST_VERSION 3
 #define CLUSTER_BACKUP_RESTORE_POINT_MAX 16
 #define CLUSTER_BACKUP_NODE_BITMAP_BYTES (CLUSTER_MAX_NODES / 8)
 #define CLUSTER_BACKUP_IC_MAGIC 0x50424249U /* "PBBI" */
@@ -51,6 +51,7 @@ typedef enum ClusterBackupManifestReason {
 	CLUSTER_BACKUP_MANIFEST_MISSING_UNDO,
 	CLUSTER_BACKUP_MANIFEST_MISSING_TT,
 	CLUSTER_BACKUP_MANIFEST_MISSING_CONTROL,
+	CLUSTER_BACKUP_MANIFEST_MISSING_SHARED_DATA,
 	CLUSTER_BACKUP_MANIFEST_BAD_SCN_PEAK,
 	CLUSTER_BACKUP_MANIFEST_BAD_CRC
 } ClusterBackupManifestReason;
@@ -110,6 +111,16 @@ typedef struct ClusterBackupManifestThread {
 	XLogRecPtr stop_cut_lsn;
 } ClusterBackupManifestThread;
 
+typedef struct ClusterRestorePoint {
+	bool present;
+	char name[CLUSTER_RESTORE_POINT_NAME_MAX];
+	SCN cut_scn;
+	XLogRecPtr cut_lsn[CLUSTER_MAX_NODES];
+	uint32 thread_count;
+	uint32 incarnation;
+	TimestampTz created_at;
+} ClusterRestorePoint;
+
 typedef struct ClusterBackupManifest {
 	uint32 magic;
 	uint32 version;
@@ -126,19 +137,12 @@ typedef struct ClusterBackupManifest {
 	char manifest_path[MAXPGPATH];
 	bool control_included;
 	bool voting_included;
+	bool shared_data_included;
+	uint32 restore_point_count;
+	ClusterRestorePoint restore_points[CLUSTER_BACKUP_RESTORE_POINT_MAX];
 	ClusterBackupManifestThread threads[CLUSTER_MAX_NODES];
 	uint32 manifest_crc;
 } ClusterBackupManifest;
-
-typedef struct ClusterRestorePoint {
-	bool present;
-	char name[CLUSTER_RESTORE_POINT_NAME_MAX];
-	SCN cut_scn;
-	XLogRecPtr cut_lsn[CLUSTER_MAX_NODES];
-	uint32 thread_count;
-	uint32 incarnation;
-	TimestampTz created_at;
-} ClusterRestorePoint;
 
 typedef struct ClusterBackupStatus {
 	bool in_progress;

@@ -9,6 +9,7 @@ GETTEXT_FILES    = $(FRONTEND_COMMON_GETTEXT_FILES) \
                    vacuumdb.c \
                    reindexdb.c \
                    pg_isready.c \
+                   pg_cluster_basebackup.c \
                    common.c \
                    ../../fe_utils/parallel_slot.c \
                    ../../fe_utils/cancel.c \
