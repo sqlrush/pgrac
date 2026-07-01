@@ -194,6 +194,7 @@ OBJS = \
 	storage/cluster_undo_alloc.o \
 	storage/cluster_undo_buf.o \
 	storage/cluster_undo_smgr.o \
+	storage/cluster_undo_vtable.o \
 	storage/cluster_undo_xlog.o \
 	storage/cluster_itl_xlog.o
 else

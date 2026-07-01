@@ -40,7 +40,9 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_undo_buftag.h" /* spec-3.27 D2: undo routing test */
 #include "cluster/storage/cluster_smgr.h"
+#include "cluster/storage/cluster_undo_vtable.h" /* spec-3.27 D2: CLUSTER_UNDO_SMGR_SMGRSW_INDEX */
 
 #undef printf
 #undef fprintf
@@ -513,6 +515,39 @@ UT_TEST(test_which_for_full_opt_in_returns_cluster)
 }
 
 
+UT_TEST(test_which_for_undo_locator_routes_to_undo_smgr)
+{
+	/* spec-3.27 D2: a reserved undo RelFileLocator routes to smgrsw index 2
+	 * (the buffer-backed undo smgr), regardless of GUCs. */
+	RelFileLocator undo = cluster_undo_relfilelocator(3, 42);
+
+	cluster_shared_storage_backend = 0;	 /* STUB */
+	cluster_smgr_user_relations = false; /* opt-in off */
+	UT_ASSERT_EQ(cluster_smgr_which_for(undo, InvalidBackendId), CLUSTER_UNDO_SMGR_SMGRSW_INDEX);
+}
+
+
+UT_TEST(test_which_for_undo_precedes_temp_and_guc)
+{
+	/* Undo routing wins even with a (nonsensical) non-Invalid backend and
+	 * full opt-in GUCs -- undo is never temp and never uses the shared-fs
+	 * opt-in, so the undo branch must precede both checks. */
+	RelFileLocator undo = cluster_undo_relfilelocator(1, 7);
+
+	cluster_shared_storage_backend = 1; /* LOCAL */
+	cluster_smgr_user_relations = true; /* opt-in on */
+	UT_ASSERT_EQ(cluster_smgr_which_for(undo, 99), CLUSTER_UNDO_SMGR_SMGRSW_INDEX);
+
+	/* A real relation with the same GUCs still routes to cluster_smgr (1),
+	 * confirming the undo branch is a targeted spcOid match, not a blanket. */
+	{
+		RelFileLocator real = { .spcOid = 1664, .dbOid = 5, .relNumber = 16385 };
+
+		UT_ASSERT_EQ(cluster_smgr_which_for(real, InvalidBackendId), 1);
+	}
+}
+
+
 /* ============================================================
  * Diagnostic accessor.
  * ============================================================ */
@@ -736,12 +771,14 @@ main(void)
 	 */
 	cluster_smgr_shmem_init();
 
-	UT_PLAN(14);
+	UT_PLAN(16);
 	UT_RUN(test_smgr_callbacks_linkable);
 	UT_RUN(test_which_for_temp_relation_returns_md);
 	UT_RUN(test_which_for_stub_backend_returns_md);
 	UT_RUN(test_which_for_user_relations_off_returns_md);
 	UT_RUN(test_which_for_full_opt_in_returns_cluster);
+	UT_RUN(test_which_for_undo_locator_routes_to_undo_smgr);
+	UT_RUN(test_which_for_undo_precedes_temp_and_guc);
 	UT_RUN(test_active_relation_count_pre_init);
 	UT_RUN(test_smgrsw_callback_signature_compiles);
 	UT_RUN(test_build_smgr_inval_msg_is_pg_native);

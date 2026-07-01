@@ -66,9 +66,11 @@
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_sinval.h"		 /* spec-5.2 D1: relsize inval broadcast */
+#include "cluster/cluster_undo_buftag.h" /* spec-3.27 D2: reserved undo spcOid routing */
 #include "cluster/cluster_write_fence.h" /* spec-4.12 D5 — hot write-path fence gate */
 #include "cluster/storage/cluster_shared_fs.h"
 #include "cluster/storage/cluster_smgr.h"
+#include "cluster/storage/cluster_undo_vtable.h" /* spec-3.27 D2: CLUSTER_UNDO_SMGR_SMGRSW_INDEX */
 
 
 #ifdef USE_PGRAC_CLUSTER
@@ -289,6 +291,19 @@ int
 cluster_smgr_which_for(RelFileLocator rlocator, BackendId backend)
 {
 	CLUSTER_INJECTION_POINT("cluster-smgr-which-decision");
+
+	/*
+	 * spec-3.27 D2 (Q3-A):  buffer-backed undo blocks carry the reserved undo
+	 * tablespace OID (cluster_undo_buftag.h).  Route them to the undo smgr
+	 * (smgrsw index 2) UNCONDITIONALLY -- not GUC-gated -- because an undo
+	 * RelFileLocator only ever reaches smgropen from the bufmgr undo write path,
+	 * which is itself only taken when cluster.undo_buffer_backend = bufmgr (D7).
+	 * In legacy_pool mode no undo BufferTag is ever constructed, so this branch
+	 * cannot fire for the wrong backend.  This precedes the temp-relation and
+	 * GUC checks:  undo is never temp and never uses the shared-fs opt-in.
+	 */
+	if (cluster_undo_locator_is_undo(rlocator))
+		return CLUSTER_UNDO_SMGR_SMGRSW_INDEX;
 
 	if (backend != InvalidBackendId)
 		return 0; /* temp relation: always md.c */

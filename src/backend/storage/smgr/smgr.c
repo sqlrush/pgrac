@@ -42,10 +42,23 @@
  *	    and cluster.enabled=off paths stay byte-identical to
  *	    upstream PG.
  *
+ *	  Stage 3.27 (spec-3.27 D2, buffer-backed undo):
+ *	    Extended smgrsw[] to a third entry (index 2,
+ *	    CLUSTER_UNDO_SMGR_SMGRSW_INDEX) that routes per-instance undo
+ *	    segment blocks (reserved undo tablespace OID, cluster_undo_buftag.h)
+ *	    through the buffer manager.  smgropen() selects it via
+ *	    cluster_smgr_which_for() whenever the RelFileLocator carries the
+ *	    reserved undo spcOid -- unconditional (undo blocks only reach
+ *	    smgropen from the bufmgr undo write path, itself gated by
+ *	    cluster.undo_buffer_backend = bufmgr, D7).  Callback bodies live in
+ *	    cluster_undo_vtable.c.  In --disable-cluster builds the array stays
+ *	    a single element (both #ifdef USE_PGRAC_CLUSTER).
+ *
  *	  Related design:
  *	    docs/cluster-smgr-design.md v1.1 (方案 C 单文件)
  *	    specs/spec-1.2-smgr-cluster.md
  *	    specs/spec-2.7-smgr-cluster-2node-concurrent-open.md
+ *	    specs/spec-3.27-undo-buffer-backed-model.md
  *
  *
  * IDENTIFICATION
@@ -66,6 +79,7 @@
 #include "cluster/cluster_cr_pool.h"			/* PGRAC: spec-5.51 CR pool epoch bump */
 #include "cluster/cluster_inject.h"			/* PGRAC: spec-5.53 D2b skip-bump fault */
 #include "cluster/storage/cluster_smgr.h"		/* PGRAC: smgrsw[1] + spec-2.7 hooks */
+#include "cluster/storage/cluster_undo_vtable.h"	/* PGRAC: smgrsw[2] undo (spec-3.27 D2) */
 #endif
 #include "storage/smgr.h"
 #include "utils/hsearch.h"
@@ -157,6 +171,35 @@ static const f_smgr smgrsw[] = {
 		.smgr_nblocks = cluster_smgr_nblocks,
 		.smgr_truncate = cluster_smgr_truncate,
 		.smgr_immedsync = cluster_smgr_immedsync,
+	}
+	,
+	/*
+	 * PGRAC spec-3.27 D2: buffer-backed undo smgr (smgrsw[2],
+	 * CLUSTER_UNDO_SMGR_SMGRSW_INDEX).  Selected by smgropen() via
+	 * cluster_smgr_which_for() for any RelFileLocator carrying the reserved
+	 * undo tablespace OID (cluster_undo_buftag.h); lets the shared buffer
+	 * manager ReadBufferExtended / FlushBuffer / checkpoint undo blocks
+	 * directly.  Callback bodies are in cluster_undo_vtable.c.  smgr_init /
+	 * smgr_shutdown are NULL (undo I/O is stateless with a lazy per-backend
+	 * fd cache inside cluster_undo_smgr.c).
+	 */
+	{
+		.smgr_init = NULL,
+		.smgr_shutdown = NULL,
+		.smgr_open = cluster_undo_vtable_open,
+		.smgr_close = cluster_undo_vtable_close,
+		.smgr_create = cluster_undo_vtable_create,
+		.smgr_exists = cluster_undo_vtable_exists,
+		.smgr_unlink = cluster_undo_vtable_unlink,
+		.smgr_extend = cluster_undo_vtable_extend,
+		.smgr_zeroextend = cluster_undo_vtable_zeroextend,
+		.smgr_prefetch = cluster_undo_vtable_prefetch,
+		.smgr_read = cluster_undo_vtable_read,
+		.smgr_write = cluster_undo_vtable_write,
+		.smgr_writeback = cluster_undo_vtable_writeback,
+		.smgr_nblocks = cluster_undo_vtable_nblocks,
+		.smgr_truncate = cluster_undo_vtable_truncate,
+		.smgr_immedsync = cluster_undo_vtable_immedsync,
 	}
 #endif
 };
