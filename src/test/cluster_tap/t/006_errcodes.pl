@@ -104,6 +104,10 @@ is(raise_and_get_sqlstate('cluster_reconfig_in_progress'), '53R60',
 	"cluster_reconfig_in_progress -> 53R60");
 is(raise_and_get_sqlstate('cluster_backup_incomplete'), '53RAD',
 	"cluster_backup_incomplete -> 53RAD");
+is(raise_and_get_sqlstate('cluster_adg_apply_lag_excessive'), '57R06',
+	"cluster_adg_apply_lag_excessive -> 57R06");
+is(raise_and_get_sqlstate('cluster_adg_standby_unresolvable'), '57R07',
+	"cluster_adg_standby_unresolvable -> 57R07");
 is(raise_and_get_sqlstate('cluster_shared_storage_failed'), '58R01',
 	"cluster_shared_storage_failed -> 58R01");
 is(raise_and_get_sqlstate('cluster_storage_fence_unavailable'), '58R15',

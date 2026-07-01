@@ -53,6 +53,20 @@ is($node->safe_psql('postgres',
 	'110',
 	'pg_stat_cluster_wait_events returns 110 rows (spec-6.0a +7 storage wait events)');
 
+is($node->safe_psql(
+		'postgres',
+		'SELECT node_id, dg_role, dg_mode, adg_enabled, mrp_status, lag_bytes
+		   FROM pg_stat_cluster_adg'),
+	'-1|primary|async|f|disabled|0',
+	'pg_stat_cluster_adg returns default primary/ADG-off state');
+
+is($node->safe_psql(
+		'postgres',
+		'SELECT receive_lsn IS NULL, apply_lsn IS NULL
+		   FROM pg_stat_cluster_adg'),
+	't|t',
+	'pg_stat_cluster_adg leaves ADG LSNs NULL while disabled');
+
 
 # ----------
 # Distinct type count: 13 (10 from spec-0.11 + SharedFs from spec-1.1

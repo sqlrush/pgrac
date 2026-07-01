@@ -478,6 +478,51 @@ cluster_tt_status_install_local(const ClusterTTStatusKey *key, ClusterTTStatus s
 	return true;
 }
 
+int
+cluster_tt_status_resolve_prepared_commit(TransactionId xid, SCN commit_scn)
+{
+	HASH_SEQ_STATUS seq;
+	ClusterTTOverlayEntry *e;
+	TimestampTz now;
+	uint32 current_epoch;
+	int resolved = 0;
+
+	if (!TransactionIdIsValid(xid) || !SCN_VALID(commit_scn))
+		return 0;
+	if (!cluster_enabled || cluster_node_id < 0 || ClusterTTStatusHTAB == NULL)
+		return 0;
+
+	current_epoch = (uint32)cluster_epoch_get_current();
+	now = GetCurrentTimestamp();
+
+	LWLockAcquire(ClusterTTStatusLock, LW_EXCLUSIVE);
+	hash_seq_init(&seq, ClusterTTStatusHTAB);
+	while ((e = (ClusterTTOverlayEntry *)hash_seq_search(&seq)) != NULL) {
+		if (e->key.local_xid != xid)
+			continue;
+		if (e->key.origin_node_id != (uint16)cluster_node_id)
+			continue;
+		if (e->key.cluster_epoch != current_epoch)
+			continue;
+		if (e->status != CLUSTER_TT_STATUS_IN_PROGRESS && e->status != CLUSTER_TT_STATUS_COMMITTED)
+			continue;
+
+		e->status = CLUSTER_TT_STATUS_COMMITTED;
+		e->commit_scn = commit_scn;
+		e->status_epoch = current_epoch;
+		e->install_ts = now;
+		e->has_parent_key = false;
+		memset(&e->parent_key, 0, sizeof(e->parent_key));
+		resolved++;
+	}
+	LWLockRelease(ClusterTTStatusLock);
+
+	if (resolved > 0)
+		pg_atomic_fetch_add_u64(&ClusterTTStatusState->recovery_overlay_rebuild_count,
+								(uint64)resolved);
+	return resolved;
+}
+
 /*
  * cluster_tt_status_install_subcommitted (spec-3.5 D2 NEW)
  *
@@ -771,6 +816,14 @@ cluster_tt_status_install_local(const ClusterTTStatusKey *key, ClusterTTStatus s
 	(void)status;
 	(void)commit_scn;
 	return false;
+}
+
+int
+cluster_tt_status_resolve_prepared_commit(TransactionId xid, SCN commit_scn)
+{
+	(void)xid;
+	(void)commit_scn;
+	return 0;
 }
 
 bool

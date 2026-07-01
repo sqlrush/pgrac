@@ -81,6 +81,12 @@
 #include "utils/resowner.h"
 #include "utils/timestamp.h"
 
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_adg.h"
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_mrp.h"
+#endif
+
 
 /*
  * GUC variables.  (Other variables that affect walreceiver are in xlog.c
@@ -134,6 +140,10 @@ static TimestampTz wakeup[NUM_WALRCV_WAKEUPS];
 static StringInfoData reply_message;
 static StringInfoData incoming_message;
 
+#ifdef USE_PGRAC_CLUSTER
+static uint16 walrcv_adg_last_thread_id = XLP_THREAD_ID_LEGACY;
+#endif
+
 /* Prototypes for private functions */
 static void WalRcvFetchTimeLineHistoryFiles(TimeLineID first, TimeLineID last);
 static void WalRcvWaitForStartPosition(XLogRecPtr *startpoint, TimeLineID *startpointTLI);
@@ -142,6 +152,10 @@ static void XLogWalRcvProcessMsg(unsigned char type, char *buf, Size len,
 								 TimeLineID tli);
 static void XLogWalRcvWrite(char *buf, Size nbytes, XLogRecPtr recptr,
 							TimeLineID tli);
+#ifdef USE_PGRAC_CLUSTER
+static void XLogWalRcvAdgObserveReceivedChunk(const char *buf, Size nbytes,
+											  XLogRecPtr recptr);
+#endif
 static void XLogWalRcvFlush(bool dying, TimeLineID tli);
 static void XLogWalRcvClose(XLogRecPtr recptr, TimeLineID tli);
 static void XLogWalRcvSendReply(bool force, bool requestReply);
@@ -957,6 +971,9 @@ XLogWalRcvWrite(char *buf, Size nbytes, XLogRecPtr recptr, TimeLineID tli)
 		}
 
 		/* Update state for write */
+#ifdef USE_PGRAC_CLUSTER
+		XLogWalRcvAdgObserveReceivedChunk(buf, (Size)byteswritten, recptr);
+#endif
 		recptr += byteswritten;
 
 		nbytes -= byteswritten;
@@ -977,6 +994,45 @@ XLogWalRcvWrite(char *buf, Size nbytes, XLogRecPtr recptr, TimeLineID tli)
 	if (recvFile >= 0 && !XLByteInSeg(recptr, recvSegNo, wal_segment_size))
 		XLogWalRcvClose(recptr, tli);
 }
+
+#ifdef USE_PGRAC_CLUSTER
+static void
+XLogWalRcvAdgObserveReceivedChunk(const char *buf, Size nbytes, XLogRecPtr recptr)
+{
+	XLogRecPtr	chunk_end;
+	XLogRecPtr	page_lsn;
+	uint32		page_offset;
+
+	if (!cluster_mrp_should_start())
+		return;
+	if (buf == NULL || nbytes == 0 || XLogRecPtrIsInvalid(recptr))
+		return;
+
+	chunk_end = recptr + nbytes;
+	page_offset = recptr % XLOG_BLCKSZ;
+	if (page_offset == 0)
+		page_lsn = recptr;
+	else
+		page_lsn = recptr + (XLOG_BLCKSZ - page_offset);
+
+	while (page_lsn <= chunk_end
+		   && chunk_end - page_lsn >= sizeof(XLogPageHeaderData))
+	{
+		Size		offset = (Size)(page_lsn - recptr);
+		XLogPageHeaderData hdr;
+
+		memcpy(&hdr, buf + offset, sizeof(hdr));
+		if (hdr.xlp_magic == XLOG_PAGE_MAGIC
+			&& cluster_xlog_validate_page_header(hdr.xlp_thread_id,
+												 hdr.xlp_cluster_flags,
+												 XLP_THREAD_ID_INVALID))
+			walrcv_adg_last_thread_id = hdr.xlp_thread_id;
+		page_lsn += XLOG_BLCKSZ;
+	}
+
+	cluster_mrp_mark_thread_received(walrcv_adg_last_thread_id, chunk_end);
+}
+#endif
 
 /*
  * Flush the log to disk.
@@ -1139,6 +1195,17 @@ XLogWalRcvSendReply(bool force, bool requestReply)
 	pq_sendint64(&reply_message, applyPtr);
 	pq_sendint64(&reply_message, GetCurrentTimestamp());
 	pq_sendbyte(&reply_message, requestReply ? 1 : 0);
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_mrp_should_start())
+	{
+		pq_sendint(&reply_message, CLUSTER_ADG_REPLY_MAGIC, 4);
+		pq_sendint16(&reply_message, CLUSTER_ADG_REPLY_VERSION);
+		pq_sendint16(&reply_message, walrcv_adg_last_thread_id);
+		pq_sendint64(&reply_message, (uint64)cluster_mrp_standby_consistent_scn());
+		pq_sendint64(&reply_message, cluster_mrp_apply_master_term());
+	}
+#endif
 
 	/* Send it */
 	elog(DEBUG2, "sending write %X/%X flush %X/%X apply %X/%X%s",

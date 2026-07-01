@@ -218,6 +218,7 @@ ClusterConf *ClusterConfShmem = &test_cluster_conf;
  * advance/observe paths aren't silently skipped (behavior tests live
  * in TAP 066 L12). */
 bool cluster_enabled = true;
+bool cluster_enable_adg = true;
 
 /* superuser stub for SQL UDF wrappers (never called in this binary). */
 bool
@@ -602,6 +603,31 @@ UT_TEST(test_scn_node_id_extracts_unsigned_byte)
 	UT_ASSERT_EQ((int)scn_node_id(s2), 0);
 }
 
+UT_TEST(test_scn_time_predecessor_preserves_node_and_decrements_local)
+{
+	SCN s = scn_encode(7, 100);
+	SCN pred = cluster_scn_time_predecessor(s);
+
+	UT_ASSERT(SCN_VALID(pred));
+	UT_ASSERT_EQ((int)scn_node_id(pred), 7);
+	UT_ASSERT_EQ((int)scn_local(pred), 99);
+	UT_ASSERT(scn_time_cmp(pred, s) < 0);
+}
+
+UT_TEST(test_scn_time_predecessor_rejects_local_zero)
+{
+	SCN s = scn_encode(7, 0);
+
+	UT_ASSERT_EQ(cluster_scn_time_predecessor(s), InvalidScn);
+}
+
+UT_TEST(test_scn_time_predecessor_rejects_reserved_node)
+{
+	SCN reserved_node_scn = ((SCN)200 << SCN_NODE_ID_SHIFT) | (SCN)10;
+
+	UT_ASSERT_EQ(cluster_scn_time_predecessor(reserved_node_scn), InvalidScn);
+}
+
 
 /* ============================================================
  * Spec-1.16 commit/abort hook + observe Lamport bump symbol tests
@@ -637,6 +663,104 @@ UT_TEST(test_spec116_abort_advance_count_linkable)
 UT_TEST(test_spec116_observe_bump_count_linkable)
 {
 	UT_ASSERT_NOT_NULL((void *)cluster_scn_observe_bump_count);
+}
+
+UT_TEST(test_spec64_adg_pending_accessors_linkable)
+{
+	UT_ASSERT_NOT_NULL((void *)cluster_scn_pending_commit_clear);
+	UT_ASSERT_NOT_NULL((void *)cluster_scn_pending_commit_clear_my_pending);
+	UT_ASSERT_NOT_NULL((void *)cluster_scn_adg_pending_min_scn);
+	UT_ASSERT_NOT_NULL((void *)cluster_scn_adg_thread_safe_scn);
+}
+
+UT_TEST(test_spec64_adg_pending_register_and_clear_real_behavior)
+{
+	uint64 pre;
+	SCN scn;
+	SCN safe;
+
+	cluster_enable_adg = true;
+	cluster_scn_shmem_init();
+	(void)cluster_scn_pending_commit_clear_my_pending();
+	pre = cluster_scn_adg_pending_count();
+
+	scn = cluster_scn_advance_for_commit();
+	UT_ASSERT(SCN_VALID(scn));
+	UT_ASSERT_EQ(cluster_scn_adg_pending_count(), pre + 1);
+	UT_ASSERT_EQ(scn_total_cmp(cluster_scn_adg_pending_min_scn(), scn), 0);
+
+	safe = cluster_scn_adg_thread_safe_scn();
+	if (scn_local(scn) == 1)
+		UT_ASSERT_EQ(safe, InvalidScn);
+	else
+		UT_ASSERT_EQ(scn_time_cmp(safe, cluster_scn_time_predecessor(scn)), 0);
+
+	UT_ASSERT(cluster_scn_pending_commit_clear(scn));
+	UT_ASSERT_EQ(cluster_scn_adg_pending_count(), pre);
+}
+
+UT_TEST(test_spec64_adg_pending_disabled_does_not_register)
+{
+	uint64 pre;
+	SCN scn;
+
+	cluster_scn_shmem_init();
+	(void)cluster_scn_pending_commit_clear_my_pending();
+	pre = cluster_scn_adg_pending_count();
+
+	cluster_enable_adg = false;
+	scn = cluster_scn_advance_for_commit();
+	cluster_enable_adg = true;
+
+	UT_ASSERT(SCN_VALID(scn));
+	UT_ASSERT_EQ(cluster_scn_adg_pending_count(), pre);
+	UT_ASSERT_EQ(scn_total_cmp(cluster_scn_adg_thread_safe_scn(), scn), 0);
+}
+
+UT_TEST(test_spec64_adg_pending_abort_cleanup_real_behavior)
+{
+	uint64 pre;
+	SCN scn;
+
+	cluster_enable_adg = true;
+	cluster_scn_shmem_init();
+	(void)cluster_scn_pending_commit_clear_my_pending();
+	pre = cluster_scn_adg_pending_count();
+
+	scn = cluster_scn_advance_for_commit();
+	UT_ASSERT(SCN_VALID(scn));
+	UT_ASSERT_EQ(cluster_scn_adg_pending_count(), pre + 1);
+
+	UT_ASSERT(cluster_scn_pending_commit_clear_my_pending());
+	UT_ASSERT_EQ(cluster_scn_adg_pending_count(), pre);
+	UT_ASSERT(!cluster_scn_pending_commit_clear_my_pending());
+}
+
+UT_TEST(test_spec64_adg_thread_safe_uses_min_pending_predecessor)
+{
+	uint64 pre;
+	SCN first;
+	SCN second;
+	SCN safe;
+
+	cluster_enable_adg = true;
+	cluster_scn_shmem_init();
+	(void)cluster_scn_pending_commit_clear_my_pending();
+	pre = cluster_scn_adg_pending_count();
+
+	first = cluster_scn_advance_for_commit();
+	second = cluster_scn_advance_for_commit();
+	UT_ASSERT(SCN_VALID(first));
+	UT_ASSERT(SCN_VALID(second));
+	UT_ASSERT_EQ(cluster_scn_adg_pending_count(), pre + 2);
+	UT_ASSERT_EQ(scn_total_cmp(cluster_scn_adg_pending_min_scn(), first), 0);
+
+	safe = cluster_scn_adg_thread_safe_scn();
+	UT_ASSERT_EQ(scn_time_cmp(safe, cluster_scn_time_predecessor(first)), 0);
+
+	UT_ASSERT(cluster_scn_pending_commit_clear(second));
+	UT_ASSERT(cluster_scn_pending_commit_clear(first));
+	UT_ASSERT_EQ(cluster_scn_adg_pending_count(), pre);
 }
 
 /* spec-1.17 BOC tick + 4 stat accessor symbol-linkable tests. */
@@ -948,7 +1072,7 @@ UT_TEST(test_spec29_boc_broadcast_msg_type_enum_value)
 int
 main(void)
 {
-	UT_PLAN(41);
+	UT_PLAN(49);
 
 	/* Stage 1.4 stub (5) */
 	UT_RUN(test_scn_typedef_size_is_8_bytes);
@@ -957,7 +1081,7 @@ main(void)
 	UT_RUN(test_scn_valid_macro_accepts_nonzero);
 	UT_RUN(test_scn_format_macro_produces_nonempty_string);
 
-	/* Spec-1.15 encoding layer (12) */
+	/* Spec-1.15 encoding layer (15) */
 	UT_RUN(test_scn_bit_layout_invariants);
 	UT_RUN(test_scn_node_id_valid_three_segments);
 	UT_RUN(test_scn_encode_roundtrip);
@@ -970,6 +1094,9 @@ main(void)
 	UT_RUN(test_scn_total_cmp_invariant_no_raw_uint64_wins);
 	UT_RUN(test_scn_invalid_remains_zero_under_encoding);
 	UT_RUN(test_scn_node_id_extracts_unsigned_byte);
+	UT_RUN(test_scn_time_predecessor_preserves_node_and_decrements_local);
+	UT_RUN(test_scn_time_predecessor_rejects_local_zero);
+	UT_RUN(test_scn_time_predecessor_rejects_reserved_node);
 
 	/* Spec-1.16 commit/abort + observe Lamport hook symbols (5) */
 	UT_RUN(test_spec116_advance_for_commit_linkable);
@@ -977,6 +1104,13 @@ main(void)
 	UT_RUN(test_spec116_commit_advance_count_linkable);
 	UT_RUN(test_spec116_abort_advance_count_linkable);
 	UT_RUN(test_spec116_observe_bump_count_linkable);
+
+	/* spec-6.4 ADG pending-commit barrier hooks (5). */
+	UT_RUN(test_spec64_adg_pending_accessors_linkable);
+	UT_RUN(test_spec64_adg_pending_register_and_clear_real_behavior);
+	UT_RUN(test_spec64_adg_pending_disabled_does_not_register);
+	UT_RUN(test_spec64_adg_pending_abort_cleanup_real_behavior);
+	UT_RUN(test_spec64_adg_thread_safe_uses_min_pending_predecessor);
 
 	/* Spec-1.17 BOC tick + accessor symbols (4) */
 	UT_RUN(test_spec117_boc_tick_linkable);

@@ -56,6 +56,7 @@
 #include "utils/relmapper.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_adg_xlog.h"			/* RM_CLUSTER_ADG_ID handlers */
 #include "cluster/storage/cluster_undo_xlog.h"	/* RM_CLUSTER_UNDO_ID handlers */
 #include "cluster/storage/cluster_raw_xlog.h"	/* RM_CLUSTER_RAW_LAYOUT_ID handlers */
 #endif

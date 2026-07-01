@@ -155,6 +155,13 @@ typedef struct ClusterScnSharedState {
 	 */
 	pg_atomic_uint64 last_observe_at_us; /* TimestampTz raw bits */
 	pg_atomic_uint64 observed_max_observe_gap_ms;
+	/* spec-6.4 D5b: ADG pending-commit SCN registry. */
+	uint16 adg_pending_count;
+	bool adg_pending_overflowed;
+	SCN adg_pending[CLUSTER_SCN_ADG_PENDING_MAX];
+	pg_atomic_uint64 adg_pending_register_count;
+	pg_atomic_uint64 adg_pending_clear_count;
+	pg_atomic_uint64 adg_pending_overflow_count;
 } ClusterScnSharedState;
 
 /* spec-2.12 D2:  defensive — raw-bits storage of TimestampTz in
@@ -165,9 +172,12 @@ StaticAssertDecl(sizeof(TimestampTz) == sizeof(uint64),
 
 
 static ClusterScnSharedState *cluster_scn_state = NULL;
+static SCN cluster_scn_backend_pending_commit_scn = InvalidScn;
 
 /* WARNING throttle: at most 1/min */
 static TimestampTz last_warn_emitted_at = 0;
+
+static bool cluster_scn_pending_commit_register(SCN commit_scn);
 
 
 /*
@@ -250,6 +260,20 @@ scn_recovery_cmp(SCN a, XLogRecPtr a_lsn, NodeId a_node, SCN b, XLogRecPtr b_lsn
 	if (a_node > b_node)
 		return 1;
 	return 0;
+}
+
+SCN
+cluster_scn_time_predecessor(SCN scn)
+{
+	NodeId node = scn_node_id(scn);
+	uint64 local = scn_local(scn);
+
+	if (!SCN_NODE_ID_VALID(node))
+		return InvalidScn;
+	if (local == 0)
+		return InvalidScn;
+
+	return scn_encode(node, local - 1);
 }
 
 
@@ -599,6 +623,8 @@ cluster_scn_advance_for_commit(void)
 
 	scn = cluster_scn_advance();
 	pg_atomic_fetch_add_u64(&cluster_scn_state->commit_advance_count, 1);
+	if (cluster_enable_adg)
+		(void)cluster_scn_pending_commit_register(scn);
 
 	CLUSTER_INJECTION_POINT("cluster-scn-commit-post-advance");
 
@@ -667,6 +693,153 @@ cluster_scn_recovery_replay_observe(SCN scn)
 	CLUSTER_INJECTION_POINT("cluster-scn-replay-observe-pre");
 
 	cluster_scn_observe(scn);
+}
+
+static bool
+cluster_scn_pending_commit_register(SCN commit_scn)
+{
+	uint16 i;
+
+	if (cluster_scn_state == NULL || !SCN_VALID(commit_scn))
+		return false;
+
+	LWLockAcquire(&cluster_scn_state->lwlock, LW_EXCLUSIVE);
+	if (cluster_scn_state->adg_pending_overflowed) {
+		LWLockRelease(&cluster_scn_state->lwlock);
+		return false;
+	}
+	for (i = 0; i < cluster_scn_state->adg_pending_count; i++) {
+		if (scn_total_cmp(cluster_scn_state->adg_pending[i], commit_scn) == 0) {
+			cluster_scn_backend_pending_commit_scn = commit_scn;
+			LWLockRelease(&cluster_scn_state->lwlock);
+			return true;
+		}
+	}
+	if (cluster_scn_state->adg_pending_count >= CLUSTER_SCN_ADG_PENDING_MAX) {
+		cluster_scn_state->adg_pending_overflowed = true;
+		pg_atomic_fetch_add_u64(&cluster_scn_state->adg_pending_overflow_count, 1);
+		LWLockRelease(&cluster_scn_state->lwlock);
+		return false;
+	}
+	cluster_scn_state->adg_pending[cluster_scn_state->adg_pending_count++] = commit_scn;
+	cluster_scn_backend_pending_commit_scn = commit_scn;
+	pg_atomic_fetch_add_u64(&cluster_scn_state->adg_pending_register_count, 1);
+	LWLockRelease(&cluster_scn_state->lwlock);
+	return true;
+}
+
+bool
+cluster_scn_pending_commit_clear(SCN commit_scn)
+{
+	uint16 i;
+	bool cleared = false;
+
+	if (cluster_scn_state == NULL || !SCN_VALID(commit_scn))
+		return false;
+
+	LWLockAcquire(&cluster_scn_state->lwlock, LW_EXCLUSIVE);
+	for (i = 0; i < cluster_scn_state->adg_pending_count; i++) {
+		if (scn_total_cmp(cluster_scn_state->adg_pending[i], commit_scn) == 0) {
+			uint16 j;
+
+			for (j = (uint16)(i + 1); j < cluster_scn_state->adg_pending_count; j++)
+				cluster_scn_state->adg_pending[j - 1] = cluster_scn_state->adg_pending[j];
+			cluster_scn_state->adg_pending_count--;
+			cluster_scn_state->adg_pending[cluster_scn_state->adg_pending_count] = InvalidScn;
+			pg_atomic_fetch_add_u64(&cluster_scn_state->adg_pending_clear_count, 1);
+			cleared = true;
+			break;
+		}
+	}
+	LWLockRelease(&cluster_scn_state->lwlock);
+
+	if (scn_total_cmp(cluster_scn_backend_pending_commit_scn, commit_scn) == 0)
+		cluster_scn_backend_pending_commit_scn = InvalidScn;
+	return cleared;
+}
+
+bool
+cluster_scn_pending_commit_clear_my_pending(void)
+{
+	SCN pending = cluster_scn_backend_pending_commit_scn;
+
+	if (!SCN_VALID(pending))
+		return false;
+	return cluster_scn_pending_commit_clear(pending);
+}
+
+SCN
+cluster_scn_adg_pending_min_scn(void)
+{
+	SCN min_scn = InvalidScn;
+	uint16 i;
+
+	if (cluster_scn_state == NULL)
+		return InvalidScn;
+
+	LWLockAcquire(&cluster_scn_state->lwlock, LW_SHARED);
+	if (cluster_scn_state->adg_pending_overflowed) {
+		LWLockRelease(&cluster_scn_state->lwlock);
+		return InvalidScn;
+	}
+	for (i = 0; i < cluster_scn_state->adg_pending_count; i++) {
+		SCN candidate = cluster_scn_state->adg_pending[i];
+
+		if (!SCN_VALID(candidate))
+			continue;
+		if (!SCN_VALID(min_scn) || scn_time_cmp(candidate, min_scn) < 0
+			|| (scn_time_cmp(candidate, min_scn) == 0 && scn_total_cmp(candidate, min_scn) < 0))
+			min_scn = candidate;
+	}
+	LWLockRelease(&cluster_scn_state->lwlock);
+	return min_scn;
+}
+
+SCN
+cluster_scn_adg_thread_safe_scn(void)
+{
+	SCN current_scn;
+	SCN min_pending;
+
+	if (cluster_scn_state == NULL)
+		return InvalidScn;
+	if (cluster_scn_adg_pending_overflowed())
+		return InvalidScn;
+
+	current_scn = cluster_scn_current();
+	if (!SCN_VALID(current_scn))
+		return InvalidScn;
+
+	min_pending = cluster_scn_adg_pending_min_scn();
+	if (!SCN_VALID(min_pending))
+		return current_scn;
+	return cluster_scn_time_predecessor(min_pending);
+}
+
+uint64
+cluster_scn_adg_pending_count(void)
+{
+	uint64 count;
+
+	if (cluster_scn_state == NULL)
+		return 0;
+	LWLockAcquire(&cluster_scn_state->lwlock, LW_SHARED);
+	count = cluster_scn_state->adg_pending_count;
+	LWLockRelease(&cluster_scn_state->lwlock);
+	return count;
+}
+
+bool
+cluster_scn_adg_pending_overflowed(void)
+{
+	bool overflowed;
+
+	if (cluster_scn_state == NULL)
+		return false;
+	LWLockAcquire(&cluster_scn_state->lwlock, LW_SHARED);
+	overflowed = cluster_scn_state->adg_pending_overflowed;
+	LWLockRelease(&cluster_scn_state->lwlock);
+	return overflowed;
 }
 
 /*
@@ -1232,6 +1405,12 @@ cluster_scn_shmem_init(void)
 		/* spec-2.12 D2 init zero (TimestampTz raw bits + atomic counter). */
 		pg_atomic_init_u64(&cluster_scn_state->last_observe_at_us, 0);
 		pg_atomic_init_u64(&cluster_scn_state->observed_max_observe_gap_ms, 0);
+		cluster_scn_state->adg_pending_count = 0;
+		cluster_scn_state->adg_pending_overflowed = false;
+		memset(cluster_scn_state->adg_pending, 0, sizeof(cluster_scn_state->adg_pending));
+		pg_atomic_init_u64(&cluster_scn_state->adg_pending_register_count, 0);
+		pg_atomic_init_u64(&cluster_scn_state->adg_pending_clear_count, 0);
+		pg_atomic_init_u64(&cluster_scn_state->adg_pending_overflow_count, 0);
 	}
 }
 

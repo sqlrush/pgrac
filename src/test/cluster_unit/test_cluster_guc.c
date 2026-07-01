@@ -336,15 +336,31 @@ UT_TEST(test_cluster_phase_remains_plain_global)
 	UT_ASSERT_STR_EQ(cluster_phase, "pre_init");
 }
 
+UT_TEST(test_cluster_adg_guc_defaults)
+{
+	UT_ASSERT_EQ(cluster_dg_role, CLUSTER_DG_ROLE_PRIMARY);
+	UT_ASSERT_EQ(cluster_dg_mode, CLUSTER_DG_MODE_ASYNC);
+	UT_ASSERT_EQ((int)cluster_enable_adg, 0);
+	UT_ASSERT_EQ((int)cluster_apply_master_election, 1);
+	UT_ASSERT_EQ(cluster_adg_lag_threshold_sec, 10);
+	UT_ASSERT_EQ(cluster_apply_master_max_lag_ms, 5000);
+	UT_ASSERT_EQ(cluster_max_standby_delay, 30);
+	UT_ASSERT_EQ(cluster_apply_master_switch_drain_ms, 5000);
+	UT_ASSERT_EQ(cluster_adg_barrier_interval_ms, 0);
+	UT_ASSERT_EQ(cluster_wal_sender_timeout_sec, 60);
+	UT_ASSERT_EQ(cluster_wal_receiver_timeout_sec, 60);
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(4);
+	UT_PLAN(5);
 	UT_RUN(test_cluster_node_id_default_is_minus_one);
 	UT_RUN(test_cluster_node_id_address_stable);
 	UT_RUN(test_cluster_init_guc_symbol_is_linkable);
 	UT_RUN(test_cluster_phase_remains_plain_global);
+	UT_RUN(test_cluster_adg_guc_defaults);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

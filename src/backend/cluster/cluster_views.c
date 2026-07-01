@@ -45,6 +45,7 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "utils/builtins.h"
+#include "utils/pg_lsn.h"
 #include "utils/tuplestore.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
@@ -55,8 +56,119 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_conf.h"			/* cluster_conf_lookup_node, role helpers */
 #include "cluster/cluster_guc.h"			/* cluster_node_id */
+#include "cluster/cluster_mrp.h"			/* cluster_mrp_shared_state */
 #include "cluster/cluster_shmem.h"			/* ClusterShmem->created_at */
 #include "cluster/cluster_version_macros.h" /* PGRAC_VERSION_STRING */
+#endif
+
+#ifdef USE_PGRAC_CLUSTER
+static const char *
+cluster_adg_role_name(void)
+{
+	switch (cluster_dg_role) {
+	case CLUSTER_DG_ROLE_PRIMARY:
+		return "primary";
+	case CLUSTER_DG_ROLE_STANDBY:
+		return "standby";
+	default:
+		return "unknown";
+	}
+}
+
+static const char *
+cluster_adg_mode_name(void)
+{
+	switch (cluster_dg_mode) {
+	case CLUSTER_DG_MODE_ASYNC:
+		return "async";
+	case CLUSTER_DG_MODE_SYNC:
+		return "sync";
+	case CLUSTER_DG_MODE_MAX_AVAILABILITY:
+		return "max_availability";
+	default:
+		return "unknown";
+	}
+}
+
+static void
+cluster_put_adg_state_row(ReturnSetInfo *rsinfo, int32 node_id)
+{
+	Datum values[13];
+	bool nulls[13] = { false, false, false, false, false, false, false,
+					   false, false, false, false, false, false };
+	XLogRecPtr receive_lsn = InvalidXLogRecPtr;
+	XLogRecPtr apply_lsn = InvalidXLogRecPtr;
+	const char *mrp_status;
+	int32 apply_master_node_id = -1;
+	uint64 apply_master_term = 0;
+	uint64 standby_consistent_scn = 0;
+	uint64 receive_time_us = 0;
+	uint64 apply_time_us = 0;
+	float8 lag_seconds = 0.0;
+	int64 lag_bytes = 0;
+	ClusterMrpSharedState *mrp = cluster_mrp_shared_state();
+
+	memset(values, 0, sizeof(values));
+
+	if (cluster_dg_role != CLUSTER_DG_ROLE_STANDBY || !cluster_enable_adg)
+		mrp_status = "disabled";
+	else if (mrp == NULL)
+		mrp_status = "not_started";
+	else {
+		uint32 packed_owner;
+
+		mrp_status
+			= cluster_mrp_state_to_string((ClusterMrpState)pg_atomic_read_u32(&mrp->mrp_state));
+		packed_owner = pg_atomic_read_u32(&mrp->apply_master_node_id);
+		if (packed_owner != UINT32_MAX)
+			apply_master_node_id = (int32)packed_owner;
+		apply_master_term = pg_atomic_read_u64(&mrp->apply_master_term);
+		receive_lsn = (XLogRecPtr)pg_atomic_read_u64(&mrp->receive_lsn);
+		apply_lsn = (XLogRecPtr)pg_atomic_read_u64(&mrp->apply_lsn);
+		standby_consistent_scn = pg_atomic_read_u64(&mrp->standby_consistent_scn);
+		for (uint16 thread_id = 0; thread_id <= CLUSTER_WAL_THREAD_MAX; thread_id++) {
+			uint64 thread_receive_time_us
+				= pg_atomic_read_u64(&mrp->thread_receive_time_us[thread_id]);
+			uint64 thread_apply_time_us = pg_atomic_read_u64(&mrp->thread_apply_time_us[thread_id]);
+
+			receive_time_us = Max(receive_time_us, thread_receive_time_us);
+			apply_time_us = Max(apply_time_us, thread_apply_time_us);
+		}
+	}
+
+	values[0] = Int32GetDatum(node_id);
+	values[1] = CStringGetTextDatum(cluster_adg_role_name());
+	values[2] = CStringGetTextDatum(cluster_adg_mode_name());
+	values[3] = BoolGetDatum(cluster_enable_adg);
+	values[4] = Int32GetDatum(apply_master_node_id);
+	values[5] = Int64GetDatum((int64)apply_master_term);
+	values[6] = CStringGetTextDatum(mrp_status);
+
+	if (XLogRecPtrIsInvalid(receive_lsn))
+		nulls[7] = true;
+	else
+		values[7] = LSNGetDatum(receive_lsn);
+	if (XLogRecPtrIsInvalid(apply_lsn))
+		nulls[8] = true;
+	else
+		values[8] = LSNGetDatum(apply_lsn);
+
+	values[9] = Int64GetDatum((int64)standby_consistent_scn);
+	if (!XLogRecPtrIsInvalid(receive_lsn) && !XLogRecPtrIsInvalid(apply_lsn)
+		&& receive_lsn >= apply_lsn)
+		lag_bytes = (int64)(receive_lsn - apply_lsn);
+	if (receive_time_us > apply_time_us)
+		lag_seconds = ((float8)(receive_time_us - apply_time_us)) / 1000000.0;
+
+	values[10] = Int64GetDatum(lag_bytes);
+	values[11] = Float8GetDatum(lag_seconds);
+	if (lag_seconds > 0.0 && lag_bytes > 0)
+		values[12] = Float8GetDatum(((float8)lag_bytes / (1024.0 * 1024.0)) / lag_seconds);
+	else
+		values[12] = Float8GetDatum((float8)0.0);
+
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
 #endif
 
 
@@ -354,6 +466,48 @@ cluster_get_gcluster_wait_events(PG_FUNCTION_ARGS)
 				tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 			}
 		}
+	}
+#endif
+
+	return (Datum)0;
+}
+
+
+/* ============================================================
+ * cluster_get_adg_state / cluster_get_gcluster_adg -- ADG lag and apply
+ * status views (spec-6.4).
+ * ============================================================ */
+
+PG_FUNCTION_INFO_V1(cluster_get_adg_state);
+
+Datum
+cluster_get_adg_state(PG_FUNCTION_ARGS)
+{
+	InitMaterializedSRF(fcinfo, 0);
+
+#ifdef USE_PGRAC_CLUSTER
+	{
+		ReturnSetInfo *rsinfo = (ReturnSetInfo *)fcinfo->resultinfo;
+
+		cluster_put_adg_state_row(rsinfo, (int32)cluster_node_id);
+	}
+#endif
+
+	return (Datum)0;
+}
+
+PG_FUNCTION_INFO_V1(cluster_get_gcluster_adg);
+
+Datum
+cluster_get_gcluster_adg(PG_FUNCTION_ARGS)
+{
+	InitMaterializedSRF(fcinfo, 0);
+
+#ifdef USE_PGRAC_CLUSTER
+	{
+		ReturnSetInfo *rsinfo = (ReturnSetInfo *)fcinfo->resultinfo;
+
+		cluster_put_adg_state_row(rsinfo, (int32)cluster_node_id);
 	}
 #endif
 

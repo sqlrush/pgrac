@@ -717,7 +717,11 @@
  * pg_cluster_backup_start/stop, pg_cluster_create_restore_point, 4 state SRFs,
  * 4 system views, LWTRANCHE_CLUSTER_BACKUP, and 53RAB..53RAF SQLSTATEs.
  * Bump 202606340 -> 202606350. */
-#define CATALOG_VERSION_NO 202606350
+/* spec-6.4: ADG physical standby/read-only catalog surface —
+ * cluster_get_adg_state + cluster_get_gcluster_adg SRFs and
+ * pg_stat_cluster_adg + pg_stat_gcluster_adg views.  Bump 202606350 ->
+ * 202606360. */
+#define CATALOG_VERSION_NO 202606360
 
 /* spec-5.13 (2026-06-27): clean-leave catalog surface — cluster_get_clean_leave_state
  * SRF (oid 8960) + pg_cluster_clean_leave_state view + pg_cluster_clean_leave_request

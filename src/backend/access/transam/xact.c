@@ -141,6 +141,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: spec-1.16 commit/abort SCN hooks; spec-1.18 WAL emit + replay. */
+#include "cluster/cluster_adg_xlog.h" /* PGRAC: spec-6.4 ADG thread barrier */
 #include "cluster/cluster_conf.h"		/* cluster_conf_has_peers */
 #include "cluster/cluster_mode.h"		/* cluster_storage_mode_enabled */
 #include "cluster/cluster_inject.h"
@@ -1615,6 +1616,7 @@ RecordTransactionCommit(void)
 			commit_scn = cluster_scn_advance_for_commit();
 			/* spec-3.3 D7: copy to function-scope variable for TT hook below. */
 			tt_commit_scn = commit_scn;
+			(void)cluster_adg_emit_thread_barrier();
 
 			/*
 			 * PGRAC (spec-3.4a D6 / N12 P0):
@@ -1756,6 +1758,15 @@ RecordTransactionCommit(void)
 		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 		END_CRIT_SECTION();
 	}
+
+#ifdef USE_PGRAC_CLUSTER
+	if (markXidCommitted)
+	{
+		(void)cluster_scn_pending_commit_clear(tt_commit_scn);
+		if (SCN_VALID(tt_commit_scn))
+			(void)cluster_adg_emit_thread_barrier();
+	}
+#endif
 
 	/* Compute latestXid while we have the child XIDs handy */
 	latestXid = TransactionIdLatest(xid, nchildren, children);
@@ -2388,6 +2399,10 @@ StartTransaction(void)
 	{
 		s->startedInRecovery = false;
 		XactReadOnly = DefaultXactReadOnly;
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_enabled && cluster_enable_adg && cluster_dg_role == CLUSTER_DG_ROLE_STANDBY)
+			XactReadOnly = true;
+#endif
 	}
 	XactDeferrable = DefaultXactDeferrable;
 	XactIsoLevel = DefaultXactIsoLevel;
@@ -3209,6 +3224,13 @@ AbortTransaction(void)
 
 	/* Reset WAL record construction state */
 	XLogResetInsertion();
+
+#ifdef USE_PGRAC_CLUSTER
+	/* spec-6.4 INV-ADG9: clear any commit_scn registered before an ERROR
+	 * escaped the precommit gap, so ADG thread-safe-SCN publication does not
+	 * freeze permanently on an aborted local transaction. */
+	(void)cluster_scn_pending_commit_clear_my_pending();
+#endif
 
 	/* Cancel condition variable sleep */
 	ConditionVariableCancelSleep();
@@ -6892,6 +6914,9 @@ xact_redo(XLogReaderState *record)
 		ParseCommitRecord(XLogRecGetInfo(record), xlrec, &parsed);
 		xact_redo_commit(&parsed, parsed.twophase_xid,
 						 record->EndRecPtr, XLogRecGetOrigin(record));
+#ifdef USE_PGRAC_CLUSTER
+		(void)cluster_tt_twophase_standby_commit_prepared(parsed.twophase_xid, parsed.scn);
+#endif
 
 		/* Delete TwoPhaseState gxact entry and/or 2PC file. */
 		LWLockAcquire(TwoPhaseStateLock, LW_EXCLUSIVE);
