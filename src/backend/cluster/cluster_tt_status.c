@@ -484,7 +484,6 @@ cluster_tt_status_resolve_prepared_commit(TransactionId xid, SCN commit_scn)
 	HASH_SEQ_STATUS seq;
 	ClusterTTOverlayEntry *e;
 	TimestampTz now;
-	uint32 current_epoch;
 	int resolved = 0;
 
 	if (!TransactionIdIsValid(xid) || !SCN_VALID(commit_scn))
@@ -492,7 +491,6 @@ cluster_tt_status_resolve_prepared_commit(TransactionId xid, SCN commit_scn)
 	if (!cluster_enabled || cluster_node_id < 0 || ClusterTTStatusHTAB == NULL)
 		return 0;
 
-	current_epoch = (uint32)cluster_epoch_get_current();
 	now = GetCurrentTimestamp();
 
 	LWLockAcquire(ClusterTTStatusLock, LW_EXCLUSIVE);
@@ -502,14 +500,12 @@ cluster_tt_status_resolve_prepared_commit(TransactionId xid, SCN commit_scn)
 			continue;
 		if (e->key.origin_node_id != (uint16)cluster_node_id)
 			continue;
-		if (e->key.cluster_epoch != current_epoch)
-			continue;
 		if (e->status != CLUSTER_TT_STATUS_IN_PROGRESS && e->status != CLUSTER_TT_STATUS_COMMITTED)
 			continue;
 
 		e->status = CLUSTER_TT_STATUS_COMMITTED;
 		e->commit_scn = commit_scn;
-		e->status_epoch = current_epoch;
+		e->status_epoch = e->key.cluster_epoch;
 		e->install_ts = now;
 		e->has_parent_key = false;
 		memset(&e->parent_key, 0, sizeof(e->parent_key));

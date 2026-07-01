@@ -6,8 +6,13 @@
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 2026, pgrac contributors
  *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
  * IDENTIFICATION
  *	  src/backend/access/rmgrdesc/clusteradgdesc.c
+ *
+ * NOTES
+ *	  This is a pgrac-original rmgr descriptor for spec-6.4 ADG WAL records.
  *
  *-------------------------------------------------------------------------
  */
