@@ -45,6 +45,10 @@ use Test::More;
 use constant BLCKSZ           => 8192;
 use constant UNDO_BLOCK_MAGIC => 0x55444F31;
 use constant DATA_BLOCK_NO    => 1;
+# spec-3.27 D3a / Q12-A: undo block is a standard PG page; the UndoBlockHeader
+# magic sits at the payload base = SizeOfPageHeaderData = 32 on a pgrac build
+# (stock 24 + pd_block_scn extension), not offset 0.
+use constant MAGIC_OFF        => 32;
 
 my $node = PgracClusterNode->new('undo_wb');
 $node->init;
@@ -195,7 +199,7 @@ corrupt_block_prefix($active_path, $active_block, 512, "\xEE");
 $node->start;
 
 my $repaired = read_block($active_path, $active_block);
-is(unpack('L<', substr($repaired, 0, 4)),
+is(unpack('L<', substr($repaired, MAGIC_OFF, 4)),
 	UNDO_BLOCK_MAGIC, 'L5 block magic restored by post-checkpoint FPI redo');
 # NB: no exact byte-compare here (unlike t/228's write-through path).  Under
 # write-back the on-disk block held only the CHECKPOINT-flushed state, while

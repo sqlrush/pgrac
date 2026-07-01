@@ -49,6 +49,10 @@ use Test::More;
 use constant BLCKSZ            => 8192;
 use constant UNDO_BLOCK_MAGIC  => 0x55444F31;    # "UDO1" little-endian (PGRAC_UNDO_BLOCK_MAGIC)
 use constant DATA_BLOCK_NO     => 1;             # block 0 is the segment header
+# spec-3.27 D3a / Q12-A: the undo block is now a standard PG page, so the
+# UndoBlockHeader (magic first) lives at the payload base = SizeOfPageHeaderData,
+# which is 32 on a pgrac build (stock 24 + the pd_block_scn extension), not 0.
+use constant MAGIC_OFF         => 32;
 
 my $node = PgracClusterNode->new('undo_fpi');
 $node->init;
@@ -98,7 +102,7 @@ for my $path (@segs)
 	{
 		my $blk = read_block($path, $b);
 		next unless defined $blk;
-		next unless unpack('L<', substr($blk, 0, 4)) == UNDO_BLOCK_MAGIC;
+		next unless unpack('L<', substr($blk, MAGIC_OFF, 4)) == UNDO_BLOCK_MAGIC;
 		$active_path  = $path;
 		$active_block = $b;
 		$expected     = $blk;   # keep scanning -> last match wins (highest block)
@@ -117,7 +121,7 @@ $node->stop('immediate');
 corrupt_block_prefix($active_path, $active_block, 512, "\xEE");
 
 my $corrupted = read_block($active_path, $active_block);
-isnt(unpack('L<', substr($corrupted, 0, 4)),
+isnt(unpack('L<', substr($corrupted, MAGIC_OFF, 4)),
 	UNDO_BLOCK_MAGIC, 'block magic clobbered by injected corruption (pre-restart)');
 
 # Restart -> crash recovery -> redo replays the post-checkpoint full-image
@@ -125,7 +129,7 @@ isnt(unpack('L<', substr($corrupted, 0, 4)),
 $node->start;
 
 my $repaired = read_block($active_path, $active_block);
-is(unpack('L<', substr($repaired, 0, 4)),
+is(unpack('L<', substr($repaired, MAGIC_OFF, 4)),
 	UNDO_BLOCK_MAGIC, 'L1 block magic restored by crash redo (always-FPI)');
 ok($repaired eq $expected,
 	'L1 block byte-restored to its pre-crash image (FPI carried the old bytes)');
