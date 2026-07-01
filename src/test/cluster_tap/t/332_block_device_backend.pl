@@ -41,6 +41,23 @@ sub make_raw_image
 	close($fh) or die "close $path: $!";
 }
 
+my $pr_node = PgracClusterNode->new('spec6_0a_block_device_pr_forced');
+$pr_node->init;
+my $pr_raw_image = abs_path($pr_node->data_dir) . '/spec6_0a_pr_raw_device.img';
+make_raw_image($pr_raw_image, 96);
+(my $pr_raw_image_conf = $pr_raw_image) =~ s/'/''/g;
+$pr_node->append_conf(
+	'postgresql.conf',
+	"cluster.shared_storage_backend = block_device\n"
+	  . "cluster.block_device_path = '$pr_raw_image_conf'\n"
+	  . "cluster.block_device_use_odirect = off\n"
+	  . "cluster.storage_fence_driver = scsi3_pr\n");
+is($pr_node->start(fail_ok => 1), 0,
+   'L0 forced scsi3_pr fails closed on a non-PR raw image');
+like(slurp_file($pr_node->logfile),
+	qr/SCSI-3 persistent reservation fencing is not available|could not register SCSI-3 persistent reservation key/,
+	'L0 forced scsi3_pr startup log names unavailable PR fencing');
+
 my $node = PgracClusterNode->new('spec6_0a_block_device');
 $node->init;
 
