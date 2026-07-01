@@ -69,29 +69,45 @@ PITR surface.
 
 | GUC | Type | Default | Context | Notes |
 |---|---|---|---|---|
-| `cluster.recovery_target_scn` | string | `''` | postmaster | Target SCN used by `pg_cluster_pitr_status`. Empty means latest unless a name or cluster-time target is set. |
+| `cluster.recovery_target_scn` | string | `''` | postmaster | Target SCN used by cluster PITR. During archive recovery of a cluster backup set, the target snaps to the backup manifest's proven restore-point cut. |
 | `cluster.recovery_target_cluster_time` | string | `''` | postmaster | Timestamp target reported by `pg_cluster_pitr_status`; current 6.5 recovery action remains fail-closed for this target type. |
-| `cluster.recovery_target_name` | string | `''` | postmaster | Named restore-point target resolved by `pg_cluster_pitr_status`. |
+| `cluster.recovery_target_name` | string | `''` | postmaster | Named restore-point target resolved by `pg_cluster_pitr_status`; startup recovery accepts the backup-stop restore point recorded in the manifest. |
 | `cluster.recovery_target_action` | enum | `pause` | postmaster | Accepted values: `pause`, `promote`, `shutdown`; exposed in PITR status. |
 | `cluster.enable_pitr_restore_points` | bool | `off` | sighup | Enables future automatic restore-point scheduling. Manual `pg_cluster_create_restore_point()` is independent. |
 | `cluster.pitr_restore_point_interval_ms` | integer | `0` | sighup | Zero disables automatic scheduling. |
-| `cluster.backup_wal_retention` | integer | `0` MB | sighup | Retention hint for the future backup-set writer. |
-| `cluster.backup_parallel_channels` | integer | `1` | sighup | Reserved copy-channel capacity for the future backup-set writer. |
+| `cluster.backup_wal_retention` | integer | `0` MB | sighup | Retention hint reported with the backup state. Durable backup WAL pins also retain WAL from the backup start REDO point. |
+| `cluster.backup_parallel_channels` | integer | `1` | sighup | Copy-channel capacity reported with the backup state. |
 | `cluster.backup_manifest_checksums` | enum | `crc32c` | sighup | Manifest checksums are mandatory; unchecked manifests are not supported. |
 
 The current implementation opens the proven single-node primary path:
 `pg_cluster_backup_start()` starts a native hot-backup session, and
 `pg_cluster_backup_stop(true)` publishes a cluster manifest only after
 the restore-point commit fence drains and PostgreSQL has archived the
-required WAL.  The start and stop calls must run in the same SQL session,
-matching PostgreSQL's native online-backup contract.  Manual
-`pg_cluster_create_restore_point()` uses the same commit fence and flushes
-the restore-point WAL record before returning.
+required WAL.  The backup set is written under `pg_cluster_backups/` and
+contains `data/backup_label`, `data/cluster_backup.manifest`, a root
+`cluster_backup.manifest`, `control/pg_control`, voting-disk evidence, and
+per-node undo/WAL-thread slices plus durable-TT proof files.  The start
+and stop calls must run in the same SQL session, matching PostgreSQL's
+native online-backup contract.
+Manual `pg_cluster_create_restore_point()` uses the same commit fence and
+flushes the restore-point WAL record before returning.
 
-Declared-peer, standby-offload, offline restore execution, and PITR replay
-remain fail-closed until their cross-node proof is present.  A cluster
-backup stop without `waitforarchive=true` or without active WAL archiving
-is rejected and does not publish a manifest.
+Single-thread offline restore is supported by copying the backup set's
+`data/` directory to a new `PGDATA`, creating `recovery.signal`, setting
+`restore_command`, and setting `cluster.recovery_target_scn` or
+`cluster.recovery_target_name` to the manifest's backup-stop target.  The
+startup path validates the manifest CRC, maps the target to the native
+end-of-backup LSN, and restores `cluster_scn` to at least the manifest
+high-water mark before opening.
+
+Declared-peer backup requires `cluster.shared_data_dir` for the shared
+backup set and `cluster.wal_threads_dir` for per-thread WAL capture.
+Multi-thread restore replay, standby-offload backup, timestamp targets,
+automatic restore-point scheduling, and configurations that set more than
+one `cluster.recovery_target_*` remain fail-closed until their proof is
+present.  A cluster backup stop without
+`waitforarchive=true` or without active WAL archiving is rejected and does
+not publish a manifest.
 
 ### `cluster.interconnect_tier`
 
