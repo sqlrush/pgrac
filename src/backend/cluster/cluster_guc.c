@@ -1438,16 +1438,18 @@ cluster_init_guc(void)
 					 "HASH_PARTITION=4096 forces internal nbuckets >= 4096, "
 					 "so even GUC=16 reserves ~3-5MB shmem via "
 					 "hash_estimate_size(Max(GUC, 4096), entry_size). "
-					 "spec-5.19 sizing note: only the local-master REQUEST/CONVERT "
-					 "release path reclaims an emptied entry "
-					 "(cluster_grd_hashremove_if_still_empty);  remote-master and "
-					 "block-lock (Cache Fusion) entries are NOT reclaimed until the "
-					 "Stage-6 DRM cold-entry reclaim lands, so a node accumulates one "
-					 "entry per distinct remote-mastered resource it has locked.  Set "
-					 "this above the node's sustained distinct-resource working set "
-					 "(roughly NBuffers × 2 for an OLTP node);  too low surfaces "
-					 "53R71 FAIL_RESERVATION_FULL once the working set is exceeded."),
-		&cluster_grd_max_entries, 16384, 0, 1048576,
+					 "sizing note (spec-6.3a cold-entry reclaim landed): "
+					 "cluster.grd_entry_reclaim (default on) sweeps any fully-cold "
+					 "entry -- pin==0 && ngranted==0 && nwaiters==0 && nconverts==0 && "
+					 "nreservations==0 -- via cluster_grd_reclaim_sweep, which is "
+					 "class-agnostic: it reclaims remote-master and block-lock (Cache "
+					 "Fusion) entries too, not just local-master ones.  A node therefore "
+					 "no longer permanently accumulates one entry per distinct "
+					 "remote-mastered resource, so 1024 coordinates out of the box.  "
+					 "Only the simultaneously-hot distinct-resource working set must fit "
+					 "under this cap between sweeps;  a burst exceeding it still surfaces "
+					 "53R71 FAIL_RESERVATION_FULL, so raise it for very wide OLTP nodes."),
+		&cluster_grd_max_entries, 1024, 0, 1048576,
 		PGC_POSTMASTER, /* ShmemInitHash size fixed at init */
 		0,				/* flags */
 		NULL,			/* check_hook */
