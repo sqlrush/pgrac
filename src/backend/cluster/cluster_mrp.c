@@ -231,8 +231,7 @@ cluster_mrp_clear_apply_master(void)
 }
 
 static bool
-cluster_mrp_lease_newer(const ClusterAdgApplyMasterLease *a,
-						const ClusterAdgApplyMasterLease *b)
+cluster_mrp_lease_newer(const ClusterAdgApplyMasterLease *a, const ClusterAdgApplyMasterLease *b)
 {
 	if (a->term != b->term)
 		return a->term > b->term;
@@ -242,8 +241,7 @@ cluster_mrp_lease_newer(const ClusterAdgApplyMasterLease *a,
 }
 
 static bool
-cluster_mrp_lease_same(const ClusterAdgApplyMasterLease *a,
-					   const ClusterAdgApplyMasterLease *b)
+cluster_mrp_lease_same(const ClusterAdgApplyMasterLease *a, const ClusterAdgApplyMasterLease *b)
 {
 	return a->term == b->term && a->generation == b->generation
 		   && a->owner_node_id == b->owner_node_id;
@@ -318,8 +316,7 @@ cluster_mrp_apply_lease_scan(ClusterMrpLeaseScan *scan)
 				candidates[candidate_count].lease = lease;
 				candidate_count++;
 			}
-next_lease:
-			;
+		next_lease:;
 		}
 
 		if (disk_ok)
@@ -401,8 +398,8 @@ cluster_mrp_shared_apply_master_term_valid(int64 now_ms)
 	owner_node_id = pg_atomic_read_u32(&cluster_mrp_state->apply_master_node_id);
 	term = pg_atomic_read_u64(&cluster_mrp_state->apply_master_term);
 	valid_until_ms = pg_atomic_read_u64(&cluster_mrp_state->apply_master_term_valid_until_ms);
-	if (!SCN_NODE_ID_VALID(cluster_node_id) || owner_node_id != (uint32)cluster_node_id
-		|| term == 0 || valid == 0)
+	if (!SCN_NODE_ID_VALID(cluster_node_id) || owner_node_id != (uint32)cluster_node_id || term == 0
+		|| valid == 0)
 		return false;
 	if (valid_until_ms != 0 && now_ms >= (int64)valid_until_ms)
 		return false;
@@ -516,8 +513,7 @@ cluster_mrp_apply_thread_barrier(uint16 thread_id, XLogRecPtr barrier_lsn, SCN t
 
 	pg_atomic_write_u64(&cluster_mrp_state->thread_barrier_scn[thread_id], (uint64)thread_safe_scn);
 	pg_atomic_write_u64(&cluster_mrp_state->thread_barrier_lsn[thread_id], (uint64)barrier_lsn);
-	if (pg_atomic_read_u64(&cluster_mrp_state->thread_apply_lsn[thread_id]) < (uint64)barrier_lsn)
-	{
+	if (pg_atomic_read_u64(&cluster_mrp_state->thread_apply_lsn[thread_id]) < (uint64)barrier_lsn) {
 		pg_atomic_write_u64(&cluster_mrp_state->thread_apply_lsn[thread_id], (uint64)barrier_lsn);
 		pg_atomic_write_u64(&cluster_mrp_state->thread_apply_time_us[thread_id],
 							(uint64)GetCurrentTimestamp());
@@ -593,9 +589,9 @@ cluster_mrp_apply_master_acquire_or_renew(void)
 		cluster_mrp_clear_apply_master();
 		return false;
 	}
-	if (!cluster_mrp_apply_lease_scan(&scan) || !scan.attached || scan.owner_node_id != cluster_node_id
-		|| scan.durable_term != term || scan.generation != generation
-		|| now_ms >= scan.lease_expires_at_ms) {
+	if (!cluster_mrp_apply_lease_scan(&scan) || !scan.attached
+		|| scan.owner_node_id != cluster_node_id || scan.durable_term != term
+		|| scan.generation != generation || now_ms >= scan.lease_expires_at_ms) {
 		cluster_mrp_clear_apply_master();
 		return false;
 	}
@@ -851,8 +847,8 @@ cluster_mrp_publish_watermarks(XLogRecPtr receive_lsn, XLogRecPtr apply_lsn,
 				if (cmp < 0 || (cmp == 0 && scn_total_cmp(candidate_scn, old_scn) <= 0))
 					break;
 			}
-			if (pg_atomic_compare_exchange_u64(&cluster_mrp_state->standby_consistent_scn,
-											   &old_raw, standby_consistent_scn))
+			if (pg_atomic_compare_exchange_u64(&cluster_mrp_state->standby_consistent_scn, &old_raw,
+											   standby_consistent_scn))
 				break;
 		}
 	}

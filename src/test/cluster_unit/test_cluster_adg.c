@@ -471,14 +471,18 @@ UT_TEST(test_standby_reply_trailer_validation)
 
 UT_TEST(test_mrp_shmem_tracks_term_validity_and_drain)
 {
-	UT_ASSERT_EQ((int)offsetof(ClusterMrpSharedState, apply_master_term_valid) >
-				 (int)offsetof(ClusterMrpSharedState, apply_master_node_id), 1);
-	UT_ASSERT_EQ((int)offsetof(ClusterMrpSharedState, apply_master_term_valid_until_ms) >
-				 (int)offsetof(ClusterMrpSharedState, apply_master_term), 1);
-	UT_ASSERT_EQ((int)offsetof(ClusterMrpSharedState, apply_master_lost_at_ms) >
-				 (int)offsetof(ClusterMrpSharedState, apply_master_term_valid_until_ms), 1);
-	UT_ASSERT_EQ((int)offsetof(ClusterMrpSharedState, standby_consistent_scn) >
-				 (int)offsetof(ClusterMrpSharedState, apply_lsn), 1);
+	UT_ASSERT_EQ((int)offsetof(ClusterMrpSharedState, apply_master_term_valid)
+					 > (int)offsetof(ClusterMrpSharedState, apply_master_node_id),
+				 1);
+	UT_ASSERT_EQ((int)offsetof(ClusterMrpSharedState, apply_master_term_valid_until_ms)
+					 > (int)offsetof(ClusterMrpSharedState, apply_master_term),
+				 1);
+	UT_ASSERT_EQ((int)offsetof(ClusterMrpSharedState, apply_master_lost_at_ms)
+					 > (int)offsetof(ClusterMrpSharedState, apply_master_term_valid_until_ms),
+				 1);
+	UT_ASSERT_EQ((int)offsetof(ClusterMrpSharedState, standby_consistent_scn)
+					 > (int)offsetof(ClusterMrpSharedState, apply_lsn),
+				 1);
 }
 
 int

@@ -627,8 +627,7 @@ cluster_scn_advance_for_commit(void)
 
 	CLUSTER_INJECTION_POINT("cluster-scn-commit-pre-advance");
 
-	if (cluster_enable_adg)
-	{
+	if (cluster_enable_adg) {
 		NodeId node;
 
 		Assert(cluster_scn_state != NULL);
@@ -646,15 +645,16 @@ cluster_scn_advance_for_commit(void)
 		 */
 		node = cluster_scn_state->node_id;
 		if (!SCN_NODE_ID_VALID(node))
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("cluster_scn_advance: cluster.node_id (%d) is not in the valid range 0..%d",
-							node, SCN_MAX_VALID_NODE_ID),
-					 errhint("Set cluster.node_id to a value in 0..127 before advancing SCN.  -1 is the "
-							 "unset / single-node-fallback sentinel and is not valid for SCN encoding.")));
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("cluster_scn_advance: cluster.node_id (%d) is not in the valid range 0..%d",
+						node, SCN_MAX_VALID_NODE_ID),
+				 errhint(
+					 "Set cluster.node_id to a value in 0..127 before advancing SCN.  -1 is the "
+					 "unset / single-node-fallback sentinel and is not valid for SCN encoding.")));
 
-		for (;;)
-		{
+		for (;;) {
 			uint64 old_local;
 			uint64 new_local;
 			uint64 expected;
@@ -664,8 +664,7 @@ cluster_scn_advance_for_commit(void)
 			scn = scn_encode(node, new_local);
 
 			LWLockAcquire(&cluster_scn_state->lwlock, LW_EXCLUSIVE);
-			if (pg_atomic_read_u64(&cluster_scn_state->current_local_scn) != old_local)
-			{
+			if (pg_atomic_read_u64(&cluster_scn_state->current_local_scn) != old_local) {
 				LWLockRelease(&cluster_scn_state->lwlock);
 				continue;
 			}
@@ -673,9 +672,8 @@ cluster_scn_advance_for_commit(void)
 			(void)cluster_scn_pending_commit_register_locked(scn);
 
 			expected = old_local;
-			if (pg_atomic_compare_exchange_u64(&cluster_scn_state->current_local_scn,
-											   &expected, new_local))
-			{
+			if (pg_atomic_compare_exchange_u64(&cluster_scn_state->current_local_scn, &expected,
+											   new_local)) {
 				LWLockRelease(&cluster_scn_state->lwlock);
 				break;
 			}
@@ -683,8 +681,7 @@ cluster_scn_advance_for_commit(void)
 			(void)cluster_scn_pending_commit_remove_locked(scn);
 			LWLockRelease(&cluster_scn_state->lwlock);
 		}
-	}
-	else
+	} else
 		scn = cluster_scn_advance();
 	pg_atomic_fetch_add_u64(&cluster_scn_state->commit_advance_count, 1);
 
