@@ -2161,6 +2161,15 @@ ClusterSnapshotRefreshFields(Snapshot snapshot)
 						 errmsg("ADG standby read point is not available"),
 						 errhint("Wait for the Apply Master to publish "
 								 "standby_consistent_scn before running read-only queries.")));
+			if (cluster_adg_lag_threshold_sec >= 0
+				&& cluster_mrp_apply_lag_ms() > (int64)cluster_adg_lag_threshold_sec * 1000)
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_ADG_APPLY_LAG_EXCESSIVE),
+						 errmsg("ADG standby apply lag exceeds the read-only service threshold"),
+						 errdetail("The current apply lag is greater than %d second(s).",
+								   cluster_adg_lag_threshold_sec),
+						 errhint("Retry after standby apply catches up or increase "
+								 "cluster.adg_lag_threshold_sec.")));
 		}
 		else
 			read_scn = cluster_scn_current();

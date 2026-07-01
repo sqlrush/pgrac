@@ -75,7 +75,8 @@
 #include "miscadmin.h"
 
 #ifdef USE_PGRAC_CLUSTER
-/* PGRAC: spec-1.17 BOC tick + GUC + pending helper. */
+/* PGRAC: spec-1.17 BOC tick + spec-6.4 ADG barrier heartbeat. */
+#include "cluster/cluster_adg_xlog.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_scn.h"
 #endif
@@ -94,6 +95,7 @@
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
+#include "utils/timestamp.h"
 
 
 /*
@@ -126,6 +128,9 @@ WalWriterMain(void)
 	MemoryContext walwriter_context;
 	int			left_till_hibernate;
 	bool		hibernating;
+#ifdef USE_PGRAC_CLUSTER
+	int64		last_adg_barrier_ms = 0;
+#endif
 
 	/*
 	 * Properly accept or ignore signals the postmaster might send us
@@ -319,6 +324,28 @@ WalWriterMain(void)
 		if (cluster_enabled
 			&& cluster_scn_boc_pending_since_last_sweep() > 0)
 			left_till_hibernate = LOOPS_UNTIL_HIBERNATE;
+
+		/*
+		 * spec-6.4 D5b: idle primary threads must still publish a
+		 * thread-safe-SCN barrier, otherwise an ADG standby read floor can
+		 * freeze until the next user commit on that thread.  Commit paths
+		 * emit pre/post barriers for the precommit gap; this heartbeat covers
+		 * quiet periods and is gated by ADG primary configuration.
+		 */
+		if (cluster_enabled && cluster_enable_adg
+			&& cluster_dg_role == CLUSTER_DG_ROLE_PRIMARY
+			&& cluster_adg_barrier_interval_ms > 0)
+		{
+			int64		now_ms = (int64) (GetCurrentTimestamp() / 1000);
+
+			if (last_adg_barrier_ms == 0
+				|| now_ms < last_adg_barrier_ms
+				|| now_ms - last_adg_barrier_ms >= cluster_adg_barrier_interval_ms)
+			{
+				(void) cluster_adg_emit_thread_barrier();
+				last_adg_barrier_ms = now_ms;
+			}
+		}
 #endif
 
 		/* report pending statistics to the cumulative stats system */
@@ -347,6 +374,10 @@ WalWriterMain(void)
 		 */
 		if (cluster_enabled)
 			cur_timeout = Min(cur_timeout, cluster_boc_sweep_interval_ms);
+		if (cluster_enabled && cluster_enable_adg
+			&& cluster_dg_role == CLUSTER_DG_ROLE_PRIMARY
+			&& cluster_adg_barrier_interval_ms > 0)
+			cur_timeout = Min(cur_timeout, cluster_adg_barrier_interval_ms);
 #endif
 
 		(void) WaitLatch(MyLatch,

@@ -133,15 +133,14 @@ extern void cluster_voting_disk_close(int fd);
 /*
  * cluster_voting_disk_io_install_timeout_handler — install the SIGALRM
  * handler used by cluster_voting_disk_read_slot / write_slot for per-I/O
- * timeout enforcement (Hardening v0.4 P1.4).  Caller is the qvotec aux
- * process at startup (after pqsignal(SIGALRM, SIG_IGN);qvotec ignores
- * SIGALRM in its main loop, so installing this handler is non-conflicting).
+ * timeout enforcement (Hardening v0.4 P1.4).  Production callers are
+ * qvotec and the ADG MRP aux process; both install it at startup after
+ * pqsignal(SIGALRM, SIG_IGN), so installing this handler is non-conflicting.
  *
  *	The handler is async-signal-safe (only sets a sig_atomic_t flag) and
  *	idempotent (replacing SIG_IGN with the real handler).  It is NOT
- *	intended for any process other than qvotec — backends and other aux
- *	processes use SIGALRM for statement_timeout etc., so installing this
- *	handler in those contexts would clobber PG's machinery.
+ *	intended for ordinary backends — they use SIGALRM for statement_timeout
+ *	etc., so installing this handler there would clobber PG's machinery.
  *
  *	Pass timeout_ms = 0 to bypass the timer (used by format / fsck tools
  *	that want unbounded I/O).

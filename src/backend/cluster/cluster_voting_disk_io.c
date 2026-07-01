@@ -64,21 +64,20 @@
  *	any deadline, so a hung disk could pin qvotec indefinitely.  This
  *	round wires the GUC to a real per-syscall guard:
  *
- *	  1. qvotec startup calls cluster_voting_disk_io_install_timeout_
- *	     handler() once.  That replaces SIG_IGN with our async-signal-
- *	     safe handler that flips a sig_atomic_t flag.
- *	  2. cluster_voting_disk_io_set_timeout_ms(...) is called by qvotec
- *	     each cycle (or on SIGHUP) to seed the deadline used by every
- *	     subsequent read_slot / write_slot call.
+ *	  1. qvotec and ADG MRP startup call cluster_voting_disk_io_install_
+ *	     timeout_handler() once.  That replaces SIG_IGN with our async-
+ *	     signal-safe handler that flips a sig_atomic_t flag.
+ *	  2. cluster_voting_disk_io_set_timeout_ms(...) is called by those aux
+ *	     processes at startup (and on SIGHUP for long-lived loops) to seed
+ *	     the deadline used by every subsequent read_slot / write_slot call.
  *	  3. read_slot / write_slot wrap their syscalls in arm_timeout()
  *	     / disarm_timeout() so SIGALRM fires after the configured
  *	     deadline if the syscall hasn't returned.  EINTR + flag-set ⇒
  *	     return CLUSTER_VOTING_DISK_IO_FAILED.
  *
- *	Only qvotec installs the handler;backends + other aux processes
- *	use SIGALRM for statement_timeout / per-statement deadlines, so
- *	installing this handler in their context would clobber PG's
- *	machinery.  cluster_qvotec.c is the sole production caller.
+ *	Only qvotec/MRP install the handler;backends use SIGALRM for
+ *	statement_timeout / per-statement deadlines, so installing this handler
+ *	in their context would clobber PG's machinery.
  *
  *	timeout_ms == 0 disarms the timer (format / fsck tools want
  *	unbounded I/O).

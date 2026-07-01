@@ -252,7 +252,7 @@ is($node->safe_psql('postgres',
 is($node->safe_psql('postgres',
 	q{SELECT setting || '|' || vartype || '|' || context
 	    FROM pg_settings WHERE name = 'cluster.adg_barrier_interval_ms'}),
-	'0|integer|sighup',
+	'1000|integer|sighup',
 	'cluster.adg_barrier_interval_ms default and context');
 is($node->safe_psql('postgres',
 	q{SELECT setting || '|' || vartype || '|' || context

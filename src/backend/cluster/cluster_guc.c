@@ -93,7 +93,7 @@ int cluster_adg_lag_threshold_sec = 10;
 int cluster_apply_master_max_lag_ms = 5000;
 int cluster_max_standby_delay = 30;
 int cluster_apply_master_switch_drain_ms = 5000;
-int cluster_adg_barrier_interval_ms = 0;
+int cluster_adg_barrier_interval_ms = 1000;
 int cluster_wal_sender_timeout_sec = 60;
 int cluster_wal_receiver_timeout_sec = 60;
 /* spec-6.5: cluster-aware backup / restore / PITR target knobs. */
@@ -1341,9 +1341,11 @@ cluster_init_guc(void)
 
 	DefineCustomIntVariable(
 		"cluster.adg_barrier_interval_ms", gettext_noop("ADG consistency barrier interval."),
-		gettext_noop("0 disables periodic barriers; commit paths still emit thread-safe SCN "
-					 "barriers.  Positive values reserve a future periodic barrier cadence."),
-		&cluster_adg_barrier_interval_ms, 0, 0, 300000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL, NULL);
+		gettext_noop("Primary walwriter emits periodic thread-safe SCN barriers at this "
+					 "interval while ADG is enabled; 0 disables the heartbeat and leaves "
+					 "only commit-driven barriers."),
+		&cluster_adg_barrier_interval_ms, 1000, 0, 300000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
+		NULL);
 
 	DefineCustomIntVariable(
 		"cluster.wal_sender_timeout_sec", gettext_noop("ADG LNS WAL sender timeout."),

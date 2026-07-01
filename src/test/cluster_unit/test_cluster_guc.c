@@ -346,7 +346,7 @@ UT_TEST(test_cluster_adg_guc_defaults)
 	UT_ASSERT_EQ(cluster_apply_master_max_lag_ms, 5000);
 	UT_ASSERT_EQ(cluster_max_standby_delay, 30);
 	UT_ASSERT_EQ(cluster_apply_master_switch_drain_ms, 5000);
-	UT_ASSERT_EQ(cluster_adg_barrier_interval_ms, 0);
+	UT_ASSERT_EQ(cluster_adg_barrier_interval_ms, 1000);
 	UT_ASSERT_EQ(cluster_wal_sender_timeout_sec, 60);
 	UT_ASSERT_EQ(cluster_wal_receiver_timeout_sec, 60);
 }
