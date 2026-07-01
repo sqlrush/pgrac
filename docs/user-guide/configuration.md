@@ -79,13 +79,19 @@ PITR surface.
 | `cluster.backup_parallel_channels` | integer | `1` | sighup | Reserved copy-channel capacity for the future backup-set writer. |
 | `cluster.backup_manifest_checksums` | enum | `crc32c` | sighup | Manifest checksums are mandatory; unchecked manifests are not supported. |
 
-The current implementation is intentionally conservative.  These GUCs
-expose the 6.5 catalog and state surface, but mutating cluster physical
-backup and restore-point entry points fail closed with
-`feature_not_supported` until the physical capture, durable WAL pin,
-commit-drain restore-point barrier, restore, and PITR replay paths are
-implemented.  The server refuses to publish a manifest or restore point
-when those proofs are absent.
+The current implementation opens the proven single-node primary path:
+`pg_cluster_backup_start()` starts a native hot-backup session, and
+`pg_cluster_backup_stop(true)` publishes a cluster manifest only after
+the restore-point commit fence drains and PostgreSQL has archived the
+required WAL.  The start and stop calls must run in the same SQL session,
+matching PostgreSQL's native online-backup contract.  Manual
+`pg_cluster_create_restore_point()` uses the same commit fence and flushes
+the restore-point WAL record before returning.
+
+Declared-peer, standby-offload, offline restore execution, and PITR replay
+remain fail-closed until their cross-node proof is present.  A cluster
+backup stop without `waitforarchive=true` or without active WAL archiving
+is rejected and does not publish a manifest.
 
 ### `cluster.interconnect_tier`
 
