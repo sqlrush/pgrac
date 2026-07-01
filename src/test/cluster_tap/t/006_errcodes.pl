@@ -106,6 +106,8 @@ is(raise_and_get_sqlstate('cluster_backup_incomplete'), '53RAD',
 	"cluster_backup_incomplete -> 53RAD");
 is(raise_and_get_sqlstate('cluster_shared_storage_failed'), '58R01',
 	"cluster_shared_storage_failed -> 58R01");
+is(raise_and_get_sqlstate('cluster_storage_fence_unavailable'), '58R15',
+	"cluster_storage_fence_unavailable -> 58R15");
 
 
 # ----------

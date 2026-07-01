@@ -265,6 +265,7 @@ my $pair = PostgreSQL::Test::ClusterPair->new_pair('sharedmerge',
 		'cluster.merged_recovery = on',
 		'cluster.recovery_workers_max = 0',
 		'cluster.recovery_stale_active_ms = 1000',
+		"cluster.cluster_stats_main_loop_interval = '60000ms'",
 	]);
 my $walroot  = $pair->wal_threads_root;
 my $dataroot = $pair->shared_data_root;
@@ -396,7 +397,9 @@ $nb->safe_psql('postgres', 'INSERT INTO t_pp VALUES (2)');
 # but finds no commit outcome -> 53R97.  A regular psql returns the
 # moment the backend's connection drops (no background-session hang).
 # No checkpoint anywhere in phase 2, so every B commit stays in the
-# merge window.
+# merge window.  The 60s cluster_stats cadence above keeps this synthetic
+# segment-boundary crash from racing an observational WAL-state refresh that
+# would otherwise mark the switched segment tail as validated durable.
 # ----------------------------------------------------------------
 $nb->psql('postgres', join(";\n",
 		'BEGIN',

@@ -131,6 +131,10 @@ sub gate
 		INSERT INTO hg_n1 SELECT g, g FROM generate_series(1, 300) g;
 		CHECKPOINT;
 	});
+	# CHECKPOINT publishes checkpoint_redo_lsn synchronously, while highest_lsn
+	# is refreshed by cluster_stats.  Let one stats tick land before the inject
+	# so online replay sees a non-empty validated window for thread_2.
+	usleep(2_000_000);
 
 	my $started0   = $dump0->('grd_recovery', 'remaster_started') || 0;
 	my $committed0 = $dump0->('recovery', 'remote_outcome_committed') || 0;

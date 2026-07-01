@@ -162,6 +162,19 @@ jobs:
             --out "scripts/perf/results/cr-profile-${{ github.run_id }}.csv" \
             | tee "scripts/perf/results/cr-profile-${{ github.run_id }}.log"
 
+      # spec-6.0a D7: storage I/O report-only matrix.  The default CI leg uses a
+      # regular-file raw image with O_DIRECT disabled, so it is a conformance and
+      # trend artifact rather than a hardware O_DIRECT claim.
+      - name: Storage I/O matrix (warn-only, Linux)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: |
+          mkdir -p scripts/perf/results
+          PGRAC_ENABLE_INSTALL=$HOME/linkdb-install \
+          STORAGE_IO_DURATION="${STORAGE_IO_DURATION:-10}" \
+          STORAGE_IO_SCALE="${STORAGE_IO_SCALE:-5}" \
+          scripts/perf/run-storage-io-matrix.sh
+
       - name: Collect perf artifacts
         if: always()
         run: |

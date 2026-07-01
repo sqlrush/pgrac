@@ -210,6 +210,17 @@ extern bool cluster_controlfile_shared_authority;
  */
 extern char *cluster_shared_storage_uuid;
 
+/* spec-6.0a: raw block-device backend configuration. */
+typedef enum ClusterStorageFenceDriver {
+	CLUSTER_STORAGE_FENCE_DRIVER_DISABLED = 0,
+	CLUSTER_STORAGE_FENCE_DRIVER_AUTO = 1,
+	CLUSTER_STORAGE_FENCE_DRIVER_SCSI3_PR = 2,
+} ClusterStorageFenceDriver;
+
+extern char *cluster_block_device_path;
+extern bool cluster_block_device_use_odirect;
+extern int cluster_storage_fence_driver;
+
 
 /*
  * cluster_smgr_user_relations -- opt-in switch routing user-relation

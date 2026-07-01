@@ -54,6 +54,14 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+static const ClusterSharedFsCaps cluster_shared_fs_local_caps = {
+	.supports_odirect = false,
+	.required_io_alignment = 0,
+	.supports_scsi3_pr = false,
+	.durability_class = CLUSTER_DURABILITY_BUFFERED,
+	.max_nodes = 1,
+};
+
 /*
  * Per-fork open-file state.  Owned by the caller via the opaque
  * ClusterSharedFsHandle pointer; lives in TopMemoryContext so it
@@ -376,10 +384,58 @@ static void
 cluster_shared_fs_local_shutdown(void)
 {}
 
+static int
+cluster_shared_fs_local_barrier_sync(ClusterSharedFsHandle *handle)
+{
+	cluster_shared_fs_local_immedsync(handle);
+	return 0;
+}
+
+static int
+cluster_shared_fs_local_register_fence_key(int node_id)
+{
+	(void)node_id;
+	return EOPNOTSUPP;
+}
+
+static ClusterFenceCapability
+cluster_shared_fs_local_fence_capability(void)
+{
+	return CLUSTER_FENCE_CAP_NONE;
+}
+
+static bool
+cluster_shared_fs_local_prefetch(ClusterSharedFsHandle *handle, BlockNumber blocknum)
+{
+	off_t offset;
+
+	if (handle == NULL || !handle->opened)
+		return false;
+
+	offset = (off_t)blocknum * BLCKSZ;
+	return FilePrefetch(handle->vfd, offset, BLCKSZ, WAIT_EVENT_DATA_FILE_PREFETCH) == 0;
+}
+
+static void
+cluster_shared_fs_local_writeback(ClusterSharedFsHandle *handle, BlockNumber blocknum,
+								  BlockNumber nblocks)
+{
+	off_t offset;
+	off_t nbytes;
+
+	if (handle == NULL || !handle->opened || nblocks == 0)
+		return;
+
+	offset = (off_t)blocknum * BLCKSZ;
+	nbytes = (off_t)nblocks * BLCKSZ;
+	FileWriteback(handle->vfd, offset, nbytes, WAIT_EVENT_DATA_FILE_FLUSH);
+}
+
 
 const ClusterSharedFsOps cluster_shared_fs_local_ops = {
 	.name = "local",
 	.id = CLUSTER_SHARED_FS_BACKEND_LOCAL,
+	.caps = &cluster_shared_fs_local_caps,
 
 	.exists = cluster_shared_fs_local_exists,
 	.open_existing = cluster_shared_fs_local_open_existing,
@@ -395,6 +451,12 @@ const ClusterSharedFsOps cluster_shared_fs_local_ops = {
 
 	.init = cluster_shared_fs_local_init,
 	.shutdown = cluster_shared_fs_local_shutdown,
+
+	.barrier_sync = cluster_shared_fs_local_barrier_sync,
+	.register_fence_key = cluster_shared_fs_local_register_fence_key,
+	.fence_capability = cluster_shared_fs_local_fence_capability,
+	.prefetch = cluster_shared_fs_local_prefetch,
+	.writeback = cluster_shared_fs_local_writeback,
 };
 
 #endif /* USE_PGRAC_CLUSTER */

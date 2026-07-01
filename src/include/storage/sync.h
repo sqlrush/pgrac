@@ -10,6 +10,22 @@
  *
  *-------------------------------------------------------------------------
  */
+/*-------------------------------------------------------------------------
+ * PGRAC MODIFICATIONS (spec-6.0a)
+ *
+ * Modified by: SqlRush <sqlrush@gmail.com>
+ *
+ * What changed:
+ *	Add SYNC_HANDLER_CLUSTER_SHARED behind USE_PGRAC_CLUSTER.
+ *
+ * Why:
+ *	cluster_smgr needs a distinct FileTag handler so shared-storage
+ *	relation writes can use PostgreSQL's pending fsync/unlink request
+ *	framework while keeping --disable-cluster builds free of the symbol.
+ *
+ *	Spec: spec-6.0a-production-shared-storage-backend-matrix.md
+ *-------------------------------------------------------------------------
+ */
 #ifndef SYNC_H
 #define SYNC_H
 
@@ -39,6 +55,9 @@ typedef enum SyncRequestHandler
 	SYNC_HANDLER_COMMIT_TS,
 	SYNC_HANDLER_MULTIXACT_OFFSET,
 	SYNC_HANDLER_MULTIXACT_MEMBER,
+#ifdef USE_PGRAC_CLUSTER
+	SYNC_HANDLER_CLUSTER_SHARED,
+#endif
 	SYNC_HANDLER_NONE
 } SyncRequestHandler;
 

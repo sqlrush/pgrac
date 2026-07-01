@@ -12,7 +12,7 @@
  * src/include/access/rmgrlist.h
  *---------------------------------------------------------------------------
  *
- * PGRAC MODIFICATIONS (Nth, stage 1.22):
+ * PGRAC MODIFICATIONS (Nth, stage 1.22 + spec-6.0a):
  *	Modified by: SqlRush <sqlrush@gmail.com>
  *
  *	What changed:  When USE_PGRAC_CLUSTER is defined, register a new
@@ -35,6 +35,16 @@
  *	               1.22 ABI.
  *	               See specs/spec-1.22-undo-tablespace-bootstrap.md
  *	               §D14a, src/backend/cluster/storage/cluster_undo_xlog.c.
+ *
+ *	               spec-6.0a adds RM_CLUSTER_RAW_LAYOUT with
+ *	               cluster_raw_layout_redo / cluster_raw_layout_desc /
+ *	               cluster_raw_layout_identify for crash-safe raw
+ *	               block-device layout metadata page images.  This rmgr
+ *	               is gated by USE_PGRAC_CLUSTER and paired with an
+ *	               XLOG_PAGE_MAGIC bump in xlog_internal.h.
+ *	               See specs/spec-6.0a-production-shared-storage-
+ *	               backend-matrix.md and
+ *	               src/backend/cluster/storage/cluster_raw_xlog.c.
  *---------------------------------------------------------------------------
  */
 
@@ -75,4 +85,6 @@ PG_RMGR(RM_LOGICALMSG_ID, "LogicalMessage", logicalmsg_redo, logicalmsg_desc, lo
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC stage 1.22: see banner above + spec-1.22 §D14a. */
 PG_RMGR(RM_CLUSTER_UNDO_ID, "ClusterUndo", cluster_undo_redo, cluster_undo_desc, cluster_undo_identify, NULL, NULL, NULL, NULL)
+/* PGRAC spec-6.0a: crash-safe raw block-device layout metadata. */
+PG_RMGR(RM_CLUSTER_RAW_LAYOUT_ID, "ClusterRawLayout", cluster_raw_layout_redo, cluster_raw_layout_desc, cluster_raw_layout_identify, NULL, NULL, NULL, NULL)
 #endif

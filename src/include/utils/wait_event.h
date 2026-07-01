@@ -11,7 +11,7 @@
  *	  Modified by: SqlRush <sqlrush@gmail.com>
  *	  Stage:        0.11 / 1.1
  *
- *	  Added the WaitEventCluster enum (now 51 entries spread across
+ *	  Added the WaitEventCluster enum (now 58 entries spread across
  *	  11 class IDs 0x10000000..0x1a000000) and pulled in
  *	  cluster/cluster_wait_events.h for the class-ID macros.  No PG
  *	  native enum is touched; the cluster enum is independent.
@@ -20,7 +20,9 @@
  *	  (GES / PCM / BufferShip / SCN / Reconfig / Recovery / Sinval /
  *	  Interconnect / Undo / ADG).  Stage 1.1 extended with the
  *	  Cluster: SharedFs class and 5 events for cluster_shared_fs
- *	  (read / write / extend / truncate / fsync).
+ *	  (read / write / extend / truncate / fsync).  Spec-6.0a added 7
+ *	  block_device-specific events for raw I/O, advisory hints, device
+ *	  sync, and SCSI-3 PR probe/register observability.
  *
  *	  Identifiers are registered here; the call sites that emit
  *	  these wait events are wired up in the spec for each owning
@@ -470,12 +472,19 @@ typedef enum {
 	WAIT_EVENT_ADG_READ_SNAPSHOT_WAIT,
 	WAIT_EVENT_ADG_SCN_SYNC_WAIT,
 
-	/* Cluster: SharedFs (5 events) -- spec-1.1 */
+	/* Cluster: SharedFs (12 events) -- spec-1.1 + spec-6.0a */
 	WAIT_EVENT_CLUSTER_SHARED_FS_READ = PG_WAIT_CLUSTER_SHAREDFS,
 	WAIT_EVENT_CLUSTER_SHARED_FS_WRITE,
 	WAIT_EVENT_CLUSTER_SHARED_FS_EXTEND,
 	WAIT_EVENT_CLUSTER_SHARED_FS_TRUNCATE,
 	WAIT_EVENT_CLUSTER_SHARED_FS_FSYNC,
+	WAIT_EVENT_CLUSTER_BLOCK_DEVICE_READ,
+	WAIT_EVENT_CLUSTER_BLOCK_DEVICE_WRITE,
+	WAIT_EVENT_CLUSTER_BLOCK_DEVICE_PREFETCH,
+	WAIT_EVENT_CLUSTER_BLOCK_DEVICE_WRITEBACK,
+	WAIT_EVENT_CLUSTER_BLOCK_DEVICE_SYNC,
+	WAIT_EVENT_CLUSTER_BLOCK_DEVICE_PR_PROBE,
+	WAIT_EVENT_CLUSTER_BLOCK_DEVICE_PR_REGISTER,
 
 	/* Cluster: StartupPhase (5 events) -- spec-1.10 (2026-05-03) */
 	WAIT_EVENT_CLUSTER_STARTUP_PHASE_0 = PG_WAIT_CLUSTER_STARTUP_PHASE,

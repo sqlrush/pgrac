@@ -4,9 +4,10 @@
 #    End-to-end regression for the cluster_shared_fs abstraction layer
 #    introduced in stage 1.1.
 #
-#    Stage 1.1 ships two built-in backends (stub + local) and reserves
-#    four enumvals for the Stage 2 cluster backends (block_device /
-#    cluster_fs / rbd / multi_attach).  This TAP test exercises the
+#    Stage 1.1 shipped two built-in backends (stub + local) and reserved
+#    four enumvals for later cluster backends.  Spec-6.0a promotes
+#    block_device to a production provider; cluster_fs remains the
+#    shared-filesystem provider name.  This TAP test exercises the
 #    surfaces visible to a running PG instance:
 #
 #      - cluster.shared_storage_backend default is 'stub'.
@@ -16,9 +17,9 @@
 #      - postgresql.conf override = local restarts cleanly and
 #        cluster_dump_state reports active_backend=local.
 #      - postgresql.conf override = block_device prevents the server
-#        from starting (cluster_shared_fs_init ereports FATAL with an
-#        errhint pointing to Stage 2).
-#      - 5 cluster_shared_fs wait events are present in
+#        from starting until cluster.block_device_path is configured
+#        (fail-closed production storage startup).
+#      - 12 cluster_shared_fs wait events are present in
 #        pg_stat_cluster_wait_events under type='Cluster: SharedFs'.
 #      - 3 cluster_shared_fs injection points appear in
 #        pg_stat_cluster_injections (registry total: 17 = 14 + 3).
@@ -107,14 +108,14 @@ is($node->safe_psql('postgres',
 
 
 # ----------
-# L7: 5 wait events under "Cluster: SharedFs".
+# L7: 12 wait events under "Cluster: SharedFs".
 # ----------
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_stat_cluster_wait_events
 		   WHERE type = 'Cluster: SharedFs'}),
-	'5',
-	'L7 5 cluster_shared_fs wait events registered under type "Cluster: SharedFs"');
+	'12',
+	'L7 12 cluster_shared_fs wait events registered under type "Cluster: SharedFs"');
 
 
 # ----------
@@ -147,21 +148,22 @@ is($node->safe_psql(
 
 is($node->safe_psql(
 		'postgres',
-		q{SELECT value FROM pg_cluster_state
+	q{SELECT value FROM pg_cluster_state
 		   WHERE category = 'shared_fs' AND key = 'registered_backends'}),
-	'stub,local,shared_fs',
-	'L11 registered_backends lists all built-in backends (spec-4.5a adds shared_fs)');
+	'stub,local,block_device,shared_fs',
+	'L11 registered_backends lists all built-in backends (spec-6.0a adds block_device)');
 
 
 # ----------
-# L12: postgresql.conf override = block_device makes startup FATAL.
+# L12: block_device without a device path makes startup FATAL.
 #
 #   Switch from "local" to "block_device" (PG GUC takes the last
-#   assignment for a given key).  cluster_shared_fs_init ereports
-#   FATAL with errhint=Stage 2.  We cannot use $node->start because
-#   PostgreSQL::Test::Cluster calls BAIL_OUT on a failed pg_ctl start
-#   (uncatchable by eval), so we invoke pg_ctl directly via system()
-#   and inspect the resulting exit code + log file.
+#   assignment for a given key).  The production raw provider must not
+#   silently fall back to a stub path, so startup fails unless
+#   cluster.block_device_path names an absolute device/file path.  We
+#   cannot use $node->start because PostgreSQL::Test::Cluster calls
+#   BAIL_OUT on a failed pg_ctl start (uncatchable by eval), so we
+#   invoke pg_ctl directly via system() and inspect the exit code + log.
 # ----------
 $node->stop;
 $node->append_conf('postgresql.conf', "cluster.shared_storage_backend = block_device\n");
@@ -170,14 +172,14 @@ my $pg_ctl = $ENV{PG_CTL} || 'pg_ctl';
 my $exit_code = system($pg_ctl, '-w', '-t', '6', '-D', $node->data_dir,
 					   '-l', $node->logfile, 'start');
 isnt($exit_code, 0,
-	 'L12 postmaster refuses to start when cluster.shared_storage_backend names an unregistered backend');
+	 'L12 postmaster refuses to start when block_device has no configured path');
 
 # The startup attempt left a postmaster log behind; confirm the
-# specific errhint reached it.
+# specific fail-closed detail reached it.
 my $log = slurp_file($node->logfile);
 like($log,
-	 qr/cluster\.shared_storage_backend selected backend.*is not available/,
-	 'L13 startup log contains FEATURE_NOT_SUPPORTED message naming the backend id');
+	 qr/cluster\.block_device_path must be set when shared_storage_backend=block_device/,
+	 'L13 startup log names missing cluster.block_device_path');
 
 
 done_testing();

@@ -89,12 +89,47 @@ typedef enum ClusterSharedFsBackendId {
  */
 typedef struct ClusterSharedFsHandle ClusterSharedFsHandle;
 
+/*
+ * ClusterSharedFsCaps -- backend capability descriptor.
+ *
+ * This is process-local metadata, not an on-disk format.  The byte layout is
+ * still pinned so production backends added after spec-6.0a can reason about a
+ * stable provider contract.
+ */
+typedef enum ClusterDurabilityClass {
+	CLUSTER_DURABILITY_BUFFERED = 0,
+	CLUSTER_DURABILITY_ODIRECT_BARRIER = 1,
+	CLUSTER_DURABILITY_NONE = 2,
+} ClusterDurabilityClass;
+
+typedef enum ClusterFenceCapability {
+	CLUSTER_FENCE_CAP_NONE = 0,
+	CLUSTER_FENCE_CAP_SCSI3_PR = 1,
+} ClusterFenceCapability;
+
+typedef struct ClusterSharedFsCaps {
+	bool supports_odirect;		  /* offset 0 */
+	uint8 _pad0[3];				  /* offset 1 */
+	uint32 required_io_alignment; /* offset 4; 0 = buffered/no special alignment */
+	bool supports_scsi3_pr;		  /* offset 8 */
+	uint8 durability_class;		  /* offset 9; ClusterDurabilityClass value */
+	uint16 max_nodes;			  /* offset 10 */
+	uint16 _pad;				  /* offset 12 */
+	uint16 _pad1;				  /* offset 14; keep sizeof == 16 */
+} ClusterSharedFsCaps;
+
+StaticAssertDecl(sizeof(ClusterSharedFsCaps) == 16, "ClusterSharedFsCaps ABI must stay 16 bytes");
+StaticAssertDecl(offsetof(ClusterSharedFsCaps, required_io_alignment) == 4,
+				 "ClusterSharedFsCaps.required_io_alignment offset changed");
+StaticAssertDecl(offsetof(ClusterSharedFsCaps, durability_class) == 9,
+				 "ClusterSharedFsCaps.durability_class offset changed");
+
 
 /*
  * ClusterSharedFsOps -- vtable.
  *
- *	Eleven storage callbacks plus two lifecycle callbacks, thirteen
- *	function pointers total.  Every member must be non-NULL when
+ *	Eleven core storage callbacks, two lifecycle callbacks, and five
+ *	production extension callbacks.  Every member must be non-NULL when
  *	registered; cluster_shared_fs_register_backend rejects partial
  *	implementations to make link-time auditing clean.
  *
@@ -126,11 +161,12 @@ typedef struct ClusterSharedFsHandle ClusterSharedFsHandle;
  *	Spec-1.7.2-cluster-smgr-warning-create-lifecycle 2026-05-03:
  *	`create` callback signature extended with `bool isRedo` parameter
  *	to match PG md.c mdcreate (see md.c:218).  Internal ABI bugfix-
- *	level amend; total still thirteen function pointers.
+ *	level amend; spec-6.0a appends durability/fence/advisory callbacks.
  */
 typedef struct ClusterSharedFsOps {
 	const char *name; /* "stub" / "local" / ... */
 	ClusterSharedFsBackendId id;
+	const ClusterSharedFsCaps *caps;
 
 	/* Existence + Open + Create (split for vtable契约清晰；Sprint A 2026-05-02;
 	 * create(isRedo) signature extended Sprint round 2 2026-05-03 spec-1.7.2). */
@@ -153,6 +189,13 @@ typedef struct ClusterSharedFsOps {
 	/* Lifecycle. */
 	void (*init)(void);		/* called once after register */
 	void (*shutdown)(void); /* called at postmaster exit */
+
+	/* Production-backend extensions (spec-6.0a). */
+	int (*barrier_sync)(ClusterSharedFsHandle *handle);
+	int (*register_fence_key)(int node_id);
+	ClusterFenceCapability (*fence_capability)(void);
+	bool (*prefetch)(ClusterSharedFsHandle *handle, BlockNumber blocknum);
+	void (*writeback)(ClusterSharedFsHandle *handle, BlockNumber blocknum, BlockNumber nblocks);
 } ClusterSharedFsOps;
 
 
@@ -211,6 +254,7 @@ extern void cluster_shared_fs_register_backend(const ClusterSharedFsOps *ops);
  * ----------
  */
 extern const ClusterSharedFsOps *cluster_shared_fs_get_active_ops(void);
+extern const ClusterSharedFsCaps *cluster_shared_fs_get_active_caps(void);
 extern int cluster_shared_fs_get_registered_count(void);
 extern const ClusterSharedFsOps *cluster_shared_fs_get_backend_at(int id);
 
@@ -250,6 +294,12 @@ extern BlockNumber cluster_shared_fs_nblocks(ClusterSharedFsHandle *handle);
 extern void cluster_shared_fs_truncate(ClusterSharedFsHandle *handle, BlockNumber nblocks);
 extern void cluster_shared_fs_immedsync(ClusterSharedFsHandle *handle);
 extern void cluster_shared_fs_unlink(RelFileLocator rlocator, ForkNumber forknum);
+extern int cluster_shared_fs_barrier_sync(ClusterSharedFsHandle *handle);
+extern int cluster_shared_fs_register_fence_key(int node_id);
+extern ClusterFenceCapability cluster_shared_fs_fence_capability(void);
+extern bool cluster_shared_fs_prefetch(ClusterSharedFsHandle *handle, BlockNumber blocknum);
+extern void cluster_shared_fs_writeback(ClusterSharedFsHandle *handle, BlockNumber blocknum,
+										BlockNumber nblocks);
 
 
 /*
@@ -259,6 +309,8 @@ extern void cluster_shared_fs_unlink(RelFileLocator rlocator, ForkNumber forknum
  */
 extern const ClusterSharedFsOps cluster_shared_fs_stub_ops;
 extern const ClusterSharedFsOps cluster_shared_fs_local_ops;
+/* Stage 6.0a: production raw block-device backend. */
+extern const ClusterSharedFsOps cluster_shared_fs_block_device_ops;
 /* Stage 4.5a (spec-4.5a D1): first genuinely cross-node-shared backend. */
 extern const ClusterSharedFsOps cluster_shared_fs_sharedfs_ops;
 

@@ -192,11 +192,14 @@ OBJS = \
 	storage/cluster_shared_fs_stub.o \
 	storage/cluster_shared_fs_local.o \
 	storage/cluster_shared_fs_sharedfs.o \
+	storage/cluster_shared_fs_block_device.o \
+	storage/cluster_pr_scsi.o \
 	storage/cluster_smgr.o \
 	storage/cluster_undo_alloc.o \
 	storage/cluster_undo_buf.o \
 	storage/cluster_undo_smgr.o \
-	storage/cluster_undo_xlog.o
+	storage/cluster_undo_xlog.o \
+	storage/cluster_raw_xlog.o
 else
 # cluster_conf.o, cluster_debug.o, cluster_views.o, cluster_ic.o,
 # cluster_inject.o, cluster_pgstat.o, cluster_scn.o are always linked

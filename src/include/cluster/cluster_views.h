@@ -51,7 +51,7 @@
  *	internal table in cluster_views.c stays in sync with the enum.
  */
 #define CLUSTER_WAIT_EVENTS_COUNT                                                                  \
-	103 /* spec-5.18 D12: +1 ReconfigNodeRemoveCleanupWait; was 102 (spec-4.12 D7) */
+	110 /* spec-6.0a D10: +7 block_device wait events; was 103 (spec-5.18 D12) */
 
 
 /*
@@ -77,7 +77,8 @@ extern Datum cluster_get_wait_events(PG_FUNCTION_ARGS);
  *	    type text    -- same as cluster_get_wait_events
  *	    name text    -- same as cluster_get_wait_events
  *
- *	Stage 0.17 returns 46 rows for the local node only; the SRF body is
+ *	Stage 0.17 returns one row per registered cluster wait event for the
+ *	local node only; the SRF body is
  *	written so that swapping the inner loop with a real cross-node RPC
  *	fan-out (Stage 6+ AD-007) leaves the column shape unchanged.  The
  *	column contract is a stable interface from 0.17 onward.

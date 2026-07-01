@@ -217,6 +217,16 @@ FileSync(File f pg_attribute_unused(), uint32 w pg_attribute_unused())
 {
 	return 0;
 }
+int
+FilePrefetch(File f pg_attribute_unused(), off_t o pg_attribute_unused(),
+			 off_t a pg_attribute_unused(), uint32 w pg_attribute_unused())
+{
+	return 0;
+}
+void
+FileWriteback(File f pg_attribute_unused(), off_t o pg_attribute_unused(),
+			  off_t a pg_attribute_unused(), uint32 w pg_attribute_unused())
+{}
 off_t
 FileSize(File f pg_attribute_unused())
 {
@@ -314,6 +324,139 @@ pg_comp_crc32c_armv8(pg_crc32c crc, const void *data pg_attribute_unused(),
 pg_crc32c (*pg_comp_crc32c)(pg_crc32c crc, const void *data, size_t len) = pg_comp_crc32c_sse42;
 
 
+static const ClusterSharedFsCaps dummy_block_device_caps = {
+	.supports_odirect = true,
+	.required_io_alignment = 512,
+	.supports_scsi3_pr = false,
+	.durability_class = CLUSTER_DURABILITY_ODIRECT_BARRIER,
+	.max_nodes = 128,
+};
+
+static bool
+dummy_block_exists(RelFileLocator rlocator pg_attribute_unused(),
+				   ForkNumber forknum pg_attribute_unused())
+{
+	return false;
+}
+
+static void
+dummy_block_open(RelFileLocator rlocator pg_attribute_unused(),
+				 ForkNumber forknum pg_attribute_unused(),
+				 ClusterSharedFsHandle **out_handle pg_attribute_unused())
+{}
+
+static void
+dummy_block_create(RelFileLocator rlocator pg_attribute_unused(),
+				   ForkNumber forknum pg_attribute_unused(), bool isRedo pg_attribute_unused(),
+				   ClusterSharedFsHandle **out_handle pg_attribute_unused())
+{}
+
+static void
+dummy_block_close(ClusterSharedFsHandle *handle pg_attribute_unused())
+{}
+
+static int
+dummy_block_read(ClusterSharedFsHandle *handle pg_attribute_unused(),
+				 BlockNumber blocknum pg_attribute_unused(), char *buf pg_attribute_unused())
+{
+	return 0;
+}
+
+static int
+dummy_block_write(ClusterSharedFsHandle *handle pg_attribute_unused(),
+				  BlockNumber blocknum pg_attribute_unused(), const char *buf pg_attribute_unused())
+{
+	return 0;
+}
+
+static void
+dummy_block_extend(ClusterSharedFsHandle *handle pg_attribute_unused(),
+				   BlockNumber blocknum pg_attribute_unused())
+{}
+
+static BlockNumber
+dummy_block_nblocks(ClusterSharedFsHandle *handle pg_attribute_unused())
+{
+	return 0;
+}
+
+static void
+dummy_block_truncate(ClusterSharedFsHandle *handle pg_attribute_unused(),
+					 BlockNumber nblocks pg_attribute_unused())
+{}
+
+static void
+dummy_block_immedsync(ClusterSharedFsHandle *handle pg_attribute_unused())
+{}
+
+static void
+dummy_block_unlink(RelFileLocator rlocator pg_attribute_unused(),
+				   ForkNumber forknum pg_attribute_unused())
+{}
+
+static void
+dummy_block_init(void)
+{}
+
+static void
+dummy_block_shutdown(void)
+{}
+
+static int
+dummy_block_barrier_sync(ClusterSharedFsHandle *handle pg_attribute_unused())
+{
+	return 0;
+}
+
+static int
+dummy_block_register_fence_key(int node_id pg_attribute_unused())
+{
+	return 0;
+}
+
+static ClusterFenceCapability
+dummy_block_fence_capability(void)
+{
+	return CLUSTER_FENCE_CAP_NONE;
+}
+
+static bool
+dummy_block_prefetch(ClusterSharedFsHandle *handle pg_attribute_unused(),
+					 BlockNumber blocknum pg_attribute_unused())
+{
+	return true;
+}
+
+static void
+dummy_block_writeback(ClusterSharedFsHandle *handle pg_attribute_unused(),
+					  BlockNumber blocknum pg_attribute_unused(),
+					  BlockNumber nblocks pg_attribute_unused())
+{}
+
+const ClusterSharedFsOps cluster_shared_fs_block_device_ops = {
+	.name = "block_device",
+	.id = CLUSTER_SHARED_FS_BACKEND_BLOCK_DEVICE,
+	.caps = &dummy_block_device_caps,
+	.exists = dummy_block_exists,
+	.open_existing = dummy_block_open,
+	.create = dummy_block_create,
+	.close = dummy_block_close,
+	.read = dummy_block_read,
+	.write = dummy_block_write,
+	.extend = dummy_block_extend,
+	.nblocks = dummy_block_nblocks,
+	.truncate = dummy_block_truncate,
+	.immedsync = dummy_block_immedsync,
+	.unlink = dummy_block_unlink,
+	.init = dummy_block_init,
+	.shutdown = dummy_block_shutdown,
+	.barrier_sync = dummy_block_barrier_sync,
+	.register_fence_key = dummy_block_register_fence_key,
+	.fence_capability = dummy_block_fence_capability,
+	.prefetch = dummy_block_prefetch,
+	.writeback = dummy_block_writeback,
+};
+
 UT_DEFINE_GLOBALS();
 
 
@@ -344,9 +487,9 @@ UT_TEST(test_shared_fs_vtable_struct_nonempty)
 	 * Anchor sizeof to "more than just one int" so an accidental
 	 * structural change (member removed, int replaces a fp) is loud.
 	 * Sprint A 2026-05-02: open split into exists / open_existing /
-	 * create -> 13 function pointers + a string + an int.
+	 * create.  Spec-6.0a adds durability/fence/advisory callbacks.
 	 */
-	UT_ASSERT(sizeof(ClusterSharedFsOps) >= sizeof(void *) * 13);
+	UT_ASSERT(sizeof(ClusterSharedFsOps) >= sizeof(void *) * 18);
 }
 
 
@@ -375,6 +518,12 @@ UT_TEST(test_stub_vtable_callbacks_nonnull)
 	UT_ASSERT_NOT_NULL((void *)ops->unlink);
 	UT_ASSERT_NOT_NULL((void *)ops->init);
 	UT_ASSERT_NOT_NULL((void *)ops->shutdown);
+	UT_ASSERT_NOT_NULL((void *)ops->caps);
+	UT_ASSERT_NOT_NULL((void *)ops->barrier_sync);
+	UT_ASSERT_NOT_NULL((void *)ops->register_fence_key);
+	UT_ASSERT_NOT_NULL((void *)ops->fence_capability);
+	UT_ASSERT_NOT_NULL((void *)ops->prefetch);
+	UT_ASSERT_NOT_NULL((void *)ops->writeback);
 }
 
 
@@ -399,6 +548,12 @@ UT_TEST(test_local_vtable_callbacks_nonnull)
 	UT_ASSERT_NOT_NULL((void *)ops->unlink);
 	UT_ASSERT_NOT_NULL((void *)ops->init);
 	UT_ASSERT_NOT_NULL((void *)ops->shutdown);
+	UT_ASSERT_NOT_NULL((void *)ops->caps);
+	UT_ASSERT_NOT_NULL((void *)ops->barrier_sync);
+	UT_ASSERT_NOT_NULL((void *)ops->register_fence_key);
+	UT_ASSERT_NOT_NULL((void *)ops->fence_capability);
+	UT_ASSERT_NOT_NULL((void *)ops->prefetch);
+	UT_ASSERT_NOT_NULL((void *)ops->writeback);
 }
 
 
@@ -429,6 +584,7 @@ UT_TEST(test_lifecycle_symbols_linkable)
 UT_TEST(test_accessor_symbols_linkable)
 {
 	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_get_active_ops);
+	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_get_active_caps);
 	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_get_registered_count);
 	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_get_backend_at);
 }
@@ -447,6 +603,11 @@ UT_TEST(test_dispatch_wrappers_linkable)
 	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_truncate);
 	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_immedsync);
 	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_unlink);
+	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_barrier_sync);
+	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_register_fence_key);
+	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_fence_capability);
+	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_prefetch);
+	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_writeback);
 }
 
 
@@ -541,6 +702,12 @@ UT_TEST(test_sharedfs_vtable_callbacks_nonnull)
 	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_sharedfs_ops.unlink);
 	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_sharedfs_ops.init);
 	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_sharedfs_ops.shutdown);
+	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_sharedfs_ops.caps);
+	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_sharedfs_ops.barrier_sync);
+	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_sharedfs_ops.register_fence_key);
+	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_sharedfs_ops.fence_capability);
+	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_sharedfs_ops.prefetch);
+	UT_ASSERT_NOT_NULL((void *)cluster_shared_fs_sharedfs_ops.writeback);
 }
 
 UT_TEST(test_sharedfs_vtable_identity)

@@ -99,6 +99,17 @@ gh workflow run perf.yml -R sqlrush/linkdb
 
 CI(GitHub Actions perf workflow)上传 artifact `perf-2node-baseline-{ubuntu,macos}-<run_id>`,retention 60 days。
 
+### Storage I/O Matrix (spec-6.0a, report-only)
+
+Production shared-storage backend work adds a storage I/O report under:
+
+```bash
+PGRAC_ENABLE_INSTALL=$HOME/linkdb-install \
+./scripts/perf/run-storage-io-matrix.sh
+```
+
+Default CI shape uses a regular-file raw image with `cluster.block_device_use_odirect=off`, so the artifact is a conformance/trend signal, not a hardware O_DIRECT claim. Set `STORAGE_IO_ODIRECT=on` only on a verified block-device environment where the soundness gate has confirmed direct-I/O alignment behavior.
+
 ---
 
 ## 5. ship 决策树(简化版)

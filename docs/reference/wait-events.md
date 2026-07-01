@@ -1,7 +1,7 @@
 # Cluster wait events
 
-linkdb registers 46 cluster-specific wait events distributed across
-10 classes.  Each row in `pg_stat_cluster_wait_events` corresponds
+linkdb registers 110 cluster-specific wait events distributed across
+11 classes.  Each row in `pg_stat_cluster_wait_events` corresponds
 to one entry in this table.
 
 The values appear in the standard `pg_stat_activity.wait_event_type`
@@ -140,10 +140,29 @@ Active Data Guard / read-only standby coordination.
 | `AdgReadSnapshotWait` | Waiting for a read snapshot to be released |
 | `AdgScnSyncWait` | Waiting for SCN sync between primary and standby |
 
+## Cluster: SharedFs (12 events)
+
+Shared-storage provider and raw block-device I/O.
+
+| Name | Description |
+|---|---|
+| `ClusterSharedFsRead` | Waiting for generic shared-storage read |
+| `ClusterSharedFsWrite` | Waiting for generic shared-storage write |
+| `ClusterSharedFsExtend` | Waiting for generic shared-storage extend |
+| `ClusterSharedFsTruncate` | Waiting for generic shared-storage truncate |
+| `ClusterSharedFsFsync` | Waiting for generic shared-storage fsync |
+| `ClusterBlockDeviceRead` | Waiting for raw block-device read |
+| `ClusterBlockDeviceWrite` | Waiting for raw block-device write |
+| `ClusterBlockDevicePrefetch` | Waiting for raw block-device prefetch hint |
+| `ClusterBlockDeviceWriteback` | Waiting for raw block-device writeback hint |
+| `ClusterBlockDeviceSync` | Waiting for raw block-device barrier sync |
+| `ClusterBlockDevicePrProbe` | Waiting for SCSI-3 PR capability probe |
+| `ClusterBlockDevicePrRegister` | Waiting for SCSI-3 PR own-key registration |
+
 ## Querying
 
 ```sql
--- Total registered (46):
+-- Total registered (110):
 SELECT count(*) FROM pg_stat_cluster_wait_events;
 
 -- Per-class counts:

@@ -11,13 +11,9 @@
  *	    - cluster_smgr_init / _shutdown lifecycle (called from PG's
  *	      smgrinit / smgrshutdown via smgrsw[1]);
  *	    - cluster_smgr_which_for() routing decision read by smgropen;
- *	    - sixteen f_smgr callbacks: eleven core I/O ops dispatch to
- *	      cluster_shared_fs (which has eleven storage callbacks plus
- *	      two lifecycle callbacks, thirteen function pointers total
- *	      after spec-1.X Sprint A vtable split + spec-1.7.2 create
- *	      isRedo amend); three advisory ops (zeroextend, prefetch,
- *	      writeback) fall through to md.c; two lifecycle / structural
- *	      callbacks have local logic.
+ *	    - sixteen f_smgr callbacks: core I/O and advisory ops dispatch
+ *	      to cluster_shared_fs as of spec-6.0a; lifecycle / structural
+ *	      callbacks keep local logic.
  *
  *	  Stage 1.2 deliberately does NOT split relations into 1GB
  *	  segments.  Each (rlocator, fork) maps to a single underlying
@@ -108,6 +104,41 @@ typedef struct ClusterSmgrRelationState {
 static HTAB *cluster_smgr_relations = NULL;
 
 #define CLUSTER_SMGR_INITIAL_HTAB_SIZE 1024
+
+static void
+cluster_smgr_init_filetag(FileTag *tag, RelFileLocator rlocator, ForkNumber forknum)
+{
+	memset(tag, 0, sizeof(*tag));
+	tag->handler = SYNC_HANDLER_CLUSTER_SHARED;
+	tag->forknum = forknum;
+	tag->rlocator = rlocator;
+	tag->segno = 0; /* cluster_shared_fs stores one logical file per fork. */
+}
+
+static void
+cluster_smgr_register_dirty(SMgrRelation reln, ForkNumber forknum, ClusterSharedFsHandle *handle)
+{
+	FileTag tag;
+
+	if (RelFileLocatorBackendIsTemp(reln->smgr_rlocator))
+		return;
+
+	cluster_smgr_init_filetag(&tag, reln->smgr_rlocator.locator, forknum);
+	if (!RegisterSyncRequest(&tag, SYNC_REQUEST, false)) {
+		ereport(DEBUG1, (errmsg_internal("could not forward cluster shared-storage fsync request "
+										 "because request queue is full")));
+		cluster_shared_fs_barrier_sync(handle);
+	}
+}
+
+static void
+cluster_smgr_forget_fsync(RelFileLocator rlocator, ForkNumber forknum)
+{
+	FileTag tag;
+
+	cluster_smgr_init_filetag(&tag, rlocator, forknum);
+	RegisterSyncRequest(&tag, SYNC_FORGET_REQUEST, true);
+}
 
 
 /*
@@ -463,13 +494,16 @@ cluster_smgr_unlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isR
 	if (forknum == InvalidForkNumber) {
 		ForkNumber f;
 
-		for (f = 0; f <= MAX_FORKNUM; f++)
+		for (f = 0; f <= MAX_FORKNUM; f++) {
+			cluster_smgr_forget_fsync(rlocator.locator, f);
 			cluster_shared_fs_unlink(rlocator.locator, f);
+		}
 
 		/* Drop the bypass state entry now that disk is gone. */
 		if (cluster_smgr_relations != NULL)
 			hash_search(cluster_smgr_relations, &rlocator, HASH_REMOVE, NULL);
 	} else {
+		cluster_smgr_forget_fsync(rlocator.locator, forknum);
 		cluster_shared_fs_unlink(rlocator.locator, forknum);
 	}
 }
@@ -482,8 +516,6 @@ cluster_smgr_extend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	ClusterSmgrRelationState *state;
 	ClusterSharedFsHandle *handle;
 
-	(void)skipFsync; /* PG handles fsync via the buffer manager */
-
 	/* spec-4.12 D5 (L240): reject before extending the underlying file. */
 	cluster_write_fence_reject_if_fenced("extend");
 
@@ -491,13 +523,15 @@ cluster_smgr_extend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	handle = cluster_smgr_ensure_handle(state, forknum);
 
 	/*
-	 * Caller (PG bufmgr or hio.c) supplies a pre-filled buffer with
-	 * either real tuples or all-zeros.  Writing at offset blocknum *
-	 * BLCKSZ extends the underlying file; intermediate blocks (if any)
-	 * appear as sparse zero-filled holes from the kernel's view, the
-	 * same as md.c.
+	 * Establish logical EOF first, then write the caller's real page.  POSIX
+	 * backends tolerate this as a zero-write followed by the real write; raw
+	 * block_device requires the explicit extend so writes past logical EOF fail
+	 * closed instead of silently allocating.
 	 */
+	cluster_shared_fs_extend(handle, blocknum);
 	cluster_shared_fs_write(handle, blocknum, (const char *)buffer);
+	if (!skipFsync)
+		cluster_smgr_register_dirty(reln, forknum, handle);
 }
 
 
@@ -509,8 +543,6 @@ cluster_smgr_zeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber block
 	ClusterSharedFsHandle *handle;
 	char zerobuf[BLCKSZ];
 	int i;
-
-	(void)skipFsync;
 
 	/* spec-4.12 D5 (L240): reject before any zero-block write. */
 	cluster_write_fence_reject_if_fenced("zero-extend");
@@ -530,26 +562,25 @@ cluster_smgr_zeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber block
 	handle = cluster_smgr_ensure_handle(state, forknum);
 
 	memset(zerobuf, 0, BLCKSZ);
-	for (i = 0; i < nblocks; i++)
+	for (i = 0; i < nblocks; i++) {
+		cluster_shared_fs_extend(handle, blocknum + i);
 		cluster_shared_fs_write(handle, blocknum + i, zerobuf);
+	}
+	if (!skipFsync && nblocks > 0)
+		cluster_smgr_register_dirty(reln, forknum, handle);
 }
 
 
 bool
 cluster_smgr_prefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
 {
-	/*
-	 * Prefetch is purely advisory (no correctness consequence if it's
-	 * a no-op).  Stage 6+ may wire posix_fadvise via a bulk
-	 * cluster_shared_fs callback; stage 1.2 just returns true (= "I
-	 * tried", per PG's smgr_prefetch contract).  We deliberately do
-	 * NOT delegate to mdprefetch because that would touch md.c's
-	 * SMgrRelationData state our smgr_which=1 path never initialises.
-	 */
-	(void)reln;
-	(void)forknum;
-	(void)blocknum;
-	return true;
+	ClusterSmgrRelationState *state;
+	ClusterSharedFsHandle *handle;
+
+	state = cluster_smgr_state_lookup(reln, true);
+	handle = cluster_smgr_ensure_handle(state, forknum);
+
+	return cluster_shared_fs_prefetch(handle, blocknum);
 }
 
 
@@ -573,8 +604,6 @@ cluster_smgr_write(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, 
 	ClusterSmgrRelationState *state;
 	ClusterSharedFsHandle *handle;
 
-	(void)skipFsync;
-
 	/* spec-4.12 D5 (L240): reject before the shared-storage block write. */
 	cluster_write_fence_reject_if_fenced("write");
 
@@ -582,6 +611,8 @@ cluster_smgr_write(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, 
 	handle = cluster_smgr_ensure_handle(state, forknum);
 
 	cluster_shared_fs_write(handle, blocknum, (const char *)buffer);
+	if (!skipFsync)
+		cluster_smgr_register_dirty(reln, forknum, handle);
 }
 
 
@@ -589,16 +620,13 @@ void
 cluster_smgr_writeback(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 					   BlockNumber nblocks)
 {
-	/*
-	 * Writeback is purely advisory (posix_fadvise WILLNEED-style hint).
-	 * Stage 6+ may wire it through cluster_shared_fs; stage 1.2 makes
-	 * it a no-op.  Same reason as cluster_smgr_prefetch: cannot
-	 * delegate to md.c (md_seg_fds uninitialised on smgr_which=1).
-	 */
-	(void)reln;
-	(void)forknum;
-	(void)blocknum;
-	(void)nblocks;
+	ClusterSmgrRelationState *state;
+	ClusterSharedFsHandle *handle;
+
+	state = cluster_smgr_state_lookup(reln, true);
+	handle = cluster_smgr_ensure_handle(state, forknum);
+
+	cluster_shared_fs_writeback(handle, blocknum, nblocks);
 }
 
 
@@ -653,6 +681,40 @@ cluster_smgr_immedsync(SMgrRelation reln, ForkNumber forknum)
 	handle = cluster_smgr_ensure_handle(state, forknum);
 
 	cluster_shared_fs_immedsync(handle);
+}
+
+int
+cluster_smgr_syncfiletag(const FileTag *ftag, char *path)
+{
+	ClusterSharedFsHandle *handle = NULL;
+
+	snprintf(path, MAXPGPATH, "cluster_shared:%u/%u/%u fork %d", ftag->rlocator.spcOid,
+			 ftag->rlocator.dbOid, ftag->rlocator.relNumber, ftag->forknum);
+
+	if (!cluster_shared_fs_exists(ftag->rlocator, ftag->forknum)) {
+		errno = ENOENT;
+		return -1;
+	}
+
+	cluster_shared_fs_open_existing(ftag->rlocator, ftag->forknum, &handle);
+	cluster_shared_fs_barrier_sync(handle);
+	cluster_shared_fs_close(handle);
+	return 0;
+}
+
+int
+cluster_smgr_unlinkfiletag(const FileTag *ftag, char *path)
+{
+	snprintf(path, MAXPGPATH, "cluster_shared:%u/%u/%u fork %d", ftag->rlocator.spcOid,
+			 ftag->rlocator.dbOid, ftag->rlocator.relNumber, ftag->forknum);
+	cluster_shared_fs_unlink(ftag->rlocator, ftag->forknum);
+	return 0;
+}
+
+bool
+cluster_smgr_filetagmatches(const FileTag *ftag, const FileTag *candidate)
+{
+	return ftag->rlocator.dbOid == candidate->rlocator.dbOid;
 }
 
 
@@ -740,6 +802,8 @@ cluster_smgr_remote_invalidation_inc(void)
 void
 cluster_smgr_build_smgr_inval_msg(RelFileLocator rlocator, SharedInvalidationMessage *out)
 {
+	uint32 backend = (uint32)InvalidBackendId;
+
 	/*
 	 * Mirror PG's CacheInvalidateSmgr() construction (inval.c).  Cluster
 	 * relations live on shared storage and are never temp, so the backend
@@ -752,8 +816,8 @@ cluster_smgr_build_smgr_inval_msg(RelFileLocator rlocator, SharedInvalidationMes
 	 * which truncates into the int8 backend_hi as -1 — byte-identical to PG's
 	 * CacheInvalidateSmgr() and round-trips back to InvalidBackendId in the
 	 * SHAREDINVALSMGR_ID apply path. */
-	out->sm.backend_hi = ((uint32)InvalidBackendId) >> 16;
-	out->sm.backend_lo = InvalidBackendId & 0xffff;
+	out->sm.backend_hi = backend >> 16;
+	out->sm.backend_lo = backend & 0xffff;
 	out->sm.rlocator = rlocator;
 }
 

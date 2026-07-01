@@ -96,6 +96,10 @@ int cluster_shared_storage_backend = CLUSTER_SHARED_FS_BACKEND_STUB;
 char *cluster_shared_data_dir = NULL;
 /* spec-4.5a D2: optional external-preset shared-storage uuid (sentinel). */
 char *cluster_shared_storage_uuid = NULL;
+/* spec-6.0a: raw block-device backend configuration. */
+char *cluster_block_device_path = NULL;
+bool cluster_block_device_use_odirect = true;
+int cluster_storage_fence_driver = CLUSTER_STORAGE_FENCE_DRIVER_AUTO;
 /*
  * spec-5.6 Da3: opt-in switch for the shared pg_control authority.  Default
  * off (Hardening v1.0.1): a node only migrates its global/pg_control into the
@@ -836,6 +840,11 @@ static const struct config_enum_entry cluster_recovery_target_action_options[]
 static const struct config_enum_entry cluster_backup_manifest_checksum_options[]
 	= { { "crc32c", CLUSTER_BACKUP_MANIFEST_CHECKSUM_CRC32C, false }, { NULL, 0, false } };
 
+static const struct config_enum_entry cluster_storage_fence_driver_options[]
+	= { { "disabled", CLUSTER_STORAGE_FENCE_DRIVER_DISABLED, false },
+		{ "auto", CLUSTER_STORAGE_FENCE_DRIVER_AUTO, false },
+		{ "scsi3_pr", CLUSTER_STORAGE_FENCE_DRIVER_SCSI3_PR, false },
+		{ NULL, 0, false } };
 
 /*
  * check_cluster_shared_data_dir -- GUC check_hook for
@@ -853,6 +862,16 @@ check_cluster_shared_data_dir(char **newval, void **extra, GucSource source)
 {
 	if (*newval != NULL && (*newval)[0] != '\0' && !is_absolute_path(*newval)) {
 		GUC_check_errdetail("cluster.shared_data_dir must be an absolute path.");
+		return false;
+	}
+	return true;
+}
+
+static bool
+check_cluster_block_device_path(char **newval, void **extra, GucSource source)
+{
+	if (*newval != NULL && (*newval)[0] != '\0' && !is_absolute_path(*newval)) {
+		GUC_check_errdetail("cluster.block_device_path must be an absolute path.");
 		return false;
 	}
 	return true;
@@ -1364,6 +1383,31 @@ cluster_init_guc(void)
 		NULL,			/* check_hook */
 		NULL,			/* assign_hook */
 		NULL);			/* show_hook */
+
+	DefineCustomStringVariable(
+		"cluster.block_device_path",
+		gettext_noop("Raw block-device path for the block_device shared-storage backend."),
+		gettext_noop(
+			"Absolute device or file path used by cluster.shared_storage_backend=block_device.  "
+			"The backend stores raw layout metadata and relation extents directly in this device."),
+		&cluster_block_device_path, "", PGC_POSTMASTER, 0, check_cluster_block_device_path, NULL,
+		NULL);
+
+	DefineCustomBoolVariable(
+		"cluster.block_device_use_odirect",
+		gettext_noop("Require direct I/O for the raw block-device backend."),
+		gettext_noop(
+			"When on, the block_device backend opens cluster.block_device_path with PG_O_DIRECT "
+			"and fails closed if that cannot be honored."),
+		&cluster_block_device_use_odirect, true, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	DefineCustomEnumVariable(
+		"cluster.storage_fence_driver", gettext_noop("Shared-storage fencing driver selection."),
+		gettext_noop(
+			"auto detects available fencing support; scsi3_pr requires SCSI-3 persistent "
+			"reservation capability and fails closed if unavailable; disabled reports no fence."),
+		&cluster_storage_fence_driver, CLUSTER_STORAGE_FENCE_DRIVER_AUTO,
+		cluster_storage_fence_driver_options, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	/*
 	 * cluster.smgr_user_relations -- opt-in switch routing user-

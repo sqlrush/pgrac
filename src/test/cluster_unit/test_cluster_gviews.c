@@ -11,9 +11,9 @@
  *	  (Stage 6+ AD-007); at 0.17 it returns one row per cluster wait
  *	  event for the local node only.
  *
- *	  Runtime SQL behavior (46 rows × 1 node, column structure, value
- *	  spot-checks) is validated by cluster_tap t/011_gviews.pl on a
- *	  real PG instance.
+ *	  Runtime SQL behavior (registered wait events × 1 node, column
+ *	  structure, value spot-checks) is validated by cluster_tap
+ *	  t/011_gviews.pl on a real PG instance.
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group

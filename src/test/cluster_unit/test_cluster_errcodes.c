@@ -16,7 +16,7 @@
  *	    correct values).
  *	  - All checked codes use the 'R' subclass character (pgrac namespace
  *	    discipline; design doc §2.3).
- *	  - The Class 58 pgrac block is dense from 58R01..58R12 (the
+ *	  - The Class 58 pgrac block is dense from 58R01..58R15 (the
  *	    largest pgrac sub-class, anchors the count proof).
  *
  *	  Why compile-time only:
@@ -137,7 +137,7 @@ UT_TEST(test_class_57_first_last)
 UT_TEST(test_class_58_first_last)
 {
 	UT_ASSERT_EQ(ERRCODE_CLUSTER_SHARED_STORAGE_FAILED, MAKE_SQLSTATE('5', '8', 'R', '0', '1'));
-	UT_ASSERT_EQ(ERRCODE_CLUSTER_RECOVERY_FAILED, MAKE_SQLSTATE('5', '8', 'R', '1', '2'));
+	UT_ASSERT_EQ(ERRCODE_CLUSTER_STORAGE_FENCE_UNAVAILABLE, MAKE_SQLSTATE('5', '8', 'R', '1', '5'));
 }
 
 UT_TEST(test_class_72_first_last)
@@ -154,8 +154,8 @@ UT_TEST(test_class_xx_first_last)
 
 
 /* ----------
- * Class 58 has the largest pgrac sub-class (12 entries).  Verify all
- * 12 are present and correctly encoded.  This anchors the per-class
+ * Class 58 has the largest pgrac sub-class (15 entries).  Verify all
+ * 15 are present and correctly encoded.  This anchors the per-class
  * dense-packing claim that the rest of the test only spot-checks.
  * ----------
  */
@@ -174,6 +174,10 @@ UT_TEST(test_class_58_complete)
 	UT_ASSERT_EQ(ERRCODE_CLUSTER_CATALOG_INCONSISTENT, MAKE_SQLSTATE('5', '8', 'R', '1', '0'));
 	UT_ASSERT_EQ(ERRCODE_CLUSTER_SINVAL_INCONSISTENT, MAKE_SQLSTATE('5', '8', 'R', '1', '1'));
 	UT_ASSERT_EQ(ERRCODE_CLUSTER_RECOVERY_FAILED, MAKE_SQLSTATE('5', '8', 'R', '1', '2'));
+	UT_ASSERT_EQ(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE,
+				 MAKE_SQLSTATE('5', '8', 'R', '1', '3'));
+	UT_ASSERT_EQ(ERRCODE_CLUSTER_STORAGE_IO_ALIGNMENT, MAKE_SQLSTATE('5', '8', 'R', '1', '4'));
+	UT_ASSERT_EQ(ERRCODE_CLUSTER_STORAGE_FENCE_UNAVAILABLE, MAKE_SQLSTATE('5', '8', 'R', '1', '5'));
 }
 
 UT_TEST(test_class_53_backup_band)
@@ -203,6 +207,7 @@ UT_TEST(test_all_use_r_subclass)
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS, 3), 'R');
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_RESTORE_POINT_DRAIN_TIMEOUT, 3), 'R');
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_SHARED_STORAGE_FAILED, 3), 'R');
+	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_STORAGE_FENCE_UNAVAILABLE, 3), 'R');
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_SNAPSHOT_TOO_OLD, 3), 'R');
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_ASSERTION_FAILURE, 3), 'R');
 }

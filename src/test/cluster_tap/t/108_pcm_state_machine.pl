@@ -81,8 +81,8 @@ is($apply_event, '1',
 # L6 — wait event count baseline through spec-2.33.
 my $wait_event_count = $node_default->safe_psql(
 	'postgres', "SELECT count(*) FROM pg_stat_cluster_wait_events");
-is($wait_event_count, '103',
-   'L6 wait event baseline 98 (spec-4.2 +2 wal-state registry I/O events)');
+is($wait_event_count, '110',
+   'L6 wait event baseline 110 (spec-6.0a +7 storage wait events)');
 
 # L7 — no PCM wire opcode smoke (no SQL-visible PCM wire opcode enum surface)
 my $pcm_grd_init_event = $node_default->safe_psql(

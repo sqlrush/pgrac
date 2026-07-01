@@ -12,6 +12,25 @@
  *
  *-------------------------------------------------------------------------
  */
+/*-------------------------------------------------------------------------
+ * PGRAC MODIFICATIONS (spec-6.0a)
+ *
+ * Modified by: SqlRush <sqlrush@gmail.com>
+ *
+ * What changed:
+ *	Add a USE_PGRAC_CLUSTER-gated sync handler table entry for
+ *	SYNC_HANDLER_CLUSTER_SHARED.  The handler delegates checkpoint fsync,
+ *	unlink-forget, and tag-match filtering to cluster_smgr.
+ *
+ * Why:
+ *	spec-6.0a promotes shared storage from experimental passthrough to a
+ *	production durability surface.  Cluster-routed relation writes must
+ *	participate in PostgreSQL's pending-fsync machinery instead of relying
+ *	on Assert-only or best-effort immediate sync behavior.
+ *
+ *	Spec: spec-6.0a-production-shared-storage-backend-matrix.md
+ *-------------------------------------------------------------------------
+ */
 #include "postgres.h"
 
 #include <unistd.h>
@@ -33,6 +52,9 @@
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/md.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/storage/cluster_smgr.h"
+#endif
 #include "utils/hsearch.h"
 #include "utils/inval.h"
 #include "utils/memutils.h"
@@ -119,7 +141,15 @@ static const SyncOps syncsw[] = {
 	/* pg_multixact/members */
 	[SYNC_HANDLER_MULTIXACT_MEMBER] = {
 		.sync_syncfiletag = multixactmemberssyncfiletag
+	},
+#ifdef USE_PGRAC_CLUSTER
+	/* pgrac cluster shared-storage relation files */
+	[SYNC_HANDLER_CLUSTER_SHARED] = {
+		.sync_syncfiletag = cluster_smgr_syncfiletag,
+		.sync_unlinkfiletag = cluster_smgr_unlinkfiletag,
+		.sync_filetagmatches = cluster_smgr_filetagmatches
 	}
+#endif
 };
 
 /*
