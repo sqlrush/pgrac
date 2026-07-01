@@ -211,8 +211,8 @@ static void cluster_backup_store_restore_point(const ClusterRestorePoint *point)
 static void cluster_backup_prepare_restore_point(const char *name, ClusterRestorePoint *point);
 static void cluster_backup_make_restore_point(const char *name, ClusterRestorePoint *point);
 static void cluster_backup_prepare_cluster_backup_stop_point(const char *name,
-															const char *backup_set_path,
-															ClusterRestorePoint *point);
+															 const char *backup_set_path,
+															 ClusterRestorePoint *point);
 static void cluster_backup_make_backup_set_path(const char *backup_id, char *path, size_t pathlen);
 static void cluster_backup_ensure_dir(const char *path);
 static void cluster_backup_capture_backup_set(const char *backup_set_path, bool include_data);
@@ -377,8 +377,8 @@ cluster_backup_safe_path_component(const char *src, char *dst, size_t dstlen)
 	for (i = 0; src[i] != '\0' && j + 1 < dstlen; i++) {
 		unsigned char c = (unsigned char)src[i];
 
-		if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
-			|| c == '-' || c == '_' || c == '.')
+		if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-'
+			|| c == '_' || c == '.')
 			dst[j++] = (char)c;
 		else
 			dst[j++] = '_';
@@ -407,8 +407,8 @@ cluster_backup_ensure_dir(const char *path)
 		ereport(ERROR,
 				(errcode_for_file_access(), errmsg("could not stat directory \"%s\": %m", path)));
 	if (MakePGDirectory(path) < 0)
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("could not create directory \"%s\": %m", path)));
+		ereport(ERROR,
+				(errcode_for_file_access(), errmsg("could not create directory \"%s\": %m", path)));
 	fsync_fname(path, true);
 }
 
@@ -442,8 +442,7 @@ cluster_backup_make_backup_set_path(const char *backup_id, char *path, size_t pa
 						errmsg("cluster backup root path is too long")));
 	cluster_backup_ensure_dir(root);
 
-	ret = snprintf(path, pathlen, "%s/%s_%lld", root, safe_id,
-				   (long long)GetCurrentTimestamp());
+	ret = snprintf(path, pathlen, "%s/%s_%lld", root, safe_id, (long long)GetCurrentTimestamp());
 	if (ret < 0 || (size_t)ret >= pathlen)
 		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 						errmsg("cluster backup set path is too long")));
@@ -530,8 +529,7 @@ cluster_backup_capture_voting(const char *backup_set_path)
 		char *tok;
 		int idx = 0;
 
-		for (tok = strtok_r(raw, ",", &saveptr); tok != NULL;
-			 tok = strtok_r(NULL, ",", &saveptr)) {
+		for (tok = strtok_r(raw, ",", &saveptr); tok != NULL; tok = strtok_r(NULL, ",", &saveptr)) {
 			char dst[MAXPGPATH];
 			char name[MAXPGPATH];
 
@@ -635,11 +633,9 @@ cluster_backup_write_manifest_to_path(const char *path, const ClusterBackupManif
 		ereport(ERROR,
 				(errcode_for_file_access(), errmsg("could not create file \"%s\": %m", tmp)));
 	if (write(fd, manifest, sizeof(*manifest)) != sizeof(*manifest) || pg_fsync(fd) != 0)
-		ereport(ERROR,
-				(errcode_for_file_access(), errmsg("could not write file \"%s\": %m", tmp)));
+		ereport(ERROR, (errcode_for_file_access(), errmsg("could not write file \"%s\": %m", tmp)));
 	if (CloseTransientFile(fd) != 0)
-		ereport(ERROR,
-				(errcode_for_file_access(), errmsg("could not close file \"%s\": %m", tmp)));
+		ereport(ERROR, (errcode_for_file_access(), errmsg("could not close file \"%s\": %m", tmp)));
 	durable_rename(tmp, path, ERROR);
 }
 
@@ -659,8 +655,7 @@ cluster_backup_manifest_read_file(const char *path, ClusterBackupManifest *manif
 	if (fd < 0) {
 		if (errno != ENOENT)
 			ereport(WARNING, (errcode_for_file_access(),
-							  errmsg("could not read cluster backup manifest \"%s\": %m",
-									 path)));
+							  errmsg("could not read cluster backup manifest \"%s\": %m", path)));
 		return false;
 	}
 	got = read(fd, manifest, sizeof(*manifest));
@@ -688,9 +683,8 @@ cluster_backup_manifest_validate_artifacts(const ClusterBackupManifest *manifest
 	if (reason != CLUSTER_BACKUP_MANIFEST_OK)
 		return reason;
 
-	root = (backup_set_path != NULL && backup_set_path[0] != '\0')
-			   ? backup_set_path
-			   : manifest->backup_set_path;
+	root = (backup_set_path != NULL && backup_set_path[0] != '\0') ? backup_set_path
+																   : manifest->backup_set_path;
 	if (root == NULL || root[0] == '\0')
 		return CLUSTER_BACKUP_MANIFEST_BAD_COUNTS;
 
@@ -841,8 +835,7 @@ cluster_backup_build_cluster_label(BackupState *state, const ClusterBackupManife
 
 		if (!thread->present)
 			continue;
-		appendStringInfo(&buf, "THREAD_%02u_NODE_ID: %d\n", thread->thread_id,
-						 thread->node_id);
+		appendStringInfo(&buf, "THREAD_%02u_NODE_ID: %d\n", thread->thread_id, thread->node_id);
 		appendStringInfo(&buf, "THREAD_%02u_START_REDO_LSN: %X/%X\n", thread->thread_id,
 						 LSN_FORMAT_ARGS(thread->start_redo_lsn));
 		appendStringInfo(&buf, "THREAD_%02u_CHECKPOINT_LSN: %X/%X\n", thread->thread_id,
@@ -895,8 +888,8 @@ cluster_backup_declared_peer_count(uint8 *bitmap)
 static void
 cluster_backup_coord_prepare_request(ClusterBackupWireRequest *request, ClusterBackupWireOp op,
 									 const char *backup_id, const char *restore_point_name,
-									 const char *backup_set_path, bool fast,
-									 bool waitforarchive, SCN requested_scn)
+									 const char *backup_set_path, bool fast, bool waitforarchive,
+									 SCN requested_scn)
 {
 	MemSet(request, 0, sizeof(*request));
 	request->magic = CLUSTER_BACKUP_IC_MAGIC;
@@ -922,8 +915,8 @@ cluster_backup_coord_prepare_request(ClusterBackupWireRequest *request, ClusterB
 
 static ClusterBackupCoordWaitResult
 cluster_backup_coord_request(ClusterBackupWireOp op, const char *backup_id,
-							 const char *restore_point_name, const char *backup_set_path,
-							 bool fast, bool waitforarchive, SCN requested_scn)
+							 const char *restore_point_name, const char *backup_set_path, bool fast,
+							 bool waitforarchive, SCN requested_scn)
 {
 	ClusterBackupCoordWaitResult result;
 	ClusterBackupWireRequest request;
@@ -976,8 +969,9 @@ cluster_backup_coord_request(ClusterBackupWireOp op, const char *backup_id,
 			if (cluster_backup_bitmap_test(cluster_backup_state->coordinator_nacked, node_id)) {
 				result.ok = false;
 				result.node_id = node_id;
-				result.result = (ClusterBackupWireResult)
-					cluster_backup_state->coordinator_acks[node_id].result;
+				result.result
+					= (ClusterBackupWireResult)cluster_backup_state->coordinator_acks[node_id]
+						  .result;
 				LWLockRelease(&cluster_backup_state->lock.lock);
 				return result;
 			}
@@ -1008,8 +1002,7 @@ cluster_backup_coord_fail_if_bad(ClusterBackupCoordWaitResult result, const char
 						errmsg("%s timed out waiting for cluster backup peer ACKs", op)));
 	ereport(ERROR, (errcode(ERRCODE_CLUSTER_BACKUP_INCOMPLETE),
 					errmsg("%s failed on cluster backup peer %d", op, result.node_id),
-					errdetail("Peer result: %s.",
-							  cluster_backup_wire_result_name(result.result))));
+					errdetail("Peer result: %s.", cluster_backup_wire_result_name(result.result))));
 }
 
 static void
@@ -1130,9 +1123,8 @@ cluster_backup_lmon_prepare_context(void)
 	MemoryContext oldcontext;
 
 	if (cluster_backup_lmon_context == NULL)
-		cluster_backup_lmon_context =
-			AllocSetContextCreate(TopMemoryContext, "cluster backup lmon context",
-								  ALLOCSET_START_SMALL_SIZES);
+		cluster_backup_lmon_context = AllocSetContextCreate(
+			TopMemoryContext, "cluster backup lmon context", ALLOCSET_START_SMALL_SIZES);
 	else {
 		cluster_backup_lmon_state = NULL;
 		cluster_backup_lmon_tablespace_map = NULL;
@@ -1273,10 +1265,9 @@ cluster_backup_lmon_execute_request(const ClusterBackupWireRequest *request)
 						sizeof(cluster_backup_lmon_backup_set_path));
 				register_persistent_abort_backup_handler();
 				do_pg_backup_start(request->backup_id, request->fast, NULL,
-								   cluster_backup_lmon_state,
-								   cluster_backup_lmon_tablespace_map);
+								   cluster_backup_lmon_state, cluster_backup_lmon_tablespace_map);
 				cluster_backup_durable_pin_publish(cluster_backup_lmon_state->startpoint,
-												  request->backup_id);
+												   request->backup_id);
 				ack.start_redo_lsn = cluster_backup_lmon_state->startpoint;
 				ack.checkpoint_lsn = cluster_backup_lmon_state->checkpointloc;
 				ack.timeline = cluster_backup_lmon_state->starttli;
@@ -1381,8 +1372,7 @@ cluster_backup_lmon_execute_request(const ClusterBackupWireRequest *request)
 
 				ack.cut_scn = cluster_backup_lmon_last_restore_point.cut_scn;
 				if (thread_index >= 0 && thread_index < CLUSTER_MAX_NODES)
-					ack.stop_cut_lsn =
-						cluster_backup_lmon_last_restore_point.cut_lsn[thread_index];
+					ack.stop_cut_lsn = cluster_backup_lmon_last_restore_point.cut_lsn[thread_index];
 			} else
 				ack.cut_scn = request->requested_scn;
 			ack.timeline = GetWALInsertionTimeLine();
@@ -1781,9 +1771,8 @@ cluster_backup_prepare_cluster_backup_stop_point(const char *name, const char *b
 	MemSet(thread_lsn, 0, sizeof(thread_lsn));
 	MemSet(&local_point, 0, sizeof(local_point));
 
-	waitres = cluster_backup_coord_request(CLUSTER_BACKUP_WIRE_OP_RESTORE_POINT_PREPARE,
-										   NULL, name, backup_set_path, false, false,
-										   InvalidScn);
+	waitres = cluster_backup_coord_request(CLUSTER_BACKUP_WIRE_OP_RESTORE_POINT_PREPARE, NULL, name,
+										   backup_set_path, false, false, InvalidScn);
 	if (!waitres.ok) {
 		(void)cluster_backup_coord_request(CLUSTER_BACKUP_WIRE_OP_ABORT, NULL, name,
 										   backup_set_path, false, false, InvalidScn);
@@ -1828,26 +1817,25 @@ cluster_backup_prepare_cluster_backup_stop_point(const char *name, const char *b
 			cluster_backup_restore_point_fence_end();
 			(void)cluster_backup_coord_request(CLUSTER_BACKUP_WIRE_OP_ABORT, NULL, name,
 											   backup_set_path, false, false, InvalidScn);
-			ereport(ERROR,
-					(errcode(ERRCODE_CLUSTER_BACKUP_INCOMPLETE),
-					 errmsg("cluster backup-stop peer %d returned invalid WAL thread id %u",
-							node_id, ack->thread_id)));
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_BACKUP_INCOMPLETE),
+							errmsg("cluster backup-stop peer %d returned invalid WAL thread id %u",
+								   node_id, ack->thread_id)));
 		}
 		thread_scn[ack->thread_id - 1] = ack->cut_scn;
 		thread_lsn[ack->thread_id - 1] = ack->stop_cut_lsn;
 	}
 	LWLockRelease(&cluster_backup_state->lock.lock);
 
-	cut_reason = cluster_restore_point_build(point, name, thread_scn, thread_lsn,
-											 CLUSTER_MAX_NODES, true, true, 1);
+	cut_reason = cluster_restore_point_build(point, name, thread_scn, thread_lsn, CLUSTER_MAX_NODES,
+											 true, true, 1);
 	if (cut_reason != CLUSTER_RESTORE_POINT_CUT_OK) {
 		cluster_backup_restore_point_fence_end();
 		(void)cluster_backup_coord_request(CLUSTER_BACKUP_WIRE_OP_ABORT, NULL, name,
 										   backup_set_path, false, false, InvalidScn);
-		ereport(ERROR, (errcode(ERRCODE_CLUSTER_BACKUP_INCOMPLETE),
-						errmsg("could not build cluster backup-stop restore point cut"),
-						errdetail("Reason: %s.",
-								  cluster_restore_point_cut_reason_name(cut_reason))));
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_BACKUP_INCOMPLETE),
+				 errmsg("could not build cluster backup-stop restore point cut"),
+				 errdetail("Reason: %s.", cluster_restore_point_cut_reason_name(cut_reason))));
 	}
 	point->created_at = GetCurrentTimestamp();
 }
@@ -1875,9 +1863,8 @@ cluster_backup_make_cluster_restore_point(const char *name, const char *backup_s
 	MemSet(thread_lsn, 0, sizeof(thread_lsn));
 	MemSet(&local_point, 0, sizeof(local_point));
 
-	waitres = cluster_backup_coord_request(CLUSTER_BACKUP_WIRE_OP_RESTORE_POINT_PREPARE,
-										   NULL, name, backup_set_path, false, false,
-										   InvalidScn);
+	waitres = cluster_backup_coord_request(CLUSTER_BACKUP_WIRE_OP_RESTORE_POINT_PREPARE, NULL, name,
+										   backup_set_path, false, false, InvalidScn);
 	if (!waitres.ok) {
 		(void)cluster_backup_coord_request(CLUSTER_BACKUP_WIRE_OP_ABORT, NULL, name,
 										   backup_set_path, false, false, InvalidScn);
@@ -1932,22 +1919,21 @@ cluster_backup_make_cluster_restore_point(const char *name, const char *backup_s
 	}
 	LWLockRelease(&cluster_backup_state->lock.lock);
 
-	cut_reason = cluster_restore_point_build(point, name, thread_scn, thread_lsn,
-											 CLUSTER_MAX_NODES, true, true, 1);
+	cut_reason = cluster_restore_point_build(point, name, thread_scn, thread_lsn, CLUSTER_MAX_NODES,
+											 true, true, 1);
 	if (cut_reason != CLUSTER_RESTORE_POINT_CUT_OK) {
 		cluster_backup_restore_point_fence_end();
 		(void)cluster_backup_coord_request(CLUSTER_BACKUP_WIRE_OP_ABORT, NULL, name,
 										   backup_set_path, false, false, InvalidScn);
-		ereport(ERROR, (errcode(ERRCODE_CLUSTER_BACKUP_INCOMPLETE),
-						errmsg("could not build cluster restore point cut"),
-						errdetail("Reason: %s.",
-								  cluster_restore_point_cut_reason_name(cut_reason))));
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_BACKUP_INCOMPLETE),
+				 errmsg("could not build cluster restore point cut"),
+				 errdetail("Reason: %s.", cluster_restore_point_cut_reason_name(cut_reason))));
 	}
 	point->created_at = GetCurrentTimestamp();
 
-	waitres = cluster_backup_coord_request(CLUSTER_BACKUP_WIRE_OP_RESTORE_POINT_RELEASE,
-										   NULL, name, backup_set_path, false, false,
-										   point->cut_scn);
+	waitres = cluster_backup_coord_request(CLUSTER_BACKUP_WIRE_OP_RESTORE_POINT_RELEASE, NULL, name,
+										   backup_set_path, false, false, point->cut_scn);
 	PG_TRY();
 	{
 		cluster_backup_restore_point_fence_end();
@@ -2019,19 +2005,18 @@ pg_cluster_backup_start(PG_FUNCTION_ARGS)
 
 	PG_TRY();
 	{
-		waitres = cluster_backup_coord_request(CLUSTER_BACKUP_WIRE_OP_START, backupidstr,
-											   NULL, backup_set_path, fast, false, InvalidScn);
+		waitres = cluster_backup_coord_request(CLUSTER_BACKUP_WIRE_OP_START, backupidstr, NULL,
+											   backup_set_path, fast, false, InvalidScn);
 		cluster_backup_coord_fail_if_bad(waitres, "pg_cluster_backup_start");
 
 		do_pg_backup_start(backupidstr, fast, NULL, cluster_backup_session_state,
 						   cluster_backup_tablespace_map);
-		cluster_backup_durable_pin_publish(cluster_backup_session_state->startpoint,
-										  backupidstr);
+		cluster_backup_durable_pin_publish(cluster_backup_session_state->startpoint, backupidstr);
 	}
 	PG_CATCH();
 	{
-		(void)cluster_backup_coord_request(CLUSTER_BACKUP_WIRE_OP_ABORT, backupidstr,
-										   NULL, backup_set_path, false, false, InvalidScn);
+		(void)cluster_backup_coord_request(CLUSTER_BACKUP_WIRE_OP_ABORT, backupidstr, NULL,
+										   backup_set_path, false, false, InvalidScn);
 		cluster_backup_durable_pin_clear();
 		cluster_backup_mark_native_stopped(NULL);
 		cluster_backup_cleanup_session_context();
@@ -2090,11 +2075,10 @@ pg_cluster_backup_stop(PG_FUNCTION_ARGS)
 		LWLockAcquire(&cluster_backup_state->lock.lock, LW_SHARED);
 		strlcpy(abort_path, cluster_backup_state->status.backup_set_path, sizeof(abort_path));
 		LWLockRelease(&cluster_backup_state->lock.lock);
-		(void)cluster_backup_coord_request(CLUSTER_BACKUP_WIRE_OP_ABORT,
-										   cluster_backup_session_state != NULL
-											   ? cluster_backup_session_state->name
-											   : NULL,
-										   NULL, abort_path, false, false, InvalidScn);
+		(void)cluster_backup_coord_request(
+			CLUSTER_BACKUP_WIRE_OP_ABORT,
+			cluster_backup_session_state != NULL ? cluster_backup_session_state->name : NULL, NULL,
+			abort_path, false, false, InvalidScn);
 		cluster_backup_abort_local_session_if_running();
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_BACKUP_INCOMPLETE),
 						errmsg("cluster backup stop requires durable WAL archive proof"),
@@ -2107,8 +2091,7 @@ pg_cluster_backup_stop(PG_FUNCTION_ARGS)
 						errhint("Did you call pg_cluster_backup_start()?")));
 
 	LWLockAcquire(&cluster_backup_state->lock.lock, LW_SHARED);
-	strlcpy(backup_set_path, cluster_backup_state->status.backup_set_path,
-			sizeof(backup_set_path));
+	strlcpy(backup_set_path, cluster_backup_state->status.backup_set_path, sizeof(backup_set_path));
 	LWLockRelease(&cluster_backup_state->lock.lock);
 
 	snprintf(restore_point_name, sizeof(restore_point_name), "cluster_backup_stop_%s",
@@ -2122,10 +2105,9 @@ pg_cluster_backup_stop(PG_FUNCTION_ARGS)
 														 &stop_point);
 		stop_fence_held = true;
 
-		waitres = cluster_backup_coord_request(CLUSTER_BACKUP_WIRE_OP_STOP,
-											   cluster_backup_session_state->name,
-											   restore_point_name, backup_set_path, false,
-											   waitforarchive, stop_point.cut_scn);
+		waitres = cluster_backup_coord_request(
+			CLUSTER_BACKUP_WIRE_OP_STOP, cluster_backup_session_state->name, restore_point_name,
+			backup_set_path, false, waitforarchive, stop_point.cut_scn);
 		cluster_backup_coord_fail_if_bad(waitres, "pg_cluster_backup_stop");
 
 		do_pg_backup_stop(cluster_backup_session_state, waitforarchive);
@@ -2171,16 +2153,15 @@ pg_cluster_backup_stop(PG_FUNCTION_ARGS)
 
 		LWLockAcquire(&cluster_backup_state->lock.lock, LW_SHARED);
 		for (node_id = 0; node_id < CLUSTER_MAX_NODES; node_id++) {
-			ClusterBackupManifestThread peer_thread =
-				cluster_backup_state->coordinator_peer_threads[node_id];
+			ClusterBackupManifestThread peer_thread
+				= cluster_backup_state->coordinator_peer_threads[node_id];
 
 			if (!peer_thread.present)
 				continue;
 			peer_thread.wal_included = true;
 			peer_thread.undo_included = true;
 			peer_thread.tt_included = true;
-			if (!cluster_backup_manifest_set_thread(&manifest,
-													(int)peer_thread.thread_id - 1,
+			if (!cluster_backup_manifest_set_thread(&manifest, (int)peer_thread.thread_id - 1,
 													&peer_thread)) {
 				LWLockRelease(&cluster_backup_state->lock.lock);
 				ereport(ERROR,
@@ -2198,8 +2179,7 @@ pg_cluster_backup_stop(PG_FUNCTION_ARGS)
 							errdetail("Reason: %s.",
 									  cluster_backup_manifest_reason_name(manifest_reason))));
 
-		backup_label = cluster_backup_build_cluster_label(cluster_backup_session_state,
-														  &manifest);
+		backup_label = cluster_backup_build_cluster_label(cluster_backup_session_state, &manifest);
 		cluster_backup_write_backup_label(backup_set_path, backup_label);
 		manifest_reason = cluster_backup_manifest_validate_artifacts(&manifest, backup_set_path);
 		if (manifest_reason != CLUSTER_BACKUP_MANIFEST_OK)
@@ -2226,12 +2206,10 @@ pg_cluster_backup_stop(PG_FUNCTION_ARGS)
 	{
 		if (stop_fence_held)
 			cluster_backup_restore_point_fence_end();
-		(void)cluster_backup_coord_request(CLUSTER_BACKUP_WIRE_OP_ABORT,
-										   cluster_backup_session_state != NULL
-											   ? cluster_backup_session_state->name
-											   : NULL,
-										   restore_point_name, backup_set_path, false, false,
-										   InvalidScn);
+		(void)cluster_backup_coord_request(
+			CLUSTER_BACKUP_WIRE_OP_ABORT,
+			cluster_backup_session_state != NULL ? cluster_backup_session_state->name : NULL,
+			restore_point_name, backup_set_path, false, false, InvalidScn);
 		if (get_backup_status() == SESSION_BACKUP_RUNNING)
 			do_pg_abort_backup(0, DatumGetBool(false));
 		cluster_backup_durable_pin_clear();

@@ -230,12 +230,10 @@ extern void cluster_backup_lmon_tick(void);
 extern void cluster_backup_pending_commit_enter(void);
 extern void cluster_backup_pending_commit_exit(void);
 extern void cluster_backup_pending_commit_abort(int code, Datum arg);
-extern void cluster_backup_durable_pin_publish(XLogRecPtr start_redo_lsn,
-											   const char *backup_id);
+extern void cluster_backup_durable_pin_publish(XLogRecPtr start_redo_lsn, const char *backup_id);
 extern void cluster_backup_durable_pin_clear(void);
 extern XLogRecPtr cluster_backup_durable_pin_lsn(void);
-extern bool cluster_backup_manifest_read_file(const char *path,
-											  ClusterBackupManifest *manifest);
+extern bool cluster_backup_manifest_read_file(const char *path, ClusterBackupManifest *manifest);
 extern ClusterBackupManifestReason
 cluster_backup_manifest_validate_artifacts(const ClusterBackupManifest *manifest,
 										   const char *backup_set_path);
