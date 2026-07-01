@@ -438,7 +438,7 @@ cluster_undo_emit_segment_reuse(uint8 instance, uint32 segment_id, uint32 old_ge
 XLogRecPtr
 cluster_undo_emit_block_write(uint8 instance, uint32 segment_id, uint32 block_no,
 							  const char *block_image, XLogRecPtr old_block_lsn, uint16 rec_off,
-							  uint16 rec_len, uint16 slot_off)
+							  uint16 rec_len, uint16 slot_off, bool allow_delta)
 {
 	xl_undo_block_write rec;
 	XLogRecPtr lsn;
@@ -464,8 +464,15 @@ cluster_undo_emit_block_write(uint8 instance, uint32 segment_id, uint32 block_no
 	 * -- a delta is safe (matching PG, which also omits full-page images then).
 	 * The caller holds DELAY_CHKPT_START across this + the block write, which
 	 * (with undo blocks in the checkpoint-flush set) closes the FPW race.
+	 *
+	 * spec-3.27 D3c: allow_delta parameterizes the decision.  Legacy callers pass
+	 * cluster_undo_buf_writeback_allowed() (write-through=false => always-FPI D2a;
+	 * write-back=true => delta D2b).  The bufmgr write path passes true always:
+	 * its dirty undo buffer is in the standard checkpoint (BufferSync) flush set,
+	 * so the same DELAY_CHKPT_START + FPI-on-first-touch interlock applies -- and
+	 * it must NOT emit a full page per record (that was the D3b 15x WAL defect).
 	 */
-	if (cluster_undo_buf_writeback_allowed()) {
+	if (allow_delta) {
 		XLogRecPtr redo;
 		XLogRecPtr stale_redo;
 		bool do_page_writes;
@@ -530,39 +537,6 @@ cluster_undo_emit_block_write(uint8 instance, uint32 segment_id, uint32 block_no
 	lsn = XLogInsert(RM_CLUSTER_UNDO_ID, XLOG_UNDO_BLOCK_WRITE);
 
 	return lsn;
-}
-
-/*
- * cluster_undo_emit_block_write_full (spec-3.27 D3b)
- *	  Always-FPI emit for the bufmgr runtime write path.  The record body is
- *	  byte-identical to cluster_undo_emit_block_write's has_fpi=1 branch (the
- *	  xl_undo_block_write header + the full BLCKSZ page), so redo applies it
- *	  through the same full-image restore -- no new redo case, no delta decision,
- *	  no DELAY_CHKPT_START.  The bufmgr caller holds the buffer content lock and
- *	  is inside a critical section spanning the page modify + this insert +
- *	  PageSetLSN + MarkBufferDirty.
- */
-XLogRecPtr
-cluster_undo_emit_block_write_full(uint8 instance, uint32 segment_id, uint32 block_no,
-								   const char *block_image)
-{
-	xl_undo_block_write rec;
-
-	Assert(instance >= 1);
-	Assert(block_no >= 1); /* block 0 is the segment header (Q2-A: never bufmgr) */
-	Assert(block_image != NULL);
-
-	memset(&rec, 0, sizeof(rec));
-	rec.segment_id = segment_id;
-	rec.block_no = block_no;
-	rec.instance = instance;
-	rec.has_fpi = 1;
-
-	XLogBeginInsert();
-	XLogRegisterData((char *)&rec, sizeof(rec));
-	XLogRegisterData(unconstify(char *, block_image), BLCKSZ);
-
-	return XLogInsert(RM_CLUSTER_UNDO_ID, XLOG_UNDO_BLOCK_WRITE);
 }
 
 /*

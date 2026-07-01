@@ -581,22 +581,8 @@ extern XLogRecPtr cluster_hw_emit_reserve(RelFileLocator rloc, ForkNumber fork, 
  */
 extern XLogRecPtr cluster_undo_emit_block_write(uint8 instance, uint32 segment_id, uint32 block_no,
 												const char *block_image, XLogRecPtr old_block_lsn,
-												uint16 rec_off, uint16 rec_len, uint16 slot_off);
-
-/*
- * cluster_undo_emit_block_write_full (spec-3.27 D3b)
- *	  Unconditional always-FPI emit of XLOG_UNDO_BLOCK_WRITE for the bufmgr
- *	  runtime write path.  Identical WAL to cluster_undo_emit_block_write's
- *	  always-FPI branch (has_fpi=1 + full BLCKSZ image), so the existing redo
- *	  apply handles it unchanged -- but it makes NO writeback/delta decision and
- *	  needs NO DELAY_CHKPT_START:  a full image is torn-write safe on its own and
- *	  the bufmgr backend's standard FlushBuffer/checkpoint interlock (PageSetLSN
- *	  + MarkBufferDirty) enforces WAL-before-data without the custom pool's
- *	  redo-point dance.  Returns the record LSN; the caller stamps it into pd_lsn
- *	  (and the block_lsn self-check mirror).
- */
-extern XLogRecPtr cluster_undo_emit_block_write_full(uint8 instance, uint32 segment_id,
-													 uint32 block_no, const char *block_image);
+												uint16 rec_off, uint16 rec_len, uint16 slot_off,
+												bool allow_delta);
 
 /*
  * cluster_undo_redo

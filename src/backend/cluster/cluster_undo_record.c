@@ -1004,7 +1004,8 @@ cluster_undo_wal_protect_block(uint32 segment_id, uint8 owner_instance, uint32 b
 	if (!cluster_undo_buf_writeback_allowed()) {
 		/* D2a: always-FPI, write-through (no checkpoint-race window). */
 		lsn = cluster_undo_emit_block_write(owner_instance, segment_id, block_no, block_buf,
-											old_block_lsn, rec_off, rec_len, slot_off);
+											old_block_lsn, rec_off, rec_len, slot_off,
+											/* allow_delta = */ false);
 		/* spec-3.27 D3a: pd_lsn is the single LSN authority; block_lsn is the
 		 * read-only self-check mirror (invariant block_lsn == PageGetLSN). */
 		blkhdr->block_lsn = lsn;
@@ -1026,7 +1027,8 @@ cluster_undo_wal_protect_block(uint32 segment_id, uint8 owner_instance, uint32 b
 	PG_TRY();
 	{
 		lsn = cluster_undo_emit_block_write(owner_instance, segment_id, block_no, block_buf,
-											old_block_lsn, rec_off, rec_len, slot_off);
+											old_block_lsn, rec_off, rec_len, slot_off,
+											/* allow_delta = */ true);
 		blkhdr->block_lsn = lsn;
 		PageSetLSN((Page)block_buf, lsn); /* spec-3.27 D3a: pd_lsn == block_lsn */
 		ok = write_undo_block(segment_id, owner_instance, block_no, block_buf,
@@ -1327,6 +1329,7 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 	bool use_defer;
 	bool use_bufmgr;				 /* spec-3.27 D3b: undo_buffer_backend = bufmgr */
 	Buffer undo_buf = InvalidBuffer; /* spec-3.27 D3b: live undo buffer (bufmgr path) */
+	XLogRecPtr bufmgr_old_lsn = InvalidXLogRecPtr; /* spec-3.27 D3c: pre-write page LSN */
 	UndoBlockHeader *blkhdr;
 	UndoRecordHeader *rechdr;
 	UndoSlotDirEntry *slot;
@@ -1554,6 +1557,11 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 		LockBuffer(undo_buf, BUFFER_LOCK_EXCLUSIVE);
 		block_buf = (char *)BufferGetPage(undo_buf);
 
+		/* spec-3.27 D3c: capture the block's pre-write page LSN for the FPI-vs-
+		 * delta decision (§2.6 D2b).  A fresh block (slot_count == 0) forces FPI
+		 * -- there is no on-disk delta base -- so record it as Invalid. */
+		bufmgr_old_lsn = (slot_count == 0) ? InvalidXLogRecPtr : PageGetLSN((Page)block_buf);
+
 		/* Anti-silent-fallback proof (rule 8.A): announce the engaged backend
 		 * once, before the critical section, at LOG so a TAP can assert it. */
 		if (!cluster_undo_bufmgr_logged) {
@@ -1564,10 +1572,10 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 
 		/*
 		 * Enter the critical section BEFORE modifying the shared page:  the page
-		 * write + always-FPI XLogInsert + PageSetLSN + MarkBufferDirty must be
-		 * atomic, so a failure PANICs (recovery replays the undo WAL) rather than
-		 * leaving a half-written shared undo buffer a reader could observe.  The
-		 * construction below performs no ereport(ERROR).
+		 * write + XLogInsert + PageSetLSN + MarkBufferDirty must be atomic, so a
+		 * failure PANICs (recovery replays the undo WAL) rather than leaving a
+		 * half-written shared undo buffer a reader could observe.  The construction
+		 * below performs no ereport(ERROR).
 		 */
 		START_CRIT_SECTION();
 		if (slot_count == 0)
@@ -1706,22 +1714,40 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 	Assert(current_block >= 1); /* data blocks only; block 0 is the segment header */
 	if (use_bufmgr) {
 		/*
-		 * spec-3.27 D3b: the record + slot + header were read-modify-written into
+		 * spec-3.27 D3c: the record + slot + header were read-modify-written into
 		 * the LIVE page above, under the EXCLUSIVE content lock inside the crit
-		 * section opened at page setup.  Emit the always-FPI WAL (data-only redo,
-		 * Q5-C keeps recovery path-based), stamp the record LSN into pd_lsn (the
-		 * SOLE flush/FPI/WAL-before-data authority, P1-2) and the block_lsn
-		 * self-check mirror, mark the buffer dirty, then close the crit section.
-		 * Durability is the standard bufmgr interlock: FlushBuffer / checkpoint
-		 * does XLogFlush(PageGetLSN) before any write-out.
+		 * section opened at page setup.  Emit the RM_CLUSTER_UNDO record with the
+		 * SAME FPI-on-first-touch-since-checkpoint + 3-range delta representation
+		 * as the legacy write-back path (allow_delta = true) -- emitting a full
+		 * page per record was the D3b 15x-WAL defect.  Q5-C keeps recovery
+		 * path-based; stamp the LSN into pd_lsn (the sole flush/FPI/WAL-before-data
+		 * authority, P1-2) + the block_lsn mirror, mark dirty, close the crit
+		 * section.
+		 *
+		 * DELAY_CHKPT_START spans the FPI-vs-delta decision + insert + PageSetLSN +
+		 * MarkBufferDirty:  it pins the redo point the decision reads so a racing
+		 * checkpoint cannot advance past bufmgr_old_lsn and flush this now-dirty
+		 * buffer (it is in the standard BufferSync flush set) before our WAL is
+		 * durable.  FlushBuffer's XLogFlush(PageGetLSN) then enforces
+		 * WAL-before-data.  Setting/restoring the flag is a plain field write
+		 * (crit-section safe) with no throwing call between set and restore.
 		 */
 		XLogRecPtr lsn;
+		int saved_delay_flags = MyProc->delayChkptFlags;
 
-		lsn = cluster_undo_emit_block_write_full(owner_instance, segment_id, current_block,
-												 block_buf);
+		Assert((saved_delay_flags & DELAY_CHKPT_START) == 0);
+		MyProc->delayChkptFlags = saved_delay_flags | DELAY_CHKPT_START;
+
+		lsn = cluster_undo_emit_block_write(owner_instance, segment_id, current_block, block_buf,
+											bufmgr_old_lsn, (uint16)free_offset,
+											(uint16)record_length,
+											(uint16)UNDO_PAYLOAD_SLOT_DIR_OFFSET(new_slot_idx),
+											/* allow_delta = */ true);
 		blkhdr->block_lsn = lsn;
 		PageSetLSN((Page)block_buf, lsn); /* pd_lsn == block_lsn invariant */
 		MarkBufferDirty(undo_buf);
+
+		MyProc->delayChkptFlags = saved_delay_flags;
 		END_CRIT_SECTION();
 		UnlockReleaseBuffer(undo_buf);
 
