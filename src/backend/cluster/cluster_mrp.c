@@ -591,6 +591,31 @@ cluster_mrp_standby_consistent_scn(void)
 	return (SCN)pg_atomic_read_u64(&cluster_mrp_state->standby_consistent_scn);
 }
 
+int64
+cluster_mrp_apply_lag_ms(void)
+{
+	uint64 receive_time_us = 0;
+	uint64 apply_time_us = 0;
+	uint16 thread_id;
+
+	if (cluster_mrp_state == NULL)
+		return 0;
+
+	for (thread_id = 0; thread_id <= CLUSTER_WAL_THREAD_MAX; thread_id++) {
+		uint64 thread_receive_time_us
+			= pg_atomic_read_u64(&cluster_mrp_state->thread_receive_time_us[thread_id]);
+		uint64 thread_apply_time_us
+			= pg_atomic_read_u64(&cluster_mrp_state->thread_apply_time_us[thread_id]);
+
+		receive_time_us = Max(receive_time_us, thread_receive_time_us);
+		apply_time_us = Max(apply_time_us, thread_apply_time_us);
+	}
+
+	if (receive_time_us <= apply_time_us)
+		return 0;
+	return (int64)((receive_time_us - apply_time_us) / 1000);
+}
+
 uint64
 cluster_mrp_apply_master_term(void)
 {
@@ -712,6 +737,9 @@ MrpMain(void)
 	pqsignal(SIGCHLD, SIG_DFL);
 	sigprocmask(SIG_SETMASK, &UnBlockSig, NULL);
 
+	cluster_voting_disk_io_install_timeout_handler();
+	cluster_voting_disk_io_set_timeout_ms(cluster_voting_disk_io_timeout_ms);
+
 	if (cluster_mrp_state == NULL)
 		ereport(FATAL,
 				(errcode(ERRCODE_INTERNAL_ERROR), errmsg("cluster_mrp shmem region not attached"),
@@ -747,6 +775,7 @@ MrpMain(void)
 		if (ConfigReloadPending) {
 			ConfigReloadPending = false;
 			ProcessConfigFile(PGC_SIGHUP);
+			cluster_voting_disk_io_set_timeout_ms(cluster_voting_disk_io_timeout_ms);
 		}
 
 		if (ShutdownRequestPending)

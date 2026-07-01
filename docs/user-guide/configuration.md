@@ -512,7 +512,7 @@ seconds, apply rate, and `standby_consistent_scn`.
 | `cluster.apply_master_max_lag_ms` | `5000` | sighup | Lag threshold surfaced by ADG status views. |
 | `cluster.max_standby_delay` | `30` | sighup | Maximum standby read delay before apply conflict handling. |
 | `cluster.apply_master_switch_drain_ms` | `5000` | sighup | Drain window during Apply Master switch. |
-| `cluster.adg_barrier_interval_ms` | `0` | sighup | Requested periodic thread-safe SCN barrier interval; `0` uses commit-driven barriers. |
+| `cluster.adg_barrier_interval_ms` | `1000` | sighup | Primary heartbeat interval for periodic thread-safe SCN barriers; `0` uses only commit-driven barriers. |
 | `cluster.wal_sender_timeout_sec` | `60` | sighup | Primary-side LNS shipping timeout. |
 | `cluster.wal_receiver_timeout_sec` | `60` | sighup | Standby-side RFS receive timeout. |
 

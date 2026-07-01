@@ -73,6 +73,7 @@ extern ClusterMrpSharedState *cluster_mrp_shared_state(void);
 extern ClusterMrpState cluster_mrp_get_state(void);
 extern const char *cluster_mrp_state_to_string(ClusterMrpState state);
 extern SCN cluster_mrp_standby_consistent_scn(void);
+extern int64 cluster_mrp_apply_lag_ms(void);
 extern bool cluster_mrp_apply_master_can_apply(void);
 extern uint64 cluster_mrp_apply_master_term(void);
 extern uint32 cluster_mrp_apply_master_node_id(void);
