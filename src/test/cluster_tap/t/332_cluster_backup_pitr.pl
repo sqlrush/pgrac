@@ -303,27 +303,28 @@ my $pair_restore_shared_parent = PostgreSQL::Test::Utils::tempdir();
 my $pair_restore_shared = "$pair_restore_shared_parent/shared_data";
 PostgreSQL::Test::RecursiveCopy::copypath("$pair_backup_set/shared_data",
 	$pair_restore_shared);
-my $pair_restore = PgracClusterNode->new('cluster_backup_pair_restore');
-PostgreSQL::Test::RecursiveCopy::copypath("$pair_backup_set/data",
-	$pair_restore->data_dir);
-chmod(0700, $pair_restore->data_dir);
-my $pair_restore_ic0 = PostgreSQL::Test::Cluster::get_free_port();
-my $pair_restore_ic1 = PostgreSQL::Test::Cluster::get_free_port();
-unlink $pair_restore->data_dir . '/pgrac.conf';
-PostgreSQL::Test::Utils::append_to_file($pair_restore->data_dir . '/pgrac.conf',
+
+sub configure_pair_restore
+{
+	my ($restore_node, $shared_dir, $target_scn) = @_;
+	my $restore_ic0 = PostgreSQL::Test::Cluster::get_free_port();
+	my $restore_ic1 = PostgreSQL::Test::Cluster::get_free_port();
+
+	unlink $restore_node->data_dir . '/pgrac.conf';
+	PostgreSQL::Test::Utils::append_to_file($restore_node->data_dir . '/pgrac.conf',
 	<<EOC);
 [cluster]
 name = cluster_backup_pair_restore
 
 [node.0]
-interconnect_addr = 127.0.0.1:$pair_restore_ic0
+interconnect_addr = 127.0.0.1:$restore_ic0
 
 [node.1]
-interconnect_addr = 127.0.0.1:$pair_restore_ic1
+interconnect_addr = 127.0.0.1:$restore_ic1
 EOC
-$pair_restore->append_conf('postgresql.conf',
-	  "port = " . $pair_restore->port . "\n"
-	. "unix_socket_directories = '" . $pair_restore->host . "'\n"
+	$restore_node->append_conf('postgresql.conf',
+	  "port = " . $restore_node->port . "\n"
+	. "unix_socket_directories = '" . $restore_node->host . "'\n"
 	. "restore_command = 'cp $pair_archive/%f %p'\n"
 	. "cluster.enabled = on\n"
 	. "cluster.node_id = 0\n"
@@ -331,12 +332,19 @@ $pair_restore->append_conf('postgresql.conf',
 	. "cluster.voting_disks = ''\n"
 	. "cluster.wal_threads_dir = ''\n"
 	. "cluster.shared_storage_backend = cluster_fs\n"
-	. "cluster.shared_data_dir = '$pair_restore_shared'\n"
+	. "cluster.shared_data_dir = '$shared_dir'\n"
 	. "cluster.smgr_user_relations = on\n"
 	. "cluster.pcm_grd_max_entries = 0\n"
-	. "cluster.recovery_target_scn = '$pair_consistent_scn'\n"
+	. "cluster.recovery_target_scn = '$target_scn'\n"
 	. "cluster.recovery_target_action = 'promote'\n");
-PostgreSQL::Test::Utils::append_to_file($pair_restore->data_dir . '/recovery.signal', '');
+	PostgreSQL::Test::Utils::append_to_file($restore_node->data_dir . '/recovery.signal', '');
+}
+
+my $pair_restore = PgracClusterNode->new('cluster_backup_pair_restore');
+PostgreSQL::Test::RecursiveCopy::copypath("$pair_backup_set/data",
+	$pair_restore->data_dir);
+chmod(0700, $pair_restore->data_dir);
+configure_pair_restore($pair_restore, $pair_restore_shared, $pair_consistent_scn);
 $pair_restore->start;
 is($pair_restore->safe_psql('postgres',
 	q{SELECT string_agg(id::text || ':' || note, ',' ORDER BY id)
@@ -347,6 +355,43 @@ like(slurp_file($pair_restore->logfile),
 	qr/redo done \(cluster backup restore\)/,
 	'L18 two-node restore drove the multi-thread restore-mode merge');
 $pair_restore->stop;
+
+ok($pair_consistent_scn > 1,
+	'L19 two-node backup consistent SCN can be decremented for PITR floor test');
+my $pair_too_early_scn = $pair_consistent_scn - 1;
+my $pair_too_early_shared_parent = PostgreSQL::Test::Utils::tempdir();
+my $pair_too_early_shared = "$pair_too_early_shared_parent/shared_data";
+PostgreSQL::Test::RecursiveCopy::copypath("$pair_backup_set/shared_data",
+	$pair_too_early_shared);
+my $pair_too_early_restore = PgracClusterNode->new('cluster_backup_pair_too_early');
+PostgreSQL::Test::RecursiveCopy::copypath("$pair_backup_set/data",
+	$pair_too_early_restore->data_dir);
+chmod(0700, $pair_too_early_restore->data_dir);
+configure_pair_restore($pair_too_early_restore, $pair_too_early_shared,
+	$pair_too_early_scn);
+is($pair_too_early_restore->start(fail_ok => 1), 0,
+	'L19 two-node PITR target before backup consistent SCN fails closed');
+like(slurp_file($pair_too_early_restore->logfile),
+	qr/cluster PITR target SCN is before the backup consistent SCN|cluster_pitr_target_unreachable/,
+	'L19 two-node PITR floor failure is reported before open');
+
+ok(rename("$pair_backup_set/thread_2", "$pair_backup_set/thread_2.missing"),
+	'L20 injection removed peer WAL thread from the backup set');
+my $pair_missing_thread_shared_parent = PostgreSQL::Test::Utils::tempdir();
+my $pair_missing_thread_shared = "$pair_missing_thread_shared_parent/shared_data";
+PostgreSQL::Test::RecursiveCopy::copypath("$pair_backup_set/shared_data",
+	$pair_missing_thread_shared);
+my $pair_missing_thread_restore = PgracClusterNode->new('cluster_backup_pair_missing_thread');
+PostgreSQL::Test::RecursiveCopy::copypath("$pair_backup_set/data",
+	$pair_missing_thread_restore->data_dir);
+chmod(0700, $pair_missing_thread_restore->data_dir);
+configure_pair_restore($pair_missing_thread_restore, $pair_missing_thread_shared,
+	$pair_consistent_scn);
+is($pair_missing_thread_restore->start(fail_ok => 1), 0,
+	'L20 two-node restore fails closed when a peer WAL thread is missing');
+like(slurp_file($pair_missing_thread_restore->logfile),
+	qr/cluster backup restore: thread 2 WAL does not reach the manifest cut|cluster_backup_incomplete/,
+	'L20 missing peer WAL thread is reported as incomplete cluster backup');
 
 my $bad_target_node = PgracClusterNode->new('cluster_backup_bad_target');
 $bad_target_node->init(allows_streaming => 1);
@@ -363,7 +408,7 @@ is($bad_target_node->safe_psql('postgres',
 	          CASE WHEN reachable THEN 't' ELSE 'f' END || ',' || reason
 	     FROM pg_cluster_pitr_status}),
 	'scn,pause,f,invalid_target',
-	'L16 invalid SCN PITR target fails closed');
+	'L21 invalid SCN PITR target fails closed');
 
 $bad_target_node->stop;
 
@@ -383,7 +428,7 @@ is($multi_target_node->safe_psql('postgres',
 	          CASE WHEN reachable THEN 't' ELSE 'f' END || ',' || reason
 	     FROM pg_cluster_pitr_status}),
 	'multiple,pause,f,multiple_targets',
-	'L17 multiple cluster PITR targets fail closed');
+	'L22 multiple cluster PITR targets fail closed');
 
 $multi_target_node->stop;
 

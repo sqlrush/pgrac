@@ -209,6 +209,8 @@ static void cluster_backup_session_exit(int code, Datum arg);
 static void cluster_backup_mark_native_stopped(const BackupState *state);
 static void cluster_backup_restore_point_fence_begin(void);
 static void cluster_backup_restore_point_fence_end(void);
+static bool cluster_backup_restore_point_pending_commits_empty(void);
+static bool cluster_backup_restore_point_fence_held(void);
 static void cluster_backup_lmon_prepare_context(void);
 static void cluster_backup_lmon_release_restore_point(SCN final_scn);
 static void cluster_backup_store_restore_point(const ClusterRestorePoint *point);
@@ -1372,6 +1374,20 @@ cluster_backup_restore_point_fence_end(void)
 	pg_atomic_write_u32(&cluster_backup_state->commit_fence_active, 0);
 }
 
+static bool
+cluster_backup_restore_point_pending_commits_empty(void)
+{
+	return cluster_backup_state != NULL
+		   && pg_atomic_read_u32(&cluster_backup_state->pending_commit_count) == 0;
+}
+
+static bool
+cluster_backup_restore_point_fence_held(void)
+{
+	return cluster_backup_state != NULL
+		   && pg_atomic_read_u32(&cluster_backup_state->commit_fence_active) != 0;
+}
+
 static ClusterBackupWireAck
 cluster_backup_lmon_execute_request(const ClusterBackupWireRequest *request)
 {
@@ -1830,6 +1846,8 @@ cluster_backup_prepare_restore_point(const char *name, ClusterRestorePoint *poin
 	uint16 thread_id;
 	int thread_index;
 	ClusterRestorePointCutReason reason;
+	bool pending_commits_empty;
+	bool commit_fence_held;
 
 	MemSet(thread_scn, 0, sizeof(thread_scn));
 	MemSet(thread_lsn, 0, sizeof(thread_lsn));
@@ -1850,8 +1868,10 @@ cluster_backup_prepare_restore_point(const char *name, ClusterRestorePoint *poin
 	thread_scn[thread_index] = cut_scn;
 	thread_lsn[thread_index] = cut_lsn;
 
+	pending_commits_empty = cluster_backup_restore_point_pending_commits_empty();
+	commit_fence_held = cluster_backup_restore_point_fence_held();
 	reason = cluster_restore_point_build(point, name, thread_scn, thread_lsn, CLUSTER_MAX_NODES,
-										 true, true, 1);
+										 pending_commits_empty, commit_fence_held, 1);
 	if (reason != CLUSTER_RESTORE_POINT_CUT_OK)
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_BACKUP_INCOMPLETE),
 						errmsg("could not build cluster restore point cut"),
@@ -1901,6 +1921,8 @@ cluster_backup_prepare_cluster_backup_stop_point(const char *name, const char *b
 	uint16 local_thread_id;
 	int local_index;
 	int node_id;
+	bool pending_commits_empty;
+	bool commit_fence_held;
 
 	if (!cluster_conf_has_peers()) {
 		cluster_backup_prepare_restore_point(name, point);
@@ -1966,8 +1988,10 @@ cluster_backup_prepare_cluster_backup_stop_point(const char *name, const char *b
 	}
 	LWLockRelease(&cluster_backup_state->lock.lock);
 
+	pending_commits_empty = cluster_backup_restore_point_pending_commits_empty();
+	commit_fence_held = cluster_backup_restore_point_fence_held();
 	cut_reason = cluster_restore_point_build(point, name, thread_scn, thread_lsn, CLUSTER_MAX_NODES,
-											 true, true, 1);
+											 pending_commits_empty, commit_fence_held, 1);
 	if (cut_reason != CLUSTER_RESTORE_POINT_CUT_OK) {
 		cluster_backup_restore_point_fence_end();
 		(void)cluster_backup_coord_request(CLUSTER_BACKUP_WIRE_OP_ABORT, NULL, name,
@@ -1992,6 +2016,8 @@ cluster_backup_make_cluster_restore_point(const char *name, const char *backup_s
 	uint16 local_thread_id;
 	int local_index;
 	int node_id;
+	bool pending_commits_empty;
+	bool commit_fence_held;
 
 	if (!cluster_conf_has_peers()) {
 		cluster_backup_make_restore_point(name, point);
@@ -2059,8 +2085,10 @@ cluster_backup_make_cluster_restore_point(const char *name, const char *backup_s
 	}
 	LWLockRelease(&cluster_backup_state->lock.lock);
 
+	pending_commits_empty = cluster_backup_restore_point_pending_commits_empty();
+	commit_fence_held = cluster_backup_restore_point_fence_held();
 	cut_reason = cluster_restore_point_build(point, name, thread_scn, thread_lsn, CLUSTER_MAX_NODES,
-											 true, true, 1);
+											 pending_commits_empty, commit_fence_held, 1);
 	if (cut_reason != CLUSTER_RESTORE_POINT_CUT_OK) {
 		cluster_backup_restore_point_fence_end();
 		(void)cluster_backup_coord_request(CLUSTER_BACKUP_WIRE_OP_ABORT, NULL, name,
