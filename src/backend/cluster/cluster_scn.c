@@ -178,7 +178,8 @@ static SCN cluster_scn_backend_pending_commit_scn = InvalidScn;
 /* WARNING throttle: at most 1/min */
 static TimestampTz last_warn_emitted_at = 0;
 
-static bool cluster_scn_pending_commit_register(SCN commit_scn);
+static bool cluster_scn_pending_commit_register_locked(SCN commit_scn);
+static bool cluster_scn_pending_commit_remove_locked(SCN commit_scn);
 
 
 /*
@@ -626,10 +627,66 @@ cluster_scn_advance_for_commit(void)
 
 	CLUSTER_INJECTION_POINT("cluster-scn-commit-pre-advance");
 
-	scn = cluster_scn_advance();
-	pg_atomic_fetch_add_u64(&cluster_scn_state->commit_advance_count, 1);
 	if (cluster_enable_adg)
-		(void)cluster_scn_pending_commit_register(scn);
+	{
+		NodeId node;
+
+		Assert(cluster_scn_state != NULL);
+
+		/*
+		 * INV-ADG8: a barrier must not be able to observe an advanced commit
+		 * SCN before the pending registry can see it.  The normal
+		 * cluster_scn_advance() hot path publishes with fetch_add first, so
+		 * ADG commit advance uses a register-before-CAS reservation loop.
+		 *
+		 * Other, non-commit SCN advances may still race through the lock-free
+		 * path.  A failed CAS removes only this backend's tentative entry and
+		 * retries with the new current value; a barrier seeing the tentative
+		 * entry before the failed CAS is conservative.
+		 */
+		node = cluster_scn_state->node_id;
+		if (!SCN_NODE_ID_VALID(node))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("cluster_scn_advance: cluster.node_id (%d) is not in the valid range 0..%d",
+							node, SCN_MAX_VALID_NODE_ID),
+					 errhint("Set cluster.node_id to a value in 0..127 before advancing SCN.  -1 is the "
+							 "unset / single-node-fallback sentinel and is not valid for SCN encoding.")));
+
+		for (;;)
+		{
+			uint64 old_local;
+			uint64 new_local;
+			uint64 expected;
+
+			old_local = pg_atomic_read_u64(&cluster_scn_state->current_local_scn);
+			new_local = old_local + 1;
+			scn = scn_encode(node, new_local);
+
+			LWLockAcquire(&cluster_scn_state->lwlock, LW_EXCLUSIVE);
+			if (pg_atomic_read_u64(&cluster_scn_state->current_local_scn) != old_local)
+			{
+				LWLockRelease(&cluster_scn_state->lwlock);
+				continue;
+			}
+
+			(void)cluster_scn_pending_commit_register_locked(scn);
+
+			expected = old_local;
+			if (pg_atomic_compare_exchange_u64(&cluster_scn_state->current_local_scn,
+											   &expected, new_local))
+			{
+				LWLockRelease(&cluster_scn_state->lwlock);
+				break;
+			}
+
+			(void)cluster_scn_pending_commit_remove_locked(scn);
+			LWLockRelease(&cluster_scn_state->lwlock);
+		}
+	}
+	else
+		scn = cluster_scn_advance();
+	pg_atomic_fetch_add_u64(&cluster_scn_state->commit_advance_count, 1);
 
 	CLUSTER_INJECTION_POINT("cluster-scn-commit-post-advance");
 
@@ -703,48 +760,41 @@ cluster_scn_recovery_replay_observe(SCN scn)
 }
 
 static bool
-cluster_scn_pending_commit_register(SCN commit_scn)
+cluster_scn_pending_commit_register_locked(SCN commit_scn)
 {
 	uint16 i;
 
 	if (cluster_scn_state == NULL || !SCN_VALID(commit_scn))
 		return false;
 
-	LWLockAcquire(&cluster_scn_state->lwlock, LW_EXCLUSIVE);
 	if (cluster_scn_state->adg_pending_overflowed) {
-		LWLockRelease(&cluster_scn_state->lwlock);
 		return false;
 	}
 	for (i = 0; i < cluster_scn_state->adg_pending_count; i++) {
 		if (scn_total_cmp(cluster_scn_state->adg_pending[i], commit_scn) == 0) {
 			cluster_scn_backend_pending_commit_scn = commit_scn;
-			LWLockRelease(&cluster_scn_state->lwlock);
 			return true;
 		}
 	}
 	if (cluster_scn_state->adg_pending_count >= CLUSTER_SCN_ADG_PENDING_MAX) {
 		cluster_scn_state->adg_pending_overflowed = true;
 		pg_atomic_fetch_add_u64(&cluster_scn_state->adg_pending_overflow_count, 1);
-		LWLockRelease(&cluster_scn_state->lwlock);
 		return false;
 	}
 	cluster_scn_state->adg_pending[cluster_scn_state->adg_pending_count++] = commit_scn;
 	cluster_scn_backend_pending_commit_scn = commit_scn;
 	pg_atomic_fetch_add_u64(&cluster_scn_state->adg_pending_register_count, 1);
-	LWLockRelease(&cluster_scn_state->lwlock);
 	return true;
 }
 
-bool
-cluster_scn_pending_commit_clear(SCN commit_scn)
+static bool
+cluster_scn_pending_commit_remove_locked(SCN commit_scn)
 {
 	uint16 i;
-	bool cleared = false;
 
 	if (cluster_scn_state == NULL || !SCN_VALID(commit_scn))
 		return false;
 
-	LWLockAcquire(&cluster_scn_state->lwlock, LW_EXCLUSIVE);
 	for (i = 0; i < cluster_scn_state->adg_pending_count; i++) {
 		if (scn_total_cmp(cluster_scn_state->adg_pending[i], commit_scn) == 0) {
 			uint16 j;
@@ -754,10 +804,24 @@ cluster_scn_pending_commit_clear(SCN commit_scn)
 			cluster_scn_state->adg_pending_count--;
 			cluster_scn_state->adg_pending[cluster_scn_state->adg_pending_count] = InvalidScn;
 			pg_atomic_fetch_add_u64(&cluster_scn_state->adg_pending_clear_count, 1);
-			cleared = true;
-			break;
+			if (scn_total_cmp(cluster_scn_backend_pending_commit_scn, commit_scn) == 0)
+				cluster_scn_backend_pending_commit_scn = InvalidScn;
+			return true;
 		}
 	}
+	return false;
+}
+
+bool
+cluster_scn_pending_commit_clear(SCN commit_scn)
+{
+	bool cleared = false;
+
+	if (cluster_scn_state == NULL || !SCN_VALID(commit_scn))
+		return false;
+
+	LWLockAcquire(&cluster_scn_state->lwlock, LW_EXCLUSIVE);
+	cleared = cluster_scn_pending_commit_remove_locked(commit_scn);
 	LWLockRelease(&cluster_scn_state->lwlock);
 
 	if (scn_total_cmp(cluster_scn_backend_pending_commit_scn, commit_scn) == 0)

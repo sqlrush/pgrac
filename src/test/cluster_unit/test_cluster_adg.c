@@ -25,6 +25,7 @@
 #include "access/rmgr.h"
 #include "cluster/cluster_adg.h"
 #include "cluster/cluster_adg_xlog.h"
+#include "cluster/cluster_mrp.h"
 
 #undef printf
 #undef fprintf
@@ -468,10 +469,22 @@ UT_TEST(test_standby_reply_trailer_validation)
 											   CLUSTER_WAL_THREAD_MAX + 1, S(2, 500), 7));
 }
 
+UT_TEST(test_mrp_shmem_tracks_term_validity_and_drain)
+{
+	UT_ASSERT_EQ((int)offsetof(ClusterMrpSharedState, apply_master_term_valid) >
+				 (int)offsetof(ClusterMrpSharedState, apply_master_node_id), 1);
+	UT_ASSERT_EQ((int)offsetof(ClusterMrpSharedState, apply_master_term_valid_until_ms) >
+				 (int)offsetof(ClusterMrpSharedState, apply_master_term), 1);
+	UT_ASSERT_EQ((int)offsetof(ClusterMrpSharedState, apply_master_lost_at_ms) >
+				 (int)offsetof(ClusterMrpSharedState, apply_master_term_valid_until_ms), 1);
+	UT_ASSERT_EQ((int)offsetof(ClusterMrpSharedState, standby_consistent_scn) >
+				 (int)offsetof(ClusterMrpSharedState, apply_lsn), 1);
+}
+
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(27);
 
 	UT_RUN(test_tracker_init_bounds);
 	UT_RUN(test_barrier_min_publishes_after_all_threads);
@@ -499,6 +512,7 @@ main(void)
 	UT_RUN(test_overlay_resolve_on_commit_prepared);
 	UT_RUN(test_thread_barrier_wal_abi);
 	UT_RUN(test_standby_reply_trailer_validation);
+	UT_RUN(test_mrp_shmem_tracks_term_validity_and_drain);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
