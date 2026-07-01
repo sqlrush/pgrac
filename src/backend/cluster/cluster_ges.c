@@ -52,8 +52,8 @@
 #include "cluster/cluster_touched_peers.h" /* spec-5.14 D2 class 1 */
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h" /* spec-5.8 D8 — cluster_ic_send_envelope (REPORT send-back) */
-#include "cluster/cluster_qvotec.h"	   /* cluster_qvotec_in_quorum */
-#include "cluster/cluster_conf.h"	   /* cluster_conf_lookup_node */
+#include "cluster/cluster_qvotec.h" /* cluster_qvotec_in_quorum */
+#include "cluster/cluster_conf.h"	/* cluster_conf_lookup_node */
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_cssd.h"		 /* spec-5.7 Direction B — peer DEAD state */
 #include "cluster/cluster_extend_gate.h" /* spec-5.7 Direction B — SOLE reclassify */
