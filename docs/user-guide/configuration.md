@@ -459,13 +459,62 @@ healthy-disk count surfaced by `pg_cluster_quorum_state.disks_ok`.
 | | |
 |---|---|
 | Type | integer (bytes; multiple of 512) |
-| Default | `65536` |
+| Default | `262144` |
 | Range | `4096` – `1048576` |
 | Context | postmaster |
 
 Size of each pre-allocated voting-disk file.  Each cluster instance
-owns one 512-byte slot at offset `node_id × 512`; the default holds
-slots for 128 instances.
+owns four 512-byte slots: voting, clean-leave marker, join-commit marker,
+and ADG apply-master lease.  The default holds all four regions for 128
+instances.
+
+## ADG Physical Standby
+
+The ADG standby path is opt-in.  Existing primary deployments keep their
+current behavior with the defaults: `cluster.dg_role = primary` and
+`cluster.enable_adg = off`.
+
+To start ADG standby apply, configure the standby instance with
+`cluster.dg_role = standby` and `cluster.enable_adg = on`.  With the
+default `cluster.apply_master_election = on`, `cluster.voting_disks`
+must name a reachable voting-disk majority because the MRP validates its
+Apply Master term lease in the ADG lease region before replay is allowed.
+For a single-node test standby only, set `cluster.apply_master_election =
+off` to bypass durable election and force the local node to act as Apply
+Master.
+
+The standby starts an MRP auxiliary process during recovery states so WAL
+replay is gated before read-only service opens.  If the Apply Master
+lease cannot be validated, replay waits fail-closed and
+`standby_consistent_scn` is cleared.  ADG thread-barrier WAL records
+advance the read-consistent SCN only after every active WAL thread has
+published a safe SCN.
+
+On the primary, `cluster.dg_mode` controls LNS commit acknowledgement.
+`async` does not add an ADG wait.  `sync` waits until at least one ADG
+standby has flushed the commit WAL.  `max_availability` waits while an
+ADG standby is connected, but releases commits when no ADG standby is
+connected so the primary remains available.
+
+`pg_stat_cluster_adg` and `pg_stat_gcluster_adg` expose the current MRP
+state, Apply Master owner/term, receive/apply LSNs, lag bytes, lag
+seconds, apply rate, and `standby_consistent_scn`.
+
+### ADG GUC Summary
+
+| GUC | Default | Context | Purpose |
+|---|---|---|---|
+| `cluster.dg_role` | `primary` | postmaster | Selects primary or ADG standby behavior. |
+| `cluster.dg_mode` | `async` | sighup | Shipping acknowledgement mode: `async`, `sync`, or `max_availability`. |
+| `cluster.enable_adg` | `off` | postmaster | Starts ADG MRP/read-only standby paths when role is `standby`. |
+| `cluster.apply_master_election` | `on` | sighup | Uses the durable voting-disk Apply Master lease. |
+| `cluster.adg_lag_threshold_sec` | `10` | sighup | Read-only service lag threshold. |
+| `cluster.apply_master_max_lag_ms` | `5000` | sighup | Lag threshold surfaced by ADG status views. |
+| `cluster.max_standby_delay` | `30` | sighup | Maximum standby read delay before apply conflict handling. |
+| `cluster.apply_master_switch_drain_ms` | `5000` | sighup | Drain window during Apply Master switch. |
+| `cluster.adg_barrier_interval_ms` | `1000` | sighup | Primary heartbeat interval for periodic thread-safe SCN barriers; `0` uses only commit-driven barriers. |
+| `cluster.wal_sender_timeout_sec` | `60` | sighup | Primary-side LNS shipping timeout. |
+| `cluster.wal_receiver_timeout_sec` | `60` | sighup | Standby-side RFS receive timeout. |
 
 ### `cluster.self_fence_enabled`
 

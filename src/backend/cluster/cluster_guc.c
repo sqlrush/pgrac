@@ -81,6 +81,18 @@ int cluster_recovery_workers_max = 4;
 /* spec-4.5 D9: merged k-way recovery (default OFF, Q8) + wait timeout. */
 bool cluster_merged_recovery = false;
 int cluster_recovery_merge_wait_timeout = 10000;
+/* spec-6.4: ADG physical standby / read-only service knobs. */
+int cluster_dg_role = CLUSTER_DG_ROLE_PRIMARY;
+int cluster_dg_mode = CLUSTER_DG_MODE_ASYNC;
+bool cluster_enable_adg = false;
+bool cluster_apply_master_election = true;
+int cluster_adg_lag_threshold_sec = 10;
+int cluster_apply_master_max_lag_ms = 5000;
+int cluster_max_standby_delay = 30;
+int cluster_apply_master_switch_drain_ms = 5000;
+int cluster_adg_barrier_interval_ms = 1000;
+int cluster_wal_sender_timeout_sec = 60;
+int cluster_wal_receiver_timeout_sec = 60;
 /* spec-6.5: cluster-aware backup / restore / PITR target knobs. */
 char *cluster_recovery_target_scn = NULL;
 char *cluster_recovery_target_cluster_time = NULL;
@@ -308,7 +320,7 @@ int cluster_cssd_dead_deadband_factor = 3;
 char *cluster_voting_disks = NULL; /* CSV path list, default empty */
 int cluster_quorum_poll_interval_ms = 2000;
 int cluster_voting_disk_io_timeout_ms = 5000;
-int cluster_voting_disk_size_bytes = 196608; /* spec-5.15: 3 regions × 128 × 512 */
+int cluster_voting_disk_size_bytes = 262144; /* spec-6.4: 4 regions × 128 × 512 */
 
 /* spec-5.15 D7 — online declared-node join.  Default off (capability opt-in;
  * fail-closed-safe via INV-J8 — a DEAD node is never auto-readmitted when off).
@@ -831,6 +843,17 @@ static const struct config_enum_entry cluster_shared_storage_backend_options[]
 		{ "multi_attach", CLUSTER_SHARED_FS_BACKEND_MULTI_ATTACH, false },
 		{ NULL, 0, false } };
 
+static const struct config_enum_entry cluster_dg_role_options[]
+	= { { "primary", CLUSTER_DG_ROLE_PRIMARY, false },
+		{ "standby", CLUSTER_DG_ROLE_STANDBY, false },
+		{ NULL, 0, false } };
+
+static const struct config_enum_entry cluster_dg_mode_options[]
+	= { { "async", CLUSTER_DG_MODE_ASYNC, false },
+		{ "sync", CLUSTER_DG_MODE_SYNC, false },
+		{ "max_availability", CLUSTER_DG_MODE_MAX_AVAILABILITY, false },
+		{ NULL, 0, false } };
+
 static const struct config_enum_entry cluster_recovery_target_action_options[]
 	= { { "pause", CLUSTER_RECOVERY_TARGET_ACTION_PAUSE, false },
 		{ "promote", CLUSTER_RECOVERY_TARGET_ACTION_PROMOTE, false },
@@ -1143,6 +1166,84 @@ cluster_init_guc(void)
 		"cluster.merged_recovery", gettext_noop("Enable cold-crash k-way SCN merged recovery."),
 		gettext_noop("Off keeps single-stream recovery (this node's own thread only)."),
 		&cluster_merged_recovery, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	/*
+	 * spec-6.4 ADG role and read-only service knobs.  Defaults keep existing
+	 * primary behavior byte-identical: ADG is off and no standby apply process
+	 * starts unless role=standby and enable_adg=on at postmaster start.
+	 */
+	DefineCustomEnumVariable(
+		"cluster.dg_role", gettext_noop("Cluster Data Guard role for this instance."),
+		gettext_noop("primary is the normal writer role; standby enables ADG standby "
+					 "startup paths when cluster.enable_adg is on."),
+		&cluster_dg_role, CLUSTER_DG_ROLE_PRIMARY, cluster_dg_role_options, PGC_POSTMASTER, 0, NULL,
+		NULL, NULL);
+
+	DefineCustomEnumVariable(
+		"cluster.dg_mode", gettext_noop("Cluster Data Guard shipping acknowledgement mode."),
+		gettext_noop("async does not wait for standby acknowledgement; sync waits for at "
+					 "least one standby; max_availability may degrade to async when no "
+					 "standby is reachable."),
+		&cluster_dg_mode, CLUSTER_DG_MODE_ASYNC, cluster_dg_mode_options, PGC_SIGHUP, 0, NULL, NULL,
+		NULL);
+
+	DefineCustomBoolVariable(
+		"cluster.enable_adg", gettext_noop("Enable ADG standby apply and read-only service."),
+		gettext_noop("Only a standby role with this setting on starts the ADG MRP path."),
+		&cluster_enable_adg, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"cluster.apply_master_election",
+		gettext_noop("Enable automatic ADG Apply Master election."),
+		gettext_noop("When on, the standby cluster elects one Apply Master using a voting-disk "
+					 "majority and the durable apply-master term lease."),
+		&cluster_apply_master_election, true, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.adg_lag_threshold_sec",
+		gettext_noop("ADG apply lag threshold for read-only service errors."),
+		gettext_noop("Standby reads fail with cluster_adg_apply_lag_excessive when the "
+					 "tracked lag exceeds this threshold."),
+		&cluster_adg_lag_threshold_sec, 10, 1, 300, PGC_SIGHUP, GUC_UNIT_S, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("cluster.apply_master_max_lag_ms",
+							gettext_noop("ADG Apply Master lag warning threshold."),
+							gettext_noop("Lag above this value is surfaced by ADG status views."),
+							&cluster_apply_master_max_lag_ms, 5000, 0, 3600000, PGC_SIGHUP,
+							GUC_UNIT_MS, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.max_standby_delay",
+		gettext_noop("Maximum delay before ADG read-only queries yield to apply."),
+		gettext_noop("-1 disables the delay limit; otherwise long standby reads that block "
+					 "apply are cancelled after this many seconds."),
+		&cluster_max_standby_delay, 30, -1, 86400, PGC_SIGHUP, GUC_UNIT_S, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.apply_master_switch_drain_ms",
+		gettext_noop("ADG Apply Master switch drain window."),
+		gettext_noop("In-flight standby reads are given this drain window during Apply "
+					 "Master failover before stricter conflict handling applies."),
+		&cluster_apply_master_switch_drain_ms, 5000, 0, 600000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
+		NULL);
+
+	DefineCustomIntVariable(
+		"cluster.adg_barrier_interval_ms", gettext_noop("ADG consistency barrier interval."),
+		gettext_noop("Primary walwriter emits periodic thread-safe SCN barriers at this "
+					 "interval while ADG is enabled; 0 disables the heartbeat and leaves "
+					 "only commit-driven barriers."),
+		&cluster_adg_barrier_interval_ms, 1000, 0, 300000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
+		NULL);
+
+	DefineCustomIntVariable(
+		"cluster.wal_sender_timeout_sec", gettext_noop("ADG LNS WAL sender timeout."),
+		gettext_noop("Primary-side per-thread ADG shipping times out after this many seconds."),
+		&cluster_wal_sender_timeout_sec, 60, 1, 3600, PGC_SIGHUP, GUC_UNIT_S, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.wal_receiver_timeout_sec", gettext_noop("ADG RFS WAL receiver timeout."),
+		gettext_noop("Standby-side per-thread ADG receive waits time out after this many seconds."),
+		&cluster_wal_receiver_timeout_sec, 60, 1, 3600, PGC_SIGHUP, GUC_UNIT_S, NULL, NULL, NULL);
 
 	/*
 	 * cluster.clean_leave_enabled -- opt-in cooperative clean-leave
@@ -2349,25 +2450,29 @@ cluster_init_guc(void)
 
 	/*
 	 * cluster.voting_disk_size_bytes (spec-2.6 D12; spec-5.13 doubled;
-	 * spec-5.15 tripled).  Voting disk file size — pre-allocated on first
-	 * boot.  Three 512-byte regions per instance: region 1 = the voting slot
+	 * spec-5.15 tripled; spec-6.4 quadrupled).  Voting disk file size —
+	 * pre-allocated on first boot.  Four 512-byte regions per instance:
+	 * region 1 = the voting slot
 	 * at offset (node_id × 512); region 2 = the clean-leave marker at offset
 	 * ((CLUSTER_MAX_NODES + node_id) × 512); region 3 = the join-commit marker
-	 * at offset ((2 × CLUSTER_MAX_NODES + node_id) × 512).  Default 196608
-	 * bytes = 3 × 128 × 512.  Range [4096, 1048576].
+	 * at offset ((2 × CLUSTER_MAX_NODES + node_id) × 512); region 4 = the ADG
+	 * apply-master lease marker at offset ((3 × CLUSTER_MAX_NODES + node_id)
+	 * × 512).  Default 262144 bytes = 4 × 128 × 512.  Range [4096, 1048576].
 	 */
-	DefineCustomIntVariable("cluster.voting_disk_size_bytes",
-							gettext_noop("Voting disk file size in bytes."),
-							gettext_noop("Pre-allocated voting disk size (spec-2.6 D12; spec-5.13 "
-										 "doubled for the clean-leave marker region; spec-5.15 "
-										 "tripled for the join-commit marker region).  Each "
-										 "instance owns a 512-byte voting slot at offset "
-										 "(node_id × 512), a 512-byte leave-marker slot at "
-										 "((128 + node_id) × 512), and a 512-byte join-marker slot "
-										 "at ((256 + node_id) × 512).  Default 196608 = 3 × 128 "
-										 "slots.  Range [4096, 1048576] bytes; multiple of 512."),
-							&cluster_voting_disk_size_bytes, 196608, 4096, 1048576, PGC_POSTMASTER,
-							GUC_UNIT_BYTE, NULL, NULL, NULL);
+	DefineCustomIntVariable(
+		"cluster.voting_disk_size_bytes", gettext_noop("Voting disk file size in bytes."),
+		gettext_noop("Pre-allocated voting disk size (spec-2.6 D12; spec-5.13 "
+					 "doubled for the clean-leave marker region; spec-5.15 "
+					 "tripled for the join-commit marker region; spec-6.4 "
+					 "quadrupled for the ADG apply-master lease region).  Each "
+					 "instance owns a 512-byte voting slot at offset "
+					 "(node_id × 512), a 512-byte leave-marker slot at "
+					 "((128 + node_id) × 512), and a 512-byte join-marker slot "
+					 "at ((256 + node_id) × 512), and a 512-byte ADG lease slot "
+					 "at ((384 + node_id) × 512).  Default 262144 = 4 × 128 "
+					 "slots.  Range [4096, 1048576] bytes; multiple of 512."),
+		&cluster_voting_disk_size_bytes, 262144, 4096, 1048576, PGC_POSTMASTER, GUC_UNIT_BYTE, NULL,
+		NULL, NULL);
 
 	/* spec-5.15 D7 — online declared-node join (Q7/Q8). */
 	DefineCustomBoolVariable("cluster.online_join",

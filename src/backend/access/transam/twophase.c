@@ -144,6 +144,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: spec-1.16 commit/abort SCN hooks for 2PC durable decisions. */
+#include "cluster/cluster_adg_xlog.h" /* PGRAC: spec-6.4 ADG thread barrier */
 #include "cluster/cluster_scn.h"
 /* PGRAC: spec-2.39 D1 — COMMIT PREPARED cluster sinval propagation. */
 #include "cluster/cluster_guc.h"
@@ -1530,7 +1531,10 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 	 */
 #ifdef USE_PGRAC_CLUSTER
 	if (isCommit)
+	{
 		final_scn = cluster_scn_advance_for_commit();
+		(void)cluster_adg_emit_thread_barrier();
+	}
 	else
 		final_scn = cluster_scn_advance_for_abort();
 
@@ -2365,7 +2369,6 @@ RecordTransactionCommitPrepared(TransactionId xid, int nchildren, TransactionId 
 								 commit_scn,	/* PGRAC: spec-1.18 */
 								 NULL);			/* PGRAC: spec-3.18 D4.1: 2PC keeps standalone 0x30 */
 
-
 	if (replorigin)
 		/* Move LSNs forward for this replication origin */
 		replorigin_session_advance(replorigin_session_origin_lsn, XactLastRecEnd);
@@ -2400,6 +2403,12 @@ RecordTransactionCommitPrepared(TransactionId xid, int nchildren, TransactionId 
 	MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 
 	END_CRIT_SECTION();
+
+#ifdef USE_PGRAC_CLUSTER
+	(void)cluster_scn_pending_commit_clear(commit_scn);
+	if (SCN_VALID(commit_scn))
+		(void)cluster_adg_emit_thread_barrier();
+#endif
 
 	/*
 	 * Wait for synchronous replication, if required.

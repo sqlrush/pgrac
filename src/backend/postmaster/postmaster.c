@@ -187,6 +187,7 @@
 #include "cluster/cluster_fence.h" /* cluster_fence_postmaster_check (spec-2.28 D6) */
 #include "cluster/cluster_guc.h"   /* cluster_enabled (spec-1.11 Sprint B) */
 #include "cluster/cluster_lmd.h"   /* cluster_lmd_mark_child_exit (spec-2.19 D12 hardening) */
+#include "cluster/cluster_mrp.h"   /* cluster_mrp_should_start (spec-6.4 D1) */
 #include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_wal_state.h" /* PGRAC: spec-4.2 publish_stopped on clean shutdown */
 #endif
@@ -341,6 +342,8 @@ static pid_t QvotecPID = 0;
 static pid_t LmsPID = 0;
 /* PGRAC (spec-2.19 Sprint A Step 1): LMD aux process pid;same pattern. */
 static pid_t LmdPID = 0;
+/* PGRAC (spec-6.4 D1): ADG Managed Recovery Process pid;same pattern. */
+static pid_t MrpPID = 0;
 /* PGRAC (spec-2.38 D4): SI Broadcaster aux process pid;same pattern. */
 static pid_t SinvalBcastPID = 0;
 /*
@@ -665,6 +668,7 @@ static void ShmemBackendArrayRemove(Backend *bn);
 #define StartQvotec() StartChildProcess(QvotecProcess)
 #define StartLms() StartChildProcess(LmsProcess)
 #define StartLmd() StartChildProcess(LmdProcess)
+#define StartMrp() StartChildProcess(MrpProcess)
 /* PGRAC (spec-2.38 D4): SI Broadcaster aux process. */
 #define StartSinvalBcast() StartChildProcess(SinvalBcastProcess)
 #endif
@@ -2001,6 +2005,17 @@ ServerLoop(void)
 			LmdPID = StartLmd();
 
 		/*
+		 * PGRAC: spec-6.4 D1 — MRP is reserved for ADG physical standby
+		 * apply.  It starts during recovery states, not only PM_RUN, because
+		 * the startup process gates WAL replay on the Apply Master lease.
+		 * Primary nodes and ADG-disabled standbys keep existing behavior.
+		 */
+		if (cluster_mrp_should_start() && MrpPID == 0
+			&& (pmState == PM_STARTUP || pmState == PM_RECOVERY
+				|| pmState == PM_HOT_STANDBY || pmState == PM_RUN))
+			MrpPID = StartMrp();
+
+		/*
 		 * PGRAC: spec-2.38 D4 — SI Broadcaster aux process spawn.
 		 * LMON owns outbound fanout because tier1 TCP fds are LMON
 		 * process-local; SinvalBcast owns inbound apply + reset.
@@ -2900,6 +2915,8 @@ process_pm_reload_request(void)
 			signal_child(LmsPID, SIGHUP);
 		if (LmdPID != 0) /* PGRAC spec-2.19 Sprint A Step 1 */
 			signal_child(LmdPID, SIGHUP);
+		if (MrpPID != 0) /* PGRAC spec-6.4 D1 */
+			signal_child(MrpPID, SIGHUP);
 		if (SinvalBcastPID != 0) /* PGRAC spec-2.38 SI Broadcaster */
 			signal_child(SinvalBcastPID, SIGHUP);
 #endif
@@ -3447,6 +3464,14 @@ process_pm_child_exit(void)
 				HandleChildCrash(pid, exitstatus, _("LMD process"));
 			continue;
 		}
+		/* PGRAC (spec-6.4 D1): MRP reaper. */
+		if (pid == MrpPID) {
+			cluster_mrp_mark_child_exit();
+			MrpPID = 0;
+			if (!EXIT_STATUS_0(exitstatus))
+				HandleChildCrash(pid, exitstatus, _("MRP process"));
+			continue;
+		}
 		/* PGRAC (spec-2.38 D4): SI Broadcaster reaper. */
 		if (pid == SinvalBcastPID) {
 			SinvalBcastPID = 0;
@@ -3884,6 +3909,12 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 	else if (LmdPID != 0 && take_action)
 		sigquit_child(LmdPID);
 
+	/* PGRAC (spec-6.4 D1): MRP crash handling. */
+	if (pid == MrpPID)
+		MrpPID = 0;
+	else if (MrpPID != 0 && take_action)
+		sigquit_child(MrpPID);
+
 	/* PGRAC (spec-2.38 D4): SI Broadcaster crash handling. */
 	if (pid == SinvalBcastPID)
 		SinvalBcastPID = 0;
@@ -4049,6 +4080,9 @@ PostmasterStateMachine(void)
 		/* spec-2.38 LIFO: SinvalBcast first (last-spawned). */
 		if (SinvalBcastPID != 0)
 			signal_child(SinvalBcastPID, SIGTERM);
+		/* spec-6.4 LIFO: MRP is newer than LMD/LMS and stops before lock actors. */
+		if (MrpPID != 0)
+			signal_child(MrpPID, SIGTERM);
 		/* spec-2.19 Q10 LIFO: LMD next. */
 		if (LmdPID != 0)
 			signal_child(LmdPID, SIGTERM);
@@ -4143,6 +4177,8 @@ PostmasterStateMachine(void)
 			LmsPID == 0 &&
 			/* PGRAC: spec-2.19 Sprint A — same wait for LMD. */
 			LmdPID == 0 &&
+			/* PGRAC: spec-6.4 D1 — same wait for MRP. */
+			MrpPID == 0 &&
 			/* PGRAC: spec-2.38 Sprint A — same wait for SI Broadcaster. */
 			SinvalBcastPID == 0 &&
 #endif
@@ -4511,6 +4547,8 @@ TerminateChildren(int signal)
 		signal_child(LmsPID, signal);
 	if (LmdPID != 0) /* PGRAC spec-2.19 Sprint A Step 1 */
 		signal_child(LmdPID, signal);
+	if (MrpPID != 0) /* PGRAC spec-6.4 D1 */
+		signal_child(MrpPID, signal);
 	if (SinvalBcastPID != 0) /* PGRAC spec-2.38 SI Broadcaster */
 		signal_child(SinvalBcastPID, signal);
 #endif
@@ -5721,6 +5759,11 @@ StartChildProcess(AuxProcType type)
 		case WalReceiverProcess:
 			ereport(LOG, (errmsg("could not fork WAL receiver process: %m")));
 			break;
+#ifdef USE_PGRAC_CLUSTER
+		case MrpProcess:
+			ereport(LOG, (errmsg("could not fork MRP process: %m")));
+			break;
+#endif
 		default:
 			ereport(LOG, (errmsg("could not fork process: %m")));
 			break;
@@ -6007,10 +6050,29 @@ cluster_postmaster_start_lms(void)
 pid_t
 cluster_postmaster_start_lmd(void)
 {
-	Assert(!IsUnderPostmaster);
+	if (IsUnderPostmaster)
+		return 0;
 
 	LmdPID = StartLmd();
 	return LmdPID;
+}
+
+/*
+ * cluster_postmaster_start_mrp -- spawn the ADG MRP aux process.
+ *
+ *	MRP is gated by cluster_mrp_should_start(), so primary clusters and
+ *	standby clusters with ADG disabled keep the process absent.
+ */
+pid_t
+cluster_postmaster_start_mrp(void)
+{
+	if (IsUnderPostmaster)
+		return 0;
+	if (!cluster_mrp_should_start())
+		return 0;
+
+	MrpPID = StartMrp();
+	return MrpPID;
 }
 #endif
 

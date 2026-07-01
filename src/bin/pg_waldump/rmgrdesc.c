@@ -43,6 +43,7 @@
 #include "access/xact.h"
 #include "access/xlog_internal.h"
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_adg_xlog.h"			/* spec-6.4 ADG barrier */
 #include "cluster/storage/cluster_undo_xlog.h" /* spec-1.22 D14a */
 #include "cluster/storage/cluster_raw_xlog.h"  /* spec-6.0a raw layout */
 #endif

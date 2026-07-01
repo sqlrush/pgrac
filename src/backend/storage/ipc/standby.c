@@ -37,6 +37,11 @@
 #include "utils/timeout.h"
 #include "utils/timestamp.h"
 
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_mrp.h"
+#endif
+
 /* User-settable GUC parameters */
 int			max_standby_archive_delay = 30 * 1000;
 int			max_standby_streaming_delay = 30 * 1000;
@@ -208,6 +213,14 @@ GetStandbyLimitTime(void)
 	 * delay variable.  Delay of -1 means wait forever.
 	 */
 	GetXLogReceiptTime(&rtime, &fromStream);
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_mrp_should_start())
+	{
+		if (cluster_max_standby_delay < 0)
+			return 0;			/* wait forever */
+		return TimestampTzPlusMilliseconds(rtime, cluster_max_standby_delay * 1000);
+	}
+#endif
 	if (fromStream)
 	{
 		if (max_standby_streaming_delay < 0)

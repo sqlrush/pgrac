@@ -81,6 +81,10 @@
 #include "utils/resowner.h"
 #include "utils/timestamp.h"
 
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_rfs.h"
+#endif
+
 
 /*
  * GUC variables.  (Other variables that affect walreceiver are in xlog.c
@@ -133,6 +137,10 @@ static TimestampTz wakeup[NUM_WALRCV_WAKEUPS];
 
 static StringInfoData reply_message;
 static StringInfoData incoming_message;
+
+#ifdef USE_PGRAC_CLUSTER
+static uint16 walrcv_adg_last_thread_id = XLP_THREAD_ID_LEGACY;
+#endif
 
 /* Prototypes for private functions */
 static void WalRcvFetchTimeLineHistoryFiles(TimeLineID first, TimeLineID last);
@@ -957,6 +965,10 @@ XLogWalRcvWrite(char *buf, Size nbytes, XLogRecPtr recptr, TimeLineID tli)
 		}
 
 		/* Update state for write */
+#ifdef USE_PGRAC_CLUSTER
+		cluster_rfs_observe_received_chunk(buf, (Size)byteswritten, recptr,
+										   &walrcv_adg_last_thread_id);
+#endif
 		recptr += byteswritten;
 
 		nbytes -= byteswritten;
@@ -1139,6 +1151,10 @@ XLogWalRcvSendReply(bool force, bool requestReply)
 	pq_sendint64(&reply_message, applyPtr);
 	pq_sendint64(&reply_message, GetCurrentTimestamp());
 	pq_sendbyte(&reply_message, requestReply ? 1 : 0);
+
+#ifdef USE_PGRAC_CLUSTER
+	cluster_rfs_append_reply_trailer(&reply_message, walrcv_adg_last_thread_id);
+#endif
 
 	/* Send it */
 	elog(DEBUG2, "sending write %X/%X flush %X/%X apply %X/%X%s",

@@ -11,10 +11,45 @@ operator-facing.
 | `pg_cluster_nodes` | Cluster topology (the parsed `pgrac.conf`) |
 | `pg_stat_cluster_wait_events` | Cluster-specific wait events on the local node |
 | `pg_stat_gcluster_wait_events` | Cluster wait events globally (cross-node placeholder) |
+| `pg_stat_cluster_adg` | Local ADG standby apply/read-only service state |
+| `pg_stat_gcluster_adg` | Cluster ADG standby state with the same row contract as the local view |
 | `pg_stat_cluster_backup` | Current cluster backup state on the local node |
 | `pg_cluster_backup_history` | Latest cluster backup manifest summary |
 | `pg_cluster_restore_points` | Cluster restore points visible to PITR status |
 | `pg_cluster_pitr_status` | Cluster PITR target reachability status |
+
+## ADG Standby Views
+
+The ADG views expose the managed recovery process, Apply Master lease,
+and standby read-consistency watermarks for spec-6.4.  With the default
+primary/ADG-off configuration they still return one local row with
+`mrp_status = 'disabled'`.
+
+### `pg_stat_cluster_adg`
+
+One row describing this node's ADG role and standby apply state.
+
+| Column | Type | Description |
+|---|---|---|
+| `node_id` | `int4` | Local `cluster.node_id` value. |
+| `dg_role` | `text` | `primary`, `standby`, or `unknown`. |
+| `dg_mode` | `text` | `async`, `sync`, `max_availability`, or `unknown`. |
+| `adg_enabled` | `bool` | Current `cluster.enable_adg` value. |
+| `apply_master_node_id` | `int4` | Node that owns the Apply Master lease, or `-1`. |
+| `apply_master_term` | `int8` | Durable Apply Master term. |
+| `mrp_status` | `text` | MRP lifecycle state such as `disabled`, `ready`, or `stopped`. |
+| `receive_lsn` | `pg_lsn` | Latest received ADG WAL LSN, NULL while disabled. |
+| `apply_lsn` | `pg_lsn` | Latest applied ADG WAL LSN, NULL while disabled. |
+| `standby_consistent_scn` | `int8` | Read-consistent standby SCN floor; zero means unavailable. |
+| `lag_bytes` | `int8` | `receive_lsn - apply_lsn`, floored at zero. |
+| `lag_seconds` | `float8` | Receive/apply timestamp gap across ADG WAL threads, floored at zero. |
+| `apply_rate_bytes_per_sec` | `float8` | Apply catch-up rate derived from `lag_bytes / lag_seconds`, or zero when no lag is measurable. |
+
+### `pg_stat_gcluster_adg`
+
+Same row shape as `pg_stat_cluster_adg`.  The current implementation
+emits the local node's ADG state and preserves the global-view column
+contract used by cluster diagnostics.
 
 ## Cluster Backup / PITR Views
 

@@ -64,21 +64,20 @@
  *	any deadline, so a hung disk could pin qvotec indefinitely.  This
  *	round wires the GUC to a real per-syscall guard:
  *
- *	  1. qvotec startup calls cluster_voting_disk_io_install_timeout_
- *	     handler() once.  That replaces SIG_IGN with our async-signal-
- *	     safe handler that flips a sig_atomic_t flag.
- *	  2. cluster_voting_disk_io_set_timeout_ms(...) is called by qvotec
- *	     each cycle (or on SIGHUP) to seed the deadline used by every
- *	     subsequent read_slot / write_slot call.
+ *	  1. qvotec and ADG MRP startup call cluster_voting_disk_io_install_
+ *	     timeout_handler() once.  That replaces SIG_IGN with our async-
+ *	     signal-safe handler that flips a sig_atomic_t flag.
+ *	  2. cluster_voting_disk_io_set_timeout_ms(...) is called by those aux
+ *	     processes at startup (and on SIGHUP for long-lived loops) to seed
+ *	     the deadline used by every subsequent read_slot / write_slot call.
  *	  3. read_slot / write_slot wrap their syscalls in arm_timeout()
  *	     / disarm_timeout() so SIGALRM fires after the configured
  *	     deadline if the syscall hasn't returned.  EINTR + flag-set ⇒
  *	     return CLUSTER_VOTING_DISK_IO_FAILED.
  *
- *	Only qvotec installs the handler;backends + other aux processes
- *	use SIGALRM for statement_timeout / per-statement deadlines, so
- *	installing this handler in their context would clobber PG's
- *	machinery.  cluster_qvotec.c is the sole production caller.
+ *	Only qvotec/MRP install the handler;backends use SIGALRM for
+ *	statement_timeout / per-statement deadlines, so installing this handler
+ *	in their context would clobber PG's machinery.
  *
  *	timeout_ms == 0 disarms the timer (format / fsck tools want
  *	unbounded I/O).
@@ -523,6 +522,63 @@ cluster_voting_disk_write_join_slot(int fd, uint32 node_id, const void *in_slot5
 	voting_disk_io_arm_timeout();
 	nwritten
 		= pwrite(fd, aligned, CLUSTER_VOTING_SLOT_BYTES, CLUSTER_VOTING_JOIN_SLOT_OFFSET(node_id));
+	if (nwritten != CLUSTER_VOTING_SLOT_BYTES) {
+		voting_disk_io_disarm_timeout();
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+	}
+	if (fdatasync(fd) != 0) {
+		voting_disk_io_disarm_timeout();
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+	}
+	voting_disk_io_disarm_timeout();
+	return CLUSTER_VOTING_DISK_IO_OK;
+}
+
+/* ============================================================
+ * spec-6.4 D7 — raw 512-byte apply-master lease slot R/W (region 4).
+ * Mirrors the leave/join payload-agnostic slot paths.
+ * ============================================================ */
+
+ClusterVotingDiskIoState
+cluster_voting_disk_read_apply_lease_slot(int fd, uint32 node_id, void *out_slot512)
+{
+	char aligned[CLUSTER_VOTING_SLOT_BYTES] __attribute__((aligned(512)));
+	ssize_t nread;
+
+	if (fd < 0)
+		return CLUSTER_VOTING_DISK_IO_NOT_TRIED;
+	if (out_slot512 == NULL || node_id >= CLUSTER_MAX_NODES)
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+
+	memset(aligned, 0, sizeof(aligned));
+
+	voting_disk_io_arm_timeout();
+	nread = pread(fd, aligned, CLUSTER_VOTING_SLOT_BYTES,
+				  CLUSTER_VOTING_APPLY_LEASE_SLOT_OFFSET(node_id));
+	voting_disk_io_disarm_timeout();
+	if (nread != CLUSTER_VOTING_SLOT_BYTES)
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+
+	memcpy(out_slot512, aligned, CLUSTER_VOTING_SLOT_BYTES);
+	return CLUSTER_VOTING_DISK_IO_OK;
+}
+
+ClusterVotingDiskIoState
+cluster_voting_disk_write_apply_lease_slot(int fd, uint32 node_id, const void *in_slot512)
+{
+	char aligned[CLUSTER_VOTING_SLOT_BYTES] __attribute__((aligned(512)));
+	ssize_t nwritten;
+
+	if (fd < 0)
+		return CLUSTER_VOTING_DISK_IO_NOT_TRIED;
+	if (in_slot512 == NULL || node_id >= CLUSTER_MAX_NODES)
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+
+	memcpy(aligned, in_slot512, CLUSTER_VOTING_SLOT_BYTES);
+
+	voting_disk_io_arm_timeout();
+	nwritten = pwrite(fd, aligned, CLUSTER_VOTING_SLOT_BYTES,
+					  CLUSTER_VOTING_APPLY_LEASE_SLOT_OFFSET(node_id));
 	if (nwritten != CLUSTER_VOTING_SLOT_BYTES) {
 		voting_disk_io_disarm_timeout();
 		return CLUSTER_VOTING_DISK_IO_FAILED;

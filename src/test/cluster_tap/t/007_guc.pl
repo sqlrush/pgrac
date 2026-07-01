@@ -180,6 +180,65 @@ like($log,
 	 'startup log contains GUC out-of-range WARNING for cluster.node_id');
 
 # ----------
+# spec-6.4 ADG GUCs.
+# ----------
+is($node->safe_psql('postgres',
+	q{SELECT setting || '|' || vartype || '|' || context
+	    FROM pg_settings WHERE name = 'cluster.dg_role'}),
+	'primary|enum|postmaster',
+	'cluster.dg_role default and context');
+is($node->safe_psql('postgres',
+	q{SELECT array_to_string(enumvals, ',')
+	    FROM pg_settings WHERE name = 'cluster.dg_mode'}),
+	'async,sync,max_availability',
+	'cluster.dg_mode enumvals');
+is($node->safe_psql('postgres',
+	q{SELECT setting || '|' || vartype || '|' || context
+	    FROM pg_settings WHERE name = 'cluster.enable_adg'}),
+	'off|bool|postmaster',
+	'cluster.enable_adg default and context');
+is($node->safe_psql('postgres',
+	q{SELECT setting || '|' || vartype || '|' || context
+	    FROM pg_settings WHERE name = 'cluster.adg_lag_threshold_sec'}),
+	'10|integer|sighup',
+	'cluster.adg_lag_threshold_sec default and context');
+is($node->safe_psql('postgres',
+	q{SELECT setting || '|' || vartype || '|' || context
+	    FROM pg_settings WHERE name = 'cluster.apply_master_max_lag_ms'}),
+	'5000|integer|sighup',
+	'cluster.apply_master_max_lag_ms default and context');
+is($node->safe_psql('postgres',
+	q{SELECT setting || '|' || vartype || '|' || context
+	    FROM pg_settings WHERE name = 'cluster.apply_master_election'}),
+	'on|bool|sighup',
+	'cluster.apply_master_election default and context');
+is($node->safe_psql('postgres',
+	q{SELECT setting || '|' || vartype || '|' || context
+	    FROM pg_settings WHERE name = 'cluster.apply_master_switch_drain_ms'}),
+	'5000|integer|sighup',
+	'cluster.apply_master_switch_drain_ms default and context');
+is($node->safe_psql('postgres',
+	q{SELECT setting || '|' || vartype || '|' || context
+	    FROM pg_settings WHERE name = 'cluster.max_standby_delay'}),
+	'30|integer|sighup',
+	'cluster.max_standby_delay default and context');
+is($node->safe_psql('postgres',
+	q{SELECT setting || '|' || vartype || '|' || context
+	    FROM pg_settings WHERE name = 'cluster.adg_barrier_interval_ms'}),
+	'1000|integer|sighup',
+	'cluster.adg_barrier_interval_ms default and context');
+is($node->safe_psql('postgres',
+	q{SELECT setting || '|' || vartype || '|' || context
+	    FROM pg_settings WHERE name = 'cluster.wal_sender_timeout_sec'}),
+	'60|integer|sighup',
+	'cluster.wal_sender_timeout_sec default and context');
+is($node->safe_psql('postgres',
+	q{SELECT setting || '|' || vartype || '|' || context
+	    FROM pg_settings WHERE name = 'cluster.wal_receiver_timeout_sec'}),
+	'60|integer|sighup',
+	'cluster.wal_receiver_timeout_sec default and context');
+
+# ----------
 # spec-6.5 cluster backup / PITR GUCs.
 # ----------
 is($node->safe_psql('postgres',

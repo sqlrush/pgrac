@@ -2005,6 +2005,20 @@ pg_stat_bgwriter| SELECT pg_stat_get_bgwriter_timed_checkpoints() AS checkpoints
     pg_stat_get_buf_fsync_backend() AS buffers_backend_fsync,
     pg_stat_get_buf_alloc() AS buffers_alloc,
     pg_stat_get_bgwriter_stat_reset_time() AS stats_reset;
+pg_stat_cluster_adg| SELECT node_id,
+    dg_role,
+    dg_mode,
+    adg_enabled,
+    apply_master_node_id,
+    apply_master_term,
+    mrp_status,
+    receive_lsn,
+    apply_lsn,
+    standby_consistent_scn,
+    lag_bytes,
+    lag_seconds,
+    apply_rate_bytes_per_sec
+   FROM cluster_get_adg_state() cluster_get_adg_state(node_id, dg_role, dg_mode, adg_enabled, apply_master_node_id, apply_master_term, mrp_status, receive_lsn, apply_lsn, standby_consistent_scn, lag_bytes, lag_seconds, apply_rate_bytes_per_sec);
 pg_stat_cluster_backup| SELECT in_progress,
     backup_id,
     coordinator_node_id,
@@ -2084,6 +2098,20 @@ pg_stat_database_conflicts| SELECT oid AS datid,
     pg_stat_get_db_conflict_startup_deadlock(oid) AS confl_deadlock,
     pg_stat_get_db_conflict_logicalslot(oid) AS confl_active_logicalslot
    FROM pg_database d;
+pg_stat_gcluster_adg| SELECT node_id,
+    dg_role,
+    dg_mode,
+    adg_enabled,
+    apply_master_node_id,
+    apply_master_term,
+    mrp_status,
+    receive_lsn,
+    apply_lsn,
+    standby_consistent_scn,
+    lag_bytes,
+    lag_seconds,
+    apply_rate_bytes_per_sec
+   FROM cluster_get_gcluster_adg() cluster_get_gcluster_adg(node_id, dg_role, dg_mode, adg_enabled, apply_master_node_id, apply_master_term, mrp_status, receive_lsn, apply_lsn, standby_consistent_scn, lag_bytes, lag_seconds, apply_rate_bytes_per_sec);
 pg_stat_gcluster_wait_events| SELECT node_id,
     type,
     name

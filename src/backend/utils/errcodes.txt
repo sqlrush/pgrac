@@ -881,6 +881,7 @@ Section: Class 57 - Operator Intervention (pgrac extension)
 57R04    E    ERRCODE_CLUSTER_NODE_DRAIN                                     cluster_node_drain
 57R05    E    ERRCODE_CLUSTER_QUIESCE_ACTIVE                                 cluster_quiesce_active
 57R06    E    ERRCODE_CLUSTER_ADG_APPLY_LAG_EXCESSIVE                        cluster_adg_apply_lag_excessive
+57R07    E    ERRCODE_CLUSTER_ADG_STANDBY_UNRESOLVABLE                       cluster_adg_standby_unresolvable
 
 Section: Class 58 - System Error (errors external to PostgreSQL itself)
 
