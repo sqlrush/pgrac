@@ -43,9 +43,11 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_lock_acquire.h"
+#include "cluster/storage/cluster_pr_scsi.h"
 #include "cluster/storage/cluster_raw_xlog.h"
 #include "cluster/storage/cluster_shared_fs.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "port/pg_crc32c.h"
 #include "storage/fd.h"
 #include "storage/lock.h"
@@ -76,7 +78,7 @@ StaticAssertDecl(CLUSTER_RAW_EXTENT_SIZE % BLCKSZ == 0,
 StaticAssertDecl(CLUSTER_RAW_LAYOUT_RESID_TYPE > LOCKTAG_LAST_TYPE,
 				 "raw layout resid namespace must not collide with any PG LockTagType");
 
-static const ClusterSharedFsCaps cluster_shared_fs_block_device_caps = {
+static ClusterSharedFsCaps cluster_shared_fs_block_device_caps = {
 	.supports_odirect = true,
 	.required_io_alignment = PG_IO_ALIGN_SIZE,
 	.supports_scsi3_pr = false,
@@ -140,6 +142,7 @@ StaticAssertDecl(sizeof(ClusterRawExtentSlot) == 16, "raw extent slot ABI must s
 
 static int cluster_raw_device_fd = -1;
 static uint64 cluster_raw_total_extents = 0;
+static ClusterFenceCapability cluster_raw_fence_capability = CLUSTER_FENCE_CAP_NONE;
 
 #define CLUSTER_RAW_DIR_MAX_ENTRIES (CLUSTER_RAW_DIR_REGION_BYTES / sizeof(ClusterRawDirEntry))
 #define CLUSTER_RAW_SLOT_REGION_OFF CLUSTER_RAW_DIR_REGION_BYTES
@@ -149,22 +152,66 @@ static uint64 cluster_raw_total_extents = 0;
 static int
 raw_device_read(void *buffer, size_t amount, off_t offset, uint32 wait_event_info)
 {
-	(void)wait_event_info;
-	return (int)pg_pread(cluster_raw_device_fd, buffer, amount, offset);
+	int rc;
+
+	pgstat_report_wait_start(wait_event_info);
+	rc = (int)pg_pread(cluster_raw_device_fd, buffer, amount, offset);
+	pgstat_report_wait_end();
+	return rc;
 }
 
 static int
 raw_device_write(const void *buffer, size_t amount, off_t offset, uint32 wait_event_info)
 {
-	(void)wait_event_info;
-	return (int)pg_pwrite(cluster_raw_device_fd, buffer, amount, offset);
+	int rc;
+
+	pgstat_report_wait_start(wait_event_info);
+	rc = (int)pg_pwrite(cluster_raw_device_fd, buffer, amount, offset);
+	pgstat_report_wait_end();
+	return rc;
 }
 
 static int
 raw_device_sync(uint32 wait_event_info)
 {
-	(void)wait_event_info;
-	return pg_fsync(cluster_raw_device_fd);
+	int rc;
+
+	pgstat_report_wait_start(wait_event_info);
+	rc = pg_fsync(cluster_raw_device_fd);
+	pgstat_report_wait_end();
+	return rc;
+}
+
+static bool
+raw_device_prefetch(off_t offset, off_t amount)
+{
+#if defined(USE_POSIX_FADVISE) && defined(POSIX_FADV_WILLNEED)
+	int rc;
+
+retry:
+	pgstat_report_wait_start(WAIT_EVENT_CLUSTER_BLOCK_DEVICE_PREFETCH);
+	rc = posix_fadvise(cluster_raw_device_fd, offset, amount, POSIX_FADV_WILLNEED);
+	pgstat_report_wait_end();
+
+	if (rc == EINTR)
+		goto retry;
+	return rc == 0;
+#else
+	(void)offset;
+	(void)amount;
+	return true;
+#endif
+}
+
+static void
+raw_device_writeback(off_t offset, off_t nbytes)
+{
+	if (nbytes <= 0)
+		return;
+
+	pgstat_report_wait_start(WAIT_EVENT_CLUSTER_BLOCK_DEVICE_WRITEBACK);
+	pg_flush_data(cluster_raw_device_fd, offset, nbytes);
+	pgstat_report_wait_end();
 }
 
 static off_t
@@ -245,7 +292,8 @@ raw_read_page(uint64 offset, PGIOAlignedBlock *page)
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_STORAGE_IO_ALIGNMENT),
 						errmsg("raw layout read offset is not BLCKSZ-aligned")));
 
-	nbytes = raw_device_read(page->data, BLCKSZ, (off_t)offset, WAIT_EVENT_DATA_FILE_READ);
+	nbytes
+		= raw_device_read(page->data, BLCKSZ, (off_t)offset, WAIT_EVENT_CLUSTER_BLOCK_DEVICE_READ);
 	if (nbytes < 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
@@ -276,7 +324,8 @@ raw_write_page(uint64 offset, const char *image, bool wal_log)
 		XLogFlush(lsn);
 
 	memcpy(io.data, image, BLCKSZ);
-	nbytes = raw_device_write(io.data, BLCKSZ, (off_t)offset, WAIT_EVENT_DATA_FILE_WRITE);
+	nbytes
+		= raw_device_write(io.data, BLCKSZ, (off_t)offset, WAIT_EVENT_CLUSTER_BLOCK_DEVICE_WRITE);
 	if (nbytes < 0)
 		ereport(ERROR, (errcode_for_file_access(),
 						errmsg("could not write raw layout page at offset " UINT64_FORMAT ": %m",
@@ -629,7 +678,7 @@ raw_initialize_layout(uint64 total_extents)
 	memcpy(page.data, &super, sizeof(super));
 	raw_write_page(0, page.data, false);
 
-	if (raw_device_sync(WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC) < 0)
+	if (raw_device_sync(WAIT_EVENT_CLUSTER_BLOCK_DEVICE_SYNC) < 0)
 		ereport(FATAL, (errcode_for_file_access(),
 						errmsg("could not fsync initialized raw block device layout: %m")));
 }
@@ -920,7 +969,7 @@ raw_zero_data_block(const ClusterSharedFsHandle *handle, const ClusterRawDirEntr
 
 	memset(&zero, 0, sizeof(zero));
 	nbytes = raw_device_write(zero.data, BLCKSZ, (off_t)raw_block_offset(handle, entry, blocknum),
-							  WAIT_EVENT_DATA_FILE_WRITE);
+							  WAIT_EVENT_CLUSTER_BLOCK_DEVICE_WRITE);
 	if (nbytes < 0)
 		ereport(ERROR, (errcode_for_file_access(),
 						errmsg("could not zero raw relation block %u: %m", blocknum)));
@@ -1023,7 +1072,7 @@ cluster_shared_fs_block_device_create(RelFileLocator rlocator, ForkNumber forknu
 			entry_index = free_index;
 			raw_write_dir_entry(entry_index, &entry);
 		}
-		if (raw_device_sync(WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC) < 0)
+		if (raw_device_sync(WAIT_EVENT_CLUSTER_BLOCK_DEVICE_SYNC) < 0)
 			ereport(ERROR, (errcode_for_file_access(),
 							errmsg("could not barrier-sync raw layout create: %m")));
 	}
@@ -1059,7 +1108,7 @@ cluster_shared_fs_block_device_read(ClusterSharedFsHandle *handle, BlockNumber b
 				 errdetail("block=%u logical_nblocks=%u", blocknum, entry.logical_nblocks)));
 
 	nbytes = raw_device_read(io.data, BLCKSZ, (off_t)raw_block_offset(handle, &entry, blocknum),
-							 WAIT_EVENT_DATA_FILE_READ);
+							 WAIT_EVENT_CLUSTER_BLOCK_DEVICE_READ);
 	if (nbytes < 0)
 		ereport(ERROR, (errcode_for_file_access(),
 						errmsg("could not read raw relation block %u: %m", blocknum)));
@@ -1086,7 +1135,7 @@ cluster_shared_fs_block_device_write(ClusterSharedFsHandle *handle, BlockNumber 
 
 	memcpy(io.data, buf, BLCKSZ);
 	nbytes = raw_device_write(io.data, BLCKSZ, (off_t)raw_block_offset(handle, &entry, blocknum),
-							  WAIT_EVENT_DATA_FILE_WRITE);
+							  WAIT_EVENT_CLUSTER_BLOCK_DEVICE_WRITE);
 	if (nbytes < 0)
 		ereport(ERROR, (errcode_for_file_access(),
 						errmsg("could not write raw relation block %u: %m", blocknum)));
@@ -1125,13 +1174,13 @@ cluster_shared_fs_block_device_extend(ClusterSharedFsHandle *handle, BlockNumber
 			old_logical = entry.logical_nblocks;
 			for (blk = old_logical; blk <= blocknum; blk++)
 				raw_zero_data_block(handle, &entry, blk);
-			if (raw_device_sync(WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC) < 0)
+			if (raw_device_sync(WAIT_EVENT_CLUSTER_BLOCK_DEVICE_SYNC) < 0)
 				ereport(ERROR, (errcode_for_file_access(),
 								errmsg("could not barrier-sync raw zero extension before "
 									   "publishing logical EOF: %m")));
 			entry.logical_nblocks = blocknum + 1;
 			raw_write_dir_entry(handle->entry_index, &entry);
-			if (raw_device_sync(WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC) < 0)
+			if (raw_device_sync(WAIT_EVENT_CLUSTER_BLOCK_DEVICE_SYNC) < 0)
 				ereport(ERROR, (errcode_for_file_access(),
 								errmsg("could not barrier-sync raw layout extend: %m")));
 		}
@@ -1199,7 +1248,7 @@ cluster_shared_fs_block_device_truncate(ClusterSharedFsHandle *handle, BlockNumb
 			raw_release_slot_chain(release_first);
 		}
 
-		if (raw_device_sync(WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC) < 0)
+		if (raw_device_sync(WAIT_EVENT_CLUSTER_BLOCK_DEVICE_SYNC) < 0)
 			ereport(ERROR, (errcode_for_file_access(),
 							errmsg("could not barrier-sync raw layout truncate: %m")));
 	}
@@ -1214,7 +1263,7 @@ static void
 cluster_shared_fs_block_device_immedsync(ClusterSharedFsHandle *handle)
 {
 	(void)handle;
-	if (raw_device_sync(WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC) < 0)
+	if (raw_device_sync(WAIT_EVENT_CLUSTER_BLOCK_DEVICE_SYNC) < 0)
 		ereport(ERROR,
 				(errcode_for_file_access(), errmsg("could not barrier-sync raw block device: %m")));
 }
@@ -1238,7 +1287,7 @@ cluster_shared_fs_block_device_unlink(RelFileLocator rlocator, ForkNumber forknu
 			memset(&entry, 0, sizeof(entry));
 			raw_write_dir_entry(entry_index, &entry);
 			raw_release_slot_chain(first_slot);
-			if (raw_device_sync(WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC) < 0)
+			if (raw_device_sync(WAIT_EVENT_CLUSTER_BLOCK_DEVICE_SYNC) < 0)
 				ereport(ERROR, (errcode_for_file_access(),
 								errmsg("could not barrier-sync raw layout unlink: %m")));
 		}
@@ -1273,18 +1322,61 @@ cluster_shared_fs_block_device_init(void)
 #endif
 	}
 
-	if (cluster_storage_fence_driver == CLUSTER_STORAGE_FENCE_DRIVER_SCSI3_PR)
-		ereport(FATAL,
-				(errcode(ERRCODE_CLUSTER_STORAGE_FENCE_UNAVAILABLE),
-				 errmsg("SCSI-3 persistent reservation fencing is not available"),
-				 errhint("Use cluster.storage_fence_driver=auto or disabled until a platform "
-						 "SCSI-3 PR driver is installed.")));
-
 	cluster_raw_device_fd = BasicOpenFile(cluster_block_device_path, flags);
 	if (cluster_raw_device_fd < 0)
 		ereport(FATAL,
 				(errcode_for_file_access(),
 				 errmsg("could not open raw block device \"%s\": %m", cluster_block_device_path)));
+	{
+		struct stat st;
+
+		if (fstat(cluster_raw_device_fd, &st) != 0)
+			ereport(FATAL,
+					(errcode_for_file_access(), errmsg("could not stat raw block device \"%s\": %m",
+													   cluster_block_device_path)));
+		if (!S_ISBLK(st.st_mode) && !S_ISREG(st.st_mode))
+			ereport(FATAL,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("cluster.block_device_path must name a block device or raw image file"),
+					 errdetail("Path \"%s\" has mode %o.", cluster_block_device_path,
+							   (unsigned)st.st_mode)));
+		if (S_ISREG(st.st_mode))
+			ereport(WARNING,
+					(errmsg("cluster.block_device_path names a regular-file raw image"),
+					 errdetail("This is accepted for CI and development conformance tests; "
+							   "production block_device deployments should use a persistent "
+							   "block-device path.")));
+	}
+
+	pgstat_report_wait_start(WAIT_EVENT_CLUSTER_BLOCK_DEVICE_PR_PROBE);
+	cluster_raw_fence_capability = cluster_pr_scsi_probe(cluster_raw_device_fd);
+	pgstat_report_wait_end();
+	cluster_shared_fs_block_device_caps.supports_scsi3_pr
+		= (cluster_raw_fence_capability == CLUSTER_FENCE_CAP_SCSI3_PR);
+
+	if (cluster_raw_fence_capability == CLUSTER_FENCE_CAP_SCSI3_PR) {
+		int rc;
+
+		pgstat_report_wait_start(WAIT_EVENT_CLUSTER_BLOCK_DEVICE_PR_REGISTER);
+		rc = cluster_pr_scsi_register_key(cluster_raw_device_fd, cluster_node_id);
+		pgstat_report_wait_end();
+		if (rc != 0) {
+			cluster_raw_fence_capability = CLUSTER_FENCE_CAP_NONE;
+			cluster_shared_fs_block_device_caps.supports_scsi3_pr = false;
+			if (cluster_storage_fence_driver == CLUSTER_STORAGE_FENCE_DRIVER_SCSI3_PR)
+				ereport(FATAL, (errcode(ERRCODE_CLUSTER_STORAGE_FENCE_UNAVAILABLE),
+								errmsg("could not register SCSI-3 persistent reservation key: %s",
+									   strerror(rc))));
+		}
+	}
+
+	if (cluster_storage_fence_driver == CLUSTER_STORAGE_FENCE_DRIVER_SCSI3_PR
+		&& cluster_raw_fence_capability != CLUSTER_FENCE_CAP_SCSI3_PR)
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_STORAGE_FENCE_UNAVAILABLE),
+				 errmsg("SCSI-3 persistent reservation fencing is not available"),
+				 errhint("Use cluster.storage_fence_driver=auto or disabled until a platform "
+						 "SCSI-3 PR-capable device is installed.")));
 
 	raw_ensure_layout();
 	elog(LOG, "cluster_shared_fs: raw block_device backend attached to \"%s\"",
@@ -1298,6 +1390,8 @@ cluster_shared_fs_block_device_shutdown(void)
 		close(cluster_raw_device_fd);
 		cluster_raw_device_fd = -1;
 	}
+	cluster_raw_fence_capability = CLUSTER_FENCE_CAP_NONE;
+	cluster_shared_fs_block_device_caps.supports_scsi3_pr = false;
 }
 
 static int
@@ -1310,16 +1404,67 @@ cluster_shared_fs_block_device_barrier_sync(ClusterSharedFsHandle *handle)
 static int
 cluster_shared_fs_block_device_register_fence_key(int node_id)
 {
-	(void)node_id;
-	if (cluster_storage_fence_driver == CLUSTER_STORAGE_FENCE_DRIVER_SCSI3_PR)
+	int rc;
+
+	if (cluster_raw_device_fd < 0 || cluster_raw_fence_capability != CLUSTER_FENCE_CAP_SCSI3_PR)
 		return EOPNOTSUPP;
-	return EOPNOTSUPP;
+
+	pgstat_report_wait_start(WAIT_EVENT_CLUSTER_BLOCK_DEVICE_PR_REGISTER);
+	rc = cluster_pr_scsi_register_key(cluster_raw_device_fd, node_id);
+	pgstat_report_wait_end();
+	if (rc != 0)
+		return rc;
+	return 0;
 }
 
 static ClusterFenceCapability
 cluster_shared_fs_block_device_fence_capability(void)
 {
-	return CLUSTER_FENCE_CAP_NONE;
+	return cluster_raw_fence_capability;
+}
+
+static bool
+cluster_shared_fs_block_device_prefetch(ClusterSharedFsHandle *handle, BlockNumber blocknum)
+{
+	ClusterRawDirEntry entry;
+
+	raw_refresh_handle_entry(handle, &entry);
+	if (blocknum >= entry.logical_nblocks)
+		return false;
+	return raw_device_prefetch((off_t)raw_block_offset(handle, &entry, blocknum), BLCKSZ);
+}
+
+static void
+cluster_shared_fs_block_device_writeback(ClusterSharedFsHandle *handle, BlockNumber blocknum,
+										 BlockNumber nblocks)
+{
+	ClusterRawDirEntry entry;
+	BlockNumber first;
+	BlockNumber last;
+
+	if (nblocks == 0)
+		return;
+
+	raw_refresh_handle_entry(handle, &entry);
+	if (blocknum >= entry.logical_nblocks)
+		return;
+
+	first = blocknum;
+	last = blocknum + nblocks;
+	if (last < first)
+		last = entry.logical_nblocks;
+	if (last > entry.logical_nblocks)
+		last = entry.logical_nblocks;
+
+	while (first < last) {
+		off_t offset = (off_t)raw_block_offset(handle, &entry, first);
+		BlockNumber extent_next
+			= ((first / CLUSTER_RAW_BLOCKS_PER_EXTENT) + 1) * CLUSTER_RAW_BLOCKS_PER_EXTENT;
+		BlockNumber chunk_last = Min(last, extent_next);
+
+		raw_device_writeback(offset, (off_t)(chunk_last - first) * BLCKSZ);
+		first = chunk_last;
+	}
 }
 
 const ClusterSharedFsOps cluster_shared_fs_block_device_ops = {
@@ -1345,6 +1490,8 @@ const ClusterSharedFsOps cluster_shared_fs_block_device_ops = {
 	.barrier_sync = cluster_shared_fs_block_device_barrier_sync,
 	.register_fence_key = cluster_shared_fs_block_device_register_fence_key,
 	.fence_capability = cluster_shared_fs_block_device_fence_capability,
+	.prefetch = cluster_shared_fs_block_device_prefetch,
+	.writeback = cluster_shared_fs_block_device_writeback,
 };
 
 #endif /* USE_PGRAC_CLUSTER */

@@ -195,7 +195,7 @@ UT_TEST(test_new_wait_events_distinct)
 }
 
 
-UT_TEST(test_cluster_wait_events_count_97)
+UT_TEST(test_cluster_wait_events_count_110)
 {
 	/* spec-2.34 D7: 83 → 85 (+ 2 reliability wait events).
 	 * spec-2.36 D8: 85 → 88 (+ 3 CF 3-way wait events).
@@ -204,8 +204,9 @@ UT_TEST(test_cluster_wait_events_count_97)
 	 * spec-4.2 D5: 95 → 97 (+ 2 wal-state registry I/O events).
 	 * spec-4.6 D4: 97 → 98 (+ 1 GRD shard remaster short-wait).
 	 * spec-4.7 D1: 98 → 99 (+ 1 GCS block RECOVERING short-wait).
-	 * spec-4.11 D5: 99 → 100 (+ 1 online thread recovery short-wait). */
-	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 103);
+	 * spec-4.11 D5: 99 → 100 (+ 1 online thread recovery short-wait).
+	 * spec-6.0a D10 current snapshot: 110. */
+	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 110);
 }
 
 
@@ -311,7 +312,7 @@ main(void)
 	UT_RUN(test_retry_total_backoff_default_1500ms);
 	UT_RUN(test_lwtranche_distinct);
 	UT_RUN(test_new_wait_events_distinct);
-	UT_RUN(test_cluster_wait_events_count_97);
+	UT_RUN(test_cluster_wait_events_count_110);
 	UT_RUN(test_dedup_full_status_distinct_from_master_not_holder);
 	UT_RUN(test_block_data_size_equals_blcksz);
 	UT_RUN(test_dedup_entry_collision_field_layout);

@@ -404,6 +404,33 @@ cluster_shared_fs_local_fence_capability(void)
 	return CLUSTER_FENCE_CAP_NONE;
 }
 
+static bool
+cluster_shared_fs_local_prefetch(ClusterSharedFsHandle *handle, BlockNumber blocknum)
+{
+	off_t offset;
+
+	if (handle == NULL || !handle->opened)
+		return false;
+
+	offset = (off_t)blocknum * BLCKSZ;
+	return FilePrefetch(handle->vfd, offset, BLCKSZ, WAIT_EVENT_DATA_FILE_PREFETCH) == 0;
+}
+
+static void
+cluster_shared_fs_local_writeback(ClusterSharedFsHandle *handle, BlockNumber blocknum,
+								  BlockNumber nblocks)
+{
+	off_t offset;
+	off_t nbytes;
+
+	if (handle == NULL || !handle->opened || nblocks == 0)
+		return;
+
+	offset = (off_t)blocknum * BLCKSZ;
+	nbytes = (off_t)nblocks * BLCKSZ;
+	FileWriteback(handle->vfd, offset, nbytes, WAIT_EVENT_DATA_FILE_FLUSH);
+}
+
 
 const ClusterSharedFsOps cluster_shared_fs_local_ops = {
 	.name = "local",
@@ -428,6 +455,8 @@ const ClusterSharedFsOps cluster_shared_fs_local_ops = {
 	.barrier_sync = cluster_shared_fs_local_barrier_sync,
 	.register_fence_key = cluster_shared_fs_local_register_fence_key,
 	.fence_capability = cluster_shared_fs_local_fence_capability,
+	.prefetch = cluster_shared_fs_local_prefetch,
+	.writeback = cluster_shared_fs_local_writeback,
 };
 
 #endif /* USE_PGRAC_CLUSTER */

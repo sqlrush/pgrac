@@ -199,6 +199,24 @@ cluster_shared_fs_stub_fence_capability(void)
 	return CLUSTER_FENCE_CAP_NONE;
 }
 
+static bool
+cluster_shared_fs_stub_prefetch(ClusterSharedFsHandle *handle, BlockNumber blocknum)
+{
+	(void)handle;
+	(void)blocknum;
+	cluster_shared_fs_stub_reject("prefetch");
+}
+
+static void
+cluster_shared_fs_stub_writeback(ClusterSharedFsHandle *handle, BlockNumber blocknum,
+								 BlockNumber nblocks)
+{
+	(void)handle;
+	(void)blocknum;
+	(void)nblocks;
+	cluster_shared_fs_stub_reject("writeback");
+}
+
 
 const ClusterSharedFsOps cluster_shared_fs_stub_ops = {
 	.name = "stub",
@@ -223,6 +241,8 @@ const ClusterSharedFsOps cluster_shared_fs_stub_ops = {
 	.barrier_sync = cluster_shared_fs_stub_barrier_sync,
 	.register_fence_key = cluster_shared_fs_stub_register_fence_key,
 	.fence_capability = cluster_shared_fs_stub_fence_capability,
+	.prefetch = cluster_shared_fs_stub_prefetch,
+	.writeback = cluster_shared_fs_stub_writeback,
 };
 
 #endif /* USE_PGRAC_CLUSTER */

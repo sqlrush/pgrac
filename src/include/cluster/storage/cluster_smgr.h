@@ -119,11 +119,8 @@ extern int cluster_smgr_which_for(RelFileLocator rlocator, BackendId backend);
  *	Signatures match PG's f_smgr typedef in src/backend/storage/smgr/
  *	smgr.c byte-for-byte so that smgrsw[1] can be initialised directly
  *	from these symbols.  Stage 1.2 implementations dispatch to
- *	cluster_shared_fs (eleven storage callbacks plus two lifecycle
- *	callbacks, thirteen function pointers total at Stage 1.X post
- *	Sprint A vtable split + spec-1.7.2 create(isRedo) signature) or
- *	fall through to md.c counterparts (for the three advisory ops:
- *	zeroextend / prefetch / writeback).  See §2.2 / §10 of the design
+ *	cluster_shared_fs (core storage, lifecycle, durability/fence, and
+ *	advisory callbacks as of spec-6.0a).  See §2.2 / §10 of the design
  *	doc for the full mapping table.
  * ----------
  */

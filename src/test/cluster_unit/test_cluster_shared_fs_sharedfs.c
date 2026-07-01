@@ -230,6 +230,18 @@ FileSync(File f, uint32 w pg_attribute_unused())
 	return fsync((int)f);
 }
 
+int
+FilePrefetch(File f pg_attribute_unused(), off_t o pg_attribute_unused(),
+			 off_t a pg_attribute_unused(), uint32 w pg_attribute_unused())
+{
+	return 0;
+}
+
+void
+FileWriteback(File f pg_attribute_unused(), off_t o pg_attribute_unused(),
+			  off_t a pg_attribute_unused(), uint32 w pg_attribute_unused())
+{}
+
 off_t
 FileSize(File f)
 {

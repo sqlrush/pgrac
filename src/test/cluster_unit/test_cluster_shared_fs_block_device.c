@@ -38,6 +38,7 @@
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_lock_acquire.h"
+#include "cluster/storage/cluster_pr_scsi.h"
 #include "cluster/storage/cluster_raw_xlog.h"
 #include "cluster/storage/cluster_shared_fs.h"
 #include "port/pg_crc32c.h"
@@ -67,6 +68,9 @@ int cluster_storage_fence_driver = CLUSTER_STORAGE_FENCE_DRIVER_AUTO;
 char *cluster_shared_storage_uuid = NULL;
 ClusterConf *ClusterConfShmem = NULL;
 PGPROC *MyProc = NULL;
+int cluster_node_id = 0;
+uint32 test_wait_event_info = 0;
+uint32 *my_wait_event_info = &test_wait_event_info;
 
 MemoryContext TopMemoryContext = NULL;
 MemoryContext CurrentMemoryContext = NULL;
@@ -178,6 +182,12 @@ pfree(void *pointer)
 	free(pointer);
 }
 
+char *
+pg_strerror(int errnum)
+{
+	return strerror(errnum);
+}
+
 File
 PathNameOpenFile(const char *fileName, int fileFlags)
 {
@@ -219,6 +229,11 @@ pg_fsync(int fd)
 {
 	return fsync(fd);
 }
+
+void
+pg_flush_data(int fd pg_attribute_unused(), off_t offset pg_attribute_unused(),
+			  off_t nbytes pg_attribute_unused())
+{}
 
 off_t
 FileSize(File f)
@@ -417,6 +432,8 @@ UT_TEST(test_block_device_roundtrip_layout_and_eof)
 	UT_ASSERT(truncate_extend_errors(ops, handle));
 
 	UT_ASSERT_EQ(ops->barrier_sync(handle), 0);
+	UT_ASSERT(ops->prefetch(handle, 0));
+	ops->writeback(handle, 0, 1);
 	UT_ASSERT_EQ(ops->fence_capability(), CLUSTER_FENCE_CAP_NONE);
 	UT_ASSERT_NE(ops->register_fence_key(0), 0);
 	ops->close(handle);
@@ -435,11 +452,23 @@ UT_TEST(test_block_device_roundtrip_layout_and_eof)
 	unlink(path);
 }
 
+UT_TEST(test_scsi_pr_key_derivation_is_nonzero_and_node_scoped)
+{
+	uint64 key0 = cluster_pr_scsi_key_for_node(0);
+	uint64 key1 = cluster_pr_scsi_key_for_node(1);
+
+	UT_ASSERT_NE(key0, 0);
+	UT_ASSERT_NE(key1, 0);
+	UT_ASSERT_NE(key0, key1);
+	UT_ASSERT_EQ(cluster_pr_scsi_key_for_node(-1), 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(1);
+	UT_PLAN(2);
 	UT_RUN(test_block_device_roundtrip_layout_and_eof);
+	UT_RUN(test_scsi_pr_key_derivation_is_nonzero_and_node_scoped);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

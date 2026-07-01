@@ -5,7 +5,7 @@
  *	  introduced in stage 0.11.
  *
  *	  This test asserts the structural invariants that must hold
- *	  across the 10-class / 46-event cluster wait event scheme:
+ *	  across the cluster wait event scheme:
  *
  *	  - The 10 PG_WAIT_CLUSTER_* class IDs match docs/wait-events-design.md
  *	    §14.1 exactly.
@@ -165,6 +165,7 @@ UT_TEST(test_first_event_per_category_anchors_class_id)
 	UT_ASSERT_EQ((uint32)WAIT_EVENT_INTERCONNECT_RDMA_SEND, PG_WAIT_CLUSTER_INTERCONNECT);
 	UT_ASSERT_EQ((uint32)WAIT_EVENT_UNDO_REMOTE_READ, PG_WAIT_CLUSTER_UNDO);
 	UT_ASSERT_EQ((uint32)WAIT_EVENT_ADG_MRP_APPLY_WAIT, PG_WAIT_CLUSTER_ADG);
+	UT_ASSERT_EQ((uint32)WAIT_EVENT_CLUSTER_SHARED_FS_READ, PG_WAIT_CLUSTER_SHAREDFS);
 }
 
 
@@ -191,13 +192,15 @@ UT_TEST(test_last_event_per_category_in_class)
 				 PG_WAIT_CLUSTER_INTERCONNECT);
 	UT_ASSERT_EQ(((uint32)WAIT_EVENT_UNDO_RETENTION_WAIT) & 0xFF000000U, PG_WAIT_CLUSTER_UNDO);
 	UT_ASSERT_EQ(((uint32)WAIT_EVENT_ADG_SCN_SYNC_WAIT) & 0xFF000000U, PG_WAIT_CLUSTER_ADG);
+	UT_ASSERT_EQ(((uint32)WAIT_EVENT_CLUSTER_BLOCK_DEVICE_PR_REGISTER) & 0xFF000000U,
+				 PG_WAIT_CLUSTER_SHAREDFS);
 }
 
 
 /* ----------
  * Per-category event counts match the design doc roster
  *  (GES 5, PCM 8, BufferShip 5, SCN 4, Reconfig 5, Recovery 6,
- *   Sinval 3, Interconnect 5, Undo 5, ADG 4, SharedFs 5 -- plus later
+ *   Sinval 3, Interconnect 5, Undo 8, ADG 4, SharedFs 12 -- plus later
  *   subsystem classes, total tracked by CLUSTER_WAIT_EVENTS_COUNT).
  *
  *	Use (last - first + 1) within each category as the count.
@@ -239,9 +242,9 @@ UT_TEST(test_per_category_event_counts)
 		(uint32)WAIT_EVENT_CLUSTER_UNDO_EXTENT_CLAIM - (uint32)WAIT_EVENT_UNDO_REMOTE_READ + 1, 8);
 	UT_ASSERT_EQ((uint32)WAIT_EVENT_ADG_SCN_SYNC_WAIT - (uint32)WAIT_EVENT_ADG_MRP_APPLY_WAIT + 1,
 				 4);
-	UT_ASSERT_EQ((uint32)WAIT_EVENT_CLUSTER_SHARED_FS_FSYNC
+	UT_ASSERT_EQ((uint32)WAIT_EVENT_CLUSTER_BLOCK_DEVICE_PR_REGISTER
 					 - (uint32)WAIT_EVENT_CLUSTER_SHARED_FS_READ + 1,
-				 5);
+				 12);
 }
 
 

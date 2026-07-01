@@ -9,9 +9,9 @@
  *	      ClusterSharedFsBackendId);
  *	    - cluster_shared_fs_init / _shutdown lifecycle hooks called
  *	      from cluster_init / before_shmem_exit;
- *	    - the eleven caller-facing I/O dispatch wrappers that forward
- *	      to active_ops->* (eleven storage callbacks plus two lifecycle
- *	      callbacks, thirteen function pointers total).
+ *	    - the caller-facing dispatch wrappers that forward to
+ *	      active_ops->* (core storage, lifecycle, durability/fence, and
+ *	      advisory callbacks).
  *
  *	  Backend selection is start-time only and freezes for the
  *	  postmaster's lifetime (see docs/cluster-shared-fs-design.md §0
@@ -131,7 +131,7 @@ cluster_shared_fs_register_backend(const ClusterSharedFsOps *ops)
 		|| ops->nblocks == NULL || ops->truncate == NULL || ops->immedsync == NULL
 		|| ops->unlink == NULL || ops->init == NULL || ops->shutdown == NULL
 		|| ops->barrier_sync == NULL || ops->register_fence_key == NULL
-		|| ops->fence_capability == NULL)
+		|| ops->fence_capability == NULL || ops->prefetch == NULL || ops->writeback == NULL)
 		ereport(FATAL, (errcode(ERRCODE_INTERNAL_ERROR),
 						errmsg("cluster_shared_fs backend \"%s\" has NULL callbacks", ops->name),
 						errdetail("All provider vtable members must be non-NULL "
@@ -467,6 +467,23 @@ cluster_shared_fs_fence_capability(void)
 {
 	ENSURE_ACTIVE();
 	return cluster_shared_fs_active_ops->fence_capability();
+}
+
+
+bool
+cluster_shared_fs_prefetch(ClusterSharedFsHandle *handle, BlockNumber blocknum)
+{
+	ENSURE_ACTIVE();
+	return cluster_shared_fs_active_ops->prefetch(handle, blocknum);
+}
+
+
+void
+cluster_shared_fs_writeback(ClusterSharedFsHandle *handle, BlockNumber blocknum,
+							BlockNumber nblocks)
+{
+	ENSURE_ACTIVE();
+	cluster_shared_fs_active_ops->writeback(handle, blocknum, nblocks);
 }
 
 #endif /* USE_PGRAC_CLUSTER */

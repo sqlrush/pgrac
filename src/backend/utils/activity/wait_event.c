@@ -1331,6 +1331,27 @@ pgstat_get_wait_cluster_sharedfs(WaitEventCluster w)
 	case WAIT_EVENT_CLUSTER_SHARED_FS_FSYNC:
 		event_name = "ClusterSharedFsFsync";
 		break;
+	case WAIT_EVENT_CLUSTER_BLOCK_DEVICE_READ:
+		event_name = "ClusterBlockDeviceRead";
+		break;
+	case WAIT_EVENT_CLUSTER_BLOCK_DEVICE_WRITE:
+		event_name = "ClusterBlockDeviceWrite";
+		break;
+	case WAIT_EVENT_CLUSTER_BLOCK_DEVICE_PREFETCH:
+		event_name = "ClusterBlockDevicePrefetch";
+		break;
+	case WAIT_EVENT_CLUSTER_BLOCK_DEVICE_WRITEBACK:
+		event_name = "ClusterBlockDeviceWriteback";
+		break;
+	case WAIT_EVENT_CLUSTER_BLOCK_DEVICE_SYNC:
+		event_name = "ClusterBlockDeviceSync";
+		break;
+	case WAIT_EVENT_CLUSTER_BLOCK_DEVICE_PR_PROBE:
+		event_name = "ClusterBlockDevicePrProbe";
+		break;
+	case WAIT_EVENT_CLUSTER_BLOCK_DEVICE_PR_REGISTER:
+		event_name = "ClusterBlockDevicePrRegister";
+		break;
 	default:
 		break;
 	}

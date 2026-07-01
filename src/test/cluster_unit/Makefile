@@ -108,6 +108,7 @@ CLUSTER_SHARED_FS_STUB_O = $(top_builddir)/src/backend/cluster/storage/cluster_s
 CLUSTER_SHARED_FS_LOCAL_O = $(top_builddir)/src/backend/cluster/storage/cluster_shared_fs_local.o
 CLUSTER_SHARED_FS_SHAREDFS_O = $(top_builddir)/src/backend/cluster/storage/cluster_shared_fs_sharedfs.o
 CLUSTER_SHARED_FS_BLOCK_DEVICE_O = $(top_builddir)/src/backend/cluster/storage/cluster_shared_fs_block_device.o
+CLUSTER_PR_SCSI_O = $(top_builddir)/src/backend/cluster/storage/cluster_pr_scsi.o
 CLUSTER_SMGR_O = $(top_builddir)/src/backend/cluster/storage/cluster_smgr.o
 CLUSTER_STARTUP_PHASE_O = $(top_builddir)/src/backend/cluster/cluster_startup_phase.o
 CLUSTER_LMON_O = $(top_builddir)/src/backend/cluster/cluster_lmon.o
@@ -721,9 +722,9 @@ test_cluster_shared_fs_sharedfs: test_cluster_shared_fs_sharedfs.c unit_test.h \
 # temporary regular file that stands in for a block device.  Links only
 # the provider object; WAL/GES entry points are stubbed by the test.
 test_cluster_shared_fs_block_device: test_cluster_shared_fs_block_device.c unit_test.h \
-		$(CLUSTER_SHARED_FS_BLOCK_DEVICE_O)
+		$(CLUSTER_SHARED_FS_BLOCK_DEVICE_O) $(CLUSTER_PR_SCSI_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_SHARED_FS_BLOCK_DEVICE_O) -o $@
+		$(CLUSTER_SHARED_FS_BLOCK_DEVICE_O) $(CLUSTER_PR_SCSI_O) -o $@
 
 # test_cluster_smgr links cluster_smgr.o + the three cluster_shared_fs
 # objects standalone.  cluster_smgr.c references HTAB / md.c / fd.c /

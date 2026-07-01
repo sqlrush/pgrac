@@ -11,13 +11,9 @@
  *	    - cluster_smgr_init / _shutdown lifecycle (called from PG's
  *	      smgrinit / smgrshutdown via smgrsw[1]);
  *	    - cluster_smgr_which_for() routing decision read by smgropen;
- *	    - sixteen f_smgr callbacks: eleven core I/O ops dispatch to
- *	      cluster_shared_fs (which has eleven storage callbacks plus
- *	      two lifecycle callbacks, thirteen function pointers total
- *	      after spec-1.X Sprint A vtable split + spec-1.7.2 create
- *	      isRedo amend); three advisory ops (zeroextend, prefetch,
- *	      writeback) fall through to md.c; two lifecycle / structural
- *	      callbacks have local logic.
+ *	    - sixteen f_smgr callbacks: core I/O and advisory ops dispatch
+ *	      to cluster_shared_fs as of spec-6.0a; lifecycle / structural
+ *	      callbacks keep local logic.
  *
  *	  Stage 1.2 deliberately does NOT split relations into 1GB
  *	  segments.  Each (rlocator, fork) maps to a single underlying
@@ -578,18 +574,13 @@ cluster_smgr_zeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber block
 bool
 cluster_smgr_prefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
 {
-	/*
-	 * Prefetch is purely advisory (no correctness consequence if it's
-	 * a no-op).  Stage 6+ may wire posix_fadvise via a bulk
-	 * cluster_shared_fs callback; stage 1.2 just returns true (= "I
-	 * tried", per PG's smgr_prefetch contract).  We deliberately do
-	 * NOT delegate to mdprefetch because that would touch md.c's
-	 * SMgrRelationData state our smgr_which=1 path never initialises.
-	 */
-	(void)reln;
-	(void)forknum;
-	(void)blocknum;
-	return true;
+	ClusterSmgrRelationState *state;
+	ClusterSharedFsHandle *handle;
+
+	state = cluster_smgr_state_lookup(reln, true);
+	handle = cluster_smgr_ensure_handle(state, forknum);
+
+	return cluster_shared_fs_prefetch(handle, blocknum);
 }
 
 
@@ -629,16 +620,13 @@ void
 cluster_smgr_writeback(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 					   BlockNumber nblocks)
 {
-	/*
-	 * Writeback is purely advisory (posix_fadvise WILLNEED-style hint).
-	 * Stage 6+ may wire it through cluster_shared_fs; stage 1.2 makes
-	 * it a no-op.  Same reason as cluster_smgr_prefetch: cannot
-	 * delegate to md.c (md_seg_fds uninitialised on smgr_which=1).
-	 */
-	(void)reln;
-	(void)forknum;
-	(void)blocknum;
-	(void)nblocks;
+	ClusterSmgrRelationState *state;
+	ClusterSharedFsHandle *handle;
+
+	state = cluster_smgr_state_lookup(reln, true);
+	handle = cluster_smgr_ensure_handle(state, forknum);
+
+	cluster_shared_fs_writeback(handle, blocknum, nblocks);
 }
 
 

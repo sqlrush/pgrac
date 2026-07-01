@@ -14,9 +14,9 @@
  *	  - CLUSTER_WAIT_EVENTS_COUNT matches the registered WaitEventCluster table.
  *	  - cluster_get_wait_events function symbol resolves at link time.
  *
- *	  Runtime behaviour (the view returns 46 rows with the correct
- *	  type / name values) is validated by cluster_tap t/010_views.pl
- *	  on a real PG instance.
+ *	  Runtime behaviour (the view returns one row per registered wait
+ *	  event with the correct type / name values) is validated by
+ *	  cluster_tap t/010_views.pl on a real PG instance.
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
@@ -169,7 +169,7 @@ cluster_shmem_iter_regions(int *idx pg_attribute_unused(),
 UT_DEFINE_GLOBALS();
 
 
-UT_TEST(test_cluster_wait_events_count_is_99)
+UT_TEST(test_cluster_wait_events_count_is_110)
 {
 	/*
 	 * Cumulative registration roster: 61 prior + 3 added by spec-2.6 D11
@@ -191,13 +191,15 @@ UT_TEST(test_cluster_wait_events_count_is_99)
 	 * (ClusterWalThreadClaimRead/Write) + 1 added by spec-4.6 D4
 	 * (ClusterGrdShardRemaster) + 1 added by spec-4.7 D1
 	 * (ClusterGCSBlockRecovering) + 1 added by spec-4.11 D5
-	 * (ClusterThreadRecovery).
+	 * (ClusterThreadRecovery) + 1 added by spec-5.18 D12
+	 * (ClusterReconfigNodeRemoveCleanupWait) + 7 added by spec-6.0a D10
+	 * (block_device production wait events).
 	 * If a future subsystem spec adds new cluster wait events, both the
 	 * enum in wait_event.h and CLUSTER_WAIT_EVENTS_COUNT must move
 	 * together, and this test number must be bumped in lockstep.
 	 */
-	/* spec-5.18 D12: +1 ReconfigNodeRemoveCleanupWait -> 103. */
-	UT_ASSERT_EQ(CLUSTER_WAIT_EVENTS_COUNT, 103);
+	/* spec-6.0a D10: +7 block_device wait events -> 110. */
+	UT_ASSERT_EQ(CLUSTER_WAIT_EVENTS_COUNT, 110);
 }
 
 
@@ -237,7 +239,7 @@ int
 main(void)
 {
 	UT_PLAN(4);
-	UT_RUN(test_cluster_wait_events_count_is_99);
+	UT_RUN(test_cluster_wait_events_count_is_110);
 	UT_RUN(test_srf_symbol_linkable);
 	UT_RUN(test_first_event_is_ges_enqueue_acquire);
 	UT_RUN(test_adg_scn_sync_wait_in_adg_class);

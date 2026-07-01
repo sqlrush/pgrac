@@ -19,7 +19,7 @@
 #      - postgresql.conf override = block_device prevents the server
 #        from starting until cluster.block_device_path is configured
 #        (fail-closed production storage startup).
-#      - 5 cluster_shared_fs wait events are present in
+#      - 12 cluster_shared_fs wait events are present in
 #        pg_stat_cluster_wait_events under type='Cluster: SharedFs'.
 #      - 3 cluster_shared_fs injection points appear in
 #        pg_stat_cluster_injections (registry total: 17 = 14 + 3).
@@ -108,14 +108,14 @@ is($node->safe_psql('postgres',
 
 
 # ----------
-# L7: 5 wait events under "Cluster: SharedFs".
+# L7: 12 wait events under "Cluster: SharedFs".
 # ----------
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_stat_cluster_wait_events
 		   WHERE type = 'Cluster: SharedFs'}),
-	'5',
-	'L7 5 cluster_shared_fs wait events registered under type "Cluster: SharedFs"');
+	'12',
+	'L7 12 cluster_shared_fs wait events registered under type "Cluster: SharedFs"');
 
 
 # ----------

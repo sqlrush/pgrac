@@ -194,6 +194,16 @@ FileSync(File f pg_attribute_unused(), uint32 w pg_attribute_unused())
 {
 	return 0;
 }
+int
+FilePrefetch(File f pg_attribute_unused(), off_t o pg_attribute_unused(),
+			 off_t a pg_attribute_unused(), uint32 w pg_attribute_unused())
+{
+	return 0;
+}
+void
+FileWriteback(File f pg_attribute_unused(), off_t o pg_attribute_unused(),
+			  off_t a pg_attribute_unused(), uint32 w pg_attribute_unused())
+{}
 off_t
 FileSize(File f pg_attribute_unused())
 {
@@ -323,6 +333,17 @@ dummy_block_fence_capability(void)
 {
 	return CLUSTER_FENCE_CAP_NONE;
 }
+static bool
+dummy_block_prefetch(ClusterSharedFsHandle *handle pg_attribute_unused(),
+					 BlockNumber blocknum pg_attribute_unused())
+{
+	return true;
+}
+static void
+dummy_block_writeback(ClusterSharedFsHandle *handle pg_attribute_unused(),
+					  BlockNumber blocknum pg_attribute_unused(),
+					  BlockNumber nblocks pg_attribute_unused())
+{}
 
 const ClusterSharedFsOps cluster_shared_fs_block_device_ops = {
 	.name = "block_device",
@@ -344,6 +365,8 @@ const ClusterSharedFsOps cluster_shared_fs_block_device_ops = {
 	.barrier_sync = dummy_block_barrier_sync,
 	.register_fence_key = dummy_block_register_fence_key,
 	.fence_capability = dummy_block_fence_capability,
+	.prefetch = dummy_block_prefetch,
+	.writeback = dummy_block_writeback,
 };
 
 /* ----------

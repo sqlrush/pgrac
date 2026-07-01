@@ -128,8 +128,8 @@ StaticAssertDecl(offsetof(ClusterSharedFsCaps, durability_class) == 9,
 /*
  * ClusterSharedFsOps -- vtable.
  *
- *	Eleven storage callbacks plus two lifecycle callbacks, thirteen
- *	function pointers total.  Every member must be non-NULL when
+ *	Eleven core storage callbacks, two lifecycle callbacks, and five
+ *	production extension callbacks.  Every member must be non-NULL when
  *	registered; cluster_shared_fs_register_backend rejects partial
  *	implementations to make link-time auditing clean.
  *
@@ -161,7 +161,7 @@ StaticAssertDecl(offsetof(ClusterSharedFsCaps, durability_class) == 9,
  *	Spec-1.7.2-cluster-smgr-warning-create-lifecycle 2026-05-03:
  *	`create` callback signature extended with `bool isRedo` parameter
  *	to match PG md.c mdcreate (see md.c:218).  Internal ABI bugfix-
- *	level amend; total still thirteen function pointers.
+ *	level amend; spec-6.0a appends durability/fence/advisory callbacks.
  */
 typedef struct ClusterSharedFsOps {
 	const char *name; /* "stub" / "local" / ... */
@@ -194,6 +194,8 @@ typedef struct ClusterSharedFsOps {
 	int (*barrier_sync)(ClusterSharedFsHandle *handle);
 	int (*register_fence_key)(int node_id);
 	ClusterFenceCapability (*fence_capability)(void);
+	bool (*prefetch)(ClusterSharedFsHandle *handle, BlockNumber blocknum);
+	void (*writeback)(ClusterSharedFsHandle *handle, BlockNumber blocknum, BlockNumber nblocks);
 } ClusterSharedFsOps;
 
 
@@ -295,6 +297,9 @@ extern void cluster_shared_fs_unlink(RelFileLocator rlocator, ForkNumber forknum
 extern int cluster_shared_fs_barrier_sync(ClusterSharedFsHandle *handle);
 extern int cluster_shared_fs_register_fence_key(int node_id);
 extern ClusterFenceCapability cluster_shared_fs_fence_capability(void);
+extern bool cluster_shared_fs_prefetch(ClusterSharedFsHandle *handle, BlockNumber blocknum);
+extern void cluster_shared_fs_writeback(ClusterSharedFsHandle *handle, BlockNumber blocknum,
+										BlockNumber nblocks);
 
 
 /*
