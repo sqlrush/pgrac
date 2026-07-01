@@ -1048,16 +1048,25 @@ cluster_init_guc(void)
 		NULL,														  /* assign_hook */
 		NULL);														  /* show_hook */
 
-	/* spec-3.27 D7 (gate for D3b): undo DATA-block buffer backend.  PGC_POSTMASTER
-	 * because the bufmgr backend changes the undo storage architecture at start
-	 * (the custom pool vs shared buffers are not swappable at runtime). */
+	/* spec-3.27 D7 (gate for D3b/D3c): undo DATA-block buffer backend.
+	 * PGC_POSTMASTER because the backend changes the undo storage architecture at
+	 * start (the custom pool vs shared buffers are not swappable at runtime).
+	 *
+	 * spec-3.27 park decision (2026-07-01): the bufmgr backend is EXPERIMENTAL and
+	 * OFF by default.  It is correctness-verified (crash recovery, MVCC) but
+	 * measured NO faster than -- and under concurrency somewhat slower than -- the
+	 * legacy_pool + backend-local pin fast path, so it does not deliver the single-
+	 * node write-tax reduction it was built to test.  Keep legacy_pool in
+	 * production; bufmgr exists only for A/B experimentation. */
 	DefineCustomEnumVariable(
 		"cluster.undo_buffer_backend",
 		gettext_noop("Buffer layer that backs cluster undo DATA blocks."),
-		gettext_noop("legacy_pool (default) keeps the custom undo buffer pool "
-					 "(spec-3.18, write-through / write-back); bufmgr routes undo "
-					 "runtime writes and reads through PostgreSQL's shared buffer "
-					 "manager (spec-3.27 B2-full).  recovery stays path-based."),
+		gettext_noop("legacy_pool (default, recommended) keeps the custom undo "
+					 "buffer pool (spec-3.18, write-through / write-back).  bufmgr "
+					 "(EXPERIMENTAL) routes undo runtime writes and reads through "
+					 "PostgreSQL's shared buffer manager; it is correctness-verified "
+					 "but measured no faster than legacy_pool, so it is not "
+					 "recommended for production.  recovery stays path-based."),
 		&cluster_undo_buffer_backend, CLUSTER_UNDO_BUFFER_BACKEND_LEGACY_POOL, /* boot */
 		cluster_undo_buffer_backend_options, PGC_POSTMASTER, 0,				   /* flags */
 		NULL,																   /* check_hook */
