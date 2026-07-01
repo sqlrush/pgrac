@@ -117,6 +117,17 @@ is($node->safe_psql('postgres', 'SELECT sum(id), min(left(payload, 2)) FROM bd_b
 	'L4 table B survives checkpoint plus immediate stop/start on block_device');
 
 $node->safe_psql('postgres', q{
+	CREATE TABLE bd_redo (id int PRIMARY KEY, payload text);
+	INSERT INTO bd_redo SELECT g, 'redo-' || g FROM generate_series(1, 700) g;
+});
+$node->stop('immediate');
+$node->start;
+
+is($node->safe_psql('postgres', 'SELECT count(*), min(left(payload, 5)) FROM bd_redo'),
+	'700|redo-',
+	'L4b committed pre-checkpoint rows survive immediate crash restart via WAL redo');
+
+$node->safe_psql('postgres', q{
 	TRUNCATE bd_b;
 	CHECKPOINT;
 });

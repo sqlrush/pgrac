@@ -88,6 +88,8 @@ static jmp_buf error_jmp;
 static bool expect_error = false;
 static int last_elevel = 0;
 static uint64 raw_wal_emit_count = 0;
+static bool test_xlog_insert_allowed = true;
+static bool test_recovery_in_progress = false;
 
 void
 ExceptionalCondition(const char *conditionName, const char *fileName, int lineNumber)
@@ -272,7 +274,13 @@ XLogFlush(XLogRecPtr record pg_attribute_unused())
 bool
 XLogInsertAllowed(void)
 {
-	return true;
+	return test_xlog_insert_allowed;
+}
+
+bool
+RecoveryInProgress(void)
+{
+	return test_recovery_in_progress;
 }
 
 TimestampTz
@@ -417,6 +425,14 @@ UT_TEST(test_block_device_roundtrip_layout_and_eof)
 	UT_ASSERT_EQ(memcmp(in0, out, BLCKSZ), 0);
 	ops->close(handle_b);
 	handle_b = NULL;
+
+	raw_wal_emit_count = 0;
+	test_xlog_insert_allowed = false;
+	test_recovery_in_progress = true;
+	ops->extend(handle, 1);
+	UT_ASSERT_EQ(raw_wal_emit_count, 0);
+	test_recovery_in_progress = false;
+	test_xlog_insert_allowed = true;
 
 	memset(in130, 0xc3, sizeof(in130));
 	ops->extend(handle, 130);

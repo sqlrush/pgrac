@@ -309,15 +309,28 @@ raw_write_page(uint64 offset, const char *image, bool wal_log)
 {
 	PGIOAlignedBlock io;
 	XLogRecPtr lsn = InvalidXLogRecPtr;
+	bool xlog_insert_allowed = false;
 	int nbytes;
 
 	if (cluster_raw_device_fd < 0 || image == NULL || offset % BLCKSZ != 0)
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_STORAGE_IO_ALIGNMENT),
 						errmsg("raw layout write image or offset is invalid")));
 
+	/*
+	 * Startup redo may reach smgr extend/create paths while replaying relation
+	 * WAL.  Those metadata changes are redo work, not new changes, so they must
+	 * not recurse into RM_CLUSTER_RAW_LAYOUT emission; outside recovery, failing
+	 * to WAL-log raw metadata is a hard error.
+	 */
 	if (wal_log)
+		xlog_insert_allowed = XLogInsertAllowed();
+	if (wal_log && xlog_insert_allowed)
 		lsn = cluster_raw_layout_emit_write(offset, image);
-	if (wal_log && XLogRecPtrIsInvalid(lsn))
+	else if (wal_log && !RecoveryInProgress())
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_SHARED_STORAGE_FAILED),
+						errmsg("raw layout metadata write could not be WAL-logged"),
+						errdetail("WAL insertion is not allowed outside recovery.")));
+	if (wal_log && xlog_insert_allowed && XLogRecPtrIsInvalid(lsn))
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_SHARED_STORAGE_FAILED),
 						errmsg("raw layout metadata write could not be WAL-logged")));
 	if (!XLogRecPtrIsInvalid(lsn))
