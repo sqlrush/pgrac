@@ -20,30 +20,35 @@ operator-facing.
 
 The cluster backup surface exposes the manifest and target-resolution
 state used by `pg_cluster_backup_start`, `pg_cluster_backup_stop`, and
-`pg_cluster_create_restore_point`.
+`pg_cluster_create_restore_point`.  The `pg_cluster_basebackup` frontend
+wraps the start/stop pair in one libpq session and prints the resulting
+manifest metadata.
 
-Current 6.5 scope is conservative but no longer entirely read-only:
+Current 6.5 scope opens the proven backup/restore/PITR path:
 
-- Single-node primary backups can start and stop through the cluster SQL
-  surface.  Stop requires `waitforarchive=true` and active WAL archiving;
-  the manifest is published only after a commit-drained restore point and
-  PostgreSQL's required-WAL archive wait complete.
+- Primary backups can start and stop through the cluster SQL surface. Stop
+  requires `waitforarchive=true` and active WAL archiving; the manifest is
+  published only after a commit-drained restore point and PostgreSQL's
+  required-WAL archive wait complete.
 - The backup set records physical data, native `backup_label`, binary
   cluster manifest, control-file copy, voting-disk evidence, and per-node
-  undo/WAL-thread slices plus durable-TT proof files.  The latest artifact
-  paths are visible in the state and history views.
-- Single-thread offline restore/PITR can consume the captured `data/`
-  directory and manifest.  Startup recovery maps the cluster SCN/name target
-  to the native end-of-backup LSN proven by the manifest and restores the SCN
-  high-water mark before opening.
-- Manual `pg_cluster_create_restore_point()` records a local restore point
-  after the same commit fence drains and the restore-point WAL record is
-  flushed.
-- Multi-thread restore replay, standby-offload backup, timestamp targets,
-  automatic restore-point scheduling, and multiple simultaneous cluster
-  PITR target settings remain fail-closed until their proof is implemented.
-  The server refuses to publish a partial manifest instead of reporting an
-  unsound backup as complete.
+  undo/WAL-thread slices plus durable-TT proof files.  When `cluster_fs` is
+  active, it also records a `shared_data/` region for shared relation files.
+  The latest artifact paths are visible in the state and history views.
+- Offline restore/PITR consumes the captured `data/` directory and manifest.
+  Startup recovery maps single-thread manifests to native recovery and
+  multi-thread manifests to the spec-4.5 k-way SCN merge engine in restore
+  mode.  SCN, name, and cluster-time targets resolve against the manifest
+  restore-point catalog.
+- Manual `pg_cluster_create_restore_point()` records a restore point after
+  the same commit fence drains and the restore-point WAL record is flushed.
+  Automatic restore-point scheduling runs in no-peer topology; multi-node
+  deployments should use explicit restore points until the scheduler is
+  asynchronous.
+- Multiple simultaneous cluster PITR target settings, standby-offload backup,
+  and online in-place rewind remain fail-closed.  The server refuses to
+  publish a partial manifest instead of reporting an unsound backup as
+  complete.
 
 ### `pg_stat_cluster_backup`
 
@@ -121,6 +126,12 @@ Mutating function execution is revoked from PUBLIC:
 SELECT * FROM pg_cluster_backup_start('b1', true);
 SELECT * FROM pg_cluster_backup_stop(true);
 SELECT * FROM pg_cluster_create_restore_point('rp1');
+```
+
+Equivalent frontend backup:
+
+```bash
+pg_cluster_basebackup --label b1 --fast -d postgres
 ```
 
 ## pg_cluster_nodes

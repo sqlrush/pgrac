@@ -54,6 +54,7 @@
 #include "miscadmin.h" /* DataDir (authority marker path) */
 #include "port/pg_crc32c.h"
 #include "storage/fd.h"
+#include "utils/errcodes.h"
 #include "utils/wait_event.h"
 
 /*
@@ -370,6 +371,8 @@ typedef struct MergeStream {
 	XLogRecPtr valid_end; /* spec-4.5a D6: EndRecPtr of the last complete
 						   * record found by the pre-replay decode pass */
 	XLogRecPtr last_end;  /* EndRecPtr of the last record replay consumed */
+	XLogRecPtr stop_lsn;  /* restore mode: inclusive per-thread cut record */
+	bool restore_mode;
 } MergeStream;
 
 struct ClusterRecoveryMergeState {
@@ -500,6 +503,10 @@ stream_advance(ClusterRecoveryMergeState *st, int idx)
 					 errhint("A crashed peer's WAL stream is corrupt between validation and "
 							 "replay; recover this node's own stream with "
 							 "cluster.merged_recovery=off.")));
+		ms->exhausted = true;
+		return;
+	}
+	if (ms->stop_lsn != InvalidXLogRecPtr && ms->reader->ReadRecPtr > ms->stop_lsn) {
 		ms->exhausted = true;
 		return;
 	}
@@ -666,7 +673,8 @@ cluster_recovery_merge_decide(uint16 own_thread, XLogRecPtr own_redo, uint64 out
  */
 static XLogRecPtr
 merge_compute_valid_end(const char *dir, XLogRecPtr start_lsn, XLogRecPtr validated_min,
-						bool is_candidate, uint16 tid, TimeLineID tli)
+						bool is_candidate, uint16 tid, TimeLineID tli, XLogRecPtr stop_lsn,
+						bool restore_mode)
 {
 	MergeStream tmp;
 	XLogReaderState *reader;
@@ -686,8 +694,11 @@ merge_compute_valid_end(const char *dir, XLogRecPtr start_lsn, XLogRecPtr valida
 						errmsg("out of memory allocating merged-recovery validation reader")));
 	reader->seg.ws_tli = tli;
 	XLogBeginRead(reader, start_lsn);
-	while (XLogReadRecord(reader, &errm) != NULL)
+	while (XLogReadRecord(reader, &errm) != NULL) {
 		valid_end = reader->EndRecPtr;
+		if (stop_lsn != InvalidXLogRecPtr && reader->ReadRecPtr >= stop_lsn)
+			break;
+	}
 	if (tmp.seg_fd >= 0) {
 		close(tmp.seg_fd);
 		tmp.seg_fd = -1;
@@ -728,12 +739,24 @@ merge_compute_valid_end(const char *dir, XLogRecPtr start_lsn, XLogRecPtr valida
 						errhint("A crashed peer's WAL stream is truncated or corrupt before its "
 								"recorded end; recover this node's own stream with "
 								"cluster.merged_recovery=off.")));
+	if (restore_mode && stop_lsn != InvalidXLogRecPtr && valid_end < stop_lsn)
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_BACKUP_INCOMPLETE),
+						errmsg("cluster backup restore: thread %u WAL does not reach the "
+							   "manifest cut",
+							   (unsigned)tid),
+						errdetail("decoded through %X/%X from start %X/%X; manifest cut is "
+								  "%X/%X%s%s.",
+								  LSN_FORMAT_ARGS(valid_end), LSN_FORMAT_ARGS(start_lsn),
+								  LSN_FORMAT_ARGS(stop_lsn), errm ? ": " : "", errm ? errm : ""),
+						errhint("The backup set or archive is missing WAL required by the "
+								"cluster backup manifest.")));
 	return valid_end;
 }
 
-ClusterRecoveryMergeState *
-cluster_recovery_merge_begin(const uint64 merge_bitmap[2], const XLogRecPtr *start_lsn,
-							 uint16 own_thread, TimeLineID tli)
+static ClusterRecoveryMergeState *
+cluster_recovery_merge_begin_internal(const uint64 merge_bitmap[2], const XLogRecPtr *start_lsn,
+									  const XLogRecPtr *stop_lsn, const char *wal_root,
+									  uint16 own_thread, TimeLineID tli, bool restore_mode)
 {
 	ClusterRecoveryMergeState *st;
 	uint16 tid;
@@ -757,7 +780,9 @@ cluster_recovery_merge_begin(const uint64 merge_bitmap[2], const XLogRecPtr *sta
 		ms->thread_id = tid;
 		ms->seg_fd = -1;
 		ms->exhausted = false;
-		snprintf(ms->dir, sizeof(ms->dir), "%s/thread_%u", cluster_wal_threads_dir, (unsigned)tid);
+		ms->stop_lsn = stop_lsn != NULL ? stop_lsn[tid] : InvalidXLogRecPtr;
+		ms->restore_mode = restore_mode;
+		snprintf(ms->dir, sizeof(ms->dir), "%s/thread_%u", wal_root, (unsigned)tid);
 		ms->reader = XLogReaderAllocate(wal_segment_size, ms->dir,
 										XL_ROUTINE(.page_read = merge_page_read,
 												   .segment_open = merge_segment_open,
@@ -776,11 +801,12 @@ cluster_recovery_merge_begin(const uint64 merge_bitmap[2], const XLogRecPtr *sta
 			ClusterWalStateSlot slot;
 			XLogRecPtr validated_min = InvalidXLogRecPtr;
 
-			if (cluster_wal_state_read_slot(tid, &slot) == CLUSTER_WAL_SLOT_OK
+			if (!restore_mode && cluster_wal_state_read_slot(tid, &slot) == CLUSTER_WAL_SLOT_OK
 				&& slot.highest_lsn > (uint64)start_lsn[tid])
 				validated_min = (XLogRecPtr)slot.highest_lsn;
 			ms->valid_end = merge_compute_valid_end(ms->dir, start_lsn[tid], validated_min,
-													tid != own_thread, tid, tli);
+													!restore_mode && tid != own_thread, tid, tli,
+													ms->stop_lsn, restore_mode);
 		}
 		ms->last_end = start_lsn[tid];
 		idx++;
@@ -791,6 +817,26 @@ cluster_recovery_merge_begin(const uint64 merge_bitmap[2], const XLogRecPtr *sta
 	for (idx = 0; idx < st->n_streams; idx++)
 		stream_advance(st, idx);
 	return st;
+}
+
+ClusterRecoveryMergeState *
+cluster_recovery_merge_begin(const uint64 merge_bitmap[2], const XLogRecPtr *start_lsn,
+							 uint16 own_thread, TimeLineID tli)
+{
+	return cluster_recovery_merge_begin_internal(merge_bitmap, start_lsn, NULL,
+												 cluster_wal_threads_dir, own_thread, tli, false);
+}
+
+ClusterRecoveryMergeState *
+cluster_recovery_merge_begin_restore(const uint64 merge_bitmap[2], const XLogRecPtr *start_lsn,
+									 const XLogRecPtr *stop_lsn, const char *wal_root,
+									 uint16 own_thread, TimeLineID tli)
+{
+	if (wal_root == NULL || wal_root[0] == '\0')
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_BACKUP_INCOMPLETE),
+						errmsg("cluster backup restore has no per-thread WAL root")));
+	return cluster_recovery_merge_begin_internal(merge_bitmap, start_lsn, stop_lsn, wal_root,
+												 own_thread, tli, true);
 }
 
 XLogReaderState *

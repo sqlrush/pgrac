@@ -15,6 +15,7 @@ binaries = [
   'vacuumdb',
   'reindexdb',
   'pg_isready',
+  'pg_cluster_basebackup',
 ]
 
 foreach binary : binaries

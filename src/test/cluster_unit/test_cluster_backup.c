@@ -73,6 +73,15 @@ fill_valid_manifest(ClusterBackupManifest *m)
 	m->backend_storage_id = 3;
 	m->node_count = 1;
 	m->control_included = true;
+	m->shared_data_included = true;
+	m->restore_point_count = 1;
+	m->restore_points[0].present = true;
+	strlcpy(m->restore_points[0].name, "cluster_backup_stop_b1", sizeof(m->restore_points[0].name));
+	m->restore_points[0].cut_scn = test_scn(10);
+	m->restore_points[0].cut_lsn[0] = 40;
+	m->restore_points[0].thread_count = 1;
+	m->restore_points[0].incarnation = 1;
+	m->restore_points[0].created_at = 1000;
 
 	memset(&thread, 0, sizeof(thread));
 	thread.thread_id = 1;
@@ -106,6 +115,11 @@ UT_TEST(test_manifest_rejects_missing_control_wal_undo_tt)
 	m.control_included = false;
 	cluster_backup_manifest_seal(&m);
 	UT_ASSERT_EQ(cluster_backup_manifest_validate(&m), CLUSTER_BACKUP_MANIFEST_MISSING_CONTROL);
+
+	fill_valid_manifest(&m);
+	m.shared_data_included = false;
+	cluster_backup_manifest_seal(&m);
+	UT_ASSERT_EQ(cluster_backup_manifest_validate(&m), CLUSTER_BACKUP_MANIFEST_MISSING_SHARED_DATA);
 
 	fill_valid_manifest(&m);
 	m.threads[0].wal_included = false;
@@ -145,6 +159,21 @@ UT_TEST(test_manifest_rejects_bad_scn_lsn_count_and_crc)
 	fill_valid_manifest(&m);
 	m.manifest_crc++;
 	UT_ASSERT_EQ(cluster_backup_manifest_validate(&m), CLUSTER_BACKUP_MANIFEST_BAD_CRC);
+}
+
+UT_TEST(test_manifest_rejects_bad_restore_point_catalog)
+{
+	ClusterBackupManifest m;
+
+	fill_valid_manifest(&m);
+	m.restore_point_count = CLUSTER_BACKUP_RESTORE_POINT_MAX + 1;
+	cluster_backup_manifest_seal(&m);
+	UT_ASSERT_EQ(cluster_backup_manifest_validate(&m), CLUSTER_BACKUP_MANIFEST_BAD_COUNTS);
+
+	fill_valid_manifest(&m);
+	m.restore_points[0].cut_lsn[0] = InvalidXLogRecPtr;
+	cluster_backup_manifest_seal(&m);
+	UT_ASSERT_EQ(cluster_backup_manifest_validate(&m), CLUSTER_BACKUP_MANIFEST_MISSING_THREAD);
 }
 
 UT_TEST(test_manifest_set_thread_is_bounds_defensive)
@@ -333,10 +362,11 @@ UT_TEST(test_backup_wire_ack_fail_closed_validation)
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
 	UT_RUN(test_manifest_validates_complete_single_thread);
 	UT_RUN(test_manifest_rejects_missing_control_wal_undo_tt);
 	UT_RUN(test_manifest_rejects_bad_scn_lsn_count_and_crc);
+	UT_RUN(test_manifest_rejects_bad_restore_point_catalog);
 	UT_RUN(test_manifest_set_thread_is_bounds_defensive);
 	UT_RUN(test_restore_point_cut_requires_drain_and_fence);
 	UT_RUN(test_restore_point_cut_records_all_threads);

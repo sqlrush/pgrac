@@ -22,6 +22,7 @@ use lib "$FindBin::RealBin/../lib";
 use PgracClusterNode;
 use PostgreSQL::Test::RecursiveCopy;
 use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::ClusterPair;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
@@ -111,6 +112,17 @@ like(slurp_file("$backup_set_path/data/backup_label"),
 	qr/CLUSTER_RESTORE_POINT_NAME: cluster_backup_stop_b332/,
 	'L8a backup_label carries cluster restore-point metadata');
 
+my ($stop_restore_name, $stop_restore_time) = split /\n/,
+  $node->safe_psql('postgres',
+	q{SELECT restore_point_name
+	     FROM pg_cluster_restore_points
+	    WHERE restore_point_name = 'cluster_backup_stop_b332';
+	  SELECT created_at
+	     FROM pg_cluster_restore_points
+	    WHERE restore_point_name = 'cluster_backup_stop_b332';});
+is($stop_restore_name, 'cluster_backup_stop_b332',
+	'L8b backup-stop restore point is visible by name');
+
 $node->safe_psql('postgres',
 	q{INSERT INTO cluster_backup_probe VALUES (2, 'after-backup');
 	  SELECT pg_switch_wal();});
@@ -143,6 +155,22 @@ is($node->safe_psql('postgres',
 	'f,1',
 	'L12 rejected no-wait stop clears in-progress state and keeps manifest history stable');
 
+PostgreSQL::Test::Utils::command_like(
+	[
+		'pg_cluster_basebackup', '--fast', '--label', 'cli332',
+		'-h', $node->host, '-p', $node->port, '-d', 'postgres'
+	],
+	qr/\Abackup_id=cli332\nstart_redo_lsn=[0-9A-F]+\/[0-9A-F]+\ncheckpoint_lsn=[0-9A-F]+\/[0-9A-F]+\nstart_tli=\d+\nconsistent_scn=\d+\nstop_cut_lsn=[0-9A-F]+\/[0-9A-F]+\nmanifest_crc=\d+\nbackup_set_path=.+\nmanifest_path=.+cluster_backup\.manifest\n\z/,
+	'L12a pg_cluster_basebackup CLI completes the proven success path');
+my ($cli_backup_set, $cli_manifest_path, $cli_threads) = split /\n/,
+  $node->safe_psql('postgres',
+	q{SELECT backup_set_path FROM pg_cluster_backup_history WHERE backup_id = 'cli332';
+	  SELECT manifest_path FROM pg_cluster_backup_history WHERE backup_id = 'cli332';
+	  SELECT thread_count FROM pg_cluster_backup_history WHERE backup_id = 'cli332';});
+is($cli_threads, '1', 'L12a CLI backup records one local WAL thread');
+ok(-d "$cli_backup_set/data", 'L12a CLI backup captured physical data directory');
+ok(-f $cli_manifest_path, 'L12a CLI backup published manifest path');
+
 $node->stop;
 
 my $restore = PgracClusterNode->new('cluster_backup_restore');
@@ -161,6 +189,40 @@ is($restore->safe_psql('postgres',
 	'1',
 	'L13 offline restore/PITR replays to the cluster backup-stop restore point');
 $restore->stop;
+
+my $name_restore = PgracClusterNode->new('cluster_backup_name_restore');
+PostgreSQL::Test::RecursiveCopy::copypath("$backup_set_path/data", $name_restore->data_dir);
+chmod(0700, $name_restore->data_dir);
+$name_restore->append_conf('postgresql.conf',
+	  "port = " . $name_restore->port . "\n"
+	. "unix_socket_directories = '" . $name_restore->host . "'\n"
+	. "restore_command = 'cp $archive_dir/%f %p'\n"
+	. "cluster.recovery_target_name = '$stop_restore_name'\n"
+	. "cluster.recovery_target_action = 'promote'\n");
+PostgreSQL::Test::Utils::append_to_file($name_restore->data_dir . '/recovery.signal', '');
+$name_restore->start;
+is($name_restore->safe_psql('postgres',
+	q{SELECT string_agg(id::text, ',' ORDER BY id) FROM cluster_backup_probe}),
+	'1',
+	'L13c offline restore/PITR resolves named cluster restore point');
+$name_restore->stop;
+
+my $time_restore = PgracClusterNode->new('cluster_backup_time_restore');
+PostgreSQL::Test::RecursiveCopy::copypath("$backup_set_path/data", $time_restore->data_dir);
+chmod(0700, $time_restore->data_dir);
+$time_restore->append_conf('postgresql.conf',
+	  "port = " . $time_restore->port . "\n"
+	. "unix_socket_directories = '" . $time_restore->host . "'\n"
+	. "restore_command = 'cp $archive_dir/%f %p'\n"
+	. "cluster.recovery_target_cluster_time = '$stop_restore_time'\n"
+	. "cluster.recovery_target_action = 'promote'\n");
+PostgreSQL::Test::Utils::append_to_file($time_restore->data_dir . '/recovery.signal', '');
+$time_restore->start;
+is($time_restore->safe_psql('postgres',
+	q{SELECT string_agg(id::text, ',' ORDER BY id) FROM cluster_backup_probe}),
+	'1',
+	'L13d offline restore/PITR resolves cluster-time restore point');
+$time_restore->stop;
 
 my $bad_manifest_restore = PgracClusterNode->new('cluster_backup_bad_manifest_restore');
 PostgreSQL::Test::RecursiveCopy::copypath("$backup_set_path/data",
@@ -184,39 +246,107 @@ like(slurp_file($bad_manifest_restore->logfile),
 	qr/cluster backup manifest is invalid|cluster_backup_incomplete/,
 	'L13b corrupt manifest reports cluster backup incomplete');
 
-my $peer_node = PgracClusterNode->new('cluster_backup_peers');
-my $peer_ic0 = PostgreSQL::Test::Cluster::get_free_port();
-my $peer_ic1 = PostgreSQL::Test::Cluster::get_free_port();
-$peer_node->init(allows_streaming => 1);
-$peer_node->append_conf('postgresql.conf',
-	  "cluster.enabled = on\n"
-	. "cluster.node_id = 0\n"
-	. "cluster.allow_single_node = on\n"
-	. "wal_level = replica\n");
-PostgreSQL::Test::Utils::append_to_file($peer_node->data_dir . '/pgrac.conf', <<EOC);
+my $pair_archive = PostgreSQL::Test::Utils::tempdir();
+my $pair = PostgreSQL::Test::ClusterPair->new_pair(
+	'cluster_backup_pair',
+	quorum_voting_disks => 3,
+	wal_threads_root    => 1,
+	shared_data         => 1,
+	extra_conf          => [
+		'autovacuum = off',
+		'wal_level = replica',
+		'archive_mode = on',
+		"archive_command = 'cp %p $pair_archive/%f'",
+	]);
+$pair->start_pair;
+ok($pair->wait_for_peer_state(0, 1, 'connected', 30),
+	'L14 two-node backup setup has node0 connected to node1');
+
+$pair->node0->safe_psql('postgres',
+	q{CREATE TABLE cluster_backup_pair_probe(id int PRIMARY KEY, note text);
+	  INSERT INTO cluster_backup_pair_probe VALUES (1, 'pair-before-backup');});
+
+is($pair->node0->safe_psql('postgres',
+	q{SELECT backup_id || ',' ||
+	          CASE WHEN start_redo_lsn IS NOT NULL THEN 't' ELSE 'f' END || ',' ||
+	          CASE WHEN checkpoint_lsn IS NOT NULL THEN 't' ELSE 'f' END
+	     FROM pg_cluster_backup_start('pair332', true);
+	  SELECT CASE WHEN consistent_scn > 0 THEN 't' ELSE 'f' END || ',' ||
+	          CASE WHEN stop_cut_lsn IS NOT NULL THEN 't' ELSE 'f' END || ',' ||
+	          CASE WHEN manifest_crc <> 0 THEN 't' ELSE 'f' END
+	     FROM pg_cluster_backup_stop(true);}),
+	"pair332,t,t\nt,t,t",
+	'L15 two-node cluster backup start/stop succeeds through peer IC coordination');
+
+my ($pair_backup_set, $pair_threads, $pair_nodes, $pair_consistent_scn) = split /\n/,
+  $pair->node0->safe_psql('postgres',
+	q{SELECT backup_set_path FROM pg_cluster_backup_history;
+	  SELECT thread_count FROM pg_cluster_backup_history;
+	  SELECT node_count FROM pg_cluster_backup_history;
+	  SELECT consistent_scn FROM pg_cluster_backup_history;});
+is("$pair_threads,$pair_nodes", '2,2',
+	'L16 two-node manifest records both WAL threads and nodes');
+ok(-d "$pair_backup_set/thread_1", 'L17 coordinator WAL thread was captured');
+ok(-d "$pair_backup_set/thread_2", 'L17 peer WAL thread was captured');
+ok(-d "$pair_backup_set/node_0_pg_undo", 'L17 coordinator undo region was captured');
+ok(-d "$pair_backup_set/node_1_pg_undo", 'L17 peer undo region was captured');
+ok(-f "$pair_backup_set/node_1_tt.proof", 'L17 peer durable TT evidence was captured');
+ok(-d "$pair_backup_set/shared_data", 'L17 shared-data region was captured');
+
+$pair->node0->safe_psql('postgres',
+	q{INSERT INTO cluster_backup_pair_probe VALUES (2, 'pair-after-backup');
+	  SELECT pg_switch_wal();});
+
+$pair->stop_pair;
+
+my $pair_restore_shared_parent = PostgreSQL::Test::Utils::tempdir();
+my $pair_restore_shared = "$pair_restore_shared_parent/shared_data";
+PostgreSQL::Test::RecursiveCopy::copypath("$pair_backup_set/shared_data",
+	$pair_restore_shared);
+my $pair_restore = PgracClusterNode->new('cluster_backup_pair_restore');
+PostgreSQL::Test::RecursiveCopy::copypath("$pair_backup_set/data",
+	$pair_restore->data_dir);
+chmod(0700, $pair_restore->data_dir);
+my $pair_restore_ic0 = PostgreSQL::Test::Cluster::get_free_port();
+my $pair_restore_ic1 = PostgreSQL::Test::Cluster::get_free_port();
+unlink $pair_restore->data_dir . '/pgrac.conf';
+PostgreSQL::Test::Utils::append_to_file($pair_restore->data_dir . '/pgrac.conf',
+	<<EOC);
 [cluster]
-name = pgrac-backup-peer-failclosed
+name = cluster_backup_pair_restore
 
 [node.0]
-interconnect_addr = 127.0.0.1:$peer_ic0
+interconnect_addr = 127.0.0.1:$pair_restore_ic0
 
 [node.1]
-interconnect_addr = 127.0.0.1:$peer_ic1
+interconnect_addr = 127.0.0.1:$pair_restore_ic1
 EOC
-$peer_node->start;
-
-my ($ret, $out, $err) = $peer_node->psql('postgres',
-	"\\set VERBOSITY verbose\nSELECT * FROM pg_cluster_backup_start('partial', true)");
-isnt($ret, 0, 'L14 declared-peer backup remains fail-closed without cross-node proof');
-like($err, qr/0A000|feature_not_supported/,
-	'L14 declared-peer backup reports feature_not_supported');
-is($peer_node->safe_psql('postgres',
-	q{SELECT CASE WHEN in_progress THEN 't' ELSE 'f' END
-	     FROM pg_stat_cluster_backup}),
-	'f',
-	'L15 failed peer backup did not leave in-progress state');
-
-$peer_node->stop;
+$pair_restore->append_conf('postgresql.conf',
+	  "port = " . $pair_restore->port . "\n"
+	. "unix_socket_directories = '" . $pair_restore->host . "'\n"
+	. "restore_command = 'cp $pair_archive/%f %p'\n"
+	. "cluster.enabled = on\n"
+	. "cluster.node_id = 0\n"
+	. "cluster.allow_single_node = on\n"
+	. "cluster.voting_disks = ''\n"
+	. "cluster.wal_threads_dir = ''\n"
+	. "cluster.shared_storage_backend = cluster_fs\n"
+	. "cluster.shared_data_dir = '$pair_restore_shared'\n"
+	. "cluster.smgr_user_relations = on\n"
+	. "cluster.pcm_grd_max_entries = 0\n"
+	. "cluster.recovery_target_scn = '$pair_consistent_scn'\n"
+	. "cluster.recovery_target_action = 'promote'\n");
+PostgreSQL::Test::Utils::append_to_file($pair_restore->data_dir . '/recovery.signal', '');
+$pair_restore->start;
+is($pair_restore->safe_psql('postgres',
+	q{SELECT string_agg(id::text || ':' || note, ',' ORDER BY id)
+	     FROM cluster_backup_pair_probe}),
+	'1:pair-before-backup',
+	'L18 two-node backup->restore->PITR reads the manifest-consistent cut');
+like(slurp_file($pair_restore->logfile),
+	qr/redo done \(cluster backup restore\)/,
+	'L18 two-node restore drove the multi-thread restore-mode merge');
+$pair_restore->stop;
 
 my $bad_target_node = PgracClusterNode->new('cluster_backup_bad_target');
 $bad_target_node->init(allows_streaming => 1);

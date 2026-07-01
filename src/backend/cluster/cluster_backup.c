@@ -67,6 +67,7 @@ PG_FUNCTION_INFO_V1(cluster_get_pitr_status);
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/storage/cluster_shared_fs.h"
 
 typedef struct ClusterBackupSharedState {
 	LWLockPadded lock;
@@ -75,6 +76,8 @@ typedef struct ClusterBackupSharedState {
 	ClusterBackupManifest last_manifest;
 	int restore_point_count;
 	int restore_point_next;
+	TimestampTz last_auto_restore_point_at;
+	uint64 auto_restore_point_seq;
 	ClusterRestorePoint restore_points[CLUSTER_BACKUP_RESTORE_POINT_MAX];
 	pg_atomic_uint32 pending_commit_count;
 	pg_atomic_uint32 commit_fence_active;
@@ -115,6 +118,7 @@ static bool cluster_backup_pending_commit_exit_registered = false;
 #define CLUSTER_BACKUP_COORD_TIMEOUT_MS 120000
 #define CLUSTER_BACKUP_PIN_MAGIC 0x50475049U /* "PGPI" */
 #define CLUSTER_BACKUP_PIN_VERSION 1
+#define CLUSTER_BACKUP_SHARED_CONTROL_FILE "pgrac_shared.control"
 
 typedef struct ClusterBackupPinFile {
 	uint32 magic;
@@ -213,9 +217,12 @@ static void cluster_backup_make_restore_point(const char *name, ClusterRestorePo
 static void cluster_backup_prepare_cluster_backup_stop_point(const char *name,
 															 const char *backup_set_path,
 															 ClusterRestorePoint *point);
+static void cluster_backup_maybe_auto_restore_point(void);
 static void cluster_backup_make_backup_set_path(const char *backup_id, char *path, size_t pathlen);
 static void cluster_backup_ensure_dir(const char *path);
 static void cluster_backup_capture_backup_set(const char *backup_set_path, bool include_data);
+static void cluster_backup_ensure_captured_data_wal(const char *backup_set_path);
+static bool cluster_backup_capture_shared_data_region(const char *backup_set_path);
 static void cluster_backup_write_tt_proof(const char *backup_set_path);
 static void cluster_backup_write_manifest_to_path(const char *path,
 												  const ClusterBackupManifest *manifest);
@@ -476,6 +483,24 @@ cluster_backup_copy_file_required(const char *src, const char *dst)
 }
 
 static bool
+cluster_backup_copy_file_optional(const char *src, const char *dst)
+{
+	struct stat st;
+
+	if (src == NULL)
+		return false;
+	if (stat(src, &st) != 0) {
+		if (errno == ENOENT)
+			return false;
+		ereport(ERROR, (errcode_for_file_access(), errmsg("could not stat file \"%s\": %m", src)));
+	}
+	if (!S_ISREG(st.st_mode))
+		return false;
+	cluster_backup_copy_file_required(src, dst);
+	return true;
+}
+
+static bool
 cluster_backup_copy_dir_optional(const char *src, const char *dst)
 {
 	struct stat st;
@@ -484,6 +509,13 @@ cluster_backup_copy_dir_optional(const char *src, const char *dst)
 		return false;
 	if (!S_ISDIR(st.st_mode))
 		return false;
+	if (stat(dst, &st) == 0) {
+		if (!S_ISDIR(st.st_mode) || !rmtree(dst, true))
+			ereport(ERROR, (errcode_for_file_access(),
+							errmsg("could not replace directory \"%s\": %m", dst)));
+	} else if (errno != ENOENT)
+		ereport(ERROR,
+				(errcode_for_file_access(), errmsg("could not stat directory \"%s\": %m", dst)));
 	copydir(src, dst, true);
 	return true;
 }
@@ -543,6 +575,52 @@ cluster_backup_capture_voting(const char *backup_set_path)
 	}
 }
 
+static bool
+cluster_backup_capture_shared_data_region(const char *backup_set_path)
+{
+	char dstroot[MAXPGPATH];
+	char src[MAXPGPATH];
+	char dst[MAXPGPATH];
+	bool found = false;
+
+	if (cluster_shared_storage_backend != CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS)
+		return false;
+	if (cluster_shared_data_dir == NULL || cluster_shared_data_dir[0] == '\0')
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_BACKUP_INCOMPLETE),
+						errmsg("cluster shared-data root is not configured")));
+
+	cluster_backup_join_path(dstroot, sizeof(dstroot), backup_set_path, "shared_data");
+	cluster_backup_ensure_dir(dstroot);
+
+	snprintf(src, sizeof(src), "%s/%s", cluster_shared_data_dir,
+			 CLUSTER_BACKUP_SHARED_CONTROL_FILE);
+	cluster_backup_join_path(dst, sizeof(dst), dstroot, CLUSTER_BACKUP_SHARED_CONTROL_FILE);
+	if (cluster_backup_copy_file_optional(src, dst))
+		found = true;
+
+	snprintf(src, sizeof(src), "%s/base", cluster_shared_data_dir);
+	cluster_backup_join_path(dst, sizeof(dst), dstroot, "base");
+	if (cluster_backup_copy_dir_optional(src, dst))
+		found = true;
+
+	snprintf(src, sizeof(src), "%s/global", cluster_shared_data_dir);
+	cluster_backup_join_path(dst, sizeof(dst), dstroot, "global");
+	if (cluster_backup_copy_dir_optional(src, dst))
+		found = true;
+
+	snprintf(src, sizeof(src), "%s/pg_tblspc", cluster_shared_data_dir);
+	cluster_backup_join_path(dst, sizeof(dst), dstroot, "pg_tblspc");
+	if (cluster_backup_copy_dir_optional(src, dst))
+		found = true;
+
+	if (!found) {
+		cluster_backup_join_path(dst, sizeof(dst), dstroot, "empty_shared_data.proof");
+		cluster_backup_write_text_file(
+			dst, "cluster_fs shared-data root had no materialized relation files at backup time\n");
+	}
+	return true;
+}
+
 static void
 cluster_backup_capture_backup_set(const char *backup_set_path, bool include_data)
 {
@@ -560,6 +638,7 @@ cluster_backup_capture_backup_set(const char *backup_set_path, bool include_data
 	if (include_data) {
 		cluster_backup_join_path(dst, sizeof(dst), backup_set_path, "data");
 		copydir(DataDir, dst, true);
+		cluster_backup_ensure_captured_data_wal(backup_set_path);
 
 		cluster_backup_join_path(dst, sizeof(dst), backup_set_path, "control");
 		cluster_backup_ensure_dir(dst);
@@ -568,6 +647,7 @@ cluster_backup_capture_backup_set(const char *backup_set_path, bool include_data
 		cluster_backup_copy_file_required(src, dst);
 
 		cluster_backup_capture_voting(backup_set_path);
+		(void)cluster_backup_capture_shared_data_region(backup_set_path);
 	}
 
 	snprintf(src, sizeof(src), "%s/pg_undo", DataDir);
@@ -584,6 +664,38 @@ cluster_backup_capture_backup_set(const char *backup_set_path, bool include_data
 	}
 
 	cluster_backup_write_tt_proof(backup_set_path);
+}
+
+static void
+cluster_backup_ensure_captured_data_wal(const char *backup_set_path)
+{
+	char data_wal[MAXPGPATH];
+	char src[MAXPGPATH];
+	char thread_dirname[MAXPGPATH];
+	struct stat st;
+	uint16 thread_id;
+
+	cluster_backup_join_path(data_wal, sizeof(data_wal), backup_set_path, "data/" XLOGDIR);
+	if (stat(data_wal, &st) == 0) {
+		if (!S_ISDIR(st.st_mode))
+			ereport(ERROR, (errcode_for_file_access(),
+							errmsg("\"%s\" exists but is not a directory", data_wal)));
+		return;
+	}
+	if (errno != ENOENT)
+		ereport(ERROR, (errcode_for_file_access(),
+						errmsg("could not stat directory \"%s\": %m", data_wal)));
+
+	if (cluster_wal_threads_dir == NULL || cluster_wal_threads_dir[0] == '\0') {
+		cluster_backup_ensure_dir(data_wal);
+		return;
+	}
+
+	thread_id = cluster_backup_local_thread_id();
+	cluster_wal_thread_dir_name(thread_id, thread_dirname, sizeof(thread_dirname));
+	snprintf(src, sizeof(src), "%s/%s", cluster_wal_threads_dir, thread_dirname);
+	if (!cluster_backup_copy_dir_optional(src, data_wal))
+		cluster_backup_ensure_dir(data_wal);
 }
 
 static void
@@ -705,6 +817,31 @@ cluster_backup_manifest_validate_artifacts(const ClusterBackupManifest *manifest
 		cluster_backup_join_path(path, sizeof(path), root, "voting");
 		if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode))
 			return CLUSTER_BACKUP_MANIFEST_MISSING_CONTROL;
+	}
+	if (manifest->backend_storage_id == CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS) {
+		bool have_shared_region = false;
+
+		cluster_backup_join_path(path, sizeof(path), root, "shared_data");
+		if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode))
+			return CLUSTER_BACKUP_MANIFEST_MISSING_SHARED_DATA;
+		cluster_backup_join_path(path, sizeof(path), root,
+								 "shared_data/" CLUSTER_BACKUP_SHARED_CONTROL_FILE);
+		if (stat(path, &st) == 0 && S_ISREG(st.st_mode))
+			have_shared_region = true;
+		cluster_backup_join_path(path, sizeof(path), root, "shared_data/base");
+		if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
+			have_shared_region = true;
+		cluster_backup_join_path(path, sizeof(path), root, "shared_data/global");
+		if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
+			have_shared_region = true;
+		cluster_backup_join_path(path, sizeof(path), root, "shared_data/pg_tblspc");
+		if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
+			have_shared_region = true;
+		cluster_backup_join_path(path, sizeof(path), root, "shared_data/empty_shared_data.proof");
+		if (stat(path, &st) == 0 && S_ISREG(st.st_mode))
+			have_shared_region = true;
+		if (!have_shared_region)
+			return CLUSTER_BACKUP_MANIFEST_MISSING_SHARED_DATA;
 	}
 
 	cluster_backup_join_path(path, sizeof(path), root, "data/" BACKUP_LABEL_FILE);
@@ -1282,6 +1419,8 @@ cluster_backup_lmon_execute_request(const ClusterBackupWireRequest *request)
 				result = CLUSTER_BACKUP_WIRE_RESULT_EXECUTOR_ERROR;
 			else {
 				do_pg_backup_stop(cluster_backup_lmon_state, request->waitforarchive);
+				if (request->backup_set_path[0] != '\0')
+					cluster_backup_capture_backup_set(request->backup_set_path, false);
 				if (cluster_backup_lmon_restore_point_held)
 					cluster_backup_lmon_release_restore_point(request->requested_scn);
 				ack.start_redo_lsn = cluster_backup_lmon_state->startpoint;
@@ -1620,6 +1759,7 @@ cluster_backup_lmon_tick(void)
 	cluster_backup_lmon_send_coord_request();
 	cluster_backup_lmon_process_peer_command();
 	cluster_backup_lmon_send_peer_reply();
+	cluster_backup_maybe_auto_restore_point();
 }
 
 static void
@@ -1952,6 +2092,52 @@ cluster_backup_make_cluster_restore_point(const char *name, const char *backup_s
 	}
 }
 
+static void
+cluster_backup_maybe_auto_restore_point(void)
+{
+	TimestampTz now;
+	uint64 seq;
+	char name[CLUSTER_RESTORE_POINT_NAME_MAX];
+	ClusterRestorePoint point;
+
+	if (!cluster_enabled || cluster_backup_state == NULL)
+		return;
+	if (!cluster_enable_pitr_restore_points || cluster_pitr_restore_point_interval_ms <= 0)
+		return;
+	if (RecoveryInProgress())
+		return;
+	if (cluster_conf_has_peers())
+		return;
+	if (pg_atomic_read_u32(&cluster_backup_state->commit_fence_active) != 0)
+		return;
+
+	now = GetCurrentTimestamp();
+	LWLockAcquire(&cluster_backup_state->lock.lock, LW_EXCLUSIVE);
+	if (cluster_backup_state->status.in_progress
+		|| (cluster_backup_state->last_auto_restore_point_at != 0
+			&& !TimestampDifferenceExceeds(cluster_backup_state->last_auto_restore_point_at, now,
+										   cluster_pitr_restore_point_interval_ms))) {
+		LWLockRelease(&cluster_backup_state->lock.lock);
+		return;
+	}
+	cluster_backup_state->last_auto_restore_point_at = now;
+	seq = ++cluster_backup_state->auto_restore_point_seq;
+	LWLockRelease(&cluster_backup_state->lock.lock);
+
+	snprintf(name, sizeof(name), "cluster_auto_%llu", (unsigned long long)seq);
+	PG_TRY();
+	{
+		cluster_backup_make_cluster_restore_point(name, NULL, &point);
+	}
+	PG_CATCH();
+	{
+		FlushErrorState();
+		ereport(WARNING,
+				(errmsg("automatic cluster PITR restore point \"%s\" was not created", name)));
+	}
+	PG_END_TRY();
+}
+
 Datum
 pg_cluster_backup_start(PG_FUNCTION_ARGS)
 {
@@ -2057,6 +2243,9 @@ pg_cluster_backup_stop(PG_FUNCTION_ARGS)
 	uint16 thread_id;
 	int thread_index;
 	int node_id;
+	ClusterRestorePoint stored_points[CLUSTER_BACKUP_RESTORE_POINT_MAX];
+	int stored_point_count;
+	int point_index;
 	ClusterBackupCoordWaitResult waitres;
 	bool stop_fence_held = false;
 
@@ -2111,6 +2300,7 @@ pg_cluster_backup_stop(PG_FUNCTION_ARGS)
 		cluster_backup_coord_fail_if_bad(waitres, "pg_cluster_backup_stop");
 
 		do_pg_backup_stop(cluster_backup_session_state, waitforarchive);
+		cluster_backup_capture_backup_set(backup_set_path, false);
 
 		thread_id = cluster_backup_local_thread_id();
 		thread_index = (int)thread_id - 1;
@@ -2133,7 +2323,35 @@ pg_cluster_backup_stop(PG_FUNCTION_ARGS)
 		manifest.node_count = (uint32)cluster_conf_node_count();
 		manifest.control_included = true;
 		manifest.voting_included = true;
+		manifest.shared_data_included
+			= cluster_shared_storage_backend == CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS;
 		strlcpy(manifest.backup_set_path, backup_set_path, sizeof(manifest.backup_set_path));
+		manifest.restore_points[0] = stop_point;
+		manifest.restore_point_count = 1;
+
+		stored_point_count
+			= cluster_backup_get_restore_points(stored_points, CLUSTER_BACKUP_RESTORE_POINT_MAX);
+		for (point_index = 0; point_index < stored_point_count
+							  && manifest.restore_point_count < CLUSTER_BACKUP_RESTORE_POINT_MAX;
+			 point_index++) {
+			bool duplicate = false;
+			uint32 existing;
+
+			if (!stored_points[point_index].present)
+				continue;
+			if (scn_time_cmp(stored_points[point_index].cut_scn, manifest.consistent_scn) < 0)
+				continue;
+			for (existing = 0; existing < manifest.restore_point_count; existing++) {
+				if (strcmp(manifest.restore_points[existing].name, stored_points[point_index].name)
+					== 0) {
+					duplicate = true;
+					break;
+				}
+			}
+			if (!duplicate)
+				manifest.restore_points[manifest.restore_point_count++]
+					= stored_points[point_index];
+		}
 
 		MemSet(&thread, 0, sizeof(thread));
 		thread.present = true;
@@ -2437,20 +2655,6 @@ cluster_get_pitr_status(PG_FUNCTION_ARGS)
 		return (Datum)0;
 	}
 
-	if ((cluster_recovery_target_scn == NULL || cluster_recovery_target_scn[0] == '\0')
-		&& (cluster_recovery_target_name == NULL || cluster_recovery_target_name[0] == '\0')
-		&& cluster_recovery_target_cluster_time != NULL
-		&& cluster_recovery_target_cluster_time[0] != '\0') {
-		values[0] = CStringGetTextDatum("cluster_time");
-		values[1] = CStringGetTextDatum(target_action);
-		values[2] = BoolGetDatum(false);
-		values[3] = CStringGetTextDatum("unsupported_target_type");
-		nulls[4] = true;
-		nulls[5] = true;
-		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
-		return (Datum)0;
-	}
-
 	if (cluster_recovery_target_scn != NULL && cluster_recovery_target_scn[0] != '\0') {
 		int64 parsed = pg_strtoint64(cluster_recovery_target_scn);
 
@@ -2485,7 +2689,8 @@ cluster_get_pitr_status(PG_FUNCTION_ARGS)
 			return (Datum)0;
 		}
 
-		count = cluster_backup_get_restore_points(points, CLUSTER_BACKUP_RESTORE_POINT_MAX);
+		count = Min((int)manifest.restore_point_count, CLUSTER_BACKUP_RESTORE_POINT_MAX);
+		memcpy(points, manifest.restore_points, sizeof(ClusterRestorePoint) * count);
 		for (i = 0; i < count; i++) {
 			if (!points[i].present)
 				continue;
@@ -2531,6 +2736,51 @@ cluster_get_pitr_status(PG_FUNCTION_ARGS)
 		return (Datum)0;
 	}
 
+	if (!have_requested_scn && cluster_recovery_target_cluster_time != NULL
+		&& cluster_recovery_target_cluster_time[0] != '\0') {
+		TimestampTz requested_time;
+		ClusterRestorePoint *best = NULL;
+
+		if (!cluster_backup_get_last_manifest(&manifest)) {
+			values[0] = CStringGetTextDatum("cluster_time");
+			values[1] = CStringGetTextDatum(target_action);
+			values[2] = BoolGetDatum(false);
+			values[3] = CStringGetTextDatum("manifest");
+			nulls[4] = true;
+			nulls[5] = true;
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+			return (Datum)0;
+		}
+		requested_time = DatumGetTimestampTz(DirectFunctionCall3(
+			timestamptz_in, CStringGetDatum(cluster_recovery_target_cluster_time),
+			ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1)));
+		count = Min((int)manifest.restore_point_count, CLUSTER_BACKUP_RESTORE_POINT_MAX);
+		memcpy(points, manifest.restore_points, sizeof(ClusterRestorePoint) * count);
+		for (i = 0; i < count; i++) {
+			if (!points[i].present || points[i].created_at == 0)
+				continue;
+			if (scn_time_cmp(points[i].cut_scn, manifest.consistent_scn) < 0)
+				continue;
+			if (points[i].created_at > requested_time)
+				continue;
+			if (best == NULL || points[i].created_at > best->created_at)
+				best = &points[i];
+		}
+		values[0] = CStringGetTextDatum("cluster_time");
+		values[1] = CStringGetTextDatum(target_action);
+		values[2] = BoolGetDatum(best != NULL);
+		values[3] = CStringGetTextDatum(best != NULL ? "ok" : "no_restore_point");
+		if (best != NULL) {
+			values[4] = Int64GetDatum((int64)best->cut_scn);
+			values[5] = CStringGetTextDatum(best->name);
+		} else {
+			nulls[4] = true;
+			nulls[5] = true;
+		}
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+		return (Datum)0;
+	}
+
 	if (!SCN_VALID(requested_scn)) {
 		values[0] = CStringGetTextDatum("latest");
 		values[1] = CStringGetTextDatum(target_action);
@@ -2553,7 +2803,8 @@ cluster_get_pitr_status(PG_FUNCTION_ARGS)
 		return (Datum)0;
 	}
 
-	count = cluster_backup_get_restore_points(points, CLUSTER_BACKUP_RESTORE_POINT_MAX);
+	count = Min((int)manifest.restore_point_count, CLUSTER_BACKUP_RESTORE_POINT_MAX);
+	memcpy(points, manifest.restore_points, sizeof(ClusterRestorePoint) * count);
 	reason
 		= cluster_pitr_resolve_scn(points, count, requested_scn, manifest.consistent_scn, &chosen);
 	values[0] = CStringGetTextDatum("scn");

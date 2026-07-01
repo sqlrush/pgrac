@@ -505,15 +505,166 @@ static uint64 cluster_recovery_own_merge_bound = 0;
 #endif
 #ifdef USE_PGRAC_CLUSTER
 static XLogRecPtr cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start,
+												 const XLogRecPtr *stop, const char *wal_root,
 												 TimeLineID tli, uint16 own_thread,
-												 TimeLineID *replayTLI);
+												 TimeLineID *replayTLI, bool restore_mode);
 static bool cluster_backup_recovery_have_manifest = false;
 static ClusterBackupManifest cluster_backup_recovery_manifest;
+static bool cluster_backup_recovery_target_active = false;
+static bool cluster_backup_recovery_merge_required = false;
+static ClusterRestorePoint cluster_backup_recovery_target_point;
+static uint64 cluster_backup_recovery_merge_bitmap[2];
+static XLogRecPtr cluster_backup_recovery_merge_start[CLUSTER_WAL_STATE_SLOT_COUNT + 1];
+static XLogRecPtr cluster_backup_recovery_merge_stop[CLUSTER_WAL_STATE_SLOT_COUNT + 1];
+static char cluster_backup_recovery_wal_root[MAXPGPATH];
 static void cluster_backup_recovery_load_manifest(void);
 static void cluster_backup_recovery_apply_target(void);
 #endif
 
 #ifdef USE_PGRAC_CLUSTER
+static bool
+cluster_backup_recovery_point_usable(const ClusterRestorePoint *point)
+{
+	if (point == NULL || !point->present || !SCN_VALID(point->cut_scn))
+		return false;
+	if (point->thread_count != cluster_backup_recovery_manifest.thread_count)
+		return false;
+	if (scn_time_cmp(point->cut_scn, cluster_backup_recovery_manifest.consistent_scn) < 0)
+		return false;
+	return true;
+}
+
+static bool
+cluster_backup_recovery_select_scn(SCN requested_scn, ClusterRestorePoint *out)
+{
+	const ClusterRestorePoint *best = NULL;
+	uint32		i;
+
+	for (i = 0; i < cluster_backup_recovery_manifest.restore_point_count; i++)
+	{
+		const ClusterRestorePoint *point = &cluster_backup_recovery_manifest.restore_points[i];
+
+		if (!cluster_backup_recovery_point_usable(point))
+			continue;
+		if (scn_time_cmp(point->cut_scn, requested_scn) > 0)
+			continue;
+		if (best == NULL || scn_time_cmp(point->cut_scn, best->cut_scn) > 0)
+			best = point;
+	}
+	if (best == NULL)
+		return false;
+	*out = *best;
+	return true;
+}
+
+static bool
+cluster_backup_recovery_select_name(const char *name, ClusterRestorePoint *out)
+{
+	uint32		i;
+
+	for (i = 0; i < cluster_backup_recovery_manifest.restore_point_count; i++)
+	{
+		const ClusterRestorePoint *point = &cluster_backup_recovery_manifest.restore_points[i];
+
+		if (!cluster_backup_recovery_point_usable(point))
+			continue;
+		if (strcmp(point->name, name) == 0)
+		{
+			*out = *point;
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool
+cluster_backup_recovery_select_time(TimestampTz requested_time, ClusterRestorePoint *out)
+{
+	const ClusterRestorePoint *best = NULL;
+	uint32		i;
+
+	for (i = 0; i < cluster_backup_recovery_manifest.restore_point_count; i++)
+	{
+		const ClusterRestorePoint *point = &cluster_backup_recovery_manifest.restore_points[i];
+
+		if (!cluster_backup_recovery_point_usable(point) || point->created_at == 0)
+			continue;
+		if (point->created_at > requested_time)
+			continue;
+		if (best == NULL || point->created_at > best->created_at)
+			best = point;
+	}
+	if (best == NULL)
+		return false;
+	*out = *best;
+	return true;
+}
+
+static void
+cluster_backup_recovery_prepare_merge(const ClusterRestorePoint *target_point)
+{
+	uint32		i;
+	uint16		local_thread_id;
+	bool		have_local_thread = false;
+	uint16		first_thread_id = XLP_THREAD_ID_LEGACY;
+
+	MemSet(cluster_backup_recovery_merge_bitmap, 0, sizeof(cluster_backup_recovery_merge_bitmap));
+	MemSet(cluster_backup_recovery_merge_start, 0, sizeof(cluster_backup_recovery_merge_start));
+	MemSet(cluster_backup_recovery_merge_stop, 0, sizeof(cluster_backup_recovery_merge_stop));
+	MemSet(cluster_backup_recovery_wal_root, 0, sizeof(cluster_backup_recovery_wal_root));
+
+	if (cluster_backup_recovery_manifest.backup_set_path[0] == '\0')
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_BACKUP_INCOMPLETE),
+						errmsg("cluster backup manifest has no backup-set path")));
+	strlcpy(cluster_backup_recovery_wal_root, cluster_backup_recovery_manifest.backup_set_path,
+			sizeof(cluster_backup_recovery_wal_root));
+
+	for (i = 0; i < CLUSTER_MAX_NODES; i++)
+	{
+		const ClusterBackupManifestThread *thread = &cluster_backup_recovery_manifest.threads[i];
+		uint16		tid;
+
+		if (!thread->present)
+			continue;
+		tid = (uint16) thread->thread_id;
+		if (tid == 0 || tid > CLUSTER_WAL_STATE_SLOT_COUNT)
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_BACKUP_INCOMPLETE),
+					 errmsg("cluster backup manifest has invalid WAL thread %u", (unsigned) tid)));
+		if (first_thread_id == XLP_THREAD_ID_LEGACY)
+			first_thread_id = tid;
+		cluster_backup_recovery_merge_bitmap[(tid - 1) / 64] |=
+			((uint64) 1 << ((tid - 1) % 64));
+		cluster_backup_recovery_merge_start[tid] = thread->start_redo_lsn;
+		if (target_point != NULL)
+		{
+			if (target_point->cut_lsn[tid - 1] == InvalidXLogRecPtr)
+				ereport(FATAL, (errcode(ERRCODE_CLUSTER_BACKUP_INCOMPLETE),
+								errmsg("cluster PITR restore point is missing WAL thread %u",
+									   (unsigned) tid)));
+			cluster_backup_recovery_merge_stop[tid] = target_point->cut_lsn[tid - 1];
+		}
+	}
+
+	local_thread_id = cluster_wal_thread_id();
+	if (local_thread_id == XLP_THREAD_ID_LEGACY)
+		local_thread_id = 1;
+	for (i = 0; i < CLUSTER_MAX_NODES; i++)
+	{
+		if (cluster_backup_recovery_manifest.threads[i].present &&
+			cluster_backup_recovery_manifest.threads[i].thread_id == local_thread_id)
+		{
+			have_local_thread = true;
+			break;
+		}
+	}
+	if (!have_local_thread && first_thread_id != XLP_THREAD_ID_LEGACY)
+		ereport(LOG, (errmsg("cluster backup restore: local WAL thread %u is not in manifest; "
+							 "using manifest thread %u as replay owner",
+							 (unsigned) local_thread_id, (unsigned) first_thread_id)));
+	cluster_backup_recovery_merge_required = true;
+}
+
 static void
 cluster_backup_recovery_load_manifest(void)
 {
@@ -523,7 +674,14 @@ cluster_backup_recovery_load_manifest(void)
 	uint32 expected_node_count;
 
 	cluster_backup_recovery_have_manifest = false;
+	cluster_backup_recovery_target_active = false;
+	cluster_backup_recovery_merge_required = false;
 	MemSet(&cluster_backup_recovery_manifest, 0, sizeof(cluster_backup_recovery_manifest));
+	MemSet(&cluster_backup_recovery_target_point, 0, sizeof(cluster_backup_recovery_target_point));
+	MemSet(cluster_backup_recovery_merge_bitmap, 0, sizeof(cluster_backup_recovery_merge_bitmap));
+	MemSet(cluster_backup_recovery_merge_start, 0, sizeof(cluster_backup_recovery_merge_start));
+	MemSet(cluster_backup_recovery_merge_stop, 0, sizeof(cluster_backup_recovery_merge_stop));
+	MemSet(cluster_backup_recovery_wal_root, 0, sizeof(cluster_backup_recovery_wal_root));
 
 	if (!cluster_enabled)
 		return;
@@ -569,9 +727,9 @@ cluster_backup_recovery_apply_target(void)
 	bool have_time_target;
 	bool have_name_target;
 	int target_count;
-	char stop_restore_point[CLUSTER_RESTORE_POINT_NAME_MAX + CLUSTER_BACKUP_ID_MAX];
 	uint16 local_thread_id;
 	int local_thread_index;
+	ClusterRestorePoint selected_point;
 
 	if (!cluster_enabled)
 		return;
@@ -585,7 +743,22 @@ cluster_backup_recovery_apply_target(void)
 	target_count = (have_scn_target ? 1 : 0) + (have_time_target ? 1 : 0)
 		+ (have_name_target ? 1 : 0);
 	if (!have_scn_target && !have_time_target && !have_name_target)
+	{
+		if (ArchiveRecoveryRequested && cluster_backup_recovery_have_manifest &&
+			cluster_backup_recovery_manifest.thread_count > 1)
+		{
+			ClusterRestorePoint selected_point;
+			SCN			requested_scn = cluster_backup_recovery_manifest.scn_durable_peak;
+
+			if (!cluster_backup_recovery_select_scn(requested_scn, &selected_point))
+				ereport(FATAL, (errcode(ERRCODE_CLUSTER_BACKUP_INCOMPLETE),
+								errmsg("cluster backup restore has no consistent multi-thread "
+									   "restore point")));
+			cluster_backup_recovery_target_point = selected_point;
+			cluster_backup_recovery_prepare_merge(&cluster_backup_recovery_target_point);
+		}
 		return;
+	}
 
 	if (!ArchiveRecoveryRequested)
 		return;
@@ -600,26 +773,22 @@ cluster_backup_recovery_apply_target(void)
 						errmsg("cluster PITR target conflicts with native recovery target"),
 						errdetail("Use either cluster.recovery_target_* or native recovery_target_* "
 								  "settings, not both.")));
-	if (have_time_target)
-		ereport(FATAL, (errcode(ERRCODE_CLUSTER_PITR_TARGET_UNREACHABLE),
-						errmsg("cluster PITR target by cluster time is not reachable"),
-						errdetail("No durable cluster restore-point timestamp catalog is present "
-								  "in this backup set.")));
 	if (!cluster_backup_recovery_have_manifest)
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_BACKUP_INCOMPLETE),
 						errmsg("cluster PITR target requires a valid cluster backup manifest")));
 
-	snprintf(stop_restore_point, sizeof(stop_restore_point), "cluster_backup_stop_%s",
-			 cluster_backup_recovery_manifest.backup_id);
-	if (have_name_target) {
-		if (strcmp(cluster_recovery_target_name, stop_restore_point) != 0)
+	MemSet(&selected_point, 0, sizeof(selected_point));
+	if (have_name_target)
+	{
+		if (!cluster_backup_recovery_select_name(cluster_recovery_target_name, &selected_point))
 			ereport(FATAL, (errcode(ERRCODE_CLUSTER_PITR_TARGET_UNREACHABLE),
 							errmsg("cluster PITR named restore point is not reachable"),
 							errdetail("Requested restore point \"%s\" is not recorded in this "
 									  "backup manifest.",
 									  cluster_recovery_target_name)));
 	}
-	if (have_scn_target) {
+	if (have_scn_target)
+	{
 		int64 parsed = pg_strtoint64(cluster_recovery_target_scn);
 		SCN requested_scn;
 
@@ -635,14 +804,37 @@ cluster_backup_recovery_apply_target(void)
 									  (unsigned long long)requested_scn,
 									  (unsigned long long)
 										  cluster_backup_recovery_manifest.consistent_scn)));
+		if (!cluster_backup_recovery_select_scn(requested_scn, &selected_point))
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_PITR_TARGET_UNREACHABLE),
+							errmsg("cluster PITR target SCN has no reachable restore point"),
+							errdetail("Requested SCN %llu; backup manifest has %u restore "
+									  "point(s).",
+									  (unsigned long long) requested_scn,
+									  cluster_backup_recovery_manifest.restore_point_count)));
+	}
+	if (have_time_target)
+	{
+		TimestampTz requested_time;
+
+		requested_time = DatumGetTimestampTz(DirectFunctionCall3(timestamptz_in,
+																 CStringGetDatum(cluster_recovery_target_cluster_time),
+																 ObjectIdGetDatum(InvalidOid),
+																 Int32GetDatum(-1)));
+		if (!cluster_backup_recovery_select_time(requested_time, &selected_point))
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_PITR_TARGET_UNREACHABLE),
+							errmsg("cluster PITR target time has no reachable restore point"),
+							errdetail("Requested cluster time %s; backup manifest has %u restore "
+									  "point(s).",
+									  timestamptz_to_str(requested_time),
+									  cluster_backup_recovery_manifest.restore_point_count)));
 	}
 
-	if (cluster_backup_recovery_manifest.thread_count > 1)
-		ereport(FATAL, (errcode(ERRCODE_CLUSTER_BACKUP_INCOMPLETE),
-						errmsg("cluster PITR target requires multi-thread restore replay"),
-						errdetail("This backup manifest records %u WAL threads; this startup "
-								  "path can only prove native single-thread replay.",
-								  cluster_backup_recovery_manifest.thread_count)));
+	if (!selected_point.present)
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_PITR_TARGET_UNREACHABLE),
+						errmsg("cluster PITR target has no reachable restore point")));
+
+	cluster_backup_recovery_target_point = selected_point;
+	cluster_backup_recovery_target_active = true;
 	local_thread_id = cluster_wal_thread_id();
 	if (local_thread_id == XLP_THREAD_ID_LEGACY)
 		local_thread_id = 1;
@@ -654,10 +846,14 @@ cluster_backup_recovery_apply_target(void)
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_BACKUP_INCOMPLETE),
 						errmsg("cluster PITR target is missing this node's WAL thread cut")));
 
-	recoveryTarget = RECOVERY_TARGET_LSN;
-	recoveryTargetLSN =
-		cluster_backup_recovery_manifest.threads[local_thread_index].stop_cut_lsn;
-	recoveryTargetInclusive = true;
+	if (cluster_backup_recovery_manifest.thread_count > 1)
+		cluster_backup_recovery_prepare_merge(&cluster_backup_recovery_target_point);
+	else
+	{
+		recoveryTarget = RECOVERY_TARGET_LSN;
+		recoveryTargetLSN = cluster_backup_recovery_target_point.cut_lsn[local_thread_index];
+		recoveryTargetInclusive = true;
+	}
 	switch (cluster_recovery_target_action) {
 	case CLUSTER_RECOVERY_TARGET_ACTION_PROMOTE:
 		recoveryTargetAction = RECOVERY_TARGET_ACTION_PROMOTE;
@@ -671,13 +867,12 @@ cluster_backup_recovery_apply_target(void)
 		break;
 	}
 	ereport(LOG,
-			(errmsg("cluster PITR target resolved to WAL location %X/%X",
-					LSN_FORMAT_ARGS(recoveryTargetLSN)),
-			 errdetail("Requested cluster target snaps to restore point \"%s\" at "
-					   "backup consistent SCN %llu.",
-					   stop_restore_point,
-					   (unsigned long long)
-						   cluster_backup_recovery_manifest.consistent_scn)));
+			(errmsg("cluster PITR target resolved to restore point \"%s\" at SCN %llu",
+					cluster_backup_recovery_target_point.name,
+					(unsigned long long) cluster_backup_recovery_target_point.cut_scn),
+			 errdetail("Backup consistent SCN %llu; %u WAL thread(s) covered.",
+					   (unsigned long long) cluster_backup_recovery_manifest.consistent_scn,
+					   cluster_backup_recovery_manifest.thread_count)));
 }
 
 #endif
@@ -2114,7 +2309,7 @@ PerformWalRecovery(void)
 	 */
 	if (record != NULL
 #ifdef USE_PGRAC_CLUSTER
-		|| cluster_engage == CLUSTER_MERGE_ENGAGE
+		|| cluster_engage == CLUSTER_MERGE_ENGAGE || cluster_backup_recovery_merge_required
 #endif
 	)
 	{
@@ -2136,6 +2331,45 @@ PerformWalRecovery(void)
 			begin_startup_progress_phase();
 
 #ifdef USE_PGRAC_CLUSTER
+		if (cluster_backup_recovery_merge_required)
+		{
+			XLogRecPtr	merged_end;
+			uint16		own_thread = cluster_wal_thread_id();
+
+			if (own_thread == XLP_THREAD_ID_LEGACY)
+				own_thread = 1;
+			merged_end = cluster_recovery_merged_replay(cluster_backup_recovery_merge_bitmap,
+														cluster_backup_recovery_merge_start,
+														cluster_backup_recovery_merge_stop,
+														cluster_backup_recovery_wal_root,
+														replayTLI, own_thread, &replayTLI,
+														true);
+			reachedRecoveryTarget = true;
+			if (cluster_backup_recovery_target_active && !reachedConsistency)
+				ereport(FATAL,
+						(errmsg("requested cluster PITR stop point is before consistent recovery "
+								"point")));
+			if (cluster_backup_recovery_target_active)
+			{
+				switch (recoveryTargetAction)
+				{
+					case RECOVERY_TARGET_ACTION_SHUTDOWN:
+						proc_exit(3);
+					case RECOVERY_TARGET_ACTION_PAUSE:
+						SetRecoveryPause(true);
+						recoveryPausesHere(true);
+						/* drop into promote */
+					case RECOVERY_TARGET_ACTION_PROMOTE:
+						break;
+				}
+			}
+			RmgrCleanup();
+			ereport(LOG, (errmsg("redo done (cluster backup restore) at %X/%X system usage: %s",
+								 LSN_FORMAT_ARGS(merged_end), pg_rusage_show(&ru0))));
+			InRedo = false;
+			goto cluster_merged_redo_done;
+		}
+
 		/*
 		 * PGRAC spec-4.5 §3.3: when merged recovery engaged, drive the
 		 * whole redo from the k-way SCN merge engine instead of the
@@ -2147,8 +2381,9 @@ PerformWalRecovery(void)
 			XLogRecPtr	merged_end;
 
 			merged_end = cluster_recovery_merged_replay(cluster_merge_bitmap, cluster_merge_start,
-														replayTLI, cluster_wal_thread_id(),
-														&replayTLI);
+														NULL, NULL, replayTLI,
+														cluster_wal_thread_id(),
+														&replayTLI, false);
 			RmgrCleanup();
 			ereport(LOG, (errmsg("redo done (merged) at %X/%X system usage: %s",
 								 LSN_FORMAT_ARGS(merged_end), pg_rusage_show(&ru0))));
@@ -2338,8 +2573,9 @@ cluster_merged_redo_done:;
  *	self-recovery (§3.3c).
  */
 static XLogRecPtr
-cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start, TimeLineID tli,
-							   uint16 own_thread, TimeLineID *replayTLI)
+cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start,
+							   const XLogRecPtr *stop, const char *wal_root, TimeLineID tli,
+							   uint16 own_thread, TimeLineID *replayTLI, bool restore_mode)
 {
 	XLogRecPtr own_end = InvalidXLogRecPtr;
 	XLogRecPtr own_read = InvalidXLogRecPtr;
@@ -2350,7 +2586,10 @@ cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start, Ti
 	uint16 t;
 
 	memset(max_recovered, 0, sizeof(max_recovered));
-	st = cluster_recovery_merge_begin(bitmap, start, own_thread, tli);
+	if (restore_mode)
+		st = cluster_recovery_merge_begin_restore(bitmap, start, stop, wal_root, own_thread, tli);
+	else
+		st = cluster_recovery_merge_begin(bitmap, start, own_thread, tli);
 	cluster_recovery_merge_window_enter();
 	/* A foreign record's page is stamped with this node's own recovery redo
 	 * (start[own_thread]) instead of the peer's incomparable LSN (§3.3b). */
@@ -2448,16 +2687,20 @@ cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start, Ti
 	 * bound feeds the candidate's own-bound skip (it clears it on reaching
 	 * RUNNING); this node's READER authority over the materialized copy is
 	 * the node-local marker, with its own lifecycle (G6). */
-	for (t = 1; t <= CLUSTER_WAL_STATE_SLOT_COUNT; t++) {
-		if (t == own_thread)
-			continue;
-		if ((bitmap[(t - 1) / 64] & ((uint64)1 << ((t - 1) % 64))) == 0)
-			continue;
-		cluster_wal_state_publish_merge_recovered(t, max_recovered[t]);
-		if (max_recovered[t] > 0)
-			cluster_merged_authority_publish((int)t - 1, max_recovered[t]);
+	if (!restore_mode)
+	{
+		for (t = 1; t <= CLUSTER_WAL_STATE_SLOT_COUNT; t++) {
+			if (t == own_thread)
+				continue;
+			if ((bitmap[(t - 1) / 64] & ((uint64)1 << ((t - 1) % 64))) == 0)
+				continue;
+			cluster_wal_state_publish_merge_recovered(t, max_recovered[t]);
+			if (max_recovered[t] > 0)
+				cluster_merged_authority_publish((int)t - 1, max_recovered[t]);
+		}
 	}
-	ereport(LOG, (errmsg("cluster merged recovery: replay complete (own thread %u)",
+	ereport(LOG, (errmsg("cluster %srecovery: replay complete (own thread %u)",
+						 restore_mode ? "backup restore " : "merged ",
 						 (unsigned)own_thread)));
 	return own_end;
 }
