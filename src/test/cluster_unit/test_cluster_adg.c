@@ -269,6 +269,27 @@ UT_TEST(test_replay_start_lsn_is_thread_local)
 	UT_ASSERT(!cluster_adg_replay_start_lsn(100, 200, InvalidXLogRecPtr, NULL));
 }
 
+UT_TEST(test_rfs_restart_lsn_prefers_thread_receive)
+{
+	XLogRecPtr restart = InvalidXLogRecPtr;
+
+	UT_ASSERT(cluster_adg_rfs_restart_lsn(1000, InvalidXLogRecPtr, InvalidXLogRecPtr, &restart));
+	UT_ASSERT_EQ(restart, (XLogRecPtr)1000);
+
+	UT_ASSERT(cluster_adg_rfs_restart_lsn(1000, 1200, InvalidXLogRecPtr, &restart));
+	UT_ASSERT_EQ(restart, (XLogRecPtr)1200);
+
+	UT_ASSERT(cluster_adg_rfs_restart_lsn(1000, 1200, 1800, &restart));
+	UT_ASSERT_EQ(restart, (XLogRecPtr)1800);
+
+	UT_ASSERT(cluster_adg_rfs_restart_lsn(2000, InvalidXLogRecPtr, 1800, &restart));
+	UT_ASSERT_EQ(restart, (XLogRecPtr)1800);
+
+	UT_ASSERT(!cluster_adg_rfs_restart_lsn(1000, 1200, 1100, &restart));
+	UT_ASSERT(!cluster_adg_rfs_restart_lsn(InvalidXLogRecPtr, 1200, 1800, &restart));
+	UT_ASSERT(!cluster_adg_rfs_restart_lsn(1000, 1200, 1800, NULL));
+}
+
 UT_TEST(test_apply_master_next_term_overflow)
 {
 	UT_ASSERT_EQ(cluster_adg_apply_master_next_term(41), (uint64)42);
@@ -702,7 +723,7 @@ UT_TEST(test_mrp_shmem_tracks_term_validity_and_drain)
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(27);
 
 	UT_RUN(test_tracker_init_bounds);
 	UT_RUN(test_barrier_min_publishes_after_all_threads);
@@ -713,6 +734,7 @@ main(void)
 	UT_RUN(test_barrier_not_record_scn_advances_read_floor);
 	UT_RUN(test_thread_bounds_are_release_checked);
 	UT_RUN(test_replay_start_lsn_is_thread_local);
+	UT_RUN(test_rfs_restart_lsn_prefers_thread_receive);
 	UT_RUN(test_apply_master_next_term_overflow);
 	UT_RUN(test_apply_master_lease_marker_pack_unpack);
 	UT_RUN(test_apply_master_lease_slot_zero_fills_tail);

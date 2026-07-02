@@ -201,6 +201,25 @@ cluster_adg_replay_start_lsn(XLogRecPtr start_lsn, XLogRecPtr receive_lsn, XLogR
 	return true;
 }
 
+bool
+cluster_adg_rfs_restart_lsn(XLogRecPtr fallback_lsn, XLogRecPtr thread_start_lsn,
+							XLogRecPtr thread_receive_lsn, XLogRecPtr *restart_lsn)
+{
+	if (restart_lsn == NULL || XLogRecPtrIsInvalid(fallback_lsn))
+		return false;
+	if (!XLogRecPtrIsInvalid(thread_start_lsn) && !XLogRecPtrIsInvalid(thread_receive_lsn)
+		&& thread_receive_lsn < thread_start_lsn)
+		return false;
+
+	if (!XLogRecPtrIsInvalid(thread_receive_lsn))
+		*restart_lsn = thread_receive_lsn;
+	else if (!XLogRecPtrIsInvalid(thread_start_lsn))
+		*restart_lsn = thread_start_lsn;
+	else
+		*restart_lsn = fallback_lsn;
+	return true;
+}
+
 uint64
 cluster_adg_apply_master_next_term(uint64 durable_term)
 {

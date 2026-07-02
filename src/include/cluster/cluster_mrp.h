@@ -106,6 +106,8 @@ extern bool cluster_mrp_read_service_available(void);
 extern uint64 cluster_mrp_apply_master_term(void);
 extern uint32 cluster_mrp_apply_master_node_id(void);
 extern void cluster_mrp_note_primary_thread_count(uint16 primary_thread_count);
+extern bool cluster_mrp_rfs_restart_lsn(uint16 thread_id, XLogRecPtr fallback_lsn,
+										XLogRecPtr *restart_lsn);
 extern int cluster_mrp_streaming_snapshot(uint64 bitmap[2], XLogRecPtr start_lsn[],
 										  XLogRecPtr receive_lsn[], XLogRecPtr barrier_lsn[],
 										  SCN barrier_scn[]);

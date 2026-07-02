@@ -812,7 +812,12 @@ cluster_rfs_connect_upstream(ClusterRfsUpstream *upstream)
 						errmsg("invalid ADG primary thread count %d", primary_thread_count)));
 	cluster_mrp_note_primary_thread_count((uint16)primary_thread_count);
 
-	upstream->start_lsn = cluster_rfs_page_start(GetXLogReplayRecPtr(NULL));
+	if (!cluster_mrp_rfs_restart_lsn(upstream->expected_thread_id,
+									 cluster_rfs_page_start(GetXLogReplayRecPtr(NULL)),
+									 &upstream->start_lsn))
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("ADG RFS cannot choose a restart LSN for thread %u",
+							   (unsigned)upstream->expected_thread_id)));
 	upstream->write_lsn = upstream->start_lsn;
 	upstream->last_thread_id = XLP_THREAD_ID_LEGACY;
 	upstream->pending_header.active = false;

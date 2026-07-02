@@ -1160,6 +1160,24 @@ cluster_mrp_apply_master_node_id(void)
 	return snap.valid != 0 ? snap.owner_node_id : UINT32_MAX;
 }
 
+bool
+cluster_mrp_rfs_restart_lsn(uint16 thread_id, XLogRecPtr fallback_lsn, XLogRecPtr *restart_lsn)
+{
+	XLogRecPtr thread_start_lsn = InvalidXLogRecPtr;
+	XLogRecPtr thread_receive_lsn = InvalidXLogRecPtr;
+
+	if (!cluster_mrp_valid_real_thread_id(thread_id))
+		return false;
+	if (cluster_mrp_state != NULL) {
+		thread_start_lsn
+			= (XLogRecPtr)pg_atomic_read_u64(&cluster_mrp_state->thread_start_lsn[thread_id]);
+		thread_receive_lsn
+			= (XLogRecPtr)pg_atomic_read_u64(&cluster_mrp_state->thread_receive_lsn[thread_id]);
+	}
+	return cluster_adg_rfs_restart_lsn(fallback_lsn, thread_start_lsn, thread_receive_lsn,
+									   restart_lsn);
+}
+
 int
 cluster_mrp_streaming_snapshot(uint64 bitmap[2], XLogRecPtr start_lsn[], XLogRecPtr receive_lsn[],
 							   XLogRecPtr barrier_lsn[], SCN barrier_scn[])
