@@ -776,8 +776,7 @@ cluster_mrp_apply_master_acquire_or_renew(void)
 		if (result != CLUSTER_MRP_APPLY_LEASE_SUBMIT_ACK) {
 			cluster_mrp_held_term = 0;
 			cluster_mrp_held_term_expires_at_ms = 0;
-			if (result == CLUSTER_MRP_APPLY_LEASE_SUBMIT_TIMEOUT)
-				cluster_mrp_clear_apply_master();
+			cluster_mrp_clear_apply_master();
 			return false;
 		}
 	}
