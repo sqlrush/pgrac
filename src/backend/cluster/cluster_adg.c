@@ -381,6 +381,28 @@ cluster_adg_apply_master_lease_cas_verdict(const ClusterAdgApplyMasterLeaseQuoru
 	return CLUSTER_ADG_APPLY_LEASE_CAS_TAKE_EXPIRED;
 }
 
+bool
+cluster_adg_apply_master_token_allows_apply(uint32 owner_node_id, uint32 valid, uint64 term,
+											uint64 generation, uint64 lease_epoch,
+											uint64 owner_incarnation, uint64 valid_until_ms,
+											int32 self_node_id, uint64 current_epoch,
+											uint64 local_incarnation, uint64 held_term,
+											int64 now_ms)
+{
+	if (!SCN_NODE_ID_VALID(self_node_id) || owner_node_id != (uint32)self_node_id)
+		return false;
+	if (term == 0 || generation == 0 || lease_epoch != current_epoch || owner_incarnation == 0
+		|| valid == 0)
+		return false;
+	if (held_term != 0 && term != held_term)
+		return false;
+	if (local_incarnation != 0 && owner_incarnation != local_incarnation)
+		return false;
+	if (valid_until_ms != 0 && now_ms >= (int64)valid_until_ms)
+		return false;
+	return true;
+}
+
 ClusterAdgReadDecision
 cluster_adg_read_only_decide(bool enable_adg, bool standby_role, bool read_service_available,
 							 SCN standby_consistent_scn, int64 apply_lag_ms, int64 max_lag_ms)

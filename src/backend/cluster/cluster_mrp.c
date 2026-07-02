@@ -550,21 +550,17 @@ static bool
 cluster_mrp_snapshot_allows_apply(const ClusterMrpApplyMasterSnapshot *snap, int64 now_ms,
 								  uint64 held_term)
 {
+	uint64 local_incarnation = 0;
+
 	if (snap == NULL)
 		return false;
 
-	if (!SCN_NODE_ID_VALID(cluster_node_id) || snap->owner_node_id != (uint32)cluster_node_id
-		|| snap->term == 0 || snap->generation == 0
-		|| snap->lease_epoch != cluster_epoch_get_current() || snap->owner_incarnation == 0
-		|| snap->valid == 0)
-		return false;
-	if (held_term != 0 && snap->term != held_term)
-		return false;
-	if (AmMrpProcess() && snap->owner_incarnation != cluster_mrp_owner_incarnation)
-		return false;
-	if (snap->valid_until_ms != 0 && now_ms >= (int64)snap->valid_until_ms)
-		return false;
-	return true;
+	if (AmMrpProcess())
+		local_incarnation = cluster_mrp_owner_incarnation;
+	return cluster_adg_apply_master_token_allows_apply(
+		snap->owner_node_id, snap->valid, snap->term, snap->generation, snap->lease_epoch,
+		snap->owner_incarnation, snap->valid_until_ms, cluster_node_id, cluster_epoch_get_current(),
+		local_incarnation, held_term, now_ms);
 }
 
 bool
