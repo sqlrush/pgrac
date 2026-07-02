@@ -173,6 +173,23 @@ extern void cluster_tt_slot_durable_set_head(uint32 segment_id, uint16 slot_offs
  */
 extern bool cluster_tt_slot_durable_lookup(uint32 segment_id, uint16 slot_offset, TransactionId xid,
 										   uint32 expected_wrap, SCN *commit_scn);
+
+typedef bool (*ClusterTTDurableXidCommitCheck)(TransactionId xid);
+
+/*
+ * cluster_tt_slot_durable_lookup_committed_stable -- durable lookup variant for
+ * visibility paths that need the CLOG cross-check inside the slot-read window.
+ *
+ * Reads the 32B TTSlot, verifies COMMITTED/exact xid/optional wrap, verifies
+ * xid_committed(xid), then re-reads the same 32B slot and requires the bytes to
+ * be unchanged before returning commit_scn.  This fail-closes a reader racing a
+ * redo/data-file RMW of the same slot; callers that cannot tolerate a torn slot
+ * must use this API instead of lookup()+external CLOG check.
+ */
+extern bool cluster_tt_slot_durable_lookup_committed_stable(
+	uint32 segment_id, uint16 slot_offset, TransactionId xid, uint32 expected_wrap,
+	ClusterTTDurableXidCommitCheck xid_committed, SCN *commit_scn);
+
 extern ClusterTTDurableResolve
 cluster_tt_slot_durable_resolve_by_xid_origin(int origin_node, TransactionId xid,
 											  uint32 expected_wrap, SCN *commit_scn,

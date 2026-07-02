@@ -49,6 +49,7 @@
 #include "postgres.h"
 
 #include "access/transam.h" /* spec-3.11 D5/C1b: TransactionIdDidCommit */
+#include "access/xlog.h"	/* RecoveryInProgress */
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/ipc.h"
@@ -281,7 +282,8 @@ is_entry_fresh(const ClusterTTOverlayEntry *e, TimestampTz now)
 static bool
 cluster_tt_status_adg_standby_overlay_enabled(void)
 {
-	return cluster_enabled && cluster_enable_adg && cluster_dg_role == CLUSTER_DG_ROLE_STANDBY;
+	return cluster_enabled && cluster_enable_adg && cluster_dg_role == CLUSTER_DG_ROLE_STANDBY
+		   && RecoveryInProgress();
 }
 
 static bool
@@ -328,10 +330,9 @@ cluster_tt_status_lookup_adg_standby_durable(const ClusterTTStatusKey *key, uint
 	if (key->tt_slot_id < 1 || key->tt_slot_id > TT_SLOTS_PER_SEGMENT)
 		return false;
 
-	if (cluster_tt_slot_durable_lookup(key->undo_segment_id,
-									   cluster_tt_slot_id_to_offset(key->tt_slot_id),
-									   key->local_xid, CLUSTER_TT_WRAP_ANY, &durable_scn)
-		&& TransactionIdDidCommit(key->local_xid)) {
+	if (cluster_tt_slot_durable_lookup_committed_stable(
+			key->undo_segment_id, cluster_tt_slot_id_to_offset(key->tt_slot_id), key->local_xid,
+			CLUSTER_TT_WRAP_ANY, TransactionIdDidCommit, &durable_scn)) {
 		result->status = CLUSTER_TT_STATUS_COMMITTED;
 		result->commit_scn = durable_scn;
 		result->status_epoch = status_epoch;
@@ -486,10 +487,9 @@ cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key, ClusterTTStatusRes
 			&& key->tt_slot_id <= TT_SLOTS_PER_SEGMENT) {
 			SCN durable_scn;
 
-			if (cluster_tt_slot_durable_lookup(key->undo_segment_id,
-											   cluster_tt_slot_id_to_offset(key->tt_slot_id),
-											   key->local_xid, CLUSTER_TT_WRAP_ANY, &durable_scn)
-				&& TransactionIdDidCommit(key->local_xid)) {
+			if (cluster_tt_slot_durable_lookup_committed_stable(
+					key->undo_segment_id, cluster_tt_slot_id_to_offset(key->tt_slot_id),
+					key->local_xid, CLUSTER_TT_WRAP_ANY, TransactionIdDidCommit, &durable_scn)) {
 				result->status = CLUSTER_TT_STATUS_COMMITTED;
 				result->commit_scn = durable_scn;
 				result->status_epoch = current_epoch;
