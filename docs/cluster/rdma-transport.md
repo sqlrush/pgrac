@@ -76,6 +76,23 @@ does not disable block-image CRC.
 spec-6.1; selecting either fails with `FEATURE_NOT_SUPPORTED` rather than
 silently behaving like generic event-driven verbs.
 
+## Hardening
+
+Spec-6.1 uses SQLSTATE `58R16` for RDMA fabric/provider failures.
+`58R14` and `58R15` remain owned by the spec-6.0a shared-storage backend
+and are not reused by the RDMA transport.
+
+The block data path is copy-into-scratch, not zero-copy DMA from live
+shared buffers.  The sender copies the page image into registered
+per-peer scratch storage before posting RDMA SEND-with-SGE, so no
+asynchronous work request can retain a live buffer-content lock or a
+pointer into shared_buffers.
+
+Inbound frames are verified before dispatch or block install.  CQE
+triage treats local-protection and provider programming failures as
+fail-closed fabric errors, while peer-loss conditions may use TCP
+fallback only when the configured policy allows it.
+
 ## SQLSTATEs
 
 | SQLSTATE | Condition | Meaning |

@@ -5,12 +5,19 @@
  *
  * Spec: spec-6.1-rdma-transport-stack.md
  *
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
  * Portions Copyright (c) 2026, pgrac contributors
  *
  * Author: SqlRush <sqlrush@gmail.com>
  *
  * IDENTIFICATION
  *	  src/backend/cluster/cluster_ic_rdma.c
+ *
+ * NOTES
+ *	  pgrac-original file.  Implements the spec-6.1 RDMA provider,
+ *	  CM/QP ownership, CQE triage, and SEND-with-SGE scratch data path.
+ *	  Live shared_buffers pages are never exposed for asynchronous RDMA DMA.
  *
  *-------------------------------------------------------------------------
  */

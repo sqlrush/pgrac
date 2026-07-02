@@ -5,12 +5,19 @@
  *
  * Spec: spec-6.1-rdma-transport-stack.md
  *
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
  * Portions Copyright (c) 2026, pgrac contributors
  *
  * Author: SqlRush <sqlrush@gmail.com>
  *
  * IDENTIFICATION
  *	  src/backend/cluster/cluster_ic_mux.c
+ *
+ * NOTES
+ *	  pgrac-original file.  Keeps ClusterICOps stable while routing each
+ *	  peer through RDMA when the spec-6.1 data path is connected, or through
+ *	  tier1 TCP fallback when RDMA is disabled or unavailable.
  *
  *-------------------------------------------------------------------------
  */

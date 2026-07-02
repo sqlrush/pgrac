@@ -5,12 +5,19 @@
  *
  * Spec: spec-6.1-rdma-transport-stack.md
  *
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
  * Portions Copyright (c) 2026, pgrac contributors
  *
  * Author: SqlRush <sqlrush@gmail.com>
  *
  * IDENTIFICATION
  *	  src/include/cluster/cluster_ic_rdma.h
+ *
+ * NOTES
+ *	  pgrac-original header.  Defines the spec-6.1 RDMA mux ABI,
+ *	  provider vtable, SGE release contract, and observability surface used
+ *	  by both backend code and standalone cluster_unit tests.
  *
  *-------------------------------------------------------------------------
  */
