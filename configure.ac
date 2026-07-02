@@ -232,6 +232,13 @@ PGAC_ARG_BOOL(enable, cluster, no,
 AC_SUBST(enable_cluster)
 
 #
+# PGRAC: --with-rdma (optional RDMA interconnect provider)
+#
+PGAC_ARG_BOOL(with, rdma, no,
+              [build with RDMA interconnect support])
+AC_SUBST(with_rdma)
+
+#
 # PGRAC: --enable-injection-points (build test-only visibility injection)
 #
 # The SQL injection helpers are catalog-visible in all builds but their
@@ -1464,6 +1471,13 @@ if test "$with_zstd" = yes ; then
   AC_CHECK_LIB(zstd, ZSTD_compress, [], [AC_MSG_ERROR([library 'zstd' is required for ZSTD support])])
 fi
 
+if test "$with_rdma" = yes ; then
+  AC_CHECK_LIB(ibverbs, ibv_get_device_list, [],
+               [AC_MSG_ERROR([library 'ibverbs' is required for RDMA support])])
+  AC_CHECK_LIB(rdmacm, rdma_create_id, [],
+               [AC_MSG_ERROR([library 'rdmacm' is required for RDMA support])])
+fi
+
 # Note: We can test for libldap_r only after we know PTHREAD_LIBS;
 # also, on AIX, we may need to have openssl in LIBS for this step.
 if test "$with_ldap" = yes ; then
@@ -1605,6 +1619,13 @@ fi
 PGAC_PATH_PROGS(ZSTD, zstd)
 if test "$with_zstd" = yes; then
   AC_CHECK_HEADER(zstd.h, [], [AC_MSG_ERROR([zstd.h header file is required for ZSTD])])
+fi
+
+if test "$with_rdma" = yes; then
+  AC_CHECK_HEADER(infiniband/verbs.h, [],
+                  [AC_MSG_ERROR([infiniband/verbs.h header file is required for RDMA])])
+  AC_CHECK_HEADER(rdma/rdma_cma.h, [],
+                  [AC_MSG_ERROR([rdma/rdma_cma.h header file is required for RDMA])])
 fi
 
 if test "$with_gssapi" = yes ; then

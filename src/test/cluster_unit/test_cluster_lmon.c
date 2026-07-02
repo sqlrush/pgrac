@@ -38,6 +38,7 @@
 
 #include <signal.h>
 
+#include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_lmon.h"
 
 #undef printf
@@ -248,6 +249,50 @@ cluster_ic_tier1_pending_outbound(int32 peer_id pg_attribute_unused())
 {
 	return false;
 }
+
+ClusterICPeerTransport
+cluster_ic_mux_peer_transport(int32 peer_id pg_attribute_unused())
+{
+	return CLUSTER_IC_PEER_TRANSPORT_TCP;
+}
+
+ClusterICSendResult
+cluster_ic_send_envelope(uint8 msg_type pg_attribute_unused(),
+						 int32 dest_node_id pg_attribute_unused(),
+						 const void *payload pg_attribute_unused(),
+						 uint32 payload_len pg_attribute_unused())
+{
+	return CLUSTER_IC_SEND_DONE;
+}
+
+int
+cluster_ic_rdma_lmon_cm_fd(void)
+{
+	return -1;
+}
+
+int
+cluster_ic_rdma_lmon_completion_fd(void)
+{
+	return -1;
+}
+
+void
+cluster_ic_rdma_lmon_start(void)
+{}
+
+void
+cluster_ic_rdma_lmon_stop(void)
+{}
+
+void
+cluster_ic_rdma_lmon_handle_cm_events(void)
+{}
+
+void
+cluster_ic_rdma_lmon_handle_completion_events(void)
+{}
+
 void
 cluster_ic_chunk_scan_reassembly_timeouts(void)
 {}

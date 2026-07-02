@@ -20,8 +20,8 @@ one shared database, Cache Fusion / SCN / GES — to PostgreSQL 16.13.
 > still being built.
 >
 > **In progress / planned:** full cross-node GES enqueue locking and crash
-> recovery (active); RDMA, Active Data Guard, rolling upgrade, FAN/TAF, and
-> backup/DR (designed, not built).
+> recovery (active); RDMA transport provider/mux work, Active Data Guard,
+> rolling upgrade, FAN/TAF, and backup/DR.
 >
 > **Sanity anchor:** the `--disable-cluster` build is binary-identical to
 > upstream PostgreSQL 16.13 and passes the full 219-test regression suite.

@@ -57,6 +57,7 @@
 #include "cluster/cluster_ic.h"		  /* cluster_ic_send_bytes (vtable) */
 #include "cluster/cluster_ic_chunk.h" /* PGRAC_IC_CHUNK_MSG_TYPE + chunk_dispatch_frame (v1.0.1 F1) */
 #include "cluster/cluster_ic_envelope.h"
+#include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_ic_tier1.h" /* cluster_ic_tier1_get_peer_fd (spec-2.5 D2.5 fanout) */
 
@@ -501,7 +502,8 @@ cluster_ic_send_envelope_fanout(uint8 msg_type, const void *payload, uint32 payl
 
 		/* Skip peers not yet connected (phase 4 first-tick / restart);
 		 * spec-2.5 §1.4 例外 #4 PEER_DOWN nonfatal contract. */
-		if (cluster_ic_tier1_get_peer_fd(peer) < 0)
+		if (cluster_ic_mux_peer_transport(peer) != CLUSTER_IC_PEER_TRANSPORT_RDMA
+			&& cluster_ic_tier1_get_peer_fd(peer) < 0)
 			continue;
 
 		/* Build envelope + send.  spec-2.4 v1.0.1 / spec-2.3 ratify ABI. */

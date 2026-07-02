@@ -28,12 +28,20 @@
 set -e
 set -o pipefail
 
-# Locate clang-format.  Some Linux distros use versioned binaries.
-CLANG_FORMAT="${CLANG_FORMAT:-clang-format}"
-if ! command -v "$CLANG_FORMAT" >/dev/null 2>&1; then
-    for v in 18 17 16 15 14; do
-        if command -v "clang-format-$v" >/dev/null 2>&1; then
-            CLANG_FORMAT="clang-format-$v"
+# Locate clang-format.  Prefer clang-format 18 because GitHub Actions
+# ubuntu-24.04 installs 18.1.x, and later releases differ on comment
+# alignment in several long-lived cluster files.
+if [ -z "${CLANG_FORMAT:-}" ]; then
+    for candidate in \
+        clang-format-18 \
+        /opt/homebrew/opt/llvm@18/bin/clang-format \
+        clang-format \
+        clang-format-17 \
+        clang-format-16 \
+        clang-format-15 \
+        clang-format-14; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            CLANG_FORMAT="$candidate"
             break
         fi
     done

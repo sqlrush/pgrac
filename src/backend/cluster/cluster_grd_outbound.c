@@ -37,6 +37,7 @@
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_grd_outbound.h"
+#include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_lmon.h"
@@ -486,7 +487,7 @@ cluster_grd_outbound_lmon_drain_send(void)
 		 * hand it a new frame.  Requeue the current slot so the byte stream is
 		 * not duplicated or interleaved.
 		 */
-		if (cluster_ic_tier1_pending_outbound((int32)slot.dest_node_id)) {
+		if (cluster_ic_mux_peer_has_pending_outbound((int32)slot.dest_node_id)) {
 			LWLockAcquire(cluster_grd_outbound_lock, LW_EXCLUSIVE);
 			requeue_slot(&slot);
 			LWLockRelease(cluster_grd_outbound_lock);
@@ -497,7 +498,7 @@ cluster_grd_outbound_lmon_drain_send(void)
 									  slot.payload_len > 0 ? slot.payload : NULL, slot.payload_len);
 		if (rc == CLUSTER_IC_SEND_DONE
 			|| (rc == CLUSTER_IC_SEND_WOULD_BLOCK
-				&& cluster_ic_tier1_pending_outbound((int32)slot.dest_node_id))) {
+				&& cluster_ic_mux_peer_has_pending_outbound((int32)slot.dest_node_id))) {
 			sent++;
 			continue;
 		}

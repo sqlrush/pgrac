@@ -100,6 +100,8 @@ is(raise_and_get_sqlstate('cluster_reconfig_abort'), '40R01',
 	"cluster_reconfig_abort -> 40R01");
 is(raise_and_get_sqlstate('cluster_lms_queue_full'), '53R01',
 	"cluster_lms_queue_full -> 53R01");
+is(raise_and_get_sqlstate('cluster_ic_rdma_unavailable'), '53R22',
+	"cluster_ic_rdma_unavailable -> 53R22");
 is(raise_and_get_sqlstate('cluster_reconfig_in_progress'), '53R60',
 	"cluster_reconfig_in_progress -> 53R60");
 is(raise_and_get_sqlstate('cluster_backup_incomplete'), '53RAD',
@@ -108,6 +110,8 @@ is(raise_and_get_sqlstate('cluster_shared_storage_failed'), '58R01',
 	"cluster_shared_storage_failed -> 58R01");
 is(raise_and_get_sqlstate('cluster_storage_fence_unavailable'), '58R15',
 	"cluster_storage_fence_unavailable -> 58R15");
+is(raise_and_get_sqlstate('cluster_ic_rdma_fabric_error'), '58R16',
+	"cluster_ic_rdma_fabric_error -> 58R16");
 
 
 # ----------

@@ -19,8 +19,8 @@
 #      - Setting tier1 in postgresql.conf prevents the server from
 #        starting (cluster_ic_init ereports FEATURE_NOT_SUPPORTED
 #        with an errhint pointing to Stage 2).
-#      - Setting tier2 / tier3 likewise prevents startup, with the
-#        Stage 6+ errhint.
+#      - In a default build without --with-rdma, setting tier2/tier3
+#        prevents startup with SQLSTATE 53R22 / RDMA-enabled build hint.
 #      - After clearing the bad config, the server starts again on
 #        stub.
 #      - Baseline regression: spec-0.16 / 0.17 cluster views still
@@ -102,13 +102,13 @@ like($stderr, qr/cannot be changed without restarting the server/i,
 # ----------
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'110',
-	'pg_stat_cluster_wait_events returns 110 rows (spec-6.0a +7 storage wait events)');
+	'112',
+	'pg_stat_cluster_wait_events returns 112 rows (spec-6.1 RDMA wait events)');
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_gcluster_wait_events'),
-	'110',
-	'pg_stat_gcluster_wait_events returns 110 rows (spec-6.0a +7 storage wait events)');
+	'112',
+	'pg_stat_gcluster_wait_events returns 112 rows (spec-6.1 RDMA wait events)');
 
 
 # ----------
@@ -131,16 +131,25 @@ ok(defined $node->wait_for_log_match(qr/tier1.*interconnect_addr|interconnect_ad
 
 
 # ----------
-# Switching to tier2 yields a different errhint (Stage 6+).
+# Switching to tier2/tier3 in a default no-RDMA build fails closed with 53R22.
 # ----------
 unlink $node->logfile;
 $node->adjust_conf('postgresql.conf', 'cluster.interconnect_tier', 'tier2');
 $start_failed = !$node->start(fail_ok => 1);
 ok($start_failed,
-	'server refuses to start with cluster.interconnect_tier = tier2 (Stage 6+)');
+	'server refuses to start with cluster.interconnect_tier = tier2 without --with-rdma');
 
-ok(defined $node->wait_for_log_match(qr/Stage 6/, 5),
-	'startup failure errhint for tier2 points to Stage 6+');
+ok(defined $node->wait_for_log_match(qr/53R22|RDMA-enabled build|with-rdma/i, 5),
+	'startup failure for tier2 reports RDMA unavailable / --with-rdma hint');
+
+unlink $node->logfile;
+$node->adjust_conf('postgresql.conf', 'cluster.interconnect_tier', 'tier3');
+$start_failed = !$node->start(fail_ok => 1);
+ok($start_failed,
+	'server refuses to start with cluster.interconnect_tier = tier3 without --with-rdma');
+
+ok(defined $node->wait_for_log_match(qr/53R22|RDMA-enabled build|with-rdma|tier3/i, 5),
+	'startup failure for tier3 reports RDMA unavailable / --with-rdma hint');
 
 
 # ----------

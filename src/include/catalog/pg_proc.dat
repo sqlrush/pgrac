@@ -12257,6 +12257,16 @@
   proargnames => '{node_id,state,interconnect_addr,last_connect_at,last_send_at,last_recv_at,last_heartbeat_sent_at,last_heartbeat_recv_at,heartbeat_send_count,heartbeat_recv_count,msg_send_count,msg_recv_count,bytes_send,bytes_recv,reconnect_count,connect_error_count,last_errno,last_error_code,last_error,stale_epoch_drop_count,chunk_reassembly_active,chunk_reassembly_timeout_count,lamport_observe_advance_count}',
   prosrc => 'cluster_get_ic_peers' },
 
+# spec-6.1 D8 -- pg_stat_cluster_ic RDMA/mux transport observability.
+{ oid => '8972', descr => 'list cluster IC TCP/RDMA mux peer transport state',
+  proname => 'cluster_get_ic_rdma_peers', prorows => '8',
+  proretset => 't', provolatile => 'v', proparallel => 'r',
+  prorettype => 'record', proargtypes => '',
+  proallargtypes => '{int4,text,text,text,text,text,int4,bool,int4,int8,int8,int8,int8,int8,int8,int8,int8,int8,text,text}',
+  proargmodes => '{o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o}',
+  proargnames => '{node_id,transport,rdma_state,provider,rdma_addr,rdma_gid,rdma_port,mr_registered,cq_depth,fallback_count,send_count,recv_count,bytes_send,bytes_recv,block_sge_send_count,block_sge_fallback_count,latency_us_sum,latency_sample_count,last_error_code,last_error}',
+  prosrc => 'cluster_get_ic_rdma_peers' },
+
 # spec-2.3 D8 cluster_get_ic_msg_types -- list registered IC message
 # types with producer mask + handler-present diagnostic.  See
 # cluster_ic_router.h ClusterICMsgTypeInfo struct.  Used by

@@ -246,6 +246,8 @@ static const char *const BuiltinTrancheNames[] = {
 	"ClusterSq",
 	/* PGRAC LWTRANCHE_CLUSTER_HW: spec-5.7 D1 HW relation-extend authority */
 	"ClusterHw",
+	/* PGRAC LWTRANCHE_CLUSTER_IC_RDMA: spec-6.1 RDMA transport stats */
+	"ClusterIcRdma",
 #endif
 };
 

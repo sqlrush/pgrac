@@ -16,7 +16,7 @@
  *	    correct values).
  *	  - All checked codes use the 'R' subclass character (pgrac namespace
  *	    discipline; design doc §2.3).
- *	  - The Class 58 pgrac block is dense from 58R01..58R15 (the
+ *	  - The Class 58 pgrac block is dense from 58R01..58R16 (the
  *	    largest pgrac sub-class, anchors the count proof).
  *
  *	  Why compile-time only:
@@ -137,7 +137,7 @@ UT_TEST(test_class_57_first_last)
 UT_TEST(test_class_58_first_last)
 {
 	UT_ASSERT_EQ(ERRCODE_CLUSTER_SHARED_STORAGE_FAILED, MAKE_SQLSTATE('5', '8', 'R', '0', '1'));
-	UT_ASSERT_EQ(ERRCODE_CLUSTER_STORAGE_FENCE_UNAVAILABLE, MAKE_SQLSTATE('5', '8', 'R', '1', '5'));
+	UT_ASSERT_EQ(ERRCODE_CLUSTER_IC_RDMA_FABRIC_ERROR, MAKE_SQLSTATE('5', '8', 'R', '1', '6'));
 }
 
 UT_TEST(test_class_72_first_last)
@@ -154,8 +154,8 @@ UT_TEST(test_class_xx_first_last)
 
 
 /* ----------
- * Class 58 has the largest pgrac sub-class (15 entries).  Verify all
- * 15 are present and correctly encoded.  This anchors the per-class
+ * Class 58 has the largest pgrac sub-class (16 entries).  Verify all
+ * 16 are present and correctly encoded.  This anchors the per-class
  * dense-packing claim that the rest of the test only spot-checks.
  * ----------
  */
@@ -178,6 +178,12 @@ UT_TEST(test_class_58_complete)
 				 MAKE_SQLSTATE('5', '8', 'R', '1', '3'));
 	UT_ASSERT_EQ(ERRCODE_CLUSTER_STORAGE_IO_ALIGNMENT, MAKE_SQLSTATE('5', '8', 'R', '1', '4'));
 	UT_ASSERT_EQ(ERRCODE_CLUSTER_STORAGE_FENCE_UNAVAILABLE, MAKE_SQLSTATE('5', '8', 'R', '1', '5'));
+	UT_ASSERT_EQ(ERRCODE_CLUSTER_IC_RDMA_FABRIC_ERROR, MAKE_SQLSTATE('5', '8', 'R', '1', '6'));
+}
+
+UT_TEST(test_class_53_rdma_band)
+{
+	UT_ASSERT_EQ(ERRCODE_CLUSTER_IC_RDMA_UNAVAILABLE, MAKE_SQLSTATE('5', '3', 'R', '2', '2'));
 }
 
 UT_TEST(test_class_53_backup_band)
@@ -263,7 +269,7 @@ UT_TEST(test_per_class_anchors)
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(14);
 	UT_RUN(test_class_08_first_last);
 	UT_RUN(test_class_40_first_last);
 	UT_RUN(test_class_53_first_last);
@@ -273,6 +279,7 @@ main(void)
 	UT_RUN(test_class_72_first_last);
 	UT_RUN(test_class_xx_first_last);
 	UT_RUN(test_class_58_complete);
+	UT_RUN(test_class_53_rdma_band);
 	UT_RUN(test_class_53_backup_band);
 	UT_RUN(test_all_use_r_subclass);
 	UT_RUN(test_no_overlap_with_pg_native);

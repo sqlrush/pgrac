@@ -56,6 +56,7 @@
 #include "cluster/cluster_conf.h" /* CLUSTER_MAX_NODES */
 #include "cluster/cluster_ic.h"	  /* ClusterICOps type for stub */
 #include "cluster/cluster_ic_envelope.h"
+#include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_touched_peers.h" /* spec-5.14 D2 stamp stub */
 #include "cluster/cluster_ic_router.h"
 
@@ -230,6 +231,12 @@ cluster_ic_tier1_get_peer_fd(int32 peer_id)
 	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
 		return -1;
 	return test_tier1_peer_fd_mock[peer_id];
+}
+
+ClusterICPeerTransport
+cluster_ic_mux_peer_transport(int32 peer_id pg_attribute_unused())
+{
+	return CLUSTER_IC_PEER_TRANSPORT_TCP;
 }
 
 ClusterICSendResult

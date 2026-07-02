@@ -698,6 +698,7 @@ LDFLAGS_EX
 ZSTD_LIBS
 ZSTD_CFLAGS
 with_zstd
+with_rdma
 LZ4_LIBS
 LZ4_CFLAGS
 with_lz4
@@ -876,6 +877,7 @@ with_system_tzdata
 with_zlib
 with_lz4
 with_zstd
+with_rdma
 with_ssl
 with_openssl
 enable_largefile
@@ -1592,6 +1594,7 @@ Optional Packages:
   --without-zlib          do not use Zlib
   --with-lz4              build with LZ4 support
   --with-zstd             build with ZSTD support
+  --with-rdma             build with RDMA interconnect support
   --with-ssl=LIB          use LIB for SSL/TLS support (openssl)
   --with-openssl          obsolete spelling of --with-ssl=openssl
 
@@ -3395,6 +3398,33 @@ $as_echo "#define USE_PGRAC_CLUSTER 1" >>confdefs.h
 
 else
   enable_cluster=no
+
+fi
+
+
+
+#
+# PGRAC: --with-rdma (optional RDMA interconnect provider)
+#
+
+
+# Check whether --with-rdma was given.
+if test "${with_rdma+set}" = set; then :
+  withval=$with_rdma;
+  case $withval in
+    yes)
+      :
+      ;;
+    no)
+      :
+      ;;
+    *)
+      as_fn_error $? "no argument expected for --with-rdma option" "$LINENO" 5
+      ;;
+  esac
+
+else
+  with_rdma=no
 
 fi
 
@@ -13471,6 +13501,103 @@ fi
 
 fi
 
+if test "$with_rdma" = yes ; then
+  { $as_echo "$as_me:${as_lineno-$LINENO}: checking for ibv_get_device_list in -libverbs" >&5
+$as_echo_n "checking for ibv_get_device_list in -libverbs... " >&6; }
+if ${ac_cv_lib_ibverbs_ibv_get_device_list+:} false; then :
+  $as_echo_n "(cached) " >&6
+else
+  ac_check_lib_save_LIBS=$LIBS
+LIBS="-libverbs  $LIBS"
+cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+/* Override any GCC internal prototype to avoid an error.
+   Use char because int might match the return type of a GCC
+   builtin and then its argument prototype would still apply.  */
+#ifdef __cplusplus
+extern "C"
+#endif
+char ibv_get_device_list ();
+int
+main ()
+{
+return ibv_get_device_list ();
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_link "$LINENO"; then :
+  ac_cv_lib_ibverbs_ibv_get_device_list=yes
+else
+  ac_cv_lib_ibverbs_ibv_get_device_list=no
+fi
+rm -f core conftest.err conftest.$ac_objext \
+    conftest$ac_exeext conftest.$ac_ext
+LIBS=$ac_check_lib_save_LIBS
+fi
+{ $as_echo "$as_me:${as_lineno-$LINENO}: result: $ac_cv_lib_ibverbs_ibv_get_device_list" >&5
+$as_echo "$ac_cv_lib_ibverbs_ibv_get_device_list" >&6; }
+if test "x$ac_cv_lib_ibverbs_ibv_get_device_list" = xyes; then :
+  cat >>confdefs.h <<_ACEOF
+#define HAVE_LIBIBVERBS 1
+_ACEOF
+
+  LIBS="-libverbs $LIBS"
+
+else
+  as_fn_error $? "library 'ibverbs' is required for RDMA support" "$LINENO" 5
+fi
+
+  { $as_echo "$as_me:${as_lineno-$LINENO}: checking for rdma_create_id in -lrdmacm" >&5
+$as_echo_n "checking for rdma_create_id in -lrdmacm... " >&6; }
+if ${ac_cv_lib_rdmacm_rdma_create_id+:} false; then :
+  $as_echo_n "(cached) " >&6
+else
+  ac_check_lib_save_LIBS=$LIBS
+LIBS="-lrdmacm  $LIBS"
+cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+/* Override any GCC internal prototype to avoid an error.
+   Use char because int might match the return type of a GCC
+   builtin and then its argument prototype would still apply.  */
+#ifdef __cplusplus
+extern "C"
+#endif
+char rdma_create_id ();
+int
+main ()
+{
+return rdma_create_id ();
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_link "$LINENO"; then :
+  ac_cv_lib_rdmacm_rdma_create_id=yes
+else
+  ac_cv_lib_rdmacm_rdma_create_id=no
+fi
+rm -f core conftest.err conftest.$ac_objext \
+    conftest$ac_exeext conftest.$ac_ext
+LIBS=$ac_check_lib_save_LIBS
+fi
+{ $as_echo "$as_me:${as_lineno-$LINENO}: result: $ac_cv_lib_rdmacm_rdma_create_id" >&5
+$as_echo "$ac_cv_lib_rdmacm_rdma_create_id" >&6; }
+if test "x$ac_cv_lib_rdmacm_rdma_create_id" = xyes; then :
+  cat >>confdefs.h <<_ACEOF
+#define HAVE_LIBRDMACM 1
+_ACEOF
+
+  LIBS="-lrdmacm $LIBS"
+
+else
+  as_fn_error $? "library 'rdmacm' is required for RDMA support" "$LINENO" 5
+fi
+
+fi
+
 # Note: We can test for libldap_r only after we know PTHREAD_LIBS;
 # also, on AIX, we may need to have openssl in LIBS for this step.
 if test "$with_ldap" = yes ; then
@@ -14162,6 +14289,31 @@ if test "x$ac_cv_header_zstd_h" = xyes; then :
 
 else
   as_fn_error $? "zstd.h header file is required for ZSTD" "$LINENO" 5
+fi
+
+
+fi
+
+if test "$with_rdma" = yes; then
+  ac_fn_c_check_header_mongrel "$LINENO" "infiniband/verbs.h" "ac_cv_header_infiniband_verbs_h" "$ac_includes_default"
+if test "x$ac_cv_header_infiniband_verbs_h" = xyes; then :
+  cat >>confdefs.h <<_ACEOF
+#define HAVE_INFINIBAND_VERBS_H 1
+_ACEOF
+
+else
+  as_fn_error $? "infiniband/verbs.h header file is required for RDMA" "$LINENO" 5
+fi
+
+
+  ac_fn_c_check_header_mongrel "$LINENO" "rdma/rdma_cma.h" "ac_cv_header_rdma_rdma_cma_h" "$ac_includes_default"
+if test "x$ac_cv_header_rdma_rdma_cma_h" = xyes; then :
+  cat >>confdefs.h <<_ACEOF
+#define HAVE_RDMA_RDMA_CMA_H 1
+_ACEOF
+
+else
+  as_fn_error $? "rdma/rdma_cma.h header file is required for RDMA" "$LINENO" 5
 fi
 
 

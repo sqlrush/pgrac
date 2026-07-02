@@ -58,6 +58,7 @@
 #include "cluster/cluster_elog.h"										/* CLUSTER_LOG */
 #include "cluster/cluster_guc.h"			/* cluster_node_id / cluster_shmem_max_regions */
 #include "cluster/cluster_ic.h"				/* cluster_ic_init / shutdown (stage 0.18) */
+#include "cluster/cluster_ic_rdma.h"		/* cluster_ic_rdma_shmem_register (spec-6.1) */
 #include "cluster/cluster_ic_tier1.h"		/* cluster_ic_tier1_shmem_register (spec-2.2 D3) */
 #include "cluster/cluster_cssd.h"			/* cluster_cssd_shmem_register (2.5 Sprint A) */
 #include "cluster/cluster_undo_cleaner.h"	/* cluster_undo_cleaner_shmem_register (3.13) */
@@ -616,6 +617,10 @@ cluster_init_shmem_module(void)
 	/* spec-2.2 D3 (2026-05-07): register cluster_ic_tier1 shmem region. */
 	if (cluster_shmem_lookup_region("pgrac cluster_ic_tier1") == NULL)
 		cluster_ic_tier1_shmem_register();
+
+	/* spec-6.1 D8: RDMA mux/transport observability region. */
+	if (cluster_shmem_lookup_region("pgrac cluster_ic_rdma") == NULL)
+		cluster_ic_rdma_shmem_register();
 
 	/* spec-1.15 D3: register cluster_scn shmem region (encoding layer). */
 	if (cluster_shmem_lookup_region("pgrac cluster scn") == NULL)

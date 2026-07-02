@@ -1213,8 +1213,14 @@ pgstat_get_wait_cluster_interconnect(WaitEventCluster w)
 	case WAIT_EVENT_INTERCONNECT_RDMA_RECV:
 		event_name = "InterconnectRdmaRecv";
 		break;
+	case WAIT_EVENT_CLUSTER_IC_RDMA_POLL:
+		event_name = "ClusterICRdmaPoll";
+		break;
+	case WAIT_EVENT_CLUSTER_IC_RDMA_CONNECT:
+		event_name = "ClusterICRdmaConnect";
+		break;
 	case WAIT_EVENT_INTERCONNECT_TCP_FALLBACK:
-		event_name = "InterconnectTcpFallback";
+		event_name = "ClusterICRdmaFallback";
 		break;
 	case WAIT_EVENT_INTERCONNECT_TIER_SWITCH:
 		event_name = "InterconnectTierSwitch";
