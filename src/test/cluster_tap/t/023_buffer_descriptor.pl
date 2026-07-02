@@ -61,7 +61,7 @@ my $has_visibility_inject =
 # admission reason counters; +1 "pgrac cluster clean_leave" (spec-5.13); +1
 # "pgrac cluster cr relgen" (spec-5.56 D4); +1 "pgrac cluster cr tuple stats"
 # (spec-5.54 D5); full list + count lives in t/020).
-  my $expected_region_count = $has_visibility_inject ? '71' : '70'; # spec-5.59 +1 xnode profile; spec-6.1 +1 rdma; spec-5.55 +1 resolver cache; spec-5.57 +1 cr coordinator; spec-5.18 +1 node_remove; spec-6.5 +1 backup
+  my $expected_region_count = $has_visibility_inject ? '72' : '71'; # spec-6.2 +1 smart fusion deps; full list lives in t/020
 
 
 # ----------
