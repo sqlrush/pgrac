@@ -205,6 +205,16 @@ cluster_adg_apply_master_lease_init(ClusterAdgApplyMasterLease *lease, uint64 te
 									int32 owner_node_id, int64 lease_expires_at_ms,
 									uint64 generation)
 {
+	cluster_adg_apply_master_lease_init_full(lease, term, owner_node_id, lease_expires_at_ms,
+											 generation, 1, 1);
+}
+
+void
+cluster_adg_apply_master_lease_init_full(ClusterAdgApplyMasterLease *lease, uint64 term,
+										 int32 owner_node_id, int64 lease_expires_at_ms,
+										 uint64 generation, uint64 lease_epoch,
+										 uint64 owner_incarnation)
+{
 	if (lease == NULL)
 		return;
 
@@ -215,6 +225,8 @@ cluster_adg_apply_master_lease_init(ClusterAdgApplyMasterLease *lease, uint64 te
 	lease->owner_node_id = owner_node_id;
 	lease->lease_expires_at_ms = lease_expires_at_ms;
 	lease->generation = generation;
+	lease->lease_epoch = lease_epoch;
+	lease->owner_incarnation = owner_incarnation;
 	lease->crc = cluster_adg_apply_master_lease_crc(lease);
 }
 
@@ -230,6 +242,8 @@ cluster_adg_apply_master_lease_valid(const ClusterAdgApplyMasterLease *lease)
 	if (lease->term == 0)
 		return false;
 	if (lease->owner_node_id < 0 || lease->owner_node_id > SCN_MAX_VALID_NODE_ID)
+		return false;
+	if (lease->lease_epoch == 0 || lease->owner_incarnation == 0)
 		return false;
 	return lease->crc == cluster_adg_apply_master_lease_crc(lease);
 }
@@ -258,7 +272,8 @@ cluster_adg_apply_master_lease_same(const ClusterAdgApplyMasterLease *a,
 									const ClusterAdgApplyMasterLease *b)
 {
 	return a->term == b->term && a->generation == b->generation
-		   && a->owner_node_id == b->owner_node_id;
+		   && a->owner_node_id == b->owner_node_id && a->lease_epoch == b->lease_epoch
+		   && a->owner_incarnation == b->owner_incarnation;
 }
 
 static bool
@@ -313,6 +328,8 @@ cluster_adg_apply_master_lease_quorum(const ClusterAdgApplyMasterLease leases[],
 			current.owner_node_id = out->owner_node_id;
 			current.generation = out->generation;
 			current.lease_expires_at_ms = out->lease_expires_at_ms;
+			current.lease_epoch = out->lease_epoch;
+			current.owner_incarnation = out->owner_incarnation;
 			should_publish = cluster_adg_apply_master_lease_newer(&candidate, &current);
 		}
 		if (should_publish) {
@@ -322,10 +339,46 @@ cluster_adg_apply_master_lease_quorum(const ClusterAdgApplyMasterLease leases[],
 			out->owner_node_id = candidate.owner_node_id;
 			out->lease_expires_at_ms = max_expires_at_ms;
 			out->generation = candidate.generation;
+			out->lease_epoch = candidate.lease_epoch;
+			out->owner_incarnation = candidate.owner_incarnation;
 		}
 	}
 
 	return true;
+}
+
+ClusterAdgApplyMasterLeaseCasVerdict
+cluster_adg_apply_master_lease_cas_verdict(const ClusterAdgApplyMasterLeaseQuorum *current,
+										   const ClusterAdgApplyMasterLease *desired, int64 now_ms)
+{
+	uint64 next_term;
+
+	if (current == NULL || desired == NULL || !cluster_adg_apply_master_lease_valid(desired))
+		return CLUSTER_ADG_APPLY_LEASE_CAS_INVALID;
+	if (desired->lease_expires_at_ms <= now_ms || desired->generation == 0)
+		return CLUSTER_ADG_APPLY_LEASE_CAS_INVALID;
+
+	if (!current->attached) {
+		if (desired->term == cluster_adg_apply_master_next_term(0))
+			return CLUSTER_ADG_APPLY_LEASE_CAS_TAKE_EMPTY;
+		return CLUSTER_ADG_APPLY_LEASE_CAS_STALE;
+	}
+
+	if (current->owner_node_id == desired->owner_node_id && current->durable_term == desired->term
+		&& current->lease_epoch == desired->lease_epoch
+		&& current->owner_incarnation == desired->owner_incarnation) {
+		if (desired->generation > current->generation)
+			return CLUSTER_ADG_APPLY_LEASE_CAS_RENEW;
+		return CLUSTER_ADG_APPLY_LEASE_CAS_STALE;
+	}
+
+	if (now_ms < current->lease_expires_at_ms)
+		return CLUSTER_ADG_APPLY_LEASE_CAS_STALE;
+
+	next_term = cluster_adg_apply_master_next_term(current->durable_term);
+	if (next_term == 0 || desired->term != next_term || desired->generation <= current->generation)
+		return CLUSTER_ADG_APPLY_LEASE_CAS_STALE;
+	return CLUSTER_ADG_APPLY_LEASE_CAS_TAKE_EXPIRED;
 }
 
 ClusterAdgReadDecision

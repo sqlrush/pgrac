@@ -362,6 +362,7 @@ UT_TEST(test_cluster_adg_guc_defaults)
 	UT_ASSERT_EQ(cluster_dg_mode, CLUSTER_DG_MODE_ASYNC);
 	UT_ASSERT_EQ((int)cluster_enable_adg, 0);
 	UT_ASSERT_EQ((int)cluster_apply_master_election, 1);
+	UT_ASSERT_EQ(cluster_adg_rfs_conninfos, NULL);
 	UT_ASSERT_EQ(cluster_adg_lag_threshold_sec, 10);
 	UT_ASSERT_EQ(cluster_max_standby_delay, 30);
 	UT_ASSERT_EQ(cluster_apply_master_switch_drain_ms, 5000);

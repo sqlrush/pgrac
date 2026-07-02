@@ -90,6 +90,7 @@ int cluster_dg_role = CLUSTER_DG_ROLE_PRIMARY;
 int cluster_dg_mode = CLUSTER_DG_MODE_ASYNC;
 bool cluster_enable_adg = false;
 bool cluster_apply_master_election = true;
+char *cluster_adg_rfs_conninfos = NULL;
 int cluster_adg_primary_thread_count = 0;
 int cluster_adg_lag_threshold_sec = 10;
 int cluster_max_standby_delay = 30;
@@ -1324,6 +1325,14 @@ cluster_init_guc(void)
 		gettext_noop("When on, the standby cluster elects one Apply Master using a voting-disk "
 					 "majority and the durable apply-master term lease."),
 		&cluster_apply_master_election, true, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	DefineCustomStringVariable(
+		"cluster.adg_rfs_conninfos", gettext_noop("ADG RFS upstream connection strings."),
+		gettext_noop("Semicolon-separated libpq connection strings used by the standby RFS "
+					 "coordinator to receive per-thread WAL from primary instances.  Each entry "
+					 "may start with \"thread_id=N\" followed by whitespace before the libpq "
+					 "connection string; entries without a prefix use their 1-based order."),
+		&cluster_adg_rfs_conninfos, "", PGC_POSTMASTER, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
 		"cluster.adg_primary_thread_count", gettext_noop("Primary ADG WAL thread count."),

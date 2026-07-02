@@ -188,6 +188,7 @@
 #include "cluster/cluster_guc.h"   /* cluster_enabled (spec-1.11 Sprint B) */
 #include "cluster/cluster_lmd.h"   /* cluster_lmd_mark_child_exit (spec-2.19 D12 hardening) */
 #include "cluster/cluster_mrp.h"   /* cluster_mrp_should_start (spec-6.4 D1) */
+#include "cluster/cluster_rfs.h"   /* cluster_rfs_should_start (spec-6.4 D3) */
 #include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_wal_state.h" /* PGRAC: spec-4.2 publish_stopped on clean shutdown */
 #endif
@@ -344,6 +345,8 @@ static pid_t LmsPID = 0;
 static pid_t LmdPID = 0;
 /* PGRAC (spec-6.4 D1): ADG Managed Recovery Process pid;same pattern. */
 static pid_t MrpPID = 0;
+/* PGRAC (spec-6.4 D3): ADG RFS coordinator pid;same pattern. */
+static pid_t RfsPID = 0;
 /* PGRAC (spec-2.38 D4): SI Broadcaster aux process pid;same pattern. */
 static pid_t SinvalBcastPID = 0;
 /*
@@ -669,6 +672,7 @@ static void ShmemBackendArrayRemove(Backend *bn);
 #define StartLms() StartChildProcess(LmsProcess)
 #define StartLmd() StartChildProcess(LmdProcess)
 #define StartMrp() StartChildProcess(MrpProcess)
+#define StartRfs() StartChildProcess(RfsProcess)
 /* PGRAC (spec-2.38 D4): SI Broadcaster aux process. */
 #define StartSinvalBcast() StartChildProcess(SinvalBcastProcess)
 #endif
@@ -2015,6 +2019,11 @@ ServerLoop(void)
 				|| pmState == PM_HOT_STANDBY || pmState == PM_RUN))
 			MrpPID = StartMrp();
 
+		if (cluster_rfs_should_start() && RfsPID == 0
+			&& (pmState == PM_STARTUP || pmState == PM_RECOVERY
+				|| pmState == PM_HOT_STANDBY || pmState == PM_RUN))
+			RfsPID = StartRfs();
+
 		/*
 		 * PGRAC: spec-2.38 D4 — SI Broadcaster aux process spawn.
 		 * LMON owns outbound fanout because tier1 TCP fds are LMON
@@ -2917,6 +2926,8 @@ process_pm_reload_request(void)
 			signal_child(LmdPID, SIGHUP);
 		if (MrpPID != 0) /* PGRAC spec-6.4 D1 */
 			signal_child(MrpPID, SIGHUP);
+		if (RfsPID != 0) /* PGRAC spec-6.4 D3 */
+			signal_child(RfsPID, SIGHUP);
 		if (SinvalBcastPID != 0) /* PGRAC spec-2.38 SI Broadcaster */
 			signal_child(SinvalBcastPID, SIGHUP);
 #endif
@@ -3472,6 +3483,13 @@ process_pm_child_exit(void)
 				HandleChildCrash(pid, exitstatus, _("MRP process"));
 			continue;
 		}
+		/* PGRAC (spec-6.4 D3): RFS coordinator reaper. */
+		if (pid == RfsPID) {
+			RfsPID = 0;
+			if (!EXIT_STATUS_0(exitstatus))
+				HandleChildCrash(pid, exitstatus, _("RFS coordinator process"));
+			continue;
+		}
 		/* PGRAC (spec-2.38 D4): SI Broadcaster reaper. */
 		if (pid == SinvalBcastPID) {
 			SinvalBcastPID = 0;
@@ -3915,6 +3933,12 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 	else if (MrpPID != 0 && take_action)
 		sigquit_child(MrpPID);
 
+	/* PGRAC (spec-6.4 D3): RFS coordinator crash handling. */
+	if (pid == RfsPID)
+		RfsPID = 0;
+	else if (RfsPID != 0 && take_action)
+		sigquit_child(RfsPID);
+
 	/* PGRAC (spec-2.38 D4): SI Broadcaster crash handling. */
 	if (pid == SinvalBcastPID)
 		SinvalBcastPID = 0;
@@ -4080,6 +4104,9 @@ PostmasterStateMachine(void)
 		/* spec-2.38 LIFO: SinvalBcast first (last-spawned). */
 		if (SinvalBcastPID != 0)
 			signal_child(SinvalBcastPID, SIGTERM);
+		/* spec-6.4 LIFO: RFS stops before MRP so apply can drain known receive state. */
+		if (RfsPID != 0)
+			signal_child(RfsPID, SIGTERM);
 		/* spec-6.4 LIFO: MRP is newer than LMD/LMS and stops before lock actors. */
 		if (MrpPID != 0)
 			signal_child(MrpPID, SIGTERM);
@@ -4179,6 +4206,8 @@ PostmasterStateMachine(void)
 			LmdPID == 0 &&
 			/* PGRAC: spec-6.4 D1 — same wait for MRP. */
 			MrpPID == 0 &&
+			/* PGRAC: spec-6.4 D3 — same wait for RFS coordinator. */
+			RfsPID == 0 &&
 			/* PGRAC: spec-2.38 Sprint A — same wait for SI Broadcaster. */
 			SinvalBcastPID == 0 &&
 #endif
@@ -4549,6 +4578,8 @@ TerminateChildren(int signal)
 		signal_child(LmdPID, signal);
 	if (MrpPID != 0) /* PGRAC spec-6.4 D1 */
 		signal_child(MrpPID, signal);
+	if (RfsPID != 0) /* PGRAC spec-6.4 D3 */
+		signal_child(RfsPID, signal);
 	if (SinvalBcastPID != 0) /* PGRAC spec-2.38 SI Broadcaster */
 		signal_child(SinvalBcastPID, signal);
 #endif
@@ -5763,6 +5794,9 @@ StartChildProcess(AuxProcType type)
 		case MrpProcess:
 			ereport(LOG, (errmsg("could not fork MRP process: %m")));
 			break;
+		case RfsProcess:
+			ereport(LOG, (errmsg("could not fork RFS coordinator process: %m")));
+			break;
 #endif
 		default:
 			ereport(LOG, (errmsg("could not fork process: %m")));
@@ -6073,6 +6107,18 @@ cluster_postmaster_start_mrp(void)
 
 	MrpPID = StartMrp();
 	return MrpPID;
+}
+
+pid_t
+cluster_postmaster_start_rfs(void)
+{
+	if (IsUnderPostmaster)
+		return 0;
+	if (!cluster_rfs_should_start())
+		return 0;
+
+	RfsPID = StartRfs();
+	return RfsPID;
 }
 #endif
 

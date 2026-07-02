@@ -27,7 +27,7 @@
 
 #define CLUSTER_ADG_MAX_THREADS CLUSTER_WAL_THREAD_MAX
 #define CLUSTER_ADG_APPLY_LEASE_MAGIC 0x41444c53 /* "ADLS" */
-#define CLUSTER_ADG_APPLY_LEASE_VERSION 1
+#define CLUSTER_ADG_APPLY_LEASE_VERSION 2
 #define CLUSTER_ADG_APPLY_LEASE_SLOT_BYTES 512
 #define CLUSTER_ADG_REPLY_MAGIC 0x41444752 /* "ADGR" */
 #define CLUSTER_ADG_REPLY_VERSION 1
@@ -67,6 +67,8 @@ typedef struct ClusterAdgApplyMasterLease {
 	int32 reserved;
 	int64 lease_expires_at_ms;
 	uint64 generation;
+	uint64 lease_epoch;
+	uint64 owner_incarnation;
 	pg_crc32c crc;
 } ClusterAdgApplyMasterLease;
 
@@ -77,7 +79,17 @@ typedef struct ClusterAdgApplyMasterLeaseQuorum {
 	int32 owner_node_id;
 	int64 lease_expires_at_ms;
 	uint64 generation;
+	uint64 lease_epoch;
+	uint64 owner_incarnation;
 } ClusterAdgApplyMasterLeaseQuorum;
+
+typedef enum ClusterAdgApplyMasterLeaseCasVerdict {
+	CLUSTER_ADG_APPLY_LEASE_CAS_INVALID = 0,
+	CLUSTER_ADG_APPLY_LEASE_CAS_RENEW,
+	CLUSTER_ADG_APPLY_LEASE_CAS_TAKE_EMPTY,
+	CLUSTER_ADG_APPLY_LEASE_CAS_TAKE_EXPIRED,
+	CLUSTER_ADG_APPLY_LEASE_CAS_STALE
+} ClusterAdgApplyMasterLeaseCasVerdict;
 
 StaticAssertDecl(sizeof(ClusterAdgApplyMasterLease) <= CLUSTER_ADG_APPLY_LEASE_SLOT_BYTES,
 				 "ADG apply-master lease marker must fit in one voting-disk lease slot");
@@ -96,6 +108,10 @@ extern pg_crc32c cluster_adg_apply_master_lease_crc(const ClusterAdgApplyMasterL
 extern void cluster_adg_apply_master_lease_init(ClusterAdgApplyMasterLease *lease, uint64 term,
 												int32 owner_node_id, int64 lease_expires_at_ms,
 												uint64 generation);
+extern void cluster_adg_apply_master_lease_init_full(ClusterAdgApplyMasterLease *lease, uint64 term,
+													 int32 owner_node_id, int64 lease_expires_at_ms,
+													 uint64 generation, uint64 lease_epoch,
+													 uint64 owner_incarnation);
 extern bool cluster_adg_apply_master_lease_valid(const ClusterAdgApplyMasterLease *lease);
 extern bool cluster_adg_apply_master_lease_pack(void *slot512,
 												const ClusterAdgApplyMasterLease *lease);
@@ -104,6 +120,9 @@ extern bool cluster_adg_apply_master_lease_unpack(const void *slot512,
 extern bool cluster_adg_apply_master_lease_quorum(const ClusterAdgApplyMasterLease leases[],
 												  const bool valid[], int lease_count, int quorum,
 												  ClusterAdgApplyMasterLeaseQuorum *out);
+extern ClusterAdgApplyMasterLeaseCasVerdict
+cluster_adg_apply_master_lease_cas_verdict(const ClusterAdgApplyMasterLeaseQuorum *current,
+										   const ClusterAdgApplyMasterLease *desired, int64 now_ms);
 
 extern ClusterAdgReadDecision cluster_adg_read_only_decide(bool enable_adg, bool standby_role,
 														   bool read_service_available,

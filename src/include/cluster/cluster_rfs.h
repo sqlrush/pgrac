@@ -21,11 +21,15 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+extern bool cluster_rfs_should_start(void);
+extern int cluster_rfs_configured_upstream_count(void);
 extern void cluster_rfs_observe_received_chunk(const char *buf, Size nbytes, XLogRecPtr recptr,
 											   TimeLineID tli, int native_wal_fd,
 											   uint16 *last_thread_id);
 extern void cluster_rfs_flush_received_threads(void);
 extern void cluster_rfs_append_reply_trailer(StringInfo reply_message, uint16 last_thread_id);
+extern pid_t cluster_postmaster_start_rfs(void);
+extern void RfsMain(void) pg_attribute_noreturn();
 
 #endif /* USE_PGRAC_CLUSTER */
 

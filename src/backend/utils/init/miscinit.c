@@ -368,6 +368,9 @@ GetBackendTypeDesc(BackendType backendType)
 	case B_MRP:
 		backendDesc = "managed recovery process";
 		break;
+	case B_RFS:
+		backendDesc = "remote file server";
+		break;
 	case B_QVOTEC:
 		backendDesc = "qvotec";
 		break;

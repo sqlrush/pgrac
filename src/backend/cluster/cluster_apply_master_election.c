@@ -44,8 +44,7 @@ cluster_apply_master_current_node_id(void)
 bool
 cluster_apply_master_term_still_valid(uint64 held_term)
 {
-	return held_term != 0 && held_term == cluster_mrp_apply_master_term()
-		   && cluster_mrp_apply_master_can_apply();
+	return cluster_mrp_apply_master_term_still_valid(held_term);
 }
 
 #endif /* USE_PGRAC_CLUSTER */

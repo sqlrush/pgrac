@@ -12,9 +12,9 @@
  *	    keep their numeric positions; the 16 pgrac values are appended
  *	    after B_WAL_WRITER (CSSD added in spec-2.5 Sprint A;
  *	    QVOTEC added in spec-2.6 Sprint A Step 3 D7).
- *	  - BACKEND_NUM_TYPES == 31 (14 PG + 17 pgrac;spec-2.18 added B_LMS).
- *	  - The 16 new values are pairwise distinct and dense (no holes).
- *	  - B_UNDO_CLEANER == BACKEND_NUM_TYPES - 1 (last value).
+ *	  - BACKEND_NUM_TYPES == 32 (14 PG + 18 pgrac;spec-6.4 added B_RFS).
+ *	  - The 18 new values are pairwise distinct and dense (no holes).
+ *	  - B_RFS == BACKEND_NUM_TYPES - 1 (last value).
  *
  *	  Why compile-time only:
  *
@@ -89,12 +89,12 @@ UT_DEFINE_GLOBALS();
  * ----------
  */
 
-UT_TEST(test_backend_num_types_is_31)
+UT_TEST(test_backend_num_types_is_32)
 {
-	/* 14 PG-native (B_INVALID..B_WAL_WRITER) + 17 pgrac = 31
+	/* 14 PG-native (B_INVALID..B_WAL_WRITER) + 18 pgrac = 32
 	 * (spec-2.5 added B_CSSD; spec-2.6 Sprint A Step 3 added B_QVOTEC;
-	 * spec-2.18 Sprint A Step 1 added B_LMS) */
-	UT_ASSERT_EQ(BACKEND_NUM_TYPES, 31);
+	 * spec-2.18 Sprint A Step 1 added B_LMS; spec-6.4 added B_RFS) */
+	UT_ASSERT_EQ(BACKEND_NUM_TYPES, 32);
 }
 
 UT_TEST(test_pgrac_values_appended_after_wal_writer)
@@ -114,6 +114,7 @@ UT_TEST(test_pgrac_values_appended_after_wal_writer)
 	UT_ASSERT(B_QVOTEC > B_WAL_WRITER);
 	UT_ASSERT(B_RECOVERY_COORD > B_WAL_WRITER);
 	UT_ASSERT(B_RECOVERY_WORKER > B_WAL_WRITER);
+	UT_ASSERT(B_RFS > B_WAL_WRITER);
 	UT_ASSERT(B_SINVAL_BCAST > B_WAL_WRITER);
 	UT_ASSERT(B_TT_GC > B_WAL_WRITER);
 	UT_ASSERT(B_UNDO_CLEANER > B_WAL_WRITER);
@@ -133,10 +134,10 @@ UT_TEST(test_pg_native_values_unchanged)
 UT_TEST(test_pgrac_values_are_dense_and_distinct)
 {
 	/*
-	 * 17 pgrac values must occupy positions 14..30 with no holes
-	 * and no duplicates (spec-2.18 added B_LMS between B_LMON and
-	 * B_LMS_WORKER).  Asserting strict ordering proves both
-	 * (alphabetic order matches enum order in §2.2 of spec-0.10).
+	 * 18 pgrac values must occupy positions 14..31 with no holes
+	 * and no duplicates.  Asserting strict ordering proves both while
+	 * preserving the append-only ABI policy for values added after
+	 * spec-0.10.
 	 */
 	UT_ASSERT(B_CLUSTER_STATS < B_CSSD);
 	UT_ASSERT(B_CSSD < B_DIAG);
@@ -154,21 +155,23 @@ UT_TEST(test_pgrac_values_are_dense_and_distinct)
 	UT_ASSERT(B_RECOVERY_WORKER < B_SINVAL_BCAST);
 	UT_ASSERT(B_SINVAL_BCAST < B_TT_GC);
 	UT_ASSERT(B_TT_GC < B_UNDO_CLEANER);
+	UT_ASSERT(B_UNDO_CLEANER < B_RFS);
 }
 
-UT_TEST(test_undo_cleaner_is_last)
+UT_TEST(test_rfs_is_last)
 {
 	/*
-	 * B_UNDO_CLEANER is the last value in the enum, so its index
+	 * B_RFS is the last value in the enum, so its index
 	 * equals BACKEND_NUM_TYPES - 1.  This anchors the count.
 	 */
-	UT_ASSERT_EQ(B_UNDO_CLEANER, BACKEND_NUM_TYPES - 1);
+	UT_ASSERT_EQ(B_RFS, BACKEND_NUM_TYPES - 1);
 }
 
 UT_TEST(test_mrp_aux_proc_slot_is_reserved)
 {
 #ifdef USE_PGRAC_CLUSTER
 	UT_ASSERT(MrpProcess > UndoCleanerProcess);
+	UT_ASSERT(RfsProcess > MrpProcess);
 	UT_ASSERT(NUM_AUXILIARY_PROCS >= NUM_AUXPROCTYPES);
 #else
 	UT_ASSERT(NUM_AUXILIARY_PROCS >= NUM_AUXPROCTYPES);
@@ -180,11 +183,11 @@ int
 main(void)
 {
 	UT_PLAN(6);
-	UT_RUN(test_backend_num_types_is_31);
+	UT_RUN(test_backend_num_types_is_32);
 	UT_RUN(test_pgrac_values_appended_after_wal_writer);
 	UT_RUN(test_pg_native_values_unchanged);
 	UT_RUN(test_pgrac_values_are_dense_and_distinct);
-	UT_RUN(test_undo_cleaner_is_last);
+	UT_RUN(test_rfs_is_last);
 	UT_RUN(test_mrp_aux_proc_slot_is_reserved);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

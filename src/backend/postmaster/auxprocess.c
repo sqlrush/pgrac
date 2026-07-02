@@ -43,6 +43,7 @@
 #include "cluster/cluster_lms.h"		  /* LmsMain (spec-2.18 Sprint A Step 1) */
 #include "cluster/cluster_lmd.h"		  /* LmdMain (spec-2.19 Sprint A Step 1) */
 #include "cluster/cluster_mrp.h"		  /* MrpMain (spec-6.4 D1) */
+#include "cluster/cluster_rfs.h"		  /* RfsMain (spec-6.4 D3) */
 #include "cluster/cluster_sinval_bcast.h" /* SinvalBcastMain (spec-2.38 D4) */
 #include "cluster/cluster_stats.h"		  /* ClusterStatsMain (stage 1.14 Sprint A) */
 #include "cluster/cluster_undo_cleaner.h" /* UndoCleanerMain (stage 3.13) */
@@ -165,6 +166,9 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 	case MrpProcess:
 		MyBackendType = B_MRP;
 		break;
+	case RfsProcess:
+		MyBackendType = B_RFS;
+		break;
 #endif
 	default:
 		elog(PANIC, "unrecognized process type: %d", (int)MyAuxProcType);
@@ -220,7 +224,7 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 #ifdef USE_PGRAC_CLUSTER
 	if (MyAuxProcType != LmsProcess && MyAuxProcType != LmdProcess
 		&& MyAuxProcType != SinvalBcastProcess && MyAuxProcType != UndoCleanerProcess
-		&& MyAuxProcType != MrpProcess)
+		&& MyAuxProcType != MrpProcess && MyAuxProcType != RfsProcess)
 #endif
 		ProcSignalInit(MaxBackends + MyAuxProcType + 1);
 
@@ -247,7 +251,7 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 	 */
 	if (MyAuxProcType == LmsProcess || MyAuxProcType == LmdProcess
 		|| MyAuxProcType == SinvalBcastProcess || MyAuxProcType == UndoCleanerProcess
-		|| MyAuxProcType == MrpProcess) {
+		|| MyAuxProcType == MrpProcess || MyAuxProcType == RfsProcess) {
 		pqsignal(SIGHUP, SignalHandlerForConfigReload);
 		pqsignal(SIGINT, SignalHandlerForShutdownRequest);
 		pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
@@ -361,6 +365,10 @@ AuxiliaryProcessMain(AuxProcType auxtype)
 	/* PGRAC (spec-6.4 D1): ADG MRP aux process dispatch. */
 	case MrpProcess:
 		MrpMain();
+		proc_exit(1);
+	/* PGRAC (spec-6.4 D3): ADG RFS coordinator aux process dispatch. */
+	case RfsProcess:
+		RfsMain();
 		proc_exit(1);
 #endif
 

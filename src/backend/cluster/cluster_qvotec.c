@@ -88,6 +88,8 @@
 #include "utils/timestamp.h"
 
 #include "cluster/cluster_clean_leave.h" /* spec-5.13 §2.5: leave-marker submit + rebuild */
+#include "cluster/cluster_adg.h"
+#include "cluster/cluster_mrp.h"
 #include "cluster/cluster_node_remove.h" /* spec-5.18 §2.5: removal-marker carry-forward */
 #include "cluster/cluster_elog.h"		 /* CLUSTER_LOG (best-effort logging) */
 #include "cluster/cluster_epoch.h"		 /* spec-4.12b D2/D5: current-epoch upper-bound Assert */
@@ -700,6 +702,111 @@ qvotec_build_baseline_marker(ClusterFenceMarker *out)
 	Assert(out->fence_epoch <= cluster_epoch_get_current());
 }
 
+static bool
+qvotec_apply_lease_scan(ClusterAdgApplyMasterLeaseQuorum *out, int *disks_ok_out)
+{
+	ClusterAdgApplyMasterLease leases[CLUSTER_MAX_VOTING_DISKS];
+	bool valid[CLUSTER_MAX_VOTING_DISKS];
+	int disks_ok = 0;
+	int quorum;
+
+	if (out == NULL || qvotec_n_disks <= 0)
+		return false;
+
+	memset(leases, 0, sizeof(leases));
+	memset(valid, 0, sizeof(valid));
+	memset(out, 0, sizeof(*out));
+	out->owner_node_id = -1;
+	quorum = qvotec_n_disks / 2 + 1;
+
+	for (int disk = 0; disk < qvotec_n_disks; disk++) {
+		uint8 slot[CLUSTER_VOTING_SLOT_BYTES];
+
+		if (cluster_voting_disk_read_apply_lease_global_slot(qvotec_fds[disk], slot)
+			!= CLUSTER_VOTING_DISK_IO_OK)
+			continue;
+		disks_ok++;
+		valid[disk] = cluster_adg_apply_master_lease_unpack(slot, &leases[disk]);
+	}
+
+	if (disks_ok_out != NULL)
+		*disks_ok_out = disks_ok;
+	if (disks_ok < quorum)
+		return false;
+	return cluster_adg_apply_master_lease_quorum(leases, valid, qvotec_n_disks, quorum, out);
+}
+
+static bool
+qvotec_apply_lease_same_winner(const ClusterAdgApplyMasterLeaseQuorum *winner,
+							   const ClusterAdgApplyMasterLease *desired)
+{
+	return winner != NULL && desired != NULL && winner->attached
+		   && winner->durable_term == desired->term
+		   && winner->owner_node_id == desired->owner_node_id
+		   && winner->generation == desired->generation
+		   && winner->lease_epoch == desired->lease_epoch
+		   && winner->owner_incarnation == desired->owner_incarnation;
+}
+
+static ClusterMrpApplyLeaseSubmitResult
+qvotec_apply_lease_cas(const ClusterAdgApplyMasterLease *desired,
+					   ClusterAdgApplyMasterLeaseQuorum *winner)
+{
+	ClusterAdgApplyMasterLeaseQuorum current;
+	ClusterAdgApplyMasterLeaseCasVerdict verdict;
+	uint8 slot[CLUSTER_VOTING_SLOT_BYTES];
+	int disks_ok = 0;
+	int writes_ok = 0;
+	int quorum;
+
+	if (winner != NULL) {
+		memset(winner, 0, sizeof(*winner));
+		winner->owner_node_id = -1;
+	}
+	if (qvotec_n_disks <= 0)
+		return CLUSTER_MRP_APPLY_LEASE_SUBMIT_NO_QUORUM;
+	quorum = qvotec_n_disks / 2 + 1;
+
+	if (!qvotec_apply_lease_scan(&current, &disks_ok) && disks_ok < quorum)
+		return CLUSTER_MRP_APPLY_LEASE_SUBMIT_NO_QUORUM;
+
+	verdict = cluster_adg_apply_master_lease_cas_verdict(&current, desired,
+														 (int64)(GetCurrentTimestamp() / 1000));
+	switch (verdict) {
+	case CLUSTER_ADG_APPLY_LEASE_CAS_RENEW:
+	case CLUSTER_ADG_APPLY_LEASE_CAS_TAKE_EMPTY:
+	case CLUSTER_ADG_APPLY_LEASE_CAS_TAKE_EXPIRED:
+		break;
+	case CLUSTER_ADG_APPLY_LEASE_CAS_INVALID:
+		if (winner != NULL)
+			*winner = current;
+		return CLUSTER_MRP_APPLY_LEASE_SUBMIT_INVALID;
+	case CLUSTER_ADG_APPLY_LEASE_CAS_STALE:
+	default:
+		if (winner != NULL)
+			*winner = current;
+		return CLUSTER_MRP_APPLY_LEASE_SUBMIT_STALE;
+	}
+
+	if (!cluster_adg_apply_master_lease_pack(slot, desired))
+		return CLUSTER_MRP_APPLY_LEASE_SUBMIT_INVALID;
+
+	for (int disk = 0; disk < qvotec_n_disks; disk++) {
+		if (cluster_voting_disk_write_apply_lease_global_slot(qvotec_fds[disk], slot)
+			== CLUSTER_VOTING_DISK_IO_OK)
+			writes_ok++;
+	}
+	if (writes_ok < quorum)
+		return CLUSTER_MRP_APPLY_LEASE_SUBMIT_FAILED;
+
+	if (!qvotec_apply_lease_scan(winner, &disks_ok))
+		return disks_ok < quorum ? CLUSTER_MRP_APPLY_LEASE_SUBMIT_NO_QUORUM
+								 : CLUSTER_MRP_APPLY_LEASE_SUBMIT_FAILED;
+	if (!qvotec_apply_lease_same_winner(winner, desired))
+		return CLUSTER_MRP_APPLY_LEASE_SUBMIT_FAILED;
+	return CLUSTER_MRP_APPLY_LEASE_SUBMIT_ACK;
+}
+
 static void
 qvotec_poll_once(void)
 {
@@ -721,6 +828,9 @@ qvotec_poll_once(void)
 	uint32 join_disks_ok = 0;
 	ClusterRemovalMarker removal_submit_marker; /* spec-5.18 §2.5 staged removal marker */
 	bool have_removal_submit;
+	ClusterAdgApplyMasterLease apply_lease_request;
+	ClusterAdgApplyMasterLeaseQuorum apply_lease_winner;
+	bool have_apply_lease_request;
 	ClusterFenceMarker baseline_marker; /* spec-4.12b D2 */
 	bool author_baseline = false;		/* spec-4.12b D2: wrote a baseline this cycle */
 	bool is_leader = false;				/* spec-4.12b D6: lowest-live baseline leader */
@@ -762,6 +872,10 @@ qvotec_poll_once(void)
 	 * carried forward every poll like the fence marker (R12), and acked majority-
 	 * durable from the self-slot write tally. */
 	have_removal_submit = cluster_node_remove_qvotec_poll_pending(&removal_submit_marker);
+	memset(&apply_lease_request, 0, sizeof(apply_lease_request));
+	memset(&apply_lease_winner, 0, sizeof(apply_lease_winner));
+	apply_lease_winner.owner_node_id = -1;
+	have_apply_lease_request = cluster_mrp_qvotec_poll_apply_lease_request(&apply_lease_request);
 
 	if (qvotec_n_disks == 0) {
 		/* Single-node compat: no disks, no quorum to decide.  Hold
@@ -775,6 +889,9 @@ qvotec_poll_once(void)
 			cluster_reconfig_join_qvotec_complete(false); /* no disk -> no majority */
 		if (have_removal_submit)
 			cluster_node_remove_qvotec_complete(false); /* no disk -> no majority */
+		if (have_apply_lease_request)
+			cluster_mrp_qvotec_complete_apply_lease_request(
+				CLUSTER_MRP_APPLY_LEASE_SUBMIT_NO_QUORUM, NULL);
 		return;
 	}
 
@@ -791,7 +908,17 @@ qvotec_poll_once(void)
 			cluster_reconfig_join_qvotec_complete(false); /* cannot author self slot */
 		if (have_removal_submit)
 			cluster_node_remove_qvotec_complete(false); /* cannot author self slot */
+		if (have_apply_lease_request)
+			cluster_mrp_qvotec_complete_apply_lease_request(CLUSTER_MRP_APPLY_LEASE_SUBMIT_INVALID,
+															NULL);
 		return;
+	}
+
+	if (have_apply_lease_request) {
+		ClusterMrpApplyLeaseSubmitResult apply_lease_result;
+
+		apply_lease_result = qvotec_apply_lease_cas(&apply_lease_request, &apply_lease_winner);
+		cluster_mrp_qvotec_complete_apply_lease_request(apply_lease_result, &apply_lease_winner);
 	}
 
 	/*
@@ -1488,6 +1615,9 @@ ClusterQvotecMain(void)
 	 */
 	cluster_clean_leave_publish_qvotec_latch(MyLatch);
 	cluster_clean_leave_rebuild_from_disks(qvotec_fds, qvotec_n_disks);
+
+	/* spec-6.4: qvotec is the sole writer for the ADG apply-master lease CAS. */
+	cluster_mrp_publish_qvotec_latch(MyLatch);
 
 	/* spec-5.18 D8: publish the removal-marker latch + rebuild the permanently-
 	 * removed set from durable §2.5 SHRUNK/REMOVED markers (INV-LF7 restart leg). */

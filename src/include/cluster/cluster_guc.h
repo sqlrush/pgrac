@@ -163,6 +163,7 @@ extern int cluster_dg_role;
 extern int cluster_dg_mode;
 extern bool cluster_enable_adg;
 extern bool cluster_apply_master_election;
+extern char *cluster_adg_rfs_conninfos;
 extern int cluster_adg_primary_thread_count;
 extern int cluster_adg_lag_threshold_sec;
 extern int cluster_max_standby_delay;

@@ -208,6 +208,8 @@ UT_TEST(test_apply_master_lease_marker_pack_unpack)
 	UT_ASSERT_EQ(out.owner_node_id, 3);
 	UT_ASSERT_EQ(out.lease_expires_at_ms, (int64)1000);
 	UT_ASSERT_EQ(out.generation, (uint64)11);
+	UT_ASSERT_EQ(out.lease_epoch, (uint64)1);
+	UT_ASSERT_EQ(out.owner_incarnation, (uint64)1);
 
 	slot[offsetof(ClusterAdgApplyMasterLease, generation)] ^= 0x01;
 	UT_ASSERT(!cluster_adg_apply_master_lease_unpack(slot, &out));
@@ -240,6 +242,12 @@ UT_TEST(test_apply_master_lease_marker_rejects_invalid_fields)
 
 	cluster_adg_apply_master_lease_init(&lease, 7, 3, 1000, 11);
 	lease.version++;
+	UT_ASSERT(!cluster_adg_apply_master_lease_valid(&lease));
+
+	cluster_adg_apply_master_lease_init_full(&lease, 7, 3, 1000, 11, 0, 1);
+	UT_ASSERT(!cluster_adg_apply_master_lease_valid(&lease));
+
+	cluster_adg_apply_master_lease_init_full(&lease, 7, 3, 1000, 11, 1, 0);
 	UT_ASSERT(!cluster_adg_apply_master_lease_valid(&lease));
 }
 
@@ -290,6 +298,61 @@ UT_TEST(test_apply_master_lease_quorum_rejects_split_without_majority)
 	UT_ASSERT(cluster_adg_apply_master_lease_quorum(leases, valid, 3, 2, &result));
 	UT_ASSERT(!result.attached);
 	UT_ASSERT(!cluster_adg_apply_master_lease_quorum(leases, valid, 3, 4, &result));
+}
+
+UT_TEST(test_apply_master_lease_cas_verdict)
+{
+	ClusterAdgApplyMasterLeaseQuorum current;
+	ClusterAdgApplyMasterLease desired;
+	int64 now_ms = 1000;
+
+	memset(&current, 0, sizeof(current));
+	current.owner_node_id = -1;
+
+	cluster_adg_apply_master_lease_init(&desired, 1, 1, 2000, 1);
+	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_cas_verdict(&current, &desired, now_ms),
+				 (int)CLUSTER_ADG_APPLY_LEASE_CAS_TAKE_EMPTY);
+
+	cluster_adg_apply_master_lease_init(&desired, 2, 1, 2000, 1);
+	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_cas_verdict(&current, &desired, now_ms),
+				 (int)CLUSTER_ADG_APPLY_LEASE_CAS_STALE);
+
+	current.attached = true;
+	current.durable_term = 7;
+	current.owner_node_id = 2;
+	current.lease_expires_at_ms = 3000;
+	current.generation = 11;
+	current.lease_epoch = 1;
+	current.owner_incarnation = 1;
+
+	cluster_adg_apply_master_lease_init(&desired, 7, 2, 4000, 12);
+	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_cas_verdict(&current, &desired, now_ms),
+				 (int)CLUSTER_ADG_APPLY_LEASE_CAS_RENEW);
+
+	cluster_adg_apply_master_lease_init_full(&desired, 7, 2, 4000, 12, 1, 2);
+	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_cas_verdict(&current, &desired, now_ms),
+				 (int)CLUSTER_ADG_APPLY_LEASE_CAS_STALE);
+
+	cluster_adg_apply_master_lease_init_full(&desired, 7, 2, 4000, 12, 2, 1);
+	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_cas_verdict(&current, &desired, now_ms),
+				 (int)CLUSTER_ADG_APPLY_LEASE_CAS_STALE);
+
+	cluster_adg_apply_master_lease_init(&desired, 7, 3, 4000, 12);
+	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_cas_verdict(&current, &desired, now_ms),
+				 (int)CLUSTER_ADG_APPLY_LEASE_CAS_STALE);
+
+	now_ms = 3500;
+	cluster_adg_apply_master_lease_init(&desired, 8, 3, 5000, 12);
+	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_cas_verdict(&current, &desired, now_ms),
+				 (int)CLUSTER_ADG_APPLY_LEASE_CAS_TAKE_EXPIRED);
+
+	cluster_adg_apply_master_lease_init(&desired, 7, 3, 5000, 12);
+	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_cas_verdict(&current, &desired, now_ms),
+				 (int)CLUSTER_ADG_APPLY_LEASE_CAS_STALE);
+
+	cluster_adg_apply_master_lease_init(&desired, 8, 3, 3000, 12);
+	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_cas_verdict(&current, &desired, now_ms),
+				 (int)CLUSTER_ADG_APPLY_LEASE_CAS_INVALID);
 }
 
 UT_TEST(test_read_only_decision_matrix)
@@ -355,6 +418,12 @@ UT_TEST(test_mrp_shmem_tracks_term_validity_and_drain)
 	UT_ASSERT_EQ((int)offsetof(ClusterMrpSharedState, apply_master_lost_at_ms)
 					 > (int)offsetof(ClusterMrpSharedState, apply_master_term_valid_until_ms),
 				 1);
+	UT_ASSERT_EQ((int)offsetof(ClusterMrpSharedState, pending_apply_lease_seq)
+					 > (int)offsetof(ClusterMrpSharedState, apply_lease_request_seq),
+				 1);
+	UT_ASSERT_EQ((int)offsetof(ClusterMrpSharedState, apply_lease_completion_seq)
+					 > (int)offsetof(ClusterMrpSharedState, pending_apply_lease_seq),
+				 1);
 	UT_ASSERT_EQ((int)offsetof(ClusterMrpSharedState, primary_thread_count)
 					 > (int)offsetof(ClusterMrpSharedState, stopped_at_us),
 				 1);
@@ -366,7 +435,7 @@ UT_TEST(test_mrp_shmem_tracks_term_validity_and_drain)
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(19);
 
 	UT_RUN(test_tracker_init_bounds);
 	UT_RUN(test_barrier_min_publishes_after_all_threads);
@@ -382,6 +451,7 @@ main(void)
 	UT_RUN(test_apply_master_lease_marker_rejects_invalid_fields);
 	UT_RUN(test_apply_master_lease_quorum_selects_single_winner);
 	UT_RUN(test_apply_master_lease_quorum_rejects_split_without_majority);
+	UT_RUN(test_apply_master_lease_cas_verdict);
 	UT_RUN(test_read_only_decision_matrix);
 	UT_RUN(test_thread_barrier_wal_abi);
 	UT_RUN(test_standby_reply_trailer_validation);
