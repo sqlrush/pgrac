@@ -164,6 +164,7 @@ typedef struct ClusterRecmergeStreamingInput {
 	bool record_available;
 	bool heartbeat_seen;
 	ClusterRecmergeKey key;
+	ClusterRecmergeKey heartbeat_key;
 } ClusterRecmergeStreamingInput;
 
 /* Strict weak ordering: a < b ?  (scn -> lsn -> node, via the gated cmp). */
@@ -239,10 +240,11 @@ cluster_recmerge_heap_pop(ClusterRecmergeHeap *h, ClusterRecmergeHeapEntry *out)
 /*
  * Streaming mode selector for spec-6.4 ADG MRP.
  *
-	 * Heartbeats prove that a stream has no earlier concrete head for this round.
-	 * A caller gets RECORD_READY only when every input has either a concrete
-	 * record head or a heartbeat, and at least one concrete record is available.
-	 */
+ * Heartbeats prove that a stream has no earlier concrete head through the
+ * advertised heartbeat key.  A caller gets RECORD_READY only when every input
+ * has either a concrete record head or a heartbeat at or beyond the selected
+ * record, and at least one concrete record is available.
+ */
 static inline ClusterRecmergeStreamingDecision
 cluster_recmerge_streaming_select(const ClusterRecmergeStreamingInput *inputs, int ninputs,
 								  int *stream_out, ClusterRecmergeKey *key_out)
@@ -267,6 +269,12 @@ cluster_recmerge_streaming_select(const ClusterRecmergeStreamingInput *inputs, i
 
 	if (!cluster_recmerge_heap_pop(&h, &out))
 		return CLUSTER_RECMERGE_STREAMING_NO_RECORD;
+	for (i = 0; i < ninputs; i++) {
+		if (inputs[i].record_available)
+			continue;
+		if (cluster_recovery_merge_cmp(&inputs[i].heartbeat_key, &out.key) < 0)
+			return CLUSTER_RECMERGE_STREAMING_NO_RECORD;
+	}
 
 	*stream_out = out.stream;
 	*key_out = out.key;
@@ -309,10 +317,10 @@ extern struct XLogReaderState *cluster_recovery_merge_next(ClusterRecoveryMergeS
 extern ClusterRecoveryMergeState *
 cluster_recovery_merge_streaming_begin(const uint64 merge_bitmap[2], const XLogRecPtr *start_lsn,
 									   TimeLineID tli);
-extern struct XLogReaderState *cluster_recovery_merge_streaming_next(ClusterRecoveryMergeState *st,
-																	 const XLogRecPtr *receive_lsn,
-																	 uint16 *thread_out,
-																	 char **errmsg_out);
+extern struct XLogReaderState *
+cluster_recovery_merge_streaming_next(ClusterRecoveryMergeState *st, const XLogRecPtr *receive_lsn,
+									  const XLogRecPtr *barrier_lsn, const SCN *barrier_scn,
+									  uint16 *thread_out, char **errmsg_out);
 extern void cluster_recovery_merge_end(ClusterRecoveryMergeState *st);
 
 /* §3.3b/§3.3d window (startup-process scoped).  enter/leave bracket the

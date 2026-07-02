@@ -369,6 +369,7 @@ typedef struct MergeStream {
 	bool exhausted;
 	bool streaming;
 	bool head_ready;
+	ClusterRecmergeKey head_key;
 	XLogRecPtr valid_end; /* spec-4.5a D6: EndRecPtr of the last complete
 						   * record found by the pre-replay decode pass */
 	XLogRecPtr last_end;  /* EndRecPtr of the last record replay consumed */
@@ -514,6 +515,7 @@ stream_advance(ClusterRecoveryMergeState *st, int idx)
 		key.scn = rec->xl_scn;
 		key.lsn = ms->reader->ReadRecPtr;
 		key.node = (int32)ms->thread_id - 1;
+		ms->head_key = key;
 		cluster_recmerge_heap_push(&st->heap, key, idx);
 		ms->head_ready = true;
 	}
@@ -559,7 +561,7 @@ streaming_stream_advance(ClusterRecoveryMergeState *st, int idx, const XLogRecPt
 		key.scn = rec->xl_scn;
 		key.lsn = ms->reader->ReadRecPtr;
 		key.node = (int32)ms->thread_id - 1;
-		cluster_recmerge_heap_push(&st->heap, key, idx);
+		ms->head_key = key;
 		ms->head_ready = true;
 	}
 }
@@ -929,11 +931,14 @@ cluster_recovery_merge_next(ClusterRecoveryMergeState *st, uint16 *thread_out, c
 
 XLogReaderState *
 cluster_recovery_merge_streaming_next(ClusterRecoveryMergeState *st, const XLogRecPtr *receive_lsn,
+									  const XLogRecPtr *barrier_lsn, const SCN *barrier_scn,
 									  uint16 *thread_out, char **errmsg_out)
 {
-	ClusterRecmergeHeapEntry top;
 	int idx;
 	int advanced_stream = -1;
+	ClusterRecmergeStreamingInput inputs[CLUSTER_RECMERGE_MAX_STREAMS];
+	ClusterRecmergeKey selected_key;
+	int selected_stream = -1;
 
 	if (errmsg_out)
 		*errmsg_out = NULL;
@@ -950,19 +955,34 @@ cluster_recovery_merge_streaming_next(ClusterRecoveryMergeState *st, const XLogR
 			continue;
 		streaming_stream_advance(st, idx, receive_lsn);
 	}
+	memset(inputs, 0, sizeof(inputs));
 	for (idx = 0; idx < st->n_streams; idx++) {
-		if (!st->streams[idx].head_ready)
-			return NULL;
-	}
+		MergeStream *ms = &st->streams[idx];
 
-	if (!cluster_recmerge_heap_pop(&st->heap, &top))
+		if (ms->head_ready) {
+			inputs[idx].record_available = true;
+			inputs[idx].key = ms->head_key;
+			continue;
+		}
+		if (barrier_lsn != NULL && barrier_scn != NULL && barrier_lsn[ms->thread_id] >= ms->last_end
+			&& SCN_VALID(barrier_scn[ms->thread_id])) {
+			inputs[idx].heartbeat_seen = true;
+			inputs[idx].heartbeat_key.scn = (uint64)barrier_scn[ms->thread_id];
+			inputs[idx].heartbeat_key.lsn = PG_UINT64_MAX;
+			inputs[idx].heartbeat_key.node = SCN_MAX_VALID_NODE_ID;
+		}
+	}
+	if (cluster_recmerge_streaming_select(inputs, st->n_streams, &selected_stream, &selected_key)
+		!= CLUSTER_RECMERGE_STREAMING_RECORD_READY)
+		return NULL;
+	if (selected_stream < 0 || selected_stream >= st->n_streams)
 		return NULL;
 
-	st->last_stream = top.stream;
-	st->streams[top.stream].head_ready = false;
+	st->last_stream = selected_stream;
+	st->streams[selected_stream].head_ready = false;
 	if (thread_out)
-		*thread_out = st->streams[top.stream].thread_id;
-	return st->streams[top.stream].reader;
+		*thread_out = st->streams[selected_stream].thread_id;
+	return st->streams[selected_stream].reader;
 }
 
 void

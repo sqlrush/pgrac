@@ -2335,6 +2335,8 @@ cluster_adg_streaming_replay(XLogPrefetcher *xlogprefetcher, XLogReaderState *xl
 	ClusterRecoveryMergeState *st = NULL;
 	XLogRecPtr start_lsn[CLUSTER_WAL_THREAD_MAX + 1];
 	XLogRecPtr receive_lsn[CLUSTER_WAL_THREAD_MAX + 1];
+	XLogRecPtr barrier_lsn[CLUSTER_WAL_THREAD_MAX + 1];
+	SCN barrier_scn[CLUSTER_WAL_THREAD_MAX + 1];
 	uint64 bitmap[2];
 	XLogRecPtr replay_end;
 	XLogRecord *native_record = first_record;
@@ -2362,7 +2364,10 @@ cluster_adg_streaming_replay(XLogPrefetcher *xlogprefetcher, XLogReaderState *xl
 
 		memset(start_lsn, 0, sizeof(start_lsn));
 		memset(receive_lsn, 0, sizeof(receive_lsn));
-		if (cluster_mrp_streaming_snapshot(bitmap, start_lsn, receive_lsn) <= 0)
+		memset(barrier_lsn, 0, sizeof(barrier_lsn));
+		memset(barrier_scn, 0, sizeof(barrier_scn));
+		if (cluster_mrp_streaming_snapshot(bitmap, start_lsn, receive_lsn, barrier_lsn,
+										   barrier_scn) <= 0)
 		{
 			if (native_record != NULL)
 			{
@@ -2425,7 +2430,8 @@ cluster_adg_streaming_replay(XLogPrefetcher *xlogprefetcher, XLogReaderState *xl
 			window_active = true;
 		}
 
-		r = cluster_recovery_merge_streaming_next(st, receive_lsn, &thread_id, NULL);
+		r = cluster_recovery_merge_streaming_next(st, receive_lsn, barrier_lsn, barrier_scn,
+												  &thread_id, NULL);
 		if (r == NULL)
 		{
 			cluster_adg_streaming_wait(&streaming_reply_sent);

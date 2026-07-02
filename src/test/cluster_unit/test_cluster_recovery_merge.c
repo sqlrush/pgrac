@@ -322,7 +322,7 @@ UT_TEST(test_streaming_selects_record)
 	inputs[0].record_available = true;
 	inputs[0].key = K(50, 30, 0);
 	inputs[1].heartbeat_seen = true;
-	inputs[1].key = K(1, 1, 1);
+	inputs[1].heartbeat_key = K(60, 1, 1);
 	inputs[2].record_available = true;
 	inputs[2].key = K(40, 90, 2);
 
@@ -340,9 +340,9 @@ UT_TEST(test_streaming_heartbeat_only_no_record)
 
 	memset(inputs, 0, sizeof(inputs));
 	inputs[0].heartbeat_seen = true;
-	inputs[0].key = K(10, 10, 0);
+	inputs[0].heartbeat_key = K(10, 10, 0);
 	inputs[1].heartbeat_seen = true;
-	inputs[1].key = K(20, 20, 1);
+	inputs[1].heartbeat_key = K(20, 20, 1);
 
 	UT_ASSERT_EQ((int)cluster_recmerge_streaming_select(inputs, 2, &stream, &key),
 				 (int)CLUSTER_RECMERGE_STREAMING_NO_RECORD);
@@ -363,17 +363,59 @@ UT_TEST(test_streaming_missing_stream_blocks_record)
 	UT_ASSERT_EQ(stream, -1);
 
 	inputs[1].heartbeat_seen = true;
+	inputs[1].heartbeat_key = K(10, 10, 1);
 	UT_ASSERT_EQ((int)cluster_recmerge_streaming_select(inputs, 2, &stream, &key),
 				 (int)CLUSTER_RECMERGE_STREAMING_RECORD_READY);
 	UT_ASSERT_EQ(stream, 0);
 	UT_ASSERT_EQ((int)key.scn, 10);
 }
 
+UT_TEST(test_streaming_heartbeat_frontier_blocks_record)
+{
+	ClusterRecmergeStreamingInput inputs[2];
+	ClusterRecmergeKey key;
+	int stream = -1;
+
+	memset(inputs, 0, sizeof(inputs));
+	inputs[0].record_available = true;
+	inputs[0].key = K(20, 20, 0);
+	inputs[1].heartbeat_seen = true;
+	inputs[1].heartbeat_key = K(19, 99, 1);
+
+	UT_ASSERT_EQ((int)cluster_recmerge_streaming_select(inputs, 2, &stream, &key),
+				 (int)CLUSTER_RECMERGE_STREAMING_NO_RECORD);
+	UT_ASSERT_EQ(stream, -1);
+
+	inputs[1].heartbeat_key = K(20, 99, 1);
+	UT_ASSERT_EQ((int)cluster_recmerge_streaming_select(inputs, 2, &stream, &key),
+				 (int)CLUSTER_RECMERGE_STREAMING_RECORD_READY);
+	UT_ASSERT_EQ(stream, 0);
+	UT_ASSERT_EQ((int)key.scn, 20);
+}
+
+UT_TEST(test_streaming_heartbeat_equal_scn_uses_closed_frontier)
+{
+	ClusterRecmergeStreamingInput inputs[2];
+	ClusterRecmergeKey key;
+	int stream = -1;
+
+	memset(inputs, 0, sizeof(inputs));
+	inputs[0].record_available = true;
+	inputs[0].key = K(20, 200, 0);
+	inputs[1].heartbeat_seen = true;
+	inputs[1].heartbeat_key = K(20, PG_UINT64_MAX, SCN_MAX_VALID_NODE_ID);
+
+	UT_ASSERT_EQ((int)cluster_recmerge_streaming_select(inputs, 2, &stream, &key),
+				 (int)CLUSTER_RECMERGE_STREAMING_RECORD_READY);
+	UT_ASSERT_EQ(stream, 0);
+	UT_ASSERT_EQ((int)key.scn, 20);
+}
+
 
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(23);
+	UT_PLAN(25);
 
 	UT_RUN(test_heap_scn_order);
 	UT_RUN(test_heap_scn_tie_lsn);
@@ -398,6 +440,8 @@ main(int argc, char **argv)
 	UT_RUN(test_streaming_selects_record);
 	UT_RUN(test_streaming_heartbeat_only_no_record);
 	UT_RUN(test_streaming_missing_stream_blocks_record);
+	UT_RUN(test_streaming_heartbeat_frontier_blocks_record);
+	UT_RUN(test_streaming_heartbeat_equal_scn_uses_closed_frontier);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

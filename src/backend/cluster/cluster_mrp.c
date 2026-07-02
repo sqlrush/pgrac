@@ -1027,7 +1027,8 @@ cluster_mrp_apply_master_node_id(void)
 }
 
 int
-cluster_mrp_streaming_snapshot(uint64 bitmap[2], XLogRecPtr start_lsn[], XLogRecPtr receive_lsn[])
+cluster_mrp_streaming_snapshot(uint64 bitmap[2], XLogRecPtr start_lsn[], XLogRecPtr receive_lsn[],
+							   XLogRecPtr barrier_lsn[], SCN barrier_scn[])
 {
 	int count = 0;
 	int expected_threads;
@@ -1035,6 +1036,14 @@ cluster_mrp_streaming_snapshot(uint64 bitmap[2], XLogRecPtr start_lsn[], XLogRec
 	if (bitmap != NULL) {
 		bitmap[0] = 0;
 		bitmap[1] = 0;
+	}
+	if (barrier_lsn != NULL || barrier_scn != NULL) {
+		for (uint16 thread_id = 0; thread_id <= CLUSTER_WAL_THREAD_MAX; thread_id++) {
+			if (barrier_lsn != NULL)
+				barrier_lsn[thread_id] = InvalidXLogRecPtr;
+			if (barrier_scn != NULL)
+				barrier_scn[thread_id] = InvalidScn;
+		}
 	}
 	if (cluster_mrp_state == NULL)
 		return 0;
@@ -1064,6 +1073,12 @@ cluster_mrp_streaming_snapshot(uint64 bitmap[2], XLogRecPtr start_lsn[], XLogRec
 			start_lsn[thread_id] = (XLogRecPtr)start;
 		if (receive_lsn != NULL)
 			receive_lsn[thread_id] = (XLogRecPtr)receive;
+		if (barrier_lsn != NULL)
+			barrier_lsn[thread_id]
+				= (XLogRecPtr)pg_atomic_read_u64(&cluster_mrp_state->thread_barrier_lsn[thread_id]);
+		if (barrier_scn != NULL)
+			barrier_scn[thread_id]
+				= (SCN)pg_atomic_read_u64(&cluster_mrp_state->thread_barrier_scn[thread_id]);
 		count++;
 		if (count > expected_threads)
 			return 0;

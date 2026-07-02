@@ -107,7 +107,8 @@ extern uint64 cluster_mrp_apply_master_term(void);
 extern uint32 cluster_mrp_apply_master_node_id(void);
 extern void cluster_mrp_note_primary_thread_count(uint16 primary_thread_count);
 extern int cluster_mrp_streaming_snapshot(uint64 bitmap[2], XLogRecPtr start_lsn[],
-										  XLogRecPtr receive_lsn[]);
+										  XLogRecPtr receive_lsn[], XLogRecPtr barrier_lsn[],
+										  SCN barrier_scn[]);
 extern void cluster_mrp_mark_thread_received_span(uint16 thread_id, XLogRecPtr start_lsn,
 												  XLogRecPtr receive_lsn);
 extern void cluster_mrp_mark_thread_received(uint16 thread_id, XLogRecPtr receive_lsn);
