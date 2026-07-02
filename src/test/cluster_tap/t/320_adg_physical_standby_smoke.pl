@@ -113,6 +113,7 @@ for my $i (0 .. 2)
 	push @voting_disks, $path;
 }
 my $voting_disks_csv = join(',', @voting_disks);
+my $primary_connstr = $primary->connstr('postgres');
 
 $standby->append_conf('postgresql.conf', qq{
 primary_slot_name = 'adg_s1'
@@ -122,6 +123,7 @@ cluster.dg_role = standby
 cluster.dg_mode = max_availability
 cluster.enable_adg = on
 cluster.wal_threads_dir = '$wal_threads_root'
+cluster.adg_rfs_conninfos = 'thread_id=8 $primary_connstr'
 cluster.apply_master_election = on
 cluster.voting_disks = '$voting_disks_csv'
 max_prepared_transactions = 10
@@ -129,6 +131,22 @@ max_prepared_transactions = 10
 $standby->start;
 
 $primary->wait_for_catchup($standby);
+
+poll_psql_value(
+	$standby,
+	q{SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'remote file server'},
+	'1',
+	'L0 RFS coordinator aux process is running');
+
+poll_psql_value(
+	$standby,
+	q{SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'managed recovery process'},
+	'1',
+	'L0 MRP coordinator aux process is running');
+
+ok($standby->wait_for_log_match(
+		qr/ADG RFS upstream 1 for thread 8 connected and streaming/, 30),
+	'L0 RFS coordinator opened a thread-bound upstream stream');
 
 $primary->safe_psql('postgres', q{INSERT INTO adg_smoke SELECT generate_series(1, 3)});
 $primary->wait_for_catchup($standby);
