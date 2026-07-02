@@ -912,8 +912,10 @@ static int
 cluster_rfs_parse_upstreams(ClusterRfsUpstream *upstreams, int max_upstreams)
 {
 	const char *p = cluster_adg_rfs_conninfos;
+	bool seen_threads[CLUSTER_WAL_THREAD_MAX + 1];
 	int count = 0;
 
+	memset(seen_threads, 0, sizeof(seen_threads));
 	p = cluster_rfs_skip_ws(p);
 	while (p != NULL && *p != '\0') {
 		const char *start = p;
@@ -947,6 +949,11 @@ cluster_rfs_parse_upstreams(ClusterRfsUpstream *upstreams, int max_upstreams)
 				ereport(FATAL,
 						(errcode(ERRCODE_CONFIG_FILE_ERROR),
 						 errmsg("cluster.adg_rfs_conninfos entry has no connection string")));
+			if (seen_threads[expected_thread_id])
+				ereport(FATAL, (errcode(ERRCODE_CONFIG_FILE_ERROR),
+								errmsg("cluster.adg_rfs_conninfos declares duplicate thread_id %u",
+									   (unsigned)expected_thread_id)));
+			seen_threads[expected_thread_id] = true;
 			len = (Size)(end - conn_start);
 			memset(&upstreams[count], 0, sizeof(upstreams[count]));
 			upstreams[count].index = count + 1;

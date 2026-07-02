@@ -136,6 +136,7 @@
 #include "cluster/cluster_hw_snapshot.h" /* PGRAC: spec-5.7 D3 HW authority recovery load */
 #include "cluster/cluster_mrp.h"	   /* PGRAC: spec-6.4 ADG Apply Master gate */
 #include "cluster/cluster_mrp_apply.h" /* PGRAC: spec-6.4 MRP apply facade */
+#include "cluster/cluster_rfs.h"	   /* PGRAC: spec-6.4 ADG RFS coordinator */
 #include "cluster/cluster_remote_xact.h" /* PGRAC: spec-4.5a G5 */
 #include "cluster/cluster_tt_status.h" /* PGRAC: spec-4.5a D11 merged counters */
 #include "cluster/cluster_recovery_plan.h"
@@ -2369,7 +2370,7 @@ cluster_adg_streaming_replay(XLogPrefetcher *xlogprefetcher, XLogReaderState *xl
 		if (cluster_mrp_streaming_snapshot(bitmap, start_lsn, receive_lsn, barrier_lsn,
 										   barrier_scn) <= 0)
 		{
-			if (native_record != NULL)
+			if (native_record != NULL && cluster_rfs_configured_upstream_count() <= 0)
 			{
 				if (!cluster_mrp_apply_master_can_apply())
 				{
