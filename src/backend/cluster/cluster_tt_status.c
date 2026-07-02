@@ -574,7 +574,6 @@ cluster_tt_status_resolve_prepared_commit(TransactionId xid, SCN commit_scn)
 	TimestampTz now;
 	bool adg_standby;
 	bool have_match = false;
-	bool ambiguous = false;
 	uint16 match_origin = 0;
 	uint32 match_epoch = 0;
 	int resolved = 0;
@@ -590,6 +589,8 @@ cluster_tt_status_resolve_prepared_commit(TransactionId xid, SCN commit_scn)
 	LWLockAcquire(ClusterTTStatusLock, LW_EXCLUSIVE);
 
 	if (adg_standby) {
+		bool ambiguous = false;
+
 		hash_seq_init(&seq, ClusterTTStatusHTAB);
 		while ((e = (ClusterTTOverlayEntry *)hash_seq_search(&seq)) != NULL) {
 			if (e->key.local_xid != xid)
