@@ -25,7 +25,10 @@
 #include "access/rmgr.h"
 #include "cluster/cluster_adg.h"
 #include "cluster/cluster_adg_xlog.h"
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_lns.h"
 #include "cluster/cluster_mrp.h"
+#include "libpq/pqformat.h"
 
 #undef printf
 #undef fprintf
@@ -34,6 +37,32 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+
+unsigned int
+pq_getmsgint(StringInfo msg, int b)
+{
+	uint32 result = 0;
+	int i;
+
+	if (msg == NULL || b <= 0 || b > 4 || msg->cursor < 0 || msg->cursor + b > msg->len)
+		abort();
+	for (i = 0; i < b; i++)
+		result = (result << 8) | (uint8)msg->data[msg->cursor++];
+	return result;
+}
+
+int64
+pq_getmsgint64(StringInfo msg)
+{
+	uint64 result = 0;
+	int i;
+
+	if (msg == NULL || msg->cursor < 0 || msg->cursor + 8 > msg->len)
+		abort();
+	for (i = 0; i < 8; i++)
+		result = (result << 8) | (uint8)msg->data[msg->cursor++];
+	return (int64)result;
+}
 
 void
 ExceptionalCondition(const char *conditionName, const char *fileName, int lineNumber)
@@ -77,6 +106,45 @@ static SCN
 S(int node, uint64 local)
 {
 	return scn_encode((NodeId)node, local);
+}
+
+static void
+put_u16(char *buf, int *pos, uint16 value)
+{
+	buf[(*pos)++] = (char)((value >> 8) & 0xFF);
+	buf[(*pos)++] = (char)(value & 0xFF);
+}
+
+static void
+put_u32(char *buf, int *pos, uint32 value)
+{
+	buf[(*pos)++] = (char)((value >> 24) & 0xFF);
+	buf[(*pos)++] = (char)((value >> 16) & 0xFF);
+	buf[(*pos)++] = (char)((value >> 8) & 0xFF);
+	buf[(*pos)++] = (char)(value & 0xFF);
+}
+
+static void
+put_u64(char *buf, int *pos, uint64 value)
+{
+	int shift;
+
+	for (shift = 56; shift >= 0; shift -= 8)
+		buf[(*pos)++] = (char)((value >> shift) & 0xFF);
+}
+
+static void
+build_reply_trailer(char *buf, uint32 magic, uint16 version, uint16 thread_id,
+					SCN standby_consistent_scn, uint64 apply_master_term)
+{
+	int pos = 0;
+
+	put_u32(buf, &pos, magic);
+	put_u16(buf, &pos, version);
+	put_u16(buf, &pos, thread_id);
+	put_u64(buf, &pos, (uint64)standby_consistent_scn);
+	put_u64(buf, &pos, apply_master_term);
+	UT_ASSERT_EQ(pos, CLUSTER_ADG_REPLY_TRAILER_BYTES);
 }
 
 UT_TEST(test_tracker_init_bounds)
@@ -474,6 +542,88 @@ UT_TEST(test_standby_reply_trailer_validation)
 											   CLUSTER_WAL_THREAD_MAX + 1, S(2, 500), 7));
 }
 
+UT_TEST(test_lns_ack_mode_matrix)
+{
+	UT_ASSERT_EQ((int)cluster_lns_ack_mode_from_guc(CLUSTER_DG_MODE_ASYNC),
+				 (int)CLUSTER_DG_ACK_ASYNC);
+	UT_ASSERT_EQ((int)cluster_lns_ack_mode_from_guc(CLUSTER_DG_MODE_SYNC),
+				 (int)CLUSTER_DG_ACK_SYNC_ONE);
+	UT_ASSERT_EQ((int)cluster_lns_ack_mode_from_guc(CLUSTER_DG_MODE_MAX_AVAILABILITY),
+				 (int)CLUSTER_DG_ACK_MAX_AVAILABILITY);
+	UT_ASSERT_EQ((int)cluster_lns_ack_mode_from_guc(99), (int)CLUSTER_DG_ACK_ASYNC);
+
+	UT_ASSERT(cluster_lns_commit_ack_satisfied(CLUSTER_DG_ACK_ASYNC, false, false));
+	UT_ASSERT(!cluster_lns_commit_ack_satisfied(CLUSTER_DG_ACK_SYNC_ONE, false, false));
+	UT_ASSERT(!cluster_lns_commit_ack_satisfied(CLUSTER_DG_ACK_SYNC_ONE, true, false));
+	UT_ASSERT(cluster_lns_commit_ack_satisfied(CLUSTER_DG_ACK_SYNC_ONE, true, true));
+	UT_ASSERT(cluster_lns_commit_ack_satisfied(CLUSTER_DG_ACK_MAX_AVAILABILITY, false, false));
+	UT_ASSERT(!cluster_lns_commit_ack_satisfied(CLUSTER_DG_ACK_MAX_AVAILABILITY, true, false));
+	UT_ASSERT(cluster_lns_commit_ack_satisfied(CLUSTER_DG_ACK_MAX_AVAILABILITY, true, true));
+	UT_ASSERT(!cluster_lns_commit_ack_satisfied((ClusterDgAckMode)99, true, true));
+	UT_ASSERT(strcmp(cluster_lns_ack_mode_name(CLUSTER_DG_ACK_SYNC_ONE), "sync_one") == 0);
+	UT_ASSERT(strcmp(cluster_lns_ack_mode_name((ClusterDgAckMode)99), "unknown") == 0);
+}
+
+UT_TEST(test_lns_reply_trailer_parse_boundaries)
+{
+	char buf[CLUSTER_ADG_REPLY_TRAILER_BYTES + 4];
+	StringInfoData msg;
+	ClusterLnsReplyState out;
+
+	memset(&msg, 0, sizeof(msg));
+	memset(&out, 0x5A, sizeof(out));
+	msg.data = buf;
+	msg.len = 0;
+	msg.cursor = 0;
+	UT_ASSERT_EQ((int)cluster_lns_parse_adg_reply_trailer(&msg, &out),
+				 (int)CLUSTER_LNS_TRAILER_ABSENT);
+	UT_ASSERT_EQ(msg.cursor, 0);
+
+	memset(buf, 0, sizeof(buf));
+	build_reply_trailer(buf, CLUSTER_ADG_REPLY_MAGIC, CLUSTER_ADG_REPLY_VERSION, 4, S(2, 500), 17);
+	msg.len = CLUSTER_ADG_REPLY_TRAILER_BYTES;
+	msg.cursor = 0;
+	UT_ASSERT_EQ((int)cluster_lns_parse_adg_reply_trailer(&msg, &out),
+				 (int)CLUSTER_LNS_TRAILER_VALID);
+	UT_ASSERT_EQ(msg.cursor, CLUSTER_ADG_REPLY_TRAILER_BYTES);
+	UT_ASSERT_EQ(out.thread_id, 4);
+	UT_ASSERT_EQ(out.reply_version, CLUSTER_ADG_REPLY_VERSION);
+	UT_ASSERT_EQ((uint64)out.standby_consistent_scn, (uint64)S(2, 500));
+	UT_ASSERT_EQ(out.apply_master_term, (uint64)17);
+
+	build_reply_trailer(buf, CLUSTER_ADG_REPLY_MAGIC + 1, CLUSTER_ADG_REPLY_VERSION, 4, S(2, 500),
+						17);
+	msg.cursor = 0;
+	UT_ASSERT_EQ((int)cluster_lns_parse_adg_reply_trailer(&msg, &out),
+				 (int)CLUSTER_LNS_TRAILER_INVALID);
+	UT_ASSERT_EQ(msg.cursor, 0);
+
+	build_reply_trailer(buf, CLUSTER_ADG_REPLY_MAGIC, CLUSTER_ADG_REPLY_VERSION + 1, 4, S(2, 500),
+						17);
+	msg.cursor = 0;
+	UT_ASSERT_EQ((int)cluster_lns_parse_adg_reply_trailer(&msg, &out),
+				 (int)CLUSTER_LNS_TRAILER_INVALID);
+
+	build_reply_trailer(buf, CLUSTER_ADG_REPLY_MAGIC, CLUSTER_ADG_REPLY_VERSION,
+						CLUSTER_WAL_THREAD_MAX + 1, S(2, 500), 17);
+	msg.cursor = 0;
+	UT_ASSERT_EQ((int)cluster_lns_parse_adg_reply_trailer(&msg, &out),
+				 (int)CLUSTER_LNS_TRAILER_INVALID);
+
+	build_reply_trailer(buf + 4, CLUSTER_ADG_REPLY_MAGIC, CLUSTER_ADG_REPLY_VERSION, 5, S(2, 600),
+						18);
+	msg.len = CLUSTER_ADG_REPLY_TRAILER_BYTES + 4;
+	msg.cursor = 4;
+	UT_ASSERT_EQ((int)cluster_lns_parse_adg_reply_trailer(&msg, &out),
+				 (int)CLUSTER_LNS_TRAILER_VALID);
+	UT_ASSERT_EQ(out.thread_id, 5);
+	UT_ASSERT_EQ(out.apply_master_term, (uint64)18);
+
+	msg.cursor = 3;
+	UT_ASSERT_EQ((int)cluster_lns_parse_adg_reply_trailer(&msg, &out),
+				 (int)CLUSTER_LNS_TRAILER_INVALID);
+}
+
 UT_TEST(test_mrp_shmem_tracks_term_validity_and_drain)
 {
 	UT_ASSERT_EQ((int)offsetof(ClusterMrpSharedState, apply_master_term_valid)
@@ -505,7 +655,7 @@ UT_TEST(test_mrp_shmem_tracks_term_validity_and_drain)
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(23);
 
 	UT_RUN(test_tracker_init_bounds);
 	UT_RUN(test_barrier_min_publishes_after_all_threads);
@@ -527,6 +677,8 @@ main(void)
 	UT_RUN(test_read_only_decision_matrix);
 	UT_RUN(test_thread_barrier_wal_abi);
 	UT_RUN(test_standby_reply_trailer_validation);
+	UT_RUN(test_lns_ack_mode_matrix);
+	UT_RUN(test_lns_reply_trailer_parse_boundaries);
 	UT_RUN(test_mrp_shmem_tracks_term_validity_and_drain);
 
 	UT_DONE();

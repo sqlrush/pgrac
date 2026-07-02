@@ -124,6 +124,7 @@ CLUSTER_VOTING_DISK_IO_O = $(top_builddir)/src/backend/cluster/cluster_voting_di
 CLUSTER_QUORUM_DECISION_O = $(top_builddir)/src/backend/cluster/cluster_quorum_decision.o
 CLUSTER_SCN_O = $(top_builddir)/src/backend/cluster/cluster_scn.o
 CLUSTER_ADG_O = $(top_builddir)/src/backend/cluster/cluster_adg.o
+CLUSTER_LNS_O = $(top_builddir)/src/backend/cluster/cluster_lns.o
 CLUSTER_GES_O = $(top_builddir)/src/backend/cluster/cluster_ges.o
 CLUSTER_GRD_O = $(top_builddir)/src/backend/cluster/cluster_grd.o
 CLUSTER_LMD_O = $(top_builddir)/src/backend/cluster/cluster_lmd.o
@@ -937,9 +938,9 @@ test_cluster_scn: test_cluster_scn.c unit_test.h \
 # primitives.  SCN comparators are stubbed locally so this binary does not pull
 # cluster_scn.o's backend/shmem dependencies.
 test_cluster_adg: test_cluster_adg.c unit_test.h \
-		$(CLUSTER_VERSION_O) $(CLUSTER_ADG_O)
+		$(CLUSTER_VERSION_O) $(CLUSTER_ADG_O) $(CLUSTER_LNS_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_VERSION_O) $(CLUSTER_ADG_O) \
+		$(CLUSTER_VERSION_O) $(CLUSTER_ADG_O) $(CLUSTER_LNS_O) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 # spec-2.13 D6: test_cluster_ges links cluster_ges.o standalone.

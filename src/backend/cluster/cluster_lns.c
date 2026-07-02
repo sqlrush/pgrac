@@ -91,7 +91,7 @@ cluster_lns_parse_adg_reply_trailer(StringInfo reply_message, ClusterLnsReplySta
 	magic = (uint32)pq_getmsgint(reply_message, 4);
 	if (magic != CLUSTER_ADG_REPLY_MAGIC) {
 		reply_message->cursor = saved_cursor;
-		return CLUSTER_LNS_TRAILER_ABSENT;
+		return CLUSTER_LNS_TRAILER_INVALID;
 	}
 
 	version = (uint16)pq_getmsgint(reply_message, 2);
