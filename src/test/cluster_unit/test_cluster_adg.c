@@ -290,6 +290,19 @@ UT_TEST(test_rfs_restart_lsn_prefers_thread_receive)
 	UT_ASSERT(!cluster_adg_rfs_restart_lsn(1000, 1200, 1800, NULL));
 }
 
+UT_TEST(test_wal_message_bounds_validation)
+{
+	UT_ASSERT(cluster_adg_wal_message_bounds_valid(1000, 0, 1000));
+	UT_ASSERT(cluster_adg_wal_message_bounds_valid(1000, 24, 1024));
+	UT_ASSERT(cluster_adg_wal_message_bounds_valid(1000, 24, 2048));
+
+	UT_ASSERT(!cluster_adg_wal_message_bounds_valid(InvalidXLogRecPtr, 24, 1024));
+	UT_ASSERT(!cluster_adg_wal_message_bounds_valid(1000, 24, InvalidXLogRecPtr));
+	UT_ASSERT(!cluster_adg_wal_message_bounds_valid(1000, 25, 1024));
+	UT_ASSERT(!cluster_adg_wal_message_bounds_valid((XLogRecPtr)(PG_UINT64_MAX - 3), 4,
+													(XLogRecPtr)PG_UINT64_MAX));
+}
+
 UT_TEST(test_apply_master_next_term_overflow)
 {
 	UT_ASSERT_EQ(cluster_adg_apply_master_next_term(41), (uint64)42);
@@ -723,7 +736,7 @@ UT_TEST(test_mrp_shmem_tracks_term_validity_and_drain)
 int
 main(void)
 {
-	UT_PLAN(27);
+	UT_PLAN(28);
 
 	UT_RUN(test_tracker_init_bounds);
 	UT_RUN(test_barrier_min_publishes_after_all_threads);
@@ -735,6 +748,7 @@ main(void)
 	UT_RUN(test_thread_bounds_are_release_checked);
 	UT_RUN(test_replay_start_lsn_is_thread_local);
 	UT_RUN(test_rfs_restart_lsn_prefers_thread_receive);
+	UT_RUN(test_wal_message_bounds_validation);
 	UT_RUN(test_apply_master_next_term_overflow);
 	UT_RUN(test_apply_master_lease_marker_pack_unpack);
 	UT_RUN(test_apply_master_lease_slot_zero_fills_tail);

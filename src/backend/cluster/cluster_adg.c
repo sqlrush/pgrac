@@ -220,6 +220,16 @@ cluster_adg_rfs_restart_lsn(XLogRecPtr fallback_lsn, XLogRecPtr thread_start_lsn
 	return true;
 }
 
+bool
+cluster_adg_wal_message_bounds_valid(XLogRecPtr data_start, uint64 payload_len, XLogRecPtr wal_end)
+{
+	if (XLogRecPtrIsInvalid(data_start) || XLogRecPtrIsInvalid(wal_end))
+		return false;
+	if (payload_len > PG_UINT64_MAX - (uint64)data_start)
+		return false;
+	return (XLogRecPtr)((uint64)data_start + payload_len) <= wal_end;
+}
+
 uint64
 cluster_adg_apply_master_next_term(uint64 durable_term)
 {

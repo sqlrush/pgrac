@@ -712,6 +712,9 @@ cluster_rfs_process_wal_message(ClusterRfsUpstream *upstream, char *buf, Size le
 
 	buf += hdrlen;
 	len -= hdrlen;
+	if (!cluster_adg_wal_message_bounds_valid(data_start, (uint64)len, wal_end))
+		ereport(ERROR, (errcode(ERRCODE_PROTOCOL_VIOLATION),
+						errmsg("invalid ADG RFS WAL message bounds received from primary")));
 
 	upstream->latest_wal_end = wal_end;
 	upstream->latest_wal_end_time = send_time;
@@ -786,6 +789,7 @@ cluster_rfs_connect_upstream(ClusterRfsUpstream *upstream)
 	int primary_thread_count;
 	WalRcvStreamOptions options;
 	char appname[NAMEDATALEN];
+	XLogRecPtr restart_lsn;
 
 	cluster_rfs_init_message_buffers(upstream);
 	snprintf(appname, sizeof(appname), "rfs%u", (unsigned)upstream->expected_thread_id);
@@ -814,10 +818,11 @@ cluster_rfs_connect_upstream(ClusterRfsUpstream *upstream)
 
 	if (!cluster_mrp_rfs_restart_lsn(upstream->expected_thread_id,
 									 cluster_rfs_page_start(GetXLogReplayRecPtr(NULL)),
-									 &upstream->start_lsn))
+									 &restart_lsn))
 		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("ADG RFS cannot choose a restart LSN for thread %u",
 							   (unsigned)upstream->expected_thread_id)));
+	upstream->start_lsn = cluster_rfs_page_start(restart_lsn);
 	upstream->write_lsn = upstream->start_lsn;
 	upstream->last_thread_id = XLP_THREAD_ID_LEGACY;
 	upstream->pending_header.active = false;

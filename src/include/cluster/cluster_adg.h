@@ -113,6 +113,8 @@ extern bool cluster_adg_replay_start_lsn(XLogRecPtr start_lsn, XLogRecPtr receiv
 										 XLogRecPtr apply_lsn, XLogRecPtr *effective_start_lsn);
 extern bool cluster_adg_rfs_restart_lsn(XLogRecPtr fallback_lsn, XLogRecPtr thread_start_lsn,
 										XLogRecPtr thread_receive_lsn, XLogRecPtr *restart_lsn);
+extern bool cluster_adg_wal_message_bounds_valid(XLogRecPtr data_start, uint64 payload_len,
+												 XLogRecPtr wal_end);
 extern uint64 cluster_adg_apply_master_next_term(uint64 durable_term);
 extern pg_crc32c cluster_adg_apply_master_lease_crc(const ClusterAdgApplyMasterLease *lease);
 extern void cluster_adg_apply_master_lease_init(ClusterAdgApplyMasterLease *lease, uint64 term,
