@@ -371,6 +371,9 @@ UT_TEST(test_apply_master_candidate_uses_lowest_fresh_live_node)
 	alive[0] = 0;
 	UT_ASSERT_EQ(cluster_adg_apply_master_candidate_node(alive, sizeof(alive)), 9);
 	UT_ASSERT_EQ(cluster_adg_apply_master_candidate_node(alive, 1), -1);
+	UT_ASSERT(cluster_adg_apply_master_candidate_allows_owner(alive, sizeof(alive), 9));
+	UT_ASSERT(!cluster_adg_apply_master_candidate_allows_owner(alive, sizeof(alive), 10));
+	UT_ASSERT(!cluster_adg_apply_master_candidate_allows_owner(alive, 1, 9));
 }
 
 UT_TEST(test_apply_master_token_apply_gate)

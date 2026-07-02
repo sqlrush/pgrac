@@ -359,6 +359,15 @@ cluster_adg_apply_master_candidate_node(const uint8 *alive_bitmap, int bitmap_by
 	}
 	return -1;
 }
+bool
+cluster_adg_apply_master_candidate_allows_owner(const uint8 *alive_bitmap, int bitmap_bytes,
+												int32 owner_node_id)
+{
+	int32 candidate_node;
+
+	candidate_node = cluster_adg_apply_master_candidate_node(alive_bitmap, bitmap_bytes);
+	return candidate_node >= 0 && candidate_node == owner_node_id;
+}
 void
 cluster_mrp_publish_qvotec_latch(struct Latch *latch pg_attribute_unused())
 {}

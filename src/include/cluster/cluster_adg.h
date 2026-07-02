@@ -124,6 +124,8 @@ extern ClusterAdgApplyMasterLeaseCasVerdict
 cluster_adg_apply_master_lease_cas_verdict(const ClusterAdgApplyMasterLeaseQuorum *current,
 										   const ClusterAdgApplyMasterLease *desired, int64 now_ms);
 extern int32 cluster_adg_apply_master_candidate_node(const uint8 *alive_bitmap, int bitmap_bytes);
+extern bool cluster_adg_apply_master_candidate_allows_owner(const uint8 *alive_bitmap,
+															int bitmap_bytes, int32 owner_node_id);
 extern bool cluster_adg_apply_master_token_allows_apply(
 	uint32 owner_node_id, uint32 valid, uint64 term, uint64 generation, uint64 lease_epoch,
 	uint64 owner_incarnation, uint64 valid_until_ms, int32 self_node_id, uint64 current_epoch,

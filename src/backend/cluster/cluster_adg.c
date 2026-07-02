@@ -403,6 +403,16 @@ cluster_adg_apply_master_candidate_node(const uint8 *alive_bitmap, int bitmap_by
 }
 
 bool
+cluster_adg_apply_master_candidate_allows_owner(const uint8 *alive_bitmap, int bitmap_bytes,
+												int32 owner_node_id)
+{
+	int32 candidate_node;
+
+	candidate_node = cluster_adg_apply_master_candidate_node(alive_bitmap, bitmap_bytes);
+	return candidate_node >= 0 && candidate_node == owner_node_id;
+}
+
+bool
 cluster_adg_apply_master_token_allows_apply(uint32 owner_node_id, uint32 valid, uint64 term,
 											uint64 generation, uint64 lease_epoch,
 											uint64 owner_incarnation, uint64 valid_until_ms,

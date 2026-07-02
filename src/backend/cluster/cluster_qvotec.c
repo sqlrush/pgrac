@@ -755,7 +755,6 @@ qvotec_apply_lease_cas(const ClusterAdgApplyMasterLease *desired, const uint8 *a
 	ClusterAdgApplyMasterLeaseQuorum current;
 	ClusterAdgApplyMasterLeaseCasVerdict verdict;
 	uint8 slot[CLUSTER_VOTING_SLOT_BYTES];
-	int32 candidate_node;
 	int disks_ok = 0;
 	int writes_ok = 0;
 	int quorum;
@@ -768,10 +767,10 @@ qvotec_apply_lease_cas(const ClusterAdgApplyMasterLease *desired, const uint8 *a
 		return CLUSTER_MRP_APPLY_LEASE_SUBMIT_NO_QUORUM;
 	if (desired == NULL || !cluster_adg_apply_master_lease_valid(desired))
 		return CLUSTER_MRP_APPLY_LEASE_SUBMIT_INVALID;
-	candidate_node = cluster_adg_apply_master_candidate_node(alive_bitmap, alive_bitmap_bytes);
-	if (candidate_node < 0)
+	if (cluster_adg_apply_master_candidate_node(alive_bitmap, alive_bitmap_bytes) < 0)
 		return CLUSTER_MRP_APPLY_LEASE_SUBMIT_NO_QUORUM;
-	if (desired->owner_node_id != candidate_node)
+	if (!cluster_adg_apply_master_candidate_allows_owner(alive_bitmap, alive_bitmap_bytes,
+														 desired->owner_node_id))
 		return CLUSTER_MRP_APPLY_LEASE_SUBMIT_STALE;
 	quorum = qvotec_n_disks / 2 + 1;
 
