@@ -168,8 +168,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT category) FROM pg_cluster_state}),
-   '51',
-   'L12 pg_cluster_state has 51 categories (spec-5.11 adds hang; spec-5.51 adds cr_pool; spec-5.14 adds reconfig_touched; spec-5.15 adds reconfig_join; spec-5.55 adds resolver_cache; spec-5.57 adds cr_coord; spec-5.59 adds xnode_profile)');
+   '52',
+   'L12 pg_cluster_state has 52 categories (spec-6.2 adds smart_fusion)');
 
 
 # ----------
@@ -232,7 +232,7 @@ is($node->safe_psql('postgres',
 my $smoke_categories = $node->safe_psql(
 	'postgres',
 	q{SELECT count(DISTINCT category) FROM pg_cluster_state});
-is($smoke_categories, '51', 'L16 cluster_smoke surface integrates buffer_format + pcm + gcs + tt_status + tt_status_hint + tt_2pc + tt_recovery + visibility + wal_thread + dl + hw + ir + ko + ts categories (51 categories;spec-5.11 adds hang;spec-5.51 adds cr_pool;spec-5.14 adds reconfig_touched;spec-5.15 adds reconfig_join; spec-5.55 adds resolver_cache; spec-5.57 adds cr_coord; spec-5.59 adds xnode_profile)');
+is($smoke_categories, '52', 'L16 cluster_smoke surface integrates buffer_format + pcm + gcs + tt_status + tt_status_hint + tt_2pc + tt_recovery + visibility + wal_thread + dl + hw + ir + ko + ts + smart_fusion categories (52 categories; spec-6.2 adds smart_fusion)');
 
 
 # ----------
