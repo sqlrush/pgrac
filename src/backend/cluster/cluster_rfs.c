@@ -397,7 +397,8 @@ cluster_rfs_backfill_page_prefix(uint16 thread_id, TimeLineID tli, int native_wa
 
 static bool
 cluster_rfs_finish_pending_header(ClusterRfsPendingHeader *pending, const char **buf, Size *nbytes,
-								  XLogRecPtr *recptr, TimeLineID tli, uint16 *current_thread_id)
+								  XLogRecPtr *recptr, TimeLineID tli, uint16 expected_thread_id,
+								  uint16 *current_thread_id)
 {
 	Size need;
 	Size take;
@@ -424,6 +425,11 @@ cluster_rfs_finish_pending_header(ClusterRfsPendingHeader *pending, const char *
 	if (!cluster_rfs_valid_real_thread_id(header_thread_id))
 		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("ADG RFS could not route a split WAL page header")));
+	if (cluster_rfs_valid_real_thread_id(expected_thread_id)
+		&& header_thread_id != expected_thread_id)
+		ereport(ERROR, (errcode(ERRCODE_PROTOCOL_VIOLATION),
+						errmsg("ADG RFS received WAL for thread %u but is bound to thread %u",
+							   (unsigned)header_thread_id, (unsigned)expected_thread_id)));
 
 	cluster_rfs_write_thread_chunk(header_thread_id, tli, pending->recptr, pending->data,
 								   sizeof(XLogPageHeaderData));
@@ -440,6 +446,7 @@ cluster_rfs_observe_received_chunk_internal(const char *buf, Size nbytes, XLogRe
 											TimeLineID tli, int native_wal_fd,
 											uint16 *last_thread_id,
 											ClusterRfsPendingHeader *pending_header,
+											uint16 expected_thread_id,
 											bool allow_landed_page_prefix)
 {
 	XLogRecPtr chunk_end;
@@ -484,7 +491,7 @@ cluster_rfs_observe_received_chunk_internal(const char *buf, Size nbytes, XLogRe
 	}
 
 	if (!cluster_rfs_finish_pending_header(pending_header, &buf, &nbytes, &recptr, tli,
-										   &observed_thread_id))
+										   expected_thread_id, &observed_thread_id))
 		return;
 
 	while (nbytes > 0) {
@@ -514,6 +521,11 @@ cluster_rfs_observe_received_chunk_internal(const char *buf, Size nbytes, XLogRe
 			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 							errmsg("ADG RFS could not route WAL at %X/%X to a real thread",
 								   LSN_FORMAT_ARGS(recptr))));
+		if (cluster_rfs_valid_real_thread_id(expected_thread_id)
+			&& route_thread_id != expected_thread_id)
+			ereport(ERROR, (errcode(ERRCODE_PROTOCOL_VIOLATION),
+							errmsg("ADG RFS received WAL for thread %u but is bound to thread %u",
+								   (unsigned)route_thread_id, (unsigned)expected_thread_id)));
 		if (page_offset != 0 && !allow_landed_page_prefix)
 			cluster_rfs_backfill_page_prefix(route_thread_id, tli, native_wal_fd, recptr);
 		cluster_rfs_write_thread_chunk(route_thread_id, tli, recptr, buf, piece);
@@ -537,7 +549,8 @@ cluster_rfs_observe_received_chunk(const char *buf, Size nbytes, XLogRecPtr recp
 								   int native_wal_fd, uint16 *last_thread_id)
 {
 	cluster_rfs_observe_received_chunk_internal(buf, nbytes, recptr, tli, native_wal_fd,
-												last_thread_id, &cluster_rfs_pending_header, false);
+												last_thread_id, &cluster_rfs_pending_header,
+												XLP_THREAD_ID_LEGACY, false);
 }
 
 void
@@ -704,9 +717,9 @@ cluster_rfs_process_wal_message(ClusterRfsUpstream *upstream, char *buf, Size le
 	upstream->latest_wal_end_time = send_time;
 	upstream->last_msg_receipt_time = GetCurrentTimestamp();
 
-	cluster_rfs_observe_received_chunk_internal(buf, len, data_start, upstream->tli, -1,
-												&upstream->last_thread_id,
-												&upstream->pending_header, true);
+	cluster_rfs_observe_received_chunk_internal(
+		buf, len, data_start, upstream->tli, -1, &upstream->last_thread_id,
+		&upstream->pending_header, upstream->expected_thread_id, true);
 	if (cluster_rfs_valid_real_thread_id(upstream->last_thread_id)
 		&& upstream->last_thread_id != upstream->expected_thread_id)
 		ereport(ERROR,
