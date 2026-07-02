@@ -4,9 +4,11 @@
  *	  Per-origin materialized transaction outcomes (spec-4.5a G5, D10a).
  *
  *	  pg_xact_remote/ is an origin-partitioned SLRU recording, for every
- *	  foreign xid whose XACT/CLOG records this node replayed during k-way
+ *	  foreign xid whose outcome records this node replayed during k-way
  *	  merged recovery, the REAL outcome B durably logged: COMMITTED (with
- *	  the commit record's SCN, spec-1.18) or ABORTED.  It exists because
+ *	  the commit record's SCN, spec-1.18) or ABORTED.  A foreign PREPARE is
+ *	  not an outcome and deliberately leaves no entry, so readers see INDOUBT
+ *	  until a matching COMMIT/ABORT PREPARED is replayed.  It exists because
  *	  neither of the two local stores may answer for a remote xid:
  *
  *	    - the local pg_xact is indexed by raw 32-bit xid and would alias
@@ -184,10 +186,11 @@ extern void cluster_remote_xact_shmem_init(void);
  * cluster_remote_xact_apply -- D10b divert target.  Called by merged
  *	replay INSTEAD of ApplyWalRecord for a foreign stream's RM_XACT /
  *	RM_CLOG record.  Parses the record; a pure outcome (commit/abort
- *	with no cross-instance side effects) lands in pg_xact_remote; any
- *	unsupported side effect (nrels / nmsgs / nstats / nsubxacts / 2PC /
- *	AE locks; foreign MULTIXACT and COMMIT_TS divert here too) is
- *	fail-closed 53RA3 (P1-1) -- never silently skipped.
+ *	with no cross-instance side effects, or a proven COMMIT/ABORT PREPARED
+ *	outcome) lands in pg_xact_remote; a foreign PREPARE only consumes the WAL
+ *	record and leaves the xid INDOUBT.  Any unsupported side effect (nrels /
+ *	nmsgs / nstats / nsubxacts; foreign MULTIXACT and COMMIT_TS divert here
+ *	too) is fail-closed 53RA3 (P1-1) -- never silently skipped.
  *
  *	online (spec-4.11 3b-2, R13): false = cold merged replay (startup) -> an
  *	unmaterializable record FATALs (re-merge next start).  true = online thread

@@ -681,12 +681,11 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 		/*
 		 * Never call PrepareRedoAdd for a foreign stream: that would expose a
 		 * peer's prepared xact in this node's local pg_prepared_xacts namespace
-		 * and alias raw xids.  Until a matching foreign COMMIT PREPARED is
-		 * replayed before the PITR cut, the row versions remain non-visible in
-		 * this restored incarnation.
+		 * and alias raw xids.  PREPARE is not a durable outcome, either: until a
+		 * matching COMMIT/ABORT PREPARED record is replayed, the remote xid must
+		 * remain INDOUBT so tuple visibility fails closed instead of inventing an
+		 * ABORTED verdict for an in-doubt prepared transaction.
 		 */
-		cluster_remote_xact_set(origin_node, xid, CLUSTER_REMOTE_XACT_ABORTED, InvalidScn, false,
-								0);
 		break;
 	}
 	default:

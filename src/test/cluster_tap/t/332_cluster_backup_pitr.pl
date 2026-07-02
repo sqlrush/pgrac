@@ -264,21 +264,35 @@ ok($pair->wait_for_peer_state(0, 1, 'connected', 30),
 	'L14 two-node backup setup has node0 connected to node1');
 
 $pair->node0->safe_psql('postgres',
-	q{CREATE TABLE cluster_backup_pair_probe(id int, marker int);});
+	q{CREATE TABLE cluster_backup_pair_probe(id int, marker int);
+	  CREATE TABLE cluster_backup_pair_pending(id int, marker int);});
 $pair->node1->safe_psql('postgres',
-	q{CREATE TABLE cluster_backup_pair_probe(id int, marker int);});
+	q{CREATE TABLE cluster_backup_pair_probe(id int, marker int);
+	  CREATE TABLE cluster_backup_pair_pending(id int, marker int);});
 my $pair_probe_path0 = $pair->node0->safe_psql('postgres',
 	q{SELECT pg_relation_filepath('cluster_backup_pair_probe')});
 my $pair_probe_path1 = $pair->node1->safe_psql('postgres',
 	q{SELECT pg_relation_filepath('cluster_backup_pair_probe')});
+my $pair_pending_path0 = $pair->node0->safe_psql('postgres',
+	q{SELECT pg_relation_filepath('cluster_backup_pair_pending')});
+my $pair_pending_path1 = $pair->node1->safe_psql('postgres',
+	q{SELECT pg_relation_filepath('cluster_backup_pair_pending')});
 if ($pair_probe_path0 ne $pair_probe_path1)
 {
 	$pair->stop_pair;
 	BAIL_OUT("same-DDL shared-data relation path mismatch: "
 	  . "node0=$pair_probe_path0 node1=$pair_probe_path1");
 }
+if ($pair_pending_path0 ne $pair_pending_path1)
+{
+	$pair->stop_pair;
+	BAIL_OUT("same-DDL shared-data pending relation path mismatch: "
+	  . "node0=$pair_pending_path0 node1=$pair_pending_path1");
+}
 is($pair_probe_path1, $pair_probe_path0,
 	'L15 same-DDL pair probe uses one shared-data relation path');
+is($pair_pending_path1, $pair_pending_path0,
+	'L15 same-DDL pair pending relation uses one shared-data relation path');
 
 $pair->node0->safe_psql('postgres',
 	q{INSERT INTO cluster_backup_pair_probe VALUES (1, 10);});
@@ -305,7 +319,7 @@ is($pair->node1->safe_psql('postgres',
 
 $pair->node1->safe_psql('postgres',
 	q{BEGIN;
-	  INSERT INTO cluster_backup_pair_probe VALUES (3, 30);
+	  INSERT INTO cluster_backup_pair_pending VALUES (3, 30);
 	  PREPARE TRANSACTION 'pair332_after_cut';});
 is($pair->node1->safe_psql('postgres',
 	q{SELECT count(*) FROM pg_prepared_xacts WHERE gid = 'pair332_after_cut'}),
@@ -403,10 +417,13 @@ is($pair_restore->safe_psql('postgres',
 	     FROM cluster_backup_pair_probe}),
 	'1:10,2:20',
 	'L18 two-node backup->restore->PITR reads the manifest-consistent cut');
-is($pair_restore->safe_psql('postgres',
-	q{SELECT count(*) FROM cluster_backup_pair_probe WHERE id = 3}),
-	'0',
-	'L18a PITR cut excludes peer COMMIT PREPARED after the cut');
+my ($pending_ret, $pending_out, $pending_err) = $pair_restore->psql('postgres',
+	q{SELECT count(*) FROM cluster_backup_pair_pending WHERE id = 3});
+isnt($pending_ret, 0,
+	'L18a unresolved foreign PREPARE fails closed instead of becoming ABORTED');
+like($pending_err,
+	qr/cluster TT status unknown|53R97|in-doubt/,
+	'L18a unresolved foreign PREPARE reports an in-doubt visibility outcome');
 is($pair_restore->safe_psql('postgres',
 	q{SELECT count(*) FROM pg_prepared_xacts WHERE gid = 'pair332_after_cut'}),
 	'0',
