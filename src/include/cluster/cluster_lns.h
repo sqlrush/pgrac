@@ -45,6 +45,8 @@ extern ClusterDgAckMode cluster_lns_ack_mode_from_guc(int dg_mode);
 extern const char *cluster_lns_ack_mode_name(ClusterDgAckMode mode);
 extern bool cluster_lns_commit_ack_satisfied(ClusterDgAckMode mode, bool standby_connected,
 											 bool standby_acknowledged);
+extern bool cluster_lns_thread_ack_matches(uint16 target_thread_id, uint16 send_thread_id,
+										   uint16 reply_thread_id);
 extern ClusterLnsTrailerStatus cluster_lns_parse_adg_reply_trailer(StringInfo reply_message,
 																   ClusterLnsReplyState *out);
 

@@ -564,6 +564,20 @@ UT_TEST(test_lns_ack_mode_matrix)
 	UT_ASSERT(strcmp(cluster_lns_ack_mode_name((ClusterDgAckMode)99), "unknown") == 0);
 }
 
+UT_TEST(test_lns_ack_thread_scope)
+{
+	UT_ASSERT(cluster_lns_thread_ack_matches(8, 8, 8));
+	UT_ASSERT(cluster_lns_thread_ack_matches(XLP_THREAD_ID_LEGACY, XLP_THREAD_ID_LEGACY,
+											 XLP_THREAD_ID_LEGACY));
+
+	UT_ASSERT(!cluster_lns_thread_ack_matches(8, 9, 8));
+	UT_ASSERT(!cluster_lns_thread_ack_matches(8, 8, 9));
+	UT_ASSERT(!cluster_lns_thread_ack_matches(8, XLP_THREAD_ID_LEGACY, 8));
+	UT_ASSERT(!cluster_lns_thread_ack_matches(8, 8, XLP_THREAD_ID_LEGACY));
+	UT_ASSERT(!cluster_lns_thread_ack_matches(CLUSTER_WAL_THREAD_MAX + 1, 8, 8));
+	UT_ASSERT(!cluster_lns_thread_ack_matches(XLP_THREAD_ID_LEGACY, 8, 8));
+}
+
 UT_TEST(test_lns_reply_trailer_parse_boundaries)
 {
 	char buf[CLUSTER_ADG_REPLY_TRAILER_BYTES + 4];
@@ -655,7 +669,7 @@ UT_TEST(test_mrp_shmem_tracks_term_validity_and_drain)
 int
 main(void)
 {
-	UT_PLAN(23);
+	UT_PLAN(24);
 
 	UT_RUN(test_tracker_init_bounds);
 	UT_RUN(test_barrier_min_publishes_after_all_threads);
@@ -678,6 +692,7 @@ main(void)
 	UT_RUN(test_thread_barrier_wal_abi);
 	UT_RUN(test_standby_reply_trailer_validation);
 	UT_RUN(test_lns_ack_mode_matrix);
+	UT_RUN(test_lns_ack_thread_scope);
 	UT_RUN(test_lns_reply_trailer_parse_boundaries);
 	UT_RUN(test_mrp_shmem_tracks_term_validity_and_drain);
 

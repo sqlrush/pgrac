@@ -91,6 +91,7 @@
 #include "cluster/cluster_adg.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_lns.h"
+#include "cluster/cluster_wal_thread.h"
 #endif
 
 /* User-settable parameters for sync rep */
@@ -514,6 +515,7 @@ SyncRepAdgCommitAckSatisfied(XLogRecPtr lsn, ClusterDgAckMode mode)
 {
 	bool		standby_connected = false;
 	bool		standby_acknowledged = false;
+	uint16		target_thread_id = cluster_wal_thread_id();
 	int			i;
 
 	if (WalSndCtl == NULL || max_wal_senders <= 0)
@@ -525,6 +527,8 @@ SyncRepAdgCommitAckSatisfied(XLogRecPtr lsn, ClusterDgAckMode mode)
 		pid_t		pid;
 		WalSndState state;
 		XLogRecPtr	flush;
+		uint16		adg_thread_id;
+		uint16		adg_send_thread_id;
 		uint16		adg_reply_version;
 		uint64		adg_apply_master_term;
 
@@ -533,6 +537,8 @@ SyncRepAdgCommitAckSatisfied(XLogRecPtr lsn, ClusterDgAckMode mode)
 		pid = walsnd->pid;
 		state = walsnd->state;
 		flush = walsnd->flush;
+		adg_thread_id = walsnd->adg_thread_id;
+		adg_send_thread_id = walsnd->adg_send_thread_id;
 		adg_reply_version = walsnd->adg_reply_version;
 		adg_apply_master_term = walsnd->adg_apply_master_term;
 		SpinLockRelease(&walsnd->mutex);
@@ -542,6 +548,8 @@ SyncRepAdgCommitAckSatisfied(XLogRecPtr lsn, ClusterDgAckMode mode)
 		if (state != WALSNDSTATE_STREAMING && state != WALSNDSTATE_STOPPING)
 			continue;
 		if (adg_reply_version != CLUSTER_ADG_REPLY_VERSION || adg_apply_master_term == 0)
+			continue;
+		if (!cluster_lns_thread_ack_matches(target_thread_id, adg_send_thread_id, adg_thread_id))
 			continue;
 
 		standby_connected = true;

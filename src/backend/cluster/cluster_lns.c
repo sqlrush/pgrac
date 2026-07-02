@@ -67,6 +67,17 @@ cluster_lns_commit_ack_satisfied(ClusterDgAckMode mode, bool standby_connected,
 	}
 }
 
+bool
+cluster_lns_thread_ack_matches(uint16 target_thread_id, uint16 send_thread_id,
+							   uint16 reply_thread_id)
+{
+	if (target_thread_id == XLP_THREAD_ID_LEGACY)
+		return send_thread_id == XLP_THREAD_ID_LEGACY && reply_thread_id == XLP_THREAD_ID_LEGACY;
+	if (target_thread_id < XLP_THREAD_ID_FIRST_REAL || target_thread_id > CLUSTER_WAL_THREAD_MAX)
+		return false;
+	return send_thread_id == target_thread_id && reply_thread_id == target_thread_id;
+}
+
 ClusterLnsTrailerStatus
 cluster_lns_parse_adg_reply_trailer(StringInfo reply_message, ClusterLnsReplyState *out)
 {
