@@ -307,6 +307,42 @@ cluster_tt_status_fill_result_from_entry(const ClusterTTOverlayEntry *e,
 }
 
 /*
+ * ADG physical standby durable fallback:
+ *
+ * A standby replays the primary's pg_xact and undo/TT slot files into its local
+ * data directory.  Unlike merged-recovery foreign origins, the local CLOG is
+ * therefore authoritative for replayed primary xids.  When a replayed TT overlay
+ * is absent or stale, resolve the exact physical TT slot directly and cross-check
+ * CLOG so a pre-commit stamp without a committed xid remains fail-closed.
+ */
+static bool
+cluster_tt_status_lookup_adg_standby_durable(const ClusterTTStatusKey *key, uint32 status_epoch,
+											 ClusterTTStatusResult *result)
+{
+	SCN durable_scn;
+
+	if (!cluster_tt_status_adg_standby_overlay_enabled())
+		return false;
+	if (!cluster_tt_durable_lookup || key == NULL || result == NULL)
+		return false;
+	if (key->tt_slot_id < 1 || key->tt_slot_id > TT_SLOTS_PER_SEGMENT)
+		return false;
+
+	if (cluster_tt_slot_durable_lookup(key->undo_segment_id,
+									   cluster_tt_slot_id_to_offset(key->tt_slot_id),
+									   key->local_xid, CLUSTER_TT_WRAP_ANY, &durable_scn)
+		&& TransactionIdDidCommit(key->local_xid)) {
+		result->status = CLUSTER_TT_STATUS_COMMITTED;
+		result->commit_scn = durable_scn;
+		result->status_epoch = status_epoch;
+		result->authoritative = true;
+		return true;
+	}
+
+	return false;
+}
+
+/*
  * ADG standby exception to HC182:
  *
  * Physical standby redo installs TT overlay entries from primary WAL, including
@@ -413,6 +449,8 @@ cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key, ClusterTTStatusRes
 
 		if (cluster_tt_status_lookup_adg_standby_overlay(key, now, result, &ambiguous))
 			return true;
+		if (!ambiguous && cluster_tt_status_lookup_adg_standby_durable(key, current_epoch, result))
+			return true;
 		pg_atomic_fetch_add_u64(&ClusterTTStatusState->lookup_miss_count, 1);
 		return false;
 	}
@@ -428,6 +466,8 @@ cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key, ClusterTTStatusRes
 		pg_atomic_fetch_add_u64(&ClusterTTStatusState->lookup_miss_count, 1);
 		if (ambiguous)
 			return false;
+		if (cluster_tt_status_lookup_adg_standby_durable(key, current_epoch, result))
+			return true;
 
 		/*
 		 * spec-3.11 D5/C3: overlay miss -> own-instance durable TT lookup.  The
@@ -595,6 +635,8 @@ cluster_tt_status_resolve_prepared_commit(TransactionId xid, SCN commit_scn)
 		while ((e = (ClusterTTOverlayEntry *)hash_seq_search(&seq)) != NULL) {
 			if (e->key.local_xid != xid)
 				continue;
+			if (!is_entry_fresh(e, now))
+				continue;
 			if (e->status != CLUSTER_TT_STATUS_IN_PROGRESS
 				&& e->status != CLUSTER_TT_STATUS_COMMITTED)
 				continue;
@@ -612,6 +654,12 @@ cluster_tt_status_resolve_prepared_commit(TransactionId xid, SCN commit_scn)
 		if (ambiguous) {
 			hash_seq_term(&seq);
 			LWLockRelease(ClusterTTStatusLock);
+			ereport(LOG,
+					(errmsg("cluster standby skipped ambiguous prepared-transaction TT overlay "
+							"resolve for xid %u",
+							xid),
+					 errdetail("multiple fresh origin/epoch groups matched the prepared xid; "
+							   "standby keeps the entries unresolved and readers fail closed")));
 			return 0;
 		}
 	}
@@ -619,6 +667,8 @@ cluster_tt_status_resolve_prepared_commit(TransactionId xid, SCN commit_scn)
 	hash_seq_init(&seq, ClusterTTStatusHTAB);
 	while ((e = (ClusterTTOverlayEntry *)hash_seq_search(&seq)) != NULL) {
 		if (e->key.local_xid != xid)
+			continue;
+		if (!is_entry_fresh(e, now))
 			continue;
 		if (adg_standby) {
 			if (!have_match || e->key.origin_node_id != match_origin

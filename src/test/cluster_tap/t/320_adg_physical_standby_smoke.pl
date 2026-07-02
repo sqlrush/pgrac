@@ -11,9 +11,11 @@
 #
 #    Coverage:
 #      L1  read-only service after replay
+#      L1b forced cluster-path read resolves replayed regular commit durably
 #      L2  local ADG lag/apply view
 #      L3  global ADG view row contract while ADG is enabled
 #      L4  2PC PREPARE remains invisible until COMMIT PREPARED redo
+#      L4b stale 2PC overlay resolves through replayed durable TT fallback
 #      L5  ROLLBACK PREPARED does not leak prepared changes
 #      L6  standby SCN floor is monotonic and barrier-driven
 #      L7  standby writes fail closed
@@ -109,6 +111,15 @@ poll_psql_value($standby, q{SELECT count(*) FROM adg_smoke}, '3',
 poll_psql_value(
 	$standby,
 	q{
+	SET cluster.cr_gate_no_peer_fastpath = off;
+	SELECT count(*) FROM adg_smoke
+	},
+	'3',
+	'L1b forced standby cluster path resolves replayed regular commit durably');
+
+poll_psql_value(
+	$standby,
+	q{
 	SELECT dg_role, dg_mode, adg_enabled, mrp_status, apply_master_node_id,
 	       apply_master_term > 0, standby_consistent_scn > 0, lag_bytes >= 0,
 	       lag_seconds >= 0, apply_rate_bytes_per_sec >= 0
@@ -145,6 +156,20 @@ $primary->safe_psql('postgres', q{COMMIT PREPARED 'adg_commit_prepared'});
 $primary->wait_for_catchup($standby);
 poll_psql_value($standby, q{SELECT count(*) FROM adg_2pc}, '1',
 	'L4 COMMIT PREPARED redo becomes visible on ADG standby');
+
+$standby->append_conf('postgresql.conf', "cluster.tt_status_overlay_ttl_ms = 1000\n");
+$standby->reload;
+select(undef, undef, undef, 1.25);
+poll_psql_value(
+	$standby,
+	q{
+	SET cluster.cr_gate_no_peer_fastpath = off;
+	SELECT count(*) FROM adg_2pc
+	},
+	'1',
+	'L4b stale 2PC overlay falls back to replayed durable TT on standby');
+$standby->append_conf('postgresql.conf', "cluster.tt_status_overlay_ttl_ms = 30000\n");
+$standby->reload;
 
 $primary->safe_psql('postgres', q{
 BEGIN;
