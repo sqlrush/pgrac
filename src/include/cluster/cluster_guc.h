@@ -148,6 +148,9 @@ extern int cluster_recovery_workers_max;
 extern bool cluster_merged_recovery;
 extern int cluster_recovery_merge_wait_timeout;
 
+/* spec-5.59 D1: cross-node profiling switch (default off, zero hot-path cost). */
+extern bool cluster_xnode_profile_enabled;
+
 
 /*
  * cluster_injection_points -- comma-separated names to auto-arm at startup.

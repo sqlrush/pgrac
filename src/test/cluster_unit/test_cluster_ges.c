@@ -59,8 +59,9 @@
 #include "cluster/cluster_grd_work_queue.h"
 #include "cluster/cluster_ic.h" /* spec-5.8 D8 — ClusterICSendResult for the send-envelope stub */
 #include "cluster/cluster_ic_envelope.h"
-#include "cluster/cluster_cssd.h"		 /* spec-5.7 Direction B stub — peer state */
-#include "cluster/cluster_extend_gate.h" /* spec-5.7 Direction B stub — sole-native */
+#include "cluster/cluster_cssd.h"		   /* spec-5.7 Direction B stub — peer state */
+#include "cluster/cluster_extend_gate.h"   /* spec-5.7 Direction B stub — sole-native */
+#include "cluster/cluster_xnode_profile.h" /* spec-5.59 D2 stub — profiling gate */
 #include "port/atomics.h"
 
 /* Drop PG's port.h printf -> pg_printf override; unit_test.h uses
@@ -858,6 +859,13 @@ cluster_lmd_cancel_ack_received_count_inc(uint64 d pg_attribute_unused())
 
 /* GUC + PG runtime stubs. */
 int cluster_ges_request_timeout_ms = 60000;
+
+/* spec-5.59 D2 stubs: cluster_ges.o now carries GUC-gated profiling probes
+ * (cluster_xnode_profile.h); the unit harness links neither cluster_guc.o
+ * nor cluster_xnode_profile.o, so define the two gate symbols inertly
+ * (probes early-return on enabled=false / Ctl=NULL). */
+bool cluster_xnode_profile_enabled = false;
+ClusterXnodeProfileShared *ClusterXnodeProfileCtl = NULL;
 
 /* CHECK_FOR_INTERRUPTS() in the local-master wait loop. */
 volatile sig_atomic_t InterruptPending = false;

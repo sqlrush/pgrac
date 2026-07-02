@@ -64,7 +64,8 @@
 #include "cluster/cluster_shmem.h" /* ClusterShmemRegion (spec-3.4e D6 stub) */
 #include "cluster/cluster_tt_slot.h"
 #include "cluster/cluster_uba.h"
-#include "miscadmin.h" /* ProcessingMode / Mode (spec-3.4e D6 stub) */
+#include "cluster/cluster_xnode_profile.h" /* spec-5.59 D7 stub — profiling gate */
+#include "miscadmin.h"					   /* ProcessingMode / Mode (spec-3.4e D6 stub) */
 #include "storage/bufpage.h"
 
 #undef printf
@@ -165,6 +166,13 @@ cluster_merged_instance_is_materialized(int origin_node pg_attribute_unused())
 {
 	return false;
 }
+
+/* spec-5.59 D7 stubs: cluster_itl.o now carries GUC-gated profiling probes
+ * (cluster_xnode_profile.h); the unit harness links neither cluster_guc.o
+ * nor cluster_xnode_profile.o, so define the two gate symbols inertly
+ * (probes early-return on enabled=false / Ctl=NULL). */
+bool cluster_xnode_profile_enabled = false;
+ClusterXnodeProfileShared *ClusterXnodeProfileCtl = NULL;
 
 Page
 BufferGetPage(Buffer buf)

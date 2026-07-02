@@ -155,12 +155,13 @@ jobs:
           # legs run in parallel and do not extend the ges-locking shard
           # wallclock.  t/327 HW workload / t/328 MG-B write perf / t/329 MG-D
           # heap-ITL WAL measure / t/330 production-bench-subset / t/331 4-node
-          # reconfig fault matrix.
-          - { name: stage5-integrated-acceptance, ranges: "327-331", unit: false, regress: false }
+          # reconfig fault matrix / t/334 spec-5.59 xnode-profile buckets.
+          - { name: stage5-integrated-acceptance, ranges: "327-331 334", unit: false, regress: false }
           # spec-6.0a production shared-storage backend matrix.  The first
           # shard covers the CI-portable block_device raw-image e2e; hardware
-          # O_DIRECT / SCSI-3 PR legs remain external/manual.
-          - { name: stage6-storage, ranges: "332-339", unit: false, regress: false }
+          # O_DIRECT / SCSI-3 PR legs remain external/manual.  (334 is the
+          # spec-5.59 profiling TAP and lives in the stage5 shard above.)
+          - { name: stage6-storage, ranges: "332-333 335-339", unit: false, regress: false }
     steps:
       - name: Checkout
         uses: actions/checkout@v4

@@ -55,8 +55,9 @@
 #include "cluster/cluster_qvotec.h" /* cluster_qvotec_in_quorum */
 #include "cluster/cluster_conf.h"	/* cluster_conf_lookup_node */
 #include "cluster/cluster_shmem.h"
-#include "cluster/cluster_cssd.h"		 /* spec-5.7 Direction B — peer DEAD state */
-#include "cluster/cluster_extend_gate.h" /* spec-5.7 Direction B — SOLE reclassify */
+#include "cluster/cluster_cssd.h"		   /* spec-5.7 Direction B — peer DEAD state */
+#include "cluster/cluster_extend_gate.h"   /* spec-5.7 Direction B — SOLE reclassify */
+#include "cluster/cluster_xnode_profile.h" /* PGRAC: spec-5.59 D2 profiling */
 #include "storage/condition_variable.h"
 #include "storage/proc.h"		/* MyProc->cluster_grd_bast_pending (D5) */
 #include "storage/procarray.h"	/* ProcSignalReason dispatch helper */
@@ -1541,9 +1542,16 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 	bool debug1_starvation_fired;
 	/* spec-5.6 Dc4b: caller-supplied wait-event label (0 = GES default). */
 	uint32 wait_ev = (wait_event != 0) ? wait_event : WAIT_EVENT_CLUSTER_GES_REPLY_WAIT;
+	ClusterXpScope xp_enqueue; /* PGRAC: spec-5.59 D2 profiling */
+	ClusterXpScope xp_wait;	   /* PGRAC: spec-5.59 D2 profiling */
 
-	if (resid == NULL || holder == NULL)
+	/* PGRAC: spec-5.59 D2 profiling — whole-body REQUEST send -> grant/reject */
+	cluster_xp_begin(&xp_enqueue, CLXP_W_GES_ENQUEUE);
+
+	if (resid == NULL || holder == NULL) {
+		cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
 		return GES_REJECT_REASON_TIMEOUT;
+	}
 
 	master = cluster_grd_lookup_master(resid);
 
@@ -1601,6 +1609,7 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 		if (action == CLUSTER_GRD_GRANT_NOW) {
 			if (cluster_ges_state != NULL)
 				pg_atomic_fetch_add_u64(&cluster_ges_state->request_defer_count, 1);
+			cluster_xp_end(&xp_enqueue);   /* PGRAC: spec-5.59 D2 profiling */
 			return GES_REJECT_REASON_NONE; /* holder registered; S5 verify-only */
 		}
 		/*
@@ -1608,10 +1617,13 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 		 * immediately (no waiter was queued, no BAST), the requester maps it to
 		 * NOT_AVAIL (false).  Reached only when conditional == true.
 		 */
-		if (action == CLUSTER_GRD_CONFLICT_NOWAIT)
+		if (action == CLUSTER_GRD_CONFLICT_NOWAIT) {
+			cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
 			return GES_REJECT_REASON_LOCK_CONFLICT;
+		}
 		if (action != CLUSTER_GRD_ENQUEUED_WAITER) {
 			/* WAIT_QUEUE_FULL / NOT_READY / ILLEGAL — fail closed, never grant. */
+			cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
 			return GES_REJECT_REASON_WORK_QUEUE_FULL;
 		}
 
@@ -1641,12 +1653,15 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 		entry = cluster_ges_reply_wait_insert(&key, deadline);
 		if (entry == NULL) {
 			(void)cluster_grd_cancel_waiter_by_id(resid, holder);
+			cluster_xp_end(&xp_enqueue);	  /* PGRAC: spec-5.59 D2 profiling */
 			return GES_REJECT_REASON_TIMEOUT; /* fail closed */
 		}
 
 		if (n_conflict > 0)
 			cluster_ges_send_bast_targeted(resid, (int)lockmode, conflict_holders, n_conflict);
 
+		/* PGRAC: spec-5.59 D2 profiling — nested CV wait breakdown (not additive) */
+		cluster_xp_begin(&xp_wait, CLXP_W_GES_WAIT);
 		ConditionVariablePrepareToSleep(&entry->cv);
 		PG_TRY();
 		{
@@ -1693,12 +1708,16 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 			 * cannot grant the lock to this now-departing requester (phantom
 			 * strong-mode holder). */
 			ConditionVariableCancelSleep();
+			/* PGRAC: spec-5.59 D2 profiling — discard scopes on error exit */
+			cluster_xp_abort(&xp_wait);
+			cluster_xp_abort(&xp_enqueue);
 			cluster_ges_reply_wait_delete(&key);
 			(void)cluster_grd_cancel_waiter_by_id(resid, holder);
 			PG_RE_THROW();
 		}
 		PG_END_TRY();
 		ConditionVariableCancelSleep();
+		cluster_xp_end(&xp_wait); /* PGRAC: spec-5.59 D2 profiling */
 
 		/* spec-5.9 D3 — deadlock victim (matching token consumed mid-wait): drop
 		 * the queued waiter + reply-wait entry and fail closed as a deadlock so
@@ -1706,6 +1725,7 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 		if (is_victim) {
 			cluster_ges_reply_wait_delete(&key);
 			(void)cluster_grd_cancel_waiter_by_id(resid, holder);
+			cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
 			return GES_REJECT_REASON_DEADLOCK_VICTIM;
 		}
 
@@ -1714,6 +1734,7 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 			/* Race: the drain may have granted between the deadline check and
 			 * here.  cancel_waiter removes a still-queued waiter (OK -> timeout)
 			 * or reports NOT_FOUND (already granted -> accept the grant). */
+			cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
 			if (cluster_grd_cancel_waiter_by_id(resid, holder) == CLUSTER_GRD_ENTRY_OK)
 				return GES_REJECT_REASON_TIMEOUT; /* fail closed */
 			return GES_REJECT_REASON_NONE;		  /* grant won the race */
@@ -1724,6 +1745,7 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 		/* GRANT (reject_reason == NONE) -> holder registered by the drain; S5
 		 * verify-only.  A non-NONE reject means the drain consumed the waiter
 		 * with a rejection — fail closed with that reason. */
+		cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
 		return reject_reason;
 	}
 
@@ -1769,6 +1791,7 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 				(errmsg_internal("cluster_ges_send_request_and_wait: reply wait table full "
 								 "(request_id=" UINT64_FORMAT " dest=%d) — fail closed",
 								 request_id, master)));
+		cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
 		return GES_REJECT_REASON_TIMEOUT;
 	}
 
@@ -1795,6 +1818,7 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 	if (!cluster_grd_outbound_enqueue_backend_request((uint32)master, &req, sizeof(req))) {
 		/* Outbound ring full — fail closed.  Caller may retry. */
 		cluster_ges_reply_wait_delete(&key);
+		cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
 		return GES_REJECT_REASON_WORK_QUEUE_FULL;
 	}
 
@@ -1806,6 +1830,8 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 	warned_starvation = false;
 	debug1_starvation_fired = false;
 
+	/* PGRAC: spec-5.59 D2 profiling — nested CV wait breakdown (not additive) */
+	cluster_xp_begin(&xp_wait, CLXP_W_GES_WAIT);
 	ConditionVariablePrepareToSleep(&entry->cv);
 	while (!entry->ready) {
 		int sleep_ms;
@@ -1835,11 +1861,13 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 			&& cluster_extend_liveness_is_sole_native()) {
 			cluster_ges_reply_wait_delete(&key);
 			ConditionVariableCancelSleep();
+			cluster_xp_end(&xp_wait); /* PGRAC: spec-5.59 D2 profiling */
 			ereport(LOG,
 					(errmsg_internal("cluster GES: master node %d declared DEAD during lock wait"
 									 " and no alive peer remains; taking PG-native lock"
 									 " (request_id=" UINT64_FORMAT ")",
 									 master, request_id)));
+			cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
 			return GES_REJECT_REASON_MASTER_DEAD_NATIVE;
 		}
 		/* spec-5.9 D3 — cross-node deadlock victim: honor the cancel ONLY when the
@@ -1851,6 +1879,7 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 		if (cluster_cancel_token_consume()) {
 			cluster_ges_reply_wait_delete(&key);
 			ConditionVariableCancelSleep();
+			cluster_xp_end(&xp_wait); /* PGRAC: spec-5.59 D2 profiling */
 			/* spec-5.9 D8 — drop our queued waiter on the REMOTE master (this is
 			 * the remote-master wait loop; the victim's abort LockReleaseAll
 			 * releases held locks, not a queued GES waiter — without this the
@@ -1858,6 +1887,7 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 			 * filters them).  wait_seq-exact, so a stale frame is rejected. */
 			cluster_ges_send_cancel_wait(master, resid, holder, ges_local_wait_seq(), 0,
 										 GES_CANCEL_WAIT_KIND_REQUEST);
+			cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
 			return GES_REJECT_REASON_DEADLOCK_VICTIM;
 		}
 
@@ -1868,6 +1898,8 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 			if (now >= deadline) {
 				ges_abandon_wait_or_release(&key, &req, master, send_opcode);
 				ConditionVariableCancelSleep();
+				cluster_xp_end(&xp_wait);	 /* PGRAC: spec-5.59 D2 profiling */
+				cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
 				return GES_REJECT_REASON_TIMEOUT;
 			}
 			remaining_ms = (long)((deadline - now) / 1000);
@@ -1895,6 +1927,8 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 		if (!perpetual && max_attempts > 0 && attempt > max_attempts) {
 			ges_abandon_wait_or_release(&key, &req, master, send_opcode);
 			ConditionVariableCancelSleep();
+			cluster_xp_end(&xp_wait);	 /* PGRAC: spec-5.59 D2 profiling */
+			cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
 			return GES_REJECT_REASON_TIMEOUT;
 		}
 
@@ -1929,6 +1963,8 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 		if (!cluster_grd_outbound_enqueue_backend_request((uint32)master, &req, sizeof(req))) {
 			cluster_ges_reply_wait_delete(&key);
 			ConditionVariableCancelSleep();
+			cluster_xp_end(&xp_wait);	 /* PGRAC: spec-5.59 D2 profiling */
+			cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
 			return GES_REJECT_REASON_WORK_QUEUE_FULL;
 		}
 		if (cluster_ges_state != NULL)
@@ -1939,11 +1975,13 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 		backoff_ms = backoff_ms < 1600 ? backoff_ms * 2 : 1600;
 	}
 	ConditionVariableCancelSleep();
+	cluster_xp_end(&xp_wait); /* PGRAC: spec-5.59 D2 profiling */
 
 	/* Capture verdict, then delete entry (HC17 pairing invariant). */
 	reject_reason = entry->reject_reason;
 	cluster_ges_reply_wait_delete(&key);
 
+	cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
 	return reject_reason;
 }
 
@@ -2214,9 +2252,16 @@ cluster_ges_send_convert_and_wait(const struct ClusterResId *resid, uint32 reque
 	int effective_timeout_ms;
 	uint32 reject_reason;
 	bool local_master;
+	ClusterXpScope xp_convert; /* PGRAC: spec-5.59 D2 profiling */
+	ClusterXpScope xp_wait;	   /* PGRAC: spec-5.59 D2 profiling */
 
-	if (resid == NULL || holder == NULL)
+	/* PGRAC: spec-5.59 D2 profiling — whole-body CONVERT send -> grant/reject */
+	cluster_xp_begin(&xp_convert, CLXP_W_GES_CONVERT);
+
+	if (resid == NULL || holder == NULL) {
+		cluster_xp_end(&xp_convert); /* PGRAC: spec-5.59 D2 profiling */
 		return GES_REJECT_REASON_TIMEOUT;
+	}
 
 	master = cluster_grd_lookup_master(resid);
 	local_master = (master < 0 || master == cluster_node_id);
@@ -2233,8 +2278,10 @@ cluster_ges_send_convert_and_wait(const struct ClusterResId *resid, uint32 reque
 	 */
 	if (local_master && cluster_lms_native_probe_required(resid, (LOCKMODE)requested_mode)) {
 		if (!cluster_lms_native_probe_wait_clear(resid, (LOCKMODE)requested_mode, holder,
-												 effective_timeout_ms))
+												 effective_timeout_ms)) {
+			cluster_xp_end(&xp_convert); /* PGRAC: spec-5.59 D2 profiling */
 			return GES_REJECT_REASON_TIMEOUT;
+		}
 	}
 
 	memset(&key, 0, sizeof(key));
@@ -2245,8 +2292,10 @@ cluster_ges_send_convert_and_wait(const struct ClusterResId *resid, uint32 reque
 	key.cluster_epoch = epoch;
 
 	entry = cluster_ges_reply_wait_insert(&key, deadline);
-	if (entry == NULL)
+	if (entry == NULL) {
+		cluster_xp_end(&xp_convert); /* PGRAC: spec-5.59 D2 profiling */
 		return GES_REJECT_REASON_TIMEOUT;
+	}
 
 	memset(&req, 0, sizeof(req));
 	req.opcode = GES_REQ_OPCODE_CONVERT;
@@ -2270,15 +2319,19 @@ cluster_ges_send_convert_and_wait(const struct ClusterResId *resid, uint32 reque
 		 * self-sourced frames);  the LMON drain processes it as master. */
 		if (!cluster_grd_work_queue_enqueue(cluster_node_id, &req, sizeof(req))) {
 			cluster_ges_reply_wait_delete(&key);
+			cluster_xp_end(&xp_convert); /* PGRAC: spec-5.59 D2 profiling */
 			return GES_REJECT_REASON_WORK_QUEUE_FULL;
 		}
 	} else {
 		if (!cluster_grd_outbound_enqueue_backend_request((uint32)master, &req, sizeof(req))) {
 			cluster_ges_reply_wait_delete(&key);
+			cluster_xp_end(&xp_convert); /* PGRAC: spec-5.59 D2 profiling */
 			return GES_REJECT_REASON_WORK_QUEUE_FULL;
 		}
 	}
 
+	/* PGRAC: spec-5.59 D2 profiling — nested CV wait breakdown (not additive) */
+	cluster_xp_begin(&xp_wait, CLXP_W_GES_WAIT);
 	ConditionVariablePrepareToSleep(&entry->cv);
 	while (!entry->ready) {
 		TimestampTz now = GetCurrentTimestamp();
@@ -2290,6 +2343,7 @@ cluster_ges_send_convert_and_wait(const struct ClusterResId *resid, uint32 reque
 		if (cluster_cancel_token_consume()) {
 			cluster_ges_reply_wait_delete(&key);
 			ConditionVariableCancelSleep();
+			cluster_xp_end(&xp_wait); /* PGRAC: spec-5.59 D2 profiling */
 
 			/*
 			 * PGRAC: spec-5.9 Hardening v1.0.1 (P1#2) — drop our queued CONVERT
@@ -2313,12 +2367,15 @@ cluster_ges_send_convert_and_wait(const struct ClusterResId *resid, uint32 reque
 					cluster_ges_send_cancel_wait(master, resid, &cancel_holder, req.wait_seq, 0,
 												 GES_CANCEL_WAIT_KIND_CONVERT);
 			}
+			cluster_xp_end(&xp_convert); /* PGRAC: spec-5.59 D2 profiling */
 			return GES_REJECT_REASON_DEADLOCK_VICTIM;
 		}
 
 		if (now >= deadline) {
 			cluster_ges_reply_wait_delete(&key);
 			ConditionVariableCancelSleep();
+			cluster_xp_end(&xp_wait);	 /* PGRAC: spec-5.59 D2 profiling */
+			cluster_xp_end(&xp_convert); /* PGRAC: spec-5.59 D2 profiling */
 			return GES_REJECT_REASON_TIMEOUT;
 		}
 		remaining_ms = (long)((deadline - now) / 1000);
@@ -2329,9 +2386,11 @@ cluster_ges_send_convert_and_wait(const struct ClusterResId *resid, uint32 reque
 		(void)ConditionVariableTimedSleep(&entry->cv, remaining_ms, WAIT_EVENT_GES_CONVERT_WAIT);
 	}
 	ConditionVariableCancelSleep();
+	cluster_xp_end(&xp_wait); /* PGRAC: spec-5.59 D2 profiling */
 
 	reject_reason = entry->reject_reason;
 	cluster_ges_reply_wait_delete(&key);
+	cluster_xp_end(&xp_convert); /* PGRAC: spec-5.59 D2 profiling */
 	return reject_reason;
 }
 

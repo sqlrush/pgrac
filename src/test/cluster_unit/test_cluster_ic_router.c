@@ -59,6 +59,7 @@
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_touched_peers.h" /* spec-5.14 D2 stamp stub */
 #include "cluster/cluster_ic_router.h"
+#include "cluster/cluster_xnode_profile.h" /* spec-5.59 D6 stub — profiling gate */
 
 #undef printf
 #undef fprintf
@@ -249,6 +250,13 @@ cluster_ic_send_bytes(int32 target_node_id pg_attribute_unused(),
 
 /* cluster_node_id global */
 int cluster_node_id = 7;
+
+/* spec-5.59 D6 stubs: cluster_ic_router.o now carries GUC-gated profiling
+ * probes (cluster_xnode_profile.h); the unit harness links neither
+ * cluster_guc.o nor cluster_xnode_profile.o, so define the two gate symbols
+ * inertly (probes early-return on enabled=false / Ctl=NULL). */
+bool cluster_xnode_profile_enabled = false;
+ClusterXnodeProfileShared *ClusterXnodeProfileCtl = NULL;
 
 /*
  * spec-2.3 hardening v1.0.1 F2 (L69): envelope_verify now calls

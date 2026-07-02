@@ -59,6 +59,7 @@
 #include "cluster/cluster_conf.h"			/* spec-5.7 HW — cluster_conf_node_count */
 #include "cluster/cluster_hw.h"				/* spec-5.7 HW — relation-extend authority */
 #include "cluster/cluster_extend_gate.h" /* spec-5.7 §3.1d — liveness engage gate */
+#include "cluster/cluster_xnode_profile.h"	/* spec-5.59 D3/D4 — read probe + relkind hint */
 
 /*
  * PGRAC (spec-4.10 D1): ignore_checksum_failure is defined in bufpage.c with
@@ -803,6 +804,26 @@ ReadBufferExtended(Relation reln, ForkNumber forkNum, BlockNumber blockNum,
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot access temporary tables of other sessions")));
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: spec-5.59 D4 — relation-kind hint for the cross-node profiling
+	 * index axis.  This is the last point on the read path that still has
+	 * the Relation (and thus relkind); the GCS block layer consumes the
+	 * hint by exact BufferTag match.  Profiling-only, GUC-gated inside the
+	 * setter, no behavior change.
+	 */
+	if (unlikely(cluster_xnode_profile_enabled) &&
+		blockNum != P_NEW &&
+		!RelationUsesLocalBuffers(reln))
+	{
+		BufferTag	xp_tag;
+
+		InitBufferTag(&xp_tag, &reln->rd_locator, forkNum, blockNum);
+		cluster_xp_relkind_hint_set(&xp_tag,
+									reln->rd_rel->relkind == RELKIND_INDEX);
+	}
+#endif
 
 	/*
 	 * Read the buffer, and update pgstat counters to reflect a cache hit or
@@ -5167,6 +5188,12 @@ LockBuffer(Buffer buffer, int mode)
 		{
 			/* Already covered locally — no master round-trip, nothing to
 			 * finalize or roll back (pcm_acquired stays false). */
+
+			/* PGRAC: spec-5.59 §3.6 read amortization probe — a share
+			 * acquire served entirely from locally-held PCM state is the
+			 * "S-holder hit" the probe counts (GUC-gated inside). */
+			if (pcm_mode == PCM_LOCK_MODE_S)
+				cluster_xp_note_read(false);
 		}
 		else
 		{

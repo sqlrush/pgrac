@@ -45,7 +45,8 @@
 #include "cluster/cluster_tt_status.h"		/* lookup_exact / Key / Result */
 #include "cluster/cluster_touched_peers.h"	/* spec-5.14 D2 class 4 */
 #include "cluster/cluster_visibility_resolve.h"
-#include "cluster/cluster_wal_state.h" /* CLUSTER_WAL_STATE_SLOT_COUNT */
+#include "cluster/cluster_wal_state.h"	   /* CLUSTER_WAL_STATE_SLOT_COUNT */
+#include "cluster/cluster_xnode_profile.h" /* spec-5.59 D3: profiling probes */
 
 /*
  * Backend-lifetime cache over cluster_merged_instance_is_materialized().
@@ -83,9 +84,14 @@ resolve_from_remote_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref,
 {
 	ClusterTTStatusKey key;
 	ClusterTTStatusResult result;
+	ClusterXpScope xp_scope; /* PGRAC: spec-5.59 D3 profiling */
 
-	if (out == NULL || ref == NULL)
+	cluster_xp_begin(&xp_scope, CLXP_R_TT_VISIBILITY_RESOLVE);
+
+	if (out == NULL || ref == NULL) {
+		cluster_xp_end(&xp_scope); /* PGRAC: spec-5.59 D3 profiling */
 		return;
+	}
 
 	out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
 	out->status = CLUSTER_TT_STATUS_UNKNOWN;
@@ -98,8 +104,10 @@ resolve_from_remote_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref,
 	key.cluster_epoch = ref->cluster_epoch;
 	key.local_xid = raw_xid;
 
-	if (!cluster_tt_status_lookup_exact(&key, &result) || !result.authoritative)
-		return; /* UNKNOWN -> caller 53R97 (C-V2: no PG-native fallback) */
+	if (!cluster_tt_status_lookup_exact(&key, &result) || !result.authoritative) {
+		cluster_xp_end(&xp_scope); /* PGRAC: spec-5.59 D3 profiling */
+		return;					   /* UNKNOWN -> caller 53R97 (C-V2: no PG-native fallback) */
+	}
 
 	/*
 	 * spec-3.5: follow a SUBCOMMITTED subxact to its parent so the caller
@@ -111,11 +119,15 @@ resolve_from_remote_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref,
 
 	if (!result.authoritative) {
 		out->status = CLUSTER_TT_STATUS_UNKNOWN;
+		cluster_xp_end(&xp_scope); /* PGRAC: spec-5.59 D3 profiling */
 		return;
 	}
 
 	out->status = result.status;
 	out->commit_scn = result.commit_scn;
+
+	/* PGRAC: spec-5.59 D3 profiling */
+	cluster_xp_end(&xp_scope);
 }
 
 

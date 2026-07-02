@@ -82,6 +82,8 @@ int cluster_recovery_workers_max = 4;
 /* spec-4.5 D9: merged k-way recovery (default OFF, Q8) + wait timeout. */
 bool cluster_merged_recovery = false;
 int cluster_recovery_merge_wait_timeout = 10000;
+/* spec-5.59 D1: cross-node profiling switch (default OFF, zero hot-path cost). */
+bool cluster_xnode_profile_enabled = false;
 /* spec-6.5: cluster-aware backup / restore / PITR target knobs. */
 char *cluster_recovery_target_scn = NULL;
 char *cluster_recovery_target_cluster_time = NULL;
@@ -1220,6 +1222,18 @@ cluster_init_guc(void)
 		"cluster.merged_recovery", gettext_noop("Enable cold-crash k-way SCN merged recovery."),
 		gettext_noop("Off keeps single-stream recovery (this node's own thread only)."),
 		&cluster_merged_recovery, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	/*
+	 * cluster.xnode_profile -- cross-node per-bucket profiling (spec-5.59).
+	 * Default OFF: every probe early-returns on one branch with no clock
+	 * read, keeping instrumented hot paths byte-equivalent to the
+	 * un-instrumented baseline.  SUSET so a superuser can toggle it at
+	 * runtime for a measurement window without a restart.
+	 */
+	DefineCustomBoolVariable("cluster.xnode_profile",
+							 gettext_noop("Enable cross-node performance profiling buckets."),
+							 gettext_noop("Off keeps all instrumented paths at zero overhead."),
+							 &cluster_xnode_profile_enabled, false, PGC_SUSET, 0, NULL, NULL, NULL);
 
 	/*
 	 * cluster.clean_leave_enabled -- opt-in cooperative clean-leave

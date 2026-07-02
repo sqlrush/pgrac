@@ -45,6 +45,7 @@
 #include "cluster/cluster_uba.h"			/* uba_decode / uba_origin_node_id (spec-3.4b D7) */
 #include "cluster/cluster_recovery_merge.h" /* spec-4.5a G6: materialized-origin slot pin */
 #include "cluster/cluster_shmem.h"			/* cluster_shmem_register_region (spec-3.4e D6) */
+#include "cluster/cluster_xnode_profile.h"	/* PGRAC: spec-5.59 D7 profiling */
 #include "miscadmin.h"						/* IsBootstrapProcessingMode (spec-3.4e D6) */
 #include "port/atomics.h"					/* pg_atomic_uint64 (spec-3.4d D11 counters) */
 #include "storage/ipc.h"					/* ShmemInitStruct (spec-3.4e D6) */
@@ -523,6 +524,10 @@ cluster_itl_alloc_or_reuse_slot(Buffer buf, TransactionId top_xid, uint8 *out_sl
 	uint8 i;
 	int free_idx;
 	int reusable_idx;
+	ClusterXpScope xps;
+
+	/* PGRAC: spec-5.59 D7 profiling */
+	cluster_xp_begin(&xps, CLXP_LOCAL_UNDO_ITL_WAL);
 
 	Assert(BufferIsValid(buf));
 	Assert(TransactionIdIsValid(top_xid));
@@ -530,8 +535,10 @@ cluster_itl_alloc_or_reuse_slot(Buffer buf, TransactionId top_xid, uint8 *out_sl
 
 	page = BufferGetPage(buf);
 
-	if (!PageHasItl(page))
+	if (!PageHasItl(page)) {
+		cluster_xp_end(&xps); /* PGRAC: spec-5.59 D7 profiling */
 		return false;
+	}
 
 	/* spec-5.2 §3.5 D11: a forward ITL write requires X. */
 	itl_require_block_x_for_write(buf);
@@ -552,6 +559,7 @@ cluster_itl_alloc_or_reuse_slot(Buffer buf, TransactionId top_xid, uint8 *out_sl
 	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
 		if (slots[i].flags == ITL_FLAG_ACTIVE && slots[i].xid == top_xid) {
 			*out_slot_idx = i;
+			cluster_xp_end(&xps); /* PGRAC: spec-5.59 D7 profiling */
 			return true;
 		}
 		if (slots[i].flags == ITL_FLAG_FREE && free_idx < 0)
@@ -563,15 +571,18 @@ cluster_itl_alloc_or_reuse_slot(Buffer buf, TransactionId top_xid, uint8 *out_sl
 
 	if (free_idx >= 0) {
 		*out_slot_idx = (uint8)free_idx;
+		cluster_xp_end(&xps); /* PGRAC: spec-5.59 D7 profiling */
 		return true;
 	}
 
 	if (reusable_idx >= 0) {
 		*out_slot_idx = (uint8)reusable_idx;
+		cluster_xp_end(&xps); /* PGRAC: spec-5.59 D7 profiling */
 		return true;
 	}
 
-	return false; /* OVERFLOW — caller raises ERROR before CRIT */
+	cluster_xp_end(&xps); /* PGRAC: spec-5.59 D7 profiling */
+	return false;		  /* OVERFLOW — caller raises ERROR before CRIT */
 }
 
 bool
@@ -826,6 +837,10 @@ cluster_itl_stamp_active(Buffer buf, uint8 slot_idx, TransactionId xid, SCN writ
 {
 	Page page;
 	ClusterItlSlotData *slot;
+	ClusterXpScope xps;
+
+	/* PGRAC: spec-5.59 D7 profiling (probe is critical-section safe) */
+	cluster_xp_begin(&xps, CLXP_LOCAL_UNDO_ITL_WAL);
 
 	Assert(BufferIsValid(buf));
 	Assert(slot_idx < CLUSTER_ITL_INITRANS_DEFAULT);
@@ -887,6 +902,7 @@ cluster_itl_stamp_active(Buffer buf, uint8 slot_idx, TransactionId xid, SCN writ
 	 */
 
 	MarkBufferDirty(buf);
+	cluster_xp_end(&xps); /* PGRAC: spec-5.59 D7 profiling */
 }
 
 void

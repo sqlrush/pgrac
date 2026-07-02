@@ -48,6 +48,7 @@
 #include "cluster/cluster_hang_resolve.h" /* spec-5.12: ClusterHangResolveCounters for dump stubs */
 #include "cluster/cluster_reconfig.h"	  /* spec-5.14 D6 touched getter stubs */
 #include "cluster/cluster_touched_peers.h" /* spec-5.14 D6 self_hex stub */
+#include "cluster/cluster_xnode_profile.h" /* spec-5.59 D1 profiling gate stubs */
 
 #undef printf
 #undef fprintf
@@ -92,6 +93,21 @@ int cluster_node_id = -1;
 int cluster_interconnect_tier = 0;
 char *cluster_config_file = NULL;
 char *cluster_injection_points = NULL;
+
+/* spec-5.59 D1 stubs: cluster_debug.o now carries GUC-gated profiling probes
+ * (cluster_xnode_profile.h); the unit harness links neither cluster_guc.o
+ * nor cluster_xnode_profile.o, so define the two gate symbols inertly
+ * (probes early-return on enabled=false / Ctl=NULL).  dump_xnode_profile
+ * also calls cluster_xp_bucket_name; the SRF body that calls it is never
+ * invoked by the unit test (same as the file's other SRF stubs). */
+bool cluster_xnode_profile_enabled = false;
+ClusterXnodeProfileShared *ClusterXnodeProfileCtl = NULL;
+
+const char *
+cluster_xp_bucket_name(ClusterXnodeBucket b pg_attribute_unused())
+{
+	return "stub";
+}
 
 /* cluster_ic */
 const ClusterICOps *ClusterICOps_Active = NULL;

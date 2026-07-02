@@ -36,6 +36,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_ic.h"
+#include "cluster/cluster_xnode_profile.h" /* spec-5.59 D6 stub — profiling gate */
 
 #undef printf
 #undef fprintf
@@ -66,6 +67,13 @@
 
 int cluster_node_id = -1;
 int cluster_interconnect_tier = 0;
+
+/* spec-5.59 D6 stubs: cluster_ic.o now carries GUC-gated profiling probes
+ * (cluster_xnode_profile.h); the unit harness links neither cluster_guc.o
+ * nor cluster_xnode_profile.o, so define the two gate symbols inertly
+ * (probes early-return on enabled=false / Ctl=NULL). */
+bool cluster_xnode_profile_enabled = false;
+ClusterXnodeProfileShared *ClusterXnodeProfileCtl = NULL;
 
 /*
  * spec-2.1 Hardening v1.0.2 D-I1 -- F2 extension fix in cluster_ic.c::

@@ -52,6 +52,7 @@
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_lock_acquire.h"
+#include "cluster/cluster_xnode_profile.h" /* PGRAC: spec-5.59 D2 profiling */
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "miscadmin.h"
 #include "storage/block.h"
@@ -143,6 +144,7 @@ cluster_hw_allocate(RelFileLocator rloc, ForkNumber fork, uint32 want, BlockNumb
 	int32 master;
 	HwAllocRequest req;
 	HwAllocReply reply;
+	ClusterXpScope xps; /* PGRAC: spec-5.59 D2 profiling */
 
 	Assert(granted != NULL);
 	Assert(want > 0);
@@ -163,12 +165,19 @@ cluster_hw_allocate(RelFileLocator rloc, ForkNumber fork, uint32 want, BlockNumb
 	req.want = want;
 	req.seed_nblocks = (uint32)seed_nblocks; /* §3.1c: used by master only at establish */
 
+	/* PGRAC: spec-5.59 D2 profiling */
+	cluster_xp_begin(&xps, CLXP_W_HW_EXTEND);
+
 	master = cluster_grd_lookup_master(&resid);
 
 	if (master < 0 || master == cluster_node_id) {
+		/* PGRAC: spec-5.59 D2 profiling (HW master locality probe) */
+		cluster_xp_note_hw_extend(false);
 		/* local master / LMS inactive / single node: process inline. */
 		cluster_hw_master_process(&req, &reply);
 	} else {
+		/* PGRAC: spec-5.59 D2 profiling (HW master locality probe) */
+		cluster_xp_note_hw_extend(true);
 		/* remote master: enqueue to the LMON outbound ring (tier-1 sockets are
 		 * LMON-owned) and wait on the reply mailbox. */
 		cluster_hw_reply_slot_arm(req.request_id);
@@ -177,19 +186,23 @@ cluster_hw_allocate(RelFileLocator rloc, ForkNumber fork, uint32 want, BlockNumb
 			/* ring full: drop the armed slot and fail closed. */
 			(void)cluster_hw_reply_slot_wait(req.request_id, 0, &reply);
 			cluster_hw_bump_failclosed();
+			cluster_xp_end(&xps); /* PGRAC: spec-5.59 D2 profiling */
 			return InvalidBlockNumber;
 		}
 		if (!cluster_hw_reply_slot_wait(req.request_id, cluster_ges_request_timeout_ms, &reply)) {
 			cluster_hw_bump_failclosed();
+			cluster_xp_end(&xps);	   /* PGRAC: spec-5.59 D2 profiling */
 			return InvalidBlockNumber; /* timeout: caller fails closed (53RA6) */
 		}
 	}
 
 	if (reply.status != HW_ALLOC_REPLY_OK || reply.granted == 0) {
 		cluster_hw_bump_failclosed();
+		cluster_xp_end(&xps); /* PGRAC: spec-5.59 D2 profiling */
 		return InvalidBlockNumber;
 	}
 	*granted = reply.granted;
+	cluster_xp_end(&xps); /* PGRAC: spec-5.59 D2 profiling */
 	return (BlockNumber)reply.first_block;
 }
 

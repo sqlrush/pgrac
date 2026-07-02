@@ -89,6 +89,7 @@
 #include "cluster/storage/cluster_undo_buf.h" /* spec-3.18 D1 read/write-through */
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "cluster/storage/cluster_undo_xlog.h" /* spec-3.18 D2a XLOG_UNDO_BLOCK_WRITE */
+#include "cluster/cluster_xnode_profile.h"	   /* PGRAC: spec-5.59 D7 profiling */
 
 #include "access/xlog.h" /* GetXLogWriteRecPtr */
 
@@ -1301,26 +1302,40 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 	int local_head_idx;
 	UBA effective_prev_uba;
 	bool first_in_tx;
+	ClusterXpScope xps;
+
+	/* PGRAC: spec-5.59 D7 profiling */
+	cluster_xp_begin(&xps, CLXP_LOCAL_UNDO_ITL_WAL);
 
 	/* Input validation. */
-	if (record_type == UNDO_RECORD_INVALID || record_type > UNDO_RECORD_ITL)
+	if (record_type == UNDO_RECORD_INVALID || record_type > UNDO_RECORD_ITL) {
+		cluster_xp_end(&xps); /* PGRAC: spec-5.59 D7 profiling */
 		return InvalidUba;
-	if (target == NULL || payload == NULL)
+	}
+	if (target == NULL || payload == NULL) {
+		cluster_xp_end(&xps); /* PGRAC: spec-5.59 D7 profiling */
 		return InvalidUba;
+	}
 
-	if (UndoRecordShared == NULL)
-		return InvalidUba; /* shmem not initialized */
+	if (UndoRecordShared == NULL) {
+		cluster_xp_end(&xps); /* PGRAC: spec-5.59 D7 profiling */
+		return InvalidUba;	  /* shmem not initialized */
+	}
 
 	record_length = undo_record_total_length(record_type, payload_len);
 
 	/* Enforce inline cap GUC. */
 	inline_cap = (uint16)cluster_undo_record_inline_max_bytes;
-	if (payload_len > inline_cap)
-		return InvalidUba; /* caller ereport 53R9D oversize */
+	if (payload_len > inline_cap) {
+		cluster_xp_end(&xps); /* PGRAC: spec-5.59 D7 profiling */
+		return InvalidUba;	  /* caller ereport 53R9D oversize */
+	}
 
 	/* Hard cap (must fit in single block). */
-	if (record_length > UNDO_RECORD_HARD_CAP_BYTES)
+	if (record_length > UNDO_RECORD_HARD_CAP_BYTES) {
+		cluster_xp_end(&xps); /* PGRAC: spec-5.59 D7 profiling */
 		return InvalidUba;
+	}
 
 	/* Owner instance is current node_id + 1 (per cluster_undo_alloc.c
 	 * convention: owner_instance is 1-indexed). */
@@ -1332,8 +1347,10 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 	 * leave the LWLock held and wedge all future undo writers in this backend.
 	 */
 	ensured_segment_id = cluster_undo_active_segment_for_node_or_create(cluster_node_id);
-	if (ensured_segment_id == 0)
+	if (ensured_segment_id == 0) {
+		cluster_xp_end(&xps); /* PGRAC: spec-5.59 D7 profiling */
 		return InvalidUba;
+	}
 
 	/*
 	 * spec-3.8 Fix 4: post-restart resume.  If shared cursor is fresh
@@ -1363,8 +1380,10 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 			ensured_segment_id = resumed;
 	}
 
-	if (!cluster_undo_local_head_ensure(tt_slot_segment_id, tt_slot_offset, &local_head_idx))
+	if (!cluster_undo_local_head_ensure(tt_slot_segment_id, tt_slot_offset, &local_head_idx)) {
+		cluster_xp_end(&xps); /* PGRAC: spec-5.59 D7 profiling */
 		return InvalidUba;
+	}
 	effective_prev_uba = cluster_undo_local_heads[local_head_idx].head;
 	if (UBA_is_invalid(effective_prev_uba) && !UBA_is_invalid(prev_uba)) {
 		uint32 prev_segment;
@@ -1489,7 +1508,8 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 										"cluster.undo_segment_create_timeout_ms.")));
 				break; /* unreachable */
 			case CLAIM_IO_FAIL:
-				return InvalidUba; /* block-0 header I/O fail */
+				cluster_xp_end(&xps); /* PGRAC: spec-5.59 D7 profiling */
+				return InvalidUba;	  /* block-0 header I/O fail */
 			}
 		}
 
@@ -1514,8 +1534,10 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 			|| cluster_undo_pending.owner_instance != owner_instance
 			|| cluster_undo_pending.block_no != current_block)) {
 		/* Block/segment switch: emit the previous block's merged record. */
-		if (!cluster_undo_pending_flush_internal(false))
+		if (!cluster_undo_pending_flush_internal(false)) {
+			cluster_xp_end(&xps); /* PGRAC: spec-5.59 D7 profiling */
 			return InvalidUba;
+		}
 	}
 
 	if (use_defer && cluster_undo_pending.active) {
@@ -1539,8 +1561,10 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 			blkhdr->crc64 = 0;
 		} else {
 			/* Mid-extent block we already wrote -> read it back from the pool. */
-			if (!read_undo_block(segment_id, owner_instance, current_block, block_buf))
-				return InvalidUba; /* I/O fail (no shared lock held in D3 path) */
+			if (!read_undo_block(segment_id, owner_instance, current_block, block_buf)) {
+				cluster_xp_end(&xps); /* PGRAC: spec-5.59 D7 profiling */
+				return InvalidUba;	  /* I/O fail (no shared lock held in D3 path) */
+			}
 			blkhdr = (UndoBlockHeader *)block_buf;
 		}
 
@@ -1654,14 +1678,18 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 		 */
 		if (!write_undo_block_ext(segment_id, owner_instance, current_block, block_buf,
 								  /* do_fsync = */ false, InvalidXLogRecPtr,
-								  /* keep_clean = */ true, &cluster_undo_pending.ref_slot))
+								  /* keep_clean = */ true, &cluster_undo_pending.ref_slot)) {
+			cluster_xp_end(&xps); /* PGRAC: spec-5.59 D7 profiling */
 			return InvalidUba;
+		}
 	} else {
 		if (!cluster_undo_wal_protect_block(segment_id, owner_instance, current_block, block_buf,
 											blkhdr->block_lsn, (uint16)free_offset,
 											(uint16)record_length,
-											(uint16)UNDO_SLOT_DIR_OFFSET(new_slot_idx)))
-			return InvalidUba; /* I/O fail (no shared lock held in D3 path) */
+											(uint16)UNDO_SLOT_DIR_OFFSET(new_slot_idx))) {
+			cluster_xp_end(&xps); /* PGRAC: spec-5.59 D7 profiling */
+			return InvalidUba;	  /* I/O fail (no shared lock held in D3 path) */
+		}
 
 		pg_atomic_fetch_add_u64(&UndoRecordShared->block_write_count, 1);
 	}
@@ -1691,6 +1719,7 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 	result = uba_encode((uint32)segment_id, current_block, tt_slot_offset, new_slot_idx);
 	cluster_undo_local_heads[local_head_idx].head = result;
 
+	cluster_xp_end(&xps); /* PGRAC: spec-5.59 D7 profiling */
 	return result;
 }
 

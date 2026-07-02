@@ -49,6 +49,7 @@
 #include "cluster/cluster_ic_envelope.h" /* spec-2.9 D4:  ClusterICEnvelope + PGRAC_IC_MSG_BOC_BROADCAST */
 #include "cluster/cluster_ic_router.h" /* spec-2.9 D4: ClusterICFanoutResult */
 #include "cluster/cluster_scn.h"
+#include "cluster/cluster_xnode_profile.h" /* spec-5.59 D2 stub — profiling gate */
 #include "port/atomics.h"
 #include "storage/lwlock.h"
 
@@ -76,6 +77,13 @@
  */
 
 bool IsUnderPostmaster = false;
+
+/* spec-5.59 D2 stubs: cluster_scn.o now carries GUC-gated profiling probes
+ * (cluster_xnode_profile.h); the unit harness links neither cluster_guc.o
+ * nor cluster_xnode_profile.o, so define the two gate symbols inertly
+ * (probes early-return on enabled=false / Ctl=NULL). */
+bool cluster_xnode_profile_enabled = false;
+ClusterXnodeProfileShared *ClusterXnodeProfileCtl = NULL;
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),

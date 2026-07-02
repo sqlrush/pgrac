@@ -59,7 +59,8 @@
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_ic_router.h"
-#include "cluster/cluster_ic_tier1.h" /* cluster_ic_tier1_get_peer_fd (spec-2.5 D2.5 fanout) */
+#include "cluster/cluster_ic_tier1.h"	   /* cluster_ic_tier1_get_peer_fd (spec-2.5 D2.5 fanout) */
+#include "cluster/cluster_xnode_profile.h" /* PGRAC: spec-5.59 D6 profiling */
 
 
 /* ============================================================
@@ -274,6 +275,7 @@ cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, 
 	const ClusterICMsgTypeInfo *info;
 	MemoryContext old_ctx;
 	MemoryContext dispatch_ctx;
+	ClusterXpScope xps; /* PGRAC: spec-5.59 D6 profiling */
 
 	if (env == NULL)
 		return false;
@@ -335,6 +337,8 @@ cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, 
 	old_ctx = CurrentMemoryContext;
 	dispatch_ctx = AllocSetContextCreate(old_ctx, "cluster_ic dispatch", ALLOCSET_SMALL_SIZES);
 	MemoryContextSwitchTo(dispatch_ctx);
+	/* PGRAC: spec-5.59 D6 profiling (set before sigsetjmp, read after) */
+	cluster_xp_begin(&xps, CLXP_IC_INBOUND_DISPATCH);
 	PG_TRY();
 	{
 		info->handler(env, payload);
@@ -357,6 +361,7 @@ cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, 
 		FlushErrorState();
 	}
 	PG_END_TRY();
+	cluster_xp_end(&xps); /* PGRAC: spec-5.59 D6 profiling */
 	MemoryContextSwitchTo(old_ctx);
 	MemoryContextDelete(dispatch_ctx);
 
