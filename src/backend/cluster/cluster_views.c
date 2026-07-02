@@ -54,6 +54,7 @@
 #include "cluster/cluster_views.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_apply_master_election.h"
 #include "cluster/cluster_conf.h"			/* cluster_conf_lookup_node, role helpers */
 #include "cluster/cluster_guc.h"			/* cluster_node_id */
 #include "cluster/cluster_mrp.h"			/* cluster_mrp_shared_state */
@@ -115,14 +116,14 @@ cluster_put_adg_state_row(ReturnSetInfo *rsinfo, int32 node_id)
 	else if (mrp == NULL)
 		mrp_status = "not_started";
 	else {
-		uint32 packed_owner;
+		uint32 current_owner;
 
 		mrp_status
 			= cluster_mrp_state_to_string((ClusterMrpState)pg_atomic_read_u32(&mrp->mrp_state));
-		packed_owner = pg_atomic_read_u32(&mrp->apply_master_node_id);
-		if (packed_owner != UINT32_MAX)
-			apply_master_node_id = (int32)packed_owner;
-		apply_master_term = pg_atomic_read_u64(&mrp->apply_master_term);
+		current_owner = cluster_apply_master_current_node_id();
+		if (current_owner != UINT32_MAX)
+			apply_master_node_id = (int32)current_owner;
+		apply_master_term = cluster_apply_master_current_term();
 		receive_lsn = (XLogRecPtr)pg_atomic_read_u64(&mrp->receive_lsn);
 		apply_lsn = (XLogRecPtr)pg_atomic_read_u64(&mrp->apply_lsn);
 		standby_consistent_scn = pg_atomic_read_u64(&mrp->standby_consistent_scn);
@@ -291,11 +292,9 @@ static const uint32 cluster_wait_event_infos[CLUSTER_WAIT_EVENTS_COUNT] = {
 	WAIT_EVENT_UNDO_SEGMENT_FETCH,
 	WAIT_EVENT_UNDO_RETENTION_WAIT,
 
-	/* Cluster: ADG (4) */
+	/* Cluster: ADG (2) */
 	WAIT_EVENT_ADG_MRP_APPLY_WAIT,
 	WAIT_EVENT_ADG_WAL_RECEIVE_LAG,
-	WAIT_EVENT_ADG_READ_SNAPSHOT_WAIT,
-	WAIT_EVENT_ADG_SCN_SYNC_WAIT,
 
 	/* Cluster: SharedFs (12 = 5 spec-1.1 + 7 spec-6.0a block_device) */
 	WAIT_EVENT_CLUSTER_SHARED_FS_READ,

@@ -104,7 +104,7 @@ my %expected = (
 	'Cluster: Sinval' => 6,
 	'Cluster: Interconnect' => 7,
 	'Cluster: Undo' => 4,
-	'Cluster: ADG' => 4,
+	'Cluster: ADG' => 2,
 );
 
 for my $type (sort keys %expected)
@@ -139,7 +139,7 @@ is($node->safe_psql('postgres', q{
 # Spot-check 6 event names exist exactly once with the expected node_id.
 # ----------
 for my $name ('GesEnqueueAcquire', 'PcmBlockReadNS', 'SinvalInjectLocalQueue',
-              'InterconnectRdmaSend', 'ClusterICRdmaFallback', 'AdgScnSyncWait')
+              'InterconnectRdmaSend', 'ClusterICRdmaFallback', 'AdgWalReceiveLag')
 {
 	my $count = $node->safe_psql(
 		'postgres',

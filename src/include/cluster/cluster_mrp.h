@@ -45,6 +45,7 @@ typedef struct ClusterMrpSharedState {
 	pg_atomic_uint32 apply_master_node_id;
 	pg_atomic_uint32 apply_master_term_valid;
 	pg_atomic_uint64 apply_master_term;
+	pg_atomic_uint64 apply_master_generation;
 	pg_atomic_uint64 apply_master_term_valid_until_ms;
 	pg_atomic_uint64 apply_master_lost_at_ms;
 	pg_atomic_uint64 receive_lsn;
@@ -56,7 +57,10 @@ typedef struct ClusterMrpSharedState {
 	pg_atomic_uint64 error_count;
 	pg_atomic_uint64 ready_at_us;
 	pg_atomic_uint64 stopped_at_us;
+	pg_atomic_uint32 primary_thread_count;
+	pg_atomic_uint64 primary_thread_bitmap[2];
 	pg_atomic_uint64 thread_receive_lsn[CLUSTER_WAL_THREAD_MAX + 1];
+	pg_atomic_uint64 thread_start_lsn[CLUSTER_WAL_THREAD_MAX + 1];
 	pg_atomic_uint64 thread_receive_time_us[CLUSTER_WAL_THREAD_MAX + 1];
 	pg_atomic_uint64 thread_apply_lsn[CLUSTER_WAL_THREAD_MAX + 1];
 	pg_atomic_uint64 thread_apply_time_us[CLUSTER_WAL_THREAD_MAX + 1];
@@ -80,10 +84,15 @@ extern bool cluster_mrp_apply_master_can_apply(void);
 extern bool cluster_mrp_read_service_available(void);
 extern uint64 cluster_mrp_apply_master_term(void);
 extern uint32 cluster_mrp_apply_master_node_id(void);
+extern void cluster_mrp_note_primary_thread_count(uint16 primary_thread_count);
+extern int cluster_mrp_streaming_snapshot(uint64 bitmap[2], XLogRecPtr start_lsn[],
+										  XLogRecPtr receive_lsn[]);
+extern void cluster_mrp_mark_thread_received_span(uint16 thread_id, XLogRecPtr start_lsn,
+												  XLogRecPtr receive_lsn);
 extern void cluster_mrp_mark_thread_received(uint16 thread_id, XLogRecPtr receive_lsn);
 extern void cluster_mrp_mark_thread_applied(uint16 thread_id, XLogRecPtr apply_lsn);
 extern void cluster_mrp_apply_thread_barrier(uint16 thread_id, XLogRecPtr barrier_lsn,
-											 SCN thread_safe_scn);
+											 SCN thread_safe_scn, uint16 primary_thread_count);
 extern void cluster_mrp_mark_child_exit(void);
 extern void cluster_mrp_publish_watermarks(XLogRecPtr receive_lsn, XLogRecPtr apply_lsn,
 										   uint64 standby_consistent_scn);

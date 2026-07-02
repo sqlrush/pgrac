@@ -57,6 +57,7 @@ static void libpqrcv_get_senderinfo(WalReceiverConn *conn,
 									char **sender_host, int *sender_port);
 static char *libpqrcv_identify_system(WalReceiverConn *conn,
 									  TimeLineID *primary_tli);
+static int	libpqrcv_get_adg_primary_thread_count(WalReceiverConn *conn);
 static char *libpqrcv_get_option_from_conninfo(const char *connInfo,
 											   const char *keyword);
 static int	libpqrcv_server_version(WalReceiverConn *conn);
@@ -90,6 +91,7 @@ static WalReceiverFunctionsType PQWalReceiverFunctions = {
 	.walrcv_get_conninfo = libpqrcv_get_conninfo,
 	.walrcv_get_senderinfo = libpqrcv_get_senderinfo,
 	.walrcv_identify_system = libpqrcv_identify_system,
+	.walrcv_get_adg_primary_thread_count = libpqrcv_get_adg_primary_thread_count,
 	.walrcv_server_version = libpqrcv_server_version,
 	.walrcv_readtimelinehistoryfile = libpqrcv_readtimelinehistoryfile,
 	.walrcv_startstreaming = libpqrcv_startstreaming,
@@ -469,6 +471,39 @@ libpqrcv_identify_system(WalReceiverConn *conn, TimeLineID *primary_tli)
 	PQclear(res);
 
 	return primary_sysid;
+}
+
+static int
+libpqrcv_get_adg_primary_thread_count(WalReceiverConn *conn)
+{
+	PGresult   *res;
+	int			thread_count;
+
+	res = libpqrcv_PQexec(conn->streamConn, "SHOW cluster.adg_primary_thread_count");
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		PQclear(res);
+		ereport(ERROR,
+				(errcode(ERRCODE_PROTOCOL_VIOLATION),
+				 errmsg("could not receive ADG primary thread count from primary server: %s",
+						pchomp(PQerrorMessage(conn->streamConn)))));
+	}
+	if (PQnfields(res) != 1 || PQntuples(res) != 1 || PQgetisnull(res, 0, 0))
+	{
+		int			ntuples = PQntuples(res);
+		int			nfields = PQnfields(res);
+
+		PQclear(res);
+		ereport(ERROR,
+				(errcode(ERRCODE_PROTOCOL_VIOLATION),
+				 errmsg("invalid ADG primary thread count response"),
+				 errdetail("Got %d rows and %d fields, expected 1 row and 1 field.",
+						   ntuples, nfields)));
+	}
+	thread_count = pg_strtoint32(PQgetvalue(res, 0, 0));
+	PQclear(res);
+
+	return thread_count;
 }
 
 /*

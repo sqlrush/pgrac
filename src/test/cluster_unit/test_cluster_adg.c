@@ -73,35 +73,6 @@ scn_total_cmp(SCN a, SCN b)
 	return 0;
 }
 
-int
-scn_recovery_cmp(SCN a, XLogRecPtr a_lsn, NodeId a_node, SCN b, XLogRecPtr b_lsn, NodeId b_node)
-{
-	int c = scn_time_cmp(a, b);
-
-	if (c != 0)
-		return c;
-	if (a_lsn < b_lsn)
-		return -1;
-	if (a_lsn > b_lsn)
-		return 1;
-	if (a_node < b_node)
-		return -1;
-	if (a_node > b_node)
-		return 1;
-	return 0;
-}
-
-SCN
-cluster_scn_time_predecessor(SCN scn)
-{
-	NodeId node = scn_node_id(scn);
-	uint64 local = scn_local(scn);
-
-	if (!SCN_NODE_ID_VALID(node) || local == 0)
-		return InvalidScn;
-	return scn_encode(node, local - 1);
-}
-
 static SCN
 S(int node, uint64 local)
 {
@@ -209,84 +180,6 @@ UT_TEST(test_thread_bounds_are_release_checked)
 	UT_ASSERT(cluster_adg_scn_tracker_init(&tracker, 1));
 	UT_ASSERT(!cluster_adg_mark_received(&tracker, 0, 1, 1));
 	UT_ASSERT(!cluster_adg_mark_received(&tracker, 2, 1, 1));
-	UT_ASSERT_EQ(cluster_adg_thread_apply_lag_ms(&tracker, 2, 100), -1);
-}
-
-UT_TEST(test_apply_lag_floor)
-{
-	ClusterAdgScnTracker tracker;
-
-	UT_ASSERT(cluster_adg_scn_tracker_init(&tracker, 1));
-	UT_ASSERT(cluster_adg_mark_applied(&tracker, 1, 10, S(1, 10), 100));
-	UT_ASSERT_EQ((int)cluster_adg_thread_apply_lag_ms(&tracker, 1, 90), 0);
-	UT_ASSERT_EQ((int)cluster_adg_thread_apply_lag_ms(&tracker, 1, 150), 50);
-}
-
-UT_TEST(test_pending_no_pending_uses_current_scn)
-{
-	ClusterAdgPendingCommitRegistry registry;
-
-	cluster_adg_pending_init(&registry);
-	UT_ASSERT_EQ(cluster_adg_thread_safe_scn(&registry, S(1, 100)), S(1, 100));
-}
-
-UT_TEST(test_pending_min_predecessor_and_abort_cleanup)
-{
-	ClusterAdgPendingCommitRegistry registry;
-
-	cluster_adg_pending_init(&registry);
-	UT_ASSERT(cluster_adg_pending_register(&registry, S(3, 120)));
-	UT_ASSERT(cluster_adg_pending_register(&registry, S(2, 80)));
-	UT_ASSERT_EQ(scn_time_cmp(cluster_adg_pending_min_scn(&registry), S(2, 80)), 0);
-	UT_ASSERT_EQ(scn_time_cmp(cluster_adg_thread_safe_scn(&registry, S(1, 200)), S(2, 79)), 0);
-	UT_ASSERT(cluster_adg_pending_clear(&registry, S(2, 80)));
-	UT_ASSERT_EQ(scn_time_cmp(cluster_adg_pending_min_scn(&registry), S(3, 120)), 0);
-	UT_ASSERT(cluster_adg_pending_clear(&registry, S(3, 120)));
-	UT_ASSERT_EQ(cluster_adg_pending_min_scn(&registry), InvalidScn);
-}
-
-UT_TEST(test_pending_predecessor_local_zero_fails_closed)
-{
-	ClusterAdgPendingCommitRegistry registry;
-
-	cluster_adg_pending_init(&registry);
-	UT_ASSERT(cluster_adg_pending_register(&registry, S(3, 0)));
-	UT_ASSERT_EQ(cluster_adg_thread_safe_scn(&registry, S(1, 200)), InvalidScn);
-}
-
-UT_TEST(test_pending_overflow_fails_closed)
-{
-	ClusterAdgPendingCommitRegistry registry;
-	int i;
-
-	cluster_adg_pending_init(&registry);
-	UT_ASSERT(!cluster_adg_pending_register(&registry, InvalidScn));
-	for (i = 0; i < CLUSTER_ADG_PENDING_MAX; i++)
-		UT_ASSERT(cluster_adg_pending_register(&registry, S(1, (uint64)i + 1)));
-	UT_ASSERT(!cluster_adg_pending_register(&registry, S(1, 1000)));
-	UT_ASSERT(registry.overflowed);
-}
-
-UT_TEST(test_apply_master_lease_decisions)
-{
-	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_check(5, 5, true, true, 10, 11),
-				 (int)CLUSTER_ADG_LEASE_VALID);
-	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_check(5, 5, false, true, 10, 11),
-				 (int)CLUSTER_ADG_LEASE_NOT_ATTACHED);
-	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_check(5, 5, true, false, 10, 11),
-				 (int)CLUSTER_ADG_LEASE_NO_QUORUM);
-	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_check(4, 5, true, true, 10, 11),
-				 (int)CLUSTER_ADG_LEASE_TERM_STALE);
-	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_check(5, 5, true, true, 11, 11),
-				 (int)CLUSTER_ADG_LEASE_EXPIRED);
-}
-
-UT_TEST(test_apply_master_term_guard_rejects_publish_when_stale)
-{
-	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_check(9, 10, true, true, 100, 200),
-				 (int)CLUSTER_ADG_LEASE_TERM_STALE);
-	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_check(10, 10, true, false, 100, 200),
-				 (int)CLUSTER_ADG_LEASE_NO_QUORUM);
 }
 
 UT_TEST(test_apply_master_next_term_overflow)
@@ -350,91 +243,67 @@ UT_TEST(test_apply_master_lease_marker_rejects_invalid_fields)
 	UT_ASSERT(!cluster_adg_apply_master_lease_valid(&lease));
 }
 
-UT_TEST(test_streaming_merge_selects_scn_lsn_node_order)
+UT_TEST(test_apply_master_lease_quorum_selects_single_winner)
 {
-	ClusterAdgMergeInput inputs[3];
-	uint16 index = 99;
+	ClusterAdgApplyMasterLease leases[3];
+	bool valid[3] = { true, true, true };
+	ClusterAdgApplyMasterLeaseQuorum result;
 
-	memset(inputs, 0, sizeof(inputs));
-	inputs[0].available = true;
-	inputs[0].scn = S(1, 10);
-	inputs[0].lsn = 50;
-	inputs[0].node = 1;
-	inputs[1].available = true;
-	inputs[1].scn = S(2, 10);
-	inputs[1].lsn = 40;
-	inputs[1].node = 2;
-	inputs[2].available = true;
-	inputs[2].scn = S(0, 9);
-	inputs[2].lsn = 99;
-	inputs[2].node = 0;
-	UT_ASSERT(cluster_adg_streaming_merge_select(inputs, 3, &index));
-	UT_ASSERT_EQ((int)index, 2);
+	cluster_adg_apply_master_lease_init(&leases[0], 7, 1, 1000, 11);
+	cluster_adg_apply_master_lease_init(&leases[1], 7, 1, 1200, 11);
+	cluster_adg_apply_master_lease_init(&leases[2], 7, 2, 1300, 11);
 
-	inputs[2].available = false;
-	UT_ASSERT(cluster_adg_streaming_merge_select(inputs, 3, &index));
-	UT_ASSERT_EQ((int)index, 1);
+	UT_ASSERT(cluster_adg_apply_master_lease_quorum(leases, valid, 3, 2, &result));
+	UT_ASSERT(result.attached);
+	UT_ASSERT_EQ(result.count, 2);
+	UT_ASSERT_EQ(result.durable_term, (uint64)7);
+	UT_ASSERT_EQ(result.owner_node_id, 1);
+	UT_ASSERT_EQ(result.lease_expires_at_ms, (int64)1200);
+	UT_ASSERT_EQ(result.generation, (uint64)11);
 
-	inputs[1].lsn = 50;
-	inputs[1].node = 0;
-	UT_ASSERT(cluster_adg_streaming_merge_select(inputs, 3, &index));
-	UT_ASSERT_EQ((int)index, 1);
+	cluster_adg_apply_master_lease_init(&leases[0], 8, 2, 2000, 12);
+	cluster_adg_apply_master_lease_init(&leases[1], 7, 1, 1200, 11);
+	cluster_adg_apply_master_lease_init(&leases[2], 8, 2, 2100, 12);
+	UT_ASSERT(cluster_adg_apply_master_lease_quorum(leases, valid, 3, 2, &result));
+	UT_ASSERT(result.attached);
+	UT_ASSERT_EQ(result.count, 2);
+	UT_ASSERT_EQ(result.durable_term, (uint64)8);
+	UT_ASSERT_EQ(result.owner_node_id, 2);
+	UT_ASSERT_EQ(result.lease_expires_at_ms, (int64)2100);
+	UT_ASSERT_EQ(result.generation, (uint64)12);
 }
 
-UT_TEST(test_streaming_merge_ignores_unavailable_or_invalid)
+UT_TEST(test_apply_master_lease_quorum_rejects_split_without_majority)
 {
-	ClusterAdgMergeInput inputs[2];
-	uint16 index = 99;
+	ClusterAdgApplyMasterLease leases[3];
+	bool valid[3] = { true, true, true };
+	ClusterAdgApplyMasterLeaseQuorum result;
 
-	memset(inputs, 0, sizeof(inputs));
-	inputs[0].available = true;
-	inputs[0].scn = InvalidScn;
-	inputs[1].available = false;
-	inputs[1].scn = S(1, 10);
-	UT_ASSERT(!cluster_adg_streaming_merge_select(inputs, 2, &index));
+	cluster_adg_apply_master_lease_init(&leases[0], 7, 1, 1000, 11);
+	cluster_adg_apply_master_lease_init(&leases[1], 7, 2, 1000, 11);
+	cluster_adg_apply_master_lease_init(&leases[2], 7, 3, 1000, 11);
+
+	UT_ASSERT(cluster_adg_apply_master_lease_quorum(leases, valid, 3, 2, &result));
+	UT_ASSERT(!result.attached);
+
+	valid[2] = false;
+	UT_ASSERT(cluster_adg_apply_master_lease_quorum(leases, valid, 3, 2, &result));
+	UT_ASSERT(!result.attached);
+	UT_ASSERT(!cluster_adg_apply_master_lease_quorum(leases, valid, 3, 4, &result));
 }
 
 UT_TEST(test_read_only_decision_matrix)
 {
-	UT_ASSERT_EQ((int)cluster_adg_read_only_decide(true, true, S(1, 90), S(2, 100), 5, 10),
+	UT_ASSERT_EQ((int)cluster_adg_read_only_decide(true, true, true, S(2, 100), 5, 10),
 				 (int)CLUSTER_ADG_READ_ALLOW);
-	UT_ASSERT_EQ((int)cluster_adg_read_only_decide(true, true, S(1, 110), S(2, 100), 5, 10),
-				 (int)CLUSTER_ADG_READ_WAIT);
-	UT_ASSERT_EQ((int)cluster_adg_read_only_decide(true, true, S(1, 90), S(2, 100), 11, 10),
+	UT_ASSERT_EQ((int)cluster_adg_read_only_decide(true, true, true, S(2, 100), 11, 10),
 				 (int)CLUSTER_ADG_READ_LAG_EXCESSIVE);
-	UT_ASSERT_EQ((int)cluster_adg_read_only_decide(false, true, S(1, 90), S(2, 100), 5, 10),
+	UT_ASSERT_EQ((int)cluster_adg_read_only_decide(false, true, true, S(2, 100), 5, 10),
 				 (int)CLUSTER_ADG_READ_UNRESOLVABLE);
-	UT_ASSERT_EQ((int)cluster_adg_read_only_decide(true, true, S(1, 90), InvalidScn, 5, 10),
+	UT_ASSERT_EQ((int)cluster_adg_read_only_decide(true, true, false, S(2, 100), 5, 10),
 				 (int)CLUSTER_ADG_READ_UNRESOLVABLE);
-}
-
-UT_TEST(test_standby_conflict_decision_matrix)
-{
-	UT_ASSERT_EQ((int)cluster_adg_standby_conflict_decide(true, true, 0, 1000),
-				 (int)CLUSTER_ADG_CONFLICT_NONE);
-	UT_ASSERT_EQ((int)cluster_adg_standby_conflict_decide(true, true, 999, 1000),
-				 (int)CLUSTER_ADG_CONFLICT_WAIT);
-	UT_ASSERT_EQ((int)cluster_adg_standby_conflict_decide(true, true, 1000, 1000),
-				 (int)CLUSTER_ADG_CONFLICT_CANCEL_READER);
-	UT_ASSERT_EQ((int)cluster_adg_standby_conflict_decide(true, true, 60000, -1),
-				 (int)CLUSTER_ADG_CONFLICT_WAIT);
-	UT_ASSERT_EQ((int)cluster_adg_standby_conflict_decide(false, true, 60000, 1000),
-				 (int)CLUSTER_ADG_CONFLICT_NONE);
-}
-
-UT_TEST(test_overlay_resolve_on_commit_prepared)
-{
-	ClusterTTStatus out_status = CLUSTER_TT_STATUS_UNKNOWN;
-	SCN out_scn = InvalidScn;
-
-	UT_ASSERT(cluster_adg_overlay_resolve_on_commit_prepared(CLUSTER_TT_STATUS_IN_PROGRESS,
-															 S(3, 77), &out_status, &out_scn));
-	UT_ASSERT_EQ((int)out_status, (int)CLUSTER_TT_STATUS_COMMITTED);
-	UT_ASSERT_EQ(scn_time_cmp(out_scn, S(3, 77)), 0);
-	UT_ASSERT(!cluster_adg_overlay_resolve_on_commit_prepared(CLUSTER_TT_STATUS_ABORTED, S(3, 77),
-															  &out_status, &out_scn));
-	UT_ASSERT(!cluster_adg_overlay_resolve_on_commit_prepared(CLUSTER_TT_STATUS_IN_PROGRESS,
-															  InvalidScn, &out_status, &out_scn));
+	UT_ASSERT_EQ((int)cluster_adg_read_only_decide(true, true, true, InvalidScn, 5, 10),
+				 (int)CLUSTER_ADG_READ_UNRESOLVABLE);
 }
 
 UT_TEST(test_thread_barrier_wal_abi)
@@ -443,12 +312,15 @@ UT_TEST(test_thread_barrier_wal_abi)
 
 	memset(&rec, 0, sizeof(rec));
 	rec.thread_id = 4;
+	rec.primary_thread_count = 2;
 	rec.thread_safe_scn = S(3, 99);
 
 	UT_ASSERT_EQ((int)sizeof(xl_cluster_adg_thread_barrier), 16);
+	UT_ASSERT_EQ((int)offsetof(xl_cluster_adg_thread_barrier, primary_thread_count), 2);
 	UT_ASSERT_EQ((int)offsetof(xl_cluster_adg_thread_barrier, thread_safe_scn), 8);
 	UT_ASSERT_EQ((int)(XLOG_CLUSTER_ADG_THREAD_BARRIER & XLR_INFO_MASK), 0);
 	UT_ASSERT_EQ((int)RM_CLUSTER_ADG_ID, (int)(RM_CLUSTER_RAW_LAYOUT_ID + 1));
+	UT_ASSERT_EQ((int)rec.primary_thread_count, 2);
 	UT_ASSERT_EQ((uint64)rec.thread_safe_scn, (uint64)S(3, 99));
 }
 
@@ -475,10 +347,16 @@ UT_TEST(test_mrp_shmem_tracks_term_validity_and_drain)
 					 > (int)offsetof(ClusterMrpSharedState, apply_master_node_id),
 				 1);
 	UT_ASSERT_EQ((int)offsetof(ClusterMrpSharedState, apply_master_term_valid_until_ms)
+					 > (int)offsetof(ClusterMrpSharedState, apply_master_generation),
+				 1);
+	UT_ASSERT_EQ((int)offsetof(ClusterMrpSharedState, apply_master_generation)
 					 > (int)offsetof(ClusterMrpSharedState, apply_master_term),
 				 1);
 	UT_ASSERT_EQ((int)offsetof(ClusterMrpSharedState, apply_master_lost_at_ms)
 					 > (int)offsetof(ClusterMrpSharedState, apply_master_term_valid_until_ms),
+				 1);
+	UT_ASSERT_EQ((int)offsetof(ClusterMrpSharedState, primary_thread_count)
+					 > (int)offsetof(ClusterMrpSharedState, stopped_at_us),
 				 1);
 	UT_ASSERT_EQ((int)offsetof(ClusterMrpSharedState, standby_consistent_scn)
 					 > (int)offsetof(ClusterMrpSharedState, apply_lsn),
@@ -488,7 +366,7 @@ UT_TEST(test_mrp_shmem_tracks_term_validity_and_drain)
 int
 main(void)
 {
-	UT_PLAN(27);
+	UT_PLAN(18);
 
 	UT_RUN(test_tracker_init_bounds);
 	UT_RUN(test_barrier_min_publishes_after_all_threads);
@@ -498,22 +376,13 @@ main(void)
 	UT_RUN(test_barrier_retreat_is_rejected);
 	UT_RUN(test_barrier_not_record_scn_advances_read_floor);
 	UT_RUN(test_thread_bounds_are_release_checked);
-	UT_RUN(test_apply_lag_floor);
-	UT_RUN(test_pending_no_pending_uses_current_scn);
-	UT_RUN(test_pending_min_predecessor_and_abort_cleanup);
-	UT_RUN(test_pending_predecessor_local_zero_fails_closed);
-	UT_RUN(test_pending_overflow_fails_closed);
-	UT_RUN(test_apply_master_lease_decisions);
-	UT_RUN(test_apply_master_term_guard_rejects_publish_when_stale);
 	UT_RUN(test_apply_master_next_term_overflow);
 	UT_RUN(test_apply_master_lease_marker_pack_unpack);
 	UT_RUN(test_apply_master_lease_slot_zero_fills_tail);
 	UT_RUN(test_apply_master_lease_marker_rejects_invalid_fields);
-	UT_RUN(test_streaming_merge_selects_scn_lsn_node_order);
-	UT_RUN(test_streaming_merge_ignores_unavailable_or_invalid);
+	UT_RUN(test_apply_master_lease_quorum_selects_single_winner);
+	UT_RUN(test_apply_master_lease_quorum_rejects_split_without_majority);
 	UT_RUN(test_read_only_decision_matrix);
-	UT_RUN(test_standby_conflict_decision_matrix);
-	UT_RUN(test_overlay_resolve_on_commit_prepared);
 	UT_RUN(test_thread_barrier_wal_abi);
 	UT_RUN(test_standby_reply_trailer_validation);
 	UT_RUN(test_mrp_shmem_tracks_term_validity_and_drain);

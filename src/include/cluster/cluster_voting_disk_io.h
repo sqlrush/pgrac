@@ -106,11 +106,13 @@
 	((off_t)(2 * CLUSTER_MAX_NODES + (node_id)) * CLUSTER_VOTING_SLOT_BYTES)
 
 /*
- * spec-6.4 D7 — ADG Apply Master term/lease region (region 4).  This is an
- * independent 512-byte slot per node and deliberately does NOT reuse
+ * spec-6.4 D7 — ADG Apply Master term/lease region (region 4).  Slot 0 is the
+ * global Apply Master authority slot; the remaining slots are reserved for
+ * format compatibility.  The region deliberately does NOT reuse
  * ClusterVotingSlot._reserved1, which belongs to the write-fence marker and is
  * rewritten by qvotec heartbeats.  Payload = ClusterAdgApplyMasterLease.
  */
+#define CLUSTER_VOTING_APPLY_LEASE_GLOBAL_SLOT 0
 #define CLUSTER_VOTING_APPLY_LEASE_SLOT_OFFSET(node_id)                                            \
 	((off_t)(3 * CLUSTER_MAX_NODES + (node_id)) * CLUSTER_VOTING_SLOT_BYTES)
 #define CLUSTER_VOTING_FILE_BYTES_MIN ((off_t)4 * CLUSTER_MAX_NODES * CLUSTER_VOTING_SLOT_BYTES)
@@ -250,6 +252,10 @@ extern ClusterVotingDiskIoState cluster_voting_disk_read_apply_lease_slot(int fd
 																		  void *out_slot512);
 extern ClusterVotingDiskIoState cluster_voting_disk_write_apply_lease_slot(int fd, uint32 node_id,
 																		   const void *in_slot512);
+extern ClusterVotingDiskIoState cluster_voting_disk_read_apply_lease_global_slot(int fd,
+																				 void *out_slot512);
+extern ClusterVotingDiskIoState
+cluster_voting_disk_write_apply_lease_global_slot(int fd, const void *in_slot512);
 
 #endif /* USE_PGRAC_CLUSTER */
 

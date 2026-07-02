@@ -2153,29 +2153,28 @@ ClusterSnapshotRefreshFields(Snapshot snapshot)
 		SCN			read_scn;
 
 		snapshot->cluster_source = (uint8) SNAPSHOT_SOURCE_CLUSTER;
-			if (cluster_mrp_should_start())
-			{
-				ClusterAdgReadDecision decision;
-				int64		lag_ms;
+		if (cluster_mrp_should_start())
+		{
+			ClusterAdgReadDecision decision;
+			int64		lag_ms;
 
-				read_scn = cluster_mrp_standby_consistent_scn();
-				lag_ms = cluster_mrp_apply_lag_ms();
-				decision = cluster_adg_read_only_decide(cluster_enable_adg, true, read_scn, read_scn,
-														lag_ms,
-														(int64)cluster_adg_lag_threshold_sec * 1000);
-				if (!cluster_mrp_read_service_available())
-					decision = CLUSTER_ADG_READ_UNRESOLVABLE;
-				if (decision == CLUSTER_ADG_READ_UNRESOLVABLE)
-					ereport(ERROR,
-							(errcode(ERRCODE_CLUSTER_ADG_STANDBY_UNRESOLVABLE),
-							 errmsg("ADG standby read point is not available"),
-							 errhint("Wait for the Apply Master to publish "
-									 "standby_consistent_scn before running read-only queries.")));
-				if (decision == CLUSTER_ADG_READ_LAG_EXCESSIVE)
-					ereport(ERROR,
-							(errcode(ERRCODE_CLUSTER_ADG_APPLY_LAG_EXCESSIVE),
-							 errmsg("ADG standby apply lag exceeds the read-only service threshold"),
-							 errdetail("The current apply lag is greater than %d second(s).",
+			read_scn = cluster_mrp_standby_consistent_scn();
+			lag_ms = cluster_mrp_apply_lag_ms();
+			decision = cluster_adg_read_only_decide(cluster_enable_adg, true,
+													cluster_mrp_read_service_available(), read_scn,
+													lag_ms,
+													(int64)cluster_adg_lag_threshold_sec * 1000);
+			if (decision == CLUSTER_ADG_READ_UNRESOLVABLE)
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_ADG_STANDBY_UNRESOLVABLE),
+						 errmsg("ADG standby read point is not available"),
+						 errhint("Wait for the Apply Master to publish "
+								 "standby_consistent_scn before running read-only queries.")));
+			if (decision == CLUSTER_ADG_READ_LAG_EXCESSIVE)
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_ADG_APPLY_LAG_EXCESSIVE),
+						 errmsg("ADG standby apply lag exceeds the read-only service threshold"),
+						 errdetail("The current apply lag is greater than %d second(s).",
 								   cluster_adg_lag_threshold_sec),
 						 errhint("Retry after standby apply catches up or increase "
 								 "cluster.adg_lag_threshold_sec.")));

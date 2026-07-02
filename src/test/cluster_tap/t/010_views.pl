@@ -69,13 +69,12 @@ is($node->safe_psql(
 
 
 # ----------
-# Distinct type count: 13 (10 from spec-0.11 + SharedFs from spec-1.1
-# + StartupPhase from spec-1.10 + BgProc from spec-1.11 Sprint B / 1.11.1 F12).
+# Distinct type count: current cluster wait-event type roster.
 # ----------
 is($node->safe_psql('postgres',
 		'SELECT count(DISTINCT type) FROM pg_stat_cluster_wait_events'),
-	'13',
-	'13 distinct Cluster: * types (added BgProc in spec-1.11 Sprint B)');
+	'14',
+	'14 distinct Cluster: * types');
 
 
 # ----------
@@ -91,7 +90,7 @@ my %expected = (
 	'Cluster: Sinval' => 6,
 	'Cluster: Interconnect' => 7,
 	'Cluster: Undo' => 4,
-	'Cluster: ADG' => 4,
+	'Cluster: ADG' => 2,
 );
 
 for my $type (sort keys %expected)
@@ -108,7 +107,7 @@ for my $type (sort keys %expected)
 # Spot-check 6 event names exist.
 # ----------
 for my $name ('GesEnqueueAcquire', 'PcmBlockReadNS', 'SinvalInjectLocalQueue',
-              'InterconnectRdmaSend', 'ClusterICRdmaFallback', 'AdgScnSyncWait')
+              'InterconnectRdmaSend', 'ClusterICRdmaFallback', 'AdgWalReceiveLag')
 {
 	my $count = $node->safe_psql(
 		'postgres',

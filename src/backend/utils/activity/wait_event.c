@@ -1315,12 +1315,6 @@ pgstat_get_wait_cluster_adg(WaitEventCluster w)
 	case WAIT_EVENT_ADG_WAL_RECEIVE_LAG:
 		event_name = "AdgWalReceiveLag";
 		break;
-	case WAIT_EVENT_ADG_READ_SNAPSHOT_WAIT:
-		event_name = "AdgReadSnapshotWait";
-		break;
-	case WAIT_EVENT_ADG_SCN_SYNC_WAIT:
-		event_name = "AdgScnSyncWait";
-		break;
 	default:
 		break;
 	}

@@ -387,12 +387,8 @@ ClosePtrType
 ClosestMatchState
 Clump
 ClusterAdgApplyMasterLease
-ClusterAdgLeaseDecision
-ClusterAdgMergeInput
-ClusterAdgPendingCommitRegistry
 ClusterAdgReadDecision
 ClusterAdgScnTracker
-ClusterAdgStandbyConflictDecision
 ClusterAdgThreadStatus
 ClusterDgAckMode
 ClusterInfo

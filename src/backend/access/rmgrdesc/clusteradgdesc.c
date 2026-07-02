@@ -37,8 +37,10 @@ cluster_adg_desc(StringInfo buf, XLogReaderState *record)
 			break;
 		}
 
-		appendStringInfo(buf, "thread_id %u thread_safe_scn " UINT64_FORMAT,
-						 (unsigned)rec->thread_id, (uint64)rec->thread_safe_scn);
+			appendStringInfo(buf, "thread_id %u primary_thread_count %u thread_safe_scn "
+								  UINT64_FORMAT,
+							 (unsigned)rec->thread_id, (unsigned)rec->primary_thread_count,
+							 (uint64)rec->thread_safe_scn);
 		break;
 	}
 	default:

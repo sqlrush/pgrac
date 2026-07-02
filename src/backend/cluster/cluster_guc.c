@@ -57,6 +57,7 @@
 #include "cluster/cluster_inject.h"			  /* cluster_injection_assign_hook (stage 0.27) */
 #include "cluster/cluster_pcm_lock.h"		  /* cluster_pcm_grd_max_entries (stage 1.7) */
 #include "cluster/storage/cluster_shared_fs.h" /* ClusterSharedFsBackendId (stage 1.1) */
+#include "cluster/cluster_xlog.h"
 
 
 /*
@@ -89,8 +90,8 @@ int cluster_dg_role = CLUSTER_DG_ROLE_PRIMARY;
 int cluster_dg_mode = CLUSTER_DG_MODE_ASYNC;
 bool cluster_enable_adg = false;
 bool cluster_apply_master_election = true;
+int cluster_adg_primary_thread_count = 0;
 int cluster_adg_lag_threshold_sec = 10;
-int cluster_apply_master_max_lag_ms = 5000;
 int cluster_max_standby_delay = 30;
 int cluster_apply_master_switch_drain_ms = 5000;
 int cluster_adg_barrier_interval_ms = 1000;
@@ -1067,6 +1068,19 @@ cluster_undo_buffer_writeback_check_hook(bool *newval, void **extra, GucSource s
 	return true;
 }
 
+static const char *
+cluster_show_adg_primary_thread_count(void)
+{
+	static char nbuf[16];
+	int count;
+
+	count = cluster_conf_node_count();
+	if (count < 0 || count > CLUSTER_WAL_THREAD_MAX)
+		count = 0;
+	snprintf(nbuf, sizeof(nbuf), "%d", count);
+	return nbuf;
+}
+
 void
 cluster_init_guc(void)
 {
@@ -1312,17 +1326,17 @@ cluster_init_guc(void)
 		&cluster_apply_master_election, true, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
+		"cluster.adg_primary_thread_count", gettext_noop("Primary ADG WAL thread count."),
+		gettext_noop("Read-only replication protocol surface for ADG standby thread discovery."),
+		&cluster_adg_primary_thread_count, 0, 0, CLUSTER_WAL_THREAD_MAX, PGC_INTERNAL,
+		GUC_NOT_IN_SAMPLE | GUC_NO_SHOW_ALL, NULL, NULL, cluster_show_adg_primary_thread_count);
+
+	DefineCustomIntVariable(
 		"cluster.adg_lag_threshold_sec",
 		gettext_noop("ADG apply lag threshold for read-only service errors."),
 		gettext_noop("Standby reads fail with cluster_adg_apply_lag_excessive when the "
 					 "tracked lag exceeds this threshold."),
 		&cluster_adg_lag_threshold_sec, 10, 1, 300, PGC_SIGHUP, GUC_UNIT_S, NULL, NULL, NULL);
-
-	DefineCustomIntVariable("cluster.apply_master_max_lag_ms",
-							gettext_noop("ADG Apply Master lag warning threshold."),
-							gettext_noop("Lag above this value is surfaced by ADG status views."),
-							&cluster_apply_master_max_lag_ms, 5000, 0, 3600000, PGC_SIGHUP,
-							GUC_UNIT_MS, NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
 		"cluster.max_standby_delay",

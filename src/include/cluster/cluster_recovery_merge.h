@@ -239,10 +239,10 @@ cluster_recmerge_heap_pop(ClusterRecmergeHeap *h, ClusterRecmergeHeapEntry *out)
 /*
  * Streaming mode selector for spec-6.4 ADG MRP.
  *
- * Heartbeats only prove stream liveness; they are deliberately ignored as
- * ordering/read-floor evidence.  A caller gets RECORD_READY only when at least
- * one concrete WAL record is available.
- */
+	 * Heartbeats prove that a stream has no earlier concrete head for this round.
+	 * A caller gets RECORD_READY only when every input has either a concrete
+	 * record head or a heartbeat, and at least one concrete record is available.
+	 */
 static inline ClusterRecmergeStreamingDecision
 cluster_recmerge_streaming_select(const ClusterRecmergeStreamingInput *inputs, int ninputs,
 								  int *stream_out, ClusterRecmergeKey *key_out)
@@ -257,8 +257,11 @@ cluster_recmerge_streaming_select(const ClusterRecmergeStreamingInput *inputs, i
 
 	cluster_recmerge_heap_init(&h);
 	for (i = 0; i < ninputs; i++) {
-		if (!inputs[i].record_available)
+		if (!inputs[i].record_available) {
+			if (!inputs[i].heartbeat_seen)
+				return CLUSTER_RECMERGE_STREAMING_NO_RECORD;
 			continue;
+		}
 		cluster_recmerge_heap_push(&h, inputs[i].key, i);
 	}
 
@@ -303,6 +306,13 @@ extern ClusterRecoveryMergeState *cluster_recovery_merge_begin(const uint64 merg
 															   uint16 own_thread, TimeLineID tli);
 extern struct XLogReaderState *cluster_recovery_merge_next(ClusterRecoveryMergeState *st,
 														   uint16 *thread_out, char **errmsg_out);
+extern ClusterRecoveryMergeState *
+cluster_recovery_merge_streaming_begin(const uint64 merge_bitmap[2], const XLogRecPtr *start_lsn,
+									   TimeLineID tli);
+extern struct XLogReaderState *cluster_recovery_merge_streaming_next(ClusterRecoveryMergeState *st,
+																	 const XLogRecPtr *receive_lsn,
+																	 uint16 *thread_out,
+																	 char **errmsg_out);
 extern void cluster_recovery_merge_end(ClusterRecoveryMergeState *st);
 
 /* §3.3b/§3.3d window (startup-process scoped).  enter/leave bracket the

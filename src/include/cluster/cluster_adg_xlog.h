@@ -31,7 +31,7 @@ StaticAssertDecl((XLOG_CLUSTER_ADG_THREAD_BARRIER & XLR_INFO_MASK) == 0,
 
 typedef struct xl_cluster_adg_thread_barrier {
 	uint16 thread_id;
-	uint16 _pad16;
+	uint16 primary_thread_count;
 	uint32 _pad32;
 	SCN thread_safe_scn;
 } xl_cluster_adg_thread_barrier;
@@ -40,6 +40,8 @@ StaticAssertDecl(sizeof(xl_cluster_adg_thread_barrier) == 16,
 				 "xl_cluster_adg_thread_barrier WAL ABI lock");
 StaticAssertDecl(offsetof(xl_cluster_adg_thread_barrier, thread_safe_scn) == 8,
 				 "xl_cluster_adg_thread_barrier.thread_safe_scn offset changed");
+StaticAssertDecl(offsetof(xl_cluster_adg_thread_barrier, primary_thread_count) == 2,
+				 "xl_cluster_adg_thread_barrier.primary_thread_count offset changed");
 
 extern XLogRecPtr cluster_adg_emit_thread_barrier(void);
 extern void cluster_adg_redo(XLogReaderState *record);

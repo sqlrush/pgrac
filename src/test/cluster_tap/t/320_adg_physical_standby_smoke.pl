@@ -4,9 +4,9 @@
 #    spec-6.4 ADG physical standby smoke coverage.
 #
 #    This is intentionally a small two-postmaster physical streaming test:
-#    primary emits ADG thread barriers, standby runs B_MRP with
-#    cluster.apply_master_election=off (single-node test lease), replays the
-#    stream, exposes pg_stat_cluster_adg, and serves read-only queries after
+#    primary emits ADG thread barriers, standby runs B_MRP with a real
+#    durable apply-master lease on voting disks, replays the stream, exposes
+#    pg_stat_cluster_adg, and serves read-only queries after
 #    standby_consistent_scn is published.
 #
 #    Coverage:
@@ -28,6 +28,7 @@
 use strict;
 use warnings;
 
+use File::Path qw(make_path);
 use FindBin;
 use lib "$FindBin::RealBin/../lib";
 
@@ -88,14 +89,41 @@ $primary->backup($backup_name);
 
 my $standby = PgracClusterNode->new('adg_standby');
 $standby->init_from_backup($primary, $backup_name, has_streaming => 1);
+
+my $wal_threads_root = PostgreSQL::Test::Utils::tempdir();
+my $standby_thread_dir = "$wal_threads_root/thread_1";
+my $primary_thread_dir = "$wal_threads_root/thread_8";
+my $standby_pg_wal = $standby->data_dir . '/pg_wal';
+make_path($wal_threads_root);
+rename $standby_pg_wal, $standby_thread_dir
+  or die "rename $standby_pg_wal to $standby_thread_dir: $!";
+symlink $standby_thread_dir, $standby_pg_wal
+  or die "symlink $standby_pg_wal -> $standby_thread_dir: $!";
+make_path($primary_thread_dir);
+
+my $disk_dir = PostgreSQL::Test::Utils::tempdir();
+my @voting_disks;
+for my $i (0 .. 2)
+{
+	my $path = "$disk_dir/disk$i";
+	open(my $fh, '>', $path) or die "open $path: $!";
+	binmode $fh;
+	print $fh ("\0" x 262144);
+	close $fh;
+	push @voting_disks, $path;
+}
+my $voting_disks_csv = join(',', @voting_disks);
+
 $standby->append_conf('postgresql.conf', qq{
 primary_slot_name = 'adg_s1'
-cluster.node_id = 11
+cluster.node_id = 0
 cluster.allow_single_node = on
 cluster.dg_role = standby
 cluster.dg_mode = max_availability
 cluster.enable_adg = on
-cluster.apply_master_election = off
+cluster.wal_threads_dir = '$wal_threads_root'
+cluster.apply_master_election = on
+cluster.voting_disks = '$voting_disks_csv'
 max_prepared_transactions = 10
 });
 $standby->start;
@@ -104,6 +132,8 @@ $primary->wait_for_catchup($standby);
 
 $primary->safe_psql('postgres', q{INSERT INTO adg_smoke SELECT generate_series(1, 3)});
 $primary->wait_for_catchup($standby);
+ok(-s "$primary_thread_dir/000000010000000000000003",
+	'RFS lands received WAL into the standby per-thread directory');
 
 poll_psql_value($standby, q{SELECT count(*) FROM adg_smoke}, '3',
 	'L1 ADG standby serves read-only query after physical replay');
@@ -121,11 +151,12 @@ poll_psql_value(
 	$standby,
 	q{
 	SELECT dg_role, dg_mode, adg_enabled, mrp_status, apply_master_node_id,
-	       apply_master_term > 0, standby_consistent_scn > 0, lag_bytes >= 0,
+	       apply_master_term > 0, receive_lsn IS NOT NULL,
+	       apply_lsn IS NOT NULL, standby_consistent_scn > 0, lag_bytes >= 0,
 	       lag_seconds >= 0, apply_rate_bytes_per_sec >= 0
 	  FROM pg_stat_cluster_adg
 	},
-	'standby|max_availability|t|ready|11|t|t|t|t|t',
+	'standby|max_availability|t|ready|0|t|t|t|t|t|t|t',
 	'L2 pg_stat_cluster_adg reports MRP lease, SCN floor, and lag metrics');
 
 poll_psql_value(
@@ -135,7 +166,7 @@ poll_psql_value(
 	       bool_and(adg_enabled), bool_and(standby_consistent_scn > 0)
 	  FROM pg_stat_gcluster_adg
 	},
-	'1|11|t|t|t',
+	'1|0|t|t|t',
 	'L3 pg_stat_gcluster_adg exposes enabled ADG standby state');
 
 my $scn_before_2pc = poll_psql_value($standby,

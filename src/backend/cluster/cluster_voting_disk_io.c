@@ -591,4 +591,18 @@ cluster_voting_disk_write_apply_lease_slot(int fd, uint32 node_id, const void *i
 	return CLUSTER_VOTING_DISK_IO_OK;
 }
 
+ClusterVotingDiskIoState
+cluster_voting_disk_read_apply_lease_global_slot(int fd, void *out_slot512)
+{
+	return cluster_voting_disk_read_apply_lease_slot(fd, CLUSTER_VOTING_APPLY_LEASE_GLOBAL_SLOT,
+													 out_slot512);
+}
+
+ClusterVotingDiskIoState
+cluster_voting_disk_write_apply_lease_global_slot(int fd, const void *in_slot512)
+{
+	return cluster_voting_disk_write_apply_lease_slot(fd, CLUSTER_VOTING_APPLY_LEASE_GLOBAL_SLOT,
+													  in_slot512);
+}
+
 #endif /* USE_PGRAC_CLUSTER */

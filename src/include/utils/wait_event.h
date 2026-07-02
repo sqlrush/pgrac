@@ -478,11 +478,9 @@ typedef enum {
 	WAIT_EVENT_CLUSTER_UNDO_BUF_FLUSH,	  /* spec-3.18 D7: undo buffer write-back I/O */
 	WAIT_EVENT_CLUSTER_UNDO_EXTENT_CLAIM, /* spec-3.18 D7: extent claim autoextend I/O */
 
-	/* Cluster: ADG (4 events) -- #95 */
+	/* Cluster: ADG (2 events) -- spec-6.4 ADG physical standby */
 	WAIT_EVENT_ADG_MRP_APPLY_WAIT = PG_WAIT_CLUSTER_ADG,
 	WAIT_EVENT_ADG_WAL_RECEIVE_LAG,
-	WAIT_EVENT_ADG_READ_SNAPSHOT_WAIT,
-	WAIT_EVENT_ADG_SCN_SYNC_WAIT,
 
 	/* Cluster: SharedFs (12 events) -- spec-1.1 + spec-6.0a */
 	WAIT_EVENT_CLUSTER_SHARED_FS_READ = PG_WAIT_CLUSTER_SHAREDFS,

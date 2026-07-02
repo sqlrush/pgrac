@@ -46,6 +46,8 @@
  */
 #include "postgres.h"
 
+#include <stdarg.h>
+
 #include "cluster/cluster_conf.h" /* ClusterConf type for the D2b latch stub */
 #include "cluster/cluster_guc.h"
 
@@ -164,6 +166,24 @@ char *GUC_check_errdetail_string = NULL;
  * test, so these are link-only stubs.
  */
 ClusterConf *ClusterConfShmem = NULL;
+
+int
+cluster_conf_node_count(void)
+{
+	return 2;
+}
+
+int
+pg_snprintf(char *str, size_t count, const char *fmt, ...)
+{
+	int ret;
+	va_list args;
+
+	va_start(args, fmt);
+	ret = vsnprintf(str, count, fmt, args);
+	va_end(args);
+	return ret;
+}
 
 bool
 errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
@@ -343,7 +363,6 @@ UT_TEST(test_cluster_adg_guc_defaults)
 	UT_ASSERT_EQ((int)cluster_enable_adg, 0);
 	UT_ASSERT_EQ((int)cluster_apply_master_election, 1);
 	UT_ASSERT_EQ(cluster_adg_lag_threshold_sec, 10);
-	UT_ASSERT_EQ(cluster_apply_master_max_lag_ms, 5000);
 	UT_ASSERT_EQ(cluster_max_standby_delay, 30);
 	UT_ASSERT_EQ(cluster_apply_master_switch_drain_ms, 5000);
 	UT_ASSERT_EQ(cluster_adg_barrier_interval_ms, 1000);

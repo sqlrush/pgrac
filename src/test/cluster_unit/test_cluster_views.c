@@ -38,6 +38,7 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_apply_master_election.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_mrp.h"
 #include "cluster/cluster_views.h"
@@ -141,6 +142,18 @@ const char *
 cluster_mrp_state_to_string(ClusterMrpState state pg_attribute_unused())
 {
 	return "disabled";
+}
+
+uint64
+cluster_apply_master_current_term(void)
+{
+	return 0;
+}
+
+uint32
+cluster_apply_master_current_node_id(void)
+{
+	return UINT32_MAX;
 }
 
 /*
@@ -254,16 +267,16 @@ UT_TEST(test_first_event_is_ges_enqueue_acquire)
 }
 
 
-UT_TEST(test_adg_scn_sync_wait_in_adg_class)
+UT_TEST(test_adg_wal_receive_lag_in_adg_class)
 {
 	/*
-	 * Class-membership anchor: WAIT_EVENT_ADG_SCN_SYNC_WAIT must sit in
+	 * Class-membership anchor: WAIT_EVENT_ADG_WAL_RECEIVE_LAG must sit in
 	 * the ADG class regardless of where the enum tail moves over time.
 	 * (spec-2.5 D8 appended ClusterBgProcCssdMainLoop and spec-2.6 D11
 	 * appended 3 more entries past it, so this is no longer the last
 	 * enum value — it is still a stable anchor for the ADG class.)
 	 */
-	UT_ASSERT_EQ(((uint32)WAIT_EVENT_ADG_SCN_SYNC_WAIT) & 0xFF000000U, PG_WAIT_CLUSTER_ADG);
+	UT_ASSERT_EQ(((uint32)WAIT_EVENT_ADG_WAL_RECEIVE_LAG) & 0xFF000000U, PG_WAIT_CLUSTER_ADG);
 }
 
 
@@ -275,7 +288,7 @@ main(void)
 	UT_RUN(test_srf_symbol_linkable);
 	UT_RUN(test_adg_srf_symbol_linkable);
 	UT_RUN(test_first_event_is_ges_enqueue_acquire);
-	UT_RUN(test_adg_scn_sync_wait_in_adg_class);
+	UT_RUN(test_adg_wal_receive_lag_in_adg_class);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

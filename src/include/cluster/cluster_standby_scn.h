@@ -24,7 +24,7 @@
 extern void cluster_standby_scn_mark_received(uint16 thread_id, XLogRecPtr receive_lsn);
 extern void cluster_standby_scn_mark_applied(uint16 thread_id, XLogRecPtr apply_lsn);
 extern void cluster_standby_scn_apply_barrier(uint16 thread_id, XLogRecPtr barrier_lsn,
-											  SCN thread_safe_scn);
+											  SCN thread_safe_scn, uint16 primary_thread_count);
 extern SCN cluster_standby_scn_consistent_scn(void);
 
 #endif /* USE_PGRAC_CLUSTER */

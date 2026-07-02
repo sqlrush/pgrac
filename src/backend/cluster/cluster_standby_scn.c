@@ -33,9 +33,10 @@ cluster_standby_scn_mark_applied(uint16 thread_id, XLogRecPtr apply_lsn)
 }
 
 void
-cluster_standby_scn_apply_barrier(uint16 thread_id, XLogRecPtr barrier_lsn, SCN thread_safe_scn)
+cluster_standby_scn_apply_barrier(uint16 thread_id, XLogRecPtr barrier_lsn, SCN thread_safe_scn,
+								  uint16 primary_thread_count)
 {
-	cluster_mrp_apply_thread_barrier(thread_id, barrier_lsn, thread_safe_scn);
+	cluster_mrp_apply_thread_barrier(thread_id, barrier_lsn, thread_safe_scn, primary_thread_count);
 }
 
 SCN

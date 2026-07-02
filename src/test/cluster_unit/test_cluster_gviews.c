@@ -35,6 +35,7 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_apply_master_election.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_mrp.h"
 #include "cluster/cluster_views.h"
@@ -132,6 +133,18 @@ const char *
 cluster_mrp_state_to_string(ClusterMrpState state pg_attribute_unused())
 {
 	return "disabled";
+}
+
+uint64
+cluster_apply_master_current_term(void)
+{
+	return 0;
+}
+
+uint32
+cluster_apply_master_current_node_id(void)
+{
+	return UINT32_MAX;
 }
 
 /*

@@ -310,6 +310,7 @@ UT_TEST(test_io_8_apply_lease_region_round_trip)
 	char *path = make_temp_path("adglease");
 	int fd;
 	uint8 in[CLUSTER_VOTING_SLOT_BYTES];
+	uint8 other[CLUSTER_VOTING_SLOT_BYTES];
 	uint8 out[CLUSTER_VOTING_SLOT_BYTES];
 	ClusterVotingDiskIoState rc;
 	uint32 i;
@@ -318,15 +319,29 @@ UT_TEST(test_io_8_apply_lease_region_round_trip)
 	UT_ASSERT(fd >= 0);
 
 	memset(in, 0, sizeof(in));
+	memset(other, 0, sizeof(other));
 	memset(out, 0, sizeof(out));
-	for (i = 0; i < sizeof(in); i++)
+	for (i = 0; i < sizeof(in); i++) {
 		in[i] = (uint8)(i ^ 0x5A);
+		other[i] = (uint8)(i ^ 0xA5);
+	}
 
-	rc = cluster_voting_disk_write_apply_lease_slot(fd, 2, in);
+	rc = cluster_voting_disk_write_apply_lease_global_slot(fd, in);
 	UT_ASSERT_EQ(rc, CLUSTER_VOTING_DISK_IO_OK);
-	rc = cluster_voting_disk_read_apply_lease_slot(fd, 2, out);
+	rc = cluster_voting_disk_read_apply_lease_global_slot(fd, out);
 	UT_ASSERT_EQ(rc, CLUSTER_VOTING_DISK_IO_OK);
 	UT_ASSERT_EQ(memcmp(in, out, sizeof(in)), 0);
+
+	rc = cluster_voting_disk_write_apply_lease_slot(fd, 2, other);
+	UT_ASSERT_EQ(rc, CLUSTER_VOTING_DISK_IO_OK);
+	memset(out, 0, sizeof(out));
+	rc = cluster_voting_disk_read_apply_lease_global_slot(fd, out);
+	UT_ASSERT_EQ(rc, CLUSTER_VOTING_DISK_IO_OK);
+	UT_ASSERT_EQ(memcmp(in, out, sizeof(in)), 0);
+	memset(out, 0, sizeof(out));
+	rc = cluster_voting_disk_read_apply_lease_slot(fd, 2, out);
+	UT_ASSERT_EQ(rc, CLUSTER_VOTING_DISK_IO_OK);
+	UT_ASSERT_EQ(memcmp(other, out, sizeof(other)), 0);
 
 	memset(out, 0, sizeof(out));
 	rc = cluster_voting_disk_read_apply_lease_slot(fd, CLUSTER_MAX_NODES, out);

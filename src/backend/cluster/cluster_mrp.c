@@ -32,6 +32,7 @@
 #include "cluster/cluster_voting_disk_io.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
+#include "port/pg_bitutils.h"
 #include "postmaster/interrupt.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
@@ -45,6 +46,7 @@
 #define MRP_IDLE_TIMEOUT_MS 100
 #define MRP_APPLY_LEASE_MIN_MS 1000
 #define MRP_APPLY_MASTER_NONE UINT32_MAX
+#define MRP_THREAD_BITMAP_WORDS 2
 
 static ClusterMrpSharedState *cluster_mrp_state = NULL;
 static int cluster_mrp_voting_fds[CLUSTER_MAX_VOTING_DISKS];
@@ -64,12 +66,6 @@ typedef struct ClusterMrpLeaseScan {
 	int64 lease_expires_at_ms;
 	uint64 generation;
 } ClusterMrpLeaseScan;
-
-typedef struct ClusterMrpLeaseCandidate {
-	bool valid;
-	int count;
-	ClusterAdgApplyMasterLease lease;
-} ClusterMrpLeaseCandidate;
 
 static const ClusterShmemRegion cluster_mrp_region = {
 	.name = "pgrac cluster mrp",
@@ -104,6 +100,91 @@ cluster_mrp_apply_lease_renew_interval_ms(void)
 {
 	return Max(MRP_IDLE_TIMEOUT_MS,
 			   Min(cluster_mrp_apply_lease_duration_ms() / 2, MRP_APPLY_LEASE_MIN_MS));
+}
+
+static bool
+cluster_mrp_valid_real_thread_id(uint16 thread_id)
+{
+	return thread_id >= XLP_THREAD_ID_FIRST_REAL && thread_id <= CLUSTER_WAL_THREAD_MAX;
+}
+
+static void
+cluster_mrp_mark_primary_thread_observed(uint16 thread_id)
+{
+	uint16 bit;
+	uint16 word;
+	uint64 mask;
+
+	if (cluster_mrp_state == NULL || !cluster_mrp_valid_real_thread_id(thread_id))
+		return;
+
+	bit = thread_id - XLP_THREAD_ID_FIRST_REAL;
+	word = bit / 64;
+	if (word >= MRP_THREAD_BITMAP_WORDS)
+		return;
+	mask = UINT64CONST(1) << (bit % 64);
+	pg_atomic_fetch_or_u64(&cluster_mrp_state->primary_thread_bitmap[word], mask);
+}
+
+static bool
+cluster_mrp_primary_thread_observed(uint16 thread_id)
+{
+	uint16 bit;
+	uint16 word;
+	uint64 mask;
+
+	if (cluster_mrp_state == NULL || !cluster_mrp_valid_real_thread_id(thread_id))
+		return false;
+
+	bit = thread_id - XLP_THREAD_ID_FIRST_REAL;
+	word = bit / 64;
+	if (word >= MRP_THREAD_BITMAP_WORDS)
+		return false;
+	mask = UINT64CONST(1) << (bit % 64);
+	return (pg_atomic_read_u64(&cluster_mrp_state->primary_thread_bitmap[word]) & mask) != 0;
+}
+
+static int
+cluster_mrp_primary_thread_count(void)
+{
+	uint32 count;
+
+	if (cluster_mrp_state == NULL)
+		return 0;
+	count = pg_atomic_read_u32(&cluster_mrp_state->primary_thread_count);
+	if (count == 0 || count > CLUSTER_WAL_THREAD_MAX)
+		return 0;
+	return (int)count;
+}
+
+static int
+cluster_mrp_observed_primary_thread_count(void)
+{
+	int count = 0;
+
+	if (cluster_mrp_state == NULL)
+		return 0;
+
+	for (int i = 0; i < MRP_THREAD_BITMAP_WORDS; i++)
+		count += pg_popcount64(pg_atomic_read_u64(&cluster_mrp_state->primary_thread_bitmap[i]));
+	return count;
+}
+
+void
+cluster_mrp_note_primary_thread_count(uint16 primary_thread_count)
+{
+	uint32 old_count;
+
+	if (cluster_mrp_state == NULL || primary_thread_count == 0
+		|| primary_thread_count > CLUSTER_WAL_THREAD_MAX)
+		return;
+
+	old_count = pg_atomic_read_u32(&cluster_mrp_state->primary_thread_count);
+	while (old_count < primary_thread_count) {
+		if (pg_atomic_compare_exchange_u32(&cluster_mrp_state->primary_thread_count, &old_count,
+										   primary_thread_count))
+			break;
+	}
 }
 
 static void
@@ -226,37 +307,20 @@ cluster_mrp_clear_apply_master(void)
 	pg_atomic_write_u32(&cluster_mrp_state->apply_master_term_valid, 0);
 	pg_atomic_write_u32(&cluster_mrp_state->apply_master_node_id, MRP_APPLY_MASTER_NONE);
 	pg_atomic_write_u64(&cluster_mrp_state->apply_master_term, 0);
+	pg_atomic_write_u64(&cluster_mrp_state->apply_master_generation, 0);
 	pg_atomic_write_u64(&cluster_mrp_state->apply_master_term_valid_until_ms, 0);
 	pg_atomic_write_u64(&cluster_mrp_state->apply_master_lost_at_ms, (uint64)now_ms);
-}
-
-static bool
-cluster_mrp_lease_newer(const ClusterAdgApplyMasterLease *a, const ClusterAdgApplyMasterLease *b)
-{
-	if (a->term != b->term)
-		return a->term > b->term;
-	if (a->generation != b->generation)
-		return a->generation > b->generation;
-	return a->owner_node_id < b->owner_node_id;
-}
-
-static bool
-cluster_mrp_lease_same(const ClusterAdgApplyMasterLease *a, const ClusterAdgApplyMasterLease *b)
-{
-	return a->term == b->term && a->generation == b->generation
-		   && a->owner_node_id == b->owner_node_id;
 }
 
 static void
 cluster_mrp_publish_apply_master(uint32 owner_node_id, uint64 term, uint64 generation,
 								 int64 lease_expires_at_ms)
 {
-	(void)generation;
-
 	if (cluster_mrp_state == NULL)
 		return;
 	pg_atomic_write_u32(&cluster_mrp_state->apply_master_node_id, owner_node_id);
 	pg_atomic_write_u64(&cluster_mrp_state->apply_master_term, term);
+	pg_atomic_write_u64(&cluster_mrp_state->apply_master_generation, generation);
 	pg_atomic_write_u64(&cluster_mrp_state->apply_master_term_valid_until_ms,
 						(uint64)lease_expires_at_ms);
 	pg_atomic_write_u64(&cluster_mrp_state->apply_master_lost_at_ms, 0);
@@ -267,15 +331,17 @@ static bool
 cluster_mrp_apply_lease_scan(ClusterMrpLeaseScan *scan)
 {
 	int disk;
-	ClusterMrpLeaseCandidate candidates[CLUSTER_MAX_VOTING_DISKS * CLUSTER_MAX_NODES];
-	int candidate_count = 0;
+	ClusterAdgApplyMasterLease leases[CLUSTER_MAX_VOTING_DISKS];
+	bool valid[CLUSTER_MAX_VOTING_DISKS];
+	ClusterAdgApplyMasterLeaseQuorum result;
 
 	if (scan == NULL)
 		return false;
 
 	memset(scan, 0, sizeof(*scan));
 	scan->owner_node_id = -1;
-	memset(candidates, 0, sizeof(candidates));
+	memset(leases, 0, sizeof(leases));
+	memset(valid, 0, sizeof(valid));
 
 	cluster_mrp_open_voting_disks();
 	scan->disks_total = cluster_mrp_voting_disk_count;
@@ -284,74 +350,30 @@ cluster_mrp_apply_lease_scan(ClusterMrpLeaseScan *scan)
 	scan->quorum = scan->disks_total / 2 + 1;
 
 	for (disk = 0; disk < cluster_mrp_voting_disk_count; disk++) {
-		bool disk_ok = false;
-		uint32 node_id;
+		uint8 slot[CLUSTER_VOTING_SLOT_BYTES];
 
-		for (node_id = 0; node_id < CLUSTER_MAX_NODES; node_id++) {
-			uint8 slot[CLUSTER_VOTING_SLOT_BYTES];
-			ClusterAdgApplyMasterLease lease;
+		if (cluster_voting_disk_read_apply_lease_global_slot(cluster_mrp_voting_fds[disk], slot)
+			!= CLUSTER_VOTING_DISK_IO_OK)
+			continue;
 
-			if (cluster_voting_disk_read_apply_lease_slot(cluster_mrp_voting_fds[disk], node_id,
-														  slot)
-				!= CLUSTER_VOTING_DISK_IO_OK)
-				continue;
-
-			disk_ok = true;
-			if (!cluster_adg_apply_master_lease_unpack(slot, &lease))
-				continue;
-			if (lease.owner_node_id >= CLUSTER_MAX_NODES)
-				continue;
-
-			for (int i = 0; i < candidate_count; i++) {
-				if (!cluster_mrp_lease_same(&lease, &candidates[i].lease))
-					continue;
-				candidates[i].count++;
-				if (lease.lease_expires_at_ms > candidates[i].lease.lease_expires_at_ms)
-					candidates[i].lease.lease_expires_at_ms = lease.lease_expires_at_ms;
-				goto next_lease;
-			}
-			if (candidate_count < lengthof(candidates)) {
-				candidates[candidate_count].valid = true;
-				candidates[candidate_count].count = 1;
-				candidates[candidate_count].lease = lease;
-				candidate_count++;
-			}
-		next_lease:;
-		}
-
-		if (disk_ok)
-			scan->disks_ok++;
+		scan->disks_ok++;
+		valid[disk] = cluster_adg_apply_master_lease_unpack(slot, &leases[disk]);
+		if (valid[disk] && leases[disk].owner_node_id >= CLUSTER_MAX_NODES)
+			valid[disk] = false;
 	}
 
 	if (scan->disks_ok < scan->quorum)
 		return false;
 
-	for (int i = 0; i < candidate_count; i++) {
-		ClusterMrpLeaseCandidate *candidate = &candidates[i];
-
-		if (!candidate->valid || candidate->count < scan->quorum)
-			continue;
-		if (!scan->attached) {
-			scan->attached = true;
-			scan->durable_term = candidate->lease.term;
-			scan->owner_node_id = candidate->lease.owner_node_id;
-			scan->lease_expires_at_ms = candidate->lease.lease_expires_at_ms;
-			scan->generation = candidate->lease.generation;
-		} else {
-			ClusterAdgApplyMasterLease current_best;
-
-			memset(&current_best, 0, sizeof(current_best));
-			current_best.term = scan->durable_term;
-			current_best.owner_node_id = scan->owner_node_id;
-			current_best.lease_expires_at_ms = scan->lease_expires_at_ms;
-			current_best.generation = scan->generation;
-			if (cluster_mrp_lease_newer(&candidate->lease, &current_best)) {
-				scan->durable_term = candidate->lease.term;
-				scan->owner_node_id = candidate->lease.owner_node_id;
-				scan->lease_expires_at_ms = candidate->lease.lease_expires_at_ms;
-				scan->generation = candidate->lease.generation;
-			}
-		}
+	if (!cluster_adg_apply_master_lease_quorum(leases, valid, cluster_mrp_voting_disk_count,
+											   scan->quorum, &result))
+		return false;
+	if (result.attached) {
+		scan->attached = true;
+		scan->durable_term = result.durable_term;
+		scan->owner_node_id = result.owner_node_id;
+		scan->lease_expires_at_ms = result.lease_expires_at_ms;
+		scan->generation = result.generation;
 	}
 
 	return true;
@@ -374,8 +396,7 @@ cluster_mrp_apply_lease_write(uint64 term, int64 lease_expires_at_ms, uint64 gen
 		return false;
 
 	for (i = 0; i < cluster_mrp_voting_disk_count; i++) {
-		if (cluster_voting_disk_write_apply_lease_slot(cluster_mrp_voting_fds[i],
-													   (uint32)cluster_node_id, slot)
+		if (cluster_voting_disk_write_apply_lease_global_slot(cluster_mrp_voting_fds[i], slot)
 			== CLUSTER_VOTING_DISK_IO_OK)
 			success++;
 	}
@@ -388,6 +409,7 @@ cluster_mrp_shared_apply_master_term_valid(int64 now_ms)
 {
 	uint32 owner_node_id;
 	uint64 term;
+	uint64 generation;
 	uint32 valid;
 	uint64 valid_until_ms;
 
@@ -397,9 +419,10 @@ cluster_mrp_shared_apply_master_term_valid(int64 now_ms)
 	valid = pg_atomic_read_u32(&cluster_mrp_state->apply_master_term_valid);
 	owner_node_id = pg_atomic_read_u32(&cluster_mrp_state->apply_master_node_id);
 	term = pg_atomic_read_u64(&cluster_mrp_state->apply_master_term);
+	generation = pg_atomic_read_u64(&cluster_mrp_state->apply_master_generation);
 	valid_until_ms = pg_atomic_read_u64(&cluster_mrp_state->apply_master_term_valid_until_ms);
 	if (!SCN_NODE_ID_VALID(cluster_node_id) || owner_node_id != (uint32)cluster_node_id || term == 0
-		|| valid == 0)
+		|| generation == 0 || valid == 0)
 		return false;
 	if (valid_until_ms != 0 && now_ms >= (int64)valid_until_ms)
 		return false;
@@ -419,6 +442,7 @@ cluster_mrp_read_service_available(void)
 {
 	uint32 valid;
 	uint64 term;
+	uint64 generation;
 	uint64 valid_until_ms;
 	uint64 lost_at_ms;
 	int64 now_ms;
@@ -431,8 +455,10 @@ cluster_mrp_read_service_available(void)
 	now_ms = cluster_mrp_now_ms();
 	valid = pg_atomic_read_u32(&cluster_mrp_state->apply_master_term_valid);
 	term = pg_atomic_read_u64(&cluster_mrp_state->apply_master_term);
+	generation = pg_atomic_read_u64(&cluster_mrp_state->apply_master_generation);
 	valid_until_ms = pg_atomic_read_u64(&cluster_mrp_state->apply_master_term_valid_until_ms);
-	if (valid != 0 && term != 0 && valid_until_ms != 0 && now_ms < (int64)valid_until_ms)
+	if (valid != 0 && term != 0 && generation != 0 && valid_until_ms != 0
+		&& now_ms < (int64)valid_until_ms)
 		return true;
 
 	lost_at_ms = pg_atomic_read_u64(&cluster_mrp_state->apply_master_lost_at_ms);
@@ -447,14 +473,13 @@ cluster_mrp_compute_consistent_scn(void)
 {
 	int expected_threads;
 	int observed_threads = 0;
-	bool have_any_barrier = false;
-	SCN min_scn = InvalidScn;
+	ClusterAdgScnTracker tracker;
 	uint16 thread_id;
 
-	expected_threads = cluster_conf_node_count();
-	if (expected_threads <= 0)
-		expected_threads = 1;
-	if (expected_threads > CLUSTER_WAL_THREAD_MAX)
+	expected_threads = cluster_mrp_primary_thread_count();
+	if (expected_threads <= 0 || expected_threads > CLUSTER_WAL_THREAD_MAX)
+		return InvalidScn;
+	if (!cluster_adg_scn_tracker_init(&tracker, CLUSTER_WAL_THREAD_MAX))
 		return InvalidScn;
 
 	for (thread_id = XLP_THREAD_ID_FIRST_REAL; thread_id <= CLUSTER_WAL_THREAD_MAX; thread_id++) {
@@ -463,6 +488,9 @@ cluster_mrp_compute_consistent_scn(void)
 		uint64 apply_lsn;
 		uint64 barrier_lsn;
 		bool observed;
+
+		if (!cluster_mrp_primary_thread_observed(thread_id))
+			continue;
 
 		receive_lsn = pg_atomic_read_u64(&cluster_mrp_state->thread_receive_lsn[thread_id]);
 		apply_lsn = pg_atomic_read_u64(&cluster_mrp_state->thread_apply_lsn[thread_id]);
@@ -477,19 +505,23 @@ cluster_mrp_compute_consistent_scn(void)
 			return InvalidScn;
 		if (apply_lsn < barrier_lsn)
 			return InvalidScn;
-
-		have_any_barrier = true;
-		if (!SCN_VALID(min_scn) || scn_time_cmp(thread_scn, min_scn) < 0)
-			min_scn = thread_scn;
+		if (receive_lsn != 0
+			&& !cluster_adg_mark_received(&tracker, thread_id, (XLogRecPtr)receive_lsn, 0))
+			return InvalidScn;
+		if (!cluster_adg_apply_thread_barrier(&tracker, thread_id, (XLogRecPtr)barrier_lsn,
+											  thread_scn, 0))
+			return InvalidScn;
 	}
 
-	if (observed_threads < expected_threads)
+	if (observed_threads < expected_threads
+		|| cluster_mrp_observed_primary_thread_count() < expected_threads)
 		return InvalidScn;
-	return have_any_barrier ? min_scn : InvalidScn;
+	return cluster_adg_scn_tracker_consistent_scn(&tracker);
 }
 
 void
-cluster_mrp_apply_thread_barrier(uint16 thread_id, XLogRecPtr barrier_lsn, SCN thread_safe_scn)
+cluster_mrp_apply_thread_barrier(uint16 thread_id, XLogRecPtr barrier_lsn, SCN thread_safe_scn,
+								 uint16 primary_thread_count)
 {
 	SCN old_thread_scn;
 	SCN old_consistent_scn;
@@ -506,6 +538,8 @@ cluster_mrp_apply_thread_barrier(uint16 thread_id, XLogRecPtr barrier_lsn, SCN t
 		pg_atomic_fetch_add_u64(&cluster_mrp_state->error_count, 1);
 		return;
 	}
+	cluster_mrp_note_primary_thread_count(primary_thread_count);
+	cluster_mrp_mark_primary_thread_observed(thread_id);
 
 	old_thread_scn = (SCN)pg_atomic_read_u64(&cluster_mrp_state->thread_barrier_scn[thread_id]);
 	if (SCN_VALID(old_thread_scn) && scn_time_cmp(thread_safe_scn, old_thread_scn) < 0)
@@ -640,6 +674,7 @@ cluster_mrp_shmem_init(void)
 		pg_atomic_init_u32(&cluster_mrp_state->apply_master_node_id, UINT32_MAX);
 		pg_atomic_init_u32(&cluster_mrp_state->apply_master_term_valid, 0);
 		pg_atomic_init_u64(&cluster_mrp_state->apply_master_term, 0);
+		pg_atomic_init_u64(&cluster_mrp_state->apply_master_generation, 0);
 		pg_atomic_init_u64(&cluster_mrp_state->apply_master_term_valid_until_ms, 0);
 		pg_atomic_init_u64(&cluster_mrp_state->apply_master_lost_at_ms, 0);
 		pg_atomic_init_u64(&cluster_mrp_state->receive_lsn, 0);
@@ -651,8 +686,12 @@ cluster_mrp_shmem_init(void)
 		pg_atomic_init_u64(&cluster_mrp_state->error_count, 0);
 		pg_atomic_init_u64(&cluster_mrp_state->ready_at_us, 0);
 		pg_atomic_init_u64(&cluster_mrp_state->stopped_at_us, 0);
+		pg_atomic_init_u32(&cluster_mrp_state->primary_thread_count, 0);
+		for (int i = 0; i < MRP_THREAD_BITMAP_WORDS; i++)
+			pg_atomic_init_u64(&cluster_mrp_state->primary_thread_bitmap[i], 0);
 		for (int i = 0; i <= CLUSTER_WAL_THREAD_MAX; i++) {
 			pg_atomic_init_u64(&cluster_mrp_state->thread_receive_lsn[i], 0);
+			pg_atomic_init_u64(&cluster_mrp_state->thread_start_lsn[i], 0);
 			pg_atomic_init_u64(&cluster_mrp_state->thread_receive_time_us[i], 0);
 			pg_atomic_init_u64(&cluster_mrp_state->thread_apply_lsn[i], 0);
 			pg_atomic_init_u64(&cluster_mrp_state->thread_apply_time_us[i], 0);
@@ -752,6 +791,77 @@ cluster_mrp_apply_master_node_id(void)
 	return pg_atomic_read_u32(&cluster_mrp_state->apply_master_node_id);
 }
 
+int
+cluster_mrp_streaming_snapshot(uint64 bitmap[2], XLogRecPtr start_lsn[], XLogRecPtr receive_lsn[])
+{
+	int count = 0;
+	int expected_threads;
+
+	if (bitmap != NULL) {
+		bitmap[0] = 0;
+		bitmap[1] = 0;
+	}
+	if (cluster_mrp_state == NULL)
+		return 0;
+	expected_threads = cluster_mrp_primary_thread_count();
+	if (expected_threads <= 0)
+		return 0;
+
+	for (uint16 thread_id = XLP_THREAD_ID_FIRST_REAL; thread_id <= CLUSTER_WAL_THREAD_MAX;
+		 thread_id++) {
+		uint64 start = pg_atomic_read_u64(&cluster_mrp_state->thread_start_lsn[thread_id]);
+		uint64 receive = pg_atomic_read_u64(&cluster_mrp_state->thread_receive_lsn[thread_id]);
+		uint16 bit;
+		uint16 word;
+
+		if (!cluster_mrp_primary_thread_observed(thread_id))
+			continue;
+		if (start == 0 || receive == 0 || receive < start)
+			return 0;
+
+		bit = thread_id - XLP_THREAD_ID_FIRST_REAL;
+		word = bit / 64;
+		if (word >= MRP_THREAD_BITMAP_WORDS)
+			return 0;
+		if (bitmap != NULL)
+			bitmap[word] |= UINT64CONST(1) << (bit % 64);
+		if (start_lsn != NULL)
+			start_lsn[thread_id] = (XLogRecPtr)start;
+		if (receive_lsn != NULL)
+			receive_lsn[thread_id] = (XLogRecPtr)receive;
+		count++;
+		if (count > expected_threads)
+			return 0;
+	}
+
+	return count == expected_threads ? count : 0;
+}
+
+void
+cluster_mrp_mark_thread_received_span(uint16 thread_id, XLogRecPtr start_lsn,
+									  XLogRecPtr receive_lsn)
+{
+	uint64 old_start;
+
+	if (cluster_mrp_state == NULL)
+		return;
+	if (thread_id < XLP_THREAD_ID_FIRST_REAL || thread_id > CLUSTER_WAL_THREAD_MAX
+		|| XLogRecPtrIsInvalid(start_lsn) || XLogRecPtrIsInvalid(receive_lsn)
+		|| receive_lsn < start_lsn) {
+		pg_atomic_fetch_add_u64(&cluster_mrp_state->error_count, 1);
+		return;
+	}
+
+	cluster_mrp_mark_primary_thread_observed(thread_id);
+	old_start = pg_atomic_read_u64(&cluster_mrp_state->thread_start_lsn[thread_id]);
+	while (old_start == 0 || old_start > (uint64)start_lsn) {
+		if (pg_atomic_compare_exchange_u64(&cluster_mrp_state->thread_start_lsn[thread_id],
+										   &old_start, (uint64)start_lsn))
+			break;
+	}
+	cluster_mrp_mark_thread_received(thread_id, receive_lsn);
+}
+
 void
 cluster_mrp_mark_thread_received(uint16 thread_id, XLogRecPtr receive_lsn)
 {
@@ -763,6 +873,7 @@ cluster_mrp_mark_thread_received(uint16 thread_id, XLogRecPtr receive_lsn)
 		pg_atomic_fetch_add_u64(&cluster_mrp_state->error_count, 1);
 		return;
 	}
+	cluster_mrp_mark_primary_thread_observed(thread_id);
 
 	old_lsn = pg_atomic_read_u64(&cluster_mrp_state->thread_receive_lsn[thread_id]);
 	if (old_lsn > (uint64)receive_lsn)
@@ -787,6 +898,7 @@ cluster_mrp_mark_thread_applied(uint16 thread_id, XLogRecPtr apply_lsn)
 		pg_atomic_fetch_add_u64(&cluster_mrp_state->error_count, 1);
 		return;
 	}
+	cluster_mrp_mark_primary_thread_observed(thread_id);
 
 	old_lsn = pg_atomic_read_u64(&cluster_mrp_state->thread_apply_lsn[thread_id]);
 	if (old_lsn > (uint64)apply_lsn)

@@ -24,7 +24,7 @@
 extern bool cluster_mrp_apply_record_replayed(uint16 thread_id, XLogRecPtr apply_lsn,
 											  SCN record_scn);
 extern bool cluster_mrp_apply_barrier_replayed(uint16 thread_id, XLogRecPtr barrier_lsn,
-											   SCN thread_safe_scn);
+											   SCN thread_safe_scn, uint16 primary_thread_count);
 
 #endif /* USE_PGRAC_CLUSTER */
 

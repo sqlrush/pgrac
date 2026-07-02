@@ -131,6 +131,7 @@
 #include "access/xlog_internal.h"
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: spec-4.1 own-stream strict thread-id for crash recovery. */
+#include "cluster/cluster_apply_master_election.h"
 #include "cluster/cluster_guc.h" /* PGRAC: spec-4.5a cluster_wal_threads_dir */
 #include "cluster/cluster_hw_snapshot.h" /* PGRAC: spec-5.7 D3 HW authority recovery load */
 #include "cluster/cluster_mrp.h"	   /* PGRAC: spec-6.4 ADG Apply Master gate */
@@ -506,6 +507,11 @@ static uint64 cluster_recovery_own_merge_bound = 0;
 static XLogRecPtr cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start,
 												 TimeLineID tli, uint16 own_thread,
 												 TimeLineID *replayTLI);
+static XLogRecPtr cluster_adg_streaming_replay(XLogPrefetcher *xlogprefetcher,
+											   XLogReaderState *xlogreader,
+											   XLogRecord *first_record, TimeLineID tli,
+											   TimeLineID *replayTLI,
+											   bool *reachedRecoveryTarget);
 #endif
 
 static void EnableStandbyMode(void);
@@ -1937,6 +1943,7 @@ PerformWalRecovery(void)
 	if (record != NULL
 #ifdef USE_PGRAC_CLUSTER
 		|| cluster_engage == CLUSTER_MERGE_ENGAGE
+		|| cluster_mrp_should_start()
 #endif
 	)
 	{
@@ -1958,6 +1965,25 @@ PerformWalRecovery(void)
 			begin_startup_progress_phase();
 
 #ifdef USE_PGRAC_CLUSTER
+		if (cluster_mrp_should_start())
+		{
+			XLogRecPtr	adg_end;
+
+			if (ArchiveRecoveryRequested && recoveryTarget != RECOVERY_TARGET_UNSET)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("ADG streaming standby does not support configured recovery targets")));
+
+			adg_end = cluster_adg_streaming_replay(xlogprefetcher, xlogreader, record,
+												   replayTLI, &replayTLI,
+												   &reachedRecoveryTarget);
+			RmgrCleanup();
+			ereport(LOG, (errmsg("redo done (ADG streaming) at %X/%X system usage: %s",
+								 LSN_FORMAT_ARGS(adg_end), pg_rusage_show(&ru0))));
+			InRedo = false;
+			goto cluster_merged_redo_done;
+		}
+
 		/*
 		 * PGRAC spec-4.5 §3.3: when merged recovery engaged, drive the
 		 * whole redo from the k-way SCN merge engine instead of the
@@ -2283,6 +2309,161 @@ cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start, Ti
 						 (unsigned)own_thread)));
 	return own_end;
 }
+
+static void
+cluster_adg_streaming_wait(bool *streaming_reply_sent)
+{
+	if (streaming_reply_sent != NULL && !*streaming_reply_sent)
+	{
+		WalRcvForceReply();
+		*streaming_reply_sent = true;
+	}
+
+	KnownAssignedTransactionIdsIdleMaintenance();
+	(void) WaitLatch(&XLogRecoveryCtl->recoveryWakeupLatch,
+					 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+					 1000L,
+					 WAIT_EVENT_RECOVERY_WAL_STREAM);
+	ResetLatch(&XLogRecoveryCtl->recoveryWakeupLatch);
+}
+
+static XLogRecPtr
+cluster_adg_streaming_replay(XLogPrefetcher *xlogprefetcher, XLogReaderState *xlogreader,
+							 XLogRecord *first_record, TimeLineID tli, TimeLineID *replayTLI,
+							 bool *reachedRecoveryTarget)
+{
+	ClusterRecoveryMergeState *st = NULL;
+	XLogRecPtr start_lsn[CLUSTER_WAL_THREAD_MAX + 1];
+	XLogRecPtr receive_lsn[CLUSTER_WAL_THREAD_MAX + 1];
+	uint64 bitmap[2];
+	XLogRecPtr replay_end;
+	XLogRecord *native_record = first_record;
+	bool window_active = false;
+	bool streaming_reply_sent = false;
+
+	SpinLockAcquire(&XLogRecoveryCtl->info_lck);
+	replay_end = XLogRecoveryCtl->lastReplayedEndRecPtr;
+	SpinLockRelease(&XLogRecoveryCtl->info_lck);
+
+	for (;;)
+	{
+		XLogReaderState *r;
+		XLogRecord *rec;
+		uint16 thread_id;
+
+		HandleStartupProcInterrupts();
+
+		if (((volatile XLogRecoveryCtlData *) XLogRecoveryCtl)->recoveryPauseState !=
+			RECOVERY_NOT_PAUSED)
+			recoveryPausesHere(false);
+
+		if (CheckForStandbyTrigger())
+			break;
+
+		memset(start_lsn, 0, sizeof(start_lsn));
+		memset(receive_lsn, 0, sizeof(receive_lsn));
+		if (cluster_mrp_streaming_snapshot(bitmap, start_lsn, receive_lsn) <= 0)
+		{
+			if (native_record != NULL)
+			{
+				if (recoveryStopsBefore(xlogreader))
+				{
+					if (reachedRecoveryTarget != NULL)
+						*reachedRecoveryTarget = true;
+					break;
+				}
+				if (recoveryApplyDelay(xlogreader)
+					&& ((volatile XLogRecoveryCtlData *) XLogRecoveryCtl)->recoveryPauseState !=
+					RECOVERY_NOT_PAUSED)
+					recoveryPausesHere(false);
+
+				ApplyWalRecord(xlogreader, native_record, replayTLI);
+				replay_end = xlogreader->EndRecPtr;
+				streaming_reply_sent = false;
+
+				if (recoveryStopsAfter(xlogreader))
+				{
+					if (reachedRecoveryTarget != NULL)
+						*reachedRecoveryTarget = true;
+					break;
+				}
+
+				native_record = ReadRecord(xlogprefetcher, LOG, false, *replayTLI);
+				continue;
+			}
+
+			cluster_adg_streaming_wait(&streaming_reply_sent);
+			continue;
+		}
+
+		if (!XLogRecPtrIsInvalid(replay_end))
+		{
+			for (uint16 thread = XLP_THREAD_ID_FIRST_REAL;
+				 thread <= CLUSTER_WAL_THREAD_MAX; thread++)
+			{
+				uint16 bit = thread - XLP_THREAD_ID_FIRST_REAL;
+				uint16 word = bit / 64;
+
+				if (word >= lengthof(bitmap))
+					break;
+				if ((bitmap[word] & (UINT64CONST(1) << (bit % 64))) == 0)
+					continue;
+				if (start_lsn[thread] < replay_end)
+					start_lsn[thread] = replay_end;
+			}
+		}
+
+		if (st == NULL)
+		{
+			st = cluster_recovery_merge_streaming_begin(bitmap, start_lsn, tli);
+			if (st == NULL)
+			{
+				cluster_adg_streaming_wait(&streaming_reply_sent);
+				continue;
+			}
+			cluster_recovery_merge_window_enter();
+			window_active = true;
+		}
+
+		r = cluster_recovery_merge_streaming_next(st, receive_lsn, &thread_id, NULL);
+		if (r == NULL)
+		{
+			cluster_adg_streaming_wait(&streaming_reply_sent);
+			continue;
+		}
+		rec = &r->record->header;
+
+		if (recoveryStopsBefore(r))
+		{
+			if (reachedRecoveryTarget != NULL)
+				*reachedRecoveryTarget = true;
+			break;
+		}
+		if (recoveryApplyDelay(r)
+			&& ((volatile XLogRecoveryCtlData *) XLogRecoveryCtl)->recoveryPauseState !=
+			RECOVERY_NOT_PAUSED)
+			recoveryPausesHere(false);
+
+		cluster_recovery_merge_set_scn(rec->xl_scn);
+		cluster_recovery_merge_set_apply_foreign(false);
+		ApplyWalRecord(r, rec, replayTLI);
+		replay_end = r->EndRecPtr;
+		streaming_reply_sent = false;
+
+		if (recoveryStopsAfter(r))
+		{
+			if (reachedRecoveryTarget != NULL)
+				*reachedRecoveryTarget = true;
+			break;
+		}
+	}
+
+	cluster_recovery_merge_set_apply_foreign(false);
+	if (window_active)
+		cluster_recovery_merge_window_leave();
+	cluster_recovery_merge_end(st);
+	return replay_end;
+}
 #endif
 
 /*
@@ -2343,7 +2524,9 @@ ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *repl
 	 * owner/term against the durable voting-disk lease; non-ADG recovery paths
 	 * return true and keep native behavior.
 	 */
-	while (!cluster_mrp_apply_master_can_apply())
+	while (cluster_mrp_should_start()
+		   && (!cluster_apply_master_is_self()
+			   || !cluster_apply_master_term_still_valid(cluster_apply_master_current_term())))
 	{
 		HandleStartupProcInterrupts();
 		(void) WaitLatch(&XLogRecoveryCtl->recoveryWakeupLatch,

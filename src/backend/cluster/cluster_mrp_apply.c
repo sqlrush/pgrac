@@ -37,14 +37,16 @@ cluster_mrp_apply_record_replayed(uint16 thread_id, XLogRecPtr apply_lsn, SCN re
 }
 
 bool
-cluster_mrp_apply_barrier_replayed(uint16 thread_id, XLogRecPtr barrier_lsn, SCN thread_safe_scn)
+cluster_mrp_apply_barrier_replayed(uint16 thread_id, XLogRecPtr barrier_lsn, SCN thread_safe_scn,
+								   uint16 primary_thread_count)
 {
 	if (!cluster_mrp_should_start())
 		return true;
 	if (!cluster_mrp_apply_master_can_apply())
 		return false;
 
-	cluster_standby_scn_apply_barrier(thread_id, barrier_lsn, thread_safe_scn);
+	cluster_standby_scn_apply_barrier(thread_id, barrier_lsn, thread_safe_scn,
+									  primary_thread_count);
 	return true;
 }
 

@@ -240,6 +240,18 @@ GetCurrentTimestamp(void)
 
 #include <stdarg.h>
 
+int
+pg_snprintf(char *str, size_t count, const char *fmt, ...)
+{
+	int ret;
+	va_list args;
+
+	va_start(args, fmt);
+	ret = vsnprintf(str, count, fmt, args);
+	va_end(args);
+	return ret;
+}
+
 bool
 errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
 {

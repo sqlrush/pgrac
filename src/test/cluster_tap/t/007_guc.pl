@@ -231,11 +231,6 @@ is($node->safe_psql('postgres',
 	'cluster.adg_lag_threshold_sec default and context');
 is($node->safe_psql('postgres',
 	q{SELECT setting || '|' || vartype || '|' || context
-	    FROM pg_settings WHERE name = 'cluster.apply_master_max_lag_ms'}),
-	'5000|integer|sighup',
-	'cluster.apply_master_max_lag_ms default and context');
-is($node->safe_psql('postgres',
-	q{SELECT setting || '|' || vartype || '|' || context
 	    FROM pg_settings WHERE name = 'cluster.apply_master_election'}),
 	'on|bool|sighup',
 	'cluster.apply_master_election default and context');

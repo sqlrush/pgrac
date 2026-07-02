@@ -39,11 +39,15 @@ static bool
 cluster_adg_recompute_consistent_scn(ClusterAdgScnTracker *tracker)
 {
 	SCN min_scn = InvalidScn;
+	bool have_active = false;
 	uint16 i;
 
 	for (i = 0; i < tracker->thread_count; i++) {
 		const ClusterAdgThreadStatus *thread = &tracker->threads[i];
 
+		if (!thread->active)
+			continue;
+		have_active = true;
 		if (!thread->has_barrier || !SCN_VALID(thread->barrier_safe_scn))
 			return true;
 		if (!SCN_VALID(min_scn) || scn_time_cmp(thread->barrier_safe_scn, min_scn) < 0
@@ -52,7 +56,7 @@ cluster_adg_recompute_consistent_scn(ClusterAdgScnTracker *tracker)
 			min_scn = thread->barrier_safe_scn;
 	}
 
-	if (!SCN_VALID(min_scn))
+	if (!have_active || !SCN_VALID(min_scn))
 		return true;
 	if (SCN_VALID(tracker->standby_consistent_scn)
 		&& scn_time_cmp(min_scn, tracker->standby_consistent_scn) < 0)
@@ -175,111 +179,6 @@ cluster_adg_scn_tracker_consistent_scn(const ClusterAdgScnTracker *tracker)
 	return tracker->standby_consistent_scn;
 }
 
-int64
-cluster_adg_thread_apply_lag_ms(const ClusterAdgScnTracker *tracker, uint16 thread_id, int64 now_ms)
-{
-	const ClusterAdgThreadStatus *thread;
-	uint16 index;
-
-	if (!cluster_adg_valid_thread_id(tracker, thread_id, &index))
-		return -1;
-	thread = &tracker->threads[index];
-	if (!thread->has_apply)
-		return -1;
-	if (now_ms <= thread->apply_time_ms)
-		return 0;
-	return now_ms - thread->apply_time_ms;
-}
-
-void
-cluster_adg_pending_init(ClusterAdgPendingCommitRegistry *registry)
-{
-	if (registry != NULL)
-		memset(registry, 0, sizeof(*registry));
-}
-
-bool
-cluster_adg_pending_register(ClusterAdgPendingCommitRegistry *registry, SCN commit_scn)
-{
-	if (registry == NULL || !SCN_VALID(commit_scn))
-		return false;
-	if (registry->count >= CLUSTER_ADG_PENDING_MAX) {
-		registry->overflowed = true;
-		return false;
-	}
-	registry->pending[registry->count++] = commit_scn;
-	return true;
-}
-
-bool
-cluster_adg_pending_clear(ClusterAdgPendingCommitRegistry *registry, SCN commit_scn)
-{
-	uint16 i;
-
-	if (registry == NULL || !SCN_VALID(commit_scn))
-		return false;
-	for (i = 0; i < registry->count; i++) {
-		if (scn_total_cmp(registry->pending[i], commit_scn) == 0) {
-			uint16 j;
-
-			for (j = i + 1; j < registry->count; j++)
-				registry->pending[j - 1] = registry->pending[j];
-			registry->count--;
-			registry->pending[registry->count] = InvalidScn;
-			return true;
-		}
-	}
-	return false;
-}
-
-SCN
-cluster_adg_pending_min_scn(const ClusterAdgPendingCommitRegistry *registry)
-{
-	SCN min_scn = InvalidScn;
-	uint16 i;
-
-	if (registry == NULL)
-		return InvalidScn;
-	for (i = 0; i < registry->count; i++) {
-		SCN candidate = registry->pending[i];
-
-		if (!SCN_VALID(candidate))
-			continue;
-		if (!SCN_VALID(min_scn) || scn_time_cmp(candidate, min_scn) < 0
-			|| (scn_time_cmp(candidate, min_scn) == 0 && scn_total_cmp(candidate, min_scn) < 0))
-			min_scn = candidate;
-	}
-	return min_scn;
-}
-
-SCN
-cluster_adg_thread_safe_scn(const ClusterAdgPendingCommitRegistry *registry, SCN current_scn)
-{
-	SCN min_pending;
-
-	if (!SCN_VALID(current_scn))
-		return InvalidScn;
-	min_pending = cluster_adg_pending_min_scn(registry);
-	if (!SCN_VALID(min_pending))
-		return current_scn;
-	return cluster_scn_time_predecessor(min_pending);
-}
-
-ClusterAdgLeaseDecision
-cluster_adg_apply_master_lease_check(uint64 held_term, uint64 durable_term, bool lease_attached,
-									 bool in_quorum, int64 now_ms, int64 lease_expires_at_ms)
-{
-	if (!lease_attached)
-		return CLUSTER_ADG_LEASE_NOT_ATTACHED;
-	if (!in_quorum)
-		return CLUSTER_ADG_LEASE_NO_QUORUM;
-	if (held_term == 0 || held_term != durable_term)
-		return CLUSTER_ADG_LEASE_TERM_STALE;
-	if (now_ms >= lease_expires_at_ms)
-		return CLUSTER_ADG_LEASE_EXPIRED;
-	return CLUSTER_ADG_LEASE_VALID;
-}
-
 uint64
 cluster_adg_apply_master_next_term(uint64 durable_term)
 {
@@ -354,80 +253,92 @@ cluster_adg_apply_master_lease_unpack(const void *slot512, ClusterAdgApplyMaster
 	return cluster_adg_apply_master_lease_valid(lease);
 }
 
-bool
-cluster_adg_streaming_merge_select(const ClusterAdgMergeInput inputs[], uint16 input_count,
-								   uint16 *out_index)
+static bool
+cluster_adg_apply_master_lease_same(const ClusterAdgApplyMasterLease *a,
+									const ClusterAdgApplyMasterLease *b)
 {
-	uint16 best = 0;
-	bool found = false;
-	uint16 i;
+	return a->term == b->term && a->generation == b->generation
+		   && a->owner_node_id == b->owner_node_id;
+}
 
-	if (inputs == NULL || out_index == NULL || input_count == 0
-		|| input_count > CLUSTER_ADG_MAX_THREADS)
+static bool
+cluster_adg_apply_master_lease_newer(const ClusterAdgApplyMasterLease *a,
+									 const ClusterAdgApplyMasterLease *b)
+{
+	if (a->term != b->term)
+		return a->term > b->term;
+	if (a->generation != b->generation)
+		return a->generation > b->generation;
+	return a->owner_node_id < b->owner_node_id;
+}
+
+bool
+cluster_adg_apply_master_lease_quorum(const ClusterAdgApplyMasterLease leases[], const bool valid[],
+									  int lease_count, int quorum,
+									  ClusterAdgApplyMasterLeaseQuorum *out)
+{
+	if (out == NULL)
 		return false;
 
-	for (i = 0; i < input_count; i++) {
-		if (!inputs[i].available || !SCN_VALID(inputs[i].scn))
+	memset(out, 0, sizeof(*out));
+	out->owner_node_id = -1;
+
+	if (leases == NULL || valid == NULL || lease_count <= 0 || quorum <= 0 || quorum > lease_count)
+		return false;
+
+	for (int i = 0; i < lease_count; i++) {
+		ClusterAdgApplyMasterLease candidate = leases[i];
+		int count = 0;
+		int64 max_expires_at_ms = candidate.lease_expires_at_ms;
+		bool should_publish;
+
+		if (!valid[i])
 			continue;
-		if (!found
-			|| scn_recovery_cmp(inputs[i].scn, inputs[i].lsn, inputs[i].node, inputs[best].scn,
-								inputs[best].lsn, inputs[best].node)
-				   < 0) {
-			best = i;
-			found = true;
+		for (int j = 0; j < lease_count; j++) {
+			if (!valid[j] || !cluster_adg_apply_master_lease_same(&candidate, &leases[j]))
+				continue;
+			count++;
+			if (leases[j].lease_expires_at_ms > max_expires_at_ms)
+				max_expires_at_ms = leases[j].lease_expires_at_ms;
+		}
+		if (count < quorum)
+			continue;
+
+		should_publish = !out->attached;
+		if (!should_publish) {
+			ClusterAdgApplyMasterLease current;
+
+			memset(&current, 0, sizeof(current));
+			current.term = out->durable_term;
+			current.owner_node_id = out->owner_node_id;
+			current.generation = out->generation;
+			current.lease_expires_at_ms = out->lease_expires_at_ms;
+			should_publish = cluster_adg_apply_master_lease_newer(&candidate, &current);
+		}
+		if (should_publish) {
+			out->attached = true;
+			out->count = count;
+			out->durable_term = candidate.term;
+			out->owner_node_id = candidate.owner_node_id;
+			out->lease_expires_at_ms = max_expires_at_ms;
+			out->generation = candidate.generation;
 		}
 	}
-	if (!found)
-		return false;
-	*out_index = best;
+
 	return true;
 }
 
 ClusterAdgReadDecision
-cluster_adg_read_only_decide(bool enable_adg, bool standby_role, SCN requested_read_scn,
+cluster_adg_read_only_decide(bool enable_adg, bool standby_role, bool read_service_available,
 							 SCN standby_consistent_scn, int64 apply_lag_ms, int64 max_lag_ms)
 {
 	if (!enable_adg || !standby_role)
 		return CLUSTER_ADG_READ_UNRESOLVABLE;
-	if (!SCN_VALID(requested_read_scn) || !SCN_VALID(standby_consistent_scn))
+	if (!read_service_available || !SCN_VALID(standby_consistent_scn))
 		return CLUSTER_ADG_READ_UNRESOLVABLE;
 	if (max_lag_ms >= 0 && apply_lag_ms > max_lag_ms)
 		return CLUSTER_ADG_READ_LAG_EXCESSIVE;
-	if (scn_time_cmp(requested_read_scn, standby_consistent_scn) <= 0)
-		return CLUSTER_ADG_READ_ALLOW;
-	return CLUSTER_ADG_READ_WAIT;
-}
-
-ClusterAdgStandbyConflictDecision
-cluster_adg_standby_conflict_decide(bool enable_adg, bool standby_role, int64 wait_ms,
-									int64 max_standby_delay_ms)
-{
-	if (!enable_adg || !standby_role)
-		return CLUSTER_ADG_CONFLICT_NONE;
-	if (wait_ms <= 0)
-		return CLUSTER_ADG_CONFLICT_NONE;
-	if (max_standby_delay_ms < 0)
-		return CLUSTER_ADG_CONFLICT_WAIT;
-	if (wait_ms >= max_standby_delay_ms)
-		return CLUSTER_ADG_CONFLICT_CANCEL_READER;
-	return CLUSTER_ADG_CONFLICT_WAIT;
-}
-
-bool
-cluster_adg_overlay_resolve_on_commit_prepared(ClusterTTStatus current_status, SCN commit_scn,
-											   ClusterTTStatus *out_status, SCN *out_commit_scn)
-{
-	if (out_status == NULL || out_commit_scn == NULL)
-		return false;
-	if (!SCN_VALID(commit_scn))
-		return false;
-	if (current_status != CLUSTER_TT_STATUS_IN_PROGRESS
-		&& current_status != CLUSTER_TT_STATUS_COMMITTED)
-		return false;
-
-	*out_status = CLUSTER_TT_STATUS_COMMITTED;
-	*out_commit_scn = commit_scn;
-	return true;
+	return CLUSTER_ADG_READ_ALLOW;
 }
 
 bool
