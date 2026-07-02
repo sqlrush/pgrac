@@ -749,12 +749,13 @@ qvotec_apply_lease_same_winner(const ClusterAdgApplyMasterLeaseQuorum *winner,
 }
 
 static ClusterMrpApplyLeaseSubmitResult
-qvotec_apply_lease_cas(const ClusterAdgApplyMasterLease *desired,
-					   ClusterAdgApplyMasterLeaseQuorum *winner)
+qvotec_apply_lease_cas(const ClusterAdgApplyMasterLease *desired, const uint8 *alive_bitmap,
+					   int alive_bitmap_bytes, ClusterAdgApplyMasterLeaseQuorum *winner)
 {
 	ClusterAdgApplyMasterLeaseQuorum current;
 	ClusterAdgApplyMasterLeaseCasVerdict verdict;
 	uint8 slot[CLUSTER_VOTING_SLOT_BYTES];
+	int32 candidate_node;
 	int disks_ok = 0;
 	int writes_ok = 0;
 	int quorum;
@@ -765,6 +766,13 @@ qvotec_apply_lease_cas(const ClusterAdgApplyMasterLease *desired,
 	}
 	if (qvotec_n_disks <= 0)
 		return CLUSTER_MRP_APPLY_LEASE_SUBMIT_NO_QUORUM;
+	if (desired == NULL || !cluster_adg_apply_master_lease_valid(desired))
+		return CLUSTER_MRP_APPLY_LEASE_SUBMIT_INVALID;
+	candidate_node = cluster_adg_apply_master_candidate_node(alive_bitmap, alive_bitmap_bytes);
+	if (candidate_node < 0)
+		return CLUSTER_MRP_APPLY_LEASE_SUBMIT_NO_QUORUM;
+	if (desired->owner_node_id != candidate_node)
+		return CLUSTER_MRP_APPLY_LEASE_SUBMIT_STALE;
 	quorum = qvotec_n_disks / 2 + 1;
 
 	if (!qvotec_apply_lease_scan(&current, &disks_ok) && disks_ok < quorum)
@@ -912,13 +920,6 @@ qvotec_poll_once(void)
 			cluster_mrp_qvotec_complete_apply_lease_request(CLUSTER_MRP_APPLY_LEASE_SUBMIT_INVALID,
 															NULL);
 		return;
-	}
-
-	if (have_apply_lease_request) {
-		ClusterMrpApplyLeaseSubmitResult apply_lease_result;
-
-		apply_lease_result = qvotec_apply_lease_cas(&apply_lease_request, &apply_lease_winner);
-		cluster_mrp_qvotec_complete_apply_lease_request(apply_lease_result, &apply_lease_winner);
 	}
 
 	/*
@@ -1186,6 +1187,9 @@ qvotec_poll_once(void)
 		pg_atomic_write_u32(&QvotecShmem->collision_state, (uint32)decision.collision_state);
 		pg_atomic_write_u32(&QvotecShmem->quorum_state, (uint32)CLUSTER_QVOTEC_QUORUM_LOST);
 		cluster_pgstat_inc(qvotec_counter_collision);
+		if (have_apply_lease_request)
+			cluster_mrp_qvotec_complete_apply_lease_request(CLUSTER_MRP_APPLY_LEASE_SUBMIT_INVALID,
+															NULL);
 
 		ereport(FATAL,
 				(errcode(ERRCODE_CLUSTER_NODE_ID_COLLISION),
@@ -1200,6 +1204,15 @@ qvotec_poll_once(void)
 				 errhint("Reconfigure cluster.node_id to a unique value, or "
 						 "ensure the peer instance has exited before reusing "
 						 "this node_id.")));
+	}
+
+	if (have_apply_lease_request) {
+		ClusterMrpApplyLeaseSubmitResult apply_lease_result;
+
+		apply_lease_result
+			= qvotec_apply_lease_cas(&apply_lease_request, decision.alive_bitmap,
+									 (int)sizeof(decision.alive_bitmap), &apply_lease_winner);
+		cluster_mrp_qvotec_complete_apply_lease_request(apply_lease_result, &apply_lease_winner);
 	}
 
 	/* ---- 3. build + write self slot to every disk ---- */

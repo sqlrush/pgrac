@@ -304,6 +304,11 @@ cluster_voting_disk_write_apply_lease_global_slot(int fd pg_attribute_unused(),
 	return CLUSTER_VOTING_DISK_IO_NOT_TRIED;
 }
 bool
+cluster_adg_apply_master_lease_valid(const ClusterAdgApplyMasterLease *lease pg_attribute_unused())
+{
+	return false;
+}
+bool
 cluster_adg_apply_master_lease_pack(void *slot512 pg_attribute_unused(),
 									const ClusterAdgApplyMasterLease *lease pg_attribute_unused())
 {
@@ -334,6 +339,25 @@ cluster_adg_apply_master_lease_cas_verdict(
 	int64 now_ms pg_attribute_unused())
 {
 	return CLUSTER_ADG_APPLY_LEASE_CAS_STALE;
+}
+int32
+cluster_adg_apply_master_candidate_node(const uint8 *alive_bitmap, int bitmap_bytes)
+{
+	int byte;
+
+	if (alive_bitmap == NULL || bitmap_bytes <= 0)
+		return -1;
+	for (byte = 0; byte < bitmap_bytes; byte++) {
+		int bit;
+
+		if (alive_bitmap[byte] == 0)
+			continue;
+		for (bit = 0; bit < 8; bit++) {
+			if ((alive_bitmap[byte] & (uint8)(1u << bit)) != 0)
+				return (int32)(byte * 8 + bit);
+		}
+	}
+	return -1;
 }
 void
 cluster_mrp_publish_qvotec_latch(struct Latch *latch pg_attribute_unused())

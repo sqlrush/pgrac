@@ -381,6 +381,27 @@ cluster_adg_apply_master_lease_cas_verdict(const ClusterAdgApplyMasterLeaseQuoru
 	return CLUSTER_ADG_APPLY_LEASE_CAS_TAKE_EXPIRED;
 }
 
+int32
+cluster_adg_apply_master_candidate_node(const uint8 *alive_bitmap, int bitmap_bytes)
+{
+	int byte;
+
+	if (alive_bitmap == NULL || bitmap_bytes <= 0)
+		return -1;
+
+	for (byte = 0; byte < bitmap_bytes; byte++) {
+		int bit;
+
+		if (alive_bitmap[byte] == 0)
+			continue;
+		for (bit = 0; bit < 8; bit++) {
+			if ((alive_bitmap[byte] & (uint8)(1u << bit)) != 0)
+				return (int32)(byte * 8 + bit);
+		}
+	}
+	return -1;
+}
+
 bool
 cluster_adg_apply_master_token_allows_apply(uint32 owner_node_id, uint32 valid, uint64 term,
 											uint64 generation, uint64 lease_epoch,

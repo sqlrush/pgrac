@@ -355,6 +355,24 @@ UT_TEST(test_apply_master_lease_cas_verdict)
 				 (int)CLUSTER_ADG_APPLY_LEASE_CAS_INVALID);
 }
 
+UT_TEST(test_apply_master_candidate_uses_lowest_fresh_live_node)
+{
+	uint8 alive[16];
+
+	memset(alive, 0, sizeof(alive));
+	UT_ASSERT_EQ(cluster_adg_apply_master_candidate_node(alive, sizeof(alive)), -1);
+	UT_ASSERT_EQ(cluster_adg_apply_master_candidate_node(NULL, sizeof(alive)), -1);
+	UT_ASSERT_EQ(cluster_adg_apply_master_candidate_node(alive, 0), -1);
+
+	alive[0] = (uint8)((1u << 5) | (1u << 2));
+	alive[1] = (uint8)(1u << 1);
+	UT_ASSERT_EQ(cluster_adg_apply_master_candidate_node(alive, sizeof(alive)), 2);
+
+	alive[0] = 0;
+	UT_ASSERT_EQ(cluster_adg_apply_master_candidate_node(alive, sizeof(alive)), 9);
+	UT_ASSERT_EQ(cluster_adg_apply_master_candidate_node(alive, 1), -1);
+}
+
 UT_TEST(test_apply_master_token_apply_gate)
 {
 	UT_ASSERT(
@@ -464,7 +482,7 @@ UT_TEST(test_mrp_shmem_tracks_term_validity_and_drain)
 int
 main(void)
 {
-	UT_PLAN(20);
+	UT_PLAN(21);
 
 	UT_RUN(test_tracker_init_bounds);
 	UT_RUN(test_barrier_min_publishes_after_all_threads);
@@ -481,6 +499,7 @@ main(void)
 	UT_RUN(test_apply_master_lease_quorum_selects_single_winner);
 	UT_RUN(test_apply_master_lease_quorum_rejects_split_without_majority);
 	UT_RUN(test_apply_master_lease_cas_verdict);
+	UT_RUN(test_apply_master_candidate_uses_lowest_fresh_live_node);
 	UT_RUN(test_apply_master_token_apply_gate);
 	UT_RUN(test_read_only_decision_matrix);
 	UT_RUN(test_thread_barrier_wal_abi);
