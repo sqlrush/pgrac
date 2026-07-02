@@ -1835,6 +1835,8 @@ cluster_ic_tier1_close_peer(int32 peer_id, const char *reason)
 	}
 
 	if (Tier1Shmem != NULL) {
+		if (reason != NULL && reason[0] != '\0')
+			peer_record_error(peer_id, 0, "08006", "%s", reason);
 		/* Don't overwrite REJECTED state -- that's a stickier verdict. */
 		if (Tier1Shmem->peers[peer_id].state != (int32)CLUSTER_IC_PEER_REJECTED)
 			Tier1Shmem->peers[peer_id].state = (int32)CLUSTER_IC_PEER_DOWN;

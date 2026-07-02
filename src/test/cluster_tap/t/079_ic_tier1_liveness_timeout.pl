@@ -12,8 +12,10 @@
 #   - SIGSTOP the LMON of node1 (kernel keeps the TCP socket alive
 #     but no heartbeat frames flow)
 #   - wait > 3 * heartbeat_interval (3.5s with default 1s interval)
-#   - assert node0 sees peer 1 transition to state='down'
-#     with last_error mentioning 'liveness timeout'
+#   - assert node0 closes peer 1 by observing reconnect_count advance
+#     with last_error mentioning 'liveness timeout'.  The final state may
+#     already be 'connected' again because active-role reconnect can happen
+#     in the same LMON tick as the timeout close.
 #   - SIGCONT node1 LMON for clean shutdown
 #
 # Spec: pgrac:specs/spec-2.2-* ## Hardening v1.0.1 F2.
@@ -65,6 +67,9 @@ my $lmon1_pid = $pair->node1->safe_psql('postgres',
 	"SELECT pid FROM pg_stat_activity WHERE backend_type = 'lmon'");
 ok($lmon1_pid > 0, "L2 located node1 LMON pid (got $lmon1_pid)");
 
+my $reconnect_before = $pair->node0->safe_psql('postgres',
+	"SELECT reconnect_count FROM pg_cluster_ic_peers WHERE node_id = 1");
+
 kill 'STOP', $lmon1_pid
 	or die "SIGSTOP $lmon1_pid failed: $!";
 note "L2 sent SIGSTOP to node1 LMON (pid $lmon1_pid)";
@@ -77,26 +82,31 @@ note "L2 sent SIGSTOP to node1 LMON (pid $lmon1_pid)";
 my $deadline = time + 15;
 my $state = '';
 my $last_err = '';
+my $reconnect_after = $reconnect_before;
+my $saw_liveness_close = 0;
 while (time < $deadline)
 {
-	$state = $pair->node0->safe_psql('postgres',
-		"SELECT state FROM pg_cluster_ic_peers WHERE node_id = 1");
-	if ($state eq 'down')
+	my $row = $pair->node0->safe_psql('postgres',
+		"SELECT state || E'\\t' || reconnect_count || E'\\t' || coalesce(last_error, '') "
+		. "FROM pg_cluster_ic_peers WHERE node_id = 1");
+	($state, $reconnect_after, $last_err) = split(/\t/, $row, 3);
+	if ($reconnect_after > $reconnect_before
+		&& $last_err =~ qr/liveness timeout|heartbeat|Connection refused|Connection reset|envelope recv|Socket is not connected|Broken pipe|EPIPE/i)
 	{
-		$last_err = $pair->node0->safe_psql('postgres',
-			"SELECT last_error FROM pg_cluster_ic_peers WHERE node_id = 1");
+		$saw_liveness_close = 1;
 		last;
 	}
 	usleep(500_000);
 }
 
-is($state, 'down',
-	"L3 node0 transitioned peer 1 to 'down' after liveness timeout (got '$state')");
-# Note: last_error is best-effort -- LMON immediately re-attempts a
-# reconnect after the close (heartbeat tick = 1s), so the original
-# "heartbeat liveness timeout" message can be overwritten by the next
-# attempt's "Connection refused" (peer LMON is still SIGSTOP'd).  Both
-# are valid evidence the F2 fix detected the silent peer death.
+ok($saw_liveness_close,
+	"L3 node0 closed peer 1 after liveness timeout (state '$state', reconnect_count "
+	. "$reconnect_before -> $reconnect_after, last_error '$last_err')");
+# Note: final state is best-effort -- LMON immediately re-attempts a
+# reconnect after the close (heartbeat tick = 1s), and the active side can
+# report CONNECTED after sending HELLO even while the peer LMON is still
+# SIGSTOP'd.  The stable proof of F2 is reconnect_count advancing with a
+# timeout/heartbeat close reason.
 like($last_err, qr/liveness timeout|heartbeat|Connection refused|Connection reset|envelope recv|Socket is not connected|Broken pipe|EPIPE/i,
 	"L3 last_error indicates timeout-driven close (got '$last_err')");
 
