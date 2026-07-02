@@ -102,6 +102,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_cr_admit.h"		  /* cluster_cr_admit_stat_* counters (spec-5.52 D9) */
 #include "cluster/cluster_cr_tuple.h"		  /* cluster_cr_tuple_stat_* counters (spec-5.54 D5) */
 #include "cluster/cluster_xnode_profile.h"	  /* xnode profiling buckets (spec-5.59 D1) */
+#include "cluster/cluster_xnode_lever.h"	  /* xnode lever counters (spec-6.12) */
 #include "cluster/cluster_resolver_cache.h"	  /* cluster_resolver_cache_* counters (spec-5.55 D8) */
 #include "cluster/cluster_cr_coordinator_stat.h" /* cluster_cr_coordinator_* counters (spec-5.57 D3) */
 #include "cluster/cluster_wal_state.h"			 /* wal_state registry dump (spec-4.2 D5) */
@@ -2791,6 +2792,31 @@ dump_xnode_profile(ReturnSetInfo *rsinfo)
 			 fmt_int64(ctl != NULL ? (int64)pg_atomic_read_u64(&ctl->hw_extend_remote_count) : 0));
 }
 
+/*
+ * dump_xnode_lever -- spec-6.12 per-wave lever counters.
+ *
+ *	Wave-prefixed keys (c_* = wave 6.12c resolver memo + D0 stamp-evidence
+ *	classification).  Keys are emitted even while every wave GUC is off
+ *	(values stay 0) so the key surface is stable for tests and samplers;
+ *	later waves append keys, never rename (5.59 Q9-B category paradigm).
+ */
+static void
+dump_xnode_lever(ReturnSetInfo *rsinfo)
+{
+	ClusterXnodeLeverShared *ctl = ClusterXnodeLeverCtl;
+
+#define XNL_ROW(field)                                                                             \
+	emit_row(rsinfo, "xnode_lever", #field,                                                        \
+			 fmt_int64(ctl != NULL ? (int64)pg_atomic_read_u64(&ctl->field) : 0))
+	XNL_ROW(c_resolve_count);
+	XNL_ROW(c_tt_lookup_count);
+	XNL_ROW(c_memo_hit_count);
+	XNL_ROW(c_memo_install_count);
+	XNL_ROW(c_stamp_cached_seen_count);
+	XNL_ROW(c_stamp_contradicted_count);
+#undef XNL_ROW
+}
+
 #endif /* USE_PGRAC_CLUSTER */
 
 
@@ -2857,6 +2883,7 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		dump_ts(rsinfo);
 		dump_ko(rsinfo);
 		dump_xnode_profile(rsinfo); /* spec-5.59 D1 */
+		dump_xnode_lever(rsinfo);	/* spec-6.12 */
 	}
 #else
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

@@ -61,7 +61,7 @@ my $has_visibility_inject =
 # admission reason counters; +1 "pgrac cluster clean_leave" (spec-5.13); +1
 # "pgrac cluster cr relgen" (spec-5.56 D4); +1 "pgrac cluster cr tuple stats"
 # (spec-5.54 D5); full list + count lives in t/020).
-  my $expected_region_count = $has_visibility_inject ? '72' : '71'; # spec-6.2 +1 smart fusion deps; full list lives in t/020
+  my $expected_region_count = $has_visibility_inject ? '73' : '72'; # spec-6.2 +1 smart fusion deps; full list lives in t/020
 
 
 # ----------
@@ -169,7 +169,7 @@ is($node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT category) FROM pg_cluster_state}),
    '52',
-   'L12 pg_cluster_state has 52 categories (spec-6.2 adds smart_fusion)');
+   'L12 pg_cluster_state has 53 categories (spec-6.2 adds smart_fusion; spec-6.12 adds xnode_lever)');
 
 
 # ----------
@@ -232,7 +232,7 @@ is($node->safe_psql('postgres',
 my $smoke_categories = $node->safe_psql(
 	'postgres',
 	q{SELECT count(DISTINCT category) FROM pg_cluster_state});
-is($smoke_categories, '52', 'L16 cluster_smoke surface integrates buffer_format + pcm + gcs + tt_status + tt_status_hint + tt_2pc + tt_recovery + visibility + wal_thread + dl + hw + ir + ko + ts + smart_fusion categories (52 categories; spec-6.2 adds smart_fusion)');
+is($smoke_categories, '53', 'L16 cluster_smoke surface integrates buffer_format + pcm + gcs + tt_status + tt_status_hint + tt_2pc + tt_recovery + visibility + wal_thread + dl + hw + ir + ko + ts + smart_fusion categories (53 categories; spec-6.2 adds smart_fusion)');
 
 
 # ----------

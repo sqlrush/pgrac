@@ -26,7 +26,7 @@ include $(top_builddir)/src/Makefile.global
 
 # Test source files (each becomes a standalone executable)
 TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
-        test_cluster_xnode_profile \
+        test_cluster_xnode_profile test_cluster_xnode_lever \
         test_cluster_wait_events test_cluster_errcodes test_cluster_guc \
         test_cluster_shmem test_cluster_signal test_cluster_views \
         test_cluster_gviews test_cluster_ic test_cluster_ic_envelope \
@@ -713,6 +713,15 @@ CLUSTER_XNODE_PROFILE_O = $(top_builddir)/src/backend/cluster/cluster_xnode_prof
 test_cluster_xnode_profile: test_cluster_xnode_profile.c unit_test.h $(CLUSTER_XNODE_PROFILE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_XNODE_PROFILE_O) -o $@
+
+# test_cluster_xnode_lever links cluster_xnode_lever.o standalone (spec-6.12
+# U-c).  The test defines the two GUC gate variables + MyProc itself and
+# stubs ShmemInitStruct / cluster_shmem_register_region; the real shmem
+# registration is exercised by cluster_tap t/020.
+CLUSTER_XNODE_LEVER_O = $(top_builddir)/src/backend/cluster/cluster_xnode_lever.o
+test_cluster_xnode_lever: test_cluster_xnode_lever.c unit_test.h $(CLUSTER_XNODE_LEVER_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_XNODE_LEVER_O) -o $@
 
 # test_cluster_shared_fs links the three storage/ objects standalone:
 # cluster_shared_fs.o (registry + dispatch), cluster_shared_fs_stub.o

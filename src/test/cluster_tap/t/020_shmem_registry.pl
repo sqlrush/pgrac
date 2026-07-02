@@ -99,7 +99,9 @@ my $has_visibility_inject =
 # "pgrac cluster_ic_tier1").
 # spec-6.2: +1 "pgrac cluster smart fusion deps" (authority dependency
 # retention state; sorts between sinval outbound and smgr).
-my $expected_region_count = $has_visibility_inject ? '72' : '71';
+# spec-6.12: +1 "pgrac cluster xnode lever" (per-wave lever counters; sorts
+# between "pgrac cluster write fence" and "pgrac cluster xnode profile").
+my $expected_region_count = $has_visibility_inject ? '73' : '72';
 my $expected_regions =
   'pgrac block recovery,pgrac cluster advisory,pgrac cluster backup,pgrac cluster cf stats,pgrac cluster clean_leave,pgrac cluster conf,pgrac cluster control,pgrac cluster cr admit stats,pgrac cluster cr coordinator,pgrac cluster cr counters,pgrac cluster cr pool,pgrac cluster cr relgen,pgrac cluster cr tuple stats,pgrac cluster cssd,pgrac cluster diag,pgrac cluster dl,pgrac cluster durable tt counters,pgrac cluster epoch,pgrac cluster fence,pgrac cluster gcs,pgrac cluster gcs block,pgrac cluster gcs block dedup,pgrac cluster ges,pgrac cluster ges dedup,pgrac cluster ges reply wait,pgrac cluster grd,pgrac cluster grd outbound,pgrac cluster grd pending,pgrac cluster grd work queue,pgrac cluster hw,pgrac cluster ir,pgrac cluster ko,pgrac cluster lck,pgrac cluster lmd,pgrac cluster lmd graph,pgrac cluster lmd probe,pgrac cluster lmon,pgrac cluster lms,pgrac cluster lock-path counters,pgrac cluster multixact overlay,pgrac cluster node_remove,pgrac cluster pcm grd,pgrac cluster qvotec,pgrac cluster reconfig,pgrac cluster resolver cache,pgrac cluster scn,pgrac cluster sequence,pgrac cluster sinval ack outbound,pgrac cluster sinval ack wait,pgrac cluster sinval inbound,pgrac cluster sinval outbound,pgrac cluster smart fusion deps,pgrac cluster smgr,pgrac cluster startup phase,pgrac cluster stats,pgrac cluster subtrans state,pgrac cluster ts,pgrac cluster tt local seq,pgrac cluster tt slot allocator,pgrac cluster tt status hint outbound,pgrac cluster tt status overlay,pgrac cluster tx enqueue,pgrac cluster undo cleaner,pgrac cluster undo record cursor';
 $expected_regions .= ',pgrac cluster visibility inject'
@@ -108,6 +110,9 @@ $expected_regions .= ',pgrac cluster visibility inject'
 # 'pgrac cluster visibility inject' ('w' > 'v') and before 'pgrac cluster_ic_tier1'
 # (space 0x20 < underscore 0x5F at the 'cluster ' boundary).
 $expected_regions .= ',pgrac cluster write fence';
+# spec-6.12: per-wave lever counters;  'xnode lever' < 'xnode profile'
+# ('l' < 'p'), both after 'pgrac cluster write fence' ('x' > 'w').
+$expected_regions .= ',pgrac cluster xnode lever';
 # spec-5.59 D1: cross-node profiling buckets;  'x' > 'w' so it follows
 # 'pgrac cluster write fence', and the space form sorts before the
 # underscore forms ('pgrac cluster_ic_rdma' / 'pgrac cluster_ic_tier1').

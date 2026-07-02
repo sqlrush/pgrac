@@ -84,6 +84,8 @@ bool cluster_merged_recovery = false;
 int cluster_recovery_merge_wait_timeout = 10000;
 /* spec-5.59 D1: cross-node profiling switch (default OFF, zero hot-path cost). */
 bool cluster_xnode_profile_enabled = false;
+/* spec-6.12c: read-layer-3 resolver terminal memo (default OFF). */
+bool cluster_page_scn_shortcut = false;
 /* spec-6.5: cluster-aware backup / restore / PITR target knobs. */
 char *cluster_recovery_target_scn = NULL;
 char *cluster_recovery_target_cluster_time = NULL;
@@ -1288,6 +1290,23 @@ cluster_init_guc(void)
 							 gettext_noop("Enable cross-node performance profiling buckets."),
 							 gettext_noop("Off keeps all instrumented paths at zero overhead."),
 							 &cluster_xnode_profile_enabled, false, PGC_SUSET, 0, NULL, NULL, NULL);
+
+	/*
+	 * cluster.page_scn_shortcut -- spec-6.12 wave c (read layer 3).  When
+	 * on, the cluster visibility resolver memoizes TERMINAL remote
+	 * transaction outcomes (exact TT key, per top-level transaction) and
+	 * replays them instead of repeating the TT overlay lookup for every
+	 * tuple.  Terminal outcomes are immutable, so the memo never answers
+	 * anything the same transaction's authoritative lookup did not
+	 * already answer.  Default OFF: resolver behaviour byte-identical to
+	 * the 5.59 baseline.  SUSET for measurement-window toggling (same
+	 * rationale as cluster.xnode_profile).
+	 */
+	DefineCustomBoolVariable(
+		"cluster.page_scn_shortcut",
+		gettext_noop("Enable the cross-node visibility resolver terminal-outcome memo."),
+		gettext_noop("Off keeps the per-tuple TT lookup path byte-identical."),
+		&cluster_page_scn_shortcut, false, PGC_SUSET, 0, NULL, NULL, NULL);
 
 	/*
 	 * cluster.clean_leave_enabled -- opt-in cooperative clean-leave
