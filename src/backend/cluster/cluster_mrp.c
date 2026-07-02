@@ -1121,26 +1121,23 @@ cluster_mrp_standby_consistent_scn(void)
 int64
 cluster_mrp_apply_lag_ms(void)
 {
-	uint64 receive_time_us = 0;
-	uint64 apply_time_us = 0;
+	uint64 max_lag_us = 0;
 	uint16 thread_id;
 
 	if (cluster_mrp_state == NULL)
 		return 0;
 
-	for (thread_id = 0; thread_id <= CLUSTER_WAL_THREAD_MAX; thread_id++) {
+	for (thread_id = XLP_THREAD_ID_FIRST_REAL; thread_id <= CLUSTER_WAL_THREAD_MAX; thread_id++) {
 		uint64 thread_receive_time_us
 			= pg_atomic_read_u64(&cluster_mrp_state->thread_receive_time_us[thread_id]);
 		uint64 thread_apply_time_us
 			= pg_atomic_read_u64(&cluster_mrp_state->thread_apply_time_us[thread_id]);
 
-		receive_time_us = Max(receive_time_us, thread_receive_time_us);
-		apply_time_us = Max(apply_time_us, thread_apply_time_us);
+		if (thread_receive_time_us > thread_apply_time_us)
+			max_lag_us = Max(max_lag_us, thread_receive_time_us - thread_apply_time_us);
 	}
 
-	if (receive_time_us <= apply_time_us)
-		return 0;
-	return (int64)((receive_time_us - apply_time_us) / 1000);
+	return (int64)(max_lag_us / 1000);
 }
 
 uint64
@@ -1256,7 +1253,7 @@ cluster_mrp_mark_thread_received(uint16 thread_id, XLogRecPtr receive_lsn)
 
 	if (cluster_mrp_state == NULL)
 		return;
-	if (thread_id > CLUSTER_WAL_THREAD_MAX || XLogRecPtrIsInvalid(receive_lsn)) {
+	if (!cluster_mrp_valid_real_thread_id(thread_id) || XLogRecPtrIsInvalid(receive_lsn)) {
 		pg_atomic_fetch_add_u64(&cluster_mrp_state->error_count, 1);
 		return;
 	}
@@ -1281,7 +1278,7 @@ cluster_mrp_mark_thread_applied(uint16 thread_id, XLogRecPtr apply_lsn)
 
 	if (cluster_mrp_state == NULL)
 		return;
-	if (thread_id > CLUSTER_WAL_THREAD_MAX || XLogRecPtrIsInvalid(apply_lsn)) {
+	if (!cluster_mrp_valid_real_thread_id(thread_id) || XLogRecPtrIsInvalid(apply_lsn)) {
 		pg_atomic_fetch_add_u64(&cluster_mrp_state->error_count, 1);
 		return;
 	}

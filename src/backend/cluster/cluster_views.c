@@ -103,8 +103,6 @@ cluster_put_adg_state_row(ReturnSetInfo *rsinfo, int32 node_id)
 	int32 apply_master_node_id = -1;
 	uint64 apply_master_term = 0;
 	uint64 standby_consistent_scn = 0;
-	uint64 receive_time_us = 0;
-	uint64 apply_time_us = 0;
 	float8 lag_seconds = 0.0;
 	int64 lag_bytes = 0;
 	ClusterMrpSharedState *mrp = cluster_mrp_shared_state();
@@ -127,13 +125,20 @@ cluster_put_adg_state_row(ReturnSetInfo *rsinfo, int32 node_id)
 		receive_lsn = (XLogRecPtr)pg_atomic_read_u64(&mrp->receive_lsn);
 		apply_lsn = (XLogRecPtr)pg_atomic_read_u64(&mrp->apply_lsn);
 		standby_consistent_scn = pg_atomic_read_u64(&mrp->standby_consistent_scn);
-		for (uint16 thread_id = 0; thread_id <= CLUSTER_WAL_THREAD_MAX; thread_id++) {
+		for (uint16 thread_id = XLP_THREAD_ID_FIRST_REAL; thread_id <= CLUSTER_WAL_THREAD_MAX;
+			 thread_id++) {
+			uint64 thread_receive_lsn = pg_atomic_read_u64(&mrp->thread_receive_lsn[thread_id]);
+			uint64 thread_apply_lsn = pg_atomic_read_u64(&mrp->thread_apply_lsn[thread_id]);
 			uint64 thread_receive_time_us
 				= pg_atomic_read_u64(&mrp->thread_receive_time_us[thread_id]);
 			uint64 thread_apply_time_us = pg_atomic_read_u64(&mrp->thread_apply_time_us[thread_id]);
 
-			receive_time_us = Max(receive_time_us, thread_receive_time_us);
-			apply_time_us = Max(apply_time_us, thread_apply_time_us);
+			if (thread_receive_lsn > thread_apply_lsn)
+				lag_bytes += (int64)(thread_receive_lsn - thread_apply_lsn);
+			if (thread_receive_time_us > thread_apply_time_us)
+				lag_seconds
+					= Max(lag_seconds,
+						  ((float8)(thread_receive_time_us - thread_apply_time_us)) / 1000000.0);
 		}
 	}
 
@@ -155,12 +160,6 @@ cluster_put_adg_state_row(ReturnSetInfo *rsinfo, int32 node_id)
 		values[8] = LSNGetDatum(apply_lsn);
 
 	values[9] = Int64GetDatum((int64)standby_consistent_scn);
-	if (!XLogRecPtrIsInvalid(receive_lsn) && !XLogRecPtrIsInvalid(apply_lsn)
-		&& receive_lsn >= apply_lsn)
-		lag_bytes = (int64)(receive_lsn - apply_lsn);
-	if (receive_time_us > apply_time_us)
-		lag_seconds = ((float8)(receive_time_us - apply_time_us)) / 1000000.0;
-
 	values[10] = Int64GetDatum(lag_bytes);
 	values[11] = Float8GetDatum(lag_seconds);
 	if (lag_seconds > 0.0 && lag_bytes > 0)
