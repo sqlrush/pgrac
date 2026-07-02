@@ -157,6 +157,7 @@
 #include "cluster/cluster_clean_leave.h"		  /* PGRAC: spec-5.13 §3.1 refuse-writes gate */
 #include "cluster/cluster_node_remove.h"		  /* PGRAC: spec-5.18 INV-LF9 self-demote gate */
 #include "cluster/cluster_reconfig.h"			  /* PGRAC: spec-5.15 §2.4 joiner write gate */
+#include "cluster/cluster_sf_dep.h"			  /* PGRAC: spec-6.2 Smart Fusion commit brake */
 #include "cluster/storage/cluster_undo_xlog.h" /* PGRAC: spec-3.18 D4.1 TT fold redo stamp */
 #endif
 #endif
@@ -1645,6 +1646,13 @@ RecordTransactionCommit(void)
 			has_tt_fold =
 				cluster_tt_local_precommit_durable_finish(xid, tt_commit_scn, &tt_fold);
 		}
+		/*
+		 * PGRAC spec-6.2 D8: Smart Fusion commit brake must run before
+		 * START_CRIT_SECTION and before XactLogCommitRecord.  On timeout it
+		 * can still ereport(ERROR) and cleanly abort because no commit record
+		 * has been emitted yet.
+		 */
+		cluster_sf_xact_commit_brake();
 #endif
 
 		START_CRIT_SECTION();
@@ -1714,12 +1722,15 @@ RecordTransactionCommit(void)
 	if ((wrote_xlog && markXidCommitted &&
 		 synchronous_commit > SYNCHRONOUS_COMMIT_OFF) ||
 		forceSyncCommit || nrels > 0)
-	{
-		XLogFlush(XactLastRecEnd);
+		{
+			XLogFlush(XactLastRecEnd);
+#ifdef USE_PGRAC_CLUSTER
+			cluster_sf_publish_origin_durable_lsn();
+#endif
 
-		/*
-		 * Now we may update the CLOG, if we wrote a COMMIT record above
-		 */
+			/*
+			 * Now we may update the CLOG, if we wrote a COMMIT record above
+			 */
 		if (markXidCommitted)
 			TransactionIdCommitTree(xid, nchildren, children);
 	}
@@ -2469,6 +2480,8 @@ StartTransaction(void)
 	 * touched_peers bitmap so a prior transaction's cross-node ingress
 	 * never leaks into this transaction's fail-stop abort decision. */
 	cluster_touched_peers_reset();
+	/* PGRAC spec-6.2 D6: start each xact with an empty touched-dep vector. */
+	cluster_sf_xact_reset_deps();
 #endif
 
 	/*
@@ -3169,6 +3182,8 @@ PrepareTransaction(void)
 	cluster_undo_record_xact_reset();
 	/* PGRAC (spec-5.14 D1):  clear the touched_peers bitmap on commit. */
 	cluster_touched_peers_reset();
+	/* PGRAC spec-6.2 D6: clear Smart Fusion touched-dep vector on commit. */
+	cluster_sf_xact_reset_deps();
 #endif
 
 	RESUME_INTERRUPTS();
@@ -3393,6 +3408,8 @@ CleanupTransaction(void)
 	cluster_undo_record_xact_reset();
 	/* PGRAC (spec-5.14 D1):  clear the touched_peers bitmap on abort/cleanup. */
 	cluster_touched_peers_reset();
+	/* PGRAC spec-6.2 D6: clear Smart Fusion touched-dep vector on abort. */
+	cluster_sf_xact_reset_deps();
 #endif
 
 	CurrentResourceOwner = NULL;	/* and resource owner */

@@ -169,7 +169,7 @@ cluster_shmem_iter_regions(int *idx pg_attribute_unused(),
 UT_DEFINE_GLOBALS();
 
 
-UT_TEST(test_cluster_wait_events_count_is_112)
+UT_TEST(test_cluster_wait_events_count_is_116)
 {
 	/*
 	 * Cumulative registration roster: 61 prior + 3 added by spec-2.6 D11
@@ -194,13 +194,14 @@ UT_TEST(test_cluster_wait_events_count_is_112)
 	 * (ClusterThreadRecovery) + 1 added by spec-5.18 D12
 	 * (ClusterReconfigNodeRemoveCleanupWait) + 7 added by spec-6.0a D10
 	 * (block_device production wait events) + spec-6.1 D8 RDMA
-	 * send/recv/poll/connect/fallback events.
+	 * send/recv/poll/connect/fallback events + 4 added by spec-6.2 D10
+	 * (Smart Fusion commit/DBWR/origin durable brakes + terminal resolve).
 	 * If a future subsystem spec adds new cluster wait events, both the
 	 * enum in wait_event.h and CLUSTER_WAIT_EVENTS_COUNT must move
 	 * together, and this test number must be bumped in lockstep.
 	 */
-	/* spec-6.1 D8: RDMA wait events included -> 112. */
-	UT_ASSERT_EQ(CLUSTER_WAIT_EVENTS_COUNT, 112);
+	/* spec-6.2 D10: Smart Fusion authority wait events included -> 116. */
+	UT_ASSERT_EQ(CLUSTER_WAIT_EVENTS_COUNT, 116);
 }
 
 
@@ -240,7 +241,7 @@ int
 main(void)
 {
 	UT_PLAN(4);
-	UT_RUN(test_cluster_wait_events_count_is_112);
+	UT_RUN(test_cluster_wait_events_count_is_116);
 	UT_RUN(test_srf_symbol_linkable);
 	UT_RUN(test_first_event_is_ges_enqueue_acquire);
 	UT_RUN(test_adg_scn_sync_wait_in_adg_class);

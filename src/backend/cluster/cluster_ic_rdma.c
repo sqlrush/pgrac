@@ -39,6 +39,7 @@
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_ic_tier1.h"
+#include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_shmem.h"
 #include "pgstat.h"
 #include "utils/elog.h"
@@ -570,6 +571,8 @@ rdma_verify_private_hello(const void *data, uint8 len, int32 expected_peer, int3
 
 	if (out_peer_id != NULL)
 		*out_peer_id = msg.source_node_id;
+	cluster_sf_note_peer_hello_capabilities(msg.source_node_id,
+											cluster_ic_hello_capabilities(&msg));
 	if (out_reason != NULL)
 		*out_reason = NULL;
 	return true;

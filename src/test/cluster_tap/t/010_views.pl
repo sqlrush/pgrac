@@ -46,12 +46,12 @@ $node->start;
 
 
 # ----------
-# Total row count: 112 (spec-6.1 adds 2 RDMA interconnect waits).
+# Total row count: 116 (spec-6.2 adds 4 Smart Fusion authority waits).
 # ----------
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'112',
-	'pg_stat_cluster_wait_events returns 112 rows (spec-6.1 RDMA wait events)');
+	'116',
+	'pg_stat_cluster_wait_events returns 116 rows (spec-6.2 Smart Fusion authority waits)');
 
 
 # ----------
@@ -69,7 +69,7 @@ is($node->safe_psql('postgres',
 # ----------
 my %expected = (
 	'Cluster: GES' => 5,
-	'Cluster: PCM' => 20,	# spec-4.7 D1: +ClusterGCSBlockRecovering
+	'Cluster: PCM' => 24,	# spec-6.2 D10: +4 Smart Fusion authority waits
 	'Cluster: BufferShip' => 5,
 	'Cluster: SCN' => 4,
 	'Cluster: Reconfig' => 8,    # spec-5.18 D12: +ReconfigNodeRemoveCleanupWait

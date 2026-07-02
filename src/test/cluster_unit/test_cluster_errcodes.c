@@ -250,11 +250,15 @@ UT_TEST(test_per_class_anchors)
 {
 	/* Class 08 has 5 entries: 08R01..08R05 */
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_PROTOCOL_VERSION_MISMATCH, 5), '5');
-	/* Class 40 has 4 entries: 40R01..40R04 */
-	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_PI_INVALIDATED_RETRY, 5), '4');
+	/* Class 40 has 5 entries: 40R01..40R05 */
+	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_SMART_FUSION_RETRY, 5), '5');
 	/* Class 53 spans base 53R01..53R07 plus later pgrac bands up to 53RAF. */
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_RESTORE_POINT_DRAIN_TIMEOUT, 4), 'A');
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_RESTORE_POINT_DRAIN_TIMEOUT, 5), 'F');
+	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_CF_TERMINAL_UNRESOLVED, 4), '9');
+	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_CF_TERMINAL_UNRESOLVED, 5), 'O');
+	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_SMART_FUSION_DEP_LOST, 4), '9');
+	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_SMART_FUSION_DEP_LOST, 5), 'P');
 	/* Class 55 has 6 entries: 55R01..55R06 */
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_BLOCK_MISSING_TEMPORARY, 5), '6');
 	/* Class 57 keeps operator-intervention cluster codes 57R02..57R06. */

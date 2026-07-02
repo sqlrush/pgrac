@@ -226,6 +226,8 @@ extern const ClusterICOps *ClusterICOps_Active;
  */
 #define PGRAC_IC_HELLO_BYTES 64
 #define PGRAC_IC_CLUSTER_NAME_MAX 24
+#define PGRAC_IC_HELLO_CAPABILITIES_OFFSET 36
+#define PGRAC_IC_HELLO_CAP_SMART_FUSION_REPLY_V2 ((uint32)0x00000001U)
 
 typedef struct ClusterICHelloMsg {
 	uint32 magic;								  /* PGRAC_IC_HELLO_MAGIC */
@@ -235,6 +237,17 @@ typedef struct ClusterICHelloMsg {
 	char cluster_name[PGRAC_IC_CLUSTER_NAME_MAX]; /* NUL-terminated; truncated */
 	uint8 _pad[28];								  /* pad to 64B fixed ABI */
 } ClusterICHelloMsg;
+
+static inline uint32
+cluster_ic_hello_capabilities(const ClusterICHelloMsg *msg)
+{
+	const uint8 *p;
+
+	if (msg == NULL)
+		return 0;
+	p = msg->_pad;
+	return ((uint32)p[0]) | ((uint32)p[1] << 8) | ((uint32)p[2] << 16) | ((uint32)p[3] << 24);
+}
 
 
 /*

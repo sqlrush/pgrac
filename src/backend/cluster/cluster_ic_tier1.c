@@ -79,6 +79,7 @@
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_ic_tier1.h"
+#include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_shmem.h"
 
 /*
@@ -1363,6 +1364,7 @@ cluster_ic_tier1_recv_and_verify_hello(int32 peer_id, int peer_fd)
 	Tier1Shmem->peers[peer_id].state = (int32)CLUSTER_IC_PEER_CONNECTED;
 	Tier1Shmem->peers[peer_id].last_connect_at = GetCurrentTimestamp();
 	(void)peer_addr(peer_id); /* cache addr in shmem for view */
+	cluster_sf_note_peer_hello_capabilities(peer_id, cluster_ic_hello_capabilities(&msg));
 
 	ereport(LOG, (errmsg("cluster_ic tier1 peer %d HELLO verified, state CONNECTED", peer_id)));
 	return true;
@@ -1525,6 +1527,7 @@ cluster_ic_tier1_continue_hello_recv(int anon_slot, int peer_fd, int32 *out_lear
 		Tier1Shmem->peers[learned].state = (int32)CLUSTER_IC_PEER_CONNECTED;
 		Tier1Shmem->peers[learned].last_connect_at = GetCurrentTimestamp();
 		(void)peer_addr(learned);
+		cluster_sf_note_peer_hello_capabilities(learned, cluster_ic_hello_capabilities(&msg));
 	}
 
 	if (out_learned_peer_id != NULL)

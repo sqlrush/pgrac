@@ -87,6 +87,19 @@ gh workflow run perf.yml -R sqlrush/linkdb
 | WAL bytes/sec | `pg_stat_wal.wal_bytes` delta / duration | bytes/sec |
 | fail_closed_count rate | `cluster_remote_row_lock_fail_closed_count` delta / duration(shmem-aggregated)| events/sec |
 | lookup_hit_miss ratio | `cluster_tt_status_lookup_hit_count / (_hit + _miss)` | ratio 0..1 |
+| terminal_authority_failclosed rate | `pg_cluster_state.undo.terminal_authority_failclosed_count` delta / duration | events/sec |
+| smart_fusion_failclosed rate | `pg_cluster_state.smart_fusion.dep_lost_failclosed_count + retry_failclosed_count` delta / duration | events/sec |
+| smart_fusion_brake wait | `pg_cluster_state.smart_fusion.commit_brake_wait_us` delta / committed txns | us/txn |
+
+Spec-6.2 Smart Fusion terminal authority is a correctness substrate,
+not a performance optimization.  It adds the
+`terminal_authority_*` and `smart_fusion` counters under
+`pg_cluster_state` so class 3/4 runs can distinguish epoch, ownership,
+terminal-state, durable-TT, retention, dependency-loss, and retryable
+brake fail-closed causes.  It does not relax the existing class
+thresholds, and a green result must not be obtained by disabling
+authority, dropping dependency evidence, or accepting
+UNKNOWN-visible/native fallback behavior.
 
 ---
 

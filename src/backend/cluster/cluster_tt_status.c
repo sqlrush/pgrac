@@ -390,8 +390,12 @@ cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key, ClusterTTStatusRes
 			 * overwrote the store no longer matches the still-bound durable
 			 * slot's wrap -> fail closed (no CLUSTER_TT_WRAP_ANY).
 			 */
-			switch (cluster_remote_outcome_durable_checked((int)key->origin_node_id, key->local_xid,
-														   &outcome_scn)) {
+			switch (cluster_cf_terminal_authority
+						? cluster_remote_outcome_terminal_authorized(
+							  (int)key->origin_node_id, key->local_xid, key->cluster_epoch,
+							  current_epoch, false, true, &outcome_scn)
+						: cluster_remote_outcome_durable_checked((int)key->origin_node_id,
+																 key->local_xid, &outcome_scn)) {
 			case CLUSTER_REMOTE_XACT_COMMITTED: {
 				result->status = CLUSTER_TT_STATUS_COMMITTED;
 				result->commit_scn = outcome_scn;

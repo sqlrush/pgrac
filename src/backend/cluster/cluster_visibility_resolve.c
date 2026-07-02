@@ -35,6 +35,7 @@
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"			/* cluster_node_id, subtrans depth */
 #include "cluster/cluster_itl.h"			/* get_tt_ref / lock ref / multixact origin */
 #include "cluster/cluster_itl_slot.h"		/* CLUSTER_ITL_SLOT_UNALLOCATED */
@@ -231,8 +232,12 @@ classify_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRecPtr 
 				return;
 			}
 
-			switch (
-				cluster_remote_outcome_durable_checked((int)ref->origin_node_id, raw_xid, &scn)) {
+			switch (cluster_cf_terminal_authority
+						? cluster_remote_outcome_terminal_authorized(
+							  (int)ref->origin_node_id, raw_xid, ref->cluster_epoch,
+							  cluster_epoch_get_current(), false, true, &scn)
+						: cluster_remote_outcome_durable_checked((int)ref->origin_node_id, raw_xid,
+																 &scn)) {
 			case CLUSTER_REMOTE_XACT_COMMITTED:
 				out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
 				out->status = CLUSTER_TT_STATUS_COMMITTED;

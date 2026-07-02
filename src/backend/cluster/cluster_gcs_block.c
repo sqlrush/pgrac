@@ -61,6 +61,7 @@
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_touched_peers.h" /* spec-5.14 D2 class 2 */
 #include "common/hashfn.h"
 #include "miscadmin.h"
@@ -101,6 +102,9 @@ typedef struct ClusterGcsBlockOutstandingSlot {
 	bool reply_received;
 	GcsBlockReplyHeader reply_header;
 	char reply_block_data[GCS_BLOCK_DATA_SIZE];
+	bool reply_sf_dep_valid;
+	uint8 reply_sf_flags;
+	ClusterSfDepVec reply_sf_dep_vec;
 	ConditionVariable reply_cv;
 	/* PGRAC: spec-2.34 D3/D4 — HC100 stale-reply defense + epoch invalidation.
 	 *  request_epoch:        snapshot of cluster_epoch at the time the
@@ -244,13 +248,21 @@ static bool gcs_block_get_ship_image(BufferTag tag, int32 dest_node, XLogRecPtr 
 									 char *copy_buf, const char **out_block_payload,
 									 uint32 *out_block_lkey,
 									 ClusterICSgeReleaseCallback *out_release_cb,
-									 void **out_release_arg);
+									 void **out_release_arg, ClusterSfDepVec *out_sf_dep_vec,
+									 bool *out_sf_dep_valid);
 static void gcs_block_release_ship_image(ClusterICSgeReleaseCallback release_cb, void *release_arg);
 static uint32 gcs_block_compute_checksum(const char *block_data);
 static uint32 gcs_block_compute_invalidate_checksum(const GcsBlockInvalidatePayload *inv);
 static uint32 gcs_block_compute_invalidate_ack_checksum(const GcsBlockInvalidateAckPayload *ack);
 static uint32 gcs_block_compute_redeclare_checksum(const GcsBlockRedeclarePayload *p);
 static void gcs_block_install_block(BufferDesc *buf, const char *block_data, XLogRecPtr page_lsn);
+static void gcs_block_install_reply_block(BufferDesc *buf, const char *block_data,
+										  XLogRecPtr page_lsn,
+										  const ClusterGcsBlockOutstandingSlot *slot);
+static bool gcs_block_decode_reply_payload(const ClusterICEnvelope *env, const void *payload,
+										   const GcsBlockReplyHeader **out_hdr,
+										   const char **out_block_data, bool *out_sf_dep_valid,
+										   uint8 *out_sf_flags, ClusterSfDepVec *out_sf_dep_vec);
 /* PGRAC: spec-2.36 D3 (HC116) — master synchronous broadcast invalidate.
  * Enumerates `holders_bm` (1 bit per cluster node), emits INVALIDATE
  * envelope to each, waits for all INVALIDATE_ACK msg_type 18 within
@@ -376,6 +388,9 @@ cluster_gcs_block_shmem_init(void)
 				slot->in_use = false;
 				slot->request_id = 0;
 				slot->reply_received = false;
+				slot->reply_sf_dep_valid = false;
+				slot->reply_sf_flags = 0;
+				cluster_sf_dep_vec_reset(&slot->reply_sf_dep_vec);
 				slot->request_epoch = 0; /* spec-2.34 HC100 */
 				slot->expected_master_node = -1;
 				slot->stale = false;
@@ -470,6 +485,9 @@ gcs_block_release_slot(ClusterGcsBlockOutstandingSlot *slot)
 	slot->request_id = 0;
 	slot->transition_id = 0;
 	slot->master_node = -1;
+	slot->reply_sf_dep_valid = false;
+	slot->reply_sf_flags = 0;
+	cluster_sf_dep_vec_reset(&slot->reply_sf_dep_vec);
 	slot->request_epoch = 0; /* spec-2.34 HC100 */
 	slot->expected_master_node = -1;
 	slot->stale = false;
@@ -502,10 +520,12 @@ gcs_block_release_ship_image(ClusterICSgeReleaseCallback release_cb, void *relea
 static bool
 gcs_block_get_ship_image(BufferTag tag, int32 dest_node, XLogRecPtr *out_page_lsn, char *copy_buf,
 						 const char **out_block_payload, uint32 *out_block_lkey,
-						 ClusterICSgeReleaseCallback *out_release_cb, void **out_release_arg)
+						 ClusterICSgeReleaseCallback *out_release_cb, void **out_release_arg,
+						 ClusterSfDepVec *out_sf_dep_vec, bool *out_sf_dep_valid)
 {
 	void *scratch = NULL;
 	uint32 scratch_lkey = 0;
+	bool smart_fusion_reply;
 
 	if (out_block_payload != NULL)
 		*out_block_payload = NULL;
@@ -515,6 +535,12 @@ gcs_block_get_ship_image(BufferTag tag, int32 dest_node, XLogRecPtr *out_page_ls
 		*out_release_cb = NULL;
 	if (out_release_arg != NULL)
 		*out_release_arg = NULL;
+	if (out_sf_dep_valid != NULL)
+		*out_sf_dep_valid = false;
+	if (out_sf_dep_vec != NULL)
+		cluster_sf_dep_vec_reset(out_sf_dep_vec);
+
+	smart_fusion_reply = cluster_smart_fusion && cluster_sf_peer_supports_reply_v2(dest_node);
 
 	if (cluster_ic_rdma_block_sge_supported(NULL)
 		&& cluster_ic_mux_peer_transport(dest_node) == CLUSTER_IC_PEER_TRANSPORT_RDMA) {
@@ -523,11 +549,20 @@ gcs_block_get_ship_image(BufferTag tag, int32 dest_node, XLogRecPtr *out_page_ls
 
 		if (cluster_ic_rdma_borrow_block_scratch(dest_node, GCS_BLOCK_DATA_SIZE, &scratch,
 												 &scratch_lkey, &release_cb, &release_arg)) {
-			if (!cluster_bufmgr_copy_block_for_gcs(tag, out_page_lsn, (char *)scratch)) {
+			bool copied;
+
+			if (smart_fusion_reply)
+				copied = cluster_bufmgr_copy_block_for_gcs_smart_fusion(
+					tag, out_page_lsn, (char *)scratch, out_sf_dep_vec);
+			else
+				copied = cluster_bufmgr_copy_block_for_gcs(tag, out_page_lsn, (char *)scratch);
+			if (!copied) {
 				if (release_cb != NULL)
 					release_cb(release_arg);
 				return false;
 			}
+			if (smart_fusion_reply && out_sf_dep_valid != NULL)
+				*out_sf_dep_valid = true;
 			*out_block_payload = (const char *)scratch;
 			if (out_block_lkey != NULL)
 				*out_block_lkey = scratch_lkey;
@@ -539,7 +574,13 @@ gcs_block_get_ship_image(BufferTag tag, int32 dest_node, XLogRecPtr *out_page_ls
 		}
 	}
 
-	if (!cluster_bufmgr_copy_block_for_gcs(tag, out_page_lsn, copy_buf))
+	if (smart_fusion_reply) {
+		if (!cluster_bufmgr_copy_block_for_gcs_smart_fusion(tag, out_page_lsn, copy_buf,
+															out_sf_dep_vec))
+			return false;
+		if (out_sf_dep_valid != NULL)
+			*out_sf_dep_valid = true;
+	} else if (!cluster_bufmgr_copy_block_for_gcs(tag, out_page_lsn, copy_buf))
 		return false;
 	*out_block_payload = copy_buf;
 	if (out_block_lkey != NULL)
@@ -624,6 +665,19 @@ gcs_block_install_block(BufferDesc *buf, const char *block_data, XLogRecPtr page
 	memcpy(page, block_data, GCS_BLOCK_DATA_SIZE);
 	PageSetLSN(page, page_lsn);
 	LWLockRelease(content_lock);
+}
+
+static void
+gcs_block_install_reply_block(BufferDesc *buf, const char *block_data, XLogRecPtr page_lsn,
+							  const ClusterGcsBlockOutstandingSlot *slot)
+{
+	if (slot != NULL && slot->reply_sf_dep_valid)
+		cluster_sf_dep_install_vec(buf->tag, &slot->reply_sf_dep_vec);
+
+	gcs_block_install_block(buf, block_data, page_lsn);
+
+	if (slot != NULL && slot->reply_sf_dep_valid)
+		cluster_sf_note_dep_touched(BufferDescriptorGetBuffer(buf));
 }
 
 
@@ -989,6 +1043,9 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 				slot->reply_received = false;
 				memset(&slot->reply_header, 0, sizeof(slot->reply_header));
 				memset(slot->reply_block_data, 0, sizeof(slot->reply_block_data));
+				slot->reply_sf_dep_valid = false;
+				slot->reply_sf_flags = 0;
+				cluster_sf_dep_vec_reset(&slot->reply_sf_dep_vec);
 				slot->request_epoch = payload.epoch;
 				slot->expected_master_node = current_master;
 				slot->stale = false;
@@ -1101,10 +1158,12 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 					ClusterXpScope xp_inst;
 
 					cluster_xp_begin(&xp_inst, CLXP_W_GCS_X_INSTALL);
-					gcs_block_install_block(buf, slot->reply_block_data, final_page_lsn);
+					gcs_block_install_reply_block(buf, slot->reply_block_data, final_page_lsn,
+												  slot);
 					cluster_xp_end(&xp_inst);
 				} else {
-					gcs_block_install_block(buf, slot->reply_block_data, final_page_lsn);
+					gcs_block_install_reply_block(buf, slot->reply_block_data, final_page_lsn,
+												  slot);
 					/* PGRAC: spec-5.59 §3.6 read amortization probe — a durable
 					 * S grant still shipped a full page image. */
 					cluster_xp_note_read(true);
@@ -1181,7 +1240,7 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 					terminal_denied = true;
 					break;
 				}
-				gcs_block_install_block(buf, slot->reply_block_data, final_page_lsn);
+				gcs_block_install_reply_block(buf, slot->reply_block_data, final_page_lsn, slot);
 				/* PGRAC: spec-5.59 §3.6 read amortization probe — a one-shot
 				 * read-image ship is exactly the "reship" the probe counts. */
 				if (xp_is_read)
@@ -1489,6 +1548,9 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, int32 holder_node)
 		slot->reply_received = false;
 		memset(&slot->reply_header, 0, sizeof(slot->reply_header));
 		memset(slot->reply_block_data, 0, sizeof(slot->reply_block_data));
+		slot->reply_sf_dep_valid = false;
+		slot->reply_sf_flags = 0;
+		cluster_sf_dep_vec_reset(&slot->reply_sf_dep_vec);
 		slot->request_epoch = cluster_epoch_get_current();
 		slot->expected_master_node = cluster_node_id;
 		slot->stale = false;
@@ -1547,8 +1609,8 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, int32 holder_node)
 			uint32 got = gcs_block_compute_checksum(slot->reply_block_data);
 
 			if (expected == got) {
-				gcs_block_install_block(buf, slot->reply_block_data,
-										(XLogRecPtr)slot->reply_header.page_lsn);
+				gcs_block_install_reply_block(buf, slot->reply_block_data,
+											  (XLogRecPtr)slot->reply_header.page_lsn, slot);
 				/* spec-5.14 D2 class 2: this node (local master) consumed the
 				 * remote holder's volatile image. */
 				gcs_block_stamp_touched(holder_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
@@ -1634,6 +1696,9 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, int32 holder_node,
 		slot->reply_received = false;
 		memset(&slot->reply_header, 0, sizeof(slot->reply_header));
 		memset(slot->reply_block_data, 0, sizeof(slot->reply_block_data));
+		slot->reply_sf_dep_valid = false;
+		slot->reply_sf_flags = 0;
+		cluster_sf_dep_vec_reset(&slot->reply_sf_dep_vec);
 		slot->request_epoch = cluster_epoch_get_current();
 		slot->expected_master_node = cluster_node_id;
 		slot->stale = false;
@@ -1723,7 +1788,8 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, int32 holder_node,
 				/* leave installed = false: faithful stale holder created. */
 			} else if (expected == got) {
 				installed_page_lsn = (XLogRecPtr)slot->reply_header.page_lsn;
-				gcs_block_install_block(buf, slot->reply_block_data, installed_page_lsn);
+				gcs_block_install_reply_block(buf, slot->reply_block_data, installed_page_lsn,
+											  slot);
 				/* spec-5.14 D2 class 2: consumed the remote holder's X image. */
 				gcs_block_stamp_touched(holder_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
 				installed = true;
@@ -1757,8 +1823,8 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, int32 holder_node,
 			uint32 got = gcs_block_compute_checksum(slot->reply_block_data);
 
 			if (expected == got) {
-				gcs_block_install_block(buf, slot->reply_block_data,
-										(XLogRecPtr)slot->reply_header.page_lsn);
+				gcs_block_install_reply_block(buf, slot->reply_block_data,
+											  (XLogRecPtr)slot->reply_header.page_lsn, slot);
 				/* spec-5.14 D2 class 2: consumed the remote holder's deferred-writer image. */
 				gcs_block_stamp_touched(holder_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
 				/* spec-5.2 §3.5 D11: mark this buffer a deferred-writer
@@ -2001,15 +2067,40 @@ gcs_block_send_reply(int32 dest_node, const GcsBlockRequestPayload *req, GcsBloc
 static void
 gcs_block_resend_cached_reply(int32 dest_node, const GcsBlockDedupEntry *entry)
 {
-	uint32 total = (uint32)(sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE);
+	uint32 header_len;
+	uint32 total;
 	char *buf;
 	GcsBlockReplyHeader *hdr;
+	char *block_data;
+	bool has_block_payload;
 
+	header_len = entry->has_sf_dep && entry->sf_dep_count > 0
+					 ? (uint32)sizeof(GcsBlockReplyHeaderV2)
+					 : (uint32)sizeof(GcsBlockReplyHeader);
+	total = header_len + GCS_BLOCK_DATA_SIZE;
 	buf = (char *)palloc0(total);
 	hdr = (GcsBlockReplyHeader *)buf;
 	*hdr = entry->reply_header;
-	if (entry->status == GCS_BLOCK_REPLY_GRANTED)
-		memcpy(buf + sizeof(GcsBlockReplyHeader), entry->block_data, GCS_BLOCK_DATA_SIZE);
+	if (entry->has_sf_dep && entry->sf_dep_count > 0) {
+		GcsBlockReplyHeaderV2 *hdrv2 = (GcsBlockReplyHeaderV2 *)buf;
+		int i;
+		int n = 0;
+
+		hdrv2->sf_flags = entry->sf_flags;
+		for (i = 0; i < CLUSTER_SF_DEP_MAX_ORIGINS; i++) {
+			if (XLogRecPtrIsInvalid(entry->sf_dep_vec.required[i]))
+				continue;
+			hdrv2->sf_dep[n].origin_node = i;
+			hdrv2->sf_dep[n].required_redo_lsn = (uint64)entry->sf_dep_vec.required[i];
+			n++;
+		}
+		hdrv2->sf_dep_count = (uint8)n;
+	}
+	block_data = buf + header_len;
+	has_block_payload = entry->status == GCS_BLOCK_REPLY_GRANTED
+						|| entry->status == GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER;
+	if (has_block_payload)
+		memcpy(block_data, entry->block_data, GCS_BLOCK_DATA_SIZE);
 	/* else: block_data already zeroed by palloc0 */
 
 	(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, dest_node, buf, total);
@@ -2042,7 +2133,8 @@ static bool
 gcs_block_produce_reply(const GcsBlockRequestPayload *req, char *block_buf,
 						GcsBlockReplyStatus *out_status, XLogRecPtr *out_page_lsn,
 						const char **out_block_payload, uint32 *out_block_lkey,
-						ClusterICSgeReleaseCallback *out_release_cb, void **out_release_arg)
+						ClusterICSgeReleaseCallback *out_release_cb, void **out_release_arg,
+						ClusterSfDepVec *out_sf_dep_vec, bool *out_sf_dep_valid)
 {
 	uint64 current_epoch;
 	PcmLockMode state;
@@ -2057,6 +2149,10 @@ gcs_block_produce_reply(const GcsBlockRequestPayload *req, char *block_buf,
 		*out_release_cb = NULL;
 	if (out_release_arg != NULL)
 		*out_release_arg = NULL;
+	if (out_sf_dep_vec != NULL)
+		cluster_sf_dep_vec_reset(out_sf_dep_vec);
+	if (out_sf_dep_valid != NULL)
+		*out_sf_dep_valid = false;
 
 	/* HC73 epoch freshness. */
 	current_epoch = cluster_epoch_get_current();
@@ -2132,11 +2228,12 @@ gcs_block_produce_reply(const GcsBlockRequestPayload *req, char *block_buf,
 	 */
 	if (!gcs_block_get_ship_image(req->tag, req->sender_node, out_page_lsn, block_buf,
 								  out_block_payload, out_block_lkey, out_release_cb,
-								  out_release_arg)) {
+								  out_release_arg, out_sf_dep_vec, out_sf_dep_valid)) {
 		*out_status = GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
 		return true;
 	}
-	pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_wal_flush_before_ship_count, 1);
+	if (out_sf_dep_valid == NULL || !*out_sf_dep_valid)
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_wal_flush_before_ship_count, 1);
 
 	/* HC77: master-side is the single transition-apply owner. */
 	if (!cluster_pcm_lock_apply_gcs_transition(req->tag, (PcmLockTransition)req->transition_id,
@@ -2188,8 +2285,11 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 	uint32 block_payload_lkey = 0;
 	ClusterICSgeReleaseCallback block_payload_release_cb = NULL;
 	void *block_payload_release_arg = NULL;
+	ClusterSfDepVec sf_dep_vec;
+	bool sf_dep_valid = false;
 
 	(void)env;
+	cluster_sf_dep_vec_reset(&sf_dep_vec);
 
 	if (env == NULL || payload == NULL || env->payload_length != sizeof(GcsBlockRequestPayload))
 		return;
@@ -2394,7 +2494,12 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 									 InvalidXLogRecPtr, NULL);
 				return;
 			}
-			if (cluster_bufmgr_copy_block_for_gcs(req->tag, &page_lsn, block_buf)) {
+			cluster_sf_dep_vec_reset(&sf_dep_vec);
+			sf_dep_valid = false;
+			if (gcs_block_get_ship_image(req->tag, req->sender_node, &page_lsn, block_buf,
+										 &block_payload, &block_payload_lkey,
+										 &block_payload_release_cb, &block_payload_release_arg,
+										 &sf_dep_vec, &sf_dep_valid)) {
 				/*
 				 * PGRAC: spec-5.2 §3.5 D11 — active-ITL hard boundary.  Even as master+holder,
 				 * if WE still have an uncommitted ITL slot on this block
@@ -2411,9 +2516,8 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 				 * ownership transfer must satisfy the holder's local commit
 				 * dependency, not just the bufmgr API contract.
 				 */
-				if (cluster_itl_page_has_active_slot((Page)block_buf)) {
+				if (cluster_itl_page_has_active_slot((Page)block_payload)) {
 					status = GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER;
-					block_payload = block_buf;
 					if (ClusterGcsBlock != NULL)
 						pg_atomic_fetch_add_u64(&ClusterGcsBlock->cf_xheld_read_ship_count, 1);
 					goto build_and_send_reply;
@@ -2448,10 +2552,10 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 					(void)cluster_bufmgr_drop_block_for_gcs_no_wire(req->tag, &drop_lsn);
 					/* spec-2.41 D2 — advance detector SCN watermark from the
 					 * shipped page's pd_block_scn (local-page source = block_buf). */
-					cluster_pcm_lock_master_grant_x_to(req->tag, req->sender_node, page_lsn,
-													   (SCN)((PageHeader)block_buf)->pd_block_scn);
+					cluster_pcm_lock_master_grant_x_to(
+						req->tag, req->sender_node, page_lsn,
+						(SCN)((PageHeader)block_payload)->pd_block_scn);
 					status = GCS_BLOCK_REPLY_GRANTED;
-					block_payload = block_buf;
 					if (ClusterGcsBlock != NULL)
 						pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_x_self_ship_count, 1);
 					goto build_and_send_reply;
@@ -2724,8 +2828,8 @@ x_path_skipped:
 				/* Master holds X locally: ship its current image without revoking X. */
 				if (gcs_block_get_ship_image(req->tag, req->sender_node, &page_lsn, block_buf,
 											 &block_payload, &block_payload_lkey,
-											 &block_payload_release_cb,
-											 &block_payload_release_arg)) {
+											 &block_payload_release_cb, &block_payload_release_arg,
+											 &sf_dep_vec, &sf_dep_valid)) {
 					status = GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER;
 					if (ClusterGcsBlock != NULL)
 						pg_atomic_fetch_add_u64(&ClusterGcsBlock->cf_xheld_read_ship_count, 1);
@@ -2854,7 +2958,7 @@ x_path_skipped:
 	/* Produce the reply through the original master flow. */
 	(void)gcs_block_produce_reply(req, block_buf, &status, &page_lsn, &block_payload,
 								  &block_payload_lkey, &block_payload_release_cb,
-								  &block_payload_release_arg);
+								  &block_payload_release_arg, &sf_dep_vec, &sf_dep_valid);
 	if (req->transition_id == PCM_TRANS_N_TO_X || req->transition_id == PCM_TRANS_S_TO_X_UPGRADE)
 		cluster_pcm_lock_clear_pending_x(req->tag);
 
@@ -2916,7 +3020,13 @@ x_path_skipped:
 	 * IN_FLIGHT_DUPLICATE.
 	 */
 build_and_send_reply: {
-	uint32 total = (uint32)(sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE);
+	bool has_block_payload
+		= (status == GCS_BLOCK_REPLY_GRANTED || status == GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER)
+		  && block_payload != NULL;
+	bool send_sf_dep = sf_dep_valid && has_block_payload;
+	uint32 header_len
+		= send_sf_dep ? (uint32)sizeof(GcsBlockReplyHeaderV2) : (uint32)sizeof(GcsBlockReplyHeader);
+	uint32 total = header_len + GCS_BLOCK_DATA_SIZE;
 	char *buf;
 	GcsBlockReplyHeader *hdr;
 
@@ -2930,20 +3040,32 @@ build_and_send_reply: {
 	hdr->transition_id = req->transition_id;
 	hdr->status = (uint8)status;
 	GcsBlockReplyHeaderSetForwardingMasterNode(hdr, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+	if (send_sf_dep) {
+		GcsBlockReplyHeaderV2 *hdrv2 = (GcsBlockReplyHeaderV2 *)buf;
+		int i;
+		int n = 0;
 
-	if ((status == GCS_BLOCK_REPLY_GRANTED || status == GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER)
-		&& block_payload != NULL) {
+		hdrv2->sf_flags = GCS_BLOCK_REPLY_SF_EARLY_TRANSFER | GCS_BLOCK_REPLY_SF_HAS_DEP_VEC;
+		for (i = 0; i < CLUSTER_SF_DEP_MAX_ORIGINS; i++) {
+			if (XLogRecPtrIsInvalid(sf_dep_vec.required[i]))
+				continue;
+			hdrv2->sf_dep[n].origin_node = i;
+			hdrv2->sf_dep[n].required_redo_lsn = (uint64)sf_dep_vec.required[i];
+			n++;
+		}
+		hdrv2->sf_dep_count = (uint8)n;
+	}
+
+	if (has_block_payload) {
 		hdr->checksum = gcs_block_compute_checksum(block_payload);
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_ship_bytes_total, GCS_BLOCK_DATA_SIZE);
 	} else {
-		hdr->checksum = gcs_block_compute_checksum(buf + sizeof(GcsBlockReplyHeader));
+		hdr->checksum = gcs_block_compute_checksum(buf + header_len);
 	}
 
-	cluster_gcs_block_dedup_install_reply(
-		&key, status, hdr,
-		(status == GCS_BLOCK_REPLY_GRANTED || status == GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER)
-			? block_payload
-			: NULL);
+	cluster_gcs_block_dedup_install_reply_ex(&key, status, hdr,
+											 has_block_payload ? block_payload : NULL,
+											 send_sf_dep ? &sf_dep_vec : NULL, send_sf_dep);
 
 	/*
 		 * spec-2.34 D17 — drop-reply injection.  When active with SKIP,
@@ -2966,13 +3088,12 @@ build_and_send_reply: {
 	{
 		ClusterICSendResult send_rc;
 
-		if ((status == GCS_BLOCK_REPLY_GRANTED || status == GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER)
-			&& block_payload != NULL) {
+		if (has_block_payload) {
 			ClusterICSge sge[2];
 
 			memset(sge, 0, sizeof(sge));
 			sge[0].addr = hdr;
-			sge[0].len = sizeof(*hdr);
+			sge[0].len = header_len;
 			sge[1].addr = (void *)block_payload;
 			sge[1].len = GCS_BLOCK_DATA_SIZE;
 			sge[1].lkey = block_payload_lkey;
@@ -3007,24 +3128,78 @@ build_and_send_reply: {
  *	indexes directly via requester_backend_id.
  * ============================================================ */
 
+static bool
+gcs_block_decode_reply_payload(const ClusterICEnvelope *env, const void *payload,
+							   const GcsBlockReplyHeader **out_hdr, const char **out_block_data,
+							   bool *out_sf_dep_valid, uint8 *out_sf_flags,
+							   ClusterSfDepVec *out_sf_dep_vec)
+{
+	uint32 v1_size = (uint32)(sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE);
+	uint32 v2_size = (uint32)(sizeof(GcsBlockReplyHeaderV2) + GCS_BLOCK_DATA_SIZE);
+
+	if (out_hdr != NULL)
+		*out_hdr = NULL;
+	if (out_block_data != NULL)
+		*out_block_data = NULL;
+	if (out_sf_dep_valid != NULL)
+		*out_sf_dep_valid = false;
+	if (out_sf_flags != NULL)
+		*out_sf_flags = 0;
+	if (out_sf_dep_vec != NULL)
+		cluster_sf_dep_vec_reset(out_sf_dep_vec);
+
+	if (env == NULL || payload == NULL)
+		return false;
+
+	if (env->payload_length == v1_size) {
+		if (out_hdr != NULL)
+			*out_hdr = (const GcsBlockReplyHeader *)payload;
+		if (out_block_data != NULL)
+			*out_block_data = ((const char *)payload) + sizeof(GcsBlockReplyHeader);
+		return true;
+	}
+
+	if (env->payload_length == v2_size) {
+		const GcsBlockReplyHeaderV2 *hdrv2 = (const GcsBlockReplyHeaderV2 *)payload;
+		ClusterSfDepVec dep_vec;
+
+		cluster_sf_dep_vec_reset(&dep_vec);
+		if (!cluster_smart_fusion || !cluster_gcs_block_reply_v2_extract_dep_vec(hdrv2, &dep_vec)) {
+			cluster_sf_dep_note_lost_failclosed();
+			return false;
+		}
+		if (out_hdr != NULL)
+			*out_hdr = &hdrv2->v1;
+		if (out_block_data != NULL)
+			*out_block_data = ((const char *)payload) + sizeof(GcsBlockReplyHeaderV2);
+		if (out_sf_flags != NULL)
+			*out_sf_flags = hdrv2->sf_flags;
+		if (out_sf_dep_vec != NULL)
+			*out_sf_dep_vec = dep_vec;
+		if (out_sf_dep_valid != NULL)
+			*out_sf_dep_valid = !cluster_sf_dep_vec_is_empty(&dep_vec);
+		return true;
+	}
+
+	return false;
+}
+
 void
 cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void *payload)
 {
 	const GcsBlockReplyHeader *hdr;
 	const char *block_data;
-	uint32 expected_size;
+	bool sf_dep_valid = false;
+	uint8 sf_flags = 0;
+	ClusterSfDepVec sf_dep_vec;
 	int backend_idx;
 	ClusterGcsBlockBackendBlock *blk;
 	int i;
 
-	(void)env;
-
-	expected_size = (uint32)(sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE);
-	if (env == NULL || payload == NULL || env->payload_length != expected_size)
+	cluster_sf_dep_vec_reset(&sf_dep_vec);
+	if (!gcs_block_decode_reply_payload(env, payload, &hdr, &block_data, &sf_dep_valid, &sf_flags,
+										&sf_dep_vec))
 		return;
-
-	hdr = (const GcsBlockReplyHeader *)payload;
-	block_data = ((const char *)payload) + sizeof(GcsBlockReplyHeader);
 
 	/* HC80: direct index by requester_backend_id (1..MaxBackends → 0..MaxBackends-1). */
 	backend_idx = hdr->requester_backend_id - 1;
@@ -3091,6 +3266,9 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 			}
 			slot->reply_header = *hdr;
 			memcpy(slot->reply_block_data, block_data, GCS_BLOCK_DATA_SIZE);
+			slot->reply_sf_dep_valid = sf_dep_valid;
+			slot->reply_sf_flags = sf_flags;
+			slot->reply_sf_dep_vec = sf_dep_vec;
 			slot->reply_received = true;
 			ConditionVariableSignal(&slot->reply_cv);
 			LWLockRelease(&blk->lock.lock);
@@ -3125,6 +3303,11 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	void *block_payload_release_arg = NULL;
 	XLogRecPtr page_lsn = InvalidXLogRecPtr;
 	bool holder_ship_ok;
+	ClusterSfDepVec sf_dep_vec;
+	bool sf_dep_valid = false;
+	bool sf_peer_v2 = false;
+	bool send_sf_dep = false;
+	uint32 header_len;
 	uint32 total;
 	char *buf;
 	GcsBlockReplyHeader *hdr;
@@ -3135,7 +3318,10 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	if (env == NULL || payload == NULL || env->payload_length != sizeof(GcsBlockForwardPayload))
 		return;
 
+	cluster_sf_dep_vec_reset(&sf_dep_vec);
 	fwd = (const GcsBlockForwardPayload *)payload;
+	sf_peer_v2
+		= cluster_smart_fusion && cluster_sf_peer_supports_reply_v2(fwd->original_requester_node);
 	pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_received_count, 1);
 
 	/* HC75 transition_id range guard (same as request handler). */
@@ -3152,14 +3338,16 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	else
 		holder_ship_ok = gcs_block_get_ship_image(
 			fwd->tag, fwd->original_requester_node, &page_lsn, block_buf, &block_payload,
-			&block_payload_lkey, &block_payload_release_cb, &block_payload_release_arg);
+			&block_payload_lkey, &block_payload_release_cb, &block_payload_release_arg, &sf_dep_vec,
+			&sf_dep_valid);
 
 	/* Build reply (header + 8KB block or zero pad) and direct-ship to
 	 * the original requester.  HC109 stores fwd->master_node in the
 	 * reply's forwarding_master_node_bytes so sender's HC108 authorized
 	 * chain validates the chain master→holder→sender. */
-	total = (uint32)(sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE);
-	buf = (char *)palloc0(total);
+	header_len = (uint32)sizeof(GcsBlockReplyHeader);
+	total = header_len + GCS_BLOCK_DATA_SIZE;
+	buf = (char *)palloc0((uint32)sizeof(GcsBlockReplyHeaderV2) + GCS_BLOCK_DATA_SIZE);
 	hdr = (GcsBlockReplyHeader *)buf;
 	hdr->request_id = fwd->request_id;
 	hdr->page_lsn = (uint64)page_lsn;
@@ -3202,7 +3390,7 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 			block_payload_lkey = 0;
 			block_payload_release_cb = NULL;
 			block_payload_release_arg = NULL;
-			hdr->checksum = gcs_block_compute_checksum(buf + sizeof(GcsBlockReplyHeader));
+			hdr->checksum = gcs_block_compute_checksum(buf + header_len);
 			hdr->status = (uint8)GCS_BLOCK_REPLY_DENIED_LOST_WRITE;
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->lost_write_detected_count, 1);
 			/* spec-2.41 D7 observability — break out the §2.6 anomaly branch. */
@@ -3335,9 +3523,32 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 		}
 	} else {
 		/* HC105 evict race */
-		hdr->checksum = gcs_block_compute_checksum(buf + sizeof(GcsBlockReplyHeader));
+		hdr->checksum = gcs_block_compute_checksum(buf + header_len);
 		hdr->status = (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_holder_evicted_count, 1);
+	}
+
+	send_sf_dep = sf_peer_v2 && sf_dep_valid && block_payload != NULL
+				  && (hdr->status == (uint8)GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER
+					  || hdr->status == (uint8)GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER
+					  || hdr->status == (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER);
+	header_len
+		= send_sf_dep ? (uint32)sizeof(GcsBlockReplyHeaderV2) : (uint32)sizeof(GcsBlockReplyHeader);
+	total = header_len + GCS_BLOCK_DATA_SIZE;
+	if (send_sf_dep) {
+		GcsBlockReplyHeaderV2 *hdrv2 = (GcsBlockReplyHeaderV2 *)buf;
+		int i;
+		int n = 0;
+
+		hdrv2->sf_flags = GCS_BLOCK_REPLY_SF_EARLY_TRANSFER | GCS_BLOCK_REPLY_SF_HAS_DEP_VEC;
+		for (i = 0; i < CLUSTER_SF_DEP_MAX_ORIGINS; i++) {
+			if (XLogRecPtrIsInvalid(sf_dep_vec.required[i]))
+				continue;
+			hdrv2->sf_dep[n].origin_node = i;
+			hdrv2->sf_dep[n].required_redo_lsn = (uint64)sf_dep_vec.required[i];
+			n++;
+		}
+		hdrv2->sf_dep_count = (uint8)n;
 	}
 
 	if (holder_ship_ok && block_payload != NULL
@@ -3348,7 +3559,7 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 
 		memset(sge, 0, sizeof(sge));
 		sge[0].addr = hdr;
-		sge[0].len = sizeof(*hdr);
+		sge[0].len = header_len;
 		sge[1].addr = (void *)block_payload;
 		sge[1].len = GCS_BLOCK_DATA_SIZE;
 		sge[1].lkey = block_payload_lkey;

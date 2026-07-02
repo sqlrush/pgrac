@@ -78,6 +78,7 @@
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_ic_tier1.h"
+#include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_scn.h" /* cluster_scn_boc_broadcast_handler (spec-2.9 D1) */
 #include "cluster/cluster_ges.h" /* cluster_ges_{request,reply}_handler (spec-2.13 D3) */
 #include "cluster/cluster_ges_reply_wait.h" /* cluster_ges_reply_wait_sweep_timeout (spec-5.16 orphan-grant TTL backstop) */
@@ -435,6 +436,15 @@ cluster_lmon_shmem_init(void)
 		if (!backup_registered) {
 			cluster_backup_register_ic_msg_types();
 			backup_registered = true;
+		}
+	}
+	/* spec-6.2 D8: register Smart Fusion durable-LSN gossip. */
+	{
+		static bool smart_fusion_registered = false;
+
+		if (!smart_fusion_registered) {
+			cluster_sf_dep_register_ic_msg_types();
+			smart_fusion_registered = true;
 		}
 	}
 }

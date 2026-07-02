@@ -579,6 +579,7 @@ cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint16 hello_version
 					   uint16 envelope_version, int32 source_node_id, const char *cluster_name)
 {
 	size_t name_len;
+	uint32 capabilities = 0;
 
 	Assert(out_buf != NULL);
 	Assert(cluster_name != NULL);
@@ -602,6 +603,11 @@ cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint16 hello_version
 	if (name_len > 0)
 		memcpy(out_buf + 12, cluster_name, name_len);
 	/* out_buf[12 + name_len] .. out_buf[35] already zero from memset. */
+
+	if (cluster_smart_fusion && cluster_interconnect_tier == cluster_smart_fusion_tier_min)
+		capabilities |= PGRAC_IC_HELLO_CAP_SMART_FUSION_REPLY_V2;
+	if (capabilities != 0)
+		ic_le_write_uint32(out_buf + PGRAC_IC_HELLO_CAPABILITIES_OFFSET, capabilities);
 }
 
 bool
@@ -628,8 +634,7 @@ cluster_ic_parse_hello(const uint8 in_buf[PGRAC_IC_HELLO_BYTES], ClusterICHelloM
 	memcpy(out_msg->cluster_name, in_buf + 12, PGRAC_IC_CLUSTER_NAME_MAX);
 	out_msg->cluster_name[PGRAC_IC_CLUSTER_NAME_MAX - 1] = '\0';
 
-	/* Pad: caller does not need it; zero out for cleanliness. */
-	memset(out_msg->_pad, 0, sizeof(out_msg->_pad));
+	memcpy(out_msg->_pad, in_buf + PGRAC_IC_HELLO_CAPABILITIES_OFFSET, sizeof(out_msg->_pad));
 
 	return true;
 }

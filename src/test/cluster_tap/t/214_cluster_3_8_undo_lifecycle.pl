@@ -6,12 +6,16 @@
 #	  TAP on ClusterPair fixture.
 #
 #	  L1   ClusterPair startup + both nodes alive
-#	  L2   undo category in pg_cluster_state has 9 rows (5 record-level
-#	       + 4 NEW lifecycle counters)
-#	  L3   53R9E SQLSTATE registered (lookup via pg_settings or smoke trigger)
-#	  L4   2 NEW GUCs registered with defaults:
+#	  L2   undo category in pg_cluster_state has the accumulated counter surface,
+#	       including spec-6.2 terminal-authority counters
+#	  L3   lifecycle and terminal-authority counter keys are present
+#	  L4   GUCs registered with defaults:
 #	       cluster.undo_segments_max_per_instance = 256
 #	       cluster.undo_segment_create_timeout_ms = 5000
+#	       cluster.cf_terminal_authority = off
+#	       cluster.cf_delayed_cleanout = reader
+#	       cluster.smart_fusion = off
+#	       cluster.smart_fusion_tier_min = tier3
 #	  L5   Initial autoextend / segment_switch / create_fail / hard_cap
 #	       counters = 0 (无活动时)
 #	  L6   GUC SIGHUP reload max_per_instance:  ALTER SYSTEM SET ... = 128;
@@ -72,18 +76,19 @@ my $node0 = $pair->node0;
 
 
 # ----------
-# L2: undo category has 32 rows
+# L2: undo category has 53 rows
 #   5 record-level (spec-3.7) + 4 lifecycle (spec-3.8) + 3 commit-fsync +
 #   4 smgr (the latter 7 added by the perf-merge undo instrumentation) +
 #   5 durable TT slot counters (spec-3.11 D8: commit / lookup hit / lookup
 #   miss / by-xid scan / redo apply) +
 #   5 retention counters (spec-3.12 D5: horizon gauge / tt_slot_retain_skip /
-#   segment_retain_skip / retention_recycle / tt_retention_rollover).
+#   segment_retain_skip / retention_recycle / tt_retention_rollover) +
+#   9 terminal authority counters (spec-6.2).
 # ----------
 my $undo_row_count = $node0->safe_psql('postgres',
 	q{SELECT count(*) FROM pg_cluster_state WHERE category='undo'});
-is($undo_row_count, '44',
-	"L2 undo category has 44 rows (5 record + 4 lifecycle + 3 fsync + 4 smgr + 5 durable-tt + 5 retention + 6 cleaner + 4 buf/extent obs [spec-3.18 D7] + 1 spec-3.22 retention_off_recycle + 4 checkpoint-writeback boundary [spec-4.8ab D7] + 2 record-segment reclaim [spec-4.12a D5] + 1 residual-revalidate-drop [spec-4.12a Hardening v1.0.1])"
+is($undo_row_count, '53',
+	"L2 undo category has 53 rows (5 record + 4 lifecycle + 3 fsync + 4 smgr + 5 durable-tt + 5 retention + 9 terminal-authority [spec-6.2] + 6 cleaner + 4 buf/extent obs [spec-3.18 D7] + 1 spec-3.22 retention_off_recycle + 4 checkpoint-writeback boundary [spec-4.8ab D7] + 2 record-segment reclaim [spec-4.12a D5] + 1 residual-revalidate-drop [spec-4.12a Hardening v1.0.1])"
 );
 
 
@@ -99,9 +104,25 @@ is($lifecycle_keys,
 	'autoextend_count,segment_create_fail_count,segment_hard_cap_fail_count,segment_switch_count',
 	"L3 all 4 NEW lifecycle counter keys present");
 
+my $terminal_authority_keys = $node0->safe_psql('postgres',
+	q{SELECT string_agg(key, ',' ORDER BY key) FROM pg_cluster_state
+	   WHERE category='undo' AND key IN (
+	       'terminal_authority_check_count',
+	       'terminal_authority_ok_count',
+	       'terminal_authority_failclosed_count',
+	       'terminal_authority_epoch_failclosed_count',
+	       'terminal_authority_ownership_failclosed_count',
+	       'terminal_authority_unknown_failclosed_count',
+	       'terminal_authority_nonterminal_failclosed_count',
+	       'terminal_authority_durable_failclosed_count',
+	       'terminal_authority_retention_failclosed_count')});
+is($terminal_authority_keys,
+	'terminal_authority_check_count,terminal_authority_durable_failclosed_count,terminal_authority_epoch_failclosed_count,terminal_authority_failclosed_count,terminal_authority_nonterminal_failclosed_count,terminal_authority_ok_count,terminal_authority_ownership_failclosed_count,terminal_authority_retention_failclosed_count,terminal_authority_unknown_failclosed_count',
+	"L3b all 9 spec-6.2 terminal-authority counter keys present");
+
 
 # ----------
-# L4: 2 NEW GUCs registered with default values
+# L4: GUCs registered with default values
 # ----------
 my $max_per_instance = $node0->safe_psql('postgres',
 	q{SELECT setting FROM pg_settings WHERE name = 'cluster.undo_segments_max_per_instance'});
@@ -110,6 +131,41 @@ is($max_per_instance, '256', "L4a max_per_instance default = 256");
 my $create_timeout = $node0->safe_psql('postgres',
 	q{SELECT setting FROM pg_settings WHERE name = 'cluster.undo_segment_create_timeout_ms'});
 is($create_timeout, '5000', "L4b create_timeout default = 5000ms");
+
+my $terminal_authority_guc = $node0->safe_psql('postgres',
+	q{SELECT setting FROM pg_settings WHERE name = 'cluster.cf_terminal_authority'});
+is($terminal_authority_guc, 'off', "L4c cf_terminal_authority default = off");
+
+my $terminal_authority_dump_guc = $node0->safe_psql('postgres',
+	q{SELECT value FROM pg_cluster_state
+	   WHERE category='guc' AND key='cluster.cf_terminal_authority'});
+is($terminal_authority_dump_guc, 'f',
+	"L4d pg_cluster_state.guc exposes cf_terminal_authority = f");
+
+my $cleanout_guc = $node0->safe_psql('postgres',
+	q{SELECT setting FROM pg_settings WHERE name = 'cluster.cf_delayed_cleanout'});
+is($cleanout_guc, 'reader', "L4e cf_delayed_cleanout default = reader");
+
+my $smart_fusion_guc = $node0->safe_psql('postgres',
+	q{SELECT setting FROM pg_settings WHERE name = 'cluster.smart_fusion'});
+is($smart_fusion_guc, 'off', "L4f smart_fusion default = off");
+
+my $smart_fusion_tier_min_guc = $node0->safe_psql('postgres',
+	q{SELECT setting FROM pg_settings WHERE name = 'cluster.smart_fusion_tier_min'});
+is($smart_fusion_tier_min_guc, 'tier3', "L4g smart_fusion_tier_min default = tier3");
+
+my $smart_fusion_dump_gucs = $node0->safe_psql('postgres',
+	q{SELECT string_agg(key || '=' || value, ',' ORDER BY key)
+	   FROM pg_cluster_state
+	  WHERE category='guc'
+	    AND key IN ('cluster.cf_delayed_cleanout',
+	                'cluster.smart_fusion',
+	                'cluster.smart_fusion_tier_min',
+	                'cluster.smart_fusion_commit_brake_timeout_ms',
+	                'cluster.smart_fusion_origin_durable_gossip_ms')});
+is($smart_fusion_dump_gucs,
+	'cluster.cf_delayed_cleanout=reader,cluster.smart_fusion=f,cluster.smart_fusion_commit_brake_timeout_ms=5000,cluster.smart_fusion_origin_durable_gossip_ms=50,cluster.smart_fusion_tier_min=tier3',
+	"L4h pg_cluster_state.guc exposes all spec-6.2 Smart Fusion GUC defaults");
 
 
 # ----------

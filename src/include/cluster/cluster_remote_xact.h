@@ -192,6 +192,9 @@ extern int cluster_remote_xact_online_writer_depth(void);
 extern ClusterRemoteXactOutcome cluster_remote_commit_outcome_ex(int origin_node, TransactionId xid,
 																 SCN *commit_scn, uint16 *out_wrap,
 																 bool *out_wrap_valid);
+extern ClusterRemoteXactOutcome cluster_remote_outcome_terminal_authorized(
+	int origin_node, TransactionId xid, uint64 observed_epoch, uint64 current_epoch,
+	bool retention_required, bool retention_proven, SCN *out_scn);
 extern ClusterRemoteXactOutcome
 cluster_remote_outcome_durable_checked(int origin_node, TransactionId xid, SCN *out_scn);
 extern ClusterRemoteXactOutcome cluster_remote_commit_outcome(int origin_node, TransactionId xid,

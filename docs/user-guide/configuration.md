@@ -180,6 +180,101 @@ Reserved for future timeout enforcement on `tier1` peer `recv(2)`.  Currently in
 
 Upper bound on the payload size accepted by the chunked-send API.  A caller asking to send a larger payload is rejected outright with `ERRCODE_PROGRAM_LIMIT_EXCEEDED` rather than silently truncating.  Increase this when the workload expects larger cross-node messages; the hard cap is 256 MB.
 
+### `cluster.cf_terminal_authority`
+
+| | |
+|---|---|
+| Type | bool |
+| Default | `off` |
+| Context | postmaster |
+
+Enables the spec-6.2 Cache Fusion terminal-authority path.  The default
+is `off`, preserving the Stage 5 conservative active-ITL transfer
+boundary.  When enabled, cross-instance undo / TT terminal outcomes
+must prove membership epoch, origin ownership, terminal state, and any
+required durable-TT or retention evidence.  Missing or contradictory
+evidence fails closed; there is no native CLOG fallback or
+UNKNOWN-visible behavior.
+
+### `cluster.cf_delayed_cleanout`
+
+| | |
+|---|---|
+| Type | enum: `off`, `reader`, `eager` |
+| Default | `reader` |
+| Context | sighup |
+
+Controls ITL hint cleanout policy for terminal authority.  `off` never
+writes back hints, `reader` performs lazy reader-path cleanout from the
+durable TT authority, and `eager` is reserved for transfer-side eager
+cleanout.  The setting changes only hinting.  Visibility verdicts still
+come from durable TT authority and fail closed when unresolved.
+
+### `cluster.smart_fusion`
+
+| | |
+|---|---|
+| Type | bool |
+| Default | `off` |
+| Context | postmaster |
+
+Enables Smart Fusion early block-transfer dependency tracking.  It only
+has effect when the peer link is authenticated tier3 and block-reply v2
+has been negotiated; otherwise the system stays on the conservative
+HC82 WAL-before-ship path.
+
+### `cluster.smart_fusion_tier_min`
+
+| | |
+|---|---|
+| Type | enum: `tier3` |
+| Default | `tier3` |
+| Context | postmaster |
+
+Minimum interconnect tier for Smart Fusion early transfer.  Only
+`tier3` is legal in spec-6.2.
+
+### `cluster.smart_fusion_commit_brake_timeout_ms`
+
+| | |
+|---|---|
+| Type | integer (milliseconds) |
+| Default | `5000` |
+| Range | `1` - `600000` |
+| Context | sighup |
+
+Upper bound for the pre-commit Smart Fusion dependency brake.  A
+transaction that consumed an early-transfer dependent block must wait
+before writing its commit record until all origin redo dependencies are
+durable.  Timeout aborts the transaction with a retryable Smart Fusion
+error rather than false-committing.
+
+### `cluster.smart_fusion_origin_durable_gossip_ms`
+
+| | |
+|---|---|
+| Type | integer (milliseconds) |
+| Default | `50` |
+| Range | `1` - `60000` |
+| Context | sighup |
+
+Interval for publishing local durable WAL progress to Smart Fusion
+peers.  Receivers release DBWR and commit brakes only after observing
+durable progress; a block marker is never treated as proof of
+durability.
+
+The live setting is visible both through `pg_settings` and
+`pg_cluster_state`:
+
+```sql
+SHOW "cluster.cf_terminal_authority";
+
+SELECT value
+  FROM pg_cluster_state
+ WHERE category = 'guc'
+   AND key = 'cluster.cf_terminal_authority';
+```
+
 ### `cluster.grd_max_entries`
 
 | | |

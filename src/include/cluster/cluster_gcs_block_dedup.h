@@ -17,8 +17,8 @@
  *	    HC91  duplicate hit must validate entry.tag == req.tag &&
  *	          entry.transition_id == req.transition_id; mismatch →
  *	          DENIED_VALIDATOR_REJECT + dedup_collision_count++
- *	    HC92  fixed-size sizeof(GcsBlockDedupEntry) == 8312B (PG dynahash
- *	          cap × 8.3KB master memory ceiling; default 1024 → 8.4MB on
+ *	    HC92  fixed-size sizeof(GcsBlockDedupEntry) == 8448B (PG dynahash
+ *	          cap × 8.5KB master memory ceiling; default 1024 → 8.5MB on
  *	          configured cluster nodes; bootstrap/initdb with node_id=-1
  *	          does not allocate the HTAB)
  *	    HC93  TTL sweep (completed_at_ts + registered_at_ts) + local
@@ -81,7 +81,7 @@ StaticAssertDecl(sizeof(GcsBlockDedupKey) == 24, "spec-2.34 D2 GcsBlockDedupKey 
 
 
 /* ============================================================
- * GcsBlockDedupEntry — fixed-size HTAB entry (HC92 + HC99; 8312B).
+ * GcsBlockDedupEntry — fixed-size HTAB entry (HC92 + HC99; 8448B).
  *
  *	Layout (offsets explicit so alignment review is mechanical):
  *	  [    0,    24) key                 GcsBlockDedupKey (24B)
@@ -90,14 +90,19 @@ StaticAssertDecl(sizeof(GcsBlockDedupKey) == 24, "spec-2.34 D2 GcsBlockDedupKey 
  *	  [   45,    46) status              uint8 (GcsBlockReplyStatus)
  *	  [   46,    56) _pad0[10]           explicit pad to 8-align
  *	  [   56,   104) reply_header        GcsBlockReplyHeader (48B)
- *	  [  104,  8296) block_data          char[GCS_BLOCK_DATA_SIZE]
- *	  [ 8296,  8304) completed_at_ts     TimestampTz (TTL sweep — replied)
- *	  [ 8304,  8312) registered_at_ts    TimestampTz (TTL sweep — in-flight)
+ *	  [  104,   105) has_sf_dep          bool                    spec-6.2
+ *	  [  105,   106) sf_flags            uint8                   spec-6.2
+ *	  [  106,   107) sf_dep_count        uint8                   spec-6.2
+ *	  [  107,   112) _pad1[5]            explicit pad to 8-align
+ *	  [  112,   240) sf_dep_vec          ClusterSfDepVec         spec-6.2
+ *	  [  240,  8432) block_data          char[GCS_BLOCK_DATA_SIZE]
+ *	  [ 8432,  8440) completed_at_ts     TimestampTz (TTL sweep — replied)
+ *	  [ 8440,  8448) registered_at_ts    TimestampTz (TTL sweep — in-flight)
  *
  *	reply_header lands at offset 56 = 8 × 7, satisfying the 8-byte
  *	alignment required by reply_header.request_id (uint64).  block_data
  *	is BLCKSZ.  Both TimestampTz fields are 8-aligned (int64) at offsets
- *	8296 and 8304.
+ *	8432 and 8440.
  *
  *	GRANTED replies fill block_data with the page bytes; non-GRANTED
  *	replies leave block_data zeroed but still occupy 8KB (PG dynahash
@@ -118,15 +123,20 @@ typedef struct GcsBlockDedupEntry {
 	uint8 status;						  /*  1B — GcsBlockReplyStatus */
 	uint8 _pad0[10];					  /* 10B — explicit pad; header @ 56 */
 	GcsBlockReplyHeader reply_header;	  /* 48B — full reply header (HC99) */
+	bool has_sf_dep;					  /*  1B — spec-6.2 v2 dep vector present */
+	uint8 sf_flags;						  /*  1B — GCS_BLOCK_REPLY_SF_* */
+	uint8 sf_dep_count;					  /*  1B — non-empty dep vector entries */
+	uint8 _pad1[5];						  /*  5B — dep_vec @ 112 */
+	ClusterSfDepVec sf_dep_vec;			  /* 128B — spec-6.2 cached v2 deps */
 	char block_data[GCS_BLOCK_DATA_SIZE]; /* 8192B — full page payload */
 	TimestampTz completed_at_ts;		  /*  8B — TTL sweep replied */
 	TimestampTz registered_at_ts;		  /*  8B — TTL sweep in-flight */
 } GcsBlockDedupEntry;
 
-StaticAssertDecl(sizeof(GcsBlockDedupEntry) == 8312,
-				 "spec-2.34 D2 GcsBlockDedupEntry 8312B "
-				 "(key 24 + tag 20 + tx 1 + status 1 + pad 10 + header 48 + "
-				 "block 8192 + completed 8 + registered 8)");
+StaticAssertDecl(offsetof(GcsBlockDedupEntry, sf_dep_vec) == 112,
+				 "spec-6.2 GcsBlockDedupEntry dep vector offset must be 112");
+StaticAssertDecl(sizeof(GcsBlockDedupEntry) == 8448,
+				 "spec-6.2 GcsBlockDedupEntry 8448B with cached Smart Fusion deps");
 
 
 /* ============================================================
@@ -217,6 +227,10 @@ extern void cluster_gcs_block_dedup_install_reply(const GcsBlockDedupKey *key,
 												  GcsBlockReplyStatus status,
 												  const GcsBlockReplyHeader *header,
 												  const char *block_data);
+extern void
+cluster_gcs_block_dedup_install_reply_ex(const GcsBlockDedupKey *key, GcsBlockReplyStatus status,
+										 const GcsBlockReplyHeader *header, const char *block_data,
+										 const ClusterSfDepVec *sf_dep_vec, bool has_sf_dep);
 
 /* Remove a specific entry by key (rare path; mostly used by tests). */
 extern void cluster_gcs_block_dedup_remove(const GcsBlockDedupKey *key);

@@ -363,6 +363,16 @@ typedef enum {
 	 * the acquire fail-closes 53R9L.  DBA sees 'ClusterGCSBlockRecovering' in
 	 * pg_stat_activity. */
 	WAIT_EVENT_GCS_BLOCK_RECOVERING,
+	/* PGRAC (spec-6.2 D10 NEW 4 wait events; Smart Fusion terminal authority).
+	 * COMMIT_BRAKE — commit waits for touched remote-origin dep durability.
+	 * DBWR_BRAKE — writeback/eviction waits for dependent origin durability.
+	 * ORIGIN_DURABLE — origin durable gossip/resolution wait.
+	 * CF_TERMINAL_RESOLVE — terminal authority resolution before visibility.
+	 */
+	WAIT_EVENT_CLUSTER_SMART_FUSION_COMMIT_BRAKE,
+	WAIT_EVENT_CLUSTER_SMART_FUSION_DBWR_BRAKE,
+	WAIT_EVENT_CLUSTER_SMART_FUSION_ORIGIN_DURABLE,
+	WAIT_EVENT_CLUSTER_CF_TERMINAL_RESOLVE,
 
 	/* Cluster: BufferShip (5 events) -- subsystem #5 */
 	WAIT_EVENT_BUFFER_SHIP_CR_BUILD = PG_WAIT_CLUSTER_BUFFERSHIP,

@@ -198,6 +198,11 @@ UNIT_STUB_SUPP=(
   --suppress=constParameterCallback:src/test/cluster_unit/test_cluster_tt_status.c
   # spec-3.2 D10: cluster_visibility_inject test stub same rationale.
   --suppress=constParameterCallback:src/test/cluster_unit/test_cluster_visibility_fork.c
+  # spec-1.1 / spec-1.2 unit stubs mirror ClusterSharedFsOps callback
+  # signatures.  cppcheck 2.20 suggests const-widening the no-op test
+  # callbacks, but doing so would stop matching the production vtable ABI.
+  --suppress=constParameterCallback:src/test/cluster_unit/test_cluster_shared_fs.c
+  --suppress=constParameterCallback:src/test/cluster_unit/test_cluster_smgr.c
   # spec-3.4a D5/D11: ClusterItlTouchCallback and foreach use PG-style
   # `void *arg` callback ABI; const-widening would break production signatures.
   --suppress=constParameterCallback:src/backend/cluster/cluster_itl_touch.c

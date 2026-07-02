@@ -452,6 +452,18 @@ bool cluster_tt_durable_lookup = true;
 bool cluster_tt_recovery_resolve_active = true;
 
 /*
+ * spec-6.2 Cache Fusion terminal authority + Smart Fusion.  Both correctness-
+ * sensitive halves default OFF so an upgraded binary preserves Stage 5
+ * conservative behavior until explicitly enabled.
+ */
+bool cluster_cf_terminal_authority = false;
+int cluster_cf_delayed_cleanout = CLUSTER_CF_DELAYED_CLEANOUT_READER;
+bool cluster_smart_fusion = false;
+int cluster_smart_fusion_tier_min = CLUSTER_IC_TIER_3;
+int cluster_smart_fusion_commit_brake_timeout_ms = 5000;
+int cluster_smart_fusion_origin_durable_gossip_ms = 50;
+
+/*
  * cluster.undo_retention_horizon_enabled (spec-3.12 D5).  When on (default),
  * the TT-slot / undo-segment allocators keep COMMITTED slots/segments alive
  * while a live reader's read_scn still needs the durable pre-image (own-
@@ -822,6 +834,15 @@ static const struct config_enum_entry cluster_interconnect_tier_options[]
 	= { { "stub", CLUSTER_IC_TIER_STUB, false }, { "mock", CLUSTER_IC_TIER_MOCK, false },
 		{ "tier1", CLUSTER_IC_TIER_1, false },	 { "tier2", CLUSTER_IC_TIER_2, false },
 		{ "tier3", CLUSTER_IC_TIER_3, false },	 { NULL, 0, false } };
+
+static const struct config_enum_entry cluster_cf_delayed_cleanout_options[]
+	= { { "off", CLUSTER_CF_DELAYED_CLEANOUT_OFF, false },
+		{ "reader", CLUSTER_CF_DELAYED_CLEANOUT_READER, false },
+		{ "eager", CLUSTER_CF_DELAYED_CLEANOUT_EAGER, false },
+		{ NULL, 0, false } };
+
+static const struct config_enum_entry cluster_smart_fusion_tier_min_options[]
+	= { { "tier3", CLUSTER_IC_TIER_3, false }, { NULL, 0, false } };
 
 static const struct config_enum_entry cluster_interconnect_rdma_fallback_options[]
 	= { { "auto", CLUSTER_IC_RDMA_FALLBACK_AUTO, false },
@@ -2780,6 +2801,64 @@ cluster_init_guc(void)
 					 "the resolution: slots stay ACTIVE and fall through to the by-xid 0-match "
 					 "path (no correctness loss, only the explicit verdict + housekeeping)."),
 		&cluster_tt_recovery_resolve_active, true, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"cluster.cf_terminal_authority",
+		gettext_noop("Enable spec-6.2 Cache Fusion durable TT/undo terminal authority."),
+		gettext_noop("Spec-6.2. Default off, preserving the Stage 5 conservative active-ITL "
+					 "transfer boundary. When on, cross-instance undo / TT terminal decisions "
+					 "must prove membership epoch, ownership, terminal outcome, and required "
+					 "durable/retention evidence before callers may trust them. Missing evidence "
+					 "fails closed; there is no native fallback or UNKNOWN-visible behavior."),
+		&cluster_cf_terminal_authority, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	DefineCustomEnumVariable(
+		"cluster.cf_delayed_cleanout",
+		gettext_noop("Choose the spec-6.2 delayed ITL cleanout policy."),
+		gettext_noop("Spec-6.2. Values: off never writes back ITL hints; reader performs lazy "
+					 "reader-path cleanout from durable TT authority; eager is reserved for a "
+					 "future transfer-side sweep. The setting only controls hinting; verdicts "
+					 "still come from durable TT authority and fail closed when unresolved."),
+		&cluster_cf_delayed_cleanout, CLUSTER_CF_DELAYED_CLEANOUT_READER,
+		cluster_cf_delayed_cleanout_options, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"cluster.smart_fusion",
+		gettext_noop("Enable spec-6.2 Smart Fusion early block-transfer dependency tracking."),
+		gettext_noop("Spec-6.2. Default off. When enabled with an authenticated tier3 direct-wire "
+					 "link and negotiated block-reply v2, dirty block transfer may overlap the "
+					 "origin WAL flush, with DBWR/checkpoint and commit brakes preserving "
+					 "WAL-before-data and commit-return soundness. Without those gates, the "
+					 "system stays on the conservative HC82 WAL-before-ship path."),
+		&cluster_smart_fusion, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	DefineCustomEnumVariable(
+		"cluster.smart_fusion_tier_min",
+		gettext_noop("Minimum interconnect tier that may use Smart Fusion early transfer."),
+		gettext_noop("Spec-6.2. Only tier3 is currently legal: Smart Fusion requires an "
+					 "authenticated direct-wire path. TCP/tier1/tier2 deployments remain on "
+					 "HC82 WAL-before-ship even if cluster.smart_fusion is on."),
+		&cluster_smart_fusion_tier_min, CLUSTER_IC_TIER_3, cluster_smart_fusion_tier_min_options,
+		PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.smart_fusion_commit_brake_timeout_ms",
+		gettext_noop("Timeout for the spec-6.2 Smart Fusion pre-commit dependency brake."),
+		gettext_noop("A transaction that consumed an early-transfer dependent block waits up to "
+					 "this many milliseconds, before writing its commit record, for all origin "
+					 "redo dependencies to become durable. Timeout aborts the transaction with "
+					 "a retryable Smart Fusion error instead of false-committing."),
+		&cluster_smart_fusion_commit_brake_timeout_ms, 5000, 1, 600000, PGC_SIGHUP, GUC_UNIT_MS,
+		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.smart_fusion_origin_durable_gossip_ms",
+		gettext_noop("Interval for publishing local durable WAL progress to Smart Fusion peers."),
+		gettext_noop("Spec-6.2 origin durable-LSN gossip interval. Receivers release DBWR and "
+					 "commit brakes only after observing durable progress; they never trust a "
+					 "block marker as proof of durability."),
+		&cluster_smart_fusion_origin_durable_gossip_ms, 50, 1, 60000, PGC_SIGHUP, GUC_UNIT_MS, NULL,
+		NULL, NULL);
 
 	DefineCustomIntVariable(
 		"cluster.cr_cache_max_blocks",

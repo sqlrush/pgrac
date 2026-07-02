@@ -111,6 +111,7 @@
 #include "cluster/cluster_resolver_cache.h" /* cluster_resolver_cache_shmem_register (spec-5.55 D3) */
 #include "cluster/cluster_cr_coordinator_stat.h" /* cluster_cr_coordinator_shmem_register (spec-5.57 D3) */
 #include "cluster/cluster_tt_durable.h" /* cluster_tt_durable_shmem_register (spec-3.11 D7) */
+#include "cluster/cluster_sf_dep.h"		/* cluster_sf_dep_shmem_register (spec-6.2 D6) */
 #include "cluster/cluster_visibility_inject.h" /* cluster_visibility_inject_shmem_register (spec-3.2 D5b) */
 #include "cluster/cluster_itl.h"			   /* cluster_lock_path_shmem_register (spec-3.4e D6) */
 #include "cluster/cluster_qvotec.h" /* cluster_qvotec_shmem_register (spec-2.6 Sprint A Step 1) */
@@ -540,6 +541,11 @@ cluster_init_shmem_module(void)
 	 * counters, 0 LWLock).
 	 */
 	cluster_tt_durable_shmem_register();
+
+	/* spec-6.2 D6: Smart Fusion dependency-vector store.  Size is zero unless
+	 * cluster.smart_fusion=on, preserving default-off behavior. */
+	if (cluster_shmem_lookup_region("pgrac cluster smart fusion deps") == NULL)
+		cluster_sf_dep_shmem_register();
 
 	/*
 	 * spec-3.2 D5b: register test-only visibility inject shmem.  The

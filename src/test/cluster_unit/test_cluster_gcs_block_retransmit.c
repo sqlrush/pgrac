@@ -17,10 +17,10 @@
  *	  live):
  *	    L1  GcsBlockReplyStatus enum extends to 8 values (DENIED_DEDUP_FULL=7)
  *	    L2  GcsBlockDedupKey == 24B + offset lock
- *	    L3  GcsBlockDedupEntry == 8312B fixed-size StaticAssertDecl
- *	    L4  GcsBlockDedupEntry.block_data offset 104 + size BLCKSZ
+ *	    L3  GcsBlockDedupEntry == 8448B fixed-size StaticAssertDecl
+ *	    L4  GcsBlockDedupEntry.sf_dep_vec offset 112, block_data offset 240
  *	    L5  GcsBlockDedupEntry.reply_header offset 56 (8-aligned for uint64)
- *	    L6  GcsBlockDedupEntry.completed_at_ts offset 8296 + registered 8304
+ *	    L6  GcsBlockDedupEntry.completed_at_ts offset 8432 + registered 8440
  *	    L7  GcsBlockDedupResult enum 5 values
  *	    L8  Retry math: backoff[N] = initial × 2^(N-1) (N=1..4 → 100/200/400/800)
  *	    L9  Total sends = 1 + max_retries
@@ -108,15 +108,16 @@ UT_TEST(test_dedup_key_size_and_offsets)
 }
 
 
-UT_TEST(test_dedup_entry_size_locked_at_8312)
+UT_TEST(test_dedup_entry_size_locked_at_8448)
 {
-	UT_ASSERT_EQ((int)sizeof(GcsBlockDedupEntry), 8312);
+	UT_ASSERT_EQ((int)sizeof(GcsBlockDedupEntry), 8448);
 }
 
 
-UT_TEST(test_dedup_entry_block_data_offset_and_size)
+UT_TEST(test_dedup_entry_smart_fusion_dep_and_block_offsets)
 {
-	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, block_data), 104);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, sf_dep_vec), 112);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, block_data), 240);
 	UT_ASSERT_EQ((int)GCS_BLOCK_DATA_SIZE, BLCKSZ);
 }
 
@@ -132,8 +133,8 @@ UT_TEST(test_dedup_entry_reply_header_offset_8_aligned)
 
 UT_TEST(test_dedup_entry_ttl_anchor_offsets)
 {
-	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, completed_at_ts), 8296);
-	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, registered_at_ts), 8304);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, completed_at_ts), 8432);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, registered_at_ts), 8440);
 	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, completed_at_ts) % 8, 0);
 	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, registered_at_ts) % 8, 0);
 }
@@ -195,7 +196,7 @@ UT_TEST(test_new_wait_events_distinct)
 }
 
 
-UT_TEST(test_cluster_wait_events_count_112)
+UT_TEST(test_cluster_wait_events_count_116)
 {
 	/* spec-2.34 D7: 83 → 85 (+ 2 reliability wait events).
 	 * spec-2.36 D8: 85 → 88 (+ 3 CF 3-way wait events).
@@ -205,8 +206,8 @@ UT_TEST(test_cluster_wait_events_count_112)
 	 * spec-4.6 D4: 97 → 98 (+ 1 GRD shard remaster short-wait).
 	 * spec-4.7 D1: 98 → 99 (+ 1 GCS block RECOVERING short-wait).
 	 * spec-4.11 D5: 99 → 100 (+ 1 online thread recovery short-wait).
-	 * spec-6.1 D8 current snapshot: 112. */
-	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 112);
+	 * spec-6.2 D10 current snapshot: 116. */
+	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 116);
 }
 
 
@@ -302,8 +303,8 @@ main(void)
 	UT_PLAN(24);
 	UT_RUN(test_dedup_full_status_enum_value);
 	UT_RUN(test_dedup_key_size_and_offsets);
-	UT_RUN(test_dedup_entry_size_locked_at_8312);
-	UT_RUN(test_dedup_entry_block_data_offset_and_size);
+	UT_RUN(test_dedup_entry_size_locked_at_8448);
+	UT_RUN(test_dedup_entry_smart_fusion_dep_and_block_offsets);
 	UT_RUN(test_dedup_entry_reply_header_offset_8_aligned);
 	UT_RUN(test_dedup_entry_ttl_anchor_offsets);
 	UT_RUN(test_dedup_result_enum_has_5_values);
@@ -312,7 +313,7 @@ main(void)
 	UT_RUN(test_retry_total_backoff_default_1500ms);
 	UT_RUN(test_lwtranche_distinct);
 	UT_RUN(test_new_wait_events_distinct);
-	UT_RUN(test_cluster_wait_events_count_112);
+	UT_RUN(test_cluster_wait_events_count_116);
 	UT_RUN(test_dedup_full_status_distinct_from_master_not_holder);
 	UT_RUN(test_block_data_size_equals_blcksz);
 	UT_RUN(test_dedup_entry_collision_field_layout);

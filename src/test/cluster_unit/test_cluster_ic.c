@@ -83,6 +83,8 @@
 
 int cluster_node_id = -1;
 int cluster_interconnect_tier = 0; /* CLUSTER_IC_TIER_STUB */
+bool cluster_smart_fusion = false;
+int cluster_smart_fusion_tier_min = CLUSTER_IC_TIER_3;
 
 /* spec-5.59 D1 stubs: cluster_ic.o now carries GUC-gated profiling probes
  * (cluster_xnode_profile.h); the unit harness links neither cluster_guc.o
@@ -580,6 +582,40 @@ UT_TEST(test_hello_wire_reference_bytes)
 		UT_ASSERT_EQ(wire[i], 0);
 }
 
+UT_TEST(test_hello_smart_fusion_capability_gate)
+{
+	uint8 wire[PGRAC_IC_HELLO_BYTES];
+	ClusterICHelloMsg parsed;
+
+	cluster_smart_fusion = false;
+	cluster_interconnect_tier = CLUSTER_IC_TIER_3;
+	cluster_smart_fusion_tier_min = CLUSTER_IC_TIER_3;
+	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 1,
+						   "sf-off");
+	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
+	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed), 0);
+
+	cluster_smart_fusion = true;
+	cluster_interconnect_tier = CLUSTER_IC_TIER_2;
+	cluster_smart_fusion_tier_min = CLUSTER_IC_TIER_3;
+	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 1,
+						   "sf-tier-mismatch");
+	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
+	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed), 0);
+
+	cluster_smart_fusion = true;
+	cluster_interconnect_tier = CLUSTER_IC_TIER_3;
+	cluster_smart_fusion_tier_min = CLUSTER_IC_TIER_3;
+	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 1,
+						   "sf-tier-match");
+	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
+	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed), PGRAC_IC_HELLO_CAP_SMART_FUSION_REPLY_V2);
+
+	cluster_smart_fusion = false;
+	cluster_interconnect_tier = CLUSTER_IC_TIER_STUB;
+	cluster_smart_fusion_tier_min = CLUSTER_IC_TIER_3;
+}
+
 UT_TEST(test_hello_parse_rejects_bad_magic)
 {
 	uint8 wire[PGRAC_IC_HELLO_BYTES];
@@ -618,7 +654,7 @@ UT_TEST(test_hello_build_truncates_long_name)
 int
 main(void)
 {
-	UT_PLAN(19); /* spec-2.3 D3: 6 ClusterMsgHeader/msg_send/recv tests deleted */
+	UT_PLAN(20); /* spec-2.3 D3: 6 ClusterMsgHeader/msg_send/recv tests deleted */
 	UT_RUN(test_ic_send_bytes_linkable);
 	UT_RUN(test_ic_recv_bytes_linkable);
 	UT_RUN(test_ic_init_linkable);
@@ -638,6 +674,7 @@ main(void)
 	/* HELLO wire encode/decode + reference bytes (post-codex review) */
 	UT_RUN(test_hello_wire_roundtrip);
 	UT_RUN(test_hello_wire_reference_bytes);
+	UT_RUN(test_hello_smart_fusion_capability_gate);
 	UT_RUN(test_hello_parse_rejects_bad_magic);
 	UT_RUN(test_hello_build_truncates_long_name);
 	UT_DONE();

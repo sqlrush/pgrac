@@ -67,6 +67,8 @@
 
 int cluster_node_id = -1;
 int cluster_interconnect_tier = 0;
+bool cluster_smart_fusion = false;
+int cluster_smart_fusion_tier_min = CLUSTER_IC_TIER_3;
 
 /* spec-5.59 D6 stubs: cluster_ic.o now carries GUC-gated profiling probes
  * (cluster_xnode_profile.h); the unit harness links neither cluster_guc.o

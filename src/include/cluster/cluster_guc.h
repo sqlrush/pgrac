@@ -610,6 +610,19 @@ extern bool cluster_tt_durable_lookup;
 /* spec-4.8 D1: resolve crash-left ACTIVE TT slots to ABORTED at startup
  * (default on; PGC_POSTMASTER). */
 extern bool cluster_tt_recovery_resolve_active;
+typedef enum ClusterCfDelayedCleanoutMode {
+	CLUSTER_CF_DELAYED_CLEANOUT_OFF = 0,
+	CLUSTER_CF_DELAYED_CLEANOUT_READER,
+	CLUSTER_CF_DELAYED_CLEANOUT_EAGER
+} ClusterCfDelayedCleanoutMode;
+
+/* spec-6.2 Cache Fusion terminal authority + Smart Fusion. */
+extern bool cluster_cf_terminal_authority;
+extern int cluster_cf_delayed_cleanout;
+extern bool cluster_smart_fusion;
+extern int cluster_smart_fusion_tier_min;
+extern int cluster_smart_fusion_commit_brake_timeout_ms;
+extern int cluster_smart_fusion_origin_durable_gossip_ms;
 
 
 /*

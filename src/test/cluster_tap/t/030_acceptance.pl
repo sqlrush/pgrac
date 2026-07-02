@@ -146,8 +146,8 @@ ok($phase_val =~ /^(init|running|shutdown|reconfig)$/,
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'112',
-	'E1 pg_stat_cluster_wait_events returns 112 rows (spec-6.0a +7 storage wait events)');
+	'116',
+	'E1 pg_stat_cluster_wait_events returns 116 rows (spec-6.2 Smart Fusion authority waits)');
 
 ok($node->safe_psql('postgres',
 		q{SELECT count(*) > 0 FROM pg_stat_cluster_wait_events WHERE type='Cluster: GES'})
@@ -159,7 +159,7 @@ ok($node->safe_psql('postgres',
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_gcluster_wait_events'),
-	'112', 'E4 pg_stat_gcluster_wait_events returns 112 rows (single-node, spec-6.0a baseline)');
+	'116', 'E4 pg_stat_gcluster_wait_events returns 116 rows (single-node, spec-6.2 Smart Fusion authority waits)');
 
 
 # ============================================================
@@ -180,7 +180,7 @@ ok($serr =~ /unknown cluster injection point/i,
 
 
 # ============================================================
-# §G  GUC framework (4 tests)
+# §G  GUC framework (9 tests)
 # ============================================================
 
 is($node->get_cluster_state_value('guc', 'cluster.node_id'),
@@ -197,6 +197,19 @@ ok($node->get_cluster_state_value('guc', 'cluster.injection_points') ne '',
 
 is($node->get_cluster_state_value('guc', 'cluster.shared_storage_backend'),
 	'stub', 'G5 dump shows cluster.shared_storage_backend GUC (default stub, stage 1.1)');
+
+is($node->safe_psql('postgres',
+		q{SELECT setting FROM pg_settings WHERE name='cluster.cf_terminal_authority'}),
+	'off', 'G6 pg_settings shows cluster.cf_terminal_authority default off');
+
+is($node->get_cluster_state_value('guc', 'cluster.cf_terminal_authority'),
+	'f', 'G7 dump shows cluster.cf_terminal_authority GUC');
+
+is($node->get_cluster_state_value('guc', 'cluster.cf_delayed_cleanout'),
+	'reader', 'G8 dump shows cluster.cf_delayed_cleanout GUC');
+
+is($node->get_cluster_state_value('guc', 'cluster.smart_fusion_tier_min'),
+	'tier3', 'G9 dump shows cluster.smart_fusion_tier_min GUC');
 
 
 # ============================================================

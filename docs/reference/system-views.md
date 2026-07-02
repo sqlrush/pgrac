@@ -17,6 +17,7 @@ operator-facing.
 | `pg_cluster_backup_history` | Latest cluster backup manifest summary |
 | `pg_cluster_restore_points` | Cluster restore points visible to PITR status |
 | `pg_cluster_pitr_status` | Cluster PITR target reachability status |
+| `pg_cluster_state` | Diagnostic snapshot of cluster GUCs, counters, and subsystem state |
 
 ## Cluster Backup / PITR Views
 
@@ -111,6 +112,57 @@ SELECT * FROM pg_cluster_backup_stop(true);
 SELECT * FROM pg_cluster_create_restore_point('rp1');
 ```
 
+## pg_cluster_state
+
+Diagnostic view over `cluster_dump_state()`.  It returns `(category,
+key, value)` text rows and is intended for TAP smoke tests, operator
+triage, and perf-gate snapshots.  The view never uses NULL values; an
+unknown or inactive counter is reported as `0`, `off`, or another
+explicit string.
+
+Spec-6.2 adds the Smart Fusion terminal-authority surface:
+
+| Category | Key | Meaning |
+|---|---|---|
+| `guc` | `cluster.cf_terminal_authority` | Live GUC value; `t` means terminal authority is enabled. |
+| `guc` | `cluster.cf_delayed_cleanout` | Terminal-authority cleanout policy: `off`, `reader`, or `eager`. |
+| `guc` | `cluster.smart_fusion` | Live GUC value; `t` means Smart Fusion early-transfer dependency tracking is enabled. |
+| `guc` | `cluster.smart_fusion_tier_min` | Minimum negotiated interconnect tier required for v2 Smart Fusion block replies. |
+| `guc` | `cluster.smart_fusion_commit_brake_timeout_ms` | Pre-commit dependency brake timeout. |
+| `guc` | `cluster.smart_fusion_origin_durable_gossip_ms` | Durable-LSN gossip interval for dependency release. |
+| `undo` | `terminal_authority_check_count` | Total authority decisions evaluated. |
+| `undo` | `terminal_authority_ok_count` | Decisions that had complete authority evidence. |
+| `undo` | `terminal_authority_failclosed_count` | Decisions rejected fail-closed for any reason. |
+| `undo` | `terminal_authority_epoch_failclosed_count` | Missing or changed membership epoch evidence. |
+| `undo` | `terminal_authority_ownership_failclosed_count` | Invalid origin/xid or origin ownership mismatch. |
+| `undo` | `terminal_authority_unknown_failclosed_count` | Disabled authority, missing terminal state, or missing commit SCN. |
+| `undo` | `terminal_authority_nonterminal_failclosed_count` | In-progress/non-terminal remote outcome. |
+| `undo` | `terminal_authority_durable_failclosed_count` | Missing or mismatched durable-TT commit proof. |
+| `undo` | `terminal_authority_retention_failclosed_count` | Retention proof was required but unavailable. |
+| `smart_fusion` | `dep_install_count` | Early-transfer dependency vectors installed for received block images. |
+| `smart_fusion` | `dep_touch_count` | Transaction-local touches of buffers with pending Smart Fusion dependencies. |
+| `smart_fusion` | `dbwr_brake_count` | Buffer writeback attempts blocked because origin redo durability is unproven. |
+| `smart_fusion` | `commit_brake_count` | Transactions that entered the pre-commit dependency brake. |
+| `smart_fusion` | `commit_brake_wait_us` | Total microseconds spent waiting in the pre-commit dependency brake. |
+| `smart_fusion` | `origin_suspect_count` | Pending dependencies associated with an origin suspected dead or unavailable. |
+| `smart_fusion` | `dep_lost_failclosed_count` | Missing or malformed dependency evidence rejected fail-closed. |
+| `smart_fusion` | `retry_failclosed_count` | Retryable Smart Fusion fail-closed outcomes, primarily commit-brake timeout. |
+
+Example:
+
+```sql
+SELECT key, value
+  FROM pg_cluster_state
+ WHERE category = 'undo'
+   AND key LIKE 'terminal_authority_%'
+ ORDER BY key;
+
+SELECT key, value
+  FROM pg_cluster_state
+ WHERE category = 'smart_fusion'
+ ORDER BY key;
+```
+
 ## pg_cluster_nodes
 
 Returns one row per node declared in `pgrac.conf`.  In single-node
@@ -154,7 +206,7 @@ SELECT role, count(*) FROM pg_cluster_nodes GROUP BY role;
 ## pg_stat_cluster_wait_events
 
 Lists the cluster-specific wait event registry on the local node.
-Always returns 112 rows in `--enable-cluster` builds (one per
+Always returns 116 rows in `--enable-cluster` builds (one per
 registered cluster wait event).
 
 ### Columns
@@ -182,7 +234,7 @@ See [Wait events](wait-events.md) for the full event roster.
 ## pg_stat_gcluster_wait_events
 
 Cross-node placeholder for cluster-wide wait events.  In the
-current release returns 112 rows for the local node only;
+current release returns 116 rows for the local node only;
 `node_id` is always the value of the local `cluster.node_id` GUC.
 
 The column shape `(node_id, type, name)` is the public contract

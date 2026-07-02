@@ -177,6 +177,8 @@ OBJS = \
 	cluster_tt_2pc_record.o \
 	cluster_tt_durable.o \
 	cluster_tt_durable_stat.o \
+	cluster_terminal_authority.o \
+	cluster_sf_dep.o \
 	cluster_tt_recovery.o \
 	cluster_tt_local.o \
 	cluster_tt_status.o \

@@ -51,7 +51,7 @@
  *	internal table in cluster_views.c stays in sync with the enum.
  */
 #define CLUSTER_WAIT_EVENTS_COUNT                                                                  \
-	112 /* spec-6.1 D8: RDMA send/recv/poll/connect/fallback events included */
+	116 /* spec-6.2 D10: Smart Fusion terminal authority waits included */
 
 
 /*

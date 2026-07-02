@@ -612,6 +612,13 @@ void
 cluster_tt_durable_shmem_register(void)
 {}
 
+/* spec-6.2 D6 stub: cluster_init_shmem_module also calls
+ * cluster_sf_dep_shmem_register (cluster_sf_dep.c).  cluster_unit test binary
+ * doesn't link that object; provide a no-op stub. */
+void
+cluster_sf_dep_shmem_register(void)
+{}
+
 /*
  * spec-5.52 D9 stub: cluster_init_shmem_module also registers the independent
  * admission reason-counter region (cluster_cr_admit_stat.c is not linked into
