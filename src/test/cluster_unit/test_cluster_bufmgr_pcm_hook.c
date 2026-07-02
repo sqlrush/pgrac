@@ -78,6 +78,18 @@ bool cluster_enabled = true; /* PGRAC: spec-2.31 D2 helper depends on this */
  * honest (local buf->pcm_state retention, no peer liveness needed). */
 bool cluster_gcs_block_local_cache = true;
 
+/* spec-6.12a stubs — the local-master S->X upgrade branch is wave-gated off
+ * (cluster_read_scache default false), so it is inert here; provide inert
+ * link-surface satisfaction.  Real coverage is t/336 (2-node). */
+bool cluster_read_scache = false;
+
+bool cluster_gcs_block_local_x_upgrade(BufferTag tag);
+bool
+cluster_gcs_block_local_x_upgrade(BufferTag tag pg_attribute_unused())
+{
+	return false;
+}
+
 /* spec-4.7a D4 — cluster_pcm_lock.o now references cluster_cssd_get_peer_state
  * (the other-live-holder gate).  This test links cluster_pcm_lock.o, so it
  * must provide the symbol; return ALIVE (this test does not exercise the D4

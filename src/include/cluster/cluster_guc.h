@@ -154,6 +154,9 @@ extern bool cluster_xnode_profile_enabled;
 /* spec-6.12c: resolver terminal memo switch (default off). */
 extern bool cluster_page_scn_shortcut;
 
+/* spec-6.12a: quiescent S-cache switch (default off). */
+extern bool cluster_read_scache;
+
 
 /*
  * cluster_injection_points -- comma-separated names to auto-arm at startup.

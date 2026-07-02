@@ -86,6 +86,8 @@ int cluster_recovery_merge_wait_timeout = 10000;
 bool cluster_xnode_profile_enabled = false;
 /* spec-6.12c: read-layer-3 resolver terminal memo (default OFF). */
 bool cluster_page_scn_shortcut = false;
+/* spec-6.12a: quiescent-block S-cache via X->S downgrade (default OFF). */
+bool cluster_read_scache = false;
 /* spec-6.5: cluster-aware backup / restore / PITR target knobs. */
 char *cluster_recovery_target_scn = NULL;
 char *cluster_recovery_target_cluster_time = NULL;
@@ -1307,6 +1309,24 @@ cluster_init_guc(void)
 		gettext_noop("Enable the cross-node visibility resolver terminal-outcome memo."),
 		gettext_noop("Off keeps the per-tuple TT lookup path byte-identical."),
 		&cluster_page_scn_shortcut, false, PGC_SUSET, 0, NULL, NULL, NULL);
+
+	/*
+	 * cluster.read_scache -- spec-6.12 wave a (read layer 1).  When on, a
+	 * master==holder node serving a cross-node read of a QUIESCENT block
+	 * (no active ITL) flushes the page storage-current, downgrades its own
+	 * PCM X to S and grants the requester a durable S copy instead of a
+	 * one-shot read image -- repeat reads then hit the requester's local S
+	 * buffer with zero wire traffic (LockBuffer covered-mode fast path).
+	 * The pre-existing S invalidate-before-X machinery provides the real
+	 * invalidation path; S also becomes a revoked-write state at the ITL
+	 * forward-write gate.  Default OFF: every cross-node read of an X-held
+	 * block keeps the one-shot read-image behaviour (5.59 baseline).
+	 * SIGHUP: the decision runs in the LMON serve path, not per-session.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.read_scache", gettext_noop("Enable quiescent-block S-caching via X->S downgrade."),
+		gettext_noop("Off keeps one-shot read-image shipping for X-held blocks."),
+		&cluster_read_scache, false, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	/*
 	 * cluster.clean_leave_enabled -- opt-in cooperative clean-leave

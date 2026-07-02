@@ -75,6 +75,9 @@ cluster_xnode_lever_shmem_init(void)
 		pg_atomic_init_u64(&ClusterXnodeLeverCtl->c_memo_install_count, 0);
 		pg_atomic_init_u64(&ClusterXnodeLeverCtl->c_stamp_cached_seen_count, 0);
 		pg_atomic_init_u64(&ClusterXnodeLeverCtl->c_stamp_contradicted_count, 0);
+		pg_atomic_init_u64(&ClusterXnodeLeverCtl->a_downgrade_count, 0);
+		pg_atomic_init_u64(&ClusterXnodeLeverCtl->a_downgrade_refused_count, 0);
+		pg_atomic_init_u64(&ClusterXnodeLeverCtl->a_fwd_oneshot_count, 0);
 	}
 }
 
@@ -201,4 +204,31 @@ cluster_lever_c_note_tt_lookup(bool stamp_cached_present, bool stamp_contradicte
 		pg_atomic_fetch_add_u64(&ClusterXnodeLeverCtl->c_stamp_cached_seen_count, 1);
 	if (stamp_contradicted)
 		pg_atomic_fetch_add_u64(&ClusterXnodeLeverCtl->c_stamp_contradicted_count, 1);
+}
+
+/* ---------------- wave-a measure hooks ---------------- */
+
+static inline bool
+lever_a_counting(void)
+{
+	return (cluster_read_scache || cluster_xnode_profile_enabled) && ClusterXnodeLeverCtl != NULL;
+}
+
+void
+cluster_lever_a_note_downgrade(bool downgraded)
+{
+	if (!lever_a_counting())
+		return;
+	if (downgraded)
+		pg_atomic_fetch_add_u64(&ClusterXnodeLeverCtl->a_downgrade_count, 1);
+	else
+		pg_atomic_fetch_add_u64(&ClusterXnodeLeverCtl->a_downgrade_refused_count, 1);
+}
+
+void
+cluster_lever_a_note_fwd_oneshot(void)
+{
+	if (!lever_a_counting())
+		return;
+	pg_atomic_fetch_add_u64(&ClusterXnodeLeverCtl->a_fwd_oneshot_count, 1);
 }

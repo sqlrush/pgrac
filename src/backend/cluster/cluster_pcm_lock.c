@@ -1749,6 +1749,23 @@ cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode)
 					ConditionVariableCancelSleep();
 				return;
 			}
+			/*
+			 * PGRAC: spec-6.12a — idempotent X re-acquire.  This NODE already
+			 * holds X (e.g. a second local backend raced in after a quiescent
+			 * X->S downgrade + local upgrade flipped buf->pcm_state, or the
+			 * covering-mode cache was bypassed).  Node-level X is already
+			 * ours; PG's buffer content lock serializes the local backends.
+			 * Mirrors the spec-4.7a D3 master-handler idempotent re-ack.
+			 * Without this branch the second backend would CV-wait forever
+			 * (nothing ever broadcasts for a state that is already granted).
+			 */
+			if (cur == PCM_STATE_X && entry->x_holder_node == holder_node) {
+				LWLockRelease(&entry->entry_lock.lock);
+				if (cv_prepared)
+					ConditionVariableCancelSleep();
+				return;
+			}
+
 			holders = pg_atomic_read_u32(&entry->s_holders_bitmap);
 			if (cur == PCM_STATE_S && (holders & holder_bit) != 0 && (holders & ~holder_bit) == 0) {
 				/*
@@ -1800,6 +1817,38 @@ cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode)
 					remote_live = true;
 
 			if (remote_live) {
+				/*
+				 * PGRAC: spec-6.12a — LOCAL-master S->X upgrade.  When the
+				 * conflict is ONLY remote S copies (the quiescent X->S
+				 * downgrade parked them there) and this node is itself an S
+				 * holder, revoke them: pending_x barrier + INVALIDATE via
+				 * the backend outbound ring + ack-certified bit clearing +
+				 * S_TO_X_UPGRADE (cluster_gcs_block_local_x_upgrade).  A
+				 * remote X conflict stays on the pre-6.12a fail-closed
+				 * (writer transfer is spec-2.36 / 4.7 territory).
+				 */
+				if (cluster_read_scache && mode == PCM_LOCK_MODE_X && cur == PCM_STATE_S
+					&& (confl_x < 0 || confl_x == holder_node)
+					&& (pg_atomic_read_u32(&entry->s_holders_bitmap) & holder_bit) != 0) {
+					LWLockRelease(&entry->entry_lock.lock);
+					if (cv_prepared) {
+						ConditionVariableCancelSleep();
+						cv_prepared = false;
+					}
+					if (cluster_gcs_block_local_x_upgrade(tag)) {
+						pcm_entry_lock_exclusive(entry);
+						entry->s_holder_refcount_local = 0;
+						LWLockRelease(&entry->entry_lock.lock);
+						return;
+					}
+					/* Invalidate did not complete — fail closed, retryable
+					 * (Rule 8.A: never write past an unconfirmed invalidate). */
+					ereport(ERROR, (errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+									errmsg("cluster_pcm: S->X upgrade invalidate did not complete"),
+									errhint("Remote S holders did not all acknowledge in time; "
+											"retry the statement.")));
+				}
+
 				LWLockRelease(&entry->entry_lock.lock);
 				if (cv_prepared)
 					ConditionVariableCancelSleep();

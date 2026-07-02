@@ -69,6 +69,12 @@ typedef struct ClusterXnodeLeverShared {
 	 */
 	pg_atomic_uint64 c_stamp_cached_seen_count;
 	pg_atomic_uint64 c_stamp_contradicted_count;
+
+	/* ---- wave a: quiescent S-cache via X->S downgrade ---- */
+	pg_atomic_uint64 a_downgrade_count;			/* X->S self-downgrades served */
+	pg_atomic_uint64 a_downgrade_refused_count; /* candidates that stayed one-shot */
+	pg_atomic_uint64 a_fwd_oneshot_count;		/* forwarded X-held reads (MVP: no
+												 * remote-holder downgrade) */
 } ClusterXnodeLeverShared;
 
 /* Set once by shmem init; NULL until the region is attached. */
@@ -96,5 +102,12 @@ extern void cluster_vis_memo_install(const ClusterTTStatusKey *key, uint8 status
  */
 extern void cluster_lever_c_note_resolve(void);
 extern void cluster_lever_c_note_tt_lookup(bool stamp_cached_present, bool stamp_contradicted);
+
+/*
+ * Wave-a counters (ticked from the GCS serve path; cheap, gated on the
+ * wave GUC or cluster.xnode_profile inside).
+ */
+extern void cluster_lever_a_note_downgrade(bool downgraded);
+extern void cluster_lever_a_note_fwd_oneshot(void);
 
 #endif /* CLUSTER_XNODE_LEVER_H */

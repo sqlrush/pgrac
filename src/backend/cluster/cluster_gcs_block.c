@@ -53,6 +53,7 @@
 #include "cluster/cluster_qvotec.h"			/* spec-5.16 D3b — in_quorum master-side gate */
 #include "cluster/cluster_recovery_merge.h" /* spec-4.7 D5 — recovered_through redo gate */
 #include "cluster/cluster_xnode_profile.h"	/* spec-5.59 D2/D3/D4 profiling buckets */
+#include "cluster/cluster_xnode_lever.h"	/* spec-6.12a — downgrade counters */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_itl.h" /* spec-5.2 D11 — active-ITL writer-transfer guard */
@@ -217,6 +218,11 @@ typedef struct ClusterGcsBlockShared {
 	pg_atomic_uint32 invalidate_broadcast_acked_bm;	   /* holders ack'd so far */
 	LWLockPadded invalidate_broadcast_lock;			   /* protects identity + ack bitmap */
 	ConditionVariable invalidate_broadcast_cv;
+	/* PGRAC: spec-6.12a — request-id source for the LOCAL-master S->X
+	 * upgrade's invalidate broadcast (backend-context caller has no wire
+	 * request to borrow an id from; uniqueness vs stale acks is all the
+	 * slot needs). */
+	pg_atomic_uint64 local_upgrade_request_seq;
 } ClusterGcsBlockShared;
 
 
@@ -373,6 +379,8 @@ cluster_gcs_block_shmem_init(void)
 		LWLockInitialize(&ClusterGcsBlock->invalidate_broadcast_lock.lock,
 						 LWTRANCHE_CLUSTER_GCS_BLOCK);
 		ConditionVariableInit(&ClusterGcsBlock->invalidate_broadcast_cv);
+		/* PGRAC: spec-6.12a — local-upgrade broadcast id source. */
+		pg_atomic_init_u64(&ClusterGcsBlock->local_upgrade_request_seq, 0);
 
 		if (gcs_block_backend_blocks == NULL)
 			return;
@@ -2824,6 +2832,25 @@ x_path_skipped:
 				 * never folded into requester pp. */
 				ClusterXpScope xp_ship;
 
+				/*
+				 * PGRAC: spec-6.12a — quiescent S-cache.  Master==holder and the
+				 * read targets our X-held block: when the wave GUC is on and the
+				 * block is quiescent, flush it storage-current, self-downgrade
+				 * X->S and DON'T take the one-shot read-image path — control
+				 * falls through to the base master flow below, which now sees
+				 * state S with a resident buffer and serves a durable GRANTED
+				 * (image + requester N->S registration).  Repeat reads then hit
+				 * the requester's cached S copy locally.  Refusal (active ITL /
+				 * state raced / flush unavailable) keeps today's one-shot ship.
+				 */
+				if (cluster_read_scache) {
+					bool downgraded = cluster_bufmgr_downgrade_x_to_s_for_gcs(req->tag);
+
+					cluster_lever_a_note_downgrade(downgraded);
+					if (downgraded)
+						goto scache_downgraded_fall_through;
+				}
+
 				cluster_xp_begin(&xp_ship, CLXP_R_READIMAGE_SHIP);
 				/* Master holds X locally: ship its current image without revoking X. */
 				if (gcs_block_get_ship_image(req->tag, req->sender_node, &page_lsn, block_buf,
@@ -2861,6 +2888,9 @@ x_path_skipped:
 					&fwd, cluster_pcm_lock_pi_watermark_scn_query(req->tag));
 				/* D2: tell the holder to ship a read image and keep its X. */
 				GcsBlockForwardPayloadSetReadImage(&fwd, true);
+				/* PGRAC: spec-6.12a MVP — remote-holder downgrade not wired;
+				 * count the forwarded one-shot so D0 can size that ceiling. */
+				cluster_lever_a_note_fwd_oneshot();
 
 				if (cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, holder_node, &fwd,
 											 sizeof(fwd))
@@ -2956,6 +2986,10 @@ x_path_skipped:
 	}
 
 	/* Produce the reply through the original master flow. */
+/* PGRAC: spec-6.12a — landing point after a quiescent X->S self-downgrade:
+ * master state is now S with a resident clean buffer, so produce_reply
+ * serves a durable GRANTED (image + requester N->S quick re-grant). */
+scache_downgraded_fall_through:
 	(void)gcs_block_produce_reply(req, block_buf, &status, &page_lsn, &block_payload,
 								  &block_payload_lkey, &block_payload_release_cb,
 								  &block_payload_release_arg, &sf_dep_vec, &sf_dep_valid);
@@ -3629,7 +3663,8 @@ static const ClusterICMsgTypeInfo gcs_block_forward_info = {
  *	DENIED_INVALIDATE_TIMEOUT (status 11) → sender 53R91.
  * ============================================================ */
 static bool
-gcs_block_broadcast_invalidate_and_wait(const GcsBlockRequestPayload *req, uint32 holders_bm)
+gcs_block_broadcast_invalidate_and_wait_ext(const GcsBlockRequestPayload *req, uint32 holders_bm,
+											bool via_outbound_ring)
 {
 	GcsBlockInvalidatePayload inv;
 	uint64 current_epoch;
@@ -3681,7 +3716,14 @@ gcs_block_broadcast_invalidate_and_wait(const GcsBlockRequestPayload *req, uint3
 		CLUSTER_INJECTION_POINT("cluster-gcs-block-invalidate-drop-broadcast");
 		if (cluster_injection_should_skip("cluster-gcs-block-invalidate-drop-broadcast"))
 			continue;
-		(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE, n, &inv, sizeof(inv));
+		/* PGRAC: spec-6.12a — a backend-context caller (local-master S->X
+		 * upgrade) cannot use the LMON-owned connections directly; route
+		 * through the backend outbound ring instead (LMON flushes it). */
+		if (via_outbound_ring)
+			(void)cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE,
+														   (uint32)n, &inv, sizeof(inv));
+		else
+			(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE, n, &inv, sizeof(inv));
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_invalidate_broadcast_count, 1);
 	}
 
@@ -3718,6 +3760,84 @@ gcs_block_broadcast_invalidate_and_wait(const GcsBlockRequestPayload *req, uint3
 	return full_ack;
 }
 
+/* Original spec-2.36 entry point (LMON master-handler context). */
+static bool
+gcs_block_broadcast_invalidate_and_wait(const GcsBlockRequestPayload *req, uint32 holders_bm)
+{
+	return gcs_block_broadcast_invalidate_and_wait_ext(req, holders_bm, false);
+}
+
+/* ============================================================
+ * PGRAC: spec-6.12a — LOCAL-master S->X upgrade with remote-S invalidate.
+ *
+ *	The backend-side PCM acquire loop (cluster_pcm_lock_acquire) is the
+ *	LOCAL-master path: before spec-6.12a it had no cross-node invalidate
+ *	and bounded-fail-closed on any live remote S holder (the spec-4.7a
+ *	HG7 gate).  The quiescent X->S downgrade deliberately creates
+ *	remote S holders, so the wave must close this gap: revoke every
+ *	remote S copy, then upgrade self to X on the authoritative entry.
+ *
+ *	Sequence (backend context, master == self, caller holds NO buffer
+ *	content lock):
+ *	  1. pending_x barrier (HC117) so concurrent N->S readers back off.
+ *	  2. Broadcast INVALIDATE to every remote S holder through the
+ *	     backend outbound ring + collect acks on the shared slot (the
+ *	     ack handler runs in LMON and only touches shmem + CV).
+ *	  3. Every ack certifies that node dropped its copy and applied its
+ *	     local S->N; clear its bit on the authoritative entry with an
+ *	     explicit S_TO_N_INVALIDATE apply (idempotent when a release
+ *	     raced ahead).
+ *	  4. Now sole-S: apply S_TO_X_UPGRADE for self.
+ *
+ *	Any failure (slot busy / ack timeout / raced state) returns false
+ *	with pending_x cleared; the caller keeps the pre-6.12a bounded
+ *	fail-closed behaviour (Rule 8.A: never write past an unconfirmed
+ *	invalidate).
+ * ============================================================ */
+bool
+cluster_gcs_block_local_x_upgrade(BufferTag tag)
+{
+	GcsBlockRequestPayload synth;
+	uint32 holders_bm;
+	uint32 self_bit;
+	int n;
+	bool upgraded = false;
+
+	if (ClusterGcsBlock == NULL || cluster_node_id < 0 || cluster_node_id >= 32)
+		return false;
+	self_bit = (uint32)1u << cluster_node_id;
+
+	cluster_pcm_lock_set_pending_x(tag, cluster_node_id, (uint64)GetXLogInsertRecPtr());
+
+	holders_bm = cluster_pcm_lock_query_s_holders_bitmap(tag) & ~self_bit;
+	if (holders_bm != 0) {
+		memset(&synth, 0, sizeof(synth));
+		synth.request_id
+			= pg_atomic_fetch_add_u64(&ClusterGcsBlock->local_upgrade_request_seq, 1) + 1;
+		synth.epoch = cluster_epoch_get_current();
+		synth.tag = tag;
+		synth.sender_node = cluster_node_id;
+
+		if (!gcs_block_broadcast_invalidate_and_wait_ext(&synth, holders_bm, true)) {
+			cluster_pcm_lock_clear_pending_x(tag);
+			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_invalidate_timeout_count, 1);
+			return false;
+		}
+
+		/* Acks certify the drops; clear the acked bits on the
+		 * authoritative entry (idempotent vs racing releases). */
+		for (n = 0; n < 32; n++) {
+			if ((holders_bm & ((uint32)1u << n)) == 0)
+				continue;
+			(void)cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_S_TO_N_INVALIDATE, n);
+		}
+	}
+
+	upgraded
+		= cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_S_TO_X_UPGRADE, cluster_node_id);
+	cluster_pcm_lock_clear_pending_x(tag);
+	return upgraded;
+}
 
 /* ============================================================
  * PGRAC: spec-2.36 D4 — invalidate handler (holder side).

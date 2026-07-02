@@ -962,6 +962,21 @@ extern bool cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode e
  * cache-eviction release wire suppressed (clears pcm_state=N first). */
 extern bool cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr *out_page_lsn);
 
+/* PGRAC: spec-6.12a — LOCAL-master S->X upgrade with remote-S invalidate.
+ * Backend-context path for a writer on the master node whose block was
+ * quiescent-downgraded: pending_x barrier + INVALIDATE broadcast via the
+ * backend outbound ring + ack-certified bit clearing + S_TO_X_UPGRADE.
+ * False = slot busy / ack timeout / raced state (caller stays on the
+ * pre-6.12a bounded fail-closed, Rule 8.A). */
+extern bool cluster_gcs_block_local_x_upgrade(BufferTag tag);
+
+/* PGRAC: spec-6.12a — master==holder quiescent X->S self-downgrade.  Flushes
+ * a dirty page to shared storage first (every S copy stays storage-
+ * consistent), applies PCM_TRANS_X_TO_S_DOWNGRADE, flips the local
+ * pcm_state cache X->S.  False = not quiescent / not X / buffer gone /
+ * master refused; caller falls back to the one-shot read-image ship. */
+extern bool cluster_bufmgr_downgrade_x_to_s_for_gcs(BufferTag tag);
+
 /* PGRAC: spec-5.2a D4 (backend eager flush) — flush a cluster sequence page to
  * shared storage from the BACKEND that just wrote it.  Caller holds a pin and
  * the buffer content lock (any mode; nextval/setval hold EXCLUSIVE).  Runs

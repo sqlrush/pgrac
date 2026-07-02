@@ -61,6 +61,7 @@
 #include "cluster/cluster_extend_gate.h" /* spec-5.7 §3.1d — liveness engage gate */
 #include "cluster/cluster_sf_dep.h"		/* spec-6.2 Smart Fusion DBWR brake */
 #include "cluster/cluster_xnode_profile.h"	/* spec-5.59 D3/D4 — read probe + relkind hint */
+#include "cluster/cluster_itl.h"	/* spec-6.12a — quiescent check for X->S downgrade */
 
 /*
  * PGRAC (spec-4.10 D1): ignore_checksum_failure is defined in bufpage.c with
@@ -6447,6 +6448,108 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 	return stable;
 }
 
+/* ========================================================================
+ * PGRAC MODIFICATIONS by SqlRush — spec-6.12a (quiescent X->S downgrade).
+ *
+ *   cluster_bufmgr_downgrade_x_to_s_for_gcs(tag) — master==holder serve-side
+ *   self-downgrade so a cross-node read becomes a durable S grant instead of
+ *   a one-shot read image.  Under the buffer content_lock EXCLUSIVE:
+ *
+ *     1. Bail (false) unless our copy holds PCM X and the page is quiescent
+ *        (no ACTIVE / LOCK_ONLY_ACTIVE ITL slot).
+ *     2. FlushBuffer when dirty — makes shared storage CURRENT before any
+ *        S copy exists, so the pre-existing S invalidate + storage-fallback
+ *        machinery stays trivially correct (every S copy in the cluster is
+ *        storage-consistent; no PI needed until spec-6.12h).  FlushBuffer
+ *        performs its own XLogFlush(page_lsn) WAL-before-data.
+ *     3. Apply the master-side PCM_TRANS_X_TO_S_DOWNGRADE (caller
+ *        guarantees this node is the block master AND the recorded X
+ *        holder), then flip the local pcm_state cache X -> S.
+ *
+ *   Holding the content_lock EXCLUSIVE across flush + flip closes the
+ *   local-writer race: a writer that arrives after the flip sees S, which
+ *   does not cover X, so its LockBuffer(EXCLUSIVE) takes the full S->X
+ *   upgrade round-trip (spec-2.36 invalidate-then-grant) — the write-
+ *   permission revocation the downgrade requires (Rule 8.A).
+ *
+ *   Any bail-out leaves state exactly as found (a completed flush is
+ *   harmless).  Runs in the LMON IC-dispatch context; the FlushBuffer
+ *   call mirrors the checkpointer contract (pin + content lock held).
+ * ======================================================================== */
+bool
+cluster_bufmgr_downgrade_x_to_s_for_gcs(BufferTag tag)
+{
+	uint32		hashcode;
+	LWLock	   *partition_lock;
+	int			buf_id;
+	BufferDesc *buf;
+	LWLock	   *content_lock;
+	uint32		buf_state;
+	bool		dirty;
+
+	hashcode = BufTableHashCode(&tag);
+	partition_lock = BufMappingPartitionLock(hashcode);
+
+	LWLockAcquire(partition_lock, LW_SHARED);
+	buf_id = BufTableLookup(&tag, hashcode);
+	if (buf_id < 0)
+	{
+		LWLockRelease(partition_lock);
+		return false;
+	}
+	buf = GetBufferDescriptor(buf_id);
+
+	buf_state = LockBufHdr(buf);
+	if (!BufferTagsEqual(&buf->tag, &tag) || (buf_state & BM_VALID) == 0)
+	{
+		UnlockBufHdr(buf, buf_state);
+		LWLockRelease(partition_lock);
+		return false;
+	}
+	cluster_bufmgr_pin_for_gcs_locked(buf, buf_state);
+	LWLockRelease(partition_lock);
+
+	content_lock = BufferDescriptorGetContentLock(buf);
+	LWLockAcquire(content_lock, LW_EXCLUSIVE);
+
+	/*
+	 * Re-verify under the content lock: still our tag, still PCM X, and
+	 * quiescent.  An ACTIVE ITL slot means a local transaction still needs
+	 * this in-memory copy for its commit stamp (the P0-2 dependency) — the
+	 * caller falls back to the one-shot read-image ship.
+	 */
+	if (!BufferTagsEqual(&buf->tag, &tag)
+		|| (PcmState) buf->pcm_state != PCM_STATE_X
+		|| cluster_itl_page_has_active_slot((Page) BufHdrGetBlock(buf)))
+	{
+		LWLockRelease(content_lock);
+		cluster_bufmgr_unpin_for_gcs(buf);
+		return false;
+	}
+
+	buf_state = LockBufHdr(buf);
+	dirty = (buf_state & BM_DIRTY) != 0;
+	UnlockBufHdr(buf, buf_state);
+
+	if (dirty)
+		FlushBuffer(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+
+	if (!cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_X_TO_S_DOWNGRADE,
+											   cluster_node_id))
+	{
+		/* Master refused (state moved under us) — leave local X untouched. */
+		LWLockRelease(content_lock);
+		cluster_bufmgr_unpin_for_gcs(buf);
+		return false;
+	}
+
+	buf->pcm_state = (uint8) PCM_STATE_S;
+
+	LWLockRelease(content_lock);
+	cluster_bufmgr_unpin_for_gcs(buf);
+	return true;
+}
+
 /*
  * Smart Fusion copy helper: same stable raw-pin/content_lock contract as
  * cluster_bufmgr_copy_block_for_gcs(), but it deliberately does not flush WAL
@@ -6983,14 +7086,29 @@ cluster_bufmgr_flush_and_release_x_for_leave(void)
  *   diverging from the holder's X copy — a silent lost-update (Rule 8.A).  The
  *   cluster_itl forward-write allocation path fails closed (53R9H, retryable)
  *   when this returns false.
+ *
+ *   PGRAC modifications by SqlRush (spec-6.12a):
+ *   What changed: with cluster.read_scache on, PCM_STATE_S also denies the
+ *   forward ITL write.  Why: the quiescent X->S downgrade turns S into a
+ *   revoked-write state whose copies other nodes may serve reads from; a
+ *   legal writer re-acquires X via LockBuffer (S does not cover X) BEFORE
+ *   reaching this gate, so denying S here only backstops paths that skipped
+ *   the coherence upgrade (write-gate polarity flip, Rule 8.A).  Off keeps
+ *   the deny-list byte-identical to the spec-5.2 baseline.
  * ======================================================================== */
 bool
 cluster_bufmgr_block_write_permitted(Buffer buffer)
 {
+	PcmState	state;
+
 	if (BufferIsLocal(buffer))
 		return true;			/* temp / local buffers are never CF-shared */
-	return ((PcmState) GetBufferDescriptor(buffer - 1)->pcm_state)
-		!= PCM_STATE_READ_IMAGE;
+	state = (PcmState) GetBufferDescriptor(buffer - 1)->pcm_state;
+	if (state == PCM_STATE_READ_IMAGE)
+		return false;
+	if (cluster_read_scache && state == PCM_STATE_S)
+		return false;			/* spec-6.12a: S is a revoked-write state */
+	return true;
 }
 
 #endif							/* USE_PGRAC_CLUSTER */

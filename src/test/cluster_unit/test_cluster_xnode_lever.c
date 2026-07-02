@@ -75,6 +75,7 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 
 /* GUC gate symbols (cluster_guc.o not linked). */
 bool cluster_page_scn_shortcut = false;
+bool cluster_read_scache = false;
 bool cluster_xnode_profile_enabled = false;
 
 /* Backend identity: the memo stamps entries with MyProc->lxid. */

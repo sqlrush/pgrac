@@ -2814,6 +2814,9 @@ dump_xnode_lever(ReturnSetInfo *rsinfo)
 	XNL_ROW(c_memo_install_count);
 	XNL_ROW(c_stamp_cached_seen_count);
 	XNL_ROW(c_stamp_contradicted_count);
+	XNL_ROW(a_downgrade_count);
+	XNL_ROW(a_downgrade_refused_count);
+	XNL_ROW(a_fwd_oneshot_count);
 #undef XNL_ROW
 }
 
