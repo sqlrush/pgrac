@@ -36,10 +36,24 @@
 #    PGBENCH pgbench binary override.  Run from repo root in a built
 #    tree: perl scripts/perf/run_2node_xnode_profile.pl
 #
+#    spec-6.12 D0-shared additive hookups (buckets/attribution untouched):
+#      XP_EXTRA_GUC  semicolon-separated GUC lines injected into the solo
+#                    + pair cluster tiers (lever wave switches; default
+#                    empty = byte-identical 5.59 behaviour)
+#      XP_STORAGE    'block_device' boots the PAIR on the spec-6.0a raw
+#                    block_device backend (loopback file image) instead
+#                    of the shared-nothing phantom harness
+#      XP_TSV_OUT    optional machine-readable key<TAB>value dump of all
+#                    per-axis bucket deltas + scalars (consumed by
+#                    run_612_value_gate.pl off/on comparison)
+#      XP_NETEM_MS   report-header honesty note only (netem-tier.sh does
+#                    the actual tc qdisc setup; runner never mutates it)
+#
 # Author: SqlRush <sqlrush@gmail.com>
 # Portions Copyright (c) 2026, pgrac contributors
 #
 # Spec: spec-5.59-two-node-crossnode-perf-profile.md (D8)
+# Spec: spec-6.12-crossnode-cache-fusion-perf-optimization.md (D0-shared)
 #
 # IDENTIFICATION
 #    scripts/perf/run_2node_xnode_profile.pl
@@ -134,6 +148,15 @@ my $REPO_ROOT = File::Spec->rel2abs("$FindBin::RealBin/../..");
 my $XP_OUT    = $ENV{XP_OUT}
   // File::Spec->catfile($REPO_ROOT, 'scripts', 'perf', 'results',
 	'xnode-profile-' . time() . '.md');
+
+# spec-6.12 D0-shared knobs (all default-off; empty = 5.59 behaviour).
+my $XP_EXTRA_GUC = $ENV{XP_EXTRA_GUC} // '';
+my $XP_STORAGE   = $ENV{XP_STORAGE} // '';
+my $XP_TSV_OUT   = $ENV{XP_TSV_OUT} // '';
+my $XP_NETEM_MS  = $ENV{XP_NETEM_MS} // '';
+
+die "XP_STORAGE must be '' or 'block_device' (got '$XP_STORAGE')\n"
+  unless $XP_STORAGE eq '' || $XP_STORAGE eq 'block_device';
 
 # The 23 buckets of cluster_xnode_profile.h, dump-key order.
 my @ALL_BUCKETS = qw(
@@ -296,6 +319,117 @@ sub bkt_n  { my ($d, $b) = @_; return $d->{"bucket.$b.n_events"}    // 0; }
 sub bkt_ns { my ($d, $b) = @_; return $d->{"bucket.$b.total_nanos"} // 0; }
 
 # ----------
+# spec-6.12 D0-shared helpers (additive; inert when the knobs are unset)
+# ----------
+
+# XP_EXTRA_GUC: semicolon-separated "name = value" lines for the cluster
+# tiers (solo + pair).  Whitespace-trimmed; empty items skipped.
+sub extra_guc_lines
+{
+	return () unless length $XP_EXTRA_GUC;
+	my @lines;
+	for my $item (split /;/, $XP_EXTRA_GUC)
+	{
+		$item =~ s/^\s+|\s+$//g;
+		next unless length $item;
+		die "XP_EXTRA_GUC item '$item' is not 'name = value'\n"
+		  unless $item =~ /^[A-Za-z0-9_.]+\s*=\s*\S/;
+		push @lines, $item;
+	}
+	return @lines;
+}
+
+# XP_STORAGE=block_device: pair boots on the spec-6.0a raw block_device
+# backend over a loopback file image (t/333 pattern).
+sub make_raw_image
+{
+	my ($path, $size_mb) = @_;
+	open(my $fh, '>', $path) or die "open $path: $!";
+	truncate($fh, $size_mb * 1024 * 1024) or die "truncate $path: $!";
+	close($fh) or die "close $path: $!";
+}
+
+sub storage_conf_lines
+{
+	return () unless $XP_STORAGE eq 'block_device';
+	my $raw_dir   = PostgreSQL::Test::Utils::tempdir();
+	my $raw_image = "$raw_dir/xpr_612_raw_device.img";
+	make_raw_image($raw_image, 512);
+	my $q = $raw_image;
+	$q =~ s/'/''/g;
+	return (
+		'cluster.shared_storage_backend = block_device',
+		"cluster.block_device_path = '$q'",
+		'cluster.block_device_use_odirect = off',
+		'cluster.storage_fence_driver = disabled',
+		'cluster.smgr_user_relations = on',
+	);
+}
+
+# Honesty note for the report header: report the loopback netem state as
+# observed (Linux tc only); the runner never mutates qdiscs itself.
+sub netem_status
+{
+	return 'n/a (non-Linux; loopback RTT is NOT representative)'
+	  unless $^O eq 'linux';
+	my $out = `tc qdisc show dev lo 2>/dev/null`;
+	chomp($out //= '');
+	return ($out =~ /netem/)
+	  ? "active ($out)"
+	  : 'none (loopback RTT is NOT representative; see netem-tier.sh)';
+}
+
+# XP_TSV_OUT: machine-readable dump of per-axis deltas + scalars for the
+# run_612_value_gate.pl off/on comparison.  Keys are stable API.
+my %TSV;
+
+sub tsv_put { my ($k, $v) = @_; $TSV{$k} = $v if defined $v; }
+
+sub tsv_axis_deltas
+{
+	my ($axis, $res) = @_;
+	for my $side (qw(d0 d1))
+	{
+		my $d = $res->{$side} or next;
+		tsv_put("$axis.$side.$_", $d->{$_}) for keys %$d;
+	}
+}
+
+sub write_tsv
+{
+	my ($w, $r, $i, $c) = @_;
+	return unless length $XP_TSV_OUT;
+
+	tsv_axis_deltas('w', $w);
+	tsv_axis_deltas('i', $i);
+	tsv_axis_deltas('c', $c);
+	tsv_put('w.nat_med',      $w->{nat_med});
+	tsv_put('w.solo_med',     $w->{solo_med});
+	tsv_put('w.pair_med',     $w->{pair_med});
+	tsv_put('w.tax_pair_pct', $w->{tax_pair_pct});
+	tsv_put('w.wall_ns',      $w->{wall_ns});
+	tsv_put('i.batches',      $i->{batches});
+	tsv_put('i.errors',       $i->{errors});
+	tsv_put('i.wall_ns',      $i->{wall_ns});
+	tsv_put('c.txns',         $c->{txns});
+	tsv_put('c.errors',       $c->{errors});
+	tsv_put('c.wall_ns',      $c->{wall_ns});
+	for my $phase (qw(pre post))
+	{
+		my $p = $r->{$phase} or next;
+		tsv_put("r.$phase.$_", $p->{$_})
+		  for qw(rounds errors reship sholder wall_ns);
+		tsv_put("r.$phase.delta.$_", $p->{delta}{$_}) for keys %{ $p->{delta} };
+	}
+
+	make_path(dirname($XP_TSV_OUT));
+	open(my $fh, '>', $XP_TSV_OUT) or die "cannot write $XP_TSV_OUT: $!\n";
+	print $fh "$_\t$TSV{$_}\n" for sort keys %TSV;
+	close $fh;
+	progress("tsv written: $XP_TSV_OUT");
+}
+
+# ----------
 # pgbench (mirror t/328 helpers; -c 1 -N is the M3 single-writer shape)
 # ----------
 sub pgbench_one
@@ -400,6 +534,8 @@ sub boot_solo
 		'cluster.allow_single_node = on', 'cluster.node_id = 0',
 		'cluster.xnode_profile = on');
 	$solo->append_conf('postgresql.conf', $_) for @perf_conf;
+	# spec-6.12 D0: lever wave switches apply to both cluster tiers.
+	$solo->append_conf('postgresql.conf', "$_\n") for extra_guc_lines();
 	PostgreSQL::Test::Utils::append_to_file(
 		$solo->data_dir . '/pgrac.conf',
 		"[cluster]\nname = xpr_solo\n\n[node.0]\ninterconnect_addr = 127.0.0.1:$ic_port\n\n"
@@ -430,6 +566,9 @@ sub boot_pair
 			'cluster.quorum_poll_interval_ms = 500',
 			'cluster.cssd_heartbeat_interval_ms = 2000',
 			'cluster.cssd_dead_deadband_factor = 10',
+			# spec-6.12 D0: 6.0a raw backend substrate + lever switches.
+			storage_conf_lines(),
+			extra_guc_lines(),
 		]);
 	$pair->start_pair;
 	my $ready =
@@ -743,6 +882,15 @@ sub report_header
 			scalar(gmtime()), $commit || 'unknown'),
 		"- knobs: XP_SECS=$XP_SECS XP_ROUNDS=$XP_ROUNDS XP_SCALE=$XP_SCALE"
 		  . " pair_scale=" . ($PAIR_SCALE_USED || 'n/a'),
+		# spec-6.12 D0 provenance: every value-gate comparison must be
+		# attributable to its wave switch / substrate / latency tier.
+		'- 6.12 extra_guc: ' . (length $XP_EXTRA_GUC ? $XP_EXTRA_GUC : 'none'),
+		'- 6.12 storage: '
+		  . ($XP_STORAGE eq 'block_device'
+			? 'spec-6.0a raw block_device (pair)'
+			: 'shared-nothing phantom harness (shipping-count only, AD-015)'),
+		'- 6.12 netem: ' . netem_status()
+		  . (length $XP_NETEM_MS ? " (declared: ${XP_NETEM_MS}ms)" : ''),
 		'',
 		'> HONESTY PREAMBLE: single-machine loopback interconnect; cassert',
 		'> builds inflate absolute nanoseconds; background cluster traffic',
@@ -1098,6 +1246,7 @@ report_axis_buckets(
 report_observe_section($o);
 report_validity_section($w, $r, $i, $c, $o);
 write_report();
+write_tsv($w, $r, $i, $c); # spec-6.12 D0: machine-readable value-gate feed
 ok(1, "report emitted: $XP_OUT");
 
 done_testing();
