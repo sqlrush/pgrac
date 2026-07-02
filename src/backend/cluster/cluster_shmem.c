@@ -56,29 +56,30 @@
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_remote_xact.h" /* PGRAC: spec-4.5a G5 SLRU */ /* cluster_conf_shmem_size / init */
 #include "cluster/cluster_elog.h"										/* CLUSTER_LOG */
-#include "cluster/cluster_guc.h"			/* cluster_node_id / cluster_shmem_max_regions */
-#include "cluster/cluster_ic.h"				/* cluster_ic_init / shutdown (stage 0.18) */
-#include "cluster/cluster_ic_rdma.h"		/* cluster_ic_rdma_shmem_register (spec-6.1) */
-#include "cluster/cluster_ic_tier1.h"		/* cluster_ic_tier1_shmem_register (spec-2.2 D3) */
-#include "cluster/cluster_cssd.h"			/* cluster_cssd_shmem_register (2.5 Sprint A) */
-#include "cluster/cluster_undo_cleaner.h"	/* cluster_undo_cleaner_shmem_register (3.13) */
-#include "cluster/cluster_diag.h"			/* cluster_diag_shmem_register (1.13 Sprint A) */
-#include "cluster/cluster_clean_leave.h"	/* cluster_clean_leave_shmem_register (spec-5.13 D2) */
-#include "cluster/cluster_node_remove.h"	/* cluster_node_remove_shmem_register (spec-5.18 D2) */
-#include "cluster/cluster_backup.h"			/* cluster_backup_shmem_register (spec-6.5) */
-#include "cluster/cluster_inject.h"			/* CLUSTER_INJECTION_POINT */
-#include "cluster/cluster_lck.h"			/* cluster_lck_shmem_register (1.12 Sprint A) */
-#include "cluster/cluster_epoch.h"			/* cluster_epoch_shmem_register (2.4) */
-#include "cluster/cluster_scn.h"			/* cluster_scn_shmem_register (1.15) */
-#include "cluster/cluster_sequence.h"		/* cluster_sequence_shmem_register (spec-5.4 D1) */
-#include "cluster/cluster_hw.h"				/* cluster_hw_shmem_register (spec-5.7 D1) */
-#include "cluster/cluster_dl.h"				/* cluster_dl_shmem_register (spec-5.7 D4) */
-#include "cluster/cluster_ir.h"				/* cluster_ir_shmem_register (spec-5.7 D8) */
-#include "cluster/cluster_ts.h"				/* cluster_ts_shmem_register (spec-5.7 D5) */
-#include "cluster/cluster_ko.h"				/* cluster_ko_shmem_register (spec-5.7 D6) */
-#include "cluster/cluster_ges.h"			/* cluster_ges_shmem_register (spec-2.13) */
-#include "cluster/cluster_advisory.h"		/* cluster_advisory_shmem_register (spec-5.5 D8) */
-#include "cluster/cluster_cf_stats.h"		/* cluster_cf_stats_shmem_register (spec-5.6 Dc4) */
+#include "cluster/cluster_guc.h"		   /* cluster_node_id / cluster_shmem_max_regions */
+#include "cluster/cluster_ic.h"			   /* cluster_ic_init / shutdown (stage 0.18) */
+#include "cluster/cluster_ic_rdma.h"	   /* cluster_ic_rdma_shmem_register (spec-6.1) */
+#include "cluster/cluster_ic_tier1.h"	   /* cluster_ic_tier1_shmem_register (spec-2.2 D3) */
+#include "cluster/cluster_cssd.h"		   /* cluster_cssd_shmem_register (2.5 Sprint A) */
+#include "cluster/cluster_undo_cleaner.h"  /* cluster_undo_cleaner_shmem_register (3.13) */
+#include "cluster/cluster_diag.h"		   /* cluster_diag_shmem_register (1.13 Sprint A) */
+#include "cluster/cluster_clean_leave.h"   /* cluster_clean_leave_shmem_register (spec-5.13 D2) */
+#include "cluster/cluster_node_remove.h"   /* cluster_node_remove_shmem_register (spec-5.18 D2) */
+#include "cluster/cluster_backup.h"		   /* cluster_backup_shmem_register (spec-6.5) */
+#include "cluster/cluster_inject.h"		   /* CLUSTER_INJECTION_POINT */
+#include "cluster/cluster_lck.h"		   /* cluster_lck_shmem_register (1.12 Sprint A) */
+#include "cluster/cluster_epoch.h"		   /* cluster_epoch_shmem_register (2.4) */
+#include "cluster/cluster_scn.h"		   /* cluster_scn_shmem_register (1.15) */
+#include "cluster/cluster_sequence.h"	   /* cluster_sequence_shmem_register (spec-5.4 D1) */
+#include "cluster/cluster_hw.h"			   /* cluster_hw_shmem_register (spec-5.7 D1) */
+#include "cluster/cluster_xnode_profile.h" /* cluster_xnode_profile_shmem_register (spec-5.59 D1) */
+#include "cluster/cluster_dl.h"			   /* cluster_dl_shmem_register (spec-5.7 D4) */
+#include "cluster/cluster_ir.h"			   /* cluster_ir_shmem_register (spec-5.7 D8) */
+#include "cluster/cluster_ts.h"			   /* cluster_ts_shmem_register (spec-5.7 D5) */
+#include "cluster/cluster_ko.h"			   /* cluster_ko_shmem_register (spec-5.7 D6) */
+#include "cluster/cluster_ges.h"		   /* cluster_ges_shmem_register (spec-2.13) */
+#include "cluster/cluster_advisory.h"	   /* cluster_advisory_shmem_register (spec-5.5 D8) */
+#include "cluster/cluster_cf_stats.h"	   /* cluster_cf_stats_shmem_register (spec-5.6 Dc4) */
 #include "cluster/cluster_ges_reply_wait.h" /* cluster_ges_reply_wait_shmem_register (spec-2.23 D1) */
 #include "cluster/cluster_grd.h"			/* cluster_grd_shmem_register (spec-2.14) */
 #include "cluster/cluster_grd_pending.h"	/* cluster_grd_pending_shmem_register (spec-2.16 D3) */
@@ -806,6 +807,10 @@ cluster_init_shmem_module(void)
 	/* spec-5.7 D6: register KO object-reuse flush counters + inbound ring region. */
 	if (cluster_shmem_lookup_region("pgrac cluster ko") == NULL)
 		cluster_ko_shmem_register();
+
+	/* spec-5.59 D1: cross-node profiling buckets (fixed size; GUC-gated use). */
+	if (cluster_shmem_lookup_region("pgrac cluster xnode profile") == NULL)
+		cluster_xnode_profile_shmem_register();
 }
 
 

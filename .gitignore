@@ -67,3 +67,4 @@ src/test/cluster_*/regression.out
 src/test/cluster_tap/tmp/
 tmp/
 codex_review/
+/.worktrees/

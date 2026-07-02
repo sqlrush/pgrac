@@ -52,6 +52,7 @@
 #include "utils/memutils.h"
 
 #include "cluster/cluster_ic.h"
+#include "cluster/cluster_xnode_profile.h" /* PGRAC: spec-5.59 D6 profiling */
 
 
 /*
@@ -335,6 +336,9 @@ cluster_ic_shutdown(void)
 ClusterICSendResult
 cluster_ic_send_bytes(int32 target_node_id, const void *buf, size_t len)
 {
+	ClusterICSendResult rc;
+	ClusterXpScope xps;
+
 	Assert(ClusterICOps_Active != NULL);
 
 	/*
@@ -356,7 +360,11 @@ cluster_ic_send_bytes(int32 target_node_id, const void *buf, size_t len)
 	 * MUST switch on result; treating WOULD_BLOCK as failure
 	 * silently bypasses partial-IO outbound buffering.
 	 */
-	return ClusterICOps_Active->send_bytes(target_node_id, buf, len);
+	/* PGRAC: spec-5.59 D6 profiling */
+	cluster_xp_begin(&xps, CLXP_IC_SEND_SERVICE);
+	rc = ClusterICOps_Active->send_bytes(target_node_id, buf, len);
+	cluster_xp_end(&xps);
+	return rc;
 }
 
 bool

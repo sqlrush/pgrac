@@ -69,6 +69,7 @@
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_undo_record.h"
 #include "cluster/cluster_undo_record_api.h"
+#include "cluster/cluster_xnode_profile.h" /* spec-5.59 D3: profiling probes */
 
 
 /*
@@ -371,6 +372,12 @@ cr_walk_chain(char *scratch_page, UBA start_uba, SCN read_scn,
 {
 	UBA uba = start_uba;
 	PGAlignedBlock record_buf;
+	ClusterXpScope xp_scope; /* PGRAC: spec-5.59 D3 profiling */
+
+	/* PGRAC: spec-5.59 D3 profiling -- nested breakdown under
+	 * CLXP_R_CR_CONSTRUCT; every ereport(ERROR) path below simply loses the
+	 * sample (scope is a stack variable, no cleanup needed). */
+	cluster_xp_begin(&xp_scope, CLXP_R_CR_CHAIN_WALK);
 
 	while (!UBA_is_invalid(uba)) {
 		UndoRecordHeader *hdr;
@@ -617,6 +624,9 @@ cr_walk_chain(char *scratch_page, UBA start_uba, SCN read_scn,
 	 * (cluster_cr_construct_block_into) accumulates cr_chain_walk_steps_sum
 	 * once after every chain completes.
 	 */
+
+	/* PGRAC: spec-5.59 D3 profiling */
+	cluster_xp_end(&xp_scope);
 }
 
 
@@ -741,10 +751,17 @@ cluster_cr_construct_block_into(Buffer buf, SCN read_scn, char *dst_page)
 {
 	/* Init silences cppcheck uninitvar across the PG_RE_THROW longjmp. */
 	const char *result = NULL;
+	ClusterXpScope xp_scope; /* PGRAC: spec-5.59 D3 profiling */
 
 	Assert(BufferIsValid(buf));
 	Assert(dst_page != NULL);
 	Assert(!cr_in_progress); /* I-lock-3 non-reentrant */
+
+	/* PGRAC: spec-5.59 D3 profiling — time the whole CR construction at its
+	 * single choke point (cache-fill and scratch paths both land here); an
+	 * ereport(ERROR) re-thrown by the PG_CATCH below loses the sample,
+	 * acceptable. */
+	cluster_xp_begin(&xp_scope, CLXP_R_CR_CONSTRUCT);
 
 	cr_in_progress = true;
 
@@ -921,6 +938,7 @@ cluster_cr_construct_block_into(Buffer buf, SCN read_scn, char *dst_page)
 	PG_END_TRY();
 
 	cr_in_progress = false;
+	cluster_xp_end(&xp_scope); /* PGRAC: spec-5.59 D3 */
 	return result;
 }
 

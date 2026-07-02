@@ -55,6 +55,7 @@
 #include "cluster/cluster_ic_router.h" /* cluster_ic_send_envelope_fanout + PGRAC_IC_MSG_BOC_BROADCAST */
 #include "cluster/cluster_inject.h" /* CLUSTER_INJECTION_POINT */
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_xnode_profile.h" /* PGRAC: spec-5.59 D2 profiling */
 #include "miscadmin.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
@@ -591,9 +592,13 @@ SCN
 cluster_scn_advance_for_commit(void)
 {
 	SCN scn;
+	ClusterXpScope xps; /* PGRAC: spec-5.59 D2 profiling */
 
 	if (cluster_scn_skip_hook_in_pre_running())
 		return InvalidScn;
+
+	/* PGRAC: spec-5.59 D2 profiling */
+	cluster_xp_begin(&xps, CLXP_C_SCN_COMMIT_ADVANCE);
 
 	CLUSTER_INJECTION_POINT("cluster-scn-commit-pre-advance");
 
@@ -601,6 +606,8 @@ cluster_scn_advance_for_commit(void)
 	pg_atomic_fetch_add_u64(&cluster_scn_state->commit_advance_count, 1);
 
 	CLUSTER_INJECTION_POINT("cluster-scn-commit-post-advance");
+
+	cluster_xp_end(&xps); /* PGRAC: spec-5.59 D2 profiling */
 
 	return scn;
 }
@@ -874,6 +881,7 @@ cluster_scn_lmon_drain_boc_broadcast(void)
 	int done = 0;
 	int would_block = 0;
 	int hard_error = 0;
+	ClusterXpScope xps; /* PGRAC: spec-5.59 D2 profiling */
 
 	if (!cluster_enabled)
 		return;
@@ -891,6 +899,9 @@ cluster_scn_lmon_drain_boc_broadcast(void)
 	 * the next walwriter sweep, LMON may still emit the latest SCN. */
 	if (cluster_cssd_get_alive_peer_count() == 0)
 		return;
+
+	/* PGRAC: spec-5.59 D2 profiling */
+	cluster_xp_begin(&xps, CLXP_C_SCN_BOC_BROADCAST);
 
 	cluster_ic_send_envelope_fanout(PGRAC_IC_MSG_BOC_BROADCAST, NULL, 0, per_peer);
 	last_drained_sweep_count = sweep_count;
@@ -922,6 +933,9 @@ cluster_scn_lmon_drain_boc_broadcast(void)
 								"(sweep_count=" UINT64_FORMAT ", done=%d)",
 								sweep_count, done)));
 	}
+
+	cluster_xp_end(&xps); /* PGRAC: spec-5.59 D2 profiling */
+
 	if (would_block > 0 || hard_error > 0)
 		ereport(DEBUG2, (errmsg("cluster_scn: BOC broadcast fanout partial "
 								"(sweep_count=" UINT64_FORMAT ", would_block=%d, hard_error=%d)",

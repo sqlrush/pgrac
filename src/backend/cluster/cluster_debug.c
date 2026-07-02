@@ -99,6 +99,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_cr_pool.h"		  /* cluster_cr_pool_* counters (spec-5.51 D9) */
 #include "cluster/cluster_cr_admit.h"		  /* cluster_cr_admit_stat_* counters (spec-5.52 D9) */
 #include "cluster/cluster_cr_tuple.h"		  /* cluster_cr_tuple_stat_* counters (spec-5.54 D5) */
+#include "cluster/cluster_xnode_profile.h"	  /* xnode profiling buckets (spec-5.59 D1) */
 #include "cluster/cluster_resolver_cache.h"	  /* cluster_resolver_cache_* counters (spec-5.55 D8) */
 #include "cluster/cluster_cr_coordinator_stat.h" /* cluster_cr_coordinator_* counters (spec-5.57 D3) */
 #include "cluster/cluster_wal_state.h"			 /* wal_state registry dump (spec-4.2 D5) */
@@ -2679,6 +2680,48 @@ dump_ko(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "ko", "inbound_full_count", fmt_int64((int64)cluster_ko_inbound_full_count()));
 }
 
+/*
+ * dump_xnode_profile -- spec-5.59 cross-node profiling buckets.
+ *
+ *	Emits bucket.<name>.total_nanos / bucket.<name>.n_events for every
+ *	ClusterXnodeBucket plus the probe keys (reset_generation, read-side
+ *	amortization probe, HW extend locality split).  Keys are emitted even
+ *	while cluster.xnode_profile is off (values stay 0) so the key surface
+ *	is stable for tests and samplers.
+ */
+static void
+dump_xnode_profile(ReturnSetInfo *rsinfo)
+{
+	ClusterXnodeProfileShared *ctl = ClusterXnodeProfileCtl;
+
+	for (int i = 0; i < CLXP_NBUCKETS; i++) {
+		const char *name = cluster_xp_bucket_name((ClusterXnodeBucket)i);
+		char key[96];
+		uint64 nanos = 0;
+		uint64 events = 0;
+
+		if (ctl != NULL) {
+			nanos = pg_atomic_read_u64(&ctl->bucket[i].total_nanos);
+			events = pg_atomic_read_u64(&ctl->bucket[i].n_events);
+		}
+		snprintf(key, sizeof(key), "bucket.%s.total_nanos", name);
+		emit_row(rsinfo, "xnode_profile", key, fmt_int64((int64)nanos));
+		snprintf(key, sizeof(key), "bucket.%s.n_events", name);
+		emit_row(rsinfo, "xnode_profile", key, fmt_int64((int64)events));
+	}
+
+	emit_row(rsinfo, "xnode_profile", "reset_generation",
+			 fmt_int64(ctl != NULL ? (int64)pg_atomic_read_u64(&ctl->reset_generation) : 0));
+	emit_row(rsinfo, "xnode_profile", "read_reship_count",
+			 fmt_int64(ctl != NULL ? (int64)pg_atomic_read_u64(&ctl->read_reship_count) : 0));
+	emit_row(rsinfo, "xnode_profile", "read_sholder_hit_count",
+			 fmt_int64(ctl != NULL ? (int64)pg_atomic_read_u64(&ctl->read_sholder_hit_count) : 0));
+	emit_row(rsinfo, "xnode_profile", "hw_extend_local_count",
+			 fmt_int64(ctl != NULL ? (int64)pg_atomic_read_u64(&ctl->hw_extend_local_count) : 0));
+	emit_row(rsinfo, "xnode_profile", "hw_extend_remote_count",
+			 fmt_int64(ctl != NULL ? (int64)pg_atomic_read_u64(&ctl->hw_extend_remote_count) : 0));
+}
+
 #endif /* USE_PGRAC_CLUSTER */
 
 
@@ -2743,6 +2786,7 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		dump_ir(rsinfo);
 		dump_ts(rsinfo);
 		dump_ko(rsinfo);
+		dump_xnode_profile(rsinfo); /* spec-5.59 D1 */
 	}
 #else
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

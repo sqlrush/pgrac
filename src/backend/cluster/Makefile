@@ -190,6 +190,7 @@ OBJS = \
 	cluster_views.o \
 	cluster_wal_state.o \
 	cluster_wal_thread.o \
+	cluster_xnode_profile.o \
 	storage/cluster_shared_fs.o \
 	storage/cluster_shared_fs_stub.o \
 	storage/cluster_shared_fs_local.o \

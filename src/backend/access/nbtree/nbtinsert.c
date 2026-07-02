@@ -10,6 +10,12 @@
  * IDENTIFICATION
  *	  src/backend/access/nbtree/nbtinsert.c
  *
+ * PGRAC MODIFICATIONS
+ *	  Modified by: SqlRush <sqlrush@gmail.com>
+ *	  - _bt_insertonpg: optional count-only rightmost-leaf insert probe for
+ *	    cross-node profiling (GUC-gated, no behavior change).
+ *	    Spec: spec-5.59-two-node-crossnode-perf-profile.md (D4)
+ *
  *-------------------------------------------------------------------------
  */
 
@@ -25,6 +31,10 @@
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
 #include "storage/smgr.h"
+
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_xnode_profile.h" /* PGRAC: spec-5.59 D4 probe */
+#endif
 
 /* Minimum tree height for application of fastpath optimization */
 #define BTREE_FASTPATH_MIN_LEVEL	2
@@ -1130,6 +1140,13 @@ _bt_insertonpg(Relation rel,
 	isroot = P_ISROOT(opaque);
 	isrightmost = P_RIGHTMOST(opaque);
 	isonly = P_LEFTMOST(opaque) && P_RIGHTMOST(opaque);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: spec-5.59 D4 — count-only rightmost-leaf insert probe
+	 * (GUC-gated inside; no behavior change). */
+	if (isleaf && isrightmost)
+		cluster_xp_count(CLXP_I_RIGHTMOST_LEAF_PING);
+#endif
 
 	/* child buffer must be given iff inserting on an internal page */
 	Assert(isleaf == !BufferIsValid(cbuf));

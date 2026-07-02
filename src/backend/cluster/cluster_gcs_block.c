@@ -52,6 +52,7 @@
 #include "cluster/cluster_membership.h"		/* spec-5.16 D3b — is_member master-side gate */
 #include "cluster/cluster_qvotec.h"			/* spec-5.16 D3b — in_quorum master-side gate */
 #include "cluster/cluster_recovery_merge.h" /* spec-4.7 D5 — recovered_through redo gate */
+#include "cluster/cluster_xnode_profile.h"	/* spec-5.59 D2/D3/D4 profiling buckets */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_itl.h" /* spec-5.2 D11 — active-ITL writer-transfer guard */
@@ -867,6 +868,12 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 	int retry_attempt;
 	int max_retries;
 	int current_master;
+	/* PGRAC: spec-5.59 D2/D3/D4 — requester-wait + index-overlay scopes. */
+	ClusterXpScope xp_req;
+	ClusterXpScope xp_idx;
+	ClusterXpScope xp_recv;
+	bool xp_is_read;
+	bool xp_is_index;
 
 	if (buf == NULL)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
@@ -903,6 +910,21 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 
 	tag = buf->tag;
 	current_master = master_node;
+
+	/* PGRAC: spec-5.59 D2/D3 — total requester exclusive-wait for this
+	 * acquisition (send -> final grant, spanning retries).  RECEIVE below is
+	 * a nested diagnostic sub-bucket (service table, not additive).  D4: the
+	 * index overlay dimension re-times the same interval into the I bucket
+	 * when the caller-supplied relkind hint marks this tag as an index block
+	 * (overlay, never added to the W/R decision sum). */
+	xp_is_read = (transition_id == PCM_TRANS_N_TO_S);
+	xp_is_index = cluster_xp_relkind_hint_is_index_for(&tag);
+	cluster_xp_begin(&xp_req, xp_is_read ? CLXP_R_GCS_S_REQUEST : CLXP_W_GCS_X_REQUEST);
+	if (xp_is_index)
+		cluster_xp_begin(&xp_idx, CLXP_I_INDEX_BLOCK_XFER);
+	else
+		xp_idx.active = false;
+
 	cluster_gcs_block_dedup_register_backend_exit_hook();
 	slot = gcs_block_reserve_slot(tag, (uint8)transition_id, current_master, &request_id);
 
@@ -1057,8 +1079,15 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 			if (final_status == GCS_BLOCK_REPLY_GRANTED
 				|| final_status == GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER
 				|| final_status == GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER) {
-				uint32 expected = slot->reply_header.checksum;
-				uint32 got = gcs_block_compute_checksum(slot->reply_block_data);
+				uint32 expected;
+				uint32 got;
+
+				/* PGRAC: spec-5.59 D2/D3 — reply verify sub-bucket (nested). */
+				cluster_xp_begin(&xp_recv,
+								 xp_is_read ? CLXP_R_GCS_S_RECEIVE : CLXP_W_GCS_X_RECEIVE);
+				expected = slot->reply_header.checksum;
+				got = gcs_block_compute_checksum(slot->reply_block_data);
+				cluster_xp_end(&xp_recv);
 
 				if (expected != got) {
 					pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_checksum_fail_count, 1);
@@ -1066,7 +1095,20 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 					terminal_denied = true;
 					break;
 				}
-				gcs_block_install_block(buf, slot->reply_block_data, final_page_lsn);
+				/* PGRAC: spec-5.59 D2 — image install sub-bucket (write axis
+				 * only; read installs stay inside the S_REQUEST total). */
+				if (!xp_is_read) {
+					ClusterXpScope xp_inst;
+
+					cluster_xp_begin(&xp_inst, CLXP_W_GCS_X_INSTALL);
+					gcs_block_install_block(buf, slot->reply_block_data, final_page_lsn);
+					cluster_xp_end(&xp_inst);
+				} else {
+					gcs_block_install_block(buf, slot->reply_block_data, final_page_lsn);
+					/* PGRAC: spec-5.59 §3.6 read amortization probe — a durable
+					 * S grant still shipped a full page image. */
+					cluster_xp_note_read(true);
+				}
 				/* spec-5.14 D2 class 2: depend on the sender (+ forwarding holder). */
 				gcs_block_stamp_touched((int32)slot->reply_header.sender_node,
 										final_forwarding_master);
@@ -1126,8 +1168,12 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 				 * re-fetches.  A cached copy with no invalidation path would go
 				 * stale once the holder writes again (Rule 8.A).
 				 */
+				/* PGRAC: spec-5.59 D3 — reply verify sub-bucket (nested). */
+				cluster_xp_begin(&xp_recv,
+								 xp_is_read ? CLXP_R_GCS_S_RECEIVE : CLXP_W_GCS_X_RECEIVE);
 				expected = slot->reply_header.checksum;
 				got = gcs_block_compute_checksum(slot->reply_block_data);
+				cluster_xp_end(&xp_recv);
 
 				if (expected != got) {
 					pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_checksum_fail_count, 1);
@@ -1136,6 +1182,10 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 					break;
 				}
 				gcs_block_install_block(buf, slot->reply_block_data, final_page_lsn);
+				/* PGRAC: spec-5.59 §3.6 read amortization probe — a one-shot
+				 * read-image ship is exactly the "reship" the probe counts. */
+				if (xp_is_read)
+					cluster_xp_note_read(true);
 				/* spec-5.14 D2 class 2: depend on the X holder that shipped this image. */
 				gcs_block_stamp_touched((int32)slot->reply_header.sender_node,
 										final_forwarding_master);
@@ -1307,6 +1357,12 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 						tag.spcOid, tag.dbOid, tag.relNumber, tag.blockNum),
 				 errhint("a node is leaving the cluster and may not yet have flushed this block; "
 						 "retry after the leave commits — retry is safe")));
+
+	/* PGRAC: spec-5.59 D2/D3/D4 — close the requester-wait (and index
+	 * overlay) scopes at the single normal-exit funnel; terminal ereport
+	 * paths above simply lose the sample (stack scope, harmless). */
+	cluster_xp_end(&xp_idx);
+	cluster_xp_end(&xp_req);
 
 	/* spec-5.2 D2: GRANTED / STORAGE_FALLBACK record durable ownership (the
 	 * caller mirrors PCM state); READ_IMAGE is a one-shot non-durable read so
@@ -2659,6 +2715,12 @@ x_path_skipped:
 
 			if (rd == GCS_XHELD_READ_DIRECT_FROM_MASTER
 				&& !cluster_injection_should_skip("cluster-gcs-block-forward-master-side")) {
+				/* PGRAC: spec-5.59 D3 — holder-side read-image ship service
+				 * time (master-local X: block copy).  Service-time bucket,
+				 * never folded into requester pp. */
+				ClusterXpScope xp_ship;
+
+				cluster_xp_begin(&xp_ship, CLXP_R_READIMAGE_SHIP);
 				/* Master holds X locally: ship its current image without revoking X. */
 				if (gcs_block_get_ship_image(req->tag, req->sender_node, &page_lsn, block_buf,
 											 &block_payload, &block_payload_lkey,
@@ -2667,8 +2729,10 @@ x_path_skipped:
 					status = GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER;
 					if (ClusterGcsBlock != NULL)
 						pg_atomic_fetch_add_u64(&ClusterGcsBlock->cf_xheld_read_ship_count, 1);
+					cluster_xp_end(&xp_ship);
 					goto build_and_send_reply;
 				}
+				cluster_xp_abort(&xp_ship);
 				/* Evict race — fall through to the fail-closed master flow. */
 			} else if (rd == GCS_XHELD_READ_FORWARD_TO_HOLDER
 					   && !cluster_injection_should_skip("cluster-gcs-block-forward-master-side")) {
@@ -3064,6 +3128,9 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	uint32 total;
 	char *buf;
 	GcsBlockReplyHeader *hdr;
+	/* PGRAC: spec-5.59 D3 — holder-forward read-image ship scope (started
+	 * only by the read-image branch below; inactive otherwise). */
+	ClusterXpScope xp_fwd_ship = { .active = false };
 
 	if (env == NULL || payload == NULL || env->payload_length != sizeof(GcsBlockForwardPayload))
 		return;
@@ -3179,6 +3246,11 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 				 * drops a block on which it still owns an active ITL slot. */
 				hdr->status = (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER;
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->cf_xheld_read_ship_count, 1);
+				/* PGRAC: spec-5.59 D3 — holder-forward read-image ship: time
+				 * from here through the reply send below (the block copy
+				 * earlier in this handler is excluded; approximate service
+				 * time, count parity via cf_xheld_read_ship_count). */
+				cluster_xp_begin(&xp_fwd_ship, CLXP_R_READIMAGE_SHIP);
 			} else {
 				hdr->status = (fwd->transition_id == PCM_TRANS_N_TO_X
 							   || fwd->transition_id == PCM_TRANS_S_TO_X_UPGRADE)
@@ -3293,6 +3365,9 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 		(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, fwd->original_requester_node,
 									   buf, total);
 	}
+	/* PGRAC: spec-5.59 D3 — close the holder-forward read-image ship scope
+	 * (no-op unless the read-image branch above started it). */
+	cluster_xp_end(&xp_fwd_ship);
 
 	pfree(buf);
 }
@@ -3353,10 +3428,14 @@ gcs_block_broadcast_invalidate_and_wait(const GcsBlockRequestPayload *req, uint3
 	bool full_ack = false;
 	long start_lsn;
 	long elapsed_ms = 0;
+	/* PGRAC: spec-5.59 D2 — invalidate broadcast + ack-collection interval
+	 * (runs at the master; service-time when master != requester). */
+	ClusterXpScope xp_inv;
 
 	if (ClusterGcsBlock == NULL)
 		return false;
 
+	cluster_xp_begin(&xp_inv, CLXP_W_GCS_X_INVALIDATE);
 	current_epoch = cluster_epoch_get_current();
 
 	/* Claim and stamp the broadcast slot as one critical section.  ACK
@@ -3365,6 +3444,7 @@ gcs_block_broadcast_invalidate_and_wait(const GcsBlockRequestPayload *req, uint3
 	LWLockAcquire(&ClusterGcsBlock->invalidate_broadcast_lock.lock, LW_EXCLUSIVE);
 	if (pg_atomic_read_u64(&ClusterGcsBlock->invalidate_broadcast_request_id) != 0) {
 		LWLockRelease(&ClusterGcsBlock->invalidate_broadcast_lock.lock);
+		cluster_xp_abort(&xp_inv); /* PGRAC: spec-5.59 — slot busy, no sample */
 		return false;
 	}
 	ClusterGcsBlock->invalidate_broadcast_epoch = current_epoch;
@@ -3423,6 +3503,7 @@ gcs_block_broadcast_invalidate_and_wait(const GcsBlockRequestPayload *req, uint3
 	pg_atomic_write_u32(&ClusterGcsBlock->invalidate_broadcast_acked_bm, 0);
 	LWLockRelease(&ClusterGcsBlock->invalidate_broadcast_lock.lock);
 
+	cluster_xp_end(&xp_inv); /* PGRAC: spec-5.59 D2 */
 	return full_ack;
 }
 

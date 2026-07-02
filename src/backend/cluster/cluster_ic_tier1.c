@@ -1743,8 +1743,10 @@ cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd)
 		 *   PEER_FAILURE    -> close peer (peer-level failure)
 		 */
 		{
-			ClusterICEnvelopeVerifyResult vrc = cluster_ic_envelope_accept_and_observe(
-				&env, payload, payload_len, (uint32)cluster_node_id, peer_id);
+			ClusterICEnvelopeVerifyResult vrc;
+
+			vrc = cluster_ic_envelope_accept_and_observe(&env, payload, payload_len,
+														 (uint32)cluster_node_id, peer_id);
 
 			if (vrc == CLUSTER_IC_ENVELOPE_DROP_NO_CLOSE) {
 				/*

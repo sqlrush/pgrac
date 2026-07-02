@@ -189,8 +189,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT category) FROM pg_cluster_state}),
-   '50',
-   'L7b pg_cluster_state has 50 distinct categories (spec-5.11 adds hang; spec-5.51 adds cr_pool; spec-5.14 adds reconfig_touched; spec-5.15 adds reconfig_join; spec-5.55 adds resolver_cache; spec-5.57 adds cr_coord)');
+   '51',
+   'L7b pg_cluster_state has 51 distinct categories (spec-5.11 adds hang; spec-5.51 adds cr_pool; spec-5.14 adds reconfig_touched; spec-5.15 adds reconfig_join; spec-5.55 adds resolver_cache; spec-5.57 adds cr_coord; spec-5.59 adds xnode_profile)');
 
 
 # ----------
@@ -209,7 +209,7 @@ is($node->safe_psql(
 my $smoke_categories = $node->safe_psql(
 	'postgres',
 	q{SELECT count(DISTINCT category) FROM pg_cluster_state});
-is($smoke_categories, '50', 'L9 cluster_smoke surface integrates pcm + gcs + tt_status + tt_status_hint + tt_2pc + tt_recovery + undo_record + visibility + wal_thread + dl + hw + ir + ko + ts categories (50 categories;spec-5.11 adds hang;spec-5.51 adds cr_pool;spec-5.14 adds reconfig_touched;spec-5.15 adds reconfig_join; spec-5.55 adds resolver_cache; spec-5.57 adds cr_coord)');
+is($smoke_categories, '51', 'L9 cluster_smoke surface integrates pcm + gcs + tt_status + tt_status_hint + tt_2pc + tt_recovery + undo_record + visibility + wal_thread + dl + hw + ir + ko + ts categories (51 categories;spec-5.11 adds hang;spec-5.51 adds cr_pool;spec-5.14 adds reconfig_touched;spec-5.15 adds reconfig_join; spec-5.55 adds resolver_cache; spec-5.57 adds cr_coord; spec-5.59 adds xnode_profile)');
 
 
 # ----------

@@ -230,4 +230,12 @@ is($node->safe_psql('postgres',
 	'1|integer|sighup',
 	'cluster.backup_parallel_channels default and context');
 
+# spec-5.59 D1: cross-node profiling switch (default off, SUSET so a
+# superuser can open a measurement window without a restart).
+is($node->safe_psql('postgres',
+	q{SELECT setting || '|' || vartype || '|' || context
+	    FROM pg_settings WHERE name = 'cluster.xnode_profile'}),
+	'off|bool|superuser',
+	'cluster.xnode_profile default off, bool, superuser context');
+
 done_testing();

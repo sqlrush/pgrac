@@ -45,6 +45,7 @@
 #include "cluster/cluster_ges.h" /* spec-5.16: GES_REPLY_OPCODE_GRANT (orphan tombstone) */
 #include "cluster/cluster_ges_reply_wait.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_xnode_profile.h" /* PGRAC: spec-5.59 D2 profiling */
 
 
 /*
@@ -339,9 +340,15 @@ cluster_ges_reply_wait_deliver(const GesReplyWaitKey *key, uint32 reply_opcode,
 	GesReplyWaitEntry *entry;
 	GesReplyWaitEntry *woke = NULL;
 	GesReplyDeliverResult result;
+	ClusterXpScope xp_wake; /* PGRAC: spec-5.59 D2 profiling */
 
-	if (reply_wait_state == NULL || reply_wait_htab == NULL)
+	/* PGRAC: spec-5.59 D2 profiling — deliver + wake service-time (LMON side) */
+	cluster_xp_begin(&xp_wake, CLXP_W_GES_WAKE);
+
+	if (reply_wait_state == NULL || reply_wait_htab == NULL) {
+		cluster_xp_end(&xp_wake); /* PGRAC: spec-5.59 D2 profiling */
 		return GES_REPLY_DELIVER_NO_WAITER;
+	}
 
 	LWLockAcquire(&reply_wait_state->lwlock, LW_EXCLUSIVE);
 	entry = (GesReplyWaitEntry *)hash_search(reply_wait_htab, key, HASH_FIND, NULL);
@@ -375,6 +382,7 @@ cluster_ges_reply_wait_deliver(const GesReplyWaitKey *key, uint32 reply_opcode,
 
 	if (woke != NULL)
 		ConditionVariableBroadcast(&woke->cv);
+	cluster_xp_end(&xp_wake); /* PGRAC: spec-5.59 D2 profiling */
 	return result;
 }
 
