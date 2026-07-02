@@ -1,11 +1,11 @@
 #!/usr/bin/env perl
 #-------------------------------------------------------------------------
 #
-# 332_cluster_backup_pitr.pl
+# 335_cluster_backup_pitr.pl
 #    spec-6.5 -- cluster-aware backup / restore / PITR SQL surface.
 #
 # IDENTIFICATION
-#    src/test/cluster_tap/t/332_cluster_backup_pitr.pl
+#    src/test/cluster_tap/t/335_cluster_backup_pitr.pl
 #
 # Author: SqlRush <sqlrush@gmail.com>
 #
@@ -305,6 +305,15 @@ is($pair_backup_session->query_safe(
 	     FROM pg_cluster_backup_start('pair332', true);}),
 	"pair332,t,t",
 	'L15a two-node cluster backup start succeeds through peer IC coordination');
+my ($pair_concurrent_ret, $pair_concurrent_out, $pair_concurrent_err) =
+  $pair->node0->psql('postgres',
+	"\\set VERBOSITY verbose\n"
+	  . "SELECT * FROM pg_cluster_backup_start('pair332_concurrent', true);");
+isnt($pair_concurrent_ret, 0,
+	'L15a concurrent cluster backup start fails closed while backup is in progress');
+like($pair_concurrent_err,
+	qr/a cluster backup is already in progress|cluster_backup_in_progress|53RAB/,
+	'L15a concurrent backup reports cluster_backup_in_progress');
 
 $pair->node1->safe_psql('postgres',
 	q{BEGIN;
@@ -339,12 +348,17 @@ is($pair_stop_out,
 	'L15d two-node cluster backup stop cuts while peer 2PC is only prepared');
 $pair_backup_session->quit;
 
-my ($pair_backup_set, $pair_threads, $pair_nodes, $pair_consistent_scn) = split /\n/,
+my (
+	$pair_backup_set, $pair_threads, $pair_nodes, $pair_consistent_scn,
+	$pair_scn_durable_peak, $pair_timeline
+) = split /\n/,
   $pair->node0->safe_psql('postgres',
 	q{SELECT backup_set_path FROM pg_cluster_backup_history;
 	  SELECT thread_count FROM pg_cluster_backup_history;
 	  SELECT node_count FROM pg_cluster_backup_history;
-	  SELECT consistent_scn FROM pg_cluster_backup_history;});
+	  SELECT consistent_scn FROM pg_cluster_backup_history;
+	  SELECT scn_durable_peak FROM pg_cluster_backup_history;
+	  SELECT timeline FROM pg_cluster_backup_history;});
 is("$pair_threads,$pair_nodes", '2,2',
 	'L16 two-node manifest records both WAL threads and nodes');
 ok(-d "$pair_backup_set/thread_1", 'L17 coordinator WAL thread was captured');
@@ -374,6 +388,9 @@ sub configure_pair_restore
 	my ($restore_node, $shared_dir, $target_scn) = @_;
 	my $restore_ic0 = PostgreSQL::Test::Cluster::get_free_port();
 	my $restore_ic1 = PostgreSQL::Test::Cluster::get_free_port();
+	my $target_conf = defined($target_scn)
+	  ? "cluster.recovery_target_scn = '$target_scn'\n"
+	  : "";
 
 	unlink $restore_node->data_dir . '/pgrac.conf';
 	PostgreSQL::Test::Utils::append_to_file($restore_node->data_dir . '/pgrac.conf',
@@ -401,7 +418,7 @@ EOC
 	. "cluster.smgr_user_relations = on\n"
 	. "max_prepared_transactions = 10\n"
 	. "cluster.pcm_grd_max_entries = 0\n"
-	. "cluster.recovery_target_scn = '$target_scn'\n"
+	. $target_conf
 	. "cluster.recovery_target_action = 'promote'\n");
 	PostgreSQL::Test::Utils::append_to_file($restore_node->data_dir . '/recovery.signal', '');
 }
@@ -417,6 +434,15 @@ is($pair_restore->safe_psql('postgres',
 	     FROM cluster_backup_pair_probe}),
 	'1:10,2:20',
 	'L18 two-node backup->restore->PITR reads the manifest-consistent cut');
+is($pair_restore->safe_psql('postgres',
+	qq{SELECT CASE WHEN cluster_scn_current() >= $pair_scn_durable_peak THEN 't' ELSE 'f' END}),
+	't',
+	'L18b PITR open restores cluster SCN at or above the manifest high-water');
+my $pair_restore_walfile = $pair_restore->safe_psql('postgres',
+	q{SELECT pg_walfile_name(pg_current_wal_lsn())});
+my $pair_restore_tli = hex(substr($pair_restore_walfile, 0, 8));
+ok($pair_restore_tli > $pair_timeline,
+	'L18c PITR open switches to a new RESETLOGS timeline');
 my ($pending_ret, $pending_out, $pending_err) = $pair_restore->psql('postgres',
 	q{SELECT count(*) FROM cluster_backup_pair_pending WHERE id = 3});
 isnt($pending_ret, 0,
@@ -432,6 +458,32 @@ like(slurp_file($pair_restore->logfile),
 	qr/redo done \(cluster backup restore\)/,
 	'L18 two-node restore drove the multi-thread restore-mode merge');
 $pair_restore->stop;
+
+my $pair_latest_shared_parent = PostgreSQL::Test::Utils::tempdir();
+my $pair_latest_shared = "$pair_latest_shared_parent/shared_data";
+PostgreSQL::Test::RecursiveCopy::copypath("$pair_backup_set/shared_data",
+	$pair_latest_shared);
+my $pair_latest_restore = PgracClusterNode->new('cluster_backup_pair_latest');
+PostgreSQL::Test::RecursiveCopy::copypath("$pair_backup_set/data",
+	$pair_latest_restore->data_dir);
+chmod(0700, $pair_latest_restore->data_dir);
+configure_pair_restore($pair_latest_restore, $pair_latest_shared, undef);
+$pair_latest_restore->start;
+is($pair_latest_restore->safe_psql('postgres',
+	q{SELECT string_agg(id::text || ':' || marker::text, ',' ORDER BY id)
+	     FROM cluster_backup_pair_probe}),
+	'1:10,2:20',
+	'L18d two-node restore with no explicit target opens at the backup-set terminus');
+is($pair_latest_restore->safe_psql('postgres',
+	qq{SELECT CASE WHEN cluster_scn_current() >= $pair_scn_durable_peak THEN 't' ELSE 'f' END}),
+	't',
+	'L18e no-target restore carries the manifest SCN high-water');
+my $pair_latest_walfile = $pair_latest_restore->safe_psql('postgres',
+	q{SELECT pg_walfile_name(pg_current_wal_lsn())});
+my $pair_latest_tli = hex(substr($pair_latest_walfile, 0, 8));
+ok($pair_latest_tli > $pair_timeline,
+	'L18f no-target restore opens on a new RESETLOGS timeline');
+$pair_latest_restore->stop;
 
 ok($pair_consistent_scn > 1,
 	'L19 two-node backup consistent SCN can be decremented for PITR floor test');
@@ -508,5 +560,29 @@ is($multi_target_node->safe_psql('postgres',
 	'L22 multiple cluster PITR targets fail closed');
 
 $multi_target_node->stop;
+
+my $pin_node = PgracClusterNode->new('cluster_backup_pin_crash');
+$pin_node->init(allows_streaming => 1);
+my $pin_archive = $pin_node->archive_dir;
+$pin_node->append_conf('postgresql.conf',
+	  "cluster.enabled = on\n"
+	. "cluster.node_id = 0\n"
+	. "cluster.allow_single_node = on\n"
+	. "wal_level = replica\n"
+	. "archive_mode = on\n"
+	. "archive_command = 'cp %p $pin_archive/%f'\n");
+$pin_node->start;
+my $pin_session = $pin_node->background_psql('postgres', on_error_die => 1);
+is($pin_session->query_safe(
+	q{SELECT backup_id FROM pg_cluster_backup_start('pin335', true);}),
+	'pin335',
+	'L23 crash-pin fixture starts a cluster backup in a live session');
+my $pin_path = $pin_node->data_dir . '/global/pgrac_cluster_backup.pin';
+ok(-f $pin_path,
+	'L23 durable WAL pin is published while cluster backup is in progress');
+$pin_node->stop('immediate');
+ok(-f $pin_path,
+	'L23 durable WAL pin survives node crash during in-progress backup');
+eval { $pin_session->quit; };
 
 done_testing();
