@@ -80,8 +80,10 @@ cluster_adg_redo(XLogReaderState *record)
 							   XLogRecGetDataLen(record))));
 
 	rec = (const xl_cluster_adg_thread_barrier *)payload;
-	(void)cluster_mrp_apply_barrier_replayed(rec->thread_id, record->EndRecPtr,
-											 rec->thread_safe_scn, rec->primary_thread_count);
+	if (!cluster_mrp_apply_barrier_replayed(rec->thread_id, record->EndRecPtr, rec->thread_safe_scn,
+											rec->primary_thread_count))
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("ADG standby apply-master lease is not valid for barrier replay")));
 }
 
 #endif /* USE_PGRAC_CLUSTER */

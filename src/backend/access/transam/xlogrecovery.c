@@ -2371,6 +2371,12 @@ cluster_adg_streaming_replay(XLogPrefetcher *xlogprefetcher, XLogReaderState *xl
 		{
 			if (native_record != NULL)
 			{
+				if (!cluster_mrp_apply_master_can_apply())
+				{
+					cluster_adg_streaming_wait(&streaming_reply_sent);
+					continue;
+				}
+
 				if (recoveryStopsBefore(xlogreader))
 				{
 					if (reachedRecoveryTarget != NULL)
@@ -2428,6 +2434,12 @@ cluster_adg_streaming_replay(XLogPrefetcher *xlogprefetcher, XLogReaderState *xl
 			}
 			cluster_recovery_merge_window_enter();
 			window_active = true;
+		}
+
+		if (!cluster_mrp_apply_master_can_apply())
+		{
+			cluster_adg_streaming_wait(&streaming_reply_sent);
+			continue;
 		}
 
 		r = cluster_recovery_merge_streaming_next(st, receive_lsn, barrier_lsn, barrier_scn,
@@ -2674,9 +2686,12 @@ ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *repl
 #ifdef USE_PGRAC_CLUSTER
 	if (cluster_mrp_should_start())
 	{
-		(void)cluster_mrp_apply_record_replayed(XLogReaderGetThreadId(xlogreader),
-												xlogreader->EndRecPtr,
-												XLogRecGetScn(xlogreader));
+		if (!cluster_mrp_apply_record_replayed(XLogReaderGetThreadId(xlogreader),
+											   xlogreader->EndRecPtr,
+											   XLogRecGetScn(xlogreader)))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("ADG standby apply-master lease is not valid for WAL replay")));
 	}
 #endif
 
