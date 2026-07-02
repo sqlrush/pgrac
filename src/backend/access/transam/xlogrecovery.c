@@ -2530,7 +2530,7 @@ ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *repl
 	 * owner/term against the durable voting-disk lease; non-ADG recovery paths
 	 * return true and keep native behavior.
 	 */
-	while (cluster_mrp_should_start()
+	while (RecoveryInProgress() && cluster_mrp_should_start()
 		   && (!cluster_apply_master_is_self()
 			   || !cluster_apply_master_term_still_valid(cluster_apply_master_current_term())))
 	{
