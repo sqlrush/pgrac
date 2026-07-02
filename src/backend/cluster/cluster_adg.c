@@ -230,6 +230,19 @@ cluster_adg_apply_master_lease_init_full(ClusterAdgApplyMasterLease *lease, uint
 	lease->crc = cluster_adg_apply_master_lease_crc(lease);
 }
 
+void
+cluster_adg_apply_master_lease_set_watermarks(ClusterAdgApplyMasterLease *lease, uint64 receive_lsn,
+											  uint64 apply_lsn, uint64 standby_consistent_scn)
+{
+	if (lease == NULL)
+		return;
+
+	lease->receive_lsn = receive_lsn;
+	lease->apply_lsn = apply_lsn;
+	lease->standby_consistent_scn = standby_consistent_scn;
+	lease->crc = cluster_adg_apply_master_lease_crc(lease);
+}
+
 bool
 cluster_adg_apply_master_lease_valid(const ClusterAdgApplyMasterLease *lease)
 {
@@ -244,6 +257,12 @@ cluster_adg_apply_master_lease_valid(const ClusterAdgApplyMasterLease *lease)
 	if (lease->owner_node_id < 0 || lease->owner_node_id > SCN_MAX_VALID_NODE_ID)
 		return false;
 	if (lease->lease_epoch == 0 || lease->owner_incarnation == 0)
+		return false;
+	if (!XLogRecPtrIsInvalid((XLogRecPtr)lease->receive_lsn)
+		&& !XLogRecPtrIsInvalid((XLogRecPtr)lease->apply_lsn)
+		&& lease->apply_lsn > lease->receive_lsn)
+		return false;
+	if (lease->standby_consistent_scn != 0 && !SCN_VALID((SCN)lease->standby_consistent_scn))
 		return false;
 	return lease->crc == cluster_adg_apply_master_lease_crc(lease);
 }
@@ -341,6 +360,9 @@ cluster_adg_apply_master_lease_quorum(const ClusterAdgApplyMasterLease leases[],
 			out->generation = candidate.generation;
 			out->lease_epoch = candidate.lease_epoch;
 			out->owner_incarnation = candidate.owner_incarnation;
+			out->receive_lsn = candidate.receive_lsn;
+			out->apply_lsn = candidate.apply_lsn;
+			out->standby_consistent_scn = candidate.standby_consistent_scn;
 		}
 	}
 

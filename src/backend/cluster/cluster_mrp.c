@@ -72,6 +72,9 @@ typedef struct ClusterMrpLeaseScan {
 	uint64 generation;
 	uint64 lease_epoch;
 	uint64 owner_incarnation;
+	uint64 receive_lsn;
+	uint64 apply_lsn;
+	uint64 standby_consistent_scn;
 } ClusterMrpLeaseScan;
 
 typedef struct ClusterMrpApplyMasterSnapshot {
@@ -487,9 +490,107 @@ cluster_mrp_apply_lease_scan(ClusterMrpLeaseScan *scan)
 		scan->generation = result.generation;
 		scan->lease_epoch = result.lease_epoch;
 		scan->owner_incarnation = result.owner_incarnation;
+		scan->receive_lsn = result.receive_lsn;
+		scan->apply_lsn = result.apply_lsn;
+		scan->standby_consistent_scn = result.standby_consistent_scn;
 	}
 
 	return true;
+}
+
+static bool
+cluster_mrp_watermarks_valid(uint64 receive_lsn, uint64 apply_lsn, uint64 standby_consistent_scn)
+{
+	if (!XLogRecPtrIsInvalid((XLogRecPtr)receive_lsn) && !XLogRecPtrIsInvalid((XLogRecPtr)apply_lsn)
+		&& apply_lsn > receive_lsn)
+		return false;
+	if (standby_consistent_scn != 0 && !SCN_VALID((SCN)standby_consistent_scn))
+		return false;
+	return true;
+}
+
+static void
+cluster_mrp_publish_lsn_watermark(pg_atomic_uint64 *watermark, XLogRecPtr lsn)
+{
+	uint64 candidate = (uint64)lsn;
+	uint64 old;
+
+	if (watermark == NULL || XLogRecPtrIsInvalid(lsn))
+		return;
+
+	old = pg_atomic_read_u64(watermark);
+	while (old < candidate) {
+		if (pg_atomic_compare_exchange_u64(watermark, &old, candidate))
+			break;
+	}
+}
+
+static void
+cluster_mrp_publish_consistent_scn(uint64 standby_consistent_scn)
+{
+	SCN candidate_scn = (SCN)standby_consistent_scn;
+	uint64 old_raw;
+
+	if (cluster_mrp_state == NULL || !SCN_VALID(candidate_scn))
+		return;
+
+	for (;;) {
+		SCN old_scn;
+
+		old_raw = pg_atomic_read_u64(&cluster_mrp_state->standby_consistent_scn);
+		old_scn = (SCN)old_raw;
+		if (SCN_VALID(old_scn)) {
+			int cmp = scn_time_cmp(candidate_scn, old_scn);
+
+			if (cmp < 0 || (cmp == 0 && scn_total_cmp(candidate_scn, old_scn) <= 0))
+				break;
+		}
+		if (pg_atomic_compare_exchange_u64(&cluster_mrp_state->standby_consistent_scn, &old_raw,
+										   standby_consistent_scn))
+			break;
+	}
+}
+
+static void
+cluster_mrp_read_local_watermarks(uint64 *receive_lsn, uint64 *apply_lsn,
+								  uint64 *standby_consistent_scn)
+{
+	if (receive_lsn != NULL)
+		*receive_lsn = 0;
+	if (apply_lsn != NULL)
+		*apply_lsn = 0;
+	if (standby_consistent_scn != NULL)
+		*standby_consistent_scn = 0;
+	if (cluster_mrp_state == NULL)
+		return;
+
+	if (receive_lsn != NULL)
+		*receive_lsn = pg_atomic_read_u64(&cluster_mrp_state->receive_lsn);
+	if (apply_lsn != NULL)
+		*apply_lsn = pg_atomic_read_u64(&cluster_mrp_state->apply_lsn);
+	if (standby_consistent_scn != NULL)
+		*standby_consistent_scn = pg_atomic_read_u64(&cluster_mrp_state->standby_consistent_scn);
+}
+
+static void
+cluster_mrp_attach_apply_master_watermarks(const ClusterMrpLeaseScan *scan, int64 now_ms)
+{
+	if (cluster_mrp_state == NULL || scan == NULL || !scan->attached)
+		return;
+	if (scan->owner_node_id < 0 || scan->owner_node_id >= CLUSTER_MAX_NODES)
+		return;
+	if (scan->lease_epoch != cluster_epoch_get_current())
+		return;
+	if (now_ms >= scan->lease_expires_at_ms)
+		return;
+	if (!cluster_mrp_watermarks_valid(scan->receive_lsn, scan->apply_lsn,
+									  scan->standby_consistent_scn))
+		return;
+
+	cluster_mrp_publish_lsn_watermark(&cluster_mrp_state->receive_lsn,
+									  (XLogRecPtr)scan->receive_lsn);
+	cluster_mrp_publish_lsn_watermark(&cluster_mrp_state->apply_lsn, (XLogRecPtr)scan->apply_lsn);
+	cluster_mrp_publish_consistent_scn(scan->standby_consistent_scn);
 }
 
 static void
@@ -745,6 +846,7 @@ cluster_mrp_apply_master_acquire_or_renew(void)
 		cluster_mrp_publish_apply_master((uint32)scan.owner_node_id, scan.durable_term,
 										 scan.generation, scan.lease_epoch, scan.owner_incarnation,
 										 scan.lease_expires_at_ms);
+		cluster_mrp_attach_apply_master_watermarks(&scan, now_ms);
 		return false;
 	}
 
@@ -768,10 +870,16 @@ cluster_mrp_apply_master_acquire_or_renew(void)
 	{
 		ClusterAdgApplyMasterLease desired;
 		ClusterMrpApplyLeaseSubmitResult result;
+		uint64 receive_lsn;
+		uint64 apply_lsn;
+		uint64 standby_consistent_scn;
 
 		cluster_adg_apply_master_lease_init_full(&desired, term, cluster_node_id, expires_at_ms,
 												 generation, cluster_epoch_get_current(),
 												 cluster_mrp_owner_incarnation);
+		cluster_mrp_read_local_watermarks(&receive_lsn, &apply_lsn, &standby_consistent_scn);
+		cluster_adg_apply_master_lease_set_watermarks(&desired, receive_lsn, apply_lsn,
+													  standby_consistent_scn);
 		result = cluster_mrp_submit_apply_lease_cas(&desired);
 		if (result != CLUSTER_MRP_APPLY_LEASE_SUBMIT_ACK) {
 			cluster_mrp_held_term = 0;
@@ -923,6 +1031,22 @@ cluster_mrp_qvotec_complete_apply_lease_request(ClusterMrpApplyLeaseSubmitResult
 	else if (result == CLUSTER_MRP_APPLY_LEASE_SUBMIT_NO_QUORUM
 			 || result == CLUSTER_MRP_APPLY_LEASE_SUBMIT_FAILED)
 		cluster_mrp_clear_apply_master();
+	if (winner != NULL && winner->attached) {
+		ClusterMrpLeaseScan scan;
+
+		memset(&scan, 0, sizeof(scan));
+		scan.attached = true;
+		scan.durable_term = winner->durable_term;
+		scan.owner_node_id = winner->owner_node_id;
+		scan.lease_expires_at_ms = winner->lease_expires_at_ms;
+		scan.generation = winner->generation;
+		scan.lease_epoch = winner->lease_epoch;
+		scan.owner_incarnation = winner->owner_incarnation;
+		scan.receive_lsn = winner->receive_lsn;
+		scan.apply_lsn = winner->apply_lsn;
+		scan.standby_consistent_scn = winner->standby_consistent_scn;
+		cluster_mrp_attach_apply_master_watermarks(&scan, cluster_mrp_now_ms());
+	}
 
 	cluster_mrp_apply_lease_publish_result(result);
 }
@@ -1183,32 +1307,13 @@ cluster_mrp_publish_watermarks(XLogRecPtr receive_lsn, XLogRecPtr apply_lsn,
 		pg_atomic_fetch_add_u64(&cluster_mrp_state->error_count, 1);
 		return;
 	}
-	if (!XLogRecPtrIsInvalid(receive_lsn) && !XLogRecPtrIsInvalid(apply_lsn)
-		&& apply_lsn > receive_lsn)
+	if (!cluster_mrp_watermarks_valid((uint64)receive_lsn, (uint64)apply_lsn,
+									  standby_consistent_scn))
 		return;
-	if (!XLogRecPtrIsInvalid(receive_lsn))
-		pg_atomic_write_u64(&cluster_mrp_state->receive_lsn, (uint64)receive_lsn);
-	if (!XLogRecPtrIsInvalid(apply_lsn))
-		pg_atomic_write_u64(&cluster_mrp_state->apply_lsn, (uint64)apply_lsn);
-	if (SCN_VALID(candidate_scn)) {
-		uint64 old_raw;
 
-		for (;;) {
-			SCN old_scn;
-
-			old_raw = pg_atomic_read_u64(&cluster_mrp_state->standby_consistent_scn);
-			old_scn = (SCN)old_raw;
-			if (SCN_VALID(old_scn)) {
-				int cmp = scn_time_cmp(candidate_scn, old_scn);
-
-				if (cmp < 0 || (cmp == 0 && scn_total_cmp(candidate_scn, old_scn) <= 0))
-					break;
-			}
-			if (pg_atomic_compare_exchange_u64(&cluster_mrp_state->standby_consistent_scn, &old_raw,
-											   standby_consistent_scn))
-				break;
-		}
-	}
+	cluster_mrp_publish_lsn_watermark(&cluster_mrp_state->receive_lsn, receive_lsn);
+	cluster_mrp_publish_lsn_watermark(&cluster_mrp_state->apply_lsn, apply_lsn);
+	cluster_mrp_publish_consistent_scn(standby_consistent_scn);
 }
 
 void

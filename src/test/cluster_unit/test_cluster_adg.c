@@ -197,6 +197,7 @@ UT_TEST(test_apply_master_lease_marker_pack_unpack)
 
 	memset(slot, 0xA5, sizeof(slot));
 	cluster_adg_apply_master_lease_init(&lease, 7, 3, 1000, 11);
+	cluster_adg_apply_master_lease_set_watermarks(&lease, 0x3000, 0x2000, 42);
 	UT_ASSERT(cluster_adg_apply_master_lease_valid(&lease));
 	UT_ASSERT(cluster_adg_apply_master_lease_pack(slot, &lease));
 	for (i = sizeof(ClusterAdgApplyMasterLease); i < sizeof(slot); i++)
@@ -210,6 +211,9 @@ UT_TEST(test_apply_master_lease_marker_pack_unpack)
 	UT_ASSERT_EQ(out.generation, (uint64)11);
 	UT_ASSERT_EQ(out.lease_epoch, (uint64)1);
 	UT_ASSERT_EQ(out.owner_incarnation, (uint64)1);
+	UT_ASSERT_EQ(out.receive_lsn, (uint64)0x3000);
+	UT_ASSERT_EQ(out.apply_lsn, (uint64)0x2000);
+	UT_ASSERT_EQ(out.standby_consistent_scn, (uint64)42);
 
 	slot[offsetof(ClusterAdgApplyMasterLease, generation)] ^= 0x01;
 	UT_ASSERT(!cluster_adg_apply_master_lease_unpack(slot, &out));
@@ -249,6 +253,10 @@ UT_TEST(test_apply_master_lease_marker_rejects_invalid_fields)
 
 	cluster_adg_apply_master_lease_init_full(&lease, 7, 3, 1000, 11, 1, 0);
 	UT_ASSERT(!cluster_adg_apply_master_lease_valid(&lease));
+
+	cluster_adg_apply_master_lease_init(&lease, 7, 3, 1000, 11);
+	cluster_adg_apply_master_lease_set_watermarks(&lease, 0x2000, 0x3000, 42);
+	UT_ASSERT(!cluster_adg_apply_master_lease_valid(&lease));
 }
 
 UT_TEST(test_apply_master_lease_quorum_selects_single_winner)
@@ -260,6 +268,9 @@ UT_TEST(test_apply_master_lease_quorum_selects_single_winner)
 	cluster_adg_apply_master_lease_init(&leases[0], 7, 1, 1000, 11);
 	cluster_adg_apply_master_lease_init(&leases[1], 7, 1, 1200, 11);
 	cluster_adg_apply_master_lease_init(&leases[2], 7, 2, 1300, 11);
+	cluster_adg_apply_master_lease_set_watermarks(&leases[0], 0x3000, 0x2000, 41);
+	cluster_adg_apply_master_lease_set_watermarks(&leases[1], 0x3000, 0x2000, 41);
+	cluster_adg_apply_master_lease_set_watermarks(&leases[2], 0x6000, 0x5000, 42);
 
 	UT_ASSERT(cluster_adg_apply_master_lease_quorum(leases, valid, 3, 2, &result));
 	UT_ASSERT(result.attached);
@@ -268,10 +279,16 @@ UT_TEST(test_apply_master_lease_quorum_selects_single_winner)
 	UT_ASSERT_EQ(result.owner_node_id, 1);
 	UT_ASSERT_EQ(result.lease_expires_at_ms, (int64)1200);
 	UT_ASSERT_EQ(result.generation, (uint64)11);
+	UT_ASSERT_EQ(result.receive_lsn, (uint64)0x3000);
+	UT_ASSERT_EQ(result.apply_lsn, (uint64)0x2000);
+	UT_ASSERT_EQ(result.standby_consistent_scn, (uint64)41);
 
 	cluster_adg_apply_master_lease_init(&leases[0], 8, 2, 2000, 12);
 	cluster_adg_apply_master_lease_init(&leases[1], 7, 1, 1200, 11);
 	cluster_adg_apply_master_lease_init(&leases[2], 8, 2, 2100, 12);
+	cluster_adg_apply_master_lease_set_watermarks(&leases[0], 0x9000, 0x8000, 43);
+	cluster_adg_apply_master_lease_set_watermarks(&leases[1], 0x3000, 0x2000, 41);
+	cluster_adg_apply_master_lease_set_watermarks(&leases[2], 0x9000, 0x8000, 43);
 	UT_ASSERT(cluster_adg_apply_master_lease_quorum(leases, valid, 3, 2, &result));
 	UT_ASSERT(result.attached);
 	UT_ASSERT_EQ(result.count, 2);
@@ -279,6 +296,9 @@ UT_TEST(test_apply_master_lease_quorum_selects_single_winner)
 	UT_ASSERT_EQ(result.owner_node_id, 2);
 	UT_ASSERT_EQ(result.lease_expires_at_ms, (int64)2100);
 	UT_ASSERT_EQ(result.generation, (uint64)12);
+	UT_ASSERT_EQ(result.receive_lsn, (uint64)0x9000);
+	UT_ASSERT_EQ(result.apply_lsn, (uint64)0x8000);
+	UT_ASSERT_EQ(result.standby_consistent_scn, (uint64)43);
 }
 
 UT_TEST(test_apply_master_lease_quorum_rejects_split_without_majority)

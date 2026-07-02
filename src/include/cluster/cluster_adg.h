@@ -27,7 +27,7 @@
 
 #define CLUSTER_ADG_MAX_THREADS CLUSTER_WAL_THREAD_MAX
 #define CLUSTER_ADG_APPLY_LEASE_MAGIC 0x41444c53 /* "ADLS" */
-#define CLUSTER_ADG_APPLY_LEASE_VERSION 2
+#define CLUSTER_ADG_APPLY_LEASE_VERSION 3
 #define CLUSTER_ADG_APPLY_LEASE_SLOT_BYTES 512
 #define CLUSTER_ADG_REPLY_MAGIC 0x41444752 /* "ADGR" */
 #define CLUSTER_ADG_REPLY_VERSION 1
@@ -69,6 +69,9 @@ typedef struct ClusterAdgApplyMasterLease {
 	uint64 generation;
 	uint64 lease_epoch;
 	uint64 owner_incarnation;
+	uint64 receive_lsn;
+	uint64 apply_lsn;
+	uint64 standby_consistent_scn;
 	pg_crc32c crc;
 } ClusterAdgApplyMasterLease;
 
@@ -81,6 +84,9 @@ typedef struct ClusterAdgApplyMasterLeaseQuorum {
 	uint64 generation;
 	uint64 lease_epoch;
 	uint64 owner_incarnation;
+	uint64 receive_lsn;
+	uint64 apply_lsn;
+	uint64 standby_consistent_scn;
 } ClusterAdgApplyMasterLeaseQuorum;
 
 typedef enum ClusterAdgApplyMasterLeaseCasVerdict {
@@ -112,6 +118,9 @@ extern void cluster_adg_apply_master_lease_init_full(ClusterAdgApplyMasterLease 
 													 int32 owner_node_id, int64 lease_expires_at_ms,
 													 uint64 generation, uint64 lease_epoch,
 													 uint64 owner_incarnation);
+extern void cluster_adg_apply_master_lease_set_watermarks(ClusterAdgApplyMasterLease *lease,
+														  uint64 receive_lsn, uint64 apply_lsn,
+														  uint64 standby_consistent_scn);
 extern bool cluster_adg_apply_master_lease_valid(const ClusterAdgApplyMasterLease *lease);
 extern bool cluster_adg_apply_master_lease_pack(void *slot512,
 												const ClusterAdgApplyMasterLease *lease);

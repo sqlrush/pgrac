@@ -745,7 +745,9 @@ qvotec_apply_lease_same_winner(const ClusterAdgApplyMasterLeaseQuorum *winner,
 		   && winner->owner_node_id == desired->owner_node_id
 		   && winner->generation == desired->generation
 		   && winner->lease_epoch == desired->lease_epoch
-		   && winner->owner_incarnation == desired->owner_incarnation;
+		   && winner->owner_incarnation == desired->owner_incarnation
+		   && winner->receive_lsn == desired->receive_lsn && winner->apply_lsn == desired->apply_lsn
+		   && winner->standby_consistent_scn == desired->standby_consistent_scn;
 }
 
 static ClusterMrpApplyLeaseSubmitResult
