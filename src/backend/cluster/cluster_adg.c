@@ -179,6 +179,28 @@ cluster_adg_scn_tracker_consistent_scn(const ClusterAdgScnTracker *tracker)
 	return tracker->standby_consistent_scn;
 }
 
+bool
+cluster_adg_replay_start_lsn(XLogRecPtr start_lsn, XLogRecPtr receive_lsn, XLogRecPtr apply_lsn,
+							 XLogRecPtr *effective_start_lsn)
+{
+	XLogRecPtr effective;
+
+	if (effective_start_lsn == NULL || XLogRecPtrIsInvalid(start_lsn)
+		|| XLogRecPtrIsInvalid(receive_lsn) || receive_lsn < start_lsn)
+		return false;
+
+	effective = start_lsn;
+	if (!XLogRecPtrIsInvalid(apply_lsn)) {
+		if (apply_lsn > receive_lsn)
+			return false;
+		if (apply_lsn > effective)
+			effective = apply_lsn;
+	}
+
+	*effective_start_lsn = effective;
+	return true;
+}
+
 uint64
 cluster_adg_apply_master_next_term(uint64 durable_term)
 {

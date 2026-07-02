@@ -250,6 +250,25 @@ UT_TEST(test_thread_bounds_are_release_checked)
 	UT_ASSERT(!cluster_adg_mark_received(&tracker, 2, 1, 1));
 }
 
+UT_TEST(test_replay_start_lsn_is_thread_local)
+{
+	XLogRecPtr effective = InvalidXLogRecPtr;
+
+	UT_ASSERT(cluster_adg_replay_start_lsn(100, 200, InvalidXLogRecPtr, &effective));
+	UT_ASSERT_EQ(effective, (XLogRecPtr)100);
+
+	UT_ASSERT(cluster_adg_replay_start_lsn(100, 200, 150, &effective));
+	UT_ASSERT_EQ(effective, (XLogRecPtr)150);
+
+	UT_ASSERT(cluster_adg_replay_start_lsn(100, 200, 90, &effective));
+	UT_ASSERT_EQ(effective, (XLogRecPtr)100);
+
+	UT_ASSERT(!cluster_adg_replay_start_lsn(100, 200, 201, &effective));
+	UT_ASSERT(!cluster_adg_replay_start_lsn(100, 99, InvalidXLogRecPtr, &effective));
+	UT_ASSERT(!cluster_adg_replay_start_lsn(InvalidXLogRecPtr, 200, InvalidXLogRecPtr, &effective));
+	UT_ASSERT(!cluster_adg_replay_start_lsn(100, 200, InvalidXLogRecPtr, NULL));
+}
+
 UT_TEST(test_apply_master_next_term_overflow)
 {
 	UT_ASSERT_EQ(cluster_adg_apply_master_next_term(41), (uint64)42);
@@ -669,7 +688,7 @@ UT_TEST(test_mrp_shmem_tracks_term_validity_and_drain)
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(25);
 
 	UT_RUN(test_tracker_init_bounds);
 	UT_RUN(test_barrier_min_publishes_after_all_threads);
@@ -679,6 +698,7 @@ main(void)
 	UT_RUN(test_barrier_retreat_is_rejected);
 	UT_RUN(test_barrier_not_record_scn_advances_read_floor);
 	UT_RUN(test_thread_bounds_are_release_checked);
+	UT_RUN(test_replay_start_lsn_is_thread_local);
 	UT_RUN(test_apply_master_next_term_overflow);
 	UT_RUN(test_apply_master_lease_marker_pack_unpack);
 	UT_RUN(test_apply_master_lease_slot_zero_fills_tail);

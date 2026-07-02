@@ -1189,12 +1189,15 @@ cluster_mrp_streaming_snapshot(uint64 bitmap[2], XLogRecPtr start_lsn[], XLogRec
 		 thread_id++) {
 		uint64 start = pg_atomic_read_u64(&cluster_mrp_state->thread_start_lsn[thread_id]);
 		uint64 receive = pg_atomic_read_u64(&cluster_mrp_state->thread_receive_lsn[thread_id]);
+		uint64 apply = pg_atomic_read_u64(&cluster_mrp_state->thread_apply_lsn[thread_id]);
+		XLogRecPtr effective_start;
 		uint16 bit;
 		uint16 word;
 
 		if (!cluster_mrp_primary_thread_observed(thread_id))
 			continue;
-		if (start == 0 || receive == 0 || receive < start)
+		if (!cluster_adg_replay_start_lsn((XLogRecPtr)start, (XLogRecPtr)receive, (XLogRecPtr)apply,
+										  &effective_start))
 			return 0;
 
 		bit = thread_id - XLP_THREAD_ID_FIRST_REAL;
@@ -1204,7 +1207,7 @@ cluster_mrp_streaming_snapshot(uint64 bitmap[2], XLogRecPtr start_lsn[], XLogRec
 		if (bitmap != NULL)
 			bitmap[word] |= UINT64CONST(1) << (bit % 64);
 		if (start_lsn != NULL)
-			start_lsn[thread_id] = (XLogRecPtr)start;
+			start_lsn[thread_id] = effective_start;
 		if (receive_lsn != NULL)
 			receive_lsn[thread_id] = (XLogRecPtr)receive;
 		if (barrier_lsn != NULL)

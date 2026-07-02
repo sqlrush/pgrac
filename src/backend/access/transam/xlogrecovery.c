@@ -2408,23 +2408,6 @@ cluster_adg_streaming_replay(XLogPrefetcher *xlogprefetcher, XLogReaderState *xl
 			continue;
 		}
 
-		if (!XLogRecPtrIsInvalid(replay_end))
-		{
-			for (uint16 thread = XLP_THREAD_ID_FIRST_REAL;
-				 thread <= CLUSTER_WAL_THREAD_MAX; thread++)
-			{
-				uint16 bit = thread - XLP_THREAD_ID_FIRST_REAL;
-				uint16 word = bit / 64;
-
-				if (word >= lengthof(bitmap))
-					break;
-				if ((bitmap[word] & (UINT64CONST(1) << (bit % 64))) == 0)
-					continue;
-				if (start_lsn[thread] < replay_end)
-					start_lsn[thread] = replay_end;
-			}
-		}
-
 		if (st == NULL)
 		{
 			st = cluster_recovery_merge_streaming_begin(bitmap, start_lsn, tli);

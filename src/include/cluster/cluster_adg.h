@@ -109,6 +109,8 @@ extern bool cluster_adg_apply_thread_barrier(ClusterAdgScnTracker *tracker, uint
 											 XLogRecPtr apply_lsn, SCN barrier_safe_scn,
 											 int64 apply_time_ms);
 extern SCN cluster_adg_scn_tracker_consistent_scn(const ClusterAdgScnTracker *tracker);
+extern bool cluster_adg_replay_start_lsn(XLogRecPtr start_lsn, XLogRecPtr receive_lsn,
+										 XLogRecPtr apply_lsn, XLogRecPtr *effective_start_lsn);
 extern uint64 cluster_adg_apply_master_next_term(uint64 durable_term);
 extern pg_crc32c cluster_adg_apply_master_lease_crc(const ClusterAdgApplyMasterLease *lease);
 extern void cluster_adg_apply_master_lease_init(ClusterAdgApplyMasterLease *lease, uint64 term,
