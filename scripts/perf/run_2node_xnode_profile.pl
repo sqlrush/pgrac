@@ -127,7 +127,8 @@ my $XP_SECS   = $ENV{XP_SECS} // 8;
 my $XP_ROUNDS = $ENV{XP_ROUNDS} // 5;
 my $XP_SCALE  = $ENV{XP_SCALE} // 10;
 my $PGBENCH   = $ENV{PGBENCH} // 'pgbench';
-my $OBS_SECS  = 4;    # observe-only write-collapse leg ("a few seconds")
+my $OBS_SECS  = 4;
+our $PAIR_SCALE_USED;    # observe-only write-collapse leg ("a few seconds")
 
 my $REPO_ROOT = File::Spec->rel2abs("$FindBin::RealBin/../..");
 my $XP_OUT    = $ENV{XP_OUT}
@@ -208,6 +209,22 @@ sub ns_per_event
 	my ($nanos, $n) = @_;
 	return 'n/a' unless defined $n && $n > 0;
 	return sprintf('%.0f', $nanos / $n);
+}
+
+
+# Cross-node statements can hit retryable fail-closed / timeout errors
+# (rule-8.A behaviour under transient load); bounded retry, never die.
+sub psql_retry
+{
+	my ($node, $sql, $tries) = @_;
+	$tries //= 5;
+	for my $i (1 .. $tries)
+	{
+		my $ok = eval { $node->safe_psql('postgres', $sql); 1 };
+		return 1 if $ok;
+		Time::HiRes::sleep(0.5);
+	}
+	return 0;
 }
 
 sub poll_sql_eq
@@ -296,16 +313,43 @@ sub pgbench_one
 
 sub pgbench_init
 {
-	my ($node) = @_;
+	my ($node, $scale) = @_;
+	$scale //= $XP_SCALE;
 	my $conn = "-h '" . $node->host . "' -p " . $node->port . ' postgres';
-	my $out = `$PGBENCH -i -s $XP_SCALE -q $conn 2>&1`;
-	if ($? != 0)
+	for my $attempt (1, 2)
 	{
+		my $out = `$PGBENCH -i -s $scale -q $conn 2>&1`;
+		return 1 if $? == 0;
 		# Never swallow the failure mode: the CI artifact must show WHY.
-		progress("pgbench init failed on " . $node->name . ": $out");
-		return 0;
+		progress("pgbench init attempt $attempt (scale $scale) failed on "
+			  . $node->name . ": $out");
+		sleep 3;    # let a transient shipping/dedup storm drain
 	}
-	return 1;
+	return 0;
+}
+
+# The phantom pair's bulk COPY is storm-prone on slow local machines
+# (dedup / transition-denied bursts under PCM-on shipping).  Degrade the
+# scale rather than dying: the harness is REPORT-ONLY and records the
+# scale actually used; 0 means the pair W-axis TPS stays n/a.
+sub pgbench_init_pair_degrading
+{
+	my ($node) = @_;
+	for my $scale ($XP_SCALE, 4, 2, 1)
+	{
+		return $scale if pgbench_init($node, $scale);
+		progress("pair pgbench init: degrading below scale $scale");
+		# a failed bulk COPY leaves partial tables + storm state behind;
+		# clear them (best effort) before the next, smaller attempt.
+		eval {
+			$node->safe_psql('postgres',
+				'DROP TABLE IF EXISTS pgbench_accounts, pgbench_branches, '
+				  . 'pgbench_history, pgbench_tellers');
+			1;
+		};
+		sleep 2;
+	}
+	return 0;
 }
 
 # Loop one SQL text against a node until $secs elapse; each safe_psql call
@@ -364,6 +408,15 @@ sub boot_pair
 		extra_conf          => [
 			@pair_conf,
 			'cluster.xnode_profile = on',
+			# Bulk pgbench -i COPY on the pair can exhaust the default
+			# retransmit budget on a loaded local machine (cassert +
+			# shipping storm); a profiling harness prefers patience.
+			'cluster.gcs_block_retransmit_max_retries = 8',
+			# Bulk COPY floods many distinct in-flight block requests; the
+			# default 1024-entry dedup HTAB TTL-sweeps too slowly on a slow
+			# cassert machine -> DENIED_DEDUP_FULL storms.  Profiling
+			# harness sizes it out of the way.
+			'cluster.gcs_block_dedup_max_entries = 16384',
 			'cluster.quorum_poll_interval_ms = 500',
 			'cluster.cssd_heartbeat_interval_ms = 2000',
 			'cluster.cssd_dead_deadband_factor = 10',
@@ -381,10 +434,34 @@ sub boot_pair
 	return $pair;
 }
 
+
+# Create every phantom-shared (coincidence-dependent) table up front,
+# IMMEDIATELY after the pair reaches quorum: any node0-only DDL (the
+# index/commit axis tables, pgbench init) advances node0's relfilenode
+# counter and would break the same-DDL/same-relfilepath premise for any
+# later duplicated table (t/334 pattern).
+sub setup_phantom_tables
+{
+	my ($pair) = @_;
+	my ($node0, $node1) = ($pair->node0, $pair->node1);
+	for my $tbl (qw(xp_read xp_hot))
+	{
+		$node0->safe_psql('postgres', "CREATE TABLE $tbl (id int, v int)");
+		$node1->safe_psql('postgres', "CREATE TABLE $tbl (id int, v int)");
+		my $p0 = $node0->safe_psql('postgres',
+			"SELECT pg_relation_filepath('$tbl')");
+		my $p1 = $node1->safe_psql('postgres',
+			"SELECT pg_relation_filepath('$tbl')");
+		die "harness failure: $tbl relfilepath coincidence does not hold "
+		  . "(n0=$p0 n1=$p1)\n"
+		  unless $p0 eq $p1;
+	}
+}
+
 # ---- W axis: pair single-writer pgbench + interleaved 3-tier baseline ----
 sub axis_write
 {
-	my ($native, $solo, $pair) = @_;
+	my ($native, $solo, $pair, $pair_scale) = @_;
 	my ($node0, $node1) = ($pair->node0, $pair->node1);
 
 	progress("W axis: $XP_ROUNDS interleaved rounds x ${XP_SECS}s "
@@ -398,8 +475,27 @@ sub axis_write
 	{
 		my ($n) = pgbench_one($native, 1, $XP_SECS);
 		my ($s) = pgbench_one($solo,   1, $XP_SECS);
-		my $t0  = Time::HiRes::time();
-		my ($p) = pgbench_one($node0, 1, $XP_SECS);
+		my $t0 = Time::HiRes::time();
+		my $p;
+		if ($pair_scale)
+		{
+			($p) = pgbench_one($node0, 1, $XP_SECS);
+		}
+		else
+		{
+			# pgbench tables unavailable on the pair: drive a plain SQL
+			# write loop so the W buckets still accumulate honest deltas
+			# (TPS/tax stay n/a in the report).  eval-wrapped: the pair
+			# may need a beat to drain the failed-COPY storm state.
+			eval {
+				$node0->safe_psql('postgres',
+					'CREATE TABLE IF NOT EXISTS xp_wfallback (id int, v int)');
+				1;
+			} or sleep 2;
+			run_sql_rounds($node0,
+				'INSERT INTO xp_wfallback SELECT g, g FROM generate_series(1,200) g',
+				$XP_SECS);
+		}
 		$pair_wall_ns += (Time::HiRes::time() - $t0) * 1e9;
 		push @nat,      $n if defined $n && $n > 0;
 		push @solo_tps, $s if defined $s && $s > 0;
@@ -463,28 +559,22 @@ sub axis_read
 	# coincident files) on BOTH nodes must land the same relfilepath; then
 	# node0 seeds rows and CHECKPOINTs them to shared storage so node1's
 	# reads go through cross-node coordination.
-	$node0->safe_psql('postgres', 'CREATE TABLE xp_read (id int, v int)');
-	$node1->safe_psql('postgres', 'CREATE TABLE xp_read (id int, v int)');
-	my $f0 = $node0->safe_psql('postgres',
-		"SELECT pg_relation_filepath('xp_read')");
-	my $f1 = $node1->safe_psql('postgres',
-		"SELECT pg_relation_filepath('xp_read')");
-	die "harness failure: xp_read relfilepath coincidence does not hold "
-	  . "(n0=$f0 n1=$f1); node1 reads would not touch node0-written blocks\n"
-	  unless $f0 eq $f1;
+	# xp_read was created (and coincidence-checked) by
+	# setup_phantom_tables right after the pair reached quorum.
 
-	$node0->safe_psql('postgres',
-		'INSERT INTO xp_read SELECT g, g FROM generate_series(1,5000) g');
+	psql_retry($node0,
+		'INSERT INTO xp_read SELECT g, g FROM generate_series(1,5000) g')
+	  or progress('R seeding failed after retries; reads will be empty');
 	# Wide UPDATE from node0: id % 5 touches rows in every heap block, so
 	# every block node1 reads carries node0-written versions.
-	$node0->safe_psql('postgres',
+	psql_retry($node0,
 		'UPDATE xp_read SET v = v + 1 WHERE id % 5 = 0');
-	$node0->safe_psql('postgres', 'CHECKPOINT');
+	psql_retry($node0, 'CHECKPOINT');
 
 	my $pre = read_phase($node1);
 
 	# Amortization experiment: VACUUM on node0, then the SAME reads.
-	$node0->safe_psql('postgres', 'VACUUM xp_read');
+	psql_retry($node0, 'VACUUM xp_read');
 	my $post = read_phase($node1);
 
 	# S-cache ceiling estimate from the PRE phase: if reship -> 0, saved
@@ -567,18 +657,12 @@ sub axis_commit
 }
 
 # ---- observe-only legs (never fail; errors are OBSERVATIONS) ----
-sub observe_legs
+sub observe_hot
 {
 	my ($pair) = @_;
 	my ($node0, $node1) = ($pair->node0, $pair->node1);
 
-	progress("observe-only: pgbench -c 2 ${OBS_SECS}s (write collapse) + "
-		  . '10 alternating same-rows updates');
-
-	# O1: -c 2 write pressure on node0 (pgbench tables from the main init
-	# on node0).
-	my ($collapse_tps, $collapse_out) = pgbench_one($node0, 2, $OBS_SECS);
-	my $collapse_errs = () = ($collapse_out =~ /error|FATAL|aborted/ig);
+	progress('observe-only O2: 10 alternating same-rows updates');
 
 	# O2: alternating same-rows UPDATEs node0/node1 (fail-closed retry
 	# observation; cross-node conflicts are expected behaviour).  xp_hot
@@ -586,18 +670,14 @@ sub observe_legs
 	# PK -- duplicated index DDL cannot work over coincident files):
 	# identical DDL on both nodes must land the same relfilepath, then
 	# node0 seeds + CHECKPOINTs so both nodes update the same blocks.
-	$node0->safe_psql('postgres', 'CREATE TABLE xp_hot (id int, v int)');
-	$node1->safe_psql('postgres', 'CREATE TABLE xp_hot (id int, v int)');
-	my $h0 = $node0->safe_psql('postgres',
-		"SELECT pg_relation_filepath('xp_hot')");
-	my $h1 = $node1->safe_psql('postgres',
-		"SELECT pg_relation_filepath('xp_hot')");
-	die "harness failure: xp_hot relfilepath coincidence does not hold "
-	  . "(n0=$h0 n1=$h1); the alternating updates would not contend\n"
-	  unless $h0 eq $h1;
-	$node0->safe_psql('postgres',
-		'INSERT INTO xp_hot SELECT g, 0 FROM generate_series(1,100) g');
-	$node0->safe_psql('postgres', 'CHECKPOINT');
+	# MUST run before the pair pgbench init: a degraded/failed bulk init
+	# advances node0's relfilenode counter and breaks the coincidence.
+	# xp_hot was created (and coincidence-checked) by
+	# setup_phantom_tables right after the pair reached quorum.
+	psql_retry($node0,
+		'INSERT INTO xp_hot SELECT g, 0 FROM generate_series(1,100) g')
+	  or progress('O2 seeding failed after retries; updates will error');
+	psql_retry($node0, 'CHECKPOINT');
 	my $hot_sql    = 'UPDATE xp_hot SET v = v + 1 WHERE id <= 50';
 	my $hot_errors = 0;
 	for my $i (1 .. 5)
@@ -609,8 +689,25 @@ sub observe_legs
 		}
 	}
 
-	return { collapse_tps => $collapse_tps, collapse_errs => $collapse_errs,
-		hot_errors => $hot_errors, hot_attempts => 10 };
+	return { hot_errors => $hot_errors, hot_attempts => 10 };
+}
+
+sub observe_collapse
+{
+	my ($pair) = @_;
+	my $node0 = $pair->node0;
+
+	progress("observe-only O1: pgbench -c 2 ${OBS_SECS}s (write collapse)");
+
+	# O1: -c 2 write pressure on node0 (pgbench tables from the pair
+	# init; skipped honestly when that init never succeeded).
+	my ($collapse_tps, $collapse_out) = (undef, '');
+	($collapse_tps, $collapse_out) = pgbench_one($node0, 2, $OBS_SECS)
+	  if $PAIR_SCALE_USED;
+	my $collapse_errs = () = ($collapse_out =~ /error|FATAL|aborted/ig);
+
+	return { collapse_tps => $collapse_tps,
+		collapse_errs => $collapse_errs };
 }
 
 # ---- report sections ----
@@ -621,7 +718,8 @@ sub report_header
 	rep('# spec-5.59 D8 cross-node four-axis profile (REPORT-ONLY)', '',
 		sprintf('- date: %s UTC | commit: %s',
 			scalar(gmtime()), $commit || 'unknown'),
-		"- knobs: XP_SECS=$XP_SECS XP_ROUNDS=$XP_ROUNDS XP_SCALE=$XP_SCALE",
+		"- knobs: XP_SECS=$XP_SECS XP_ROUNDS=$XP_ROUNDS XP_SCALE=$XP_SCALE"
+		  . " pair_scale=" . ($PAIR_SCALE_USED || 'n/a'),
 		'',
 		'> HONESTY PREAMBLE: single-machine loopback interconnect; cassert',
 		'> builds inflate absolute nanoseconds; background cluster traffic',
@@ -842,21 +940,18 @@ progress("repo=$REPO_ROOT out=$XP_OUT pgbench=$PGBENCH");
 my $native = boot_native();
 my $solo   = boot_solo();
 my $pair   = boot_pair();
-ok(1, 'harness: native + solo + 2-node pair booted, pair in quorum');
+setup_phantom_tables($pair);
+ok(1, 'harness: native + solo + 2-node pair booted, pair in quorum, '
+	  . 'phantom tables coincident');
 
 pgbench_init($native) or die "harness failure: pgbench init (native)\n";
 pgbench_init($solo)   or die "harness failure: pgbench init (solo)\n";
-pgbench_init($pair->node0)
-  or die "harness failure: pgbench init (pair node0)\n";
-ok(1, "harness: pgbench -i -s $XP_SCALE on all three tiers");
+ok(1, "harness: pgbench -i (native/solo scale $XP_SCALE)");
 
-my $w = axis_write($native, $solo, $pair);
-ok(1, 'W axis measured');
-
-# native + solo are only needed for the interleaved W baseline.
-$native->stop;
-$solo->stop;
-
+# Axis order matters on a slow local machine: the pair-side pgbench
+# bulk COPY is storm-prone and can wound the pair's GCS state, so the
+# small-workload axes (R/I/C/observe) run FIRST on a healthy pair and
+# the pgbench-based W axis (with its degrading init chain) runs LAST.
 my $r = axis_read($pair);
 ok(1, 'R axis measured (pre/post-VACUUM amortization probe)');
 
@@ -866,8 +961,24 @@ ok(1, 'I axis measured');
 my $c = axis_commit($pair);
 ok(1, 'C axis measured');
 
-my $o = observe_legs($pair);
-ok(1, 'observe-only legs recorded');
+my $o = observe_hot($pair);
+ok(1, 'observe-only O2 recorded');
+
+$PAIR_SCALE_USED = pgbench_init_pair_degrading($pair->node0);
+progress($PAIR_SCALE_USED
+	? "pair pgbench init succeeded at scale $PAIR_SCALE_USED"
+	: 'pair pgbench init FAILED at every scale; pair W-axis TPS will be n/a');
+
+my $o1 = observe_collapse($pair);
+$o->{$_} = $o1->{$_} for keys %$o1;
+ok(1, 'observe-only O1 recorded');
+
+my $w = axis_write($native, $solo, $pair, $PAIR_SCALE_USED);
+ok(1, 'W axis measured');
+
+# native + solo are only needed for the interleaved W baseline.
+$native->stop;
+$solo->stop;
 
 $pair->stop_pair if $pair->can('stop_pair');
 
