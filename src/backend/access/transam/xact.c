@@ -1652,7 +1652,8 @@ RecordTransactionCommit(void)
 		 * can still ereport(ERROR) and cleanly abort because no commit record
 		 * has been emitted yet.
 		 */
-		cluster_sf_xact_commit_brake();
+		if (cluster_smart_fusion)
+			cluster_sf_xact_commit_brake();
 #endif
 
 		START_CRIT_SECTION();
@@ -1725,7 +1726,8 @@ RecordTransactionCommit(void)
 		{
 			XLogFlush(XactLastRecEnd);
 #ifdef USE_PGRAC_CLUSTER
-			cluster_sf_publish_origin_durable_lsn();
+			if (cluster_smart_fusion)
+				cluster_sf_publish_origin_durable_lsn();
 #endif
 
 			/*

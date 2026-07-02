@@ -3796,7 +3796,7 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	 * End this I/O attempt without clearing BM_DIRTY; a later checkpoint or
 	 * bgwriter pass can write it after the dependency vector is cleared.
 	 */
-	if (cluster_sf_dep_buffer_flush_blocked(buf)) {
+	if (cluster_smart_fusion && cluster_sf_dep_buffer_flush_blocked(buf)) {
 		TerminateBufferIO(buf, false, 0);
 		return;
 	}
