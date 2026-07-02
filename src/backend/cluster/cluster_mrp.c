@@ -32,6 +32,7 @@
 #include "cluster/cluster_mrp.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_voting_disk_io.h"
+#include "cluster/storage/cluster_shared_fs.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "port/pg_bitutils.h"
@@ -209,6 +210,17 @@ static bool
 cluster_mrp_valid_real_thread_id(uint16 thread_id)
 {
 	return thread_id >= XLP_THREAD_ID_FIRST_REAL && thread_id <= CLUSTER_WAL_THREAD_MAX;
+}
+
+static bool
+cluster_mrp_shared_storage_attach_safe(void)
+{
+	if (!cluster_smgr_user_relations)
+		return false;
+	return cluster_shared_storage_backend == CLUSTER_SHARED_FS_BACKEND_BLOCK_DEVICE
+		   || cluster_shared_storage_backend == CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS
+		   || cluster_shared_storage_backend == CLUSTER_SHARED_FS_BACKEND_RBD
+		   || cluster_shared_storage_backend == CLUSTER_SHARED_FS_BACKEND_MULTI_ATTACH;
 }
 
 static void
@@ -579,6 +591,8 @@ cluster_mrp_attach_apply_master_watermarks(const ClusterMrpLeaseScan *scan, int6
 		return;
 	if (scan->owner_node_id < 0 || scan->owner_node_id >= CLUSTER_MAX_NODES)
 		return;
+	if (scan->owner_node_id != cluster_node_id && !cluster_mrp_shared_storage_attach_safe())
+		return;
 	if (scan->lease_epoch != cluster_epoch_get_current())
 		return;
 	if (now_ms >= scan->lease_expires_at_ms)
@@ -704,8 +718,12 @@ cluster_mrp_read_service_available(void)
 	now_ms = cluster_mrp_now_ms();
 	if (snap.valid != 0 && snap.term != 0 && snap.generation != 0 && snap.lease_epoch != 0
 		&& snap.owner_incarnation != 0 && snap.valid_until_ms != 0
-		&& now_ms < (int64)snap.valid_until_ms)
+		&& now_ms < (int64)snap.valid_until_ms) {
+		if ((int32)snap.owner_node_id != cluster_node_id
+			&& !cluster_mrp_shared_storage_attach_safe())
+			return false;
 		return true;
+	}
 
 	if (snap.lost_at_ms == 0 || cluster_apply_master_switch_drain_ms <= 0)
 		return false;
