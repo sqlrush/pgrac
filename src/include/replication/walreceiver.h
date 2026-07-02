@@ -176,6 +176,7 @@ typedef struct
 		struct
 		{
 			TimeLineID	startpointTLI;	/* Starting timeline */
+			uint16		adg_thread_id;	/* Optional ADG per-thread stream binding */
 		}			physical;
 		struct
 		{

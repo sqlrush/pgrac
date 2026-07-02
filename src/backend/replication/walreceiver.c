@@ -434,6 +434,7 @@ WalReceiverMain(void)
 		options.startpoint = startpoint;
 		options.slotname = slotname[0] != '\0' ? slotname : NULL;
 		options.proto.physical.startpointTLI = startpointTLI;
+		options.proto.physical.adg_thread_id = 0;
 		if (walrcv_startstreaming(wrconn, &options))
 		{
 			if (first_stream)

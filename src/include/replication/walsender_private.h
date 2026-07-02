@@ -92,6 +92,8 @@ typedef struct WalSnd
 	uint32		adg_reply_reserved;
 	uint64		adg_standby_consistent_scn;
 	uint64		adg_apply_master_term;
+	uint16		adg_send_thread_id;
+	uint16		adg_send_reserved;
 
 	ReplicationKind kind;
 } WalSnd;

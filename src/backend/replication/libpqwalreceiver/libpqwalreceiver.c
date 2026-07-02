@@ -646,8 +646,13 @@ libpqrcv_startstreaming(WalReceiverConn *conn,
 		appendStringInfoChar(&cmd, ')');
 	}
 	else
+	{
 		appendStringInfo(&cmd, " TIMELINE %u",
 						 options->proto.physical.startpointTLI);
+		if (options->proto.physical.adg_thread_id != 0)
+			appendStringInfo(&cmd, " ADG_THREAD %u",
+							 (unsigned) options->proto.physical.adg_thread_id);
+	}
 
 	/* Start streaming. */
 	res = libpqrcv_PQexec(conn->streamConn, cmd.data);

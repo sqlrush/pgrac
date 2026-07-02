@@ -810,6 +810,7 @@ cluster_rfs_connect_upstream(ClusterRfsUpstream *upstream)
 	options.slotname = NULL;
 	options.startpoint = upstream->start_lsn;
 	options.proto.physical.startpointTLI = upstream->tli;
+	options.proto.physical.adg_thread_id = upstream->expected_thread_id;
 	if (!walrcv_startstreaming(upstream->conn, &options))
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						errmsg("ADG RFS upstream %d contains no more WAL on timeline %u",

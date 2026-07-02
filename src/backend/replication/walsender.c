@@ -96,7 +96,9 @@
 #include "utils/timestamp.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
 #include "cluster/cluster_lns.h"
+#include "cluster/cluster_wal_thread.h"
 #endif
 
 /* Minimum interval used by walsender for stats flushes, in ms */
@@ -283,6 +285,11 @@ static bool TransactionIdInRecentPast(TransactionId xid, uint32 epoch);
 
 static void WalSndSegmentOpen(XLogReaderState *state, XLogSegNo nextSegNo,
 							  TimeLineID *tli_p);
+
+#ifdef USE_PGRAC_CLUSTER
+static void WalSndValidateAdgThreadBinding(StartReplicationCmd *cmd);
+static void WalSndPublishAdgSendThread(uint16 thread_id);
+#endif
 
 
 /* Initialize walsender process before entering the main command loop */
@@ -684,6 +691,56 @@ SendTimeLineHistory(TimeLineHistoryCmd *cmd)
 	pq_endmessage(&buf);
 }
 
+#ifdef USE_PGRAC_CLUSTER
+static void
+WalSndPublishAdgSendThread(uint16 thread_id)
+{
+	WalSnd	   *walsnd = MyWalSnd;
+
+	if (walsnd == NULL)
+		return;
+
+	SpinLockAcquire(&walsnd->mutex);
+	walsnd->adg_send_thread_id = thread_id;
+	walsnd->adg_send_reserved = 0;
+	SpinLockRelease(&walsnd->mutex);
+}
+
+static void
+WalSndValidateAdgThreadBinding(StartReplicationCmd *cmd)
+{
+	uint16		own_thread;
+
+	if (cmd->adg_thread_id == 0)
+	{
+		WalSndPublishAdgSendThread(0);
+		return;
+	}
+
+	if (cmd->adg_thread_id < XLP_THREAD_ID_FIRST_REAL ||
+		cmd->adg_thread_id > CLUSTER_WAL_THREAD_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROTOCOL_VIOLATION),
+				 errmsg("invalid ADG thread id %u",
+						(unsigned) cmd->adg_thread_id)));
+
+	if (!cluster_enabled || !cluster_enable_adg ||
+		cluster_dg_role != CLUSTER_DG_ROLE_PRIMARY)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("ADG thread-bound WAL streaming requires an ADG primary")));
+
+	own_thread = cluster_wal_thread_id();
+	if (own_thread != cmd->adg_thread_id)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("ADG thread-bound WAL streaming requested thread %u from primary thread %u",
+						(unsigned) cmd->adg_thread_id, (unsigned) own_thread)));
+
+	WalSndPublishAdgSendThread(cmd->adg_thread_id);
+}
+#endif
+
 /*
  * Handle START_REPLICATION command.
  *
@@ -709,6 +766,17 @@ StartReplication(StartReplicationCmd *cmd)
 				(errcode(ERRCODE_OUT_OF_MEMORY),
 				 errmsg("out of memory"),
 				 errdetail("Failed while allocating a WAL reading processor.")));
+
+#ifdef USE_PGRAC_CLUSTER
+	WalSndValidateAdgThreadBinding(cmd);
+	if (cmd->adg_thread_id != 0)
+		xlogreader->cluster_expected_thread_id = cmd->adg_thread_id;
+#else
+	if (cmd->adg_thread_id != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("ADG thread-bound WAL streaming requires a cluster-enabled build")));
+#endif
 
 	/*
 	 * We assume here that we're logging enough information in the WAL for
@@ -2706,6 +2774,8 @@ InitWalSenderSlot(void)
 			walsnd->adg_reply_reserved = 0;
 			walsnd->adg_standby_consistent_scn = 0;
 			walsnd->adg_apply_master_term = 0;
+			walsnd->adg_send_thread_id = 0;
+			walsnd->adg_send_reserved = 0;
 
 			/*
 			 * The kind assignment is done here and not in StartReplication()
