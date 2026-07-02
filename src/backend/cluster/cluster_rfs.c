@@ -874,6 +874,12 @@ cluster_rfs_step_upstream(ClusterRfsUpstream *upstream)
 	if (got_data) {
 		cluster_rfs_flush_received_threads();
 		cluster_rfs_send_reply(upstream, false, false);
+	} else if (cluster_wal_receiver_timeout_sec > 0 && upstream->last_msg_receipt_time != 0
+			   && TimestampDifferenceExceeds(upstream->last_msg_receipt_time, GetCurrentTimestamp(),
+											 cluster_wal_receiver_timeout_sec * 1000)) {
+		ereport(LOG, (errmsg("ADG RFS upstream %d timed out after %d second(s)", upstream->index,
+							 cluster_wal_receiver_timeout_sec)));
+		cluster_rfs_disconnect_upstream(upstream, true);
 	}
 }
 

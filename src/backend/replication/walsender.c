@@ -267,6 +267,7 @@ static void ProcessStandbyHSFeedbackMessage(void);
 #ifdef USE_PGRAC_CLUSTER
 static ClusterLnsTrailerStatus ProcessStandbyAdgReplyTrailer(ClusterLnsReplyState *state);
 #endif
+static int WalSndEffectiveTimeout(void);
 static void ProcessRepliesIfAny(void);
 static void ProcessPendingWrites(void);
 static void WalSndKeepalive(bool requestReply, XLogRecPtr writePtr);
@@ -1468,6 +1469,7 @@ WalSndWriteData(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid,
 				bool last_write)
 {
 	TimestampTz now;
+	int			effective_timeout;
 
 	/*
 	 * Fill the send timestamp last, so that it is taken as late as possible.
@@ -1490,8 +1492,10 @@ WalSndWriteData(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid,
 		WalSndShutdown();
 
 	/* Try taking fast path unless we get too close to walsender timeout. */
-	if (now < TimestampTzPlusMilliseconds(last_reply_timestamp,
-										  wal_sender_timeout / 2) &&
+	effective_timeout = WalSndEffectiveTimeout();
+	if (effective_timeout > 0 &&
+		now < TimestampTzPlusMilliseconds(last_reply_timestamp,
+										  effective_timeout / 2) &&
 		!pq_is_send_pending())
 	{
 		return;
@@ -1567,6 +1571,7 @@ WalSndUpdateProgress(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId 
 	TimestampTz now = GetCurrentTimestamp();
 	bool		pending_writes = false;
 	bool		end_xact = ctx->end_xact;
+	int			effective_timeout = WalSndEffectiveTimeout();
 
 	/*
 	 * Track lag no more than once per WALSND_LOGICAL_LAG_TRACK_INTERVAL_MS to
@@ -1614,9 +1619,9 @@ WalSndUpdateProgress(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId 
 	 * for large transactions where we don't send any changes to the
 	 * downstream and the receiver can timeout due to that.
 	 */
-	if (pending_writes || (!end_xact &&
+	if (pending_writes || (!end_xact && effective_timeout > 0 && last_reply_timestamp > 0 &&
 						   now >= TimestampTzPlusMilliseconds(last_reply_timestamp,
-															  wal_sender_timeout / 2)))
+															  effective_timeout / 2)))
 		ProcessPendingWrites();
 }
 
@@ -2516,8 +2521,9 @@ static long
 WalSndComputeSleeptime(TimestampTz now)
 {
 	long		sleeptime = 10000;	/* 10 s */
+	int			effective_timeout = WalSndEffectiveTimeout();
 
-	if (wal_sender_timeout > 0 && last_reply_timestamp > 0)
+	if (effective_timeout > 0 && last_reply_timestamp > 0)
 	{
 		TimestampTz wakeup_time;
 
@@ -2526,7 +2532,7 @@ WalSndComputeSleeptime(TimestampTz now)
 		 * reached.
 		 */
 		wakeup_time = TimestampTzPlusMilliseconds(last_reply_timestamp,
-												  wal_sender_timeout);
+												  effective_timeout);
 
 		/*
 		 * If no ping has been sent yet, wakeup when it's time to do so.
@@ -2535,13 +2541,33 @@ WalSndComputeSleeptime(TimestampTz now)
 		 */
 		if (!waiting_for_ping_response)
 			wakeup_time = TimestampTzPlusMilliseconds(last_reply_timestamp,
-													  wal_sender_timeout / 2);
+													  effective_timeout / 2);
 
 		/* Compute relative time until wakeup. */
 		sleeptime = TimestampDifferenceMilliseconds(now, wakeup_time);
 	}
 
 	return sleeptime;
+}
+
+static int
+WalSndEffectiveTimeout(void)
+{
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_enabled && cluster_enable_adg && cluster_dg_role == CLUSTER_DG_ROLE_PRIMARY
+		&& cluster_wal_sender_timeout_sec > 0 && MyWalSnd != NULL)
+	{
+		uint16		adg_send_thread_id;
+
+		SpinLockAcquire(&MyWalSnd->mutex);
+		adg_send_thread_id = MyWalSnd->adg_send_thread_id;
+		SpinLockRelease(&MyWalSnd->mutex);
+		if (adg_send_thread_id >= XLP_THREAD_ID_FIRST_REAL
+			&& adg_send_thread_id <= CLUSTER_WAL_THREAD_MAX)
+			return cluster_wal_sender_timeout_sec * 1000;
+	}
+#endif
+	return wal_sender_timeout;
 }
 
 /*
@@ -2560,15 +2586,16 @@ static void
 WalSndCheckTimeOut(void)
 {
 	TimestampTz timeout;
+	int			effective_timeout = WalSndEffectiveTimeout();
 
 	/* don't bail out if we're doing something that doesn't require timeouts */
 	if (last_reply_timestamp <= 0)
 		return;
 
 	timeout = TimestampTzPlusMilliseconds(last_reply_timestamp,
-										  wal_sender_timeout);
+										  effective_timeout);
 
-	if (wal_sender_timeout > 0 && last_processing >= timeout)
+	if (effective_timeout > 0 && last_processing >= timeout)
 	{
 		/*
 		 * Since typically expiration of replication timeout means
@@ -3889,12 +3916,13 @@ static void
 WalSndKeepaliveIfNecessary(void)
 {
 	TimestampTz ping_time;
+	int			effective_timeout = WalSndEffectiveTimeout();
 
 	/*
 	 * Don't send keepalive messages if timeouts are globally disabled or
 	 * we're doing something not partaking in timeouts.
 	 */
-	if (wal_sender_timeout <= 0 || last_reply_timestamp <= 0)
+	if (effective_timeout <= 0 || last_reply_timestamp <= 0)
 		return;
 
 	if (waiting_for_ping_response)
@@ -3906,7 +3934,7 @@ WalSndKeepaliveIfNecessary(void)
 	 * an immediate reply.
 	 */
 	ping_time = TimestampTzPlusMilliseconds(last_reply_timestamp,
-											wal_sender_timeout / 2);
+											effective_timeout / 2);
 	if (last_processing >= ping_time)
 	{
 		WalSndKeepalive(true, InvalidXLogRecPtr);
