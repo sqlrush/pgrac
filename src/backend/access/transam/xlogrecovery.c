@@ -2339,6 +2339,7 @@ cluster_adg_streaming_replay(XLogPrefetcher *xlogprefetcher, XLogReaderState *xl
 	XLogRecPtr barrier_lsn[CLUSTER_WAL_THREAD_MAX + 1];
 	SCN barrier_scn[CLUSTER_WAL_THREAD_MAX + 1];
 	uint64 bitmap[2];
+	uint64 active_bitmap[2] = {0, 0};
 	XLogRecPtr replay_end;
 	XLogRecord *native_record = first_record;
 	bool window_active = false;
@@ -2408,6 +2409,18 @@ cluster_adg_streaming_replay(XLogPrefetcher *xlogprefetcher, XLogReaderState *xl
 			continue;
 		}
 
+		if (st != NULL && (active_bitmap[0] != bitmap[0] || active_bitmap[1] != bitmap[1]))
+		{
+			cluster_recovery_merge_set_apply_foreign(false);
+			if (window_active)
+			{
+				cluster_recovery_merge_window_leave();
+				window_active = false;
+			}
+			cluster_recovery_merge_end(st);
+			st = NULL;
+		}
+
 		if (st == NULL)
 		{
 			st = cluster_recovery_merge_streaming_begin(bitmap, start_lsn, tli);
@@ -2418,6 +2431,8 @@ cluster_adg_streaming_replay(XLogPrefetcher *xlogprefetcher, XLogReaderState *xl
 			}
 			cluster_recovery_merge_window_enter();
 			window_active = true;
+			active_bitmap[0] = bitmap[0];
+			active_bitmap[1] = bitmap[1];
 		}
 
 		if (!cluster_mrp_apply_master_can_apply())
