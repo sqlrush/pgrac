@@ -512,6 +512,20 @@ UT_TEST(test_apply_master_token_apply_gate)
 		!cluster_adg_apply_master_token_allows_apply(2, 1, 7, 11, 5, 99, 2000, -1, 5, 0, 0, 1000));
 }
 
+UT_TEST(test_apply_master_lease_fresh_accepts_initial_epoch)
+{
+	UT_ASSERT(cluster_adg_apply_master_lease_fresh(1, 7, 11, 0, 99, 2000, 0, 1000));
+	UT_ASSERT(cluster_adg_apply_master_lease_fresh(1, 7, 11, 5, 99, 2000, 5, 1000));
+
+	UT_ASSERT(!cluster_adg_apply_master_lease_fresh(0, 7, 11, 0, 99, 2000, 0, 1000));
+	UT_ASSERT(!cluster_adg_apply_master_lease_fresh(1, 0, 11, 0, 99, 2000, 0, 1000));
+	UT_ASSERT(!cluster_adg_apply_master_lease_fresh(1, 7, 0, 0, 99, 2000, 0, 1000));
+	UT_ASSERT(!cluster_adg_apply_master_lease_fresh(1, 7, 11, 1, 99, 2000, 0, 1000));
+	UT_ASSERT(!cluster_adg_apply_master_lease_fresh(1, 7, 11, 0, 0, 2000, 0, 1000));
+	UT_ASSERT(!cluster_adg_apply_master_lease_fresh(1, 7, 11, 0, 99, 0, 0, 1000));
+	UT_ASSERT(!cluster_adg_apply_master_lease_fresh(1, 7, 11, 0, 99, 1000, 0, 1000));
+}
+
 UT_TEST(test_read_only_decision_matrix)
 {
 	UT_ASSERT_EQ((int)cluster_adg_read_only_decide(true, true, true, S(2, 100), 5, 10),
@@ -688,7 +702,7 @@ UT_TEST(test_mrp_shmem_tracks_term_validity_and_drain)
 int
 main(void)
 {
-	UT_PLAN(25);
+	UT_PLAN(26);
 
 	UT_RUN(test_tracker_init_bounds);
 	UT_RUN(test_barrier_min_publishes_after_all_threads);
@@ -708,6 +722,7 @@ main(void)
 	UT_RUN(test_apply_master_lease_cas_verdict);
 	UT_RUN(test_apply_master_candidate_uses_lowest_fresh_live_node);
 	UT_RUN(test_apply_master_token_apply_gate);
+	UT_RUN(test_apply_master_lease_fresh_accepts_initial_epoch);
 	UT_RUN(test_read_only_decision_matrix);
 	UT_RUN(test_thread_barrier_wal_abi);
 	UT_RUN(test_standby_reply_trailer_validation);

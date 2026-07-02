@@ -478,6 +478,20 @@ cluster_adg_apply_master_token_allows_apply(uint32 owner_node_id, uint32 valid, 
 	return true;
 }
 
+bool
+cluster_adg_apply_master_lease_fresh(uint32 valid, uint64 term, uint64 generation,
+									 uint64 lease_epoch, uint64 owner_incarnation,
+									 uint64 valid_until_ms, uint64 current_epoch, int64 now_ms)
+{
+	if (valid == 0 || term == 0 || generation == 0 || owner_incarnation == 0)
+		return false;
+	if (lease_epoch != current_epoch)
+		return false;
+	if (valid_until_ms == 0 || now_ms >= (int64)valid_until_ms)
+		return false;
+	return true;
+}
+
 ClusterAdgReadDecision
 cluster_adg_read_only_decide(bool enable_adg, bool standby_role, bool read_service_available,
 							 SCN standby_consistent_scn, int64 apply_lag_ms, int64 max_lag_ms)

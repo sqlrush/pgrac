@@ -141,6 +141,10 @@ extern bool cluster_adg_apply_master_token_allows_apply(
 	uint32 owner_node_id, uint32 valid, uint64 term, uint64 generation, uint64 lease_epoch,
 	uint64 owner_incarnation, uint64 valid_until_ms, int32 self_node_id, uint64 current_epoch,
 	uint64 local_incarnation, uint64 held_term, int64 now_ms);
+extern bool cluster_adg_apply_master_lease_fresh(uint32 valid, uint64 term, uint64 generation,
+												 uint64 lease_epoch, uint64 owner_incarnation,
+												 uint64 valid_until_ms, uint64 current_epoch,
+												 int64 now_ms);
 
 extern ClusterAdgReadDecision cluster_adg_read_only_decide(bool enable_adg, bool standby_role,
 														   bool read_service_available,

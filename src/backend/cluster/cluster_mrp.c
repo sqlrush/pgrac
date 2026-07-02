@@ -716,9 +716,9 @@ cluster_mrp_read_service_available(void)
 		return false;
 
 	now_ms = cluster_mrp_now_ms();
-	if (snap.valid != 0 && snap.term != 0 && snap.generation != 0 && snap.lease_epoch != 0
-		&& snap.owner_incarnation != 0 && snap.valid_until_ms != 0
-		&& now_ms < (int64)snap.valid_until_ms) {
+	if (cluster_adg_apply_master_lease_fresh(
+			snap.valid, snap.term, snap.generation, snap.lease_epoch, snap.owner_incarnation,
+			snap.valid_until_ms, cluster_epoch_get_current(), now_ms)) {
 		if ((int32)snap.owner_node_id != cluster_node_id
 			&& !cluster_mrp_shared_storage_attach_safe())
 			return false;
