@@ -91,6 +91,7 @@ char *cluster_recovery_target_name = NULL;
 int cluster_recovery_target_action = CLUSTER_RECOVERY_TARGET_ACTION_PAUSE;
 bool cluster_enable_pitr_restore_points = false;
 int cluster_pitr_restore_point_interval_ms = 0;
+int cluster_restore_point_drain_timeout_ms = 30000;
 int cluster_backup_wal_retention = 0;
 int cluster_backup_parallel_channels = 1;
 int cluster_backup_manifest_checksums = CLUSTER_BACKUP_MANIFEST_CHECKSUM_CRC32C;
@@ -1315,6 +1316,14 @@ cluster_init_guc(void)
 							gettext_noop("Zero disables automatic restore point scheduling."),
 							&cluster_pitr_restore_point_interval_ms, 0, 0, 86400000, PGC_SIGHUP,
 							GUC_UNIT_MS, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.restore_point_drain_timeout_ms",
+		gettext_noop("Timeout for cluster restore-point commit drain."),
+		gettext_noop("A restore-point fence fails closed if in-flight commits do not drain "
+					 "within this timeout."),
+		&cluster_restore_point_drain_timeout_ms, 30000, 1, 600000, PGC_SUSET, GUC_UNIT_MS, NULL,
+		NULL, NULL);
 
 	DefineCustomIntVariable(
 		"cluster.backup_wal_retention",

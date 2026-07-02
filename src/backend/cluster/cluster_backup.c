@@ -118,7 +118,6 @@ static char cluster_backup_lmon_backup_set_path[MAXPGPATH];
 static bool cluster_backup_pending_commit_registered = false;
 static bool cluster_backup_pending_commit_exit_registered = false;
 
-#define CLUSTER_BACKUP_RESTORE_POINT_DRAIN_TIMEOUT_MS 30000
 #define CLUSTER_BACKUP_COORD_TIMEOUT_MS 120000
 #define CLUSTER_BACKUP_PIN_MAGIC 0x50475049U /* "PGPI" */
 #define CLUSTER_BACKUP_PIN_VERSION 1
@@ -1486,12 +1485,12 @@ cluster_backup_restore_point_fence_drain_done(TimestampTz started_at)
 		return true;
 
 	if (TimestampDifferenceExceeds(started_at, GetCurrentTimestamp(),
-								   CLUSTER_BACKUP_RESTORE_POINT_DRAIN_TIMEOUT_MS)) {
+								   cluster_restore_point_drain_timeout_ms)) {
 		cluster_backup_restore_point_fence_end();
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_RESTORE_POINT_DRAIN_TIMEOUT),
 						errmsg("timed out waiting for cluster restore-point commit drain"),
 						errdetail("Pending commits did not drain within %d ms.",
-								  CLUSTER_BACKUP_RESTORE_POINT_DRAIN_TIMEOUT_MS)));
+								  cluster_restore_point_drain_timeout_ms)));
 	}
 
 	return false;

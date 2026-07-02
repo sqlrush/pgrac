@@ -675,8 +675,8 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 							   parsed.nabortstats, parsed.nmsgs,
 							   xlrec->initfileinval ? "true" : "false"),
 					 errhint("Foreign prepared transactions are not exposed as local prepared "
-							 "transactions; only pure row-DML prepares can be materialized "
-							 "as non-visible before their COMMIT PREPARED record.")));
+							 "transactions; unresolved prepares remain in-doubt until their "
+							 "COMMIT PREPARED or ABORT PREPARED record is replayed.")));
 
 		/*
 		 * Never call PrepareRedoAdd for a foreign stream: that would expose a

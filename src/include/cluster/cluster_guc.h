@@ -533,6 +533,7 @@ extern char *cluster_recovery_target_name;
 extern int cluster_recovery_target_action;
 extern bool cluster_enable_pitr_restore_points;
 extern int cluster_pitr_restore_point_interval_ms;
+extern int cluster_restore_point_drain_timeout_ms;
 extern int cluster_backup_wal_retention;
 extern int cluster_backup_parallel_channels;
 extern int cluster_backup_manifest_checksums;

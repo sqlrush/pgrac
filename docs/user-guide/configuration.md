@@ -75,6 +75,7 @@ PITR surface.
 | `cluster.recovery_target_action` | enum | `pause` | postmaster | Accepted values: `pause`, `promote`, `shutdown`; exposed in PITR status. |
 | `cluster.enable_pitr_restore_points` | bool | `off` | sighup | Enables automatic restore-point scheduling in no-peer topology. Manual `pg_cluster_create_restore_point()` is independent and works through the cluster fence path. |
 | `cluster.pitr_restore_point_interval_ms` | integer | `0` | sighup | Automatic restore-point interval in milliseconds; zero disables scheduling. |
+| `cluster.restore_point_drain_timeout_ms` | integer | `30000` ms | superuser | Fail-closed timeout for in-flight commits to drain while a cluster restore-point fence is held. |
 | `cluster.backup_wal_retention` | integer | `0` MB | sighup | Retention hint reported with the backup state. Durable backup WAL pins also retain WAL from the backup start REDO point. |
 | `cluster.backup_parallel_channels` | integer | `1` | sighup | Copy-channel capacity reported with the backup state. |
 | `cluster.backup_manifest_checksums` | enum | `crc32c` | sighup | Manifest checksums are mandatory; unchecked manifests are not supported. |

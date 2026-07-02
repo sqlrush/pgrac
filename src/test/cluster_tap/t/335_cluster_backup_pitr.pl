@@ -20,11 +20,13 @@ use FindBin;
 use lib "$FindBin::RealBin/../lib";
 
 use PgracClusterNode;
+use PgracWalState qw(crc32c);
 use PostgreSQL::Test::RecursiveCopy;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::ClusterPair;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use Time::HiRes qw(usleep);
 
 my $node = PgracClusterNode->new('cluster_backup_single');
 $node->init(allows_streaming => 1);
@@ -171,6 +173,31 @@ is($cli_threads, '1', 'L12a CLI backup records one local WAL thread');
 ok(-d "$cli_backup_set/data", 'L12a CLI backup captured physical data directory');
 ok(-f $cli_manifest_path, 'L12a CLI backup published manifest path');
 
+my $drain_sleeper = $node->background_psql('postgres', on_error_die => 1);
+$drain_sleeper->query_safe(
+	q{SELECT cluster_inject_fault('cluster-scn-commit-pre-advance', 'sleep', 5000000)});
+$drain_sleeper->{stdin} .=
+  "INSERT INTO cluster_backup_probe VALUES (90, 'drain-sleeper');\n";
+$drain_sleeper->{run}->pump_nb();
+usleep(250_000);
+my ($drain_ret, $drain_out, $drain_err) = $node->psql('postgres',
+	"\\set VERBOSITY verbose\n"
+	  . "SET cluster.restore_point_drain_timeout_ms = 1000;\n"
+	  . "SELECT * FROM pg_cluster_create_restore_point('rp332_drain_timeout');\n");
+isnt($drain_ret, 0,
+	'L12b restore-point creation fails closed when commit drain times out');
+like($drain_err,
+	qr/timed out waiting for cluster restore-point commit drain|53RAF|cluster_restore_point_drain_timeout/,
+	'L12b drain timeout reports the restore-point drain failure');
+$drain_sleeper->query_safe(
+	q{SELECT cluster_inject_fault('cluster-scn-commit-pre-advance', 'none', 0)});
+$drain_sleeper->query_safe(q{SELECT 1});
+$drain_sleeper->quit;
+is($node->safe_psql('postgres',
+	q{SELECT count(*) FROM cluster_backup_probe WHERE id = 90}),
+	'1',
+	'L12b timed-out fence releases after fail-closed and the held commit completes');
+
 $node->stop;
 
 my $restore = PgracClusterNode->new('cluster_backup_restore');
@@ -265,10 +292,12 @@ ok($pair->wait_for_peer_state(0, 1, 'connected', 30),
 
 $pair->node0->safe_psql('postgres',
 	q{CREATE TABLE cluster_backup_pair_probe(id int, marker int);
-	  CREATE TABLE cluster_backup_pair_pending(id int, marker int);});
+	  CREATE TABLE cluster_backup_pair_pending(id int, marker int);
+	  CREATE TABLE cluster_backup_pair_delete_probe(id int, marker int);});
 $pair->node1->safe_psql('postgres',
 	q{CREATE TABLE cluster_backup_pair_probe(id int, marker int);
-	  CREATE TABLE cluster_backup_pair_pending(id int, marker int);});
+	  CREATE TABLE cluster_backup_pair_pending(id int, marker int);
+	  CREATE TABLE cluster_backup_pair_delete_probe(id int, marker int);});
 my $pair_probe_path0 = $pair->node0->safe_psql('postgres',
 	q{SELECT pg_relation_filepath('cluster_backup_pair_probe')});
 my $pair_probe_path1 = $pair->node1->safe_psql('postgres',
@@ -277,6 +306,10 @@ my $pair_pending_path0 = $pair->node0->safe_psql('postgres',
 	q{SELECT pg_relation_filepath('cluster_backup_pair_pending')});
 my $pair_pending_path1 = $pair->node1->safe_psql('postgres',
 	q{SELECT pg_relation_filepath('cluster_backup_pair_pending')});
+my $pair_delete_path0 = $pair->node0->safe_psql('postgres',
+	q{SELECT pg_relation_filepath('cluster_backup_pair_delete_probe')});
+my $pair_delete_path1 = $pair->node1->safe_psql('postgres',
+	q{SELECT pg_relation_filepath('cluster_backup_pair_delete_probe')});
 if ($pair_probe_path0 ne $pair_probe_path1)
 {
 	$pair->stop_pair;
@@ -289,13 +322,22 @@ if ($pair_pending_path0 ne $pair_pending_path1)
 	BAIL_OUT("same-DDL shared-data pending relation path mismatch: "
 	  . "node0=$pair_pending_path0 node1=$pair_pending_path1");
 }
+if ($pair_delete_path0 ne $pair_delete_path1)
+{
+	$pair->stop_pair;
+	BAIL_OUT("same-DDL shared-data delete relation path mismatch: "
+	  . "node0=$pair_delete_path0 node1=$pair_delete_path1");
+}
 is($pair_probe_path1, $pair_probe_path0,
 	'L15 same-DDL pair probe uses one shared-data relation path');
 is($pair_pending_path1, $pair_pending_path0,
 	'L15 same-DDL pair pending relation uses one shared-data relation path');
+is($pair_delete_path1, $pair_delete_path0,
+	'L15 same-DDL pair prepared-delete relation uses one shared-data relation path');
 
 $pair->node0->safe_psql('postgres',
-	q{INSERT INTO cluster_backup_pair_probe VALUES (1, 10);});
+	q{INSERT INTO cluster_backup_pair_probe VALUES (1, 10);
+	  INSERT INTO cluster_backup_pair_delete_probe VALUES (4, 40);});
 
 my $pair_backup_session = $pair->node0->background_psql('postgres', on_error_die => 1);
 is($pair_backup_session->query_safe(
@@ -335,6 +377,15 @@ is($pair->node1->safe_psql('postgres',
 	'1',
 	'L15c peer 2PC is prepared before the backup-stop cut');
 
+$pair->node1->safe_psql('postgres',
+	q{BEGIN;
+	  DELETE FROM cluster_backup_pair_delete_probe WHERE id = 4;
+	  PREPARE TRANSACTION 'pair332_delete_after_cut';});
+is($pair->node1->safe_psql('postgres',
+	q{SELECT count(*) FROM pg_prepared_xacts WHERE gid = 'pair332_delete_after_cut'}),
+	'1',
+	'L15c peer prepared DELETE is in-doubt before the backup-stop cut');
+
 my ($pair_stop_out, $pair_stop_had_stderr) = $pair_backup_session->query(
 	q{SELECT CASE WHEN consistent_scn > 0 THEN 't' ELSE 'f' END || ',' ||
 	          CASE WHEN stop_cut_lsn IS NOT NULL THEN 't' ELSE 'f' END || ',' ||
@@ -370,6 +421,7 @@ ok(-d "$pair_backup_set/shared_data", 'L17 shared-data region was captured');
 
 $pair->node1->safe_psql('postgres',
 	q{COMMIT PREPARED 'pair332_after_cut';
+	  COMMIT PREPARED 'pair332_delete_after_cut';
 	  SELECT pg_switch_wal();});
 my $pair_after_2pc_scn = $pair->node1->safe_psql('postgres',
 	q{SELECT cluster_scn_current()});
@@ -454,6 +506,14 @@ is($pair_restore->safe_psql('postgres',
 	q{SELECT count(*) FROM pg_prepared_xacts WHERE gid = 'pair332_after_cut'}),
 	'0',
 	'L18a foreign peer 2PC is not exposed as a local prepared xact after PITR');
+my ($pending_delete_ret, $pending_delete_out, $pending_delete_err) =
+  $pair_restore->psql('postgres',
+	q{SELECT count(*) FROM cluster_backup_pair_delete_probe WHERE id = 4});
+isnt($pending_delete_ret, 0,
+	'L18g unresolved foreign prepared DELETE fails closed instead of making a row visible');
+like($pending_delete_err,
+	qr/cluster TT status unknown|53R97|in-doubt|cluster TT slot recycled|fresh snapshot/,
+	'L18g unresolved prepared DELETE reports a fail-closed visibility outcome');
 like(slurp_file($pair_restore->logfile),
 	qr/redo done \(cluster backup restore\)/,
 	'L18 two-node restore drove the multi-thread restore-mode merge');
@@ -580,9 +640,24 @@ is($pin_session->query_safe(
 my $pin_path = $pin_node->data_dir . '/global/pgrac_cluster_backup.pin';
 ok(-f $pin_path,
 	'L23 durable WAL pin is published while cluster backup is in progress');
+my $pin_raw = slurp_file($pin_path);
+my ($pin_magic, $pin_version, $pin_lsn, $pin_backup_id, $pin_crc) =
+  unpack('L<L<Q<Z64L<', substr($pin_raw, 0, 84));
+is($pin_magic, 0x50475049, 'L23 durable WAL pin carries the expected magic');
+is($pin_version, 1, 'L23 durable WAL pin carries the expected version');
+is($pin_backup_id, 'pin335', 'L23 durable WAL pin records the backup id');
+ok($pin_lsn > 0, 'L23 durable WAL pin records a nonzero start REDO LSN');
+is($pin_crc, crc32c(substr($pin_raw, 0, 80)),
+	'L23 durable WAL pin CRC protects the published retention record');
 $pin_node->stop('immediate');
 ok(-f $pin_path,
 	'L23 durable WAL pin survives node crash during in-progress backup');
+$pin_node->start;
+$pin_node->safe_psql('postgres', q{CHECKPOINT; SELECT pg_switch_wal(); CHECKPOINT;});
+unlike(slurp_file($pin_node->logfile),
+	qr/cluster backup WAL pin is invalid|cluster backup WAL pin is truncated/,
+	'L23 restarted node accepts the crash-surviving durable WAL pin in the recycle gate');
+$pin_node->stop;
 eval { $pin_session->quit; };
 
 done_testing();

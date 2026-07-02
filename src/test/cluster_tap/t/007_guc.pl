@@ -229,6 +229,11 @@ is($node->safe_psql('postgres',
 	    FROM pg_settings WHERE name = 'cluster.backup_parallel_channels'}),
 	'1|integer|sighup',
 	'cluster.backup_parallel_channels default and context');
+is($node->safe_psql('postgres',
+	q{SELECT setting || '|' || vartype || '|' || context
+	    FROM pg_settings WHERE name = 'cluster.restore_point_drain_timeout_ms'}),
+	'30000|integer|superuser',
+	'cluster.restore_point_drain_timeout_ms default and context');
 
 # spec-5.59 D1: cross-node profiling switch (default off, SUSET so a
 # superuser can open a measurement window without a restart).
