@@ -78,7 +78,7 @@ SELECT attname, format_type(atttypid, atttypmod)
 -- ----------
 -- 3. Cluster wait events: 116 rows (anchored by
 --    CLUSTER_WAIT_EVENTS_COUNT, spec-0.11 + StaticAssertDecl
---    in cluster_views.c; spec-6.0a D10 +7 block_device events).
+--    in cluster_views.c; spec-6.2 D10 +4 authority waits).
 -- ----------
 SELECT count(*) FROM pg_stat_cluster_wait_events;
  count 
@@ -149,3 +149,4 @@ SELECT setting FROM pg_settings WHERE name = 'cluster.interconnect_tier';
 ---------
  stub
 (1 row)
+

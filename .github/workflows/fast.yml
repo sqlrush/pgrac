@@ -257,6 +257,9 @@ jobs:
         with:
           name: linux-enable-fast-gate-failure
           path: |
+            src/test/cluster_regress/regression.diffs
+            src/test/cluster_regress/regression.out
+            src/test/cluster_regress/log/
             src/test/regress/regression.diffs
             src/test/regress/regression.out
             src/test/regress/log/

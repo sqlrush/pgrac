@@ -244,6 +244,9 @@ jobs:
         with:
           name: nightly-cluster-tap-diffs-${{ matrix.shard.name }}
           path: |
+            src/test/cluster_regress/regression.diffs
+            src/test/cluster_regress/regression.out
+            src/test/cluster_regress/log/
             src/test/cluster_tap/tmp_check/log/
           if-no-files-found: ignore
           retention-days: 14
@@ -320,6 +323,9 @@ jobs:
         with:
           name: nightly-regression-diffs-macos
           path: |
+            src/test/cluster_regress/regression.diffs
+            src/test/cluster_regress/regression.out
+            src/test/cluster_regress/log/
             src/test/regress/regression.diffs
             src/test/regress/regression.out
             src/test/regress/log/
