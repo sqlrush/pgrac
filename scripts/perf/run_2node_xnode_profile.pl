@@ -353,19 +353,29 @@ sub pgbench_init_pair_degrading
 }
 
 # Loop one SQL text against a node until $secs elapse; each safe_psql call
-# is one round.  Errors are observations (counted), never fatal.
+# is one round.  Errors are observations (counted), never fatal.  The FIRST
+# error text is kept (one line) so an invalid phase self-describes WHY in
+# the report instead of just showing an error count.
 sub run_sql_rounds
 {
 	my ($node, $sql, $secs) = @_;
 	my $t0       = Time::HiRes::time();
 	my $deadline = $t0 + $secs;
-	my ($rounds, $errors) = (0, 0);
+	my ($rounds, $errors, $first_err) = (0, 0, undef);
 	while (Time::HiRes::time() < $deadline)
 	{
-		eval { $node->safe_psql('postgres', $sql); 1 } or $errors++;
+		unless (eval { $node->safe_psql('postgres', $sql); 1 })
+		{
+			$errors++;
+			if (!defined $first_err)
+			{
+				($first_err) = ($@ =~ /(ERROR:[^\n]*)/);
+				$first_err //= 'unknown (no ERROR line in psql output)';
+			}
+		}
 		$rounds++;
 	}
-	return ($rounds, (Time::HiRes::time() - $t0) * 1e9, $errors);
+	return ($rounds, (Time::HiRes::time() - $t0) * 1e9, $errors, $first_err);
 }
 
 # ----------
@@ -531,12 +541,13 @@ sub read_phase
 {
 	my ($node1) = @_;
 	my $before = xp_snapshot($node1);
-	my ($rounds, $wall_ns, $errors) = run_sql_rounds($node1,
+	my ($rounds, $wall_ns, $errors, $first_err) = run_sql_rounds($node1,
 		'SELECT count(*), sum(v) FROM xp_read', $XP_SECS);
 	my $after = xp_snapshot($node1);
 	my $d     = xp_delta($before, $after);
 	return {
 		rounds => $rounds, wall_ns => $wall_ns, errors => $errors,
+		first_err => $first_err,
 		delta => $d,
 		reship => $d->{read_reship_count} // 0,
 		sholder => $d->{read_sholder_hit_count} // 0,
@@ -645,13 +656,14 @@ sub axis_commit
 	# 100 single-statement INSERTs per psql invocation; psql autocommit
 	# makes each its own transaction (=> 100 commits per batch).
 	my $batch = join(";\n", ('INSERT INTO xp_commit VALUES (1)') x 100) . ';';
-	my ($batches, $wall_ns, $errors) =
+	my ($batches, $wall_ns, $errors, $first_err) =
 	  run_sql_rounds($node0, $batch, $XP_SECS);
 
 	return {
-		txns    => $batches * 100,
-		errors  => $errors,
-		wall_ns => $wall_ns,
+		txns      => $batches * 100,
+		errors    => $errors,
+		first_err => $first_err,
+		wall_ns   => $wall_ns,
 		pair_deltas($before, snap_pair($node0, $node1)),
 	};
 }
@@ -674,9 +686,16 @@ sub observe_hot
 	# advances node0's relfilenode counter and breaks the coincidence.
 	# xp_hot was created (and coincidence-checked) by
 	# setup_phantom_tables right after the pair reached quorum.
-	psql_retry($node0,
+	# Seeding failure does NOT make the updates error: xp_hot exists but is
+	# empty, so every UPDATE trivially succeeds touching zero rows.  Track
+	# the seeded state so the report can say NO SIGNAL instead of the
+	# misleading "0 of N errored".
+	my $hot_seeded = psql_retry($node0,
 		'INSERT INTO xp_hot SELECT g, 0 FROM generate_series(1,100) g')
-	  or progress('O2 seeding failed after retries; updates will error');
+	  ? 1 : 0;
+	progress('O2 seeding failed after retries; '
+		  . 'empty-table updates are a NO-SIGNAL observation')
+	  unless $hot_seeded;
 	psql_retry($node0, 'CHECKPOINT');
 	my $hot_sql    = 'UPDATE xp_hot SET v = v + 1 WHERE id <= 50';
 	my $hot_errors = 0;
@@ -689,7 +708,11 @@ sub observe_hot
 		}
 	}
 
-	return { hot_errors => $hot_errors, hot_attempts => 10 };
+	return {
+		hot_errors   => $hot_errors,
+		hot_attempts => 10,
+		hot_seeded   => $hot_seeded,
+	};
 }
 
 sub observe_collapse
@@ -867,7 +890,13 @@ sub report_read_section
 		  . '(expected currently: ~1 reship/read, zero amortization -- '
 		  . 'spec §3.6)';
 	}
-	rep("verdict: $verdict", '');
+	rep("verdict: $verdict");
+	for my $ph (['pre-VACUUM', $pre], ['post-VACUUM', $post])
+	{
+		rep(sprintf('- %s first error: %s', $ph->[0], $ph->[1]{first_err}))
+		  if $ph->[1]{errors} > 0 && defined $ph->[1]{first_err};
+	}
+	rep('');
 	for my $b (qw(r_gcs_s_request r_cr_construct r_cr_chain_walk
 		r_tt_visibility_resolve))
 	{
@@ -914,11 +943,76 @@ sub report_observe_section
 			defined $o->{collapse_tps} ? sprintf('%.0f', $o->{collapse_tps})
 			: 'n/a (run failed -- observation)',
 			$o->{collapse_errs}),
-		sprintf('- alternating same-rows updates: %d of %d errored '
+		$o->{hot_seeded}
+		? sprintf('- alternating same-rows updates: %d of %d errored '
 			  . '(fail-closed retries are expected behaviour, recorded '
 			  . 'not judged)',
-			$o->{hot_errors}, $o->{hot_attempts}),
+			$o->{hot_errors}, $o->{hot_attempts})
+		: '- alternating same-rows updates: NO SIGNAL (seeding failed; '
+		  . 'updates ran against an empty table and succeed trivially)',
 		'');
+}
+
+# Per-axis consumability.  REPORT-ONLY and informational -- this section
+# never fails the run; it exists so a downstream reader (e.g. a lever spec
+# consuming these numbers) cannot over-read a partially-failed artifact.
+sub report_validity_section
+{
+	my ($w, $r, $i, $c, $o) = @_;
+	my $phase_ok = sub {
+		my ($ph) = @_;
+		return 0 unless $ph->{rounds} > 0 && $ph->{errors} == 0;
+		return ($ph->{reship} + $ph->{sholder}) > 0 ? 1 : 0;
+	};
+	my ($pre_ok, $post_ok) =
+	  ($phase_ok->($r->{pre}), $phase_ok->($r->{post}));
+	my $row = sub { rep(sprintf('| %s | %s | %s |', @_)) };
+	rep('## Artifact validity (per-axis consumability; informational, '
+		  . 'never a gate)',
+		'',
+		'| axis | consumable | why |',
+		'|---|---|---|');
+	$row->(
+		'W pair tax + Table 1 pp folding',
+		defined $w->{tax_pair_pct} ? 'yes' : 'NO',
+		defined $w->{tax_pair_pct}
+		? sprintf('pair tps measured at pgbench scale %s', $PAIR_SCALE_USED)
+		: 'pair pgbench init failed at every scale; tax/pp = n/a');
+	$row->(
+		'R pre-VACUUM phase',
+		$pre_ok ? 'yes' : 'NO',
+		sprintf('%d rounds, %d errors, reship+sholder=%d',
+			$r->{pre}{rounds}, $r->{pre}{errors},
+			$r->{pre}{reship} + $r->{pre}{sholder}));
+	$row->(
+		'R post-VACUUM phase',
+		$post_ok ? 'yes' : 'NO',
+		sprintf('%d rounds, %d errors, reship+sholder=%d',
+			$r->{post}{rounds}, $r->{post}{errors},
+			$r->{post}{reship} + $r->{post}{sholder}));
+	$row->(
+		'R pre/post amortization verdict + S-cache ceiling',
+		($pre_ok && $post_ok) ? 'yes' : 'NO',
+		'needs BOTH read phases valid');
+	$row->(
+		'I index axis',
+		($i->{batches} > 0 && $i->{errors} == 0) ? 'yes' : 'NO',
+		sprintf('%d batches, %d errors', $i->{batches}, $i->{errors}));
+	$row->(
+		'C commit axis',
+		$c->{errors} == 0 ? 'yes' : 'trend-only',
+		sprintf('%d errors of %d txns%s', $c->{errors}, $c->{txns},
+			$c->{errors} > 0
+			? ' (errored loop: per-event costs stay indicative, '
+			  . 'exclusion-grade verdicts do not)'
+			: ''));
+	$row->(
+		'O2 same-rows observe leg',
+		$o->{hot_seeded} ? 'yes' : 'NO',
+		$o->{hot_seeded}
+		? 'seeded; error count is a real conflict observation'
+		: 'seeding failed; empty-table updates succeed trivially');
+	rep('');
 }
 
 sub write_report
@@ -996,10 +1090,13 @@ report_axis_buckets(
 	$i, qw(i_index_block_xfer i_rightmost_leaf_ping));
 report_axis_buckets(
 	'Commit axis -- tiny single-row commits from node0',
-	sprintf('- %d committed txns in %.1fs, errors=%d',
-		$c->{txns}, $c->{wall_ns} / 1e9, $c->{errors}),
+	sprintf('- %d committed txns in %.1fs, errors=%d%s',
+		$c->{txns}, $c->{wall_ns} / 1e9, $c->{errors},
+		($c->{errors} > 0 && defined $c->{first_err})
+		? " (first error: $c->{first_err})" : ''),
 	$c, qw(c_scn_commit_advance c_scn_boc_broadcast));
 report_observe_section($o);
+report_validity_section($w, $r, $i, $c, $o);
 write_report();
 ok(1, "report emitted: $XP_OUT");
 
