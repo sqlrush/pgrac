@@ -91,7 +91,7 @@ SELECT * FROM pg_cluster_state ORDER BY category, key;
 ```sql
 SHOW cluster.node_id;                    -- this node's id
 SHOW cluster.config_file;
-SHOW cluster.interconnect_tier;          -- stub / mock / tcp / rdma
+SHOW cluster.interconnect_tier;          -- stub / mock / tier1 / tier2 / tier3
 SHOW cluster.injection_points;           -- startup-time batch arm list
 ```
 
@@ -104,6 +104,7 @@ directly:
 SELECT * FROM cluster_get_wait_events();
 SELECT * FROM cluster_get_global_wait_events();
 SELECT * FROM cluster_get_nodes();
+SELECT * FROM cluster_get_ic_rdma_peers();
 SELECT * FROM cluster_get_injection_state();
 SELECT * FROM cluster_get_stat_nodes();
 SELECT * FROM cluster_get_pgstat_counters();
@@ -290,4 +291,3 @@ Per-run pgbench output lands in `scripts/perf/results/<timestamp>-<mode>-<rw|ro>
 and is gitignored.  Read-write and read-only runs are timed
 separately, so a single invocation produces four output files (two
 modes × two read patterns) when run with `--mode=both` (the default).
-

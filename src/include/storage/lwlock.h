@@ -346,6 +346,8 @@ typedef enum BuiltinTrancheIds {
 	LWTRANCHE_CLUSTER_SQ,
 	/* PGRAC: spec-5.7 D1 — HW relation-extend block-number authority region. */
 	LWTRANCHE_CLUSTER_HW,
+	/* PGRAC: spec-6.1 — RDMA transport observability shmem strings/state. */
+	LWTRANCHE_CLUSTER_IC_RDMA,
 #endif
 	LWTRANCHE_FIRST_USER_DEFINED
 } BuiltinTrancheIds;

@@ -27,6 +27,8 @@
 #        the read site that motivated promoting it from a placeholder.
 #      - cluster.interconnect_tier enum advertises all five tiers
 #        (stub / mock / tier1 / tier2 / tier3) and defaults to stub.
+#      - RDMA interconnect GUCs advertise fallback/provider/completion
+#        choices and safe defaults.
 #      - cluster.config_file defaults to "pgrac.conf".
 #      - cluster.injection_points defaults to empty and accepts a
 #        runtime SET (PGC_SUSET, unlike the postmaster-locked GUCs).
@@ -131,6 +133,31 @@ my $tier_options = $node->safe_psql(
 	    FROM pg_settings WHERE name = 'cluster.interconnect_tier'});
 is($tier_options, 'stub,mock,tier1,tier2,tier3',
    'cluster.interconnect_tier enumvals expose all five tiers');
+
+is($node->safe_psql(
+	'postgres',
+	q{SELECT setting || '|' || vartype || '|' || context
+	    FROM pg_settings WHERE name = 'cluster.interconnect_rdma_fallback'}),
+	'auto|enum|postmaster',
+	'cluster.interconnect_rdma_fallback defaults to auto');
+is($node->safe_psql(
+	'postgres',
+	q{SELECT array_to_string(enumvals, ',')
+	    FROM pg_settings WHERE name = 'cluster.interconnect_rdma_provider'}),
+	'auto,verbs,mlx5',
+	'cluster.interconnect_rdma_provider enumvals expose provider choices');
+is($node->safe_psql(
+	'postgres',
+	q{SELECT setting || '|' || vartype || '|' || context
+	    FROM pg_settings WHERE name = 'cluster.interconnect_rdma_completion'}),
+	'event|enum|postmaster',
+	'cluster.interconnect_rdma_completion defaults to event');
+is($node->safe_psql(
+	'postgres',
+	q{SELECT setting || '|' || vartype || '|' || context
+	    FROM pg_settings WHERE name = 'cluster.interconnect_rdma_crc_offload'}),
+	'off|bool|postmaster',
+	'cluster.interconnect_rdma_crc_offload defaults off');
 
 
 # ----------

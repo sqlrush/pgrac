@@ -46,12 +46,12 @@ $node->start;
 
 
 # ----------
-# Total row count: 110 (spec-6.0a adds 7 block-device storage waits).
+# Total row count: 112 (spec-6.1 adds 2 RDMA interconnect waits).
 # ----------
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'110',
-	'pg_stat_cluster_wait_events returns 110 rows (spec-6.0a +7 storage wait events)');
+	'112',
+	'pg_stat_cluster_wait_events returns 112 rows (spec-6.1 RDMA wait events)');
 
 
 # ----------
@@ -75,7 +75,7 @@ my %expected = (
 	'Cluster: Reconfig' => 8,    # spec-5.18 D12: +ReconfigNodeRemoveCleanupWait
 	'Cluster: Recovery' => 7,    # spec-4.12 D6: +ClusterWriteFenceVerify
 	'Cluster: Sinval' => 6,
-	'Cluster: Interconnect' => 5,
+	'Cluster: Interconnect' => 7,
 	'Cluster: Undo' => 4,
 	'Cluster: ADG' => 4,
 );
@@ -91,10 +91,10 @@ for my $type (sort keys %expected)
 
 
 # ----------
-# Spot-check 5 event names exist.
+# Spot-check 6 event names exist.
 # ----------
 for my $name ('GesEnqueueAcquire', 'PcmBlockReadNS', 'SinvalInjectLocalQueue',
-              'InterconnectRdmaSend', 'AdgScnSyncWait')
+              'InterconnectRdmaSend', 'ClusterICRdmaFallback', 'AdgScnSyncWait')
 {
 	my $count = $node->safe_psql(
 		'postgres',
@@ -110,6 +110,27 @@ my $native_activity_count = $node->safe_psql('postgres',
 	q{SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend'});
 cmp_ok($native_activity_count, '>=', 1,
 	'pg_stat_activity still works after cluster view extension');
+
+# ----------
+# spec-6.1: pg_stat_cluster_ic mux/RDMA observability view.
+# ----------
+is($node->safe_psql('postgres',
+		q{SELECT count(*) FROM pg_stat_cluster_ic}),
+	'1',
+	'pg_stat_cluster_ic returns one single-node fallback row');
+
+is($node->safe_psql('postgres',
+		q{SELECT transport || '|' || rdma_state || '|' || provider
+		    FROM pg_stat_cluster_ic}),
+	'tcp|disabled|auto',
+	'pg_stat_cluster_ic exposes TCP fallback transport defaults');
+
+is($node->safe_psql('postgres',
+		q{SELECT string_agg(column_name, ',' ORDER BY ordinal_position)
+		    FROM information_schema.columns
+		   WHERE table_name = 'pg_stat_cluster_ic'}),
+	'node_id,transport,rdma_state,provider,rdma_addr,rdma_gid,rdma_port,mr_registered,cq_depth,fallback_count,send_count,recv_count,bytes_send,bytes_recv,block_sge_send_count,block_sge_fallback_count,latency_us_sum,latency_sample_count,last_error_code,last_error',
+	'pg_stat_cluster_ic column contract matches spec-6.1 D8');
 
 
 $node->stop;

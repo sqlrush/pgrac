@@ -150,11 +150,12 @@ sure the interconnect ports are reachable.
 ## Current limitations
 
 - **`tier1` carries the heartbeat path only**: the cross-node interconnect
-  carries LMON heartbeat and membership today.  Higher tiers (`tier2`+) are
-  not yet supported and cause the postmaster to refuse to start with
-  `ERRCODE_FEATURE_NOT_SUPPORTED`; cross-node GES / Cache Fusion / recovery
-  are scaffolded and likewise return `FEATURE_NOT_SUPPORTED`.  See
-  [Configuration](configuration.md) for the GUC reference.
+  carries LMON heartbeat and membership today.  `tier2` / `tier3` select the
+  RDMA-capable mux and require a `--with-rdma` build; otherwise startup fails
+  closed with `53R22`.  `tier3` is reserved in spec-6.1 and fails closed until
+  mlx5 direct verbs are implemented.  Cross-node GES / Cache Fusion / recovery remain
+  separately staged.  See [Configuration](configuration.md) for the GUC
+  reference.
 - **Bash only**: `pgrac-init` / `pgrac-start` are bash scripts;
   they require a POSIX shell.  Windows is not currently supported.
 - **No one-shot multi-node bootstrap**: there is no built-in tool for

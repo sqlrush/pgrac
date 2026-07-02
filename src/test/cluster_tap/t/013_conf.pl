@@ -113,13 +113,13 @@ is($cols,
 # ----------
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'110',
-	'pg_stat_cluster_wait_events returns 110 rows (spec-6.0a +7 storage wait events)');
+	'112',
+	'pg_stat_cluster_wait_events returns 112 rows (spec-6.0a +7 storage wait events)');
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_gcluster_wait_events'),
-	'110',
-	'pg_stat_gcluster_wait_events returns 110 rows (spec-6.0a +7 storage wait events)');
+	'112',
+	'pg_stat_gcluster_wait_events returns 112 rows (spec-6.0a +7 storage wait events)');
 
 is($node->safe_psql('postgres', q{SHOW "cluster.interconnect_tier"}),
 	'stub',
@@ -141,12 +141,22 @@ name = pgrac-test-013
 
 [node.0]
 interconnect_addr = 10.0.0.10:6432
+rdma_addr = 10.0.1.10:18515
+rdma_gid = fe80::10
+rdma_port = 1
+rdma_pkey = 0xffff
+rdma_qkey = 0x11112222
 hostname = test-node-0
 role = primary
 region = us-east-1a
 
 [node.1]
 interconnect_addr = 10.0.0.11:6432
+rdma_addr = 10.0.1.11:18515
+rdma_gid = fe80::11
+rdma_port = 2
+rdma_pkey = 0x7fff
+rdma_qkey = 305419896
 hostname = test-node-1
 role = standby
 EOC
@@ -180,6 +190,20 @@ is($node->safe_psql('postgres',
 		   WHERE node_id = 1 AND role = 'standby'}),
 	'1',
 	'non-self row matches [node.1] from pgrac.conf');
+
+is($node->safe_psql('postgres',
+		q{SELECT rdma_addr || '|' || rdma_gid || '|' || rdma_port
+		    FROM pg_stat_cluster_ic
+		   WHERE node_id = 0}),
+	'10.0.1.10:18515|fe80::10|1',
+	'pg_stat_cluster_ic reflects RDMA fields from [node.0]');
+
+is($node->safe_psql('postgres',
+		q{SELECT node_id::text
+		    FROM pg_cluster_nodes
+		   WHERE node_id = 1}),
+	'1',
+	'pgrac.conf accepts rdma_pkey/rdma_qkey partition metadata');
 
 
 # ----------

@@ -243,6 +243,13 @@ UT_TEST(test_node_info_alignment)
 	UT_ASSERT_EQ(sizeof(ClusterNodeInfo) % 8, 0);
 }
 
+UT_TEST(test_rdma_node_field_budgets)
+{
+	UT_ASSERT_EQ(CLUSTER_NODE_RDMA_ADDR_LEN, 64);
+	UT_ASSERT_EQ(CLUSTER_NODE_RDMA_GID_LEN, 40);
+	UT_ASSERT(sizeof(ClusterConf) <= 65536);
+}
+
 UT_TEST(test_conf_size_under_64k)
 {
 	UT_ASSERT(sizeof(ClusterConf) <= 65536);
@@ -381,11 +388,12 @@ UT_TEST(test_cluster_enabled_linkable)
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(20);
 	UT_RUN(test_max_nodes_constant);
 	UT_RUN(test_conf_magic_constant);
 	UT_RUN(test_node_role_int32_sized);
 	UT_RUN(test_node_info_alignment);
+	UT_RUN(test_rdma_node_field_budgets);
 	UT_RUN(test_conf_size_under_64k);
 	UT_RUN(test_role_to_string_primary);
 	UT_RUN(test_role_to_string_standby_arbiter);

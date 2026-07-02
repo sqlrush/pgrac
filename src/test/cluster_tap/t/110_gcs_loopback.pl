@@ -87,11 +87,11 @@ is($gcs_reply_wait_event, '1',
    'L3 ClusterGcsReplyWait wait event registered (spec-2.32 D7)');
 
 
-# L4 — CLUSTER_WAIT_EVENTS_COUNT == 95 (spec-4.1).
+# L4 — CLUSTER_WAIT_EVENTS_COUNT == 112 (spec-6.1).
 my $total_wait_events = $node->safe_psql(
 	'postgres', 'SELECT count(*) FROM pg_stat_cluster_wait_events');
-is($total_wait_events, '110',
-	'L4 wait_events count 110 (spec-6.0a +7 storage wait events)');
+is($total_wait_events, '112',
+	'L4 wait_events count 112 (spec-6.1 RDMA wait events)');
 
 
 # L6 — Production workload does NOT trigger wire path (HC72 short-circuit).

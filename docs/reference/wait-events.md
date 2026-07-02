@@ -1,6 +1,6 @@
 # Cluster wait events
 
-linkdb registers 110 cluster-specific wait events distributed across
+linkdb registers 112 cluster-specific wait events distributed across
 11 classes.  Each row in `pg_stat_cluster_wait_events` corresponds
 to one entry in this table.
 
@@ -8,11 +8,10 @@ The values appear in the standard `pg_stat_activity.wait_event_type`
 and `pg_stat_activity.wait_event` columns when a backend is waiting
 on a cluster operation.
 
-In the current release most events are registered but not yet
-emitted by code (because the corresponding cross-node subsystems
-are not yet implemented; cross-node sends raise
-`ERRCODE_FEATURE_NOT_SUPPORTED` rather than blocking on a wait).
-The events become observable as the corresponding subsystem ships.
+In the current release some events are registered before their full
+runtime call sites are active.  They become observable as the
+corresponding subsystem ships or as a selected transport path reaches
+the relevant wait.
 
 ## Cluster: GES (5 events)
 
@@ -96,7 +95,7 @@ Cross-node shared invalidation broadcast.
 | `SinvalBroadcastReceive` | Waiting for incoming sinval broadcast |
 | `SinvalInjectLocalQueue` | Waiting to inject received sinval into local queue |
 
-## Cluster: Interconnect (11 events)
+## Cluster: Interconnect (13 events)
 
 Network transport layer.
 
@@ -104,7 +103,9 @@ Network transport layer.
 |---|---|
 | `InterconnectRdmaSend` | Waiting for an RDMA send completion |
 | `InterconnectRdmaRecv` | Waiting for an RDMA receive |
-| `InterconnectTcpFallback` | Waiting on the TCP fallback transport |
+| `ClusterICRdmaPoll` | Waiting for RDMA completion-queue polling |
+| `ClusterICRdmaConnect` | Waiting for RDMA connection setup |
+| `ClusterICRdmaFallback` | Waiting on the TCP fallback transport selected by the RDMA mux |
 | `InterconnectTierSwitch` | Waiting for transport tier switch (e.g. RDMA → TCP fallback) |
 | `InterconnectConnectRetry` | Waiting for an interconnect reconnection attempt |
 | `ClusterICTcpAccept` | LMON waiting on the Tier 1 listener for an incoming peer connection |
@@ -162,7 +163,7 @@ Shared-storage provider and raw block-device I/O.
 ## Querying
 
 ```sql
--- Total registered (110):
+-- Total registered (112):
 SELECT count(*) FROM pg_stat_cluster_wait_events;
 
 -- Per-class counts:

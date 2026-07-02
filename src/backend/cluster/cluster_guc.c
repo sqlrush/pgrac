@@ -53,6 +53,7 @@
 #include "cluster/cluster_hang_resolve.h"	  /* HANG_RESOLVE_* + disposition GUCs (spec-5.12 D6) */
 #include "cluster/storage/cluster_undo_buf.h" /* cluster_undo_buf_writeback_allowed (spec-3.18 D1) */
 #include "cluster/cluster_ic.h"				  /* ClusterICTier enum values */
+#include "cluster/cluster_ic_rdma.h"		  /* RDMA GUC enum values */
 #include "cluster/cluster_inject.h"			  /* cluster_injection_assign_hook (stage 0.27) */
 #include "cluster/cluster_pcm_lock.h"		  /* cluster_pcm_grd_max_entries (stage 1.7) */
 #include "cluster/storage/cluster_shared_fs.h" /* ClusterSharedFsBackendId (stage 1.1) */
@@ -346,6 +347,13 @@ int cluster_interconnect_chunk_reassembly_timeout_ms = 10000;  /* 10s */
 int cluster_interconnect_tcp_keepidle_sec = 60;
 int cluster_interconnect_tcp_keepintvl_sec = 10;
 int cluster_interconnect_tcp_keepcnt = 6;
+int cluster_interconnect_rdma_fallback = CLUSTER_IC_RDMA_FALLBACK_AUTO;
+int cluster_interconnect_rdma_provider = CLUSTER_IC_RDMA_PROVIDER_AUTO;
+int cluster_interconnect_rdma_completion = CLUSTER_IC_RDMA_COMPLETION_EVENT;
+int cluster_interconnect_rdma_busypoll_us = 50;
+bool cluster_interconnect_rdma_crc_offload = false;
+int cluster_interconnect_rdma_inline_max = 256;
+int cluster_interconnect_rdma_max_send_wr = 256;
 
 /*
  * cluster.undo_segments_per_instance (spec-1.22 D7).  Number of undo
@@ -813,6 +821,22 @@ static const struct config_enum_entry cluster_interconnect_tier_options[]
 		{ "tier1", CLUSTER_IC_TIER_1, false },	 { "tier2", CLUSTER_IC_TIER_2, false },
 		{ "tier3", CLUSTER_IC_TIER_3, false },	 { NULL, 0, false } };
 
+static const struct config_enum_entry cluster_interconnect_rdma_fallback_options[]
+	= { { "auto", CLUSTER_IC_RDMA_FALLBACK_AUTO, false },
+		{ "off", CLUSTER_IC_RDMA_FALLBACK_OFF, false },
+		{ NULL, 0, false } };
+
+static const struct config_enum_entry cluster_interconnect_rdma_provider_options[]
+	= { { "auto", CLUSTER_IC_RDMA_PROVIDER_AUTO, false },
+		{ "verbs", CLUSTER_IC_RDMA_PROVIDER_VERBS, false },
+		{ "mlx5", CLUSTER_IC_RDMA_PROVIDER_MLX5, false },
+		{ NULL, 0, false } };
+
+static const struct config_enum_entry cluster_interconnect_rdma_completion_options[]
+	= { { "event", CLUSTER_IC_RDMA_COMPLETION_EVENT, false },
+		{ "busypoll", CLUSTER_IC_RDMA_COMPLETION_BUSYPOLL, false },
+		{ NULL, 0, false } };
+
 
 /*
  * Mapping for cluster.shared_storage_backend.  Mirrors
@@ -1033,7 +1057,8 @@ cluster_init_guc(void)
 	DefineCustomEnumVariable(
 		"cluster.interconnect_tier", gettext_noop("Cluster interconnect tier vtable selection."),
 		gettext_noop("stub (default) keeps cross-node IPC disabled; tier1 (TCP) "
-					 "lands in Stage 2; tier2 / tier3 (RDMA) land in Stage 6+. "
+					 "uses TCP; tier2 selects the RDMA-capable transport mux; "
+					 "tier3 is reserved until mlx5 direct verbs are implemented. "
 					 "See docs/cluster-ic-design.md."),
 		&cluster_interconnect_tier, CLUSTER_IC_TIER_STUB,  /* boot value */
 		cluster_interconnect_tier_options, PGC_POSTMASTER, /* tier change requires restart */
@@ -1041,6 +1066,58 @@ cluster_init_guc(void)
 		NULL,											   /* check_hook */
 		NULL,											   /* assign_hook */
 		NULL);											   /* show_hook */
+
+	DefineCustomEnumVariable(
+		"cluster.interconnect_rdma_fallback",
+		gettext_noop("Policy for RDMA-to-TCP interconnect fallback."),
+		gettext_noop("auto allows the transport mux to use tier1 TCP when RDMA is unavailable "
+					 "for a peer. off fails closed if RDMA cannot be used."),
+		&cluster_interconnect_rdma_fallback, CLUSTER_IC_RDMA_FALLBACK_AUTO,
+		cluster_interconnect_rdma_fallback_options, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	DefineCustomEnumVariable(
+		"cluster.interconnect_rdma_provider",
+		gettext_noop("RDMA provider selection for tier2/tier3 interconnect."),
+		gettext_noop("auto and verbs request generic libibverbs; mlx5 is reserved and "
+					 "fails closed until the optimized mlx5 provider is implemented."),
+		&cluster_interconnect_rdma_provider, CLUSTER_IC_RDMA_PROVIDER_AUTO,
+		cluster_interconnect_rdma_provider_options, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	DefineCustomEnumVariable(
+		"cluster.interconnect_rdma_completion",
+		gettext_noop("RDMA completion model for the interconnect."),
+		gettext_noop("event integrates with the LMON wait loop; busypoll is reserved "
+					 "and fails closed until the tier3 poller is implemented."),
+		&cluster_interconnect_rdma_completion, CLUSTER_IC_RDMA_COMPLETION_EVENT,
+		cluster_interconnect_rdma_completion_options, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.interconnect_rdma_busypoll_us",
+		gettext_noop("RDMA busy-poll spin budget in microseconds."),
+		gettext_noop("Reserved for cluster.interconnect_rdma_completion=busypoll; "
+					 "unused by the spec-6.1 event-driven path."),
+		&cluster_interconnect_rdma_busypoll_us, 50, 0, 10000, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"cluster.interconnect_rdma_crc_offload",
+		gettext_noop("Reserved RDMA control-plane CRC offload switch."),
+		gettext_noop("Spec-6.1 rejects this setting when enabled; block shipping always "
+					 "uses application-level CRC32C."),
+		&cluster_interconnect_rdma_crc_offload, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.interconnect_rdma_inline_max",
+		gettext_noop("RDMA inline-send threshold in bytes."),
+		gettext_noop("Small control frames at or below this size may use inline send when "
+					 "the provider supports it."),
+		&cluster_interconnect_rdma_inline_max, 256, 0, 4096, PGC_POSTMASTER, GUC_UNIT_BYTE, NULL,
+		NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.interconnect_rdma_max_send_wr",
+		gettext_noop("RDMA send work request queue depth per peer."),
+		gettext_noop("Defines the per-peer RDMA send queue depth before backpressure."),
+		&cluster_interconnect_rdma_max_send_wr, 256, 16, 4096, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	/*
 	 * cluster.config_file -- path to pgrac.conf.  Default "pgrac.conf"

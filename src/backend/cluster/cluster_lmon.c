@@ -75,6 +75,7 @@
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_chunk.h" /* cluster_ic_chunk_scan_reassembly_timeouts (2.4) */
+#include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_scn.h" /* cluster_scn_boc_broadcast_handler (spec-2.9 D1) */
@@ -752,6 +753,11 @@ lmon_advance_liveness_tick(void)
 void
 LmonMain(void)
 {
+	ClusterICTier ic_tier = (ClusterICTier)cluster_interconnect_tier;
+	bool lmon_transport_loop = cluster_enabled
+							   && (ic_tier == CLUSTER_IC_TIER_1 || ic_tier == CLUSTER_IC_TIER_2
+								   || ic_tier == CLUSTER_IC_TIER_3);
+
 	/*
 	 * HC1 reverse defense: LmonMain runs in the LMON child, so
 	 * IsUnderPostmaster MUST be true.  Catch a misconfigured
@@ -812,8 +818,10 @@ LmonMain(void)
 	 * connect before publishing READY (that would deadlock when this
 	 * node starts before its peers).
 	 */
-	if (cluster_enabled && (ClusterICTier)cluster_interconnect_tier == CLUSTER_IC_TIER_1) {
+	if (lmon_transport_loop) {
 		(void)cluster_ic_tier1_listener_bind(); /* FATAL on failure */
+		if (ic_tier == CLUSTER_IC_TIER_2 || ic_tier == CLUSTER_IC_TIER_3)
+			cluster_ic_rdma_lmon_start();
 	}
 
 	/*
@@ -845,7 +853,7 @@ LmonMain(void)
 	 *      semantic in stub/mock mode.  In tier1 mode heartbeat is
 	 *      transport liveness only, NOT membership (per §3.6 boundary).
 	 */
-	if (cluster_enabled && (ClusterICTier)cluster_interconnect_tier == CLUSTER_IC_TIER_1) {
+	if (lmon_transport_loop) {
 		/*
 		 * spec-2.2 Step 11 D5 -- LMON Tier1 peer drive.
 		 *
@@ -889,6 +897,8 @@ LmonMain(void)
 		WaitEventSet *wes = NULL;
 		bool wes_dirty = true;
 		int listener_fd = cluster_ic_tier1_get_listener_fd();
+		int rdma_cm_fd = -1;
+		int rdma_cq_fd = -1;
 		TimestampTz next_heartbeat_at;
 		int32 self_id = cluster_node_id;
 		int32 pi;
@@ -1119,6 +1129,8 @@ LmonMain(void)
 						const ClusterICPeerStateShmem *p = cluster_ic_tier1_peer_get(pi);
 						TimestampTz last;
 
+						if (cluster_ic_mux_peer_transport(pi) == CLUSTER_IC_PEER_TRANSPORT_RDMA)
+							continue;
 						if (p == NULL)
 							continue;
 						last = p->last_heartbeat_recv_at;
@@ -1142,13 +1154,13 @@ LmonMain(void)
 			 * Heartbeat send tick.
 			 *
 			 * spec-2.3 hardening v1.0.1 F1 (L68):
-			 *   send_heartbeat returns three-state.  WOULD_BLOCK = the
-			 *   outbound buffer holds the (possibly partial) frame; we
-			 *   keep the peer CONNECTED, mark wes_dirty so the WaitEventSet
-			 *   rebuild adds WL_SOCKET_WRITEABLE for that fd, and let the
-			 *   next writability wakeup drain the tail.  Closing the peer
-			 *   on EAGAIN was the v1.0.0 bug -- it silently bypassed the
-			 *   per-peer outbound buffer designed exactly for this case.
+				 *   send_heartbeat returns three-state.  WOULD_BLOCK means the
+				 *   selected transport has retained the frame: TCP drains its
+				 *   tier1 tail on WL_SOCKET_WRITEABLE; RDMA drains its one-frame
+				 *   send queue from the SEND CQE completion path.  We keep the
+				 *   peer CONNECTED and rebuild the wait set so either transport's
+				 *   next wake can make progress.  Closing the peer on EAGAIN was
+				 *   the v1.0.0 bug -- it bypassed the per-peer outbound buffer.
 			 *   HARD_ERROR = real socket death; close peer + state DOWN.
 			 */
 			if (now >= next_heartbeat_at) {
@@ -1157,12 +1169,15 @@ LmonMain(void)
 
 					if (lmon_peer_track[pi].substate != LMON_SUB_CONNECTED)
 						continue;
-					rc = cluster_ic_tier1_send_heartbeat(pi);
+					if (cluster_ic_mux_peer_transport(pi) == CLUSTER_IC_PEER_TRANSPORT_RDMA)
+						rc = cluster_ic_send_envelope(PGRAC_IC_MSG_HEARTBEAT, pi, NULL, 0);
+					else
+						rc = cluster_ic_tier1_send_heartbeat(pi);
 					switch (rc) {
 					case CLUSTER_IC_SEND_DONE:
 						break;
 					case CLUSTER_IC_SEND_WOULD_BLOCK:
-						/* Tail buffered; arrange WL_SOCKET_WRITEABLE drain. */
+						/* Transport-retained frame; arrange the next drain wake. */
 						wes_dirty = true;
 						break;
 					case CLUSTER_IC_SEND_HARD_ERROR:
@@ -1220,7 +1235,8 @@ LmonMain(void)
 						 * peer send.  Result written back atomic before
 						 * publishing pending=0. */
 						if (cs == cluster_node_id || cluster_conf_lookup_node(cs) == NULL
-							|| cluster_ic_tier1_get_peer_fd(cs) < 0)
+							|| (cluster_ic_mux_peer_transport(cs) != CLUSTER_IC_PEER_TRANSPORT_RDMA
+								&& cluster_ic_tier1_get_peer_fd(cs) < 0))
 							fanout_rc = CLUSTER_IC_FANOUT_PEER_DOWN;
 						else if (!cluster_ic_envelope_build(
 									 &env, PGRAC_IC_MSG_CSSD_HEARTBEAT, (uint32)cluster_node_id,
@@ -1290,11 +1306,20 @@ LmonMain(void)
 					FreeWaitEventSet(wes);
 					wes = NULL;
 				}
-				wes = CreateWaitEventSet(CurrentMemoryContext, 2 + 2 * CLUSTER_MAX_NODES);
+				rdma_cm_fd = cluster_ic_rdma_lmon_cm_fd();
+				rdma_cq_fd = cluster_ic_rdma_lmon_completion_fd();
+
+				wes = CreateWaitEventSet(CurrentMemoryContext, 4 + 2 * CLUSTER_MAX_NODES);
 				AddWaitEventToSet(wes, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch, NULL);
 				if (listener_fd >= 0)
 					AddWaitEventToSet(wes, WL_SOCKET_READABLE, listener_fd, NULL,
 									  (void *)(intptr_t)-1);
+				if (rdma_cm_fd >= 0)
+					AddWaitEventToSet(wes, WL_SOCKET_READABLE, rdma_cm_fd, NULL,
+									  (void *)(intptr_t)-2);
+				if (rdma_cq_fd >= 0)
+					AddWaitEventToSet(wes, WL_SOCKET_READABLE, rdma_cq_fd, NULL,
+									  (void *)(intptr_t)-3);
 
 				/* Per-peer (post-HELLO-bound) fds. */
 				for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
@@ -1385,6 +1410,11 @@ LmonMain(void)
 						lmon_pending_fds[slot] = new_fd;
 						wes_dirty = true;
 					}
+				} else if (tag == -2) {
+					cluster_ic_rdma_lmon_handle_cm_events();
+					wes_dirty = true;
+				} else if (tag == -3) {
+					cluster_ic_rdma_lmon_handle_completion_events();
 				} else if (tag >= 0 && tag < CLUSTER_MAX_NODES) {
 					int32 peer = (int32)tag;
 					int peer_fd = lmon_peer_track[peer].fd;
@@ -1514,6 +1544,8 @@ LmonMain(void)
 		}
 		if (wes != NULL)
 			FreeWaitEventSet(wes);
+		if (ic_tier == CLUSTER_IC_TIER_2 || ic_tier == CLUSTER_IC_TIER_3)
+			cluster_ic_rdma_lmon_stop();
 	} else {
 		/* Stub / mock / disabled mode -- preserve spec-1.11 simple loop. */
 		for (;;) {
