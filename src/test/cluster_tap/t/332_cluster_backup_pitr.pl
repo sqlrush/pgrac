@@ -256,6 +256,7 @@ my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 		'autovacuum = off',
 		'wal_level = replica',
 		'archive_mode = on',
+		'max_prepared_transactions = 10',
 		"archive_command = 'cp %p $pair_archive/%f'",
 	]);
 $pair->start_pair;
@@ -263,20 +264,66 @@ ok($pair->wait_for_peer_state(0, 1, 'connected', 30),
 	'L14 two-node backup setup has node0 connected to node1');
 
 $pair->node0->safe_psql('postgres',
-	q{CREATE TABLE cluster_backup_pair_probe(id int PRIMARY KEY, note text);
-	  INSERT INTO cluster_backup_pair_probe VALUES (1, 'pair-before-backup');});
+	q{CREATE TABLE cluster_backup_pair_probe(id int, marker int);});
+$pair->node1->safe_psql('postgres',
+	q{CREATE TABLE cluster_backup_pair_probe(id int, marker int);});
+my $pair_probe_path0 = $pair->node0->safe_psql('postgres',
+	q{SELECT pg_relation_filepath('cluster_backup_pair_probe')});
+my $pair_probe_path1 = $pair->node1->safe_psql('postgres',
+	q{SELECT pg_relation_filepath('cluster_backup_pair_probe')});
+if ($pair_probe_path0 ne $pair_probe_path1)
+{
+	$pair->stop_pair;
+	BAIL_OUT("same-DDL shared-data relation path mismatch: "
+	  . "node0=$pair_probe_path0 node1=$pair_probe_path1");
+}
+is($pair_probe_path1, $pair_probe_path0,
+	'L15 same-DDL pair probe uses one shared-data relation path');
 
-is($pair->node0->safe_psql('postgres',
+$pair->node0->safe_psql('postgres',
+	q{INSERT INTO cluster_backup_pair_probe VALUES (1, 10);});
+
+my $pair_backup_session = $pair->node0->background_psql('postgres', on_error_die => 1);
+is($pair_backup_session->query_safe(
 	q{SELECT backup_id || ',' ||
 	          CASE WHEN start_redo_lsn IS NOT NULL THEN 't' ELSE 'f' END || ',' ||
 	          CASE WHEN checkpoint_lsn IS NOT NULL THEN 't' ELSE 'f' END
-	     FROM pg_cluster_backup_start('pair332', true);
-	  SELECT CASE WHEN consistent_scn > 0 THEN 't' ELSE 'f' END || ',' ||
+	     FROM pg_cluster_backup_start('pair332', true);}),
+	"pair332,t,t",
+	'L15a two-node cluster backup start succeeds through peer IC coordination');
+
+$pair->node1->safe_psql('postgres',
+	q{BEGIN;
+	  INSERT INTO cluster_backup_pair_probe VALUES (2, 20);
+	  PREPARE TRANSACTION 'pair332_before_cut';
+	  COMMIT PREPARED 'pair332_before_cut';
+	  SELECT pg_switch_wal();});
+is($pair->node1->safe_psql('postgres',
+	q{SELECT count(*) FROM cluster_backup_pair_probe WHERE id = 2}),
+	'1',
+	'L15b peer COMMIT PREPARED before the backup-stop cut is durable');
+
+$pair->node1->safe_psql('postgres',
+	q{BEGIN;
+	  INSERT INTO cluster_backup_pair_probe VALUES (3, 30);
+	  PREPARE TRANSACTION 'pair332_after_cut';});
+is($pair->node1->safe_psql('postgres',
+	q{SELECT count(*) FROM pg_prepared_xacts WHERE gid = 'pair332_after_cut'}),
+	'1',
+	'L15c peer 2PC is prepared before the backup-stop cut');
+
+my ($pair_stop_out, $pair_stop_had_stderr) = $pair_backup_session->query(
+	q{SELECT CASE WHEN consistent_scn > 0 THEN 't' ELSE 'f' END || ',' ||
 	          CASE WHEN stop_cut_lsn IS NOT NULL THEN 't' ELSE 'f' END || ',' ||
 	          CASE WHEN manifest_crc <> 0 THEN 't' ELSE 'f' END
-	     FROM pg_cluster_backup_stop(true);}),
-	"pair332,t,t\nt,t,t",
-	'L15 two-node cluster backup start/stop succeeds through peer IC coordination');
+	     FROM pg_cluster_backup_stop(true);});
+die "unexpected pg_cluster_backup_stop stderr: $pair_backup_session->{stderr}"
+  if $pair_stop_had_stderr
+  && $pair_backup_session->{stderr} !~ /all required WAL segments have been archived/;
+is($pair_stop_out,
+	"t,t,t",
+	'L15d two-node cluster backup stop cuts while peer 2PC is only prepared');
+$pair_backup_session->quit;
 
 my ($pair_backup_set, $pair_threads, $pair_nodes, $pair_consistent_scn) = split /\n/,
   $pair->node0->safe_psql('postgres',
@@ -293,9 +340,13 @@ ok(-d "$pair_backup_set/node_1_pg_undo", 'L17 peer undo region was captured');
 ok(-f "$pair_backup_set/node_1_tt.proof", 'L17 peer durable TT evidence was captured');
 ok(-d "$pair_backup_set/shared_data", 'L17 shared-data region was captured');
 
-$pair->node0->safe_psql('postgres',
-	q{INSERT INTO cluster_backup_pair_probe VALUES (2, 'pair-after-backup');
+$pair->node1->safe_psql('postgres',
+	q{COMMIT PREPARED 'pair332_after_cut';
 	  SELECT pg_switch_wal();});
+my $pair_after_2pc_scn = $pair->node1->safe_psql('postgres',
+	q{SELECT cluster_scn_current()});
+ok($pair_after_2pc_scn > $pair_consistent_scn,
+	'L17a peer COMMIT PREPARED advances SCN above the backup cut');
 
 $pair->stop_pair;
 
@@ -334,6 +385,7 @@ EOC
 	. "cluster.shared_storage_backend = cluster_fs\n"
 	. "cluster.shared_data_dir = '$shared_dir'\n"
 	. "cluster.smgr_user_relations = on\n"
+	. "max_prepared_transactions = 10\n"
 	. "cluster.pcm_grd_max_entries = 0\n"
 	. "cluster.recovery_target_scn = '$target_scn'\n"
 	. "cluster.recovery_target_action = 'promote'\n");
@@ -347,10 +399,18 @@ chmod(0700, $pair_restore->data_dir);
 configure_pair_restore($pair_restore, $pair_restore_shared, $pair_consistent_scn);
 $pair_restore->start;
 is($pair_restore->safe_psql('postgres',
-	q{SELECT string_agg(id::text || ':' || note, ',' ORDER BY id)
+	q{SELECT string_agg(id::text || ':' || marker::text, ',' ORDER BY id)
 	     FROM cluster_backup_pair_probe}),
-	'1:pair-before-backup',
+	'1:10,2:20',
 	'L18 two-node backup->restore->PITR reads the manifest-consistent cut');
+is($pair_restore->safe_psql('postgres',
+	q{SELECT count(*) FROM cluster_backup_pair_probe WHERE id = 3}),
+	'0',
+	'L18a PITR cut excludes peer COMMIT PREPARED after the cut');
+is($pair_restore->safe_psql('postgres',
+	q{SELECT count(*) FROM pg_prepared_xacts WHERE gid = 'pair332_after_cut'}),
+	'0',
+	'L18a foreign peer 2PC is not exposed as a local prepared xact after PITR');
 like(slurp_file($pair_restore->logfile),
 	qr/redo done \(cluster backup restore\)/,
 	'L18 two-node restore drove the multi-thread restore-mode merge');

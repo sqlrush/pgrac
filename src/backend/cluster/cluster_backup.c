@@ -95,6 +95,7 @@ typedef struct ClusterBackupSharedState {
 
 	bool peer_command_pending;
 	ClusterBackupWireRequest peer_command;
+	bool peer_restore_point_prepare_pending;
 	bool peer_reply_pending;
 	int32 peer_reply_dest;
 	ClusterBackupWireAck peer_reply;
@@ -109,7 +110,10 @@ static StringInfo cluster_backup_lmon_tablespace_map = NULL;
 static MemoryContext cluster_backup_lmon_context = NULL;
 static ClusterRestorePoint cluster_backup_lmon_restore_point;
 static ClusterRestorePoint cluster_backup_lmon_last_restore_point;
+static ClusterBackupWireRequest cluster_backup_lmon_prepare_request;
+static TimestampTz cluster_backup_lmon_prepare_started_at;
 static bool cluster_backup_lmon_restore_point_held = false;
+static bool cluster_backup_lmon_restore_point_prepare_pending = false;
 static char cluster_backup_lmon_backup_set_path[MAXPGPATH];
 static bool cluster_backup_pending_commit_registered = false;
 static bool cluster_backup_pending_commit_exit_registered = false;
@@ -207,6 +211,8 @@ cluster_backup_shmem_register(void)
 static void cluster_backup_cleanup_session_context(void);
 static void cluster_backup_session_exit(int code, Datum arg);
 static void cluster_backup_mark_native_stopped(const BackupState *state);
+static TimestampTz cluster_backup_restore_point_fence_start(void);
+static bool cluster_backup_restore_point_fence_drain_done(TimestampTz started_at);
 static void cluster_backup_restore_point_fence_begin(void);
 static void cluster_backup_restore_point_fence_end(void);
 static bool cluster_backup_restore_point_pending_commits_empty(void);
@@ -214,6 +220,8 @@ static bool cluster_backup_restore_point_fence_held(void);
 static void cluster_backup_lmon_prepare_context(void);
 static void cluster_backup_lmon_release_restore_point(SCN final_scn);
 static void cluster_backup_store_restore_point(const ClusterRestorePoint *point);
+static void cluster_backup_finish_restore_point_after_fence(const char *name,
+															ClusterRestorePoint *point);
 static void cluster_backup_prepare_restore_point(const char *name, ClusterRestorePoint *point);
 static void cluster_backup_make_restore_point(const char *name, ClusterRestorePoint *point);
 static void cluster_backup_prepare_cluster_backup_stop_point(const char *name,
@@ -1238,8 +1246,131 @@ cluster_backup_init_wire_ack(ClusterBackupWireAck *ack, const ClusterBackupWireR
 }
 
 static void
+cluster_backup_lmon_set_prepare_pending(bool pending)
+{
+	if (cluster_backup_state == NULL)
+		return;
+
+	LWLockAcquire(&cluster_backup_state->lock.lock, LW_EXCLUSIVE);
+	cluster_backup_state->peer_restore_point_prepare_pending = pending;
+	LWLockRelease(&cluster_backup_state->lock.lock);
+}
+
+static void
+cluster_backup_lmon_clear_prepare_pending(void)
+{
+	if (cluster_backup_lmon_restore_point_prepare_pending) {
+		cluster_backup_lmon_restore_point_prepare_pending = false;
+		MemSet(&cluster_backup_lmon_prepare_request, 0,
+			   sizeof(cluster_backup_lmon_prepare_request));
+		cluster_backup_lmon_prepare_started_at = 0;
+		cluster_backup_lmon_set_prepare_pending(false);
+	}
+}
+
+static void
+cluster_backup_lmon_queue_peer_reply(const ClusterBackupWireAck *reply, int32 dest)
+{
+	if (reply == NULL)
+		return;
+
+	LWLockAcquire(&cluster_backup_state->lock.lock, LW_EXCLUSIVE);
+	cluster_backup_state->peer_reply = *reply;
+	cluster_backup_state->peer_reply_dest = dest;
+	cluster_backup_state->peer_reply_pending = true;
+	LWLockRelease(&cluster_backup_state->lock.lock);
+}
+
+static bool
+cluster_backup_lmon_start_restore_point_prepare(const ClusterBackupWireRequest *request,
+												ClusterBackupWireAck *ack)
+{
+	ClusterBackupWireResult result = CLUSTER_BACKUP_WIRE_RESULT_EXECUTOR_ERROR;
+
+	cluster_backup_init_wire_ack(ack, request, result);
+
+	if (request->restore_point_name[0] == '\0')
+		result = CLUSTER_BACKUP_WIRE_RESULT_BAD_REQUEST;
+	else if (cluster_backup_lmon_restore_point_held
+			 || cluster_backup_lmon_restore_point_prepare_pending)
+		result = CLUSTER_BACKUP_WIRE_RESULT_BUSY;
+	else {
+		if (request->backup_set_path[0] != '\0')
+			cluster_backup_capture_backup_set(request->backup_set_path, false);
+
+		cluster_backup_lmon_prepare_request = *request;
+		cluster_backup_lmon_prepare_started_at = cluster_backup_restore_point_fence_start();
+		cluster_backup_lmon_restore_point_prepare_pending = true;
+		cluster_backup_lmon_set_prepare_pending(true);
+		return false;
+	}
+
+	ack->result = (uint16)result;
+	cluster_backup_wire_ack_compute_crc(ack);
+	return true;
+}
+
+static void
+cluster_backup_lmon_advance_restore_point_prepare(void)
+{
+	ClusterBackupWireAck ack;
+	ClusterBackupWireRequest request;
+	ClusterBackupWireResult result = CLUSTER_BACKUP_WIRE_RESULT_EXECUTOR_ERROR;
+	int thread_index;
+	bool drained = false;
+
+	if (!cluster_backup_lmon_restore_point_prepare_pending)
+		return;
+
+	request = cluster_backup_lmon_prepare_request;
+	cluster_backup_init_wire_ack(&ack, &request, result);
+
+	PG_TRY();
+	{
+		drained
+			= cluster_backup_restore_point_fence_drain_done(cluster_backup_lmon_prepare_started_at);
+		if (!drained)
+			result = CLUSTER_BACKUP_WIRE_RESULT_BUSY;
+		else {
+			cluster_backup_finish_restore_point_after_fence(request.restore_point_name,
+															&cluster_backup_lmon_restore_point);
+			cluster_backup_lmon_restore_point_held = true;
+			thread_index = (int)ack.thread_id - 1;
+			ack.cut_scn = cluster_backup_lmon_restore_point.cut_scn;
+			if (thread_index >= 0 && thread_index < CLUSTER_MAX_NODES)
+				ack.stop_cut_lsn = cluster_backup_lmon_restore_point.cut_lsn[thread_index];
+			ack.timeline = GetWALInsertionTimeLine();
+			result = CLUSTER_BACKUP_WIRE_RESULT_OK;
+		}
+	}
+	PG_CATCH();
+	{
+		FlushErrorState();
+		cluster_backup_restore_point_fence_end();
+		cluster_backup_lmon_restore_point_held = false;
+		MemSet(&cluster_backup_lmon_restore_point, 0, sizeof(cluster_backup_lmon_restore_point));
+		result = CLUSTER_BACKUP_WIRE_RESULT_EXECUTOR_ERROR;
+	}
+	PG_END_TRY();
+
+	if (!drained && result == CLUSTER_BACKUP_WIRE_RESULT_BUSY)
+		return;
+
+	cluster_backup_lmon_clear_prepare_pending();
+	ack.result = (uint16)result;
+	cluster_backup_wire_ack_compute_crc(&ack);
+	cluster_backup_lmon_queue_peer_reply(&ack, request.coordinator_node_id);
+	cluster_lmon_wakeup();
+}
+
+static void
 cluster_backup_lmon_reset_context(void)
 {
+	if (cluster_backup_lmon_restore_point_prepare_pending) {
+		cluster_backup_restore_point_fence_end();
+		cluster_backup_lmon_clear_prepare_pending();
+		MemSet(&cluster_backup_lmon_restore_point, 0, sizeof(cluster_backup_lmon_restore_point));
+	}
 	if (cluster_backup_lmon_restore_point_held) {
 		cluster_backup_restore_point_fence_end();
 		cluster_backup_lmon_restore_point_held = false;
@@ -1332,11 +1463,10 @@ cluster_backup_pending_commit_abort(int code, Datum arg)
 	cluster_backup_pending_commit_exit();
 }
 
-static void
-cluster_backup_restore_point_fence_begin(void)
+static TimestampTz
+cluster_backup_restore_point_fence_start(void)
 {
 	uint32 expected = 0;
-	TimestampTz started_at;
 
 	if (cluster_backup_state == NULL)
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -1346,19 +1476,36 @@ cluster_backup_restore_point_fence_begin(void)
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_RESTORE_POINT_DRAIN_TIMEOUT),
 						errmsg("cluster restore-point commit fence is already active")));
 
-	started_at = GetCurrentTimestamp();
-	for (;;) {
-		if (pg_atomic_read_u32(&cluster_backup_state->pending_commit_count) == 0)
-			return;
+	return GetCurrentTimestamp();
+}
 
-		if (TimestampDifferenceExceeds(started_at, GetCurrentTimestamp(),
-									   CLUSTER_BACKUP_RESTORE_POINT_DRAIN_TIMEOUT_MS)) {
-			cluster_backup_restore_point_fence_end();
-			ereport(ERROR, (errcode(ERRCODE_CLUSTER_RESTORE_POINT_DRAIN_TIMEOUT),
-							errmsg("timed out waiting for cluster restore-point commit drain"),
-							errdetail("Pending commits did not drain within %d ms.",
-									  CLUSTER_BACKUP_RESTORE_POINT_DRAIN_TIMEOUT_MS)));
-		}
+static bool
+cluster_backup_restore_point_fence_drain_done(TimestampTz started_at)
+{
+	if (pg_atomic_read_u32(&cluster_backup_state->pending_commit_count) == 0)
+		return true;
+
+	if (TimestampDifferenceExceeds(started_at, GetCurrentTimestamp(),
+								   CLUSTER_BACKUP_RESTORE_POINT_DRAIN_TIMEOUT_MS)) {
+		cluster_backup_restore_point_fence_end();
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_RESTORE_POINT_DRAIN_TIMEOUT),
+						errmsg("timed out waiting for cluster restore-point commit drain"),
+						errdetail("Pending commits did not drain within %d ms.",
+								  CLUSTER_BACKUP_RESTORE_POINT_DRAIN_TIMEOUT_MS)));
+	}
+
+	return false;
+}
+
+static void
+cluster_backup_restore_point_fence_begin(void)
+{
+	TimestampTz started_at;
+
+	started_at = cluster_backup_restore_point_fence_start();
+	for (;;) {
+		if (cluster_backup_restore_point_fence_drain_done(started_at))
+			return;
 
 		CHECK_FOR_INTERRUPTS();
 		pg_usleep(1000L);
@@ -1388,19 +1535,20 @@ cluster_backup_restore_point_fence_held(void)
 		   && pg_atomic_read_u32(&cluster_backup_state->commit_fence_active) != 0;
 }
 
-static ClusterBackupWireAck
-cluster_backup_lmon_execute_request(const ClusterBackupWireRequest *request)
+static bool
+cluster_backup_lmon_execute_request(const ClusterBackupWireRequest *request,
+									ClusterBackupWireAck *ack)
 {
-	ClusterBackupWireAck ack;
 	ClusterBackupWireResult result = CLUSTER_BACKUP_WIRE_RESULT_EXECUTOR_ERROR;
+	bool have_reply = true;
 
-	cluster_backup_init_wire_ack(&ack, request, result);
+	cluster_backup_init_wire_ack(ack, request, result);
 
 	if (request == NULL || !cluster_backup_wire_request_valid(request)
 		|| request->coordinator_node_id < 0 || request->coordinator_node_id >= CLUSTER_MAX_NODES) {
-		ack.result = CLUSTER_BACKUP_WIRE_RESULT_BAD_REQUEST;
-		cluster_backup_wire_ack_compute_crc(&ack);
-		return ack;
+		ack->result = CLUSTER_BACKUP_WIRE_RESULT_BAD_REQUEST;
+		cluster_backup_wire_ack_compute_crc(ack);
+		return true;
 	}
 
 	PG_TRY();
@@ -1421,9 +1569,9 @@ cluster_backup_lmon_execute_request(const ClusterBackupWireRequest *request)
 								   cluster_backup_lmon_state, cluster_backup_lmon_tablespace_map);
 				cluster_backup_durable_pin_publish(cluster_backup_lmon_state->startpoint,
 												   request->backup_id);
-				ack.start_redo_lsn = cluster_backup_lmon_state->startpoint;
-				ack.checkpoint_lsn = cluster_backup_lmon_state->checkpointloc;
-				ack.timeline = cluster_backup_lmon_state->starttli;
+				ack->start_redo_lsn = cluster_backup_lmon_state->startpoint;
+				ack->checkpoint_lsn = cluster_backup_lmon_state->checkpointloc;
+				ack->timeline = cluster_backup_lmon_state->starttli;
 				result = CLUSTER_BACKUP_WIRE_RESULT_OK;
 			}
 			break;
@@ -1439,15 +1587,15 @@ cluster_backup_lmon_execute_request(const ClusterBackupWireRequest *request)
 					cluster_backup_capture_backup_set(request->backup_set_path, false);
 				if (cluster_backup_lmon_restore_point_held)
 					cluster_backup_lmon_release_restore_point(request->requested_scn);
-				ack.start_redo_lsn = cluster_backup_lmon_state->startpoint;
-				ack.checkpoint_lsn = cluster_backup_lmon_state->checkpointloc;
-				ack.timeline = cluster_backup_lmon_state->stoptli;
+				ack->start_redo_lsn = cluster_backup_lmon_state->startpoint;
+				ack->checkpoint_lsn = cluster_backup_lmon_state->checkpointloc;
+				ack->timeline = cluster_backup_lmon_state->stoptli;
 				if (cluster_backup_lmon_last_restore_point.present) {
-					ack.cut_scn = cluster_backup_lmon_last_restore_point.cut_scn;
-					ack.stop_cut_lsn = cluster_backup_lmon_state->stoppoint;
+					ack->cut_scn = cluster_backup_lmon_last_restore_point.cut_scn;
+					ack->stop_cut_lsn = cluster_backup_lmon_state->stoppoint;
 				} else {
-					ack.cut_scn = request->requested_scn;
-					ack.stop_cut_lsn = cluster_backup_lmon_state->stoppoint;
+					ack->cut_scn = request->requested_scn;
+					ack->stop_cut_lsn = cluster_backup_lmon_state->stoppoint;
 				}
 				cluster_backup_durable_pin_clear();
 				cluster_backup_lmon_reset_context();
@@ -1456,6 +1604,8 @@ cluster_backup_lmon_execute_request(const ClusterBackupWireRequest *request)
 			break;
 
 		case CLUSTER_BACKUP_WIRE_OP_ABORT:
+			if (cluster_backup_lmon_restore_point_prepare_pending)
+				cluster_backup_lmon_reset_context();
 			if (cluster_backup_lmon_restore_point_held) {
 				cluster_backup_restore_point_fence_end();
 				cluster_backup_lmon_restore_point_held = false;
@@ -1480,57 +1630,33 @@ cluster_backup_lmon_execute_request(const ClusterBackupWireRequest *request)
 
 				cluster_backup_make_restore_point(request->restore_point_name, &point);
 				cluster_backup_store_restore_point(&point);
-				thread_index = (int)ack.thread_id - 1;
-				ack.cut_scn = point.cut_scn;
+				thread_index = (int)ack->thread_id - 1;
+				ack->cut_scn = point.cut_scn;
 				if (thread_index >= 0 && thread_index < CLUSTER_MAX_NODES)
-					ack.stop_cut_lsn = point.cut_lsn[thread_index];
-				ack.timeline = GetWALInsertionTimeLine();
+					ack->stop_cut_lsn = point.cut_lsn[thread_index];
+				ack->timeline = GetWALInsertionTimeLine();
 				result = CLUSTER_BACKUP_WIRE_RESULT_OK;
 			}
 			break;
 
 		case CLUSTER_BACKUP_WIRE_OP_RESTORE_POINT_PREPARE:
-			if (request->restore_point_name[0] == '\0')
-				result = CLUSTER_BACKUP_WIRE_RESULT_BAD_REQUEST;
-			else if (cluster_backup_lmon_restore_point_held)
-				result = CLUSTER_BACKUP_WIRE_RESULT_BUSY;
-			else {
-				int thread_index;
-
-				if (request->backup_set_path[0] != '\0')
-					cluster_backup_capture_backup_set(request->backup_set_path, false);
-				PG_TRY();
-				{
-					cluster_backup_prepare_restore_point(request->restore_point_name,
-														 &cluster_backup_lmon_restore_point);
-					cluster_backup_lmon_restore_point_held = true;
-				}
-				PG_CATCH();
-				{
-					cluster_backup_restore_point_fence_end();
-					PG_RE_THROW();
-				}
-				PG_END_TRY();
-				thread_index = (int)ack.thread_id - 1;
-				ack.cut_scn = cluster_backup_lmon_restore_point.cut_scn;
-				if (thread_index >= 0 && thread_index < CLUSTER_MAX_NODES)
-					ack.stop_cut_lsn = cluster_backup_lmon_restore_point.cut_lsn[thread_index];
-				ack.timeline = GetWALInsertionTimeLine();
+			have_reply = cluster_backup_lmon_start_restore_point_prepare(request, ack);
+			if (!have_reply)
 				result = CLUSTER_BACKUP_WIRE_RESULT_OK;
-			}
 			break;
 
 		case CLUSTER_BACKUP_WIRE_OP_RESTORE_POINT_RELEASE:
 			cluster_backup_lmon_release_restore_point(request->requested_scn);
 			if (cluster_backup_lmon_last_restore_point.present) {
-				int thread_index = (int)ack.thread_id - 1;
+				int thread_index = (int)ack->thread_id - 1;
 
-				ack.cut_scn = cluster_backup_lmon_last_restore_point.cut_scn;
+				ack->cut_scn = cluster_backup_lmon_last_restore_point.cut_scn;
 				if (thread_index >= 0 && thread_index < CLUSTER_MAX_NODES)
-					ack.stop_cut_lsn = cluster_backup_lmon_last_restore_point.cut_lsn[thread_index];
+					ack->stop_cut_lsn
+						= cluster_backup_lmon_last_restore_point.cut_lsn[thread_index];
 			} else
-				ack.cut_scn = request->requested_scn;
-			ack.timeline = GetWALInsertionTimeLine();
+				ack->cut_scn = request->requested_scn;
+			ack->timeline = GetWALInsertionTimeLine();
 			result = CLUSTER_BACKUP_WIRE_RESULT_OK;
 			break;
 
@@ -1554,9 +1680,12 @@ cluster_backup_lmon_execute_request(const ClusterBackupWireRequest *request)
 	}
 	PG_END_TRY();
 
-	ack.result = (uint16)result;
-	cluster_backup_wire_ack_compute_crc(&ack);
-	return ack;
+	if (!have_reply)
+		return false;
+
+	ack->result = (uint16)result;
+	cluster_backup_wire_ack_compute_crc(ack);
+	return true;
 }
 
 static void
@@ -1576,7 +1705,10 @@ cluster_backup_request_handler(const ClusterICEnvelope *env, const void *payload
 		return;
 
 	LWLockAcquire(&cluster_backup_state->lock.lock, LW_EXCLUSIVE);
-	if (!cluster_backup_state->peer_command_pending && !cluster_backup_state->peer_reply_pending) {
+	if (!cluster_backup_state->peer_command_pending
+		&& ((ClusterBackupWireOp)request->op == CLUSTER_BACKUP_WIRE_OP_ABORT
+			|| (!cluster_backup_state->peer_reply_pending
+				&& !cluster_backup_state->peer_restore_point_prepare_pending))) {
 		cluster_backup_state->peer_command = *request;
 		cluster_backup_state->peer_command_pending = true;
 	}
@@ -1746,6 +1878,7 @@ cluster_backup_lmon_process_peer_command(void)
 	ClusterBackupWireRequest request;
 	ClusterBackupWireAck reply;
 	bool have_command;
+	bool have_reply;
 
 	LWLockAcquire(&cluster_backup_state->lock.lock, LW_EXCLUSIVE);
 	have_command = cluster_backup_state->peer_command_pending;
@@ -1756,13 +1889,9 @@ cluster_backup_lmon_process_peer_command(void)
 	if (!have_command)
 		return;
 
-	reply = cluster_backup_lmon_execute_request(&request);
-
-	LWLockAcquire(&cluster_backup_state->lock.lock, LW_EXCLUSIVE);
-	cluster_backup_state->peer_reply = reply;
-	cluster_backup_state->peer_reply_dest = request.coordinator_node_id;
-	cluster_backup_state->peer_reply_pending = true;
-	LWLockRelease(&cluster_backup_state->lock.lock);
+	have_reply = cluster_backup_lmon_execute_request(&request, &reply);
+	if (have_reply)
+		cluster_backup_lmon_queue_peer_reply(&reply, request.coordinator_node_id);
 }
 
 void
@@ -1773,7 +1902,9 @@ cluster_backup_lmon_tick(void)
 
 	cluster_backup_lmon_send_peer_reply();
 	cluster_backup_lmon_send_coord_request();
+	cluster_backup_lmon_advance_restore_point_prepare();
 	cluster_backup_lmon_process_peer_command();
+	cluster_backup_lmon_advance_restore_point_prepare();
 	cluster_backup_lmon_send_peer_reply();
 	cluster_backup_maybe_auto_restore_point();
 }
@@ -1837,7 +1968,7 @@ cluster_backup_store_restore_point(const ClusterRestorePoint *point)
 }
 
 static void
-cluster_backup_prepare_restore_point(const char *name, ClusterRestorePoint *point)
+cluster_backup_finish_restore_point_after_fence(const char *name, ClusterRestorePoint *point)
 {
 	SCN thread_scn[CLUSTER_MAX_NODES];
 	XLogRecPtr thread_lsn[CLUSTER_MAX_NODES];
@@ -1852,7 +1983,6 @@ cluster_backup_prepare_restore_point(const char *name, ClusterRestorePoint *poin
 	MemSet(thread_scn, 0, sizeof(thread_scn));
 	MemSet(thread_lsn, 0, sizeof(thread_lsn));
 
-	cluster_backup_restore_point_fence_begin();
 	cut_scn = cluster_scn_current();
 	if (!SCN_VALID(cut_scn))
 		cut_scn = cluster_scn_advance();
@@ -1877,6 +2007,13 @@ cluster_backup_prepare_restore_point(const char *name, ClusterRestorePoint *poin
 						errmsg("could not build cluster restore point cut"),
 						errdetail("Reason: %s.", cluster_restore_point_cut_reason_name(reason))));
 	point->created_at = GetCurrentTimestamp();
+}
+
+static void
+cluster_backup_prepare_restore_point(const char *name, ClusterRestorePoint *point)
+{
+	cluster_backup_restore_point_fence_begin();
+	cluster_backup_finish_restore_point_after_fence(name, point);
 }
 
 static void

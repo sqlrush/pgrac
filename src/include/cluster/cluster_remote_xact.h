@@ -90,14 +90,40 @@ cluster_remote_xact_entryno(TransactionId xid)
  * cluster_remote_xact_commit_blocked -- P1-1 pure predicate: a foreign commit
  * record may materialize ONLY as a pure outcome.  Any cross-instance side
  * effect (relfile drop / invalidation / stats drop / subxacts / 2PC / AE
- * locks) makes it unmergeable -> the caller fails closed (53RA3).
+ * locks) makes it unmergeable -> the caller fails closed (53RA3).  The paired
+ * prepared-commit predicate admits the expected XACT_XINFO_HAS_TWOPHASE and
+ * XACT_XINFO_HAS_AE_LOCKS bits: prepared-xact lock release is not durable state
+ * to materialize after PITR; relfile/inval/stats/subxact side effects still
+ * fail closed.
  */
+static inline bool
+cluster_remote_xact_commit_common_blocked(int nrels, int nmsgs, int nstats, int nsubxacts,
+										  uint32 xinfo, uint32 twophase_bit, uint32 ae_locks_bit,
+										  bool allow_twophase)
+{
+	uint32 disallowed_xinfo = ae_locks_bit;
+
+	if (!allow_twophase)
+		disallowed_xinfo |= twophase_bit;
+	return nrels > 0 || nmsgs > 0 || nstats > 0 || nsubxacts > 0 || (xinfo & disallowed_xinfo) != 0;
+}
+
 static inline bool
 cluster_remote_xact_commit_blocked(int nrels, int nmsgs, int nstats, int nsubxacts, uint32 xinfo,
 								   uint32 twophase_bit, uint32 ae_locks_bit)
 {
-	return nrels > 0 || nmsgs > 0 || nstats > 0 || nsubxacts > 0
-		   || (xinfo & (twophase_bit | ae_locks_bit)) != 0;
+	return cluster_remote_xact_commit_common_blocked(nrels, nmsgs, nstats, nsubxacts, xinfo,
+													 twophase_bit, ae_locks_bit, false);
+}
+
+static inline bool
+cluster_remote_xact_commit_prepared_blocked(int nrels, int nmsgs, int nstats, int nsubxacts,
+											uint32 xinfo, uint32 twophase_bit, uint32 ae_locks_bit)
+{
+	(void)xinfo;
+	(void)twophase_bit;
+	(void)ae_locks_bit;
+	return nrels > 0 || nmsgs > 0 || nstats > 0 || nsubxacts > 0;
 }
 
 /*

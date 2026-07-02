@@ -6,7 +6,14 @@
  * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 2026, pgrac contributors
  *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
+ * IDENTIFICATION
  * src/bin/scripts/pg_cluster_basebackup.c
+ *
+ * NOTES
+ *	  Frontend entrypoint for the spec-6.5 cluster backup success path.  It
+ *	  drives the SQL API and does not bypass server-side proof checks.
  *
  *-------------------------------------------------------------------------
  */

@@ -381,6 +381,53 @@ cluster_remote_xact_flush(void)
 	SimpleLruWriteAll(ClusterRemoteXactCtl, true);
 }
 
+static bool
+cluster_remote_xact_commit_wrap_proof(int origin_node, TransactionId xid,
+									  const xl_xact_parsed_commit *parsed, int blocked_elevel,
+									  bool require_wrap, uint16 *out_wrap)
+{
+	SCN durable_scn = InvalidScn;
+	uint16 durable_wrap = 0;
+	uint16 durable_seg = 0;
+	uint16 durable_slot = 0;
+	ClusterTTDurableResolve resolve;
+
+	if (out_wrap != NULL)
+		*out_wrap = 0;
+
+	if (parsed->has_tt_commit) {
+		cluster_tt_durable_redo_stamp_slot(parsed->tt_commit.instance, parsed->tt_commit.segment_id,
+										   parsed->tt_commit.slot_offset, parsed->tt_commit.wrap,
+										   parsed->tt_commit.xid, parsed->tt_commit.commit_scn);
+		if (out_wrap != NULL)
+			*out_wrap = parsed->tt_commit.wrap;
+		return true;
+	}
+
+	resolve = cluster_tt_slot_durable_resolve_by_xid_origin(origin_node, xid, CLUSTER_TT_WRAP_ANY,
+															&durable_scn, &durable_seg,
+															&durable_slot, &durable_wrap);
+	if (resolve == CLUSTER_TT_DURABLE_RESOLVED_SCN && durable_scn == parsed->scn) {
+		if (out_wrap != NULL)
+			*out_wrap = durable_wrap;
+		return true;
+	}
+
+	if (require_wrap)
+		ereport(blocked_elevel,
+				(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+				 errmsg("merged recovery: foreign prepared commit lacks durable TT proof "
+						"(origin node %d, xid %u)",
+						origin_node, xid),
+				 errdetail("durable_resolve=%d durable_scn=%llu commit_scn=%llu.", (int)resolve,
+						   (unsigned long long)durable_scn, (unsigned long long)parsed->scn),
+				 errhint("A foreign COMMIT PREPARED is mergeable only when the peer's "
+						 "standalone durable-TT commit record was replayed before the "
+						 "prepared-commit record.")));
+
+	return false;
+}
+
 /*
  * cluster_remote_xact_apply -- D10b divert (P1-1 fail-closed parse).
  *
@@ -430,13 +477,14 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 	Assert(rmid == RM_XACT_ID);
 
 	/*
-	 * Only a commit/abort keyed by a NORMAL xid materializes a per-origin
-	 * outcome.  A foreign XACT record with a non-normal xl_xid (e.g. a
-	 * standalone invalidations/assignment sub-record, or a commit whose
-	 * real xid lives in the parsed body) carries nothing to key the store
-	 * by -- consume it rather than open an SLRU page for xid 0.
+	 * Only records keyed by a NORMAL xid materialize a per-origin outcome.
+	 * COMMIT/ABORT PREPARED carry that xid in the parsed body, so they must
+	 * bypass this raw-xl_xid guard and validate their parsed twophase_xid.
+	 * Standalone invalidations/assignment sub-records carry nothing to key the
+	 * store by -- consume them rather than open an SLRU page for xid 0.
 	 */
-	if (!TransactionIdIsNormal(xid)) {
+	if (!TransactionIdIsNormal(xid) && info != XLOG_XACT_COMMIT_PREPARED
+		&& info != XLOG_XACT_ABORT_PREPARED) {
 		elog(DEBUG1,
 			 "cluster_remote_xact_apply: consumed foreign XACT info 0x%02x with non-normal xid %u "
 			 "(origin %d)",
@@ -448,6 +496,8 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 	case XLOG_XACT_COMMIT: {
 		xl_xact_commit *xlrec = (xl_xact_commit *)XLogRecGetData(record);
 		xl_xact_parsed_commit parsed;
+		uint16 commit_wrap = 0;
+		bool commit_wrap_valid;
 
 		ParseCommitRecord(XLogRecGetInfo(record), xlrec, &parsed);
 
@@ -498,13 +548,58 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 		 *	   readers' commit_scn cross-check (G5) reads.
 		 */
 		cluster_scn_recovery_replay_observe(parsed.scn);
+		commit_wrap_valid = cluster_remote_xact_commit_wrap_proof(
+			origin_node, xid, &parsed, blocked_elevel, false, &commit_wrap);
 		cluster_remote_xact_set(origin_node, xid, CLUSTER_REMOTE_XACT_COMMITTED, parsed.scn,
-								parsed.has_tt_commit, parsed.tt_commit.wrap);
-		if (parsed.has_tt_commit)
-			cluster_tt_durable_redo_stamp_slot(parsed.tt_commit.instance,
-											   parsed.tt_commit.segment_id,
-											   parsed.tt_commit.slot_offset, parsed.tt_commit.wrap,
-											   parsed.tt_commit.xid, parsed.tt_commit.commit_scn);
+								commit_wrap_valid, commit_wrap);
+		pg_atomic_fetch_add_u64(&RemoteXactShared->diverted_commit_count, 1);
+		break;
+	}
+	case XLOG_XACT_COMMIT_PREPARED: {
+		xl_xact_commit *xlrec = (xl_xact_commit *)XLogRecGetData(record);
+		xl_xact_parsed_commit parsed;
+		uint16 commit_wrap = 0;
+		bool commit_wrap_valid;
+
+		ParseCommitRecord(XLogRecGetInfo(record), xlrec, &parsed);
+		xid = parsed.twophase_xid;
+		if (!TransactionIdIsNormal(xid) || (parsed.xinfo & XACT_XINFO_HAS_TWOPHASE) == 0)
+			ereport(blocked_elevel, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+									 errmsg("merged recovery: malformed foreign prepared commit "
+											"(origin node %d, xid %u)",
+											origin_node, xid),
+									 errhint("The prepared transaction xid must be present in the "
+											 "COMMIT PREPARED record body.")));
+
+		if (cluster_remote_xact_commit_prepared_blocked(
+				parsed.nrels, parsed.nmsgs, parsed.nstats, parsed.nsubxacts, parsed.xinfo,
+				XACT_XINFO_HAS_TWOPHASE, XACT_XINFO_HAS_AE_LOCKS))
+			ereport(
+				blocked_elevel,
+				(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+				 errmsg("merged recovery: foreign prepared commit carries an unsupported "
+						"side effect (origin node %d, xid %u)",
+						origin_node, xid),
+				 errdetail("nrels=%d nmsgs=%d nstats=%d nsubxacts=%d xinfo=0x%x.", parsed.nrels,
+						   parsed.nmsgs, parsed.nstats, parsed.nsubxacts, (unsigned)parsed.xinfo),
+				 errhint("Cross-instance relfile drop / invalidation / stats / subxacts "
+						 "are not yet mergeable; recover with "
+						 "cluster.merged_recovery=off.")));
+
+		if (!SCN_VALID(parsed.scn))
+			ereport(blocked_elevel,
+					(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+					 errmsg("merged recovery: foreign prepared commit carries no SCN "
+							"(origin node %d, xid %u)",
+							origin_node, xid),
+					 errhint("spec-1.18 stamps every prepared commit record; a missing SCN "
+							 "means a pre-cluster WAL stream, which cannot be merged.")));
+
+		cluster_scn_recovery_replay_observe(parsed.scn);
+		commit_wrap_valid = cluster_remote_xact_commit_wrap_proof(
+			origin_node, xid, &parsed, blocked_elevel, true, &commit_wrap);
+		cluster_remote_xact_set(origin_node, xid, CLUSTER_REMOTE_XACT_COMMITTED, parsed.scn,
+								commit_wrap_valid, commit_wrap);
 		pg_atomic_fetch_add_u64(&RemoteXactShared->diverted_commit_count, 1);
 		break;
 	}
@@ -529,19 +624,83 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 		pg_atomic_fetch_add_u64(&RemoteXactShared->diverted_abort_count, 1);
 		break;
 	}
+	case XLOG_XACT_ABORT_PREPARED: {
+		xl_xact_abort *xlrec = (xl_xact_abort *)XLogRecGetData(record);
+		xl_xact_parsed_abort parsed;
+
+		ParseAbortRecord(XLogRecGetInfo(record), xlrec, &parsed);
+		xid = parsed.twophase_xid;
+		if (!TransactionIdIsNormal(xid) || (parsed.xinfo & XACT_XINFO_HAS_TWOPHASE) == 0)
+			ereport(blocked_elevel, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+									 errmsg("merged recovery: malformed foreign prepared abort "
+											"(origin node %d, xid %u)",
+											origin_node, xid),
+									 errhint("The prepared transaction xid must be present in the "
+											 "ABORT PREPARED record body.")));
+		if (parsed.nrels > 0 || parsed.nstats > 0 || parsed.nsubxacts > 0)
+			ereport(blocked_elevel,
+					(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+					 errmsg("merged recovery: foreign prepared abort carries an unsupported "
+							"side effect (origin node %d, xid %u)",
+							origin_node, xid),
+					 errhint("Recover with cluster.merged_recovery=off.")));
+
+		cluster_scn_recovery_replay_observe(parsed.scn);
+		cluster_remote_xact_set(origin_node, xid, CLUSTER_REMOTE_XACT_ABORTED, InvalidScn, false,
+								0);
+		pg_atomic_fetch_add_u64(&RemoteXactShared->diverted_abort_count, 1);
+		break;
+	}
+	case XLOG_XACT_PREPARE: {
+		xl_xact_prepare *xlrec = (xl_xact_prepare *)XLogRecGetData(record);
+		xl_xact_parsed_prepare parsed;
+
+		ParsePrepareRecord(XLogRecGetInfo(record), xlrec, &parsed);
+		xid = parsed.twophase_xid;
+		if (!TransactionIdIsNormal(xid))
+			ereport(blocked_elevel, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+									 errmsg("merged recovery: malformed foreign prepare "
+											"(origin node %d, xid %u)",
+											origin_node, xid)));
+		if (parsed.nsubxacts > 0 || parsed.nrels > 0 || parsed.nabortrels > 0 || parsed.nstats > 0
+			|| parsed.nabortstats > 0 || parsed.nmsgs > 0 || xlrec->initfileinval)
+			ereport(blocked_elevel,
+					(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+					 errmsg("merged recovery: foreign prepare carries an unsupported "
+							"side effect (origin node %d, xid %u)",
+							origin_node, xid),
+					 errdetail("nsubxacts=%d ncommitrels=%d nabortrels=%d ncommitstats=%d "
+							   "nabortstats=%d ninvalmsgs=%d initfileinval=%s.",
+							   parsed.nsubxacts, parsed.nrels, parsed.nabortrels, parsed.nstats,
+							   parsed.nabortstats, parsed.nmsgs,
+							   xlrec->initfileinval ? "true" : "false"),
+					 errhint("Foreign prepared transactions are not exposed as local prepared "
+							 "transactions; only pure row-DML prepares can be materialized "
+							 "as non-visible before their COMMIT PREPARED record.")));
+
+		/*
+		 * Never call PrepareRedoAdd for a foreign stream: that would expose a
+		 * peer's prepared xact in this node's local pg_prepared_xacts namespace
+		 * and alias raw xids.  Until a matching foreign COMMIT PREPARED is
+		 * replayed before the PITR cut, the row versions remain non-visible in
+		 * this restored incarnation.
+		 */
+		cluster_remote_xact_set(origin_node, xid, CLUSTER_REMOTE_XACT_ABORTED, InvalidScn, false,
+								0);
+		break;
+	}
 	default:
 		/*
-		 * COMMIT_PREPARED / ABORT_PREPARED / PREPARE / ASSIGNMENT /
-		 * INVALIDATIONS: all carry cross-instance machinery this store
-		 * cannot honestly absorb yet.
+		 * ASSIGNMENT / INVALIDATIONS with normal xl_xid: all carry cross-instance
+		 * machinery this store cannot honestly absorb yet.
 		 */
 		ereport(blocked_elevel,
 				(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
 				 errmsg("merged recovery: unsupported foreign xact record (info 0x%02x, "
 						"origin node %d, xid %u)",
 						(unsigned)info, origin_node, xid),
-				 errhint("2PC / assignment / standalone-invalidation records are not yet "
-						 "mergeable; recover with cluster.merged_recovery=off.")));
+				 errhint("Assignment / standalone-invalidation records are not yet mergeable; "
+						 "recover with cluster.merged_recovery=off.")));
 	}
 }
 

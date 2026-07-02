@@ -2683,21 +2683,23 @@ cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start,
 	 * backends can read them after recovery finishes. */
 	cluster_remote_xact_flush();
 
-	/* §3.3c: record how far each candidate was replayed.  The registry
-	 * bound feeds the candidate's own-bound skip (it clears it on reaching
-	 * RUNNING); this node's READER authority over the materialized copy is
-	 * the node-local marker, with its own lifecycle (G6). */
-	if (!restore_mode)
-	{
-		for (t = 1; t <= CLUSTER_WAL_STATE_SLOT_COUNT; t++) {
-			if (t == own_thread)
-				continue;
-			if ((bitmap[(t - 1) / 64] & ((uint64)1 << ((t - 1) % 64))) == 0)
-				continue;
+	/*
+	 * §3.3c: record how far each candidate was replayed.  The live-crash
+	 * registry bound feeds the candidate's own-bound skip (it clears it on
+	 * reaching RUNNING), so restore-mode must not publish it.  The node-local
+	 * reader-authority marker is different: it proves THIS restored pgdata
+	 * materialized the peer's undo + outcome store, so restore-mode needs it
+	 * just like crash merged recovery or post-open reads fail closed.
+	 */
+	for (t = 1; t <= CLUSTER_WAL_STATE_SLOT_COUNT; t++) {
+		if (t == own_thread)
+			continue;
+		if ((bitmap[(t - 1) / 64] & ((uint64)1 << ((t - 1) % 64))) == 0)
+			continue;
+		if (!restore_mode)
 			cluster_wal_state_publish_merge_recovered(t, max_recovered[t]);
-			if (max_recovered[t] > 0)
-				cluster_merged_authority_publish((int)t - 1, max_recovered[t]);
-		}
+		if (max_recovered[t] > 0)
+			cluster_merged_authority_publish((int)t - 1, max_recovered[t]);
 	}
 	ereport(LOG, (errmsg("cluster %srecovery: replay complete (own thread %u)",
 						 restore_mode ? "backup restore " : "merged ",

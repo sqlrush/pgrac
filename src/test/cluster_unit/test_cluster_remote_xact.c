@@ -56,8 +56,8 @@ UT_DEFINE_GLOBALS();
 
 /* Mirror the production xact.h bit values used by the predicate (kept local
  * so the test does not pull access/xact.h's heavy include chain). */
-#define UT_XACT_XINFO_HAS_TWOPHASE 0x02
-#define UT_XACT_XINFO_HAS_AE_LOCKS 0x10
+#define UT_XACT_XINFO_HAS_TWOPHASE 0x10
+#define UT_XACT_XINFO_HAS_AE_LOCKS 0x40
 
 
 /* ============================================================
@@ -144,6 +144,22 @@ UT_TEST(test_remote_xact_side_effects_blocked)
 												 UT_XACT_XINFO_HAS_AE_LOCKS)); /* AE locks */
 }
 
+UT_TEST(test_remote_xact_prepared_commit_allows_2pc_lock_bits)
+{
+	/* COMMIT PREPARED must carry the 2PC bit, but that bit alone is not a
+	 * side effect; the prepared outcome is keyed by the parsed twophase_xid.
+	 * Access-exclusive lock release is likewise not durable state after PITR. */
+	UT_ASSERT(!cluster_remote_xact_commit_prepared_blocked(0, 0, 0, 0, UT_XACT_XINFO_HAS_TWOPHASE,
+														   UT_XACT_XINFO_HAS_TWOPHASE,
+														   UT_XACT_XINFO_HAS_AE_LOCKS));
+	UT_ASSERT(!cluster_remote_xact_commit_prepared_blocked(
+		0, 0, 0, 0, UT_XACT_XINFO_HAS_TWOPHASE | UT_XACT_XINFO_HAS_AE_LOCKS,
+		UT_XACT_XINFO_HAS_TWOPHASE, UT_XACT_XINFO_HAS_AE_LOCKS));
+	UT_ASSERT(cluster_remote_xact_commit_prepared_blocked(1, 0, 0, 0, UT_XACT_XINFO_HAS_TWOPHASE,
+														  UT_XACT_XINFO_HAS_TWOPHASE,
+														  UT_XACT_XINFO_HAS_AE_LOCKS));
+}
+
 UT_TEST(test_remote_xact_unrelated_xinfo_not_blocked)
 {
 	/* An xinfo bit OUTSIDE the {2PC, AE locks} mask does not block. */
@@ -226,6 +242,7 @@ main(void)
 	UT_RUN(test_remote_xact_origin_no_cross_partition_overlap);
 	UT_RUN(test_remote_xact_pure_outcome_allowed);
 	UT_RUN(test_remote_xact_side_effects_blocked);
+	UT_RUN(test_remote_xact_prepared_commit_allows_2pc_lock_bits);
 	UT_RUN(test_remote_xact_unrelated_xinfo_not_blocked);
 	UT_RUN(test_remote_xact_indoubt_is_zero);
 
