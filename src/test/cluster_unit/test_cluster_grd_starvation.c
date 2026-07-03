@@ -57,8 +57,9 @@
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_gcs.h"	   /* spec-4.7 D2 (L238) — cluster_gcs_lookup_master proto */
 #include "cluster/cluster_gcs_block.h" /* spec-4.7 D2 (L238) — block re-declare scan/send protos */
-#include "cluster/cluster_ges_mode.h"  /* spec-5.1b — frozen matrix + convert classification */
-#include "access/transam.h"			   /* spec-5.8 D1c — InvalidTransactionId */
+#include "cluster/cluster_ges_handoff.h" /* spec-6.12e1 — verifier stub types */
+#include "cluster/cluster_ges_mode.h"	 /* spec-5.1b — frozen matrix + convert classification */
+#include "access/transam.h"				 /* spec-5.8 D1c — InvalidTransactionId */
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_lmd.h"			 /* spec-5.8 D1b — WFG vertex + submit/cancel edge */
 #include "cluster/cluster_reconfig.h"		 /* spec-4.6 D1 — ReconfigEvent stub type */
@@ -833,6 +834,24 @@ set_mock_declared(int count, const int32 *nodes)
 
 /* spec-5.10 D7 GUC stubs (defined in cluster_guc.c in the backend build). */
 int cluster_ges_starvation_max_skips = 8;
+
+/* spec-6.12e1 — handoff-verifier stubs (cluster_grd.o's release_and_drain
+ * references them).  Both arming GUCs stay false here, so the snapshot
+ * branch never fires and the two functions are never reached; the real
+ * verifier is exercised by test_cluster_ges_handoff. */
+bool cluster_ges_handoff = false;
+bool cluster_xnode_profile_enabled = false;
+ClusterGesHandoffVerdict
+cluster_ges_handoff_verify(const ClusterGesHandoffSnapshot *snap pg_attribute_unused())
+{
+	abort();
+}
+void
+cluster_ges_handoff_note_drain(int n_granted pg_attribute_unused(),
+							   ClusterGesHandoffVerdict verdict pg_attribute_unused())
+{
+	abort();
+}
 
 
 /* ============================================================
