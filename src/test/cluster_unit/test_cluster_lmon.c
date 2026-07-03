@@ -682,6 +682,12 @@ cluster_ges_lmon_drain_work_queue(void)
 	return 0;
 }
 
+/* spec-6.12b — LmonMain ships finished CR-server results each tick; stub it
+ * (no LMS / no IC in the lmon unit harness). */
+void
+cluster_lms_cr_ship_ready(void)
+{}
+
 /* spec-5.16 — LmonMain sweeps abandoned reply-wait tombstones each tick; stub it
  * (real impl in cluster_ges_reply_wait.o, not linked into this standalone test). */
 int

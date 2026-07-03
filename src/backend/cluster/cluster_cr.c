@@ -67,6 +67,7 @@
 #include "cluster/cluster_undo_retention.h"		/* spec-3.22: retention horizon proof */
 #include "cluster/cluster_visibility_resolve.h" /* spec-3.21: cluster_vis_cr_xmax_verdict */
 #include "cluster/cluster_uba.h"
+#include "cluster/cluster_cr_server.h" /* spec-6.12b CR-server data plane */
 #include "cluster/cluster_undo_record.h"
 #include "cluster/cluster_undo_record_api.h"
 #include "cluster/cluster_xnode_profile.h" /* spec-5.59 D3: profiling probes */
@@ -106,6 +107,20 @@ typedef struct ClusterCRShared {
 	pg_atomic_uint64 cr_xmax_recycled_invisible_count;
 	pg_atomic_uint64 cr_xmax_invalid_or_ambiguous_count;
 	pg_atomic_uint64 cr_xmax_scan_unavail_or_no_proof_count;
+	/*
+	 * spec-6.12b: CR-server data plane (6 counters).  requester side: how the
+	 * remote fetch resolved (full page / partial + local continue / failed ->
+	 * unchanged 53R9G).  server side (bumped in the LMS construction and the
+	 * LMON submit path): requests parked, results shipped full/partial, and
+	 * refusals (GUC off, no free slot, block not resident, interleaved homes,
+	 * construction error -> all fail-closed to the requester).
+	 */
+	pg_atomic_uint64 cr_remote_full_count;
+	pg_atomic_uint64 cr_remote_partial_count;
+	pg_atomic_uint64 cr_remote_failed_count;
+	pg_atomic_uint64 cr_server_full_count;
+	pg_atomic_uint64 cr_server_partial_count;
+	pg_atomic_uint64 cr_server_denied_count;
 } ClusterCRShared;
 
 static ClusterCRShared *CRShared = NULL;
@@ -166,6 +181,12 @@ cluster_cr_shmem_init(void)
 		pg_atomic_init_u64(&CRShared->cr_cache_miss_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_cache_evict_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_cache_install_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_remote_full_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_remote_partial_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_remote_failed_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_server_full_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_server_partial_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_server_denied_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_resolved_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_recycled_invisible_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_invalid_or_ambiguous_count, 0);
@@ -205,6 +226,25 @@ CR_COUNTER_ACCESSOR(cluster_cr_construct_count, cr_construct_count)
 CR_COUNTER_ACCESSOR(cluster_cr_snapshot_too_old_count, cr_snapshot_too_old_count)
 CR_COUNTER_ACCESSOR(cluster_cr_cross_instance_unsupported_count,
 					cr_cross_instance_unsupported_count)
+
+/* PGRAC: spec-6.12b — CR-server side counter bump (LMS/LMON contexts). */
+void
+cluster_cr_server_stat_bump(ClusterCrServerStat which)
+{
+	if (CRShared == NULL)
+		return;
+	switch (which) {
+	case CLUSTER_CR_SERVER_STAT_FULL:
+		pg_atomic_fetch_add_u64(&CRShared->cr_server_full_count, 1);
+		break;
+	case CLUSTER_CR_SERVER_STAT_PARTIAL:
+		pg_atomic_fetch_add_u64(&CRShared->cr_server_partial_count, 1);
+		break;
+	case CLUSTER_CR_SERVER_STAT_DENIED:
+		pg_atomic_fetch_add_u64(&CRShared->cr_server_denied_count, 1);
+		break;
+	}
+}
 CR_COUNTER_ACCESSOR(cluster_cr_corruption_count, cr_corruption_count)
 CR_COUNTER_ACCESSOR(cluster_cr_chain_walk_steps_sum, cr_chain_walk_steps_sum)
 CR_COUNTER_ACCESSOR(cluster_cr_inverse_insert_count, cr_inverse_insert_count)
@@ -215,6 +255,14 @@ CR_COUNTER_ACCESSOR(cluster_cr_cache_hit_count, cr_cache_hit_count)
 CR_COUNTER_ACCESSOR(cluster_cr_cache_miss_count, cr_cache_miss_count)
 CR_COUNTER_ACCESSOR(cluster_cr_cache_evict_count, cr_cache_evict_count)
 CR_COUNTER_ACCESSOR(cluster_cr_cache_install_count, cr_cache_install_count)
+
+/* spec-6.12b: CR-server data plane (6 counters). */
+CR_COUNTER_ACCESSOR(cluster_cr_remote_full_count, cr_remote_full_count)
+CR_COUNTER_ACCESSOR(cluster_cr_remote_partial_count, cr_remote_partial_count)
+CR_COUNTER_ACCESSOR(cluster_cr_remote_failed_count, cr_remote_failed_count)
+CR_COUNTER_ACCESSOR(cluster_cr_server_full_count, cr_server_full_count)
+CR_COUNTER_ACCESSOR(cluster_cr_server_partial_count, cr_server_partial_count)
+CR_COUNTER_ACCESSOR(cluster_cr_server_denied_count, cr_server_denied_count)
 /* spec-3.22 D3: xmax recycled-slot resolve outcome buckets. */
 CR_COUNTER_ACCESSOR(cluster_cr_xmax_resolved_count, cr_xmax_resolved_count)
 CR_COUNTER_ACCESSOR(cluster_cr_xmax_recycled_invisible_count, cr_xmax_recycled_invisible_count)
@@ -731,20 +779,243 @@ cr_resolve_kept_tuples_durable(char *dst_page, SCN read_scn, const ClusterCRCand
  * ============================================================ */
 
 /*
+ * cr_construct_from_copy -- construction core over an ALREADY-COPIED page
+ *	(spec-6.12b refactor of the spec-3.9/3.10/3.11 body; the Buffer wrapper
+ *	below memcpy's the live page first and keeps its exact pre-6.12b
+ *	semantics).
+ *
+ *	Modes:
+ *	  local  (server_mode=false)  the classic backend construction.  NEW:
+ *	         when cluster.crossnode_cr_data_plane is on and the NEWEST
+ *	         candidate chain's undo home is a class-(3) runtime-remote
+ *	         origin (the spec-5.57 boundary that otherwise refuses 53R9G),
+ *	         fetch the CR result from that origin's CR-server first: a FULL
+ *	         result replaces dst outright; a PARTIAL result replaces dst and
+ *	         the construction CONTINUES here on the shipped page (candidates
+ *	         re-derive from its ITL state; a still-foreign chain hits the
+ *	         class-(3) walk backstop -> 53R9G).  A failed fetch falls into
+ *	         the unchanged cr_coordinator_refuse_runtime_remote (Rule 8.A).
+ *	  server (server_mode=true)   the LMS-side construction: classify the
+ *	         write_scn-DESC chain homes (cluster_cr_server_split_classify),
+ *	         refuse an interleave (53R9G -> the LMS wrapper turns any error
+ *	         into a DENIED reply), peel only the self-home DESC prefix and
+ *	         report *out_partial so the requester knows to continue.
+ *
+ *	The caller owns cr_in_progress + PG_TRY taxonomy + the profiling scope;
+ *	this helper throws on every failure path (I-fail-4 discipline).
+ */
+static void
+cr_construct_from_copy(char *dst_page, SCN read_scn, RelFileLocator cur_locator,
+					   ForkNumber cur_fork, BlockNumber cur_block, bool server_mode,
+					   bool *out_partial)
+{
+	Page page;
+	const ClusterItlSlotData *slots;
+	ClusterCRCandidateChain chains[CLUSTER_ITL_INITRANS_DEFAULT];
+	int nchains;
+	int peel_n;
+	uint32 steps = 0;
+	uint32 max_steps = (uint32)cluster_cr_chain_walk_max_steps;
+	bool watermark_exceeds = false;
+
+	if (out_partial != NULL)
+		*out_partial = false;
+
+	/* I-lock-1/2/4: caller holds the content lock (or made a stable copy);
+	 * we only read page bytes in dst -- no buffer lock, no WAL, no dirty.
+	 * The wait event covers the undo I/O of the chain walks. */
+	pgstat_report_wait_start(WAIT_EVENT_CLUSTER_CR_CONSTRUCT);
+
+	/* deterministic wait-event window for TAP L8 (armed us sleep). */
+	{
+		uint64 delay_us = 0;
+
+		if (cluster_cr_injection_armed("cr_construct_delay_us", &delay_us) && delay_us > 0)
+			pg_usleep((long)delay_us);
+	}
+
+	/* spec-3.9 Step 7: injection-forced taxonomy fires FIRST (TAP L4/L5/L6),
+	 * before any page inspection, so it is page-state-independent. */
+	cr_check_error_injections();
+
+	page = (Page)dst_page;
+	if (!PageHasItl(page))
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("cluster CR target page has no ITL special area")));
+
+	/*
+	 * spec-3.10 (S)v0.5 / spec-3.11 D6: slot-reuse gate.  If a completed DATA
+	 * ITL slot whose write_scn is newer than this reader's snapshot was
+	 * recycled out of this block (its undo-chain anchor overwritten), the
+	 * per-page candidate set may be incomplete and a post-read_scn tuple
+	 * version could survive the candidate prune as a false-visible.
+	 */
+	{
+		SCN recycle_wm = ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn;
+
+		watermark_exceeds = SCN_VALID(recycle_wm) && scn_time_cmp(recycle_wm, read_scn) > 0;
+	}
+
+	/* Snapshot candidate chains BEFORE mutation, then peel newest-first. */
+	slots = ClusterPageGetItlSlots(page);
+	nchains = cluster_cr_collect_candidate_chains(slots, read_scn, chains,
+												  CLUSTER_ITL_INITRANS_DEFAULT);
+	if (nchains > 1)
+		qsort(chains, nchains, sizeof(chains[0]), cluster_cr_chain_cmp_by_write_scn_desc);
+	peel_n = nchains;
+
+	if (server_mode) {
+		/*
+		 * PGRAC: spec-6.12b -- CR-server split.  One chain = one transaction
+		 * = one undo home, so classifying the DESC-ordered head origins fully
+		 * decides the one-hop serve (see cluster_cr_server.h).  DENY throws
+		 * the canonical cross-instance SQLSTATE; the LMS wrapper converts any
+		 * throw into a DENIED reply (fail-closed at the requester, Rule 8.A).
+		 */
+		int32 origins[CLUSTER_ITL_INITRANS_DEFAULT];
+		int prefix = 0;
+		ClusterCrServerSplit split;
+
+		for (int i = 0; i < nchains; i++)
+			origins[i] = (int32)uba_origin_node_id(chains[i].undo_segment_head);
+		split = cluster_cr_server_split_classify(origins, nchains, (int32)cluster_node_id, &prefix);
+		if (split == CLUSTER_CR_SPLIT_DENY)
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_CR_CROSS_INSTANCE_UNSUPPORTED),
+					 errmsg("cluster CR server cannot construct: candidate chain homes "
+							"interleave across instances"),
+					 errhint("The one-page one-hop CR protocol preserves the write_scn-DESC "
+							 "peel order only for a self-home prefix; the requester keeps the "
+							 "fail-closed refusal.")));
+		peel_n = prefix;
+		if (out_partial != NULL)
+			*out_partial = (split == CLUSTER_CR_SPLIT_PARTIAL);
+	} else if (cluster_crossnode_cr_data_plane && nchains > 0) {
+		/*
+		 * PGRAC: spec-6.12b -- requester-side remote-first.  Only when the
+		 * NEWEST chain is class-(3) remote: the DESC peel must start there, so
+		 * a local peel could never come first (a local-prefix mix would need a
+		 * page round-trip mid-construction -- out of the one-hop protocol;
+		 * those interleaves keep the in-walk class-(3) backstop -> 53R9G).
+		 */
+		NodeId head_origin = uba_origin_node_id(chains[0].undo_segment_head);
+
+		if (cluster_cr_coordinator_classify_origin(head_origin) == CR_COORD_ORIGIN_RUNTIME_REMOTE) {
+			bool partial = false;
+			BufferTag tag;
+
+			InitBufferTag(&tag, &cur_locator, cur_fork, cur_block);
+			if (!cluster_gcs_block_cr_fetch_and_wait(tag, read_scn, (int32)head_origin, dst_page,
+													 &partial)) {
+				if (CRShared != NULL)
+					pg_atomic_fetch_add_u64(&CRShared->cr_remote_failed_count, 1);
+				/* Unchanged spec-5.57 refusal: 53R9G + coordinator counters. */
+				cr_coordinator_refuse_runtime_remote((int)head_origin);
+			}
+
+			if (!partial) {
+				/* FULL: dst holds the origin-finished CR page (it already ran
+				 * prune + walk + durable resolve there). */
+				if (CRShared != NULL) {
+					pg_atomic_fetch_add_u64(&CRShared->cr_remote_full_count, 1);
+					pg_atomic_fetch_add_u64(&CRShared->cr_construct_count, 1);
+				}
+				pgstat_report_wait_end();
+				return;
+			}
+
+			if (CRShared != NULL)
+				pg_atomic_fetch_add_u64(&CRShared->cr_remote_partial_count, 1);
+
+			/* PARTIAL: continue on the shipped page -- re-derive everything
+			 * from its content (the peeled prefix chains' ITL slots were
+			 * inverse-restored, so they no longer collect as candidates). */
+			page = (Page)dst_page;
+			if (!PageHasItl(page))
+				ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+								errmsg("cluster CR server shipped a page without an ITL "
+									   "special area")));
+			{
+				SCN recycle_wm = ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn;
+
+				watermark_exceeds = SCN_VALID(recycle_wm) && scn_time_cmp(recycle_wm, read_scn) > 0;
+			}
+			slots = ClusterPageGetItlSlots(page);
+			nchains = cluster_cr_collect_candidate_chains(slots, read_scn, chains,
+														  CLUSTER_ITL_INITRANS_DEFAULT);
+			if (nchains > 1)
+				qsort(chains, nchains, sizeof(chains[0]), cluster_cr_chain_cmp_by_write_scn_desc);
+			peel_n = nchains;
+		}
+	}
+
+	/*
+	 * If the recycle watermark says the candidate set may be incomplete,
+	 * resolve evicted post-read_scn tuple creators before walking undo.
+	 * Otherwise a recycled-slot tuple can remain NORMAL at the target
+	 * offset and block an older UPDATE/DELETE restore with a length/identity
+	 * mismatch.  The post-walk call below remains as the final fail-closed
+	 * guard for tuples materialized by the chain walk itself.
+	 */
+	if (watermark_exceeds) {
+		if (cluster_tt_durable_lookup)
+			cr_resolve_kept_tuples_durable(dst_page, read_scn, chains, nchains);
+		else
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CR_SNAPSHOT_TOO_OLD),
+							errmsg("cluster CR cannot reconstruct block: ITL slot reused "
+								   "after snapshot"),
+							errhint("retry the transaction with a fresh snapshot")));
+	}
+
+	/*
+	 * spec-3.10 (S)v0.6: prune post-read_scn versions BOTH before and after
+	 * the inverse-apply (v0.4 pruned only after).  prune-FIRST +
+	 * PageRepairFragmentation frees the line pointer a later INSERT reused so
+	 * the inverse-apply can re-add the old image at its read_scn offnum; the
+	 * prune-AFTER strips intermediate versions the walk restored.  In the
+	 * spec-6.12b server-PARTIAL mode the prune still uses the FULL candidate
+	 * list (pruning is xmin matching, no undo I/O) while the walk below peels
+	 * only the self-home prefix -- the requester's continue-run re-prunes
+	 * idempotently with its own re-collected list.
+	 */
+	(void)cluster_cr_prune_post_snapshot_versions(dst_page, chains, nchains);
+	PageRepairFragmentation((Page)dst_page);
+
+	for (int i = 0; i < peel_n; i++)
+		cr_walk_chain(dst_page, chains[i].undo_segment_head, read_scn, chains, nchains, &steps,
+					  max_steps, cur_locator, cur_fork, cur_block);
+
+	(void)cluster_cr_prune_post_snapshot_versions(dst_page, chains, nchains);
+
+	/*
+	 * spec-3.11 D6/C4: if a completed post-read_scn DATA slot was evicted
+	 * (watermark > read_scn), the candidate set above may miss its writer.
+	 * Resolve every kept tuple whose xmin is not a live candidate against the
+	 * durable TT by xid, pruning evicted post-read_scn versions and failing
+	 * closed only on an unresolvable (recycled) slot.
+	 */
+	if (watermark_exceeds)
+		cr_resolve_kept_tuples_durable(dst_page, read_scn, chains, nchains);
+
+	pgstat_report_wait_end();
+
+	if (CRShared != NULL) {
+		pg_atomic_fetch_add_u64(&CRShared->cr_construct_count, 1);
+		pg_atomic_fetch_add_u64(&CRShared->cr_chain_walk_steps_sum, steps);
+	}
+}
+
+/*
  * cluster_cr_construct_block_into -- full-block CR into a caller-provided
  *	BLCKSZ destination (the CR cache victim slot in spec-3.10, or the backend
  *	scratch via the public wrapper).  memcpy the live page, then inverse-apply
- *	EVERY candidate ITL chain (write_scn newer than read_scn) in write_scn-DESC order so
- *	the whole block is rolled back to read_scn (Oracle block-level CR).
+ *	EVERY candidate ITL chain (write_scn newer than read_scn) in write_scn-DESC
+ *	order so the whole block is rolled back to read_scn (Oracle block-level
+ *	CR).  Body lives in cr_construct_from_copy (spec-6.12b refactor); the
+ *	local-mode semantics are unchanged.
  *
- *	Candidate chains are snapshotted BEFORE any inverse-apply (cluster_cr_apply
- *	itl_inverse mutates the page's ITL slots; re-reading heads mid-walk would
- *	corrupt selection — spec-3.10 D1).  Order is newest-first because each
- *	per-transaction chain's inverse is an unconditional old-image restore and a
- *	row touched by txB then txC must be peeled C->B (spec-3.10 Q10).
- *
- *	I-lock-3 non-reentrant + I-fail-1 balanced guard (PG_TRY resets cr_in_progress
- *	and re-throws the precise SQLSTATE).  Returns dst_page.
+ *	I-lock-3 non-reentrant + I-fail-1 balanced guard (PG_TRY resets
+ *	cr_in_progress and re-throws the precise SQLSTATE).  Returns dst_page.
  */
 static const char *
 cluster_cr_construct_block_into(Buffer buf, SCN read_scn, char *dst_page)
@@ -757,7 +1028,7 @@ cluster_cr_construct_block_into(Buffer buf, SCN read_scn, char *dst_page)
 	Assert(dst_page != NULL);
 	Assert(!cr_in_progress); /* I-lock-3 non-reentrant */
 
-	/* PGRAC: spec-5.59 D3 profiling — time the whole CR construction at its
+	/* PGRAC: spec-5.59 D3 profiling -- time the whole CR construction at its
 	 * single choke point (cache-fill and scratch paths both land here); an
 	 * ereport(ERROR) re-thrown by the PG_CATCH below loses the sample,
 	 * acceptable. */
@@ -767,149 +1038,18 @@ cluster_cr_construct_block_into(Buffer buf, SCN read_scn, char *dst_page)
 
 	PG_TRY();
 	{
-		Page page;
-		const ClusterItlSlotData *slots;
-		ClusterCRCandidateChain chains[CLUSTER_ITL_INITRANS_DEFAULT];
-		int nchains;
-		uint32 steps = 0;
-		uint32 max_steps = (uint32)cluster_cr_chain_walk_max_steps;
-		bool watermark_exceeds = false; /* spec-3.11 D6: durable resolve gate */
+		RelFileLocator cur_locator;
+		ForkNumber cur_fork;
+		BlockNumber cur_block;
 
-		/* I-lock-1/2/4: caller holds the content lock; we only read page bytes
-		 * into dst — no buffer lock, no WAL, no dirty.  The wait event covers
-		 * the undo I/O of the chain walks (spec-3.9 §2 / TAP L8). */
-		pgstat_report_wait_start(WAIT_EVENT_CLUSTER_CR_CONSTRUCT);
-
-		/* deterministic wait-event window for TAP L8 (armed µs sleep). */
-		{
-			uint64 delay_us = 0;
-
-			if (cluster_cr_injection_armed("cr_construct_delay_us", &delay_us) && delay_us > 0)
-				pg_usleep((long)delay_us);
-		}
+		/* spec-3.20 D3.A (F8): the physical identity of the block we are
+		 * reconstructing, so cr_walk_chain can drop undo records the same
+		 * transaction wrote against OTHER relations/forks/blocks. */
+		BufferGetTag(buf, &cur_locator, &cur_fork, &cur_block);
 
 		memcpy(dst_page, BufferGetPage(buf), BLCKSZ);
-
-		/* spec-3.9 Step 7: injection-forced taxonomy fires FIRST (TAP L4/L5/L6),
-		 * before any page inspection, so it is page-state-independent. */
-		cr_check_error_injections();
-
-		page = (Page)dst_page;
-		if (!PageHasItl(page))
-			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-							errmsg("cluster CR target page has no ITL special area")));
-
-		/*
-		 * spec-3.10 §v0.5 / spec-3.11 D6: slot-reuse gate.  If a completed DATA
-		 * ITL slot whose write_scn is newer than this reader's snapshot was
-		 * recycled out of this block (its undo-chain anchor overwritten), the
-		 * per-page candidate set may be incomplete and a post-read_scn tuple
-		 * version could survive the candidate prune as a false-visible.
-		 *
-		 * spec-3.10 failed the whole block closed (53R9F) here.  spec-3.11 D6
-		 * instead defers to cr_resolve_kept_tuples_durable() after the candidate
-		 * prune + walk: each kept tuple whose xmin is not a live candidate is
-		 * resolved against the durable TT by xid, so only a tuple whose own
-		 * durable slot was already recycled still fails closed (§v0.5 A).
-		 */
-		{
-			SCN recycle_wm = ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn;
-
-			watermark_exceeds = SCN_VALID(recycle_wm) && scn_time_cmp(recycle_wm, read_scn) > 0;
-		}
-
-		/* Snapshot candidate chains BEFORE mutation, then peel newest-first. */
-		slots = ClusterPageGetItlSlots(page);
-		nchains = cluster_cr_collect_candidate_chains(slots, read_scn, chains,
-													  CLUSTER_ITL_INITRANS_DEFAULT);
-		if (nchains > 1)
-			qsort(chains, nchains, sizeof(chains[0]), cluster_cr_chain_cmp_by_write_scn_desc);
-
-		/*
-		 * If the recycle watermark says the candidate set may be incomplete,
-		 * resolve evicted post-read_scn tuple creators before walking undo.
-		 * Otherwise a recycled-slot tuple can remain NORMAL at the target
-		 * offset and block an older UPDATE/DELETE restore with a length/identity
-		 * mismatch.  The post-walk call below remains as the final fail-closed
-		 * guard for tuples materialized by the chain walk itself.
-		 */
-		if (watermark_exceeds) {
-			if (cluster_tt_durable_lookup)
-				cr_resolve_kept_tuples_durable(dst_page, read_scn, chains, nchains);
-			else
-				ereport(ERROR, (errcode(ERRCODE_CLUSTER_CR_SNAPSHOT_TOO_OLD),
-								errmsg("cluster CR cannot reconstruct block: ITL slot reused "
-									   "after snapshot"),
-								errhint("retry the transaction with a fresh snapshot")));
-		}
-
-		/*
-		 * spec-3.10 §v0.6: prune post-read_scn versions BOTH before and after
-		 * the inverse-apply (v0.4 pruned only after).
-		 *
-		 * Chain revert clears xmax but does not remove the new physical version
-		 * an UPDATE produced (heap_update emits only UNDO_RECORD_UPDATE, no
-		 * INSERT-undo for the new version); the prune marks LP_UNUSED every
-		 * tuple whose xmin is a post-read_scn candidate (new versions, reusing
-		 * INSERTs, standalone INSERTs -- see its header + §3.3).
-		 *
-		 * prune-FIRST + PageRepairFragmentation (§v0.6): frees the line pointer
-		 * a later INSERT reused for one of those tuples and reclaims its space,
-		 * so the inverse-apply can re-add the old image at its read_scn offnum
-		 * even though PG's prune horizon (decoupled from read_scn -- AD-012)
-		 * reused that offset after the snapshot.  INSERT-inverse is idempotent
-		 * on the already-freed slot.  See cluster_cr_apply.c
-		 * cr_restore_full_image / cr_readd_at_offnum (§v0.6 B1-B5).
-		 *
-		 * prune-AFTER (retained from v0.4): a row updated more than once on this
-		 * block has intermediate versions whose pre-images the walk restores
-		 * (the older txn's UNDO_RECORD_UPDATE old image IS the newer version);
-		 * those carry a candidate xmin, so a second prune strips them, leaving
-		 * exactly the read_scn version (Q10 write_scn-DESC peel -- t/216 L4b).
-		 */
-		(void)cluster_cr_prune_post_snapshot_versions(dst_page, chains, nchains);
-		PageRepairFragmentation((Page)dst_page);
-
-		/*
-		 * spec-3.20 D3.A (F8): the physical identity of the block we are
-		 * reconstructing, so cr_walk_chain can drop undo records the same
-		 * transaction wrote against OTHER relations/forks/blocks.
-		 */
-		{
-			RelFileLocator cur_locator;
-			ForkNumber cur_fork;
-			BlockNumber cur_block;
-
-			BufferGetTag(buf, &cur_locator, &cur_fork, &cur_block);
-
-			for (int i = 0; i < nchains; i++)
-				cr_walk_chain(dst_page, chains[i].undo_segment_head, read_scn, chains, nchains,
-							  &steps, max_steps, cur_locator, cur_fork, cur_block);
-		}
-
-		(void)cluster_cr_prune_post_snapshot_versions(dst_page, chains, nchains);
-
-		/*
-		 * spec-3.11 D6/C4: if a completed post-read_scn DATA slot was evicted
-		 * (watermark > read_scn), the candidate set above may miss its writer.
-		 * Resolve every kept tuple whose xmin is not a live candidate against the
-		 * durable TT by xid, pruning evicted post-read_scn versions and failing
-		 * closed only on an unresolvable (recycled) slot.
-		 *
-		 * cluster.tt_durable_lookup=off (C6 fallback) reverts to the spec-3.10
-		 * overlay-only behavior: any watermark > read_scn fails the whole block
-		 * closed (53R9F) without consulting the durable TT.
-		 */
-		if (watermark_exceeds)
-			cr_resolve_kept_tuples_durable(dst_page, read_scn, chains, nchains);
-
-		pgstat_report_wait_end();
-
-		if (CRShared != NULL) {
-			pg_atomic_fetch_add_u64(&CRShared->cr_construct_count, 1);
-			pg_atomic_fetch_add_u64(&CRShared->cr_chain_walk_steps_sum, steps);
-		}
-
+		cr_construct_from_copy(dst_page, read_scn, cur_locator, cur_fork, cur_block,
+							   false /* local mode */, NULL);
 		result = dst_page;
 	}
 	PG_CATCH();
@@ -942,11 +1082,61 @@ cluster_cr_construct_block_into(Buffer buf, SCN read_scn, char *dst_page)
 	return result;
 }
 
+/*
+ * cluster_cr_construct_page_for_server -- spec-6.12b LMS-side entry: full CR
+ *	construction over a STABLE COPY of the current page (cur_page; the LMS
+ *	drain made it with the raw-pin/content-lock copy helper), peeling only
+ *	the self-home write_scn-DESC prefix.  *out_partial reports whether a
+ *	foreign suffix remains for the requester.  Throws on every failure
+ *	(interleave, snapshot-too-old, corruption); the LMS drain wrapper
+ *	converts any throw into a DENIED reply -- fail-closed at the requester,
+ *	never an LMS crash (Rule 8.A).
+ */
+void
+cluster_cr_construct_page_for_server(const char *cur_page, SCN read_scn, BufferTag tag,
+									 char *dst_page, bool *out_partial)
+{
+	Assert(cur_page != NULL && dst_page != NULL);
+	Assert(!cr_in_progress); /* LMS is single-threaded; guard stays honest */
+
+	cr_in_progress = true;
+
+	PG_TRY();
+	{
+		RelFileLocator cur_locator = BufTagGetRelFileLocator(&tag);
+
+		memcpy(dst_page, cur_page, BLCKSZ);
+		cr_construct_from_copy(dst_page, read_scn, cur_locator, tag.forkNum, tag.blockNum,
+							   true /* server mode */, out_partial);
+	}
+	PG_CATCH();
+	{
+		/* Same taxonomy bumps as the local wrapper (spec-3.9 Step 6). */
+		if (CRShared != NULL) {
+			int sqlerr = geterrcode();
+
+			if (sqlerr == ERRCODE_CLUSTER_CR_SNAPSHOT_TOO_OLD)
+				pg_atomic_fetch_add_u64(&CRShared->cr_snapshot_too_old_count, 1);
+			else if (sqlerr == ERRCODE_CLUSTER_CR_CROSS_INSTANCE_UNSUPPORTED)
+				pg_atomic_fetch_add_u64(&CRShared->cr_cross_instance_unsupported_count, 1);
+			else if (sqlerr == ERRCODE_DATA_CORRUPTED)
+				pg_atomic_fetch_add_u64(&CRShared->cr_corruption_count, 1);
+		}
+
+		pgstat_report_wait_end();
+		cr_in_progress = false;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	cr_in_progress = false;
+}
+
 const char *
 cluster_cr_construct_block(Buffer buf, SCN read_scn)
 {
 	/* Public fallback: construct into the backend-local scratch.  Used by the
-	 * test SRF and as the cache-disabled path (spec-3.10 §3.1). */
+	 * test SRF and as the cache-disabled path (spec-3.10 (S)3.1). */
 	cr_scratch_ensure();
 	return cluster_cr_construct_block_into(buf, read_scn, cr_scratch);
 }

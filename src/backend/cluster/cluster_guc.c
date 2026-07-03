@@ -90,6 +90,8 @@ bool cluster_page_scn_shortcut = false;
 bool cluster_read_scache = false;
 /* spec-6.12e1: GES release-side handoff verify + counters (default OFF). */
 bool cluster_ges_handoff = false;
+/* spec-6.12b: cross-instance CR-server data plane (default OFF = 53R9G). */
+bool cluster_crossnode_cr_data_plane = false;
 /* spec-6.12d: instance space-affinity mode + lease cap (default OFF). */
 int cluster_space_affinity = CLUSTER_SPACE_AFFINITY_OFF;
 int cluster_space_lease_blocks = 64;
@@ -1371,6 +1373,27 @@ cluster_init_guc(void)
 		gettext_noop("Verify the GES release-side deterministic handoff invariants."),
 		gettext_noop("Off keeps the drain path byte-identical (no verify, no counters)."),
 		&cluster_ges_handoff, false, PGC_SUSET, 0, NULL, NULL, NULL);
+
+	/*
+	 * cluster.crossnode_cr_data_plane -- spec-6.12 wave b (read layer 2).
+	 * When on, a CR construction whose newest candidate chain lives in a
+	 * REMOTE instance's undo (the spec-5.57 class-3 boundary that
+	 * otherwise fails closed 53R9G) asks that origin's CR-server for the
+	 * result: the origin's LMS constructs from its own current block +
+	 * local undo/TT and ships one CR page back (full, or a
+	 * write_scn-DESC-prefix partial the requester finishes locally).
+	 * Any uncertainty on either side -- origin cannot complete, chains
+	 * interleave across homes, timeout, checksum, GUC off on the origin
+	 * -- keeps the unchanged 53R9G fail-closed (Rule 8.A; the CR result
+	 * is never installed as current and never flushed).  Default OFF:
+	 * cross-instance CR keeps the 5.57 fail-closed boundary
+	 * byte-identical.  SUSET for measurement-window toggling.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.crossnode_cr_data_plane",
+		gettext_noop("Enable the cross-instance CR-server data plane (spec-6.12b)."),
+		gettext_noop("Off keeps cross-instance CR fail-closed (SQLSTATE 53R9G)."),
+		&cluster_crossnode_cr_data_plane, false, PGC_SUSET, 0, NULL, NULL, NULL);
 
 	/*
 	 * cluster.space_affinity -- spec-6.12 wave d (static).  static makes

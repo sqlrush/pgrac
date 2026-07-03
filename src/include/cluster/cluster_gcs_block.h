@@ -174,7 +174,7 @@ typedef enum GcsBlockReplyStatus {
 													 * Reuses HC103 copy-ship + HC127
 													 * watermark. */
 	,
-	GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING = 14, /* PGRAC: spec-5.16 D3b NEW;
+	GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING = 14,  /* PGRAC: spec-5.16 D3b NEW;
 													 * master-side hard gate (INV-R8/R14)
 													 * — the master (a rejoining node) is
 													 * NOT yet a quorum MEMBER, or the
@@ -185,7 +185,7 @@ typedef enum GcsBlockReplyStatus {
 													 * requester routed here never gets a
 													 * cold grant.  sender maps to 53R9L
 													 * (retry-safe, Class 53). */
-	GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE = 15 /* PGRAC: spec-6.12a ㉕ NEW;
+	GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE = 15, /* PGRAC: spec-6.12a ㉕ NEW;
 													 * the remote X holder accepted the
 													 * downgrade request: it flushed the
 													 * quiescent page, flipped its own
@@ -206,6 +206,32 @@ typedef enum GcsBlockReplyStatus {
 													 * durable copy the master does not
 													 * track).  HC108 authorized chain
 													 * applies as for GRANTED_FROM_HOLDER. */
+	GCS_BLOCK_REPLY_CR_RESULT_FULL = 16,			  /* PGRAC: spec-6.12b NEW; the
+													 * origin's LMS constructed the
+													 * COMPLETE CR page at the carried
+													 * read_scn (every candidate chain
+													 * was origin-home).  The page is a
+													 * consistent-read result: NEVER
+													 * installed as current, never
+													 * flushed, consumed only by the CR
+													 * waiter into the CR cache slot /
+													 * scratch (Rule 8.A hard
+													 * invariant). */
+	GCS_BLOCK_REPLY_CR_RESULT_PARTIAL = 17			  /* PGRAC: spec-6.12b NEW; the
+													 * origin's LMS applied the
+													 * write_scn-DESC PREFIX of the
+													 * candidate chains (all
+													 * origin-home) and stopped at the
+													 * first foreign chain — which in
+													 * the 2-node topology is
+													 * requester-home.  The requester
+													 * CONTINUES the construction
+													 * locally on the shipped page (the
+													 * remaining candidates re-derive
+													 * from the page's ITL state); any
+													 * still-foreign chain there hits
+													 * the class-③ walk backstop ->
+													 * 53R9G (Rule 8.A). */
 } GcsBlockReplyStatus;
 
 /* spec-5.16 D3b / r4 (spec-6.12a ㉕ extends) — every new reply status MUST be
@@ -215,9 +241,13 @@ typedef enum GcsBlockReplyStatus {
 StaticAssertDecl(GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING
 					 == GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER + 1,
 				 "GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING must follow READ_IMAGE_FROM_XHOLDER");
-StaticAssertDecl(GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE
-					 == GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING + 1,
-				 "GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE must be the tail enum value");
+StaticAssertDecl(
+	GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE == GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING + 1,
+	"GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE must follow DENIED_RESOURCE_RECOVERING");
+StaticAssertDecl(GCS_BLOCK_REPLY_CR_RESULT_PARTIAL == GCS_BLOCK_REPLY_CR_RESULT_FULL + 1
+					 && GCS_BLOCK_REPLY_CR_RESULT_FULL
+							== GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE + 1,
+				 "spec-6.12b CR result statuses must be the tail enum values");
 
 /* ============================================================
  * GcsBlockInvalidatePayload — spec-2.36 D1 NEW.
@@ -902,6 +932,35 @@ GcsBlockForwardPayloadIsDowngradeRequest(const GcsBlockForwardPayload *p)
 	return p->reserved_0[3] != 0;
 }
 
+/* PGRAC: spec-6.12b — cross-instance CR request flag carried in reserved_0[4]
+ * ([0]=read-image, [1]=X-transfer, [2]=clean-eligible, [3]=downgrade-request
+ * above; [5..6] remain free).
+ *
+ *	Sent REQUESTER -> ORIGIN (the foreign undo home derived from the chain
+ *	head UBA), riding the same 64B forward wire the sub-case B read-image
+ *	path already sends requester->holder.  With this flag set the
+ *	expected_pi_watermark_scn_bytes[8] carrier is REINTERPRETED as the
+ *	requester's snapshot read_scn (both are SCN carriers; a CR result is
+ *	historical by intent so the lost-write watermark verdict does not apply
+ *	on this path).  master_node = the requester itself, so the HC108
+ *	authorized chain on the direct-shipped reply validates exactly like the
+ *	sub-case B flow.  The origin's LMON only VALIDATES + parks the request
+ *	for LMS (light-work rule: construction never runs in the dispatch
+ *	loop); LMS constructs, LMON ships CR_RESULT_FULL / CR_RESULT_PARTIAL,
+ *	or a DENIED status which the requester maps to the unchanged 53R9G
+ *	fail-closed (Rule 8.A). */
+static inline void
+GcsBlockForwardPayloadSetCrRequest(GcsBlockForwardPayload *p, bool cr_request)
+{
+	p->reserved_0[4] = cr_request ? (uint8)1 : (uint8)0;
+}
+
+static inline bool
+GcsBlockForwardPayloadIsCrRequest(const GcsBlockForwardPayload *p)
+{
+	return p->reserved_0[4] != 0;
+}
+
 /* PGRAC: spec-5.2 D2 — pure master-side decision for an N→S read request
  * when the block is held in X.  Kept pure (no shmem / no I/O) so the gate
  * truth table is unit-tested standalone (U3). */
@@ -1001,6 +1060,7 @@ StaticAssertDecl(GCS_BLOCK_DATA_SIZE == BLCKSZ,
 #include "cluster/cluster_pcm_lock.h" /* PcmLockMode for invalidate helper */
 extern bool cluster_bufmgr_probe_block_for_gcs(BufferTag tag);
 extern bool cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char *dst);
+extern uint32 cluster_gcs_block_compute_checksum(const char *block_data);
 extern bool cluster_bufmgr_copy_block_for_gcs_smart_fusion(BufferTag tag, XLogRecPtr *out_page_lsn,
 														   char *dst, ClusterSfDepVec *out_dep_vec);
 /* PGRAC: spec-2.36 D4 (HC118 / HC123) — by-tag invalidate wrapper for

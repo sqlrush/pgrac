@@ -45,6 +45,7 @@
 #include "cluster/cluster_cssd.h" /* spec-4.6 D4 — dead-master block-path guard */
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_gcs.h"
+#include "cluster/cluster_cr_server.h" /* spec-6.12b CR-server park/fetch */
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_gcs_block_dedup.h" /* spec-2.34 D1 — counter forward */
 #include "cluster/cluster_grd.h"			 /* spec-4.6 D4 — block_path_failclosed counter */
@@ -516,6 +517,14 @@ gcs_block_compute_checksum(const char *block_data)
 	COMP_CRC32C(crc, block_data, GCS_BLOCK_DATA_SIZE);
 	FIN_CRC32C(crc);
 	return (uint32)crc;
+}
+
+/* PGRAC: spec-6.12b — public checksum for the CR-server reply builder
+ * (cluster_cr_server.c ships GCS_BLOCK_REPLY frames from the LMON tick). */
+uint32
+cluster_gcs_block_compute_checksum(const char *block_data)
+{
+	return gcs_block_compute_checksum(block_data);
 }
 
 static void
@@ -1711,6 +1720,136 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, int32 holder_node)
 					errhint("The X holder did not ship a current image in time; retry, or "
 							"inspect dump_gcs.cf_xheld_read_ship_count.")));
 	return true; /* unreachable */
+}
+
+
+/*
+ * PGRAC: spec-6.12b — requester-side CR fetch.
+ *
+ *	Ask origin_node's CR-server for the CR page of `tag` at read_scn.  The
+ *	request rides the sub-case B wire shape (FORWARD payload direct to the
+ *	serving node via the backend outbound ring; the HC108 chain on the
+ *	direct-shipped reply validates forwarding_master == self).  The SCN
+ *	carrier holds the snapshot read_scn (the CR path never runs the
+ *	lost-write watermark verdict — the result is historical by intent).
+ *
+ *	true  -> dst_page holds the shipped CR page; *out_partial says whether
+ *	         the local construction continues on it.
+ *	false -> fail-closed: the caller keeps the unchanged 53R9G refusal
+ *	         (timeout, DENIED, checksum failure — Rule 8.A).  The CR page
+ *	         is NEVER installed as current and never flushed; it exists
+ *	         only in the caller's CR destination.
+ */
+bool
+cluster_gcs_block_cr_fetch_and_wait(BufferTag tag, SCN read_scn, int32 origin_node, char *dst_page,
+									bool *out_partial)
+{
+	ClusterGcsBlockOutstandingSlot *slot;
+	uint64 request_id = 0;
+	GcsBlockForwardPayload fwd;
+	bool got_reply = false;
+	bool fetched = false;
+
+	if (out_partial != NULL)
+		*out_partial = false;
+	if (dst_page == NULL || origin_node < 0 || origin_node == cluster_node_id)
+		return false;
+
+	cluster_gcs_block_dedup_register_backend_exit_hook();
+	slot = gcs_block_reserve_slot(tag, (uint8)PCM_TRANS_N_TO_S, cluster_node_id, &request_id);
+
+	PG_TRY();
+	{
+		ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
+		TimestampTz deadline;
+
+		LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+		slot->reply_received = false;
+		memset(&slot->reply_header, 0, sizeof(slot->reply_header));
+		memset(slot->reply_block_data, 0, sizeof(slot->reply_block_data));
+		slot->reply_sf_dep_valid = false;
+		slot->reply_sf_flags = 0;
+		cluster_sf_dep_vec_reset(&slot->reply_sf_dep_vec);
+		slot->request_epoch = cluster_epoch_get_current();
+		slot->expected_master_node = cluster_node_id;
+		slot->stale = false;
+		LWLockRelease(&blk->lock.lock);
+
+		memset(&fwd, 0, sizeof(fwd));
+		fwd.request_id = request_id;
+		fwd.epoch = cluster_epoch_get_current();
+		fwd.tag = tag;
+		fwd.original_requester_node = cluster_node_id;
+		fwd.requester_backend_id = (int32)MyBackendId;
+		fwd.master_node = cluster_node_id;
+		fwd.transition_id = (uint8)PCM_TRANS_N_TO_S;
+		GcsBlockForwardPayloadSetExpectedPiWatermarkScn(&fwd, read_scn);
+		GcsBlockForwardPayloadSetCrRequest(&fwd, true);
+
+		if (!cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
+													  (uint32)origin_node, &fwd, sizeof(fwd)))
+			ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
+							errmsg("cluster_gcs_block: failed to enqueue CR request to "
+								   "origin node %d",
+								   (int)origin_node)));
+
+		deadline = GetCurrentTimestamp()
+				   + ((TimestampTz)cluster_gcs_reply_timeout_ms) * (TimestampTz)1000;
+
+		ConditionVariablePrepareToSleep(&slot->reply_cv);
+		for (;;) {
+			TimestampTz now;
+			long timeout_ms;
+			bool have_reply;
+
+			LWLockAcquire(&blk->lock.lock, LW_SHARED);
+			have_reply = slot->in_use && slot->reply_received;
+			LWLockRelease(&blk->lock.lock);
+			if (have_reply) {
+				got_reply = true;
+				break;
+			}
+			now = GetCurrentTimestamp();
+			if (now >= deadline)
+				break;
+			timeout_ms = (long)((deadline - now) / 1000);
+			if (timeout_ms <= 0)
+				timeout_ms = 1;
+			(void)ConditionVariableTimedSleep(&slot->reply_cv, timeout_ms,
+											  WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+		}
+		ConditionVariableCancelSleep();
+
+		if (got_reply
+			&& (slot->reply_header.status == (uint8)GCS_BLOCK_REPLY_CR_RESULT_FULL
+				|| slot->reply_header.status == (uint8)GCS_BLOCK_REPLY_CR_RESULT_PARTIAL)) {
+			uint32 expected = slot->reply_header.checksum;
+			uint32 got = gcs_block_compute_checksum(slot->reply_block_data);
+
+			if (expected == got) {
+				memcpy(dst_page, slot->reply_block_data, BLCKSZ);
+				/* spec-5.14 D2 class 2: this CR result is the origin's
+				 * volatile construction — depend on it for fail-stop. */
+				gcs_block_stamp_touched(origin_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+				if (out_partial != NULL)
+					*out_partial
+						= (slot->reply_header.status == (uint8)GCS_BLOCK_REPLY_CR_RESULT_PARTIAL);
+				fetched = true;
+			} else {
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_checksum_fail_count, 1);
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		gcs_block_release_slot(slot);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	gcs_block_release_slot(slot);
+
+	return fetched; /* false -> caller keeps the unchanged 53R9G refusal */
 }
 
 
@@ -3409,6 +3548,8 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 					&& (hdr->status == (uint8)GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE
+						|| hdr->status == (uint8)GCS_BLOCK_REPLY_CR_RESULT_FULL
+						|| hdr->status == (uint8)GCS_BLOCK_REPLY_CR_RESULT_PARTIAL
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_DENIED_LOST_WRITE))
@@ -3487,6 +3628,39 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	if (fwd->transition_id < PCM_TRANS_N_TO_S || fwd->transition_id > PCM_TRANS_S_TO_X_CLEANOUT)
 		return; /* malformed, silently drop;  master
 								 * dedup TTL will sweep stale entry */
+
+	/*
+	 * PGRAC: spec-6.12b — CR-server request.  LMON only validates + parks
+	 * the request for LMS (light-work rule: a CR construction walks undo
+	 * I/O and must never run in this dispatch loop); the LMON tick ships
+	 * the finished result.  A refused park (data plane off / no free slot)
+	 * replies a fail-closed DENIED immediately so the requester keeps its
+	 * unchanged 53R9G refusal (Rule 8.A).  Never falls through to the
+	 * current-image ship below: a CR result is HISTORICAL by intent and
+	 * the lost-write watermark verdict does not apply (the SCN carrier
+	 * holds the requester's read_scn on this path).
+	 */
+	if (GcsBlockForwardPayloadIsCrRequest(fwd)) {
+		if (!cluster_lms_cr_submit(fwd)) {
+			uint32 deny_total = (uint32)sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE;
+			char *deny_buf = (char *)palloc0(deny_total);
+			GcsBlockReplyHeader *deny_hdr = (GcsBlockReplyHeader *)deny_buf;
+
+			deny_hdr->request_id = fwd->request_id;
+			deny_hdr->epoch = cluster_epoch_get_current();
+			deny_hdr->sender_node = cluster_node_id;
+			deny_hdr->requester_backend_id = fwd->requester_backend_id;
+			deny_hdr->transition_id = fwd->transition_id;
+			deny_hdr->status = (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
+			GcsBlockReplyHeaderSetForwardingMasterNode(deny_hdr, fwd->master_node);
+			deny_hdr->checksum
+				= cluster_gcs_block_compute_checksum(deny_buf + sizeof(GcsBlockReplyHeader));
+			(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY,
+										   fwd->original_requester_node, deny_buf, deny_total);
+			pfree(deny_buf);
+		}
+		return;
+	}
 
 	/*
 	 * PGRAC: spec-6.12a ㉕ — remote-holder downgrade.  The master asked us

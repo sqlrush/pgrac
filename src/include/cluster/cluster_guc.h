@@ -160,6 +160,9 @@ extern bool cluster_read_scache;
 /* spec-6.12e1: GES release-side handoff verify switch (default off). */
 extern bool cluster_ges_handoff;
 
+/* spec-6.12b: cross-instance CR-server data plane (default off = 53R9G). */
+extern bool cluster_crossnode_cr_data_plane;
+
 /*
  * spec-6.12d: instance space-affinity mode (default off).  static parks
  * the unconsumed tail of oversized HW grants as a per-node lease

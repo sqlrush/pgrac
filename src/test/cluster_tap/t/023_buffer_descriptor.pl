@@ -61,7 +61,7 @@ my $has_visibility_inject =
 # admission reason counters; +1 "pgrac cluster clean_leave" (spec-5.13); +1
 # "pgrac cluster cr relgen" (spec-5.56 D4); +1 "pgrac cluster cr tuple stats"
 # (spec-5.54 D5); full list + count lives in t/020).
-  my $expected_region_count = $has_visibility_inject ? '74' : '73'; # spec-6.2 +1 smart fusion deps; spec-6.12 +1 xnode lever +1 hw lease; full list lives in t/020
+  my $expected_region_count = $has_visibility_inject ? '75' : '74'; # spec-6.2 +1 smart fusion deps; spec-6.12 +1 xnode lever +1 hw lease +1 cr server (6.12b); full list lives in t/020
 
 
 # ----------
@@ -157,7 +157,7 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '149',
+   '150',
    'L11 pg_stat_cluster_injections is 141 (spec-5.13 +6 cluster-clean-leave-* + Hardening v1.0.3 +1 suppress-preflight-ack) (spec-5.2a +1 clean-xfer stale-holder; spec-4.8ab +2 undo boundary guards; spec-5.7 +1 cluster-ko-peer-skip-ack; spec-2.41 +1 cluster-gcs-block-stale-ship; spec-5.55 Hardening v1.1 +1 cluster-cr-resolver-memo-suspect; spec-5.15 Hardening v1.1 +1 cluster-reconfig-join-commit-marker-durable)');
 
 

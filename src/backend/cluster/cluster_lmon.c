@@ -55,6 +55,7 @@
 #include "utils/ps_status.h"
 #include "utils/timestamp.h"
 
+#include "cluster/cluster_cr_server.h" /* spec-6.12b CR-server result ship */
 #include "cluster/cluster_backup.h" /* cluster_backup_register_ic_msg_types + lmon_tick (spec-6.5) */
 #include "cluster/cluster_clean_leave.h" /* cluster_clean_leave_register_ic_msg_types (spec-5.13 D8) */
 #include "cluster/cluster_node_remove.h" /* cluster_node_remove_lmon_tick + register (spec-5.18 D9/D10) */
@@ -1007,6 +1008,9 @@ LmonMain(void)
 			 * LMS never advances past STARTING for the ownership purpose.
 			 */
 			cluster_ges_lmon_drain_work_queue();
+			/* PGRAC: spec-6.12b — ship finished CR-server results (LMS
+			 * constructed them; only LMON owns the IC connections). */
+			cluster_lms_cr_ship_ready();
 			/*
 			 * spec-5.16 (orphan-grant, Rule 8.A) — reclaim abandoned reply-wait
 			 * tombstones whose bounded TTL has elapsed.  This is the documented
@@ -1627,6 +1631,9 @@ LmonMain(void)
 			 * single node has no peers to send to).
 			 */
 			cluster_ges_lmon_drain_work_queue();
+			/* PGRAC: spec-6.12b — ship finished CR-server results (LMS
+			 * constructed them; only LMON owns the IC connections). */
+			cluster_lms_cr_ship_ready();
 
 			cluster_sinval_drain_outbound_and_broadcast();
 			cluster_sinval_drain_ack_outbound_and_send();

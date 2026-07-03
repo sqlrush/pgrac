@@ -323,10 +323,43 @@ UT_TEST(test_s_granted_xholder_downgrade_status_is_15)
 }
 
 
+/* PGRAC: spec-6.12b — CR request flag rides reserved_0[4] independently and
+ * the CR result statuses are the enum tail (16/17). */
+UT_TEST(test_cr_request_flag_round_trip_independent)
+{
+	GcsBlockForwardPayload fwd;
+
+	memset(&fwd, 0, sizeof(fwd));
+	UT_ASSERT(!GcsBlockForwardPayloadIsCrRequest(&fwd));
+
+	GcsBlockForwardPayloadSetReadImage(&fwd, true);
+	GcsBlockForwardPayloadSetDowngradeRequest(&fwd, true);
+	GcsBlockForwardPayloadSetCrRequest(&fwd, true);
+
+	UT_ASSERT(GcsBlockForwardPayloadIsCrRequest(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsReadImage(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsDowngradeRequest(&fwd));
+
+	GcsBlockForwardPayloadSetCrRequest(&fwd, false);
+	UT_ASSERT(!GcsBlockForwardPayloadIsCrRequest(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsReadImage(&fwd));
+	UT_ASSERT_EQ((int)sizeof(GcsBlockForwardPayload), 64);
+}
+
+
+UT_TEST(test_cr_result_statuses_are_16_17)
+{
+	UT_ASSERT_EQ((int)GCS_BLOCK_REPLY_CR_RESULT_FULL, 16);
+	UT_ASSERT_EQ((int)GCS_BLOCK_REPLY_CR_RESULT_PARTIAL, 17);
+	UT_ASSERT_EQ((int)GCS_BLOCK_REPLY_CR_RESULT_FULL,
+				 (int)GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE + 1);
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(26);
 	UT_RUN(test_block_forward_msg_type_is_16);
 	UT_RUN(test_granted_from_holder_status_is_8);
 	UT_RUN(test_forward_payload_size_locked_at_64);
@@ -351,6 +384,8 @@ main(void)
 	UT_RUN(test_l22_master_holder_lifecycle_documented_in_tap);
 	UT_RUN(test_downgrade_request_flag_round_trip_independent);
 	UT_RUN(test_s_granted_xholder_downgrade_status_is_15);
+	UT_RUN(test_cr_request_flag_round_trip_independent);
+	UT_RUN(test_cr_result_statuses_are_16_17);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -2434,6 +2434,19 @@ dump_cr(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_cr_cache_evict_count()));
 	emit_row(rsinfo, "cr", "cr_cache_install_count",
 			 fmt_int64((int64)cluster_cr_cache_install_count()));
+	/* spec-6.12b: CR-server data plane (cr category 35 -> 41 rows). */
+	emit_row(rsinfo, "cr", "cr_remote_full_count",
+			 fmt_int64((int64)cluster_cr_remote_full_count()));
+	emit_row(rsinfo, "cr", "cr_remote_partial_count",
+			 fmt_int64((int64)cluster_cr_remote_partial_count()));
+	emit_row(rsinfo, "cr", "cr_remote_failed_count",
+			 fmt_int64((int64)cluster_cr_remote_failed_count()));
+	emit_row(rsinfo, "cr", "cr_server_full_count",
+			 fmt_int64((int64)cluster_cr_server_full_count()));
+	emit_row(rsinfo, "cr", "cr_server_partial_count",
+			 fmt_int64((int64)cluster_cr_server_partial_count()));
+	emit_row(rsinfo, "cr", "cr_server_denied_count",
+			 fmt_int64((int64)cluster_cr_server_denied_count()));
 	/* spec-3.22 D3: xmax recycled-slot resolve outcome buckets. */
 	emit_row(rsinfo, "cr", "cr_xmax_resolved_count",
 			 fmt_int64((int64)cluster_cr_xmax_resolved_count()));

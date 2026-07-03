@@ -1572,6 +1572,37 @@ cluster_cr_cache_install_count(void)
 {
 	return 0;
 }
+/* spec-6.12b: CR-server data plane counters. */
+uint64
+cluster_cr_remote_full_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_remote_partial_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_remote_failed_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_server_full_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_server_partial_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_server_denied_count(void)
+{
+	return 0;
+}
 /* spec-3.22 D3: xmax recycled-slot resolve outcome buckets. */
 uint64
 cluster_cr_xmax_resolved_count(void)

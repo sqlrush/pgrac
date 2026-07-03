@@ -222,6 +222,14 @@ extern uint64 cluster_cr_xmax_recycled_invisible_count(void);
 extern uint64 cluster_cr_xmax_invalid_or_ambiguous_count(void);
 extern uint64 cluster_cr_xmax_scan_unavail_or_no_proof_count(void);
 
+/* spec-6.12b: CR-server data plane counters. */
+extern uint64 cluster_cr_remote_full_count(void);
+extern uint64 cluster_cr_remote_partial_count(void);
+extern uint64 cluster_cr_remote_failed_count(void);
+extern uint64 cluster_cr_server_full_count(void);
+extern uint64 cluster_cr_server_partial_count(void);
+extern uint64 cluster_cr_server_denied_count(void);
+
 /* Shmem region register / size / init (L206 5-step). */
 extern Size cluster_cr_shmem_size(void);
 extern void cluster_cr_shmem_init(void);

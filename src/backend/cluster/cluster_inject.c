@@ -349,6 +349,16 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 */
 	{ .name = "cluster-gcs-block-remote-downgrade" },
 	/*
+	 * spec-6.12b — CR-server construction refusal injection.
+	 *
+	 *	cluster-lms-cr-construct:
+	 *	  Fires in the LMS CR drain just before the stable copy +
+	 *	  construction.  SKIP forces the DENIED serve so TAP pins the
+	 *	  fail-closed requester leg (unchanged 53R9G) under a topology
+	 *	  that would otherwise serve FULL/PARTIAL.
+	 */
+	{ .name = "cluster-lms-cr-construct" },
+	/*
 	 * spec-5.2a D3 — FAITHFUL clean-page stale-holder injection.
 	 *
 	 *	cluster-clean-xfer-stale-holder:
