@@ -41,9 +41,11 @@
 #include "cluster/cluster.h"
 #include "cluster/cluster_elog.h"
 #include "cluster/cluster_ges_mode.h" /* cluster_ges_mode_init (spec-5.1a) */
+#include "cluster/cluster_guc.h"	  /* cluster_smart_fusion */
 #include "cluster/cluster_inject.h"	  /* CLUSTER_INJECTION_POINT (stage 0.30 sweep) */
 #include "cluster/cluster_shmem.h"	  /* cluster_init_shmem_module (stage 1.3) */
 #include "utils/elog.h"
+#include "utils/errcodes.h"
 
 
 /*
@@ -94,6 +96,13 @@ cluster_init(void)
 	 * (which is postmaster-only); the actual phase advance is
 	 * orchestrated in PostmasterMain only.
 	 */
+	if (cluster_smart_fusion)
+		ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("cluster.smart_fusion is fail-closed"),
+						errdetail("The spec-6.2 enabled path still lacks complete checkpoint, 2PC, "
+								  "and dependency-consumer soundness; leave cluster.smart_fusion "
+								  "off until those blockers are fixed.")));
+
 	CLUSTER_LOG(DEBUG1, "cluster_init: registering cluster shmem regions");
 
 	/*
