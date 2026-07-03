@@ -1044,6 +1044,31 @@ cluster_undo_buffer_writeback_check_hook(bool *newval, void **extra, GucSource s
 	return true;
 }
 
+/*
+ * spec-6.2 post-ship guardrail: Smart Fusion's early-transfer enabled path is
+ * a correctness-sensitive visibility / durability authority.  Keep the
+ * substrate counters, wire definitions, and off-path behavior, but reject the
+ * runtime path until checkpoint writeback, 2PC, and dependency-consumer
+ * contracts are closed end to end.
+ */
+static bool
+cluster_smart_fusion_check_hook(bool *newval, void **extra, GucSource source)
+{
+	(void)extra;
+	(void)source;
+
+	if (!*newval)
+		return true;
+
+	GUC_check_errcode(ERRCODE_INVALID_PARAMETER_VALUE);
+	GUC_check_errdetail("cluster.smart_fusion is fail-closed after the "
+						"v0.121.0-stage6.2 review because the enabled path still "
+						"lacks complete checkpoint, 2PC, and dependency-consumer "
+						"soundness; leave it off until those spec-6.2 blockers "
+						"are fixed.");
+	return false;
+}
+
 void
 cluster_init_guc(void)
 {
@@ -2824,13 +2849,13 @@ cluster_init_guc(void)
 
 	DefineCustomBoolVariable(
 		"cluster.smart_fusion",
-		gettext_noop("Enable spec-6.2 Smart Fusion early block-transfer dependency tracking."),
-		gettext_noop("Spec-6.2. Default off. When enabled with an authenticated tier3 direct-wire "
-					 "link and negotiated block-reply v2, dirty block transfer may overlap the "
-					 "origin WAL flush, with DBWR/checkpoint and commit brakes preserving "
-					 "WAL-before-data and commit-return soundness. Without those gates, the "
-					 "system stays on the conservative HC82 WAL-before-ship path."),
-		&cluster_smart_fusion, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+		gettext_noop("Guarded spec-6.2 Smart Fusion early block-transfer dependency tracking."),
+		gettext_noop("Spec-6.2. Default off and currently fail-closed if set on. The "
+					 "substrate counters and wire definitions remain available, but the "
+					 "early-transfer runtime path is rejected until checkpoint writeback, 2PC, "
+					 "and dependency-consumer soundness are complete."),
+		&cluster_smart_fusion, false, PGC_POSTMASTER, 0, cluster_smart_fusion_check_hook, NULL,
+		NULL);
 
 	DefineCustomEnumVariable(
 		"cluster.smart_fusion_tier_min",

@@ -180,7 +180,7 @@ ok($serr =~ /unknown cluster injection point/i,
 
 
 # ============================================================
-# §G  GUC framework (9 tests)
+# §G  GUC framework (12 tests)
 # ============================================================
 
 is($node->get_cluster_state_value('guc', 'cluster.node_id'),
@@ -210,6 +210,20 @@ is($node->get_cluster_state_value('guc', 'cluster.cf_delayed_cleanout'),
 
 is($node->get_cluster_state_value('guc', 'cluster.smart_fusion_tier_min'),
 	'tier3', 'G9 dump shows cluster.smart_fusion_tier_min GUC');
+
+is($node->get_cluster_state_value('guc', 'cluster.smart_fusion'),
+	'f', 'G10 dump shows cluster.smart_fusion guarded-off GUC');
+
+my $sf_guard = PostgreSQL::Test::Cluster->new('smart_fusion_guard');
+$sf_guard->init;
+$sf_guard->append_conf('postgresql.conf', "cluster.smart_fusion = on\n");
+is($sf_guard->start(fail_ok => 1), 0,
+	'G11 cluster.smart_fusion=on fails closed at startup');
+open my $sf_guard_log_fh, '<', $sf_guard->logfile
+	or die "open smart_fusion_guard log: $!";
+my $sf_guard_log = do { local $/; <$sf_guard_log_fh> };
+like($sf_guard_log, qr/cluster\.smart_fusion is fail-closed/i,
+	'G12 startup log explains the Smart Fusion guardrail');
 
 
 # ============================================================

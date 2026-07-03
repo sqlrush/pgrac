@@ -120,13 +120,16 @@ triage, and perf-gate snapshots.  The view never uses NULL values; an
 unknown or inactive counter is reported as `0`, `off`, or another
 explicit string.
 
-Spec-6.2 adds the Smart Fusion terminal-authority surface:
+Spec-6.2 adds the Smart Fusion terminal-authority surface.  The
+`cluster.smart_fusion` enabled path is currently fail-closed by startup
+configuration; its counters remain a substrate / diagnostic surface and
+must not be read as evidence that early transfer is active.
 
 | Category | Key | Meaning |
 |---|---|---|
 | `guc` | `cluster.cf_terminal_authority` | Live GUC value; `t` means terminal authority is enabled. |
 | `guc` | `cluster.cf_delayed_cleanout` | Terminal-authority cleanout policy: `off`, `reader`, or `eager`. |
-| `guc` | `cluster.smart_fusion` | Live GUC value; `t` means Smart Fusion early-transfer dependency tracking is enabled. |
+| `guc` | `cluster.smart_fusion` | Live GUC value; supported startup keeps this `f` because `on` is fail-closed by the guardrail. |
 | `guc` | `cluster.smart_fusion_tier_min` | Minimum negotiated interconnect tier required for v2 Smart Fusion block replies. |
 | `guc` | `cluster.smart_fusion_commit_brake_timeout_ms` | Pre-commit dependency brake timeout. |
 | `guc` | `cluster.smart_fusion_origin_durable_gossip_ms` | Durable-LSN gossip interval for dependency release. |
@@ -139,10 +142,10 @@ Spec-6.2 adds the Smart Fusion terminal-authority surface:
 | `undo` | `terminal_authority_nonterminal_failclosed_count` | In-progress/non-terminal remote outcome. |
 | `undo` | `terminal_authority_durable_failclosed_count` | Missing or mismatched durable-TT commit proof. |
 | `undo` | `terminal_authority_retention_failclosed_count` | Retention proof was required but unavailable. |
-| `smart_fusion` | `dep_install_count` | Early-transfer dependency vectors installed for received block images. |
-| `smart_fusion` | `dep_touch_count` | Transaction-local touches of buffers with pending Smart Fusion dependencies. |
-| `smart_fusion` | `dbwr_brake_count` | Buffer writeback attempts blocked because origin redo durability is unproven. |
-| `smart_fusion` | `commit_brake_count` | Transactions that entered the pre-commit dependency brake. |
+| `smart_fusion` | `dep_install_count` | Reserved substrate counter for dependency vectors installed from received block images; remains inactive while the guardrail is closed. |
+| `smart_fusion` | `dep_touch_count` | Reserved substrate counter for transaction-local touches of pending Smart Fusion dependencies. |
+| `smart_fusion` | `dbwr_brake_count` | Reserved substrate counter for writeback brakes; should remain zero while the guardrail is closed. |
+| `smart_fusion` | `commit_brake_count` | Reserved substrate counter for pre-commit dependency brakes; should remain zero while the guardrail is closed. |
 | `smart_fusion` | `commit_brake_wait_us` | Total microseconds spent waiting in the pre-commit dependency brake. |
 | `smart_fusion` | `origin_suspect_count` | Pending dependencies associated with an origin suspected dead or unavailable. |
 | `smart_fusion` | `dep_lost_failclosed_count` | Missing or malformed dependency evidence rejected fail-closed. |

@@ -136,19 +136,27 @@ DefineCustomStringVariable(
 	/* Stub for unit-test linking; real impl lives in PG backend. */
 }
 
+static GucBoolCheckHook smart_fusion_check_hook = NULL;
+static bool *smart_fusion_value_addr = NULL;
+static bool smart_fusion_boot_value = true;
+static GucContext smart_fusion_context = PGC_INTERNAL;
+
 void
-DefineCustomBoolVariable(const char *name pg_attribute_unused(),
-						 const char *short_desc pg_attribute_unused(),
-						 const char *long_desc pg_attribute_unused(),
-						 bool *valueAddr pg_attribute_unused(),
-						 bool bootValue pg_attribute_unused(),
-						 GucContext context pg_attribute_unused(), int flags pg_attribute_unused(),
-						 GucBoolCheckHook check_hook pg_attribute_unused(),
+DefineCustomBoolVariable(const char *name, const char *short_desc pg_attribute_unused(),
+						 const char *long_desc pg_attribute_unused(), bool *valueAddr,
+						 bool bootValue, GucContext context, int flags pg_attribute_unused(),
+						 GucBoolCheckHook check_hook,
 						 GucBoolAssignHook assign_hook pg_attribute_unused(),
 						 GucShowHook show_hook pg_attribute_unused())
 {
 	/* Stub for unit-test linking; real impl lives in PG backend.
 	 * Added at stage 1.2 for cluster.smgr_user_relations. */
+	if (strcmp(name, "cluster.smart_fusion") == 0) {
+		smart_fusion_check_hook = check_hook;
+		smart_fusion_value_addr = valueAddr;
+		smart_fusion_boot_value = bootValue;
+		smart_fusion_context = context;
+	}
 }
 
 /* spec-2.27 D4 stubs — GUC_check_errcode / GUC_check_errdetail macro
@@ -199,9 +207,9 @@ pre_format_elog_string(int errnum pg_attribute_unused(), const char *domain pg_a
 {}
 
 char *
-format_elog_string(const char *fmt pg_attribute_unused(), ...)
+format_elog_string(const char *fmt, ...)
 {
-	return NULL;
+	return (char *)fmt;
 }
 
 /*
@@ -337,14 +345,46 @@ UT_TEST(test_cluster_phase_remains_plain_global)
 }
 
 
+UT_TEST(test_smart_fusion_guc_is_guarded_failclosed)
+{
+	bool newval;
+	void *extra = NULL;
+
+	smart_fusion_check_hook = NULL;
+	smart_fusion_value_addr = NULL;
+	smart_fusion_boot_value = true;
+	smart_fusion_context = PGC_INTERNAL;
+	GUC_check_errdetail_string = NULL;
+
+	cluster_init_guc();
+
+	UT_ASSERT_NOT_NULL(smart_fusion_check_hook);
+	UT_ASSERT_EQ(smart_fusion_value_addr == &cluster_smart_fusion, true);
+	UT_ASSERT_EQ(smart_fusion_boot_value, false);
+	UT_ASSERT_EQ(smart_fusion_context, PGC_POSTMASTER);
+
+	newval = false;
+	extra = NULL;
+	UT_ASSERT_EQ(smart_fusion_check_hook(&newval, &extra, PGC_S_TEST), true);
+
+	newval = true;
+	extra = NULL;
+	UT_ASSERT_EQ(smart_fusion_check_hook(&newval, &extra, PGC_S_FILE), false);
+	UT_ASSERT_NOT_NULL(GUC_check_errdetail_string);
+	if (GUC_check_errdetail_string != NULL)
+		UT_ASSERT(strstr(GUC_check_errdetail_string, "cluster.smart_fusion") != NULL);
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(4);
+	UT_PLAN(5);
 	UT_RUN(test_cluster_node_id_default_is_minus_one);
 	UT_RUN(test_cluster_node_id_address_stable);
 	UT_RUN(test_cluster_init_guc_symbol_is_linkable);
 	UT_RUN(test_cluster_phase_remains_plain_global);
+	UT_RUN(test_smart_fusion_guc_is_guarded_failclosed);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
