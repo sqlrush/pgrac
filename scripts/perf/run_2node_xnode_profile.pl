@@ -469,9 +469,29 @@ sub pgbench_init
 sub pgbench_init_pair_degrading
 {
 	my ($node) = @_;
+
+	# spec-6.12d: XP_PAIR_INIT_LEASE=1 arms the static space-affinity lease
+	# for the DURATION OF THE INIT ONLY (ALTER SYSTEM + reload; PGC_SIGHUP),
+	# then restores the boot-conf value before the measurement phase.  The
+	# pair bulk COPY storm (extend-per-block HW master round-trips) is what
+	# made pair W-axis tax unmeasurable on every platform; leases collapse
+	# the extend traffic so init can complete.  Used identically by BOTH
+	# value-gate legs, so the A/B still differs only in the measured GUC.
+	my $init_lease = ($ENV{XP_PAIR_INIT_LEASE} // '') eq '1';
+	if ($init_lease)
+	{
+		eval {
+			$node->safe_psql('postgres',
+				"ALTER SYSTEM SET cluster.space_affinity = 'static'; "
+				  . 'SELECT pg_reload_conf()');
+			1;
+		} or progress('pair init lease crutch: arm failed (continuing)');
+	}
+
+	my $scale_got = 0;
 	for my $scale ($XP_SCALE, 4, 2, 1)
 	{
-		return $scale if pgbench_init($node, $scale);
+		if (pgbench_init($node, $scale)) { $scale_got = $scale; last; }
 		progress("pair pgbench init: degrading below scale $scale");
 		# a failed bulk COPY leaves partial tables + storm state behind;
 		# clear them (best effort) before the next, smaller attempt.
@@ -483,7 +503,17 @@ sub pgbench_init_pair_degrading
 		};
 		sleep 2;
 	}
-	return 0;
+
+	if ($init_lease)
+	{
+		eval {
+			$node->safe_psql('postgres',
+				'ALTER SYSTEM RESET cluster.space_affinity; '
+				  . 'SELECT pg_reload_conf()');
+			1;
+		} or progress('pair init lease crutch: restore failed');
+	}
+	return $scale_got;
 }
 
 # Loop one SQL text against a node until $secs elapse; each safe_psql call

@@ -56,7 +56,7 @@ my $has_visibility_inject =
 # and +1 for the unconditional "pgrac cluster cr admit stats" region (spec-5.52 D9;
 # and +1 for the unconditional "pgrac cluster cr relgen" region (spec-5.56 D4;
 # full enumerated region list + count lives in t/020).
-  my $expected_region_count = $has_visibility_inject ? '73' : '72'; # spec-6.2 +1 smart fusion deps; full list lives in t/020
+  my $expected_region_count = $has_visibility_inject ? '74' : '73'; # spec-6.2 +1 smart fusion deps; spec-6.12 +1 xnode lever +1 hw lease; full list lives in t/020
 
 
 # ----------

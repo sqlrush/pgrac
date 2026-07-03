@@ -577,6 +577,12 @@ void
 cluster_xnode_lever_shmem_register(void)
 {}
 
+/* spec-6.12d stub: cluster_init_shmem_module also calls
+ * cluster_hw_lease_shmem_register (cluster_hw_lease.c); no-op here. */
+void
+cluster_hw_lease_shmem_register(void)
+{}
+
 /* spec-3.4e D6 stub: cluster_init_shmem_module also calls
  * cluster_lock_path_shmem_register (cluster_itl.c).  cluster_unit
  * test binary doesn't link cluster_itl.o;  provide no-op stub. */

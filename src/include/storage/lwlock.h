@@ -251,6 +251,8 @@ typedef enum BuiltinTrancheIds {
 	LWTRANCHE_CLUSTER_NODE_REMOVE,
 	/* spec-6.5: guards the cluster backup / restore / PITR shmem block. */
 	LWTRANCHE_CLUSTER_BACKUP,
+	/* spec-6.12d: guards the per-node HW space-lease slot table. */
+	LWTRANCHE_CLUSTER_HW_LEASE,
 	/*
 	 * PGRAC (stage 1.14 Sprint A): dedicated tranche for
 	 * ClusterStatsSharedState lwlock — same pattern as LMON / LCK / DIAG.

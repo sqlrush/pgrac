@@ -90,6 +90,15 @@ bool cluster_page_scn_shortcut = false;
 bool cluster_read_scache = false;
 /* spec-6.12e1: GES release-side handoff verify + counters (default OFF). */
 bool cluster_ges_handoff = false;
+/* spec-6.12d: instance space-affinity mode + lease cap (default OFF). */
+int cluster_space_affinity = CLUSTER_SPACE_AFFINITY_OFF;
+int cluster_space_lease_blocks = 64;
+
+static const struct config_enum_entry cluster_space_affinity_options[]
+	= { { "off", CLUSTER_SPACE_AFFINITY_OFF, false },
+		{ "static", CLUSTER_SPACE_AFFINITY_STATIC, false },
+		{ "dynamic", CLUSTER_SPACE_AFFINITY_DYNAMIC, false },
+		{ NULL, 0, false } };
 /* spec-6.5: cluster-aware backup / restore / PITR target knobs. */
 char *cluster_recovery_target_scn = NULL;
 char *cluster_recovery_target_cluster_time = NULL;
@@ -931,6 +940,23 @@ check_cluster_block_device_path(char **newval, void **extra, GucSource source)
 	return true;
 }
 
+/*
+ * spec-6.12d: dynamic space affinity needs the spec-6.3 DRM remaster
+ * machinery; reject the value explicitly until that ships (rule 8 --
+ * never a silently inert setting).
+ */
+static bool
+check_cluster_space_affinity(int *newval, void **extra, GucSource source)
+{
+	if (*newval == CLUSTER_SPACE_AFFINITY_DYNAMIC) {
+		GUC_check_errdetail("cluster.space_affinity = \"dynamic\" requires the "
+							"DRM remaster machinery (spec-6.3), which is not "
+							"implemented yet; use \"static\" or \"off\".");
+		return false;
+	}
+	return true;
+}
+
 
 /*
  * cluster_init_guc -- register all cluster GUC variables.
@@ -1345,6 +1371,35 @@ cluster_init_guc(void)
 		gettext_noop("Verify the GES release-side deterministic handoff invariants."),
 		gettext_noop("Off keeps the drain path byte-identical (no verify, no counters)."),
 		&cluster_ges_handoff, false, PGC_SUSET, 0, NULL, NULL, NULL);
+
+	/*
+	 * cluster.space_affinity -- spec-6.12 wave d (static).  static makes
+	 * the cluster relation-extend path over-ask the HW master
+	 * (max(need, cluster.space_lease_blocks)), zero-extend the whole
+	 * grant (file stays dense) and park the unconsumed tail as this
+	 * node's private lease, consumed block-at-a-time before the shared
+	 * FSM (Q17-A extent-interior per-instance grouping; cuts HW master
+	 * round-trips by the lease factor).  dynamic is rejected until the
+	 * spec-6.3 DRM machinery ships (rule 8 explicit rejection).  Default
+	 * OFF: extend path byte-identical.
+	 */
+	DefineCustomEnumVariable(
+		"cluster.space_affinity",
+		gettext_noop("Instance space-affinity mode for cluster relation extends."),
+		gettext_noop("off = plain authority extends; static = per-node HW space leases."),
+		&cluster_space_affinity, CLUSTER_SPACE_AFFINITY_OFF, cluster_space_affinity_options,
+		PGC_SIGHUP, 0, check_cluster_space_affinity, NULL, NULL);
+
+	/*
+	 * cluster.space_lease_blocks -- spec-6.12 wave d.  Per-grant lease
+	 * cap; the transient bloat upper bound is
+	 * sum over active (relation, fork) leases of lease_blocks x nodes
+	 * (spec-6.12 v0.4 amendment 9), which the D0 bloat gate consumes.
+	 */
+	DefineCustomIntVariable(
+		"cluster.space_lease_blocks", gettext_noop("Blocks handed to a node per HW space lease."),
+		gettext_noop("Caps per-lease transient bloat (unconsumed zero pages)."),
+		&cluster_space_lease_blocks, 64, 1, 8192, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	/*
 	 * cluster.clean_leave_enabled -- opt-in cooperative clean-leave

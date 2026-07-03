@@ -50,6 +50,7 @@
 #include "cluster/cluster_touched_peers.h" /* spec-5.14 D6 self_hex stub */
 #include "cluster/cluster_xnode_profile.h" /* spec-5.59 D1 profiling gate stubs */
 #include "cluster/cluster_xnode_lever.h"   /* spec-6.12 lever counter stub */
+#include "cluster/cluster_hw_lease.h"	   /* spec-6.12d lease counter stub */
 
 #undef printf
 #undef fprintf
@@ -119,6 +120,10 @@ cluster_xp_bucket_name(ClusterXnodeBucket b pg_attribute_unused())
 /* spec-6.12 stub: dump_xnode_lever reads this pointer (NULL -> all-zero
  * rows); the unit harness does not link cluster_xnode_lever.o. */
 ClusterXnodeLeverShared *ClusterXnodeLeverCtl = NULL;
+
+/* spec-6.12d stub: dump_hw reads this pointer (NULL -> lease rows
+ * skipped); the unit harness does not link cluster_hw_lease.o. */
+ClusterHwLeaseShared *ClusterHwLeaseCtl = NULL;
 
 /* cluster_ic */
 const ClusterICOps *ClusterICOps_Active = NULL;

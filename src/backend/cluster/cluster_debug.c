@@ -103,6 +103,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_cr_tuple.h"		  /* cluster_cr_tuple_stat_* counters (spec-5.54 D5) */
 #include "cluster/cluster_xnode_profile.h"	  /* xnode profiling buckets (spec-5.59 D1) */
 #include "cluster/cluster_xnode_lever.h"	  /* xnode lever counters (spec-6.12) */
+#include "cluster/cluster_hw_lease.h"		  /* space-lease counters (spec-6.12d) */
 #include "cluster/cluster_resolver_cache.h"	  /* cluster_resolver_cache_* counters (spec-5.55 D8) */
 #include "cluster/cluster_cr_coordinator_stat.h" /* cluster_cr_coordinator_* counters (spec-5.57 D3) */
 #include "cluster/cluster_wal_state.h"			 /* wal_state registry dump (spec-4.2 D5) */
@@ -2675,6 +2676,25 @@ dump_hw(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_hw_remaster_done_count()));
 	emit_row(rsinfo, "hw", "remaster_blocked_count",
 			 fmt_int64((int64)cluster_hw_remaster_blocked_count()));
+
+	/*
+	 * spec-6.12d D-obs: space-lease counters.  bloat_ratio itself is a
+	 * per-relation D0-gate metric the harness computes from these plus
+	 * relation size; outstanding = leased_total - consumed - orphan_zero
+	 * is the live zero-page inventory across all active leases.
+	 */
+	if (ClusterHwLeaseCtl != NULL) {
+		uint64 leased = pg_atomic_read_u64(&ClusterHwLeaseCtl->d_leased_total);
+		uint64 consumed = pg_atomic_read_u64(&ClusterHwLeaseCtl->d_consumed);
+		uint64 orphan = pg_atomic_read_u64(&ClusterHwLeaseCtl->d_orphan_zero);
+
+		emit_row(rsinfo, "hw", "lease_leased_total", fmt_int64((int64)leased));
+		emit_row(rsinfo, "hw", "lease_consumed", fmt_int64((int64)consumed));
+		emit_row(rsinfo, "hw", "lease_orphan_zero", fmt_int64((int64)orphan));
+		emit_row(rsinfo, "hw", "lease_grants",
+				 fmt_int64((int64)pg_atomic_read_u64(&ClusterHwLeaseCtl->d_lease_grants)));
+		emit_row(rsinfo, "hw", "lease_outstanding", fmt_int64((int64)(leased - consumed - orphan)));
+	}
 }
 
 /*

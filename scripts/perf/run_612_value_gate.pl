@@ -131,6 +131,7 @@ sub run_leg
     local $ENV{XP_SCALE}     = $ENV{VG_SCALE}  if defined $ENV{VG_SCALE};
     local $ENV{XP_STORAGE}   = $ENV{VG_STORAGE} // '';
     local $ENV{XP_NETEM_MS}  = $ENV{VG_NETEM_MS} // '';
+    local $ENV{XP_PAIR_INIT_LEASE} = $ENV{VG_PAIR_INIT_LEASE} // '';
     my %wave_env = ($leg eq 'on' && $WAVE_ENV{$wave}) ? %{ $WAVE_ENV{$wave} } : ();
     local @ENV{keys %wave_env} = values %wave_env if %wave_env;
 

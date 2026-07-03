@@ -58,6 +58,7 @@
 #include "cluster/cluster_block_recovery.h" /* spec-4.10 D1 — online block recovery */
 #include "cluster/cluster_conf.h"			/* spec-5.7 HW — cluster_conf_node_count */
 #include "cluster/cluster_hw.h"				/* spec-5.7 HW — relation-extend authority */
+#include "cluster/cluster_hw_lease.h"	/* spec-6.12d — per-node HW space leases */
 #include "cluster/cluster_extend_gate.h" /* spec-5.7 §3.1d — liveness engage gate */
 #include "cluster/cluster_sf_dep.h"		/* spec-6.2 Smart Fusion DBWR brake */
 #include "cluster/cluster_xnode_profile.h"	/* spec-5.59 D3/D4 — read probe + relkind hint */
@@ -2026,6 +2027,7 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	ClusterHwClass hwc = CLUSTER_HW_NATIVE_LOCAL;
 	HwLock		hwlk;
 	ClusterResId hw_resid;
+	uint32		hw_lease_tail = 0;	/* spec-6.12d: parked grant tail */
 
 	if (cluster_relation_extend_lock_enabled && bmr.rel != NULL && cluster_node_id >= 0
 		&& fork == MAIN_FORKNUM && !RecoveryInProgress()
@@ -2178,9 +2180,27 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 		 * across nodes, so smgrzeroextend of distinct ranges is safe without it
 		 * held.  The authority may grant fewer blocks than requested; release
 		 * the surplus victim buffers (mirroring the extend_upto path below).
+		 *
+		 * PGRAC: spec-6.12d -- with static space affinity on, a plain-heap
+		 * extend over-asks the master (up to cluster.space_lease_blocks) so
+		 * the unconsumed tail of the grant can be parked as this node's
+		 * private lease: later writers on this node consume it without a
+		 * master round-trip (Q17-A extent-interior per-instance grouping).
+		 * Restricted to relkind 'r' main-fork extends without extend_upto,
+		 * the only shape the hio.c lease consumer serves.
 		 */
-		first_block = cluster_hw_allocate(RelationGetSmgr(bmr.rel)->smgr_rlocator.locator, fork,
-										  extend_by, seed_nblocks, &hw_granted);
+		{
+			uint32		hw_want = extend_by;
+
+			if (cluster_hw_lease_active() &&
+				extend_upto == InvalidBlockNumber &&
+				bmr.rel->rd_rel->relkind == RELKIND_RELATION &&
+				(uint32) cluster_space_lease_blocks > extend_by)
+				hw_want = (uint32) cluster_space_lease_blocks;
+
+			first_block = cluster_hw_allocate(RelationGetSmgr(bmr.rel)->smgr_rlocator.locator, fork,
+											  hw_want, seed_nblocks, &hw_granted);
+		}
 		cluster_hw_unlock(&hwlk);
 
 		if (first_block == InvalidBlockNumber || hw_granted == 0)
@@ -2213,6 +2233,18 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 				UnpinBuffer(buf_hdr);
 			}
 			extend_by = hw_granted;
+		}
+		else
+		{
+			/*
+			 * PGRAC: spec-6.12d -- the over-ask surplus becomes this node's
+			 * lease.  It MUST also be zero-extended below: the HWM advance
+			 * for the whole grant is already durable, so leaving the tail
+			 * beyond EOF would break the dense-file contract (Q17-A) for
+			 * every EOF consumer.  Parked after the physical extension
+			 * succeeds.
+			 */
+			hw_lease_tail = hw_granted - extend_by;
 		}
 	}
 	else
@@ -2386,6 +2418,26 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	 * We don't need to set checksum for all-zero pages.
 	 */
 	smgrzeroextend(bmr.smgr, fork, first_block, extend_by, false);
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: spec-6.12d -- physically materialize the lease tail of the HW
+	 * grant as zero pages (the file MUST stay dense up to the durably
+	 * advanced HWM) and only then park it.  No victim buffers exist for
+	 * these blocks -- they are disk-only zero pages, which is exactly what
+	 * keeps them out of the shared FSM (Q19-A #4) until a local writer
+	 * consumes them via the hio.c lease hook.  If smgrzeroextend throws,
+	 * no lease is installed and the range degrades to the documented
+	 * orphan-zero-page fail-safe once a later extend covers it.
+	 */
+	if (hw_lease_tail > 0)
+	{
+		smgrzeroextend(bmr.smgr, fork, first_block + extend_by,
+					   (int) hw_lease_tail, false);
+		cluster_hw_lease_install(bmr.smgr->smgr_rlocator.locator, fork,
+								 first_block + extend_by, hw_lease_tail);
+	}
+#endif
 
 	/*
 	 * Release the file-extension lock; it's now OK for someone else to extend

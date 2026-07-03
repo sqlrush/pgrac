@@ -47,6 +47,11 @@ on:
         required: false
         type: string
         default: ''
+      xp_pair_init_lease:
+        description: 'xnode-profile: arm space-affinity lease during pair pgbench init only (1 = on)'
+        required: false
+        type: string
+        default: ''
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -487,6 +492,7 @@ jobs:
           XP_SCALE="${XP_SCALE:-10}" \
           XP_EXTRA_GUC="${{ inputs.xp_extra_guc }}" \
           XP_INDEX_RELOPT="${{ inputs.xp_index_relopt }}" \
+          XP_PAIR_INIT_LEASE="${{ inputs.xp_pair_init_lease }}" \
           XP_TSV_OUT="scripts/perf/results/xnode-profile-${{ github.run_id }}.tsv" \
           XP_OUT="scripts/perf/results/xnode-profile-${{ github.run_id }}.md" \
           perl scripts/perf/run_2node_xnode_profile.pl \

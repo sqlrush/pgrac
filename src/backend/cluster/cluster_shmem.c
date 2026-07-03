@@ -74,6 +74,7 @@
 #include "cluster/cluster_hw.h"			   /* cluster_hw_shmem_register (spec-5.7 D1) */
 #include "cluster/cluster_xnode_profile.h" /* cluster_xnode_profile_shmem_register (spec-5.59 D1) */
 #include "cluster/cluster_xnode_lever.h"   /* cluster_xnode_lever_shmem_register (spec-6.12) */
+#include "cluster/cluster_hw_lease.h"	   /* cluster_hw_lease_shmem_register (spec-6.12d) */
 #include "cluster/cluster_dl.h"			   /* cluster_dl_shmem_register (spec-5.7 D4) */
 #include "cluster/cluster_ir.h"			   /* cluster_ir_shmem_register (spec-5.7 D8) */
 #include "cluster/cluster_ts.h"			   /* cluster_ts_shmem_register (spec-5.7 D5) */
@@ -822,6 +823,10 @@ cluster_init_shmem_module(void)
 	/* spec-6.12: per-wave lever counters (fixed size; GUC-gated use). */
 	if (cluster_shmem_lookup_region("pgrac cluster xnode lever") == NULL)
 		cluster_xnode_lever_shmem_register();
+
+	/* spec-6.12d: per-node HW space-lease slot table (GUC-gated use). */
+	if (cluster_shmem_lookup_region("pgrac cluster hw lease") == NULL)
+		cluster_hw_lease_shmem_register();
 }
 
 

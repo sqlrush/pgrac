@@ -160,6 +160,23 @@ extern bool cluster_read_scache;
 /* spec-6.12e1: GES release-side handoff verify switch (default off). */
 extern bool cluster_ges_handoff;
 
+/*
+ * spec-6.12d: instance space-affinity mode (default off).  static parks
+ * the unconsumed tail of oversized HW grants as a per-node lease
+ * (Q17-A extent-interior grouping); dynamic is spec-6.3 DRM territory
+ * and is rejected at GUC check time until that ships.
+ */
+typedef enum ClusterSpaceAffinity {
+	CLUSTER_SPACE_AFFINITY_OFF = 0,
+	CLUSTER_SPACE_AFFINITY_STATIC,
+	CLUSTER_SPACE_AFFINITY_DYNAMIC,
+} ClusterSpaceAffinity;
+
+extern int cluster_space_affinity;
+
+/* spec-6.12d: per-lease grant-size cap in blocks (bloat bound input). */
+extern int cluster_space_lease_blocks;
+
 
 /*
  * cluster_injection_points -- comma-separated names to auto-arm at startup.

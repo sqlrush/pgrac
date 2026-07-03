@@ -95,6 +95,7 @@ OBJS = \
 	cluster_thread_recovery_worker.o \
 	cluster_remote_xact.o \
 	cluster_reverse_key.o \
+	cluster_hw_lease.o \
 	cluster_dl.o \
 	cluster_dl_lock.o \
 	cluster_ir.o \
