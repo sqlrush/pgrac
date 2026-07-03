@@ -150,6 +150,30 @@ sub count_wal_files
 	return $count;
 }
 
+# Like wait_for_log_match, but only matches log content written after
+# $offset bytes -- needed when the same line already appeared earlier
+# (e.g. "ready to accept" before and after a fail-stop restart).
+sub wait_for_log_match_from
+{
+	my ($node, $offset, $regex, $timeout) = @_;
+	$timeout //= 60;
+
+	my $deadline = time() + $timeout;
+	my $logfile = $node->logfile;
+
+	while (time() < $deadline)
+	{
+		if (-f $logfile)
+		{
+			my $content = PostgreSQL::Test::Utils::slurp_file($logfile);
+			my $tail = length($content) > $offset ? substr($content, $offset) : '';
+			return $& if $tail =~ /$regex/;
+		}
+		usleep(250_000);
+	}
+	return undef;
+}
+
 my $primary_wal_root = PostgreSQL::Test::Utils::tempdir();
 my $primary_shared_root = PostgreSQL::Test::Utils::tempdir();
 my $standby_wal_root = PostgreSQL::Test::Utils::tempdir();
@@ -254,6 +278,7 @@ cluster.shared_data_dir = '$standby_shared_root'
 cluster.smgr_user_relations = on
 cluster.cssd_heartbeat_interval_ms = 2000
 cluster.cssd_dead_deadband_factor = 10
+cluster.adg_lease_takeover_grace_ms = 1000
 max_prepared_transactions = 10
 };
 $standby0->append_conf('postgresql.conf', $standby_common_conf);
@@ -265,7 +290,16 @@ $standby1->append_conf('postgresql.conf', "cluster.node_id = 1\n");
 write_pair_conf($standby0, $standby1, 'adg2_standby');
 
 $standby0->start;
-$standby1->start;
+
+# standby1 is a non-master node: INV-ADG5 blocks its replay until it holds
+# the apply-master lease, so it never reaches hot standby and pg_ctl -w
+# cannot succeed.  Start it without waiting for read service.
+{
+	local $ENV{PGCTLTIMEOUT} = 5;
+	my $started = $standby1->start(fail_ok => 1);
+	is($started, 0,
+		'standby node1 does not open read service without the apply-master lease');
+}
 
 poll_psql_value($standby0,
 	q{SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'remote file server'},
@@ -275,10 +309,20 @@ poll_psql_value($standby0,
 	q{SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'managed recovery process'},
 	'1',
 	'standby node0 runs MRP coordinator');
-poll_psql_value($standby1,
-	q{SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'managed recovery process'},
-	'1',
-	'standby node1 runs MRP coordinator for attach/read service');
+
+# Fail-closed posture (spec-6.4 P0-2): the non-master node parks before its
+# first replayed record and refuses client reads instead of serving
+# incoherent shared-storage pages.
+ok($standby1->wait_for_log_match(
+		qr/ADG standby is waiting for the apply-master lease before replaying WAL/, 60),
+	'standby node1 parks at the INV-ADG5 gate as a warm takeover candidate');
+{
+	my ($ret1, $out1, $err1) = $standby1->psql('postgres', 'SELECT 1');
+	isnt($ret1, 0, 'standby node1 refuses reads while not apply master');
+	like($err1,
+		qr/starting up|not yet accepting connections|read point is not available/,
+		'standby node1 read refusal is the fail-closed startup/read-point error');
+}
 
 ok($standby0->wait_for_log_match(qr/ADG RFS upstream 1 for thread 1 connected and streaming/, 60),
 	'RFS upstream 1 is bound to primary thread 1');
@@ -301,16 +345,15 @@ SELECT count(*) || '|' || coalesce(sum(id), 0)
 
 $standby0->safe_psql('postgres', 'CHECKPOINT');
 
-poll_psql_value($standby1,
-	q{
-SELECT count(*) || '|' || coalesce(sum(id), 0)
-  FROM (SELECT id FROM adg_pair_p0
-        UNION ALL
-        SELECT id FROM adg_pair_p1) s
-	},
-	'2|3',
-	'standby attach node reads the apply-master shared result',
-	240);
+# spec-6.4 P0-2: the non-master node must keep refusing reads even while the
+# apply master serves them -- cross-node standby reads stay fail-closed until
+# cluster coherence covers them.
+{
+	my ($ret1, $out1, $err1) = $standby1->psql('postgres',
+		q{SELECT count(*) FROM adg_pair_p0});
+	isnt($ret1, 0,
+		'standby attach node keeps refusing reads while node0 is apply master');
+}
 
 ok(count_wal_files("$standby_wal_root/thread_1") > 0,
 	'RFS landed WAL files for primary thread 1');
@@ -326,7 +369,86 @@ SELECT dg_role, dg_mode, adg_enabled, mrp_status, apply_master_node_id,
 	'standby|max_availability|t|ready|0|t|t',
 	'ADG view reports elected apply master and read floor');
 
+# ------------------------------------------------------------------
+# L9: lease loss -- no double apply (spec-6.4 INV-ADG5 e2e).
+#
+# Freeze node0's MRP so its apply-master lease expires without renewal.
+# The lease-expired master must fail stop BEFORE applying its next
+# record (never apply under an invalid lease), and may only resume
+# after re-taking the lease with a strictly higher term.  node1 stays
+# excluded the whole time: the voting-disk candidate gate only admits
+# the lowest CSSD-alive node, and node0 stays alive throughout.  (The
+# full cssd-dead partition takeover is chaos-harness scope; the
+# enforcement point of the invariant -- fail-stop before apply -- is
+# exercised for real here.)
+# ------------------------------------------------------------------
+my $term_before = trim($standby0->safe_psql('postgres',
+	q{SELECT apply_master_term FROM pg_stat_cluster_adg}));
+ok($term_before =~ /^\d+$/ && $term_before > 0, 'L9 captured pre-freeze apply-master term');
+
+my $mrp0_pid = trim($standby0->safe_psql('postgres',
+	q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'managed recovery process'}));
+ok($mrp0_pid =~ /^\d+$/, 'L9 found node0 MRP pid');
+
+my $standby0_log_offset = -s $standby0->logfile;
+
+kill 'STOP', $mrp0_pid or die "SIGSTOP $mrp0_pid: $!";
+
+# Push one more record at the lease-expired master: the INV-ADG5 gate must
+# fail stop instead of applying it.
+$primary0->safe_psql('postgres', q{INSERT INTO adg_pair_p0 VALUES (3, 'post-expiry')});
+my $post_expiry_scn = trim($primary0->safe_psql('postgres', q{SELECT cluster_scn_current()}));
+ok(wait_for_log_match_from($standby0, $standby0_log_offset,
+		qr/was not renewed within the takeover-grace window|does not hold the apply-master lease|taken over by another node/,
+		120),
+	'L9 lease-expired node0 fails stop before applying the next record');
+
+# Release the frozen MRP so the shutdown can finish.  A startup-process
+# fail-stop takes the whole node down (the strictest fail-stop; an external
+# supervisor restarts the instance).
+kill 'CONT', $mrp0_pid;
+ok(wait_for_log_match_from($standby0, $standby0_log_offset,
+		qr/database system is shut down/, 120),
+	'L9 failed-stop node0 shuts down completely');
+
+# node1 was never admitted: even with the master down and the lease expired
+# it stays excluded (node0 is still the durable candidate) and keeps
+# refusing reads.
+{
+	my ($ret1, $out1, $err1) = $standby1->psql('postgres', 'SELECT 1');
+	isnt($ret1, 0, 'L9 node1 never became apply master and still refuses reads');
+}
+
+# Retire node1 before restarting node0: its parked postmaster still
+# heartbeats the voting disks, and a bootstrapping node0 would otherwise
+# seed it into the membership and stall GCS against a node that runs no
+# interconnect service (it never left recovery).
 $standby1->stop;
+
+# Restart node0 as the external supervisor would.  It re-takes the lease
+# with a strictly higher term and applies the deferred record exactly once.
+$standby0->stop('fast', fail_ok => 1);    # reconcile tracked pid with the dead postmaster
+$standby0->start;
+
+poll_psql_value($standby0,
+	qq{SELECT apply_master_node_id = 0 AND apply_master_term > $term_before
+	     FROM pg_stat_cluster_adg},
+	't',
+	'L9 node0 re-mastered under a strictly higher term');
+
+# The deferred record is applied only now, under the new term: the read
+# floor crossing the post-expiry commit SCN proves the apply happened after
+# re-mastering (replay was fenced before it).  Asserted through the ADG
+# view: a user-table read would consult GCS toward the retired-but-durably-
+# registered node1 slot, which a standby cluster cannot judge dead (no CSSD
+# below PM_RUN) -- that parked-peer membership gap is registered as
+# Stage-6 coherence forward work in the spec amend.
+poll_psql_value($standby0,
+	qq{SELECT standby_consistent_scn >= $post_expiry_scn FROM pg_stat_cluster_adg},
+	't',
+	'L9 the deferred record is applied under the new term (read floor crosses it)',
+	240);
+
 $standby0->stop;
 $primary1->stop;
 $primary0->stop;

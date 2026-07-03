@@ -118,6 +118,26 @@ sub wait_for_adg_scn_floor
 	die "timed out waiting for ADG standby SCN floor to reach $target_scn";
 }
 
+# spec-6.4 F4: a negative-visibility assertion is only meaningful once the
+# standby has APPLIED (not merely landed) the WAL in question; otherwise it
+# passes vacuously against the pre-apply state.
+sub wait_for_adg_applied
+{
+	my ($standby, $target_lsn) = @_;
+
+	for my $try (1 .. 240)
+	{
+		my ($ret, $stdout, $stderr) = $standby->psql(
+			'postgres',
+			qq{SELECT apply_lsn >= '$target_lsn'::pg_lsn FROM pg_stat_cluster_adg});
+		return if $ret == 0 && trim($stdout) eq 't';
+
+		select(undef, undef, undef, 0.25);
+	}
+
+	die "timed out waiting for ADG standby apply_lsn to reach $target_lsn";
+}
+
 my $primary_wal_root = PostgreSQL::Test::Utils::tempdir();
 my $primary_thread_dir = "$primary_wal_root/thread_8";
 
@@ -130,7 +150,10 @@ cluster.dg_role = primary
 cluster.dg_mode = max_availability
 cluster.enable_adg = on
 cluster.wal_threads_dir = '$primary_wal_root'
-cluster.adg_barrier_interval_ms = 100
+# Barriers start disabled so the standby's read point provably cannot
+# publish -- the L5c leg asserts the fail-closed 57R07 refusal -- and are
+# enabled by reload right after it.
+cluster.adg_barrier_interval_ms = 300000
 wal_level = replica
 max_wal_senders = 5
 max_replication_slots = 5
@@ -194,6 +217,33 @@ ok($standby->wait_for_log_match(
 		qr/ADG RFS upstream 1 for thread 8 connected and streaming/, 30),
 	'L0 RFS coordinator opened a thread-bound upstream stream');
 
+# L5c (spec-6.4): with no consistency barriers ever shipped, the standby has
+# no read point and every read must fail closed with 57R07 -- never serve a
+# snapshot it cannot prove.
+{
+	my ($r7, $o7, $e7) = $standby->psql('postgres', 'SELECT 1');
+	isnt($r7, 0, 'L5c standby refuses reads while the read point is unavailable');
+	like($e7, qr/read point is not available/,
+		'L5c read refusal is the 57R07 unresolvable-read-point error');
+}
+
+# Enable barriers; the read floor publishes and read service opens.
+$primary->append_conf('postgresql.conf', "cluster.adg_barrier_interval_ms = 100\n");
+$primary->reload;
+
+# spec-6.4 F5: the RFS/MRP aux processes must be visible in pg_stat_activity
+# (this is also the only e2e coverage of their backend-status slot wiring).
+poll_psql_value(
+	$standby,
+	q{SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'remote file server'},
+	'1',
+	'L0 RFS coordinator aux process is running');
+poll_psql_value(
+	$standby,
+	q{SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'managed recovery process'},
+	'1',
+	'L0 MRP coordinator aux process is running');
+
 $primary->safe_psql('postgres', q{INSERT INTO adg_smoke SELECT generate_series(1, 3)});
 my $target_scn = trim($primary->safe_psql('postgres', q{SELECT cluster_scn_current()}));
 my $target_lsn = wait_for_adg_rfs_landed($primary, $standby_primary_thread_dir);
@@ -246,8 +296,9 @@ BEGIN;
 	PREPARE TRANSACTION 'adg_commit_prepared';
 	});
 $target_lsn = wait_for_adg_rfs_landed($primary, $standby_primary_thread_dir);
-poll_psql_value($standby, q{SELECT count(*) FROM adg_2pc}, '0',
-	'L4 prepared transaction remains invisible before COMMIT PREPARED');
+wait_for_adg_applied($standby, $target_lsn);
+is($standby->safe_psql('postgres', q{SELECT count(*) FROM adg_2pc}), '0',
+	'L4 prepared transaction remains invisible after its records are applied');
 
 $primary->safe_psql('postgres', q{COMMIT PREPARED 'adg_commit_prepared'});
 $target_scn = trim($primary->safe_psql('postgres', q{SELECT cluster_scn_current()}));
@@ -276,12 +327,14 @@ BEGIN;
 	PREPARE TRANSACTION 'adg_rollback_prepared';
 	});
 $target_lsn = wait_for_adg_rfs_landed($primary, $standby_primary_thread_dir);
-poll_psql_value($standby, q{SELECT count(*) FROM adg_2pc}, '1',
-	'L5 second prepared transaction remains invisible before rollback');
+wait_for_adg_applied($standby, $target_lsn);
+is($standby->safe_psql('postgres', q{SELECT count(*) FROM adg_2pc}), '1',
+	'L5 second prepared transaction remains invisible after its records are applied');
 
 $primary->safe_psql('postgres', q{ROLLBACK PREPARED 'adg_rollback_prepared'});
 $target_lsn = wait_for_adg_rfs_landed($primary, $standby_primary_thread_dir);
-poll_psql_value($standby, q{SELECT count(*) FROM adg_2pc}, '1',
+wait_for_adg_applied($standby, $target_lsn);
+is($standby->safe_psql('postgres', q{SELECT count(*) FROM adg_2pc}), '1',
 	'L5 ROLLBACK PREPARED redo does not expose aborted prepared rows');
 
 poll_psql_value(
@@ -293,6 +346,40 @@ poll_psql_value(
 	},
 	't',
 	'L6 standby SCN floor is monotonic across prepared commit replay');
+
+# L7b (spec-6.4): freeze apply while shipping keeps flowing -- reads must
+# fail closed with 57R06 once the tracked lag exceeds the threshold, and
+# recover after apply catches back up.
+my $startup_pid = trim($standby->safe_psql('postgres',
+	q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'startup'}));
+ok($startup_pid =~ /^\d+$/, 'L7b found standby startup pid');
+
+$standby->append_conf('postgresql.conf', "cluster.adg_lag_threshold_sec = 1\n");
+$standby->reload;
+
+kill 'STOP', $startup_pid or die "SIGSTOP $startup_pid: $!";
+$primary->safe_psql('postgres', q{INSERT INTO adg_smoke VALUES (100)});
+wait_for_adg_rfs_landed($primary, $standby_primary_thread_dir);
+
+my $lag_seen = 0;
+for my $try (1 .. 120)
+{
+	my ($lret, $lout, $lerr) = $standby->psql('postgres',
+		q{SELECT count(*) FROM adg_smoke});
+	if ($lret != 0 && $lerr =~ /apply lag exceeds/)
+	{
+		$lag_seen = 1;
+		last;
+	}
+	select(undef, undef, undef, 0.25);
+}
+ok($lag_seen, 'L7b reads fail closed with 57R06 once apply lag exceeds the threshold');
+
+kill 'CONT', $startup_pid;
+$standby->append_conf('postgresql.conf', "cluster.adg_lag_threshold_sec = 300\n");
+$standby->reload;
+poll_psql_value($standby, q{SELECT count(*) FROM adg_smoke WHERE id = 100}, '1',
+	'L7b reads recover after apply catches up');
 
 my ($ret, $stdout, $stderr) = $standby->psql('postgres',
 	q{CREATE TABLE adg_should_fail(id int)});

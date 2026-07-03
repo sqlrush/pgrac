@@ -508,6 +508,86 @@ static uint64 cluster_recovery_own_merge_bound = 0;
  * the lease or seeing a different term is a FATAL fail-stop (P0-1): cached
  * pages may be stale against an interim master and must be discarded. */
 static uint64 cluster_adg_applied_under_term = 0;
+/* Renewal-gap deadline: an ex-master waits at most half the takeover grace
+ * for a same-term renewal to land before failing stop.  0 = not waiting. */
+static int64 cluster_adg_gate_gap_deadline_ms = 0;
+/* Once-per-episode logging for the closed gate (operator visibility). */
+static bool cluster_adg_gate_wait_logged = false;
+
+/*
+ * cluster_adg_apply_gate_self_valid -- INV-ADG5 gate predicate + fail-stop
+ *	policy, shared by the streaming-loop pre-gates and the ApplyWalRecord
+ *	gate so a deposed master fails stop promptly wherever it is waiting.
+ *
+ *	Returns true when this node holds a fresh apply-master lease and may
+ *	apply; records the term it clears us under.  A node that has already
+ *	applied records under some term FATALs on term change, on a foreign
+ *	takeover, and when a renewal gap outlives half the takeover grace --
+ *	its cached pages may be stale against an interim master, and the only
+ *	safe reaction is to discard them by failing stop (P0-1).
+ */
+static bool
+cluster_adg_apply_gate_self_valid(void)
+{
+	uint64		term = 0;
+	ClusterMrpApplyGateState gate = cluster_mrp_apply_gate_probe(&term);
+
+	if (gate == CLUSTER_MRP_APPLY_GATE_SELF_VALID)
+	{
+		if (cluster_adg_applied_under_term != 0
+			&& term != cluster_adg_applied_under_term)
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_ADG_NOT_APPLY_MASTER),
+					 errmsg("ADG apply-master term changed from " UINT64_FORMAT
+							" to " UINT64_FORMAT " while this node held replayed state",
+							cluster_adg_applied_under_term, term),
+					 errdetail("Another Apply Master may have applied WAL in between; "
+							   "this node fails stop to discard its cached pages.")));
+		cluster_adg_applied_under_term = term;
+		cluster_adg_gate_gap_deadline_ms = 0;
+		if (cluster_adg_gate_wait_logged)
+		{
+			ereport(LOG,
+					(errmsg("ADG standby acquired the apply-master lease (term " UINT64_FORMAT
+							"); resuming WAL replay",
+							term)));
+			cluster_adg_gate_wait_logged = false;
+		}
+		return true;
+	}
+
+	/* Once per wait episode: make the closed gate operator-visible. */
+	if (!cluster_adg_gate_wait_logged)
+	{
+		ereport(LOG,
+				(errmsg("ADG standby is waiting for the apply-master lease before "
+						"replaying WAL")));
+		cluster_adg_gate_wait_logged = true;
+	}
+
+	if (cluster_adg_applied_under_term != 0)
+	{
+		int64		now_ms = (int64) (GetCurrentTimestamp() / 1000);
+
+		if (gate == CLUSTER_MRP_APPLY_GATE_FOREIGN_MASTER)
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_ADG_NOT_APPLY_MASTER),
+					 errmsg("ADG apply-master lease was taken over by another node"),
+					 errdetail("This deposed node fails stop to discard its cached pages "
+							   "before the new Apply Master's writes could be shadowed.")));
+		if (cluster_adg_gate_gap_deadline_ms == 0)
+			cluster_adg_gate_gap_deadline_ms =
+				now_ms + cluster_adg_lease_takeover_grace_ms / 2;
+		else if (now_ms >= cluster_adg_gate_gap_deadline_ms)
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_ADG_NOT_APPLY_MASTER),
+					 errmsg("ADG apply-master lease was not renewed within the "
+							"takeover-grace window"),
+					 errdetail("This node's lease may already be up for takeover; it fails "
+							   "stop to discard its cached pages.")));
+	}
+	return false;
+}
 #endif
 #ifdef USE_PGRAC_CLUSTER
 static XLogRecPtr cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start,
@@ -2414,9 +2494,10 @@ cluster_adg_streaming_replay(XLogPrefetcher *xlogprefetcher, XLogReaderState *xl
 				 * writes through the shared smgr, so replaying it without
 				 * the lease would race the current Apply Master's writes
 				 * into the same shared files.  A node that cannot obtain
-				 * the lease waits here and never opens for reads.
+				 * the lease waits here and never opens for reads; an
+				 * ex-master fails stop inside the predicate (P0-1).
 				 */
-				if (!cluster_mrp_apply_master_can_apply())
+				if (!cluster_adg_apply_gate_self_valid())
 				{
 					cluster_adg_streaming_wait(&streaming_reply_sent);
 					continue;
@@ -2481,7 +2562,7 @@ cluster_adg_streaming_replay(XLogPrefetcher *xlogprefetcher, XLogReaderState *xl
 			active_bitmap[1] = bitmap[1];
 		}
 
-		if (!cluster_mrp_apply_master_can_apply())
+		if (!cluster_adg_apply_gate_self_valid())
 		{
 			cluster_adg_streaming_wait(&streaming_reply_sent);
 			continue;
@@ -2616,50 +2697,8 @@ ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *repl
 	 */
 	if (RecoveryInProgress() && cluster_mrp_should_start())
 	{
-		int64		gap_deadline_ms = 0;
-
-		for (;;)
+		while (!cluster_adg_apply_gate_self_valid())
 		{
-			uint64		term = 0;
-			ClusterMrpApplyGateState gate = cluster_mrp_apply_gate_probe(&term);
-
-			if (gate == CLUSTER_MRP_APPLY_GATE_SELF_VALID)
-			{
-				if (cluster_adg_applied_under_term != 0
-					&& term != cluster_adg_applied_under_term)
-					ereport(FATAL,
-							(errcode(ERRCODE_CLUSTER_ADG_NOT_APPLY_MASTER),
-							 errmsg("ADG apply-master term changed from " UINT64_FORMAT
-									" to " UINT64_FORMAT " while this node held replayed state",
-									cluster_adg_applied_under_term, term),
-							 errdetail("Another Apply Master may have applied WAL in between; "
-									   "this node fails stop to discard its cached pages.")));
-				cluster_adg_applied_under_term = term;
-				break;
-			}
-
-			if (cluster_adg_applied_under_term != 0)
-			{
-				int64		now_ms = (int64) (GetCurrentTimestamp() / 1000);
-
-				if (gate == CLUSTER_MRP_APPLY_GATE_FOREIGN_MASTER)
-					ereport(FATAL,
-							(errcode(ERRCODE_CLUSTER_ADG_NOT_APPLY_MASTER),
-							 errmsg("ADG apply-master lease was taken over by another node"),
-							 errdetail("This deposed node fails stop to discard its cached "
-									   "pages before the new Apply Master's writes could be "
-									   "shadowed.")));
-				if (gap_deadline_ms == 0)
-					gap_deadline_ms = now_ms + cluster_adg_lease_takeover_grace_ms / 2;
-				else if (now_ms >= gap_deadline_ms)
-					ereport(FATAL,
-							(errcode(ERRCODE_CLUSTER_ADG_NOT_APPLY_MASTER),
-							 errmsg("ADG apply-master lease was not renewed within the "
-									"takeover-grace window"),
-							 errdetail("This node's lease may already be up for takeover; "
-									   "it fails stop to discard its cached pages.")));
-			}
-
 			HandleStartupProcInterrupts();
 			(void) WaitLatch(&XLogRecoveryCtl->recoveryWakeupLatch,
 							 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,

@@ -761,12 +761,40 @@ WalSndAdjustAdgThreadStartpoint(StartReplicationCmd *cmd, XLogRecPtr flushPtr,
 		 * spec-6.4 P0-3: an invalid startpoint is the standby's explicit
 		 * "earliest available" request -- it has no same-space restart
 		 * source for this thread and must not borrow one from another
-		 * thread's LSN space.  Scan forward from the oldest segment this
-		 * primary still retains; re-streaming already-applied WAL is
+		 * thread's LSN space.  Scan forward from the oldest segment file
+		 * actually present in this primary's WAL directory (a basebackup-
+		 * born instance starts well past segment 1 without ever having
+		 * "removed" anything); re-streaming already-applied WAL is
 		 * idempotent on the standby, whereas guessing high loses records.
 		 */
-		XLogSegNo	oldest = XLogGetLastRemovedSegno() + 1;
+		DIR		   *dir;
+		struct dirent *de;
+		XLogSegNo	oldest = 0;
 
+		dir = AllocateDir(XLOGDIR);
+		while ((de = ReadDirExtended(dir, XLOGDIR, DEBUG1)) != NULL)
+		{
+			TimeLineID	ftli;
+			XLogSegNo	fsegno;
+
+			if (!IsXLogFileName(de->d_name))
+				continue;
+			XLogFromFileName(de->d_name, &ftli, &fsegno, wal_segment_size);
+			if (ftli != tli)
+				continue;
+			if (oldest == 0 || fsegno < oldest)
+				oldest = fsegno;
+		}
+		if (dir != NULL)
+			FreeDir(dir);
+		if (oldest <= XLogGetLastRemovedSegno())
+			oldest = XLogGetLastRemovedSegno() + 1;
+		if (oldest == 0)
+		{
+			/* no WAL on this timeline at all: start at the flush point */
+			cmd->startpoint = flushPtr - (flushPtr % XLOG_BLCKSZ);
+			return;
+		}
 		XLogSegNoOffsetToRecPtr(oldest, 0, wal_segment_size, scanptr);
 	}
 	else if (cmd->startpoint >= flushPtr)

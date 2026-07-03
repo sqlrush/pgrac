@@ -290,8 +290,8 @@ pgstat_beinit(void)
 }
 
 /*
- * Verify the selected backend status slot's out-of-line fields point at
- * their per-slot buffers before pgstat_bestart() writes through them.
+ * PGRAC: verify the selected backend status slot's out-of-line fields point
+ * at their per-slot buffers before pgstat_bestart() writes through them.
  *
  * CreateSharedBackendStatus() wired these pointers when the postmaster
  * created shared memory; every child inherits them.  Verify-only on
