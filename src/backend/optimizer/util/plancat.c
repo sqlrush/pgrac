@@ -11,6 +11,12 @@
  * IDENTIFICATION
  *	  src/backend/optimizer/util/plancat.c
  *
+ * PGRAC MODIFICATIONS
+ *	  Modified by: SqlRush <sqlrush@gmail.com>
+ *	  - get_relation_info: mark a reverse-key btree non-orderable (NULL
+ *	    sortopfamily) and flag IndexOptInfo.cluster_reverse_key.
+ *	    Spec: spec-6.12-crossnode-cache-fusion-perf-optimization.md (wave f)
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -309,7 +315,11 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 				/*
 				 * Fetch the ordering information for the index, if any.
 				 */
-				if (info->relam == BTREE_AM_OID)
+				if (info->relam == BTREE_AM_OID
+#ifdef USE_PGRAC_CLUSTER
+					&& !BTGetClusterReverseKey(indexRelation)
+#endif
+					)
 				{
 					/*
 					 * If it's a btree index, we can use its opfamily OIDs
@@ -329,6 +339,25 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 						info->nulls_first[i] = (opt & INDOPTION_NULLS_FIRST) != 0;
 					}
 				}
+#ifdef USE_PGRAC_CLUSTER
+				else if (info->relam == BTREE_AM_OID)
+				{
+					/*
+					 * PGRAC: spec-6.12f -- a reverse-key btree index stores
+					 * byte-reversed keys, so it provides NO usable sort
+					 * order.  Leaving sortopfamily NULL makes the planner
+					 * treat it as non-ordering (build_index_pathkeys returns
+					 * NIL on NULL sortopfamily), so ORDER BY never matches
+					 * and no ordering code touches reverse_sort/nulls_first.
+					 * The flag makes index-path matching accept only
+					 * equality clauses (Q18-A equality-only).
+					 */
+					info->sortopfamily = NULL;
+					info->reverse_sort = NULL;
+					info->nulls_first = NULL;
+					info->cluster_reverse_key = true;
+				}
+#endif
 				else if (amroutine->amcanorder)
 				{
 					/*

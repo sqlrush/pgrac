@@ -1,0 +1,242 @@
+-- ============================================================
+-- reverse_key -- pgrac spec-6.12 wave f regression.
+--
+--	Reverse-key btree index (reloption cluster_reverse_key):
+--	byte-reversed leading integer key scatters monotonic inserts
+--	across leaf pages; equality-only planner contract (Q18-A).
+--	Locks: equality correctness on both build paths (CREATE INDEX
+--	over populated table vs incremental btinsert), cross-type
+--	probe normalization, planner rejection of range / ORDER BY /
+--	index-only paths, build-time type validation, unique
+--	constraint behavior, and the post-ANALYZE costing path that
+--	used to segfault (NULL sortopfamily in btcostestimate /
+--	get_actual_variable_range).
+--	See specs/spec-6.12-crossnode-cache-fusion-perf-optimization.md
+--	wave f + spec-0.21-cluster-regress.md §2.2.
+--
+--	Author: SqlRush <sqlrush@gmail.com>
+--	Portions Copyright (c) 2026, pgrac contributors
+-- ============================================================
+-- ----------
+-- 1. Build path A: CREATE INDEX over a populated table (nbtsort
+--    spool) must store the reversed encoding; equality probes work.
+-- ----------
+CREATE TABLE rk_pop (id int);
+INSERT INTO rk_pop SELECT g FROM generate_series(1, 10000) g;
+INSERT INTO rk_pop VALUES (-42);
+CREATE INDEX rk_pop_rev ON rk_pop (id) WITH (cluster_reverse_key = on);
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT count(*) FROM rk_pop WHERE id = 4242;
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM rk_pop WHERE id = -42;
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM rk_pop WHERE id = 123456789;  -- absent value
+ count 
+-------
+     0
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT * FROM rk_pop WHERE id = 4242;
+              QUERY PLAN               
+---------------------------------------
+ Index Scan using rk_pop_rev on rk_pop
+   Index Cond: (id = 4242)
+(2 rows)
+
+-- ----------
+-- 2. Post-ANALYZE planning must not crash (regression: NULL
+--    sortopfamily deref in btcostestimate correlation block) and
+--    equality must still return the right row.
+-- ----------
+ANALYZE rk_pop;
+SELECT count(*) FROM rk_pop WHERE id = 4242;
+ count 
+-------
+     1
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT * FROM rk_pop WHERE id = 4242;
+              QUERY PLAN               
+---------------------------------------
+ Index Scan using rk_pop_rev on rk_pop
+   Index Cond: (id = 4242)
+(2 rows)
+
+-- ----------
+-- 3. Inequality selectivity after ANALYZE exercises
+--    get_actual_variable_range, which must skip the reverse-key
+--    index (regression: NULL sortopfamily[0] deref).  The planner
+--    must not pick the index for a range predicate either.
+-- ----------
+SET enable_seqscan = on;
+SELECT count(*) FROM rk_pop WHERE id > 9990;
+ count 
+-------
+    10
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT * FROM rk_pop WHERE id > 9990;
+      QUERY PLAN       
+-----------------------
+ Seq Scan on rk_pop
+   Filter: (id > 9990)
+(2 rows)
+
+-- ----------
+-- 4. ORDER BY never uses a reverse-key index (no pathkeys), and
+--    an index-only scan is never chosen (btcanreturn = false).
+-- ----------
+EXPLAIN (COSTS OFF) SELECT * FROM rk_pop ORDER BY id LIMIT 5;
+           QUERY PLAN           
+--------------------------------
+ Limit
+   ->  Sort
+         Sort Key: id
+         ->  Seq Scan on rk_pop
+(4 rows)
+
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF) SELECT id FROM rk_pop WHERE id = 4242;
+              QUERY PLAN               
+---------------------------------------
+ Index Scan using rk_pop_rev on rk_pop
+   Index Cond: (id = 4242)
+(2 rows)
+
+-- ----------
+-- 5. Build path B: index first, rows via btinsert; int8 key with
+--    cross-type probes (int4 literal via integer_ops int84eq must
+--    be normalized to key width before reversal; int2 likewise).
+-- ----------
+CREATE TABLE rk_ins (id bigint);
+CREATE INDEX rk_ins_rev ON rk_ins (id) WITH (cluster_reverse_key = on);
+INSERT INTO rk_ins SELECT g FROM generate_series(1, 1000) g;
+INSERT INTO rk_ins VALUES (6000000000), (-777);
+SELECT count(*) FROM rk_ins WHERE id = 777;            -- int4 literal
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM rk_ins WHERE id = -777;           -- negative int4
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM rk_ins WHERE id = 42::int2;       -- int2 probe
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM rk_ins WHERE id = 6000000000;     -- same-type int8
+ count 
+-------
+     1
+(1 row)
+
+PREPARE rk_p4(int4) AS SELECT count(*) FROM rk_ins WHERE id = $1;
+EXECUTE rk_p4(777);                                    -- runtime cross-type key
+ count 
+-------
+     1
+(1 row)
+
+DEALLOCATE rk_p4;
+-- ----------
+-- 6. Narrowing probe: an out-of-range value on a narrower key type
+--    provably matches nothing -- zero rows, no error.
+-- ----------
+CREATE TABLE rk_nar (id smallint);
+CREATE INDEX rk_nar_rev ON rk_nar (id) WITH (cluster_reverse_key = on);
+INSERT INTO rk_nar SELECT g % 30000 FROM generate_series(1, 1000) g;
+SELECT count(*) FROM rk_nar WHERE id = 500;
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM rk_nar WHERE id = 100000;
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM rk_nar WHERE id = 99999999999::int8;
+ count 
+-------
+     0
+(1 row)
+
+-- ----------
+-- 7. REINDEX runs the build path again over reversed-stored data.
+-- ----------
+REINDEX INDEX rk_pop_rev;
+SELECT count(*) FROM rk_pop WHERE id = 4242;
+ count 
+-------
+     1
+(1 row)
+
+-- ----------
+-- 8. Unique reverse-key index: ON CONFLICT arbiter works, and a
+--    duplicate-key error reports the logical key value, not the
+--    stored byte-reversed encoding.
+-- ----------
+CREATE TABLE rk_uni (id bigint, v text);
+CREATE UNIQUE INDEX rk_uni_rev ON rk_uni (id) WITH (cluster_reverse_key = on);
+INSERT INTO rk_uni VALUES (1, 'a'), (2, 'b');
+INSERT INTO rk_uni VALUES (1, 'dup')
+	ON CONFLICT (id) DO UPDATE SET v = 'updated';
+SELECT * FROM rk_uni WHERE id = 1;
+ id |    v    
+----+---------
+  1 | updated
+(1 row)
+
+INSERT INTO rk_uni VALUES (1, 'x');  -- must fail with logical key in DETAIL
+ERROR:  duplicate key value violates unique constraint "rk_uni_rev"
+DETAIL:  Key (id)=(1) already exists.
+-- ----------
+-- 9. Build-time validation: only a single-column int2 / int4 / int8
+--    key is accepted (rule 8 explicit rejection).
+-- ----------
+CREATE TABLE rk_bad (t text, a int, b int, ts timestamp);
+CREATE INDEX rk_bad_text ON rk_bad (t) WITH (cluster_reverse_key = on);
+ERROR:  cluster_reverse_key supports only smallint / integer / bigint keys
+HINT:  Byte-reversal is defined for fixed-width pass-by-value integer keys (int2 / int4 / int8).
+CREATE INDEX rk_bad_multi ON rk_bad (a, b) WITH (cluster_reverse_key = on);
+ERROR:  cluster_reverse_key requires a single-column index
+HINT:  Reverse-key indexes scatter one leading integer key; build a separate plain index for other columns.
+CREATE INDEX rk_bad_ts ON rk_bad (ts) WITH (cluster_reverse_key = on);
+ERROR:  cluster_reverse_key supports only smallint / integer / bigint keys
+HINT:  Byte-reversal is defined for fixed-width pass-by-value integer keys (int2 / int4 / int8).
+-- ----------
+-- 10. Off (default) keeps a plain btree: ordered scans still work.
+-- ----------
+CREATE TABLE rk_off (id int);
+INSERT INTO rk_off SELECT g FROM generate_series(1, 100) g;
+CREATE INDEX rk_off_idx ON rk_off (id);
+EXPLAIN (COSTS OFF) SELECT * FROM rk_off ORDER BY id LIMIT 3;
+                    QUERY PLAN                    
+--------------------------------------------------
+ Limit
+   ->  Index Only Scan using rk_off_idx on rk_off
+(2 rows)
+
+-- ----------
+-- Cleanup.
+-- ----------
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+DROP TABLE rk_pop, rk_ins, rk_nar, rk_uni, rk_bad, rk_off;

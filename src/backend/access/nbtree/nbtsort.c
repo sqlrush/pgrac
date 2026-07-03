@@ -40,6 +40,13 @@
  * IDENTIFICATION
  *	  src/backend/access/nbtree/nbtsort.c
  *
+ * PGRAC MODIFICATIONS
+ *	  Modified by: SqlRush <sqlrush@gmail.com>
+ *	  - btbuild: validate reverse-key index shape at build time.
+ *	  - _bt_build_callback: byte-reverse the leading key when building a
+ *	    reverse-key index over existing heap tuples.
+ *	    Spec: spec-6.12-crossnode-cache-fusion-perf-optimization.md (wave f)
+ *
  *-------------------------------------------------------------------------
  */
 
@@ -49,6 +56,9 @@
 #include "access/parallel.h"
 #include "access/relscan.h"
 #include "access/table.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_reverse_key.h" /* PGRAC: spec-6.12f validate */
+#endif
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
@@ -308,6 +318,16 @@ btbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	if (log_btree_build_stats)
 		ResetUsage();
 #endif							/* BTREE_BUILD_STATS */
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: spec-6.12f -- reject an unsupported reverse-key index shape
+	 * (non-integer / multi-column leading key) at build time so there is
+	 * never a silent wrong-result path (rule 8 explicit rejection).  No-op
+	 * for plain indexes.
+	 */
+	cluster_reverse_key_validate_index(index);
+#endif
 
 	buildstate.isunique = indexInfo->ii_Unique;
 	buildstate.nulls_not_distinct = indexInfo->ii_NullsNotDistinct;
@@ -593,6 +613,22 @@ _bt_build_callback(Relation index,
 				   void *state)
 {
 	BTBuildState *buildstate = (BTBuildState *) state;
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: spec-6.12f -- reverse-key.  CREATE INDEX / REINDEX feed the
+	 * existing heap tuples through this callback (serial and parallel
+	 * builds alike), bypassing btinsert, so byte-reverse the leading key
+	 * here too; otherwise a build over a populated table would store
+	 * un-reversed keys while equality probes search for the reversed
+	 * encoding.  The spooled (reversed) datums are then sorted with the
+	 * unchanged btree comparator, giving exactly the leaf order that
+	 * incremental btinsert produces.
+	 */
+	if (BTGetClusterReverseKey(index) && !isnull[0])
+		values[0] = cluster_reverse_key_encode(
+			values[0], TupleDescAttr(RelationGetDescr(index), 0)->attlen);
+#endif
 
 	/*
 	 * insert the index tuple into the appropriate spool file for subsequent

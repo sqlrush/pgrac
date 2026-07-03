@@ -11,6 +11,11 @@
  *
  * src/include/nodes/pathnodes.h
  *
+ * PGRAC MODIFICATIONS
+ *	  Modified by: SqlRush <sqlrush@gmail.com>
+ *	  - IndexOptInfo: add cluster_reverse_key (equality-only marker).
+ *	    Spec: spec-6.12-crossnode-cache-fusion-perf-optimization.md (wave f)
+ *
  *-------------------------------------------------------------------------
  */
 #ifndef PATHNODES_H
@@ -1186,6 +1191,13 @@ struct IndexOptInfo
 	bool		amcanparallel;
 	/* does AM have ammarkpos interface? */
 	bool		amcanmarkpos;
+	/*
+	 * PGRAC: spec-6.12f -- reverse-key btree index (byte-reversed leading
+	 * key).  Equality-only: no pathkeys and no non-equality clause matches
+	 * (the stored encoding is not order-preserving).  false for every
+	 * other index.
+	 */
+	bool		cluster_reverse_key;
 	/* AM's cost estimator */
 	/* Rather than include amapi.h here, we declare amcostestimate like this */
 	void		(*amcostestimate) (struct PlannerInfo *, struct IndexPath *, double, Cost *, Cost *, Selectivity *, double *, double *) pg_node_attr(read_write_ignore);

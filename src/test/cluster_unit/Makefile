@@ -27,6 +27,7 @@ include $(top_builddir)/src/Makefile.global
 # Test source files (each becomes a standalone executable)
 TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_xnode_profile test_cluster_xnode_lever test_cluster_ges_handoff \
+        test_cluster_reverse_key \
         test_cluster_wait_events test_cluster_errcodes test_cluster_guc \
         test_cluster_shmem test_cluster_signal test_cluster_views \
         test_cluster_gviews test_cluster_ic test_cluster_ic_envelope \
@@ -722,6 +723,16 @@ CLUSTER_XNODE_LEVER_O = $(top_builddir)/src/backend/cluster/cluster_xnode_lever.
 test_cluster_xnode_lever: test_cluster_xnode_lever.c unit_test.h $(CLUSTER_XNODE_LEVER_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_XNODE_LEVER_O) -o $@
+
+# test_cluster_reverse_key links cluster_reverse_key.o standalone (spec-6.12
+# U-f): locks the byte-reversal math (involution / known patterns / width
+# gate / order-not-preserved).  The ereport / lsyscache / fmgr externs used
+# by the scankey transform are stubbed locally and never fire; the transform
+# + planner contract are exercised end-to-end by cluster_regress reverse_key.
+CLUSTER_REVERSE_KEY_O = $(top_builddir)/src/backend/cluster/cluster_reverse_key.o
+test_cluster_reverse_key: test_cluster_reverse_key.c unit_test.h $(CLUSTER_REVERSE_KEY_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_REVERSE_KEY_O) -o $@
 
 # test_cluster_ges_handoff links the pure verifier (spec-6.12e1) + the frozen
 # GES mode matrix (cluster_ges_mode.o) so the compatibility rule is the real

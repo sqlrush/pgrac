@@ -10,6 +10,11 @@
  * IDENTIFICATION
  *	  src/backend/access/common/reloptions.c
  *
+ * PGRAC MODIFICATIONS
+ *	  Modified by: SqlRush <sqlrush@gmail.com>
+ *	  - boolRelOpts: add the cluster_reverse_key btree reloption.
+ *	    Spec: spec-6.12-crossnode-cache-fusion-perf-optimization.md (wave f)
+ *
  *-------------------------------------------------------------------------
  */
 
@@ -168,6 +173,25 @@ static relopt_bool boolRelOpts[] =
 		},
 		true
 	},
+#ifdef USE_PGRAC_CLUSTER
+	{
+		{
+			/*
+			 * PGRAC: spec-6.12f -- reverse-key btree index (equality-only).
+			 * Registered only in cluster builds: a non-cluster build has no
+			 * reversal code, so accepting the option there would be a silent
+			 * no-op; unregistered, it fails with "unrecognized parameter"
+			 * (rule 8 explicit rejection).
+			 */
+			"cluster_reverse_key",
+			"Byte-reverse the leading integer key to scatter monotonic inserts (equality-only)",
+			RELOPT_KIND_BTREE,
+			AccessExclusiveLock		/* changes stored key encoding: only
+									 * meaningful when set at CREATE INDEX */
+		},
+		false
+	},
+#endif
 	/* list terminator */
 	{{NULL}}
 };
