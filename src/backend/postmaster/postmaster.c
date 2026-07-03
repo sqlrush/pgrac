@@ -3485,18 +3485,30 @@ process_pm_child_exit(void)
 				HandleChildCrash(pid, exitstatus, _("LMD process"));
 			continue;
 		}
-		/* PGRAC (spec-6.4 D1): MRP reaper. */
+		/*
+		 * PGRAC (spec-6.4 D1): MRP reaper.  Like the wal receiver below,
+		 * exit status one (FATAL exit) is an orderly termination: MRP
+		 * raises FATAL on shutdown-time interrupts and on refused
+		 * configurations, and the server loop restarts it when it is
+		 * still wanted.  Only treat other nonzero statuses as a crash.
+		 */
 		if (pid == MrpPID) {
 			cluster_mrp_mark_child_exit();
 			MrpPID = 0;
-			if (!EXIT_STATUS_0(exitstatus))
+			if (!EXIT_STATUS_0(exitstatus) && !EXIT_STATUS_1(exitstatus))
 				HandleChildCrash(pid, exitstatus, _("MRP process"));
 			continue;
 		}
-		/* PGRAC (spec-6.4 D3): RFS coordinator reaper. */
+		/*
+		 * PGRAC (spec-6.4 D3): RFS coordinator reaper.  The RFS shutdown
+		 * path runs through libpqwalreceiver's ProcessWalRcvInterrupts(),
+		 * which reports a pending shutdown as FATAL (exit status one).
+		 * Mirror the wal receiver reaper below and accept status one as
+		 * a clean exit instead of escalating to a crash cascade.
+		 */
 		if (pid == RfsPID) {
 			RfsPID = 0;
-			if (!EXIT_STATUS_0(exitstatus))
+			if (!EXIT_STATUS_0(exitstatus) && !EXIT_STATUS_1(exitstatus))
 				HandleChildCrash(pid, exitstatus, _("RFS coordinator process"));
 			continue;
 		}
