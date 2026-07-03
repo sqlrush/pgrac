@@ -26,7 +26,7 @@ include $(top_builddir)/src/Makefile.global
 
 # Test source files (each becomes a standalone executable)
 TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
-        test_cluster_xnode_profile test_cluster_xnode_lever \
+        test_cluster_xnode_profile test_cluster_xnode_lever test_cluster_ges_handoff \
         test_cluster_wait_events test_cluster_errcodes test_cluster_guc \
         test_cluster_shmem test_cluster_signal test_cluster_views \
         test_cluster_gviews test_cluster_ic test_cluster_ic_envelope \
@@ -722,6 +722,16 @@ CLUSTER_XNODE_LEVER_O = $(top_builddir)/src/backend/cluster/cluster_xnode_lever.
 test_cluster_xnode_lever: test_cluster_xnode_lever.c unit_test.h $(CLUSTER_XNODE_LEVER_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_XNODE_LEVER_O) -o $@
+
+# test_cluster_ges_handoff links the pure verifier (spec-6.12e1) + the frozen
+# GES mode matrix (cluster_ges_mode.o) so the compatibility rule is the real
+# one.  Neither object needs shmem / runtime symbols.
+CLUSTER_GES_HANDOFF_POLICY_O = $(top_builddir)/src/backend/cluster/cluster_ges_handoff_policy.o
+test_cluster_ges_handoff: test_cluster_ges_handoff.c unit_test.h \
+		$(CLUSTER_GES_HANDOFF_POLICY_O) $(CLUSTER_GES_MODE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_GES_HANDOFF_POLICY_O) $(CLUSTER_GES_MODE_O) \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 # test_cluster_shared_fs links the three storage/ objects standalone:
 # cluster_shared_fs.o (registry + dispatch), cluster_shared_fs_stub.o

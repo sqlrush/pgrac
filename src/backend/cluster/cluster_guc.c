@@ -88,6 +88,8 @@ bool cluster_xnode_profile_enabled = false;
 bool cluster_page_scn_shortcut = false;
 /* spec-6.12a: quiescent-block S-cache via X->S downgrade (default OFF). */
 bool cluster_read_scache = false;
+/* spec-6.12e1: GES release-side handoff verify + counters (default OFF). */
+bool cluster_ges_handoff = false;
 /* spec-6.5: cluster-aware backup / restore / PITR target knobs. */
 char *cluster_recovery_target_scn = NULL;
 char *cluster_recovery_target_cluster_time = NULL;
@@ -1327,6 +1329,22 @@ cluster_init_guc(void)
 		"cluster.read_scache", gettext_noop("Enable quiescent-block S-caching via X->S downgrade."),
 		gettext_noop("Off keeps one-shot read-image shipping for X-held blocks."),
 		&cluster_read_scache, false, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	/*
+	 * cluster.ges_handoff -- spec-6.12 wave e1.  The deterministic
+	 * release-side drain (spec-5.3 D3) already grants the next compatible
+	 * convert/waiter in a single pass; this switch arms the 8.A-dual
+	 * verifier (no-double-grant / no-stale-holder / no-lost-waiter) over
+	 * every drain and the e1_* counters in the xnode_lever dump category,
+	 * so an invariant break surfaces as a counter + LOG.  Default OFF: the
+	 * drain path is byte-identical (verify skipped).  SUSET for a
+	 * measurement / chaos window without a restart.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.ges_handoff",
+		gettext_noop("Verify the GES release-side deterministic handoff invariants."),
+		gettext_noop("Off keeps the drain path byte-identical (no verify, no counters)."),
+		&cluster_ges_handoff, false, PGC_SUSET, 0, NULL, NULL, NULL);
 
 	/*
 	 * cluster.clean_leave_enabled -- opt-in cooperative clean-leave

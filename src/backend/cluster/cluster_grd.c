@@ -41,6 +41,7 @@
 #include "cluster/cluster_hw_remaster.h" /* spec-5.7 D3 S5d — HW authority rebuild launch + gate */
 #include "cluster/cluster_lmd.h"		 /* spec-2.24 D10 cleanup_*_count_inc */
 #include "cluster/cluster_guc.h"		 /* cluster_node_id, cluster_grd_max_entries */
+#include "cluster/cluster_ges_handoff.h" /* spec-6.12e1: drain invariant verify */
 #include "cluster/cluster_lms.h"		 /* spec-4.6 D2 — Q3-C wire routing token */
 #include "cluster/cluster_pcm_lock.h"	 /* spec-2.36 HC124 pending_x node-dead cleanup */
 #include "cluster/cluster_gcs.h"		 /* spec-4.7 D2 — cluster_gcs_lookup_master */
@@ -4964,6 +4965,8 @@ cluster_grd_release_and_drain(const ClusterResId *resid, const ClusterGrdHolderI
 	ClusterGrdEntryResult lookup_result;
 	uint64 cur_epoch;
 	int n;
+	ClusterGesHandoffSnapshot handoff_snap; /* spec-6.12e1 drain snapshot */
+	bool handoff_armed = false;
 
 	Assert(resid != NULL && holder != NULL);
 	Assert(granted_out != NULL && max_out > 0);
@@ -5014,8 +5017,65 @@ cluster_grd_release_and_drain(const ClusterResId *resid, const ClusterGrdHolderI
 	/* (3) Grant compatible converts then one waiter (5.1b drain). */
 	n = cluster_grd_entry_drain_converts_then_waiters(entry, granted_out, max_out);
 
+	/*
+	 * spec-6.12e1 -- capture a flattened, runtime-free snapshot of this
+	 * drain under the lock while the entry state is coherent.  The pure
+	 * 8.A-dual verifier + counters run AFTER the spinlock is released
+	 * (cluster_ges_handoff_note_drain), so the fast path is unaffected and
+	 * the hot lock is not held across the verify.  Only populate the
+	 * snapshot when the wave GUC / profiling armed the check.
+	 */
+	{
+		bool arm = cluster_ges_handoff || cluster_xnode_profile_enabled;
+
+		if (arm) {
+			int cap = CLUSTER_GES_HANDOFF_MAX;
+			int i;
+
+			memset(&handoff_snap, 0, sizeof(handoff_snap));
+			handoff_snap.released_node_id = (int32)holder->node_id;
+			handoff_snap.released_procno = holder->procno;
+
+			for (i = 0; i < entry->ngranted && handoff_snap.nholders < cap; i++) {
+				handoff_snap.holders[handoff_snap.nholders].node_id = entry->holders[i].node_id;
+				handoff_snap.holders[handoff_snap.nholders].procno = entry->holders[i].procno;
+				handoff_snap.holders[handoff_snap.nholders].mode = entry->holders[i].mode;
+				handoff_snap.nholders++;
+			}
+			for (i = 0; i < entry->nwaiters && handoff_snap.nwaiters < cap; i++) {
+				handoff_snap.waiters[handoff_snap.nwaiters].node_id = entry->waiters[i].node_id;
+				handoff_snap.waiters[handoff_snap.nwaiters].procno = entry->waiters[i].procno;
+				handoff_snap.waiters[handoff_snap.nwaiters].mode = entry->waiters[i].mode;
+				handoff_snap.waiters[handoff_snap.nwaiters].fair_queue_seq
+					= entry->waiters[i].fair_queue_seq;
+				handoff_snap.waiters[handoff_snap.nwaiters].barriered
+					= grd_waiter_is_barriered(entry, i);
+				handoff_snap.nwaiters++;
+			}
+			for (i = 0; i < n && handoff_snap.ngranted < cap; i++) {
+				handoff_snap.granted[handoff_snap.ngranted].node_id
+					= (int32)granted_out[i].holder.node_id;
+				handoff_snap.granted[handoff_snap.ngranted].procno = granted_out[i].holder.procno;
+				handoff_snap.granted[handoff_snap.ngranted].mode = granted_out[i].mode;
+				handoff_snap.ngranted++;
+			}
+			handoff_armed = true;
+		}
+	}
+
 	SpinLockRelease(&entry->lock);
 	cluster_grd_entry_release(entry);
+
+	/*
+	 * spec-6.12e1 -- verify the three invariants (no-stale-holder /
+	 * no-double-grant / no-lost-waiter) over the captured snapshot + bump
+	 * the e1_* counters.  Pure + fast; runs outside the entry spinlock.
+	 */
+	if (handoff_armed) {
+		ClusterGesHandoffVerdict verdict = cluster_ges_handoff_verify(&handoff_snap);
+
+		cluster_ges_handoff_note_drain(n, verdict);
+	}
 
 	/* spec-5.8 D1b — granted waiters/converts departed; holders changed.
 	 * cluster_grd_entry_release() may already have reclaimed a now-empty entry;

@@ -157,6 +157,9 @@ extern bool cluster_page_scn_shortcut;
 /* spec-6.12a: quiescent S-cache switch (default off). */
 extern bool cluster_read_scache;
 
+/* spec-6.12e1: GES release-side handoff verify switch (default off). */
+extern bool cluster_ges_handoff;
+
 
 /*
  * cluster_injection_points -- comma-separated names to auto-arm at startup.

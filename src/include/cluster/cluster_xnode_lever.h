@@ -75,6 +75,11 @@ typedef struct ClusterXnodeLeverShared {
 	pg_atomic_uint64 a_downgrade_refused_count; /* candidates that stayed one-shot */
 	pg_atomic_uint64 a_fwd_oneshot_count;		/* forwarded X-held reads (MVP: no
 												 * remote-holder downgrade) */
+
+	/* ---- wave e1: GES release-side deterministic handoff ---- */
+	pg_atomic_uint64 e1_drain_count;			   /* release drains verified */
+	pg_atomic_uint64 e1_grant_count;			   /* identities granted by drains */
+	pg_atomic_uint64 e1_invariant_violation_count; /* 8.A-dual: MUST stay 0 */
 } ClusterXnodeLeverShared;
 
 /* Set once by shmem init; NULL until the region is attached. */

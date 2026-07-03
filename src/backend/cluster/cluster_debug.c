@@ -2817,6 +2817,9 @@ dump_xnode_lever(ReturnSetInfo *rsinfo)
 	XNL_ROW(a_downgrade_count);
 	XNL_ROW(a_downgrade_refused_count);
 	XNL_ROW(a_fwd_oneshot_count);
+	XNL_ROW(e1_drain_count);
+	XNL_ROW(e1_grant_count);
+	XNL_ROW(e1_invariant_violation_count);
 #undef XNL_ROW
 }
 

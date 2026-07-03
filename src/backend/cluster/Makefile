@@ -62,6 +62,8 @@ OBJS = \
 	cluster_write_fence.o \
 	cluster_ges.o \
 	cluster_ges_dedup.o \
+	cluster_ges_handoff.o \
+	cluster_ges_handoff_policy.o \
 	cluster_ges_mode.o \
 	cluster_ges_mode_backend.o \
 	cluster_ges_reply_wait.o \

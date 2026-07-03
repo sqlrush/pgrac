@@ -78,6 +78,9 @@ cluster_xnode_lever_shmem_init(void)
 		pg_atomic_init_u64(&ClusterXnodeLeverCtl->a_downgrade_count, 0);
 		pg_atomic_init_u64(&ClusterXnodeLeverCtl->a_downgrade_refused_count, 0);
 		pg_atomic_init_u64(&ClusterXnodeLeverCtl->a_fwd_oneshot_count, 0);
+		pg_atomic_init_u64(&ClusterXnodeLeverCtl->e1_drain_count, 0);
+		pg_atomic_init_u64(&ClusterXnodeLeverCtl->e1_grant_count, 0);
+		pg_atomic_init_u64(&ClusterXnodeLeverCtl->e1_invariant_violation_count, 0);
 	}
 }
 
