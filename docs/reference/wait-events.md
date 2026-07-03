@@ -52,9 +52,9 @@ shipping, and Smart Fusion terminal-authority waits.
 | `ClusterGCSBlockInvalidateAckWait` | Waiting for invalidate ACKs from all enumerated holders |
 | `ClusterGCSBlockStarvationRetry` | Reader retry backoff while a pending writer barrier exists |
 | `ClusterGCSBlockRecovering` | Waiting while a block resource is fenced as recovering |
-| `ClusterSmartFusionCommitBrake` | Waiting before commit until touched early-transfer origin redo dependencies are durable |
-| `ClusterSmartFusionDbwrBrake` | Blocking buffer writeback while a Smart Fusion dependency is still pending |
-| `ClusterSmartFusionOriginDurable` | Waiting for origin durable-LSN gossip/resolution |
+| `ClusterSmartFusionCommitBrake` | Reserved Smart Fusion pre-commit dependency wait; the enabled path is currently guarded off |
+| `ClusterSmartFusionDbwrBrake` | Reserved Smart Fusion writeback-brake wait; the enabled path is currently guarded off |
+| `ClusterSmartFusionOriginDurable` | Reserved Smart Fusion durable-LSN gossip wait; the enabled path is currently guarded off |
 | `ClusterCfTerminalResolve` | Waiting while terminal authority resolves cross-instance undo / TT evidence |
 
 ## Cluster: BufferShip (5 events)

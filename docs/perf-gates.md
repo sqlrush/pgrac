@@ -96,8 +96,10 @@ not a performance optimization.  It adds the
 `terminal_authority_*` and `smart_fusion` counters under
 `pg_cluster_state` so class 3/4 runs can distinguish epoch, ownership,
 terminal-state, durable-TT, retention, dependency-loss, and retryable
-brake fail-closed causes.  It does not relax the existing class
-thresholds, and a green result must not be obtained by disabling
+brake fail-closed causes.  The current post-ship guardrail rejects
+`cluster.smart_fusion=on`, so Smart Fusion brake counters are reserved
+and should stay zero in supported runs.  It does not relax the existing
+class thresholds, and a green result must not be obtained by disabling
 authority, dropping dependency evidence, or accepting
 UNKNOWN-visible/native fallback behavior.
 

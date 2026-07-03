@@ -196,6 +196,13 @@ required durable-TT or retention evidence.  Missing or contradictory
 evidence fails closed; there is no native CLOG fallback or
 UNKNOWN-visible behavior.
 
+Known limitation: the current substrate does not re-parse terminal
+authority references across a membership reconfiguration.  A reference
+captured under an older membership epoch fails closed as `INDOUBT` /
+UNKNOWN after the epoch advances, even if a later lookup could prove the
+same terminal outcome.  Keep this GUC `off` outside targeted validation
+until a future release adds epoch revalidation.
+
 ### `cluster.cf_delayed_cleanout`
 
 | | |
@@ -204,10 +211,11 @@ UNKNOWN-visible behavior.
 | Default | `reader` |
 | Context | sighup |
 
-Controls ITL hint cleanout policy for terminal authority.  `off` never
-writes back hints, `reader` performs lazy reader-path cleanout from the
-durable TT authority, and `eager` is reserved for transfer-side eager
-cleanout.  The setting changes only hinting.  Visibility verdicts still
+Accepted ITL hint-cleanout policy for terminal authority.  In the
+current guarded spec-6.2 substrate, production cleanout writeback is not
+active: `reader` is the reserved default and does not install ITL hints,
+while `eager` remains reserved for transfer-side eager cleanout.  The
+setting changes only future hinting policy.  Visibility verdicts still
 come from durable TT authority and fail closed when unresolved.
 
 ### `cluster.smart_fusion`
@@ -218,10 +226,13 @@ come from durable TT authority and fail closed when unresolved.
 | Default | `off` |
 | Context | postmaster |
 
-Enables Smart Fusion early block-transfer dependency tracking.  It only
-has effect when the peer link is authenticated tier3 and block-reply v2
-has been negotiated; otherwise the system stays on the conservative
-HC82 WAL-before-ship path.
+Guarded Smart Fusion early block-transfer dependency tracking.  The
+current spec-6.2 post-ship guardrail keeps this GUC default `off` and
+rejects `on` at startup.  The counters and wire definitions remain as a
+substrate, but the early-transfer runtime path stays fail-closed until
+checkpoint writeback, 2PC, and dependency-consumer soundness are proven.
+The supported path therefore remains the conservative HC82
+WAL-before-ship behavior.
 
 ### `cluster.smart_fusion_tier_min`
 
@@ -231,8 +242,9 @@ HC82 WAL-before-ship path.
 | Default | `tier3` |
 | Context | postmaster |
 
-Minimum interconnect tier for Smart Fusion early transfer.  Only
-`tier3` is legal in spec-6.2.
+Reserved minimum interconnect tier for the future Smart Fusion early
+transfer path.  Only `tier3` is legal in spec-6.2, but
+`cluster.smart_fusion=on` is currently rejected by the guardrail above.
 
 ### `cluster.smart_fusion_commit_brake_timeout_ms`
 
@@ -243,11 +255,9 @@ Minimum interconnect tier for Smart Fusion early transfer.  Only
 | Range | `1` - `600000` |
 | Context | sighup |
 
-Upper bound for the pre-commit Smart Fusion dependency brake.  A
-transaction that consumed an early-transfer dependent block must wait
-before writing its commit record until all origin redo dependencies are
-durable.  Timeout aborts the transaction with a retryable Smart Fusion
-error rather than false-committing.
+Reserved upper bound for the pre-commit Smart Fusion dependency brake.
+It is accepted for substrate compatibility, but no production transaction
+enters this brake while `cluster.smart_fusion=on` is guarded off.
 
 ### `cluster.smart_fusion_origin_durable_gossip_ms`
 
@@ -258,10 +268,10 @@ error rather than false-committing.
 | Range | `1` - `60000` |
 | Context | sighup |
 
-Interval for publishing local durable WAL progress to Smart Fusion
-peers.  Receivers release DBWR and commit brakes only after observing
-durable progress; a block marker is never treated as proof of
-durability.
+Reserved interval for publishing local durable WAL progress to Smart
+Fusion peers.  It is accepted for substrate compatibility, but durable
+progress gossip is not an active release signal while
+`cluster.smart_fusion=on` is guarded off.
 
 The live setting is visible both through `pg_settings` and
 `pg_cluster_state`:
