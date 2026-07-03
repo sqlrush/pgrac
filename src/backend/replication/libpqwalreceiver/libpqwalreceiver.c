@@ -12,6 +12,10 @@
  * IDENTIFICATION
  *	  src/backend/replication/libpqwalreceiver/libpqwalreceiver.c
  *
+ * PGRAC MODIFICATIONS
+ *	  Adds ADG physical standby thread discovery and per-thread
+ *	  START_REPLICATION binding.
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"

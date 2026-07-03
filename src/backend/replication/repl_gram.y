@@ -10,6 +10,9 @@
  * IDENTIFICATION
  *	  src/backend/replication/repl_gram.y
  *
+ * PGRAC MODIFICATIONS
+ *	  Extends physical START_REPLICATION with an ADG thread selector.
+ *
  *-------------------------------------------------------------------------
  */
 

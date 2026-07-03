@@ -9,6 +9,10 @@
  *
  * src/include/nodes/replnodes.h
  *
+ * PGRAC MODIFICATIONS
+ *	  Carries the ADG physical replication thread selector parsed from
+ *	  START_REPLICATION.
+ *
  *-------------------------------------------------------------------------
  */
 #ifndef REPLNODES_H

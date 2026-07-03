@@ -7,6 +7,10 @@
  *
  * src/include/replication/walreceiver.h
  *
+ * PGRAC MODIFICATIONS
+ *	  Exposes ADG primary thread discovery and per-thread streaming
+ *	  options through the walreceiver interface.
+ *
  *-------------------------------------------------------------------------
  */
 #ifndef _WALRECEIVER_H
