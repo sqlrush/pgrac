@@ -37,6 +37,16 @@ on:
         required: false
         type: boolean
         default: false
+      xp_extra_guc:
+        description: 'xnode-profile: extra GUC lines (spec-6.12 D0 value-gate candidate leg)'
+        required: false
+        type: string
+        default: ''
+      xp_index_relopt:
+        description: 'xnode-profile: I-axis PK storage parameter (e.g. cluster_reverse_key=on)'
+        required: false
+        type: string
+        default: ''
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -475,6 +485,9 @@ jobs:
           XP_SECS="${XP_SECS:-8}" \
           XP_ROUNDS="${XP_ROUNDS:-5}" \
           XP_SCALE="${XP_SCALE:-10}" \
+          XP_EXTRA_GUC="${{ inputs.xp_extra_guc }}" \
+          XP_INDEX_RELOPT="${{ inputs.xp_index_relopt }}" \
+          XP_TSV_OUT="scripts/perf/results/xnode-profile-${{ github.run_id }}.tsv" \
           XP_OUT="scripts/perf/results/xnode-profile-${{ github.run_id }}.md" \
           perl scripts/perf/run_2node_xnode_profile.pl \
             | tee "scripts/perf/results/xnode-profile-${{ github.run_id }}.log"
