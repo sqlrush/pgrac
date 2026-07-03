@@ -13,10 +13,46 @@ operator-facing.
 | `pg_stat_gcluster_wait_events` | Cluster wait events globally (cross-node placeholder) |
 | `pg_cluster_ic_peers` | Tier1 TCP interconnect peer state and counters |
 | `pg_stat_cluster_ic` | TCP/RDMA mux and RDMA transport observability |
+| `pg_stat_cluster_adg` | Local ADG standby apply/read-only service state |
+| `pg_stat_gcluster_adg` | Cluster ADG standby state with the same row contract as the local view |
 | `pg_stat_cluster_backup` | Current cluster backup state on the local node |
 | `pg_cluster_backup_history` | Latest cluster backup manifest summary |
 | `pg_cluster_restore_points` | Cluster restore points visible to PITR status |
 | `pg_cluster_pitr_status` | Cluster PITR target reachability status |
+| `pg_cluster_state` | Diagnostic snapshot of cluster GUCs, counters, and subsystem state |
+
+## ADG Standby Views
+
+The ADG views expose the managed recovery process, Apply Master lease,
+and standby read-consistency watermarks for spec-6.4.  With the default
+primary/ADG-off configuration they still return one local row with
+`mrp_status = 'disabled'`.
+
+### `pg_stat_cluster_adg`
+
+One row describing this node's ADG role and standby apply state.
+
+| Column | Type | Description |
+|---|---|---|
+| `node_id` | `int4` | Local `cluster.node_id` value. |
+| `dg_role` | `text` | `primary`, `standby`, or `unknown`. |
+| `dg_mode` | `text` | `async`, `sync`, `max_availability`, or `unknown`. |
+| `adg_enabled` | `bool` | Current `cluster.enable_adg` value. |
+| `apply_master_node_id` | `int4` | Node that owns the Apply Master lease, or `-1`. |
+| `apply_master_term` | `int8` | Durable Apply Master term. |
+| `mrp_status` | `text` | MRP lifecycle state such as `disabled`, `ready`, or `stopped`. |
+| `receive_lsn` | `pg_lsn` | Latest received ADG WAL LSN, NULL while disabled. |
+| `apply_lsn` | `pg_lsn` | Latest applied ADG WAL LSN, NULL while disabled. |
+| `standby_consistent_scn` | `int8` | Read-consistent standby SCN floor; zero means unavailable. |
+| `lag_bytes` | `int8` | `receive_lsn - apply_lsn`, floored at zero. |
+| `lag_seconds` | `float8` | Receive/apply timestamp gap across ADG WAL threads, floored at zero. |
+| `apply_rate_bytes_per_sec` | `float8` | Apply catch-up rate derived from `lag_bytes / lag_seconds`, or zero when no lag is measurable. |
+
+### `pg_stat_gcluster_adg`
+
+Same row shape as `pg_stat_cluster_adg`.  The current implementation
+emits the local node's ADG state and preserves the global-view column
+contract used by cluster diagnostics.
 
 ## Cluster Backup / PITR Views
 
@@ -136,6 +172,60 @@ Equivalent frontend backup:
 pg_cluster_basebackup --label b1 --fast -d postgres
 ```
 
+## pg_cluster_state
+
+Diagnostic view over `cluster_dump_state()`.  It returns `(category,
+key, value)` text rows and is intended for TAP smoke tests, operator
+triage, and perf-gate snapshots.  The view never uses NULL values; an
+unknown or inactive counter is reported as `0`, `off`, or another
+explicit string.
+
+Spec-6.2 adds the Smart Fusion terminal-authority surface.  The
+`cluster.smart_fusion` enabled path is currently fail-closed by startup
+configuration; its counters remain a substrate / diagnostic surface and
+must not be read as evidence that early transfer is active.
+
+| Category | Key | Meaning |
+|---|---|---|
+| `guc` | `cluster.cf_terminal_authority` | Live GUC value; `t` means terminal authority is enabled. |
+| `guc` | `cluster.cf_delayed_cleanout` | Terminal-authority cleanout policy: `off`, `reader`, or `eager`. |
+| `guc` | `cluster.smart_fusion` | Live GUC value; supported startup keeps this `f` because `on` is fail-closed by the guardrail. |
+| `guc` | `cluster.smart_fusion_tier_min` | Minimum negotiated interconnect tier required for v2 Smart Fusion block replies. |
+| `guc` | `cluster.smart_fusion_commit_brake_timeout_ms` | Pre-commit dependency brake timeout. |
+| `guc` | `cluster.smart_fusion_origin_durable_gossip_ms` | Durable-LSN gossip interval for dependency release. |
+| `undo` | `terminal_authority_check_count` | Total authority decisions evaluated. |
+| `undo` | `terminal_authority_ok_count` | Decisions that had complete authority evidence. |
+| `undo` | `terminal_authority_failclosed_count` | Decisions rejected fail-closed for any reason. |
+| `undo` | `terminal_authority_epoch_failclosed_count` | Missing or changed membership epoch evidence. |
+| `undo` | `terminal_authority_ownership_failclosed_count` | Invalid origin/xid or origin ownership mismatch. |
+| `undo` | `terminal_authority_unknown_failclosed_count` | Disabled authority, missing terminal state, or missing commit SCN. |
+| `undo` | `terminal_authority_nonterminal_failclosed_count` | In-progress/non-terminal remote outcome. |
+| `undo` | `terminal_authority_durable_failclosed_count` | Missing or mismatched durable-TT commit proof. |
+| `undo` | `terminal_authority_retention_failclosed_count` | Retention proof was required but unavailable. |
+| `smart_fusion` | `dep_install_count` | Reserved substrate counter for dependency vectors installed from received block images; remains inactive while the guardrail is closed. |
+| `smart_fusion` | `dep_touch_count` | Reserved substrate counter for transaction-local touches of pending Smart Fusion dependencies. |
+| `smart_fusion` | `dbwr_brake_count` | Reserved substrate counter for writeback brakes; should remain zero while the guardrail is closed. |
+| `smart_fusion` | `commit_brake_count` | Reserved substrate counter for pre-commit dependency brakes; should remain zero while the guardrail is closed. |
+| `smart_fusion` | `commit_brake_wait_us` | Total microseconds spent waiting in the pre-commit dependency brake. |
+| `smart_fusion` | `origin_suspect_count` | Pending dependencies associated with an origin suspected dead or unavailable. |
+| `smart_fusion` | `dep_lost_failclosed_count` | Missing or malformed dependency evidence rejected fail-closed. |
+| `smart_fusion` | `retry_failclosed_count` | Retryable Smart Fusion fail-closed outcomes, primarily commit-brake timeout. |
+
+Example:
+
+```sql
+SELECT key, value
+  FROM pg_cluster_state
+ WHERE category = 'undo'
+   AND key LIKE 'terminal_authority_%'
+ ORDER BY key;
+
+SELECT key, value
+  FROM pg_cluster_state
+ WHERE category = 'smart_fusion'
+ ORDER BY key;
+```
+
 ## pg_cluster_nodes
 
 Returns one row per node declared in `pgrac.conf`.  In single-node
@@ -179,7 +269,7 @@ SELECT role, count(*) FROM pg_cluster_nodes GROUP BY role;
 ## pg_stat_cluster_wait_events
 
 Lists the cluster-specific wait event registry on the local node.
-Always returns 112 rows in `--enable-cluster` builds (one per
+Always returns 116 rows in `--enable-cluster` builds (one per
 registered cluster wait event).
 
 ### Columns
@@ -207,7 +297,7 @@ See [Wait events](wait-events.md) for the full event roster.
 ## pg_stat_gcluster_wait_events
 
 Cross-node placeholder for cluster-wide wait events.  In the
-current release returns 112 rows for the local node only;
+current release returns 116 rows for the local node only;
 `node_id` is always the value of the local `cluster.node_id` GUC.
 
 The column shape `(node_id, type, name)` is the public contract

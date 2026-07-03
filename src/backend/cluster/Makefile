@@ -39,6 +39,9 @@ include $(top_builddir)/src/Makefile.global
 ifeq ($(enable_pgrac_cluster), yes)
 OBJS = \
 	cluster.o \
+	cluster_adg.o \
+	cluster_adg_xlog.o \
+	cluster_apply_master_election.o \
 	cluster_advisory.o \
 	cluster_cancel_token.o \
 	cluster_backup.o \
@@ -92,6 +95,7 @@ OBJS = \
 	cluster_thread_recovery_orchestrator_srf.o \
 	cluster_thread_recovery_worker.o \
 	cluster_remote_xact.o \
+	cluster_rfs.o \
 	cluster_dl.o \
 	cluster_dl_lock.o \
 	cluster_ir.o \
@@ -134,7 +138,10 @@ OBJS = \
 	cluster_lmd_wait_state.o \
 	cluster_lmon.o \
 	cluster_lms.o \
+	cluster_lns.o \
 	cluster_membership.o \
+	cluster_mrp.o \
+	cluster_mrp_apply.o \
 	cluster_node_remove.o \
 	cluster_node_remove_policy.o \
 	cluster_node_remove_views.o \
@@ -151,6 +158,7 @@ OBJS = \
 	cluster_sinval.o \
 	cluster_sinval_bcast.o \
 	cluster_startup_phase.o \
+	cluster_standby_scn.o \
 	cluster_itl.o \
 	cluster_itl_cleanout.o \
 	cluster_itl_touch.o \
@@ -177,6 +185,8 @@ OBJS = \
 	cluster_tt_2pc_record.o \
 	cluster_tt_durable.o \
 	cluster_tt_durable_stat.o \
+	cluster_terminal_authority.o \
+	cluster_sf_dep.o \
 	cluster_tt_recovery.o \
 	cluster_tt_local.o \
 	cluster_tt_status.o \

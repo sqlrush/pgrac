@@ -248,6 +248,8 @@ ProcessConfigFile(int context pg_attribute_unused())
 #include "cluster/cluster_voting_disk_io.h"
 #include "cluster/cluster_quorum_decision.h"
 #include "cluster/cluster_pgstat.h"
+#include "cluster/cluster_adg.h"
+#include "cluster/cluster_mrp.h"
 
 int
 cluster_voting_disk_open(const char *path pg_attribute_unused(),
@@ -289,6 +291,96 @@ cluster_voting_disk_write_join_slot(int fd pg_attribute_unused(),
 {
 	return CLUSTER_VOTING_DISK_IO_NOT_TRIED;
 }
+ClusterVotingDiskIoState
+cluster_voting_disk_read_apply_lease_global_slot(int fd pg_attribute_unused(),
+												 void *out_slot512 pg_attribute_unused())
+{
+	return CLUSTER_VOTING_DISK_IO_NOT_TRIED;
+}
+ClusterVotingDiskIoState
+cluster_voting_disk_write_apply_lease_global_slot(int fd pg_attribute_unused(),
+												  const void *in_slot512 pg_attribute_unused())
+{
+	return CLUSTER_VOTING_DISK_IO_NOT_TRIED;
+}
+bool
+cluster_adg_apply_master_lease_valid(const ClusterAdgApplyMasterLease *lease pg_attribute_unused())
+{
+	return false;
+}
+bool
+cluster_adg_apply_master_lease_pack(void *slot512 pg_attribute_unused(),
+									const ClusterAdgApplyMasterLease *lease pg_attribute_unused())
+{
+	return false;
+}
+bool
+cluster_adg_apply_master_lease_unpack(const void *slot512 pg_attribute_unused(),
+									  ClusterAdgApplyMasterLease *lease pg_attribute_unused())
+{
+	return false;
+}
+bool
+cluster_adg_apply_master_lease_quorum(
+	const ClusterAdgApplyMasterLease leases[] pg_attribute_unused(),
+	const bool valid[] pg_attribute_unused(), int lease_count pg_attribute_unused(),
+	int quorum pg_attribute_unused(), ClusterAdgApplyMasterLeaseQuorum *out)
+{
+	if (out != NULL) {
+		memset(out, 0, sizeof(*out));
+		out->owner_node_id = -1;
+	}
+	return true;
+}
+ClusterAdgApplyMasterLeaseCasVerdict
+cluster_adg_apply_master_lease_cas_verdict(
+	const ClusterAdgApplyMasterLeaseQuorum *current pg_attribute_unused(),
+	const ClusterAdgApplyMasterLease *desired pg_attribute_unused(),
+	int64 now_ms pg_attribute_unused(), int64 takeover_grace_ms pg_attribute_unused())
+{
+	return CLUSTER_ADG_APPLY_LEASE_CAS_STALE;
+}
+int32
+cluster_adg_apply_master_candidate_node(const uint8 *alive_bitmap, int bitmap_bytes)
+{
+	int byte;
+
+	if (alive_bitmap == NULL || bitmap_bytes <= 0)
+		return -1;
+	for (byte = 0; byte < bitmap_bytes; byte++) {
+		int bit;
+
+		if (alive_bitmap[byte] == 0)
+			continue;
+		for (bit = 0; bit < 8; bit++) {
+			if ((alive_bitmap[byte] & (uint8)(1u << bit)) != 0)
+				return (int32)(byte * 8 + bit);
+		}
+	}
+	return -1;
+}
+bool
+cluster_adg_apply_master_candidate_allows_owner(const uint8 *alive_bitmap, int bitmap_bytes,
+												int32 owner_node_id)
+{
+	int32 candidate_node;
+
+	candidate_node = cluster_adg_apply_master_candidate_node(alive_bitmap, bitmap_bytes);
+	return candidate_node >= 0 && candidate_node == owner_node_id;
+}
+void
+cluster_mrp_publish_qvotec_latch(struct Latch *latch pg_attribute_unused())
+{}
+bool
+cluster_mrp_qvotec_poll_apply_lease_request(ClusterAdgApplyMasterLease *out pg_attribute_unused())
+{
+	return false;
+}
+void
+cluster_mrp_qvotec_complete_apply_lease_request(
+	ClusterMrpApplyLeaseSubmitResult result pg_attribute_unused(),
+	const ClusterAdgApplyMasterLeaseQuorum *winner pg_attribute_unused())
+{}
 ClusterQvotecQuorumState
 decide_quorum_view(const ClusterVotingSlot *slots pg_attribute_unused(),
 				   const ClusterVotingDiskIoState *io_states pg_attribute_unused(),
@@ -320,6 +412,7 @@ MemoryContextAllocZero(MemoryContext context pg_attribute_unused(), Size size)
 }
 int cluster_quorum_poll_interval_ms = 2000;
 int cluster_voting_disk_io_timeout_ms = 5000;
+int cluster_adg_lease_takeover_grace_ms = 5000;
 
 /* spec-4.12 D2/D4 stubs: cluster_qvotec.o references the write-fence marker
  * scan / token refresh / submit-mailbox helpers + the lease GUC; cluster_write_

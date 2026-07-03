@@ -70,6 +70,7 @@
 
 #include "c.h"
 #include "cluster/cluster_pcm_lock.h" /* PcmLockTransition */
+#include "cluster/cluster_sf_dep.h"	  /* ClusterSfDepVec / max origins */
 #include "storage/block.h"			  /* BLCKSZ */
 #include "storage/buf_internals.h"	  /* BufferTag, BufferDesc */
 
@@ -520,6 +521,92 @@ StaticAssertDecl(sizeof(GcsBlockReplyHeader) == 48,
 				 "sender_node 4 + requester_backend_id 4 + transition_id 1 + "
 				 "status 1 + forwarding_master_node_bytes 4 + reserved 6)");
 
+#define GCS_BLOCK_REPLY_PROTOCOL_V1 1
+#define GCS_BLOCK_REPLY_PROTOCOL_V2 2
+#define GCS_BLOCK_REPLY_SF_EARLY_TRANSFER 0x01
+#define GCS_BLOCK_REPLY_SF_HAS_DEP_VEC 0x02
+#define GCS_BLOCK_REPLY_SF_KNOWN_FLAGS                                                             \
+	(GCS_BLOCK_REPLY_SF_EARLY_TRANSFER | GCS_BLOCK_REPLY_SF_HAS_DEP_VEC)
+
+typedef struct GcsBlockReplySfDep {
+	int32 origin_node;
+	uint32 reserved_0;
+	uint64 required_redo_lsn;
+} GcsBlockReplySfDep;
+
+/*
+ * spec-6.2 D5: block-reply v2 header.  It is never sent to peers that have not
+ * negotiated GCS_BLOCK_REPLY_PROTOCOL_V2 in HELLO; mixed-version peers continue
+ * to receive the 48-byte v1 header and the HC82 WAL-before-ship path.
+ */
+typedef struct GcsBlockReplyHeaderV2 {
+	GcsBlockReplyHeader v1; /* [0,48) byte-identical v1 prefix */
+	uint8 sf_flags;
+	uint8 sf_dep_count;
+	uint8 reserved_0[6];
+	GcsBlockReplySfDep sf_dep[CLUSTER_SF_DEP_MAX_ORIGINS];
+} GcsBlockReplyHeaderV2;
+
+StaticAssertDecl(offsetof(GcsBlockReplyHeaderV2, sf_flags) == sizeof(GcsBlockReplyHeader),
+				 "spec-6.2 D5 GcsBlockReplyHeaderV2 sf_flags must follow v1 header");
+StaticAssertDecl(offsetof(GcsBlockReplyHeaderV2, sf_dep) == sizeof(GcsBlockReplyHeader) + 8,
+				 "spec-6.2 D5 GcsBlockReplyHeaderV2 dependency vector offset");
+StaticAssertDecl(sizeof(GcsBlockReplySfDep) == 16,
+				 "spec-6.2 D5 Smart Fusion dependency wire entry is 16 bytes");
+StaticAssertDecl(sizeof(GcsBlockReplyHeaderV2)
+					 == sizeof(GcsBlockReplyHeader) + 8
+							+ CLUSTER_SF_DEP_MAX_ORIGINS * sizeof(GcsBlockReplySfDep),
+				 "spec-6.2 D5 GcsBlockReplyHeaderV2 max-size ABI");
+
+static inline bool
+cluster_gcs_block_reply_v2_extract_dep_vec(const GcsBlockReplyHeaderV2 *hdr,
+										   ClusterSfDepVec *out_vec)
+{
+	bool seen[CLUSTER_SF_DEP_MAX_ORIGINS];
+	bool has_dep;
+	int i;
+
+	if (out_vec != NULL)
+		cluster_sf_dep_vec_reset(out_vec);
+	if (hdr == NULL)
+		return false;
+	if ((hdr->sf_flags & ~GCS_BLOCK_REPLY_SF_KNOWN_FLAGS) != 0)
+		return false;
+	for (i = 0; i < (int)sizeof(hdr->reserved_0); i++) {
+		if (hdr->reserved_0[i] != 0)
+			return false;
+	}
+	if (hdr->sf_dep_count > CLUSTER_SF_DEP_MAX_ORIGINS)
+		return false;
+
+	has_dep = (hdr->sf_flags & GCS_BLOCK_REPLY_SF_HAS_DEP_VEC) != 0;
+	if (!has_dep)
+		return hdr->sf_dep_count == 0;
+	if ((hdr->sf_flags & GCS_BLOCK_REPLY_SF_EARLY_TRANSFER) == 0 || hdr->sf_dep_count == 0)
+		return false;
+
+	memset(seen, 0, sizeof(seen));
+	for (i = 0; i < hdr->sf_dep_count; i++) {
+		int32 origin = hdr->sf_dep[i].origin_node;
+		XLogRecPtr required_lsn = (XLogRecPtr)hdr->sf_dep[i].required_redo_lsn;
+
+		if (hdr->sf_dep[i].reserved_0 != 0)
+			return false;
+		if (!cluster_sf_dep_origin_valid(origin) || seen[origin]
+			|| XLogRecPtrIsInvalid(required_lsn))
+			return false;
+		seen[origin] = true;
+		if (out_vec != NULL)
+			out_vec->required[origin] = required_lsn;
+	}
+	for (; i < CLUSTER_SF_DEP_MAX_ORIGINS; i++) {
+		if (hdr->sf_dep[i].origin_node != 0 || hdr->sf_dep[i].reserved_0 != 0
+			|| !XLogRecPtrIsInvalid((XLogRecPtr)hdr->sf_dep[i].required_redo_lsn))
+			return false;
+	}
+	return true;
+}
+
 
 /* ============================================================
  * Helpers for the spec-2.35 HC109 forwarding_master_node_bytes[4] field.
@@ -863,6 +950,8 @@ StaticAssertDecl(GCS_BLOCK_DATA_SIZE == BLCKSZ,
 #include "cluster/cluster_pcm_lock.h" /* PcmLockMode for invalidate helper */
 extern bool cluster_bufmgr_probe_block_for_gcs(BufferTag tag);
 extern bool cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char *dst);
+extern bool cluster_bufmgr_copy_block_for_gcs_smart_fusion(BufferTag tag, XLogRecPtr *out_page_lsn,
+														   char *dst, ClusterSfDepVec *out_dep_vec);
 /* PGRAC: spec-2.36 D4 (HC118 / HC123) — by-tag invalidate wrapper for
  * holder-side INVALIDATE handler.  XLogFlush+InvalidateBuffer. */
 extern bool cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode,

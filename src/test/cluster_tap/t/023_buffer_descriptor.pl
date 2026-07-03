@@ -61,7 +61,7 @@ my $has_visibility_inject =
 # admission reason counters; +1 "pgrac cluster clean_leave" (spec-5.13); +1
 # "pgrac cluster cr relgen" (spec-5.56 D4); +1 "pgrac cluster cr tuple stats"
 # (spec-5.54 D5); full list + count lives in t/020).
-  my $expected_region_count = $has_visibility_inject ? '71' : '70'; # spec-5.59 +1 xnode profile; spec-6.1 +1 rdma; spec-5.55 +1 resolver cache; spec-5.57 +1 cr coordinator; spec-5.18 +1 node_remove; spec-6.5 +1 backup
+  my $expected_region_count = $has_visibility_inject ? '73' : '72'; # spec-6.2 +1 smart fusion deps; spec-6.4 +1 mrp; full list lives in t/020
 
 
 # ----------
@@ -137,8 +137,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-   '112',
-   'L9 pg_stat_cluster_wait_events returns 112 rows (spec-6.0a +7 storage wait events)');
+   '116',
+   'L9 pg_stat_cluster_wait_events returns 116 rows (spec-6.2 Smart Fusion authority waits)');
 
 
 # ----------
@@ -168,8 +168,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT category) FROM pg_cluster_state}),
-   '51',
-   'L12 pg_cluster_state has 51 categories (spec-5.11 adds hang; spec-5.51 adds cr_pool; spec-5.14 adds reconfig_touched; spec-5.15 adds reconfig_join; spec-5.55 adds resolver_cache; spec-5.57 adds cr_coord; spec-5.59 adds xnode_profile)');
+   '52',
+   'L12 pg_cluster_state has 52 categories (spec-6.2 adds smart_fusion)');
 
 
 # ----------
@@ -232,7 +232,7 @@ is($node->safe_psql('postgres',
 my $smoke_categories = $node->safe_psql(
 	'postgres',
 	q{SELECT count(DISTINCT category) FROM pg_cluster_state});
-is($smoke_categories, '51', 'L16 cluster_smoke surface integrates buffer_format + pcm + gcs + tt_status + tt_status_hint + tt_2pc + tt_recovery + visibility + wal_thread + dl + hw + ir + ko + ts categories (51 categories;spec-5.11 adds hang;spec-5.51 adds cr_pool;spec-5.14 adds reconfig_touched;spec-5.15 adds reconfig_join; spec-5.55 adds resolver_cache; spec-5.57 adds cr_coord; spec-5.59 adds xnode_profile)');
+is($smoke_categories, '52', 'L16 cluster_smoke surface integrates buffer_format + pcm + gcs + tt_status + tt_status_hint + tt_2pc + tt_recovery + visibility + wal_thread + dl + hw + ir + ko + ts + smart_fusion categories (52 categories; spec-6.2 adds smart_fusion)');
 
 
 # ----------

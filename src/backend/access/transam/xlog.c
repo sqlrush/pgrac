@@ -7562,6 +7562,26 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 static void
 RecoveryRestartPoint(const CheckPoint *checkPoint, XLogReaderState *record)
 {
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: spec-6.4 P1-c -- a FOREIGN WAL thread's checkpoint record must
+	 * never become this node's restartpoint anchor.  Its redo/record LSNs
+	 * live in another thread's LSN space; stashing them here would make the
+	 * next restartpoint write a cross-space checkPoint into the control
+	 * file, and the following restart would read garbage at that offset in
+	 * the local recovery thread's WAL ("could not locate a valid checkpoint
+	 * record").  Only recovery-space (own-thread) checkpoints anchor
+	 * restartpoints.
+	 */
+	if (cluster_recmerge_window_active && cluster_recmerge_apply_foreign)
+	{
+		elog(trace_recovery(DEBUG2),
+			 "skipping restart point from a foreign WAL thread's checkpoint at %X/%X",
+			 LSN_FORMAT_ARGS(checkPoint->redo));
+		return;
+	}
+#endif
+
 	/*
 	 * Also refrain from creating a restartpoint if we have seen any
 	 * references to non-existent pages. Restarting recovery from the

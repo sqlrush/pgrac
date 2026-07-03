@@ -57,6 +57,7 @@
 #include "cluster/cluster_inject.h"			  /* cluster_injection_assign_hook (stage 0.27) */
 #include "cluster/cluster_pcm_lock.h"		  /* cluster_pcm_grd_max_entries (stage 1.7) */
 #include "cluster/storage/cluster_shared_fs.h" /* ClusterSharedFsBackendId (stage 1.1) */
+#include "cluster/cluster_xlog.h"
 
 
 /*
@@ -84,6 +85,20 @@ bool cluster_merged_recovery = false;
 int cluster_recovery_merge_wait_timeout = 10000;
 /* spec-5.59 D1: cross-node profiling switch (default OFF, zero hot-path cost). */
 bool cluster_xnode_profile_enabled = false;
+/* spec-6.4: ADG physical standby / read-only service knobs. */
+int cluster_dg_role = CLUSTER_DG_ROLE_PRIMARY;
+int cluster_dg_mode = CLUSTER_DG_MODE_ASYNC;
+bool cluster_enable_adg = false;
+bool cluster_apply_master_election = true;
+char *cluster_adg_rfs_conninfos = NULL;
+int cluster_adg_primary_thread_count = 0;
+int cluster_adg_lag_threshold_sec = 10;
+int cluster_max_standby_delay = 30;
+int cluster_apply_master_switch_drain_ms = 5000;
+int cluster_adg_lease_takeover_grace_ms = 5000;
+int cluster_adg_barrier_interval_ms = 1000;
+int cluster_wal_sender_timeout_sec = 60;
+int cluster_wal_receiver_timeout_sec = 60;
 /* spec-6.5: cluster-aware backup / restore / PITR target knobs. */
 char *cluster_recovery_target_scn = NULL;
 char *cluster_recovery_target_cluster_time = NULL;
@@ -312,7 +327,7 @@ int cluster_cssd_dead_deadband_factor = 3;
 char *cluster_voting_disks = NULL; /* CSV path list, default empty */
 int cluster_quorum_poll_interval_ms = 2000;
 int cluster_voting_disk_io_timeout_ms = 5000;
-int cluster_voting_disk_size_bytes = 196608; /* spec-5.15: 3 regions × 128 × 512 */
+int cluster_voting_disk_size_bytes = 262144; /* spec-6.4: 4 regions × 128 × 512 */
 
 /* spec-5.15 D7 — online declared-node join.  Default off (capability opt-in;
  * fail-closed-safe via INV-J8 — a DEAD node is never auto-readmitted when off).
@@ -451,6 +466,19 @@ bool cluster_tt_durable_lookup = true;
  * resolution runs once at startup.
  */
 bool cluster_tt_recovery_resolve_active = true;
+
+/*
+ * spec-6.2 Cache Fusion terminal authority + Smart Fusion.  Both correctness-
+ * sensitive halves default OFF so an upgraded binary preserves Stage 5
+ * conservative behavior until explicitly enabled.
+ */
+bool cluster_cf_terminal_authority = false;
+int cluster_cf_delayed_cleanout = CLUSTER_CF_DELAYED_CLEANOUT_READER;
+bool cluster_smart_fusion = false;
+int cluster_smart_fusion_tier_min = CLUSTER_IC_TIER_3;
+int cluster_smart_fusion_commit_brake_timeout_ms = 5000;
+int cluster_smart_fusion_origin_durable_gossip_ms = 50;
+static bool cluster_smart_fusion_enable_requested = false;
 
 /*
  * cluster.undo_retention_horizon_enabled (spec-3.12 D5).  When on (default),
@@ -824,6 +852,15 @@ static const struct config_enum_entry cluster_interconnect_tier_options[]
 		{ "tier1", CLUSTER_IC_TIER_1, false },	 { "tier2", CLUSTER_IC_TIER_2, false },
 		{ "tier3", CLUSTER_IC_TIER_3, false },	 { NULL, 0, false } };
 
+static const struct config_enum_entry cluster_cf_delayed_cleanout_options[]
+	= { { "off", CLUSTER_CF_DELAYED_CLEANOUT_OFF, false },
+		{ "reader", CLUSTER_CF_DELAYED_CLEANOUT_READER, false },
+		{ "eager", CLUSTER_CF_DELAYED_CLEANOUT_EAGER, false },
+		{ NULL, 0, false } };
+
+static const struct config_enum_entry cluster_smart_fusion_tier_min_options[]
+	= { { "tier3", CLUSTER_IC_TIER_3, false }, { NULL, 0, false } };
+
 static const struct config_enum_entry cluster_interconnect_rdma_fallback_options[]
 	= { { "auto", CLUSTER_IC_RDMA_FALLBACK_AUTO, false },
 		{ "off", CLUSTER_IC_RDMA_FALLBACK_OFF, false },
@@ -856,6 +893,17 @@ static const struct config_enum_entry cluster_shared_storage_backend_options[]
 		{ "cluster_fs", CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS, false },
 		{ "rbd", CLUSTER_SHARED_FS_BACKEND_RBD, false },
 		{ "multi_attach", CLUSTER_SHARED_FS_BACKEND_MULTI_ATTACH, false },
+		{ NULL, 0, false } };
+
+static const struct config_enum_entry cluster_dg_role_options[]
+	= { { "primary", CLUSTER_DG_ROLE_PRIMARY, false },
+		{ "standby", CLUSTER_DG_ROLE_STANDBY, false },
+		{ NULL, 0, false } };
+
+static const struct config_enum_entry cluster_dg_mode_options[]
+	= { { "async", CLUSTER_DG_MODE_ASYNC, false },
+		{ "sync", CLUSTER_DG_MODE_SYNC, false },
+		{ "max_availability", CLUSTER_DG_MODE_MAX_AVAILABILITY, false },
 		{ NULL, 0, false } };
 
 static const struct config_enum_entry cluster_recovery_target_action_options[]
@@ -1022,6 +1070,51 @@ cluster_undo_buffer_writeback_check_hook(bool *newval, void **extra, GucSource s
 				 errhint("Undo continues to use the write-through path (per-commit fsync to "
 						 "shared storage).  Single-node deployments may enable write-back.")));
 	return true;
+}
+
+static const char *
+cluster_show_adg_primary_thread_count(void)
+{
+	static char nbuf[16];
+	int count;
+
+	count = cluster_conf_node_count();
+	if (count < 0 || count > CLUSTER_WAL_THREAD_MAX)
+		count = 0;
+	snprintf(nbuf, sizeof(nbuf), "%d", count);
+	return nbuf;
+}
+
+/*
+ * spec-6.2 post-ship guardrail: Smart Fusion's early-transfer enabled path is
+ * a correctness-sensitive visibility / durability authority.  Keep the
+ * substrate counters, wire definitions, and off-path behavior, but reject the
+ * runtime path until checkpoint writeback, 2PC, and dependency-consumer
+ * contracts are closed end to end.
+ */
+static bool
+cluster_smart_fusion_check_hook(bool *newval, void **extra, GucSource source)
+{
+	(void)extra;
+	(void)source;
+
+	if (!*newval)
+		return true;
+
+	cluster_smart_fusion_enable_requested = true;
+	GUC_check_errcode(ERRCODE_INVALID_PARAMETER_VALUE);
+	GUC_check_errdetail("cluster.smart_fusion is fail-closed after the "
+						"v0.121.0-stage6.2 review because the enabled path still "
+						"lacks complete checkpoint, 2PC, and dependency-consumer "
+						"soundness; leave it off until those spec-6.2 blockers "
+						"are fixed.");
+	return false;
+}
+
+bool
+cluster_smart_fusion_failclosed_requested(void)
+{
+	return cluster_smart_fusion_enable_requested;
 }
 
 void
@@ -1235,6 +1328,107 @@ cluster_init_guc(void)
 							 gettext_noop("Enable cross-node performance profiling buckets."),
 							 gettext_noop("Off keeps all instrumented paths at zero overhead."),
 							 &cluster_xnode_profile_enabled, false, PGC_SUSET, 0, NULL, NULL, NULL);
+
+	/*
+	 * spec-6.4 ADG role and read-only service knobs.  Defaults keep existing
+	 * primary behavior byte-identical: ADG is off and no standby apply process
+	 * starts unless role=standby and enable_adg=on at postmaster start.
+	 */
+	DefineCustomEnumVariable(
+		"cluster.dg_role", gettext_noop("Cluster Data Guard role for this instance."),
+		gettext_noop("primary is the normal writer role; standby enables ADG standby "
+					 "startup paths when cluster.enable_adg is on."),
+		&cluster_dg_role, CLUSTER_DG_ROLE_PRIMARY, cluster_dg_role_options, PGC_POSTMASTER, 0, NULL,
+		NULL, NULL);
+
+	DefineCustomEnumVariable(
+		"cluster.dg_mode", gettext_noop("Cluster Data Guard shipping acknowledgement mode."),
+		gettext_noop("async does not wait for standby acknowledgement; sync waits for at "
+					 "least one standby; max_availability may degrade to async when no "
+					 "standby is reachable."),
+		&cluster_dg_mode, CLUSTER_DG_MODE_ASYNC, cluster_dg_mode_options, PGC_SIGHUP, 0, NULL, NULL,
+		NULL);
+
+	DefineCustomBoolVariable(
+		"cluster.enable_adg", gettext_noop("Enable ADG standby apply and read-only service."),
+		gettext_noop("Only a standby role with this setting on starts the ADG MRP path."),
+		&cluster_enable_adg, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	/*
+	 * PGC_POSTMASTER on purpose: flipping election off at runtime would let
+	 * every standby in a multi-node cluster appoint itself Apply Master on
+	 * the next reload, so the off mode is a start-time, single-node-only
+	 * decision (MRP refuses to start with it off when peers are declared).
+	 */
+	DefineCustomBoolVariable(
+		"cluster.apply_master_election",
+		gettext_noop("Enable automatic ADG Apply Master election."),
+		gettext_noop("When on, the standby cluster elects one Apply Master using a voting-disk "
+					 "majority and the durable apply-master term lease."),
+		&cluster_apply_master_election, true, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	DefineCustomStringVariable(
+		"cluster.adg_rfs_conninfos", gettext_noop("ADG RFS upstream connection strings."),
+		gettext_noop("Semicolon-separated libpq connection strings used by the standby RFS "
+					 "coordinator to receive per-thread WAL from primary instances.  Each entry "
+					 "may start with \"thread_id=N\" followed by whitespace before the libpq "
+					 "connection string; entries without a prefix use their 1-based order."),
+		&cluster_adg_rfs_conninfos, "", PGC_POSTMASTER, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.adg_primary_thread_count", gettext_noop("Primary ADG WAL thread count."),
+		gettext_noop("Read-only replication protocol surface for ADG standby thread discovery."),
+		&cluster_adg_primary_thread_count, 0, 0, CLUSTER_WAL_THREAD_MAX, PGC_INTERNAL,
+		GUC_NOT_IN_SAMPLE | GUC_NO_SHOW_ALL, NULL, NULL, cluster_show_adg_primary_thread_count);
+
+	DefineCustomIntVariable(
+		"cluster.adg_lag_threshold_sec",
+		gettext_noop("ADG apply lag threshold for read-only service errors."),
+		gettext_noop("Standby reads fail with cluster_adg_apply_lag_excessive when the "
+					 "tracked lag exceeds this threshold."),
+		&cluster_adg_lag_threshold_sec, 10, 1, 300, PGC_SIGHUP, GUC_UNIT_S, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.max_standby_delay",
+		gettext_noop("Maximum delay before ADG read-only queries yield to apply."),
+		gettext_noop("-1 disables the delay limit; otherwise long standby reads that block "
+					 "apply are cancelled after this many seconds."),
+		&cluster_max_standby_delay, 30, -1, 86400, PGC_SIGHUP, GUC_UNIT_S, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.apply_master_switch_drain_ms",
+		gettext_noop("ADG Apply Master switch drain window."),
+		gettext_noop("In-flight standby reads are given this drain window during Apply "
+					 "Master failover before stricter conflict handling applies."),
+		&cluster_apply_master_switch_drain_ms, 5000, 0, 600000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
+		NULL);
+
+	DefineCustomIntVariable(
+		"cluster.adg_lease_takeover_grace_ms",
+		gettext_noop("Grace period past apply-master lease expiry before takeover."),
+		gettext_noop("A standby may only take over an expired apply-master lease this long "
+					 "after its expiry; the deposed master stops shared-storage writes at "
+					 "most halfway through it, and the other half absorbs clock skew."),
+		&cluster_adg_lease_takeover_grace_ms, 5000, 0, 600000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
+		NULL);
+
+	DefineCustomIntVariable(
+		"cluster.adg_barrier_interval_ms", gettext_noop("ADG consistency barrier interval."),
+		gettext_noop("Primary walwriter emits periodic thread-safe SCN barriers at this "
+					 "interval while ADG is enabled; 0 disables the heartbeat and leaves "
+					 "only commit-driven barriers."),
+		&cluster_adg_barrier_interval_ms, 1000, 0, 300000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
+		NULL);
+
+	DefineCustomIntVariable(
+		"cluster.wal_sender_timeout_sec", gettext_noop("ADG LNS WAL sender timeout."),
+		gettext_noop("Primary-side per-thread ADG shipping times out after this many seconds."),
+		&cluster_wal_sender_timeout_sec, 60, 1, 3600, PGC_SIGHUP, GUC_UNIT_S, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.wal_receiver_timeout_sec", gettext_noop("ADG RFS WAL receiver timeout."),
+		gettext_noop("Standby-side per-thread ADG receive waits time out after this many seconds."),
+		&cluster_wal_receiver_timeout_sec, 60, 1, 3600, PGC_SIGHUP, GUC_UNIT_S, NULL, NULL, NULL);
 
 	/*
 	 * cluster.clean_leave_enabled -- opt-in cooperative clean-leave
@@ -2447,25 +2641,29 @@ cluster_init_guc(void)
 
 	/*
 	 * cluster.voting_disk_size_bytes (spec-2.6 D12; spec-5.13 doubled;
-	 * spec-5.15 tripled).  Voting disk file size — pre-allocated on first
-	 * boot.  Three 512-byte regions per instance: region 1 = the voting slot
+	 * spec-5.15 tripled; spec-6.4 quadrupled).  Voting disk file size —
+	 * pre-allocated on first boot.  Four 512-byte regions per instance:
+	 * region 1 = the voting slot
 	 * at offset (node_id × 512); region 2 = the clean-leave marker at offset
 	 * ((CLUSTER_MAX_NODES + node_id) × 512); region 3 = the join-commit marker
-	 * at offset ((2 × CLUSTER_MAX_NODES + node_id) × 512).  Default 196608
-	 * bytes = 3 × 128 × 512.  Range [4096, 1048576].
+	 * at offset ((2 × CLUSTER_MAX_NODES + node_id) × 512); region 4 = the ADG
+	 * apply-master lease marker at offset ((3 × CLUSTER_MAX_NODES + node_id)
+	 * × 512).  Default 262144 bytes = 4 × 128 × 512.  Range [4096, 1048576].
 	 */
-	DefineCustomIntVariable("cluster.voting_disk_size_bytes",
-							gettext_noop("Voting disk file size in bytes."),
-							gettext_noop("Pre-allocated voting disk size (spec-2.6 D12; spec-5.13 "
-										 "doubled for the clean-leave marker region; spec-5.15 "
-										 "tripled for the join-commit marker region).  Each "
-										 "instance owns a 512-byte voting slot at offset "
-										 "(node_id × 512), a 512-byte leave-marker slot at "
-										 "((128 + node_id) × 512), and a 512-byte join-marker slot "
-										 "at ((256 + node_id) × 512).  Default 196608 = 3 × 128 "
-										 "slots.  Range [4096, 1048576] bytes; multiple of 512."),
-							&cluster_voting_disk_size_bytes, 196608, 4096, 1048576, PGC_POSTMASTER,
-							GUC_UNIT_BYTE, NULL, NULL, NULL);
+	DefineCustomIntVariable(
+		"cluster.voting_disk_size_bytes", gettext_noop("Voting disk file size in bytes."),
+		gettext_noop("Pre-allocated voting disk size (spec-2.6 D12; spec-5.13 "
+					 "doubled for the clean-leave marker region; spec-5.15 "
+					 "tripled for the join-commit marker region; spec-6.4 "
+					 "quadrupled for the ADG apply-master lease region).  Each "
+					 "instance owns a 512-byte voting slot at offset "
+					 "(node_id × 512), a 512-byte leave-marker slot at "
+					 "((128 + node_id) × 512), and a 512-byte join-marker slot "
+					 "at ((256 + node_id) × 512), and a 512-byte ADG lease slot "
+					 "at ((384 + node_id) × 512).  Default 262144 = 4 × 128 "
+					 "slots.  Range [4096, 1048576] bytes; multiple of 512."),
+		&cluster_voting_disk_size_bytes, 262144, 4096, 1048576, PGC_POSTMASTER, GUC_UNIT_BYTE, NULL,
+		NULL, NULL);
 
 	/* spec-5.15 D7 — online declared-node join (Q7/Q8). */
 	DefineCustomBoolVariable("cluster.online_join",
@@ -2787,6 +2985,64 @@ cluster_init_guc(void)
 					 "the resolution: slots stay ACTIVE and fall through to the by-xid 0-match "
 					 "path (no correctness loss, only the explicit verdict + housekeeping)."),
 		&cluster_tt_recovery_resolve_active, true, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"cluster.cf_terminal_authority",
+		gettext_noop("Enable spec-6.2 Cache Fusion durable TT/undo terminal authority."),
+		gettext_noop("Spec-6.2. Default off, preserving the Stage 5 conservative active-ITL "
+					 "transfer boundary. When on, cross-instance undo / TT terminal decisions "
+					 "must prove membership epoch, ownership, terminal outcome, and required "
+					 "durable/retention evidence before callers may trust them. Missing evidence "
+					 "fails closed; there is no native fallback or UNKNOWN-visible behavior."),
+		&cluster_cf_terminal_authority, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	DefineCustomEnumVariable(
+		"cluster.cf_delayed_cleanout",
+		gettext_noop("Choose the spec-6.2 delayed ITL cleanout policy."),
+		gettext_noop("Spec-6.2. Values: off never writes back ITL hints; reader performs lazy "
+					 "reader-path cleanout from durable TT authority; eager is reserved for a "
+					 "future transfer-side sweep. The setting only controls hinting; verdicts "
+					 "still come from durable TT authority and fail closed when unresolved."),
+		&cluster_cf_delayed_cleanout, CLUSTER_CF_DELAYED_CLEANOUT_READER,
+		cluster_cf_delayed_cleanout_options, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"cluster.smart_fusion",
+		gettext_noop("Guarded spec-6.2 Smart Fusion early block-transfer dependency tracking."),
+		gettext_noop("Spec-6.2. Default off and currently fail-closed if set on. The "
+					 "substrate counters and wire definitions remain available, but the "
+					 "early-transfer runtime path is rejected until checkpoint writeback, 2PC, "
+					 "and dependency-consumer soundness are complete."),
+		&cluster_smart_fusion, false, PGC_POSTMASTER, 0, cluster_smart_fusion_check_hook, NULL,
+		NULL);
+
+	DefineCustomEnumVariable(
+		"cluster.smart_fusion_tier_min",
+		gettext_noop("Minimum interconnect tier that may use Smart Fusion early transfer."),
+		gettext_noop("Spec-6.2. Only tier3 is currently legal: Smart Fusion requires an "
+					 "authenticated direct-wire path. TCP/tier1/tier2 deployments remain on "
+					 "HC82 WAL-before-ship even if cluster.smart_fusion is on."),
+		&cluster_smart_fusion_tier_min, CLUSTER_IC_TIER_3, cluster_smart_fusion_tier_min_options,
+		PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.smart_fusion_commit_brake_timeout_ms",
+		gettext_noop("Timeout for the spec-6.2 Smart Fusion pre-commit dependency brake."),
+		gettext_noop("A transaction that consumed an early-transfer dependent block waits up to "
+					 "this many milliseconds, before writing its commit record, for all origin "
+					 "redo dependencies to become durable. Timeout aborts the transaction with "
+					 "a retryable Smart Fusion error instead of false-committing."),
+		&cluster_smart_fusion_commit_brake_timeout_ms, 5000, 1, 600000, PGC_SIGHUP, GUC_UNIT_MS,
+		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.smart_fusion_origin_durable_gossip_ms",
+		gettext_noop("Interval for publishing local durable WAL progress to Smart Fusion peers."),
+		gettext_noop("Spec-6.2 origin durable-LSN gossip interval. Receivers release DBWR and "
+					 "commit brakes only after observing durable progress; they never trust a "
+					 "block marker as proof of durability."),
+		&cluster_smart_fusion_origin_durable_gossip_ms, 50, 1, 60000, PGC_SIGHUP, GUC_UNIT_MS, NULL,
+		NULL, NULL);
 
 	DefineCustomIntVariable(
 		"cluster.cr_cache_max_blocks",

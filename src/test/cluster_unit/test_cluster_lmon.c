@@ -484,6 +484,13 @@ void
 cluster_backup_lmon_tick(void)
 {}
 
+/* spec-6.2 D7 stub: cluster_lmon_shmem_init registers Smart Fusion durable
+ * gossip IC msg types; this standalone unit binary does not link
+ * cluster_sf_dep.o. */
+void
+cluster_sf_dep_register_ic_msg_types(void)
+{}
+
 /* spec-2.2 D5 LMON drive references cluster_conf_lookup_node + cluster_node_id. */
 const struct ClusterNodeInfo *
 cluster_conf_lookup_node(int32 node_id pg_attribute_unused())

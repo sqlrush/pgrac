@@ -71,7 +71,7 @@ my $has_visibility_inject =
 # and +1 for the unconditional "pgrac cluster cr admit stats" region (spec-5.52 D9;
 # and +1 for the unconditional "pgrac cluster cr relgen" region (spec-5.56 D4;
 # full enumerated region list + count lives in t/020).
-  my $expected_region_count = $has_visibility_inject ? '71' : '70'; # spec-5.59 +1 xnode profile; spec-6.1 +1 rdma; +1 clean_leave +1 cr relgen +1 cr tuple stats +1 resolver cache +1 cr coordinator; spec-5.18 +1 node_remove; spec-6.5 +1 backup
+  my $expected_region_count = $has_visibility_inject ? '73' : '72'; # spec-6.2 +1 smart fusion deps; spec-6.4 +1 mrp; full list lives in t/020
 
 
 # ----------
@@ -210,8 +210,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-   '112',
-   'L12b pg_stat_cluster_wait_events returns 112 rows (spec-6.0a +7 storage wait events)');
+   '116',
+   'L12b pg_stat_cluster_wait_events returns 116 rows (spec-6.2 Smart Fusion authority waits)');
 
 is($node->safe_psql(
 		'postgres',

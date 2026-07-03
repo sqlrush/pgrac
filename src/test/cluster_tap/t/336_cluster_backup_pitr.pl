@@ -1,11 +1,11 @@
 #!/usr/bin/env perl
 #-------------------------------------------------------------------------
 #
-# 335_cluster_backup_pitr.pl
+# 336_cluster_backup_pitr.pl
 #    spec-6.5 -- cluster-aware backup / restore / PITR SQL surface.
 #
 # IDENTIFICATION
-#    src/test/cluster_tap/t/335_cluster_backup_pitr.pl
+#    src/test/cluster_tap/t/336_cluster_backup_pitr.pl
 #
 # Author: SqlRush <sqlrush@gmail.com>
 #

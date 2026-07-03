@@ -455,17 +455,21 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 			 * (a different LSN sequence), so the lsn comparison below is
 			 * meaningless there.  Freshness is judged by the page's
 			 * pd_block_scn watermark instead (stamped by the PageSetLSN
-			 * window hook): an SCN at or below the watermark was already
-			 * applied (first run or crash-rerun) -> BLK_DONE; otherwise
-			 * the record is strictly newer in the global SCN order ->
-			 * BLK_NEEDS_REDO.  Outside the window this block is dead.
+			 * window hook): an older SCN was already applied
+			 * (first run or crash-rerun) -> BLK_DONE; a newer SCN must be
+			 * replayed -> BLK_NEEDS_REDO.  Equal-SCN records are common
+			 * inside one transaction, so they fall through to the native LSN
+			 * comparison below to preserve intra-thread record order.
+			 * Outside the window this block is dead.
 			 */
 			if (cluster_recmerge_window_active)
 			{
-				if (cluster_recmerge_window_scn <=
-					(uint64) ((PageHeader) BufferGetPage(*buf))->pd_block_scn)
+				uint64		page_scn = (uint64) ((PageHeader) BufferGetPage(*buf))->pd_block_scn;
+
+				if (cluster_recmerge_window_scn < page_scn)
 					return BLK_DONE;
-				return BLK_NEEDS_REDO;
+				if (cluster_recmerge_window_scn > page_scn)
+					return BLK_NEEDS_REDO;
 			}
 #endif
 			if (lsn <= PageGetLSN(BufferGetPage(*buf)))

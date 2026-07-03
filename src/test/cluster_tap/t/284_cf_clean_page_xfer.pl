@@ -137,6 +137,45 @@ sub cnext
 	die "cnext($seq): exhausted retries under contention; last=$last_err";
 }
 
+# Retry a post-restart nextval through documented fail-closed, quorum, and
+# connection readiness windows, but still require a successful value before
+# checking durability.
+sub restart_nextval
+{
+	my ($node, $seq) = @_;
+	my $last_err = '';
+	for my $attempt (1 .. 60)
+	{
+		my ($rc, $out, $err);
+		my $ran = eval {
+			($rc, $out, $err) =
+			  $node->psql('postgres', "SELECT nextval('$seq')", timeout => 10);
+			1;
+		};
+		if ($ran && defined $rc && $rc == 0 && defined $out && $out ne '')
+		{
+			return (1, $out, '');
+		}
+
+		$last_err = $ran ? ($err // '(no stderr)') : ($@ // '(psql died)');
+		last
+		  unless $last_err =~ /could not obtain X transfer/
+		  || $last_err =~ /did not ship a current image/
+		  || $last_err =~ /retry the transaction/
+		  || $last_err =~ /cluster TT status unknown/
+		  || $last_err =~ /Remote commit_scn not yet propagated/
+		  || $last_err =~ /cluster quorum lost or uncertain/
+		  || $last_err =~ /transaction aborted: cluster quorum lost/
+		  || $last_err =~ /database system is starting up/
+		  || $last_err =~ /server closed the connection unexpectedly/
+		  || $last_err =~ /could not connect to server/
+		  || $last_err =~ /Connection refused/
+		  || $last_err =~ /terminating connection due to administrator command/;
+		usleep(500_000);
+	}
+	return (0, undef, $last_err);
+}
+
 # ----------
 # L1: strict pair + shared data + same-DDL (same relfilenode) + counter baseline.
 # ----------
@@ -454,9 +493,19 @@ $n0->safe_psql('postgres', 'CHECKPOINT');
 $pair->node0->stop('immediate');
 $pair->node0->start;
 ok($pair->wait_for_peer_state(1, 0, 'connected', 60), 'L6: node0 rejoined after crash-restart');
-my $after_crash = $n0->safe_psql('postgres', "SELECT nextval('dseq')");
-cmp_ok($after_crash, '>', $max_issued,
-	"L6: post-crash node0 nextval ($after_crash) > pre-crash max issued ($max_issued) -- durable across restart");
+my ($after_ok, $after_crash, $after_err) = restart_nextval($n0, 'dseq');
+ok($after_ok, 'L6: node0 dseq nextval succeeds after restart')
+  or diag("L6 post-crash nextval did not succeed: $after_err");
+if ($after_ok)
+{
+	cmp_ok($after_crash, '>', $max_issued,
+		"L6: post-crash node0 nextval ($after_crash) > pre-crash max issued ($max_issued) -- durable across restart");
+}
+else
+{
+	fail(
+		"L6: post-crash node0 nextval is available for durability comparison -- pre-crash max issued ($max_issued)");
+}
 
 $pair->stop_pair;
 done_testing();

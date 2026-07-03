@@ -132,10 +132,14 @@
 #include "catalog/catversion.h"
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: spec-4.1 own-stream strict thread-id for crash recovery. */
+#include "cluster/cluster_apply_master_election.h"
 #include "cluster/cluster_backup.h" /* PGRAC: spec-6.5 restore/PITR manifest */
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h" /* PGRAC: spec-4.5a cluster_wal_threads_dir */
 #include "cluster/cluster_hw_snapshot.h" /* PGRAC: spec-5.7 D3 HW authority recovery load */
+#include "cluster/cluster_mrp.h"	   /* PGRAC: spec-6.4 ADG Apply Master gate */
+#include "cluster/cluster_mrp_apply.h" /* PGRAC: spec-6.4 MRP apply facade */
+#include "cluster/cluster_rfs.h"	   /* PGRAC: spec-6.4 ADG RFS coordinator */
 #include "cluster/cluster_remote_xact.h" /* PGRAC: spec-4.5a G5 */
 #include "cluster/cluster_tt_status.h" /* PGRAC: spec-4.5a D11 merged counters */
 #include "cluster/cluster_recovery_plan.h"
@@ -502,6 +506,91 @@ static ClusterRecoveryRecordClass cluster_record_apply_class(XLogReaderState *r)
  * or below it must NOT be re-applied (they would regress shared pages that
  * carry NEWER cross-thread state).  0 = never merged / not configured. */
 static uint64 cluster_recovery_own_merge_bound = 0;
+/* PGRAC: spec-6.4 INV-ADG5 -- the apply-master term this startup process has
+ * already applied records under.  0 = nothing applied yet.  Once set, losing
+ * the lease or seeing a different term is a FATAL fail-stop (P0-1): cached
+ * pages may be stale against an interim master and must be discarded. */
+static uint64 cluster_adg_applied_under_term = 0;
+/* Renewal-gap deadline: an ex-master waits at most half the takeover grace
+ * for a same-term renewal to land before failing stop.  0 = not waiting. */
+static int64 cluster_adg_gate_gap_deadline_ms = 0;
+/* Once-per-episode logging for the closed gate (operator visibility). */
+static bool cluster_adg_gate_wait_logged = false;
+
+/*
+ * cluster_adg_apply_gate_self_valid -- INV-ADG5 gate predicate + fail-stop
+ *	policy, shared by the streaming-loop pre-gates and the ApplyWalRecord
+ *	gate so a deposed master fails stop promptly wherever it is waiting.
+ *
+ *	Returns true when this node holds a fresh apply-master lease and may
+ *	apply; records the term it clears us under.  A node that has already
+ *	applied records under some term FATALs on term change, on a foreign
+ *	takeover, and when a renewal gap outlives half the takeover grace --
+ *	its cached pages may be stale against an interim master, and the only
+ *	safe reaction is to discard them by failing stop (P0-1).
+ */
+static bool
+cluster_adg_apply_gate_self_valid(void)
+{
+	uint64		term = 0;
+	ClusterMrpApplyGateState gate = cluster_mrp_apply_gate_probe(&term);
+
+	if (gate == CLUSTER_MRP_APPLY_GATE_SELF_VALID)
+	{
+		if (cluster_adg_applied_under_term != 0
+			&& term != cluster_adg_applied_under_term)
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_ADG_NOT_APPLY_MASTER),
+					 errmsg("ADG apply-master term changed from " UINT64_FORMAT
+							" to " UINT64_FORMAT " while this node held replayed state",
+							cluster_adg_applied_under_term, term),
+					 errdetail("Another Apply Master may have applied WAL in between; "
+							   "this node fails stop to discard its cached pages.")));
+		cluster_adg_applied_under_term = term;
+		cluster_adg_gate_gap_deadline_ms = 0;
+		if (cluster_adg_gate_wait_logged)
+		{
+			ereport(LOG,
+					(errmsg("ADG standby acquired the apply-master lease (term " UINT64_FORMAT
+							"); resuming WAL replay",
+							term)));
+			cluster_adg_gate_wait_logged = false;
+		}
+		return true;
+	}
+
+	/* Once per wait episode: make the closed gate operator-visible. */
+	if (!cluster_adg_gate_wait_logged)
+	{
+		ereport(LOG,
+				(errmsg("ADG standby is waiting for the apply-master lease before "
+						"replaying WAL")));
+		cluster_adg_gate_wait_logged = true;
+	}
+
+	if (cluster_adg_applied_under_term != 0)
+	{
+		int64		now_ms = (int64) (GetCurrentTimestamp() / 1000);
+
+		if (gate == CLUSTER_MRP_APPLY_GATE_FOREIGN_MASTER)
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_ADG_NOT_APPLY_MASTER),
+					 errmsg("ADG apply-master lease was taken over by another node"),
+					 errdetail("This deposed node fails stop to discard its cached pages "
+							   "before the new Apply Master's writes could be shadowed.")));
+		if (cluster_adg_gate_gap_deadline_ms == 0)
+			cluster_adg_gate_gap_deadline_ms =
+				now_ms + cluster_adg_lease_takeover_grace_ms / 2;
+		else if (now_ms >= cluster_adg_gate_gap_deadline_ms)
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_ADG_NOT_APPLY_MASTER),
+					 errmsg("ADG apply-master lease was not renewed within the "
+							"takeover-grace window"),
+					 errdetail("This node's lease may already be up for takeover; it fails "
+							   "stop to discard its cached pages.")));
+	}
+	return false;
+}
 #endif
 #ifdef USE_PGRAC_CLUSTER
 static XLogRecPtr cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start,
@@ -875,6 +964,11 @@ cluster_backup_recovery_apply_target(void)
 					   cluster_backup_recovery_manifest.thread_count)));
 }
 
+static XLogRecPtr cluster_adg_streaming_replay(XLogPrefetcher *xlogprefetcher,
+											   XLogReaderState *xlogreader,
+											   XLogRecord *first_record, TimeLineID tli,
+											   TimeLineID *replayTLI,
+											   bool *reachedRecoveryTarget);
 #endif
 
 static void EnableStandbyMode(void);
@@ -1157,6 +1251,17 @@ InitWalRecovery(ControlFileData *ControlFile, bool *wasShutdown_ptr,
 						  &backupFromStandby))
 	{
 		List	   *tablespaces = NIL;
+
+#ifdef USE_PGRAC_CLUSTER
+		/*
+		 * PGRAC: a backup label can point at the source node's WAL checkpoint.
+		 * Backup-label recovery is replay, not plain local crash recovery, and
+		 * must accept any valid thread id just like archive/standby replay.
+		 * Keep the strict own-thread check for the local crash recovery path
+		 * with no recovery signal and no backup_label.
+		 */
+		xlogreader->cluster_expected_thread_id = XLP_THREAD_ID_INVALID;
+#endif
 
 		/*
 		 * Archive recovery was requested, and thanks to the backup label
@@ -2309,7 +2414,9 @@ PerformWalRecovery(void)
 	 */
 	if (record != NULL
 #ifdef USE_PGRAC_CLUSTER
-		|| cluster_engage == CLUSTER_MERGE_ENGAGE || cluster_backup_recovery_merge_required
+		|| cluster_engage == CLUSTER_MERGE_ENGAGE
+		|| cluster_backup_recovery_merge_required
+		|| cluster_mrp_should_start()
 #endif
 	)
 	{
@@ -2366,6 +2473,25 @@ PerformWalRecovery(void)
 			RmgrCleanup();
 			ereport(LOG, (errmsg("redo done (cluster backup restore) at %X/%X system usage: %s",
 								 LSN_FORMAT_ARGS(merged_end), pg_rusage_show(&ru0))));
+			InRedo = false;
+			goto cluster_merged_redo_done;
+		}
+
+		if (cluster_mrp_should_start())
+		{
+			XLogRecPtr	adg_end;
+
+			if (ArchiveRecoveryRequested && recoveryTarget != RECOVERY_TARGET_UNSET)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("ADG streaming standby does not support configured recovery targets")));
+
+			adg_end = cluster_adg_streaming_replay(xlogprefetcher, xlogreader, record,
+												   replayTLI, &replayTLI,
+												   &reachedRecoveryTarget);
+			RmgrCleanup();
+			ereport(LOG, (errmsg("redo done (ADG streaming) at %X/%X system usage: %s",
+								 LSN_FORMAT_ARGS(adg_end), pg_rusage_show(&ru0))));
 			InRedo = false;
 			goto cluster_merged_redo_done;
 		}
@@ -2706,6 +2832,225 @@ cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start,
 						 (unsigned)own_thread)));
 	return own_end;
 }
+
+static void
+cluster_adg_streaming_wait(bool *streaming_reply_sent)
+{
+	if (streaming_reply_sent != NULL && !*streaming_reply_sent)
+	{
+		WalRcvForceReply();
+		*streaming_reply_sent = true;
+	}
+
+	KnownAssignedTransactionIdsIdleMaintenance();
+	(void) WaitLatch(&XLogRecoveryCtl->recoveryWakeupLatch,
+					 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+					 1000L,
+					 WAIT_EVENT_RECOVERY_WAL_STREAM);
+	ResetLatch(&XLogRecoveryCtl->recoveryWakeupLatch);
+}
+
+static XLogRecPtr
+cluster_adg_streaming_replay(XLogPrefetcher *xlogprefetcher, XLogReaderState *xlogreader,
+							 XLogRecord *first_record, TimeLineID tli, TimeLineID *replayTLI,
+							 bool *reachedRecoveryTarget)
+{
+	ClusterRecoveryMergeState *st = NULL;
+	XLogRecPtr start_lsn[CLUSTER_WAL_THREAD_MAX + 1];
+	XLogRecPtr receive_lsn[CLUSTER_WAL_THREAD_MAX + 1];
+	XLogRecPtr barrier_lsn[CLUSTER_WAL_THREAD_MAX + 1];
+	SCN barrier_scn[CLUSTER_WAL_THREAD_MAX + 1];
+	uint64 bitmap[2];
+	uint64 active_bitmap[2] = {0, 0};
+	XLogRecPtr replay_end;
+	XLogRecord *native_record = first_record;
+	bool window_active = false;
+	bool streaming_reply_sent = false;
+	uint16 recovery_thread;
+	XLogRecPtr own_progress_lsn;
+
+	SpinLockAcquire(&XLogRecoveryCtl->info_lck);
+	replay_end = XLogRecoveryCtl->lastReplayedEndRecPtr;
+	SpinLockRelease(&XLogRecoveryCtl->info_lck);
+
+	/*
+	 * spec-6.4 P1-c: this standby's durable recovery state (backup label,
+	 * minRecoveryPoint, local pg_wal) all live in the LSN space of the WAL
+	 * thread its base backup came from -- the thread the just-read
+	 * checkpoint record sits on.  Records on that thread advance the native
+	 * recovery-progress globals; records on every other thread are FOREIGN
+	 * (incomparable LSN space) and get the merged-window pd_lsn/progress
+	 * clamp, mirroring cluster_recovery_merged_replay's §3.3b discipline.
+	 */
+	recovery_thread = XLogReaderGetThreadId(xlogreader);
+	if (recovery_thread < XLP_THREAD_ID_FIRST_REAL || recovery_thread > CLUSTER_WAL_THREAD_MAX)
+		recovery_thread = cluster_wal_thread_id();
+	own_progress_lsn = replay_end;
+	/* P0-3: RFS restart-point selection needs to know the recovery space. */
+	cluster_mrp_publish_recovery_thread(recovery_thread);
+
+	for (;;)
+	{
+		XLogReaderState *r;
+		XLogRecord *rec;
+		uint16 thread_id;
+
+		HandleStartupProcInterrupts();
+
+		if (((volatile XLogRecoveryCtlData *) XLogRecoveryCtl)->recoveryPauseState !=
+			RECOVERY_NOT_PAUSED)
+			recoveryPausesHere(false);
+
+		if (CheckForStandbyTrigger())
+			break;
+
+		memset(start_lsn, 0, sizeof(start_lsn));
+		memset(receive_lsn, 0, sizeof(receive_lsn));
+		memset(barrier_lsn, 0, sizeof(barrier_lsn));
+		memset(barrier_scn, 0, sizeof(barrier_scn));
+		if (cluster_mrp_streaming_snapshot(bitmap, start_lsn, receive_lsn, barrier_lsn,
+										   barrier_scn) <= 0)
+		{
+			if (native_record != NULL && cluster_rfs_configured_upstream_count() <= 0)
+			{
+				/*
+				 * spec-6.4 INV-ADG5 (F1): the apply-master gate covers the
+				 * whole replay, including pre-consistency bootstrap.  The
+				 * "local copy" a base backup restores routes user-relation
+				 * writes through the shared smgr, so replaying it without
+				 * the lease would race the current Apply Master's writes
+				 * into the same shared files.  A node that cannot obtain
+				 * the lease waits here and never opens for reads; an
+				 * ex-master fails stop inside the predicate (P0-1).
+				 */
+				if (!cluster_adg_apply_gate_self_valid())
+				{
+					cluster_adg_streaming_wait(&streaming_reply_sent);
+					continue;
+				}
+
+				if (recoveryStopsBefore(xlogreader))
+				{
+					if (reachedRecoveryTarget != NULL)
+						*reachedRecoveryTarget = true;
+					break;
+				}
+				if (recoveryApplyDelay(xlogreader)
+					&& ((volatile XLogRecoveryCtlData *) XLogRecoveryCtl)->recoveryPauseState !=
+					RECOVERY_NOT_PAUSED)
+					recoveryPausesHere(false);
+
+				ApplyWalRecord(xlogreader, native_record, replayTLI);
+				replay_end = xlogreader->EndRecPtr;
+				own_progress_lsn = replay_end;
+				streaming_reply_sent = false;
+
+				if (recoveryStopsAfter(xlogreader))
+				{
+					if (reachedRecoveryTarget != NULL)
+						*reachedRecoveryTarget = true;
+					break;
+				}
+
+				native_record = ReadRecord(xlogprefetcher, LOG, false, *replayTLI);
+				continue;
+			}
+
+			cluster_adg_streaming_wait(&streaming_reply_sent);
+			continue;
+		}
+
+		if (st != NULL && (active_bitmap[0] != bitmap[0] || active_bitmap[1] != bitmap[1]))
+		{
+			cluster_recovery_merge_set_apply_foreign(false);
+			if (window_active)
+			{
+				cluster_recovery_merge_window_leave();
+				window_active = false;
+			}
+			cluster_recovery_merge_end(st);
+			st = NULL;
+		}
+
+		if (st == NULL)
+		{
+			st = cluster_recovery_merge_streaming_begin(bitmap, start_lsn, tli);
+			if (st == NULL)
+			{
+				cluster_adg_streaming_wait(&streaming_reply_sent);
+				continue;
+			}
+			cluster_recovery_merge_window_enter();
+			/* §3.3b: foreign records' pages get the own-space clamp (P1-c). */
+			cluster_recovery_merge_set_own_lsn((uint64) own_progress_lsn);
+			window_active = true;
+			active_bitmap[0] = bitmap[0];
+			active_bitmap[1] = bitmap[1];
+		}
+
+		if (!cluster_adg_apply_gate_self_valid())
+		{
+			cluster_adg_streaming_wait(&streaming_reply_sent);
+			continue;
+		}
+
+		r = cluster_recovery_merge_streaming_next(st, receive_lsn, barrier_lsn, barrier_scn,
+												  &thread_id, NULL);
+		if (r == NULL)
+		{
+			cluster_adg_streaming_wait(&streaming_reply_sent);
+			continue;
+		}
+		rec = &r->record->header;
+
+		if (recoveryStopsBefore(r))
+		{
+			if (reachedRecoveryTarget != NULL)
+				*reachedRecoveryTarget = true;
+			break;
+		}
+		if (recoveryApplyDelay(r)
+			&& ((volatile XLogRecoveryCtlData *) XLogRecoveryCtl)->recoveryPauseState !=
+			RECOVERY_NOT_PAUSED)
+			recoveryPausesHere(false);
+
+		{
+			bool		is_own = (thread_id == recovery_thread);
+
+			cluster_recovery_merge_set_scn(rec->xl_scn);
+			/*
+			 * spec-6.4 P1-c: only recovery-thread records carry LSNs in this
+			 * node's own recovery space.  Every other thread is FOREIGN --
+			 * its pd_lsn stamps and the shared recovery-progress globals get
+			 * clamped to own_progress_lsn (see PageSetLSN and
+			 * ApplyWalRecord), keeping minRecoveryPoint single-space.
+			 */
+			cluster_recovery_merge_set_apply_foreign(!is_own);
+			ApplyWalRecord(r, rec, replayTLI);
+			cluster_recovery_merge_set_apply_foreign(false);
+			if (is_own)
+			{
+				own_progress_lsn = r->EndRecPtr;
+				cluster_recovery_merge_set_own_lsn((uint64) own_progress_lsn);
+			}
+		}
+		replay_end = r->EndRecPtr;
+		streaming_reply_sent = false;
+
+		if (recoveryStopsAfter(r))
+		{
+			if (reachedRecoveryTarget != NULL)
+				*reachedRecoveryTarget = true;
+			break;
+		}
+	}
+
+	cluster_recovery_merge_set_apply_foreign(false);
+	if (window_active)
+		cluster_recovery_merge_window_leave();
+	cluster_recovery_merge_end(st);
+	return replay_end;
+}
 #endif
 
 /*
@@ -2758,6 +3103,37 @@ ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *repl
 {
 	ErrorContextCallback errcallback;
 	bool		switchedTLI = false;
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * spec-6.4 INV-ADG5: an ADG standby may only replay (and thus write
+	 * shared standby storage) while this node holds the Apply Master lease.
+	 * The gate covers every record, including pre-consistency bootstrap
+	 * replay from a base backup (F1): those writes go through the shared
+	 * smgr too, so a node that cannot obtain the lease waits here forever
+	 * and never opens for reads.
+	 *
+	 * A node that has already applied records under some term must never
+	 * resume under a different term (P0-1): an interim Apply Master may
+	 * have advanced shared storage past this node's cached pages, so the
+	 * only safe reaction to deposition is a FATAL fail-stop that discards
+	 * the caches.  A same-term renewal gap is tolerated for at most half
+	 * the takeover grace -- a successor can only win the durable lease CAS
+	 * a full grace after expiry.
+	 */
+	if (RecoveryInProgress() && cluster_mrp_should_start())
+	{
+		while (!cluster_adg_apply_gate_self_valid())
+		{
+			HandleStartupProcInterrupts();
+			(void) WaitLatch(&XLogRecoveryCtl->recoveryWakeupLatch,
+							 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+							 100L,
+							 WAIT_EVENT_ADG_MRP_APPLY_WAIT);
+			ResetLatch(&XLogRecoveryCtl->recoveryWakeupLatch);
+		}
+	}
+#endif
 
 	/* Setup error traceback support for ereport() */
 	errcallback.callback = rm_redo_error_callback;
@@ -2816,11 +3192,32 @@ ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *repl
 	/*
 	 * Update shared replayEndRecPtr before replaying this record, so that
 	 * XLogFlush will update minRecoveryPoint correctly.
+	 *
+	 * PGRAC: spec-6.4 P1-c -- a FOREIGN record's EndRecPtr is in another WAL
+	 * thread's LSN space.  replayEndRecPtr feeds UpdateMinRecoveryPoint (and
+	 * GetCurrentReplayRecPtr in other processes), which assume this node's
+	 * recovery-thread space, so pin the shared progress at the own-space
+	 * clamp instead of poisoning the control file with a mixed-space LSN.
 	 */
-	SpinLockAcquire(&XLogRecoveryCtl->info_lck);
-	XLogRecoveryCtl->replayEndRecPtr = xlogreader->EndRecPtr;
-	XLogRecoveryCtl->replayEndTLI = *replayTLI;
-	SpinLockRelease(&XLogRecoveryCtl->info_lck);
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_recmerge_window_active && cluster_recmerge_apply_foreign)
+	{
+		XLogRecPtr	own_lsn = (XLogRecPtr) cluster_recmerge_window_own_lsn;
+
+		SpinLockAcquire(&XLogRecoveryCtl->info_lck);
+		if (XLogRecoveryCtl->replayEndRecPtr < own_lsn)
+			XLogRecoveryCtl->replayEndRecPtr = own_lsn;
+		XLogRecoveryCtl->replayEndTLI = *replayTLI;
+		SpinLockRelease(&XLogRecoveryCtl->info_lck);
+	}
+	else
+#endif
+	{
+		SpinLockAcquire(&XLogRecoveryCtl->info_lck);
+		XLogRecoveryCtl->replayEndRecPtr = xlogreader->EndRecPtr;
+		XLogRecoveryCtl->replayEndTLI = *replayTLI;
+		SpinLockRelease(&XLogRecoveryCtl->info_lck);
+	}
 
 	/*
 	 * If we are attempting to enter Hot Standby mode, process XIDs we see
@@ -2880,12 +3277,35 @@ ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *repl
 	/*
 	 * Update lastReplayedEndRecPtr after this record has been successfully
 	 * replayed.
+	 *
+	 * PGRAC: spec-6.4 P1-c -- skip the update for a FOREIGN record: the
+	 * shared last-replayed pointers stay pinned at the last own-space
+	 * record so GetXLogReplayRecPtr readers never observe a mixed-space
+	 * LSN.  Per-thread progress is tracked separately in the MRP shmem
+	 * watermarks below.
 	 */
-	SpinLockAcquire(&XLogRecoveryCtl->info_lck);
-	XLogRecoveryCtl->lastReplayedReadRecPtr = xlogreader->ReadRecPtr;
-	XLogRecoveryCtl->lastReplayedEndRecPtr = xlogreader->EndRecPtr;
-	XLogRecoveryCtl->lastReplayedTLI = *replayTLI;
-	SpinLockRelease(&XLogRecoveryCtl->info_lck);
+#ifdef USE_PGRAC_CLUSTER
+	if (!(cluster_recmerge_window_active && cluster_recmerge_apply_foreign))
+#endif
+	{
+		SpinLockAcquire(&XLogRecoveryCtl->info_lck);
+		XLogRecoveryCtl->lastReplayedReadRecPtr = xlogreader->ReadRecPtr;
+		XLogRecoveryCtl->lastReplayedEndRecPtr = xlogreader->EndRecPtr;
+		XLogRecoveryCtl->lastReplayedTLI = *replayTLI;
+		SpinLockRelease(&XLogRecoveryCtl->info_lck);
+	}
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_mrp_should_start())
+	{
+		if (!cluster_mrp_apply_record_replayed(XLogReaderGetThreadId(xlogreader),
+											   xlogreader->EndRecPtr,
+											   XLogRecGetScn(xlogreader)))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("ADG standby apply-master lease is not valid for WAL replay")));
+	}
+#endif
 
 	/* ------
 	 * Wakeup walsenders:
@@ -5325,6 +5745,28 @@ CheckForStandbyTrigger(void)
 
 	if (IsPromoteSignaled() && CheckPromoteSignal())
 	{
+#ifdef USE_PGRAC_CLUSTER
+		/*
+		 * spec-6.4 P1-b: only the current Apply Master may end recovery.  A
+		 * non-master standby's replay position is arbitrarily stale, so
+		 * promoting it would rewind shared storage to that stale point and
+		 * shadow everything the Apply Master wrote since.  Fail closed and
+		 * leave the promote signal removed so the node does not FATAL-loop.
+		 */
+		if (cluster_mrp_should_start()
+			&& !(cluster_apply_master_is_self()
+				 && cluster_apply_master_term_still_valid(cluster_apply_master_current_term())))
+		{
+			ereport(LOG, (errmsg("received promote request")));
+			RemovePromoteSignalFiles();
+			ResetPromoteSignaled();
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_ADG_NOT_APPLY_MASTER),
+					 errmsg("promotion refused: this node is not the ADG apply master"),
+					 errhint("Promote the node that currently holds the apply-master lease, "
+							 "or wait until this node is elected Apply Master.")));
+		}
+#endif
 		ereport(LOG, (errmsg("received promote request")));
 		RemovePromoteSignalFiles();
 		ResetPromoteSignaled();

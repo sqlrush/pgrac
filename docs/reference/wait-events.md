@@ -1,7 +1,7 @@
 # Cluster wait events
 
-linkdb registers 112 cluster-specific wait events distributed across
-11 classes.  Each row in `pg_stat_cluster_wait_events` corresponds
+linkdb registers 116 cluster-specific wait events distributed across
+13 classes.  Each row in `pg_stat_cluster_wait_events` corresponds
 to one entry in this table.
 
 The values appear in the standard `pg_stat_activity.wait_event_type`
@@ -25,9 +25,10 @@ Global Enqueue Service — distributed lock manager events.
 | `GesMasterQuery` | Waiting for a GES master lookup response |
 | `GesLocalFastPath` | Local-only GES fast-path serialisation |
 
-## Cluster: PCM (6 events)
+## Cluster: PCM (24 events)
 
-Parallel Cache Management — block-level cluster locks.
+Parallel Cache Management — block-level cluster locks, GCS block
+shipping, and Smart Fusion terminal-authority waits.
 
 | Name | Description |
 |---|---|
@@ -37,6 +38,24 @@ Parallel Cache Management — block-level cluster locks.
 | `PcmBlockConvertWait` | Waiting for a PCM lock conversion to complete |
 | `PcmBlockDowngrade` | Waiting for downgrade ack from current holder |
 | `PcmItlCleanout` | Waiting for ITL slot cleanout / commit-SCN backfill |
+| `ClusterPcmGrdInit` | Initializing the PCM GRD shared-memory hash table |
+| `ClusterPcmTransitionApply` | Waiting while applying a PCM state transition under the entry lock |
+| `ClusterPcmCompatibleStateWait` | Waiting for an incompatible PCM holder to release |
+| `ClusterGcsReplyWait` | Waiting for a GCS transition ACK from the master |
+| `ClusterGCSBlockShipWait` | Waiting for a GCS block reply with page payload |
+| `ClusterGCSBlockRequestDispatch` | Dispatch-side wait for a GCS block request |
+| `ClusterGCSBlockReplyDispatch` | Dispatch-side wait for a GCS block reply |
+| `ClusterGCSBlockChecksumFail` | Diagnostic wait path after received block checksum failure |
+| `ClusterGCSBlockRetransmitWait` | Backoff wait before retransmitting a GCS block request |
+| `ClusterGCSBlockEpochStaleRetry` | Retry path after a stale-epoch GCS block reply |
+| `ClusterGCSBlockInvalidateBroadcast` | Master-side invalidate broadcast before granting a writer |
+| `ClusterGCSBlockInvalidateAckWait` | Waiting for invalidate ACKs from all enumerated holders |
+| `ClusterGCSBlockStarvationRetry` | Reader retry backoff while a pending writer barrier exists |
+| `ClusterGCSBlockRecovering` | Waiting while a block resource is fenced as recovering |
+| `ClusterSmartFusionCommitBrake` | Reserved Smart Fusion pre-commit dependency wait; the enabled path is currently guarded off |
+| `ClusterSmartFusionDbwrBrake` | Reserved Smart Fusion writeback-brake wait; the enabled path is currently guarded off |
+| `ClusterSmartFusionOriginDurable` | Reserved Smart Fusion durable-LSN gossip wait; the enabled path is currently guarded off |
+| `ClusterCfTerminalResolve` | Waiting while terminal authority resolves cross-instance undo / TT evidence |
 
 ## Cluster: BufferShip (5 events)
 
@@ -163,7 +182,7 @@ Shared-storage provider and raw block-device I/O.
 ## Querying
 
 ```sql
--- Total registered (112):
+-- Total registered (116):
 SELECT count(*) FROM pg_stat_cluster_wait_events;
 
 -- Per-class counts:

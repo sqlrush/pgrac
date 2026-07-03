@@ -44,18 +44,19 @@ SELECT attname, format_type(atttypid, atttypmod)
 
 
 -- ----------
--- 3. Cluster wait events: 112 rows (anchored by
+-- 3. Cluster wait events: 116 rows (anchored by
 --    CLUSTER_WAIT_EVENTS_COUNT, spec-0.11 + StaticAssertDecl
---    in cluster_views.c; spec-6.0a D10 +7 block_device events).
+--    in cluster_views.c; spec-6.2 D10 +4 authority waits).
 -- ----------
 SELECT count(*) FROM pg_stat_cluster_wait_events;
 
 
 -- ----------
--- 4. Cluster wait events: 13 distinct types
+-- 4. Cluster wait events: 14 distinct types
 --    (docs/wait-events-design.md §2.1 categories:
 --    GES / PCM / BufferShip / SCN / Reconfig / Recovery /
---    Sinval / Interconnect / Undo / ADG / SharedFs / StartupPhase).
+--    Sinval / Interconnect / Undo / ADG / SharedFs / StartupPhase /
+--    BgProc).
 -- ----------
 SELECT count(DISTINCT type) FROM pg_stat_cluster_wait_events;
 

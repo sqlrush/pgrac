@@ -141,7 +141,8 @@
 
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: spec-1.16 commit/abort SCN hooks; spec-1.18 WAL emit + replay. */
-#include "cluster/cluster_backup.h"		/* spec-6.5 restore-point commit drain */
+#include "cluster/cluster_adg_xlog.h" /* PGRAC: spec-6.4 ADG thread barrier */
+#include "cluster/cluster_backup.h"	  /* spec-6.5 restore-point commit drain */
 #include "cluster/cluster_conf.h"		/* cluster_conf_has_peers */
 #include "cluster/cluster_mode.h"		/* cluster_storage_mode_enabled */
 #include "cluster/cluster_inject.h"
@@ -158,6 +159,7 @@
 #include "cluster/cluster_clean_leave.h"		  /* PGRAC: spec-5.13 §3.1 refuse-writes gate */
 #include "cluster/cluster_node_remove.h"		  /* PGRAC: spec-5.18 INV-LF9 self-demote gate */
 #include "cluster/cluster_reconfig.h"			  /* PGRAC: spec-5.15 §2.4 joiner write gate */
+#include "cluster/cluster_sf_dep.h"			  /* PGRAC: spec-6.2 Smart Fusion commit brake */
 #include "cluster/storage/cluster_undo_xlog.h" /* PGRAC: spec-3.18 D4.1 TT fold redo stamp */
 #endif
 #endif
@@ -1619,6 +1621,8 @@ RecordTransactionCommit(void)
 				commit_scn = cluster_scn_advance_for_commit();
 				/* spec-3.3 D7: copy to function-scope variable for TT hook below. */
 				tt_commit_scn = commit_scn;
+				/* PGRAC: spec-6.4 -- ADG thread barrier rides the commit SCN. */
+				(void)cluster_adg_emit_thread_barrier();
 
 				/*
 				 * PGRAC (spec-3.4a D6 / N12 P0):
@@ -1649,6 +1653,17 @@ RecordTransactionCommit(void)
 				has_tt_fold =
 					cluster_tt_local_precommit_durable_finish(xid, tt_commit_scn, &tt_fold);
 			}
+
+			/*
+			 * PGRAC spec-6.2 D8: Smart Fusion commit brake must run before
+			 * START_CRIT_SECTION and before XactLogCommitRecord.  On timeout
+			 * it can still ereport(ERROR) and cleanly abort because no commit
+			 * record has been emitted yet; running inside the spec-6.5
+			 * pending-commit PG_TRY keeps that registration cleared on the
+			 * ERROR path.
+			 */
+			if (cluster_smart_fusion)
+				cluster_sf_xact_commit_brake();
 		}
 		PG_CATCH();
 		{
@@ -1728,12 +1743,16 @@ RecordTransactionCommit(void)
 	if ((wrote_xlog && markXidCommitted &&
 		 synchronous_commit > SYNCHRONOUS_COMMIT_OFF) ||
 		forceSyncCommit || nrels > 0)
-	{
-		XLogFlush(XactLastRecEnd);
+		{
+			XLogFlush(XactLastRecEnd);
+#ifdef USE_PGRAC_CLUSTER
+			if (cluster_smart_fusion)
+				cluster_sf_publish_origin_durable_lsn();
+#endif
 
-		/*
-		 * Now we may update the CLOG, if we wrote a COMMIT record above
-		 */
+			/*
+			 * Now we may update the CLOG, if we wrote a COMMIT record above
+			 */
 		if (markXidCommitted)
 			TransactionIdCommitTree(xid, nchildren, children);
 	}
@@ -1770,6 +1789,15 @@ RecordTransactionCommit(void)
 		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 		END_CRIT_SECTION();
 	}
+
+#ifdef USE_PGRAC_CLUSTER
+	if (markXidCommitted)
+	{
+		(void)cluster_scn_pending_commit_clear(tt_commit_scn);
+		if (SCN_VALID(tt_commit_scn))
+			(void)cluster_adg_emit_thread_barrier();
+	}
+#endif
 
 	/* Compute latestXid while we have the child XIDs handy */
 	latestXid = TransactionIdLatest(xid, nchildren, children);
@@ -2402,6 +2430,10 @@ StartTransaction(void)
 	{
 		s->startedInRecovery = false;
 		XactReadOnly = DefaultXactReadOnly;
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_enabled && cluster_enable_adg && cluster_dg_role == CLUSTER_DG_ROLE_STANDBY)
+			XactReadOnly = true;
+#endif
 	}
 	XactDeferrable = DefaultXactDeferrable;
 	XactIsoLevel = DefaultXactIsoLevel;
@@ -2483,6 +2515,8 @@ StartTransaction(void)
 	 * touched_peers bitmap so a prior transaction's cross-node ingress
 	 * never leaks into this transaction's fail-stop abort decision. */
 	cluster_touched_peers_reset();
+	/* PGRAC spec-6.2 D6: start each xact with an empty touched-dep vector. */
+	cluster_sf_xact_reset_deps();
 #endif
 
 	/*
@@ -3183,6 +3217,8 @@ PrepareTransaction(void)
 	cluster_undo_record_xact_reset();
 	/* PGRAC (spec-5.14 D1):  clear the touched_peers bitmap on commit. */
 	cluster_touched_peers_reset();
+	/* PGRAC spec-6.2 D6: clear Smart Fusion touched-dep vector on commit. */
+	cluster_sf_xact_reset_deps();
 #endif
 
 	RESUME_INTERRUPTS();
@@ -3223,6 +3259,13 @@ AbortTransaction(void)
 
 	/* Reset WAL record construction state */
 	XLogResetInsertion();
+
+#ifdef USE_PGRAC_CLUSTER
+	/* spec-6.4 INV-ADG9: clear any commit_scn registered before an ERROR
+	 * escaped the precommit gap, so ADG thread-safe-SCN publication does not
+	 * freeze permanently on an aborted local transaction. */
+	(void)cluster_scn_pending_commit_clear_my_pending();
+#endif
 
 	/* Cancel condition variable sleep */
 	ConditionVariableCancelSleep();
@@ -3407,6 +3450,8 @@ CleanupTransaction(void)
 	cluster_undo_record_xact_reset();
 	/* PGRAC (spec-5.14 D1):  clear the touched_peers bitmap on abort/cleanup. */
 	cluster_touched_peers_reset();
+	/* PGRAC spec-6.2 D6: clear Smart Fusion touched-dep vector on abort. */
+	cluster_sf_xact_reset_deps();
 #endif
 
 	CurrentResourceOwner = NULL;	/* and resource owner */
@@ -6906,6 +6951,9 @@ xact_redo(XLogReaderState *record)
 		ParseCommitRecord(XLogRecGetInfo(record), xlrec, &parsed);
 		xact_redo_commit(&parsed, parsed.twophase_xid,
 						 record->EndRecPtr, XLogRecGetOrigin(record));
+#ifdef USE_PGRAC_CLUSTER
+		(void)cluster_tt_twophase_standby_commit_prepared(parsed.twophase_xid, parsed.scn);
+#endif
 
 		/* Delete TwoPhaseState gxact entry and/or 2PC file. */
 		LWLockAcquire(TwoPhaseStateLock, LW_EXCLUSIVE);

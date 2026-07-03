@@ -10,6 +10,8 @@
  *	  T-io-4 node_id mismatch → FAILED (wrong-offset write defence)
  *	  T-io-5 short-read / EOF returns FAILED
  *	  T-io-6 fd<0 → NOT_TRIED defensive
+ *	  T-io-8 apply lease region round-trip
+ *	  T-io-9 marker regions are disjoint from voting slot _reserved1
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
@@ -26,6 +28,7 @@
 #include "postgres.h"
 
 #include <fcntl.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -302,11 +305,79 @@ UT_TEST(test_io_6_fd_negative_not_tried)
 	UT_ASSERT_EQ(rc, CLUSTER_VOTING_DISK_IO_NOT_TRIED);
 }
 
+UT_TEST(test_io_8_apply_lease_region_round_trip)
+{
+	char *path = make_temp_path("adglease");
+	int fd;
+	uint8 in[CLUSTER_VOTING_SLOT_BYTES];
+	uint8 other[CLUSTER_VOTING_SLOT_BYTES];
+	uint8 out[CLUSTER_VOTING_SLOT_BYTES];
+	ClusterVotingDiskIoState rc;
+	uint32 i;
+
+	fd = cluster_voting_disk_open(path, /*create*/ true);
+	UT_ASSERT(fd >= 0);
+
+	memset(in, 0, sizeof(in));
+	memset(other, 0, sizeof(other));
+	memset(out, 0, sizeof(out));
+	for (i = 0; i < sizeof(in); i++) {
+		in[i] = (uint8)(i ^ 0x5A);
+		other[i] = (uint8)(i ^ 0xA5);
+	}
+
+	rc = cluster_voting_disk_write_apply_lease_global_slot(fd, in);
+	UT_ASSERT_EQ(rc, CLUSTER_VOTING_DISK_IO_OK);
+	rc = cluster_voting_disk_read_apply_lease_global_slot(fd, out);
+	UT_ASSERT_EQ(rc, CLUSTER_VOTING_DISK_IO_OK);
+	UT_ASSERT_EQ(memcmp(in, out, sizeof(in)), 0);
+
+	rc = cluster_voting_disk_write_apply_lease_slot(fd, 2, other);
+	UT_ASSERT_EQ(rc, CLUSTER_VOTING_DISK_IO_OK);
+	memset(out, 0, sizeof(out));
+	rc = cluster_voting_disk_read_apply_lease_global_slot(fd, out);
+	UT_ASSERT_EQ(rc, CLUSTER_VOTING_DISK_IO_OK);
+	UT_ASSERT_EQ(memcmp(in, out, sizeof(in)), 0);
+	memset(out, 0, sizeof(out));
+	rc = cluster_voting_disk_read_apply_lease_slot(fd, 2, out);
+	UT_ASSERT_EQ(rc, CLUSTER_VOTING_DISK_IO_OK);
+	UT_ASSERT_EQ(memcmp(other, out, sizeof(other)), 0);
+
+	memset(out, 0, sizeof(out));
+	rc = cluster_voting_disk_read_apply_lease_slot(fd, CLUSTER_MAX_NODES, out);
+	UT_ASSERT_EQ(rc, CLUSTER_VOTING_DISK_IO_FAILED);
+	rc = cluster_voting_disk_write_apply_lease_slot(fd, CLUSTER_MAX_NODES, in);
+	UT_ASSERT_EQ(rc, CLUSTER_VOTING_DISK_IO_FAILED);
+	rc = cluster_voting_disk_read_apply_lease_slot(-1, 2, out);
+	UT_ASSERT_EQ(rc, CLUSTER_VOTING_DISK_IO_NOT_TRIED);
+
+	cluster_voting_disk_close(fd);
+	(void)unlink(path);
+	free(path);
+}
+
+UT_TEST(test_io_9_marker_regions_are_disjoint)
+{
+	off_t reserved1_start = CLUSTER_VOTING_SLOT_OFFSET(0) + offsetof(ClusterVotingSlot, _reserved1);
+	off_t reserved1_end = reserved1_start + sizeof(((ClusterVotingSlot *)0)->_reserved1);
+
+	UT_ASSERT_EQ(CLUSTER_VOTING_SLOT_OFFSET(0), (off_t)0);
+	UT_ASSERT_EQ(CLUSTER_VOTING_LEAVE_SLOT_OFFSET(0),
+				 (off_t)CLUSTER_MAX_NODES * CLUSTER_VOTING_SLOT_BYTES);
+	UT_ASSERT_EQ(CLUSTER_VOTING_JOIN_SLOT_OFFSET(0),
+				 (off_t)2 * CLUSTER_MAX_NODES * CLUSTER_VOTING_SLOT_BYTES);
+	UT_ASSERT_EQ(CLUSTER_VOTING_APPLY_LEASE_SLOT_OFFSET(0),
+				 (off_t)3 * CLUSTER_MAX_NODES * CLUSTER_VOTING_SLOT_BYTES);
+	UT_ASSERT(CLUSTER_VOTING_APPLY_LEASE_SLOT_OFFSET(0) >= reserved1_end);
+	UT_ASSERT(CLUSTER_VOTING_FILE_BYTES_MIN
+			  == (off_t)4 * CLUSTER_MAX_NODES * CLUSTER_VOTING_SLOT_BYTES);
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(9);
 	UT_RUN(test_io_1_round_trip);
 	UT_RUN(test_io_2_crc_mismatch_returns_torn);
 	UT_RUN(test_io_3_magic_mismatch_failed);
@@ -314,6 +385,8 @@ main(void)
 	UT_RUN(test_io_5_short_read_returns_failed);
 	UT_RUN(test_io_7_disk_index_misroute_failed);
 	UT_RUN(test_io_6_fd_negative_not_tried);
+	UT_RUN(test_io_8_apply_lease_region_round_trip);
+	UT_RUN(test_io_9_marker_regions_are_disjoint);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -155,6 +155,18 @@ typedef struct ClusterRecmergeHeap {
 	int n;
 } ClusterRecmergeHeap;
 
+typedef enum ClusterRecmergeStreamingDecision {
+	CLUSTER_RECMERGE_STREAMING_NO_RECORD = 0,
+	CLUSTER_RECMERGE_STREAMING_RECORD_READY = 1
+} ClusterRecmergeStreamingDecision;
+
+typedef struct ClusterRecmergeStreamingInput {
+	bool record_available;
+	bool heartbeat_seen;
+	ClusterRecmergeKey key;
+	ClusterRecmergeKey heartbeat_key;
+} ClusterRecmergeStreamingInput;
+
 /* Strict weak ordering: a < b ?  (scn -> lsn -> node, via the gated cmp). */
 static inline int
 cluster_recovery_merge_cmp(const ClusterRecmergeKey *a, const ClusterRecmergeKey *b)
@@ -225,6 +237,50 @@ cluster_recmerge_heap_pop(ClusterRecmergeHeap *h, ClusterRecmergeHeapEntry *out)
 	return true;
 }
 
+/*
+ * Streaming mode selector for spec-6.4 ADG MRP.
+ *
+ * Heartbeats prove that a stream has no earlier concrete head through the
+ * advertised heartbeat key.  A caller gets RECORD_READY only when every input
+ * has either a concrete record head or a heartbeat at or beyond the selected
+ * record, and at least one concrete record is available.
+ */
+static inline ClusterRecmergeStreamingDecision
+cluster_recmerge_streaming_select(const ClusterRecmergeStreamingInput *inputs, int ninputs,
+								  int *stream_out, ClusterRecmergeKey *key_out)
+{
+	ClusterRecmergeHeap h;
+	ClusterRecmergeHeapEntry out;
+	int i;
+
+	if (stream_out == NULL || key_out == NULL || inputs == NULL || ninputs <= 0
+		|| ninputs > CLUSTER_RECMERGE_MAX_STREAMS)
+		return CLUSTER_RECMERGE_STREAMING_NO_RECORD;
+
+	cluster_recmerge_heap_init(&h);
+	for (i = 0; i < ninputs; i++) {
+		if (!inputs[i].record_available) {
+			if (!inputs[i].heartbeat_seen)
+				return CLUSTER_RECMERGE_STREAMING_NO_RECORD;
+			continue;
+		}
+		cluster_recmerge_heap_push(&h, inputs[i].key, i);
+	}
+
+	if (!cluster_recmerge_heap_pop(&h, &out))
+		return CLUSTER_RECMERGE_STREAMING_NO_RECORD;
+	for (i = 0; i < ninputs; i++) {
+		if (inputs[i].record_available)
+			continue;
+		if (cluster_recovery_merge_cmp(&inputs[i].heartbeat_key, &out.key) < 0)
+			return CLUSTER_RECMERGE_STREAMING_NO_RECORD;
+	}
+
+	*stream_out = out.stream;
+	*key_out = out.key;
+	return CLUSTER_RECMERGE_STREAMING_RECORD_READY;
+}
+
 #ifndef FRONTEND
 
 /* Backend engine (cluster_recovery_merge.c). */
@@ -262,6 +318,13 @@ cluster_recovery_merge_begin_restore(const uint64 merge_bitmap[2], const XLogRec
 									 uint16 own_thread, TimeLineID tli);
 extern struct XLogReaderState *cluster_recovery_merge_next(ClusterRecoveryMergeState *st,
 														   uint16 *thread_out, char **errmsg_out);
+extern ClusterRecoveryMergeState *
+cluster_recovery_merge_streaming_begin(const uint64 merge_bitmap[2], const XLogRecPtr *start_lsn,
+									   TimeLineID tli);
+extern struct XLogReaderState *
+cluster_recovery_merge_streaming_next(ClusterRecoveryMergeState *st, const XLogRecPtr *receive_lsn,
+									  const XLogRecPtr *barrier_lsn, const SCN *barrier_scn,
+									  uint16 *thread_out, char **errmsg_out);
 extern void cluster_recovery_merge_end(ClusterRecoveryMergeState *st);
 
 /* §3.3b/§3.3d window (startup-process scoped).  enter/leave bracket the
@@ -287,6 +350,8 @@ extern uint64 cluster_recovery_merge_window_scn(void);
  */
 extern bool cluster_recmerge_window_active;
 extern uint64 cluster_recmerge_window_scn;
+extern uint64 cluster_recmerge_window_own_lsn;
+extern bool cluster_recmerge_apply_foreign;
 
 /*
  * spec-4.5a: has this node EVER merged-recovered `origin_node`'s stream?

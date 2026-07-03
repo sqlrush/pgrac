@@ -245,11 +245,13 @@ static const char *const BuiltinTrancheNames[] = {
 	/* PGRAC LWTRANCHE_CLUSTER_SQ: spec-5.4 D1 SQ sequence instance cache */
 	"ClusterSq",
 	/* PGRAC LWTRANCHE_CLUSTER_HW: spec-5.7 D1 HW relation-extend authority */
-	"ClusterHw",
-	/* PGRAC LWTRANCHE_CLUSTER_IC_RDMA: spec-6.1 RDMA transport stats */
-	"ClusterIcRdma",
-#endif
-};
+		"ClusterHw",
+		/* PGRAC LWTRANCHE_CLUSTER_IC_RDMA: spec-6.1 RDMA transport stats */
+		"ClusterIcRdma",
+		/* PGRAC LWTRANCHE_CLUSTER_SMART_FUSION: spec-6.2 dependency authority */
+		"ClusterSmartFusion",
+	#endif
+	};
 
 StaticAssertDecl(lengthof(BuiltinTrancheNames)
 					 == LWTRANCHE_FIRST_USER_DEFINED - NUM_INDIVIDUAL_LWLOCKS,

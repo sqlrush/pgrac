@@ -187,6 +187,8 @@
 #include "cluster/cluster_fence.h" /* cluster_fence_postmaster_check (spec-2.28 D6) */
 #include "cluster/cluster_guc.h"   /* cluster_enabled (spec-1.11 Sprint B) */
 #include "cluster/cluster_lmd.h"   /* cluster_lmd_mark_child_exit (spec-2.19 D12 hardening) */
+#include "cluster/cluster_mrp.h"   /* cluster_mrp_should_start (spec-6.4 D1) */
+#include "cluster/cluster_rfs.h"   /* cluster_rfs_should_start (spec-6.4 D3) */
 #include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_wal_state.h" /* PGRAC: spec-4.2 publish_stopped on clean shutdown */
 #endif
@@ -341,6 +343,10 @@ static pid_t QvotecPID = 0;
 static pid_t LmsPID = 0;
 /* PGRAC (spec-2.19 Sprint A Step 1): LMD aux process pid;same pattern. */
 static pid_t LmdPID = 0;
+/* PGRAC (spec-6.4 D1): ADG Managed Recovery Process pid;same pattern. */
+static pid_t MrpPID = 0;
+/* PGRAC (spec-6.4 D3): ADG RFS coordinator pid;same pattern. */
+static pid_t RfsPID = 0;
 /* PGRAC (spec-2.38 D4): SI Broadcaster aux process pid;same pattern. */
 static pid_t SinvalBcastPID = 0;
 /*
@@ -665,6 +671,8 @@ static void ShmemBackendArrayRemove(Backend *bn);
 #define StartQvotec() StartChildProcess(QvotecProcess)
 #define StartLms() StartChildProcess(LmsProcess)
 #define StartLmd() StartChildProcess(LmdProcess)
+#define StartMrp() StartChildProcess(MrpProcess)
+#define StartRfs() StartChildProcess(RfsProcess)
 /* PGRAC (spec-2.38 D4): SI Broadcaster aux process. */
 #define StartSinvalBcast() StartChildProcess(SinvalBcastProcess)
 #endif
@@ -1969,12 +1977,28 @@ ServerLoop(void)
 
 		/*
 		 * PGRAC: spec-2.6 Sprint A Step 3 D7 — same ServerLoop respawn
-		 * for QVOTEC (6th cluster aux process).  Spawned post PM_RUN by
-		 * phase 4 driver fourth升级;respawn here closes restart_after_
-		 * crash recovery + external-SIGTERM paths.
+		 * for QVOTEC (6th cluster aux process).  Normal primary-cluster
+		 * startup is still driven by phase 4 after PM_RUN.  ADG standby
+		 * recovery is the exception: MRP must acquire its apply-master
+		 * lease before recovery can reach hot standby, so qvotec must be
+		 * available during recovery states to complete the lease CAS.
 		 */
-		if (cluster_enabled && qvotec_spawn_enabled && QvotecPID == 0 && pmState == PM_RUN)
+		/*
+		 * spec-6.4 F7: no respawn once a shutdown is in progress.  The ADG
+		 * recovery-state conditions here (and for MRP / RFS below) stay
+		 * true through PM_HOT_STANDBY during a smart shutdown, so without
+		 * this guard a SIGTERM'd aux process would be resurrected.
+		 */
+		if (cluster_enabled && QvotecPID == 0 && Shutdown == NoShutdown
+			&& ((qvotec_spawn_enabled && pmState == PM_RUN)
+				|| (cluster_mrp_should_start()
+					&& (pmState == PM_STARTUP || pmState == PM_RECOVERY
+						|| pmState == PM_HOT_STANDBY || pmState == PM_RUN))))
+		{
+			if (cluster_mrp_should_start())
+				qvotec_spawn_enabled = true;
 			QvotecPID = StartQvotec();
+		}
 
 		/*
 		 * PGRAC: spec-2.18 Sprint A — same ServerLoop respawn for LMS
@@ -1999,6 +2023,22 @@ ServerLoop(void)
 		 */
 		if (cluster_enabled && cluster_lmd_enabled && LmdPID == 0 && pmState == PM_RUN)
 			LmdPID = StartLmd();
+
+		/*
+		 * PGRAC: spec-6.4 D1 — MRP is reserved for ADG physical standby
+		 * apply.  It starts during recovery states, not only PM_RUN, because
+		 * the startup process gates WAL replay on the Apply Master lease.
+		 * Primary nodes and ADG-disabled standbys keep existing behavior.
+		 */
+		if (cluster_mrp_should_start() && MrpPID == 0 && Shutdown == NoShutdown
+			&& (pmState == PM_STARTUP || pmState == PM_RECOVERY
+				|| pmState == PM_HOT_STANDBY || pmState == PM_RUN))
+			MrpPID = StartMrp();
+
+		if (cluster_rfs_should_start() && RfsPID == 0 && Shutdown == NoShutdown
+			&& (pmState == PM_STARTUP || pmState == PM_RECOVERY
+				|| pmState == PM_HOT_STANDBY || pmState == PM_RUN))
+			RfsPID = StartRfs();
 
 		/*
 		 * PGRAC: spec-2.38 D4 — SI Broadcaster aux process spawn.
@@ -2900,6 +2940,10 @@ process_pm_reload_request(void)
 			signal_child(LmsPID, SIGHUP);
 		if (LmdPID != 0) /* PGRAC spec-2.19 Sprint A Step 1 */
 			signal_child(LmdPID, SIGHUP);
+		if (MrpPID != 0) /* PGRAC spec-6.4 D1 */
+			signal_child(MrpPID, SIGHUP);
+		if (RfsPID != 0) /* PGRAC spec-6.4 D3 */
+			signal_child(RfsPID, SIGHUP);
 		if (SinvalBcastPID != 0) /* PGRAC spec-2.38 SI Broadcaster */
 			signal_child(SinvalBcastPID, SIGHUP);
 #endif
@@ -3447,6 +3491,33 @@ process_pm_child_exit(void)
 				HandleChildCrash(pid, exitstatus, _("LMD process"));
 			continue;
 		}
+		/*
+		 * PGRAC (spec-6.4 D1): MRP reaper.  Like the wal receiver below,
+		 * exit status one (FATAL exit) is an orderly termination: MRP
+		 * raises FATAL on shutdown-time interrupts and on refused
+		 * configurations, and the server loop restarts it when it is
+		 * still wanted.  Only treat other nonzero statuses as a crash.
+		 */
+		if (pid == MrpPID) {
+			cluster_mrp_mark_child_exit();
+			MrpPID = 0;
+			if (!EXIT_STATUS_0(exitstatus) && !EXIT_STATUS_1(exitstatus))
+				HandleChildCrash(pid, exitstatus, _("MRP process"));
+			continue;
+		}
+		/*
+		 * PGRAC (spec-6.4 D3): RFS coordinator reaper.  The RFS shutdown
+		 * path runs through libpqwalreceiver's ProcessWalRcvInterrupts(),
+		 * which reports a pending shutdown as FATAL (exit status one).
+		 * Mirror the wal receiver reaper below and accept status one as
+		 * a clean exit instead of escalating to a crash cascade.
+		 */
+		if (pid == RfsPID) {
+			RfsPID = 0;
+			if (!EXIT_STATUS_0(exitstatus) && !EXIT_STATUS_1(exitstatus))
+				HandleChildCrash(pid, exitstatus, _("RFS coordinator process"));
+			continue;
+		}
 		/* PGRAC (spec-2.38 D4): SI Broadcaster reaper. */
 		if (pid == SinvalBcastPID) {
 			SinvalBcastPID = 0;
@@ -3884,6 +3955,18 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 	else if (LmdPID != 0 && take_action)
 		sigquit_child(LmdPID);
 
+	/* PGRAC (spec-6.4 D1): MRP crash handling. */
+	if (pid == MrpPID)
+		MrpPID = 0;
+	else if (MrpPID != 0 && take_action)
+		sigquit_child(MrpPID);
+
+	/* PGRAC (spec-6.4 D3): RFS coordinator crash handling. */
+	if (pid == RfsPID)
+		RfsPID = 0;
+	else if (RfsPID != 0 && take_action)
+		sigquit_child(RfsPID);
+
 	/* PGRAC (spec-2.38 D4): SI Broadcaster crash handling. */
 	if (pid == SinvalBcastPID)
 		SinvalBcastPID = 0;
@@ -4049,6 +4132,12 @@ PostmasterStateMachine(void)
 		/* spec-2.38 LIFO: SinvalBcast first (last-spawned). */
 		if (SinvalBcastPID != 0)
 			signal_child(SinvalBcastPID, SIGTERM);
+		/* spec-6.4 LIFO: RFS stops before MRP so apply can drain known receive state. */
+		if (RfsPID != 0)
+			signal_child(RfsPID, SIGTERM);
+		/* spec-6.4 LIFO: MRP is newer than LMD/LMS and stops before lock actors. */
+		if (MrpPID != 0)
+			signal_child(MrpPID, SIGTERM);
 		/* spec-2.19 Q10 LIFO: LMD next. */
 		if (LmdPID != 0)
 			signal_child(LmdPID, SIGTERM);
@@ -4143,6 +4232,10 @@ PostmasterStateMachine(void)
 			LmsPID == 0 &&
 			/* PGRAC: spec-2.19 Sprint A — same wait for LMD. */
 			LmdPID == 0 &&
+			/* PGRAC: spec-6.4 D1 — same wait for MRP. */
+			MrpPID == 0 &&
+			/* PGRAC: spec-6.4 D3 — same wait for RFS coordinator. */
+			RfsPID == 0 &&
 			/* PGRAC: spec-2.38 Sprint A — same wait for SI Broadcaster. */
 			SinvalBcastPID == 0 &&
 #endif
@@ -4511,6 +4604,10 @@ TerminateChildren(int signal)
 		signal_child(LmsPID, signal);
 	if (LmdPID != 0) /* PGRAC spec-2.19 Sprint A Step 1 */
 		signal_child(LmdPID, signal);
+	if (MrpPID != 0) /* PGRAC spec-6.4 D1 */
+		signal_child(MrpPID, signal);
+	if (RfsPID != 0) /* PGRAC spec-6.4 D3 */
+		signal_child(RfsPID, signal);
 	if (SinvalBcastPID != 0) /* PGRAC spec-2.38 SI Broadcaster */
 		signal_child(SinvalBcastPID, signal);
 #endif
@@ -5721,6 +5818,14 @@ StartChildProcess(AuxProcType type)
 		case WalReceiverProcess:
 			ereport(LOG, (errmsg("could not fork WAL receiver process: %m")));
 			break;
+#ifdef USE_PGRAC_CLUSTER
+		case MrpProcess:
+			ereport(LOG, (errmsg("could not fork MRP process: %m")));
+			break;
+		case RfsProcess:
+			ereport(LOG, (errmsg("could not fork RFS coordinator process: %m")));
+			break;
+#endif
 		default:
 			ereport(LOG, (errmsg("could not fork process: %m")));
 			break;
@@ -6007,10 +6112,41 @@ cluster_postmaster_start_lms(void)
 pid_t
 cluster_postmaster_start_lmd(void)
 {
-	Assert(!IsUnderPostmaster);
+	if (IsUnderPostmaster)
+		return 0;
 
 	LmdPID = StartLmd();
 	return LmdPID;
+}
+
+/*
+ * cluster_postmaster_start_mrp -- spawn the ADG MRP aux process.
+ *
+ *	MRP is gated by cluster_mrp_should_start(), so primary clusters and
+ *	standby clusters with ADG disabled keep the process absent.
+ */
+pid_t
+cluster_postmaster_start_mrp(void)
+{
+	if (IsUnderPostmaster)
+		return 0;
+	if (!cluster_mrp_should_start())
+		return 0;
+
+	MrpPID = StartMrp();
+	return MrpPID;
+}
+
+pid_t
+cluster_postmaster_start_rfs(void)
+{
+	if (IsUnderPostmaster)
+		return 0;
+	if (!cluster_rfs_should_start())
+		return 0;
+
+	RfsPID = StartRfs();
+	return RfsPID;
 }
 #endif
 

@@ -10,6 +10,9 @@
  * IDENTIFICATION
  *	  src/backend/replication/repl_gram.y
  *
+ * PGRAC MODIFICATIONS
+ *	  Extends physical START_REPLICATION with an ADG thread selector.
+ *
  *-------------------------------------------------------------------------
  */
 
@@ -83,7 +86,7 @@ Node *replication_parse_result;
 				read_replication_slot timeline_history show
 %type <list>	generic_option_list
 %type <defelt>	generic_option
-%type <uintval>	opt_timeline
+%type <uintval>	opt_timeline opt_adg_thread
 %type <list>	plugin_options plugin_opt_list
 %type <defelt>	plugin_opt_elem
 %type <node>	plugin_opt_arg
@@ -258,10 +261,10 @@ drop_replication_slot:
 			;
 
 /*
- * START_REPLICATION [SLOT slot] [PHYSICAL] %X/%X [TIMELINE %d]
+ * START_REPLICATION [SLOT slot] [PHYSICAL] %X/%X [TIMELINE %d] [ADG_THREAD %d]
  */
 start_replication:
-			K_START_REPLICATION opt_slot opt_physical RECPTR opt_timeline
+			K_START_REPLICATION opt_slot opt_physical RECPTR opt_timeline opt_adg_thread
 				{
 					StartReplicationCmd *cmd;
 
@@ -270,6 +273,7 @@ start_replication:
 					cmd->slotname = $2;
 					cmd->startpoint = $4;
 					cmd->timeline = $5;
+					cmd->adg_thread_id = (uint16) $6;
 					$$ = (Node *) cmd;
 				}
 			;
@@ -334,6 +338,22 @@ opt_timeline:
 					$$ = $2;
 				}
 				| /* EMPTY */			{ $$ = 0; }
+			;
+
+opt_adg_thread:
+			IDENT UCONST
+				{
+					if (pg_strcasecmp($1, "ADG_THREAD") != 0)
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("unrecognized START_REPLICATION option \"%s\"", $1)));
+					if ($2 == 0 || $2 > PG_UINT16_MAX)
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("invalid ADG thread id %u", $2)));
+					$$ = $2;
+				}
+			| /* EMPTY */				{ $$ = 0; }
 			;
 
 

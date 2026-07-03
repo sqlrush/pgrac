@@ -1035,6 +1035,18 @@ pgstat_get_wait_cluster_pcm(WaitEventCluster w)
 		 * reconfiguration); timeout fail-closes 53R9L. */
 		event_name = "ClusterGCSBlockRecovering";
 		break;
+	case WAIT_EVENT_CLUSTER_SMART_FUSION_COMMIT_BRAKE:
+		event_name = "ClusterSmartFusionCommitBrake";
+		break;
+	case WAIT_EVENT_CLUSTER_SMART_FUSION_DBWR_BRAKE:
+		event_name = "ClusterSmartFusionDbwrBrake";
+		break;
+	case WAIT_EVENT_CLUSTER_SMART_FUSION_ORIGIN_DURABLE:
+		event_name = "ClusterSmartFusionOriginDurable";
+		break;
+	case WAIT_EVENT_CLUSTER_CF_TERMINAL_RESOLVE:
+		event_name = "ClusterCfTerminalResolve";
+		break;
 	default:
 		break;
 	}
@@ -1302,12 +1314,6 @@ pgstat_get_wait_cluster_adg(WaitEventCluster w)
 		break;
 	case WAIT_EVENT_ADG_WAL_RECEIVE_LAG:
 		event_name = "AdgWalReceiveLag";
-		break;
-	case WAIT_EVENT_ADG_READ_SNAPSHOT_WAIT:
-		event_name = "AdgReadSnapshotWait";
-		break;
-	case WAIT_EVENT_ADG_SCN_SYNC_WAIT:
-		event_name = "AdgScnSyncWait";
 		break;
 	default:
 		break;

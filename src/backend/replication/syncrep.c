@@ -87,8 +87,17 @@
 #include "utils/guc_hooks.h"
 #include "utils/ps_status.h"
 
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_adg.h"
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_lns.h"
+#include "cluster/cluster_wal_thread.h"
+#endif
+
 /* User-settable parameters for sync rep */
 char	   *SyncRepStandbyNames;
+
+#define SYNC_REP_ADG_ACK_POLL_MS 10
 
 #define SyncStandbysDefined() \
 	(SyncRepStandbyNames != NULL && SyncRepStandbyNames[0] != '\0')
@@ -106,6 +115,11 @@ static bool SyncRepGetSyncRecPtr(XLogRecPtr *writePtr,
 								 XLogRecPtr *flushPtr,
 								 XLogRecPtr *applyPtr,
 								 bool *am_sync);
+#ifdef USE_PGRAC_CLUSTER
+static void SyncRepAdgWaitForLSN(XLogRecPtr lsn, bool commit);
+static bool SyncRepAdgCommitAckRequired(bool commit);
+static bool SyncRepAdgCommitAckSatisfied(XLogRecPtr lsn, ClusterDgAckMode mode);
+#endif
 static void SyncRepGetOldestSyncRecPtr(XLogRecPtr *writePtr,
 									   XLogRecPtr *flushPtr,
 									   XLogRecPtr *applyPtr,
@@ -156,6 +170,10 @@ SyncRepWaitForLSN(XLogRecPtr lsn, bool commit)
 	 * influenced by external interruptions.
 	 */
 	Assert(InterruptHoldoffCount > 0);
+
+#ifdef USE_PGRAC_CLUSTER
+	SyncRepAdgWaitForLSN(lsn, commit);
+#endif
 
 	/*
 	 * Fast exit if user has not requested sync replication, or there are no
@@ -412,6 +430,140 @@ SyncRepCancelWait(void)
 	MyProc->syncRepState = SYNC_REP_NOT_WAITING;
 	LWLockRelease(SyncRepLock);
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * ADG Data Guard acknowledgement modes are layered on the primary-side sync
+ * replication wait path so commit acknowledgement observes the same WALSender
+ * reply stream used by physical replication.  The ADG-specific part requires
+ * an ADG-capable standby trailer and a flush position at or beyond the commit
+ * LSN; apply/read consistency remains governed by MRP barriers.
+ */
+static void
+SyncRepAdgWaitForLSN(XLogRecPtr lsn, bool commit)
+{
+	ClusterDgAckMode mode;
+
+	if (!SyncRepAdgCommitAckRequired(commit))
+		return;
+
+	mode = cluster_lns_ack_mode_from_guc(cluster_dg_mode);
+
+	if (update_process_title)
+	{
+		char		buffer[64];
+
+		snprintf(buffer, sizeof(buffer), "waiting for ADG %s ack %X/%X",
+				 cluster_lns_ack_mode_name(mode), LSN_FORMAT_ARGS(lsn));
+		set_ps_display_suffix(buffer);
+	}
+
+	for (;;)
+	{
+		int			rc;
+
+		if (SyncRepAdgCommitAckSatisfied(lsn, mode))
+			break;
+
+		ResetLatch(MyLatch);
+
+		if (ProcDiePending)
+		{
+			ereport(WARNING,
+					(errcode(ERRCODE_ADMIN_SHUTDOWN),
+					 errmsg("canceling the wait for ADG standby acknowledgement and terminating connection due to administrator command"),
+					 errdetail("The transaction has already committed locally, but might not have been flushed to an ADG standby.")));
+			whereToSendOutput = DestNone;
+			break;
+		}
+
+		if (QueryCancelPending)
+		{
+			QueryCancelPending = false;
+			ereport(WARNING,
+					(errmsg("canceling wait for ADG standby acknowledgement due to user request"),
+					 errdetail("The transaction has already committed locally, but might not have been flushed to an ADG standby.")));
+			break;
+		}
+
+		rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+					   SYNC_REP_ADG_ACK_POLL_MS, WAIT_EVENT_ADG_WAL_RECEIVE_LAG);
+		if (rc & WL_POSTMASTER_DEATH)
+		{
+			ProcDiePending = true;
+			whereToSendOutput = DestNone;
+			break;
+		}
+	}
+
+	if (update_process_title)
+		set_ps_display_remove_suffix();
+}
+
+static bool
+SyncRepAdgCommitAckRequired(bool commit)
+{
+	if (!commit)
+		return false;
+	if (!cluster_enabled || !cluster_enable_adg || cluster_dg_role != CLUSTER_DG_ROLE_PRIMARY)
+		return false;
+	return cluster_lns_ack_mode_from_guc(cluster_dg_mode) != CLUSTER_DG_ACK_ASYNC;
+}
+
+static bool
+SyncRepAdgCommitAckSatisfied(XLogRecPtr lsn, ClusterDgAckMode mode)
+{
+	bool		standby_connected = false;
+	bool		standby_acknowledged = false;
+	uint16		target_thread_id = cluster_wal_thread_id();
+	int			i;
+
+	if (WalSndCtl == NULL || max_wal_senders <= 0)
+		return cluster_lns_commit_ack_satisfied(mode, false, false);
+
+	for (i = 0; i < max_wal_senders; i++)
+	{
+		volatile WalSnd *walsnd;
+		pid_t		pid;
+		WalSndState state;
+		XLogRecPtr	flush;
+		uint16		adg_thread_id;
+		uint16		adg_send_thread_id;
+		uint16		adg_reply_version;
+		uint64		adg_apply_master_term;
+
+		walsnd = &WalSndCtl->walsnds[i];
+		SpinLockAcquire(&walsnd->mutex);
+		pid = walsnd->pid;
+		state = walsnd->state;
+		flush = walsnd->flush;
+		adg_thread_id = walsnd->adg_thread_id;
+		adg_send_thread_id = walsnd->adg_send_thread_id;
+		adg_reply_version = walsnd->adg_reply_version;
+		adg_apply_master_term = walsnd->adg_apply_master_term;
+		SpinLockRelease(&walsnd->mutex);
+
+		if (pid == 0)
+			continue;
+		if (state != WALSNDSTATE_STREAMING && state != WALSNDSTATE_STOPPING)
+			continue;
+		if (adg_reply_version != CLUSTER_ADG_REPLY_VERSION || adg_apply_master_term == 0)
+			continue;
+		if (!cluster_lns_thread_ack_matches(target_thread_id, adg_send_thread_id, adg_thread_id))
+			continue;
+
+		standby_connected = true;
+		if (!XLogRecPtrIsInvalid(flush) && flush >= lsn)
+		{
+			standby_acknowledged = true;
+			break;
+		}
+	}
+
+	return cluster_lns_commit_ack_satisfied(mode, standby_connected,
+											standby_acknowledged);
+}
+#endif
 
 void
 SyncRepCleanupAtProcExit(void)

@@ -81,6 +81,11 @@
 #include "utils/resowner.h"
 #include "utils/timestamp.h"
 
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_mrp.h"
+#include "cluster/cluster_rfs.h"
+#endif
+
 
 /*
  * GUC variables.  (Other variables that affect walreceiver are in xlog.c
@@ -133,6 +138,10 @@ static TimestampTz wakeup[NUM_WALRCV_WAKEUPS];
 
 static StringInfoData reply_message;
 static StringInfoData incoming_message;
+
+#ifdef USE_PGRAC_CLUSTER
+static uint16 walrcv_adg_last_thread_id = XLP_THREAD_ID_LEGACY;
+#endif
 
 /* Prototypes for private functions */
 static void WalRcvFetchTimeLineHistoryFiles(TimeLineID first, TimeLineID last);
@@ -341,10 +350,25 @@ WalReceiverMain(void)
 		 * Check that we're connected to a valid server using the
 		 * IDENTIFY_SYSTEM replication command.
 		 */
-		primary_sysid = walrcv_identify_system(wrconn, &primaryTLI);
+			primary_sysid = walrcv_identify_system(wrconn, &primaryTLI);
 
-		snprintf(standby_sysid, sizeof(standby_sysid), UINT64_FORMAT,
-				 GetSystemIdentifier());
+#ifdef USE_PGRAC_CLUSTER
+			if (cluster_mrp_should_start())
+			{
+				int			primary_thread_count;
+
+				primary_thread_count = walrcv_get_adg_primary_thread_count(wrconn);
+				if (primary_thread_count <= 0 || primary_thread_count > CLUSTER_WAL_THREAD_MAX)
+					ereport(ERROR,
+							(errcode(ERRCODE_PROTOCOL_VIOLATION),
+							 errmsg("invalid ADG primary thread count %d",
+									primary_thread_count)));
+				cluster_mrp_note_primary_thread_count((uint16)primary_thread_count);
+			}
+#endif
+
+			snprintf(standby_sysid, sizeof(standby_sysid), UINT64_FORMAT,
+					 GetSystemIdentifier());
 		if (strcmp(primary_sysid, standby_sysid) != 0)
 		{
 			ereport(ERROR,
@@ -410,6 +434,7 @@ WalReceiverMain(void)
 		options.startpoint = startpoint;
 		options.slotname = slotname[0] != '\0' ? slotname : NULL;
 		options.proto.physical.startpointTLI = startpointTLI;
+		options.proto.physical.adg_thread_id = 0;
 		if (walrcv_startstreaming(wrconn, &options))
 		{
 			if (first_stream)
@@ -957,6 +982,10 @@ XLogWalRcvWrite(char *buf, Size nbytes, XLogRecPtr recptr, TimeLineID tli)
 		}
 
 		/* Update state for write */
+#ifdef USE_PGRAC_CLUSTER
+		cluster_rfs_observe_received_chunk(buf, (Size)byteswritten, recptr, tli, recvFile,
+										   &walrcv_adg_last_thread_id);
+#endif
 		recptr += byteswritten;
 
 		nbytes -= byteswritten;
@@ -994,6 +1023,9 @@ XLogWalRcvFlush(bool dying, TimeLineID tli)
 		WalRcvData *walrcv = WalRcv;
 
 		issue_xlog_fsync(recvFile, recvSegNo, tli);
+#ifdef USE_PGRAC_CLUSTER
+		cluster_rfs_flush_received_threads();
+#endif
 
 		LogstreamResult.Flush = LogstreamResult.Write;
 
@@ -1139,6 +1171,10 @@ XLogWalRcvSendReply(bool force, bool requestReply)
 	pq_sendint64(&reply_message, applyPtr);
 	pq_sendint64(&reply_message, GetCurrentTimestamp());
 	pq_sendbyte(&reply_message, requestReply ? 1 : 0);
+
+#ifdef USE_PGRAC_CLUSTER
+	cluster_rfs_append_reply_trailer(&reply_message, walrcv_adg_last_thread_id);
+#endif
 
 	/* Send it */
 	elog(DEBUG2, "sending write %X/%X flush %X/%X apply %X/%X%s",

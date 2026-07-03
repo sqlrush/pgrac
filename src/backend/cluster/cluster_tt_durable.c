@@ -398,6 +398,64 @@ cluster_tt_slot_durable_lookup(uint32 segment_id, uint16 slot_offset, Transactio
 	return true;
 }
 
+bool
+cluster_tt_slot_durable_lookup_committed_stable(uint32 segment_id, uint16 slot_offset,
+												TransactionId xid, uint32 expected_wrap,
+												ClusterTTDurableXidCommitCheck xid_committed,
+												SCN *commit_scn)
+{
+	uint8 owner;
+	uint32 off;
+	TTSlot first;
+	TTSlot second;
+
+	if (commit_scn == NULL || xid_committed == NULL || slot_offset >= TT_SLOTS_PER_SEGMENT)
+		return false;
+
+	owner = tt_owner_instance_for_segment(segment_id);
+	off = tt_slot_file_offset(slot_offset);
+
+	cluster_tt_durable_io_wait_start();
+	if (!cluster_undo_smgr_read_header_bytes(segment_id, owner, off, (char *)&first,
+											 sizeof(first))) {
+		cluster_tt_durable_io_wait_end();
+		cluster_tt_durable_count_lookup(false);
+		return false;
+	}
+	cluster_tt_durable_io_wait_end();
+
+	if (!cluster_tt_durable_slot_match(first.status, first.xid, first.wrap, first.commit_scn, xid,
+									   expected_wrap)) {
+		cluster_tt_durable_count_lookup(false);
+		return false;
+	}
+
+	if (!xid_committed(xid)) {
+		cluster_tt_durable_count_lookup(false);
+		return false;
+	}
+
+	cluster_tt_durable_io_wait_start();
+	if (!cluster_undo_smgr_read_header_bytes(segment_id, owner, off, (char *)&second,
+											 sizeof(second))) {
+		cluster_tt_durable_io_wait_end();
+		cluster_tt_durable_count_lookup(false);
+		return false;
+	}
+	cluster_tt_durable_io_wait_end();
+
+	if (memcmp(&first, &second, sizeof(first)) != 0
+		|| !cluster_tt_durable_slot_match(second.status, second.xid, second.wrap, second.commit_scn,
+										  xid, expected_wrap)) {
+		cluster_tt_durable_count_lookup(false);
+		return false;
+	}
+
+	*commit_scn = second.commit_scn;
+	cluster_tt_durable_count_lookup(true);
+	return true;
+}
+
 
 ClusterTTDurableResolve
 cluster_tt_slot_durable_resolve_by_xid(TransactionId xid, uint32 expected_wrap, SCN *commit_scn,

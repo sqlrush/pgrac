@@ -269,11 +269,13 @@ cluster_gcs_block_dedup_lookup_or_register(const GcsBlockDedupKey *key, BufferTa
 }
 
 void
-cluster_gcs_block_dedup_install_reply(const GcsBlockDedupKey *key, GcsBlockReplyStatus status,
-									  const GcsBlockReplyHeader *header, const char *block_data)
+cluster_gcs_block_dedup_install_reply_ex(const GcsBlockDedupKey *key, GcsBlockReplyStatus status,
+										 const GcsBlockReplyHeader *header, const char *block_data,
+										 const ClusterSfDepVec *sf_dep_vec, bool has_sf_dep)
 {
 	GcsBlockDedupEntry *entry;
 	bool found;
+	bool has_block_payload;
 
 	Assert(key != NULL);
 	Assert(header != NULL);
@@ -294,13 +296,38 @@ cluster_gcs_block_dedup_install_reply(const GcsBlockDedupKey *key, GcsBlockReply
 
 	entry->status = (uint8)status;
 	entry->reply_header = *header;
-	if (block_data != NULL && status == GCS_BLOCK_REPLY_GRANTED)
+	entry->has_sf_dep = has_sf_dep;
+	entry->sf_flags
+		= has_sf_dep ? (GCS_BLOCK_REPLY_SF_HAS_DEP_VEC | GCS_BLOCK_REPLY_SF_EARLY_TRANSFER) : 0;
+	entry->sf_dep_count = 0;
+	cluster_sf_dep_vec_reset(&entry->sf_dep_vec);
+	if (has_sf_dep && sf_dep_vec != NULL) {
+		int i;
+
+		for (i = 0; i < CLUSTER_SF_DEP_MAX_ORIGINS; i++) {
+			if (XLogRecPtrIsInvalid(sf_dep_vec->required[i]))
+				continue;
+			entry->sf_dep_vec.required[i] = sf_dep_vec->required[i];
+			entry->sf_dep_count++;
+		}
+	}
+	has_block_payload = block_data != NULL
+						&& (status == GCS_BLOCK_REPLY_GRANTED
+							|| status == GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER);
+	if (has_block_payload)
 		memcpy(entry->block_data, block_data, GCS_BLOCK_DATA_SIZE);
 	else
 		memset(entry->block_data, 0, GCS_BLOCK_DATA_SIZE);
 	entry->completed_at_ts = GetCurrentTimestamp();
 
 	LWLockRelease(&cluster_gcs_block_dedup_shared->lock.lock);
+}
+
+void
+cluster_gcs_block_dedup_install_reply(const GcsBlockDedupKey *key, GcsBlockReplyStatus status,
+									  const GcsBlockReplyHeader *header, const char *block_data)
+{
+	cluster_gcs_block_dedup_install_reply_ex(key, status, header, block_data, NULL, false);
 }
 
 void

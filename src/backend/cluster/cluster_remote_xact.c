@@ -47,10 +47,13 @@
 #include "utils/elog.h"
 
 #include "cluster/cluster_elog.h"
+#include "cluster/cluster_epoch.h"
+#include "cluster/cluster_guc.h"
 #include "cluster/cluster_remote_xact.h"
-#include "cluster/cluster_scn.h"			   /* recovery_replay_observe (G6) */
-#include "cluster/cluster_tt_durable.h"		   /* durable wrap cross-check (G6 P1 #2) */
-#include "cluster/storage/cluster_undo_xlog.h" /* redo_stamp_slot (G6) */
+#include "cluster/cluster_scn.h"				/* recovery_replay_observe (G6) */
+#include "cluster/cluster_terminal_authority.h" /* spec-6.2 authority substrate */
+#include "cluster/cluster_tt_durable.h"			/* durable wrap cross-check (G6 P1 #2) */
+#include "cluster/storage/cluster_undo_xlog.h"	/* redo_stamp_slot (G6) */
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -254,18 +257,13 @@ cluster_remote_commit_outcome(int origin_node, TransactionId xid, SCN *commit_sc
 }
 
 /*
- * cluster_remote_outcome_durable_checked -- spec-4.5a G6 (P1 #2) exact
- * authority read.  A COMMITTED verdict requires the outcome store AND the
- * INDEPENDENT durable TT slot (pg_undo/instance_<origin>, kept bound by the
- * G6 slot pin) to agree on BOTH commit_scn AND wrap.  The durable lookup uses
- * the outcome's wrap as expected_wrap -- NOT CLUSTER_TT_WRAP_ANY -- so a slot
- * still holding a different wrap (same-xid wraparound overwrote the store)
- * yields no match -> INDOUBT.  A missing wrap is unprovable -> INDOUBT
- * (规则 8.A: never trust a bare (origin,xid) committed verdict).  ABORTED /
- * INDOUBT pass through unchanged (no SCN/identity to alias).
+ * Legacy durable-check path used when spec-6.2 terminal authority is disabled.
+ * This preserves the Stage 5 behavior for existing callers: COMMITTED must
+ * still be backed by an exact durable TT slot match, but membership/retention
+ * authority is not required because the aggressive 6.2 transfer paths are off.
  */
-ClusterRemoteXactOutcome
-cluster_remote_outcome_durable_checked(int origin_node, TransactionId xid, SCN *out_scn)
+static ClusterRemoteXactOutcome
+cluster_remote_outcome_durable_checked_legacy(int origin_node, TransactionId xid, SCN *out_scn)
 {
 	SCN outcome_scn;
 	SCN durable_scn;
@@ -278,18 +276,12 @@ cluster_remote_outcome_durable_checked(int origin_node, TransactionId xid, SCN *
 
 	oc = cluster_remote_commit_outcome_ex(origin_node, xid, &outcome_scn, &outcome_wrap,
 										  &outcome_wrap_valid);
-	if (oc != CLUSTER_REMOTE_XACT_COMMITTED)
-		return oc; /* ABORTED / INDOUBT: no commit_scn identity to wrap-verify */
+	if (oc != CLUSTER_REMOTE_XACT_COMMITTED) {
+		if (oc == CLUSTER_REMOTE_XACT_ABORTED)
+			return CLUSTER_REMOTE_XACT_ABORTED;
+		return CLUSTER_REMOTE_XACT_INDOUBT;
+	}
 
-	/*
-	 * Cross-check against the INDEPENDENT durable TT slot via an origin-
-	 * qualified by-xid scan (NOT the offset path: the tuple's 8-slot heap ITL
-	 * cache is reused, so its offset may point at a newer xact's durable
-	 * slot).  The scan excludes any slot whose wrap differs from the outcome's
-	 * (a same-xid wraparound), so exactly one resolved match whose commit_scn
-	 * equals the outcome's is the authority; anything else is unprovable ->
-	 * INDOUBT (规则 8.A: no bare (origin,xid) trust; a missing wrap likewise).
-	 */
 	if (!outcome_wrap_valid
 		|| cluster_tt_slot_durable_resolve_by_xid_origin(origin_node, xid, (uint32)outcome_wrap,
 														 &durable_scn, NULL, NULL, NULL)
@@ -303,6 +295,122 @@ cluster_remote_outcome_durable_checked(int origin_node, TransactionId xid, SCN *
 	if (out_scn != NULL)
 		*out_scn = outcome_scn;
 	return CLUSTER_REMOTE_XACT_COMMITTED;
+}
+
+/*
+ * cluster_remote_outcome_terminal_authorized -- spec-6.2 Smart Fusion terminal
+ * authority read.  This wraps the existing materialized outcome + durable-TT
+ * exact-match proof in an explicit fail-closed evidence decision:
+ *
+ *   - membership epoch must be known and unchanged;
+ *   - the origin-owned store partition must match the claimed origin;
+ *   - COMMITTED must carry a valid commit SCN and independent durable-TT proof;
+ *   - optional retention decisions must pass an explicit retention proof.
+ *
+ * Any missing leg returns INDOUBT and bumps the spec-6.2 fail-closed counters.
+ * It never falls back to native local CLOG or UNKNOWN-visible semantics.
+ */
+ClusterRemoteXactOutcome
+cluster_remote_outcome_terminal_authorized(int origin_node, TransactionId xid,
+										   uint64 observed_epoch, uint64 current_epoch,
+										   bool retention_required, bool retention_proven,
+										   SCN *out_scn)
+{
+	SCN outcome_scn;
+	SCN durable_scn;
+	uint16 outcome_wrap;
+	bool outcome_wrap_valid;
+	ClusterRemoteXactOutcome oc;
+	ClusterTerminalAuthorityEvidence ev;
+	ClusterTerminalAuthorityReason reason;
+	bool terminal_seen = false;
+
+	if (out_scn != NULL)
+		*out_scn = InvalidScn;
+
+	memset(&ev, 0, sizeof(ev));
+	ev.enabled = cluster_cf_terminal_authority;
+	ev.origin_node = origin_node;
+	ev.xid = xid;
+	ev.epoch_known = true;
+	ev.observed_epoch = observed_epoch;
+	ev.current_epoch = current_epoch;
+	ev.owner_known = true;
+	ev.owner_node = origin_node;
+	ev.retention_required = retention_required;
+	ev.retention_proven = retention_proven;
+	ev.durable_commit_required = true;
+
+	oc = cluster_remote_commit_outcome_ex(origin_node, xid, &outcome_scn, &outcome_wrap,
+										  &outcome_wrap_valid);
+	switch (oc) {
+	case CLUSTER_REMOTE_XACT_COMMITTED:
+		terminal_seen = true;
+		ev.terminal_state = CLUSTER_TERMINAL_AUTH_COMMITTED;
+		ev.terminal_scn = outcome_scn;
+
+		/*
+		 * Cross-check against the INDEPENDENT durable TT slot via an origin-
+		 * qualified by-xid scan (NOT the offset path: the tuple's 8-slot heap ITL
+		 * cache is reused, so its offset may point at a newer xact's durable
+		 * slot).  The scan excludes any slot whose wrap differs from the outcome's
+		 * (a same-xid wraparound), so exactly one resolved match whose commit_scn
+		 * equals the outcome's is the authority; anything else is unprovable.
+		 */
+		if (outcome_wrap_valid
+			&& cluster_tt_slot_durable_resolve_by_xid_origin(origin_node, xid, (uint32)outcome_wrap,
+															 &durable_scn, NULL, NULL, NULL)
+				   == CLUSTER_TT_DURABLE_RESOLVED_SCN) {
+			ev.durable_commit_resolved = true;
+			ev.durable_commit_scn = durable_scn;
+		}
+		break;
+
+	case CLUSTER_REMOTE_XACT_ABORTED:
+		terminal_seen = true;
+		ev.terminal_state = CLUSTER_TERMINAL_AUTH_ABORTED;
+		ev.terminal_scn = InvalidScn;
+		ev.durable_commit_required = false;
+		break;
+
+	case CLUSTER_REMOTE_XACT_INDOUBT:
+	default:
+		ev.terminal_state = CLUSTER_TERMINAL_AUTH_UNKNOWN;
+		ev.terminal_scn = InvalidScn;
+		ev.durable_commit_required = false;
+		break;
+	}
+
+	reason = cluster_terminal_authority_decide(&ev);
+	cluster_terminal_authority_count_decision(reason);
+	if (reason != CLUSTER_TERMINAL_AUTH_OK) {
+		if (terminal_seen && RemoteXactShared != NULL)
+			pg_atomic_fetch_add_u64(&RemoteXactShared->outcome_indoubt_count, 1);
+		return CLUSTER_REMOTE_XACT_INDOUBT;
+	}
+
+	if (oc == CLUSTER_REMOTE_XACT_COMMITTED && out_scn != NULL)
+		*out_scn = outcome_scn;
+	return oc;
+}
+
+/*
+ * cluster_remote_outcome_durable_checked -- compatibility wrapper for existing
+ * Stage 4/5 callers.  With cluster.cf_terminal_authority=off (the spec-6.2
+ * default), keep the legacy durable exact-match behavior.  Once the 6.2
+ * terminal authority is explicitly enabled, route through the full evidence
+ * decision using a stable current-epoch snapshot.
+ */
+ClusterRemoteXactOutcome
+cluster_remote_outcome_durable_checked(int origin_node, TransactionId xid, SCN *out_scn)
+{
+	uint64 current_epoch = cluster_epoch_get_current();
+
+	if (!cluster_cf_terminal_authority)
+		return cluster_remote_outcome_durable_checked_legacy(origin_node, xid, out_scn);
+
+	return cluster_remote_outcome_terminal_authorized(origin_node, xid, current_epoch,
+													  current_epoch, false, true, out_scn);
 }
 
 /*

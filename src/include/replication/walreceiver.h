@@ -7,6 +7,10 @@
  *
  * src/include/replication/walreceiver.h
  *
+ * PGRAC MODIFICATIONS
+ *	  Exposes ADG primary thread discovery and per-thread streaming
+ *	  options through the walreceiver interface.
+ *
  *-------------------------------------------------------------------------
  */
 #ifndef _WALRECEIVER_H
@@ -176,6 +180,7 @@ typedef struct
 		struct
 		{
 			TimeLineID	startpointTLI;	/* Starting timeline */
+			uint16		adg_thread_id;	/* Optional ADG per-thread stream binding */
 		}			physical;
 		struct
 		{
@@ -279,6 +284,14 @@ typedef void (*walrcv_get_senderinfo_fn) (WalReceiverConn *conn,
  */
 typedef char *(*walrcv_identify_system_fn) (WalReceiverConn *conn,
 											TimeLineID *primary_tli);
+
+/*
+ * walrcv_get_adg_primary_thread_count_fn
+ *
+ * Query the primary over the physical replication connection for the ADG WAL
+ * thread count advertised by its runtime cluster configuration.
+ */
+typedef int (*walrcv_get_adg_primary_thread_count_fn) (WalReceiverConn *conn);
 
 /*
  * walrcv_server_version_fn
@@ -393,6 +406,7 @@ typedef struct WalReceiverFunctionsType
 	walrcv_get_conninfo_fn walrcv_get_conninfo;
 	walrcv_get_senderinfo_fn walrcv_get_senderinfo;
 	walrcv_identify_system_fn walrcv_identify_system;
+	walrcv_get_adg_primary_thread_count_fn walrcv_get_adg_primary_thread_count;
 	walrcv_server_version_fn walrcv_server_version;
 	walrcv_readtimelinehistoryfile_fn walrcv_readtimelinehistoryfile;
 	walrcv_startstreaming_fn walrcv_startstreaming;
@@ -417,6 +431,8 @@ extern PGDLLIMPORT WalReceiverFunctionsType *WalReceiverFunctions;
 	WalReceiverFunctions->walrcv_get_senderinfo(conn, sender_host, sender_port)
 #define walrcv_identify_system(conn, primary_tli) \
 	WalReceiverFunctions->walrcv_identify_system(conn, primary_tli)
+#define walrcv_get_adg_primary_thread_count(conn) \
+	WalReceiverFunctions->walrcv_get_adg_primary_thread_count(conn)
 #define walrcv_server_version(conn) \
 	WalReceiverFunctions->walrcv_server_version(conn)
 #define walrcv_readtimelinehistoryfile(conn, tli, filename, content, size) \

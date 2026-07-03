@@ -24,10 +24,10 @@
  *	  Modified by: SqlRush <sqlrush@gmail.com>
  *	  Stage:        0.10
  *
- *	  Extended BackendType enum with 14 pgrac cluster background process
- *	  types (B_CLUSTER_STATS .. B_UNDO_CLEANER), appended after the 13
+ *	  Extended BackendType enum with pgrac cluster background process
+ *	  types (B_CLUSTER_STATS .. B_RFS), appended after the 13
  *	  PG-native values to preserve PG ABI for the original numeric
- *	  positions.  BACKEND_NUM_TYPES updated to 28 (14 PG + 14 pgrac).
+ *	  positions.  BACKEND_NUM_TYPES is anchored on the final pgrac value.
  *
  *	  Stage 0.10 only registers the enum identifiers; postmaster fork
  *	  paths for these processes land in stage 0.13+ (ProcessAux + GUC).
@@ -362,9 +362,8 @@ typedef enum BackendType {
 
 	/*
 	 * PGRAC: pgrac cluster background process types (stage 0.10).
-	 * Appended in alphabetic order; see docs/background-process-design.md
-	 * §8.2.  Stage 0.10 registers identifiers only -- spawning paths
-	 * land in stage 0.13+.
+	 * Values are append-only to preserve backend-type ABI.  Stage 0.10
+	 * registered identifiers only -- spawning paths land in later stages.
 	 */
 	B_CLUSTER_STATS,
 	B_CSSD,
@@ -383,10 +382,11 @@ typedef enum BackendType {
 	B_SINVAL_BCAST,
 	B_TT_GC,
 	B_UNDO_CLEANER,
+	B_RFS,
 } BackendType;
 
 /* PGRAC: anchored on the last pgrac value so additions stay correct.    */
-#define BACKEND_NUM_TYPES (B_UNDO_CLEANER + 1)
+#define BACKEND_NUM_TYPES (B_RFS + 1)
 
 extern PGDLLIMPORT BackendType MyBackendType;
 
@@ -606,6 +606,15 @@ typedef enum {
 	 */
 	UndoCleanerProcess,
 
+	/*
+	 * MRP (Managed Recovery Process) is the spec-6.4 ADG physical standby
+	 * apply process.  Appended after UndoCleanerProcess to preserve every
+	 * existing AuxProcType value; postmaster only forks it when
+	 * cluster.dg_role=standby and cluster.enable_adg=on.
+	 */
+	MrpProcess,
+	RfsProcess,
+
 #endif
 	NUM_AUXPROCTYPES /* Must be last! */
 } AuxProcType;
@@ -629,6 +638,8 @@ extern PGDLLIMPORT AuxProcType MyAuxProcType;
 #define AmLmdProcess() (MyAuxProcType == LmdProcess)
 #define AmSinvalBcastProcess() (MyAuxProcType == SinvalBcastProcess)
 #define AmUndoCleanerProcess() (MyAuxProcType == UndoCleanerProcess)
+#define AmMrpProcess() (MyAuxProcType == MrpProcess)
+#define AmRfsProcess() (MyAuxProcType == RfsProcess)
 #endif
 
 

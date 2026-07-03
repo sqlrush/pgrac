@@ -368,6 +368,9 @@ typedef struct MergeStream {
 	XLogSegNo seg_no;
 	char dir[MAXPGPATH];
 	bool exhausted;
+	bool streaming;
+	bool head_ready;
+	ClusterRecmergeKey head_key;
 	XLogRecPtr valid_end; /* spec-4.5a D6: EndRecPtr of the last complete
 						   * record found by the pre-replay decode pass */
 	XLogRecPtr last_end;  /* EndRecPtr of the last record replay consumed */
@@ -456,9 +459,9 @@ merge_page_read(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
 	pgstat_report_wait_start(WAIT_EVENT_WAL_READ);
 	nread = pg_pread(ms->seg_fd, readBuf, XLOG_BLCKSZ, (off_t)offset);
 	pgstat_report_wait_end();
-	if (nread != XLOG_BLCKSZ)
-		return -1; /* torn / short -> stream end */
-	return XLOG_BLCKSZ;
+	if (nread < reqLen)
+		return -1; /* torn / short before the requested bytes */
+	return (int)nread;
 }
 
 /*
@@ -487,6 +490,8 @@ stream_advance(ClusterRecoveryMergeState *st, int idx)
 	const XLogRecord *rec;
 
 	if (ms->exhausted)
+		return;
+	if (ms->head_ready)
 		return;
 	rec = XLogReadRecord(ms->reader, &errm);
 	if (rec == NULL) {
@@ -517,7 +522,54 @@ stream_advance(ClusterRecoveryMergeState *st, int idx)
 		key.scn = rec->xl_scn;
 		key.lsn = ms->reader->ReadRecPtr;
 		key.node = (int32)ms->thread_id - 1;
+		ms->head_key = key;
 		cluster_recmerge_heap_push(&st->heap, key, idx);
+		ms->head_ready = true;
+	}
+}
+
+static void
+streaming_stream_advance(ClusterRecoveryMergeState *st, int idx, const XLogRecPtr *receive_lsn)
+{
+	MergeStream *ms = &st->streams[idx];
+	char *errm = NULL;
+	const XLogRecord *rec;
+
+	if (ms->exhausted)
+		return;
+	if (ms->head_ready)
+		return;
+	if (receive_lsn != NULL) {
+		XLogRecPtr received = receive_lsn[ms->thread_id];
+
+		if (XLogRecPtrIsInvalid(received) || received <= ms->last_end)
+			return;
+	}
+
+	rec = XLogReadRecord(ms->reader, &errm);
+	if (rec == NULL) {
+		XLogBeginRead(ms->reader, ms->last_end);
+		return;
+	}
+
+	if (receive_lsn != NULL) {
+		XLogRecPtr received = receive_lsn[ms->thread_id];
+
+		if (XLogRecPtrIsInvalid(received) || ms->reader->EndRecPtr > received) {
+			XLogBeginRead(ms->reader, ms->last_end);
+			return;
+		}
+	}
+
+	ms->last_end = ms->reader->EndRecPtr;
+	{
+		ClusterRecmergeKey key;
+
+		key.scn = rec->xl_scn;
+		key.lsn = ms->reader->ReadRecPtr;
+		key.node = (int32)ms->thread_id - 1;
+		ms->head_key = key;
+		ms->head_ready = true;
 	}
 }
 
@@ -780,6 +832,8 @@ cluster_recovery_merge_begin_internal(const uint64 merge_bitmap[2], const XLogRe
 		ms->thread_id = tid;
 		ms->seg_fd = -1;
 		ms->exhausted = false;
+		ms->streaming = false;
+		ms->head_ready = false;
 		ms->stop_lsn = stop_lsn != NULL ? stop_lsn[tid] : InvalidXLogRecPtr;
 		ms->restore_mode = restore_mode;
 		snprintf(ms->dir, sizeof(ms->dir), "%s/thread_%u", wal_root, (unsigned)tid);
@@ -839,6 +893,63 @@ cluster_recovery_merge_begin_restore(const uint64 merge_bitmap[2], const XLogRec
 												 own_thread, tli, true);
 }
 
+ClusterRecoveryMergeState *
+cluster_recovery_merge_streaming_begin(const uint64 merge_bitmap[2], const XLogRecPtr *start_lsn,
+									   TimeLineID tli)
+{
+	ClusterRecoveryMergeState *st;
+	uint16 tid;
+	int idx = 0;
+
+	st = (ClusterRecoveryMergeState *)palloc0(sizeof(ClusterRecoveryMergeState));
+	cluster_recmerge_heap_init(&st->heap);
+	st->last_stream = -1;
+	st->tli = tli;
+
+	for (tid = 1; tid <= CLUSTER_WAL_STATE_SLOT_COUNT; tid++) {
+		MergeStream *ms;
+
+		if ((merge_bitmap[(tid - 1) / 64] & ((uint64)1 << ((tid - 1) % 64))) == 0)
+			continue;
+		if (idx >= CLUSTER_RECMERGE_MAX_STREAMS)
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+							errmsg("ADG streaming merge set exceeds %d streams",
+								   CLUSTER_RECMERGE_MAX_STREAMS)));
+		if (start_lsn == NULL || XLogRecPtrIsInvalid(start_lsn[tid]))
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+					 errmsg("ADG streaming merge has no start LSN for thread %u", (unsigned)tid)));
+
+		ms = &st->streams[idx];
+		ms->thread_id = tid;
+		ms->seg_fd = -1;
+		ms->exhausted = false;
+		ms->streaming = true;
+		ms->head_ready = false;
+		ms->valid_end = InvalidXLogRecPtr;
+		ms->last_end = start_lsn[tid];
+		snprintf(ms->dir, sizeof(ms->dir), "%s/thread_%u", cluster_wal_threads_dir, (unsigned)tid);
+		ms->reader = XLogReaderAllocate(wal_segment_size, ms->dir,
+										XL_ROUTINE(.page_read = merge_page_read,
+												   .segment_open = merge_segment_open,
+												   .segment_close = merge_segment_close),
+										ms);
+		if (ms->reader == NULL)
+			ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY),
+							errmsg("out of memory allocating ADG streaming merge reader")));
+		ms->reader->seg.ws_tli = tli;
+		ms->last_end = XLogFindNextRecord(ms->reader, start_lsn[tid]);
+		if (XLogRecPtrIsInvalid(ms->last_end)) {
+			st->n_streams = idx + 1;
+			cluster_recovery_merge_end(st);
+			return NULL;
+		}
+		idx++;
+	}
+	st->n_streams = idx;
+	return st;
+}
+
 XLogReaderState *
 cluster_recovery_merge_next(ClusterRecoveryMergeState *st, uint16 *thread_out, char **errmsg_out)
 {
@@ -858,9 +969,66 @@ cluster_recovery_merge_next(ClusterRecoveryMergeState *st, uint16 *thread_out, c
 		return NULL; /* all streams exhausted */
 
 	st->last_stream = top.stream;
+	st->streams[top.stream].head_ready = false;
 	if (thread_out)
 		*thread_out = st->streams[top.stream].thread_id;
 	return st->streams[top.stream].reader;
+}
+
+XLogReaderState *
+cluster_recovery_merge_streaming_next(ClusterRecoveryMergeState *st, const XLogRecPtr *receive_lsn,
+									  const XLogRecPtr *barrier_lsn, const SCN *barrier_scn,
+									  uint16 *thread_out, char **errmsg_out)
+{
+	int idx;
+	int advanced_stream = -1;
+	ClusterRecmergeStreamingInput inputs[CLUSTER_RECMERGE_MAX_STREAMS];
+	ClusterRecmergeKey selected_key;
+	int selected_stream = -1;
+
+	if (errmsg_out)
+		*errmsg_out = NULL;
+	if (st == NULL)
+		return NULL;
+
+	if (st->last_stream >= 0) {
+		advanced_stream = st->last_stream;
+		streaming_stream_advance(st, st->last_stream, receive_lsn);
+		st->last_stream = -1;
+	}
+	for (idx = 0; idx < st->n_streams; idx++) {
+		if (idx == advanced_stream)
+			continue;
+		streaming_stream_advance(st, idx, receive_lsn);
+	}
+	memset(inputs, 0, sizeof(inputs));
+	for (idx = 0; idx < st->n_streams; idx++) {
+		const MergeStream *ms = &st->streams[idx];
+
+		if (ms->head_ready) {
+			inputs[idx].record_available = true;
+			inputs[idx].key = ms->head_key;
+			continue;
+		}
+		if (barrier_lsn != NULL && barrier_scn != NULL && barrier_lsn[ms->thread_id] >= ms->last_end
+			&& SCN_VALID(barrier_scn[ms->thread_id])) {
+			inputs[idx].heartbeat_seen = true;
+			inputs[idx].heartbeat_key.scn = (uint64)barrier_scn[ms->thread_id];
+			inputs[idx].heartbeat_key.lsn = PG_UINT64_MAX;
+			inputs[idx].heartbeat_key.node = SCN_MAX_VALID_NODE_ID;
+		}
+	}
+	if (cluster_recmerge_streaming_select(inputs, st->n_streams, &selected_stream, &selected_key)
+		!= CLUSTER_RECMERGE_STREAMING_RECORD_READY)
+		return NULL;
+	if (selected_stream < 0 || selected_stream >= st->n_streams)
+		return NULL;
+
+	st->last_stream = selected_stream;
+	st->streams[selected_stream].head_ready = false;
+	if (thread_out)
+		*thread_out = st->streams[selected_stream].thread_id;
+	return st->streams[selected_stream].reader;
 }
 
 void

@@ -146,8 +146,8 @@ ok($phase_val =~ /^(init|running|shutdown|reconfig)$/,
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'112',
-	'E1 pg_stat_cluster_wait_events returns 112 rows (spec-6.0a +7 storage wait events)');
+	'116',
+	'E1 pg_stat_cluster_wait_events returns 116 rows (spec-6.2 Smart Fusion authority waits)');
 
 ok($node->safe_psql('postgres',
 		q{SELECT count(*) > 0 FROM pg_stat_cluster_wait_events WHERE type='Cluster: GES'})
@@ -159,7 +159,7 @@ ok($node->safe_psql('postgres',
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_gcluster_wait_events'),
-	'112', 'E4 pg_stat_gcluster_wait_events returns 112 rows (single-node, spec-6.0a baseline)');
+	'116', 'E4 pg_stat_gcluster_wait_events returns 116 rows (single-node, spec-6.2 Smart Fusion authority waits)');
 
 
 # ============================================================
@@ -180,7 +180,7 @@ ok($serr =~ /unknown cluster injection point/i,
 
 
 # ============================================================
-# §G  GUC framework (4 tests)
+# §G  GUC framework (12 tests)
 # ============================================================
 
 is($node->get_cluster_state_value('guc', 'cluster.node_id'),
@@ -197,6 +197,33 @@ ok($node->get_cluster_state_value('guc', 'cluster.injection_points') ne '',
 
 is($node->get_cluster_state_value('guc', 'cluster.shared_storage_backend'),
 	'stub', 'G5 dump shows cluster.shared_storage_backend GUC (default stub, stage 1.1)');
+
+is($node->safe_psql('postgres',
+		q{SELECT setting FROM pg_settings WHERE name='cluster.cf_terminal_authority'}),
+	'off', 'G6 pg_settings shows cluster.cf_terminal_authority default off');
+
+is($node->get_cluster_state_value('guc', 'cluster.cf_terminal_authority'),
+	'f', 'G7 dump shows cluster.cf_terminal_authority GUC');
+
+is($node->get_cluster_state_value('guc', 'cluster.cf_delayed_cleanout'),
+	'reader', 'G8 dump shows cluster.cf_delayed_cleanout GUC');
+
+is($node->get_cluster_state_value('guc', 'cluster.smart_fusion_tier_min'),
+	'tier3', 'G9 dump shows cluster.smart_fusion_tier_min GUC');
+
+is($node->get_cluster_state_value('guc', 'cluster.smart_fusion'),
+	'f', 'G10 dump shows cluster.smart_fusion guarded-off GUC');
+
+my $sf_guard = PostgreSQL::Test::Cluster->new('smart_fusion_guard');
+$sf_guard->init;
+$sf_guard->append_conf('postgresql.conf', "cluster.smart_fusion = on\n");
+is($sf_guard->start(fail_ok => 1), 0,
+	'G11 cluster.smart_fusion=on fails closed at startup');
+open my $sf_guard_log_fh, '<', $sf_guard->logfile
+	or die "open smart_fusion_guard log: $!";
+my $sf_guard_log = do { local $/; <$sf_guard_log_fh> };
+like($sf_guard_log, qr/cluster\.smart_fusion is fail-closed/i,
+	'G12 startup log explains the Smart Fusion guardrail');
 
 
 # ============================================================
@@ -220,7 +247,7 @@ ok($node->safe_psql('postgres',
 
 is($node->safe_psql('postgres',
 		q{SELECT count(DISTINCT type) FROM pg_stat_cluster_wait_events}),
-	'13', 'I1 wait_events has exactly 13 distinct types (10 from stage 0 + SharedFs from stage 1.1 + StartupPhase from stage 1.10 + BgProc from stage 1.11 Sprint B / 1.11.1 F12)');
+	'14', 'I1 wait_events has exactly 14 distinct types');
 
 ok($node->safe_psql('postgres',
 		q{SELECT count(*) > 0 FROM pg_stat_gcluster_wait_events WHERE node_id IS NOT NULL})
@@ -368,8 +395,8 @@ ok($node->safe_psql('postgres',
 
 is($node->safe_psql('postgres',
 		q{SELECT string_agg(DISTINCT category, ',' ORDER BY category) FROM pg_cluster_state}),
-	'advisory,block_format,buffer_format,cf,cluster_cssd,cluster_stats,conf,cr,cr_coord,cr_pool,diag,dl,gcs,gcs_recovery,ges,grd,grd_recovery,guc,hang,hw,ic,inject,ir,ko,lck,lmd,lmon,lms,pcm,pgstat,phase,reconfig_join,reconfig_touched,recovery,resolver_cache,scn,sequence,shared_fs,shmem,sinval,ts,tt_2pc,tt_recovery,tt_status,tt_status_hint,undo,undo_cleaner,visibility,wal_thread,write_fence,xnode_profile',
-	'O2 pg_cluster_state has all 51 categories (spec-5.11 adds hang; spec-5.51 adds cr_pool; spec-5.14 adds reconfig_touched; spec-5.15 adds reconfig_join; spec-5.55 adds resolver_cache; spec-5.57 adds cr_coord)');
+	'advisory,block_format,buffer_format,cf,cluster_cssd,cluster_stats,conf,cr,cr_coord,cr_pool,diag,dl,gcs,gcs_recovery,ges,grd,grd_recovery,guc,hang,hw,ic,inject,ir,ko,lck,lmd,lmon,lms,pcm,pgstat,phase,reconfig_join,reconfig_touched,recovery,resolver_cache,scn,sequence,shared_fs,shmem,sinval,smart_fusion,ts,tt_2pc,tt_recovery,tt_status,tt_status_hint,undo,undo_cleaner,visibility,wal_thread,write_fence,xnode_profile',
+	'O2 pg_cluster_state has all 52 categories (spec-6.2 adds smart_fusion)');
 
 is($node->safe_psql('postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE value IS NULL}),

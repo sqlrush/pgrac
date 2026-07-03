@@ -49,6 +49,7 @@
 #include "postgres.h"
 
 #include "access/transam.h" /* spec-3.11 D5/C1b: TransactionIdDidCommit */
+#include "access/xlog.h"	/* RecoveryInProgress */
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/ipc.h"
@@ -278,6 +279,194 @@ is_entry_fresh(const ClusterTTOverlayEntry *e, TimestampTz now)
 	return age_us < ((int64)cluster_tt_status_overlay_ttl_ms * 1000);
 }
 
+static bool
+cluster_tt_status_adg_standby_overlay_enabled(void)
+{
+	return cluster_enabled && cluster_enable_adg && cluster_dg_role == CLUSTER_DG_ROLE_STANDBY
+		   && RecoveryInProgress();
+}
+
+static bool
+cluster_tt_status_adg_standby_provisional(ClusterTTStatus status)
+{
+	return status == CLUSTER_TT_STATUS_IN_PROGRESS || status == CLUSTER_TT_STATUS_SUBCOMMITTED;
+}
+
+static bool
+cluster_tt_status_same_identity_except_epoch(const ClusterTTStatusKey *a,
+											 const ClusterTTStatusKey *b)
+{
+	return a->origin_node_id == b->origin_node_id && a->undo_segment_id == b->undo_segment_id
+		   && a->tt_slot_id == b->tt_slot_id && a->local_xid == b->local_xid;
+}
+
+static void
+cluster_tt_status_fill_result_from_entry(const ClusterTTOverlayEntry *e,
+										 ClusterTTStatusResult *result)
+{
+	result->status = e->status;
+	result->commit_scn = e->commit_scn;
+	result->status_epoch = e->status_epoch;
+	result->authoritative = true;
+	if (e->status == CLUSTER_TT_STATUS_SUBCOMMITTED && e->has_parent_key) {
+		result->has_parent_key = true;
+		result->parent_key = e->parent_key;
+	}
+}
+
+/*
+ * ADG physical standby durable fallback:
+ *
+ * ADG standby redo can install primary-origin overlay entries before all
+ * durable status paths line up with a local xid-space lookup.  Prefer the
+ * direct committed-stable check when it applies, then a diverted remote
+ * outcome cross-checked against origin-qualified durable TT.  If no outcome
+ * store is populated, accept only an origin-qualified durable TT scan that
+ * resolves exactly one COMMITTED slot with a valid commit SCN.  Ambiguous,
+ * missing, or unstamped durable state remains fail-closed.
+ */
+static bool
+cluster_tt_status_lookup_adg_standby_durable(const ClusterTTStatusKey *key, uint32 status_epoch,
+											 ClusterTTStatusResult *result)
+{
+	SCN durable_scn;
+	ClusterRemoteXactOutcome remote_outcome;
+	ClusterTTDurableResolve durable_resolve;
+
+	if (!cluster_tt_status_adg_standby_overlay_enabled())
+		return false;
+	if (!cluster_tt_durable_lookup || key == NULL || result == NULL)
+		return false;
+	if (key->tt_slot_id < 1 || key->tt_slot_id > TT_SLOTS_PER_SEGMENT)
+		return false;
+
+	if (cluster_tt_slot_durable_lookup_committed_stable(
+			key->undo_segment_id, cluster_tt_slot_id_to_offset(key->tt_slot_id), key->local_xid,
+			CLUSTER_TT_WRAP_ANY, TransactionIdDidCommit, &durable_scn)) {
+		result->status = CLUSTER_TT_STATUS_COMMITTED;
+		result->commit_scn = durable_scn;
+		result->status_epoch = status_epoch;
+		result->authoritative = true;
+		result->has_parent_key = false;
+		memset(&result->parent_key, 0, sizeof(result->parent_key));
+		return true;
+	}
+
+	remote_outcome = cluster_remote_outcome_durable_checked((int)key->origin_node_id,
+															key->local_xid, &durable_scn);
+	if (remote_outcome == CLUSTER_REMOTE_XACT_COMMITTED) {
+		result->status = CLUSTER_TT_STATUS_COMMITTED;
+		result->commit_scn = durable_scn;
+		result->status_epoch = status_epoch;
+		result->authoritative = true;
+		result->has_parent_key = false;
+		memset(&result->parent_key, 0, sizeof(result->parent_key));
+		return true;
+	}
+	if (remote_outcome == CLUSTER_REMOTE_XACT_ABORTED) {
+		result->status = CLUSTER_TT_STATUS_ABORTED;
+		result->commit_scn = InvalidScn;
+		result->status_epoch = status_epoch;
+		result->authoritative = true;
+		result->has_parent_key = false;
+		memset(&result->parent_key, 0, sizeof(result->parent_key));
+		return true;
+	}
+
+	durable_resolve = cluster_tt_slot_durable_resolve_by_xid_origin(
+		(int)key->origin_node_id, key->local_xid, CLUSTER_TT_WRAP_ANY, &durable_scn, NULL, NULL,
+		NULL);
+	if (durable_resolve == CLUSTER_TT_DURABLE_RESOLVED_SCN) {
+		result->status = CLUSTER_TT_STATUS_COMMITTED;
+		result->commit_scn = durable_scn;
+		result->status_epoch = status_epoch;
+		result->authoritative = true;
+		result->has_parent_key = false;
+		memset(&result->parent_key, 0, sizeof(result->parent_key));
+		return true;
+	}
+
+	return false;
+}
+
+static void
+cluster_tt_status_adg_standby_maybe_use_durable(const ClusterTTStatusKey *key, uint32 status_epoch,
+												ClusterTTStatusResult *result)
+{
+	ClusterTTStatusResult durable_result;
+
+	if (!cluster_tt_status_adg_standby_provisional(result->status))
+		return;
+
+	/*
+	 * ADG physical standby replay can have a fresh provisional overlay while
+	 * replayed durable TT/CLOG already proves the transaction committed.  That
+	 * is replay authority, not a peer hint; only upgrade provisional states.
+	 */
+	memset(&durable_result, 0, sizeof(durable_result));
+	if (cluster_tt_status_lookup_adg_standby_durable(key, status_epoch, &durable_result))
+		*result = durable_result;
+}
+
+/*
+ * ADG standby exception to HC182:
+ *
+ * Physical standby redo installs TT overlay entries from primary WAL, including
+ * the primary/replay record's epoch.  The standby live cluster epoch is local
+ * control-plane state and WAL redo intentionally does not advance it.  A normal
+ * exact epoch fence would therefore fail closed after either side reconfigures,
+ * making committed prepared rows permanently invisible on the standby.
+ *
+ * Keep the exception narrow: only ADG standby, same origin/undo slot/xid, fresh
+ * overlay entry, and exactly one candidate.  Multiple epoch candidates for the
+ * same physical TT identity stay UNKNOWN rather than choosing one.
+ */
+static bool
+cluster_tt_status_lookup_adg_standby_overlay(const ClusterTTStatusKey *key, TimestampTz now,
+											 uint32 current_epoch, ClusterTTStatusResult *result,
+											 bool *ambiguous)
+{
+	HASH_SEQ_STATUS seq;
+	ClusterTTOverlayEntry *e;
+	const ClusterTTOverlayEntry *candidate = NULL;
+
+	if (ambiguous != NULL)
+		*ambiguous = false;
+	if (!cluster_tt_status_adg_standby_overlay_enabled())
+		return false;
+
+	LWLockAcquire(ClusterTTStatusLock, LW_SHARED);
+	hash_seq_init(&seq, ClusterTTStatusHTAB);
+	while ((e = (ClusterTTOverlayEntry *)hash_seq_search(&seq)) != NULL) {
+		if (!cluster_tt_status_same_identity_except_epoch(&e->key, key))
+			continue;
+		if (!is_entry_fresh(e, now))
+			continue;
+		if (candidate != NULL) {
+			if (ambiguous != NULL)
+				*ambiguous = true;
+			hash_seq_term(&seq);
+			LWLockRelease(ClusterTTStatusLock);
+			return false;
+		}
+		candidate = e;
+	}
+
+	if (candidate == NULL) {
+		LWLockRelease(ClusterTTStatusLock);
+		return false;
+	}
+
+	cluster_tt_status_fill_result_from_entry(candidate, result);
+	LWLockRelease(ClusterTTStatusLock);
+	cluster_tt_status_adg_standby_maybe_use_durable(key, current_epoch, result);
+
+	pg_atomic_fetch_add_u64(&ClusterTTStatusState->lookup_hit_count, 1);
+	if (result->status == CLUSTER_TT_STATUS_SUBCOMMITTED)
+		pg_atomic_fetch_add_u64(&ClusterTTStatusState->subcommitted_lookup_hit_count, 1);
+	return true;
+}
+
 static void
 note_overlay_full(const char *dropped_kind)
 {
@@ -319,20 +508,36 @@ cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key, ClusterTTStatusRes
 	if (!cluster_enabled || ClusterTTStatusHTAB == NULL)
 		return false;
 
-	/* HC182:  reject lookups for an epoch newer/older than current. */
 	current_epoch = (uint32)cluster_epoch_get_current();
+	now = GetCurrentTimestamp();
+
+	/* HC182: reject epoch mismatch except for the narrow ADG standby case. */
 	if (key->cluster_epoch != current_epoch) {
+		bool ambiguous = false;
+
+		if (cluster_tt_status_lookup_adg_standby_overlay(key, now, current_epoch, result,
+														 &ambiguous))
+			return true;
+		if (!ambiguous && cluster_tt_status_lookup_adg_standby_durable(key, current_epoch, result))
+			return true;
 		pg_atomic_fetch_add_u64(&ClusterTTStatusState->lookup_miss_count, 1);
 		return false;
 	}
 
-	now = GetCurrentTimestamp();
-
 	LWLockAcquire(ClusterTTStatusLock, LW_SHARED);
 	e = (ClusterTTOverlayEntry *)hash_search(ClusterTTStatusHTAB, key, HASH_FIND, NULL);
 	if (e == NULL || !is_entry_fresh(e, now)) {
+		bool ambiguous = false;
+
 		LWLockRelease(ClusterTTStatusLock);
+		if (cluster_tt_status_lookup_adg_standby_overlay(key, now, current_epoch, result,
+														 &ambiguous))
+			return true;
 		pg_atomic_fetch_add_u64(&ClusterTTStatusState->lookup_miss_count, 1);
+		if (ambiguous)
+			return false;
+		if (cluster_tt_status_lookup_adg_standby_durable(key, current_epoch, result))
+			return true;
 
 		/*
 		 * spec-3.11 D5/C3: overlay miss -> own-instance durable TT lookup.  The
@@ -351,10 +556,9 @@ cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key, ClusterTTStatusRes
 			&& key->tt_slot_id <= TT_SLOTS_PER_SEGMENT) {
 			SCN durable_scn;
 
-			if (cluster_tt_slot_durable_lookup(key->undo_segment_id,
-											   cluster_tt_slot_id_to_offset(key->tt_slot_id),
-											   key->local_xid, CLUSTER_TT_WRAP_ANY, &durable_scn)
-				&& TransactionIdDidCommit(key->local_xid)) {
+			if (cluster_tt_slot_durable_lookup_committed_stable(
+					key->undo_segment_id, cluster_tt_slot_id_to_offset(key->tt_slot_id),
+					key->local_xid, CLUSTER_TT_WRAP_ANY, TransactionIdDidCommit, &durable_scn)) {
 				result->status = CLUSTER_TT_STATUS_COMMITTED;
 				result->commit_scn = durable_scn;
 				result->status_epoch = current_epoch;
@@ -390,8 +594,12 @@ cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key, ClusterTTStatusRes
 			 * overwrote the store no longer matches the still-bound durable
 			 * slot's wrap -> fail closed (no CLUSTER_TT_WRAP_ANY).
 			 */
-			switch (cluster_remote_outcome_durable_checked((int)key->origin_node_id, key->local_xid,
-														   &outcome_scn)) {
+			switch (cluster_cf_terminal_authority
+						? cluster_remote_outcome_terminal_authorized(
+							  (int)key->origin_node_id, key->local_xid, key->cluster_epoch,
+							  current_epoch, false, true, &outcome_scn)
+						: cluster_remote_outcome_durable_checked((int)key->origin_node_id,
+																 key->local_xid, &outcome_scn)) {
 			case CLUSTER_REMOTE_XACT_COMMITTED: {
 				result->status = CLUSTER_TT_STATUS_COMMITTED;
 				result->commit_scn = outcome_scn;
@@ -413,20 +621,10 @@ cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key, ClusterTTStatusRes
 		return false;
 	}
 
-	result->status = e->status;
-	result->commit_scn = e->commit_scn;
-	result->status_epoch = e->status_epoch;
-	result->authoritative = true;
-	/*
-	 * PGRAC (spec-3.5): copy parent_key chain metadata only for
-	 * SUBCOMMITTED entries.  Bump dedicated SUBCOMMITTED hit counter.
-	 */
-	if (e->status == CLUSTER_TT_STATUS_SUBCOMMITTED && e->has_parent_key) {
-		result->has_parent_key = true;
-		result->parent_key = e->parent_key;
-	}
+	cluster_tt_status_fill_result_from_entry(e, result);
 
 	LWLockRelease(ClusterTTStatusLock);
+	cluster_tt_status_adg_standby_maybe_use_durable(key, current_epoch, result);
 	pg_atomic_fetch_add_u64(&ClusterTTStatusState->lookup_hit_count, 1);
 	if (result->status == CLUSTER_TT_STATUS_SUBCOMMITTED)
 		pg_atomic_fetch_add_u64(&ClusterTTStatusState->subcommitted_lookup_hit_count, 1);
@@ -476,6 +674,97 @@ cluster_tt_status_install_local(const ClusterTTStatusKey *key, ClusterTTStatus s
 
 	pg_atomic_fetch_add_u64(&ClusterTTStatusState->install_count, 1);
 	return true;
+}
+
+int
+cluster_tt_status_resolve_prepared_commit(TransactionId xid, SCN commit_scn)
+{
+	HASH_SEQ_STATUS seq;
+	ClusterTTOverlayEntry *e;
+	TimestampTz now;
+	bool adg_standby;
+	bool have_match = false;
+	uint16 match_origin = 0;
+	uint32 match_epoch = 0;
+	int resolved = 0;
+
+	if (!TransactionIdIsValid(xid) || !SCN_VALID(commit_scn))
+		return 0;
+	if (!cluster_enabled || cluster_node_id < 0 || ClusterTTStatusHTAB == NULL)
+		return 0;
+
+	now = GetCurrentTimestamp();
+	adg_standby = cluster_tt_status_adg_standby_overlay_enabled();
+
+	LWLockAcquire(ClusterTTStatusLock, LW_EXCLUSIVE);
+
+	if (adg_standby) {
+		bool ambiguous = false;
+
+		hash_seq_init(&seq, ClusterTTStatusHTAB);
+		while ((e = (ClusterTTOverlayEntry *)hash_seq_search(&seq)) != NULL) {
+			if (e->key.local_xid != xid)
+				continue;
+			if (!is_entry_fresh(e, now))
+				continue;
+			if (e->status != CLUSTER_TT_STATUS_IN_PROGRESS
+				&& e->status != CLUSTER_TT_STATUS_COMMITTED)
+				continue;
+			if (!have_match) {
+				have_match = true;
+				match_origin = e->key.origin_node_id;
+				match_epoch = e->key.cluster_epoch;
+				continue;
+			}
+			if (e->key.origin_node_id != match_origin || e->key.cluster_epoch != match_epoch) {
+				ambiguous = true;
+				break;
+			}
+		}
+		if (ambiguous) {
+			hash_seq_term(&seq);
+			LWLockRelease(ClusterTTStatusLock);
+			ereport(LOG,
+					(errmsg("cluster standby skipped ambiguous prepared-transaction TT overlay "
+							"resolve for xid %u",
+							xid),
+					 errdetail("multiple fresh origin/epoch groups matched the prepared xid; "
+							   "standby keeps the entries unresolved and readers fail closed")));
+			return 0;
+		}
+	}
+
+	hash_seq_init(&seq, ClusterTTStatusHTAB);
+	while ((e = (ClusterTTOverlayEntry *)hash_seq_search(&seq)) != NULL) {
+		if (e->key.local_xid != xid)
+			continue;
+		if (!is_entry_fresh(e, now))
+			continue;
+		if (adg_standby) {
+			if (!have_match || e->key.origin_node_id != match_origin
+				|| e->key.cluster_epoch != match_epoch)
+				continue;
+		} else {
+			if (e->key.origin_node_id != (uint16)cluster_node_id)
+				continue;
+		}
+		if (e->status != CLUSTER_TT_STATUS_IN_PROGRESS && e->status != CLUSTER_TT_STATUS_COMMITTED)
+			continue;
+
+		e->status = CLUSTER_TT_STATUS_COMMITTED;
+		e->commit_scn = commit_scn;
+		e->status_epoch = e->key.cluster_epoch;
+		e->install_ts = now;
+		e->has_parent_key = false;
+		memset(&e->parent_key, 0, sizeof(e->parent_key));
+		resolved++;
+	}
+	LWLockRelease(ClusterTTStatusLock);
+
+	if (resolved > 0)
+		pg_atomic_fetch_add_u64(&ClusterTTStatusState->recovery_overlay_rebuild_count,
+								(uint64)resolved);
+	return resolved;
 }
 
 /*
@@ -771,6 +1060,14 @@ cluster_tt_status_install_local(const ClusterTTStatusKey *key, ClusterTTStatus s
 	(void)status;
 	(void)commit_scn;
 	return false;
+}
+
+int
+cluster_tt_status_resolve_prepared_commit(TransactionId xid, SCN commit_scn)
+{
+	(void)xid;
+	(void)commit_scn;
+	return 0;
 }
 
 bool

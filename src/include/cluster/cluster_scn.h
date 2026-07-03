@@ -145,6 +145,16 @@ typedef int32 NodeId;
 #define SCN_MAX_LOCAL SCN_LOCAL_MASK
 #define SCN_NODE_ID_VALID(n) ((n) >= 0 && (n) <= SCN_MAX_VALID_NODE_ID)
 
+/*
+ * spec-6.4 ADG pending-commit registry capacity.
+ *
+ * The registry fences the precommit gap between commit_scn allocation and
+ * commit WAL record insertion.  It is intentionally small and fail-closed:
+ * overflow freezes ADG thread-safe-SCN publication rather than making an
+ * unsafe read floor claim.
+ */
+#define CLUSTER_SCN_ADG_PENDING_MAX 128
+
 
 /*
  * Wraparound watermark thresholds (spec-1.15 D7 stub).
@@ -212,6 +222,17 @@ extern int scn_total_cmp(SCN a, SCN b);
 extern int scn_recovery_cmp(SCN a, XLogRecPtr a_lsn, NodeId a_node, SCN b, XLogRecPtr b_lsn,
 							NodeId b_node);
 
+/*
+ * cluster_scn_time_predecessor -- return the greatest SCN strictly before
+ * `scn` in time order while preserving the origin node bits.
+ *
+ * ADG thread barriers use this for "safe below the earliest pending commit".
+ * The helper fails closed to InvalidScn when the input has no predecessor
+ * (local_scn == 0) or carries a reserved node id.  Callers must not derive the
+ * predecessor with raw integer arithmetic outside the SCN layer.
+ */
+extern SCN cluster_scn_time_predecessor(SCN scn);
+
 
 /*
  * Public advance / observe API (single-node; spec-1.15 + spec-1.16).
@@ -260,6 +281,21 @@ extern TimestampTz cluster_scn_last_advance_at(void);
  */
 extern SCN cluster_scn_advance_for_commit(void);
 extern SCN cluster_scn_advance_for_abort(void);
+
+/*
+ * spec-6.4 ADG pending-commit barrier helpers.
+ *
+ * cluster_scn_advance_for_commit() registers its returned SCN before exposing
+ * it to barrier computation.  Normal commit paths clear the SCN after the
+ * commit WAL record has been inserted.  Abort/ERROR cleanup calls the no-arg
+ * helper to clear this backend's current pending SCN.
+ */
+extern bool cluster_scn_pending_commit_clear(SCN commit_scn);
+extern bool cluster_scn_pending_commit_clear_my_pending(void);
+extern SCN cluster_scn_adg_pending_min_scn(void);
+extern SCN cluster_scn_adg_thread_safe_scn(void);
+extern uint64 cluster_scn_adg_pending_count(void);
+extern bool cluster_scn_adg_pending_overflowed(void);
 
 /* spec-1.16 stat accessors (LW_SHARED). */
 extern uint64 cluster_scn_commit_advance_count(void);

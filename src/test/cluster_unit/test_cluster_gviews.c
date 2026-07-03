@@ -35,6 +35,9 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_apply_master_election.h"
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_mrp.h"
 #include "cluster/cluster_views.h"
 
 /*
@@ -65,6 +68,14 @@
 #include "funcapi.h"
 #include "utils/builtins.h"
 #include "utils/wait_event.h" /* prototypes for pgstat_get_wait_event* */
+
+void
+ExceptionalCondition(const char *conditionName pg_attribute_unused(),
+					 const char *fileName pg_attribute_unused(),
+					 int lineNumber pg_attribute_unused())
+{
+	abort();
+}
 
 void
 InitMaterializedSRF(FunctionCallInfo fcinfo pg_attribute_unused(),
@@ -108,6 +119,33 @@ pgstat_get_wait_event_type(uint32 wait_event_info pg_attribute_unused())
  * definition with the same default value as the GUC.
  */
 int cluster_node_id = -1;
+int cluster_dg_role = CLUSTER_DG_ROLE_PRIMARY;
+int cluster_dg_mode = CLUSTER_DG_MODE_ASYNC;
+bool cluster_enable_adg = false;
+
+ClusterMrpSharedState *
+cluster_mrp_shared_state(void)
+{
+	return NULL;
+}
+
+const char *
+cluster_mrp_state_to_string(ClusterMrpState state pg_attribute_unused())
+{
+	return "disabled";
+}
+
+uint64
+cluster_apply_master_current_term(void)
+{
+	return 0;
+}
+
+uint32
+cluster_apply_master_current_node_id(void)
+{
+	return UINT32_MAX;
+}
 
 /*
  * Stage 0.28 stubs: cluster_views.c::cluster_get_stat_nodes references
@@ -164,13 +202,19 @@ UT_TEST(test_gcluster_srf_linkable)
 	UT_ASSERT_NOT_NULL((void *)cluster_get_gcluster_wait_events);
 }
 
+UT_TEST(test_gcluster_adg_srf_linkable)
+{
+	UT_ASSERT_NOT_NULL((void *)cluster_get_gcluster_adg);
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(2);
+	UT_PLAN(3);
 	UT_RUN(test_local_srf_still_linkable);
 	UT_RUN(test_gcluster_srf_linkable);
+	UT_RUN(test_gcluster_adg_srf_linkable);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

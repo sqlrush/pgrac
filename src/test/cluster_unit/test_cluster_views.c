@@ -38,6 +38,9 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_apply_master_election.h"
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_mrp.h"
 #include "cluster/cluster_views.h"
 #include "cluster/cluster_wait_events.h" /* PG_WAIT_CLUSTER_GES / ADG */
 #include "utils/wait_event.h"			 /* WAIT_EVENT_GES_ENQUEUE_ACQUIRE etc. */
@@ -72,6 +75,14 @@
  */
 #include "funcapi.h"
 #include "utils/builtins.h"
+
+void
+ExceptionalCondition(const char *conditionName pg_attribute_unused(),
+					 const char *fileName pg_attribute_unused(),
+					 int lineNumber pg_attribute_unused())
+{
+	abort();
+}
 
 void
 InitMaterializedSRF(FunctionCallInfo fcinfo pg_attribute_unused(),
@@ -117,6 +128,33 @@ pgstat_get_wait_event_type(uint32 wait_event_info pg_attribute_unused())
  * value as the GUC.  Mirrors the stub in test_cluster_gviews.c.
  */
 int cluster_node_id = -1;
+int cluster_dg_role = CLUSTER_DG_ROLE_PRIMARY;
+int cluster_dg_mode = CLUSTER_DG_MODE_ASYNC;
+bool cluster_enable_adg = false;
+
+ClusterMrpSharedState *
+cluster_mrp_shared_state(void)
+{
+	return NULL;
+}
+
+const char *
+cluster_mrp_state_to_string(ClusterMrpState state pg_attribute_unused())
+{
+	return "disabled";
+}
+
+uint64
+cluster_apply_master_current_term(void)
+{
+	return 0;
+}
+
+uint32
+cluster_apply_master_current_node_id(void)
+{
+	return UINT32_MAX;
+}
 
 /*
  * Stage 0.28 stubs: cluster_views.c::cluster_get_stat_nodes references
@@ -169,7 +207,7 @@ cluster_shmem_iter_regions(int *idx pg_attribute_unused(),
 UT_DEFINE_GLOBALS();
 
 
-UT_TEST(test_cluster_wait_events_count_is_112)
+UT_TEST(test_cluster_wait_events_count_is_116)
 {
 	/*
 	 * Cumulative registration roster: 61 prior + 3 added by spec-2.6 D11
@@ -194,19 +232,25 @@ UT_TEST(test_cluster_wait_events_count_is_112)
 	 * (ClusterThreadRecovery) + 1 added by spec-5.18 D12
 	 * (ClusterReconfigNodeRemoveCleanupWait) + 7 added by spec-6.0a D10
 	 * (block_device production wait events) + spec-6.1 D8 RDMA
-	 * send/recv/poll/connect/fallback events.
+	 * send/recv/poll/connect/fallback events + 4 added by spec-6.2 D10
+	 * (Smart Fusion commit/DBWR/origin durable brakes + terminal resolve).
 	 * If a future subsystem spec adds new cluster wait events, both the
 	 * enum in wait_event.h and CLUSTER_WAIT_EVENTS_COUNT must move
 	 * together, and this test number must be bumped in lockstep.
 	 */
-	/* spec-6.1 D8: RDMA wait events included -> 112. */
-	UT_ASSERT_EQ(CLUSTER_WAIT_EVENTS_COUNT, 112);
+	/* spec-6.2 D10: Smart Fusion authority wait events included -> 116. */
+	UT_ASSERT_EQ(CLUSTER_WAIT_EVENTS_COUNT, 116);
 }
 
 
 UT_TEST(test_srf_symbol_linkable)
 {
 	UT_ASSERT_NOT_NULL((void *)cluster_get_wait_events);
+}
+
+UT_TEST(test_adg_srf_symbol_linkable)
+{
+	UT_ASSERT_NOT_NULL((void *)cluster_get_adg_state);
 }
 
 
@@ -223,27 +267,28 @@ UT_TEST(test_first_event_is_ges_enqueue_acquire)
 }
 
 
-UT_TEST(test_adg_scn_sync_wait_in_adg_class)
+UT_TEST(test_adg_wal_receive_lag_in_adg_class)
 {
 	/*
-	 * Class-membership anchor: WAIT_EVENT_ADG_SCN_SYNC_WAIT must sit in
+	 * Class-membership anchor: WAIT_EVENT_ADG_WAL_RECEIVE_LAG must sit in
 	 * the ADG class regardless of where the enum tail moves over time.
 	 * (spec-2.5 D8 appended ClusterBgProcCssdMainLoop and spec-2.6 D11
 	 * appended 3 more entries past it, so this is no longer the last
 	 * enum value — it is still a stable anchor for the ADG class.)
 	 */
-	UT_ASSERT_EQ(((uint32)WAIT_EVENT_ADG_SCN_SYNC_WAIT) & 0xFF000000U, PG_WAIT_CLUSTER_ADG);
+	UT_ASSERT_EQ(((uint32)WAIT_EVENT_ADG_WAL_RECEIVE_LAG) & 0xFF000000U, PG_WAIT_CLUSTER_ADG);
 }
 
 
 int
 main(void)
 {
-	UT_PLAN(4);
-	UT_RUN(test_cluster_wait_events_count_is_112);
+	UT_PLAN(5);
+	UT_RUN(test_cluster_wait_events_count_is_116);
 	UT_RUN(test_srf_symbol_linkable);
+	UT_RUN(test_adg_srf_symbol_linkable);
 	UT_RUN(test_first_event_is_ges_enqueue_acquire);
-	UT_RUN(test_adg_scn_sync_wait_in_adg_class);
+	UT_RUN(test_adg_wal_receive_lag_in_adg_class);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

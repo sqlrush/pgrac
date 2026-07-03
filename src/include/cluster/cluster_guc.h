@@ -151,6 +151,28 @@ extern int cluster_recovery_merge_wait_timeout;
 /* spec-5.59 D1: cross-node profiling switch (default off, zero hot-path cost). */
 extern bool cluster_xnode_profile_enabled;
 
+/* spec-6.4: ADG physical standby / read-only service configuration. */
+#define CLUSTER_DG_ROLE_PRIMARY 0
+#define CLUSTER_DG_ROLE_STANDBY 1
+
+#define CLUSTER_DG_MODE_ASYNC 0
+#define CLUSTER_DG_MODE_SYNC 1
+#define CLUSTER_DG_MODE_MAX_AVAILABILITY 2
+
+extern int cluster_dg_role;
+extern int cluster_dg_mode;
+extern bool cluster_enable_adg;
+extern bool cluster_apply_master_election;
+extern char *cluster_adg_rfs_conninfos;
+extern int cluster_adg_primary_thread_count;
+extern int cluster_adg_lag_threshold_sec;
+extern int cluster_max_standby_delay;
+extern int cluster_apply_master_switch_drain_ms;
+extern int cluster_adg_lease_takeover_grace_ms;
+extern int cluster_adg_barrier_interval_ms;
+extern int cluster_wal_sender_timeout_sec;
+extern int cluster_wal_receiver_timeout_sec;
+
 
 /*
  * cluster_injection_points -- comma-separated names to auto-arm at startup.
@@ -452,7 +474,7 @@ extern int cluster_cssd_dead_deadband_factor;
  *   cluster.voting_disks               -- CSV path list (default empty)
  *   cluster.quorum_poll_interval_ms    -- 500..30000, default 2000
  *   cluster.voting_disk_io_timeout_ms  -- 500..60000, default 5000
- *   cluster.voting_disk_size_bytes     -- 4096..1048576, default 131072
+ *   cluster.voting_disk_size_bytes     -- 4096..1048576, default 262144
  *
  * All PGC_POSTMASTER.  Per Q4 v0.2 lease semantics, backend
  * in_quorum() check uses 2 × quorum_poll_interval_ms as the lease
@@ -611,6 +633,20 @@ extern bool cluster_tt_durable_lookup;
 /* spec-4.8 D1: resolve crash-left ACTIVE TT slots to ABORTED at startup
  * (default on; PGC_POSTMASTER). */
 extern bool cluster_tt_recovery_resolve_active;
+typedef enum ClusterCfDelayedCleanoutMode {
+	CLUSTER_CF_DELAYED_CLEANOUT_OFF = 0,
+	CLUSTER_CF_DELAYED_CLEANOUT_READER,
+	CLUSTER_CF_DELAYED_CLEANOUT_EAGER
+} ClusterCfDelayedCleanoutMode;
+
+/* spec-6.2 Cache Fusion terminal authority + Smart Fusion. */
+extern bool cluster_cf_terminal_authority;
+extern int cluster_cf_delayed_cleanout;
+extern bool cluster_smart_fusion;
+extern int cluster_smart_fusion_tier_min;
+extern int cluster_smart_fusion_commit_brake_timeout_ms;
+extern int cluster_smart_fusion_origin_durable_gossip_ms;
+extern bool cluster_smart_fusion_failclosed_requested(void);
 
 
 /*

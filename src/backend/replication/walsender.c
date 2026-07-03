@@ -95,6 +95,12 @@
 #include "utils/timeout.h"
 #include "utils/timestamp.h"
 
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_lns.h"
+#include "cluster/cluster_wal_thread.h"
+#endif
+
 /* Minimum interval used by walsender for stats flushes, in ms */
 #define WALSENDER_STATS_FLUSH_INTERVAL         1000
 
@@ -258,6 +264,10 @@ static void StartLogicalReplication(StartReplicationCmd *cmd);
 static void ProcessStandbyMessage(void);
 static void ProcessStandbyReplyMessage(void);
 static void ProcessStandbyHSFeedbackMessage(void);
+#ifdef USE_PGRAC_CLUSTER
+static ClusterLnsTrailerStatus ProcessStandbyAdgReplyTrailer(ClusterLnsReplyState *state);
+#endif
+static int WalSndEffectiveTimeout(void);
 static void ProcessRepliesIfAny(void);
 static void ProcessPendingWrites(void);
 static void WalSndKeepalive(bool requestReply, XLogRecPtr writePtr);
@@ -276,6 +286,14 @@ static bool TransactionIdInRecentPast(TransactionId xid, uint32 epoch);
 
 static void WalSndSegmentOpen(XLogReaderState *state, XLogSegNo nextSegNo,
 							  TimeLineID *tli_p);
+
+#ifdef USE_PGRAC_CLUSTER
+static void WalSndValidateAdgThreadBinding(StartReplicationCmd *cmd);
+static void WalSndAdjustAdgThreadStartpoint(StartReplicationCmd *cmd,
+											XLogRecPtr flushPtr,
+											TimeLineID tli);
+static void WalSndPublishAdgSendThread(uint16 thread_id);
+#endif
 
 
 /* Initialize walsender process before entering the main command loop */
@@ -677,6 +695,154 @@ SendTimeLineHistory(TimeLineHistoryCmd *cmd)
 	pq_endmessage(&buf);
 }
 
+#ifdef USE_PGRAC_CLUSTER
+static void
+WalSndPublishAdgSendThread(uint16 thread_id)
+{
+	WalSnd	   *walsnd = MyWalSnd;
+
+	if (walsnd == NULL)
+		return;
+
+	SpinLockAcquire(&walsnd->mutex);
+	walsnd->adg_send_thread_id = thread_id;
+	walsnd->adg_send_reserved = 0;
+	SpinLockRelease(&walsnd->mutex);
+}
+
+static void
+WalSndValidateAdgThreadBinding(StartReplicationCmd *cmd)
+{
+	uint16		own_thread;
+
+	if (cmd->adg_thread_id == 0)
+	{
+		WalSndPublishAdgSendThread(0);
+		return;
+	}
+
+	if (cmd->adg_thread_id < XLP_THREAD_ID_FIRST_REAL ||
+		cmd->adg_thread_id > CLUSTER_WAL_THREAD_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROTOCOL_VIOLATION),
+				 errmsg("invalid ADG thread id %u",
+						(unsigned) cmd->adg_thread_id)));
+
+	if (!cluster_enabled || !cluster_enable_adg ||
+		cluster_dg_role != CLUSTER_DG_ROLE_PRIMARY)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("ADG thread-bound WAL streaming requires an ADG primary")));
+
+	own_thread = cluster_wal_thread_id();
+	if (own_thread != cmd->adg_thread_id)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("ADG thread-bound WAL streaming requested thread %u from primary thread %u",
+						(unsigned) cmd->adg_thread_id, (unsigned) own_thread)));
+
+	WalSndPublishAdgSendThread(cmd->adg_thread_id);
+}
+
+static void
+WalSndAdjustAdgThreadStartpoint(StartReplicationCmd *cmd, XLogRecPtr flushPtr,
+								TimeLineID tli)
+{
+	XLogRecPtr scanptr;
+	XLogRecPtr original_startpoint;
+
+	if (cmd->adg_thread_id == 0)
+		return;
+
+	original_startpoint = cmd->startpoint;
+	if (XLogRecPtrIsInvalid(cmd->startpoint))
+	{
+		/*
+		 * spec-6.4 P0-3: an invalid startpoint is the standby's explicit
+		 * "earliest available" request -- it has no same-space restart
+		 * source for this thread and must not borrow one from another
+		 * thread's LSN space.  Scan forward from the oldest segment file
+		 * actually present in this primary's WAL directory (a basebackup-
+		 * born instance starts well past segment 1 without ever having
+		 * "removed" anything); re-streaming already-applied WAL is
+		 * idempotent on the standby, whereas guessing high loses records.
+		 */
+		DIR		   *dir;
+		struct dirent *de;
+		XLogSegNo	oldest = 0;
+
+		dir = AllocateDir(XLOGDIR);
+		while ((de = ReadDirExtended(dir, XLOGDIR, DEBUG1)) != NULL)
+		{
+			TimeLineID	ftli;
+			XLogSegNo	fsegno;
+
+			if (!IsXLogFileName(de->d_name))
+				continue;
+			XLogFromFileName(de->d_name, &ftli, &fsegno, wal_segment_size);
+			if (ftli != tli)
+				continue;
+			if (oldest == 0 || fsegno < oldest)
+				oldest = fsegno;
+		}
+		if (dir != NULL)
+			FreeDir(dir);
+		if (oldest <= XLogGetLastRemovedSegno())
+			oldest = XLogGetLastRemovedSegno() + 1;
+		if (oldest == 0)
+		{
+			/* no WAL on this timeline at all: start at the flush point */
+			cmd->startpoint = flushPtr - (flushPtr % XLOG_BLCKSZ);
+			return;
+		}
+		XLogSegNoOffsetToRecPtr(oldest, 0, wal_segment_size, scanptr);
+	}
+	else if (cmd->startpoint >= flushPtr)
+		return;
+	else
+		scanptr = cmd->startpoint - (cmd->startpoint % XLOG_BLCKSZ);
+
+	while (scanptr + sizeof(XLogPageHeaderData) <= flushPtr)
+	{
+		WALReadError errinfo;
+		XLogPageHeaderData hdr;
+
+		if (!WALRead(xlogreader, (char *) &hdr, scanptr, sizeof(hdr), tli,
+					 &errinfo))
+			WALReadRaiseError(&errinfo);
+
+		if (hdr.xlp_magic == XLOG_PAGE_MAGIC &&
+			cluster_xlog_validate_page_header(hdr.xlp_thread_id,
+											  hdr.xlp_cluster_flags,
+											  XLP_THREAD_ID_INVALID) &&
+			(hdr.xlp_thread_id == XLP_THREAD_ID_LEGACY ||
+			 hdr.xlp_thread_id == cmd->adg_thread_id))
+		{
+			if (scanptr > cmd->startpoint)
+			{
+				cmd->startpoint = scanptr;
+				ereport(LOG,
+						(errmsg("ADG thread-bound WAL streaming advanced startpoint for thread %u from %X/%X to %X/%X",
+								(unsigned) cmd->adg_thread_id,
+								LSN_FORMAT_ARGS(original_startpoint),
+								LSN_FORMAT_ARGS(cmd->startpoint))));
+			}
+			return;
+		}
+
+		scanptr += XLOG_BLCKSZ;
+	}
+
+	/*
+	 * Nothing matched below flushPtr.  For an earliest-available request
+	 * this means no WAL for the thread exists yet; stream from the flush
+	 * point so the standby picks up the thread's first future page.
+	 */
+	if (XLogRecPtrIsInvalid(cmd->startpoint))
+		cmd->startpoint = flushPtr - (flushPtr % XLOG_BLCKSZ);
+}
+#endif
+
 /*
  * Handle START_REPLICATION command.
  *
@@ -702,6 +868,15 @@ StartReplication(StartReplicationCmd *cmd)
 				(errcode(ERRCODE_OUT_OF_MEMORY),
 				 errmsg("out of memory"),
 				 errdetail("Failed while allocating a WAL reading processor.")));
+
+#ifdef USE_PGRAC_CLUSTER
+	WalSndValidateAdgThreadBinding(cmd);
+#else
+	if (cmd->adg_thread_id != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("ADG thread-bound WAL streaming requires a cluster-enabled build")));
+#endif
 
 	/*
 	 * We assume here that we're logging enough information in the WAL for
@@ -828,6 +1003,11 @@ StartReplication(StartReplicationCmd *cmd)
 		 * Don't allow a request to stream from a future point in WAL that
 		 * hasn't been flushed to disk in this server yet.
 		 */
+#ifdef USE_PGRAC_CLUSTER
+		WalSndAdjustAdgThreadStartpoint(cmd, FlushPtr, sendTimeLine);
+		if (cmd->adg_thread_id != 0)
+			xlogreader->cluster_expected_thread_id = cmd->adg_thread_id;
+#endif
 		if (FlushPtr < cmd->startpoint)
 		{
 			ereport(ERROR,
@@ -1393,6 +1573,7 @@ WalSndWriteData(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid,
 				bool last_write)
 {
 	TimestampTz now;
+	int			effective_timeout;
 
 	/*
 	 * Fill the send timestamp last, so that it is taken as late as possible.
@@ -1415,8 +1596,10 @@ WalSndWriteData(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid,
 		WalSndShutdown();
 
 	/* Try taking fast path unless we get too close to walsender timeout. */
-	if (now < TimestampTzPlusMilliseconds(last_reply_timestamp,
-										  wal_sender_timeout / 2) &&
+	effective_timeout = WalSndEffectiveTimeout();
+	if (effective_timeout > 0 &&
+		now < TimestampTzPlusMilliseconds(last_reply_timestamp,
+										  effective_timeout / 2) &&
 		!pq_is_send_pending())
 	{
 		return;
@@ -1492,6 +1675,7 @@ WalSndUpdateProgress(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId 
 	TimestampTz now = GetCurrentTimestamp();
 	bool		pending_writes = false;
 	bool		end_xact = ctx->end_xact;
+	int			effective_timeout = WalSndEffectiveTimeout();
 
 	/*
 	 * Track lag no more than once per WALSND_LOGICAL_LAG_TRACK_INTERVAL_MS to
@@ -1539,9 +1723,9 @@ WalSndUpdateProgress(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId 
 	 * for large transactions where we don't send any changes to the
 	 * downstream and the receiver can timeout due to that.
 	 */
-	if (pending_writes || (!end_xact &&
+	if (pending_writes || (!end_xact && effective_timeout > 0 && last_reply_timestamp > 0 &&
 						   now >= TimestampTzPlusMilliseconds(last_reply_timestamp,
-															  wal_sender_timeout / 2)))
+															  effective_timeout / 2)))
 		ProcessPendingWrites();
 }
 
@@ -2095,6 +2279,14 @@ PhysicalConfirmReceivedLocation(XLogRecPtr lsn)
 /*
  * Regular reply from standby advising of WAL locations on standby server.
  */
+#ifdef USE_PGRAC_CLUSTER
+static ClusterLnsTrailerStatus
+ProcessStandbyAdgReplyTrailer(ClusterLnsReplyState *state)
+{
+	return cluster_lns_parse_adg_reply_trailer(&reply_message, state);
+}
+#endif
+
 static void
 ProcessStandbyReplyMessage(void)
 {
@@ -2108,6 +2300,10 @@ ProcessStandbyReplyMessage(void)
 	bool		clearLagTimes;
 	TimestampTz now;
 	TimestampTz replyTime;
+#ifdef USE_PGRAC_CLUSTER
+	ClusterLnsTrailerStatus adg_trailer_status;
+	ClusterLnsReplyState adg_reply_state;
+#endif
 
 	static bool fullyAppliedLastTime = false;
 
@@ -2117,6 +2313,17 @@ ProcessStandbyReplyMessage(void)
 	applyPtr = pq_getmsgint64(&reply_message);
 	replyTime = pq_getmsgint64(&reply_message);
 	replyRequested = pq_getmsgbyte(&reply_message);
+#ifdef USE_PGRAC_CLUSTER
+	memset(&adg_reply_state, 0, sizeof(adg_reply_state));
+	adg_trailer_status = ProcessStandbyAdgReplyTrailer(&adg_reply_state);
+	if (adg_trailer_status == CLUSTER_LNS_TRAILER_INVALID)
+	{
+		ereport(COMMERROR,
+				(errcode(ERRCODE_PROTOCOL_VIOLATION),
+				 errmsg("invalid ADG standby reply trailer")));
+		proc_exit(0);
+	}
+#endif
 
 	if (message_level_is_interesting(DEBUG2))
 	{
@@ -2181,6 +2388,16 @@ ProcessStandbyReplyMessage(void)
 		if (applyLag != -1 || clearLagTimes)
 			walsnd->applyLag = applyLag;
 		walsnd->replyTime = replyTime;
+#ifdef USE_PGRAC_CLUSTER
+		if (adg_trailer_status == CLUSTER_LNS_TRAILER_VALID)
+		{
+			walsnd->adg_thread_id = adg_reply_state.thread_id;
+			walsnd->adg_reply_version = adg_reply_state.reply_version;
+			walsnd->adg_reply_reserved = 0;
+			walsnd->adg_standby_consistent_scn = (uint64)adg_reply_state.standby_consistent_scn;
+			walsnd->adg_apply_master_term = adg_reply_state.apply_master_term;
+		}
+#endif
 		SpinLockRelease(&walsnd->mutex);
 	}
 
@@ -2408,8 +2625,9 @@ static long
 WalSndComputeSleeptime(TimestampTz now)
 {
 	long		sleeptime = 10000;	/* 10 s */
+	int			effective_timeout = WalSndEffectiveTimeout();
 
-	if (wal_sender_timeout > 0 && last_reply_timestamp > 0)
+	if (effective_timeout > 0 && last_reply_timestamp > 0)
 	{
 		TimestampTz wakeup_time;
 
@@ -2418,7 +2636,7 @@ WalSndComputeSleeptime(TimestampTz now)
 		 * reached.
 		 */
 		wakeup_time = TimestampTzPlusMilliseconds(last_reply_timestamp,
-												  wal_sender_timeout);
+												  effective_timeout);
 
 		/*
 		 * If no ping has been sent yet, wakeup when it's time to do so.
@@ -2427,13 +2645,33 @@ WalSndComputeSleeptime(TimestampTz now)
 		 */
 		if (!waiting_for_ping_response)
 			wakeup_time = TimestampTzPlusMilliseconds(last_reply_timestamp,
-													  wal_sender_timeout / 2);
+													  effective_timeout / 2);
 
 		/* Compute relative time until wakeup. */
 		sleeptime = TimestampDifferenceMilliseconds(now, wakeup_time);
 	}
 
 	return sleeptime;
+}
+
+static int
+WalSndEffectiveTimeout(void)
+{
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_enabled && cluster_enable_adg && cluster_dg_role == CLUSTER_DG_ROLE_PRIMARY
+		&& cluster_wal_sender_timeout_sec > 0 && MyWalSnd != NULL)
+	{
+		uint16		adg_send_thread_id;
+
+		SpinLockAcquire(&MyWalSnd->mutex);
+		adg_send_thread_id = MyWalSnd->adg_send_thread_id;
+		SpinLockRelease(&MyWalSnd->mutex);
+		if (adg_send_thread_id >= XLP_THREAD_ID_FIRST_REAL
+			&& adg_send_thread_id <= CLUSTER_WAL_THREAD_MAX)
+			return cluster_wal_sender_timeout_sec * 1000;
+	}
+#endif
+	return wal_sender_timeout;
 }
 
 /*
@@ -2452,15 +2690,16 @@ static void
 WalSndCheckTimeOut(void)
 {
 	TimestampTz timeout;
+	int			effective_timeout = WalSndEffectiveTimeout();
 
 	/* don't bail out if we're doing something that doesn't require timeouts */
 	if (last_reply_timestamp <= 0)
 		return;
 
 	timeout = TimestampTzPlusMilliseconds(last_reply_timestamp,
-										  wal_sender_timeout);
+										  effective_timeout);
 
-	if (wal_sender_timeout > 0 && last_processing >= timeout)
+	if (effective_timeout > 0 && last_processing >= timeout)
 	{
 		/*
 		 * Since typically expiration of replication timeout means
@@ -2661,6 +2900,13 @@ InitWalSenderSlot(void)
 			walsnd->sync_standby_priority = 0;
 			walsnd->latch = &MyProc->procLatch;
 			walsnd->replyTime = 0;
+			walsnd->adg_thread_id = 0;
+			walsnd->adg_reply_version = 0;
+			walsnd->adg_reply_reserved = 0;
+			walsnd->adg_standby_consistent_scn = 0;
+			walsnd->adg_apply_master_term = 0;
+			walsnd->adg_send_thread_id = 0;
+			walsnd->adg_send_reserved = 0;
 
 			/*
 			 * The kind assignment is done here and not in StartReplication()
@@ -3774,12 +4020,13 @@ static void
 WalSndKeepaliveIfNecessary(void)
 {
 	TimestampTz ping_time;
+	int			effective_timeout = WalSndEffectiveTimeout();
 
 	/*
 	 * Don't send keepalive messages if timeouts are globally disabled or
 	 * we're doing something not partaking in timeouts.
 	 */
-	if (wal_sender_timeout <= 0 || last_reply_timestamp <= 0)
+	if (effective_timeout <= 0 || last_reply_timestamp <= 0)
 		return;
 
 	if (waiting_for_ping_response)
@@ -3791,7 +4038,7 @@ WalSndKeepaliveIfNecessary(void)
 	 * an immediate reply.
 	 */
 	ping_time = TimestampTzPlusMilliseconds(last_reply_timestamp,
-											wal_sender_timeout / 2);
+											effective_timeout / 2);
 	if (last_processing >= ping_time)
 	{
 		WalSndKeepalive(true, InvalidXLogRecPtr);

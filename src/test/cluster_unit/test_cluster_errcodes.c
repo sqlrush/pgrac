@@ -21,7 +21,7 @@
  *
  *	  Why compile-time only:
  *
- *	  Stage 0.12 wires no ereport() call sites; the 45 errcodes are
+ *	  Stage 0.12 wires no ereport() call sites; the registered errcodes are
  *	  identifier registrations.  Runtime invocation of plpgsql-friendly
  *	  names (cluster_*) is validated separately by cluster_tap
  *	  t/006_errcodes.pl, which raises exceptions in a real PG instance
@@ -131,7 +131,7 @@ UT_TEST(test_class_55_first_last)
 UT_TEST(test_class_57_first_last)
 {
 	UT_ASSERT_EQ(ERRCODE_CLUSTER_FENCE_TRIGGERED, MAKE_SQLSTATE('5', '7', 'R', '0', '2'));
-	UT_ASSERT_EQ(ERRCODE_CLUSTER_ADG_APPLY_LAG_EXCESSIVE, MAKE_SQLSTATE('5', '7', 'R', '0', '6'));
+	UT_ASSERT_EQ(ERRCODE_CLUSTER_ADG_STANDBY_UNRESOLVABLE, MAKE_SQLSTATE('5', '7', 'R', '0', '7'));
 }
 
 UT_TEST(test_class_58_first_last)
@@ -212,6 +212,7 @@ UT_TEST(test_all_use_r_subclass)
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_PCM_STATE_INVALID, 3), 'R');
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS, 3), 'R');
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_RESTORE_POINT_DRAIN_TIMEOUT, 3), 'R');
+	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_ADG_STANDBY_UNRESOLVABLE, 3), 'R');
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_SHARED_STORAGE_FAILED, 3), 'R');
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_STORAGE_FENCE_UNAVAILABLE, 3), 'R');
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_SNAPSHOT_TOO_OLD, 3), 'R');
@@ -250,15 +251,19 @@ UT_TEST(test_per_class_anchors)
 {
 	/* Class 08 has 5 entries: 08R01..08R05 */
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_PROTOCOL_VERSION_MISMATCH, 5), '5');
-	/* Class 40 has 4 entries: 40R01..40R04 */
-	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_PI_INVALIDATED_RETRY, 5), '4');
+	/* Class 40 has 5 entries: 40R01..40R05 */
+	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_SMART_FUSION_RETRY, 5), '5');
 	/* Class 53 spans base 53R01..53R07 plus later pgrac bands up to 53RAF. */
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_RESTORE_POINT_DRAIN_TIMEOUT, 4), 'A');
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_RESTORE_POINT_DRAIN_TIMEOUT, 5), 'F');
+	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_CF_TERMINAL_UNRESOLVED, 4), '9');
+	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_CF_TERMINAL_UNRESOLVED, 5), 'O');
+	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_SMART_FUSION_DEP_LOST, 4), '9');
+	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_SMART_FUSION_DEP_LOST, 5), 'P');
 	/* Class 55 has 6 entries: 55R01..55R06 */
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_BLOCK_MISSING_TEMPORARY, 5), '6');
-	/* Class 57 keeps operator-intervention cluster codes 57R02..57R06. */
-	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_ADG_APPLY_LAG_EXCESSIVE, 5), '6');
+	/* Class 57 keeps operator-intervention cluster codes 57R02..57R07. */
+	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_ADG_STANDBY_UNRESOLVABLE, 5), '7');
 	/* Class 72 has 2 entries: 72R01..72R02 */
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_SNAPSHOT_UNAVAILABLE, 5), '2');
 	/* Class XX has 3 entries: XXR01..XXR03 */

@@ -32,9 +32,12 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "access/htup_details.h"
+#include "access/transam.h"
+#include "access/xlog.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"			/* cluster_node_id, subtrans depth */
 #include "cluster/cluster_itl.h"			/* get_tt_ref / lock ref / multixact origin */
 #include "cluster/cluster_itl_slot.h"		/* CLUSTER_ITL_SLOT_UNALLOCATED */
@@ -97,6 +100,27 @@ resolve_from_remote_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref,
 	out->status = CLUSTER_TT_STATUS_UNKNOWN;
 	out->commit_scn = InvalidScn;
 
+	/*
+	 * ADG physical standby replay is not the generic cross-node raw-xid case:
+	 * pg_xact and the heap page both come from the same primary WAL stream.
+	 * If the replayed ITL slot already carries a committed status plus a real
+	 * commit_scn, CLOG-confirm it and use that exact page evidence.  This keeps
+	 * prepared/in-progress xids fail-closed and leaves ordinary remote-origin
+	 * reads on the overlay/durable-TT path below.
+	 *
+	 * spec-6.4 F2: the slot must still be bound to this tuple's xid.  A
+	 * recycled ITL slot carries some OTHER transaction's commit_scn, and
+	 * returning it here would hand the caller a false SCN for raw_xid.
+	 */
+	if (cluster_enable_adg && cluster_dg_role == CLUSTER_DG_ROLE_STANDBY && RecoveryInProgress()
+		&& ref->local_xid == raw_xid && ref->has_cached_status && SCN_VALID(ref->cached_commit_scn)
+		&& TransactionIdDidCommit(raw_xid)) {
+		out->status = CLUSTER_TT_STATUS_COMMITTED;
+		out->commit_scn = ref->cached_commit_scn;
+		cluster_xp_end(&xp_scope); /* PGRAC: spec-5.59 D3 profiling */
+		return;
+	}
+
 	memset(&key, 0, sizeof(key));
 	key.origin_node_id = ref->origin_node_id;
 	key.undo_segment_id = ref->undo_segment_id;
@@ -156,6 +180,30 @@ classify_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRecPtr 
 	if (ref->tt_slot_id == 0) {
 		/* spec-3.1 placeholder slot: not authoritative evidence. */
 		out->evidence = CLUSTER_VIS_EVIDENCE_NONE;
+		return;
+	}
+
+	/*
+	 * On an ADG standby the replayed page's ITL slot can carry the commit
+	 * evidence before the overlay / durable-TT paths can resolve the xid.
+	 * The page itself is the authority, but only for an exact, terminal ITL
+	 * binding: the slot must still belong to this tuple-side xid and must
+	 * carry a committed cached SCN.  ACTIVE, ABORTED, invalid-SCN, and
+	 * recycled slots continue through the ordinary local/remote fail-closed
+	 * paths below.
+	 *
+	 * spec-6.4 F3: additionally cross-check the local CLOG (replayed from
+	 * the same WAL stream) instead of trusting page provenance alone.
+	 * Reads only run on the Apply Master, whose pg_xact is current through
+	 * its read point, so a committed xid confirms here; anything else falls
+	 * through to the fail-closed paths.
+	 */
+	if (cluster_enable_adg && cluster_dg_role == CLUSTER_DG_ROLE_STANDBY && RecoveryInProgress()
+		&& ref->local_xid == raw_xid && ref->has_cached_status && SCN_VALID(ref->cached_commit_scn)
+		&& TransactionIdDidCommit(raw_xid)) {
+		out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
+		out->status = CLUSTER_TT_STATUS_COMMITTED;
+		out->commit_scn = ref->cached_commit_scn;
 		return;
 	}
 
@@ -231,8 +279,12 @@ classify_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRecPtr 
 				return;
 			}
 
-			switch (
-				cluster_remote_outcome_durable_checked((int)ref->origin_node_id, raw_xid, &scn)) {
+			switch (cluster_cf_terminal_authority
+						? cluster_remote_outcome_terminal_authorized(
+							  (int)ref->origin_node_id, raw_xid, ref->cluster_epoch,
+							  cluster_epoch_get_current(), false, true, &scn)
+						: cluster_remote_outcome_durable_checked((int)ref->origin_node_id, raw_xid,
+																 &scn)) {
 			case CLUSTER_REMOTE_XACT_COMMITTED:
 				out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
 				out->status = CLUSTER_TT_STATUS_COMMITTED;

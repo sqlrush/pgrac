@@ -15,7 +15,8 @@
  *	  U3  cluster_tt_durable_slot_match -- exact / wrong-xid / UNUSED /
  *	      invalid-scn (xid-match; recycle stamps a new owner xid)
  *	  U4  cluster_tt_slot_durable_lookup -- match / wrong-xid / unused /
- *	      read-fail (mocked smgr)
+ *	      read-fail; stable CLOG-window lookup success / torn-read fail-closed /
+ *	      uncommitted fail-closed (mocked smgr)
  *	  U5  cluster_tt_slot_durable_lookup_by_xid -- 0 / 1 / >1 matches (mocked
  *	      block); ambiguity fail-closed (规则 8.A)
  *
@@ -118,6 +119,9 @@ int cluster_node_id = 0;
 
 static TTSlot g_canned_slot;	  /* returned by read_header_bytes */
 static bool g_read_hdr_ok = true; /* read_header_bytes success flag */
+static TTSlot g_canned_slot_second;
+static bool g_read_hdr_second_enabled = false;
+static int g_read_hdr_calls = 0;
 
 static char g_canned_block[BLCKSZ];		  /* returned by read_block for segment 1 */
 static uint32 g_canned_block_segment = 1; /* which segment_id the canned block answers */
@@ -193,10 +197,14 @@ cluster_undo_smgr_read_header_bytes(uint32 segment_id pg_attribute_unused(),
 									uint8 owner_instance pg_attribute_unused(), uint32 offset,
 									char *buf, uint32 len)
 {
+	g_read_hdr_calls++;
 	if (!g_read_hdr_ok || buf == NULL || len != sizeof(TTSlot))
 		return false;
 	(void)offset;
-	memcpy(buf, &g_canned_slot, sizeof(TTSlot));
+	memcpy(buf,
+		   (g_read_hdr_second_enabled && g_read_hdr_calls == 2) ? &g_canned_slot_second
+																: &g_canned_slot,
+		   sizeof(TTSlot));
 	return true;
 }
 
@@ -250,6 +258,34 @@ seed_block_slot(int i, uint8 status, TransactionId xid, SCN commit_scn)
 	hdr->tt_slots[i].status = status;
 	hdr->tt_slots[i].xid = xid;
 	hdr->tt_slots[i].commit_scn = commit_scn;
+}
+
+static bool g_commit_check_result = true;
+static int g_commit_check_calls = 0;
+static int g_commit_check_read_calls_seen = 0;
+static TransactionId g_commit_check_xid = InvalidTransactionId;
+
+static bool
+mock_xid_committed(TransactionId xid)
+{
+	g_commit_check_calls++;
+	g_commit_check_xid = xid;
+	g_commit_check_read_calls_seen = g_read_hdr_calls;
+	return g_commit_check_result;
+}
+
+static void
+reset_header_read_mock(void)
+{
+	g_read_hdr_ok = true;
+	g_read_hdr_second_enabled = false;
+	g_read_hdr_calls = 0;
+	memset(&g_canned_slot, 0, sizeof(g_canned_slot));
+	memset(&g_canned_slot_second, 0, sizeof(g_canned_slot_second));
+	g_commit_check_result = true;
+	g_commit_check_calls = 0;
+	g_commit_check_read_calls_seen = 0;
+	g_commit_check_xid = InvalidTransactionId;
 }
 
 
@@ -391,6 +427,61 @@ UT_TEST(test_lookup_read_fail_miss)
 
 	g_read_hdr_ok = false; /* segment absent / I/O error */
 	UT_ASSERT_EQ((int)cluster_tt_slot_durable_lookup(1, 0, 100, CLUSTER_TT_WRAP_ANY, &got), 0);
+}
+UT_TEST(test_lookup_committed_stable_success)
+{
+	SCN got = InvalidScn;
+
+	reset_header_read_mock();
+	g_canned_slot.status = TT_SLOT_COMMITTED;
+	g_canned_slot.xid = 100;
+	g_canned_slot.wrap = 5;
+	g_canned_slot.commit_scn = scn_encode(1, 42);
+
+	UT_ASSERT_EQ((int)cluster_tt_slot_durable_lookup_committed_stable(
+					 1, 0, 100, CLUSTER_TT_WRAP_ANY, mock_xid_committed, &got),
+				 1);
+	UT_ASSERT_EQ((int)(scn_local(got)), 42);
+	UT_ASSERT_EQ(g_read_hdr_calls, 2);
+	UT_ASSERT_EQ(g_commit_check_calls, 1);
+	UT_ASSERT_EQ((int)g_commit_check_xid, 100);
+	UT_ASSERT_EQ(g_commit_check_read_calls_seen, 1);
+}
+UT_TEST(test_lookup_committed_stable_torn_read_failclosed)
+{
+	SCN got = InvalidScn;
+
+	reset_header_read_mock();
+	g_canned_slot.status = TT_SLOT_COMMITTED;
+	g_canned_slot.xid = 100;
+	g_canned_slot.wrap = 5;
+	g_canned_slot.commit_scn = scn_encode(1, 42);
+	g_canned_slot_second = g_canned_slot;
+	g_canned_slot_second.commit_scn = scn_encode(1, 17);
+	g_read_hdr_second_enabled = true;
+
+	UT_ASSERT_EQ((int)cluster_tt_slot_durable_lookup_committed_stable(
+					 1, 0, 100, CLUSTER_TT_WRAP_ANY, mock_xid_committed, &got),
+				 0);
+	UT_ASSERT_EQ(g_read_hdr_calls, 2);
+	UT_ASSERT_EQ(g_commit_check_calls, 1);
+}
+UT_TEST(test_lookup_committed_stable_uncommitted_failclosed)
+{
+	SCN got = InvalidScn;
+
+	reset_header_read_mock();
+	g_canned_slot.status = TT_SLOT_COMMITTED;
+	g_canned_slot.xid = 100;
+	g_canned_slot.wrap = 5;
+	g_canned_slot.commit_scn = scn_encode(1, 42);
+	g_commit_check_result = false;
+
+	UT_ASSERT_EQ((int)cluster_tt_slot_durable_lookup_committed_stable(
+					 1, 0, 100, CLUSTER_TT_WRAP_ANY, mock_xid_committed, &got),
+				 0);
+	UT_ASSERT_EQ(g_read_hdr_calls, 1);
+	UT_ASSERT_EQ(g_commit_check_calls, 1);
 }
 
 
@@ -894,7 +985,7 @@ UT_TEST(test_revert_delete_identity_mismatch_failclosed)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(57);
+	UT_PLAN(60);
 
 	UT_RUN(test_layout_sizes);
 
@@ -914,6 +1005,9 @@ main(int argc, char **argv)
 	UT_RUN(test_lookup_wrong_xid_miss);
 	UT_RUN(test_lookup_unused_miss);
 	UT_RUN(test_lookup_read_fail_miss);
+	UT_RUN(test_lookup_committed_stable_success);
+	UT_RUN(test_lookup_committed_stable_torn_read_failclosed);
+	UT_RUN(test_lookup_committed_stable_uncommitted_failclosed);
 
 	UT_RUN(test_by_xid_zero_match_miss);
 	UT_RUN(test_by_xid_one_match);

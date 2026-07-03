@@ -240,6 +240,18 @@ GetCurrentTimestamp(void)
 
 #include <stdarg.h>
 
+int
+pg_snprintf(char *str, size_t count, const char *fmt, ...)
+{
+	int ret;
+	va_list args;
+
+	va_start(args, fmt);
+	ret = vsnprintf(str, count, fmt, args);
+	va_end(args);
+	return ret;
+}
+
 bool
 errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
 {
@@ -612,6 +624,13 @@ void
 cluster_tt_durable_shmem_register(void)
 {}
 
+/* spec-6.2 D6 stub: cluster_init_shmem_module also calls
+ * cluster_sf_dep_shmem_register (cluster_sf_dep.c).  cluster_unit test binary
+ * doesn't link that object; provide a no-op stub. */
+void
+cluster_sf_dep_shmem_register(void)
+{}
+
 /*
  * spec-5.52 D9 stub: cluster_init_shmem_module also registers the independent
  * admission reason-counter region (cluster_cr_admit_stat.c is not linked into
@@ -796,6 +815,12 @@ cluster_lms_shmem_register(void)
 void cluster_lmd_shmem_register(void);
 void
 cluster_lmd_shmem_register(void)
+{}
+
+/* spec-6.4 stub: ADG Managed Recovery Process shmem region. */
+void cluster_mrp_shmem_register(void);
+void
+cluster_mrp_shmem_register(void)
 {}
 
 /* spec-2.27 D2 stub: cluster_ges_dedup shmem region. */

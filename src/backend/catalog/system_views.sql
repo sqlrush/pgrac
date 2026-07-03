@@ -1715,6 +1715,48 @@ GRANT SELECT ON pg_cluster_node_removal_state TO PUBLIC;
 -- REVOKE EXECUTE FROM PUBLIC for defense-in-depth (L7).
 REVOKE ALL ON FUNCTION pg_cluster_remove_node(int) FROM PUBLIC;
 
+-- PGRAC: ADG physical standby / read-only service status (spec-6.4).
+--   Local view surfaces the standby apply/read floor for this node.  Global
+--   view keeps the same row shape and is local-only until cross-node fanout is
+--   wired; the column contract is stable for MRP/RFS runtime updates.
+CREATE VIEW pg_stat_cluster_adg AS
+    SELECT node_id,
+           dg_role,
+           dg_mode,
+           adg_enabled,
+           apply_master_node_id,
+           apply_master_term,
+           mrp_status,
+           receive_lsn,
+           apply_lsn,
+           standby_consistent_scn,
+           lag_bytes,
+           lag_seconds,
+           apply_rate_bytes_per_sec
+      FROM cluster_get_adg_state();
+
+REVOKE ALL ON pg_stat_cluster_adg FROM PUBLIC;
+GRANT SELECT ON pg_stat_cluster_adg TO PUBLIC;
+
+CREATE VIEW pg_stat_gcluster_adg AS
+    SELECT node_id,
+           dg_role,
+           dg_mode,
+           adg_enabled,
+           apply_master_node_id,
+           apply_master_term,
+           mrp_status,
+           receive_lsn,
+           apply_lsn,
+           standby_consistent_scn,
+           lag_bytes,
+           lag_seconds,
+           apply_rate_bytes_per_sec
+      FROM cluster_get_gcluster_adg();
+
+REVOKE ALL ON pg_stat_gcluster_adg FROM PUBLIC;
+GRANT SELECT ON pg_stat_gcluster_adg TO PUBLIC;
+
 -- PGRAC: cluster-aware backup / restore / PITR surface (spec-6.5).
 --   The state/history/restore-point/PITR views are read-only observability.
 --   Mutating entry points are superuser-gated in C and revoked from PUBLIC.

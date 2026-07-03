@@ -9,6 +9,10 @@
  *
  * src/include/nodes/replnodes.h
  *
+ * PGRAC MODIFICATIONS
+ *	  Carries the ADG physical replication thread selector parsed from
+ *	  START_REPLICATION.
+ *
  *-------------------------------------------------------------------------
  */
 #ifndef REPLNODES_H
@@ -83,6 +87,7 @@ typedef struct StartReplicationCmd
 	char	   *slotname;
 	TimeLineID	timeline;
 	XLogRecPtr	startpoint;
+	uint16		adg_thread_id;
 	List	   *options;
 } StartReplicationCmd;
 

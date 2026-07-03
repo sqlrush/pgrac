@@ -88,11 +88,17 @@
 /* cluster_shmem */
 ClusterShmemCtl *ClusterShmem = NULL;
 
-/* cluster_guc (4 vars) */
+/* cluster_guc */
 int cluster_node_id = -1;
 int cluster_interconnect_tier = 0;
 char *cluster_config_file = NULL;
 char *cluster_injection_points = NULL;
+bool cluster_cf_terminal_authority = false;
+int cluster_cf_delayed_cleanout = 1; /* CLUSTER_CF_DELAYED_CLEANOUT_READER */
+bool cluster_smart_fusion = false;
+int cluster_smart_fusion_tier_min = 3;
+int cluster_smart_fusion_commit_brake_timeout_ms = 5000;
+int cluster_smart_fusion_origin_durable_gossip_ms = 50;
 
 /* spec-5.59 D1 stubs: cluster_debug.o now carries GUC-gated profiling probes
  * (cluster_xnode_profile.h); the unit harness links neither cluster_guc.o
@@ -1668,6 +1674,95 @@ cluster_tt_durable_by_xid_scan_count(void)
 }
 uint64
 cluster_tt_durable_redo_apply_count(void)
+{
+	return 0;
+}
+/* spec-6.2: terminal authority counters share the durable-TT stat region in
+ * the backend; this standalone dump unit stubs the accessors. */
+uint64
+cluster_terminal_authority_check_count(void)
+{
+	return 0;
+}
+uint64
+cluster_terminal_authority_ok_count(void)
+{
+	return 0;
+}
+uint64
+cluster_terminal_authority_failclosed_count(void)
+{
+	return 0;
+}
+uint64
+cluster_terminal_authority_epoch_failclosed_count(void)
+{
+	return 0;
+}
+uint64
+cluster_terminal_authority_ownership_failclosed_count(void)
+{
+	return 0;
+}
+uint64
+cluster_terminal_authority_unknown_failclosed_count(void)
+{
+	return 0;
+}
+uint64
+cluster_terminal_authority_nonterminal_failclosed_count(void)
+{
+	return 0;
+}
+uint64
+cluster_terminal_authority_durable_failclosed_count(void)
+{
+	return 0;
+}
+uint64
+cluster_terminal_authority_retention_failclosed_count(void)
+{
+	return 0;
+}
+/* spec-6.2 D10: Smart Fusion dependency counters (cluster_sf_dep.c) are not
+ * linked here; stub the accessors that dump_smart_fusion reads. */
+uint64
+cluster_sf_dep_install_count(void)
+{
+	return 0;
+}
+uint64
+cluster_sf_dep_touch_count(void)
+{
+	return 0;
+}
+uint64
+cluster_sf_dep_dbwr_brake_count(void)
+{
+	return 0;
+}
+uint64
+cluster_sf_dep_commit_brake_count(void)
+{
+	return 0;
+}
+uint64
+cluster_sf_dep_commit_brake_wait_us(void)
+{
+	return 0;
+}
+uint64
+cluster_sf_dep_origin_suspect_count(void)
+{
+	return 0;
+}
+uint64
+cluster_sf_dep_lost_failclosed_count(void)
+{
+	return 0;
+}
+uint64
+cluster_sf_dep_retry_failclosed_count(void)
 {
 	return 0;
 }

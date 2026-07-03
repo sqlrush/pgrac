@@ -34,6 +34,13 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 use Time::HiRes qw(usleep);
 
+my $lmon1_pid = '';
+
+END
+{
+	kill 'CONT', $lmon1_pid
+	  if defined $lmon1_pid && $lmon1_pid =~ /^\d+$/;
+}
 
 my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	'pgrac079',
@@ -63,7 +70,7 @@ is($pair->node0->safe_psql('postgres',
 # ----------
 # L2: SIGSTOP node1 LMON -- TCP stays open but no heartbeat sends.
 # ----------
-my $lmon1_pid = $pair->node1->safe_psql('postgres',
+$lmon1_pid = $pair->node1->safe_psql('postgres',
 	"SELECT pid FROM pg_stat_activity WHERE backend_type = 'lmon'");
 ok($lmon1_pid > 0, "L2 located node1 LMON pid (got $lmon1_pid)");
 
@@ -74,22 +81,37 @@ kill 'STOP', $lmon1_pid
 	or die "SIGSTOP $lmon1_pid failed: $!";
 note "L2 sent SIGSTOP to node1 LMON (pid $lmon1_pid)";
 
+my $lmon1_stat = '';
+my $stop_deadline = time + 10;
+while (time < $stop_deadline)
+{
+	$lmon1_stat = `ps -o stat= -p $lmon1_pid 2>/dev/null`;
+	chomp $lmon1_stat;
+	last if $lmon1_stat =~ /T/;
+	usleep(100_000);
+}
+like($lmon1_stat, qr/T/, "L2 node1 LMON reached stopped state (stat='$lmon1_stat')");
+
 
 # ----------
 # L3: wait > 3 * heartbeat_interval; node0 should detect liveness timeout.
-# Default interval = 1s -> liveness window = 3s.  Wait 6s for safety.
+# Default interval = 1s -> liveness window = 3s.  CI can delay the LMON
+# scheduler under TAP shard load, so keep the assertion strict but allow a
+# longer observation window.
 # ----------
-my $deadline = time + 15;
+my $deadline = time + 45;
 my $state = '';
 my $last_err = '';
 my $reconnect_after = $reconnect_before;
 my $saw_liveness_close = 0;
+my $last_diag = '';
 while (time < $deadline)
 {
 	my $row = $pair->node0->safe_psql('postgres',
 		"SELECT state || E'\\t' || reconnect_count || E'\\t' || coalesce(last_error, '') "
 		. "FROM pg_cluster_ic_peers WHERE node_id = 1");
 	($state, $reconnect_after, $last_err) = split(/\t/, $row, 3);
+	$last_diag = "state=$state|reconnect=$reconnect_after|err=$last_err";
 	if ($reconnect_after > $reconnect_before
 		&& $last_err =~ qr/liveness timeout|heartbeat|Connection refused|Connection reset|envelope recv|Socket is not connected|Broken pipe|EPIPE/i)
 	{
@@ -98,6 +120,7 @@ while (time < $deadline)
 	}
 	usleep(500_000);
 }
+diag("L3 final node0 peer sample: $last_diag") if !$saw_liveness_close;
 
 ok($saw_liveness_close,
 	"L3 node0 closed peer 1 after liveness timeout (state '$state', reconnect_count "
@@ -119,5 +142,6 @@ note "L4 sent SIGCONT to node1 LMON for cleanup";
 sleep 1;
 
 $pair->stop_pair;
+$lmon1_pid = '';
 
 done_testing();

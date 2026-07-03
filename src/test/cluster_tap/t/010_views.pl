@@ -46,22 +46,35 @@ $node->start;
 
 
 # ----------
-# Total row count: 112 (spec-6.1 adds 2 RDMA interconnect waits).
+# Total row count: 116 (spec-6.2 adds 4 Smart Fusion authority waits).
 # ----------
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'112',
-	'pg_stat_cluster_wait_events returns 112 rows (spec-6.1 RDMA wait events)');
+	'116',
+	'pg_stat_cluster_wait_events returns 116 rows (spec-6.2 Smart Fusion authority waits)');
+
+is($node->safe_psql(
+		'postgres',
+		'SELECT node_id, dg_role, dg_mode, adg_enabled, mrp_status, lag_bytes
+		   FROM pg_stat_cluster_adg'),
+	'-1|primary|async|f|disabled|0',
+	'pg_stat_cluster_adg returns default primary/ADG-off state');
+
+is($node->safe_psql(
+		'postgres',
+		'SELECT receive_lsn IS NULL, apply_lsn IS NULL
+		   FROM pg_stat_cluster_adg'),
+	't|t',
+	'pg_stat_cluster_adg leaves ADG LSNs NULL while disabled');
 
 
 # ----------
-# Distinct type count: 13 (10 from spec-0.11 + SharedFs from spec-1.1
-# + StartupPhase from spec-1.10 + BgProc from spec-1.11 Sprint B / 1.11.1 F12).
+# Distinct type count: current cluster wait-event type roster.
 # ----------
 is($node->safe_psql('postgres',
 		'SELECT count(DISTINCT type) FROM pg_stat_cluster_wait_events'),
-	'13',
-	'13 distinct Cluster: * types (added BgProc in spec-1.11 Sprint B)');
+	'14',
+	'14 distinct Cluster: * types');
 
 
 # ----------
@@ -69,7 +82,7 @@ is($node->safe_psql('postgres',
 # ----------
 my %expected = (
 	'Cluster: GES' => 5,
-	'Cluster: PCM' => 20,	# spec-4.7 D1: +ClusterGCSBlockRecovering
+	'Cluster: PCM' => 24,	# spec-6.2 D10: +4 Smart Fusion authority waits
 	'Cluster: BufferShip' => 5,
 	'Cluster: SCN' => 4,
 	'Cluster: Reconfig' => 8,    # spec-5.18 D12: +ReconfigNodeRemoveCleanupWait
@@ -77,7 +90,7 @@ my %expected = (
 	'Cluster: Sinval' => 6,
 	'Cluster: Interconnect' => 7,
 	'Cluster: Undo' => 4,
-	'Cluster: ADG' => 4,
+	'Cluster: ADG' => 2,
 );
 
 for my $type (sort keys %expected)
@@ -94,7 +107,7 @@ for my $type (sort keys %expected)
 # Spot-check 6 event names exist.
 # ----------
 for my $name ('GesEnqueueAcquire', 'PcmBlockReadNS', 'SinvalInjectLocalQueue',
-              'InterconnectRdmaSend', 'ClusterICRdmaFallback', 'AdgScnSyncWait')
+              'InterconnectRdmaSend', 'ClusterICRdmaFallback', 'AdgWalReceiveLag')
 {
 	my $count = $node->safe_psql(
 		'postgres',

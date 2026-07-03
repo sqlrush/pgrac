@@ -1523,7 +1523,7 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 			|| (!RecoveryInProgress()
 				&& cluster_tuple_has_remote_evidence(buffer, tuple)))) {
 		TransactionId raw_xmin = HeapTupleHeaderGetRawXmin(tuple);
-		ClusterUndoTTSlotRef ref;
+		ClusterUndoTTSlotRef ref = {0};
 		bool ref_filled = false;
 
 		/*
@@ -1620,11 +1620,12 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 		{
 			ClusterVisResolve res;
 
-			if (ref_filled)
+			if (ref_filled) {
 				cluster_visibility_resolve_from_ref(raw_xmin, &ref,
 													PageGetLSN(BufferGetPage(buffer)), &res);
-			else
+			} else {
 				cluster_visibility_resolve_tuple(buffer, tuple, raw_xmin, CLUSTER_VIS_XMIN, &res);
+			}
 
 			if (res.evidence == CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS)
 				ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),

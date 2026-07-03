@@ -69,10 +69,12 @@
 
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC (spec-3.3 D2): cluster snapshot field refresh. */
+#include "cluster/cluster_adg.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h" /* spec-4.5a L4: cr_force_read_scn */
+#include "cluster/cluster_mrp.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_undo_retention.h" /* spec-3.12 D1: retention horizon */
@@ -2148,8 +2150,38 @@ ClusterSnapshotRefreshFields(Snapshot snapshot)
 	 */
 	if (cluster_storage_mode_enabled())
 	{
+		SCN			read_scn;
+
 		snapshot->cluster_source = (uint8) SNAPSHOT_SOURCE_CLUSTER;
-		snapshot->read_scn = cluster_scn_current();
+		if (cluster_mrp_should_start())
+		{
+			ClusterAdgReadDecision decision;
+			int64		lag_ms;
+
+			read_scn = cluster_mrp_standby_consistent_scn();
+			lag_ms = cluster_mrp_apply_lag_ms();
+			decision = cluster_adg_read_only_decide(cluster_enable_adg, true,
+													cluster_mrp_read_service_available(), read_scn,
+													lag_ms,
+													(int64)cluster_adg_lag_threshold_sec * 1000);
+			if (decision == CLUSTER_ADG_READ_UNRESOLVABLE)
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_ADG_STANDBY_UNRESOLVABLE),
+						 errmsg("ADG standby read point is not available"),
+						 errhint("Wait for the Apply Master to publish "
+								 "standby_consistent_scn before running read-only queries.")));
+			if (decision == CLUSTER_ADG_READ_LAG_EXCESSIVE)
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_ADG_APPLY_LAG_EXCESSIVE),
+						 errmsg("ADG standby apply lag exceeds the read-only service threshold"),
+						 errdetail("The current apply lag is greater than %d second(s).",
+								   cluster_adg_lag_threshold_sec),
+						 errhint("Retry after standby apply catches up or increase "
+								 "cluster.adg_lag_threshold_sec.")));
+		}
+		else
+			read_scn = cluster_scn_current();
+		snapshot->read_scn = read_scn;
 		snapshot->read_epoch = cluster_epoch_get_current();
 
 		/*

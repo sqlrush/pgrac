@@ -221,6 +221,111 @@ Reserved for future timeout enforcement on `tier1` peer `recv(2)`.  Currently in
 
 Upper bound on the payload size accepted by the chunked-send API.  A caller asking to send a larger payload is rejected outright with `ERRCODE_PROGRAM_LIMIT_EXCEEDED` rather than silently truncating.  Increase this when the workload expects larger cross-node messages; the hard cap is 256 MB.
 
+### `cluster.cf_terminal_authority`
+
+| | |
+|---|---|
+| Type | bool |
+| Default | `off` |
+| Context | postmaster |
+
+Enables the spec-6.2 Cache Fusion terminal-authority path.  The default
+is `off`, preserving the Stage 5 conservative active-ITL transfer
+boundary.  When enabled, cross-instance undo / TT terminal outcomes
+must prove membership epoch, origin ownership, terminal state, and any
+required durable-TT or retention evidence.  Missing or contradictory
+evidence fails closed; there is no native CLOG fallback or
+UNKNOWN-visible behavior.
+
+Known limitation: the current substrate does not re-parse terminal
+authority references across a membership reconfiguration.  A reference
+captured under an older membership epoch fails closed as `INDOUBT` /
+UNKNOWN after the epoch advances, even if a later lookup could prove the
+same terminal outcome.  Keep this GUC `off` outside targeted validation
+until a future release adds epoch revalidation.
+
+### `cluster.cf_delayed_cleanout`
+
+| | |
+|---|---|
+| Type | enum: `off`, `reader`, `eager` |
+| Default | `reader` |
+| Context | sighup |
+
+Accepted ITL hint-cleanout policy for terminal authority.  In the
+current guarded spec-6.2 substrate, production cleanout writeback is not
+active: `reader` is the reserved default and does not install ITL hints,
+while `eager` remains reserved for transfer-side eager cleanout.  The
+setting changes only future hinting policy.  Visibility verdicts still
+come from durable TT authority and fail closed when unresolved.
+
+### `cluster.smart_fusion`
+
+| | |
+|---|---|
+| Type | bool |
+| Default | `off` |
+| Context | postmaster |
+
+Guarded Smart Fusion early block-transfer dependency tracking.  The
+current spec-6.2 post-ship guardrail keeps this GUC default `off` and
+rejects `on` at startup.  The counters and wire definitions remain as a
+substrate, but the early-transfer runtime path stays fail-closed until
+checkpoint writeback, 2PC, and dependency-consumer soundness are proven.
+The supported path therefore remains the conservative HC82
+WAL-before-ship behavior.
+
+### `cluster.smart_fusion_tier_min`
+
+| | |
+|---|---|
+| Type | enum: `tier3` |
+| Default | `tier3` |
+| Context | postmaster |
+
+Reserved minimum interconnect tier for the future Smart Fusion early
+transfer path.  Only `tier3` is legal in spec-6.2, but
+`cluster.smart_fusion=on` is currently rejected by the guardrail above.
+
+### `cluster.smart_fusion_commit_brake_timeout_ms`
+
+| | |
+|---|---|
+| Type | integer (milliseconds) |
+| Default | `5000` |
+| Range | `1` - `600000` |
+| Context | sighup |
+
+Reserved upper bound for the pre-commit Smart Fusion dependency brake.
+It is accepted for substrate compatibility, but no production transaction
+enters this brake while `cluster.smart_fusion=on` is guarded off.
+
+### `cluster.smart_fusion_origin_durable_gossip_ms`
+
+| | |
+|---|---|
+| Type | integer (milliseconds) |
+| Default | `50` |
+| Range | `1` - `60000` |
+| Context | sighup |
+
+Reserved interval for publishing local durable WAL progress to Smart
+Fusion peers.  It is accepted for substrate compatibility, but durable
+progress gossip is not an active release signal while
+`cluster.smart_fusion=on` is guarded off.
+
+The live setting is visible both through `pg_settings` and
+`pg_cluster_state`:
+
+```sql
+SHOW "cluster.cf_terminal_authority";
+
+SELECT value
+  FROM pg_cluster_state
+ WHERE category = 'guc'
+   AND key = 'cluster.cf_terminal_authority';
+```
+
 ### `cluster.grd_max_entries`
 
 | | |
@@ -515,13 +620,63 @@ healthy-disk count surfaced by `pg_cluster_quorum_state.disks_ok`.
 | | |
 |---|---|
 | Type | integer (bytes; multiple of 512) |
-| Default | `65536` |
+| Default | `262144` |
 | Range | `4096` – `1048576` |
 | Context | postmaster |
 
 Size of each pre-allocated voting-disk file.  Each cluster instance
-owns one 512-byte slot at offset `node_id × 512`; the default holds
-slots for 128 instances.
+owns four 512-byte slots: voting, clean-leave marker, join-commit marker,
+and ADG apply-master lease.  The default holds all four regions for 128
+instances.
+
+## ADG Physical Standby
+
+The ADG standby path is opt-in.  Existing primary deployments keep their
+current behavior with the defaults: `cluster.dg_role = primary` and
+`cluster.enable_adg = off`.
+
+To start ADG standby apply, configure the standby instance with
+`cluster.dg_role = standby` and `cluster.enable_adg = on`.  With the
+default `cluster.apply_master_election = on`, `cluster.voting_disks`
+must name a reachable voting-disk majority because the MRP validates its
+Apply Master term lease in the ADG lease region before replay is allowed.
+For a single-node test standby only, set `cluster.apply_master_election =
+off` to bypass durable election and force the local node to act as Apply
+Master.
+
+The standby starts an MRP auxiliary process during recovery states so WAL
+replay is gated before read-only service opens.  If the Apply Master
+lease cannot be validated, replay waits fail-closed and
+`standby_consistent_scn` is cleared.  ADG thread-barrier WAL records
+advance the read-consistent SCN only after every active WAL thread has
+published a safe SCN.
+
+On the primary, `cluster.dg_mode` controls LNS commit acknowledgement.
+`async` does not add an ADG wait.  `sync` waits until at least one ADG
+standby has flushed the commit WAL.  `max_availability` waits while an
+ADG standby is connected, but releases commits when no ADG standby is
+connected so the primary remains available.
+
+`pg_stat_cluster_adg` and `pg_stat_gcluster_adg` expose the current MRP
+state, Apply Master owner/term, receive/apply LSNs, lag bytes, lag
+seconds, apply rate, and `standby_consistent_scn`.
+
+### ADG GUC Summary
+
+| GUC | Default | Context | Purpose |
+|---|---|---|---|
+| `cluster.dg_role` | `primary` | postmaster | Selects primary or ADG standby behavior. |
+| `cluster.dg_mode` | `async` | sighup | Shipping acknowledgement mode: `async`, `sync`, or `max_availability`. |
+| `cluster.enable_adg` | `off` | postmaster | Starts ADG MRP/read-only standby paths when role is `standby`. |
+| `cluster.apply_master_election` | `on` | postmaster | Uses the durable voting-disk Apply Master lease. Turning it off is only accepted on a single-node standby cluster. |
+| `cluster.adg_lease_takeover_grace_ms` | `5000` | sighup | Extra wait past Apply Master lease expiry before another standby may take it over; also bounds how long an unrenewed master keeps writing. |
+| `cluster.adg_lag_threshold_sec` | `10` | sighup | Read-only service lag threshold. |
+| `cluster.apply_master_max_lag_ms` | `5000` | sighup | Lag threshold surfaced by ADG status views. |
+| `cluster.max_standby_delay` | `30` | sighup | Maximum standby read delay before apply conflict handling. |
+| `cluster.apply_master_switch_drain_ms` | `5000` | sighup | Drain window during Apply Master switch. |
+| `cluster.adg_barrier_interval_ms` | `1000` | sighup | Primary heartbeat interval for periodic thread-safe SCN barriers; `0` uses only commit-driven barriers. |
+| `cluster.wal_sender_timeout_sec` | `60` | sighup | Primary-side LNS shipping timeout. |
+| `cluster.wal_receiver_timeout_sec` | `60` | sighup | Standby-side RFS receive timeout. |
 
 ### `cluster.self_fence_enabled`
 

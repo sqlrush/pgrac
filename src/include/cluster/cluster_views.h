@@ -51,7 +51,7 @@
  *	internal table in cluster_views.c stays in sync with the enum.
  */
 #define CLUSTER_WAIT_EVENTS_COUNT                                                                  \
-	112 /* spec-6.1 D8: RDMA send/recv/poll/connect/fallback events included */
+	116 /* spec-6.2 D10: Smart Fusion terminal authority waits included */
 
 
 /*
@@ -84,6 +84,18 @@ extern Datum cluster_get_wait_events(PG_FUNCTION_ARGS);
  *	column contract is a stable interface from 0.17 onward.
  */
 extern Datum cluster_get_gcluster_wait_events(PG_FUNCTION_ARGS);
+
+/*
+ * cluster_get_adg_state / cluster_get_gcluster_adg -- SRFs backing
+ * pg_stat_cluster_adg and pg_stat_gcluster_adg (spec-6.4).
+ *
+ * v1 row shape is intentionally narrow and stable: local/global ADG role,
+ * Apply Master lease identity, receive/apply watermarks, read-consistency SCN,
+ * and lag metrics.  MRP/RFS update the same underlying fields as the runtime
+ * pieces land; the default primary/ADG-off state emits status "disabled".
+ */
+extern Datum cluster_get_adg_state(PG_FUNCTION_ARGS);
+extern Datum cluster_get_gcluster_adg(PG_FUNCTION_ARGS);
 
 
 /*

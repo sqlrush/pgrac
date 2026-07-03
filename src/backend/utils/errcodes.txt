@@ -362,6 +362,7 @@ Section: Class 40 - Transaction Rollback (pgrac extension)
 40R02    E    ERRCODE_CLUSTER_ISOLATION_FAILED                               cluster_isolation_failed
 40R03    E    ERRCODE_CLUSTER_CACHE_FUSION_RETRY                             cluster_cache_fusion_retry
 40R04    E    ERRCODE_CLUSTER_PI_INVALIDATED_RETRY                           cluster_pi_invalidated_retry
+40R05    E    ERRCODE_CLUSTER_SMART_FUSION_RETRY                             cluster_smart_fusion_retry
 
 Section: Class 42 - Syntax Error or Access Rule Violation
 
@@ -733,6 +734,17 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 # 53R9A..M are allocated, so N is the next free slot in the 53R9 family.
 53R9N    E    ERRCODE_CLUSTER_UNDO_WRITEBACK_BOUNDARY_VIOLATION                cluster_undo_writeback_boundary_violation
 
+# spec-6.2 D10: Cache Fusion terminal authority could not prove a holder's
+# durable TT/undo terminal state.  53R9A/B are already allocated by earlier
+# specs, so spec-6.2 uses the next free 53R9 slots instead of the design-ahead
+# placeholders.  Fail closed: never treat UNKNOWN as visible or released.
+53R9O    E    ERRCODE_CLUSTER_CF_TERMINAL_UNRESOLVED                           cluster_cf_terminal_unresolved
+
+# spec-6.2 D10: Smart Fusion dependency was lost before the origin redo became
+# durable.  Dependent blocks/transactions must fail closed and be rebuilt or
+# retried; never write dependent bytes to storage.
+53R9P    E    ERRCODE_CLUSTER_SMART_FUSION_DEP_LOST                            cluster_smart_fusion_dep_lost
+
 # spec-5.2a D6:  clean-page X-transfer enabler terminal fail-closed.  A clean
 # (sequence) page X-transfer could not complete safely and there is no proven-
 # safe fallback:  a 3-node third-party master clean transfer (out of the 2-node
@@ -882,6 +894,8 @@ Section: Class 57 - Operator Intervention (pgrac extension)
 57R04    E    ERRCODE_CLUSTER_NODE_DRAIN                                     cluster_node_drain
 57R05    E    ERRCODE_CLUSTER_QUIESCE_ACTIVE                                 cluster_quiesce_active
 57R06    E    ERRCODE_CLUSTER_ADG_APPLY_LAG_EXCESSIVE                        cluster_adg_apply_lag_excessive
+57R07    E    ERRCODE_CLUSTER_ADG_STANDBY_UNRESOLVABLE                       cluster_adg_standby_unresolvable
+57R08    E    ERRCODE_CLUSTER_ADG_NOT_APPLY_MASTER                           cluster_adg_not_apply_master
 
 Section: Class 58 - System Error (errors external to PostgreSQL itself)
 

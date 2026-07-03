@@ -38,6 +38,7 @@
 #include "utils/wait_event.h"
 
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_terminal_authority.h"
 #include "cluster/cluster_tt_durable.h"
 
 /*
@@ -63,6 +64,17 @@ typedef struct ClusterTTDurableShared {
 	pg_atomic_uint64 recovery_verdict_failclosed;	  /* D2/D7 verdict fail-closed */
 	pg_atomic_uint64 heap_tuples_physically_reverted; /* D7 physical revert */
 	pg_atomic_uint64 undo_revert_failclosed;		  /* D7 revert safety-gate fail-closed */
+
+	/* spec-6.2 Smart Fusion terminal-authority counters. */
+	pg_atomic_uint64 terminal_authority_check;
+	pg_atomic_uint64 terminal_authority_ok;
+	pg_atomic_uint64 terminal_authority_failclosed;
+	pg_atomic_uint64 terminal_authority_epoch_failclosed;
+	pg_atomic_uint64 terminal_authority_ownership_failclosed;
+	pg_atomic_uint64 terminal_authority_unknown_failclosed;
+	pg_atomic_uint64 terminal_authority_nonterminal_failclosed;
+	pg_atomic_uint64 terminal_authority_durable_failclosed;
+	pg_atomic_uint64 terminal_authority_retention_failclosed;
 } ClusterTTDurableShared;
 
 #ifdef USE_PGRAC_CLUSTER
@@ -101,6 +113,15 @@ cluster_tt_durable_shmem_init(void)
 		pg_atomic_init_u64(&TTDurableShared->recovery_verdict_failclosed, 0);
 		pg_atomic_init_u64(&TTDurableShared->heap_tuples_physically_reverted, 0);
 		pg_atomic_init_u64(&TTDurableShared->undo_revert_failclosed, 0);
+		pg_atomic_init_u64(&TTDurableShared->terminal_authority_check, 0);
+		pg_atomic_init_u64(&TTDurableShared->terminal_authority_ok, 0);
+		pg_atomic_init_u64(&TTDurableShared->terminal_authority_failclosed, 0);
+		pg_atomic_init_u64(&TTDurableShared->terminal_authority_epoch_failclosed, 0);
+		pg_atomic_init_u64(&TTDurableShared->terminal_authority_ownership_failclosed, 0);
+		pg_atomic_init_u64(&TTDurableShared->terminal_authority_unknown_failclosed, 0);
+		pg_atomic_init_u64(&TTDurableShared->terminal_authority_nonterminal_failclosed, 0);
+		pg_atomic_init_u64(&TTDurableShared->terminal_authority_durable_failclosed, 0);
+		pg_atomic_init_u64(&TTDurableShared->terminal_authority_retention_failclosed, 0);
 	}
 }
 
@@ -220,6 +241,67 @@ TT_DURABLE_ACCESSOR(cluster_tt_recovery_heap_tuples_physically_reverted_count,
 					heap_tuples_physically_reverted)
 TT_DURABLE_ACCESSOR(cluster_tt_recovery_undo_revert_failclosed_count, undo_revert_failclosed)
 
+void
+cluster_terminal_authority_count_decision(ClusterTerminalAuthorityReason reason)
+{
+	if (TTDurableShared == NULL)
+		return;
+
+	pg_atomic_fetch_add_u64(&TTDurableShared->terminal_authority_check, 1);
+	if (reason == CLUSTER_TERMINAL_AUTH_OK) {
+		pg_atomic_fetch_add_u64(&TTDurableShared->terminal_authority_ok, 1);
+		return;
+	}
+
+	pg_atomic_fetch_add_u64(&TTDurableShared->terminal_authority_failclosed, 1);
+	switch (reason) {
+	case CLUSTER_TERMINAL_AUTH_EPOCH_UNKNOWN:
+	case CLUSTER_TERMINAL_AUTH_EPOCH_CHANGED:
+		pg_atomic_fetch_add_u64(&TTDurableShared->terminal_authority_epoch_failclosed, 1);
+		break;
+	case CLUSTER_TERMINAL_AUTH_OWNER_UNKNOWN:
+	case CLUSTER_TERMINAL_AUTH_OWNER_MISMATCH:
+	case CLUSTER_TERMINAL_AUTH_INVALID_ORIGIN:
+	case CLUSTER_TERMINAL_AUTH_INVALID_XID:
+		pg_atomic_fetch_add_u64(&TTDurableShared->terminal_authority_ownership_failclosed, 1);
+		break;
+	case CLUSTER_TERMINAL_AUTH_TERMINAL_UNKNOWN:
+	case CLUSTER_TERMINAL_AUTH_DISABLED:
+	case CLUSTER_TERMINAL_AUTH_COMMIT_SCN_MISSING:
+		pg_atomic_fetch_add_u64(&TTDurableShared->terminal_authority_unknown_failclosed, 1);
+		break;
+	case CLUSTER_TERMINAL_AUTH_NONTERMINAL:
+		pg_atomic_fetch_add_u64(&TTDurableShared->terminal_authority_nonterminal_failclosed, 1);
+		break;
+	case CLUSTER_TERMINAL_AUTH_DURABLE_MISSING:
+	case CLUSTER_TERMINAL_AUTH_DURABLE_MISMATCH:
+		pg_atomic_fetch_add_u64(&TTDurableShared->terminal_authority_durable_failclosed, 1);
+		break;
+	case CLUSTER_TERMINAL_AUTH_RETENTION_UNPROVEN:
+		pg_atomic_fetch_add_u64(&TTDurableShared->terminal_authority_retention_failclosed, 1);
+		break;
+	case CLUSTER_TERMINAL_AUTH_OK:
+	case CLUSTER_TERMINAL_AUTH_REASON__COUNT:
+		break;
+	}
+}
+
+TT_DURABLE_ACCESSOR(cluster_terminal_authority_check_count, terminal_authority_check)
+TT_DURABLE_ACCESSOR(cluster_terminal_authority_ok_count, terminal_authority_ok)
+TT_DURABLE_ACCESSOR(cluster_terminal_authority_failclosed_count, terminal_authority_failclosed)
+TT_DURABLE_ACCESSOR(cluster_terminal_authority_epoch_failclosed_count,
+					terminal_authority_epoch_failclosed)
+TT_DURABLE_ACCESSOR(cluster_terminal_authority_ownership_failclosed_count,
+					terminal_authority_ownership_failclosed)
+TT_DURABLE_ACCESSOR(cluster_terminal_authority_unknown_failclosed_count,
+					terminal_authority_unknown_failclosed)
+TT_DURABLE_ACCESSOR(cluster_terminal_authority_nonterminal_failclosed_count,
+					terminal_authority_nonterminal_failclosed)
+TT_DURABLE_ACCESSOR(cluster_terminal_authority_durable_failclosed_count,
+					terminal_authority_durable_failclosed)
+TT_DURABLE_ACCESSOR(cluster_terminal_authority_retention_failclosed_count,
+					terminal_authority_retention_failclosed)
+
 #else /* !USE_PGRAC_CLUSTER */
 
 Size
@@ -319,5 +401,21 @@ TT_RECOVERY_ZERO(cluster_tt_recovery_scn_highwater_recovered_count)
 TT_RECOVERY_ZERO(cluster_tt_recovery_recovery_verdict_failclosed_count)
 TT_RECOVERY_ZERO(cluster_tt_recovery_heap_tuples_physically_reverted_count)
 TT_RECOVERY_ZERO(cluster_tt_recovery_undo_revert_failclosed_count)
+
+void
+cluster_terminal_authority_count_decision(ClusterTerminalAuthorityReason reason)
+{
+	(void)reason;
+}
+
+TT_RECOVERY_ZERO(cluster_terminal_authority_check_count)
+TT_RECOVERY_ZERO(cluster_terminal_authority_ok_count)
+TT_RECOVERY_ZERO(cluster_terminal_authority_failclosed_count)
+TT_RECOVERY_ZERO(cluster_terminal_authority_epoch_failclosed_count)
+TT_RECOVERY_ZERO(cluster_terminal_authority_ownership_failclosed_count)
+TT_RECOVERY_ZERO(cluster_terminal_authority_unknown_failclosed_count)
+TT_RECOVERY_ZERO(cluster_terminal_authority_nonterminal_failclosed_count)
+TT_RECOVERY_ZERO(cluster_terminal_authority_durable_failclosed_count)
+TT_RECOVERY_ZERO(cluster_terminal_authority_retention_failclosed_count)
 
 #endif /* USE_PGRAC_CLUSTER */

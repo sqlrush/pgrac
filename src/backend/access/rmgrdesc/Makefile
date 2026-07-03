@@ -12,6 +12,7 @@ include $(top_builddir)/src/Makefile.global
 OBJS = \
 	brindesc.o \
 	clogdesc.o \
+	clusteradgdesc.o \
 	clusterrawdesc.o \
 	clusterundodesc.o \
 	committsdesc.o \

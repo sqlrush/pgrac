@@ -59,6 +59,7 @@
 #include "cluster/cluster_conf.h"			/* spec-5.7 HW — cluster_conf_node_count */
 #include "cluster/cluster_hw.h"				/* spec-5.7 HW — relation-extend authority */
 #include "cluster/cluster_extend_gate.h" /* spec-5.7 §3.1d — liveness engage gate */
+#include "cluster/cluster_sf_dep.h"		/* spec-6.2 Smart Fusion DBWR brake */
 #include "cluster/cluster_xnode_profile.h"	/* spec-5.59 D3/D4 — read probe + relkind hint */
 
 /*
@@ -3788,6 +3789,19 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	if (!StartBufferIO(buf, false))
 		return;
 
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC spec-6.2 D7: a Smart Fusion dependent buffer must not be written
+	 * to shared storage before every origin dependency is observed durable.
+	 * End this I/O attempt without clearing BM_DIRTY; a later checkpoint or
+	 * bgwriter pass can write it after the dependency vector is cleared.
+	 */
+	if (cluster_smart_fusion && cluster_sf_dep_buffer_flush_blocked(buf)) {
+		TerminateBufferIO(buf, false, 0);
+		return;
+	}
+#endif
+
 	/* Setup error traceback support for ereport() */
 	errcallback.callback = shared_buffer_write_error_callback;
 	errcallback.arg = (void *) buf;
@@ -6430,6 +6444,118 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 	}
 
 	cluster_bufmgr_unpin_for_gcs(buf);
+	return stable;
+}
+
+/*
+ * Smart Fusion copy helper: same stable raw-pin/content_lock contract as
+ * cluster_bufmgr_copy_block_for_gcs(), but it deliberately does not flush WAL
+ * before shipping.  Instead it returns a per-origin dependency vector that the
+ * receiver must install before the copied bytes can participate in DBWR or
+ * commit.  Any missing origin/LSN evidence returns false; callers must not
+ * silently downgrade that specific Smart Fusion attempt.
+ */
+bool
+cluster_bufmgr_copy_block_for_gcs_smart_fusion(BufferTag tag, XLogRecPtr *out_page_lsn, char *dst,
+											   ClusterSfDepVec *out_dep_vec)
+{
+	uint32		hashcode;
+	LWLock	   *partition_lock;
+	int			buf_id;
+	BufferDesc *buf;
+	LWLock	   *content_lock;
+	XLogRecPtr	first_lsn;
+	XLogRecPtr	second_lsn;
+	int			retries;
+	bool		copied_stable;
+	bool		stable;
+	Page		page;
+
+	if (dst == NULL || out_page_lsn == NULL || out_dep_vec == NULL)
+		return false;
+	if (!cluster_sf_dep_origin_valid(cluster_node_id))
+		return false;
+
+	cluster_sf_dep_vec_reset(out_dep_vec);
+	hashcode = BufTableHashCode(&tag);
+	partition_lock = BufMappingPartitionLock(hashcode);
+
+	LWLockAcquire(partition_lock, LW_SHARED);
+	buf_id = BufTableLookup(&tag, hashcode);
+	if (buf_id < 0)
+	{
+		LWLockRelease(partition_lock);
+		return false;
+	}
+	buf = GetBufferDescriptor(buf_id);
+
+	{
+		uint32		buf_state;
+
+		buf_state = LockBufHdr(buf);
+		if (!BufferTagsEqual(&buf->tag, &tag) || (buf_state & BM_VALID) == 0)
+		{
+			UnlockBufHdr(buf, buf_state);
+			LWLockRelease(partition_lock);
+			return false;
+		}
+		cluster_bufmgr_pin_for_gcs_locked(buf, buf_state);
+	}
+	LWLockRelease(partition_lock);
+
+	content_lock = BufferDescriptorGetContentLock(buf);
+	page = (Page) BufHdrGetBlock(buf);
+	copied_stable = false;
+	stable = false;
+	for (retries = 0; retries < 2; retries++)
+	{
+		LWLockAcquire(content_lock, LW_SHARED);
+		first_lsn = PageGetLSN(page);
+		memcpy(dst, page, BLCKSZ);
+		second_lsn = PageGetLSN(page);
+		if (BufferTagsEqual(&buf->tag, &tag) && !XLogRecPtrIsInvalid(first_lsn)
+			&& first_lsn == second_lsn)
+		{
+			*out_page_lsn = second_lsn;
+			LWLockRelease(content_lock);
+			copied_stable = true;
+			break;
+		}
+		LWLockRelease(content_lock);
+	}
+
+	if (copied_stable)
+	{
+		ClusterSfDepVec existing_vec;
+		bool		has_existing_deps;
+		bool		add_local_dep;
+		uint32		buf_state;
+
+		/*
+		 * Keep lock ordering compatible with receiver install:
+		 * cluster_sf_dep_install_vec() takes the Smart Fusion dep lock before
+		 * page install may take content_lock EXCLUSIVE.  We therefore read the
+		 * dep store after releasing content_lock, while the raw pin keeps this
+		 * descriptor/tag from being recycled.
+		 */
+		has_existing_deps =
+			cluster_sf_dep_vec_for_ship(BufferDescriptorGetBuffer(buf), &existing_vec);
+		cluster_sf_dep_vec_reset(out_dep_vec);
+		if (has_existing_deps)
+			(void) cluster_sf_dep_vec_union(out_dep_vec, &existing_vec);
+
+		buf_state = LockBufHdr(buf);
+		add_local_dep = (buf_state & (BM_DIRTY | BM_JUST_DIRTIED)) != 0
+						|| !has_existing_deps;
+		UnlockBufHdr(buf, buf_state);
+		if (add_local_dep)
+			(void) cluster_sf_dep_vec_set(out_dep_vec, cluster_node_id, *out_page_lsn);
+		stable = !cluster_sf_dep_vec_is_empty(out_dep_vec);
+	}
+
+	cluster_bufmgr_unpin_for_gcs(buf);
+	if (!stable)
+		cluster_sf_dep_vec_reset(out_dep_vec);
 	return stable;
 }
 

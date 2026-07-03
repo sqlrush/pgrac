@@ -93,6 +93,8 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_lmd_probe_collector.h" /* spec-5.8 D8 — probe collector counters */
 #include "cluster/cluster_lms.h"	 /* cluster_lms_* observability accessors (spec-2.18 D10) */
 #include "cluster/cluster_tt_slot.h" /* spec-3.12 D5 retention counters */
+#include "cluster/cluster_terminal_authority.h" /* spec-6.2 authority counters */
+#include "cluster/cluster_sf_dep.h"				/* spec-6.2 Smart Fusion dep counters */
 #include "cluster/cluster_undo_record_api.h"  /* cluster_undo_* counter accessors (spec-3.7 D10) */
 #include "cluster/storage/cluster_undo_buf.h" /* spec-3.18 D7: undo buffer counters */
 #include "cluster/cluster_cr.h"				  /* cluster_cr_* counter accessors (spec-3.9 D8) */
@@ -264,6 +266,20 @@ ic_tier_to_text(int t)
 	return "unknown";
 }
 
+static const char *
+cf_delayed_cleanout_to_text(int mode)
+{
+	switch ((ClusterCfDelayedCleanoutMode)mode) {
+	case CLUSTER_CF_DELAYED_CLEANOUT_OFF:
+		return "off";
+	case CLUSTER_CF_DELAYED_CLEANOUT_READER:
+		return "reader";
+	case CLUSTER_CF_DELAYED_CLEANOUT_EAGER:
+		return "eager";
+	}
+	return "unknown";
+}
+
 
 /* ============================================================
  * Per-category dumpers.
@@ -343,6 +359,17 @@ dump_guc(ReturnSetInfo *rsinfo)
 
 	/* Stage 1.3: cluster.shmem_max_regions int. */
 	emit_row(rsinfo, "guc", "cluster.shmem_max_regions", fmt_int32(cluster_shmem_max_regions));
+	emit_row(rsinfo, "guc", "cluster.cf_terminal_authority",
+			 fmt_bool(cluster_cf_terminal_authority));
+	emit_row(rsinfo, "guc", "cluster.cf_delayed_cleanout",
+			 cf_delayed_cleanout_to_text(cluster_cf_delayed_cleanout));
+	emit_row(rsinfo, "guc", "cluster.smart_fusion", fmt_bool(cluster_smart_fusion));
+	emit_row(rsinfo, "guc", "cluster.smart_fusion_tier_min",
+			 ic_tier_to_text(cluster_smart_fusion_tier_min));
+	emit_row(rsinfo, "guc", "cluster.smart_fusion_commit_brake_timeout_ms",
+			 fmt_int32(cluster_smart_fusion_commit_brake_timeout_ms));
+	emit_row(rsinfo, "guc", "cluster.smart_fusion_origin_durable_gossip_ms",
+			 fmt_int32(cluster_smart_fusion_origin_durable_gossip_ms));
 }
 
 static void
@@ -1675,6 +1702,27 @@ dump_cf(ReturnSetInfo *rsinfo)
 }
 
 static void
+dump_smart_fusion(ReturnSetInfo *rsinfo)
+{
+	emit_row(rsinfo, "smart_fusion", "dep_install_count",
+			 fmt_int64((int64)cluster_sf_dep_install_count()));
+	emit_row(rsinfo, "smart_fusion", "dep_touch_count",
+			 fmt_int64((int64)cluster_sf_dep_touch_count()));
+	emit_row(rsinfo, "smart_fusion", "dbwr_brake_count",
+			 fmt_int64((int64)cluster_sf_dep_dbwr_brake_count()));
+	emit_row(rsinfo, "smart_fusion", "commit_brake_count",
+			 fmt_int64((int64)cluster_sf_dep_commit_brake_count()));
+	emit_row(rsinfo, "smart_fusion", "commit_brake_wait_us",
+			 fmt_int64((int64)cluster_sf_dep_commit_brake_wait_us()));
+	emit_row(rsinfo, "smart_fusion", "origin_suspect_count",
+			 fmt_int64((int64)cluster_sf_dep_origin_suspect_count()));
+	emit_row(rsinfo, "smart_fusion", "dep_lost_failclosed_count",
+			 fmt_int64((int64)cluster_sf_dep_lost_failclosed_count()));
+	emit_row(rsinfo, "smart_fusion", "retry_failclosed_count",
+			 fmt_int64((int64)cluster_sf_dep_retry_failclosed_count()));
+}
+
+static void
 dump_gcs(ReturnSetInfo *rsinfo)
 {
 	emit_row(rsinfo, "gcs", "api_state", cluster_gcs_get_api_state());
@@ -1946,12 +1994,13 @@ dump_gcs(ReturnSetInfo *rsinfo)
 /*
  * dump_undo -- spec-3.7 D10 + D6 真激活 counter observability.
  *
- *	Emits 26 rows under category='undo': 5 record-level allocator counters
+ *	Emits 53 rows under category='undo': 5 record-level allocator counters
  *	(spec-3.7) + 4 segment-lifecycle counters (spec-3.8) + 3 commit-fsync +
  *	4 smgr counters (the latter 7 added by the perf-merge undo
  *	instrumentation) + 5 durable TT slot counters (spec-3.11 D8) + 5 retention
  *	counters (spec-3.12 D5: horizon gauge / tt_slot_retain_skip /
  *	segment_retain_skip / retention_recycle / tt_retention_rollover) +
+ *	9 terminal authority counters (spec-6.2) +
  *	6 cleaner/reuse counters (spec-3.13 D6) +
  *	4 checkpoint-writeback boundary counters (spec-4.8ab D7:
  *	undo_buf_held_wal / undo_buf_held_evidence / undo_buf_boundary_violations /
@@ -2302,6 +2351,26 @@ dump_undo(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_tt_slot_retention_off_recycle_count()));
 	emit_row(rsinfo, "undo", "tt_retention_rollover_count",
 			 fmt_int64((int64)cluster_undo_tt_retention_rollover_count()));
+
+	/* spec-6.2: Smart Fusion terminal-authority substrate counters. */
+	emit_row(rsinfo, "undo", "terminal_authority_check_count",
+			 fmt_int64((int64)cluster_terminal_authority_check_count()));
+	emit_row(rsinfo, "undo", "terminal_authority_ok_count",
+			 fmt_int64((int64)cluster_terminal_authority_ok_count()));
+	emit_row(rsinfo, "undo", "terminal_authority_failclosed_count",
+			 fmt_int64((int64)cluster_terminal_authority_failclosed_count()));
+	emit_row(rsinfo, "undo", "terminal_authority_epoch_failclosed_count",
+			 fmt_int64((int64)cluster_terminal_authority_epoch_failclosed_count()));
+	emit_row(rsinfo, "undo", "terminal_authority_ownership_failclosed_count",
+			 fmt_int64((int64)cluster_terminal_authority_ownership_failclosed_count()));
+	emit_row(rsinfo, "undo", "terminal_authority_unknown_failclosed_count",
+			 fmt_int64((int64)cluster_terminal_authority_unknown_failclosed_count()));
+	emit_row(rsinfo, "undo", "terminal_authority_nonterminal_failclosed_count",
+			 fmt_int64((int64)cluster_terminal_authority_nonterminal_failclosed_count()));
+	emit_row(rsinfo, "undo", "terminal_authority_durable_failclosed_count",
+			 fmt_int64((int64)cluster_terminal_authority_durable_failclosed_count()));
+	emit_row(rsinfo, "undo", "terminal_authority_retention_failclosed_count",
+			 fmt_int64((int64)cluster_terminal_authority_retention_failclosed_count()));
 
 	/* spec-3.13 D6: 6 cleaner/reuse counters (26 -> 32 rows). */
 	emit_row(rsinfo, "undo", "cleaner_pass_count",
@@ -2757,6 +2826,7 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		dump_pcm(rsinfo);
 		dump_gcs(rsinfo);
 		dump_cf(rsinfo);
+		dump_smart_fusion(rsinfo);
 		dump_phase(rsinfo);
 		dump_lmon(rsinfo);
 		dump_lck(rsinfo);

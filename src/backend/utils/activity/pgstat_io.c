@@ -18,7 +18,7 @@
  *	  Modified by: SqlRush <sqlrush@gmail.com>
  *
  *	  pgstat_tracks_io_bktype() is extended to classify the pgrac cluster
- *	  background process types (miscadmin.h B_CLUSTER_STATS .. B_UNDO_CLEANER)
+ *	  background process types (miscadmin.h B_CLUSTER_STATS .. B_RFS)
  *	  so the switch stays exhaustive.  The sinval broadcaster (B_SINVAL_BCAST)
  *	  flushes relation buffers to shared storage during cross-node key-object
  *	  invalidation drain (cluster_ko_drain_inbound_and_apply ->
@@ -322,7 +322,7 @@ pgstat_io_snapshot_cb(void)
 *
 * What changed:
 *	  Added the pgrac cluster background process types (B_CLUSTER_STATS ..
-*	  B_UNDO_CLEANER) to the switch below.  B_SINVAL_BCAST returns true; the
+*	  B_RFS) to the switch below.  B_SINVAL_BCAST returns true; the
 *	  other cluster aux types return false.
 *
 * Why:
@@ -384,6 +384,7 @@ pgstat_tracks_io_bktype(BackendType bktype)
 		case B_LMS_WORKER:
 		case B_MRP:
 		case B_QVOTEC:
+		case B_RFS:
 		case B_RECOVERY_COORD:
 		case B_RECOVERY_WORKER:
 		case B_TT_GC:
