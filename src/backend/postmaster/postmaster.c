@@ -1977,12 +1977,22 @@ ServerLoop(void)
 
 		/*
 		 * PGRAC: spec-2.6 Sprint A Step 3 D7 — same ServerLoop respawn
-		 * for QVOTEC (6th cluster aux process).  Spawned post PM_RUN by
-		 * phase 4 driver fourth升级;respawn here closes restart_after_
-		 * crash recovery + external-SIGTERM paths.
+		 * for QVOTEC (6th cluster aux process).  Normal primary-cluster
+		 * startup is still driven by phase 4 after PM_RUN.  ADG standby
+		 * recovery is the exception: MRP must acquire its apply-master
+		 * lease before recovery can reach hot standby, so qvotec must be
+		 * available during recovery states to complete the lease CAS.
 		 */
-		if (cluster_enabled && qvotec_spawn_enabled && QvotecPID == 0 && pmState == PM_RUN)
+		if (cluster_enabled && QvotecPID == 0
+			&& ((qvotec_spawn_enabled && pmState == PM_RUN)
+				|| (cluster_mrp_should_start()
+					&& (pmState == PM_STARTUP || pmState == PM_RECOVERY
+						|| pmState == PM_HOT_STANDBY || pmState == PM_RUN))))
+		{
+			if (cluster_mrp_should_start())
+				qvotec_spawn_enabled = true;
 			QvotecPID = StartQvotec();
+		}
 
 		/*
 		 * PGRAC: spec-2.18 Sprint A — same ServerLoop respawn for LMS

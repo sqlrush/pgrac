@@ -287,6 +287,12 @@ cluster_tt_status_adg_standby_overlay_enabled(void)
 }
 
 static bool
+cluster_tt_status_adg_standby_provisional(ClusterTTStatus status)
+{
+	return status == CLUSTER_TT_STATUS_IN_PROGRESS || status == CLUSTER_TT_STATUS_SUBCOMMITTED;
+}
+
+static bool
 cluster_tt_status_same_identity_except_epoch(const ClusterTTStatusKey *a,
 											 const ClusterTTStatusKey *b)
 {
@@ -311,17 +317,21 @@ cluster_tt_status_fill_result_from_entry(const ClusterTTOverlayEntry *e,
 /*
  * ADG physical standby durable fallback:
  *
- * A standby replays the primary's pg_xact and undo/TT slot files into its local
- * data directory.  Unlike merged-recovery foreign origins, the local CLOG is
- * therefore authoritative for replayed primary xids.  When a replayed TT overlay
- * is absent or stale, resolve the exact physical TT slot directly and cross-check
- * CLOG so a pre-commit stamp without a committed xid remains fail-closed.
+ * ADG standby redo can install primary-origin overlay entries before all
+ * durable status paths line up with a local xid-space lookup.  Prefer the
+ * direct committed-stable check when it applies, then a diverted remote
+ * outcome cross-checked against origin-qualified durable TT.  If no outcome
+ * store is populated, accept only an origin-qualified durable TT scan that
+ * resolves exactly one COMMITTED slot with a valid commit SCN.  Ambiguous,
+ * missing, or unstamped durable state remains fail-closed.
  */
 static bool
 cluster_tt_status_lookup_adg_standby_durable(const ClusterTTStatusKey *key, uint32 status_epoch,
 											 ClusterTTStatusResult *result)
 {
 	SCN durable_scn;
+	ClusterRemoteXactOutcome remote_outcome;
+	ClusterTTDurableResolve durable_resolve;
 
 	if (!cluster_tt_status_adg_standby_overlay_enabled())
 		return false;
@@ -337,10 +347,65 @@ cluster_tt_status_lookup_adg_standby_durable(const ClusterTTStatusKey *key, uint
 		result->commit_scn = durable_scn;
 		result->status_epoch = status_epoch;
 		result->authoritative = true;
+		result->has_parent_key = false;
+		memset(&result->parent_key, 0, sizeof(result->parent_key));
+		return true;
+	}
+
+	remote_outcome = cluster_remote_outcome_durable_checked((int)key->origin_node_id,
+															key->local_xid, &durable_scn);
+	if (remote_outcome == CLUSTER_REMOTE_XACT_COMMITTED) {
+		result->status = CLUSTER_TT_STATUS_COMMITTED;
+		result->commit_scn = durable_scn;
+		result->status_epoch = status_epoch;
+		result->authoritative = true;
+		result->has_parent_key = false;
+		memset(&result->parent_key, 0, sizeof(result->parent_key));
+		return true;
+	}
+	if (remote_outcome == CLUSTER_REMOTE_XACT_ABORTED) {
+		result->status = CLUSTER_TT_STATUS_ABORTED;
+		result->commit_scn = InvalidScn;
+		result->status_epoch = status_epoch;
+		result->authoritative = true;
+		result->has_parent_key = false;
+		memset(&result->parent_key, 0, sizeof(result->parent_key));
+		return true;
+	}
+
+	durable_resolve = cluster_tt_slot_durable_resolve_by_xid_origin(
+		(int)key->origin_node_id, key->local_xid, CLUSTER_TT_WRAP_ANY, &durable_scn, NULL, NULL,
+		NULL);
+	if (durable_resolve == CLUSTER_TT_DURABLE_RESOLVED_SCN) {
+		result->status = CLUSTER_TT_STATUS_COMMITTED;
+		result->commit_scn = durable_scn;
+		result->status_epoch = status_epoch;
+		result->authoritative = true;
+		result->has_parent_key = false;
+		memset(&result->parent_key, 0, sizeof(result->parent_key));
 		return true;
 	}
 
 	return false;
+}
+
+static void
+cluster_tt_status_adg_standby_maybe_use_durable(const ClusterTTStatusKey *key, uint32 status_epoch,
+												ClusterTTStatusResult *result)
+{
+	ClusterTTStatusResult durable_result;
+
+	if (!cluster_tt_status_adg_standby_provisional(result->status))
+		return;
+
+	/*
+	 * ADG physical standby replay can have a fresh provisional overlay while
+	 * replayed durable TT/CLOG already proves the transaction committed.  That
+	 * is replay authority, not a peer hint; only upgrade provisional states.
+	 */
+	memset(&durable_result, 0, sizeof(durable_result));
+	if (cluster_tt_status_lookup_adg_standby_durable(key, status_epoch, &durable_result))
+		*result = durable_result;
 }
 
 /*
@@ -358,7 +423,8 @@ cluster_tt_status_lookup_adg_standby_durable(const ClusterTTStatusKey *key, uint
  */
 static bool
 cluster_tt_status_lookup_adg_standby_overlay(const ClusterTTStatusKey *key, TimestampTz now,
-											 ClusterTTStatusResult *result, bool *ambiguous)
+											 uint32 current_epoch, ClusterTTStatusResult *result,
+											 bool *ambiguous)
 {
 	HASH_SEQ_STATUS seq;
 	ClusterTTOverlayEntry *e;
@@ -393,6 +459,7 @@ cluster_tt_status_lookup_adg_standby_overlay(const ClusterTTStatusKey *key, Time
 
 	cluster_tt_status_fill_result_from_entry(candidate, result);
 	LWLockRelease(ClusterTTStatusLock);
+	cluster_tt_status_adg_standby_maybe_use_durable(key, current_epoch, result);
 
 	pg_atomic_fetch_add_u64(&ClusterTTStatusState->lookup_hit_count, 1);
 	if (result->status == CLUSTER_TT_STATUS_SUBCOMMITTED)
@@ -448,7 +515,8 @@ cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key, ClusterTTStatusRes
 	if (key->cluster_epoch != current_epoch) {
 		bool ambiguous = false;
 
-		if (cluster_tt_status_lookup_adg_standby_overlay(key, now, result, &ambiguous))
+		if (cluster_tt_status_lookup_adg_standby_overlay(key, now, current_epoch, result,
+														 &ambiguous))
 			return true;
 		if (!ambiguous && cluster_tt_status_lookup_adg_standby_durable(key, current_epoch, result))
 			return true;
@@ -462,7 +530,8 @@ cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key, ClusterTTStatusRes
 		bool ambiguous = false;
 
 		LWLockRelease(ClusterTTStatusLock);
-		if (cluster_tt_status_lookup_adg_standby_overlay(key, now, result, &ambiguous))
+		if (cluster_tt_status_lookup_adg_standby_overlay(key, now, current_epoch, result,
+														 &ambiguous))
 			return true;
 		pg_atomic_fetch_add_u64(&ClusterTTStatusState->lookup_miss_count, 1);
 		if (ambiguous)
@@ -555,6 +624,7 @@ cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key, ClusterTTStatusRes
 	cluster_tt_status_fill_result_from_entry(e, result);
 
 	LWLockRelease(ClusterTTStatusLock);
+	cluster_tt_status_adg_standby_maybe_use_durable(key, current_epoch, result);
 	pg_atomic_fetch_add_u64(&ClusterTTStatusState->lookup_hit_count, 1);
 	if (result->status == CLUSTER_TT_STATUS_SUBCOMMITTED)
 		pg_atomic_fetch_add_u64(&ClusterTTStatusState->subcommitted_lookup_hit_count, 1);

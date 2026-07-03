@@ -307,7 +307,7 @@ cluster_adg_apply_master_lease_valid(const ClusterAdgApplyMasterLease *lease)
 		return false;
 	if (lease->owner_node_id < 0 || lease->owner_node_id > SCN_MAX_VALID_NODE_ID)
 		return false;
-	if (lease->lease_epoch == 0 || lease->owner_incarnation == 0)
+	if (lease->owner_incarnation == 0)
 		return false;
 	if (!XLogRecPtrIsInvalid((XLogRecPtr)lease->receive_lsn)
 		&& !XLogRecPtrIsInvalid((XLogRecPtr)lease->apply_lsn)

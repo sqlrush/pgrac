@@ -456,9 +456,9 @@ merge_page_read(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
 	pgstat_report_wait_start(WAIT_EVENT_WAL_READ);
 	nread = pg_pread(ms->seg_fd, readBuf, XLOG_BLCKSZ, (off_t)offset);
 	pgstat_report_wait_end();
-	if (nread != XLOG_BLCKSZ)
-		return -1; /* torn / short -> stream end */
-	return XLOG_BLCKSZ;
+	if (nread < reqLen)
+		return -1; /* torn / short before the requested bytes */
+	return (int)nread;
 }
 
 /*

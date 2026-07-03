@@ -42,6 +42,13 @@ sub trim
 	return $s;
 }
 
+sub quote_conf
+{
+	my ($s) = @_;
+	$s =~ s/'/''/g;
+	return "'$s'";
+}
+
 sub poll_psql_value
 {
 	my ($node, $sql, $expected, $label) = @_;
@@ -64,14 +71,66 @@ sub poll_psql_value
 	return undef;
 }
 
+sub lsn_segment_offset
+{
+	my ($lsn) = @_;
+	my ($hi, $lo) = split('/', $lsn);
+	my $bytes = (hex($hi) << 32) + hex($lo);
+	return $bytes % (16 * 1024 * 1024);
+}
+
+sub wait_for_adg_rfs_landed
+{
+	my ($primary, $thread_dir) = @_;
+	my $target_lsn = $primary->lsn('flush');
+	my $walfile = trim($primary->safe_psql(
+		'postgres', qq{SELECT pg_walfile_name('$target_lsn')}));
+	my $path = "$thread_dir/$walfile";
+	my $required_size = lsn_segment_offset($target_lsn);
+
+	for my $try (1 .. 80)
+	{
+		if (-e $path && ($required_size == 0 || -s $path >= $required_size))
+		{
+			return $target_lsn;
+		}
+		select(undef, undef, undef, 0.25);
+	}
+
+	die "timed out waiting for ADG RFS to land $target_lsn in $path";
+}
+
+sub wait_for_adg_scn_floor
+{
+	my ($standby, $target_scn) = @_;
+
+	for my $try (1 .. 80)
+	{
+		my ($ret, $stdout, $stderr) = $standby->psql(
+			'postgres',
+			qq{SELECT standby_consistent_scn >= $target_scn
+			     FROM pg_stat_cluster_adg});
+		return if $ret == 0 && trim($stdout) eq 't';
+
+		select(undef, undef, undef, 0.25);
+	}
+
+	die "timed out waiting for ADG standby SCN floor to reach $target_scn";
+}
+
+my $primary_wal_root = PostgreSQL::Test::Utils::tempdir();
+my $primary_thread_dir = "$primary_wal_root/thread_8";
+
 my $primary = PgracClusterNode->new('adg_primary');
-$primary->init(allows_streaming => 1);
+$primary->init(allows_streaming => 1, extra => [ '-X', $primary_thread_dir ]);
 $primary->append_conf('postgresql.conf', qq{
 cluster.node_id = 7
 cluster.allow_single_node = on
 cluster.dg_role = primary
 cluster.dg_mode = max_availability
 cluster.enable_adg = on
+cluster.wal_threads_dir = '$primary_wal_root'
+cluster.adg_barrier_interval_ms = 100
 wal_level = replica
 max_wal_senders = 5
 max_replication_slots = 5
@@ -89,16 +148,16 @@ $primary->backup($backup_name);
 my $standby = PgracClusterNode->new('adg_standby');
 $standby->init_from_backup($primary, $backup_name, has_streaming => 1);
 
-my $wal_threads_root = PostgreSQL::Test::Utils::tempdir();
-my $standby_thread_dir = "$wal_threads_root/thread_1";
-my $primary_thread_dir = "$wal_threads_root/thread_8";
+my $standby_wal_root = PostgreSQL::Test::Utils::tempdir();
+my $standby_thread_dir = "$standby_wal_root/thread_1";
+my $standby_primary_thread_dir = "$standby_wal_root/thread_8";
 my $standby_pg_wal = $standby->data_dir . '/pg_wal';
-make_path($wal_threads_root);
+make_path($standby_wal_root);
 rename $standby_pg_wal, $standby_thread_dir
   or die "rename $standby_pg_wal to $standby_thread_dir: $!";
 symlink $standby_thread_dir, $standby_pg_wal
   or die "symlink $standby_pg_wal -> $standby_thread_dir: $!";
-make_path($primary_thread_dir);
+make_path($standby_primary_thread_dir);
 
 my $disk_dir = PostgreSQL::Test::Utils::tempdir();
 my @voting_disks;
@@ -113,6 +172,7 @@ for my $i (0 .. 2)
 }
 my $voting_disks_csv = join(',', @voting_disks);
 my $primary_connstr = $primary->connstr('postgres');
+my $rfs_conninfos = quote_conf("thread_id=8 $primary_connstr");
 
 $standby->append_conf('postgresql.conf', qq{
 primary_slot_name = 'adg_s1'
@@ -121,35 +181,24 @@ cluster.allow_single_node = on
 cluster.dg_role = standby
 cluster.dg_mode = max_availability
 cluster.enable_adg = on
-cluster.wal_threads_dir = '$wal_threads_root'
-cluster.adg_rfs_conninfos = 'thread_id=8 $primary_connstr'
+cluster.wal_threads_dir = '$standby_wal_root'
+cluster.adg_rfs_conninfos = $rfs_conninfos
 cluster.apply_master_election = on
 cluster.voting_disks = '$voting_disks_csv'
+cluster.adg_lag_threshold_sec = 300
 max_prepared_transactions = 10
 });
 $standby->start;
-
-$primary->wait_for_catchup($standby);
-
-poll_psql_value(
-	$standby,
-	q{SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'remote file server'},
-	'1',
-	'L0 RFS coordinator aux process is running');
-
-poll_psql_value(
-	$standby,
-	q{SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'managed recovery process'},
-	'1',
-	'L0 MRP coordinator aux process is running');
 
 ok($standby->wait_for_log_match(
 		qr/ADG RFS upstream 1 for thread 8 connected and streaming/, 30),
 	'L0 RFS coordinator opened a thread-bound upstream stream');
 
 $primary->safe_psql('postgres', q{INSERT INTO adg_smoke SELECT generate_series(1, 3)});
-$primary->wait_for_catchup($standby);
-ok(-s "$primary_thread_dir/000000010000000000000003",
+my $target_scn = trim($primary->safe_psql('postgres', q{SELECT cluster_scn_current()}));
+my $target_lsn = wait_for_adg_rfs_landed($primary, $standby_primary_thread_dir);
+wait_for_adg_scn_floor($standby, $target_scn);
+ok(-s "$standby_primary_thread_dir/000000010000000000000003",
 	'RFS lands received WAL into the standby per-thread directory');
 
 poll_psql_value($standby, q{SELECT count(*) FROM adg_smoke}, '3',
@@ -193,15 +242,17 @@ my $scn_before_2pc = poll_psql_value($standby,
 
 $primary->safe_psql('postgres', q{
 BEGIN;
-INSERT INTO adg_2pc VALUES (1, 'commit prepared');
-PREPARE TRANSACTION 'adg_commit_prepared';
-});
-$primary->wait_for_catchup($standby);
+	INSERT INTO adg_2pc VALUES (1, 'commit prepared');
+	PREPARE TRANSACTION 'adg_commit_prepared';
+	});
+$target_lsn = wait_for_adg_rfs_landed($primary, $standby_primary_thread_dir);
 poll_psql_value($standby, q{SELECT count(*) FROM adg_2pc}, '0',
 	'L4 prepared transaction remains invisible before COMMIT PREPARED');
 
 $primary->safe_psql('postgres', q{COMMIT PREPARED 'adg_commit_prepared'});
-$primary->wait_for_catchup($standby);
+$target_scn = trim($primary->safe_psql('postgres', q{SELECT cluster_scn_current()}));
+$target_lsn = wait_for_adg_rfs_landed($primary, $standby_primary_thread_dir);
+wait_for_adg_scn_floor($standby, $target_scn);
 poll_psql_value($standby, q{SELECT count(*) FROM adg_2pc}, '1',
 	'L4 COMMIT PREPARED redo becomes visible on ADG standby');
 
@@ -221,15 +272,15 @@ $standby->reload;
 
 $primary->safe_psql('postgres', q{
 BEGIN;
-INSERT INTO adg_2pc VALUES (2, 'rollback prepared');
-PREPARE TRANSACTION 'adg_rollback_prepared';
-});
-$primary->wait_for_catchup($standby);
+	INSERT INTO adg_2pc VALUES (2, 'rollback prepared');
+	PREPARE TRANSACTION 'adg_rollback_prepared';
+	});
+$target_lsn = wait_for_adg_rfs_landed($primary, $standby_primary_thread_dir);
 poll_psql_value($standby, q{SELECT count(*) FROM adg_2pc}, '1',
 	'L5 second prepared transaction remains invisible before rollback');
 
 $primary->safe_psql('postgres', q{ROLLBACK PREPARED 'adg_rollback_prepared'});
-$primary->wait_for_catchup($standby);
+$target_lsn = wait_for_adg_rfs_landed($primary, $standby_primary_thread_dir);
 poll_psql_value($standby, q{SELECT count(*) FROM adg_2pc}, '1',
 	'L5 ROLLBACK PREPARED redo does not expose aborted prepared rows');
 

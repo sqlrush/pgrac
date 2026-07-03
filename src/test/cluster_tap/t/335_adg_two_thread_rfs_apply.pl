@@ -45,6 +45,13 @@ sub trim
 	return $s;
 }
 
+sub quote_conf
+{
+	my ($s) = @_;
+	$s =~ s/'/''/g;
+	return "'$s'";
+}
+
 sub poll_psql_value
 {
 	my ($node, $sql, $expected, $label, $tries) = @_;
@@ -79,7 +86,7 @@ sub make_voting_disks
 		my $path = "$disk_dir/${prefix}_disk$i";
 		open(my $fh, '>', $path) or die "open $path: $!";
 		binmode $fh;
-		print $fh ("\0" x (2 * 128 * 512));
+		print $fh ("\0" x (4 * 128 * 512));
 		close $fh;
 		push @disks, $path;
 	}
@@ -158,6 +165,7 @@ cluster.enabled = on
 cluster.node_id = 0
 cluster.allow_single_node = on
 cluster.dg_role = primary
+cluster.dg_mode = max_availability
 cluster.enable_adg = on
 cluster.wal_threads_dir = '$primary_wal_root'
 cluster.shared_storage_backend = cluster_fs
@@ -167,11 +175,13 @@ cluster.adg_barrier_interval_ms = 100
 wal_level = replica
 max_wal_senders = 10
 max_replication_slots = 10
+wal_keep_size = '64MB'
 max_prepared_transactions = 10
 });
 $primary0->start;
 $primary0->safe_psql('postgres', q{
-CREATE TABLE adg_pair(id int primary key, origin text);
+CREATE TABLE adg_pair_p0(id int primary key, origin text);
+CREATE TABLE adg_pair_p1(id int primary key, origin text);
 });
 $primary0->backup('adg2_b');
 $primary0->stop;
@@ -198,6 +208,7 @@ cluster.cssd_dead_deadband_factor = 10
 wal_level = replica
 max_wal_senders = 10
 max_replication_slots = 10
+wal_keep_size = '64MB'
 max_prepared_transactions = 10
 };
 $primary0->append_conf('postgresql.conf', $primary_common_conf);
@@ -234,6 +245,7 @@ cluster.interconnect_tier = tier1
 cluster.allow_single_node = off
 cluster.voting_disks = '$standby_disks'
 cluster.dg_role = standby
+cluster.dg_mode = max_availability
 cluster.enable_adg = on
 cluster.apply_master_election = on
 cluster.wal_threads_dir = '$standby_wal_root'
@@ -246,7 +258,8 @@ max_prepared_transactions = 10
 };
 $standby0->append_conf('postgresql.conf', $standby_common_conf);
 $standby0->append_conf('postgresql.conf', "cluster.node_id = 0\n");
-$standby0->append_conf('postgresql.conf', "cluster.adg_rfs_conninfos = '$rfs_conninfos'\n");
+$standby0->append_conf('postgresql.conf',
+	'cluster.adg_rfs_conninfos = ' . quote_conf($rfs_conninfos) . "\n");
 $standby1->append_conf('postgresql.conf', $standby_common_conf);
 $standby1->append_conf('postgresql.conf', "cluster.node_id = 1\n");
 write_pair_conf($standby0, $standby1, 'adg2_standby');
@@ -272,16 +285,29 @@ ok($standby0->wait_for_log_match(qr/ADG RFS upstream 1 for thread 1 connected an
 ok($standby0->wait_for_log_match(qr/ADG RFS upstream 2 for thread 2 connected and streaming/, 60),
 	'RFS upstream 2 is bound to primary thread 2');
 
-$primary0->safe_psql('postgres', q{INSERT INTO adg_pair VALUES (1, 'p0')});
-$primary1->safe_psql('postgres', q{INSERT INTO adg_pair VALUES (2, 'p1')});
+$primary0->safe_psql('postgres', q{INSERT INTO adg_pair_p0 VALUES (1, 'p0')});
+$primary1->safe_psql('postgres', q{INSERT INTO adg_pair_p1 VALUES (2, 'p1')});
 
 poll_psql_value($standby0,
-	q{SELECT count(*) || '|' || coalesce(sum(id), 0) FROM adg_pair},
+	q{
+SELECT count(*) || '|' || coalesce(sum(id), 0)
+  FROM (SELECT id FROM adg_pair_p0
+        UNION ALL
+        SELECT id FROM adg_pair_p1) s
+	},
 	'2|3',
 	'standby apply master reads commits from both primary WAL threads',
 	240);
+
+$standby0->safe_psql('postgres', 'CHECKPOINT');
+
 poll_psql_value($standby1,
-	q{SELECT count(*) || '|' || coalesce(sum(id), 0) FROM adg_pair},
+	q{
+SELECT count(*) || '|' || coalesce(sum(id), 0)
+  FROM (SELECT id FROM adg_pair_p0
+        UNION ALL
+        SELECT id FROM adg_pair_p1) s
+	},
 	'2|3',
 	'standby attach node reads the apply-master shared result',
 	240);

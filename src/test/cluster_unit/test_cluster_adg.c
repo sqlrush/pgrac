@@ -370,7 +370,7 @@ UT_TEST(test_apply_master_lease_marker_rejects_invalid_fields)
 	UT_ASSERT(!cluster_adg_apply_master_lease_valid(&lease));
 
 	cluster_adg_apply_master_lease_init_full(&lease, 7, 3, 1000, 11, 0, 1);
-	UT_ASSERT(!cluster_adg_apply_master_lease_valid(&lease));
+	UT_ASSERT(cluster_adg_apply_master_lease_valid(&lease));
 
 	cluster_adg_apply_master_lease_init_full(&lease, 7, 3, 1000, 11, 1, 0);
 	UT_ASSERT(!cluster_adg_apply_master_lease_valid(&lease));

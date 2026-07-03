@@ -792,6 +792,17 @@ InitWalRecovery(ControlFileData *ControlFile, bool *wasShutdown_ptr,
 	{
 		List	   *tablespaces = NIL;
 
+#ifdef USE_PGRAC_CLUSTER
+		/*
+		 * PGRAC: a backup label can point at the source node's WAL checkpoint.
+		 * Backup-label recovery is replay, not plain local crash recovery, and
+		 * must accept any valid thread id just like archive/standby replay.
+		 * Keep the strict own-thread check for the local crash recovery path
+		 * with no recovery signal and no backup_label.
+		 */
+		xlogreader->cluster_expected_thread_id = XLP_THREAD_ID_INVALID;
+#endif
+
 		/*
 		 * Archive recovery was requested, and thanks to the backup label
 		 * file, we know how far we need to replay to reach consistency. Enter
@@ -2373,7 +2384,7 @@ cluster_adg_streaming_replay(XLogPrefetcher *xlogprefetcher, XLogReaderState *xl
 		{
 			if (native_record != NULL && cluster_rfs_configured_upstream_count() <= 0)
 			{
-				if (!cluster_mrp_apply_master_can_apply())
+				if (reachedConsistency && !cluster_mrp_apply_master_can_apply())
 				{
 					cluster_adg_streaming_wait(&streaming_reply_sent);
 					continue;
@@ -2540,8 +2551,12 @@ ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *repl
 	 * this node is the current Apply Master.  The helper validates the shmem
 	 * owner/term against the durable voting-disk lease; non-ADG recovery paths
 	 * return true and keep native behavior.
+	 *
+	 * Backup-label/bootstrap recovery is replay to make this local copy reach a
+	 * consistent hot-standby point; it runs before ADG read service exists and
+	 * must not wait behind the post-consistency apply-master gate.
 	 */
-	while (RecoveryInProgress() && cluster_mrp_should_start()
+	while (RecoveryInProgress() && reachedConsistency && cluster_mrp_should_start()
 		   && (!cluster_apply_master_is_self()
 			   || !cluster_apply_master_term_still_valid(cluster_apply_master_current_term())))
 	{

@@ -17,6 +17,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "access/xlogrecovery.h"
 #include "cluster/cluster_mrp.h"
 #include "cluster/cluster_mrp_apply.h"
 #include "cluster/cluster_standby_scn.h"
@@ -26,8 +27,11 @@ cluster_mrp_apply_record_replayed(uint16 thread_id, XLogRecPtr apply_lsn, SCN re
 {
 	if (!cluster_mrp_should_start())
 		return true;
-	if (!cluster_mrp_apply_master_can_apply())
+	if (!cluster_mrp_apply_master_can_apply()) {
+		if (!reachedConsistency)
+			return true;
 		return false;
+	}
 
 	cluster_standby_scn_mark_applied(thread_id, apply_lsn);
 	cluster_mrp_publish_watermarks(apply_lsn, apply_lsn,
@@ -42,8 +46,11 @@ cluster_mrp_apply_barrier_replayed(uint16 thread_id, XLogRecPtr barrier_lsn, SCN
 {
 	if (!cluster_mrp_should_start())
 		return true;
-	if (!cluster_mrp_apply_master_can_apply())
+	if (!cluster_mrp_apply_master_can_apply()) {
+		if (!reachedConsistency)
+			return true;
 		return false;
+	}
 
 	cluster_standby_scn_apply_barrier(thread_id, barrier_lsn, thread_safe_scn,
 									  primary_thread_count);

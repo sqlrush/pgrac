@@ -38,6 +38,7 @@
 #include "replication/walreceiver.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
+#include "storage/latch.h"
 #include "tcop/tcopprot.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
@@ -46,10 +47,10 @@
 #include "utils/wait_event.h"
 
 #define RFS_IDLE_TIMEOUT_MS 1000
+#define RFS_ACTIVE_POLL_TIMEOUT_MS 1
 #define RFS_POLL_TIMEOUT_MS 100
 #define RFS_RECONNECT_MIN_MS 1000
 #define RFS_RECONNECT_MAX_MS 30000
-
 typedef struct ClusterRfsThreadFile {
 	int fd;
 	TimeLineID tli;
@@ -78,7 +79,10 @@ typedef struct ClusterRfsUpstream {
 	TimeLineID tli;
 	XLogRecPtr start_lsn;
 	XLogRecPtr write_lsn;
+	XLogRecPtr flush_lsn;
 	XLogRecPtr latest_wal_end;
+	XLogRecPtr last_reply_write_lsn;
+	XLogRecPtr last_reply_flush_lsn;
 	TimestampTz latest_wal_end_time;
 	TimestampTz last_msg_receipt_time;
 	TimestampTz last_msg_send_time;
@@ -422,9 +426,13 @@ cluster_rfs_finish_pending_header(ClusterRfsPendingHeader *pending, const char *
 		return false;
 
 	header_thread_id = cluster_rfs_thread_from_header((const XLogPageHeaderData *)pending->data);
-	if (!cluster_rfs_valid_real_thread_id(header_thread_id))
-		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-						errmsg("ADG RFS could not route a split WAL page header")));
+	if (!cluster_rfs_valid_real_thread_id(header_thread_id)) {
+		if (cluster_rfs_valid_real_thread_id(expected_thread_id))
+			header_thread_id = expected_thread_id;
+		else
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("ADG RFS could not route a split WAL page header")));
+	}
 	if (cluster_rfs_valid_real_thread_id(expected_thread_id)
 		&& header_thread_id != expected_thread_id)
 		ereport(ERROR, (errcode(ERRCODE_PROTOCOL_VIOLATION),
@@ -516,6 +524,10 @@ cluster_rfs_observe_received_chunk_internal(const char *buf, Size nbytes, XLogRe
 			}
 		} else if (!cluster_rfs_valid_real_thread_id(route_thread_id))
 			route_thread_id = cluster_rfs_read_native_page_thread(native_wal_fd, recptr);
+
+		if (!cluster_rfs_valid_real_thread_id(route_thread_id)
+			&& cluster_rfs_valid_real_thread_id(expected_thread_id))
+			route_thread_id = expected_thread_id;
 
 		if (!cluster_rfs_valid_real_thread_id(route_thread_id))
 			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
@@ -627,15 +639,24 @@ cluster_rfs_init_message_buffers(ClusterRfsUpstream *upstream)
 }
 
 static void
-cluster_rfs_disconnect_upstream(ClusterRfsUpstream *upstream, bool schedule_reconnect)
+cluster_rfs_disconnect_upstream(ClusterRfsUpstream *upstream, bool schedule_reconnect,
+								bool end_streaming)
 {
 	TimeLineID next_tli = 0;
+	WalReceiverConn *conn = upstream->conn;
+	bool was_streaming = upstream->state == CLUSTER_RFS_UPSTREAM_STREAMING;
 
-	if (upstream->conn != NULL) {
-		if (upstream->state == CLUSTER_RFS_UPSTREAM_STREAMING) {
+	upstream->conn = NULL;
+	upstream->state = CLUSTER_RFS_UPSTREAM_DISCONNECTED;
+	upstream->wait_fd = PGINVALID_SOCKET;
+	upstream->pending_header.active = false;
+	upstream->pending_header.len = 0;
+
+	if (conn != NULL) {
+		if (end_streaming && was_streaming) {
 			PG_TRY();
 			{
-				walrcv_endstreaming(upstream->conn, &next_tli);
+				walrcv_endstreaming(conn, &next_tli);
 			}
 			PG_CATCH();
 			{
@@ -643,14 +664,9 @@ cluster_rfs_disconnect_upstream(ClusterRfsUpstream *upstream, bool schedule_reco
 			}
 			PG_END_TRY();
 		}
-		walrcv_disconnect(upstream->conn);
+		walrcv_disconnect(conn);
 	}
 
-	upstream->conn = NULL;
-	upstream->state = CLUSTER_RFS_UPSTREAM_DISCONNECTED;
-	upstream->wait_fd = PGINVALID_SOCKET;
-	upstream->pending_header.active = false;
-	upstream->pending_header.len = 0;
 	if (schedule_reconnect) {
 		upstream->next_reconnect_time = cluster_rfs_timestamp_after_ms(
 			cluster_rfs_reconnect_delay_ms(upstream->reconnect_attempts));
@@ -673,7 +689,9 @@ cluster_rfs_send_reply(ClusterRfsUpstream *upstream, bool force, bool request_re
 		return;
 
 	now = GetCurrentTimestamp();
-	if (!force && upstream->last_msg_send_time != 0
+	if (!force && upstream->last_reply_write_lsn == upstream->write_lsn
+		&& upstream->last_reply_flush_lsn == upstream->flush_lsn
+		&& upstream->last_msg_send_time != 0
 		&& !TimestampDifferenceExceeds(upstream->last_msg_send_time, now,
 									   wal_receiver_status_interval * 1000))
 		return;
@@ -682,14 +700,28 @@ cluster_rfs_send_reply(ClusterRfsUpstream *upstream, bool force, bool request_re
 	resetStringInfo(&upstream->reply_message);
 	pq_sendbyte(&upstream->reply_message, 'r');
 	pq_sendint64(&upstream->reply_message, upstream->write_lsn);
-	pq_sendint64(&upstream->reply_message, upstream->write_lsn);
+	pq_sendint64(&upstream->reply_message, upstream->flush_lsn);
 	pq_sendint64(&upstream->reply_message, apply_lsn);
 	pq_sendint64(&upstream->reply_message, now);
 	pq_sendbyte(&upstream->reply_message, request_reply ? 1 : 0);
 	cluster_rfs_append_reply_trailer(&upstream->reply_message, upstream->last_thread_id);
 
 	walrcv_send(upstream->conn, upstream->reply_message.data, upstream->reply_message.len);
+	upstream->last_reply_write_lsn = upstream->write_lsn;
+	upstream->last_reply_flush_lsn = upstream->flush_lsn;
 	upstream->last_msg_send_time = now;
+}
+
+static bool
+cluster_rfs_flush_pending(ClusterRfsUpstream *upstream, bool force_reply)
+{
+	if (upstream->flush_lsn >= upstream->write_lsn)
+		return false;
+
+	cluster_rfs_flush_received_threads();
+	upstream->flush_lsn = upstream->write_lsn;
+	cluster_rfs_send_reply(upstream, force_reply, false);
+	return true;
 }
 
 static void
@@ -824,6 +856,7 @@ cluster_rfs_connect_upstream(ClusterRfsUpstream *upstream)
 							   (unsigned)upstream->expected_thread_id)));
 	upstream->start_lsn = cluster_rfs_page_start(restart_lsn);
 	upstream->write_lsn = upstream->start_lsn;
+	upstream->flush_lsn = upstream->start_lsn;
 	upstream->last_thread_id = XLP_THREAD_ID_LEGACY;
 	upstream->pending_header.active = false;
 	upstream->pending_header.len = 0;
@@ -847,7 +880,7 @@ cluster_rfs_connect_upstream(ClusterRfsUpstream *upstream)
 	cluster_rfs_send_reply(upstream, true, false);
 }
 
-static void
+static bool
 cluster_rfs_step_upstream(ClusterRfsUpstream *upstream)
 {
 	char *buf = NULL;
@@ -855,7 +888,7 @@ cluster_rfs_step_upstream(ClusterRfsUpstream *upstream)
 	bool got_data = false;
 
 	if (upstream->state != CLUSTER_RFS_UPSTREAM_STREAMING || upstream->conn == NULL)
-		return;
+		return false;
 
 	do {
 		upstream->wait_fd = PGINVALID_SOCKET;
@@ -866,21 +899,29 @@ cluster_rfs_step_upstream(ClusterRfsUpstream *upstream)
 		} else if (len < 0) {
 			ereport(LOG, (errmsg("ADG RFS upstream %d ended streaming at %X/%X", upstream->index,
 								 LSN_FORMAT_ARGS(upstream->write_lsn))));
-			cluster_rfs_disconnect_upstream(upstream, true);
-			return;
+			cluster_rfs_disconnect_upstream(upstream, true, true);
+			return got_data;
 		}
 	} while (len > 0);
 
-	if (got_data) {
-		cluster_rfs_flush_received_threads();
-		cluster_rfs_send_reply(upstream, false, false);
-	} else if (cluster_wal_receiver_timeout_sec > 0 && upstream->last_msg_receipt_time != 0
-			   && TimestampDifferenceExceeds(upstream->last_msg_receipt_time, GetCurrentTimestamp(),
-											 cluster_wal_receiver_timeout_sec * 1000)) {
+	/*
+	 * Drain all immediately available CopyData first, then fsync once for the
+	 * drained batch.  This avoids per-frame fsync during catchup while still
+	 * advancing flush_lsn for small commits when keepalives or barriers keep
+	 * the socket busy.
+	 */
+	if (upstream->write_lsn > upstream->flush_lsn)
+		cluster_rfs_flush_pending(upstream, false);
+
+	if (!got_data && cluster_wal_receiver_timeout_sec > 0 && upstream->last_msg_receipt_time != 0
+		&& TimestampDifferenceExceeds(upstream->last_msg_receipt_time, GetCurrentTimestamp(),
+									  cluster_wal_receiver_timeout_sec * 1000)) {
 		ereport(LOG, (errmsg("ADG RFS upstream %d timed out after %d second(s)", upstream->index,
 							 cluster_wal_receiver_timeout_sec)));
-		cluster_rfs_disconnect_upstream(upstream, true);
+		cluster_rfs_disconnect_upstream(upstream, true, false);
 	}
+
+	return got_data;
 }
 
 static void
@@ -891,7 +932,7 @@ cluster_rfs_log_upstream_error(ClusterRfsUpstream *upstream)
 	edata = CopyErrorData();
 	FlushErrorState();
 	upstream->error_count++;
-	cluster_rfs_disconnect_upstream(upstream, true);
+	cluster_rfs_disconnect_upstream(upstream, true, false);
 	ereport(LOG, (errmsg("ADG RFS upstream %d disconnected; will retry", upstream->index),
 				  errdetail("%s", edata->message)));
 	FreeErrorData(edata);
@@ -901,6 +942,7 @@ static void
 cluster_rfs_maybe_connect_upstream(ClusterRfsUpstream *upstream)
 {
 	TimestampTz now;
+	MemoryContext oldcontext;
 
 	if (upstream->state == CLUSTER_RFS_UPSTREAM_STREAMING)
 		return;
@@ -909,6 +951,7 @@ cluster_rfs_maybe_connect_upstream(ClusterRfsUpstream *upstream)
 	if (upstream->next_reconnect_time != 0 && now < upstream->next_reconnect_time)
 		return;
 
+	oldcontext = CurrentMemoryContext;
 	PG_TRY();
 	{
 		cluster_rfs_connect_upstream(upstream);
@@ -918,23 +961,30 @@ cluster_rfs_maybe_connect_upstream(ClusterRfsUpstream *upstream)
 	}
 	PG_CATCH();
 	{
+		MemoryContextSwitchTo(oldcontext);
 		cluster_rfs_log_upstream_error(upstream);
 	}
 	PG_END_TRY();
 }
 
-static void
+static bool
 cluster_rfs_maybe_step_upstream(ClusterRfsUpstream *upstream)
 {
+	MemoryContext oldcontext = CurrentMemoryContext;
+	bool got_data = false;
+
 	PG_TRY();
 	{
-		cluster_rfs_step_upstream(upstream);
+		got_data = cluster_rfs_step_upstream(upstream);
 	}
 	PG_CATCH();
 	{
+		MemoryContextSwitchTo(oldcontext);
 		cluster_rfs_log_upstream_error(upstream);
 	}
 	PG_END_TRY();
+
+	return got_data;
 }
 
 static int
@@ -1016,7 +1066,58 @@ static void
 cluster_rfs_disconnect_all_upstreams(ClusterRfsUpstream *upstreams, int upstream_count)
 {
 	for (int i = 0; i < upstream_count; i++)
-		cluster_rfs_disconnect_upstream(&upstreams[i], false);
+		cluster_rfs_disconnect_upstream(&upstreams[i], false, true);
+}
+
+static void
+cluster_rfs_wait_for_activity(ClusterRfsUpstream *upstreams, int upstream_count)
+{
+	int nsockets = 0;
+	pgsocket wait_fd = PGINVALID_SOCKET;
+	long timeout_ms = RFS_POLL_TIMEOUT_MS;
+
+	for (int i = 0; i < upstream_count; i++) {
+		if (upstreams[i].state != CLUSTER_RFS_UPSTREAM_STREAMING
+			|| upstreams[i].wait_fd == PGINVALID_SOCKET)
+			continue;
+		nsockets++;
+		wait_fd = upstreams[i].wait_fd;
+		if (upstreams[i].latest_wal_end > upstreams[i].write_lsn)
+			timeout_ms = RFS_ACTIVE_POLL_TIMEOUT_MS;
+	}
+
+	if (nsockets == 0) {
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						RFS_POLL_TIMEOUT_MS, WAIT_EVENT_ADG_WAL_RECEIVE_LAG);
+		ResetLatch(MyLatch);
+		return;
+	}
+
+	if (nsockets == 1) {
+		(void)WaitLatchOrSocket(
+			MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH | WL_SOCKET_READABLE, wait_fd,
+			timeout_ms, WAIT_EVENT_ADG_WAL_RECEIVE_LAG);
+		ResetLatch(MyLatch);
+		return;
+	}
+
+	{
+		WaitEventSet *wes;
+		WaitEvent event;
+
+		wes = CreateWaitEventSet(CurrentMemoryContext, nsockets + 2);
+		AddWaitEventToSet(wes, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch, NULL);
+		AddWaitEventToSet(wes, WL_EXIT_ON_PM_DEATH, PGINVALID_SOCKET, NULL, NULL);
+		for (int i = 0; i < upstream_count; i++) {
+			if (upstreams[i].state == CLUSTER_RFS_UPSTREAM_STREAMING
+				&& upstreams[i].wait_fd != PGINVALID_SOCKET)
+				AddWaitEventToSet(wes, WL_SOCKET_READABLE, upstreams[i].wait_fd, NULL,
+								  &upstreams[i]);
+		}
+		(void)WaitEventSetWait(wes, timeout_ms, &event, 1, WAIT_EVENT_ADG_WAL_RECEIVE_LAG);
+		FreeWaitEventSet(wes);
+		ResetLatch(MyLatch);
+	}
 }
 
 void
@@ -1067,6 +1168,8 @@ RfsMain(void)
 	set_ps_display(activitymsg);
 
 	for (;;) {
+		bool got_data = false;
+
 		CHECK_FOR_INTERRUPTS();
 
 		if (ConfigReloadPending) {
@@ -1078,16 +1181,18 @@ RfsMain(void)
 
 		for (int i = 0; i < upstream_count; i++)
 			cluster_rfs_maybe_connect_upstream(&upstreams[i]);
+
 		for (int i = 0; i < upstream_count; i++)
-			cluster_rfs_maybe_step_upstream(&upstreams[i]);
+			got_data |= cluster_rfs_maybe_step_upstream(&upstreams[i]);
 
 		snprintf(activitymsg, sizeof(activitymsg), "rfs coordinator %d/%d streaming",
 				 cluster_rfs_active_upstreams(upstreams, upstream_count), upstream_count);
 		set_ps_display(activitymsg);
 
-		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-						RFS_POLL_TIMEOUT_MS, WAIT_EVENT_ADG_WAL_RECEIVE_LAG);
-		ResetLatch(MyLatch);
+		if (got_data)
+			continue;
+
+		cluster_rfs_wait_for_activity(upstreams, upstream_count);
 	}
 
 	cluster_rfs_disconnect_all_upstreams(upstreams, upstream_count);

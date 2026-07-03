@@ -289,6 +289,9 @@ static void WalSndSegmentOpen(XLogReaderState *state, XLogSegNo nextSegNo,
 
 #ifdef USE_PGRAC_CLUSTER
 static void WalSndValidateAdgThreadBinding(StartReplicationCmd *cmd);
+static void WalSndAdjustAdgThreadStartpoint(StartReplicationCmd *cmd,
+											XLogRecPtr flushPtr,
+											TimeLineID tli);
 static void WalSndPublishAdgSendThread(uint16 thread_id);
 #endif
 
@@ -740,6 +743,51 @@ WalSndValidateAdgThreadBinding(StartReplicationCmd *cmd)
 
 	WalSndPublishAdgSendThread(cmd->adg_thread_id);
 }
+
+static void
+WalSndAdjustAdgThreadStartpoint(StartReplicationCmd *cmd, XLogRecPtr flushPtr,
+								TimeLineID tli)
+{
+	XLogRecPtr scanptr;
+	XLogRecPtr original_startpoint;
+
+	if (cmd->adg_thread_id == 0 || cmd->startpoint >= flushPtr)
+		return;
+
+	original_startpoint = cmd->startpoint;
+	scanptr = cmd->startpoint - (cmd->startpoint % XLOG_BLCKSZ);
+
+	while (scanptr + sizeof(XLogPageHeaderData) <= flushPtr)
+	{
+		WALReadError errinfo;
+		XLogPageHeaderData hdr;
+
+		if (!WALRead(xlogreader, (char *) &hdr, scanptr, sizeof(hdr), tli,
+					 &errinfo))
+			WALReadRaiseError(&errinfo);
+
+		if (hdr.xlp_magic == XLOG_PAGE_MAGIC &&
+			cluster_xlog_validate_page_header(hdr.xlp_thread_id,
+											  hdr.xlp_cluster_flags,
+											  XLP_THREAD_ID_INVALID) &&
+			(hdr.xlp_thread_id == XLP_THREAD_ID_LEGACY ||
+			 hdr.xlp_thread_id == cmd->adg_thread_id))
+		{
+			if (scanptr > cmd->startpoint)
+			{
+				cmd->startpoint = scanptr;
+				ereport(LOG,
+						(errmsg("ADG thread-bound WAL streaming advanced startpoint for thread %u from %X/%X to %X/%X",
+								(unsigned) cmd->adg_thread_id,
+								LSN_FORMAT_ARGS(original_startpoint),
+								LSN_FORMAT_ARGS(cmd->startpoint))));
+			}
+			return;
+		}
+
+		scanptr += XLOG_BLCKSZ;
+	}
+}
 #endif
 
 /*
@@ -770,8 +818,6 @@ StartReplication(StartReplicationCmd *cmd)
 
 #ifdef USE_PGRAC_CLUSTER
 	WalSndValidateAdgThreadBinding(cmd);
-	if (cmd->adg_thread_id != 0)
-		xlogreader->cluster_expected_thread_id = cmd->adg_thread_id;
 #else
 	if (cmd->adg_thread_id != 0)
 		ereport(ERROR,
@@ -904,6 +950,11 @@ StartReplication(StartReplicationCmd *cmd)
 		 * Don't allow a request to stream from a future point in WAL that
 		 * hasn't been flushed to disk in this server yet.
 		 */
+#ifdef USE_PGRAC_CLUSTER
+		WalSndAdjustAdgThreadStartpoint(cmd, FlushPtr, sendTimeLine);
+		if (cmd->adg_thread_id != 0)
+			xlogreader->cluster_expected_thread_id = cmd->adg_thread_id;
+#endif
 		if (FlushPtr < cmd->startpoint)
 		{
 			ereport(ERROR,

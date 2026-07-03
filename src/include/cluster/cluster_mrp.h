@@ -71,6 +71,7 @@ typedef struct ClusterMrpSharedState {
 	pg_atomic_uint64 ready_at_us;
 	pg_atomic_uint64 stopped_at_us;
 	struct Latch *apply_lease_qvotec_latch;
+	struct Latch *apply_latch;
 	pg_atomic_uint64 apply_lease_request_seq;
 	pg_atomic_uint64 pending_apply_lease_seq;
 	pg_atomic_uint64 apply_lease_completion_seq;

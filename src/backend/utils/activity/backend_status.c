@@ -73,6 +73,7 @@ static MemoryContext backendStatusSnapContext;
 
 
 static void pgstat_beshutdown_hook(int code, Datum arg);
+static void pgstat_init_backend_status_slot(int slotno);
 static void pgstat_read_current_status(void);
 static void pgstat_setup_backend_status_context(void);
 
@@ -248,16 +249,23 @@ CreateSharedBackendStatus(void)
 void
 pgstat_beinit(void)
 {
+	int			slotno;
+
 	/* Initialize MyBEEntry */
 	if (MyBackendId != InvalidBackendId)
 	{
 		Assert(MyBackendId >= 1 && MyBackendId <= MaxBackends);
-		MyBEEntry = &BackendStatusArray[MyBackendId - 1];
+		if (MyBackendId < 1 || MyBackendId > MaxBackends)
+			elog(PANIC, "invalid backend ID %d for backend status slot", MyBackendId);
+		slotno = MyBackendId - 1;
 	}
 	else
 	{
 		/* Must be an auxiliary process */
 		Assert(MyAuxProcType != NotAnAuxProcess);
+		if (MyAuxProcType < 0 || MyAuxProcType >= NUM_AUXPROCTYPES)
+			elog(PANIC, "invalid auxiliary process type %d for backend status slot",
+				 (int) MyAuxProcType);
 
 		/*
 		 * Assign the MyBEEntry for an auxiliary process.  Since it doesn't
@@ -267,11 +275,47 @@ pgstat_beinit(void)
 		 * MaxBackends + AuxProcType as the index of the slot for an auxiliary
 		 * process.
 		 */
-		MyBEEntry = &BackendStatusArray[MaxBackends + MyAuxProcType];
+		slotno = MaxBackends + MyAuxProcType;
 	}
+
+	if (slotno < 0 || slotno >= NumBackendStatSlots)
+		elog(PANIC, "backend status slot %d outside valid range 0..%d",
+			 slotno, NumBackendStatSlots - 1);
+
+	MyBEEntry = &BackendStatusArray[slotno];
+	pgstat_init_backend_status_slot(slotno);
 
 	/* Set up a process-exit hook to clean up */
 	on_shmem_exit(pgstat_beshutdown_hook, 0);
+}
+
+/*
+ * Make sure the selected backend status slot's out-of-line fields point at
+ * their per-slot buffers before pgstat_bestart() writes through them.
+ */
+static void
+pgstat_init_backend_status_slot(int slotno)
+{
+	if (BackendStatusArray == NULL || BackendAppnameBuffer == NULL
+		|| BackendClientHostnameBuffer == NULL || BackendActivityBuffer == NULL)
+		elog(PANIC, "backend status shared memory is not initialized");
+
+	BackendStatusArray[slotno].st_appname = BackendAppnameBuffer + (slotno * NAMEDATALEN);
+	BackendStatusArray[slotno].st_clienthostname
+		= BackendClientHostnameBuffer + (slotno * NAMEDATALEN);
+	BackendStatusArray[slotno].st_activity_raw
+		= BackendActivityBuffer + (slotno * pgstat_track_activity_query_size);
+
+#ifdef USE_SSL
+	if (BackendSslStatusBuffer == NULL)
+		elog(PANIC, "backend SSL status shared memory is not initialized");
+	BackendStatusArray[slotno].st_sslstatus = BackendSslStatusBuffer + slotno;
+#endif
+#ifdef ENABLE_GSS
+	if (BackendGssStatusBuffer == NULL)
+		elog(PANIC, "backend GSS status shared memory is not initialized");
+	BackendStatusArray[slotno].st_gssstatus = BackendGssStatusBuffer + slotno;
+#endif
 }
 
 

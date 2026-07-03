@@ -32,6 +32,8 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "access/htup_details.h"
+#include "access/transam.h"
+#include "access/xlog.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 
@@ -98,6 +100,23 @@ resolve_from_remote_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref,
 	out->status = CLUSTER_TT_STATUS_UNKNOWN;
 	out->commit_scn = InvalidScn;
 
+	/*
+	 * ADG physical standby replay is not the generic cross-node raw-xid case:
+	 * pg_xact and the heap page both come from the same primary WAL stream.
+	 * If the replayed ITL slot already carries a committed status plus a real
+	 * commit_scn, CLOG-confirm it and use that exact page evidence.  This keeps
+	 * prepared/in-progress xids fail-closed and leaves ordinary remote-origin
+	 * reads on the overlay/durable-TT path below.
+	 */
+	if (cluster_enable_adg && cluster_dg_role == CLUSTER_DG_ROLE_STANDBY && RecoveryInProgress()
+		&& ref->has_cached_status && SCN_VALID(ref->cached_commit_scn)
+		&& TransactionIdDidCommit(raw_xid)) {
+		out->status = CLUSTER_TT_STATUS_COMMITTED;
+		out->commit_scn = ref->cached_commit_scn;
+		cluster_xp_end(&xp_scope); /* PGRAC: spec-5.59 D3 profiling */
+		return;
+	}
+
 	memset(&key, 0, sizeof(key));
 	key.origin_node_id = ref->origin_node_id;
 	key.undo_segment_id = ref->undo_segment_id;
@@ -157,6 +176,24 @@ classify_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRecPtr 
 	if (ref->tt_slot_id == 0) {
 		/* spec-3.1 placeholder slot: not authoritative evidence. */
 		out->evidence = CLUSTER_VIS_EVIDENCE_NONE;
+		return;
+	}
+
+	/*
+	 * ADG attach/read nodes can read user pages flushed by the elected Apply
+	 * Master without having replayed the matching commit record into their own
+	 * pg_xact / TT overlay.  For those nodes the replayed page itself is the
+	 * authority, but only for an exact, terminal ITL binding: the slot must still
+	 * belong to this tuple-side xid and must carry a committed cached SCN.
+	 * ACTIVE, ABORTED, invalid-SCN, and recycled slots continue through the
+	 * ordinary local/remote fail-closed paths below.
+	 */
+	if (cluster_enable_adg && cluster_dg_role == CLUSTER_DG_ROLE_STANDBY && RecoveryInProgress()
+		&& ref->local_xid == raw_xid && ref->has_cached_status
+		&& SCN_VALID(ref->cached_commit_scn)) {
+		out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
+		out->status = CLUSTER_TT_STATUS_COMMITTED;
+		out->commit_scn = ref->cached_commit_scn;
 		return;
 	}
 

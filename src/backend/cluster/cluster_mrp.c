@@ -119,6 +119,20 @@ cluster_mrp_wakeup_recovery(void)
 }
 
 static void
+cluster_mrp_wakeup_apply(void)
+{
+	Latch *latch;
+
+	if (cluster_mrp_state == NULL)
+		return;
+
+	latch = cluster_mrp_state->apply_latch;
+	if (latch != NULL)
+		SetLatch(latch);
+	cluster_mrp_wakeup_recovery();
+}
+
+static void
 cluster_mrp_apply_master_token_begin_update(void)
 {
 	if (cluster_mrp_state == NULL)
@@ -964,6 +978,7 @@ cluster_mrp_shmem_init(void)
 		pg_atomic_init_u64(&cluster_mrp_state->ready_at_us, 0);
 		pg_atomic_init_u64(&cluster_mrp_state->stopped_at_us, 0);
 		cluster_mrp_state->apply_lease_qvotec_latch = NULL;
+		cluster_mrp_state->apply_latch = NULL;
 		pg_atomic_init_u64(&cluster_mrp_state->apply_lease_request_seq, 0);
 		pg_atomic_init_u64(&cluster_mrp_state->pending_apply_lease_seq, 0);
 		pg_atomic_init_u64(&cluster_mrp_state->apply_lease_completion_seq, 0);
@@ -1001,6 +1016,22 @@ cluster_mrp_publish_qvotec_latch(struct Latch *latch)
 		return;
 	cluster_mrp_state->apply_lease_qvotec_latch = latch;
 	on_shmem_exit(cluster_mrp_clear_qvotec_latch, (Datum)0);
+}
+
+static void
+cluster_mrp_clear_apply_latch(int code pg_attribute_unused(), Datum arg pg_attribute_unused())
+{
+	if (cluster_mrp_state != NULL && cluster_mrp_state->apply_latch == MyLatch)
+		cluster_mrp_state->apply_latch = NULL;
+}
+
+static void
+cluster_mrp_publish_apply_latch(void)
+{
+	if (cluster_mrp_state == NULL)
+		return;
+	cluster_mrp_state->apply_latch = MyLatch;
+	on_shmem_exit(cluster_mrp_clear_apply_latch, (Datum)0);
 }
 
 bool
@@ -1208,6 +1239,9 @@ cluster_mrp_streaming_snapshot(uint64 bitmap[2], XLogRecPtr start_lsn[], XLogRec
 		uint64 start = pg_atomic_read_u64(&cluster_mrp_state->thread_start_lsn[thread_id]);
 		uint64 receive = pg_atomic_read_u64(&cluster_mrp_state->thread_receive_lsn[thread_id]);
 		uint64 apply = pg_atomic_read_u64(&cluster_mrp_state->thread_apply_lsn[thread_id]);
+		uint64 barrier = pg_atomic_read_u64(&cluster_mrp_state->thread_barrier_lsn[thread_id]);
+		uint64 barrier_scn_raw
+			= pg_atomic_read_u64(&cluster_mrp_state->thread_barrier_scn[thread_id]);
 		XLogRecPtr effective_start;
 		uint16 bit;
 		uint16 word;
@@ -1229,11 +1263,9 @@ cluster_mrp_streaming_snapshot(uint64 bitmap[2], XLogRecPtr start_lsn[], XLogRec
 		if (receive_lsn != NULL)
 			receive_lsn[thread_id] = (XLogRecPtr)receive;
 		if (barrier_lsn != NULL)
-			barrier_lsn[thread_id]
-				= (XLogRecPtr)pg_atomic_read_u64(&cluster_mrp_state->thread_barrier_lsn[thread_id]);
+			barrier_lsn[thread_id] = (XLogRecPtr)barrier;
 		if (barrier_scn != NULL)
-			barrier_scn[thread_id]
-				= (SCN)pg_atomic_read_u64(&cluster_mrp_state->thread_barrier_scn[thread_id]);
+			barrier_scn[thread_id] = (SCN)barrier_scn_raw;
 		count++;
 		if (count > expected_threads)
 			return 0;
@@ -1271,6 +1303,7 @@ void
 cluster_mrp_mark_thread_received(uint16 thread_id, XLogRecPtr receive_lsn)
 {
 	uint64 old_lsn;
+	bool advanced;
 
 	if (cluster_mrp_state == NULL)
 		return;
@@ -1283,6 +1316,7 @@ cluster_mrp_mark_thread_received(uint16 thread_id, XLogRecPtr receive_lsn)
 	old_lsn = pg_atomic_read_u64(&cluster_mrp_state->thread_receive_lsn[thread_id]);
 	if (old_lsn > (uint64)receive_lsn)
 		return;
+	advanced = old_lsn < (uint64)receive_lsn;
 
 	pg_atomic_write_u64(&cluster_mrp_state->thread_receive_lsn[thread_id], (uint64)receive_lsn);
 	pg_atomic_write_u64(&cluster_mrp_state->thread_receive_time_us[thread_id],
@@ -1290,6 +1324,8 @@ cluster_mrp_mark_thread_received(uint16 thread_id, XLogRecPtr receive_lsn)
 	old_lsn = pg_atomic_read_u64(&cluster_mrp_state->receive_lsn);
 	if (old_lsn <= (uint64)receive_lsn)
 		pg_atomic_write_u64(&cluster_mrp_state->receive_lsn, (uint64)receive_lsn);
+	if (advanced)
+		cluster_mrp_wakeup_apply();
 }
 
 void
@@ -1404,6 +1440,7 @@ MrpMain(void)
 
 	cluster_mrp_set_state(CLUSTER_MRP_READY);
 	pg_atomic_write_u64(&cluster_mrp_state->ready_at_us, (uint64)GetCurrentTimestamp());
+	cluster_mrp_publish_apply_latch();
 	next_lease_check_ms = 0;
 
 	for (;;) {
