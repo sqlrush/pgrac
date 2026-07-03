@@ -232,8 +232,15 @@ is($node->safe_psql('postgres',
 is($node->safe_psql('postgres',
 	q{SELECT setting || '|' || vartype || '|' || context
 	    FROM pg_settings WHERE name = 'cluster.apply_master_election'}),
-	'on|bool|sighup',
+	'on|bool|postmaster',
 	'cluster.apply_master_election default and context');
+
+# spec-6.4 Hardening v1.1: lease takeover requires a grace past expiry.
+is($node->safe_psql('postgres',
+	q{SELECT setting || '|' || vartype || '|' || context
+	    FROM pg_settings WHERE name = 'cluster.adg_lease_takeover_grace_ms'}),
+	'5000|integer|sighup',
+	'cluster.adg_lease_takeover_grace_ms default and context');
 is($node->safe_psql('postgres',
 	q{SELECT setting || '|' || vartype || '|' || context
 	    FROM pg_settings WHERE name = 'cluster.apply_master_switch_drain_ms'}),

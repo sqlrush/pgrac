@@ -627,7 +627,8 @@ seconds, apply rate, and `standby_consistent_scn`.
 | `cluster.dg_role` | `primary` | postmaster | Selects primary or ADG standby behavior. |
 | `cluster.dg_mode` | `async` | sighup | Shipping acknowledgement mode: `async`, `sync`, or `max_availability`. |
 | `cluster.enable_adg` | `off` | postmaster | Starts ADG MRP/read-only standby paths when role is `standby`. |
-| `cluster.apply_master_election` | `on` | sighup | Uses the durable voting-disk Apply Master lease. |
+| `cluster.apply_master_election` | `on` | postmaster | Uses the durable voting-disk Apply Master lease. Turning it off is only accepted on a single-node standby cluster. |
+| `cluster.adg_lease_takeover_grace_ms` | `5000` | sighup | Extra wait past Apply Master lease expiry before another standby may take it over; also bounds how long an unrenewed master keeps writing. |
 | `cluster.adg_lag_threshold_sec` | `10` | sighup | Read-only service lag threshold. |
 | `cluster.apply_master_max_lag_ms` | `5000` | sighup | Lag threshold surfaced by ADG status views. |
 | `cluster.max_standby_delay` | `30` | sighup | Maximum standby read delay before apply conflict handling. |

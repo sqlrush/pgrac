@@ -59,7 +59,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "access/xlog.h" /* GetXLogWriteRecPtr, GetWALInsertionTimeLine */
+#include "access/xlog.h"		 /* GetXLogWriteRecPtr, GetWALInsertionTimeLine */
+#include "access/xlogrecovery.h" /* GetXLogReplayRecPtr (spec-6.4 standby stop) */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_scn.h"
@@ -266,13 +267,30 @@ cluster_wal_state_ensure(void)
 
 /*
  * fill_own_slot -- collect the live fields for this node's slot.
+ *
+ *	spec-6.4: an ADG standby publishes STOPPED while it is still in
+ *	recovery -- it never leaves it -- so the insertion timeline does not
+ *	exist yet (GetWALInsertionTimeLine() asserts RECOVERY_STATE_DONE) and
+ *	the write pointer tracks nothing.  Publish the replay position and its
+ *	timeline instead; on a primary the original insertion-side values are
+ *	unchanged.
  */
 static void
 fill_own_slot(ClusterWalStateSlot *slot, uint32 state, int64 started_at)
 {
-	cluster_wal_state_slot_fill(slot, cluster_wal_thread_id(), cluster_node_id, state,
-								(uint32)GetWALInsertionTimeLine(), started_at,
-								(int64)GetCurrentTimestamp(), (uint64)GetXLogWriteRecPtr(),
+	TimeLineID tli;
+	XLogRecPtr write_ptr;
+
+	if (RecoveryInProgress()) {
+		tli = 0;
+		write_ptr = GetXLogReplayRecPtr(&tli);
+	} else {
+		tli = GetWALInsertionTimeLine();
+		write_ptr = GetXLogWriteRecPtr();
+	}
+
+	cluster_wal_state_slot_fill(slot, cluster_wal_thread_id(), cluster_node_id, state, (uint32)tli,
+								started_at, (int64)GetCurrentTimestamp(), (uint64)write_ptr,
 								(uint64)cluster_scn_current());
 }
 
