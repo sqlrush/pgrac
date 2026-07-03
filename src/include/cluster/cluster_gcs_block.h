@@ -1066,6 +1066,12 @@ extern bool cluster_bufmgr_copy_block_for_gcs_smart_fusion(BufferTag tag, XLogRe
 /* PGRAC: spec-2.36 D4 (HC118 / HC123) — by-tag invalidate wrapper for
  * holder-side INVALIDATE handler.  XLogFlush+InvalidateBuffer. */
 extern PcmLockMode cluster_bufmgr_block_pcm_state(BufferTag tag);
+/* PGRAC: spec-6.12g — no-fetch resident-buffer acquire for the commit-time
+ * ITL stamp; residency proves ownership (a self-contained transfer drops the
+ * copy).  InvalidBuffer -> block transferred away -> skip the stamp. */
+extern Buffer cluster_bufmgr_lock_resident_for_stamp(RelFileLocator rlocator, ForkNumber forknum,
+													 BlockNumber blocknum);
+extern void cluster_bufmgr_unlock_resident_stamp(Buffer buffer);
 extern bool cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode,
 													XLogRecPtr *out_page_lsn, SCN *out_page_scn);
 /* PGRAC: spec-5.2 D11 (writer-transfer-revoke) — by-tag local buffer drop

@@ -47,11 +47,13 @@
 
 #include "access/generic_xlog.h" /* GenericXLog delta WAL (spec-3.4a D8) */
 #include "cluster/cluster_conf.h"
-#include "cluster/cluster_guc.h" /* cluster_enabled */
-#include "cluster/cluster_itl.h" /* stamp_committed / stamp_aborted */
+#include "cluster/cluster_gcs_block.h" /* spec-6.12g resident-stamp acquire */
+#include "cluster/cluster_guc.h"	   /* cluster_enabled / block_self_contained */
+#include "cluster/cluster_itl.h"	   /* stamp_committed / stamp_aborted */
 #include "cluster/cluster_itl_touch.h"
-#include "cluster/cluster_mode.h" /* cluster_storage_mode_enabled */
-#include "storage/bufmgr.h"		  /* ReadBufferWithoutRelcache / ReleaseBuffer */
+#include "cluster/cluster_mode.h"		 /* cluster_storage_mode_enabled */
+#include "cluster/cluster_xnode_lever.h" /* spec-6.12g stamp-skip counter */
+#include "storage/bufmgr.h"				 /* ReadBufferWithoutRelcache / ReleaseBuffer */
 #include "storage/buf_internals.h"
 #include "utils/memutils.h"
 
@@ -497,6 +499,7 @@ itl_finish_flush_batch(ItlFinishBatchCtx *bctx)
 {
 	GenericXLogState *state;
 	Buffer bufs[MAX_GENERIC_XLOG_PAGES];
+	bool self_contained_buf[MAX_GENERIC_XLOG_PAGES];
 	uint8 nbufs = 0;
 	uint8 p;
 
@@ -507,29 +510,65 @@ itl_finish_flush_batch(ItlFinishBatchCtx *bctx)
 
 	for (p = 0; p < bctx->npages; p++) {
 		const ClusterItlPagedHandle *page_handle = &bctx->pages[p];
-		ClusterItlTouchHandle key_handle;
 		Page image;
 		uint8 i;
+		Buffer buf;
+		bool via_resident = false;
 
-		memset(&key_handle, 0, sizeof(key_handle));
-		key_handle.rloc = page_handle->rloc;
-		key_handle.forknum = page_handle->forknum;
-		key_handle.block = page_handle->block;
-		key_handle.slot_idx = 0;
-		key_handle.flags = page_handle->flags;
+		/*
+		 * PGRAC: spec-6.12g D-g1 -- opportunistic commit cleanout.  When
+		 * block self-containment is on, stamp the ITL slot only if the block
+		 * is STILL RESIDENT here (a NO-FETCH lookup): a self-contained
+		 * X-transfer drops the holder's copy as it ships, so a resident
+		 * block was never transferred away and is ours to stamp.  A block
+		 * that drifted away is SKIPPED -- its ACTIVE slot stays unstamped and
+		 * every reader resolves its committed-ness through the TT authority
+		 * (ITL->UBA->TT, AD-006), exactly as for any remote ITL ref.  Never
+		 * re-fetch: stamping a re-fetched copy of a block we no longer own
+		 * would trip the P0-2 stamp assert or flush a stale image over the
+		 * new holder's version (8.A).
+		 */
+		if (cluster_block_self_contained) {
+			buf = cluster_bufmgr_lock_resident_for_stamp(page_handle->rloc, page_handle->forknum,
+														 page_handle->block);
+			if (!BufferIsValid(buf)) {
+				cluster_lever_g_note_stamp_skipped();
+				continue; /* drifted away -> TT is the authority */
+			}
+			via_resident = true;
+		} else {
+			ClusterItlTouchHandle key_handle;
 
-		bufs[nbufs] = itl_touch_acquire_buffer(&key_handle);
-		image = GenericXLogRegisterBuffer(state, bufs[nbufs], 0);
+			memset(&key_handle, 0, sizeof(key_handle));
+			key_handle.rloc = page_handle->rloc;
+			key_handle.forknum = page_handle->forknum;
+			key_handle.block = page_handle->block;
+			key_handle.slot_idx = 0;
+			key_handle.flags = page_handle->flags;
+			buf = itl_touch_acquire_buffer(&key_handle);
+		}
+
+		bufs[nbufs] = buf;
+		self_contained_buf[nbufs] = via_resident;
+		image = GenericXLogRegisterBuffer(state, buf, 0);
 		nbufs++;
 
 		for (i = 0; i < page_handle->nslots; i++)
 			itl_finish_stamp_page(image, page_handle->slot_indices[i], &bctx->finish);
 	}
 
-	GenericXLogFinish(state);
+	/* Every page in this batch drifted away -> nothing to log (D-g1). */
+	if (nbufs == 0)
+		GenericXLogAbort(state);
+	else
+		GenericXLogFinish(state);
 
-	for (p = 0; p < nbufs; p++)
-		itl_touch_release_buffer(bufs[p]);
+	for (p = 0; p < nbufs; p++) {
+		if (self_contained_buf[p])
+			cluster_bufmgr_unlock_resident_stamp(bufs[p]);
+		else
+			itl_touch_release_buffer(bufs[p]);
+	}
 
 	bctx->npages = 0;
 }

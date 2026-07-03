@@ -2856,6 +2856,9 @@ dump_xnode_lever(ReturnSetInfo *rsinfo)
 	XNL_ROW(e1_drain_count);
 	XNL_ROW(e1_grant_count);
 	XNL_ROW(e1_invariant_violation_count);
+	XNL_ROW(g_active_itl_transfer_count);
+	XNL_ROW(g_stamp_skipped_count);
+	XNL_ROW(g_drift_resolved_via_tt_count);
 #undef XNL_ROW
 }
 

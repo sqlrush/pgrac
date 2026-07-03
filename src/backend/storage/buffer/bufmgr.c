@@ -6604,6 +6604,91 @@ cluster_bufmgr_downgrade_x_to_s_for_gcs(BufferTag tag)
 }
 
 /* ========================================================================
+ * PGRAC MODIFICATIONS by SqlRush — spec-6.12g (block self-containment,
+ * opportunistic commit cleanout).
+ *
+ *   cluster_bufmgr_lock_resident_for_stamp(rlocator, forknum, blocknum) —
+ *   a NO-FETCH resident-buffer acquire for the commit-time ITL stamp path.
+ *   Returns a normally-pinned + content-lock-EXCLUSIVE Buffer iff the block
+ *   is ALREADY resident in this backend's buffer pool; InvalidBuffer
+ *   otherwise (never reads from storage / cache-fusion).
+ *
+ *   Residency IS the ownership proof under spec-6.12g: a self-contained
+ *   X-transfer (cluster_gcs_block.c D-g2) InvalidateBuffer-drops the
+ *   holder's copy as it ships, so a block still resident here was NOT
+ *   transferred away and its ITL slots are ours to stamp.  Stamping a
+ *   re-fetched copy of a block we no longer own would either trip the
+ *   P0-2 stamp assert or (worse) later flush a stale image over the new
+ *   holder's version -- hence the NO-FETCH contract (a freshly-fetched
+ *   buffer's pcm_state is not an authoritative ownership signal).
+ *
+ *   Caller MUST release with cluster_bufmgr_unlock_resident_stamp().  Runs
+ *   in a backend at commit (has a resource owner), so the standard
+ *   PinBuffer_Locked / ReleaseBuffer accounting applies (unlike the LMON
+ *   raw-pin helpers).
+ * ======================================================================== */
+Buffer
+cluster_bufmgr_lock_resident_for_stamp(RelFileLocator rlocator, ForkNumber forknum,
+									   BlockNumber blocknum)
+{
+	BufferTag	tag;
+	uint32		hashcode;
+	LWLock	   *partition_lock;
+	int			buf_id;
+	BufferDesc *buf;
+
+	InitBufferTag(&tag, &rlocator, forknum, blocknum);
+	hashcode = BufTableHashCode(&tag);
+	partition_lock = BufMappingPartitionLock(hashcode);
+
+	ReservePrivateRefCountEntry();
+	ResourceOwnerEnlargeBuffers(CurrentResourceOwner);
+
+	LWLockAcquire(partition_lock, LW_SHARED);
+	buf_id = BufTableLookup(&tag, hashcode);
+	if (buf_id < 0)
+	{
+		/* Not resident -> transferred away (or never cached).  Skip stamp. */
+		LWLockRelease(partition_lock);
+		return InvalidBuffer;
+	}
+	buf = GetBufferDescriptor(buf_id);
+
+	/* Pin under the header spinlock, then drop the partition lock (the pin
+	 * keeps the identity stable), and take the content lock EXCLUSIVE for the
+	 * GenericXLog stamp mutation. */
+	LockBufHdr(buf);
+	PinBuffer_Locked(buf);		/* releases the header spinlock */
+	LWLockRelease(partition_lock);
+
+	LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE);
+
+	/* Re-validate under the content lock: a concurrent transfer could have
+	 * evicted + reused this descriptor between the pin and the lock. */
+	if (!BufferTagsEqual(&buf->tag, &tag)
+		|| (pg_atomic_read_u32(&buf->state) & BM_VALID) == 0)
+	{
+		LWLockRelease(BufferDescriptorGetContentLock(buf));
+		ReleaseBuffer(BufferDescriptorGetBuffer(buf));
+		return InvalidBuffer;
+	}
+
+	return BufferDescriptorGetBuffer(buf);
+}
+
+void
+cluster_bufmgr_unlock_resident_stamp(Buffer buffer)
+{
+	BufferDesc *buf;
+
+	if (!BufferIsValid(buffer))
+		return;
+	buf = GetBufferDescriptor(buffer - 1);
+	LWLockRelease(BufferDescriptorGetContentLock(buf));
+	ReleaseBuffer(buffer);
+}
+
+/* ========================================================================
  * PGRAC MODIFICATIONS by SqlRush — spec-6.12a ㉕ (remote-holder X->S
  * downgrade).
  *

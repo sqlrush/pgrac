@@ -95,6 +95,18 @@ typedef struct ClusterXnodeLeverShared {
 	pg_atomic_uint64 e1_drain_count;			   /* release drains verified */
 	pg_atomic_uint64 e1_grant_count;			   /* identities granted by drains */
 	pg_atomic_uint64 e1_invariant_violation_count; /* 8.A-dual: MUST stay 0 */
+
+	/* ---- wave g: block self-containment (active-ITL migration) ---- */
+	pg_atomic_uint64 g_active_itl_transfer_count;	/* X-transfers shipped WITH an
+													* uncommitted ITL slot (D11
+													* deferral lifted) */
+	pg_atomic_uint64 g_stamp_skipped_count;			/* commit cleanouts that skipped
+													* the stamp (block not resident;
+													* drifted ITL -> TT authority) */
+	pg_atomic_uint64 g_drift_resolved_via_tt_count; /* reader resolutions of a
+													 * stamp-skipped ACTIVE slot
+													 * that the TT authority
+													 * decided (observability) */
 } ClusterXnodeLeverShared;
 
 /* Set once by shmem init; NULL until the region is attached. */
@@ -131,5 +143,13 @@ extern void cluster_lever_a_note_downgrade(bool downgraded);
 extern void cluster_lever_a_note_fwd_oneshot(void);
 extern void cluster_lever_a_note_remote_downgrade(bool downgraded);
 extern void cluster_lever_a_note_remote_ack_degraded(void);
+
+/*
+ * Wave-g counters (block self-containment; gated on cluster.block_self_contained
+ * or cluster.xnode_profile inside).
+ */
+extern void cluster_lever_g_note_active_itl_transfer(void);
+extern void cluster_lever_g_note_stamp_skipped(void);
+extern void cluster_lever_g_note_drift_resolved_via_tt(void);
 
 #endif /* CLUSTER_XNODE_LEVER_H */

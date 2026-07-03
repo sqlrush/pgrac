@@ -3791,7 +3791,19 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 					   || (GcsBlockForwardPayloadIsXTransfer(fwd)
 						   && (fwd->transition_id == PCM_TRANS_N_TO_X
 							   || fwd->transition_id == PCM_TRANS_S_TO_X_UPGRADE)
-						   && cluster_itl_page_has_active_slot((Page)block_payload))) {
+						   && cluster_itl_page_has_active_slot((Page)block_payload)
+						   /* PGRAC: spec-6.12g D-g2 — with block self-containment
+							* the active-ITL X-transfer is NO LONGER deferred: the
+							* block ships WITH its uncommitted ITL and is dropped
+							* here (falls to the destructive-transfer branch below).
+							* The holder's later commit skips the stamp for this
+							* now-drifted block (D-g1) and readers resolve the
+							* migrated ACTIVE slot through the TT authority (AD-006).
+							* A same-ROW writer on the new holder still serializes
+							* through the cross-node TX enqueue wait (spec-5.2 D4/D5,
+							* t/280); only the same-block DIFFERENT-row false
+							* serialization is removed. */
+						   && !cluster_block_self_contained)) {
 				/* Holder keeps its X; the requester consumes this image —
 				 * read-image (D2) reads once and never registers as an S holder,
 				 * X-transfer deferral (D11) sees the row lock and waits, retrying
@@ -3832,6 +3844,16 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 				if (GcsBlockForwardPayloadIsXTransfer(fwd)
 					&& hdr->status == (uint8)GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER) {
 					XLogRecPtr drop_lsn = InvalidXLogRecPtr;
+
+					/*
+					 * PGRAC: spec-6.12g D-g2 — count a transfer that carries an
+					 * uncommitted ITL slot (the D11 deferral we just lifted).
+					 * block_payload still points at the current image here, so
+					 * the active-ITL probe is exact.
+					 */
+					if (cluster_block_self_contained
+						&& cluster_itl_page_has_active_slot((Page)block_payload))
+						cluster_lever_g_note_active_itl_transfer();
 
 					if (block_payload_release_cb != NULL) {
 						memcpy(block_buf, block_payload, GCS_BLOCK_DATA_SIZE);

@@ -92,6 +92,9 @@ bool cluster_read_scache = false;
 bool cluster_ges_handoff = false;
 /* spec-6.12b: cross-instance CR-server data plane (default OFF = 53R9G). */
 bool cluster_crossnode_cr_data_plane = false;
+/* spec-6.12g: block self-containment (active-ITL migration + opportunistic
+ * commit cleanout; default OFF = the spec-5.2 D11 writer-transfer deferral). */
+bool cluster_block_self_contained = false;
 /* spec-6.12d: instance space-affinity mode + lease cap (default OFF). */
 int cluster_space_affinity = CLUSTER_SPACE_AFFINITY_OFF;
 int cluster_space_lease_blocks = 64;
@@ -1394,6 +1397,30 @@ cluster_init_guc(void)
 		gettext_noop("Enable the cross-instance CR-server data plane (spec-6.12b)."),
 		gettext_noop("Off keeps cross-instance CR fail-closed (SQLSTATE 53R9G)."),
 		&cluster_crossnode_cr_data_plane, false, PGC_SUSET, 0, NULL, NULL, NULL);
+
+	/*
+	 * cluster.block_self_contained -- spec-6.12 wave g (write-write
+	 * collapse root).  When on, a block may be X-transferred across
+	 * instances WITH an uncommitted (ACTIVE) ITL slot -- the spec-5.2 D11
+	 * deferral that kept a block pinned to its holder until the holder's
+	 * transaction went terminal is lifted, so a same-block DIFFERENT-row
+	 * writer no longer waits on the holder's unrelated row.  The holder's
+	 * later commit stamps the ITL slot only if the block is still resident
+	 * (opportunistic cleanout); a drifted ACTIVE slot is left unstamped and
+	 * every reader resolves its committed-ness through the TT authority
+	 * (ITL->UBA->TT, AD-006), exactly as for any remote ITL ref.  SAME-row
+	 * conflicts still serialize through the cross-node TX enqueue wait
+	 * (spec-5.2 D4/D5, t/280).  8.A: the TT is the SOLE post-stamp-skip
+	 * commit_scn authority; any UNKNOWN resolution fails closed (53R97 /
+	 * 53R9G), never visible.  Default OFF: the D11 deferral is
+	 * byte-identical.  SUSET for a measurement / chaos window.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.block_self_contained",
+		gettext_noop("Allow active-ITL block migration + opportunistic commit cleanout "
+					 "(spec-6.12g)."),
+		gettext_noop("Off keeps the spec-5.2 D11 writer-transfer deferral for active-ITL blocks."),
+		&cluster_block_self_contained, false, PGC_SUSET, 0, NULL, NULL, NULL);
 
 	/*
 	 * cluster.space_affinity -- spec-6.12 wave d (static).  static makes

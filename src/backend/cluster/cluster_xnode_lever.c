@@ -78,9 +78,18 @@ cluster_xnode_lever_shmem_init(void)
 		pg_atomic_init_u64(&ClusterXnodeLeverCtl->a_downgrade_count, 0);
 		pg_atomic_init_u64(&ClusterXnodeLeverCtl->a_downgrade_refused_count, 0);
 		pg_atomic_init_u64(&ClusterXnodeLeverCtl->a_fwd_oneshot_count, 0);
+		/* spec-6.12a ㉕ — explicit init (belt-and-suspenders for non-lockfree
+		 * u64 atomic platforms; memset alone is not the pg_atomic contract). */
+		pg_atomic_init_u64(&ClusterXnodeLeverCtl->a_remote_downgrade_count, 0);
+		pg_atomic_init_u64(&ClusterXnodeLeverCtl->a_remote_downgrade_refused_count, 0);
+		pg_atomic_init_u64(&ClusterXnodeLeverCtl->a_remote_ack_degraded_count, 0);
 		pg_atomic_init_u64(&ClusterXnodeLeverCtl->e1_drain_count, 0);
 		pg_atomic_init_u64(&ClusterXnodeLeverCtl->e1_grant_count, 0);
 		pg_atomic_init_u64(&ClusterXnodeLeverCtl->e1_invariant_violation_count, 0);
+		/* spec-6.12g */
+		pg_atomic_init_u64(&ClusterXnodeLeverCtl->g_active_itl_transfer_count, 0);
+		pg_atomic_init_u64(&ClusterXnodeLeverCtl->g_stamp_skipped_count, 0);
+		pg_atomic_init_u64(&ClusterXnodeLeverCtl->g_drift_resolved_via_tt_count, 0);
 	}
 }
 
@@ -255,4 +264,40 @@ cluster_lever_a_note_remote_ack_degraded(void)
 	if (!lever_a_counting())
 		return;
 	pg_atomic_fetch_add_u64(&ClusterXnodeLeverCtl->a_remote_ack_degraded_count, 1);
+}
+
+/* ---------------- wave-g measure hooks ---------------- */
+
+static inline bool
+lever_g_counting(void)
+{
+	return (cluster_block_self_contained || cluster_xnode_profile_enabled)
+		   && ClusterXnodeLeverCtl != NULL;
+}
+
+/* spec-6.12g — an X-transfer shipped WITH an uncommitted ITL slot. */
+void
+cluster_lever_g_note_active_itl_transfer(void)
+{
+	if (!lever_g_counting())
+		return;
+	pg_atomic_fetch_add_u64(&ClusterXnodeLeverCtl->g_active_itl_transfer_count, 1);
+}
+
+/* spec-6.12g — a commit cleanout that skipped the stamp (block not resident). */
+void
+cluster_lever_g_note_stamp_skipped(void)
+{
+	if (!lever_g_counting())
+		return;
+	pg_atomic_fetch_add_u64(&ClusterXnodeLeverCtl->g_stamp_skipped_count, 1);
+}
+
+/* spec-6.12g — a reader resolved a stamp-skipped ACTIVE slot via the TT. */
+void
+cluster_lever_g_note_drift_resolved_via_tt(void)
+{
+	if (!lever_g_counting())
+		return;
+	pg_atomic_fetch_add_u64(&ClusterXnodeLeverCtl->g_drift_resolved_via_tt_count, 1);
 }
