@@ -196,6 +196,13 @@ required durable-TT or retention evidence.  Missing or contradictory
 evidence fails closed; there is no native CLOG fallback or
 UNKNOWN-visible behavior.
 
+Known limitation: the current substrate does not re-parse terminal
+authority references across a membership reconfiguration.  A reference
+captured under an older membership epoch fails closed as `INDOUBT` /
+UNKNOWN after the epoch advances, even if a later lookup could prove the
+same terminal outcome.  Keep this GUC `off` outside targeted validation
+until a future release adds epoch revalidation.
+
 ### `cluster.cf_delayed_cleanout`
 
 | | |
