@@ -450,6 +450,12 @@ void
 cluster_write_fence_reject_if_fenced(const char *op pg_attribute_unused())
 {}
 
+/* spec-6.4 INV-ADG5 stub: cluster_smgr.o references the ADG standby write gate. */
+void cluster_mrp_standby_shared_write_gate(const char *op);
+void
+cluster_mrp_standby_shared_write_gate(const char *op pg_attribute_unused())
+{}
+
 /* HTAB stubs. */
 HTAB *
 hash_create(const char *t pg_attribute_unused(), long n pg_attribute_unused(),

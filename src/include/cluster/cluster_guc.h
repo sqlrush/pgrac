@@ -168,6 +168,7 @@ extern int cluster_adg_primary_thread_count;
 extern int cluster_adg_lag_threshold_sec;
 extern int cluster_max_standby_delay;
 extern int cluster_apply_master_switch_drain_ms;
+extern int cluster_adg_lease_takeover_grace_ms;
 extern int cluster_adg_barrier_interval_ms;
 extern int cluster_wal_sender_timeout_sec;
 extern int cluster_wal_receiver_timeout_sec;

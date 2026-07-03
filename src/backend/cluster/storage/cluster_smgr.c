@@ -60,6 +60,7 @@
 
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
+#include "cluster/cluster_mrp.h" /* spec-6.4 INV-ADG5 — standby write gate */
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_sinval.h"		 /* spec-5.2 D1: relsize inval broadcast */
 #include "cluster/cluster_write_fence.h" /* spec-4.12 D5 — hot write-path fence gate */
@@ -400,6 +401,8 @@ cluster_smgr_create(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 
 	/* spec-4.12 D5 (L240): reject before any side effect if this node is fenced. */
 	cluster_write_fence_reject_if_fenced("create");
+	/* spec-6.4 INV-ADG5 (P0-1): an ADG standby write also needs the apply-master lease. */
+	cluster_mrp_standby_shared_write_gate("create");
 
 	/*
 	 * Ensure the tablespace's per-database directory exists before we
@@ -470,6 +473,8 @@ cluster_smgr_unlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isR
 
 	/* spec-4.12 D5 (L240): reject before any handle close / physical unlink. */
 	cluster_write_fence_reject_if_fenced("unlink");
+	/* spec-6.4 INV-ADG5 (P0-1): an ADG standby write also needs the apply-master lease. */
+	cluster_mrp_standby_shared_write_gate("unlink");
 
 	if (cluster_smgr_relations != NULL) {
 		ClusterSmgrRelationState *state;
@@ -518,6 +523,8 @@ cluster_smgr_extend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 	/* spec-4.12 D5 (L240): reject before extending the underlying file. */
 	cluster_write_fence_reject_if_fenced("extend");
+	/* spec-6.4 INV-ADG5 (P0-1): an ADG standby write also needs the apply-master lease. */
+	cluster_mrp_standby_shared_write_gate("extend");
 
 	state = cluster_smgr_state_lookup(reln, true);
 	handle = cluster_smgr_ensure_handle(state, forknum);
@@ -546,6 +553,8 @@ cluster_smgr_zeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber block
 
 	/* spec-4.12 D5 (L240): reject before any zero-block write. */
 	cluster_write_fence_reject_if_fenced("zero-extend");
+	/* spec-6.4 INV-ADG5 (P0-1): an ADG standby write also needs the apply-master lease. */
+	cluster_mrp_standby_shared_write_gate("zero-extend");
 
 	/*
 	 * mdzeroextend cannot be used as a fallback: it operates on PG's
@@ -606,6 +615,8 @@ cluster_smgr_write(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, 
 
 	/* spec-4.12 D5 (L240): reject before the shared-storage block write. */
 	cluster_write_fence_reject_if_fenced("write");
+	/* spec-6.4 INV-ADG5 (P0-1): an ADG standby write also needs the apply-master lease. */
+	cluster_mrp_standby_shared_write_gate("write");
 
 	state = cluster_smgr_state_lookup(reln, true);
 	handle = cluster_smgr_ensure_handle(state, forknum);
@@ -663,6 +674,8 @@ cluster_smgr_truncate(SMgrRelation reln, ForkNumber forknum, BlockNumber old_blo
 
 	/* spec-4.12 D5 (L240): reject before truncating the underlying file. */
 	cluster_write_fence_reject_if_fenced("truncate");
+	/* spec-6.4 INV-ADG5 (P0-1): an ADG standby write also needs the apply-master lease. */
+	cluster_mrp_standby_shared_write_gate("truncate");
 
 	state = cluster_smgr_state_lookup(reln, true);
 	handle = cluster_smgr_ensure_handle(state, forknum);

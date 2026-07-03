@@ -780,7 +780,8 @@ qvotec_apply_lease_cas(const ClusterAdgApplyMasterLease *desired, const uint8 *a
 		return CLUSTER_MRP_APPLY_LEASE_SUBMIT_NO_QUORUM;
 
 	verdict = cluster_adg_apply_master_lease_cas_verdict(&current, desired,
-														 (int64)(GetCurrentTimestamp() / 1000));
+														 (int64)(GetCurrentTimestamp() / 1000),
+														 cluster_adg_lease_takeover_grace_ms);
 	switch (verdict) {
 	case CLUSTER_ADG_APPLY_LEASE_CAS_RENEW:
 	case CLUSTER_ADG_APPLY_LEASE_CAS_TAKE_EMPTY:

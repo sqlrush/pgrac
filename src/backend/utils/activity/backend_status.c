@@ -290,8 +290,15 @@ pgstat_beinit(void)
 }
 
 /*
- * Make sure the selected backend status slot's out-of-line fields point at
+ * Verify the selected backend status slot's out-of-line fields point at
  * their per-slot buffers before pgstat_bestart() writes through them.
+ *
+ * CreateSharedBackendStatus() wired these pointers when the postmaster
+ * created shared memory; every child inherits them.  Verify-only on
+ * purpose (spec-6.4 F8): rewriting shared pointers from each starting
+ * process would be an unlocked cross-process store, and papering over a
+ * miswired slot would hide the real initialization bug this PANIC exists
+ * to expose.
  */
 static void
 pgstat_init_backend_status_slot(int slotno)
@@ -300,21 +307,22 @@ pgstat_init_backend_status_slot(int slotno)
 		|| BackendClientHostnameBuffer == NULL || BackendActivityBuffer == NULL)
 		elog(PANIC, "backend status shared memory is not initialized");
 
-	BackendStatusArray[slotno].st_appname = BackendAppnameBuffer + (slotno * NAMEDATALEN);
-	BackendStatusArray[slotno].st_clienthostname
-		= BackendClientHostnameBuffer + (slotno * NAMEDATALEN);
-	BackendStatusArray[slotno].st_activity_raw
-		= BackendActivityBuffer + (slotno * pgstat_track_activity_query_size);
+	if (BackendStatusArray[slotno].st_appname != BackendAppnameBuffer + (slotno * NAMEDATALEN)
+		|| BackendStatusArray[slotno].st_clienthostname
+			   != BackendClientHostnameBuffer + (slotno * NAMEDATALEN)
+		|| BackendStatusArray[slotno].st_activity_raw
+			   != BackendActivityBuffer + (slotno * pgstat_track_activity_query_size))
+		elog(PANIC, "backend status slot %d is not wired to its per-slot buffers", slotno);
 
 #ifdef USE_SSL
-	if (BackendSslStatusBuffer == NULL)
-		elog(PANIC, "backend SSL status shared memory is not initialized");
-	BackendStatusArray[slotno].st_sslstatus = BackendSslStatusBuffer + slotno;
+	if (BackendSslStatusBuffer == NULL
+		|| BackendStatusArray[slotno].st_sslstatus != BackendSslStatusBuffer + slotno)
+		elog(PANIC, "backend SSL status slot %d is not wired to its per-slot buffer", slotno);
 #endif
 #ifdef ENABLE_GSS
-	if (BackendGssStatusBuffer == NULL)
-		elog(PANIC, "backend GSS status shared memory is not initialized");
-	BackendStatusArray[slotno].st_gssstatus = BackendGssStatusBuffer + slotno;
+	if (BackendGssStatusBuffer == NULL
+		|| BackendStatusArray[slotno].st_gssstatus != BackendGssStatusBuffer + slotno)
+		elog(PANIC, "backend GSS status slot %d is not wired to its per-slot buffer", slotno);
 #endif
 }
 

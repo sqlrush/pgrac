@@ -70,6 +70,13 @@ typedef struct ClusterMrpSharedState {
 	pg_atomic_uint64 error_count;
 	pg_atomic_uint64 ready_at_us;
 	pg_atomic_uint64 stopped_at_us;
+	/* spec-6.4 F9: both latch pointers are plain (unlocked) shared stores.
+	 * That is safe here because a Latch lives in fixed shared memory for
+	 * the process's lifetime, publish/clear are single aligned pointer
+	 * stores by the owning process, and a reader that catches a stale
+	 * value at worst issues a spurious or missed SetLatch -- every waiter
+	 * uses a bounded WaitLatch timeout, so a missed wakeup only costs one
+	 * poll interval. */
 	struct Latch *apply_lease_qvotec_latch;
 	struct Latch *apply_latch;
 	pg_atomic_uint64 apply_lease_request_seq;
@@ -79,6 +86,11 @@ typedef struct ClusterMrpSharedState {
 	pg_atomic_uint64 apply_lease_write_failed;
 	ClusterAdgApplyMasterLease pending_apply_lease;
 	pg_atomic_uint32 primary_thread_count;
+	/* spec-6.4 P0-3: WAL thread whose LSN space this node's local recovery
+	 * state (backup label / minRecoveryPoint / pg_wal) lives in; published
+	 * by the startup process, read by RFS restart-point selection.  0 = not
+	 * yet published. */
+	pg_atomic_uint32 recovery_thread_id;
 	pg_atomic_uint64 primary_thread_bitmap[2];
 	pg_atomic_uint64 thread_receive_lsn[CLUSTER_WAL_THREAD_MAX + 1];
 	pg_atomic_uint64 thread_start_lsn[CLUSTER_WAL_THREAD_MAX + 1];
@@ -103,10 +115,25 @@ extern SCN cluster_mrp_standby_consistent_scn(void);
 extern int64 cluster_mrp_apply_lag_ms(void);
 extern bool cluster_mrp_apply_master_can_apply(void);
 extern bool cluster_mrp_apply_master_term_still_valid(uint64 held_term);
+
+/*
+ * spec-6.4 INV-ADG5: one-snapshot verdict for the startup process's apply
+ * gate, and the shared-storage write fence used by cluster_smgr (P0-1).
+ */
+typedef enum ClusterMrpApplyGateState {
+	CLUSTER_MRP_APPLY_GATE_SELF_VALID,
+	CLUSTER_MRP_APPLY_GATE_NO_MASTER,
+	CLUSTER_MRP_APPLY_GATE_FOREIGN_MASTER,
+} ClusterMrpApplyGateState;
+
+extern ClusterMrpApplyGateState cluster_mrp_apply_gate_probe(uint64 *term_out);
+extern void cluster_mrp_standby_shared_write_gate(const char *op);
 extern bool cluster_mrp_read_service_available(void);
 extern uint64 cluster_mrp_apply_master_term(void);
 extern uint32 cluster_mrp_apply_master_node_id(void);
 extern void cluster_mrp_note_primary_thread_count(uint16 primary_thread_count);
+extern void cluster_mrp_publish_recovery_thread(uint16 thread_id);
+extern uint16 cluster_mrp_recovery_thread(void);
 extern bool cluster_mrp_rfs_restart_lsn(uint16 thread_id, XLogRecPtr fallback_lsn,
 										XLogRecPtr *restart_lsn);
 extern int cluster_mrp_streaming_snapshot(uint64 bitmap[2], XLogRecPtr start_lsn[],

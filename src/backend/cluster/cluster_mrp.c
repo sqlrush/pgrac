@@ -226,17 +226,6 @@ cluster_mrp_valid_real_thread_id(uint16 thread_id)
 	return thread_id >= XLP_THREAD_ID_FIRST_REAL && thread_id <= CLUSTER_WAL_THREAD_MAX;
 }
 
-static bool
-cluster_mrp_shared_storage_attach_safe(void)
-{
-	if (!cluster_smgr_user_relations)
-		return false;
-	return cluster_shared_storage_backend == CLUSTER_SHARED_FS_BACKEND_BLOCK_DEVICE
-		   || cluster_shared_storage_backend == CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS
-		   || cluster_shared_storage_backend == CLUSTER_SHARED_FS_BACKEND_RBD
-		   || cluster_shared_storage_backend == CLUSTER_SHARED_FS_BACKEND_MULTI_ATTACH;
-}
-
 static void
 cluster_mrp_mark_primary_thread_observed(uint16 thread_id)
 {
@@ -605,7 +594,16 @@ cluster_mrp_attach_apply_master_watermarks(const ClusterMrpLeaseScan *scan, int6
 		return;
 	if (scan->owner_node_id < 0 || scan->owner_node_id >= CLUSTER_MAX_NODES)
 		return;
-	if (scan->owner_node_id != cluster_node_id && !cluster_mrp_shared_storage_attach_safe())
+
+	/*
+	 * spec-6.4 P0-2: never adopt a foreign Apply Master's watermarks as this
+	 * node's read floor.  A non-master node has no invalidation protocol for
+	 * pages it may have cached, so manufacturing a read point from the
+	 * master's progress would serve torn or stale snapshots.  Re-publishing
+	 * this node's own durable watermarks (owner == self, e.g. after an MRP
+	 * restart) stays allowed.
+	 */
+	if (scan->owner_node_id != cluster_node_id)
 		return;
 	if (scan->lease_epoch != cluster_epoch_get_current())
 		return;
@@ -718,6 +716,95 @@ cluster_mrp_apply_master_term_still_valid(uint64 held_term)
 	return cluster_mrp_snapshot_allows_apply(&snap, cluster_mrp_now_ms(), held_term);
 }
 
+/*
+ * cluster_mrp_apply_gate_probe -- one-snapshot verdict for the startup
+ *	process's INV-ADG5 apply gate (spec-6.4).
+ *
+ *	SELF_VALID     this node owns a fresh apply-master lease; *term_out is
+ *	               its term.
+ *	FOREIGN_MASTER a fresh lease is owned by another node.
+ *	NO_MASTER      no fresh lease is visible (vacant, expired, or a torn
+ *	               snapshot read) -- conservative default.
+ */
+ClusterMrpApplyGateState
+cluster_mrp_apply_gate_probe(uint64 *term_out)
+{
+	ClusterMrpApplyMasterSnapshot snap;
+	int64 now_ms;
+
+	if (term_out != NULL)
+		*term_out = 0;
+	if (!cluster_mrp_read_apply_master_snapshot(&snap))
+		return CLUSTER_MRP_APPLY_GATE_NO_MASTER;
+
+	now_ms = cluster_mrp_now_ms();
+	if (cluster_mrp_snapshot_allows_apply(&snap, now_ms, 0)) {
+		if (term_out != NULL)
+			*term_out = snap.term;
+		return CLUSTER_MRP_APPLY_GATE_SELF_VALID;
+	}
+	if (cluster_adg_apply_master_lease_fresh(
+			snap.valid, snap.term, snap.generation, snap.lease_epoch, snap.owner_incarnation,
+			snap.valid_until_ms, cluster_epoch_get_current(), now_ms)
+		&& (int32)snap.owner_node_id != cluster_node_id)
+		return CLUSTER_MRP_APPLY_GATE_FOREIGN_MASTER;
+	return CLUSTER_MRP_APPLY_GATE_NO_MASTER;
+}
+
+/*
+ * cluster_mrp_standby_shared_write_gate -- spec-6.4 INV-ADG5 storage-side
+ *	fence (P0-1).
+ *
+ *	On an ADG standby every shared-routed storage mutation must be covered
+ *	by this node's own apply-master lease.  A node that lost (or never had)
+ *	the lease may hold arbitrarily stale cached pages, and flushing one of
+ *	them would overwrite the current Apply Master's newer version on shared
+ *	storage -- a lost write no later mechanism can detect.  PANIC rather
+ *	than ERROR: the only safe reaction is to discard every cached page by
+ *	restarting the node, after which boot waits for the lease before
+ *	replaying again.
+ *
+ *	The write allowance extends half the takeover grace past lease expiry
+ *	(cluster_adg_apply_master_token_allows_write), so a renewal hiccup does
+ *	not shoot down a still-exclusive master; a successor can only win the
+ *	durable CAS after the full grace.
+ */
+void
+cluster_mrp_standby_shared_write_gate(const char *op)
+{
+	ClusterMrpApplyMasterSnapshot snap;
+	bool have_snap = false;
+
+	if (!cluster_mrp_should_start())
+		return;
+
+	/*
+	 * The snapshot read can fail transiently while MRP republishes the
+	 * token; give it a few tries before failing closed.
+	 */
+	for (int attempt = 0; attempt < 10; attempt++) {
+		if (cluster_mrp_read_apply_master_snapshot(&snap)) {
+			have_snap = true;
+			break;
+		}
+		pg_usleep(1000L);
+	}
+
+	if (have_snap
+		&& cluster_adg_apply_master_token_allows_write(
+			snap.owner_node_id, snap.valid, snap.term, snap.generation, snap.lease_epoch,
+			snap.owner_incarnation, snap.valid_until_ms, cluster_node_id,
+			cluster_epoch_get_current(), cluster_adg_lease_takeover_grace_ms, cluster_mrp_now_ms()))
+		return;
+
+	ereport(PANIC, (errcode(ERRCODE_CLUSTER_ADG_NOT_APPLY_MASTER),
+					errmsg("ADG standby shared-storage %s rejected: this node does not hold the "
+						   "apply-master lease",
+						   op),
+					errdetail("Only the elected Apply Master may write shared storage; a stale or "
+							  "deposed node fails stop so that its cached pages are discarded.")));
+}
+
 bool
 cluster_mrp_read_service_available(void)
 {
@@ -733,10 +820,14 @@ cluster_mrp_read_service_available(void)
 	if (cluster_adg_apply_master_lease_fresh(
 			snap.valid, snap.term, snap.generation, snap.lease_epoch, snap.owner_incarnation,
 			snap.valid_until_ms, cluster_epoch_get_current(), now_ms)) {
-		if ((int32)snap.owner_node_id != cluster_node_id
-			&& !cluster_mrp_shared_storage_attach_safe())
-			return false;
-		return true;
+		/*
+		 * spec-6.4 P0-2: read service is only available on the Apply Master
+		 * itself.  An attach node reading shared storage behind a foreign
+		 * master has no cache-invalidation protocol, so its reads fail
+		 * closed (57R07 through the snapshot gate) until cross-instance
+		 * standby coherence lands in a later Stage-6 spec.
+		 */
+		return (int32)snap.owner_node_id == cluster_node_id;
 	}
 
 	if (snap.lost_at_ms == 0 || cluster_apply_master_switch_drain_ms <= 0)
@@ -872,8 +963,14 @@ cluster_mrp_apply_master_acquire_or_renew(void)
 		return false;
 	}
 
+	/*
+	 * Mirror of the durable CAS verdict (cluster_adg_apply_master_lease_cas_
+	 * verdict): a foreign lease may only be taken a full takeover grace past
+	 * its expiry.  The deposed owner stops writing at most halfway through
+	 * that grace, so the halves never overlap even with clock skew.
+	 */
 	can_take_lease = !scan.attached || scan.owner_node_id == cluster_node_id
-					 || now_ms >= scan.lease_expires_at_ms;
+					 || now_ms >= scan.lease_expires_at_ms + cluster_adg_lease_takeover_grace_ms;
 	if (!can_take_lease) {
 		cluster_mrp_publish_apply_master((uint32)scan.owner_node_id, scan.durable_term,
 										 scan.generation, scan.lease_epoch, scan.owner_incarnation,
@@ -959,6 +1056,7 @@ cluster_mrp_shmem_init(void)
 															  ? CLUSTER_MRP_NOT_STARTED
 															  : CLUSTER_MRP_DISABLED);
 		pg_atomic_init_u32(&cluster_mrp_state->pid, 0);
+		pg_atomic_init_u32(&cluster_mrp_state->recovery_thread_id, 0);
 		pg_atomic_init_u32(&cluster_mrp_state->apply_master_node_id, UINT32_MAX);
 		pg_atomic_init_u32(&cluster_mrp_state->apply_master_term_valid, 0);
 		pg_atomic_init_u64(&cluster_mrp_state->apply_master_token_seq, 0);
@@ -1189,6 +1287,27 @@ cluster_mrp_apply_master_node_id(void)
 	if (!cluster_mrp_read_apply_master_snapshot(&snap))
 		return UINT32_MAX;
 	return snap.valid != 0 ? snap.owner_node_id : UINT32_MAX;
+}
+
+/*
+ * spec-6.4 P0-3: the startup process publishes the WAL thread whose LSN
+ * space this node's local recovery state lives in; RFS restart-point
+ * selection may only fall back to GetXLogReplayRecPtr() for that thread.
+ */
+void
+cluster_mrp_publish_recovery_thread(uint16 thread_id)
+{
+	if (cluster_mrp_state == NULL)
+		return;
+	pg_atomic_write_u32(&cluster_mrp_state->recovery_thread_id, (uint32)thread_id);
+}
+
+uint16
+cluster_mrp_recovery_thread(void)
+{
+	if (cluster_mrp_state == NULL)
+		return 0;
+	return (uint16)pg_atomic_read_u32(&cluster_mrp_state->recovery_thread_id);
 }
 
 bool
@@ -1436,6 +1555,23 @@ MrpMain(void)
 						errhint("Set cluster.voting_disks to a shared voting-disk majority, "
 								"or set cluster.apply_master_election=off for a single-node "
 								"test standby.")));
+
+	/*
+	 * spec-6.4 P1-a: with election off every MRP appoints itself Apply
+	 * Master unconditionally.  That is only sound when this standby cluster
+	 * cannot contain a second writer, so refuse to start when the topology
+	 * declares peers instead of silently double-appointing.
+	 */
+	if (!cluster_apply_master_election && cluster_conf_has_peers())
+		ereport(FATAL, (errcode(ERRCODE_CONFIG_FILE_ERROR),
+						errmsg("cluster.apply_master_election=off requires a single-node standby "
+							   "cluster"),
+						errdetail("The cluster topology declares %d nodes; with election disabled "
+								  "each of them would appoint itself Apply Master and write shared "
+								  "storage concurrently.",
+								  cluster_conf_node_count()),
+						errhint("Enable cluster.apply_master_election and configure "
+								"cluster.voting_disks, or reduce the topology to one node.")));
 	on_shmem_exit(cluster_mrp_close_voting_disks_atexit, (Datum)0);
 
 	cluster_mrp_set_state(CLUSTER_MRP_READY);

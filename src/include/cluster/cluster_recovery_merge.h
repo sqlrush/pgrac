@@ -346,6 +346,8 @@ extern uint64 cluster_recovery_merge_window_scn(void);
  */
 extern bool cluster_recmerge_window_active;
 extern uint64 cluster_recmerge_window_scn;
+extern uint64 cluster_recmerge_window_own_lsn;
+extern bool cluster_recmerge_apply_foreign;
 
 /*
  * spec-4.5a: has this node EVER merged-recovered `origin_node`'s stream?

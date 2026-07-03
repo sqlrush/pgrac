@@ -1983,7 +1983,13 @@ ServerLoop(void)
 		 * lease before recovery can reach hot standby, so qvotec must be
 		 * available during recovery states to complete the lease CAS.
 		 */
-		if (cluster_enabled && QvotecPID == 0
+		/*
+		 * spec-6.4 F7: no respawn once a shutdown is in progress.  The ADG
+		 * recovery-state conditions here (and for MRP / RFS below) stay
+		 * true through PM_HOT_STANDBY during a smart shutdown, so without
+		 * this guard a SIGTERM'd aux process would be resurrected.
+		 */
+		if (cluster_enabled && QvotecPID == 0 && Shutdown == NoShutdown
 			&& ((qvotec_spawn_enabled && pmState == PM_RUN)
 				|| (cluster_mrp_should_start()
 					&& (pmState == PM_STARTUP || pmState == PM_RECOVERY
@@ -2024,12 +2030,12 @@ ServerLoop(void)
 		 * the startup process gates WAL replay on the Apply Master lease.
 		 * Primary nodes and ADG-disabled standbys keep existing behavior.
 		 */
-		if (cluster_mrp_should_start() && MrpPID == 0
+		if (cluster_mrp_should_start() && MrpPID == 0 && Shutdown == NoShutdown
 			&& (pmState == PM_STARTUP || pmState == PM_RECOVERY
 				|| pmState == PM_HOT_STANDBY || pmState == PM_RUN))
 			MrpPID = StartMrp();
 
-		if (cluster_rfs_should_start() && RfsPID == 0
+		if (cluster_rfs_should_start() && RfsPID == 0 && Shutdown == NoShutdown
 			&& (pmState == PM_STARTUP || pmState == PM_RECOVERY
 				|| pmState == PM_HOT_STANDBY || pmState == PM_RUN))
 			RfsPID = StartRfs();

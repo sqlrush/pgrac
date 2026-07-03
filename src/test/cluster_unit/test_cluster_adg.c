@@ -286,8 +286,17 @@ UT_TEST(test_rfs_restart_lsn_prefers_thread_receive)
 	UT_ASSERT_EQ(restart, (XLogRecPtr)1800);
 
 	UT_ASSERT(!cluster_adg_rfs_restart_lsn(1000, 1200, 1100, &restart));
-	UT_ASSERT(!cluster_adg_rfs_restart_lsn(InvalidXLogRecPtr, 1200, 1800, &restart));
 	UT_ASSERT(!cluster_adg_rfs_restart_lsn(1000, 1200, 1800, NULL));
+
+	/* spec-6.4 P0-3: the fallback is optional; shmem watermarks alone are
+	 * usable, and all-invalid means "no restart point" instead of a
+	 * cross-space substitute. */
+	UT_ASSERT(cluster_adg_rfs_restart_lsn(InvalidXLogRecPtr, 1200, 1800, &restart));
+	UT_ASSERT_EQ(restart, (XLogRecPtr)1800);
+	UT_ASSERT(cluster_adg_rfs_restart_lsn(InvalidXLogRecPtr, 1200, InvalidXLogRecPtr, &restart));
+	UT_ASSERT_EQ(restart, (XLogRecPtr)1200);
+	UT_ASSERT(!cluster_adg_rfs_restart_lsn(InvalidXLogRecPtr, InvalidXLogRecPtr, InvalidXLogRecPtr,
+										   &restart));
 }
 
 UT_TEST(test_wal_message_bounds_validation)
@@ -451,11 +460,11 @@ UT_TEST(test_apply_master_lease_cas_verdict)
 	current.owner_node_id = -1;
 
 	cluster_adg_apply_master_lease_init(&desired, 1, 1, 2000, 1);
-	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_cas_verdict(&current, &desired, now_ms),
+	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_cas_verdict(&current, &desired, now_ms, 0),
 				 (int)CLUSTER_ADG_APPLY_LEASE_CAS_TAKE_EMPTY);
 
 	cluster_adg_apply_master_lease_init(&desired, 2, 1, 2000, 1);
-	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_cas_verdict(&current, &desired, now_ms),
+	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_cas_verdict(&current, &desired, now_ms, 0),
 				 (int)CLUSTER_ADG_APPLY_LEASE_CAS_STALE);
 
 	current.attached = true;
@@ -467,33 +476,79 @@ UT_TEST(test_apply_master_lease_cas_verdict)
 	current.owner_incarnation = 1;
 
 	cluster_adg_apply_master_lease_init(&desired, 7, 2, 4000, 12);
-	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_cas_verdict(&current, &desired, now_ms),
+	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_cas_verdict(&current, &desired, now_ms, 0),
 				 (int)CLUSTER_ADG_APPLY_LEASE_CAS_RENEW);
 
 	cluster_adg_apply_master_lease_init_full(&desired, 7, 2, 4000, 12, 1, 2);
-	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_cas_verdict(&current, &desired, now_ms),
+	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_cas_verdict(&current, &desired, now_ms, 0),
 				 (int)CLUSTER_ADG_APPLY_LEASE_CAS_STALE);
 
 	cluster_adg_apply_master_lease_init_full(&desired, 7, 2, 4000, 12, 2, 1);
-	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_cas_verdict(&current, &desired, now_ms),
+	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_cas_verdict(&current, &desired, now_ms, 0),
 				 (int)CLUSTER_ADG_APPLY_LEASE_CAS_STALE);
 
 	cluster_adg_apply_master_lease_init(&desired, 7, 3, 4000, 12);
-	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_cas_verdict(&current, &desired, now_ms),
+	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_cas_verdict(&current, &desired, now_ms, 0),
 				 (int)CLUSTER_ADG_APPLY_LEASE_CAS_STALE);
 
+	/*
+	 * spec-6.4 P1-d: a same-owner RENEW of an already-expired lease is
+	 * STALE -- the owner must re-take through the expired path (next term
+	 * plus full takeover grace), because a taker may already be inside the
+	 * grace window.
+	 */
 	now_ms = 3500;
+	cluster_adg_apply_master_lease_init(&desired, 7, 2, 5000, 13);
+	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_cas_verdict(&current, &desired, now_ms, 0),
+				 (int)CLUSTER_ADG_APPLY_LEASE_CAS_STALE);
+
 	cluster_adg_apply_master_lease_init(&desired, 8, 3, 5000, 12);
-	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_cas_verdict(&current, &desired, now_ms),
+	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_cas_verdict(&current, &desired, now_ms, 0),
+				 (int)CLUSTER_ADG_APPLY_LEASE_CAS_TAKE_EXPIRED);
+
+	/*
+	 * spec-6.4 P1-d: with a takeover grace the same attempt is STALE until
+	 * a full grace has elapsed past the lease expiry.
+	 */
+	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_cas_verdict(&current, &desired, now_ms, 1000),
+				 (int)CLUSTER_ADG_APPLY_LEASE_CAS_STALE);
+	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_cas_verdict(&current, &desired, 4000, 1000),
+				 (int)CLUSTER_ADG_APPLY_LEASE_CAS_TAKE_EXPIRED);
+	/* A negative grace clamps to zero rather than loosening the gate. */
+	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_cas_verdict(&current, &desired, now_ms, -500),
 				 (int)CLUSTER_ADG_APPLY_LEASE_CAS_TAKE_EXPIRED);
 
 	cluster_adg_apply_master_lease_init(&desired, 7, 3, 5000, 12);
-	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_cas_verdict(&current, &desired, now_ms),
+	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_cas_verdict(&current, &desired, now_ms, 0),
 				 (int)CLUSTER_ADG_APPLY_LEASE_CAS_STALE);
 
 	cluster_adg_apply_master_lease_init(&desired, 8, 3, 3000, 12);
-	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_cas_verdict(&current, &desired, now_ms),
+	UT_ASSERT_EQ((int)cluster_adg_apply_master_lease_cas_verdict(&current, &desired, now_ms, 0),
 				 (int)CLUSTER_ADG_APPLY_LEASE_CAS_INVALID);
+}
+
+UT_TEST(test_apply_master_token_allows_write_grace)
+{
+	/* Fresh self-owned lease: write allowed. */
+	UT_ASSERT(
+		cluster_adg_apply_master_token_allows_write(2, 1, 7, 11, 5, 99, 2000, 2, 5, 1000, 1000));
+	/* Foreign owner: never. */
+	UT_ASSERT(
+		!cluster_adg_apply_master_token_allows_write(3, 1, 7, 11, 5, 99, 2000, 2, 5, 1000, 1000));
+	/* Expired lease inside grace/2: still allowed (renewal hiccup shield). */
+	UT_ASSERT(
+		cluster_adg_apply_master_token_allows_write(2, 1, 7, 11, 5, 99, 2000, 2, 5, 1000, 2400));
+	/* At or past expiry + grace/2: refused. */
+	UT_ASSERT(
+		!cluster_adg_apply_master_token_allows_write(2, 1, 7, 11, 5, 99, 2000, 2, 5, 1000, 2500));
+	/* Zero grace degenerates to plain expiry. */
+	UT_ASSERT(
+		!cluster_adg_apply_master_token_allows_write(2, 1, 7, 11, 5, 99, 2000, 2, 5, 0, 2000));
+	/* Stale epoch / invalid token stay refused regardless of grace. */
+	UT_ASSERT(
+		!cluster_adg_apply_master_token_allows_write(2, 1, 7, 11, 4, 99, 2000, 2, 5, 1000, 1000));
+	UT_ASSERT(
+		!cluster_adg_apply_master_token_allows_write(2, 0, 7, 11, 5, 99, 2000, 2, 5, 1000, 1000));
 }
 
 UT_TEST(test_apply_master_candidate_uses_lowest_fresh_live_node)
@@ -756,6 +811,7 @@ main(void)
 	UT_RUN(test_apply_master_lease_quorum_selects_single_winner);
 	UT_RUN(test_apply_master_lease_quorum_rejects_split_without_majority);
 	UT_RUN(test_apply_master_lease_cas_verdict);
+	UT_RUN(test_apply_master_token_allows_write_grace);
 	UT_RUN(test_apply_master_candidate_uses_lowest_fresh_live_node);
 	UT_RUN(test_apply_master_token_apply_gate);
 	UT_RUN(test_apply_master_lease_fresh_accepts_initial_epoch);

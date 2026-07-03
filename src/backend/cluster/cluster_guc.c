@@ -95,6 +95,7 @@ int cluster_adg_primary_thread_count = 0;
 int cluster_adg_lag_threshold_sec = 10;
 int cluster_max_standby_delay = 30;
 int cluster_apply_master_switch_drain_ms = 5000;
+int cluster_adg_lease_takeover_grace_ms = 5000;
 int cluster_adg_barrier_interval_ms = 1000;
 int cluster_wal_sender_timeout_sec = 60;
 int cluster_wal_receiver_timeout_sec = 60;
@@ -1319,12 +1320,18 @@ cluster_init_guc(void)
 		gettext_noop("Only a standby role with this setting on starts the ADG MRP path."),
 		&cluster_enable_adg, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
+	/*
+	 * PGC_POSTMASTER on purpose: flipping election off at runtime would let
+	 * every standby in a multi-node cluster appoint itself Apply Master on
+	 * the next reload, so the off mode is a start-time, single-node-only
+	 * decision (MRP refuses to start with it off when peers are declared).
+	 */
 	DefineCustomBoolVariable(
 		"cluster.apply_master_election",
 		gettext_noop("Enable automatic ADG Apply Master election."),
 		gettext_noop("When on, the standby cluster elects one Apply Master using a voting-disk "
 					 "majority and the durable apply-master term lease."),
-		&cluster_apply_master_election, true, PGC_SIGHUP, 0, NULL, NULL, NULL);
+		&cluster_apply_master_election, true, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	DefineCustomStringVariable(
 		"cluster.adg_rfs_conninfos", gettext_noop("ADG RFS upstream connection strings."),
@@ -1360,6 +1367,15 @@ cluster_init_guc(void)
 		gettext_noop("In-flight standby reads are given this drain window during Apply "
 					 "Master failover before stricter conflict handling applies."),
 		&cluster_apply_master_switch_drain_ms, 5000, 0, 600000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
+		NULL);
+
+	DefineCustomIntVariable(
+		"cluster.adg_lease_takeover_grace_ms",
+		gettext_noop("Grace period past apply-master lease expiry before takeover."),
+		gettext_noop("A standby may only take over an expired apply-master lease this long "
+					 "after its expiry; the deposed master stops shared-storage writes at "
+					 "most halfway through it, and the other half absorbs clock skew."),
+		&cluster_adg_lease_takeover_grace_ms, 5000, 0, 600000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
 		NULL);
 
 	DefineCustomIntVariable(

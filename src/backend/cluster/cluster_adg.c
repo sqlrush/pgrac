@@ -205,18 +205,25 @@ bool
 cluster_adg_rfs_restart_lsn(XLogRecPtr fallback_lsn, XLogRecPtr thread_start_lsn,
 							XLogRecPtr thread_receive_lsn, XLogRecPtr *restart_lsn)
 {
-	if (restart_lsn == NULL || XLogRecPtrIsInvalid(fallback_lsn))
+	if (restart_lsn == NULL)
 		return false;
 	if (!XLogRecPtrIsInvalid(thread_start_lsn) && !XLogRecPtrIsInvalid(thread_receive_lsn)
 		&& thread_receive_lsn < thread_start_lsn)
 		return false;
 
+	/*
+	 * spec-6.4 P0-3: the fallback is optional.  The caller decides whether a
+	 * cross-space substitute exists at all; when every source is invalid the
+	 * answer is "no restart point", never a borrowed LSN.
+	 */
 	if (!XLogRecPtrIsInvalid(thread_receive_lsn))
 		*restart_lsn = thread_receive_lsn;
 	else if (!XLogRecPtrIsInvalid(thread_start_lsn))
 		*restart_lsn = thread_start_lsn;
-	else
+	else if (!XLogRecPtrIsInvalid(fallback_lsn))
 		*restart_lsn = fallback_lsn;
+	else
+		return false;
 	return true;
 }
 
@@ -422,7 +429,8 @@ cluster_adg_apply_master_lease_quorum(const ClusterAdgApplyMasterLease leases[],
 
 ClusterAdgApplyMasterLeaseCasVerdict
 cluster_adg_apply_master_lease_cas_verdict(const ClusterAdgApplyMasterLeaseQuorum *current,
-										   const ClusterAdgApplyMasterLease *desired, int64 now_ms)
+										   const ClusterAdgApplyMasterLease *desired, int64 now_ms,
+										   int64 takeover_grace_ms)
 {
 	uint64 next_term;
 
@@ -430,6 +438,8 @@ cluster_adg_apply_master_lease_cas_verdict(const ClusterAdgApplyMasterLeaseQuoru
 		return CLUSTER_ADG_APPLY_LEASE_CAS_INVALID;
 	if (desired->lease_expires_at_ms <= now_ms || desired->generation == 0)
 		return CLUSTER_ADG_APPLY_LEASE_CAS_INVALID;
+	if (takeover_grace_ms < 0)
+		takeover_grace_ms = 0;
 
 	if (!current->attached) {
 		if (desired->term == cluster_adg_apply_master_next_term(0))
@@ -440,12 +450,28 @@ cluster_adg_apply_master_lease_cas_verdict(const ClusterAdgApplyMasterLeaseQuoru
 	if (current->owner_node_id == desired->owner_node_id && current->durable_term == desired->term
 		&& current->lease_epoch == desired->lease_epoch
 		&& current->owner_incarnation == desired->owner_incarnation) {
+		/*
+		 * A same-term RENEW is only exclusive while the durable lease is
+		 * still live.  Once it has expired, another candidate may already
+		 * be inside the takeover-grace window, so the owner must re-take
+		 * through the ordinary expired path (next term + full grace) and
+		 * cannot quietly resurrect its old term.
+		 */
+		if (now_ms >= current->lease_expires_at_ms)
+			return CLUSTER_ADG_APPLY_LEASE_CAS_STALE;
 		if (desired->generation > current->generation)
 			return CLUSTER_ADG_APPLY_LEASE_CAS_RENEW;
 		return CLUSTER_ADG_APPLY_LEASE_CAS_STALE;
 	}
 
-	if (now_ms < current->lease_expires_at_ms)
+	/*
+	 * Takeover fencing: the previous owner keeps writing until its lease
+	 * expiry plus at most half the takeover grace (see
+	 * cluster_adg_apply_master_token_allows_write), so a taker must wait
+	 * the full grace past expiry.  The remaining half is the clock-skew
+	 * budget between the deposed writer and the taker.
+	 */
+	if (now_ms < current->lease_expires_at_ms + takeover_grace_ms)
 		return CLUSTER_ADG_APPLY_LEASE_CAS_STALE;
 
 	next_term = cluster_adg_apply_master_next_term(current->durable_term);
@@ -503,6 +529,37 @@ cluster_adg_apply_master_token_allows_apply(uint32 owner_node_id, uint32 valid, 
 	if (local_incarnation != 0 && owner_incarnation != local_incarnation)
 		return false;
 	if (valid_until_ms != 0 && now_ms >= (int64)valid_until_ms)
+		return false;
+	return true;
+}
+
+/*
+ * cluster_adg_apply_master_token_allows_write -- shared-storage write fence
+ *	predicate for an ADG standby (spec-6.4 INV-ADG5 storage side).
+ *
+ *	Same self-ownership checks as cluster_adg_apply_master_token_allows_apply,
+ *	but a write is still permitted for up to half the takeover grace past the
+ *	lease expiry: a taker only wins the durable CAS a full grace after expiry,
+ *	so writes inside expiry + grace/2 can never race the successor while the
+ *	remaining half absorbs clock skew.  This keeps in-flight flushes from a
+ *	still-current master out of the PANIC path during a renewal hiccup without
+ *	ever overlapping a new master's first write.
+ */
+bool
+cluster_adg_apply_master_token_allows_write(uint32 owner_node_id, uint32 valid, uint64 term,
+											uint64 generation, uint64 lease_epoch,
+											uint64 owner_incarnation, uint64 valid_until_ms,
+											int32 self_node_id, uint64 current_epoch,
+											int64 takeover_grace_ms, int64 now_ms)
+{
+	if (!SCN_NODE_ID_VALID(self_node_id) || owner_node_id != (uint32)self_node_id)
+		return false;
+	if (term == 0 || generation == 0 || lease_epoch != current_epoch || owner_incarnation == 0
+		|| valid == 0)
+		return false;
+	if (takeover_grace_ms < 0)
+		takeover_grace_ms = 0;
+	if (valid_until_ms != 0 && now_ms >= (int64)valid_until_ms + takeover_grace_ms / 2)
 		return false;
 	return true;
 }

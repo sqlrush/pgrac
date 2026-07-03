@@ -336,7 +336,7 @@ ClusterAdgApplyMasterLeaseCasVerdict
 cluster_adg_apply_master_lease_cas_verdict(
 	const ClusterAdgApplyMasterLeaseQuorum *current pg_attribute_unused(),
 	const ClusterAdgApplyMasterLease *desired pg_attribute_unused(),
-	int64 now_ms pg_attribute_unused())
+	int64 now_ms pg_attribute_unused(), int64 takeover_grace_ms pg_attribute_unused())
 {
 	return CLUSTER_ADG_APPLY_LEASE_CAS_STALE;
 }
@@ -412,6 +412,7 @@ MemoryContextAllocZero(MemoryContext context pg_attribute_unused(), Size size)
 }
 int cluster_quorum_poll_interval_ms = 2000;
 int cluster_voting_disk_io_timeout_ms = 5000;
+int cluster_adg_lease_takeover_grace_ms = 5000;
 
 /* spec-4.12 D2/D4 stubs: cluster_qvotec.o references the write-fence marker
  * scan / token refresh / submit-mailbox helpers + the lease GUC; cluster_write_

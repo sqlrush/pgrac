@@ -107,9 +107,13 @@ resolve_from_remote_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref,
 	 * commit_scn, CLOG-confirm it and use that exact page evidence.  This keeps
 	 * prepared/in-progress xids fail-closed and leaves ordinary remote-origin
 	 * reads on the overlay/durable-TT path below.
+	 *
+	 * spec-6.4 F2: the slot must still be bound to this tuple's xid.  A
+	 * recycled ITL slot carries some OTHER transaction's commit_scn, and
+	 * returning it here would hand the caller a false SCN for raw_xid.
 	 */
 	if (cluster_enable_adg && cluster_dg_role == CLUSTER_DG_ROLE_STANDBY && RecoveryInProgress()
-		&& ref->has_cached_status && SCN_VALID(ref->cached_commit_scn)
+		&& ref->local_xid == raw_xid && ref->has_cached_status && SCN_VALID(ref->cached_commit_scn)
 		&& TransactionIdDidCommit(raw_xid)) {
 		out->status = CLUSTER_TT_STATUS_COMMITTED;
 		out->commit_scn = ref->cached_commit_scn;
@@ -180,17 +184,23 @@ classify_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRecPtr 
 	}
 
 	/*
-	 * ADG attach/read nodes can read user pages flushed by the elected Apply
-	 * Master without having replayed the matching commit record into their own
-	 * pg_xact / TT overlay.  For those nodes the replayed page itself is the
-	 * authority, but only for an exact, terminal ITL binding: the slot must still
-	 * belong to this tuple-side xid and must carry a committed cached SCN.
-	 * ACTIVE, ABORTED, invalid-SCN, and recycled slots continue through the
-	 * ordinary local/remote fail-closed paths below.
+	 * On an ADG standby the replayed page's ITL slot can carry the commit
+	 * evidence before the overlay / durable-TT paths can resolve the xid.
+	 * The page itself is the authority, but only for an exact, terminal ITL
+	 * binding: the slot must still belong to this tuple-side xid and must
+	 * carry a committed cached SCN.  ACTIVE, ABORTED, invalid-SCN, and
+	 * recycled slots continue through the ordinary local/remote fail-closed
+	 * paths below.
+	 *
+	 * spec-6.4 F3: additionally cross-check the local CLOG (replayed from
+	 * the same WAL stream) instead of trusting page provenance alone.
+	 * Reads only run on the Apply Master, whose pg_xact is current through
+	 * its read point, so a committed xid confirms here; anything else falls
+	 * through to the fail-closed paths.
 	 */
 	if (cluster_enable_adg && cluster_dg_role == CLUSTER_DG_ROLE_STANDBY && RecoveryInProgress()
-		&& ref->local_xid == raw_xid && ref->has_cached_status
-		&& SCN_VALID(ref->cached_commit_scn)) {
+		&& ref->local_xid == raw_xid && ref->has_cached_status && SCN_VALID(ref->cached_commit_scn)
+		&& TransactionIdDidCommit(raw_xid)) {
 		out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
 		out->status = CLUSTER_TT_STATUS_COMMITTED;
 		out->commit_scn = ref->cached_commit_scn;

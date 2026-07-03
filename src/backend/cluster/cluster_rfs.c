@@ -426,6 +426,17 @@ cluster_rfs_finish_pending_header(ClusterRfsPendingHeader *pending, const char *
 		return false;
 
 	header_thread_id = cluster_rfs_thread_from_header((const XLogPageHeaderData *)pending->data);
+
+	/*
+	 * spec-6.4 F6: only a *valid* page header may borrow the bound stream's
+	 * thread, and only when it is a legacy (pre-thread-era) page.  A garbage
+	 * header must stay a loud DATA_CORRUPTED error -- silently routing it
+	 * into the bound thread's files would turn corruption into a quiet
+	 * replay stall.
+	 */
+	if (header_thread_id == XLP_THREAD_ID_INVALID)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("ADG RFS received a corrupt split WAL page header")));
 	if (!cluster_rfs_valid_real_thread_id(header_thread_id)) {
 		if (cluster_rfs_valid_real_thread_id(expected_thread_id))
 			header_thread_id = expected_thread_id;
@@ -520,6 +531,17 @@ cluster_rfs_observe_received_chunk_internal(const char *buf, Size nbytes, XLogRe
 
 				memcpy(&hdr, buf, sizeof(hdr));
 				header_thread_id = cluster_rfs_thread_from_header(&hdr);
+
+				/*
+				 * spec-6.4 F6: a garbage page header is DATA_CORRUPTED, not
+				 * an excuse to route the bytes into the bound thread's
+				 * files.  Only a valid legacy header may fall through to
+				 * the bound-stream substitution below.
+				 */
+				if (header_thread_id == XLP_THREAD_ID_INVALID)
+					ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+									errmsg("ADG RFS received a corrupt WAL page header at %X/%X",
+										   LSN_FORMAT_ARGS(recptr))));
 				route_thread_id = header_thread_id;
 			}
 		} else if (!cluster_rfs_valid_real_thread_id(route_thread_id))
@@ -812,6 +834,80 @@ cluster_rfs_process_stream_message(ClusterRfsUpstream *upstream, char *buf, int 
 	}
 }
 
+/*
+ * cluster_rfs_scan_landed_restart -- spec-6.4 P0-3 durable restart source.
+ *
+ *	Returns the segment-start LSN of the highest fully-identifiable WAL
+ *	segment this standby has already landed for the thread on the given
+ *	timeline, or InvalidXLogRecPtr when nothing usable is on disk.  The
+ *	segment's first page header must carry the right pageaddr and a
+ *	matching (or legacy) thread id; a zero-filled or torn head falls back
+ *	to the next lower segment.  Restarting from a segment start re-streams
+ *	at most one segment, and re-landing already-applied WAL is idempotent.
+ */
+static XLogRecPtr
+cluster_rfs_scan_landed_restart(uint16 thread_id, TimeLineID tli)
+{
+	char dir[MAXPGPATH];
+	XLogSegNo exclude_from = (XLogSegNo)-1;
+
+	if (!cluster_rfs_valid_real_thread_id(thread_id)
+		|| !cluster_rfs_thread_dir_path(thread_id, dir, sizeof(dir)))
+		return InvalidXLogRecPtr;
+
+	for (;;) {
+		DIR *dirdesc;
+		struct dirent *de;
+		XLogSegNo best = 0;
+		char path[MAXPGPATH];
+		XLogRecPtr seg_start;
+		XLogPageHeaderData hdr;
+		uint16 hdr_thread;
+		int fd;
+		ssize_t nread;
+
+		dirdesc = AllocateDir(dir);
+		if (dirdesc == NULL)
+			return InvalidXLogRecPtr;
+		while ((de = ReadDirExtended(dirdesc, dir, DEBUG1)) != NULL) {
+			TimeLineID ftli;
+			XLogSegNo fsegno;
+
+			if (!IsXLogFileName(de->d_name))
+				continue;
+			XLogFromFileName(de->d_name, &ftli, &fsegno, wal_segment_size);
+			if (ftli != tli || fsegno >= exclude_from)
+				continue;
+			if (fsegno > best)
+				best = fsegno;
+		}
+		FreeDir(dirdesc);
+
+		if (best == 0)
+			return InvalidXLogRecPtr;
+		if (!cluster_rfs_thread_segment_path(thread_id, tli, best, path, sizeof(path)))
+			return InvalidXLogRecPtr;
+
+		fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+		if (fd < 0) {
+			exclude_from = best;
+			continue;
+		}
+		nread = read(fd, &hdr, sizeof(hdr));
+		CloseTransientFile(fd);
+
+		XLogSegNoOffsetToRecPtr(best, 0, wal_segment_size, seg_start);
+		hdr_thread = (nread == (ssize_t)sizeof(hdr)) ? cluster_rfs_thread_from_header(&hdr)
+													 : XLP_THREAD_ID_INVALID;
+		if (hdr_thread != XLP_THREAD_ID_INVALID
+			&& (hdr_thread == XLP_THREAD_ID_LEGACY || hdr_thread == thread_id)
+			&& hdr.xlp_pageaddr == seg_start)
+			return seg_start;
+
+		exclude_from = best;
+	}
+}
+
 static void
 cluster_rfs_connect_upstream(ClusterRfsUpstream *upstream)
 {
@@ -848,12 +944,25 @@ cluster_rfs_connect_upstream(ClusterRfsUpstream *upstream)
 						errmsg("invalid ADG primary thread count %d", primary_thread_count)));
 	cluster_mrp_note_primary_thread_count((uint16)primary_thread_count);
 
-	if (!cluster_mrp_rfs_restart_lsn(upstream->expected_thread_id,
-									 cluster_rfs_page_start(GetXLogReplayRecPtr(NULL)),
-									 &restart_lsn))
-		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-						errmsg("ADG RFS cannot choose a restart LSN for thread %u",
-							   (unsigned)upstream->expected_thread_id)));
+	/*
+	 * spec-6.4 P0-3: pick the restart point from same-space sources only.
+	 *	1. live shmem thread watermarks (this postmaster generation);
+	 *	2. durable: the highest landed segment for this thread on disk;
+	 *	3. GetXLogReplayRecPtr(), but ONLY for the recovery-space thread --
+	 *	   the global replay position is meaningless in any other thread's
+	 *	   LSN space and borrowing it silently skips committed records;
+	 *	4. otherwise InvalidXLogRecPtr: the primary's walsender resolves it
+	 *	   to the earliest WAL it still retains (under-shoot is idempotent,
+	 *	   over-shoot would be data loss).
+	 */
+	restart_lsn = InvalidXLogRecPtr;
+	if (!cluster_mrp_rfs_restart_lsn(upstream->expected_thread_id, InvalidXLogRecPtr,
+									 &restart_lsn)) {
+		restart_lsn = cluster_rfs_scan_landed_restart(upstream->expected_thread_id, upstream->tli);
+		if (XLogRecPtrIsInvalid(restart_lsn)
+			&& upstream->expected_thread_id == cluster_mrp_recovery_thread())
+			restart_lsn = cluster_rfs_page_start(GetXLogReplayRecPtr(NULL));
+	}
 	upstream->start_lsn = cluster_rfs_page_start(restart_lsn);
 	upstream->write_lsn = upstream->start_lsn;
 	upstream->flush_lsn = upstream->start_lsn;

@@ -751,11 +751,28 @@ WalSndAdjustAdgThreadStartpoint(StartReplicationCmd *cmd, XLogRecPtr flushPtr,
 	XLogRecPtr scanptr;
 	XLogRecPtr original_startpoint;
 
-	if (cmd->adg_thread_id == 0 || cmd->startpoint >= flushPtr)
+	if (cmd->adg_thread_id == 0)
 		return;
 
 	original_startpoint = cmd->startpoint;
-	scanptr = cmd->startpoint - (cmd->startpoint % XLOG_BLCKSZ);
+	if (XLogRecPtrIsInvalid(cmd->startpoint))
+	{
+		/*
+		 * spec-6.4 P0-3: an invalid startpoint is the standby's explicit
+		 * "earliest available" request -- it has no same-space restart
+		 * source for this thread and must not borrow one from another
+		 * thread's LSN space.  Scan forward from the oldest segment this
+		 * primary still retains; re-streaming already-applied WAL is
+		 * idempotent on the standby, whereas guessing high loses records.
+		 */
+		XLogSegNo	oldest = XLogGetLastRemovedSegno() + 1;
+
+		XLogSegNoOffsetToRecPtr(oldest, 0, wal_segment_size, scanptr);
+	}
+	else if (cmd->startpoint >= flushPtr)
+		return;
+	else
+		scanptr = cmd->startpoint - (cmd->startpoint % XLOG_BLCKSZ);
 
 	while (scanptr + sizeof(XLogPageHeaderData) <= flushPtr)
 	{
@@ -787,6 +804,14 @@ WalSndAdjustAdgThreadStartpoint(StartReplicationCmd *cmd, XLogRecPtr flushPtr,
 
 		scanptr += XLOG_BLCKSZ;
 	}
+
+	/*
+	 * Nothing matched below flushPtr.  For an earliest-available request
+	 * this means no WAL for the thread exists yet; stream from the flush
+	 * point so the standby picks up the thread's first future page.
+	 */
+	if (XLogRecPtrIsInvalid(cmd->startpoint))
+		cmd->startpoint = flushPtr - (flushPtr % XLOG_BLCKSZ);
 }
 #endif
 
