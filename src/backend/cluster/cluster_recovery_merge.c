@@ -957,7 +957,7 @@ cluster_recovery_merge_streaming_next(ClusterRecoveryMergeState *st, const XLogR
 	}
 	memset(inputs, 0, sizeof(inputs));
 	for (idx = 0; idx < st->n_streams; idx++) {
-		MergeStream *ms = &st->streams[idx];
+		const MergeStream *ms = &st->streams[idx];
 
 		if (ms->head_ready) {
 			inputs[idx].record_available = true;

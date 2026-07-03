@@ -52,10 +52,11 @@ SELECT count(*) FROM pg_stat_cluster_wait_events;
 
 
 -- ----------
--- 4. Cluster wait events: 13 distinct types
+-- 4. Cluster wait events: 14 distinct types
 --    (docs/wait-events-design.md §2.1 categories:
 --    GES / PCM / BufferShip / SCN / Reconfig / Recovery /
---    Sinval / Interconnect / Undo / ADG / SharedFs / StartupPhase).
+--    Sinval / Interconnect / Undo / ADG / SharedFs / StartupPhase /
+--    BgProc).
 -- ----------
 SELECT count(DISTINCT type) FROM pg_stat_cluster_wait_events;
 

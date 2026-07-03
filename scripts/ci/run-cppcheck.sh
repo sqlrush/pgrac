@@ -212,12 +212,6 @@ UNIT_STUB_SUPP=(
   --suppress=constParameterCallback:src/test/cluster_unit/test_cluster_visibility_inject.c
   --suppress=constParameterCallback:src/test/cluster_unit/test_cluster_itl_cleanout_perf.c
   --suppress=constParameterCallback:src/test/cluster_unit/test_cluster_heap_lock_tuple.c
-  # Reason: block-device stubs in these cluster_unit tests are installed into
-  # ClusterSharedFsOps; cppcheck 2.20 suggests const-widening dummy callback
-  # parameters because the bodies are no-ops, but the function signatures must
-  # match the production vtable exactly.
-  --suppress=constParameterCallback:src/test/cluster_unit/test_cluster_shared_fs.c
-  --suppress=constParameterCallback:src/test/cluster_unit/test_cluster_smgr.c
 )
 
 echo "## cppcheck $(cppcheck --version)"
