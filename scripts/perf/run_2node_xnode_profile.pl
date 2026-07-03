@@ -755,9 +755,15 @@ sub axis_index
 	# metapage -- t/334 pattern).  The index blocks still hash-master
 	# ~50% onto node1, so node0's own index maintenance IS the
 	# cross-node traffic being measured.
+	# spec-6.12 D0 (wave f): XP_INDEX_RELOPT rebuilds the right-growing PK
+	# index with the given storage parameter (candidate leg:
+	# cluster_reverse_key=on).  Default '' keeps the 5.59 DDL byte-identical.
+	my $relopt = $ENV{XP_INDEX_RELOPT} // '';
 	$node0->safe_psql('postgres',
 		'DROP TABLE IF EXISTS xp_index; '
-		  . 'CREATE TABLE xp_index (id bigserial PRIMARY KEY, v int)');
+		  . 'CREATE TABLE xp_index (id bigserial, v int, PRIMARY KEY (id)'
+		  . ($relopt ne '' ? " WITH ($relopt)" : '')
+		  . ')');
 
 	my $before = snap_pair($node0, $node1);
 

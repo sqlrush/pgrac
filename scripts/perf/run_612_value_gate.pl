@@ -59,7 +59,15 @@ my %WAVE_GUC = (
     e1 => ['cluster.ges_handoff = on'],
     e2 => ['cluster.ges_handoff = on', 'cluster.ges_bast = on'],
     d  => ['cluster.space_affinity = static'],
-    f  => ['cluster.index_leaf_affinity = reverse_key'],
+    f  => [],    # wave f is a reloption, not a GUC -- see %WAVE_ENV
+);
+
+# wave -> extra env for the CANDIDATE leg only.  Wave f shipped as the
+# btree reloption cluster_reverse_key (spec-6.12f), not a GUC: the on-leg
+# rebuilds the I-axis right-growing PK index reverse-keyed via
+# XP_INDEX_RELOPT (consumed by axis_index in run_2node_xnode_profile.pl).
+my %WAVE_ENV = (
+    f => { XP_INDEX_RELOPT => 'cluster_reverse_key=on' },
 );
 
 # wave -> the counters whose delta decides the gate (TSV keys).
@@ -123,6 +131,8 @@ sub run_leg
     local $ENV{XP_SCALE}     = $ENV{VG_SCALE}  if defined $ENV{VG_SCALE};
     local $ENV{XP_STORAGE}   = $ENV{VG_STORAGE} // '';
     local $ENV{XP_NETEM_MS}  = $ENV{VG_NETEM_MS} // '';
+    my %wave_env = ($leg eq 'on' && $WAVE_ENV{$wave}) ? %{ $WAVE_ENV{$wave} } : ();
+    local @ENV{keys %wave_env} = values %wave_env if %wave_env;
 
     print "== value-gate $wave: running $leg leg (extra_guc='$extra_guc')\n";
     system($^X, $RUNNER) == 0
@@ -189,6 +199,10 @@ print $fh join("\n",
     "- baseline tsv: $base_tsv",
     "- candidate tsv: $cand_tsv",
     '- candidate guc: ' . join('; ', @{ $WAVE_GUC{$wave} }),
+    '- candidate env: '
+      . ($WAVE_ENV{$wave}
+        ? join('; ', map { "$_=$WAVE_ENV{$wave}{$_}" } sort keys %{ $WAVE_ENV{$wave} })
+        : '(none)'),
     '- storage: ' . ($ENV{VG_STORAGE} // '(shared-nothing)'),
     '- netem declared: ' . ($ENV{VG_NETEM_MS} // 'none'),
     '',
