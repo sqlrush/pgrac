@@ -96,7 +96,7 @@ cluster_init(void)
 	 * (which is postmaster-only); the actual phase advance is
 	 * orchestrated in PostmasterMain only.
 	 */
-	if (cluster_smart_fusion)
+	if (cluster_smart_fusion || cluster_smart_fusion_failclosed_requested())
 		ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("cluster.smart_fusion is fail-closed"),
 						errdetail("The spec-6.2 enabled path still lacks complete checkpoint, 2PC, "

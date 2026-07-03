@@ -623,6 +623,7 @@ extern bool cluster_smart_fusion;
 extern int cluster_smart_fusion_tier_min;
 extern int cluster_smart_fusion_commit_brake_timeout_ms;
 extern int cluster_smart_fusion_origin_durable_gossip_ms;
+extern bool cluster_smart_fusion_failclosed_requested(void);
 
 
 /*

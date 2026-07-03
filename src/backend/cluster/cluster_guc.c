@@ -462,6 +462,7 @@ bool cluster_smart_fusion = false;
 int cluster_smart_fusion_tier_min = CLUSTER_IC_TIER_3;
 int cluster_smart_fusion_commit_brake_timeout_ms = 5000;
 int cluster_smart_fusion_origin_durable_gossip_ms = 50;
+static bool cluster_smart_fusion_enable_requested = false;
 
 /*
  * cluster.undo_retention_horizon_enabled (spec-3.12 D5).  When on (default),
@@ -1060,6 +1061,7 @@ cluster_smart_fusion_check_hook(bool *newval, void **extra, GucSource source)
 	if (!*newval)
 		return true;
 
+	cluster_smart_fusion_enable_requested = true;
 	GUC_check_errcode(ERRCODE_INVALID_PARAMETER_VALUE);
 	GUC_check_errdetail("cluster.smart_fusion is fail-closed after the "
 						"v0.121.0-stage6.2 review because the enabled path still "
@@ -1067,6 +1069,12 @@ cluster_smart_fusion_check_hook(bool *newval, void **extra, GucSource source)
 						"soundness; leave it off until those spec-6.2 blockers "
 						"are fixed.");
 	return false;
+}
+
+bool
+cluster_smart_fusion_failclosed_requested(void)
+{
+	return cluster_smart_fusion_enable_requested;
 }
 
 void

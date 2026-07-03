@@ -366,10 +366,12 @@ UT_TEST(test_smart_fusion_guc_is_guarded_failclosed)
 	newval = false;
 	extra = NULL;
 	UT_ASSERT_EQ(smart_fusion_check_hook(&newval, &extra, PGC_S_TEST), true);
+	UT_ASSERT_EQ(cluster_smart_fusion_failclosed_requested(), false);
 
 	newval = true;
 	extra = NULL;
 	UT_ASSERT_EQ(smart_fusion_check_hook(&newval, &extra, PGC_S_FILE), false);
+	UT_ASSERT_EQ(cluster_smart_fusion_failclosed_requested(), true);
 	UT_ASSERT_NOT_NULL(GUC_check_errdetail_string);
 	if (GUC_check_errdetail_string != NULL)
 		UT_ASSERT(strstr(GUC_check_errdetail_string, "cluster.smart_fusion") != NULL);
