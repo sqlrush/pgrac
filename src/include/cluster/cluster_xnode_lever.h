@@ -73,8 +73,23 @@ typedef struct ClusterXnodeLeverShared {
 	/* ---- wave a: quiescent S-cache via X->S downgrade ---- */
 	pg_atomic_uint64 a_downgrade_count;			/* X->S self-downgrades served */
 	pg_atomic_uint64 a_downgrade_refused_count; /* candidates that stayed one-shot */
-	pg_atomic_uint64 a_fwd_oneshot_count;		/* forwarded X-held reads (MVP: no
-												 * remote-holder downgrade) */
+	pg_atomic_uint64 a_fwd_oneshot_count;		/* forwarded X-held reads that stayed
+												 * one-shot (read_scache off, or the
+												 * pre-㉕ MVP ceiling counter) */
+
+	/* ---- wave a ㉕: remote-holder downgrade (holder != master) ---- */
+	pg_atomic_uint64 a_remote_downgrade_count;		   /* holder-side: accepted +
+														* durable S grant shipped */
+	pg_atomic_uint64 a_remote_downgrade_refused_count; /* holder-side: refused
+														* (active ITL / raced /
+														* flush or notify failed)
+														* -> one-shot fallback */
+	pg_atomic_uint64 a_remote_ack_degraded_count;	   /* requester-side: durable
+														* grant received but the S
+														* registration was denied
+														* (notify raced/lost) ->
+														* degraded to one-shot
+														* (Rule 8.A fail-closed) */
 
 	/* ---- wave e1: GES release-side deterministic handoff ---- */
 	pg_atomic_uint64 e1_drain_count;			   /* release drains verified */
@@ -114,5 +129,7 @@ extern void cluster_lever_c_note_tt_lookup(bool stamp_cached_present, bool stamp
  */
 extern void cluster_lever_a_note_downgrade(bool downgraded);
 extern void cluster_lever_a_note_fwd_oneshot(void);
+extern void cluster_lever_a_note_remote_downgrade(bool downgraded);
+extern void cluster_lever_a_note_remote_ack_degraded(void);
 
 #endif /* CLUSTER_XNODE_LEVER_H */

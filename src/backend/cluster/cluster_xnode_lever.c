@@ -235,3 +235,24 @@ cluster_lever_a_note_fwd_oneshot(void)
 		return;
 	pg_atomic_fetch_add_u64(&ClusterXnodeLeverCtl->a_fwd_oneshot_count, 1);
 }
+
+/* spec-6.12a ㉕ — holder-side remote-downgrade outcome. */
+void
+cluster_lever_a_note_remote_downgrade(bool downgraded)
+{
+	if (!lever_a_counting())
+		return;
+	if (downgraded)
+		pg_atomic_fetch_add_u64(&ClusterXnodeLeverCtl->a_remote_downgrade_count, 1);
+	else
+		pg_atomic_fetch_add_u64(&ClusterXnodeLeverCtl->a_remote_downgrade_refused_count, 1);
+}
+
+/* spec-6.12a ㉕ — requester-side registration denial (degrade to one-shot). */
+void
+cluster_lever_a_note_remote_ack_degraded(void)
+{
+	if (!lever_a_counting())
+		return;
+	pg_atomic_fetch_add_u64(&ClusterXnodeLeverCtl->a_remote_ack_degraded_count, 1);
+}

@@ -6266,6 +6266,7 @@ TestForOldSnapshot_impl(Snapshot snapshot, Relation relation)
  */
 
 #include "access/xlog.h"			/* XLogFlush */
+#include "cluster/cluster_gcs.h"	/* spec-6.12a ㉕ — downgrade notify (nowait) */
 #include "cluster/cluster_gcs_block.h"
 
 /*
@@ -6602,6 +6603,107 @@ cluster_bufmgr_downgrade_x_to_s_for_gcs(BufferTag tag)
 	return true;
 }
 
+/* ========================================================================
+ * PGRAC MODIFICATIONS by SqlRush — spec-6.12a ㉕ (remote-holder X->S
+ * downgrade).
+ *
+ *   cluster_bufmgr_downgrade_x_to_s_remote_for_gcs(tag, master_node) — the
+ *   REMOTE-holder twin of cluster_bufmgr_downgrade_x_to_s_for_gcs above.
+ *   Runs on the X HOLDER when the block's GCS master is a DIFFERENT node
+ *   (the master forwarded an N->S read with the downgrade-request flag).
+ *   Steps 1-2 (verify X + quiescent under the content_lock EXCLUSIVE,
+ *   FlushBuffer when dirty) are identical to the local variant.  Step 3
+ *   differs: the master PCM entry lives on master_node, so the
+ *   PCM_TRANS_X_TO_S_DOWNGRADE is delivered as a fire-and-forget wire
+ *   notify (cluster_gcs_send_transition_nowait) — this handler runs in the
+ *   LMON IC-dispatch context, which structurally cannot block on a reply it
+ *   would have to deliver itself.  The local pcm_state flips X->S ONLY
+ *   after the notify was handed to the transport; a send failure bails with
+ *   every state exactly as found (master unchanged, local X kept).
+ *
+ *   Safety of not observing the master's verdict: while this node holds a
+ *   local X (verified under the content_lock), the master's recorded
+ *   x_holder for the tag must be this node in the same epoch — every
+ *   transfer path destroys the holder's local X copy first, so a same-epoch
+ *   x_holder mismatch is unreachable; the notify carries the current epoch
+ *   and a post-reconfig master rejects it stale (HC73), where the epoch
+ *   cache-invalidation sweep already handles surviving copies.  A LOST
+ *   notify leaves master=X@us, local=S: our own writes then take the S->X
+ *   upgrade round-trip which fails closed until re-converged, and the
+ *   requester's registration try-ACK fails closed to one-shot semantics —
+ *   no path serves a copy the master does not track (Rule 8.A).
+ * ======================================================================== */
+bool
+cluster_bufmgr_downgrade_x_to_s_remote_for_gcs(BufferTag tag, int32 master_node)
+{
+	uint32		hashcode;
+	LWLock	   *partition_lock;
+	int			buf_id;
+	BufferDesc *buf;
+	LWLock	   *content_lock;
+	uint32		buf_state;
+	bool		dirty;
+
+	if (master_node < 0 || master_node == cluster_node_id)
+		return false;
+
+	hashcode = BufTableHashCode(&tag);
+	partition_lock = BufMappingPartitionLock(hashcode);
+
+	LWLockAcquire(partition_lock, LW_SHARED);
+	buf_id = BufTableLookup(&tag, hashcode);
+	if (buf_id < 0)
+	{
+		LWLockRelease(partition_lock);
+		return false;
+	}
+	buf = GetBufferDescriptor(buf_id);
+
+	buf_state = LockBufHdr(buf);
+	if (!BufferTagsEqual(&buf->tag, &tag) || (buf_state & BM_VALID) == 0)
+	{
+		UnlockBufHdr(buf, buf_state);
+		LWLockRelease(partition_lock);
+		return false;
+	}
+	cluster_bufmgr_pin_for_gcs_locked(buf, buf_state);
+	LWLockRelease(partition_lock);
+
+	content_lock = BufferDescriptorGetContentLock(buf);
+	LWLockAcquire(content_lock, LW_EXCLUSIVE);
+
+	/* Same re-verify as the local variant: tag, PCM X, quiescent. */
+	if (!BufferTagsEqual(&buf->tag, &tag)
+		|| (PcmState) buf->pcm_state != PCM_STATE_X
+		|| cluster_itl_page_has_active_slot((Page) BufHdrGetBlock(buf)))
+	{
+		LWLockRelease(content_lock);
+		cluster_bufmgr_unpin_for_gcs(buf);
+		return false;
+	}
+
+	buf_state = LockBufHdr(buf);
+	dirty = (buf_state & BM_DIRTY) != 0;
+	UnlockBufHdr(buf, buf_state);
+
+	if (dirty)
+		FlushBuffer(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+
+	if (!cluster_gcs_send_transition_nowait(tag, PCM_TRANS_X_TO_S_DOWNGRADE, master_node))
+	{
+		/* Notify not handed to transport — keep local X, master unchanged. */
+		LWLockRelease(content_lock);
+		cluster_bufmgr_unpin_for_gcs(buf);
+		return false;
+	}
+
+	buf->pcm_state = (uint8) PCM_STATE_S;
+
+	LWLockRelease(content_lock);
+	cluster_bufmgr_unpin_for_gcs(buf);
+	return true;
+}
+
 /*
  * Smart Fusion copy helper: same stable raw-pin/content_lock contract as
  * cluster_bufmgr_copy_block_for_gcs(), but it deliberately does not flush WAL
@@ -6889,9 +6991,74 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 	if (was_dirty && !XLogRecPtrIsInvalid(page_lsn))
 		XLogFlush(page_lsn);
 
-	InvalidateBuffer(buf);
+	/*
+	 * PGRAC: spec-6.12a ㉕ (latent-bug fix) — InvalidateBuffer requires the
+	 * buffer header spinlock held at ENTRY (it Assert()s BM_LOCKED) and
+	 * releases it internally.  The bare call here previously ran with the
+	 * header unlocked; it never fired because the invalidate handler's
+	 * remote-holder path short-circuited before reaching the drop (see the
+	 * matching handler fix), so the first real caller tripped the assert.
+	 * Re-lock, re-validate the mapping (the buffer may have been evicted /
+	 * retagged while unpinned during XLogFlush), and clear the residency
+	 * mode under the lock so InvalidateBuffer's eviction hook sees
+	 * PCM_STATE_N and skips the remote-master release wire (the §3.5 LMON
+	 * context has no backend slot to send one — same BLOCKER A contract as
+	 * cluster_bufmgr_drop_block_for_gcs_no_wire below).
+	 */
+	buf_state = LockBufHdr(buf);
+	if (!BufferTagsEqual(&buf->tag, &tag) || (buf_state & BM_VALID) == 0)
+	{
+		UnlockBufHdr(buf, buf_state);
+		return false;
+	}
+	buf->pcm_state = (uint8) PCM_STATE_N;
+	InvalidateBuffer(buf);		/* releases the header spinlock */
 
 	return true;
+}
+
+/* ========================================================================
+ * PGRAC MODIFICATIONS by SqlRush — spec-6.12a ㉕.
+ *
+ *   cluster_bufmgr_block_pcm_state(tag) — the resident buffer's node-local
+ *   PCM residency mirror for `tag` (PCM_STATE_N when the block is not
+ *   resident).  The INVALIDATE envelope handler needs the HOLDER-side view:
+ *   consulting cluster_pcm_lock_query there reads the local MASTER hash
+ *   table, which on a non-master holder has no entry and always answers N —
+ *   the latent pre-㉕ bug that made every remote-holder INVALIDATE
+ *   short-circuit to "already invalidated" while the cached S copy silently
+ *   survived (Rule 8.A stale-S hazard, masked on the phantom-shared harness
+ *   by the AD-015 divergence honesty note).
+ * ======================================================================== */
+PcmLockMode
+cluster_bufmgr_block_pcm_state(BufferTag tag)
+{
+	uint32		hashcode;
+	LWLock	   *partition_lock;
+	int			buf_id;
+	BufferDesc *buf;
+	uint32		buf_state;
+	PcmLockMode mode = PCM_LOCK_MODE_N;
+
+	hashcode = BufTableHashCode(&tag);
+	partition_lock = BufMappingPartitionLock(hashcode);
+
+	LWLockAcquire(partition_lock, LW_SHARED);
+	buf_id = BufTableLookup(&tag, hashcode);
+	if (buf_id < 0)
+	{
+		LWLockRelease(partition_lock);
+		return PCM_LOCK_MODE_N;
+	}
+	buf = GetBufferDescriptor(buf_id);
+
+	buf_state = LockBufHdr(buf);
+	if (BufferTagsEqual(&buf->tag, &tag) && (buf_state & BM_VALID) != 0)
+		mode = (PcmLockMode) buf->pcm_state;
+	UnlockBufHdr(buf, buf_state);
+	LWLockRelease(partition_lock);
+
+	return mode;
 }
 
 /* ========================================================================

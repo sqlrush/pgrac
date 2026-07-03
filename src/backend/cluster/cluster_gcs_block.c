@@ -1143,7 +1143,8 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 
 			if (final_status == GCS_BLOCK_REPLY_GRANTED
 				|| final_status == GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER
-				|| final_status == GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER) {
+				|| final_status == GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER
+				|| final_status == GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE) {
 				uint32 expected;
 				uint32 got;
 
@@ -1180,7 +1181,8 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 				gcs_block_stamp_touched((int32)slot->reply_header.sender_node,
 										final_forwarding_master);
 				if (final_status == GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER
-					|| final_status == GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER) {
+					|| final_status == GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER
+					|| final_status == GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE) {
 					/*
 					 * spec-2.35 HC111: requester S-holder bit represents real
 					 * cache residency, not a forward intent.  The master
@@ -1195,8 +1197,30 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 					if (final_status == GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER)
 						pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_x_granted_from_holder_count,
 												1);
-					cluster_gcs_send_transition_and_wait(tag, (PcmLockTransition)transition_id,
-														 final_forwarding_master);
+					if (final_status == GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE) {
+						/*
+						 * PGRAC: spec-6.12a ㉕ — the remote holder downgraded
+						 * X->S and shipped a durable S grant; its master notify
+						 * (PCM_TRANS_X_TO_S_DOWNGRADE) travels independently.
+						 * Register as an S holder with the NON-throwing
+						 * transition: if the master already processed the
+						 * notify our N->S lands on state S (grant + bitmap
+						 * add); if the notify is still in flight (or lost, or
+						 * a concurrent X-transfer won the race) the master
+						 * denies N->S-on-X and we DEGRADE to the one-shot
+						 * read-image semantics — install stands, pcm_state
+						 * stays N, no durable copy the master does not track
+						 * (Rule 8.A fail-closed; the next read converges).
+						 */
+						if (!cluster_gcs_try_send_transition_and_wait(
+								tag, (PcmLockTransition)transition_id, final_forwarding_master)) {
+							cluster_lever_a_note_remote_ack_degraded();
+							read_image = true;
+							break;
+						}
+					} else
+						cluster_gcs_send_transition_and_wait(tag, (PcmLockTransition)transition_id,
+															 final_forwarding_master);
 				}
 				granted = true;
 				break;
@@ -1523,9 +1547,16 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
  *	holder keeps its X; this node installs the bytes for THIS read only and
  *	never registers as an S holder (returns false so buf->pcm_state stays N).
  *
- *	Returns false (one-shot read image, non-durable).  Fails closed
- *	(ereport) if no read image can be obtained — never a silent stale read
- *	(Rule 8.A).
+ *	spec-6.12a ㉕: with cluster.read_scache on, the forward also carries the
+ *	downgrade-request flag.  If the holder accepts (ships
+ *	S_GRANTED_XHOLDER_DOWNGRADE), this node — being the master — registers
+ *	itself as an S holder via a LOCAL transition apply and returns true
+ *	(durable S; the caller mirrors pcm_state).  Registration failure
+ *	degrades to the one-shot semantics below.
+ *
+ *	Returns false for the one-shot read image (non-durable), true for the
+ *	㉕ durable downgraded S grant.  Fails closed (ereport) if no image can
+ *	be obtained — never a silent stale read (Rule 8.A).
  */
 bool
 cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, int32 holder_node)
@@ -1536,6 +1567,7 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, int32 holder_node)
 	GcsBlockForwardPayload fwd;
 	bool got_reply = false;
 	bool installed = false;
+	bool durable_s = false; /* spec-6.12a ㉕ — holder downgraded, we registered */
 
 	if (buf == NULL)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
@@ -1575,6 +1607,12 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, int32 holder_node)
 		GcsBlockForwardPayloadSetExpectedPiWatermarkScn(
 			&fwd, cluster_pcm_lock_pi_watermark_scn_query(tag));
 		GcsBlockForwardPayloadSetReadImage(&fwd, true);
+		/* PGRAC: spec-6.12a ㉕ — ask the remote X holder to TRY the quiescent
+		 * X->S downgrade so this read (and every later one) becomes a durable
+		 * cached S.  We ARE the master here, so on the holder's durable reply
+		 * the registration is a local transition apply — no ACK wire. */
+		if (cluster_read_scache)
+			GcsBlockForwardPayloadSetDowngradeRequest(&fwd, true);
 
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_sent_count, 1);
 		if (!cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
@@ -1612,7 +1650,9 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, int32 holder_node)
 		ConditionVariableCancelSleep();
 
 		if (got_reply
-			&& slot->reply_header.status == (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER) {
+			&& (slot->reply_header.status == (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER
+				|| slot->reply_header.status
+					   == (uint8)GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE)) {
 			uint32 expected = slot->reply_header.checksum;
 			uint32 got = gcs_block_compute_checksum(slot->reply_block_data);
 
@@ -1623,6 +1663,25 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, int32 holder_node)
 				 * remote holder's volatile image. */
 				gcs_block_stamp_touched(holder_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
 				installed = true;
+				/*
+				 * PGRAC: spec-6.12a ㉕ — the holder downgraded X->S and shipped
+				 * a DURABLE S grant.  We are the master: register ourselves as
+				 * an S holder with a LOCAL transition apply (no ACK wire).  The
+				 * holder's own X->S notify travels on the LMON dispatch path;
+				 * if it was applied first our N->S lands on state S (bitmap
+				 * add); if it is still in flight the apply fails and we
+				 * DEGRADE to the one-shot semantics — install stands,
+				 * pcm_state stays N (Rule 8.A: never a durable copy the
+				 * master entry does not track).
+				 */
+				if (slot->reply_header.status
+					== (uint8)GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE) {
+					if (cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_N_TO_S,
+															  cluster_node_id))
+						durable_s = true;
+					else
+						cluster_lever_a_note_remote_ack_degraded();
+				}
 			} else {
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_checksum_fail_count, 1);
 			}
@@ -1637,6 +1696,8 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, int32 holder_node)
 
 	gcs_block_release_slot(slot);
 
+	if (durable_s)
+		return true; /* spec-6.12a ㉕ — durable S; caller mirrors pcm_state = S */
 	if (installed)
 		return false; /* one-shot read image — non-durable, leave pcm_state N */
 
@@ -2614,8 +2675,23 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 		 *   (5) a second X holder can never be granted (HG5 no double-X).
 		 * A dead holder is NOT handled here — that is the dead-master / warm-
 		 * recovery path (53R9K / spec-4.7); leave it to the flow below.
+		 *
+		 * PGRAC: spec-6.12a ㉕ — the gate is narrowed to the live X-HOLDER
+		 * case.  Live S holders now have a REAL invalidate path: the
+		 * pre_state==S branch below broadcasts GCS_BLOCK_INVALIDATE, collects
+		 * every ack, clears the invalidated bits, then grants — the same
+		 * invalidate-before-X contract the LOCAL-master upgrade
+		 * (cluster_gcs_block_local_x_upgrade) already enforces.  Before ㉕ the
+		 * S-holder combination was unreachable here (a remote-mastered block a
+		 * node had written stayed X at that node), so the blanket deny was
+		 * safe; after ㉕ the quiescent downgrade deliberately creates
+		 * "requester holds S, other nodes hold S" and the blanket deny would
+		 * make every downgraded block permanently unwritable by its former
+		 * holder.  Taking the block from a live X HOLDER remains wave-g
+		 * territory and stays denied.
 		 */
-		if (cluster_pcm_master_other_live_holder_exists(req->tag, req->sender_node)) {
+		if (cluster_pcm_lock_query(req->tag) == PCM_LOCK_MODE_X
+			&& cluster_pcm_master_other_live_holder_exists(req->tag, req->sender_node)) {
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_master_not_holder_count, 1);
 			gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER,
 								 InvalidXLogRecPtr, NULL);
@@ -2727,6 +2803,26 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 			if (requester_is_s_holder)
 				holders_bm &= ~((uint32)1u << req->sender_node);
 
+			/*
+			 * PGRAC: spec-6.12a ㉕ — the master itself may hold an S copy (it
+			 * registered as a reader after a remote-holder downgrade).  The
+			 * wire INVALIDATE cannot self-deliver; perform the holder-side
+			 * actions synchronously — drop the local copy and clear our own
+			 * bit on the authoritative entry — then broadcast only to the
+			 * remaining REMOTE holders.  (Idempotent when the copy is not
+			 * resident: the transition apply early-returns on a cleared bit.)
+			 */
+			if ((holders_bm & ((uint32)1u << cluster_node_id)) != 0) {
+				XLogRecPtr self_lsn = InvalidXLogRecPtr;
+				SCN self_scn = InvalidScn;
+
+				(void)cluster_bufmgr_invalidate_block_for_gcs(req->tag, PCM_LOCK_MODE_S, &self_lsn,
+															  &self_scn);
+				(void)cluster_pcm_lock_apply_gcs_transition(req->tag, PCM_TRANS_S_TO_N_INVALIDATE,
+															cluster_node_id);
+				holders_bm &= ~((uint32)1u << cluster_node_id);
+			}
+
 			if (holders_bm != 0) {
 				if (!gcs_block_broadcast_invalidate_and_wait(req, holders_bm)) {
 					/* Budget exhausted — reply DENIED_INVALIDATE_TIMEOUT;
@@ -2739,6 +2835,23 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 					return;
 				}
 				/* All acks collected; fall through to direct grant. */
+
+				/*
+				 * PGRAC: spec-6.12a ㉕ — clear the invalidated holders' bits on
+				 * the authoritative entry (mirror of the LOCAL-master upgrade,
+				 * cluster_gcs_block_local_x_upgrade).  The invalidate ACK
+				 * handler only collects the acked bitmap; without this clear
+				 * the sole-holder legality inside the S→X_UPGRADE apply below
+				 * still sees the dropped holders' bits and fails, sending the
+				 * requester a spurious DENIED_MASTER_NOT_HOLDER.  pending_x is
+				 * set, so no NEW S grant can slip in between the ack collection
+				 * and this clear (HC117).
+				 */
+				for (int inv_n = 0; inv_n < 32; inv_n++) {
+					if ((holders_bm & ((uint32)1u << inv_n)) != 0)
+						(void)cluster_pcm_lock_apply_gcs_transition(
+							req->tag, PCM_TRANS_S_TO_N_INVALIDATE, inv_n);
+				}
 			}
 
 			/*
@@ -2888,9 +3001,16 @@ x_path_skipped:
 					&fwd, cluster_pcm_lock_pi_watermark_scn_query(req->tag));
 				/* D2: tell the holder to ship a read image and keep its X. */
 				GcsBlockForwardPayloadSetReadImage(&fwd, true);
-				/* PGRAC: spec-6.12a MVP — remote-holder downgrade not wired;
-				 * count the forwarded one-shot so D0 can size that ceiling. */
-				cluster_lever_a_note_fwd_oneshot();
+				/* PGRAC: spec-6.12a ㉕ — with the wave GUC on, additionally ask
+				 * the holder to TRY the quiescent X->S downgrade so this (and
+				 * every later) read becomes a durable cached S instead of a
+				 * one-shot re-ship.  The holder alone judges quiescence and
+				 * falls back to the read-image ship on refusal; with the GUC
+				 * off this is the pre-㉕ one-shot (counted for D0 ceiling). */
+				if (cluster_read_scache)
+					GcsBlockForwardPayloadSetDowngradeRequest(&fwd, true);
+				else
+					cluster_lever_a_note_fwd_oneshot();
 
 				if (cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, holder_node, &fwd,
 											 sizeof(fwd))
@@ -3276,16 +3396,19 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 			fwd_master = GcsBlockReplyHeaderGetForwardingMasterNode(hdr);
 
 			if (fwd_master == GCS_BLOCK_REPLY_NO_FORWARDING_MASTER) {
-				/* direct-from-master path */
+				/* direct-from-master path — a master never self-claims a
+				 * holder-shipped status (spec-6.12a ㉕ status included). */
 				if (hdr->sender_node == slot->expected_master_node
 					&& hdr->status != (uint8)GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER
-					&& hdr->status != (uint8)GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER)
+					&& hdr->status != (uint8)GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER
+					&& hdr->status != (uint8)GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE)
 					authorized = true;
 			} else {
 				/* forwarded-by-master path */
 				if (fwd_master == slot->expected_master_node
 					&& (hdr->status == (uint8)GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER
+						|| hdr->status == (uint8)GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER
 						|| hdr->status == (uint8)GCS_BLOCK_REPLY_DENIED_LOST_WRITE))
@@ -3337,6 +3460,8 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	void *block_payload_release_arg = NULL;
 	XLogRecPtr page_lsn = InvalidXLogRecPtr;
 	bool holder_ship_ok;
+	bool remote_downgraded = false; /* spec-6.12a ㉕ — holder accepted the
+									 * master's downgrade request */
 	ClusterSfDepVec sf_dep_vec;
 	bool sf_dep_valid = false;
 	bool sf_peer_v2 = false;
@@ -3362,6 +3487,28 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	if (fwd->transition_id < PCM_TRANS_N_TO_S || fwd->transition_id > PCM_TRANS_S_TO_X_CLEANOUT)
 		return; /* malformed, silently drop;  master
 								 * dedup TTL will sweep stale entry */
+
+	/*
+	 * PGRAC: spec-6.12a ㉕ — remote-holder downgrade.  The master asked us
+	 * (the X holder) to TRY the quiescent X->S self-downgrade before
+	 * shipping.  This MUST run before the ship-image copy below so a
+	 * successful downgrade ships the post-flush storage-consistent S page —
+	 * copying first would open a copy-vs-downgrade window where a local
+	 * write lands between the two and the requester caches a stale image
+	 * (Rule 8.A).  Refusal of any kind (wave GUC off on this node, active
+	 * ITL, state raced, flush unavailable, master notify send failure,
+	 * injection) falls back to today's one-shot read-image ship — the flag
+	 * is a request, never a command.
+	 */
+	if (cluster_read_scache && GcsBlockForwardPayloadIsReadImage(fwd)
+		&& GcsBlockForwardPayloadIsDowngradeRequest(fwd)
+		&& fwd->transition_id == PCM_TRANS_N_TO_S) {
+		CLUSTER_INJECTION_POINT("cluster-gcs-block-remote-downgrade");
+		if (!cluster_injection_should_skip("cluster-gcs-block-remote-downgrade"))
+			remote_downgraded
+				= cluster_bufmgr_downgrade_x_to_s_remote_for_gcs(fwd->tag, fwd->master_node);
+		cluster_lever_a_note_remote_downgrade(remote_downgraded);
+	}
 
 	/* spec-2.35 D15 — fault injection.  SKIP simulates evict race:
 	 * holder pretends buffer is not cached so we exercise the HC105
@@ -3455,11 +3602,22 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 			 * transfer."  Rule 8.A: a GCS ownership transfer must satisfy the
 			 * holder's local commit dependency, not just the bufmgr API contract.
 			 */
-			if (GcsBlockForwardPayloadIsReadImage(fwd)
-				|| (GcsBlockForwardPayloadIsXTransfer(fwd)
-					&& (fwd->transition_id == PCM_TRANS_N_TO_X
-						|| fwd->transition_id == PCM_TRANS_S_TO_X_UPGRADE)
-					&& cluster_itl_page_has_active_slot((Page)block_payload))) {
+			if (remote_downgraded) {
+				/*
+				 * PGRAC: spec-6.12a ㉕ — we accepted the downgrade: our copy is
+				 * S, the page is flushed storage-current, and the master
+				 * notify is on the wire.  Ship a DURABLE S grant; the
+				 * requester installs + registers as an S holder (wire try-ACK
+				 * or local apply), degrading to one-shot on denial.  HC109
+				 * chain fields were stamped above as for every holder ship.
+				 */
+				hdr->status = (uint8)GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE;
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_from_holder_ship_count, 1);
+			} else if (GcsBlockForwardPayloadIsReadImage(fwd)
+					   || (GcsBlockForwardPayloadIsXTransfer(fwd)
+						   && (fwd->transition_id == PCM_TRANS_N_TO_X
+							   || fwd->transition_id == PCM_TRANS_S_TO_X_UPGRADE)
+						   && cluster_itl_page_has_active_slot((Page)block_payload))) {
 				/* Holder keeps its X; the requester consumes this image —
 				 * read-image (D2) reads once and never registers as an S holder,
 				 * X-transfer deferral (D11) sees the row lock and waits, retrying
@@ -3588,7 +3746,12 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	if (holder_ship_ok && block_payload != NULL
 		&& (hdr->status == (uint8)GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER
 			|| hdr->status == (uint8)GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER
-			|| hdr->status == (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER)) {
+			|| hdr->status == (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER
+			/* PGRAC: spec-6.12a ㉕ — the downgraded durable S grant ships page
+			 * bytes exactly like the statuses above; leaving it off this list
+			 * would send the palloc0 zero pad under a real-page checksum
+			 * (guaranteed verify failure at the requester). */
+			|| hdr->status == (uint8)GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE)) {
 		ClusterICSge sge[2];
 
 		memset(sge, 0, sizeof(sge));
@@ -3878,7 +4041,17 @@ cluster_gcs_handle_block_invalidate_envelope(const ClusterICEnvelope *env, const
 		goto send_ack;
 	}
 
-	pre_state = cluster_pcm_lock_query(inv->tag);
+	/*
+	 * PGRAC: spec-6.12a ㉕ (latent-bug fix) — this handler runs on the
+	 * HOLDER, so the residency question must be answered by the node-local
+	 * buffer mirror, NOT cluster_pcm_lock_query: that reads the local MASTER
+	 * hash table, which on a non-master holder has no entry and always
+	 * answered N — every remote-holder INVALIDATE short-circuited to
+	 * "already invalidated" while the cached S copy silently survived
+	 * (Rule 8.A stale-S; masked pre-㉕ by the AD-015 phantom-harness
+	 * divergence deferral, exposed by the ㉕ remote-downgrade S caches).
+	 */
+	pre_state = cluster_bufmgr_block_pcm_state(inv->tag);
 	if (pre_state == PCM_LOCK_MODE_N) {
 		ack_status = 2; /* already_invalidated */
 		goto send_ack;

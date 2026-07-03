@@ -23,6 +23,17 @@
 #	       reader's S copies; node1 then sees exactly the new values
 #	       (a stale-S serve would break the sum)
 #	  L4   counter surface: wave-a xnode_lever keys present on both nodes
+#	  L5   ㉕ remote-holder downgrade: the ~half of the working set whose
+#	       GRD master is node1 (round-robin shards) takes the sub-case B
+#	       topology -- reader node1 IS the master, X holder node0 is
+#	       remote.  Pre-㉕ those blocks re-shipped on EVERY read; now the
+#	       forward carries the downgrade request, node0's LMON accepts
+#	       (X->S + fire-and-forget master notify) and ships a DURABLE S
+#	       grant.  Assert the holder-side acceptance counter ticked on
+#	       node0 and that a settled repeat read ships ZERO pages.  (The
+#	       3-corner topology -- reader/master/holder all distinct -- needs
+#	       a 3-node harness; its requester leg shares this wire protocol
+#	       and is deferred to the ClusterTriple follow-up.)
 #
 # Spec: spec-6.12-crossnode-cache-fusion-perf-optimization.md (wave a)
 #
@@ -198,16 +209,46 @@ is($n0_cnt, $NROWS, 'L3 node0 row count exact after write');
 ok(defined $n0_sum, 'L3 node0 authoritative sum readable');
 
 # ============================================================
-# L4: wave-a counter surface on both nodes.
+# L4: wave-a counter surface on both nodes (base 3 + ㉕ remote 3).
 # ============================================================
 for my $n ($node0, $node1)
 {
 	my $rows = $n->safe_psql('postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='xnode_lever' AND key IN
-		     ('a_downgrade_count','a_downgrade_refused_count','a_fwd_oneshot_count')});
-	is($rows, '3', 'L4 wave-a lever keys present (' . $n->name . ')');
+		     ('a_downgrade_count','a_downgrade_refused_count','a_fwd_oneshot_count',
+		      'a_remote_downgrade_count','a_remote_downgrade_refused_count',
+		      'a_remote_ack_degraded_count')});
+	is($rows, '6', 'L4 wave-a lever keys present incl ㉕ remote (' . $n->name . ')');
 }
+
+# ============================================================
+# L5: ㉕ remote-holder downgrade (sub-case B: reader == master, holder
+# remote).  The L2/L3 traffic above already drove both mastering
+# topologies; the ~node1-mastered half of the blocks can only have been
+# served through the ㉕ path (pre-㉕ they were one-shot re-ships and the
+# settled reship assertion below would fail).
+# ============================================================
+my $remote_ok0 = state_val($node0, 'xnode_lever', 'a_remote_downgrade_count');
+cmp_ok($remote_ok0, '>', 0,
+	sprintf('L5 node0 (X holder) accepted remote downgrade requests (%d)',
+		$remote_ok0));
+
+# Settled convergence: after L3 node0 re-took X on every block; read once to
+# re-populate node1 (mixed direct/remote grants), let the fire-and-forget
+# notifies land, then a further repeat read must ship ZERO pages -- every
+# block is either a durable cached S or a locally re-grantable install.
+my $c3 = read_sql($node1, 'SELECT count(*) FROM xa_read');
+ok(defined $c3, 'L5 node1 re-read after write completed');
+usleep(1_000_000);
+my $c4 = read_sql($node1, 'SELECT count(*) FROM xa_read');
+my $r3 = reship($node1);
+my $c5 = read_sql($node1, 'SELECT count(*) FROM xa_read');
+my $r4 = reship($node1);
+is($c5, $c4, 'L5 settled repeat reads agree');
+is($r4 - $r3, 0,
+	sprintf('L5 settled repeat read ships zero pages (reship delta %d)',
+		$r4 - $r3));
 
 $pair->stop_pair if $pair->can('stop_pair');
 done_testing();

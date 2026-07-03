@@ -2014,7 +2014,9 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode)
 	 * by a REMOTE node, an N→S reader cannot be served by the tag-only acquire
 	 * (no data plane).  Forward a read-image request to the holder and install
 	 * the shipped current image for this read (non-durable — returns false so
-	 * the caller leaves buf->pcm_state == N).
+	 * the caller leaves buf->pcm_state == N).  spec-6.12a ㉕: if the holder
+	 * accepted the piggybacked downgrade request this returns true instead
+	 * (durable S; caller mirrors pcm_state = S).
 	 */
 	if (mode == PCM_LOCK_MODE_S) {
 		PcmLockMode master_state = cluster_pcm_lock_query(tag);

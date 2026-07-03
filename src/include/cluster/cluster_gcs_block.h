@@ -174,7 +174,7 @@ typedef enum GcsBlockReplyStatus {
 													 * Reuses HC103 copy-ship + HC127
 													 * watermark. */
 	,
-	GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING = 14 /* PGRAC: spec-5.16 D3b NEW;
+	GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING = 14, /* PGRAC: spec-5.16 D3b NEW;
 													 * master-side hard gate (INV-R8/R14)
 													 * — the master (a rejoining node) is
 													 * NOT yet a quorum MEMBER, or the
@@ -185,14 +185,39 @@ typedef enum GcsBlockReplyStatus {
 													 * requester routed here never gets a
 													 * cold grant.  sender maps to 53R9L
 													 * (retry-safe, Class 53). */
+	GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE = 15 /* PGRAC: spec-6.12a ㉕ NEW;
+													 * the remote X holder accepted the
+													 * downgrade request: it flushed the
+													 * quiescent page, flipped its own
+													 * copy X→S, fired the master
+													 * PCM_TRANS_X_TO_S_DOWNGRADE notify,
+													 * and ships this DURABLE S grant.
+													 * The requester installs the bytes,
+													 * then registers as an S holder via
+													 * the normal N→S transition (wire
+													 * try-ACK for the 3-corner path;
+													 * local apply when requester ==
+													 * master).  If that registration is
+													 * denied (notify raced or lost) the
+													 * requester DEGRADES to the one-shot
+													 * read-image semantics: pcm_state
+													 * stays N, no S copy is retained
+													 * (Rule 8.A fail-closed — never a
+													 * durable copy the master does not
+													 * track).  HC108 authorized chain
+													 * applies as for GRANTED_FROM_HOLDER. */
 } GcsBlockReplyStatus;
 
-/* spec-5.16 D3b / r4 — the new reply status MUST be the tail value (no
- * collision with any shipped status; r3 mis-read a truncated enum as max 8,
- * the real shipped max is READ_IMAGE_FROM_XHOLDER=13). */
+/* spec-5.16 D3b / r4 (spec-6.12a ㉕ extends) — every new reply status MUST be
+ * appended as the tail value (no collision with any shipped status; r3 mis-read
+ * a truncated enum as max 8, the real shipped max before spec-5.16 was
+ * READ_IMAGE_FROM_XHOLDER=13). */
 StaticAssertDecl(GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING
 					 == GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER + 1,
-				 "GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING must be the tail enum value");
+				 "GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING must follow READ_IMAGE_FROM_XHOLDER");
+StaticAssertDecl(GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE
+					 == GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING + 1,
+				 "GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE must be the tail enum value");
 
 /* ============================================================
  * GcsBlockInvalidatePayload — spec-2.36 D1 NEW.
@@ -851,6 +876,32 @@ GcsBlockForwardPayloadIsCleanEligible(const GcsBlockForwardPayload *p)
 	return p->reserved_0[2] != 0;
 }
 
+/* PGRAC: spec-6.12a ㉕ — remote-holder downgrade request flag carried in
+ * reserved_0[3] ([0]=read-image, [1]=X-transfer, [2]=clean-eligible above;
+ * [4..6] remain free).
+ *
+ *	Set by the master ALONGSIDE the read-image flag when forwarding an N→S
+ *	read to a remote X holder and cluster.read_scache is on: the holder
+ *	should TRY the quiescent X→S self-downgrade (flush + local flip + master
+ *	notify) and, on success, ship a durable S grant
+ *	(S_GRANTED_XHOLDER_DOWNGRADE) instead of the one-shot read image.
+ *	Refusal (active ITL / raced / flush unavailable / notify send failure)
+ *	falls back to the read-image ship — the flag is a request, never a
+ *	command (Rule 8.A: the holder alone can judge quiescence).  A holder
+ *	running with cluster.read_scache=off ignores the flag entirely
+ *	(off-path byte-identical). */
+static inline void
+GcsBlockForwardPayloadSetDowngradeRequest(GcsBlockForwardPayload *p, bool downgrade)
+{
+	p->reserved_0[3] = downgrade ? (uint8)1 : (uint8)0;
+}
+
+static inline bool
+GcsBlockForwardPayloadIsDowngradeRequest(const GcsBlockForwardPayload *p)
+{
+	return p->reserved_0[3] != 0;
+}
+
 /* PGRAC: spec-5.2 D2 — pure master-side decision for an N→S read request
  * when the block is held in X.  Kept pure (no shmem / no I/O) so the gate
  * truth table is unit-tested standalone (U3). */
@@ -954,6 +1005,7 @@ extern bool cluster_bufmgr_copy_block_for_gcs_smart_fusion(BufferTag tag, XLogRe
 														   char *dst, ClusterSfDepVec *out_dep_vec);
 /* PGRAC: spec-2.36 D4 (HC118 / HC123) — by-tag invalidate wrapper for
  * holder-side INVALIDATE handler.  XLogFlush+InvalidateBuffer. */
+extern PcmLockMode cluster_bufmgr_block_pcm_state(BufferTag tag);
 extern bool cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode,
 													XLogRecPtr *out_page_lsn, SCN *out_page_scn);
 /* PGRAC: spec-5.2 D11 (writer-transfer-revoke) — by-tag local buffer drop
@@ -976,6 +1028,7 @@ extern bool cluster_gcs_block_local_x_upgrade(BufferTag tag);
  * pcm_state cache X->S.  False = not quiescent / not X / buffer gone /
  * master refused; caller falls back to the one-shot read-image ship. */
 extern bool cluster_bufmgr_downgrade_x_to_s_for_gcs(BufferTag tag);
+extern bool cluster_bufmgr_downgrade_x_to_s_remote_for_gcs(BufferTag tag, int32 master_node);
 
 /* PGRAC: spec-5.2a D4 (backend eager flush) — flush a cluster sequence page to
  * shared storage from the BACKEND that just wrote it.  Caller holds a pin and

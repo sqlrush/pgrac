@@ -285,10 +285,48 @@ UT_TEST(test_l22_master_holder_lifecycle_documented_in_tap)
 }
 
 
+/* PGRAC: spec-6.12a ㉕ — downgrade-request flag rides reserved_0[3] and must
+ * not disturb the read-image [0] / X-transfer [1] / clean-eligible [2]
+ * overlays; the new durable reply status is the enum tail (15). */
+UT_TEST(test_downgrade_request_flag_round_trip_independent)
+{
+	GcsBlockForwardPayload fwd;
+
+	memset(&fwd, 0, sizeof(fwd));
+	UT_ASSERT(!GcsBlockForwardPayloadIsDowngradeRequest(&fwd));
+
+	GcsBlockForwardPayloadSetReadImage(&fwd, true);
+	GcsBlockForwardPayloadSetXTransfer(&fwd, true);
+	GcsBlockForwardPayloadSetCleanEligible(&fwd, true);
+	GcsBlockForwardPayloadSetDowngradeRequest(&fwd, true);
+
+	UT_ASSERT(GcsBlockForwardPayloadIsReadImage(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsXTransfer(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsCleanEligible(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsDowngradeRequest(&fwd));
+
+	GcsBlockForwardPayloadSetDowngradeRequest(&fwd, false);
+	UT_ASSERT(!GcsBlockForwardPayloadIsDowngradeRequest(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsReadImage(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsXTransfer(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsCleanEligible(&fwd));
+	/* sizeof unchanged — flag lives inside the existing 64B wire. */
+	UT_ASSERT_EQ((int)sizeof(GcsBlockForwardPayload), 64);
+}
+
+
+UT_TEST(test_s_granted_xholder_downgrade_status_is_15)
+{
+	UT_ASSERT_EQ((int)GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE, 15);
+	UT_ASSERT_EQ((int)GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE,
+				 (int)GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING + 1);
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(24);
 	UT_RUN(test_block_forward_msg_type_is_16);
 	UT_RUN(test_granted_from_holder_status_is_8);
 	UT_RUN(test_forward_payload_size_locked_at_64);
@@ -311,6 +349,8 @@ main(void)
 	UT_RUN(test_l20_evict_race_recovery_documented_in_tap);
 	UT_RUN(test_l21_hc112_unlock_preserves_bit_documented_in_tap);
 	UT_RUN(test_l22_master_holder_lifecycle_documented_in_tap);
+	UT_RUN(test_downgrade_request_flag_round_trip_independent);
+	UT_RUN(test_s_granted_xholder_downgrade_status_is_15);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
