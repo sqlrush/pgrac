@@ -137,14 +137,14 @@ sub cnext
 	die "cnext($seq): exhausted retries under contention; last=$last_err";
 }
 
-# Retry a post-restart nextval through documented fail-closed and connection
-# readiness windows, but still require a successful value before checking
-# durability.
+# Retry a post-restart nextval through documented fail-closed, quorum, and
+# connection readiness windows, but still require a successful value before
+# checking durability.
 sub restart_nextval
 {
 	my ($node, $seq) = @_;
 	my $last_err = '';
-	for my $attempt (1 .. 12)
+	for my $attempt (1 .. 60)
 	{
 		my ($rc, $out, $err);
 		my $ran = eval {
@@ -164,6 +164,8 @@ sub restart_nextval
 		  || $last_err =~ /retry the transaction/
 		  || $last_err =~ /cluster TT status unknown/
 		  || $last_err =~ /Remote commit_scn not yet propagated/
+		  || $last_err =~ /cluster quorum lost or uncertain/
+		  || $last_err =~ /transaction aborted: cluster quorum lost/
 		  || $last_err =~ /database system is starting up/
 		  || $last_err =~ /server closed the connection unexpectedly/
 		  || $last_err =~ /could not connect to server/
