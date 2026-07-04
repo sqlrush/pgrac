@@ -27,8 +27,17 @@
 #    per-node until spec-6.14 ships the shared catalog, so a table
 #    created on node0 does not exist in node1's catalog.
 #
-#    D5c legs (slot claim / owner identity / 5.18 retired) and the D5d
-#    standby leg land with their deliverables.
+#      L5   D5c slot claim: both nodes' region-4 stripe slots carry
+#           the PGXS magic durably on disk after admission.
+#      L6   D5c retire-before-removal: node1 clean-leaves (5.13), node0
+#           permanently removes it (5.18) — the removal commits only
+#           after node1's stripe slot is durably retired (retired flag
+#           byte set on disk, retire logged on the coordinator).
+#      L7   the removed node's fresh boot stays fail-closed: no
+#           writable transaction ever succeeds (membership 53R64 and
+#           the retired stripe slot 53RB1 both bar the way).
+#
+#    The D5d standby skip-fill leg lands with its deliverable.
 #
 # IDENTIFICATION
 #    src/test/cluster_tap/t/347_cluster_6_15_xid_stripe_activation.pl
@@ -93,6 +102,23 @@ sub log_count
 	return $n;
 }
 
+# Read {magic, retired} of a region-4 stripe slot from a voting disk
+# file.  Slot N sits at ((3 * 128) + N) * 512; magic "PGXS" =
+# 0x50475853 LE; the retired flag is the byte at record offset 12
+# (magic 4 + version 4 + node_id 4).
+sub read_stripe_slot
+{
+	my ($path, $node) = @_;
+	open(my $fh, '<', $path) or return undef;
+	binmode $fh;
+	return undef unless seek($fh, (3 * 128 + $node) * 512, 0);
+	my $buf;
+	return undef unless read($fh, $buf, 16) == 16;
+	close $fh;
+	my ($magic, $retired) = (unpack('V', substr($buf, 0, 4)), ord(substr($buf, 12, 1)));
+	return { magic => $magic, retired => $retired };
+}
+
 # Read the region-5 activation record magic from a voting disk file.
 # Region 5 sits at offset 4 * 128 * 512; magic "PGXA" = 0x50475841 LE.
 sub read_activation_magic
@@ -109,6 +135,9 @@ sub read_activation_magic
 
 my @conf = (
 	'cluster.online_join = on',
+	'cluster.clean_leave_enabled = on',
+	'cluster.online_node_removal = on',
+	'cluster.quorum_poll_interval_ms = 500',
 	'cluster.join_convergence_timeout_ms = 30000',
 	'cluster.cssd_heartbeat_interval_ms = 500',
 	'cluster.cssd_dead_deadband_factor = 6',
@@ -212,6 +241,63 @@ my $node1 = $pair->node1;
 
 	my $x1 = $node1->safe_psql('postgres', 'SELECT txid_current()');
 	is($x1 % 16, 1, "L4-iv rejoined node1 xid $x1 back in slot 1 (mod 16)");
+}
+
+# ----------
+# L5 — D5c: both region-4 stripe slots durably claimed (PGXS on disk).
+# ----------
+my $disk0;
+{
+	my $disks = $node0->safe_psql('postgres',
+		q{SELECT setting FROM pg_settings WHERE name = 'cluster.voting_disks'});
+	($disk0) = split(/,/, $disks);
+	for my $n (0, 1)
+	{
+		my $slot = read_stripe_slot($disk0, $n);
+		is(sprintf('0x%08X', $slot->{magic} // 0), '0x50475853',
+			"L5-i slot $n carries the PGXS magic on disk");
+		is($slot->{retired}, 0, "L5-ii slot $n is not retired");
+	}
+}
+
+# ----------
+# L6 — D5c: retire-before-removal (clean-leave then permanent removal).
+# ----------
+{
+	my $leave = $node1->safe_psql('postgres', 'SELECT pg_cluster_clean_leave_request()');
+	is($leave, 'accepted', 'L6-i node1 clean-leave accepted');
+	ok(poll_until($node1,
+			q{SELECT phase = 'committed' FROM pg_cluster_clean_leave_state},
+			't', 40, 'node1 clean-leave committed'),
+		'L6-ii node1 clean-leave commits (dormant member)');
+
+	my $req = $node0->safe_psql('postgres', 'SELECT pg_cluster_remove_node(1)');
+	is($req, 'accepted', 'L6-iii node0 pg_cluster_remove_node(1) accepted');
+	ok(poll_until($node0,
+			q{SELECT phase = 'committed' FROM pg_cluster_node_removal_state},
+			't', 60, 'removal committed'),
+		'L6-iv removal commits');
+
+	cmp_ok(log_count($node0, 'slot 1 retired'), '>=', 1,
+		'L6-v coordinator logged the durable stripe-slot retire');
+	my $slot = read_stripe_slot($disk0, 1);
+	is($slot->{retired}, 1, 'L6-vi region-4 slot 1 retired flag durable on disk');
+	is(sprintf('0x%08X', $slot->{magic} // 0), '0x50475853',
+		'L6-vii retired record still carries the PGXS magic (owner preserved)');
+}
+
+# ----------
+# L7 — the removed node's fresh boot stays fail-closed (never writable).
+# ----------
+{
+	$node1->stop;
+	$node1->start;
+	sleep 8; # give the joiner gate several LMON ticks to (wrongly) open
+
+	my $write_ok =
+	  eval { $node1->safe_psql('postgres', 'INSERT INTO t347_n1 VALUES (7)'); 1 } // 0;
+	is($write_ok, 0, 'L7 removed node1 stays fail-closed after a fresh boot');
+	$node1->stop;
 }
 
 $pair->stop_pair;

@@ -1480,6 +1480,18 @@ qvotec_poll_once(void)
 	}
 }
 
+/*
+ * spec-6.15 D5c: expose this boot's self-incarnation (the canonical
+ * durable identity seed, also written into the voting self-slot every
+ * poll).  Consumed by the stripe slot first-claim, which runs in this
+ * process (qvotec) via the stripe mailbox service.
+ */
+uint64
+cluster_qvotec_self_incarnation_value(void)
+{
+	return qvotec_self_incarnation;
+}
+
 static void
 qvotec_open_disks(void)
 {
