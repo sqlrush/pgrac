@@ -83,21 +83,253 @@ lane whose posted receives are consumed only by block-reply SENDs.
 | D6.9 | Observability | Increment direct-land success/abort counters and expose lane state/error reason in RDMA debug output or `pg_stat_cluster_ic`. |
 | D6.10 | Tests | Add unit tests for sidecar/slot identity and state transitions; add soft-RoCE TAP for direct-land success, stale slot rejection, checksum failure, peer disconnect, and fallback. |
 
+### D6.1 Block-Reply Lane/QP
+
+The block-reply lane is a per-peer RDMA lane used only for
+`PGRAC_IC_MSG_GCS_BLOCK_REPLY` direct-land attempts.  It is intentionally not
+part of `ClusterICOps.recv_bytes()` and is never used by the generic envelope
+dispatcher.
+
+Each `ClusterICRdmaPeer` grows a second logical lane:
+
+| Field | Meaning |
+|---|---|
+| `block_reply_qp` | Dedicated RC QP, or equivalent provider lane, for direct-land block replies. |
+| `block_reply_connected` | True only after the peer negotiated and established the block-reply lane. |
+| `block_reply_max_recv_sge` | Provider-reported receive SGE capacity; must be at least 2. |
+| `block_reply_send_busy` | SEND backpressure for direct-land replies. |
+| `block_reply_arm_head/tail` | LMON-owned arm table or freelist for posted receives. |
+| `block_reply_last_error` | Human-readable reason for the last lane fallback/error. |
+
+The generic QP remains unchanged:
+
+- generic receive WRs keep one SGE and feed `rdma_process_recv_completion()`;
+- generic CQEs are still demuxed by SEND/RECV plus peer;
+- generic traffic may not consume block-reply posted receives;
+- block-reply CQEs may not enter `rdma_dispatch_pending_frames()`.
+
+Lane setup follows the same RDMA CM peer lifecycle as the generic QP.  If the
+provider cannot create a second QP, or the created QP reports
+`max_recv_sge < 2`, the peer remains RDMA-capable for generic traffic but
+`block_reply_connected=false`; D6 direct-land requests for that peer fall back
+before the request is sent with the direct-land flag.
+
+### D6.2 Two-SGE Receive
+
+A direct-land receive WR has exactly two SGEs:
+
+| SGE | Address | Length | Trust level |
+|---|---|---:|---|
+| SGE0 | LMON-owned sidecar buffer | `CLUSTER_IC_RDMA_DIRECT_LAND_SIDECAR_BYTES` | Quarantine metadata, untrusted until verified. |
+| SGE1 | Reserved target page | `BLCKSZ` | Untrusted bytes until verifier succeeds. |
+
+SGE1 must never point at a currently visible valid shared buffer page.  The
+allowed targets are:
+
+| Target kind | Use | Install rule |
+|---|---|---|
+| Reserved invalid shared buffer | Preferred zero-copy target.  The requester reserves/pins the buffer for `BufferTag`, keeps it not valid and not visible, and lets RDMA DMA into its page memory. | Verifier marks the page valid/installed only after all checks pass. |
+| Registered staging page | Safety fallback when a final buffer cannot be reserved before the request. | Verifier copies into the final buffer through the existing install path; this increments copy counters and is not counted as direct install. |
+
+The first D6 implementation should target the reserved invalid shared-buffer
+case for normal read misses.  It must keep the existing staging-copy path for
+cases that cannot prove exclusive ownership of the target page.
+
+### D6.3 Slot Correlation
+
+The receive CQE must map to a single live outstanding GCS slot without scanning
+all backends.  The correlation has three layers:
+
+| Layer | Carries | Purpose |
+|---|---|---|
+| `wr_id` | WR type `BLOCK_REPLY_RECV`, arm table index, generation bits | Fast LMON CQE demux to an arm record. |
+| Arm record | Full `backend_id`, slot index, request id, slot generation, expected peer, target pointer | Authoritative local ownership and cleanup state. |
+| Sidecar/reply header | Envelope source/destination, reply request id, requester backend id, transition id, epoch, checksum | Wire identity echoed by the sender and verified against the slot. |
+
+The `wr_id` does not need to pack the full backend/request identity.  It should
+pack a bounded arm-table index plus enough generation bits to reject stale CQEs
+before following the arm pointer.  The arm record then stores the full identity.
+
+`ClusterGcsBlockOutstandingSlot` grows direct-land fields:
+
+| Field | Meaning |
+|---|---|
+| `direct_generation` | Incremented every time the slot is reserved; prevents stale CQE reuse. |
+| `direct_state` | `UNARMED`, `ARMING`, `ARMED`, `LANDED`, `INSTALLED`, `ABORTING`, `ABORTED`. |
+| `direct_expected_peer` | Peer whose block-reply lane has the posted receive. |
+| `direct_arm_id` | LMON arm-table index or invalid. |
+| `direct_target_kind` | Reserved invalid buffer or staging page. |
+| `direct_target_buf` | Buffer descriptor when SGE1 targets shared_buffers. |
+| `direct_sidecar` | Pointer to sidecar quarantine bytes. |
+| `direct_abort_reason` | Last local abort reason for debug/observability. |
+
+The arm record stores the same `direct_generation`.  A CQE is usable only if
+the slot is still in `ARMED`, the arm record generation matches, and the sidecar
+echoes the current request identity.
+
+### D6.4 LMON Arm-Before-Send Handoff
+
+LMON owns QPs and posted receives, so the backend must not post the direct-land
+WR itself.  The request path is:
+
+1. Backend reserves a GCS outstanding slot and increments `direct_generation`.
+2. Backend marks the slot `ARMING` and enqueues a normal GCS outbound request
+   with `direct_land_desired=true`; it does not set the wire flag yet.
+3. LMON drains the outbound request.  Before sending the request to the master,
+   LMON checks peer capability and tries to post a two-SGE receive on that
+   peer's block-reply lane.
+4. If arming succeeds, LMON marks the slot `ARMED`, sets
+   `GcsBlockRequestPayload.reserved_0[1]`, and sends the request.
+5. If arming fails, LMON marks the slot `UNARMED`, clears the direct-land flag,
+   increments lane fallback stats, and sends the request on the existing
+   staging-copy path.
+
+This keeps arming and request SEND ordered inside LMON: the wire request cannot
+advertise direct-land until the receive WR is already posted.
+
+Forwarded holder replies require an exact expected sender.  The safe initial
+D6 rule is:
+
+- direct-land is enabled only when the expected reply peer is known and armed;
+- if the master forwards to a holder that was not the armed peer, it must clear
+  the direct-land flag in `GcsBlockForwardPayload` and use the existing reply
+  path;
+- a later in-spec enhancement may add a redirect-arm handshake, but holder
+  direct-land must not rely on a wildcard receive posted to the wrong peer.
+
+### D6.5 Sender Capability Gate
+
+A sender may use the direct-land reply format only if all conditions hold:
+
+- the inbound request or forward payload has the direct-land armed flag set;
+- the sender has a connected block-reply lane to the requester;
+- the reply is a v1 GCS block reply with exactly `GcsBlockReplyHeader + BLCKSZ`;
+- the reply is non-Smart-Fusion-v2 and non-destructive X-transfer;
+- the sender can produce a valid block image from live SGE, scratch SGE, or a
+  local copy buffer.
+
+When the flag is set and the lane is connected, the sender should consume the
+requester's posted receive on the block-reply lane.  It may still source the
+page from a copied buffer; direct-land is about receiver placement, not only
+sender live SGE.
+
+If the sender cannot build a successful block reply after the requester armed a
+receive, it should send a direct-land denial reply with a zeroed page payload on
+the block-reply lane when possible.  Sending a generic reply after the request
+advertised direct-land is unsafe because the posted block-reply receive would
+remain outstanding and could later DMA into a released target.  If the
+block-reply lane itself fails, the requester times out, resets or drains the
+lane, and retries without direct-land.
+
+### D6.6 Completion Verifier
+
+LMON handles block-reply CQEs before waking the backend.  Completion processing:
+
+1. Decode `wr_id` and find the arm record.
+2. Reject if the arm index/generation is stale or the slot is not `ARMED`.
+3. On CQE error, move to abort cleanup.
+4. On CQE success, mark the arm `LANDED` but keep the target invisible.
+5. Verify sidecar envelope and reply header.
+6. Verify `request_id`, `requester_backend_id`, `transition_id`, epoch, and
+   expected peer against the outstanding slot.
+7. Verify envelope CRC over the sidecar payload header plus landed page bytes.
+8. Verify `GcsBlockReplyHeader.checksum` over the landed page bytes.
+9. Run the existing lost-write/page-LSN/SCN checks.
+10. Install or mark valid only after every check passes.
+
+The verifier must not call the generic envelope dispatcher.  It can reuse the
+same checksum helpers, but the payload bytes are discontiguous across sidecar
+and SGE1.
+
+### D6.7 Abort Cleanup
+
+Abort cleanup must account for posted receives that cannot be unposted from an
+RC QP.  The cleanup policy is:
+
+| Failure | Cleanup |
+|---|---|
+| Arming failed before `ibv_post_recv` | Clear flag, release target, send normal request. |
+| Timeout while WR is posted | Mark arm `ABORTING`; reset or drain the block-reply lane until the WR completes with error before releasing target memory. |
+| CQE error | Release target, clear arm, increment `direct_install_abort_count` and lane error stats. |
+| Sidecar/checksum/identity failure | Leave target invisible, release target after verifier marks slot failed, increment abort counters. |
+| Backend exit/cancel | Mark slot orphaned and ask LMON to reset/drain the lane before releasing or reusing the target. |
+| Peer disconnect | Fail all armed slots for that peer, reset lane, wake waiters for retry/failure. |
+
+No abort path may release a target page while a posted receive can still DMA
+into it.  If the provider cannot prove the WR is completed or flushed, reset the
+block-reply QP and rebuild the lane before accepting new direct-land arms.
+
+### D6.8 Fallback Semantics
+
+Fallback is allowed before the direct-land request is advertised on the wire:
+
+- no RDMA build/runtime support;
+- peer not using RDMA;
+- no block-reply lane;
+- two-SGE receive unsupported;
+- no reserved invalid buffer target;
+- arm-table full;
+- `ibv_post_recv` failed.
+
+After the request has been sent with direct-land armed, the attempt must finish
+through the block-reply lane or abort.  It must not silently install a generic
+fallback reply into the same slot while the posted receive is still live.
+
+### D6.9 Observability
+
+The existing counters remain valid, but D6 makes the direct-land counters live
+and adds lane-level evidence:
+
+| Counter/state | Source | Meaning |
+|---|---|---|
+| `direct_install_count` | GCS | Verified direct-land page installed with no staging copy. |
+| `direct_install_abort_count` | GCS | Direct-land arm/completion/verifier failed after resources were reserved. |
+| `block_reply_lane_fallback_count` | RDMA peer stats | Direct-land desired but not armed before request send. |
+| `block_reply_lane_error_count` | RDMA peer stats | CQE/provider/lane reset error on the block-reply lane. |
+| `block_reply_lane_state` | `pg_stat_cluster_ic` or debug dump | `disabled`, `connecting`, `connected`, `resetting`, `error`. |
+| `last_block_reply_error` | `pg_stat_cluster_ic` or debug dump | Last direct-land lane error/fallback reason. |
+
+### D6.10 Tests
+
+Unit tests:
+
+- sidecar size/layout is exactly `ClusterICEnvelope + GcsBlockReplyHeader`;
+- `wr_id` arm-index/generation decoding rejects stale CQEs;
+- slot state transitions reject illegal edges;
+- arming failure clears request/forward direct-land flags;
+- verifier rejects wrong peer, wrong backend id, wrong request id, wrong
+  transition id, stale epoch, bad envelope CRC, bad block checksum;
+- timeout/backend-exit cleanup does not release a live posted target.
+
+soft-RoCE TAP:
+
+- direct master reply lands into a reserved invalid buffer and increments
+  `direct_install_count`;
+- arming unavailable falls back and increments lane fallback counters;
+- forwarded holder path clears direct-land unless exact holder arm exists;
+- stale direct-land reply is dropped and does not make the buffer valid;
+- checksum failure aborts and increments `direct_install_abort_count`;
+- peer disconnect with an armed receive resets/drains the lane and wakes the
+  waiter;
+- retry after abort succeeds through normal copy path.
+
 ### Direct-Land Sidecar
 
 The direct-land receive sidecar is fixed at
 `CLUSTER_IC_RDMA_DIRECT_LAND_SIDECAR_BYTES` and precedes the 8 KB block image.
-It is quarantine metadata, not trusted state.  It must carry or authenticate:
+It is quarantine metadata, not trusted state.  The frozen byte layout is:
 
-- envelope magic/version/message type/source/destination/epoch/payload length;
-- `GcsBlockReplyHeader`;
-- requester backend id and request id;
-- slot generation;
-- sending peer node id;
-- checksum for the landed page.
+| Bytes | Field | Notes |
+|---:|---|---|
+| `0..35` | `ClusterICEnvelope` | `msg_type=PGRAC_IC_MSG_GCS_BLOCK_REPLY`; `payload_length=sizeof(GcsBlockReplyHeader)+BLCKSZ`. |
+| `36..83` | `GcsBlockReplyHeader` | Existing v1 reply header.  Smart Fusion v2 replies are not direct-landed in D6. |
 
-The exact field packing must preserve the existing 84-byte constant unless the
-constant, unit test, and compatibility note are updated together.
+The 84-byte size is exactly `sizeof(ClusterICEnvelope) +
+sizeof(GcsBlockReplyHeader)`.  Slot generation is local receiver state and is
+carried by `wr_id` plus the LMON arm record, not by the sender-visible sidecar.
+Changing this layout requires changing
+`CLUSTER_IC_RDMA_DIRECT_LAND_SIDECAR_BYTES`, unit tests, and compatibility
+notes in one patch.
 
 ### Request/Forward Flags
 
@@ -106,6 +338,10 @@ direct-land receive.  Forwarded holder requests carry the same intent in the
 forward payload flag already reserved for spec-6.13.  A sender must treat the
 flag as advisory and also check RDMA peer capability before choosing the
 direct-land reply format.
+
+The master must clear the forward direct-land flag unless it can prove the
+requester armed the holder as the exact expected reply peer.  Without that
+proof, the holder uses the existing generic reply path.
 
 ### Receiver State Machine
 
@@ -118,13 +354,27 @@ direct-land reply format.
 | `INSTALLED` | Page passed verification and was made visible to the waiting backend. | Slot release. |
 | `ABORTED` | Any error path released resources and marked the attempt unusable. | Retry without direct-land or propagate existing GCS error. |
 
+Legal transitions:
+
+| From | To | Trigger |
+|---|---|---|
+| `UNARMED` | `ARMING` | Backend reserves a slot and direct-land is desired. |
+| `ARMING` | `ARMED` | LMON posts the two-SGE receive successfully. |
+| `ARMING` | `UNARMED` | LMON cannot arm; request proceeds without direct-land flag. |
+| `ARMED` | `LANDED` | Block-reply lane CQE success. |
+| `ARMED` | `ABORTED` | CQE error, peer loss, timeout with lane reset, backend cancel. |
+| `LANDED` | `INSTALLED` | Verifier accepts sidecar and page. |
+| `LANDED` | `ABORTED` | Verifier rejects sidecar/page. |
+| `INSTALLED` | `UNARMED` | Slot release/reuse. |
+| `ABORTED` | `UNARMED` | Slot release/retry. |
+
 ### Resource Ownership
 
 - Backend owns the GCS outstanding slot and wait condition variable.
 - LMON owns RDMA QPs, CQs, and posted receives.
 - The direct-land arm record bridges the two with an explicit slot generation.
-- The buffer raw pin or staging page reference is held from successful arming
-  until verifier success or abort cleanup.
+- The reserved invalid buffer pin or staging page reference is held from
+  successful arming until verifier success or abort cleanup.
 - Backend exit must cancel any armed receive or mark it orphaned so LMON drops a
   later CQE without installing bytes.
 
@@ -142,6 +392,10 @@ Direct-land completion may set `reply_received` only after all checks pass:
 
 Failure of any check increments `direct_install_abort_count`, releases the arm
 record, and never installs the landed page.
+
+For a reserved invalid shared-buffer target, "never installs" means the page is
+left invalid and no waiter can observe the DMA bytes.  For a staging target,
+the staging memory is released without copying into shared_buffers.
 
 ## Observability
 
