@@ -119,13 +119,13 @@ $node0->stop;
 # ----------
 my $cluster_conf = <<EOC;
 cluster.enabled = on
+cluster.lms_enabled = on
 cluster.interconnect_tier = tier1
 cluster.allow_single_node = off
 cluster.voting_disks = '$disks_csv'
 cluster.cssd_heartbeat_interval_ms = 2000
 cluster.cssd_dead_deadband_factor = 10
 cluster.cf_enqueue_timeout_ms = 30000
-cluster.gcs_block_local_cache = off
 EOC
 
 $node0->append_conf('postgresql.conf', $cluster_conf);
@@ -202,9 +202,10 @@ my $iters = 0;
 for my $i (1 .. 10)
 {
 	$iters = $i;
-	($seen) = $node1->psql('postgres',
+	my ($rc2, $out2, $err2) = $node1->psql('postgres',
 		"SELECT note FROM a1_shared_cat WHERE id = 1");
-	last if defined $seen && $seen eq 'from-node0';
+	$seen = (defined $rc2 && $rc2 == 0 && defined $out2) ? $out2 : '';
+	last if $seen eq 'from-node0';
 	usleep(100_000);
 }
 is($seen, 'from-node0',
