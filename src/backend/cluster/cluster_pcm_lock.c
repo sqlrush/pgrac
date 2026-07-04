@@ -293,6 +293,9 @@ typedef struct ClusterPcmShared {
 	pg_atomic_uint64 trans_s_to_n_invalidate_count;
 	pg_atomic_uint64 trans_s_to_n_release_count;
 	pg_atomic_uint64 trans_s_to_x_cleanout_count; /* HC60 永 0 in spec-2.30 */
+	/* PGRAC: spec-6.14a D2 — local-master X-vs-remote-S arm: writer had no
+	 * local S residency, no provable-current carrier -> fail-closed count. */
+	pg_atomic_uint64 local_s_revoke_nonholder_failclosed_count;
 } ClusterPcmShared;
 
 StaticAssertDecl(sizeof(ClusterPcmShared) >= sizeof(LWLockPadded) + 72,
@@ -1578,6 +1581,15 @@ cluster_pcm_get_trans_x_to_s_downgrade_count(void)
 	return ClusterPcm != NULL ? pg_atomic_read_u64(&ClusterPcm->trans_x_to_s_downgrade_count) : 0;
 }
 
+/* PGRAC: spec-6.14a D2 — observability for the (b) fail-closed leg. */
+uint64
+cluster_pcm_get_local_s_revoke_nonholder_failclosed_count(void)
+{
+	return ClusterPcm != NULL
+		? pg_atomic_read_u64(&ClusterPcm->local_s_revoke_nonholder_failclosed_count)
+		: 0;
+}
+
 uint64
 cluster_pcm_get_trans_x_to_n_downgrade_count(void)
 {
@@ -1826,8 +1838,16 @@ cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode)
 				 * S_TO_X_UPGRADE (cluster_gcs_block_local_x_upgrade).  A
 				 * remote X conflict stays on the pre-6.12a fail-closed
 				 * (writer transfer is spec-2.36 / 4.7 territory).
+				 *
+				 * PGRAC: spec-6.14a D2 — the cluster_read_scache gate is
+				 * removed: plain read-sharing (multiple nodes N->S on a
+				 * never-written block, then one of them writes — the
+				 * shared-catalog boot shape) creates the same S-vs-S
+				 * conflict without any quiescent downgrade, and the arm's
+				 * own preconditions already bound it.  Without the arm that
+				 * shape fail-closed unconditionally.
 				 */
-				if (cluster_read_scache && mode == PCM_LOCK_MODE_X && cur == PCM_STATE_S
+				if (mode == PCM_LOCK_MODE_X && cur == PCM_STATE_S
 					&& (confl_x < 0 || confl_x == holder_node)
 					&& (pg_atomic_read_u32(&entry->s_holders_bitmap) & holder_bit) != 0) {
 					LWLockRelease(&entry->entry_lock.lock);
@@ -1847,6 +1867,33 @@ cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode)
 									errmsg("cluster_pcm: S->X upgrade invalidate did not complete"),
 									errhint("Remote S holders did not all acknowledge in time; "
 											"retry the statement.")));
+				}
+
+				/*
+				 * PGRAC: spec-6.14a D2 (b) — X requested by a node with NO S
+				 * residency while other live nodes cache the block in S.
+				 * There is no provable-current local carrier to write on: a
+				 * revoked dirty-S copy is dropped after only an XLogFlush
+				 * (bufmgr invalidate contract), so shared storage may be
+				 * stale post-revoke — writing on it would be a lost update.
+				 * Fail closed (bounded, counted); holder-ship capture is a
+				 * later spec.  Reaching here implies our own S bit is clear
+				 * (the upgrade arm above handles the holder case).
+				 */
+				if (mode == PCM_LOCK_MODE_X && cur == PCM_STATE_S
+					&& (confl_x < 0 || confl_x == holder_node)) {
+					pg_atomic_fetch_add_u64(
+						&ClusterPcm->local_s_revoke_nonholder_failclosed_count, 1);
+					LWLockRelease(&entry->entry_lock.lock);
+					if (cv_prepared)
+						ConditionVariableCancelSleep();
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("cluster_pcm: cross-node write needs local S residency "
+									"while other nodes cache this block"),
+							 errhint("This node holds no current copy (it never read the "
+									 "block), so revoking the remote shared copies would "
+									 "leave no provable-current image to write on.")));
 				}
 
 				LWLockRelease(&entry->entry_lock.lock);
@@ -2572,6 +2619,7 @@ cluster_pcm_grd_init(void)
 		pg_atomic_init_u64(&ClusterPcm->trans_s_to_n_invalidate_count, 0);
 		pg_atomic_init_u64(&ClusterPcm->trans_s_to_n_release_count, 0);
 		pg_atomic_init_u64(&ClusterPcm->trans_s_to_x_cleanout_count, 0);
+		pg_atomic_init_u64(&ClusterPcm->local_s_revoke_nonholder_failclosed_count, 0);
 	}
 
 	/*

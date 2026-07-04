@@ -236,6 +236,9 @@ typedef struct ClusterGcsBlockShared {
 	 * request to borrow an id from; uniqueness vs stale acks is all the
 	 * slot needs). */
 	pg_atomic_uint64 local_upgrade_request_seq;
+	/* PGRAC: spec-6.14a D2 — successful local-master S->X upgrades (revoke
+	 * granted; the L442 mechanism counter for the local arm). */
+	pg_atomic_uint64 local_s_upgrade_grant_count;
 	/* PGRAC: spec-6.13 D8 — RDMA tier3/direct-land copy observability. */
 	pg_atomic_uint64 scratch_copy_count;
 	pg_atomic_uint64 live_sge_send_count;
@@ -401,6 +404,7 @@ cluster_gcs_block_shmem_init(void)
 		ConditionVariableInit(&ClusterGcsBlock->invalidate_broadcast_cv);
 		/* PGRAC: spec-6.12a — local-upgrade broadcast id source. */
 		pg_atomic_init_u64(&ClusterGcsBlock->local_upgrade_request_seq, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->local_s_upgrade_grant_count, 0);
 		/* PGRAC: spec-6.13 D8 — RDMA tier3/direct-land copy counters init. */
 		pg_atomic_init_u64(&ClusterGcsBlock->scratch_copy_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->live_sge_send_count, 0);
@@ -5018,6 +5022,8 @@ cluster_gcs_block_local_x_upgrade(BufferTag tag)
 
 	upgraded
 		= cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_S_TO_X_UPGRADE, cluster_node_id);
+	if (upgraded)
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->local_s_upgrade_grant_count, 1);
 	cluster_pcm_lock_clear_pending_x(tag);
 	return upgraded;
 }
