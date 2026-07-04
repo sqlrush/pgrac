@@ -40,6 +40,7 @@
 #include "utils/timestamp.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_ic_router.h"
@@ -65,26 +66,36 @@
 
 #define PGRAC_CLUSTER_IC_RDMA_MAGIC ((uint32)0x414D4452)		 /* "RDMA" LE */
 #define PGRAC_CLUSTER_IC_RDMA_PRIVATE_MAGIC ((uint32)0x52445056) /* "RDPR" LE */
-#define PGRAC_CLUSTER_IC_RDMA_PRIVATE_VERSION 1
+#define PGRAC_CLUSTER_IC_RDMA_PRIVATE_VERSION 2
 #define CLUSTER_IC_RDMA_PROVIDER_NAME_LEN 32
 #define CLUSTER_IC_RDMA_ERRCODE_LEN 6
 #define CLUSTER_IC_RDMA_ERRMSG_LEN 128
 #define CLUSTER_IC_RDMA_MAX_SGE 8
 #define CLUSTER_IC_RDMA_RECV_BUFFER_BYTES (PGRAC_IC_ENVELOPE_BYTES + PGRAC_IC_PAYLOAD_MAX)
+#define CLUSTER_IC_RDMA_BLOCK_REPLY_SEND_BYTES CLUSTER_IC_RDMA_DIRECT_LAND_REPLY_BYTES
+#define CLUSTER_IC_RDMA_PRIVATE_CAP_BLOCK_REPLY UINT32CONST(0x00000001)
+#define CLUSTER_IC_RDMA_LANE_GENERIC 0
+#define CLUSTER_IC_RDMA_LANE_BLOCK_REPLY 1
+#define CLUSTER_IC_RDMA_LANE_ANY 0xFF
 #define CLUSTER_IC_RDMA_WR_TYPE_SEND UINT64CONST(0x5100000000000000)
 #define CLUSTER_IC_RDMA_WR_TYPE_RECV UINT64CONST(0x5200000000000000)
+#define CLUSTER_IC_RDMA_WR_TYPE_BLOCK_REPLY_SEND UINT64CONST(0x5300000000000000)
+#define CLUSTER_IC_RDMA_WR_TYPE_BLOCK_REPLY_RECV CLUSTER_IC_RDMA_DIRECT_LAND_WR_TYPE_RECV
 #define CLUSTER_IC_RDMA_WR_TYPE_MASK UINT64CONST(0xFF00000000000000)
 #define CLUSTER_IC_RDMA_WR_PEER_SHIFT 32
+#define CLUSTER_IC_RDMA_WR_PEER_MASK UINT64CONST(0x00FFFFFF)
 #define CLUSTER_IC_RDMA_CM_PRIVATE_BYTES sizeof(ClusterICRdmaPrivateData)
 
 typedef struct ClusterICRdmaPeerStats {
 	int32 node_id;
 	int32 transport;
 	int32 state;
+	int32 block_reply_lane_state;
 	int32 cq_depth;
 	char provider[CLUSTER_IC_RDMA_PROVIDER_NAME_LEN];
 	char last_error_code[CLUSTER_IC_RDMA_ERRCODE_LEN];
 	char last_error[CLUSTER_IC_RDMA_ERRMSG_LEN];
+	char last_block_reply_error[CLUSTER_IC_RDMA_ERRMSG_LEN];
 	pg_atomic_uint64 fallback_count;
 	pg_atomic_uint64 send_count;
 	pg_atomic_uint64 recv_count;
@@ -92,6 +103,8 @@ typedef struct ClusterICRdmaPeerStats {
 	pg_atomic_uint64 bytes_recv;
 	pg_atomic_uint64 latency_us_sum;
 	pg_atomic_uint64 latency_sample_count;
+	pg_atomic_uint64 block_reply_lane_fallback_count;
+	pg_atomic_uint64 block_reply_lane_error_count;
 } ClusterICRdmaPeerStats;
 
 typedef struct ClusterICRdmaShmem {
@@ -125,6 +138,7 @@ struct ClusterICRdmaCtx {
 
 struct ClusterICQp {
 	int32 peer_id;
+	uint8 lane_type;
 #ifdef HAVE_LIBIBVERBS
 	struct ibv_qp *qp;
 #endif
@@ -163,6 +177,19 @@ typedef struct ClusterICRdmaPeer {
 	size_t block_scratch_len;
 	struct ibv_mr *block_scratch_mr;
 	bool block_scratch_borrowed;
+	struct rdma_cm_id *block_reply_id;
+	ClusterICQp block_reply_qp;
+	bool block_reply_connected;
+	bool block_reply_send_busy;
+	uint8 *block_reply_send_buf;
+	size_t block_reply_send_buf_len;
+	struct ibv_mr *block_reply_send_mr;
+	uint8 *block_reply_sidecar_buf;
+	size_t block_reply_sidecar_len;
+	struct ibv_mr *block_reply_sidecar_mr;
+	ClusterICSgeReleaseCallback block_reply_pending_release_cb[CLUSTER_IC_RDMA_MAX_SGE];
+	void *block_reply_pending_release_arg[CLUSTER_IC_RDMA_MAX_SGE];
+	int block_reply_pending_release_count;
 	uint8 *queued_buf;
 	size_t queued_len;
 	size_t queued_buf_len;
@@ -180,6 +207,9 @@ typedef struct ClusterICRdmaPrivateData {
 	uint16 rdma_port;
 	uint32 rdma_pkey;
 	uint32 rdma_qkey;
+	uint8 lane_type;
+	uint8 reserved_0[3];
+	uint32 capabilities;
 	uint8 hello[PGRAC_IC_HELLO_BYTES];
 } ClusterICRdmaPrivateData;
 
@@ -216,6 +246,15 @@ static bool
 rdma_valid_peer_id(int32 peer_id)
 {
 	return peer_id >= 0 && peer_id < CLUSTER_MAX_NODES;
+}
+
+static uint32
+rdma_block_reply_arm_capacity(void) pg_attribute_unused();
+
+static uint32
+rdma_block_reply_arm_capacity(void)
+{
+	return (uint32)MaxBackends * CLUSTER_GCS_BLOCK_MAX_OUTSTANDING_PER_BACKEND;
 }
 
 static const char *
@@ -280,7 +319,7 @@ rdma_make_wr_id(uint64 type, int32 peer_id)
 static int32
 rdma_wr_peer(uint64 wr_id)
 {
-	return (int32)((wr_id >> CLUSTER_IC_RDMA_WR_PEER_SHIFT) & UINT64CONST(0xFFFFFFFF));
+	return (int32)((wr_id >> CLUSTER_IC_RDMA_WR_PEER_SHIFT) & CLUSTER_IC_RDMA_WR_PEER_MASK);
 }
 #endif
 
@@ -514,10 +553,10 @@ rdma_register_shared_buffers(ClusterICRdmaCtx *ctx, ClusterICMr *out)
 
 #if defined(HAVE_LIBIBVERBS) && defined(HAVE_LIBRDMACM) && defined(HAVE_RDMA_RDMA_CMA_H)
 static void
-rdma_cm_id_set_peer(struct rdma_cm_id *id, int32 peer_id)
+rdma_cm_id_set_peer_lane(struct rdma_cm_id *id, int32 peer_id, uint8 lane_type)
 {
 	if (id != NULL)
-		id->context = (void *)(intptr_t)(peer_id + 1);
+		id->context = (void *)(intptr_t)(((peer_id + 1) << 2) | (lane_type & 0x3));
 }
 
 static int32
@@ -528,11 +567,22 @@ rdma_cm_id_peer(struct rdma_cm_id *id)
 	if (id == NULL || id->context == NULL)
 		return -1;
 	raw = (intptr_t)id->context;
-	return (int32)(raw - 1);
+	return (int32)((raw >> 2) - 1);
+}
+
+static uint8
+rdma_cm_id_lane(struct rdma_cm_id *id)
+{
+	intptr_t raw;
+
+	if (id == NULL || id->context == NULL)
+		return CLUSTER_IC_RDMA_LANE_GENERIC;
+	raw = (intptr_t)id->context;
+	return (uint8)(raw & 0x3);
 }
 
 static void
-rdma_build_private_data(ClusterICRdmaPrivateData *private_data)
+rdma_build_private_data(ClusterICRdmaPrivateData *private_data, uint8 lane_type)
 {
 	const char *cluster_name = "";
 	const ClusterNodeInfo *self;
@@ -549,13 +599,15 @@ rdma_build_private_data(ClusterICRdmaPrivateData *private_data)
 		private_data->rdma_pkey = self->rdma_pkey;
 		private_data->rdma_qkey = self->rdma_qkey;
 	}
+	private_data->lane_type = lane_type;
+	private_data->capabilities = CLUSTER_IC_RDMA_PRIVATE_CAP_BLOCK_REPLY;
 	cluster_ic_build_hello(private_data->hello, PGRAC_IC_HELLO_VERSION_V1,
 						   PGRAC_IC_ENVELOPE_VERSION_V1, cluster_node_id, cluster_name);
 }
 
 static bool
-rdma_verify_private_hello(const void *data, uint8 len, int32 expected_peer, int32 *out_peer_id,
-						  const char **out_reason)
+rdma_verify_private_hello(const void *data, uint8 len, int32 expected_peer, uint8 expected_lane,
+						  int32 *out_peer_id, uint8 *out_lane_type, const char **out_reason)
 {
 	const ClusterICRdmaPrivateData *private_data = (const ClusterICRdmaPrivateData *)data;
 	ClusterICHelloMsg msg;
@@ -564,6 +616,8 @@ rdma_verify_private_hello(const void *data, uint8 len, int32 expected_peer, int3
 
 	if (out_peer_id != NULL)
 		*out_peer_id = -1;
+	if (out_lane_type != NULL)
+		*out_lane_type = CLUSTER_IC_RDMA_LANE_GENERIC;
 	if (out_reason != NULL)
 		*out_reason = "RDMA HELLO missing";
 
@@ -617,9 +671,22 @@ rdma_verify_private_hello(const void *data, uint8 len, int32 expected_peer, int3
 			*out_reason = "RDMA partition metadata mismatch";
 		return false;
 	}
+	if (private_data->lane_type != expected_lane && expected_lane != CLUSTER_IC_RDMA_LANE_ANY) {
+		if (out_reason != NULL)
+			*out_reason = "RDMA lane type mismatch";
+		return false;
+	}
+	if (private_data->lane_type == CLUSTER_IC_RDMA_LANE_BLOCK_REPLY
+		&& (private_data->capabilities & CLUSTER_IC_RDMA_PRIVATE_CAP_BLOCK_REPLY) == 0) {
+		if (out_reason != NULL)
+			*out_reason = "RDMA peer lacks block-reply lane capability";
+		return false;
+	}
 
 	if (out_peer_id != NULL)
 		*out_peer_id = msg.source_node_id;
+	if (out_lane_type != NULL)
+		*out_lane_type = private_data->lane_type;
 	cluster_sf_note_peer_hello_capabilities(msg.source_node_id,
 											cluster_ic_hello_capabilities(&msg));
 	if (out_reason != NULL)
@@ -645,6 +712,14 @@ rdma_peer_release_buffers(ClusterICRdmaPeer *peer)
 		(void)ibv_dereg_mr(peer->block_scratch_mr);
 		peer->block_scratch_mr = NULL;
 	}
+	if (peer->block_reply_send_mr != NULL) {
+		(void)ibv_dereg_mr(peer->block_reply_send_mr);
+		peer->block_reply_send_mr = NULL;
+	}
+	if (peer->block_reply_sidecar_mr != NULL) {
+		(void)ibv_dereg_mr(peer->block_reply_sidecar_mr);
+		peer->block_reply_sidecar_mr = NULL;
+	}
 	if (peer->send_buf != NULL) {
 		pfree(peer->send_buf);
 		peer->send_buf = NULL;
@@ -660,6 +735,16 @@ rdma_peer_release_buffers(ClusterICRdmaPeer *peer)
 		peer->block_scratch_buf = NULL;
 		peer->block_scratch_len = 0;
 		peer->block_scratch_borrowed = false;
+	}
+	if (peer->block_reply_send_buf != NULL) {
+		pfree(peer->block_reply_send_buf);
+		peer->block_reply_send_buf = NULL;
+		peer->block_reply_send_buf_len = 0;
+	}
+	if (peer->block_reply_sidecar_buf != NULL) {
+		pfree(peer->block_reply_sidecar_buf);
+		peer->block_reply_sidecar_buf = NULL;
+		peer->block_reply_sidecar_len = 0;
 	}
 	if (peer->queued_buf != NULL) {
 		pfree(peer->queued_buf);
@@ -686,6 +771,23 @@ rdma_peer_release_pending_send(ClusterICRdmaPeer *peer)
 	peer->pending_release_count = 0;
 }
 
+static void
+rdma_peer_release_block_reply_pending_send(ClusterICRdmaPeer *peer)
+{
+	int i;
+
+	if (peer == NULL)
+		return;
+
+	for (i = 0; i < peer->block_reply_pending_release_count; i++) {
+		if (peer->block_reply_pending_release_cb[i] != NULL)
+			peer->block_reply_pending_release_cb[i](peer->block_reply_pending_release_arg[i]);
+		peer->block_reply_pending_release_cb[i] = NULL;
+		peer->block_reply_pending_release_arg[i] = NULL;
+	}
+	peer->block_reply_pending_release_count = 0;
+}
+
 static bool
 rdma_peer_add_pending_release(ClusterICRdmaPeer *peer, ClusterICSgeReleaseCallback cb, void *arg)
 {
@@ -707,6 +809,28 @@ rdma_peer_add_pending_release(ClusterICRdmaPeer *peer, ClusterICSgeReleaseCallba
 	return true;
 }
 
+static bool
+rdma_peer_add_block_reply_pending_release(ClusterICRdmaPeer *peer, ClusterICSgeReleaseCallback cb,
+										  void *arg)
+{
+	int i;
+
+	if (peer == NULL || cb == NULL)
+		return true;
+
+	for (i = 0; i < peer->block_reply_pending_release_count; i++) {
+		if (peer->block_reply_pending_release_cb[i] == cb
+			&& peer->block_reply_pending_release_arg[i] == arg)
+			return true;
+	}
+	if (peer->block_reply_pending_release_count >= CLUSTER_IC_RDMA_MAX_SGE)
+		return false;
+	peer->block_reply_pending_release_cb[peer->block_reply_pending_release_count] = cb;
+	peer->block_reply_pending_release_arg[peer->block_reply_pending_release_count] = arg;
+	peer->block_reply_pending_release_count++;
+	return true;
+}
+
 static void
 rdma_peer_release_block_scratch(void *arg)
 {
@@ -724,7 +848,9 @@ rdma_peer_ensure_buffers(ClusterICRdmaPeer *peer)
 	if (peer == NULL || RdmaCtx.pd == NULL)
 		return false;
 	if (peer->send_buf != NULL && peer->recv_buf != NULL && peer->block_scratch_buf != NULL
-		&& peer->send_mr != NULL && peer->recv_mr != NULL && peer->block_scratch_mr != NULL)
+		&& peer->block_reply_send_buf != NULL && peer->block_reply_sidecar_buf != NULL
+		&& peer->send_mr != NULL && peer->recv_mr != NULL && peer->block_scratch_mr != NULL
+		&& peer->block_reply_send_mr != NULL && peer->block_reply_sidecar_mr != NULL)
 		return true;
 
 	rdma_peer_release_buffers(peer);
@@ -732,9 +858,14 @@ rdma_peer_ensure_buffers(ClusterICRdmaPeer *peer)
 	peer->send_buf_len = CLUSTER_IC_RDMA_RECV_BUFFER_BYTES;
 	peer->recv_buf_len = CLUSTER_IC_RDMA_RECV_BUFFER_BYTES;
 	peer->block_scratch_len = BLCKSZ;
+	peer->block_reply_send_buf_len = CLUSTER_IC_RDMA_BLOCK_REPLY_SEND_BYTES;
+	peer->block_reply_sidecar_len
+		= (size_t)rdma_block_reply_arm_capacity() * CLUSTER_IC_RDMA_DIRECT_LAND_SIDECAR_BYTES;
 	peer->send_buf = (uint8 *)palloc(peer->send_buf_len);
 	peer->recv_buf = (uint8 *)palloc(peer->recv_buf_len);
 	peer->block_scratch_buf = (uint8 *)palloc(peer->block_scratch_len);
+	peer->block_reply_send_buf = (uint8 *)palloc(peer->block_reply_send_buf_len);
+	peer->block_reply_sidecar_buf = (uint8 *)palloc(peer->block_reply_sidecar_len);
 	MemoryContextSwitchTo(oldctx);
 
 	peer->send_mr
@@ -755,6 +886,22 @@ rdma_peer_ensure_buffers(ClusterICRdmaPeer *peer)
 										peer->block_scratch_len, IBV_ACCESS_LOCAL_WRITE);
 	if (peer->block_scratch_mr == NULL) {
 		RdmaUnavailableReason = "ibv_reg_mr(RDMA block scratch) failed";
+		rdma_peer_release_buffers(peer);
+		return false;
+	}
+	peer->block_reply_send_mr
+		= ibv_reg_mr(RdmaCtx.pd, peer->block_reply_send_buf, peer->block_reply_send_buf_len,
+					 IBV_ACCESS_LOCAL_WRITE);
+	if (peer->block_reply_send_mr == NULL) {
+		RdmaUnavailableReason = "ibv_reg_mr(RDMA block-reply send buffer) failed";
+		rdma_peer_release_buffers(peer);
+		return false;
+	}
+	peer->block_reply_sidecar_mr
+		= ibv_reg_mr(RdmaCtx.pd, peer->block_reply_sidecar_buf, peer->block_reply_sidecar_len,
+					 IBV_ACCESS_LOCAL_WRITE);
+	if (peer->block_reply_sidecar_mr == NULL) {
+		RdmaUnavailableReason = "ibv_reg_mr(RDMA block-reply sidecar buffer) failed";
 		rdma_peer_release_buffers(peer);
 		return false;
 	}
@@ -832,6 +979,47 @@ rdma_peer_flush_queued_send(int32 peer_id)
 }
 
 static void
+rdma_peer_close_block_reply_lane(int32 peer_id, const char *reason, bool notify_gcs)
+{
+	ClusterICRdmaPeer *peer;
+	ClusterICRdmaPeerStats *stats;
+	bool had_lane;
+
+	if (!rdma_valid_peer_id(peer_id))
+		return;
+	peer = &RdmaPeers[peer_id];
+	had_lane = peer->block_reply_id != NULL || peer->block_reply_qp.qp != NULL
+			   || peer->block_reply_connected || peer->block_reply_send_busy
+			   || peer->block_reply_pending_release_count > 0;
+
+	if (peer->block_reply_id != NULL) {
+		if (peer->block_reply_connected)
+			(void)rdma_disconnect(peer->block_reply_id);
+		if (peer->block_reply_id->qp != NULL)
+			rdma_destroy_qp(peer->block_reply_id);
+		rdma_destroy_id(peer->block_reply_id);
+	}
+	peer->block_reply_id = NULL;
+	memset(&peer->block_reply_qp, 0, sizeof(peer->block_reply_qp));
+	peer->block_reply_qp.peer_id = peer_id;
+	peer->block_reply_connected = false;
+	peer->block_reply_send_busy = false;
+	rdma_peer_release_block_reply_pending_send(peer);
+
+	stats = rdma_peer_stats(peer_id);
+	if (stats != NULL && had_lane) {
+		LWLockAcquire(&RdmaShmem->lock.lock, LW_EXCLUSIVE);
+		stats->block_reply_lane_state = CLUSTER_IC_RDMA_BLOCK_REPLY_ERROR;
+		if (reason != NULL)
+			strlcpy(stats->last_block_reply_error, reason, sizeof(stats->last_block_reply_error));
+		LWLockRelease(&RdmaShmem->lock.lock);
+		pg_atomic_fetch_add_u64(&stats->block_reply_lane_error_count, 1);
+	}
+	if (notify_gcs && had_lane)
+		cluster_gcs_block_lmon_abort_direct_land_peer(peer_id, GCS_BLOCK_DIRECT_ABORT_PEER_DOWN);
+}
+
+static void
 rdma_peer_close(int32 peer_id, const char *reason, bool fallback_to_tcp)
 {
 	ClusterICRdmaPeer *peer;
@@ -839,6 +1027,8 @@ rdma_peer_close(int32 peer_id, const char *reason, bool fallback_to_tcp)
 	if (!rdma_valid_peer_id(peer_id))
 		return;
 	peer = &RdmaPeers[peer_id];
+
+	rdma_peer_close_block_reply_lane(peer_id, reason, true);
 
 	if (peer->id != NULL) {
 		if (peer->connected)
@@ -927,6 +1117,35 @@ rdma_stats_note_busypoll(uint64 burned_us, bool fallback)
 		pg_atomic_fetch_add_u64(&RdmaShmem->busypoll_fallback_count, 1);
 }
 
+static void
+rdma_stats_note_block_reply_fallback(int32 peer_id, const char *reason)
+{
+	ClusterICRdmaPeerStats *stats = rdma_peer_stats(peer_id);
+
+	if (stats == NULL)
+		return;
+	LWLockAcquire(&RdmaShmem->lock.lock, LW_EXCLUSIVE);
+	if (reason != NULL)
+		strlcpy(stats->last_block_reply_error, reason, sizeof(stats->last_block_reply_error));
+	LWLockRelease(&RdmaShmem->lock.lock);
+	pg_atomic_fetch_add_u64(&stats->block_reply_lane_fallback_count, 1);
+}
+
+static void
+rdma_stats_note_block_reply_error(int32 peer_id, const char *reason)
+{
+	ClusterICRdmaPeerStats *stats = rdma_peer_stats(peer_id);
+
+	if (stats == NULL)
+		return;
+	LWLockAcquire(&RdmaShmem->lock.lock, LW_EXCLUSIVE);
+	stats->block_reply_lane_state = CLUSTER_IC_RDMA_BLOCK_REPLY_ERROR;
+	if (reason != NULL)
+		strlcpy(stats->last_block_reply_error, reason, sizeof(stats->last_block_reply_error));
+	LWLockRelease(&RdmaShmem->lock.lock);
+	pg_atomic_fetch_add_u64(&stats->block_reply_lane_error_count, 1);
+}
+
 #ifdef HAVE_LIBIBVERBS
 static bool
 rdma_wc_status_is_peer_loss(int status)
@@ -945,13 +1164,18 @@ rdma_wc_status_is_local_protection(int status)
 }
 
 static void
-rdma_handle_completion_error(int32 peer_id, uint64 wr_type, int status)
+rdma_handle_completion_error(int32 peer_id, uint64 wr_id, int status)
 {
 	char reason[96];
+	uint64 wr_type = wr_id & CLUSTER_IC_RDMA_WR_TYPE_MASK;
 
 #if defined(HAVE_LIBRDMACM) && defined(HAVE_RDMA_RDMA_CMA_H)
 	if (wr_type == CLUSTER_IC_RDMA_WR_TYPE_SEND)
 		rdma_peer_release_pending_send(&RdmaPeers[peer_id]);
+	else if (wr_type == CLUSTER_IC_RDMA_WR_TYPE_BLOCK_REPLY_SEND)
+		rdma_peer_release_block_reply_pending_send(&RdmaPeers[peer_id]);
+	else if (wr_type == CLUSTER_IC_RDMA_WR_TYPE_BLOCK_REPLY_RECV)
+		cluster_gcs_block_lmon_handle_direct_land_completion(peer_id, wr_id, false, 0, NULL);
 #endif
 
 	snprintf(reason, sizeof(reason), "RDMA completion error status %d", status);
@@ -974,15 +1198,28 @@ rdma_handle_completion_error(int32 peer_id, uint64 wr_type, int status)
 #endif
 
 static bool
-rdma_create_cm_qp(ClusterICRdmaPeer *peer)
+rdma_create_cm_qp(ClusterICRdmaPeer *peer, uint8 lane_type)
 {
 	struct ibv_qp_init_attr attr;
+	struct rdma_cm_id *id;
+	ClusterICQp *qp;
 
-	if (peer == NULL || peer->id == NULL || RdmaCtx.pd == NULL || RdmaCtx.cq == NULL)
+	if (peer == NULL || RdmaCtx.pd == NULL || RdmaCtx.cq == NULL)
 		return false;
-	if (peer->id->qp != NULL) {
-		peer->qp.peer_id = peer->peer_id;
-		peer->qp.qp = peer->id->qp;
+
+	if (lane_type == CLUSTER_IC_RDMA_LANE_BLOCK_REPLY) {
+		id = peer->block_reply_id;
+		qp = &peer->block_reply_qp;
+	} else {
+		id = peer->id;
+		qp = &peer->qp;
+	}
+	if (id == NULL)
+		return false;
+	if (id->qp != NULL) {
+		qp->peer_id = peer->peer_id;
+		qp->lane_type = lane_type;
+		qp->qp = id->qp;
 		return true;
 	}
 
@@ -993,15 +1230,18 @@ rdma_create_cm_qp(ClusterICRdmaPeer *peer)
 	attr.cap.max_send_wr = cluster_interconnect_rdma_max_send_wr;
 	attr.cap.max_recv_wr = cluster_interconnect_rdma_max_send_wr;
 	attr.cap.max_send_sge = CLUSTER_IC_RDMA_MAX_SGE + 1;
-	attr.cap.max_recv_sge = 1;
+	attr.cap.max_recv_sge = lane_type == CLUSTER_IC_RDMA_LANE_BLOCK_REPLY
+								 ? CLUSTER_IC_RDMA_BLOCK_REPLY_MAX_RECV_SGE
+								 : 1;
 	attr.cap.max_inline_data = cluster_interconnect_rdma_inline_max;
 
-	if (rdma_create_qp(peer->id, RdmaCtx.pd, &attr) != 0) {
+	if (rdma_create_qp(id, RdmaCtx.pd, &attr) != 0) {
 		RdmaUnavailableReason = "rdma_create_qp failed";
 		return false;
 	}
-	peer->qp.peer_id = peer->peer_id;
-	peer->qp.qp = peer->id->qp;
+	qp->peer_id = peer->peer_id;
+	qp->lane_type = lane_type;
+	qp->qp = id->qp;
 	return true;
 }
 
@@ -1016,28 +1256,63 @@ rdma_post_peer_recv(ClusterICRdmaPeer *peer)
 	sge.addr = peer->recv_buf;
 	sge.len = peer->recv_buf_len;
 	sge.lkey = peer->recv_mr->lkey;
-	return RdmaProvider != NULL && RdmaProvider->post_recv(&peer->qp, &sge);
+	return RdmaProvider != NULL
+		   && RdmaProvider->post_recv(
+			   &peer->qp, &sge, 1, rdma_make_wr_id(CLUSTER_IC_RDMA_WR_TYPE_RECV, peer->peer_id));
 }
 
 static bool
-rdma_prepare_peer_for_connect(int32 peer_id, struct rdma_cm_id *id, bool active_side)
+rdma_prepare_peer_for_connect(int32 peer_id, struct rdma_cm_id *id, bool active_side,
+							  uint8 lane_type)
 {
 	ClusterICRdmaPeer *peer;
+	ClusterICRdmaPeerStats *stats;
 
 	if (!rdma_valid_peer_id(peer_id) || id == NULL)
 		return false;
 
 	peer = &RdmaPeers[peer_id];
+	if (lane_type == CLUSTER_IC_RDMA_LANE_BLOCK_REPLY) {
+		if (peer->block_reply_id != NULL && peer->block_reply_id != id)
+			rdma_peer_close_block_reply_lane(peer_id, "replacing duplicate block-reply RDMA CM id",
+											 true);
+		peer->peer_id = peer_id;
+		peer->active_side = active_side;
+		peer->block_reply_id = id;
+		rdma_cm_id_set_peer_lane(id, peer_id, lane_type);
+
+		if (!rdma_create_cm_qp(peer, lane_type) || !rdma_peer_ensure_buffers(peer)) {
+			rdma_stats_note_block_reply_error(
+				peer_id, RdmaUnavailableReason != NULL ? RdmaUnavailableReason
+														: "RDMA block-reply lane preparation failed");
+			return false;
+		}
+		stats = rdma_peer_stats(peer_id);
+		if (stats != NULL) {
+			LWLockAcquire(&RdmaShmem->lock.lock, LW_EXCLUSIVE);
+			stats->block_reply_lane_state = CLUSTER_IC_RDMA_BLOCK_REPLY_CONNECTING;
+			LWLockRelease(&RdmaShmem->lock.lock);
+		}
+		return true;
+	}
+
 	if (peer->id != NULL && peer->id != id)
 		rdma_peer_close(peer_id, "replacing duplicate RDMA CM id", false);
 
-	memset(peer, 0, sizeof(*peer));
+	rdma_peer_release_pending_send(peer);
+	peer->connected = false;
+	peer->send_busy = false;
+	peer->queued_len = 0;
+	peer->wr_since_signal = 0;
+	peer->signal_batch_k = 0;
+	memset(&peer->qp, 0, sizeof(peer->qp));
 	peer->peer_id = peer_id;
 	peer->active_side = active_side;
 	peer->id = id;
-	rdma_cm_id_set_peer(id, peer_id);
+	rdma_cm_id_set_peer_lane(id, peer_id, lane_type);
 
-	if (!rdma_create_cm_qp(peer) || !rdma_peer_ensure_buffers(peer) || !rdma_post_peer_recv(peer)) {
+	if (!rdma_create_cm_qp(peer, lane_type) || !rdma_peer_ensure_buffers(peer)
+		|| !rdma_post_peer_recv(peer)) {
 		cluster_ic_rdma_stats_note_error(
 			peer_id, "58R16",
 			RdmaUnavailableReason != NULL ? RdmaUnavailableReason : "RDMA peer preparation failed");
@@ -1050,13 +1325,14 @@ rdma_prepare_peer_for_connect(int32 peer_id, struct rdma_cm_id *id, bool active_
 }
 
 static bool
-rdma_conn_params(struct rdma_conn_param *param, ClusterICRdmaPrivateData *private_data)
+rdma_conn_params(struct rdma_conn_param *param, ClusterICRdmaPrivateData *private_data,
+				 uint8 lane_type)
 {
 	if (param == NULL || private_data == NULL)
 		return false;
 
 	memset(param, 0, sizeof(*param));
-	rdma_build_private_data(private_data);
+	rdma_build_private_data(private_data, lane_type);
 	param->private_data = private_data;
 	param->private_data_len = CLUSTER_IC_RDMA_CM_PRIVATE_BYTES;
 	param->responder_resources = 1;
@@ -1067,13 +1343,27 @@ rdma_conn_params(struct rdma_conn_param *param, ClusterICRdmaPrivateData *privat
 }
 
 static void
-rdma_mark_peer_connected(int32 peer_id)
+rdma_mark_peer_connected(int32 peer_id, uint8 lane_type)
 {
 	ClusterICRdmaPeer *peer;
+	ClusterICRdmaPeerStats *stats;
 
 	if (!rdma_valid_peer_id(peer_id))
 		return;
 	peer = &RdmaPeers[peer_id];
+	if (lane_type == CLUSTER_IC_RDMA_LANE_BLOCK_REPLY) {
+		peer->block_reply_connected = true;
+		peer->block_reply_send_busy = false;
+		stats = rdma_peer_stats(peer_id);
+		if (stats != NULL) {
+			LWLockAcquire(&RdmaShmem->lock.lock, LW_EXCLUSIVE);
+			stats->block_reply_lane_state = CLUSTER_IC_RDMA_BLOCK_REPLY_CONNECTED;
+			stats->last_block_reply_error[0] = '\0';
+			LWLockRelease(&RdmaShmem->lock.lock);
+		}
+		ereport(LOG, (errmsg("cluster_ic RDMA block-reply lane peer %d connected", peer_id)));
+		return;
+	}
 	peer->connected = true;
 	peer->send_busy = false;
 	cluster_ic_mux_set_peer_transport(peer_id, CLUSTER_IC_PEER_TRANSPORT_RDMA,
@@ -1107,7 +1397,7 @@ rdma_peer_addr(int32 peer_id, const char **addr, const char **reason)
 }
 
 static void
-rdma_start_active_connect_one(int32 peer_id)
+rdma_start_active_connect_one(int32 peer_id, uint8 lane_type)
 {
 	const char *addr = NULL;
 	const char *reason = NULL;
@@ -1120,21 +1410,34 @@ rdma_start_active_connect_one(int32 peer_id)
 
 	if (!rdma_valid_peer_id(peer_id))
 		return;
-	if (RdmaPeers[peer_id].id != NULL || RdmaPeers[peer_id].connected)
+	if (lane_type == CLUSTER_IC_RDMA_LANE_BLOCK_REPLY) {
+		if (RdmaPeers[peer_id].block_reply_id != NULL || RdmaPeers[peer_id].block_reply_connected)
+			return;
+	} else if (RdmaPeers[peer_id].id != NULL || RdmaPeers[peer_id].connected)
 		return;
 	if (!rdma_peer_addr(peer_id, &addr, &reason)) {
-		rdma_peer_fail_or_fallback(peer_id, reason);
+		if (lane_type == CLUSTER_IC_RDMA_LANE_BLOCK_REPLY)
+			rdma_stats_note_block_reply_error(peer_id,
+											  reason != NULL ? reason : "RDMA peer address unavailable");
+		else
+			rdma_peer_fail_or_fallback(peer_id, reason);
 		return;
 	}
 	if (!rdma_split_host_port(addr, host, sizeof(host), port, sizeof(port))) {
-		rdma_peer_fail_or_fallback(peer_id, "peer rdma_addr is malformed");
+		if (lane_type == CLUSTER_IC_RDMA_LANE_BLOCK_REPLY)
+			rdma_stats_note_block_reply_error(peer_id, "peer rdma_addr is malformed");
+		else
+			rdma_peer_fail_or_fallback(peer_id, "peer rdma_addr is malformed");
 		return;
 	}
 	if (rdma_create_id(RdmaCmChannel, &id, NULL, RDMA_PS_TCP) != 0) {
-		rdma_peer_fail_or_fallback(peer_id, "rdma_create_id(active) failed");
+		if (lane_type == CLUSTER_IC_RDMA_LANE_BLOCK_REPLY)
+			rdma_stats_note_block_reply_error(peer_id, "rdma_create_id(block-reply active) failed");
+		else
+			rdma_peer_fail_or_fallback(peer_id, "rdma_create_id(active) failed");
 		return;
 	}
-	rdma_cm_id_set_peer(id, peer_id);
+	rdma_cm_id_set_peer_lane(id, peer_id, lane_type);
 
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_UNSPEC;
@@ -1142,23 +1445,41 @@ rdma_start_active_connect_one(int32 peer_id)
 	gai_rc = getaddrinfo(host, port, &hints, &res);
 	if (gai_rc != 0 || res == NULL) {
 		rdma_destroy_id(id);
-		rdma_peer_fail_or_fallback(peer_id, "getaddrinfo(peer RDMA address) failed");
+		if (lane_type == CLUSTER_IC_RDMA_LANE_BLOCK_REPLY)
+			rdma_stats_note_block_reply_error(peer_id,
+											  "getaddrinfo(block-reply RDMA address) failed");
+		else
+			rdma_peer_fail_or_fallback(peer_id, "getaddrinfo(peer RDMA address) failed");
 		return;
 	}
 
 	if (rdma_resolve_addr(id, NULL, res->ai_addr, cluster_interconnect_connect_timeout_ms) != 0) {
 		freeaddrinfo(res);
 		rdma_destroy_id(id);
-		rdma_peer_fail_or_fallback(peer_id, "rdma_resolve_addr failed");
+		if (lane_type == CLUSTER_IC_RDMA_LANE_BLOCK_REPLY)
+			rdma_stats_note_block_reply_error(peer_id, "rdma_resolve_addr(block-reply) failed");
+		else
+			rdma_peer_fail_or_fallback(peer_id, "rdma_resolve_addr failed");
 		return;
 	}
 	freeaddrinfo(res);
 
 	RdmaPeers[peer_id].peer_id = peer_id;
 	RdmaPeers[peer_id].active_side = true;
-	RdmaPeers[peer_id].id = id;
-	cluster_ic_mux_set_peer_transport(peer_id, CLUSTER_IC_PEER_TRANSPORT_TCP,
-									  CLUSTER_IC_RDMA_PEER_CONNECTING);
+	if (lane_type == CLUSTER_IC_RDMA_LANE_BLOCK_REPLY) {
+		ClusterICRdmaPeerStats *stats = rdma_peer_stats(peer_id);
+
+		RdmaPeers[peer_id].block_reply_id = id;
+		if (stats != NULL) {
+			LWLockAcquire(&RdmaShmem->lock.lock, LW_EXCLUSIVE);
+			stats->block_reply_lane_state = CLUSTER_IC_RDMA_BLOCK_REPLY_CONNECTING;
+			LWLockRelease(&RdmaShmem->lock.lock);
+		}
+	} else {
+		RdmaPeers[peer_id].id = id;
+		cluster_ic_mux_set_peer_transport(peer_id, CLUSTER_IC_PEER_TRANSPORT_TCP,
+										  CLUSTER_IC_RDMA_PEER_CONNECTING);
+	}
 }
 
 static void
@@ -1170,8 +1491,10 @@ rdma_start_active_connects(void)
 	for (peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
 		if (peer == self_id || cluster_conf_lookup_node(peer) == NULL)
 			continue;
-		if (cluster_ic_mesh_role_for_pair(self_id, peer) == CLUSTER_IC_MESH_ACTIVE)
-			rdma_start_active_connect_one(peer);
+		if (cluster_ic_mesh_role_for_pair(self_id, peer) == CLUSTER_IC_MESH_ACTIVE) {
+			rdma_start_active_connect_one(peer, CLUSTER_IC_RDMA_LANE_GENERIC);
+			rdma_start_active_connect_one(peer, CLUSTER_IC_RDMA_LANE_BLOCK_REPLY);
+		}
 	}
 }
 
@@ -1470,6 +1793,7 @@ cluster_ic_rdma_shmem_init(void)
 			p->node_id = i;
 			p->transport = CLUSTER_IC_PEER_TRANSPORT_TCP;
 			p->state = CLUSTER_IC_RDMA_PEER_DISABLED;
+			p->block_reply_lane_state = CLUSTER_IC_RDMA_BLOCK_REPLY_DISABLED;
 			p->cq_depth = 0;
 			strlcpy(p->provider, rdma_selected_provider_name(), sizeof(p->provider));
 			pg_atomic_init_u64(&p->fallback_count, 0);
@@ -1479,6 +1803,8 @@ cluster_ic_rdma_shmem_init(void)
 			pg_atomic_init_u64(&p->bytes_recv, 0);
 			pg_atomic_init_u64(&p->latency_us_sum, 0);
 			pg_atomic_init_u64(&p->latency_sample_count, 0);
+			pg_atomic_init_u64(&p->block_reply_lane_fallback_count, 0);
+			pg_atomic_init_u64(&p->block_reply_lane_error_count, 0);
 		}
 	}
 }
@@ -1573,6 +1899,24 @@ cluster_ic_rdma_peer_state_name(ClusterICRdmaPeerState state)
 	case CLUSTER_IC_RDMA_PEER_CONNECTED:
 		return "connected";
 	case CLUSTER_IC_RDMA_PEER_ERROR:
+		return "error";
+	}
+	return "unknown";
+}
+
+static const char *
+rdma_block_reply_lane_state_name(ClusterICRdmaBlockReplyLaneState state)
+{
+	switch (state) {
+	case CLUSTER_IC_RDMA_BLOCK_REPLY_DISABLED:
+		return "disabled";
+	case CLUSTER_IC_RDMA_BLOCK_REPLY_CONNECTING:
+		return "connecting";
+	case CLUSTER_IC_RDMA_BLOCK_REPLY_CONNECTED:
+		return "connected";
+	case CLUSTER_IC_RDMA_BLOCK_REPLY_RESETTING:
+		return "resetting";
+	case CLUSTER_IC_RDMA_BLOCK_REPLY_ERROR:
 		return "error";
 	}
 	return "unknown";
@@ -1989,6 +2333,247 @@ cluster_ic_rdma_send_envelope_sge(uint8 msg_type, int32 dest_node_id,
 	return rdma_send_envelope_sge_fallback(&env, dest_node_id, payload_sge, n_sge, payload_len);
 }
 
+bool
+cluster_ic_rdma_block_reply_lane_connected(int32 peer_id, const char **reason)
+{
+	ClusterICRdmaPeerStats *stats;
+
+	if (reason != NULL)
+		*reason = NULL;
+	if (!rdma_valid_peer_id(peer_id)) {
+		if (reason != NULL)
+			*reason = "invalid RDMA peer id";
+		return false;
+	}
+	stats = rdma_peer_stats(peer_id);
+	if (stats != NULL
+		&& stats->block_reply_lane_state == CLUSTER_IC_RDMA_BLOCK_REPLY_CONNECTED)
+		return true;
+#if defined(HAVE_LIBIBVERBS) && defined(HAVE_LIBRDMACM) && defined(HAVE_RDMA_RDMA_CMA_H)
+	ClusterICRdmaPeer *peer;
+
+	peer = &RdmaPeers[peer_id];
+	if (peer->block_reply_connected && peer->block_reply_qp.qp != NULL)
+		return true;
+#endif
+	if (reason != NULL)
+		*reason = "RDMA block-reply lane is not connected";
+	return false;
+}
+
+bool
+cluster_ic_rdma_block_reply_post_recv(int32 peer_id, uint32 arm_id, uint32 generation,
+									  void *target_addr, uint32 target_lkey)
+{
+#if defined(HAVE_LIBIBVERBS) && defined(HAVE_LIBRDMACM) && defined(HAVE_RDMA_RDMA_CMA_H)
+	ClusterICRdmaPeer *peer;
+	ClusterICSge sge[2];
+	uint64 wr_id;
+
+	if (!rdma_valid_peer_id(peer_id) || target_addr == NULL || target_lkey == 0)
+		return false;
+	peer = &RdmaPeers[peer_id];
+	if (!peer->block_reply_connected || peer->block_reply_qp.qp == NULL
+		|| peer->block_reply_sidecar_buf == NULL || peer->block_reply_sidecar_mr == NULL)
+	{
+		rdma_stats_note_block_reply_fallback(peer_id, "RDMA block-reply lane is not connected");
+		return false;
+	}
+	if (arm_id >= rdma_block_reply_arm_capacity()) {
+		rdma_stats_note_block_reply_fallback(peer_id, "RDMA block-reply arm id is out of range");
+		return false;
+	}
+
+	memset(sge, 0, sizeof(sge));
+	sge[0].addr = peer->block_reply_sidecar_buf
+				  + ((size_t)arm_id * CLUSTER_IC_RDMA_DIRECT_LAND_SIDECAR_BYTES);
+	sge[0].len = CLUSTER_IC_RDMA_DIRECT_LAND_SIDECAR_BYTES;
+	sge[0].lkey = peer->block_reply_sidecar_mr->lkey;
+	sge[1].addr = target_addr;
+	sge[1].len = BLCKSZ;
+	sge[1].lkey = target_lkey;
+	wr_id = cluster_ic_rdma_direct_land_make_wr_id((uint32)peer_id, arm_id, generation);
+
+	if (!RdmaProvider->post_recv(&peer->block_reply_qp, sge, lengthof(sge), wr_id)) {
+		rdma_stats_note_block_reply_fallback(
+			peer_id, RdmaUnavailableReason != NULL ? RdmaUnavailableReason
+													: "RDMA block-reply post_recv failed");
+		return false;
+	}
+	return true;
+#else
+	return false;
+#endif
+}
+
+ClusterICSendResult
+cluster_ic_rdma_send_block_reply_direct(int32 dest_node_id, const ClusterICSge *payload_sge,
+										int n_sge, uint32 payload_len)
+{
+	ClusterICEnvelope env;
+	uint32 summed_len;
+	bool sum_ok;
+	int i;
+
+	if (dest_node_id == cluster_node_id) {
+		rdma_release_sge_callbacks(payload_sge, n_sge);
+		return CLUSTER_IC_SEND_DONE;
+	}
+	if (payload_len != GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE)
+		return CLUSTER_IC_SEND_HARD_ERROR;
+	summed_len = rdma_sum_sge_lengths(payload_sge, n_sge, &sum_ok);
+	if (!sum_ok || summed_len != payload_len)
+		return CLUSTER_IC_SEND_HARD_ERROR;
+	if (!cluster_ic_envelope_build(&env, PGRAC_IC_MSG_GCS_BLOCK_REPLY, (uint32)cluster_node_id,
+								   (uint32)dest_node_id, NULL, 0))
+		return CLUSTER_IC_SEND_HARD_ERROR;
+	env.payload_length = payload_len;
+	env.payload_crc32c = 0;
+	env.payload_crc32c = rdma_compute_sge_crc(&env, payload_sge, n_sge);
+
+#if defined(HAVE_LIBIBVERBS) && defined(HAVE_LIBRDMACM) && defined(HAVE_RDMA_RDMA_CMA_H)
+	{
+		ClusterICRdmaPeer *peer;
+		ClusterICSge send_sge[CLUSTER_IC_RDMA_MAX_SGE + 1];
+		ClusterICSgeReleaseCallback release_cb[CLUSTER_IC_RDMA_MAX_SGE];
+		void *release_arg[CLUSTER_IC_RDMA_MAX_SGE];
+		char *scratch;
+		size_t scratch_len = 0;
+		bool saw_registered_payload = false;
+		int send_sge_count = 0;
+		int release_count = 0;
+		bool signaled;
+		ClusterICSendResult rc;
+
+		if (!rdma_valid_peer_id(dest_node_id))
+			return CLUSTER_IC_SEND_HARD_ERROR;
+		peer = &RdmaPeers[dest_node_id];
+		if (!peer->block_reply_connected || peer->block_reply_send_busy
+			|| peer->block_reply_qp.qp == NULL || peer->block_reply_send_buf == NULL
+			|| peer->block_reply_send_mr == NULL)
+		{
+			rdma_stats_note_block_reply_error(dest_node_id,
+											  "RDMA block-reply lane cannot send direct reply");
+			rdma_release_sge_callbacks(payload_sge, n_sge);
+			return CLUSTER_IC_SEND_HARD_ERROR;
+		}
+		if (sizeof(env) + payload_len > peer->block_reply_send_buf_len) {
+			rdma_release_sge_callbacks(payload_sge, n_sge);
+			return CLUSTER_IC_SEND_HARD_ERROR;
+		}
+
+		memset(send_sge, 0, sizeof(send_sge));
+		memset(release_cb, 0, sizeof(release_cb));
+		memset(release_arg, 0, sizeof(release_arg));
+		memcpy(peer->block_reply_send_buf, &env, sizeof(env));
+		scratch = (char *)peer->block_reply_send_buf + sizeof(env);
+		for (i = 0; i < n_sge; i++) {
+			if (payload_sge[i].len == 0)
+				continue;
+			if (payload_sge[i].release_cb != NULL) {
+				bool duplicate = false;
+				int j;
+
+				for (j = 0; j < release_count; j++) {
+					if (release_cb[j] == payload_sge[i].release_cb
+						&& release_arg[j] == payload_sge[i].release_arg) {
+						duplicate = true;
+						break;
+					}
+				}
+				if (!duplicate) {
+					if (release_count >= lengthof(release_cb)) {
+						rdma_release_sge_callbacks(payload_sge, n_sge);
+						return CLUSTER_IC_SEND_HARD_ERROR;
+					}
+					release_cb[release_count] = payload_sge[i].release_cb;
+					release_arg[release_count] = payload_sge[i].release_arg;
+					release_count++;
+				}
+			}
+			if (payload_sge[i].lkey != 0) {
+				if (scratch_len > 0) {
+					send_sge[send_sge_count].addr = peer->block_reply_send_buf;
+					send_sge[send_sge_count].len = sizeof(env) + scratch_len;
+					send_sge[send_sge_count].lkey = peer->block_reply_send_mr->lkey;
+					send_sge_count++;
+					scratch_len = 0;
+				}
+				if (send_sge_count >= lengthof(send_sge)) {
+					rdma_release_sge_callbacks(payload_sge, n_sge);
+					return CLUSTER_IC_SEND_HARD_ERROR;
+				}
+				send_sge[send_sge_count] = payload_sge[i];
+				send_sge_count++;
+				saw_registered_payload = true;
+				continue;
+			}
+			if (saw_registered_payload) {
+				rdma_release_sge_callbacks(payload_sge, n_sge);
+				return CLUSTER_IC_SEND_HARD_ERROR;
+			}
+			memcpy(scratch + scratch_len, payload_sge[i].addr, payload_sge[i].len);
+			scratch_len += payload_sge[i].len;
+		}
+		if (scratch_len > 0 || send_sge_count == 0) {
+			if (send_sge_count >= lengthof(send_sge)) {
+				rdma_release_sge_callbacks(payload_sge, n_sge);
+				return CLUSTER_IC_SEND_HARD_ERROR;
+			}
+			send_sge[send_sge_count].addr = peer->block_reply_send_buf;
+			send_sge[send_sge_count].len = sizeof(env) + scratch_len;
+			send_sge[send_sge_count].lkey = peer->block_reply_send_mr->lkey;
+			send_sge_count++;
+		}
+
+		signaled = true;
+		pgstat_report_wait_start(WAIT_EVENT_INTERCONNECT_RDMA_SEND);
+		rc = RdmaProvider->post_send(&peer->block_reply_qp, send_sge, send_sge_count, signaled,
+									 false, 0);
+		pgstat_report_wait_end();
+		if (rc == CLUSTER_IC_SEND_DONE) {
+			int j;
+
+			rdma_peer_release_block_reply_pending_send(peer);
+			for (j = 0; j < release_count; j++) {
+				if (!rdma_peer_add_block_reply_pending_release(peer, release_cb[j],
+															   release_arg[j]))
+					ereport(FATAL, (errcode(ERRCODE_CLUSTER_IC_RDMA_FABRIC_ERROR),
+									errmsg("RDMA block-reply SEND posted but release table is full"),
+									errdetail("peer_id=%d", dest_node_id)));
+			}
+			peer->block_reply_send_busy = true;
+			cluster_ic_rdma_stats_note_send(dest_node_id, sizeof(env) + payload_len, true);
+			return CLUSTER_IC_SEND_DONE;
+		}
+		rdma_stats_note_block_reply_error(
+			dest_node_id, RdmaUnavailableReason != NULL ? RdmaUnavailableReason
+														: "RDMA block-reply post_send failed");
+		rdma_release_sge_callbacks(payload_sge, n_sge);
+		return rc;
+	}
+#else
+	for (i = 0; i < n_sge; i++) {
+		if (payload_sge[i].release_cb != NULL)
+			payload_sge[i].release_cb(payload_sge[i].release_arg);
+	}
+	return CLUSTER_IC_SEND_HARD_ERROR;
+#endif
+}
+
+void
+cluster_ic_rdma_block_reply_abort_peer(int32 peer_id, const char *reason)
+{
+#if defined(HAVE_LIBIBVERBS) && defined(HAVE_LIBRDMACM) && defined(HAVE_RDMA_RDMA_CMA_H)
+	rdma_peer_close_block_reply_lane(peer_id,
+									 reason != NULL ? reason : "RDMA block-reply lane abort",
+									 true);
+#else
+	(void)peer_id;
+	(void)reason;
+#endif
+}
+
 #if defined(HAVE_LIBIBVERBS) && defined(HAVE_LIBRDMACM) && defined(HAVE_RDMA_RDMA_CMA_H)
 static bool
 rdma_split_host_port(const char *addr, char *host, size_t host_len, char *port, size_t port_len)
@@ -2017,7 +2602,7 @@ rdma_cm_close(void)
 	int i;
 
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
-		if (RdmaPeers[i].id != NULL)
+		if (RdmaPeers[i].id != NULL || RdmaPeers[i].block_reply_id != NULL)
 			rdma_peer_close(i, "RDMA CM shutdown", false);
 	}
 	if (RdmaListenId != NULL) {
@@ -2199,6 +2784,7 @@ cluster_ic_rdma_lmon_handle_cm_events(void)
 	const void *private_data = NULL;
 	uint8 private_data_len = 0;
 	int32 peer_id = -1;
+	uint8 lane_type = CLUSTER_IC_RDMA_LANE_GENERIC;
 	const char *reason = NULL;
 	int status;
 
@@ -2219,11 +2805,16 @@ cluster_ic_rdma_lmon_handle_cm_events(void)
 		private_data_len = event->param.conn.private_data_len;
 	}
 	peer_id = rdma_cm_id_peer(id);
+	lane_type = rdma_cm_id_lane(id);
 
 	if (status != 0) {
 		rdma_ack_cm_event(event);
-		if (rdma_valid_peer_id(peer_id))
-			rdma_peer_fail_or_fallback(peer_id, "RDMA CM event error");
+		if (rdma_valid_peer_id(peer_id)) {
+			if (lane_type == CLUSTER_IC_RDMA_LANE_BLOCK_REPLY)
+				rdma_peer_close_block_reply_lane(peer_id, "RDMA block-reply CM event error", true);
+			else
+				rdma_peer_fail_or_fallback(peer_id, "RDMA CM event error");
+		}
 		else
 			cluster_ic_rdma_stats_note_error(cluster_node_id, "58R16", "RDMA CM event error");
 		return;
@@ -2231,7 +2822,8 @@ cluster_ic_rdma_lmon_handle_cm_events(void)
 
 	switch (event_type) {
 	case RDMA_CM_EVENT_CONNECT_REQUEST:
-		if (!rdma_verify_private_hello(private_data, private_data_len, -1, &peer_id, &reason)) {
+		if (!rdma_verify_private_hello(private_data, private_data_len, -1,
+									   CLUSTER_IC_RDMA_LANE_ANY, &peer_id, &lane_type, &reason)) {
 			rdma_reject(id, NULL, 0);
 			cluster_ic_rdma_stats_note_error(cluster_node_id, "08P01",
 											 reason != NULL ? reason : "RDMA HELLO rejected");
@@ -2239,16 +2831,28 @@ cluster_ic_rdma_lmon_handle_cm_events(void)
 			rdma_destroy_id(id);
 			return;
 		}
-		if (!rdma_prepare_peer_for_connect(peer_id, id, false)) {
+		if (!rdma_prepare_peer_for_connect(peer_id, id, false, lane_type)) {
 			rdma_ack_cm_event(event);
-			rdma_peer_fail_or_fallback(peer_id, RdmaUnavailableReason != NULL
-													? RdmaUnavailableReason
-													: "RDMA accept preparation failed");
+			if (lane_type == CLUSTER_IC_RDMA_LANE_BLOCK_REPLY)
+				rdma_peer_close_block_reply_lane(peer_id,
+												 RdmaUnavailableReason != NULL
+													 ? RdmaUnavailableReason
+													 : "RDMA block-reply accept preparation failed",
+												 true);
+			else
+				rdma_peer_fail_or_fallback(peer_id, RdmaUnavailableReason != NULL
+														? RdmaUnavailableReason
+														: "RDMA accept preparation failed");
 			return;
 		}
-		if (!rdma_conn_params(&conn_param, &private_reply) || rdma_accept(id, &conn_param) != 0) {
+		if (!rdma_conn_params(&conn_param, &private_reply, lane_type)
+			|| rdma_accept(id, &conn_param) != 0) {
 			rdma_ack_cm_event(event);
-			rdma_peer_fail_or_fallback(peer_id, "rdma_accept failed");
+			if (lane_type == CLUSTER_IC_RDMA_LANE_BLOCK_REPLY)
+				rdma_peer_close_block_reply_lane(peer_id, "rdma_accept(block-reply) failed",
+												 true);
+			else
+				rdma_peer_fail_or_fallback(peer_id, "rdma_accept failed");
 			return;
 		}
 		break;
@@ -2260,18 +2864,29 @@ cluster_ic_rdma_lmon_handle_cm_events(void)
 											 "RDMA address-resolved event lacked peer context");
 			return;
 		}
-		if (!rdma_prepare_peer_for_connect(peer_id, id, true)) {
+		if (!rdma_prepare_peer_for_connect(peer_id, id, true, lane_type)) {
 			rdma_ack_cm_event(event);
-			rdma_peer_fail_or_fallback(peer_id, RdmaUnavailableReason != NULL
-													? RdmaUnavailableReason
-													: "RDMA active preparation failed");
+			if (lane_type == CLUSTER_IC_RDMA_LANE_BLOCK_REPLY)
+				rdma_peer_close_block_reply_lane(peer_id,
+												 RdmaUnavailableReason != NULL
+													 ? RdmaUnavailableReason
+													 : "RDMA block-reply active preparation failed",
+												 true);
+			else
+				rdma_peer_fail_or_fallback(peer_id, RdmaUnavailableReason != NULL
+														? RdmaUnavailableReason
+														: "RDMA active preparation failed");
 			return;
-		}
-		if (rdma_resolve_route(id, cluster_interconnect_connect_timeout_ms) != 0) {
-			rdma_ack_cm_event(event);
-			rdma_peer_fail_or_fallback(peer_id, "rdma_resolve_route failed");
-			return;
-		}
+			}
+			if (rdma_resolve_route(id, cluster_interconnect_connect_timeout_ms) != 0) {
+				rdma_ack_cm_event(event);
+				if (lane_type == CLUSTER_IC_RDMA_LANE_BLOCK_REPLY)
+					rdma_peer_close_block_reply_lane(peer_id,
+													 "rdma_resolve_route(block-reply) failed", true);
+				else
+					rdma_peer_fail_or_fallback(peer_id, "rdma_resolve_route failed");
+				return;
+			}
 		break;
 
 	case RDMA_CM_EVENT_ROUTE_RESOLVED:
@@ -2281,9 +2896,14 @@ cluster_ic_rdma_lmon_handle_cm_events(void)
 											 "RDMA route-resolved event lacked peer context");
 			return;
 		}
-		if (!rdma_conn_params(&conn_param, &private_reply) || rdma_connect(id, &conn_param) != 0) {
+		if (!rdma_conn_params(&conn_param, &private_reply, lane_type)
+			|| rdma_connect(id, &conn_param) != 0) {
 			rdma_ack_cm_event(event);
-			rdma_peer_fail_or_fallback(peer_id, "rdma_connect failed");
+			if (lane_type == CLUSTER_IC_RDMA_LANE_BLOCK_REPLY)
+				rdma_peer_close_block_reply_lane(peer_id, "rdma_connect(block-reply) failed",
+												 true);
+			else
+				rdma_peer_fail_or_fallback(peer_id, "rdma_connect failed");
 			return;
 		}
 		break;
@@ -2291,25 +2911,38 @@ cluster_ic_rdma_lmon_handle_cm_events(void)
 	case RDMA_CM_EVENT_ESTABLISHED: {
 		int32 expected_peer = peer_id;
 		int32 verified_peer = -1;
+		uint8 verified_lane = CLUSTER_IC_RDMA_LANE_GENERIC;
 
-		if (!rdma_verify_private_hello(private_data, private_data_len, expected_peer,
-									   &verified_peer, &reason)) {
+		if (!rdma_verify_private_hello(private_data, private_data_len, expected_peer, lane_type,
+									   &verified_peer, &verified_lane, &reason)) {
 			rdma_ack_cm_event(event);
 			if (rdma_valid_peer_id(expected_peer))
-				rdma_peer_fail_or_fallback(expected_peer,
-										   reason != NULL ? reason : "RDMA HELLO verify failed");
+			{
+				if (lane_type == CLUSTER_IC_RDMA_LANE_BLOCK_REPLY)
+					rdma_peer_close_block_reply_lane(
+						expected_peer, reason != NULL ? reason : "RDMA block-reply HELLO verify failed",
+						true);
+				else
+					rdma_peer_fail_or_fallback(
+						expected_peer, reason != NULL ? reason : "RDMA HELLO verify failed");
+			}
 			else
 				cluster_ic_rdma_stats_note_error(
 					cluster_node_id, "08P01", reason != NULL ? reason : "RDMA HELLO verify failed");
 			return;
 		}
-		rdma_mark_peer_connected(verified_peer);
+		rdma_mark_peer_connected(verified_peer, verified_lane);
 	} break;
 
 	case RDMA_CM_EVENT_DISCONNECTED:
 		rdma_ack_cm_event(event);
-		if (rdma_valid_peer_id(peer_id))
-			rdma_peer_fail_or_fallback(peer_id, "RDMA peer disconnected");
+		if (rdma_valid_peer_id(peer_id)) {
+			if (lane_type == CLUSTER_IC_RDMA_LANE_BLOCK_REPLY)
+				rdma_peer_close_block_reply_lane(peer_id, "RDMA block-reply peer disconnected",
+												 true);
+			else
+				rdma_peer_fail_or_fallback(peer_id, "RDMA peer disconnected");
+		}
 		return;
 
 	case RDMA_CM_EVENT_REJECTED:
@@ -2318,8 +2951,13 @@ cluster_ic_rdma_lmon_handle_cm_events(void)
 	case RDMA_CM_EVENT_CONNECT_ERROR:
 	case RDMA_CM_EVENT_UNREACHABLE:
 		rdma_ack_cm_event(event);
-		if (rdma_valid_peer_id(peer_id))
-			rdma_peer_fail_or_fallback(peer_id, "RDMA CM connection event failed");
+		if (rdma_valid_peer_id(peer_id)) {
+			if (lane_type == CLUSTER_IC_RDMA_LANE_BLOCK_REPLY)
+				rdma_peer_close_block_reply_lane(peer_id, "RDMA block-reply CM event failed",
+												 true);
+			else
+				rdma_peer_fail_or_fallback(peer_id, "RDMA CM connection event failed");
+		}
 		else
 			cluster_ic_rdma_stats_note_error(cluster_node_id, "58R16",
 											 "RDMA CM connection event failed");
@@ -2385,7 +3023,7 @@ rdma_process_polled_completions(ClusterICWc *wc, int n)
 			continue;
 		}
 		if (wc[i].status != IBV_WC_SUCCESS) {
-			rdma_handle_completion_error(peer_id, wr_type, wc[i].status);
+			rdma_handle_completion_error(peer_id, wc[i].wc.wr_id, wc[i].status);
 			continue;
 		}
 		if (wr_type == CLUSTER_IC_RDMA_WR_TYPE_SEND) {
@@ -2394,11 +3032,29 @@ rdma_process_polled_completions(ClusterICWc *wc, int n)
 			RdmaPeers[peer_id].send_busy = false;
 			rdma_peer_flush_queued_send(peer_id);
 #endif
+		} else if (wr_type == CLUSTER_IC_RDMA_WR_TYPE_BLOCK_REPLY_SEND) {
+#if defined(HAVE_LIBRDMACM) && defined(HAVE_RDMA_RDMA_CMA_H)
+			rdma_peer_release_block_reply_pending_send(&RdmaPeers[peer_id]);
+			RdmaPeers[peer_id].block_reply_send_busy = false;
+#endif
 		} else if (wr_type == CLUSTER_IC_RDMA_WR_TYPE_RECV) {
 #if defined(HAVE_LIBRDMACM) && defined(HAVE_RDMA_RDMA_CMA_H)
 			pgstat_report_wait_start(WAIT_EVENT_INTERCONNECT_RDMA_RECV);
 			rdma_process_recv_completion(&RdmaPeers[peer_id], wc[i].wc.byte_len);
 			pgstat_report_wait_end();
+#endif
+		} else if (wr_type == CLUSTER_IC_RDMA_WR_TYPE_BLOCK_REPLY_RECV) {
+#if defined(HAVE_LIBRDMACM) && defined(HAVE_RDMA_RDMA_CMA_H)
+			uint32 arm_id = 0;
+			const void *sidecar = NULL;
+
+			(void)cluster_ic_rdma_direct_land_decode_wr_id(wc[i].wc.wr_id, NULL, &arm_id, NULL);
+			if (arm_id < rdma_block_reply_arm_capacity()
+				&& RdmaPeers[peer_id].block_reply_sidecar_buf != NULL)
+				sidecar = RdmaPeers[peer_id].block_reply_sidecar_buf
+						  + ((size_t)arm_id * CLUSTER_IC_RDMA_DIRECT_LAND_SIDECAR_BYTES);
+			cluster_gcs_block_lmon_handle_direct_land_completion(
+				peer_id, wc[i].wc.wr_id, true, wc[i].wc.byte_len, sidecar);
 #endif
 		}
 	}
@@ -2525,6 +3181,7 @@ rdma_provider_qp_create(ClusterICRdmaCtx *ctx, int32 peer, ClusterICQp *out)
 
 	memset(out, 0, sizeof(*out));
 	out->peer_id = peer;
+	out->lane_type = CLUSTER_IC_RDMA_LANE_GENERIC;
 	out->qp = ibv_create_qp(ctx->pd, &attr);
 	if (out->qp == NULL) {
 		RdmaUnavailableReason = "ibv_create_qp failed";
@@ -2564,7 +3221,10 @@ rdma_provider_post_send(ClusterICQp *qp, const ClusterICSge *sge, int n_sge, boo
 	}
 
 	memset(&wr, 0, sizeof(wr));
-	wr.wr_id = rdma_make_wr_id(CLUSTER_IC_RDMA_WR_TYPE_SEND, qp->peer_id);
+	wr.wr_id = rdma_make_wr_id(qp->lane_type == CLUSTER_IC_RDMA_LANE_BLOCK_REPLY
+								   ? CLUSTER_IC_RDMA_WR_TYPE_BLOCK_REPLY_SEND
+								   : CLUSTER_IC_RDMA_WR_TYPE_SEND,
+							   qp->peer_id);
 	wr.opcode = IBV_WR_SEND;
 	wr.sg_list = verbs_sge;
 	wr.num_sge = n_sge;
@@ -2583,27 +3243,34 @@ rdma_provider_post_send(ClusterICQp *qp, const ClusterICSge *sge, int n_sge, boo
 }
 
 static bool
-rdma_provider_post_recv(ClusterICQp *qp, ClusterICSge *sge)
+rdma_provider_post_recv(ClusterICQp *qp, const ClusterICSge *sge, int n_sge, uint64 wr_id)
 {
 #ifdef HAVE_LIBIBVERBS
-	struct ibv_sge verbs_sge;
+	struct ibv_sge verbs_sge[CLUSTER_IC_RDMA_MAX_SGE + 1];
 	struct ibv_recv_wr wr;
 	struct ibv_recv_wr *bad_wr = NULL;
+	int i;
 
-	if (qp == NULL || qp->qp == NULL || sge == NULL || sge->addr == NULL || sge->len == 0
-		|| sge->len > PG_UINT32_MAX) {
+	if (qp == NULL || qp->qp == NULL || sge == NULL || n_sge <= 0
+		|| n_sge > CLUSTER_IC_RDMA_MAX_SGE + 1) {
 		RdmaUnavailableReason = "invalid RDMA post_recv request";
 		return false;
 	}
 
-	memset(&verbs_sge, 0, sizeof(verbs_sge));
-	verbs_sge.addr = (uintptr_t)sge->addr;
-	verbs_sge.length = (uint32)sge->len;
-	verbs_sge.lkey = sge->lkey;
+	memset(verbs_sge, 0, sizeof(verbs_sge));
+	for (i = 0; i < n_sge; i++) {
+		if (sge[i].addr == NULL || sge[i].len == 0 || sge[i].len > PG_UINT32_MAX) {
+			RdmaUnavailableReason = "invalid RDMA recv SGE";
+			return false;
+		}
+		verbs_sge[i].addr = (uintptr_t)sge[i].addr;
+		verbs_sge[i].length = (uint32)sge[i].len;
+		verbs_sge[i].lkey = sge[i].lkey;
+	}
 	memset(&wr, 0, sizeof(wr));
-	wr.wr_id = rdma_make_wr_id(CLUSTER_IC_RDMA_WR_TYPE_RECV, qp->peer_id);
-	wr.sg_list = &verbs_sge;
-	wr.num_sge = 1;
+	wr.wr_id = wr_id;
+	wr.sg_list = verbs_sge;
+	wr.num_sge = n_sge;
 	if (ibv_post_recv(qp->qp, &wr, &bad_wr) != 0) {
 		RdmaUnavailableReason = "ibv_post_recv failed";
 		return false;
@@ -2851,20 +3518,26 @@ cluster_get_ic_rdma_peers(PG_FUNCTION_ARGS)
 			ClusterICRdmaPeerStats *p = rdma_peer_stats(n->node_id);
 			ClusterICPeerTransport transport = CLUSTER_IC_PEER_TRANSPORT_TCP;
 			ClusterICRdmaPeerState state = CLUSTER_IC_RDMA_PEER_DISABLED;
+			ClusterICRdmaBlockReplyLaneState block_reply_lane_state
+				= CLUSTER_IC_RDMA_BLOCK_REPLY_DISABLED;
 			char provider_buf[CLUSTER_IC_RDMA_PROVIDER_NAME_LEN];
 			char last_error_code_buf[CLUSTER_IC_RDMA_ERRCODE_LEN];
 			char last_error_buf[CLUSTER_IC_RDMA_ERRMSG_LEN];
+			char last_block_reply_error_buf[CLUSTER_IC_RDMA_ERRMSG_LEN];
 			int32 cq_depth = 0;
-			Datum values[25];
-			bool nulls[25] = { false };
+			Datum values[29];
+			bool nulls[29] = { false };
 
 			strlcpy(provider_buf, rdma_selected_provider_name(), sizeof(provider_buf));
 			last_error_code_buf[0] = '\0';
 			last_error_buf[0] = '\0';
+			last_block_reply_error_buf[0] = '\0';
 			if (p != NULL) {
 				LWLockAcquire(&RdmaShmem->lock.lock, LW_SHARED);
 				transport = (ClusterICPeerTransport)p->transport;
 				state = (ClusterICRdmaPeerState)p->state;
+				block_reply_lane_state
+					= (ClusterICRdmaBlockReplyLaneState)p->block_reply_lane_state;
 				cq_depth = p->cq_depth;
 				if (p->provider[0] != '\0')
 					strlcpy(provider_buf, p->provider, sizeof(provider_buf));
@@ -2872,6 +3545,9 @@ cluster_get_ic_rdma_peers(PG_FUNCTION_ARGS)
 					strlcpy(last_error_code_buf, p->last_error_code, sizeof(last_error_code_buf));
 				if (p->last_error[0] != '\0')
 					strlcpy(last_error_buf, p->last_error, sizeof(last_error_buf));
+				if (p->last_block_reply_error[0] != '\0')
+					strlcpy(last_block_reply_error_buf, p->last_block_reply_error,
+							sizeof(last_block_reply_error_buf));
 				LWLockRelease(&RdmaShmem->lock.lock);
 			}
 
@@ -2906,20 +3582,31 @@ cluster_get_ic_rdma_peers(PG_FUNCTION_ARGS)
 			values[18] = Int64GetDatum((int64)unsignaled_batch_count);
 			values[19] = Int64GetDatum((int64)busypoll_us_burned);
 			values[20] = Int64GetDatum((int64)busypoll_fallback_count);
-			values[21]
-				= Int64GetDatum(p != NULL ? (int64)pg_atomic_read_u64(&p->latency_us_sum) : 0);
+			values[21] = CStringGetTextDatum(
+				rdma_block_reply_lane_state_name(block_reply_lane_state));
 			values[22] = Int64GetDatum(
+				p != NULL ? (int64)pg_atomic_read_u64(&p->block_reply_lane_fallback_count) : 0);
+			values[23] = Int64GetDatum(
+				p != NULL ? (int64)pg_atomic_read_u64(&p->block_reply_lane_error_count) : 0);
+			values[24]
+				= Int64GetDatum(p != NULL ? (int64)pg_atomic_read_u64(&p->latency_us_sum) : 0);
+			values[25] = Int64GetDatum(
 				p != NULL ? (int64)pg_atomic_read_u64(&p->latency_sample_count) : 0);
 
 			if (last_error_code_buf[0] == '\0')
-				nulls[23] = true;
+				nulls[26] = true;
 			else
-				values[23] = CStringGetTextDatum(last_error_code_buf);
+				values[26] = CStringGetTextDatum(last_error_code_buf);
 
 			if (last_error_buf[0] == '\0')
-				nulls[24] = true;
+				nulls[27] = true;
 			else
-				values[24] = CStringGetTextDatum(last_error_buf);
+				values[27] = CStringGetTextDatum(last_error_buf);
+
+			if (last_block_reply_error_buf[0] == '\0')
+				nulls[28] = true;
+			else
+				values[28] = CStringGetTextDatum(last_block_reply_error_buf);
 
 			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 		}

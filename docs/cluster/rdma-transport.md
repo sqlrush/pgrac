@@ -58,11 +58,13 @@ peer's declared port, P_Key, and Q_Key before enabling RDMA traffic.
 
 ## Correctness constraints
 
-RDMA carries the same `ClusterICEnvelope` as TCP.  Block shipping must
-not bypass envelope verification.  The receiver path is unchanged: data
-lands in the normal inbound frame buffer, passes the common
-envelope/CRC32C verification path, and is installed only after
-verification succeeds.
+RDMA carries the same `ClusterICEnvelope` as TCP.  Generic messages still land
+in the normal inbound frame buffer, pass the common envelope/CRC32C
+verification path, and dispatch only after verification succeeds.  GCS
+block-reply direct-land is the only receiver-side exception: it uses a
+dedicated block-reply lane, posts a two-SGE receive, quarantines sidecar bytes
+separately from the target page, and installs the page only after the D6
+verifier accepts identity, epoch, status, checksum, and slot generation.
 
 There are two sender-side block payload sources:
 
@@ -86,13 +88,12 @@ supports event-driven completions and bounded busypoll completions.
 when the binary and device expose mlx5dv capability; otherwise it follows
 the configured fallback policy.
 
-Receiver direct-land is in the expanded spec-6.13 scope, but it must not
-use the generic RC QP.  The current generic QP has a single receive lane
-and one receive SGE, so a block reply cannot safely pre-post a sidecar +
-target-page receive on that lane without risking FIFO consumption by an
-unrelated message.  Direct-land must use the dedicated block-reply
-QP/lane, two-SGE receive posting, slot generation correlation, and LMON
-arm-before-send handoff described in the spec-6.13 design.
+Receiver direct-land must not use the generic RC QP.  The generic QP has a
+single receive lane and one receive SGE, so a block reply cannot safely
+pre-post a sidecar + target-page receive on that lane without risking FIFO
+consumption by an unrelated message.  The shipped D6 path uses the dedicated
+block-reply QP/lane, two-SGE receive posting, slot generation correlation, and
+LMON arm-before-send handoff described in the spec-6.13 design.
 
 ## Hardening
 
@@ -128,10 +129,11 @@ TCP fallback events under `Cluster: Interconnect`.  Use
 RDMA state, provider, RDMA address metadata, MR registration status, CQ
 depth, fallback count, byte counters, SEND-with-SGE block counters,
 tier3 send count, inline send count, unsignaled batch count, busypoll
-burn/fallback counters, and last error summary.
+burn/fallback counters, block-reply lane state/fallback/error counters, and
+last error summaries.
 
 `dump_cluster_state` exposes GCS-side copy-path counters:
 `scratch_copy_count`, `live_sge_send_count`, `live_sge_fallback_count`,
 `direct_install_count`, `direct_install_abort_count`, and
-`install_copy_count`.  The direct-install counters are reserved by the
-expanded spec-6.13 D6 direct-land lane until that lane lands.
+`install_copy_count`.  The direct-install counters are live for the shipped
+spec-6.13 D6 direct-land lane.

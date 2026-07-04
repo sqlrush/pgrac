@@ -703,6 +703,12 @@ cluster_grd_outbound_lmon_drain_send(void)
 	return 0;
 }
 
+int
+cluster_gcs_block_lmon_drain_direct_land_aborts(void)
+{
+	return 0;
+}
+
 void
 cluster_lms_native_probe_retry_tick(void)
 {}

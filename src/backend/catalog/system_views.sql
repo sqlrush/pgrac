@@ -1524,10 +1524,14 @@ CREATE VIEW pg_stat_cluster_ic AS
            unsignaled_batch_count,
            busypoll_us_burned,
            busypoll_fallback_count,
+           block_reply_lane_state,
+           block_reply_lane_fallback_count,
+           block_reply_lane_error_count,
            latency_us_sum,
            latency_sample_count,
            last_error_code,
-           last_error
+           last_error,
+           last_block_reply_error
       FROM cluster_get_ic_rdma_peers();
 
 REVOKE ALL ON pg_stat_cluster_ic FROM PUBLIC;

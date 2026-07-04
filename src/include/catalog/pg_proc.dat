@@ -12262,9 +12262,9 @@
   proname => 'cluster_get_ic_rdma_peers', prorows => '8',
   proretset => 't', provolatile => 'v', proparallel => 'r',
   prorettype => 'record', proargtypes => '',
-  proallargtypes => '{int4,text,text,text,text,text,int4,bool,int4,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,text,text}',
-  proargmodes => '{o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o}',
-  proargnames => '{node_id,transport,rdma_state,provider,rdma_addr,rdma_gid,rdma_port,mr_registered,cq_depth,fallback_count,send_count,recv_count,bytes_send,bytes_recv,block_sge_send_count,block_sge_fallback_count,tier3_send_count,inline_send_count,unsignaled_batch_count,busypoll_us_burned,busypoll_fallback_count,latency_us_sum,latency_sample_count,last_error_code,last_error}',
+  proallargtypes => '{int4,text,text,text,text,text,int4,bool,int4,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,text,int8,int8,int8,int8,text,text,text}',
+  proargmodes => '{o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o}',
+  proargnames => '{node_id,transport,rdma_state,provider,rdma_addr,rdma_gid,rdma_port,mr_registered,cq_depth,fallback_count,send_count,recv_count,bytes_send,bytes_recv,block_sge_send_count,block_sge_fallback_count,tier3_send_count,inline_send_count,unsignaled_batch_count,busypoll_us_burned,busypoll_fallback_count,block_reply_lane_state,block_reply_lane_fallback_count,block_reply_lane_error_count,latency_us_sum,latency_sample_count,last_error_code,last_error,last_block_reply_error}',
   prosrc => 'cluster_get_ic_rdma_peers' },
 
 # spec-2.3 D8 cluster_get_ic_msg_types -- list registered IC message

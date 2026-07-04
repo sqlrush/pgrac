@@ -1023,6 +1023,7 @@ LmonMain(void)
 			 */
 			(void)cluster_ges_reply_wait_sweep_timeout(GetCurrentTimestamp());
 			cluster_grd_outbound_lmon_drain_send();
+			(void)cluster_gcs_block_lmon_drain_direct_land_aborts();
 			cluster_lms_native_probe_retry_tick();
 
 			/* spec-5.13 D6: clean-leave orchestration runs BEFORE the reconfig
@@ -1638,6 +1639,7 @@ LmonMain(void)
 			 * single node has no peers to send to).
 			 */
 			cluster_ges_lmon_drain_work_queue();
+			(void)cluster_gcs_block_lmon_drain_direct_land_aborts();
 			/* PGRAC: spec-6.12b — ship finished CR-server results (LMS
 			 * constructed them; only LMON owns the IC connections). */
 			cluster_lms_cr_ship_ready();

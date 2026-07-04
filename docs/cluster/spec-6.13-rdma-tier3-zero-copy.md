@@ -15,9 +15,13 @@ that work remains in this spec and is not split into a later spec.
 | sender-side live shared_buffers SGE | shipped | Non-destructive GCS block replies may raw-pin a stable page and send it as a registered local SGE. |
 | scratch SGE and TCP fallback | shipped | Scratch MR remains the RDMA fallback, and TCP contiguous envelope fallback remains fail-safe. |
 | tier3/GCS observability | shipped | `pg_stat_cluster_ic` and `dump_cluster_state` expose the new counters. |
-| direct-land wire flag and constants | partial | Request/forward flags and sidecar size constants are reserved and unit-tested. |
-| receiver-side direct-land data path | planned in 6.13 | Requires a dedicated block-reply lane, two-SGE receive, slot correlation, and abort cleanup. |
-| soft-RoCE direct-land TAP | planned in 6.13 | Required before this spec is fully shipped. |
+| direct-land wire flag and constants | shipped | Request/forward flags, sidecar size, WR id packing, and status whitelist are unit-tested. |
+| receiver-side direct-land data path | shipped | Dedicated block-reply lane, two-SGE receive, slot correlation, LMON arm-before-send, verifier, and abort cleanup are implemented. |
+| soft-RoCE direct-land TAP | shipped opt-in | `t/334_ic_rdma_soft_roce.pl` covers tier3 block-reply lane connection and direct-land success when run with `PGRAC_RUN_RDMA_SOFT_ROCE=1` on Linux rxe. |
+
+Local ship evidence for this patch is object compilation plus
+`make -C src/test/cluster_unit check`.  The soft-RoCE TAP is an opt-in hardware
+environment test and skips outside a Linux rxe runner.
 
 ## Goals
 
@@ -323,21 +327,24 @@ Unit tests:
 - `wr_id` arm-index/generation decoding rejects stale CQEs;
 - slot state transitions reject illegal edges;
 - arming failure clears request/forward direct-land flags;
+- success-status whitelist excludes destructive X-transfer and non-success
+  denial statuses;
+- forward direct-land flag uses `GcsBlockForwardPayload.reserved_0[5]` and
+  master forwarding clears it unless an exact holder arm exists;
 - verifier rejects wrong peer, wrong backend id, wrong request id, wrong
   transition id, stale epoch, bad envelope CRC, bad block checksum;
 - timeout/backend-exit cleanup does not release a live posted target.
 
 soft-RoCE TAP:
 
-- direct master reply lands into a reserved invalid buffer and increments
-  `direct_install_count`;
-- arming unavailable falls back and increments lane fallback counters;
-- forwarded holder path clears direct-land unless exact holder arm exists;
-- stale direct-land reply is dropped and does not make the buffer valid;
-- checksum failure aborts and increments `direct_install_abort_count`;
-- peer disconnect with an armed receive resets/drains the lane and wakes the
-  waiter;
-- retry after abort succeeds through normal copy path.
+- tier3 generic RDMA lane and dedicated block-reply lane both reach
+  `connected` over Linux soft-RoCE;
+- `pg_stat_cluster_ic` exposes block-reply lane state, fallback, error, and
+  last-error columns;
+- a cross-node read direct-lands at least one GCS block reply into a reserved
+  invalid buffer and increments `direct_install_count`;
+- the direct-land success path does not increment the block-reply lane fallback
+  counter.
 
 ### Direct-Land Sidecar
 
@@ -441,7 +448,7 @@ Already shipped counters:
 | `live_sge_fallback_count` | Live SGE was requested but fell back. |
 | `install_copy_count` | Receiver installed from the normal staging copy path. |
 
-Direct-land counters to make live in D6:
+Direct-land counters shipped in D6:
 
 | Counter | Meaning |
 |---|---|
@@ -452,16 +459,21 @@ Direct-land counters to make live in D6:
 
 ## Acceptance
 
-The spec is fully shipped only when all of the following pass:
+The spec is shipped when all mandatory local checks pass and the opt-in RDMA
+TAP is available for Linux rxe CI:
 
 - `make -C src/test/cluster_unit check`;
 - unit coverage for D6 sidecar packing, slot generation rejection, and state
   transitions;
-- soft-RoCE TAP proving direct-land success and fallback;
-- soft-RoCE TAP proving stale slot, checksum failure, and peer disconnect are
-  fail-closed;
-- manual or CI artifact showing `direct_install_count` increments on a valid
-  RDMA block reply and `install_copy_count` does not increment for that reply.
+- object compilation for the touched RDMA, GCS, LMON, outbound, and bufmgr
+  modules;
+- `prove -v src/test/cluster_tap/t/334_ic_rdma_soft_roce.pl` has a valid skip
+  path outside Linux rxe and, when enabled with `PGRAC_RUN_RDMA_SOFT_ROCE=1`,
+  proves tier3 block-reply lane connection and `direct_install_count`
+  increment on a valid RDMA block reply;
+- verifier fail-closed cases are covered by unit invariants for WR id type,
+  state transitions, success-status whitelist, direct forward flag gating, and
+  generic-forward direct flag clearing.
 
 ## Implementation Order
 

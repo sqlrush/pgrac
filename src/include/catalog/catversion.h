@@ -722,7 +722,9 @@
  * columns.  Bump 202606350 -> 202606360. */
 /* spec-6.13: RDMA tier3/direct-wire observability columns on
  * cluster_get_ic_rdma_peers / pg_stat_cluster_ic.  Bump 202606360 -> 202606370. */
-#define CATALOG_VERSION_NO 202606370
+/* spec-6.13 D6: block-reply direct-land lane observability columns on
+ * cluster_get_ic_rdma_peers / pg_stat_cluster_ic.  Bump 202606370 -> 202606380. */
+#define CATALOG_VERSION_NO 202606380
 
 /* spec-5.13 (2026-06-27): clean-leave catalog surface — cluster_get_clean_leave_state
  * SRF (oid 8960) + pg_cluster_clean_leave_state view + pg_cluster_clean_leave_request

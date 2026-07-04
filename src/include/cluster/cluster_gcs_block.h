@@ -85,12 +85,72 @@
 #define GCS_BLOCK_DATA_SIZE 8192
 
 /*
+ * Keep the per-backend outstanding-block cap visible to the RDMA direct-land
+ * lane: wr_id/sidecar arm ids are derived from backend_idx * cap + slot_idx
+ * so LMON can demux a completion without scanning every backend.
+ */
+#define CLUSTER_GCS_BLOCK_MAX_OUTSTANDING_PER_BACKEND 8
+
+/*
  * spec-2.35 HC108/HC109: forwarding_master_node_bytes stores the master that
  * authorized a holder-to-requester direct ship.  Node 0 is a valid cluster
  * node, so the direct-from-master sentinel must be outside the legal node-id
  * range.
  */
 #define GCS_BLOCK_REPLY_NO_FORWARDING_MASTER (-1)
+
+typedef enum ClusterGcsBlockDirectState {
+	GCS_BLOCK_DIRECT_UNARMED = 0,
+	GCS_BLOCK_DIRECT_ARMING,
+	GCS_BLOCK_DIRECT_ARMED,
+	GCS_BLOCK_DIRECT_LANDED,
+	GCS_BLOCK_DIRECT_INSTALLED,
+	GCS_BLOCK_DIRECT_ABORTING,
+	GCS_BLOCK_DIRECT_ABORTED,
+} ClusterGcsBlockDirectState;
+
+typedef enum ClusterGcsBlockDirectTargetKind {
+	GCS_BLOCK_DIRECT_TARGET_NONE = 0,
+	GCS_BLOCK_DIRECT_TARGET_SHARED_BUFFER,
+	GCS_BLOCK_DIRECT_TARGET_STAGING_PAGE,
+} ClusterGcsBlockDirectTargetKind;
+
+typedef enum ClusterGcsBlockDirectAbortReason {
+	GCS_BLOCK_DIRECT_ABORT_NONE = 0,
+	GCS_BLOCK_DIRECT_ABORT_ARM_FAILED,
+	GCS_BLOCK_DIRECT_ABORT_CQE_ERROR,
+	GCS_BLOCK_DIRECT_ABORT_BAD_LENGTH,
+	GCS_BLOCK_DIRECT_ABORT_BAD_SIDECAR,
+	GCS_BLOCK_DIRECT_ABORT_BAD_STATUS,
+	GCS_BLOCK_DIRECT_ABORT_BAD_IDENTITY,
+	GCS_BLOCK_DIRECT_ABORT_BAD_CHECKSUM,
+	GCS_BLOCK_DIRECT_ABORT_TIMEOUT,
+	GCS_BLOCK_DIRECT_ABORT_PEER_DOWN,
+} ClusterGcsBlockDirectAbortReason;
+
+static inline bool
+cluster_gcs_block_direct_state_transition_ok(ClusterGcsBlockDirectState from,
+											 ClusterGcsBlockDirectState to)
+{
+	switch (from) {
+	case GCS_BLOCK_DIRECT_UNARMED:
+		return to == GCS_BLOCK_DIRECT_ARMING;
+	case GCS_BLOCK_DIRECT_ARMING:
+		return to == GCS_BLOCK_DIRECT_ARMED || to == GCS_BLOCK_DIRECT_UNARMED
+			   || to == GCS_BLOCK_DIRECT_ABORTED;
+	case GCS_BLOCK_DIRECT_ARMED:
+		return to == GCS_BLOCK_DIRECT_LANDED || to == GCS_BLOCK_DIRECT_ABORTING
+			   || to == GCS_BLOCK_DIRECT_ABORTED;
+	case GCS_BLOCK_DIRECT_LANDED:
+		return to == GCS_BLOCK_DIRECT_INSTALLED || to == GCS_BLOCK_DIRECT_ABORTED;
+	case GCS_BLOCK_DIRECT_ABORTING:
+		return to == GCS_BLOCK_DIRECT_ABORTED;
+	case GCS_BLOCK_DIRECT_INSTALLED:
+	case GCS_BLOCK_DIRECT_ABORTED:
+		return to == GCS_BLOCK_DIRECT_UNARMED;
+	}
+	return false;
+}
 
 
 /* ============================================================
@@ -248,6 +308,14 @@ StaticAssertDecl(GCS_BLOCK_REPLY_CR_RESULT_PARTIAL == GCS_BLOCK_REPLY_CR_RESULT_
 					 && GCS_BLOCK_REPLY_CR_RESULT_FULL
 							== GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE + 1,
 				 "spec-6.12b CR result statuses must be the tail enum values");
+
+static inline bool
+GcsBlockReplyStatusAllowsDirectLandInstall(GcsBlockReplyStatus status)
+{
+	return status == GCS_BLOCK_REPLY_GRANTED
+		   || status == GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER
+		   || status == GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE;
+}
 
 /* ============================================================
  * GcsBlockInvalidatePayload — spec-2.36 D1 NEW.
@@ -1111,6 +1179,10 @@ extern bool cluster_bufmgr_borrow_block_for_gcs_live_sge(BufferTag tag, XLogRecP
 														 void **out_page_addr,
 														 BufferDesc **out_buf);
 extern void cluster_bufmgr_release_block_for_gcs_live_sge(BufferDesc *buf);
+extern bool cluster_bufmgr_prepare_direct_land_target_for_gcs(BufferDesc *buf, BufferTag tag,
+															  void **out_page_addr);
+extern void cluster_bufmgr_finish_direct_land_target_for_gcs(BufferDesc *buf, bool valid,
+															 XLogRecPtr page_lsn);
 extern uint32 cluster_gcs_block_compute_checksum(const char *block_data);
 extern bool cluster_bufmgr_copy_block_for_gcs_smart_fusion(BufferTag tag, XLogRecPtr *out_page_lsn,
 														   char *dst, ClusterSfDepVec *out_dep_vec);
@@ -1473,6 +1545,29 @@ extern uint64 cluster_gcs_get_recovery_before_boundary_failclosed(void);
  *	of ClusterGcsBlockShared to other translation units.
  */
 extern void cluster_gcs_block_bump_master_holder_lifecycle(void);
+
+/*
+ * spec-6.13 D6 direct-land hooks.
+ *
+ * LMON calls prepare_outbound_request after dequeuing a backend-produced
+ * GCS_BLOCK_REQUEST but before sending it on the wire.  The hook posts the
+ * two-SGE block-reply receive when the slot is in ARMING state and sets the
+ * request direct-land flag only after post_recv succeeds.
+ *
+ * The RDMA block-reply lane calls handle_direct_land_completion for receive
+ * CQEs.  `sidecar` points at exactly
+ * CLUSTER_IC_RDMA_DIRECT_LAND_SIDECAR_BYTES bytes containing
+ * ClusterICEnvelope + GcsBlockReplyHeader; the landed page is already in the
+ * slot target.
+ */
+extern void cluster_gcs_block_lmon_prepare_outbound_request(GcsBlockRequestPayload *req,
+															int32 dest_node);
+extern void cluster_gcs_block_lmon_handle_direct_land_completion(int32 peer_node, uint64 wr_id,
+																 bool cqe_success, uint32 byte_len,
+																 const void *sidecar);
+extern void cluster_gcs_block_lmon_abort_direct_land_peer(int32 peer_node,
+														  ClusterGcsBlockDirectAbortReason reason);
+extern int cluster_gcs_block_lmon_drain_direct_land_aborts(void);
 
 
 /* ============================================================

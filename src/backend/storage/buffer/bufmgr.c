@@ -6611,6 +6611,71 @@ cluster_bufmgr_release_block_for_gcs_live_sge(BufferDesc *buf)
 		cluster_bufmgr_unpin_for_gcs(buf);
 }
 
+/*
+ * Prepare a caller-pinned shared buffer as a direct-land target for a GCS block
+ * reply.  The target must already be tagged for the requested block, but it
+ * must not be visible as valid data.  We mark BM_IO_IN_PROGRESS so ordinary
+ * readers wait instead of observing RDMA-written bytes before the verifier has
+ * accepted the sidecar/header/checksum chain.
+ */
+bool
+cluster_bufmgr_prepare_direct_land_target_for_gcs(BufferDesc *buf, BufferTag tag,
+												  void **out_page_addr)
+{
+	uint32		buf_state;
+
+	Assert(out_page_addr != NULL);
+
+	*out_page_addr = NULL;
+	if (buf == NULL)
+		return false;
+
+	buf_state = LockBufHdr(buf);
+	if (!BufferTagsEqual(&buf->tag, &tag)
+		|| (buf_state & BM_TAG_VALID) == 0
+		|| (buf_state & BM_VALID) != 0
+		|| (buf_state & BM_IO_IN_PROGRESS) != 0)
+	{
+		UnlockBufHdr(buf, buf_state);
+		return false;
+	}
+	UnlockBufHdr(buf, buf_state);
+
+	if (!StartBufferIO(buf, true))
+		return false;
+
+	*out_page_addr = BufHdrGetBlock(buf);
+	return true;
+}
+
+/*
+ * Finish a direct-land target prepared by
+ * cluster_bufmgr_prepare_direct_land_target_for_gcs().  The caller guarantees
+ * any posted receive has completed or the block-reply lane was flushed/reset.
+ * On success, set the page LSN while holding content_lock and then publish
+ * BM_VALID through TerminateBufferIO.  On failure, leave the buffer invalid.
+ */
+void
+cluster_bufmgr_finish_direct_land_target_for_gcs(BufferDesc *buf, bool valid,
+												 XLogRecPtr page_lsn)
+{
+	if (buf == NULL)
+		return;
+
+	if (valid)
+	{
+		LWLock	   *content_lock = BufferDescriptorGetContentLock(buf);
+		Page		page = (Page) BufHdrGetBlock(buf);
+
+		LWLockAcquire(content_lock, LW_EXCLUSIVE);
+		PageSetLSN(page, page_lsn);
+		LWLockRelease(content_lock);
+		TerminateBufferIO(buf, false, BM_VALID);
+	}
+	else
+		TerminateBufferIO(buf, false, 0);
+}
+
 /* ========================================================================
  * PGRAC MODIFICATIONS by SqlRush — spec-6.12a (quiescent X->S downgrade).
  *
