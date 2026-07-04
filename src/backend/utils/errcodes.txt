@@ -850,7 +850,12 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 53RAE    E    ERRCODE_CLUSTER_RESTORE_INCOMPATIBLE                            cluster_restore_incompatible
 53RAF    E    ERRCODE_CLUSTER_RESTORE_POINT_DRAIN_TIMEOUT                     cluster_restore_point_drain_timeout
 
-# 53RB0 is reserved by spec-6.14 (shared catalog authority) — do not reuse.
+# spec-6.14 D6/D5:  shared-catalog OID / relmap authority unavailable.  Opens
+# the 53RB band.  Under cluster.shared_catalog=on the shared OID-lease or
+# relmapper authority file is missing/corrupt (fail-closed): DDL and OID
+# allocation fail rather than fall back to a node-local counter or a stale
+# map copy.  Retryable once the shared authority is repaired.
+53RB0    E    ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE                    cluster_catalog_authority_unavailable
 
 # spec-6.15:  xid space segmentation (per-slot striping) fail-closed band.
 # 53RB1 rejects a node whose stripe-mode / activation-floor / epoch handshake

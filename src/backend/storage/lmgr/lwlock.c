@@ -254,6 +254,8 @@ static const char *const BuiltinTrancheNames[] = {
 		"ClusterSmartFusion",
 		/* PGRAC LWTRANCHE_CLUSTER_XID_STRIPE: spec-6.15 D5b activation publication */
 		"ClusterXidStripe",
+		/* PGRAC LWTRANCHE_CLUSTER_OID_LEASE: spec-6.14 D6 OID lease region */
+		"ClusterOidLease",
 	#endif
 	};
 

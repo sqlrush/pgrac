@@ -1506,6 +1506,9 @@ pgstat_get_wait_cluster_bgproc(WaitEventCluster w)
 	case WAIT_EVENT_CLUSTER_OBJECT_FLUSH_WAIT:
 		event_name = "ClusterObjectFlushWait";
 		break;
+	case WAIT_EVENT_CLUSTER_OID_LEASE:
+		event_name = "ClusterOidLease";
+		break;
 	default:
 		break;
 	}

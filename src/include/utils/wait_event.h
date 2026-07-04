@@ -624,6 +624,14 @@ typedef enum {
 	 * cluster.sinval_ack_timeout_ms.  Wake on all ACKs or timeout (53RAA).
 	 */
 	WAIT_EVENT_CLUSTER_OBJECT_FLUSH_WAIT,
+	/*
+	 * spec-6.14 D6:  OID lease refill wait.  Under cluster.shared_catalog=on a
+	 * backend whose node-level OID lease block is exhausted sleeps here while
+	 * another backend on the node refills it from the shared OID authority
+	 * (cross-node X lock + torn-safe authority writeback).  Wake on the refill
+	 * completing (ConditionVariable broadcast) or on the refiller failing.
+	 */
+	WAIT_EVENT_CLUSTER_OID_LEASE,
 } WaitEventCluster;
 
 

@@ -354,6 +354,8 @@ typedef enum BuiltinTrancheIds {
 		LWTRANCHE_CLUSTER_SMART_FUSION,
 		/* PGRAC: spec-6.15 D5b — xid stripe activation publication + seed mailbox. */
 		LWTRANCHE_CLUSTER_XID_STRIPE,
+		/* PGRAC: spec-6.14 D6 — shared-catalog OID lease node-level region. */
+		LWTRANCHE_CLUSTER_OID_LEASE,
 	#endif
 		LWTRANCHE_FIRST_USER_DEFINED
 	} BuiltinTrancheIds;

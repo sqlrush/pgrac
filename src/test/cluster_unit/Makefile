@@ -62,6 +62,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_ges_mode \
         test_cluster_sequence \
         test_cluster_shared_catalog \
+        test_cluster_oid_lease \
         test_cluster_hw \
         test_cluster_dl \
         test_cluster_extend_gate \
@@ -414,6 +415,18 @@ test_cluster_shared_catalog: test_cluster_shared_catalog.c unit_test.h \
 		$(CLUSTER_SHARED_CATALOG_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_SHARED_CATALOG_O) \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# spec-6.14 D6: test_cluster_oid_lease links cluster_oid_lease.o (the pure
+# lease math + torn-safe authority file I/O).  fd.c openers, pg_fsync,
+# durable_rename and the ereport machinery are stubbed locally; CRC32C comes
+# from libpgport.  The shmem/refill layer (cluster_oid_lease_shmem.o) needs the
+# full backend and is exercised by the TAP suite, not here.
+CLUSTER_OID_LEASE_O = $(top_builddir)/src/backend/cluster/cluster_oid_lease.o
+test_cluster_oid_lease: test_cluster_oid_lease.c unit_test.h \
+		$(CLUSTER_OID_LEASE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_OID_LEASE_O) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 # spec-5.6 Da2: test_cluster_cf_storage links cluster_cf_storage.o (migration

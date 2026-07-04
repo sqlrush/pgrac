@@ -156,6 +156,8 @@ OBJS = \
 	cluster_quorum_decision.o \
 	cluster_qvotec.o \
 	cluster_scn.o \
+	cluster_oid_lease.o \
+	cluster_oid_lease_shmem.o \
 	cluster_sequence.o \
 	cluster_sequence_shmem.o \
 	cluster_shared_catalog.o \

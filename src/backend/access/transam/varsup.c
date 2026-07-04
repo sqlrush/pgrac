@@ -65,6 +65,11 @@
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
 #include "utils/syscache.h"
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC (spec-6.14 D6): shared-catalog OID lease path for GetNewObjectId. */
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_oid_lease.h"
+#endif
 
 
 /* Number of OIDs to prefetch (preallocate) per XLOG write */
@@ -696,6 +701,25 @@ GetNewObjectId(void)
 	/* safety check, we should never get this far in a HS standby */
 	if (RecoveryInProgress())
 		elog(ERROR, "cannot assign OIDs during recovery");
+
+#ifdef USE_PGRAC_CLUSTER
+
+	/*
+	 * PGRAC MODIFICATIONS by SqlRush (spec-6.14 D6):
+	 *
+	 * Under cluster.shared_catalog=on the OID space is cluster-wide: two nodes
+	 * allocating from the node-local ShmemVariableCache->nextOid would collide
+	 * on the shared catalog.  Draw OIDs from this node's lease of the shared
+	 * OID authority instead.  The lease path does NOT consume
+	 * ShmemVariableCache->nextOid and does NOT emit XLOG_NEXTOID (the prefetch
+	 * WAL path below runs only when shared_catalog is off); a replayed
+	 * XLOG_NEXTOID / checkpoint.nextOid merely updates the now-unused local
+	 * counter (harmless).  The authority is fail-closed: unavailability raises
+	 * 53RB, never a silent fallback to the local counter.
+	 */
+	if (cluster_shared_catalog)
+		return cluster_oid_lease_get_next();
+#endif
 
 	LWLockAcquire(OidGenLock, LW_EXCLUSIVE);
 
