@@ -240,6 +240,14 @@ extern void cluster_rtvis_undo_fetch_note_wire(void);
 extern void cluster_rtvis_undo_fetch_note_cache_hit(void);
 extern void cluster_rtvis_undo_fetch_note_failclosed(void);
 
+/* spec-6.12i CP3: recycled-slot active-runtime resolution verdicts. */
+extern uint64 cluster_rtvis_resolve_committed_count(void);
+extern uint64 cluster_rtvis_resolve_aborted_count(void);
+extern uint64 cluster_rtvis_resolve_failclosed_count(void);
+extern void cluster_rtvis_resolve_note_committed(void);
+extern void cluster_rtvis_resolve_note_aborted(void);
+extern void cluster_rtvis_resolve_note_failclosed(void);
+
 /* Shmem region register / size / init (L206 5-step). */
 extern Size cluster_cr_shmem_size(void);
 extern void cluster_cr_shmem_init(void);
