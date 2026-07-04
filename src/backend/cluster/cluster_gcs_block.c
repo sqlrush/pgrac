@@ -47,7 +47,7 @@
 #include "cluster/cluster_gcs.h"
 #include "cluster/cluster_cr_server.h" /* spec-6.12b CR-server park/fetch */
 #include "cluster/cluster_gcs_block.h"
-#include "cluster/cluster_gcs_reqid.h" /* PGRAC: spec-6.14a D1 — id domains */
+#include "cluster/cluster_gcs_reqid.h"		 /* PGRAC: spec-6.14a D1 — id domains */
 #include "cluster/cluster_gcs_block_dedup.h" /* spec-2.34 D1 — counter forward */
 #include "cluster/cluster_grd.h"			 /* spec-4.6 D4 — block_path_failclosed counter */
 #include "cluster/cluster_grd_outbound.h"
@@ -3458,16 +3458,14 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 			 */
 			if (!requester_is_s_holder) {
 				if ((holders_bm & ((uint32)1u << cluster_node_id)) != 0
-					&& gcs_block_get_ship_image(req->tag, req->sender_node, true, &page_lsn,
-												block_buf, &block_payload, &block_payload_lkey,
-												&block_payload_release_cb,
-												&block_payload_release_arg, &sf_dep_vec,
-												&sf_dep_valid))
+					&& gcs_block_get_ship_image(
+						req->tag, req->sender_node, true, &page_lsn, block_buf, &block_payload,
+						&block_payload_lkey, &block_payload_release_cb, &block_payload_release_arg,
+						&sf_dep_vec, &sf_dep_valid))
 					xvs_b2_captured = true;
 
 				if (!xvs_b2_captured) {
-					pg_atomic_fetch_add_u64(&ClusterGcsBlock->x_vs_s_no_carrier_denied_count,
-											1);
+					pg_atomic_fetch_add_u64(&ClusterGcsBlock->x_vs_s_no_carrier_denied_count, 1);
 					cluster_pcm_lock_clear_pending_x(req->tag);
 					status = GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
 					page_lsn = InvalidXLogRecPtr;
@@ -3565,9 +3563,8 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 			 * STORAGE_FALLBACK is not a legal reply here).
 			 */
 			if (!requester_is_s_holder && xvs_b2_captured) {
-				cluster_pcm_lock_master_grant_x_to(
-					req->tag, req->sender_node, page_lsn,
-					(SCN)((PageHeader)block_payload)->pd_block_scn);
+				cluster_pcm_lock_master_grant_x_to(req->tag, req->sender_node, page_lsn,
+												   (SCN)((PageHeader)block_payload)->pd_block_scn);
 				cluster_pcm_lock_clear_pending_x(req->tag);
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->x_vs_s_nonholder_grant_count, 1);
 				status = GCS_BLOCK_REPLY_GRANTED;
@@ -5604,8 +5601,7 @@ cluster_gcs_get_local_s_upgrade_grant_count(void)
 uint64
 cluster_gcs_get_x_vs_s_nonholder_grant_count(void)
 {
-	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->x_vs_s_nonholder_grant_count)
-						   : 0;
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->x_vs_s_nonholder_grant_count) : 0;
 }
 
 uint64

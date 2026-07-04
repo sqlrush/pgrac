@@ -40,8 +40,8 @@ UT_DEFINE_GLOBALS();
 
 /* Assert stub for libpgport_srv linkage under --enable-cassert (the standard
  * cluster_unit pure-test pattern). */
-void		ExceptionalCondition(const char *conditionName, const char *fileName,
-								 int lineNumber) pg_attribute_noreturn();
+void ExceptionalCondition(const char *conditionName, const char *fileName, int lineNumber)
+	pg_attribute_noreturn();
 
 void
 ExceptionalCondition(const char *conditionName, const char *fileName, int lineNumber)
@@ -61,17 +61,14 @@ UT_TEST(nonzero_always)
 
 UT_TEST(top_bit_split)
 {
-	int			nodes[] = {0, 1, 15, 31};
-	uint64		seqs[] = {1, 7, GCS_REQID_REQUESTER_SEQ_MASK};
-	int			i,
-				j;
+	int nodes[] = { 0, 1, 15, 31 };
+	uint64 seqs[] = { 1, 7, GCS_REQID_REQUESTER_SEQ_MASK };
+	int i, j;
 
-	for (i = 0; i < (int) lengthof(nodes); i++)
-	{
-		for (j = 0; j < (int) lengthof(seqs); j++)
-		{
-			uint64		req = gcs_reqid_requester(nodes[i], 3, seqs[j]);
-			uint64		loc = gcs_reqid_local_upgrade(nodes[i], seqs[j]);
+	for (i = 0; i < (int)lengthof(nodes); i++) {
+		for (j = 0; j < (int)lengthof(seqs); j++) {
+			uint64 req = gcs_reqid_requester(nodes[i], 3, seqs[j]);
+			uint64 loc = gcs_reqid_local_upgrade(nodes[i], seqs[j]);
 
 			UT_ASSERT((req & GCS_REQID_LOCAL_DOMAIN_FLAG) == 0);
 			UT_ASSERT((loc & GCS_REQID_LOCAL_DOMAIN_FLAG) != 0);
@@ -83,7 +80,7 @@ UT_TEST(node0_domains)
 {
 	/* r2-P1: node0's local-upgrade domain must stay tagged (top byte 0x80,
 	 * not 0x00) -- a plain node<<56 tag degrades to the raw counter. */
-	uint64		loc = gcs_reqid_local_upgrade(0, 5);
+	uint64 loc = gcs_reqid_local_upgrade(0, 5);
 
 	UT_ASSERT((loc >> 56) == UINT64CONST(0x80));
 	UT_ASSERT(loc != 5);
@@ -98,29 +95,22 @@ UT_TEST(cross_domain_disjoint)
 {
 	/* Distinct sources must never produce equal ids, whatever their seqs.
 	 * Sample a grid and compare every pair from different sources. */
-	int			nodes[] = {0, 1, 31};
-	int			backends[] = {0, 1, 65535};
-	uint64		seqs[] = {1, 42, GCS_REQID_REQUESTER_SEQ_MASK};
-	uint64		ids[64];
-	int			src[64];		/* source key: node*100000 + backend (or -node for local) */
-	int			n = 0;
-	int			a,
-				b,
-				s,
-				i,
-				j;
+	int nodes[] = { 0, 1, 31 };
+	int backends[] = { 0, 1, 65535 };
+	uint64 seqs[] = { 1, 42, GCS_REQID_REQUESTER_SEQ_MASK };
+	uint64 ids[64];
+	int src[64]; /* source key: node*100000 + backend (or -node for local) */
+	int n = 0;
+	int a, b, s, i, j;
 
-	for (a = 0; a < (int) lengthof(nodes); a++)
-	{
-		for (b = 0; b < (int) lengthof(backends); b++)
-			for (s = 0; s < (int) lengthof(seqs); s++)
-			{
+	for (a = 0; a < (int)lengthof(nodes); a++) {
+		for (b = 0; b < (int)lengthof(backends); b++)
+			for (s = 0; s < (int)lengthof(seqs); s++) {
 				ids[n] = gcs_reqid_requester(nodes[a], backends[b], seqs[s]);
 				src[n] = nodes[a] * 100000 + backends[b];
 				n++;
 			}
-		for (s = 0; s < (int) lengthof(seqs); s++)
-		{
+		for (s = 0; s < (int)lengthof(seqs); s++) {
 			ids[n] = gcs_reqid_local_upgrade(nodes[a], seqs[s]);
 			src[n] = -(nodes[a] + 1);
 			n++;
@@ -128,10 +118,9 @@ UT_TEST(cross_domain_disjoint)
 	}
 
 	for (i = 0; i < n; i++)
-		for (j = i + 1; j < n; j++)
-		{
+		for (j = i + 1; j < n; j++) {
 			if (src[i] == src[j])
-				continue;		/* same source: monotone counter handles it */
+				continue; /* same source: monotone counter handles it */
 			UT_ASSERT(ids[i] != ids[j]);
 		}
 }
@@ -140,8 +129,8 @@ UT_TEST(wrap_maps_to_one)
 {
 	/* A wrapped (masked-to-zero) seq becomes 1, preserving both the domain
 	 * bits and the non-zero invariant. */
-	uint64		req = gcs_reqid_requester(1, 2, UINT64CONST(1) << 40);
-	uint64		loc = gcs_reqid_local_upgrade(1, UINT64CONST(1) << 56);
+	uint64 req = gcs_reqid_requester(1, 2, UINT64CONST(1) << 40);
+	uint64 loc = gcs_reqid_local_upgrade(1, UINT64CONST(1) << 56);
 
 	UT_ASSERT((req & GCS_REQID_REQUESTER_SEQ_MASK) == UINT64CONST(1));
 	UT_ASSERT((loc & GCS_REQID_LOCAL_SEQ_MASK) == UINT64CONST(1));
@@ -154,14 +143,13 @@ UT_TEST(single_node_fallback_masks)
 	/* cluster_node_id = -1 (single-node fallback) masks to 0x7f without
 	 * touching the domain flag; no peers exist, so only self-consistency
 	 * (non-zero, in-domain) matters. */
-	uint64		req = gcs_reqid_requester(-1, 0, 9);
-	uint64		loc = gcs_reqid_local_upgrade(-1, 9);
+	uint64 req = gcs_reqid_requester(-1, 0, 9);
+	uint64 loc = gcs_reqid_local_upgrade(-1, 9);
 
 	UT_ASSERT(req != 0);
 	UT_ASSERT((req & GCS_REQID_LOCAL_DOMAIN_FLAG) == 0);
 	UT_ASSERT((loc & GCS_REQID_LOCAL_DOMAIN_FLAG) != 0);
-	UT_ASSERT(((req >> GCS_REQID_NODE_SHIFT) & GCS_REQID_NODE_MASK)
-			  == UINT64CONST(0x7f));
+	UT_ASSERT(((req >> GCS_REQID_NODE_SHIFT) & GCS_REQID_NODE_MASK) == UINT64CONST(0x7f));
 }
 
 int

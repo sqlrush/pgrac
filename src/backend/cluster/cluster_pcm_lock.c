@@ -1586,8 +1586,8 @@ uint64
 cluster_pcm_get_local_s_revoke_nonholder_failclosed_count(void)
 {
 	return ClusterPcm != NULL
-		? pg_atomic_read_u64(&ClusterPcm->local_s_revoke_nonholder_failclosed_count)
-		: 0;
+			   ? pg_atomic_read_u64(&ClusterPcm->local_s_revoke_nonholder_failclosed_count)
+			   : 0;
 }
 
 uint64
@@ -1882,18 +1882,17 @@ cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode)
 				 */
 				if (mode == PCM_LOCK_MODE_X && cur == PCM_STATE_S
 					&& (confl_x < 0 || confl_x == holder_node)) {
-					pg_atomic_fetch_add_u64(
-						&ClusterPcm->local_s_revoke_nonholder_failclosed_count, 1);
+					pg_atomic_fetch_add_u64(&ClusterPcm->local_s_revoke_nonholder_failclosed_count,
+											1);
 					LWLockRelease(&entry->entry_lock.lock);
 					if (cv_prepared)
 						ConditionVariableCancelSleep();
-					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("cluster_pcm: cross-node write needs local S residency "
-									"while other nodes cache this block"),
-							 errhint("This node holds no current copy (it never read the "
-									 "block), so revoking the remote shared copies would "
-									 "leave no provable-current image to write on.")));
+					ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									errmsg("cluster_pcm: cross-node write needs local S residency "
+										   "while other nodes cache this block"),
+									errhint("This node holds no current copy (it never read the "
+											"block), so revoking the remote shared copies would "
+											"leave no provable-current image to write on.")));
 				}
 
 				LWLockRelease(&entry->entry_lock.lock);

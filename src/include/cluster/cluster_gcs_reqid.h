@@ -75,13 +75,12 @@
 static inline uint64
 gcs_reqid_requester(int node, int backend_ord, uint64 seq)
 {
-	uint64		low = seq & GCS_REQID_REQUESTER_SEQ_MASK;
+	uint64 low = seq & GCS_REQID_REQUESTER_SEQ_MASK;
 
 	if (low == 0)
 		low = 1;
-	return (((uint64) node & GCS_REQID_NODE_MASK) << GCS_REQID_NODE_SHIFT)
-		| (((uint64) backend_ord & GCS_REQID_BACKEND_MASK) << GCS_REQID_BACKEND_SHIFT)
-		| low;
+	return (((uint64)node & GCS_REQID_NODE_MASK) << GCS_REQID_NODE_SHIFT)
+		   | (((uint64)backend_ord & GCS_REQID_BACKEND_MASK) << GCS_REQID_BACKEND_SHIFT) | low;
 }
 
 /*
@@ -91,13 +90,12 @@ gcs_reqid_requester(int node, int backend_ord, uint64 seq)
 static inline uint64
 gcs_reqid_local_upgrade(int node, uint64 seq)
 {
-	uint64		low = seq & GCS_REQID_LOCAL_SEQ_MASK;
+	uint64 low = seq & GCS_REQID_LOCAL_SEQ_MASK;
 
 	if (low == 0)
 		low = 1;
 	return GCS_REQID_LOCAL_DOMAIN_FLAG
-		| (((uint64) node & GCS_REQID_NODE_MASK) << GCS_REQID_NODE_SHIFT)
-		| low;
+		   | (((uint64)node & GCS_REQID_NODE_MASK) << GCS_REQID_NODE_SHIFT) | low;
 }
 
-#endif							/* CLUSTER_GCS_REQID_H */
+#endif /* CLUSTER_GCS_REQID_H */
