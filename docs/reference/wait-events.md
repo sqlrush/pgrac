@@ -1,6 +1,6 @@
 # Cluster wait events
 
-linkdb registers 116 cluster-specific wait events distributed across
+linkdb registers 118 cluster-specific wait events distributed across
 13 classes.  Each row in `pg_stat_cluster_wait_events` corresponds
 to one entry in this table.
 
@@ -80,7 +80,7 @@ System Change Number propagation across nodes.
 | `ScnCrossNodeCompare` | Waiting for cross-node SCN compare round-trip |
 | `ScnAdvanceBroadcast` | Waiting for SCN advance broadcast to acknowledge |
 
-## Cluster: Reconfig (5 events)
+## Cluster: Reconfig (8 events)
 
 Cluster reconfiguration after membership changes.
 
@@ -91,8 +91,11 @@ Cluster reconfiguration after membership changes.
 | `ReconfigFenceWait` | Waiting for fence (eviction) of a stale node |
 | `ReconfigMasterSelection` | Waiting for new master selection round |
 | `ReconfigBarrierWait` | Waiting at a reconfig protocol barrier |
+| `ClusterGrdShardRemaster` | Waiting during GRD shard remaster coordination |
+| `ClusterWriteFenceMarkerWrite` | Waiting for durable fence-marker majority write |
+| `ReconfigNodeRemoveCleanupWait` | Waiting for survivor cleanup ACKs during node removal |
 
-## Cluster: Recovery (5 events)
+## Cluster: Recovery (7 events)
 
 Cluster-level recovery / WAL apply.
 
@@ -103,8 +106,10 @@ Cluster-level recovery / WAL apply.
 | `RecoveryApplyPerThread` | Waiting for per-thread WAL apply slot |
 | `RecoveryUndoReplay` | Waiting for undo segment replay |
 | `RecoveryPcmStateRestore` | Waiting for PCM lock state restoration |
+| `ClusterThreadRecovery` | Waiting during cluster WAL-thread recovery orchestration |
+| `ClusterWriteFenceVerify` | Waiting while verifying a durable fence marker |
 
-## Cluster: Sinval (3 events)
+## Cluster: Sinval (6 events)
 
 Cross-node shared invalidation broadcast.
 
@@ -113,8 +118,11 @@ Cross-node shared invalidation broadcast.
 | `SinvalBroadcastSend` | Waiting for sinval broadcast send to all peers |
 | `SinvalBroadcastReceive` | Waiting for incoming sinval broadcast |
 | `SinvalInjectLocalQueue` | Waiting to inject received sinval into local queue |
+| `SinvalAckWait` | Waiting for sinval ACK barrier completion |
+| `SinvalAckSend` | Waiting while sending a sinval ACK |
+| `SinvalAckReceive` | Waiting while receiving a sinval ACK |
 
-## Cluster: Interconnect (13 events)
+## Cluster: Interconnect (9 events)
 
 Network transport layer.
 
@@ -123,18 +131,14 @@ Network transport layer.
 | `InterconnectRdmaSend` | Waiting for an RDMA send completion |
 | `InterconnectRdmaRecv` | Waiting for an RDMA receive |
 | `ClusterICRdmaPoll` | Waiting for RDMA completion-queue polling |
+| `InterconnectRdmaBusypoll` | Waiting while bounded busypoll completion draining is active |
+| `InterconnectRdmaInlineSend` | Waiting for an inline RDMA send completion |
 | `ClusterICRdmaConnect` | Waiting for RDMA connection setup |
 | `ClusterICRdmaFallback` | Waiting on the TCP fallback transport selected by the RDMA mux |
 | `InterconnectTierSwitch` | Waiting for transport tier switch (e.g. RDMA → TCP fallback) |
 | `InterconnectConnectRetry` | Waiting for an interconnect reconnection attempt |
-| `ClusterICTcpAccept` | LMON waiting on the Tier 1 listener for an incoming peer connection |
-| `ClusterICTcpConnect` | LMON waiting for an outbound nonblocking `connect(2)` to a peer to complete |
-| `ClusterICTcpRecv` | LMON waiting to read bytes from a peer socket |
-| `ClusterICTcpSend` | LMON waiting to write bytes to a peer socket |
-| `ClusterICHeartbeatWait` | LMON main loop is idle, waiting for the next heartbeat tick |
-| `ClusterICReconnect` | LMON waiting before re-attempting a connection to a peer that is currently `down` |
 
-## Cluster: Undo (8 events)
+## Cluster: Undo (4 events)
 
 Undo segment access, durable transaction-table I/O, and the local undo buffer pool.
 
@@ -144,10 +148,6 @@ Undo segment access, durable transaction-table I/O, and the local undo buffer po
 | `UndoTtLookupRemote` | Waiting for a remote transaction-table lookup |
 | `UndoSegmentFetch` | Waiting for an undo segment fetch |
 | `UndoRetentionWait` | Waiting on undo retention to expire |
-| `ClusterCRConstruct` | Waiting to construct a consistent-read block image |
-| `ClusterTTDurableIO` | Waiting on durable transaction-table slot header I/O |
-| `ClusterUndoBufFlush` | Waiting on an undo buffer write-back to storage |
-| `ClusterUndoExtentClaim` | Waiting to extend an undo segment while claiming an extent |
 
 ## Cluster: ADG (4 events)
 
@@ -179,10 +179,55 @@ Shared-storage provider and raw block-device I/O.
 | `ClusterBlockDevicePrProbe` | Waiting for SCSI-3 PR capability probe |
 | `ClusterBlockDevicePrRegister` | Waiting for SCSI-3 PR own-key registration |
 
+## Cluster: StartupPhase (5 events)
+
+Cluster startup phase barriers.
+
+| Name | Description |
+|---|---|
+| `ClusterStartupPhase0Wait` | Waiting in startup phase 0 |
+| `ClusterStartupPhase1Wait` | Waiting in startup phase 1 |
+| `ClusterStartupPhase2Wait` | Waiting in startup phase 2 |
+| `ClusterStartupPhase3Wait` | Waiting in startup phase 3 |
+| `ClusterStartupPhase4Wait` | Waiting in startup phase 4 |
+
+## Cluster: BgProc (25 events)
+
+Cluster background-process lifecycle, liveness, and internal coordination
+waits.
+
+| Name | Description |
+|---|---|
+| `ClusterBgProcLmonMainLoop` | LMON main loop wait |
+| `ClusterBgProcLckMainLoop` | LCK main loop wait |
+| `ClusterBgProcDiagMainLoop` | DIAG main loop wait |
+| `ClusterBgProcClusterStatsMainLoop` | cluster_stats main loop wait |
+| `ClusterBgProcCssdMainLoop` | CSSD main loop wait |
+| `ClusterBgProcUndoCleanerMainLoop` | undo cleaner main loop wait |
+| `ClusterUndoCleanerSegmentScan` | Undo cleaner segment-scan wait |
+| `ClusterBgProcQvotecMainLoop` | quorum-vote coordinator main loop wait |
+| `ClusterVotingDiskRead` | Voting-disk read wait |
+| `ClusterVotingDiskWrite` | Voting-disk write wait |
+| `ClusterWalThreadClaimRead` | WAL-thread claim-file read wait |
+| `ClusterWalThreadClaimWrite` | WAL-thread claim-file write wait |
+| `ClusterWalStateRead` | WAL-state registry read wait |
+| `ClusterWalStateWrite` | WAL-state registry write wait |
+| `ClusterFenceBackendInterruptCheck` | Fence backend interrupt-check wait |
+| `BgProcLmonReconfigTick` | LMON reconfiguration tick wait |
+| `ClusterLmdStartup` | LMD startup wait |
+| `ClusterLmdScan` | LMD wait-for-graph scan wait |
+| `ClusterLmdIdle` | LMD idle wait |
+| `ClusterGesS4Wait` | GES S4 caller-side wait |
+| `ClusterLmdProbe` | LMD deadlock probe handling wait |
+| `ClusterGesReplyWait` | Cross-node GES reply wait |
+| `ClusterLmdProbeCollect` | LMD probe result collection wait |
+| `ClusterLmsNativeProbeWait` | LMS native-lock probe wait |
+| `ClusterNativeProbeReplyWait` | Native-lock probe reply wait |
+
 ## Querying
 
 ```sql
--- Total registered (116):
+-- Total registered (118):
 SELECT count(*) FROM pg_stat_cluster_wait_events;
 
 -- Per-class counts:

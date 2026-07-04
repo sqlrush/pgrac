@@ -2,7 +2,8 @@
 
 Spec: `spec-6.1-rdma-transport-stack.md` and the spec-6.13 RDMA tier3
 extensions.  The detailed spec-6.13 design is
-`docs/cluster/spec-6.13-rdma-tier3-zero-copy.md`.
+`docs/cluster/spec-6.13-rdma-tier3-zero-copy.md`; the shipped evidence is
+summarised in `docs/cluster/spec-6.13-ship-report.md`.
 
 The RDMA transport is optional.  Default builds do not link libibverbs
 or librdmacm.  Build with `--with-rdma` to enable RDMA provider and mux

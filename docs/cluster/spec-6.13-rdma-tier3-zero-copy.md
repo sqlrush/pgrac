@@ -19,9 +19,14 @@ that work remains in this spec and is not split into a later spec.
 | receiver-side direct-land data path | shipped | Dedicated block-reply lane, two-SGE receive, slot correlation, LMON arm-before-send, verifier, and abort cleanup are implemented. |
 | soft-RoCE direct-land TAP | shipped opt-in | `t/334_ic_rdma_soft_roce.pl` covers tier3 block-reply lane connection and direct-land success when run with `PGRAC_RUN_RDMA_SOFT_ROCE=1` on Linux rxe. |
 
-Local ship evidence for this patch is object compilation plus
-`make -C src/test/cluster_unit check`.  The soft-RoCE TAP is an opt-in hardware
-environment test and skips outside a Linux rxe runner.
+Ship evidence for the code-bearing head is the GitHub nightly full CI
+workflow-dispatch run
+`https://github.com/sqlrush/pgrac/actions/runs/28702365954`, completed
+successfully on 2026-07-04 for commit
+`3755f1f814a09755238af1c6b00dc8a38b7a2466`.  Local evidence also included
+object compilation plus `make -C src/test/cluster_unit check`.  The soft-RoCE
+TAP is an opt-in hardware environment test and skips outside a Linux rxe
+runner.
 
 ## Goals
 

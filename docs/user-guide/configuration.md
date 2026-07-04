@@ -103,7 +103,7 @@ Selects the cluster interconnect transport.
 | `stub` (default) | Same-node operation is a no-op success.  Cross-node send raises `ERRCODE_FEATURE_NOT_SUPPORTED`.  No real wire traffic.  Suitable for single-node deployments and CI. |
 | `tier1` | TCP transport for the LMON heartbeat path between cluster nodes.  Requires every peer (including self) to be listed in `pgrac.conf` with an `interconnect_addr`.  See `pg_cluster_ic_peers` for runtime peer state. |
 | `tier2` | RDMA-capable transport mux.  Requires a binary configured with `--with-rdma`; otherwise startup fails closed with `53R22`.  When RDMA is built but unavailable at runtime, `cluster.interconnect_rdma_fallback=auto` keeps TCP fallback active. |
-| `tier3` | Reserved for mlx5 direct-verbs optimization.  Spec-6.1 fails closed with `FEATURE_NOT_SUPPORTED` until the `mlx5dv` path is implemented. |
+| `tier3` | RDMA tier3 path shipped in spec-6.13.  Requires `--with-rdma`; it prefers mlx5 direct-verbs capability when requested/available, otherwise follows `cluster.interconnect_rdma_fallback` for generic verbs or TCP fallback. |
 
 ```text
 # postgresql.conf
@@ -129,9 +129,9 @@ These settings are relevant only when `cluster.interconnect_tier` is
 | Setting | Type | Default | Context | Notes |
 |---|---|---|---|---|
 | `cluster.interconnect_rdma_fallback` | enum | `auto` | postmaster | `auto` allows TCP fallback; `off` fails closed if RDMA is unavailable. |
-| `cluster.interconnect_rdma_provider` | enum | `auto` | postmaster | `auto` and `verbs` use generic verbs.  `mlx5` is reserved and fails closed in spec-6.1. |
-| `cluster.interconnect_rdma_completion` | enum | `event` | postmaster | `event` is implemented.  `busypoll` is reserved and fails closed in spec-6.1. |
-| `cluster.interconnect_rdma_busypoll_us` | integer | `50` | sighup | Reserved busy-poll spin budget; accepted for forward compatibility but unused unless busypoll is implemented. |
+| `cluster.interconnect_rdma_provider` | enum | `auto` | postmaster | `auto` and `verbs` use generic verbs.  `mlx5` selects the tier3 mlx5 direct-verbs preference and follows the configured fallback policy if mlx5dv is unavailable. |
+| `cluster.interconnect_rdma_completion` | enum | `event` | postmaster | `event` uses completion-channel driven progress.  `busypoll` uses bounded CQ polling under `cluster.interconnect_rdma_busypoll_us`. |
+| `cluster.interconnect_rdma_busypoll_us` | integer | `50` | sighup | Bounded busy-poll spin budget for `cluster.interconnect_rdma_completion=busypoll`. |
 | `cluster.interconnect_rdma_crc_offload` | bool | `off` | postmaster | Reserved.  Enabling it fails closed in spec-6.1; block shipping always keeps application CRC32C enabled. |
 | `cluster.interconnect_rdma_inline_max` | integer | `256` | postmaster | Inline-send threshold in bytes. |
 | `cluster.interconnect_rdma_max_send_wr` | integer | `256` | postmaster | Per-peer send work-request depth. |
