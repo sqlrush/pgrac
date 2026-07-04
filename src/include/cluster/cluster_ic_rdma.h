@@ -168,11 +168,13 @@ extern bool cluster_ic_rdma_pending_outbound(int32 peer_id);
 /*
  * D5 guard surface: callers may ask whether the current active transport can
  * carry a block image by RDMA SEND-with-SGE while preserving the envelope
- * verify/quarantine/install chain.  The SGE points at a registered per-peer
- * scratch MR populated under the normal bufmgr content-lock copy contract;
- * it never borrows a live shared_buffers page across asynchronous CQ
- * completion.  False means the caller must keep the existing contiguous
- * envelope path.
+ * verify/quarantine/install chain.  A block payload may be either a
+ * registered per-peer scratch MR or a raw-pinned shared_buffers page whose
+ * address is validated against the shared_buffers MR by
+ * cluster_ic_rdma_shared_buffers_sge().  The GCS owner remains responsible
+ * for WAL flush/revalidation and release after SEND completion/fallback.
+ * False means the caller must keep the existing contiguous envelope path.
+ * This is sender-side SGE support only, not receiver direct-land.
  */
 extern bool cluster_ic_rdma_block_sge_supported(const char **reason);
 extern bool cluster_ic_rdma_shared_buffers_sge(void *addr, size_t len, uint32 *out_lkey);

@@ -3,7 +3,7 @@
  * cluster_ic_rdma.c
  *	  RDMA provider, CM/QP data path, and tier2/tier3 vtables.
  *
- * Spec: spec-6.1-rdma-transport-stack.md
+ * Spec: spec-6.1-rdma-transport-stack.md + spec-6.13 RDMA tier3
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -15,9 +15,13 @@
  *	  src/backend/cluster/cluster_ic_rdma.c
  *
  * NOTES
- *	  pgrac-original file.  Implements the spec-6.1 RDMA provider,
- *	  CM/QP ownership, CQE triage, and SEND-with-SGE scratch data path.
- *	  Live shared_buffers pages are never exposed for asynchronous RDMA DMA.
+ *	  pgrac-original file.  Implements the RDMA provider, CM/QP ownership,
+ *	  CQE triage, tier3 policy, and SEND-with-SGE block data path.  The
+ *	  block sender may expose a raw-pinned shared_buffers page as a local
+ *	  SEND SGE after WAL flush/revalidation; the receiver still verifies a
+ *	  normal envelope before install.  Direct-land receives require a
+ *	  dedicated block-reply lane and are intentionally not implemented on the
+ *	  generic RC QP.
  *
  *-------------------------------------------------------------------------
  */

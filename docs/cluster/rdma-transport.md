@@ -1,6 +1,7 @@
 # RDMA interconnect transport
 
-Spec: `spec-6.1-rdma-transport-stack.md`
+Spec: `spec-6.1-rdma-transport-stack.md` and the spec-6.13 RDMA tier3
+extensions.
 
 The RDMA transport is optional.  Default builds do not link libibverbs
 or librdmacm.  Build with `--with-rdma` to enable RDMA provider and mux
@@ -16,17 +17,20 @@ per-peer transport selection.
 | Tier | Meaning |
 |---|---|
 | `tier1` | TCP transport |
-| `tier2` | RDMA-capable mux baseline |
-| `tier3` | Reserved for mlx5 direct-verbs optimization; spec-6.1 fails closed with `FEATURE_NOT_SUPPORTED` until the `mlx5dv` path lands |
+| `tier2` | Generic verbs RDMA mux baseline |
+| `tier3` | RDMA tier that prefers mlx5 direct-verbs capability and falls back according to `cluster.interconnect_rdma_fallback` |
 
 If the binary was not built with `--with-rdma`, selecting `tier2` or
 `tier3` fails closed with SQLSTATE `53R22`
 (`cluster_ic_rdma_unavailable`).  If RDMA was built but no usable data
 path is active, `cluster.interconnect_rdma_fallback=auto` uses TCP
-fallback; `fallback=off` fails closed.  A `--with-rdma` build opens a
-verbs device and creates PD/CQ/completion-channel resources only in LMON.
-Peer traffic stays on TCP until the per-peer RDMA CM/QP handshake reaches
-connected state.
+fallback; `fallback=off` fails closed.  A `tier3` or explicit
+`cluster.interconnect_rdma_provider=mlx5` request probes mlx5dv support.
+With `fallback=auto`, a missing build/runtime mlx5 path logs the reason
+and uses generic verbs; with `fallback=off`, it fails closed.  A
+`--with-rdma` build opens a verbs device and creates
+PD/CQ/completion-channel resources only in LMON.  Peer traffic stays on
+TCP until the per-peer RDMA CM/QP handshake reaches connected state.
 
 ## pgrac.conf RDMA fields
 
@@ -54,27 +58,39 @@ peer's declared port, P_Key, and Q_Key before enabling RDMA traffic.
 ## Correctness constraints
 
 RDMA carries the same `ClusterICEnvelope` as TCP.  Block shipping must
-not bypass envelope verification.  Spec-6.1 uses a registered per-peer
-block scratch MR: the sender copies a stable page image into scratch while
-holding the buffer content lock, releases the lock, and then sends the
-scratch region by RDMA SEND-with-SGE.  This removes the unsafe live-page
-DMA window and keeps the receiver path unchanged: data lands in
-quarantine, passes the common envelope/CRC32C verification path, and is
-installed only after verification succeeds.
+not bypass envelope verification.  The receiver path is unchanged: data
+lands in the normal inbound frame buffer, passes the common
+envelope/CRC32C verification path, and is installed only after
+verification succeeds.
+
+There are two sender-side block payload sources:
+
+| Source | Use |
+|---|---|
+| Live shared_buffers SGE | Preferred for non-destructive GCS block replies when the peer is RDMA-connected and shared_buffers has an RDMA MR/lkey.  The sender raw-pins the buffer, performs the WAL flush plus HC89 single-retry revalidation, posts the page as a local SEND SGE, and releases the raw pin when the SEND path completes or falls back. |
+| Per-peer scratch MR | Fallback when live SGE is not allowed or cannot be borrowed/validated.  The sender copies the page image into registered scratch storage and sends that scratch region by RDMA SEND-with-SGE. |
 
 Destructive X-transfer replies that must drop the sender's local X copy
 before the wire reply is visible materialize the block into a local 8 KB
 buffer before the drop.  That keeps the existing single-owner
-drop-before-send rule intact; ordinary GRANTED and READ_IMAGE replies may
-use the registered scratch SGE when the peer is RDMA-connected.
+drop-before-send rule intact.  Smart Fusion reply-v2 also stays on its
+copy-based payload path.  Ordinary GRANTED and READ_IMAGE replies may use
+the live SGE path first and fall back to scratch/copy/TCP.
 
 Application-level CRC32C remains mandatory for block shipping.
-`cluster.interconnect_rdma_crc_offload=on` fails closed in spec-6.1 and
-does not disable block-image CRC.
-`cluster.interconnect_rdma_completion=busypoll` and
-`cluster.interconnect_rdma_provider=mlx5` are reserved settings in
-spec-6.1; selecting either fails with `FEATURE_NOT_SUPPORTED` rather than
-silently behaving like generic event-driven verbs.
+`cluster.interconnect_rdma_crc_offload=on` still fails closed and does
+not disable block-image CRC.  `cluster.interconnect_rdma_completion`
+supports event-driven completions and bounded busypoll completions.
+`cluster.interconnect_rdma_provider=mlx5` selects the tier3 provider
+when the binary and device expose mlx5dv capability; otherwise it follows
+the configured fallback policy.
+
+Receiver direct-land is not implemented on the generic RC QP.  The
+current QP has a single receive lane and one receive SGE, so a block
+reply cannot safely pre-post a sidecar + target-page receive on that lane
+without risking FIFO consumption by an unrelated message.  Direct-land
+requires a dedicated block-reply QP/lane, two-SGE receive posting, and an
+LMON send-before-arm handoff.
 
 ## Hardening
 
@@ -82,11 +98,11 @@ Spec-6.1 uses SQLSTATE `58R16` for RDMA fabric/provider failures.
 `58R14` and `58R15` remain owned by the spec-6.0a shared-storage backend
 and are not reused by the RDMA transport.
 
-The block data path is copy-into-scratch, not zero-copy DMA from live
-shared buffers.  The sender copies the page image into registered
-per-peer scratch storage before posting RDMA SEND-with-SGE, so no
-asynchronous work request can retain a live buffer-content lock or a
-pointer into shared_buffers.
+The live SGE path never holds a buffer content lock across asynchronous
+RDMA completion.  It relies on a raw pin to prevent buffer reuse and on
+the existing block checksum/envelope verification to fail closed if page
+contents drift after revalidation.  Scratch SGE and TCP fallback remain
+available whenever the live page cannot be borrowed or registered.
 
 Inbound frames are verified before dispatch or block install.  CQE
 triage treats local-protection and provider programming failures as
@@ -108,5 +124,12 @@ TCP fallback events under `Cluster: Interconnect`.  Use
 
 `pg_stat_cluster_ic` exposes the mux state: per-peer transport,
 RDMA state, provider, RDMA address metadata, MR registration status, CQ
-depth, fallback count, byte counters, SEND-with-SGE block counters, and
-last error summary.
+depth, fallback count, byte counters, SEND-with-SGE block counters,
+tier3 send count, inline send count, unsignaled batch count, busypoll
+burn/fallback counters, and last error summary.
+
+`dump_cluster_state` exposes GCS-side copy-path counters:
+`scratch_copy_count`, `live_sge_send_count`, `live_sge_fallback_count`,
+`direct_install_count`, `direct_install_abort_count`, and
+`install_copy_count`.  The direct-install counters are reserved until the
+dedicated block-reply direct-land lane lands.
