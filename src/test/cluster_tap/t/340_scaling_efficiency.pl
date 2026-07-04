@@ -1,9 +1,21 @@
 #!/usr/bin/env perl
-# spec-6.12 scaling-efficiency probe (report-only, run via make check).
-#   READ  scenario: pgbench -S    WRITE scenario: pgbench -N
-#   solo (node0 alone) vs pair (node0+node1 concurrent).
-#   efficiency = pair_tps / (2 * solo_tps); decay = 1 - efficiency.
-# All 6.12 waves ON.  Env: SC_SECS(8) SC_CLIENTS(4) SC_SCALE(10).
+#-------------------------------------------------------------------------
+#
+# 340_scaling_efficiency.pl
+#	  spec-6.12 scaling-efficiency probe (report-only, run via make check).
+#	  READ  scenario: pgbench -S    WRITE scenario: pgbench -N
+#	  solo (node0 alone) vs pair (node0+node1 concurrent).
+#	  efficiency = pair_tps / (2 * solo_tps); decay = 1 - efficiency.
+#	  All 6.12 waves ON.  Env: SC_SECS(8) SC_CLIENTS(4) SC_SCALE(10).
+#
+# Author: SqlRush <sqlrush@gmail.com>
+#
+# Portions Copyright (c) 2026, pgrac contributors
+#
+# IDENTIFICATION
+#	  src/test/cluster_tap/t/340_scaling_efficiency.pl
+#
+#-------------------------------------------------------------------------
 use strict;
 use warnings;
 use FindBin;
