@@ -161,6 +161,16 @@ extern bool cluster_oid_authority_read(Oid *next_oid);
  */
 extern void cluster_oid_authority_write(Oid next_oid);
 
+/*
+ * cluster_oid_authority_seed_if_absent -- create the shared OID authority with
+ *	an initial high-water of max(FirstNormalObjectId, initial_next_oid) IF it
+ *	does not already exist (D2 seed node).  A join node whose authority already
+ *	exists is a no-op (returns false).  Returns true when it seeded.  Idempotent
+ *	for the normal seed-then-join bring-up (a designated seed node comes up
+ *	first).  Never lowers an existing high-water.
+ */
+extern bool cluster_oid_authority_seed_if_absent(Oid initial_next_oid);
+
 /* ---- shmem lease + refill (cluster_oid_lease_shmem.c, backend) ---------- */
 
 extern Size cluster_oid_lease_shmem_size(void);

@@ -355,10 +355,34 @@ UT_TEST(test_authority_primary_corrupt_falls_back_to_bak)
 	UT_ASSERT_EQ(got, 111111u);
 }
 
+UT_TEST(test_authority_seed_if_absent)
+{
+	Oid			got = 0;
+
+	setup_shared_dir();
+	unlink_authority();
+
+	/* absent -> seeds with normalized initial (a low value is forced up). */
+	UT_ASSERT_EQ(cluster_oid_authority_seed_if_absent(5), true);
+	UT_ASSERT_EQ(cluster_oid_authority_read(&got), true);
+	UT_ASSERT_EQ(got, (Oid) FirstNormalObjectId);
+
+	/* present -> no-op (does not lower or change the existing high-water). */
+	UT_ASSERT_EQ(cluster_oid_authority_seed_if_absent(1000000), false);
+	UT_ASSERT_EQ(cluster_oid_authority_read(&got), true);
+	UT_ASSERT_EQ(got, (Oid) FirstNormalObjectId);	/* unchanged */
+
+	/* a higher initial on a fresh authority seeds that value. */
+	unlink_authority();
+	UT_ASSERT_EQ(cluster_oid_authority_seed_if_absent(500000), true);
+	UT_ASSERT_EQ(cluster_oid_authority_read(&got), true);
+	UT_ASSERT_EQ(got, 500000u);
+}
+
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(11);
 	UT_RUN(test_normalize_forces_reserved_up);
 	UT_RUN(test_carve_basic_block);
 	UT_RUN(test_carve_normalizes_reserved_hw);
@@ -369,6 +393,7 @@ main(void)
 	UT_RUN(test_classify_short_and_magic_and_crc);
 	UT_RUN(test_authority_write_read_round_trip);
 	UT_RUN(test_authority_primary_corrupt_falls_back_to_bak);
+	UT_RUN(test_authority_seed_if_absent);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

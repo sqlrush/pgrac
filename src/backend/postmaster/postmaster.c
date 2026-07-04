@@ -184,6 +184,7 @@
  * banner above for the HC1 rationale.
  */
 #include "cluster/cluster_cf_storage.h" /* cluster_cf_startup_prepare (spec-5.6 Da3) */
+#include "cluster/cluster_catalog_bootstrap.h" /* cluster_catalog_startup_prepare (spec-6.14 D2) */
 #include "cluster/cluster_fence.h" /* cluster_fence_postmaster_check (spec-2.28 D6) */
 #include "cluster/cluster_guc.h"   /* cluster_enabled (spec-1.11 Sprint B) */
 #include "cluster/cluster_lmd.h"   /* cluster_lmd_mark_child_exit (spec-2.19 D12 hardening) */
@@ -1111,6 +1112,14 @@ PostmasterMain(int argc, char *argv[])
 	 * control file.  A no-op unless the authority is enabled (default off).
 	 */
 	cluster_cf_startup_prepare(DataDir);
+
+	/*
+	 * PGRAC: spec-6.14 D2.  With the shared pg_control authority established
+	 * above, seed the shared catalog authorities (OID high-water) from it when
+	 * cluster.shared_catalog is on.  Seed node creates them; join node adopts.
+	 * No-op when shared_catalog is off (default).
+	 */
+	cluster_catalog_startup_prepare();
 #endif
 
 	/*

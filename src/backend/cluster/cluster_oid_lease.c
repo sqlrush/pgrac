@@ -323,3 +323,20 @@ cluster_oid_authority_write(Oid next_oid)
 	roll_primary_to_bak(primary, bak, baktmp);
 	write_durable(tmp, primary, buffer);
 }
+
+/*
+ * cluster_oid_authority_seed_if_absent -- see header.  Read-then-seed: if the
+ * authority is already present (any trustworthy image) do nothing; otherwise
+ * write the normalized initial high-water.
+ */
+bool
+cluster_oid_authority_seed_if_absent(Oid initial_next_oid)
+{
+	Oid			existing;
+
+	if (cluster_oid_authority_read(&existing))
+		return false;			/* already seeded (join node / prior seed) */
+
+	cluster_oid_authority_write(cluster_oid_lease_normalize_start(initial_next_oid));
+	return true;
+}
