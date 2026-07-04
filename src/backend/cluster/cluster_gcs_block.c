@@ -224,6 +224,13 @@ typedef struct ClusterGcsBlockShared {
 	 * request to borrow an id from; uniqueness vs stale acks is all the
 	 * slot needs). */
 	pg_atomic_uint64 local_upgrade_request_seq;
+	/* PGRAC: spec-6.13 D8 — RDMA tier3/direct-land copy observability. */
+	pg_atomic_uint64 scratch_copy_count;
+	pg_atomic_uint64 live_sge_send_count;
+	pg_atomic_uint64 live_sge_fallback_count;
+	pg_atomic_uint64 direct_install_count;
+	pg_atomic_uint64 direct_install_abort_count;
+	pg_atomic_uint64 install_copy_count;
 } ClusterGcsBlockShared;
 
 
@@ -382,6 +389,13 @@ cluster_gcs_block_shmem_init(void)
 		ConditionVariableInit(&ClusterGcsBlock->invalidate_broadcast_cv);
 		/* PGRAC: spec-6.12a — local-upgrade broadcast id source. */
 		pg_atomic_init_u64(&ClusterGcsBlock->local_upgrade_request_seq, 0);
+		/* PGRAC: spec-6.13 D8 — RDMA tier3/direct-land copy counters init. */
+		pg_atomic_init_u64(&ClusterGcsBlock->scratch_copy_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->live_sge_send_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->live_sge_fallback_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->direct_install_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->direct_install_abort_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->install_copy_count, 0);
 
 		if (gcs_block_backend_blocks == NULL)
 			return;
@@ -534,6 +548,27 @@ gcs_block_release_ship_image(ClusterICSgeReleaseCallback release_cb, void *relea
 		release_cb(release_arg);
 }
 
+static void
+gcs_block_note_scratch_copy(void)
+{
+	if (ClusterGcsBlock != NULL)
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->scratch_copy_count, 1);
+}
+
+static void
+gcs_block_note_live_sge_fallback(void)
+{
+	if (ClusterGcsBlock != NULL)
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->live_sge_fallback_count, 1);
+}
+
+static void
+gcs_block_note_install_copy(void)
+{
+	if (ClusterGcsBlock != NULL)
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->install_copy_count, 1);
+}
+
 static bool
 gcs_block_get_ship_image(BufferTag tag, int32 dest_node, XLogRecPtr *out_page_lsn, char *copy_buf,
 						 const char **out_block_payload, uint32 *out_block_lkey,
@@ -578,6 +613,7 @@ gcs_block_get_ship_image(BufferTag tag, int32 dest_node, XLogRecPtr *out_page_ls
 					release_cb(release_arg);
 				return false;
 			}
+			gcs_block_note_scratch_copy();
 			if (smart_fusion_reply && out_sf_dep_valid != NULL)
 				*out_sf_dep_valid = true;
 			*out_block_payload = (const char *)scratch;
@@ -589,6 +625,7 @@ gcs_block_get_ship_image(BufferTag tag, int32 dest_node, XLogRecPtr *out_page_ls
 				*out_release_arg = release_arg;
 			return true;
 		}
+		gcs_block_note_live_sge_fallback();
 	}
 
 	if (smart_fusion_reply) {
@@ -597,8 +634,11 @@ gcs_block_get_ship_image(BufferTag tag, int32 dest_node, XLogRecPtr *out_page_ls
 			return false;
 		if (out_sf_dep_valid != NULL)
 			*out_sf_dep_valid = true;
+		gcs_block_note_scratch_copy();
 	} else if (!cluster_bufmgr_copy_block_for_gcs(tag, out_page_lsn, copy_buf))
 		return false;
+	else
+		gcs_block_note_scratch_copy();
 	*out_block_payload = copy_buf;
 	if (out_block_lkey != NULL)
 		*out_block_lkey = 0;
@@ -680,6 +720,7 @@ gcs_block_install_block(BufferDesc *buf, const char *block_data, XLogRecPtr page
 	LWLockAcquire(content_lock, LW_EXCLUSIVE);
 	page = BufferGetPage(BufferDescriptorGetBuffer(buf));
 	memcpy(page, block_data, GCS_BLOCK_DATA_SIZE);
+	gcs_block_note_install_copy();
 	PageSetLSN(page, page_lsn);
 	LWLockRelease(content_lock);
 }
@@ -2587,6 +2628,8 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 			fwd.requester_backend_id = req->requester_backend_id;
 			fwd.master_node = cluster_node_id;
 			fwd.transition_id = req->transition_id;
+			GcsBlockForwardPayloadSetDirectLandArmed(
+				&fwd, GcsBlockRequestPayloadIsDirectLandArmed(req));
 			/* PGRAC: spec-2.37 D3 HC127 (spec-2.41 SCN migration) — stamp
 			 * expected pi_watermark_scn so the holder can validate the copied
 			 * page's pd_block_scn before ship. */
@@ -2889,6 +2932,8 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 				fwd.requester_backend_id = req->requester_backend_id;
 				fwd.master_node = cluster_node_id;
 				fwd.transition_id = req->transition_id;
+				GcsBlockForwardPayloadSetDirectLandArmed(
+					&fwd, GcsBlockRequestPayloadIsDirectLandArmed(req));
 				/* PGRAC: spec-2.37 D3 HC127 (spec-2.41 SCN migration) — stamp
 				 * expected pi_watermark_scn. */
 				GcsBlockForwardPayloadSetExpectedPiWatermarkScn(
@@ -3136,6 +3181,8 @@ x_path_skipped:
 				fwd.requester_backend_id = req->requester_backend_id;
 				fwd.master_node = cluster_node_id;
 				fwd.transition_id = req->transition_id;
+				GcsBlockForwardPayloadSetDirectLandArmed(
+					&fwd, GcsBlockRequestPayloadIsDirectLandArmed(req));
 				GcsBlockForwardPayloadSetExpectedPiWatermarkScn(
 					&fwd, cluster_pcm_lock_pi_watermark_scn_query(req->tag));
 				/* D2: tell the holder to ship a read image and keep its X. */
@@ -3206,6 +3253,8 @@ x_path_skipped:
 			fwd.requester_backend_id = req->requester_backend_id;
 			fwd.master_node = cluster_node_id;
 			fwd.transition_id = req->transition_id;
+			GcsBlockForwardPayloadSetDirectLandArmed(
+				&fwd, GcsBlockRequestPayloadIsDirectLandArmed(req));
 			/* PGRAC: spec-2.37 D3 HC127 (spec-2.41 SCN migration) — stamp
 			 * expected pi_watermark_scn so the holder can validate the copied
 			 * page's pd_block_scn before ship. */
@@ -4549,6 +4598,43 @@ uint64
 cluster_gcs_get_block_ship_bytes_total(void)
 {
 	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->block_ship_bytes_total) : 0;
+}
+
+/* PGRAC: spec-6.13 D8 — RDMA tier3/direct-land copy observability. */
+uint64
+cluster_gcs_get_scratch_copy_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->scratch_copy_count) : 0;
+}
+
+uint64
+cluster_gcs_get_live_sge_send_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->live_sge_send_count) : 0;
+}
+
+uint64
+cluster_gcs_get_live_sge_fallback_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->live_sge_fallback_count) : 0;
+}
+
+uint64
+cluster_gcs_get_direct_install_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->direct_install_count) : 0;
+}
+
+uint64
+cluster_gcs_get_direct_install_abort_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->direct_install_abort_count) : 0;
+}
+
+uint64
+cluster_gcs_get_install_copy_count(void)
+{
+	return ClusterGcsBlock ? pg_atomic_read_u64(&ClusterGcsBlock->install_copy_count) : 0;
 }
 
 

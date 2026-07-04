@@ -2039,11 +2039,16 @@ pg_stat_cluster_ic| SELECT node_id,
     bytes_recv,
     block_sge_send_count,
     block_sge_fallback_count,
+    tier3_send_count,
+    inline_send_count,
+    unsignaled_batch_count,
+    busypoll_us_burned,
+    busypoll_fallback_count,
     latency_us_sum,
     latency_sample_count,
     last_error_code,
     last_error
-   FROM cluster_get_ic_rdma_peers() cluster_get_ic_rdma_peers(node_id, transport, rdma_state, provider, rdma_addr, rdma_gid, rdma_port, mr_registered, cq_depth, fallback_count, send_count, recv_count, bytes_send, bytes_recv, block_sge_send_count, block_sge_fallback_count, latency_us_sum, latency_sample_count, last_error_code, last_error);
+   FROM cluster_get_ic_rdma_peers() cluster_get_ic_rdma_peers(node_id, transport, rdma_state, provider, rdma_addr, rdma_gid, rdma_port, mr_registered, cq_depth, fallback_count, send_count, recv_count, bytes_send, bytes_recv, block_sge_send_count, block_sge_fallback_count, tier3_send_count, inline_send_count, unsignaled_batch_count, busypoll_us_burned, busypoll_fallback_count, latency_us_sum, latency_sample_count, last_error_code, last_error);
 pg_stat_cluster_injections| SELECT name,
     fault_type,
     param,

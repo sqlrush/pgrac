@@ -518,6 +518,22 @@ GcsBlockRequestPayloadIsCleanEligible(const GcsBlockRequestPayload *p)
 	return p->reserved_0[0] != 0;
 }
 
+/* PGRAC: spec-6.13 D6 — direct-land arming flag carried in REQUEST
+ * reserved_0[1].  REQUEST bytes are independent from FORWARD bytes; [0] is
+ * the clean-page X-transfer eligibility flag above and [1] was previously
+ * unused. */
+static inline void
+GcsBlockRequestPayloadSetDirectLandArmed(GcsBlockRequestPayload *p, bool armed)
+{
+	p->reserved_0[1] = armed ? (uint8)1 : (uint8)0;
+}
+
+static inline bool
+GcsBlockRequestPayloadIsDirectLandArmed(const GcsBlockRequestPayload *p)
+{
+	return p->reserved_0[1] != 0;
+}
+
 
 /* ============================================================
  * GcsBlockReplyHeader -- wire ABI for PGRAC_IC_MSG_GCS_BLOCK_REPLY
@@ -961,6 +977,22 @@ GcsBlockForwardPayloadIsCrRequest(const GcsBlockForwardPayload *p)
 	return p->reserved_0[4] != 0;
 }
 
+/* PGRAC: spec-6.13 D6 — direct-land arming flag on FORWARD uses
+ * reserved_0[5].  The frozen spec text mentioned [3], but spec-6.12a already
+ * uses [3] for downgrade-request and spec-6.12b uses [4] for CR request; [5]
+ * is the first remaining free byte in the 7-byte FORWARD reserved area. */
+static inline void
+GcsBlockForwardPayloadSetDirectLandArmed(GcsBlockForwardPayload *p, bool armed)
+{
+	p->reserved_0[5] = armed ? (uint8)1 : (uint8)0;
+}
+
+static inline bool
+GcsBlockForwardPayloadIsDirectLandArmed(const GcsBlockForwardPayload *p)
+{
+	return p->reserved_0[5] != 0;
+}
+
 /* PGRAC: spec-5.2 D2 — pure master-side decision for an N→S read request
  * when the block is held in X.  Kept pure (no shmem / no I/O) so the gate
  * truth table is unit-tested standalone (U3). */
@@ -1321,6 +1353,13 @@ extern uint64 cluster_gcs_get_block_storage_fallback_count(void);
 extern uint64 cluster_gcs_get_block_master_not_holder_count(void);
 extern uint64 cluster_gcs_get_block_wal_flush_before_ship_count(void);
 extern uint64 cluster_gcs_get_block_ship_bytes_total(void);
+/* PGRAC: spec-6.13 D8 — RDMA tier3/direct-land copy observability. */
+extern uint64 cluster_gcs_get_scratch_copy_count(void);
+extern uint64 cluster_gcs_get_live_sge_send_count(void);
+extern uint64 cluster_gcs_get_live_sge_fallback_count(void);
+extern uint64 cluster_gcs_get_direct_install_count(void);
+extern uint64 cluster_gcs_get_direct_install_abort_count(void);
+extern uint64 cluster_gcs_get_install_copy_count(void);
 
 /* ============================================================
  * spec-2.34 D1 — reliability hardening counter accessors (9 NEW).

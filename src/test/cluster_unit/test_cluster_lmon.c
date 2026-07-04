@@ -192,6 +192,7 @@ char *cluster_injection_points = NULL;
  */
 bool cluster_enabled = false;
 int cluster_interconnect_tier = 0; /* CLUSTER_IC_TIER_STUB */
+int cluster_interconnect_rdma_completion = 0; /* CLUSTER_IC_RDMA_COMPLETION_EVENT */
 
 /* spec-2.2 D7 GUCs (cluster_lmon.c references heartbeat_interval_ms). */
 int cluster_interconnect_heartbeat_interval_ms = 1000;

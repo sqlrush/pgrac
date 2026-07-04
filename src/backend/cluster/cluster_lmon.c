@@ -1385,13 +1385,20 @@ LmonMain(void)
 
 			now = GetCurrentTimestamp();
 			wait_ms = (next_heartbeat_at > now) ? (long)((next_heartbeat_at - now) / 1000) : 0;
-			if (wait_ms < 0)
-				wait_ms = 0;
-			if (wait_ms > HEARTBEAT_INTERVAL_MS)
-				wait_ms = HEARTBEAT_INTERVAL_MS;
+				if (wait_ms < 0)
+					wait_ms = 0;
+				if (wait_ms > HEARTBEAT_INTERVAL_MS)
+					wait_ms = HEARTBEAT_INTERVAL_MS;
+				if ((ic_tier == CLUSTER_IC_TIER_2 || ic_tier == CLUSTER_IC_TIER_3)
+					&& (ClusterICRdmaCompletionModel)cluster_interconnect_rdma_completion
+						   == CLUSTER_IC_RDMA_COMPLETION_BUSYPOLL) {
+					cluster_ic_rdma_lmon_handle_completion_events();
+					if (wait_ms > 1)
+						wait_ms = 1;
+				}
 
-			n_events = WaitEventSetWait(wes, wait_ms, ev, lengthof(ev),
-										WAIT_EVENT_CLUSTER_IC_HEARTBEAT_WAIT);
+				n_events = WaitEventSetWait(wes, wait_ms, ev, lengthof(ev),
+											WAIT_EVENT_CLUSTER_IC_HEARTBEAT_WAIT);
 
 			for (i = 0; i < n_events; i++) {
 				intptr_t tag = (intptr_t)ev[i].user_data;

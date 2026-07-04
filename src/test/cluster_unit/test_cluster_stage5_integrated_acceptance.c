@@ -189,10 +189,10 @@ UT_TEST(test_stage5_sqlstate_acceptance_surface_encodable)
 UT_TEST(test_stage5_wait_events_count_and_multinode_set)
 {
 	/* Current Stage 5 surface value; spec-6.2 adds the latest 4 Smart Fusion
-	 * authority waits.  update-required contract: a future spec adding cluster
-	 * wait events MUST bump this snapshot (and the dump/test baselines that
-	 * count them). */
-	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 116);
+	 * authority waits and spec-6.13 adds 2 RDMA tier3 waits.  update-required
+	 * contract: a future spec adding cluster wait events MUST bump this snapshot
+	 * (and the dump/test baselines that count them). */
+	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 118);
 
 	/* The multi-node write-path wait events MG-B aggregates for the M2 share
 	 * must all be present and pairwise distinct (a reorder/removal would change

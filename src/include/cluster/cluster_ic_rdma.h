@@ -76,6 +76,34 @@ typedef struct ClusterICSge {
 	void *release_arg;
 } ClusterICSge;
 
+/*
+ * spec-6.13 D3/D6 constants.  Keep these header-visible so cluster_unit can
+ * pin the queue-depth policy and block-reply direct-land wire size without
+ * linking the backend RDMA implementation.
+ */
+#define CLUSTER_IC_RDMA_SIGNAL_BATCH_CAP 32
+#define CLUSTER_IC_RDMA_DIRECT_LAND_SIDECAR_BYTES 84
+#define CLUSTER_IC_RDMA_DIRECT_LAND_REPLY_BYTES \
+	(CLUSTER_IC_RDMA_DIRECT_LAND_SIDECAR_BYTES + BLCKSZ)
+
+static inline uint32
+cluster_ic_rdma_signal_batch_k(uint32 max_send_wr)
+{
+	uint32 k = max_send_wr / 2;
+
+	if (k == 0)
+		k = 1;
+	if (k > CLUSTER_IC_RDMA_SIGNAL_BATCH_CAP)
+		k = CLUSTER_IC_RDMA_SIGNAL_BATCH_CAP;
+	return k;
+}
+
+static inline bool
+cluster_ic_rdma_payload_inline_eligible(uint32 payload_len, int inline_max)
+{
+	return inline_max > 0 && payload_len <= (uint32)inline_max;
+}
+
 typedef struct ClusterICRdmaCtx ClusterICRdmaCtx;
 typedef struct ClusterICQp ClusterICQp;
 typedef struct ClusterICWc ClusterICWc;
@@ -86,7 +114,7 @@ typedef struct ClusterICRdmaProvider {
 	bool (*reg_region)(ClusterICRdmaCtx *ctx, void *base, size_t len, ClusterICMr *out);
 	bool (*qp_create)(ClusterICRdmaCtx *ctx, int32 peer, ClusterICQp *out);
 	ClusterICSendResult (*post_send)(ClusterICQp *qp, const ClusterICSge *sge, int n_sge,
-									 bool signaled, uint32 imm);
+									 bool signaled, bool inline_send, uint32 imm);
 	bool (*post_recv)(ClusterICQp *qp, ClusterICSge *sge);
 	int (*poll_cq)(ClusterICRdmaCtx *ctx, ClusterICWc *out, int max);
 	void (*device_close)(ClusterICRdmaCtx *ctx);

@@ -14317,6 +14317,59 @@ else
 fi
 
 
+  ac_fn_c_check_header_mongrel "$LINENO" "infiniband/mlx5dv.h" "ac_cv_header_infiniband_mlx5dv_h" "$ac_includes_default"
+if test "x$ac_cv_header_infiniband_mlx5dv_h" = xyes; then :
+  cat >>confdefs.h <<_ACEOF
+#define HAVE_INFINIBAND_MLX5DV_H 1
+_ACEOF
+
+  { $as_echo "$as_me:${as_lineno-$LINENO}: checking for mlx5dv_query_device in -lmlx5" >&5
+$as_echo_n "checking for mlx5dv_query_device in -lmlx5... " >&6; }
+if ${ac_cv_lib_mlx5_mlx5dv_query_device+:} false; then :
+  $as_echo_n "(cached) " >&6
+else
+  ac_check_lib_save_LIBS=$LIBS
+LIBS="-lmlx5  $LIBS"
+cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+/* Override any GCC internal prototype to avoid an error.
+   Use char because int might match the return type of a GCC
+   builtin and then its argument prototype would still apply.  */
+#ifdef __cplusplus
+extern "C"
+#endif
+char mlx5dv_query_device ();
+int
+main ()
+{
+return mlx5dv_query_device ();
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_link "$LINENO"; then :
+  ac_cv_lib_mlx5_mlx5dv_query_device=yes
+else
+  ac_cv_lib_mlx5_mlx5dv_query_device=no
+fi
+rm -f core conftest.err conftest.$ac_objext \
+    conftest$ac_exeext conftest.$ac_ext
+LIBS=$ac_check_lib_save_LIBS
+fi
+{ $as_echo "$as_me:${as_lineno-$LINENO}: result: $ac_cv_lib_mlx5_mlx5dv_query_device" >&5
+$as_echo "$ac_cv_lib_mlx5_mlx5dv_query_device" >&6; }
+if test "x$ac_cv_lib_mlx5_mlx5dv_query_device" = xyes; then :
+
+$as_echo "#define HAVE_MLX5DV 1" >>confdefs.h
+
+  LIBS="-lmlx5 $LIBS"
+
+fi
+
+fi
+
+
 fi
 
 if test "$with_gssapi" = yes ; then

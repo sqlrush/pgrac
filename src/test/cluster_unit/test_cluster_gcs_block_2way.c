@@ -356,10 +356,44 @@ UT_TEST(test_cr_result_statuses_are_16_17)
 }
 
 
+/* PGRAC: spec-6.13 D6 — direct-land FORWARD flag uses reserved_0[5], not the
+ * frozen-spec [3] byte that spec-6.12a already occupies for downgrade. */
+UT_TEST(test_direct_land_forward_flag_round_trip_independent)
+{
+	GcsBlockForwardPayload fwd;
+
+	memset(&fwd, 0, sizeof(fwd));
+	UT_ASSERT(!GcsBlockForwardPayloadIsDirectLandArmed(&fwd));
+
+	GcsBlockForwardPayloadSetReadImage(&fwd, true);
+	GcsBlockForwardPayloadSetXTransfer(&fwd, true);
+	GcsBlockForwardPayloadSetCleanEligible(&fwd, true);
+	GcsBlockForwardPayloadSetDowngradeRequest(&fwd, true);
+	GcsBlockForwardPayloadSetCrRequest(&fwd, true);
+	GcsBlockForwardPayloadSetDirectLandArmed(&fwd, true);
+
+	UT_ASSERT(GcsBlockForwardPayloadIsReadImage(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsXTransfer(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsCleanEligible(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsDowngradeRequest(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsCrRequest(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsDirectLandArmed(&fwd));
+
+	GcsBlockForwardPayloadSetDirectLandArmed(&fwd, false);
+	UT_ASSERT(!GcsBlockForwardPayloadIsDirectLandArmed(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsReadImage(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsXTransfer(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsCleanEligible(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsDowngradeRequest(&fwd));
+	UT_ASSERT(GcsBlockForwardPayloadIsCrRequest(&fwd));
+	UT_ASSERT_EQ((int)sizeof(GcsBlockForwardPayload), 64);
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(27);
 	UT_RUN(test_block_forward_msg_type_is_16);
 	UT_RUN(test_granted_from_holder_status_is_8);
 	UT_RUN(test_forward_payload_size_locked_at_64);
@@ -386,6 +420,7 @@ main(void)
 	UT_RUN(test_s_granted_xholder_downgrade_status_is_15);
 	UT_RUN(test_cr_request_flag_round_trip_independent);
 	UT_RUN(test_cr_result_statuses_are_16_17);
+	UT_RUN(test_direct_land_forward_flag_round_trip_independent);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

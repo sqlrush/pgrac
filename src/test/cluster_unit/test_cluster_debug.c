@@ -931,6 +931,36 @@ cluster_gcs_get_block_ship_bytes_total(void)
 {
 	return 0;
 }
+uint64
+cluster_gcs_get_scratch_copy_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_live_sge_send_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_live_sge_fallback_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_direct_install_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_direct_install_abort_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_install_copy_count(void)
+{
+	return 0;
+}
 
 /* spec-2.34 D10 stubs: 9 NEW reliability hardening counter accessors. */
 uint64

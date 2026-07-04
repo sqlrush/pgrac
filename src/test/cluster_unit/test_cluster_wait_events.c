@@ -199,8 +199,8 @@ UT_TEST(test_last_event_per_category_in_class)
 
 /* ----------
  * Per-category event counts match the design doc roster
- *  (GES 5, PCM 8, BufferShip 5, SCN 4, Reconfig 5, Recovery 6,
- *   Sinval 3, Interconnect 7, Undo 8, ADG 4, SharedFs 12 -- plus later
+	 *  (GES 5, PCM 8, BufferShip 5, SCN 4, Reconfig 5, Recovery 6,
+	 *   Sinval 3, Interconnect 9, Undo 8, ADG 4, SharedFs 12 -- plus later
  *   subsystem classes, total tracked by CLUSTER_WAIT_EVENTS_COUNT).
  *
  *	Use (last - first + 1) within each category as the count.
@@ -234,7 +234,7 @@ UT_TEST(test_per_category_event_counts)
 				 3);
 	UT_ASSERT_EQ((uint32)WAIT_EVENT_INTERCONNECT_CONNECT_RETRY
 					 - (uint32)WAIT_EVENT_INTERCONNECT_RDMA_SEND + 1,
-				 7);
+				 9);
 	/* Undo category: 4 (AD-010) + CR_CONSTRUCT (spec-3.9) + TT_DURABLE_IO
 	 * (spec-3.11) + BUF_FLUSH + EXTENT_CLAIM (spec-3.18 D7) = 8.  Count the
 	 * full range to the last event so future additions are caught here (F12). */

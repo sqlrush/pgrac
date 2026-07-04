@@ -1771,6 +1771,19 @@ dump_gcs(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_gcs_get_block_wal_flush_before_ship_count()));
 	emit_row(rsinfo, "gcs", "block_ship_bytes_total",
 			 fmt_int64((int64)cluster_gcs_get_block_ship_bytes_total()));
+	/* spec-6.13 D8: RDMA tier3/direct-land copy path observability. */
+	emit_row(rsinfo, "gcs", "scratch_copy_count",
+			 fmt_int64((int64)cluster_gcs_get_scratch_copy_count()));
+	emit_row(rsinfo, "gcs", "live_sge_send_count",
+			 fmt_int64((int64)cluster_gcs_get_live_sge_send_count()));
+	emit_row(rsinfo, "gcs", "live_sge_fallback_count",
+			 fmt_int64((int64)cluster_gcs_get_live_sge_fallback_count()));
+	emit_row(rsinfo, "gcs", "direct_install_count",
+			 fmt_int64((int64)cluster_gcs_get_direct_install_count()));
+	emit_row(rsinfo, "gcs", "direct_install_abort_count",
+			 fmt_int64((int64)cluster_gcs_get_direct_install_abort_count()));
+	emit_row(rsinfo, "gcs", "install_copy_count",
+			 fmt_int64((int64)cluster_gcs_get_install_copy_count()));
 
 	/* spec-2.34 D10:  9 NEW reliability hardening counter rows
 	 * (dump_gcs 22 → 31 row).  Mirrors counters in
