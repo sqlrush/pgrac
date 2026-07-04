@@ -46,6 +46,7 @@
 
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
+#include "cluster/cluster_shared_catalog.h"
 #include "cluster/storage/cluster_shared_fs.h"
 
 
@@ -229,6 +230,38 @@ cluster_shared_fs_init(void)
 				 errhint("Set cluster.shared_storage_backend=local in postgresql.conf "
 						 "to enable cluster_smgr routing, or revert "
 						 "cluster.smgr_user_relations=off.")));
+
+	/*
+	 * spec-6.14 D1 cross-check: cluster.shared_catalog=on requires all three
+	 * hard dependencies -- smgr_user_relations (permanent relations must
+	 * already route through cluster_smgr), a configured shared_data_dir (to
+	 * hold the single catalog tree) and controlfile_shared_authority (so
+	 * join nodes have a shared pg_control to adopt the system identifier
+	 * from).  Missing any one is incoherent, so fail closed at postmaster
+	 * init with a precise errhint naming the one thing to fix.  Co-located
+	 * with the stub cross-check above so all shared-storage cross-GUC gates
+	 * live together (spec-6.14 §2.3 / §3.5).  The join-time "all nodes
+	 * agree" consistency check is enforced separately in the membership
+	 * path (cluster_shared_catalog_register_ic_msg_types).
+	 */
+	{
+		ClusterSharedCatalogVetResult vet;
+		bool		have_shared_data_dir =
+			(cluster_shared_data_dir != NULL && cluster_shared_data_dir[0] != '\0');
+
+		vet = cluster_shared_catalog_vet(cluster_shared_catalog,
+										 cluster_smgr_user_relations,
+										 have_shared_data_dir,
+										 cluster_controlfile_shared_authority);
+		if (vet != CLUSTER_SHARED_CATALOG_VET_OK)
+			ereport(FATAL,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cluster.shared_catalog=on requires %s",
+							cluster_shared_catalog_vet_missing_dep_name(vet)),
+					 errhint("Set %s in postgresql.conf and restart, or revert "
+							 "cluster.shared_catalog=off.",
+							 cluster_shared_catalog_vet_missing_dep_name(vet))));
+	}
 
 	/*
 	 * PGRAC: spec-1.7.2 2026-05-03 F2 fix — EXPERIMENTAL WARNING

@@ -1,0 +1,93 @@
+/*-------------------------------------------------------------------------
+ *
+ * cluster_shared_catalog.h
+ *	  Shared system-catalog single-authority: pure decision helpers.
+ *
+ *	  spec-6.14 D1.  This header hosts the dependency-light, side-effect-free
+ *	  predicates that gate the shared_catalog feature: the startup vet (which
+ *	  hard dependencies must be satisfied before cluster.shared_catalog=on may
+ *	  boot) and the single "non-temp = shared" routing criterion consumed by
+ *	  the smgr (G1), PCM-track (G2) and lock-globalization (G3) sites.  Keeping
+ *	  the judgement in one pure translation unit lets cluster_unit exercise it
+ *	  standalone (U8-U10, U14-U16) and guarantees a future gate cannot drift
+ *	  away from the others (spec-6.14 R6).
+ *
+ *
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2026, pgrac contributors
+ *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
+ * IDENTIFICATION
+ *	  src/include/cluster/cluster_shared_catalog.h
+ *
+ * NOTES
+ *	  This is a pgrac-original file.
+ *	  Spec: spec-6.14-shared-catalog-single-authority.md (D1)
+ *
+ *-------------------------------------------------------------------------
+ */
+#ifndef CLUSTER_SHARED_CATALOG_H
+#define CLUSTER_SHARED_CATALOG_H
+
+#include "c.h"
+
+/*
+ * Result of the shared_catalog startup vet.  Values other than _OK name the
+ * FIRST unsatisfied hard dependency, in a fixed priority order, so the FATAL
+ * errhint can point the operator at exactly one thing to fix.
+ */
+typedef enum ClusterSharedCatalogVetResult
+{
+	CLUSTER_SHARED_CATALOG_VET_OK = 0,
+	CLUSTER_SHARED_CATALOG_VET_MISSING_SMGR_USER_RELATIONS,
+	CLUSTER_SHARED_CATALOG_VET_MISSING_SHARED_DATA_DIR,
+	CLUSTER_SHARED_CATALOG_VET_MISSING_CF_AUTHORITY
+} ClusterSharedCatalogVetResult;
+
+/*
+ * cluster_shared_catalog_vet -- pure startup dependency check.
+ *
+ *	Given the shared_catalog master switch and the state of its three hard
+ *	dependencies, return the first unmet dependency (priority order:
+ *	smgr_user_relations, shared_data_dir, controlfile_shared_authority) or
+ *	_OK.  When shared_catalog is off the result is always _OK (the feature
+ *	imposes no requirements and the off path is byte-identical to stock PG).
+ *
+ *	The three dependencies exist because shared_catalog can only be sound
+ *	when (a) permanent relations already route through cluster_smgr, (b) a
+ *	shared data root is configured to hold the single catalog tree, and (c)
+ *	a shared pg_control authority exists for join nodes to adopt the system
+ *	identifier from (spec-6.14 §2.3 / §3.5).
+ */
+extern ClusterSharedCatalogVetResult
+			cluster_shared_catalog_vet(bool shared_catalog,
+									   bool smgr_user_relations,
+									   bool have_shared_data_dir,
+									   bool controlfile_shared_authority);
+
+/*
+ * cluster_shared_catalog_vet_missing_dep_name -- human-readable dependency
+ *	name for a non-OK vet result, for use in the FATAL errhint.  Returns a
+ *	static string; returns "" for _OK.
+ */
+extern const char *cluster_shared_catalog_vet_missing_dep_name(ClusterSharedCatalogVetResult r);
+
+/*
+ * cluster_shared_catalog_is_shared_rel -- the single "non-temp = shared"
+ *	routing criterion (spec-6.14 §2.4).  Only meaningful under
+ *	shared_catalog=on; callers gate on the master switch first.  is_temp is
+ *	true for temp/local (backend-qualified) relations, which always stay
+ *	node-local.  Everything else is cluster-shared -- the historic
+ *	relNumber >= FirstNormalObjectId catalog/user split collapses to this,
+ *	so a rewritten catalog (VACUUM FULL pg_class) no longer creates routing
+ *	ambiguity.  This is the ONE place the judgement lives (R6).
+ */
+static inline bool
+cluster_shared_catalog_is_shared_rel(bool is_temp)
+{
+	return !is_temp;
+}
+
+#endif							/* CLUSTER_SHARED_CATALOG_H */

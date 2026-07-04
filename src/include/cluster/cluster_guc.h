@@ -314,6 +314,23 @@ extern int cluster_storage_fence_driver;
  */
 extern bool cluster_smgr_user_relations;
 
+/*
+ * cluster_shared_catalog -- spec-6.14 D1 master switch for the shared
+ *	system-catalog single authority.  Default off (per-node catalog copies,
+ *	byte-identical to current behaviour).  On requires smgr_user_relations,
+ *	shared_data_dir and controlfile_shared_authority (startup vet in
+ *	cluster_shared_fs_init) and every node must agree (join consistency
+ *	check).  context: PGC_POSTMASTER.
+ */
+extern bool cluster_shared_catalog;
+
+/*
+ * cluster_oid_lease_size -- spec-6.14 D6.  Per-node OID lease block size for
+ *	the shared OID authority (default 8192, range 1024..1048576).  Only
+ *	meaningful when cluster_shared_catalog is on.  context: PGC_POSTMASTER.
+ */
+extern int	cluster_oid_lease_size;
+
 
 /*
  * cluster_shmem_max_regions -- capacity of the cluster shmem region

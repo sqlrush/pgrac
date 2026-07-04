@@ -163,6 +163,14 @@ int cluster_storage_fence_driver = CLUSTER_STORAGE_FENCE_DRIVER_AUTO;
  */
 bool cluster_controlfile_shared_authority = false;
 bool cluster_smgr_user_relations = false;
+/*
+ * spec-6.14 D1: shared system-catalog single authority.  Off by default; on
+ * requires smgr_user_relations=on + shared_data_dir + controlfile_shared_
+ * authority (startup vet in cluster_shared_fs_init).  cluster.oid_lease_size
+ * is the per-node OID lease block size (D6).
+ */
+bool cluster_shared_catalog = false;
+int cluster_oid_lease_size = 8192;
 int cluster_shmem_max_regions = 80; /* spec-5.56: 64 -> 80 (cr relgen region; restore margin) */
 
 /* spec-3.18 D1: undo block buffer pool slot count (0 = disabled). */
@@ -1998,6 +2006,59 @@ cluster_init_guc(void)
 					 "file per (rlocator, fork) without the md.c .seg suffix."),
 		&cluster_smgr_user_relations, false,
 		PGC_POSTMASTER, /* smgr_which is cached per-relation; restart required */
+		0,				/* flags */
+		NULL,			/* check_hook */
+		NULL,			/* assign_hook */
+		NULL);			/* show_hook */
+
+	/*
+	 * cluster.shared_catalog -- spec-6.14 D1 master switch for the shared
+	 * system-catalog single authority.  Off keeps the existing per-node
+	 * catalog copies (byte-identical to the current cluster behaviour); on
+	 * routes catalog storage into the single shared tree with cross-node
+	 * cache coherency (Cache Fusion) and a shared relmapper + OID authority.
+	 * On requires cluster.smgr_user_relations=on + cluster.shared_data_dir +
+	 * cluster.controlfile_shared_authority=on; the startup vet in
+	 * cluster_shared_fs_init FATALs otherwise, and every node must agree
+	 * (join-time consistency check, fail-closed).  PGC_POSTMASTER: routing
+	 * and bootstrap mode are fixed at startup.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.shared_catalog",
+		gettext_noop("Route system catalogs through a single shared authority."),
+		gettext_noop("When on (combined with cluster.smgr_user_relations=on, "
+					 "cluster.shared_data_dir set and "
+					 "cluster.controlfile_shared_authority=on), all permanent "
+					 "relations -- catalogs included -- live in one shared tree "
+					 "kept coherent across nodes, and DDL on one node becomes "
+					 "visible on the others.  Off keeps per-node catalog copies. "
+					 "All nodes in a cluster must set the same value."),
+		&cluster_shared_catalog, false,
+		PGC_POSTMASTER, /* routing + bootstrap mode fixed at startup */
+		0,				/* flags */
+		NULL,			/* check_hook */
+		NULL,			/* assign_hook */
+		NULL);			/* show_hook */
+
+	/*
+	 * cluster.oid_lease_size -- spec-6.14 D6.  Under shared_catalog=on a node
+	 * leases this many OIDs at a time from the shared durable OID authority
+	 * and consumes them node-locally before refilling.  Larger = fewer
+	 * cross-node refills; the cost of a larger lease is a bigger OID segment
+	 * wasted when a node crashes mid-lease (harmless -- the OID space wraps
+	 * around and GetNewOidWithIndex re-checks uniqueness).  No effect when
+	 * shared_catalog=off.
+	 */
+	DefineCustomIntVariable(
+		"cluster.oid_lease_size",
+		gettext_noop("Number of OIDs a node leases at a time from the shared OID authority."),
+		gettext_noop("Range [1024, 1048576].  Default 8192.  Only meaningful when "
+					 "cluster.shared_catalog=on.  Larger values reduce cross-node "
+					 "OID-refill round trips at the cost of a larger OID segment "
+					 "wasted on a mid-lease node crash (harmless: the OID space "
+					 "wraps and uniqueness is re-checked at index insert)."),
+		&cluster_oid_lease_size, 8192, 1024, 1048576,
+		PGC_POSTMASTER, /* lease pool sized at startup */
 		0,				/* flags */
 		NULL,			/* check_hook */
 		NULL,			/* assign_hook */
