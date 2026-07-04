@@ -158,6 +158,7 @@ OBJS = \
 	cluster_scn.o \
 	cluster_oid_lease.o \
 	cluster_oid_lease_shmem.o \
+	cluster_relmap_authority.o \
 	cluster_sequence.o \
 	cluster_sequence_shmem.o \
 	cluster_shared_catalog.o \
