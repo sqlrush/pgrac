@@ -9,6 +9,31 @@
  *	  src/backend/access/transam/varsup.c
  *
  *-------------------------------------------------------------------------
+ *
+ * PGRAC MODIFICATIONS (spec-6.15 D1)
+ *
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *	Spec: spec-6.15-xid-space-segmentation.md
+ *
+ *	What changed:
+ *	  - GetNewTransactionId(): when cluster.xid_striping is enabled the
+ *	    issued xid is the striped candidate -- the smallest value at or
+ *	    above nextXid whose 32-bit form lies in this node's congruence
+ *	    class (xid mod 16 == node slot).  The wraparound limit checks
+ *	    and the CLOG / commit_ts / subtrans extension all operate on
+ *	    the candidate, and nextXid advances to candidate + 1 so the
+ *	    native "one past last assigned" invariant is preserved for
+ *	    GetSnapshotData / oldestXid consumers.  With the GUC off (the
+ *	    default) the candidate equals nextXid and behaviour is
+ *	    byte-identical to vanilla PostgreSQL.
+ *
+ *	Why: striping makes the 32-bit xid value space globally unique
+ *	across cluster nodes so a raw xid is self-describing about its
+ *	origin node.  All candidate arithmetic lives in
+ *	cluster/cluster_xid_stripe.c; this file only consumes it under
+ *	XidGenLock.
+ *
+ *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
@@ -19,6 +44,7 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlogutils.h"
+#include "cluster/cluster_xid_stripe.h" /* PGRAC: spec-6.15 D1 striped candidate */
 #include "commands/dbcommands.h"
 #include "miscadmin.h"
 #include "postmaster/autovacuum.h"
@@ -79,6 +105,34 @@ GetNewTransactionId(bool isSubXact)
 
 	full_xid = ShmemVariableCache->nextXid;
 	xid = XidFromFullTransactionId(full_xid);
+
+#ifdef USE_PGRAC_CLUSTER
+
+	/*
+	 * PGRAC MODIFICATIONS (spec-6.15 D1)
+	 *
+	 * What changed: with xid striping active, the value we issue is the
+	 * striped candidate rather than nextXid itself.  Everything below
+	 * (wraparound limit checks, CLOG/commit_ts/subtrans extension, the
+	 * ProcArray publish and the caller's return value) operates on the
+	 * candidate; the advance at the bottom republishes candidate + 1.
+	 *
+	 * Why: node slot k must only ever issue 32-bit values congruent to
+	 * k (mod 16) so the value space is globally unique across cluster
+	 * nodes.  Candidate arithmetic is pure and lives in
+	 * cluster_xid_stripe.c; with striping off (default) the slot is -1
+	 * and this block is a no-op (byte-identical vanilla behaviour).
+	 */
+	{
+		int			stripe_slot = cluster_xid_allocation_slot();
+
+		if (stripe_slot >= 0)
+		{
+			full_xid = cluster_xid_next_striped_full(full_xid, stripe_slot);
+			xid = XidFromFullTransactionId(full_xid);
+		}
+	}
+#endif
 
 	/*----------
 	 * Check to see if it's safe to assign another XID.  This protects against
@@ -163,6 +217,20 @@ GetNewTransactionId(bool isSubXact)
 		LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
 		full_xid = ShmemVariableCache->nextXid;
 		xid = XidFromFullTransactionId(full_xid);
+
+#ifdef USE_PGRAC_CLUSTER
+		/* PGRAC: spec-6.15 D1 -- re-derive the striped candidate from the
+		 * re-read nextXid (mirrors the derivation at the top). */
+		{
+			int			stripe_slot = cluster_xid_allocation_slot();
+
+			if (stripe_slot >= 0)
+			{
+				full_xid = cluster_xid_next_striped_full(full_xid, stripe_slot);
+				xid = XidFromFullTransactionId(full_xid);
+			}
+		}
+#endif
 	}
 
 	/*
@@ -184,6 +252,16 @@ GetNewTransactionId(bool isSubXact)
 	 * want the next incoming transaction to try it again.  We cannot assign
 	 * more XIDs until there is CLOG space for them.
 	 */
+#ifdef USE_PGRAC_CLUSTER
+
+	/*
+	 * PGRAC: spec-6.15 D1 -- republish the striped candidate (which may
+	 * lie ahead of the stored nextXid) so the advance below lands at
+	 * candidate + 1.  With striping off full_xid still equals nextXid
+	 * and this store is a no-op.
+	 */
+	ShmemVariableCache->nextXid = full_xid;
+#endif
 	FullTransactionIdAdvance(&ShmemVariableCache->nextXid);
 
 	/*

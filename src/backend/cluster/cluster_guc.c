@@ -113,6 +113,9 @@ bool cluster_block_self_contained = false;
 /* spec-6.12i: active-runtime cross-instance recycled-slot visibility
  * resolution via undo-block CF fetch (default OFF = 53R97). */
 bool cluster_crossnode_runtime_visibility = false;
+/* spec-6.15 D1: xid space segmentation -- striped allocation (default
+ * OFF = vanilla dense per-node xid allocation). */
+bool cluster_xid_striping = false;
 /* spec-6.12d: instance space-affinity mode + lease cap (default OFF). */
 int cluster_space_affinity = CLUSTER_SPACE_AFFINITY_OFF;
 int cluster_space_lease_blocks = 64;
@@ -1567,6 +1570,23 @@ cluster_init_guc(void)
 		gettext_noop("Off keeps active-runtime recycled-slot resolution fail-closed "
 					 "(SQLSTATE 53R97)."),
 		&cluster_crossnode_runtime_visibility, false, PGC_SUSET, 0, NULL, NULL, NULL);
+
+	/*
+	 * cluster.xid_striping -- spec-6.15 D1 (AD-012 exception 10 xid
+	 * space segmentation).  When on, this node only issues 32-bit xids
+	 * congruent to its declared node slot modulo 16, making the xid
+	 * value space globally unique across cluster nodes.  Requires
+	 * cluster.node_id in [0, 15]; boot fails closed otherwise (see
+	 * cluster_init_shmem).  POSTMASTER context: activation is a
+	 * whole-node restart decision, never a runtime flip.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.xid_striping",
+		gettext_noop("Stripe xid allocation into per-node congruence classes (spec-6.15)."),
+		gettext_noop("Each declared node only issues xids congruent to its node slot "
+					 "modulo 16, making xid values self-describing about their origin "
+					 "node. Requires cluster.node_id between 0 and 15."),
+		&cluster_xid_striping, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	/*
 	 * cluster.block_self_contained -- spec-6.12 wave g (write-write

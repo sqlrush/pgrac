@@ -33,6 +33,7 @@
 #include "postgres.h"
 
 #include "access/transam.h"
+#include "cluster/cluster_guc.h" /* cluster_enabled / cluster_node_id / cluster_xid_striping */
 #include "cluster/cluster_xid_stripe.h"
 
 /*
@@ -152,6 +153,23 @@ cluster_xid_lag_exceeds(FullTransactionId local_next, FullTransactionId cluster_
 		return false;
 
 	return (max_val - local_val) > threshold;
+}
+
+/*
+ * Allocation-side slot gate (see header).  Pure function of the GUC
+ * face and the declared node identity, so it is safe under
+ * EXEC_BACKEND (children recompute instead of inheriting) and cheap
+ * enough for the GetNewTransactionId hot path (two branches).
+ */
+int
+cluster_xid_allocation_slot(void)
+{
+	if (!cluster_enabled || !cluster_xid_striping)
+		return -1;
+	if (cluster_node_id < 0 || cluster_node_id >= CLUSTER_XID_STRIDE)
+		return -1;
+
+	return cluster_node_id;
 }
 
 /*

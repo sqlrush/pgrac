@@ -100,6 +100,17 @@ extern int cluster_xid_origin_slot(TransactionId xid);
 extern bool cluster_xid_is_mine(TransactionId xid);
 
 /*
+ * Allocation-side slot gate consumed by GetNewTransactionId under
+ * XidGenLock: this node's stripe slot when striping is enabled and the
+ * declared node identity fits the stripe width, else -1 (allocation
+ * stays vanilla).  Boot-time validation in cluster_init_shmem FATALs
+ * on striping-on configurations whose node_id cannot stripe, so -1
+ * here never silently mixes striped and unstriped allocation in an
+ * enabled cluster.
+ */
+extern int cluster_xid_allocation_slot(void);
+
+/*
  * Latch the process-local stripe runtime state.  Ownership: the stripe
  * activation / join path (later deliverable of spec-6.15) calls this
  * once per process at startup; values are immutable for the life of
