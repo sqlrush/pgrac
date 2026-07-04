@@ -6501,6 +6501,116 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 	return stable;
 }
 
+/*
+ * Borrow a live shared_buffers page for a registered RDMA SGE.
+ *
+ * This mirrors cluster_bufmgr_copy_block_for_gcs() through the HC82 WAL flush
+ * and HC89 single revalidation, but returns a raw-pinned page pointer instead
+ * of copying bytes.  content_lock is deliberately not held across return:
+ * callers must keep the existing end-to-end CRC fail-closed behavior because
+ * hint-bit or page-content drift after the revalidation can still make the
+ * shipped bytes differ from the pre-post checksum.  The raw pin only prevents
+ * buffer reuse while the asynchronous SEND is in flight.
+ */
+bool
+cluster_bufmgr_borrow_block_for_gcs_live_sge(BufferTag tag, XLogRecPtr *out_page_lsn,
+											 void **out_page_addr, BufferDesc **out_buf)
+{
+	uint32		hashcode;
+	LWLock	   *partition_lock;
+	int			buf_id;
+	BufferDesc *buf;
+	LWLock	   *content_lock;
+	XLogRecPtr	first_lsn;
+	XLogRecPtr	second_lsn;
+	int			retries;
+	Page		page;
+
+	Assert(out_page_lsn != NULL);
+	Assert(out_page_addr != NULL);
+	Assert(out_buf != NULL);
+
+	*out_page_lsn = InvalidXLogRecPtr;
+	*out_page_addr = NULL;
+	*out_buf = NULL;
+
+	hashcode = BufTableHashCode(&tag);
+	partition_lock = BufMappingPartitionLock(hashcode);
+
+	LWLockAcquire(partition_lock, LW_SHARED);
+	buf_id = BufTableLookup(&tag, hashcode);
+	if (buf_id < 0)
+	{
+		LWLockRelease(partition_lock);
+		return false;
+	}
+	buf = GetBufferDescriptor(buf_id);
+
+	{
+		uint32		buf_state;
+
+		buf_state = LockBufHdr(buf);
+		if (!BufferTagsEqual(&buf->tag, &tag) || (buf_state & BM_VALID) == 0)
+		{
+			UnlockBufHdr(buf, buf_state);
+			LWLockRelease(partition_lock);
+			return false;
+		}
+		cluster_bufmgr_pin_for_gcs_locked(buf, buf_state);
+	}
+	LWLockRelease(partition_lock);
+
+	content_lock = BufferDescriptorGetContentLock(buf);
+	page = (Page) BufHdrGetBlock(buf);
+
+	for (retries = 0; retries < 2; retries++)
+	{
+		LWLockAcquire(content_lock, LW_SHARED);
+		first_lsn = PageGetLSN(page);
+		LWLockRelease(content_lock);
+
+#ifdef USE_CLUSTER_UNIT
+		if (cluster_gcs_block_test_xlog_flush_hook != NULL)
+			cluster_gcs_block_test_xlog_flush_hook((uint64) first_lsn);
+#endif
+		if (!XLogRecPtrIsInvalid(first_lsn))
+			XLogFlush(first_lsn);
+
+		LWLockAcquire(content_lock, LW_SHARED);
+		second_lsn = PageGetLSN(page);
+
+#ifdef USE_CLUSTER_UNIT
+		if (cluster_gcs_block_test_lsn_drift_hook != NULL)
+		{
+			int			drift_remaining = cluster_gcs_block_test_lsn_drift_hook();
+
+			if (drift_remaining > retries)
+				second_lsn = first_lsn + 1;
+		}
+#endif
+
+		if (BufferTagsEqual(&buf->tag, &tag) && first_lsn == second_lsn)
+		{
+			*out_page_lsn = second_lsn;
+			*out_page_addr = page;
+			*out_buf = buf;
+			LWLockRelease(content_lock);
+			return true;
+		}
+		LWLockRelease(content_lock);
+	}
+
+	cluster_bufmgr_unpin_for_gcs(buf);
+	return false;
+}
+
+void
+cluster_bufmgr_release_block_for_gcs_live_sge(BufferDesc *buf)
+{
+	if (buf != NULL)
+		cluster_bufmgr_unpin_for_gcs(buf);
+}
+
 /* ========================================================================
  * PGRAC MODIFICATIONS by SqlRush — spec-6.12a (quiescent X->S downgrade).
  *

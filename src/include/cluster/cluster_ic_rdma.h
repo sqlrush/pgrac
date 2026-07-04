@@ -175,6 +175,7 @@ extern bool cluster_ic_rdma_pending_outbound(int32 peer_id);
  * envelope path.
  */
 extern bool cluster_ic_rdma_block_sge_supported(const char **reason);
+extern bool cluster_ic_rdma_shared_buffers_sge(void *addr, size_t len, uint32 *out_lkey);
 extern bool cluster_ic_rdma_borrow_block_scratch(int32 peer_id, size_t len, void **out_addr,
 												 uint32 *out_lkey,
 												 ClusterICSgeReleaseCallback *out_release_cb,

@@ -1092,6 +1092,10 @@ StaticAssertDecl(GCS_BLOCK_DATA_SIZE == BLCKSZ,
 #include "cluster/cluster_pcm_lock.h" /* PcmLockMode for invalidate helper */
 extern bool cluster_bufmgr_probe_block_for_gcs(BufferTag tag);
 extern bool cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char *dst);
+extern bool cluster_bufmgr_borrow_block_for_gcs_live_sge(BufferTag tag, XLogRecPtr *out_page_lsn,
+														 void **out_page_addr,
+														 BufferDesc **out_buf);
+extern void cluster_bufmgr_release_block_for_gcs_live_sge(BufferDesc *buf);
 extern uint32 cluster_gcs_block_compute_checksum(const char *block_data);
 extern bool cluster_bufmgr_copy_block_for_gcs_smart_fusion(BufferTag tag, XLogRecPtr *out_page_lsn,
 														   char *dst, ClusterSfDepVec *out_dep_vec);

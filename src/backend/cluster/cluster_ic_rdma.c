@@ -1693,6 +1693,39 @@ cluster_ic_rdma_block_sge_supported(const char **reason)
 }
 
 bool
+cluster_ic_rdma_shared_buffers_sge(void *addr, size_t len, uint32 *out_lkey)
+{
+#ifdef HAVE_LIBIBVERBS
+	uintptr_t base;
+	uintptr_t ptr;
+	uintptr_t end;
+	uintptr_t mr_end;
+
+	if (out_lkey != NULL)
+		*out_lkey = 0;
+	if (addr == NULL || len == 0 || BufferBlocks == NULL || NBuffers <= 0)
+		return false;
+	if (RdmaSharedBuffersMr.base == NULL || RdmaSharedBuffersMr.lkey == 0)
+		return false;
+
+	base = (uintptr_t)BufferBlocks;
+	ptr = (uintptr_t)addr;
+	end = ptr + (uintptr_t)len;
+	mr_end = base + (uintptr_t)((size_t)NBuffers * (size_t)BLCKSZ);
+	if (ptr < base || end < ptr || end > mr_end)
+		return false;
+
+	if (out_lkey != NULL)
+		*out_lkey = RdmaSharedBuffersMr.lkey;
+	return true;
+#else
+	if (out_lkey != NULL)
+		*out_lkey = 0;
+	return false;
+#endif
+}
+
+bool
 cluster_ic_rdma_borrow_block_scratch(int32 peer_id, size_t len, void **out_addr, uint32 *out_lkey,
 									 ClusterICSgeReleaseCallback *out_release_cb,
 									 void **out_release_arg)
